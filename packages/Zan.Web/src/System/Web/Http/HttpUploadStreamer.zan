@@ -1,0 +1,65 @@
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Threading;
+
+namespace System.Web;
+
+// HTTP 大文件流式接收与磁盘暂存器：
+// 针对路由标记为 streamUpload 的请求，在收到头部后直接通过 socket 边接收边写入磁盘临时文件，
+// 避免整个大文件（数十 MB 至数 GB）常驻内存引发 GC 停顿或内存溢出。
+public class HttpUploadStreamer {
+    [DllImport("crt")]
+    private static extern long time(nint ptr);
+
+    [DllImport("crt")]
+    private static extern nint fopen(string path, string mode);
+
+    [DllImport("crt")]
+    private static extern long fwrite(string buf, long size, long count, nint fp);
+
+    [DllImport("crt")]
+    private static extern int fclose(nint fp);
+
+    // 将请求正文以流式方式直写到指定上传目录的临时文件，返回落盘文件绝对路径；失败返回空串 ""。
+    public static async string StreamToFile(nint sock, HttpFramer framer,
+                                           HttpRequest request, string uploadDir,
+                                           AtomicInt uploadSeq) {
+        if (sock == 0 || framer == null || request == null) { return ""; }
+        if (!Directory.Exists(uploadDir)) {
+            Directory.CreateDirectoryRecursive(uploadDir);
+        }
+        int seq = uploadSeq != null ? uploadSeq.Increment() : 1;
+        string tmp = uploadDir + "/upload_" + Convert.ToString(HttpUploadStreamer.time(0))
+            + "_" + Convert.ToString(seq) + ".bin";
+        nint fp = HttpUploadStreamer.fopen(tmp, "wb");
+        if (fp == 0) { return ""; }
+        int total = request.contentLength;
+        int have = 0;
+        int headerEnd = request.bodyStart;
+        int bodyInBuf = framer.Pending() - headerEnd;
+        if (bodyInBuf > total) { bodyInBuf = total; }
+        if (bodyInBuf > 0) {
+            string firstChunk = framer.Slice(headerEnd, bodyInBuf);
+            int _w0 = (int)HttpUploadStreamer.fwrite(firstChunk, 1, bodyInBuf, fp);
+            if (_w0 < bodyInBuf) { int _c0 = HttpUploadStreamer.fclose(fp); return ""; }
+            have = bodyInBuf;
+        }
+        framer.Consume(headerEnd + have);
+        byte[] buf = new byte[65537];
+        while (have < total) {
+            int n = await Socket.RecvIntoAsync(sock, buf, 65535);
+            if (n <= 0) { int _c1 = HttpUploadStreamer.fclose(fp); return ""; }
+            if (have + n > total) { n = total - have; }
+            // fwrite 短写（磁盘满/配额）必须当失败处理：不校验的话
+            // have 照常推进，落盘文件被静默截断，调用方拿到一个
+            // 看似成功的残缺文件。
+            int _w = (int)HttpUploadStreamer.fwrite(buf, 1, n, fp);
+            if (_w < n) { int _c3 = HttpUploadStreamer.fclose(fp); return ""; }
+            have = have + n;
+        }
+        int _c2 = HttpUploadStreamer.fclose(fp);
+        return tmp;
+    }
+}

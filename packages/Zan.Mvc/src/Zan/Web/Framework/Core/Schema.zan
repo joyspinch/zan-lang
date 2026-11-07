@@ -78,7 +78,7 @@ public class Schema {
 
     /* 持约者标识：进程内一次性 nonce + pid + 端口，保证跨机器跨重启
        都不会撞成同一串（撞了会让释放语句误删别人的租约）。 */
-    static string leaseHolder = "";
+    private static string leaseHolder = "";
 
     private static string Holder() {
         if (leaseHolder.Length == 0) {
@@ -102,22 +102,27 @@ public class Schema {
         int waited = 0;
         while (true) {
             int now = WebApp.NowSeconds();
-            /* 过期租约先扫掉，再公平竞争。 */
+            /* 过期租约先扫掉，再公平竞争（参数化预编译模式）。 */
+            DbParams pDel = new DbParams();
+            pDel.AddInt(now);
             int _s = await db.ExecuteAsync(
-                "DELETE FROM sys_lock WHERE expires < "
-                + Convert.ToString(now));
+                "DELETE FROM sys_lock WHERE expires < ?", pDel);
             try {
+                DbParams pIns = new DbParams();
+                pIns.Add(holder);
+                pIns.AddInt(now + LeaseSec);
                 int _i = await db.ExecuteAsync("INSERT INTO sys_lock"
-                    + "(name, holder, expires) VALUES('schema', '"
-                    + holder + "', " + Convert.ToString(now + LeaseSec)
-                    + ")");
+                    + "(name, holder, expires) VALUES('schema', ?, ?)", pIns);
                 return true;
-            } catch {
+            } catch (Exception _ex) {
                 /* 主键冲突 = 已有持约者（并发启动或租约未过期）。 */
             }
-            int claimed = await db.ExecuteAsync("UPDATE sys_lock SET holder='"
-                + holder + "', expires=" + Convert.ToString(now + LeaseSec)
-                + " WHERE name='schema' AND expires < " + Convert.ToString(now));
+            DbParams pUpd = new DbParams();
+            pUpd.Add(holder);
+            pUpd.AddInt(now + LeaseSec);
+            pUpd.AddInt(now);
+            int claimed = await db.ExecuteAsync("UPDATE sys_lock SET holder = ?, "
+                + "expires = ? WHERE name = 'schema' AND expires < ?", pUpd);
             if (claimed > 0) { return true; }
             if (waited >= WaitMs) {
                 Log.Error("[db] schema lock busy after "
@@ -132,8 +137,10 @@ public class Schema {
     }
 
     private static async void ReleaseLease(IDbConnection db) {
+        DbParams ps = new DbParams();
+        ps.Add(Holder());
         int _r = await db.ExecuteAsync("DELETE FROM sys_lock WHERE "
-            + "name='schema' AND holder='" + Holder() + "'");
+            + "name = 'schema' AND holder = ?", ps);
     }
 
     /* 表设计器的动作/行内编辑标志后补列时，旧行是 NULL（ORM 读作 0）——
@@ -213,7 +220,7 @@ public class Schema {
         return _admin > 0 && _editor > 0;
     }
 
-    static async int AddRole(IZanSql fsql, string name, string code, int rank,
+    private static async int AddRole(IZanSql fsql, string name, string code, int rank,
                           string description, int dataScope) {
         SysRole r = new SysRole();
         r.name = name;
@@ -229,7 +236,7 @@ public class Schema {
         return await fsql.Insert<SysRole>(r).ExecuteIdentityAsync();
     }
 
-    static async bool Grant(IZanSql fsql, int roleId, string screen, int mask,
+    private static async bool Grant(IZanSql fsql, int roleId, string screen, int mask,
                             long now) {
         SysRoleGrant g = new SysRoleGrant();
         g.roleId = roleId;
@@ -248,7 +255,7 @@ public class Schema {
         return await AddDept(fsql, 1, "内容运营", "content", 3);
     }
 
-    static async bool AddDept(IZanSql fsql, int parentId, string name,
+    private static async bool AddDept(IZanSql fsql, int parentId, string name,
                            string code, int sortOrder) {
         SysDepartment d = new SysDepartment();
         d.parentId = parentId;
@@ -284,7 +291,7 @@ public class Schema {
         return _id > 0;
     }
 
-    static async bool AddDictItem(IZanSql fsql, string typeCode, string value,
+    private static async bool AddDictItem(IZanSql fsql, string typeCode, string value,
                             string label, int sortOrder) {
         SysDictItem it = new SysDictItem();
         it.typeCode = typeCode;
@@ -377,7 +384,7 @@ public class Schema {
             "text", "生成代码写入此目录，相对服务进程工作目录解释；需为包含 src 与 views 的应用源码根目录，生产发布建议填绝对路径", 80);
     }
 
-    static async bool EnsureSetting(IZanSql fsql, string groupName, string name,
+    private static async bool EnsureSetting(IZanSql fsql, string groupName, string name,
                                 string label, string value, string kind,
                                 string tip, int sortOrder) {
         int have = await fsql.Select<SysSiteSetting>()
@@ -386,7 +393,7 @@ public class Schema {
         return await AddSetting(fsql, groupName, name, label, value, kind, tip, sortOrder);
     }
 
-    static async bool AddSetting(IZanSql fsql, string groupName, string name,
+    private static async bool AddSetting(IZanSql fsql, string groupName, string name,
                              string label, string value, string kind,
                              string tip, int sortOrder) {
         SysSiteSetting s = new SysSiteSetting();

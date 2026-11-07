@@ -7,12 +7,12 @@
 
 | 模块目录 | 内容 |
 |---|---|
-| `Http/` | WebApp / WebHost / WebServer 应用骨架与生命周期、HttpContext 请求上下文、Hooks 与 Filter |
+| `Http/` | WebApp / WebHost / WebServer 应用骨架与生命周期、HttpContext 请求上下文、HttpFormParser 表单/多部件解析器、HttpUploadStreamer 大文件流式落盘器、HttpSseStreamer SSE 流式传输器、Hooks 与 Filter |
 | `Routing/` | Router / Route 路由表与匹配引擎、RouteTable 跨进程共享路由快照 |
 | `Attributes/` | 统一特性标注（Attribute 基类、HttpGet/Post/Put/Patch/Delete、Route/RouteR、NonAction、ReadOnly 等） |
 | `Controllers/` | Controller 控制器基型与 View 页面/片段视图渲染引擎 |
 | `Security/` | AuthDelegates (AuthFn/PermissionFn)、Csrf 防护、RateLimiter 限流器、LockManager 排他锁、Sessions 会话、Validator 校验器 |
-| `Seo/` | GeoAgent AI 爬虫识别、GeoMeta、GeoSchema、GeoSource、LlmsTxt (llms.txt)、RobotsTxt、Sitemap (sitemap.xml) |
+| `Seo/` | GeoAgent AI 爬虫识别、GeoMeta、GeoSchema、GeoSource、LlmsTxt (llms.txt)、RobotsTxt、Sitemap (sitemap.xml)、SeoRouter 协议路由与分发器 |
 | `Static/` | StaticFiles 静态资源挂载与流式分发中间件 |
 | `WebSocket/` | WebWs 握手升级装配与 WsSession 长连接会话 |
 | `Navigation/` | MenuBuilder / MenuNode 动态导航树构建、ApiDocs 接口文档生成 |

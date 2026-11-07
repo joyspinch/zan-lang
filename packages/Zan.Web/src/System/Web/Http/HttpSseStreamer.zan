@@ -1,0 +1,79 @@
+using System;
+using System.Diagnostics;
+using System.Net.Sockets;
+using System.Text;
+
+namespace System.Web;
+
+// HTTP Server-Sent Events (SSE) 流式传输器：
+// 负责 SSE 协议握手、事件帧打包、保活 Ping 帧发送及底层 TCP 背压流式循环写出。
+public class HttpSseStreamer {
+
+    // 开启 SSE 流式连接通道：发送标准响应头，接管底层 TCP 连接并标记统计指标。
+    public static async bool Open(HttpContext ctx) {
+        if (ctx == null || ctx.conn == null) { return false; }
+        string head = "HTTP/1.1 200 OK\r\n"
+            + "Content-Type: " + HttpLimits.MimeEventStream + "\r\n"
+            + "Cache-Control: no-cache, no-transform\r\n"
+            + "Connection: keep-alive\r\n"
+            + "X-Accel-Buffering: no\r\n\r\n";
+        int n = await ctx.conn.SendAsync(head);
+        if (n <= 0) { return false; }
+        ctx.hijacked = true;
+        ctx.wasHijacked = true;
+        ctx.ended = true;
+        ServerMetrics.Global().StreamOpened();
+        return true;
+    }
+
+    // 循环发送全部 TCP 字节。在客户端高背压或慢订阅者场景下处理短写，直到全部写入或连接中断。
+    public static async bool SendAllTcp(TcpClient conn, string data) {
+        if (conn == null) { return false; }
+        int total = data.Length;
+        if (total == 0) { return true; }
+        int sent = 0;
+        while (sent < total) {
+            string rest = data.Substring(sent, total - sent);
+            int n = await conn.SendAsync(rest);
+            if (n <= 0) { return false; }
+            sent = sent + n;
+        }
+        return true;
+    }
+
+    // 格式化并发送一条 SSE 事件消息（包含可选事件名称与多行 data 编码）。
+    public static async bool Send(HttpContext ctx, string name, string data) {
+        if (ctx == null || !ctx.hijacked || ctx.conn == null) { return false; }
+        StringBuilder sb = new StringBuilder();
+        if (name.Length > 0) { sb.Append("event: "); sb.Append(name); sb.Append("\n"); }
+        int start = 0;
+        for (int i = 0; i <= data.Length; i = i + 1) {
+            if (i == data.Length || (data[i] & 255) == 10) {
+                sb.Append("data: ");
+                sb.Append(data.Substring(start, i - start));
+                sb.Append("\n");
+                start = i + 1;
+            }
+        }
+        sb.Append("\n");
+        string frame = sb.ToString();
+        bool ok = await HttpSseStreamer.SendAllTcp(ctx.conn, frame);
+        if (!ok) { ctx.hijacked = false; return false; }
+        // 续期超时期限，避免健康流被连接清扫器回收
+        ctx.TouchDeadline(ctx.streamIdleMs);
+        ctx.frames = ctx.frames + 1;
+        ctx.framesBytes = ctx.framesBytes + frame.Length;
+        return true;
+    }
+
+    // 发送 SSE 格式的标准注释保活帧 (: ping\n\n)。
+    public static async bool Ping(HttpContext ctx) {
+        if (ctx == null || !ctx.hijacked || ctx.conn == null) { return false; }
+        bool ok = await HttpSseStreamer.SendAllTcp(ctx.conn, ": ping\n\n");
+        if (!ok) { ctx.hijacked = false; return false; }
+        ctx.TouchDeadline(ctx.streamIdleMs);
+        ctx.frames = ctx.frames + 1;
+        ctx.framesBytes = ctx.framesBytes + 8;
+        return true;
+    }
+}

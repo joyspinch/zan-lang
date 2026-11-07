@@ -11,67 +11,55 @@ using System;
 namespace System.Web;
 
 public class WebApp : IDisposable {
-    [DllImport("crt")]
-    private static extern long time(nint ptr);
-
-    [DllImport("crt")]
-    private static extern nint fopen(string path, string mode);
-
-    [DllImport("crt")]
-    private static extern long fwrite(string buf, long size, long count, nint fp);
-
-    [DllImport("crt")]
-    private static extern int fclose(nint fp);
-
-    string host;
-    int port;
-    bool running;
-    TcpListener listener;
+    public string host;
+    public int port;
+    public bool running;
+    public TcpListener listener;
     // 共享内存表：包含限流、锁和路由计数器，多工作进程间无拷贝共享。
-    Router router;
-    Hooks hooks;
-    View views;
-    Sessions sessions;
-    RateLimiter limiter;
-    LockManager locks;
-    AuthFn authResolver;
-    PermissionFn permissionResolver;
-    ServerMetrics metrics;
-    LlmsTxt llmsTxt;
-    RobotsTxt robotsTxt;
-    Sitemap sitemap;
+    public Router router;
+    public Hooks hooks;
+    public View views;
+    public Sessions sessions;
+    public RateLimiter limiter;
+    public LockManager locks;
+    public AuthFn authResolver;
+    public PermissionFn permissionResolver;
+    public ServerMetrics metrics;
+    public LlmsTxt llmsTxt;
+    public RobotsTxt robotsTxt;
+    public Sitemap sitemap;
     /* 应用层 GEO 内容源：内容由应用层每次请求求值，协议层只渲染。 */
-    SitemapSource sitemapSource;
-    RobotsSource robotsSource;
-    LlmsSource llmsSource;
+    public SitemapSource sitemapSource;
+    public RobotsSource robotsSource;
+    public LlmsSource llmsSource;
     /* 挂载幂等标记：静态对象与内容源共用挂载点，同一路径只挂一次。 */
-    bool sitemapMounted;
-    bool robotsMounted;
-    bool llmsMounted;
-    List<StaticMount> staticMounts;
-    bool staticHookInstalled;
-    List<string> csrfSkips;
-    List<string> wsOrigins;
+    public bool sitemapMounted;
+    public bool robotsMounted;
+    public bool llmsMounted;
+    private List<StaticMount> staticMounts;
+    private bool staticHookInstalled;
+    private List<string> csrfSkips;
+    private List<string> wsOrigins;
 
     // 内存请求体上限（字节），超出回答 413。
-    int maxBodyBytes;  // in-memory request body cap (413 above this)
+    private int maxBodyBytes;  // in-memory request body cap (413 above this)
     // 流式上传上限（字节），只作用于 [Upload] 路由。
-    int maxUploadBytes;  // streaming upload cap for .Upload() routes
-    int requestTimeoutMs;  // per-request deadline: a connection that stops
+    private int maxUploadBytes;  // streaming upload cap for .Upload() routes
+    private int requestTimeoutMs;  // per-request deadline: a connection that stops
     // 并发连接上限（0 = 不设上限；超限回答 503 并关闭）。
-    int maxConnections;  // concurrent connections served at once (0 = no cap)
-    string uploadDir;  // where streamed uploads land
+    private int maxConnections;  // concurrent connections served at once (0 = no cap)
+    private string uploadDir;  // where streamed uploads land
     // 进程内全局连接统计原子计数器。
-    AtomicInt uploadSeq;
-    string loginPath;
+    private AtomicInt uploadSeq;
+    private string loginPath;
     // 全局每秒请求上限（0 = 不限；超限 429）。
-    int globalLimit;  // requests/sec across all routes (0 = unlimited)
-    AtomicInt totalRequests;
-    AtomicInt activeConnections;
-    bool reusePort;
+    private int globalLimit;  // requests/sec across all routes (0 = unlimited)
+    private AtomicInt totalRequests;
+    private AtomicInt activeConnections;
+    private bool reusePort;
 
     // 当前进程单例应用实例句柄，供 Worker 底层连接回调分发。
-    static WebApp active;
+    private static WebApp active;
 
     // 构造应用服务器并填入默认配置：请求体上限 2MB、流式上传上限
     // 512MB、请求超时 30s、并发连接上限 10000、上传目录 uploads；
@@ -88,11 +76,11 @@ public class WebApp : IDisposable {
         this.authResolver = null;
         this.permissionResolver = null;
         this.metrics = ServerMetrics.Global();
-        this.maxBodyBytes = 2 * 1024 * 1024;  // 2MB default
-        this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
-        this.requestTimeoutMs = 30000;
-        this.maxConnections = 10000;
-        this.uploadDir = "uploads";
+        this.maxBodyBytes = HttpLimits.DefaultMaxBodyBytes;
+        this.maxUploadBytes = HttpLimits.DefaultMaxUploadBytes;
+        this.requestTimeoutMs = HttpLimits.DefaultTimeoutMs;
+        this.maxConnections = HttpLimits.DefaultMaxConnections;
+        this.uploadDir = HttpLimits.DefaultUploadDir;
         this.uploadSeq = new AtomicInt(0);
         this.loginPath = "";
         this.globalLimit = 0;
@@ -138,10 +126,10 @@ public class WebApp : IDisposable {
     // 初始化跨进程路由统计共享内存表。
     public void InitStats() { this.router.InitStatsShared(); }
 
-    static const string ShareRate = "WEB_RATE";
-    static const string ShareLock = "WEB_LOCK";
-    static const string ShareRoute = "WEB_ROUTE";
-    static const string ShareRouteTable = "WEB_ROUTE_TABLE";
+    private static const string ShareRate = "WEB_RATE";
+    private static const string ShareLock = "WEB_LOCK";
+    private static const string ShareRoute = "WEB_ROUTE";
+    private static const string ShareRouteTable = "WEB_ROUTE_TABLE";
 
     // 共享内存表：包含限流、锁和路由计数器，多工作进程间无拷贝共享。
     public void InitShared() {
@@ -214,163 +202,90 @@ public class WebApp : IDisposable {
     public Route Delete(string pattern, HttpHandler h) { return this.router.Delete(pattern, h); }
 
     // 启用 GEO 大模型站点友好规范，自动挂载 /.well-known/llms.txt 与 /llms.txt。
-    WebApp UseLlmsTxt(LlmsTxt llms) {
+    public WebApp UseLlmsTxt(LlmsTxt llms) {
         this.llmsTxt = llms;
         if (llms != null) { this.MountLlms(); }
         return this;
     }
 
     // 应用层接管 llms.txt 内容：委托每次请求求值，返回 null 时回退静态对象。
-    WebApp UseLlmsSource(LlmsSource source) {
+    public WebApp UseLlmsSource(LlmsSource source) {
         this.llmsSource = source;
         if (source != null) { this.MountLlms(); }
         return this;
     }
 
-    // llms.txt 挂载点：静态对象与内容源共用，三条路径只挂一次。
-    void MountLlms() {
-        if (!this.llmsMounted) {
-            this.llmsMounted = true;
-            this.router.Get("/.well-known/llms.txt", WebApp.HandleLlmsTxt);
-            this.router.Get("/.well-known/llms-full.txt", WebApp.HandleLlmsFullTxt);
-            this.router.Get("/llms.txt", WebApp.HandleLlmsTxt);
-        }
-        /* 如果未显式定制 robots.txt，自动挂载默认放行 AI 爬虫并声明 llms.txt 的 robots.txt */
-        if (this.robotsTxt == null && this.robotsSource == null) {
-            this.UseRobotsTxt(RobotsTxt.Create());
-        }
+    // llms.txt 挂载点：委托给 SeoRouter。
+    public void MountLlms() {
+        SeoRouter.MountLlms(this);
     }
 
     // 启用搜索引擎与 AI 爬虫协议规则 robots.txt。
-    WebApp UseRobotsTxt(RobotsTxt robots) {
+    public WebApp UseRobotsTxt(RobotsTxt robots) {
         this.robotsTxt = robots;
         if (robots != null) { this.MountRobots(); }
         return this;
     }
 
     // 应用层接管 robots.txt 内容：委托每次请求求值，返回 null 时回退静态对象。
-    WebApp UseRobotsSource(RobotsSource source) {
+    public WebApp UseRobotsSource(RobotsSource source) {
         this.robotsSource = source;
         if (source != null) { this.MountRobots(); }
         return this;
     }
 
-    // robots.txt 挂载点：静态对象与内容源共用，同一路径只挂一次。
-    void MountRobots() {
-        if (this.robotsMounted) { return; }
-        this.robotsMounted = true;
-        this.router.Get("/robots.txt", WebApp.HandleRobotsTxt);
+    // robots.txt 挂载点：委托给 SeoRouter。
+    public void MountRobots() {
+        SeoRouter.MountRobots(this);
     }
 
     // 启用 XML 站点地图 sitemap.xml。
-    WebApp UseSitemap(Sitemap sm) {
+    public WebApp UseSitemap(Sitemap sm) {
         this.sitemap = sm;
         if (sm != null) { this.MountSitemap(); }
         return this;
     }
 
     // 应用层接管 sitemap.xml 内容：委托每次请求求值，返回 null 时回退静态对象。
-    WebApp UseSitemapSource(SitemapSource source) {
+    public WebApp UseSitemapSource(SitemapSource source) {
         this.sitemapSource = source;
         if (source != null) { this.MountSitemap(); }
         return this;
     }
 
-    // sitemap.xml 挂载点：静态对象与内容源共用，同一路径只挂一次。
-    void MountSitemap() {
-        if (this.sitemapMounted) { return; }
-        this.sitemapMounted = true;
-        this.router.Get("/sitemap.xml", WebApp.HandleSitemapXml);
+    // sitemap.xml 挂载点：委托给 SeoRouter。
+    public void MountSitemap() {
+        SeoRouter.MountSitemap(this);
     }
 
-    LlmsTxt Llms() { return this.llmsTxt; }
-    RobotsTxt Robots() { return this.robotsTxt; }
-    Sitemap SiteMap() { return this.sitemap; }
+    public LlmsTxt Llms() { return this.llmsTxt; }
+    public RobotsTxt Robots() { return this.robotsTxt; }
+    public Sitemap SiteMap() { return this.sitemap; }
     // 是否已启用 llms.txt（静态对象或应用层内容源任一）。
-    bool HasLlms() { return this.llmsTxt != null || this.llmsSource != null; }
+    public bool HasLlms() { return this.llmsTxt != null || this.llmsSource != null; }
     // 是否已启用 robots.txt（静态对象或应用层内容源任一）。
-    bool HasRobots() { return this.robotsTxt != null || this.robotsSource != null; }
+    public bool HasRobots() { return this.robotsTxt != null || this.robotsSource != null; }
     // 是否已启用 sitemap.xml（静态对象或应用层内容源任一）。
-    bool HasSitemap() { return this.sitemap != null || this.sitemapSource != null; }
+    public bool HasSitemap() { return this.sitemap != null || this.sitemapSource != null; }
 
-    // llms.txt 处理器：内容源优先，其次静态对象，都没有则给出未配置提示。
-    static async void HandleLlmsTxt(HttpContext ctx) {
-        WebApp app = WebHost.Current();
-        if (app != null) {
-            LlmsSource source = app.llmsSource;
-            if (source != null) {
-                LlmsTxt content = await source();
-                if (content != null) {
-                    ctx.Markdown(content.ToMarkdown());
-                    return;
-                }
-            }
-            if (app.llmsTxt != null) {
-                ctx.Markdown(app.llmsTxt.ToMarkdown());
-                return;
-            }
-        }
-        ctx.Text("# llms.txt not configured\n");
+    // llms.txt 处理器：委托给 SeoRouter。
+    public static async void HandleLlmsTxt(HttpContext ctx) {
+        SeoRouter.HandleLlmsTxt(ctx);
     }
 
-    // llms-full.txt 处理器：与 llms.txt 同源，长文本聚合版。
-    static async void HandleLlmsFullTxt(HttpContext ctx) {
-        WebApp app = WebHost.Current();
-        if (app != null) {
-            LlmsSource source = app.llmsSource;
-            if (source != null) {
-                LlmsTxt content = await source();
-                if (content != null) {
-                    ctx.Markdown(content.ToFullMarkdown());
-                    return;
-                }
-            }
-            if (app.llmsTxt != null) {
-                ctx.Markdown(app.llmsTxt.ToFullMarkdown());
-                return;
-            }
-        }
-        ctx.Text("# llms-full.txt not configured\n");
+    // llms-full.txt 处理器：委托给 SeoRouter。
+    public static async void HandleLlmsFullTxt(HttpContext ctx) {
+        SeoRouter.HandleLlmsFullTxt(ctx);
     }
 
-    // robots.txt 处理器：内容源优先，其次静态对象，都没有则全站放行。
-    static async void HandleRobotsTxt(HttpContext ctx) {
-        WebApp app = WebHost.Current();
-        if (app != null) {
-            RobotsSource source = app.robotsSource;
-            if (source != null) {
-                RobotsTxt content = await source();
-                if (content != null) {
-                    ctx.Text(content.ToText());
-                    return;
-                }
-            }
-            if (app.robotsTxt != null) {
-                ctx.Text(app.robotsTxt.ToText());
-                return;
-            }
-        }
-        ctx.Text("User-agent: *\nAllow: /\n");
+    // robots.txt 处理器：委托给 SeoRouter。
+    public static async void HandleRobotsTxt(HttpContext ctx) {
+        SeoRouter.HandleRobotsTxt(ctx);
     }
 
-    // sitemap.xml 处理器：内容源优先，其次静态对象，都没有则给空站点地图。
-    static async void HandleSitemapXml(HttpContext ctx) {
-        WebApp app = WebHost.Current();
-        if (app != null) {
-            SitemapSource source = app.sitemapSource;
-            if (source != null) {
-                Sitemap content = await source();
-                if (content != null) {
-                    ctx.Xml(content.ToXml());
-                    return;
-                }
-            }
-            if (app.sitemap != null) {
-                ctx.Xml(app.sitemap.ToXml());
-                return;
-            }
-        }
-        ctx.Xml("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"></urlset>\n");
+    // sitemap.xml 处理器：委托给 SeoRouter。
+    public static async void HandleSitemapXml(HttpContext ctx) {
+        SeoRouter.HandleSitemapXml(ctx);
     }
 
     // 渲染模板并套最近的布局；未加载视图时返回空串。
@@ -387,16 +302,25 @@ public class WebApp : IDisposable {
 
     // ---- 静态文件挂载与分发 ----
     public WebApp Mount(string urlPrefix, string dir) {
-        return this.Mount(urlPrefix, dir, 86400);
+        return this.Mount(urlPrefix, dir, HttpLimits.DefaultTtlSeconds);
     }
 
     public WebApp Mount(string urlPrefix, string dir, int maxAge) {
         this.staticMounts.Add(new StaticMount(urlPrefix, dir, maxAge));
         if (!this.staticHookInstalled) {
             this.staticHookInstalled = true;
-            this.Before(this.ServeStatic);
+            this.Before(WebApp.StaticHook);
         }
         return this;
+    }
+
+    private static bool StaticHook(HttpContext ctx) {
+        if (ctx == null) { return true; }
+        WebApp app = ctx.App();
+        if (app != null) {
+            return app.ServeStatic(ctx);
+        }
+        return true;
     }
 
     public List<StaticMount> StaticMounts() {
@@ -459,7 +383,7 @@ public class WebApp : IDisposable {
         return s;
     }
 
-    ServerBanner Banner(int procs) {
+    public ServerBanner Banner(int procs) {
         string mode = "single process";
         if (procs > 1) {
             mode = "master + " + Convert.ToString(procs) + " workers";
@@ -508,20 +432,32 @@ public class WebApp : IDisposable {
 
     public void Dispose() {
         this.Stop();
+        if (this.hooks != null) {
+            this.hooks.Clear();
+        }
+        if (this.staticMounts != null) {
+            this.staticMounts.Clear();
+        }
+        if (this.csrfSkips != null) {
+            this.csrfSkips.Clear();
+        }
+        if (this.wsOrigins != null) {
+            this.wsOrigins.Clear();
+        }
     }
 
     public static void SetActive(WebApp app) {
         active = app;
     }
 
-    static async void ServeSock(nint clientSock) {
+    private static async void ServeSock(nint clientSock) {
         WebApp app = active;
         if (app == null) { Socket.Close(clientSock); return; }
         if (await app.RefuseOverCapacity(clientSock)) { return; }
         await app.HandleConnection(clientSock);
     }
 
-    async bool RefuseOverCapacity(nint clientSock) {
+    private async bool RefuseOverCapacity(nint clientSock) {
         long live = this.activeConnections.Increment();
         if (this.maxConnections <= 0 || live <= (long)this.maxConnections) {
             return false;
@@ -541,7 +477,7 @@ public class WebApp : IDisposable {
     // slowloris）；SSE/WS 劫持的连接由 handler 接管，循环随即结束。
     // 清理走 finally：即便管线里有未被 catch 的异常展开到这一层，
     // deadline 槽位、framer 缓冲、套接字与连接计数也必须归位。
-    async void HandleConnection(nint clientSock) {
+    public async void HandleConnection(nint clientSock) {
         try {
             await this.HandleConnectionInner(clientSock);
         } finally {
@@ -553,7 +489,7 @@ public class WebApp : IDisposable {
     // 在这里创建，正常结束路径统一清理；套接字本身的 Close 由
     // HandleConnection 的 finally 负责（ShutdownBoth 无法替代——
     // 劫持连接之后的收尾也要真正释放描述符）。
-    async void HandleConnectionInner(nint clientSock) {
+    private async void HandleConnectionInner(nint clientSock) {
         Socket.SetNoDelay(clientSock);
         TcpClient client = TcpClient.FromSocket(clientSock);
         HttpFramer framer = HttpFramer.Create(clientSock);
@@ -588,10 +524,10 @@ public class WebApp : IDisposable {
             keepAlive = request.keepAlive;
             HttpContext ctx = new HttpContext(request, remoteIp);
             ctx.SetApp(this);
-            ctx.__Attach(client);
-            ctx.__SetFramer(framer);
+            ctx.Attach(client);
+            ctx.SetFramer(framer);
             // 请求到达与响应处理的超时时限（毫秒）。
-            ctx.__SetDeadlineSlot(watch, this.requestTimeoutMs);
+            ctx.SetDeadlineSlot(watch, this.requestTimeoutMs);
             Route route = this.router.Match(ctx);
 
             // 限流在正文之前：原顺序先把正文缓冲齐（≤maxBodyBytes）并解析
@@ -672,49 +608,13 @@ public class WebApp : IDisposable {
     }
 
     // failure.
-    async string StreamBodyToFile(nint sock, HttpFramer framer,
+    private async string StreamBodyToFile(nint sock, HttpFramer framer,
                                   HttpRequest request) {
-        if (!Directory.Exists(this.uploadDir)) {
-            Directory.CreateDirectoryRecursive(this.uploadDir);
-        }
-        long seq = this.uploadSeq.Increment();
-        string tmp = this.uploadDir + "/upload_" + Convert.ToString(WebApp.NowSeconds())
-            + "_" + Convert.ToString(seq) + ".bin";
-        nint fp = fopen(tmp, "wb");
-        if (fp == 0) { return ""; }
-        int total = request.contentLength;
-        int have = 0;
-        int headerEnd = request.bodyStart;
-        int bodyInBuf = framer.Pending() - headerEnd;
-        if (bodyInBuf > total) { bodyInBuf = total; }
-        if (bodyInBuf > 0) {
-            string firstChunk = framer.Slice(headerEnd, bodyInBuf);
-            int _w0 = (int)fwrite(firstChunk, 1, bodyInBuf, fp);
-            if (_w0 < bodyInBuf) { int _c0 = fclose(fp); return ""; }
-            have = bodyInBuf;
-        }
-        framer.Consume(headerEnd + have);
-        byte[] buf = WebApp.MakeBuffer(65536);
-        while (have < total) {
-            int n = await Socket.RecvIntoAsync(sock, buf, 65535);
-            if (n <= 0) { int _c1 = fclose(fp); return ""; }
-            if (have + n > total) { n = total - have; }
-            // fwrite 短写（磁盘满/配额）必须当失败处理：不校验的话
-            // have 照常推进，落盘文件被静默截断，调用方拿到一个
-            // 看似成功的残缺文件。
-            int _w = (int)fwrite(buf, 1, n, fp);
-            if (_w < n) { int _c3 = fclose(fp); return ""; }
-            have = have + n;
-        }
-        int _c2 = fclose(fp);
-        return tmp;
+        return await HttpUploadStreamer.StreamToFile(sock, framer, request,
+            this.uploadDir, this.uploadSeq);
     }
 
-    private static byte[] MakeBuffer(int size) {
-        return new byte[size + 1];
-    }
-
-    async void Dispatch(HttpContext ctx, Route route, bool keepAlive) {
+    private async void Dispatch(HttpContext ctx, Route route, bool keepAlive) {
         long startUs = ServerMetrics.MonoMicros();
         long _n = this.totalRequests.Increment();
         this.metrics.Entered();
@@ -744,7 +644,7 @@ public class WebApp : IDisposable {
     // 回落 IP，再回落 _unknown_），路由限流按 rateScope 拼 uid/ip。返回
     // true 表示超限，应答由调用方写出并断连。ctx.uid 顺带在这里解析好
     // （AuthUser 只看请求头），DispatchInner 复用、不再重付会话查询。
-    async bool LimitExceeded(HttpContext ctx, Route route) {
+    private async bool LimitExceeded(HttpContext ctx, Route route) {
         string uid = await this.AuthUser(ctx);
         ctx.uid = uid;
         string principal = uid;
@@ -770,7 +670,7 @@ public class WebApp : IDisposable {
     // 花服务器的带宽与解析 CPU），uid 亦由门处解析好放在 ctx.uid。
     // ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
     // 时仍未写应答的也兜底 500。
-    async void DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
+    private async void DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
 
         string uid = ctx.uid;
         string principal = uid;
@@ -884,7 +784,7 @@ public class WebApp : IDisposable {
         ctx.BuildResponseDirect(keepAlive);
     }
 
-    bool WantsPage(HttpContext ctx) {
+    private bool WantsPage(HttpContext ctx) {
         if (this.loginPath.Length == 0) { return false; }
         if (ctx.method != "GET") { return false; }
         if (ctx.Header("HX-Request").Length > 0) { return false; }
@@ -893,14 +793,14 @@ public class WebApp : IDisposable {
         return !ctx.Header("Accept").Contains("application/json");
     }
 
-    async bool Allow(string uid, string action) {
+    public async bool Allow(string uid, string action) {
         if (this.permissionResolver != null) {
             return await this.permissionResolver(uid, action);
         }
         return uid.Length > 0;
     }
 
-    async string AuthUser(HttpContext ctx) {
+    private async string AuthUser(HttpContext ctx) {
         string auth = ctx.Header("Authorization");
         if (auth != null && auth.StartsWith("Bearer ")) {
             string token = auth.Substring(7);
@@ -915,13 +815,13 @@ public class WebApp : IDisposable {
         return "";
     }
 
-    static string err404 = "{\"code\":\"404\",\"msg\":\"not found\"}";
-    static string err405 = "{\"code\":\"405\",\"msg\":\"method not allowed\"}";
-    static string err401 = "{\"code\":\"401\",\"msg\":\"authentication required\"}";
-    static string err403 = "{\"code\":\"403\",\"msg\":\"insufficient permission\"}";
-    static string err429 = "{\"code\":\"429\",\"msg\":\"request already in progress\"}";
-    static string err500 = "{\"code\":\"500\",\"msg\":\"internal server error\"}";
-    static string err500noResp = "{\"code\":\"500\",\"msg\":\"handler produced no response\"}";
+    private static string err404 = "{\"code\":\"404\",\"msg\":\"not found\"}";
+    private static string err405 = "{\"code\":\"405\",\"msg\":\"method not allowed\"}";
+    private static string err401 = "{\"code\":\"401\",\"msg\":\"authentication required\"}";
+    private static string err403 = "{\"code\":\"403\",\"msg\":\"insufficient permission\"}";
+    private static string err429 = "{\"code\":\"429\",\"msg\":\"request already in progress\"}";
+    private static string err500 = "{\"code\":\"500\",\"msg\":\"internal server error\"}";
+    private static string err500noResp = "{\"code\":\"500\",\"msg\":\"handler produced no response\"}";
 
     private static string ErrorJson(string code, string msg) {
         if (code == "404" && msg == "not found") { return WebApp.err404; }
@@ -936,7 +836,7 @@ public class WebApp : IDisposable {
         return "{\"code\":\"" + code + "\",\"msg\":\"" + msg + "\"}";
     }
 
-    string StatusJson() {
+    public string StatusJson() {
         WebAppStatusDoc o = new WebAppStatusDoc();
         o.total_requests = (int)this.totalRequests.Load();
         o.active_connections = (int)this.activeConnections.Load();
@@ -944,12 +844,12 @@ public class WebApp : IDisposable {
         return Json.Serialize<WebAppStatusDoc>(o);
     }
 
-    string MetricsJson() {
+    public string MetricsJson() {
         return this.metrics.SnapshotJson();
     }
 
     // start or stop.
-    string MetricsSeriesJson(int seconds) {
+    public string MetricsSeriesJson(int seconds) {
         return this.metrics.SeriesJson(seconds);
     }
 

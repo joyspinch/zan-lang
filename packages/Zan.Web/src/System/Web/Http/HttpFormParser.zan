@@ -1,0 +1,182 @@
+using System;
+using System.Net.Http;
+using System.Text;
+
+namespace System.Web;
+
+// HTTP 表单与 Multipart 协议解析器：
+// 负责 application/x-www-form-urlencoded 与 multipart/form-data 的键值对解析与文本字段提取。
+public class HttpFormParser {
+
+    // 解析 application/x-www-form-urlencoded 格式的键值对。
+    public static void ParseUrlEncoded(string body, StrMap form) {
+        if (body == null || body.Length == 0 || form == null) { return; }
+        HttpFormParser.ParsePairs(body, form);
+    }
+
+    // 解析请求体中的表单内容（支持 urlencoded 与 multipart/form-data）。
+    public static void ParseFormBody(HttpRequest req, HttpContext ctx) {
+        if (req == null || ctx == null) { return; }
+        if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
+            if (ctx.form == null) {
+                if (req.body.Length > 0) {
+                    ctx.form = new StrMap();
+                    HttpFormParser.ParsePairs(req.body, ctx.form);
+                }
+            } else {
+                ctx.form.Clear();
+                HttpFormParser.ParsePairs(req.body, ctx.form);
+            }
+        }
+    }
+
+    // multipart/form-data 的文本字段进 form 表。
+    public static void ParseMultipartFields(HttpRequest req, HttpContext ctx) {
+        if (req == null || ctx == null) { return; }
+        if (ctx.form == null) {
+            ctx.form = new StrMap();
+        } else {
+            ctx.form.Clear();
+        }
+        HttpFormParser.ParseMultipartInto(req.contentType, req.body, ctx.form);
+    }
+
+    // 将 multipart 文本字段解析进指定 StrMap。
+    public static void ParseMultipartInto(string contentType, string body, StrMap form) {
+        if (contentType == null || body == null || form == null) { return; }
+        int bIdx = HttpFormParser.FindNoCaseFrom(contentType, "boundary=", 0);
+        if (bIdx < 0) { return; }
+        int bs = bIdx + 9;
+        int be = bs;
+        while (be < contentType.Length && (contentType[be] & 255) != 59) { be = be + 1; }
+        string raw = contentType.Substring(bs, be - bs);
+        // boundary 参数可带引号。
+        if (raw.Length >= 2 && (raw[0] & 255) == 34
+            && (raw[raw.Length - 1] & 255) == 34) {
+            raw = raw.Substring(1, raw.Length - 2);
+        }
+        if (raw.Length == 0) { return; }
+        // RFC 2046 §5.1.1：boundary 只允许 bchars（字母数字与 '()+_,-./:=?）且上限 70 字符。
+        if (raw.Length > 70) { return; }
+        int bi = 0;
+        while (bi < raw.Length) {
+            int bc = raw[bi] & 255;
+            bool legal = (bc >= 48 && bc <= 57)  // 0-9
+                || (bc >= 65 && bc <= 90)  // A-Z
+                || (bc >= 97 && bc <= 122)  // a-z
+                || bc == 39 || bc == 40 || bc == 41  // ' ( )
+                || (bc >= 43 && bc <= 47)  // + , - . /
+                || bc == 58 || bc == 61 || bc == 63  // : = ?
+                || bc == 95;  // _
+            if (!legal) { return; }
+            bi = bi + 1;
+        }
+        string delim = "--" + raw;
+        int n = body.Length;
+        int dlen = delim.Length;
+        int pos = HttpFormParser.FindFrom(body, delim, 0);
+        while (pos >= 0) {
+            int after = pos + dlen;
+            if (after + 1 < n && (body[after] & 255) == 45
+                && (body[after + 1] & 255) == 45) {
+                break;  // "--boundary--"：结束分隔
+            }
+            if (after + 1 < n && (body[after] & 255) == 13
+                && (body[after + 1] & 255) == 10) {
+                after = after + 2;
+            } else if (after < n && (body[after] & 255) == 10) {
+                after = after + 1;
+            }
+            int hb = HttpFormParser.FindFrom(body, "\r\n\r\n", after);
+            if (hb < 0 || hb + 4 > n) { break; }
+            string head = body.Substring(after, hb + 4 - after);
+            int vStart = hb + 4;
+            string name = HttpFormParser.DispositionName(head);
+            int next = HttpFormParser.FindFrom(body, delim, vStart);
+            if (name.Length > 0 && next > vStart) {
+                int vEnd = next;
+                if (vEnd > vStart && (body[vEnd - 1] & 255) == 10) { vEnd = vEnd - 1; }
+                if (vEnd > vStart && (body[vEnd - 1] & 255) == 13) { vEnd = vEnd - 1; }
+                form.Set(name, body.Substring(vStart, vEnd - vStart));
+            }
+            if (next < 0) { break; }
+            pos = next;
+        }
+    }
+
+    public static string DispositionName(string head) {
+        if (HttpFormParser.FindNoCaseFrom(head, "filename=", 0) >= 0) { return ""; }
+        int k = HttpFormParser.FindNoCaseFrom(head, "name=", 0);
+        if (k < 0) { return ""; }
+        int qs = k + 5;
+        if (qs < head.Length && (head[qs] & 255) == 34) {
+            int qe = HttpFormParser.FindFrom(head, "\"", qs + 1);
+            if (qe < 0) { return ""; }
+            return head.Substring(qs + 1, qe - qs - 1);
+        }
+        int e = qs;
+        while (e < head.Length) {
+            int c = head[e] & 255;
+            if (c == 59 || c == 13 || c == 10) { break; }  // ';' CR LF
+            e = e + 1;
+        }
+        return head.Substring(qs, e - qs);
+    }
+
+    public static int FindFrom(string hay, string needle, int from) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = from; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    public static int FindNoCaseFrom(string hay, string needle, int from) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = from; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m) {
+                int a = hay[i + k] & 255;
+                int b = needle[k] & 255;
+                if (a >= 65 && a <= 90) { a = a + 32; }
+                if (b >= 65 && b <= 90) { b = b + 32; }
+                if (a != b) { break; }
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    public static void ParsePairs(string s, StrMap into) {
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            int eq = -1;
+            int e = i;
+            while (e < n) {
+                int c = s[e] & 255;
+                if (c == 38) { break; }  // '&'
+                if (eq < 0 && c == 61) { eq = e; }  // '='
+                e = e + 1;
+            }
+            if (eq > i) {
+                string k = Encoding.UrlDecode(s.Substring(i, eq - i));
+                string v = Encoding.UrlDecode(s.Substring(eq + 1, e - eq - 1));
+                if (k.Length > 2 && k.Substring(k.Length - 2, 2) == "[]") {
+                    k = k.Substring(0, k.Length - 2);
+                    string prev = into.GetOr(k, "");
+                    if (prev.Length > 0) { v = prev + "," + v; }
+                }
+                into.Set(k, v);
+            }
+            i = e + 1;
+        }
+    }
+}

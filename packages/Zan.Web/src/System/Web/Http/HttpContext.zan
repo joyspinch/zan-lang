@@ -30,10 +30,10 @@ public class HttpContext : IDisposable {
     // JSON 正文的惰性缓存：JsonBody() 第一次调用时解析一次，之后
     // 直接返回缓存（同一个请求体往往被多个读取方消费）。
     public JsonValue jsonBody;
-    public bool jsonParsed;
+    private bool jsonParsed;
     // 高性能平面 Tape JSON 文档缓存（零分配解析，JsonDoc() 调用时解析一次）。
     public JsonDoc jsonDoc;
-    public bool jsonDocParsed;
+    private bool jsonDocParsed;
 
     public int status;
     public string statusText;
@@ -90,7 +90,7 @@ public class HttpContext : IDisposable {
         this.jsonDocParsed = false;
         this.status = 200;
         this.statusText = "OK";
-        this.contentType = "text/html; charset=utf-8";
+        this.contentType = HttpLimits.MimeHtmlUtf8;
         this.body = "";
         this.bodyBytes = null;
         this.bodyBytesLen = 0;
@@ -102,11 +102,11 @@ public class HttpContext : IDisposable {
         this.frames = 0;
         this.framesBytes = 0;
         this.deadlineSlot = null;
-        this.streamIdleMs = 30000;
+        this.streamIdleMs = HttpLimits.DefaultTimeoutMs;
         this.framer = null;
         if (req.queryString.Length > 0) {
             this.query = new StrMap();
-            HttpContext.ParsePairs(req.queryString, this.query);
+            HttpFormParser.ParsePairs(req.queryString, this.query);
         }
         // 表单在这里解析一次，服务的是直接构造 HttpContext 的调用方
         // （此时 request.body 已是完整正文）。WebApp 的连接循环里正文
@@ -117,10 +117,10 @@ public class HttpContext : IDisposable {
             if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
                 if (req.body.Length > 0) {
                     this.form = new StrMap();
-                    HttpContext.ParsePairs(req.body, this.form);
+                    HttpFormParser.ParsePairs(req.body, this.form);
                 }
             } else if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
-                HttpContext.ParseMultipartFields(req, this);
+                HttpFormParser.ParseMultipartFields(req, this);
             }
         }
     }
@@ -152,176 +152,35 @@ public class HttpContext : IDisposable {
 
     // 请求体缓冲完成后重新解析表单键值对。
     public static void ParseFormBody(HttpRequest req, HttpContext ctx) {
-        if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
-            if (ctx.form == null) {
-                if (req.body.Length > 0) {
-                    ctx.form = new StrMap();
-                    HttpContext.ParsePairs(req.body, ctx.form);
-                }
-            } else {
-                ctx.form.Clear();
-                HttpContext.ParsePairs(req.body, ctx.form);
-            }
-        }
+        HttpFormParser.ParseFormBody(req, ctx);
     }
 
-    // multipart/form-data 的文本字段进 form 表。浏览器在同一张
-    // 表单里混排文本输入与文件输入，此前只有 urlencoded 的字段被解析，
-    // multipart 请求里的文本字段在服务端不可见。文件部件不在这里展开：
-    // 流式上传路径的正文已整体落盘（WebApp.StreamBodyToFile），内存路径
-    // 的文件部件由处理器按需取用——只有带 filename= 的部件被跳过，
-    // 其余部件的值原样进入 form（multipart 值不做百分号解码）。
-    // 与 ParseFormBody 一样先 Clear：构造函数可能已按首个 TCP 分段的
-    // 部分正文解析过一次，正文缓冲齐后的二次解析必须整体重放，
-    // 不能把不完整的字段值留在表里。
+    // multipart/form-data 的文本字段进 form 表。
     public static void ParseMultipartFields(HttpRequest req, HttpContext ctx) {
-        string ctype = req.contentType;
-        int bIdx = HttpContext.FindNoCaseFrom(ctype, "boundary=", 0);
-        if (bIdx < 0) { return; }
-        if (ctx.form == null) {
-            ctx.form = new StrMap();
-        } else {
-            ctx.form.Clear();
-        }
-        int bs = bIdx + 9;
-        int be = bs;
-        while (be < ctype.Length && (ctype[be] & 255) != 59) { be = be + 1; }
-        string raw = ctype.Substring(bs, be - bs);
-        // boundary 参数可带引号。
-        if (raw.Length >= 2 && (raw[0] & 255) == 34
-            && (raw[raw.Length - 1] & 255) == 34) {
-            raw = raw.Substring(1, raw.Length - 2);
-        }
-        if (raw.Length == 0) { return; }
-        // RFC 2046 §5.1.1：boundary 只允许 bchars（字母数字与 '()+_,-./:=?）
-        // 且上限 70 字符。不设限的 boundary 直接成为攻击面：超长串交给
-        // FindFrom 的朴素扫描就是 O(正文×boundary) 的 CPU 放大器；控制
-        // 字符则让分隔符跨行匹配、部件边界与帧语义脱钩。不合法与缺失
-        // 同一出口：字段表为空，请求不炸，处理器拿到空 form。
-        if (raw.Length > 70) { return; }
-        int bi = 0;
-        while (bi < raw.Length) {
-            int bc = raw[bi] & 255;
-            bool legal = (bc >= 48 && bc <= 57)  // 0-9
-                || (bc >= 65 && bc <= 90)  // A-Z
-                || (bc >= 97 && bc <= 122)  // a-z
-                || bc == 39 || bc == 40 || bc == 41  // ' ( )
-                || (bc >= 43 && bc <= 47)  // + , - . /
-                || bc == 58 || bc == 61 || bc == 63  // : = ?
-                || bc == 95;  // _
-            if (!legal) { return; }
-            bi = bi + 1;
-        }
-        string delim = "--" + raw;
-        string body = req.body;
-        int n = body.Length;
-        int dlen = delim.Length;
-        int pos = HttpContext.FindFrom(body, delim, 0);
-        while (pos >= 0) {
-            int after = pos + dlen;
-            if (after + 1 < n && (body[after] & 255) == 45
-                && (body[after + 1] & 255) == 45) {
-                break;  // "--boundary--"：结束分隔
-            }
-            if (after + 1 < n && (body[after] & 255) == 13
-                && (body[after + 1] & 255) == 10) {
-                after = after + 2;
-            } else if (after < n && (body[after] & 255) == 10) {
-                after = after + 1;
-            }
-            int hb = HttpContext.FindFrom(body, "\r\n\r\n", after);
-            if (hb < 0 || hb + 4 > n) { break; }
-            string head = body.Substring(after, hb + 4 - after);
-            int vStart = hb + 4;
-            string name = HttpContext.DispositionName(head);
-            int next = HttpContext.FindFrom(body, delim, vStart);
-            if (name.Length > 0 && next > vStart) {
-                int vEnd = next;
-                // 值尾的 CRLF 属于分隔符前缀，不属于值。
-                if (vEnd > vStart && (body[vEnd - 1] & 255) == 10) { vEnd = vEnd - 1; }
-                if (vEnd > vStart && (body[vEnd - 1] & 255) == 13) { vEnd = vEnd - 1; }
-                ctx.form.Set(name, body.Substring(vStart, vEnd - vStart));
-            }
-            if (next < 0) { break; }
-            pos = next;
-        }
-    }
-
-    // 部件 Content-Disposition 里的 name 值；带 filename= 的
-    // 部件是文件，返回空串让调用方跳过（文件字节不能混进 form 表）。
-    private static string DispositionName(string head) {
-        if (HttpContext.FindNoCaseFrom(head, "filename=", 0) >= 0) { return ""; }
-        int k = HttpContext.FindNoCaseFrom(head, "name=", 0);
-        if (k < 0) { return ""; }
-        int qs = k + 5;
-        if (qs < head.Length && (head[qs] & 255) == 34) {
-            int qe = HttpContext.FindFrom(head, "\"", qs + 1);
-            if (qe < 0) { return ""; }
-            return head.Substring(qs + 1, qe - qs - 1);
-        }
-        int e = qs;
-        while (e < head.Length) {
-            int c = head[e] & 255;
-            if (c == 59 || c == 13 || c == 10) { break; }  // ';' CR LF
-            e = e + 1;
-        }
-        return head.Substring(qs, e - qs);
-    }
-
-    // 从 from 起查找子串首次出现，返回下标；无则 -1。
-    private static int FindFrom(string hay, string needle, int from) {
-        int n = hay.Length;
-        int m = needle.Length;
-        for (int i = from; i + m <= n; i = i + 1) {
-            int k = 0;
-            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
-                k = k + 1;
-            }
-            if (k == m) { return i; }
-        }
-        return -1;
-    }
-
-    // 同 FindFrom，但 ASCII 大小写不敏感。
-    private static int FindNoCaseFrom(string hay, string needle, int from) {
-        int n = hay.Length;
-        int m = needle.Length;
-        for (int i = from; i + m <= n; i = i + 1) {
-            int k = 0;
-            while (k < m) {
-                int a = hay[i + k] & 255;
-                int b = needle[k] & 255;
-                if (a >= 65 && a <= 90) { a = a + 32; }
-                if (b >= 65 && b <= 90) { b = b + 32; }
-                if (a != b) { break; }
-                k = k + 1;
-            }
-            if (k == m) { return i; }
-        }
-        return -1;
+        HttpFormParser.ParseMultipartFields(req, ctx);
     }
 
 
     // 路由参数（{param} 段匹配到的值）。
-    string Param(string name) {
+    public string Param(string name) {
         if (this.routeParams == null) { return ""; }
         return this.routeParams.Get(name);
     }
     // query string 参数。
-    string Query(string name) {
+    public string Query(string name) {
         if (this.query == null) { return ""; }
         return this.query.Get(name);
     }
     // 表单字段（urlencoded 或 multipart 的文本字段）。
-    string Form(string name) {
+    public string Form(string name) {
         if (this.form == null) { return ""; }
         return this.form.Get(name);
     }
     // 原始请求正文。
-    string Body() { return this.request.body; }
+    public string Body() { return this.request.body; }
 
     // 解析并缓存请求体 JSON 对象，空体返回 null。
-    JsonValue JsonBody() {
+    public JsonValue JsonBody() {
         if (!this.jsonParsed) {
             this.jsonParsed = true;
             this.jsonBody = null;
@@ -342,7 +201,7 @@ public class HttpContext : IDisposable {
             if (b.Length > 0) {
                 try {
                     this.jsonDoc = System.Json.JsonDoc.Parse(b);
-                } catch (Exception ex) {
+                } catch (Exception _ex) {
                     this.jsonDoc = null;
                 }
             }
@@ -381,25 +240,25 @@ public class HttpContext : IDisposable {
 
     // 按 route → query → form 顺序取原始字符串（未过滤）；
     // 三处都缺时返回空串。
-    string InputString(string name) {
+    public string InputString(string name) {
         return this.InRaw(name);
     }
 
     // 按合并顺序取整型；缺失、非整数或溢出时返回
     // `dflt`。"42"、"-7"、"+7" 合法；"12abc"、"2.5"、"" 不合法。
-    int InputInt(string name, int dflt) {
+    public int InputInt(string name, int dflt) {
         return this.InInt(name, dflt);
     }
 
     // 按合并顺序取 64 位整型；规则同 InputInt。
-    long InputLong(string name, long dflt) {
+    public long InputLong(string name, long dflt) {
         return this.InLong(name, dflt);
     }
 
     // 按合并顺序取布尔："1"/"true"/"on"/"yes"
     // （大小写不敏感）为真，"0"/"false"/"off"/"no" 为假，
     // 其余返回 `dflt`。
-    bool InputBool(string name, bool dflt) {
+    public bool InputBool(string name, bool dflt) {
         return this.InBool(name, dflt);
     }
 
@@ -448,9 +307,9 @@ public class HttpContext : IDisposable {
         return neg ? 0 - acc : acc;
     }
     // 按名取请求头；不存在返回 ""。
-    string Header(string name) { return this.request.GetHeader(name); }
+    public string Header(string name) { return this.request.GetHeader(name); }
 
-    string Cookie(string name) {
+    public string Cookie(string name) {
         string all = this.request.GetHeader("Cookie");
         int allLen = all.Length;
         if (allLen == 0) { return ""; }
@@ -485,7 +344,7 @@ public class HttpContext : IDisposable {
     }
 
     // X-Requested-With 恰为 XMLHttpRequest（仅认这两种大小写写法）时为真。
-    bool IsAjax() {
+    public bool IsAjax() {
         string x = this.request.GetHeader("X-Requested-With");
         return x == "XMLHttpRequest" || x == "xmlhttprequest";
     }
@@ -493,7 +352,7 @@ public class HttpContext : IDisposable {
     // 统一过滤输入：优先使用安全过滤方法读取参数。
 
     // 获取原始未过滤参数值 (优先级：路由参数 -> Query -> Form)。
-    string InRaw(string name) {
+    public string InRaw(string name) {
         if (this.routeParams != null) {
             string v = this.routeParams.Get(name);
             if (v.Length > 0) { return v; }
@@ -509,27 +368,27 @@ public class HttpContext : IDisposable {
     }
 
     // 获取安全过滤后的字符串参数值（自动裁剪首尾空白并剔除控制字符）。
-    string In(string name) { return Filter.Clean(this.InRaw(name)); }
+    public string In(string name) { return Filter.Clean(this.InRaw(name)); }
 
-    string InText(string name) { return Filter.Html(this.InRaw(name)); }
+    public string InText(string name) { return Filter.Html(this.InRaw(name)); }
 
     // 获取整数参数值，缺失或格式无效时回退默认值。
-    int InInt(string name, int def) {
+    public int InInt(string name, int def) {
         return HttpContext.ParseIntStrict(Filter.Clean(this.InRaw(name)), def);
     }
 
     // 获取 64 位长整数参数值，缺失或格式无效时回退默认值。
-    long InLong(string name, long def) {
+    public long InLong(string name, long def) {
         return HttpContext.ParseLongStrict(Filter.Clean(this.InRaw(name)), def);
     }
 
-    double InDouble(string name, double def) {
+    public double InDouble(string name, double def) {
         return Filter.ToDouble(this.InRaw(name), def);
     }
 
-    bool InBool(string name, bool def) { return Filter.ToBool(this.InRaw(name), def); }
+    public bool InBool(string name, bool def) { return Filter.ToBool(this.InRaw(name), def); }
 
-    bool HasIn(string name) {
+    public bool HasIn(string name) {
         if (this.form != null && this.form.Has(name)) { return true; }
         if (this.query != null && this.query.Has(name)) { return true; }
         if (this.routeParams != null && this.routeParams.Has(name)) { return true; }
@@ -608,14 +467,14 @@ public class HttpContext : IDisposable {
 
     // 以 text/html; charset=utf-8 应答并结束本请求。
     public void Html(string html) {
-        this.contentType = "text/html; charset=utf-8";
+        this.contentType = HttpLimits.MimeHtmlUtf8;
         this.body = html;
         this.ended = true;
     }
 
     // 以 text/plain; charset=utf-8 应答并结束本请求。
     public void Text(string text) {
-        this.contentType = "text/plain; charset=utf-8";
+        this.contentType = HttpLimits.MimePlainUtf8;
         this.body = text;
         this.ended = true;
     }
@@ -629,7 +488,7 @@ public class HttpContext : IDisposable {
 
     // 以 application/xml; charset=utf-8 应答并结束本请求（Sitemap/RSS/XML 输出）。
     public void Xml(string xml) {
-        this.contentType = "application/xml; charset=utf-8";
+        this.contentType = HttpLimits.MimeXmlUtf8;
         this.body = xml;
         this.ended = true;
     }
@@ -667,7 +526,7 @@ public class HttpContext : IDisposable {
 
     // 以 application/json 应答并结束本请求。
     public void Json(string json) {
-        this.contentType = "application/json";
+        this.contentType = HttpLimits.MimeJson;
         this.body = json;
         this.ended = true;
     }
@@ -710,7 +569,7 @@ public class HttpContext : IDisposable {
     }
 
     // 统一 API 响应信封模型：包含 code、msg、data 与 traceId。
-    void Api(string code, string msg, string data) {
+    public void Api(string code, string msg, string data) {
         ApiEnvelope o = new ApiEnvelope();
         o.code = code;
         o.msg = msg;
@@ -721,7 +580,7 @@ public class HttpContext : IDisposable {
     }
 
     // 302 跳转：Location 经 HeaderSafe 清洗，正文为空。
-    void Redirect(string url) {
+    public void Redirect(string url) {
         this.status = 302;
         this.statusText = "Found";
         if (this.headers == null) { this.headers = new List<string>(); }
@@ -734,119 +593,70 @@ public class HttpContext : IDisposable {
     public WebApp App() { return this.app; }
     public void SetApp(WebApp a) { this.app = a; }
 
-    void __Attach(TcpClient client) { this.conn = client; }
+    public void Attach(TcpClient client) { this.conn = client; }
 
-    nint ClientSock() {
+    public nint ClientSock() {
         if (this.conn == null) { return 0; }
         return this.conn.Sock();
     }
 
     // 请求到达与响应处理的超时时限（毫秒）。
-    HttpDeadlineToken deadlineSlot;
+    public HttpDeadlineToken deadlineSlot;
 
     // 请求到达与响应处理的超时时限（毫秒）。
-    int streamIdleMs;
-    HttpFramer framer;
+    public int streamIdleMs;
+    public HttpFramer framer;
 
     // 本连接挂载的期限槽（长流处理器须定期 Touch，见 deadlineSlot 字段说明）。
-    HttpDeadlineToken DeadlineSlot() { return this.deadlineSlot; }
+    public HttpDeadlineToken DeadlineSlot() { return this.deadlineSlot; }
 
     // 由连接循环注入期限槽与空闲窗口（应用的 requestTimeoutMs）。
-    void __SetDeadlineSlot(HttpDeadlineToken slot, int idleMs) {
+    public void SetDeadlineSlot(HttpDeadlineToken slot, int idleMs) {
         this.deadlineSlot = slot;
         this.streamIdleMs = idleMs;
     }
 
     // 由连接循环注入定界缓冲（WS 升级时从中切出管线其后的帧字节）。
-    void __SetFramer(HttpFramer framer) { this.framer = framer; }
+    public void SetFramer(HttpFramer framer) { this.framer = framer; }
 
     // 请求到达与响应处理的超时时限（毫秒）。
-    void TouchDeadline(int timeoutMs) {
+    public void TouchDeadline(int timeoutMs) {
         if (this.deadlineSlot != null) {
             HttpDeadline.Touch(this.deadlineSlot, timeoutMs);
         }
     }
 
-    bool Hijacked() { return this.hijacked; }
+    public bool Hijacked() { return this.hijacked; }
 
-    bool MetricsExcluded() { return this.wasHijacked; }
+    public bool MetricsExcluded() { return this.wasHijacked; }
 
-    long Frames() { return this.frames; }
+    public long Frames() { return this.frames; }
     // 该连接累计推出的帧字节数（流式连接的流量度量）。
-    long FrameBytes() { return this.framesBytes; }
+    public long FrameBytes() { return this.framesBytes; }
 
-    async bool SseOpen() {
-        if (this.conn == null) { return false; }
-        string head = "HTTP/1.1 200 OK\r\n"
-            + "Content-Type: text/event-stream; charset=utf-8\r\n"
-            + "Cache-Control: no-cache, no-transform\r\n"
-            + "Connection: keep-alive\r\n"
-            + "X-Accel-Buffering: no\r\n\r\n";
-        int n = await this.conn.SendAsync(head);
-        if (n <= 0) { return false; }
-        this.hijacked = true;
-        this.wasHijacked = true;
-        this.ended = true;
-        ServerMetrics.Global().StreamOpened();
-        return true;
+    // 开启 SSE 流式响应，委托给 HttpSseStreamer。
+    public async bool SseOpen() {
+        return await HttpSseStreamer.Open(this);
     }
 
-    // 循环直到整段写出。TcpClient.SendAsync 是单次非阻塞
-    // send：TCP 背压下（慢订阅者 + 快上游——繁忙转发的常态）它经常
-    // 短写，此前按 frame.Length 记账等于把没发出去的事件当已送达，
-    // 下一事件从半帧中间开始——浏览器收到的补全是坏 JSON。
-    // false = 对端已断开。
-    async bool SendAllTcp(string data) {
-        int total = data.Length;
-        if (total == 0) { return true; }
-        int sent = 0;
-        while (sent < total) {
-            string rest = data.Substring(sent, total - sent);
-            int n = await this.conn.SendAsync(rest);
-            if (n <= 0) { return false; }
-            sent = sent + n;
-        }
-        return true;
+    // 底层流式长链接 TCP 写出辅助（带短写重试）。
+    public async bool SendAllTcp(string data) {
+        return await HttpSseStreamer.SendAllTcp(this.conn, data);
     }
 
-    async bool SseSend(string name, string data) {
-        if (!this.hijacked || this.conn == null) { return false; }
-        StringBuilder sb = new StringBuilder();
-        if (name.Length > 0) { sb.Append("event: "); sb.Append(name); sb.Append("\n"); }
-        int start = 0;
-        for (int i = 0; i <= data.Length; i = i + 1) {
-            if (i == data.Length || (data[i] & 255) == 10) {
-                sb.Append("data: ");
-                sb.Append(data.Substring(start, i - start));
-                sb.Append("\n");
-                start = i + 1;
-            }
-        }
-        sb.Append("\n");
-        string frame = sb.ToString();
-        bool ok = await this.SendAllTcp(frame);
-        if (!ok) { this.hijacked = false; return false; }
-        // 连接清扫器按 requestTimeoutMs（默认 30s）掐不续期的 socket；SSE
-        // 不像 WS 会话有 FlushOut 续期，漏了这一笔，健康流每 30s 被切一次。
-        this.TouchDeadline(this.streamIdleMs);
-        this.frames = this.frames + 1;
-        this.framesBytes = this.framesBytes + frame.Length;
-        return true;
+    // 发送 SSE 格式事件帧，委托给 HttpSseStreamer。
+    public async bool SseSend(string name, string data) {
+        return await HttpSseStreamer.Send(this, name, data);
     }
 
-    async bool SsePing() {
-        if (!this.hijacked || this.conn == null) { return false; }
-        bool ok = await this.SendAllTcp(": ping\n\n");
-        if (!ok) { this.hijacked = false; return false; }
-        this.TouchDeadline(this.streamIdleMs);
-        this.frames = this.frames + 1;
-        this.framesBytes = this.framesBytes + 8;
-        return true;
+    // 发送 SSE 格式保活心跳帧，委托给 HttpSseStreamer。
+    public async bool SsePing() {
+        return await HttpSseStreamer.Ping(this);
     }
 
     // socket's permission.
 
-    bool IsWebSocketRequest() {
+    public bool IsWebSocketRequest() {
         if (this.conn == null) { return false; }
         string up = this.request.GetHeader("Upgrade");
         int ul = up.Length;
@@ -987,29 +797,7 @@ public class HttpContext : IDisposable {
         return true;
     }
 
-    private static void ParsePairs(string s, StrMap into) {
-        int i = 0;
-        int n = s.Length;
-        while (i < n) {
-            int eq = -1;
-            int e = i;
-            while (e < n) {
-                int c = s[e] & 255;
-                if (c == 38) { break; }  // '&'
-                if (eq < 0 && c == 61) { eq = e; }  // '='
-                e = e + 1;
-            }
-            if (eq > i) {
-                string k = Encoding.UrlDecode(s.Substring(i, eq - i));
-                string v = Encoding.UrlDecode(s.Substring(eq + 1, e - eq - 1));
-                if (k.Length > 2 && k.Substring(k.Length - 2, 2) == "[]") {
-                    k = k.Substring(0, k.Length - 2);
-                    string prev = into.GetOr(k, "");
-                    if (prev.Length > 0) { v = prev + "," + v; }
-                }
-                into.Set(k, v);
-            }
-            i = e + 1;
-        }
+    public static void ParsePairs(string s, StrMap into) {
+        HttpFormParser.ParsePairs(s, into);
     }
 }
