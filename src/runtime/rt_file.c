@@ -1,19 +1,16 @@
+/* rt_file.c: 文件元数据、文件流与文件锁运行时（跨平台组合分发入口） */
 
-#if defined(_WIN32) && !defined(_WIN32_WINNT)
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS 1
+#endif
+
+#if defined(_WIN32)
+#if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0601
+#undef _WIN32_WINNT
+#endif
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
 #endif
-#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-#define _POSIX_C_SOURCE 200809L
-#endif
-#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
-#define _DEFAULT_SOURCE 1
-#endif
-
-#if !defined(_WIN32) && !defined(_DARWIN_C_SOURCE)
-#define _DARWIN_C_SOURCE 1
-#endif
-#if !defined(_WIN32) && !defined(_BSD_SOURCE)
-#define _BSD_SOURCE 1
 #endif
 
 #include <stdint.h>
@@ -23,174 +20,21 @@
 #include <time.h>
 
 #ifdef _WIN32
-#include <windows.h>
+#include "file/rt_file_win.c"
 #else
-#include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <sched.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#ifndef __wasm__
-#include <sys/file.h>      /* flock */
-#endif
-#ifdef __APPLE__
-#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
-#endif
-#if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__OpenBSD__) || defined(__NetBSD__)
-#include <sys/types.h>
-#include <sys/sysctl.h>
-#endif
+#include "file/rt_file_posix.c"
 #endif
 
-#if !defined(_WIN32) && !defined(O_NOFOLLOW)
-#define O_NOFOLLOW 0
-#endif
-#if !defined(_WIN32) && !defined(O_CLOEXEC)
-#define O_CLOEXEC 0
-#endif
-
-#ifdef _WIN32
-static wchar_t *zan_win_utf8_to_wide(const char *text) {
-    if (!text) return NULL;
-    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1,
-                                NULL, 0);
-    if (n <= 0) return NULL;
-    wchar_t *wide = (wchar_t *)malloc((size_t)n * sizeof(*wide));
-    if (!wide) return NULL;
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1,
-                            wide, n) != n) { free(wide); return NULL; }
-    return wide;
-}
-#endif
-
-void *zan_file_fopen(const char *path, const char *mode) {
-    if (!path || !mode) return NULL;
-#ifdef _WIN32
-    wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    wchar_t *wide_mode = zan_win_utf8_to_wide(mode);
-    if (!wide_path || !wide_mode) { free(wide_path); free(wide_mode); return NULL; }
-    FILE *f = _wfopen(wide_path, wide_mode);
-    free(wide_path); free(wide_mode);
-    return f;
-#else
-    return fopen(path, mode);
-#endif
-}
-
-int zan_file_remove(const char *path) {
-    if (!path || !path[0]) return -1;
-#ifdef _WIN32
-    wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    if (!wide_path) return -1;
-    int ok = DeleteFileW(wide_path) ? 0 : -1;
-    free(wide_path);
-    return ok;
-#else
-    return remove(path);
-#endif
-}
-
-int zan_file_rename(const char *source, const char *dest) {
-    if (!source || !source[0] || !dest || !dest[0]) return -1;
-#ifdef _WIN32
-    wchar_t *wide_source = zan_win_utf8_to_wide(source);
-    wchar_t *wide_dest = zan_win_utf8_to_wide(dest);
-    if (!wide_source || !wide_dest) { free(wide_source); free(wide_dest); return -1; }
-    int ok = MoveFileExW(wide_source, wide_dest, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
-    free(wide_source); free(wide_dest);
-    return ok;
-#else
-    return rename(source, dest);
-#endif
-}
-
-/* 文件元数据错误码口径规范（B-ID106 收敛）：
- * 1. zan_file_time: 成功返回 Unix 秒时间戳；路径不存在或读取失败返回 0
- *    (与 .NET DateTime.FromFileTime(0) 以及测试集 file_info.out missing_time=0 保持一致)。
- * 2. zan_file_length: 成功返回文件字节数；路径不存在或读取失败返回 -1。
- * 3. zan_file_attributes: 成功返回属性位掩码；路径不存在或读取失败返回 -1。
- * 4. zan_file_set_readonly: 成功返回 0；失败返回 -1。
- */
-long long zan_file_time(const char *path, int which) {
-    if (!path || !path[0]) return 0;
-#ifdef _WIN32
-    wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    if (!wide_path) return 0;
-    WIN32_FILE_ATTRIBUTE_DATA d;
-    int got = GetFileAttributesExW(wide_path, GetFileExInfoStandard, &d);
-    free(wide_path);
-    if (!got) return 0;
-    FILETIME ft = d.ftLastWriteTime;
-    if (which == 1) ft = d.ftCreationTime;
-    else if (which == 2) ft = d.ftLastAccessTime;
-    unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32)
-                         | (unsigned long long)ft.dwLowDateTime;
-    if (t == 0) return 0;
-    return (long long)(t / 10000000ULL) - 11644473600LL;
-#else
-    struct stat st;
-    if (stat(path, &st) != 0) return 0;
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
-    if (which == 1) return (long long)st.st_birthtime;
-#else
-    if (which == 1) return (long long)st.st_ctime;
-#endif
-    if (which == 2) return (long long)st.st_atime;
-    return (long long)st.st_mtime;
-#endif
-}
-
-long long zan_file_length(const char *path) {
-    if (!path || !path[0]) return -1;
-#ifdef _WIN32
-    wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    if (!wide_path) return -1;
-    WIN32_FILE_ATTRIBUTE_DATA d;
-    int got = GetFileAttributesExW(wide_path, GetFileExInfoStandard, &d);
-    free(wide_path);
-    if (!got) return -1;
-    return (long long)(((unsigned long long)d.nFileSizeHigh << 32)
-                       | (unsigned long long)d.nFileSizeLow);
-#else
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    return (long long)st.st_size;
-#endif
-}
-
-
-#if defined(_WIN32)
-static volatile LONG g_appdir_resolved;
-#elif defined(__wasm__)
-static int g_appdir_resolved;
-#else
-static volatile int g_appdir_resolved;
-#endif
+/* --------------------------------------------------------------------------
+ * 跨平台应用执行目录与包解析路径探测
+ * -------------------------------------------------------------------------- */
 
 const char *zan_file_app_dir(void) {
     static char dir[4096];
-#if defined(_WIN32)
-    for (;;) {
-        if (InterlockedCompareExchangeAcquire(&g_appdir_resolved, 0, 0) == 1)
-            return dir;
-        if (InterlockedCompareExchangeAcquire(&g_appdir_resolved, 2, 0) == 0)
-            break;
-        SwitchToThread();
-    }
-#elif defined(__wasm__)
-    if (g_appdir_resolved) return dir;
-#else
-    for (;;) {
-        if (__atomic_load_n(&g_appdir_resolved, __ATOMIC_ACQUIRE) == 1)
-            return dir;
-        int expected = 0;
-        if (__atomic_compare_exchange_n(&g_appdir_resolved, &expected, 2, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            break;
-        sched_yield();
-    }
-#endif
+    if (plat_appdir_is_resolved()) return dir;
+    plat_appdir_acquire();
+    if (plat_appdir_is_resolved()) return dir;
+
     const char *env = getenv("ZAN_APP_DIR");
     char local[4096];
     local[0] = '\0';
@@ -208,24 +52,7 @@ const char *zan_file_app_dir(void) {
     } else {
         char exe[4096];
         exe[0] = 0;
-#ifdef _WIN32
-        DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
-        if (n == 0 || n >= sizeof(exe)) exe[0] = 0;
-#elif defined(__APPLE__)
-        uint32_t cap = (uint32_t)sizeof(exe);
-        if (_NSGetExecutablePath(exe, &cap) != 0) exe[0] = 0;
-#elif defined(__linux__)
-        ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-        if (n <= 0) exe[0] = 0;
-        else exe[n] = 0;
-#elif defined(__FreeBSD__) || defined(__DragonFly__)
-        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
-        size_t cb = sizeof(exe);
-        if (sysctl(mib, 4, exe, &cb, NULL, 0) != 0) exe[0] = 0;
-#elif defined(__sun)
-        const char *p = getexecname();
-        if (p && strlen(p) < sizeof(exe)) strcpy(exe, p);
-#endif
+        plat_get_executable_path(exe, sizeof(exe));
         if (exe[0]) {
             char *fwd = strrchr(exe, '/');
             char *back = strrchr(exe, '\\');
@@ -238,13 +65,7 @@ const char *zan_file_app_dir(void) {
         }
     }
     memcpy(dir, local, strlen(local) + 1);
-#if defined(_WIN32)
-    InterlockedCompareExchangeRelease(&g_appdir_resolved, 1, 2);
-#elif defined(__wasm__)
-    g_appdir_resolved = 1;
-#else
-    __atomic_store_n(&g_appdir_resolved, 1, __ATOMIC_RELEASE);
-#endif
+    plat_appdir_release();
     return dir;
 }
 
@@ -264,8 +85,6 @@ static const char *zan_alt_path(const char *path, int which, char *out,
 }
 
 #define ZAN_ALT_BASES 2
-
-static long long zan_file_attributes_at(const char *path);
 
 const char *zan_file_read_path(const char *path) {
     if (zan_file_attributes_at(path) >= 0) return "";
@@ -305,114 +124,9 @@ long long zan_file_attributes(const char *path) {
     return -1;
 }
 
-static long long zan_file_attributes_at(const char *path) {
-    if (!path || !path[0]) return -1;
-#ifdef _WIN32
-    wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    if (!wide_path) return -1;
-    DWORD a = GetFileAttributesW(wide_path);
-    free(wide_path);
-    if (a == INVALID_FILE_ATTRIBUTES) return -1;
-    long long r = 0;
-    if (a & FILE_ATTRIBUTE_READONLY)  r |= 1;
-    if (a & FILE_ATTRIBUTE_HIDDEN)    r |= 2;
-    if (a & FILE_ATTRIBUTE_DIRECTORY) r |= 4;
-    return r;
-#else
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    long long r = 0;
-    if (!(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) r |= 1;
-    { const char *base = strrchr(path, '/');
-      base = base ? base + 1 : path;
-      if (base[0] == '.') r |= 2; }
-    if (S_ISDIR(st.st_mode)) r |= 4;
-    return r;
-#endif
-}
-
-#ifndef _WIN32
-static int zan_posix_open_nofollow(const char *path) {
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-#if defined(O_PATH)
-    if (fd < 0 && errno == EACCES) {
-        fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
-    }
-#endif
-    return fd;
-}
-#endif
-
-long long zan_file_set_readonly(const char *path, int on) {
-    if (!path || !path[0]) return 0;
-#ifdef _WIN32
-    wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    if (!wide_path) return 0;
-    DWORD a = GetFileAttributesW(wide_path);
-    if (a == INVALID_FILE_ATTRIBUTES) { free(wide_path); return 0; }
-    if (on) a |= FILE_ATTRIBUTE_READONLY;
-    else    a &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
-    int ok = SetFileAttributesW(wide_path, a) ? 1 : 0;
-    free(wide_path);
-    return ok;
-#else
-    int fd = zan_posix_open_nofollow(path);
-    if (fd < 0) return 0;
-    struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); return 0; }
-    mode_t m = st.st_mode;
-    if (on) m &= ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH);
-    else    m |= S_IWUSR;
-#if defined(__wasi__)
-    int ok = 0;
-#else
-    int ok = fchmod(fd, m) == 0 ? 1 : 0;
-#endif
-    close(fd);
-    return ok;
-#endif
-}
-
-long long zan_file_set_time(const char *path, int which, long long unix_sec) {
-    if (!path || !path[0]) return 0;
-    if (which != 0 && which != 1 && which != 2) return 0;
-#ifdef _WIN32
-    wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    if (!wide_path) return 0;
-    HANDLE h = CreateFileW(wide_path, FILE_WRITE_ATTRIBUTES,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    free(wide_path);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    unsigned long long ticks = (unsigned long long)(unix_sec + 11644473600LL)
-                             * 10000000ULL;
-    FILETIME ft;
-    ft.dwLowDateTime = (DWORD)(ticks & 0xFFFFFFFFULL);
-    ft.dwHighDateTime = (DWORD)(ticks >> 32);
-    int ok = 0;
-    if (which == 0)      ok = SetFileTime(h, NULL, NULL, &ft);
-    else if (which == 1) ok = SetFileTime(h, &ft, NULL, NULL);
-    else                 ok = SetFileTime(h, NULL, &ft, NULL);
-    CloseHandle(h);
-    return ok ? 1 : 0;
-#else
-    if (which == 1) return 0;
-    int fd = zan_posix_open_nofollow(path);
-    if (fd < 0) return 0;
-    struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); return 0; }
-    struct timespec times[2];
-    /* atime, mtime */
-    times[0].tv_sec = (which == 2) ? unix_sec : st.st_atime;
-    times[0].tv_nsec = 0;
-    times[1].tv_sec = (which == 0) ? unix_sec : st.st_mtime;
-    times[1].tv_nsec = 0;
-    int ok = futimens(fd, times) == 0 ? 1 : 0;
-    close(fd);
-    return ok;
-#endif
-}
-
+/* --------------------------------------------------------------------------
+ * 跨平台文件句柄表（Thread-safe Handle Table）
+ * -------------------------------------------------------------------------- */
 
 #define ZAN_FH_CAP0 64
 #define ZAN_FH_CAP_MAX (1024 * 1024)
@@ -448,30 +162,6 @@ static int zan_fh_grow(void) {
     return 1;
 }
 
-#ifdef _WIN32
-static CRITICAL_SECTION g_fh_cs;
-static INIT_ONCE g_fh_once = INIT_ONCE_STATIC_INIT;
-
-static BOOL CALLBACK zan_fh_cs_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
-    (void)once; (void)param; (void)ctx;
-    InitializeCriticalSection(&g_fh_cs);
-    return TRUE;
-}
-
-static void zan_fh_lock(void) {
-    InitOnceExecuteOnce(&g_fh_once, zan_fh_cs_init, NULL, NULL);
-    EnterCriticalSection(&g_fh_cs);
-}
-static void zan_fh_unlock(void) { LeaveCriticalSection(&g_fh_cs); }
-#elif defined(__wasm__)
-static void zan_fh_lock(void) {}
-static void zan_fh_unlock(void) {}
-#else
-static pthread_mutex_t g_fh_mx = PTHREAD_MUTEX_INITIALIZER;
-static void zan_fh_lock(void) { pthread_mutex_lock(&g_fh_mx); }
-static void zan_fh_unlock(void) { pthread_mutex_unlock(&g_fh_mx); }
-#endif
-
 static long zan_fh_index(long long handle) {
     unsigned long long h = (unsigned long long)handle;
     uint32_t idx = (uint32_t)(h & 0xFFFFFFFFULL);
@@ -496,7 +186,6 @@ static FILE *zan_fh_pin(long long handle, long *idx_out) {
     return f;
 }
 
-/* Drop a pin */
 static void zan_fh_unpin(long idx) {
     FILE *dying = NULL;
     if (idx < 0) return;
@@ -569,12 +258,7 @@ long long zan_file_seek(long long handle, long long offset, int origin) {
     FILE *f = zan_fh_pin(handle, &idx);
     if (!f) return -1;
     int whence = origin == 1 ? SEEK_CUR : (origin == 2 ? SEEK_END : SEEK_SET);
-    long long r;
-#ifdef _WIN32
-    r = _fseeki64(f, (__int64)offset, whence) != 0 ? -1 : (long long)_ftelli64(f);
-#else
-    r = fseeko(f, (off_t)offset, whence) != 0 ? -1 : (long long)ftello(f);
-#endif
+    long long r = plat_file_seek_raw(f, offset, whence);
     zan_fh_unpin(idx);
     return r;
 }
@@ -583,11 +267,7 @@ long long zan_file_tell(long long handle) {
     long idx;
     FILE *f = zan_fh_pin(handle, &idx);
     if (!f) return -1;
-#ifdef _WIN32
-    long long r = (long long)_ftelli64(f);
-#else
-    long long r = (long long)ftello(f);
-#endif
+    long long r = plat_file_tell_raw(f);
     zan_fh_unpin(idx);
     return r;
 }
@@ -636,14 +316,13 @@ long long zan_file_eof(long long handle) {
     return e;
 }
 
+/* --------------------------------------------------------------------------
+ * 跨平台文件锁表（Cross-process File Lock Table）
+ * -------------------------------------------------------------------------- */
 
 #define ZAN_LK_CAP 32
 typedef struct {
-#ifdef _WIN32
-    HANDLE h;
-#else
-    int fd;
-#endif
+    plat_file_lock_t lock;
     int used;
     uint32_t gen;
 } zan_lk_slot;
@@ -661,10 +340,6 @@ static long zan_lk_index(long long handle) {
 
 long long zan_file_try_lock(const char *path) {
     if (!path || !path[0]) return 0;
-#if defined(__wasm__)
-    (void)path;
-    return 0;
-#else
     zan_fh_lock();
     long slot = -1;
     for (long i = 0; i < ZAN_LK_CAP; i++) {
@@ -676,38 +351,23 @@ long long zan_file_try_lock(const char *path) {
     }
     zan_fh_unlock();
     if (slot < 0) return 0;
-#ifdef _WIN32
-    wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    if (!wide_path) goto fail_reserve;
-    HANDLE h = CreateFileW(wide_path, GENERIC_WRITE, 0 /* no sharing */, NULL,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(wide_path);
-    if (h == INVALID_HANDLE_VALUE) goto fail_reserve;
-#else
-    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-    if (fd < 0) goto fail_reserve;
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); goto fail_reserve; }
-#endif
+
+    plat_file_lock_t lk = plat_file_lock_open(path);
+    if (lk == PLAT_FILE_LOCK_INVALID) {
+        zan_fh_lock();
+        g_lk_table[slot].used = 0;
+        zan_fh_unlock();
+        return 0;
+    }
+
     zan_fh_lock();
-#ifdef _WIN32
-    g_lk_table[slot].h = h;
-#else
-    g_lk_table[slot].fd = fd;
-#endif
+    g_lk_table[slot].lock = lk;
     uint32_t next_gen = (uint32_t)(g_lk_table[slot].gen + 1);
     if (next_gen == 0) {
-#ifdef _WIN32
-        g_lk_table[slot].h = NULL;
-#else
-        g_lk_table[slot].fd = -1;
-#endif
+        g_lk_table[slot].lock = PLAT_FILE_LOCK_INVALID;
         g_lk_table[slot].used = 2;
         zan_fh_unlock();
-#ifdef _WIN32
-        CloseHandle(h);
-#else
-        close(fd);
-#endif
+        plat_file_lock_close(lk);
         return 0;
     }
     g_lk_table[slot].gen = next_gen;
@@ -716,13 +376,6 @@ long long zan_file_try_lock(const char *path) {
         | (unsigned long long)slot;
     zan_fh_unlock();
     return (long long)lk_handle;
-
-fail_reserve:
-    zan_fh_lock();
-    g_lk_table[slot].used = 0;
-    zan_fh_unlock();
-    return 0;
-#endif /* !__wasm__ */
 }
 
 long long zan_file_unlock(long long handle) {
@@ -733,23 +386,14 @@ long long zan_file_unlock(long long handle) {
         return 0;
     }
     zan_lk_slot *s = &g_lk_table[slot];
-#ifdef _WIN32
-    HANDLE h = s->h;
-    s->h = NULL;
-#else
-    int fd = s->fd;
-    s->fd = -1;
-#endif
+    plat_file_lock_t lk = s->lock;
+    s->lock = PLAT_FILE_LOCK_INVALID;
     s->used = 0;
     s->gen = s->gen + 1;
     if (s->gen == 0) {
         s->used = 2;
     }
     zan_fh_unlock();
-#ifdef _WIN32
-    CloseHandle(h);
-#else
-    close(fd);
-#endif
+    plat_file_lock_close(lk);
     return 1;
 }
