@@ -8,19 +8,37 @@ partial class Irgen {
         ExprVal obj = GenExpr(e.a);
         ExprVal idx = GenExpr(e.b);
         if (IsStr(obj.ty)) {
-            // a null string is a soft runtime error in the C host: it reports
-            // and reads a scratch page, so the program keeps running and the
-            // element reads as NUL. The self-host switches to a zero page.
+            // B-ID182：镜像 C 宿主 emit_string_elem_guard + emit_index_bounds_check
+            // （irgen_generics.c:1883 / irgen_expr_access.c:1275）。旧实现零页
+            // select + 裸 GEP：null 无报告无抛、越界读越界内存（真实 OOB read，
+            // 探针 _scratch/nullprobe：宿主 try 内抛 NRE / IndexOutOfRange，
+            // 自举端 no-throw）。① null 守卫（try 内抛 NullReferenceException，
+            // try 外 soft 报告后落零页）；② len 越界守卫（负或 >= len → try 内
+            // 抛 IndexOutOfRangeException，try 外 soft 报告 + 索引钳 0——宿主
+            // 越界读返回 0 号字符，此口径双端一致）。
             string isn = NT();
             L("  " + isn + " = icmp eq i8* " + obj.op + ", null");
+            EmitRuntimeCheckIf(e, isn,
+                "null reference where a string/byte buffer is required (element access)");
             string zp = NT();
             L("  " + zp + " = getelementptr inbounds [16 x i8], [16 x i8]* @.zeropage, i64 0, i64 0");
             string bstr = NT();
             L("  " + bstr + " = select i1 " + isn + ", i8* " + zp + ", i8* " + obj.op);
             string sidx = NT();
             L("  " + sidx + " = select i1 " + isn + ", i64 0, i64 " + idx.op);
+            string ln = NT();
+            L("  " + ln + " = call i64 @zstr_len(i8* " + bstr + ")");
+            string neg = NT();
+            L("  " + neg + " = icmp slt i64 " + sidx + ", 0");
+            string ge = NT();
+            L("  " + ge + " = icmp sge i64 " + sidx + ", " + ln);
+            string oob = NT();
+            L("  " + oob + " = or i1 " + neg + ", " + ge);
+            EmitRuntimeCheckIf(e, oob, "string index out of bounds");
+            string safe = NT();
+            L("  " + safe + " = select i1 " + oob + ", i64 0, i64 " + sidx);
             string p = NT();
-            L("  " + p + " = getelementptr i8, i8* " + bstr + ", i64 " + sidx);
+            L("  " + p + " = getelementptr i8, i8* " + bstr + ", i64 " + safe);
             string ch = NT();
             L("  " + ch + " = load i8, i8* " + p);
             string z = NT();
