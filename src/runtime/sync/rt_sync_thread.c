@@ -458,6 +458,14 @@ void zan_dispatch_clear(void) {
     }
 }
 
+typedef struct {
+#ifdef _WIN32
+    volatile LONG64 value;
+#else
+    int64_t value;
+#endif
+} zan_atomic_int;
+
 int64_t zan_atomic_int_create(int64_t initial_value) {
     zan_atomic_int *atomic = (zan_atomic_int *)malloc(sizeof(*atomic));
     if (!atomic) return 0;

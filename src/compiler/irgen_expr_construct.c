@@ -2539,6 +2539,11 @@ static bool await_target_is_async(zan_irgen_t *g, zan_ast_node_t *expr,
             memcmp(ty->name.str, "ValueTask", 9) == 0) return true;
     }
     if (expr->kind != AST_CALL || !expr->call.callee) return false;
+    if (expr->call.resolved_sym && expr->call.resolved_sym->decl &&
+        expr->call.resolved_sym->decl->kind == AST_METHOD_DECL) {
+        if ((expr->call.resolved_sym->decl->method_decl.modifiers & MOD_ASYNC) != 0)
+            return true;
+    }
     zan_ast_node_t *callee = expr->call.callee;
     /* 被调者本身就是委托（局部变量、字段、下标元素都算）——
      * `await shutdownHooks[i]()`。委托类型自带 async 标记。 */
