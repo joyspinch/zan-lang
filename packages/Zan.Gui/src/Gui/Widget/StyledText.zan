@@ -14,55 +14,55 @@ namespace Gui.Widget;
 // 写出最大滚动偏移，供调用方回读。
 public class StyledText : Control {
     // 展示行缓存（调用方每帧赋值）；null 或空 = 不画。
-    List<TextRun> lines;
+    public List<TextRun> lines;
     // 滚动偏移（底端锚定的行数，0 = 贴住最新一行），调用方持有。
-    int scroll;
+    public int scroll;
     // true 时在记录末尾追加一行 busy 提示（busyText）。
-    bool busy;
+    public bool busy;
     // 文本选择状态（interactive 时由控件更新）。
-    LogState sel;
+    public LogState sel;
     // 允许指针交互：拖选文本、点击思考折叠行与工具摘要行。
-    bool interactive;
+    public bool interactive;
     // 思考折叠信号（1 = 展开），点击 kind-4 行切换；null = 无该行。
-    SignalInt thinkOpen;
+    public SignalInt thinkOpen;
     // 已展开工具结果的消息索引列表，点击 kind-5 行增删。
-    List<int> toolOpen;
+    public List<int> toolOpen;
     // busy 行文本（调用方已本地化）。
-    string busyText;
+    public string busyText;
     // 绘制后写出：本帧的最大滚动偏移，供调用方回读。
-    int maxScroll;
+    public int maxScroll;
     // 调用方的滚动偏移信号（底端锚定，单位是展示行，0 = 贴住最新一行）。
     // 给了它就在右侧画一条可拖动的纵向滚动条：只有滚轮的时候，长记录既
     // 看不出自己停在整段的哪一段，也没法一把拖回去。null = 不画。
-    SignalInt scrollBar;
+    public SignalInt scrollBar;
 
-    // busy 行复用的常驻 Label（替代每帧 DrawStyledText）。
-    static Label thinkingLbl;
+    // busy 行复用的实例常驻 Label（避免跨组件实例状态竞态）。
+    private Label thinkingLbl;
 
     // 滚动条要的是「像素、从顶算」的信号，而记录的滚动是「行、从底算」。
-    // 常驻一个转换用的信号，免得每帧新分配一个。
-    static SignalInt barSig;
+    // 实例常驻一个转换用的信号，避免多实例竞态。
+    private SignalInt barSig;
 
     // 常驻的滚动条转换信号（惰性创建，避免每帧新分配）。
-    static SignalInt BarSig() {
-        if (StyledText.barSig == null) { StyledText.barSig = new SignalInt(0); }
-        return StyledText.barSig;
+    private SignalInt BarSig() {
+        if (this.barSig == null) { this.barSig = new SignalInt(0); }
+        return this.barSig;
     }
 
     // 纵向滚动条占掉的宽度。调用方按它收窄换行宽度，最长的一行才不会被
     // 压在滑块底下。
-    static int BarW(App app) { return app.Scale(12); }
+    public static int BarW(App app) { return app.Scale(12); }
 
     // 惰性创建常驻的「思考中」标签（hint small 样式），避免每帧分配。
-    static void EnsureThinking(App app) {
-        if (StyledText.thinkingLbl == null) {
-            StyledText.thinkingLbl = new Label();
-            StyledText.thinkingLbl.Class = "hint small";
+    private void EnsureThinking(App app) {
+        if (this.thinkingLbl == null) {
+            this.thinkingLbl = new Label();
+            this.thinkingLbl.Class = "hint small";
         }
     }
 
     // 空控件；行缓存与各状态由调用方每帧绑定（见类型注释）。
-    StyledText() {
+    public StyledText() {
         this.InitControl("styledText", 1);
         // OnPaint 自行绘制网格，不让框架再铺一层 CSS 表面。
         styleSurfaceOwned = true;
@@ -76,10 +76,13 @@ public class StyledText : Control {
         busyText = "";
         maxScroll = 0;
         scrollBar = null;
+        thinkingLbl = null;
+        barSig = null;
+        headAva = null;
     }
 
     // 记录的字号，解析自各行绘制时用的同一套样式，使测量与绘制不会错位。
-    static int FontPx(App app) {
+    public static int FontPx(App app) {
         return Style.Of(app, "label", "small", Style.SNormal())
             .FontOr(Style.FontFallback(app, "small"));
     }
@@ -87,7 +90,7 @@ public class StyledText : Control {
     // 一行的高度：一行文本加呼吸空间，且不小于头行要画的芯片。两者
     // 都解释了之前面板为何显得局促错位——固定 18px 在大 UI 缩放
     // 下比字体的行盒更紧，也比它要装的 Tag 更矮。
-    static int RowH(App app) {
+    public static int RowH(App app) {
         int h = Canvas.FontHeight(StyledText.FontPx(app)) + app.Scale(3);
         int chip = Tag.Height(app, "");
         if (h < chip) { h = chip; }
@@ -95,10 +98,10 @@ public class StyledText : Control {
     }
 
     // 轮次之间的分隔线高度：块与块之间只让出这么多，不再插空行。
-    static int SepH(App app) { return app.Scale(1); }
+    public static int SepH(App app) { return app.Scale(1); }
 
     // `mouseY` 下的展示行索引（底端锚定的记录，第一可见行为 `start`）。
-    static int RowAt(int startY, int pad, int rowH, int start,
+    public static int RowAt(int startY, int pad, int rowH, int start,
             int count, int mouseY) {
         int rel = (mouseY - (startY + pad)) / rowH;
         if (rel < 0) { rel = 0; }
@@ -110,7 +113,7 @@ public class StyledText : Control {
 
     // 发言者名字的首个可见字符，用于圆形 Avatar。CJK 名字保留首字；
     // 拉丁名字大写。
-    static string Initial(string name) {
+    public static string Initial(string name) {
         if (name == "") { return "?"; }
         // 按字符边界而非字节边界截断：CJK 名字每字 3 字节，Left(name,1)
         // 会切下码点的三分之一，变成头像里看到的乱码。
@@ -120,21 +123,18 @@ public class StyledText : Control {
         return ch.ToUpper();
     }
 
-    // 一个名字行，由共享控件而非手绘拼成：复用实例，因为每个可见轮次
-    // 都画一个头行，每行每帧分配一个控件正是长记录卡顿的根源。
-    static Avatar headAva;
-    // 常驻的头行头像实例（惰性创建：每个可见轮次都画一个头行，
-    // 复用同一实例避免每行每帧分配控件）。
-    static Avatar HeadAvatar() {
-        if (StyledText.headAva == null) {
-            StyledText.headAva = new Avatar();
+    // 实例常驻的头行头像实例（惰性创建：每个可见轮次都画一个头行，
+    // 复用同一实例避免每行每帧分配控件与跨实例冲突）。
+    private Avatar HeadAvatar() {
+        if (this.headAva == null) {
+            this.headAva = new Avatar();
         }
-        return StyledText.headAva;
+        return this.headAva;
     }
 
     // 绘制消息头行：时刻贴右缘，再从左向右画头像、名字与状态/进度
     // 芯片；右缘空间不足时宁可丢弃后面的芯片也不压到时刻上。
-    static void PaintHeadRow(App app, TextRun ln, int x, int y, int rowH,
+    private void PaintHeadRow(App app, TextRun ln, int x, int y, int rowH,
             int rightEdge, StyleBox timeStyle) {
         int cx = x;
         // 时刻贴右缘，并把芯片可用的右边界收回来：成员名很长时宁可
@@ -157,7 +157,7 @@ public class StyledText : Control {
         int chipH = Tag.Height(app, ln.tagCls);
         int chipY = y + (rowH - chipH) / 2;
         if (chipY < y) { chipY = y; }
-        Avatar av = StyledText.HeadAvatar();
+        Avatar av = this.HeadAvatar();
         av.Text = ln.ava;
         av.Size = 16;
         av.Class = ln.tagCls;
@@ -187,7 +187,7 @@ public class StyledText : Control {
     }
 
     // 覆写：纯铺满槽位的画布，偏好尺寸取当前边界。
-    override void OnMeasure(App app) {
+    public override void OnMeasure(App app) {
         // 纯铺满槽位的画布：尺寸由 RenderInside 的 Rect 决定，
         // 这里把偏好设成当前边界即可。
         prefW = bw;
@@ -196,7 +196,7 @@ public class StyledText : Control {
 
     // 覆写：绘制整行网格（正文/代码底纹/头行/busy 行），处理文本
     // 选择、折叠行与工具行的点击及滚动条交互，并写出 maxScroll。
-    override void OnPaint(App app) {
+    public override void OnPaint(App app) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         if (lines == null || lines.Count == 0) { return; }
@@ -382,7 +382,7 @@ public class StyledText : Control {
                     // 圆形 Avatar、名字的 Tag 芯片，团队聊天下再加一个
                     // 节拍 Tag 和一个百分比 Tag。手搓这个胶囊正是让助手
                     // 的外观偏离 IDE 中所有其它列表行的原因。
-                    StyledText.PaintHeadRow(app, cache[idx], textX, ry, rowH,
+                    this.PaintHeadRow(app, cache[idx], textX, ry, rowH,
                         bx + bw - pad - inset, timeStyle);
                 } else if (cache[idx].kind == 1) {
                     c.DrawText(textX + app.Scale(4), ry + textDy,
@@ -406,9 +406,9 @@ public class StyledText : Control {
                 }
             } else {
                 // busy 行：常驻 Label 替代每帧 DrawStyledText。
-                StyledText.EnsureThinking(app);
-                StyledText.thinkingLbl.Text = busyText;
-                StyledText.thinkingLbl.RenderAt(app, bx + pad, ry + textDy);
+                this.EnsureThinking(app);
+                this.thinkingLbl.Text = busyText;
+                this.thinkingLbl.RenderAt(app, bx + pad, ry + textDy);
             }
             idx = idx + 1;
         }
@@ -417,7 +417,7 @@ public class StyledText : Control {
         // 像素」，在这里换一下再把拖动结果写回调用方的信号。
         if (wantBar) {
             int trackH = bh - pad * 2;
-            SignalInt px = StyledText.BarSig();
+            SignalInt px = this.BarSig();
             px.Set((maxSc - sc) * rowH);
             Scrollbar.RenderVerticalScrollIn(app, bx + bw - inset, by + pad,
                 trackH, maxRows * rowH, total * rowH, px,
@@ -433,5 +433,5 @@ public class StyledText : Control {
     // ---- 设计器 / 序列化模型 ----
 
     // 控件类型标识（序列化/设计器用）。
-    override string Kind() { return "StyledText"; }
+    public override string Kind() { return "StyledText"; }
 }
