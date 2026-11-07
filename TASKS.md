@@ -49,7 +49,7 @@
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 
 - [x] B-ID169 Convert/Parse 异常抛出与自举孪生对齐：全仓审计 345 处调用方证实绝大多数依赖非 try 默认安全兜底，C 宿主原有 try 内部 emit_runtime_check 异常分发路径成立；修复自举端 irgen_expr_member.zan 在 @__exc_sp > 1（进入用户级 try 块）时经由 EmitExceptionThrow 抛出 FormatException/OverflowException，非 try 作用域保持 stderr soft note + 0 兜底。内置异常类描述符在 binder/checker/irgen/irgen_expr_assign 注册并对齐 tid_Exception 继承链。新增 conformance/convert_invalid_catch.zan，selfhost_gen1、selfhost_fixed_point（37.9MB 逐字节对齐）、selfhost_diff（213通过/0已知缺口/50拒绝）三门自举全体验证通过。
-- [ ] B-ID170 结构收口三件：① 中风险拆分（Designer 三件套：Designer.Form.zan 4301行已于 commit 3b8cdd439 按 partial 拆出 Ribbon/Layout/Free/Canvas/Ruler/Preview 6切面并完成 RenderDesignCanvas 巨函数拆解；余 Designer.zan 6909 与 Designer.Inspector.zan 3466、SceneDesigner 2951——后两者将在 B-ID177 改写为保留式，拆前先评估；App.zan 已并入 B-ID174）；② 命名空间三前缀统一（System.* 被 stdlib/packages 同名分仓、Game 裸名——独立大工程，动前定一尊；Gui 已定案并入 B-ID178）；③ zan.pkg 加 deps 字段 + zan-pm restore 下载闭环（pm_main.c:216-248 现为空转）。
+- [ ] B-ID170 结构收口三件：① 中风险拆分（Designer 三件套：Designer.Form.zan 4301行已于 commit 3b8cdd439 按 partial 拆出 Ribbon/Layout/Free/Canvas/Ruler/Preview 6切面并完成 RenderDesignCanvas 巨函数拆解；余 Designer.zan 6909 与 Designer.Inspector.zan 3466、SceneDesigner 2951——后两者将在 B-ID177 改写为保留式，拆前先评估；App.zan 已并入 B-ID174）；② 命名空间三前缀统一（System.* 被 stdlib/packages 同名分仓、Game 裸名——独立大工程，动前定一尊；Gui 已定案并入 B-ID178）；③ [x] zan.pkg / zan.json 支持 deps 顶层/数组与约束解析，zan_pkg_fetch 补齐本地目录及 monorepo 回退，闭环 zan-pm restore 下载与 sha256 树校验（unit_zan_pm_cli 覆盖端到端 12 步验证全过）。
 
 - [ ] B-ID178〔前置 B-ID172～B-ID177〕GUI 分层重构 P7 按层拆命名空间：目录即命名空间，codemod 原子提交（约 1,285 个调用方文件 + 977 处限定引用），兄弟包各占己名，机检切严格（承接 B-ID170 ② 的 Gui 部分）。
 

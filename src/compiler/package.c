@@ -452,6 +452,29 @@ static bool path_ends_with_json(const char *path) {
     return false;
 }
 
+static void parse_dep_spec(const char *spec, char *out_name, size_t name_cap, char *out_constraint, size_t constr_cap) {
+    if (!spec || !out_name || !out_constraint) return;
+    out_name[0] = 0;
+    out_constraint[0] = 0;
+    while (*spec && isspace((unsigned char)*spec)) spec++;
+    size_t ni = 0;
+    while (*spec && !isspace((unsigned char)*spec) && *spec != '@' && *spec != '=' && *spec != '^' && *spec != '~' && *spec != '>' && *spec != '<' && ni + 1 < name_cap) {
+        out_name[ni++] = *spec++;
+    }
+    out_name[ni] = 0;
+    while (*spec && isspace((unsigned char)*spec)) spec++;
+    if (*spec == '@') spec++;
+    while (*spec && isspace((unsigned char)*spec)) spec++;
+    size_t ci = 0;
+    while (*spec && ci + 1 < constr_cap) {
+        out_constraint[ci++] = *spec++;
+    }
+    out_constraint[ci] = 0;
+    if (out_constraint[0] == 0) {
+        strncpy(out_constraint, "*", constr_cap - 1);
+    }
+}
+
 bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
     FILE *f = fopen(manifest_path, "rb");
     if (!f) return false;
@@ -524,6 +547,18 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
                 }
                 zan_pkg_add_dep(pkg, dep_name, dep_source, dep_constraint);
             }
+        } else if (deps && deps->type == JSON_ARR) {
+            for (int i = 0; i < deps->as.arr.count; i++) {
+                json_value *dep_item = deps->as.arr.items[i];
+                if (dep_item && dep_item->type == JSON_STR) {
+                    char dname[128] = {0};
+                    char dconstraint[128] = {0};
+                    parse_dep_spec(dep_item->as.str, dname, sizeof(dname), dconstraint, sizeof(dconstraint));
+                    if (dname[0]) {
+                        zan_pkg_add_dep(pkg, dname, "", dconstraint);
+                    }
+                }
+            }
         }
 
         json_free(root);
@@ -533,6 +568,7 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
     /* INI / zan.pkg 格式解析 */
     const char *p = buf;
     bool in_deps = false;
+    bool in_deps_array = false;
     while (*p) {
         char line[1024];
         int li = 0;
@@ -547,8 +583,31 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
         if (*lp == '#' || *lp == 0) continue;
         if (*lp == '[') {
             in_deps = (strncmp(lp, "[deps]", 6) == 0 || strncmp(lp, "[dependencies]", 14) == 0);
+            in_deps_array = false;
             continue;
         }
+
+        if (in_deps_array) {
+            while (*lp) {
+                skip_ws(&lp);
+                if (*lp == ']') { in_deps_array = false; break; }
+                if (*lp == ',' || *lp == ';') { lp++; continue; }
+                if (*lp == '"') {
+                    char dep_spec[256] = {0};
+                    read_qstr(&lp, dep_spec, sizeof(dep_spec));
+                    char dname[128] = {0};
+                    char dconstraint[128] = {0};
+                    parse_dep_spec(dep_spec, dname, sizeof(dname), dconstraint, sizeof(dconstraint));
+                    if (dname[0]) {
+                        zan_pkg_add_dep(pkg, dname, "", dconstraint);
+                    }
+                } else {
+                    lp++;
+                }
+            }
+            continue;
+        }
+
         char key[128] = {0};
         int ki = 0;
         while (*lp && *lp != '=' && !isspace((unsigned char)*lp) && ki < 127) { key[ki++] = *lp; lp++; }
@@ -558,6 +617,28 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
         skip_ws(&lp);
 
         if (!in_deps) {
+            if ((strcmp(key, "deps") == 0 || strcmp(key, "dependencies") == 0) && *lp == '[') {
+                lp++;
+                in_deps_array = true;
+                while (*lp) {
+                    skip_ws(&lp);
+                    if (*lp == ']') { in_deps_array = false; break; }
+                    if (*lp == ',' || *lp == ';') { lp++; continue; }
+                    if (*lp == '"') {
+                        char dep_spec[256] = {0};
+                        read_qstr(&lp, dep_spec, sizeof(dep_spec));
+                        char dname[128] = {0};
+                        char dconstraint[128] = {0};
+                        parse_dep_spec(dep_spec, dname, sizeof(dname), dconstraint, sizeof(dconstraint));
+                        if (dname[0]) {
+                            zan_pkg_add_dep(pkg, dname, "", dconstraint);
+                        }
+                    } else {
+                        lp++;
+                    }
+                }
+                continue;
+            }
             char val[256] = {0};
             if (*lp == '"') { read_qstr(&lp, val, sizeof(val)); }
             else { int vi = 0; while (*lp && *lp != '\n' && *lp != '\r' && vi < 255) { val[vi++] = *lp; lp++; } val[vi] = 0; }
@@ -600,6 +681,22 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
                     }
                 }
                 if (*lp == '}') lp++;
+            } else if (*lp == '"') {
+                char dval[512] = {0};
+                read_qstr(&lp, dval, sizeof(dval));
+                zan_dep_parse_constraint(dval, dep);
+            } else {
+                char dval[512] = {0};
+                int vi = 0;
+                while (*lp && *lp != '\n' && *lp != '\r' && vi < 511) { dval[vi++] = *lp++; }
+                dval[vi] = 0;
+                const char *dp = dval;
+                skip_ws(&dp);
+                if (dp[0]) {
+                    zan_dep_parse_constraint(dp, dep);
+                } else {
+                    dep->kind = ZAN_DEP_ANY;
+                }
             }
             pkg->dep_count++;
         }
@@ -648,7 +745,7 @@ bool zan_pkg_save(const zan_package_t *pkg, const char *manifest_path) {
             }
             fprintf(f, "  }\n");
         } else {
-            fprintf(f, "\n");
+            fprintf(f, ",\n  \"dependencies\": {}\n");
         }
         fprintf(f, "}\n");
     } else {
@@ -660,23 +757,21 @@ bool zan_pkg_save(const zan_package_t *pkg, const char *manifest_path) {
         if (pkg->license[0]) fprintf(f, "license = \"%s\"\n", pkg->license);
         if (pkg->entry_point[0]) fprintf(f, "entry = \"%s\"\n", pkg->entry_point);
         if (pkg->plugin_id[0]) fprintf(f, "plugin_id = \"%s\"\n", pkg->plugin_id);
-        if (pkg->dep_count > 0) {
-            fprintf(f, "\n[deps]\n");
-            for (int i = 0; i < pkg->dep_count; i++) {
-                const zan_dependency_t *d = &pkg->deps[i];
-                char dep_ver[64]; zan_version_format(&d->min_ver, dep_ver, sizeof(dep_ver));
-                const char *prefix = "";
-                switch (d->kind) {
-                case ZAN_DEP_COMPAT: prefix = "^"; break;
-                case ZAN_DEP_TILDE: prefix = "~"; break;
-                case ZAN_DEP_MINIMUM: prefix = ">="; break;
-                case ZAN_DEP_MAXIMUM: prefix = "<="; break;
-                case ZAN_DEP_EXACT: prefix = "="; break;
-                case ZAN_DEP_RANGE: prefix = ">="; break;
-                case ZAN_DEP_ANY: prefix = "*"; break;
-                }
-                fprintf(f, "%s = { source = \"%s\", version = \"%s%s\" }\n", d->name, d->source, prefix, dep_ver);
+        fprintf(f, "\n[deps]\n");
+        for (int i = 0; i < pkg->dep_count; i++) {
+            const zan_dependency_t *d = &pkg->deps[i];
+            char dep_ver[64]; zan_version_format(&d->min_ver, dep_ver, sizeof(dep_ver));
+            const char *prefix = "";
+            switch (d->kind) {
+            case ZAN_DEP_COMPAT: prefix = "^"; break;
+            case ZAN_DEP_TILDE: prefix = "~"; break;
+            case ZAN_DEP_MINIMUM: prefix = ">="; break;
+            case ZAN_DEP_MAXIMUM: prefix = "<="; break;
+            case ZAN_DEP_EXACT: prefix = "="; break;
+            case ZAN_DEP_RANGE: prefix = ">="; break;
+            case ZAN_DEP_ANY: prefix = "*"; break;
             }
+            fprintf(f, "%s = { source = \"%s\", version = \"%s%s\" }\n", d->name, d->source, prefix, dep_ver);
         }
     }
     bool ok = (ferror(f) == 0);
@@ -768,6 +863,8 @@ static bool pkg_token_is_shell_safe(const char *s) {
 }
 
 static bool pkg_safe_component(const char *s);
+static bool pkg_mkdirs(const char *path);
+static bool pkg_copy_tree(const char *src, const char *dst, int depth);
 
 bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     char pkg_dir[1024];
@@ -798,6 +895,40 @@ bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
             ret = system(cmd);
         }
         return ret == 0;
+    } else if (dep->source[0] && pkg_is_dir(dep->source)) {
+        if (!pkg_mkdirs(pkg_dir)) return false;
+        return pkg_copy_tree(dep->source, pkg_dir, 0);
+    } else if (dep->source[0] == 0) {
+        /* 1. 尝试从全局包存储恢复 */
+        char gstore[1024];
+        if (zan_pkg_global_store(gstore, sizeof(gstore))) {
+            char src_dir[1024];
+            snprintf(src_dir, sizeof(src_dir), "%s" PATH_SEP "%s", gstore, dep->name);
+            if (pkg_is_dir(src_dir)) {
+                if (!pkg_mkdirs(pkg_dir)) return false;
+                return pkg_copy_tree(src_dir, pkg_dir, 0);
+            }
+        }
+        /* 2. 尝试从当前工程向上层目录回退寻找 packages/<dep->name> (Monorepo 溯源，最多遍历 8 层) */
+        char curr[1024];
+        snprintf(curr, sizeof(curr), "%s", reg->cache_dir);
+        char *sep = strrchr(curr, '\\');
+        char *sep2 = strrchr(curr, '/');
+        if (sep2 && (!sep || sep2 > sep)) sep = sep2;
+        if (sep) *sep = '\0';
+
+        for (int depth = 0; depth < 8; depth++) {
+            char cand[1024];
+            snprintf(cand, sizeof(cand), "%s" PATH_SEP "packages" PATH_SEP "%s", curr, dep->name);
+            if (pkg_is_dir(cand)) {
+                if (!pkg_mkdirs(pkg_dir)) return false;
+                return pkg_copy_tree(cand, pkg_dir, 0);
+            }
+            char next[1024];
+            snprintf(next, sizeof(next), "%s" PATH_SEP "..", curr);
+            if (!pkg_is_dir(next)) break;
+            snprintf(curr, sizeof(curr), "%s", next);
+        }
     }
     return false;
 }

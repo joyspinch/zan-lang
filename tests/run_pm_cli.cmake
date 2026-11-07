@@ -61,6 +61,20 @@ if(NOT EXISTS "${WORK_DIR}/zan.lock")
     message(FATAL_ERROR "zan.lock was not generated")
 endif()
 
+# 4b. zan-pm restore with zan.pkg
+execute_process(
+    COMMAND "${ZAN_PM}" restore --project "${WORK_DIR}"
+    RESULT_VARIABLE res
+    OUTPUT_VARIABLE out
+    ERROR_VARIABLE err
+)
+if(NOT res EQUAL 0)
+    message(FATAL_ERROR "zan-pm restore on zan.pkg failed (${res}): ${out}\n${err}")
+endif()
+if(NOT IS_DIRECTORY "${WORK_DIR}/.zan-packages/Zan.Linq")
+    message(FATAL_ERROR "zan-pm restore did not download Zan.Linq into .zan-packages")
+endif()
+
 # 5. zan-pm check
 execute_process(
     COMMAND "${ZAN_PM}" check --project "${WORK_DIR}"
@@ -136,6 +150,9 @@ execute_process(
 if(NOT res EQUAL 0)
     message(FATAL_ERROR "zan-pm restore failed (${res}): ${out}\n${err}")
 endif()
+if(NOT IS_DIRECTORY "${WORK_DIR}/.zan-packages/Zan.Data")
+    message(FATAL_ERROR "zan-pm restore did not download Zan.Data into .zan-packages")
+endif()
 
 # 11. zan-pm publish with zan.json
 execute_process(
@@ -146,6 +163,23 @@ execute_process(
 )
 if(NOT res EQUAL 0)
     message(FATAL_ERROR "zan-pm publish failed (${res}): ${out}\n${err}")
+endif()
+
+# 12. Test top-level deps array in zan.pkg
+file(REMOVE_RECURSE "${WORK_DIR}")
+file(MAKE_DIRECTORY "${WORK_DIR}")
+file(WRITE "${WORK_DIR}/zan.pkg" "name = \"ArrayDepApp\"\nversion = \"1.0.0\"\ndeps = [\n  \"Zan.Data\",\n  \"Zan.Linq >= 1.0.0\"\n]\n")
+execute_process(
+    COMMAND "${ZAN_PM}" restore --project "${WORK_DIR}"
+    RESULT_VARIABLE res
+    OUTPUT_VARIABLE out
+    ERROR_VARIABLE err
+)
+if(NOT res EQUAL 0)
+    message(FATAL_ERROR "zan-pm restore with top-level deps array failed (${res}): ${out}\n${err}")
+endif()
+if(NOT IS_DIRECTORY "${WORK_DIR}/.zan-packages/Zan.Data" OR NOT IS_DIRECTORY "${WORK_DIR}/.zan-packages/Zan.Linq")
+    message(FATAL_ERROR "zan-pm restore did not restore packages from top-level deps array")
 endif()
 
 # Clean up

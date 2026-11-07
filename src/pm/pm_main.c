@@ -245,13 +245,47 @@ static int cmd_restore(const char *project_dir) {
     }
 
     printf("Restoring dependencies for '%s'...\n", pkg.name);
+    bool all_ok = true;
     for (int i = 0; i < reg.resolved_count; i++) {
         zan_package_t *rp = reg.resolved[i];
         if (!rp) continue;
         char ver[64];
         zan_version_format(&rp->version, ver, sizeof(ver));
         printf("  - %s (%s)\n", rp->name, ver);
+
+        zan_dependency_t dep;
+        memset(&dep, 0, sizeof(dep));
+        strncpy(dep.name, rp->name, sizeof(dep.name) - 1);
+        if (rp->source[0]) strncpy(dep.source, rp->source, sizeof(dep.source) - 1);
+        dep.min_ver = rp->version;
+
+        if (!zan_pkg_fetch(&reg, &dep)) {
+            fprintf(stderr, "error: failed to restore dependency '%s'\n", rp->name);
+            all_ok = false;
+            continue;
+        }
+
+        if (rp->checksum[0]) {
+            char pkg_dir[1024];
+            snprintf(pkg_dir, sizeof(pkg_dir), "%s/%s", reg.cache_dir, rp->name);
+            char actual_hash[65] = {0};
+            if (zan_pkg_compute_tree_checksum(pkg_dir, actual_hash)) {
+                if (strcmp(actual_hash, rp->checksum) != 0) {
+                    fprintf(stderr, "error: checksum mismatch for package '%s': expected %s, got %s\n",
+                            rp->name, rp->checksum, actual_hash);
+                    all_ok = false;
+                }
+            }
+        }
     }
+
+    if (!all_ok) {
+        fprintf(stderr, "error: failed to restore one or more dependencies\n");
+        zan_pkg_registry_destroy(&reg);
+        zan_pkg_destroy(&pkg);
+        return 1;
+    }
+
     printf("All dependencies restored successfully.\n");
 
     zan_pkg_registry_destroy(&reg);
