@@ -20,32 +20,14 @@ namespace System.Ai;
 // 校验失败**不要抛异常**——回一个错误结果给模型（`AiToolResult.isError`
 // 为 true），让它看到错误并自己纠正。抛异常会把整个循环打断。
 
-// 工具实现：吃一份参数 JSON，吐一份结果。
-public async delegate string AiToolFn(JsonValue args);
+// 工具实现：吃一份参数字典，吐一份结果。
+public async delegate string AiToolFn(Dictionary<string, string> args);
 
-// **同步**的工具实现。
-//
-// 为什么要有同步这一版：工具要做的事**大多数不碰 IO**（算一下、查个内存
-// 里的字典、格式化一段文字）。强迫它们写成 `async` 只是让每个实现多一
-// 个 `await` 的噪声，而且同步实现根本不能赋给异步委托（编译器直接
-// 报"cannot convert non-async method to async delegate"）。
-//
-// 什么时候该用异步版：工具要碰 IO（查数据库、调 HTTP、读文件）——
-// 同步实现会停掉事件循环，把并发限制在 worker 数量上。
-public delegate string AiToolSyncFn(JsonValue args);
+// 同步的工具实现。
+public delegate string AiToolSyncFn(Dictionary<string, string> args);
 
-// 工具实现：**直接给出结果**的那一版。
-//
-// ## 为什么要有第三版
-//
-// 前两版（异步 / 同步）都只能回一个**字符串**，"失败"只能用 null
-// 表示——于是 `Call` 只能给出一句**泛化文案**（"工具执行失败：<名字>"）。
-// 实现自己知道的具体原因（远端返回的错误正文、缺哪个参数）就丢了。
-// 模型看到泛化文案没法纠正，只能编一个答案。
-//
-// 这一版让实现**自己给出结果**：成功内容、是不是错误、错误的具体原因
-// 都由实现说了算，`Call` 只补上调用 id（实现不知道调用 id）。
-public async delegate AiToolResult AiToolResultFn(JsonValue args);
+// 工具实现：直接给出结果的那一版。
+public async delegate AiToolResult AiToolResultFn(Dictionary<string, string> args);
 
 // 一个工具的**实现**（声明 + 代码）。
 public class AiToolImpl {
@@ -217,27 +199,19 @@ public class ToolRegistry {
         return outp;
     }
 
-    // 工具声明的 JSON 数组 DOM（发给服务方）。
-    public JsonValue DeclarationsArray() {
-        JsonValue arr = JsonValue.NewArray();
-        List<AiTool> decls = this.Declarations();
-        for (int i = 0; i < decls.Count; i = i + 1) {
-            arr.Append(decls[i].ToJson());
-        }
-        return arr;
-    }
-
     // 工具声明的 JSON 数组（发给服务方）。
     public string DeclarationsJson() {
-        return this.DeclarationsArray().ToJson();
+        JsonWriter w = new JsonWriter();
+        w.StartArray();
+        List<AiTool> decls = this.Declarations();
+        for (int i = 0; i < decls.Count; i = i + 1) {
+            decls[i].WriteTo(w);
+        }
+        w.EndArray();
+        return w.ToJson();
     }
 
     // 按名字执行一次调用。
-    //
-    // 找不到工具 → 返回错误结果（不是异常）：模型可能幻觉出一个不存
-    // 在的工具名，把它当错误回给模型，它会自己纠正。
-    //
-    // 参数解析失败 → 同样回错误结果。
     public async AiToolResult Call(AiToolCall call) {
         this.lastError = "";
         if (call == null) {
@@ -247,7 +221,7 @@ public class ToolRegistry {
             this.lastError = "没有这个工具：" + call.name;
             return AiToolResult.Error(call.id, this.lastError);
         }
-        JsonValue args = call.ParseArgs();
+        Dictionary<string, string> args = call.ParseArgs();
         if (args == null) {
             this.lastError = "工具参数不是合法 JSON：" + call.name;
             return AiToolResult.Error(call.id, this.lastError);

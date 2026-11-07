@@ -159,30 +159,33 @@ public class AnthropicClient : IChat {
             this.lastError = "没有消息";
             return AiStreamResult.Failure(this.lastError);
         }
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", this.config.model);
-        // `max_tokens` 在 Anthropic 是**必填**。
-        body.PutInt("max_tokens", this.config.maxTokens);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", this.config.model);
+        w.WriteProperty("max_tokens", this.config.maxTokens);
         if (temperature >= 0.0) {
-            body.PutDouble("temperature", temperature);
+            w.WriteProperty("temperature", temperature);
         }
-        body.PutBool("stream", true);
-        // 系统提示：Anthropic 是**顶层字段**，不是 messages 里的一条。
+        w.WriteProperty("stream", true);
         string system = AnthropicClient.SystemText(messages);
         if (system.Length > 0) {
-            body.PutStr("system", system);
+            w.WriteProperty("system", system);
         }
-        body.Put("messages", AnthropicClient.MessagesJson(messages));
+        w.WriteKey("messages");
+        AnthropicClient.WriteMessages(w, messages);
         if (tools != null && tools.Count > 0) {
-            body.Put("tools", AnthropicClient.ToolsJson(tools));
-            JsonValue choice = JsonValue.NewObject();
-            choice.PutStr("type", "auto");
-            body.Put("tool_choice", choice);
+            w.WriteKey("tools");
+            AnthropicClient.WriteTools(w, tools);
+            w.WriteKey("tool_choice");
+            w.StartObject();
+            w.WriteProperty("type", "auto");
+            w.EndObject();
         }
-        string payload = body.ToJson();
+        w.EndObject();
+        string payload = w.ToJson();
         if (payload.Length > this.config.requestLimitBytes) {
             this.lastError = "请求体超过上限（"
-            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+                + this.config.requestLimitBytes.ToString() + " 字节）";
             return AiStreamResult.Failure(this.lastError);
         }
         HttpClient http = this.StreamClient(ep);
@@ -217,34 +220,37 @@ public class AnthropicClient : IChat {
             this.lastError = "没有消息";
             return null;
         }
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", this.config.model);
-        // `max_tokens` 在 Anthropic 是**必填**（OpenAI 兼容那边是可选的
-        // `max_completion_tokens`）。不给就直接 400。
-        body.PutInt("max_tokens", this.config.maxTokens);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", this.config.model);
+        w.WriteProperty("max_tokens", this.config.maxTokens);
         if (temperature >= 0.0) {
-            body.PutDouble("temperature", temperature);
+            w.WriteProperty("temperature", temperature);
         }
-        body.PutBool("stream", false);
-        // 系统提示：Anthropic 是**顶层字段**，不是 messages 里的一条。
+        w.WriteProperty("stream", false);
         string system = AnthropicClient.SystemText(messages);
         if (system.Length > 0) {
-            body.PutStr("system", system);
+            w.WriteProperty("system", system);
         }
         if (stop != null && stop.Length > 0) {
-            JsonValue seqs = JsonValue.NewArray();
-            seqs.AppendStr(stop);
-            body.Put("stop_sequences", seqs);
+            w.WriteKey("stop_sequences");
+            w.StartArray();
+            w.WriteString(stop);
+            w.EndArray();
         }
-        body.Put("messages", AnthropicClient.MessagesJson(messages));
+        w.WriteKey("messages");
+        AnthropicClient.WriteMessages(w, messages);
         if (tools != null && tools.Count > 0) {
-            body.Put("tools", AnthropicClient.ToolsJson(tools));
-            JsonValue choice = JsonValue.NewObject();
-            choice.PutStr("type", "auto");
-            body.Put("tool_choice", choice);
+            w.WriteKey("tools");
+            AnthropicClient.WriteTools(w, tools);
+            w.WriteKey("tool_choice");
+            w.StartObject();
+            w.WriteProperty("type", "auto");
+            w.EndObject();
         }
+        w.EndObject();
 
-        string raw = await this.PostJson(ep, body);
+        string raw = await this.PostJson(ep, w.ToJson());
         if (raw == null) { return null; }
         JsonDoc doc = null;
         try {
@@ -272,15 +278,10 @@ public class AnthropicClient : IChat {
     }
 
     // 发起一次 POST（带重试）。失败返回 null，原因在 lastError。
-    //
-    // 4xx 不重试（请求本身有问题：key 错、参数错、额度不足）。5xx 与网络
-    // 错误才重试（指数退避，上限 2 秒）。默认不重试（补全没有幂等键，
-    // 重试可能重复计费）。
-    public async string PostJson(AiEndpoint ep, JsonValue body) {
-        string payload = body.ToJson();
+    public async string PostJson(AiEndpoint ep, string payload) {
         if (payload.Length > this.config.requestLimitBytes) {
             this.lastError = "请求体超过上限（"
-            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+                + this.config.requestLimitBytes.ToString() + " 字节）";
             return null;
         }
         int attempts = this.config.maxAttempts;
@@ -306,7 +307,7 @@ public class AnthropicClient : IChat {
                     this.lastError = AnthropicClient.HttpErrorMessage(status, bodyText);
                     return null;
                 }
-                lastReason = "Anthropic 服务返回 " + Convert.ToString(status);
+                lastReason = "Anthropic 服务返回 " + status.ToString();
             } catch (Exception e) {
                 lastReason = "请求 Anthropic 服务失败：" + e.Message;
             }
@@ -427,131 +428,137 @@ public class AnthropicClient : IChat {
     //    块）——见类注释里那段"必须做对的细节"。
     // 3. 正文从字符串变成**内容块数组**；assistant 的工具调用变成
     //    `tool_use` 块。
-    public static JsonValue MessagesJson(List<AiMessage> messages) {
-        JsonValue arr = JsonValue.NewArray();
-        if (messages == null) { return arr; }
-        // 待合并的 tool_result 块（连续的工具结果共用一条 user 消息）。
-        JsonValue pending = null;
+    public static void WriteMessages(JsonWriter w, List<AiMessage> messages) {
+        w.StartArray();
+        if (messages == null) { w.EndArray(); return; }
+        bool pendingToolResult = false;
         for (int i = 0; i < messages.Count; i = i + 1) {
             AiMessage m = messages[i];
-            if (m == null) { continue; }
-            if (m.role == "system") { continue; }
+            if (m == null || m.role == "system") { continue; }
             if (m.role == "tool") {
-                JsonValue block = JsonValue.NewObject();
-                block.PutStr("type", "tool_result");
-                block.PutStr("tool_use_id", m.toolCallId);
-                block.PutStr("content", m.content == null ? "" : m.content);
-                if (pending == null) {
-                    pending = JsonValue.NewArray();
-                    JsonValue um = JsonValue.NewObject();
-                    um.PutStr("role", "user");
-                    um.Put("content", pending);
-                    arr.Append(um);
+                if (!pendingToolResult) {
+                    w.StartObject();
+                    w.WriteProperty("role", "user");
+                    w.WriteKey("content");
+                    w.StartArray();
+                    pendingToolResult = true;
                 }
-                pending.Append(block);
+                w.StartObject();
+                w.WriteProperty("type", "tool_result");
+                w.WriteProperty("tool_use_id", m.toolCallId);
+                w.WriteProperty("content", m.content == null ? "" : m.content);
+                w.EndObject();
                 continue;
             }
-            // 别的角色打断了工具结果的连续性。
-            pending = null;
-            JsonValue msg = JsonValue.NewObject();
-            msg.PutStr("role", m.role);
-            JsonValue blocks = JsonValue.NewArray();
+            if (pendingToolResult) {
+                w.EndArray();
+                w.EndObject();
+                pendingToolResult = false;
+            }
+            w.StartObject();
+            w.WriteProperty("role", m.role);
+            w.WriteKey("content");
+            w.StartArray();
             if (m.role == "assistant") {
                 if (m.content != null && m.content.Length > 0) {
-                    JsonValue t = JsonValue.NewObject();
-                    t.PutStr("type", "text");
-                    t.PutStr("text", m.content);
-                    blocks.Append(t);
+                    w.StartObject();
+                    w.WriteProperty("type", "text");
+                    w.WriteProperty("text", m.content);
+                    w.EndObject();
                 }
                 for (int j = 0; j < m.toolCalls.Count; j = j + 1) {
                     AiToolCall c = m.toolCalls[j];
-                    JsonValue use = JsonValue.NewObject();
-                    use.PutStr("type", "tool_use");
-                    use.PutStr("id", c.id);
-                    use.PutStr("name", c.name);
-                    use.Put("input", AnthropicClient.InputOf(c.arguments));
-                    blocks.Append(use);
+                    w.StartObject();
+                    w.WriteProperty("type", "tool_use");
+                    w.WriteProperty("id", c.id);
+                    w.WriteProperty("name", c.name);
+                    w.WriteKey("input");
+                    if (c.arguments != null && c.arguments.Length > 0) {
+                        w.WriteRaw(c.arguments);
+                    } else {
+                        w.StartObject();
+                        w.EndObject();
+                    }
+                    w.EndObject();
                 }
             } else {
-                JsonValue t = JsonValue.NewObject();
-                t.PutStr("type", "text");
-                t.PutStr("text", m.content == null ? "" : m.content);
-                blocks.Append(t);
+                w.StartObject();
+                w.WriteProperty("type", "text");
+                w.WriteProperty("text", m.content == null ? "" : m.content);
+                w.EndObject();
             }
-            msg.Put("content", blocks);
-            arr.Append(msg);
+            w.EndArray();
+            w.EndObject();
         }
-        return arr;
+        if (pendingToolResult) {
+            w.EndArray();
+            w.EndObject();
+        }
+        w.EndArray();
     }
 
-    // 工具声明（实体）→ Anthropic 的 `tools` 数组。
-    //
-    // 形状差异只在壳上：OpenAI 兼容是
-    // `{"type":"function","function":{name,description,parameters}}`，
-    // Anthropic 是 `{"name":...,"description":...,"input_schema":{...}}`。
-    // 参数 schema 本身**原样搬**——两边都是 JSON Schema。
-    public static JsonValue ToolsJson(List<AiTool> tools) {
-        JsonValue arr = JsonValue.NewArray();
-        if (tools == null) { return arr; }
-        for (int i = 0; i < tools.Count; i = i + 1) {
-            AiTool t = tools[i];
-            if (t == null) { continue; }
-            JsonValue one = JsonValue.NewObject();
-            one.PutStr("name", t.name);
-            one.PutStr("description", t.description);
-            if (t.parameters != null) {
-                one.Put("input_schema", t.parameters);
-            } else {
-                JsonValue p = JsonValue.NewObject();
-                p.PutStr("type", "object");
-                one.Put("input_schema", p);
-            }
-            arr.Append(one);
-        }
-        return arr;
+    public static string MessagesJson(List<AiMessage> messages) {
+        JsonWriter w = new JsonWriter();
+        AnthropicClient.WriteMessages(w, messages);
+        return w.ToJson();
     }
 
-    // 工具参数（JSON 串）→ Anthropic 的 `input` 对象。
-    //
-    // 解析不了就用空对象——参数坏掉时这次调用本来也执行不了，**不能因为
-    // 解析失败把整个请求打回去**（那会让对话直接断掉）。
-    public static JsonValue InputOf(string arguments) {
+    public static void WriteTools(JsonWriter w, List<AiTool> tools) {
+        w.StartArray();
+        if (tools != null) {
+            for (int i = 0; i < tools.Count; i = i + 1) {
+                AiTool t = tools[i];
+                if (t == null) { continue; }
+                w.StartObject();
+                w.WriteProperty("name", t.name);
+                w.WriteProperty("description", t.description);
+                w.WriteKey("input_schema");
+                if (t.parametersJson != null && t.parametersJson.Length > 0) {
+                    w.WriteRaw(t.parametersJson);
+                } else if (t.parameters != null) {
+                    w.WriteRaw(Json.Serialize(t.parameters));
+                } else {
+                    w.StartObject();
+                    w.WriteProperty("type", "object");
+                    w.EndObject();
+                }
+                w.EndObject();
+            }
+        }
+        w.EndArray();
+    }
+
+    public static string ToolsJson(List<AiTool> tools) {
+        JsonWriter w = new JsonWriter();
+        AnthropicClient.WriteTools(w, tools);
+        return w.ToJson();
+    }
+
+    public static string InputOf(string arguments) {
         if (arguments == null || arguments.Length == 0) {
-            return JsonValue.NewObject();
+            return "{}";
         }
-        JsonValue v = null;
         try {
-            v = JsonValue.Parse(arguments);
-        } catch (Exception e) {
-            v = null;
+            JsonDoc doc = JsonDoc.Parse(arguments);
+            if (doc != null && doc.KindAt(0) == 5) {
+                return arguments;
+            }
+        } catch (Exception _ex) {
         }
-        if (v == null || !v.IsObject()) { return JsonValue.NewObject(); }
-        return v;
+        return "{}";
     }
 
-    // 解析 Anthropic 的响应（公开是为了能单独测）。
-    //
-    // 坏 JSON → 返回 null。**错误响应也返回 null**（错误文案由调用方从
-    // 响应里取——静态方法碰不到实例的 lastError）。
     public static AiToolTurn ParseTurn(string raw) {
-        if (raw == null) { return null; }
-        JsonDoc doc = null;
+        if (raw == null || raw.Length == 0) { return null; }
         try {
-            doc = JsonDoc.Parse(raw);
-        } catch (Exception e) {
-            doc = null;
+            JsonDoc doc = JsonDoc.Parse(raw);
+            if (doc != null) {
+                return AnthropicClient.ParseTurn(doc);
+            }
+        } catch (Exception _ex) {
+            return null;
         }
-        if (doc != null && doc.root >= 0) {
-            return AnthropicClient.ParseTurn(doc);
-        }
-        JsonValue root = null;
-        try {
-            root = JsonValue.Parse(raw);
-        } catch (Exception e) {
-            root = null;
-        }
-        if (root == null) { return null; }
-        return AnthropicClient.ParseTurn(root);
+        return null;
     }
 
     public static AiToolTurn ParseTurn(JsonDoc doc) {
@@ -583,37 +590,6 @@ public class AnthropicClient : IChat {
         return turn;
     }
 
-    // 解析 Anthropic 的响应体。
-    //
-    // `content` 是内容块数组：文本块拼成正文，`tool_use` 块变成工具调用
-    // （`input` 对象转回 JSON 串——`AiToolCall.arguments` 的约定是
-    // "JSON 串"）。
-    public static AiToolTurn ParseTurn(JsonValue root) {
-        if (root == null || !root.IsObject()) { return null; }
-        JsonValue content = root.Get("content");
-        if (content == null || !content.IsArray()) { return null; }
-        AiToolTurn turn = new AiToolTurn();
-        turn.finishReason = root.Str("stop_reason", "");
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < content.Count(); i = i + 1) {
-            JsonValue block = content.At(i);
-            if (block == null || !block.IsObject()) { continue; }
-            string type = block.Str("type", "");
-            if (type == "text") {
-                string t = block.Str("text", "");
-                if (sb.Length > 0) { sb.Append("\n"); }
-                sb.Append(t);
-            } else if (type == "tool_use") {
-                JsonValue input = block.Get("input");
-                string args = input == null ? "{}" : input.ToJson();
-                turn.toolCalls.Add(new AiToolCall(block.Str("id", ""),
-                    block.Str("name", ""), args));
-            }
-        }
-        turn.content = sb.ToString();
-        return turn;
-    }
-
     // 从 HTTP 响应里提错误文案（4xx 时的解释）。
     private static string HttpErrorMessage(int status, string body) {
         string detail = "";
@@ -629,7 +605,7 @@ public class AnthropicClient : IChat {
             }
         }
         if (detail.Length == 0) {
-            detail = "Anthropic 服务返回 " + Convert.ToString(status);
+            detail = "Anthropic 服务返回 " + status.ToString();
         }
         return detail;
     }
@@ -641,16 +617,6 @@ public class AnthropicClient : IChat {
         if (usage < 0) { return; }
         int p = doc.IntAt(doc.Get(usage, "input_tokens"), 0);
         int c = doc.IntAt(doc.Get(usage, "output_tokens"), 0);
-        if (p <= 0 && c <= 0) { return; }
-        this.lastUsage = new AiUsage(p, c, false);
-    }
-
-    private void CaptureUsage(JsonValue root) {
-        if (root == null) { return; }
-        JsonValue usage = root.Get("usage");
-        if (usage == null || !usage.IsObject()) { return; }
-        int p = usage.Int("input_tokens", 0);
-        int c = usage.Int("output_tokens", 0);
         if (p <= 0 && c <= 0) { return; }
         this.lastUsage = new AiUsage(p, c, false);
     }

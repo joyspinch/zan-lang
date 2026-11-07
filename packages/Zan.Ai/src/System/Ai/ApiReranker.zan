@@ -81,19 +81,22 @@ public class ApiReranker : IReranker {
         while (start < total) {
             int take = this.batchSize;
             if (start + take > total) { take = total - start; }
-            JsonValue batch = JsonValue.NewArray();
+            JsonWriter w = new JsonWriter();
+            w.StartObject();
+            w.WriteProperty("model", this.client.config.model);
+            w.WriteProperty("query", query);
+            w.WriteKey("documents");
+            w.StartArray();
             for (int i = 0; i < take; i = i + 1) {
                 string d = documents[start + i];
-                batch.AppendStr(d == null ? "" : d);
+                w.WriteString(d == null ? "" : d);
             }
-            JsonValue body = JsonValue.NewObject();
-            body.PutStr("model", this.client.config.model);
-            body.PutStr("query", query);
-            body.Put("documents", batch);
-            body.PutInt("top_n", take);
-            body.PutBool("return_documents", false);
+            w.EndArray();
+            w.WriteProperty("top_n", take);
+            w.WriteProperty("return_documents", false);
+            w.EndObject();
 
-            string raw = await this.client.PostJson(ep, "/rerank", body);
+            string raw = await this.client.PostJson(ep, "/rerank", w.ToJson());
             if (raw == null) {
                 this.lastError = "重排服务调用失败：" + this.client.lastError;
                 return null;
@@ -124,47 +127,50 @@ public class ApiReranker : IReranker {
     // baseIndex 是本批在**原始候选数组**里的起始下标——分批时要把下标
     // 映射回全局位置。
     public List<RerankHit> Parse(string raw, int baseIndex) {
-        JsonValue root = null;
+        if (raw == null || raw.Length == 0) {
+            this.lastError = "重排服务返回的内容无法解析";
+            return null;
+        }
+        List<RerankHit> outp = new List<RerankHit>();
         try {
-            root = JsonValue.Parse(raw);
+            JsonDoc doc = JsonDoc.Parse(raw);
+            if (doc == null || doc.KindAt(0) != 5) {
+                this.lastError = "重排服务返回的内容无法解析";
+                return null;
+            }
+            int err = doc.Get(0, "error");
+            if (err >= 0 && doc.KindAt(err) == 5) {
+                int msg = doc.Get(err, "message");
+                if (msg >= 0 && doc.KindAt(msg) == 3) {
+                    this.lastError = doc.StrAt(msg, "重排服务返回错误");
+                } else {
+                    this.lastError = "重排服务返回错误";
+                }
+                return null;
+            }
+            int results = doc.Get(0, "results");
+            if (results < 0 || doc.KindAt(results) != 4) {
+                this.lastError = "重排服务没有返回结果";
+                return null;
+            }
+            int count = doc.Count(results);
+            int one = doc.FirstChild(results);
+            for (int i = 0; i < count; i = i + 1) {
+                if (one < 0) { break; }
+                int idxVal = doc.Get(one, "index");
+                int at = baseIndex + (idxVal < 0 ? i : doc.IntAt(idxVal, i));
+                double score = 0.0;
+                int sc = doc.Get(one, "relevance_score");
+                if (sc < 0) { sc = doc.Get(one, "score"); }
+                if (sc >= 0) { score = doc.DoubleAt(sc, 0.0); }
+                outp.Add(new RerankHit(at, score));
+                one = doc.NextSibling(one);
+            }
+            return outp;
         } catch (Exception e) {
             this.lastError = "重排服务返回的内容无法解析";
             return null;
         }
-        if (root == null) {
-            this.lastError = "重排服务返回的内容无法解析";
-            return null;
-        }
-        // 服务商的错误体（{"error": {...}}）——取出可读原因。
-        JsonValue err = root.Get("error");
-        if (err != null && err.IsObject()) {
-            JsonValue msg = err.Get("message");
-            if (msg != null && msg.IsString()) {
-                this.lastError = msg.AsString("重排服务返回错误");
-            } else {
-                this.lastError = "重排服务返回错误";
-            }
-            return null;
-        }
-        JsonValue results = root.Get("results");
-        if (results == null || !results.IsArray()) {
-            this.lastError = "重排服务没有返回结果";
-            return null;
-        }
-        List<RerankHit> outp = new List<RerankHit>();
-        for (int i = 0; i < results.Count(); i = i + 1) {
-            JsonValue one = results.At(i);
-            if (one == null) { continue; }
-            JsonValue idxVal = one.Get("index");
-            // 按 index 归位（不靠数组顺序）。
-            int at = baseIndex + (idxVal == null ? i : (int)idxVal.AsDouble((double)i));
-            double score = 0.0;
-            JsonValue sc = one.Get("relevance_score");
-            if (sc == null) { sc = one.Get("score"); }
-            if (sc != null) { score = sc.AsDouble(0.0); }
-            outp.Add(new RerankHit(at, score));
-        }
-        return outp;
     }
 
     // 分数降序；同分按**原下标升序**（保证确定性——同分的顺序不能

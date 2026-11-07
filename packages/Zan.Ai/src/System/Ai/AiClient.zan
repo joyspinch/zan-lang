@@ -109,18 +109,21 @@ public class AiClient : IDisposable, IChat {
             this.lastError = "没有指定模型";
             return null;
         }
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", this.config.model);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", this.config.model);
         if (temperature >= 0.0) {
-            body.PutDouble("temperature", temperature);
+            w.WriteProperty("temperature", temperature);
         }
         if (stop != null && stop.Length > 0) {
-            body.PutStr("stop", stop);
+            w.WriteProperty("stop", stop);
         }
-        body.PutBool("stream", false);
-        body.Put("messages", AiClient.MessagesArray(messages));
+        w.WriteProperty("stream", false);
+        w.WriteKey("messages");
+        AiClient.WriteMessagesJson(w, messages);
+        w.EndObject();
 
-        string raw = await this.PostJson(ep, "/chat/completions", body);
+        string raw = await this.PostJson(ep, "/chat/completions", w.ToJson());
         if (raw == null) { return null; }
         JsonDoc doc = null;
         try {
@@ -177,37 +180,30 @@ public class AiClient : IDisposable, IChat {
             this.lastError = "没有指定模型";
             return null;
         }
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", this.config.model);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", this.config.model);
         if (temperature >= 0.0) {
-            body.PutDouble("temperature", temperature);
+            w.WriteProperty("temperature", temperature);
         }
-        body.PutBool("stream", false);
-        body.Put("messages", AiClient.MessagesArray(messages));
+        w.WriteProperty("stream", false);
+        w.WriteKey("messages");
+        AiClient.WriteMessagesJson(w, messages);
         if (tools != null && tools.Count > 0) {
-            body.Put("tools", AiClient.DeclarationsArray(tools));
-            body.PutStr("tool_choice", "auto");
+            w.WriteKey("tools");
+            AiClient.WriteDeclarations(w, tools);
+            w.WriteProperty("tool_choice", "auto");
         }
+        w.EndObject();
 
-        string raw = await this.PostJson(ep, "/chat/completions", body);
+        string raw = await this.PostJson(ep, "/chat/completions", w.ToJson());
         if (raw == null) { return null; }
-        JsonValue root = null;
-        try {
-            root = JsonValue.Parse(raw);
-        } catch (Exception e) {
-            this.lastError = "AI 服务返回的内容无法解析";
-            return null;
-        }
-        if (root == null) {
-            this.lastError = "AI 服务返回的内容无法解析";
-            return null;
-        }
-        AiToolTurn turn = AiClient.ParseToolTurn(root);
+        AiToolTurn turn = AiClient.ParseToolTurn(raw);
         if (turn == null) {
             this.lastError = "AI 服务返回的内容无法解析";
             return null;
         }
-        this.CaptureUsage(root);
+        this.CaptureUsage(raw);
         return turn;
     }
 
@@ -232,87 +228,70 @@ public class AiClient : IDisposable, IChat {
             this.lastError = "没有指定模型";
             return null;
         }
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", this.config.model);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", this.config.model);
         if (temperature >= 0.0) {
-            body.PutDouble("temperature", temperature);
+            w.WriteProperty("temperature", temperature);
         }
-        body.PutBool("stream", false);
-        body.Put("messages", AiClient.MessagesArray(messages));
+        w.WriteProperty("stream", false);
+        w.WriteKey("messages");
+        AiClient.WriteMessagesJson(w, messages);
         if (toolsJson != null && toolsJson.Length > 0) {
-            body.PutJson("tools", toolsJson);
-            // 让模型在需要时自己决定不调（有些服务方默认不许不调）。
-            body.PutStr("tool_choice", "auto");
+            w.WriteRawProperty("tools", toolsJson);
+            w.WriteProperty("tool_choice", "auto");
         }
+        w.EndObject();
 
-        string raw = await this.PostJson(ep, "/chat/completions", body);
+        string raw = await this.PostJson(ep, "/chat/completions", w.ToJson());
         if (raw == null) { return null; }
-        JsonValue root = null;
-        try {
-            root = JsonValue.Parse(raw);
-        } catch (Exception e) {
-            this.lastError = "AI 服务返回的内容无法解析";
-            return null;
-        }
-        if (root == null) {
-            this.lastError = "AI 服务返回的内容无法解析";
-            return null;
-        }
-        AiToolTurn turn = AiClient.ParseToolTurn(root);
+        AiToolTurn turn = AiClient.ParseToolTurn(raw);
         if (turn == null) {
             this.lastError = "AI 服务返回的内容无法解析";
             return null;
         }
-        this.CaptureUsage(root);
-        return turn;
-    }
-
-    // 解析带工具的响应 DOM。
-    public static AiToolTurn ParseToolTurn(JsonValue root) {
-        if (root == null) { return null; }
-        string errMsg = AiClient.ErrorMessage(root);
-        if (errMsg.Length > 0) { return null; }
-        JsonValue choices = root.Get("choices");
-        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
-            return null;
-        }
-        JsonValue choice = choices.At(0);
-        if (choice == null) { return null; }
-        JsonValue msg = choice.Get("message");
-        if (msg == null) { return null; }
-
-        AiToolTurn turn = new AiToolTurn();
-        turn.content = msg.Str("content", "");
-        turn.finishReason = choice.Str("finish_reason", "");
-        // 工具调用：按 index 归位（不靠数组顺序）。
-        JsonValue calls = msg.Get("tool_calls");
-        if (calls != null && calls.IsArray()) {
-            for (int i = 0; i < calls.Count(); i = i + 1) {
-                JsonValue one = calls.At(i);
-                if (one == null) { continue; }
-                string id = one.Str("id", "");
-                JsonValue fn = one.Get("function");
-                if (fn == null) { continue; }
-                string name = fn.Str("name", "");
-                string args = fn.Str("arguments", "");
-                turn.toolCalls.Add(new AiToolCall(id, name, args));
-            }
-        }
+        this.CaptureUsage(raw);
         return turn;
     }
 
     // 解析带工具的响应文本（公开是为了能单独测——归位、错误提取全在这里）。
-    //
     // 坏 JSON → 返回 null。
     public static AiToolTurn ParseToolTurn(string raw) {
-        if (raw == null) { return null; }
-        JsonValue root = null;
+        if (raw == null || raw.Length == 0) { return null; }
         try {
-            root = JsonValue.Parse(raw);
-        } catch (Exception e) {
+            JsonDoc doc = JsonDoc.Parse(raw);
+            if (doc == null || doc.KindAt(0) != 5) { return null; }
+            int err = doc.Get(0, "error");
+            if (err >= 0) { return null; }
+            int choices = doc.Get(0, "choices");
+            if (choices < 0 || doc.KindAt(choices) != 4 || doc.Count(choices) == 0) {
+                return null;
+            }
+            int choice = doc.FirstChild(choices);
+            if (choice < 0) { return null; }
+            int msg = doc.Get(choice, "message");
+            if (msg < 0) { return null; }
+            AiToolTurn turn = new AiToolTurn();
+            turn.content = doc.Str(msg, "content", "");
+            turn.finishReason = doc.Str(choice, "finish_reason", "");
+            int calls = doc.Get(msg, "tool_calls");
+            if (calls >= 0 && doc.KindAt(calls) == 4) {
+                int p = doc.FirstChild(calls);
+                while (p >= 0) {
+                    string id = doc.Str(p, "id", "");
+                    int fn = doc.Get(p, "function");
+                    if (fn >= 0) {
+                        string name = doc.Str(fn, "name", "");
+                        string args = doc.Str(fn, "arguments", "");
+                        turn.toolCalls.Add(new AiToolCall(id, name, args));
+                    }
+                    p = doc.NextSibling(p);
+                }
+            }
+            return turn;
+        } catch (Exception _ex) {
             return null;
         }
-        return AiClient.ParseToolTurn(root);
     }
 
     // 补全并返回用量（成本核算用）。
@@ -345,18 +324,21 @@ public class AiClient : IDisposable, IChat {
             this.lastError = "服务地址不合法: " + this.config.baseUrl;
             return null;
         }
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", this.config.model);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", this.config.model);
         if (temperature >= 0.0) {
-            body.PutDouble("temperature", temperature);
+            w.WriteProperty("temperature", temperature);
         }
-        body.PutBool("stream", true);
-        body.Put("messages", AiClient.MessagesArray(messages));
+        w.WriteProperty("stream", true);
+        w.WriteKey("messages");
+        AiClient.WriteMessagesJson(w, messages);
+        w.EndObject();
 
-        string payload = body.ToJson();
+        string payload = w.ToJson();
         if (payload.Length > this.config.requestLimitBytes) {
             this.lastError = "请求体超过上限（"
-            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+                + this.config.requestLimitBytes.ToString() + " 字节）";
             return null;
         }
 
@@ -472,22 +454,25 @@ public class AiClient : IDisposable, IChat {
             this.lastError = "没有消息";
             return AiStreamResult.Failure(this.lastError);
         }
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", this.config.model);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", this.config.model);
         if (temperature >= 0.0) {
-            body.PutDouble("temperature", temperature);
+            w.WriteProperty("temperature", temperature);
         }
-        body.PutBool("stream", true);
-        body.Put("messages", AiClient.MessagesArray(messages));
+        w.WriteProperty("stream", true);
+        w.WriteKey("messages");
+        AiClient.WriteMessagesJson(w, messages);
         if (tools != null && tools.Count > 0) {
-            body.Put("tools", AiClient.DeclarationsArray(tools));
-            // 让模型在需要时自己决定不调（有些服务方默认不许不调）。
-            body.PutStr("tool_choice", "auto");
+            w.WriteKey("tools");
+            AiClient.WriteDeclarations(w, tools);
+            w.WriteProperty("tool_choice", "auto");
         }
-        string payload = body.ToJson();
+        w.EndObject();
+        string payload = w.ToJson();
         if (payload.Length > this.config.requestLimitBytes) {
             this.lastError = "请求体超过上限（"
-            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+                + this.config.requestLimitBytes.ToString() + " 字节）";
             return AiStreamResult.Failure(this.lastError);
         }
         HttpClient http = this.StreamClient(ep);
@@ -579,11 +564,10 @@ public class AiClient : IDisposable, IChat {
     //
     // public 是因为 `Embeddings` 也用它（同一套出网预算与重试策略
     // 不该写两遍）。包内调用不会绕过 lastError 的约定。
-    public async string PostJson(AiEndpoint ep, string path, JsonValue body) {
-        string payload = body.ToJson();
+    public async string PostJson(AiEndpoint ep, string path, string payload) {
         if (payload.Length > this.config.requestLimitBytes) {
             this.lastError = "请求体超过上限（"
-            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+                + this.config.requestLimitBytes.ToString() + " 字节）";
             return null;
         }
         int attempts = this.config.maxAttempts;
@@ -610,7 +594,7 @@ public class AiClient : IDisposable, IChat {
                     this.lastError = AiClient.HttpErrorMessage(status, bodyText);
                     return null;
                 }
-                lastReason = "AI 服务返回 " + Convert.ToString(status);
+                lastReason = "AI 服务返回 " + status.ToString();
             } catch (Exception e) {
                 lastReason = "请求 AI 服务失败：" + e.Message;
             }
@@ -666,80 +650,71 @@ public class AiClient : IDisposable, IChat {
     //
     // 与 `ToolRegistry.DeclarationsJson` 同一形状——放在这里是为了让
     // 客户端不依赖注册表（注册表只是"声明 + 实现"的一个来源）。
-    // 工具声明（实体）→ OpenAI 兼容的线格式 JSON 数组 DOM。
-    public static JsonValue DeclarationsArray(List<AiTool> tools) {
-        JsonValue arr = JsonValue.NewArray();
-        if (tools == null) { return arr; }
-        for (int i = 0; i < tools.Count; i = i + 1) {
-            AiTool t = tools[i];
-            if (t == null) { continue; }
-            arr.Append(t.ToJson());
+    // 工具声明（实体）写入 JSON。
+    public static void WriteDeclarations(JsonWriter w, List<AiTool> tools) {
+        w.StartArray();
+        if (tools != null) {
+            for (int i = 0; i < tools.Count; i = i + 1) {
+                if (tools[i] != null) { tools[i].WriteTo(w); }
+            }
         }
-        return arr;
+        w.EndArray();
     }
 
     // 工具声明（实体）→ OpenAI 兼容的线格式 JSON 数组文本。
-    //
-    // 与 `ToolRegistry.DeclarationsJson` 同一形状——放在这里是为了让
-    // 客户端不依赖注册表（注册表只是"声明 + 实现"的一个来源）。
     public static string DeclarationsJson(List<AiTool> tools) {
-        return AiClient.DeclarationsArray(tools).ToJson();
+        JsonWriter w = new JsonWriter();
+        AiClient.WriteDeclarations(w, tools);
+        return w.ToJson();
     }
 
-    // 消息列表 → JSON 数组 DOM。
-    public static JsonValue MessagesArray(List<AiMessage> messages) {
-        JsonValue arr = JsonValue.NewArray();
-        if (messages == null) { return arr; }
-        for (int i = 0; i < messages.Count; i = i + 1) {
-            arr.Append(AiClient.MessageJson(messages[i]));
+    // 消息列表写入 JSON 数组。
+    public static void WriteMessagesJson(JsonWriter w, List<AiMessage> messages) {
+        w.StartArray();
+        if (messages != null) {
+            for (int i = 0; i < messages.Count; i = i + 1) {
+                AiClient.WriteMessageJson(w, messages[i]);
+            }
         }
-        return arr;
+        w.EndArray();
     }
 
     // 消息列表 → JSON 数组文本。
     public static string MessagesJson(List<AiMessage> messages) {
-        return AiClient.MessagesArray(messages).ToJson();
+        JsonWriter w = new JsonWriter();
+        AiClient.WriteMessagesJson(w, messages);
+        return w.ToJson();
     }
 
     // 单条消息的 JSON。
-    //
-    // 三种形态（见 `AiMessage` 的说明）：
-    // - system / user：role + content
-    // - assistant：role + content + tool_calls（可空）
-    // - tool：role + content + tool_call_id
-    public static JsonValue MessageJson(AiMessage msg) {
-        JsonValue m = JsonValue.NewObject();
-        m.PutStr("role", msg.role);
-        m.PutStr("content", msg.content);
+    public static void WriteMessageJson(JsonWriter w, AiMessage msg) {
+        w.StartObject();
+        w.WriteProperty("role", msg.role);
+        w.WriteProperty("content", msg.content);
         if (msg.IsTool() && msg.toolCallId.Length > 0) {
-            m.PutStr("tool_call_id", msg.toolCallId);
+            w.WriteProperty("tool_call_id", msg.toolCallId);
         }
         if (msg.IsAssistant() && msg.toolCalls.Count > 0) {
-            JsonValue calls = JsonValue.NewArray();
+            w.WriteKey("tool_calls");
+            w.StartArray();
             for (int i = 0; i < msg.toolCalls.Count; i = i + 1) {
                 AiToolCall c = msg.toolCalls[i];
-                JsonValue fn = JsonValue.NewObject();
-                fn.PutStr("name", c.name);
-                fn.PutStr("arguments", c.arguments);
-                JsonValue call = JsonValue.NewObject();
-                call.PutStr("id", c.id);
-                call.PutStr("type", "function");
-                call.Put("function", fn);
-                calls.Append(call);
+                w.StartObject();
+                w.WriteProperty("id", c.id);
+                w.WriteProperty("type", "function");
+                w.WriteKey("function");
+                w.StartObject();
+                w.WriteProperty("name", c.name);
+                w.WriteProperty("arguments", c.arguments);
+                w.EndObject();
+                w.EndObject();
             }
-            m.Put("tool_calls", calls);
+            w.EndArray();
         }
-        return m;
+        w.EndObject();
     }
 
     // 估算 token 数（启发式）。
-    //
-    // CJK 字符约 1 token，其余约 4 字符 1 token。这是各厂商 tokenizer
-    // 的经验区间，不是真值——精确计数要接厂商的 tokenizer。
-    //
-    // 与 `Chunking.EstimateTokens` 是**同一把尺子**（`Chunking.TokenCost`
-    // 的 4 倍刻度）——两处口径不一致会让"切出来说每块 100 token，
-    // 一算却是 25"。
     public static int EstimateTokens(string text) {
         return Chunking.EstimateTokens(text);
     }
@@ -753,13 +728,6 @@ public class AiClient : IDisposable, IChat {
         string msg = doc.StrAt(doc.Get(err, "message"), "");
         if (msg.Length > 0) { return msg; }
         return "AI 服务返回错误";
-    }
-
-    public static string ErrorMessage(JsonValue root) {
-        if (root == null) { return ""; }
-        JsonValue err = root.Get("error");
-        if (err == null || !err.IsObject()) { return ""; }
-        return err.Str("message", "AI 服务返回错误");
     }
 
     // 从 HTTP 响应里提错误文案（4xx 时的解释）。
@@ -777,30 +745,30 @@ public class AiClient : IDisposable, IChat {
             }
         }
         if (detail.Length == 0) {
-            detail = "AI 服务返回 " + Convert.ToString(status);
+            detail = "AI 服务返回 " + status.ToString();
         }
         return detail;
     }
 
     // 记录用量：服务端口径与本包一致就用服务端的，否则保持估算。
+    private void CaptureUsage(string raw) {
+        if (raw == null || raw.Length == 0) { return; }
+        try {
+            JsonDoc doc = JsonDoc.Parse(raw);
+            if (doc != null) {
+                this.CaptureUsage(doc);
+            }
+        } catch (Exception _ex) {
+            // 响应体非标准 JSON 或为流式截断片时捕获解析异常，保留客户端原有用量估算
+        }
+    }
+
     private void CaptureUsage(JsonDoc doc) {
         if (doc == null || doc.root < 0) { return; }
         int usage = doc.Get(doc.root, "usage");
         if (usage < 0) { return; }
         int p = doc.IntAt(doc.Get(usage, "prompt_tokens"), 0);
         int c = doc.IntAt(doc.Get(usage, "completion_tokens"), 0);
-        if (p <= 0 && c <= 0) { return; }
-        this.lastUsage = new AiUsage(p, c, false);
-    }
-
-    private void CaptureUsage(JsonValue root) {
-        JsonValue usage = root.Get("usage");
-        if (usage == null || !usage.IsObject()) { return; }
-        JsonValue pt = usage.Get("prompt_tokens");
-        JsonValue ct = usage.Get("completion_tokens");
-        if (pt == null && ct == null) { return; }
-        int p = pt == null ? 0 : (int)pt.AsDouble(0.0);
-        int c = ct == null ? 0 : (int)ct.AsDouble(0.0);
         if (p <= 0 && c <= 0) { return; }
         this.lastUsage = new AiUsage(p, c, false);
     }

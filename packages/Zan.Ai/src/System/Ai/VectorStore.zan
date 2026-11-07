@@ -135,60 +135,81 @@ public class VectorStore {
     // "id 变字符串键再变回来"的往返损耗（int → string → int 看着简单，
     // 但字符串键的 JSON 顺序不保证，重建时的对应关系就成了隐式约定）。
     public string ExportState() {
-        JsonValue obj = JsonValue.NewObject();
-        obj.PutInt("dimensions", this.dimensions);
-        obj.PutBool("normalized", this.normalized);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("dimensions", this.dimensions);
+        w.WriteProperty("normalized", this.normalized);
         if (this.index != null) {
-            obj.Put("index", this.index.ExportState());
+            w.WriteKey("index");
+            w.WriteRaw(this.index.ExportState().ToJson());
         }
         List<int> ids = this.Ids();
-        JsonValue idArr = JsonValue.NewArray();
-        JsonValue textArr = JsonValue.NewArray();
-        JsonValue metaArr = JsonValue.NewArray();
+        w.WriteKey("ids");
+        w.StartArray();
         for (int i = 0; i < ids.Count; i = i + 1) {
-            idArr.AppendInt(ids[i]);
-            textArr.AppendStr(this.texts[ids[i]]);
-            metaArr.AppendStr(this.metadata[ids[i]]);
+            w.WriteInt(ids[i]);
         }
-        obj.Put("ids", idArr);
-        obj.Put("texts", textArr);
-        obj.Put("metadata", metaArr);
-        return obj.ToJson();
+        w.EndArray();
+        w.WriteKey("texts");
+        w.StartArray();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            string t = this.texts[ids[i]];
+            w.WriteString(t == null ? "" : t);
+        }
+        w.EndArray();
+        w.WriteKey("metadata");
+        w.StartArray();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            string m = this.metadata[ids[i]];
+            w.WriteString(m == null ? "" : m);
+        }
+        w.EndArray();
+        w.EndObject();
+        return w.ToJson();
     }
 
     // 从状态恢复。
     public static VectorStore ImportState(string json) {
-        JsonValue obj = JsonValue.Parse(json);
-        if (obj == null || !obj.IsObject()) {
+        if (json == null || json.Length == 0) {
             throw new ArgumentException("向量存储状态不是合法 JSON 对象");
         }
-        JsonValue dimVal = obj.Get("dimensions");
-        JsonValue normVal = obj.Get("normalized");
-        int dims = dimVal == null ? 0 : (int)dimVal.AsDouble(0.0);
-        bool norm = normVal == null ? false : normVal.AsBool(false);
-        VectorStore store = new VectorStore(dims, norm);
-        JsonValue idx = obj.Get("index");
-        if (idx != null && idx.IsObject()) {
-            store.index = VectorIndex.ImportState(idx);
+        JsonDoc doc = JsonDoc.Parse(json);
+        if (doc == null || doc.root < 0 || doc.KindAt(doc.root) != 5) {
+            throw new ArgumentException("向量存储状态不是合法 JSON 对象");
         }
-        JsonValue idArr = obj.Get("ids");
-        JsonValue textArr = obj.Get("texts");
-        JsonValue metaArr = obj.Get("metadata");
-        if (idArr != null && idArr.IsArray()) {
-            for (int i = 0; i < idArr.Count(); i = i + 1) {
-                int id = (int)idArr.At(i).AsDouble(0.0);
-                string t = "";
-                string m = "";
-                if (textArr != null && textArr.IsArray() && i < textArr.Count()) {
-                    t = textArr.At(i).AsString("");
-                }
-                if (metaArr != null && metaArr.IsArray() && i < metaArr.Count()) {
-                    m = metaArr.At(i).AsString("");
-                }
+        int dimNode = doc.Get(doc.root, "dimensions");
+        int normNode = doc.Get(doc.root, "normalized");
+        int dims = dimNode < 0 ? 0 : doc.IntAt(dimNode, 0);
+        bool norm = normNode < 0 ? false : doc.BoolAt(normNode, false);
+        VectorStore store = new VectorStore(dims, norm);
+
+        int idArr = doc.Get(doc.root, "ids");
+        int textArr = doc.Get(doc.root, "texts");
+        int metaArr = doc.Get(doc.root, "metadata");
+        if (idArr >= 0 && doc.KindAt(idArr) == 4) {
+            int count = doc.Count(idArr);
+            int idSlot = doc.FirstChild(idArr);
+            int textSlot = textArr >= 0 ? doc.FirstChild(textArr) : -1;
+            int metaSlot = metaArr >= 0 ? doc.FirstChild(metaArr) : -1;
+            for (int i = 0; i < count; i = i + 1) {
+                if (idSlot < 0) { break; }
+                int id = doc.IntAt(idSlot, 0);
+                string t = textSlot >= 0 ? doc.StrAt(textSlot, "") : "";
+                string m = metaSlot >= 0 ? doc.StrAt(metaSlot, "") : "";
                 store.texts[id] = t;
                 store.metadata[id] = m;
+                idSlot = doc.NextSibling(idSlot);
+                if (textSlot >= 0) { textSlot = doc.NextSibling(textSlot); }
+                if (metaSlot >= 0) { metaSlot = doc.NextSibling(metaSlot); }
             }
         }
+
+        int idxNode = doc.Get(doc.root, "index");
+        if (idxNode >= 0 && doc.KindAt(idxNode) == 5) {
+            string idxJson = doc.ToJson(idxNode);
+            store.index = VectorIndex.ImportState(JsonValue.Parse(idxJson));
+        }
+
         return store;
     }
 
