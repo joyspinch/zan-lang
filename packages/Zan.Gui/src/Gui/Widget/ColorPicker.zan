@@ -129,20 +129,16 @@ public class ColorPicker : Control {
                                   b * 255 / 1000);
     }
 
-    // RGB（0..16777215 低 24 位）→ HSV。s/v 打包成 s*4096+v 返回，
-    // h 写入静态 hueOut（Zan 无出参；调用后立即消费）。
-    // RgbToSv 写出的色相（0..359）；Zan 无出参，调用后立即消费。
-    static int hueOut;
-    // RGB（低 24 位）转 HSV：h 写入 hueOut，返回 s*4096+v。
-    static int RgbToSv(int rgb) {
+    // RGB（低 24 位）转 HSV：直接更新当前实例的 hue/sat/val，消除全局静态变量污染。
+    public void ApplyRgbToHsv(int rgb) {
         int r = (rgb >> 16) & 255;
         int g = (rgb >> 8) & 255;
         int b = rgb & 255;
         int max = r; if (g > max) { max = g; } if (b > max) { max = b; }
         int min = r; if (g < min) { min = g; } if (b < min) { min = b; }
         int d = max - min;
-        int v = max * 1000 / 255;
-        int s = max > 0 ? d * 1000 / max : 0;
+        val = max * 1000 / 255;
+        sat = max > 0 ? d * 1000 / max : 0;
         int h = 0;
         if (d > 0) {
             if (max == r) {
@@ -155,8 +151,7 @@ public class ColorPicker : Control {
             if (h < 0) { h = h + 360; }
             if (h > 359) { h = 359; }
         }
-        hueOut = h;
-        return s * 4096 + v;
+        hue = h;
     }
 
     // 打包色 → "#RRGGBB"。
@@ -198,16 +193,9 @@ public class ColorPicker : Control {
         return ColorPicker.HexByte(ch[0] & 255);
     }
 
-    // HexParse / FuncParse 最近一次是否解析成功（Zan 无出参；且
-    // 合法打包色在 alpha ≥ 0x80 时回绕成负 int，-1 不能再当失败
-    // 哨兵——旧写法把 "#RRGGBB" 一类高 alpha 颜色整体拒收。
-    // hueOut 同款套路）。
-    static bool parseOk;
-
-    // "#RGB"/"#RRGGBB"/"#RRGGBBAA" → 打包色（失败时 parseOk=false）。
-    static int HexParse(string s) {
-        ColorPicker.parseOk = false;
-        if (s == null || s.Length < 4 || (s[0] & 255) != 35) { return -1; }  // '#'
+    // "#RGB"/"#RRGGBB"/"#RRGGBBAA" → 打包色（以 ColorParseResult 实例返回，消除全局静态污染）。
+    public static ColorParseResult HexParse(string s) {
+        if (s == null || s.Length < 4 || (s[0] & 255) != 35) { return new ColorParseResult(false, -1); }  // '#'
         int blen = s.Length - 1;
         int r = 0;
         int g = 0;
@@ -217,7 +205,7 @@ public class ColorPicker : Control {
             int d0 = ColorPicker.HexByte(s[1] & 255);
             int d1 = ColorPicker.HexByte(s[2] & 255);
             int d2 = ColorPicker.HexByte(s[3] & 255);
-            if (d0 < 0 || d1 < 0 || d2 < 0) { return -1; }
+            if (d0 < 0 || d1 < 0 || d2 < 0) { return new ColorParseResult(false, -1); }
             r = d0 * 17;
             g = d1 * 17;
             b = d2 * 17;
@@ -228,43 +216,41 @@ public class ColorPicker : Control {
             int d3 = ColorPicker.HexByte(s[4] & 255);
             int d4 = ColorPicker.HexByte(s[5] & 255);
             int d5 = ColorPicker.HexByte(s[6] & 255);
-            if (d0 < 0 || d1 < 0 || d2 < 0 || d3 < 0 || d4 < 0 || d5 < 0) { return -1; }
+            if (d0 < 0 || d1 < 0 || d2 < 0 || d3 < 0 || d4 < 0 || d5 < 0) { return new ColorParseResult(false, -1); }
             r = (d0 << 4) | d1;
             g = (d2 << 4) | d3;
             b = (d4 << 4) | d5;
             if (blen == 8) {
                 int d6 = ColorPicker.HexByte(s[7] & 255);
                 int d7 = ColorPicker.HexByte(s[8] & 255);
-                if (d6 < 0 || d7 < 0) { return -1; }
+                if (d6 < 0 || d7 < 0) { return new ColorParseResult(false, -1); }
                 a = (d6 << 4) | d7;
             }
         } else {
-            return -1;
+            return new ColorParseResult(false, -1);
         }
-        ColorPicker.parseOk = true;
-        return a * 16777216 + r * 65536 + g * 256 + b;
+        return new ColorParseResult(true, a * 16777216 + r * 65536 + g * 256 + b);
     }
 
     // "rgba(91, 55, 55, 1)" / "rgb(91, 55, 55)" /
     // "hsl(120, 50%, 40%)" / "hsb(120, 50%, 40%)"（可带第 4 个
-    // alpha 参数）→ 打包色（失败时 parseOk=false）。
-    static int FuncParse(string s) {
-        ColorPicker.parseOk = false;
+    // alpha 参数）→ 打包色（以 ColorParseResult 实例返回，消除全局静态污染）。
+    public static ColorParseResult FuncParse(string s) {
         int lp = s.IndexOf("(");
-        if (lp < 0) { return -1; }
-        if (!s.EndsWith(")")) { return -1; }
+        if (lp < 0) { return new ColorParseResult(false, -1); }
+        if (!s.EndsWith(")")) { return new ColorParseResult(false, -1); }
         string head = s.Substring(0, lp).Trim().ToLower();
         string body = s.Substring(lp + 1, s.Length - lp - 2);
         bool isHsl = head == "hsl" || head == "hsla";
         bool isHsb = head == "hsb" || head == "hsv";
         bool rgbish = head == "rgb" || head == "rgba";
-        if (!isHsl && !isHsb && !rgbish) { return -1; }
+        if (!isHsl && !isHsb && !rgbish) { return new ColorParseResult(false, -1); }
         List<string> parts = body.Split(",");
-        if (parts.Count < 3) { return -1; }
+        if (parts.Count < 3) { return new ColorParseResult(false, -1); }
         int a = 255;
         if (parts.Count >= 4) {
             a = ColorPicker.PctOrFrac(parts[3].Trim());
-            if (a < 0) { return -1; }
+            if (a < 0) { return new ColorParseResult(false, -1); }
         }
         int r;
         int g;
@@ -273,7 +259,7 @@ public class ColorPicker : Control {
             int h = ColorPicker.ParseIntSafe(parts[0].Trim());
             int ss = ColorPicker.PctNum(parts[1].Trim());
             int ll = ColorPicker.PctNum(parts[2].Trim());
-            if (h < 0 || h > 359 || ss < 0 || ll < 0) { return -1; }
+            if (h < 0 || h > 359 || ss < 0 || ll < 0) { return new ColorParseResult(false, -1); }
             int rgb = ColorPicker.RgbOf(ColorPicker.HslToRgb(h, ss, ll));
             r = (rgb / 65536) % 256;
             g = (rgb / 256) % 256;
@@ -282,7 +268,7 @@ public class ColorPicker : Control {
             int h = ColorPicker.ParseIntSafe(parts[0].Trim());
             int ss = ColorPicker.PctNum(parts[1].Trim());
             int vv = ColorPicker.PctNum(parts[2].Trim());
-            if (h < 0 || h > 359 || ss < 0 || vv < 0) { return -1; }
+            if (h < 0 || h > 359 || ss < 0 || vv < 0) { return new ColorParseResult(false, -1); }
             int rgb = ColorPicker.RgbOf(ColorPicker.HsvToRgb(h, ss, vv));
             r = (rgb / 65536) % 256;
             g = (rgb / 256) % 256;
@@ -299,11 +285,10 @@ public class ColorPicker : Control {
                 b = ColorPicker.ParseIntSafe(parts[2].Trim());
             }
             if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
-                return -1;
+                return new ColorParseResult(false, -1);
             }
         }
-        ColorPicker.parseOk = true;
-        return a * 16777216 + r * 65536 + g * 256 + b;
+        return new ColorParseResult(true, a * 16777216 + r * 65536 + g * 256 + b);
     }
 
     // "1" / "0.5" / "50%" → alpha 0..255（非法 -1）。
@@ -481,10 +466,7 @@ public class ColorPicker : Control {
         hsvTouched = false;
         alpha = ColorPicker.AlphaOf(packed);
         if (!showAlpha) { alpha = 255; }
-        int sv = ColorPicker.RgbToSv(ColorPicker.RgbOf(packed));
-        sat = sv / 4096;
-        val = sv % 4096;
-        hue = hueOut;
+        this.ApplyRgbToHsv(ColorPicker.RgbOf(packed));
     }
 
     // 程序化赋值（同步内部 HSV 与触发条；不触发 Change）。
@@ -714,9 +696,9 @@ public class ColorPicker : Control {
     // 从文本赋值（designer / 程序化）："#RRGGBB[AA]" 与
     // rgba()/rgb()/hsl()/hsb() 都接受，非法文本忽略。
     public void SetText(string value) {
-        int packed = ColorPicker.HexParse(value);
-        if (!ColorPicker.parseOk) { packed = ColorPicker.FuncParse(value); }
-        if (ColorPicker.parseOk) { this.SetColor(packed); }
+        ColorParseResult res = ColorPicker.HexParse(value);
+        if (!res.ok) { res = ColorPicker.FuncParse(value); }
+        if (res.ok) { this.SetColor(res.packed); }
     }
 
     // ---- 渲染 ------------------------------------------------------
@@ -786,6 +768,12 @@ public class ColorPicker : Control {
                 OverlayHost.DismissPopup();
             }
             app.RequestRedraw();
+        }
+        if (open && !disabled && !OverlayHost.IsActiveAnchor(app, this)) {
+            Control pop = this.customPopup != null ? this.customPopup : this.EnsurePopupCard(app);
+            OverlayHost.ShowPopup(app, this, pop);
+        } else if (!open && OverlayHost.IsActiveAnchor(app, this)) {
+            OverlayHost.DismissPopup();
         }
         if (disabled) {
             if (open) { OverlayHost.DismissPopup(); }
@@ -945,23 +933,23 @@ public class ColorPicker : Control {
                 ok = true;
             }
         } else if (which == 4) {
-            int packed = ColorPicker.HexParse(inHex.GetText());
-            if (ColorPicker.parseOk) {
-                this.ApplyPacked(packed);
+            ColorParseResult res = ColorPicker.HexParse(inHex.GetText());
+            if (res.ok) {
+                this.ApplyPacked(res.packed);
                 ok = true;
             }
         } else if (which == 5) {
-            int packed = ColorPicker.FuncParse(
+            ColorParseResult res = ColorPicker.FuncParse(
                 "hsl(" + inHsl.GetText() + ")");
-            if (ColorPicker.parseOk) {
-                this.ApplyPacked(packed);
+            if (res.ok) {
+                this.ApplyPacked(res.packed);
                 ok = true;
             }
         } else {
-            int packed = ColorPicker.FuncParse(
+            ColorParseResult res = ColorPicker.FuncParse(
                 "hsb(" + inHsb.GetText() + ")");
-            if (ColorPicker.parseOk) {
-                this.ApplyPacked(packed);
+            if (res.ok) {
+                this.ApplyPacked(res.packed);
                 ok = true;
             }
         }
@@ -1035,5 +1023,15 @@ public class ColorPicker : Control {
     // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bw, bh) 完成触发器绘制与事件交互（弹层经 OnPaintOverlay 延迟绘制）。
     override void OnPaint(App app) {
         this.PaintTrigger(app, bx, by, bw, bh);
+    }
+}
+
+// 颜色解析结果对象（消除全局 static parseOk 状态污染）
+public class ColorParseResult {
+    public bool ok;
+    public int packed;
+    public ColorParseResult(bool ok, int packed) {
+        this.ok = ok;
+        this.packed = packed;
     }
 }
