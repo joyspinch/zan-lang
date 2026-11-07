@@ -82,7 +82,7 @@ echo "== [1b] Compiling fortify/link shims =="
 # be rewritten to the very __*_chk symbols it exists to provide.
 $CC -O2 -g0 -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
     -U_FORTIFY_SOURCE \
-    -c "$ROOT/src/runtime/zan_fortify_compat.c" -o "$WORK/zan_fortify_compat.o"
+    -c "$ROOT/src/common/zan_fortify_compat.c" -o "$WORK/zan_fortify_compat.o"
 
 echo "== [2/3] Extracting static X11 system objects =="
 X_OBJS_DIR="$WORK/x_objs"

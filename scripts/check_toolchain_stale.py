@@ -74,7 +74,7 @@ ZIG_BUNDLED = []  # zig/wasi/musl sysroot subsets + external prebuilts: no repo 
 GUI = [p for p in sorted(glob.glob("src/drivers/gui/*"))
        if not p.endswith("gui_image_svg.c")] + [
     "src/drivers/gui/zan_gui_graphics.h", "src/runtime/rt_crash.h",
-    "src/runtime/zan_fortify_compat.c"]
+    "src/common/zan_fortify_compat.c"]
 IMAGE = ["src/drivers/image/zan_image.c", "src/drivers/image/zan_image.h",
          "src/drivers/image/zan_bitmap.h", "src/drivers/gui/gui_image_svg.c",
          "src/third_party/stb_image.h", "src/third_party/libwebp",
