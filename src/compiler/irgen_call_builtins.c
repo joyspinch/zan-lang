@@ -1642,7 +1642,12 @@ LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *expr,
                                 ? arg : LLVMBuildFPExt(g->builder, arg, dbl, "toint.ext");
                             LLVMValueRef r = zan_call2(g->builder, d1_ty,
                                 get_libc_fn(g, "rint", d1_ty), &as_dbl, 1, "toint.rint");
-                            parsed = LLVMBuildFPToSI(g->builder, r, i64t, "toint");
+                            /* B-ID180：double 实参路径此前裸 fptosi——1e300
+                             * 溢出 poison、NaN 平台各异、try 内无异常分发
+                             * （Convert 字符串/整型路径 B-ID169 已收，此处
+                             * 补齐）。守卫后 i64 归一化，其后 over 判定与
+                             * select-0 兜底不变。 */
+                            parsed = emit_fptosi_guarded(g, r, i64t, expr->loc, NULL);
                         } else if (ak == LLVMIntegerTypeKind) {
                             if (LLVMTypeOf(arg) == i64t)
                                 parsed = arg;

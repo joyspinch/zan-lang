@@ -1662,7 +1662,8 @@ void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg) {
  *   ④ 窄目标（<64 位）截断：域内值与旧窄直转逐位一致，域外旧 poison
  *      现为定义值。 */
 LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val,
-                                 LLVMTypeRef target, zan_loc_t loc) {
+                                 LLVMTypeRef target, zan_loc_t loc,
+                                 LLVMValueRef arm_mask) {
     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
     if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMFloatTypeKind)
         val = LLVMBuildFPExt(g->builder, val, dbl, "f2i.ext");
@@ -1672,7 +1673,9 @@ LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val,
     LLVMValueRef ge_lo = LLVMBuildFCmp(g->builder, LLVMRealOGE, val, lo, "f2i.lo");
     LLVMValueRef lt_hi = LLVMBuildFCmp(g->builder, LLVMRealOLT, val, hi, "f2i.hi");
     LLVMValueRef in_range = LLVMBuildAnd(g->builder, ge_lo, lt_hi, "f2i.in");
-    if (g->runtime_checks && g->current_fn) {
+    LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef cur_fn = cur_bb ? LLVMGetBasicBlockParent(cur_bb) : NULL;
+    if (g->runtime_checks && cur_fn && cur_fn == g->current_fn && loc.line > 0 && !arm_mask) {
         LLVMValueRef bad = LLVMBuildNot(g->builder, in_range, "f2i.bad");
         emit_runtime_check(g, bad, loc,
             "value is outside the range of the target type");
