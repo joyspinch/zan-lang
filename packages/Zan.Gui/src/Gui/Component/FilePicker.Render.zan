@@ -1,0 +1,883 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+namespace Gui.Component;
+
+public partial class FilePicker {
+    public void RenderWindow() {
+        if (!open || popup == null || !popup.needsRedraw) { return; }
+        popup.BeginFrame();
+        // 该对话框是即时模式，但与主窗口共享进程级 WidgetId
+        // 计数器，而只有主循环会重置它。为对话框自身的帧
+        // 固定一个较高的基线，使其按钮每帧
+        // 获得相同的 id（否则悬停/按下永远无法匹配
+        // 框架在上一帧解析出的指针目标），同时
+        // 不与主应用的 id 空间冲突；之后恢复。
+        // 为对话框帧压入独立作用域栈，消除硬编码 900000 魔数号段，
+        // 允许同屏运行多个文件选择器实例互不干扰。
+        WidgetId.Push("file_picker");
+        RenderContent(popup);
+        popup.RenderChrome(title);
+        WidgetId.Pop();
+        popup.PresentFrame();
+    }
+
+    // inlineMode（Android/无第二窗口环境）的绘制入口：宿主在自己的
+    // 渲染回调里（页面之上、每帧一次，Layer.Render 同款时机）调用。
+    // 先铺变暗遮罩并吞掉其下命中，再复用 RenderContent 的即时模式
+    // 主体——它按传入 app 的画布尺寸与 ContentTop 自适应，全屏承载。
+    // 桌面（窗口模式）本函数是 no-op，宿主可以无条件调用。
+    public void RenderOverlay(App host) {
+        if (!open || !inlineMode) { return; }
+        Canvas hc = host.canvas;
+        StyleBox ov = Style.Part(host, "dialog", "overlay", "", "", "",
+                                 Style.SNormal());
+        hc.FillRect(0, 0, hc.Width(), hc.Height(), ov.bg);
+        host.BlockHitsBelow();
+        NativeLayer.Occlude(host, 0, 0, hc.Width(), hc.Height());
+        WidgetId.Push("file_picker_overlay");
+        RenderContent(host);
+        WidgetId.Pop();
+    }
+
+    public void RenderContent(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        StyleBox labelStyle = Style.Part(app, "filepicker", "label", "",
+                                         "", "", Style.SNormal());
+        StyleBox paneStyle = Style.Part(app, "filepicker", "pane", "",
+                                        "", "", Style.SNormal());
+        StyleBox paneBorderStyle = Style.Part(app, "filepicker", "pane-border",
+                                              "", "", "", Style.SNormal());
+        StyleBox rowStyle = Style.Part(app, "filepicker", "row", "",
+                                       "", "", Style.SNormal());
+        StyleBox rowHoverStyle = Style.Part(app, "filepicker", "row", "",
+                                            "", "", Style.SHover());
+        StyleBox rowSelectedStyle = Style.Part(app, "filepicker", "row", "",
+                                               "", "", Style.SSelected());
+        StyleBox iconStyle = Style.Part(app, "filepicker", "icon", "",
+                                        "", "", Style.SNormal());
+        StyleBox folderIconStyle = Style.Part(app, "filepicker", "folder-icon",
+                                              "", "", "", Style.SNormal());
+        StyleBox emptyStyle = Style.Part(app, "filepicker", "empty", "",
+                                         "", "", Style.SNormal());
+        StyleBox scrollbarStyle = Style.Part(app, "filepicker", "scrollbar", "",
+                                             "", "", Style.SNormal());
+        StyleBox statusStyle = Style.Part(app, "filepicker", "status", "",
+                                          "", "", Style.SNormal());
+        StyleBox errorStyle = Style.Part(app, "filepicker", "status", "",
+                                         "error", "", Style.SNormal());
+        StyleBox filterStyle = Style.Part(app, "filepicker", "filter", "",
+                                          "", "", Style.SNormal());
+        StyleBox filterBorderStyle = Style.Part(app, "filepicker", "filter-border",
+                                                "", "", "", Style.SNormal());
+        StyleBox filterOpenStyle = Style.Part(app, "filepicker", "filter", "",
+                                              "", "", Style.SActive());
+        StyleBox filterHoverStyle = Style.Part(app, "filepicker", "filter", "",
+                                               "", "", Style.SHover());
+        StyleBox filterShadowStyle = Style.Part(app, "filepicker", "filter-shadow",
+                                         "", "", "", Style.SNormal());
+        // 多选行尾对勾用 checkbox 主题的勾色，与 Checkbox 勾选态一致。
+        StyleBox checkboxCheckStyle = Style.Part(app, "checkbox", "check",
+                                         "", "", "", Style.SChecked());
+        app.RenderBackground(0, 0, W, H, 6);
+        int pad = t.paddingLarge;
+        int top = app.ContentTop() + pad;
+
+        bool narrow = (W - pad * 2) < app.Scale(560);
+
+        int btnH = t.heightMedium;
+        int upW = btnH;
+        int refreshW = btnH;
+        int newW = narrow ? app.Scale(36) : app.Scale(118);
+        int upX = pad;
+        int refreshX = upX + upW + t.gapSmall;
+        int pathX = refreshX + refreshW + t.gapSmall;
+        int newX = W - pad - newW;
+        int pathW = newX - pathX - t.gapMedium;
+        int paneY = top + btnH + t.gapMedium;
+
+        // 1. 向上上一级矢量图标按钮（arrow-up）
+        int upId = app.focus.AllocId();
+        int upBg = app.focus.IsHovered(upId) ? rowHoverStyle.BgOr(0) : paneStyle.BgOr(0);
+        c.FillRoundRect(upX, top, upW, btnH, t.borderRadiusSmall, upBg);
+        c.DrawRoundRect(upX, top, upW, btnH, t.borderRadiusSmall, paneBorderStyle.BorderOr(0), 1);
+        c.DrawGlyphIn("arrow-up", upX, top, upW, btnH, t.iconSizeSmall, iconStyle.FgOr(0));
+        app.hitTester.RegisterRect(upId, upX, top, upW, btnH, 0);
+
+        // 2. 刷新矢量图标按钮（refresh）
+        int refId = app.focus.AllocId();
+        int refBg = app.focus.IsHovered(refId) ? rowHoverStyle.BgOr(0) : paneStyle.BgOr(0);
+        c.FillRoundRect(refreshX, top, refreshW, btnH, t.borderRadiusSmall, refBg);
+        c.DrawRoundRect(refreshX, top, refreshW, btnH, t.borderRadiusSmall, paneBorderStyle.BorderOr(0), 1);
+        c.DrawGlyphIn("refresh", refreshX, top, refreshW, btnH, t.iconSizeSmall, iconStyle.FgOr(0));
+        app.hitTester.RegisterRect(refId, refreshX, top, refreshW, btnH, 0);
+
+        // 3. 路径地址栏（自动撑满中间，回车跳转）
+        pathInput.Render(app, pathX, top, pathW, btnH);
+
+        // 4. 新建文件夹胶囊按钮（folder-plus 矢量图标 + 文字）
+        int newId = app.focus.AllocId();
+        int newBg = app.focus.IsHovered(newId) ? rowHoverStyle.BgOr(0) : paneStyle.BgOr(0);
+        c.FillRoundRect(newX, top, newW, btnH, t.borderRadiusSmall, newBg);
+        c.DrawRoundRect(newX, top, newW, btnH, t.borderRadiusSmall, paneBorderStyle.BorderOr(0), 1);
+        if (narrow) {
+            c.DrawGlyphIn("folder-plus", newX, top, newW, btnH, t.iconSizeSmall, folderIconStyle.FgOr(0));
+        } else {
+            int newIconX = newX + t.paddingSmall;
+            c.DrawGlyphIn("folder-plus", newIconX, top, t.iconSizeSmall, btnH, t.iconSizeSmall, folderIconStyle.FgOr(0));
+            int newTextX = newIconX + t.iconSizeSmall + t.gapSmall;
+            int newTextY = Canvas.CenterTextY(top, btnH, Style.FontFallback(app, "medium"));
+            c.DrawText(newTextX, newTextY, FilePicker.T("New Folder", "新建文件夹"), rowStyle.FgOr(0), Style.FontFallback(app, "medium"));
+        }
+        app.hitTester.RegisterRect(newId, newX, top, newW, btnH, 0);
+
+        string dir = FilePicker.Normalize(pathInput.GetText());
+        bool valid = Directory.ExistsUtf8(dir);
+
+        if (creatingFolder) {
+            int labelW = app.Scale(112);
+            int createW = app.Scale(88);
+            int cancelW = app.Scale(88);
+            c.DrawText(pad, paneY + app.Scale(8),
+                FilePicker.T("Folder name", "文件夹名称"),
+                labelStyle.FgOr(0), Style.FontFallback(app, "medium"));
+            int inputX = pad + labelW;
+            int buttonsW = createW + cancelW + t.gapSmall;
+            int inputW = W - inputX - pad - buttonsW - t.gapMedium;
+            folderInput.Render(app, inputX, paneY, inputW, t.heightMedium);
+            int createX = inputX + inputW + t.gapMedium;
+            new Button { Text = FilePicker.T("Create", "创建"), Class = "primary" }.Render(
+                app, createX, paneY, createW);
+            int folderCancelX = createX + createW + t.gapSmall;
+            new Button { Text = FilePicker.T("Cancel", "取消") }.Render(
+                app, folderCancelX, paneY, cancelW);
+
+            if (FilePicker.Clicked(
+                    app, createX, paneY, createW, t.heightMedium)) {
+                this.OnFolderSubmit();
+            } else if (FilePicker.Clicked(
+                    app, folderCancelX, paneY, cancelW, t.heightMedium)) {
+                creatingFolder = false;
+                statusText = "";
+                app.RequestRedraw();
+            }
+            paneY = paneY + t.heightMedium + t.gapMedium;
+        }
+
+        int footerH = t.heightMedium + t.gapMedium;
+        if (mode != 0) {
+            footerH = t.heightMedium * 2 + t.gapMedium * 2;
+        }
+        // 侧边栏桌面定宽 200，比例紧凑精致；手机视口单栏
+        int treeW = app.Scale(200);
+        int paneGap = t.gapMedium;
+        if (narrow) { treeW = 0; }
+        int maxTree = (W - pad * 2 - paneGap) / 2;
+        if (treeW > maxTree) { treeW = maxTree; }
+        int listX = pad + treeW + paneGap;
+        int listW = W - listX - pad;
+        int scrollW = app.Scale(12);
+        int rowH = app.Scale(28);
+
+        // 列表上方的筛选框，与列表列同宽
+        this.SearchBox().Render(app, listX, paneY, listW, t.heightMedium);
+        paneY = paneY + t.heightMedium + t.gapMedium;
+        int paneH = H - paneY - footerH - pad;
+
+        if (treeW > 0) {
+            c.FillRoundRect(
+                pad, paneY, treeW, paneH,
+                t.borderRadiusMedium, paneStyle.BgOr(0));
+            c.DrawRoundRect(pad, paneY, treeW, paneH,
+                            t.borderRadiusMedium,
+                            paneBorderStyle.BorderOr(0), 1);
+        }
+        c.FillRoundRect(
+            listX, paneY, listW, paneH,
+            t.borderRadiusMedium, paneStyle.BgOr(0));
+        c.DrawRoundRect(listX, paneY, listW, paneH, t.borderRadiusMedium,
+                        paneBorderStyle.BorderOr(0), 1);
+
+        // --- 扩展名过滤器下拉框的几何与交互（底部，
+        // 确定/取消按钮左侧）。在此处理，先于树/列表点击
+        // 闸门，这样打开的菜单会吞掉本帧的点击。最后绘制。---
+        bool showFilter = mode != 0 && filters.Count > 0;
+        int fBtnW = app.Scale(112);
+        int filterW = app.Scale(210);
+        int rowAvail = W - pad * 2 - t.gapMedium * 2 - fBtnW * 2;
+        if (filterW > rowAvail) {
+            filterW = rowAvail;
+            if (filterW < app.Scale(80)) {
+                filterW = app.Scale(80);
+                int btnAvail = (W - pad * 2 - t.gapMedium * 2 - filterW) / 2;
+                if (btnAvail < fBtnW) { fBtnW = btnAvail; }
+            }
+        }
+        int fCancelX = W - pad - fBtnW - t.gapMedium - fBtnW;
+        int filterX = fCancelX - t.gapMedium - filterW;
+        int filterRowY = paneY + paneH + t.gapMedium;
+        if (mode != 0) { filterRowY = filterRowY + t.heightMedium + t.gapMedium; }
+        int filterMenuH = filters.Count * t.heightMedium + t.paddingTiny * 2;
+        int filterMenuY = filterRowY - filterMenuH - app.Scale(4);
+        bool suppressOthers = false;
+        if (showFilter) {
+            bool onTrigger = FilePicker.Clicked(
+                app, filterX, filterRowY, filterW, t.heightMedium);
+            if (filterOpen) {
+                suppressOthers = true;
+                app.BlockHitsRect(
+                    filterX, filterMenuY, filterW, filterMenuH);
+                for (int fi2 = 0; fi2 < filters.Count; fi2 = fi2 + 1) {
+                    int iy = filterMenuY + t.paddingTiny + fi2 * t.heightMedium;
+                    if (FilePicker.Clicked(app, filterX, iy, filterW, t.heightMedium)
+                            && fi2 != filterSel.Get()) {
+                        filterSel.Set(fi2);
+                        suffix = FilePicker.FilterTokenToSuffix(
+                            FilePicker.FirstExt(filters[fi2].pattern));
+                        selectedPath = "";
+                        selectedPaths = new List<string>();
+                        anchorIdx = 0 - 1;
+                        listScroll.Set(0);
+                    }
+                }
+                if (app.EventKind() == 3) {
+                    filterOpen = false;
+                    app.RequestRedraw();
+                }
+            } else if (onTrigger) {
+                filterOpen = true;
+                suppressOthers = true;
+                app.RequestRedraw();
+            }
+        }
+
+        bool releaseConsumed = treeDragging || listDragging || suppressOthers;
+
+        // 快捷访问列表渲染（跨平台：桌面、下载、图片、文档、主目录）
+        List<FilePickerItem> quickItems = FilePicker.QuickAccessItems();
+        int quickHeaderH = app.Scale(22);
+        int quickCount = quickItems.Count;
+        int quickAreaH = quickHeaderH + quickCount * rowH + app.Scale(6);
+
+        int treePaneY = paneY;
+        int treePaneH = paneH;
+        if (treeW > 0 && quickCount > 0) {
+            int titleY = paneY + app.Scale(4);
+            int titleTextY = Canvas.CenterTextY(titleY, quickHeaderH, Style.FontFallback(app, "small"));
+            c.DrawText(pad + t.paddingSmall, titleTextY,
+                FilePicker.T("QUICK ACCESS", "快捷访问"), statusStyle.FgOr(0), Style.FontFallback(app, "small"));
+
+            for (int qi = 0; qi < quickCount; qi = qi + 1) {
+                FilePickerItem qitem = quickItems[qi];
+                int qRowY = paneY + quickHeaderH + qi * rowH;
+                int qRowId = app.focus.AllocId();
+                bool qSel = FilePicker.SamePath(qitem.path, dir);
+                if (qSel) {
+                    c.FillRoundRect(pad + 4, qRowY + 1, treeW - 8, rowH - 2, app.Scale(4), rowSelectedStyle.BgOr(0));
+                    c.FillRoundRect(pad + 4, qRowY + 3, app.Scale(3), rowH - 6, app.Scale(1), rowSelectedStyle.BgOr(0));
+                } else if (app.focus.IsHovered(qRowId)) {
+                    c.FillRoundRect(pad + 4, qRowY + 1, treeW - 8, rowH - 2, app.Scale(4), rowHoverStyle.BgOr(0));
+                }
+                int qIconSize = t.iconSizeSmall;
+                int qIconX = pad + t.paddingSmall;
+                c.DrawGlyphIn(qitem.icon != "" ? qitem.icon : "folder", qIconX, qRowY, qIconSize, rowH, qIconSize,
+                    qSel ? rowSelectedStyle.FgOr(0) : iconStyle.FgOr(0));
+                int qTextX = qIconX + qIconSize + t.gapSmall;
+                int qTextW = pad + treeW - qTextX - app.Scale(4);
+                string qText = Ellipsis.Fit(qitem.name, qTextW, Style.FontFallback(app, "medium"));
+                int qTextY = Canvas.CenterTextY(qRowY, rowH, Style.FontFallback(app, "medium"));
+                c.DrawText(qTextX, qTextY, qText, qSel ? rowSelectedStyle.FgOr(0) : rowStyle.FgOr(0), Style.FontFallback(app, "medium"));
+                app.hitTester.RegisterRect(qRowId, pad + 4, qRowY, treeW - 8, rowH, 0);
+
+                if (!releaseConsumed && FilePicker.Clicked(app, pad + 4, qRowY, treeW - 8, rowH)) {
+                    Navigate(qitem.path);
+                }
+            }
+
+            int sepY = paneY + quickAreaH - app.Scale(2);
+            c.DrawLine(pad + app.Scale(8), sepY, pad + treeW - app.Scale(8), sepY, paneBorderStyle.BorderOr(0), 1);
+            int storageTitleY = Canvas.CenterTextY(sepY + app.Scale(4), quickHeaderH, Style.FontFallback(app, "small"));
+            c.DrawText(pad + t.paddingSmall, storageTitleY,
+                FilePicker.T("STORAGE", "此电脑"), statusStyle.FgOr(0), Style.FontFallback(app, "small"));
+
+            treePaneY = sepY + quickHeaderH + app.Scale(4);
+            treePaneH = paneH - (treePaneY - paneY);
+            if (treePaneH < rowH * 2) { treePaneH = rowH * 2; }
+        }
+
+        List<FilePickerTreeNode> treeNodes = new List<FilePickerTreeNode>();
+        if (treeW > 0) {
+            List<string> roots = Directory.GetRootsUtf8();
+            for (int rootIndex = 0; rootIndex < roots.Count; rootIndex = rootIndex + 1) {
+                if (Directory.ExistsUtf8(roots[rootIndex])) {
+                    BuildTree(roots[rootIndex], 0, treeNodes);
+                }
+            }
+        }
+
+        int treeRows = treePaneH / rowH;
+        if (treeRows < 1) { treeRows = 1; }
+        int treeMax = treeNodes.Count - treeRows;
+        if (treeMax < 0) { treeMax = 0; }
+        int treeOff = treeScroll.Get();
+        bool overTree = FilePicker.Inside(
+            app, pad, treePaneY, treeW, treePaneH);
+        bool ownsTreeWheel = app.CaptureWheel(pad, treePaneY, treeW, treePaneH);
+        if (overTree && ownsTreeWheel) {
+            treeOff = treeOff - FilePicker.WheelStep(app) * 3;
+            app.RequestRedraw();
+        }
+        if (treeOff < 0) { treeOff = 0; }
+        if (treeOff > treeMax) { treeOff = treeMax; }
+
+        for (int treeShown = 0; treeW > 0 && treeOff + treeShown < treeNodes.Count
+               && treeShown < treeRows; treeShown = treeShown + 1) {
+            int idx = treeOff + treeShown;
+            FilePickerTreeNode node = treeNodes[idx];
+            string path = node.path;
+            int depth = node.depth;
+            int rowY = treePaneY + treeShown * rowH;
+            int rowId = app.focus.AllocId();
+            bool selected = path == dir;
+            if (selected) {
+                c.FillRoundRect(
+                    pad + 4, rowY + 1, treeW - scrollW - 8,
+                    rowH - 2, app.Scale(4), rowSelectedStyle.BgOr(0));
+                c.FillRoundRect(
+                    pad + 4, rowY + 3, app.Scale(3),
+                    rowH - 6, app.Scale(1), rowSelectedStyle.BgOr(0));
+            } else if (app.focus.IsHovered(rowId)) {
+                c.FillRoundRect(
+                    pad + 4, rowY + 1, treeW - scrollW - 8,
+                    rowH - 2, app.Scale(4), rowHoverStyle.BgOr(0));
+            }
+            int indent = app.Scale(14) * depth;
+            int arrowX = pad + t.paddingSmall + indent;
+            string chev = "chevron-right";
+            if (IsExpanded(path)) { chev = "chevron-down"; }
+            c.DrawGlyphIn(chev, arrowX, rowY, t.iconSizeSmall, rowH,
+                t.iconSizeSmall, iconStyle.FgOr(0));
+            string display = Path.GetFileName(path);
+            if (display == "") { display = path; }
+            string nodeIcon = depth == 0 ? "database" : "folder";
+            int nodeIconX = arrowX + app.Scale(16);
+            c.DrawGlyphIn(nodeIcon, nodeIconX, rowY, t.iconSizeSmall, rowH, t.iconSizeSmall,
+                selected ? rowSelectedStyle.FgOr(0) : folderIconStyle.FgOr(0));
+            int textX = nodeIconX + t.iconSizeSmall + t.gapSmall;
+            int textW = pad + treeW - scrollW - app.Scale(8) - textX;
+            display = Ellipsis.Fit(
+                display, textW, Style.FontFallback(app, "medium"));
+            int treeTextY = Canvas.CenterTextY(rowY, rowH, Style.FontFallback(app, "medium"));
+            c.DrawText(
+                textX, treeTextY,
+                display, selected ? rowSelectedStyle.FgOr(0) : rowStyle.FgOr(0), Style.FontFallback(app, "medium"));
+            app.hitTester.RegisterRect(
+                rowId, pad + 1, rowY,
+                treeW - scrollW - 2, rowH, 0);
+
+            if (!releaseConsumed && FilePicker.Clicked(
+                    app, arrowX - app.Scale(4), rowY,
+                    app.Scale(20), rowH)) {
+                if (IsExpanded(path)) { Collapse(path); }
+                else { Expand(path); }
+                app.RequestRedraw();
+            } else if (!releaseConsumed && FilePicker.Clicked(
+                    app, arrowX + app.Scale(16), rowY,
+                    treeW - (arrowX - pad) - scrollW - app.Scale(16),
+                    rowH)) {
+                Navigate(path);
+            }
+        }
+
+        if (treeW > 0 && treeNodes.Count > treeRows) {
+            int trackX = pad + treeW - scrollW;
+            int thumbH = treePaneH * treeRows / treeNodes.Count;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            int range = treePaneH - thumbH;
+            int thumbY = treePaneY;
+            if (treeMax > 0) {
+                thumbY = treePaneY + range * treeOff / treeMax;
+            }
+            c.FillRect(trackX, treePaneY, scrollW, treePaneH, scrollbarStyle.BgOr(0));
+            c.FillRoundRect(
+                trackX + app.Scale(2), thumbY,
+                scrollW - app.Scale(4), thumbH,
+                app.Scale(3), scrollbarStyle.FgOr(0));
+
+            if (FilePicker.Pressed(
+                    app, trackX, thumbY, scrollW, thumbH)) {
+                treeDragging = true;
+                if (app.TouchDevice()) { app.ClaimDrag(); }
+                treeDragOffset = app.mouseY - thumbY;
+            } else if (FilePicker.Pressed(
+                    app, trackX, treePaneY, scrollW, treePaneH)) {
+                treeDragging = true;
+                if (app.TouchDevice()) { app.ClaimDrag(); }
+                treeDragOffset = thumbH / 2;
+                if (range > 0) {
+                    treeOff = (app.mouseY - treePaneY - treeDragOffset)
+                        * treeMax / range;
+                }
+                app.RequestRedraw();
+            }
+            if (treeDragging && app.EventKind() == 1 && range > 0) {
+                treeOff = (app.mouseY - treePaneY - treeDragOffset)
+                    * treeMax / range;
+                app.RequestRedraw();
+            }
+        }
+
+        List<FilePickerItem> items = new List<FilePickerItem>();
+        if (valid) {
+            // 筛选框按子串同时过滤文件夹和文件，因此输入 "rep"
+            // 既能缩小报告目录，也能缩小其子文件夹；"" 显示全部。
+            string nameFilter = this.SearchBox().GetText();
+            if (nameFilter != lastFilter) {
+                lastFilter = nameFilter;
+                listScroll.Set(0);
+                app.RequestRedraw();
+            }
+            List<string> dirs = Directory.GetDirectoriesFiltered(
+                dir, showHidden.Get());
+            for (int di = 0; di < dirs.Count; di = di + 1) {
+                if (FilePicker.ContainsText(dirs[di], nameFilter)) {
+                    items.Add(new FilePickerItem(
+                        dirs[di], FilePicker.Join(dir, dirs[di]), 1));
+                }
+            }
+            if (mode != 0) {
+                List<string> files = Directory.GetFilesFiltered(
+                    dir, showHidden.Get());
+                for (int fi = 0; fi < files.Count; fi = fi + 1) {
+                    if (MatchesCurrentFilter(files[fi])
+                            && FilePicker.ContainsText(files[fi], nameFilter)) {
+                        items.Add(new FilePickerItem(
+                            files[fi], FilePicker.Join(dir, files[fi]), 0));
+                    }
+                }
+            }
+        }
+
+        int listRows = paneH / rowH;
+        if (listRows < 1) { listRows = 1; }
+        int listMax = items.Count - listRows;
+        if (listMax < 0) { listMax = 0; }
+        int listOff = listScroll.Get();
+        bool overList = FilePicker.Inside(
+            app, listX, paneY, listW, paneH);
+        bool ownsListWheel = app.CaptureWheel(
+            listX, paneY, listW, paneH);
+        if (overList && ownsListWheel) {
+            listOff = listOff - FilePicker.WheelStep(app) * 3;
+            app.RequestRedraw();
+        }
+        if (listOff < 0) { listOff = 0; }
+        if (listOff > listMax) { listOff = listMax; }
+
+        int clicked = 0 - 1;
+        for (int shown = 0; listOff + shown < items.Count && shown < listRows; shown = shown + 1) {
+            int idx = listOff + shown;
+            FilePickerItem item = items[idx];
+            int rowY = paneY + shown * rowH;
+            int rowId = app.focus.AllocId();
+            bool multiPicked = allowMulti && this.InMultiSelection(idx, items);
+            bool selected = selectedPath == item.path || multiPicked;
+            if (selected) {
+                // 多选行不做满行大色块：左侧细标记条 + 行内对勾，
+                // 满行高亮留给悬停/单选当前行，避免整屏都是绿色块。
+                if (multiPicked) {
+                    c.FillRect(
+                        listX + 1, rowY, app.Scale(3), rowH,
+                        rowSelectedStyle.BgOr(0));
+                    c.FillRoundRect(
+                        listX + listW - scrollW - app.Scale(22)
+                            - t.gapSmall, rowY + (rowH - t.iconSizeSmall) / 2,
+                        t.iconSizeSmall, t.iconSizeSmall,
+                        t.borderRadiusSmall, rowSelectedStyle.BgOr(0));
+                    c.DrawGlyphIn("check",
+                        listX + listW - scrollW - app.Scale(22)
+                            - t.gapSmall,
+                        rowY + (rowH - t.iconSizeSmall) / 2,
+                        t.iconSizeSmall, t.iconSizeSmall,
+                        t.iconSizeSmall,
+                        checkboxCheckStyle.FgOr(0));
+                } else {
+                    c.FillRoundRect(
+                        listX + 4, rowY + 1, listW - scrollW - 8,
+                        rowH - 2, app.Scale(4), rowSelectedStyle.BgOr(0));
+                    c.FillRoundRect(
+                        listX + 4, rowY + 3, app.Scale(3),
+                        rowH - 6, app.Scale(1), rowSelectedStyle.BgOr(0));
+                }
+            } else if (app.focus.IsHovered(rowId)) {
+                c.FillRoundRect(
+                    listX + 4, rowY + 1, listW - scrollW - 8,
+                    rowH - 2, app.Scale(4), rowHoverStyle.BgOr(0));
+            }
+            int color = rowStyle.FgOr(0);
+            string iconName = item.kind == 1 ? "folder" : FilePicker.FileIconFor(item.name);
+            int iconColor = item.kind == 1 ? folderIconStyle.FgOr(0) : iconStyle.FgOr(0);
+            if (item.kind == 1) {
+                color = folderIconStyle.FgOr(0);
+            }
+            int iconSize = t.iconSizeSmall;
+            int iconX = listX + t.paddingMedium;
+            int iconY = rowY + (rowH - iconSize) / 2;
+            c.DrawGlyphIn(iconName, iconX, rowY, iconSize, rowH, iconSize, iconColor);
+            int textX = iconX + iconSize + t.gapSmall;
+            int textW = listX + listW - scrollW
+                - app.Scale(8) - textX;
+            string shownName = Ellipsis.Fit(
+                item.name, textW, Style.FontFallback(app, "medium"));
+            int itemTextY = Canvas.CenterTextY(rowY, rowH, Style.FontFallback(app, "medium"));
+            c.DrawText(
+                textX, itemTextY,
+                shownName, color, Style.FontFallback(app, "medium"));
+            app.hitTester.RegisterRect(
+                rowId, listX + 1, rowY,
+                listW - scrollW - 2, rowH, 0);
+            if (!releaseConsumed && FilePicker.Clicked(
+                    app, listX + 1, rowY,
+                    listW - scrollW - 2, rowH)) {
+                clicked = idx;
+            }
+        }
+
+        if (items.Count == 0) {
+            string emptyText = FilePicker.T(
+                "This folder is empty.", "此文件夹为空。");
+            if (!valid) {
+                emptyText = FilePicker.T(
+                    "Folder not found.", "找不到文件夹。");
+            }
+            int emptyY = Canvas.CenterTextY(paneY + pad, t.heightMedium, Style.FontFallback(app, "medium"));
+            c.DrawText(
+                listX + pad, emptyY,
+                emptyText, emptyStyle.FgOr(0), Style.FontFallback(app, "medium"));
+        }
+
+        if (items.Count > listRows) {
+            int trackX = listX + listW - scrollW;
+            int thumbH = paneH * listRows / items.Count;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            int range = paneH - thumbH;
+            int thumbY = paneY;
+            if (listMax > 0) {
+                thumbY = paneY + range * listOff / listMax;
+            }
+            c.FillRect(trackX, paneY, scrollW, paneH, scrollbarStyle.BgOr(0));
+            c.FillRoundRect(
+                trackX + app.Scale(2), thumbY,
+                scrollW - app.Scale(4), thumbH,
+                app.Scale(3), scrollbarStyle.FgOr(0));
+
+            if (FilePicker.Pressed(
+                    app, trackX, thumbY, scrollW, thumbH)) {
+                listDragging = true;
+                if (app.TouchDevice()) { app.ClaimDrag(); }
+                listDragOffset = app.mouseY - thumbY;
+            } else if (FilePicker.Pressed(
+                    app, trackX, paneY, scrollW, paneH)) {
+                listDragging = true;
+                if (app.TouchDevice()) { app.ClaimDrag(); }
+                listDragOffset = thumbH / 2;
+                if (range > 0) {
+                    listOff = (app.mouseY - paneY - listDragOffset)
+                        * listMax / range;
+                }
+                app.RequestRedraw();
+            }
+            if (listDragging && app.EventKind() == 1 && range > 0) {
+                listOff = (app.mouseY - paneY - listDragOffset)
+                    * listMax / range;
+                app.RequestRedraw();
+            }
+        }
+
+        if (treeOff < 0) { treeOff = 0; }
+        if (treeOff > treeMax) { treeOff = treeMax; }
+        if (listOff < 0) { listOff = 0; }
+        if (listOff > listMax) { listOff = listMax; }
+        treeScroll.Set(treeOff);
+        listScroll.Set(listOff);
+
+        if (app.EventKind() == 3) {
+            treeDragging = false;
+            listDragging = false;
+        }
+
+        if (!suppressOthers && app.EventKind() == 4) {
+            int key = app.window.EventKeyCode();
+            if (key == 27) {
+                if (creatingFolder) {
+                    creatingFolder = false;
+                    folderInput.SetText("");
+                    statusText = "";
+                    app.ClaimKey();
+                    app.RequestRedraw();
+                } else if (filterOpen) {
+                    filterOpen = false;
+                    app.ClaimKey();
+                    app.RequestRedraw();
+                } else {
+                    app.ClaimKey();
+                    Close();
+                }
+            } else if (key == 13) {
+                if (creatingFolder) {
+                    this.OnFolderSubmit();
+                    app.ClaimKey();
+                } else if (app.focus.IsFocused(pathInput.WidgetId())) {
+                    this.OnPathSubmit();
+                    app.ClaimKey();
+                } else if (searchInput != null && app.focus.IsFocused(searchInput.WidgetId())) {
+                    if (items.Count == 1 && items[0].kind == 0) {
+                        selectedPath = items[0].path;
+                        nameInput.SetText(items[0].name);
+                        this.TryAccept();
+                        app.ClaimKey();
+                    }
+                } else {
+                    this.TryAccept();
+                    app.ClaimKey();
+                }
+            } else if (key == 8) {
+                // Backspace: 在非文本编辑状态下回退上一级
+                bool inInput = app.focus.IsFocused(pathInput.WidgetId()) || app.focus.IsFocused(nameInput.WidgetId())
+                    || (creatingFolder && app.focus.IsFocused(folderInput.WidgetId()))
+                    || (searchInput != null && app.focus.IsFocused(searchInput.WidgetId()));
+                if (!inInput && dir != "") {
+                    string parent = FilePicker.ParentDirectory(dir);
+                    if (Directory.ExistsUtf8(parent)) {
+                        Navigate(parent);
+                        app.ClaimKey();
+                    }
+                }
+            } else if (key == 116) {
+                // F5: 刷新当前目录
+                Navigate(dir);
+                app.ClaimKey();
+            }
+        }
+
+        if (!suppressOthers && FilePicker.Clicked(
+                app, upX, top, upW, btnH)) {
+            string parent = FilePicker.ParentDirectory(dir);
+            if (Directory.ExistsUtf8(parent)) { Navigate(parent); }
+        } else if (!suppressOthers && FilePicker.Clicked(
+                app, refreshX, top, refreshW, btnH)) {
+            Navigate(dir);
+        } else if (!suppressOthers && FilePicker.Clicked(
+                app, newX, top, newW, btnH)) {
+            if (valid) {
+                creatingFolder = true;
+                folderInput.SetText(FilePicker.T(
+                    "New Folder", "新建文件夹"));
+                statusText = "";
+                app.RequestRedraw();
+            }
+        } else if (!suppressOthers && clicked >= 0 && clicked < items.Count) {
+            FilePickerItem clickedItem = items[clicked];
+            if (clickedItem.kind == 1) {
+                Navigate(clickedItem.path);
+            } else if (allowMulti) {
+                // 多选：普通点击重置为单行；Ctrl+点击切换；Shift+点击
+                // 从锚点扩展。文件夹行永远走 Navigate。
+                int mods = app.window.EventMods();
+                bool blocked = false;
+                if (Modifiers.HasCtrl(mods)) {
+                    if (this.InMultiSelection(clicked, items)) {
+                        this.RemoveSelectedPath(clickedItem.path);
+                        statusText = "";
+                    } else if (maxSelect > 0
+                               && selectedPaths.Count >= maxSelect) {
+                        // 上限拦截：加不进了，但已选中的行仍可移出。
+                        blocked = true;
+                        statusText = FilePicker.T(
+                            "Reached the limit of ", "已达数量上限 ")
+                            + Convert.ToString(maxSelect)
+                            + FilePicker.T(" files.", " 个。");
+                    } else {
+                        selectedPaths.Add(clickedItem.path);
+                        statusText = "";
+                    }
+                    anchorIdx = clicked;
+                } else if (Modifiers.HasShift(mods) && anchorIdx >= 0) {
+                    int a = anchorIdx;
+                    int b = clicked;
+                    if (b < a) { int tmp = a; a = b; b = tmp; }
+                    selectedPaths = new List<string>();
+                    int r = a;
+                    while (r <= b) {
+                        if (r < items.Count && items[r].kind == 0
+                                && !selectedPaths.Contains(items[r].path)) {
+                            if (maxSelect > 0
+                                    && selectedPaths.Count >= maxSelect) {
+                                blocked = true;
+                                statusText = FilePicker.T(
+                                    "Reached the limit of ", "已达数量上限 ")
+                                    + Convert.ToString(maxSelect)
+                                    + FilePicker.T(" files.", " 个。");
+                                break;
+                            }
+                            selectedPaths.Add(items[r].path);
+                        }
+                        r = r + 1;
+                    }
+                } else {
+                    selectedPaths = new List<string>();
+                    selectedPaths.Add(clickedItem.path);
+                    anchorIdx = clicked;
+                }
+                selectedPath = clickedItem.path;
+                nameInput.SetText(clickedItem.name);
+                // 上限拦截信息必须存活到渲染：仅当本次点击
+                // 真正改动了选区时才清状态。
+                if (!blocked) { statusText = ""; }
+                if (app.DoubleClickNow()) {
+                    this.TryAccept();
+                } else {
+                    app.RequestRedraw();
+                }
+            } else {
+                selectedPath = clickedItem.path;
+                nameInput.SetText(clickedItem.name);
+                statusText = "";
+                if (app.DoubleClickNow()) {
+                    this.TryAccept();
+                } else {
+                    app.RequestRedraw();
+                }
+            }
+        }
+
+        int footerY = paneY + paneH + t.gapMedium;
+        if (mode != 0) {
+            c.DrawText(
+                pad, footerY + app.Scale(8),
+                FilePicker.T("File name", "文件名"),
+                labelStyle.FgOr(0), Style.FontFallback(app, "medium"));
+            nameInput.Render(
+                app, pad + app.Scale(84), footerY,
+                W - pad - pad - app.Scale(84),
+                t.heightMedium);
+            footerY = footerY + t.heightMedium + t.gapMedium;
+        }
+
+        string info = "";
+        if (allowMulti && maxSelect > 0) {
+            // 数量上限窗口内常驻可见：状态区实时显示「已选 x/N」。
+            info = FilePicker.T("Selected ", "已选 ")
+                + Convert.ToString(selectedPaths.Count) + "/"
+                + Convert.ToString(maxSelect);
+        }
+        if (mode != 0 && selectedPath != "") {
+            if (info != "") { info = info + "  ·  "; }
+            info = info + Path.GetFileName(selectedPath);
+        }
+        if (statusText != "") { info = statusText; }
+        int infoColor = statusStyle.FgOr(0);
+        if (statusText != "") { infoColor = errorStyle.FgOr(0); }
+        bool hiddenBefore = showHidden.Get();
+        Checkbox hidden = Checkbox.Bind(
+            FilePicker.T("Show hidden files", "显示隐藏文件"), showHidden);
+        // 过滤器弹窗打开期间拥有点击所有权。
+        hidden.Disabled = suppressOthers;
+        hidden.Render(app, pad, footerY);
+        if (hiddenBefore != showHidden.Get()) {
+            treeScroll.Set(0);
+            listScroll.Set(0);
+            app.RequestRedraw();
+        }
+        // 信息列紧跟在「显示隐藏文件」复选框之后：宽度按标签实测
+        // （boxSize + gap + 文本），写死会在中文/英文两套文案下或
+        // 长文案时重叠。
+        int hiddenFontSize = Style.FontFallback(app, "medium");
+        int infoX = pad + app.Scale(18) + app.Scale(8)
+            + Canvas.MeasureText(
+                FilePicker.T("Show hidden files", "显示隐藏文件"),
+                hiddenFontSize)
+            + app.Scale(12);
+        // 窄视口上长状态文案会一路画进行尾的 Cancel/Open 按钮底下，
+        // 裁剪到按钮左侧（桌面宽度不受影响）。
+        int buttonW = app.Scale(112);
+        int acceptX = W - pad - buttonW;
+        int cancelX = acceptX - t.gapMedium - buttonW;
+        if (info != "") {
+            int infoMaxW = cancelX - t.gapMedium - infoX;
+            if (infoMaxW > 0) {
+                c.PushClip(infoX, footerY, infoMaxW, t.heightMedium);
+            }
+            c.DrawText(
+                infoX, footerY + app.Scale(8),
+                info, infoColor, Style.FontFallback(app, "small"));
+            if (infoMaxW > 0) { c.PopClip(); }
+        }
+
+        string acceptText = FilePicker.T(
+            "Select Folder", "选择文件夹");
+        if (mode == 1) { acceptText = FilePicker.T("Open", "打开"); }
+        if (mode == 2) { acceptText = FilePicker.T("Save", "保存"); }
+        new Button { Text = FilePicker.T("Cancel", "取消"), Class = "secondary" }.Render(
+            app, cancelX, footerY, buttonW);
+        new Button { Text = acceptText, Class = "primary" }.Render(
+            app, acceptX, footerY, buttonW);
+
+        // 扩展名过滤器下拉框，在按钮之后绘制，使其打开的菜单
+        // 层叠在按钮之上。交互已在帧内早些时候解析。
+        if (showFilter) {
+            int fTextY = Canvas.CenterTextY(filterRowY, t.heightMedium, Style.FontFallback(app, "medium"));
+            c.FillRoundRect(filterX, filterRowY, filterW, t.heightMedium,
+                t.borderRadiusMedium, filterStyle.BgOr(0));
+            c.DrawRoundRect(filterX, filterRowY, filterW, t.heightMedium,
+                t.borderRadiusMedium, filterBorderStyle.BorderOr(0), 1);
+            string flabel = Ellipsis.Fit(filters[filterSel.Get()].label,
+                filterW - t.paddingMedium * 2 - t.iconSizeSmall, Style.FontFallback(app, "medium"));
+            c.DrawText(filterX + t.paddingMedium, fTextY, flabel,
+                filterStyle.FgOr(0), Style.FontFallback(app, "medium"));
+            c.DrawGlyphIn("chevron-down",
+                filterX + filterW - t.paddingMedium - t.iconSizeSmall, filterRowY,
+                t.iconSizeSmall, t.heightMedium, t.iconSizeSmall,
+                iconStyle.FgOr(0));
+            if (filterOpen) {
+                c.FillRoundRect(filterX + 1, filterMenuY + 2, filterW,
+                    filterMenuH, t.borderRadiusMedium, filterShadowStyle.shadow);
+                c.FillRoundRect(filterX, filterMenuY, filterW, filterMenuH,
+                    t.borderRadiusMedium, filterOpenStyle.BgOr(0));
+                c.DrawRoundRect(filterX, filterMenuY, filterW, filterMenuH,
+                    t.borderRadiusMedium, filterBorderStyle.BorderOr(0), 1);
+                app.BlockHitsRect(filterX, filterMenuY, filterW, filterMenuH);
+                for (int mi = 0; mi < filters.Count; mi = mi + 1) {
+                    int iy = filterMenuY + t.paddingTiny + mi * t.heightMedium;
+                    if (mi == filterSel.Get()) {
+                        c.FillRect(filterX + 1, iy, filterW - 2,
+                            t.heightMedium, filterOpenStyle.BgOr(0));
+                    } else if (FilePicker.Inside(app, filterX, iy, filterW,
+                            t.heightMedium)) {
+                        c.FillRect(filterX + 1, iy, filterW - 2,
+                            t.heightMedium, filterHoverStyle.BgOr(0));
+                    }
+                    int iTextY = Canvas.CenterTextY(iy, t.heightMedium, Style.FontFallback(app, "medium"));
+                    c.DrawText(filterX + t.paddingMedium, iTextY,
+                        filters[mi].label, filterStyle.FgOr(0), Style.FontFallback(app, "medium"));
+                }
+            }
+        }
+
+        if (!suppressOthers && FilePicker.Clicked(
+                app, cancelX, footerY, buttonW, t.heightMedium)) {
+            selectedPath = "";
+            selectedPaths = new List<string>();
+            Finish(2);
+        } else if (!suppressOthers && FilePicker.Clicked(
+                app, acceptX, footerY, buttonW, t.heightMedium)) {
+            this.TryAccept();
+        }
+    }
+}

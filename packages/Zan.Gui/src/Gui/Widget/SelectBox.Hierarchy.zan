@@ -1,0 +1,251 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget.Models;
+
+namespace Gui.Widget;
+
+public partial class SelectBox {
+    // 固定弹层列数（等宽）；0 恢复自动。选项按列优先填，
+    // 先从第一列自上而下。
+    public SelectBox Columns(int n) {
+        if (n < 0) { n = 0; }
+        cols = n;
+        scrollY = 0;
+        popupWDirty = true;
+        return this;
+    }
+
+    // 表格式下拉（强类型实体入参）：弹层变成一张带列标题的表。
+    public SelectBox Table(List<SelectBoxColumn> columns) {
+        if (columns == null) {
+            this.tableColumns = null;
+            this.scrollY = 0;
+            this.popupWDirty = true;
+            return this;
+        }
+        this.tableColumns = columns;
+        this.scrollY = 0;
+        this.popupWDirty = true;
+        return this;
+    }
+
+    // 表格式下拉：弹层变成一张带列标题的表，每个选项占一行、
+    // 每行按 `widths` 分列。首列是选项的 label（Text() 仍然返回它），
+    // 其余列由 AddRow 提供。
+    // 传 null 恢复普通列表。
+    public SelectBox Table(List<string> titles, List<int> widths) {
+        if (titles == null || widths == null) {
+            this.tableColumns = null;
+            this.scrollY = 0;
+            this.popupWDirty = true;
+            return this;
+        }
+        this.tableColumns = new List<SelectBoxColumn>();
+        int count = titles.Count < widths.Count ? titles.Count : widths.Count;
+        for (int i = 0; i < count; i = i + 1) {
+            this.tableColumns.Add(new SelectBoxColumn(titles[i], widths[i]));
+        }
+        scrollY = 0;
+        popupWDirty = true;
+        return this;
+    }
+
+    // 是否处于表格式下拉模式。
+    public bool IsTable() {
+        return tableColumns != null && tableColumns.Count > 0;
+    }
+
+    // 表格式下拉的一行。`cells[0]` 是 label（首列），其余为后续列。
+    public void AddRow(List<string> cells) {
+        if (cells == null || cells.Count == 0) { return; }
+        SelectOption o = new SelectOption(cells[0], false);
+        List<string> rest = new List<string>();
+        for (int i = 1; i < cells.Count; i = i + 1) { rest.Add(cells[i]); }
+        o.cells = rest;
+        opts.Add(o);
+        popupWDirty = true;
+    }
+
+    // 表头高度（表格模式下弹层顶部占用的空间）。
+    public int HeaderH(App app) {
+        if (!this.IsTable()) { return 0; }
+        return app.Scale(26);
+    }
+
+
+    public Card defaultTreeCard;
+    public Card defaultCascadeCard;
+    public CascadePanel cascadePanel;
+
+    private static void OnTreeNodeSelected(Control sender) {
+        if (sender == null) { return; }
+        Control cur = sender.Parent();
+        while (cur != null) {
+            if (cur is SelectBox) {
+                SelectBox sb = (SelectBox)cur;
+                sb.OnTreeSelected();
+                return;
+            }
+            cur = cur.Parent();
+        }
+    }
+
+    public void OnTreeSelected() {
+        if (treeBox == null || treeBox.data == null) { return; }
+        int si = treeBox.SelectedIndex();
+        if (si >= 0 && si < treeBox.data.Count) {
+            TreeNode node = treeBox.data[si];
+            if (!node.isDir) {
+                pathText = node.payload;
+                if (pathText == "") { pathText = node.label; }
+                Change.RaiseS(this);
+                this.SetOpen(false);
+            }
+        }
+    }
+
+    public Card EnsureTreeCard(App app) {
+        if (defaultTreeCard == null) {
+            defaultTreeCard = new Card("");
+            defaultTreeCard.Class = "select-popup tree-select-popup";
+            defaultTreeCard.Pad(4);
+            defaultTreeCard.parent = this;
+            if (treeBox != null) {
+                treeBox.parent = defaultTreeCard;
+                treeBox.Select.AddS(SelectBox.OnTreeNodeSelected);
+                defaultTreeCard.With(treeBox);
+            }
+        }
+        if (app != null) {
+            int w = bw > 0 ? bw : app.Scale(260);
+            if (w < app.Scale(260)) { w = app.Scale(260); }
+            int viewH = OverlayPopup.FitH(app, maxVisible * (lastH > 0 ? lastH : app.theme.heightMedium) + app.theme.paddingSmall * 2);
+            defaultTreeCard.prefW = w;
+            defaultTreeCard.prefH = viewH;
+            if (treeBox != null) {
+                treeBox.prefW = w - app.Scale(8);
+                treeBox.prefH = viewH - app.Scale(8);
+            }
+        }
+        return defaultTreeCard;
+    }
+
+
+    public Card EnsureCascadeCard(App app) {
+        if (defaultCascadeCard == null) {
+            defaultCascadeCard = new Card("");
+            defaultCascadeCard.Class = "select-popup cascade-select-popup";
+            defaultCascadeCard.Pad(0);
+            defaultCascadeCard.parent = this;
+
+            cascadePanel = new CascadePanel(this);
+            cascadePanel.parent = defaultCascadeCard;
+            defaultCascadeCard.With(cascadePanel);
+        }
+        if (app != null) {
+            cascadePanel.OnMeasure(app);
+            defaultCascadeCard.prefW = cascadePanel.prefW;
+            defaultCascadeCard.prefH = cascadePanel.prefH;
+        }
+        return defaultCascadeCard;
+    }
+
+
+    // 级联选择模式。层级用 AddBranch / AddChild 建立，
+    // 弹层逐列展开，选中叶子时触发器显示完整路径
+    // （"浙江 / 杭州 / 西湖区"）。配合 Multi(true) 得到勾选式
+    // 多选（父子联动 + 勾选策略 + 标签芯片触发器）。
+    public SelectBox Cascade() {
+        cascade = true;
+        return this;
+    }
+
+    // 勾选策略常量（CheckStrategy 的取值）。
+    public static int CheckAll() { return 0; }
+    // 策略 1：只有勾选的父级节点计入触发器值集合。
+    public static int CheckParent() { return 1; }
+    // 策略 2：只有勾选的子级节点计入触发器值集合。
+    public static int CheckChild() { return 2; }
+
+    // 级联父子联动（Naive UI `cascade` prop，默认开）：勾选父级带动
+    // 全部子孙；关掉后任何层级的选项独立勾选，单选下也允许直接选中
+    // 带子级的分支。
+    public SelectBox CascadeLink(bool v) {
+        cascadeLink = v;
+        return this;
+    }
+
+    // 勾选策略：CheckAll / CheckParent / CheckChild（Naive UI
+    // check-strategy）。决定哪些勾选节点计入触发器的值集合。
+    public SelectBox CheckStrategy(int v) {
+        if (v >= 0 && v <= 2) { checkStrategy = v; }
+        return this;
+    }
+
+    // 触发器是否显示完整路径；false 只显示末级短标签
+    // （Naive UI show-path）。
+    public SelectBox ShowPath(bool v) {
+        showPath = v;
+        return this;
+    }
+
+    // 悬停即展开下一列（Naive UI hover-trigger）；默认点击展开。
+    public SelectBox HoverExpand(bool v) {
+        hoverExpand = v;
+        return this;
+    }
+
+    // 从过滤结果里选中后是否清掉搜索词（Naive UI
+    // clear-filter-after-select，默认清）。
+    public SelectBox ClearFilterAfter(bool v) {
+        clearFilterAfter = v;
+        return this;
+    }
+
+    // 加一个顶层分支（级联第一列的条目），返回它的平铺下标
+    // （继续 AddChild 时作父下标用）。
+    public int AddBranch(string label) {
+        SelectOption o = new SelectOption(label, false);
+        o.flatIdx = opts.Count;
+        opts.Add(o);
+        if (cascRoots == null) { cascRoots = new List<SelectOption>(); }
+        cascRoots.Add(o);
+        popupWDirty = true;
+        return o.flatIdx;
+    }
+
+    // 给第 `parent` 个选项挂一个子级（父下标是 AddBranch /
+    // AddChild 的返回值），返回子级的平铺下标。挂在同一父级
+    // 下的子级按插入顺序排成一列。
+    public int AddChild(int parent, string label) {
+        if (parent < 0 || parent >= opts.Count) { return 0 - 1; }
+        SelectOption o = new SelectOption(label, false);
+        o.flatIdx = opts.Count;
+        o.parentIdx = parent;
+        opts.Add(o);
+        opts[parent].Attach(o, o.flatIdx);
+        popupWDirty = true;
+        return o.flatIdx;
+    }
+
+    // 树形选择模式：弹层内嵌一颗真 TreeView。层级用
+    // TreeNode.Dir / TreeNode.File 构建，经 TreeNodes 绑定；
+    // 叶节点被选中时触发器显示它的 payload（未设则 label）。
+    // 树的展开、滚动、悬停全部是 TreeView 自己的行为。
+    public SelectBox Tree() {
+        treeMode = true;
+        treeBox = new TreeView();
+        treeSelSeen = 0 - 1;
+        return this;
+    }
+
+    // 绑定树节点（调用方的列表，TreeView.Bind 不复制）。
+    public SelectBox TreeNodes(List<TreeNode> nodes) {
+        if (treeBox == null) { this.Tree(); }
+        treeBox.Bind(nodes);
+        return this;
+    }
+
+
+}
