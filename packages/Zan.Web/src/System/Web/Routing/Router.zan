@@ -45,7 +45,7 @@ public class Router {
         } else {
             this.dynamics.Add(r);
         }
-        r.idx = this.flat.Count;
+        r.SetIdx(this.flat.Count);
         this.flat.Add(r);
         return r;
     }
@@ -54,7 +54,7 @@ public class Router {
     public Route AddRegex(string method, string pattern, HttpHandler handler) {
         Route r = new Route(method, pattern, handler, true);
         this.regexes.Add(r);
-        r.idx = this.flat.Count;
+        r.SetIdx(this.flat.Count);
         this.flat.Add(r);
         return r;
     }
@@ -117,10 +117,10 @@ public class Router {
         if (rt == null) { return; }
         for (int i = 0; i < this.statics.Count; i = i + 1) {
             Route r = this.statics[i];
-            int auth = (r.needsLogin || r.needsAuth) ? 1 : 0;
+            int auth = (r.NeedsLogin() || r.NeedsAuth()) ? 1 : 0;
             int perm = 0;
-            int menu = r.inMenu ? 1 : 0;
-            rt.Add(r.method, r.pattern, auth, perm, menu, r.action, r.idx);
+            int menu = r.InMenu() ? 1 : 0;
+            rt.Add(r.Method(), r.Pattern(), auth, perm, menu, r.Action(), r.Idx());
         }
         this.routeTable = rt;
     }
@@ -220,7 +220,7 @@ public class Router {
         i = 0;
         while (i < this.statics.Count) {
             Route r = this.statics[i];
-            int h = Router.HashKey(r.method, r.pattern) & mask;
+            int h = Router.HashKey(r.Method(), r.Pattern()) & mask;
             bool placed = false;
             while (!placed) {
                 int si = slots[h];
@@ -229,7 +229,7 @@ public class Router {
                     placed = true;
                 } else {
                     Route other = this.statics[si];
-                    if (other.method == r.method && other.pattern == r.pattern) {
+                    if (other.Method() == r.Method() && other.Pattern() == r.Pattern()) {
                         /* 重复注册先声明者赢（web_route_duplicate_key 钉的
                          * 口径）：同键后到者不进索引，首个 handler 继续服务。 */
                         placed = true;
@@ -252,15 +252,15 @@ public class Router {
             int si = this.hashSlots[h];
             if (si < 0) { return null; }
             Route r = this.statics[si];
-            if (r.method == method && r.pattern == path) { return r; }
+            if (r.Method() == method && r.Pattern() == path) { return r; }
             h = (h + 1) & mask;
         }
         return null;
     }
 
     public Route Match(HttpContext ctx) {
-        string method = ctx.method;
-        string path = ctx.path;
+        string method = ctx.Method();
+        string path = ctx.Path();
 
         // 1. 优先通过跨进程共享内存路由表做 O(1) 匹配
         if (this.routeTable != null) {
@@ -297,9 +297,9 @@ public class Router {
             int segCount = segs.Count;
             for (int i = 0; i < this.dynamics.Count; i = i + 1) {
                 Route r = this.dynamics[i];
-                if (r.segs.Count == segCount && (r.method == method || r.method == "*")) {
-                    if (ctx.routeParams == null) { ctx.routeParams = new StrMap(); }
-                    if (Router.MatchRoute(r, segs, ctx.routeParams)) {
+                if (r.Segs().Count == segCount && (r.Method() == method || r.Method() == "*")) {
+                    StrMap routeParams = ctx.EnsureRouteParams();
+                    if (Router.MatchRoute(r, segs, routeParams)) {
                         return r;
                     }
                 }
@@ -310,24 +310,24 @@ public class Router {
         if (this.regexes.Count > 0) {
             for (int ri = 0; ri < this.regexes.Count; ri = ri + 1) {
                 Route r = this.regexes[ri];
-                if (r.method == method || r.method == "*") {
-                    Match m = r.regex.Find(path);
+                if (r.Method() == method || r.Method() == "*") {
+                    Match m = r.Regex().Find(path);
                     if (m.Success()) {
-                        if (ctx.routeParams == null) { ctx.routeParams = new StrMap(); }
-                        if (r.regexGroupNames != null) {
-                            for (int gi = 0; gi < r.regexGroupNames.Count; gi = gi + 1) {
-                                string gname = r.regexGroupNames[gi];
+                        StrMap routeParams = ctx.EnsureRouteParams();
+                        if (r.RegexGroupNames() != null) {
+                            for (int gi = 0; gi < r.RegexGroupNames().Count; gi = gi + 1) {
+                                string gname = r.RegexGroupNames()[gi];
                                 if (gname.Length > 0) {
-                                    int gnum = r.regex.GroupNumber(gname);
+                                    int gnum = r.Regex().GroupNumber(gname);
                                     if (gnum >= 0 && m.GroupSuccess(gnum)) {
-                                        ctx.routeParams.Set(gname, m.Group(gnum));
+                                        routeParams.Set(gname, m.Group(gnum));
                                     }
                                 }
                             }
                         }
                         for (int gi = 1; gi < m.GroupCount(); gi = gi + 1) {
                             if (m.GroupSuccess(gi)) {
-                                ctx.routeParams.Set(Convert.ToString(gi), m.Group(gi));
+                                routeParams.Set(Convert.ToString(gi), m.Group(gi));
                             }
                         }
                         return r;
@@ -347,12 +347,12 @@ public class Router {
         }
         int i = 0;
         for (; i < this.statics.Count; i = i + 1) {
-            if (this.statics[i].pattern == path) { return true; }
+            if (this.statics[i].Pattern() == path) { return true; }
         }
         if (path.Length > 1 && path.EndsWith("/")) {
             string altPath = path.Substring(0, path.Length - 1);
             for (i = 0; i < this.statics.Count; i = i + 1) {
-                if (this.statics[i].pattern == altPath) { return true; }
+                if (this.statics[i].Pattern() == altPath) { return true; }
             }
         }
         if (this.dynamics.Count > 0) {
@@ -362,13 +362,13 @@ public class Router {
             i = 0;
             while (i < this.dynamics.Count) {
                 Route r = this.dynamics[i];
-                if (r.segs.Count == segCount && Router.MatchRoute(r, segs, scratch)) { return true; }
+                if (r.Segs().Count == segCount && Router.MatchRoute(r, segs, scratch)) { return true; }
                 i = i + 1;
             }
         }
         if (this.regexes.Count > 0) {
             for (int ri = 0; ri < this.regexes.Count; ri = ri + 1) {
-                if (this.regexes[ri].regex.IsMatch(path)) { return true; }
+                if (this.regexes[ri].Regex().IsMatch(path)) { return true; }
             }
         }
         return false;
@@ -384,10 +384,10 @@ public class Router {
 
     // 段数相等且逐段相等；利用预编译的 paramNames 零分配写入 into。
     public static bool MatchRoute(Route r, List<string> segs, StrMap into) {
-        List<string> pat = r.segs;
+        List<string> pat = r.Segs();
         int count = pat.Count;
         if (count != segs.Count) { return false; }
-        List<string> pnames = r.paramNames;
+        List<string> pnames = r.ParamNames();
         // 1. 先验证所有静态段是否吻合，不产生中间副作用
         for (int i = 0; i < count; i = i + 1) {
             if (pnames[i].Length == 0 && pat[i] != segs[i]) {
