@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Diagnostics;
+using System.Net;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Tls;
@@ -28,8 +29,8 @@ public class HttpConnectionPool : IDisposable {
     public HttpConnectionPool(int maxConnections, int maxIdleConnections, long idleTimeoutMs, long maxLifetimeMs) {
         this.maxConnections = maxConnections > 0 ? maxConnections : 32;
         this.maxIdleConnections = maxIdleConnections > 0 ? maxIdleConnections : 16;
-        this.idleTimeoutMs = idleTimeoutMs > 0 ? idleTimeoutMs : 60000;
-        this.maxLifetimeMs = maxLifetimeMs > 0 ? maxLifetimeMs : 300000;
+        this.idleTimeoutMs = idleTimeoutMs > 0 ? idleTimeoutMs : (long)NetConstants.TimeoutTotalBudgetMs;
+        this.maxLifetimeMs = maxLifetimeMs > 0 ? maxLifetimeMs : (long)(5 * NetConstants.TimeoutTotalBudgetMs);
         this.mtx = Mutex.Create();
         this.idleList = new List<PooledHttpConnection>();
         this.activeCount = 0;
@@ -43,7 +44,7 @@ public class HttpConnectionPool : IDisposable {
     }
 
     public static HttpConnectionPool CreateDefault() {
-        return new HttpConnectionPool(32, 16, 60000, 300000);
+        return new HttpConnectionPool(32, 16, (long)NetConstants.TimeoutTotalBudgetMs, (long)(5 * NetConstants.TimeoutTotalBudgetMs));
     }
 
     public int MaxConnections() { return this.maxConnections; }
@@ -76,7 +77,7 @@ public class HttpConnectionPool : IDisposable {
         if (this.mtx == 0 || this.disposed) {
             throw new InvalidOperationException("HttpConnectionPool is closed or disposed");
         }
-        long budget = timeoutMs > 0 ? (long)timeoutMs : 10000L;
+        long budget = timeoutMs > 0 ? (long)timeoutMs : (long)NetConstants.TimeoutConnectMs;
         long startMs = Stopwatch.GetMilliseconds();
         while (true) {
             if (this.mtx == 0 || this.disposed) {
@@ -274,6 +275,37 @@ public class HttpConnectionPool : IDisposable {
         if (this.mtx == 0) { return this.statWaitTimeouts; }
         Mutex.Lock(this.mtx);
         try { return this.statWaitTimeouts; } finally { Mutex.Unlock(this.mtx); }
+    }
+
+    // 主动清扫空闲连接列表中已过期或异常的连接，释放底层资源并唤醒等待协程。
+    // 返回本次清扫释放的连接总数。
+    public int SweepExpired() {
+        if (this.mtx == 0) { return 0; }
+        List<PooledHttpConnection> expired = new List<PooledHttpConnection>();
+        Mutex.Lock(this.mtx);
+        try {
+            long idleUs = this.idleTimeoutMs * 1000L;
+            long lifeUs = this.maxLifetimeMs * 1000L;
+            int i = 0;
+            while (i < this.idleList.Count) {
+                PooledHttpConnection conn = this.idleList[i];
+                if (conn.IsExpired(idleUs, lifeUs) || !conn.IsHealthy()) {
+                    this.idleList.RemoveAt(i);
+                    expired.Add(conn);
+                } else {
+                    i = i + 1;
+                }
+            }
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+        for (int j = 0; j < expired.Count; j = j + 1) {
+            expired[j].Dispose();
+        }
+        if (expired.Count > 0 && this.gate != null) {
+            this.gate.Signal();
+        }
+        return expired.Count;
     }
 
     // 彻底销毁连接池，清理所有存活连接并释放互斥量底层系统句柄

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 
@@ -43,8 +44,69 @@ public class DnsClient : IDisposable {
         return this.nextId;
     }
 
+    // 从系统 hosts 文件或本地表查询主机名映射
+    public static string LookupHosts(string domain) {
+        if (domain == null || domain.Length == 0) { return ""; }
+        string d = domain.ToLower();
+        string hostsFile = "";
+        #if WINDOWS
+        hostsFile = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+        #else
+        hostsFile = "/etc/hosts";
+        #endif
+        if (!File.Exists(hostsFile)) { return ""; }
+        try {
+            List<string> lines = File.ReadAllLines(hostsFile);
+            for (int i = 0; i < lines.Count; i = i + 1) {
+                string line = lines[i].Trim();
+                if (line.Length == 0 || line.StartsWith("#")) { continue; }
+                int comment = line.IndexOf("#");
+                if (comment >= 0) { line = line.Substring(0, comment).Trim(); }
+                List<string> parts = line.Split(" ");
+                List<string> tokens = new List<string>();
+                for (int p = 0; p < parts.Count; p = p + 1) {
+                    string part = parts[p].Trim();
+                    if (part.Length > 0) { tokens.Add(part); }
+                }
+                if (tokens.Count >= 2) {
+                    string ip = tokens[0];
+                    for (int t = 1; t < tokens.Count; t = t + 1) {
+                        if (tokens[t].ToLower() == d) {
+                            return ip;
+                        }
+                    }
+                }
+            }
+        } catch (Exception _ex) {
+            // 系统 hosts 读取异常抑制并降级至远端 DNS
+        }
+        return "";
+    }
+
     // 异步解析 IPv4 地址列表 (Type A)
     public async List<string> ResolveAsync(string domain) {
+        if (domain == null || domain.Length == 0) { return new List<string>(); }
+        // 1. IP 字面量直接短路返回
+        if (IPAddress.IsIPv4(domain)) {
+            List<string> direct = new List<string>();
+            direct.Add(domain);
+            return direct;
+        }
+        // 2. 本地回环预解析
+        string dLow = domain.ToLower();
+        if (dLow == "localhost" || dLow == "localhost.localdomain") {
+            List<string> local = new List<string>();
+            local.Add("127.0.0.1");
+            return local;
+        }
+        // 3. 系统 hosts 优先匹配
+        string hostsIp = DnsClient.LookupHosts(domain);
+        if (hostsIp.Length > 0 && IPAddress.IsIPv4(hostsIp)) {
+            List<string> mapped = new List<string>();
+            mapped.Add(hostsIp);
+            return mapped;
+        }
+        // 4. 远端 UDP DNS 查询
         List<DnsRecord> records = await this.QueryAsync(domain, DnsRecordType.A);
         List<string> ips = new List<string>();
         for (int i = 0; i < records.Count; i = i + 1) {
@@ -57,6 +119,19 @@ public class DnsClient : IDisposable {
 
     // 异步解析 IPv6 地址列表 (Type AAAA)
     public async List<string> ResolveAaaaAsync(string domain) {
+        if (domain == null || domain.Length == 0) { return new List<string>(); }
+        string dLow = domain.ToLower();
+        if (dLow == "localhost" || dLow == "localhost.localdomain") {
+            List<string> local = new List<string>();
+            local.Add("::1");
+            return local;
+        }
+        string hostsIp = DnsClient.LookupHosts(domain);
+        if (hostsIp.Length > 0 && hostsIp.Contains(":")) {
+            List<string> mapped = new List<string>();
+            mapped.Add(hostsIp);
+            return mapped;
+        }
         List<DnsRecord> records = await this.QueryAsync(domain, DnsRecordType.AAAA);
         List<string> ips = new List<string>();
         for (int i = 0; i < records.Count; i = i + 1) {
