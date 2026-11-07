@@ -360,6 +360,10 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.h
             ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_diag.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_core.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_co.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_misc.c
     COMMENT "Building unified timer runtime object (zanrt_timer)"
     VERBATIM)
 add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})
