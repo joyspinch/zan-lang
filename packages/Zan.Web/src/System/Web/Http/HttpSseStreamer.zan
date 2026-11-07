@@ -11,16 +11,15 @@ public class HttpSseStreamer {
 
     // 开启 SSE 流式连接通道：发送标准响应头，接管底层 TCP 连接并标记统计指标。
     public static async bool Open(HttpContext ctx) {
-        if (ctx == null || ctx.conn == null) { return false; }
+        if (ctx == null || ctx.Conn() == null) { return false; }
         string head = "HTTP/1.1 200 OK\r\n"
             + "Content-Type: " + HttpLimits.MimeEventStream + "\r\n"
             + "Cache-Control: no-cache, no-transform\r\n"
             + "Connection: keep-alive\r\n"
             + "X-Accel-Buffering: no\r\n\r\n";
-        int n = await ctx.conn.SendAsync(head);
+        int n = await ctx.Conn().SendAsync(head);
         if (n <= 0) { return false; }
-        ctx.hijacked = true;
-        ctx.wasHijacked = true;
+        ctx.Hijack();
         ctx.ended = true;
         ServerMetrics.Global().StreamOpened();
         return true;
@@ -43,7 +42,7 @@ public class HttpSseStreamer {
 
     // 格式化并发送一条 SSE 事件消息（包含可选事件名称与多行 data 编码）。
     public static async bool Send(HttpContext ctx, string name, string data) {
-        if (ctx == null || !ctx.hijacked || ctx.conn == null) { return false; }
+        if (ctx == null || !ctx.Hijacked() || ctx.Conn() == null) { return false; }
         StringBuilder sb = new StringBuilder();
         if (name.Length > 0) { sb.Append("event: "); sb.Append(name); sb.Append("\n"); }
         int start = 0;
@@ -57,23 +56,21 @@ public class HttpSseStreamer {
         }
         sb.Append("\n");
         string frame = sb.ToString();
-        bool ok = await HttpSseStreamer.SendAllTcp(ctx.conn, frame);
-        if (!ok) { ctx.hijacked = false; return false; }
+        bool ok = await HttpSseStreamer.SendAllTcp(ctx.Conn(), frame);
+        if (!ok) { ctx.CloseHijack(); return false; }
         // 续期超时期限，避免健康流被连接清扫器回收
-        ctx.TouchDeadline(ctx.streamIdleMs);
-        ctx.frames = ctx.frames + 1;
-        ctx.framesBytes = ctx.framesBytes + frame.Length;
+        ctx.TouchDeadline(ctx.StreamIdleMs());
+        ctx.RecordFrame(frame.Length);
         return true;
     }
 
     // 发送 SSE 格式的标准注释保活帧 (: ping\n\n)。
     public static async bool Ping(HttpContext ctx) {
-        if (ctx == null || !ctx.hijacked || ctx.conn == null) { return false; }
-        bool ok = await HttpSseStreamer.SendAllTcp(ctx.conn, ": ping\n\n");
-        if (!ok) { ctx.hijacked = false; return false; }
-        ctx.TouchDeadline(ctx.streamIdleMs);
-        ctx.frames = ctx.frames + 1;
-        ctx.framesBytes = ctx.framesBytes + 8;
+        if (ctx == null || !ctx.Hijacked() || ctx.Conn() == null) { return false; }
+        bool ok = await HttpSseStreamer.SendAllTcp(ctx.Conn(), ": ping\n\n");
+        if (!ok) { ctx.CloseHijack(); return false; }
+        ctx.TouchDeadline(ctx.StreamIdleMs());
+        ctx.RecordFrame(8);
         return true;
     }
 }
