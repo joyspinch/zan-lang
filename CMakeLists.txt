@@ -987,7 +987,13 @@ if(ZAN_BUILD_IMAGE)
 endif()
 
 if(ZAN_BUILD_AUDIO)
-    add_library(zan_audio SHARED src/runtime/zan_audio.c)
+    add_library(zan_audio SHARED
+        src/runtime/zan_audio.c
+        src/runtime/audio/audio_mixer.c
+        src/runtime/audio/audio_clip.c
+        src/runtime/audio/audio_wasapi.c
+        src/runtime/audio/audio_posix.c
+        src/runtime/audio/audio_api.c)
     if(WIN32)
         target_link_libraries(zan_audio PRIVATE ole32)
     else()
