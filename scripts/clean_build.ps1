@@ -64,7 +64,9 @@ $keepExe = @(
     # DAP 集成测试的固定目标程序（CMake 自定义命令生成，删了测试就跑不了）
     'dbgtarget.exe', 'dbgtarget_burn.exe',
     # 图表演示程序（build_gallery.ps1 / build_charts.ps1 产出，正在跑的时候别删）
-    'gallery_test.exe', 'charts_test.exe'
+    'gallery_test.exe', 'charts_test.exe',
+    # 自举测试/门禁目标程序（run_selfhost_diff / run_fixedpoint 运行期间不可删）
+    'selfhost_diff_gen1.exe', 'gen1.exe', 'gen2.exe'
 )
 
 $plan = [ordered]@{}
