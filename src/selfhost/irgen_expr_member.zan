@@ -132,6 +132,26 @@ partial class Irgen {
     }
     ExprVal GenConsoleCall(string mname, Node e) {
         int argc = e.kids.Count;
+        if (mname == "ErrorWriteLine") {
+            if (!ExternSeen("zan_rt_eprint_line")) {
+                externDecls.Add("zan_rt_eprint_line");
+                H("declare void @zan_rt_eprint_line(i8*)");
+            }
+            if (argc == 0) {
+                ExprVal empt = GenStr("");
+                L("  call void @zan_rt_eprint_line(i8* " + empt.op + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            if (argc != 1) {
+                diags.Error("Console.ErrorWriteLine takes at most one argument", e.line, e.col);
+                return new ExprVal("0", MkType("void"));
+            }
+            ExprVal a = GenExpr(e.kids[0]);
+            string s = a.op;
+            if (!IsStr(a.ty)) { s = ToCStr(a); }
+            L("  call void @zan_rt_eprint_line(i8* " + s + ")");
+            return new ExprVal("0", MkType("void"));
+        }
         // ---- Console.Write / WriteLine / PrintLine ----
         // The host prints the argument and, for WriteLine/PrintLine, a
         // newline. The rendering depends on the argument's type:
@@ -869,6 +889,16 @@ partial class Irgen {
         EmitRuntimeCheckIf(at, "1", msg);
     }
 
+    string InferGuardExceptionTid(string msg) {
+        if (msg.IndexOf("InvalidCast") >= 0) { return "InvalidCastException"; }
+        if (msg.IndexOf("division by zero") >= 0) { return "DivideByZeroException"; }
+        if (msg.IndexOf("not a valid") >= 0) { return "FormatException"; }
+        if (msg.IndexOf("outside the range") >= 0 || msg.IndexOf("out of range") >= 0 || msg.IndexOf("overflow") >= 0) { return "OverflowException"; }
+        if (msg.IndexOf("index") >= 0 || msg.IndexOf("bounds") >= 0) { return "IndexOutOfRangeException"; }
+        if (msg.IndexOf("null reference") >= 0) { return "NullReferenceException"; }
+        return "Exception";
+    }
+
     // The predicate form: the C host's emit_runtime_check takes the `bad`
     // value and reports only when it is set (irgen_generics.c). Same-shape
     // diagnostic, same once-per-text dedup, same exit 70 under
@@ -900,6 +930,16 @@ partial class Irgen {
         int lcheck = NL(); int lskip = NL();
         L("  br i1 " + bad + ", label %L" + lcheck + ", label %L" + lskip);
         Label(lcheck);
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string hasH = NT();
+        L("  " + hasH + " = icmp sgt i64 " + sp + ", 1");
+        int lthrow = NL(); int lnothrow = NL();
+        L("  br i1 " + hasH + ", label %L" + lthrow + ", label %L" + lnothrow);
+        Label(lthrow);
+        string tid = InferGuardExceptionTid(msg);
+        EmitExceptionThrow(tid, msg);
+        Label(lnothrow);
         int lhard = NL(); int lsoft = NL();
         string hd = NT();
         L("  " + hd + " = call i32 @zan_rt_soft_is_hard()");
