@@ -100,11 +100,19 @@ public class SqlitePool : IDisposable {
             return;
         }
         if (c.inTxn) {
-            // 归还时事务没收尾：回滚掉再入池（P2-29）。UnitOfWork 用户
-            // 不受影响（它本来就先 Rollback）；回滚失败也放行——连接仍
-            // 可用，下一位使用者的显式 BEGIN 会撞上残留事务报错，可定位。
-            try { c.Rollback(); } catch (DbException e) { }
+            // 归还时事务未收尾：执行回滚；若回滚失败则连接状态不可信，必须关闭丢弃。
+            bool failed = false;
+            try {
+                c.Rollback();
+            } catch (Exception _ex) {
+                failed = true;
+            }
             c.inTxn = false;
+            if (failed || this.core.IsClosed() || !c.IsConnected()) {
+                c.Close();
+                this.core.Drop(c);
+                return;
+            }
         }
         this.core.Pool(c);
     }

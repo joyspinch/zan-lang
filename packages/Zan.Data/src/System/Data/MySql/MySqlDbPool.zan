@@ -29,13 +29,21 @@ public class MySqlDbPool : DbPool {
         base.Release(c);
     }
 
-    // 清理协程体：ROLLBACK 落地后按基类同规入池/丢弃。
+    // 清理协程体：ROLLBACK 落地后按基类同规入池；若回滚抛出异常或连接失效，
+    // 说明连接可能处于协议错位或断开状态，立即关闭并丢弃，严禁脏连接回池。
     private async bool Cleanup(MySqlConnection mc) {
+        bool failed = false;
         try {
             await mc.RollbackAsync();
-        } catch (Exception) {
+        } catch (Exception ex) {
+            failed = true;
         }
         mc.inTxn = false;
+        if (failed || !mc.IsConnected()) {
+            mc.Close();
+            this.Drop(mc);
+            return true;
+        }
         base.Release(mc);
         return true;
     }

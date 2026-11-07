@@ -23,12 +23,18 @@ namespace System.Data.Odbc;
 // 语句失败时抛出 <see cref="DbException"/>；空结果集总
 // 意味着「无行」，错误文本可通过 GetError() 获取。
 public class DbConnection : IDbConnection {
-    nint handle;  // ODBC 连接（dbc）句柄
-    nint env;  // ODBC 环境句柄
-    int provider;  // DbProvider.*
-    string connectionString;
-    bool connected;
-    string lastError;
+    private const int DEFAULT_BUFFER_SIZE = 4096;
+    private const int MSG_BUFFER_SIZE = 1024;
+    private const int NAME_BUFFER_SIZE = 256;
+    private const int PTR_SIZE = 8;
+    private const int INT_SIZE = 4;
+
+    private nint handle;  // ODBC 连接（dbc）句柄
+    private nint env;  // ODBC 环境句柄
+    private int provider;  // DbProvider.*
+    private string connectionString;
+    private bool connected;
+    private string lastError;
 
     // --- ODBC 驱动管理器 FFI ---
     // ODBC 管理器提供统一的基于缓冲区的 API（SQLGetData），因此一套
@@ -150,7 +156,7 @@ public class DbConnection : IDbConnection {
     #endif
 
     // 空连接；外部经各 Open* 工厂构造。
-    DbConnection() {
+    private DbConnection() {
         this.handle = 0;
         this.env = 0;
         this.provider = DbProvider.ODBC;
@@ -164,7 +170,7 @@ public class DbConnection : IDbConnection {
     // 重建写入 out 缓冲区中的 64 位句柄/指针。
     // 64 位平台上句柄为指针大小（8 字节），因此必须读回全部八个
     // 小端字节。
-    static nint HandleFromBuf(string p) {
+    private static nint HandleFromBuf(string p) {
         long v = 0;
         v = v + (p[0] & 255);
         v = v + ((long)(p[1] & 255) << 8);
@@ -178,12 +184,12 @@ public class DbConnection : IDbConnection {
     }
 
     // 从 out 缓冲区读取 16 位小端值。
-    static int Int16FromBuf(string p) {
+    private static int Int16FromBuf(string p) {
         return (p[0] & 255) + ((p[1] & 255) << 8);
     }
 
     // 驱动填充的文本缓冲区中第一个 NUL 字节的索引。
-    static int ScanNul(string buf, int max) {
+    private static int ScanNul(string buf, int max) {
         for (int i = 0; i < max; i = i + 1) {
             if (buf[i] == 0) { return i; }
         }
@@ -191,12 +197,12 @@ public class DbConnection : IDbConnection {
     }
 
     // 将 NUL 结尾的 C 缓冲区复制为 Zan 字符串。
-    static string BufToString(string buf, int max) {
+    private static string BufToString(string buf, int max) {
         return buf.Substring(0, ScanNul(buf, max));
     }
 
     // ODBC 返回码是否成功（SQL_SUCCESS=0 或 SQL_SUCCESS_WITH_INFO=1）。
-    static bool OdbcSuccess(int rc) {
+    private static bool OdbcSuccess(int rc) {
         return rc == 0 || rc == 1;
     }
 
@@ -334,7 +340,7 @@ public class DbConnection : IDbConnection {
         conn.connectionString = connectionString;
 
         // 分配环境句柄（SQL_HANDLE_ENV = 1）。
-        byte[] pEnv = new byte[8];
+        byte[] pEnv = new byte[PTR_SIZE];
         int rc = SQLAllocHandle(1, 0, pEnv);
         if (!OdbcSuccess(rc)) {
             conn.lastError = "SQLAllocHandle(ENV) failed";
@@ -350,7 +356,7 @@ public class DbConnection : IDbConnection {
         }
 
         // 分配连接句柄（SQL_HANDLE_DBC = 2）。
-        byte[] pDbc = new byte[8];
+        byte[] pDbc = new byte[PTR_SIZE];
         rc = SQLAllocHandle(2, envH, pDbc);
         if (!OdbcSuccess(rc)) {
             SQLFreeHandle(1, envH);
@@ -360,9 +366,9 @@ public class DbConnection : IDbConnection {
         nint dbcH = HandleFromBuf(pDbc);
 
         // 建立连接。SQL_NTS = -3、SQL_DRIVER_NOPROMPT = 0。
-        byte[] outConn = new byte[1024];
-        byte[] pOutLen = new byte[8];
-        rc = SQLDriverConnect(dbcH, 0, connectionString, -3, outConn, 1024, pOutLen, 0);
+        byte[] outConn = new byte[MSG_BUFFER_SIZE];
+        byte[] pOutLen = new byte[PTR_SIZE];
+        rc = SQLDriverConnect(dbcH, 0, connectionString, -3, outConn, MSG_BUFFER_SIZE, pOutLen, 0);
 
         if (OdbcSuccess(rc)) {
             conn.env = envH;
@@ -380,8 +386,8 @@ public class DbConnection : IDbConnection {
     // 执行 / 查询
 
     // 分配语句句柄（SQL_HANDLE_STMT = 3）；失败时返回 0。
-    nint AllocStmt() {
-        byte[] pStmt = new byte[8];
+    private nint AllocStmt() {
+        byte[] pStmt = new byte[PTR_SIZE];
         int rc = SQLAllocHandle(3, this.handle, pStmt);
         if (!OdbcSuccess(rc)) { return 0; }
         nint stmt = HandleFromBuf(pStmt);
@@ -391,7 +397,7 @@ public class DbConnection : IDbConnection {
     // 抛出记录的失败。provider 指明来自哪个引擎，
     // 处理方无需解析消息即可分支处理；错误文本仍可通过
     // <see cref="GetError"/> 获取。
-    void Fail() {
+    private void Fail() {
         string why = this.lastError;
         if (why.Length == 0) {
             why = "the statement failed";
@@ -404,16 +410,16 @@ public class DbConnection : IDbConnection {
     // 表不存在，驱动的诊断文本才会。句柄无效或没有记录时不改动
     // lastError（静态描述兜底）。只取第一条记录：ODBC 的失败原因
     // 几乎总在第一条。
-    void Diagnose(int handleType, nint h) {
+    private void Diagnose(int handleType, nint h) {
         if (h == 0) { return; }
-        byte[] state = new byte[8];
-        byte[] native = new byte[8];
-        byte[] msg = new byte[1024];
-        byte[] mlen = new byte[8];
-        int rc = SQLGetDiagRec(handleType, h, 1, state, native, msg, 1024,
+        byte[] state = new byte[PTR_SIZE];
+        byte[] native = new byte[PTR_SIZE];
+        byte[] msg = new byte[MSG_BUFFER_SIZE];
+        byte[] mlen = new byte[PTR_SIZE];
+        int rc = SQLGetDiagRec(handleType, h, 1, state, native, msg, MSG_BUFFER_SIZE,
                                mlen);
         if (rc == 0 || rc == 1) {
-            string text = BufToString(msg, 1024);
+            string text = BufToString(msg, MSG_BUFFER_SIZE);
             if (text.Length > 0) { this.lastError = text; }
         }
     }
@@ -436,7 +442,7 @@ public class DbConnection : IDbConnection {
             this.Fail();
         }
 
-        byte[] pRows = new byte[8];
+        byte[] pRows = new byte[PTR_SIZE];
         SQLRowCount(stmt, pRows);
         int affected = (int)HandleFromBuf(pRows);
 
@@ -450,14 +456,14 @@ public class DbConnection : IDbConnection {
     // SQLExecute 完成之后——ARC 不移动对象，地址稳定，但引用
     // 断了内存就没了；调用方持有 keepAlive 列表跨过 await。
     // 返回绑定的参数个数，失败返回 -1。
-    int BindParams(nint stmt, DbParams prms, List<string> keepValues,
+    private int BindParams(nint stmt, DbParams prms, List<string> keepValues,
                    List<byte[]> keepInds) {
         int n = prms.Count();
         for (int i = 0; i < n; i = i + 1) {
             string v = prms.IsNull(i) ? "" : prms.AsText(i);
-            byte[] ind = new byte[8];
+            byte[] ind = new byte[PTR_SIZE];
             if (prms.IsNull(i)) {
-                for (int b = 0; b < 8; b = b + 1) { ind[b] = 255; }
+                for (int b = 0; b < PTR_SIZE; b = b + 1) { ind[b] = 255; }
             }
             keepValues.Add(v);
             keepInds.Add(ind);
@@ -493,7 +499,7 @@ public class DbConnection : IDbConnection {
 
     // Prepare +（可选）绑定参数 + 阻塞卸载的 SQLExecute；返回受影响行数，
     // 失败抛 <see cref="DbException"/>。
-    async int ExecuteCoreAsync(string sql, DbParams prms) {
+    private async int ExecuteCoreAsync(string sql, DbParams prms) {
         if (!this.connected) {
             this.lastError = "not connected";
             this.Fail();
@@ -524,7 +530,7 @@ public class DbConnection : IDbConnection {
             SQLFreeHandle(3, stmt);
             this.Fail();
         }
-        byte[] pRows = new byte[8];
+        byte[] pRows = new byte[PTR_SIZE];
         SQLRowCount(stmt, pRows);
         int affected = (int)HandleFromBuf(pRows);
         SQLFreeStmt(stmt, 0);
@@ -546,7 +552,7 @@ public class DbConnection : IDbConnection {
 
     // Prepare + 执行 + 描述列名 + 逐行 SQLGetData 取值（NULL 按指示符识别）；
     // 失败抛 <see cref="DbException"/>。
-    async DbResult QueryCoreAsync(string sql, DbParams prms) {
+    private async DbResult QueryCoreAsync(string sql, DbParams prms) {
         if (!this.connected) {
             this.lastError = "not connected";
             this.Fail();
@@ -577,36 +583,36 @@ public class DbConnection : IDbConnection {
             SQLFreeHandle(3, stmt);
             this.Fail();
         }
-        byte[] pcc = new byte[4];
+        byte[] pcc = new byte[INT_SIZE];
         SQLNumResultCols(stmt, pcc);
         int colCount = Int16FromBuf(pcc);
         result.SetColumnCount(colCount);
 
         int c = 0;
         for (; c < colCount; c = c + 1) {
-            byte[] nameBuf = new byte[256];
-            byte[] pNameLen = new byte[4];
-            byte[] pType = new byte[4];
-            byte[] pSize = new byte[8];
-            byte[] pDec = new byte[4];
-            byte[] pNull = new byte[4];
-            SQLDescribeCol(stmt, c + 1, nameBuf, 256, pNameLen, pType, pSize, pDec, pNull);
-            result.AddColumnName(BufToString(nameBuf, 256));
+            byte[] nameBuf = new byte[NAME_BUFFER_SIZE];
+            byte[] pNameLen = new byte[INT_SIZE];
+            byte[] pType = new byte[INT_SIZE];
+            byte[] pSize = new byte[PTR_SIZE];
+            byte[] pDec = new byte[INT_SIZE];
+            byte[] pNull = new byte[INT_SIZE];
+            SQLDescribeCol(stmt, c + 1, nameBuf, NAME_BUFFER_SIZE, pNameLen, pType, pSize, pDec, pNull);
+            result.AddColumnName(BufToString(nameBuf, NAME_BUFFER_SIZE));
         }
 
 
         // 单元格取值缓冲跨行复用：每格 new 一个 4096 字节缓冲的代价
         // 在宽表/深结果集上比取值本身还贵。BufToString 当场复制成串，
         // 复用是安全的。
-        byte[] buf = new byte[4096];
-        byte[] pInd = new byte[8];
+        byte[] buf = new byte[DEFAULT_BUFFER_SIZE];
+        byte[] pInd = new byte[PTR_SIZE];
         int fr = await SQLFetch(stmt);
         while (fr == 0 || fr == 1) {
             List<string> row = new List<string>();
             List<bool> nulls = new List<bool>();
             c = 0;
             while (c < colCount) {
-                int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
+                int g = SQLGetData(stmt, c + 1, 1, buf, DEFAULT_BUFFER_SIZE, pInd);
                 // SQL_NULL_DATA = -1：指示缓冲由驱动填写，此前从未读过，
                 // NULL 被不可逆地压成 ""，IsNull() 永远不触发。
                 bool isNull = g == 100
@@ -617,7 +623,7 @@ public class DbConnection : IDbConnection {
                     row.Add("");
                 } else {
                     nulls.Add(false);
-                    row.Add(BufToString(buf, 4096));
+                    row.Add(BufToString(buf, DEFAULT_BUFFER_SIZE));
                 }
                 c = c + 1;
             }
@@ -650,36 +656,36 @@ public class DbConnection : IDbConnection {
             this.Fail();
         }
 
-        byte[] pcc = new byte[4];
+        byte[] pcc = new byte[INT_SIZE];
         SQLNumResultCols(stmt, pcc);
         int colCount = Int16FromBuf(pcc);
         result.SetColumnCount(colCount);
 
         int c = 0;
         for (; c < colCount; c = c + 1) {
-            byte[] nameBuf = new byte[256];
-            byte[] pNameLen = new byte[4];
-            byte[] pType = new byte[4];
-            byte[] pSize = new byte[8];
-            byte[] pDec = new byte[4];
-            byte[] pNull = new byte[4];
-            SQLDescribeCol(stmt, c + 1, nameBuf, 256, pNameLen, pType, pSize, pDec, pNull);
-            result.AddColumnName(BufToString(nameBuf, 256));
+            byte[] nameBuf = new byte[NAME_BUFFER_SIZE];
+            byte[] pNameLen = new byte[INT_SIZE];
+            byte[] pType = new byte[INT_SIZE];
+            byte[] pSize = new byte[PTR_SIZE];
+            byte[] pDec = new byte[INT_SIZE];
+            byte[] pNull = new byte[INT_SIZE];
+            SQLDescribeCol(stmt, c + 1, nameBuf, NAME_BUFFER_SIZE, pNameLen, pType, pSize, pDec, pNull);
+            result.AddColumnName(BufToString(nameBuf, NAME_BUFFER_SIZE));
         }
 
 
         // 单元格取值缓冲跨行复用：每格 new 一个 4096 字节缓冲的代价
         // 在宽表/深结果集上比取值本身还贵。BufToString 当场复制成串，
         // 复用是安全的。
-        byte[] buf = new byte[4096];
-        byte[] pInd = new byte[8];
+        byte[] buf = new byte[DEFAULT_BUFFER_SIZE];
+        byte[] pInd = new byte[PTR_SIZE];
         int fr = SQLFetch(stmt);
         while (fr == 0 || fr == 1) {
             List<string> row = new List<string>();
             List<bool> nulls = new List<bool>();
             c = 0;
             while (c < colCount) {
-                int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
+                int g = SQLGetData(stmt, c + 1, 1, buf, DEFAULT_BUFFER_SIZE, pInd);
                 bool isNull = g == 100
                     || ((pInd[0] & 255) == 255 && (pInd[1] & 255) == 255
                         && (pInd[2] & 255) == 255 && (pInd[3] & 255) == 255);
@@ -688,7 +694,7 @@ public class DbConnection : IDbConnection {
                     row.Add("");
                 } else {
                     nulls.Add(false);
-                    row.Add(BufToString(buf, 4096));
+                    row.Add(BufToString(buf, DEFAULT_BUFFER_SIZE));
                 }
                 c = c + 1;
             }
@@ -832,7 +838,7 @@ public class DbConnection : IDbConnection {
             SQLFreeHandle(3, stmt);
             this.Fail();
         }
-        byte[] pRows = new byte[8];
+        byte[] pRows = new byte[PTR_SIZE];
         SQLRowCount(stmt, pRows);
         int affected = (int)HandleFromBuf(pRows);
         SQLFreeStmt(stmt, 0);
@@ -875,36 +881,36 @@ public class DbConnection : IDbConnection {
             this.Fail();
         }
 
-        byte[] pcc = new byte[4];
+        byte[] pcc = new byte[INT_SIZE];
         SQLNumResultCols(stmt, pcc);
         int colCount = Int16FromBuf(pcc);
         result.SetColumnCount(colCount);
 
         int c = 0;
         for (; c < colCount; c = c + 1) {
-            byte[] nameBuf = new byte[256];
-            byte[] pNameLen = new byte[4];
-            byte[] pType = new byte[4];
-            byte[] pSize = new byte[8];
-            byte[] pDec = new byte[4];
-            byte[] pNull = new byte[4];
-            SQLDescribeCol(stmt, c + 1, nameBuf, 256, pNameLen, pType, pSize, pDec, pNull);
-            result.AddColumnName(BufToString(nameBuf, 256));
+            byte[] nameBuf = new byte[NAME_BUFFER_SIZE];
+            byte[] pNameLen = new byte[INT_SIZE];
+            byte[] pType = new byte[INT_SIZE];
+            byte[] pSize = new byte[PTR_SIZE];
+            byte[] pDec = new byte[INT_SIZE];
+            byte[] pNull = new byte[INT_SIZE];
+            SQLDescribeCol(stmt, c + 1, nameBuf, NAME_BUFFER_SIZE, pNameLen, pType, pSize, pDec, pNull);
+            result.AddColumnName(BufToString(nameBuf, NAME_BUFFER_SIZE));
         }
 
 
         // 单元格取值缓冲跨行复用：每格 new 一个 4096 字节缓冲的代价
         // 在宽表/深结果集上比取值本身还贵。BufToString 当场复制成串，
         // 复用是安全的。
-        byte[] buf = new byte[4096];
-        byte[] pInd = new byte[8];
+        byte[] buf = new byte[DEFAULT_BUFFER_SIZE];
+        byte[] pInd = new byte[PTR_SIZE];
         int fr = SQLFetch(stmt);
         while (fr == 0 || fr == 1) {
             List<string> row = new List<string>();
             List<bool> nulls = new List<bool>();
             c = 0;
             while (c < colCount) {
-                int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
+                int g = SQLGetData(stmt, c + 1, 1, buf, DEFAULT_BUFFER_SIZE, pInd);
                 bool isNull = g == 100
                     || ((pInd[0] & 255) == 255 && (pInd[1] & 255) == 255
                         && (pInd[2] & 255) == 255 && (pInd[3] & 255) == 255);
@@ -913,7 +919,7 @@ public class DbConnection : IDbConnection {
                     row.Add("");
                 } else {
                     nulls.Add(false);
-                    row.Add(BufToString(buf, 4096));
+                    row.Add(BufToString(buf, DEFAULT_BUFFER_SIZE));
                 }
                 c = c + 1;
             }
