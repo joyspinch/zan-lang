@@ -40,9 +40,22 @@ partial class Irgen {
         EmitTempReleases();
         stmtTemps = svT; stmtTempTypes = svTT;
         qmem.a = saved; qmem.ival = 1;
+        string valOp = v.op;
+        bool isValPrim = (v.ty != null && IsPrimValue(v.ty) && !IsNullable(v.ty));
+        if (isValPrim) {
+            valOp = BoxVal(v, v.ty);
+        }
         string bthen = curLbl;
         L("  br label %L" + lend);
         Label(lend);
+        if (isValPrim) {
+            Node nty = MkType(v.ty.sval);
+            nty.op = 1;
+            string r = NT();
+            L("  " + r + " = phi i8* [ null, %" + bpre + " ], [ " + valOp + ", %" + bthen + " ]");
+            AddTemp(r, nty);
+            return new ExprVal(r, nty);
+        }
         string vt = MapType(v.ty);
         if (vt == "void") { return new ExprVal("0", MkType("int")); }
         string dflt = "0";
@@ -962,6 +975,42 @@ partial class Irgen {
         if (vt == "i32") { return v.op; }
         string r = NT();
         L("  " + r + " = " + (vt == "i64" ? "trunc" : "sext") + " " + vt + " " + v.op + " to i32");
+        return r;
+    }
+
+    // B-ID180：浮点→整型 poison 收口（镜像 C 宿主 irgen_generics.c
+    // emit_fptosi_guarded，cast / Convert / 反射三通道同口径）。裸 fptosi
+    // 对溢出值产生 LLVM poison：x86 得 0x8000…、ARM64 饱和、WASM trap——
+    // 三平台三种结果且违反「无 UB」承诺。发射序：范围谓词
+    // [-2^63, 2^63)（NaN 两个比较全 false 自动落网）→ EmitRuntimeCheckIf
+    // （try 内抛 OverflowException，try 外 soft 报告）→ in_range false 归
+    // 0.0 转 0、再按 fcmp 无序语义叠 clamp（上越界→INT64_MAX、下越界→
+    // INT64_MIN、NaN→0），fptosi 输入必定义，绝无 poison。
+    //   常量 0xC3E0000000000000 = -2^63、0x43E0000000000000 = 2^63
+    //   （f64 可精确表示；上界开区间——fptosi(2^63) 即 poison）。
+    string EmitFptosiGuarded(Node at, string v) {
+        string ge = NT();
+        L("  " + ge + " = fcmp oge double " + v + ", 0xC3E0000000000000");
+        string lt = NT();
+        L("  " + lt + " = fcmp olt double " + v + ", 0x43E0000000000000");
+        string inr = NT();
+        L("  " + inr + " = and i1 " + ge + ", " + lt);
+        string bad = NT();
+        L("  " + bad + " = xor i1 " + inr + ", true");
+        EmitRuntimeCheckIf(at, bad,
+            "value is outside the range of the target type");
+        string sf = NT();
+        L("  " + sf + " = select i1 " + inr + ", double " + v + ", double 0.0");
+        string conv = NT();
+        L("  " + conv + " = fptosi double " + sf + " to i64");
+        string chi = NT();
+        L("  " + chi + " = fcmp oge double " + v + ", 0x43E0000000000000");
+        string shi = NT();
+        L("  " + shi + " = select i1 " + chi + ", i64 9223372036854775807, i64 " + conv);
+        string clo = NT();
+        L("  " + clo + " = fcmp olt double " + v + ", 0xC3E0000000000000");
+        string r = NT();
+        L("  " + r + " = select i1 " + clo + ", i64 -9223372036854775808, i64 " + shi);
         return r;
     }
 
