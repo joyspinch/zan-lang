@@ -20,23 +20,29 @@ public partial class Layer {
     static Rect notifPrev;
     // ---- 打开注册表（键盘语义与 CloseLast/CloseAll 的次序依据） ----
     // Open() 时按打开顺序入表（末尾最上），关闭后惰性剔除。
-    static List<LayerState> zorder;
+    private static List<LayerState> zorder;
     // CloseLast/CloseAll 翻开 open 标志后置位：下一次渲染沿结束后由
     // 渲染路径兑现成 app.RequestRedraw()（CloseLast 没有 App 参数，
     // 无法就地请求）。保证遮罩/窗口消失的那一帧真的被渲染上屏。
-    static bool requestRedraw;
+    private static bool requestRedraw;
     // ---- photos 的键盘会话状态：RenderPhotos 每帧刷新， ----
     // Key() 借此判断照片层是否仍在屏上（250ms 内算活着）。
-    static int photosTick;
-    static SignalInt photosIdx;
-    static int photoCount;
-    static bool photosCloseReq;
+    private static int photosTick;
+    private static SignalInt photosIdx;
+    private static int photoCount;
+    private static bool photosCloseReq;
     // ---- page 层正文控件树的保留 id 段游标（seq 域） ----
-    static int savedSeq;
-    static int bodySeq;
+    private static int savedSeq;
+    private static int bodySeq;
 
-    static void EnsureZorder() {
+    private static void EnsureZorder() {
         if (Layer.zorder == null) { Layer.zorder = new List<LayerState>(); }
+    }
+
+    public static void RegisterOpen(LayerState s) {
+        Layer.EnsureZorder();
+        Layer.zorder.Remove(s);
+        Layer.zorder.Add(s);
     }
 
     // 剔除已关闭的注册项（随渲染路径惰性调用）。出场动画没走完
@@ -222,14 +228,19 @@ public partial class Layer {
     }
 
     // page 层正文控件树的构造包裹（与 LayerState.SetBody 配对）：
-    // BeginBody 压入 Layer 专属的作用域栈，EndBody 构造完出栈。
-    // 基于作用域 Hash 栈消除 980000 魔数号段，杜绝正文控件中途 new 出时踩踏外部计数器。
-    static void BeginBody() {
-        WidgetId.Push("layer_body");
+    // BeginBody 把 WidgetId 计数器切到 Layer 专属的 body 保留段
+    // （seq 980000 起，每棵树步长 1024），EndBody 构造完还原宿主
+    // 计数器并前进游标。正文控件在点击回调里中途 new 出来，若直接
+    // 从宿主计数领号，领走的正是随后每帧控件的本命 id（“信号污染”）。
+    public static void BeginBody() {
+        if (Layer.bodySeq < 980000) { Layer.bodySeq = 980000; }
+        Layer.savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(Layer.bodySeq);
     }
 
-    static void EndBody() {
-        WidgetId.Pop();
+    public static void EndBody() {
+        Layer.bodySeq = Layer.bodySeq + 1024;
+        WidgetId.SetSeq(Layer.savedSeq);
     }
 
     static void EnsureQueues() {
@@ -666,7 +677,7 @@ public partial class Layer {
     // 图片源（文件 / data URI / http(s) URL / SVG），由 Gui.Widget.Image
     // 以 cover 填满观看框——photos 层不自己画占位。
     // 关闭按钮被点击的那一帧返回 true。
-    static bool RenderPhotos(App app, List<string> slides, SignalInt idx,
+    public static bool RenderPhotos(App app, List<string> slides, SignalInt idx,
                              CarouselAnim anim) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -744,32 +755,32 @@ public partial class Layer {
 
     // 可拖动的页面窗口 + 模态对话框
 
-    static int BarH(App app) {
+    public static int BarH(App app) {
         return app.theme.heightLarge;
     }
 
-    static int FooterH(App app) {
+    public static int FooterH(App app) {
         return app.theme.heightMedium + app.Scale(20);
     }
 
-    static int BtnW(App app) {
+    public static int BtnW(App app) {
         return app.Scale(46);
     }
 
     // 状态 `s` 下，调用方正文内容应开始的绝对 Y 坐标。
-    static int BodyTop(App app, LayerState s) {
+    public static int BodyTop(App app, LayerState s) {
         int top = app.titlebarH;
         if (s.state == 1) { return top + Layer.BarH(app) + app.Scale(16); }
         return s.y + Layer.BarH(app) + app.Scale(16);
     }
 
     // 正文内容应开始的绝对 X 坐标。
-    static int BodyLeft(App app, LayerState s) {
+    public static int BodyLeft(App app, LayerState s) {
         if (s.state == 1) { return app.Scale(20); }
         return s.x + app.Scale(20);
     }
 
-    static bool Inside(int mx, int my, int x, int y, int w, int h) {
+    public static bool Inside(int mx, int my, int x, int y, int w, int h) {
         return mx >= x && mx < x + w && my >= y && my < y + h;
     }
 
@@ -777,7 +788,7 @@ public partial class Layer {
     // x/y/w/h（含最小尺寸与客户区钳制）。dir 与 s.rDir 同义：
     // 1 左缘，2 右缘，3 下缘，4 右下角，5 左下角。渲染拖动与
     // 无窗口回归共用这一份推导。
-    static void ApplyResize(App app, LayerState s, int mx, int my) {
+    public static void ApplyResize(App app, LayerState s, int mx, int my) {
         int W = app.canvas.Width();
         int H = app.canvas.Height();
         int minW = app.Scale(220);
@@ -819,7 +830,7 @@ public partial class Layer {
     // 最小化窗口在左下角任务条上的位置（仅剩一条标题栏，宽 260）：
     // 槽位从左往右横排，一行放不下向上折行。命中区（Bounds）与
     // 绘制（RenderActive）都从这里取位，保证两者始终一致。
-    static void MinPos(App app, LayerState s, List<int> outv) {
+    public static void MinPos(App app, LayerState s, List<int> outv) {
         int mw = app.Scale(260);
         int gap = app.Scale(8);
         int margin = app.Scale(8);
@@ -836,7 +847,7 @@ public partial class Layer {
 
     // `s` 实际在屏幕上的边界（考虑最大化 / 最小化），
     // 写入 4 元素 int 列表 [x, y, w, h]。
-    static void Bounds(App app, LayerState s, List<int> outv) {
+    public static void Bounds(App app, LayerState s, List<int> outv) {
         int top = app.titlebarH;
         int bar = Layer.BarH(app);
         int ex = s.x; int ey = s.y; int ew = s.w; int eh = s.h;
@@ -851,7 +862,7 @@ public partial class Layer {
         outv.Add(ex); outv.Add(ey); outv.Add(ew); outv.Add(eh);
     }
 
-    static bool Contains(App app, LayerState s, int mx, int my) {
+    public static bool Contains(App app, LayerState s, int mx, int my) {
         List<int> b = new List<int>();
         Layer.Bounds(app, s, b);
         return Layer.Inside(mx, my, b[0], b[1], b[2], b[3]);
@@ -859,7 +870,7 @@ public partial class Layer {
 
     // layer 打开以来的入场进度（千分比）；仍在缓入时
     // 会重新启动动画计时。
-    static int Entrance(App app, LayerState s) {
+    public static int Entrance(App app, LayerState s) {
         if (s.openMs <= 0) { return 1000; }
         int el = Window.GetTickMs() - s.openMs;
         int p = App.Ease(Layer.Clamp01(el * 1000 / 180));
@@ -875,16 +886,16 @@ public partial class Layer {
     }
 
     // 入场动画当前的竖直上移量（px）：外框（RenderWindow）画的时候把窗口 y 上移这么多，宿主自绘正文的窗口（设计器大编辑器）必须用同一偏移定位正文，否则入场那 180ms 只有外框在动、内容停在终点不动。
-    static int EntranceDy(App app, LayerState s) {
+    public static int EntranceDy(App app, LayerState s) {
         return (1000 - Layer.Entrance(app, s)) * app.Scale(10) / 1000;
     }
 
     // 出场动画时长（layui isOutAnim ~300ms 的量级）。
-    static int ExitMs() { return 240; }
+    public static int ExitMs() { return 240; }
 
     // 出场进度（0..1000）：closing 层在关闭沿之后的淡出/位移进度，
     // 非 closing 层恒 1000。渲染路径用它衰减 shade 与表面。
-    static int ExitP(LayerState s) {
+    public static int ExitP(LayerState s) {
         if (!s.closing || s.closeMs <= 0) { return 1000; }
         return App.Ease(Layer.Clamp01((Window.GetTickMs() - s.closeMs)
             * 1000 / Layer.ExitMs()));
@@ -894,7 +905,7 @@ public partial class Layer {
     // Style.Fade 是「设为 a‰」的绝对语义，对 0x22000000 阴影、遮罩
     // ov.bg 这类预透明色，a=1000 时会跳成全不透明——淡出必须用
     // 乘法衰减。
-    static int MulAlpha(int color, int a) {
+    public static int MulAlpha(int color, int a) {
         if (a >= 1000) { return color; }
         if (a <= 0) { return 0; }
         int rgb = color % 16777216;
@@ -908,7 +919,7 @@ public partial class Layer {
     // 淡出/上滑收场帧（模态对话框走整屏遮罩+表面，页面窗口走窗口
     // 自身），走完请求整帧重绘擦净。返回 true 表示本帧处理了该层
     // （调用方不必再画它）。
-    static bool ClosingFrame(App app, LayerState s) {
+    public static bool ClosingFrame(App app, LayerState s) {
         if (s.wasOpen) {
             Layer.BeginExit(s);
             if (!s.closedRaised) {
@@ -935,7 +946,7 @@ public partial class Layer {
     // 从后往前绘制页面窗口堆栈（最后一个 = 最顶层）。点击
     // 任一窗口都会将其置顶；只有指针下最顶层的窗口（或被拖动者）
     // 才消费鼠标事件。
-    static void RenderStack(App app, List<LayerState> list) {
+    public static void RenderStack(App app, List<LayerState> list) {
         Layer.PruneZorder();
         int ek = app.EventKind();
         int mx = app.mouseX;
@@ -991,7 +1002,7 @@ public partial class Layer {
         Layer.FlushCloseRedraw(app);
     }
 
-    static void Render(App app, LayerState s) {
+    public static void Render(App app, LayerState s) {
         Layer.RenderActive(app, s, true);
         Layer.FlushCloseRedraw(app);
     }
@@ -999,7 +1010,7 @@ public partial class Layer {
     // CloseLast/CloseAll 翻开 open 标志时没有 App 可请求重绘；渲染沿
     // 结束后在这里兑现（无论该层走的是哪条渲染路径——宿主可能只渲染
     // 这一个层就返回）。CloseTopmostDialog/Key/Close 已就地请求。
-    static void FlushCloseRedraw(App app) {
+    public static void FlushCloseRedraw(App app) {
         if (Layer.requestRedraw) {
             Layer.requestRedraw = false;
             app.RequestRedraw();
