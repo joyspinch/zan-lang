@@ -191,6 +191,12 @@ static void checker_bind_call_intrinsic(zan_checker_t *c, zan_ast_node_t *expr,
         if ((called_sym->modifiers & MOD_INTRINSIC) != 0 ||
             (called_sym->parent && (called_sym->parent->modifiers & MOD_INTRINSIC) != 0)) {
             expr->call.is_intrinsic = 1;
+        } else if (called_sym->parent && called_sym->parent->name.str && called_sym->name.str &&
+                   zan_builtin_has_native_member(called_sym->parent->name.str,
+                                                 called_sym->parent->name.len,
+                                                 called_sym->name.str,
+                                                 called_sym->name.len)) {
+            expr->call.is_intrinsic = 1;
         } else {
             expr->call.is_intrinsic = 0;
         }

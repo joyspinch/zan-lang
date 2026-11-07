@@ -328,6 +328,15 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
             ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_addr.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_dns.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_pool.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_sched.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_gate.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_epoll.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_kqueue.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_iocp.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_select.c
     COMMENT "Building socket-async reactor object (zanrt_io)"
     VERBATIM)
 add_custom_target(zanrt_io ALL DEPENDS ${ZAN_RT_IO_OBJ})
@@ -491,6 +500,15 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
             ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_addr.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_dns.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_pool.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_sched.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_gate.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_epoll.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_kqueue.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_iocp.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_select.c
     COMMENT "Building multi-worker reactor object (zanrt_io_mt)"
     VERBATIM)
 add_custom_target(zanrt_io_mt ALL DEPENDS ${ZAN_RT_IO_MT_OBJ})
