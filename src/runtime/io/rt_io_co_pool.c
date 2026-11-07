@@ -578,29 +578,89 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     zan_co_ready_batch(&t, 1);
 }
 
-/* ---- 帧检疫区（A380 方向 b）----
+/* ---- 帧检疫区与线程本地复用热池（Thread-Local Coroutine Frame Pool）----
  * 帧的释放方（读 .Result 后的 zan_emit_frame_free）与完成方可能对同一
  * 帧各走一次 __zan_co_frame_free。幂等守卫读帧首 CO_DEAD 位，但通用
  * 分配器在 free 后会把块首 8 字节写成 freelist 指针（rt_mem.c），守卫
  * 读到垃圾 → 二次释放直接 abort（double free of block）。检疫区把释放
  * 的帧延迟归还：守卫位在被覆盖之前，第二次释放稳定读到 DEAD 并返回。
- * 封顶 ZAN_FRAME_QUAR_MAX 帧，超限按 FIFO 真放前一半——检疫窗口过后
- * 的陈旧双释放本就超出指针身份能判定的范围（A380 的结论）。 */
-/* 线程本地检疫区（Per-Thread TLS Quarantine）：
- * 彻底消除多线程并发下释放协程帧时的全局排他锁争用（Lock Contention）。
- * 每个工作线程独立维护 64 帧容量的无锁环形检疫窗口；满后平滑真释放最老的一半，
- * 为幂等守卫提供完全充足的 DEAD 状态检疫时间窗口，零动态分配、零跨核锁竞争。 */
+ *
+ * 经过检疫窗口（32 帧周期）平滑脱离危险期的合法帧，不再直接回落通用 free()，
+ * 而是按规格分流收纳至线程本地协程帧热池 (t_co_frame_pool) 中；下次启动
+ * async 协程时，直接自 TLS 弹出复用，纯寄存器基址直取，实现零堆分配 (Zero-Alloc Async)。 */
 #define ZAN_TLS_FRAME_QUAR_CAP 64
 static _Thread_local void  *t_frame_quar[ZAN_TLS_FRAME_QUAR_CAP];
 static _Thread_local size_t t_frame_quar_head = 0;
 static _Thread_local size_t t_frame_quar_len = 0;
+
+#define ZAN_CO_FRAME_MAGIC 0x5a434f46U /* "ZCOF" */
+#define ZAN_CO_FRAME_CLASSES 4
+#define ZAN_CO_FRAME_POOL_CAP 32
+
+static const size_t g_co_frame_class_sz[ZAN_CO_FRAME_CLASSES] = {
+    256, 512, 1024, 2048
+};
+
+typedef struct {
+    uint32_t magic;      /* ZAN_CO_FRAME_MAGIC */
+    uint32_t class_idx;  /* 0..3 或 99(堆分配 fallback) */
+    uint64_t actual_sz;  /* 请求尺寸 */
+} zan_co_frame_prefix_t;
+
+typedef struct {
+    void  *frames[ZAN_CO_FRAME_POOL_CAP];
+    size_t count;
+} zan_co_frame_bucket_t;
+
+static _Thread_local zan_co_frame_bucket_t t_co_frame_pool[ZAN_CO_FRAME_CLASSES];
+
+static inline uint32_t co_frame_size_class(size_t sz) {
+    if (sz <= 256)  return 0;
+    if (sz <= 512)  return 1;
+    if (sz <= 1024) return 2;
+    if (sz <= 2048) return 3;
+    return 99;
+}
+
+void *__zan_co_frame_alloc(size_t size) {
+    size_t req = size ? size : 1;
+    uint32_t c = co_frame_size_class(req);
+    size_t alloc_sz = (c < ZAN_CO_FRAME_CLASSES) ? g_co_frame_class_sz[c] : req;
+    size_t total_sz = sizeof(zan_co_frame_prefix_t) + alloc_sz;
+
+    zan_co_frame_prefix_t *pfx = NULL;
+    if (c < ZAN_CO_FRAME_CLASSES && t_co_frame_pool[c].count > 0) {
+        pfx = (zan_co_frame_prefix_t *)t_co_frame_pool[c].frames[--t_co_frame_pool[c].count];
+    } else {
+        pfx = (zan_co_frame_prefix_t *)malloc(total_sz);
+        if (!pfx) return NULL;
+    }
+    memset(pfx, 0, total_sz);
+    pfx->magic = ZAN_CO_FRAME_MAGIC;
+    pfx->class_idx = c;
+    pfx->actual_sz = req;
+    return (void *)(pfx + 1);
+}
 
 static void co_frame_quarantine_add(void *frame) {
     if (t_frame_quar_len == ZAN_TLS_FRAME_QUAR_CAP) {
         size_t half = ZAN_TLS_FRAME_QUAR_CAP / 2;
         for (size_t i = 0; i < half; i++) {
             void *old_frame = t_frame_quar[(t_frame_quar_head + i) % ZAN_TLS_FRAME_QUAR_CAP];
-            free(old_frame);
+            if (!old_frame) continue;
+            zan_co_frame_prefix_t *pfx = (zan_co_frame_prefix_t *)old_frame - 1;
+            if (pfx->magic == ZAN_CO_FRAME_MAGIC && pfx->class_idx < ZAN_CO_FRAME_CLASSES) {
+                uint32_t c = pfx->class_idx;
+                if (t_co_frame_pool[c].count < ZAN_CO_FRAME_POOL_CAP) {
+                    t_co_frame_pool[c].frames[t_co_frame_pool[c].count++] = (void *)pfx;
+                    continue;
+                }
+                free(pfx);
+            } else if (pfx->magic == ZAN_CO_FRAME_MAGIC) {
+                free(pfx);
+            } else {
+                free(old_frame);
+            }
         }
         t_frame_quar_head = (t_frame_quar_head + half) % ZAN_TLS_FRAME_QUAR_CAP;
         t_frame_quar_len -= half;
@@ -608,6 +668,23 @@ static void co_frame_quarantine_add(void *frame) {
     size_t tail = (t_frame_quar_head + t_frame_quar_len) % ZAN_TLS_FRAME_QUAR_CAP;
     t_frame_quar[tail] = frame;
     t_frame_quar_len++;
+}
+
+static void co_frame_pool_flush_tls(void) {
+    for (size_t i = 0; i < t_frame_quar_len; i++) {
+        void *f = t_frame_quar[(t_frame_quar_head + i) % ZAN_TLS_FRAME_QUAR_CAP];
+        if (!f) continue;
+        zan_co_frame_prefix_t *pfx = (zan_co_frame_prefix_t *)f - 1;
+        if (pfx->magic == ZAN_CO_FRAME_MAGIC) free(pfx);
+        else free(f);
+    }
+    t_frame_quar_len = t_frame_quar_head = 0;
+    for (int c = 0; c < ZAN_CO_FRAME_CLASSES; c++) {
+        for (size_t i = 0; i < t_co_frame_pool[c].count; i++) {
+            free(t_co_frame_pool[c].frames[i]);
+        }
+        t_co_frame_pool[c].count = 0;
+    }
 }
 
 void __zan_co_frame_free(void *frame) {

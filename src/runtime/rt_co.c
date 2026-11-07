@@ -102,3 +102,11 @@ void zan_co_sched_run(void) {
 size_t zan_co_pending(void) {
     return g_len;
 }
+
+void *__zan_co_frame_alloc(size_t size) {
+    return calloc(1, size ? size : 1);
+}
+
+void __zan_co_frame_free(void *frame) {
+    free(frame);
+}

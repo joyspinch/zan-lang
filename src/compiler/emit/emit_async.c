@@ -225,9 +225,14 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMBasicBlockRef ramp_entry = LLVMAppendBasicBlockInContext(g->ctx, ramp_fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, ramp_entry);
         di_set_loc(g, member->loc);
-        LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
         LLVMValueRef fsize = LLVMSizeOf(frame_type);
-        LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
+        LLVMValueRef raw;
+        if (g->rt_co_frame_alloc) {
+            raw = zan_call2(g->builder, g->rt_co_frame_alloc_type, g->rt_co_frame_alloc, &fsize, 1, "frame.raw");
+        } else {
+            LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
+            raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
+        }
         zan_irgen_emit_oom_check(g, ramp_fn, raw);
         emit_rt_alloc_add(g, fsize);
         {

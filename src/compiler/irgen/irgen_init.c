@@ -348,6 +348,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->rt_co_ready = LLVMAddFunction(g->mod, "zan_co_ready", g->rt_co_ready_type);
     g->rt_co_poll_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_poll = LLVMAddFunction(g->mod, "zan_co_poll", g->rt_co_poll_type);
+    g->rt_co_frame_alloc_type = LLVMFunctionType(i8ptr,
+                                                 (LLVMTypeRef[]){ LLVMInt64TypeInContext(g->ctx) }, 1, 0);
+    g->rt_co_frame_alloc = LLVMAddFunction(g->mod, "__zan_co_frame_alloc",
+                                           g->rt_co_frame_alloc_type);
     g->rt_co_frame_free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                                                 (LLVMTypeRef[]){ i8ptr }, 1, 0);
     g->rt_co_frame_free = LLVMAddFunction(g->mod, "__zan_co_frame_free",

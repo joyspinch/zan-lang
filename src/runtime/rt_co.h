@@ -21,6 +21,7 @@ void   zan_co_sched_run(void);
 void   zan_co_sched_run_until(const volatile int *done);
 size_t zan_co_pending(void);
 
+void  *__zan_co_frame_alloc(size_t size);
 void   __zan_co_frame_free(void *frame);
 
 typedef int (*zan_co_idle_fn)(void);

@@ -570,6 +570,7 @@ static void co_pool_start_background(void) {
 }
 
 static void co_pool_retire(zan_co_worker_t *w) {
+    co_frame_pool_flush_tls();
     if (w->bg_gen != g_co_pool_gen || g_co_pool_gen == 0) { return; }
     co_trace("retire", w);
     if (InterlockedDecrement(&g_co_pool_out) != 0) { return; }
@@ -743,6 +744,10 @@ void zan_co_ready_batch(const zan_co_task_t *tasks, size_t count) {
 
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
     zan_timer_delay(ms, frame, step);
+}
+
+void *__zan_co_frame_alloc(size_t size) {
+    return calloc(1, size ? size : 1);
 }
 
 void __zan_co_frame_free(void *frame) { free(frame); }

@@ -1009,7 +1009,7 @@ static void zan_prepare_static_runtime(zan_irgen_t *g,
 
     if (!g->emit_lib) return;
     LLVMValueRef co_fallbacks[] = {
-        g->rt_co_ready, g->rt_co_poll, g->rt_co_frame_free,
+        g->rt_co_ready, g->rt_co_poll, g->rt_co_frame_alloc, g->rt_co_frame_free,
         g->rt_co_sched_init, g->rt_co_sched_run, g->rt_co_sched_run_until
     };
     for (size_t i = 0; i < sizeof(co_fallbacks) / sizeof(co_fallbacks[0]); i++)

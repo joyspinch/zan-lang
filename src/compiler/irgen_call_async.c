@@ -224,9 +224,14 @@ LLVMValueRef emit_task_action_run(zan_irgen_t *g, LLVMValueRef lv,
     emit_closure_retain(g, lv_i8);
 
     LLVMTypeRef ft = get_task_action_frame_type(g);
-    LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
     LLVMValueRef fsize = LLVMSizeOf(ft);
-    LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "task.raw");
+    LLVMValueRef raw;
+    if (g->rt_co_frame_alloc) {
+        raw = zan_call2(g->builder, g->rt_co_frame_alloc_type, g->rt_co_frame_alloc, &fsize, 1, "task.raw");
+    } else {
+        LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
+        raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "task.raw");
+    }
     zan_irgen_emit_oom_check(g, g->current_fn, raw);
     emit_rt_alloc_add(g, fsize);
 

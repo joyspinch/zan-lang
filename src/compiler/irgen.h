@@ -535,6 +535,8 @@ struct zan_irgen {
     LLVMTypeRef  rt_co_ready_type;
     LLVMValueRef rt_co_poll;
     LLVMTypeRef  rt_co_poll_type;
+    LLVMValueRef rt_co_frame_alloc;
+    LLVMTypeRef  rt_co_frame_alloc_type;
     LLVMValueRef rt_co_frame_free;
     LLVMTypeRef  rt_co_frame_free_type;
     LLVMValueRef rt_co_sched_init;
