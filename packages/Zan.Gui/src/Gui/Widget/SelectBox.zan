@@ -21,6 +21,7 @@ public partial class SelectBox : Control {
     // 全部选项（平铺：分组标题、禁用项、级联子级都在此列）。
     List<SelectOption> opts;
     Control customPopup;
+    Card defaultPopupCard;
     // 单选选中下标（-1 无）；多选模式不用。
     int selected;
     // 可选共享选择信号（SelectBox.Bind）。
@@ -440,6 +441,55 @@ public partial class SelectBox : Control {
     // 弹层当前是否打开。
     bool IsOpen() { return open; }
 
+    static void OnOptionButtonClick(Control sender) {
+        if (sender == null) { return; }
+        Control cur = sender.Parent();
+        while (cur != null) {
+            if (cur is SelectBox) {
+                SelectBox sb = (SelectBox)cur;
+                int idx = Convert.ToInt32(sender.name);
+                sb.Choose(idx);
+                if (!sb.multi) { sb.SetOpen(false); }
+                return;
+            }
+            cur = cur.Parent();
+        }
+    }
+
+    public Card EnsurePopupCard(App app) {
+        if (defaultPopupCard == null) {
+            defaultPopupCard = new Card("");
+            defaultPopupCard.Class = "select-popup";
+            defaultPopupCard.Pad(4);
+            defaultPopupCard.parent = this;
+        }
+        defaultPopupCard.RemoveAll();
+        Panel col = Panel.Column();
+        col.Gap(2);
+        for (int i = 0; i < opts.Count; i = i + 1) {
+            SelectOption op = opts[i];
+            if (op.grp) {
+                Label grp = new Label(op.label).Small();
+                grp.AddClass("muted");
+                col.Add(grp);
+            } else {
+                Button item = new Button(op.label).Ghost();
+                item.AddClass("align-left");
+                item.Class = "select-option";
+                item.name = Convert.ToString(i);
+                if (selected == i) { item.AddClass("is-selected"); }
+                if (op.disabled) { item.Disabled.Set(true); }
+                item.Click.AddS(SelectBox.OnOptionButtonClick);
+                col.Add(item);
+            }
+        }
+        defaultPopupCard.With(col);
+        if (app != null) {
+            defaultPopupCard.OnMeasure(app);
+        }
+        return defaultPopupCard;
+    }
+
     // 打开/关闭列表，并在实际切换时触发 Open/Close，
     // 使每个入口（触发控件、选择、外部按压、Esc、代码）以相同方式
     // 报告。
@@ -447,7 +497,9 @@ public partial class SelectBox : Control {
         if (open == v) { return; }
         open = v;
         if (v) {
-            OverlayHost.ShowPopup(App.FrameApp(), this, this);
+            Control pop = this.customPopup != null ? this.customPopup
+                        : (!this.cascade && !this.treeMode ? this.EnsurePopupCard(App.FrameApp()) : this);
+            OverlayHost.ShowPopup(App.FrameApp(), this, pop);
             scrollY = 0;
             // 级联弹层回到第一列；单选已有选中值时把它的祖先链展开，
             // 重开弹层能直接看到选中路径（多选没有单一选中，回第一列）。
@@ -1126,13 +1178,11 @@ public partial class SelectBox : Control {
         return this.customPopup;
     }
 
-    // 覆盖层绘制：如果有自定义插槽内容，直接绘制互嵌组件；
-    // 否则按模式分发给 CascaderOverlay、TreeOverlay 或 SelectDropdownOverlay。
+    // 覆盖层绘制：如果有自定义插槽内容或标准保留卡片，由 OverlayHost 统一 RenderTree；
+    // 其余复杂级联/树模式暂由子引擎调度。
     override void OnPaintOverlay(App app) {
         if (!open) { return; }
-        if (this.customPopup != null) {
-            OverlayHost.ShowPopup(app, this, this.customPopup);
-            this.customPopup.RenderTree(app);
+        if (this.customPopup != null || this.defaultPopupCard != null) {
             return;
         }
 
