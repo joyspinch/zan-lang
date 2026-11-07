@@ -1,0 +1,324 @@
+using System;
+using System.Interop;
+using System.Net.Sockets;
+using System.Threading;
+using Zan.Kafka;
+
+class Program {
+    static const int PORT = 29092;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    // 1. 底层序列化与变长编码单测
+    static void TestPrimitives() {
+        KafkaWriter w = new KafkaWriter(64);
+        w.WriteInt8(-12);
+        w.WriteInt16(1234);
+        w.WriteInt32(987654);
+        w.WriteInt64(1234567890123L);
+        w.WriteVarint(0);
+        w.WriteVarint(-1);
+        w.WriteVarint(123456);
+        w.WriteVarlong(987654321012L);
+        w.WriteString(null);
+        w.WriteString("");
+        w.WriteString("kafka-wire");
+        byte[] raw = new byte[3];
+        raw[0] = 65; raw[1] = 66; raw[2] = 67;
+        w.WriteBytes(raw);
+
+        KafkaReader r = new KafkaReader(w.ToBytes());
+        Check(r.ReadInt8() == -12, "int8 read");
+        Check(r.ReadInt16() == 1234, "int16 read");
+        Check(r.ReadInt32() == 987654, "int32 read");
+        Check(r.ReadInt64() == 1234567890123L, "int64 read");
+        Check(r.ReadVarint() == 0, "varint zero");
+        Check(r.ReadVarint() == -1, "varint negative");
+        Check(r.ReadVarint() == 123456, "varint positive");
+        Check(r.ReadVarlong() == 987654321012L, "varlong read");
+        Check(r.ReadString() == null, "null string");
+        Check(r.ReadString() == "", "empty string");
+        Check(r.ReadString() == "kafka-wire", "str value");
+        byte[] rBytes = r.ReadBytes();
+        Check(rBytes != null && rBytes.Length == 3 && rBytes[0] == 65 && rBytes[2] == 67, "bytes read");
+    }
+
+    // 2. RecordBatch v2 与 CRC32C 校验单测
+    static void TestRecordBatch() {
+        KafkaRecord rec = new KafkaRecord("user-key", "user-payload");
+        rec.headers["span-id"] = "span-1234";
+        rec.headers["env"] = "prod";
+
+        List<KafkaRecord> list = new List<KafkaRecord>();
+        list.Add(rec);
+
+        byte[] batchBytes = KafkaRecord.BuildRecordBatch(100L, list);
+        Check(batchBytes != null && batchBytes.Length > 61, "record batch built");
+
+        // 校验 Magic 字节
+        Check(batchBytes[16] == (byte)KafkaConstants.RECORD_BATCH_MAGIC, "record batch magic v2");
+
+        // 解析并验证消息内容
+        List<KafkaRecord> parsed = KafkaRecord.ParseRecordBatch(batchBytes, 0, batchBytes.Length);
+        Check(parsed != null && parsed.Count == 1, "record batch parsed count");
+        KafkaRecord r0 = parsed[0];
+        Check(r0.offset == 100L, "record offset");
+        Check(r0.key == "user-key", "record key");
+        Check(r0.value == "user-payload", "record value");
+        Check(r0.headers != null && r0.headers["span-id"] == "span-1234", "record header span-id");
+        Check(r0.headers["env"] == "prod", "record header env");
+    }
+
+    // 进程内 Mock Kafka Broker
+    static TcpListener serverListener;
+    static bool serverRunning = true;
+    static byte[] lastStoredRecordBatch = null;
+
+    static async int ReadExact(nint sock, byte[] outBuf, int count) {
+        if (outBuf == null || count <= 0) { return 0; }
+        int received = 0;
+        while (received < count) {
+            int n = await Socket.RecvPtrAsync(sock, (nint)outBuf + (nint)received, count - received);
+            if (n <= 0) { return -1; }
+            received = received + n;
+        }
+        return received;
+    }
+
+    static async void HandleMockClient(nint sock) {
+        try {
+            Socket.SetNoDelay(sock);
+            byte[] lenBuf = new byte[4];
+
+            while (Program.serverRunning) {
+                // 读取 4 字节请求长度
+                int rLen = await Program.ReadExact(sock, lenBuf, 4);
+                if (rLen < 4) { break; }
+                int reqLen = ((int)lenBuf[0] << 24) | (((int)lenBuf[1] & 255) << 16) |
+                             (((int)lenBuf[2] & 255) << 8) | ((int)lenBuf[3] & 255);
+                if (reqLen <= 0 || reqLen > 67108864) { break; }
+
+                byte[] reqBuf = new byte[reqLen];
+                int rBody = await Program.ReadExact(sock, reqBuf, reqLen);
+                if (rBody < reqLen) { break; }
+
+                KafkaReader r = new KafkaReader(reqBuf);
+                int apiKey = r.ReadInt16();
+                int apiVersion = r.ReadInt16();
+                int correlationId = r.ReadInt32();
+                string clientId = r.ReadString();
+
+                // 构造响应头 (4 字节 correlation_id)
+                KafkaWriter resp = new KafkaWriter(256);
+                resp.WriteInt32(correlationId);
+
+                if (apiKey == KafkaConstants.API_METADATA) {
+                    // Metadata API v1 Response
+                    // 1. Brokers 数组 (1 个 broker)
+                    resp.WriteArrayHeader(1);
+                    resp.WriteInt32(1); // node_id: 1
+                    resp.WriteString("127.0.0.1");
+                    resp.WriteInt32(Program.PORT);
+                    resp.WriteString(null); // rack: null
+
+                    resp.WriteInt32(1); // controller_id: 1
+
+                    // 2. Topics 数组 (1 个 topic)
+                    resp.WriteArrayHeader(1);
+                    resp.WriteInt16(KafkaConstants.ERR_NONE);
+                    resp.WriteString("orders.events");
+                    resp.WriteInt8(0); // is_internal: false
+
+                    // Partitions 数组 (1 个 partition)
+                    resp.WriteArrayHeader(1);
+                    resp.WriteInt16(KafkaConstants.ERR_NONE);
+                    resp.WriteInt32(0); // partition_id: 0
+                    resp.WriteInt32(1); // leader_id: 1
+                    resp.WriteArrayHeader(1); // replicas
+                    resp.WriteInt32(1);
+                    resp.WriteArrayHeader(1); // isr
+                    resp.WriteInt32(1);
+                } else if (apiKey == KafkaConstants.API_PRODUCE) {
+                    // Produce API v3 Request 解析
+                    string txId = r.ReadString();
+                    int acks = r.ReadInt16();
+                    int timeout = r.ReadInt32();
+                    int topicCount = r.ReadArrayHeader();
+                    string top = r.ReadString();
+                    int partCount = r.ReadArrayHeader();
+                    int partId = r.ReadInt32();
+                    byte[] recordBatchBytes = r.ReadBytes();
+                    // 模拟 Kafka 服务端落盘：将 RecordBatch 的 baseOffset (前 8 字节大端) 更新为实际写入位点 42L
+                    if (recordBatchBytes != null && recordBatchBytes.Length >= 8) {
+                        recordBatchBytes[0] = 0;
+                        recordBatchBytes[1] = 0;
+                        recordBatchBytes[2] = 0;
+                        recordBatchBytes[3] = 0;
+                        recordBatchBytes[4] = 0;
+                        recordBatchBytes[5] = 0;
+                        recordBatchBytes[6] = 0;
+                        recordBatchBytes[7] = 42;
+                    }
+                    Program.lastStoredRecordBatch = recordBatchBytes;
+
+                    // Produce API v3 Response
+                    resp.WriteArrayHeader(1); // topics count
+                    resp.WriteString(top);
+                    resp.WriteArrayHeader(1); // partitions count
+                    resp.WriteInt32(partId);
+                    resp.WriteInt16(KafkaConstants.ERR_NONE);
+                    resp.WriteInt64(42L); // base_offset: 42
+                    resp.WriteInt64(1700000000000L); // log_append_time
+                    resp.WriteInt64(0L); // log_start_offset
+                    resp.WriteInt32(0); // throttle_time_ms
+                } else if (apiKey == KafkaConstants.API_FETCH) {
+                    // Fetch API v4 Request 解析
+                    int replicaId = r.ReadInt32();
+                    int maxWait = r.ReadInt32();
+                    int minBytes = r.ReadInt32();
+                    int maxBytes = r.ReadInt32();
+                    int isoLevel = r.ReadInt8();
+                    int topicCount = r.ReadArrayHeader();
+                    string top = r.ReadString();
+                    int partCount = r.ReadArrayHeader();
+                    int partId = r.ReadInt32();
+                    long fetchOff = r.ReadInt64();
+
+                    // Fetch API v4 Response
+                    resp.WriteInt32(0); // throttle_time_ms
+                    resp.WriteArrayHeader(1); // topics count
+                    resp.WriteString(top);
+                    resp.WriteArrayHeader(1); // partitions count
+                    resp.WriteInt32(partId);
+                    resp.WriteInt16(KafkaConstants.ERR_NONE);
+                    resp.WriteInt64(43L); // high_watermark
+                    resp.WriteInt64(43L); // last_stable_offset
+                    resp.WriteInt64(0L); // log_start_offset
+                    resp.WriteArrayHeader(0); // aborted_transactions
+                    resp.WriteBytes(Program.lastStoredRecordBatch); // record_set
+                } else if (apiKey == KafkaConstants.API_LIST_OFFSETS) {
+                    // ListOffsets API v1 Request 解析
+                    int replicaId = r.ReadInt32();
+                    int topicCount = r.ReadArrayHeader();
+                    string top = r.ReadString();
+                    int partCount = r.ReadArrayHeader();
+                    int partId = r.ReadInt32();
+                    long targetTs = r.ReadInt64();
+
+                    // ListOffsets API v1 Response
+                    resp.WriteArrayHeader(1); // topics count
+                    resp.WriteString(top);
+                    resp.WriteArrayHeader(1); // partitions count
+                    resp.WriteInt32(partId);
+                    resp.WriteInt16(KafkaConstants.ERR_NONE);
+                    resp.WriteInt64(1700000000000L); // timestamp
+                    resp.WriteInt64(43L); // offset
+                }
+
+                // 发送响应包：4 字节总长度 + 内容
+                byte[] bodyBytes = resp.ToBytes();
+                KafkaWriter frameW = new KafkaWriter(4 + bodyBytes.Length);
+                frameW.WriteInt32(bodyBytes.Length);
+                frameW.WriteRaw(bodyBytes, bodyBytes.Length);
+                byte[] pkt = frameW.ToBytes();
+                await Socket.SendAsync(sock, pkt, pkt.Length);
+            }
+        } finally {
+            Socket.Close(sock);
+        }
+    }
+
+    static async void RunMockBroker() {
+        TcpListener l = new TcpListener("127.0.0.1", Program.PORT);
+        l.Start();
+        Program.serverListener = l;
+
+        while (Program.serverRunning) {
+            nint sock = await l.AcceptAsync();
+            if (sock >= 0) {
+                Task.Spawn(Program.HandleMockClient(sock));
+            }
+        }
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        // 1. 底层序列化单测
+        TestPrimitives();
+        TestRecordBatch();
+
+        // 2. 启动进程内 Mock Kafka 服务端
+        Task.Spawn(Program.RunMockBroker());
+        await Task.Delay(100);
+
+        // 3. 建立 Kafka 客户端连接
+        KafkaConnection conn = await KafkaConnection.ConnectAsync("127.0.0.1", Program.PORT);
+        Check(conn != null && conn.IsConnected(), "kafka client connected");
+
+        // 4. 验证 Metadata API
+        KafkaProducer producer = new KafkaProducer(conn);
+        List<string> topics = new List<string>();
+        topics.Add("orders.events");
+        List<TopicMetadata> metas = await producer.GetMetadataAsync(topics);
+        Check(metas != null && metas.Count == 1, "metadata response received");
+        Check(metas[0].name == "orders.events", "metadata topic name");
+        Check(metas[0].partitions.Count == 1 && metas[0].partitions[0].leaderId == 1, "metadata partition leader");
+
+        // 5. 验证 Produce API (批量投递单条带有 Headers 的消息)
+        KafkaRecord sendRec = new KafkaRecord("order-key-999", "{\"orderId\":999,\"amount\":88.5}");
+        sendRec.headers["trace-id"] = "trace-kafka-777";
+        List<KafkaRecord> sendList = new List<KafkaRecord>();
+        sendList.Add(sendRec);
+        ProduceResult pRes = await producer.SendBatchAsync("orders.events", 0, sendList);
+        Check(pRes.IsSuccess(), "produce result success");
+        Check(pRes.topic == "orders.events", "produce topic matched");
+        Check(pRes.partition == 0, "produce partition matched");
+        Check(pRes.offset == 42L, "produce offset matched 42");
+
+        // 6. 验证 Consumer Poll API (拉取已投递的消息)
+        KafkaConsumer consumer = new KafkaConsumer(conn);
+        List<KafkaRecord> polled = await consumer.PollAsync("orders.events", 0, 500);
+        Check(polled != null && polled.Count == 1, "poll records count 1");
+        KafkaRecord rRec = polled[0];
+        Check(rRec.key == "order-key-999", "polled record key");
+        Check(rRec.value == "{\"orderId\":999,\"amount\":88.5}", "polled record value");
+        Check(rRec.headers != null && rRec.headers["trace-id"] == "trace-kafka-777", "polled record header");
+        Check(consumer.currentOffset == 43L, "consumer current offset advanced to 43");
+
+        // 7. 验证 ListOffsets API (查询最新位点)
+        long latestOffset = await consumer.GetOffsetAsync("orders.events", 0, -1L);
+        Check(latestOffset == 43L, "latest offset queried 43");
+
+        // 8. 资源释放与清理
+        producer.Dispose();
+        consumer.Dispose();
+        conn.Dispose();
+
+        Program.serverRunning = false;
+        if (Program.serverListener != null) {
+            Program.serverListener.Stop();
+            Program.serverListener = null;
+        }
+
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        if (failures == 0) {
+            Console.WriteLine("ok kafka wire protocol suite passed");
+            return 0;
+        }
+        return 1;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

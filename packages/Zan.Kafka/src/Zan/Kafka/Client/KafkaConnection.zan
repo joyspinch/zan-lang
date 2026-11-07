@@ -1,0 +1,145 @@
+using System;
+using System.Interop;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace Zan.Kafka;
+
+// Kafka 底层物理连接管理器 (管理套接字 I/O、二进制封包解包与关联 ID 多路复用)
+public class KafkaConnection {
+    public string host;
+    public int port;
+    public string clientId;
+    private nint sock;
+    private bool connected;
+    private int nextCorrelationId;
+    private Mutex ioLock;
+
+    public KafkaConnection(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.clientId = "zan-kafka-client";
+        this.sock = -1;
+        this.connected = false;
+        this.nextCorrelationId = 1;
+        this.ioLock = new Mutex();
+    }
+
+    public static async KafkaConnection ConnectAsync(string host, int port) {
+        KafkaConnection conn = new KafkaConnection(host, port);
+        Socket.Initialize();
+        TcpClient client = await TcpClient.ConnectAsync(host, port);
+        if (client == null) {
+            return null;
+        }
+        nint s = client.GetSocket();
+        if (s < 0) {
+            return null;
+        }
+        Socket.SetNoDelay(s);
+        conn.sock = s;
+        conn.connected = true;
+        return conn;
+    }
+
+    public bool IsConnected() {
+        return this.connected && this.sock >= 0;
+    }
+
+    // 发送标准 Kafka 请求并同步等待响应
+    public async KafkaReader SendRequestAsync(int apiKey, int apiVersion, byte[] bodyPayload) {
+        if (!this.connected || this.sock < 0) { return null; }
+
+        this.ioLock.WaitOne();
+        try {
+            int cid = this.nextCorrelationId;
+            this.nextCorrelationId = this.nextCorrelationId + 1;
+
+            // 1. 构造请求头 (Request Header v1)
+            KafkaWriter hw = new KafkaWriter(32);
+            hw.WriteInt16(apiKey);
+            hw.WriteInt16(apiVersion);
+            hw.WriteInt32(cid);
+            hw.WriteString(this.clientId);
+            byte[] hdrBytes = hw.ToBytes();
+
+            int bodyLen = bodyPayload != null ? bodyPayload.Length : 0;
+            int totalMsgLen = hdrBytes.Length + bodyLen;
+
+            // 2. 发送 4 字节大端总长度 + Header + Body
+            KafkaWriter pkt = new KafkaWriter(4 + totalMsgLen);
+            pkt.WriteInt32(totalMsgLen);
+            pkt.WriteRaw(hdrBytes, hdrBytes.Length);
+            if (bodyLen > 0) {
+                pkt.WriteRaw(bodyPayload, bodyLen);
+            }
+            byte[] rawPkt = pkt.ToBytes();
+            int sent = await Socket.SendAsync(this.sock, rawPkt, rawPkt.Length);
+            if (sent < rawPkt.Length) {
+                this.Close();
+                return null;
+            }
+
+            // 3. 读取 4 字节响应总长度
+            byte[] lenBuf = new byte[4];
+            int rLen = await this.ReadExactAsync(lenBuf, 4);
+            if (rLen < 4) {
+                this.Close();
+                return null;
+            }
+            int respLen = ((int)lenBuf[0] << 24) | (((int)lenBuf[1] & 255) << 16) |
+                          (((int)lenBuf[2] & 255) << 8) | ((int)lenBuf[3] & 255);
+            if (respLen <= 0 || respLen > 67108864) { // 防御性上限 64MB
+                this.Close();
+                return null;
+            }
+
+            // 4. 读取完整的响应内容体
+            byte[] respBuf = new byte[respLen];
+            int rBody = await this.ReadExactAsync(respBuf, respLen);
+            if (rBody < respLen) {
+                this.Close();
+                return null;
+            }
+
+            // 5. 解析 Response Header (读取 correlation_id 并校验匹配)
+            KafkaReader r = new KafkaReader(respBuf);
+            int respCid = r.ReadInt32();
+            if (respCid != cid) {
+                // 关联 ID 不匹配
+                return null;
+            }
+
+            return r;
+        } finally {
+            this.ioLock.ReleaseMutex();
+        }
+    }
+
+    private async int ReadExactAsync(byte[] outBuf, int count) {
+        if (outBuf == null || count <= 0) { return 0; }
+        int received = 0;
+        while (received < count && this.connected) {
+            int n = await Socket.RecvPtrAsync(this.sock, (nint)outBuf + (nint)received, count - received);
+            if (n <= 0) { return -1; }
+            received = received + n;
+        }
+        return received;
+    }
+
+    public void Close() {
+        this.connected = false;
+        if (this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.sock = -1;
+        }
+        if (this.ioLock != null) {
+            this.ioLock.Close();
+            this.ioLock = null;
+        }
+    }
+
+    public void Dispose() {
+        this.Close();
+    }
+}

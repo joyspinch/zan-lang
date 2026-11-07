@@ -1,0 +1,147 @@
+using System;
+
+namespace Zan.Kafka;
+
+// Kafka 高性能异步消费者客户端 (支持 Fetch 拉取、Offset 自主推进与最新/最早位点探测)
+public class KafkaConsumer {
+    private KafkaConnection conn;
+    public long currentOffset;
+    public int maxWaitMs;
+    public int minBytes;
+    public int maxBytes;
+
+    public KafkaConsumer(KafkaConnection connection) {
+        this.conn = connection;
+        this.currentOffset = 0L;
+        this.maxWaitMs = 500;
+        this.minBytes = 1;
+        this.maxBytes = 1048576; // 1MB
+    }
+
+    public static async KafkaConsumer CreateAsync(string host, int port) {
+        KafkaConnection c = await KafkaConnection.ConnectAsync(host, port);
+        if (c == null) { return null; }
+        return new KafkaConsumer(c);
+    }
+
+    public bool IsConnected() {
+        return this.conn != null && this.conn.IsConnected();
+    }
+
+    // 查询指定主题分区的最新 (-1) 或最早 (-2) 位点 (ListOffsets API v1)
+    public async long GetOffsetAsync(string topic, int partition, long timestamp) {
+        if (!this.IsConnected()) { return -1L; }
+        KafkaWriter w = new KafkaWriter(64);
+        w.WriteInt32(-1); // replica_id: -1 (normal consumer)
+
+        // Topic 数组
+        w.WriteArrayHeader(1);
+        w.WriteString(topic);
+
+        // Partition 数组
+        w.WriteArrayHeader(1);
+        w.WriteInt32(partition);
+        w.WriteInt64(timestamp);
+
+        KafkaReader r = await this.conn.SendRequestAsync(KafkaConstants.API_LIST_OFFSETS, 1, w.ToBytes());
+        if (r == null) { return -1L; }
+
+        int topicCount = r.ReadArrayHeader();
+        if (topicCount <= 0) { return -1L; }
+
+        string respTopic = r.ReadString();
+        int partCount = r.ReadArrayHeader();
+        if (partCount <= 0) { return -1L; }
+
+        int respPart = r.ReadInt32();
+        int errCode = r.ReadInt16();
+        long respTs = r.ReadInt64();
+        long offset = r.ReadInt64();
+
+        if (errCode == KafkaConstants.ERR_NONE) {
+            return offset;
+        }
+        return -1L;
+    }
+
+    // 从指定主题与分区拉取一批消息 (Fetch API v4)
+    public async List<KafkaRecord> PollAsync(string topic, int partition, int timeoutMs) {
+        List<KafkaRecord> result = new List<KafkaRecord>();
+        if (!this.IsConnected()) { return result; }
+
+        int waitMs = timeoutMs > 0 ? timeoutMs : this.maxWaitMs;
+
+        // 1. 构造 FetchRequest v4 请求体
+        KafkaWriter w = new KafkaWriter(128);
+        w.WriteInt32(-1); // replica_id: -1
+        w.WriteInt32(waitMs);
+        w.WriteInt32(this.minBytes);
+        w.WriteInt32(this.maxBytes);
+        w.WriteInt8(0); // isolation_level: 0 (READ_UNCOMMITTED)
+
+        // Topic 数组
+        w.WriteArrayHeader(1);
+        w.WriteString(topic);
+
+        // Partition 数组
+        w.WriteArrayHeader(1);
+        w.WriteInt32(partition);
+        w.WriteInt64(this.currentOffset);
+        w.WriteInt64(-1L); // log_start_offset: -1
+        w.WriteInt32(this.maxBytes);
+
+        // 2. 发送请求
+        KafkaReader r = await this.conn.SendRequestAsync(KafkaConstants.API_FETCH, 4, w.ToBytes());
+        if (r == null) { return result; }
+
+        // 3. 解析 FetchResponse v4
+        int throttleTimeMs = r.ReadInt32();
+        int topicCount = r.ReadArrayHeader();
+        if (topicCount <= 0) { return result; }
+
+        string respTopic = r.ReadString();
+        int partCount = r.ReadArrayHeader();
+        if (partCount <= 0) { return result; }
+
+        int respPart = r.ReadInt32();
+        int errCode = r.ReadInt16();
+        long highWatermark = r.ReadInt64();
+        long lastStableOffset = r.ReadInt64();
+        long logStartOffset = r.ReadInt64();
+
+        // aborted_transactions 数组
+        int abortCount = r.ReadArrayHeader();
+        if (abortCount > 0) {
+            for (int a = 0; a < abortCount; a = a + 1) {
+                long pid = r.ReadInt64();
+                long firstOff = r.ReadInt64();
+            }
+        }
+
+        // record_set 二进制消息块 (32-bit length prefix + RecordBatch bytes)
+        byte[] recordSetBytes = r.ReadBytes();
+        if (recordSetBytes != null && recordSetBytes.Length > 0) {
+            List<KafkaRecord> batch = KafkaRecord.ParseRecordBatch(recordSetBytes, 0, recordSetBytes.Length);
+            for (int i = 0; i < batch.Count; i = i + 1) {
+                KafkaRecord rec = batch[i];
+                result.Add(rec);
+                if (rec.offset >= this.currentOffset) {
+                    this.currentOffset = rec.offset + 1L;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    public void Close() {
+        if (this.conn != null) {
+            this.conn.Close();
+            this.conn = null;
+        }
+    }
+
+    public void Dispose() {
+        this.Close();
+    }
+}

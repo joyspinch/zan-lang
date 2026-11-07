@@ -1,0 +1,159 @@
+using System;
+using System.Interop;
+
+namespace Zan.Kafka;
+
+// Kafka 二进制网络协议大端序序列化工具
+public class KafkaWriter {
+    private byte[] buffer;
+    private int capacity;
+    private int position;
+
+    public KafkaWriter() {
+        this.capacity = 256;
+        this.buffer = new byte[this.capacity];
+        this.position = 0;
+    }
+
+    public KafkaWriter(int initialCapacity) {
+        if (initialCapacity < 64) { initialCapacity = 64; }
+        this.capacity = initialCapacity;
+        this.buffer = new byte[this.capacity];
+        this.position = 0;
+    }
+
+    private void EnsureCapacity(int bytesNeeded) {
+        int required = this.position + bytesNeeded;
+        if (required <= this.capacity) { return; }
+        int nextCap = this.capacity * 2;
+        if (nextCap < required) { nextCap = required + 128; }
+        byte[] nextBuf = new byte[nextCap];
+        NativeMemory.Copy((nint)nextBuf, (nint)this.buffer, this.position);
+        this.buffer = nextBuf;
+        this.capacity = nextCap;
+    }
+
+    public void WriteInt8(int v) {
+        this.EnsureCapacity(1);
+        this.buffer[this.position] = (byte)(v & 255);
+        this.position = this.position + 1;
+    }
+
+    public void WriteInt16(int v) {
+        this.EnsureCapacity(2);
+        this.buffer[this.position] = (byte)((v >> 8) & 255);
+        this.buffer[this.position + 1] = (byte)(v & 255);
+        this.position = this.position + 2;
+    }
+
+    public void WriteInt32(int v) {
+        this.EnsureCapacity(4);
+        this.buffer[this.position] = (byte)((v >> 24) & 255);
+        this.buffer[this.position + 1] = (byte)((v >> 16) & 255);
+        this.buffer[this.position + 2] = (byte)((v >> 8) & 255);
+        this.buffer[this.position + 3] = (byte)(v & 255);
+        this.position = this.position + 4;
+    }
+
+    public void WriteInt64(long v) {
+        this.EnsureCapacity(8);
+        this.buffer[this.position] = (byte)((v >> 56) & 255);
+        this.buffer[this.position + 1] = (byte)((v >> 48) & 255);
+        this.buffer[this.position + 2] = (byte)((v >> 40) & 255);
+        this.buffer[this.position + 3] = (byte)((v >> 32) & 255);
+        this.buffer[this.position + 4] = (byte)((v >> 24) & 255);
+        this.buffer[this.position + 5] = (byte)((v >> 16) & 255);
+        this.buffer[this.position + 6] = (byte)((v >> 8) & 255);
+        this.buffer[this.position + 7] = (byte)(v & 255);
+        this.position = this.position + 8;
+    }
+
+    // 变长无符号整数编码 (Kafka Record v2 Varint / Zigzag)
+    public void WriteVarint(int v) {
+        int z = (v << 1) ^ (v >> 31);
+        while ((z & ~127) != 0) {
+            this.WriteInt8((z & 127) | 128);
+            z = (int)((uint)z >> 7);
+        }
+        this.WriteInt8(z & 127);
+    }
+
+    public void WriteVarlong(long v) {
+        long z = (v << 1) ^ (v >> 63);
+        while ((z & ~127L) != 0L) {
+            this.WriteInt8((int)(z & 127L) | 128);
+            z = (long)((ulong)z >> 7);
+        }
+        this.WriteInt8((int)(z & 127L));
+    }
+
+    // 写入标准 Kafka 字符串：2 字节有符号大端长度 + 字符串内容（-1 表示 null）
+    public void WriteString(string s) {
+        if (s == null) {
+            this.WriteInt16(-1);
+            return;
+        }
+        int len = s.Length;
+        this.WriteInt16(len);
+        if (len > 0) {
+            this.EnsureCapacity(len);
+            NativeMemory.PutString((nint)this.buffer, this.position, s, len);
+            this.position = this.position + len;
+        }
+    }
+
+    public void WriteStringRaw(string s) {
+        if (s == null || s.Length == 0) { return; }
+        int len = s.Length;
+        this.EnsureCapacity(len);
+        NativeMemory.PutString((nint)this.buffer, this.position, s, len);
+        this.position = this.position + len;
+    }
+
+    // 写入标准 Kafka 字节数组：4 字节有符号大端长度 + 数据（-1 表示 null）
+    public void WriteBytes(byte[] b) {
+        if (b == null) {
+            this.WriteInt32(-1);
+            return;
+        }
+        int len = b.Length;
+        this.WriteInt32(len);
+        if (len > 0) {
+            this.EnsureCapacity(len);
+            NativeMemory.Copy((nint)this.buffer + (nint)this.position, (nint)b, len);
+            this.position = this.position + len;
+        }
+    }
+
+    public void WriteRaw(byte[] b, int len) {
+        if (b == null || len <= 0) { return; }
+        this.EnsureCapacity(len);
+        NativeMemory.Copy((nint)this.buffer + (nint)this.position, (nint)b, len);
+        this.position = this.position + len;
+    }
+
+    public void WriteArrayHeader(int count) {
+        this.WriteInt32(count);
+    }
+
+    // 回填指定偏移处的 4 字节整数（用于在计算出负载大小或 CRC 后补齐协议头）
+    public void PatchInt32(int offset, int v) {
+        if (offset < 0 || offset + 4 > this.position) { return; }
+        this.buffer[offset] = (byte)((v >> 24) & 255);
+        this.buffer[offset + 1] = (byte)((v >> 16) & 255);
+        this.buffer[offset + 2] = (byte)((v >> 8) & 255);
+        this.buffer[offset + 3] = (byte)(v & 255);
+    }
+
+    public int Length() {
+        return this.position;
+    }
+
+    public byte[] ToBytes() {
+        byte[] res = new byte[this.position];
+        if (this.position > 0) {
+            NativeMemory.Copy((nint)res, (nint)this.buffer, this.position);
+        }
+        return res;
+    }
+}
