@@ -1217,6 +1217,7 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
     uint32_t ref_count = 0;
     uint32_t instance_size = 0;
     uint32_t offsets[256];
+    memset(offsets, 0, sizeof(offsets));
 
     if (g->site_coll && g->site_coll[site_idx]) {
         int ck = g->site_coll[site_idx];
@@ -1229,6 +1230,7 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
                               elem_type->kind == TYPE_OBJECT)) {
                 kind = 1;
                 ref_count = 1;
+                offsets[0] = 16;
             } else {
                 kind = 3;
                 ref_count = 0;
@@ -1236,6 +1238,9 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
         } else if (ck == 3) { /* Dict */
             kind = 2;
             ref_count = 3;
+            offsets[0] = 16;
+            offsets[1] = 24;
+            offsets[2] = 0;
         } else {
             kind = 3;
             ref_count = 0;
