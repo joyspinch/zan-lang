@@ -1,0 +1,772 @@
+using System;
+using System.Globalization;
+using System.Collections.Generic;
+using System.IO;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Game.Scene;
+
+public partial class SceneDesigner {
+    // --- 顶层渲染 ----------------------------------------------------
+
+    // 渲染整个设计器（功能区 + 画布 + 面板/检查器/状态栏）到矩形 (x,y,w,h)；使用作用域 Hash 栈，不污染宿主 id。宿主面板开启时只画功能区与画布。
+    public void Render(App app, int x, int y, int w, int h) {
+        WidgetId.Push("scene_designer");
+        this.RenderPinned(app, x, y, w, h);
+        WidgetId.Pop();
+    }
+
+    // 宿主（IDE）把元素面板和属性面板画进自己的 dock 面板里，
+    // 设计器本体就只剩功能区 + 画布。
+    public void RenderHostPanels(App app, Rect toolRect, Rect propRect) {
+        this.hostPanels = true;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (toolRect != null && toolRect.width > 1 && toolRect.height > 1 && toolRect.x > -1000) {
+            WidgetId.Push("designer_palette");
+            this.RenderPalette(app, c, t, toolRect.x, toolRect.y,
+                toolRect.width, toolRect.height);
+            WidgetId.Pop();
+        }
+        if (propRect != null && propRect.width > 1 && propRect.height > 1 && propRect.x > -1000) {
+            WidgetId.Push("designer_inspector");
+            this.RenderInspector(app, c, t, propRect.x, propRect.y,
+                propRect.width, propRect.height);
+            WidgetId.Pop();
+        }
+    }
+
+    // 渲染设计器本体（Render 的别名入口），沿用宿主传入的同一矩形；宿主面板由 IDE 自行调用 RenderHostPanels 绘制。
+    public void RenderPinned(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int pad = app.Scale(10);
+        int statusH = app.Scale(22);
+        int top = y + pad;
+        int bot = y + h - statusH - pad;
+        int bodyH = bot - top;
+
+        // 三栏宽度跟着宿主面板走：宿主窄了先按比例压缩两侧，
+        // 压不动就把面板/检查器收起来，绝不把内容画到面板外。
+        int avail = w - pad * 4;
+        if (avail < app.Scale(80)) { avail = app.Scale(80); }
+        int palW = app.Scale(172);
+        int inspW = app.Scale(276);
+        if (this.hostPanels) { palW = 0; inspW = 0; avail = w - pad * 2; }
+        int minCan = app.Scale(200);
+        if (palW + inspW + minCan > avail) {
+            int side = avail - minCan;
+            if (side < 0) { side = 0; }
+            int sum = palW + inspW;
+            palW = side * palW / sum;
+            inspW = side - palW;
+            if (palW < app.Scale(120)) { inspW = inspW + palW; palW = 0; }
+            if (inspW < app.Scale(180)) { palW = palW + inspW; inspW = 0; }
+            if (palW > 0 && palW < app.Scale(120)) { palW = 0; }
+        }
+        int canW = avail - palW - inspW;
+        if (canW < app.Scale(80)) { canW = app.Scale(80); }
+
+        int palX = x + pad;
+        int canX = palX + pad;
+        if (palW > 0) { canX = palX + palW + pad; }
+        if (this.hostPanels) { canX = palX; }
+        int inspX = canX + canW + pad;
+        if (this.hostPanels) { inspX = palX + avail; }
+
+        // 设计器整体裁剪在宿主给的矩形内。
+        c.PushClip(x, y, w, h);
+
+        // 选中项变化时同步检查器输入。
+        if (this.sel != this.lastSel) {
+            if (this.sel != null) {
+                this.nameIn.SetText(this.sel.Name());
+                this.imgIn.SetText(this.sel.ImageId());
+                this.textIn.SetText(this.sel.Text());
+                this.itemsIn.SetText(this.sel.Items());
+                this.layerIn.SetText(this.sel.Layer());
+                this.clickIn.SetText(this.sel.OnAction("Click"));
+                this.classIn.SetText(this.sel.CssClass());
+            }
+            this.lastSel = this.sel;
+        }
+
+        if (palW > 0) { this.RenderPalette(app, c, t, palX, top, palW, bodyH); }
+        this.RenderCanvas(app, c, t, canX, top, canW, bodyH);
+        if (inspW > 0) {
+            this.RenderInspector(app, c, t, inspX, top, inspW, bodyH);
+        }
+        this.RenderStatus(app, c, t, palX, bot + app.Scale(2), inspX + inspW - palX);
+
+        // 面板拖拽幽灵：跟随光标的浮动芯片，直到
+        // 在画布上放下（由 RenderCanvas 处理）或在别处释放。
+        int gek = app.EventKind();
+        if (app.PointerCaptured()) { gek = 0; }
+        if (this.palDrag.Length > 0) {
+            if (gek == 1) { this.palMoved = true; }
+            if (gek == 3) {
+                // 在画布外释放（画布内放下已清除了它）。
+                this.palDrag = "";
+            } else if (this.palMoved) {
+                string gl = SceneDesigner.KindLabel(this.palDrag);
+                int gw = app.Scale(24) + gl.Length * t.fontSizeSmall;
+                int gh = app.Scale(24);
+                c.FillRoundRect(app.mouseX + app.Scale(10), app.mouseY + app.Scale(10),
+                    gw, gh, app.Scale(4), SceneDesigner.PackColor(70, 110, 200, 220));
+                app.canvas.DrawText(app.mouseX + app.Scale(18), app.mouseY + app.Scale(14), gl, t.textInverse,
+                    Style.Of(app, "label", "small", Style.SNormal())
+                        .FontOr(app.theme.fontSizeSmall));
+            }
+            app.RequestRedraw();
+        }
+
+        c.PopClip();
+
+        this.RenderContextMenu(app, c, t);
+        this.RenderLayerMenu(app, c, t, x, y, w, h);
+        this.RenderResPicker(app, c, t, x, y, w, h);
+    }
+
+    // 层下拉菜单：列出基础层 + 文档里出现过的层名与新建层入口，选择后画布切到那一层编辑。菜单浮在功能区"编辑：xx"按钮下；点击菜单外关闭。
+    public void RenderLayerMenu(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        if (!this.layerMenuOpen) { return; }
+        List<string> ls = new List<string>();
+        ls.Add(SceneDesigner.T("Base layer", "基础层"));
+        List<string> docLs = this.DocLayers();
+        for (int i = 0; i < docLs.Count; i = i + 1) { ls.Add(docLs[i]); }
+        // 增加新建层操作项
+        ls.Add("+ " + SceneDesigner.T("New Layer", "新建图层"));
+
+        int mw = app.Scale(220);
+        int rowH = app.Scale(26);
+        int mh = app.Scale(8) + ls.Count * rowH + app.Scale(6);
+        // 锚定在功能区左端（层组按钮附近）。
+        int mx = x + app.Scale(12);
+        int my = y + app.Scale(8) + this.BarH(app);
+        Prompt.Surface(app, mx, my, mw, mh, "");
+        Prompt.Caption(app, mx, my,
+            SceneDesigner.T("Edit layer", "编辑层"));
+        // 遮罩铺满全窗（BlockHitsMenu），不只铺菜单自身那块：
+        // 只挡自身矩形时，菜单开着点画布 → 菜单关了，画布还照样
+        // 选中/起拖拽（点外面也穿透）。全窗遮罩让画布的裸事件
+        // 路径被 PointerCaptured 收走，右键则仍解析到菜单下方
+        // （Windows 语义：别处右键把菜单换个地方重开）。
+        app.BlockHitsMenu();
+        int iy = my + app.Scale(24);
+        int totalItems = ls.Count;
+        for (int i = 0; i < totalItems; i = i + 1) {
+            bool hover = SceneDesigner.InRect(app.mouseX, app.mouseY,
+                mx + app.Scale(4), iy, mw - app.Scale(8), rowH);
+            if (hover) {
+                c.FillRect(mx + app.Scale(4), iy, mw - app.Scale(8), rowH, t.bgTertiary);
+            }
+            string cur = ls[i];
+            bool isNewAction = (i == totalItems - 1);
+            bool active = !isNewAction && ((i == 0 && this.editLayer.Length == 0)
+                || (i > 0 && this.editLayer == ls[i]));
+
+            int textColor = isNewAction ? t.primary : (active ? t.primary : t.textPrimary);
+            c.DrawText(mx + app.Scale(10),
+                Canvas.CenterTextY(iy, rowH, t.fontSizeSmall), cur,
+                textColor, t.fontSizeSmall);
+
+            int idx = i;
+            if (Ui.ClickedIn(app, mx + app.Scale(4), iy, mw - app.Scale(8), rowH)) {
+                if (isNewAction) {
+                    // 生成唯一图层名 layer1, layer2...
+                    int layerNum = docLs.Count + 1;
+                    string newLayerName = "layer" + SceneDoc.IntStr(layerNum);
+                    while (this.DocHasLayer(newLayerName)) {
+                        layerNum = layerNum + 1;
+                        newLayerName = "layer" + SceneDoc.IntStr(layerNum);
+                    }
+                    this.editLayer = newLayerName;
+                    this.layerMenuOpen = false;
+                    this.sel = null;
+                    this.selExtra = new List<SceneElement>();
+                    this.msg = SceneDesigner.T("created and editing layer ", "已创建并切换到层 ") + this.editLayer;
+                } else {
+                    this.editLayer = idx == 0 ? "" : ls[idx];
+                    this.layerMenuOpen = false;
+                    this.sel = null;
+                    this.selExtra = new List<SceneElement>();
+                    this.msg = idx == 0
+                        ? SceneDesigner.T("editing base layer", "正在编辑基础层")
+                        : SceneDesigner.T("editing layer ", "正在编辑层 ") + this.editLayer;
+                }
+                app.RequestRedraw();
+            }
+            iy = iy + rowH;
+        }
+        // 点击菜单外关闭。
+        if (app.ClickAvailable()
+            && !SceneDesigner.InRect(app.mouseX, app.mouseY, mx, my, mw, mh)) {
+            this.layerMenuOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+    public bool DocHasLayer(string ly) {
+        if (ly == null || ly.Length == 0) { return true; }
+        for (int i = 0; i < this.doc.Count(); i = i + 1) {
+            if (this.doc.ElementAt(i).Layer() == ly) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 将 s 中的 ASCII 大写字母转为小写；其余字符原样保留（用于扩展名等不区分大小写的比较）。
+    public static string AsciiLower(string s) {
+        if (s == null) { return ""; }
+        return s.ToLower();
+    }
+
+    // s 是否以 suf 结尾（区分大小写；s 短于 suf 时返回 false）。
+    public static bool EndsWith(string s, string suf) {
+        if (s == null || suf == null) { return false; }
+        return s.EndsWith(suf);
+    }
+
+    // nm 是否为图片资源文件名（.png/.jpg/.jpeg/.bmp/.gif/.tga 之一，忽略大小写）。
+    public static bool IsImageFile(string nm) {
+        string lo = SceneDesigner.AsciiLower(nm);
+        return SceneDesigner.EndsWith(lo, ".png") || SceneDesigner.EndsWith(lo, ".jpg")
+            || SceneDesigner.EndsWith(lo, ".jpeg") || SceneDesigner.EndsWith(lo, ".bmp")
+            || SceneDesigner.EndsWith(lo, ".gif") || SceneDesigner.EndsWith(lo, ".tga");
+    }
+
+    // 居中的弹出窗口，列出项目打包的图片资源；选择一个即可填充图片/背景输入框（仍可手动输入路径）。首行为"（无）"。
+    public void RenderResPicker(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        if (this.resPick == 0) { return; }
+        List<string> files = DirectoryTree.Names(SceneDesigner.assetsDir,
+            PathFilter.Only(".png .jpg .jpeg .bmp .gif .webp"));
+        int mW = app.Scale(300);
+        int rowH = app.theme.heightLarge;
+        int rows = files.Count + 1;
+        if (rows > 10) { rows = 10; }
+        int listH = rows * rowH + app.Scale(4);
+        int mH = app.Scale(34) + listH;
+        int mx = x + (w - mW) / 2;
+        int my = y + (h - mH) / 2;
+
+        string title = SceneDesigner.T("Pick a resource (assets/)", "选择资源（assets/）");
+        if (this.resPick == 2) {
+            title = SceneDesigner.T("Pick a background (assets/)", "选择背景（assets/）");
+        }
+        Prompt.Surface(app, mx, my, mW, mH, "");
+        Prompt.Caption(app, mx, my, title);
+        // 资源选择是模态弹窗：遮罩铺满全窗，不只铺弹窗自身那块。
+        // 只挡自身矩形时，点弹窗外的画布 → 弹窗关了，画布还照样
+        // 选中/起拖拽（点外面也穿透）。全窗遮罩在画布绘制之前就
+        // 铺下，画布的裸事件路径被 PointerCaptured 收走；弹窗内
+        // 的资源列表在遮罩之后注册，条目照常可点。
+        app.BlockHitsBelow();
+
+        List<string> picks = new List<string>();
+        picks.Add(SceneDesigner.T("(none)", "（无）"));
+        for (int i = 0; i < files.Count; i = i + 1) {
+            picks.Add(files[i]);
+        }
+        if (this.resList == null) {
+            this.resList = new ListView<string>(
+                new Gui.Widget.ListColumn<string>("", s => s));
+            this.resList.Class = "flat";
+            this.resList.EmptyText(SceneDesigner.T(
+                "no image resources; add files via Project Config",
+                "暂无图片资源，可在项目配置中添加"));
+            this.resList.OnSelect(() => { this.ResourcePicked(); });
+        }
+        this.resList.Bind(picks);
+        this.resList.RenderInside(app, new Rect(
+            mx + app.Scale(6), my + app.Scale(30),
+            mW - app.Scale(12), listH));
+
+        // 点击弹窗外部将其关闭。
+        if (app.ClickAvailable()
+            && !SceneDesigner.InRect(app.mouseX, app.mouseY, mx, my, mW, mH)) {
+            this.resPick = 0;
+        }
+        app.RequestRedraw();
+    }
+
+    // 固定在画布上方的快速布局工具栏：对齐 / 居中 /
+    // 等高宽按钮，作用于多选元素。
+    // 单个功能区组：将 `items` 渲染为小按钮，下方
+    // 带标题和尾部分隔线；返回组后方的 x 坐标。点击
+    // 通过 this.barClickGroup / barClickIndex 上报。
+    public int barClickGroup;
+    public int barClickIndex;
+    // 顶部功能区：和窗口设计器同一个 Ribbon 控件、
+    // 同一套分组和同一种命令外观（小图标 + 一行文字，
+    // 每组两行）。命令的登记顺序决定它的全局序号，
+    // dispatches 实体列表把序号映射回原来的分派逻辑（消除 grp/idx 平行列表）。
+    // 登记一个功能区命令：把条目 it 加入组 g，并在 dispatches 强类型实体表记录分派码。
+    public void AddBarItem(List<RibbonGroup> groups, List<SceneBarDispatch> dispatches,
+            RibbonGroup g, RibbonItem it, int group, int index) {
+        g.Add(it);
+        if (dispatches != null) { dispatches.Add(new SceneBarDispatch(group, index)); }
+    }
+
+    // 功能区高度（像素），画布工具栏与层菜单定位使用。
+    public int BarH(App app) { return Gui.Widget.Ribbon.HeightGroups(app); }
+
+    // 渲染画布上方的快速布局功能区（排版/编辑/网格/缩放/层五组）并分派点击：右侧同时显示只读的缩放与多选状态。
+    public void RenderLayoutBar(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        this.barClickGroup = 0 - 1;
+        this.barClickIndex = 0 - 1;
+        bool hasSel = this.sel != null;
+
+        List<RibbonGroup> groups = new List<RibbonGroup>();
+        List<SceneBarDispatch> dispatches = new List<SceneBarDispatch>();
+
+        // --- 排版：对齐、等宽等高、居中画布、均分间距、层次合成一组图标格
+        // （和窗口设计器同一组、同顺序、同图标）---
+        RibbonGroup ga = new RibbonGroup(SceneDesigner.T("Align", "排版"));
+        List<SceneAlignCommand> alignCmds = new List<SceneAlignCommand>{
+            new SceneAlignCommand("align-left", SceneDesigner.T("Left", "左对齐"), 0, 0),
+            new SceneAlignCommand("align-center", SceneDesigner.T("Centre", "水平居中"), 0, 4),
+            new SceneAlignCommand("align-right", SceneDesigner.T("Right", "右对齐"), 0, 1),
+            new SceneAlignCommand("align-top", SceneDesigner.T("Top", "顶对齐"), 0, 2),
+            new SceneAlignCommand("align-middle", SceneDesigner.T("Middle", "垂直居中"), 0, 5),
+            new SceneAlignCommand("align-bottom", SceneDesigner.T("Bottom", "底对齐"), 0, 3),
+            new SceneAlignCommand("layout", SceneDesigner.T("Same W", "等宽"), 1, 0),
+            new SceneAlignCommand("sort", SceneDesigner.T("Same H", "等高"), 1, 1),
+            new SceneAlignCommand("chevron-up", SceneDesigner.T("Forward", "上一层"), 3, 0),
+            new SceneAlignCommand("chevron-down", SceneDesigner.T("Back", "下一层"), 3, 1),
+            new SceneAlignCommand("arrow-up", SceneDesigner.T("Front", "置顶"), 3, 2),
+            new SceneAlignCommand("arrow-down", SceneDesigner.T("Send back", "置底"), 3, 3),
+            new SceneAlignCommand("align-center", SceneDesigner.T("Canvas H", "水平居中画布"), 0, 8),
+            new SceneAlignCommand("align-middle", SceneDesigner.T("Canvas V", "垂直居中画布"), 0, 9),
+            new SceneAlignCommand("layout", SceneDesigner.T("Dist H", "水平均分"), 0, 10),
+            new SceneAlignCommand("sort", SceneDesigner.T("Dist V", "垂直均分"), 0, 11)
+        };
+        for (int a = 0; a < alignCmds.Count; a = a + 1) {
+            SceneAlignCommand cmd = alignCmds[a];
+            RibbonItem it = RibbonItem.Tile(cmd.icon, cmd.label);
+            it.SetEnabled(hasSel);
+            this.AddBarItem(groups, dispatches, ga, it, cmd.group, cmd.index);
+        }
+        groups.Add(ga);
+
+        // --- 编辑 ---
+        RibbonGroup ge = new RibbonGroup(SceneDesigner.T("Edit", "编辑"));
+        RibbonItem dup = RibbonItem.Small("copy", SceneDesigner.T("Duplicate", "复制"));
+        dup.SetEnabled(hasSel);
+        this.AddBarItem(groups, dispatches, ge, dup, 2, 0);
+        RibbonItem del = RibbonItem.Small("trash", SceneDesigner.T("Delete", "删除"));
+        del.SetEnabled(hasSel);
+        this.AddBarItem(groups, dispatches, ge, del, 2, 1);
+        RibbonItem lk = RibbonItem.Toggle("lock", SceneDesigner.T("Lock", "锁定"),
+            hasSel && this.sel.Locked());
+        lk.SetTip(SceneDesigner.T("Locked elements cannot be moved or resized",
+            "锁定后不能拖动、不能改大小"));
+        lk.SetEnabled(hasSel);
+        this.AddBarItem(groups, dispatches, ge, lk, 2, 2);
+        groups.Add(ge);
+
+        // --- 网格（原来在组件面板底部的画布开关）---
+        RibbonGroup gg = new RibbonGroup(SceneDesigner.T("Grid", "网格"));
+        this.AddBarItem(groups, dispatches, gg,
+            RibbonItem.Toggle("grid", SceneDesigner.T("Show grid", "显示网格"),
+                this.showGrid), 5, 0);
+        this.AddBarItem(groups, dispatches, gg,
+            RibbonItem.Toggle("pin", SceneDesigner.T("Snap", "吸附网格"),
+                this.snap), 5, 1);
+        this.AddBarItem(groups, dispatches, gg,
+            RibbonItem.Small("table", SceneDesigner.T("Step ", "步长 ")
+                + SceneDoc.IntStr(this.grid)), 5, 2);
+        this.AddBarItem(groups, dispatches, gg,
+            RibbonItem.Small("magnet", SceneDesigner.T("Snap Now", "一键吸附")), 5, 3);
+        this.AddBarItem(groups, dispatches, gg,
+            RibbonItem.Toggle("font", SceneDesigner.T("Tags", "标签"),
+                this.showTags), 5, 4);
+        groups.Add(gg);
+
+        // --- 缩放 ---
+        RibbonGroup gv = new RibbonGroup(SceneDesigner.T("Zoom", "缩放"));
+        this.AddBarItem(groups, dispatches, gv,
+            RibbonItem.Small("minus", SceneDesigner.T("Zoom out", "缩小")), 4, 0);
+        this.AddBarItem(groups, dispatches, gv,
+            RibbonItem.Small("plus", SceneDesigner.T("Zoom in", "放大")), 4, 1);
+        this.AddBarItem(groups, dispatches, gv,
+            RibbonItem.Small("search", "100%"), 4, 2);
+        this.AddBarItem(groups, dispatches, gv,
+            RibbonItem.Small("layout", SceneDesigner.T("Fit", "适应")), 4, 3);
+        RibbonItem hd = RibbonItem.Toggle("hand", SceneDesigner.T("Pan", "抓手"), this.hand);
+        hd.SetTip(SceneDesigner.T("Drag the canvas with the left button (middle button always pans)",
+            "按住左键拖动画布查看细节（中键随时可拖）"));
+        this.AddBarItem(groups, dispatches, gv, hd, 4, 4);
+        groups.Add(gv);
+
+        // --- 层（弹窗/菜单页）：下拉选编辑层 + 幽灵显示开关 ---
+        RibbonGroup gl = new RibbonGroup(SceneDesigner.T("Layer", "层"));
+        string lyLabel = this.editLayer.Length == 0
+            ? SceneDesigner.T("Base", "基础层") : this.editLayer;
+        RibbonItem lyPick = RibbonItem.Small("layout",
+            SceneDesigner.T("Edit: ", "编辑：") + lyLabel);
+        lyPick.SetTip(SceneDesigner.T(
+            "Pick the layer to edit; elements on other layers show as ghosts (when Ghost is on) and are not hit by clicks",
+            "选择正在编辑的层；其它层元素以幽灵显示（Ghost 开启时）且不被点击命中"));
+        this.AddBarItem(groups, dispatches, gl, lyPick, 6, 0);
+        this.AddBarItem(groups, dispatches, gl,
+            RibbonItem.Toggle("eye", SceneDesigner.T("Ghost", "幽灵"),
+                this.showGhost), 6, 1);
+        groups.Add(gl);
+
+        int hit = Gui.Widget.Ribbon.RenderGroups(app, x, y, w, groups);
+        if (hit >= 0 && dispatches != null && hit < dispatches.Count) {
+            this.barClickGroup = dispatches[hit].group;
+            this.barClickIndex = dispatches[hit].index;
+        }
+
+        // 右端只读状态：当前缩放 + 多选提示。
+        string zs = SceneDesigner.T("Fit", "适应");
+        if (this.zoom > 0) { zs = SceneDoc.IntStr(this.zoom / 10) + "%"; }
+        int selN = this.selExtra.Count;
+        if (this.sel != null) { selN = selN + 1; }
+        string hint = zs + "   " + SceneDesigner.T("select 2+ elements (drag box / Ctrl+click)",
+            "框选或 Ctrl+单击多选 2 个以上元素");
+        if (selN >= 2) {
+            hint = zs + "   " + SceneDesigner.T("selected ", "已选中 ") + SceneDoc.IntStr(selN)
+                + SceneDesigner.T(" element(s)", " 个元素");
+        }
+        int hw = Canvas.MeasureText(hint, t.fontSizeSmall);
+        c.DrawText(x + w - hw - app.Scale(10),
+            Canvas.CenterTextY(y, h, t.fontSizeSmall), hint,
+            t.textTertiary, t.fontSizeSmall);
+
+        // 分派被点击组记录的点击。
+        if (this.barClickGroup == 0) { this.AlignSel(this.barClickIndex); app.RequestRedraw(); }
+        else if (this.barClickGroup == 1) { this.AlignSel(6 + this.barClickIndex); app.RequestRedraw(); }
+        else if (this.barClickGroup == 5) {
+            if (this.barClickIndex == 0) { this.showGrid = !this.showGrid; }
+            else if (this.barClickIndex == 1) { this.snap = !this.snap; }
+            else if (this.barClickIndex == 2) {
+                if (this.grid == 4) { this.grid = 8; }
+                else if (this.grid == 8) { this.grid = 16; }
+                else if (this.grid == 16) { this.grid = 32; }
+                else { this.grid = 4; }
+            }
+            else if (this.barClickIndex == 3) { this.SnapSelectionToGrid(); }
+            else { this.showTags = !this.showTags; }
+            app.RequestRedraw();
+        }
+        else if (this.barClickGroup == 6) {
+            if (this.barClickIndex == 0) { this.layerMenuOpen = !this.layerMenuOpen; }
+            else { this.showGhost = !this.showGhost; }
+            app.RequestRedraw();
+        }
+        else if (this.barClickGroup == 4) {
+            int z = this.zoom;
+            if (z == 0) { z = 1000; }
+            if (this.barClickIndex == 0) { z = z * 10 / 11; }
+            else if (this.barClickIndex == 1) { z = z * 11 / 10; }
+            else if (this.barClickIndex == 2) { z = 1000; }
+            else if (this.barClickIndex == 3) { z = 0; }
+            else { this.hand = !this.hand; }
+            if (z > 0 && z < 100) { z = 100; }
+            if (z > 4000) { z = 4000; }
+            this.zoom = z;
+            if (z == 0) { this.panX = 0; this.panY = 0; }
+            app.RequestRedraw();
+        }
+        else if (this.barClickGroup >= 2) {
+            if (this.sel == null) {
+                this.msg = SceneDesigner.T("select an element first", "请先选中一个元素");
+            } else if (this.barClickGroup == 2) {
+                if (this.barClickIndex == 0) { this.DuplicateSel(); }
+                else if (this.barClickIndex == 1) { this.DeleteSel(); }
+                else {
+                    this.PushUndo();
+                    this.sel.SetLocked(!this.sel.Locked());
+                    if (this.sel.Locked()) { this.msg = SceneDesigner.T("locked", "已锁定"); }
+                    else { this.msg = SceneDesigner.T("unlocked", "已解锁"); }
+                }
+            } else {
+                if (this.barClickIndex == 0) { this.RaiseSel(1); this.msg = SceneDesigner.T("brought forward", "已上移一层"); }
+                else if (this.barClickIndex == 1) { this.RaiseSel(0 - 1); this.msg = SceneDesigner.T("sent backward", "已下移一层"); }
+                else if (this.barClickIndex == 2) { this.SelToTop(); this.msg = SceneDesigner.T("brought to front", "已置顶"); }
+                else { this.SelToBottom(); this.msg = SceneDesigner.T("sent to back", "已置底"); }
+            }
+            app.RequestRedraw();
+        }
+    }
+
+    // 针对选中画布元素的浮动右键菜单（复制/删除/z 顺序/移至图层/锁定）；Esc 或点击菜单项后关闭，无选中时自动收起。
+    public void RenderContextMenu(App app, Canvas c, Theme t) {
+        if (!this.ctxOpen) { return; }
+        if (this.sel == null) { this.ctxOpen = false; return; }
+        List<string> items = new List<string>{
+            SceneDesigner.T("Duplicate", "复制"),
+            SceneDesigner.T("Delete", "删除"),
+            "-",
+            SceneDesigner.T("Bring Forward", "上移一层"),
+            SceneDesigner.T("Send Backward", "下移一层"),
+            SceneDesigner.T("Bring to Front", "置顶"),
+            SceneDesigner.T("Send to Back", "置底"),
+            "-" };
+
+        // 移至当前编辑层或基础层
+        if (this.sel.Layer() != this.editLayer) {
+            string targetLayerName = this.editLayer.Length == 0
+                ? SceneDesigner.T("Base layer", "基础层")
+                : this.editLayer;
+            items.Add(SceneDesigner.T("Move to ", "移至 ") + targetLayerName);
+        } else if (this.sel.Layer().Length > 0) {
+            items.Add(SceneDesigner.T("Move to Base layer", "移至基础层"));
+        }
+
+        items.Add(SceneDesigner.T("Snap to Grid", "对齐到网格"));
+
+        if (this.selExtra.Count >= 2) {
+            items.Add(SceneDesigner.T("Distribute Horizontally", "水平均分间距"));
+            items.Add(SceneDesigner.T("Distribute Vertically", "垂直均分间距"));
+        }
+        items.Add(SceneDesigner.T("Center on Canvas (H)", "水平居中到画布"));
+        items.Add(SceneDesigner.T("Center on Canvas (V)", "垂直居中到画布"));
+
+        if (this.sel.Locked()) { items.Add(SceneDesigner.T("Unlock", "解锁")); }
+        else { items.Add(SceneDesigner.T("Lock", "锁定")); }
+
+        int choice = ContextMenu.Render(app, this.ctxX, this.ctxY, items);
+        if (choice == 0 - 2) {
+            this.ctxOpen = false;
+        } else if (choice >= 0) {
+            this.ApplyContextAction(choice, items[choice]);
+            this.ctxOpen = false;
+        }
+        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+            this.ctxOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+    // 执行右键菜单项操作，支持移至图层与锁定切换，统一受 PushUndo 保护。
+    public void ApplyContextAction(int idx, string itemText) {
+        if (idx == 0) { this.DuplicateSel(); }
+        else if (idx == 1) { this.DeleteSel(); }
+        else if (idx == 3) { this.RaiseSel(1); this.msg = SceneDesigner.T("brought forward", "已上移一层"); }
+        else if (idx == 4) { this.RaiseSel(0 - 1); this.msg = SceneDesigner.T("sent backward", "已下移一层"); }
+        else if (idx == 5) { this.SelToTop(); this.msg = SceneDesigner.T("brought to front", "已置顶"); }
+        else if (idx == 6) { this.SelToBottom(); this.msg = SceneDesigner.T("sent to back", "已置底"); }
+        else if (itemText != null && (itemText.StartsWith(SceneDesigner.T("Move to", "移至")))) {
+            if (this.sel != null) {
+                this.PushUndo();
+                if (itemText.EndsWith(SceneDesigner.T("Base layer", "基础层"))) {
+                    this.sel.SetLayer("");
+                    this.layerIn.SetText("");
+                    this.msg = SceneDesigner.T("moved to base layer", "已移至基础层");
+                } else {
+                    this.sel.SetLayer(this.editLayer);
+                    this.layerIn.SetText(this.editLayer);
+                    this.msg = SceneDesigner.T("moved to layer ", "已移至层 ") + this.editLayer;
+                }
+            }
+        }
+        else if (itemText != null && (itemText == SceneDesigner.T("Snap to Grid", "对齐到网格"))) {
+            this.SnapSelectionToGrid();
+        }
+        else if (itemText != null && (itemText == SceneDesigner.T("Distribute Horizontally", "水平均分间距"))) {
+            this.AlignSel(10);
+        }
+        else if (itemText != null && (itemText == SceneDesigner.T("Distribute Vertically", "垂直均分间距"))) {
+            this.AlignSel(11);
+        }
+        else if (itemText != null && (itemText == SceneDesigner.T("Center on Canvas (H)", "水平居中到画布"))) {
+            this.AlignSel(8);
+        }
+        else if (itemText != null && (itemText == SceneDesigner.T("Center on Canvas (V)", "垂直居中到画布"))) {
+            this.AlignSel(9);
+        }
+        else if (this.sel != null && (itemText == SceneDesigner.T("Lock", "锁定") || itemText == SceneDesigner.T("Unlock", "解锁"))) {
+            this.PushUndo();
+            this.sel.SetLocked(!this.sel.Locked());
+            if (this.sel.Locked()) {
+                this.msg = SceneDesigner.T("locked", "已锁定");
+            } else {
+                this.msg = SceneDesigner.T("unlocked", "已解锁");
+            }
+        }
+    }
+
+    // --- 面板（添加元素） ---------------------------------------------
+
+    // 每个元素种类的工具箱图标。图标字体里没有专门的
+    // 游戏控件字形，所以按"这东西长什么样/干什么"就近取。
+    public static string KindIcon(string kind) {
+        if (kind == "label" || kind == "text") { return "font"; }
+        if (kind == "arttext") { return "star"; }
+        if (kind == "button") { return "select-all"; }
+        if (kind == "imagebox" || kind == "sprite") { return "image"; }
+        if (kind == "animbox" || kind == "anim") { return "play"; }
+        if (kind == "textbox") { return "edit"; }
+        if (kind == "input") { return "edit"; }
+        if (kind == "progressbar") { return "sort"; }
+        if (kind == "slider") { return "sort"; }
+        if (kind == "scrollbar") { return "more"; }
+        if (SceneDesigner.IsSlotKind(kind)) { return "grid"; }
+        if (kind == "avatarbox") { return "user"; }
+        if (kind == "checkbox") { return "check"; }
+        if (kind == "tabbox") { return "layout"; }
+        if (kind == "container") { return "folder"; }
+        if (kind == "minimap") { return "globe"; }
+        if (kind == "combobox") { return "chevron-down"; }
+        if (kind == "listbox") { return "table"; }
+        if (kind == "rect") { return "stop"; }
+        if (kind == "circle") { return "sun"; }
+        return "file";
+    }
+
+    // 面板度量（像素）：分组标题行高 / 元素行高 / 元素行步进。
+    public int PalHeadH(App app) { return app.Scale(22); }
+    // 元素行高（像素）。
+    public int PalRowH(App app) { return app.Scale(22); }
+    // 元素行步进（像素，含行间距，决定面板内容总高）。
+    public int PalRowStep(App app) { return app.Scale(24); }
+
+    // 分组标题 title 当前是否处于折叠状态。
+    public bool PalFolded(string title) {
+        for (int i = 0; i < this.palFolded.Count; i = i + 1) {
+            if (this.palFolded[i] == title) { return true; }
+        }
+        return false;
+    }
+
+    // 切换分组标题的折叠/展开状态。
+    public void PalToggleFold(string title) {
+        List<string> keep = new List<string>();
+        bool found = false;
+        for (int i = 0; i < this.palFolded.Count; i = i + 1) {
+            if (this.palFolded[i] == title) { found = true; }
+            else { keep.Add(this.palFolded[i]); }
+        }
+        if (!found) { keep.Add(title); }
+        this.palFolded = keep;
+    }
+
+    // 分组标题行：折叠箭头 + 标题，点整行折叠/展开。返回下一行的 y。
+    public int PaletteHeader(App app, Canvas c, Theme t, string title,
+            int ix, int iy, int iw) {
+        int hh = this.PalHeadH(app);
+        bool hov = this.palDrag.Length == 0
+            && SceneDesigner.InRect(app.mouseX, app.mouseY, ix, iy, iw, hh);
+        if (hov) {
+            c.FillRoundRect(ix, iy, iw, hh, t.borderRadiusSmall, t.bgHover);
+            app.RequestRedraw();
+        }
+        string arrow = "chevron-down";
+        if (this.PalFolded(title)) { arrow = "chevron-right"; }
+        c.DrawGlyphIn(arrow, ix, iy, app.Scale(14), hh, t.fontSizeSmall,
+            t.textTertiary);
+        c.DrawText(ix + app.Scale(16),
+            iy + (hh - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+            title, t.textSecondary, t.fontSizeSmall);
+        if (hov && app.EventKind() == 3 && !this.palMoved) {
+            this.PalToggleFold(title);
+            app.RequestRedraw();
+        }
+        return iy + hh;
+    }
+
+    // 一行元素种类（小图标 + 名称，无边框，悬停底色）。
+    // 点击在画布中心添加，按住拖到画布可指定位置。
+    public int PaletteRow(App app, Canvas c, Theme t, string kind,
+            int ix, int iy, int iw) {
+        int rowH = this.PalRowH(app);
+        int ek = app.EventKind();
+        if (app.PointerCaptured()) { ek = 0; }
+        bool over = SceneDesigner.InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH);
+        bool hov = this.palDrag.Length == 0 && over;
+        if (hov) {
+            c.FillRoundRect(ix, iy, iw, rowH, t.borderRadiusSmall, t.bgHover);
+            app.RequestRedraw();
+        }
+        c.DrawGlyphIn(SceneDesigner.KindIcon(kind), ix + app.Scale(2), iy,
+            app.Scale(16), rowH, t.fontSizeSmall, t.textSecondary);
+        c.DrawText(ix + app.Scale(20),
+            iy + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+            SceneDesigner.KindLabel(kind), t.textPrimary, t.fontSizeSmall);
+        if (ek == 2 && over) {
+            this.palDrag = kind;
+            this.palMoved = false;
+            this.msg = SceneDesigner.T("click to add at centre, or drag onto the canvas",
+                "单击添加到画布中心，或拖到画布指定位置");
+            app.RequestRedraw();
+        }
+        // 原地按下再松开就是一次点击：直接加到画布中心，
+        // 和拖拽共用同一次按下。
+        if (ek == 3 && over && !this.palMoved && this.palDrag == kind) {
+            this.AddElement(kind);
+            this.palDrag = "";
+            app.RequestRedraw();
+        }
+        return iy + this.PalRowStep(app);
+    }
+
+    // 一个可折叠分组，返回其后的 y。
+    public int PaletteSection(App app, Canvas c, Theme t, int x, int y, int w,
+            string title, List<string> kinds) {
+        int iy = this.PaletteHeader(app, c, t, title, x, y, w);
+        if (this.PalFolded(title)) { return iy + app.Scale(2); }
+        for (int k = 0; k < kinds.Count; k = k + 1) {
+            iy = this.PaletteRow(app, c, t, kinds[k], x, iy, w);
+        }
+        return iy + app.Scale(6);
+    }
+
+    // 一个分组占用的总高度（含标题行、count 个行与间距；折叠时只有标题），供面板内容总高与滚动钳制计算。
+    public int PaletteSectionH(App app, string title, int count) {
+        int h = this.PalHeadH(app);
+        if (this.PalFolded(title)) { return h + app.Scale(2); }
+        return h + count * this.PalRowStep(app) + app.Scale(6);
+    }
+
+    // 渲染元素面板：两个可折叠分组（控件/组件），支持内部滚轮滚动与右侧滚动条；指针悬停行时占用滚轮。
+    public void RenderPalette(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        app.FillChrome(x, y, w, h, t.borderRadiusLarge, t.bgSecondary);
+        app.canvas.DrawRect(x, y, w, h, app.theme.borderPrimary, 1);
+        int ix = x + app.Scale(8);
+        int iw = w - app.Scale(16);
+
+        string ctlTitle = SceneDesigner.T("CONTROLS", "控件");
+        string cmpTitle = SceneDesigner.T("COMPONENTS", "组件");
+        int contentH = this.PaletteSectionH(app, ctlTitle,
+                SceneDesigner.ControlKinds().Count)
+            + this.PaletteSectionH(app, cmpTitle,
+                SceneDesigner.ComponentKinds().Count)
+            + app.Scale(16);
+
+        // 面板内部滚动：指针在面板上时占用滚轮，
+        // 否则整页跟着滚。
+        int maxScroll = contentH - h;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (SceneDesigner.InRect(app.mouseX, app.mouseY, x, y, w, h)
+                && app.CaptureWheel(x, y, w, h)) {
+            int delta = app.window.EventKeyCode();
+            this.palScroll = this.palScroll - delta * app.Scale(40) / 120;
+            app.RequestRedraw();
+        }
+        if (this.palScroll > maxScroll) { this.palScroll = maxScroll; }
+        if (this.palScroll < 0) { this.palScroll = 0; }
+
+        c.PushClip(x + 1, y + 1, w - 2, h - 2);
+        int iy = y + app.Scale(10) - this.palScroll;
+        iy = this.PaletteSection(app, c, t, ix, iy, iw, ctlTitle,
+            SceneDesigner.ControlKinds());
+        iy = this.PaletteSection(app, c, t, ix, iy, iw, cmpTitle,
+            SceneDesigner.ComponentKinds());
+
+        c.PopClip();
+
+        if (maxScroll > 0) {
+            Scrollbar.RenderVertical(app, x + w - app.Scale(7), y + 1,
+                h - 2, contentH, this.palScroll);
+        }
+    }
+
+}

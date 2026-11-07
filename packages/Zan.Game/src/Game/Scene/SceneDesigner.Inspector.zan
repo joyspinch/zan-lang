@@ -1,0 +1,467 @@
+using System;
+using System.Globalization;
+using System.Collections.Generic;
+using System.IO;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Game.Scene;
+
+public partial class SceneDesigner {
+    // --- 检查器 -----------------------------------------------------------
+
+    // 检查器整数步进器行（标签 + -/按钮 + 数值框）；返回点击后的新值（未点击为 cur），步长 step。
+    public int Stepper(App app, Canvas c, Theme t, int x, int y, int w, string label, int cur, int step) {
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            x, y + app.Scale(6), label,
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int bw = app.Scale(26);
+        int valW = app.Scale(58);
+        int rx = x + w - bw * 2 - valW - app.Scale(8);
+        int minusId = new Button { Text = "-" }.Render(app, rx, y, bw);
+        int vX = rx + bw + app.Scale(4);
+        app.FillChrome(vX, y, valW, app.Scale(28), t.borderRadiusSmall, t.bgPrimary);
+        app.canvas.DrawRect(vX, y, valW, app.Scale(28),
+            app.theme.borderPrimary, 1);
+        int res = cur;
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "small", Style.SNormal()),
+            vX + app.Scale(6), y + app.Scale(6), SceneDoc.IntStr(cur),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int plusId = new Button { Text = "+" }.Render(app, vX + valW + app.Scale(4), y, bw);
+        if (Ui.Clicked(app, minusId)) { res = cur - step; app.RequestRedraw(); }
+        if (Ui.Clicked(app, plusId)) { res = cur + step; app.RequestRedraw(); }
+        return res;
+    }
+
+    // 同一行上并排的紧凑步进器（如 rows/cols 的标签对），返回逻辑同 Stepper。
+    public int StepperHalf(App app, Canvas c, Theme t, int x, int y, int w, string label, int cur, int step) {
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            x, y + app.Scale(6), label,
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int labW = app.Scale(30);
+        int bw = app.Scale(24);
+        int vX = x + labW + bw + app.Scale(3);
+        int valW = w - labW - bw * 2 - app.Scale(6);
+        if (valW < app.Scale(24)) { valW = app.Scale(24); }
+        int minusId = new Button { Text = "-", Class = "small" }.Render(app, x + labW, y, bw);
+        app.FillChrome(vX, y, valW, t.heightSmall, t.borderRadiusSmall, t.bgPrimary);
+        app.canvas.DrawRect(vX, y, valW, t.heightSmall,
+            app.theme.borderPrimary, 1);
+        int res = cur;
+        string vs = SceneDoc.IntStr(cur);
+        c.DrawText(vX + (valW - Canvas.MeasureText(vs, t.fontSizeSmall)) / 2,
+            y + (t.heightSmall - Canvas.FontHeight(t.fontSizeSmall)) / 2, vs,
+            t.textPrimary, t.fontSizeSmall);
+        int plusId = new Button { Text = "+", Class = "small" }.Render(app, vX + valW + app.Scale(3), y, bw);
+        if (Ui.Clicked(app, minusId)) { res = cur - step; app.RequestRedraw(); }
+        if (Ui.Clicked(app, plusId)) { res = cur + step; app.RequestRedraw(); }
+        return res;
+    }
+
+    // 渲染属性检查器：上半为场景属性（设计尺寸/缩放模式/窗口位置标题与开关/背景），下半为选中元素的属性（名称/层/点击动作/图片/文本/选项/几何/网格组/z 与值/锚点/操作按钮）；无选中时只显示场景区与提示。
+    public void RenderInspector(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        app.FillChrome(x, y, w, h, t.borderRadiusLarge, t.bgSecondary);
+        app.canvas.DrawRect(x, y, w, h,
+            app.theme.borderPrimary, 1);
+        int ix = x + app.Scale(12);
+        int iw = w - app.Scale(24);
+        int iy = y + app.Scale(12);
+        int rowH = app.Scale(34);
+        int halfW = (iw - app.Scale(10)) / 2;
+
+        c.DrawText(ix, iy, SceneDesigner.T("SCENE", "场景"), t.textTertiary, t.fontSizeSmall);
+        iy = iy + app.Scale(20);
+        int nw = this.StepperHalf(app, c, t, ix, iy, halfW, "W", this.doc.DesignWidth(), 20);
+        if (nw >= 16) { this.doc.designWidth = nw; }
+        int nh = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, "H", this.doc.DesignHeight(), 20);
+        if (nh >= 16) { this.doc.designHeight = nh; }
+        iy = iy + rowH;
+
+        // 缩放模式选择器。
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("scale", "缩放"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int mbw = (iw - app.Scale(52) - app.Scale(6)) / 4;
+        int mx = ix + app.Scale(52);
+        List<string> modes = new List<string>{
+            "Fit",
+            "Fill",
+            "Str",
+            "1:1" };
+        for (int m = 0; m < modes.Count; m = m + 1) {
+            int mid = new Button { Text = modes[m], Class = "small " + Style.TypeClass(this.ModeType(m)) }.Render(app, mx + m * (mbw + app.Scale(2)), iy, mbw);
+            if (Ui.Clicked(app, mid)) { this.doc.SetMode(m); app.RequestRedraw(); }
+        }
+        iy = iy + rowH;
+
+        // 窗口位置：显示时居中（默认）vs 手动 X/Y。
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("pos", "位置"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int pbw = (iw - app.Scale(52) - app.Scale(2)) / 2;
+        int ppx = ix + app.Scale(52);
+        int cId = new Button { Text = SceneDesigner.T("Center", "居中"), Class = "small " + Style.TypeClass(this.CenterType(1)) }.Render(app, ppx, iy, pbw);
+        if (Ui.Clicked(app, cId)) { this.doc.SetWinCenter(1); app.RequestRedraw(); }
+        int mId = new Button { Text = SceneDesigner.T("Manual", "手动"), Class = "small " + Style.TypeClass(this.CenterType(0)) }.Render(app, ppx + pbw + app.Scale(2), iy, pbw);
+        if (Ui.Clicked(app, mId)) { this.doc.SetWinCenter(0); app.RequestRedraw(); }
+        iy = iy + rowH;
+        if (this.doc.WinCenter() == 0) {
+            int nx = this.StepperHalf(app, c, t, ix, iy, halfW, "X", this.doc.WinPosX(), 20);
+            int ny = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, "Y", this.doc.WinPosY(), 20);
+            this.doc.SetWinPos(nx, ny);
+            iy = iy + rowH;
+        }
+
+        // 窗口标题：写进场景设计稿的 winTitle，生成代码用它建窗口
+        // 与画自绘标题栏；空 = 用场景名。
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("title", "标题"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdTitle = this.titleIn.Render(app, ix + app.Scale(52), iy,
+            iw - app.Scale(52), app.Scale(28));
+        this.doc.SetWinTitle(this.titleIn.GetText());
+        iy = iy + rowH;
+
+        // 窗口开关：可调整大小 / 标题栏。
+        int wkw = (iw - app.Scale(52) - app.Scale(2)) / 2;
+        int wkx = ix + app.Scale(52);
+        int rzId = new Button { Text = SceneDesigner.T("Resizable", "可缩放"), Class = "small " + Style.TypeClass(this.doc.WinResizable() ? 1 : 0) }.Render(app, wkx, iy, wkw);
+        if (Ui.Clicked(app, rzId)) { this.doc.SetWinResizable(!this.doc.WinResizable()); app.RequestRedraw(); }
+        int chId = new Button { Text = SceneDesigner.T("Title bar", "标题栏"), Class = "small " + Style.TypeClass(this.doc.WinChrome() ? 1 : 0) }.Render(app, wkx + wkw + app.Scale(2), iy, wkw);
+        if (Ui.Clicked(app, chId)) { this.doc.SetWinChrome(!this.doc.WinChrome()); app.RequestRedraw(); }
+        iy = iy + rowH;
+
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("bg", "背景"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdBg = this.bgIn.Render(app, ix + app.Scale(52), iy,
+            iw - app.Scale(52) - app.Scale(32), app.Scale(28));
+        int bgBr = new Button { Text = "…", Class = "small" }.Render(app, ix + iw - app.Scale(28), iy, app.Scale(28));
+        if (Ui.Clicked(app, bgBr)) { this.resPick = 2; app.RequestRedraw(); }
+        this.doc.SetBackground(this.bgIn.GetText());
+        iy = iy + rowH + app.Scale(6);
+
+        c.FillRect(ix, iy, iw, 1, t.borderPrimary);
+        iy = iy + app.Scale(10);
+
+        if (this.sel == null) {
+            c.DrawText(ix, iy, SceneDesigner.T("Select an element to edit", "选中一个元素进行编辑"),
+                t.textTertiary, t.fontSizeSmall);
+            return;
+        }
+
+        c.DrawText(ix, iy, SceneDesigner.T("ELEMENT · ", "元素 · ") + SceneDesigner.KindLabel(this.sel.Kind()),
+            t.textTertiary, t.fontSizeSmall);
+        iy = iy + app.Scale(20);
+
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("name", "名称"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdName = this.nameIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        string nn = this.nameIn.GetText();
+        // 名称是代码后置的变量名：与其它元素重名会生成重复字段，
+        // 等到编译才报错。改名撞上已有名字时拒绝提交并提示。
+        if (nn != this.sel.ename && this.UsedName(nn)) {
+            this.msg = SceneDesigner.T("name already used: ", "名称已被使用：") + nn;
+            this.nameIn.SetText(this.sel.ename);
+            app.RequestRedraw();
+        } else {
+            this.sel.ename = nn;
+        }
+        iy = iy + rowH;
+
+        // 归属层：空 = 基础层。新元素跟随当前编辑层；改层名
+        // 撞上不存在的层就当作新层创建（DocLayers 下次聚合）。
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("layer", "层"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdLayer = this.layerIn.Render(app, ix + app.Scale(52), iy,
+            iw - app.Scale(52), app.Scale(28));
+        string lyIn = this.layerIn.GetText();
+        // 输入框回显与真实值不同步：把真实层灌回输入框（选区
+        // 刚切换 / 改名撞回退时）。
+        if (lyIn != this.sel.layer) {
+            this.sel.layer = lyIn;
+        }
+        if (this.sel.layer.Length > 0 && this.editLayer.Length == 0) {
+            // 在基础层上把元素划进命名层后自动切过去，保持可见。
+            this.editLayer = this.sel.layer;
+            this.layerIn.SetText(this.sel.layer);
+        }
+        iy = iy + rowH;
+
+        // onClick 动作：内置动作（ShowLayer:bag / ToggleLayer:equip /
+        // HideLayer:self / CloseAllLayers / OpenScene:menu）或代码后置
+        // 方法名（OnBuyClicked，经 SceneDoc.SetHandler 注册），
+        // 多个用 ';' 串接。运行时 SceneView.HandleClicks 按层过滤
+        // 命中后解释执行。
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("click", "点击"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int ckBtnW = app.Scale(36);
+        int ckInpW = iw - app.Scale(52) - ckBtnW - app.Scale(4);
+        this.inpIdClick = this.clickIn.Render(app, ix + app.Scale(52), iy,
+            ckInpW, app.Scale(28));
+        int ckNavId = new Button { Text = SceneDesigner.T("code", "代码"), Class = "small" }.Render(app,
+            ix + app.Scale(52) + ckInpW + app.Scale(4), iy, ckBtnW);
+        if (Ui.Clicked(app, ckNavId)) {
+            string h = this.clickIn.GetText();
+            if (h == "") {
+                string nm = this.sel.Name();
+                if (nm == "") { nm = "Element"; }
+                h = "On" + nm + "Click";
+                this.clickIn.SetText(h);
+                this.sel.On("Click", h);
+            }
+            this.openCodeBehindElement = "handler:" + h;
+            this.openCodeBehindRequested = true;
+            this.msg = SceneDesigner.T("navigating to handler: ", "跳转到事件处理器: ") + h;
+            app.RequestRedraw();
+        }
+        string ckIn = this.clickIn.GetText();
+        if (ckIn != this.sel.OnAction("Click")) {
+            this.sel.On("Click", ckIn);
+        }
+        iy = iy + rowH;
+
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("image", "图片"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdImg = this.imgIn.Render(app, ix + app.Scale(52), iy,
+            iw - app.Scale(52) - app.Scale(32), app.Scale(28));
+        int imBr = new Button { Text = "…", Class = "small" }.Render(app, ix + iw - app.Scale(28), iy, app.Scale(28));
+        if (Ui.Clicked(app, imBr)) { this.resPick = 1; app.RequestRedraw(); }
+        this.sel.image = this.imgIn.GetText();
+        iy = iy + rowH;
+
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("text", "文本"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdText = this.textIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.sel.text = this.textIn.GetText();
+        iy = iy + rowH;
+
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("items", "选项"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdItems = this.itemsIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.sel.items = this.itemsIn.GetText();
+        iy = iy + rowH;
+
+        // CSS 样式类（皮肤美化、主题定制，与 Gui.Control.Class 统一）
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("class", "类名"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdClass = this.classIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.sel.cssClass = this.classIn.GetText();
+        iy = iy + rowH;
+
+        // 染色 Tint (RGB)：文本框 + 真取色器
+        iy = iy + this.RenderColorRow(app, c, t, ix, iy, iw);
+
+        // 透明度 Alpha (0..255)
+        int na = this.StepperHalf(app, c, t, ix, iy, iw, SceneDesigner.T("alpha", "透明度"), this.sel.A(), 15);
+        if (na < 0) { na = 0; }
+        if (na > 255) { na = 255; }
+        if (na != this.sel.A()) {
+            this.sel.Tint(this.sel.R(), this.sel.G(), this.sel.B(), na);
+        }
+        iy = iy + rowH;
+
+        // 定位模式：0 = 流式(Flex), 1 = 浮动(Float/Absolute)
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("pos", "定位"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int posBw = (iw - app.Scale(52) - app.Scale(2)) / 2;
+        int posBx = ix + app.Scale(52);
+        int flowId = new Button { Text = SceneDesigner.T("Flow", "流式"), Class = "small " + Style.TypeClass(this.sel.Position() == 0 ? 1 : 0) }.Render(app, posBx, iy, posBw);
+        if (Ui.Clicked(app, flowId)) { this.sel.SetPosition(0); app.RequestRedraw(); }
+        int floatId = new Button { Text = SceneDesigner.T("Float", "浮动"), Class = "small " + Style.TypeClass(this.sel.Position() == 1 ? 1 : 0) }.Render(app, posBx + posBw + app.Scale(2), iy, posBw);
+        if (Ui.Clicked(app, floatId)) { this.sel.SetPosition(1); app.RequestRedraw(); }
+        iy = iy + rowH;
+
+        this.sel.x = this.StepperHalf(app, c, t, ix, iy, halfW, "x", this.sel.X(), 1);
+        this.sel.y = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, "y", this.sel.Y(), 1);
+        iy = iy + rowH;
+        int ww = this.StepperHalf(app, c, t, ix, iy, halfW, "w", this.sel.W(), 1);
+        int hh = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, "h", this.sel.H(), 1);
+        if ((ww >= 1 && ww != this.sel.W()) || (hh >= 1 && hh != this.sel.H())) {
+            // 原地缩放：保持设计空间左上角不变，使锚定的
+            // 元素在尺寸变化时不漂移。
+            int kL = this.DesignLeft(this.sel);
+            int kT = this.DesignTop(this.sel);
+            if (ww >= 1) { this.sel.w = ww; }
+            if (hh >= 1) { this.sel.h = hh; }
+            this.SetDesignPos(this.sel, kL, kT);
+        }
+        iy = iy + rowH;
+
+        // 网格组：rows x cols 个单元并带间距（任何元素都可变为网格组；
+        // 格子类元素默认即为网格组）。
+        int nr = this.StepperHalf(app, c, t, ix, iy, halfW, SceneDesigner.T("rows", "行"), this.sel.Rows(), 1);
+        int nc = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, SceneDesigner.T("cols", "列"), this.sel.Cols(), 1);
+        this.sel.Grid(nr, nc, this.sel.GapX(), this.sel.GapY());
+        iy = iy + rowH;
+        int ngx = this.StepperHalf(app, c, t, ix, iy, halfW, SceneDesigner.T("gapX", "横距"), this.sel.GapX(), 1);
+        int ngy = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, SceneDesigner.T("gapY", "纵距"), this.sel.GapY(), 1);
+        if (ngx >= 0) { this.sel.gapX = ngx; }
+        if (ngy >= 0) { this.sel.gapY = ngy; }
+        iy = iy + rowH;
+
+        int nz = this.StepperHalf(app, c, t, ix, iy, halfW, "z", this.sel.Z(), 1);
+        this.sel.z = nz;
+        int nv = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, SceneDesigner.T("val", "值"), this.sel.Value(), 5);
+        if (nv < 0) { nv = 0; }
+        this.sel.SetValue(nv);
+        iy = iy + rowH;
+
+        // 九宫格锚点。
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("anchor", "锚点"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int abw = t.heightSmall;
+        int ax0 = ix + app.Scale(52);
+        for (int r = 0; r < 3; r = r + 1) {
+            for (int col = 0; col < 3; col = col + 1) {
+                int av = col * 500;
+                int avy = r * 500;
+                string glyph = "·";
+                if (this.sel.AnchorX() == av && this.sel.AnchorY() == avy) { glyph = "●"; }
+                int aid = new Button { Text = glyph, Class = "small" }.Render(app,
+                    ax0 + col * (abw + app.Scale(3)),
+                    iy + r * (abw + app.Scale(3)), abw);
+                if (Ui.Clicked(app, aid)) {
+                    // 原地重新锚定：重算 x/y 偏移，使
+                    // 元素保持在画布上的位置。
+                    int kL = this.DesignLeft(this.sel);
+                    int kT = this.DesignTop(this.sel);
+                    this.sel.AnchorTo(av, avy);
+                    this.SetDesignPos(this.sel, kL, kT);
+                    app.RequestRedraw();
+                }
+            }
+        }
+        iy = iy + 3 * (abw + app.Scale(3)) + app.Scale(8);
+
+        int btnRowH = t.heightSmall + app.Scale(6);
+        int visId = new Button { Text = this.VisLabel(), Class = "small" }.Render(app, ix, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, visId)) { this.sel.SetVisible(!this.sel.Visible()); app.RequestRedraw(); }
+        int dupId = new Button { Text = SceneDesigner.T("Duplicate", "复制"), Class = "small" }.Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, dupId)) { this.DuplicateSel(); app.RequestRedraw(); }
+        iy = iy + btnRowH;
+        int lkId = new Button { Text = this.sel.Locked() ? SceneDesigner.T("Unlock", "解锁") : SceneDesigner.T("Lock", "锁定"), Class = "small" }.Render(app, ix, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, lkId)) { this.sel.SetLocked(!this.sel.Locked()); app.RequestRedraw(); }
+        int upId = new Button { Text = SceneDesigner.T("forward", "上移一层"), Class = "small" }.Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, upId)) { this.RaiseSel(1); app.RequestRedraw(); }
+        iy = iy + btnRowH;
+        int dnId = new Button { Text = SceneDesigner.T("back", "下移一层"), Class = "small" }.Render(app, ix, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, dnId)) { this.RaiseSel(0 - 1); app.RequestRedraw(); }
+        int delId = new Button { Text = SceneDesigner.T("Delete", "删除"), Class = "error small" }.Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
+        if (Ui.Clicked(app, delId)) { this.DeleteSel(); app.RequestRedraw(); }
+    }
+
+    // 可见性按钮的文本：选中元素可见时"显示"，否则"隐藏"（无选中按隐藏处理）。
+    public string VisLabel() {
+        if (this.sel != null && this.sel.Visible()) { return SceneDesigner.T("Visible", "显示"); }
+        return SceneDesigner.T("Hidden", "隐藏");
+    }
+
+    // 缩放模式选择器按钮的类型码：当前文档模式返回 1（高亮），否则 0。
+    public int ModeType(int m) {
+        if (m == this.doc.Mode()) { return 1; }
+        return 0;
+    }
+
+    // 窗口位置按钮的类型码：want 与文档当前 WinCenter 一致返回 1（高亮），否则 0。
+    public int CenterType(int want) {
+        if (want == this.doc.WinCenter()) { return 1; }
+        return 0;
+    }
+
+    // 颜色行（元素属性区）：文本框 + 真取色器（点开是 SV/色相面板）。
+    // 独立成方法，用例能无头渲染这一行，断言两条写回路径（取色器改
+    // 色 → 文本 + 元素染色；手改文本 → 取色器跟随）。
+    // 返回本行占用的高度。
+    public int RenderColorRow(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("color", "颜色"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int swatchW = app.Scale(28);
+        int colorInpW = iw - app.Scale(52) - swatchW - app.Scale(4);
+        this.inpIdColor = this.colorIn.Render(app, ix + app.Scale(52), iy, colorInpW, app.Scale(28));
+        string colStr = this.colorIn.GetText();
+        int curPacked = SceneView.PackColor(this.sel.R(), this.sel.G(), this.sel.B(), 255);
+        // 取色器：色块就是它的触发条（弹层落在色块下方）。透明度不
+        // 由取色器管——下面那行"透明度"步进器才是 alpha 的唯一出处，
+        // 取色器关掉透明度条（alpha 恒 255），写回时保留场景的 alpha。
+        if (this.colorPick == null) {
+            this.colorPick = new ColorPicker(curPacked);
+            this.colorPick.Mode = "hex";
+            this.colorPick.SetShowAlpha(false);
+            this.colorPickVal = this.colorPick.Value();
+        }
+        int swatchX = ix + app.Scale(52) + colorInpW + app.Scale(4);
+        this.colorPick.RenderIn(app, swatchX, iy, swatchW, app.Scale(28));
+        // 文本 → 取色器：只有文本真的被改过（不是我们自己写回的）才
+        // 同步。否则两条路径会互相顶：用户刚在弹层里挑的色，被上一
+        // 帧的旧文本顶回去。
+        if (colStr != this.colorTextShadow) {
+            ColorParseResult pr = ColorPicker.HexParse(colStr);
+            if (pr.ok) {
+                this.colorPick.SetColor(pr.packed);
+                this.colorPickVal = this.colorPick.Value();
+            }
+            this.colorTextShadow = colStr;
+        }
+        // 取色器 → 文本：用户在弹层里拖了色盘，模型值变了就翻成
+        // hex 写回输入框。
+        int pickVal = this.colorPick.Value();
+        if (pickVal != this.colorPickVal) {
+            this.colorPickVal = pickVal;
+            colStr = this.colorPick.FormatAs("hex");
+            this.colorIn.SetText(colStr);
+            this.colorTextShadow = colStr;
+        }
+        if (colStr != "") {
+            ColorParseResult pv = ColorPicker.HexParse(colStr);
+            if (pv.ok) {
+                // 分量要走 RgbOf 掩码再拆：打包色 alpha≥0x80 时是负
+                // int，裸除会算出负分量（-231 这种），元素颜色直接变花。
+                int rgb = ColorPicker.RgbOf(pv.packed);
+                int pr = (rgb / 65536) % 256;
+                int pg = (rgb / 256) % 256;
+                int pb = rgb % 256;
+                if (pr != this.sel.R() || pg != this.sel.G() || pb != this.sel.B()) {
+                    this.sel.Tint(pr, pg, pb, this.sel.A());
+                }
+            }
+        }
+        return app.Scale(34);
+    }
+
+    // 渲染底部状态栏：场景设计稿、元素计数与最近一条操作提示 msg。
+    public void RenderStatus(App app, Canvas c, Theme t, int x, int y, int w) {
+        c.DrawText(x, y, ".html · " + SceneDoc.IntStr(this.doc.Count())
+            + SceneDesigner.T(" elements   ", " 个元素   ") + this.msg,
+            t.textTertiary, t.fontSizeTiny);
+    }
+}
