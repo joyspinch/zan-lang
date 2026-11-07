@@ -69,6 +69,8 @@ AR="$PRE/bin/llvm-ar"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RT="$ROOT/src/runtime"
+ACCEL="$ROOT/src/accel"
+EMBED="$ROOT/src/embed"
 
 # The compiler-rt builtins live in a versioned directory; find the one that
 # matches this NDK instead of hardcoding a version.
@@ -103,16 +105,16 @@ for pair in android-x64:x86_64 android-arm64:aarch64; do
     # Crypto as an archive member -- see scripts/build_linux_rt.sh for why a
     # bare .o on the link line is wrong here.
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
+        -I "$RT" -I "$ACCEL" -O2 -ffunction-sections -fdata-sections -c "$ACCEL/zan_hw_accel.c" -o "$out/zan_crypto.o"
     rm -f "$out/libzancrypto.a"
     "$AR" rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$RT/zan_embed_api.c" \
+        -I "$RT" -I "$EMBED" -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$EMBED/zan_embed_api.c" \
         -o "$out/zan_embed_api.o"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
         -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
-        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$RT/zan_inflate.c" \
+        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$EMBED/zan_inflate.c" \
         -o "$out/zan_inflate.o"
 
     # ---- the NDK sysroot subset the cross link needs ----------------------

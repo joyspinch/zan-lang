@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "miniz_tinfl.c"
+#include "../common/miniz_tinfl.c"
 
 #define ZAN_EMBED_MAX_RAW_LEN (512u * 1024u * 1024u)
 

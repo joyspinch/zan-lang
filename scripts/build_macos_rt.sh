@@ -19,6 +19,9 @@ set -eu
 ZIG=${1:-zig}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RT="$ROOT/src/runtime"
+ACCEL="$ROOT/src/accel"
+EMBED="$ROOT/src/embed"
+DRV="$ROOT/src/drivers"
 
 for pair in arm64:aarch64 x64:x86_64; do
     sub=${pair%%:*}
@@ -68,29 +71,29 @@ for pair in arm64:aarch64 x64:x86_64; do
     # Rebuild this together with zanrt_timer.o: both derive from the same
     # rt_hw_accel.c, and mixing generations would define the same symbol
     # twice (TASKS.md A493).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
-        -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -I "$ACCEL" -O2 -ffunction-sections -fdata-sections \
+        -c "$ACCEL/zan_hw_accel.c" -o "$out/zan_crypto.o"
     rm -f "$out/libzancrypto.a"
     "$ZIG" ar rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
     # GUI compatibility stubs (event seq/flag, font ascent, full surface presentation).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
-        -c "$RT/gui_compat_mac.c" -o "$out/zanrt_gui.o"
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -I "$DRV" -O2 -ffunction-sections -fdata-sections \
+        -c "$DRV/gui/gui_compat_mac.c" -o "$out/zanrt_gui.o"
     # Embedded-resource API + compressed-resource decoder: GUI programs pull
     # skins/icons through the auto-embed path, so irgen sets uses_embed_api /
     # uses_inflate and the cross link injects these two objects (same flags as
     # the ZAN_EMBED_OBJ / ZAN_INFLATE_OBJ recipes in CMakeLists.txt).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
-        -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -I "$EMBED" -O2 -ffunction-sections -fdata-sections \
+        -c "$EMBED/zan_embed_api.c" -o "$out/zan_embed_api.o"
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections \
         -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
         -I "$ROOT/src/common" \
-        -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
+        -c "$EMBED/zan_inflate.c" -o "$out/zan_inflate.o"
     echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_crash.o zanrt_decimal.o libzancrypto.a zanrt_gui.o zan_embed_api.o zan_inflate.o"
 done
 
 mkdir -p "$ROOT/toolchain/ios/arm64"
-"$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
-    -c "$RT/gui_compat_mac.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
+"$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -I "$DRV" -O2 -ffunction-sections -fdata-sections \
+    -c "$DRV/gui/gui_compat_mac.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
 echo "built toolchain/ios/arm64: zanrt_gui.o"
 

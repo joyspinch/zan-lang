@@ -67,8 +67,6 @@ void zan_timer_stats(long long *initialized, long long *num, long long *round);
 int64_t zan_time_epoch_ms(void);
 int32_t zan_time_local_offset_minutes(int64_t unix_seconds);
 
-#include "rt_hw_accel.h"
-
 #ifdef __cplusplus
 }
 #endif

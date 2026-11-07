@@ -18,6 +18,8 @@ set -eu
 ZIG=${1:-zig}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RT="$ROOT/src/runtime"
+ACCEL="$ROOT/src/accel"
+EMBED="$ROOT/src/embed"
 
 for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     sub=${pair%%:*}
@@ -62,19 +64,19 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     # rt_hw_accel.c, and mixing generations would define the same symbol
     # twice (TASKS.md A493).
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
-        -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
+        -I "$RT" -I "$ACCEL" -O2 -ffunction-sections -fdata-sections -c "$ACCEL/zan_hw_accel.c" -o "$out/zan_crypto.o"
     rm -f "$out/libzancrypto.a"
     "$ZIG" ar rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
     # Embedded-resource API + compressed-resource decoder: GUI programs pull
     # skins/icons through the auto-embed path, so the cross link injects these
     # two objects (same flags as the ZAN_INFLATE_OBJ recipe in CMakeLists.txt).
-    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
-        -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -I "$RT" -I "$EMBED" -O2 -ffunction-sections -fdata-sections \
+        -c "$EMBED/zan_embed_api.c" -o "$out/zan_embed_api.o"
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections \
         -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
         -I "$ROOT/src/common" \
-        -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
+        -c "$EMBED/zan_inflate.c" -o "$out/zan_inflate.o"
     # The small-object allocator's memory object: only linux-musl ships it (the
     # other arches use the platform allocator). It was missing here while the
     # stale-check table listed it -- the recipe and the check disagreed about

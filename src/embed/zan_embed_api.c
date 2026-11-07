@@ -1,7 +1,6 @@
 #include <string.h>
 #include <stdlib.h>
-
-#include "rt_timer.h"
+#include <stdint.h>
 
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"

@@ -52,14 +52,13 @@ RT_DECIMAL = ["src/runtime/rt_decimal.c", "src/runtime/rt_decimal.h"]
 RT_TIMER = ["src/runtime/rt_timer.c", "src/runtime/rt_timer.h",
             "src/runtime/rt_crash.h"]
 RT_CRASH = ["src/runtime/rt_crash.c", "src/runtime/rt_crash.h"]
-RT_CRYPTO = ["src/runtime/rt_hw_accel.c", "src/runtime/rt_hw_accel.h"]
+RT_CRYPTO = ["src/accel/zan_hw_accel.c", "src/accel/zan_hw_accel.h"]
 RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
                                      # links alongside as its own object (build_cross_rt.cmd)
 RT_GUI_MAC = ["src/drivers/gui/gui_compat_mac.c"]
 RT_MEM = ["src/runtime/rt_mem.c"]
-EMBED = ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h",
-         "src/common/host_oom.h"]
-INFLATE = ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c",
+EMBED = ["src/embed/zan_embed_api.c", "src/common/host_oom.h"]
+INFLATE = ["src/embed/zan_inflate.c", "src/common/miniz_tinfl.c",
            "src/common/miniz.h"]
 WASM_GUI = ["src/drivers/gui/gui_runtime.c", "src/drivers/gui/gui_gl_backend.c",
             "src/drivers/gui/gui_gl_context.c", "src/drivers/gui/gui_runtime_wasm.c",
@@ -316,10 +315,8 @@ ARTIFACTS = [
     ("toolchain/ohos-arm64/zanrt_timer.o", RT_TIMER, "runtime"),
     ("toolchain/ohos-arm64/zanrt_crash.o", RT_CRASH, "runtime"),
     ("toolchain/ohos-arm64/libzancrypto.a", RT_CRYPTO, "runtime"),
-    ("toolchain/ohos-arm64/zan_embed_api.o",
-     ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h"], "runtime"),
-    ("toolchain/ohos-arm64/zan_inflate.o",
-     ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c"], "runtime"),
+    ("toolchain/ohos-arm64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/ohos-arm64/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/ohos-arm64/zap_main.o", ["toolchain/ohos-x64/zap_main.c"], "runtime"),
     ("toolchain/ohos-x64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/ohos-x64/zanrt_sync.o", RT_SYNC, "runtime"),
@@ -328,10 +325,8 @@ ARTIFACTS = [
     ("toolchain/ohos-x64/zanrt_timer.o", RT_TIMER, "runtime"),
     ("toolchain/ohos-x64/zanrt_crash.o", RT_CRASH, "runtime"),
     ("toolchain/ohos-x64/libzancrypto.a", RT_CRYPTO, "runtime"),
-    ("toolchain/ohos-x64/zan_embed_api.o",
-     ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h"], "runtime"),
-    ("toolchain/ohos-x64/zan_inflate.o",
-     ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c"], "runtime"),
+    ("toolchain/ohos-x64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/ohos-x64/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/ohos-x64/zap_main.o", ["toolchain/ohos-x64/zap_main.c"], "runtime"),
     # The OHOS NDK sysroot subset (crt + libc.a + compiler-rt builtins/unwind)
     # tracks the SDK itself, not repo sources -- report-only, refreshed by
@@ -482,6 +477,10 @@ def rebuild_cmd(artifact, zig, ndk):
     the ohos stub .so pair is NDK-built by hand). Mirrors do_rebuild /
     build_cross_rt.cmd flag for flag."""
     rt = "src/runtime"
+    accel = "src/accel"
+    embed = "src/embed"
+    drv = "src/drivers"
+    tp = "src/third_party"
     d, name = os.path.split(artifact.replace("\\", "/"))
     if d.startswith("toolchain/"):
         d = d[len("toolchain/"):]
@@ -498,35 +497,35 @@ def rebuild_cmd(artifact, zig, ndk):
                     "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
                     "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
                     "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common",
-                    "-c", f"{rt}/zan_inflate.c"]
+                    "-c", f"{embed}/zan_inflate.c"]
         if name == "zanrt_gui.o":
             # Core text/drawing only; retain the .cmd's FreeType detection and
             # bitmap-font fallback, with the same static export contract.
             cmd = [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
-                   "-I", rt]
+                   "-I", rt, "-I", drv, "-I", tp]
             ft_inc = _find_freetype_inc()
             with_freetype = (bool(ft_inc)
                              and os.path.isfile(os.path.join(ft_inc, "ft2build.h"))
                              and os.path.isfile("toolchain/wasm32/libfreetype.a"))
             if with_freetype:
                 cmd += ["-I", ft_inc, "-I", "toolchain/wasm32/freetype-shim"]
-            cmd += ["-O2", "-c", f"{rt}/gui_runtime.c", "-DZAN_GUI_WASM",
+            cmd += ["-O2", "-c", f"{drv}/gui/gui_runtime.c", "-DZAN_GUI_WASM",
                     "-DZAN_GUI_STATIC"]
             if with_freetype:
                 cmd += ["-DZAN_GUI_FREETYPE"]
             return cmd
         feature_sources = {
-            "zanrt_image.o": ("zan_image.c", "ZAN_IMAGE_STATIC"),
-            "zanrt_audio.o": ("zan_audio.c", "ZAN_AUDIO_STATIC"),
-            "zanrt_game.o": ("zan_game.c", "ZAN_GAME_STATIC"),
+            "zanrt_image.o": (f"{drv}/image/zan_image.c", "ZAN_IMAGE_STATIC"),
+            "zanrt_audio.o": (f"{drv}/audio/zan_audio.c", "ZAN_AUDIO_STATIC"),
+            "zanrt_game.o": (f"{drv}/game/zan_game.c", "ZAN_GAME_STATIC"),
         }
         if name in feature_sources:
             source, static_macro = feature_sources[name]
             cmd = [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
-                   "-I", rt]
+                   "-I", rt, "-I", drv, "-I", tp]
             if name == "zanrt_image.o":
-                cmd += ["-I", f"{rt}/libwebp/src"]
-            return cmd + ["-O2", "-c", f"{rt}/{source}", f"-D{static_macro}"]
+                cmd += ["-I", f"{tp}/libwebp/src"]
+            return cmd + ["-O2", "-c", source, f"-D{static_macro}"]
         if name == "zanrt_syncw.o":
             return [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
                     "-I", rt, "-O2", "-c", f"{rt}/rt_sync_wasm.c"]
@@ -552,13 +551,13 @@ def rebuild_cmd(artifact, zig, ndk):
             return None
         if name == "zan_embed_api.o":
             return [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28",
-                    "-g0", "-std=c11", "-fPIC", "-I", rt, "-I", "src/common",
-                    "-O2", "-c", f"{rt}/zan_embed_api.c"]
+                    "-g0", "-std=c11", "-fPIC", "-I", rt, "-I", embed, "-I", "src/common",
+                    "-O2", "-c", f"{embed}/zan_embed_api.c"]
         if name == "zan_inflate.o":
             return [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28",
                     "-g0", "-std=c11", "-fPIC", "-DMINIZ_NO_ARCHIVE_APIS",
                     "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
-                    "-I", rt, "-I", "src/common", "-O2", "-c", f"{rt}/zan_inflate.c"]
+                    "-I", rt, "-I", "src/common", "-O2", "-c", f"{embed}/zan_inflate.c"]
         base = [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28"]
         if src == "rt_io.c":
             # io_mt compiles rt_io.c (+ZAN_CO_DRIVER), never rt_io_mt.c.
@@ -592,11 +591,11 @@ def rebuild_cmd(artifact, zig, ndk):
                 (c11 + (["-mcpu=generic+sha2"] if arch == "aarch64" else [])
                     + ["-I", rt, "-c", f"{rt}/rt_timer.c"]),
             "zan_embed_api.o":
-                (c11 + ["-I", rt, "-I", "src/common", "-c", f"{rt}/zan_embed_api.c"]),
+                (c11 + ["-I", rt, "-I", embed, "-I", "src/common", "-c", f"{embed}/zan_embed_api.c"]),
             "zan_inflate.o":
                 (c11 + ["-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
                         "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-I", rt, "-I", "src/common",
-                        "-c", f"{rt}/zan_inflate.c"]),
+                        "-c", f"{embed}/zan_inflate.c"]),
         }
         if name not in table:
             return None  # the OHOS NDK's libEGL/libGLESv3/libfreetype: copied
@@ -621,10 +620,10 @@ def rebuild_cmd(artifact, zig, ndk):
         if name == "zanrt_gui.o":
             # gui_compat_mac.c is self-contained -- no libc headers needed.
             return ([zig, "cc", "-target", "aarch64-ios.14.0", "-g0",
-                     "-std=c11", "-fPIC", "-I", rt, "-O2",
-                     "-c", f"{rt}/gui_compat_mac.c"])
+                     "-std=c11", "-fPIC", "-I", rt, "-I", drv, "-O2",
+                     "-c", f"{drv}/gui/gui_compat_mac.c"])
         if name == "zan_embed_api.o":
-            return base + c11 + ["-c", f"{rt}/zan_embed_api.c"]
+            return base + c11 + ["-I", embed, "-c", f"{embed}/zan_embed_api.c"]
         if name == "zan_inflate.o":
             # Same flag set as build_cross_rt.cmd's ios line: no -I rt,
             # miniz trim defines + -DMINIZ_NO_ARCHIVE_WRITERS, -I src/common.
@@ -634,7 +633,7 @@ def rebuild_cmd(artifact, zig, ndk):
                      "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
                      "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
                      "-DMINIZ_NO_ARCHIVE_WRITERS",
-                     "-I", "src/common", "-c", f"{rt}/zan_inflate.c"])
+                     "-I", "src/common", "-c", f"{embed}/zan_inflate.c"])
         return base + c11 + ["-c", f"{rt}/{src}"]
     else:
         # win-*: CI builds these with the matching MSYS2 arch clang
@@ -650,15 +649,15 @@ def rebuild_cmd(artifact, zig, ndk):
     if d.startswith("macos/") and name == "zanrt_gui.o":
         # macOS GUI shim object compiles gui_compat_mac.c, not rt_gui.c.
         return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC",
-                "-I", rt, "-O2", "-c", f"{rt}/gui_compat_mac.c"]
+                "-I", rt, "-I", drv, "-O2", "-c", f"{drv}/gui/gui_compat_mac.c"]
     if name == "zan_embed_api.o":
         return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC",
-                "-I", rt, "-O2", "-c", f"{rt}/zan_embed_api.c"]
+                "-I", rt, "-I", embed, "-O2", "-c", f"{embed}/zan_embed_api.c"]
     if name == "zan_inflate.o":
         return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC", "-O2",
                 "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO",
                 "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common",
-                "-c", f"{rt}/zan_inflate.c"]
+                "-c", f"{embed}/zan_inflate.c"]
     if not zig:
         return None
     cmd = [zig, "cc", "-target", target, "-g0", "-fPIC", "-I", rt, "-O2"]
@@ -723,6 +722,9 @@ def do_rebuild():
     print(f"Using NDK: {ndk}")
 
     rt = "src/runtime"
+    accel = "src/accel"
+    embed = "src/embed"
+    drv = "src/drivers"
 
     if zig:
         for name, arch in [("linux-musl", "x86_64"), ("linux-arm64", "aarch64"), ("linux-riscv64", "riscv64")]:
@@ -734,8 +736,8 @@ def do_rebuild():
             subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_sync.c", "-o", f"{outdir}/zanrt_sync.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_file.c", "-o", f"{outdir}/zanrt_file.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
-            subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
-            subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common", "-c", f"{rt}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-I", embed, "-O2", "-c", f"{embed}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common", "-c", f"{embed}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
             if name == "linux-musl":
                 subprocess.run([zig, "cc", "-target", "x86_64-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_mem.c", "-o", f"{outdir}/zanrt_mem.o"], check=True)
 
@@ -749,9 +751,9 @@ def do_rebuild():
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_file.c", "-o", f"{outdir}/zanrt_file.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_decimal.c", "-o", f"{outdir}/zanrt_decimal.o"], check=True)
-            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/gui_compat_mac.c", "-o", f"{outdir}/zanrt_gui.o"], check=True)
-            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
-            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common", "-c", f"{rt}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-I", drv, "-O2", "-c", f"{drv}/gui/gui_compat_mac.c", "-o", f"{outdir}/zanrt_gui.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-I", embed, "-O2", "-c", f"{embed}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common", "-c", f"{embed}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
 
         outdir = "toolchain/wasm32"
         os.makedirs(outdir, exist_ok=True)
@@ -800,8 +802,8 @@ def do_rebuild():
                 subprocess.run(base_cmd + ["-std=c11", "-c", f"{rt}/rt_sync.c", "-o", f"{outdir}/zanrt_sync.o"], check=True)
                 subprocess.run(base_cmd + ["-std=c11", "-c", f"{rt}/rt_file.c", "-o", f"{outdir}/zanrt_file.o"], check=True)
                 subprocess.run(base_cmd + ["-std=c11", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
-                subprocess.run(base_cmd + ["-std=c11", "-I", "src/common", "-c", f"{rt}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
-                subprocess.run(base_cmd + ["-std=c11", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-I", "src/common", "-c", f"{rt}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
+                subprocess.run(base_cmd + ["-std=c11", "-I", embed, "-I", "src/common", "-c", f"{embed}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
+                subprocess.run(base_cmd + ["-std=c11", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-I", "src/common", "-c", f"{embed}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
 
     print("Rebuild completed successfully.")
     return 0

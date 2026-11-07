@@ -30,6 +30,8 @@ if [ -z "$ZIG" ]; then
 fi
 
 RT=src/runtime
+ACCEL=src/accel
+EMBED=src/embed
 OUT=toolchain/wasm32
 mkdir -p "$OUT"
 
@@ -51,7 +53,7 @@ build zanrt_crash.o    rt_crash.c   -std=c11  -I "$RT" -O2
 # whole archive into every wasm link; the member form lets the linker
 # drop it for programs without native crypto references (same reason the
 # linux/macos blocks use an archive).
-build zan_crypto.o    rt_hw_accel.c -std=c11 -I "$RT" -O2
+"$ZIG" cc -target wasm32-wasi -g0 -std=c11 -I "$RT" -I "$ACCEL" -O2 -c "$ACCEL/zan_hw_accel.c" -o "$OUT/zan_crypto.o"
 rm -f "$OUT/libzancrypto.a"
 "$ZIG" ar rcs "$OUT/libzancrypto.a" "$OUT/zan_crypto.o"
 # Compressed embedded icons/skins need the same decoder as native targets:
@@ -59,7 +61,7 @@ rm -f "$OUT/libzancrypto.a"
 "$ZIG" cc -target wasm32-wasi -g0 -std=c11 -O2 \
     -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
     -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
-    -I src/common -c "$RT/zan_inflate.c" -o "$OUT/zan_inflate.o"
+    -I src/common -c "$EMBED/zan_inflate.c" -o "$OUT/zan_inflate.o"
 # Single-threaded sync equivalents (threads run bodies synchronously,
 # atomics are plain cells): gnu11 exposes what the wasm shells need.
 build zanrt_syncw.o   rt_sync_wasm.c -std=gnu11 -I "$RT" -O2

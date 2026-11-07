@@ -357,7 +357,6 @@ add_custom_command(
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.h
             ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_diag.c
@@ -403,7 +402,7 @@ add_custom_command(TARGET zanc POST_BUILD
 
 # ---- Hardware-accelerated crypto runtime (archive, not a bare object) ----
 #
-# rt_hw_accel.c used to be #included at the end of rt_timer.c, so every
+# zan_hw_accel.c used to be #included at the end of rt_timer.c, so every
 # program linked the whole SHA/AES/SM3/SM4/AVX2 block (53,408 B of .text)
 # even when it used none of it. A bare .o on the link line is loaded whole --
 # section GC cannot trim it -- so the fix is to ship the code as an *archive
@@ -419,14 +418,14 @@ set(ZAN_RT_CRYPTO_ARCHIVE "${CMAKE_BINARY_DIR}/libzancrypto.a")
 add_custom_command(
     OUTPUT ${ZAN_RT_CRYPTO_ARCHIVE}
     COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
+            -I ${CMAKE_SOURCE_DIR}/src/accel -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+            -c ${CMAKE_SOURCE_DIR}/src/accel/zan_hw_accel.c
             -o ${ZAN_RT_CRYPTO_OBJ}
     COMMAND ${CMAKE_COMMAND} -E rm -f ${ZAN_RT_CRYPTO_ARCHIVE}
     COMMAND ${CMAKE_AR} rc ${ZAN_RT_CRYPTO_ARCHIVE} ${ZAN_RT_CRYPTO_OBJ}
     COMMAND ${CMAKE_RANLIB} ${ZAN_RT_CRYPTO_ARCHIVE}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.h
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/accel/zan_hw_accel.c
+            ${CMAKE_SOURCE_DIR}/src/accel/zan_hw_accel.h
     COMMENT "Building hardware-accelerated crypto archive (libzancrypto)"
     VERBATIM)
 add_custom_target(zanrt_crypto ALL DEPENDS ${ZAN_RT_CRYPTO_ARCHIVE})
@@ -438,7 +437,7 @@ add_custom_command(TARGET zanc POST_BUILD
             $<TARGET_FILE_DIR:zanc>/libzancrypto${CMAKE_C_STATIC_LIBRARY_SUFFIX}
     VERBATIM)
 
-# Generic embedded-resource read API (src/runtime/zan_embed_api.c). The data
+# Generic embedded-resource read API (src/embed/zan_embed_api.c). The data
 # table is registered by a generated object (scripts/gen_embed.ps1) when a
 # program embeds resources; the API object itself is injected whenever a
 # program *references* the zan_embed_* functions (e.g. any GUI program calling
@@ -449,10 +448,10 @@ set(ZAN_EMBED_OBJ "${CMAKE_BINARY_DIR}/zan_embed_api${CMAKE_C_OUTPUT_EXTENSION}"
 add_custom_command(
     OUTPUT ${ZAN_EMBED_OBJ}
     COMMAND ${ZAN_RT_IO_CC} -O2 ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/zan_embed_api.c
+            -I ${CMAKE_SOURCE_DIR}/src/embed -I ${CMAKE_SOURCE_DIR}/src/runtime
+            -c ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_api.c
             -o ${ZAN_EMBED_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/zan_embed_api.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_api.c
             ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
     COMMENT "Building embedded-resource API object (zan_embed_api)"
     VERBATIM)
@@ -460,7 +459,7 @@ add_custom_target(zan_embed_api ALL DEPENDS ${ZAN_EMBED_OBJ})
 add_dependencies(zanc zan_embed_api)
 target_compile_definitions(zanc PRIVATE ZAN_EMBED_OBJ="${ZAN_EMBED_OBJ}")
 
-# Compressed-resource decoder (src/runtime/zan_inflate.c + vendored miniz).
+# Compressed-resource decoder (src/embed/zan_inflate.c + vendored miniz).
 # zanc's --embed bakes deflate-compressed payloads and the inline read API it
 # emits calls zan_embed_decode/rawlen here; the object is linked next to zanc
 # like ZAN_EMBED_OBJ and injected whenever a program embeds resources
@@ -472,9 +471,9 @@ add_custom_command(
             -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO
             -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS
             -I ${CMAKE_SOURCE_DIR}/src/common
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/zan_inflate.c
+            -c ${CMAKE_SOURCE_DIR}/src/embed/zan_inflate.c
             -o ${ZAN_INFLATE_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/zan_inflate.c
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/embed/zan_inflate.c
             ${CMAKE_SOURCE_DIR}/src/common/miniz.c
             ${CMAKE_SOURCE_DIR}/src/common/miniz_tinfl.c
             ${CMAKE_SOURCE_DIR}/src/common/miniz_tdef.c
@@ -3753,7 +3752,7 @@ if(SELFHOST_CLANG)
   # mingw vs MSVC). rt_co.c is deliberately absent: rt_io.c already provides
   # the coroutine scheduler, and the self-host emits its own copy as a weak
   # fallback (mirroring the host's zan_runtime_fallback).
-  # rt_hw_accel.c belongs here: the self-hosted compiler binary itself pulls in
+  # zan_hw_accel.c belongs here: the self-hosted compiler binary itself pulls in
   # the stdlib's NativeMemory crypto declarations (Extern -> zan_hw_*), so
   # gen2's IR references those symbols and the link needs them. Since
   # ce1041cf9 the host links crypto as an *archive member* (libzancrypto.a)
@@ -3762,17 +3761,17 @@ if(SELFHOST_CLANG)
   # it cannot be reused for a link driven by SELFHOST_CLANG. The TU is
   # therefore compiled again here, with the same clang as the rest of the
   # bundle.
-  set(_sh_rt_srcs rt_file.c rt_io.c rt_crash.c rt_sched.c rt_timer.c
-                   rt_decimal.c rt_sync.c zan_embed_api.c rt_hw_accel.c)
+  set(_sh_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_sched.c runtime/rt_timer.c
+                   runtime/rt_decimal.c runtime/rt_sync.c embed/zan_embed_api.c accel/zan_hw_accel.c)
   set(_sh_rt_objs)
   foreach(_sh_src IN LISTS _sh_rt_srcs)
     get_filename_component(_sh_stem ${_sh_src} NAME_WE)
     set(_sh_obj "${CMAKE_BINARY_DIR}/zanrt_sh_${_sh_stem}${CMAKE_C_OUTPUT_EXTENSION}")
     add_custom_command(
       OUTPUT ${_sh_obj}
-      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/${_sh_src}
+      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} -I ${CMAKE_SOURCE_DIR}/src/runtime -I ${CMAKE_SOURCE_DIR}/src/accel -I ${CMAKE_SOURCE_DIR}/src/embed -O2 -c ${CMAKE_SOURCE_DIR}/src/${_sh_src}
               -o ${_sh_obj}
-      DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/${_sh_src}
+      DEPENDS ${CMAKE_SOURCE_DIR}/src/${_sh_src}
       COMMENT "Building ${_sh_src} for the selfhost fixed point")
     list(APPEND _sh_rt_objs ${_sh_obj})
   endforeach()
@@ -3837,17 +3836,17 @@ if(SELFHOST_CLANG)
   # (the C host links the shipped mt runtime, the self-host links its own
   # emitted fallback). The gate therefore compares *compiler* behaviour --
   # the stdout a program produces -- not runtime internals.
-  set(_shd_rt_srcs rt_file.c rt_io.c rt_crash.c rt_sched.c rt_timer.c
-                    rt_decimal.c rt_sync.c zan_embed_api.c rt_hw_accel.c)
+  set(_shd_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_sched.c runtime/rt_timer.c
+                    runtime/rt_decimal.c runtime/rt_sync.c embed/zan_embed_api.c accel/zan_hw_accel.c)
   set(_shd_rt_objs)
   foreach(_shd_src IN LISTS _shd_rt_srcs)
     get_filename_component(_shd_stem ${_shd_src} NAME_WE)
     set(_shd_obj "${CMAKE_BINARY_DIR}/zanrt_shd_${_shd_stem}${CMAKE_C_OUTPUT_EXTENSION}")
     add_custom_command(
       OUTPUT ${_shd_obj}
-      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/${_shd_src}
+      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} -I ${CMAKE_SOURCE_DIR}/src/runtime -I ${CMAKE_SOURCE_DIR}/src/accel -I ${CMAKE_SOURCE_DIR}/src/embed -O2 -c ${CMAKE_SOURCE_DIR}/src/${_shd_src}
               -o ${_shd_obj}
-      DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/${_shd_src}
+      DEPENDS ${CMAKE_SOURCE_DIR}/src/${_shd_src}
       COMMENT "Building ${_shd_src} for the selfhost differential gate")
     list(APPEND _shd_rt_objs ${_shd_obj})
   endforeach()
@@ -3930,6 +3929,43 @@ add_test(NAME selfhost_gen1
     "-DSYSLIBS=${_sh_syslibs}"
     -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
 set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
+
+# ---- Self-hosting repo-wide compile gate ----
+# The differential gate proves gen1 agrees with the C host on 230 curated
+# cases; the repo gate widens the compile surface to what the repo actually
+# ships: the stdlib, every project under examples/ and templates/ (one unit
+# per first-level directory, discovered at gate time), and -- in the opt-in
+# packages tier -- every package. A unit gen1 cannot lower yet is listed in
+# tests/selfhost/repo_known_gaps.txt and reported as a GAP; anything else
+# that fails is a regression. The light tier is bounded (worst units are
+# ~1 min); the packages tier walks every package incl. the 23MB Zan.Gui and
+# is registered separately so the default targeted runs stay cheap.
+add_test(NAME selfhost_repo
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_repo/gen1${_exe_ext}
+    -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_repo
+    -DTIER_ROOTS=stdlib,examples,templates
+    -DGAPS=${CMAKE_SOURCE_DIR}/tests/selfhost/repo_known_gaps.txt
+    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_repo.cmake)
+set_tests_properties(selfhost_repo PROPERTIES TIMEOUT 3600)
+
+# Opt-in heavy tier: every package as one unit. Registered only when the
+# packages tree exists (it always does in-tree; guards a packaged-source
+# export where it may be absent).
+if(EXISTS ${CMAKE_SOURCE_DIR}/packages)
+  add_test(NAME selfhost_repo_packages
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
+      -DGEN1=${CMAKE_BINARY_DIR}/selfhost_repo/gen1${_exe_ext}
+      -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_repo
+      -DTIER_ROOTS=packages
+      -DGAPS=${CMAKE_SOURCE_DIR}/tests/selfhost/repo_known_gaps.txt
+      -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_repo.cmake)
+  set_tests_properties(selfhost_repo_packages PROPERTIES TIMEOUT 7200)
+endif()
 
 # ---- Self-hosting: jsongen must fail closed on unsupported field types ----
 # The ok program maps a class whose int[] field is [JsonIgnore]-annotated

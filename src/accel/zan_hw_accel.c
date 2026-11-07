@@ -1,6 +1,6 @@
-/* rt_hw_accel.c: 硬件指令集加速与密码学/SIMD 运行时（组合分发入口） */
+/* zan_hw_accel.c: 硬件指令集加速与密码学/SIMD 运行时（组合分发入口） */
 
-#include "rt_hw_accel.h"
+#include "zan_hw_accel.h"
 #include <string.h>
 #include <stdlib.h>
 

@@ -19,6 +19,8 @@ SUB=${1:?usage: build_win_rt.sh <win-arm64|win-x64> [cc]}
 CC=${2:-cc}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RT="$ROOT/src/runtime"
+ACCEL="$ROOT/src/accel"
+EMBED="$ROOT/src/embed"
 OUT="$ROOT/toolchain/$SUB"
 
 # Build into a staging directory and swap it in only when every object is
@@ -58,17 +60,17 @@ mkdir -p "$STAGE"
 # Rebuild this together with zanrt_timer.o: both derive from the same
 # rt_hw_accel.c, and mixing generations would define the same symbol twice
 # (TASKS.md A493).
-"$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -c "$RT/rt_hw_accel.c" -o "$STAGE/zan_crypto.o"
+"$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -I "$ACCEL" -c "$ACCEL/zan_hw_accel.c" -o "$STAGE/zan_crypto.o"
 rm -f "$STAGE/libzancrypto.a"
 "${AR:-ar}" rcs "$STAGE/libzancrypto.a" "$STAGE/zan_crypto.o"
 # Embedded-resource API + compressed-resource decoder: GUI programs pull
 # skins/icons through the auto-embed path, so the cross link injects these two
 # objects (same flags as the ZAN_INFLATE_OBJ recipe in CMakeLists.txt).
-"$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -c "$RT/zan_embed_api.c" -o "$STAGE/zan_embed_api.o"
+"$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -I "$EMBED" -c "$EMBED/zan_embed_api.c" -o "$STAGE/zan_embed_api.o"
 "$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 \
     -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
     -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
-    -I "$ROOT/src/common" -c "$RT/zan_inflate.c" -o "$STAGE/zan_inflate.o"
+    -I "$ROOT/src/common" -c "$EMBED/zan_inflate.c" -o "$STAGE/zan_inflate.o"
 
 # Self-check (when nm is around): the size invariant of A493 -- the crypto
 # block must live in the ARCHIVE, not in the timer object. A timer that

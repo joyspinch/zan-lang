@@ -26,6 +26,8 @@ set -eu
 ZIG=${1:-zig}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RT="$ROOT/src/runtime"
+ACCEL="$ROOT/src/accel"
+EMBED="$ROOT/src/embed"
 
 for pair in arm64:aarch64 x64:x86_64; do
     sub=${pair%%:*}
@@ -65,15 +67,15 @@ for pair in arm64:aarch64 x64:x86_64; do
     # rt_hw_accel.c, and mixing generations would define the same symbol
     # twice (TASKS.md A493). $march is the same crypto feature macro the
     # timer object above uses, so both stay in step.
-    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC $march -I "$RT" \
-        -O2 -ffunction-sections -fdata-sections -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
+    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC $march -I "$RT" -I "$ACCEL" \
+        -O2 -ffunction-sections -fdata-sections -c "$ACCEL/zan_hw_accel.c" -o "$out/zan_crypto.o"
     rm -f "$out/libzancrypto.a"
     "$ZIG" ar rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
-    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" \
-        -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
+    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -I "$EMBED" \
+        -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$EMBED/zan_embed_api.c" -o "$out/zan_embed_api.o"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC \
         -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME \
-        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
+        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$EMBED/zan_inflate.c" -o "$out/zan_inflate.o"
     # HAP XComponent shell adapter zanc puts at the head of every ohos -shared
     # link; the source is arch-independent and lives next to the x64 subset.
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections \
