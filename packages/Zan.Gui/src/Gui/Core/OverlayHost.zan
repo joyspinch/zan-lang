@@ -9,29 +9,29 @@ namespace Gui;
 // 具备以下核心保证：
 // 1. 天然置于视觉最顶层（无需逐控件硬调 z-order）；
 // 2. 外部点击自动关闭（DismissOnOutsideClick）；
-// 3. 浮层内事件正常捕获，浮层外事件天然阻断，彻底消除 BlockHitsRect 与 ClaimClick。
+// 3. 浮层内事件正常捕获，消除 BlockHitsRect 与 ClaimClick；
+// 4. 彻底实例绑定于 App 实例，杜绝全局静态多窗口竞态与 ARC 强引用内存泄漏。
 public class OverlayHost {
-    static List<Control> overlays;
-    static Control activePopup;
-    static Control activeAnchor;
+    private List<Control> overlays;
+    private Control activePopup;
+    private Control activeAnchor;
 
-    static void EnsureList() {
-        if (overlays == null) {
-            overlays = new List<Control>();
-        }
+    public OverlayHost() {
+        this.overlays = new List<Control>();
     }
 
-    // 显示一个浮动卡片（如 SelectBox 列表、DatePicker 日历、ColorPicker 面板）
-    // 依附于 anchor 控件下方，若下方空间不足则自动上翻。
-    public static void ShowPopup(App app, Control anchor, Control popup) {
+    public bool HasActive() {
+        return activePopup != null || (overlays != null && overlays.Count > 0);
+    }
+
+    public void Show(App app, Control anchor, Control popup) {
         if (app == null || popup == null) { return; }
-        OverlayHost.EnsureList();
+        if (overlays == null) { overlays = new List<Control>(); }
         activePopup = popup;
         activeAnchor = anchor;
         if (!overlays.Contains(popup)) {
             overlays.Add(popup);
         }
-        // 自动计算锚点几何并放置
         if (anchor != null) {
             int popW = popup.prefW > 0 ? popup.prefW : anchor.bw;
             int popH = popup.prefH > 0 ? popup.prefH : app.Scale(200);
@@ -41,8 +41,7 @@ public class OverlayHost {
         }
     }
 
-    // 关闭当前激活的浮动卡片
-    public static void DismissPopup() {
+    public void Dismiss() {
         if (activeAnchor != null) {
             activeAnchor.OnPopupDismissed();
         }
@@ -53,10 +52,8 @@ public class OverlayHost {
         activeAnchor = null;
     }
 
-    // 检查并处理点击外部关闭逻辑（在帧结束时由 App.RunOverlays 驱动）
-    public static void Update(App app) {
+    public void Update(App app) {
         if (activePopup == null || app == null) { return; }
-        // 外部点击判定：鼠标按下且不在 activePopup 也并不在 activeAnchor 内部
         if (app.ClickAvailable()) {
             int mx = app.mouseX;
             int my = app.mouseY;
@@ -68,15 +65,14 @@ public class OverlayHost {
                         && my >= activeAnchor.by && my < activeAnchor.by + activeAnchor.bh;
             }
             if (!inPopup && !inAnchor) {
-                OverlayHost.DismissPopup();
+                this.Dismiss();
             }
         }
     }
 
-    // 绘制所有激活的浮层（在全窗口内容绘制完成后调用，确保绘制在顶层）
-    public static void RenderAll(App app) {
+    public void RenderAll(App app) {
         if (overlays == null || overlays.Count == 0) { return; }
-        OverlayHost.Update(app);
+        this.Update(app);
         if (activePopup != null) {
             app.BlockHitsBelow();
             app.BlockHitsRect(activePopup.bx, activePopup.by, activePopup.bw, activePopup.bh);
@@ -86,6 +82,29 @@ public class OverlayHost {
             if (pop != null && pop.StyleVisible()) {
                 pop.RenderTree(app);
             }
+        }
+    }
+
+    // ---- 静态转发门面：保证各控件已有调用代码平滑运行，底层完全委托至对应 App 实例 ----
+
+    public static void ShowPopup(App app, Control anchor, Control popup) {
+        if (app == null) { app = App.FrameApp(); }
+        if (app != null && app.overlayHost != null) {
+            app.overlayHost.Show(app, anchor, popup);
+        }
+    }
+
+    public static void DismissPopup() {
+        App app = App.FrameApp();
+        if (app != null && app.overlayHost != null) {
+            app.overlayHost.Dismiss();
+        }
+    }
+
+    public static void DismissPopupFor(App app) {
+        if (app == null) { app = App.FrameApp(); }
+        if (app != null && app.overlayHost != null) {
+            app.overlayHost.Dismiss();
         }
     }
 }

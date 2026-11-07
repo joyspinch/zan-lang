@@ -22,8 +22,8 @@ namespace Gui.Widget;
 // "yearrange"     — 双面板选年份区间（右面板 = 下一个 12 年页）
 public class DatePicker : Control {
     Control customPopup;
-    // 最近交互的实例（Input.Change 不带宿主，静态转发经它找实例）。
-    static DatePicker current;
+    Card defaultPopupCard;
+    Calendar calendarWidget;
     // 取值输入框（键盘编辑路径）。
     Input editor;
     // 右侧日历按钮（点击开合弹层）。
@@ -63,7 +63,7 @@ public class DatePicker : Control {
     Binding<string> Size;
 
     // 构造：内置编辑框与日历按钮，默认取今天。
-    DatePicker() {
+    public DatePicker() {
         this.InitControl("datePicker", 1);
         editor = new Input("YYYY-MM-DD");
         editor.Class = "date";
@@ -89,11 +89,10 @@ public class DatePicker : Control {
         endHour = 0;
         endMinute = 0;
         wid = WidgetId.Next();
-        DatePicker.current = this;
         wiresOwnEvents = true;
         this.Add(editor);
         this.Add(trigger);
-        trigger.Click += DatePicker.TriggerClicked;
+        trigger.Click.AddS(DatePicker.OnTriggerClick);
         this.SetDate(selected);
     }
 
@@ -228,30 +227,30 @@ public class DatePicker : Control {
     }
 
     // 当前编辑框文本（各 Type 的格式见类文档）。
-    string Text() { return editor.GetText(); }
+    public string Text() { return editor.GetText(); }
     // 当前选中值（range 模式为结束值）。
-    DateTime GetDate() { return selected; }
+    public DateTime GetDate() { return selected; }
     // range 模式下的起始值；非 range 模式时 == GetDate()。
-    DateTime GetStart() {
+    public DateTime GetStart() {
         if (this.IsRange() && hasPending) { return pendingStart; }
         return selected;
     }
     // range 模式下的结束值；非 range 模式时 == GetDate()。
-    DateTime GetEnd() { return selected; }
+    public DateTime GetEnd() { return selected; }
     // 是否为区间/周选择变体（取值为起止对）。
-    bool IsRange() {
+    public bool IsRange() {
         return Type == "daterange" || Type == "datetimerange" ||
             Type == "monthrange" || Type == "quarterrange" ||
             Type == "yearrange" || Type == "week";
     }
     // 是否为 datetime 变体（单值 + 时分）。
-    bool IsDateTime() { return Type == "datetime"; }
+    public bool IsDateTime() { return Type == "datetime"; }
     // 是否带时分输入行（datetime / datetimerange）。
-    bool HasTime() { return Type == "datetime" || Type == "datetimerange"; }
+    public bool HasTime() { return Type == "datetime" || Type == "datetimerange"; }
 
     // 面板粒度：day（date/datetime/week/daterange/datetimerange）、
     // month、quarter、year。month/quarter/year 复用同一套宫格绘制。
-    string Granularity() {
+    public string Granularity() {
         if (Type == "month" || Type == "monthrange") { return "month"; }
         if (Type == "quarter" || Type == "quarterrange") { return "quarter"; }
         if (Type == "year" || Type == "yearrange") { return "year"; }
@@ -259,7 +258,7 @@ public class DatePicker : Control {
     }
 
     // 程序化赋值：同步视图年月与时分并刷新编辑框文本（不触发 Change）。
-    void SetDate(DateTime value) {
+    public void SetDate(DateTime value) {
         selected = value;
         viewYear = value.Year();
         viewMonth = value.Month();
@@ -275,13 +274,13 @@ public class DatePicker : Control {
     }
 
     // 程序化按文本赋值：与键盘编辑同一解析路径（非法文本忽略）。
-    void SetText(string value) {
+    public void SetText(string value) {
         editor.SetText(value);
         this.Edited();
     }
 
     // 格式化当前值为编辑框文本，遵循 Type 变体。
-    string FormatText() {
+    public string FormatText() {
         if (Type == "datetime") {
             return selected.ToDateString() + " " + DateTime.Pad2(hour)
                 + ":" + DateTime.Pad2(minute);
@@ -531,21 +530,56 @@ public class DatePicker : Control {
         }
     }
 
-    // 日历按钮的静态转发（经 current 找到实例后开合弹层）。
-    static void TriggerClicked() {
-        if (DatePicker.current != null) {
-            DatePicker.current.ToggleOpen();
+    // 日历按钮的静态回调：经 sender 回溯找到所属 DatePicker 实例并开合弹层。
+    static void OnTriggerClick(Control sender) {
+        if (sender == null || sender.parent == null) { return; }
+        DatePicker dp = sender.parent as DatePicker;
+        if (dp != null) {
+            dp.ToggleOpen();
         }
     }
 
-    // 归属切换：悬停新实例或弹层开着时转移 current，
-    // 并关闭前一个实例仍开着的弹层。
-    static void Use(DatePicker value) {
-        if (DatePicker.current != null && DatePicker.current != value &&
-            DatePicker.current.open) {
-            DatePicker.current.open = false;
+    static void OnCalendarDateChange(Control sender) {
+        if (sender == null || !(sender is Calendar)) { return; }
+        Calendar cal = (Calendar)sender;
+        Control cur = cal.Parent();
+        while (cur != null) {
+            if (cur is DatePicker) {
+                DatePicker dp = (DatePicker)cur;
+                DateTime d = cal.GetDate();
+                if (d != null) {
+                    dp.selected = d;
+                    dp.editor.SetText(dp.FormatText());
+                    dp.open = false;
+                    dp.Change.RaiseS(dp);
+                    OverlayHost.DismissPopup();
+                }
+                return;
+            }
+            cur = cur.Parent();
         }
-        DatePicker.current = value;
+    }
+
+    public Card EnsurePopupCard(App app) {
+        if (defaultPopupCard == null) {
+            defaultPopupCard = new Card("");
+            defaultPopupCard.Class = "datepicker-popup";
+            defaultPopupCard.Pad(4);
+            defaultPopupCard.parent = this;
+
+            calendarWidget = new Calendar();
+            calendarWidget.Mode = "panel";
+            calendarWidget.parent = defaultPopupCard;
+            calendarWidget.Change.AddS(DatePicker.OnCalendarDateChange);
+            defaultPopupCard.With(calendarWidget);
+        }
+        if (selected != null) {
+            calendarWidget.SetDate(selected);
+        }
+        if (app != null) {
+            defaultPopupCard.OnMeasure(app);
+        }
+        return defaultPopupCard;
     }
 
     // 开合弹层；打开时把视图对到当前区间起始（range）或
@@ -556,7 +590,8 @@ public class DatePicker : Control {
             OverlayHost.DismissPopup();
             return;
         }
-        OverlayHost.ShowPopup(App.FrameApp(), this, this);
+        Control pop = this.customPopup != null ? this.customPopup : this.EnsurePopupCard(App.FrameApp());
+        OverlayHost.ShowPopup(App.FrameApp(), this, pop);
         pickingEnd = false;
         if (this.IsRange()) {
             // 编辑框文本是 "A ~ B"，ParseSingle 解析不了；左面板
@@ -714,27 +749,9 @@ public class DatePicker : Control {
         Change.RaiseS(this);
     }
 
-    // 覆写：轮询内嵌编辑框、归属判定（Ui.Over，弹层压住邻居时不抢焦点），
-    // 展开时把日历弹层推迟到覆盖阶段绘制。
+    // 覆写：轮询内嵌编辑框。
     override void OnPaint(App app) {
         this.Edited();
-        int buttonW = app.Scale(34);
-        // 归属判定必须走 Ui.Over：裸坐标比较看不见压在本控件上面的
-        // 下拉弹层——gallery 里多个日期框并排，弹层展开后正好压住
-        // 邻居的触发按钮，鼠标在弹层里一滑动，邻居就把"当前实例"
-        // 抢走，正开着的日历随之关闭。Ui.Over 内部用
-        // App.PointerCaptured() 把被上层弹层接管的指针排除掉。
-        bool overTrigger = Ui.Over(app, bx + bw - buttonW, by, buttonW, bh);
-        if (overTrigger) {
-            DatePicker.Use(this);
-        } else if (open) {
-            DatePicker.Use(this);
-        }
-        // 弹层推迟到覆盖阶段绘制并注册最顶层命中区域，
-        // 与 SelectBox/Popover 相同（参见 OverlayPopup.Host）。
-        if (open && DatePicker.current == this) {
-            app.AddOverlay(OverlayPopup.Host(this));
-        }
     }
 
     // 覆写：按尺寸档解析 input 样式给宽高，并保证装下回显文本 + 触发按钮。
@@ -772,13 +789,10 @@ public class DatePicker : Control {
 
     // 覆写：展开且归属本实例时绘制日历/时间弹层（Naive UI 各 type 面板）。
     override void OnPaintOverlay(App app) {
-        if (!open || DatePicker.current != this) { return; }
-        if (this.customPopup != null) {
-            OverlayHost.ShowPopup(app, this, this.customPopup);
-            this.customPopup.RenderTree(app);
+        if (!open) { return; }
+        if (this.customPopup != null || this.defaultPopupCard != null) {
             return;
         }
-        CalendarOverlay.Render(this, app);
     }
 
     // 快捷区间点选应用：按配置的相对今天偏移计算起止日期。

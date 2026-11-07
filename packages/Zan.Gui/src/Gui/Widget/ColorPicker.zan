@@ -429,24 +429,38 @@ public class ColorPicker : Control {
         inHex = new Input("#000000");
         inHsl = new Input("0, 0%, 0%");
         inHsb = new Input("0, 0%, 0%");
+        inR.name = "0";
+        inG.name = "1";
+        inB.name = "2";
+        inA.name = "3";
+        inHex.name = "4";
+        inHsl.name = "5";
+        inHsb.name = "6";
+        inR.parent = this;
+        inG.parent = this;
+        inB.parent = this;
+        inA.parent = this;
+        inHex.parent = this;
+        inHsl.parent = this;
+        inHsb.parent = this;
         inputView = 0;
-        inR.Submit += ColorPicker.SubmitR;
-        inG.Submit += ColorPicker.SubmitG;
-        inB.Submit += ColorPicker.SubmitB;
-        inA.Submit += ColorPicker.SubmitA;
-        inHex.Submit += ColorPicker.SubmitHex;
-        inHsl.Submit += ColorPicker.SubmitHsl;
-        inHsb.Submit += ColorPicker.SubmitHsb;
+        inR.Submit.AddS(ColorPicker.OnChannelSubmit);
+        inG.Submit.AddS(ColorPicker.OnChannelSubmit);
+        inB.Submit.AddS(ColorPicker.OnChannelSubmit);
+        inA.Submit.AddS(ColorPicker.OnChannelSubmit);
+        inHex.Submit.AddS(ColorPicker.OnChannelSubmit);
+        inHsl.Submit.AddS(ColorPicker.OnChannelSubmit);
+        inHsb.Submit.AddS(ColorPicker.OnChannelSubmit);
     }
 
     // Default design-time constructor（黑色）。
-    ColorPicker() {
+    public ColorPicker() {
         this.InitPicker(new SignalInt(0xFF000000));
         this.ApplyPacked(model.Get());
     }
 
     // 自持信号：`ColorPicker pick = new ColorPicker(0xFF5B3737);`
-    ColorPicker(int packed) {
+    public ColorPicker(int packed) {
         this.InitPicker(new SignalInt(packed));
         this.ApplyPacked(packed);
     }
@@ -474,17 +488,17 @@ public class ColorPicker : Control {
     }
 
     // 程序化赋值（同步内部 HSV 与触发条；不触发 Change）。
-    void SetColor(int packed) {
+    public void SetColor(int packed) {
         this.ApplyPacked(packed);
         model.Set(this.CurrentRgb());
         if (data != null) { data.Set(this.CurrentRgb()); }
     }
 
     // 当前模型值（打包 0xAARRGGBB）。
-    int Value() { return model.Get(); }
+    public int Value() { return model.Get(); }
 
     // 用户手势落定：写模型、写回双向绑定、触发 Change。
-    void Commit() {
+    public void Commit() {
         int packed = this.CurrentRgb();
         model.Set(packed);
         if (data != null) { data.Set(packed); }
@@ -499,7 +513,7 @@ public class ColorPicker : Control {
     }
 
     // 显示透明度条（Naive UI show-alpha）。关闭时 alpha 恒 1。
-    void SetShowAlpha(bool on) {
+    public void SetShowAlpha(bool on) {
         showAlpha = on;
         if (!on) { alpha = 255; }
     }
@@ -509,7 +523,7 @@ public class ColorPicker : Control {
     // 此处直接改写 Mode，纯计算路径（Text()）与渲染路径同源。
     // 当前 Mode 不在新集合里时改取集合首个（Naive UI 的行为：
     // modes 缩小后 value 格式必须仍是可选格式之一）。
-    void SetModes(List<string> list) {
+    public void SetModes(List<string> list) {
         modes = list;
         if (modes == null) { modes = new List<string>(); }
         if (modes.Count == 1) {
@@ -699,7 +713,7 @@ public class ColorPicker : Control {
 
     // 从文本赋值（designer / 程序化）："#RRGGBB[AA]" 与
     // rgba()/rgb()/hsl()/hsb() 都接受，非法文本忽略。
-    void SetText(string value) {
+    public void SetText(string value) {
         int packed = ColorPicker.HexParse(value);
         if (!ColorPicker.parseOk) { packed = ColorPicker.FuncParse(value); }
         if (ColorPicker.parseOk) { this.SetColor(packed); }
@@ -766,18 +780,17 @@ public class ColorPicker : Control {
             open = !open;
             viewAligned = false;
             if (open) {
-                OverlayHost.ShowPopup(app, this, this);
+                Control pop = this.customPopup != null ? this.customPopup : this;
+                OverlayHost.ShowPopup(app, this, pop);
             } else {
                 OverlayHost.DismissPopup();
             }
-            app.ClaimClick();
             app.RequestRedraw();
         }
         if (disabled) {
             if (open) { OverlayHost.DismissPopup(); }
             open = false;
         }
-        if (open) { app.AddOverlay(OverlayPopup.Host(this)); }
         if (this.On.Any()) { On.Fire(app, id, this); }
         return id;
     }
@@ -793,7 +806,12 @@ public class ColorPicker : Control {
     public void SetOpen(bool want) {
         if (open == want) { return; }
         open = want;
-        if (!want) {
+        App a = this.FindApp();
+        if (a == null) { a = App.FrameApp(); }
+        if (want) {
+            Control pop = this.customPopup != null ? this.customPopup : this;
+            OverlayHost.ShowPopup(a, this, pop);
+        } else {
             OverlayHost.DismissPopup();
         }
     }
@@ -824,8 +842,6 @@ public class ColorPicker : Control {
     override void OnPaintOverlay(App app) {
         if (!open) { return; }
         if (this.customPopup != null) {
-            OverlayHost.ShowPopup(app, this, this.customPopup);
-            this.customPopup.RenderTree(app);
             return;
         }
         ColorPaletteOverlay.Render(this, app);
@@ -874,27 +890,18 @@ public class ColorPicker : Control {
         return false;
     }
 
-    // 正在渲染输入行的选择器（Input 的 Submit 委托无法捕获 this，
-    // 静态转发宿主，DatePicker.current 同款）。
-    static ColorPicker editing;
-
     // 弹层打开后是否已把输入行对齐到 Mode（每次打开重新对齐）。
     bool viewAligned;
 
-    // Input.Submit 的静态转发入口：经 editing 找到当前宿主后分发。
-    static void SubmitR() { if (editing != null) { editing.SubmitChannel(0); } }
-    // Input.Submit 静态转发：提交 G 通道输入。
-    static void SubmitG() { if (editing != null) { editing.SubmitChannel(1); } }
-    // Input.Submit 静态转发：提交 B 通道输入。
-    static void SubmitB() { if (editing != null) { editing.SubmitChannel(2); } }
-    // Input.Submit 静态转发：提交 A 通道（0..100%）输入。
-    static void SubmitA() { if (editing != null) { editing.SubmitChannel(3); } }
-    // Input.Submit 静态转发：提交 HEX 整色输入。
-    static void SubmitHex() { if (editing != null) { editing.SubmitChannel(4); } }
-    // Input.Submit 静态转发：提交 HSL 整色输入。
-    static void SubmitHsl() { if (editing != null) { editing.SubmitChannel(5); } }
-    // Input.Submit 静态转发：提交 HSB 整色输入。
-    static void SubmitHsb() { if (editing != null) { editing.SubmitChannel(6); } }
+    // Input.Submit 的静态回调：经 sender 回溯找到所属 ColorPicker 实例并提交对应通道。
+    static void OnChannelSubmit(Control sender) {
+        if (sender == null || sender.parent == null) { return; }
+        ColorPicker cp = sender.parent as ColorPicker;
+        if (cp != null) {
+            int which = Convert.ToInt32(sender.name);
+            cp.SubmitChannel(which);
+        }
+    }
 
     // 输入行回车提交：0-2 替换单个 R/G/B 通道，3 写 alpha（0..100%），
     // 4-6 整色替换（hex / hsl / hsb）。非法文本忽略。解析成功的一律
