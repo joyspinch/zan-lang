@@ -1,0 +1,773 @@
+using System;
+using System.Json;
+
+namespace Gui;
+
+public partial class Style {
+    // 角色类（primary/info/success/warning/error）在某状态下的强调色，
+    // 无角色类时为 0。按钮/tab 的上色已经全在 skins/base.css 里，这里
+    // 留给自绘标记的控件（时间轴的圆点等）按角色取一个主题色。
+    public static int RoleColor(Theme t, string cls, int state) {
+        bool hover = (state & Style.SHover()) != 0;
+        bool active = (state & Style.SActive()) != 0;
+        if (Style.Has(cls, "primary")) {
+            if (active) { return t.primaryPressed; }
+            if (hover) { return t.primaryHover; }
+            return t.primary;
+        }
+        if (Style.Has(cls, "info")) {
+            if (active) { return t.infoPressed; }
+            if (hover) { return t.infoHover; }
+            return t.info;
+        }
+        if (Style.Has(cls, "success")) {
+            if (active) { return t.successPressed; }
+            if (hover) { return t.successHover; }
+            return t.success;
+        }
+        if (Style.Has(cls, "warning")) {
+            if (active) { return t.warningPressed; }
+            if (hover) { return t.warningHover; }
+            return t.warning;
+        }
+        if (Style.Has(cls, "error")) {
+            if (active) { return t.errorPressed; }
+            if (hover) { return t.errorHover; }
+            return t.error;
+        }
+        return 0;
+    }
+
+    // 角色的静态强调色（不受状态影响）。
+    public static int RoleBase(Theme t, string cls) {
+        return Style.RoleColor(t, cls, 0);
+    }
+
+    // 用当前主题对某控件族的默认值填充 `b`，这样皮肤的
+    // CSS 只需声明想要改变的部分，而完全没有 CSS 的
+    // 主题应用外观与内置主题分毫不差。
+    public static void Defaults(App app, StyleBox b, string type, string cls, int state) {
+        Theme t = app.theme;
+        bool active = (state & Style.SActive()) != 0;
+        bool disabled = (state & Style.SDisabled()) != 0;
+
+        // 控件从自身尺寸比例推导的度量（高度、字号、
+        // 水平内边距）在此有意不设置：控件会
+        // 把它们作为回退值传入（`s.HeightOr(myHeight)`），因此 CSS 声明了
+        // 就用 CSS 的，未声明时尺寸比例依然生效。
+        b.transitionMs = t.animFastMs;
+        b.fg = t.textPrimary;
+        Style.UnitEnvironment(app, b);
+        // 禁用态的弱化文字放在默认层，CSS 因此还能改写它
+        // （皮肤的 `x:disabled { color: ... }` 以前被 Style.Shell 抹掉）。
+        if (disabled) { b.fg = t.textDisabled; }
+        b.accent = t.primary;
+
+        if (type == "button" || type == "floatbutton") {
+            Style.ButtonDefaults(app, b, cls, active, disabled);
+        } else if (type == "tab") {
+            Style.TabDefaults(app, b, cls);
+        } else {
+            // 未在代码里设默认值的类型，外观完全由 CSS 决定；
+            // 新增控件无需在此登记。自定义组合控件（用户的
+            // Control 子类、设计稿控件文档）是纯容器：不画卡片
+            // 外框，也不吃 24px 内边距。过去这里套 SurfaceDefaults，
+            // 等于给每个组合控件白送一个边框加四边内边距——父级
+            // 给它 40px 高时，子控件就被挤成 0 高（搜索框消失），
+            // 横向则被裁掉两侧（导轨文字截断）。外观由组合控件
+            // 自己的子控件决定，皮肤仍可在 CSS 里按类型名给它上样式。
+        }
+        b.MarkThemeLengths();
+    }
+
+    // 解析环境自身也携带来源：主题根字号已缩放，视口仍为逻辑尺寸。
+    public static void UnitEnvironment(App app, StyleBox b) {
+        b.envDpiScale = app.dpiScale;
+        b.envTheme = app.theme;
+        b.envSheet = app.sheet;
+        // Clone 曾遗漏单位环境，文本布局因而一直回退到 16px；
+        // 复制环境时不能把主题 rem 基准当成未声明字号的布局默认值。
+        b.envRemPx = app.Scale(16);
+        int remBase = app.theme.fontSizeMedium;
+        if (remBase > 0) { b.envRootFontPx = remBase; b.envRemPhysical = true; }
+        int viewportW = app.CssViewportWidth();
+        int viewportH = app.CssViewportHeight();
+        if (viewportW > 0) { b.envVw = viewportW; }
+        if (viewportH > 0) { b.envVh = viewportH; }
+        b.mediaDark = app.isDark;
+        b.mediaReduced = app.reducedMotion;
+    }
+
+    // 静态 CSS 规则无法表达的运行时处理，在
+    // sheet 之后应用：玻璃磨砂，以及新粗野主义的偏移阴影外壳
+    // （均受主题标志/状态控制）。禁用态的弱化文字不在这里——
+    // 它是默认层（Style.Defaults）的事，否则皮肤写的
+    // `button:disabled { color: ... }` 会被这里抹掉。
+    public static void Shell(App app, StyleBox b, string type, string cls, int state) {
+        Theme t = app.theme;
+        bool active = (state & Style.SActive()) != 0;
+        // 磨砂玻璃不在这里：表面的背景、模糊、圆角、边框、投影
+        // 和光泽均由 skins/base.css 根据主题导出的 `--surface-*`
+        // token 声明（见 Style.RootFromTheme），皮肤在自己的 CSS 里
+        // 改写即可。在 sheet 之后重写这些值只会把皮肤的声明抹掉。
+        // 壁纸（或自行绘制背景的皮肤）会让主题的
+        // 表面 token 变半透明，使背景透出外壳。
+        // 皮肤 CSS 里命名了不透明表面颜色的——多数皮肤都是，
+        // 且常用渐变——会在上面打出不透明孔洞，
+        // 使卡片和工具面板像被贴到周围磨砂
+        // 框架上。要让这些填充带上与 token 相同的 alpha；
+        // 已经写好半透明填充的皮肤（dreamy 的 55% 紫色）保留
+        // 自己的 alpha，否则卡片会暗到 token 的近不透明程度，
+        // 不再与周围面板协调。
+        int surfA = StyleBox.AlphaOf(t.bgPrimary);
+        if (surfA < 255 && (type == "card" || type == "panel")) {
+            if (b.bg != 0 && StyleBox.AlphaOf(b.bg) >= 255) {
+                b.bg = App.WithAlpha(b.bg, surfA);
+            }
+            if (b.bgTo != 0 && StyleBox.AlphaOf(b.bgTo) >= 255) {
+                b.bgTo = App.WithAlpha(b.bgTo, surfA);
+            }
+        }
+        bool internalParts = type == "checkbox" || type == "radio" || type == "switch"
+            || type == "slider" || type == "progress";
+        // 未模糊的偏移阴影画在填充之下，因此没有自己的填充
+        // 的盒子（sheet 保持透明的弹层族、自行绘制行
+        // 的列表）会把阴影铺满整个区域，
+        // 变成整块纯黑而非 4px 的边缘。仅对有填充的外壳生效。
+        bool hasFill = b.bg != 0 || b.bgTo != 0;
+        if (t.brutal == 1 && hasFill && !Style.FlatType(type) && !internalParts) {
+            b.shadow = t.shadowColor;
+            b.shadowDx = 4;
+            b.shadowDy = 4;
+            b.shadowBlur = 0;
+            b.borderColor = t.borderPrimary;
+            b.borderW = t.borderWidth;
+            b.SetPrescaled(StyleBox.SourceBorder(), true);
+            b.SetPrescaled(StyleBox.SourceShadowDx() | StyleBox.SourceShadowDy()
+                | StyleBox.SourceShadowBlur(), false);
+            if (active) {
+                b.shadow = 0; b.tx = 4; b.ty = 4;
+                b.SetPrescaled(StyleBox.SourceTx() | StyleBox.SourceTy(), false);
+            }
+        }
+    }
+
+    // 内置组件基线（skins/base.css），解析时把当前主题的
+    // token 作为 :root 注入，使它的 var() 规则能解析到实时的
+    // 调色板。每次解析都垫在应用自身 sheet 之下，并按主题代次
+    // 缓存（主题/皮肤变化时重建）。
+
+    // 按 主题代次 + 度量缩放 缓存：同一代次里设计器会在原始度量和
+    // 画布缩放后的度量之间来回切换（每个预览控件两次），两份解析结果
+    // 因此必须并存 —— 否则每个控件都要重新解析一遍 base.css，
+    // 一帧几十个控件就是几百毫秒。
+
+    // 内置基线样式表（skins/base.css，主题 token 以 :root 注入），
+    // 每次解析都垫在应用自身 sheet 之下。按主题代次 + 度量缩放
+    // 缓存；base.css 为空（未打包皮肤资源）时返回空表。
+    static StyleSheet BaseSheet(App app) {
+        int gen = app.bgThemeGen;
+        if (app.baseSheets == null || app.baseSheetGen != gen) {
+            app.baseSheets = new Dict<int, StyleSheet>();
+            app.baseSheetGen = gen;
+        }
+        int scale = app.metricsScale;
+        StyleSheet hit;
+        if (app.baseSheets.TryGetValue(scale, out hit)) { return hit; }
+        StyleSheet made;
+        string css = Skin.BaseCss();
+        if (css == "") {
+            made = new StyleSheet();
+        } else {
+            List<CssVarDecl> decls = Css.CollectVarDecls(Style.RootFromTheme(app.theme));
+            made = Css.ParseWith(css, decls);
+        }
+        app.baseSheets.Add(scale, made);
+        return made;
+    }
+
+    // 当前主题的调色板输出为 `:root` 块，使 base.css 的 var(--token)
+    // 规则解析到当前（可能被皮肤覆写的）颜色。值以
+    // 纯十进制输出——正是 ParseColor 存储的格式——使 CSS
+    // 路径与旧代码路径的颜色逐位一致。
+    public static string RootFromTheme(Theme t) {
+        // 尺寸标准（全库唯一来源，皮肤改写 :root 即整体调整）：
+        // 控件高度 4 档 tiny/small/medium/large = 24/28/32/40，
+        // 字号 5 档 tiny..huge = 12/13/14/16/20，圆角 3 档 = 4/8/12，
+        // 内边距 4 档 = 4/8/12/16，间距 3 档 = 4/8/12。
+        // 这些数字由 Theme 默认值取自 Space/Radius/WidgetSize
+        // （那三个文件是唯一真源），这里只把同一组数导成 CSS 令牌。
+        // base.css 的 `.small/.large` 尺寸档规则全部消费这些 token；
+        // 组件代码里的 Theme 字段与这里是同一组数（见 Theme.Dflt）。
+        // 长度按 100% 书写，ScaleLayout 解析时按显示缩放。
+        StringBuilder sb = new StringBuilder();
+        sb.Append(":root {\n");
+        sb.Append(Style.TokN("font-size-tiny", t.fontSizeTiny));
+        sb.Append(Style.TokN("font-size-small", t.fontSizeSmall));
+        sb.Append(Style.TokN("font-size-medium", t.fontSizeMedium));
+        sb.Append(Style.TokN("font-size-large", t.fontSizeLarge));
+        sb.Append(Style.TokN("font-size-huge", t.fontSizeHuge));
+        sb.Append(Style.TokN("height-tiny", t.heightTiny));
+        sb.Append(Style.TokN("height-small", t.heightSmall));
+        sb.Append(Style.TokN("height-medium", t.heightMedium));
+        sb.Append(Style.TokN("height-large", t.heightLarge));
+        // 微型件高度档（紧凑标签、状态胶囊）：与图标尺寸同值，但语义是
+        // 「控件高度」——紧凑件不再借用 --icon-size-* 令牌，图标大小与
+        // 控件高度从此可以各自调整。
+        sb.Append(Style.TokN("height-micro-tiny", t.iconSizeSmall));
+        sb.Append(Style.TokN("height-micro-small", t.iconSizeMedium));
+        sb.Append(Style.TokN("radius-small", t.borderRadiusSmall));
+        sb.Append(Style.TokN("radius-medium", t.borderRadiusMedium));
+        sb.Append(Style.TokN("radius-large", t.borderRadiusLarge));
+        sb.Append(Style.TokN("padding-tiny", t.paddingTiny));
+        sb.Append(Style.TokN("padding-small", t.paddingSmall));
+        sb.Append(Style.TokN("padding-medium", t.paddingMedium));
+        sb.Append(Style.TokN("padding-large", t.paddingLarge));
+        sb.Append(Style.TokN("gap-small", t.gapSmall));
+        sb.Append(Style.TokN("gap-medium", t.gapMedium));
+        sb.Append(Style.TokN("gap-large", t.gapLarge));
+        // 间距阶梯（Space）与图标尺寸（WidgetSize 的另一半）也导出成
+        // 令牌：原子类（.gap-1/.gap-2/…）与指示器尺寸从此也只有一个
+        // 出处。--space-* 是逻辑像素（跟随显示缩放），--icon-size-* 是
+        // 主题度量（已按 DPI/密度缩放，勿再乘）。
+        sb.Append(Style.TokN("space-xs", Space.XS));
+        sb.Append(Style.TokN("space-s", Space.S));
+        sb.Append(Style.TokN("space-sm", Space.SM));
+        sb.Append(Style.TokN("space-m", Space.M));
+        sb.Append(Style.TokN("space-l", Space.L));
+        sb.Append(Style.TokN("space-xl", Space.XL));
+        sb.Append(Style.TokN("radius-full", Radius.Full));
+        sb.Append(Style.TokN("icon-size-small", t.iconSizeSmall));
+        sb.Append(Style.TokN("icon-size-medium", t.iconSizeMedium));
+        sb.Append(Style.TokN("icon-size-large", t.iconSizeLarge));
+        // 动效三档（Motion 是唯一真源）：皮肤与 IDE 壳层的
+        // `transition` 只写 var(--anim-*)，不再各写各的毫秒数。
+        // 时长是时间不是长度——不随 DPI/密度缩放，因此不在
+        // Css.IsPhysicalThemeMetric 的名单里，单位也带 ms。
+        sb.Append(Style.TokMs("anim-fast", Motion.Fast));
+        sb.Append(Style.TokMs("anim-medium", Motion.Medium));
+        sb.Append(Style.TokMs("anim-slow", Motion.Slow));
+        sb.Append(Style.Tok("primary", t.primary));
+        sb.Append(Style.Tok("info", t.info));
+        sb.Append(Style.Tok("success", t.success));
+        sb.Append(Style.Tok("warning", t.warning));
+        sb.Append(Style.Tok("error", t.error));
+        sb.Append(Style.Tok("text-primary", t.textPrimary));
+        sb.Append(Style.Tok("text-secondary", t.textSecondary));
+        sb.Append(Style.Tok("text-tertiary", t.textTertiary));
+        sb.Append(Style.Tok("text-disabled", t.textDisabled));
+        sb.Append(Style.Tok("text-inverse", t.textInverse));
+        sb.Append(Style.Tok("bg-primary", t.bgPrimary));
+        sb.Append(Style.Tok("bg-secondary", t.bgSecondary));
+        sb.Append(Style.Tok("bg-tertiary", t.bgTertiary));
+        sb.Append(Style.Tok("bg-hover", t.bgHover));
+        sb.Append(Style.Tok("bg-active", t.bgActive));
+        sb.Append(Style.Tok("bg-disabled", t.bgDisabled));
+        sb.Append(Style.Tok("border-primary", t.borderPrimary));
+        sb.Append(Style.Tok("border-secondary", t.borderSecondary));
+        sb.Append(Style.Tok("border-hover", t.borderHover));
+        sb.Append(Style.Tok("border-focus", t.borderFocus));
+        sb.Append(Style.Tok("divider", t.divider));
+        sb.Append(Style.Tok("shadow-color", t.shadowColor));
+        sb.Append(Style.Tok("drawer-edge-shadow",
+                          App.WithAlpha(t.shadowColor, 26)));
+        sb.Append(Style.Tok("titlebar-glass-bg",
+                          App.WithAlpha(t.bgSecondary, 200)));
+        sb.Append(Style.Tok("titlebar-glass-sheen",
+                          App.WithAlpha(t.textPrimary, 26)));
+        sb.Append(Style.Tok("window-glass-clear",
+                          App.WithAlpha(t.bgPrimary, 198)));
+        sb.Append(Style.Tok("window-glass-sheen",
+                          App.WithAlpha(t.textPrimary, 255)));
+        sb.Append(Style.Tok("window-glass-edge",
+                          App.WithAlpha(t.textPrimary, 130)));
+        sb.Append(Style.Tok("window-glass-highlight",
+                          App.WithAlpha(t.textPrimary, 70)));
+        sb.Append(Style.Tok("styledtext-selection",
+                          App.ScaleAlpha(t.primary, 90)));
+        sb.Append(Style.Tok("styledtext-code-bg",
+                          App.ScaleAlpha(t.bgTertiary, 160)));
+        sb.Append(Style.Tok("styledtext-rail-success", t.success));
+        sb.Append(Style.Tok("styledtext-tint-success",
+                          App.ScaleAlpha(t.success, 16)));
+        sb.Append(Style.Tok("styledtext-rail-primary", t.primary));
+        sb.Append(Style.Tok("styledtext-tint-primary",
+                          App.ScaleAlpha(t.primary, 34)));
+        sb.Append(Style.Tok("styledtext-rail-tool", t.textTertiary));
+        sb.Append(Style.Tok("styledtext-tint-tool",
+                          App.ScaleAlpha(t.bgTertiary, 90)));
+        sb.Append(Style.Tok("styledtext-rail-error", t.error));
+        sb.Append(Style.Tok("styledtext-tint-error",
+                          App.ScaleAlpha(t.error, 30)));
+        // 代码编辑器语法色：默认调色板由 CodeEditor 自带（部件规则
+        // 未声明时回退 EditorPalette.For），Style 不再把调色板烘进
+        // token——Style 编译图因此不背 Component.CodeEditor 目录
+        // （auto-stdlib 按需拉取，皮肤 core 不拉编辑器）。皮肤改写
+        // codeeditor:: 部件规则即可定制配色。
+        sb.Append(Style.Tok("caption-close-bg",
+                          App.WithAlpha(Theme.Rgb(232, 17, 35), 255)));
+        sb.Append(Style.Tok("tooltip-bg", t.tooltipBg));
+        sb.Append(Style.Tok("tooltip-border", t.tooltipBorder));
+        sb.Append(Style.Tok("tooltip-text", t.tooltipText));
+        // 表面形态 token：卡片/面板/停靠区的背景、磨砂、圆角、
+        // 边框、投影和光泽都从这里取值，玻璃与不透明主题的差异
+        // 就是这几个数字——玻璃的画法因此存在 base.css 里，
+        // 而不是撑在控件或 Style.Shell 的分支里。皮肤可以改
+        // `--glass-*` token，也可以直接改写组件规则。
+        bool glass = t.glass != 0;
+        int surfBg = t.bgPrimary;
+        if (glass) { surfBg = App.ScaleAlpha(t.bgPrimary, t.glassTint); }
+        sb.Append(Style.Tok("surface-bg", surfBg));
+        int fieldBg = t.bgPrimary;
+        if (glass) { fieldBg = App.ScaleAlpha(t.bgPrimary, 700); }
+        sb.Append(Style.Tok("field-bg", fieldBg));
+        // 弹层底色（上下文菜单/下拉/富菜单）：不透明主题沿用次级
+        // 底色；玻璃主题下弹层浮在磨砂内容甚至壁纸之上，卡片那层
+        // 两成的表面色调会把文字压得融进背景，弹层取接近不透明的
+        // 底，配合 base.css 浮层规则的表面磨砂保证可读。
+        int popupBg = t.bgSecondary;
+        if (glass) { popupBg = App.ScaleAlpha(t.bgPrimary, 820); }
+        sb.Append(Style.Tok("popup-bg", popupBg));
+        // 字段选区与滚动条：过去在 Input/TextArea 每帧现混
+        // （LerpColor），现在导出为 token，混色只在主题切换时发生一次。
+        sb.Append(Style.Tok("selection-bg",
+                          App.LerpColor(t.bgPrimary, t.primary, 96)));
+        sb.Append(Style.Tok("scrollbar", t.scrollbar));
+        sb.Append(Style.Tok("scrollbar-hover", t.scrollbarHover));
+        // 遮罩与媒体层：模态压暗层、全屏媒体 scrim 及其上的
+        // 待机控件/文字色。浮层控件（Layer/Tooltip）从这些 token
+        // 取色，绘制路径不再直接读主题字段。
+        sb.Append(Style.Tok("overlay", t.overlay));
+        sb.Append(Style.Tok("scrim", t.scrim));
+        sb.Append(Style.Tok("scrim-chip", t.scrimChip));
+        sb.Append(Style.Tok("scrim-chip-hover", t.scrimChipHover));
+        sb.Append(Style.Tok("on-scrim", t.onScrim));
+        sb.Append(Style.Tok("tooltip-text-muted", t.tooltipTextMuted));
+        // 停靠区这类大面积外壳用更浓的色调：整块面板若只上卡片那么淡
+        // 的一层，背后的壁纸会把文字压得读不清。
+        int dockBg = t.bgTertiary;
+        if (glass) { dockBg = App.ScaleAlpha(t.bgTertiary, t.glassChromeTint); }
+        sb.Append(Style.Tok("dock-bg", dockBg));
+        // 拖放高亮底色：过去由 DockHost 每帧 Style.Fade(t.primary, 260)
+        // 计算，现在在换肤时导出为 token。
+        sb.Append(Style.Tok("drop-tint", Style.Fade(t.primary, 260)));
+        int surfBlur = 0;
+        int surfSheen = 0;
+        // 这些是按 100% 书写的 CSS 长度（ScaleLayout 会按显示缩放），
+        // 因此这里不能塞已经按 DPI 缩放过的主题度量。
+        int surfRadius = t.borderRadiusMedium;
+        int surfBorderW = 1;
+        int surfShadowDy = 2;
+        int surfShadowBlur = 0;
+        if (glass) {
+            surfBlur = t.glassBlur;
+            surfSheen = t.glassSheen;
+            surfRadius = t.glassRadius;
+            surfBorderW = 1;
+            surfShadowDy = t.glassShadowDy;
+            surfShadowBlur = t.glassShadowBlur;
+        }
+        sb.Append(Style.TokN("surface-blur", surfBlur));
+        sb.Append(Style.TokN("surface-sheen", surfSheen));
+        sb.Append(Style.TokN("surface-radius", surfRadius));
+        sb.Append(Style.TokN("surface-border-w", surfBorderW));
+        sb.Append(Style.TokN("surface-shadow-dy", surfShadowDy));
+        sb.Append(Style.TokN("surface-shadow-blur", surfShadowBlur));
+        // 按钮/tab 的角色色与其状态色：过去按钮的颜色在
+        // ButtonDefaults 里按类名和状态现算，皮肤想改一个按下色
+        // 也无从下手。现在主题只导出 token，“哪个 token 画哪个
+        // 状态”写在 base.css 里。
+        sb.Append(Style.Tok("primary-hover", t.primaryHover));
+        sb.Append(Style.Tok("primary-pressed", t.primaryPressed));
+        sb.Append(Style.Tok("info-hover", t.infoHover));
+        sb.Append(Style.Tok("info-pressed", t.infoPressed));
+        sb.Append(Style.Tok("success-hover", t.successHover));
+        sb.Append(Style.Tok("success-pressed", t.successPressed));
+        sb.Append(Style.Tok("warning-hover", t.warningHover));
+        sb.Append(Style.Tok("warning-pressed", t.warningPressed));
+        sb.Append(Style.Tok("error-hover", t.errorHover));
+        sb.Append(Style.Tok("error-pressed", t.errorPressed));
+        sb.Append(Style.VariantTokens("primary", t.primary, t.bgPrimary));
+        sb.Append(Style.VariantTokens("info", t.info, t.bgPrimary));
+        sb.Append(Style.VariantTokens("success", t.success, t.bgPrimary));
+        sb.Append(Style.VariantTokens("warning", t.warning, t.bgPrimary));
+        sb.Append(Style.VariantTokens("error", t.error, t.bgPrimary));
+        // 中性（无角色类）的 ghost/secondary 以主文字色为色调。
+        sb.Append(Style.VariantTokens("neutral", t.textPrimary, t.bgPrimary));
+        // 禁用形状：在任何主题下都保持可见的弱化盒子。文字色由
+        // Style.Shell 统一压成 --text-disabled，这里只给填充和描边。
+        sb.Append(Style.Tok("disabled-bg", t.borderPrimary));
+        sb.Append(Style.Tok("disabled-fg",
+                          App.LerpColor(t.borderPrimary, t.textPrimary, 110)));
+        sb.Append(Style.Tok("disabled-border",
+                          App.LerpColor(t.borderPrimary, t.textPrimary, 45)));
+        sb.Append("}\n");
+        return sb.ToString();
+    }
+
+    // 一个角色的 ghost / secondary 变体色。CSS 没有混色函数，而
+    // 这些混色只随主题变化，所以在导出 token 时算一次：
+    // ghost 用角色色的低透明度作悬停/按下底色，secondary 是
+    // 角色色与页面底色的浅混。皮肤可以逐个 token 改写。
+    public static string VariantTokens(string name, int tint, int surface) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Style.Tok(name + "-ghost-hover-bg", App.ScaleAlpha(tint, 120)));
+        sb.Append(Style.Tok(name + "-ghost-active-bg", App.ScaleAlpha(tint, 215)));
+        sb.Append(Style.Tok(name + "-soft-bg", App.LerpColor(surface, tint, 90)));
+        sb.Append(Style.Tok(name + "-soft-hover-bg",
+                          App.LerpColor(surface, tint, 150)));
+        sb.Append(Style.Tok(name + "-soft-active-bg",
+                          App.LerpColor(surface, tint, 200)));
+        return sb.ToString();
+    }
+
+    // 颜色 token 行 `--name: #AARRGGBB`（值经 Hex8 输出，可被
+    // StyleSheet.HexToInt 原样往返）。
+    public static string Tok(string name, int v) {
+        return "  --" + name + ": #" + Style.Hex8(v) + ";\n";
+    }
+
+    // 数值 token（长度/强度/开关），以十进制输出。
+    public static string TokN(string name, int v) {
+        return "  --" + name + ": " + Convert.ToString(v) + ";\n";
+    }
+
+    // 时长 token：`--name: 200ms;`。时长是时间不是长度——不随
+    // DPI/密度缩放，所以不写 px 也不进物理度量名单。
+    public static string TokMs(string name, int v) {
+        return "  --" + name + ": " + Convert.ToString(v) + "ms;\n";
+    }
+
+    // UA 样式表（WEB_GUI_ROADMAP P0）：web 元素的缺省语义，垫在
+    // 装载链最底（App.ApplyAppCss 第一个 merge），皮肤与应用样式
+    // 按正常层叠覆盖。只给纯布局/排版 tag——与真控件 Kind 撞名的
+    // （label/button/form/input/...）不给，避免改变现有控件的
+    // display 归类。label 尤其不能给 display:block：块流容器里的
+    // Label 控件文本是控件内绘、不是流内子节点，display=3 会让它
+    // 被空块测量塌成 0 高（conformance_gui_ua_label 钉死此契约）。
+    public static string UaCss() {
+        return "div, p, section, article, header, footer, nav, aside, main,"
+            + " ul, ol, li, dl, dt, dd, h1, h2, h3, h4, h5, h6, blockquote,"
+            + " figure, figcaption, pre, address, body, panel, card, dialog, popup { display: block; }\n"
+            + "span, a, strong, em, b, i, u, s, code, small, sub, sup, abbr,"
+            + " cite, q, time, mark { display: inline; }\n"
+            + "p, blockquote, ul, ol, dl, figure, address, pre"
+            + " { margin: 1em 0; }\n"
+            + "h1 { font-size: 2em; margin: 0.67em 0; }\n"
+            + "h2 { font-size: 1.5em; margin: 0.75em 0; }\n"
+            + "h3 { font-size: 1.17em; margin: 0.83em 0; }\n"
+            + "h4 { font-size: 1em; margin: 1em 0; }\n"
+            + "h5 { font-size: 0.83em; margin: 1.5em 0; }\n"
+            + "h6 { font-size: 0.67em; margin: 1.67em 0; }\n"
+            + "ul, ol, dd { padding-left: 40px; }\n"
+            + "pre { white-space: pre; }\n"
+            + "body { margin: 0; padding: 0; }\n"
+            // <a> 的链接示能（affordance）：主题主色（点击导航由
+            // Html.AutoLink 在建树时接，见 docs/HTML_UI.md）。不发
+            // cursor: pointer——StyleBox.cursor 在 retained 模式没有
+            // 消费点（写而不读，见 TASKS.md A47）；text-decoration:
+            // underline 没有绘制原语，色差即链接的桌面示能。
+            + "a { color: var(--primary); }\n"
+            // <template data-for> 的原型行：声明本身不显示（Chrome
+            // 语义），运行时由 ChildWindow 逐项克隆展开。
+            + "template { display: none; }\n";
+    }
+
+    // 尺寸档对应的主题字号：tiny/small/large/huge，
+    // medium 与未知档回退 fontSizeMedium。
+    public static int FontFallback(App app, string size) {
+        Theme t = app.theme;
+        if (size == "tiny") { return t.fontSizeTiny; }
+        if (size == "small") { return t.fontSizeSmall; }
+        if (size == "large") { return t.fontSizeLarge; }
+        if (size == "huge") { return t.fontSizeHuge; }
+        return t.fontSizeMedium;
+    }
+
+    // 把 32 位颜色输出为 8 位十六进制（#AARRGGBB），按二进制补码
+    // 逐 nibble 提取，这样经 StyleSheet.HexToInt 能原样往返
+    // 回同一个带符号 int——与 `%` 的符号约定无关。
+    public static string Hex8(int v) {
+        int x = v;
+        string outp = "";
+        for (int i = 0; i < 8; i = i + 1) {
+            int nib = x % 16;
+            if (nib < 0) { nib = nib + 16; }
+            outp = Style.HexDigit(nib) + outp;
+            x = (x - nib) / 16;
+        }
+        return outp;
+    }
+
+    // 0–15 的单个十六进制大写数字字符。
+    public static string HexDigit(int n) {
+        if (n == 10) { return "A"; }
+        if (n == 11) { return "B"; }
+        if (n == 12) { return "C"; }
+        if (n == 13) { return "D"; }
+        if (n == 14) { return "E"; }
+        if (n == 15) { return "F"; }
+        return Convert.ToString(n);
+    }
+
+    // 对直接绘制在给定区域内、不拥有表面的
+    // 类型返回 true，这样皮肤的全局边框和阴影外壳就不会
+    // 给它们框出盒子。
+    public static bool FlatType(string type) {
+        return type == "ribbon" || type == "label" || type == "text"
+            || type == "empty" || type == "window"
+            || type == "result" || type == "spin" || type == "timeline"
+            || type == "steps" || type == "breadcrumb" || type == "pageheader";
+    }
+
+    // `tiny` / `small` / `medium` / `large` 类对应的尺寸档位，
+    // 作用于高度、字号和水平内边距。所有带尺寸的控件
+    // （button、tag 等）共用它，所以 `button.large` 和 `tag.large` 表示
+    // 同一档，皮肤仍可覆写其中任何一项。
+    public static void SizeDefaults(App app, StyleBox b, string cls) {
+        Theme t = app.theme;
+        if (Style.Has(cls, "tiny")) {
+            b.height = t.heightTiny; b.fontPx = t.fontSizeTiny;
+            b.padL = t.paddingSmall; b.padR = t.paddingSmall;
+        } else if (Style.Has(cls, "small")) {
+            b.height = t.heightSmall; b.fontPx = t.fontSizeSmall;
+            b.padL = t.paddingMedium; b.padR = t.paddingMedium;
+        } else if (Style.Has(cls, "large")) {
+            b.height = t.heightLarge; b.fontPx = t.fontSizeLarge;
+            b.padL = t.paddingLarge + t.gapSmall;
+            b.padR = t.paddingLarge + t.gapSmall;
+        } else if (Style.Has(cls, "medium")) {
+            b.height = t.heightMedium; b.fontPx = t.fontSizeMedium;
+            b.padL = t.paddingLarge; b.padR = t.paddingLarge;
+        }
+        // 无尺寸类：什么都不设置，所有读取方回退到
+        // 传入 HeightOr/FontOr/PadLOr 的 medium 主题度量。
+    }
+
+    // 下面的名称是设计系统的词汇表：控件始终只把
+    // 类列表交给解析器，皮肤可以在 CSS 中重新定义其中任意一个。
+    // int 形式服务于数据驱动的调用方（设计文档、
+    // 场景文件），它们把变体存储为数字。
+
+    // 语义类型：1 primary，2 info，3 success，4 warning，5 error。
+    public static string TypeClass(int type) {
+        switch (type) {
+            case 1: return "primary";
+            case 2: return "info";
+            case 3: return "success";
+            case 4: return "warning";
+            case 5: return "error";
+            default: return "";
+        }
+    }
+
+    // 列表已携带的角色类（"primary" … "error"），中性时返回 ""。
+    // 需要按角色选择图标或部件样式的控件
+    // 读取它，而不是自行逐个判断角色名。
+    public static string RoleClass(string cls) {
+        int i = 1;
+        while (i <= 5) {
+            string role = Style.TypeClass(i);
+            if (Style.Has(cls, role)) { return role; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // 填充方式：1 outline，2 text，3 dashed（0 = solid，无类）。
+    public static string FillClass(int fill) {
+        switch (fill) {
+            case 1: return "outline";
+            case 2: return "text";
+            case 3: return "dashed";
+            default: return "";
+        }
+    }
+
+    // 尺寸：0 tiny，1 small，2 medium，3 large。
+    public static string SizeClass(int size) {
+        switch (size) {
+            case 0: return "tiny";
+            case 1: return "small";
+            case 3: return "large";
+            default: return "medium";
+        }
+    }
+
+    // 条目在序列中的位置：`done` 表示在当前项之前，
+    // `active` 是当前项，`pending` 在其后，失败时为 `error`。所有
+    // 序列展示（步骤指示器、时间线、向导轨道）共用它，
+    // 这样一条皮肤规则即可统一各处同一状态的样式。
+    public static string StateClass(int index, int current, int errorIndex) {
+        if (index == errorIndex) { return "error"; }
+        if (index < current) { return "done"; }
+        if (index == current) { return "active"; }
+        return "pending";
+    }
+
+    // 把不透明打包颜色的 alpha 缩放到 `a` 千分比（0..1000），
+    // 任何元素都能通过它绘制来实现淡入淡出。
+    public static int Fade(int color, int a) {
+        if (a >= 1000) { return color; }
+        if (a < 0) { a = 0; }
+        int rgb = color % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        return (255 * a / 1000) * 16777216 + rgb;
+    }
+
+    // 供没有自己的 StyleBox、直接绘制按钮型表面的控件使用
+    // （按钮组、功能带、工具栏），所以它们接收 int。
+
+    // 按钮类型的强调色（默认回退到主文字色，
+    // 保证 tinted/ghost/text 样式仍然可读）。
+    public static int TypeColor(Theme t, int type) {
+        if (type == 1) { return t.primary; }
+        if (type == 2) { return t.info; }
+        if (type == 3) { return t.success; }
+        if (type == 4) { return t.warning; }
+        if (type == 5) { return t.error; }
+        return t.textPrimary;
+    }
+
+    // 给定交互状态下按钮型表面的背景。
+    // `style` 0 = solid，1 = outline。
+    public static int TypeFill(Theme t, int type, int style, bool hovered, bool pressed) {
+        int tc = Style.TypeColor(t, type);
+        if (style == 1) {
+            if (pressed) { return App.LerpColor(t.bgPrimary, tc, 55); }
+            if (hovered) { return App.LerpColor(t.bgPrimary, tc, 28); }
+            return t.bgPrimary;
+        }
+        if (type == 0) {
+            if (pressed) { return t.bgActive; }
+            if (hovered) { return t.bgHover; }
+            return t.bgPrimary;
+        }
+        if (pressed) { return App.LerpColor(tc, (int)4278190080, 150); }
+        if (hovered) { return App.LerpColor(tc, (int)4294967295, 150); }
+        return tc;
+    }
+
+    // 与 TypeFill 匹配的前景（label）颜色。
+    public static int TypeFg(Theme t, int type, int style) {
+        if (style == 1 || type == 0) {
+            if (type == 0) { return t.textPrimary; }
+            return Style.TypeColor(t, type);
+        }
+        return t.textInverse;
+    }
+
+    // 按钮的几何量与非声明式装饰。颜色（角色、变体、各状态）
+    // 全在 skins/base.css 里，这里一律不碰——否则皮肤写了
+    // `button.primary:active` 也改不动一个按下色。
+    public static void ButtonDefaults(App app, StyleBox b, string cls, bool active,
+                               bool disabled) {
+        Theme t = app.theme;
+        b.SetRadius(t.borderRadiusMedium);
+        b.gap = t.gapSmall;
+        b.align = 1;
+        Style.SizeDefaults(app, b, cls);
+        // 堆叠命令（图标在上、文字在下）按内容测量，所以
+        // 它去掉尺寸档的固定高度和过宽的侧边内边距。
+        if (Style.Has(cls, "stacked")) {
+            b.height = -1;
+            b.padL = t.paddingTiny;
+            b.padR = t.paddingTiny;
+            b.padT = t.paddingTiny;
+            b.padB = t.paddingTiny;
+            b.gap = t.paddingTiny;
+        }
+        if (Style.Has(cls, "align-left")) { b.align = 0; }
+        // 形状与装饰在此按类选择，这样控件只绘制一个
+        // 已解析的 box，皮肤可以在 CSS 中覆写其中任意部分。
+        if (Style.Has(cls, "round") || Style.Has(cls, "circle")) {
+            b.SetRadius(9999);
+        }
+        if (Style.Has(cls, "dashed")) { b.borderStyle = 1; }
+        if (Style.Has(cls, "specular")) { b.specular = 1; }
+        if (t.neu == 1 && !disabled) {
+            b.emboss = 1;
+            if (active) { b.emboss = 2; }
+        }
+    }
+
+    // 通用表面（卡片/面板）的主题默认值：背景、文字、圆角、细边框、
+    // 柔和投影与四边内边距；玻璃主题改为半透明色调 + 背景模糊并去
+    // 边框。解析主路径的这些外观已改由 skins/base.css 声明，此方法
+    // 当前无调用方，保留给绕过 CSS 的场景。
+    public static void SurfaceDefaults(App app, StyleBox b, string cls) {
+        Theme t = app.theme;
+        b.bg = t.bgPrimary;
+        b.fg = t.textPrimary;
+        b.SetRadius(t.borderRadiusMedium);
+        b.borderColor = t.borderSecondary;
+        b.borderW = 1;
+        b.shadow = t.shadowColor;
+        b.shadowDx = 1;
+        b.shadowDy = 2;
+        b.padL = t.paddingLarge;
+        b.padT = t.paddingLarge;
+        b.padR = t.paddingLarge;
+        b.padB = t.paddingLarge;
+        if (t.glass != 0) {
+            // 磨砂皮肤：模糊背景并叠加半透明色调，
+            // 而不是不透明填充。
+            b.blur = 36;
+            b.bg = App.ScaleAlpha(t.bgPrimary, 260);
+            // 不加浅色描边：每张卡片、面板和弹层外围的
+            // 近白细线会显得像画上去的轮廓（并且与
+            // 旁边的分隔线叠加变粗）。磨砂和色调已足够把玻璃表面
+            // 与背景区分开。
+            b.borderW = 0;
+        }
+    }
+
+    // 单个标签页的几何量。颜色（基础/悬停/选中、下划线与卡片
+    // 描边）在 skins/base.css 的 `tab`、`tab.card`、`tab.segment`
+    // 规则里。
+    public static void TabDefaults(App app, StyleBox b, string cls) {
+        Theme t = app.theme;
+        b.align = 1;
+        b.SetRadius(0);
+        if (Style.Has(cls, "card")) {
+            b.SetRadius(t.borderRadiusMedium);
+        } else if (Style.Has(cls, "segment")) {
+            b.SetRadius(t.borderRadiusSmall);
+        }
+    }
+
+
+    // 把控件自身的 inline 样式（Control.Bg/Radius/Border/... 或 UiDoc 应用的
+    // CSS）叠加到已解析的 box 上，使 retained-mode 控件与
+    // immediate-mode 控件共用一条解析路径。
+    public static void Inline(StyleBox b, Control c) {
+        if (c == null) { return; }
+        int resolvedFont = b.fontPx;
+        bool fontPhysical = b.IsPrescaled(StyleBox.SourceFont());
+        if (c.styleBg != 0) { b.bg = c.styleBg; b.bgTo = c.styleBgTo; }
+        if (c.styleRadius != 0) {
+            b.SetRadius(b.ScaleLogical(c.styleRadius));
+            b.SetPrescaled(StyleBox.SourceRadius() | StyleBox.SourceRadiusTL()
+                | StyleBox.SourceRadiusTR() | StyleBox.SourceRadiusBR()
+                | StyleBox.SourceRadiusBL(), true);
+        }
+        if (c.styleCorners != 0) { b.SetCorners(c.styleCorners); }
+        if (c.styleBorderColor != 0) { b.borderColor = c.styleBorderColor; }
+        if (c.styleBorderWidth != 0) {
+            b.borderW = b.ScaleLogical(c.styleBorderWidth);
+            b.SetPrescaled(StyleBox.SourceBorder(), true);
+        }
+        if (c.styleShadow != 0) {
+            b.shadow = c.styleShadow;
+            b.shadowDy = c.styleShadowDy;
+            b.SetPrescaled(StyleBox.SourceShadowDy(), false);
+        }
+        if (c.styleColor != 0) { b.fg = c.styleColor; }
+        if (c.styleFontPx != 0) {
+            b.fontPx = b.ScaleLogical(c.styleFontPx);
+            b.SetPrescaled(StyleBox.SourceFont(), true);
+        }
+        if (c.styleTransitionMs != 0) { b.transitionMs = c.styleTransitionMs; }
+        StyleSheet.ReplayInline(b, c, resolvedFont, fontPhysical);
+    }
+}
