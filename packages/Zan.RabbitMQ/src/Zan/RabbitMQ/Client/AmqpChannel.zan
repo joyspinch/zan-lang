@@ -1,0 +1,459 @@
+using System;
+using System.Collections.Generic;
+
+namespace Zan.RabbitMQ;
+
+// AMQP 0-9-1 多路复用虚拟信道与协议方法交互接口。
+public class AmqpChannel : IDisposable {
+    private int channelId;
+    private AmqpConnection conn;
+    private bool open;
+    private Gate rpcGate;
+    private int expectedClass;
+    private int expectedMethod;
+    private bool rpcSuccess;
+    private string rpcError;
+    private string declaredQueue;
+    private int messageCount;
+    private int consumerCount;
+
+    // 活跃消费者表：consumerTag -> AmqpConsumer
+    private Dictionary<string, AmqpConsumer> consumers;
+
+    // 当前正在组装的多帧投递消息
+    private AmqpMessage currentDelivery;
+    private int deliveryBodyRemaining;
+    private byte[] deliveryBodyBuf;
+    private int deliveryBodyOffset;
+
+    public int ChannelId() { return this.channelId; }
+    public bool IsOpen() { return this.open; }
+
+    public AmqpChannel(int channelId, AmqpConnection conn) {
+        this.channelId = channelId;
+        this.conn = conn;
+        this.open = true;
+        this.rpcGate = new Gate();
+        this.expectedClass = 0;
+        this.expectedMethod = 0;
+        this.rpcSuccess = false;
+        this.rpcError = "";
+        this.declaredQueue = "";
+        this.messageCount = 0;
+        this.consumerCount = 0;
+        this.consumers = new Dictionary<string, AmqpConsumer>();
+        this.currentDelivery = null;
+        this.deliveryBodyRemaining = 0;
+        this.deliveryBodyBuf = null;
+        this.deliveryBodyOffset = 0;
+    }
+
+    // 声明交换机 (Exchange.Declare)
+    public async bool ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete) {
+        if (!this.open) { return false; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_EXCHANGE);
+        w.WriteShort(AmqpConstants.METHOD_EXCHANGE_DECLARE);
+        w.WriteShort(0); // ticket
+        w.WriteShortString(exchange);
+        w.WriteShortString(type != null && type.Length > 0 ? type : "direct");
+        w.WriteBit(false); // passive
+        w.WriteBit(durable);
+        w.WriteBit(autoDelete);
+        w.WriteBit(false); // internal
+        w.WriteBit(false); // nowait
+        w.FlushBits();
+        w.WriteTable(null); // arguments
+        byte[] payload = w.ToBytes();
+
+        return await this.ExecuteRpcAsync(payload, AmqpConstants.CLASS_EXCHANGE, AmqpConstants.METHOD_EXCHANGE_DECLARE_OK);
+    }
+
+    // 删除交换机 (Exchange.Delete)
+    public async bool ExchangeDeleteAsync(string exchange, bool ifUnused) {
+        if (!this.open) { return false; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_EXCHANGE);
+        w.WriteShort(AmqpConstants.METHOD_EXCHANGE_DELETE);
+        w.WriteShort(0); // ticket
+        w.WriteShortString(exchange);
+        w.WriteBit(ifUnused);
+        w.WriteBit(false); // nowait
+        w.FlushBits();
+        return await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_EXCHANGE, AmqpConstants.METHOD_EXCHANGE_DELETE_OK);
+    }
+
+    // 声明队列 (Queue.Declare)
+    public async string QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete) {
+        if (!this.open) { return ""; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_QUEUE);
+        w.WriteShort(AmqpConstants.METHOD_QUEUE_DECLARE);
+        w.WriteShort(0); // ticket
+        w.WriteShortString(queue != null ? queue : "");
+        w.WriteBit(false); // passive
+        w.WriteBit(durable);
+        w.WriteBit(exclusive);
+        w.WriteBit(autoDelete);
+        w.WriteBit(false); // nowait
+        w.FlushBits();
+        w.WriteTable(null); // arguments
+
+        bool ok = await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_DECLARE_OK);
+        if (ok) {
+            return this.declaredQueue.Length > 0 ? this.declaredQueue : queue;
+        }
+        return "";
+    }
+
+    // 绑定队列到交换机 (Queue.Bind)
+    public async bool QueueBindAsync(string queue, string exchange, string routingKey) {
+        if (!this.open) { return false; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_QUEUE);
+        w.WriteShort(AmqpConstants.METHOD_QUEUE_BIND);
+        w.WriteShort(0); // ticket
+        w.WriteShortString(queue);
+        w.WriteShortString(exchange);
+        w.WriteShortString(routingKey != null ? routingKey : "");
+        w.WriteBit(false); // nowait
+        w.FlushBits();
+        w.WriteTable(null); // arguments
+        return await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_BIND_OK);
+    }
+
+    // 解绑队列 (Queue.Unbind)
+    public async bool QueueUnbindAsync(string queue, string exchange, string routingKey) {
+        if (!this.open) { return false; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_QUEUE);
+        w.WriteShort(AmqpConstants.METHOD_QUEUE_UNBIND);
+        w.WriteShort(0); // ticket
+        w.WriteShortString(queue);
+        w.WriteShortString(exchange);
+        w.WriteShortString(routingKey != null ? routingKey : "");
+        w.WriteTable(null); // arguments
+        return await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_UNBIND_OK);
+    }
+
+    // 清空队列 (Queue.Purge)
+    public async int QueuePurgeAsync(string queue) {
+        if (!this.open) { return -1; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_QUEUE);
+        w.WriteShort(AmqpConstants.METHOD_QUEUE_PURGE);
+        w.WriteShort(0); // ticket
+        w.WriteShortString(queue);
+        w.WriteBit(false); // nowait
+        w.FlushBits();
+        bool ok = await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_PURGE_OK);
+        return ok ? this.messageCount : -1;
+    }
+
+    // 删除队列 (Queue.Delete)
+    public async int QueueDeleteAsync(string queue, bool ifUnused, bool ifEmpty) {
+        if (!this.open) { return -1; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_QUEUE);
+        w.WriteShort(AmqpConstants.METHOD_QUEUE_DELETE);
+        w.WriteShort(0); // ticket
+        w.WriteShortString(queue);
+        w.WriteBit(ifUnused);
+        w.WriteBit(ifEmpty);
+        w.WriteBit(false); // nowait
+        w.FlushBits();
+        bool ok = await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_DELETE_OK);
+        return ok ? this.messageCount : -1;
+    }
+
+    // 设置消费者流控配额 (Basic.Qos)
+    public async bool BasicQosAsync(int prefetchCount, bool global) {
+        if (!this.open) { return false; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_BASIC);
+        w.WriteShort(AmqpConstants.METHOD_BASIC_QOS);
+        w.WriteLong(0); // prefetch-size
+        w.WriteShort(prefetchCount);
+        w.WriteBit(global);
+        w.FlushBits();
+        return await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_BASIC, AmqpConstants.METHOD_BASIC_QOS_OK);
+    }
+
+    // 发布字符串消息 (Basic.Publish + Header + Body)
+    public async bool BasicPublishAsync(string exchange, string routingKey, string body, BasicProperties props) {
+        if (body == null) { body = ""; }
+        byte[] b = body.ToBytes();
+        return await this.BasicPublishBytesAsync(exchange, routingKey, b, b.Length, props);
+    }
+
+    // 发布二进制消息 (分帧流水发送：Method 帧 -> Content Header 帧 -> Body 帧序列)
+    public async bool BasicPublishBytesAsync(string exchange, string routingKey, byte[] body, int bodyLen, BasicProperties props) {
+        if (!this.open || this.conn == null) { return false; }
+        if (props == null) { props = BasicProperties.CreateDefault(); }
+        if (body == null) { bodyLen = 0; }
+
+        // 1. 发送 Basic.Publish 方法帧 (Class 60, Method 40)
+        AmqpWriter mw = new AmqpWriter();
+        mw.WriteShort(AmqpConstants.CLASS_BASIC);
+        mw.WriteShort(AmqpConstants.METHOD_BASIC_PUBLISH);
+        mw.WriteShort(0); // ticket
+        mw.WriteShortString(exchange != null ? exchange : "");
+        mw.WriteShortString(routingKey != null ? routingKey : "");
+        mw.WriteBit(false); // mandatory
+        mw.WriteBit(false); // immediate
+        mw.FlushBits();
+        byte[] methodPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, mw.ToBytes(), mw.Length());
+        await this.conn.SendRawAsync(methodPkt, methodPkt.Length);
+
+        // 2. 发送 Content Header 帧 (Type 2: Class 60, Weight 0, BodySize 64-bit, Properties)
+        AmqpWriter hw = new AmqpWriter();
+        hw.WriteShort(AmqpConstants.CLASS_BASIC);
+        hw.WriteShort(0); // weight
+        hw.WriteLongLong((long)bodyLen); // body size
+        props.Encode(hw);
+        byte[] headerPkt = AmqpFrame.Encode(AmqpConstants.FRAME_HEADER, this.channelId, hw.ToBytes(), hw.Length());
+        await this.conn.SendRawAsync(headerPkt, headerPkt.Length);
+
+        // 3. 发送 Content Body 帧 (Type 3: 切片按协商的 frameMax 流水切分)
+        if (bodyLen > 0) {
+            int frameMax = this.conn.FrameMax() - 8;
+            if (frameMax <= 0) { frameMax = 131072; }
+            int offset = 0;
+            while (offset < bodyLen) {
+                int chunk = bodyLen - offset;
+                if (chunk > frameMax) { chunk = frameMax; }
+                byte[] chunkBuf = new byte[chunk];
+                NativeMemory.Copy((nint)chunkBuf, (nint)body + offset, chunk);
+                byte[] bodyPkt = AmqpFrame.Encode(AmqpConstants.FRAME_BODY, this.channelId, chunkBuf, chunk);
+                await this.conn.SendRawAsync(bodyPkt, bodyPkt.Length);
+                offset = offset + chunk;
+            }
+        }
+        return true;
+    }
+
+    // 注册异步消费者 (Basic.Consume)
+    public async string BasicConsumeAsync(string queue, bool autoAck, AmqpMessageHandler handler) {
+        if (!this.open) { return ""; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_BASIC);
+        w.WriteShort(AmqpConstants.METHOD_BASIC_CONSUME);
+        w.WriteShort(0); // ticket
+        w.WriteShortString(queue);
+        w.WriteShortString(""); // consumer-tag: 服务端自动分配
+        w.WriteBit(false); // no-local
+        w.WriteBit(autoAck);
+        w.WriteBit(false); // exclusive
+        w.WriteBit(false); // nowait
+        w.FlushBits();
+        w.WriteTable(null); // arguments
+
+        bool ok = await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_BASIC, AmqpConstants.METHOD_BASIC_CONSUME_OK);
+        if (ok && this.declaredQueue.Length > 0) {
+            string tag = this.declaredQueue;
+            AmqpConsumer c = new AmqpConsumer(queue, tag, autoAck, handler);
+            this.consumers[tag] = c;
+            return tag;
+        }
+        return "";
+    }
+
+    // 确认单条或多条已接收消息 (Basic.Ack)
+    public async void BasicAckAsync(long deliveryTag, bool multiple) {
+        if (!this.open || this.conn == null) { return; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_BASIC);
+        w.WriteShort(AmqpConstants.METHOD_BASIC_ACK);
+        w.WriteLongLong(deliveryTag);
+        w.WriteBit(multiple);
+        w.FlushBits();
+        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, w.ToBytes(), w.Length());
+        await this.conn.SendRawAsync(pkt, pkt.Length);
+    }
+
+    // 否定并拒绝单条或多条消息 (Basic.Nack - RabbitMQ 扩展)
+    public async void BasicNackAsync(long deliveryTag, bool multiple, bool requeue) {
+        if (!this.open || this.conn == null) { return; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_BASIC);
+        w.WriteShort(AmqpConstants.METHOD_BASIC_NACK);
+        w.WriteLongLong(deliveryTag);
+        w.WriteBit(multiple);
+        w.WriteBit(requeue);
+        w.FlushBits();
+        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, w.ToBytes(), w.Length());
+        await this.conn.SendRawAsync(pkt, pkt.Length);
+    }
+
+    // 拒绝单条消息 (Basic.Reject)
+    public async void BasicRejectAsync(long deliveryTag, bool requeue) {
+        if (!this.open || this.conn == null) { return; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_BASIC);
+        w.WriteShort(AmqpConstants.METHOD_BASIC_REJECT);
+        w.WriteLongLong(deliveryTag);
+        w.WriteBit(requeue);
+        w.FlushBits();
+        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, w.ToBytes(), w.Length());
+        await this.conn.SendRawAsync(pkt, pkt.Length);
+    }
+
+    // 开启发布者确认模式 (Confirm.Select)
+    public async bool ConfirmSelectAsync() {
+        if (!this.open) { return false; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_CONFIRM);
+        w.WriteShort(AmqpConstants.METHOD_CONFIRM_SELECT);
+        w.WriteBit(false); // nowait
+        w.FlushBits();
+        return await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_CONFIRM, AmqpConstants.METHOD_CONFIRM_SELECT_OK);
+    }
+
+    // 关闭信道 (Channel.Close)
+    public async void CloseAsync() {
+        if (!this.open || this.conn == null) { return; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_CHANNEL);
+        w.WriteShort(AmqpConstants.METHOD_CHANNEL_CLOSE);
+        w.WriteShort(AmqpConstants.REPLY_SUCCESS);
+        w.WriteShortString("Normal Shutdown");
+        w.WriteShort(0);
+        w.WriteShort(0);
+        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, w.ToBytes(), w.Length());
+        await this.conn.SendRawAsync(pkt, pkt.Length);
+        this.open = false;
+        if (this.rpcGate != null) {
+            this.rpcGate.SignalAll();
+        }
+    }
+
+    public void Dispose() {
+        this.open = false;
+        if (this.rpcGate != null) {
+            this.rpcGate.Close();
+            this.rpcGate = null;
+        }
+        if (this.consumers != null) {
+            this.consumers.Clear();
+            this.consumers = null;
+        }
+        this.conn = null;
+    }
+
+    // 同步等待特定 RPC 方法回复
+    private async bool ExecuteRpcAsync(byte[] methodPayload, int expectClass, int expectMethod) {
+        this.expectedClass = expectClass;
+        this.expectedMethod = expectMethod;
+        this.rpcSuccess = false;
+        this.rpcError = "";
+
+        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, methodPayload, methodPayload.Length);
+        await this.conn.SendRawAsync(pkt, pkt.Length);
+
+        // 在专属 Gate 上异步等待事件唤醒（最多 10000ms 超时）
+        await this.rpcGate.Wait(10000);
+        this.expectedClass = 0;
+        this.expectedMethod = 0;
+        return this.rpcSuccess;
+    }
+
+    // 内部帧派发处理（由 AmqpConnection 接收循环驱动）
+    internal void DispatchFrame(AmqpFrame frame) {
+        if (frame.type == AmqpConstants.FRAME_METHOD) {
+            this.HandleMethodFrame(frame.payload);
+        } else if (frame.type == AmqpConstants.FRAME_HEADER) {
+            this.HandleHeaderFrame(frame.payload);
+        } else if (frame.type == AmqpConstants.FRAME_BODY) {
+            this.HandleBodyFrame(frame.payload);
+        }
+    }
+
+    private void HandleMethodFrame(byte[] payload) {
+        if (payload == null || payload.Length < 4) { return; }
+        AmqpReader r = new AmqpReader(payload);
+        int cls = r.ReadShort();
+        int mtd = r.ReadShort();
+
+        if (cls == AmqpConstants.CLASS_BASIC && mtd == AmqpConstants.METHOD_BASIC_DELIVER) {
+            // 开始组装新的三段式投递消息
+            this.currentDelivery = new AmqpMessage();
+            this.currentDelivery.consumerTag = r.ReadShortString();
+            this.currentDelivery.deliveryTag = r.ReadLongLong();
+            this.currentDelivery.redelivered = r.ReadBit();
+            this.currentDelivery.exchange = r.ReadShortString();
+            this.currentDelivery.routingKey = r.ReadShortString();
+            return;
+        }
+
+        if (cls == AmqpConstants.CLASS_QUEUE && mtd == AmqpConstants.METHOD_QUEUE_DECLARE_OK) {
+            this.declaredQueue = r.ReadShortString();
+            this.messageCount = r.ReadLong();
+            this.consumerCount = r.ReadLong();
+        } else if (cls == AmqpConstants.CLASS_QUEUE && (mtd == AmqpConstants.METHOD_QUEUE_PURGE_OK || mtd == AmqpConstants.METHOD_QUEUE_DELETE_OK)) {
+            this.messageCount = r.ReadLong();
+        } else if (cls == AmqpConstants.CLASS_BASIC && mtd == AmqpConstants.METHOD_BASIC_CONSUME_OK) {
+            this.declaredQueue = r.ReadShortString(); // 保存 consumer-tag
+        }
+
+        if (cls == this.expectedClass && mtd == this.expectedMethod) {
+            this.rpcSuccess = true;
+            this.rpcGate.Signal();
+        } else if (cls == AmqpConstants.CLASS_CHANNEL && mtd == AmqpConstants.METHOD_CHANNEL_CLOSE) {
+            int code = r.ReadShort();
+            string text = r.ReadShortString();
+            this.rpcSuccess = false;
+            this.rpcError = text;
+            this.open = false;
+            this.rpcGate.Signal();
+        }
+    }
+
+    private void HandleHeaderFrame(byte[] payload) {
+        if (payload == null || payload.Length < 14) { return; }
+        AmqpReader r = new AmqpReader(payload);
+        int cls = r.ReadShort();
+        int weight = r.ReadShort();
+        long bodySize = r.ReadLongLong();
+        BasicProperties props = BasicProperties.Decode(r);
+
+        if (this.currentDelivery != null) {
+            this.currentDelivery.properties = props;
+            this.deliveryBodyRemaining = (int)bodySize;
+            this.deliveryBodyBuf = new byte[this.deliveryBodyRemaining];
+            this.deliveryBodyOffset = 0;
+            if (this.deliveryBodyRemaining == 0) {
+                this.FinishCurrentDelivery();
+            }
+        }
+    }
+
+    private void HandleBodyFrame(byte[] payload) {
+        if (this.currentDelivery == null || payload == null || payload.Length == 0) { return; }
+        int chunk = payload.Length;
+        if (chunk > this.deliveryBodyRemaining) { chunk = this.deliveryBodyRemaining; }
+        NativeMemory.Copy((nint)this.deliveryBodyBuf + (nint)this.deliveryBodyOffset, (nint)payload, chunk);
+        this.deliveryBodyOffset = this.deliveryBodyOffset + chunk;
+        this.deliveryBodyRemaining = this.deliveryBodyRemaining - chunk;
+
+        if (this.deliveryBodyRemaining <= 0) {
+            this.FinishCurrentDelivery();
+        }
+    }
+
+    private void FinishCurrentDelivery() {
+        if (this.currentDelivery == null) { return; }
+        this.currentDelivery.bodyBytes = this.deliveryBodyBuf;
+        this.currentDelivery.bodyLen = this.deliveryBodyOffset;
+        AmqpMessage msg = this.currentDelivery;
+        this.currentDelivery = null;
+        this.deliveryBodyBuf = null;
+
+        // 查找消费者并异步调度触发回调
+        if (this.consumers.ContainsKey(msg.consumerTag)) {
+            AmqpConsumer c = this.consumers[msg.consumerTag];
+            if (c.handler != null) {
+                Task.Spawn(c.handler(this, msg));
+            }
+        }
+    }
+}

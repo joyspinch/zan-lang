@@ -1,0 +1,403 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Threading;
+using Zan.RabbitMQ;
+
+class Program {
+    static int failures = 0;
+    static int PORT = 15672;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    // 单元测试 1：AMQP 二进制数据类型序列化与反序列化
+    static void TestPrimitives() {
+        AmqpWriter w = new AmqpWriter();
+        w.WriteOctet(254);
+        w.WriteShort(65530);
+        w.WriteLong(2147483000);
+        w.WriteLongLong(9223372036854770000L);
+        w.WriteShortString("hello amqp");
+        w.WriteLongString("very long amqp message content with multiple bytes");
+
+        // 位压缩
+        w.WriteBit(true);
+        w.WriteBit(false);
+        w.WriteBit(true);
+        w.FlushBits();
+
+        // 嵌套字典表
+        Dictionary<string, string> tbl = new Dictionary<string, string>();
+        tbl["x-max-length"] = "1000";
+        tbl["x-message-ttl"] = "60000";
+        tbl["cluster"] = "zan-node-1";
+        w.WriteTable(tbl);
+
+        byte[] bytes = w.ToBytes();
+        AmqpReader r = new AmqpReader(bytes);
+
+        Check(r.ReadOctet() == 254, "octet read");
+        Check(r.ReadShort() == 65530, "short read");
+        Check(r.ReadLong() == 2147483000, "long read");
+        Check(r.ReadLongLong() == 9223372036854770000L, "longlong read");
+        Check(r.ReadShortString() == "hello amqp", "shortstr read");
+        Check(r.ReadLongString() == "very long amqp message content with multiple bytes", "longstr read");
+
+        Check(r.ReadBit() == true, "bit 1 read");
+        Check(r.ReadBit() == false, "bit 2 read");
+        Check(r.ReadBit() == true, "bit 3 read");
+
+        Dictionary<string, string> decTbl = r.ReadTable();
+        Check(decTbl != null && decTbl["x-max-length"] == "1000", "table entry 1");
+        Check(decTbl["x-message-ttl"] == "60000", "table entry 2");
+        Check(decTbl["cluster"] == "zan-node-1", "table entry 3");
+    }
+
+    // 单元测试 2：帧封装与 BasicProperties 元数据位图编解码
+    static void TestFramingAndProps() {
+        byte[] payload = "test payload bytes".ToBytes();
+        byte[] frameBytes = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 5, payload, payload.Length);
+        Check(frameBytes.Length == 7 + payload.Length + 1, "frame len");
+        Check(frameBytes[0] == AmqpConstants.FRAME_METHOD, "frame type");
+        Check((frameBytes[frameBytes.Length - 1] & 255) == AmqpConstants.FRAME_END, "frame end");
+
+        AmqpFrame decHeader = AmqpFrame.DecodeHeader(frameBytes, 0);
+        Check(decHeader.type == AmqpConstants.FRAME_METHOD, "dec type");
+        Check(decHeader.channel == 5, "dec channel");
+        Check(decHeader.length == payload.Length, "dec len");
+
+        byte[] hb = AmqpFrame.BuildHeartbeat();
+        Check(hb.Length == 8 && hb[0] == AmqpConstants.FRAME_HEARTBEAT, "heartbeat build");
+
+        BasicProperties p = new BasicProperties();
+        p.contentType = "application/json";
+        p.contentEncoding = "gzip";
+        p.deliveryMode = 2;
+        p.priority = 9;
+        p.correlationId = "corr-101";
+        p.messageId = "msg-8888";
+        p.timestamp = 1700000000L;
+        p.headers["x-trace-id"] = "trace-zan-999";
+
+        AmqpWriter pw = new AmqpWriter();
+        p.Encode(pw);
+        byte[] propBytes = pw.ToBytes();
+
+        AmqpReader pr = new AmqpReader(propBytes);
+        BasicProperties decP = BasicProperties.Decode(pr);
+        Check(decP.contentType == "application/json", "prop contentType");
+        Check(decP.contentEncoding == "gzip", "prop contentEncoding");
+        Check(decP.deliveryMode == 2, "prop deliveryMode");
+        Check(decP.priority == 9, "prop priority");
+        Check(decP.correlationId == "corr-101", "prop correlationId");
+        Check(decP.messageId == "msg-8888", "prop messageId");
+        Check(decP.timestamp == 1700000000L, "prop timestamp");
+        Check(decP.headers != null && decP.headers["x-trace-id"] == "trace-zan-999", "prop headers");
+    }
+
+    // 进程内 Mock AMQP Broker 协程
+    static TcpListener serverListener;
+    static bool serverRunning = true;
+
+    static async void RunMockBroker() {
+        TcpListener l = new TcpListener("127.0.0.1", Program.PORT);
+        l.Start();
+        Program.serverListener = l;
+
+        while (Program.serverRunning) {
+            nint sock = await l.AcceptAsync();
+            if (sock >= 0) {
+                Task.Spawn(Program.HandleMockClient(sock));
+            }
+        }
+    }
+
+    static async int ReadExact(nint sock, byte[] outBuf, int count) {
+        if (outBuf == null || count <= 0) { return 0; }
+        int received = 0;
+        while (received < count) {
+            int n = await Socket.RecvPtrAsync(sock, (nint)outBuf + (nint)received, count - received);
+            if (n <= 0) { return -1; }
+            received = received + n;
+        }
+        return received;
+    }
+
+    static async void HandleMockClient(nint sock) {
+        try {
+            Socket.SetNoDelay(sock);
+            // 1. 读取 8 字节协议头部
+            byte[] protoHdr = new byte[8];
+            int rHdr = await Program.ReadExact(sock, protoHdr, 8);
+            if (rHdr < 8) { Socket.Close(sock); return; }
+
+            // 2. 发送 Connection.Start (Class 10, Method 10)
+            AmqpWriter sw = new AmqpWriter();
+            sw.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            sw.WriteShort(AmqpConstants.METHOD_CONNECTION_START);
+            sw.WriteOctet(0); // major
+            sw.WriteOctet(9); // minor
+            Dictionary<string, string> serverProps = new Dictionary<string, string>();
+            serverProps["product"] = "RabbitMQ";
+            serverProps["version"] = "3.12.0";
+            sw.WriteTable(serverProps);
+            sw.WriteLongString("PLAIN");
+            sw.WriteLongString("en_US");
+            byte[] startPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, sw.ToBytes(), sw.Length());
+            await Socket.SendAsync(sock, startPkt, startPkt.Length);
+
+            // 3. 读取 Connection.Start-Ok
+            byte[] frameHdr = new byte[7];
+            int r1 = await Program.ReadExact(sock, frameHdr, 7);
+            AmqpFrame fStartOk = AmqpFrame.DecodeHeader(frameHdr, 0);
+            byte[] pStartOk = new byte[fStartOk.length + 1];
+            await Program.ReadExact(sock, pStartOk, fStartOk.length + 1);
+
+            // 4. 发送 Connection.Tune (Class 10, Method 30)
+            AmqpWriter tw = new AmqpWriter();
+            tw.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            tw.WriteShort(AmqpConstants.METHOD_CONNECTION_TUNE);
+            tw.WriteShort(2047);
+            tw.WriteLong(131072);
+            tw.WriteShort(60);
+            byte[] tunePkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, tw.ToBytes(), tw.Length());
+            await Socket.SendAsync(sock, tunePkt, tunePkt.Length);
+
+            // 5. 读取 Connection.Tune-Ok
+            await Program.ReadExact(sock, frameHdr, 7);
+            AmqpFrame fTuneOk = AmqpFrame.DecodeHeader(frameHdr, 0);
+            byte[] pTuneOk = new byte[fTuneOk.length + 1];
+            await Program.ReadExact(sock, pTuneOk, fTuneOk.length + 1);
+
+            // 6. 读取 Connection.Open
+            await Program.ReadExact(sock, frameHdr, 7);
+            AmqpFrame fOpen = AmqpFrame.DecodeHeader(frameHdr, 0);
+            byte[] pOpen = new byte[fOpen.length + 1];
+            await Program.ReadExact(sock, pOpen, fOpen.length + 1);
+
+            // 7. 发送 Connection.Open-Ok
+            AmqpWriter ow = new AmqpWriter();
+            ow.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            ow.WriteShort(AmqpConstants.METHOD_CONNECTION_OPEN_OK);
+            ow.WriteShortString(""); // reserved-1
+            byte[] openOkPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, ow.ToBytes(), ow.Length());
+            await Socket.SendAsync(sock, openOkPkt, openOkPkt.Length);
+
+            // 循环处理信道与业务方法帧
+            while (Program.serverRunning) {
+                int r = await Program.ReadExact(sock, frameHdr, 7);
+                if (r < 7) { break; }
+                AmqpFrame f = AmqpFrame.DecodeHeader(frameHdr, 0);
+                if (f == null) { break; }
+                byte[] payloadWithEnd = new byte[f.length + 1];
+                int rp = await Program.ReadExact(sock, payloadWithEnd, f.length + 1);
+                if (rp < f.length + 1) { break; }
+
+                if (f.type == AmqpConstants.FRAME_METHOD) {
+                    AmqpReader mr = new AmqpReader(payloadWithEnd, 0, f.length);
+                    int cls = mr.ReadShort();
+                    int mtd = mr.ReadShort();
+
+                    if (cls == AmqpConstants.CLASS_CHANNEL && mtd == AmqpConstants.METHOD_CHANNEL_OPEN) {
+                        AmqpWriter cw = new AmqpWriter();
+                        cw.WriteShort(AmqpConstants.CLASS_CHANNEL);
+                        cw.WriteShort(AmqpConstants.METHOD_CHANNEL_OPEN_OK);
+                        cw.WriteLongString("");
+                        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, f.channel, cw.ToBytes(), cw.Length());
+                        await Socket.SendAsync(sock, pkt, pkt.Length);
+                    } else if (cls == AmqpConstants.CLASS_BASIC && mtd == AmqpConstants.METHOD_BASIC_QOS) {
+                        AmqpWriter qw = new AmqpWriter();
+                        qw.WriteShort(AmqpConstants.CLASS_BASIC);
+                        qw.WriteShort(AmqpConstants.METHOD_BASIC_QOS_OK);
+                        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, f.channel, qw.ToBytes(), qw.Length());
+                        await Socket.SendAsync(sock, pkt, pkt.Length);
+                    } else if (cls == AmqpConstants.CLASS_EXCHANGE && mtd == AmqpConstants.METHOD_EXCHANGE_DECLARE) {
+                        AmqpWriter ew = new AmqpWriter();
+                        ew.WriteShort(AmqpConstants.CLASS_EXCHANGE);
+                        ew.WriteShort(AmqpConstants.METHOD_EXCHANGE_DECLARE_OK);
+                        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, f.channel, ew.ToBytes(), ew.Length());
+                        await Socket.SendAsync(sock, pkt, pkt.Length);
+                    } else if (cls == AmqpConstants.CLASS_QUEUE && mtd == AmqpConstants.METHOD_QUEUE_DECLARE) {
+                        AmqpWriter qw = new AmqpWriter();
+                        qw.WriteShort(AmqpConstants.CLASS_QUEUE);
+                        qw.WriteShort(AmqpConstants.METHOD_QUEUE_DECLARE_OK);
+                        qw.WriteShortString("orders.q");
+                        qw.WriteLong(0); // message-count
+                        qw.WriteLong(0); // consumer-count
+                        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, f.channel, qw.ToBytes(), qw.Length());
+                        await Socket.SendAsync(sock, pkt, pkt.Length);
+                    } else if (cls == AmqpConstants.CLASS_QUEUE && mtd == AmqpConstants.METHOD_QUEUE_BIND) {
+                        AmqpWriter bw = new AmqpWriter();
+                        bw.WriteShort(AmqpConstants.CLASS_QUEUE);
+                        bw.WriteShort(AmqpConstants.METHOD_QUEUE_BIND_OK);
+                        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, f.channel, bw.ToBytes(), bw.Length());
+                        await Socket.SendAsync(sock, pkt, pkt.Length);
+                    } else if (cls == AmqpConstants.CLASS_BASIC && mtd == AmqpConstants.METHOD_BASIC_CONSUME) {
+                        AmqpWriter cw = new AmqpWriter();
+                        cw.WriteShort(AmqpConstants.CLASS_BASIC);
+                        cw.WriteShort(AmqpConstants.METHOD_BASIC_CONSUME_OK);
+                        cw.WriteShortString("ctag-order-worker");
+                        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, f.channel, cw.ToBytes(), cw.Length());
+                        await Socket.SendAsync(sock, pkt, pkt.Length);
+                    } else if (cls == AmqpConstants.CLASS_BASIC && mtd == AmqpConstants.METHOD_BASIC_PUBLISH) {
+                        // 收到发布消息：紧接着读 Header 帧和 Body 帧，然后将该消息回环 Deliver 给已注册的消费者
+                        // 1. 读 Header 帧
+                        await Program.ReadExact(sock, frameHdr, 7);
+                        AmqpFrame fHdr = AmqpFrame.DecodeHeader(frameHdr, 0);
+                        byte[] pHdr = new byte[fHdr.length + 1];
+                        await Program.ReadExact(sock, pHdr, fHdr.length + 1);
+
+                        // 2. 读 Body 帧
+                        await Program.ReadExact(sock, frameHdr, 7);
+                        AmqpFrame fBody = AmqpFrame.DecodeHeader(frameHdr, 0);
+                        byte[] pBody = new byte[fBody.length + 1];
+                        await Program.ReadExact(sock, pBody, fBody.length + 1);
+
+                        // 3. 回发 Deliver 投递给客户端 (Method -> Header -> Body)
+                        AmqpWriter dw = new AmqpWriter();
+                        dw.WriteShort(AmqpConstants.CLASS_BASIC);
+                        dw.WriteShort(AmqpConstants.METHOD_BASIC_DELIVER);
+                        dw.WriteShortString("ctag-order-worker");
+                        dw.WriteLongLong(1001L); // deliveryTag
+                        dw.WriteBit(false); // redelivered
+                        dw.WriteShortString("orders.exchange");
+                        dw.WriteShortString("orders.created");
+                        byte[] dPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, f.channel, dw.ToBytes(), dw.Length());
+                        await Socket.SendAsync(sock, dPkt, dPkt.Length);
+
+                        // 原样回传 Header 帧与 Body 帧
+                        byte[] dHdrPkt = new byte[7 + fHdr.length + 1];
+                        NativeMemory.Copy((nint)dHdrPkt, (nint)frameHdr, 7);
+                        NativeMemory.Copy((nint)dHdrPkt + 7, (nint)pHdr, fHdr.length + 1);
+                        dHdrPkt[0] = (byte)AmqpConstants.FRAME_HEADER;
+                        dHdrPkt[1] = (byte)((f.channel >> 8) & 255);
+                        dHdrPkt[2] = (byte)(f.channel & 255);
+                        dHdrPkt[3] = (byte)((fHdr.length >> 24) & 255);
+                        dHdrPkt[4] = (byte)((fHdr.length >> 16) & 255);
+                        dHdrPkt[5] = (byte)((fHdr.length >> 8) & 255);
+                        dHdrPkt[6] = (byte)(fHdr.length & 255);
+                        await Socket.SendAsync(sock, dHdrPkt, dHdrPkt.Length);
+
+                        byte[] dBodyPkt = new byte[7 + fBody.length + 1];
+                        dBodyPkt[0] = (byte)AmqpConstants.FRAME_BODY;
+                        dBodyPkt[1] = (byte)((f.channel >> 8) & 255);
+                        dBodyPkt[2] = (byte)(f.channel & 255);
+                        dBodyPkt[3] = (byte)((fBody.length >> 24) & 255);
+                        dBodyPkt[4] = (byte)((fBody.length >> 16) & 255);
+                        dBodyPkt[5] = (byte)((fBody.length >> 8) & 255);
+                        dBodyPkt[6] = (byte)(fBody.length & 255);
+                        NativeMemory.Copy((nint)dBodyPkt + 7, (nint)pBody, fBody.length + 1);
+                        await Socket.SendAsync(sock, dBodyPkt, dBodyPkt.Length);
+                    } else if (cls == AmqpConstants.CLASS_BASIC && mtd == AmqpConstants.METHOD_BASIC_ACK) {
+                        // 确认消息
+                    } else if (cls == AmqpConstants.CLASS_CONNECTION && mtd == AmqpConstants.METHOD_CONNECTION_CLOSE) {
+                        AmqpWriter cw = new AmqpWriter();
+                        cw.WriteShort(AmqpConstants.CLASS_CONNECTION);
+                        cw.WriteShort(AmqpConstants.METHOD_CONNECTION_CLOSE_OK);
+                        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, cw.ToBytes(), cw.Length());
+                        await Socket.SendAsync(sock, pkt, pkt.Length);
+                        break;
+                    }
+                }
+            }
+        } finally {
+            Socket.Close(sock);
+        }
+    }
+
+    static string receivedBody = "";
+    static long receivedTag = 0;
+    static string receivedTraceId = "";
+
+    static async void OnMessage(AmqpChannel ch, AmqpMessage msg) {
+        Program.receivedBody = msg.Body();
+        Program.receivedTag = msg.deliveryTag;
+        if (msg.properties != null && msg.properties.headers != null) {
+            Program.receivedTraceId = msg.properties.headers["trace_id"];
+        }
+        ch.BasicAckAsync(msg.deliveryTag, false);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        // 1. 运行底层序列化单测
+        TestPrimitives();
+        TestFramingAndProps();
+
+        // 2. 启动进程内 Mock AMQP Broker
+        Task.Spawn(Program.RunMockBroker());
+        await Task.Delay(100);
+
+        // 3. 客户端发起连接与握手 (ConnectAsync)
+        AmqpConnection conn = await AmqpConnection.ConnectAsync(
+            "127.0.0.1", Program.PORT, "admin", "secret123", "/");
+        Check(conn != null && conn.IsConnected(), "amqp client connected and handshake completed");
+
+        // 4. 打开信道 (Channel.Open)
+        AmqpChannel channel = await conn.CreateChannelAsync();
+        Check(channel != null && channel.IsOpen(), "amqp channel opened");
+
+        // 5. 拓扑声明 (Exchange.Declare + Queue.Declare + Queue.Bind)
+        bool edOk = await channel.ExchangeDeclareAsync("orders.exchange", "direct", true, false);
+        Check(edOk, "exchange declare ok");
+
+        string qName = await channel.QueueDeclareAsync("orders.q", true, false, false);
+        Check(qName == "orders.q", "queue declare ok");
+
+        bool qbOk = await channel.QueueBindAsync(qName, "orders.exchange", "orders.created");
+        Check(qbOk, "queue bind ok");
+
+        // 6. 注册消费者 (Basic.Consume)
+        string ctag = await channel.BasicConsumeAsync(qName, false, Program.OnMessage);
+        Check(ctag == "ctag-order-worker", "basic consume registered");
+
+        // 7. 发送带有元数据头部的业务消息 (Basic.Publish)
+        BasicProperties props = new BasicProperties();
+        props.contentType = "application/json";
+        props.deliveryMode = 2;
+        props.headers["trace_id"] = "trace-order-7788";
+        string orderJson = "{\"orderId\":998811,\"amount\":199.5}";
+        bool pubOk = await channel.BasicPublishAsync("orders.exchange", "orders.created", orderJson, props);
+        Check(pubOk, "basic publish sent");
+
+        // 8. 异步等待消费者接收
+        for (int i = 0; i < 50 && Program.receivedBody.Length == 0; i = i + 1) {
+            await Task.Delay(20);
+        }
+        Check(Program.receivedBody == orderJson, "consumer received message body");
+        Check(Program.receivedTag == 1001L, "consumer received deliveryTag");
+        Check(Program.receivedTraceId == "trace-order-7788", "consumer received custom header");
+
+        // 9. 优雅退出与资源清理
+        channel.Dispose();
+        channel = null;
+        await conn.CloseAsync();
+        conn = null;
+
+        Program.serverRunning = false;
+        if (Program.serverListener != null) {
+            Program.serverListener.Stop();
+            Program.serverListener = null;
+        }
+
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        if (failures == 0) {
+            Console.WriteLine("ok rabbitmq amqp 0-9-1 suite passed");
+            return 0;
+        }
+        return 1;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

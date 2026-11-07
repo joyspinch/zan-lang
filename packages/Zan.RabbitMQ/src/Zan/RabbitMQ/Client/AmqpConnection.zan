@@ -1,0 +1,383 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Threading;
+
+namespace Zan.RabbitMQ;
+
+// AMQP 0-9-1 物理连接管理器与帧多路复用引擎。
+public class AmqpConnection : IDisposable {
+    private string host;
+    private int port;
+    private string user;
+    private string password;
+    private string virtualHost;
+    private bool useTls;
+    private bool connected;
+    private nint sock;
+    private TlsStream tls;
+    private Mutex sendLock;
+    private int channelMax;
+    private int frameMax;
+    private int heartbeatSec;
+    private int nextChannelId;
+
+    private Dictionary<int, AmqpChannel> channels;
+    private Gate connGate;
+    private bool openOkReceived;
+    private string closeReason;
+
+    public bool IsConnected() { return this.connected; }
+    public int FrameMax() { return this.frameMax; }
+    public int ChannelMax() { return this.channelMax; }
+
+    public AmqpConnection(string host, int port, string user, string password, string virtualHost, bool useTls) {
+        this.host = host;
+        this.port = port > 0 ? port : (useTls ? AmqpConstants.DEFAULT_TLS_PORT : AmqpConstants.DEFAULT_PORT);
+        this.user = user != null && user.Length > 0 ? user : "guest";
+        this.password = password != null ? password : "guest";
+        this.virtualHost = virtualHost != null && virtualHost.Length > 0 ? virtualHost : "/";
+        this.useTls = useTls;
+        this.connected = false;
+        this.sock = -1;
+        this.tls = null;
+        this.sendLock = new Mutex();
+        this.channelMax = AmqpConstants.DEFAULT_CHANNEL_MAX;
+        this.frameMax = AmqpConstants.DEFAULT_FRAME_MAX;
+        this.heartbeatSec = AmqpConstants.DEFAULT_HEARTBEAT_SEC;
+        this.nextChannelId = 1;
+        this.channels = new Dictionary<int, AmqpChannel>();
+        this.connGate = new Gate();
+        this.openOkReceived = false;
+        this.closeReason = "";
+    }
+
+    // 连接 RabbitMQ 服务端并完成标准 AMQP 握手全流程
+    public static async AmqpConnection ConnectAsync(string host, int port, string user, string password, string virtualHost) {
+        return await AmqpConnection.ConnectAsync(host, port, user, password, virtualHost, false, 0);
+    }
+
+    public static async AmqpConnection ConnectAsync(string host, int port, string user, string password, string virtualHost, bool useTls, int heartbeatSec) {
+        AmqpConnection conn = new AmqpConnection(host, port, user, password, virtualHost, useTls);
+        if (heartbeatSec > 0) { conn.heartbeatSec = heartbeatSec; }
+
+        Socket.Initialize();
+        TcpClient client = await TcpClient.ConnectAsync(conn.host, conn.port);
+        if (client == null) {
+            return null;
+        }
+        nint s = client.GetSocket();
+        conn.sock = s;
+        Socket.SetNoDelay(s);
+
+        if (useTls) {
+            TlsContext ctx = TlsContext.CreateClient();
+            TlsStream ts = await TlsStream.ConnectAsync(ctx, s, conn.host, 10000);
+            if (ts == null) {
+                Socket.Close(s);
+                ctx.Free();
+                return null;
+            }
+            conn.tls = ts;
+        }
+
+        conn.connected = true;
+
+        // 1. 发送 8 字节协议头部 (AMQP\x00\x00\x09\x01)
+        byte[] protoHdr = AmqpConstants.PROTOCOL_HEADER.ToBytes();
+        int _sp = await conn.SendRawAsync(protoHdr, protoHdr.Length);
+
+        // 2. 启动后台帧接收调度协程
+        Task.Spawn(conn.RunFrameLoopAsync());
+
+        // 3. 阻塞等待握手完成 (Open-Ok)
+        await conn.connGate.Wait(15000);
+        if (!conn.openOkReceived) {
+            conn.Close();
+            return null;
+        }
+
+        // 4. 启动心跳协程
+        if (conn.heartbeatSec > 0) {
+            Task.Spawn(conn.RunHeartbeatLoopAsync());
+        }
+
+        return conn;
+    }
+
+    // 申请创建新的逻辑信道 (Channel.Open)
+    public async AmqpChannel CreateChannelAsync() {
+        if (!this.connected) { return null; }
+        this.sendLock.WaitOne();
+        int cid = this.nextChannelId;
+        this.nextChannelId = this.nextChannelId + 1;
+        AmqpChannel ch = new AmqpChannel(cid, this);
+        this.channels[cid] = ch;
+        this.sendLock.ReleaseMutex();
+
+        // 发送 Channel.Open (Class 20, Method 10)
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_CHANNEL);
+        w.WriteShort(AmqpConstants.METHOD_CHANNEL_OPEN);
+        w.WriteShortString(""); // reserved-1
+        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, cid, w.ToBytes(), w.Length());
+        await this.SendRawAsync(pkt, pkt.Length);
+
+        // 等待 Channel.Open-Ok
+        await ch.BasicQosAsync(0, false); // 探测信道可用性
+        return ch;
+    }
+
+    // 发送底层网络原始数据包（加互斥锁保证多信道写网络原子性）
+    internal async int SendRawAsync(byte[] data, int len) {
+        if (!this.connected || data == null || len <= 0) { return -1; }
+        this.sendLock.WaitOne();
+        int sent = 0;
+        try {
+            if (this.tls != null) {
+                sent = await this.tls.SendBytesAsync(data, 0, len);
+            } else {
+                sent = await Socket.SendAsync(this.sock, data, len);
+            }
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+        return sent;
+    }
+
+    // 帧接收与分发循环核心
+    private async void RunFrameLoopAsync() {
+        byte[] hdrBuf = new byte[7];
+        while (this.connected) {
+            int rHdr = await this.ReadExactAsync(hdrBuf, 7);
+            if (rHdr < 7) { break; }
+
+            AmqpFrame frame = AmqpFrame.DecodeHeader(hdrBuf, 0);
+            if (frame == null) { break; }
+
+            byte[] payload = null;
+            if (frame.length > 0) {
+                payload = new byte[frame.length];
+                int rPayload = await this.ReadExactAsync(payload, frame.length);
+                if (rPayload < frame.length) { break; }
+            }
+            frame.payload = payload;
+
+            // 读取并校验 1 字节结束符 0xCE
+            byte[] endBuf = new byte[1];
+            int rEnd = await this.ReadExactAsync(endBuf, 1);
+            if (rEnd < 1 || (endBuf[0] & 255) != AmqpConstants.FRAME_END) {
+                break;
+            }
+
+            if (frame.type == AmqpConstants.FRAME_HEARTBEAT) {
+                // 心跳帧直接响应
+                continue;
+            }
+
+            if (frame.channel == 0) {
+                await this.HandleConnectionFrameAsync(frame);
+            } else {
+                if (this.channels.ContainsKey(frame.channel)) {
+                    AmqpChannel ch = this.channels[frame.channel];
+                    ch.DispatchFrame(frame);
+                }
+            }
+        }
+
+        this.Close();
+    }
+
+    // 处理 0 号信道的连接控制帧
+    private async Task HandleConnectionFrameAsync(AmqpFrame frame) {
+        if (frame.type != AmqpConstants.FRAME_METHOD || frame.payload == null || frame.payload.Length < 4) {
+            return;
+        }
+        AmqpReader r = new AmqpReader(frame.payload);
+        int cls = r.ReadShort();
+        int mtd = r.ReadShort();
+
+        if (cls == AmqpConstants.CLASS_CONNECTION && mtd == AmqpConstants.METHOD_CONNECTION_START) {
+            // 收到 Connection.Start：回复 Connection.Start-Ok
+            int major = r.ReadOctet();
+            int minor = r.ReadOctet();
+            Dictionary<string, string> serverProps = r.ReadTable();
+            string mechanisms = r.ReadLongString();
+            string locales = r.ReadLongString();
+
+            AmqpWriter w = new AmqpWriter();
+            w.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            w.WriteShort(AmqpConstants.METHOD_CONNECTION_START_OK);
+
+            // 客户端属性
+            Dictionary<string, string> clientProps = new Dictionary<string, string>();
+            clientProps["product"] = "Zan.RabbitMQ";
+            clientProps["version"] = "1.0.0";
+            clientProps["platform"] = "Zan";
+            w.WriteTable(clientProps);
+
+            // SASL 机制选择 PLAIN
+            w.WriteShortString("PLAIN");
+
+            // SASL PLAIN 响应载荷格式: \x00user\x00password
+            AmqpWriter saslW = new AmqpWriter();
+            saslW.WriteOctet(0);
+            byte[] userBytes = this.user.ToBytes();
+            saslW.WriteBytes(userBytes, userBytes.Length);
+            saslW.WriteOctet(0);
+            byte[] passBytes = this.password.ToBytes();
+            saslW.WriteBytes(passBytes, passBytes.Length);
+            byte[] saslBytes = saslW.ToBytes();
+
+            w.WriteLong(saslBytes.Length);
+            w.WriteBytes(saslBytes, saslBytes.Length);
+            w.WriteShortString("en_US");
+
+            byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, w.ToBytes(), w.Length());
+            await this.SendRawAsync(pkt, pkt.Length);
+        } else if (cls == AmqpConstants.CLASS_CONNECTION && mtd == AmqpConstants.METHOD_CONNECTION_TUNE) {
+            // 收到 Connection.Tune：协商 channelMax, frameMax 与 heartbeat
+            int srvChannelMax = r.ReadShort();
+            int srvFrameMax = r.ReadLong();
+            int srvHeartbeat = r.ReadShort();
+
+            if (srvChannelMax > 0 && srvChannelMax < this.channelMax) { this.channelMax = srvChannelMax; }
+            if (srvFrameMax > 0 && srvFrameMax < this.frameMax) { this.frameMax = srvFrameMax; }
+            if (srvHeartbeat > 0) { this.heartbeatSec = srvHeartbeat; }
+
+            // 1. 回复 Connection.Tune-Ok
+            AmqpWriter tw = new AmqpWriter();
+            tw.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            tw.WriteShort(AmqpConstants.METHOD_CONNECTION_TUNE_OK);
+            tw.WriteShort(this.channelMax);
+            tw.WriteLong(this.frameMax);
+            tw.WriteShort(this.heartbeatSec);
+            byte[] tuneOkPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, tw.ToBytes(), tw.Length());
+            await this.SendRawAsync(tuneOkPkt, tuneOkPkt.Length);
+
+            // 2. 发送 Connection.Open (Class 10, Method 40)
+            AmqpWriter ow = new AmqpWriter();
+            ow.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            ow.WriteShort(AmqpConstants.METHOD_CONNECTION_OPEN);
+            ow.WriteShortString(this.virtualHost);
+            ow.WriteShortString(""); // reserved-1
+            ow.WriteBit(false); // reserved-2
+            ow.FlushBits();
+            byte[] openPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, ow.ToBytes(), ow.Length());
+            await this.SendRawAsync(openPkt, openPkt.Length);
+        } else if (cls == AmqpConstants.CLASS_CONNECTION && mtd == AmqpConstants.METHOD_CONNECTION_OPEN_OK) {
+            // 握手成功
+            this.openOkReceived = true;
+            this.connGate.Signal();
+        } else if (cls == AmqpConstants.CLASS_CONNECTION && mtd == AmqpConstants.METHOD_CONNECTION_CLOSE) {
+            int replyCode = r.ReadShort();
+            string replyText = r.ReadShortString();
+            this.closeReason = replyText;
+            this.connected = false;
+
+            // 回复 Connection.Close-Ok
+            AmqpWriter cw = new AmqpWriter();
+            cw.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            cw.WriteShort(AmqpConstants.METHOD_CONNECTION_CLOSE_OK);
+            byte[] closeOkPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, cw.ToBytes(), cw.Length());
+            await this.SendRawAsync(closeOkPkt, closeOkPkt.Length);
+
+            this.connGate.SignalAll();
+        } else if (cls == AmqpConstants.CLASS_CONNECTION && mtd == AmqpConstants.METHOD_CONNECTION_CLOSE_OK) {
+            this.connected = false;
+            this.connGate.SignalAll();
+        }
+    }
+
+    // 后台心跳保活循环
+    private async void RunHeartbeatLoopAsync() {
+        int intervalMs = (this.heartbeatSec / 2) * 1000;
+        if (intervalMs < 1000) { intervalMs = 1000; }
+        while (this.connected) {
+            int slept = 0;
+            while (slept < intervalMs && this.connected) {
+                await Task.Delay(50);
+                slept = slept + 50;
+            }
+            if (!this.connected) { break; }
+            byte[] hb = AmqpFrame.BuildHeartbeat();
+            await this.SendRawAsync(hb, hb.Length);
+        }
+    }
+
+    // 从套接字读取精确指定字节数
+    private async int ReadExactAsync(byte[] outBuf, int count) {
+        if (outBuf == null || count <= 0) { return 0; }
+        int received = 0;
+        while (received < count && this.connected) {
+            int want = count - received;
+            int n = 0;
+            if (this.tls != null) {
+                byte[] chunk = new byte[want];
+                n = await this.tls.RecvBytesAsync(chunk, 0, want);
+                if (n > 0) {
+                    NativeMemory.Copy((nint)outBuf + (nint)received, (nint)chunk, n);
+                }
+            } else {
+                n = await Socket.RecvPtrAsync(this.sock, (nint)outBuf + (nint)received, want);
+            }
+            if (n <= 0) {
+                return -1;
+            }
+            received = received + n;
+        }
+        return received;
+    }
+
+    // 正常关闭 AMQP 连接 (Connection.Close)
+    public async Task CloseAsync() {
+        if (!this.connected) { return; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_CONNECTION);
+        w.WriteShort(AmqpConstants.METHOD_CONNECTION_CLOSE);
+        w.WriteShort(AmqpConstants.REPLY_SUCCESS);
+        w.WriteShortString("Normal Shutdown");
+        w.WriteShort(0);
+        w.WriteShort(0);
+        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, w.ToBytes(), w.Length());
+        await this.SendRawAsync(pkt, pkt.Length);
+        this.Close();
+        await Task.Delay(80);
+    }
+
+    public void Close() {
+        this.connected = false;
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
+        if (this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.sock = -1;
+        }
+        if (this.sendLock != null) {
+            this.sendLock.WaitOne();
+            if (this.channels != null) {
+                List<int> keys = this.channels.Keys;
+                for (int i = 0; i < keys.Count; i = i + 1) {
+                    this.channels[keys[i]].Dispose();
+                }
+                this.channels.Clear();
+                this.channels = null;
+            }
+            this.sendLock.ReleaseMutex();
+            this.sendLock = null;
+        }
+
+        if (this.connGate != null) {
+            this.connGate.SignalAll();
+            this.connGate.Close();
+            this.connGate = null;
+        }
+    }
+
+    public void Dispose() {
+        this.Close();
+    }
+}

@@ -1,0 +1,165 @@
+using System;
+using System.Collections.Generic;
+
+namespace Zan.RabbitMQ;
+
+// AMQP 0-9-1 二进制大端序数据反序列化读取器。
+public class AmqpReader {
+    private byte[] buf;
+    private int offset;
+    private int limit;
+    private int bitMask;
+    private int bitPos;
+
+    public AmqpReader(byte[] buf) {
+        this.buf = buf;
+        this.offset = 0;
+        this.limit = buf != null ? buf.Length : 0;
+        this.bitMask = 0;
+        this.bitPos = 8;
+    }
+
+    public AmqpReader(byte[] buf, int offset, int length) {
+        this.buf = buf;
+        this.offset = offset;
+        this.limit = offset + length;
+        if (this.limit > buf.Length) { this.limit = buf.Length; }
+        this.bitMask = 0;
+        this.bitPos = 8;
+    }
+
+    public int Offset() { return this.offset; }
+    public int Remaining() { return this.limit - this.offset; }
+    public bool HasRemaining() { return this.offset < this.limit; }
+
+    public int ReadOctet() {
+        this.bitPos = 8;
+        if (this.offset >= this.limit) { return 0; }
+        int v = this.buf[this.offset] & 255;
+        this.offset = this.offset + 1;
+        return v;
+    }
+
+    public int ReadShort() {
+        this.bitPos = 8;
+        if (this.offset + 2 > this.limit) { return 0; }
+        int v = ((this.buf[this.offset] & 255) << 8) | (this.buf[this.offset + 1] & 255);
+        this.offset = this.offset + 2;
+        return v;
+    }
+
+    public int ReadLong() {
+        this.bitPos = 8;
+        if (this.offset + 4 > this.limit) { return 0; }
+        int v = ((this.buf[this.offset] & 255) << 24)
+              | ((this.buf[this.offset + 1] & 255) << 16)
+              | ((this.buf[this.offset + 2] & 255) << 8)
+              | (this.buf[this.offset + 3] & 255);
+        this.offset = this.offset + 4;
+        return v;
+    }
+
+    public long ReadLongLong() {
+        this.bitPos = 8;
+        if (this.offset + 8 > this.limit) { return 0; }
+        long hi = ((long)(this.buf[this.offset] & 255) << 24)
+                | ((long)(this.buf[this.offset + 1] & 255) << 16)
+                | ((long)(this.buf[this.offset + 2] & 255) << 8)
+                | (long)(this.buf[this.offset + 3] & 255);
+        long lo = ((long)(this.buf[this.offset + 4] & 255) << 24)
+                | ((long)(this.buf[this.offset + 5] & 255) << 16)
+                | ((long)(this.buf[this.offset + 6] & 255) << 8)
+                | (long)(this.buf[this.offset + 7] & 255);
+        this.offset = this.offset + 8;
+        return (hi << 32) | (lo & 4294967295L);
+    }
+
+    public string ReadShortString() {
+        this.bitPos = 8;
+        int len = this.ReadOctet();
+        if (len <= 0) { return ""; }
+        if (this.offset + len > this.limit) { len = this.limit - this.offset; }
+        string s = NativeMemory.GetString((nint)this.buf, this.offset, len);
+        this.offset = this.offset + len;
+        return s;
+    }
+
+    public string ReadLongString() {
+        this.bitPos = 8;
+        int len = this.ReadLong();
+        if (len <= 0) { return ""; }
+        if (this.offset + len > this.limit) { len = this.limit - this.offset; }
+        string s = NativeMemory.GetString((nint)this.buf, this.offset, len);
+        this.offset = this.offset + len;
+        return s;
+    }
+
+    public byte[] ReadBytes(int count) {
+        this.bitPos = 8;
+        if (count <= 0) { return new byte[0]; }
+        if (this.offset + count > this.limit) { count = this.limit - this.offset; }
+        byte[] res = new byte[count];
+        if (count > 0) {
+            NativeMemory.Copy((nint)res, (nint)this.buf + (nint)this.offset, count);
+            this.offset = this.offset + count;
+        }
+        return res;
+    }
+
+    public bool ReadBit() {
+        if (this.bitPos >= 8) {
+            if (this.offset >= this.limit) { return false; }
+            this.bitMask = this.buf[this.offset] & 255;
+            this.offset = this.offset + 1;
+            this.bitPos = 0;
+        }
+        bool val = (this.bitMask & (1 << this.bitPos)) != 0;
+        this.bitPos = this.bitPos + 1;
+        return val;
+    }
+
+    // 解析 AMQP Field Table 字段表
+    public Dictionary<string, string> ReadTable() {
+        this.bitPos = 8;
+        Dictionary<string, string> table = new Dictionary<string, string>();
+        int tblLen = this.ReadLong();
+        if (tblLen <= 0 || this.offset + tblLen > this.limit) {
+            return table;
+        }
+        int tblEnd = this.offset + tblLen;
+        while (this.offset < tblEnd) {
+            string key = this.ReadShortString();
+            if (this.offset >= tblEnd) { break; }
+            int typeTag = this.ReadOctet();
+            if (typeTag == 83) { // 'S': Long String
+                string val = this.ReadLongString();
+                table[key] = val;
+            } else if (typeTag == 115) { // 's': Short String
+                string val = this.ReadShortString();
+                table[key] = val;
+            } else if (typeTag == 73) { // 'I': Signed 32-bit int
+                int val = this.ReadLong();
+                table[key] = Convert.ToString(val);
+            } else if (typeTag == 108) { // 'l': Signed 64-bit int
+                long val = this.ReadLongLong();
+                table[key] = Convert.ToString(val);
+            } else if (typeTag == 116) { // 't': Boolean
+                int val = this.ReadOctet();
+                table[key] = val != 0 ? "true" : "false";
+            } else if (typeTag == 70) { // 'F': Field Table
+                Dictionary<string, string> sub = this.ReadTable();
+                table[key] = "[table]";
+            } else if (typeTag == 84) { // 'T': Timestamp
+                long val = this.ReadLongLong();
+                table[key] = Convert.ToString(val);
+            } else if (typeTag == 86) { // 'V': Void
+                table[key] = "";
+            } else {
+                // 跳过未知类型（尽可能保守容错）
+                break;
+            }
+        }
+        this.offset = tblEnd;
+        return table;
+    }
+}
