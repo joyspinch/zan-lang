@@ -357,20 +357,11 @@ typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
 
 #define ZAN_CO_STACK_POOL_MAX 256
 
-static zan_mutex_t g_stack_pool_lock;
-static volatile int g_stack_pool_lock_inited = 0;
+static zan_mutex_t g_stack_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *g_stack_pool;
 static int g_stack_pool_n;
 
-static void ensure_stack_pool_lock(void) {
-    if (!g_stack_pool_lock_inited) {
-        zan_mutex_init(&g_stack_pool_lock);
-        g_stack_pool_lock_inited = 1;
-    }
-}
-
 static char *plat_stack_alloc(void) {
-    ensure_stack_pool_lock();
     zan_mutex_lock(&g_stack_pool_lock);
     if (g_stack_pool) {
         char *s = (char *)g_stack_pool;
@@ -393,7 +384,6 @@ static char *plat_stack_alloc(void) {
 }
 
 static void plat_stack_free(char *stack) {
-    ensure_stack_pool_lock();
     zan_mutex_lock(&g_stack_pool_lock);
     if (g_stack_pool_n < ZAN_CO_STACK_POOL_MAX) {
         *(void **)stack = g_stack_pool;
@@ -405,6 +395,19 @@ static void plat_stack_free(char *stack) {
     zan_mutex_unlock(&g_stack_pool_lock);
     long page = sysconf(_SC_PAGESIZE);
     munmap((char *)stack - page, co_stack_size() + (size_t)page);
+}
+
+static void plat_stack_pool_drain(void) {
+    zan_mutex_lock(&g_stack_pool_lock);
+    long page = sysconf(_SC_PAGESIZE);
+    size_t total = co_stack_size() + (size_t)page;
+    while (g_stack_pool) {
+        char *s = (char *)g_stack_pool;
+        g_stack_pool = *(void **)s;
+        g_stack_pool_n--;
+        munmap(s - page, total);
+    }
+    zan_mutex_unlock(&g_stack_pool_lock);
 }
 
 #if ZAN_POSIX_ASM_FIBER
@@ -1289,5 +1292,8 @@ void zan_sched_shutdown(void) {
     zan_mutex_destroy(&g_global_lock);
     zan_mutex_destroy(&g_timer_lock);
     zan_mutex_destroy(&g_all_tasks_lock);
+#ifndef _WIN32
+    plat_stack_pool_drain();
+#endif
     plat_sched_leave();
 }
