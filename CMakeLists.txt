@@ -387,6 +387,10 @@ add_custom_command(
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c -o ${ZAN_RT_CRASH_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_io.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_sym.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_guard.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_posix.c
     COMMENT "Building crash reporter runtime object (zanrt_crash)"
     VERBATIM)
 add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ})
