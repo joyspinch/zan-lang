@@ -828,30 +828,18 @@ partial class Irgen {
         return r;
     }
 
-    // The C host's integer division guard (src/compiler/irgen_expr.c): a zero
-    // divisor and the MIN / -1 combination both divide by 1 instead of
-    // trapping, and the zero divisor is reported through the runtime guard
-    // (zan_rt_guard_fail3) before the program continues.
+    // The C host's integer division guard (irgen_expr_ops.c TK_SLASH/TK_PERCENT):
+    // a zero divisor and the MIN / -1 combination both divide by 1 instead of
+    // trapping. The zero divisor goes through EmitRuntimeCheckIf -- the same
+    // dual-track dispatch as the C host's emit_runtime_check: inside a user
+    // try it throws a catchable DivideByZeroException, outside it soft-reports
+    // and the program continues with the quotient of 1.
     string GuardDivisor(ExprVal a, ExprVal b, int op, Node e, int width, bool uns) {
         string isz = NT();
         L("  " + isz + " = icmp eq i64 " + b.op + ", 0");
-        // the report: the host prints "file:line:col: runtime error: division
-        // by zero" and keeps going
-        int lbad = NL(); int lcont = NL();
-        L("  br i1 " + isz + ", label %L" + lbad + ", label %L" + lcont);
-        Label(lbad);
         string msg = "division by zero";
         if (op == TK.Percent()) { msg = "division by zero (modulo)"; }
-        ExprVal fs = GenStr(diags.FileOfLine(e.line));
-        ExprVal ms = GenStr(msg);
-        if (!ExternSeen("zan_rt_guard_fail3")) {
-            externDecls.Add("zan_rt_guard_fail3");
-            H("declare void @zan_rt_guard_fail3(i8*, i32, i32, i8*)");
-        }
-        L("  call void @zan_rt_guard_fail3(i8* " + fs.op + ", i32 "
-            + diags.LineInFile(e.line) + ", i32 " + e.col + ", i8* " + ms.op + ")");
-        L("  br label %L" + lcont);
-        Label(lcont);
+        EmitRuntimeCheckIf(e, isz, msg);
         string unsf = isz;
         if (!uns && width > 0) {
             string minv = "";
@@ -869,6 +857,7 @@ partial class Irgen {
         }
         string d = NT();
         L("  " + d + " = select i1 " + unsf + ", i64 1, i64 " + b.op);
+        divUnsafe = unsf;
         return d;
     }
 

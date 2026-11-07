@@ -605,7 +605,7 @@ public class Checker {
         int pc = PrimCat(n);
         if ((pc >= 1 && pc <= 3) || pc == 5 || pc == 6 || pc == 8) { return true; }
         Node d = binder.FindType(n);
-        return d != null && d.kind == AK.StructDecl();
+        return d != null && (d.kind == AK.StructDecl() || d.kind == AK.EnumDecl());
     }
 
     Node LiftNullCondType(Node e, Node t) {
@@ -696,7 +696,7 @@ public class Checker {
                 Node rt = InferType(e.b);
                 if (lt == null) { return rt; }
                 if (rt == null) { return lt; }
-                if (lt.op == 1) {
+                if (lt.op == 1 && IsValueType(lt)) {
                     if (rt.op == 1) { return lt; }
                     // T? ?? T → 负载形态：给发射端钉标记（binary 节点 ival
                     // 其余未用），发射走解箱 phi。
@@ -753,6 +753,14 @@ public class Checker {
         }
         if (k == AK.MemberAccess()) {
             Node ot = InferType(e.a);
+            if (ot != null && ot.op == 1) {
+                if (e.sval == "HasValue") { return MkType("bool"); }
+                if (e.sval == "Value") {
+                    Node ut = MkType(ot.sval);
+                    ut.kids = ot.kids;
+                    return ut;
+                }
+            }
             if (ot != null && ot.sval == "string" && e.sval == "Length") { return MkType("int"); }
             if (ot != null && (ot.sval == "List" || ot.sval == "Dict" || ot.sval == "Dictionary" || ot.sval == "StringBuilder") && (e.sval == "Count" || e.sval == "Length")) { return MkType("int"); }
             if (ot != null && ot.ival > 0 && e.sval == "Length") { return MkType("int"); }
@@ -858,6 +866,11 @@ public class Checker {
                             return MkType("string");
                         }
                     }
+                }
+                if (ot != null && ot.op == 1 && callee.sval == "GetValueOrDefault") {
+                    Node ut = MkType(ot.sval);
+                    ut.kids = ot.kids;
+                    return ut;
                 }
                 Node cls = ClassOf(ot);
                 if (cls != null) {
@@ -2045,6 +2058,7 @@ public class Checker {
                     }
                 }
             }
+            if (k == AK.Binary() && n.op == TK.QQ()) { InferType(n); }
             if (k == AK.Assignment()) {
                 CheckTaskNoResult(InferType(n.a), InferType(n.b), "assignment", n.line, n.col);
             }
@@ -2220,6 +2234,9 @@ public class Checker {
         if (cls != null) { CheckInternalAccess(cls, n.sval, n); }
         else { Node sc = StaticRecv(n.a); if (sc != null) { CheckInternalAccess(sc, n.sval, n); } }
         if (cls != null && !HasMember(cls, n.sval) && !HasExt(cls.sval, n.sval)) {
+            if (ot != null && ot.op == 1 && (n.sval == "HasValue" || n.sval == "Value")) {
+                return;
+            }
             if (!IsReflInstName(n.sval)) {
                 // recv.<Entity> table accessor fires before the no-member
                 // diagnostic. Rewritten nodes get checked like any other new
@@ -2353,6 +2370,12 @@ public class Checker {
                 mm = MethodUp(targetCls, callee.sval);
             }
             if (cls != null) {
+                if (ot != null && ot.op == 1 && callee.sval == "GetValueOrDefault") {
+                    if (argc > 1) {
+                        diags.Error("no overload of 'GetValueOrDefault' takes " + argc + " argument(s)", n.line, n.col);
+                    }
+                    return;
+                }
                 if (!HasMember(cls, callee.sval) && !HasExt(cls.sval, callee.sval)) {
                     if (!IsReflInstName(callee.sval)) {
                         diags.Error("type '" + cls.sval + "' has no member '" + callee.sval + "'", n.line, n.col);

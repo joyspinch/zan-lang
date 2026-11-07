@@ -109,8 +109,9 @@ partial class Irgen {
             // 右支在分支内惰性求值，phi 按负载型。checker 同步定型为负载
             // 类型（A536 家族，宿主 emit_null_coalesce 同口径）。曾走聚合
             // phi 且定型 int?，`int y = x ?? 5;` 编不过。
-            if (e.ival == 1) {
-                ExprVal qa = GenExpr(e.a);
+            ExprVal qa = GenExpr(e.a);
+            bool unbox = qa.ty != null && IsNullableValue(qa.ty);
+            if (unbox) {
                 int ulb = NL(); int ula = NL(); int ulend = NL();
                 string uisn = NT();
                 L("  " + uisn + " = icmp eq i8* " + qa.op + ", null");
@@ -127,7 +128,16 @@ partial class Irgen {
                 List<string> svT3 = stmtTemps; List<Node> svTT3 = stmtTempTypes;
                 stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
                 ExprVal ub = GenExpr(e.b);
-                string ubc = Coerce(ub, uult);
+                string ubc = ub.op;
+                if (ub.ty != null && IsNullableValue(ub.ty)) {
+                    string up2 = NT();
+                    L("  " + up2 + " = bitcast i8* " + ub.op + " to " + uult + "*");
+                    string upv2 = NT();
+                    L("  " + upv2 + " = load " + uult + ", " + uult + "* " + up2);
+                    ubc = upv2;
+                } else {
+                    ubc = Coerce(ub, uult);
+                }
                 EmitTempReleases();
                 stmtTemps = svT3; stmtTempTypes = svTT3;
                 string ubpost = curLbl;
@@ -139,7 +149,7 @@ partial class Irgen {
                 AddTemp(ur, uuty);
                 return new ExprVal(ur, uuty);
             }
-            ExprVal a = GenExpr(e.a);
+            ExprVal a = qa;
             string at = MapType(a.ty);
             int lb = NL(); int la = NL(); int lend = NL();
             string isn = NT();
@@ -295,6 +305,18 @@ partial class Irgen {
                 } else { hasB = "1"; }
                 string bothH = NT();
                 L("  " + bothH + " = and i1 " + hasA + ", " + hasB);
+                string preVal;
+                if (op == TK.EqEq()) {
+                    string notA = NT(); L("  " + notA + " = xor i1 " + hasA + ", 1");
+                    string notB = NT(); L("  " + notB + " = xor i1 " + hasB + ", 1");
+                    string neither = NT(); L("  " + neither + " = and i1 " + notA + ", " + notB);
+                    string pv = NT(); L("  " + pv + " = zext i1 " + neither + " to i64");
+                    preVal = pv;
+                } else {
+                    string oneHas = NT(); L("  " + oneHas + " = xor i1 " + hasA + ", " + hasB);
+                    string pv = NT(); L("  " + pv + " = zext i1 " + oneHas + " to i64");
+                    preVal = pv;
+                }
                 int lcmp2 = NL(); int lmerge2 = NL();
                 string preLbl = curLbl;
                 L("  br i1 " + bothH + ", label %L" + lcmp2 + ", label %L" + lmerge2);
@@ -324,7 +346,7 @@ partial class Irgen {
                 L("  br label %L" + lmerge2);
                 Label(lmerge2);
                 string mrg = NT();
-                L("  " + mrg + " = phi i64 [ 0, %" + preLbl + " ], [ " + cv + ", %L" + lcmp2 + " ]");
+                L("  " + mrg + " = phi i64 [ " + preVal + ", %" + preLbl + " ], [ " + cv + ", %L" + lcmp2 + " ]");
                 return new ExprVal(mrg, MkType("bool"));
             }
             if (IsStr(a.ty) && IsStr(b.ty)) {
@@ -425,6 +447,14 @@ partial class Irgen {
                 bs = GuardDivisor(a, b, op, e, aw, awu);
             }
             L("  " + t + " = " + ar + " i64 " + a.op + ", " + bs);
+            if (op == TK.Slash() || op == TK.Percent()) {
+                // B-ID181：unsafe（零除/MIN-1）时商归一化为 0——镜像 C 宿主
+                // irgen_expr_ops.c 的 divz.res/remz.res select；自举端曾只换
+                // 除数不换商（零除得被除数、MIN/-1 得 MIN，与宿主不一致）。
+                string qs = NT();
+                L("  " + qs + " = select i1 " + divUnsafe + ", i64 0, i64 " + t);
+                t = qs;
+            }
             // >>>（逻辑右移）按声明宽度做**真**位移（宿主 irgen_expr.c：int
             // 操作数 trunc i32 → lshr i32 → zext，long 直接 lshr i64）——
             // 不能用「lshr i64 再 WrapArith(32)」模拟：-16 >>> 2 的 64 位
@@ -448,6 +478,53 @@ partial class Irgen {
         string cp = CmpOp(op);
         if (uns) { cp = UCmpOp(op); }
         if (cp != "") {
+            if ((a.ty != null && IsNullableValue(a.ty)) || (b.ty != null && IsNullableValue(b.ty))) {
+                string hasA; string hasB;
+                if (IsNullableValue(a.ty)) {
+                    string ha = NT();
+                    L("  " + ha + " = icmp ne i8* " + a.op + ", null");
+                    hasA = ha;
+                } else { hasA = "1"; }
+                if (IsNullableValue(b.ty)) {
+                    string hb = NT();
+                    L("  " + hb + " = icmp ne i8* " + b.op + ", null");
+                    hasB = hb;
+                } else { hasB = "1"; }
+                string bothH = NT();
+                L("  " + bothH + " = and i1 " + hasA + ", " + hasB);
+                int lcmp3 = NL(); int lmerge3 = NL();
+                string preLbl = curLbl;
+                L("  br i1 " + bothH + ", label %L" + lcmp3 + ", label %L" + lmerge3);
+                Label(lcmp3);
+                string aUlt = (a.ty != null && IsNullableValue(a.ty)) ? UnderLL(a.ty) : MapType(a.ty);
+                string bUlt = (b.ty != null && IsNullableValue(b.ty)) ? UnderLL(b.ty) : MapType(b.ty);
+                string aPl = a.op;
+                if (IsNullableValue(a.ty)) {
+                    string ap = NT();
+                    L("  " + ap + " = bitcast i8* " + a.op + " to " + aUlt + "*");
+                    string av = NT();
+                    L("  " + av + " = load " + aUlt + ", " + aUlt + "* " + ap);
+                    aPl = av;
+                }
+                string bPl = b.op;
+                if (IsNullableValue(b.ty)) {
+                    string bp = NT();
+                    L("  " + bp + " = bitcast i8* " + b.op + " to " + bUlt + "*");
+                    string bv = NT();
+                    L("  " + bv + " = load " + bUlt + ", " + bUlt + "* " + bp);
+                    bPl = bv;
+                }
+                string cc = NT();
+                L("  " + cc + " = icmp " + cp + " " + aUlt + " " + aPl + ", " + bPl);
+                string zcmp = NT();
+                L("  " + zcmp + " = zext i1 " + cc + " to i64");
+                string bcmp = curLbl;
+                L("  br label %L" + lmerge3);
+                Label(lmerge3);
+                string r = NT();
+                L("  " + r + " = phi i64 [ " + zcmp + ", %" + bcmp + " ], [ 0, %" + preLbl + " ]");
+                return new ExprVal(r, MkType("bool"));
+            }
             // lexicographic ordering for strings (matches ==/!= strcmp handling)
             if (IsStr(a.ty) && IsStr(b.ty)) {
                 string r = NT();
