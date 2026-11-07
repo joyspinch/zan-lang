@@ -123,8 +123,14 @@ static volatile int g_slab_lock;
 
 static void zan_mem_backoff(int spins) {
     if (spins < 64) {
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(_WIN32)
+        YieldProcessor();
+#elif defined(__i386__) || defined(__x86_64__)
         __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+        __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__riscv)
+        __asm__ __volatile__(".insn i 0x0F, 0, x0, x0, 0x010" ::: "memory");
 #endif
         return;
     }
@@ -209,6 +215,10 @@ static zan_mem_cache *zan_mem_cache_get(void) {
         while ((st = __atomic_load_n(&g_exit_key_state, __ATOMIC_ACQUIRE)) == 1) {
 #if defined(__i386__) || defined(__x86_64__)
             __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+            __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__riscv)
+            __asm__ __volatile__(".insn i 0x0F, 0, x0, x0, 0x010" ::: "memory");
 #endif
         }
     }
