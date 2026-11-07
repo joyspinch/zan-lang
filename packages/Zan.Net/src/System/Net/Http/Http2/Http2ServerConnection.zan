@@ -15,7 +15,7 @@ public async delegate int Http2SendFn(byte[] data, int len);
 
 // 原始明文套接字发送适配器
 public class Http2SocketSender {
-    public nint sock;
+    private nint sock;
     public Http2SocketSender(nint s) {
         this.sock = s;
     }
@@ -35,9 +35,9 @@ public class Http2ServerStream {
     public Http2ServerStream(int id, HttpRequest req) {
         this.streamId = id;
         this.request = req;
-        this.bodyBuffer = ByteBuffer.Alloc(1024);
+        this.bodyBuffer = ByteBuffer.Alloc(NetConstants.BufferSmall);
         this.complete = false;
-        this.outboundStreamWindow = 65535;
+        this.outboundStreamWindow = Http2Settings.DEFAULT_INITIAL_WINDOW_SIZE;
     }
 
     public void Dispose() {
@@ -55,33 +55,33 @@ public class Http2ServerStream {
 // 3. 多并发 Stream 汇聚与解复用：HEADERS / DATA 帧驱动请求组装。
 // 4. HPACK 头部编解码往返与出站帧串行调度（防止并发流交错打乱帧边界）。
 public class Http2ServerConnection : IDisposable {
-    public HttpFramer framer;
-    public Http2SendFn sendFn;
-    public HttpRequestHandler handler;
-    public HpackContext inboundHpack;
-    public HpackContext outboundHpack;
-    public Mutex sendLock;
-    public bool connected;
-    public List<Http2ServerStream> pendingStreams;
-    public int lastStreamId;
-    public int outboundConnWindow;
-    public int initialStreamWindow;
-    public int maxFrameSize;
-    public int inboundConsumed;
+    private HttpFramer framer;
+    private Http2SendFn sendFn;
+    private HttpRequestHandler handler;
+    private HpackContext inboundHpack;
+    private HpackContext outboundHpack;
+    private Mutex sendLock;
+    private bool connected;
+    private List<Http2ServerStream> pendingStreams;
+    private int lastStreamId;
+    private int outboundConnWindow;
+    private int initialStreamWindow;
+    private int maxFrameSize;
+    private int inboundConsumed;
 
     public Http2ServerConnection(HttpFramer framer, HttpRequestHandler handler, Http2SendFn sendFn) {
         this.framer = framer;
         this.handler = handler;
         this.sendFn = sendFn;
-        this.inboundHpack = new HpackContext(4096);
-        this.outboundHpack = new HpackContext(4096);
+        this.inboundHpack = new HpackContext(Http2Settings.DEFAULT_HEADER_TABLE_SIZE);
+        this.outboundHpack = new HpackContext(Http2Settings.DEFAULT_HEADER_TABLE_SIZE);
         this.sendLock = new Mutex();
         this.connected = true;
         this.pendingStreams = new List<Http2ServerStream>();
         this.lastStreamId = 0;
-        this.outboundConnWindow = 65535;
-        this.initialStreamWindow = 65535;
-        this.maxFrameSize = 16384;
+        this.outboundConnWindow = Http2Settings.DEFAULT_INITIAL_WINDOW_SIZE;
+        this.initialStreamWindow = Http2Settings.DEFAULT_INITIAL_WINDOW_SIZE;
+        this.maxFrameSize = Http2Settings.DEFAULT_MAX_FRAME_SIZE;
         this.inboundConsumed = 0;
     }
 
@@ -150,14 +150,14 @@ public class Http2ServerConnection : IDisposable {
                         int sId = ((payload[idx] & 255) << 8) | (payload[idx + 1] & 255);
                         int sVal = ((payload[idx + 2] & 255) << 24) | ((payload[idx + 3] & 255) << 16)
                                  | ((payload[idx + 4] & 255) << 8) | (payload[idx + 5] & 255);
-                        if (sId == 4) { // SETTINGS_INITIAL_WINDOW_SIZE
+                        if (sId == Http2Settings.INITIAL_WINDOW_SIZE) {
                             int delta = sVal - this.initialStreamWindow;
                             this.initialStreamWindow = sVal;
                             for (int i = 0; i < this.pendingStreams.Count; i = i + 1) {
                                 this.pendingStreams[i].outboundStreamWindow = this.pendingStreams[i].outboundStreamWindow + delta;
                             }
-                        } else if (sId == 5) { // SETTINGS_MAX_FRAME_SIZE
-                            if (sVal >= 16384 && sVal <= 16777215) {
+                        } else if (sId == Http2Settings.MAX_FRAME_SIZE) {
+                            if (sVal >= Http2Settings.DEFAULT_MAX_FRAME_SIZE && sVal <= Http2Settings.MAX_FRAME_SIZE_CEILING) {
                                 this.maxFrameSize = sVal;
                             }
                         }
