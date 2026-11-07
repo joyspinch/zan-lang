@@ -7,8 +7,16 @@
 
 typedef void (*zan_co_step_t)(void *frame);
 
+typedef struct {
+    void         *frame;
+    zan_co_step_t step;
+} zan_co_task_t;
+
+typedef zan_co_task_t zan_co_task;
+
 void   zan_co_sched_init(void);
 void   zan_co_ready(void *frame, zan_co_step_t step);
+void   zan_co_ready_batch(const zan_co_task_t *tasks, size_t count);
 void   zan_co_sched_run(void);
 void   zan_co_sched_run_until(const volatile int *done);
 size_t zan_co_pending(void);

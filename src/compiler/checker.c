@@ -11,8 +11,7 @@
 static const char *type_name(zan_type_t *t);
 
 /* 线程局部存储。LSP 进程里诊断线程与工作线程各跑各的 checker
- * （src/lsp/lsp_main.c），类型名缓冲池不能共用。写法抄 runtime 的
- * rt_sched.c。 */
+ * （src/lsp/lsp_main.c），类型名缓冲池不能共用。 */
 #if defined(_MSC_VER)
 #define ZAN_TLS __declspec(thread)
 #elif defined(__GNUC__) || defined(__clang__)

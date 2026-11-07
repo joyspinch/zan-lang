@@ -249,10 +249,9 @@ endif()
 # ---- Socket-async reactor object (S4b-2) ----
 # Programs that use socket await (await Socket.ReadReady/WriteReady) link a
 # small readiness reactor built from src/runtime/rt_io.c (epoll/kqueue/IOCP).
-# It is compiled here as a standalone object (ZAN_IO_STACKLESS_ONLY drops the
-# rt_sched fiber half, so it depends only on zan_co_ready, which the produced
-# program provides inline). zanc injects this object into the link only when a
-# program actually uses socket await (see src/compiler/main.c). The object must
+# It is compiled here as a standalone object (stackless IO depends only
+# on zan_co_ready, which the produced program provides inline). zanc injects
+# this object into the link only when a program actually uses socket await (see src/compiler/main.c). The object must
 # match the ABI of zanc's produced objects: on Windows zanc emits
 # x86_64-w64-windows-gnu (MinGW) objects and links them with the bundled GNU ld,
 # so compile the reactor with a MinGW gcc (NOT clang-cl/MSVC); elsewhere the
@@ -1173,35 +1172,6 @@ endif()
 add_test(NAME runtime_io_addr COMMAND zanrt_io_addr_test)
 set_tests_properties(runtime_io_addr PROPERTIES TIMEOUT 30)
 add_dependencies(zanc zanrt_io_addr_test)
-
-# M:N coroutine scheduler + runtime verification
-add_executable(zanrt_sched_test
-    tests/runtime/rt_test.c
-    src/runtime/rt_sched.c
-    src/runtime/rt_io.c
-    src/runtime/rt_co.c
-    src/runtime/rt_crash.c
-    src/runtime/rt_timer.c
-    src/runtime/rt_mem.c
-)
-target_include_directories(zanrt_sched_test PRIVATE ${CMAKE_SOURCE_DIR})
-set_target_properties(zanrt_sched_test PROPERTIES
-    C_STANDARD 11
-    C_STANDARD_REQUIRED YES
-)
-if(NOT WIN32)
-    target_compile_definitions(zanrt_sched_test PRIVATE _GNU_SOURCE)
-    find_package(Threads REQUIRED)
-    target_link_libraries(zanrt_sched_test PRIVATE Threads::Threads m)
-    if(NOT APPLE)
-        target_link_libraries(zanrt_sched_test PRIVATE rt)
-    endif()
-else()
-    target_link_libraries(zanrt_sched_test PRIVATE ws2_32 mswsock)
-endif()
-add_test(NAME runtime_sched COMMAND zanrt_sched_test)
-set_tests_properties(runtime_sched PROPERTIES TIMEOUT 60)
-add_dependencies(zanc zanrt_sched_test)
 
 # A hung-up peer (a closed SSE tab) must not kill the process with SIGPIPE.
 # POSIX only: Windows has no such signal.
@@ -3761,7 +3731,7 @@ if(SELFHOST_CLANG)
   # it cannot be reused for a link driven by SELFHOST_CLANG. The TU is
   # therefore compiled again here, with the same clang as the rest of the
   # bundle.
-  set(_sh_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_sched.c runtime/rt_timer.c
+  set(_sh_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_timer.c
                    runtime/rt_decimal.c runtime/rt_sync.c embed/zan_embed_api.c accel/zan_hw_accel.c)
   set(_sh_rt_objs)
   foreach(_sh_src IN LISTS _sh_rt_srcs)
@@ -3836,7 +3806,7 @@ if(SELFHOST_CLANG)
   # (the C host links the shipped mt runtime, the self-host links its own
   # emitted fallback). The gate therefore compares *compiler* behaviour --
   # the stdout a program produces -- not runtime internals.
-  set(_shd_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_sched.c runtime/rt_timer.c
+  set(_shd_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_timer.c
                     runtime/rt_decimal.c runtime/rt_sync.c embed/zan_embed_api.c accel/zan_hw_accel.c)
   set(_shd_rt_objs)
   foreach(_shd_src IN LISTS _shd_rt_srcs)

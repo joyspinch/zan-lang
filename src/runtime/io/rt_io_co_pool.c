@@ -103,7 +103,7 @@ typedef struct {
 #define CO_DEAD      8LL
 #define CO_SELFQ     16LL  
 
-typedef struct { void *frame; zan_co_step_t step; } zan_co_task;
+/* zan_co_task_t / zan_co_task 由 rt_co.h 声明 */
 
 typedef struct {
     unsigned long long ran;
@@ -255,6 +255,40 @@ static void inj_push(zan_co_task t) {
     if (g_inj_tail) g_inj_tail->next = n; else g_inj_head = n;
     g_inj_tail = n;
     InterlockedIncrement(&g_inj_len);
+    LeaveCriticalSection(&g_inj_lock);
+}
+
+/* 单次临界区持有，批量链接注入任务节点，极大降低跨核加锁竞争 (B-ID89 Pipeline Merging) */
+static void inj_push_batch(const zan_co_task *tasks, size_t count) {
+    if (!tasks || count == 0) return;
+    EnterCriticalSection(&g_inj_lock);
+    zan_co_node *head_batch = NULL;
+    zan_co_node *tail_batch = NULL;
+    for (size_t i = 0; i < count; i++) {
+        zan_co_node *n = g_inj_free;
+        if (n) {
+            g_inj_free = n->next;
+        } else {
+            n = (zan_co_node *)malloc(sizeof(*n));
+            if (!n) zan_rt_fatal("oom", "io: injection node alloc failed");
+        }
+        n->next = NULL;
+        n->frame = tasks[i].frame;
+        n->step = tasks[i].step;
+        if (tail_batch) {
+            tail_batch->next = n;
+        } else {
+            head_batch = n;
+        }
+        tail_batch = n;
+    }
+    if (g_inj_tail) {
+        g_inj_tail->next = head_batch;
+    } else {
+        g_inj_head = head_batch;
+    }
+    g_inj_tail = tail_batch;
+    InterlockedExchangeAdd(&g_inj_len, (LONG)count);
     LeaveCriticalSection(&g_inj_lock);
 }
 
@@ -463,30 +497,85 @@ static void co_submit(void *frame, zan_co_step_t step) {
     co_notify();
 }
 
+static void co_submit_batch(const zan_co_task *tasks, size_t count) {
+    if (!tasks || count == 0) return;
+    zan_co_worker_t *w = co_self();
+    if (!w) {
+        co_cnt_add(NULL, (int)count, (int)count);
+        inj_push_batch(tasks, count);
+        InterlockedExchangeAdd(&g_inj_push_ext, (LONG)count);
+        for (size_t i = 0; i < count; i++) co_trace("inj", tasks[i].frame);
+        co_notify();
+        return;
+    }
+    co_cnt_add(w, (int)count, (int)count);
+    size_t i = 0;
+    if (!w->lifo_full && i < count) {
+        w->lifo = tasks[i];
+        w->lifo_full = 1;
+        w->st.lifo_put++;
+        i++;
+    }
+    for (; i < count; i++) {
+        lq_push(w, tasks[i]);
+    }
+    co_notify();
+}
+
+void zan_co_ready_batch(const zan_co_task_t *tasks, size_t count) {
+    if (!tasks || count == 0) return;
+    zan_co_task runnable[64];
+    size_t n_run = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        void *frame = tasks[i].frame;
+        zan_co_step_t step = tasks[i].step;
+        if (!step || !frame) continue;
+
+        zan_co_fhdr *h = co_hdr(frame);
+        int queued = 0;
+        for (;;) {
+            long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
+            if (s & CO_DEAD) break;
+            if (s & CO_QUEUED) break;
+            if (s & CO_RUNNING) {
+                zan_co_worker_t *sw = co_self();
+                long long selfq = (sw && sw->cur == frame) ? CO_SELFQ : 0;
+                __atomic_store_n(&h->pending, step, __ATOMIC_RELAXED);
+                if (__atomic_compare_exchange_n(&h->sched, &s,
+                                                s | CO_NOTIFIED | selfq, 0,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                    break;
+                continue;
+            }
+            if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_QUEUED, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                queued = 1;
+                break;
+            }
+        }
+        if (queued) {
+            runnable[n_run].frame = frame;
+            runnable[n_run].step = step;
+            n_run++;
+            if (n_run == 64) {
+                co_submit_batch(runnable, n_run);
+                n_run = 0;
+            }
+        }
+    }
+    if (n_run > 0) {
+        co_submit_batch(runnable, n_run);
+    }
+    co_pool_ensure();
+}
+
 void zan_co_ready(void *frame, zan_co_step_t step) {
     if (!step || !frame) return;
-    zan_co_fhdr *h = co_hdr(frame);
-    for (;;) {
-        long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
-        if (s & CO_DEAD) return;
-        if (s & CO_QUEUED) return;
-        if (s & CO_RUNNING) {
-            zan_co_worker_t *sw = co_self();
-            long long selfq = (sw && sw->cur == frame) ? CO_SELFQ : 0;
-            __atomic_store_n(&h->pending, step, __ATOMIC_RELAXED);
-            if (__atomic_compare_exchange_n(&h->sched, &s,
-                                            s | CO_NOTIFIED | selfq, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-                return;
-            continue;
-        }
-    if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_QUEUED, 0,
-                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-        break;
-    }
-    co_submit(frame, step);
-    /* 跨线程安全就绪：支持任意线程恢复协程 */
-    co_pool_ensure();
+    zan_co_task_t t;
+    t.frame = frame;
+    t.step = step;
+    zan_co_ready_batch(&t, 1);
 }
 
 /* ---- 帧检疫区（A380 方向 b）----

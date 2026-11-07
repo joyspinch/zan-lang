@@ -713,6 +713,8 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     }
     IOTRACE("poll removed=%lu cnt=%ld", (unsigned long)removed, g_io_count);
     int woke = 0;
+    zan_co_task_t ready_batch[64];
+    size_t ready_count = 0;
     for (ULONG i = 0; i < removed; i++) {
         if (!entries[i].lpOverlapped) {
             woke += dns_drain();
@@ -739,8 +741,15 @@ int32_t zan_io_poll(int64_t timeout_ms) {
                        entries[i].Internal);
         op_free(op);
         IO_CNT_DEC();
-        io_wake(co, step);
+        if (step && co) {
+            ready_batch[ready_count].frame = co;
+            ready_batch[ready_count].step = step;
+            ready_count++;
+        }
         woke++;
+    }
+    if (ready_count > 0) {
+        zan_co_ready_batch(ready_batch, ready_count);
     }
     return woke;
 }

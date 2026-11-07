@@ -45,7 +45,7 @@ import shutil
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
-RT_IO = ["src/runtime/rt_io.c", "src/runtime/rt_sched.c"]
+RT_IO = ["src/runtime/rt_io.c"]
 RT_SYNC = ["src/runtime/rt_sync.c"]
 RT_FILE = ["src/runtime/rt_file.c"]
 RT_DECIMAL = ["src/runtime/rt_decimal.c", "src/runtime/rt_decimal.h"]

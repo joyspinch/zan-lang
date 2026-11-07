@@ -184,8 +184,11 @@ static int zan_mem_owns(const void *p) {
     return 0;
 }
 
-static zan_mem_cache *zan_mem_cache_get(void) {
 #if defined(_WIN32)
+static inline DWORD zan_mem_fls_slot(void) {
+    static DWORD s_fls = FLS_OUT_OF_INDEXES;
+    if (__builtin_expect(s_fls != FLS_OUT_OF_INDEXES, 1)) return s_fls;
+
     int fst = __atomic_load_n(&g_fls_state, __ATOMIC_ACQUIRE);
     if (fst == 0 && __atomic_compare_exchange_n(&g_fls_state, &fst, 1, 0,
                                                 __ATOMIC_ACQ_REL,
@@ -194,12 +197,23 @@ static zan_mem_cache *zan_mem_cache_get(void) {
         __atomic_store_n(&g_fls, idx, __ATOMIC_RELEASE);
         __atomic_store_n(&g_fls_state, idx == FLS_OUT_OF_INDEXES ? 3 : 2,
                          __ATOMIC_RELEASE);
-        fst = idx == FLS_OUT_OF_INDEXES ? 3 : 2;
+        s_fls = idx;
+        return s_fls;
     }
-    if (fst != 2) return NULL;
+    while (__atomic_load_n(&g_fls_state, __ATOMIC_ACQUIRE) == 1) {
+        YieldProcessor();
+    }
     DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
-    zan_mem_cache *c = (fls == FLS_OUT_OF_INDEXES)
-                       ? NULL : (zan_mem_cache *)FlsGetValue(fls);
+    s_fls = fls;
+    return fls;
+}
+#endif
+
+static zan_mem_cache *zan_mem_cache_get(void) {
+#if defined(_WIN32)
+    DWORD fls = zan_mem_fls_slot();
+    if (fls == FLS_OUT_OF_INDEXES) return NULL;
+    zan_mem_cache *c = (zan_mem_cache *)FlsGetValue(fls);
     if (c) return c;
 #else
     zan_mem_cache *c = t_cache;
@@ -451,7 +465,7 @@ size_t zan_mem_trim(void) {
     zan_mem_unlock();
 
 #if defined(_WIN32)
-    DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
+    DWORD fls = zan_mem_fls_slot();
     zan_mem_cache *self = (fls == FLS_OUT_OF_INDEXES)
                           ? NULL : (zan_mem_cache *)FlsGetValue(fls);
 #else
@@ -525,7 +539,7 @@ void __wrap_free(void *p) {
     }
     zan_mem_cache *owner = __atomic_load_n(&h->owner, __ATOMIC_RELAXED);
 #if defined(_WIN32)
-    DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
+    DWORD fls = zan_mem_fls_slot();
     zan_mem_cache *self = (fls == FLS_OUT_OF_INDEXES)
                           ? NULL : (zan_mem_cache *)FlsGetValue(fls);
 #else
@@ -726,6 +740,10 @@ static inline unsigned zan_live_hash(uintptr_t ptr) {
     return (unsigned)x;
 }
 
+static void zan_live_atexit_detector(void) {
+    zan_gc_detect_cycles();
+}
+
 static void zan_live_ensure_init(void) {
     if (__atomic_load_n(&g_live_stripes_inited, __ATOMIC_ACQUIRE)) return;
     static volatile long init_lock = 0;
@@ -739,6 +757,9 @@ static void zan_live_ensure_init(void) {
             g_live_stripes[i].buckets = (zan_live_entry_t **)__real_calloc(64, sizeof(zan_live_entry_t *));
             g_live_stripes[i].count = 0;
             g_live_stripes[i].free_list = NULL;
+        }
+        if (getenv("ZAN_DETECT_LEAKS")) {
+            atexit(zan_live_atexit_detector);
         }
         __atomic_store_n(&g_live_stripes_inited, 1, __ATOMIC_RELEASE);
     }
@@ -1088,8 +1109,22 @@ int64_t zan_gc_detect_cycles(void) {
 
     if (orphan_count > 0) {
         fprintf(stderr,
-            "[zan-gc] cycle detection: %lld unreachable object(s) in orphan cycles (%zu bytes)\n",
+            "[zan-gc] cycle detection: %lld unreachable object(s) in orphan cycles (%zu bytes):\n",
             (long long)orphan_count, orphan_bytes);
+        int printed = 0;
+        for (size_t i = 0; i < actual_count && printed < 20; i++) {
+            if (!nodes[i].marked) {
+                const char *tyname = zan_get_object_tyname(nodes[i].obj);
+                uint64_t site = *(uint64_t *)((char *)nodes[i].obj + ZAN_OBJ_SITE_OFF);
+                fprintf(stderr, "  - [%s] at %p (rc=%lld, internal_rc=%lld, size=%zu, site=%llu)\n",
+                        tyname, nodes[i].obj, (long long)nodes[i].rc, (long long)nodes[i].internal_rc,
+                        nodes[i].size, (unsigned long long)site);
+                printed++;
+            }
+        }
+        if (orphan_count > 20) {
+            fprintf(stderr, "  ... and %lld more orphan object(s)\n", (long long)(orphan_count - 20));
+        }
     }
 
     if (queue) __real_free(queue);
@@ -1101,6 +1136,10 @@ int64_t zan_gc_detect_cycles(void) {
     }
 
     return orphan_count;
+}
+
+void zan_rt_dump_leaks(void) {
+    zan_gc_detect_cycles();
 }
 
 typedef struct {

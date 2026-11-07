@@ -72,6 +72,13 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     g_len++;
 }
 
+void zan_co_ready_batch(const zan_co_task_t *tasks, size_t count) {
+    if (!tasks || count == 0) return;
+    for (size_t i = 0; i < count; i++) {
+        zan_co_ready(tasks[i].frame, tasks[i].step);
+    }
+}
+
 void zan_co_sched_run_until(const volatile int *done) {
     for (;;) {
         while (g_len > 0) {

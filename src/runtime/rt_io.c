@@ -84,12 +84,6 @@ static ZAN_MAYBE_UNUSED void zan_io_fd_cloexec(int fd) {
 #include <fcntl.h>
 #include <unistd.h>
 #endif
-#ifndef ZAN_IO_STACKLESS_ONLY
-#include "rt_sched.h"
-extern void zan_io_suspend_current(void);   /* implemented in rt_sched.c */
-extern void zan_io_resume(void *co);        /* implemented in rt_sched.c */
-extern void *zan_io_get_current_co(void);   /* implemented in rt_sched.c */
-#endif
 #include "../common/host_oom.h"
 
 #if !defined(_WIN32)
@@ -160,12 +154,7 @@ void zan_co_delay(long long ms, void *frame, zan_co_step_t step);
 
 /* 唤醒就绪文件描述符关联的等待观察者 */
 static void io_wake(void *co, zan_co_step_t step) {
-#ifdef ZAN_IO_STACKLESS_ONLY
     zan_co_ready(co, step);
-#else
-    if (step) zan_co_ready(co, step);
-    else      zan_io_resume(co);
-#endif
 }
 
 #if !defined(_WIN32)
@@ -975,137 +964,6 @@ int32_t zan_io_has_pending(void) {
     return (g_io_count > 0) || (g_blocking_inflight > 0);
 }
 
-#ifndef ZAN_IO_STACKLESS_ONLY
-
-int64_t zan_io_wait_readable(intptr_t fd) {
-    void *co = zan_io_get_current_co();
-    if (!co) return -1;
-    io_register(fd, ZAN_IO_READ, co, NULL);
-    zan_io_suspend_current();
-    return 0;
-}
-
-int64_t zan_io_wait_writable(intptr_t fd) {
-    void *co = zan_io_get_current_co();
-    if (!co) return -1;
-    io_register(fd, ZAN_IO_WRITE, co, NULL);
-    zan_io_suspend_current();
-    return 0;
-}
-
-int64_t zan_io_wait_readable_timeout(intptr_t fd, int64_t timeout_ms) {
-    if (timeout_ms < 0) {
-        void *co = zan_io_get_current_co();
-        if (!co) return -1;
-        io_register(fd, ZAN_IO_READ, co, NULL);
-        zan_io_suspend_current();
-        return 1;
-    }
-#if defined(_WIN32)
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET((SOCKET)fd, &fds);
-    struct timeval tv;
-    tv.tv_sec = (long)(timeout_ms / 1000);
-    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
-    int r = select(0, &fds, NULL, NULL, &tv);
-    if (r < 0) return -1;
-    if (r == 0) return 0;
-    return 1;
-#else
-    struct pollfd pfd;
-    pfd.fd = (int)fd;
-    pfd.events = POLLIN;
-    int r = poll(&pfd, 1, (int)timeout_ms);
-    if (r < 0) return -1;
-    if (r == 0) return 0;
-    return 1;
-#endif
-}
-
-
-#if defined(_WIN32)
-/* Windows ConnectEx 异步连接：挂起协程直至连接完成 */
-int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
-    SOCKET s = (SOCKET)fd;
-
-    /* ConnectEx 契约：套接字必须预先绑定地址 */
-    struct sockaddr_in local;
-    memset(&local, 0, sizeof(local));
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = INADDR_ANY;
-    local.sin_port = 0;
-    bind(s, (struct sockaddr *)&local, sizeof(local));
-
-    /* 新连接套接字首次强制关联完成端口 */
-    mark_assoc(s);
-
-    GUID guid = WSAID_CONNECTEX;
-    LPFN_CONNECTEX pConnectEx = NULL;
-    DWORD bytes = 0;
-    if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER,
-                 &guid, sizeof(guid), &pConnectEx, sizeof(pConnectEx),
-                 &bytes, NULL, NULL) != 0 || !pConnectEx)
-        return -1;
-
-    struct sockaddr_in target;
-    memset(&target, 0, sizeof(target));
-    target.sin_family = AF_INET;
-    target.sin_port = htons((u_short)port);
-    target.sin_addr.s_addr = inet_addr(ip);
-
-    void *co = zan_io_get_current_co();
-    if (!co) return -1;
-
-    zan_io_op_t *op = op_alloc();
-    if (!op) return -1;
-    op->sock = s;
-    op->interest = ZAN_IO_WRITE;
-    op->co = co;
-    IO_CNT_INC();
-
-    BOOL ok = pConnectEx(s, (struct sockaddr *)&target, sizeof(target),
-                         NULL, 0, NULL, &op->ov);
-    if (!ok && WSAGetLastError() != ERROR_IO_PENDING) {
-        op_free(op);
-        IO_CNT_DEC();
-        return -1;
-    }
-    zan_io_suspend_current();
-
-    if (setsockopt(s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0) != 0)
-        return -1;
-    struct sockaddr_in peer;
-    int plen = sizeof(peer);
-    return getpeername(s, (struct sockaddr *)&peer, &plen) == 0 ? 0 : -1;
-}
-
-#else
-/* POSIX 异步连接：非阻塞连接与可写就绪挂起 */
-int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
-    int s = (int)fd;
-    struct sockaddr_in target;
-    memset(&target, 0, sizeof(target));
-    target.sin_family = AF_INET;
-    target.sin_port = htons((uint16_t)port);
-    target.sin_addr.s_addr = inet_addr(ip);
-
-    zan_io_set_nonblocking(fd);
-    int r = connect(s, (struct sockaddr *)&target, sizeof(target));
-    if (r == 0) return 0;
-    if (errno != EINPROGRESS && errno != EWOULDBLOCK)
-        return -1;
-
-    zan_io_wait_writable(fd);
-
-    int err = 0;
-    socklen_t len = sizeof(err);
-    /* 连接探测失败：套接字已在等待期间关闭 */
-    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) != 0) return -1;
-    return err == 0 ? 0 : -1;
-}
-#endif
-#endif /* ZAN_IO_STACKLESS_ONLY */
 
 #ifdef ZAN_CO_DRIVER
 

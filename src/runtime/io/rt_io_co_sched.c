@@ -260,6 +260,8 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
         dns_drain();
         return;
     }
+    zan_co_task_t ready_batch[64];
+    size_t ready_count = 0;
     for (ULONG i = 0; i < removed; i++) {
         if (entries[i].lpOverlapped == NULL) {
             if (entries[i].lpCompletionKey == ZAN_WAKE_KEY) {
@@ -289,8 +291,15 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
         io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
                        entries[i].Internal);
         op_free(op);
-        if (step) zan_co_ready(co, step);
         IO_CNT_DEC();
+        if (step && co) {
+            ready_batch[ready_count].frame = co;
+            ready_batch[ready_count].step = step;
+            ready_count++;
+        }
+    }
+    if (ready_count > 0) {
+        zan_co_ready_batch(ready_batch, ready_count);
     }
 #else
     (void)w;
@@ -723,6 +732,13 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     n->next = NULL; n->frame = frame; n->step = step;
     if (g_rq_tail) g_rq_tail->next = n; else g_rq_head = n;
     g_rq_tail = n;
+}
+
+void zan_co_ready_batch(const zan_co_task_t *tasks, size_t count) {
+    if (!tasks || count == 0) return;
+    for (size_t i = 0; i < count; i++) {
+        zan_co_ready(tasks[i].frame, tasks[i].step);
+    }
 }
 
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {

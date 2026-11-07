@@ -38,7 +38,7 @@ fi
 
 # gen2 links the same runtime the host links for an ordinary program.
 RT_OBJS=()
-for rt in rt_file rt_io rt_crash rt_sched rt_timer rt_decimal rt_sync; do
+for rt in rt_file rt_io rt_crash rt_timer rt_decimal rt_sync; do
   obj="$BUILD/${rt}.o"
   if [ ! -f "$obj" ]; then
     ${CC:-clang} -O2 -c "$ROOT/src/runtime/${rt}.c" -o "$obj"

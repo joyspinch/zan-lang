@@ -38,7 +38,6 @@ rem ---- runtime objects for gen2 (same set the host links for a program) ----
 call :rt rt_file
 call :rt rt_io
 call :rt rt_crash
-call :rt rt_sched
 call :rt rt_timer
 call :rt rt_decimal
 call :rt rt_sync

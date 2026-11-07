@@ -88,6 +88,81 @@ static bool are_same_arc_object(LLVMValueRef op1, LLVMValueRef op2) {
     return false;
 }
 
+static bool is_safe_pure_function(const char *fn_name) {
+    if (!fn_name) return false;
+
+    /* LLVM 基础诊断与数值内联 */
+    if (strncmp(fn_name, "llvm.lifetime.", 14) == 0 ||
+        strncmp(fn_name, "llvm.dbg.", 9) == 0 ||
+        strncmp(fn_name, "llvm.assume", 11) == 0 ||
+        strncmp(fn_name, "llvm.expect", 11) == 0 ||
+        strncmp(fn_name, "llvm.sadd.", 10) == 0 ||
+        strncmp(fn_name, "llvm.uadd.", 10) == 0 ||
+        strncmp(fn_name, "llvm.ssub.", 10) == 0 ||
+        strncmp(fn_name, "llvm.usub.", 10) == 0 ||
+        strncmp(fn_name, "llvm.smul.", 10) == 0 ||
+        strncmp(fn_name, "llvm.umul.", 10) == 0 ||
+        strncmp(fn_name, "llvm.smin.", 10) == 0 ||
+        strncmp(fn_name, "llvm.smax.", 10) == 0 ||
+        strncmp(fn_name, "llvm.umin.", 10) == 0 ||
+        strncmp(fn_name, "llvm.umax.", 10) == 0 ||
+        strncmp(fn_name, "llvm.abs.", 9) == 0 ||
+        strncmp(fn_name, "llvm.bswap.", 11) == 0 ||
+        strncmp(fn_name, "llvm.ctpop.", 11) == 0 ||
+        strncmp(fn_name, "llvm.ctlz.", 10) == 0 ||
+        strncmp(fn_name, "llvm.cttz.", 10) == 0 ||
+        strncmp(fn_name, "llvm.sin.", 9) == 0 ||
+        strncmp(fn_name, "llvm.cos.", 9) == 0 ||
+        strncmp(fn_name, "llvm.sqrt.", 10) == 0 ||
+        strncmp(fn_name, "llvm.fabs.", 10) == 0 ||
+        strncmp(fn_name, "llvm.pow.", 9) == 0 ||
+        strncmp(fn_name, "llvm.floor.", 11) == 0 ||
+        strncmp(fn_name, "llvm.ceil.", 10) == 0 ||
+        strncmp(fn_name, "llvm.round.", 11) == 0 ||
+        strncmp(fn_name, "llvm.trunc.", 11) == 0 ||
+        strncmp(fn_name, "llvm.minnum.", 12) == 0 ||
+        strncmp(fn_name, "llvm.maxnum.", 12) == 0 ||
+        strncmp(fn_name, "llvm.log.", 9) == 0 ||
+        strncmp(fn_name, "llvm.exp.", 9) == 0) {
+        return true;
+    }
+
+    /* 边界检查与只读运行时探针（不修改目标对象引用计数或内存布局） */
+    if (strcmp(fn_name, "zan_bound_check") == 0 ||
+        strcmp(fn_name, "zan_rt_bound_check") == 0 ||
+        strcmp(fn_name, "zan_rt_str_len") == 0 ||
+        strcmp(fn_name, "zan_rt_str_compare") == 0 ||
+        strcmp(fn_name, "zan_rt_str_equal") == 0 ||
+        strcmp(fn_name, "zan_rt_str_hash") == 0 ||
+        strcmp(fn_name, "zan_rt_str_bytes") == 0 ||
+        strcmp(fn_name, "zan_rt_arr_len") == 0 ||
+        strcmp(fn_name, "zan_rt_now_ms") == 0 ||
+        strcmp(fn_name, "zan_rt_tick_us") == 0) {
+        return true;
+    }
+
+    /* 标准 C 纯数学函数 (libm / msvcrt) */
+    if (strcmp(fn_name, "sin") == 0 || strcmp(fn_name, "cos") == 0 ||
+        strcmp(fn_name, "tan") == 0 || strcmp(fn_name, "asin") == 0 ||
+        strcmp(fn_name, "acos") == 0 || strcmp(fn_name, "atan") == 0 ||
+        strcmp(fn_name, "atan2") == 0 || strcmp(fn_name, "exp") == 0 ||
+        strcmp(fn_name, "log") == 0 || strcmp(fn_name, "log10") == 0 ||
+        strcmp(fn_name, "log2") == 0 || strcmp(fn_name, "pow") == 0 ||
+        strcmp(fn_name, "sqrt") == 0 || strcmp(fn_name, "ceil") == 0 ||
+        strcmp(fn_name, "floor") == 0 || strcmp(fn_name, "fabs") == 0 ||
+        strcmp(fn_name, "round") == 0 || strcmp(fn_name, "fmod") == 0) {
+        return true;
+    }
+
+    /* 标准 C 内存与字符串只读查询 */
+    if (strcmp(fn_name, "strlen") == 0 || strcmp(fn_name, "memcmp") == 0 ||
+        strcmp(fn_name, "strcmp") == 0 || strcmp(fn_name, "strncmp") == 0) {
+        return true;
+    }
+
+    return false;
+}
+
 static bool is_safe_arc_intermediate(LLVMValueRef inst, LLVMValueRef target_obj) {
     if (!inst) return false;
     LLVMOpcode opcode = LLVMGetInstructionOpcode(inst);
@@ -105,22 +180,21 @@ static bool is_safe_arc_intermediate(LLVMValueRef inst, LLVMValueRef target_obj)
         if (callee) {
             const char *fn_name = LLVMGetValueName(callee);
             if (fn_name) {
-                if (strncmp(fn_name, "llvm.lifetime.", 14) == 0 ||
-                    strncmp(fn_name, "llvm.dbg.", 9) == 0 ||
-                    strncmp(fn_name, "llvm.assume", 11) == 0 ||
-                    strncmp(fn_name, "llvm.expect", 11) == 0 ||
-                    strncmp(fn_name, "llvm.sadd.", 10) == 0 ||
-                    strncmp(fn_name, "llvm.uadd.", 10) == 0 ||
-                    strncmp(fn_name, "llvm.ssub.", 10) == 0 ||
-                    strncmp(fn_name, "llvm.usub.", 10) == 0 ||
-                    strncmp(fn_name, "llvm.smul.", 10) == 0 ||
-                    strncmp(fn_name, "llvm.umul.", 10) == 0 ||
-                    strncmp(fn_name, "llvm.bswap.", 11) == 0 ||
-                    strncmp(fn_name, "llvm.ctpop.", 11) == 0 ||
-                    strncmp(fn_name, "llvm.ctlz.", 10) == 0 ||
-                    strncmp(fn_name, "llvm.cttz.", 10) == 0 ||
-                    strcmp(fn_name, "zan_bound_check") == 0 ||
-                    strcmp(fn_name, "zan_rt_bound_check") == 0) {
+                if (is_safe_pure_function(fn_name)) {
+                    return true;
+                }
+                /* 内存拷贝内联：若目标地址不是 target_obj 且不是 target_obj 的来源槽位，则安全 */
+                if (strncmp(fn_name, "llvm.memcpy.", 12) == 0 ||
+                    strncmp(fn_name, "llvm.memmove.", 13) == 0 ||
+                    strncmp(fn_name, "llvm.memset.", 12) == 0) {
+                    if (LLVMGetNumOperands(inst) >= 1) {
+                        LLVMValueRef dst = strip_pointer_casts(LLVMGetOperand(inst, 0));
+                        if (dst == target_obj) return false;
+                        if (LLVMIsAInstruction(target_obj) && LLVMGetInstructionOpcode(target_obj) == LLVMLoad) {
+                            LLVMValueRef src_ptr = strip_pointer_casts(LLVMGetOperand(target_obj, 0));
+                            if (dst == src_ptr) return false;
+                        }
+                    }
                     return true;
                 }
             }
@@ -186,27 +260,35 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
                         if (op1) {
                             LLVMValueRef curr = next;
                             int steps = 0;
-                            const int MAX_ARC_WINDOW = 64;
+                            const int MAX_ARC_WINDOW = 128;
                             LLVMValueRef match_release = NULL;
+                            int retain_depth = 1;
 
                             while (curr && steps < MAX_ARC_WINDOW) {
                                 zan_arc_call_kind_t k2 = get_arc_call_kind(curr);
                                 if (k2 != ARC_NONE) {
                                     LLVMValueRef op2 = get_arc_operand(curr);
                                     if (are_same_arc_object(op1, op2)) {
-                                        if ((k1 == ARC_RETAIN_OBJ && k2 == ARC_RELEASE_OBJ) ||
-                                            (k1 == ARC_RETAIN_STR && k2 == ARC_RELEASE_STR)) {
-                                            match_release = curr;
+                                        if ((k1 == ARC_RETAIN_OBJ && k2 == ARC_RETAIN_OBJ) ||
+                                            (k1 == ARC_RETAIN_STR && k2 == ARC_RETAIN_STR)) {
+                                            retain_depth++;
+                                        } else if ((k1 == ARC_RETAIN_OBJ && k2 == ARC_RELEASE_OBJ) ||
+                                                   (k1 == ARC_RETAIN_STR && k2 == ARC_RELEASE_STR)) {
+                                            retain_depth--;
+                                            if (retain_depth == 0) {
+                                                match_release = curr;
+                                                break;
+                                            }
                                         }
-                                        break;
-                                    }
-                                    /* B-ID96：异对象 ARC 释放不安全——别名判定只认
-                                     * SSA/同槽 load、不追 GEP 与容器级联，异对象
-                                     * release 可能在运行期经容器元素/字段别名动到
-                                     * 目标对象的引用计数。保守关窗；
-                                     * 异对象 retain 不改目标计数，仍可穿窗。 */
-                                    if (k2 == ARC_RELEASE_OBJ || k2 == ARC_RELEASE_STR) {
-                                        break;
+                                    } else {
+                                        /* B-ID96：异对象 ARC 释放不安全——别名判定只认
+                                         * SSA/同槽 load、不追 GEP 与容器级联，异对象
+                                         * release 可能在运行期经容器元素/字段别名动到
+                                         * 目标对象的引用计数。保守关窗；
+                                         * 异对象 retain 不改目标计数，仍可穿窗。 */
+                                        if (k2 == ARC_RELEASE_OBJ || k2 == ARC_RELEASE_STR) {
+                                            break;
+                                        }
                                     }
                                 }
 

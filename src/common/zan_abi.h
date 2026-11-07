@@ -87,6 +87,7 @@ void zan_rt_live_register(void *obj, size_t size);
 void zan_rt_live_unregister(void *obj);
 void zan_rt_register_site_field_graphs(void **graphs, void **tynames, int64_t count);
 int64_t zan_gc_detect_cycles(void);
+void zan_rt_dump_leaks(void);
 int64_t zan_gc_write_heap_snapshot(const char *path);
 
 #endif /* ZAN_ABI_H */

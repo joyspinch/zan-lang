@@ -277,6 +277,8 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
         if (n < 0) n = 0;
         if (n != 0) {
             int woke = 0;
+            zan_co_task_t ready_batch[256];
+            size_t ready_count = 0;
             for (int i = 0; i < n; i++) {
                 int fd = events[i].data.fd;
                 if (fd == sh->wake_rfd) {
@@ -305,11 +307,20 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
                 for (int k = 0; k < nr; k++) {
                     io_deliver_waiter(fd, &ready[k]);
                     InterlockedDecrement(&g_io_count);
-                    io_wake(ready[k].co, ready[k].step);
+                    if (ready[k].co && ready[k].step && ready_count < 256) {
+                        ready_batch[ready_count].frame = ready[k].co;
+                        ready_batch[ready_count].step = ready[k].step;
+                        ready_count++;
+                    } else {
+                        io_wake(ready[k].co, ready[k].step);
+                    }
                     woke++;
                 }
             }
             shard_unlock(sh);
+            if (ready_count > 0) {
+                zan_co_ready_batch(ready_batch, ready_count);
+            }
             return woke;
         }
         int w2 = dns_timeout_scan();
