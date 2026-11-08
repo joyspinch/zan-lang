@@ -35,7 +35,7 @@
   - CodeEditor.Completion.zan (2826行) -> Match/Refs/Members/Project/Fixup 5切面 (commit 250e62ba7)
   所有新拆出文件严格 ≤ 1200 行门禁，conformance/gui 测试全绿通过。
 - [~] B-ID171 GUI 分层重构 P0 安全网与护栏（`docs/GUI_ARCHITECTURE.md` §4，后续 B-ID172～179 同）：① 计划落盘（立项即落）；② 补注册未登记 GUI 用例 + 布局树金标用例（P5 等价门）〔串行前置：批次 0 在飞 CMakeLists.txt〕；③ `scripts/check_code_standards.py` 层级棘轮 + 基线（已落 eb289a6bd）；④ 清死 using（实测 23→5，2026-11-09）与文档漂移（zan.pkg、README、agent-kb、gui-design skill）；层级机检补 static 可变字段棘轮（Gui.Core/Widget/Component，2026-11-09 裁定）；gui-design/game-dev skill 画布例外条款改写与三副本同步——有并发会话在飞未提交改动，待其收口后同提交执行。
-- [ ] B-ID172 GUI 分层重构 P1 断包环、按目标层摆目录：① HMI 注册移入 Zan.Industrial `HmiBootstrap`，ControlBootstrap 删 `using Gui.Hmi`；② 新建 Forms/Binding/Testing 目录、基元移到 src/Gui 根（命名空间不变）〔串行前置：批次 0 在飞 ChildWindow/DocWire/ModelBinder/UiDriver〕；③ ControlBootstrap 移入 Widget/。
+- [ ] B-ID172 GUI 分层重构 P1 断包环、按目标层摆目录：① 控件注册梯子退役（2026-11-09 用户裁定 `Install()` 类注册方案属不可行历史方案，移除；原 HmiBootstrap 外移方案作废）——替代机制先出小设计：候选为编译器生成控件清单（类型在编译图内即自动可按 kind 构造、miss 显式报错，替代 ControlBootstrap/DataTableBootstrap/ChartBootstrap/CefControlBootstrap 全部手工注册），ControlBootstrap 删 `using Gui.Hmi` 并入该机制；② 新建 Forms/Binding/Testing 目录、基元移到 src/Gui 根（命名空间不变）〔串行前置：批次 0 在飞 ChildWindow/DocWire/ModelBinder/UiDriver〕；③ ControlBootstrap 移入 Widget/。
 
 ### 批次 3 · 有前置（前置闭了再领）
 
