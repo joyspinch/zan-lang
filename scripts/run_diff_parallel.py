@@ -72,7 +72,7 @@ def run_case(case, a):
     if rc == -9:
         why = "gen1 emit timed out after %ds (miscompile spin?)" % a.emit_timeout
     elif rc != 0:
-        why = "gen1 failed to compile it (rc=%d): %s" % (rc, out)
+        why = "gen1 failed to compile it (rc=%d): %s%s" % (rc, out, err)
     elif a.clang and a.rtobjs:
         rc, out, err = run_cmd([a.clang, ll] + a.rtobjs + a.syslibs + ["-o", exe], a.workdir, a.link_timeout)
         if rc == -9:
