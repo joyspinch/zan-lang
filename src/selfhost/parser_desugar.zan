@@ -1,0 +1,335 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+public partial class Parser {
+
+    // Iterator methods are lowered eagerly: a method containing `yield` gets a
+    // hidden `List<T> __yield` accumulator, each `yield return e` appends to it,
+    // `yield break` returns it early, and the method returns the finished list
+    // (its IEnumerable<T> return type is rewritten to List<T>, which foreach
+    // already iterates). Mirrors the C host desugar_yield.
+    void DesugarIterators(Node unit) {
+        int di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int mi = 0;
+                while (mi < d.kids.Count) {
+                    Node m = d.kids[mi];
+                    if (m.kind == AK.MethodDecl() && m.d != null) { DesugarYieldMethod(m); }
+                    mi = mi + 1;
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    bool StmtHasYield(Node s) {
+        if (s == null) { return false; }
+        if (s.kind == AK.YieldStmt()) { return true; }
+        if (StmtHasYield(s.a)) { return true; }
+        if (StmtHasYield(s.b)) { return true; }
+        if (StmtHasYield(s.c)) { return true; }
+        if (StmtHasYield(s.d)) { return true; }
+        int i = 0;
+        while (i < s.kids.Count) { if (StmtHasYield(s.kids[i])) { return true; } i = i + 1; }
+        return false;
+    }
+
+    Node YieldIdent() {
+        Node id = new Node(AK.Ident());
+        id.sval = "__yield";
+        return id;
+    }
+
+    Node RewriteYieldOne(Node s) {
+        if (s == null) { return null; }
+        if (s.kind == AK.YieldStmt()) {
+            if (s.a != null) {
+                Node mem = new Node(AK.MemberAccess());
+                mem.a = YieldIdent(); mem.sval = "Add"; mem.line = s.line; mem.col = s.col;
+                Node call = new Node(AK.Call());
+                call.a = mem; call.Add(s.a); call.line = s.line; call.col = s.col;
+                Node es = new Node(AK.ExprStmt());
+                es.a = call; es.line = s.line; es.col = s.col;
+                return es;
+            }
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = YieldIdent(); ret.line = s.line; ret.col = s.col;
+            return ret;
+        }
+        RewriteYields(s);
+        return s;
+    }
+
+    void RewriteYields(Node s) {
+        if (s == null) { return; }
+        int k = s.kind;
+        if (k == AK.Block()) {
+            int i = 0;
+            while (i < s.kids.Count) { s.kids[i] = RewriteYieldOne(s.kids[i]); i = i + 1; }
+        } else if (k == AK.IfStmt()) {
+            s.b = RewriteYieldOne(s.b);
+            s.c = RewriteYieldOne(s.c);
+        } else if (k == AK.WhileStmt()) {
+            s.b = RewriteYieldOne(s.b);
+        } else if (k == AK.DoWhileStmt()) {
+            s.b = RewriteYieldOne(s.b);
+        } else if (k == AK.ForStmt()) {
+            s.d = RewriteYieldOne(s.d);
+        } else if (k == AK.ForeachStmt()) {
+            s.c = RewriteYieldOne(s.c);
+        } else if (k == AK.TryStmt()) {
+            s.a = RewriteYieldOne(s.a);
+            if (s.b != null) { s.b.a = RewriteYieldOne(s.b.a); }
+            s.c = RewriteYieldOne(s.c);
+        } else if (k == AK.SwitchStmt()) {
+            int i = 0;
+            while (i < s.kids.Count) { Node c = s.kids[i]; c.b = RewriteYieldOne(c.b); i = i + 1; }
+        }
+    }
+
+    void DesugarYieldMethod(Node m) {
+        Node body = m.d;
+        if (!StmtHasYield(body)) { return; }
+        Node rt = m.type;
+        if (rt == null) { return; }
+        // rewrite IEnumerable<T> / List<T> return type to List<T>
+        rt.sval = "List";
+        // build accumulator initializer: new List<T>()
+        Node lt = new Node(AK.TypeRef());
+        lt.sval = "List";
+        int i = 0;
+        while (i < rt.kids.Count) { lt.Add(rt.kids[i]); i = i + 1; }
+        if (lt.kids.Count > 0) { lt.a = lt.kids[0]; }
+        Node nw = new Node(AK.NewExpr());
+        nw.type = lt;
+        Node decl = new Node(AK.VarDecl());
+        decl.sval = "__yield";
+        decl.type = null;
+        decl.b = nw;
+        RewriteYields(body);
+        Node ret = new Node(AK.ReturnStmt());
+        ret.a = YieldIdent();
+        List<Node> old = body.kids;
+        List<Node> nk = new List<Node>();
+        nk.Add(decl);
+        int j = 0;
+        while (j < old.Count) { nk.Add(old[j]); j = j + 1; }
+        nk.Add(ret);
+        body.kids = nk;
+    }
+
+    bool ContainsStr(List<string> xs, string s) {
+        int i = 0;
+        while (i < xs.Count) { if (xs[i] == s) { return true; } i = i + 1; }
+        return false;
+    }
+
+    Node FindDelegate(Node unit, string name) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.DelegateDecl() && d.sval == name) { return d; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // `event D E;` fields lower to a generated multicast holder class
+    // `__Event_D` backed by a List<D>; its op_add/op_sub drive the `E += h` /
+    // `E -= h` compound-assignment desugar, E.Invoke(..) raises the event and
+    // E.Count() reports the handler count. Mirrors the C host desugar_events.
+    void DesugarEvents(Node unit) {
+        List<string> gen = new List<string>();
+        int origCount = unit.kids.Count;
+        int di = 0;
+        while (di < origCount) {
+            Node d = unit.kids[di];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int mi = 0;
+                while (mi < d.kids.Count) {
+                    Node m = d.kids[mi];
+                    if (m.kind == AK.FieldDecl() && HasModBit(m.mods, MOD.Event()) && m.type != null) {
+                        string dn = m.type.sval;
+                        Node ddecl = FindDelegate(unit, dn);
+                        if (ddecl != null) {
+                            string hn = "__Event_" + dn;
+                            if (!ContainsStr(gen, hn)) {
+                                GenEventHolder(unit, ddecl, dn, hn);
+                                gen.Add(hn);
+                            }
+                            m.type.sval = hn;
+                        }
+                    }
+                    mi = mi + 1;
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    void GenEventHolder(Node unit, Node ddecl, string dn, string hn) {        string s = "class " + hn + " {\n";
+        s = s + "    List<" + dn + "> hs;\n";
+        s = s + "    static " + hn + " op_add(" + hn + " self, " + dn + " h) {\n";
+        s = s + "        " + hn + " r = self;\n";
+        s = s + "        if (r == null) { r = new " + hn + "(); r.hs = new List<" + dn + ">(); }\n";
+        s = s + "        r.hs.Add(h);\n";
+        s = s + "        return r;\n";
+        s = s + "    }\n";
+        s = s + "    static " + hn + " op_sub(" + hn + " self, " + dn + " h) {\n";
+        s = s + "        if (self == null) { return self; }\n";
+        s = s + "        int i = self.hs.Count - 1;\n";
+        s = s + "        while (i >= 0) {\n";
+        s = s + "            if (self.hs[i] == h) { self.hs.RemoveAt(i); return self; }\n";
+        s = s + "            i = i - 1;\n";
+        s = s + "        }\n";
+        s = s + "        return self;\n";
+        s = s + "    }\n";
+        s = s + "    int Count() { return hs.Count; }\n";
+        s = s + "    void Invoke(";
+        int i = 0;
+        while (i < ddecl.kids.Count) {
+            Node p = ddecl.kids[i];
+            if (p.kind == AK.Param()) {
+                if (i > 0) { s = s + ", "; }
+                s = s + TypeName(p.type) + " a" + i;
+            }
+            i = i + 1;
+        }
+        s = s + ") {\n";
+        s = s + "        int i = 0;\n";
+        s = s + "        while (i < hs.Count) {\n";
+        s = s + "            " + dn + " d = hs[i];\n";
+        s = s + "            d(";
+        i = 0;
+        while (i < ddecl.kids.Count) {
+            Node p = ddecl.kids[i];
+            if (p.kind == AK.Param()) {
+                if (i > 0) { s = s + ", "; }
+                s = s + "a" + i;
+            }
+            i = i + 1;
+        }
+        s = s + ");\n";
+        s = s + "            i = i + 1;\n";
+        s = s + "        }\n";
+        s = s + "    }\n";
+        // `E(args)` raises the event, as in C#. The holder is null until the
+        // first subscription, and a call with no subscribers does nothing --
+        // the `E?.Invoke(...)` shape C# code writes by hand.
+        s = s + "    static void op_call(" + hn + " self";
+        int np = 0;
+        int pi = 0;
+        while (pi < ddecl.kids.Count) {
+            Node p = ddecl.kids[pi];
+            if (p.kind == AK.Param()) {
+                if (np > 0) { s = s + ", "; }
+                s = s + ", " + TypeName(p.type) + " a" + np;
+                np = np + 1;
+            }
+            pi = pi + 1;
+        }
+        s = s + ") {\n";
+        s = s + "        if (self == null) { return; }\n";
+        s = s + "        self.Invoke(";
+        int ai = 0;
+        while (ai < np) {
+            if (ai > 0) { s = s + ", "; }
+            s = s + "a" + ai;
+            ai = ai + 1;
+        }
+        s = s + ");\n";
+        s = s + "    }\n";
+        s = s + "}\n";
+        Lexer lx = new Lexer(s);
+        List<Token> gt = lx.Run();
+        Parser gp = new Parser(gt, diags);
+        Node gu = gp.ParseUnit();
+        int j = 0;
+        while (j < gu.kids.Count) { unit.Add(gu.kids[j]); j = j + 1; }
+    }
+
+    // Merge `partial` type declarations: members (and base) of later parts are
+    // appended to the first part of the same kind/name, later parts dropped.
+    // Runs before binding so the rest of the pipeline sees one decl per type.
+    void MergePartials(Node unit) {
+        List<Node> merged = new List<Node>();
+        int di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            Node first = null;
+            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && HasModBit(d.mods, MOD.Partial())) {
+                int fi = 0;
+                while (fi < merged.Count) {
+                    Node e = merged[fi];
+                    if (e.kind == d.kind && HasModBit(e.mods, MOD.Partial()) && e.sval == d.sval) {
+                        first = e;
+                        fi = merged.Count;
+                    } else {
+                        fi = fi + 1;
+                    }
+                }
+            }
+            if (first != null) {
+                int mi = 0;
+                while (mi < d.kids.Count) {
+                    Node km = d.kids[mi];
+                    if (km.kind != AK.TypeParam()) { first.Add(km); }
+                    mi = mi + 1;
+                }
+                if (first.sval2 == "" && d.sval2 != "") { first.sval2 = d.sval2; }
+            } else {
+                merged.Add(d);
+            }
+            di = di + 1;
+        }
+        unit.kids = merged;
+    }
+
+    // Nested type declarations lift to the unit top level under their simple
+    // name (mirrors the C host's zan_parser_flatten_nested_types): the binder
+    // and ngen see flat type tables only. Recursion lifts deeper nesting
+    // first, member lists keep their order, and hoisted types land after
+    // their enclosing class like the C host.
+    void FlattenNested(Node unit) {
+        int di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()
+                    || d.kind == AK.EnumDecl()) {
+                HoistNested(unit, d);
+            }
+            di = di + 1;
+        }
+    }
+
+    int HoistNested(Node unit, Node typeNode) {
+        int hoisted = 0;
+        int mi = 0;
+        while (mi < typeNode.kids.Count) {
+            Node mem = typeNode.kids[mi];
+            if (mem.kind == AK.ClassDecl() || mem.kind == AK.StructDecl()
+                    || mem.kind == AK.EnumDecl() || mem.kind == AK.DelegateDecl()) {
+                // a hoisted nested type keeps the enclosing declaration's
+                // resolution context (the C host stamps members with the
+                // file's namespace, not an Outer.Inner path)
+                mem.nsName = typeNode.nsName != null ? typeNode.nsName : "";
+                mem.nsUsings = typeNode.nsUsings;
+                hoisted = hoisted + HoistNested(unit, mem);
+                unit.Add(mem);
+                hoisted = hoisted + 1;
+                int k = mi;
+                while (k < typeNode.kids.Count - 1) {
+                    typeNode.kids[k] = typeNode.kids[k + 1];
+                    k = k + 1;
+                }
+                typeNode.kids.RemoveAt(typeNode.kids.Count - 1);
+            } else {
+                mi = mi + 1;
+            }
+        }
+        return hoisted;
+    }
+}

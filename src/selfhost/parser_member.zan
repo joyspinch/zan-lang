@@ -1,0 +1,399 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+public partial class Parser {
+
+    Node ParseMember(string className) {
+        ParseAttrs();
+        bool wantExtern = attrDll;
+        bool wantVariadic = attrVariadic;
+        string entry = attrEntry;
+        int fieldOffset = attrFieldOffset;
+        string fieldCustom = attrFieldCustom;
+        long fieldFlags = attrFieldFlags;
+        string fieldDefault = attrFieldDefault;
+        string blob = attrBlob;
+        int mods = ParseMods();
+        if (attrThreadEntry) { mods = mods + MOD.ThreadEntry(); }
+        if (attrAtomicCas) { mods = mods + MOD.AtomicCas(); }
+        if (attrAtomicLoad) { mods = mods + MOD.AtomicLoad(); }
+        if (attrAtomicStore) { mods = mods + MOD.AtomicStore(); }
+        if (attrStaticAddr != "") { mods = mods + MOD.StaticAddr(); }
+        if (attrIntrinsic) { mods = mods | MOD.Intrinsic(); }
+        // `event` is contextual: a field modifier only when introducing an
+        // event field (`event D E;`), so identifiers named `event` still work.
+        if (At(TK.Ident()) && Cur().text == "event" && K1() == TK.Ident()) { Next(); mods = mods + MOD.Event(); }
+        // nested type declarations parse like top-level ones and lift to the
+        // unit top level afterwards (FlattenNested, mirroring the C host's
+        // zan_parser_flatten_nested_types)
+        int nk = K();
+        if (nk == TK.Class() || nk == TK.Struct()) { return ParseClass(mods, nk); }
+        if (nk == TK.Interface()) { return ParseInterface(mods); }
+        if (nk == TK.Enum()) { return ParseEnum(mods); }
+        // nested named delegate type (e.g. a callback slot declared inside
+        // the widget that uses it): parse like a top-level delegate and let
+        // FlattenNested lift it to the unit
+        if (nk == TK.Ident() && Cur().text == "delegate") { return ParseDelegate(mods); }
+        // destructor / finalizer:  ~Name() { ... }
+        if (At(TK.Bang()) || At(TK.Tilde())) {
+            // A517 自举半边：与宿主 binder 同口径编译期拒绝——ARC 运行时在
+            // 引用计数归零时没有析构钩子，~X() 是死语义，放行只会误导迁移。
+            Token dtorTok = Cur();
+            string dtorName = "X";
+            if (pos + 1 < toks.Count && toks[pos + 1].kind == TK.Ident()) {
+                dtorName = toks[pos + 1].text;
+            }
+            diags.Error("[E1016] destructors ('~" + dtorName + "()') are not supported: the ARC runtime "
+                + "has no destructor hook on release -- do deterministic cleanup "
+                + "explicitly (using statement or a Close/Dispose method) instead "
+                + "of relying on '~" + dtorName + "()'", dtorTok.line, dtorTok.col);
+            Next(); // '~'
+            Node dtor = new Node(AK.MethodDecl());
+            dtor.mods = mods;
+            dtor.sval = "__dtor";
+            if (At(TK.Ident())) { Next(); }
+            ParseParams(dtor);
+            if (At(TK.LBrace())) { dtor.d = ParseBlock(); } else { Expect(TK.Semicolon()); }
+            return dtor;
+        }
+        // constructor: Name '('
+        if (At(TK.Ident()) && Cur().text == className && K1() == TK.LParen()) {
+            Node ctor = new Node(AK.CtorDecl());
+            ctor.mods = mods;
+            ctor.sval = Next().text;
+            ParseParams(ctor);
+            // ctor initializer: `: base(args)` stored as a Call node in
+            // ctor.b, `: this(args)` in ctor.c -- the two are mutually
+            // exclusive (this-chaining takes priority in codegen)
+            if (Eat(TK.Colon())) {
+                bool isBase = At(TK.Base());
+                Next();
+                Node ba = new Node(AK.Call());
+                Expect(TK.LParen());
+                while (!At(TK.RParen()) && !At(TK.Eof())) {
+                    ba.Add(ParseExpr());
+                    Eat(TK.Comma());
+                }
+                Expect(TK.RParen());
+                if (isBase) { ctor.b = ba; }
+                else { ctor.c = ba; }
+            }
+            ctor.d = ParseBlock();
+            return ctor;
+        }
+        // Conversion declarations have no leading return type: the type is
+        // AFTER `operator`. Keep contextual identifiers usable as type names.
+        if (At(TK.Ident()) && (Cur().text == "implicit" || Cur().text == "explicit")
+                && K1() == TK.Ident() && toks[pos + 1].text == "operator") {
+            return ParseConversionOperator(mods);
+        }
+        Node type = ParseType();
+        Node member = new Node(AK.FieldDecl());
+        member.mods = mods;
+        member.type = type;
+        member.fieldOffset = fieldOffset;
+        member.attrStaticAddr = attrStaticAddr;
+        member.attrFieldCustom = fieldCustom;
+        member.attrFieldFlags = fieldFlags;
+        member.attrFieldDefault = fieldDefault;
+        member.attrBlob = blob;
+        member.line = Cur().line; member.col = Cur().col;
+        if (HasModBit(mods, MOD.Weak())) { type.mods = type.mods + MOD.Weak(); }
+        if (At(TK.Ident()) || At(TK.Get()) || At(TK.Set())) { member.sval = Next().text; }
+        // operator overload:  T operator <sym> ( ... ) { ... }
+        if (member.sval == "operator") {
+            int otk = Next().kind;
+            member.kind = AK.MethodDecl();
+            member.sval = OpMethodName(otk);
+            ParseParams(member);
+            if (At(TK.LBrace())) { member.d = ParseBlock(); }
+            else { Expect(TK.Semicolon()); }
+            return member;
+        }
+        // indexer:  T this[T0 i0, ...] { get ... set ... }  |  T this[i] => expr;
+        // Lowers to op_index / op_index_set instance methods (the protocol
+        // obj[i] calls dispatch through), like src/compiler/parser.c.
+        if (At(TK.This()) && K1() == TK.LBracket()) {
+            return ParseIndexer(type, mods);
+        }
+        // generic method type params:  Name <T, ...> ( ... )
+        if (At(TK.Less()) && member.sval != "operator") {
+            Next();
+            while (!At(TK.Greater()) && !At(TK.Eof())) {
+                if (At(TK.Ident())) { Node mtp = new Node(AK.TypeParam()); mtp.sval = Next().text; member.Add(mtp); }
+                else { Next(); }
+                Eat(TK.Comma());
+            }
+            Expect(TK.Greater());
+        }
+        if (At(TK.LParen())) {
+            member.kind = AK.MethodDecl();
+            ParseParams(member);
+            ParseWhereClauses(member);
+            // expression-bodied method:  T Name(...) => expr;
+            if (At(TK.Arrow())) {
+                Next();
+                Node blk = new Node(AK.Block());
+                Node ret = new Node(AK.ReturnStmt());
+                ret.a = ParseExpr();
+                blk.Add(ret);
+                member.d = blk;
+                Expect(TK.Semicolon());
+                DesugarAsyncTaskReturn(member);
+                return member;
+            }
+            if (At(TK.LBrace())) { member.d = ParseBlock(); }
+            else { Expect(TK.Semicolon()); }
+            if ((wantExtern || HasModBit(mods, MOD.Extern())) && member.d == null) {
+                if (!HasModBit(member.mods, MOD.Extern())) { member.mods = member.mods + MOD.Extern(); }
+                if (wantVariadic) { member.mods = member.mods + MOD.Variadic(); }
+                if (entry != "") { member.sval2 = entry; } else { member.sval2 = member.sval; }
+            } else if (entry != "") {
+                member.sval2 = entry;
+            }
+            DesugarAsyncTaskReturn(member);
+            return member;
+        }
+        // property:  T Name { get; set; } | { get {..} set {..} } | => expr;
+        if (At(TK.LBrace()) || At(TK.Arrow())) {
+            return ParseProperty(member);
+        }
+        // field (multi-declarator: `int a, b = 7, c;` -- extra declarators
+        // ride as FieldDecl kids; the class-body loop flattens them)
+        if (Eat(TK.Eq())) { member.b = ParseExpr(); }
+        while (At(TK.Comma())) {
+            Next();
+            Node fd = new Node(AK.FieldDecl());
+            fd.mods = mods; fd.type = type; fd.fieldOffset = fieldOffset;
+            fd.attrFieldCustom = fieldCustom; fd.attrFieldFlags = fieldFlags; fd.attrFieldDefault = fieldDefault; fd.attrBlob = blob;
+            fd.line = Cur().line; fd.col = Cur().col;
+            if (HasModBit(mods, MOD.Weak())) { fd.type.mods = fd.type.mods + MOD.Weak(); }
+            if (At(TK.Ident()) || At(TK.Get()) || At(TK.Set())) { fd.sval = Next().text; }
+            if (Eat(TK.Eq())) { fd.b = ParseExpr(); }
+            member.Add(fd);
+        }
+        Expect(TK.Semicolon());
+        return member;
+    }
+
+    // The C host's parser (src/compiler/parser.c: desugar_async_task_method)
+    // does two rewrites for a method whose return type is Task/ValueTask:
+    //   * `async` or no body -> the method is an async method (the async
+    //     marker is added even when the keyword is missing -- an interface
+    //     method without a body is an async method too), and the task-shaped
+    //     return type carries the result;
+    //   * the name "ValueTask" -> "Task" (the host's binder does not know
+    //     "ValueTask" at all -- only "Task" -- so the name must not reach
+    //     it).
+    // The self-hosted parser does the same two rewrites, so an async method
+    // looks the same to the checker and to both backends. The async marker
+    // matters for a call through an interface: the call site decides "this
+    // is a coroutine call" from the *declared* method, and an interface
+    // method has no body -- without the marker the await would refuse the
+    // call ("this operand is not lowered as a coroutine frame").
+    void DesugarAsyncTaskReturn(Node m) {
+        if (m == null || m.type == null) { return; }
+        bool isTask = m.type.sval == "Task" || m.type.sval == "ValueTask";
+        if (!isTask) { return; }
+        bool isAsyncM = HasModBit(m.mods, MOD.Async());
+        // a plain method (not async, with a body): the host leaves the name
+        // alone, and its binder reports "undefined type 'ValueTask'"
+        if (!isAsyncM && m.d != null) { return; }
+        if (!isAsyncM) { m.mods = m.mods + MOD.Async(); }
+        if (m.type.sval == "ValueTask") { m.type.sval = "Task"; }
+    }
+
+    Node ParseConversionOperator(int mods) {
+        Token kw = Next();
+        Next(); // contextual `operator`, checked by the caller
+        Node m = new Node(AK.MethodDecl());
+        m.line = kw.line; m.col = kw.col;
+        m.mods = mods;
+        if (!HasModBit(m.mods, MOD.Static())) { m.mods = m.mods + MOD.Static(); }
+        m.sval = kw.text == "implicit" ? "op_implicit" : "op_explicit";
+        m.type = ParseType();
+        ParseParams(m);
+        int count = 0; int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                count = count + 1;
+                if (p.ival == 1 || p.op == 1 || p.b != null) {
+                    diags.Error("conversion operator requires one by-value parameter without a default", m.line, m.col);
+                }
+            }
+            i = i + 1;
+        }
+        if (count != 1) { diags.Error("conversion operator requires exactly one parameter", m.line, m.col); }
+        if (At(TK.Arrow())) {
+            Next();
+            m.d = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = ParseExpr();
+            m.d.Add(ret);
+            Expect(TK.Semicolon());
+        } else if (At(TK.LBrace())) { m.d = ParseBlock(); }
+        else { Expect(TK.Semicolon()); }
+        return m;
+    }
+
+    // Map an operator token to the mangled method name (must match irgen).
+    string OpMethodName(int tk) {
+        if (tk == TK.Plus()) { return "op_add"; }
+        if (tk == TK.Minus()) { return "op_sub"; }
+        if (tk == TK.PlusPlus()) { return "op_inc"; }
+        if (tk == TK.MinusMinus()) { return "op_dec"; }
+        if (tk == TK.Star()) { return "op_mul"; }
+        if (tk == TK.Slash()) { return "op_div"; }
+        if (tk == TK.Percent()) { return "op_mod"; }
+        if (tk == TK.EqEq()) { return "op_eq"; }
+        if (tk == TK.BangEq()) { return "op_neq"; }
+        if (tk == TK.Less()) { return "op_lt"; }
+        if (tk == TK.Greater()) { return "op_gt"; }
+        if (tk == TK.LessEq()) { return "op_le"; }
+        if (tk == TK.GreaterEq()) { return "op_ge"; }
+        return "op_unknown";
+    }
+
+    Node MakeGetter(string name, Node type, int mods, Node body) {
+        Node g = new Node(AK.MethodDecl());
+        g.mods = mods; g.type = type; g.sval = "get_" + name; g.d = body;
+        return g;
+    }
+
+    Node MakeSetter(string name, Node type, int mods, Node body) {
+        Node s = new Node(AK.MethodDecl());
+        s.mods = mods; s.type = new Node(AK.TypeRef()); s.type.sval = "void";
+        s.sval = "set_" + name;
+        Node p = new Node(AK.Param());
+        p.type = type; p.sval = "value";
+        s.Add(p);
+        s.d = body;
+        return s;
+    }
+
+    // Desugar a property into a backing field (auto) or accessor methods
+    // (get_Name / set_Name). Returns a Block whose kids the class splices in.
+    Node ParseProperty(Node member) {
+        Node type = member.type;
+        string name = member.sval;
+        int mods = member.mods;
+        Node group = new Node(AK.Block());
+        group.attrBlob = member.attrBlob;
+        if (At(TK.Arrow())) {
+            Next();
+            Node body = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = ParseExpr();
+            body.Add(ret);
+            Expect(TK.Semicolon());
+            group.Add(MakeGetter(name, type, mods, body));
+            return group;
+        }
+        Expect(TK.LBrace());
+        Node getBody = null; Node setBody = null;
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            ParseMods(); // accessor-level modifiers, if any
+            if (At(TK.Get()) || (At(TK.Ident()) && Cur().text == "get")) {
+                Next();
+                if (At(TK.LBrace())) { getBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+            } else if (At(TK.Set()) || (At(TK.Ident()) && Cur().text == "set")) {
+                Next();
+                if (At(TK.LBrace())) { setBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+            } else { Next(); }
+        }
+        Expect(TK.RBrace());
+        // both accessors bodyless => auto-property backing field
+        if (getBody == null && setBody == null) {
+            Node f = new Node(AK.FieldDecl());
+            f.mods = mods; f.type = type; f.sval = name;
+            f.fieldOffset = member.fieldOffset;
+            f.attrFieldCustom = member.attrFieldCustom;
+            f.attrFieldFlags = member.attrFieldFlags;
+            f.attrFieldDefault = member.attrFieldDefault;
+            f.attrBlob = member.attrBlob;
+            // auto-property initializer:  T Name { get; set; } = expr;
+            if (Eat(TK.Eq())) { f.b = ParseExpr(); }
+            Eat(TK.Semicolon());
+            group.Add(f);
+            return group;
+        }
+        if (getBody != null) { group.Add(MakeGetter(name, type, mods, getBody)); }
+        if (setBody != null) { group.Add(MakeSetter(name, type, mods, setBody)); }
+        return group;
+    }
+
+    // C# indexer:  T this[T0 i0, ...] { get {...} set {...} }  or the
+    // expression-bodied read-only form  T this[i] => expr;
+    // Synthesizes instance op_index(index...) / op_index_set(index..., value)
+    // methods; a bodyless (automatic) accessor is skipped, mirroring the
+    // reference parser (src/compiler/parser.c).
+    Node ParseIndexer(Node type, int mods) {
+        Next(); // this
+        Expect(TK.LBracket());
+        Node m = new Node(AK.MethodDecl());   // reuses ParseParams: '[' in place of '('
+        while (!At(TK.RBracket()) && !At(TK.Eof())) {
+            Node p = new Node(AK.Param());
+            p.type = ParseType();
+            if (At(TK.Ident()) || At(TK.Get()) || At(TK.Set())) { p.sval = Next().text; }
+            if (Eat(TK.Eq())) { p.b = ParseExpr(); }
+            m.Add(p);
+            if (!Eat(TK.Comma())) { }
+        }
+        Expect(TK.RBracket());
+        Node getterBody = null;
+        Node setterBody = null;
+        if (At(TK.Arrow())) {
+            Next();
+            getterBody = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = ParseExpr();
+            getterBody.Add(ret);
+            Expect(TK.Semicolon());
+        } else {
+            Expect(TK.LBrace());
+            while (!At(TK.RBrace()) && !At(TK.Eof())) {
+                ParseMods(); // accessor-level modifiers, if any
+                if (At(TK.Get()) || (At(TK.Ident()) && Cur().text == "get")) {
+                    Next();
+                    if (At(TK.LBrace())) { getterBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+                } else if (At(TK.Set()) || (At(TK.Ident()) && Cur().text == "set")) {
+                    Next();
+                    if (At(TK.LBrace())) { setterBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+                } else { Next(); }
+            }
+            Expect(TK.RBrace());
+        }
+        Node group = new Node(AK.Block());   // spliced by AddMember
+        if (getterBody != null) {
+            Node g = new Node(AK.MethodDecl());
+            g.mods = mods;
+            g.type = type;
+            g.sval = "op_index";
+            int pi = 0;
+            while (pi < m.kids.Count) { g.Add(m.kids[pi]); pi = pi + 1; }
+            g.d = getterBody;
+            group.Add(g);
+        }
+        if (setterBody != null) {
+            Node s = new Node(AK.MethodDecl());
+            s.mods = mods;
+            s.type = new Node(AK.TypeRef());
+            s.type.sval = "void";
+            s.sval = "op_index_set";
+            int pi2 = 0;
+            while (pi2 < m.kids.Count) { s.Add(m.kids[pi2]); pi2 = pi2 + 1; }
+            Node vp = new Node(AK.Param());
+            vp.type = type;
+            vp.sval = "value";
+            s.Add(vp);
+            s.d = setterBody;
+            group.Add(s);
+        }
+        if (group.kids.Count == 0) {
+            diags.Error("indexer has no accessors", type != null ? type.line : 0, type != null ? type.col : 0);
+        }
+        return group;
+    }
+}

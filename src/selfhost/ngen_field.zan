@@ -1,0 +1,311 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    // a literal node for a primitive-type constant read (`int.MaxValue`),
+    // or null when `mem` is not one
+    // does this member access name a compiler-lowered primitive constant
+    // (int.MaxValue, double.NaN, ...)? Returns the primitive's own name, so
+    // callers get both the existence check and the rendering type
+    string PrimitiveConstRecvTy(Node mem) {
+        if (mem == null || mem.a == null || mem.a.kind != AK.Ident()) { return null; }
+        string recv = mem.a.sval;
+        if (recv != "int" && recv != "long" && recv != "short" && recv != "ushort"
+                && recv != "byte" && recv != "sbyte" && recv != "uint"
+                && recv != "ulong" && recv != "char" && recv != "float"
+                && recv != "double") { return null; }
+        string s = mem.sval;
+        if (s == "MaxValue" || s == "MinValue" || s == "Epsilon" || s == "NaN"
+                || s == "PositiveInfinity" || s == "NegativeInfinity") { return recv; }
+        return null;
+    }
+
+    Node PrimitiveConstLit(Node mem) {
+        if (mem == null || mem.a == null || mem.a.kind != AK.Ident()) { return null; }
+        string recv = mem.a.sval;
+        // host math constants fold like primitive constants (no storage);
+        // a user-declared Math member keeps its own identity
+        if (recv == "Math" && (mem.sval == "PI" || mem.sval == "E")
+                && FindStaticTy("Math", mem.sval) == null) {
+            return FloatLitNg(mem.sval == "PI" ? "3.141592653589793" : "2.718281828459045");
+        }
+        if (PrimitiveConstRecvTy(mem) == null) { return null; }
+        string s = mem.sval;
+        if (recv == "int") {
+            if (s == "MaxValue") { return IntLitNg(2147483647); }
+            return IntLitNg(0 - 2147483648);
+        }
+        if (recv == "long") {
+            if (s == "MaxValue") { return IntLitNg(9223372036854775807); }
+            return IntLitNg(-9223372036854775807 - 1);
+        }
+        // the narrow unsigned kinds fold as positive i64 words, which the
+        // signed renderer prints identically; only ulong.MaxValue sets the
+        // high bit, so it types ulong and rides the unsigned renderer
+        if (recv == "uint") {
+            if (s == "MaxValue") { return IntLitNg(4294967295); }
+            return IntLitNg(0);
+        }
+        if (recv == "ulong") {
+            if (s == "MaxValue") { return IntLitNg(-1); }
+            return IntLitNg(0);
+        }
+        if (recv == "short") {
+            if (s == "MaxValue") { return IntLitNg(32767); }
+            return IntLitNg(0 - 32768);
+        }
+        if (recv == "ushort") {
+            if (s == "MaxValue") { return IntLitNg(65535); }
+            return IntLitNg(0);
+        }
+        if (recv == "byte") {
+            if (s == "MaxValue") { return IntLitNg(255); }
+            return IntLitNg(0);
+        }
+        if (recv == "sbyte") {
+            if (s == "MaxValue") { return IntLitNg(127); }
+            return IntLitNg(0 - 128);
+        }
+        if (recv == "char") {
+            Node c = new Node(AK.CharLit());
+            c.ival = s == "MaxValue" ? 65535 : 0;
+            return c;
+        }
+        if (recv == "float") {
+            // float constants widen to the double that exactly holds them,
+            // printing through the double path (gen0's widening render)
+            if (s == "MaxValue") { return FloatLitNg("3.4028234663852886e38"); }
+            if (s == "MinValue") { return FloatLitNg("-3.4028234663852886e38"); }
+            if (s == "Epsilon") { return FloatLitNg("1.401298464324817e-45"); }
+            if (s == "NaN") { return FloatLitNg("nan"); }
+            if (s == "PositiveInfinity") { return FloatLitNg("inf"); }
+            return FloatLitNg("-inf");
+        }
+        if (s == "MaxValue") { return FloatLitNg("1.7976931348623157e308"); }
+        if (s == "MinValue") { return FloatLitNg("-1.7976931348623157e308"); }
+        if (s == "Epsilon") { return FloatLitNg("2.2250738585072014e-308"); }
+        if (s == "NaN") { return FloatLitNg("nan"); }
+        if (s == "PositiveInfinity") { return FloatLitNg("inf"); }
+        return FloatLitNg("-inf");
+    }
+
+    Node IntLitNg(long v) {
+        Node n = new Node(AK.IntLit());
+        n.ival = v;
+        return n;
+    }
+
+    Node FloatLitNg(string txt) {
+        Node n = new Node(AK.FloatLit());
+        n.sval = txt;
+        return n;
+    }
+
+    void GenFieldLoad(Node mem) {
+        Fld f = FieldOf(mem);
+        if (f == null) {
+            // span view member: Length reads the boxed view length
+            if (mem.sval == "Length" && SpanContainerTy(mem.a) != null) {
+                GenExpr(mem.a);                      // box -> x0
+                LdrU(0, 0, 8);                       // x0 = [box+8]
+                return;
+            }
+            // primitive-type constants: int.MaxValue / long.MinValue /
+            // double.MaxValue ... fold to literals (no runtime storage)
+            Node pcl = PrimitiveConstLit(mem);
+            if (pcl != null) { GenExpr(pcl); return; }
+            // qualified static read: ClsName.field
+            if (mem.a != null && mem.a.kind == AK.Ident()) {
+                string ssym = FindStaticSym(QualifiedCls(mem.a.sval, mem.sval2), mem.sval);
+                if (ssym != null) {
+                    LoadSymRef(ssym, 0);
+                    LdrU(0, 0, 0);
+                    return;
+                }
+            }
+            // qualified static property read: ClsName.Prop -> get_Prop()
+            if (mem.a != null && mem.a.kind == AK.Ident() && LocalIdx(mem.a.sval) < 0
+                    && FindClass(mem.a.sval) != null) {
+                Node sg = AccessorInChain(mem.a.sval, "get_" + mem.sval);
+                if (sg != null && HasMod(sg, MOD.Static())) {
+                    LoadImm(0, 0);
+                    BLInternal(MethSymNg(accOwnerCls, sg));
+                    return;
+                }
+            }
+            // property getter fallback: `obj.Prop` with no backing field
+            // names the desugared get_Prop accessor
+            string gc = ExprCls(mem.a);
+            Node gm = gc != null ? AccessorInChain(gc, "get_" + mem.sval) : null;
+            if (gm != null) {
+                string targetCls = accOwnerCls;
+                GenExpr(mem.a);
+                BLInternal(MethSymNg(targetCls, gm));
+                return;
+            }
+            diags.Error("ngen: unknown field '" + mem.sval + "'", mem.line, mem.col);
+            LoadImm(0, 0);
+            return;
+        }
+        GenExpr(mem.a);                                  // receiver -> x0
+        Cls nxc = ExpandedStructOf(f);
+        if (nxc != null) {
+            // 批43:struct 值字段的读取 = 物化新箱(载荷从扁平区域拷贝),
+            // 后续成员写永不穿透回父对象;null 接收者保持旧软零语义
+            // (跳过物化,x0 = null 原样传递)
+            if (mem.a.kind != AK.ThisExpr()) {
+                int gEnd = NL();
+                CbzReg(0, gEnd);
+                MaterializeNestedBox(nxc, f);
+                Mark(gEnd);
+            } else {
+                MaterializeNestedBox(nxc, f);
+            }
+            return;
+        }
+        if (mem.a.kind != AK.ThisExpr()) {
+            // null receiver fails soft with a zero field value (gen0
+            // parity: `t.name` on a null reference reports and reads null)
+            int gEnd = NL();
+            CbzReg(0, gEnd);
+            LoadFieldNg(0, 0, f);                        // ldr x0, [x0, #off]
+            Mark(gEnd);
+            // fallthrough leaves x0 = 0 when the receiver was null
+        } else {
+            LoadFieldNg(0, 0, f);                        // ldr x0, [x0, #off]
+        }
+    }
+
+    // static type name of an expression when it denotes a user class, else null
+    string ExprCls(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.ThisExpr() || (e.kind == AK.Ident() && e.sval == "this")) { return curCls; }
+        if (e.kind == AK.BaseExpr() || (e.kind == AK.Ident() && e.sval == "base")) {
+            Cls bc = FindClass(curCls);
+            return bc != null ? bc.baseName : null;
+        }
+        if (e.kind == AK.NewExpr()) { return e.type != null ? e.type.sval : null; }
+        if (e.kind == AK.CastExpr() && e.type != null) { return ClassTyOf(e.type.sval); }
+        if (e.kind == AK.AsExpr() && e.type != null) { return ClassTyOf(e.type.sval); }
+        if (e.kind == AK.AwaitExpr()) { return ClassTyOf(AsyncAwaitElemTyNg(e.a)); }
+        if (e.kind == AK.Index()) { return ClassTyOf(ElemTyOf(e)); }
+        if (e.kind == AK.Call() && e.a != null) {
+            // method results carry a class identity when the method's
+            // declared return type names one (ChartOption.Create().x)
+            return ClassTyOf(CallRetTy(e));
+        }
+        if (e.kind == AK.Ident()) {
+            return ClassTyOf(NamedSlotTy(e.sval));
+        }
+        if (e.kind == AK.MemberAccess()) {
+            // field chains resolve to the field's declared class
+            // (`x.next.n` needs ExprCls of `x.next`)
+            Fld mf = FieldOf(e);
+            if (mf != null) { return ClassTyOf(mf.ty); }
+            // qualified static field chains: `Store.items.Count` types the
+            // receiver from the static field's declared type. A static
+            // PROPERTY read (Encoding.UTF8) finds no field here and falls
+            // through to the accessor typing below.
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+                    && FindClass(e.a.sval) != null) {
+                string qst = FindStaticTy(QualifiedCls(e.a.sval, e.sval2), e.sval);
+                if (qst != null) { return ClassTyOf(qst); }
+            }
+            // property getter member (`obj.Prop` with no backing field):
+            // the accessor's declared return types the chain
+            // (`b.Tags.Count` needs ExprCls(b.Tags) == "List")
+            return ClassTyOf(PropGetterTy(e));
+        }
+        return null;
+    }
+
+    // element type name of an index expression ("l[i]" with l declared as
+    // "List<Pt>" or "Pt[]"), or null. Struct elements resolve too: values
+    // clone at every storage boundary now, so slots hold independent
+    // objects and member access goes through the element pointer.
+    string ElemTyOf(Node e) {
+        if (e == null || e.a == null) { return null; }
+        string el = null;
+        if (ArrContainerTy(e.a) != null) {
+            string at = ArrContainerTy(e.a);
+            if (at != null && at.Length > 2) { el = ArrElemName(at); }
+        } else if (ExprCls(e.a) == "List") {
+            string ct = StaticTyOf(e.a);
+            if (ct != null && ct.Length > 5 && ct.Substring(0, 5) == "List<"
+                    && ct.Substring(ct.Length - 1, 1) == ">") {
+                el = ct.Substring(5, ct.Length - 6);
+            }
+        } else if (ExprCls(e.a) == "Dict") {
+            // Dictionary<string, V>[key] yields the value type
+            string ct = StaticTyOf(e.a);
+            if (ct != null && IsDictTyName(ct)
+                    && ct.Substring(ct.Length - 1, 1) == ">") {
+                string inner = ct.Substring(ct.IndexOf("<") + 1, ct.Length - ct.IndexOf("<") - 2);
+                int comma = inner.IndexOf(",");
+                el = comma >= 0 ? inner.Substring(comma + 1) : null;
+            }
+        } else if (IsDictViewAccess(e.a)) {
+            // d.Keys[i] / d.Values[i]: the snapshot's element is the slot type
+            el = DictSlotTy(e.a.a, e.a.sval == "Keys");
+        }
+        if (el == null) {
+            // an indexer's element type is the op_index method's declared
+            // return type (fit against the index expression for overloads)
+            Node om = OpIndexFit(ExprCls(e.a), "op_index", e.b, null);
+            if (om != null && om.type != null) { el = TypeFullName(om.type); }
+        }
+        if (el == null) { return null; }
+        return el;
+    }
+
+    // "Dictionary<..."/"Dict<...": the builtin dict under either spelling
+    bool IsDictTyName(string t) {
+        return t != null && (t.IndexOf("Dictionary<") == 0 || t.IndexOf("Dict<") == 0);
+    }
+
+    // `d.Keys` / `d.Values` on a Dictionary expression: the snapshot-view
+    // access that indexes and counts exactly like a List
+    bool IsDictViewAccess(Node a) {
+        return a != null && a.kind == AK.MemberAccess()
+                && (a.sval == "Keys" || a.sval == "Values")
+                && a.a != null && ExprCls(a.a) == "Dict";
+    }
+
+    // normalize a declared type name to its class identity ("List<string>"
+    // behaves as its open type; primitive arrays carry none), else null
+    string ClassTyOf(string t) {
+        if (t == null || t == "" || IsNulTy(t) || t == "int" || t == "string" || t == "bool"
+                || t == "void" || t == "char" || t == "double" || t == "long"
+                || t == "ulong") { return null; }
+        if (t.Length > 5 && t.Substring(0, 5) == "List<") { return "List"; }
+        if (IsDictTyName(t)) { return "Dict"; }
+        if (IsArrTy(t) && (t == "int[]" || t == "long[]" || t == "ulong[]"
+                || t == "double[]" || t == "string[]" || t == "bool[]"
+                || t == "char[]")) { return null; }
+        // generics are erased: `GBox<bool>` names the open class `GBox`
+        int lt = t.IndexOf("<");
+        if (lt > 0) {
+            string open = t.Substring(0, lt);
+            if (FindClass(open) != null) { return open; }
+        }
+        return t;
+    }
+
+    // binary operator behind a compound assignment (+= -> +, ...), or 0
+    int CompoundBinOp(int k2) {
+        if (k2 == TK.PlusEq()) { return TK.Plus(); }
+        if (k2 == TK.MinusEq()) { return TK.Minus(); }
+        if (k2 == TK.StarEq()) { return TK.Star(); }
+        if (k2 == TK.SlashEq()) { return TK.Slash(); }
+        if (k2 == TK.PercentEq()) { return TK.Percent(); }
+        if (k2 == TK.AmpEq()) { return TK.Amp(); }
+        if (k2 == TK.PipeEq()) { return TK.Pipe(); }
+        if (k2 == TK.CaretEq()) { return TK.Caret(); }
+        if (k2 == TK.LessLessEq()) { return TK.LessLess(); }
+        if (k2 == TK.GreaterGreaterEq()) { return TK.GreaterGreater(); }
+        if (k2 == TK.GreaterGreaterGreaterEq()) { return TK.GreaterGreaterGreater(); }
+        return 0;
+    }
+}

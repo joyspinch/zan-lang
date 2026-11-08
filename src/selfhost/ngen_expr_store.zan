@@ -1,0 +1,620 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    void GenWithExprNg(Node e) {
+            // `recv with { f = v, ... }`: a memberwise copy of recv with the
+            // named fields overwritten (record copy); the copy is a fresh
+            // object even for classes
+            string wtn = StaticTyOf(e.a);
+            Cls wc = wtn != null ? SpecClsOf(wtn) : null;
+            if (wc == null) {
+                diags.Error("ngen: 'with' receiver has no record type", e.line, e.col);
+                LoadImm(0, 0);
+            } else {
+                GenExpr(e.a);
+                XPushV0();                      // push src
+                LoadImm(0, wc.size + 16);
+                LoadImm(1, 0);
+                BLInternal("_zan_rt_alloc");
+                XPopV(1);                           // pop src -> x1
+                LoadImm(2, wc.size + 16);
+                SubImm(0, 0, 8);
+                SubImm(1, 1, 8);
+                BLExtern("_memcpy");
+                AddImm(0, 0, 8);                     // x0 = the copy
+                XPushV0();                      // hold the copy
+                int wi = 0;
+                while (wi < e.kids.Count) {
+                    Node wasg = e.kids[wi];
+                    Fld wf = wasg.a != null ? FindField(wc, wasg.a.sval) : null;
+                    if (wf == null) {
+                        diags.Error("ngen: unknown field '" + wasg.a.sval + "' in with expression", wasg.line, wasg.col);
+                    } else {
+                        GenExpr(wasg.b);
+                        GenCloneIfStruct(wasg.b);
+                        Cls wxc = ExpandedStructOf(wf);
+                        if (wxc != null) {
+                            // 批49:展开字段整体值存储(与赋值路径同一载荷
+                            // memcpy;目标是新鲜拷贝,区域基 = 拷贝+off)
+                            XPushV0();                          // save src box
+                            if (tgt86 == 1) { XopRMem(0x8B, 6, 4, 16); }  // mov rsi,[rsp+16] (copy)
+                            else { E4(0xF84103E1); }     // ldur x1, [sp, #16] (copy)
+                            MovRR(0, 1);
+                            AddImm(0, 0, wf.off);               // dest = copy + off
+                            XPopV(1);                           // src box
+                            LoadImm(2, wxc.size);
+                            BLExtern("_memcpy");
+                        } else {
+                            if (IsDblTy(wf.ty) && !IsDblExpr(wasg.b)) { ConvI2D(); }
+                            if (tgt86 == 1) { XopRMem(0x8B, 6, 4, 0); }  // mov rsi,[rsp] (peek copy)
+                            else { E4(0xF84003E1); }     // ldur x1, [sp] (peek copy)
+                            StoreFieldNg(0, 1, wf);
+                        }
+                    }
+                    wi = wi + 1;
+                }
+                XPopV(0);                      // pop copy -> x0
+            }
+    }
+    void GenAssignmentNg(Node e) {
+            string tgtTy = AssignTargetTy(e.a);
+            if (tgtTy != null && tgtTy == "float") { tgtTy = "double"; }
+            if (e.op != TK.Eq() && e.op != TK.QQEq()) {
+                // compound assignment reads the target through the ordinary
+                // Binary path (which knows ints, doubles, ulongs and string
+                // concat) and stores through the same chain as `=`
+                int bop2 = CompoundBinOp(e.op);
+                if (bop2 == 0) {
+                    diags.Error("ngen: unsupported compound assignment operator", e.line, e.col);
+                    return;
+                }
+                Node bin2 = new Node(AK.Binary());
+                bin2.op = bop2;
+                bin2.line = e.line;
+                bin2.col = e.col;
+                bin2.a = e.a;
+                bin2.b = e.b;
+                GenExpr(bin2);
+                if (tgtTy == "double" && !IsDblExpr(bin2)) { ConvI2D(); }
+                else if (tgtTy == "float") {
+                    // packed float[] slots take single bits; 8-byte float
+                    // slots (locals, lists, fields) keep the widened double
+                    if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null) { NarrowF32Bits(); }
+                    else { NarrowF32(); }
+                }
+                else if (tgtTy == "int" && !IsDblExpr(bin2) && !IsStrExpr(bin2)) { Sxtw0(); }   // sxtw x0, w0
+                else if (tgtTy == "uint" && !IsDblExpr(bin2) && !IsStrExpr(bin2)) { E4(0xD3407C00); }  // ubfm: zero-extend low 32
+            } else if (TryGenBindingValue(e.b, tgtTy)) {
+                // Binding<T> sugar: x0 already holds the fresh binding object
+            } else {
+                GenConversionValueNg(e.b, tgtTy);
+            }
+            if (TryGenStringStore(e.a)) { return; }
+            if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null
+                    && ArrElemName(ArrContainerTy(e.a.a)) == "float") {
+                NarrowF32Bits();                     // packed float slots hold single bits
+            }
+            if (e.a != null && e.a.kind == AK.Ident()) {
+                int li = LocalIdx(e.a.sval);
+                if (li < 0) {
+                    // implicit field store inside instance methods
+                    Fld fld = CurField(e.a.sval);
+                    if (fld != null) {
+                        Cls nxc = ExpandedStructOf(fld);
+                        if (nxc != null) {
+                            // 批43:整体值存储 = 载荷拷贝进 this 的扁平区域
+                            XPushV0();              // src box
+                            LoadLocal(LocalIdx("this"), 0);
+                            if (fld.off <= 4095) { AddImm(0, 0, fld.off); }
+                            else { LoadImm(16, fld.off); AddRR(0, 0, 16); }
+                            XPopV(1);
+                            LoadImm(2, nxc.size);
+                            BLExtern("_memcpy");
+                            return;
+                        }
+                        XPushV0();                  // str x0, [sp, #-16]! (value)
+                        LoadLocal(LocalIdx("this"), 0);  // receiver -> x0
+                        XPopV(1);                        // ldr x1, [sp], #16 (value)
+                        StoreFieldNg(1, 0, fld);             // str x1, [x0, #off]
+                        return;
+                    }
+                    // static field store through its data-global slot
+                    string ssym = FindStaticSym(curCls, e.a.sval);
+                    if (ssym != null) {
+                        LoadSymRef(ssym, 9);
+                        StrU(0, 9, 0);
+                        return;
+                    }
+                    // bare property store: the desugared set_Name accessor
+                    // (instance: x0 = receiver, x1 = value; static: the
+                    // value is the first parameter, so it stays in x0)
+                    Node bs = AccessorInChain(curCls, "set_" + e.a.sval);
+                    if (bs != null) {
+                        if (HasMod(bs, MOD.Static())) {
+                            // value already in x0
+                        } else {
+                            XPushV0();              // push value
+                            LoadLocal(LocalIdx("this"), 0);
+                            XPopV(1);              // x1 = value
+                        }
+                        BLInternal(MethSymNg(accOwnerCls, bs));
+                        return;
+                    }
+                    // oracle parity: a plain `ident = expr` to an undeclared
+                    // name is a silent dead store -- the RHS still evaluated
+                    // above (Control's paneMin/paneMax, InputOtp's
+                    // completeArmed init); explicit this., compound writes
+                    // and reads all still error
+                    return;
+                }
+                if (locRef[li]) {
+                    StoreRefLocal(li);
+                    return;
+                }
+                StoreLocalVal(li, 0);
+            } else if (e.a != null && e.a.kind == AK.Index() && e.a.kids.Count > 0
+                    && ArrContainerTy(e.a.a) != null) {
+                // rectangular element set: the value rides the stack while
+                // the subscripts bounds-check (same rule as the get)
+                int nsub = 1 + e.a.kids.Count;
+                int esz = ArrElemSize(ArrContainerTy(e.a.a));
+                XPushV0();                      // push value
+                MdPrologueNg(e.a);
+                MdFlatNg(e.a, nsub, e.line, e.col);
+                XPopV(2);                      // pop value -> x2
+                AddImm(1, 19, 8 * nsub);             // x1 = data
+                if (esz == 4) {
+                    E4(0x8B090821);                  // add x1, x1, x9, lsl #2
+                } else if (esz == 8) {
+                    E4(0x8B090C21);                  // add x1, x1, x9, lsl #3
+                } else {
+                    E4(0x8B090021);                  // add x1, x1, x9
+                }
+                if (esz == 1) {
+                    E4(0x39000022);                  // strb w2, [x1]
+                } else if (esz == 2) {
+                    E4(0x79000022);                  // strh w2, [x1]
+                } else if (esz == 4) {
+                    E4(0xB9000022);                  // str w2, [x1]
+                } else {
+                    E4(0xF9000022);                  // str x2, [x1]
+                }
+            } else if (e.a != null && e.a.kind == AK.Index() && ArrContainerTy(e.a.a) != null) {
+                // array element set: same bounds rule as the get; the value
+                // and index survive the guard call on the stack
+                int esz = ArrElemSize(ArrContainerTy(e.a.a));
+                XPushV0();                      // push value
+                GenExpr(e.a.a);
+                XPushV0();                      // push arr
+                GenExpr(e.a.b);                      // x0 = idx
+                XPopV(1);                      // pop arr -> x1
+                XPopV(2);                      // pop value -> x2
+                if (tgt86 == 1) { LdrU(3, 1, -16); } else { E4(0xF85F0023); }   // ldur x3, [x1, #-16] (len) = mov rcx,[rsi-16]
+                int bad = NL();
+                int cont = NL();
+                StringCmp(0, 3);                     // cmp x0, x3
+                EmitBcond(10, bad);                  // b.ge bad
+                StringCmp(0, 31);                    // cmp x0, xzr
+                EmitBcond(11, bad);                  // b.lt bad
+                EmitB(cont);
+                Mark(bad);
+                XPushR(1);                      // keep arr (guard clobbers x1)
+                XPushV0();                      // keep idx
+                XPushR(2);                      // keep value
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, e.line);
+                LoadImm(2, e.col);
+                LoadSymRef("l_.str." + guardArrIdx, 3);
+                BLInternal("_zan_rt_guard_fail3");
+                XPopV(2);                      // pop value
+                XPopV(0);                      // pop idx
+                XPopV(1);                      // pop arr
+                LoadImm(0, 0);
+                Mark(cont);
+                if (esz == 1) {
+                    if (tgt86 == 1) { X3(0x88, 0x14, 0x3E); } else { E4(0x38206822); }   // strb w2, [x1, x0] = mov [rsi+rdi], dl
+                } else if (esz == 2) {
+                    // strh 寄存器形式必须 S=1(lsl #1):0x…6822 是 S=0 无缩放,
+                    // 下标没乘 2(d[1] 落在字节 1);x86 臂的 rdi*2 一直是对的
+                    if (tgt86 == 1) { X3(0x66, 0x89, 0x14); X1(0x7E); } else { E4(0x78207822); }   // strh w2, [x1, x0, lsl #1] = mov [rsi+rdi*2], dx
+                } else if (esz == 4) {
+                    if (tgt86 == 1) { X3(0x89, 0x14, 0xBE); } else { E4(0xB8207822); }   // str w2, [x1, x0, lsl #2] = mov [rsi+rdi*4], edx (SIB 0xBE = idx rdi)
+                } else {
+                    if (tgt86 == 1) { X3(0x48, 0x89, 0x14); X1(0xFE); } else { E4(0xF8207822); }   // str x2, [x1, x0, lsl #3] = mov [rsi+rdi*8], rdx
+                }
+            } else if (e.a != null && e.a.kind == AK.Index() && e.a.a != null
+                    && e.a.a.kind == AK.NewExpr() && IsSpanNew(e.a.a)) {
+                // Span<T> element set: the value survives on the stack while
+                // the view's {base, len} box derefs; same bounds rule as the
+                // get
+                string sel = SpanElemTy(e.a.a);
+                int sesz = SpanElemSize(e.a.a);
+                XPushV0();                      // push value
+                GenExpr(e.a.a);                      // box -> x0
+                XPushV0();                      // push box
+                GenExpr(e.a.b);                      // idx -> x0
+                SpanBoxDeref();                      // x1 = base, x2 = len
+                XPopV(3);                      // pop value -> x3
+                SpanIdxGuard(e.line, e.col, 3);
+                EmitSpanElemStore(sel, sesz);
+            } else if (e.a != null && e.a.kind == AK.Index() && SpanContainerTy(e.a.a) != null) {
+                // local/field Span<T> element set: the value survives on the
+                // stack while the view's {base, len} box derefs; same bounds
+                // rule as the get
+                string sct2 = SpanContainerTy(e.a.a);
+                XPushV0();                      // push value
+                GenExpr(e.a.a);                      // box -> x0
+                XPushV0();                      // push box
+                GenExpr(e.a.b);                      // idx -> x0
+                SpanBoxDeref();                      // x1 = base, x2 = len
+                XPopV(3);                      // pop value -> x3
+                SpanIdxGuard(e.line, e.col, 3);
+                EmitSpanElemStore(SpanTyElem(sct2), SpanTyElemSize(sct2));
+            } else if (e.a != null && e.a.kind == AK.Index() && ExprCls(e.a.a) == "Dict") {
+                DictCheckOperand(e.a.a, e.a.b, true);
+                DictCheckOperand(e.a.a, e.b, false);
+                // d[key] = v: value survives on the stack while the dict and
+                // key evaluate; _zan_rt_dict_set inserts or updates
+                GenCloneIfStruct(e.b);               // struct values: fresh box
+                XPushV0();                      // push value
+                GenExpr(e.a.a);                      // dict -> x0
+                XPushV0();                      // push dict
+                GenExpr(e.a.b);                      // key -> x0
+                MovRR(1, 0);                         // x1 = key
+                XPopV(0);                      // pop dict -> x0
+                XPopV(2);                      // pop value -> x2
+                BLInternal("_zan_rt_dict_set");
+            } else if (e.a != null && e.a.kind == AK.Index() && ExprCls(e.a.a) == "List") {
+                // element set: bounds check like the get, then store into
+                // the 8-byte slot (value preserved across the guard call);
+                // List<int> narrows a long-valued literal to int32 first
+                bool lint = ElemTyOf(e.a) == "int";
+                XPushV0();                      // push value
+                GenExpr(e.a.a);
+                XPushV0();                      // push obj
+                GenExpr(e.a.b);                      // x0 = idx
+                XPopV(1);                      // pop obj -> x1
+                XPopV(2);                      // pop value -> x2
+                if (lint) { if (tgt86 == 1) { X3(0x48, 0x63, 0xD2); } else { E4(0x93407C42); } }        // sxtw x2, w2
+                LdrU(3, 1, 0);                       // count
+                LdrU(4, 1, 16);                      // data
+                int bad = NL();
+                int cont = NL();
+                if (tgt86 == 1) { Xop(0x39, 7, 1); } else { E4(0xEB03001F); }                      // cmp x0, x3
+                EmitBcond(10, bad);                  // b.ge bad
+                if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                      // cmp x0, xzr
+                EmitBcond(11, bad);                  // b.lt bad
+                EmitB(cont);
+                Mark(bad);
+                XPushR(4);                      // keep data (guard clobbers x4)
+                XPushV0();                      // keep idx
+                XPushR(2);                      // keep value
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, e.line);
+                LoadImm(2, e.col);
+                LoadSymRef("l_.str." + guardListIdx, 3);
+                BLInternal("_zan_rt_guard_fail3");
+                XPopV(2);                      // pop value
+                XPopV(0);                      // pop idx
+                XPopV(4);                      // pop data
+                LoadImm(0, 0);
+                Mark(cont);
+                int sEnd = NL();
+                CbzReg(4, sEnd);                     // empty list: backing is null, drop the store
+                if (tgt86 == 1) { X3(0x49, 0x89, 0x14); X1(0xF8); } else { E4(0xF8207882); } // str x2,[x4,x0,lsl#3] = mov [r8+rdi*8],rdx (v2 home rdx)
+                Mark(sEnd);
+            } else if (e.a != null && e.a.kind == AK.Index()
+                    && OpIndexFit(ExprCls(e.a.a), "op_index_set", e.a.b, e.b) != null) {
+                // indexer set: obj[i] = v (or += v -- the read half went
+                // through the ordinary Index path above). The value was
+                // evaluated into x0 at the top; lower to the op_index_set
+                // protocol: x0 receiver, x1 index, x2 value. Overloads are
+                // picked by the index and value argument types.
+                string oc = ExprCls(e.a.a);
+                Node osm = OpIndexFit(oc, "op_index_set", e.a.b, e.b);
+                XPushV0();                      // push value
+                GenExpr(e.a.a);                      // receiver -> x0
+                XPushV0();                      // push receiver
+                GenExpr(e.a.b);                      // index -> x0
+                MovRR(1, 0);                         // x1 = index
+                XPopV(0);                      // pop receiver -> x0
+                XPopV(2);                      // pop value -> x2
+                BLInternal(MethSymNg(oc, osm));
+            } else if (e.a != null && e.a.kind == AK.MemberAccess()) {
+                // class-qualified static write: Program.starting = v
+                // (the value was already evaluated into x0 at the top).
+                // The receiver must NAME a class: a plain local (`bb.title
+                // = v`, `this.w = ""`) is an instance-field write even when
+                // another class declares a static of the same name --
+                // FindStaticSym's by-name fallback would otherwise steal
+                // the store into that static's global slot
+                if (e.a.a != null && e.a.a.kind == AK.Ident() && LocalIdx(e.a.a.sval) < 0
+                        && FindClass(e.a.a.sval) != null) {
+                    string ssym = FindStaticSym(QualifiedCls(e.a.a.sval, e.a.sval2), e.a.sval);
+                    if (ssym != null) {
+                        XPushV0();                  // push value across LoadSymRef
+                        LoadSymRef(ssym, 1);             // x1 = &slot
+                        XPopV(0);                  // pop value -> x0
+                        StrU(0, 1, 0);
+                        return;
+                    }
+                }
+                Fld f = FieldOf(e.a);
+                if (f == null) {
+                    // property setter fallback: obj.Prop = v / Cls.Prop = v
+                    // dispatches to the desugared set_Prop accessor
+                    Node sm2 = null;
+                    string sc2 = null;
+                    if (e.a.a != null && e.a.a.kind == AK.Ident() && LocalIdx(e.a.a.sval) < 0
+                            && FindClass(e.a.a.sval) != null) {
+                        sm2 = AccessorInChain(e.a.a.sval, "set_" + e.a.sval);
+                    }
+                    if (sm2 == null) {
+                        sc2 = ExprCls(e.a.a);
+                        sm2 = sc2 != null ? AccessorInChain(sc2, "set_" + e.a.sval) : null;
+                    }
+                    if (sm2 != null) {
+                        string targetCls = accOwnerCls;
+                        if (HasMod(sm2, MOD.Static())) {
+                            // value already in x0 (first parameter)
+                        } else {
+                            XPushV0();              // push value
+                            GenExpr(e.a.a);              // receiver -> x0
+                            XPopV(1);                   // x1 = value
+                        }
+                        BLInternal(MethSymNg(targetCls, sm2));
+                        return;
+                    }
+                    diags.Error("ngen: unknown field '" + e.a.sval + "'", e.line, e.col);
+                    return;
+                }
+                Cls nxc = ExpandedStructOf(f);
+                if (nxc != null) {
+                    // 批43:整体值存储 = 载荷拷贝(源箱 → 扁平区域),
+                    // 源箱本身保持共享无扰;区域基址经链偏移算术直达,
+                    // 深链(o.i.j = q)不物化中间箱
+                    XPushV0();                      // src box
+                    GenNestedRegionAddr(e.a.a);     // x0 = region base
+                    XPopV(1);                       // x1 = src
+                    LoadImm(2, nxc.size);
+                    BLExtern("_memcpy");
+                    return;
+                }
+                XPushV0();                          // str x0, [sp, #-16]! (value)
+                if (e.a.a != null && ChainIsExpanded(e.a.a)) {
+                    GenNestedRegionAddr(e.a.a);     // 批43:链偏移算术,不物化
+                } else {
+                    GenExpr(e.a.a);                 // receiver -> x0
+                }
+                XPopV(1);                           // ldr x1, [sp], #16 (value)
+                StoreFieldNg(1, 0, f);                       // str x1, [x0, #off]
+            } else {
+                diags.Error("ngen: unsupported assignment target", e.line, e.col);
+            }
+    }
+    void GenIndexNg(Node e) {
+            if (IsStrExpr(e.a)) {
+                // char access: bounds-checked byte load (gen0 reports the
+                // same guard message and continues with index 0); a null
+                // base reports too and answers 0 like the zeroed scratch
+                GenExpr(e.a);
+                XPushV0();                      // push s
+                GenExpr(e.b);
+                XPopV(1);                      // pop s -> x1 (x0 = idx)
+                int bad = NL();
+                int ldok = NL();
+                int done = NL();
+                int nulls = NL();
+                CbzReg(1, nulls);                    // null base
+                EmitB(ldok);
+                Mark(nulls);
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, e.line);
+                LoadImm(2, e.col);
+                LoadSymRef("l_.str." + guardStrNull, 3);
+                BLInternal("_zan_rt_guard_fail3");
+                LoadImm(0, 0);
+                EmitB(done);
+                Mark(ldok);
+                SubImm(2, 1, 8);                      // sub x2, x1, #8
+                LdrU(2, 2, 0);                       // ldr x2, [x2]
+                Uxtw32(2, 2);                        // ubfm x2, x2, #0, #31 (len)
+                if (tgt86 == 1) { Xop(0x39, 7, 2); } else { E4(0xEB02001F); }                      // cmp x0, x2
+                EmitBcond(10, bad);                  // b.ge bad
+                if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                      // cmp x0, xzr
+                EmitBcond(11, bad);                  // b.lt bad
+                if (tgt86 == 1) { X3(0x0F, 0xB6, 0x3C); X1(0x3E); } else { E4(0x38606820); } // ldrb w0, [x1, x0] = movzx edi,[rsi+rdi] (v0 home rdi)
+                EmitB(done);
+                Mark(bad);
+                XPushR(1);                      // keep s across the call
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, e.line);
+                LoadImm(2, e.col);
+                LoadSymRef("l_.str." + guardStrIdx, 3);
+                BLInternal("_zan_rt_guard_fail3");
+                XPopV(1);                      // pop s
+                LoadImm(0, 0);                       // safe index
+                Mark(done);
+            } else if (e.a != null && ArrContainerTy(e.a) != null && e.kids.Count > 0) {
+                // rectangular element get (B8): per-dim bounds then a
+                // row-major flat index; dims at arr+8d, data at arr+8*rank
+                int nsub = 1 + e.kids.Count;
+                string ct = ArrContainerTy(e.a);
+                MdPrologueNg(e);
+                MdFlatNg(e, nsub, e.line, e.col);
+                AddImm(19, 19, 8 * nsub);          // data base = arr + 8*rank
+                EmitArrElemLoad(ArrElemSize(ct), ArrElemName(ct), 19, 9, 0);
+            } else if (ArrContainerTy(e.a) != null) {
+                // array element get: len = i64 at arr-16; a bad index reports
+                // and continues with index 0 (gen0 parity). int[] stores i32.
+                int esz = ArrElemSize(ArrContainerTy(e.a));
+                GenExpr(e.a);
+                XPushV0();                      // push arr
+                GenExpr(e.b);
+                XPopV(1);                      // pop arr -> x1 (x0 = idx)
+                if (tgt86 == 1) { LdrU(2, 1, -16); } else { E4(0xF85F0022); }   // ldur x2, [x1, #-16] (len) = mov rdx,[rsi-16]
+                int bad = NL();
+                int cont = NL();
+                StringCmp(0, 2);                     // cmp x0, x2
+                EmitBcond(10, bad);                  // b.ge bad
+                StringCmp(0, 31);                    // cmp x0, xzr
+                EmitBcond(11, bad);                  // b.lt bad
+                EmitB(cont);
+                Mark(bad);
+                XPushR(1);                      // keep arr (guard clobbers x1)
+                XPushV0();                      // keep idx
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, e.line);
+                LoadImm(2, e.col);
+                LoadSymRef("l_.str." + guardArrIdx, 3);
+                BLInternal("_zan_rt_guard_fail3");
+                XPopV(0);                      // pop idx
+                XPopV(1);                      // pop arr
+                LoadImm(0, 0);
+                Mark(cont);
+                EmitArrElemLoad(esz, ArrElemName(ArrContainerTy(e.a)), 1, 0, 0);
+            } else if (e.a != null && e.a.kind == AK.NewExpr() && IsSpanNew(e.a)) {
+                // Span<T> element get: deref the view's {base, len} box,
+                // bounds-checked like an array
+                int sesz = SpanElemSize(e.a);
+                string sel = SpanElemTy(e.a);
+                GenExpr(e.a);                        // box -> x0
+                XPushV0();                      // push box
+                GenExpr(e.b);                        // idx -> x0
+                SpanBoxDeref();                      // x1 = base, x2 = len
+                SpanIdxGuard(e.line, e.col, 0);
+                EmitSpanElemLoad(sel, sesz);
+            } else if (SpanContainerTy(e.a) != null) {
+                // local/field Span<T> element get: deref the view's
+                // {base, len} box, bounds-checked like an array
+                string sct = SpanContainerTy(e.a);
+                GenExpr(e.a);                        // box -> x0
+                XPushV0();                      // push box
+                GenExpr(e.b);                        // idx -> x0
+                SpanBoxDeref();                      // x1 = base, x2 = len
+                SpanIdxGuard(e.line, e.col, 0);
+                EmitSpanElemLoad(SpanTyElem(sct), SpanTyElemSize(sct));
+            } else if (ExprCls(e.a) == "Dict") {
+                DictCheckOperand(e.a, e.b, true);
+                // d[key] get: _zan_rt_dict_get returns 0 for a missing key
+                // (zero-value semantics, gen0 parity); a struct value reads
+                // out as a fresh copy so mutations never write through
+                GenExpr(e.a);                        // dict -> x0
+                XPushV0();                      // push dict
+                GenExpr(e.b);                        // key -> x0
+                MovRR(1, 0);                         // x1 = key
+                XPopV(0);                      // pop dict -> x0
+                BLInternal("_zan_rt_dict_get");
+                int skipGc = NL();
+                CbzReg(0, skipGc);                   // missing key: stay 0
+                GenCloneIfStruct(e);
+                Mark(skipGc);
+            } else if (ExprCls(e.a) == "List" || IsDictViewAccess(e.a)) {
+                // element get: data = obj+16, count = obj+0, 8-byte slots
+                // (a Dictionary Keys/Values snapshot view indexes the same
+                // way -- the member read already lowers to the snapshot list)
+                GenExpr(e.a);
+                XPushV0();                      // push obj
+                GenExpr(e.b);
+                XPopV(1);                      // pop obj -> x1 (x0 = idx)
+                LdrU(2, 1, 0);                       // count
+                LdrU(3, 1, 16);                      // data
+                int bad = NL();
+                int cont = NL();
+                if (tgt86 == 1) { Xop(0x39, 7, 2); } else { E4(0xEB02001F); }                      // cmp x0, x2
+                EmitBcond(10, bad);                  // b.ge bad
+                if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                      // cmp x0, xzr
+                EmitBcond(11, bad);                  // b.lt bad
+                EmitB(cont);
+                Mark(bad);
+                XPushR(3);                      // keep data (guard clobbers x3)
+                XPushV0();                      // keep idx
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, e.line);
+                LoadImm(2, e.col);
+                LoadSymRef("l_.str." + guardListIdx, 3);
+                BLInternal("_zan_rt_guard_fail3");
+                XPopV(0);                      // pop idx
+                XPopV(3);                      // pop data
+                LoadImm(0, 0);
+                Mark(cont);
+                int gEnd = NL();
+                CbzReg(3, gEnd);                     // empty list: backing is null
+                if (tgt86 == 1) { X3(0x48, 0x8B, 0x3C); X1(0xF9); } else { E4(0xF8607860); } // ldr x0,[x3,x0,lsl#3] = mov rdi,[rcx+rdi*8] (v0 home rdi)
+                Mark(gEnd);                          // null backing reads as zero
+            } else if (OpIndexFit(ExprCls(e.a), "op_index", e.b, null) != null) {
+                // class instance with an indexer: `obj[i]` lowers to the
+                // op_index instance-method protocol (x0 receiver, x1 index);
+                // overloads are picked by the index argument's type
+                string oc = ExprCls(e.a);
+                Node om = OpIndexFit(oc, "op_index", e.b, null);
+                GenExpr(e.a);
+                XPushV0();                      // push receiver
+                GenExpr(e.b);
+                MovRR(1, 0);                         // x1 = index
+                XPopV(0);                      // pop receiver -> x0
+                BLInternal(MethSymNg(oc, om));
+            } else {
+                diags.Error("ngen: unsupported index target", e.line, e.col);
+            }
+    }
+    void GenCastNg(Node e) {
+            if (TryGenConversionCastNg(e)) { return; }
+            // numeric casts: int<->ulong share the slot bits; to/from
+            // double converts via scvtf/fcvtzs (like gen0's fptosi/sitofp)
+            string ty = e.type.sval;
+            bool toDbl = IsDblTy(ty);
+            bool fromDbl = IsDblExpr(e.b);
+            if (toDbl && !fromDbl) {
+                GenExpr(e.b);
+                if (tgt86 == 1) {
+                    X2(0xF2, 0x0F); X2(0x2A, 0xC7);   // cvtsi2sd xmm0, rdi
+                    X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7);   // movq rdi, xmm0
+                } else {
+                    if (tgt86 == 1) { X4(0x2A0F48F2); X1(0xC7); } else { E4(0x9E620000); }                      // scvtf d0, x0
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }                      // fmov x0, d0
+                }
+            } else if (!toDbl && fromDbl) {
+                GenExpr(e.b);
+                if (tgt86 == 1) {
+                    X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7);   // movq xmm0, rdi (bits)
+                    X2(0xF2, 0x48); X2(0x0F, 0x2C); X1(0xF8);   // cvttsd2si rdi, xmm0
+                } else {
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7); } else { E4(0x9E670000); }                      // fmov d0, x0
+                    E4(0x9E780000);                      // fcvtzs x0, d0
+                }
+                if (ty == "int") { Sxtw0(); } // wrap the saturated i64 down to i32
+            } else {
+                // a static method group casts to its raw code address (the
+                // oracle's native method-group value), not a delegate pair
+                int rawMg = StaticGroupCastIdxNg(e);
+                if (rawMg >= 0) { LoadSymRef(MethSymNg(methCls[rawMg], methNodes[rawMg]), 0); }
+                else { GenExpr(e.b); }               // int<->ulong (and dbl->dbl): bits unchanged
+                // (DelegateTy)nintExpr: a runtime-resolved address becomes a
+                // bare code pointer (the oracle's `(WndProc)addr`, its
+                // int->ptr cast). Bit 0 tags "call directly with the declared
+                // signature, no env"; interned delegate pairs are even, so
+                // the invoke branch never confuses the two shapes.
+                if (IsDelegateTyNg(TypeFullName(e.type)) && !IsDelegateTyNg(StaticTyOf(e.b))) {
+                    if (tgt86 == 1) { X2(0x48, 0x83); X2(0xCF, 0x01); }   // or rdi, 1
+                    else { E4(0xB2400000); }         // orr x0, x0, #1
+                }
+                // narrow casts wrap at the declared width, like gen0's
+                // truncating integer conversions
+                // 批38:x86 臂补齐——这族全是 0-槽(rdi)就地变换,编码对齐
+                // 1380/1386 已验证的 movsx 族;mov edi,edi 是 32 位自拷贝,
+                // 写回时清高 32(零扩展语义,=arm64 ubfm)
+                if (ty == "int") { Sxtw0(); }             // sbfm #31 / movsxd rdi, edi
+                else if (ty == "uint") { if (tgt86 == 1) { X2(0x89, 0xFF); } else { E4(0xD3407C00); } }       // ubfm #31 / mov edi, edi
+                // modrm 必须 FF(rm=111 → di/dil,值在 v0=rdi):1380 处的
+                // F8(rm=000 → ax)在那站是良性的——XCallSeq 收尾 mov rdi, rax
+                // 让 ax==di;这里值只在 rdi,照抄就会扩展出垃圾低 16 位
+                else if (ty == "short") { if (tgt86 == 1) { X3(0x48, 0x0F, 0xBF); X1(0xFF); } else { E4(0x93403C00); } }      // sbfm #15 / movsx rdi, di
+                else if (ty == "ushort" || ty == "char") { if (tgt86 == 1) { X3(0x0F, 0xB7, 0xFF); } else { E4(0xD3403C00); } }  // ubfm #15 / movzx edi, di
+                else if (ty == "sbyte") { if (tgt86 == 1) { X3(0x48, 0x0F, 0xBE); X1(0xFF); } else { E4(0x93401C00); } }      // sbfm #7 / movsx rdi, dil
+                else if (ty == "byte") { if (tgt86 == 1) { X1(0x40); X3(0x0F, 0xB6, 0xFF); } else { E4(0xD3401C00); } }   // ubfm #7 / movzx edi, dil (dil 需 REX)
+            }
+    }
+}

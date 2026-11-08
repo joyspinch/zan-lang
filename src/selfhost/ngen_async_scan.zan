@@ -1,0 +1,263 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    // ---- element type of an await: Task<T> -> T, Task/void -> null ----
+    string AsyncElemTyOfMethod(Node m) {
+        string rt = m != null && m.type != null ? TypeFullName(m.type) : null;
+        if (rt == null || rt == "" || rt == "void" || rt == "Task") { return null; }
+        if (rt.IndexOf("Task<") == 0 && rt.Length > 6
+                && rt.Substring(rt.Length - 1, 1) == ">") {
+            return rt.Substring(5, rt.Length - 6);
+        }
+        return rt;
+    }
+
+    // C#-spelling awaitability: a Task / Task<T> / ValueTask<T> return type
+    // (the interface spelling of an async method carries no `async`
+    // keyword -- the declared type is what makes it awaitable)
+    bool IsTaskShapedRetNg(Node m) {
+        string rt = m != null && m.type != null ? TypeFullName(m.type) : null;
+        if (rt == null) { return false; }
+        return rt == "Task" || rt.IndexOf("Task<") == 0
+                || rt.IndexOf("ValueTask<") == 0;
+    }
+
+    // Hook C helper: the value type of `await <inner>`
+    string AsyncAwaitElemTyNg(Node inner) {
+        if (inner == null) { return null; }
+        if (inner.kind != AK.Call()) {
+            string st = StaticTyOf(inner);
+            if (st != null && st.IndexOf("Task<") == 0 && st.Substring(st.Length - 1, 1) == ">") {
+                return st.Substring(5, st.Length - 6);
+            }
+            if (st != null && st.IndexOf("ValueTask<") == 0 && st.Substring(st.Length - 1, 1) == ">") {
+                return st.Substring(10, st.Length - 11);
+            }
+            if (st == "Task" || st == "ValueTask") {
+                return "void";
+            }
+            return null;
+        }
+        int mi = ResolveStaticNg(inner);
+        if (mi < 0) {
+            string rt = CallRetTy(inner);
+            if (rt != null && rt.IndexOf("Task<") == 0 && rt.Substring(rt.Length - 1, 1) == ">") {
+                return rt.Substring(5, rt.Length - 6);
+            }
+            if (rt == "Task" || rt == "ValueTask") {
+                return "void";
+            }
+            return rt;
+        }
+        return AsyncElemTyOfMethod(methNodes[mi]);
+    }
+
+    string AsyncResumeSymNg(int mi) {
+        return MethSymNg(methCls[mi], methNodes[mi]) + "$resume";
+    }
+
+    // can this statement position suspend? Every await (statement-head or
+    // hoisted) consumes exactly one pre-reserved resume label and one sub
+    // slot, whether or not its target turns out resolvable, so the count and
+    // the emission always agree.
+    bool HeadsAwait(Node e) {
+        return e != null && e.kind == AK.AwaitExpr();
+    }
+
+    // every AwaitExpr in an expression tree (the ANF pre-count)
+    int CountAwaitExprsNg(Node n) {
+        if (n == null) { return 0; }
+        int total = n.kind == AK.AwaitExpr() ? 1 : 0;
+        total = total + CountAwaitExprsNg(n.a);
+        total = total + CountAwaitExprsNg(n.b);
+        total = total + CountAwaitExprsNg(n.c);
+        total = total + CountAwaitExprsNg(n.d);
+        int i = 0;
+        while (i < n.kids.Count) { total = total + CountAwaitExprsNg(n.kids[i]); i = i + 1; }
+        return total;
+    }
+
+    int CountAsyncSuspendsNg(Node s) {
+        if (s == null) { return 0; }
+        int k = s.kind;
+        if (k == AK.Block()) {
+            int n = 0;
+            int i = 0;
+            while (i < s.kids.Count) { n = n + CountAsyncSuspendsNg(s.kids[i]); i = i + 1; }
+            return n;
+        }
+        if (k == AK.VarDecl()) { return CountAwaitExprsNg(s.b); }
+        if (k == AK.ReturnStmt()) { return CountAwaitExprsNg(s.a); }
+        if (k == AK.ExprStmt()) { return CountAwaitExprsNg(s.a); }
+        if (k == AK.IfStmt()) {
+            return CountAwaitExprsNg(s.a) + CountAsyncSuspendsNg(s.b) + CountAsyncSuspendsNg(s.c);
+        }
+        if (k == AK.WhileStmt()) {
+            return CountAwaitExprsNg(s.a) + CountAsyncSuspendsNg(s.b);
+        }
+        if (k == AK.DoWhileStmt()) {
+            return CountAwaitExprsNg(s.a) + CountAsyncSuspendsNg(s.b);
+        }
+        if (k == AK.ForStmt()) {
+            return CountAsyncSuspendsNg(s.a) + CountAwaitExprsNg(s.b)
+                    + CountAsyncSuspendsNg(s.d) + CountAwaitExprsNg(s.c);
+        }
+        if (k == AK.ForeachStmt()) {
+            return CountAwaitExprsNg(s.b) + CountAsyncSuspendsNg(s.c);
+        }
+        if (k == AK.SwitchStmt()) {
+            int n = CountAwaitExprsNg(s.a);
+            int i = 0;
+            while (i < s.kids.Count) {
+                n = n + CountAwaitExprsNg(s.kids[i].a) + CountAsyncSuspendsNg(s.kids[i].b);
+                i = i + 1;
+            }
+            return n;
+        }
+        if (k == AK.TryStmt()) {
+            int n = CountAsyncSuspendsNg(s.a);       // try body
+            int ct = 0;
+            Node cc = s.b;
+            while (cc != null) { n = n + CountAsyncSuspendsNg(cc.a); ct = ct + CountTransfersNg(cc.a); cc = cc.b; }
+            if (s.c != null) {
+                // a finally body is emitted once per exit path: the normal
+                // path, the unmatched-rethrow path, the after-handled-catch
+                // path (when clauses exist), and once per early transfer in
+                // the guarded bodies. Over-counting is safe: a resume state
+                // no await ever armed gets an unreachable stub. The whole
+                // subtree multiplies, so nested try/finally compounds like
+                // the per-copy emission does.
+                int copies = 4 + (s.b != null ? 2 : 0) + CountTransfersNg(s.a) + ct + CountTransfersNg(s.c) * 4;
+                n = n + CountAsyncSuspendsNg(s.c) * copies;
+            }
+            return n;
+        }
+        return 0;
+    }
+
+    // every early transfer (return/break/continue/goto) in a subtree: each one
+    // emits one extra copy of every finally it leaves
+    int CountTransfersNg(Node n) {
+        if (n == null) { return 0; }
+        int k = n.kind;
+        int total = (k == AK.ReturnStmt() || k == AK.BreakStmt() || k == AK.ContinueStmt() || k == AK.GotoStmt()) ? 1 : 0;
+        total = total + CountTransfersNg(n.a);
+        total = total + CountTransfersNg(n.b);
+        total = total + CountTransfersNg(n.c);
+        total = total + CountTransfersNg(n.d);
+        int i = 0;
+        while (i < n.kids.Count) { total = total + CountTransfersNg(n.kids[i]); i = i + 1; }
+        return total;
+    }
+
+    // foreach, switch, and try statements in pre-order: each needs frame-resident
+    // scratch slots that must survive suspensions
+    void AsyncScanCtrlNodesNg(Node s, List<Node> fes, List<Node> sws, List<Node> trys) {
+        if (s == null) { return; }
+        int k = s.kind;
+        if (k == AK.ForeachStmt() && fes != null) { fes.Add(s); }
+        if (k == AK.SwitchStmt() && sws != null) { sws.Add(s); }
+        if ((k == AK.TryStmt() || k == AK.LockStmt()) && trys != null) { trys.Add(s); }
+        AsyncScanCtrlNodesNg(s.a, fes, sws, trys);
+        AsyncScanCtrlNodesNg(s.b, fes, sws, trys);
+        AsyncScanCtrlNodesNg(s.c, fes, sws, trys);
+        AsyncScanCtrlNodesNg(s.d, fes, sws, trys);
+        int i = 0;
+        while (i < s.kids.Count) { AsyncScanCtrlNodesNg(s.kids[i], fes, sws, trys); i = i + 1; }
+    }
+
+    void AsyncScanGotoLabelsNg(Node s, int finDepth, int tryDepth) {
+        if (s == null) { return; }
+        int k = s.kind;
+        if (k == AK.LabelStmt()) {
+            asyncGotoNames.Add(s.sval);
+            asyncGotoFinDepths.Add(finDepth);
+            asyncGotoTryDepths.Add(tryDepth);
+            return;
+        }
+        if (k == AK.TryStmt()) {
+            int bodyFin = finDepth + (s.c != null ? 1 : 0);
+            int bodyTry = tryDepth + 1;
+            AsyncScanGotoLabelsNg(s.a, bodyFin, bodyTry);
+            Node cc = s.b;
+            while (cc != null) {
+                AsyncScanGotoLabelsNg(cc.a, bodyFin, bodyTry);
+                cc = cc.b;
+            }
+            if (s.c != null) {
+                AsyncScanGotoLabelsNg(s.c, bodyFin, bodyTry);
+            }
+            return;
+        }
+        if (k == AK.LockStmt()) {
+            AsyncScanGotoLabelsNg(s.b, finDepth + 1, tryDepth + 1);
+            return;
+        }
+        AsyncScanGotoLabelsNg(s.a, finDepth, tryDepth);
+        AsyncScanGotoLabelsNg(s.b, finDepth, tryDepth);
+        AsyncScanGotoLabelsNg(s.c, finDepth, tryDepth);
+        AsyncScanGotoLabelsNg(s.d, finDepth, tryDepth);
+        int i = 0;
+        while (i < s.kids.Count) {
+            AsyncScanGotoLabelsNg(s.kids[i], finDepth, tryDepth);
+            i = i + 1;
+        }
+    }
+
+    int AsyncGotoFinDepth(string name) {
+        if (asyncGotoNames == null) { return 0; }
+        int i = 0;
+        while (i < asyncGotoNames.Count) {
+            if (asyncGotoNames[i] == name) { return asyncGotoFinDepths[i]; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    int AsyncGotoTryDepth(string name) {
+        if (asyncGotoNames == null) { return 0; }
+        int i = 0;
+        while (i < asyncGotoNames.Count) {
+            if (asyncGotoNames[i] == name) { return asyncGotoTryDepths[i]; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // declare the resume frame's local slots (this, params, body locals, then
+    // the system slots); called twice (ramp count + resume emission) and
+    // must stay in the same order. Everything after the user locals is
+    // system-owned: per-foreach collection, per-switch discriminant, and
+    // per-try scratch slots (frame-resident: live across suspensions inside
+    // the loop / case / try bodies), the return-value scratch that carries
+    // a result across finally bodies on `return` paths, and the two EH/system slots.
+    void AsyncDeclareSlotsNg(string cls, Node m, bool inst) {
+        InitLocalsNg();
+        if (inst) { AddLoc("this", m.sval2 != null && m.sval2 != "" ? m.sval2 : cls, false); }
+        int pi = 0;
+        while (pi < m.kids.Count) {
+            Node p = m.kids[pi];
+            if (p.kind == AK.Param()) {
+                AddLoc(p.sval, TypeFullName(p.type), p.ival == 1);
+            }
+            pi = pi + 1;
+        }
+        ReserveLocals(m.d);
+        BoxLambdaWrittenLocalsNg(m.d);
+        int fi = 0;
+        while (fi < asyncFeNodes.Count) { AddLoc("#afc" + Convert.ToString(fi), "long", false); fi = fi + 1; }
+        int wi = 0;
+        while (wi < asyncSwNodes.Count) { AddLoc("#asw" + Convert.ToString(wi), "long", false); wi = wi + 1; }
+        int ti = 0;
+        while (ti < asyncTryNodes.Count) { AddLoc("#atryret" + Convert.ToString(ti), "long", false); ti = ti + 1; }
+        ti = 0;
+        while (ti < asyncTryNodes.Count) { AddLoc("#atryexc" + Convert.ToString(ti), "long", false); ti = ti + 1; }
+        AddLoc("#afinret", "long", false);
+        AddLoc("#afinexc", "long", false);
+        AddLoc("#aframe", "long", false);
+        AddLoc("#aehtop0", "long", false);
+    }
+}

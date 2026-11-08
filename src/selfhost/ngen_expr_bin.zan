@@ -1,0 +1,494 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    void GenBinaryExprNg(Node e) {
+            if (TryOpOverloadNg(e)) {
+                // the overload call left its result (value or object) in x0
+            } else if (TryGenConversionBinaryNg(e)) {
+            } else if (e.op == TK.QQ() && IsNulExpr(e.a)) {
+                // nullable-value coalescing: the left side is a cell; the
+                // result is a payload exactly when the right side is one
+                int useB = NL();
+                int doneQ = NL();
+                bool resDbl = IsDblTy(NulPayOf(StaticTyOf(e.a)));
+                GenExpr(e.a);
+                CbzReg(0, useB);
+                if (!IsNulExpr(e.b)) {
+                    LdrU(0, 0, 0);                       // payload out of the cell
+                    if (resDbl) { if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7); } else { E4(0x9E670000); } }      // fmov d0, x0
+                } else if (resDbl && IsDblTy(NulPayOf(StaticTyOf(e.b)))) {
+                    LdrU(0, 0, 0);                       // both cells: unwrap left
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7); } else { E4(0x9E670000); }                      // fmov d0, x0
+                }
+                EmitB(doneQ);
+                Mark(useB);
+                GenExpr(e.b);
+                if (IsNulExpr(e.b) && IsDblTy(NulPayOf(StaticTyOf(e.b)))) {
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7); } else { E4(0x9E670000); }                      // fmov d0, x0 (cell -> payload)
+                }
+                Mark(doneQ);
+            } else if (IsLiftedNulBinary(e)) {
+                GenLiftedNulBinary(e);
+            } else if (e.op == TK.QQ() && QQRefShapeNg(e.a) && !IsDblExpr(e.b)) {
+                // null coalescing on reference shapes: a != null ? a : b
+                int useB = NL();
+                int doneQQ = NL();
+                GenExpr(e.a);
+                EmitCBZ(0, useB);
+                EmitB(doneQQ);
+                Mark(useB);
+                GenExpr(e.b);
+                Mark(doneQQ);
+            } else if ((e.op == TK.EqEq() || e.op == TK.BangEq())
+                    && StructEqPair(e.a, e.b) != null) {
+                // struct equality without an overload: field-wise value
+                // compare (gen0's aggregate equality; a pointer compare
+                // would answer false for equal copies). Batch 32: the x86
+                // arm rides the same helpers (LdrU/StringCmp/XSetV0cc)
+                // with the two fmovs per-field for the double case.
+                Cls sa = StructEqPair(e.a, e.b);
+                if (sa != null) {
+                    GenExpr(e.a);
+                    XPushV0();                  // push a
+                    GenExpr(e.b);
+                    MovRR(1, 0);                     // x1 = b (a peeked below)
+                    int neq = NL();
+                    int doneq = NL();
+                    // 批43:field-wise 对比走扁平叶(嵌套值字段的载荷
+                    // 逐槽比较),合成 width-8 槽 Fld
+                    List<Fld> flatEq = new List<Fld>();
+                    FlatValueFields(sa, flatEq, 0, new List<string>());
+                    int fi = 0;
+                    while (fi < flatEq.Count) {
+                        LoadFieldNg(2, 1, flatEq[fi]);     // b.f
+                        LdrU(3, 31, 0);                  // a (batch 32: was raw ldur)
+                        LoadFieldNg(3, 3, flatEq[fi]);     // a.f
+                        if (IsDblTy(flatEq[fi].ty)) {
+                            // floating fields compare with IEEE semantics:
+                            // an unordered pair (NaN) counts as unequal, like
+                            // the scalar == lowering
+                            if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC1); } else { E4(0x9E670060); }              // fmov d0, x3 / movq xmm0, rcx
+                            if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xCA); } else { E4(0x9E670041); }              // fmov d1, x2 / movq xmm1, rdx
+                            if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC8); } else { E4(0x1E602020); }              // fcmp d1, d0
+                            EmitBcond(6, neq);           // b.vs -> unequal
+                            EmitBcond(1, neq);           // b.ne -> unequal
+                        } else {
+                            StringCmp(3, 2);             // cmp x3, x2
+                            EmitBcond(1, neq);           // b.ne
+                        }
+                        fi = fi + 1;
+                    }
+                    LoadImm(0, 1);
+                    EmitB(doneq);
+                    Mark(neq);
+                    LoadImm(0, 0);
+                    Mark(doneq);
+                    AddSPImm(16, true);                  // drop a
+                    if (e.op == TK.BangEq()) {
+                        ExtCmpImm(0, 0);                 // cmp x0, #0 (batch 32: was raw 32-bit cmp)
+                        if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                  // cset x0, eq (1 = equal)
+                    }
+                }
+            } else if (e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b))) {
+                // string concatenation: non-string operands convert through
+                // zan_rt_int2str (gen0 prints them with "%lld"), then
+                // lhs -> x0, rhs -> x1, zan_rt_strcat2(lhs, rhs)
+                if (IsNulExpr(e.a) && NulPayOf(StaticTyOf(e.a)) != null) {
+                    GenNulToStr(e.a);                    // null renders ""
+                } else {
+                    GenExpr(e.a);
+                    if (!IsStrExpr(e.a)) {
+                        if (IsDblExpr(e.a)) { BLInternal("_zan_rt_dbl2str"); }
+                        else if (IsCharExpr(e.a)) { BLInternal("_zan_rt_chrstr"); }
+                        else if (IsUlongExpr(e.a)) { BLInternal("_zan_rt_uint2str"); }
+                        else { BLInternal("_zan_rt_int2str"); }
+                    }
+                }
+                XPushV0();                          // str x0, [sp, #-16]!
+                if (IsNulExpr(e.b) && NulPayOf(StaticTyOf(e.b)) != null) {
+                    GenNulToStr(e.b);                    // null renders ""
+                } else {
+                    GenExpr(e.b);
+                    if (!IsStrExpr(e.b)) {
+                        if (IsDblExpr(e.b)) { BLInternal("_zan_rt_dbl2str"); }
+                        else if (IsCharExpr(e.b)) { BLInternal("_zan_rt_chrstr"); }
+                        else if (IsUlongExpr(e.b)) { BLInternal("_zan_rt_uint2str"); }
+                        else { BLInternal("_zan_rt_int2str"); }
+                    }
+                }
+                if (tgt86 == 1) {
+                    XPopV(1);                          // lhs -> v1 (rsi)
+                    X3(0x49, 0x89, 0xFA);              // mov r10, rdi (rhs)
+                    XMov(7, 6);                        // mov rdi, rsi (lhs)
+                    X3(0x4C, 0x89, 0xD6);              // mov rsi, r10 (rhs)
+                } else {
+                    XPopV(1);                    // ldr x1, [sp], #16 (lhs)
+                    E4(0xAA0003E9);                    // mov x9, x0
+                    MovRR(0, 1);                    // mov x0, x1
+                    E4(0xAA0903E1);                    // mov x1, x9
+                }
+                BLInternal("_zan_rt_strcat2");
+            } else if (IsStrExpr(e.a) && IsStrExpr(e.b)
+                    && (e.op == TK.EqEq() || e.op == TK.BangEq())) {
+                // lexicographic equality via strcmp (gen0 parity)
+                GenExpr(e.a);
+                XPushV0();                      // push a
+                GenExpr(e.b);
+                if (tgt86 == 1) { XPopV(1); }             // pop a -> v1 (rsi)
+                else { PopV(1); }                  // pop a -> x1 (x0 = b)
+                BLInternal("_zan_rt_strcmp0");       // w0 = 0 iff equal
+                if (tgt86 == 1) {
+                    X3(0x48, 0x85, 0xFF);                // test rdi, rdi
+                    X3(0x0F, 0x90 | (e.op == TK.EqEq() ? 4 : 5), 0xC0);  // sete/setne al
+                    X3(0x0F, 0xB6, 0xF8);                // movzx edi, al
+                } else {
+                    E4(0x7100001F);                      // cmp w0, #0
+                    if (e.op == TK.EqEq()) { E4(0x9A9F17E0); }   // cset x0, eq
+                    else { E4(0x9A9F07E0); }                     // cset x0, ne
+                }
+            } else if (IsStrExpr(e.a) && IsStrExpr(e.b)
+                    && (e.op == TK.Less() || e.op == TK.LessEq()
+                     || e.op == TK.Greater() || e.op == TK.GreaterEq())) {
+                // relational string comparison: strcmp order, not pool
+                // addresses (gen0 parity); null sorts before every string
+                GenExpr(e.a);
+                XPushV0();                      // push a
+                GenExpr(e.b);
+                if (tgt86 == 1) {
+                    XPopV(1);                            // pop a -> v1
+                    X3(0x49, 0x89, 0xFA);                // mov r10, rdi (b)
+                    XMov(7, 6);                          // mov rdi, rsi (a)
+                    X3(0x4C, 0x89, 0xD6);                // mov rsi, r10 (b)
+                } else {
+                    XPopV(1);                      // pop a -> x1 (x0 = b)
+                    E4(0xAA0003E9);                      // mov x9, x0
+                    MovRR(0, 1);                      // mov x0, x1
+                    E4(0xAA0903E1);                      // mov x1, x9
+                }
+                BLInternal("_zan_rt_strcmp0");       // w0 = strcmp(a, b)
+                if (tgt86 == 1) {
+                    X3(0x48, 0x85, 0xFF);                // test rdi, rdi
+                    int xcc = e.op == TK.Less() ? 0x0C
+                            : e.op == TK.LessEq() ? 0x0E
+                            : e.op == TK.Greater() ? 0x0F : 0x0D;
+                    X3(0x0F, 0x90 | xcc, 0xC0);          // setcc al
+                    X3(0x0F, 0xB6, 0xF8);                // movzx edi, al
+                } else {
+                    E4(0x7100001F);                      // cmp w0, #0
+                    if (e.op == TK.Less()) { CsetCondX0(11); }          // cset x0, lt
+                    else if (e.op == TK.LessEq()) { CsetCondX0(13); }   // cset x0, le
+                    else if (e.op == TK.Greater()) { E4(0x9A9FD7E0); }  // cset x0, gt
+                    else { E4(0x9A9FB7E0); }                            // cset x0, ge
+                }
+            } else if (IsDblExpr(e.a) || IsDblExpr(e.b)) {
+                // double arithmetic/comparison: values travel as i64 bit
+                // patterns in x0; the op materialises d-regs, coercing int
+                // operands with scvtf. Comparisons are the ordered ones (a
+                // NaN input always answers false, true only for !=).
+                if (tgt86 == 1) {
+                    // SSE twin: a in xmm1, b in xmm0 (bit patterns ride
+                    // rsi/rdi until movq materialises them). Ordered
+                    // compares come from comisd + setcc with the parity
+                    // bit folded in for eq/ne; NaN answers false except
+                    // !=. fmod keeps the true FP ABI (xmm0/xmm1) and
+                    // returns in xmm0, so its call bypasses the rax tail.
+                    GenExpr(e.a);
+                    XPushV0();
+                    GenExpr(e.b);
+                    XPopV(1);                      // rdi = b, rsi = a
+                    if (IsDblExpr(e.b)) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7); }   // movq xmm0, rdi
+                    else { X3(0xF2, 0x48, 0x0F); X2(0x2A, 0xC7); }                  // cvtsi2sd xmm0, rdi
+                    if (IsDblExpr(e.a)) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xCE); }   // movq xmm1, rsi
+                    else { X3(0xF2, 0x48, 0x0F); X2(0x2A, 0xCE); }                  // cvtsi2sd xmm1, rsi
+                    int op = e.op;
+                    if (op == TK.Plus()) {
+                        X2(0xF2, 0x0F); X2(0x58, 0xC8);   // addsd xmm1, xmm0
+                    } else if (op == TK.Minus()) {
+                        X2(0xF2, 0x0F); X2(0x5C, 0xC8);   // subsd xmm1, xmm0
+                    } else if (op == TK.Star()) {
+                        X2(0xF2, 0x0F); X2(0x59, 0xC8);   // mulsd xmm1, xmm0
+                    } else if (op == TK.Slash()) {
+                        X2(0xF2, 0x0F); X2(0x5E, 0xC8);   // divsd xmm1, xmm0 (IEEE, no guard)
+                    } else if (op == TK.Percent()) {
+                        // C# `%` keeps the dividend's sign (C fmod). SysV:
+                        // xmm0 = a, xmm1 = b, result xmm0 -- no rax tail.
+                        X3(0x66, 0x0F, 0x28); X1(0xC1);          // movapd xmm0, xmm1
+                        X1(0xE8);                                // call _fmod
+                        fixups.Add(new Fixup(txt.Count - 1, 4, 0, 0, "_fmod"));
+                        X4(0);
+                        X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7);    // movq rdi, xmm0
+                        return;
+                    } else if (op == TK.Less()) {
+                        X3(0x66, 0x0F, 0x2F); X1(0xC1);          // comisd xmm0, xmm1
+                        XSetV0cc(0x97);                          // seta (b>a ordered <=> a<b)
+                        return;
+                    } else if (op == TK.Greater()) {
+                        X3(0x66, 0x0F, 0x2F); X1(0xC8);          // comisd xmm1, xmm0
+                        XSetV0cc(0x97);                          // seta
+                        return;
+                    } else if (op == TK.LessEq()) {
+                        X3(0x66, 0x0F, 0x2F); X1(0xC1);          // comisd xmm0, xmm1
+                        XSetV0cc(0x93);                          // setae (b>=a <=> a<=b)
+                        return;
+                    } else if (op == TK.GreaterEq()) {
+                        X3(0x66, 0x0F, 0x2F); X1(0xC8);          // comisd xmm1, xmm0
+                        XSetV0cc(0x93);                          // setae
+                        return;
+                    } else if (op == TK.EqEq()) {
+                        // eq = ZF set AND parity clear (unordered is ZF=PF=1)
+                        X3(0x66, 0x0F, 0x2F); X1(0xC8);          // comisd xmm1, xmm0
+                        X3(0x0F, 0x94, 0xC0);                    // sete al
+                        X3(0x0F, 0x9B, 0xC2);                    // setnp dl
+                        X2(0x22, 0xC2);                          // and al, dl
+                        X3(0x48, 0x0F, 0xB6); X1(0xF8);          // movzx rdi, al
+                        return;
+                    } else if (op == TK.BangEq()) {
+                        // ne = not-equal OR unordered (parity set)
+                        X3(0x66, 0x0F, 0x2F); X1(0xC8);          // comisd xmm1, xmm0
+                        X3(0x0F, 0x95, 0xC0);                    // setne al
+                        X3(0x0F, 0x9A, 0xC2);                    // setp dl
+                        X2(0x08, 0xD0);                          // or al, dl
+                        X3(0x48, 0x0F, 0xB6); X1(0xF8);          // movzx rdi, al
+                        return;
+                    } else {
+                        diags.Error("ngen: unsupported double operator " + op, e.line, e.col);
+                        return;
+                    }
+                    X3(0x66, 0x48, 0x0F); X2(0x7E, 0xCF);        // movq rdi, xmm1
+                    return;
+                }
+                GenExpr(e.a);
+                XPushV0();                      // str x0, [sp, #-16]!
+                GenExpr(e.b);
+                XPopV(1);                      // ldr x1, [sp], #16
+                int op = e.op;
+                if (IsDblExpr(e.a)) { if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC6); } else { E4(0x9E670020); } }  // fmov d0, x1 (movq xmm0, rsi)
+                else { if (tgt86 == 1) { X4(0x2A0F48F2); X1(0xC6); } else { E4(0x9E620020); } }                 // scvtf d0, x1 (cvtsi2sd xmm0, rsi)
+                if (IsDblExpr(e.b)) { if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xCF); } else { E4(0x9E670001); } }  // fmov d1, x0 (movq xmm1, rdi)
+                else { if (tgt86 == 1) { X4(0x2A0F48F2); X1(0xCF); } else { E4(0x9E620001); } }                 // scvtf d1, x0 (cvtsi2sd xmm1, rdi)
+                if (op == TK.Plus()) {
+                    if (tgt86 == 1) { X4(0xC1580FF2); } else { E4(0x1E602820); }                  // fadd d0, d1, d0
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }                  // fmov x0, d0
+                } else if (op == TK.Minus()) {
+                    if (tgt86 == 1) { X4(0xC15C0FF2); } else { E4(0x1E613800); }                  // fsub d0, d0, d1
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }
+                } else if (op == TK.Star()) {
+                    if (tgt86 == 1) { X4(0xC1590FF2); } else { E4(0x1E600820); }                  // fmul d0, d1, d0
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }
+                } else if (op == TK.Slash()) {
+                    if (tgt86 == 1) { X4(0xC15E0FF2); } else { E4(0x1E611800); }                  // fdiv d0, d0, d1 (IEEE: no guard, like gen0)
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }
+                } else if (op == TK.Percent()) {
+                    // C# `%` on doubles keeps the dividend's sign (C fmod):
+                    // the oracle lowers to LLVM frem, which the ARM64
+                    // backend realizes as a libm fmod call
+                    BLExtern("_fmod");
+                    if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }                  // fmov x0, d0
+                } else if (op == TK.Less()) {
+                    if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC1); } else { E4(0x1E612000); }                  // fcmp d0, d1
+                    if (tgt86 == 1) { X3(0x0F, 0x92, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F57E0); }                  // cset x0, mi
+                } else if (op == TK.Greater()) {
+                    if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC1); } else { E4(0x1E612000); }                  // fcmp d0, d1
+                    if (tgt86 == 1) { X3(0x0F, 0x97, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FD7E0); }                  // cset x0, gt
+                } else if (op == TK.LessEq()) {
+                    if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC8); } else { E4(0x1E602020); }                  // fcmp d1, d0 (swapped: a<=b <=> b>=a)
+                    if (tgt86 == 1) { X3(0x0F, 0x93, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FB7E0); }                  // cset x0, ge
+                } else if (op == TK.GreaterEq()) {
+                    if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC1); } else { E4(0x1E612000); }                  // fcmp d0, d1
+                    if (tgt86 == 1) { X3(0x0F, 0x93, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FB7E0); }                  // cset x0, ge
+                } else if (op == TK.EqEq()) {
+                    int set0 = NL();
+                    int done2 = NL();
+                    if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC8); } else { E4(0x1E602020); }                  // fcmp d1, d0
+                    if (tgt86 == 1) { X2(0x0F, 0x8A); fixups.Add(new Fixup(txt.Count - 2, 1, set0, 6, null)); X4(0); } else { EmitBcond(6, set0); }   // b.vs -> unordered: false (comisd = parity)
+                    if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                  // cset x0, eq
+                    EmitB(done2);
+                    Mark(set0);
+                    LoadImm(0, 0);
+                    Mark(done2);
+                } else if (op == TK.BangEq()) {
+                    int set1 = NL();
+                    int done3 = NL();
+                    if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC8); } else { E4(0x1E602020); }                  // fcmp d1, d0
+                    if (tgt86 == 1) { X2(0x0F, 0x8A); fixups.Add(new Fixup(txt.Count - 2, 1, set1, 6, null)); X4(0); } else { EmitBcond(6, set1); }   // b.vs -> unordered: true (comisd = parity)
+                    if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                  // cset x0, ne
+                    EmitB(done3);
+                    Mark(set1);
+                    LoadImm(0, 1);
+                    Mark(done3);
+                } else {
+                    diags.Error("ngen: unsupported double operator " + op, e.line, e.col);
+                }
+            } else {
+                GenExpr(e.a);
+                if (tgt86 == 1) { XPushV0(); } else { XPushV0(); }   // str x0, [sp, #-16]!
+                GenExpr(e.b);
+                if (tgt86 == 1) { XPopV(1); } else { PopV(1); }    // ldr x1, [sp], #16
+                int op = e.op;
+                if (tgt86 == 1) { X86IntBinop(e, op); }
+                else if (IsUlongExpr(e.a) || IsUlongExpr(e.b)
+                        || (Int32Kind(e.a) == 2 && Int32Kind(e.b) == 2)) {
+                    // unsigned 64-bit: add/sub/mul keep the full i64 result
+                    // (gen0's uint reads are 64-bit; the declared-width slot
+                    // store truncates), division drops the MIN/-1 fold,
+                    // comparisons go unsigned, and >> is logical
+                    if (tgt86 == 1) { XFailClosed("ulong operators", curLine, curCol); return; }
+                    bool bothU = Int32Kind(e.a) == 2 && Int32Kind(e.b) == 2;
+                    if (op == TK.Plus()) {
+                        AddRR(0, 1, 0);                  // add x0, x1, x0
+                    } else if (op == TK.Minus()) {
+                        SubRR(0, 1, 0);                  // sub x0, x1, x0
+                    } else if (op == TK.Star()) {
+                        MaddRR(0, 1, 0, 31);                  // mul x0, x1, x0
+                    } else if (op == TK.Slash() || op == TK.Percent()) {
+                        int bad = NL();
+                        int cont = NL();
+                        CbzReg(0, bad);
+                        EmitB(cont);
+                        Mark(bad);
+                        XPushR(1);                  // str x1, [sp, #-16]! (keep dividend)
+                        LoadSymRef("l_.str." + guardFileIdx, 0);
+                        LoadImm(1, curLine);
+                        LoadImm(2, curCol);
+                        if (op == TK.Slash()) { LoadSymRef("l_.str." + guardDivIdx, 3); }
+                        else { LoadSymRef("l_.str." + guardModIdx, 3); }
+                        BLInternal("_zan_rt_guard_fail3");
+                        XPopV(1);                  // ldr x1, [sp], #16
+                        LoadImm(0, 1);                   // safe divisor
+                        Mark(cont);
+                        if (op == TK.Slash()) {
+                            E4(0x9AC00820);              // udiv x0, x1, x0
+                        } else {
+                            E4(0x9AC00824);              // udiv x4, x1, x0
+                            E4(0x9B008480);              // msub x0, x4, x0, x1
+                        }
+                    } else if (op == TK.Less()) {
+                        CmpRR(1, 0);                  // cmp x1, x0
+                        CsetCondX0(3);                  // cset x0, lo
+                    } else if (op == TK.Greater()) {
+                        CmpRR(1, 0);
+                        E4(0x9A9F97E0);                  // cset x0, hi
+                    } else if (op == TK.LessEq()) {
+                        CmpRR(1, 0);
+                        E4(0x9A9F87E0);                  // cset x0, ls
+                    } else if (op == TK.GreaterEq()) {
+                        CmpRR(1, 0);
+                        E4(0x9A9F37E0);                  // cset x0, hs
+                    } else if (op == TK.EqEq()) {
+                        CmpRR(1, 0);
+                        if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                  // cset x0, eq
+                    } else if (op == TK.BangEq()) {
+                        CmpRR(1, 0);
+                        if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                  // cset x0, ne
+                    } else if (op == TK.LessLess()) {
+                        if (bothU) { E4(0x92401000); }   // and x0, x0, #31
+                        E4(0x9AC02020);                  // lslv x0, x1, x0
+                    } else if (op == TK.GreaterGreater()) {
+                        if (bothU) { E4(0x92401000); }   // and x0, x0, #31
+                        E4(0x9AC02420);                  // lsrv x0, x1, x0
+                    } else if (op == TK.GreaterGreaterGreater()) {
+                        if (bothU) { E4(0x92401000); }   // and x0, x0, #31
+                        E4(0x9AC02420);                  // lsrv x0, x1, x0
+                    } else if (op == TK.Amp()) {
+                        E4(0x8A000020);                  // and x0, x1, x0
+                    } else if (op == TK.Pipe()) {
+                        E4(0xAA000020);                  // orr x0, x1, x0
+                    } else if (op == TK.Caret()) {
+                        E4(0xCA000020);                  // eor x0, x1, x0
+                    } else {
+                        diags.Error("ngen: unsupported ulong operator " + op, e.line, e.col);
+                    }
+                } else if (op == TK.Plus()) {
+                    AddRR(0, 1, 0);                      // add x0, x1, x0
+                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
+                } else if (op == TK.Minus()) {
+                    SubRR(0, 1, 0);                      // sub x0, x1, x0
+                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
+                } else if (op == TK.Star()) {
+                    MaddRR(0, 1, 0, 31);                      // mul x0, x1, x0
+                    if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
+                } else if (op == TK.Slash() || op == TK.Percent()) {
+                    // divide/modulo: x1 = dividend, x0 = divisor. A zero
+                    // divisor reports through zan_rt_guard_fail3 -- the same
+                    // C-runtime guard the IR backend links -- and continues
+                    // with divisor 1; INT_MIN / -1 also divides by 1 to
+                    // avoid the SIGFPE trap, mirroring gen0's select guard.
+                    int bad = NL();
+                    int cont = NL();
+                    int safe = NL();
+                    CbzReg(0, bad);
+                    EmitB(cont);
+                    Mark(bad);
+                    XPushR(1);                      // str x1, [sp, #-16]! (keep dividend across the call)
+                    LoadSymRef("l_.str." + guardFileIdx, 0);
+                    LoadImm(1, curLine);
+                    LoadImm(2, curCol);
+                    if (op == TK.Slash()) { LoadSymRef("l_.str." + guardDivIdx, 3); }
+                    else { LoadSymRef("l_.str." + guardModIdx, 3); }
+                    BLInternal("_zan_rt_guard_fail3");
+                    XPopV(1);                      // ldr x1, [sp], #16 (own push; cont must not pop)
+                    LoadImm(0, 1);                       // safe divisor
+                    Mark(cont);
+                    LoadImm(2, 0x8000000000000000);      // i64 min
+                    LoadImm(3, -1);
+                    if (tgt86 == 1) { Xop(0x39, 7, 1); } else { E4(0xEB03001F); }                      // cmp x0, x3
+                    EmitBcond(1, safe);                  // b.ne safe
+                    CmpRR(1, 2);                      // cmp x1, x2
+                    EmitBcond(1, safe);
+                    LoadImm(0, 1);
+                    Mark(safe);
+                    if (op == TK.Slash()) {
+                        E4(0x9AC00C20);                  // sdiv x0, x1, x0
+                        // the 64-bit quotient of INT_MIN / -1 is +2^31;
+                        // int semantics wrap it back to INT_MIN
+                        if (Int32Kind(e.a) == 1 && Int32Kind(e.b) == 1) { Wrap32(1); }
+                    } else {
+                        E4(0x9AC00C24);                  // sdiv x4, x1, x0
+                        E4(0x9B008480);                  // msub x0, x4, x0, x1
+                    }
+                } else if (op == TK.Less()) {
+                    CmpRR(1, 0);                      // cmp x1, x0
+                    CsetCondX0(11);                      // cset x0, lt
+                } else if (op == TK.Greater()) {
+                    CmpRR(1, 0);                      // cmp x1, x0
+                    if (tgt86 == 1) { X3(0x0F, 0x97, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FD7E0); }                      // cset x0, gt
+                } else if (op == TK.LessEq()) {
+                    CmpRR(1, 0);                      // cmp x1, x0
+                    CsetCondX0(13);                      // cset x0, le
+                } else if (op == TK.GreaterEq()) {
+                    CmpRR(1, 0);                      // cmp x1, x0
+                    if (tgt86 == 1) { X3(0x0F, 0x93, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FB7E0); }                      // cset x0, ge
+                } else if (op == TK.EqEq()) {
+                    CmpRR(1, 0);                      // cmp x1, x0
+                    if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                      // cset x0, eq
+                } else if (op == TK.BangEq()) {
+                    CmpRR(1, 0);                      // cmp x1, x0
+                    if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                      // cset x0, ne
+                } else if (op == TK.LessLess()) {
+                    // shifts compute at 64 bits; only the count masks, by the
+                    // left operand's DECLARED width (a bare literal declares
+                    // int), and an int target narrows the result at the store
+                    if (ShiftMask32(e.a)) { E4(0x92401000); }   // and x0, x0, #31
+                    E4(0x9AC02020);                      // lslv x0, x1, x0
+                } else if (op == TK.GreaterGreater()) {
+                    if (ShiftMask32(e.a)) { E4(0x92401000); }   // and x0, x0, #31
+                    E4(0x9AC02820);                      // asrv x0, x1, x0
+                } else if (op == TK.GreaterGreaterGreater()) {
+                    // always logical; the 64-bit result stays untruncated
+                    // here -- an int target narrows it at the store
+                    if (ShiftMask32(e.a)) { E4(0x92401000); }   // and x0, x0, #31
+                    E4(0x9AC02420);                      // lsrv x0, x1, x0
+                } else if (op == TK.Amp()) {
+                    E4(0x8A000020);                      // and x0, x1, x0
+                } else if (op == TK.Pipe()) {
+                    E4(0xAA000020);                      // orr x0, x1, x0
+                } else if (op == TK.Caret()) {
+                    E4(0xCA000020);                      // eor x0, x1, x0
+                } else {
+                    diags.Error("ngen: unsupported operator " + op, e.line, e.col);
+                }
+            }
+    }
+}

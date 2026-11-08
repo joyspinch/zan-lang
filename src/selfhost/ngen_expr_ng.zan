@@ -1,0 +1,318 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    void GenExprInEnvNg(Node e) {
+        // ngen_async hook A: `await <async call>` (root drive; diagnosed
+        // inside an async body, where only statement-head awaits suspend)
+        if (TryGenAwaitExprNg(e)) { return; }
+        if (TryGenDelegateExpr(e)) { return; }
+        if (TryGenStringRead(e)) { return; }
+        int k = e.kind;
+        if (k == AK.IntLit()) {
+            // gen0's int-literal rule: an unsuffixed radix-2/8/16 literal in
+            // the uint range types as int, so its runtime value is the
+            // int-domain (two's-complement) one
+            long v = e.ival;
+            int sfx = e.suffix - (e.suffix / 4) * 4;
+            int rad = e.suffix >= 16 ? 16 : (e.suffix >= 8 ? 8 : 0);
+            if (sfx == 0 && rad != 0 && v > 2147483647 && v <= 4294967295) {
+                v = v - 4294967296;
+            }
+            LoadImm(0, v);
+        } else if (k == AK.NullLit()) {
+            LoadImm(0, 0);
+        } else if (k == AK.StringLit()) {
+            if (IsTypeofNode(e)) { ReflLoadTypeofRec(e); }
+            else { LoadStr(InternStr(DecodeLiteralNg(e.sval)), 0); }
+        } else if (k == AK.BoolLit()) {
+            LoadImm(0, e.ival);
+        } else if (k == AK.CharLit()) {
+            // a char is its codepoint in the value slot (rendering decides
+            // string vs decimal per context, like gen0)
+            LoadImm(0, e.ival);
+        } else if (k == AK.FloatLit()) {
+            // 缺口四 a: IEEE bits resolved at compile time and emitted as
+            // a movz/movk immediate. The previous lazy `dbl.N` __DATA
+            // slot (strtod on first load) only worked in the first object
+            // of a link; later objects' slots stayed zero and the
+            // conversion fired on a null literal-text pointer.
+            LoadImm(0, DblBitsOf(e.sval));
+        } else if (k == AK.ThisExpr() || k == AK.BaseExpr()) {
+            LoadLocal(LocalIdx("this"), 0);
+        } else if (k == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li < 0) {
+                // implicit field reference inside instance methods
+                Fld fld = CurField(e.sval);
+                if (fld != null) {
+                    LoadLocal(LocalIdx("this"), 0);
+                    Cls nxc = ExpandedStructOf(fld);
+                    if (nxc != null) { MaterializeNestedBox(nxc, fld); }
+                    else { LoadFieldNg(0, 0, fld); }
+                    return;
+                }
+                // static field: the value lives in a data-global slot
+                string ssym = FindStaticSym(curCls, e.sval);
+                if (ssym != null) {
+                    LoadSymRef(ssym, 0);
+                    LdrU(0, 0, 0);
+                    return;
+                }
+                // bare property read: the desugared get_Name accessor
+                // (static tried first, then instance through `this`)
+                Node bg = AccessorInChain(curCls, "get_" + e.sval);
+                if (bg != null) {
+                    if (HasMod(bg, MOD.Static())) {
+                        LoadImm(0, 0);
+                    } else {
+                        LoadLocal(LocalIdx("this"), 0);
+                    }
+                    BLInternal(MethSymNg(accOwnerCls, bg));
+                    return;
+                }
+                // out-of-block local read: the name still types method-wide
+                // (NamedSlotTy), but the scoped slot lookup misses -- the
+                // oracle's irgen falls back to constant 0 here, so field
+                // reads on the null receiver guard to 0 (qa34 probe parity)
+                if (DeclaredLocIdxNg(e.sval) >= 0) { LoadImm(0, 0); return; }
+                diags.Error("ngen: unknown identifier '" + e.sval + "'", e.line, e.col);
+                LoadImm(0, 0);
+                return;
+            }
+            if (locRef[li]) {
+                LoadRefLocal(li);
+                return;
+            }
+            LoadLocalVal(li, 0);
+        } else if (k == AK.MemberAccess()) {
+            if (e.ival == 1) {
+                // null-conditional `a?.m`: the receiver is tested once and
+                // a null short-circuits to the null of the result type; a
+                // value-typed member result wraps into its cell on the
+                // taken path (the reference spelling re-reads the receiver,
+                // which the suite's pure receivers make unobservable)
+                string qmt = StaticTyOf(e);
+                string qpay = IsNulTy(qmt) ? NulPayOf(qmt) : null;
+                GenExpr(e.a);                            // x0 = receiver
+                int qnull = NL();
+                int qfin = NL();
+                CbzReg(0, qnull);
+                e.ival = 0;                              // ordinary member read
+                GenExpr(e);
+                e.ival = 1;
+                if (qpay != null) { GenNulWrap(IsDblTy(qpay)); }
+                EmitB(qfin);
+                Mark(qnull);
+                LoadImm(0, 0);
+                Mark(qfin);
+                return;
+            }
+            if (TryGenHostMember(e)) { return; }
+            if ((e.sval == "HasValue" || e.sval == "Value") && e.a != null
+                    && IsNulTy(StaticTyOf(e.a))) {
+                GenNulMemberRead(e);                     // nullable payload read
+                return;
+            }
+            if (e.sval == "Count" && ExprCls(e.a) == "List") { GenListCount(e.a); }
+            else if (e.sval == "Count" && ExprCls(e.a) == "Dict") { GenExpr(e.a); LdrU(0, 0, 0); }
+            else if (e.sval == "Count" && IsDictViewAccess(e.a)) {
+                GenListCount(e.a);                       // d.Keys.Count / d.Values.Count
+            }
+            else if ((e.sval == "Keys" || e.sval == "Values") && ExprCls(e.a) == "Dict") {
+                // snapshot list: _zan_rt_dict_keys / _dict_values build a
+                // List whose slots alias the dict's own keys/values
+                GenExpr(e.a);
+                BLInternal(e.sval == "Keys" ? "_zan_rt_dict_keys" : "_zan_rt_dict_values");
+            }
+            else if ((e.sval == "Length" || e.sval == "Count") && ArrContainerTy(e.a) != null) {
+                // gen0: null report (reads the zeroed scratch afterwards),
+                // length is the i64 count at arr-16; .Count is aliased to
+                // .Length so a params bundle answers the List spelling too
+                GenExpr(e.a);
+                int badn = NL();
+                int contn = NL();
+                int donen = NL();
+                CbzReg(0, badn);
+                EmitB(contn);
+                Mark(badn);
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, curLine);
+                LoadImm(2, curCol);
+                LoadSymRef("l_.str." + guardArrNull, 3);
+                BLInternal("_zan_rt_guard_fail3");
+                LoadImm(0, 0);
+                EmitB(donen);
+                Mark(contn);
+                if (tgt86 == 1) { LdrU(0, 0, -16); } else { E4(0xF85F0000); }   // ldur x0, [x0, #-16] = mov rdi,[rdi-16]
+                Mark(donen);
+            }
+            else if (e.sval == "Length" && IsStrExpr(e.a)) {
+                // gen0 probes the SNAZ header: length lives in the low 32
+                // bits of the i64 at s-8; a null string reports and answers 0
+                GenExpr(e.a);
+                int bads = NL();
+                int conts = NL();
+                int dones = NL();
+                CbzReg(0, bads);
+                EmitB(conts);
+                Mark(bads);
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, curLine);
+                LoadImm(2, curCol);
+                LoadSymRef("l_.str." + guardStrNull, 3);
+                BLInternal("_zan_rt_guard_fail3");
+                LoadImm(0, 0);
+                EmitB(dones);
+                Mark(conts);
+                E4(0xD1002009);                      // sub x9, x0, #8
+                E4(0xF9400120);                      // ldr x0, [x9]
+                E4(0xD3407C00);                      // ubfm x0, x0, #0, #31
+                Mark(dones);
+            }
+            else if (e.a != null && e.a.kind == AK.Ident()
+                    && FindEnumMemIdx(e.a.sval, e.sval) >= 0) {
+                // EnumType.Member constant
+                LoadImm(0, enVal[FindEnumMemIdx(e.a.sval, e.sval)]);
+            }
+            else if ((e.sval == "IsCompleted" || e.sval == "Result")
+                    && TaskTyOfNg(e.a) != null) {
+                GenTaskMemberRead(e);                    // property-style read
+            }
+            else if (GenReflPropRead(e)) {               // TypeInfo surface
+            }
+            else { GenFieldLoad(e); }
+        } else if (k == AK.Binary() && e.op == TK.AmpAmp()) {
+            // short-circuit AND: the right operand runs only when the left
+            // is truthy; result normalises to 0/1
+            int falsL = NL();
+            int endL = NL();
+            GenExpr(e.a);
+            CbzReg(0, falsL);
+            GenExpr(e.b);
+            EmitB(endL);
+            Mark(falsL);
+            LoadImm(0, 0);
+            Mark(endL);
+        } else if (k == AK.Binary() && e.op == TK.PipePipe()) {
+            int trueL = NL();
+            int endL = NL();
+            GenExpr(e.a);
+            EmitCbnz(0, trueL);
+            GenExpr(e.b);
+            EmitB(endL);
+            Mark(trueL);
+            LoadImm(0, 1);
+            Mark(endL);
+        } else if (k == AK.Binary()) {
+            GenBinaryExprNg(e);
+        } else if (k == AK.Unary()) {
+            GenExpr(e.a);
+            if (e.op == TK.Minus()) {
+                if (IsDblExpr(e.a)) {
+                    if (tgt86 == 1) {
+                        // fneg = flip the double's sign bit; the value rides
+                        // as i64 bits in rdi, so an integer xor is exact
+                        // (r11 is the lane's scratch, dead across an operand)
+                        X2(0x49, 0xBB); X4(0); X4(0x80000000);      // movabs r11, 0x8000...0 (10B: opcode+imm64)
+                        X3(0x4C, 0x31, 0xDF);                       // xor rdi, r11 (REX.R -> r11)
+                    } else {
+                        if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7); } else { E4(0x9E670000); }                  // fmov d0, x0
+                        E4(0x1E614000);                  // fneg d0, d0
+                        if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }                  // fmov x0, d0
+                    }
+                } else {
+                    if (tgt86 == 1) { X3(0x48, 0xF7, 0xDF); }   // neg rdi, rdi
+                    else { E4(0xCB0003E0); }                  // neg x0, x0 (sub x0, xzr, x0)
+                    // only a 32-bit-domain signed operand wraps at the neg
+                    // (uint reads are 64-bit; literals are 64-bit)
+                    if (Int32Kind(e.a) == 1) { Wrap32(1); }
+                }
+            } else if (e.op == TK.Bang()) {
+                // logical not on every operand shape: `!x` is (x == 0),
+                // matching the IR's icmp eq 0 (irgen_expr) -- this is what
+                // makes `!d.ContainsKey(k)` behave on an int-shaped 0/1
+                // predicate
+                if (tgt86 == 1) {
+                    X3(0x48, 0x85, 0xFF);                // test rdi, rdi
+                    X3(0x0F, 0x94, 0xC0);                // sete al
+                    X3(0x48, 0x0F, 0xB6); X1(0xF8);      // movzx rdi, al
+                } else {
+                    E4(0xF100001F);                      // cmp x0, #0
+                    if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                      // cset x0, eq
+                }
+            } else if (e.op == TK.Tilde()) {
+                // source-level `~`: the C# bitwise complement
+                if (tgt86 == 1) { X3(0x48, 0xF7, 0xD7); }   // not rdi, rdi
+                else { E4(0xAA2003E0); }                      // orn x0, xzr, x0 (mvn)
+            } else if (e.op == TK.PlusPlus() || e.op == TK.MinusMinus()) {
+                // prefix ++/--: yield the NEW value
+                GenIncDec(e.a, e.op == TK.PlusPlus(), true);
+            }
+            // unary plus is a no-op on the bit pattern
+        } else if (k == AK.CastExpr() && e.type != null) {
+            GenCastNg(e);
+        } else if (k == AK.Index()) {
+            GenIndexNg(e);
+        } else if (k == AK.Assignment()) {
+            GenAssignmentNg(e);
+        } else if (k == AK.NewExpr()) {
+            GenNew(e);
+        } else if (k == AK.IsExpr()) {
+            GenIs(e);
+        } else if (k == AK.AsExpr()) {
+            GenAs(e);
+        } else if (k == AK.Call()) {
+            GenCall(e);
+        } else if (k == AK.Conditional()) {
+            // c ? a : b -- truthiness is the 0/1 bool convention
+            int elseL = NL();
+            int endL = NL();
+            GenExpr(e.a);
+            EmitCBZ(0, elseL);
+            GenExpr(e.b);
+            if (IsDblExpr(e) && !IsDblExpr(e.b)) { ConvI2D(); }
+            EmitB(endL);
+            Mark(elseL);
+            GenExpr(e.c);
+            if (IsDblExpr(e) && !IsDblExpr(e.c)) { ConvI2D(); }
+            Mark(endL);
+        } else if (k == AK.SwitchExpr()) {
+            GenSwitchExpr(e);
+        } else if (k == AK.TupleExpr()) {
+            GenTupleNg(e);
+        } else if (k == AK.PostfixUnary()) {
+            if (e.op == TK.Bang()) {
+                GenExpr(e.a);
+            } else {
+                // x++ / x--: yield the OLD value, then store old +/- 1; any
+                // place (local, ref local, field, static, element) goes through
+                // its address so the target evaluates exactly once
+                GenIncDec(e.a, e.op == TK.PlusPlus(), false);
+            }
+        } else if (k == AK.WithExpr()) {
+            GenWithExprNg(e);
+        } else if (k == AK.CallInit()) {
+            // 工厂调用延续初始化器：先降调用本身，结果（同一个对象）
+            // 压栈应用成员写，原样返回——不做记录式拷贝。
+            string fcls = CallRetTy(e.a);
+            if (fcls == null || FindClass(fcls) == null) {
+                diags.Error("ngen: factory-call initializer on unknown type", e.line, e.col);
+                LoadImm(0, 0);
+            } else {
+                GenExpr(e.a);
+                XPushV0();                      // push obj
+                GenInitItems(fcls, e, 0);
+                XPopV(0);                      // pop obj -> x0
+            }
+        } else if (k == AK.OutArg()) {
+            // an out/ref argument evaluated in expression position yields
+            // its storage ADDRESS (gen0's emit_expr of a ref arg)
+            GenRefArg(e);
+        } else {
+            diags.Error("ngen: unsupported expression kind " + k, e.line, e.col);
+        }
+    }
+}

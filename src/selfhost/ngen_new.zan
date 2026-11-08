@@ -1,0 +1,533 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    void GenNew(Node e) {
+        if (TryGenDelegateNew(e)) { return; }
+        if (TryGenHostNew(e)) { return; }
+        string cls = e.type != null ? e.type.sval : null;
+        if (cls == "List") { GenListNew(e); return; }
+        if (cls == "Dict" || cls == "Dictionary") { GenDictNew(e); return; }
+        if (cls == "Span") {
+            // the view's {base, len} pair lands in this site's private
+            // frame box (batch 12): [box]=base, [box+8]=len; indexing
+            // derefs the box. No heap allocation, no per-call leak.
+            GenExpr(e.kids[0]);                      // base -> x0
+            XPushV0();                          // push base
+            GenExpr(e.kids[1]);                      // len -> x0
+            XPushV0();                          // push len
+            SpanSiteBox(e);                          // x0 = frame box
+            XPopV(2);                          // pop len -> x2
+            XPopV(1);                          // pop base -> x1
+            StrU(1, 0, 0);                           // [box] = base
+            StrU(2, 0, 8);                           // [box+8] = len
+            return;
+        }
+        if (e.ival == 1) {
+            string etn = TypeFullName(e.type);
+            int dims = e.sval2 != null && e.sval2 != "" ? (int)Convert.ToInt64(e.sval2) : 1;
+            if (dims > 1) {
+                GenMdArrNew(e, dims);
+                return;
+            }
+            // the element of `new T[a][b]` is itself an array (8-byte refs):
+            // the size reads from T plus ALL ranks, sized + trailing
+            int Jesz = ArrElemSize(etn + ArrSuffix(e.op + 1));
+            if (e.kids.Count > 0) {
+                // array initializer: `new T[] { a, b, c }` (an explicit size,
+                // if any, must equal the element count)
+                GenArrInit(e, Jesz);
+                return;
+            }
+            GenArrNew(e.b, Jesz);
+            return;
+        }
+        Cls c = cls != null ? SpecClsOf(TypeFullName(e.type)) : null;
+        if (c == null) {
+            diags.Error("ngen: unknown class in 'new' expression", e.line, e.col);
+            LoadImm(0, 0);
+            return;
+        }
+        // allocate: x0 = size + 16 (header), x1 = descriptor (0: no dtor)
+        LoadImm(0, c.size + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        // stamp the runtime class site into the upper half of obj-8 (the
+        // descriptor slot, 0 for plain news) so `x is T` can identify the
+        // object's class later
+        RtLdur(1, 0, -8);                                // ldur x1, [x0, #-8]
+        if (tgt86 == 1) {
+            // same descriptor stamp: desc |= site << 16 (v1=rsi, v2=rdx)
+            XLoadImm(2, (long)c.site << 32);   // arm64 臂 movz hw=2 = lsl #32(旧注释 #16 有误)
+            Xop(0x09, 6, 2);                             // or rsi, rdx
+        } else {
+            E4((int)(0xD2C00000 | (((long)c.site) << 5) | 2)); // movz x2, #site, lsl #16
+            E4(0xAA020021);                              // orr x1, x1, x2
+        }
+        RtStur(1, 0, -8);                                // stur x1, [x0, #-8]
+        if (c.poly == 1) {
+            // polymorphic: stamp the class's (lazily built) vtable at obj+0
+            XPushV0();                              // push obj
+            LoadSymRef(DGlobalSym("vt." + cls), 9);      // x9 = &slot
+            LdrU(1, 9, 0);                               // x1 = table (0 before init)
+            int vtDone = NL();
+            CbnzReg(1, vtDone);
+            BLInternal("_vtinit_" + cls);                // x0 = table
+            MovRR(1, 0);                                 // x1 = table
+            Mark(vtDone);
+            XPopV(0);                              // pop obj -> x0
+            StrU(1, 0, 0);                               // obj->vptr = table
+        }
+        XPushV0();                                  // str x0, [sp, #-16]! (obj)
+        // ctor arguments: for a brace object initializer (`new C(a) { X = v }`)
+        // the first e.op kids are the paren args and the rest are field
+        // initializers; otherwise every kid is an argument. Provided args
+        // first, trailing defaults filled in; a class without any ctor
+        // allocates bare (no call).
+        Node callN = e;
+        if (e.ival == 2) {
+            Node tmp = new Node(AK.Call());
+            tmp.line = e.line;
+            tmp.col = e.col;
+            int ai = 0;
+            while (ai < e.op && ai < e.kids.Count) { tmp.Add(e.kids[ai]); ai = ai + 1; }
+            callN = tmp;
+        }
+        // the instantiation substitutes open ctor parameter types both in
+        // overload scoring (ArgParamScore) and at delegate registration
+        // (PushCallArgs snapshots it)
+        string instNg = TypeFullName(e.type);
+        pendingCtorInstNg = instNg != null && instNg.IndexOf("<") > 0 ? instNg : null;
+        int cix = FitCtorIdx(cls, callN, false, null);
+        // `new C { X = v }` over a type whose ctors all take arguments: the
+        // brace-only initializer lowers to a bare allocation plus its member
+        // writes -- the reference's form (cs_b18_init; real C# demands a
+        // parameterless ctor, the reference does not). Only a brace-only
+        // initializer qualifies: a plain `new C()` still reports.
+        bool braceOnly = e.ival == 2 && e.op == 0 && e.kids.Count > 0;
+        string ctorSym = null;
+        if (cix >= 0) {
+            ctorSym = CtorSymNg(cls, methNodes[cix]);
+            // a generic-class instantiation needs its OWN ctor body: the
+            // open ctor is a template compiled with erasure, so any
+            // type-sensitive lowering inside it degrades to the reference
+            // form (a `new Dict<T, int>()` keeps the key-kind bits clear
+            // and int-key instantiations strcmp their keys)
+            string inst = TypeFullName(e.type);
+            if (inst != null && inst.IndexOf("<") > 0) {
+                Cls gc = FindClass(cls);
+                if (gc != null && gc.tps.Count > 0) {
+                    ctorSym = InstCtorSpecNg(inst, cls, gc, cix);
+                }
+            }
+        }
+        int pushed;
+        if (cix >= 0) {
+            pushed = PushCallArgs(methNodes[cix], callN);
+            pendingCtorInstNg = null;
+        } else if (CtorCountNg(cls) > 0 && !braceOnly) {
+            pendingCtorInstNg = null;
+            diags.Error("ngen: no constructor of '" + cls + "' takes "
+                + callN.kids.Count + " argument(s)", e.line, e.col);
+            return;
+        } else {
+            pendingCtorInstNg = null;
+            pushed = 0;
+        }
+        int r = pushed;
+        int armOvfArea = 0;
+        int envc = pushed + 1;
+        if (tgt86 != 1 && envc > 16) {
+            int novf = envc - 16;
+            armOvfArea = 16 * ((novf + 1) / 2);
+            AddSPImm(armOvfArea, false);
+            LdrU(0, 31, armOvfArea + 16 * pushed);
+            int k = 1;
+            while (k <= pushed) {
+                int off = armOvfArea + 16 * (pushed - k);
+                if (k < 16) {
+                    LdrU(k, 31, off);
+                } else {
+                    LdrU(10, 31, off);
+                    StrU(10, 31, 8 * (k - 16));
+                }
+                k = k + 1;
+            }
+            XPushV0();
+            if (ctorSym != null) {
+                BLInternal(ctorSym);
+            }
+            XPopV(0);
+            AddSPImm(armOvfArea + 16 * (pushed + 1), true);
+            XPushV0();
+        } else {
+            while (r >= 1) { XPopV(XArgVOf(r)); r = r - 1; } // ldr xr, [sp], #16 (args reversed; x86 v16/v17→真家)
+            XPopV(0);                                  // ldr x0, [sp], #16 (obj)
+            XPushV0();                                  // str x0, [sp, #-16]! (keep obj across the void ctor)
+            if (ctorSym != null) {
+                BLInternal(ctorSym);
+            }
+        }
+        // field initializers store through the object still on the stack
+        if (e.ival == 2) { GenInitItems(cls, e, e.op); }
+        XPopV(0);                                  // ldr x0, [sp], #16 (obj)
+    }
+
+    // 对象初始化器的成员写序列（GenNew 与 CallInit 共用）：对象压在栈
+    // 上，从 kids[from] 起逐项应用——`member = { a, b }` 集合收养、
+    // 属性走 set_ 访问器、字段直接存。每项结束时对象回到栈顶。
+    void GenInitItems(string cls, Node e, int from) {
+        int bi = from;
+        while (bi < e.kids.Count) {
+            Node it = e.kids[bi];
+            if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()
+                    && it.b != null && it.b.kind == AK.NewExpr() && it.b.ival == 2
+                    && it.b.type == null) {
+                // `member = { a, b }`: C# member collection initializer
+                GenMemberCollInit(cls, it);
+            } else if (it.kind == AK.Assignment() && it.a != null && it.a.kind == AK.Ident()) {
+                Fld initFld = FindField(FindClass(cls), it.a.sval);
+                if (initFld == null && AccessorInChain(cls, "set_" + it.a.sval) != null) {
+                    // property setter dispatch: an initializer item on a
+                    // property calls the desugared set_Prop accessor
+                    // exactly like an ordinary assignment
+                    Node initSet = AccessorInChain(cls, "set_" + it.a.sval);
+                    string initTy = (initSet != null && initSet.type != null) ? TypeFullName(initSet.type) : null;
+                    if (initTy == null || !TryGenBindingValue(it.b, initTy)) {
+                        GenExpr(it.b);
+                    }
+                    if (initTy != null && IsDblTy(initTy) && !IsDblExpr(it.b)) { ConvI2D(); }
+                    if (initTy == "float") { NarrowF32(); }
+                    MovRR(1, 0);                     // x1 = value
+                    LdrU(0, 31, 0);                  // x0 = obj (peek: the call
+                    BLInternal(MethSymNg(accOwnerCls, initSet));   // clobbers x0)
+                    // obj stays the stack top for the next item
+                } else if (initFld == null) {
+                    diags.Error("ngen: unknown field '" + it.a.sval + "' in initializer", it.line, it.col);
+                } else {
+                    if (!TryGenBindingValue(it.b, initFld.ty)) {
+                        GenExpr(it.b);
+                    }
+                    if (IsDblTy(initFld.ty) && !IsDblExpr(it.b)) { ConvI2D(); }
+                    if (initFld.ty == "float") { NarrowF32(); }
+                    Cls initNxc = ExpandedStructOf(initFld);
+                    if (initNxc != null) {
+                        // 批43:整体值初始化 = 载荷拷贝进扁平区域
+                        // (x0 = src 箱,栈顶 = obj)
+                        XPushV0();                  // push src
+                        XPopV(2);                   // x2 = src
+                        XPopV(0);                   // x0 = obj (dst base)
+                        if (initFld.off <= 4095) { AddImm(0, 0, initFld.off); }
+                        else { LoadImm(16, initFld.off); AddRR(0, 0, 16); }
+                        MovRR(1, 2);                // x1 = src
+                        LoadImm(2, initNxc.size);   // x2 = n
+                        BLExtern("_memcpy");
+                        XPushV0();                  // push obj back for the next item
+                    } else {
+                        XPushV0();                  // push value
+                        XPopV(1);                   // pop value -> x1 (top)
+                        XPopV(0);                   // pop obj -> x0
+                        StoreFieldNg(1, 0, initFld);     // obj->field = value
+                        XPushV0();                  // push obj back for the next item
+                    }
+                }
+            } else {
+                diags.Error("ngen: unsupported object initializer item", it.line, it.col);
+            }
+            bi = bi + 1;
+        }
+    }
+
+    // `member = { a, b }` inside an object initializer: read the member once
+    // off the object still on the stack (field load or getter-only property),
+    // then Add every item into it -- C# semantics: existing content survives
+    // and instances never share the collection. Dict members take flat
+    // key/value pairs.
+    void GenMemberCollInit(string cls, Node it) {
+        Cls fc = FindClass(cls);
+        Fld f = fc != null ? FindField(fc, it.a.sval) : null;
+        string getterSym = null;
+        string mty = null;
+        if (f != null) {
+            mty = f.ty;
+        } else {
+            Node g = fc != null ? AccessorInChain(cls, "get_" + it.a.sval) : null;
+            if (g == null) {
+                diags.Error("ngen: unknown member '" + it.a.sval
+                    + "' in collection initializer", it.line, it.col);
+                int di = 0;
+                while (di < it.b.kids.Count) { GenExpr(it.b.kids[di]); di = di + 1; }
+                return;
+            }
+            getterSym = MethSymNg(accOwnerCls, g);
+            mty = TypeFullName(g.type);
+        }
+        bool dict = mty != null && mty.IndexOf("Dict<") == 0;
+        // 门面集合（既不是 List 也不是 Dict 的类类型，如
+        // ControlChildren——Add 是 owner.With(c) 的收养门面）：逐项调用
+        // 它的 Add 方法，而不是把元素裸追加进对象内部布局（那会写穿
+        // 非列表对象）。oracle irgen 的成员集合初始化同样逐个调 Add。
+        string facadeAddSym = null;
+        if (!dict && mty != null && mty.IndexOf("List<") != 0 && mty != "List") {
+            Node am = AccessorInChain(mty, "Add");
+            if (am != null && ParamCount(am) == 1) {
+                facadeAddSym = MethSymNg(accOwnerCls, am);
+            }
+        }
+        // strip the declared generic: List<E> -> E, Dict<K,V> -> K / V
+        string args2 = "";
+        if (mty != null) {
+            int lt = mty.IndexOf("<");
+            if (lt > 0 && mty.Length - 1 > lt) {
+                args2 = mty.Substring(lt + 1, mty.Length - lt - 2);
+            }
+        }
+        string keyTy = args2;
+        string valTy = args2;
+        if (dict) {
+            int comma = args2.IndexOf(",");
+            if (comma > 0) {
+                keyTy = args2.Substring(0, comma);
+                valTy = args2.Substring(comma + 1, args2.Length - comma - 1);
+            }
+        } else {
+            valTy = args2;
+        }
+        // the member's collection reference, once: x0 = obj (peek) -> x0 = coll
+        E4(0xF84003E0);                                  // ldur x0, [sp] (obj)
+        if (f != null) {
+            LdrU(0, 0, f.off);
+        } else {
+            BLInternal(getterSym);                       // x0 = coll
+        }
+        XPushV0();                                  // push coll (obj beneath)
+        int ii = 0;
+        while (ii < it.b.kids.Count) {
+            if (dict) {
+                if (ii + 1 >= it.b.kids.Count) {
+                    diags.Error("ngen: dictionary initializer needs key/value pairs", it.line, it.col);
+                    break;
+                }
+                GenExpr(it.b.kids[ii + 1]);              // value -> x0
+                CoerceCollElem(valTy, it.b.kids[ii + 1]);
+                XPushV0();                          // push value
+                GenExpr(it.b.kids[ii]);                  // key -> x0
+                CoerceCollElem(keyTy, it.b.kids[ii]);
+                XPushV0();                          // push key
+                // pushes are 16-byte cells (str x0, [sp, #-0x10]!): the
+                // stack is now [sp]=key, [sp+16]=value, [sp+32]=coll, with
+                // the peeked obj still beneath
+                RtLdur(0, 31, 32);                       // x0 = coll
+                XPushV0();                          // push dict
+                RtDictSet3();                            // pops dict, key, value
+                ii = ii + 2;
+            } else {
+                GenExpr(it.b.kids[ii]);                  // item -> x0
+                CoerceCollElem(valTy, it.b.kids[ii]);
+                GenCloneIfStruct(it.b.kids[ii]);
+                MovRR(1, 0);                             // x1 = item
+                LdrU(0, 31, 0);                          // x0 = coll (peek)
+                if (facadeAddSym != null) {
+                    BLInternal(facadeAddSym);            // facade.Add(item)
+                } else {
+                    ListAppendRaw();
+                }
+                ii = ii + 1;
+            }
+        }
+        AddSPImm(16, true);                              // pop coll (obj back on top)
+    }
+
+    // element coercion at a collection-initializer boundary, mirroring the
+    // inline List.Add rules (int slots widen, float slots round on the way in)
+    void CoerceCollElem(string ety, Node arg) {
+        if (ety == "double" && !IsDblExpr(arg)) { ConvI2D(); }
+        else if (ety == "int" && !IsDblExpr(arg) && !IsStrExpr(arg)) {
+            Sxtw0();                              // sxtw x0, w0
+        } else if (ety == "float" && !IsStrExpr(arg)) {
+            NarrowF32();
+        }
+    }
+
+    // `new T[] { a, b, c }`: allocate with the element count, then store each
+    // initializer expression at its slot (no bounds check -- the count is
+    // static). The array stays on the stack across element evaluation.
+    void GenArrInit(Node e, int esz) {
+        int n = e.kids.Count;
+        Node cnt = new Node(AK.IntLit());
+        cnt.ival = n;
+        GenArrNew(cnt, esz);
+        bool f32 = esz == 4 && ArrElemName(TypeFullName(e.type) + "[]") == "float";
+        string ieln = TypeFullName(e.type);              // declared element type
+        XPushV0();                                  // push arr
+        int k = 0;
+        while (k < n) {
+            GenExpr(e.kids[k]);                          // x0 = element value
+            if (IsNulTy(ieln) && !IsNulExpr(e.kids[k])) {
+                GenNulWrap(IsDblTy(NulPayOf(ieln)));     // payload -> cell
+            }
+            if (f32) { NarrowF32Bits(); }
+            XPopV(1);                              // pop arr -> x1
+            if (tgt86 == 1) {
+                // 批38:初始化器下标是编译期常量——基址 r10 加常量位移
+                // 后走 EmitArrElemStore/EmitSpanElemStore 同族存储形式
+                // (4D/45 89 1A、66 45 89 1A、45 88 1A,批37b/38 双探针验证)
+                XGetV(0, 11);                          // r11 = value
+                XGetV(1, 10);                          // r10 = arr
+                int disp = k * esz;
+                if (disp < 128 && disp > -128) { X3(0x4D, 0x8D, 0x52); X1(disp); }   // lea r10, [r10+disp8]
+                else { X3(0x4D, 0x8D, 0x92); X4(disp); }                             // lea r10, [r10+disp32]
+                if (esz == 8) { X3(0x4D, 0x89, 0x1A); }                // mov [r10], r11
+                else if (esz == 4) { X3(0x45, 0x89, 0x1A); }           // mov [r10], r11d
+                else if (esz == 2) { X3(0x66, 0x45, 0x89); X1(0x1A); } // mov [r10], r11w
+                else { X3(0x45, 0x88, 0x1A); }                         // mov [r10], r11b
+            } else {
+                E4((int)(0xD2800000 | (((long)k) << 5) | 2)); // movz x2, #k
+                if (esz == 1) {
+                    E4(0x38226820);                      // strb w0, [x1, x2] (S=0:汇编器对质形,批38)
+                } else if (esz == 2) {
+                    E4(0x78227820);                      // strh w0, [x1, x2, lsl #1]
+                } else if (esz == 4) {
+                    E4(0xB8227820);                      // str w0, [x1, x2, lsl #2]
+                } else {
+                    E4(0xF8227820);                      // str x0, [x1, x2, lsl #3]
+                }
+            }
+            XPushR(1);                              // push arr back
+            k = k + 1;
+        }
+        XPopV(0);                                  // pop arr -> x0
+    }
+
+    // rectangular multidim alloc (B8), the reference zan_mdarray_alloc:
+    // each dim evaluates once (a negative one reports and keeps its value),
+    // the total product folds on wrap ("array allocation overflow"), then
+    // calloc(32 + 8*rank + total*esz) with rc=1, RCMAGIC, count=total and
+    // rank in the site slot; dims[d] land at arr+8d, data at arr+8*rank.
+    // `new int[2,2] { ... }` row-major items store right after.
+    void GenMdArrNew(Node e, int rank) {
+        string ety = TypeFullName(e.type);
+        int esz = ArrElemSize(ety + "[]");
+        int di = 0;
+        while (di < rank) {
+            Node dn = di == 0 ? e.b : e.kids[di - 1];
+            if (dn == null) { LoadImm(0, 0); } else { GenExpr(dn); }
+            if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                              // cmp x0, xzr
+            int okneg = NL();
+            EmitBcond(10, okneg);                        // b.ge okneg
+            LoadSymRef("l_.str." + guardFileIdx, 0);
+            LoadImm(1, curLine);
+            LoadImm(2, curCol);
+            LoadSymRef("l_.str." + guardArrNeg, 3);
+            BLInternal("_zan_rt_guard_fail3");
+            LoadImm(0, 0);                               // safe dim
+            Mark(okneg);
+            XPushV0();
+            di = di + 1;
+        }
+        // total = product of dims; a negative product means the multiply
+        // wrapped ("array allocation overflow", folded to 0)
+        LoadImm(9, 1);
+        di = 0;
+        while (di < rank) {
+            LdrU(0, 31, 16 * (rank - 1 - di));
+            E4(0x9B007D29);                              // mul x9, x9, x0
+            di = di + 1;
+        }
+        E4(0xEB1F013F);                                  // cmp x9, xzr
+        int okt = NL();
+        EmitBcond(10, okt);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrOvf, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        LoadImm(9, 0);
+        Mark(okt);
+        MovRR(23, 9);                                    // x23 = total (count)
+        if (esz == 4) {
+            E4(0xD37EF529);                              // lsl x9, x9, #2
+        } else if (esz == 8) {
+            E4(0xD37DF129);                              // lsl x9, x9, #3
+        } else if (esz == 2) {
+            E4(0xD37FF929);                              // lsl x9, x9, #1
+        }
+        // wrapped bytes fold to the bare header, as in the reference
+        E4(0xEB1F013F);                                  // cmp x9, xzr
+        int okb = NL();
+        EmitBcond(10, okb);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrOvf, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        LoadImm(9, 32 + 8 * rank);
+        Mark(okb);
+        E4(0x91000000 | ((32 + 8 * rank) << 10) | (9 << 5) | 9); // add x9, x9, #hdr
+        MovRR(24, 9);                                    // x24 = bytes
+        MovRR(0, 24);
+        LoadImm(1, 1);
+        BLExtern("_calloc");                             // x0 = raw
+        MovRR(25, 0);                                    // x25 = raw
+        int okalloc = NL();
+        CbnzReg(0, okalloc);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrFail, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        Mark(okalloc);
+        MovRR(0, 25);
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                                   // raw->rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                                   // raw->rcmagic
+        StrU(23, 0, 16);                                 // raw->count = total
+        LoadImm(2, rank);
+        StrU(2, 0, 24);                                  // site slot = rank
+        di = 0;
+        while (di < rank) {
+            LdrU(2, 31, 16 * (rank - 1 - di));
+            StrU(2, 0, 32 + 8 * di);               // dims[di] (arr+8*di)
+            di = di + 1;
+        }
+        AddSPImm(16 * rank, true);
+        AddImm(0, 0, 32);                     // add x0, x0, #32 (arr; dims live at arr+8*d)
+        // row-major initializer items, if any: each `{ ... }` kid is a row
+        int it = rank - 1;
+        if (it < e.kids.Count) {
+            bool f32 = esz == 4 && ety == "float";
+            bool dbl = esz == 8 && ety == "double";
+            XPushV0();                              // push arr
+            int k = 0;
+            while (it < e.kids.Count) {
+                Node row = e.kids[it];
+                int ri = 0;
+                while (ri < row.kids.Count) {
+                    Node itm = row.kids[ri];
+                    GenExpr(itm);
+                    if (dbl && !IsDblExpr(itm)) { ConvI2D(); }
+                    if (f32) { NarrowF32Bits(); }
+                    XPopV(1);                      // pop arr -> x1
+                    int off = 8 * rank + k * esz;
+                    if (esz == 8) {
+                        StrU(0, 1, off);
+                    } else if (esz == 4) {
+                        E4(0xB9000000 | ((off / 4) << 10) | (1 << 5));   // str w0, [x1, #off] (imm scaled)
+                    } else if (esz == 1) {
+                        E4(0x39000000 | (off << 10) | (1 << 5));         // strb w0
+                    } else {
+                        E4(0x79000000 | ((off / 2) << 10) | (1 << 5));   // strh w0 (imm scaled)
+                    }
+                    XPushR(1);                      // push arr back
+                    k = k + 1;
+                    ri = ri + 1;
+                }
+                it = it + 1;
+            }
+            XPopV(0);                              // pop arr -> x0
+        }
+    }
+}

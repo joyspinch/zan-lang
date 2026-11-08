@@ -1,0 +1,451 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    // ---- expressions: result in x0 ----
+    // switch (disc) { case C: ... default: ... }: a compare chain like
+    // gen0's constant lowering (the selfhost parser only produces constant
+    // cases). The discriminant stays at [sp] for the whole statement; every
+    // case body and the default arm end at the shared exit, where it is
+    // popped. `break` inside a case targets the switch exit, not an
+    // enclosing loop; `continue` keeps targeting the loop.
+    // linear pattern switch: the scrutinee evaluates once and stays pushed;
+    // each case in source order peeks at it, tests its pattern, binds, and
+    // evaluates its `when` guard -- a match falls into the body. Bindings
+    // are pre-stamped frame slots (StampPatternBindings); a miss peeks the
+    // next case's test with the value intact.
+    void GenPatternSwitchStmt(Node s) {
+        int endL = NL();
+        GenExpr(s.a);                                    // x0 = discriminant
+        XPushV0();                                  // push discriminant
+        string sst = StaticTyOf(s.a);
+        brkL.Add(endL);
+        brkLoop.Add(false); brkFinBase.Add(finBodies.Count);
+        int i = 0;
+        while (i < s.kids.Count) {
+            Node c = s.kids[i];
+            int nextL = NL();
+            if (c.ival == 1 && c.type != null) {
+                LdrU(0, 31, 0);                          // x0 = discriminant
+                EmitTypeTestNg(TypeFullName(c.type), sst);
+                EmitCBZ(0, nextL);                       // no match: next case
+                if (c.sval != null && c.sval != "") {
+                    int li = LocalIdx(c.sval);
+                    if (li >= 0) {
+                        LdrU(1, 31, 0);                  // x1 = discriminant
+                        StoreLocal(li, 1);               // bind
+                    }
+                }
+            } else if (c.ival == 1) {                    // `case null:`
+                LdrU(1, 31, 0);                          // x1 = discriminant
+                E4(0xEB1F003F);                          // cmp x1, xzr
+                EmitCbnz(1, nextL);                      // non-null: next case
+            } else if (c.a != null) {
+                if (IsStrExpr(s.a)) {
+                    GenExpr(c.a);                        // x0 = case label
+                    LdrU(1, 31, 0);                      // x1 = discriminant
+                    BLExtern("_strcmp");
+                    if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                      // cmp x0, xzr
+                    EmitCbnz(0, nextL);                  // unequal: next case
+                } else {
+                    GenExpr(c.a);                        // x0 = case label
+                    XPushV0();                      // push label
+                    LdrU(1, 31, 16);                     // x1 = discriminant
+                    XPopV(0);                      // pop label -> x0
+                    CmpRR(0, 1);                      // cmp x0, x1
+                    EmitBcond(1, nextL);                 // b.ne: next case
+                }
+            }
+            // c.a == null && c.ival == 0 is `default:`: matches always
+            if (c.c != null) {
+                GenExpr(c.c);                            // `when` guard
+                EmitCBZ(0, nextL);                       // false: next case
+            }
+            GenStmt(c.b);
+            if (c.b == null || c.b.kids.Count > 0) { EmitB(endL); }
+            Mark(nextL);
+            i = i + 1;
+        }
+        brkL.RemoveAt(brkL.Count - 1);
+        brkLoop.RemoveAt(brkLoop.Count - 1);
+        brkFinBase.RemoveAt(brkFinBase.Count - 1);
+        Mark(endL);
+        XPopV(0);                                  // pop discriminant
+    }
+
+    void GenSwitchStmt(Node s) {
+        // a pattern case (`case T x [when g]:`, `case null:`) forces the
+        // linear form: tests run in source order, the first match takes its
+        // body. Plain constant switches keep the jump-chain form below.
+        int i = 0;
+        while (i < s.kids.Count) {
+            if (s.kids[i].ival == 1) { GenPatternSwitchStmt(s); return; }
+            i = i + 1;
+        }
+        int endL = NL();
+        int defL = NL();
+        GenExpr(s.a);
+        XPushV0();                                  // push discriminant
+        int nc = s.kids.Count;
+        int[] bodies = new int[nc];
+        int defIdx = -1;
+        i = 0;
+        while (i < nc) {
+            Node c = s.kids[i];
+            if (c.a == null) { defIdx = i; i = i + 1; continue; }
+            bodies[i] = NL();
+            if (IsStrExpr(s.a)) {
+                GenExpr(c.a);                            // x0 = case label
+                LdrU(1, 31, 0);                          // x1 = discriminant
+                BLExtern("_strcmp");
+                if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                          // cmp x0, xzr
+            } else {
+                GenExpr(c.a);                            // x0 = case label
+                XPushV0();                          // push label
+                LdrU(1, 31, 16);                         // x1 = discriminant
+                XPopV(0);                          // pop label -> x0
+                CmpRR(0, 1);                          // cmp x0, x1
+            }
+            EmitBcond(0, bodies[i]);                     // b.eq body
+            i = i + 1;
+        }
+        EmitB(defIdx >= 0 ? defL : endL);
+        brkL.Add(endL);
+        brkLoop.Add(false); brkFinBase.Add(finBodies.Count);
+        i = 0;
+        while (i < nc) {
+            Node c = s.kids[i];
+            if (c.a == null) { i = i + 1; continue; }
+            Mark(bodies[i]);
+            GenStmt(c.b);
+            // an empty case body falls through to the next case (C# rule);
+            // only a body that emitted code needs the jump to the exit
+            if (c.b == null || c.b.kids.Count > 0) { EmitB(endL); }
+            i = i + 1;
+        }
+        if (defIdx >= 0) {
+            Mark(defL);
+            GenStmt(s.kids[defIdx].b);
+            EmitB(endL);
+        }
+        brkL.RemoveAt(brkL.Count - 1);
+        brkLoop.RemoveAt(brkLoop.Count - 1);
+        brkFinBase.RemoveAt(brkFinBase.Count - 1);
+        Mark(endL);
+        XPopV(0);                                  // pop discriminant
+    }
+
+    void GenExpr(Node e) {
+        int saved = EnterEnvNg(e);
+        GenExprInEnvNg(e);
+        locHead = saved;
+    }
+
+    // 缺口四 a: strtod in the emitter's own process, then a raw-memory
+    // roundtrip turns the double (bits in x0 per the internal value
+    // model) into the i64 immediate LoadImm emits directly.
+    long DblBitsOf(string txt) {
+        nint buf = NgenDblEnv.Alloc(8);
+        Span<double> dv = new Span<double>(buf, 1);
+        dv[0] = NgenDblEnv.StrToD(txt, 0);
+        Span<long> lv = new Span<long>(buf, 1);
+        long bits = lv[0];
+        NgenDblEnv.Free(buf);
+        return bits;
+    }
+
+    // x is T / x is null. With single inheritance the receiver's static type
+    // decides statically whenever the target is equal to or a base of it
+    // (any instance of the receiver is then also a T, so only null fails).
+    // When the receiver's type is a strict base of T the object's runtime
+    // class has to be consulted via the site stamped by 'new'; unrelated
+    // static types answer false, like gen0.
+    // switch expression: `scrutinee switch { pat => result, ... }`. The
+    // scrutinee evaluates exactly once and stays pushed on the machine
+    // stack; every arm peeks at it through [sp], so a failed pattern or a
+    // failed `when` guard falls through to later arms with the value
+    // intact. The winning arm's result lands in x0, then the scrutinee pop
+    // discards into x1. Type-pattern bindings are pre-stamped frame slots
+    // (StampPatternBindings); the store peeks so the next arm can re-bind
+    // the same scrutinee when a guard fails.
+    void GenSwitchExpr(Node e) {
+        GenExpr(e.a);                                    // x0 = scrutinee
+        XPushV0();                                  // push scrutinee
+        int endL = NL();
+        string sst = StaticTyOf(e.a);
+        int i = 0;
+        while (i < e.kids.Count) {
+            Node arm = e.kids[i];
+            int nextL = NL();
+            if (arm.a == null && arm.ival == 0) {
+                // `_` discard: matches unconditionally
+            } else if (arm.ival == 1) {
+                LdrU(0, 31, 0);                          // x0 = scrutinee (peek)
+                EmitTypeTestNg(arm.type != null ? arm.type.sval : null, sst);
+                EmitCBZ(0, nextL);                       // no match: next arm
+                if (arm.sval != null) {
+                    int li = LocalIdx(arm.sval);
+                    if (li >= 0) {
+                        LdrU(1, 31, 0);                  // x1 = scrutinee
+                        StoreLocal(li, 1);               // bind
+                    }
+                }
+            } else if (arm.a != null && arm.a.kind == AK.NullLit()) {
+                LdrU(1, 31, 0);                          // x1 = scrutinee
+                E4(0xEB1F003F);                          // cmp x1, xzr
+                EmitCbnz(1, nextL);                      // non-null: next arm
+            } else if (arm.op == TK.Less() || arm.op == TK.Greater()
+                    || arm.op == TK.LessEq() || arm.op == TK.GreaterEq()) {
+                LdrU(1, 31, 0);                          // x1 = scrutinee
+                GenExpr(arm.a);                          // x0 = bound
+                CmpRR(1, 0);                          // cmp x1, x0
+                int skip = 11;
+                if (arm.op == TK.Less()) { skip = 10; }          // b.ge
+                else if (arm.op == TK.Greater()) { skip = 13; }  // b.le
+                else if (arm.op == TK.LessEq()) { skip = 12; }   // b.gt
+                EmitBcond(skip, nextL);
+            } else if (arm.a != null) {
+                LdrU(1, 31, 0);                          // x1 = scrutinee
+                GenExpr(arm.a);                          // x0 = constant
+                CmpRR(1, 0);                          // cmp x1, x0
+                EmitBcond(1, nextL);                     // b.ne: next arm
+            }
+            if (arm.c != null) {
+                GenExpr(arm.c);                          // `when` guard
+                EmitCBZ(0, nextL);                       // false: next arm
+            }
+            GenExpr(arm.b);                              // x0 = arm result
+            if (IsDblExpr(e) && !IsDblExpr(arm.b)) { ConvI2D(); }
+            XPopV(1);                              // pop scrutinee -> x1
+            EmitB(endL);
+            Mark(nextL);
+            i = i + 1;
+        }
+        // no discard arm and nothing matched: the zero fallback (a null
+        // string for string results), like the zero initializer
+        XPopV(1);                                  // pop scrutinee -> x1
+        LoadImm(0, 0);
+        Mark(endL);
+    }
+
+    // tuple literal: alloc the synthesized layout and store each element
+    // (clone semantics match a field write -- strings share, structs copy)
+    void GenTupleNg(Node e) {
+        string mangled = TupleExprMangledNg(e);
+        EnsureTupleClsNg(mangled, TupleClsElemTysOfNg(mangled, e));
+        int n2 = e.kids.Count;
+        LoadImm(0, n2 * 8 + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                     // x0 = zeroed payload
+        XPushV0();                                  // hold the payload
+        int i = 0;
+        while (i < e.kids.Count) {
+            GenExpr(e.kids[i]);                          // x0 = element
+            GenCloneIfStruct(e.kids[i]);
+            LdrU(1, 31, 0);                              // x1 = payload (peek;
+                                                         //  element eval pushes
+                                                         //  are balanced)
+            StrU(0, 1, 8 * i);                           // ItemN = element
+            i = i + 1;
+        }
+        XPopV(0);                                  // pop payload -> x0
+    }
+
+    // the element types a registered tuple class was built with, computed
+    // from the literal when the class lookup loses the race (both paths
+    // mangle identically, so this only fires on inference-order edges)
+    List<string> TupleClsElemTysOfNg(string mangled, Node lit) {
+        Cls c = FindClass(mangled);
+        if (c != null) {
+            List<string> fs = new List<string>();
+            int i = 0;
+            while (i < c.flds.Count) { fs.Add(c.flds[i].ty); i = i + 1; }
+            return fs;
+        }
+        List<string> etys = new List<string>();
+        int j = 0;
+        while (j < lit.kids.Count) { etys.Add(TupleElemTyNg(lit.kids[j])); j = j + 1; }
+        return etys;
+    }
+
+    // deconstruction: `var (a, b) = rhs;` / `(int x, int y) = rhs;` -- the
+    // rhs evaluates once to the tuple payload; slot i loads into the
+    // pre-stamped binding local
+    void GenDeconNg(Node s) {
+        GenExpr(s.b);                                    // x0 = tuple payload
+        XPushV0();                                  // hold it
+        int i = 0;
+        while (i < s.kids.Count) {
+            Node p = s.kids[i];
+            // slot by DECL NODE: the statement's env snapshot predates the
+            // bound locals, so the name chain is trimmed back here
+            int li = p.sval != null ? DeclSlotNg(p) : -1;
+            if (li >= 0) {
+                LdrU(0, 31, 0);                          // x0 = payload (peek)
+                LdrU(2, 0, 8 * i);                       // x2 = element i
+                StoreLocal(li, 2);
+            }
+            i = i + 1;
+        }
+        XPopV(1);                                  // pop payload -> x1
+    }
+
+    // the Task / Task<T> shape of an expression's static type, else null
+    string TaskTyOfNg(Node e) {
+        string t = StaticTyOf(e);
+        if (t != null && (t == "Task" || t.IndexOf("Task<") == 0)) { return t; }
+        return null;
+    }
+
+    // t.IsCompleted / t.Result property reads on a Task-typed value -- the
+    // same semantics as the call forms: the null frame of an inline-run
+    // Task.Run body is already done with result 0; Result pumps the driver
+    // until the frame completes, rethrows a captured exception, and reads
+    // frame+32
+    void GenTaskMemberRead(Node e) {
+        GenExpr(e.a);                                    // x0 = frame handle
+        int tnull = NL();
+        int tend = NL();
+        if (e.sval == "IsCompleted") {
+            CbzReg(0, tnull);
+            LdrU(0, 0, 8);                               // frame.done
+            if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                              // cmp x0, xzr
+            if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                              // cset x0, ne
+            EmitB(tend);
+            Mark(tnull);
+            LoadImm(0, 1);                               // null frame: done
+            Mark(tend);
+            return;
+        }
+        CbzReg(0, tnull);
+        XPushV0();                                  // frame stays live
+        AddImm(0, 0, 8);                                 // x0 = &frame.done
+        LoadImm(1, 1);                                   // mode 1: quiesce
+        BLInternal("_zan_co_sched_run_until");
+        PopV(9);                                  // x9 = frame
+        AsyncSubExcCheckNg();                            // Result rethrows
+        LdrU(0, 9, 32);                                  // frame.result
+        EmitB(tend);
+        Mark(tnull);
+        LoadImm(0, 0);                                   // null frame: inline-run body, no result
+        Mark(tend);
+    }
+
+    int FindStaticIdx(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return -1; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) { return cs[i]; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    int ParamCount(Node m) {
+        int n = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // i-th declared parameter of method m (this excluded), or null
+    Node ParamAt(Node m, int idx) {
+        int seen = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (seen == idx) { return m.kids[i]; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // is this expression already the params bundle (an array value)? A call
+    // whose single tail argument is the array itself passes it through
+    // unpacked, as in C#
+    bool IsArrValExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.NewExpr() && e.ival == 1) { return true; }
+        string t = StaticTyOf(e);
+        return t != null && IsArrTy(t);
+    }
+
+    // int (x0) -> double (x0), in place: the value is an integer bit pattern
+    // but the destination slot carries a double
+    void ConvI2D() {
+        // batch 29: gate removed -- the cvtsi2sd sequence below was written
+        // in the batch-22 double lane but stayed dead behind this
+        // fail-closed line; `double t = 0` and List<float>.Add(int) were
+        // the first shapes to need it
+        if (tgt86 == 1) { X4(0x2A0F48F2); X1(0xC7); } else { E4(0x9E620000); }                                  // scvtf d0, x0 / cvtsi2sd xmm0, rdi
+        if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }                                  // fmov x0, d0 / movq rdi, xmm0
+    }
+
+    // double -> float -> double round trip in x0: a float-typed value rounds
+    // to single precision on the way into any float slot and widens on the
+    // way out (registers keep the double-bit representation throughout, so
+    // this is idempotent on already-narrowed values)
+    void NarrowF32() {
+        // batch 29: sd->ss->sd round trip in xmm0 -- the same precision
+        // round as the arm64 fmov/fcvt chain, value stays in rdi's double
+        // bits
+        if (tgt86 == 1) {
+            X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7);   // movq xmm0, rdi (fmov d31, x0)
+            X3(0xF2, 0x0F, 0x5A); X1(0xC0);         // cvtsd2ss xmm0, xmm0 (fcvt s31, d31)
+            X3(0xF3, 0x0F, 0x5A); X1(0xC0);         // cvtss2sd xmm0, xmm0 (fcvt d31, s31)
+            X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7);   // movq rdi, xmm0 (fmov x0, d31)
+            return;
+        }
+        E4(0x9E67001F);                                  // fmov d31, x0
+        E4(0x1E6243FF);                                  // fcvt s31, d31
+        E4(0x1E22C3FF);                                  // fcvt d31, s31
+        E4(0x9E6603E0);                                  // fmov x0, d31
+    }
+
+    // same round trip but x0 ends holding the SINGLE bits (low 32, zero
+    // extended) -- the representation packed 4-byte array slots store
+    void NarrowF32Bits() {
+        if (tgt86 == 1) {
+            // 批38:x86 臂 = movq xmm0, rdi(双精度位型)→ cvtsd2ss →
+            // movd edi, xmm0(单精度位型落低 32)——三件编码与批37 调用臂
+            // 浮点面同一族,已由 callp 八面验证
+            X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7);            // movq xmm0, rdi
+            X3(0xF2, 0x0F, 0x5A); X1(0xC0);                  // cvtsd2ss xmm0, xmm0
+            X3(0x66, 0x0F, 0x7E); X1(0xC7);                  // movd edi, xmm0
+            return;
+        }
+        E4(0x9E67001F);                                  // fmov d31, x0
+        E4(0x1E6243FF);                                  // fcvt s31, d31
+        E4(0x1E2603E0);                                  // fmov w0, s31
+    }
+
+    // implicit int->double conversion for argument `idx` of method m when
+    // the declared parameter is double but the argument expression is not
+    void ConvArg(Node m, int idx, Node arg) {
+        Node p = ParamAt(m, idx);
+        if (p == null || p.type == null) { return; }
+        if (TryEmitConversionNg(arg, TypeFullName(p.type), false, false)) { return; }
+        string pt = TypeFullName(p.type);
+        // a nullable-value parameter boxes a raw payload into its cell (the
+        // same boundary GenConversionValueNg applies at assignments); null
+        // and already-nullable arguments ride as the null cell / pointer
+        if (pt != null && IsNulTy(pt) && !IsNulExpr(arg)) {
+            GenCloneIfStruct(arg);
+            GenNulWrap(IsDblTy(NulPayOf(pt)));
+            return;
+        }
+        if (IsDblTy(pt) && !IsDblExpr(arg)) {
+            ConvI2D();
+            if (pt == "float") { NarrowF32(); }          // float params round on entry
+            return;
+        }
+        if (pt == "float" && !IsStrExpr(arg)) { NarrowF32(); return; }
+        if (pt == "int" && !IsDblExpr(arg) && !IsStrExpr(arg)) { Sxtw0(); }     // sxtw x0, w0
+    }
+}

@@ -1,0 +1,1174 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- vtable emission for polymorphic classes ----
+    // Slots are matched by name AND parameter tags so overloaded virtual
+    // methods each get their own slot bound to the right definition symbol.
+    void EmitVtable(Node cls) {
+        List<Node> ms = new List<Node>();
+        CollectVSlotNodes(cls, ms);
+        string s = "@" + cls.sval + "_vtable = global [" + ms.Count + " x i8*] [";
+        int i = 0;
+        while (i < ms.Count) {
+            Node sm = ms[i];
+            string tags = ParamTags(sm);
+            string impl = "";
+            Node im = null;
+            Node c = cls;
+            while (c != null) {
+                Node f = FindMethodSig(c, sm.sval, tags);
+                if (f != null && !IsAbstract(f)) { impl = c.sval; im = f; c = null; }
+                else { c = BaseClassOf(c); }
+            }
+            if (im == null) { impl = ResolveImpl(cls, sm.sval); im = FindMethodUp(cls, sm.sval); }
+            if (i > 0) { s = s + ", "; }
+            s = s + "i8* bitcast (" + MethodFnTypeThis(im, impl) + " @" + MethodSym(impl, im) + " to i8*)";
+            i = i + 1;
+        }
+        s = s + "]";
+        H(s);
+    }
+
+    // "_tag1_tag2" parameter-type signature of a method, for overload matching.
+    string ParamTags(Node m) {
+        string s = "";
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTag(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // method declared directly on cls with the given name and parameter tags
+    Node FindMethodSig(Node cls, string name, string tags) {
+        if (cls == null) { return null; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name && ParamTags(m) == tags) { return m; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    Node FindMethodUp(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            Node m = binder.FindMethod(c, name);
+            if (m != null) { return m; }
+            if (c.interfaces != null) {
+                int ii = 0;
+                while (ii < c.interfaces.Count) {
+                    string iname = c.interfaces[ii];
+                    int ilt = iname.IndexOf("<");
+                    string baseIf = ilt > 0 ? iname.Substring(0, ilt) : iname;
+                    Node iface = binder.FindType(baseIf);
+                    if (iface != null) {
+                        Node im = FindMethodUp(iface, name);
+                        if (im != null) { return im; }
+                    }
+                    ii = ii + 1;
+                }
+            }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    Node FindMethodUpSig(Node cls, string name, string tags) {
+        Node c = cls;
+        while (c != null) {
+            Node m = FindMethodSig(c, name, tags);
+            if (m != null) { return m; }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    string FindMethodImplCls(Node cls, string name, string tags) {
+        Node c = cls;
+        while (c != null) {
+            Node m = FindMethodSig(c, name, tags);
+            if (m != null && !IsAbstract(m)) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return "";
+    }
+
+    string FindMethodImplClsName(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            Node m = binder.FindMethod(c, name);
+            if (m != null && !IsAbstract(m)) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return "";
+    }
+
+    Node FindMethodImplNode(Node cls, string name, string tags) {
+        Node c = cls;
+        while (c != null) {
+            Node m = FindMethodSig(c, name, tags);
+            if (m != null && !IsAbstract(m)) { return m; }
+            c = BaseClassOf(c);
+        }
+        return FindMethodUp(cls, name);
+    }
+
+    string MethodOwner(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            if (binder.FindMethod(c, name) != null) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return "";
+    }
+
+    // The class that declares the method `m` (walking the chain from `cls`).
+    // The symbol of a call has to name the DECLARING class: an overload
+    // inherited from a base is defined under the base's name, and a name-only
+    // lookup would point the call at the derived class (no such symbol).
+    string DeclOwnerOf(Node cls, Node m) {
+        if (cls == null || m == null) { return ""; }
+        string tags = ParamTags(m);
+        Node c = cls;
+        while (c != null) {
+            Node f = FindMethodSig(c, m.sval, tags);
+            if (f != null) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return cls.sval;
+    }
+
+    // Is a method with the same parameter signature already in the list? A
+    // derived member hides a base member with the same signature, so the base
+    // one is not a separate candidate.
+    //
+    // The signature includes the TYPE-PARAMETER COUNT (C#: `M<T>(string)` and
+    // `M(string)` are different signatures -- the generic one does not hide
+    // the plain one). Without it the plain overload swallowed the generic one
+    // and `b.GetAsync<User>("k")` reached the non-generic method.
+    bool HasSameSig(List<Node> cands, Node m) {
+        string tags = SigTags(m);
+        int i = 0;
+        while (i < cands.Count) {
+            if (SigTags(cands[i]) == tags) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // The signature of a method: its type-parameter count plus its parameter
+    // types. Used for the hiding rule only -- the emitted symbols keep their
+    // own naming (MethodSym).
+    string SigTags(Node m) {
+        return "T" + TParams(m).Count + ParamTags(m);
+    }
+
+    // Does the method accept this many positional arguments? A `params` tail
+    // array takes the arguments the fixed parameters do not.
+    bool AcceptsArity(Node m, int argc) {        if (m == null) { return false; }
+        int tot = 0; int req = 0; int j = 0;
+        Node lastP = null;
+        while (j < m.kids.Count) {
+            if (m.kids[j].kind == AK.Param()) {
+                tot = tot + 1;
+                if (m.kids[j].b == null) { req = req + 1; }
+                lastP = m.kids[j];
+            }
+            j = j + 1;
+        }
+        bool vparams = lastP != null && lastP.op == 1;
+        if (argc >= req && argc <= tot) { return true; }
+        if (vparams && argc >= req - 1) { return true; }
+        return false;
+    }
+
+    // Number of methods named `name` declared directly in `cls`.
+    int MethodCount(Node cls, string name) {
+        if (cls == null) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // A type name reduced to a symbol-safe tag for overload mangling.
+    // The ARRAY RANK and the NULLABLE flag are part of the tag: without them
+    // `op_call(self, int)` and `op_call(self, params int[])` share a
+    // signature, the second is dropped as a duplicate overload and the call
+    // with a packed argument list finds no candidate.
+    string TypeTag(Node t) {
+        if (t == null) { return "v"; }
+        if (t.sval == "") { return "v"; }
+        string s = t.sval;
+        int ranks = 0;
+        if (s.EndsWith("[]")) { s = s.Substring(0, s.Length - 2); ranks = 1; }
+        int i = 0;
+        while (i < t.kids.Count) { s = s + "." + TypeTag(t.kids[i]); i = i + 1; }
+        if (t.op == 1) { s = s + "?"; }
+        int r = ranks + t.ival;
+        while (r > 0) { s = s + "A"; r = r - 1; }
+        return s;
+    }
+
+    // does a type reference mention an unbound generic type parameter?
+    bool MentionsTypeParam(Node t) {
+        if (t == null) { return false; }
+        if (binder.IsTypeParam(t.sval)) { return true; }
+        int i = 0;
+        while (i < t.kids.Count) { if (MentionsTypeParam(t.kids[i])) { return true; } i = i + 1; }
+        return false;
+    }
+
+    // static type of an expression-bodied lambda's result, with its typed
+    // parameters visible (only same-name parameter references are resolved).
+    Node LambdaRetType(Node lam) {
+        if (lam == null || lam.a == null) { return null; }
+        Node b = lam.a;
+        if (b.kind == AK.Ident()) {
+            int i = 0;
+            while (i < lam.kids.Count) {
+                Node p = lam.kids[i];
+                if (p.kind == AK.Param() && p.sval == b.sval) { return p.type; }
+                i = i + 1;
+            }
+            return null;
+        }
+        return ArgTypeNode(b);
+    }
+
+    // The LLVM symbol for a method. Non-overloaded names stay `Owner_Name`
+    // (so all existing output -- including the self-host fixed point, which
+    // has no overloads -- is unchanged); an overloaded name gains an arity and
+    // per-parameter-type suffix so each overload is a distinct definition.
+    string MethodSym(string owner, Node m) {
+        if (HasMod(m, MOD.Extern())) {
+            // NativeMemory hardware helpers route to the zan_hw_* C runtime
+            // symbols (the C host's routing); inline-lowered methods never
+            // reach here because their call sites return before symbol lookup
+            if (owner == "NativeMemory") { return "zan_hw_" + ExternName(m); }
+            return ExternName(m);
+        }
+        Node oc = binder.FindType(owner);
+        if (MethodCount(oc, m.sval) <= 1) { return owner + "_" + m.sval; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(owner);
+        sb.Append("_");
+        sb.Append(m.sval);
+        sb.Append("__");
+        // a generic method carries its type parameters in the symbol: a
+        // generic overload and a plain one with the same parameter list
+        // would otherwise claim the same definition
+        List<string> mtps = TParams(m);
+        int ti = 0;
+        while (ti < mtps.Count) {
+            sb.Append("_");
+            sb.Append(mtps[ti]);
+            ti = ti + 1;
+        }
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                sb.Append("_");
+                sb.Append(TypeTag(p.type));
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // number of constructor declarations in a class (a static constructor is
+    // not an overload of `new C(...)`)
+    int CtorDeclCount(Node cls) {
+        if (cls == null) { return 0; }
+        int n = 0; int i = 0;
+        while (i < cls.kids.Count) {
+            if (cls.kids[i].kind == AK.CtorDecl() && !IsStatic(cls.kids[i])) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // Symbol for a constructor. With a single ctor this stays the historical
+    // `Type_ctor`; with overloads the parameter types are appended (mirrors
+    // MethodSym) so two ctors cannot collide on one LLVM symbol.
+    string CtorSym(string owner, Node ctor) {
+        if (CtorDeclCount(binder.FindType(owner)) <= 1) { return owner + "_ctor"; }
+        string s = owner + "_ctor__";
+        int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTag(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // The symbol of a static constructor: it takes no receiver and no
+    // arguments, so the class name is enough.
+    string StaticCtorSym(string owner) { return owner + "_sctor"; }
+
+    // A generic class' constructor is shared by every instantiation, so the
+    // collections it creates would not know their element type -- a list of
+    // objects would not own its elements, and they would be freed while the
+    // list still holds them. The C host specializes the constructor per
+    // instantiation (src/compiler/irgen_expr.c: find_generic_ctor); the
+    // self-host does the same, so `new Bag<Item>(...)` runs a body that knows
+    // the element type is Item. The specialized body is queued for emission.
+    string SpecCtorSym(string owner, Node ctor, Node instTy) {
+        Node cls = binder.FindType(owner);
+        if (cls == null) { return CtorSym(owner, ctor); }
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || instTy == null) { return CtorSym(owner, ctor); }
+        if (instTy.kids.Count != tps.Count) { return CtorSym(owner, ctor); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(CtorSym(owner, ctor));
+        sb.Append("__SPI");
+        int i = 0;
+        while (i < instTy.kids.Count) {
+            if (instTy.kids[i] == null || MentionsTypeParam(instTy.kids[i])) { return CtorSym(owner, ctor); }
+            sb.Append("_");
+            sb.Append(TypeTag(instTy.kids[i]));
+            i = i + 1;
+        }
+        string sym = sb.ToString();
+        if (IndexOfStr(specSyms, sym) < 0) {
+            specSyms.Add(sym);
+            specCtors.Add(CloneSubst(ctor, tps, instTy.kids));
+            specCtorCls.Add(cls);
+            specCtorThis.Add(instTy);
+            specCtorSyms.Add(sym);
+        }
+        return sym;
+    }
+
+    // The symbol of the constructor to CALL for `owner` inside the current
+    // instantiation: the specialized clone when the class is generic and the
+    // instantiation is concrete, the shared one otherwise.
+    string CtorCallSym(string owner, Node ctor) {
+        if (curInstCls != "" && curInstCls == owner
+            && curInstArgs != null && curInstArgs.Count > 0) {
+            Node it = new Node(AK.TypeRef());
+            it.sval = owner;
+            int i = 0;
+            while (i < curInstArgs.Count) { it.Add(curInstArgs[i]); i = i + 1; }
+            return SpecCtorSym(owner, ctor, it);
+        }
+        return CtorSym(owner, ctor);
+    }
+
+    // The parameter type of a constructor of the CURRENTLY specialized class,
+    // with the class's type arguments applied (`TextOf<T>` in `Bag<Item>` is
+    // `TextOf<Item>`): the specialized constructor takes the concrete shapes.
+    Node InstCtorParamType(Node ctor, int idx) {
+        Node t = CtorParamType(ctor, idx);
+        if (curInstCls == "" || curInstArgs == null || curInstArgs.Count == 0) { return t; }
+        if (curInstCls != curClass) { return t; }
+        return SubstTP(t, TParams(binder.FindType(curInstCls)), curInstArgs);
+    }
+
+    // ---- non-emitting argument typer (for overload resolution only) ----
+    // The method's return type with the type arguments applied: the receiver's
+    // concrete instantiation binds the CLASS's type parameters (`Pool<string>`
+    // -> T = string), the explicit type arguments bind the METHOD's
+    // (`Get<int>(x)` -> U = int). The C host's checker substitutes the same
+    // way (checker.c:2880) -- without it an awaited `T` stayed erased and the
+    // value was printed as an integer.
+    Node SubstCallType(Node m, Node recvTy, Node e) {
+        if (m == null) { return null; }
+        List<string> tns = new List<string>();
+        List<Node> trs = new List<Node>();
+        if (recvTy != null && recvTy.kids.Count > 0) {
+            Node cls = binder.FindType(recvTy.sval);
+            if (cls != null) {
+                List<string> ctps = TParams(cls);
+                int i = 0;
+                while (i < ctps.Count && i < recvTy.kids.Count) {
+                    tns.Add(ctps[i]); trs.Add(recvTy.kids[i]);
+                    i = i + 1;
+                }
+            }
+        }
+        if (recvTy == null && e != null && e.a != null && e.a.kind == AK.MemberAccess() && e.a.a != null && e.a.a.kind == AK.Ident()) {
+            Node tc = binder.FindType(e.a.a.sval);
+            if (tc != null) {
+                Node cargs = e.a.d;
+                if (cargs == null) { cargs = e.d; }
+                if (cargs != null && cargs.kids.Count > 0) {
+                    List<string> ctps = TParams(tc);
+                    int i = 0;
+                    while (i < ctps.Count && i < cargs.kids.Count) {
+                        tns.Add(ctps[i]); trs.Add(cargs.kids[i]);
+                        i = i + 1;
+                    }
+                }
+            }
+        }
+        Node targs = ExplicitTypeArgs(e);
+        if (targs != null) {
+            List<string> mtps = TParams(m);
+            int i = 0;
+            while (i < mtps.Count && i < targs.kids.Count) {
+                if (IndexOfStr(tns, mtps[i]) < 0) { tns.Add(mtps[i]); trs.Add(targs.kids[i]); }
+                i = i + 1;
+            }
+        }
+        return SubstTP(m.type, tns, trs);
+    }
+
+    // The overload a call with EXPLICIT type arguments names: the candidate
+    // whose type-parameter count matches them (the C host's rule,
+    // checker.c:1681: a candidate whose method type-parameter count differs
+    // from the call's type-argument count is not a candidate at all).
+    Node MethodForTypeArgs(Node cls, string name, Node e) {
+        Node targs = ExplicitTypeArgs(e);
+        if (targs == null || cls == null) { return null; }
+        int n = targs.kids.Count;
+        Node c = cls;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name && TParams(m).Count == n) { return m; }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    // The result type of a call: the callee's return type with the type
+    // arguments applied.
+    Node CallResultType(Node e) {
+        if (e == null) { return null; }
+        Node callee = e.a;
+        if (callee == null) { return null; }
+        Node m = null; Node recvTy = null;
+        if (callee.kind == AK.MemberAccess()) {
+            if (callee.a != null && callee.a.kind == AK.Ident() && callee.a.sval == "Math") {
+                string mn = callee.sval;
+                if (mn == "Abs") {
+                    if (e.kids.Count == 1) {
+                        Node at = ArgTypeNode(e.kids[0]);
+                        if (at != null) {
+                            if (at.sval == "double" || at.sval == "float" || at.sval == "int" || at.sval == "long" || at.sval == "short" || at.sval == "byte" || at.sval == "sbyte") {
+                                return at;
+                            }
+                            if (IsDbl(at)) { return MkType("double"); }
+                        }
+                    }
+                    return MkType("double");
+                }
+                if (mn == "Max" || mn == "Min" || mn == "Clamp") {
+                    int k = 0;
+                    bool anyDbl = false;
+                    while (k < e.kids.Count) {
+                        Node at = ArgTypeNode(e.kids[k]);
+                        if (at != null && IsDbl(at)) { anyDbl = true; }
+                        k = k + 1;
+                    }
+                    if (anyDbl) { return MkType("double"); }
+                    if (e.kids.Count > 0) {
+                        Node at0 = ArgTypeNode(e.kids[0]);
+                        if (at0 != null) { return at0; }
+                    }
+                    return MkType("int");
+                }
+                if (mn == "Sign") { return MkType("int"); }
+                return MkType("double");
+            }
+            recvTy = ArgTypeNode(callee.a);
+            Node rc = ClassOf(recvTy);
+            if (rc != null) {
+                m = MethodForTypeArgs(rc, callee.sval, e);
+                if (m == null) { m = FindMethodUp(rc, callee.sval); }
+            }
+            // a static call through a class name: `Sha1.Hash(...)`
+            if (m == null && callee.a != null && callee.a.kind == AK.Ident()) {
+                Node tc = binder.FindType(callee.a.sval);
+                if (tc != null) {
+                    m = MethodForTypeArgs(tc, callee.sval, e);
+                    if (m == null) { m = FindMethodUp(tc, callee.sval); }
+                }
+            }
+        } else if (callee.kind == AK.Ident()) {
+            Node cls = binder.FindType(curClass);
+            if (cls != null) {
+                m = MethodForTypeArgs(cls, callee.sval, e);
+                if (m == null) { m = FindMethodUp(cls, callee.sval); }
+            }
+        }
+        if (m == null) { return null; }
+        return SubstCallType(m, recvTy, e);
+    }
+
+    // The type of a floating-point literal: an f/F suffix makes it a float,
+    // no suffix (or the decimal m/M suffix, which the self-host maps to
+    // double) makes it a double -- the C host's rule (checker.c:
+    // AST_FLOAT_LITERAL -> lit_suffix ? float : double).
+    string FloatLitType(Node e) {
+        if (e != null && e.suffix == 1) { return "float"; }
+        return "double";
+    }
+
+    // Yields the static type of an argument expression without generating any
+    // IR. Returns null when the type cannot be determined; callers treat that
+    // as "compatible with anything" so nothing is mis-resolved.
+    Node ArgTypeNode(Node e) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        if (k == AK.IntLit()) { return MkType("int"); }
+        if (k == AK.FloatLit()) { return MkType(FloatLitType(e)); }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.ThisExpr()) { return CurThisTy(); }
+        if (k == AK.CastExpr()) { return e.type; }
+        if (k == AK.NewExpr()) { return e.type; }
+        if (k == AK.IsExpr()) { return MkType("bool"); }
+        if (k == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locType[li]; }
+            return FieldType(binder.FindType(curClass), e.sval);
+        }
+        if (k == AK.MemberAccess()) {
+            if (e.a != null && e.a.kind == AK.Ident()) {
+                ExprVal pc = PrimTypeConst(e.a.sval, e.sval);
+                if (pc != null) { return pc.ty; }
+                if (e.a.sval == "Math" && (e.sval == "PI" || e.sval == "E")) { return MkType("double"); }
+                Node tc = binder.FindType(e.a.sval);
+                if (tc != null) {
+                    Node sf = FindStaticField(tc, e.sval);
+                    if (sf != null) {
+                        Node sft = sf.type;
+                        Node cargs = e.d;
+                        if (cargs != null && cargs.kids.Count > 0) {
+                            List<string> ctps = TParams(tc);
+                            if (ctps.Count > 0) { sft = SubstTP(sft, ctps, cargs.kids); }
+                        }
+                        return sft;
+                    }
+                }
+            }
+            Node ot = ArgTypeNode(e.a);
+            // the C host's builtin property table (compiler/builtin_api.c):
+            // string.Length, List.Count, Dict.Count, StringBuilder.Length --
+            // and Length/Count on an array. Without these a lambda like
+            // `x => x.Length` types as "unknown" and every delegate
+            // overload scores the same, so the wrong one wins.
+            if (ot != null && ot.ival == 0) {
+                if (IsStr(ot)) {
+                    if (e.sval == "Length") { return MkType("int"); }
+                } else if (IsListType(ot)) {
+                    if (e.sval == "Count") { return MkType("int"); }
+                } else if (IsDictType(ot)) {
+                    if (e.sval == "Count") { return MkType("int"); }
+                    if (e.sval == "Keys") { return ListOf(DictKey(ot)); }
+                    if (e.sval == "Values") { return ListOf(DictVal(ot)); }
+                } else if (IsSbType(ot)) {
+                    if (e.sval == "Length") { return MkType("int"); }
+                }
+            }
+            if (ot != null && ot.ival >= 1) {
+                if (e.sval == "Length" || e.sval == "Count") { return MkType("int"); }
+            }
+            Node cls = ClassOf(ot);
+            if (cls != null) {
+                Node fty = FieldType(cls, e.sval);
+                if (fty != null) { return SubstRecvTy(fty, ot); }
+                return null;
+            }
+            return null;
+        }
+        if (k == AK.Unary()) { if (e.op == TK.Bang()) { return MkType("bool"); } return ArgTypeNode(e.a); }
+        if (k == AK.PostfixUnary()) { return ArgTypeNode(e.a); }
+        if (k == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.EqEq() || op == TK.BangEq() || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq() || op == TK.AmpAmp() || op == TK.PipePipe()) {
+                return MkType("bool");
+            }
+            Node lt = ArgTypeNode(e.a);
+            Node rt = ArgTypeNode(e.b);
+            if (IsStr(lt) || IsStr(rt)) { return MkType("string"); }
+            if (lt != null) { return lt; }
+            return rt;
+        }
+        if (k == AK.Index()) {
+            Node ot = ArgTypeNode(e.a);
+            if (ot != null) {
+                if (IsListType(ot)) { return ListElem(ot); }
+                if (ot.sval == "string") { return MkType("char"); }
+            }
+            return null;
+        }
+        if (k == AK.Call()) {
+            // the return type of the called method. Without it an argument
+            // like `b.Data()` types as "unknown", and every overload scores
+            // the same -- `Sha1.Hash(bytes, len)` then tied with
+            // `Sha1.Hash(string, len)` and the call was refused.
+            // The type arguments are applied: `GetAsync<User>(k)` is a User,
+            // not the erased type parameter.
+            return CallResultType(e);
+        }
+        if (k == AK.AwaitExpr()) {
+            // the awaited value's type: the awaited call's result type
+            return CallResultType(e.a);
+        }
+        return null;
+    }
+
+    // Full tag (including generic arguments) so e.g. List<int> vs List<double>
+    // overloads score an exact match instead of tying as ambiguous.
+    string ArgTag(Node e) { Node t = ArgTypeNode(e); if (t == null) { return ""; } return TypeTag(t); }
+
+    // The host's types_match_modulo_tp (src/compiler/irgen_expr_core.c:705):
+    // a type parameter matches anything, otherwise the names, the array
+    // ranks and the type arguments must match.
+    bool TypesMatchModuloTP(Node a, Node b) {
+        if (a == null || b == null) { return false; }
+        if (IsErasedType(a) || IsErasedType(b)) { return true; }
+        if (a.sval != b.sval) { return false; }
+        if (a.ival != b.ival) { return false; }
+        if (a.kids.Count != b.kids.Count) { return false; }
+        int i = 0;
+        while (i < a.kids.Count) {
+            if (!TypesMatchModuloTP(a.kids[i], b.kids[i])) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // The host's type_family (src/compiler/irgen_expr_core.c:727): the coarse
+    // kind of a type -- what "compatible enough" means when the exact types
+    // differ.
+    int TypeFamily(Node t) {
+        if (t == null) { return 0; }
+        string n = t.sval;
+        if (n == "bool") { return 1; }
+        if (n == "byte" || n == "short" || n == "int" || n == "long"
+            || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte"
+            || n == "char") { return 2; }
+        if (n == "float" || n == "double") { return 3; }
+        if (n == "decimal") { return 4; }
+        if (n == "string") { return 5; }
+        if (n == "object") { return 6; }
+        if (n == "List" || n == "Dict" || n == "Dictionary" || n == "StringBuilder"
+            || n == "Span" || n == "ReadOnlySpan") { return 6; }
+        Node d = binder.FindType(n);
+        if (d != null) {
+            if (d.kind == AK.EnumDecl()) { return 2; }
+            return 6;
+        }
+        return 0;
+    }
+
+    // The number of declared parameters of a method.
+    int MethodParamCount(Node m) {
+        int n = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // The method a METHOD-GROUP argument names: `Cls.Method` where Cls is a
+    // class (not a local) and Method is one of its methods. The C host's
+    // arg_method_group (src/compiler/irgen_expr_core.c:820); `arity` picks
+    // the overload (the delegate's parameter count), -1 for the first one.
+    Node ArgMethodGroup(Node arg, int arity) {
+        if (arg == null || arg.kind != AK.MemberAccess()) { return null; }
+        if (arg.a == null || arg.a.kind != AK.Ident()) { return null; }
+        if (LocalIdx(arg.a.sval) >= 0) { return null; }
+        Node cls = binder.FindType(arg.a.sval);
+        if (cls == null) { return null; }
+        if (cls.kind != AK.ClassDecl() && cls.kind != AK.StructDecl()) { return null; }
+        if (FieldIndex(cls, arg.sval) >= 0) { return null; }
+        if (arity >= 0) {
+            Node c = cls;
+            while (c != null) {
+                int i = 0;
+                while (i < c.kids.Count) {
+                    Node mm = c.kids[i];
+                    if (mm.kind == AK.MethodDecl() && mm.sval == arg.sval
+                        && MethodParamCount(mm) == arity) { return mm; }
+                    i = i + 1;
+                }
+                c = BaseClassOf(c);
+            }
+        }
+        return FindMethodUp(cls, arg.sval);
+    }
+
+    // The C host's method_group_score (src/compiler/irgen_expr_core.c:836):
+    // a method group fits a delegate-typed parameter when the arity matches;
+    // the return types must be compatible (the same type scores higher, a
+    // different family rules the candidate out). -1 means "does not fit".
+    int MethodGroupScore(Node m, Node pt) {
+        if (m == null) { return -1; }
+        if (pt == null || !IsDelegate(pt)) { return -1; }
+        if (DelegParams(pt).Count != MethodParamCount(m)) { return -1; }
+        int score = 2;
+        Node rt = m.type;
+        Node dr = DelegRet(pt);
+        if (rt != null && dr != null && !MentionsTypeParam(rt) && !MentionsTypeParam(dr)) {
+            if (TypeTag(rt) == TypeTag(dr)) { score = score + 2; }
+            else {
+                int rf = TypeFamily(rt); int df = TypeFamily(dr);
+                if (rf != df && rf != 0 && df != 0) { return -1; }
+            }
+        }
+        return score;
+    }
+
+    // The explicit type arguments of a call (`M<int>(x)`), if any.
+    Node ExplicitTypeArgs(Node e) {
+        if (e == null || e.d == null) { return null; }
+        if (e.d.kind != AK.TypeRef() || e.d.sval != "__typeargs") { return null; }
+        return e.d;
+    }
+
+    // How well candidate `m` fits the call `e`: +1 for matching the caller's
+    // static/instance context, +4 for each exact argument-type match, -1 for a
+    // known mismatch (an implicit conversion may still apply, so it is not
+    // disqualifying). Unknown argument types are neutral.
+    int ScoreCand(Node m, Node e, int argc, bool wantStatic) {
+        int score = 0;
+        if (IsStatic(m) == wantStatic) { score = score + 1; }
+        // explicit type arguments pick the generic overload: `M<int>(x)`
+        // must reach the method with one type parameter, not a plain
+        // overload with the same parameter list
+        Node targs = ExplicitTypeArgs(e);
+        if (targs != null) {
+            int ntp = TParams(m).Count;
+            if (ntp == targs.kids.Count) { score = score + 8; }
+            else { score = score - 8; }
+        }
+        int a = 0;
+        while (a < argc) {
+            Node pt = ParamTypeNode(m, a);
+            Node arg = e.kids[a];
+            if (arg.kind == AK.Lambda()) {
+                // score a lambda argument by its result type against the
+                // delegate parameter's declared return type
+                Node dd = null;
+                if (pt != null) { dd = binder.FindDelegate(pt.sval); }
+                if (dd != null) {
+                    Node lrt = LambdaRetType(arg);
+                    if (lrt != null && !MentionsTypeParam(dd.type)) {
+                        if (TypeTag(lrt) == TypeTag(dd.type)) { score = score + 4; }
+                        else { score = score - 1; }
+                    }
+                }
+                a = a + 1;
+                continue;
+            }
+            // a method group (`Cls.Method` used as a value) fits a
+            // delegate-typed parameter: the C host's method_group_score
+            Node paty = pt;
+            int parity = -1;
+            if (paty != null && IsDelegate(paty)) { parity = DelegParams(paty).Count; }
+            Node mg = ArgMethodGroup(arg, parity);
+            if (mg != null) {
+                int ms = MethodGroupScore(mg, paty);
+                if (ms > 0) { score = score + ms; }
+                a = a + 1;
+                continue;
+            }
+            Node atn = ArgTypeNode(arg);
+            if (atn != null) {
+                if (MentionsTypeParam(pt)) {
+                    // a parameter that mentions a type parameter scores only
+                    // when the argument matches it MODULO that parameter
+                    // (the C host's types_match_modulo_tp): `Col<T>` takes
+                    // `Col<Item>`, `List<Col<T>>` does not
+                    if (TypesMatchModuloTP(pt, atn)) { score = score + 3; }
+                }
+                else if (TypeTag(atn) == TypeTag(pt)) { score = score + 4; }
+                else if (!FloatDoubleCross(atn, pt)) { score = score - 1; }
+            }
+            a = a + 1;
+        }
+        return score;
+    }
+
+    // A float and a double convert into each other implicitly (the C host
+    // lets a float argument reach a double parameter): such a pair is not a
+    // mismatch -- it is just not an exact match either.
+    bool FloatDoubleCross(Node a, Node b) {
+        if (a == null || b == null) { return false; }
+        if (a.sval == "float" && b.sval == "double") { return true; }
+        if (a.sval == "double" && b.sval == "float") { return true; }
+        return false;
+    }
+
+    // Select the method named `name` in `cls` for the call `e`. With a single
+    // candidate the behaviour is unchanged (arity is not consulted, so
+    bool CallTargetsExtern(Node e) {
+        if (e == null || e.kind != AK.Call() || e.a == null) { return false; }
+        string clsName = "";
+        string methName = "";
+        if (e.a.kind == AK.Ident()) {
+            clsName = curClass;
+            methName = e.a.sval;
+        } else if (e.a.kind == AK.MemberAccess() && e.a.a != null && e.a.a.kind == AK.Ident()) {
+            clsName = e.a.a.sval;
+            methName = e.a.sval;
+        } else {
+            return false;
+        }
+        Node cls = binder.FindType(clsName);
+        if (cls == null) { return false; }
+        Node m = ResolveMethod(cls, methName, e, true);
+        if (m == null) { return false; }
+        return HasMod(m, MOD.Extern());
+    }
+
+    // default-argument calls still resolve, and the self-host fixed point --
+    // which has no overloads -- emits byte-identical IR). With several
+    // overloads we keep those whose arity admits the call, then pick the best
+    // argument-type match for the caller's static/instance context; an empty
+    // candidate set or a tie is a diagnostic.
+    Node ResolveMethod(Node cls, string name, Node e, bool wantStatic) {
+        if (cls == null) { return null; }
+        // The candidates are the class's own overloads PLUS the inherited ones:
+        // C# resolves a call over the whole hierarchy, and a derived member
+        // hides a base one only when the SIGNATURES match (`Strip.Add(string)`
+        // does not hide `Bag.Add(Bag)` -- a call with a Bag argument still
+        // reaches the base's overload). A base overload with the same
+        // signature is hidden, so it is not a candidate.
+        List<Node> cands = new List<Node>();
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name && !HasSameSig(cands, m)) { cands.Add(m); }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        if (cands.Count == 0) { return null; }
+        int argc = e.kids.Count;
+        List<Node> fit = new List<Node>();
+        int i = 0;
+        while (i < cands.Count) {
+            if (AcceptsArity(cands[i], argc)) { fit.Add(cands[i]); }
+            i = i + 1;
+        }
+        if (fit.Count == 0) {
+            diags.Error("no overload of '" + name + "' takes " + argc + " argument(s)", e.line, e.col);
+            return cands[0];
+        }
+        if (fit.Count == 1) { return fit[0]; }
+        bool anyNamed = false;
+        i = 0;
+        while (i < e.kids.Count) { if (e.kids[i].argName != "") { anyNamed = true; } i = i + 1; }
+        if (anyNamed) { return fit[0]; }
+        int mx = -2000000000;
+        List<int> sc = new List<int>();
+        i = 0;
+        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, wantStatic); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
+        int cntMax = 0;
+        Node best = fit[0];
+        i = 0;
+        while (i < fit.Count) {
+            if (sc[i] == mx) { if (cntMax == 0) { best = fit[i]; } cntMax = cntMax + 1; }
+            i = i + 1;
+        }        // The C host has NO "ambiguous call to overloaded '...'" diagnostic
+        // (grep src/compiler: no such message): it resolves the call by its
+        // own best-match rules and never refuses it. Refusing here made the
+        // self-host reject programs the host compiles, so a tie now keeps
+        // the first best-scoring candidate.
+        return best;
+    }
+
+    // Like ResolveMethod but walks base classes, matching FindMethodUp.
+    Node ResolveMethodUp(Node cls, string name, Node e, bool wantStatic) {
+        Node c = cls;
+        while (c != null) {
+            Node m = ResolveMethod(c, name, e, wantStatic);
+            if (m != null) { return m; }
+            if (c.interfaces != null) {
+                int ii = 0;
+                while (ii < c.interfaces.Count) {
+                    string iname = c.interfaces[ii];
+                    int ilt = iname.IndexOf("<");
+                    string baseIf = ilt > 0 ? iname.Substring(0, ilt) : iname;
+                    Node iface = binder.FindType(baseIf);
+                    if (iface != null) {
+                        Node im = ResolveMethodUp(iface, name, e, wantStatic);
+                        if (im != null) { return im; }
+                    }
+                    ii = ii + 1;
+                }
+            }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    // The number of arguments a constructor needs at least: the parameters
+    // without a default (a `params` array is not one of them).
+    int CtorArityMin(Node ctor) {
+        int n = 0; int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param() && p.op != 1 && p.b == null) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // The number of arguments a constructor takes at most (-1: a `params`
+    // array takes any number of them).
+    int CtorArityMax(Node ctor) {
+        int n = 0; bool variadic = false; int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) {
+                n = n + 1;
+                if (p.op == 1) { variadic = true; }
+            }
+            i = i + 1;
+        }
+        if (variadic) { return -1; }
+        return n;
+    }
+
+    // The C host's checker accepts a constructor when the argument count is
+    // within its arity range (a `params` array takes any number).
+    bool CtorArityFits(Node ctor, int argc) {
+        if (argc < CtorArityMin(ctor)) { return false; }
+        int hi = CtorArityMax(ctor);
+        if (hi >= 0 && argc > hi) { return false; }
+        return true;
+    }
+
+    // The C host's code generator matches a constructor by its parameter
+    // count and fills the omitted trailing parameters with their defaults:
+    // a constructor fits when the arguments do not outnumber its parameters
+    // and every parameter left over has a default. A `params` array does not
+    // fit that way -- the host refuses such a call in code generation.
+    bool CtorFitsStrict(Node ctor, int argc) {
+        int seen = 0; int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) {
+                if (seen >= argc && p.b == null) { return false; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return argc <= seen;
+    }
+
+    // The number of parameters a lambda declares.
+    int LambdaArity(Node lam) {
+        int n = 0; int i = 0;
+        while (i < lam.kids.Count) {
+            if (lam.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // The C host's constructor selection (src/compiler/irgen_expr_core.c:
+    // find_ctor) rules a constructor OUT when an argument does not fit its
+    // parameter: a lambda fits only a delegate-typed parameter whose
+    // parameter count matches the lambda's arity, and a method group fits
+    // only a delegate-typed parameter it can be converted to. Without that
+    // rule a `Bag<T>(List<string>)` overload swallows the lambda argument of
+    // `new Bag<Item>(i => i.name)`, the lambda's parameter stays untyped and
+    // its body does not compile.
+    bool CtorArgFits(Node ctor, Node e) {
+        int argc = e.kids.Count;
+        int j = 0;
+        int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) {
+                if (j < argc) {
+                    Node arg = e.kids[j];
+                    Node pt = p.type;
+                    if (arg != null && arg.kind == AK.Lambda()) {
+                        if (pt == null || !IsDelegate(pt)) { return false; }
+                        if (DelegParams(pt).Count != LambdaArity(arg)) { return false; }
+                    }
+                    else {
+                        int parity = -1;
+                        if (pt != null && IsDelegate(pt)) { parity = DelegParams(pt).Count; }
+                        Node mg = ArgMethodGroup(arg, parity);
+                        if (mg != null && MethodGroupScore(mg, pt) < 0) { return false; }
+                    }
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // Select the constructor for `new C(args)`: a constructor fits when the
+    // argument count fits its parameters (the omitted trailing ones have
+    // defaults); with several fitting overloads the argument types pick the
+    // best one. `exclude` rules a ctor out (a `: this(...)` chain must not
+    // retarget itself). Returns null when nothing fits.
+    Node ResolveCtorEx(Node cls, Node e, Node exclude) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        int i = 0;
+        while (i < cls.kids.Count) {
+            if (cls.kids[i].kind == AK.CtorDecl() && !IsStatic(cls.kids[i]) && cls.kids[i] != exclude) { cands.Add(cls.kids[i]); }
+            i = i + 1;
+        }
+        if (cands.Count == 0) { return null; }
+        int argc = e.kids.Count;
+        List<Node> fit = new List<Node>();
+        i = 0;
+        while (i < cands.Count) {
+            if (CtorFitsStrict(cands[i], argc) && CtorArgFits(cands[i], e)) { fit.Add(cands[i]); }
+            i = i + 1;
+        }
+        if (fit.Count == 0) { return null; }
+        if (fit.Count == 1) { return fit[0]; }
+        int mx = -2000000000;
+        List<int> sc = new List<int>();
+        i = 0;
+        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, false); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
+        i = 0;
+        while (i < fit.Count) { if (sc[i] == mx) { return fit[i]; } i = i + 1; }
+        return fit[0];
+    }
+
+    Node ResolveCtor(Node cls, Node e) {
+        return ResolveCtorEx(cls, e, null);
+    }
+
+    // vtable slot method names, base classes first
+    void CollectVSlots(Node cls, List<string> slots) {
+        if (cls == null) { return; }
+        CollectVSlots(BaseClassOf(cls), slots);
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl()) {
+                if (IsVSlotIntro(m)) { slots.Add(m.sval); }
+                else if (IsOverride(m)) {
+                    int j = 0;
+                    bool found = false;
+                    while (j < slots.Count) {
+                        if (slots[j] == m.sval) { found = true; break; }
+                        j = j + 1;
+                    }
+                    if (!found) { slots.Add(m.sval); }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    void CollectVSlotNodes(Node cls, List<Node> ms) {
+        if (cls == null) { return; }
+        CollectVSlotNodes(BaseClassOf(cls), ms);
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl()) {
+                if (IsVSlotIntro(m)) { ms.Add(m); }
+                else if (IsOverride(m)) {
+                    string tags = ParamTags(m);
+                    int j = 0;
+                    bool found = false;
+                    while (j < ms.Count) {
+                        if (ms[j].sval == m.sval && ParamTags(ms[j]) == tags) { found = true; break; }
+                        j = j + 1;
+                    }
+                    if (!found) { ms.Add(m); }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    int VSlotIndex(Node cls, string name) {
+        List<string> slots = new List<string>();
+        CollectVSlots(cls, slots);
+        int i = 0;
+        while (i < slots.Count) { if (slots[i] == name) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // slot index of the specific overload m; falls back to a unique name match
+    int VSlotIndexM(Node cls, Node m) {
+        List<Node> ms = new List<Node>();
+        CollectVSlotNodes(cls, ms);
+        string tags = ParamTags(m);
+        int i = 0;
+        while (i < ms.Count) {
+            if (ms[i].sval == m.sval && ParamTags(ms[i]) == tags) { return i; }
+            i = i + 1;
+        }
+        int hit = 0 - 1;
+        int n = 0;
+        i = 0;
+        while (i < ms.Count) {
+            if (ms[i].sval == m.sval) { hit = i; n = n + 1; }
+            i = i + 1;
+        }
+        if (n == 1) { return hit; }
+        return -1;
+    }
+
+    // most-derived class (from cls upward) providing a concrete body for a slot.
+    // Matches explicit override AND implicit interface implementation (a plain
+    // method whose name matches an inherited abstract/virtual slot).
+    string ResolveImpl(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            Node m = binder.FindMethod(c, name);
+            if (m != null && !IsAbstract(m)) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return "";
+    }
+
+    string MethodFnTypeThis(Node m, string thisCls) {
+        // an ASYNC method's function returns the coroutine FRAME, whatever
+        // the declared result type is -- including `async void`: the ramp
+        // hands back the frame pointer, and the await needs it. Using the
+        // declared type here (void) would make the vtable entry claim a
+        // void-returning function while the definition returns i8*, and the
+        // frame pointer would be lost.
+        string rt = MapType(m.type);
+        if (IsAsync(m)) { rt = "i8*"; }
+        string ty = rt + " (%" + thisCls + "*";
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                // a by-ref parameter travels as the ADDRESS of the caller's
+                // storage (the definition's signature says so too)
+                if (p.ival == 1) { ty = ty + ", " + MapType(p.type) + "*"; }
+                else { ty = ty + ", " + MapType(p.type); }
+            }
+            i = i + 1;
+        }
+        return ty + ")*";
+    }
+
+}

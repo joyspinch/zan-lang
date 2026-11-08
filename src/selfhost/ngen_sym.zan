@@ -1,0 +1,149 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+
+// Ngen: native backend slice (M1). Emits arm64 machine code directly from the
+// bound AST — no LLVM IR text, no clang. The object container (Mach-O) lives
+// in ngen_macho.zan.
+//
+// Instruction words are stored as 32-bit two's-complement ints: Zan hex
+// literals above 0x7FFFFFFF wrap, but the bit pattern survives the wrap and
+// byte extraction takes the low 32 bits.
+//
+// Kernel subset: static methods, int params/locals/returns, int literals,
+// `+ - * <`, if/while, plain calls (recursion ok), Console.WriteLine(int).
+// Anything else is a compile error, not a silent fallback.
+
+// Open-addressed string -> insertion-ordered bucket index over the method
+// tables. Our builtin Dictionary is a linear walk (_zan_rt_dict_index), so
+// it cannot speed up the very scans it appears in; this table gives O(1)
+// key probes. Buckets chain in append order, so iteration inside a bucket
+// matches the old flat table scan exactly.
+// 缺口四 a: compile-time decimal -> IEEE-754 bits for float literals.
+// The emitter calls libc strtod in its own process (the P/Invoke stub
+// hands the result bits back in x0 under the internal value model),
+// parks them in a raw 8-byte buffer, and re-reads them as an i64
+// immediate. Replaces the lazy `dbl.N` __DATA slot: only the first
+// object of a link ever ran its static initialization, so every later
+// object's slots stayed zero and the lazy conversion fired on a null
+// literal-text pointer (the batch-8 float-value crashes).
+public class NgenDblEnv {
+    [DllImport("crt", EntryPoint="strtod")] public static extern double StrToD(string s, long endp);
+    [DllImport("crt", EntryPoint="malloc")] public static extern nint Alloc(int size);
+    [DllImport("crt", EntryPoint="free")] public static extern void Free(nint p);
+}
+
+public class MethIndex {
+    List<string> keys;
+    List<int> head;
+    List<int> tail;
+    List<int> entVal;
+    List<int> entNext;
+    List<int> slots;
+
+    public MethIndex() {
+        keys = new List<string>();
+        head = new List<int>();
+        tail = new List<int>();
+        entVal = new List<int>();
+        entNext = new List<int>();
+        slots = new List<int>();
+        int i = 0;
+        while (i < 4096) { slots.Add(-1); i = i + 1; }
+    }
+
+    int HashOf(string s) {
+        int h = 17;
+        int i = 0;
+        while (i < s.Length) { h = h * 31 + (int)s[i] + 1; i = i + 1; }
+        if (h < 0) { h = 0 - h; }
+        if (h < 0) { h = 0; }
+        return h;
+    }
+
+    // find-or-insert the key id
+    int KeyId(string k) {
+        int n = slots.Count;
+        int j = HashOf(k) % n;
+        while (slots[j] >= 0) {
+            if (keys[slots[j]] == k) { return slots[j]; }
+            j = j + 1;
+            if (j == n) { j = 0; }
+        }
+        int id = keys.Count;
+        keys.Add(k);
+        head.Add(-1);
+        tail.Add(-1);
+        slots[j] = id;
+        if (keys.Count * 2 >= n) { Rehash(); }
+        return id;
+    }
+
+    void Rehash() {
+        List<string> oldKeys = keys;
+        slots = new List<int>();
+        int n = oldKeys.Count * 8 + 1;
+        int i = 0;
+        while (i < n) { slots.Add(-1); i = i + 1; }
+        int q = 0;
+        while (q < oldKeys.Count) {
+            int j = HashOf(oldKeys[q]) % n;
+            while (slots[j] >= 0) { j = j + 1; if (j == n) { j = 0; } }
+            slots[j] = q;
+            q = q + 1;
+        }
+    }
+
+    public void Add(string k, int v) {
+        int id = KeyId(k);
+        int e = entVal.Count;
+        entVal.Add(v);
+        entNext.Add(-1);
+        if (tail[id] < 0) { head[id] = e; } else { entNext[tail[id]] = e; }
+        tail[id] = e;
+    }
+
+    // method indices for k in insertion order, or null on miss
+    public List<int> Get(string k) {
+        int n = slots.Count;
+        int j = HashOf(k) % n;
+        while (slots[j] >= 0) {
+            if (keys[slots[j]] == k) {
+                List<int> r = new List<int>();
+                int e = head[slots[j]];
+                while (e >= 0) { r.Add(entVal[e]); e = entNext[e]; }
+                return r;
+            }
+            j = j + 1;
+            if (j == n) { j = 0; }
+        }
+        return null;
+    }
+}
+
+public class Fixup {
+    public int pos;    // text offset of the patched instruction
+    public int kind;   // 0=B 1=CBZ 2=Bcond 3=BL-internal 4=BL-extern 5=TBZ/TBNZ
+    public int lbl;    // label id (kinds 0-2)
+    public int cond;   // cond code (kind 2)
+    public string sym; // target symbol (kinds 3-4)
+    public Fixup(int p, int k, int l, int c, string s) {
+        pos = p; kind = k; lbl = l; cond = c; sym = s;
+    }
+}
+
+public class StrRef {
+    public int adrpPos;  // text offset of the adrp instruction
+    public int addPos;   // text offset of the add/ldr instruction
+    public string sym;   // target symbol name (l_.str.N / l_.g.NAME / __stdinp)
+    public int got;      // 1: adrp + ldr through the homemade __nl_symbol_ptr
+                         //    slot (dylib data symbols)
+    public StrRef(int a, int b, string s) { adrpPos = a; addPos = b; sym = s; got = 0; }
+}
+
+public class Sym {
+    public string name;  // link-time symbol name (underscore prefixed)
+    public int pos;      // text offset of the definition
+    public Sym(string n, int p) { name = n; pos = p; }
+}

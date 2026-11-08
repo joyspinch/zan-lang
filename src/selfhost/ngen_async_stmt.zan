@@ -1,0 +1,1130 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    // statement walker for the async body: awaits only suspend at statement
+    // heads; everything else is ordinary emission or a diagnostic
+    void GenAsyncStmtNg(Node s) {
+        if (s == null) { return; }
+        if (s.line > 0) { curLine = s.line; curCol = s.col; }
+        // mirror GenStmt's env discipline: ReserveLocals restored locHead to
+        // the pre-body chain, so without this the type helpers below (and
+        // anything running before the first GenExpr of the statement) cannot
+        // see the method's user locals
+        int savedEnv = EnterEnvNg(s);
+        int k = s.kind;
+        if (k == AK.Block()) {
+            int i = 0;
+            while (i < s.kids.Count) { GenAsyncStmtNg(s.kids[i]); i = i + 1; }
+        } else if (k == AK.VarDecl()) {
+            if (HeadsAwait(s.b)) {
+                HoistAllAwaitsNg(s.b.a);             // nested awaits inside the target
+                EmitAwaitNg(s.b, true);
+                StoreDeclValNg(s);
+            } else if (CountAwaitExprsNg(s.b) > 0) {
+                HoistAllAwaitsNg(s.b);               // ANF: lift, then emit plainly
+                GenStmt(s);
+            } else {
+                GenStmt(s);
+            }
+        } else if (k == AK.ReturnStmt()) {
+            if (HeadsAwait(s.a)) {
+                HoistAllAwaitsNg(s.a.a);
+                EmitAwaitNg(s.a, true);
+            } else if (CountAwaitExprsNg(s.a) > 0) {
+                HoistAllAwaitsNg(s.a);
+                GenConversionValueNg(s.a, AsyncElemTyOfMethod(curMeth));
+            } else if (s.a != null) {
+                string el = AsyncElemTyOfMethod(curMeth);
+                GenConversionValueNg(s.a, el);
+            } else {
+                LoadImm(0, 0);
+            }
+            if (finBodies.Count > 0 || asyncTryCatchLs.Count > 0) {
+                // the result survives every finally this return runs (they may
+                // suspend, so the scratch lives in the frame's saved set)
+                StoreLocal(asyncFinRetLocal, 0);
+                List<int> savedC = new List<int>();
+                List<int> savedF = new List<int>();
+                int si = 0;
+                while (si < asyncTryCatchLs.Count) { savedC.Add(asyncTryCatchLs[si]); si = si + 1; }
+                si = 0;
+                while (si < asyncTryFinLs.Count) { savedF.Add(asyncTryFinLs[si]); si = si + 1; }
+
+                while (asyncTryFinLs.Count > 0) {
+                    int finIdx = asyncTryFinLs[asyncTryFinLs.Count - 1];
+                    asyncTryFinLs.RemoveAt(asyncTryFinLs.Count - 1);
+                    if (asyncTryCatchLs.Count > 0) {
+                        asyncTryCatchLs.RemoveAt(asyncTryCatchLs.Count - 1);
+                    }
+                    AsyncTopSetNg();
+                    if (FinIsActive(finIdx)) {
+                        continue;
+                    }
+                    if (finIdx >= 0 && finIdx < finBodies.Count && finBodies[finIdx] != null) {
+                        finActive.Add(finIdx);
+                        int savedFinCur = finCur;
+                        finCur = finIdx;
+                        EmitAsyncFinallyBodyNg(finBodies[finIdx]);
+                        finCur = savedFinCur;
+                        finActive.RemoveAt(finActive.Count - 1);
+                    }
+                }
+                LoadLocal(asyncFinRetLocal, 0);
+                asyncTryCatchLs = savedC;
+                asyncTryFinLs = savedF;
+            }
+            EmitAsyncCompleteNg();
+        } else if (k == AK.ExprStmt()) {
+            Node e = s.a;
+            if (HeadsAwait(e)) {
+                HoistAllAwaitsNg(e.a);               // nested awaits in the target args
+                EmitAwaitNg(e, false);               // result discarded
+            } else if (e != null && e.kind == AK.Assignment() && HeadsAwait(e.b)
+                    && e.op == TK.Eq()) {
+                int savedH = EnterEnvNg(e);          // the store resolves names
+                HoistAllAwaitsNg(e.a);               // in the statement's own
+                HoistAllAwaitsNg(e.b.a);             // scope (GenStmt's rule)
+                EmitAwaitNg(e.b, true);
+                AsyncStoreNg(e.a, e);
+                locHead = savedH;
+            } else if (e != null && CountAwaitExprsNg(e) > 0) {
+                HoistAllAwaitsNg(e);                 // ANF: lift, then emit plainly
+                if (PrepareAsyncStmtNg(s)) {
+                    // detached async call (same lowering as the root hook)
+                } else {
+                    GenStmt(s);
+                }
+            } else if (PrepareAsyncStmtNg(s)) {
+                // detached async call (same lowering as the root hook)
+            } else {
+                GenStmt(s);
+            }
+        } else if (k == AK.IfStmt()) {
+            int els = NL(); int end = NL();
+            HoistAllAwaitsNg(s.a);                   // condition awaits suspend first
+            GenExpr(s.a);
+            EmitCBZ(0, els);
+            GenAsyncStmtNg(s.b);
+            EmitB(end);
+            Mark(els);
+            if (s.c != null) { GenAsyncStmtNg(s.c); }
+            Mark(end);
+        } else if (k == AK.WhileStmt()) {
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            asyncCntTryBase.Add(asyncTryFinLs.Count);
+            Mark(top);
+            HoistAllAwaitsNg(s.a);                   // re-suspends on every iteration
+            GenExpr(s.a);
+            EmitCBZ(0, outL);
+            GenAsyncStmtNg(s.b);
+            Mark(cnt);
+            EmitB(top);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            asyncCntTryBase.RemoveAt(asyncCntTryBase.Count - 1);
+        } else if (k == AK.DoWhileStmt()) {
+            // do body while (cond);: the continue point is the condition,
+            // with awaits hoisted before evaluating the condition each iteration
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            asyncCntTryBase.Add(asyncTryFinLs.Count);
+            Mark(top);
+            GenAsyncStmtNg(s.b);
+            Mark(cnt);
+            HoistAllAwaitsNg(s.a);
+            GenExpr(s.a);
+            EmitCBZ(0, outL);
+            EmitB(top);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            asyncCntTryBase.RemoveAt(asyncCntTryBase.Count - 1);
+        } else if (k == AK.ForStmt()) {
+            // for (init; cond; step) body: init runs once, the condition
+            // guards the top (its awaits re-suspend every iteration), the
+            // step runs at the continue point before looping back
+            if (s.a != null) { GenAsyncStmtNg(s.a); }
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            asyncCntTryBase.Add(asyncTryFinLs.Count);
+            Mark(top);
+            if (s.b != null) {
+                HoistAllAwaitsNg(s.b);
+                GenExpr(s.b);
+                EmitCBZ(0, outL);
+            }
+            GenAsyncStmtNg(s.d);
+            Mark(cnt);
+            if (s.c != null) {
+                HoistAllAwaitsNg(s.c);
+                GenExpr(s.c);
+            }
+            EmitB(top);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            asyncCntTryBase.RemoveAt(asyncCntTryBase.Count - 1);
+        } else if (k == AK.ForeachStmt()) {
+            // foreach (T x in coll) body with the collection in a frame slot:
+            // the sync lane keeps it on the machine stack across the body,
+            // which a suspension would discard
+            Node coll = s.b;
+            // a user GetEnumerator collection: the enumerator object is the
+            // frame-resident slot (re-calling GetEnumerator per iteration
+            // would reset it); MoveNext/Current are plain calls
+            int protoMi = FeProtoEnumMi(coll);
+            if (protoMi >= 0) {
+                string ec = methNodes[protoMi].type != null ? TypeFullName(methNodes[protoMi].type) : null;
+                int mvMi = ec != null ? FeProtoMethodUp(ec, "MoveNext", 0) : -1;
+                int cuMi = ec != null ? FeProtoCurMi(ec) : -1;
+                int elemVar = DeclSlotNg(s);
+                int collSlot = AsyncFeSlotNg(s);
+                int top = NL(); int outL = NL(); int cnt = NL();
+                brkL.Add(outL); cntL.Add(cnt);
+                brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+                cntFinBase.Add(finBodies.Count);
+                asyncBrkTryBase.Add(asyncTryFinLs.Count);
+                asyncCntTryBase.Add(asyncTryFinLs.Count);
+                HoistAllAwaitsNg(coll);
+                GenExpr(coll);
+                BLInternal(MethSymNg(methCls[protoMi], methNodes[protoMi]));
+                StoreLocal(collSlot, 0);             // frame-resident enumerator
+                Mark(top);
+                LoadLocal(collSlot, 0);
+                BLInternal(MethSymNg(methCls[mvMi], methNodes[mvMi]));
+                CbzReg(0, outL);
+                LoadLocal(collSlot, 0);
+                BLInternal(MethSymNg(methCls[cuMi], methNodes[cuMi]));
+                StoreLocal(elemVar, 0);
+                GenAsyncStmtNg(s.c);
+                Mark(cnt);
+                EmitB(top);
+                Mark(outL);
+                brkL.RemoveAt(brkL.Count - 1);
+                cntL.RemoveAt(cntL.Count - 1);
+                brkLoop.RemoveAt(brkLoop.Count - 1);
+                brkFinBase.RemoveAt(brkFinBase.Count - 1);
+                cntFinBase.RemoveAt(cntFinBase.Count - 1);
+                asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+                asyncCntTryBase.RemoveAt(asyncCntTryBase.Count - 1);
+                return;
+            }
+            bool isArr = IsArrExpr(coll);
+            bool isStr = !isArr && IsStrExpr(coll);
+            int esz = isArr ? ArrElemSize(ArrTyOf(coll)) : 8;
+            int elemVar = DeclSlotNg(s);
+            int idxVar = elemVar + 1;                // this foreach's hidden index
+            int collSlot = AsyncFeSlotNg(s);
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            asyncCntTryBase.Add(asyncTryFinLs.Count);
+            LoadImm(0, 0);
+            StoreLocal(idxVar, 0);
+            Mark(top);
+            HoistAllAwaitsNg(coll);                  // collection awaits re-suspend
+            GenExpr(coll);
+            StoreLocal(collSlot, 0);
+            LoadLocal(collSlot, 0);
+            if (isArr) {
+                if (tgt86 == 1) { LdrU(2, 0, -16); } else { E4(0xF85F0002); }   // ldur x2, [x0, #-16] (len)
+            } else if (isStr) {
+                E4(0xD1002002);                      // sub x2, x0, #8
+                E4(0xF9400042);                      // ldr x2, [x2]
+                E4(0xD3407C42);                      // ubfm x2, x2, #0, #31
+            } else {
+                LdrU(2, 0, 0);                       // x2 = count
+            }
+            LoadLocal(idxVar, 0);                    // x0 = i
+            E4(0xEB02001F);                          // cmp x0, x2
+            int outGe = NL();
+            EmitBcond(10, outGe);                    // b.ge out
+            LoadLocal(collSlot, 2);                  // x2 = coll
+            if (isArr && esz == 4) {
+                E4(0xB8A07840);                      // ldrsw x0, [x2, x0, lsl #2]
+            } else if (isArr) {
+                E4(0xF8607840);                      // ldr x0, [x2, x0, lsl #3]
+            } else if (isStr) {
+                E4(0x38606840);                      // ldrb w0, [x2, x0]
+            } else {
+                LdrU(3, 2, 16);                      // x3 = data
+                E4(0xF8607860);                      // ldr x0, [x3, x0, lsl #3]
+            }
+            StoreLocal(elemVar, 0);
+            GenAsyncStmtNg(s.c);
+            Mark(cnt);
+            LoadLocal(idxVar, 0);
+            AddImm(0, 0, 1);
+            StoreLocal(idxVar, 0);
+            EmitB(top);
+            Mark(outGe);
+            EmitB(outL);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            asyncCntTryBase.RemoveAt(asyncCntTryBase.Count - 1);
+        } else if (k == AK.SwitchStmt()) {
+            // switch with the discriminant in a frame slot: a case body may
+            // suspend, and the sync lane's machine-stack slot would not
+            // survive the round trip
+            int swSlot = AsyncSwSlotNg(s);
+            int endL = NL();
+            int defL = NL();
+            HoistAllAwaitsNg(s.a);
+            GenExpr(s.a);
+            StoreLocal(swSlot, 0);
+            int nc = s.kids.Count;
+            int[] bodies = new int[nc];
+            int defIdx = -1;
+            int i = 0;
+            while (i < nc) {
+                Node c = s.kids[i];
+                if (c.a == null) { defIdx = i; i = i + 1; continue; }
+                bodies[i] = NL();
+                HoistAllAwaitsNg(c.a);
+                GenExpr(c.a);                        // x0 = case label
+                if (IsStrExpr(s.a)) {
+                    LoadLocal(swSlot, 1);            // x1 = discriminant
+                    BLExtern("_strcmp");
+                    CmpRR(0, 31);                  // cmp x0, xzr
+                } else {
+                    LoadLocal(swSlot, 1);            // x1 = discriminant
+                    CmpRR(0, 1);                  // cmp x0, x1
+                }
+                EmitBcond(0, bodies[i]);             // b.eq body
+                i = i + 1;
+            }
+            EmitB(defIdx >= 0 ? defL : endL);
+            brkL.Add(endL);
+            brkLoop.Add(false); brkFinBase.Add(finBodies.Count);
+            asyncBrkTryBase.Add(asyncTryFinLs.Count);
+            i = 0;
+            while (i < nc) {
+                Node c = s.kids[i];
+                if (c.a == null) { i = i + 1; continue; }
+                Mark(bodies[i]);
+                GenAsyncStmtNg(c.b);
+                // an empty case body falls through to the next case (C# rule);
+                // only a body that emitted code needs the jump to the exit
+                if (c.b == null || c.b.kids.Count > 0) { EmitB(endL); }
+                i = i + 1;
+            }
+            if (defIdx >= 0) {
+                Mark(defL);
+                GenAsyncStmtNg(s.kids[defIdx].b);
+                EmitB(endL);
+            }
+            brkL.RemoveAt(brkL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            asyncBrkTryBase.RemoveAt(asyncBrkTryBase.Count - 1);
+            Mark(endL);
+        } else if (k == AK.BreakStmt()) {
+            if (brkL.Count == 0) {
+                diags.Error("ngen: break outside loop", s.line, s.col);
+            } else {
+                AsyncTransferNg(brkFinBase[brkFinBase.Count - 1],
+                        asyncBrkTryBase[asyncBrkTryBase.Count - 1]);
+                EmitB(brkL[brkL.Count - 1]);
+            }
+        } else if (k == AK.ContinueStmt()) {
+            if (cntL.Count == 0) {
+                diags.Error("ngen: continue outside loop", s.line, s.col);
+            } else {
+                AsyncTransferNg(cntFinBase[cntFinBase.Count - 1],
+                        asyncCntTryBase[asyncCntTryBase.Count - 1]);
+                EmitB(cntL[cntL.Count - 1]);
+            }
+        } else if (k == AK.ThrowStmt()) {
+            if (s.a != null) {
+                GenExpr(s.a);
+            } else {
+                // bare rethrow: the owning catch clause's OWN exception (a
+                // nested try inside the clause body overwrites the in-flight
+                // global; the reference keeps the original per clause), else
+                // the in-flight exception in the state block
+                if (clauseExcOpen.Count > 0) {
+                    LoadLocal(clauseExcOpen[clauseExcOpen.Count - 1], 0);
+                } else {
+                    BLInternal("_zan_rt_eh_state");
+                    LdrU(0, 0, 8);
+                }
+            }
+            StoreLocal(asyncFinExcLocal, 0);
+            AsyncRunFinsNg(0, true);                 // finallys of abandoned catches
+            BLInternal("_zan_rt_eh_state");
+            MovRR(1, 0);
+            LoadLocal(asyncFinExcLocal, 2);          // exception value
+            StrU(2, 1, 8);                           // state->exc = value
+            EhRethrowNg();
+        } else if (k == AK.LockStmt()) {
+            // lock inside an async body: the same desugar as GenLockStmt,
+            // but the try/finally must ride the async lane -- the sync
+            // lane's ehTopLocal/ehBaseLocal/ehBrkLocal name slots from
+            // whatever non-async method emitted last, and the finally has
+            // to stay suspendable (EmitAsyncTryNg / ArmAsyncTryBufNg)
+            string vt2 = InferExprTyNg(s.a);
+            if (!TryGenBindingValue(s.a, vt2)) { GenConversionValueNg(s.a, vt2); }
+            StoreLocal(DeclSlotNg(s.c), 0);
+            BLExtern("_zan_monitor_enter");          // x0 = obj
+            Node fin2 = new Node(AK.MonitorExitStmt());
+            fin2.a = s.c;
+            Node t2 = new Node(AK.TryStmt());
+            t2.a = s.b;
+            t2.b = null;
+            t2.c = fin2;
+            t2.d = s;
+            EmitAsyncTryNg(t2);
+        } else if (k == AK.TryStmt()) {
+            EmitAsyncTryNg(s);
+        } else if (k == AK.LabelStmt()) {
+            Mark(GotoLabelId(s.sval));
+        } else if (k == AK.GotoStmt()) {
+            int targetFin = AsyncGotoFinDepth(s.sval);
+            int targetTry = AsyncGotoTryDepth(s.sval);
+            if (targetFin >= 0 && targetTry >= 0) {
+                AsyncTransferNg(targetFin, targetTry);
+            }
+            EmitB(GotoLabelId(s.sval));
+        } else {
+            GenStmt(s);                              // plain decl
+        }
+        locHead = savedEnv;
+    }
+
+    // park the exception a completed sub carries in frame[6] into the runtime
+    // EH state and unwind (shared by the root drive and... nothing else; the
+    // in-body await rethrows inline in EmitAwaitNg)
+    void AsyncSubExcCheckNg() {
+        int nullL = NL();
+        CbzReg(9, nullL);
+        LdrU(1, 9, 48);                              // sub.exc
+        int okL = NL();
+        EmitCBZ(1, okL);
+        PushV(1);                              // hold the exception
+        BLInternal("_zan_rt_eh_state");
+        MovRR(1, 0);
+        PopV(2);
+        StrU(2, 1, 8);                               // state->exc = exc
+        EhRethrowNg();
+        Mark(okL);
+        Mark(nullL);
+    }
+
+    // ---- Hook A: `await <async call>` in expression position ----
+    // Inside an async body only statement-head awaits suspend, so this
+    // diagnoses; at a non-async root it lowers the reference's synchronous
+    // root drive (irgen_expr.c:8557-8580).
+    bool TryGenAwaitExprNg(Node e) {
+        if (e == null || e.kind != AK.AwaitExpr()) { return false; }
+        if (IsTaskDelayNg(e.a)) {
+            diags.Error("ngen: 'await Task.Delay(...)' is only supported as a discard statement (`await Task.Delay(ms);`) inside an async method", e.line, e.col);
+            LoadImm(0, 0);
+            return true;
+        }
+        if (IsTaskYieldNg(e.a)) {
+            diags.Error("ngen: 'await Task.Yield()' is only supported as a discard statement (`await Task.Yield();`) inside an async method", e.line, e.col);
+            LoadImm(0, 0);
+            return true;
+        }
+        if (inAsyncNg) {
+            int hi = HoistIndexNg(e);
+            if (hi >= 0) {
+                LoadLocal(asyncFrameLocal, 9);       // ANF: hoisted before the head
+                LdrU(0, 9, hoistSlots[hi]);          // result parked in its sub slot
+                return true;
+            }
+            diags.Error("ngen: 'await' must be the whole initializer / right-hand side of a statement inside an async method", e.line, e.col);
+            LoadImm(0, 0);
+            return true;
+        }
+        Node inner = e.a;
+        string st = StaticTyOf(inner);
+        bool isTaskVal = st != null && (st == "Task" || st == "ValueTask"
+                || st.IndexOf("Task<") == 0 || st.IndexOf("ValueTask<") == 0);
+        int mi = -1;
+        if (isTaskVal) {
+            mi = -2;
+        } else {
+            if (inner == null) {
+                diags.Error("ngen: 'await' target is null", e.line, e.col);
+                LoadImm(0, 0);
+                return true;
+            }
+            if (BlockingExternMiNg(inner) >= 0) {
+                // the reference rejects these outside an async method outright
+                // (emit_await_blocking_extern needs a frame to suspend)
+                diags.Error("ngen: awaited native extern calls are only supported inside an async method", e.line, e.col);
+                LoadImm(0, 0);
+                return true;
+            }
+            mi = AsyncResolveCallNg(inner);
+            if (mi == -1 && IsDelegateCalleeNg(inner)) { mi = -2; }
+            if (mi == -1) {
+                diags.Error("ngen: 'await' of this expression is not supported by the native backend (only calls to non-generic async methods) [" + asyncWhyNg + "]", e.line, e.col);
+                LoadImm(0, 0);
+                return true;
+            }
+        }
+        EnsureAsyncRuntimeNg();
+        EmitAsyncCallNg(mi, mi, inner);              // x0 = sub frame
+        MovRR(9, 0);
+        int rootDone = NL();
+        CbzReg(9, rootDone);                         // null frame: already done
+        LdrU(1, 9, 8);                               // sub.done
+        CbnzReg(1, rootDone);                        // sub.done != 0: fast path!
+        XPushR(9);                              // hold sub: the driver
+        if (mi >= 0) {
+            LoadSymRef(AsyncResumeSymNg(mi), 1);     // calls clobber x9
+        } else {
+            LdrU(1, 9, 40);                          // dispatched: the ramp's own resume
+        }
+        MovRR(0, 9);
+        BLInternal("_zan_co_ready");                 // ready(sub, sub_resume)
+        XPopV(9);                              // x9 = sub
+        MovRR(0, 9);
+        AddImm(0, 0, 8);                             // x0 = &frame[1] (done)
+        XPushR(9);                              // hold sub across the pump
+        LoadImm(1, 0);                               // mode 0: preempt on done
+        BLInternal("_zan_co_sched_run_until");       // pump until *this* is done
+        XPopV(9);                              // x9 = sub
+        Mark(rootDone);
+        AsyncSubExcCheckNg();
+        int subZero = NL();
+        int subFin = NL();
+        CbzReg(9, subZero);
+        LdrU(0, 9, 32);                              // x0 = sub.result
+        EmitB(subFin);
+        Mark(subZero);
+        LoadImm(0, 0);
+        Mark(subFin);
+        return true;
+    }
+
+    // ---- Hook B: a discarded async call statement detaches ----
+    // (irgen_call.c:22-68): awaiter = the frame itself (a non-null marker),
+    // awaiter_step = the reaper, then ready. The queue is NOT pumped here:
+    // the reference only readies, so a detached body runs at the next pump.
+    // `Task.Spawn(<async call>)` / `Task.Run(<async call>)` detach the same
+    // way (the handle they return is the frame; only statement-level spawns
+    // that discard it are recognized here).
+    // Task.Spawn(<async call>) / Task.Run(<async call>) in a VALUE position:
+    // the same detach as the statement form, but the coroutine handle (the
+    // frame pointer as a long) stays on the expression so the caller can
+    // join it later (web_typed_binding joins through TaskJoin.WhenAll).
+    bool TryGenTaskSpawnValueNg(Node e) {
+        if (e == null || e.a == null || e.a.kind != AK.MemberAccess()
+                || e.a.a == null || e.a.a.kind != AK.Ident()
+                || e.a.a.sval != "Task"
+                || (e.a.sval != "Spawn" && e.a.sval != "Run")
+                || e.kids.Count != 1) { return false; }
+        Node target = e.kids[0];
+        int mi = AsyncResolveCallNg(target);
+        if (mi == -1) { return false; }              // not an async call shape
+        if (mi >= 0 && HasTypeParams(methNodes[mi])) {
+            diags.Error("ngen: a generic async call is not supported by the native backend", e.line, e.col);
+            return true;
+        }
+        EnsureAsyncRuntimeNg();
+        EmitAsyncCallNg(mi, mi, target);             // x0 = sub frame
+        PushV(0);                              // hold the frame
+        MovRR(9, 0);
+        StrU(9, 9, 16);                              // sub.awaiter = sub (marker)
+        LoadSymRef("_zan_co_reap", 1);
+        StrU(1, 9, 24);                              // sub.awaiter_step = reap
+        LdrU(1, 9, 40);                              // sub own_resume
+        MovRR(0, 9);
+        BLInternal("_zan_co_ready");
+        PopV(0);                              // x0 = the handle
+        return true;
+    }
+
+    bool PrepareAsyncStmtNg(Node s) {
+        if (s == null || s.kind != AK.ExprStmt() || s.a == null
+                || s.a.kind != AK.Call()) { return false; }
+        Node call = s.a;
+        bool spawn = call.a != null && call.a.kind == AK.MemberAccess()
+                && call.a.a != null && call.a.a.kind == AK.Ident()
+                && call.a.a.sval == "Task"
+                && (call.a.sval == "Spawn" || call.a.sval == "Run")
+                && call.kids.Count == 1;
+        Node target = spawn ? (call.kids.Count > 0 ? call.kids[0] : null) : call;
+        int mi = AsyncResolveCallNg(target);
+        if (mi == -1) { return false; }              // not an async call (or a non-async Task.Spawn argument)
+        if (mi >= 0 && HasTypeParams(methNodes[mi])) {
+            diags.Error("ngen: a discarded generic async call is not supported by the native backend", s.line, s.col);
+            return true;
+        }
+        EnsureAsyncRuntimeNg();
+        EmitAsyncCallNg(mi, mi, target);             // x0 = sub frame
+        MovRR(9, 0);
+        StrU(9, 9, 16);                              // sub.awaiter = sub (marker)
+        LoadSymRef("_zan_co_reap", 1);
+        StrU(1, 9, 24);                              // sub.awaiter_step = reap
+        LdrU(1, 9, 40);                              // sub own_resume
+        MovRR(0, 9);
+        BLInternal("_zan_co_ready");
+        return true;
+    }
+
+    // ---- the cooperative driver, emitted once on first async use ----
+    // Faithful to runtime/rt_co.c + the inline C driver (irgen.c:2162-2296):
+    // a FIFO of nodes {next, frame, step}; ready appends when step != null;
+    // run_until pops one node per round and checks the caller's done flag
+    // before each step and once more when the queue drains.
+    // Queue invariant: empty <=> coq == 0. A single-element pop clears BOTH
+    // coq and coqt: the popped node is still the tail, so its next pointer
+    // is only written afterwards (by a step that enqueues) -- reading it for
+    // the new head would orphan that later append. Enqueue branches on coq,
+    // not on coqt, for the same reason.
+    // Native deviation: popped nodes and heap frames are never freed.
+    // does any method in the program reach the CPS runtime? An async method
+    // emits its ramp through EnsureAsyncRuntimeNg; a sync body with an
+    // `await` root-drives through it (TryGenAwaitExprNg). The entry shim
+    // pre-emits the runtime blob only for such programs, so async-free ones
+    // (the crossboot ELF lanes) keep linking without the co/io primitives.
+    bool ProgramCanAwaitNg() {
+        int ci = 0;
+        while (ci < methNodes.Count) {
+            Node m = methNodes[ci];
+            if (m != null) {
+                if (HasMod(m, MOD.Async()) || HasAwaitExprNg(m)) { return true; }
+            }
+            ci = ci + 1;
+        }
+        return false;
+    }
+    bool HasAwaitExprNg(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == AK.AwaitExpr()) { return true; }
+        if (HasAwaitExprNg(n.a) || HasAwaitExprNg(n.b)
+                || HasAwaitExprNg(n.c) || HasAwaitExprNg(n.d)
+                || HasAwaitExprNg(n.type)) { return true; }
+        if (n.kids == null) { return false; }
+        int i = 0;
+        while (i < n.kids.Count) {
+            if (HasAwaitExprNg(n.kids[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    void EnsureAsyncRuntimeNg() {
+        if (asyncRtDone) { return; }
+        asyncRtDone = true;
+        dglbs.Add(new DGlob("coq", 8, dataLen));    // queue head
+        dataLen = dataLen + 8;
+        dglbs.Add(new DGlob("coqt", 8, dataLen));   // queue tail
+        dataLen = dataLen + 8;
+        dglbs.Add(new DGlob("co_tq", 8, dataLen));  // timer list head
+        dataLen = dataLen + 8;
+
+        // _zan_ng_co_cancel(i64 frame) -- Task.Cancel's lowering target
+        // (get_co_cancel_fn, irgen_async.c:328): mark the frame cancelled and
+        // follow the CHILD chain, marking everything it is transitively
+        // suspended on. Each marked frame observes the flag at its next
+        // $resume entry and completes early. The scheduler is not touched:
+        // a frame parked on a timer is only cancelled once that wait fires.
+        // Frames are never freed on the native lane, so a stale handle is
+        // still valid memory -- re-marking a completed frame is harmless;
+        // a zero handle (never spawned) just returns.
+        syms.Add(new Sym("_zan_ng_co_cancel", FnPad()));
+        RtPrologue();
+        MovRR(9, 0);                                 // x9 = frame
+        int cchead = NL();
+        int ccdone = NL();
+        Mark(cchead);
+        CbzReg(9, ccdone);
+        LoadImm(0, 1);
+        StrU(0, 9, 56);                              // frame[7] = cancel
+        LdrU(9, 9, 64);                              // frame[8] = child
+        EmitB(cchead);
+        Mark(ccdone);
+        RtEpilogue();
+
+        // _zan_co_ready(i64 frame, i64 step)
+        syms.Add(new Sym("_zan_co_ready", FnPad()));
+        RtPrologue();
+        // register the resume callback with the runtime core (缺口五: the
+        // hook is a Zan static behind _zan_set_ready_hook; the C baseline's
+        // zanstubs.c ships a same-name shim). x0/x1 carry (frame, step) for
+        // the resume below -- keep them across the registration call.
+        PushV(0);                              // push frame
+        PushV(1);                              // push step
+        LoadSymRef("_zan_co_ready", 9);
+        MovRR(0, 9);
+        BLExtern("_zan_set_ready_hook");
+        PopV(1);                              // pop step -> x1
+        PopV(0);                              // pop frame -> x0
+        int noStep = NL();
+        CbzReg(1, noStep);                           // step == 0: nothing
+        PushV(0);                              // push frame
+        PushV(1);                              // push step
+        LoadImm(0, 24);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                 // node (zeroed)
+        MovRR(9, 0);
+        PopV(1);                              // pop step -> x1
+        PopV(2);                              // pop frame -> x2
+        StrU(2, 9, 8);                               // node.frame
+        StrU(1, 9, 16);                              // node.step
+        LoadSymRef(DGlobalSym("coq"), 0);
+        LdrU(2, 0, 0);                               // head
+        LoadSymRef(DGlobalSym("coqt"), 3);
+        int empty2 = NL();
+        int after = NL();
+        CbzReg(2, empty2);
+        LdrU(4, 3, 0);                               // tail
+        StrU(9, 4, 0);                               // tail.next = node
+        EmitB(after);
+        Mark(empty2);
+        StrU(9, 0, 0);                               // coq = node
+        Mark(after);
+        StrU(9, 3, 0);                               // coqt = node
+        Mark(noStep);
+        RtEpilogue();
+
+        // i64 _zan_co_sched_run_until(i64* done, i64 mode)
+        // When the ready queue drains with *done still clear: move every due
+        // timer onto the queue and keep pumping; if none is due but timers
+        // exist, sleep to the earliest deadline (rt_co.c's timer bridge /
+        // zan_timer_next_timeout, irgen.c's timers_bb) and retry; with no
+        // ready work, no timer and *done == 0 the reference exits too.
+        // mode (x1): 0 = preempt as soon as *done is seen (the await
+        // protocol and the async Main shim -- preserves the exact step
+        // interleaving the reference driver produces); 1 = quiesce: step
+        // every readied continuation and sleep out every pending timer
+        // before returning (Task.Wait/Task.Result -- the reference's own
+        // cs_b15 run shows the detached 20ms PrintLater printing between
+        // "t3 done=1" and the sum, i.e. its pump outlives the awaited
+        // frame's done flag until the timer queue empties).
+        syms.Add(new Sym("_zan_co_sched_run_until", FnPad()));
+        RtPrologue();
+        AddSPImm(32, false);
+        StrU(0, 31, 0);                              // [sp] = done
+        StrU(1, 31, 8);                              // [sp+8] = mode (x1: 0 = preempt
+                                                     //  on *done (await/shim), 1 =
+                                                     //  quiesce (Task.Wait/Result));
+                                                     //  [sp+16] = timer-wait scratch
+        int loopL = NL();
+        int drained = NL();
+        int stepL = NL();
+        int outL = NL();
+        int notDone = NL();
+        Mark(loopL);
+        LoadSymRef(DGlobalSym("coq"), 0);            // x0 = &coq for the round
+        LdrU(9, 0, 0);                               // head
+        CbzReg(9, drained);
+        LoadSymRef(DGlobalSym("coqt"), 3);
+        LdrU(4, 3, 0);                               // tail
+        int single = NL();
+        int popped = NL();
+        CmpRR(4, 9);                              // cmp x4, x9 (tail, head)
+        EmitBcond(0, single);                        // tail == head: last node
+        LdrU(2, 9, 0);
+        StrU(2, 0, 0);                               // coq = head.next
+        EmitB(popped);
+        Mark(single);
+        LoadImm(2, 0);
+        StrU(2, 0, 0);                               // coq = 0
+        StrU(2, 3, 0);                               // coqt = 0
+        Mark(popped);
+        LdrU(3, 31, 8);                              // mode
+        CbnzReg(3, stepL);                           // quiesce: step every readied
+                                                     //  continuation regardless of
+                                                     //  the done flag
+        LdrU(3, 31, 0);                              // done
+        CbzReg(3, stepL);
+        LdrU(3, 3, 0);
+        CbnzReg(3, outL);                            // *done: stop pre-step
+        Mark(stepL);
+        LdrU(0, 9, 8);                               // x0 = frame
+        LdrU(1, 9, 16);                              // x1 = step
+        if (tgt86 == 1) { XGetV(1, 11); X2(0x41, 0xFF); X1(0xD3); } else { E4(0xD63F0020); }                              // blr x1
+        EmitB(loopL);
+        Mark(drained);
+        LdrU(3, 31, 8);                              // mode
+        CbnzReg(3, notDone);                         // quiesce: keep going to the
+                                                     //  timer queue regardless
+        LdrU(3, 31, 0);
+        CbzReg(3, notDone);                          // null done: drain mode
+        LdrU(3, 3, 0);
+        CbnzReg(3, outL);                            // *done (queue empty)
+        Mark(notDone);
+        BLInternal("_zan_co_timers_due");            // x0 = due timers readied
+        CbnzReg(0, loopL);
+        BLInternal("_zan_co_timer_wait");            // x0 = ns to earliest / -1
+        StrU(0, 31, 16);                             // stash it ([sp+16] scratch)
+        BLExtern("_zan_io_poll");                    // poll the parked io watchers
+                                                     // (bounded by the timer wait):
+                                                     // 1 = watchers exist, loop
+        CbnzReg(0, loopL);
+        LdrU(0, 31, 16);                             // no watchers: timer sleep
+        CmpRR(0, 31);                              // cmp x0, xzr
+        EmitBcond(11, outL);                         // no timers: exit
+        // cap each sleep at one second: a saturated (never-due) deadline
+        // must not hand nanosleep a tv_nsec past its 999999999 field --
+        // EINVAL returns at once and the pump would spin at 100% cpu.
+        // Re-dispatching on wake keeps the semantics (dispatch is
+        // deadline-based, so nothing fires early)
+        LoadImm(10, 999999999);
+        CmpRR(0, 10);                       // cmp x0, cap
+        int slKeep = NL();
+        EmitBcond(9, slKeep);                        // b.ls: within the field
+        MovRR(0, 10);
+        Mark(slKeep);
+        AddSPImm(32, false);                         // [sp]=req.sec [sp+8]=req.nsec [sp+16]=rem
+        if (tgt86 == 1) { X3(0x48, 0xC7, 0x04); X1(0x24); X4(0); } else { E4(0xF90003FF); }                              // str xzr, [sp] (tv_sec = 0)
+        StrU(0, 31, 8);                              // tv_nsec = wait ns (x0 survives)
+        AddImm(0, 31, 0);                            // x0 = &req
+        AddImm(1, 0, 16);                            // x1 = &rem
+        BLExtern("_nanosleep");
+        AddSPImm(32, true);
+        EmitB(loopL);                                // retry: dispatch due timers
+        Mark(outL);
+        AddSPImm(32, true);
+        RtEpilogue();
+
+        // _zan_co_after(i64 ms, i64 frame, i64 step): register a one-shot
+        // timer that re-readies `frame` at now+ms (zan_timer_delay via
+        // zan_co_delay, rt_timer.c:598). Node {next, deadline_ns, frame, step}.
+        syms.Add(new Sym("_zan_co_after", FnPad()));
+        RtPrologue();
+        AddSPImm(48, false);                         // [sp]=sec [sp+8]=nsec [sp+16]=deadline
+                                                     // [sp+24]=ms [sp+32]=frame [sp+40]=step
+        StrU(0, 31, 24);                             // ms -> [sp+24]: x0 is clobbered
+                                                     // by the clock id + syscall below
+        StrU(1, 31, 32);                             // frame -> [sp+32] (extern calls
+        StrU(2, 31, 40);                             // step -> [sp+40]  clobber x1/x2)
+        int noStep2 = NL();
+        CbzReg(2, noStep2);                          // step == 0: nothing
+        LoadImm(0, 0);
+        StrU(0, 31, 0);                              // timespec = {0, 0}
+        StrU(0, 31, 8);                              // (clock_gettime fills it)
+        LoadImm(0, 6);                               // CLOCK_MONOTONIC (Darwin: 6, Linux: 1)
+        AddImm(1, 31, 0);                            // x1 = &timespec (sp)
+        BLExtern("_clock_gettime");
+        LdrU(9, 31, 0);                              // sec
+        LoadImm(10, 1000000000);
+        MaddRR(9, 9, 10, 31);   // mul x9, x9, x10
+        LdrU(10, 31, 8);                             // nsec
+        AddRR(9, 9, 10);                             // x9 = now_ns
+        int msPos = NL();
+        LdrU(0, 31, 24);                             // reload ms
+        CmpRR(0, 31);                  // cmp x0, xzr (ms)
+        EmitBcond(12, msPos);                        // b.gt: positive ms
+        LoadImm(0, 0);                               // clamp ms <= 0 to 0
+        Mark(msPos);
+        // deadline = now + ms*1e6, saturating at int64 max like the
+        // reference's zan_timer_saturating_due (rt_timer.c:674): the plain
+        // multiply+add wraps for Task.Delay(int64.MaxValue), the wrapped
+        // deadline compares due immediately, and the huge-delay task wins
+        // every WhenAny it enters -- exactly what async_delay_max pins. A
+        // saturated deadline is never due (max > any now) and its sleep
+        // argument is capped in the pump below.
+        int dSat = NL();
+        int dMul = NL();
+        int dFine = NL();
+        int dStore = NL();
+        LoadImm(10, 9223372036854);                  // floor(int64max / 1e6)
+        CmpRR(0, 10);                 // cmp ms, floor
+        EmitBcond(13, dMul);                         // b.le: multiply stays exact
+        EmitB(dSat);
+        Mark(dMul);
+        LoadImm(10, 1000000);
+        MaddRR(10, 10, 0, 31);  // mul x10, x0, x10
+        LoadImm(11, 9223372036854775807);
+        SubRR(11, 11, 9); // sub x11, x11, x9 (headroom)
+        CmpRR(10, 11);               // cmp delay, headroom
+        EmitBcond(13, dFine);                        // b.le: now+delay fits
+        Mark(dSat);
+        LoadImm(9, 9223372036854775807);             // deadline = int64 max
+        EmitB(dStore);
+        Mark(dFine);
+        AddRR(9, 9, 10);                             // deadline_ns = now + delay
+        Mark(dStore);
+        StrU(9, 31, 16);
+        LoadImm(0, 32);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                 // zeroed timer node
+        MovRR(9, 0);
+        LdrU(1, 31, 32);                             // frame (saved across the
+                                                     // extern clock call above)
+        LdrU(2, 31, 40);                             // step
+        StrU(1, 9, 16);                              // node.frame
+        StrU(2, 9, 24);                              // node.step
+        LdrU(1, 31, 16);                             // deadline (sp restored)
+        StrU(1, 9, 8);                               // node.deadline_ns
+        LoadSymRef(DGlobalSym("co_tq"), 0);
+        LdrU(2, 0, 0);                               // old head
+        StrU(2, 9, 0);                               // node.next = head
+        StrU(9, 0, 0);                               // co_tq = node
+        Mark(noStep2);
+        AddSPImm(48, true);
+        RtEpilogue();
+
+        // i64 _zan_co_timers_due(): move every timer with deadline <= now
+        // onto the ready queue (zan_timer_dispatch_due); returns the count.
+        // Walks with a pointer to the current LINK so unlinks are uniform.
+        // x20 (link) / x21 (count) survive the internal calls: callee-saved
+        // by the platform ABI and untouched by our own emitted functions.
+        syms.Add(new Sym("_zan_co_timers_due", FnPad()));
+        RtPrologue();
+        AddSPImm(16, false);                         // [sp] = timespec
+        LoadImm(21, 0);                              // count
+        LoadSymRef(DGlobalSym("co_tq"), 20);         // x20 = &link
+        LoadImm(0, 0);
+        StrU(0, 31, 0);                              // timespec = {0, 0}
+        StrU(0, 31, 8);                              // (clock_gettime fills it)
+        LoadImm(0, 6);                               // CLOCK_MONOTONIC (Darwin: 6, Linux: 1)
+        AddImm(1, 31, 0);                            // x1 = &timespec (sp)
+        BLExtern("_clock_gettime");
+        LdrU(9, 31, 0);
+        LoadImm(10, 1000000000);
+        MaddRR(9, 9, 10, 31);   // mul x9, x9, x10
+        LdrU(10, 31, 8);
+        AddRR(9, 9, 10);                             // x9 = now_ns
+        XPushR(9);                              // push now_ns
+        int tloop = NL();
+        int tout = NL();
+        int tnext = NL();
+        Mark(tloop);
+        LdrU(10, 20, 0);                             // node = *link
+        CbzReg(10, tout);
+        LdrU(11, 10, 8);                             // node.deadline_ns
+        LdrU(12, 31, 0);                             // now (peek)
+        CmpRR(11, 12);          // cmp x11, x12 (deadline, now)
+        EmitBcond(12, tnext);                        // b.gt: deadline still ahead: keep
+        LdrU(13, 10, 0);                             // node.next
+        StrU(13, 20, 0);                             // *link = next (unlink)
+        LdrU(0, 10, 16);                             // frame
+        LdrU(1, 10, 24);                             // step
+        BLInternal("_zan_co_ready");                 // enqueue(frame, step)
+        AddImm(21, 21, 1);
+        EmitB(tloop);                                // *link is the next node
+        Mark(tnext);
+        MovRR(20, 10);                               // link = &node.next
+        EmitB(tloop);
+        Mark(tout);
+        AddSPImm(16, true);                          // pop now
+        MovRR(0, 21);                                // x0 = count
+        AddSPImm(16, true);                          // timespec
+        RtEpilogue();
+
+        // i64 _zan_co_timer_wait(): nanoseconds until the EARLIEST timer
+        // deadline (zan_timer_next_timeout), clamped >= 0; -1 when the list
+        // is empty.
+        syms.Add(new Sym("_zan_co_timer_wait", FnPad()));
+        RtPrologue();
+        AddSPImm(16, false);                         // [sp] = timespec
+        LoadImm(0, 0);
+        StrU(0, 31, 0);                              // timespec = {0, 0}
+        StrU(0, 31, 8);                              // (clock_gettime fills it)
+        LoadImm(0, 6);                               // CLOCK_MONOTONIC (Darwin: 6, Linux: 1)
+        AddImm(1, 31, 0);                            // x1 = &timespec (sp)
+        BLExtern("_clock_gettime");
+        LdrU(10, 31, 0);
+        LoadImm(11, 1000000000);
+        MaddRR(10, 10, 11, 31); // mul x10, x10, x11
+        LdrU(11, 31, 8);
+        AddRR(10, 10, 11);                           // x10 = now_ns (before any scan:
+                                                    //  x9 must not span the extern call)
+        LoadImm(9, -1);                              // best = none
+        LoadSymRef(DGlobalSym("co_tq"), 20);
+        LdrU(20, 20, 0);                             // x20 = node = head (callee-saved)
+        int wloop = NL();
+        int wout = NL();
+        int wnext = NL();
+        int wset = NL();
+        int wnone = NL();
+        int wdone = NL();
+        int wepi = NL();
+        Mark(wloop);
+        CbzReg(20, wout);
+        LdrU(12, 20, 8);                             // deadline
+        CmpRR(9, 31);                // cmp x9, xzr (best)
+        EmitBcond(11, wset);                         // best unset
+        CmpRR(12, 9);            // cmp x9, x12 (best, deadline)
+        EmitBcond(12, wnext);                        // b.gt: best already smaller: keep
+        Mark(wset);
+        MovRR(9, 12);
+        Mark(wnext);
+        LdrU(20, 20, 0);                             // node = node.next
+        EmitB(wloop);
+        Mark(wout);
+        CmpRR(9, 31);                // cmp x9, xzr (best)
+        EmitBcond(11, wnone);                        // none: return -1
+        SubRR(0, 9, 10);  // sub x0, x9, x10
+        CmpRR(0, 31);           // cmp x0, xzr (over-dispatched)
+        EmitBcond(5, wdone);                         // b.pl: non-negative
+        LoadImm(0, 0);                               // clamp to 0 (due now)
+        Mark(wdone);
+        EmitB(wepi);
+        Mark(wnone);
+        LoadImm(0, -1);
+        Mark(wepi);
+        AddSPImm(16, true);
+        RtEpilogue();
+
+        // _zan_co_reap(i64 frame): completion wake target of a detached
+        // frame. _zan_rt_alloc has no free on the native lane, so the reaper
+        // is a no-op; the wake still drains one queue entry, keeping the
+        // pump accounting identical to the reference.
+        syms.Add(new Sym("_zan_co_reap", FnPad()));
+        RtPrologue();
+        RtEpilogue();
+
+        // ---- gate + io suspension primitives ----
+        // Gate/Socket declare these as DllImport EntryPoints; they are
+        // emitted next to the co scheduler into every async module, so the
+        // extern table resolves them locally (BLExtern scans local syms
+        // before exts). Semantics mirror rt_io.c 5060-5160.
+
+        // zan_gate_new() -> gate{head,tail,surplus} (zeroed)
+        syms.Add(new Sym("_zan_gate_new", FnPad()));
+        RtPrologue();
+        LoadImm(0, 24);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        RtEpilogue();
+
+        // zan_gate_park(g, frame, step): consume a surplus signal or enqueue
+        // the (frame, step) waiter. A null gate, a zero step or a failed
+        // allocation degrade to an immediate wake (rt_io.c's released-gate
+        // Wait returns at once).
+        syms.Add(new Sym("_zan_gate_park", FnPad()));
+        RtPrologue();
+        int gpImm = NL();
+        int gpEnq = NL();
+        int gpDone = NL();
+        int gpEmpty = NL();
+        CbzReg(0, gpImm);
+        CbzReg(2, gpImm);
+        LdrU(3, 0, 16);                              // surplus
+        CbzReg(3, gpEnq);
+        LdrU(3, 0, 16);
+        SubImm(3, 3, 1);
+        StrU(3, 0, 16);                              // surplus-- : consumed
+        Mark(gpImm);                                 // immediate wake
+        MovRR(0, 1);
+        MovRR(1, 2);
+        BLInternal("_zan_co_ready");
+        EmitB(gpDone);
+        Mark(gpEnq);                                 // waiter{next,frame,step}
+        PushV(0);                              // hold gate (the alloc call
+        PushV(1);                              // below clobbers x0)
+        PushV(2);                              // hold step
+        LoadImm(0, 24);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        MovRR(9, 0);
+        PopV(2);                              // step -> x2
+        PopV(1);                              // frame -> x1
+        PopV(0);                              // gate -> x0 (restored)
+        CbzReg(9, gpImm);                            // alloc failed: fire now
+        StrU(1, 9, 8);
+        StrU(2, 9, 16);
+        LdrU(3, 0, 0);                               // head
+        CbzReg(3, gpEmpty);
+        LdrU(4, 0, 8);                               // tail
+        StrU(9, 4, 0);                               // tail.next = waiter
+        StrU(9, 0, 8);                               // tail = waiter (rt_io.c 5117:
+                                                     // without this the next park
+                                                     // relinks from the stale tail
+                                                     // and orphans the middle of
+                                                     // the queue)
+        EmitB(gpDone);
+        Mark(gpEmpty);
+        StrU(9, 0, 0);                               // head = waiter
+        StrU(9, 0, 8);                               // tail = waiter
+        Mark(gpDone);
+        RtEpilogue();
+
+        // zan_gate_signal(g): wake the head waiter, else bank a surplus
+        syms.Add(new Sym("_zan_gate_signal", FnPad()));
+        RtPrologue();
+        int gsOut = NL();
+        int gsBank = NL();
+        int gsTail = NL();
+        int gsDone = NL();
+        CbzReg(0, gsOut);
+        LdrU(3, 0, 0);                               // head
+        CbzReg(3, gsBank);
+        LdrU(1, 3, 0);                               // head.next
+        StrU(1, 0, 0);                               // head = next
+        EmitCbnz(1, gsTail);
+        StrU(1, 0, 8);                               // drained: tail = 0 (x1)
+        Mark(gsTail);
+        LdrU(0, 3, 8);                               // waiter.frame
+        LdrU(1, 3, 16);                              // waiter.step
+        BLInternal("_zan_co_ready");
+        EmitB(gsDone);
+        Mark(gsBank);
+        LdrU(3, 0, 16);
+        AddImm(3, 3, 1);
+        StrU(3, 0, 16);                              // surplus++
+        Mark(gsDone);
+        Mark(gsOut);
+        RtEpilogue();
+
+        // zan_gate_free(g): release -- every parked waiter re-readies
+        // (rt_io.c's drain). Storage itself is not freed (no-free lane).
+        syms.Add(new Sym("_zan_gate_free", FnPad()));
+        RtPrologue();
+        int gfOut = NL();
+        int gfLoop = NL();
+        CbzReg(0, gfOut);
+        LdrU(3, 0, 0);
+        Mark(gfLoop);
+        CbzReg(3, gfOut);
+        LdrU(4, 3, 0);                               // next
+        LdrU(0, 3, 8);
+        LdrU(1, 3, 16);
+        BLInternal("_zan_co_ready");
+        MovRR(3, 4);
+        EmitB(gfLoop);
+        Mark(gfOut);
+        RtEpilogue();
+
+        // ---- awaited io suspension helpers ----
+        // zan_io_wait_co / _recv_co / _recv_to_co / _accept_co /
+        // _resolve_sa_co moved to the transition runtime
+        // (zanstubs.c): the native lane now has a REAL reactor --
+        // watchers park until zan_io_poll (called from the pump
+        // above) sees the fd ready, a recv-to deadline expires, the
+        // self-pipe signals a finished DNS worker, or close_notify
+        // wakes them. BLExtern resolves them from zanstubs.o.
+
+    }
+}

@@ -1,0 +1,350 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    // the recognized Task.Delay intrinsic shape: static `Task.Delay(<one arg>)`
+    // -- the callee is MemberAccess { receiver Ident "Task", name "Delay" }
+    // with exactly one argument (the Call node itself carries no sval)
+    bool IsTaskDelayNg(Node inner) {
+        return inner != null && inner.kind == AK.Call() && inner.a != null
+                && inner.a.kind == AK.MemberAccess() && inner.a.a != null
+                && inner.a.a.kind == AK.Ident() && inner.a.a.sval == "Task"
+                && inner.a.sval == "Delay" && inner.kids.Count == 1;
+    }
+
+    // the recognized Task.Yield intrinsic shape: static `Task.Yield()`
+    // -- the callee is MemberAccess { receiver Ident "Task", name "Yield" }
+    // with zero arguments
+    bool IsTaskYieldNg(Node inner) {
+        return inner != null && inner.kind == AK.Call() && inner.a != null
+                && inner.a.kind == AK.MemberAccess() && inner.a.a != null
+                && inner.a.a.kind == AK.Ident() && inner.a.a.sval == "Task"
+                && inner.a.sval == "Yield" && inner.kids.Count == 0;
+    }
+
+    // the IO-reactor / gate suspension intrinsics the compiler lowers
+    // itself (irgen_async.zan IsSocketIntrinsic, C host irgen_expr.c
+    // 8147-8540): 0 = none, 1 = Gate.Park, 2 = readiness probe,
+    // 3 = RecvOv, 4 = RecvToOv, 5 = AcceptOv, 6 = ResolveSockAddr,
+    // 7 = ResolveAsync. ResolveAsync matters even though the stdlib body
+    // is one line: that line awaits ITSELF, so without the intrinsic the
+    // body recurses through the scheduler forever (async_dns / async_mt).
+    int CoIntrinsicKindNg(Node inner) {
+        if (inner == null || inner.kind != AK.Call() || inner.a == null
+                || inner.a.kind != AK.MemberAccess() || inner.a.a == null
+                || inner.a.a.kind != AK.Ident()) { return 0; }
+        string cn = inner.a.a.sval;
+        string mn = inner.a.sval;
+        if (cn == "Gate" && mn == "Park" && inner.kids.Count == 1) { return 1; }
+        if (cn != "Socket") { return 0; }
+        if ((mn == "ReadReady" || mn == "WriteReady") && inner.kids.Count == 1) { return 2; }
+        if (mn == "RecvOv" && inner.kids.Count == 3) { return 3; }
+        if (mn == "RecvToOv" && inner.kids.Count == 4) { return 4; }
+        if (mn == "AcceptOv" && inner.kids.Count == 1) { return 5; }
+        if (mn == "ResolveSockAddr" && inner.kids.Count == 4) { return 6; }
+        if (mn == "ResolveAsync" && inner.kids.Count == 1) { return 7; }
+        return 0;
+    }
+
+    // lower one suspension intrinsic: evaluate the args (the statement head
+    // already hoisted any awaits inside them), spill live slots, call the
+    // self-emitted runtime helper -- frame + $resume + &result slot are the
+    // tail arguments -- then suspend; resume-k reloads and delivers the
+    // helper's result (frame+32) for the value-yielding kinds
+    void EmitCoIntrinsicNg(int kind, Node inner, Node aw, bool resUsed, int k, int kLbl) {
+        if (kind <= 2 && resUsed) {
+            diags.Error("ngen: 'await Gate.Park / Socket.ReadReady / Socket.WriteReady' yields no value and is only supported as a discard statement inside an async method", aw.line, aw.col);
+        }
+        int i = 0;
+        while (i < inner.kids.Count) {
+            GenExpr(inner.kids[i]);
+            PushV(0);                          // push arg (16-aligned)
+            i = i + 1;
+        }
+        SaveSlotsNg();
+        if (kind == 1) {
+            PopV(0);                          // handle -> x0
+        } else if (kind == 2) {                      // fd -> x0; the interest
+            PopV(0);                          // is a lowered constant
+            if (inner.a.sval == "WriteReady") { LoadImm(1, 2); } else { LoadImm(1, 1); }
+        } else if (kind == 3) {                      // RecvOv: len,buf,fd
+            PopV(2);
+            PopV(1);
+            PopV(0);
+        } else if (kind == 4) {                      // RecvToOv: tmo,len,buf,fd
+            PopV(3);
+            PopV(2);
+            PopV(1);
+            PopV(0);
+        } else if (kind == 5) {
+            PopV(0);                          // fd -> x0
+        } else if (kind == 6) {                      // ResolveSockAddr: cap,buf,port,name
+            PopV(3);
+            PopV(2);
+            PopV(1);
+            PopV(0);                          // name -> x0 (the handle IS
+        } else if (kind == 7) {                      //  the char* on this lane)
+            PopV(0);                          // ResolveAsync: name -> x0
+        }
+        if (kind == 1) {
+            LoadLocal(asyncFrameLocal, 1);           // park(g, frame, resume)
+            LoadSymRef(asyncResumeSym, 2);
+            BLExtern("_zan_gate_park");
+        } else if (kind == 2) {
+            LoadLocal(asyncFrameLocal, 2);           // wait_co(fd, interest, frame, resume)
+            LoadSymRef(asyncResumeSym, 3);
+            BLExtern("_zan_io_wait_co");
+        } else if (kind == 3) {
+            LoadLocal(asyncFrameLocal, 3);           // recv_co(fd, buf, len, frame, resume, &res)
+            LoadSymRef(asyncResumeSym, 4);
+            LoadLocal(asyncFrameLocal, 5);
+            AddImm(5, 5, 32);
+            BLExtern("_zan_io_recv_co");
+        } else if (kind == 4) {
+            // recv_to_co(fd, buf, len, tmo, frame, resume, outn)——第 7 参
+            // 回归 C 契约:outn = frame+32,与恢复体重读的槽同址。x86
+            // SysV 第 7 参走栈,XCallSeq 从 v6 暂存家押到 [rsp](批46
+            // xStackArgs 修复闭环;此前 arity-blind 裸 bl 让运行时拿到
+            // 垃圾指针,是 RecvToOv 段错误根因);arm64 直落 x6。
+            LoadLocal(asyncFrameLocal, 4);           // frame
+            LoadSymRef(asyncResumeSym, 5);           // resume
+            LoadLocal(asyncFrameLocal, 6);           // outn = frame+32
+            AddImm(6, 6, 32);
+            xStackArgs = 1;
+            BLExtern("_zan_io_recv_to_co");
+        } else if (kind == 5) {
+            LoadLocal(asyncFrameLocal, 1);           // accept_co(fd, frame, resume, &res)
+            LoadSymRef(asyncResumeSym, 2);
+            LoadLocal(asyncFrameLocal, 3);
+            AddImm(3, 3, 32);
+            BLExtern("_zan_io_accept_co");
+        } else if (kind == 6) {
+            // resolve_sa_co(name, port, buf, cap, frame, resume, outn)——
+            // 第 7 参回归 C 契约,押栈方式同 kind 4。
+            LoadLocal(asyncFrameLocal, 4);           // frame
+            LoadSymRef(asyncResumeSym, 5);           // resume
+            LoadLocal(asyncFrameLocal, 6);           // outn = frame+32
+            AddImm(6, 6, 32);
+            xStackArgs = 1;
+            BLExtern("_zan_resolve_sa_co");
+        } else if (kind == 7) {
+            LoadLocal(asyncFrameLocal, 1);           // resolve_ipv4_co(name, frame, resume, &res)
+            LoadSymRef(asyncResumeSym, 2);
+            LoadLocal(asyncFrameLocal, 3);
+            AddImm(3, 3, 32);
+            BLExtern("_zan_resolve_ipv4_co");
+        }
+        LoadLocal(asyncFrameLocal, 1);
+        LoadImm(0, k);
+        StrU(0, 1, 0);                               // state = k
+        AsyncEhUnarmNg();                            // suspend disarms
+        Epilogue();                                  // ret to the scheduler
+        Mark(kLbl);
+        // ---- resume-k ----
+        ReloadSlotsNg();
+        int rti = 0;
+        while (rti < asyncTryCatchLs.Count) {        // re-arm trys open around
+            ArmAsyncTryBufNg(asyncTryCatchLs[rti]);  // the suspension
+            rti = rti + 1;
+        }
+        if (kind >= 3) {                             // Recv*/Accept/Resolve yield
+            LoadLocal(asyncFrameLocal, 9);           // the helper's result slot
+            LdrU(0, 9, 32);
+        } else {
+            LoadImm(0, 0);                           // Park / probe yield 0
+        }
+    }
+
+    // the awaited callee is a DllImport static extern (`await
+    // Socket.NativeResolveAllAsync(...)`, irgen_expr.c:7969
+    // emit_await_blocking_extern): returns its static method index, -1 if
+    // the callee is not one. Await paths only -- statement-level detach
+    // recognition must not see this.
+    int BlockingExternMiNg(Node call) {
+        if (call == null || call.kind != AK.Call() || call.a == null) { return -1; }
+        int mi = ResolveStaticNg(call);
+        if (mi < 0) { return -1; }
+        if (!HasMod(methNodes[mi], MOD.Extern())) { return -1; }
+        return mi;
+    }
+
+    // lower `await <DllImport extern>(scalars)` (irgen_expr.c:7969). The
+    // reference hands a function pointer + the scalar args to the rt
+    // blocking worker and wakes this frame on completion; the native lane
+    // has no worker pool (the recv/accept deviation), so the call runs
+    // inline and the waiter re-readies itself via _zan_co_ready -- the
+    // exact suspend/resume shape of the co-intrinsics. The oracle's
+    // validation mirrors here: at most four arguments, only integer,
+    // nint, bool, and enum scalars across the suspension, and only int,
+    // long, nint, or void returns; diagnostics fire but emission stays on
+    // the one consistent path so the state chain keeps its label.
+    void EmitBlockingExternNg(int mi, Node inner, Node aw, int k, int kLbl) {
+        Node m = methNodes[mi];
+        int n = inner.kids.Count;
+        if (n > 4) {
+            diags.Error("ngen: awaited native extern call has " + Convert.ToString(n) + " arguments; at most four scalar arguments are supported", aw.line, aw.col);
+        }
+        string rt = TypeFullName(m.type);
+        bool hasRes = rt != "void";
+        if (hasRes && rt != "int" && rt != "long" && rt != "nint") {
+            diags.Error("ngen: awaited native extern call returns '" + rt + "', but only int, long, nint, or void can cross a suspension safely", aw.line, aw.col);
+        }
+        int pc = ParamCount(m);
+        int pi = 0;
+        while (pi < pc) {
+            Node p = ParamAt(m, pi);
+            if (p == null) { break; }
+            string pt = TypeFullName(p.type);
+            if (pt != "int" && pt != "long" && pt != "nint" && pt != "bool"
+                    && pt != "byte" && pt != "sbyte" && pt != "short"
+                    && pt != "char" && pt != "uint" && pt != "ushort"
+                    && pt != "ulong" && FindEnum(pt) < 0) {
+                diags.Error("ngen: awaited native extern argument " + Convert.ToString(pi + 1) + " has type '" + pt + "'; only integer, nint, bool, and enum scalars are safe across suspension", aw.line, aw.col);
+            }
+            pi = pi + 1;
+        }
+        EnsureAsyncRuntimeNg();
+        int pushN = n > 4 ? 4 : n;
+        int ai = 0;
+        while (ai < n) {
+            GenExpr(inner.kids[ai]);
+            if (ai < pushN) { PushV(0); }      // push arg (16-aligned)
+            ai = ai + 1;
+        }
+        SaveSlotsNg();
+        if (pushN >= 4) { PopV(3); }          // pop in reverse into x0..x3
+        if (pushN >= 3) { PopV(2); }
+        if (pushN >= 2) { PopV(1); }
+        if (pushN >= 1) { PopV(0); }
+        BLExtern(ExternSymNg(m));                    // x0 = raw result
+        if (rt == "int") {
+            Sxtw0();                          // sxtw x0, w0 (EOF == -1)
+        } else if (rt == "short") {
+            E4(0x93403C00);                          // sxth x0, w0
+        }
+        if (hasRes) {
+            LoadLocal(asyncFrameLocal, 9);
+            StrU(0, 9, 32);                          // frame.result = raw
+        }
+        LoadLocal(asyncFrameLocal, 1);
+        LoadImm(0, k);
+        StrU(0, 1, 0);                               // state = k
+        LoadLocal(asyncFrameLocal, 1);               // x1 = frame
+        LoadSymRef(asyncResumeSym, 2);               // x2 = self $resume
+        MovRR(0, 1);                                 // co_ready(frame, step)
+        MovRR(1, 2);
+        BLInternal("_zan_co_ready");                 // immediate re-ready
+        AsyncEhUnarmNg();                            // suspend disarms
+        Epilogue();                                  // ret to the scheduler
+        Mark(kLbl);
+        // ---- resume-k ----
+        ReloadSlotsNg();
+        int rti = 0;
+        while (rti < asyncTryCatchLs.Count) {        // re-arm trys open around
+            ArmAsyncTryBufNg(asyncTryCatchLs[rti]);  // the suspension
+            rti = rti + 1;
+        }
+        if (hasRes) {
+            LoadLocal(asyncFrameLocal, 9);
+            LdrU(0, 9, 32);                          // the result slot
+        } else {
+            LoadImm(0, 0);
+        }
+    }
+
+    // the awaited callee is itself a delegate VALUE (local, field,
+    // parameter -- `await onDown(conn);`): its thunk dispatches to a
+    // method-group ramp that yields the frame handle like any instance
+    // call, and the general await reads the SELF resume out of the frame
+    // for indirect calls (irgen_expr.c:8540). Only await paths consult
+    // this -- statement-level detach recognition (PrepareAsyncStmtNg)
+    // must NOT see a -2 for an ordinary delegate invocation.
+    bool IsDelegateCalleeNg(Node call) {
+        if (call == null || call.a == null) { return false; }
+        Node callee = call.a;
+        if (callee.kind != AK.Ident() && callee.kind != AK.MemberAccess()) { return false; }
+        string dt = StaticTyOf(callee);
+        return dt != null && IsDelegateTyNg(dt);
+    }
+
+    // classify an awaited/detached call: -1 = not an async call, >= 0 = the
+    // static method index (CallStaticNg emits the ramp call), -2 = an
+    // instance/interface/virtual dispatch (GenExpr emits it -- the vtable
+    // slot holds the ramp, so the call still yields the frame handle)
+    int AsyncResolveCallNg(Node call) {
+        asyncWhyNg = "not-a-call";
+        if (call == null || call.kind != AK.Call() || call.a == null) { return -1; }
+        int mi = ResolveStaticNg(call);
+        if (mi >= 0) {
+            if (IsAsync(methNodes[mi]) && !HasMod(methNodes[mi], MOD.Extern())
+                    && !HasTypeParams(methNodes[mi])) { return mi; }
+            asyncWhyNg = "static-not-async";
+            return -1;
+        }
+        Node callee = call.a;
+        string name = callee.sval;
+        string rc = null;
+        if (callee.kind == AK.MemberAccess() && callee.a != null) {
+            rc = ExprCls(callee.a);
+        } else if (callee.kind == AK.Ident() && LocalIdx("this") >= 0) {
+            rc = curCls;                                 // implicit `this` receiver
+        }
+        if (rc == null) {
+            asyncWhyNg = "rc-null kind=" + Convert.ToString(callee.kind);
+            return -1;
+        }
+        List<int> icands = new List<int>();
+        InstanceCands(rc, name, icands);
+        int im = icands.Count > 0 ? FitPickIdx(icands, call) : -1;
+        // C# spellings declare interface members without `async`
+        // (`Task<int> ComputeAsync(int a, int b);`), so the interface's
+        // abstract declaration carries no async mod even when every
+        // implementation is an async method (async_csharp_task); the
+        // concrete override is not on the interface's own chain either.
+        // The vtable dispatch is unaffected -- the override's ramp fills
+        // the same slot -- so a bodyless declaration with a Task-shaped
+        // return type is awaitable too (the declared type is what makes
+        // it awaitable in C#). Only the verdict reads these; the -2
+        // emission re-resolves on its own.
+        bool ifaceTask = false;
+        if (im >= 0 && !IsAsync(methNodes[im])) {
+            int ci2 = 0;
+            while (ci2 < icands.Count) {
+                Node cm = methNodes[icands[ci2]];
+                if (!HasMod(cm, MOD.Extern()) && !HasTypeParams(cm)
+                        && cm.d == null && IsTaskShapedRetNg(cm)) {
+                    ifaceTask = true;
+                    break;
+                }
+                ci2 = ci2 + 1;
+            }
+        }
+        // The global name-only fallback is sound only for an implicit-this
+        // call (rc == curCls): an explicit receiver (d.Add(k, v) on the
+        // builtin Dict, List.Add, ...) must resolve on its own class chain.
+        // Without that bound a test's own `async int Add(string, int)`
+        // matched statement-level Dict.Add calls and detached them as
+        // coroutine spawns (orm_table_accessor's byCol dict corruption).
+        if (im < 0 && callee.kind == AK.Ident()) { im = FindInstanceIdx(name); }
+        if (im < 0) {
+            asyncWhyNg = "no-inst rc=" + rc + " ncands=" + Convert.ToString(icands.Count);
+            return -1;
+        }
+        Node m = methNodes[im];
+        if ((!IsAsync(m) && !ifaceTask) || HasMod(m, MOD.Extern())
+                || HasTypeParams(m)) {
+            asyncWhyNg = "inst-not-async im=" + Convert.ToString(im);
+            return -1;
+        }
+        return -2;
+    }
+
+    // emit an async call whose frame lands in x0 (the ramp returns it)
+    void EmitAsyncCallNg(int kind, int mi, Node call) {
+        if (kind >= 0) { CallStaticNg(mi, call); }
+        else if (kind == -2) { GenExpr(call); }
+        else { LoadImm(0, 0); }
+    }
+}

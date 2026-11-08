@@ -1,0 +1,671 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    // ---- List<T>, ABI-identical to gen0's %List = {i64 count, i64 cap, ptr data} ----
+
+    // new List<T>(): alloc 24+16 (calloc-zeroed count), cap = 8,
+    // data = calloc(8, 8) -- mirrors gen0's collection initializer
+    void GenListNew(Node e) {
+        // batch 12: a view stored in a list would outlive the method frame
+        // that owns its box (ref-struct shape)
+        if (e != null && e.type != null && e.type.kids != null
+                && e.type.kids.Count > 0
+                && SpanTyNg(TypeFullName(e.type.kids[0]))) {
+            diags.Error("ngen: a Span view cannot be a List element (ref-struct shape)", e.line, e.col);
+            LoadImm(0, 0);
+            return;
+        }
+        // copy constructor: `new List<T>(src)` clones count/cap and copies
+        // the slot array (shallow: class elements share instances, gen0
+        // parity; the copy is independent of later Add on either side)
+        if (e != null && e.ival != 2 && e.kids.Count == 1
+                && ExprCls(e.kids[0]) == "List") {
+            GenExpr(e.kids[0]);                          // x0 = src
+            XPushV0();                                   // push src
+            LoadImm(0, 24 + 16);
+            LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");                 // x0 = obj
+            XPushV0();                                   // push obj
+            LdrU(1, 31, 16);                             // x1 = src
+            LdrU(2, 1, 0);                               // src->count
+            StrU(2, 0, 0);                               // obj->count
+            LdrU(2, 1, 8);                               // src->cap
+            StrU(2, 0, 8);                               // obj->cap
+            MovRR(0, 2);                                 // x0 = cap
+            LoadImm(1, 8);
+            BLExtern("_calloc");                         // x0 = data
+            MovRR(9, 0);                                 // x9 = data
+            LdrU(0, 31, 0);                              // x0 = obj
+            StrU(9, 0, 16);                              // obj->data = data
+            MovRR(0, 9);                                 // dst
+            LdrU(1, 31, 16);                             // x1 = src
+            LdrU(1, 1, 16);                              // src->data
+            LdrU(2, 31, 0);                              // x2 = obj
+            LdrU(2, 2, 0);                               // count
+            LoadImm(3, 8);
+            if (tgt86 == 1) { X3(0x48, 0x0F, 0xAF); X1(0xD1); }  // imul rdx, rcx
+            else { E4(0x9B037C42); }                     // mul x2, x2, x3
+            BLExtern("_memcpy");                         // copy the slots
+            LdrU(0, 31, 0);                              // x0 = obj (result)
+            AddSPImm(32, true);                          // pop obj + src
+            return;
+        }
+        LoadImm(0, 24 + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        XPushV0();                                   // str x0, [sp, #-16]! (obj)
+        LoadImm(1, 8);
+        StrU(1, 0, 8);                               // obj->cap = 8
+        LoadImm(0, 8);
+        LoadImm(1, 8);
+        BLExtern("_calloc");                         // data = calloc(8, 8)
+        XPopV(1);                                    // ldr x1, [sp], #16 (obj)
+        StrU(0, 1, 16);                              // obj->data = x0
+        MovRR(0, 1);                                 // result = obj
+        // collection initializer: `new List<T> { a, b, c }` appends each
+        // item through the same growth path as Add
+        if (e != null && e.ival == 2) {
+            XPushV0();                               // push list
+            int j = 0;
+            while (j < e.kids.Count) {
+                GenExpr(e.kids[j]);
+                MovRR(1, 0);                         // x1 = value
+                LdrU(0, 31, 0);                      // x0 = list (peek)
+                ListAppendRaw();
+                j = j + 1;
+            }
+            XPopV(0);                                // pop list -> x0
+        }
+    }
+
+    // append with x0 = list and x1 = value: grows the backing store when
+    // full, stores the value, bumps the count
+    void ListAppendRaw() {
+        // re-push list+value as one pair: the str-only push leaves the
+        // upper half of the slot stale (callee-saved LR from earlier calls)
+        XPushPair01();                               // stp x0, x1, [sp, #-16]!
+        LdrU(2, 0, 0);                               // count
+        LdrU(3, 0, 8);                               // cap
+        if (tgt86 == 1) { Xop(0x39, 2, 1); }         // cmp rdx, rcx (x2 - x3)
+        else { E4(0xEB03005F); }                     // cmp x2, x3
+        int skip = NL();
+        EmitBcond(1, skip);                          // b.ne skip (cond 1 = NE)
+        AddRR(3, 3, 3);                              // ncap = cap * 2
+        StrU(3, 0, 8);                               // cap = ncap
+        LdrU(4, 0, 16);                              // old data
+        MovRR(9, 3);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                              // x9 = ncap * 8 bytes
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        LdrU(5, 31, 0);                              // x5 = list
+        StrU(0, 5, 16);                              // list->data = new data
+        Mark(skip);
+        LdrU(0, 31, 0);                              // list
+        LdrU(2, 0, 0);                               // count
+        LdrU(3, 0, 16);                              // data
+        LdrU(1, 31, 8);                              // value
+        if (tgt86 == 1) {
+            X3(0x48, 0x89, 0x34); X1(0xD1);          // mov [rcx + rdx*8], rsi
+        } else {                                     // (str x1, [x3, x2, lsl #3])
+            E4(0xF8207800 | (2 << 16) | (3 << 5) | 1);   // str x1, [x3, x2, lsl #3]
+        }
+        AddImm(2, 2, 1);                             // count + 1
+        StrU(2, 0, 0);                               // list->count
+        AddSPImm(16, true);                          // pop the stp'd pair
+    }
+
+    // new T[count]: gen0's inline array allocation. Layout from the user
+    // pointer arr: count = i64 at arr-16, magic2 at arr-24, data at arr+0.
+    // raw = calloc(count*esz + 32): [raw]=rc 1, [raw+8]=25404552263127619,
+    // [raw+16]=count, [raw+24]=6503565379360670041. A negative count reports
+    // "negative array length" and then fails the overflow guard (which
+    // zeroes count, like gen0's select pair); a failed calloc reports and
+    // stores into null exactly like gen0's continue-after-guard flow.
+    void GenArrNew(Node countExpr, int esz) {
+        if (countExpr == null) {
+            LoadImm(0, 0);
+        } else {
+            GenExpr(countExpr);                          // x0 = count
+        }
+        // negative guard: report, keep the value (gen0's rt.cont keeps %0)
+        StringCmp(0, 31);                            // cmp x0, xzr
+        int okneg = NL();
+        EmitBcond(10, okneg);                        // b.ge okneg
+        XPushR(0);                                   // keep count
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrNeg, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        XPopV(0);                                    // pop count
+        Mark(okneg);
+        // total = count * esz; overflow = total > 2^64-33 (unsigned)
+        MovRR(1, 0);                                 // x1 = count
+        if (tgt86 == 1) {
+            // shl rdi, 2/3(v0 常驻 rdi;C1 /4 imm8 形态)
+            X1(0x48); X1(0xC1); X1(0xE7); X1(esz == 4 ? 2 : 3);
+        } else if (esz == 4) {
+            E4(0xD37EF400);                          // lsl x0, x0, #2
+        } else {
+            E4(0xD37DF000);                          // lsl x0, x0, #3
+        }
+        LoadImm(9, -33);                             // x9 = 0xFFFF...FFDF
+        StringCmp(0, 9);                             // cmp x0, x9
+        int okovf = NL();
+        EmitBcond(9, okovf);                         // b.ls okovf (unsigned <=)
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrOvf, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        LoadImm(0, 0);                               // safe total = 0
+        LoadImm(1, 0);                               // safe count = 0
+        Mark(okovf);
+        // bytes = total + 32; raw = calloc(bytes, 1)
+        AddImm(0, 0, 32);                            // add x0, x0, #32
+        XPushR(1);                                   // push count
+        LoadImm(1, 1);
+        BLExtern("_calloc");                         // x0 = raw
+        XPopV(1);                                    // pop count -> x1
+        // null guard: gen0 reports and continues into the stores
+        int okalloc = NL();
+        CbnzReg(0, okalloc);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrFail, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        Mark(okalloc);
+        XPushR(0);                                   // push raw
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                               // raw->rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                               // raw->rcmagic
+        StrU(1, 0, 16);                              // raw->count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                              // raw->magic2
+        XPopV(0);                                    // pop raw -> x0
+        AddImm(0, 0, 32);                            // add x0, x0, #32 (arr)
+    }
+
+    // list.Count: load field 0
+    void GenListCount(Node recv) {
+        GenExpr(recv);
+        LdrU(0, 0, 0);
+    }
+
+    void GenListAdd(Node recv, Node arg) {
+        GenExpr(recv);
+        XPushV0();                                   // push list
+        GenExpr(arg);
+        // List<double>.Add(3) coerces the int at the boundary (gen0's
+        // int-coerce path); the slot then carries the double bit pattern.
+        // List<int>.Add of a long-valued literal narrows to int32.
+        if (StaticTyOf(recv) == "List<double>" && !IsDblExpr(arg)) {
+            ConvI2D();
+        } else if (StaticTyOf(recv) == "List<int>" && !IsDblExpr(arg) && !IsStrExpr(arg)) {
+            Sxtw0();                          // sxtw x0, w0
+        } else if (StaticTyOf(recv) == "List<float>" && !IsStrExpr(arg)) {
+            // batch 29: float slots round on the way in -- but an int
+            // argument must widen BEFORE the round: NarrowF32 alone
+            // reinterprets the integer bits as a double bit pattern, and
+            // 2 became a denormal that rounds to 0.0f (kernel-gap: no
+            // golden covered List<float>.Add(int)). Double-valued args
+            // arrive as double bits, which NarrowF32 rounds idempotently.
+            if (!IsDblExpr(arg)) { ConvI2D(); }
+            NarrowF32();
+        }
+        GenCloneIfStruct(arg);                       // element copies by value
+        MovRR(1, 0);                                 // x1 = value
+        LdrU(0, 31, 0);                              // x0 = list (peek)
+        ListAppendRaw();
+        AddSPImm(16, true);                          // pop list
+    }
+
+    // ---- List<T> operation family (gen0-compatible inline sequences;
+    // layout: [list+0] count, [list+8] cap, [list+16] data of 8-byte slots) ----
+
+    // one shared prologue discipline: frame 32 below the saved pair
+    void RtListFrame(string name) {
+        syms.Add(new Sym(name, FnPad()));
+        RtPrologue();
+        AddSPImm(32, false);
+    }
+    void RtListReturn() {
+        AddSPImm(32, true);
+        RtEpilogue();
+    }
+
+    void RtEmitListOps() {
+        RtEmitListRemoveAt();
+        RtEmitListInsert();
+        RtEmitListReverse();
+        RtEmitListReserve();
+        RtEmitListIndexOf(false);
+        RtEmitListIndexOf(true);
+        RtEmitListAddRange();
+        RtEmitListToArray(8);
+        RtEmitListToArray(4);
+        RtEmitListToArray(2);
+        RtEmitListToArray(1);
+        RtEmitListToArrayF32();
+        RtEmitDictIndex();
+        RtEmitDictSet();
+        RtEmitDictGet();
+        RtEmitDictQuery();
+        RtEmitDictTryGet();
+        RtEmitDictKeysValues(16);
+        RtEmitDictKeysValues(24);
+    }
+
+    // void _zan_rt_list_removeat(ptr list, i64 idx): an out-of-range idx
+    // leaves the list untouched
+    void RtEmitListRemoveAt() {
+        RtListFrame("_zan_rt_list_removeat");
+        RtStur(0, 29, -16);                    // list
+        RtStur(1, 29, -24);                    // idx
+        LdrU(2, 0, 0);                         // count
+        RtLdur(3, 29, -24);
+        int ok = NL();
+        if (tgt86 == 1) { Xop(0x39, 1, 2); } else { E4(0xEB02007F); }   // cmp x3(idx), x2(count)
+        EmitBcond(3, ok);                      // b.lo (unsigned: negatives fail)
+        RtListReturn();
+        Mark(ok);
+        LdrU(4, 0, 16);                        // data
+        RtLdur(3, 29, -24);
+        // x0 = data + idx*8 (dst), x1 = x0 + 8 (src): elements shift LEFT
+        if (tgt86 == 1) { X4(0xC83C8D49); } else { E4(0x8B000000 | (3 << 16) | (3 << 10) | (4 << 5) | 0); }   // add x0,x4,x3,lsl#3 / lea rdi,[r8+rcx*8]
+        AddImm(1, 0, 8);
+        // x2 = (count - idx - 1) * 8
+        if (tgt86 == 1) { X3(0x48, 0x29, 0xCA); } else { E4(0xCB030042); }   // sub x2, x2, x3
+        SubImm(2, 2, 1);
+        if (tgt86 == 1) { X4(0x03E2C148); } else { E4(0xD37DF042); }   // lsl x2, x2, #3 / shl rdx,3
+        BLExtern("_memmove");
+        RtLdur(0, 29, -16);                    // x0 = list (memmove returns dst)
+        LdrU(2, 0, 0);
+        SubImm(2, 2, 1);
+        StrU(2, 0, 0);                         // count - 1
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_insert(ptr list, i64 idx, i64 value): idx == count
+    // appends; out of range leaves the list untouched
+    void RtEmitListInsert() {
+        RtListFrame("_zan_rt_list_insert");
+        AddSPImm(16, false);                   // value@-32 (frame 48 total)
+        RtStur(0, 29, -16);                    // list
+        RtStur(1, 29, -24);                    // idx
+        RtStur(2, 29, -32);                    // value
+        LdrU(2, 0, 0);                         // count
+        RtLdur(3, 29, -24);
+        int oki = NL();
+        if (tgt86 == 1) { Xop(0x39, 1, 2); } else { E4(0xEB02007F); }   // cmp idx,count / cmp rcx,rdx
+        EmitBcond(3, oki);                     // b.lo ok (idx < count)
+        if (tgt86 == 1) { Xop(0x39, 1, 2); } else { E4(0xEB02007F); }   // cmp idx, count
+        EmitBcond(0, oki);                     // b.eq ok (idx == count)
+        AddSPImm(48, true);
+        RtEpilogue();
+        Mark(oki);
+        LdrU(6, 0, 0);
+        AddImm(6, 6, 1);                       // wanted = count + 1
+        ListGrow();
+        RtLdur(0, 29, -16);                    // x0 = list (ListGrow clobbers x0)
+        // shift: memmove(data + (idx+1)*8, data + idx*8, (count - idx) * 8)
+        LdrU(4, 0, 16);
+        RtLdur(3, 29, -24);
+        if (tgt86 == 1) { XGetV(3, 10); X4(0xC8348D49); } else { E4(0x8B000000 | (3 << 16) | (3 << 10) | (4 << 5) | 1); }   // x1 = data + idx*8 / lea rsi,[r8+rcx*8]
+        AddImm(0, 1, 8);                       // x0 = x1 + 8
+        RtLdur(2, 29, -16);                    // x2 = list (x0 is dst now)
+        LdrU(2, 2, 0);                         // count
+        if (tgt86 == 1) { Xop(0x29, 2, 1); } else { E4(0xCB030042); }   // sub x2,x2,x3 / sub rdx,rcx
+        if (tgt86 == 1) { X4(0x03E2C148); } else { E4(0xD37DF042); }   // lsl x2,x2,#3 / shl rdx,3
+        BLExtern("_memmove");
+        RtLdur(0, 29, -16);                    // x0 = list (memmove returns dst)
+        // data[idx] = value; count + 1
+        LdrU(4, 0, 16);
+        RtLdur(3, 29, -24);
+        RtLdur(6, 29, -32);
+        // str x6, [x4, x3, lsl #3]:x86 = mov [r8+rcx*8], r10——REX = W|R|B
+        // = 4D(R 是 bit2=4!首写成 4B=W|X|B:源变 rdx、下标变垃圾 r9,
+        // Rosetta 直接 UE;capstone 反汇编 4919 当场抓获)
+        if (tgt86 == 1) { XGetV(6, 10); X4(0xC814894D); } else { E4(0xF8207800 | (3 << 16) | (4 << 5) | 6); }   // str x6,[x4,x3,lsl#3] / mov [r8+rcx*8],r10
+        LdrU(2, 0, 0);
+        AddImm(2, 2, 1);
+        StrU(2, 0, 0);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // grow the list in x0 until cap >= x6 (the wanted count): doubles from 4
+    // and reallocs; list lives at [x29-16]. Clobbers x2..x5, x9, x0, x1 --
+    // reload pointers from the frame afterwards.
+    void ListGrow() {
+        LdrU(2, 0, 0);                         // count
+        LdrU(3, 0, 8);                         // cap
+        int have = NL();
+        CbnzReg(3, have);
+        LoadImm(3, 4);                         // first growth from zero
+        Mark(have);
+        int chk = NL();
+        int grown = NL();
+        Mark(chk);
+        if (tgt86 == 1) { XGetV(6, 10); Xop(0x39, 1, 10); } else { E4(0xEB06007F); }   // cmp cap,wanted / cmp rcx,r10
+        EmitBcond(8, grown);                   // b.hi cap > wanted: done
+        AddRR(3, 3, 3);                        // cap *= 2
+        EmitB(chk);
+        Mark(grown);
+        StrU(3, 0, 8);                         // list->cap
+        LdrU(4, 0, 16);                        // old data
+        MovRR(9, 3);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                        // x9 = cap * 8
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        RtLdur(5, 29, -16);                    // list
+        StrU(0, 5, 16);                        // list->data
+    }
+
+    // void _zan_rt_list_reserve(ptr list, i64 want): pre-grow the backing
+    // buffer so the next adds never realloc; want <= cap (including any
+    // negative request) leaves the list untouched
+    void RtEmitListReserve() {
+        RtListFrame("_zan_rt_list_reserve");
+        RtStur(0, 29, -16);                    // list
+        RtStur(1, 29, -24);                    // want
+        LdrU(6, 0, 8);                         // x6 = cap
+        RtLdur(2, 29, -24);                    // x2 = want
+        int done = NL();
+        if (tgt86 == 1) { XGetV(6, 10); Xop(0x39, 10, 2); } else { E4(0xEB020000 | (2 << 16) | (6 << 5) | 31); }   // cmp cap,want / cmp r10,rdx
+        EmitBcond(8, done);                    // b.hi cap > want
+        EmitBcond(0, done);                    // b.eq cap == want
+        MovRR(6, 2);                           // wanted = want
+        ListGrow();                            // grow + realloc (caps at >= want)
+        Mark(done);
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_reverse(ptr list)
+    void RtEmitListReverse() {
+        RtListFrame("_zan_rt_list_reverse");
+        RtStur(0, 29, -16);
+        LdrU(2, 0, 0);                         // count
+        LoadImm(3, 2);
+        int go = NL();
+        if (tgt86 == 1) { Xop(0x39, 2, 1); } else { E4(0xEB03005F); }   // cmp count,2 / cmp rdx,rcx
+        EmitBcond(10, go);                     // b.ge (>= 2)
+        RtListReturn();
+        Mark(go);
+        LdrU(4, 0, 16);                        // data
+        LoadImm(5, 0);                         // x5 = i = 0 (same arm64 word)
+        SubImm(6, 2, 1);                       // x6 = j = count - 1
+        int lp2 = NL();
+        int fin = NL();
+        Mark(lp2);
+        if (tgt86 == 1) { XGetV(6, 10); Xop(0x39, 9, 10); } else { E4(0xEB0600BF); }   // cmp i,j / cmp r9,r10
+        EmitBcond(10, fin);                    // b.ge done
+        EmitArrElemLoad(8, "long", 4, 5, 7);   // x7 = data[i]
+        EmitArrElemLoad(8, "long", 4, 6, 8);   // x8 = data[j]
+        if (tgt86 == 1) { XGetV(8, 10); X4(0xC814894F); } else { E4(0xF8207800 | (5 << 16) | (4 << 5) | 8); }   // data[i]=x8 / mov [r8+r9*8],r10
+        if (tgt86 == 1) { XGetV(7, 10); XGetV(6, 11); X4(0xD814894F); } else { E4(0xF8207800 | (6 << 16) | (4 << 5) | 7); }   // data[j]=x7 / mov [r8+r11*8],r10
+        AddImm(5, 5, 1);
+        SubImm(6, 6, 1);
+        EmitB(lp2);
+        Mark(fin);
+        RtListReturn();
+    }
+
+    // i64 _zan_rt_list_indexof[_str](ptr list, i64 value): first equal slot,
+    // or -1; the _str form compares strings by value
+    void RtEmitListIndexOf(bool strForm) {
+        RtListFrame(strForm ? "_zan_rt_list_indexof_str" : "_zan_rt_list_indexof");
+        RtStur(0, 29, -16);
+        RtStur(1, 29, -24);
+        LdrU(4, 0, 16);                        // data
+        LdrU(5, 0, 0);                         // count
+        RtLdur(7, 29, -24);                    // value
+        LoadImm(6, 0);                         // i = 0 (same arm64 word)
+        RtStur(6, 29, -32);
+        int lp = NL();
+        int miss = NL();
+        int hit = NL();
+        Mark(lp);
+        RtLdur(0, 29, -16);
+        LdrU(4, 0, 16);
+        LdrU(5, 0, 0);
+        RtLdur(7, 29, -24);
+        RtLdur(6, 29, -32);
+        if (tgt86 == 1) { XGetV(6, 10); Xop(0x39, 10, 9); } else { E4(0xEB0500DF); }   // cmp i,count / cmp r10,r9
+        EmitBcond(10, miss);                   // b.ge -> -1
+        EmitArrElemLoad(8, "long", 4, 6, 0);   // x0 = data[i]
+        if (strForm) {
+            MovRR(1, 7);
+            BLExtern("_strcmp");
+            if (tgt86 == 1) { X2(0x85, 0xC0); } else { E4(0x7100001F); }   // cmp w0,#0 / test eax,eax
+            EmitBcond(0, hit);
+        } else {
+            if (tgt86 == 1) { XGetV(7, 10); Xop(0x39, 7, 10); } else { E4(0xEB07001F); }   // cmp x0,value / cmp rdi,r10
+            EmitBcond(0, hit);
+        }
+        RtLdur(6, 29, -32);
+        AddImm(6, 6, 1);
+        RtStur(6, 29, -32);
+        EmitB(lp);
+        Mark(miss);
+        LoadImm(0, -1);
+        RtListReturn();
+        Mark(hit);
+        RtLdur(0, 29, -32);
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_addrange(ptr dst, ptr src): appends every src slot;
+    // self-append is safe (reads [0, oldCount), writes [oldCount, ...)).
+    // State lives in callee-saved x19-x23 (realloc/memcpy preserve them),
+    // so there are no frame-slot reloads to get out of sync.
+    void RtEmitListAddRange() {
+        syms.Add(new Sym("_zan_rt_list_addrange", FnPad()));
+        RtPrologue();
+        AddSPImm(48, false);                   // saves: x19@-16..x23@-48
+        RtStur(19, 29, -16);
+        RtStur(20, 29, -24);
+        RtStur(21, 29, -32);
+        RtStur(22, 29, -40);
+        RtStur(23, 29, -48);
+        MovRR(19, 0);                          // x19 = dst
+        MovRR(20, 1);                          // x20 = src
+        CbzReg(20, NL());
+        int snul = lblPos.Count - 1;
+        LdrU(21, 20, 0);                       // x21 = n
+        CbzReg(21, snul);
+        // grow dst until cap >= count + n
+        LdrU(22, 19, 0);                       // x22 = wanted = count
+        AddRR(22, 22, 21);
+        LdrU(23, 19, 8);                       // x23 = cap
+        int have = NL();
+        CbnzReg(23, have);
+        LoadImm(23, 4);
+        Mark(have);
+        int chk = NL();
+        int grown = NL();
+        Mark(chk);
+        if (tgt86 == 1) { XGetV(23, 10); XGetV(22, 11); Xop(0x39, 10, 11); } else { E4(0xEB000000 | (22 << 16) | (23 << 5) | 31); }   // cmp cap,wanted / cmp r10,r11
+        EmitBcond(8, grown);                   // b.hi
+        AddRR(23, 23, 23);
+        EmitB(chk);
+        Mark(grown);
+        StrU(23, 19, 8);                       // dst->cap
+        LdrU(0, 19, 16);                       // old data
+        MovRR(9, 23);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                        // cap * 8
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        StrU(0, 19, 16);                       // dst->data
+        // memcpy(dst->data + count*8, src->data, n*8)
+        LdrU(4, 19, 16);
+        LdrU(6, 19, 0);
+        // add x0,x4,x6,lsl#3 三操作数直写 x0(m memcpy 第一参数);x86 的 lea
+        // 是二操作数,目的必须显式落 rdi——首版写成 lea rax,rdi 仍是 realloc
+        // 返回值,memcpy 落在 data 起点而不是 data+count(第二次 AddRange 把
+        // 前 count 个同值覆写、后 n 个不写,索引读出 10,20,30,40,0,0,0,0)
+        if (tgt86 == 1) { XGetV(6, 10); X4(0xD03C8D4B); } else { E4(0x8B000000 | (6 << 16) | (3 << 10) | (4 << 5) | 0); }   // x0 = dstdata+count*8 / lea rdi,[r8+r10*8]
+        LdrU(1, 20, 16);
+        if (tgt86 == 1) { XGetV(21, 2); X4(0x03E2C148); } else { E4(0xD37DF000 | (21 << 5) | 2); }   // lsl x2,x21,#3 / shl rdx,3
+        BLExtern("_memcpy");
+        // dst.count += n
+        LdrU(3, 19, 0);
+        AddRR(3, 3, 21);
+        StrU(3, 19, 0);
+        RtLdur(19, 29, -16);
+        RtLdur(20, 29, -24);
+        RtLdur(21, 29, -32);
+        RtLdur(22, 29, -40);
+        RtLdur(23, 29, -48);
+        AddSPImm(48, true);
+        RtEpilogue();
+        Mark(snul);
+        RtLdur(19, 29, -16);
+        RtLdur(20, 29, -24);
+        RtLdur(21, 29, -32);
+        RtLdur(22, 29, -40);
+        RtLdur(23, 29, -48);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // List<T>.ToArray() per packed element size (float has its own face):
+    // the list's slots are always 8 bytes wide, but the RESULT array packs
+    // the static element size (long/double/string/object = 8, int/uint/
+    // char = 4, short/ushort = 2, bool/byte/sbyte = 1). esz==8 is a flat
+    // memcpy; esz<8 repacks element-by-element like toarray_f32. The first
+    // cut memcpy'd count*8 bytes for every type -- reading the result as
+    // int[] then yields interleaved zeros (10,0,20,0,...) on BOTH lanes;
+    // the arm64 reference shipped the same wrong bytes, so the fixture was
+    // green while self-consistent, not while correct.
+    void RtEmitListToArray(int esz) {
+        string face = "_zan_rt_list_toarray";
+        if (esz == 4) { face = "_zan_rt_list_toarray4"; }
+        else if (esz == 2) { face = "_zan_rt_list_toarray2"; }
+        else if (esz == 1) { face = "_zan_rt_list_toarray1"; }
+        RtListFrame(face);
+        RtStur(0, 29, -16);
+        LdrU(20, 0, 0);                        // x20 = n (callee-saved; calloc preserves)
+        MovRR(4, 20);
+        if (esz == 8) { AddRR(4, 4, 4); }
+        if (esz >= 4) { AddRR(4, 4, 4); }
+        if (esz >= 2) { AddRR(4, 4, 4); }      // x4 = n*esz
+        AddImm(4, 4, 32);                      // bytes = n*esz + 32
+        MovRR(0, 4);
+        LoadImm(1, 1);
+        BLExtern("_calloc");                   // raw
+        MovRR(23, 0);                          // x23 = raw
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                         // rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                         // rcmagic
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);
+        StrU(2, 0, 16);                        // count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                        // magic2
+        if (esz == 8) {
+            // memcpy(raw + 32, data, n * 8) -- all helpers, no raw shifts
+            AddImm(0, 23, 32);                 // dst
+            RtLdur(1, 29, -16);
+            LdrU(1, 1, 16);                    // src = list->data
+            MovRR(2, 20);
+            AddRR(2, 2, 2);
+            AddRR(2, 2, 2);
+            AddRR(2, 2, 2);                    // n*8
+            BLExtern("_memcpy");
+        } else {
+            RtLdur(21, 29, -16);
+            LdrU(21, 21, 16);                  // x21 = data
+            AddImm(19, 23, 32);                // x19 = dst
+            LoadImm(22, 0);                    // x22 = i
+            int loop = NL();
+            int done = NL();
+            Mark(loop);
+            if (tgt86 == 1) { XGetV(22, 10); XGetV(20, 11); Xop(0x39, 10, 11); } else { E4(0xEB1402DF); }   // cmp i,n
+            EmitBcond(10, done);
+            EmitArrElemLoad(8, "long", 21, 22, 9);   // qword slot -> x9/rax
+            MovRR(11, 22);
+            if (esz >= 4) { AddRR(11, 11, 11); }
+            if (esz >= 2) { AddRR(11, 11, 11); }     // x11 = i*esz (byte offset)
+            if (esz == 4) {
+                if (tgt86 == 1) { XGetV(19, 10); XGetV(11, 11); X4(0x1A048943); } else { E4(0xB8206A00 | (11 << 16) | (19 << 5) | 9); }   // str w9,[x19,x11] / mov [r10+r11],eax
+            } else if (esz == 2) {
+                // STRH(register) 基址 0x78206800:bits15:10 = 011 0 10,写成
+                // …6000 时 bits11:10=00 会落进原子类(ldumaxh),存储变读
+                if (tgt86 == 1) { XGetV(19, 10); XGetV(11, 11); X1(0x66); X4(0x1A048943); } else { E4(0x78206800 | (11 << 16) | (19 << 5) | 9); }   // strh w9,[x19,x11] / mov word [r10+r11],ax
+            } else {
+                if (tgt86 == 1) { XGetV(19, 10); XGetV(11, 11); X4(0x1A048843); } else { E4(0x38206800 | (11 << 16) | (19 << 5) | 9); }   // strb w9,[x19,x11] / mov byte [r10+r11],al
+            }
+            AddImm(22, 22, 1);
+            EmitB(loop);
+            Mark(done);
+        }
+        AddImm(0, 23, 32);                     // arr = raw + 32
+        RtListReturn();
+    }
+
+    // List<float>.ToArray(): repack the 8-byte widened-double slots into a
+    // real packed float[] (4-byte single bits), like the reference host
+    void RtEmitListToArrayF32() {
+        RtListFrame("_zan_rt_list_toarray_f32");
+        RtStur(0, 29, -16);
+        LdrU(20, 0, 0);                        // x20 = n (callee-saved; calloc preserves)
+        AddRR(4, 20, 20);                      // x4 = n*4
+        AddRR(4, 4, 4);
+        AddImm(4, 4, 32);                      // bytes = n*4 + 32
+        MovRR(0, 4);
+        LoadImm(1, 1);
+        BLExtern("_calloc");
+        MovRR(23, 0);                          // x23 = raw
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                         // rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                         // rcmagic
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);
+        StrU(2, 0, 16);                        // count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                        // magic2
+        RtLdur(21, 29, -16);
+        LdrU(21, 21, 16);                      // x21 = data
+        AddImm(19, 23, 32);                    // x19 = dst (raw + 32)
+        LoadImm(22, 0);                        // x22 = i
+        int loop = NL();
+        int done = NL();
+        Mark(loop);
+        if (tgt86 == 1) { XGetV(22, 10); XGetV(20, 11); Xop(0x39, 10, 11); } else { E4(0xEB1402DF); }   // cmp i,n / cmp r10,r11
+        EmitBcond(10, done);
+        EmitArrElemLoad(8, "long", 21, 22, 9); // ldr x9, [x21, x22, lsl #3]
+        if (tgt86 == 1) {
+            X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC0);   // movq xmm0, rax (fmov d31, x9)
+            X3(0xF2, 0x0F, 0x5A); X1(0xC0);         // cvtsd2ss xmm0, xmm0 (fcvt s31, d31; F3 是 cvtss2sd 方向反了)
+            X3(0x66, 0x0F, 0x7E); X1(0xC0);         // movd eax, xmm0 (fmov w0, s31)
+        } else {
+        E4(0x9E67013F);                        // fmov d31, x9
+        E4(0x1E6243FF);                        // fcvt s31, d31
+        E4(0x1E2603E0);                        // fmov w0, s31 (single bits)
+        }
+        AddRR(11, 22, 22);                     // x11 = i*4
+        AddRR(11, 11, 11);
+        if (tgt86 == 1) { XGetV(19, 10); XGetV(11, 11); X4(0x1A048943); } else { E4(0xB82B6A60); }   // str w0,[x19,x11] / mov [r10+r11],eax
+        AddImm(22, 22, 1);
+        EmitB(loop);
+        Mark(done);
+        MovRR(0, 19);                          // arr = raw + 32
+        RtListReturn();
+    }
+}

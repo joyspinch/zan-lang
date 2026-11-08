@@ -1,0 +1,494 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+public partial class Parser {
+
+    void QualifyTypes(Node unit) {
+        qDcls = new List<Node>();
+        qFulls = new List<string>();
+        qFinals = new List<string>();
+        qFullIx = new MethIndex();
+        qSimpleIx = new MethIndex();
+        int di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            // class/struct/interface/delegate — interfaces parse as
+            // ClassDecl (abstract+interface mods) and nested declarations
+            // are already hoisted to unit level at this point (the C host
+            // runs zan_parser_flatten_nested_types before
+            // zan_nsresolve_run), so all participate in the conflict table
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()
+                    || d.kind == AK.EnumDecl() || d.kind == AK.DelegateDecl()) {
+                string ns = d.nsName != null ? d.nsName : "";
+                qDcls.Add(d);
+                qFulls.Add(ns == "" ? d.sval : ns + "." + d.sval);
+                qFinals.Add(d.sval);
+            }
+            di = di + 1;
+        }
+        int ci = 0;
+        while (ci < qDcls.Count) {
+            qFullIx.Add(qFulls[ci], ci);
+            qSimpleIx.Add(qDcls[ci].sval, ci);
+            ci = ci + 1;
+        }
+        // 2. cross-namespace simple-name collisions, each unordered pair once
+        List<bool> qConf = new List<bool>();
+        ci = 0;
+        while (ci < qDcls.Count) { qConf.Add(false); ci = ci + 1; }
+        ci = 0;
+        while (ci < qDcls.Count) {
+            List<int> group = qSimpleIx.Get(qDcls[ci].sval);
+            if (group != null) {
+                int g = 0;
+                while (g < group.Count) {
+                    int j = group[g];
+                    if (j > ci && qFulls[j] != qFulls[ci]) {
+                        qConf[ci] = true;
+                        qConf[j] = true;
+                    }
+                    g = g + 1;
+                }
+            }
+            ci = ci + 1;
+        }
+        // 3. give each conflicting declaration a unique mangled name, in
+        // declaration order, each uniquified against every final so far
+        // (including the not-yet-mangled simple names — a dotless full like
+        // `Button` collides with its own initial final and gets `Button_2`)
+        ci = 0;
+        while (ci < qDcls.Count) {
+            if (qConf[ci]) { qFinals[ci] = MangleFull(qFulls[ci]); }
+            ci = ci + 1;
+        }
+        // 3b. rename conflicting declarations
+        ci = 0;
+        while (ci < qDcls.Count) {
+            if (qFinals[ci] != qDcls[ci].sval) { qDcls[ci].sval = qFinals[ci]; }
+            ci = ci + 1;
+        }
+        // 4. rewrite references against each declaration's own context
+        di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            RewriteBaseClause(d, d.nsName != null ? d.nsName : "", d.nsUsings);
+            NsWalkDecl(d);
+            di = di + 1;
+        }
+    }
+
+    string MangleFull(string full) {
+        string m = "";
+        int i = 0;
+        while (i < full.Length) {
+            string ch = full.Substring(i, 1);
+            m = m + (ch == "." ? "_" : ch);
+            i = i + 1;
+        }
+        string cand = m;
+        int suffix = 2;
+        for (;;) {
+            int t = 0;
+            bool taken = false;
+            while (t < qFinals.Count) {
+                if (qFinals[t] == cand) { taken = true; }
+                t = t + 1;
+            }
+            if (!taken) { return cand; }
+            cand = m + "_" + suffix;
+            suffix = suffix + 1;
+        }
+        return cand;
+    }
+
+    int FindFullExact(string full) {
+        if (full == null) { return -1; }
+        List<int> hit = qFullIx.Get(full);
+        if (hit == null) { return -1; }
+        return hit[0];
+    }
+
+    int CountSimple(string r) {
+        List<int> hit = qSimpleIx.Get(r);
+        return hit != null ? hit.Count : 0;
+    }
+
+    // The number of declarations that answer to a simple name AND take the
+    // reference's type arguments (the C host's count_simple_matching). A
+    // generic `Action<T>` and a non-generic `Action` of another namespace do
+    // not make a reference ambiguous -- only same-arity candidates do.
+    int CountSimpleMatching(string r, Node tr) {
+        List<int> hit = qSimpleIx.Get(r);
+        if (hit == null) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < hit.Count) {
+            if (ArityMatches(tr, qDcls[hit[i]])) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // a reference carrying type arguments can only bind to a declaration
+    // with the same type-parameter count; argument-less refs bind to anything
+    bool ArityMatches(Node tr, Node d) {
+        if (tr.kids.Count == 0) { return true; }
+        int tp = 0;
+        int i = 0;
+        while (i < d.kids.Count) {
+            if (d.kids[i].kind == AK.TypeParam()) { tp = tp + 1; }
+            i = i + 1;
+        }
+        return tp == tr.kids.Count;
+    }
+
+    string ResolveQualifiedName(string r, Node tr, List<string> us) {
+        int hit = FindFullExact(r);
+        if (hit < 0 && us != null) {
+            int u = 0;
+            while (u < us.Count && hit < 0) {
+                string up = us[u];
+                if (up != null && up != "") { hit = FindFullExact(up + "." + r); }
+                u = u + 1;
+            }
+        }
+        if (hit >= 0) {
+            if (ArityMatches(tr, qDcls[hit])) { return qFinals[hit]; }
+            hit = -1;
+        }
+        // non-declared (or arity-mismatched) qualified type: reduce to the
+        // trailing segment so the simple-name binder can resolve it (the
+        // generic builtin, if any)
+        int ld = r.LastIndexOf(".");
+        return ld > 0 ? r.Substring(ld + 1) : r;
+    }
+
+    string ResolveSimpleName(string r, Node tr, string ns, List<string> us) {
+        // same-namespace first (the global namespace is a namespace too: a
+        // declaration at global scope must win over an import)
+        string local = ns == "" ? r : ns + "." + r;
+        int hit = FindFullExact(local);
+        if (hit >= 0) {
+            if (ArityMatches(tr, qDcls[hit])) { return qFinals[hit]; }
+            // the same-namespace declaration cannot take the reference's
+            // type arguments: leave untouched so the generic builtin wins
+            return r;
+        }
+        // walk ancestor namespaces (e.g. System.Net.Http -> System.Net -> System)
+        if (ns != "") {
+            string anc = ns;
+            int dot = anc.LastIndexOf(".");
+            while (dot > 0) {
+                anc = anc.Substring(0, dot);
+                hit = FindFullExact(anc + "." + r);
+                if (hit >= 0) {
+                    if (ArityMatches(tr, qDcls[hit])) { return qFinals[hit]; }
+                    return r;
+                }
+                dot = anc.LastIndexOf(".");
+            }
+        }
+        if (us != null) {
+            int u = 0;
+            while (u < us.Count) {
+                string up = us[u];
+                if (up != null && up != "") {
+                    hit = FindFullExact(up + "." + r);
+                    if (hit >= 0) {
+                        if (ArityMatches(tr, qDcls[hit])) { return qFinals[hit]; }
+                        hit = -1;
+                    }
+                }
+                u = u + 1;
+            }
+        }
+        // Last resort for a dangling reference: every context rule missed,
+        // but a declared type somewhere carries this simple name. User decls
+        // sit before the stdlib pull-ins in the unit, so scanning from the
+        // end binds a stdlib file's bare mention of a name a user class
+        // shadows to the stdlib declaration it was written against (a global
+        // user `class Button` renames both it and Gui.Widget.Button; Html.zan
+        // must keep binding the Widget Button it calls InitButton on). Only
+        // namespace-qualified candidates qualify (full != the bare name): a
+        // global declaration that kept its simple name is reachable through
+        // the binder's exact-name lookup below, unchanged. Skipped when the
+        // candidate cannot take the reference's type arguments.
+        // The oracle errors on a bare name declared in two namespaces with no
+        // global declaration; keep that. But when a global declaration does
+        // exist, the oracle leaves the reference for the binder's exact-name
+        // lookup — which only resolves while the declaration kept its simple
+        // name. Under the rename pass both it and its namespaced twin are
+        // mangled, and the reference dangles; bind it to the stdlib-side
+        // declaration instead (see above).
+        bool amb = CountSimpleMatching(r, tr) >= 2 && FindFullExact(r) < 0;
+        if (!amb) {
+            List<int> fall = qSimpleIx.Get(r);
+            if (fall != null) {
+                int fi = fall.Count - 1;
+                while (fi >= 0) {
+                    int cand = fall[fi];
+                    if (qFulls[cand] != r && ArityMatches(tr, qDcls[cand])) {
+                        return qFinals[cand];
+                    }
+                    fi = fi - 1;
+                }
+            }
+        }
+        if (amb) {
+            diags.Error("[E1019] ambiguous type '" + r + "'; qualify it with its namespace", tr.line, tr.col);
+        }
+        return r;
+    }
+
+    void RewriteBaseClause(Node d, string ns, List<string> us) {
+        string b = d.sval2;
+        if (b != null && b != "") {
+            Node tr = new Node(AK.TypeRef());   // no type args: arity always true
+            if (b.IndexOf(".") > 0) { d.sval2 = ResolveQualifiedName(b, tr, us); }
+            else { d.sval2 = ResolveSimpleName(b, tr, ns, us); }
+        }
+        if (d.interfaces != null) {
+            int i = 0;
+            while (i < d.interfaces.Count) {
+                string iname = d.interfaces[i];
+                if (iname != null && iname != "") {
+                    Node tr2 = new Node(AK.TypeRef());
+                    if (iname.IndexOf(".") > 0) { d.interfaces[i] = ResolveQualifiedName(iname, tr2, us); }
+                    else { d.interfaces[i] = ResolveSimpleName(iname, tr2, ns, us); }
+                }
+                i = i + 1;
+            }
+        }
+    }
+
+    // ---- expression-position receivers (mirror of resolve_static_receiver /
+    // resolve_qualified_receiver / collect_shadows) ----
+    // A type name also appears in expression position as the receiver of a
+    // static member access (`Dispatcher.Post(h)`, `Colors.Red`), where it
+    // parses as a plain identifier. Those receivers rewrite to the resolved
+    // declaration's final name too, otherwise renaming leaves every static
+    // call to a mangled class unresolved. Names bound by the enclosing
+    // member (fields, params, locals, foreach/catch vars, lambda params)
+    // shadow: there the identifier means the value, not the type.
+
+    void NsWalkDecl(Node d) {
+        // class/struct fields shadow inside every member body
+        List<string> flds = new List<string>();
+        if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+            int i = 0;
+            while (i < d.kids.Count) {
+                Node m = d.kids[i];
+                if (m.kind == AK.FieldDecl() && m.sval != null && m.sval != "") { flds.Add(m.sval); }
+                i = i + 1;
+            }
+        }
+        NsWalk(d, d.nsName != null ? d.nsName : "", d.nsUsings, flds);
+    }
+
+    void NsWalk(Node n, string ns, List<string> us, List<string> sh) {
+        if (n == null) { return; }
+        // a stamped declaration keeps the file context it was parsed with
+        // (merged partials keep their own file's imports)
+        if (n.nsUsings != null) {
+            ns = n.nsName != null ? n.nsName : "";
+            us = n.nsUsings;
+        }
+        if (n.kind == AK.TypeRef()) {
+            if (n.sval != null && n.sval != "") {
+                if (n.sval.IndexOf(".") > 0) { n.sval = ResolveQualifiedName(n.sval, n, us); }
+                else { n.sval = ResolveSimpleName(n.sval, n, ns, us); }
+            }
+        } else if (n.kind == AK.MethodDecl() || n.kind == AK.CtorDecl()
+                || n.kind == AK.DelegateDecl()) {
+            // one flat shadow set per member, collected before the walk so
+            // every name binds member-wide (nsresolve has no scopes either)
+            List<string> sh2 = CopyShadows(sh);
+            int pi = 0;
+            while (pi < n.kids.Count) {
+                Node p = n.kids[pi];
+                if (p.kind == AK.Param() && p.sval != null && p.sval != "") { sh2.Add(p.sval); }
+                pi = pi + 1;
+            }
+            CollectShadows(n.d, sh2);
+            NsWalk(n.type, ns, us, sh2);
+            pi = 0;
+            while (pi < n.kids.Count) { NsWalk(n.kids[pi], ns, us, sh2); pi = pi + 1; }
+            NsWalk(n.d, ns, us, sh2);
+            return;
+        } else if (n.kind == AK.Lambda()) {
+            List<string> sh2 = CopyShadows(sh);
+            int pi = 0;
+            while (pi < n.kids.Count) {
+                Node p = n.kids[pi];
+                if (p.kind == AK.Param() && p.sval != null && p.sval != "") { sh2.Add(p.sval); }
+                pi = pi + 1;
+            }
+            NsWalk(n.d, ns, us, sh2);
+            NsWalk(n.a, ns, us, sh2);
+            NsWalk(n.type, ns, us, sh2);
+            pi = 0;
+            while (pi < n.kids.Count) { NsWalk(n.kids[pi], ns, us, sh2); pi = pi + 1; }
+            return;
+        } else if (n.kind == AK.MemberAccess() && n.a != null) {
+            if (n.a.kind == AK.Ident() && n.a.sval != null && n.a.sval != ""
+                    && (sh == null || !ShadowHas(sh, n.a.sval))) {
+                string fin = ResolveStaticReceiver(n.a.sval, ns, us);
+                if (fin != null && fin != n.a.sval) { n.a.sval = fin; }
+            } else if (n.a.kind == AK.MemberAccess()) {
+                ResolveQualifiedReceiver(n.a, ns, us, sh);
+            }
+        }
+        NsWalk(n.a, ns, us, sh);
+        NsWalk(n.b, ns, us, sh);
+        NsWalk(n.c, ns, us, sh);
+        NsWalk(n.d, ns, us, sh);
+        NsWalk(n.type, ns, us, sh);
+        int i = 0;
+        while (i < n.kids.Count) { NsWalk(n.kids[i], ns, us, sh); i = i + 1; }
+    }
+
+    List<string> CopyShadows(List<string> sh) {
+        List<string> outList = new List<string>();
+        if (sh != null) {
+            int i = 0;
+            while (i < sh.Count) { outList.Add(sh[i]); i = i + 1; }
+        }
+        return outList;
+    }
+
+    bool ShadowHas(List<string> sh, string name) {
+        int i = 0;
+        while (i < sh.Count) { if (sh[i] == name) { return true; } i = i + 1; }
+        return false;
+    }
+
+    // every name the member binds, anywhere in its body: one flat set, so a
+    // variable is never mistaken for a type of the same name
+    void CollectShadows(Node n, List<string> sh) {
+        if (n == null) { return; }
+        if ((n.kind == AK.VarDecl() || n.kind == AK.Param()
+                || n.kind == AK.ForeachStmt() || n.kind == AK.CatchClause())
+                && n.sval != null && n.sval != "") {
+            sh.Add(n.sval);
+        }
+        if (n.kind == AK.Lambda()) {
+            int i = 0;
+            while (i < n.kids.Count) {
+                Node p = n.kids[i];
+                if (p.kind == AK.Param() && p.sval != null && p.sval != "") { sh.Add(p.sval); }
+                i = i + 1;
+            }
+        }
+        CollectShadows(n.a, sh);
+        CollectShadows(n.b, sh);
+        CollectShadows(n.c, sh);
+        CollectShadows(n.d, sh);
+        int k = 0;
+        while (k < n.kids.Count) { CollectShadows(n.kids[k], sh); k = k + 1; }
+    }
+
+    string ResolveStaticReceiver(string r, string ns, List<string> us) {
+        int hit = FindFullExact(ns == "" ? r : ns + "." + r);
+        if (hit < 0 && us != null) {
+            int u = 0;
+            while (u < us.Count && hit < 0) {
+                string up = us[u];
+                if (up != null && up != "") { hit = FindFullExact(up + "." + r); }
+                u = u + 1;
+            }
+        }
+        if (hit < 0) { hit = FindFullExact(r); }   // global-namespace decl
+        return hit >= 0 ? qFinals[hit] : null;
+    }
+
+    // flattens a receiver made of identifiers and member accesses into a
+    // dotted name; null when it is something else (this.x, calls, indexes)
+    string DottedPathOf(Node n) {
+        if (n == null) { return null; }
+        if (n.kind == AK.Ident()) { return n.sval != null ? n.sval : ""; }
+        if (n.kind == AK.MemberAccess()) {
+            string head = DottedPathOf(n.a);
+            if (head == null || head == "") { return null; }
+            return head + "." + n.sval;
+        }
+        return null;
+    }
+
+    // rewrites a namespace-qualified static receiver (`Beta.Log.Line(...)`)
+    // to the renamed declaration: the whole `Beta.Log` chain collapses into
+    // the single identifier the flat table knows. The qualified name is
+    // resolved the way the C host's nsresolve does -- the current namespace
+    // first, then the file's usings, then the global namespace -- so a
+    // partial namespace path (`Widget.Tooltip` inside `namespace Gui`) names
+    // `Gui.Widget.Tooltip`. Only an exact namespace+type match collapses, so
+    // a field chain is never touched.
+    void ResolveQualifiedReceiver(Node recv, string ns, List<string> us, List<string> sh) {
+        string full = DottedPathOf(recv);
+        if (full == null || full.IndexOf(".") < 0) { return; }
+        // a local variable named like the head of the chain wins over the
+        // namespace: `Widget.Tooltip` is a field access, not a type
+        Node head = HeadIdentOf(recv);
+        if (head != null && sh != null && ShadowHas(sh, head.sval)) { return; }
+        string fin = ResolveStaticReceiver(full, ns, us);
+        if (fin == null) { return; }
+        recv.kind = AK.Ident();
+        recv.sval = fin;
+        recv.a = null;
+        recv.b = null;
+        recv.c = null;
+        recv.d = null;
+        recv.kids = new List<Node>();
+    }
+
+    // the head identifier of a dotted chain (null when there is none)
+    Node HeadIdentOf(Node n) {
+        if (n == null) { return null; }
+        if (n.kind == AK.Ident()) { return n; }
+        if (n.kind == AK.MemberAccess()) { return HeadIdentOf(n.a); }
+        return null;
+    }
+
+    void StripTypeArgs(Node n) {
+        if (n == null) { return; }
+        if (n.kind == AK.MemberAccess() && n.a != null
+                && n.a.b != null && n.a.b.kind == AK.TypeRef()
+                && n.a.b.sval == "__typeargs") {
+            // generic-qualified static access (`Stat<int>.s`): record the
+            // instantiation for ngen's per-instantiation statics
+            string s = "";
+            int i = 0;
+            while (i < n.a.b.kids.Count) {
+                if (i > 0) { s = s + "__"; }
+                s = s + TypeName(n.a.b.kids[i]);
+                i = i + 1;
+            }
+            n.sval2 = s;
+            // keep the type-argument NODES: the LLVM backend gives every
+            // instantiation of a generic class its own static storage
+            // (`Stat<int>.s` vs `Stat<double>.s`) and specializes the
+            // class's static methods per instantiation
+            n.d = n.a.b;
+            n.a.b = null;
+        }
+        if (n.kind == AK.Call() && n.a != null
+                && n.a.b != null && n.a.b.kind == AK.TypeRef()
+                && n.a.b.sval == "__typeargs") {
+            // record the explicit instantiation for ngen's monomorphizer on
+            // the call's d slot (TypeRef kids): sval2 is the named-argument
+            // marker, and a generic call used as an argument carries both
+            n.d = n.a.b;
+            n.a.b = null;
+        }
+        if ((n.kind == AK.MemberAccess() || n.kind == AK.Ident())
+            && n.b != null && n.b.kind == AK.TypeRef() && n.b.sval == "__typeargs") {
+            n.b = null;
+        }
+        StripTypeArgs(n.a);
+        StripTypeArgs(n.b);
+        StripTypeArgs(n.c);
+        StripTypeArgs(n.d);
+        int i = 0;
+        while (i < n.kids.Count) { StripTypeArgs(n.kids[i]); i = i + 1; }
+    }
+}

@@ -1,0 +1,907 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    void EmitArcRuntime() {
+        // header layout, 24 bytes before the object pointer: [ i8* class id ]
+        // [ i64 refcount ] [ i8* destructor ]. zalloc records all three;
+        // zrelease at count 0 runs the destructor (which releases members /
+        // frees internal buffers) then frees. The class id is the address of
+        // the class's tid global -- the runtime type test compares it against
+        // the tid of every class that derives from the tested type, so an
+        // `object` slot can be asked "which class is this?" at runtime.
+        H("define i8* @zalloc(i64 %n, i8* %dtor, i8* %cid) {");
+        H("  %tot = add i64 %n, 24");
+        H("  %raw = call i8* @calloc(i64 1, i64 %tot)");
+        H("  %cp = getelementptr i8, i8* %raw, i64 0");
+        H("  %cs = bitcast i8* %cp to i8**");
+        H("  store i8* %cid, i8** %cs");
+        H("  %rp = getelementptr i8, i8* %raw, i64 8");
+        H("  %rc = bitcast i8* %rp to i64*");
+        H("  store i64 1, i64* %rc");
+        H("  %ds0 = getelementptr i8, i8* %raw, i64 16");
+        H("  %ds = bitcast i8* %ds0 to i8**");
+        H("  store i8* %dtor, i8** %ds");
+        H("  %obj = getelementptr i8, i8* %raw, i64 24");
+        H("  ret i8* %obj");
+        H("}");
+        H("define void @zretain(i8* %p) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %done, label %go");
+        H("go:");
+        H("  %hdr = getelementptr i8, i8* %p, i64 -16");
+        H("  %rc = bitcast i8* %hdr to i64*");
+        H("  %c = atomicrmw add i64* %rc, i64 1 monotonic");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+        H("define void @zrelease(i8* %p) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %done, label %go");
+        H("go:");
+        H("  %hdr = getelementptr i8, i8* %p, i64 -16");
+        H("  %rc = bitcast i8* %hdr to i64*");
+        H("  %c = atomicrmw sub i64* %rc, i64 1 acq_rel");
+        // The count that was there BEFORE the release decides what happens.
+        // 1 -> the last strong reference: the weak slots pointing at the
+        // object are cleared first, then the object dies.  0 or less -> an
+        // over-release: the count only goes down, the object is NOT freed a
+        // second time (the C host answers the same way -- the file
+        // src/compiler/irgen_arc.c, build_class_release_body).
+        H("  %last = icmp eq i64 %c, 1");
+        H("  br i1 %last, label %lastblk, label %done");
+        H("lastblk:");
+        H("  %pv = ptrtoint i8* %p to i64");
+        H("  %ok = call i1 @zan_rt_weak_destroy_begin(i64 %pv)");
+        H("  br i1 %ok, label %dofree, label %done");
+        H("dofree:");
+        H("  %ds0 = getelementptr i8, i8* %p, i64 -8");
+        H("  %ds = bitcast i8* %ds0 to i8**");
+        H("  %dtor = load i8*, i8** %ds");
+        H("  %hasd = icmp ne i8* %dtor, null");
+        H("  br i1 %hasd, label %rund, label %fr");
+        H("rund:");
+        H("  %fn = bitcast i8* %dtor to void (i8*)*");
+        H("  call void %fn(i8* %p)");
+        H("  br label %fr");
+        H("fr:");
+        // the block starts 24 bytes before the object pointer
+        H("  %base = getelementptr i8, i8* %p, i64 -24");
+        H("  call void @free(i8* %base)");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+        // The runtime class identity: the class id stored in the object
+        // header. Null-safe -- a null object has no class.
+        H("define i8* @__zan_class_id(i8* %obj) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %obj, null");
+        H("  br i1 %isnull, label %none, label %read");
+        H("none:");
+        H("  ret i8* null");
+        H("read:");
+        H("  %cp = getelementptr i8, i8* %obj, i64 -24");
+        H("  %cs = bitcast i8* %cp to i8**");
+        H("  %cid = load i8*, i8** %cs");
+        H("  ret i8* %cid");
+        H("}");
+        // Is the object a managed string? The string header keeps a magic word
+        // right before the payload; a class instance has a destructor pointer
+        // there instead. Null-safe.
+        H("define i64 @__zan_is_string(i8* %obj) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %obj, null");
+        H("  br i1 %isnull, label %no, label %read");
+        H("no:");
+        H("  ret i64 0");
+        H("read:");
+        H("  %wp = getelementptr i8, i8* %obj, i64 -8");
+        H("  %wq = bitcast i8* %wp to i64*");
+        H("  %w = load i64, i64* %wq");
+        H("  %eq = icmp eq i64 %w, 1515082580");
+        H("  %z = zext i1 %eq to i64");
+        H("  ret i64 %z");
+        H("}");
+        // Dynamic field metadata lookup: given TypeInfo %ti and string %name,
+        // returns the field's metadata slot pointer { fname, ftype, fkind, foff, ... }, or null if not found.
+        H("define i8* @__zan_refl_field_find(i8* %ti, i8* %name) {");
+        H("entry:");
+        H("  %isnull_ti = icmp eq i8* %ti, null");
+        H("  %isnull_nm = icmp eq i8* %name, null");
+        H("  %bad = or i1 %isnull_ti, %isnull_nm");
+        H("  br i1 %bad, label %miss, label %read");
+        H("read:");
+        H("  %fp_off = getelementptr inbounds i8, i8* %ti, i64 -40");
+        H("  %fp_ptr = bitcast i8* %fp_off to i8**");
+        H("  %fbase = load i8*, i8** %fp_ptr");
+        H("  %fcp_off = getelementptr inbounds i8, i8* %ti, i64 -32");
+        H("  %fcp_ptr = bitcast i8* %fcp_off to i64*");
+        H("  %fcnt = load i64, i64* %fcp_ptr");
+        H("  %noc = icmp sle i64 %fcnt, 0");
+        H("  br i1 %noc, label %miss, label %loop_init");
+        H("loop_init:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %idx = phi i64 [ 0, %loop_init ], [ %next_idx, %step ]");
+        H("  %cur_off = mul i64 %idx, 72");
+        H("  %slot = getelementptr inbounds i8, i8* %fbase, i64 %cur_off");
+        H("  %fn_ptr = bitcast i8* %slot to i8**");
+        H("  %fname = load i8*, i8** %fn_ptr");
+        H("  %eq = call i32 @strcmp(i8* %fname, i8* %name)");
+        H("  %hit = icmp eq i32 %eq, 0");
+        H("  br i1 %hit, label %found, label %step");
+        H("step:");
+        H("  %next_idx = add i64 %idx, 1");
+        H("  %cont = icmp slt i64 %next_idx, %fcnt");
+        H("  br i1 %cont, label %loop, label %miss");
+        H("found:");
+        H("  ret i8* %slot");
+        H("miss:");
+        H("  ret i8* null");
+        H("}");
+    }
+
+    // is `t` a heap object carrying an ARC header (class/struct instance or one
+    // of the built-in containers routed through zalloc)? Strings, primitives,
+    // erased generic slots and nullable value boxes are not ARC-managed.
+    bool ArcManaged(Node t) {
+        if (t == null) { return false; }
+        if (IsErasedType(t)) { return false; }
+        if (IsNullableValue(t)) { return false; }
+        if (t.ival >= 1) { return false; }
+        string n = t.sval;
+        // hardware vectors are first-class values, not ARC-managed heap objects
+        if (n == "Vector128" || n == "Vector256") { return false; }
+        if (n == "List" || n == "Dictionary" || n == "Dict" || n == "StringBuilder") { return true; }
+        Node d = binder.FindType(n);
+        if (d != null && (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())) { return true; }
+        return false;
+    }
+
+    void EmitArcRetain(string val, Node ty) {
+        if (!ArcManaged(ty)) { return; }
+        string lt = MapType(ty);
+        if (lt == "i8*") {
+            L("  call void @zretain(i8* " + val + ")");
+        } else {
+            string t = NT();
+            L("  " + t + " = bitcast " + lt + " " + val + " to i8*");
+            L("  call void @zretain(i8* " + t + ")");
+        }
+    }
+
+    void EmitArcRetainObject(string val) {
+        int lnotstr = NL();
+        int lskip = NL();
+        string isNull = NT();
+        L("  " + isNull + " = icmp eq i8* " + val + ", null");
+        L("  br i1 " + isNull + ", label %L" + lskip + ", label %L" + lnotstr);
+        Label(lnotstr);
+        string isStr = NT();
+        L("  " + isStr + " = call i64 @__zan_is_string(i8* " + val + ")");
+        string isZero = NT();
+        L("  " + isZero + " = icmp eq i64 " + isStr + ", 0");
+        int lret = NL();
+        L("  br i1 " + isZero + ", label %L" + lret + ", label %L" + lskip);
+        Label(lret);
+        L("  call void @zretain(i8* " + val + ")");
+        L("  br label %L" + lskip);
+        Label(lskip);
+    }
+
+    // Retain a value that is stored into a slot.  An ARC-managed slot type
+    // retains as usual.  A slot that is *not* ARC-managed (an `object` slot)
+    // still owns the reference it holds -- its static type just says nothing
+    // about what that is -- so a class instance stored there is retained by
+    // the *value's* type.  A string has no refcount and must not be retained
+    // (its header carries the length, not a count).
+    void EmitArcRetainStore(string val, Node slotTy, Node valTy) {
+        if (ArcManaged(slotTy)) { EmitArcRetain(val, slotTy); return; }
+        if (valTy == null || !ArcManaged(valTy)) { return; }
+        if (MapType(slotTy) != "i8*") { return; }
+        EmitArcRetain(val, valTy);
+    }
+
+    void EmitArcRelease(string val, Node ty) {
+        if (!ArcManaged(ty)) { return; }
+        string lt = MapType(ty);
+        if (lt == "i8*") {
+            L("  call void @zrelease(i8* " + val + ")");
+        } else {
+            string t = NT();
+            L("  " + t + " = bitcast " + lt + " " + val + " to i8*");
+            L("  call void @zrelease(i8* " + t + ")");
+        }
+    }
+
+    void EmitLocalReleases() {
+        ReleaseLocalsFrom(0);
+    }
+
+    void AddTemp(string op, Node ty) {
+        if (!ArcManaged(ty)) { return; }
+        // ARC 临时值的释放点固定在语句末尾，而它可能生成在某个分支里
+        // （三元、if 分支、循环体）。直接拿寄存器值去释放，会在合并块
+        // 里违反支配关系（LLVM: "Instruction does not dominate all uses"）。
+        // 与 C 宿主 emit_entry_alloca 同法：分支内生成的临时值落一个
+        // entry 槽位，释放时再 load 出来；分支没走时槽位是 null，
+        // zrelease(null) 是空操作。
+        if (eaActive && curLbl != "entry") {
+            string lt = MapType(ty);
+            string reg = NTS();
+            entryAllocas.Append("  " + reg + " = alloca " + lt + "\n");
+            entryAllocas.Append("  store " + lt + " null, " + lt + "* " + reg + "\n");
+            L("  store " + lt + " " + op + ", " + lt + "* " + reg);
+            stmtTemps.Add(reg);
+            stmtTempTypes.Add(ty);
+            return;
+        }
+        stmtTemps.Add(op);
+        stmtTempTypes.Add(ty);
+    }
+
+    void EmitTempReleases() {
+        int i = 0;
+        while (i < stmtTemps.Count) {
+            string op = stmtTemps[i];
+            if (op.Length > 1 && op[1] == 122) {
+                // entry 槽位（%z 前缀）：load 出值再释放
+                string lt = MapType(stmtTempTypes[i]);
+                string v = NT();
+                L("  " + v + " = load " + lt + ", " + lt + "* " + op);
+                EmitArcRelease(v, stmtTempTypes[i]);
+            } else {
+                EmitArcRelease(op, stmtTempTypes[i]);
+            }
+            i = i + 1;
+        }
+        stmtTemps = new List<string>();
+        stmtTempTypes = new List<Node>();
+    }
+
+    void ReleaseLocalsFrom(int from) {
+        int i = from;
+        while (i < locName.Count) {
+            // __qdot temps hold a borrowed `?.` receiver: not owned, never released
+            if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { i = i + 1; continue; }
+            // a by-ref parameter's reference belongs to the CALLER's slot
+            if (i < locRef.Count && locRef[i]) { i = i + 1; continue; }
+            if (ArcManaged(locType[i])) {
+                string lt = MapType(locType[i]);
+                string t = NT();
+                if (curAsync && locBox[i]) {
+                    // the local lives in a heap cell: the register holds the
+                    // CELL pointer, the cell holds the value -- release the
+                    // value, not the cell
+                    string c = NT();
+                    L("  " + c + " = load i8*, i8** " + locReg[i]);
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
+                    L("  " + t + " = load " + lt + ", " + lt + "* " + p);
+                    EmitArcRelease(t, locType[i]);
+                } else {
+                    L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                    EmitArcRelease(t, locType[i]);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    void TrimLocals(int to) {
+        List<string> nn = new List<string>();
+        List<Node> nt = new List<Node>();
+        List<string> nr = new List<string>();
+        List<bool> nb = new List<bool>();
+        List<bool> ni = new List<bool>();
+        List<string> nc = new List<string>();
+        List<bool> nref = new List<bool>();
+        List<bool> nop = new List<bool>();
+        int i = 0;
+        while (i < to) {
+            nn.Add(locName[i]); nt.Add(locType[i]); nr.Add(locReg[i]);
+            nb.Add(locBox[i]); ni.Add(locIter[i]); nc.Add(locCell[i]);
+            if (i < locRef.Count) { nref.Add(locRef[i]); } else { nref.Add(false); }
+            if (i < locOpaque.Count) { nop.Add(locOpaque[i]); } else { nop.Add(false); }
+            i = i + 1;
+        }
+        locName = nn; locType = nt; locReg = nr;
+        locBox = nb; locIter = ni; locCell = nc; locRef = nref;
+        locOpaque = nop;
+    }
+
+    // per-class destructor: release every ARC-managed field, then return (the
+    // object storage itself is freed by zrelease after this runs).
+    void EmitClassDtor(Node cls) {
+        string cn = cls.sval;
+        H("define void @" + cn + "_dtor(i8* %p) {");
+        H("  %o = bitcast i8* %p to %" + cn + "*");
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
+        int fb = FieldBase(cls);
+        int i = 0;
+        int seq = 0;
+        // the field types are written in THIS class's scope: a type parameter
+        // of the class erases there (an i64 slot, not an ARC-managed
+        // pointer -- releasing it would corrupt the slot)
+        string savedScope = typeScopeCls;
+        typeScopeCls = cls.sval;
+        while (i < names.Count) {
+            if (WeakTy(types[i])) {
+                // a weak field leaves the registry when its holder dies: the
+                // registry must not keep a pointer into freed memory, and the
+                // slot itself is cleared
+                string lt = MapType(types[i]);
+                if (lt == "i64" || lt.EndsWith("*")) {
+                    int idx = fb + i;
+                    string fp = "%f" + seq;
+                    string ws = "%w" + seq;
+                    H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
+                    H("  " + ws + " = bitcast %" + cn + "* " + fp + " to i64*");
+                    EmitWeakClear(ws);
+                    seq = seq + 1;
+                }
+            } else if (ArcManaged(types[i])) {
+                int idx = fb + i;
+                string lt = MapType(types[i]);
+                string fp = "%f" + seq;
+                string fv = "%v" + seq;
+                H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
+                H("  " + fv + " = load " + lt + ", " + lt + "* " + fp);
+                if (lt == "i8*") {
+                    H("  call void @zrelease(i8* " + fv + ")");
+                } else {
+                    string fc = "%c" + seq;
+                    H("  " + fc + " = bitcast " + lt + " " + fv + " to i8*");
+                    H("  call void @zrelease(i8* " + fc + ")");
+                }
+                seq = seq + 1;
+            }
+            i = i + 1;
+        }
+        typeScopeCls = savedScope;
+        H("  ret void");
+        H("}");
+    }
+
+    // ---- managed strings ----
+    // A string value points at the payload of a block with a 16-byte header:
+    //   [ i64 len ][ i64 magic ][ bytes... ][ NUL ]
+    // The payload stays NUL-terminated, so a string is still a valid C string
+    // for the runtime (printf and friends) and the ABI towards the C host is
+    // unchanged -- but the length is exact and an embedded NUL no longer
+    // truncates the value.
+    //
+    // The magic guards the header: every string the backend hands out comes
+    // from zstr_new / zstr_of / a literal, and a value that does not carry
+    // the magic is a bug -- zstr_len aborts instead of returning a length
+    // read out of unrelated memory.
+    void EmitStrRuntime() {
+        if (!ExternSeen("abort")) { externDecls.Add("abort"); H("declare void @abort()"); }
+        H("define void @zstr_bad() {");
+        H("entry:");
+        H("  call void @abort()");
+        H("  ret void");
+        H("}");
+        H("define i8* @zstr_new(i64 %len) {");
+        H("entry:");
+        H("  %tot = add i64 %len, 25");
+        H("  %raw = call i8* @malloc(i64 %tot)");
+        // the class-id slot makes the string header the same size as an object
+        // header, so reading it is always in bounds
+        H("  %cp = getelementptr i8, i8* %raw, i64 0");
+        H("  %cs = bitcast i8* %cp to i8**");
+        H("  store i8* null, i8** %cs");
+        H("  %hp = getelementptr i8, i8* %raw, i64 8");
+        H("  store i64 %len, i64* %hp");
+        H("  %mp = getelementptr i8, i8* %raw, i64 16");
+        H("  store i64 1515082580, i64* %mp");
+        H("  %p = getelementptr i8, i8* %raw, i64 24");
+        H("  %endp = getelementptr i8, i8* %p, i64 %len");
+        H("  store i8 0, i8* %endp");
+        H("  ret i8* %p");
+        H("}");
+        H("define i64 @zstr_len(i8* %p) {");
+        H("entry:");
+        // a null string is a soft runtime error in the C host: it reports and
+        // answers 0 (the program keeps running). The self-host has no
+        // runtime report channel here, so it answers 0 as well.
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %nullstr, label %probe");
+        H("nullstr:");
+        H("  ret i64 0");
+        H("probe:");
+        H("  %mp = getelementptr i8, i8* %p, i64 -8");
+        H("  %m = load i64, i64* %mp");
+        H("  %ok = icmp eq i64 %m, 1515082580");
+        H("  br i1 %ok, label %good, label %bad");
+        H("good:");
+        H("  %lp = getelementptr i8, i8* %p, i64 -16");
+        H("  %len = load i64, i64* %lp");
+        H("  ret i64 %len");
+        H("bad:");
+        H("  call void @zstr_bad()");
+        H("  ret i64 0");
+        H("}");
+        // The C-visible length: the offset of the first NUL byte, i.e. what a
+        // C string operation (strlen / strstr / printf) sees.  The C host keeps
+        // the exact length for Length / indexing / concatenation but truncates
+        // its search and transform methods at the first NUL, so the
+        // self-hosted backend has to split the two as well (A390).
+        // %p must be the base of a managed string; the magic check keeps a
+        // bogus pointer fail-closed instead of silently measuring garbage.
+        H("define i64 @zstr_clen(i8* %p) {");
+        H("entry:");
+        H("  %mp = getelementptr i8, i8* %p, i64 -8");
+        H("  %m = load i64, i64* %mp");
+        H("  %ok = icmp eq i64 %m, 1515082580");
+        H("  br i1 %ok, label %good, label %bad");
+        H("good:");
+        H("  %n = call i64 @strlen(i8* %p)");
+        H("  ret i64 %n");
+        H("bad:");
+        H("  call void @zstr_bad()");
+        H("  ret i64 0");
+        H("}");
+        H("define i8* @zstr_dup(i8* %p) {");
+        H("entry:");
+        H("  %len = call i64 @zstr_len(i8* %p)");
+        H("  %q = call i8* @zstr_new(i64 %len)");
+        H("  call i8* @memcpy(i8* %q, i8* %p, i64 %len)");
+        H("  ret i8* %q");
+        H("}");
+        H("define i8* @zstr_of(i8* %c) {");
+        H("entry:");
+        H("  %n = call i64 @strlen(i8* %c)");
+        H("  %q = call i8* @zstr_new(i64 %n)");
+        H("  call i8* @memcpy(i8* %q, i8* %c, i64 %n)");
+        H("  ret i8* %q");
+        H("}");
+    }
+
+    // ---- array length probe ----
+    // The C host reads an array length from the header slot at -8; a null
+    // base is switched to the soft scratch page first (rt_timer_diag.c
+    // zan_rt_soft_scratch), whose length field carries the
+    // ZAN_SOFT_SCRATCH_RC sentinel (1<<62). A null array therefore reports
+    // a huge in-range length and element 0 reads as the zero value. The
+    // self-host has no scratch page: zarr_len mirrors the contract exactly
+    // (null answers the sentinel, a real array reads its header), so a
+    // null-array index passes the bounds check and lands on the zero page
+    // with element 0 -- and the header of the zero page is never read (it
+    // has none; reading past the global would be a real OOB read).
+    void EmitArrLenRuntime() {
+        H("define i64 @zarr_len(i64* %p) {");
+        H("entry:");
+        H("  %isnull = icmp eq i64* %p, null");
+        H("  br i1 %isnull, label %nullarr, label %probe");
+        H("nullarr:");
+        H("  ret i64 4611686018427387904");
+        H("probe:");
+        H("  %lp = getelementptr i64, i64* %p, i64 -1");
+        H("  %len = load i64, i64* %lp");
+        H("  ret i64 %len");
+        H("}");
+    }
+
+    // StringBuilder: growable byte buffer { count, cap, i8* data }. Append is
+    // amortised O(1) (capacity doubling); ToString materialises one string.
+    void EmitSbRuntime() {
+        H("%zsb = type { i64, i64, i8* }");
+        H("define void @zsb_dtor(i8* %p) {");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %dptr = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %data = load i8*, i8** %dptr");
+        H("  call void @free(i8* %data)");
+        H("  ret void");
+        H("}");
+        H("define i8* @zsb_new() {");
+        H("  %p = call i8* @zalloc(i64 24, i8* bitcast (void (i8*)* @zsb_dtor to i8*), " + ContainerCid("StringBuilder") + ")");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %c = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
+        H("  store i64 0, i64* %c");
+        H("  %cap = getelementptr %zsb, %zsb* %b, i32 0, i32 1");
+        H("  store i64 0, i64* %cap");
+        H("  %d = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  store i8* null, i8** %d");
+        H("  ret i8* %p");
+        H("}");
+        H("define void @zsb_append(i8* %p, i8* %s) {");
+        H("entry:");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %slen = call i64 @zstr_len(i8* %s)");
+        H("  %cptr = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %capptr = getelementptr %zsb, %zsb* %b, i32 0, i32 1");
+        H("  %cap = load i64, i64* %capptr");
+        H("  %need = add i64 %count, %slen");
+        H("  %full = icmp sgt i64 %need, %cap");
+        H("  br i1 %full, label %grow, label %st");
+        H("grow:");
+        H("  %nc0 = mul i64 %cap, 2");
+        H("  %small = icmp slt i64 %nc0, %need");
+        H("  %nc = select i1 %small, i64 %need, i64 %nc0");
+        H("  %dptr = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %olddata = load i8*, i8** %dptr");
+        H("  %newdata = call i8* @realloc(i8* %olddata, i64 %nc)");
+        H("  store i8* %newdata, i8** %dptr");
+        H("  store i64 %nc, i64* %capptr");
+        H("  br label %st");
+        H("st:");
+        H("  %dptr2 = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %data = load i8*, i8** %dptr2");
+        H("  %dest = getelementptr i8, i8* %data, i64 %count");
+        H("  call i8* @memcpy(i8* %dest, i8* %s, i64 %slen)");
+        H("  %ncount = add i64 %count, %slen");
+        H("  store i64 %ncount, i64* %cptr");
+        H("  ret void");
+        H("}");
+        H("define void @zsb_append_bytes(i8* %p, i8* %bytes, i64 %slen) {");
+        H("entry:");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %cptr = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %capptr = getelementptr %zsb, %zsb* %b, i32 0, i32 1");
+        H("  %cap = load i64, i64* %capptr");
+        H("  %need = add i64 %count, %slen");
+        H("  %full = icmp sgt i64 %need, %cap");
+        H("  br i1 %full, label %grow, label %st");
+        H("grow:");
+        H("  %nc0 = mul i64 %cap, 2");
+        H("  %small = icmp slt i64 %nc0, %need");
+        H("  %nc = select i1 %small, i64 %need, i64 %nc0");
+        H("  %dptr = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %olddata = load i8*, i8** %dptr");
+        H("  %newdata = call i8* @realloc(i8* %olddata, i64 %nc)");
+        H("  store i8* %newdata, i8** %dptr");
+        H("  store i64 %nc, i64* %capptr");
+        H("  br label %st");
+        H("st:");
+        H("  %dptr2 = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %data = load i8*, i8** %dptr2");
+        H("  %dest = getelementptr i8, i8* %data, i64 %count");
+        H("  call i8* @memcpy(i8* %dest, i8* %bytes, i64 %slen)");
+        H("  %ncount = add i64 %count, %slen");
+        H("  store i64 %ncount, i64* %cptr");
+        H("  ret void");
+        H("}");
+        H("define i8* @zsb_tostring(i8* %p) {");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %cptr = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %dptr = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %data = load i8*, i8** %dptr");
+        H("  %buf = call i8* @zstr_new(i64 %count)");
+        H("  call i8* @memcpy(i8* %buf, i8* %data, i64 %count)");
+        H("  ret i8* %buf");
+        H("}");
+    }
+
+    // String helpers needing loops: LastIndexOf, Replace, Trim, ToUpper/ToLower.
+    // Emitted only when a program uses one of them (usesStrOps).
+    void EmitStrOpsRuntime() {
+        EmitStrOpsSearch();
+        EmitStrOpsTransform();
+        EmitStrOpsSplitJoin();
+    }
+
+    /// zstr_lastidx / zstr_replace.
+    void EmitStrOpsSearch() {
+        if (!ExternSeen("strstr")) { externDecls.Add("strstr"); H("declare i8* @strstr(i8*, i8*)"); }
+        if (!ExternSeen("strncmp")) { externDecls.Add("strncmp"); H("declare i32 @strncmp(i8*, i8*, i64)"); }
+        H("define i64 @zstr_lastidx(i8* %s, i8* %sub) {");
+        H("entry:");
+        H("  %best = alloca i64");
+        H("  store i64 -1, i64* %best");
+        H("  %i = alloca i64");
+        H("  store i64 0, i64* %i");
+        H("  %ls = call i64 @zstr_clen(i8* %s)");
+        H("  %lsub = call i64 @zstr_clen(i8* %sub)");
+        H("  %end = sub i64 %ls, %lsub");
+        H("  br label %loop");
+        H("loop:");
+        H("  %iv = load i64, i64* %i");
+        H("  %cond = icmp sle i64 %iv, %end");
+        H("  br i1 %cond, label %bdy, label %done");
+        H("bdy:");
+        H("  %p = getelementptr i8, i8* %s, i64 %iv");
+        H("  %c = call i32 @strncmp(i8* %p, i8* %sub, i64 %lsub)");
+        H("  %hit = icmp eq i32 %c, 0");
+        H("  br i1 %hit, label %sethit, label %next");
+        H("sethit:");
+        H("  store i64 %iv, i64* %best");
+        H("  br label %next");
+        H("next:");
+        H("  %iv1 = add i64 %iv, 1");
+        H("  store i64 %iv1, i64* %i");
+        H("  br label %loop");
+        H("done:");
+        H("  %r = load i64, i64* %best");
+        H("  ret i64 %r");
+        H("}");
+        H("define i8* @zstr_replace(i8* %s, i8* %from, i8* %to) {");
+        H("entry:");
+        H("  %lf = call i64 @zstr_clen(i8* %from)");
+        H("  %lt = call i64 @zstr_clen(i8* %to)");
+        H("  %ls = call i64 @zstr_clen(i8* %s)");
+        H("  %g0 = mul i64 %ls, %lt");
+        H("  %g1 = add i64 %g0, %ls");
+        H("  %g2 = add i64 %g1, %lt");
+        H("  %cap = add i64 %g2, 1");
+        H("  %buf = call i8* @malloc(i64 %cap)");
+        H("  %cur = alloca i8*");
+        H("  store i8* %s, i8** %cur");
+        H("  %out = alloca i64");
+        H("  store i64 0, i64* %out");
+        H("  %fempty = icmp eq i64 %lf, 0");
+        H("  br i1 %fempty, label %rest, label %loop");
+        H("loop:");
+        H("  %c = load i8*, i8** %cur");
+        H("  %hit = call i8* @strstr(i8* %c, i8* %from)");
+        H("  %miss = icmp eq i8* %hit, null");
+        H("  br i1 %miss, label %rest, label %copyseg");
+        H("copyseg:");
+        H("  %ov = load i64, i64* %out");
+        H("  %hi = ptrtoint i8* %hit to i64");
+        H("  %ci = ptrtoint i8* %c to i64");
+        H("  %seg = sub i64 %hi, %ci");
+        H("  %dst = getelementptr i8, i8* %buf, i64 %ov");
+        H("  call i8* @memcpy(i8* %dst, i8* %c, i64 %seg)");
+        H("  %ov1 = add i64 %ov, %seg");
+        H("  %dst2 = getelementptr i8, i8* %buf, i64 %ov1");
+        H("  call i8* @memcpy(i8* %dst2, i8* %to, i64 %lt)");
+        H("  %ov2 = add i64 %ov1, %lt");
+        H("  store i64 %ov2, i64* %out");
+        H("  %ncur = getelementptr i8, i8* %hit, i64 %lf");
+        H("  store i8* %ncur, i8** %cur");
+        H("  br label %loop");
+        H("rest:");
+        H("  %rc = load i8*, i8** %cur");
+        // the tail pointer points into the payload, not at a string base, so
+        // it has no header -- measure it as a C string
+        H("  %rl = call i64 @strlen(i8* %rc)");
+        H("  %rov = load i64, i64* %out");
+        H("  %rdst = getelementptr i8, i8* %buf, i64 %rov");
+        H("  call i8* @memcpy(i8* %rdst, i8* %rc, i64 %rl)");
+        H("  %rov1 = add i64 %rov, %rl");
+        H("  store i64 %rov1, i64* %out");
+        H("  %fin = call i8* @zstr_new(i64 %rov1)");
+        H("  call i8* @memcpy(i8* %fin, i8* %buf, i64 %rov1)");
+        H("  ret i8* %fin");
+        H("}");
+    }
+
+    /// zstr_trim / zstr_case / zstr_split.
+    void EmitStrOpsTransform() {
+        H("define i8* @zstr_trim(i8* %s) {");
+        H("entry:");
+        H("  %n = call i64 @zstr_clen(i8* %s)");
+        H("  %b = alloca i64");
+        H("  store i64 0, i64* %b");
+        H("  %e = alloca i64");
+        H("  store i64 %n, i64* %e");
+        H("  br label %l1");
+        H("l1:");
+        H("  %bv = load i64, i64* %b");
+        H("  %c1 = icmp slt i64 %bv, %n");
+        H("  br i1 %c1, label %l1chk, label %l2");
+        H("l1chk:");
+        H("  %p1 = getelementptr i8, i8* %s, i64 %bv");
+        H("  %ch1 = load i8, i8* %p1");
+        H("  %sp1 = icmp eq i8 %ch1, 32");
+        H("  %tb1 = icmp eq i8 %ch1, 9");
+        H("  %cr1 = icmp eq i8 %ch1, 13");
+        H("  %nl1 = icmp eq i8 %ch1, 10");
+        H("  %w1a = or i1 %sp1, %tb1");
+        H("  %w1b = or i1 %cr1, %nl1");
+        H("  %w1 = or i1 %w1a, %w1b");
+        H("  br i1 %w1, label %l1inc, label %l2");
+        H("l1inc:");
+        H("  %bv1 = add i64 %bv, 1");
+        H("  store i64 %bv1, i64* %b");
+        H("  br label %l1");
+        H("l2:");
+        H("  %ev = load i64, i64* %e");
+        H("  %bv2 = load i64, i64* %b");
+        H("  %c2 = icmp sgt i64 %ev, %bv2");
+        H("  br i1 %c2, label %l2chk, label %fin");
+        H("l2chk:");
+        H("  %em1 = sub i64 %ev, 1");
+        H("  %p2 = getelementptr i8, i8* %s, i64 %em1");
+        H("  %ch2 = load i8, i8* %p2");
+        H("  %sp2 = icmp eq i8 %ch2, 32");
+        H("  %tb2 = icmp eq i8 %ch2, 9");
+        H("  %cr2 = icmp eq i8 %ch2, 13");
+        H("  %nl2 = icmp eq i8 %ch2, 10");
+        H("  %w2a = or i1 %sp2, %tb2");
+        H("  %w2b = or i1 %cr2, %nl2");
+        H("  %w2 = or i1 %w2a, %w2b");
+        H("  br i1 %w2, label %l2dec, label %fin");
+        H("l2dec:");
+        H("  store i64 %em1, i64* %e");
+        H("  br label %l2");
+        H("fin:");
+        H("  %bv3 = load i64, i64* %b");
+        H("  %ev3 = load i64, i64* %e");
+        H("  %len = sub i64 %ev3, %bv3");
+        H("  %buf = call i8* @zstr_new(i64 %len)");
+        H("  %srcp = getelementptr i8, i8* %s, i64 %bv3");
+        H("  call i8* @memcpy(i8* %buf, i8* %srcp, i64 %len)");
+        H("  ret i8* %buf");
+        H("}");
+        H("define i8* @zstr_case(i8* %s, i64 %up) {");
+        H("entry:");
+        H("  %n = call i64 @zstr_clen(i8* %s)");
+        H("  %buf = call i8* @zstr_new(i64 %n)");
+        H("  %i = alloca i64");
+        H("  store i64 0, i64* %i");
+        H("  %isup = icmp ne i64 %up, 0");
+        H("  br label %loop");
+        H("loop:");
+        H("  %iv = load i64, i64* %i");
+        H("  %cond = icmp slt i64 %iv, %n");
+        H("  br i1 %cond, label %bdy, label %done");
+        H("bdy:");
+        H("  %p = getelementptr i8, i8* %s, i64 %iv");
+        H("  %c = load i8, i8* %p");
+        H("  %gea = icmp sge i8 %c, 97");
+        H("  %lez = icmp sle i8 %c, 122");
+        H("  %islow = and i1 %gea, %lez");
+        H("  %cup = sub i8 %c, 32");
+        H("  %vup = select i1 %islow, i8 %cup, i8 %c");
+        H("  %geA = icmp sge i8 %c, 65");
+        H("  %leZ = icmp sle i8 %c, 90");
+        H("  %isupc = and i1 %geA, %leZ");
+        H("  %cdn = add i8 %c, 32");
+        H("  %vdn = select i1 %isupc, i8 %cdn, i8 %c");
+        H("  %v = select i1 %isup, i8 %vup, i8 %vdn");
+        H("  %dp = getelementptr i8, i8* %buf, i64 %iv");
+        H("  store i8 %v, i8* %dp");
+        H("  %iv1 = add i64 %iv, 1");
+        H("  store i64 %iv1, i64* %i");
+        H("  br label %loop");
+        H("done:");
+        H("  ret i8* %buf");
+        H("}");
+        H("define i8* @zstr_split(i8* %s, i8* %sep, i64 %opt) {");
+        H("entry:");
+        H("  %lsep = call i64 @zstr_clen(i8* %sep)");
+        H("  %lst = call i8* @zlist_new(i64 0)");
+        H("  %cur = alloca i8*");
+        H("  store i8* %s, i8** %cur");
+        H("  %empty = icmp eq i64 %lsep, 0");
+        H("  br i1 %empty, label %last, label %loop");
+        H("loop:");
+        H("  %c = load i8*, i8** %cur");
+        H("  %hit = call i8* @strstr(i8* %c, i8* %sep)");
+        H("  %miss = icmp eq i8* %hit, null");
+        H("  br i1 %miss, label %last, label %seg");
+        H("seg:");
+        H("  %hi = ptrtoint i8* %hit to i64");
+        H("  %ci = ptrtoint i8* %c to i64");
+        H("  %n = sub i64 %hi, %ci");
+        H("  %skip0 = and i64 %opt, 1");
+        H("  %skip1 = icmp ne i64 %skip0, 0");
+        H("  %skip2 = icmp eq i64 %n, 0");
+        H("  %skip = and i1 %skip1, %skip2");
+        H("  br i1 %skip, label %nseg, label %dopush");
+        H("dopush:");
+        H("  %buf = call i8* @zstr_new(i64 %n)");
+        H("  call i8* @memcpy(i8* %buf, i8* %c, i64 %n)");
+        H("  %bi = ptrtoint i8* %buf to i64");
+        H("  call void @zlist_add(i8* %lst, i64 %bi)");
+        H("  br label %nseg");
+        H("nseg:");
+        H("  %ncur = getelementptr i8, i8* %hit, i64 %lsep");
+        H("  store i8* %ncur, i8** %cur");
+        H("  br label %loop");
+        H("last:");
+        H("  %lc = load i8*, i8** %cur");
+        H("  %n2 = call i64 @strlen(i8* %lc)");
+        H("  %lskip0 = and i64 %opt, 1");
+        H("  %lskip1 = icmp ne i64 %lskip0, 0");
+        H("  %lskip2 = icmp eq i64 %n2, 0");
+        H("  %lskip = and i1 %lskip1, %lskip2");
+        H("  br i1 %lskip, label %fin, label %dolastpush");
+        H("dolastpush:");
+        H("  %buf2 = call i8* @zstr_new(i64 %n2)");
+        H("  call i8* @memcpy(i8* %buf2, i8* %lc, i64 %n2)");
+        H("  %bi2 = ptrtoint i8* %buf2 to i64");
+        H("  call void @zlist_add(i8* %lst, i64 %bi2)");
+        H("  br label %fin");
+        H("fin:");
+        H("  ret i8* %lst");
+        H("}");
+    }
+
+    /// zstr_join / zstr_isempty.
+    void EmitStrOpsSplitJoin() {
+        H("define i8* @zstr_join(i8* %sep, i8* %lst) {");
+        H("entry:");
+        H("  %n = call i64 @zlist_count(i8* %lst)");
+        H("  %lsep = call i64 @zstr_clen(i8* %sep)");
+        H("  %tot = alloca i64");
+        H("  store i64 0, i64* %tot");
+        H("  %i = alloca i64");
+        H("  store i64 0, i64* %i");
+        H("  br label %mcond");
+        H("mcond:");
+        H("  %iv = load i64, i64* %i");
+        H("  %mdone = icmp sge i64 %iv, %n");
+        H("  br i1 %mdone, label %alloc, label %mbody");
+        H("mbody:");
+        H("  %sl = call i64 @zlist_get(i8* %lst, i64 %iv)");
+        H("  %sp = inttoptr i64 %sl to i8*");
+        H("  %l = call i64 @zstr_clen(i8* %sp)");
+        H("  %t0 = load i64, i64* %tot");
+        H("  %t1 = add i64 %t0, %l");
+        H("  %t2 = add i64 %t1, %lsep");
+        H("  store i64 %t2, i64* %tot");
+        H("  %ni = add i64 %iv, 1");
+        H("  store i64 %ni, i64* %i");
+        H("  br label %mcond");
+        H("alloc:");
+        H("  %tv = load i64, i64* %tot");
+        H("  %bsz = add i64 %tv, 1");
+        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  store i64 0, i64* %i");
+        H("  %out = alloca i64");
+        H("  store i64 0, i64* %out");
+        H("  br label %ccond");
+        H("ccond:");
+        H("  %iv2 = load i64, i64* %i");
+        H("  %cdone = icmp sge i64 %iv2, %n");
+        H("  br i1 %cdone, label %fin, label %cbody");
+        H("cbody:");
+        H("  %first = icmp eq i64 %iv2, 0");
+        H("  br i1 %first, label %citem, label %csep");
+        H("csep:");
+        H("  %ov = load i64, i64* %out");
+        H("  %dst = getelementptr i8, i8* %buf, i64 %ov");
+        H("  call i8* @memcpy(i8* %dst, i8* %sep, i64 %lsep)");
+        H("  %ov1 = add i64 %ov, %lsep");
+        H("  store i64 %ov1, i64* %out");
+        H("  br label %citem");
+        H("citem:");
+        H("  %sl2 = call i64 @zlist_get(i8* %lst, i64 %iv2)");
+        H("  %sp2 = inttoptr i64 %sl2 to i8*");
+        H("  %l2 = call i64 @zstr_clen(i8* %sp2)");
+        H("  %ov2 = load i64, i64* %out");
+        H("  %dst2 = getelementptr i8, i8* %buf, i64 %ov2");
+        H("  call i8* @memcpy(i8* %dst2, i8* %sp2, i64 %l2)");
+        H("  %ov3 = add i64 %ov2, %l2");
+        H("  store i64 %ov3, i64* %out");
+        H("  %ni2 = add i64 %iv2, 1");
+        H("  store i64 %ni2, i64* %i");
+        H("  br label %ccond");
+        H("fin:");
+        H("  %ovf = load i64, i64* %out");
+        H("  %finbuf = call i8* @zstr_new(i64 %ovf)");
+        H("  call i8* @memcpy(i8* %finbuf, i8* %buf, i64 %ovf)");
+        H("  ret i8* %finbuf");
+        H("}");
+        H("define i64 @zstr_isempty(i8* %s) {");
+        H("entry:");
+        H("  %isn = icmp eq i8* %s, null");
+        H("  br i1 %isn, label %yes, label %chk");
+        H("chk:");
+        H("  %c = load i8, i8* %s");
+        H("  %z = icmp eq i8 %c, 0");
+        H("  br i1 %z, label %yes, label %no");
+        H("yes:");
+        H("  ret i64 1");
+        H("no:");
+        H("  ret i64 0");
+        H("}");
+    }
+
+    // Dictionary<string,V>: growable parallel arrays { count, cap, i8** keys,
+    // i64* values } with linear-scan lookup. Set updates in place on an existing
+    // key, otherwise appends (capacity doubling). Keys are strings (strcmp).
+}

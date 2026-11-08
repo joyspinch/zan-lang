@@ -1,0 +1,609 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+public partial class Checker {
+    void CheckExpr(Node n) {
+        if (n == null) { return; }
+        int k = n.kind;
+        if (k == AK.Ident()) {
+            if (!KnownValue(n.sval)) {
+                diags.Error("undefined identifier '" + n.sval + "'", n.line, n.col);
+            } else if (curStatic && !ScopeHas(n.sval)) {
+                Node f = FieldUp(curClass, n.sval);
+                if (f != null && !HasMod(f, MOD.Static())) {
+                    diags.Error("cannot access instance field '" + n.sval + "' from a static method", n.line, n.col);
+                }
+            }
+            return;
+        }
+        if (k == AK.ThisExpr()) {
+            if (curStatic) { diags.Error("'this' cannot be used in a static method", n.line, n.col); }
+            return;
+        }
+        if (k == AK.MemberAccess()) { CheckMember(n); return; }
+        if (k == AK.Call()) { CheckCall(n); return; }
+        if (k == AK.OutArg()) {
+            // `ref x` place form: check the referenced expression
+            if (n.a != null) { CheckExpr(n.a); return; }
+            // `out T name` declares a new local visible after the call
+            if (n.type != null) { ScopeAdd(n.sval, n.type); }
+            else if (!KnownValue(n.sval)) {
+                diags.Error("undefined identifier '" + n.sval + "'", n.line, n.col);
+            }
+            return;
+        }
+        if (k == AK.Binary() || k == AK.Assignment()) {
+            if (k == AK.Assignment() && n.op == TK.Eq()
+                && n.a != null && n.a.kind == AK.Ident() && !KnownValue(n.a.sval)) {
+                // `x = v` where x names nothing: the C host resolves the
+                // target against locals / instance fields / static fields,
+                // finds none, and drops the store silently (no diagnostic).
+                // Only a *read* of an undeclared identifier is an error
+                // there, so a plain `=` must not be flagged here.
+                // (Zan.Gui's Control.zan relies on it: `paneMin = 0;`
+                // assigns a field it never declares.)
+                CheckExpr(n.b);
+                return;
+            }
+            if (k == AK.Assignment()) {
+                CheckExpr(n.a);
+                Node prevAsgTarget = curTargetType;
+                curTargetType = InferType(n.a);
+                if (curTargetType != null && binder.DelegateIsAsync(curTargetType.sval) && n.b != null && n.b.kind == AK.Lambda()) {
+                    diags.Error("[E3104] cannot convert a lambda to async delegate '" + curTargetType.sval
+                        + "': a lambda is not a coroutine; assign an async method group instead", n.b.line, n.b.col);
+                }
+                if (curTargetType != null && (n.op == TK.PlusEq() || n.op == TK.MinusEq())) {
+                    Node opCls = ClassOf(curTargetType);
+                    if (opCls != null) {
+                        string opName = "op_add";
+                        if (n.op == TK.MinusEq()) { opName = "op_sub"; }
+                        Node opM = MethodUp(opCls, opName);
+                        if (opM != null) {
+                            Node paramType = NthParamType(opM, 1);
+                            if (paramType != null) {
+                                curTargetType = paramType;
+                            }
+                        }
+                    }
+                }
+                CheckExpr(n.b);
+                curTargetType = prevAsgTarget;
+            } else {
+                CheckExpr(n.a); CheckExpr(n.b);
+            }
+            // decimal 与 float/double 的混合算术是 C# CS0019 编译错，宿主
+            // checker.c 的 +/-/*// 百分号组当场拒绝（TASKS.md A511②）——
+            // double 位模式被按 decimal 重解读会产出垃圾数。自举把 decimal
+            // 槽位映射成 double（parser.zan），只有 m 后缀字面量仍带 decimal
+            // 名，所以这里挡住的是字面量形态的混算；声明的 decimal 槽位参与
+            // 混算在这个模型下不可分辨（`decimal d = 0.5m; d + 0.5` 仍是
+            // double 加法）。
+            if (k == AK.Binary()
+                && (n.op == TK.Plus() || n.op == TK.Minus() || n.op == TK.Star()
+                    || n.op == TK.Slash() || n.op == TK.Percent())) {
+                Node lt = InferType(n.a); Node rt = InferType(n.b);
+                if (lt != null && rt != null) {
+                    string ln = lt.sval; string rn = rt.sval;
+                    bool lm = ln == "decimal"; bool rm = rn == "decimal";
+                    bool lf = ln == "float" || ln == "double";
+                    bool rf = rn == "float" || rn == "double";
+                    if ((lm && rf) || (rm && lf)) {
+                        diags.Error("[E2041] cannot apply operator to 'decimal' and '"
+                            + (rm ? ln : rn)
+                            + "' -- convert explicitly (e.g. Decimal.FromDouble)",
+                            n.line, n.col);
+                    }
+                }
+            }
+            if (k == AK.Binary() && n.op == TK.QQ()) { InferType(n); }
+            if (k == AK.Assignment()) {
+                CheckTaskNoResult(InferType(n.a), InferType(n.b), "assignment", n.line, n.col);
+            }
+            return;
+        }
+        if (k == AK.Unary()) { CheckExpr(n.a); CheckUnaryOperand(n); return; }
+        if (k == AK.PostfixUnary()) { CheckExpr(n.a); return; }
+        if (k == AK.Index()) {
+            CheckExpr(n.a); CheckExpr(n.b);
+            // the extra subscripts of a rectangular access (`a[i, j]`)
+            int ki = 0;
+            while (ki < n.kids.Count) { CheckExpr(n.kids[ki]); ki = ki + 1; }
+            return;
+        }
+        if (k == AK.CallInit()) { CheckCallInitItems(n); return; }
+        if (k == AK.NewExpr()) {
+            // anonymous new has no type node: it only appears inside query
+            // expression lambdas, which the Linq expression model captures
+            // before this walk; anything surviving to here is a user error
+            if (n.type == null) {
+                diags.Error("anonymous types are only supported in database query lambdas", n.line, n.col);
+                return;
+            }
+            // 类型参数不能实例化（**标量**形态）：类型参数没有构造器，
+            // 只能造出一个 null 引用——运行期第一次成员访问就崩进程。
+            // 数组形态 `new T[n]` 不在此列（ival == 1）：元素类型在实例化
+            // 时被替换，是合法的。
+            if (n.ival == 0 && binder.IsTypeParam(n.type.sval)) {
+                if (!TypeParamHasNew(n.type.sval)) {
+                    diags.Error("[E2057] cannot instantiate a type parameter '" + n.type.sval + "'", n.line, n.col);
+                    return;
+                }
+            }
+            CheckType(n.type);
+            CheckExpr(n.b);
+            Node ctor = null;
+            bool isDel = false;
+            if (n.type != null) {
+                if (binder.IsDelegateName(n.type.sval)) {
+                    isDel = true;
+                } else {
+                    Node cls = ClassOf(n.type);
+                    if (cls != null) {
+                        ctor = binder.FindCtorArity(cls, n.kids.Count);
+                        if (ctor == null) { ctor = binder.FindCtor(cls); }
+                    }
+                }
+            }
+            int i = 0;
+            while (i < n.kids.Count) {
+                Node it = n.kids[i];
+                // object initializer `Field = v`: the lhs names a field of the
+                // new type, not a local, so only the value is checked here.
+                if (n.ival == 2 && it.kind == AK.Assignment()) {
+                    CheckExpr(it.b);
+                } else {
+                    Node prevArgTarget = curTargetType;
+                    if (isDel) {
+                        curTargetType = n.type;
+                    } else if (ctor != null) {
+                        curTargetType = NthParamType(ctor, i);
+                    }
+                    if (curTargetType != null && binder.DelegateIsAsync(curTargetType.sval) && it != null && it.kind == AK.Lambda()) {
+                        diags.Error("[E3104] cannot convert a lambda to async delegate '" + curTargetType.sval
+                            + "': a lambda is not a coroutine; assign an async method group instead", it.line, it.col);
+                    }
+                    CheckExpr(it);
+                    curTargetType = prevArgTarget;
+                }
+                i = i + 1;
+            }
+            return;
+        }
+        if (k == AK.CastExpr()) {
+            CheckType(n.type);
+            Node prevCastTarget = curTargetType;
+            curTargetType = n.type;
+            CheckExpr(n.b);
+            curTargetType = prevCastTarget;
+            return;
+        }
+        if (k == AK.AsExpr()) {
+            CheckType(n.type);
+            CheckExpr(n.a);
+            return;
+        }
+        if (k == AK.IsExpr()) {
+            CheckExpr(n.a);
+            CheckType(n.type);
+            ScopeAdd(n.sval, n.type);
+            return;
+        }
+        if (k == AK.Conditional()) { CheckExpr(n.a); CheckExpr(n.b); CheckExpr(n.c); return; }
+        if (k == AK.QueryExpr()) {
+            CheckExpr(n.a);
+            int mark = ScopeMark();
+            Node et = null;
+            Node ct = InferType(n.a);
+            if (ct != null && ct.sval == "List" && ct.kids.Count > 0) { et = ct.kids[0]; }
+            ScopeAdd(n.sval, et);
+            int i = 0;
+            while (i < n.kids.Count) { CheckExpr(n.kids[i]); i = i + 1; }
+            CheckExpr(n.b);
+            ScopeTrim(mark);
+            return;
+        }
+        if (k == AK.Lambda()) {
+            int mark = ScopeMark();
+            Node retTy = null;
+            List<Node> expectedParamTypes = new List<Node>();
+            if (curTargetType != null) {
+                if (binder.IsDelegateName(curTargetType.sval)) {
+                    Node d = binder.FindDelegate(curTargetType.sval);
+                    if (d != null) {
+                        retTy = d.type;
+                        int pi = 0;
+                        while (pi < d.kids.Count) {
+                            if (d.kids[pi].kind == AK.Param()) {
+                                expectedParamTypes.Add(d.kids[pi].type);
+                            }
+                            pi = pi + 1;
+                        }
+                    }
+                } else if (curTargetType.sval == "Func" && curTargetType.kids.Count > 0) {
+                    retTy = curTargetType.kids[curTargetType.kids.Count - 1];
+                    int pi = 0;
+                    while (pi < curTargetType.kids.Count - 1) {
+                        expectedParamTypes.Add(curTargetType.kids[pi]);
+                        pi = pi + 1;
+                    }
+                } else if (curTargetType.sval == "Action") {
+                    retTy = MkType("void");
+                    int pi = 0;
+                    while (pi < curTargetType.kids.Count) {
+                        expectedParamTypes.Add(curTargetType.kids[pi]);
+                        pi = pi + 1;
+                    }
+                }
+            }
+            int i = 0;
+            int pidx = 0;
+            while (i < n.kids.Count) {
+                Node p = n.kids[i];
+                if (p.kind == AK.Param()) {
+                    if ((p.type == null || p.type.sval == "var") && pidx < expectedParamTypes.Count) {
+                        p.type = expectedParamTypes[pidx];
+                    }
+                    pidx = pidx + 1;
+                    ScopeAdd(p.sval, p.type);
+                }
+                i = i + 1;
+            }
+            Node saveRet = curRet;
+            curRet = retTy;
+            if (n.a != null) {
+                CheckExpr(n.a);
+                if (retTy == null) {
+                    retTy = InferType(n.a);
+                }
+            }
+            CheckStmt(n.d);
+            curRet = saveRet;
+            if (n.type == null && retTy != null) {
+                n.type = retTy;
+            }
+            ScopeTrim(mark);
+            return;
+        }
+        if (k == AK.SwitchExpr()) {
+            CheckExpr(n.a);
+            int i = 0;
+            while (i < n.kids.Count) {
+                Node arm = n.kids[i];
+                // Pattern arm (`T x when g => v`): the binding is in scope for
+                // the guard and the result expression.
+                int m = ScopeMark();
+                if (arm.ival == 1) {
+                    if (arm.type != null) { CheckType(arm.type); }
+                    if (arm.sval != null && arm.sval != "") { ScopeAdd(arm.sval, arm.type); }
+                    CheckExpr(arm.c);
+                } else {
+                    CheckExpr(arm.a);
+                }
+                CheckExpr(arm.b);
+                ScopeTrim(m);
+                i = i + 1;
+            }
+            return;
+        }
+        if (k == AK.TupleExpr()) {
+            int i = 0;
+            while (i < n.kids.Count) { CheckExpr(n.kids[i]); i = i + 1; }
+            return;
+        }
+    }
+
+    // The reflection instance surface lowers to generated helpers (ngen),
+    // not user members -- accepted on any receiver, like the oracle.
+    bool IsReflInstName(string n) {
+        if (n == "GetType" || n == "HasField" || n == "HasMethod") { return true; }
+        if (n == "GetFieldInt" || n == "GetFieldLong" || n == "GetFieldBool"
+                || n == "GetFieldDouble" || n == "GetFieldString" || n == "GetFieldObject") { return true; }
+        if (n == "SetFieldInt" || n == "SetFieldLong" || n == "SetFieldBool"
+                || n == "SetFieldDouble" || n == "SetFieldString" || n == "SetFieldObject") { return true; }
+        if (n == "Invoke" || n == "InvokeInt" || n == "InvokeLong"
+                || n == "InvokeDouble" || n == "InvokeString" || n == "InvokeObject") { return true; }
+        return false;
+    }
+
+    void CheckMember(Node n) {
+        CheckObj(n.a);
+        Node ot = InferType(n.a);
+        Node cls = ClassOf(ot);
+        if (cls != null) { CheckInternalAccess(cls, n.sval, n); }
+        else { Node sc = StaticRecv(n.a); if (sc != null) { CheckInternalAccess(sc, n.sval, n); } }
+        if (cls != null && !HasMember(cls, n.sval) && !HasExt(cls.sval, n.sval)) {
+            if (ot != null && ot.op == 1 && (n.sval == "HasValue" || n.sval == "Value")) {
+                return;
+            }
+            if (!IsReflInstName(n.sval)) {
+                // recv.<Entity> table accessor fires before the no-member
+                // diagnostic. Rewritten nodes get checked like any other new
+                // expression (the host calls check_expr on the degraded
+                // node); the E2095 path leaves the node alone -- re-checking
+                // it here would re-enter this very branch forever.
+                if (TryEntityAccessor(n, ot)) {
+                    if (n.kind == AK.NewExpr()) { CheckExpr(n); }
+                    return;
+                }
+                diags.Error("type '" + cls.sval + "' has no member '" + n.sval + "'", n.line, n.col);
+            }
+        } else if (cls != null && FieldUp(cls, n.sval) == null && MethodUp(cls, "get_" + n.sval) == null && MethodUp(cls, n.sval) != null) {
+            // 方法组当值拦截（B-ID151）：非属性方法未调用且未作为委托使用时报错
+            bool okTarget = false;
+            if (curTargetType != null) {
+                if (binder.IsDelegateName(curTargetType.sval)) {
+                    okTarget = true;
+                    Node m = MethodUp(cls, n.sval);
+                    if (m != null) {
+                        bool mAsync = HasMod(m, MOD.Async());
+                        bool dAsync = binder.DelegateIsAsync(curTargetType.sval);
+                        if (mAsync != dAsync) {
+                            diags.Error("[E3047] cannot convert " + (mAsync ? "async" : "non-async")
+                                + " method '" + m.sval + "' to " + (dAsync ? "async" : "non-async")
+                                + " delegate '" + curTargetType.sval + "'", n.line, n.col);
+                        }
+                    }
+                } else if (curTargetType.sval == "nint" || curTargetType.sval == "ulong" || curTargetType.sval == "long") {
+                    Node m = MethodUp(cls, n.sval);
+                    if (m != null && HasMod(m, MOD.Static())) {
+                        okTarget = true;
+                    }
+                }
+            }
+            if (!okTarget) {
+                diags.Error("[E2039] '" + n.sval + "' is a method, not a value; call it as '" + n.sval + "()'", n.line, n.col);
+            }
+        }
+    }
+
+    bool IsBuiltinClassName(string name) {
+        if (name == "Console" || name == "Convert" || name == "Math") { return true; }
+        if (name == "Task" || name == "Gate" || name == "Socket") { return true; }
+        if (name == "Environment" || name == "File" || name == "Directory") { return true; }
+        if (name == "NativeMemory" || name == "BitOperations") { return true; }
+        if (name == "Vector128" || name == "Vector256" || name == "Sse2" || name == "Aes" || name == "Sse42") { return true; }
+        if (name == "string" || name == "String") { return true; }
+        if (name == "int" || name == "long" || name == "double" || name == "float") { return true; }
+        if (name == "Int32" || name == "Int64" || name == "Double" || name == "Single") { return true; }
+        return false;
+    }
+
+    void CheckCall(Node n) {
+        Node callee = n.a;
+        bool hasNamed = false;
+        Node callTargetMethod = null;
+        if (callee != null) {
+            if (callee.kind == AK.Ident()) {
+                callTargetMethod = MethodUp(curClass, callee.sval);
+            } else if (callee.kind == AK.MemberAccess()) {
+                Node ot = InferType(callee.a);
+                Node cls = ClassOf(ot);
+                if (cls != null) {
+                    callTargetMethod = MethodUpCall(cls, callee.sval, n);
+                }
+            }
+        }
+        int i = 0;
+        while (i < n.kids.Count) {
+            if (n.kids[i].argName != "") { hasNamed = true; }
+            Node prevArgTarget = curTargetType;
+            if (callTargetMethod != null) {
+                curTargetType = NthParamType(callTargetMethod, i);
+            }
+            if (curTargetType != null && binder.DelegateIsAsync(curTargetType.sval) && n.kids[i] != null && n.kids[i].kind == AK.Lambda()) {
+                diags.Error("[E3104] cannot convert a lambda to async delegate '" + curTargetType.sval
+                    + "': a lambda is not a coroutine; assign an async method group instead", n.kids[i].line, n.kids[i].col);
+            }
+            CheckExpr(n.kids[i]);
+            curTargetType = prevArgTarget;
+            i = i + 1;
+        }
+        int argc = n.kids.Count;
+        if (callee != null && callee.kind == AK.Ident()) {
+            // bare call: resolve against the enclosing type's methods
+            Node cands = MethodUp(curClass, callee.sval);
+            if (cands != null) {
+                n.resolvedSym = cands;
+                n.isIntrinsic = (cands.mods & MOD.Intrinsic()) != 0 ||
+                                (curClass != null && (curClass.mods & MOD.Intrinsic()) != 0);
+            }
+            if (cands != null && !hasNamed && !AcceptsArgc(curClass, callee.sval, argc)) {
+                diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
+            }
+            if (!hasNamed) { CheckTaskArgs(cands, n); }
+            CheckMethodConstraints(cands, n);
+            return;
+        }
+        if (callee != null && callee.kind == AK.MemberAccess()) {
+            // 零参 SyncStructureAll(Async) 且接收者能当连接：改写为静态
+            // 直调 DbExtensions.<name>(db, new Meta[]{...})，实参补进 kids
+            // 后照常检查。扩展分发 + await 会踩泛型环境失真（体不执行、
+            // 结果槽 0，B-ID63 家族），与宿主 CALL 口的同名改写一致。
+            if (n.kids.Count == 0
+                    && (callee.sval == "SyncStructureAll" || callee.sval == "SyncStructureAllAsync")
+                    && callee.a != null) {
+                Node ot0 = InferType(callee.a);
+                if (ot0 != null && RecvIsConn(ot0)) {
+                    Node recvnode = callee.a;
+                    Node zid = new Node(AK.Ident());
+                    zid.sval = "DbExtensions";
+                    zid.line = callee.line; zid.col = callee.col;
+                    callee.a = zid;
+                    Node metas = SynthTableArray(n);
+                    n.Add(recvnode);
+                    n.Add(metas);
+                    CheckExpr(recvnode);
+                    CheckExpr(metas);
+                }
+            }
+            CheckObj(callee.a);
+            Node ot = InferType(callee.a);
+            Node cls = ClassOf(ot);
+            Node sc = null;
+            if (cls != null) { CheckInternalAccess(cls, callee.sval, n); }
+            else { sc = StaticRecv(callee.a); if (sc != null) { CheckInternalAccess(sc, callee.sval, n); } }
+            Node targetCls = cls != null ? cls : sc;
+            Node mm = null;
+            if (targetCls != null) {
+                mm = MethodUp(targetCls, callee.sval);
+            }
+            if (cls != null) {
+                if (ot != null && ot.op == 1 && callee.sval == "GetValueOrDefault") {
+                    if (argc > 1) {
+                        diags.Error("no overload of 'GetValueOrDefault' takes " + argc + " argument(s)", n.line, n.col);
+                    }
+                    return;
+                }
+                if (!HasMember(cls, callee.sval) && !HasExt(cls.sval, callee.sval)) {
+                    if (!IsReflInstName(callee.sval)) {
+                        diags.Error("type '" + cls.sval + "' has no member '" + callee.sval + "'", n.line, n.col);
+                    }
+                } else if (mm != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
+                    diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
+                }
+                if (!hasNamed) { CheckTaskArgs(mm, n); }
+                CheckMethodConstraints(mm, n);
+            }
+            if (mm != null) {
+                n.resolvedSym = mm;
+                n.isIntrinsic = (mm.mods & MOD.Intrinsic()) != 0 ||
+                                (targetCls != null && (targetCls.mods & MOD.Intrinsic()) != 0);
+            } else if (callee.a != null && callee.a.kind == AK.Ident() && IsBuiltinClassName(callee.a.sval)) {
+                n.isIntrinsic = true;
+            }
+            return;
+        }
+        CheckObj(callee);
+    }
+
+    // A518: method-call-site where-constraint check, mirroring the C host's
+    // checker_check_method_call_constraints (checker.c ~1757). A generic
+    // method's `where T : Entity` clauses parse onto the method's TypeParam
+    // kids (parser.zan ParseWhereClauses on the member node); the call site
+    // must verify the type arguments actually satisfy them. The C host also
+    // reads explicit call type args; the self-host strips those before
+    // binding (parser StripTypeArgs), so bindings come from parameter-shape
+    // unification only -- List<T> vs List<int> binds T=int. Unresolvable
+    // bindings pass (the "don't kill on what you can't judge" rule); the
+    // satisfaction walk has the base chain only (DerivesFromName), so an
+    // interface constraint binds nothing and passes -- the declared model
+    // limit, same as the assignment-compatibility walk.
+    void CheckMethodConstraints(Node m, Node call) {
+        if (m == null || m.kind != AK.MethodDecl()) { return; }
+        List<Node> tps = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.TypeParam()) { tps.Add(m.kids[i]); }
+            i = i + 1;
+        }
+        if (tps.Count <= 0 || tps.Count > 8) { return; }
+        bool anyCons = false;
+        int w = 0;
+        while (w < tps.Count) { if (tps[w].b != null) { anyCons = true; } w = w + 1; }
+        if (!anyCons) { return; }
+        Node[] bind = new Node[tps.Count];
+        int j = 0;
+        int ai = 0;
+        while (j < m.kids.Count && ai < call.kids.Count) {
+            Node p = m.kids[j];
+            if (p.kind == AK.Param()) {
+                Node a = call.kids[ai];
+                if (a != null) { UnifyMethodTp(p.type, InferType(a), tps, bind); }
+                ai = ai + 1;
+            }
+            j = j + 1;
+        }
+        i = 0;
+        while (i < tps.Count) {
+            Node tp = tps[i];
+            Node arg = bind[i];
+            if (tp.b != null && arg != null && !binder.IsTypeParam(arg.sval)) {
+                string cn = tp.b.sval;
+                if (cn != "" && !DerivesFromName(arg.sval, cn)) {
+                    diags.Error("type '" + arg.sval + "' does not satisfy constraint '" + cn + "' for type parameter '" + tp.sval + "' of method '" + m.sval + "'", call.line, call.col);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // structural unification of a declared parameter type against an
+    // argument type (the host's checker_unify_method_tp on Node types):
+    // a type-parameter mention binds to the argument; containers recurse
+    // pairwise when arities match; arrays recurse into the element (the
+    // element lives in sval with the rank decremented); a nullable param
+    // binds only from a nullable argument (the op flag marks nullability,
+    // there is no separate element node to descend into)
+    void UnifyMethodTp(Node dp, Node at, List<Node> tps, Node[] bind) {
+        if (dp == null || at == null) { return; }
+        if (dp.ival < 1 && dp.op != 1 && binder.IsTypeParam(dp.sval)) {
+            int i = 0;
+            while (i < tps.Count) {
+                if (tps[i].sval == dp.sval) {
+                    if (bind[i] == null && at.ival < 1 && at.op != 1 && !binder.IsTypeParam(at.sval)) {
+                        bind[i] = at;
+                    }
+                    return;
+                }
+                i = i + 1;
+            }
+            return;
+        }
+        if (dp.kids.Count > 0 && dp.kids.Count == at.kids.Count) {
+            int i = 0;
+            while (i < dp.kids.Count) {
+                UnifyMethodTp(dp.kids[i], at.kids[i], tps, bind);
+                i = i + 1;
+            }
+            return;
+        }
+        if (dp.ival >= 1 && at.ival == dp.ival) {
+            Node de = MkType(dp.sval); de.ival = dp.ival - 1;
+            Node ae = MkType(at.sval); ae.ival = at.ival - 1;
+            UnifyMethodTp(de, ae, tps, bind);
+        }
+    }
+
+    // A no-result handle passed where a Task<T> is expected: the same rule as
+    // on the declaration side (the host compares the argument with the formal
+    // parameter type). The parameter list must match the argument count --
+    // the self-hosted checker resolves overloads by name, so a different
+    // overload may be the intended one.
+    void CheckTaskArgs(Node m, Node call) {
+        if (m == null) { return; }
+        int np = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { np = np + 1; }
+            i = i + 1;
+        }
+        if (np != call.kids.Count) { return; }
+        int j = 0;
+        i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                Node a = call.kids[j];
+                if (a != null) {
+                    CheckTaskNoResult(p.type, InferType(a), "argument", a.line, a.col);
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+    // 工厂调用延续初始化器的成员写（独立方法：CheckExpr 已在每方法的
+    // 局部槽预算边缘，不再往里长）：调用本身照常查，成员写只查右值
+    // （lhs 是返回对象的成员名，不是局部量）。
+    void CheckCallInitItems(Node n) {
+        CheckExpr(n.a);
+        int i = 0;
+        while (i < n.kids.Count) {
+            Node it = n.kids[i];
+            if (it.kind == AK.Assignment()) { CheckExpr(it.b); } else { CheckExpr(it); }
+            i = i + 1;
+        }
+    }
+}

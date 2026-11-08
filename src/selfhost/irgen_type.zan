@@ -1,0 +1,464 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    string MapType(Node t) {
+        if (t == null) { return "void"; }
+        string n = t.sval;
+        if (IsNullableValue(t)) { return "i8*"; }
+        // an array travels as its element-slot pointer (i64*), even when the
+        // element type is a generic parameter: the array check has to come
+        // BEFORE the erasure check, or `T[]` would be lowered to a bare i64
+        // slot and the data pointer would not fit.
+        if (t.ival >= 1) { return "i64*"; }
+        if (IsErasedType(t)) { return "i64"; }
+        if (n == "void") { return "void"; }
+        if (n == "string") { return "i8*"; }
+        // A487: decimal 保留类型名（checker 按名分流），发射仍是 double。
+        if (n == "double" || n == "float" || n == "decimal") { return "double"; }
+        if (n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte" || n == "nint") { return "i64"; }
+        if (n == "object" || n == "var") { return "i8*"; }
+        if (n == "List" || n == "Dictionary" || n == "Dict") { return "i8*"; }
+        if (n == "StringBuilder") { return "i8*"; }
+        // hardware vectors travel as first-class LLVM vector values (the C
+        // host's ABI); they are never heap objects
+        if (n == "Vector128") { return "<2 x i64>"; }
+        if (n == "Vector256") { return "<4 x i64>"; }
+        // Span<T> / ReadOnlySpan<T> is a non-owning view; the host carries
+        // { base, len } but the selfhost backend has no aggregate values, so
+        // a span travels as its base address (spans are never bounds-checked).
+        if (n == "Span" || n == "ReadOnlySpan") { return "i64"; }
+        // A task handle travels as the coroutine frame pointer: an async call
+        // hands back the frame (the `__task` pseudo-type of the call site), so
+        // a Task-typed slot is a pointer, not an integer.
+        if (n == "Task" && binder.FindType(n) == null) { return "i8*"; }
+        Node d = binder.FindType(n);
+        if (d != null) {
+            if (d.kind == AK.EnumDecl()) { return "i64"; }
+            return "%" + n + "*";
+        }
+        return "i8*";
+    }
+
+    bool IsPtrType(Node t) {
+        string m = MapType(t);
+        if (m == "i8*") { return true; }
+        int L2 = m.Length;
+        if (L2 > 0 && m.Substring(L2 - 1, 1) == "*") { return true; }
+        return false;
+    }
+
+    bool IsListType(Node t) {
+        if (t == null) { return false; }
+        // an array of lists (`List<string>[]`) is an array, not a list: the
+        // rank (ival) decides
+        if (t.ival >= 1) { return false; }
+        if (t.sval == "List") { return true; }
+        return false;
+    }
+
+    bool IsSbType(Node t) {
+        if (t == null) { return false; }
+        if (t.ival >= 1) { return false; }
+        if (t.sval == "StringBuilder") { return true; }
+        return false;
+    }
+
+    bool IsSpanType(Node t) {
+        if (t == null) { return false; }
+        if (t.ival >= 1) { return false; }
+        if (t.sval == "Span" || t.sval == "ReadOnlySpan") { return true; }
+        return false;
+    }
+
+    Node SpanElem(Node t) {
+        if (t != null && t.kids.Count > 0) { return t.kids[0]; }
+        return MkType("int");
+    }
+
+    // LLVM integer type of one span element (its storage width, not the i64
+    // every scalar travels in).
+    string SpanIty(Node el) {
+        string n = "int";
+        if (el != null) { n = el.sval; }
+        if (n == "byte" || n == "sbyte" || n == "bool" || n == "char") { return "i8"; }
+        if (n == "short" || n == "ushort") { return "i16"; }
+        if (n == "int" || n == "uint") { return "i32"; }
+        if (n == "double") { return "double"; }
+        if (n == "float") { return "float"; }
+        return "i64";
+    }
+
+    // Whether loading a span element widens without sign extension.
+    bool SpanZext(Node el) {
+        string n = "int";
+        if (el != null) { n = el.sval; }
+        if (n == "byte" || n == "bool" || n == "char") { return true; }
+        if (n == "ushort" || n == "uint" || n == "ulong") { return true; }
+        return false;
+    }
+
+    // i8*/i16*/i32*/i64* to the span's element at `idx`.
+    string SpanElemPtr(string baseOp, string idxOp, string ity) {
+        string bp = NT();
+        L("  " + bp + " = inttoptr i64 " + baseOp + " to " + ity + "*");
+        string ep = NT();
+        L("  " + ep + " = getelementptr " + ity + ", " + ity + "* " + bp + ", i64 " + idxOp);
+        return ep;
+    }
+
+    bool IsDictType(Node t) {
+        if (t == null) { return false; }
+        if (t.ival >= 1) { return false; }
+        if (t.sval == "Dictionary") { return true; }
+        if (t.sval == "Dict") { return true; }
+        return false;
+    }
+
+    Node DictVal(Node t) {
+        if (t != null && t.kids.Count > 1) { return t.kids[1]; }
+        return MkType("int");
+    }
+
+    Node DictKey(Node t) {
+        if (t != null && t.kids.Count > 0) { return t.kids[0]; }
+        return MkType("int");
+    }
+
+    // the List<elem> type node
+    Node ListOf(Node elem) {
+        Node t = MkType("List");
+        t.a = elem;
+        t.Add(elem);
+        return t;
+    }
+
+    Node ListElem(Node t) {
+        if (t != null && t.kids.Count > 0) { return t.kids[0]; }
+        return MkType("int");
+    }
+
+    // class decl referenced by a class-pointer type, or null
+    Node ClassOf(Node t) {
+        if (t == null) { return null; }
+        // an array type names its ELEMENT with the rank in `ival`: the
+        // element's members are not the array's
+        if (t.ival >= 1) { return null; }
+        Node d = binder.FindType(t.sval);
+        if (d != null && (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())) { return d; }
+        if (t.sval == "Exception" || t.sval == "InvalidCastException"
+            || t.sval == "FormatException" || t.sval == "OverflowException"
+            || t.sval == "IndexOutOfRangeException" || t.sval == "DivideByZeroException"
+            || t.sval == "NullReferenceException") {
+            Node syn = new Node(AK.ClassDecl());
+            syn.sval = t.sval;
+            if (t.sval != "Exception") { syn.sval2 = "Exception"; }
+            return syn;
+        }
+        return null;
+    }
+
+    // per-class type descriptor: the global's address is the type identity
+    // and its value links to the base class's descriptor (chain walk for
+    // catch-clause matching; see GenTry).
+    void EmitTid(Node d) {
+        Node bt = BaseClassOf(d);
+        if (bt != null) {
+            H("@__tid_" + d.sval + " = global i8* bitcast (i8** @__tid_" + bt.sval + " to i8*)");
+        } else {
+            H("@__tid_" + d.sval + " = global i8* null");
+        }
+        tidNames.Add(d.sval);
+    }
+
+    // The built-in containers are heap objects too, so they carry a class id
+    // and the runtime type test can tell a List from a Dict -- the C host can.
+    // The tid global of a container has no source declaration, so it is
+    // emitted here (a user class of the same name takes precedence).
+    string ContainerTidName(string ty) {
+        if (ty == null) { return ""; }
+        if (ty == "List" || ty.StartsWith("List<")) { return "List"; }
+        if (ty == "Dict" || ty.StartsWith("Dict<") || ty == "Dictionary" || ty.StartsWith("Dictionary<")) { return "Dict"; }
+        if (ty == "StringBuilder") { return "StringBuilder"; }
+        return "";
+    }
+
+    // true when `ty` names one of the built-in containers (and no user class
+    // took the name)
+    bool IsContainerType(string ty) {
+        string tn = ContainerTidName(ty);
+        if (tn == "") { return false; }
+        return binder.FindType(tn) == null;
+    }
+
+    // the class-id argument of a container allocation: the address of the
+    // container's tid global
+    string ContainerCid(string ty) {
+        // The cid argument is an `i8*` -- a typed null, not a bare `null`:
+        // LLVM rejects an untyped null as a call argument ("expected type").
+        if (!IsContainerType(ty)) { return "i8* null"; }
+        return "i8* bitcast (i8** @__tid_" + ContainerTidName(ty) + " to i8*)";
+    }
+
+    void EmitContainerTids() {
+        List<string> cs = new List<string>();
+        cs.Add("List"); cs.Add("Dict"); cs.Add("StringBuilder");
+        int i = 0;
+        while (i < cs.Count) {
+            string cn = cs[i];
+            if (binder.FindType(cn) == null) {
+                H("@__tid_" + cn + " = global i8* null");
+            }
+            i = i + 1;
+        }
+        if (!Contains(tidNames, "Exception") && binder.FindType("Exception") == null) {
+            H("@__tid_Exception = global i8* null");
+            tidNames.Add("Exception");
+        }
+        List<string> bExcs = new List<string>();
+        bExcs.Add("InvalidCastException");
+        bExcs.Add("FormatException");
+        bExcs.Add("OverflowException");
+        bExcs.Add("IndexOutOfRangeException");
+        bExcs.Add("DivideByZeroException");
+        bExcs.Add("NullReferenceException");
+        int bei = 0;
+        while (bei < bExcs.Count) {
+            string ben = bExcs[bei];
+            if (!Contains(tidNames, ben) && binder.FindType(ben) == null) {
+                H("@__tid_" + ben + " = global i8* bitcast (i8** @__tid_Exception to i8*)");
+                tidNames.Add(ben);
+            }
+            bei = bei + 1;
+        }
+    }
+
+    // `new object()`: a bare heap object with no fields. It only needs a
+    // destructor -- the ARC runtime frees the storage.
+    void EmitObjectRuntime() {
+        H("define void @__zan_object_dtor(i8* %p) {");
+        H("  ret void");
+        H("}");
+    }
+
+    // ---- inheritance / virtual dispatch helpers ----
+    Node BaseClassOf(Node cls) {
+        if (cls == null) { return null; }
+        if (cls.sval2 == "") { return null; }
+        return binder.FindType(cls.sval2);
+    }
+
+    bool HasMod(Node m, int flag) { return (m.mods / flag) - ((m.mods / flag) / 2) * 2 == 1; }
+    bool IsVirtual(Node m) { return HasMod(m, MOD.Virtual()); }
+    bool IsOverride(Node m) { return HasMod(m, MOD.Override()); }
+    bool IsAbstract(Node m) { return HasMod(m, MOD.Abstract()); }
+    // introduces a fresh vtable slot: virtual or abstract, but not an override
+    bool IsVSlotIntro(Node m) { return (IsVirtual(m) || IsAbstract(m)) && !IsOverride(m); }
+
+    // A class is polymorphic if it or any ancestor declares a virtual/abstract/
+    // override method, or if it implements any interface; such classes carry
+    // a vtable pointer in field slot 0.
+    // Interfaces are modelled as abstract classes and are polymorphic too.
+    bool IsPolyClass(Node cls) {
+        if (cls == null) { return false; }
+        if (HasMod(cls, MOD.Iface())) { return true; }
+        if (cls.interfaces != null && cls.interfaces.Count > 0) { return true; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && (IsVirtual(m) || IsOverride(m) || IsAbstract(m))) { return true; }
+            i = i + 1;
+        }
+        return IsPolyClass(BaseClassOf(cls));
+    }
+
+    // field slot offset: 1 when a vtable pointer occupies slot 0.
+    //
+    // 类**一律**留这个槽（结构体是值类型，没有）：继承链上只要有一处
+    // 偏移不一致，字段就会错位——以前 vptr 槽只在"本类或祖先多态"时才留，
+    // 于是 Base（无接口无虚方法）与 Derived : Base, IFace（有 vptr）
+    // 给同一个字段两套下标，基类构造器把字段写进了派生对象的 vptr 槽。
+    int FieldBase(Node cls) {
+        if (cls == null) { return 0; }
+        if (cls.kind == AK.StructDecl()) { return 0; }
+        return 1;
+    }
+
+    // weak fields are non-owning back-references: never retained or released.
+    bool WeakTy(Node t) { if (t == null) { return false; } int b = t.mods / 1024; return b - (b / 2) * 2 == 1; }
+
+    // ordered fields, base classes first (layout-compatible with base pointers)
+    void CollectFields(Node cls, List<string> names, List<Node> types) {
+        if (cls == null) { return; }
+        CollectFields(BaseClassOf(cls), names, types);
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl() && !IsStatic(m)) { names.Add(m.sval); types.Add(m.type); }
+            i = i + 1;
+        }
+    }
+
+    // The number of instance fields the class chain below `cls` contributes
+    // to its layout (the base fields come first).
+    int BaseFieldCount(Node cls) {
+        if (cls == null) { return 0; }
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
+        return names.Count;
+    }
+
+    // The position of `name` in the flattened field layout of `cls` (base
+    // fields first). The **most derived** declaration wins: a derived field
+    // hides a base field of the same name, and both keep their own slot.
+    int FieldPos(Node cls, string name) {
+        if (cls == null) { return -1; }
+        int bcount = BaseFieldCount(BaseClassOf(cls));
+        int seen = 0;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl() && !IsStatic(m)) {
+                if (m.sval == name) { return bcount + seen; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return FieldPos(BaseClassOf(cls), name);
+    }
+
+    int FieldIndex(Node cls, string name) {
+        if (cls == null) { return -1; }
+        int p = FieldPos(cls, name);
+        if (p < 0) { return -1; }
+        return FieldBase(cls) + p;
+    }
+
+    // The type of the most derived declaration of the field `name`: a derived
+    // field may hide a base field of the same name with a different type.
+    Node FieldType(Node cls, string name) {
+        if (cls == null) { return null; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl() && !IsStatic(m) && m.sval == name) { return m.type; }
+            i = i + 1;
+        }
+        return FieldType(BaseClassOf(cls), name);
+    }
+
+    // ---- locals ----
+    string AddLocal(string name, Node ty) {
+        locSeq = locSeq + 1;
+        string r = "%v." + name + "." + locSeq;
+        locName.Add(name); locType.Add(ty); locReg.Add(r);
+        locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false);
+        locOpaque.Add(false);
+        return r;
+    }
+    string RegOf(string name) { int i = LocalIdx(name); if (i < 0) { return "%v." + name; } return locReg[i]; }
+    int LocalIdx(string name) {
+        int i = locName.Count - 1;
+        while (i >= 0) { if (locName[i] == name) { return i; } i = i - 1; }
+        return -1;
+    }
+
+    // byte size of a lowered type: a capture cell holds exactly one value
+    int TypeSizeBytes(string lt) {
+        if (lt == "i1" || lt == "i8") { return 1; }
+        if (lt == "i16") { return 2; }
+        if (lt == "i32" || lt == "float") { return 4; }
+        if (lt == "<2 x i64>") { return 16; }
+        if (lt == "<4 x i64>") { return 32; }
+        return 8;
+    }
+
+    // A local a closure captures has to live in a heap cell: the closure
+    // keeps the cell, so a write to the local after the capture stays
+    // visible inside the closure (C# semantics). The local's register
+    // becomes the cell's payload pointer, so every read and write goes
+    // through the cell. Returns the local's new register.
+    string BoxLocal(int li) {
+        Node ty = locType[li];
+        string lt = MapType(ty);
+        string cell = NT();
+        L("  " + cell + " = call i8* @malloc(i64 " + TypeSizeBytes(lt) + ")");
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + cell + " to " + lt + "*");
+        locReg[li] = p;
+        locBox[li] = true;
+        locCell[li] = cell;
+        return p;
+    }
+
+    // a local whose name shows up inside a lambda of this function may be
+    // captured by a closure: it has to live in a cell
+    bool ShouldBox(string name) { return Contains(capNames, name); }
+
+    // ---- string helpers ----
+    string HEXD(int d) { return "0123456789ABCDEF".Substring(d, 1); }
+    string Hex2(int b) { int hi = b / 16; int lo = b - hi * 16; return HEXD(hi) + HEXD(lo); }
+
+    // eight little-endian bytes of a 64-bit value, as the escaped text an
+    // LLVM c"..." constant needs
+    string HexI64LE(long v) {
+        string s = "";
+        int i = 0;
+        while (i < 8) {
+            int b = (int)(v % 256);
+            s = s + "\\" + Hex2(b);
+            v = v / 256;
+            i = i + 1;
+        }
+        return s;
+    }
+
+    List<int> DecodeStr(string raw) {
+        return StrEsc.DecodeBytes(raw);
+    }
+
+    ExprVal GenStr(string raw) {
+        List<int> bytes = DecodeStr(raw);
+        string bodytxt = "";
+        int i = 0;
+        while (i < bytes.Count) { bodytxt = bodytxt + "\\" + Hex2(bytes[i]); i = i + 1; }
+        bodytxt = bodytxt + "\\00";
+        int blen = bytes.Count + 1;
+        // managed string header in front of the payload: [i64 cid][i64 len]
+        // [i64 magic] -- the same 24-byte shape as an object header, so the
+        // runtime type test can read the class-id slot of any heap value
+        string hdr = HexI64LE(0) + HexI64LE(bytes.Count) + "\\54\\53\\4E\\5A\\00\\00\\00\\00";
+        strn = strn + 1;
+        string g = "@.s" + strn;
+        int tlen = 24 + blen;
+        H(g + " = private unnamed_addr constant [" + tlen + " x i8] c\"" + hdr + bodytxt + "\"");
+        string t = NT();
+        L("  " + t + " = getelementptr inbounds [" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 24");
+        return new ExprVal(t, MkType("string"));
+    }
+
+    void CollectTParams(Node unit) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int j = 0;
+                while (j < d.kids.Count) {
+                    Node dm = d.kids[j];
+                    if (dm.kind == AK.TypeParam()) { tparamNames.Add(dm.sval); }
+                    else {
+                        int k = 0;
+                        while (k < dm.kids.Count) {
+                            if (dm.kids[k].kind == AK.TypeParam()) { tparamNames.Add(dm.kids[k].sval); }
+                            k = k + 1;
+                        }
+                    }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}

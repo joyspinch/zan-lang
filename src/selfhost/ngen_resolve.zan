@@ -1,0 +1,605 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    Node FindStatic(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return null; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) { return methNodes[cs[i]]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // find an instance method by name (first match across classes)
+    int FindInstanceIdx(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return -1; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 0) { return cs[i]; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    bool IsVirtualMod(Node m) { return HasMod(m, MOD.Virtual()) || HasMod(m, MOD.Override()); }
+    // what occupies a vtable slot: virtual, override, or an abstract
+    // declaration (interfaces are all-abstract classes)
+    bool IsSlotMod(Node m) { return IsVirtualMod(m) || HasMod(m, MOD.Abstract()); }
+
+    int IndexOfStrNg(List<string> xs, string s) {
+        int i = 0;
+        while (i < xs.Count) { if (xs[i] == s) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    int MethodCountNg(string cls, string name) {
+        int n = 0;
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return 0; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] != 2) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // exported symbol for a method (static or instance). With a single
+    // declaration the historical `_Cls_name` stands; with overloads the
+    // parameter tags are appended so two methods cannot collide (mirrors
+    // CtorSymNg). 缺口四: this plain name now carries the C-ABI export
+    // shim; the compiled body lives one "__body" suffix away, and every
+    // internal reference (BLInternal calls, vtable slots, delegate and
+    // method-group loads, reflection thunks, async ramps) resolves to the
+    // body through MethSymNg below.
+    string MethExportSymNg(string cls, Node m) {
+        string cs = ConversionSymNg(cls, m);
+        if (cs != null) { return cs; }
+        if (m.sval2 != null && m.sval2 != "" && m.sval2.IndexOf("<") < 0) { return "_" + m.sval2; }
+        if (MethodCountNg(cls, m.sval) <= 1) { return "_" + cls + "_" + m.sval; }
+        string s = "_" + cls + "_" + m.sval + "__";
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTagNg(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // symbol of the compiled body of a method: MethExportSymNg plus the
+    // "__body" suffix. Constructed only here so registration and every
+    // reference stay in lockstep.
+    string MethSymNg(string cls, Node m) {
+        return MethExportSymNg(cls, m) + "__body";
+    }
+
+    // vtable slot key of a method declaration: name + parameter type tags.
+    // Overloads occupy distinct slots (C# matches overrides by signature),
+    // so a virtual dispatch through one overload can never land in another
+    string SlotKeyNg(Node m) {
+        string s = m.sval;
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTagNg(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // is a slot-key tag an OPEN type parameter: a bare identifier that
+    // resolves to no declared type or primitive ("T" in Box<T>.Put(T, T)).
+    // Under erasure one shared body serves every instantiation, so such a
+    // tag accepts any word tag the implementation declares.
+    bool ErasedTagNg(string tag) {
+        if (tag == null || tag.Length == 0) { return false; }
+        if (tag.IndexOf("[") >= 0) { return false; }
+        int dot = tag.IndexOf(".");
+        string head = dot > 0 ? tag.Substring(0, dot) : tag;
+        if (head == "int" || head == "long" || head == "ulong" || head == "double"
+                || head == "bool" || head == "char" || head == "string"
+                || head == "object" || head == "byte" || head == "sbyte"
+                || head == "short" || head == "ushort" || head == "uint"
+                || head == "float" || head == "nint" || head == "void") { return false; }
+        return FindClass(head) == null;
+    }
+
+    // does a method occupy a slot key: exact key equality, or a generic
+    // base's erased key ("Put_T_T") matching a concrete implementation
+    // ("Put_int_int") tag-for-tag with open tags as wildcards
+    bool SlotKeyMatchNg(Node m, string key) {
+        string mk = SlotKeyNg(m);
+        if (mk == key) { return true; }
+        int un = mk.IndexOf("_");
+        int uk = key.IndexOf("_");
+        if (un <= 0 || uk <= 0) { return false; }
+        if (mk.Substring(0, un) != key.Substring(0, uk)) { return false; }
+        int i = un + 1;
+        int j = uk + 1;
+        while (i < mk.Length || j < key.Length) {
+            int e1 = mk.IndexOf("_", i); if (e1 < 0) { e1 = mk.Length; }
+            int e2 = key.IndexOf("_", j); if (e2 < 0) { e2 = key.Length; }
+            string t1 = mk.Substring(i, e1 - i);
+            string t2 = key.Substring(j, e2 - j);
+            if (t1 != t2 && !ErasedTagNg(t2)) { return false; }
+            if (e1 == mk.Length && e2 == key.Length) { return true; }
+            if (e1 == mk.Length || e2 == key.Length) { return false; }
+            i = e1 + 1;
+            j = e2 + 1;
+        }
+        return true;
+    }
+
+    // virtual-slot keys of cls, base classes first; a derived
+    // re-declaration of an inherited virtual keeps the base slot
+    void CollectVSlotsNg(string cls, List<string> slots) {
+        Cls c = FindClass(cls);
+        if (c != null && c.baseName != null) { CollectVSlotsNg(c.baseName, slots); }
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return; }
+        int i = 0;
+        while (i < mine.Count) {
+            int mi = mine[i];
+            if (methStat[mi] == 0 && IsSlotMod(methNodes[mi])
+                    && IndexOfStrNg(slots, SlotKeyNg(methNodes[mi])) < 0) { slots.Add(SlotKeyNg(methNodes[mi])); }
+            i = i + 1;
+        }
+    }
+
+    // slot index of method decl m in the receiver's static class's vtable,
+    // or -1 when the call is not virtual
+    int VSlotOf(string rc, Node m) {
+        List<string> slots = new List<string>();
+        CollectVSlotsNg(rc, slots);
+        return IndexOfStrNg(slots, SlotKeyNg(m));
+    }
+
+    // instance-method candidates for a call on receiver class rc, derived
+    // class first (shadowing picks the most-derived declaration)
+    void InstanceCands(string rc, string name, List<int> outIdx) {
+        string cur = rc;
+        while (cur != null) {
+            List<int> cs = MethCandsClsName(cur, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    if (methStat[cs[i]] == 0) { outIdx.Add(cs[i]); }
+                    i = i + 1;
+                }
+            }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+    }
+
+    // extension-method dispatch: `recv.Name(args)` with no instance or
+    // static-through-instance match names a static method whose first
+    // parameter is `this T` with T the receiver's static type (declared by
+    // fn.ival == 1 in ParseParams). Candidates are ranked by temporarily
+    // letting the receiver occupy the first argument slot, so the remaining
+    // arguments score against parameters 1.. exactly like FitPickIdx.
+    // Returns the chosen method index without mutating callNode, or -1.
+    int ResolveExtNg(Node recv, string name, Node callNode) {
+        string rt = ExtRecvTy(recv);
+        if (rt == null) { return -1; }
+        List<int> cands = new List<int>();
+        List<int> nc = MethCandsName(name);
+        if (nc != null) {
+            int i = 0;
+            while (i < nc.Count) {
+                int mi = nc[i];
+                Node m = methNodes[mi];
+                if (methStat[mi] == 1 && m.ival == 1 && m.kids.Count > 0) {
+                    Node p0 = ParamAt(m, 0);
+                    string pt = p0 != null && p0.type != null ? TypeFullName(p0.type) : null;
+                    if (pt == rt || (pt != null && IndexOfStrNg(DeclTps(m), pt) >= 0)) { cands.Add(mi); }
+                }
+                i = i + 1;
+            }
+        }
+        if (cands.Count == 0) { return -1; }
+        callNode.kids.Insert(0, recv);
+        int pick = FitPickIdx(cands, callNode);
+        callNode.kids.RemoveAt(0);
+        return pick;
+    }
+
+    // static type name of an extension-method receiver: StaticTyOf plus the
+    // literal shapes it does not cover ("hey".Shout(), (3).Twice())
+    string ExtRecvTy(Node e) {
+        if (e == null) { return null; }
+        string t = StaticTyOf(e);
+        if (t != null) { return t; }
+        return ExtRecvLitTy(e);
+    }
+
+    string ExtRecvLitTy(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.IntLit()) {
+            if (e.suffix == 2 || e.suffix == 3) { return "ulong"; }
+            if (e.suffix == 1) { return "long"; }
+            return "int";
+        }
+        if (e.kind == AK.StringLit()) { return "string"; }
+        if (e.kind == AK.FloatLit()) { return "double"; }
+        if (e.kind == AK.BoolLit()) { return "bool"; }
+        if (e.kind == AK.CharLit()) { return "char"; }
+        return null;
+    }
+
+    // the op_index / op_index_set instance method of cls (its base chain),
+    // or null -- the indexer protocol obj[i] dispatches through
+    Node OpIndexMethod(string cls) { return OpMethodInChain(cls, "op_index"); }
+    Node OpIndexSetMethod(string cls) { return OpMethodInChain(cls, "op_index_set"); }
+    Node OpMethodInChain(string cls, string name) {
+        string cur = cls;
+        while (cur != null) {
+            Node m = FindInstanceInCls(cur, name);
+            if (m != null) { return m; }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+        return null;
+    }
+
+    // first method of any kind whose declared name matches, or -1
+    // (specialization lookups by mangled name)
+    int FindMethByNameNg(string name) {
+        List<int> cs = MethCandsName(name);
+        return cs != null && cs.Count > 0 ? cs[0] : -1;
+    }
+    Node AccessorInChain(string cls, string name) {
+        string cur = cls;
+        while (cur != null) {
+            List<int> cs = MethCandsClsName(cur, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    int st = methStat[cs[i]];
+                    if (st == 0 || st == 1) {
+                        accOwnerCls = cur;
+                        return methNodes[cs[i]];
+                    }
+                    i = i + 1;
+                }
+            }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+        return null;
+    }
+
+    // among a class's op_index / op_index_set overloads, the one whose index
+    // (and, for setters, value) parameters best fit the operand types, or
+    // null -- indexer overloads are distinguished by their parameter types
+    Node OpIndexFit(string cls, string name, Node idxExpr, Node valExpr) {
+        Node best = null;
+        int bestScore = -2000000000;
+        string cur = cls;
+        while (cur != null) {
+            List<int> cs = MethCandsClsName(cur, name);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    int mi = cs[i];
+                    if (methStat[mi] == 0 || methStat[mi] == 1) {
+                        Node m = methNodes[mi];
+                        // the indexer protocol takes both spellings: an
+                        // instance op_index(idx[, val]) and a static
+                        // op_index(self, idx[, val]) -- the register layout
+                        // is identical either way (x0 receiver, x1 index,
+                        // x2 value), only the parameter offset shifts
+                        int ioff = 0;
+                        if (methStat[mi] == 1) {
+                            Node sp = ParamAt(m, 0);
+                            if (sp == null || sp.type == null
+                                    || TypeFullName(sp.type) != cur) { i = i + 1; continue; }
+                            ioff = 1;
+                        }
+                        Node ip = ParamAt(m, ioff);
+                        if (ip == null || ip.type == null) { i = i + 1; continue; }
+                        int s1 = ArgParamScore(idxExpr, TypeFullName(ip.type));
+                        if (s1 <= -100) { i = i + 1; continue; }
+                        int score = s1;
+                        if (valExpr != null) {
+                            Node vp = ParamAt(m, ioff + 1);
+                            if (vp == null || vp.type == null) { i = i + 1; continue; }
+                            int s2 = ArgParamScore(valExpr, TypeFullName(vp.type));
+                            if (s2 <= -100) { i = i + 1; continue; }
+                            score = score + s2;
+                        }
+                        if (score > bestScore) { bestScore = score; best = m; }
+                    }
+                    i = i + 1;
+                }
+            }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+        return best;
+    }
+
+    string VSlotImplCls(string cls, string key) {
+        string cur = cls;
+        while (cur != null) {
+            List<int> cs = MethCandsCls(cur);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    // an abstract declaration does not implement its own slot;
+                    // the search continues down the chain to the concrete body
+                    if (methStat[cs[i]] == 0 && SlotKeyMatchNg(methNodes[cs[i]], key)
+                            && !HasMod(methNodes[cs[i]], MOD.Abstract())) { return cur; }
+                    i = i + 1;
+                }
+            }
+            Cls cc = FindClass(cur);
+            cur = cc != null ? cc.baseName : null;
+        }
+        return null;
+    }
+
+    Node FindInstanceInCls(string cls, string name) {
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return null; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 0) { return methNodes[cs[i]]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // the concrete instance declaration occupying a signature-keyed slot
+    Node FindInstanceInClsKey(string cls, string key) {
+        List<int> cs = MethCandsCls(cls);
+        if (cs == null) { return null; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 0 && SlotKeyMatchNg(methNodes[cs[i]], key)) { return methNodes[cs[i]]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // does method m admit a call with argc arguments: the exact arity, a
+    // `params` tail covering the rest, or trailing default parameters
+    // filling the gap (gen0's method_accepts_arity)
+    bool MethodAcceptsArity(Node m, int argc) {
+        int pc = ParamCount(m);
+        Node lastP = pc > 0 ? ParamAt(m, pc - 1) : null;
+        bool variadic = lastP != null && lastP.op == 1;
+        if (variadic) { return argc >= pc - 1; }
+        // [DllImport(Variadic = true)]: the declared parameters are the fixed
+        // prefix of a C varargs callee -- every argument beyond them is
+        // well-formed (printf(fmt, ...))
+        if (HasMod(m, MOD.Variadic())) { return argc >= pc; }
+        if (argc == pc) { return true; }
+        if (argc > pc) { return false; }
+        int j = argc;
+        while (j < pc) {
+            Node p = ParamAt(m, j);
+            if (p == null || p.b == null) { return false; }
+            j = j + 1;
+        }
+        return true;
+    }
+
+    // overload resolution among candidate method indices: exact-arity
+    // candidates outrank default-filled ones, each scored by
+    // argument/parameter type agreement (same shape as FitCtorIdx)
+    int FitPickIdx(List<int> cands, Node callNode) {
+        int argc = callNode.kids.Count;
+        int exact = -1; int exactScore = -2000000000;
+        int filled = -1; int filledScore = -2000000000;
+        int i = 0;
+        while (i < cands.Count) {
+            Node m = methNodes[cands[i]];
+            if (MethodAcceptsArity(m, argc)) {
+                int pc = ParamCount(m);
+                int score = 0;
+                bool compatible = true;
+                int j = 0;
+                while (j < argc && compatible) {
+                    if (j < pc) {
+                        Node p = ParamAt(m, j);
+                        string pt = p != null && p.type != null ? TypeFullName(p.type) : null;
+                        if (p != null && p.op == 1 && IsArrTy(pt)) {
+                            // the params tail takes every remaining argument
+                            // as an element, so it is ranked against the
+                            // element type -- comparing an element with the
+                            // array type would disqualify the only candidate
+                            // that can take the call (Calc.Sum(1, 2, 3),
+                            // gen0's method_args_score). The bundle handed
+                            // over whole stays exact.
+                            string et = pt.Substring(0, pt.Length - 2);
+                            while (j < argc) {
+                                Node ta = callNode.kids[j];
+                                string tat = StaticTyOf(ta);
+                                if (tat != null && tat == pt) {
+                                    score = score + 8;
+                                } else {
+                                    int es = ArgParamScore(ta, et);
+                                    if (es <= -100) { compatible = false; }
+                                    score = score + es;
+                                }
+                                j = j + 1;
+                            }
+                        } else {
+                            int s = ArgParamScore(callNode.kids[j], pt);
+                            if (s <= -100) { compatible = false; }
+                            score = score + s;
+                        }
+                    }
+                    j = j + 1;
+                }
+                if (compatible) {
+                    if (pc == argc) {
+                        if (score > exactScore) { exactScore = score; exact = cands[i]; }
+                    } else {
+                        if (score > filledScore) { filledScore = score; filled = cands[i]; }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if (exact >= 0) { return exact; }
+        return filled;
+    }
+
+    // Shared by call emission and return-type inference, so an extern's
+    // signature cannot be replaced by an unrelated same-named method.
+    int ResolveStaticNg(Node e) {
+        if (e.a == null) { return -1; }
+        Node callee = e.a;
+        string cls = curCls;
+        bool bare = callee.kind == AK.Ident();
+        if (!bare) {
+            if (callee.kind != AK.MemberAccess() || callee.a == null) { return -1; }
+            // namespace-qualified static call `Ns.Sub.Cls.Method(args)`:
+            // the receiver is a pure dotted identifier path whose LAST
+            // segment names the class (types register by simple name, so
+            // the namespace prefix is decoration). The head must not be a
+            // local, so genuine instance chains (`a.b.Method()`) fall
+            // through to the instance handlers (irgen_call.c:4878).
+            if (callee.a.kind == AK.MemberAccess()) {
+                Node head = callee.a;
+                while (head.kind == AK.MemberAccess()) { head = head.a; }
+                if (head.kind != AK.Ident() || LocalIdx(head.sval) >= 0
+                        || FindClass(callee.a.sval) == null) { return -1; }
+                cls = callee.a.sval;
+            } else if (callee.a.kind != AK.Ident()
+                    || FindClass(callee.a.sval) == null) { return -1; }
+            else { cls = callee.a.sval; }
+        }
+        List<int> cands = new List<int>();
+        while (cls != null) {
+            List<int> cs = MethCandsClsName(cls, callee.sval);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    if (methStat[cs[i]] == 1) { cands.Add(cs[i]); }
+                    i = i + 1;
+                }
+            }
+            Cls c = FindClass(cls);
+            cls = c != null ? c.baseName : null;
+        }
+        if (bare && cands.Count == 0) {
+            // An implicit this member outranks the legacy global-static
+            // fallback (Lexer.Ident must not resolve to TK.Ident).
+            if (LocalIdx("this") >= 0) {
+                List<int> inst = new List<int>();
+                InstanceCands(curCls, callee.sval, inst);
+                if (inst.Count > 0) { return -1; }
+            }
+            List<int> gs = MethCandsName(callee.sval);
+            if (gs != null) {
+                int i = 0;
+                while (i < gs.Count) {
+                    if (methStat[gs[i]] == 1) { cands.Add(gs[i]); }
+                    i = i + 1;
+                }
+            }
+        }
+        if (cands.Count == 0) { return -1; }
+        int pick = cands.Count == 1 ? cands[0] : FitPickIdx(cands, e);
+        return pick >= 0 ? pick : cands[0];
+    }
+
+    // find a static method declared by exactly this class (Class.Method()
+    // form -- FindStaticIdx only matches by bare name)
+    int FindStaticInCls(string cls, string name) {
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return -1; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) { return cs[i]; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // does the named class declare a constructor?
+    bool ClassHasCtor(string cls) {
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return false; }
+        int i = 0;
+        while (i < mine.Count) {
+            if (methStat[mine[i]] == 2) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // does the program itself declare a member of that class with this
+    // name? (gen0 steps its built-ins aside per member, so defining one
+    // Convert or Math method does not disable the others)
+    bool UserDefinesClsMember(string cls, string name) {
+        return MethCandsClsName(cls, name) != null;
+    }
+
+    // which scalar flavour does this expression carry, for x.ToString()
+    // rendering (null = not a scalar: leave the call to method dispatch)?
+    string ScalarToStringTy(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.IntLit()) { return "int"; }
+        if (IsBoolExpr(e)) { return "bool"; }
+        if (IsStrExpr(e)) { return "string"; }
+        if (IsCharExpr(e)) { return "char"; }
+        if (IsDblExpr(e)) { return "double"; }
+        if (IsUlongExpr(e)) { return "ulong"; }
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            // gen0 renders uint/ushort signed too (only ulong goes unsigned)
+            string t = e.type.sval;
+            if (t == "double" || t == "float") { return "double"; }
+            if (t == "ulong") { return "ulong"; }
+            if (t == "int" || t == "long" || t == "short" || t == "byte"
+                    || t == "sbyte" || t == "uint" || t == "ushort") { return "int"; }
+            return null;
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) {
+                string t = locTy[li];
+                if (t == "int" || t == "long" || t == "short" || t == "byte"
+                        || t == "sbyte" || t == "uint" || t == "ushort") { return "int"; }
+                return null;
+            }
+            Fld f = CurField(e.sval);
+            if (f != null && (f.ty == "int" || f.ty == "long"
+                    || f.ty == "short" || f.ty == "byte")) { return "int"; }
+            string st = FindStaticTy(curCls, e.sval);
+            if (st == "int" || st == "long") { return "int"; }
+            return null;
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            string rt = CallRetTy(e);
+            if (rt == "int" || rt == "long" || rt == "short" || rt == "byte") { return "int"; }
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null && (f.ty == "int" || f.ty == "long"
+                    || f.ty == "short" || f.ty == "byte")) { return "int"; }
+        }
+        // computed scalar shapes (parenthesized arithmetic, shifts, unary):
+        // the bool/double/ulong probes above already classified their kinds,
+        // so what remains of these operators renders through the int renderer
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+                    || op == TK.Slash() || op == TK.Percent()
+                    || op == TK.LessLess() || op == TK.GreaterGreater()
+                    || op == TK.GreaterGreaterGreater()) { return "int"; }
+        }
+        if (e.kind == AK.Unary() && e.op == TK.Minus()) { return "int"; }
+        return null;
+    }
+}

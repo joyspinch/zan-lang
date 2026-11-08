@@ -1,0 +1,329 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+
+    // ---- register-op helpers (encodings verified against clang -arch arm64) ----
+    void MovRR(int rd, int rm) {
+        if (tgt86 == 1) {
+            int d = XMapReal(rd);
+            if (d >= 0) { XGetV(rm, d); }
+            else { XGetV(rm, 10); XSetV(rd, 10); }
+            return;
+        }
+        E4(0xAA000000 | (rm << 16) | (31 << 5) | rd); // mov rd, rm (orr with xzr)
+    }
+    void AddRR(int rd, int rn, int rm) {
+        if (tgt86 == 1) { XAddRR(rd, rn, rm); return; }
+        E4(0x8B000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void SubImm(int rd, int rn, int imm) {
+        if (tgt86 == 1) {
+            if (rd == rn) {
+                int d = XMapReal(rd);
+                if (d >= 0) {
+                    if (imm >= -128 && imm <= 127) { X1(XrexW(0, d)); X1(0x83); X1(0xE8 | (d & 7)); X1(imm); }
+                    else { X1(XrexW(0, d)); X1(0x81); X1(0xE8 | (d & 7)); X4(imm); }
+                    return;
+                }
+            }
+            XAddImmTwin(rd, rn, imm, 1);
+            return;
+        }
+        E4(0xD1000000 | (imm << 10) | (rn << 5) | rd);
+    }
+    // ---- 三寄存器算术族(batch 24)----
+    // x86 是两地址机:经 r10/r11 暂存,r 槽位寄存器(v8-v15)经 XGetV/
+    // XSetV 进出,真寄存器直通。arm64 字与既有裸 E4 逐位一致(基址从
+    // 在用裸字反推),替换不改变 arm64 码流。
+    void AndRR(int rd, int rn, int rm) {
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("AndRR d-slot with rn=v16", curLine, curCol); return; }
+            // and 写穿暂存 r10:家在 r10 的 v16 作被操作数时会被毁
+            int tmp = (dd == 11) ? 10 : 11;      // 目的地是 r11 时避开
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            Xop(0x21, dd, tmp);                  // and dd, tmp
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0x8A000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void OrrRR(int rd, int rn, int rm) {
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("OrrRR d-slot with rn=v16", curLine, curCol); return; }
+            int tmp = (dd == 11) ? 10 : 11;
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            Xop(0x09, dd, tmp);                  // or dd, tmp (r/m 为目的的形态)
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xAA000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void SubRR(int rd, int rn, int rm) {         // 与 AndRR/OrrRR 同构的减法族(批 46:
+        if (tgt86 == 1) {                        // 协程定时器头差/整型减法现形)
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("SubRR d-slot with rn=v16", curLine, curCol); return; }
+            int tmp = (dd == 11) ? 10 : 11;      // 目的地是 r11 时避开
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            Xop(0x29, dd, tmp);                  // sub dd, tmp
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xCB000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    // 字节级载入/存储([rn+off] 单字节;batch 34 sha256 的 big-endian 拼装)
+    void LoadB(int rd, int rn, int off) {
+        if (tgt86 == 1) {
+            if (rn == 31) {
+                X1(0x44); X1(0x0F); X1(0xB6); X1(0x9C); X1(0x24); X4(off);   // movzx r11d, byte [rsp+disp32]
+                XSetV(rd, 11);
+                return;
+            }
+            XGetV(rn, 11);
+            X3(0x45, 0x0F, 0xB6); X1(0x5B); X1(off & 0xFF);    // movzx r11d, byte [r11+disp8]
+            XSetV(rd, 11);
+            return;
+        }
+        E4(0x39400000 | (off << 10) | (rn << 5) | rd);
+    }
+    void StoreB(int rt, int rn, int off) {
+        if (tgt86 == 1) {
+            if (rn == 31) {
+                XGetV(rt, 10);
+                X1(0x44); X1(0x88); X1(0x94); X1(0x24); X4(off);   // mov byte [rsp+disp32], r10b
+                return;
+            }
+            XGetV(rt, 10);
+            XGetV(rn, 11);
+            X3(0x45, 0x88, 0x53); X1(off & 0xFF);              // mov byte [r11+disp8], r10b(rm=r11 需 B——首版 44 解码成 [rbx],sha256 全部 scratch 写入落空)
+            return;
+        }
+        E4(0x39000000 | (off << 10) | (rn << 5) | rt);
+    }
+    void MaddRR(int rd, int rn, int rm, int ra) {  // rd = rn*rm + ra(batch 34 DateTime)
+        if (tgt86 == 1) {
+            XGetV(rn, 10);
+            XGetV(rm, 11);
+            // modrm D3: reg=r10(目的) rm=r11——首版 DA 的 reg 域是 r11,
+            // 积落 r11,后面按 r10 取读到旧值
+            X3(0x4D, 0x0F, 0xAF); X1(0xD3);      // imul r10, r11
+            if (ra == 31) { XSetV(rd, 10); return; }   // xzr 加数 = 纯 mul;XAddRR 不认 v31
+            XAddRR(rd, 16, ra);                  // v16 = 实 r10(积);首版传 v10 是陈旧 spill 槽
+            return;
+        }
+        E4(0x9B000000 | (rm << 16) | (ra << 10) | (rn << 5) | rd);
+    }
+    void UdivRR(int rd, int rn, int rm) {        // 无符号除;x86 除法必须占 rdx(v2 的家)——
+        if (tgt86 == 1) {                        // 调用点 v2 活跃时先 HostSave
+            // 批 35:div 的被除数是 rdx:rax——首版把 rn 装进 r10 就 div,
+            // rax 一直是陈旧值,商随调用点垃圾浮动(b64 groups 根因)
+            XGetV(rn, 0);                        // 被除数 -> rax
+            XGetV(rm, 11);
+            X2(0x31, 0xD2);                      // xor edx, edx(清满 rdx)
+            X3(0x49, 0xF7, 0xF3);                // div r11
+            XSetV(rd, 0);                        // 商在 rax
+            return;
+        }
+        E4(0x9AC00800 | (rm << 16) | (rn << 5) | rd);
+    }
+    void LdrHImm(int rt, int rn, int off) {      // 半字零扩展载入(batch 34 stat mode)
+        if (tgt86 == 1) {
+            XGetV(rn, 11);
+            X3(0x45, 0x0F, 0xB7); X1(0x5B); X1(off & 0xFF);   // movzx r11d, word [r11+disp8]
+            XSetV(rt, 11);
+            return;
+        }
+        E4(0x79400000 | (off << 10) | (rn << 5) | rt);
+    }
+    void SdivRR(int rd, int rn, int rm) {        // 带符号除(截断向零;batch 34 DateTime)
+        if (tgt86 == 1) {
+            XGetV(rn, 0);                        // 被除数 -> rax
+            XGetV(rm, 10);
+            X2(0x48, 0x99);                      // cqo
+            X1(0x48); X2(0xF7, 0xFA);            // idiv r10
+            XSetV(rd, 0);                        // 商 -> rd
+            return;
+        }
+        E4(0x9AC00C00 | (rm << 16) | (rn << 5) | rd);
+    }
+    void XorRR(int rd, int rn, int rm) {         // 批 34:sha256 的 Σ/σ 需要
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("XorRR d-slot with rn=v16", curLine, curCol); return; }
+            int tmp = (dd == 11) ? 10 : 11;
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            Xop(0x31, dd, tmp);                  // xor dd, tmp
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xCA000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void LslImm(int rd, int rn, int sh) {        // 逻辑左移立即数(= lsl #sh;ExtLsl 的同字双臂化)
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("LslImm d-slot with rn=v16", curLine, curCol); return; }
+            XGetV(rn, dd);
+            X1(XrexW(0, dd)); X1(0xC1); X1(0xC0 | (4 << 3) | (dd & 7)); X1(sh);   // shl dd, imm8
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xD3400000 | (((64 - sh) & 63) << 16) | ((63 - sh) << 10) | (rn << 5) | rd);
+    }
+    void LsrImm(int rd, int rn, int sh) {        // 逻辑右移立即数(= ubfm sh..63)
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("LsrImm d-slot with rn=v16", curLine, curCol); return; }
+            XGetV(rn, dd);
+            X1(XrexW(0, dd)); X1(0xC1); X1(0xC0 | (5 << 3) | (dd & 7)); X1(sh);   // shr dd, imm8
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xD3400000 | (sh << 16) | (63 << 10) | (rn << 5) | rd);
+    }
+    void Uxtw32(int rd, int rn) {                // 零扩展低 32(= ubfm #0,#31);x86 用 32 位 mov 自零扩展
+        if (tgt86 == 1) {
+            // 批 31:统一 r10 暂存形态。旧臂的 89 modrm 无 REX——r=10/d=10
+            // 时 reg/rm 域编码静默别名到 rdx(89 modrm 的 reg 域 bit3 被
+            // REX.R 才能带出来),只有双撞 r10 被闸住,单侧 v16 是无声坏
+            // 字节。45 89 D2 = mov r10d,r10d(R|B 齐全)对一切 rd/rn 形态
+            // 正确;零扩展在 32 位 mov 里天然发生。
+            XGetV(rn, 10);
+            X3(0x45, 0x89, 0xD2);                // mov r10d, r10d(高 32 清零)
+            XSetV(rd, 10);
+            return;
+        }
+        E4(0xD3400000 | (31 << 10) | (rn << 5) | rd);
+    }
+    // 可变量移位(lslv/lsrv):x86 移位量必须经 cl(rcx = v3 的家)。
+    // rn=v3 且 rm≠v3 时 rcx 先被移位量占用,取 rn 会读到移位量——
+    // 该组合 fail-closed;rm=v3 或两者皆 v3 均正确。
+    void LslvVV(int rd, int rn, int rm) {
+        if (tgt86 == 1) {
+            if (rn == 3 && rm != 3) { XFailClosed("LslvVV rn=v3 loses rcx", curLine, curCol); return; }
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            XGetV(rm, 1);                        // mov rcx, 移位量
+            XGetV(rn, dd);
+            X1(XrexW(1, dd)); X1(0xD3); X1(0xC0 | (4 << 3) | (dd & 7));   // shl dd, cl
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0x9AC02000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void LsrvVV(int rd, int rn, int rm) {
+        if (tgt86 == 1) {
+            if (rn == 3 && rm != 3) { XFailClosed("LsrvVV rn=v3 loses rcx", curLine, curCol); return; }
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            XGetV(rm, 1);
+            XGetV(rn, dd);
+            X1(XrexW(1, dd)); X1(0xD3); X1(0xC0 | (5 << 3) | (dd & 7));   // shr dd, cl
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0x9AC02400 | (rm << 16) | (rn << 5) | rd);
+    }
+    void CbzReg(int rt, int lbl) {
+        if (tgt86 == 1) { XCbz(rt, lbl, 0); return; }
+        E4(0xB4000000 | rt); fixups.Add(new Fixup(txt.Count - 4, 1, lbl, 0, null));
+    }
+    void CbnzReg(int rt, int lbl) {
+        if (tgt86 == 1) { XCbz(rt, lbl, 1); return; }
+        E4(0xB5000000 | rt); fixups.Add(new Fixup(txt.Count - 4, 1, lbl, 0, null));
+    }
+    void LdrU(int rd, int rn, int off) {
+        if (tgt86 == 1) {
+            int b;
+            if (rn == 31) { b = 4; }                      // sp base (x31 is sp in a base position)
+            else {
+                b = XMapReal(rn);
+                if (b < 0) { XGetV(rn, 11); b = 11; }
+            }
+            int r = XMapReal(rd);
+            if (r >= 0) { XopRMem(0x8B, r, b, off); }
+            else { XopRMem(0x8B, 10, b, off); XSetV(rd, 10); }
+            return;
+        }
+        E4(0xF9400000 | ((off / 8) << 10) | (rn << 5) | rd);
+    }
+    void StrU(int rt, int rn, int off) {
+        if (tgt86 == 1) {
+            int b;
+            if (rn == 31) { b = 4; }                      // sp base
+            else {
+                b = XMapReal(rn);
+                if (b < 0) { XGetV(rn, 11); b = 11; }
+            }
+            if (rt == 31) {
+                // xzr 源(基址位置 31 是 sp,源位置是零寄存器):存字面 0
+                XopMemR(0xC7, 0, b, off); X4(0);
+                return;
+            }
+            int r = XMapReal(rt);
+            if (r >= 0) { XopMemR(0x89, r, b, off); }
+            else { XGetV(rt, 10); XopMemR(0x89, 10, b, off); }
+            return;
+        }
+        E4(0xF9000000 | ((off / 8) << 10) | (rn << 5) | rt);
+    }
+    void Strb0(int rn) {
+        if (tgt86 == 1) {
+            int b = XMapReal(rn);
+            if (b < 0) { XGetV(rn, 11); b = 11; }
+            // mov byte [b], 0 -- mod=00 form, no disp byte. Rosetta 2
+            // mis-decodes the mod=01 disp8 encoding (c6 47 00): it steals
+            // the next instruction's REX byte as the immediate, so the
+            // terminator store lands as 0x48 ('H') and the swallowed
+            // prefix demotes the following instruction to its 32-bit
+            // form. The operand is always a v-register (never sp/SIB or
+            // the rbp/rip mod=00 traps), so the short form is safe.
+            if (b >= 8) { X1(0x41); X2(0xC6, b & 7); }
+            else { X2(0xC6, b & 7); }
+            X1(0);
+            return;
+        }
+        E4(0x39000000 | (rn << 5) | 31); // strb wzr, [rn]
+    }
+
+    // stur/ldur with explicit base register, signed 9-bit unscaled offset
+    void RtStur(int rt, int rn, int off) {
+        if (tgt86 == 1) { XMemV(0, rt, rn, off); return; }
+        E4(0xF8000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    }
+    void RtLdur(int rd, int rn, int off) {
+        if (tgt86 == 1) { XMemV(1, rd, rn, off); return; }
+        E4(0xF8400000 | ((off & 0x1FF) << 12) | (rn << 5) | rd);
+    }
+
+    // ---- hand-emitted runtime core ----
+    void RtPrologue() {
+        if (tgt86 == 1) { XPrologue(0); return; }
+        E4(0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
+        E4(0x910003FD); // mov x29, sp
+    }
+    void RtEpilogue() {
+        if (tgt86 == 1) { XEpilogue(); return; }
+        E4(0xA8C17BFD); // ldp x29, x30, [sp], #16
+        E4(0xD65F03C0); // ret
+    }
+    void RtOom() { // prints the oom message and exits; clobbers everything
+        LoadSymRef("l_.str." + oomIdx, 0);
+        if (tgt86 == 1) { X2(0x31, 0xC0); }   // xor eax, eax: SysV varargs al=0
+        BLExtern("_printf");
+        LoadImm(0, 1);
+        BLExtern("_exit");
+    }
+}

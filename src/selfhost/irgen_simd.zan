@@ -1,0 +1,1111 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- hardware SIMD + bit builtins (mirror the C host's emit_vector128_call
+    // and the BitOperations intrinsics).
+    //
+    // A Vector128/256 value is 16 (or 32) BYTES. The C host carries it in a
+    // { i64, i64 } struct and defines EVERY operation on the byte lanes (the
+    // host's vec128_to_v16i8 path, src/compiler/irgen_expr.c). The self-host
+    // carries the same bytes in a <2 x i64> (or <4 x i64>) value and bitcasts
+    // to the byte view for every operation -- so the bytes, and with them
+    // every result, are the host's.
+    string VecBytePtr(ExprVal a) { return NmAddr(a, "0"); }
+    string VecVT(int bits) { return "<" + (bits / 64) + " x i64>"; }
+    string VecV8(int bits) { return "<" + (bits / 8) + " x i8>"; }
+    string VecFT(int bits) { return "<" + (bits / 32) + " x float>"; }
+    string VecName(int bits) { if (bits == 128) { return "Vector128"; } return "Vector256"; }
+
+    // <bits/64 x i64> 全泳道同值常量（SWAR 掩码用）。
+    string VecSplat64(int bits, string c) {
+        string s = "<";
+        int i = 0;
+        while (i < bits / 64) {
+            if (i > 0) { s = s + ", "; }
+            s = s + "i64 " + c;
+            i = i + 1;
+        }
+        return s + ">";
+    }
+
+    // the byte view of a vector value
+    string VecAsBytes(string v, int bits) {
+        string r = NT();
+        L("  " + r + " = bitcast " + VecVT(bits) + " " + v + " to " + VecV8(bits));
+        return r;
+    }
+    // ... and back to the carrier
+    string VecFromBytes(string v8, int bits) {
+        string r = NT();
+        L("  " + r + " = bitcast " + VecV8(bits) + " " + v8 + " to " + VecVT(bits));
+        return r;
+    }
+    // the float view (four floats per 128-bit vector)
+    string VecAsFloats(string v, int bits) {
+        string r = NT();
+        L("  " + r + " = bitcast " + VecVT(bits) + " " + v + " to " + VecFT(bits));
+        return r;
+    }
+    string VecFromFloats(string vf, int bits) {
+        string r = NT();
+        L("  " + r + " = bitcast " + VecFT(bits) + " " + vf + " to " + VecVT(bits));
+        return r;
+    }
+    // a vector of ones, one per byte lane
+    string VecByteOnes(int bits) {
+        int lanes = bits / 8;
+        string v8 = VecV8(bits);
+        string r = NT();
+        L("  " + r + " = insertelement " + v8 + " undef, i8 1, i32 0");
+        int i = 1;
+        while (i < lanes) {
+            string r2 = NT();
+            L("  " + r2 + " = insertelement " + v8 + " " + r + ", i8 1, i32 " + i);
+            r = r2;
+            i = i + 1;
+        }
+        return r;
+    }
+    // a vector of 0xFF, one per byte lane (the NOT mask)
+    string VecByteAllOnes(int bits) {
+        int lanes = bits / 8;
+        string v8 = VecV8(bits);
+        string r = NT();
+        L("  " + r + " = insertelement " + v8 + " undef, i8 -1, i32 0");
+        int i = 1;
+        while (i < lanes) {
+            string r2 = NT();
+            L("  " + r2 + " = insertelement " + v8 + " " + r + ", i8 -1, i32 " + i);
+            r = r2;
+            i = i + 1;
+        }
+        return r;
+    }
+    // a byte-wise binary op over the two vector arguments
+    ExprVal VecByteOp(Node e, string op, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        string v8 = VecV8(bits);
+        string a8 = VecAsBytes(a.op, bits);
+        string b8 = VecAsBytes(b.op, bits);
+        string r8 = NT();
+        L("  " + r8 + " = " + op + " " + v8 + " " + a8 + ", " + b8);
+        return new ExprVal(VecFromBytes(r8, bits), MkType(VecName(bits)));
+    }
+    // a byte-wise comparison: every matching byte becomes 0xFF
+    ExprVal VecByteCmp(Node e, string pred, int bits) {
+        if (pred == "eq") {
+            // SWAR 等值掩码（A439）：全程 <bits/64 x i64> 泳道算子，
+            // 不产生 i1 向量——<32 x i1> 这类非法宽度在通用 CPU（无
+            // AVX2）的合法化阶段致命（"Do not know how to split this
+            // operator's operand"）。每泳道：x = a^b（等值字节为 0）；
+            // 经典 haszero 掩码标出等值字节（0x80/byte）；(t>>7)*0xFF
+            // 展开成字节掩码 0xFF，与 C 主机的 emit_byte_eq_mask_i64
+            // 同一算式。
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            string wv = VecVT(bits);
+            string x = NT();
+            L("  " + x + " = xor " + wv + " " + a.op + ", " + b.op);
+            string nx = NT();
+            L("  " + nx + " = xor " + wv + " " + x + ", " + VecSplat64(bits, "-1"));
+            string sub = NT();
+            L("  " + sub + " = sub " + wv + " " + x + ", " + VecSplat64(bits, "72340172838076673"));
+            string t1 = NT();
+            L("  " + t1 + " = and " + wv + " " + sub + ", " + nx);
+            string t2 = NT();
+            L("  " + t2 + " = and " + wv + " " + t1 + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string shr = NT();
+            L("  " + shr + " = lshr " + wv + " " + t2 + ", " + VecSplat64(bits, "7"));
+            string m = NT();
+            L("  " + m + " = mul " + wv + " " + shr + ", " + VecSplat64(bits, "255"));
+            string r8 = NT();
+            L("  " + r8 + " = bitcast " + wv + " " + m + " to " + VecV8(bits));
+            return new ExprVal(VecFromBytes(r8, bits), MkType(VecName(bits)));
+        }
+        if (pred == "sgt" || pred == "slt") {
+            // SWAR 带符号大于（A439，与 C 主机 emit_byte_sgt_mask_i64 同
+            // 算式）：异或 0x80 偏序后做无符号逐字节大于——位 7 独大者
+            // 直接胜，位 7 相同者比低 7 位。slt 交换实参。全程泳道算子，
+            // 不产生 i1 向量。
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            string wv = VecVT(bits);
+            string la = pred == "sgt" ? a.op : b.op;
+            string lb = pred == "sgt" ? b.op : a.op;
+            string au = NT();
+            L("  " + au + " = xor " + wv + " " + la + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string bu = NT();
+            L("  " + bu + " = xor " + wv + " " + lb + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string nbu = NT();
+            L("  " + nbu + " = xor " + wv + " " + bu + ", " + VecSplat64(bits, "-1"));
+            string t1 = NT();
+            L("  " + t1 + " = and " + wv + " " + au + ", " + nbu);
+            string t1h = NT();
+            L("  " + t1h + " = and " + wv + " " + t1 + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string x = NT();
+            L("  " + x + " = xor " + wv + " " + la + ", " + lb);
+            string x7 = NT();
+            L("  " + x7 + " = and " + wv + " " + x + ", " + VecSplat64(bits, "9187201950435737471"));
+            string nx7 = NT();
+            L("  " + nx7 + " = xor " + wv + " " + x7 + ", " + VecSplat64(bits, "-1"));
+            string sub = NT();
+            L("  " + sub + " = sub " + wv + " " + x7 + ", " + VecSplat64(bits, "72340172838076673"));
+            string e7 = NT();
+            L("  " + e7 + " = and " + wv + " " + sub + ", " + nx7);
+            string e7h = NT();
+            L("  " + e7h + " = and " + wv + " " + e7 + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string auh = NT();
+            L("  " + auh + " = or " + wv + " " + au + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string bul7 = NT();
+            L("  " + bul7 + " = and " + wv + " " + bu + ", " + VecSplat64(bits, "9187201950435737471"));
+            string gd = NT();
+            L("  " + gd + " = sub " + wv + " " + auh + ", " + bul7);
+            string ge7 = NT();
+            L("  " + ge7 + " = and " + wv + " " + gd + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string abx = NT();
+            L("  " + abx + " = xor " + wv + " " + au + ", " + bu);
+            string eq7 = NT();
+            L("  " + eq7 + " = xor " + wv + " " + abx + ", " + VecSplat64(bits, "-1"));
+            string eq7h = NT();
+            L("  " + eq7h + " = and " + wv + " " + eq7 + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string ne7 = NT();
+            L("  " + ne7 + " = xor " + wv + " " + e7h + ", " + VecSplat64(bits, "-1"));
+            string g2 = NT();
+            L("  " + g2 + " = and " + wv + " " + ge7 + ", " + ne7);
+            string g3 = NT();
+            L("  " + g3 + " = and " + wv + " " + g2 + ", " + eq7h);
+            string gt = NT();
+            L("  " + gt + " = or " + wv + " " + t1h + ", " + g3);
+            string shr = NT();
+            L("  " + shr + " = lshr " + wv + " " + gt + ", " + VecSplat64(bits, "7"));
+            string m = NT();
+            L("  " + m + " = mul " + wv + " " + shr + ", " + VecSplat64(bits, "255"));
+            string r8 = NT();
+            L("  " + r8 + " = bitcast " + wv + " " + m + " to " + VecV8(bits));
+            return new ExprVal(VecFromBytes(r8, bits), MkType(VecName(bits)));
+        }
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        string v8 = VecV8(bits);
+        string a8 = VecAsBytes(a.op, bits);
+        string b8 = VecAsBytes(b.op, bits);
+        string c = NT();
+        L("  " + c + " = icmp " + pred + " " + v8 + " " + a8 + ", " + b8);
+        string r8 = NT();
+        L("  " + r8 + " = sext <" + (bits / 8) + " x i1> " + c + " to " + v8);
+        return new ExprVal(VecFromBytes(r8, bits), MkType(VecName(bits)));
+    }
+    // a byte-wise op the LLVM has an intrinsic for (saturating add/sub, min, max)
+    ExprVal VecByteIntrinsic(Node e, string baseName, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        string v8 = VecV8(bits);
+        string name = baseName + ".v" + (bits / 8) + "i8";
+        EnsureIntrinsic(name, v8, v8 + ", " + v8);
+        string a8 = VecAsBytes(a.op, bits);
+        string b8 = VecAsBytes(b.op, bits);
+        string r8 = NT();
+        L("  " + r8 + " = call " + v8 + " @" + name + "(" + v8 + " " + a8 + ", " + v8 + " " + b8 + ")");
+        return new ExprVal(VecFromBytes(r8, bits), MkType(VecName(bits)));
+    }
+    // the portable pavgb (the C host's emit_pavg_portable): the rounded
+    // per-byte average. The vector adds wrap per lane, so no carry runs
+    // between the bytes: (a&b) + ((a^b)>>1) + ((a^b)&1).
+    ExprVal VecByteAverage(Node e, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        string v8 = VecV8(bits);
+        string a8 = VecAsBytes(a.op, bits);
+        string b8 = VecAsBytes(b.op, bits);
+        string ones = VecByteOnes(bits);
+        string ab = NT(); L("  " + ab + " = and " + v8 + " " + a8 + ", " + b8);
+        string xb = NT(); L("  " + xb + " = xor " + v8 + " " + a8 + ", " + b8);
+        string half = NT(); L("  " + half + " = lshr " + v8 + " " + xb + ", " + ones);
+        string odd = NT(); L("  " + odd + " = and " + v8 + " " + xb + ", " + ones);
+        string sum = NT(); L("  " + sum + " = add " + v8 + " " + ab + ", " + half);
+        string res = NT(); L("  " + res + " = add " + v8 + " " + sum + ", " + odd);
+        return new ExprVal(VecFromBytes(res, bits), MkType(VecName(bits)));
+    }
+    // the portable pshufb (the C host's emit_pshufb_portable): a byte-wise
+    // table lookup whose mask byte with the high bit set clears the lane
+    ExprVal VecByteShuffle(Node e, int bits) {
+        ExprVal v = GenExpr(e.kids[0]);
+        ExprVal m = GenExpr(e.kids[1]);
+        int lanes = bits / 8;
+        string v8 = VecV8(bits);
+        string vv = VecAsBytes(v.op, bits);
+        string mm = VecAsBytes(m.op, bits);
+        string res = NT();
+        L("  " + res + " = insertelement " + v8 + " undef, i8 0, i32 0");
+        int i = 1;
+        while (i < lanes) {
+            string r2 = NT();
+            L("  " + r2 + " = insertelement " + v8 + " " + res + ", i8 0, i32 " + i);
+            res = r2;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < lanes) {
+            string mi = NT(); L("  " + mi + " = extractelement " + v8 + " " + mm + ", i32 " + i);
+            string hi = NT(); L("  " + hi + " = and i8 " + mi + ", 128");
+            string pick = NT(); L("  " + pick + " = icmp eq i8 " + hi + ", 0");
+            string lo = NT(); L("  " + lo + " = and i8 " + mi + ", 15");
+            string idx = NT(); L("  " + idx + " = zext i8 " + lo + " to i32");
+            string got = NT(); L("  " + got + " = extractelement " + v8 + " " + vv + ", i32 " + idx);
+            string lane = NT(); L("  " + lane + " = select i1 " + pick + ", i8 " + got + ", i8 0");
+            string r3 = NT(); L("  " + r3 + " = insertelement " + v8 + " " + res + ", i8 " + lane + ", i32 " + i);
+            res = r3;
+            i = i + 1;
+        }
+        return new ExprVal(VecFromBytes(res, bits), MkType(VecName(bits)));
+    }
+    // a byte-wise float op (the C host's <4 x float> paths: mulps / addps / subps)
+    ExprVal VecFloatOp(Node e, string op, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        string ft = VecFT(bits);
+        string af = VecAsFloats(a.op, bits);
+        string bf = VecAsFloats(b.op, bits);
+        string r = NT();
+        L("  " + r + " = " + op + " " + ft + " " + af + ", " + bf);
+        return new ExprVal(VecFromFloats(r, bits), MkType(VecName(bits)));
+    }
+    // the float lanes of a vector, one by one (the host's vec128_to_v4f32)
+    string VecFloatLane(string vf, int lane, int bits) {
+        string r = NT();
+        L("  " + r + " = extractelement " + VecFT(bits) + " " + vf + ", i32 " + lane);
+        return r;
+    }
+    // Store a vector (16 or 32 bytes) into an address, a byte[] or a float[]
+    ExprVal VecStore(Node e, int bits) {
+        ExprVal dst = GenExpr(e.kids[0]);
+        ExprVal v = GenExpr(e.kids[e.kids.Count - 1]);
+        bool isArr = dst.ty != null && dst.ty.ival >= 1;
+        Node elem = null;
+        if (isArr) { elem = ArrElemOf(dst.ty); }
+        bool isFloatArr = elem != null && elem.sval == "float";
+        if (isFloatArr) {
+            // a float[] holds its elements in slots here: the floats are
+            // written one by one, so the array keeps the host's elements
+            ExprVal off = GenExpr(e.kids[1]);
+            string vf = VecAsFloats(v.op, bits);
+            int lanes = bits / 32;
+            int i = 0;
+            while (i < lanes) {
+                string f = VecFloatLane(vf, i, bits);
+                string d = NT(); L("  " + d + " = fpext float " + f + " to double");
+                string raw = NT(); L("  " + raw + " = bitcast double " + d + " to i64");
+                string idx = NT(); L("  " + idx + " = add i64 " + off.op + ", " + i);
+                string slot = NT();
+                L("  " + slot + " = getelementptr i64, i64* " + dst.op + ", i64 " + idx);
+                L("  store i64 " + raw + ", i64* " + slot);
+                i = i + 1;
+            }
+            return new ExprVal("0", MkType("void"));
+        }
+        string off = "0";
+        if (e.kids.Count == 3) {
+            ExprVal o = GenExpr(e.kids[1]);
+            // an array offset counts ELEMENTS; a byte array's element is a
+            // byte, every other array's element is a slot
+            if (isArr) {
+                int esz = ArrElemSize(ArrElemOf(dst.ty));
+                if (esz > 1) {
+                    string scaled = NT();
+                    L("  " + scaled + " = mul i64 " + o.op + ", " + esz);
+                    off = scaled;
+                } else {
+                    off = o.op;
+                }
+            } else {
+                off = o.op;
+            }
+        }
+        string vt = VecVT(bits);
+        string dbp = VecBytePtr(dst);
+        string p = NT();
+        if (off == "0") {
+            L("  " + p + " = bitcast i8* " + dbp + " to " + vt + "*");
+        } else {
+            string ap = NT();
+            L("  " + ap + " = getelementptr i8, i8* " + dbp + ", i64 " + off);
+            L("  " + p + " = bitcast i8* " + ap + " to " + vt + "*");
+        }
+        L("  store " + vt + " " + v.op + ", " + vt + "* " + p);
+        return new ExprVal("0", MkType("void"));
+    }
+    // the interleave (the C host's punpcklbw / punpckhbw). The host builds
+    // them with LLVMBuildShuffleVector, so the mask is the shufflevector
+    // index vector: the low half interleaves a[i] with b[i] (mask 0,16,1,17
+    // -- the second operand starts at index 16), the high half a[8+i] with
+    // b[8+i].
+    ExprVal VecUnpack(Node e, int bits, bool low) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        int lanes = bits / 8;
+        int half = lanes / 2;
+        string v8 = VecV8(bits);
+        string a8 = VecAsBytes(a.op, bits);
+        string b8 = VecAsBytes(b.op, bits);
+        string mask = "<" + lanes + " x i32> <";
+        int i = 0;
+        while (i < lanes) {
+            if (i > 0) { mask = mask + ", "; }
+            int ai = low ? i / 2 : half + i / 2;
+            int bi = low ? lanes + i / 2 : lanes + half + i / 2;
+            mask = mask + "i32 " + ai + ", i32 " + bi;
+            i = i + 2;
+        }
+        mask = mask + ">";
+        string r8 = NT();
+        L("  " + r8 + " = shufflevector " + v8 + " " + a8 + ", " + v8 + " " + b8 + ", " + mask);
+        return new ExprVal(VecFromBytes(r8, bits), MkType(VecName(bits)));
+    }
+    // the branchless blend (the C host's ConditionalSelect)
+    ExprVal VecBlend(Node e, int bits) {
+        ExprVal c = GenExpr(e.kids[0]);
+        ExprVal l = GenExpr(e.kids[1]);
+        ExprVal r = GenExpr(e.kids[2]);
+        string v8 = VecV8(bits);
+        string c8 = VecAsBytes(c.op, bits);
+        string l8 = VecAsBytes(l.op, bits);
+        string r8 = VecAsBytes(r.op, bits);
+        string ones = VecByteAllOnes(bits);
+        string a = NT(); L("  " + a + " = and " + v8 + " " + c8 + ", " + l8);
+        string nc = NT(); L("  " + nc + " = xor " + v8 + " " + c8 + ", " + ones);
+        string b = NT(); L("  " + b + " = and " + v8 + " " + nc + ", " + r8);
+        string res = NT(); L("  " + res + " = or " + v8 + " " + a + ", " + b);
+        return new ExprVal(VecFromBytes(res, bits), MkType(VecName(bits)));
+    }
+    // the fused multiply-add over the float lanes (the C host's llvm.fma.v4f32)
+    ExprVal VecFma(Node e, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        ExprVal c = GenExpr(e.kids[2]);
+        string ft = VecFT(bits);
+        string name = "llvm.fma.v" + (bits / 32) + "f32";
+        EnsureIntrinsic(name, ft, ft + ", " + ft + ", " + ft);
+        string af = VecAsFloats(a.op, bits);
+        string bf = VecAsFloats(b.op, bits);
+        string cf = VecAsFloats(c.op, bits);
+        string r = NT();
+        L("  " + r + " = call " + ft + " @" + name + "(" + ft + " " + af + ", " + ft + " " + bf + ", " + ft + " " + cf + ")");
+        return new ExprVal(VecFromFloats(r, bits), MkType(VecName(bits)));
+    }
+    // the square root over the float lanes (the C host's llvm.sqrt.v4f32)
+    ExprVal VecSqrt(Node e, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        string ft = VecFT(bits);
+        string name = "llvm.sqrt.v" + (bits / 32) + "f32";
+        EnsureIntrinsic(name, ft, ft);
+        string af = VecAsFloats(a.op, bits);
+        string r = NT();
+        L("  " + r + " = call " + ft + " @" + name + "(" + ft + " " + af + ")");
+        return new ExprVal(VecFromFloats(r, bits), MkType(VecName(bits)));
+    }
+
+    // Prefetch(address) / Prefetch(byte[] source, int offset): the C host
+    // emits llvm.prefetch.p0 with the base address of the array (plus the
+    // element offset) -- irgen_expr.c:2377 and :2719.
+    ExprVal VecPrefetch(Node e) {
+        ExprVal a0 = GenExpr(e.kids[0]);
+        string baseName = NmAddr(a0, "0");
+        if (e.kids.Count == 2) {
+            ExprVal off = GenExpr(e.kids[1]);
+            // an array source counts ELEMENTS -- scale by the element width
+            string o = off.op;
+            if (a0.ty != null && a0.ty.ival >= 1) {
+                int esz = ArrElemSize(ArrElemOf(a0.ty));
+                if (esz > 1) {
+                    string scaled = NT();
+                    L("  " + scaled + " = mul i64 " + o + ", " + esz);
+                    o = scaled;
+                }
+            }
+            string p = NT();
+            L("  " + p + " = getelementptr i8, i8* " + baseName + ", i64 " + o);
+            baseName = p;
+        }
+        EnsureIntrinsic("llvm.prefetch.p0", "void", "i8*, i32, i32, i32");
+        L("  call void @llvm.prefetch.p0(i8* " + baseName + ", i32 0, i32 3, i32 1)");
+        return new ExprVal("0", MkType("void"));
+    }
+
+    // Load 16 (or 32) bytes from an address (arg 0, optionally arg 1 = an
+    // element offset) into a vector.
+    ExprVal VecLoad(Node e, int bits) {
+        ExprVal vb = GenExpr(e.kids[0]);
+        bool isArr = vb.ty != null && vb.ty.ival >= 1;
+        Node velem = null;
+        if (isArr) { velem = ArrElemOf(vb.ty); }
+        bool isFloatArr = velem != null && velem.sval == "float";
+        if (isFloatArr) {
+            // a float[] holds its elements in slots here (eight bytes each),
+            // so the four floats are read one by one and narrowed -- the
+            // resulting bytes are the host's.
+            ExprVal off = GenExpr(e.kids[1]);
+            string ft = VecFT(bits);
+            int lanes = bits / 32;
+            string v = NT();
+            L("  " + v + " = insertelement " + ft + " undef, float 0.0, i32 0");
+            int i = 0;
+            while (i < lanes) {
+                string idx = NT(); L("  " + idx + " = add i64 " + off.op + ", " + i);
+                string slot = NT();
+                L("  " + slot + " = getelementptr i64, i64* " + vb.op + ", i64 " + idx);
+                string raw = NT(); L("  " + raw + " = load i64, i64* " + slot);
+                string d = NT(); L("  " + d + " = bitcast i64 " + raw + " to double");
+                string f = NT(); L("  " + f + " = fptrunc double " + d + " to float");
+                string r2 = NT();
+                L("  " + r2 + " = insertelement " + ft + " " + v + ", float " + f + ", i32 " + i);
+                v = r2;
+                i = i + 1;
+            }
+            return new ExprVal(VecFromFloats(v, bits), MkType(VecName(bits)));
+        }
+        string off = "0";
+        if (e.kids.Count == 2) {
+            ExprVal o = GenExpr(e.kids[1]);
+            // byte[]/float[] + int: the offset is an element index; scale to bytes
+            if (isArr) {
+                int esz = ArrElemSize(ArrElemOf(vb.ty));
+                if (esz > 1) {
+                    string scaled = NT();
+                    L("  " + scaled + " = mul i64 " + o.op + ", " + esz);
+                    off = scaled;
+                } else {
+                    off = o.op;
+                }
+            } else {
+                off = o.op;
+            }
+        }
+        string vt = VecVT(bits);
+        string bp = VecBytePtr(vb);
+        string p = NT();
+        if (off == "0") {
+            L("  " + p + " = bitcast i8* " + bp + " to " + vt + "*");
+        } else {
+            string ap = NT();
+            L("  " + ap + " = getelementptr i8, i8* " + bp + ", i64 " + off);
+            L("  " + p + " = bitcast i8* " + ap + " to " + vt + "*");
+        }
+        string v = NT();
+        L("  " + v + " = load " + vt + ", " + vt + "* " + p);
+        Node rt = MkType(bits == 128 ? "Vector128" : "Vector256");
+        return new ExprVal(v, rt);
+    }
+
+    // bitwise/arithmetic vector op over two vector operands
+    ExprVal VecBinOp(Node e, string op, string resTy) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        string at = MapType(a.ty);
+        string r = NT();
+        L("  " + r + " = " + op + " " + at + " " + a.op + ", " + b.op);
+        return new ExprVal(r, MkType(resTy));
+    }
+
+    // Vector128.Create(...): the C host picks the lane type from the
+    // argument (src/compiler/irgen_expr.c:2075) -- a float broadcasts into
+    // four floats, a long into two longs, a byte into sixteen bytes, an int
+    // into four ints; two arguments are the low and the high half; four
+    // arguments are four floats.
+    ExprVal VecCreate(Node e, int bits) {
+        int argc = e.kids.Count;
+        string rty = VecName(bits);
+        if (argc == 2) {
+            // the low and the high 64-bit half
+            ExprVal lo = GenExpr(e.kids[0]);
+            ExprVal hi = GenExpr(e.kids[1]);
+            string vt = VecVT(bits);
+            string r = NT();
+            L("  " + r + " = insertelement " + vt + " undef, i64 " + lo.op + ", i32 0");
+            string r2 = NT();
+            L("  " + r2 + " = insertelement " + vt + " " + r + ", i64 " + hi.op + ", i32 1");
+            return new ExprVal(r2, MkType(rty));
+        }
+        if (argc == 4) {
+            // four floats
+            string ft = VecFT(bits);
+            string v = NT();
+            L("  " + v + " = insertelement " + ft + " undef, float 0.0, i32 0");
+            int i = 0;
+            while (i < 4) {
+                ExprVal a = GenExpr(e.kids[i]);
+                // the value rides a double slot here (a float is a double in
+                // this backend), so it is narrowed before it enters a float
+                // lane
+                string f = NT();
+                if (a.ty != null && IsDbl(a.ty)) {
+                    L("  " + f + " = fptrunc double " + a.op + " to float");
+                } else {
+                    L("  " + f + " = sitofp i64 " + a.op + " to float");
+                }
+                string r2 = NT();
+                L("  " + r2 + " = insertelement " + ft + " " + v + ", float " + f + ", i32 " + i);
+                v = r2;
+                i = i + 1;
+            }
+            return new ExprVal(VecFromFloats(v, bits), MkType(rty));
+        }
+        // one argument: a broadcast into the lane type the argument implies
+        ExprVal a = GenExpr(e.kids[0]);
+        string an = "int";
+        if (a.ty != null) { an = a.ty.sval; }
+        if (an == "float" || an == "double") {
+            string ft = VecFT(bits);
+            // the argument rides a double slot, so it is narrowed into the
+            // float lane
+            string f = NT();
+            if (a.ty != null && IsDbl(a.ty)) {
+                L("  " + f + " = fptrunc double " + a.op + " to float");
+            } else {
+                L("  " + f + " = sitofp i64 " + a.op + " to float");
+            }
+            int lanes = bits / 32;
+            string v = NT();
+            L("  " + v + " = insertelement " + ft + " undef, float " + f + ", i32 0");
+            int i = 1;
+            while (i < lanes) {
+                string r2 = NT();
+                L("  " + r2 + " = insertelement " + ft + " " + v + ", float " + f + ", i32 " + i);
+                v = r2;
+                i = i + 1;
+            }
+            return new ExprVal(VecFromFloats(v, bits), MkType(rty));
+        }
+        if (an == "long" || an == "ulong" || an == "nint") {
+            string vt = VecVT(bits);
+            int lanes = bits / 64;
+            string v = NT();
+            L("  " + v + " = insertelement " + vt + " undef, i64 " + a.op + ", i32 0");
+            int i = 1;
+            while (i < lanes) {
+                string r2 = NT();
+                L("  " + r2 + " = insertelement " + vt + " " + v + ", i64 " + a.op + ", i32 " + i);
+                v = r2;
+                i = i + 1;
+            }
+            return new ExprVal(v, MkType(rty));
+        }
+        if (an == "byte" || an == "sbyte") {
+            string v8 = VecV8(bits);
+            int lanes = bits / 8;
+            string b = NT(); L("  " + b + " = trunc i64 " + a.op + " to i8");
+            string v = NT();
+            L("  " + v + " = insertelement " + v8 + " undef, i8 " + b + ", i32 0");
+            int i = 1;
+            while (i < lanes) {
+                string r2 = NT();
+                L("  " + r2 + " = insertelement " + v8 + " " + v + ", i8 " + b + ", i32 " + i);
+                v = r2;
+                i = i + 1;
+            }
+            return new ExprVal(VecFromBytes(v, bits), MkType(rty));
+        }
+        // an int: four 32-bit lanes
+        string it = "<" + (bits / 32) + " x i32>";
+        int lanes = bits / 32;
+        string w = NT(); L("  " + w + " = trunc i64 " + a.op + " to i32");
+        string v = NT();
+        L("  " + v + " = insertelement " + it + " undef, i32 " + w + ", i32 0");
+        int i = 1;
+        while (i < lanes) {
+            string r2 = NT();
+            L("  " + r2 + " = insertelement " + it + " " + v + ", i32 " + w + ", i32 " + i);
+            v = r2;
+            i = i + 1;
+        }
+        // the 32-bit lanes are packed into the 64-bit carrier
+        string c = NT();
+        L("  " + c + " = bitcast " + it + " " + v + " to " + VecVT(bits));
+        return new ExprVal(c, MkType(rty));
+    }
+
+    // declare an LLVM intrinsic: sig carries only the parameter types ("i64, i1"),
+    // ret is the return type — emitted as `declare <ret> @name(<sig>)`
+    void EnsureIntrinsic(string name, string ret, string sig) {
+        if (ExternSeen(name)) { return; }
+        externDecls.Add(name);
+        H("declare " + ret + " @" + name + "(" + sig + ")");
+    }
+
+    // AES round function on two <2 x i64> operands (bitcast through <16 x i8>
+    // for the aesni intrinsics; xor-with-key for the "last" variants as the C
+    // host does). With xorKey the second operand is the round key and the
+    // intrinsic runs on the value alone, then XORs the key into the result.
+    ExprVal VecAesOp(Node e, string intrin, bool notUsed) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal k = GenExpr(e.kids[1]);
+        string vt = "<2 x i64>";
+        string v8 = "<16 x i8>";
+        EnsureIntrinsic(intrin, v8, v8 + ", " + v8);
+        string a8 = NT();
+        L("  " + a8 + " = bitcast " + vt + " " + a.op + " to " + v8);
+        string z = NT();
+        L("  " + z + " = zeroinitializer");
+        string z8 = NT();
+        L("  " + z8 + " = bitcast " + vt + " " + z + " to " + v8);
+        string r8 = NT();
+        L("  " + r8 + " = call " + v8 + " @" + intrin + "(" + v8 + " " + a8 + ", " + v8 + " " + z8 + ")");
+        string r64 = NT();
+        L("  " + r64 + " = bitcast " + v8 + " " + r8 + " to " + vt);
+        string r = NT();
+        L("  " + r + " = xor " + vt + " " + r64 + ", " + k.op);
+        return new ExprVal(r, MkType("Vector128"));
+    }
+
+    // The CRC32C step over N bytes (the C host's crc32c_step_fn): the
+    // self-hosted IR has to stay portable -- its consumer compiles it with a
+    // generic CPU, where the SSE4.2 instruction cannot be selected -- so the
+    // step is computed from the CRC32C table instead of the hardware opcode.
+    void EmitCrc32CStep(int nbytes) {
+        string name = "__zan_crc32c_step" + Convert.ToString(nbytes);
+        if (ExternSeen(name)) { return; }
+        EmitCrc32CHelper();
+        externDecls.Add(name);
+        bool wide = nbytes == 8;
+        string rt = wide ? "i64" : "i32";
+        string dt = nbytes == 1 ? "i8" : (nbytes == 2 ? "i16" : (nbytes == 4 ? "i32" : "i64"));
+        H("define internal " + rt + " @" + name + "(" + rt + " %crc, " + dt + " %data) {");
+        H("entry:");
+        // the crc is a 32-bit value; the data is read little-endian, byte by
+        // byte (the CRC32C reflected form)
+        // an instruction operand may not be a parenthesised expression, so
+        // every shifted byte goes through its own SSA name
+        string c = "%c0";
+        if (wide) { H("  %c0 = trunc i64 %crc to i32"); }
+        else { H("  %c0 = add i32 %crc, 0"); }
+        string d = "%d64";
+        if (dt == "i64") { H("  %d64 = add i64 %data, 0"); }
+        else { H("  %d64 = zext " + dt + " %data to i64"); }
+        int k = 0;
+        while (k < nbytes) {
+            string sfx = Convert.ToString(k);
+            if (k > 0) {
+                H("  %sr" + sfx + " = lshr i64 %d64, " + Convert.ToString(8 * k));
+                H("  %b" + sfx + " = and i64 %sr" + sfx + ", 255");
+            } else {
+                H("  %b" + sfx + " = and i64 %d64, 255");
+            }
+            H("  %b" + sfx + "32 = trunc i64 %b" + sfx + " to i32");
+            H("  %x" + sfx + " = xor i32 %c" + Convert.ToString(k) + ", %b" + sfx + "32");
+            H("  %ti" + sfx + " = and i32 %x" + sfx + ", 255");
+            H("  %ti" + sfx + "64 = zext i32 %ti" + sfx + " to i64");
+            H("  %ep" + sfx + " = getelementptr [256 x i32], [256 x i32]* @__zan_crc32c_table, i64 0, i64 %ti" + sfx + "64");
+            H("  %te" + sfx + " = load i32, i32* %ep" + sfx);
+            H("  %sh" + sfx + " = lshr i32 %c" + Convert.ToString(k) + ", 8");
+            H("  %c" + Convert.ToString(k + 1) + " = xor i32 %te" + sfx + ", %sh" + sfx);
+            k = k + 1;
+        }
+        if (wide) {
+            H("  %fin = zext i32 %c" + Convert.ToString(nbytes) + " to i64");
+            H("  ret i64 %fin");
+        } else {
+            H("  ret i32 %c" + Convert.ToString(nbytes));
+        }
+        H("}");
+    }
+
+    // The SSE4.2 CRC32 instruction (the C host's emit_sse42_call): the width
+    // follows the argument types -- a 64-bit datum runs the 64-bit step, a
+    // 16/8/32-bit datum the matching narrower step.
+    ExprVal Sse42Crc32(Node e) {
+        ExprVal cv = GenExpr(e.kids[0]);
+        ExprVal dv = GenExpr(e.kids[1]);
+        Node t0 = ArgTypeNode(e.kids[0]);
+        Node t1 = ArgTypeNode(e.kids[1]);
+        bool t0long = t0 != null && (t0.sval == "long" || t0.sval == "ulong");
+        bool t1long = t1 != null && (t1.sval == "long" || t1.sval == "ulong");
+        bool t1short = t1 != null && (t1.sval == "short" || t1.sval == "ushort" || t1.sval == "char");
+        bool t1byte = t1 != null && (t1.sval == "byte" || t1.sval == "sbyte");
+        if (t0long) {
+            EmitCrc32CStep(8);
+            string r = NT();
+            L("  " + r + " = call i64 @__zan_crc32c_step8(i64 " + cv.op + ", i64 " + dv.op + ")");
+            return new ExprVal(r, MkType("ulong"));
+        }
+        string c32 = NT();
+        L("  " + c32 + " = trunc i64 " + cv.op + " to i32");
+        if (t1long) {
+            // a 64-bit datum with a 32-bit crc: the step truncates the crc to
+            // 32 bits anyway, so the result is the same 32-bit value
+            EmitCrc32CStep(8);
+            string c64 = NT();
+            L("  " + c64 + " = sext i32 " + c32 + " to i64");
+            string r = NT();
+            L("  " + r + " = call i64 @__zan_crc32c_step8(i64 " + c64 + ", i64 " + dv.op + ")");
+            return new ExprVal(r, MkType("uint"));
+        }
+        if (t1short) {
+            EmitCrc32CStep(2);
+            string d16 = NT();
+            L("  " + d16 + " = trunc i64 " + dv.op + " to i16");
+            string r32 = NT();
+            L("  " + r32 + " = call i32 @__zan_crc32c_step2(i32 " + c32 + ", i16 " + d16 + ")");
+            string rz = NT();
+            L("  " + rz + " = zext i32 " + r32 + " to i64");
+            return new ExprVal(rz, MkType("uint"));
+        }
+        if (t1byte) {
+            EmitCrc32CStep(1);
+            string d8 = NT();
+            L("  " + d8 + " = trunc i64 " + dv.op + " to i8");
+            string r32 = NT();
+            L("  " + r32 + " = call i32 @__zan_crc32c_step1(i32 " + c32 + ", i8 " + d8 + ")");
+            string rz = NT();
+            L("  " + rz + " = zext i32 " + r32 + " to i64");
+            return new ExprVal(rz, MkType("uint"));
+        }
+        EmitCrc32CStep(4);
+        string d32 = NT();
+        L("  " + d32 + " = trunc i64 " + dv.op + " to i32");
+        string r32 = NT();
+        L("  " + r32 + " = call i32 @__zan_crc32c_step4(i32 " + c32 + ", i32 " + d32 + ")");
+        string rz = NT();
+        L("  " + rz + " = zext i32 " + r32 + " to i64");
+        return new ExprVal(rz, MkType("uint"));
+    }
+
+    // The PixelOps raster primitives (the C host's emit_pixel_ops_call):
+    // they route to the zan_hw_pixel_* runtime helpers.
+    ExprVal GenPixelOps(string m, Node e) {
+        int argc = e.kids.Count;
+        if (m == "BlendOver" && argc == 3) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal count = GenExpr(e.kids[2]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(dst, "0")); a.Add(NmAddr(src, "0")); a.Add(count.op);
+            NmCallVoid("zan_hw_pixel_blend_over", "i8*, i8*, i64", a);
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "SwapRB" && argc == 3) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal count = GenExpr(e.kids[2]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(dst, "0")); a.Add(NmAddr(src, "0")); a.Add(count.op);
+            NmCallVoid("zan_hw_pixel_swap_rb", "i8*, i8*, i64", a);
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "FillRect" && argc == 7) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal dstStride = GenExpr(e.kids[1]);
+            ExprVal x = GenExpr(e.kids[2]); ExprVal y = GenExpr(e.kids[3]);
+            ExprVal w = GenExpr(e.kids[4]); ExprVal h = GenExpr(e.kids[5]);
+            ExprVal color = GenExpr(e.kids[6]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(dst, "0")); a.Add(dstStride.op); a.Add(x.op); a.Add(y.op);
+            a.Add(w.op); a.Add(h.op); a.Add(NmI32(color));
+            NmCallVoid("zan_hw_pixel_fill_rect", "i8*, i64, i64, i64, i64, i64, i32", a);
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "ResampleBilinearRow" && argc == 7) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src0 = GenExpr(e.kids[1]);
+            ExprVal src1 = GenExpr(e.kids[2]); ExprVal xIdx = GenExpr(e.kids[3]);
+            ExprVal xWt = GenExpr(e.kids[4]); ExprVal wy = GenExpr(e.kids[5]);
+            ExprVal width = GenExpr(e.kids[6]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(dst, "0")); a.Add(NmAddr(src0, "0")); a.Add(NmAddr(src1, "0"));
+            a.Add(NmAddr(xIdx, "0")); a.Add(NmAddr(xWt, "0")); a.Add(NmI32(wy)); a.Add(width.op);
+            NmCallVoid("zan_hw_pixel_resample_bilinear_row", "i8*, i8*, i8*, i8*, i8*, i32, i64", a);
+            return new ExprVal("0", MkType("void"));
+        }
+        return null;
+    }
+
+    // Dispatch a static call on a builtin type to its inline lowering.
+    // Returns null when the method is not a recognised builtin (caller falls
+    // through to the ordinary static-call path).
+    ExprVal GenBuiltinStatic(string cls, string m, Node e) {
+        int argc = e.kids.Count;
+        if (cls == "PixelOps") {
+            ExprVal pv = GenPixelOps(m, e);
+            if (pv != null) { return pv; }
+        }
+        if (cls == "Sse42" && m == "Crc32" && argc == 2) { return Sse42Crc32(e); }
+        if (cls == "Vector128" || cls == "Vector256") {
+            int bits = cls == "Vector128" ? 128 : 256;
+            string rty = bits == 128 ? "Vector128" : "Vector256";
+            if (m == "Load" && (argc == 1 || argc == 2)) { return VecLoad(e, bits); }
+            if (m == "LoadVector128" && argc == 1) { return VecLoad(e, bits); }
+            if (m == "Store" && (argc == 2 || argc == 3)) { return VecStore(e, bits); }
+            if (m == "Prefetch" && (argc == 1 || argc == 2)) { return VecPrefetch(e); }
+            if (m == "Create" && (argc == 1 || argc == 2 || argc == 4)) { return VecCreate(e, bits); }
+            if (m == "Zero" && argc == 0) {
+                return new ExprVal("zeroinitializer", MkType(rty));
+            }
+            if (m == "AllBitsSet" && argc == 0) {
+                // every byte is 0xFF
+                string v8 = VecV8(bits);
+                int lanes = bits / 8;
+                string ones = NT();
+                L("  " + ones + " = insertelement " + v8 + " undef, i8 -1, i32 0");
+                int lane = 1;
+                while (lane < lanes) {
+                    string r2 = NT();
+                    L("  " + r2 + " = insertelement " + v8 + " " + ones + ", i8 -1, i32 " + lane);
+                    ones = r2;
+                    lane = lane + 1;
+                }
+                return new ExprVal(VecFromBytes(ones, bits), MkType(rty));
+            }
+            // byte-wise bitwise / arithmetic (the C host's v16i8 paths)
+            if (m == "And" && argc == 2) { return VecByteOp(e, "and", bits); }
+            if (m == "Or" && argc == 2) { return VecByteOp(e, "or", bits); }
+            if (m == "Xor" && argc == 2) { return VecByteOp(e, "xor", bits); }
+            if (m == "AndNot" && argc == 2) {
+                // (~a) & b (the C host's pandn)
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal b = GenExpr(e.kids[1]);
+                string v8 = VecV8(bits);
+                string a8 = VecAsBytes(a.op, bits);
+                string b8 = VecAsBytes(b.op, bits);
+                string ones = VecByteAllOnes(bits);
+                string na = NT();
+                L("  " + na + " = xor " + v8 + " " + a8 + ", " + ones);
+                string r8 = NT();
+                L("  " + r8 + " = and " + v8 + " " + na + ", " + b8);
+                return new ExprVal(VecFromBytes(r8, bits), MkType(rty));
+            }
+            if (m == "Add" && argc == 2) { return VecByteOp(e, "add", bits); }
+            if (m == "Subtract" && argc == 2) { return VecByteOp(e, "sub", bits); }
+            if (m == "AddSaturate" && argc == 2) { return VecByteIntrinsic(e, "llvm.uadd.sat", bits); }
+            if (m == "SubtractSaturate" && argc == 2) { return VecByteIntrinsic(e, "llvm.usub.sat", bits); }
+            if (m == "Min" && argc == 2) { return VecByteIntrinsic(e, "llvm.umin", bits); }
+            if (m == "Max" && argc == 2) { return VecByteIntrinsic(e, "llvm.umax", bits); }
+            if (m == "Average" && argc == 2) { return VecByteAverage(e, bits); }
+            if ((m == "Equals" || m == "CompareEqual") && argc == 2) { return VecByteCmp(e, "eq", bits); }
+            if (m == "GreaterThan" && argc == 2) { return VecByteCmp(e, "sgt", bits); }
+            if (m == "LessThan" && argc == 2) { return VecByteCmp(e, "slt", bits); }
+            if (m == "Shuffle" && argc == 2) { return VecByteShuffle(e, bits); }
+            if ((m == "UnpackLow" || m == "UnpackHigh") && argc == 2) {
+                return VecUnpack(e, bits, m == "UnpackLow");
+            }
+            if (m == "ConditionalSelect" && argc == 3) { return VecBlend(e, bits); }
+            if (m == "ExtractMostSignificantBits" && argc == 1) { return VecExtractMsb(e, bits); }
+            if (m == "MoveMask" && argc == 1) { return VecExtractMsb(e, bits); }
+            // the float lanes (the C host's <4 x float> paths)
+            if (m == "Multiply" && argc == 2) { return VecFloatOp(e, "fmul", bits); }
+            if (m == "AddFloat" && argc == 2) { return VecFloatOp(e, "fadd", bits); }
+            if (m == "SubtractFloat" && argc == 2) { return VecFloatOp(e, "fsub", bits); }
+            if (m == "MultiplyAdd" && argc == 3) { return VecFma(e, bits); }
+            if (m == "Sqrt" && argc == 1) { return VecSqrt(e, bits); }
+        }
+        // Sse2 shares the Vector128 shapes (the C host routes Sse2.* through
+        // emit_vector128_call as well)
+        if (cls == "Sse2") {
+            string vt = "<2 x i64>";
+            if (m == "LoadVector128" && argc == 1) {
+                ExprVal vb = GenExpr(e.kids[0]);
+                string bp = VecBytePtr(vb);
+                string p = NT();
+                L("  " + p + " = bitcast i8* " + bp + " to " + vt + "*");
+                string v = NT();
+                L("  " + v + " = load " + vt + ", " + vt + "* " + p);
+                return new ExprVal(v, MkType("Vector128"));
+            }
+            if (m == "Store" && argc == 2) {
+                ExprVal dst = GenExpr(e.kids[0]);
+                ExprVal v = GenExpr(e.kids[1]);
+                string dbp = VecBytePtr(dst);
+                string p = NT();
+                L("  " + p + " = bitcast i8* " + dbp + " to " + vt + "*");
+                L("  store " + vt + " " + v.op + ", " + vt + "* " + p);
+                return new ExprVal("0", MkType("void"));
+            }
+            if (m == "And" && argc == 2) { return VecBinOp(e, "and", "Vector128"); }
+            if (m == "Or" && argc == 2) { return VecBinOp(e, "or", "Vector128"); }
+            if (m == "Xor" && argc == 2) { return VecBinOp(e, "xor", "Vector128"); }
+            if (m == "CompareEqual" && argc == 2) { return VecByteCmp(e, "eq", 128); }
+            if (m == "MoveMask" && argc == 1) { return VecExtractMsb(e, 128); }
+        }
+        // AES-NI round intrinsics (the C host's emit_aes_call)
+        if (cls == "Aes") {
+            string vt = "<2 x i64>";
+            string v8 = "<16 x i8>";
+            if (m == "Encrypt" && argc == 2) { return VecAesOp(e, "llvm.x86.aesni.aesenc", false); }
+            if (m == "EncryptLast" && argc == 2) { return VecAesOp(e, "llvm.x86.aesni.aesenclast", false); }
+            if (m == "Decrypt" && argc == 2) { return VecAesOp(e, "llvm.x86.aesni.aesdec", false); }
+            if (m == "DecryptLast" && argc == 2) { return VecAesOp(e, "llvm.x86.aesni.aesdeclast", false); }
+            if (m == "InverseMixColumns" && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                EnsureIntrinsic("llvm.x86.aesni.aesimc", vt, vt);
+                string r = NT();
+                L("  " + r + " = call " + vt + " @llvm.x86.aesni.aesimc(" + vt + " " + a.op + ")");
+                return new ExprVal(r, MkType("Vector128"));
+            }
+            if (m == "KeygenAssist" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal rcon = GenExpr(e.kids[1]);
+                EnsureIntrinsic("llvm.x86.aesni.aeskeygenassist", vt, vt + ", i8");
+                string r8 = NT();
+                L("  " + r8 + " = trunc i64 " + rcon.op + " to i8");
+                string r = NT();
+                L("  " + r + " = call " + vt + " @llvm.x86.aesni.aeskeygenassist(" + vt + " " + a.op + ", i8 " + r8 + ")");
+                return new ExprVal(r, MkType("Vector128"));
+            }
+        }
+        if (cls == "BitOperations") {
+            if ((m == "PopCount" || m == "Popcount") && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                EnsureIntrinsic("llvm.ctpop.i64", "i64", "i64");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.ctpop.i64(i64 " + a.op + ")");
+                return new ExprVal(r, MkType("int"));
+            }
+            if (m == "LeadingZeroCount" && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                if (!IntArgIs64(e.kids[0])) {
+                    // a 32-bit argument counts the leading zeros of its 32 bits
+                    EnsureIntrinsic("llvm.ctlz.i32", "i32", "i32, i1");
+                    string a32 = NT();
+                    L("  " + a32 + " = trunc i64 " + a.op + " to i32");
+                    string r = NT();
+                    L("  " + r + " = call i32 @llvm.ctlz.i32(i32 " + a32 + ", i1 false)");
+                    string r64 = NT();
+                    L("  " + r64 + " = zext i32 " + r + " to i64");
+                    return new ExprVal(r64, MkType("int"));
+                }
+                EnsureIntrinsic("llvm.ctlz.i64", "i64", "i64, i1");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.ctlz.i64(i64 " + a.op + ", i1 false)");
+                string r2 = NT();
+                L("  " + r2 + " = and i64 " + r + ", 4294967295");
+                string r3 = NT();
+                L("  " + r3 + " = shl i64 " + r2 + ", 32");
+                string r4 = NT();
+                L("  " + r4 + " = ashr i64 " + r3 + ", 32");
+                return new ExprVal(r4, MkType("int"));
+            }
+            if (m == "TrailingZeroCount" && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                if (!IntArgIs64(e.kids[0])) {
+                    EnsureIntrinsic("llvm.cttz.i32", "i32", "i32, i1");
+                    string a32 = NT();
+                    L("  " + a32 + " = trunc i64 " + a.op + " to i32");
+                    string r = NT();
+                    L("  " + r + " = call i32 @llvm.cttz.i32(i32 " + a32 + ", i1 false)");
+                    string r64 = NT();
+                    L("  " + r64 + " = zext i32 " + r + " to i64");
+                    return new ExprVal(r64, MkType("int"));
+                }
+                EnsureIntrinsic("llvm.cttz.i64", "i64", "i64, i1");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.cttz.i64(i64 " + a.op + ", i1 false)");
+                string r2 = NT();
+                L("  " + r2 + " = and i64 " + r + ", 4294967295");
+                string r3 = NT();
+                L("  " + r3 + " = shl i64 " + r2 + ", 32");
+                string r4 = NT();
+                L("  " + r4 + " = ashr i64 " + r3 + ", 32");
+                return new ExprVal(r4, MkType("int"));
+            }
+            if (m == "RotateLeft" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal n = GenExpr(e.kids[1]);
+                if (!IntArgIs64(e.kids[0])) {
+                    // a 32-bit rotate: the value narrows to 32 bits first and
+                    // the result is an int in the host (an i32), so it comes
+                    // back SIGN-extended -- `RotateRight(0x12345678, 4)` is
+                    // -2128007553, not 2166959747
+                    EnsureIntrinsic("llvm.fshl.i32", "i32", "i32, i32, i32");
+                    string a32 = NT();
+                    L("  " + a32 + " = trunc i64 " + a.op + " to i32");
+                    string n32 = NT();
+                    L("  " + n32 + " = trunc i64 " + n.op + " to i32");
+                    string r = NT();
+                    L("  " + r + " = call i32 @llvm.fshl.i32(i32 " + a32 + ", i32 " + a32 + ", i32 " + n32 + ")");
+                    string r64 = NT();
+                    L("  " + r64 + " = sext i32 " + r + " to i64");
+                    return new ExprVal(r64, MkType("int"));
+                }
+                EnsureIntrinsic("llvm.fshl.i64", "i64", "i64, i64, i64");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.fshl.i64(i64 " + a.op + ", i64 " + a.op + ", i64 " + n.op + ")");
+                return new ExprVal(r, MkType("int"));
+            }
+            if (m == "RotateRight" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal n = GenExpr(e.kids[1]);
+                if (!IntArgIs64(e.kids[0])) {
+                    EnsureIntrinsic("llvm.fshr.i32", "i32", "i32, i32, i32");
+                    string a32 = NT();
+                    L("  " + a32 + " = trunc i64 " + a.op + " to i32");
+                    string n32 = NT();
+                    L("  " + n32 + " = trunc i64 " + n.op + " to i32");
+                    string r = NT();
+                    L("  " + r + " = call i32 @llvm.fshr.i32(i32 " + a32 + ", i32 " + a32 + ", i32 " + n32 + ")");
+                    string r64 = NT();
+                    L("  " + r64 + " = sext i32 " + r + " to i64");
+                    return new ExprVal(r64, MkType("int"));
+                }
+                EnsureIntrinsic("llvm.fshr.i64", "i64", "i64, i64, i64");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.fshr.i64(i64 " + a.op + ", i64 " + a.op + ", i64 " + n.op + ")");
+                return new ExprVal(r, MkType("int"));
+            }
+            if (m == "IsPow2" && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string nz = NT();
+                L("  " + nz + " = icmp ne i64 " + a.op + ", 0");
+                string m1 = NT();
+                L("  " + m1 + " = sub i64 " + a.op + ", 1");
+                string p2 = NT();
+                L("  " + p2 + " = icmp eq i64 " + a.op + ", " + m1);
+                string r = NT();
+                L("  " + r + " = and i1 " + nz + ", " + p2);
+                string r64 = NT();
+                L("  " + r64 + " = zext i1 " + r + " to i64");
+                return new ExprVal(r64, MkType("bool"));
+            }
+            if ((m == "Log2" || m == "Log2Floor") && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                EnsureIntrinsic("llvm.ctlz.i64", "i64", "i64, i1");
+                string lz = NT();
+                L("  " + lz + " = call i64 @llvm.ctlz.i64(i64 " + a.op + ", i1 false)");
+                string r = NT();
+                L("  " + r + " = sub i64 63, " + lz);
+                return new ExprVal(r, MkType("int"));
+            }
+        }
+        return null;
+    }
+
+    // byte-granular pmovmskb equivalent for the byte paths: gather the MSB of
+    // each of the 16/32 bytes into an int (mirrors llvm.x86.pmovmskb semantics
+    // portably across non-x86 targets, as the C host does).
+    ExprVal VecExtractMsb(Node e, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        string vt = "<" + (bits / 64) + " x i64>";
+        int lanes = bits / 64;
+        string acc = "0";
+        int byteIdx = 0;
+        while (byteIdx < bits / 8) {
+            int lane = byteIdx / 8;
+            int shift = (byteIdx % 8) * 8;
+            string lv = NT();
+            L("  " + lv + " = extractelement " + vt + " " + a.op + ", i32 " + lane);
+            string bv = NT();
+            L("  " + bv + " = lshr i64 " + lv + ", " + (shift + 7));
+            string bb = NT();
+            L("  " + bb + " = and i64 " + bv + ", 1");
+            string sb = NT();
+            L("  " + sb + " = shl i64 " + bb + ", " + byteIdx);
+            string orv = NT();
+            L("  " + orv + " = or i64 " + acc + ", " + sb);
+            acc = orv;
+            byteIdx = byteIdx + 1;
+        }
+        string t32 = NT();
+        L("  " + t32 + " = and i64 " + acc + ", 4294967295");
+        string r = NT();
+        L("  " + r + " = shl i64 " + t32 + ", 32");
+        string r2 = NT();
+        L("  " + r2 + " = ashr i64 " + r + ", 32");
+        return new ExprVal(r2, MkType("int"));
+    }
+
+}

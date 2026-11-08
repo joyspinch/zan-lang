@@ -1,0 +1,383 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+public partial class Parser {
+
+    bool IsAssignOp(int k) {
+        if (k == TK.Eq()) { return true; }
+        if (k == TK.PlusEq()) { return true; }
+        if (k == TK.MinusEq()) { return true; }
+        if (k == TK.StarEq()) { return true; }
+        if (k == TK.SlashEq()) { return true; }
+        if (k == TK.PercentEq()) { return true; }
+        if (k == TK.AmpEq()) { return true; }
+        if (k == TK.PipeEq()) { return true; }
+        if (k == TK.CaretEq()) { return true; }
+        if (k == TK.LessLessEq()) { return true; }
+        return false;
+    }
+
+    // Query-clause chain helpers: `from x in src where W` becomes
+    // src.Where(x => W) over the Enumerable shaped generic extensions, the
+    // same machinery ordinary .Where()/.Select() chains already exercise.
+    Node QLambda(string qv, Node body) {
+        Node lam = new Node(AK.Lambda());
+        Node p = new Node(AK.Param());
+        p.type = MkTypeRef("var");
+        p.sval = qv;
+        lam.Add(p);
+        lam.a = body;
+        lam.line = body.line; lam.col = body.col;
+        return lam;
+    }
+
+    Node QCall(Node recv, string name, Node arg) {
+        Node ma = new Node(AK.MemberAccess());
+        ma.a = recv;
+        ma.sval = name;
+        ma.line = recv.line; ma.col = recv.col;
+        Node c = new Node(AK.Call());
+        c.a = ma;
+        c.Add(arg);
+        c.line = recv.line; c.col = recv.col;
+        return c;
+    }
+
+    Node QCall2(Node recv, string name, Node a1, Node a2) {
+        Node ma = new Node(AK.MemberAccess());
+        ma.a = recv;
+        ma.sval = name;
+        ma.line = recv.line; ma.col = recv.col;
+        Node c = new Node(AK.Call());
+        c.a = ma;
+        c.Add(a1);
+        c.Add(a2);
+        c.line = recv.line; c.col = recv.col;
+        return c;
+    }
+
+    Node QCall3(Node recv, string name, Node a1, Node a2, Node a3) {
+        Node ma = new Node(AK.MemberAccess());
+        ma.a = recv;
+        ma.sval = name;
+        ma.line = recv.line; ma.col = recv.col;
+        Node c = new Node(AK.Call());
+        c.a = ma;
+        c.Add(a1);
+        c.Add(a2);
+        c.Add(a3);
+        c.line = recv.line; c.col = recv.col;
+        return c;
+    }
+
+    Node QMem(Node recv, string name) {
+        Node ma = new Node(AK.MemberAccess());
+        ma.a = recv;
+        ma.sval = name;
+        ma.line = recv.line; ma.col = recv.col;
+        return ma;
+    }
+
+    string QFresh() {
+        qRowSeq = qRowSeq + 1;
+        // no "__" prefix: the compiler encodes explicit type args and spec
+        // names with "__" joins, and a dunder local corrupts that encoding
+        return "zrow" + Convert.ToString(qRowSeq);
+    }
+
+    // deep-copy an expression subtree: the desugar's row mapping reuses one
+    // access expression in several lowered lambdas, and a shared Node would
+    // be visited (and stamped) twice by codegen
+    Node QClone(Node n) {
+        if (n == null) { return null; }
+        Node c = new Node(n.kind);
+        c.sval = n.sval;
+        c.sval2 = n.sval2;
+        c.argName = n.argName;
+        c.ival = n.ival;
+        c.op = n.op;
+        c.line = n.line;
+        c.col = n.col;
+        c.type = n.type;
+        c.a = QClone(n.a);
+        c.b = QClone(n.b);
+        c.c = QClone(n.c);
+        c.d = QClone(n.d);
+        int i = 0;
+        while (i < n.kids.Count) { c.Add(QClone(n.kids[i])); i = i + 1; }
+        return c;
+    }
+
+    // substitute the query's transparent row mapping inside a clause body:
+    // each identifier the mapping names becomes a clone of its row access
+    // (row.first / row.second chains). A nested lambda whose parameter
+    // shadows a mapped name hides the mapping from its body.
+    Node QRewrite(Node n, List<string> names, List<Node> vals) {
+        if (n == null) { return n; }
+        if (n.kind == AK.Ident() && n.sval != null) {
+            int i = 0;
+            while (i < names.Count) {
+                if (names[i] == n.sval) { return QClone(vals[i]); }
+                i = i + 1;
+            }
+            return n;
+        }
+        if (n.kind == AK.Lambda()) {
+            Node c = new Node(n.kind);
+            c.sval = n.sval; c.sval2 = n.sval2; c.argName = n.argName;
+            c.ival = n.ival; c.op = n.op; c.line = n.line; c.col = n.col;
+            c.type = n.type;
+            List<string> sn = new List<string>();
+            List<Node> sv = new List<Node>();
+            int i = 0;
+            while (i < names.Count) { sn.Add(names[i]); sv.Add(vals[i]); i = i + 1; }
+            int k = 0;
+            while (k < n.kids.Count) {
+                Node kid = n.kids[k];
+                if (kid.kind == AK.Param() && kid.sval != null) {
+                    c.Add(kid);
+                    int s = sn.Count - 1;
+                    while (s >= 0) {
+                        if (sn[s] == kid.sval) {
+                            sn.RemoveAt(s);
+                            sv.RemoveAt(s);
+                        }
+                        s = s - 1;
+                    }
+                } else {
+                    c.Add(QRewrite(kid, sn, sv));
+                }
+                k = k + 1;
+            }
+            c.a = QRewrite(n.a, sn, sv);
+            c.d = QRewrite(n.d, sn, sv);
+            return c;
+        }
+        Node c2 = new Node(n.kind);
+        c2.sval = n.sval;
+        c2.sval2 = n.sval2;
+        c2.argName = n.argName;
+        c2.ival = n.ival;
+        c2.op = n.op;
+        c2.line = n.line;
+        c2.col = n.col;
+        c2.type = n.type;
+        c2.a = QRewrite(n.a, names, vals);
+        c2.b = QRewrite(n.b, names, vals);
+        c2.c = QRewrite(n.c, names, vals);
+        c2.d = QRewrite(n.d, names, vals);
+        int ki = 0;
+        while (ki < n.kids.Count) { c2.Add(QRewrite(n.kids[ki], names, vals)); ki = ki + 1; }
+        return c2;
+    }
+
+    // rebuild n with every reference to the previous row variable renamed
+    // to the fresh one (row accesses only ever mention the current row)
+    Node QSubstVar(Node n, string from, string to) {
+        if (n == null) { return n; }
+        if (n.kind == AK.Ident() && n.sval == from) {
+            Node c = new Node(AK.Ident());
+            c.sval = to;
+            c.line = n.line; c.col = n.col;
+            return c;
+        }
+        Node c = new Node(n.kind);
+        c.sval = n.sval;
+        c.sval2 = n.sval2;
+        c.argName = n.argName;
+        c.ival = n.ival;
+        c.op = n.op;
+        c.line = n.line;
+        c.col = n.col;
+        c.type = n.type;
+        c.a = QSubstVar(n.a, from, to);
+        c.b = QSubstVar(n.b, from, to);
+        c.c = QSubstVar(n.c, from, to);
+        c.d = QSubstVar(n.d, from, to);
+        int i = 0;
+        while (i < n.kids.Count) { c.Add(QSubstVar(n.kids[i], from, to)); i = i + 1; }
+        return c;
+    }
+
+    // LINQ query: `from x in src [where c]... [let d = v]...
+    // [join y in inner on l equals r [into g]]... [orderby k [descending], ...]
+    // (select e | group e by k [into g])`. `from` is contextual, committed
+    // only once `in` follows the range variable. Lowered at parse time onto
+    // flat Enumerable extensions: where -> .Where, let -> .With (QPair row),
+    // join -> .JoinPairs, join..into -> .JoinInto, group..by -> .GroupBySel,
+    // orderby -> one single-key stable sort per key in reverse order (the
+    // sorts are stable, so that reproduces C#'s major-to-minor mixed
+    // ordering), select -> .Select. After a row-introducing clause the live
+    // range variables read as row.first/row.second chains; QRewrite
+    // substitutes them into every later clause body. join/group keys are
+    // integer (the KeySelector family); identity selects are elided.
+    Node ParseQuery() {
+        int save = pos;
+        Next(); // from
+        string qv = Next().text; // range var
+        if (!At(TK.In())) { pos = save; return null; }
+        Next(); // in
+        Node q = ParseExpr();
+        List<string> names = new List<string>();
+        List<Node> vals = new List<Node>();
+        names.Add(qv);
+        vals.Add(new Node(AK.Ident()));
+        vals[0].sval = qv;
+        vals[0].line = q.line; vals[0].col = q.col;
+        string curVar = qv;
+        while (At(TK.Ident())) {
+            string kw = Cur().text;
+            if (kw == "where") {
+                Next();
+                q = QCall(q, "Where", QLambda(curVar, QRewrite(ParseExpr(), names, vals)));
+                continue;
+            }
+            if (kw == "let") {
+                Next();
+                string dv = Next().text;
+                if (!At(TK.Eq())) {
+                    diags.Error("expected '=' in let clause", Cur().line, Cur().col);
+                    return q;
+                }
+                Next();
+                Node e = ParseExpr();
+                string f = QFresh();
+                // stream = src.With(v => e): the With extension pairs the
+                // element with its computed value (row.first / row.second).
+                // A Select+factory row cannot type here: the factory's
+                // generic return only binds at emission, after the clause
+                // chain's shaped scan needed it.
+                q = QCall(q, "With", QLambda(curVar, QRewrite(e, names, vals)));
+                int wi = 0;
+                while (wi < vals.Count) {
+                    vals[wi] = QMem(QSubstVar(vals[wi], curVar, f), "first");
+                    wi = wi + 1;
+                }
+                Node dvAcc = new Node(AK.Ident());
+                dvAcc.sval = f;
+                dvAcc.line = q.line; dvAcc.col = q.col;
+                names.Add(dv);
+                vals.Add(QMem(dvAcc, "second"));
+                curVar = f;
+                continue;
+            }
+            if (kw == "orderby") {
+                Next();
+                List<Node> keys = new List<Node>();
+                List<bool> descs = new List<bool>();
+                while (true) {
+                    keys.Add(QRewrite(ParseExpr(), names, vals));
+                    bool desc = false;
+                    if (At(TK.Ident()) && (Cur().text == "ascending"
+                            || Cur().text == "descending")) {
+                        desc = Cur().text == "descending";
+                        Next();
+                    }
+                    descs.Add(desc);
+                    if (At(TK.Comma())) { Next(); continue; }
+                    break;
+                }
+                int ki = keys.Count;
+                while (ki > 0) {
+                    ki = ki - 1;
+                    q = QCall(q, descs[ki] ? "OrderByDescending" : "OrderBy",
+                              QLambda(curVar, keys[ki]));
+                }
+                continue;
+            }
+            if (kw == "join") {
+                Next();
+                string iv = Next().text;
+                if (!At(TK.In())) {
+                    diags.Error("expected 'in' in join clause", Cur().line, Cur().col);
+                    return q;
+                }
+                Next();
+                Node inner = ParseExpr();
+                if (!(At(TK.Ident()) && Cur().text == "on")) {
+                    diags.Error("[E0039] expected 'on' in join clause", Cur().line, Cur().col);
+                    return q;
+                }
+                Next();
+                Node lkey = QRewrite(ParseExpr(), names, vals);
+                if (!(At(TK.Ident()) && Cur().text == "equals")) {
+                    diags.Error("[E0040] expected 'equals' in join clause", Cur().line, Cur().col);
+                    return q;
+                }
+                Next();
+                List<string> rn = new List<string>();
+                List<Node> rv = new List<Node>();
+                rn.Add(iv);
+                rv.Add(new Node(AK.Ident()));
+                rv[0].sval = iv;
+                rv[0].line = lkey.line; rv[0].col = lkey.col;
+                Node rkey = QRewrite(ParseExpr(), rn, rv);
+                bool intoG = At(TK.Ident()) && Cur().text == "into";
+                string gv = null;
+                if (intoG) {
+                    Next();
+                    gv = Next().text;
+                }
+                string f = QFresh();
+                if (intoG) {
+                    q = QCall3(q, "JoinInto", inner,
+                        QLambda(curVar, lkey), QLambda(iv, rkey));
+                } else {
+                    q = QCall3(q, "JoinPairs", inner,
+                        QLambda(curVar, lkey), QLambda(iv, rkey));
+                }
+                int wi = 0;
+                while (wi < vals.Count) {
+                    vals[wi] = QMem(QSubstVar(vals[wi], curVar, f), "first");
+                    wi = wi + 1;
+                }
+                Node gvAcc = new Node(AK.Ident());
+                gvAcc.sval = f;
+                gvAcc.line = lkey.line; gvAcc.col = lkey.col;
+                names.Add(intoG ? gv : iv);
+                vals.Add(QMem(gvAcc, "second"));
+                curVar = f;
+                continue;
+            }
+            if (kw == "group") {
+                Next();
+                Node elem = QRewrite(ParseExpr(), names, vals);
+                if (!(At(TK.Ident()) && Cur().text == "by")) {
+                    diags.Error("[E0041] expected 'by' in group clause", Cur().line, Cur().col);
+                    return q;
+                }
+                Next();
+                Node key = QRewrite(ParseExpr(), names, vals);
+                q = QCall2(q, "GroupBySel", QLambda(curVar, key), QLambda(curVar, elem));
+                if (At(TK.Ident()) && Cur().text == "into") {
+                    Next();
+                    string gv = Next().text;
+                    names.Clear();
+                    vals.Clear();
+                    names.Add(gv);
+                    Node gvAcc = new Node(AK.Ident());
+                    gvAcc.sval = QFresh();
+                    gvAcc.line = elem.line; gvAcc.col = elem.col;
+                    vals.Add(gvAcc);
+                    curVar = gvAcc.sval;
+                    continue;
+                }
+                return q;
+            }
+            break;
+        }
+        if (At(TK.Ident()) && Cur().text == "select") {
+            Next();
+            Node e = ParseExpr();
+            bool identity = e.kind == AK.Ident() && e.sval == curVar
+                && names.Count == 1;
+            if (!identity) {
+                q = QCall(q, "Select", QLambda(curVar, QRewrite(e, names, vals)));
+            }
+        } else {
+            diags.Error("[E0043] expected 'select' in query expression", Cur().line, Cur().col);
+        }
+        return q;
+    }
+}

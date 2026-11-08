@@ -1,0 +1,342 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+
+    // throw expr — store the exception object, pop the innermost handler and
+    // longjmp back into its try (setjmp returns nonzero -> catch path).
+    void GenThrow(Node s) {
+        if (s.a == null) {
+            // a bare `throw;`: re-raise the exception the enclosing catch
+            // clause caught. The in-flight globals may have been overwritten
+            // by a nested try inside the clause body, so the clause's own
+            // copy is the one that is re-raised.
+            if (catchExcVal.Count > 0) {
+                string rv = NT();
+                L("  " + rv + " = load i8*, i8** " + catchExcVal[catchExcVal.Count - 1]);
+                L("  store i8* " + rv + ", i8** @__exc_val");
+                string rt = NT();
+                L("  " + rt + " = load i8*, i8** " + catchExcTid[catchExcTid.Count - 1]);
+                L("  store i8* " + rt + ", i8** @__exc_tid");
+            }
+            EmitRaise();
+            return;
+        }
+        ExprVal v = GenExpr(s.a);
+        string vt = MapType(v.ty);
+        string ev = v.op;
+        if (vt != "i8*") {
+            string t = NT();
+            L("  " + t + " = bitcast " + vt + " " + ev + " to i8*");
+            ev = t;
+        }
+        Node tc = ClassOf(v.ty);
+        if (tc != null) {
+            L("  store i8* bitcast (i8** @__tid_" + tc.sval + " to i8*), i8** @__exc_tid");
+        } else {
+            L("  store i8* null, i8** @__exc_tid");
+        }
+        L("  store i8* " + ev + ", i8** @__exc_val");
+        EmitRaise();
+    }
+
+    // pop the innermost handler and longjmp into its try (the exception
+    // object/tid globals already hold the in-flight exception).
+    void EmitRaise() {
+        // The exception never crosses a coroutine frame: a coroutine that
+        // has no handler for it puts the exception into its frame and the
+        // awaiter re-throws it in its own context (the C host does the
+        // same, irgen_async.c: emit_async_exc_epilogue). So there is no
+        // cross-frame unwind here any more -- walking the awaiter chain
+        // would free frames that are still alive.
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string hasH = NT();
+        L("  " + hasH + " = icmp sgt i64 " + sp + ", 0");
+        int lhandle = NL(); int lunhandled = NL();
+        L("  br i1 " + hasH + ", label %L" + lhandle + ", label %L" + lunhandled);
+        Label(lunhandled);
+        L("  call void @exit(i32 70)");
+        L("  unreachable");
+        Label(lhandle);
+        string sp1 = NT();
+        L("  " + sp1 + " = sub i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        string slot = NT();
+        L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp1);
+        string buf = NT();
+        L("  " + buf + " = load i8*, i8** " + slot);
+        L("  call void @longjmp(i8* " + buf + ", i32 1)");
+        L("  unreachable");
+        term = true;
+    }
+
+    void EmitExcPop() {
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string sp1 = NT();
+        L("  " + sp1 + " = sub i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+    }
+
+    // Run the finally bodies this exit path leaves, innermost first, and pop
+    // the EH frames of the try statements it leaves. A `return` inside a try
+    // body (or a catch clause) MUST run the finally before it returns: the C
+    // host does, and skipping it leaves whatever the finally releases
+    // (a mutex, a file handle) held forever -- the next Lock on it
+    // deadlocks.
+    //
+    // `from` is the index of the innermost finally the exit path leaves: a
+    // break/continue out of a loop runs only the finallys opened INSIDE that
+    // loop, a return runs all of them.
+    void EmitExitFins(int from) {
+        if (finBodies.Count <= from) { return; }
+        // the liveness flags are per-path: the pops below belong to this
+        // path only, so the flags are restored afterwards
+        List<int> saved = new List<int>();
+        int i = 0;
+        while (i < finBodies.Count) { saved.Add(finLive[i]); i = i + 1; }
+        i = finBodies.Count - 1;
+        while (i >= from) {
+            // the try's EH frame goes first: a throw from the finally body
+            // must reach the handler of the NEXT outer try
+            if (finLive[i] == 1) { EmitExcPop(); finLive[i] = 0; }
+            if (finBodies[i] != null && !FinIsActive(i)) {
+                finActive.Add(i);
+                GenStmt(finBodies[i]);
+                finActive.RemoveAt(finActive.Count - 1);
+                // a finally that returns ends the whole exit path
+                if (term) { break; }
+            }
+            i = i - 1;
+        }
+        i = 0;
+        while (i < finBodies.Count) { finLive[i] = saved[i]; i = i + 1; }
+    }
+
+    bool FinIsActive(int i) {
+        int k = 0;
+        while (k < finActive.Count) { if (finActive[k] == i) { return true; } k = k + 1; }
+        return false;
+    }
+
+    // try { } catch (T e) { } finally { }  — setjmp/longjmp based
+    void GenTry(Node s) {
+        // the jmp_buf lives in a global array slot (not a stack alloca): in a
+        // coroutine the resume invocation that armed the handler may have
+        // returned by the time a throw longjmps here, so its stack is dead.
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string bufe = NT();
+        L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
+        string bufp = NT();
+        L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
+        string slot = NT();
+        L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
+        L("  store i8* " + bufp + ", i8** " + slot);
+        string sp1 = NT();
+        L("  " + sp1 + " = add i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        if (curAsync) {
+            // arm: unwind stops at a frame with hcount > 0 (the handler
+            // resumes inside it); keep the heap frame authoritative across
+            // this try -- a throw crossing a suspension longjmps into a stale
+            // invocation whose stack allocas are garbage.
+            EmitAsyncHcAdd(1);
+            EmitAsyncSaveSlots();
+        }
+        // setjmp
+        string r = NT();
+        L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* null)");
+        string c = NT();
+        L("  " + c + " = icmp ne i32 " + r + ", 0");
+        int ltry = NL(); int lcatch = NL(); int lend = NL();
+        L("  br i1 " + c + ", label %L" + lcatch + ", label %L" + ltry);
+        // the try joins the finally stack: a `return` (or a break/continue)
+        // that leaves the try region must run its finally body, exactly like
+        // the C host. The entry lives until the whole try is emitted, so the
+        // catch clauses see it too.
+        int mark = finBodies.Count;
+        finBodies.Add(s.c);
+        finLive.Add(1);
+        Label(ltry);
+        if (curAsync) { asyncTryLbl.Add(lcatch); }
+        GenStmt(s.a);
+        if (curAsync) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
+        if (!term) {
+            EmitExcPop();
+            if (curAsync) { EmitAsyncHcAdd(-1); }
+            // the try's own frame is gone: the finally entry must not pop it
+            // a second time
+            finLive[mark] = 0;
+            if (s.c != null) {
+                finActive.Add(mark);
+                GenStmt(s.c);
+                finActive.RemoveAt(finActive.Count - 1);
+            }
+            if (!term) { L("  br label %L" + lend); }
+        }
+        term = false;
+        Label(lcatch);
+        // the throw popped this try's EH frame on its way here
+        finLive[mark] = 0;
+        if (curAsync) {
+            // disarm. The locals are NOT reloaded from the frame here: the
+            // handler is always reached in the invocation that is running
+            // now (a suspension re-arms it, see EmitAsyncRearm), so the
+            // stack slots hold the current values -- reloading would
+            // overwrite an assignment made after the last suspension with
+            // the frame's older copy.
+            EmitAsyncHcAdd(-1);
+        }
+        // handler already popped by throw; dispatch to the first clause whose
+        // type matches the thrown tid (walking the base chain), rethrowing to
+        // the outer handler when no clause matches. A null tid (string/legacy
+        // throw) matches the first clause.
+        int lfin = NL();
+        if (s.b != null) {
+            int lrethrow = NL();
+            string tidSlot = NT();
+            L("  " + tidSlot + " = alloca i8*");
+            Node cc = s.b;
+            bool first = true;
+            bool sawAll = false;
+            while (cc != null) {
+                int lbody = NL();
+                int lmiss = lrethrow;
+                if (cc.b != null) { lmiss = NL(); }
+                Node ct = ClassOf(cc.type);
+                if (ct != null && !sawAll) {
+                    string tid0 = NT();
+                    L("  " + tid0 + " = load i8*, i8** @__exc_tid");
+                    if (first) {
+                        int lw = NL();
+                        string zn = NT();
+                        L("  " + zn + " = icmp eq i8* " + tid0 + ", null");
+                        L("  br i1 " + zn + ", label %L" + lbody + ", label %L" + lw);
+                        Label(lw);
+                        string tid1 = NT();
+                        L("  " + tid1 + " = load i8*, i8** @__exc_tid");
+                        tid0 = tid1;
+                    }
+                    L("  store i8* " + tid0 + ", i8** " + tidSlot);
+                    int lloop = NL(); int lcmp = NL(); int lstep = NL();
+                    L("  br label %L" + lloop);
+                    Label(lloop);
+                    string cur = NT();
+                    L("  " + cur + " = load i8*, i8** " + tidSlot);
+                    string cn = NT();
+                    L("  " + cn + " = icmp eq i8* " + cur + ", null");
+                    L("  br i1 " + cn + ", label %L" + lmiss + ", label %L" + lcmp);
+                    Label(lcmp);
+                    string hit = NT();
+                    L("  " + hit + " = icmp eq i8* " + cur + ", bitcast (i8** @__tid_" + ct.sval + " to i8*)");
+                    L("  br i1 " + hit + ", label %L" + lbody + ", label %L" + lstep);
+                    Label(lstep);
+                    string curpp = NT();
+                    L("  " + curpp + " = bitcast i8* " + cur + " to i8**");
+                    string nx = NT();
+                    L("  " + nx + " = load i8*, i8** " + curpp);
+                    L("  store i8* " + nx + ", i8** " + tidSlot);
+                    L("  br label %L" + lloop);
+                } else {
+                    // untyped clause (or unknown type): catches everything
+                    L("  br label %L" + lbody);
+                    sawAll = true;
+                }
+                Label(lbody);
+                int catchScope = locName.Count;
+                if (cc.sval != "" && cc.type != null) {
+                    string exv = NT();
+                    L("  " + exv + " = load i8*, i8** @__exc_val");
+                    string cty = MapType(cc.type);
+                    string reg = AddLocal(cc.sval, cc.type);
+                    L("  " + reg + " = alloca " + cty);
+                    string cv = exv;
+                    if (cty != "i8*") {
+                        string t = NT();
+                        L("  " + t + " = bitcast i8* " + exv + " to " + cty);
+                        cv = t;
+                    }
+                    L("  store " + cty + " " + cv + ", " + cty + "* " + reg);
+                }
+                // the exception this clause caught: a bare `throw;` in the body
+                // re-raises it (the in-flight globals may have been
+                // overwritten by a nested try inside the clause body)
+                string exSlot = NT();
+                L("  " + exSlot + " = alloca i8*");
+                string exNow = NT();
+                L("  " + exNow + " = load i8*, i8** @__exc_val");
+                L("  store i8* " + exNow + ", i8** " + exSlot);
+                string tdSlot = NT();
+                L("  " + tdSlot + " = alloca i8*");
+                string tdNow = NT();
+                L("  " + tdNow + " = load i8*, i8** @__exc_tid");
+                L("  store i8* " + tdNow + ", i8** " + tdSlot);
+                catchExcVal.Add(exSlot);
+                catchExcTid.Add(tdSlot);
+                GenStmt(cc.a);
+                catchExcVal.RemoveAt(catchExcVal.Count - 1);
+                catchExcTid.RemoveAt(catchExcTid.Count - 1);
+                if (!term) {
+                    ReleaseLocalsFrom(catchScope);
+                    L("  br label %L" + lfin);
+                }
+                term = false;
+                TrimLocals(catchScope);
+                first = false;
+                if (sawAll) { cc = null; } else { cc = cc.b; }
+                if (cc != null && lmiss != lrethrow) { Label(lmiss); }
+            }
+            // no clause matched: re-raise to the next outer handler (this
+            // try's frame was already popped by the throw); note the finally
+            // body is bypassed on this path (mirrors the C host).
+            if (!sawAll) {
+                Label(lrethrow);
+                EmitRaise();
+                term = false;
+            }
+        } else {
+            L("  br label %L" + lfin);
+        }
+        Label(lfin);
+        if (s.c != null) {
+            // the finally body may run try/catch of its own; keep the
+            // in-flight exception intact across it
+            string sv2 = NT(); string st2 = NT();
+            L("  " + sv2 + " = alloca i8*");
+            L("  " + st2 + " = alloca i8*");
+            string ev0 = NT(); L("  " + ev0 + " = load i8*, i8** @__exc_val");
+            L("  store i8* " + ev0 + ", i8** " + sv2);
+            string td0 = NT(); L("  " + td0 + " = load i8*, i8** @__exc_tid");
+            L("  store i8* " + td0 + ", i8** " + st2);
+            finActive.Add(mark);
+            GenStmt(s.c);
+            finActive.RemoveAt(finActive.Count - 1);
+            if (!term) {
+                string ev1 = NT(); L("  " + ev1 + " = load i8*, i8** " + sv2);
+                L("  store i8* " + ev1 + ", i8** @__exc_val");
+                string td1 = NT(); L("  " + td1 + " = load i8*, i8** " + st2);
+                L("  store i8* " + td1 + ", i8** @__exc_tid");
+            }
+        }
+        if (!term) {
+            if (s.b == null) {
+                // finally-only try: the exception keeps unwinding (the C
+                // host runs the finally at the throw site and propagates)
+                EmitRaise();
+                term = false;
+            } else {
+                L("  br label %L" + lend);
+            }
+        }
+        Label(lend);
+        term = false;
+        // the try leaves the finally stack
+        if (finBodies.Count > mark) {
+            finBodies.RemoveAt(finBodies.Count - 1);
+            finLive.RemoveAt(finLive.Count - 1);
+        }
+    }
+}

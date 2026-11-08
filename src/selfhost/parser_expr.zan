@@ -1,0 +1,1001 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+public partial class Parser {
+
+    // ---- expressions (precedence climbing) ----
+    public Node ParseExpr() { return ParseAssign(); }
+
+    Node ParseAssign() {
+        if (At(TK.Ident()) && Cur().text == "from" && K1() == TK.Ident()) {
+            Node q = ParseQuery();
+            if (q != null) { return q; }
+        }
+        Node left = ParseCoalesce();
+        // conditional:  cond ? a : b  (right-associative, above assignment)
+        if (At(TK.Question())) {
+            Next();
+            Node t = ParseAssign();
+            Expect(TK.Colon());
+            Node f = ParseAssign();
+            Node cn = new Node(AK.Conditional());
+            cn.a = left; cn.b = t; cn.c = f;
+            cn.line = left.line; cn.col = left.col;
+            return cn;
+        }
+        if (At(TK.QQ()) && K1() == TK.Eq()) {
+            Next(); Next();
+            Node right = ParseAssign();
+            Node n = new Node(AK.Assignment());
+            n.op = TK.QQEq(); n.a = left; n.b = right;
+            return n;
+        }
+        if (IsUshrEq()) {
+            Next(); Next(); Next();
+            Node right = ParseAssign();
+            Node n = new Node(AK.Assignment());
+            n.op = TK.GreaterGreaterGreaterEq(); n.a = left; n.b = right;
+            return n;
+        }
+        if (IsShrEq()) {
+            Next(); Next();
+            Node right = ParseAssign();
+            Node n = new Node(AK.Assignment());
+            n.op = TK.GreaterGreaterEq(); n.a = left; n.b = right;
+            return n;
+        }
+        if (IsAssignOp(K())) {
+            Token op = Cur();
+            Next();
+            Node right = ParseAssign();
+            Node n = new Node(AK.Assignment());
+            n.op = op.kind; n.a = left; n.b = right;
+            n.line = op.line; n.col = op.col;
+            return n;
+        }
+        return left;
+    }
+
+    // null-coalescing "a ?? b": lower precedence than || , right-associative.
+    Node ParseCoalesce() {
+        Node left = ParseOr();
+        if (At(TK.QQ()) && K1() != TK.Eq()) {
+            Token tk = Next();
+            Node right = ParseCoalesce();
+            return Bin(tk, left, right);
+        }
+        return left;
+    }
+
+    Node ParseOr() {
+        Node left = ParseAnd();
+        while (At(TK.PipePipe())) { Token tk = Next(); Node r = ParseAnd(); left = Bin(tk, left, r); }
+        return left;
+    }
+    Node ParseAnd() {
+        Node left = ParseBitOr();
+        while (At(TK.AmpAmp())) { Token tk = Next(); Node r = ParseBitOr(); left = Bin(tk, left, r); }
+        return left;
+    }
+    Node ParseBitOr() {
+        Node left = ParseBitXor();
+        while (At(TK.Pipe())) { Token tk = Next(); Node r = ParseBitXor(); left = Bin(tk, left, r); }
+        return left;
+    }
+    Node ParseBitXor() {
+        Node left = ParseBitAnd();
+        while (At(TK.Caret())) { Token tk = Next(); Node r = ParseBitAnd(); left = Bin(tk, left, r); }
+        return left;
+    }
+    Node ParseBitAnd() {
+        Node left = ParseEq();
+        while (At(TK.Amp())) { Token tk = Next(); Node r = ParseEq(); left = Bin(tk, left, r); }
+        return left;
+    }
+    Node ParseEq() {
+        Node left = ParseRel();
+        while (At(TK.EqEq()) || At(TK.BangEq())) { Token tk = Next(); Node r = ParseRel(); left = Bin(tk, left, r); }
+        return left;
+    }
+    Node ParseRel() {
+        Node left = ParseShift();
+        while (At(TK.Less()) || At(TK.Greater()) || At(TK.LessEq()) || At(TK.GreaterEq())) {
+            // ">>" (two adjacent ">") is a shift, handled in ParseShift; here a
+            // lone ">"/"<" etc. is relational.
+            if (At(TK.Greater()) && K1() == TK.Greater() && AdjNext()) { break; }
+            if (IsShrEq()) { break; }
+            Token tk = Next(); Node r = ParseShift(); left = Bin(tk, left, r);
+        }
+        // type pattern:  x is T  |  x is T name  |  x is null  |  x is not null
+        if (At(TK.Is())) {
+            Next();
+            Node ie = new Node(AK.IsExpr());
+            ie.a = left;
+            if (At(TK.Null())) {
+                Next();                                  // `is null`: no type
+            } else if (At(TK.Ident()) && Cur().text == "not") {
+                Next();                                  // `is not ...`
+                if (At(TK.Null())) { Next(); }
+                else {
+                    ie.type = ParseType();
+                    FixIsTernaryQ(ie);
+                    if (At(TK.Ident())) { ie.sval = Next().text; }
+                }
+                ie.op = 1;                               // negated test
+            } else {
+                ie.type = ParseType();
+                FixIsTernaryQ(ie);
+                if (At(TK.Ident())) { ie.sval = Next().text; }
+            }
+            left = ie;
+        }
+        // x as T: like a cast, but yields null instead of failing on a
+        // downcast whose runtime class does not match
+        if (At(TK.As())) {
+            Next();
+            Node ae = new Node(AK.AsExpr());
+            ae.a = left;
+            ae.type = ParseType();
+            FixIsTernaryQ(ae);
+            left = ae;
+        }
+        return left;
+    }
+
+    // `x is T? ...`: C# conditional-operator precedence -- a type-final `?`
+    // opens the ternary when a `:` pairs with it at bracket depth 0 before
+    // any statement terminator (o is string ? "a" : "b"); only a genuine
+    // nullable suffix keeps it (`is int? x` patterns and trailing `is int?`
+    // have no paired colon). Rewinds over the `?` so ParseCond reads it.
+    void FixIsTernaryQ(Node ie) {
+        if (ie == null || ie.type == null || ie.type.op != 1) { return; }
+        if (pos <= 0 || toks[pos - 1].kind != TK.Question()) { return; }
+        if (!TernaryColonAhead()) { return; }
+        pos = pos - 1;
+        ie.type.op = 0;
+    }
+
+    // is there a `:` pairing with a `?` at the current spot? `tern` counts
+    // open ternaries INCLUDING the `?` under decision (start 1): a colon at
+    // tern==1 closes it (rewind), deeper colons close nested ternaries, and
+    // `?`/`:` inside parens/brackets never count -- `o is string ?
+    // (s is string ? "a" : "b") : "c"` rewinds while `is int? n2 ? 1 : 0`
+    // (a `;` arrives with our `?` still open) stays a nullable binding
+    bool TernaryColonAhead() {
+        int paren = 0;
+        int tern = 1;
+        int i = pos;
+        while (i < toks.Count) {
+            int k2 = toks[i].kind;
+            if (k2 == TK.LParen() || k2 == TK.LBracket()) { paren = paren + 1; }
+            else if (k2 == TK.RParen() || k2 == TK.RBracket()) {
+                if (paren == 0) { return false; }
+                paren = paren - 1;
+            }
+            else if (k2 == TK.Question()) {
+                if (paren == 0) { tern = tern + 1; }
+            }
+            else if (k2 == TK.Colon()) {
+                if (paren == 0) {
+                    if (tern <= 1) { return true; }
+                    tern = tern - 1;
+                }
+            }
+            else if (paren == 0 && tern == 1 && (k2 == TK.Semicolon() || k2 == TK.LBrace()
+                    || k2 == TK.RBrace() || k2 == TK.Eof())) { return false; }
+            i = i + 1;
+        }
+        return false;
+    }
+    Node ParseShift() {
+        Node left = ParseAdd();
+        while (true) {
+            if (At(TK.LessLess())) { Token tk = Next(); Node r = ParseAdd(); left = Bin(tk, left, r); }
+            else if (IsUshrEq()) { break; }
+            else if (IsUshr()) {
+                Token tk = Next(); Next(); Next();
+                Node r = ParseAdd();
+                left = BinOp(TK.GreaterGreaterGreater(), tk.line, tk.col, left, r);
+            }
+            else if (At(TK.Greater()) && K1() == TK.Greater() && AdjNext() && !IsShrEq()) {
+                Token tk = Next(); Next();
+                Node r = ParseAdd();
+                left = BinOp(TK.GreaterGreater(), tk.line, tk.col, left, r);
+            } else { break; }
+        }
+        return left;
+    }
+    Node ParseAdd() {
+        Node left = ParseMul();
+        while (At(TK.Plus()) || At(TK.Minus())) { Token tk = Next(); Node r = ParseMul(); left = Bin(tk, left, r); }
+        return left;
+    }
+    Node ParseMul() {
+        Node left = ParseUnary();
+        while (At(TK.Star()) || At(TK.Slash()) || At(TK.Percent())) { Token tk = Next(); Node r = ParseUnary(); left = Bin(tk, left, r); }
+        return left;
+    }
+
+    Node Bin(Token t, Node l, Node r) {
+        return BinOp(t.kind, t.line, t.col, l, r);
+    }
+
+    // A binary expression carries the OPERATOR's position (the C host's
+    // parser does the same -- src/compiler/parser.c), so a diagnostic about
+    // the expression points at the operator.
+    Node BinOp(int op, int line, int col, Node l, Node r) {
+        Node n = new Node(AK.Binary());
+        n.op = op; n.a = l; n.b = r;
+        n.line = line; n.col = col;
+        // checked/unchecked context pins the overflow semantics of + - *
+        if (chkMode != 0 && n.ival == 0
+                && (op == TK.Plus() || op == TK.Minus() || op == TK.Star())) {
+            n.ival = chkMode;
+        }
+        return n;
+    }
+
+    Node ParseUnary() {
+        Token pt = Cur();
+        Node r = ParseUnaryInner();
+        if (r != null && r.line == 0) { r.line = pt.line; r.col = pt.col; }
+        return r;
+    }
+
+    Node ParseUnaryInner() {
+        if (At(TK.Await())) {
+            Token aw = Next();
+            Node n = new Node(AK.AwaitExpr());
+            n.a = ParseUnary();
+            n.line = aw.line; n.col = aw.col;
+            return n;
+        }
+        int k = K();
+        if (k == TK.PlusPlus() || k == TK.MinusMinus()) {
+            // prefix ++/-- yields the NEW value (like the reference: an
+            // AST unary with the ++/-- op); the statement form discards it
+            int op = Next().kind;
+            Node n = new Node(AK.Unary());
+            n.op = op; n.a = ParseUnary();
+            return n;
+        }
+        if (k == TK.Bang() || k == TK.Tilde() || k == TK.Minus() || k == TK.Plus()) {
+            int op = Next().kind;
+            Node n = new Node(AK.Unary());
+            n.op = op; n.a = ParseUnary();
+            return n;
+        }
+        // cast: '(' typeKeyword ')' unary, '(' TypeName ')' unary,
+        // or '(' Name<...> ')' unary (缺口五 generic delegate casts)
+        if (k == TK.LParen() && (IsTypeKeyword(K1()) || IsGenericCast() || IsNamedCast())) {
+            int save = pos;
+            Next(); // (
+            Node ty = ParseType();
+            if (Eat(TK.RParen())) {
+                Node n = new Node(AK.CastExpr());
+                n.type = ty; n.b = ParseUnary();
+                return n;
+            }
+            pos = save;
+        }
+        Node e = ParsePostfix();
+        if (At(TK.Switch())) { return ParseSwitchExpr(e); }
+        return e;
+    }
+
+    // switch expression:  operand switch { pat => e, _ => e }
+    // Arm encoding: `_` discard (a=null, ival=0), constant (a=expr),
+    // relational (op + a), null (a=NullLit), type pattern (ival=1,
+    // type=T, sval=binding); any arm may carry a `when` guard in c.
+    Node ParseSwitchExpr(Node operand) {
+        Next(); // switch
+        Node n = new Node(AK.SwitchExpr());
+        n.a = operand;
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            Node arm = new Node(AK.SwitchCase());
+            int rk = K();
+            if (At(TK.Ident()) && Cur().text == "_") { Next(); arm.a = null; }
+            else if (rk == TK.Less() || rk == TK.Greater() || rk == TK.LessEq() || rk == TK.GreaterEq()) {
+                arm.op = Next().kind; arm.a = ParseAdd();
+            }
+            else if (rk == TK.Null()) { Next(); Node nl = new Node(AK.NullLit()); arm.a = nl; }
+            else if (TypePatternAhead()) {
+                arm.ival = 1;
+                arm.type = ParseType();
+                if (At(TK.Ident())) { arm.sval = Next().text; }
+            }
+            else { arm.a = ParseExpr(); }
+            if (At(TK.Ident()) && Cur().text == "when") { Next(); arm.c = ParseExpr(); }
+            Expect(TK.Arrow());
+            arm.b = ParseExpr();
+            n.Add(arm);
+            Eat(TK.Comma());
+        }
+        Expect(TK.RBrace());
+        return n;
+    }
+
+    // Disambiguate "Name<...>(": treat "<" as generic type args only when a
+    // balanced angle-bracket run made of type-like tokens is immediately
+    // followed by "(". Otherwise it is a relational operator.
+    // `<` opens explicit generic type args when the angle-balanced scan of
+    // type-argument shapes is followed by `(` (a generic call) or `.`
+    // (a generic-qualified member: `Stat<int>.s`); erasure drops the args
+    bool LooksLikeGenericArgs() {
+        int i = pos + 1;
+        int depth = 1;
+        while (i < toks.Count && depth > 0) {
+            int kk = toks[i].kind;
+            if (kk == TK.Less()) { depth = depth + 1; }
+            else if (kk == TK.Greater()) { depth = depth - 1; }
+            else if (kk == TK.Ident() || IsTypeKeyword(kk) || kk == TK.Comma()
+                     || kk == TK.Dot() || kk == TK.LBracket() || kk == TK.RBracket()
+                     || kk == TK.Question()) { }
+            else { return false; }
+            i = i + 1;
+        }
+        if (depth != 0) { return false; }
+        return i < toks.Count && (toks[i].kind == TK.LParen() || toks[i].kind == TK.Dot());
+    }
+
+    bool LooksLikeGenericCall() {
+        int i = pos + 1;
+        int depth = 1;
+        while (i < toks.Count && depth > 0) {
+            int kk = toks[i].kind;
+            if (kk == TK.Less()) { depth = depth + 1; }
+            else if (kk == TK.Greater()) { depth = depth - 1; }
+            else if (kk == TK.Ident() || IsTypeKeyword(kk) || kk == TK.Comma()
+                     || kk == TK.Dot() || kk == TK.LBracket() || kk == TK.RBracket()
+                     || kk == TK.Question()) { }
+            else { return false; }
+            i = i + 1;
+        }
+        if (depth != 0) { return false; }
+        return i < toks.Count && toks[i].kind == TK.LParen();
+    }
+
+    Node ParsePostfix() {
+        Node e = ParsePrimary();
+        while (true) {
+            int k = K();
+            if (k == TK.Dot() || k == TK.QDot()) {
+                Next();
+                Node m = new Node(AK.MemberAccess());
+                m.a = e; m.line = e.line; m.col = e.col;
+                if (k == TK.QDot()) { m.ival = 1; } // null-conditional `?.`
+                if (At(TK.Ident())) { m.sval = Next().text; }
+                else { m.sval = Next().text; }
+                // `Task.WhenAll(handles)` / `Task.WhenAny(handles)` name the
+                // fan-out joins, but the joins are ordinary async stdlib code
+                // (System.Threading.TaskJoin), not compiler intrinsics --
+                // rewrite the receiver here so the promised spelling binds
+                // like any other static async call (parser.c's
+                // desugar_task_join; Task's real intrinsics Spawn/Run/
+                // Cancel/Delay/IsDone/IsCancellationRequested are untouched)
+                if (e.kind == AK.Ident() && e.sval == "Task"
+                        && (m.sval == "WhenAll" || m.sval == "WhenAny")) {
+                    e.sval = "TaskJoin";
+                }
+                e = m;
+            } else if (k == TK.Ident() && Cur().text == "with" && K1() == TK.LBrace()) {
+                // `recv with { field = value, ... }` (record copy), contextual
+                // like C#: `with` is claimed only right before `{`
+                Next();
+                Expect(TK.LBrace());
+                Node we = new Node(AK.WithExpr());
+                we.a = e;
+                while (!At(TK.RBrace()) && !At(TK.Eof())) {
+                    if (!At(TK.Ident())) { break; }
+                    Node asg = new Node(AK.Assignment());
+                    asg.op = TK.Eq();
+                    Node lhs = new Node(AK.Ident());
+                    lhs.sval = Next().text;
+                    asg.a = lhs;
+                    Expect(TK.Eq());
+                    asg.b = ParseExpr();
+                    we.Add(asg);
+                    if (!Eat(TK.Comma())) { break; }
+                }
+                Expect(TK.RBrace());
+                e = we;
+            } else if (k == TK.Less() && LooksLikeGenericArgs()) {
+                // generic method call:  Name<TypeArgs>(args). Erasure is uniform,
+                // so codegen ignores the explicit type args; they are kept
+                // on the callee (b = "__typeargs" container) only until
+                // StripTypeArgs removes them before binding. The following
+                // "(" is picked up as a normal call on the next pass.
+                Next();
+                Node targs = new Node(AK.TypeRef());
+                targs.sval = "__typeargs";
+                targs.Add(ParseCallTypeArg());
+                while (Eat(TK.Comma())) { targs.Add(ParseCallTypeArg()); }
+                Expect(TK.Greater());
+                if (e.kind == AK.MemberAccess() || e.kind == AK.Ident()) { e.b = targs; }
+            } else if (k == TK.LParen()) {
+                Node call = new Node(AK.Call());
+                call.a = e; call.line = e.line; call.col = e.col;
+                ParseArgs(call);
+                e = call;
+            } else if (k == TK.LBracket()) {
+                Token lb = Cur();
+                Next();
+                Node idx = new Node(AK.Index());
+                idx.a = e; idx.line = lb.line; idx.col = lb.col; idx.b = ParseExpr();
+                // rectangular arrays index with several subscripts: m[i, j]
+                // -- the extra subscripts ride in kids (mirrors the oracle
+                // parser's index.extra list)
+                while (Eat(TK.Comma())) { idx.Add(ParseExpr()); }
+                Expect(TK.RBracket());
+                e = idx;
+            } else if (k == TK.LBrace() && (e.kind == AK.Call()
+                        || e.kind == AK.Ident() || e.kind == AK.MemberAccess())) {
+                // 对象初始化器的大括号延续（oracle parse_postfix）：
+                // `Panel.Row() { X = v }`（工厂延续，保住刚解析的调用，
+                // 成员写作用在返回对象上）、`List<int> { a, b }` /
+                // `Panel { X = v }`（标识符/成员链末端重解释为类型，
+                // 等价 brace-only 的 new）。只有表达式紧跟 `{` 才会进
+                // 这里——`foreach (x in xs) {` 的花括号隔着 `)`，不冲突。
+                if (e.kind == AK.Call()) {
+                    Node ci = new Node(AK.CallInit());
+                    ci.a = e;
+                    ci.line = e.line; ci.col = e.col;
+                    ParseBraceItems(ci);
+                    e = ci;
+                } else {
+                    Node nw = new Node(AK.NewExpr());
+                    nw.ival = 2;
+                    Node ty = new Node(AK.TypeRef());
+                    ty.sval = e.sval;
+                    ty.line = e.line; ty.col = e.col;
+                    nw.type = ty;
+                    nw.line = e.line; nw.col = e.col;
+                    ParseBraceItems(nw);
+                    e = nw;
+                }
+            } else if (k == TK.PlusPlus() || k == TK.MinusMinus()) {
+                int op = Next().kind;
+                Node pf = new Node(AK.PostfixUnary());
+                pf.op = op; pf.a = e; pf.line = e.line; pf.col = e.col;
+                e = pf;
+            } else if (k == TK.Bang()) {
+                // postfix null-forgiving `!` (C# parity): construct PostfixUnary
+                // node, stripped at checker time, transparent to codegen and ARC
+                int op = Next().kind;
+                Node pf = new Node(AK.PostfixUnary());
+                pf.op = op; pf.a = e; pf.line = e.line; pf.col = e.col;
+                e = pf;
+            } else {
+                return e;
+            }
+        }
+    }
+
+    void ParseArgs(Node call) {
+        Expect(TK.LParen());
+        while (!At(TK.RParen()) && !At(TK.Eof())) {
+            // ref argument: `ref x` passes the address of the local x
+            if ((K() == TK.Ref() || (At(TK.Ident()) && Cur().text == "ref"))
+                && (K1() == TK.Ident() || IsTypeKeyword(K1()))) {
+                Next();
+                Node ra = new Node(AK.OutArg());
+                ra.ival = 1;              // ref-place form: `a` holds the place
+                ra.a = ParseExpr();
+                call.Add(ra);
+                if (!Eat(TK.Comma())) { }
+                continue;
+            }
+            // out argument: `out T name` declares, `out place` references --
+            // the place is a full expression (`out x`, `out b.a`, `out arr[i]`,
+            // `out Box.sv`), matching the C host's parse_call_arg
+            if (At(TK.Ident()) && Cur().text == "out" && (IsTypeKeyword(K1()) || K1() == TK.Ident())) {
+                Next();
+                Node oa = new Node(AK.OutArg());
+                oa.ival = 1;              // place form: `a` holds the place
+                if (IsTypeKeyword(K())) {
+                    oa.type = ParseType();
+                    if (At(TK.Ident())) { oa.sval = Next().text; }
+                    oa.ival = 2;          // declaration form: `out T name`
+                } else {
+                    // `out Foo x` (class-typed declaration): the expression
+                    // parse consumes the type name; a following identifier
+                    // flips the node to a declaration
+                    Node pe = ParseExpr();
+                    if (pe != null && pe.kind == AK.Ident() && At(TK.Ident())) {
+                        Node ty = new Node(AK.TypeRef());
+                        ty.sval = pe.sval;
+                        ty.line = pe.line; ty.col = pe.col;
+                        oa.type = ty;
+                        oa.sval = Next().text;
+                        oa.ival = 2;
+                    } else {
+                        oa.a = pe;
+                    }
+                }
+                call.Add(oa);
+                if (!Eat(TK.Comma())) { }
+                continue;
+            }
+            // named argument:  name: expr
+            string aname = "";
+            if (At(TK.Ident()) && K1() == TK.Colon()) { aname = Next().text; Next(); }
+            Node arg = ParseExpr();
+            if (aname != "") { arg.argName = aname; }
+            call.Add(arg);
+            if (!Eat(TK.Comma())) { }
+        }
+        Expect(TK.RParen());
+    }
+
+    Node ParsePrimary() {
+        Token pt = Cur();
+        Node r = ParsePrimaryInner();
+        if (r != null && r.line == 0) { r.line = pt.line; r.col = pt.col; }
+        return r;
+    }
+
+    // Canonical display name of a parsed type-ref, matching the C host's
+    // render_type_ref_name (used by typeof).
+    string TypeName(Node t) {
+        string s = t.sval;
+        if (t.kids.Count > 0) {
+            s = s + "<";
+            int i = 0;
+            while (i < t.kids.Count) {
+                if (i > 0) { s = s + ", "; }
+                s = s + TypeName(t.kids[i]);
+                i = i + 1;
+            }
+            s = s + ">";
+        }
+        if (t.ival == 1) { s = s + "[]"; }
+        if (t.op == 1) { s = s + "?"; }
+        return s;
+    }
+
+    Node ParsePrimaryInner() {
+        int k = K();
+        // typeof(T) folds to the type's display name string; the parsed type
+        // node rides in `b` so ngen can build the reflection record (kind,
+        // element type, type arguments) from it
+        if (k == TK.Ident() && Cur().text == "typeof" && K1() == TK.LParen()) {
+            Next(); Next(); // typeof (
+            Node ty = ParseType();
+            Expect(TK.RParen());
+            Node n = new Node(AK.StringLit());
+            n.sval = TypeName(ty);
+            n.b = ty;
+            return n;
+        }
+        // nameof(x) / nameof(a.b.c) folds to the trailing identifier string.
+        if (k == TK.Ident() && Cur().text == "nameof" && K1() == TK.LParen()) {
+            Next(); Next(); // nameof (
+            string nm = "";
+            if (IsTypeKeyword(K())) { nm = TypeKeywordName(K()); Next(); }
+            else if (At(TK.Ident())) { nm = Next().text; }
+            while (At(TK.Dot()) || At(TK.QDot())) {
+                Next();
+                if (At(TK.Ident())) { nm = Next().text; }
+            }
+            Expect(TK.RParen());
+            Node n = new Node(AK.StringLit());
+            n.sval = nm;
+            return n;
+        }
+        if (k == TK.IntLit()) {
+            Node n = new Node(AK.IntLit());
+            Token it = Next();
+            n.ival = it.intVal;
+            n.suffix = it.litSuffix;
+            if (it.text.Length > 1 && it.text.Substring(0, 2) == "0x") { n.suffix = n.suffix + 16; }
+            else if (it.text.Length > 1 && it.text.Substring(0, 2) == "0X") { n.suffix = n.suffix + 16; }
+            else if (it.text.Length > 1 && it.text.Substring(0, 2) == "0b") { n.suffix = n.suffix + 8; }
+            else if (it.text.Length > 1 && it.text.Substring(0, 2) == "0B") { n.suffix = n.suffix + 8; }
+            else if (it.text.Length > 1 && it.text.Substring(0, 2) == "0o") { n.suffix = n.suffix + 24; }
+            else if (it.text.Length > 1 && it.text.Substring(0, 2) == "0O") { n.suffix = n.suffix + 24; }
+            // A literal that does not fit a signed 64-bit integer is a ULONG in
+            // the host (the lexer's strtoull path: the suffix becomes UL, and
+            // an L suffix is an error). The host reports the two overflow
+            // errors from its lexer; the self-host has no lexer diagnostics,
+            // so the parser reports them at the literal's own position.
+            if (it.litBig) {
+                if (it.litSuffix == 1) {
+                    diags.Error("[E0006] integer literal is too large for 'long'", it.line, it.col);
+                } else if (it.litSuffix == 0) {
+                    n.suffix = n.suffix + 3;
+                }
+            }
+            // A literal with more significant digits than a ulong can hold is
+            // out of range for every integer type. The digit budget follows
+            // the radix: 20 decimal, 16 hex, 22 octal, 64 binary digits.
+            int maxDigits = 20;
+            if (n.suffix >= 24) { maxDigits = 22; }
+            else if (n.suffix >= 16) { maxDigits = 16; }
+            else if (n.suffix >= 8) { maxDigits = 64; }
+            if (it.litDigits > maxDigits) {
+                diags.Error("[E0005] integer literal is too large for 'ulong'", it.line, it.col);
+            }
+            return n;
+        }
+        if (k == TK.FloatLit()) {
+            Token it = Next();
+            Node n = new Node(AK.FloatLit());
+            n.sval = it.text;
+            n.suffix = it.litSuffix;
+            return n;
+        }
+        if (k == TK.StringLit()) { Node n = new Node(AK.StringLit()); n.sval = Next().text; return n; }
+        if (k == TK.CharLit()) { Node n = new Node(AK.CharLit()); n.ival = Next().intVal; return n; }
+        if (k == TK.True()) { Next(); Node n = new Node(AK.BoolLit()); n.ival = 1; return n; }
+        if (k == TK.False()) { Next(); Node n = new Node(AK.BoolLit()); n.ival = 0; return n; }
+        if (k == TK.Null()) { Next(); return new Node(AK.NullLit()); }
+        if (k == TK.This()) { Next(); return new Node(AK.ThisExpr()); }
+        if (k == TK.Base()) { Next(); return new Node(AK.BaseExpr()); }
+        if (k == TK.New()) { return ParseNew(); }
+        // anonymous method:  delegate (params) { body }  |  delegate { body }
+        if (k == TK.Ident() && Cur().text == "delegate"
+                && (K1() == TK.LParen() || K1() == TK.LBrace())) {
+            return ParseAnonMethod();
+        }
+        // checked(expr) / unchecked(expr): overflow context for + - *
+        if (k == TK.Ident() && (Cur().text == "checked" || Cur().text == "unchecked")
+                && K1() == TK.LParen()) {
+            int cm = Cur().text == "checked" ? 1 : 2;
+            Next();
+            Expect(TK.LParen());
+            int savedChk = chkMode;
+            chkMode = cm;
+            Node ce = ParseExpr();
+            chkMode = savedChk;
+            Expect(TK.RParen());
+            return ce;
+        }
+        // postfix collection initializer:  List<int> xs = List<int> { 10, 20 };
+        if (k == TK.Ident() && K1() == TK.Less() && LooksLikeGenericBrace()) {
+            Node ty = ParseType();
+            Node nw = new Node(AK.NewExpr());
+            nw.type = ty;
+            nw.ival = 2;
+            ParseBraceItems(nw);
+            return nw;
+        }
+        // single-parameter lambda:  x => ...
+        if (k == TK.Ident() && K1() == TK.Arrow()) { return ParseLambda(); }
+        if (k == TK.LParen()) {
+            if (LooksLikeLambda()) { return ParseLambda(); }
+            Next();
+            Node e = ParseExpr();
+            if (At(TK.Comma())) {
+                Node tup = new Node(AK.TupleExpr());
+                tup.Add(e);
+                while (Eat(TK.Comma())) { tup.Add(ParseExpr()); }
+                Expect(TK.RParen());
+                return tup;
+            }
+            Expect(TK.RParen()); return e;
+        }
+        if (k == TK.Value()) { Next(); Node n = new Node(AK.Ident()); n.sval = "value"; return n; }
+        if (k == TK.Get() || k == TK.Set()) { Node n = new Node(AK.Ident()); n.sval = Next().text; return n; }
+        // `int.Parse(s)` / `double.MaxValue`：类型关键字仅当紧跟 `.` 时才在
+        // 表达式里当静态接收者标识符放行（镜像 parser.c parse_primary 的
+        // is_type_kw + TK_DOT 分支），否则留给声明/类型转换路径——此前三元
+        // 表达式里 int/string/double.Parse 直落 E0045（B-ID109 diff 门
+        // convert_int_semantics 等 4 案 gen1 拒编的根）
+        if (IsTypeKeyword(k) && K1() == TK.Dot()) {
+            Node n = new Node(AK.Ident());
+            n.sval = TypeKeywordName(k);
+            Next();
+            return n;
+        }
+        if (k == TK.Ident()) { Node n = new Node(AK.Ident()); n.sval = Next().text; return n; }
+        // 语法错误占位（毒化节点，镜像 parser.c parser_error_node → AST_ERROR_EXPR）：
+        // 不再伪造 Ident 让 checker 去报 "unknown identifier"；结构性收尾符
+        // （; ) ] } , / EOF）留给外层构造消费，免得紧接着再报一串 expected（B-ID91）。
+        if (pos != lastErrPos) {
+            Token c = Cur();
+            if (k == TK.Eof()) { diags.Error("syntax error: unexpected end of file", c.line, c.col); }
+            else {
+                string what = c.text;
+                if (what == "") { what = TK.Lexeme(c.kind); }
+                diags.Error("[E0045] unexpected token '" + what + "' in expression", c.line, c.col);
+            }
+            lastErrPos = pos;
+        }
+        if (k != TK.Semicolon() && k != TK.RParen() && k != TK.RBracket() &&
+            k != TK.RBrace() && k != TK.Comma() && k != TK.Eof()) { Next(); }
+        return new Node(AK.ErrorExpr());
+    }
+
+    Node MkTypeRef(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
+
+    // Lookahead: does a parenthesised group end with ) => ?  (a lambda arg list)
+    bool LooksLikeLambda() {
+        int save = pos;
+        if (K() != TK.LParen()) { return false; }
+        int depth = 0;
+        while (!At(TK.Eof())) {
+            int k = K();
+            if (k == TK.LParen()) { depth = depth + 1; }
+            else if (k == TK.RParen()) { depth = depth - 1; Next(); if (depth == 0) { break; } continue; }
+            Next();
+        }
+        bool arrow = At(TK.Arrow());
+        pos = save;
+        return arrow;
+    }
+
+    bool LooksLikeTypedParam() {
+        int k = K();
+        if (IsTypeKeyword(k)) { return true; }
+        if (k != TK.Ident()) { return false; }
+        if (K1() == TK.Ident()) { return true; }
+        // `Name<...> name`: the type carries type arguments, so the plain
+        // "ident ident" lookahead is not enough -- scan the balanced angle
+        // group and look for the name after it. (An expression that starts
+        // with `a < b` runs past the end of the group and finds no name, so
+        // it still reads as an expression.)
+        int save = pos;
+        Next(); // the type name
+        while (At(TK.Dot()) && K1() == TK.Ident()) { Next(); Next(); }
+        if (At(TK.Less())) {
+            int depth = 0;
+            while (!At(TK.Eof())) {
+                int kk = K();
+                if (kk == TK.Less()) { depth = depth + 1; }
+                else if (kk == TK.Greater()) { depth = depth - 1; }
+                else if (kk == TK.GreaterGreater()) { depth = depth - 2; }
+                Next();
+                if (depth <= 0) { break; }
+            }
+        }
+        bool ok = At(TK.Ident());
+        pos = save;
+        return ok;
+    }
+
+    // Lambda:  x => e | (a, b) => e | (int a) => { ... }
+    Node ParseLambda() {
+        Node lam = new Node(AK.Lambda());
+        if (At(TK.LParen())) {
+            Next();
+            while (!At(TK.RParen()) && !At(TK.Eof())) {
+                Node p = new Node(AK.Param());
+                if (LooksLikeTypedParam()) { p.type = ParseType(); } else { p.type = MkTypeRef("var"); }
+                if (At(TK.Ident())) { p.sval = Next().text; }
+                lam.Add(p);
+                Eat(TK.Comma());
+            }
+            Expect(TK.RParen());
+        } else {
+            Node p = new Node(AK.Param());
+            p.type = MkTypeRef("var");
+            if (At(TK.Ident())) { p.sval = Next().text; }
+            lam.Add(p);
+        }
+        Expect(TK.Arrow());
+        if (At(TK.LBrace())) { lam.d = ParseBlock(); } else { lam.a = ParseExpr(); }
+        return lam;
+    }
+
+    Node ParseNew() {
+        Next(); // new
+        Node n = new Node(AK.NewExpr());
+        // anonymous new: `new { a, b = expr, ... }`. The members are plain
+        // expressions / assignments; only the database codegen consumes
+        // them (query lambdas), so the node carries no type.
+        if (At(TK.LBrace())) {
+            n.ival = 2;
+            ParseBraceItems(n);
+            return n;
+        }
+        n.type = ParseTypeNoArray();
+        if (At(TK.LBracket())) {
+            Next();
+            n.ival = 1; // array
+            if (!At(TK.RBracket())) { n.b = ParseExpr(); }
+            // rectangular ranks: `new int[2,3]` -- the extra sizes ride in
+            // kids BEFORE any brace initializer items; the dim count (the
+            // rank of the dims group) is what codegen uses to split the
+            // dims from the items
+            int ndims = 1;
+            if (At(TK.Comma())) {
+                while (Eat(TK.Comma())) { n.Add(ParseExpr()); ndims = ndims + 1; }
+                // sval2 keeps its old meaning: the dim count (the native
+                // backend reads it to pick the rectangular path)
+                n.sval2 = Convert.ToString(ndims);
+            }
+            Expect(TK.RBracket());
+            // The RANK LIST of the created array, outer to inner: the dims
+            // group first, then the trailing groups (`new int[2][,]` is an
+            // array of `int[,]` -> "1,2"). A trailing group only names the
+            // shape of the elements -- the outer array is allocated, the
+            // inner ones stay null until they are assigned.
+            string rk = Convert.ToString(ndims);
+            while (At(TK.LBracket())) {
+                int commas = 0;
+                while (!At(TK.RBracket()) && !At(TK.Eof())) {
+                    if (At(TK.Comma())) { commas = commas + 1; }
+                    Next();
+                }
+                Expect(TK.RBracket());
+                if (commas == 0) { n.op = n.op + 1; }
+                rk = rk + "," + Convert.ToString(commas + 1);
+            }
+            n.arrRanks = rk;
+        } else if (At(TK.LParen())) {
+            int k0 = n.kids.Count;
+            ParseArgs(n);
+            // for a brace object initializer the paren args are the first
+            // op kids and the rest are `Field = value` items
+            n.op = n.kids.Count - k0;
+        }
+        // collection / object initializer: `new T { a, b }` or
+        // `new T { Field = v, ... }`. Items are parsed as expressions (a field
+        // initializer is an Assignment whose lhs is the field name); ival == 2
+        // marks the brace form so codegen fills a list / stores object fields.
+        // An array keeps ival == 1 with the elements as kids: `new T[] { a, b }`
+        // is an array initializer, and array-new also carries no args node.
+        if (At(TK.LBrace())) {
+            if (n.ival != 1) { n.ival = 2; ParseBraceItems(n); }
+            else { ParseArrayInitItems(n); }
+        }
+        return n;
+    }
+
+    // The items of an ARRAY initializer: `new T[] { a, b }`. A nested brace
+    // group is flattened into the item list -- the C host does the same
+    // (`new int[2,2] { {1,2},{3,4} }` is four row-major items).
+    void ParseArrayInitItems(Node n) {
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            if (At(TK.LBrace())) {
+                // a nested group: its items join the flat item list
+                Next();
+                while (!At(TK.RBrace()) && !At(TK.Eof())) {
+                    n.Add(ParseExpr());
+                    if (!Eat(TK.Comma())) { break; }
+                }
+                Expect(TK.RBrace());
+            } else {
+                n.Add(ParseExpr());
+            }
+            if (!Eat(TK.Comma())) { break; }
+        }
+        Expect(TK.RBrace());
+    }
+
+    // brace-initializer items between `{ }`: plain expressions (list items,
+    // `Field = v` object fields), `member = { a, b }` member collection
+    // initializers (encoded as an Assignment whose rhs is a typeless
+    // NewExpr bundle with ival == 2), and `{ k, v }` dictionary pairs
+    // (encoded as TupleExpr with op == 1).
+    void ParseBraceItems(Node n) {
+        Expect(TK.LBrace());
+        if (!At(TK.RBrace())) {
+            n.Add(ParseBraceItem());
+            while (Eat(TK.Comma())) {
+                if (At(TK.RBrace())) { break; }
+                n.Add(ParseBraceItem());
+            }
+        }
+        Expect(TK.RBrace());
+    }
+
+    Node ParseBraceItem() {
+        if (At(TK.LBrace())) { return ParseDictPair(); }
+        int save = pos;
+        if (At(TK.Ident())) {
+            Token nt = Next();
+            while (At(TK.Dot())) { Next(); if (At(TK.Ident())) { Next(); } }
+            bool memberInit = At(TK.Eq()) && K1() == TK.LBrace();
+            pos = save;
+            if (memberInit) {
+                // dotted member name parsed by hand (ParseExpr would try to
+                // consume `= {...}` as an assignment)
+                Node name = new Node(AK.Ident());
+                name.sval = Next().text;
+                name.line = nt.line; name.col = nt.col;
+                while (At(TK.Dot())) {
+                    Next();
+                    Node m = new Node(AK.MemberAccess());
+                    m.a = name;
+                    m.sval = Next().text;
+                    m.line = name.line; m.col = name.col;
+                    name = m;
+                }
+                Next(); // =
+                Node bundle = new Node(AK.NewExpr());
+                bundle.ival = 2;          // collection items, no type node
+                ParseBraceItems(bundle);
+                Node asg = new Node(AK.Assignment());
+                asg.op = TK.Eq();
+                asg.a = name;
+                asg.b = bundle;
+                asg.line = name.line; asg.col = name.col;
+                return asg;
+            }
+        }
+        return ParseExpr();
+    }
+
+    // `{ k, v }` dictionary-initializer pair
+    Node ParseDictPair() {
+        Expect(TK.LBrace());
+        Node t = new Node(AK.TupleExpr());
+        t.op = 1;   // pair marker: consumed by the initializer, not a real tuple
+        t.Add(ParseExpr());
+        while (Eat(TK.Comma())) { t.Add(ParseExpr()); }
+        Expect(TK.RBrace());
+        return t;
+    }
+
+    // anonymous method:  delegate ( T a, ... ) { body }  |  delegate { body }
+    // Lowers to the same Lambda node expression lambdas use (block body).
+    Node ParseAnonMethod() {
+        Next(); // delegate
+        Node lam = new Node(AK.Lambda());
+        if (At(TK.LParen())) {
+            Next();
+            while (!At(TK.RParen()) && !At(TK.Eof())) {
+                Node p = new Node(AK.Param());
+                if (LooksLikeTypedParam()) { p.type = ParseType(); } else { p.type = MkTypeRef("var"); }
+                if (At(TK.Ident())) { p.sval = Next().text; }
+                lam.Add(p);
+                Eat(TK.Comma());
+            }
+            Expect(TK.RParen());
+        }
+        if (At(TK.LBrace())) { lam.d = ParseBlock(); } else { lam.a = ParseExpr(); }
+        return lam;
+    }
+
+    // lookahead for `Name<...> {` (postfix collection initializer): a
+    // balanced angle-bracket run of type-like tokens followed by `{`.
+    // 调用点 pos 停在 Name 上（K1() == Less 已验证），所以扫描从 pos+2
+    // 起、depth 预置 1 记账开括号——与 LooksLikeGenericArgs 以 `<` 为
+    // pos 的约定等价；从 pos+1 起会把同一个 `<` 数两遍，depth 永不
+    // 归零，分支成了死代码。
+    bool LooksLikeGenericBrace() {
+        int i = pos + 2;
+        int depth = 1;
+        while (i < toks.Count && depth > 0) {
+            int kk = toks[i].kind;
+            if (kk == TK.Less()) { depth = depth + 1; }
+            else if (kk == TK.Greater()) { depth = depth - 1; }
+            else if (kk == TK.Ident() || IsTypeKeyword(kk) || kk == TK.Comma()
+                     || kk == TK.Dot() || kk == TK.LBracket() || kk == TK.RBracket()
+                     || kk == TK.Question()) { }
+            else { return false; }
+            i = i + 1;
+        }
+        if (depth != 0) { return false; }
+        return i < toks.Count && toks[i].kind == TK.LBrace();
+    }
+
+    // like ParseType but do not consume trailing [] (that means array-new size)
+    Node ParseTypeNoArray() {
+        Node t = new Node(AK.TypeRef());
+        int k = K();
+        // the type's own position (a diagnostic about this type points at the
+        // type name), the way ParseType records it
+        t.line = Cur().line; t.col = Cur().col;
+        if (IsTypeKeyword(k)) { t.sval = TypeKeywordName(k); Next(); }
+        else if (k == TK.Ident()) { t.sval = Next().text; }
+        else { t.sval = "int"; Next(); }
+        while (At(TK.Dot())) {
+            Next();
+            if (At(TK.Ident())) { t.sval = t.sval + "." + Next().text; }
+        }
+        if (At(TK.Less())) {
+            Next();
+            t.Add(ParseType());
+            while (Eat(TK.Comma())) { t.Add(ParseType()); }
+            Expect(TK.Greater());
+        }
+        // nullable element (`new int?[3]`)
+        if (At(TK.Question())) { Next(); t.op = 1; }
+        return t;
+    }
+}
