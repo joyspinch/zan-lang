@@ -1,0 +1,674 @@
+using System;
+using System.Data;
+using System.Text;
+using Zan.Web.Model;
+
+namespace Zan.Web.Core;
+
+// Gen 分部：控制器源码生成（ControllerSource，处理分页/字典/查询/CRUD路由绑定）
+public partial class Gen {
+    public static string ControllerSource(SysGenTable t, List<SysGenColumn> cols,
+        List<SysGenTable> designed) {
+        string cls = t.entityName + "Controller";
+        string mdl = "Zan.Web.Model.Gen." + t.entityName;
+        string route = Route(t);
+        string orderCol = OrderCol(t, cols);
+        string orderCall = "OrderBy(a => a." + orderCol + ")";
+        if (t.orderDesc == 1) { orderCall = "OrderByDescending(a => a." + orderCol + ")"; }
+        bool hasDict = false;
+        bool hasRelLabel = false;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id") { continue; }
+            if (c.dictType.Length > 0 && Safe(c.dictType)) { hasDict = true; }
+            if (RelDesigned(c, designed)) { hasRelLabel = true; }
+        }
+        /* 页签列与菜单图标：菜单图标仅字符兜底，页签列的字典/布尔校验在 TabColOf。 */
+        SysGenColumn tabC = TabColOf(t, cols);
+        string tabCol = tabC == null ? "" : tabC.name;
+        string menuIcon = t.menuIcon == null ? "" : t.menuIcon.Trim();
+        /* 动作开关：关闭的动作不生成端点，列表不出对应入口（增/改/删/菜单）。 */
+        bool hasCreate = t.hasCreate == 1;
+        bool hasEdit = t.hasEdit == 1;
+        bool hasDelete = t.hasDelete == 1;
+        bool inMenu = t.menuEnabled == 1;
+        StringBuilder b = new StringBuilder();
+        b.Append(ZanHeader());
+        b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
+        b.Append("using System.Json;\n");
+        b.Append("using System.Web;\nusing Zan.Web.Core;\n");
+        b.Append("using Zan.Web.Dao;\nusing Zan.Web.Model;\n");
+        b.Append("using Zan.Web.Security;\nusing Zan.Web.Web;\nusing Zan.Web.Services;\n\n");
+        b.Append("namespace Zan.Web.Admin;\n\n");
+        b.Append("/// <summary>" + Comment(t.title)
+            + " 管理。由表设计器生成，可直接修改。</summary>\n");
+        b.Append("[Route(\"admin/" + route + "/[action]\")]\n");
+        b.Append("[Custom(Authorization = CustomAuthorization.Grant)]\n");
+        b.Append("[Description(\"" + Literal(t.title) + "\")]\n");
+        b.Append("public class " + cls + " : AdminController {\n");
+
+        /* 本屏唯一声明：列、筛选、行内写动作白名单。字典与关联的选项是运行时
+           数据，按请求查好拼进声明；设计器元数据在生成期展开——改列回到设计器
+           重新生成即可。 */
+        b.Append("    async ListPage Screen() {\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || (c.inList != 1 && c.inFilter != 1)) { continue; }
+            /* 字典列的选项是运行时数据（列表 Tag 与筛选 Select 都吃它），按请求
+               查好拼进声明；关联筛选走 options 端点远程搜索（Pick），不预载。 */
+            if (c.dictType.Length > 0 && Safe(c.dictType)) {
+                b.Append("        string " + c.name + "Opts = \"\";\n");
+                b.Append("        List<SysDictItem> " + c.name
+                    + "Items = await this.SysDictItem.ByTypeCodeActive(\""
+                    + Literal(c.dictType) + "\");\n");
+                b.Append("        for (int i = 0; i < " + c.name
+                    + "Items.Count; i = i + 1) {\n");
+                b.Append("            if (" + c.name
+                    + "Opts.Length > 0) { " + c.name + "Opts = " + c.name + "Opts + \",\"; }\n");
+                b.Append("            " + c.name + "Opts = " + c.name + "Opts + " + c.name
+                    + "Items[i].value + \"=\" + " + c.name + "Items[i].label;\n");
+                b.Append("        }\n");
+            }
+        }
+        b.Append("        return ListPage.Of()\n");
+        b.Append("            .Col(\"id\", \"ID\", \"num\", \"56px\")\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || c.inList != 1) { continue; }
+            string width = ColWidth(c);
+            if (width.Length == 0) {
+                if (ColKind(c.kind) == "num") { width = "90px"; }
+                if (c.kind == "datetime") { width = "130px"; }
+            }
+            string label = Literal(LabelOf(c));
+            bool dictFed = c.dictType.Length > 0 && Safe(c.dictType);
+            bool relFed = RelDesigned(c, designed);
+            if (c.kind == "bool") {
+                b.Append("            .Tag(\"" + c.name + "\", \"" + label
+                    + "\", \"1=是|ok,0=否|off\", \"" + width + "\")\n");
+            } else if (dictFed) {
+                b.Append("            .Tag(\"" + c.name + "\", \"" + label + "\", " + c.name
+                    + "Opts, \"" + width + "\")\n");
+            } else if (relFed) {
+                b.Append("            .Col(\"" + c.name + "Name\", \"" + label
+                    + "\", \"text\", \"" + width + "\")\n");
+            } else {
+                b.Append("            .Col(\"" + c.name + "\", \"" + label
+                    + "\", \"" + ColKind(c.kind) + "\", \"" + width + "\")\n");
+            }
+        }
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || c.inFilter != 1) { continue; }
+            if (tabCol.Length > 0 && c.name == tabCol) { continue; }
+            string label = Literal(LabelOf(c));
+            bool dictFed = c.dictType.Length > 0 && Safe(c.dictType);
+            string op = FilterOpOf(c, designed);
+            if (op == "pick") {
+                SysGenTable rel = DesignedOf(designed, c.relTable);
+                b.Append("            .Pick(\"" + label + "\", \"" + c.name + "\", \""
+                    + c.name + "\", \"/admin/" + Route(rel) + "/options\")\n");
+            } else if (op == "select") {
+                string opts = c.kind == "bool" ? "\"1=是,0=否\"" : c.name + "Opts";
+                b.Append("            .Select(\"" + label + "\", \"" + c.name + "\", \""
+                    + c.name + "\", " + opts + ")\n");
+            } else if (op == "time") {
+                b.Append("            .Time(\"" + label + "\", \"" + c.name + "\", \""
+                    + c.name + "\")\n");
+            } else if (op == "range") {
+                b.Append("            .Text(\"" + label + " 从\", \"" + c.name
+                    + "From\", \"" + c.name + "\", \"" + label + " 下限\")\n");
+                b.Append("            .Text(\"" + label + " 到\", \"" + c.name
+                    + "To\", \"" + c.name + "\", \"" + label + " 上限\")\n");
+            } else if (op == "eq") {
+                b.Append("            .Text(\"" + label + "\", \"" + c.name + "\", \""
+                    + c.name + "\", \"" + label + " 精确值\")\n");
+            } else {
+                b.Append("            .Text(\"" + label + "\", \"" + c.name + "\", \""
+                    + c.name + "\", \"" + label + " 模糊搜索\")\n");
+            }
+        }
+        if (hasCreate) {
+            b.Append("            .TbarAdd(\"新增\", \"/admin/" + route + "/form\")\n");
+        }
+        if (hasDelete) {
+            b.Append("            .TbarDelete(\"/admin/" + route + "/batchdelete\")\n");
+        }
+        if (hasEdit) {
+            b.Append("            .OpsEdit(\"/admin/" + route + "/form\")\n");
+        }
+        if (hasDelete) {
+            b.Append("            .OpsDel(\"/admin/" + route + "/delete\", \"确定删除吗？\")\n");
+        }
+        b.Append("            .Table(\"" + t.tableName + "\")\n");
+        b.Append("            .EditFields(\"");
+        string edits = "";
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            /* 行内编辑是编辑的快捷通道：inEdit 且未显式关行内（inQuick），
+               字典/关联/时间列的语义行内控件表达不了，恒不进白名单。 */
+            if (c.name == "id" || c.inEdit != 1 || c.inQuick != 1) { continue; }
+            bool fed = (c.dictType.Length > 0 && Safe(c.dictType))
+                || RelDesigned(c, designed);
+            if (fed || c.kind == "datetime") { continue; }
+            if (edits.Length > 0) { edits = edits + ","; }
+            string ft = "text";
+            if (c.kind == "int" || c.kind == "long") { ft = "int"; }
+            edits = edits + c.name + ":" + ft;
+        }
+        b.Append(edits + "\")\n");
+        b.Append("            ;\n    }\n");
+
+        /* 选项端点（data-pick 契约）：?id= 单条回显、?kw= 标签包含匹配，
+           最多 20 条；标签列按 labelColumn 或探测列。关联筛选的远程搜索打这里。 */
+        string labelCol = LabelCol(t, cols);
+        b.Append("\n    [HttpGet]\n    [Custom(Perm = PermBit.View)]\n");
+        b.Append("    [Description(\"" + Literal(t.title) + "选项\")]\n");
+        b.Append("    async void Options() {\n");
+        b.Append("        string kw = this.In(\"kw\").Trim();\n");
+        b.Append("        string idv = this.In(\"id\").Trim();\n");
+        b.Append("        DbTable t = DbTable.Of(this.Held(), \"" + t.tableName + "\");\n");
+        b.Append("        if (idv.Length > 0) {\n");
+        b.Append("            DbResult one = await t.Query().WhereEq(\"id\", Filter.ToLong(idv, 0))\n");
+        b.Append("                .Limit(1).ToResultAsync();\n");
+        b.Append("            JsonWriter row = new JsonWriter();\n");
+        b.Append("            row.StartObject();\n");
+        b.Append("            if (one != null && one.RowCount() > 0) {\n");
+        b.Append("                row.WriteProperty(\"id\", Filter.ToInt(idv, 0));\n");
+        b.Append("                row.WriteProperty(\"label\", one.GetString(0, one.GetColumnIndex(\""
+            + labelCol + "\")));\n");
+        b.Append("            }\n");
+        b.Append("            row.EndObject();\n");
+        b.Append("            this.Ctx().Api(Codes.Ok, \"ok\", row.ToJson());\n");
+        b.Append("            return;\n        }\n");
+        b.Append("        DbTableQuery q = t.Query();\n");
+        b.Append("        if (kw.Length > 0) { q = q.WhereContains(\"" + labelCol + "\", kw); }\n");
+        b.Append("        DbResult rows = await q.OrderBy(\"" + labelCol
+            + "\").Limit(20).ToResultAsync();\n");
+        b.Append("        JsonWriter arr = new JsonWriter();\n");
+        b.Append("        arr.StartArray();\n");
+        b.Append("        if (rows != null) {\n");
+        b.Append("            int idc = rows.GetColumnIndex(\"id\");\n");
+        b.Append("            int lbc = rows.GetColumnIndex(\"" + labelCol + "\");\n");
+        b.Append("            for (int i = 0; i < rows.RowCount(); i = i + 1) {\n");
+        b.Append("                arr.StartObject();\n");
+        b.Append("                arr.WriteProperty(\"id\", rows.GetInt(i, idc));\n");
+        b.Append("                arr.WriteProperty(\"label\", rows.GetString(i, lbc));\n");
+        b.Append("                arr.EndObject();\n");
+        b.Append("            }\n");
+        b.Append("        }\n");
+        b.Append("        arr.EndArray();\n");
+        b.Append("        this.Ctx().Api(Codes.Ok, \"ok\", arr.ToJson());\n");
+        b.Append("    }\n");
+
+        if (hasDict) {
+            b.Append("\n    /* 字典值合法性：空值看必填，非空必须命中该字典类型的活动项。 */\n");
+            b.Append("    async string CheckDict(string typeCode, string label, string value, bool required) {\n");
+            b.Append("        if (value.Length == 0) { return required ? \"请选择\" + label : \"\"; }\n");
+            b.Append("        List<SysDictItem> items = await this.SysDictItem.ByTypeCodeActive(typeCode);\n");
+            b.Append("        for (int i = 0; i < items.Count; i = i + 1) {\n");
+            b.Append("            if (items[i].value == value) { return \"\"; }\n");
+            b.Append("        }\n");
+            b.Append("        return label + \" 的值不在选项内\";\n");
+            b.Append("    }\n");
+        }
+
+        b.Append("\n    [HttpGet]\n    [Route(\"/admin/" + route + "\")]\n");
+        if (!inMenu) {
+            b.Append("    [Custom(IsMenu = false, Perm = PermBit.View)]\n");
+        } else if (menuIcon.Length > 0) {
+            b.Append("    [Custom(IsMenu = true, Perm = PermBit.View, Icon = \""
+                + Literal(menuIcon) + "\")]\n");
+        } else {
+            b.Append("    [Custom(IsMenu = true, Perm = PermBit.View)]\n");
+        }
+        b.Append("    [Description(\"" + Literal(t.title) + "列表\")]\n");
+        b.Append("    async void Index() {\n");
+        b.Append("        ViewData d = await this.Layout(\"" + Literal(t.title) + "\");\n");
+        b.Append("        if (!this.DbReady()) { d.Set(\"dbDown\", \"1\"); this.Page(d); return; }\n");
+        b.Append("        ListPage lp = await this.Screen();\n");
+        if (tabC != null) {
+            /* 列表状态页签：选项随设计（字典项或 是/否），选中态随请求回显。 */
+            b.Append("        List<StrMap> tabItems = d.AddList(\"tabItems\");\n");
+            b.Append("        string tabCur = this.InAny(\"" + tabCol + "\").Trim();\n");
+            b.Append("        d.Set(\"tabCol\", \"" + tabCol + "\");\n");
+            b.Append("        StrMap tabAll = new StrMap();\n");
+            b.Append("        tabAll.Set(\"value\", \"\"); tabAll.Set(\"label\", \"全部\");\n");
+            b.Append("        if (tabCur.Length == 0) { tabAll.Set(\"selected\", \"1\"); }\n");
+            b.Append("        tabItems.Add(tabAll);\n");
+            if (tabC.kind == "bool") {
+                b.Append("        StrMap tabY = new StrMap();\n");
+                b.Append("        tabY.Set(\"value\", \"1\"); tabY.Set(\"label\", \"是\");\n");
+                b.Append("        if (tabCur == \"1\") { tabY.Set(\"selected\", \"1\"); }\n");
+                b.Append("        tabItems.Add(tabY);\n");
+                b.Append("        StrMap tabN = new StrMap();\n");
+                b.Append("        tabN.Set(\"value\", \"0\"); tabN.Set(\"label\", \"否\");\n");
+                b.Append("        if (tabCur == \"0\") { tabN.Set(\"selected\", \"1\"); }\n");
+                b.Append("        tabItems.Add(tabN);\n");
+            } else {
+                b.Append("        List<SysDictItem> tabDict = await this.SysDictItem.ByTypeCodeActive(\""
+                    + Literal(tabC.dictType) + "\");\n");
+                b.Append("        for (int i = 0; i < tabDict.Count; i = i + 1) {\n");
+                b.Append("            StrMap o = new StrMap();\n");
+                b.Append("            o.Set(\"value\", Convert.ToString(tabDict[i].value));\n");
+                b.Append("            o.Set(\"label\", tabDict[i].label);\n");
+                b.Append("            if (tabCur == Convert.ToString(tabDict[i].value)) { o.Set(\"selected\", \"1\"); }\n");
+                b.Append("            tabItems.Add(o);\n");
+                b.Append("        }\n");
+            }
+        }
+        if (t.exportEnabled == 1) {
+            b.Append("        d.Set(\"exportUrl\", \"/admin/" + route + "/export\");\n");
+        }
+        b.Append("        List<OrmCond> conds = lp.Collect(this);\n");
+        b.Append("        ListQuery q = this.Paged(\"" + orderCol + "\", "
+            + Convert.ToString(PageSizeOf(t)) + ");\n");
+        /* 筛选局部变量 + WhereIf：与 ListPage.Collect 语义逐条对齐，共享发射。 */
+        string whereLines = FilterEmit(b, cols, designed, tabCol);
+        b.Append("        int total = await this." + t.entityName + "\n");
+        b.Append(whereLines);
+        b.Append("            .CountAsync();\n");
+        b.Append("        List<" + mdl + "> rows = await this." + t.entityName + "\n");
+        b.Append(whereLines);
+        b.Append("            ." + orderCall + "\n");
+        b.Append("            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();\n");
+        b.Append("        List<StrMap> items = d.AddList(\"rows\");\n");
+        b.Append("        Rows.Project(rows, items);\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || c.inList != 1 || !RelDesigned(c, designed)) { continue; }
+            b.Append("        StrMap " + c.name + "Names = new StrMap();\n");
+            b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
+                + c.relTable + "\").Query()\n");
+            b.Append("            .OrderBy(\"" + RelLabel(c)
+                + "\").Limit(500).ToResultAsync();\n");
+            b.Append("        if (" + c.name + "Rows != null) {\n");
+            b.Append("            int " + c.name + "V = " + c.name
+                + "Rows.GetColumnIndex(\"" + RelValue(c) + "\");\n");
+            b.Append("            int " + c.name + "L = " + c.name
+                + "Rows.GetColumnIndex(\"" + RelLabel(c) + "\");\n");
+            b.Append("            if (" + c.name + "V >= 0 && " + c.name + "L >= 0) {\n");
+            b.Append("                for (int i = 0; i < " + c.name
+                + "Rows.RowCount(); i = i + 1) {\n");
+            b.Append("                    " + c.name + "Names.Set(" + c.name
+                + "Rows.GetString(i, " + c.name + "V), " + c.name + "Rows.GetString(i, "
+                + c.name + "L));\n");
+            b.Append("                }\n");
+            b.Append("            }\n");
+            b.Append("        }\n");
+            b.Append("        for (int i = 0; i < items.Count; i = i + 1) {\n");
+            b.Append("            items[i].Set(\"" + c.name + "Name\", " + c.name
+                + "Names.Get(items[i].Get(\"" + c.name + "\")));\n");
+            b.Append("        }\n");
+        }
+        b.Append("        string path = this.Ctx().path;\n");
+        b.Append("        bool canCreate = await this.Can(PermBit.Create);\n");
+        b.Append("        bool canUpdate = await this.Can(PermBit.Update);\n");
+        b.Append("        bool canDelete = await this.Can(PermBit.Delete);\n");
+        b.Append("        lp.Screen(this, d, path, \"/admin/" + route
+            + "\", conds, q, total, items, canCreate, canUpdate, canDelete);\n");
+        b.Append("        this.Page(d);\n    }\n\n");
+
+        if (t.exportEnabled == 1) {
+            /* CSV 导出：同款筛选与排序，Take(50000) 兜底；字典/关联翻译成标签。 */
+            b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.Export)]\n");
+            b.Append("    [Description(\"导出" + Literal(t.title) + "CSV\")]\n");
+            b.Append("    async void Export() {\n");
+            string whereLines = FilterEmit(b, cols, designed, tabCol);
+            b.Append("        List<" + mdl + "> rows = await this." + t.entityName + "\n");
+            b.Append(whereLines);
+            b.Append("            ." + orderCall + "\n");
+            b.Append("            .Take(50000).ToListAsync();\n");
+            for (int i = 0; i < cols.Count; i = i + 1) {
+                SysGenColumn c = cols[i];
+                if (c.name == "id" || c.inList != 1) { continue; }
+                if (c.dictType.Length > 0 && Safe(c.dictType)) {
+                    b.Append("        StrMap " + c.name + "Map = new StrMap();\n");
+                    b.Append("        List<SysDictItem> " + c.name
+                        + "Items = await this.SysDictItem.ByTypeCodeActive(\""
+                        + Literal(c.dictType) + "\");\n");
+                    b.Append("        for (int i = 0; i < " + c.name
+                        + "Items.Count; i = i + 1) {\n");
+                    b.Append("            " + c.name + "Map.Set(Convert.ToString("
+                        + c.name + "Items[i].value), " + c.name + "Items[i].label);\n");
+                    b.Append("        }\n");
+                } else if (RelDesigned(c, designed)) {
+                    b.Append("        StrMap " + c.name + "Names = new StrMap();\n");
+                    b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
+                        + c.relTable + "\").Query()\n");
+                    b.Append("            .OrderBy(\"" + RelLabel(c)
+                        + "\").Limit(500).ToResultAsync();\n");
+                    b.Append("        if (" + c.name + "Rows != null) {\n");
+                    b.Append("            int " + c.name + "V = " + c.name
+                        + "Rows.GetColumnIndex(\"" + RelValue(c) + "\");\n");
+                    b.Append("            int " + c.name + "L = " + c.name
+                        + "Rows.GetColumnIndex(\"" + RelLabel(c) + "\");\n");
+                    b.Append("            if (" + c.name + "V >= 0 && " + c.name + "L >= 0) {\n");
+                    b.Append("                for (int i = 0; i < " + c.name
+                        + "Rows.RowCount(); i = i + 1) {\n");
+                    b.Append("                    " + c.name + "Names.Set(" + c.name
+                        + "Rows.GetString(i, " + c.name + "V), " + c.name
+                        + "Rows.GetString(i, " + c.name + "L));\n");
+                    b.Append("                }\n");
+                    b.Append("            }\n");
+                    b.Append("        }\n");
+                }
+            }
+            b.Append("        StringBuilder sb = new StringBuilder();\n");
+            b.Append("        string head = \"\";\n");
+            b.Append("        head = head + CsvCell(\"ID\");\n");
+            for (int i = 0; i < cols.Count; i = i + 1) {
+                SysGenColumn c = cols[i];
+                if (c.name == "id" || c.inList != 1) { continue; }
+                b.Append("        head = head + \",\" + CsvCell(\""
+                    + Literal(LabelOf(c)) + "\");\n");
+            }
+            b.Append("        sb.Append(head + \"\\n\");\n");
+            b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
+            b.Append("            string line = \"\";\n");
+            b.Append("            line = line + CsvCell(Convert.ToString(rows[i].id));\n");
+            for (int i = 0; i < cols.Count; i = i + 1) {
+                SysGenColumn c = cols[i];
+                if (c.name == "id" || c.inList != 1) { continue; }
+                string v;
+                if (c.kind == "bool") {
+                    v = "(rows[i]." + c.name + " == 1 ? \"是\" : \"否\")";
+                } else if (c.kind == "datetime") {
+                    v = "(rows[i]." + c.name
+                        + " > 0 ? Fmt.DayInput(rows[i]." + c.name + ") : \"\")";
+                } else if (c.dictType.Length > 0 && Safe(c.dictType)) {
+                    v = "CsvDict(" + c.name + "Map, Convert.ToString(rows[i]." + c.name + "))";
+                } else if (RelDesigned(c, designed)) {
+                    v = "CsvDict(" + c.name + "Names, Convert.ToString(rows[i]." + c.name + "))";
+                } else {
+                    v = "Convert.ToString(rows[i]." + c.name + ")";
+                }
+                b.Append("            line = line + \",\" + CsvCell(" + v + ");\n");
+            }
+            b.Append("            sb.Append(line + \"\\n\");\n");
+            b.Append("        }\n");
+            b.Append("        this.Ctx().Download(\"" + t.tableName
+                + ".csv\", \"text/csv; charset=utf-8\", sb.ToString());\n");
+            b.Append("    }\n\n");
+            b.Append("    /* CSV 值：包裹引号防逗号/换行破行，内部引号翻倍。 */\n");
+            b.Append("    static string CsvCell(string v) {\n");
+            b.Append("        StringBuilder sb = new StringBuilder();\n");
+            b.Append("        sb.Append(\"\\\"\");\n");
+            b.Append("        for (int i = 0; i < v.Length; i = i + 1) {\n");
+            b.Append("            string ch = v.Substring(i, 1);\n");
+            b.Append("            if ((v[i] & 255) == 34) { sb.Append(\"\\\"\"); }\n");
+            b.Append("            sb.Append(ch);\n");
+            b.Append("        }\n");
+            b.Append("        sb.Append(\"\\\"\");\n");
+            b.Append("        return sb.ToString();\n");
+            b.Append("    }\n\n");
+            b.Append("    /* 字典/关联翻译：映射缺失时回落原始值。 */\n");
+            b.Append("    static string CsvDict(StrMap m, string raw) {\n");
+            b.Append("        string label = m.Get(raw);\n");
+            b.Append("        if (label.Length > 0) { return label; }\n");
+            b.Append("        return raw;\n");
+            b.Append("    }\n\n");
+        }
+
+        /* 表格配置契约：本屏声明 → adminUI ZanTable 的 ListConfData JSON。 */
+        b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.View)]\n");
+        b.Append("    [Description(\"" + Literal(t.title) + "表格配置\")]\n");
+        b.Append("    async void Conf() {\n");
+        b.Append("        CrudOps.Conf(this, await this.Screen());\n");
+        b.Append("    }\n\n");
+
+        if (hasEdit) {
+            b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Update)]\n");
+            b.Append("    [Description(\"编辑" + Literal(t.title) + "字段\")]\n");
+            b.Append("    async void Field() {\n");
+            b.Append("        int id = this.InInt(\"id\", 0);\n");
+            b.Append("        " + mdl + " cur = await this." + t.entityName + ".Read(id);\n");
+            b.Append("        List<int> allowed = new List<int>();\n");
+            b.Append("        if (cur != null) { allowed.Add(id); }\n");
+            b.Append("        await CrudOps.Field(this, await this.Screen(), \"" + Literal(t.title)
+                + "\", this.In(\"field\").Trim(), this.In(\"value\"), allowed);\n");
+            b.Append("    }\n\n");
+        }
+
+        if (hasDelete) {
+            b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Delete)]\n");
+            b.Append("    [Description(\"批量删除" + Literal(t.title) + "\")]\n");
+            b.Append("    async void BatchDelete() {\n");
+            b.Append("        await CrudOps.Delete(this, await this.Screen(),"
+                + " this.Ids(\"ids\"), \"批量删除" + Literal(t.title) + "\");\n");
+            b.Append("    }\n\n");
+        }
+
+        if (hasCreate || hasEdit) {
+            b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.Create | PermBit.Update)]\n");
+            b.Append("    [Description(\"" + Literal(t.title) + "表单\")]\n");
+            b.Append("    async void Form() {\n");
+        b.Append("        int id = this.InInt(\"id\", 0);\n");
+        b.Append("        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {\n");
+        b.Append("            this.Fail(403, \"0403\", \"权限不足\"); return;\n        }\n");
+        b.Append("        " + mdl + " e = null;\n");
+        b.Append("        if (id > 0) {\n");
+        b.Append("            e = await this." + t.entityName + ".Read(id);\n");
+        b.Append("            if (e == null) { this.Fail(404, \"0404\", \"记录不存在\"); }\n");
+        b.Append("        }\n");
+        b.Append("        ViewData d = new ViewData();\n");
+        b.Append("        d.Set(\"id\", Convert.ToString(id));\n");
+        b.Append("        d.Set(id > 0 ? \"editing\" : \"creating\", \"1\");\n");
+        b.Append("        d.Set(\"dialogTitle\", id > 0 ? \"编辑" + Literal(t.title)
+            + "\" : \"新增" + Literal(t.title) + "\");\n");
+        b.Append("        if (e != null) {\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || c.inEdit != 1) { continue; }
+            if (c.kind == "datetime") {
+                b.Append("            d.Set(\"" + c.name + "\", e." + c.name
+                    + " > 0 ? Fmt.DayInput(e." + c.name + ") : \"\");\n");
+            } else if (ZanType(c.kind) == "string") {
+                b.Append("            d.Set(\"" + c.name + "\", e." + c.name + ");\n");
+            } else {
+                b.Append("            d.Set(\"" + c.name
+                    + "\", Convert.ToString(e." + c.name + "));\n");
+            }
+        }
+        b.Append("        }\n");
+        /* 字典/关联下拉的服务端喂数：选项行 {value,label,selected}；当前值不在
+           选项集里时补 {name}None，视图用保留行显示原值，避免静默改数据。 */
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || (c.inCreate != 1 && c.inEdit != 1)) { continue; }
+            bool dictFed = c.dictType.Length > 0 && Safe(c.dictType);
+            bool relFed = RelDesigned(c, designed);
+            if (!dictFed && !relFed) { continue; }
+            string count = "";
+            string vexpr = "";
+            string lexpr = "";
+            if (dictFed) {
+                b.Append("        List<StrMap> " + c.name + "Opts = d.AddList(\"" + c.name + "Opts\");\n");
+                b.Append("        List<SysDictItem> " + c.name
+                    + "Items = await this.SysDictItem.ByTypeCodeActive(\""
+                    + Literal(c.dictType) + "\");\n");
+                count = c.name + "Items.Count";
+                vexpr = c.name + "Items[i].value";
+                lexpr = c.name + "Items[i].label";
+            } else {
+                b.Append("        List<StrMap> " + c.name + "Opts = d.AddList(\"" + c.name + "Opts\");\n");
+                b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
+                    + c.relTable + "\").Query()\n");
+                b.Append("            .OrderBy(\"" + RelLabel(c)
+                    + "\").Limit(100).ToResultAsync();\n");
+                b.Append("        int " + c.name + "N = 0;\n");
+                b.Append("        int " + c.name + "V = -1;\n");
+                b.Append("        int " + c.name + "L = -1;\n");
+                b.Append("        if (" + c.name + "Rows != null) {\n");
+                b.Append("            " + c.name + "N = " + c.name + "Rows.RowCount();\n");
+                b.Append("            " + c.name + "V = " + c.name + "Rows.GetColumnIndex(\""
+                    + RelValue(c) + "\");\n");
+                b.Append("            " + c.name + "L = " + c.name + "Rows.GetColumnIndex(\""
+                    + RelLabel(c) + "\");\n");
+                b.Append("        }\n");
+                count = c.name + "N";
+                vexpr = c.name + "Rows.GetString(i, " + c.name + "V)";
+                lexpr = c.name + "Rows.GetString(i, " + c.name + "L)";
+            }
+            b.Append("        bool " + c.name + "Hit = false;\n");
+            b.Append("        for (int i = 0; i < " + count + "; i = i + 1) {\n");
+            b.Append("            StrMap o = new StrMap();\n");
+            b.Append("            o.Set(\"value\", Convert.ToString(" + vexpr + "));\n");
+            b.Append("            o.Set(\"label\", " + lexpr + ");\n");
+            b.Append("            if (e != null && Convert.ToString(" + vexpr
+                + ") == Convert.ToString(e." + c.name + ")) {\n");
+            b.Append("                o.Set(\"selected\", \"1\");\n");
+            b.Append("                " + c.name + "Hit = true;\n");
+            b.Append("            }\n");
+            b.Append("            " + c.name + "Opts.Add(o);\n");
+            b.Append("        }\n");
+            b.Append("        if (e != null && !" + c.name + "Hit) { d.Set(\"" + c.name
+                + "None\", \"1\"); }\n");
+        }
+        b.Append("        this.Dialog(d);\n    }\n\n");
+        }
+
+        if (hasCreate || hasEdit) {
+            b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Create | PermBit.Update)]\n");
+            b.Append("    [Description(\"保存" + Literal(t.title) + "\")]\n");
+            b.Append("    async void Save() {\n");
+            b.Append("        int id = this.InInt(\"id\", 0);\n");
+            b.Append("        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {\n");
+            b.Append("            this.Fail(403, \"0403\", \"权限不足\"); return;\n        }\n");
+            /* 表级开关守卫：动作生成与否看组合，半开时另一侧请求在此拒绝。 */
+            if (!hasCreate) {
+                b.Append("        if (id == 0) { this.Fail(404, \"0404\", \"该表未开放新增\"); }\n");
+            }
+            if (!hasEdit) {
+                b.Append("        if (id > 0) { this.Fail(404, \"0404\", \"该表未开放编辑\"); }\n");
+            }
+        b.Append("        " + mdl + " e = new " + mdl + "();\n");
+        b.Append("        if (id > 0) {\n");
+        b.Append("            " + mdl + " cur = await this." + t.entityName + ".Read(id);\n");
+        b.Append("            if (cur == null) { this.Fail(404, \"0404\", \"记录不存在\"); }\n");
+        b.Append("            e = cur;\n        }\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || (c.inCreate != 1 && c.inEdit != 1)) { continue; }
+            if (c.inCreate != 1) { b.Append("        if (id > 0) {\n"); }
+            if (c.inEdit != 1) { b.Append("        if (id == 0) {\n"); }
+            string zt = ZanType(c.kind);
+            string label = Literal(LabelOf(c));
+            bool dictFed = c.dictType.Length > 0 && Safe(c.dictType);
+            bool relFed = RelDesigned(c, designed);
+            if (c.kind == "datetime") {
+                /* 日期列：入参是 YYYY-MM-DD 文本，ParseDay 转秒存整型列。 */
+                b.Append("        string " + c.name + "Raw = this.In(\"" + c.name + "\").Trim();\n");
+                if (c.required == 1) {
+                    b.Append("        if (" + c.name + "Raw.Length == 0) { this.Fail(400, \"0400\", \"请填写"
+                        + label + "\"); return; }\n");
+                }
+                b.Append("        if (" + c.name + "Raw.Length > 0) {\n");
+                b.Append("            e." + c.name + " = Fmt.ParseDay(" + c.name + "Raw);\n");
+                b.Append("            if (e." + c.name + " <= 0) { this.Fail(400, \"0400\", \""
+                    + label + " 格式应为 YYYY-MM-DD\"); return; }\n");
+                if (c.required != 1) {
+                    b.Append("        } else { e." + c.name + " = 0; }\n");
+                } else {
+                    b.Append("        }\n");
+                }
+            } else if (zt == "string") {
+                if (c.required == 1) {
+                    b.Append("        e." + c.name + " = this.Need(\"" + c.name
+                        + "\", \"" + label + "\");\n");
+                } else {
+                    b.Append("        e." + c.name + " = this.In(\"" + c.name + "\");\n");
+                }
+            } else if (zt == "int") {
+                b.Append("        e." + c.name + " = this.InInt(\"" + c.name + "\", 0);\n");
+            } else if (zt == "long") {
+                b.Append("        e." + c.name + " = this.InLong(\"" + c.name + "\", 0);\n");
+            } else {
+                b.Append("        e." + c.name + " = this.InDouble(\"" + c.name + "\", 0.0);\n");
+            }
+            if (dictFed && c.kind != "bool") {
+                string vexpr = zt == "string" ? "e." + c.name
+                    : "Convert.ToString(e." + c.name + ")";
+                b.Append("        string " + c.name + "Err = await this.CheckDict(\""
+                    + Literal(c.dictType) + "\", \"" + label + "\", " + vexpr + ", "
+                    + (c.required == 1 ? "true" : "false") + ");\n");
+                b.Append("        if (" + c.name + "Err.Length > 0) { this.Fail(400, \"0400\", "
+                    + c.name + "Err); return; }\n");
+            }
+            if (relFed) {
+                string relCheck = "DbResult " + c.name + "Chk = await DbTable.Of(this.Held(), \""
+                    + c.relTable + "\").Query()\n                .WhereEq(\""
+                    + RelValue(c) + "\", ";
+                if (zt == "string") {
+                    b.Append("        if (e." + c.name + ".Length > 0) {\n");
+                    b.Append("            " + relCheck + "e." + c.name
+                        + ").Limit(1).ToResultAsync();\n");
+                    b.Append("            if (" + c.name + "Chk == null || " + c.name
+                        + "Chk.RowCount() == 0) { this.Fail(400, \"0400\", \"" + label
+                        + " 所选记录不存在\"); return; }\n");
+                    b.Append("        }");
+                } else {
+                    b.Append("        if (e." + c.name + " > 0) {\n");
+                    b.Append("            long " + c.name + "Id = e." + c.name + ";\n");
+                    b.Append("            " + relCheck + c.name + "Id).Limit(1).ToResultAsync();\n");
+                    b.Append("            if (" + c.name + "Chk == null || " + c.name
+                        + "Chk.RowCount() == 0) { this.Fail(400, \"0400\", \"" + label
+                        + " 所选记录不存在\"); return; }\n");
+                    b.Append("        }");
+                }
+                if (c.required == 1) {
+                    b.Append(" else {\n            this.Fail(400, \"0400\", \"请选择" + label
+                        + "\"); return;\n        }\n");
+                } else {
+                    b.Append("\n");
+                }
+            } else if (zt != "string" && c.kind != "datetime" && c.kind != "bool"
+                && c.required == 1) {
+                string zero = c.kind == "decimal" ? "0.0" : "0";
+                b.Append("        if (e." + c.name + " == " + zero
+                    + ") { this.Fail(400, \"0400\", \"请填写" + label + "\"); return; }\n");
+            }
+            if (c.inCreate != 1 || c.inEdit != 1) { b.Append("        }\n"); }
+        }
+        b.Append("        if (id > 0) {\n");
+        bool hasEdit = false;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].name != "id" && cols[i].inEdit == 1) { hasEdit = true; }
+        }
+        if (hasEdit) {
+            b.Append("            int n = await this." + t.entityName + ".Update()\n");
+            for (int i = 0; i < cols.Count; i = i + 1) {
+                SysGenColumn c = cols[i];
+                if (c.name == "id" || c.inEdit != 1) { continue; }
+                b.Append("                .Set(a => a." + c.name + ", e." + c.name + ")\n");
+            }
+            b.Append("                .Where(a => a.id == id).ExecuteAffrowsAsync();\n");
+        } else {
+            b.Append("            int n = 0;\n");
+        }
+        b.Append("            await this.Note(\"编辑" + Literal(t.title)
+            + "\", Convert.ToString(id), n > 0, \"\");\n");
+        b.Append("            this.Saved(\"已保存\");\n            return;\n        }\n");
+        b.Append("        int newId = await this." + t.entityName
+            + ".Insert(e).ExecuteIdentityAsync();\n");
+        b.Append("        await this.Note(\"新增" + Literal(t.title)
+            + "\", Convert.ToString(newId), newId > 0, \"\");\n");
+        b.Append("        this.Saved(\"已创建\");\n    }\n\n");
+        }
+
+        if (hasDelete) {
+            b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Delete)]\n");
+            b.Append("    [Description(\"删除" + Literal(t.title) + "\")]\n");
+            b.Append("    async void Delete() {\n");
+            b.Append("        int id = this.InInt(\"id\", 0);\n");
+            b.Append("        int n = await this." + t.entityName
+                + ".Delete().Where(a => a.id == id).ExecuteAffrowsAsync();\n");
+            b.Append("        await this.Note(\"删除" + Literal(t.title)
+                + "\", Convert.ToString(id), n > 0, \"\");\n");
+            b.Append("        this.Saved(\"已删除\");\n    }\n");
+        }
+        b.Append("}\n");
+        return b.ToString();
+    }
+
+}
