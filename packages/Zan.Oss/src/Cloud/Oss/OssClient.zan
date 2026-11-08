@@ -67,6 +67,41 @@ public class OssClient {
     /// <summary>对象的公网直链。basePath 前缀在这里拼上。</summary>
     public string PublicUrl(string key) { return this.PublicUrlFor(this.config.ObjectKey(key)); }
 
+    /// <summary>生成临时安全访问预签名 URL。供前端/客户端在有限有效秒数内无需秘钥直传或下载。
+    /// method: 默认为 "GET"（下载/预览），也可传 "PUT"（前端直传上传）。
+    /// expiresSeconds: 有效期（秒），默认 900 秒（15 分钟）。</summary>
+    public virtual string GeneratePresignedUrl(string key, long expiresSeconds = 900, string method = "GET") {
+        if (key == null || key.Length == 0) { return ""; }
+        string objKey = this.config.ObjectKey(key);
+        string scheme = this.config.endpointTls ? "https://" : "http://";
+        string portStr = "";
+        if ((this.config.endpointTls && this.config.endpointPort != 443) ||
+            (!this.config.endpointTls && this.config.endpointPort != 80)) {
+            portStr = ":" + this.config.endpointPort;
+        }
+        string baseUrl = scheme + this.HostName() + portStr + this.RequestPath(objKey);
+        long expiresTimestamp = DateTime.UtcNow().ToUnixSeconds() + (expiresSeconds <= 0 ? 900 : expiresSeconds);
+
+        string d = this.config.driver == null ? "" : this.config.driver.ToLower();
+        if (d == "aliyun_oss" || d == "aliyun" || d == "oss") {
+            string resource = "/" + this.config.bucket + "/" + objKey;
+            string sts = method + "\n\n\n" + expiresTimestamp + "\n" + resource;
+            string sig = AliyunOssSigner.Sign(this.config.secretKey, sts);
+            return baseUrl + "?OSSAccessKeyId=" + OssSigner.Rfc3986(this.config.accessKey) +
+                   "&Expires=" + expiresTimestamp +
+                   "&Signature=" + OssSigner.Rfc3986(sig);
+        }
+
+        // S3 / MinIO 兼容模式 (标准查询参数预签名)
+        string s3Resource = "/" + this.config.bucket + "/" + objKey;
+        string s3Sts = method + "\n\n\n" + expiresTimestamp + "\n" + s3Resource;
+        byte[] mac = OssSigner.HmacSha1(this.config.secretKey, s3Sts);
+        string s3Sig = mac != null ? OssSigner.Base64(mac) : "";
+        return baseUrl + "?AWSAccessKeyId=" + OssSigner.Rfc3986(this.config.accessKey) +
+               "&Expires=" + expiresTimestamp +
+               "&Signature=" + OssSigner.Rfc3986(s3Sig);
+    }
+
     // —— 通用操作 ——
 
     /// <summary>建一个连到该端点的 HTTP 客户端。端点没解析出来返回 null。</summary>

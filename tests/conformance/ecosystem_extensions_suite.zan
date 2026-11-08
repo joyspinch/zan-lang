@@ -1,0 +1,187 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Cloud.Oss;
+using Data.Validation;
+using Tools.Cli;
+
+public class UserSignup {
+    public string email;
+    public string role;
+    public long balance;
+    public long timestamp;
+
+    public UserSignup(string email, string role, long balance, long timestamp) {
+        this.email = email;
+        this.role = role;
+        this.balance = balance;
+        this.timestamp = timestamp;
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Main() {
+        // -------------------------------------------------------------
+        // 1. 测试 Zan.Linq: TakeLast, SkipLast, Slice 现代算子
+        // -------------------------------------------------------------
+        List<int> numbers = new List<int>();
+        for (int i = 1; i <= 10; i = i + 1) {
+            numbers.Add(i);
+        }
+
+        // TakeLast(3) -> [8, 9, 10]
+        List<int> last3 = numbers.TakeLast(3);
+        Check(last3.Count == 3, "takelast count 3");
+        Check(last3[0] == 8 && last3[1] == 9 && last3[2] == 10, "takelast elements 8,9,10");
+
+        // TakeLast 边界条件
+        Check(numbers.TakeLast(0).Count == 0, "takelast 0 is empty");
+        Check(numbers.TakeLast(20).Count == 10, "takelast 20 is full copy");
+
+        // SkipLast(3) -> [1..7]
+        List<int> skip3 = numbers.SkipLast(3);
+        Check(skip3.Count == 7, "skiplast count 7");
+        Check(skip3[0] == 1 && skip3[6] == 7, "skiplast start 1 end 7");
+
+        // SkipLast 边界条件
+        Check(numbers.SkipLast(0).Count == 10, "skiplast 0 is full copy");
+        Check(numbers.SkipLast(10).Count == 0, "skiplast 10 is empty");
+
+        // Slice(start, count)
+        List<int> slice = numbers.Slice(2, 4); // index 2 is 3, 4 elements -> [3, 4, 5, 6]
+        Check(slice.Count == 4, "slice count 4");
+        Check(slice[0] == 3 && slice[3] == 6, "slice elements 3..6");
+
+        // Slice 越界安全截断
+        List<int> sliceEnd = numbers.Slice(8, 10); // index 8 is 9, 2 elements left -> [9, 10]
+        Check(sliceEnd.Count == 2, "slice clamped count 2");
+        Check(sliceEnd[0] == 9 && sliceEnd[1] == 10, "slice clamped elements 9,10");
+
+        // -------------------------------------------------------------
+        // 2. 测试 Zan.Validation: RangeLong, Email, In, NotIn
+        // -------------------------------------------------------------
+        ValidationPlan<UserSignup> plan = new ValidationPlan<UserSignup>();
+        plan.Email("email", s => s.email, "invalid email format");
+        
+        List<string> allowedRoles = new List<string>();
+        allowedRoles.Add("admin");
+        allowedRoles.Add("editor");
+        allowedRoles.Add("viewer");
+        plan.In("role", s => s.role, allowedRoles, "role not allowed");
+
+        List<string> blockedRoles = new List<string>();
+        blockedRoles.Add("root");
+        blockedRoles.Add("superuser");
+        plan.NotIn("role", s => s.role, blockedRoles, "role forbidden");
+
+        plan.RangeLong("balance", s => s.balance, 100L, 10000000000L, "balance out of range");
+        plan.GreaterThanLong("timestamp", s => s.timestamp, 1700000000000L, "timestamp too old");
+
+        // 合法用户
+        UserSignup validUser = new UserSignup("developer@company.com", "editor", 5000L, 1770000000000L);
+        ValidationResult res1 = plan.Validate(validUser);
+        Check(res1.IsValid, "valid user passed validation");
+
+        // 邮箱错误
+        UserSignup invalidEmail = new UserSignup("developer_no_at.com", "editor", 5000L, 1770000000000L);
+        ValidationResult resEmail = plan.Validate(invalidEmail);
+        ValidationFailure fEmail = resEmail.FirstFailure();
+        Check(!resEmail.IsValid && fEmail != null && fEmail.property == "email", "invalid email caught");
+
+        // 角色非法（不在白名单内）
+        UserSignup invalidRole = new UserSignup("developer@company.com", "guest", 5000L, 1770000000000L);
+        ValidationResult resRole = plan.Validate(invalidRole);
+        ValidationFailure fRole = resRole.FirstFailure();
+        Check(!resRole.IsValid && fRole != null && fRole.code == "In", "role not in whitelist caught");
+
+        // 角色在黑名单内
+        UserSignup rootRole = new UserSignup("developer@company.com", "root", 5000L, 1770000000000L);
+        ValidationResult resRoot = plan.Validate(rootRole);
+        Check(!resRoot.IsValid, "forbidden role caught");
+
+        // 长整型越界
+        UserSignup balanceLow = new UserSignup("developer@company.com", "editor", 50L, 1770000000000L);
+        ValidationResult resBalance = plan.Validate(balanceLow);
+        ValidationFailure fBalance = resBalance.FirstFailure();
+        Check(!resBalance.IsValid && fBalance != null && fBalance.code == "RangeLong", "balance range long caught");
+
+        // -------------------------------------------------------------
+        // 3. 测试 Zan.Oss: GeneratePresignedUrl 预签名 URL 引擎
+        // -------------------------------------------------------------
+        OssConfig cfgAliyun = new OssConfig();
+        cfgAliyun.driver = "aliyun";
+        cfgAliyun.endpoint = "https://oss-cn-hangzhou.aliyuncs.com";
+        cfgAliyun.bucket = "my-test-bucket";
+        cfgAliyun.accessKey = "AKID123456";
+        cfgAliyun.secretKey = "SECRET123456";
+        cfgAliyun.Parse();
+
+        OssClient ossAliyun = OssClient.Create(cfgAliyun);
+        Check(ossAliyun != null, "aliyun oss client created");
+
+        string presignedGet = ossAliyun.GeneratePresignedUrl("docs/readme.txt", 3600, "GET");
+        Check(presignedGet.StartsWith("https://my-test-bucket.oss-cn-hangzhou.aliyuncs.com/docs/readme.txt?"), "presigned url base matched");
+        Check(presignedGet.Contains("OSSAccessKeyId=AKID123456"), "presigned url contains access key");
+        Check(presignedGet.Contains("&Expires="), "presigned url contains expires");
+        Check(presignedGet.Contains("&Signature="), "presigned url contains signature");
+
+        string presignedPut = ossAliyun.GeneratePresignedUrl("uploads/file.png", 600, "PUT");
+        Check(presignedPut.Contains("OSSAccessKeyId=AKID123456"), "presigned put contains access key");
+
+        // S3 兼容驱动
+        OssConfig cfgS3 = new OssConfig();
+        cfgS3.driver = "s3";
+        cfgS3.endpoint = "https://s3.us-west-2.amazonaws.com";
+        cfgS3.bucket = "my-s3-bucket";
+        cfgS3.accessKey = "S3AKID";
+        cfgS3.secretKey = "S3SECRET";
+        cfgS3.Parse();
+
+        OssClient ossS3 = OssClient.Create(cfgS3);
+        string presignedS3 = ossS3.GeneratePresignedUrl("data/report.pdf", 1800, "GET");
+        Check(presignedS3.Contains("AWSAccessKeyId=S3AKID"), "presigned s3 url contains AWSAccessKeyId");
+
+        // -------------------------------------------------------------
+        // 4. 测试 Zan.Cli: 剥离模型后 CliCommand, CliOption, CliResult 协作正常
+        // -------------------------------------------------------------
+        CliApp app = new CliApp("myapp");
+        CliCommand cmd = new CliCommand("deploy");
+        cmd.Describe("Deploy application to target cloud");
+        cmd.AddOption(new CliOption("env", CliType.String).Short("e").Default("prod"));
+        cmd.AddOption(new CliOption("force", CliType.Bool));
+        cmd.AddOption(new CliOption("artifact", CliType.String).AsPositional().Required());
+
+        bool executed = false;
+        cmd.On((CliResult res) => {
+            Check(res.Get("env", "") == "prod", "cli option env default prod");
+            Check(res.GetBool("force") == true, "cli option force true");
+            Check(res.At(0) == "app.tar.gz", "cli positional artifact matched");
+            executed = true;
+            return 0;
+        });
+        app.Add(cmd);
+
+        string[] args = new string[3];
+        args[0] = "deploy";
+        args[1] = "--force";
+        args[2] = "app.tar.gz";
+        int exitCode = app.Run(args);
+        Check(exitCode == 0, "cli app execution success");
+        Check(executed, "cli action executed successfully");
+
+        if (Program.failures == 0) {
+            Console.WriteLine("ok ecosystem extensions full suite passed");
+        }
+    }
+}
