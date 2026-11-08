@@ -1,4 +1,4 @@
-# Zan.Browser.Firefox
+# Browser.Firefox
 
 Zan 平台进程内嵌入式火狐（Gecko）浏览器与 AI 智能体自动化原生驱动包。
 
@@ -19,7 +19,7 @@ Zan 平台进程内嵌入式火狐（Gecko）浏览器与 AI 智能体自动化�
 ## 快速上手
 
 ```csharp
-using Zan.Browser.Firefox;
+using Browser.Firefox;
 
 // 1. 初始化内核
 FirefoxBootstrap.Init();
