@@ -768,4 +768,52 @@ partial class Irgen {
         H("}");
     }
 
+    // A case-insensitive ASCII string compare for bool.Parse and friends.
+    // POSIX strcasecmp does not exist in the MSVC CRT, so a gen1-built
+    // program linked with clang + MSVC CRT failed with LNK2019; the C host
+    // gets away with the raw extern because its shipped runtime objects
+    // are MinGW builds. The shim is `weak`: a CRT that provides the real
+    // one wins, otherwise this ASCII-only loop answers. Equality is exact;
+    // the returned difference is that of the lowercased bytes (the call
+    // sites only consume the zero/non-zero distinction).
+    void EmitStrcasecmpShim() {
+        if (strcasecmpDone) { return; }
+        strcasecmpDone = true;
+        H("define weak i32 @strcasecmp(i8* %a, i8* %b) {");
+        H("entry:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %i = phi i64 [ 0, %entry ], [ %ni, %cont ]");
+        H("  %pa = getelementptr i8, i8* %a, i64 %i");
+        H("  %pb = getelementptr i8, i8* %b, i64 %i");
+        H("  %ca = load i8, i8* %pa");
+        H("  %cb = load i8, i8* %pb");
+        H("  %caw = zext i8 %ca to i32");
+        H("  %cbw = zext i8 %cb to i32");
+        H("  %aa = icmp uge i32 %caw, 65");
+        H("  %az = icmp ule i32 %caw, 90");
+        H("  %aup = and i1 %aa, %az");
+        H("  %al = or i32 %caw, 32");
+        H("  %la = select i1 %aup, i32 %al, i32 %caw");
+        H("  %ba = icmp uge i32 %cbw, 65");
+        H("  %bz = icmp ule i32 %cbw, 90");
+        H("  %bup = and i1 %ba, %bz");
+        H("  %bl = or i32 %cbw, 32");
+        H("  %lb = select i1 %bup, i32 %bl, i32 %cbw");
+        H("  %same = icmp eq i32 %la, %lb");
+        H("  br i1 %same, label %chk, label %diff");
+        H("chk:");
+        H("  %done = icmp eq i32 %la, 0");
+        H("  br i1 %done, label %ret0, label %cont");
+        H("diff:");
+        H("  %d = sub i32 %la, %lb");
+        H("  ret i32 %d");
+        H("cont:");
+        H("  %ni = add i64 %i, 1");
+        H("  br label %loop");
+        H("ret0:");
+        H("  ret i32 0");
+        H("}");
+    }
+
 }
