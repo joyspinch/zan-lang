@@ -43,23 +43,29 @@ with open(SRC_LIST, "r", encoding="utf-8") as f:
             findings.append("listed but missing: src/%s.zan" % line)
 
 on_disk = set()
-for name in os.listdir(SELFHOST_DIR):
-    if name.endswith(".zan"):
-        on_disk.add(name[:-4])
+for root_dir, _, files in os.walk(SELFHOST_DIR):
+    for name in files:
+        if name.endswith(".zan"):
+            rel_path = os.path.relpath(os.path.join(root_dir, name), os.path.join(ROOT, "src")).replace("\\", "/")
+            on_disk.add(rel_path[:-4])
 
-for name in sorted(on_disk - listed_stems):
+for path in sorted(on_disk - listed):
     findings.append(
-        "on disk but not in scripts/selfhost_sources.txt: src/selfhost/%s.zan "
-        "(it silently drops out of gen1/gen2 and the fixed point)" % name)
+        "on disk but not in scripts/selfhost_sources.txt: src/%s.zan "
+        "(it silently drops out of gen1/gen2 and the fixed point)" % path)
 
 # ---- 3: bootstrap.md architecture table ----------------------------------
 with open(BOOTSTRAP_MD, "r", encoding="utf-8") as f:
     md = f.read()
-for m in re.finditer(r'^\|\s*`(\w+\.zan)`\s*\|', md, re.M):
+for m in re.finditer(r'^\|\s*`([a-zA-Z0-9_/]+\.zan)`\s*\|', md, re.M):
     name = m.group(1)
-    # selfhost table only names src/selfhost files; the doc's other tables
-    # reference runtime/host files which are matched in the C tree too
-    if os.path.isfile(os.path.join(SELFHOST_DIR, name)):
+    bare = os.path.basename(name)
+    found = False
+    for root_dir, _, files in os.walk(SELFHOST_DIR):
+        if bare in files:
+            found = True
+            break
+    if found:
         continue
     if os.path.isfile(os.path.join(ROOT, "src", name)):
         continue

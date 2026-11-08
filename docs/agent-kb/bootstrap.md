@@ -52,7 +52,7 @@ may be absent; it is **not** the reference semantics.
 
 ## Architecture
 
-`src/selfhost/` (36 files, including native code generation under `ngen*.zan`)
+`src/selfhost/` (117 files structured into `driver/`, `frontend/`, `irgen/`, `ngen/`, `tools/`)
 mirrors the module structure of the C host in `src/compiler/`:
 
 | File          | Role                                                       |
@@ -67,11 +67,11 @@ mirrors the module structure of the C host in `src/compiler/`:
 | `irgen.zan`   | Lowering to LLVM IR **text**                               |
 | `irgen_expr.zan` | Irgen part: expression codegen (assignment, member access, indexing, …) |
 | `irgen_stmt.zan` | Irgen part: statement codegen, vtable emission for polymorphic classes |
-| `irgen_async*.zan` | Irgen part: async/await CPS lowering, ANF normalization, Task & sched runtime |
+| `irgen_async.zan` | Irgen part: async/await CPS lowering, ANF normalization, Task & sched runtime |
 | `irgen_method.zan` | Irgen part: method/constructor codegen, static ctor, main wrapper |
 | `lsp.zan`     | Language-server surface used by the driver                    |
 | `nio.zan`     | Binary file output helper                                     |
-| `ngen*.zan`   | Cross-platform machine-code generator (x86/ARM, Mach-O/ELF/COFF/Wasm) |
+| `ngen.zan`    | Cross-platform machine-code generator (x86/ARM, Mach-O/ELF/COFF/Wasm) |
 | `main.zan`    | Driver: read files, run the pipeline, write `.ll`          |
 
 C-host passes with **no self-hosted counterpart** (code compiled by gen1 cannot
