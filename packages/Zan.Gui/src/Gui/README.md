@@ -26,7 +26,7 @@ Zan GUI 划分为清晰的四层体系：
 |  - Layout Engine: Layout (Flex), LineBox, Scroll                        |
 |  - Styling & Theme: Style, StyleSheet, Skin, Theme, Css, Effects, Fx   |
 |  - Rendering Pipeline: Render (Canvas2D), RenderAA, Device, NativeLayer |
-|  - Declarative Runtime: Html, ControlFactory, Reactive Store/Signal     |
+|  - Declarative Runtime: Html, ControlFactory, ModelBinder (data-bind)    |
 +-------------------------------------------------------------------------+
 ```
 
@@ -35,15 +35,19 @@ Zan GUI 划分为清晰的四层体系：
 ## 2. 命名空间与目录组织契约
 
 Zan 编译器采用**按路径零配置自动按需引入**（Demand-driven stdlib pull-in）机制：
-`using X.Y;` 严格映射至 `stdlib/X/Y/*.zan`。因此，目录结构直接反映命名空间层级：
+GUI 的"标准库"就是本包 `packages/Zan.Gui`——`using X.Y;` 按路径按需拉取源码，
+目录结构直接反映命名空间层级（不存在独立的 `stdlib/Gui/` 目录）：
 
 | 命名空间 / 路径 | 核心定位与职责 | 代表类型与文件 |
 | :--- | :--- | :--- |
-| **`Gui`** (`stdlib/Gui/`) | **GUI 核心内核**。提供应用程序生命周期、事件总线、排版引擎、样式系统、渲染画布与声明式工厂。 | `App`, `Control`, `Element`, `Event`, `Layout`, `Render`, `Style`, `Html` |
-| **`Gui.Widget`** (`stdlib/Gui/Widget/`) | **原子与复合控件集**。轻量、结构明确的基础 UI 输入/展示控件与工具条。 | `Button`, `TextBox`, `Label`, `CheckBox`, `ComboBox`, `Slider`, `QrCode`, `Ribbon` |
-| **`Gui.Component`** (`stdlib/Gui/Component/`) | **高级业务组件**。具备独立状态机、复杂视口与重型交互的高级控件与特效。 | `ChatView`, `ConsoleView`, `LogView`, `TreeView`, `MarkdownViewer`, `Dock`, `RibbonFx` |
-| **`Gui.Reactive`** (`stdlib/Gui/Reactive/`) | **响应式数据流**。单向数据流与细粒度响应式状态绑定（Signal, Observable, Store）。 | `Store`, `Signal`, `Binding` |
-| **`Gui.Backend`** (`stdlib/Gui/Backend/`) | **底层图形后端适配**。对接 Windows GDI/DirectWrite、Software Rasterizer 等本地驱动。 | `GdiBackend`, `SoftwareBackend` |
+| **`Gui`** (`src/Gui/` 根) | **GUI 核心内核**。提供应用程序生命周期、事件总线、排版引擎、样式系统、渲染画布与声明式工厂。 | `App`, `Control`, `Element`, `Event`, `Layout`, `Style`, `Html` |
+| **`Gui.Widget`** (`src/Gui/Widget/`) | **原子与复合控件集**。轻量、结构明确的基础 UI 输入/展示控件与工具条。 | `Button`, `TextBox`, `Label`, `CheckBox`, `ComboBox`, `Slider`, `QrCode`, `Ribbon` |
+| **`Gui.Component`** (`src/Gui/Component/`) | **高级业务组件**。具备独立状态机、复杂视口与重型交互的高级控件与特效。 | `ChatView`, `ConsoleView`, `LogView`, `TreeView`, `MarkdownViewer`, `RibbonFx` |
+| **`Gui.Backend`** (`src/Gui/Backend/`) | **底层图形后端适配**。对接 Windows GDI/DirectWrite、Software Rasterizer 等本地驱动。 | `GdiBackend`, `SoftwareBackend` |
+
+数据绑定走两条正道：HTML 窗口用 `data-bind`（ModelBinder），代码侧用
+`Binding<T> data` 字段（`stdlib/System/Binding.zan`）。`Signal*` 只是控件内部
+状态缓冲，不是对外绑定协议；本包不存在 `Gui.Reactive`/`Gui.Designer` 命名空间。
 
 ---
 
@@ -61,7 +65,7 @@ Zan 编译器采用**按路径零配置自动按需引入**（Demand-driven stdl
 | `DrawingContext` / `SKCanvas` | `Gui.Render` | 高性能保留/即时混合 2D 绘图上下文（Canvas） |
 | `Panel` / `StackPanel` / `Grid` | `Gui.Layout` / `Gui.CssGrid` | 采用 Flex 与 CSS 栅格化标准排版引擎 |
 | `Style` / `ResourceDictionary` | `Gui.Style` / `Gui.StyleSheet` / `Gui.Skin` | 基于属性继承与 CSS 级联特性的主题/皮肤模型 |
-| `DependencyProperty` / `INotifyPropertyChanged` | `Gui.Reactive.Store` / `Signal` | 现代细粒度响应式数据绑定 |
+| `DependencyProperty` / `INotifyPropertyChanged` | `data-bind`（ModelBinder）/ `Binding<T>` | 双向绑定两条正道；`Signal*` 仅作控件内部状态缓冲 |
 
 ---
 
@@ -71,6 +75,7 @@ Zan 编译器采用**按路径零配置自动按需引入**（Demand-driven stdl
 1. **凡垂直业务或专有领域套件，绝不侵入标准库**：
    - 工业组态/仪表控件请引用 `packages/Zan.Industrial`；
    - 复杂统计图表/高维可视化请引用 `packages/Zan.Gui.Charts`；
-   - 游戏 UI/实时动画请引用 `packages/Zan.Game`。
+   - 游戏引擎/实时动画请引用 `packages/Zan.Game`（引擎核心），具体游戏类目
+     引用对应的 `Zan.Game.<类目>` 独立包（Arpg/Idle/Board/Match3 等）。
 2. **纯算法与专用工具就近放置**：
    - 二维码矩阵编码等仅为特定控件服务的算法，统一收敛在 `Gui.Widget`（如 `QrEncoder.zan`），避免在根目录平铺杂质。

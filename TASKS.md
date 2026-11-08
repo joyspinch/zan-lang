@@ -14,6 +14,7 @@
 
 - [~] 在飞观察（2026-11-06）：工作区约 177 个文件未提交——JsonValue→JsonWriter 迁移（Zan.Ai/Zan.Json/Zan.Mvc/Zan.Net/ide_zan services+dialogs/templates 全家）+ IDE LSP 模型调整（LspRange/LspTextEdit 新增、dap/lsp 旧模型删除）+ `src/compiler/irgen_async.c` 改动 + 新增 conformance（json_serializer_dict）。持有会话未走调度器注册；本轮全量整改（B-ID163-166）已按黑名单绕开这些文件。
 - [~] 在飞观察（2026-11-06 补）：ChildWindow 声明式装配——z-mount 挂载（`DocWire.MountSlots`）、`:prop` 绑定启动期对账、`diag_cw_bad_mount` 注册；涉及 Zan.Gui 9 个文件（UiDriver/ChildWindow/Control/ControlExtra/DocWire/ModelBinder/Html/Progress/win-x64 libzan_gui.a）与 CMakeLists.txt，持有会话未注册调度器。GUI 分层重构（B-ID171+）已绕开这些文件。
+- [~] 在飞观察（2026-11-09 补）：游戏域拆包——`Zan.Game` 收缩为引擎核心（Core/Graphics/Kit/Scene/Physics 等），`Zan.Game.Arpg`/`Zan.Game.Idle` 等类目整包迁出为独立包（工作区未提交 D/?? 状态）；gui-design/game-dev skill 也有同日未提交改动（Dock 方言清理方向）。持有会话未注册调度器；B-ID177 的游戏域迁移待拆包收口后执行。
 
 ### 批次 1 · 根修项（闭它解锁下游，优先领）
 
@@ -33,7 +34,7 @@
   - Win32Shell.zan (3085行) -> Imports/Icon/WndProc/Present/Window/Events 6切面 (commit 7eacc4d57)
   - CodeEditor.Completion.zan (2826行) -> Match/Refs/Members/Project/Fixup 5切面 (commit 250e62ba7)
   所有新拆出文件严格 ≤ 1200 行门禁，conformance/gui 测试全绿通过。
-- [~] B-ID171 GUI 分层重构 P0 安全网与护栏（`docs/GUI_ARCHITECTURE.md` §4，后续 B-ID172～179 同）：① 计划落盘（立项即落）；② 补注册未登记 GUI 用例 + 布局树金标用例（P5 等价门）〔串行前置：批次 0 在飞 CMakeLists.txt〕；③ `scripts/check_code_standards.py` 层级棘轮 + 基线（已落 eb289a6bd）；④ 清死 using（Core 23、Widget 7；在飞的 Control.zan/ChildWindow.zan 顺延）与文档漂移（zan.pkg、README、agent-kb、gui-design skill）。
+- [~] B-ID171 GUI 分层重构 P0 安全网与护栏（`docs/GUI_ARCHITECTURE.md` §4，后续 B-ID172～179 同）：① 计划落盘（立项即落）；② 补注册未登记 GUI 用例 + 布局树金标用例（P5 等价门）〔串行前置：批次 0 在飞 CMakeLists.txt〕；③ `scripts/check_code_standards.py` 层级棘轮 + 基线（已落 eb289a6bd）；④ 清死 using（实测 23→5，2026-11-09）与文档漂移（zan.pkg、README、agent-kb、gui-design skill）；层级机检补 static 可变字段棘轮（Gui.Core/Widget/Component，2026-11-09 裁定）；gui-design/game-dev skill 画布例外条款改写与三副本同步——有并发会话在飞未提交改动，待其收口后同提交执行。
 - [ ] B-ID172 GUI 分层重构 P1 断包环、按目标层摆目录：① HMI 注册移入 Zan.Industrial `HmiBootstrap`，ControlBootstrap 删 `using Gui.Hmi`；② 新建 Forms/Binding/Testing 目录、基元移到 src/Gui 根（命名空间不变）〔串行前置：批次 0 在飞 ChildWindow/DocWire/ModelBinder/UiDriver〕；③ ControlBootstrap 移入 Widget/。
 
 ### 批次 3 · 有前置（前置闭了再领）
@@ -42,8 +43,8 @@
 - [ ] B-ID173〔前置 B-ID172〕GUI 分层重构 P2 绑定收敛：PropSpec 标默认绑定属性、ModelBinder 删 10 处 `is X` 特判；模型游标接口统一 POCO/JsonValue/JsonDoc/字典取值；ChildWindow 绑定泵并入 ModelHosts；IDE 里当应用状态用的 Signal 改字段 + `Binding<T>`。
 - [ ] B-ID174〔前置 B-ID172〕GUI 分层重构 P3 拆 App：颜色计算、BackdropPainter、DamageTracker、FrameLoop、WindowHost、HtmlLoader、InputArbiter、OverlayHost 骨架逐项抽出，目标 App.zan < 1000 行（承接 B-ID170 ① 的 App.zan 部分）。
 - [ ] B-ID175〔前置 B-ID174〕GUI 分层重构 P4 统一浮层：OverlayHost 分层结算命中与原生遮挡；OverlayPopup 下沉 Widget；SelectBox/DatePicker/ColorPicker/Popover/菜单改用共享件；模态合一。
-- [ ] B-ID176〔前置 B-ID171 ②〕GUI 分层重构 P5 布局方言退役：删 Serialize.zan 与 Alert 别名；补齐 CSS grid/absolute；解析期脱糖 data-dock/data-fx 后删 Dock 引擎（带旧属性的 42 个 html 全是设计器文档，文件改写并入 B-ID179）。
-- [ ] B-ID177〔前置 B-ID175〕GUI 分层重构 P6 即时模式下线：路由事件转正 → 控件分批改事件驱动 → 514 处调用方迁移（设计器预览离屏、gui_gallery 并入 html_gallery 等）→ 删 `Render(App` 入口与 InputArbiter。
+- [ ] B-ID176〔前置 B-ID171 ②〕GUI 分层重构 P5 布局方言退役：删 Serialize.zan 与 Alert 别名（Serialize/Dock 引擎已删，2026-11-09 实测）；补齐 CSS grid/absolute；解析期脱糖 data-dock/data-fx 后删兜底（带旧属性的设计器文档实测 43 个，文件改写并入 B-ID179）。
+- [ ] B-ID177〔前置 B-ID175〕GUI 分层重构 P6 即时模式与静态状态下线（2026-11-09 裁定扩为"全部统一"，画布例外取消）：路由事件转正 → 控件分批改事件驱动 → 调用方迁移（设计器预览离屏、gui_gallery 并入 html_gallery、Charts/DataTable/CodeEditor/Industrial 整体改写范式二控件——OnPaint 仅内部实现、游戏 HUD 视图与 SceneDesigner 面板纳入）→ 删 `Render(App` 入口、InputArbiter、Ui 轮询族与静态可变状态（WidgetId 全局栈、OverlayPopup static occl*/lastRichHover、Layer 静态打开态队列）；Mat4/Mesh3D 外迁 Zan.Game 引擎核心。
 - [ ] B-ID179〔前置 B-ID176〕GUI 分层重构 P8 设计器改产出 CSS，脚本改写 42 个设计器文档（含 IDE 面板），删 P5 脱糖兜底（P5 完成后单独出计划）。
 
 ### 批次 5 · 自举工业化（2026-11-07 立项：自举闭环已达 L5 固定点，转入验证面扩容与诊断工程；蓝本见 docs/agent-kb/bootstrap.md "Known limitations" 缺口索引 G1~G10）

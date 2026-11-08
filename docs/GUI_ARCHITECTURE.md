@@ -2,36 +2,59 @@
 
 > 2026-11-06 立。台账：B-ID171～B-ID179（`TASKS.md`）。本文是 Zan.Gui 分层重构的
 > 唯一设计依据——阶段内容、验证门与完成标志以此为准；执行中结论变化时改正文，
-> 并在文末「决策记录」留一行。
+> 并在文末「决策记录」留一行。2026-11-09 用户裁定两范式全统一并取消画布例外
+> （见 §1 与决策记录），现状数据已按同日源码实测复核。
 
 ## 1. 设计意图
 
-Zan.Gui 只做两件事：
+GUI 组件只保留**两种创作范式**（2026-11-09 裁定，画布例外取消）：
 
-1. **用 HTML + CSS 描述并绘制界面**：标签长成保留式控件树，外观由 CSS 级联决定，
-   布局只有 CSS 一个引擎。
-2. **Zan 数据与界面双向绑定**：HTML 窗口用 `data-bind`（ModelBinder），代码侧用
-   `Binding<T> data` 字段；动态宿主（设计器、PropertyGrid）走 `GetProp/SetProp`
-   属性协议。
+1. **范式一：HTML + CSS**：`Gui.Markup/Html` 由底层渲染管线解析为现代盒模型，
+   外观由 CSS 级联决定，布局只有 CSS（Flex/Grid/Flow）一个引擎。
+2. **范式二：保留模式 + 声明式对象树**：代码侧 `Children = [ ... ]`、
+   `ClassName = "..."` 建树，排版纯 Flex/Grid/Flow；动态宿主（设计器、
+   PropertyGrid）走 `GetProp/SetProp` 属性协议。
 
-凡不服务于这两件事的机制都是历史包袱，按本文路线退役。
+数据绑定是范式二的附属：HTML 窗口用 `data-bind`（ModelBinder），代码侧用
+`Binding<T> data` 字段。像素绘制**只存在于控件 `OnPaint` 的内部实现**——它是
+范式二控件的实现机制，不是创作 API：公开面不允许出现 `Render(App, …)` 即时
+入口或任何应用侧 `Draw*` 调用。图表曲线、仪表指针、代码高亮这类"画布类内容"
+一律**收编为范式二控件**：控件骨架走 Children/ClassName 与 CSS，像素画在
+控件自己的 OnPaint 里。
 
-## 2. 现状（当前实现：2026-11-06 源码审计核实，证据路径见表）
+**游戏域边界**：`Zan.Game` 引擎核心的世界渲染（GameViewport/`Entity.OnRender`/
+Kit）是游戏引擎职责，不属 Gui 控件两范式管辖；但游戏 HUD 面板、场景编辑器
+（SceneDesigner）、游戏菜单等 UI 面是 Gui 控件，纳入范式二统一。
+
+**控件纯实例化**（2026-11-09 补充裁定）：控件是实例对象，其状态只存在于实例
+字段与控件树可达的宿主（OverlayHost/ModelHosts）上。静态**可变**状态与静态
+逐帧入口是根本性封装错误——多实例/多弹层同屏时互相污染——一律退役：
+`Core/WidgetId.zan` 的全局 ID 栈（static seq/idStack/seqStack）、
+`Core/OverlayPopup.zan` 的 static 遮挡与悬停字段（occl*/lastRichHover）、
+`Widget/Layer.zan` 的静态打开态队列（RegisterOpen/TopmostDialog/Close 族）、
+`Core/Ui.zan` 的静态轮询查询族。控件类上的 static **纯函数**（几何/文本度量/
+颜色计算助手，如 `IdHash`、`Tooltip.TriDown`、`WrapLines`）无害，收敛到基元层
+保留。
+
+凡不服务于这两种范式的机制都是历史包袱，按本文路线退役。
+
+## 2. 现状（当前实现：2026-11-06 源码审计立表，2026-11-09 实测复核更新）
 
 主线是健康的：五个装载入口都汇聚到 `Html.Parse`，绘制管线只有一条路径，
 SelectBox/Input/Button 的外观全部走 CSS（零硬编码颜色）。臃肿集中在下面几处
-（路径相对 `packages/Zan.Gui/src/Gui/`）：
+（路径相对 `packages/Zan.Gui/src/Gui/`；行内标注为 2026-11-09 实测差异）：
 
 | 问题 | 证据 |
 |---|---|
-| 分层没有边界 | Core/Layout/Styling/Rendering/Text/Media 共 165 个文件同属扁平 `namespace Gui`。编译器的 `internal` 按命名空间生效、没有包级可见性，77 个 zan.pkg 都不声明依赖，任何层都能调用任何层。Core 的 27 个 `using Gui.Widget;` 有 23 个是死引用，噪声掩盖了真实依赖 |
+| 分层没有边界 | Core/Layout/Styling/Rendering/Text/Media 同属扁平 `namespace Gui`。编译器的 `internal` 按命名空间生效、没有包级可见性，zan.pkg 都不声明依赖，任何层都能调用任何层。Core 的 `using Gui.Widget;` 死引用已从 23 清到 5（P0 ④ 部分落地，2026-11-09 实测） |
 | 包级环 | `Core/ControlBootstrap.zan:3` 写着 `using Gui.Hmi;`，并直接 new 出 Zan.Industrial 的 9 个 HMI 控件；同样是扩展控件，Chart/DataGrid 走的却是 `HeavyControls.Register` 注册表 |
-| App 上帝对象 | `Core/App.zan` 4,470 行、200 多个方法，揉进约 12 种职责：窗口、帧循环、故障护栏、事件分发、即时模式输入仲裁、脏区、壁纸与毛玻璃绘制、颜色计算、作用域 ID 栈、浮层列表、HTML 加载与链接导航、IME。partial 拆分只拆了文件，没拆职责 |
-| 输入在绘制时轮询 | 路由事件（隧道/冒泡，`Core/Control.HitTest.zan:53-63`）已经实现，且 `App.ProcessEvent` 会先走它（`Core/App.zan:3113`），但生产代码里没有一个控件订阅。控件在 OnPaint 里调用 ClaimClick/BlockHitsRect 抢输入，命中目标依赖上一帧的绘制期登记 |
-| 双范式 | 23 个控件既是保留式 Control，又提供每帧调用的 `Render(App, x, y, …)` 入口；绘制只有一份（OnPaint 委托给 Render），但外部有 514 处即时模式调用（Gallery 156、设计器、SceneDesigner、IDE 面板、测试） |
-| 4 套布局 | CSS flow/flex/grid；WinForms 式 Dock（`data-dock` + `data-fw/fh`，约 300 处，是 IDE 30 多个 html 的主力写法）；设计器绝对坐标（`data-fx/fy/fw/fh`）；24 栏 `data-span`。模板里同一个元素上三种方言叠着写 |
-| 绑定 7 条通道 | data-bind/ModelBinder、`Binding<T>`、控件事件、GetProp/SetProp、Signal*（IDE 约 30 个文件仍拿它当应用状态）、FormField/fname、z-mount。控件没有"可绑定值"契约，`Core/ModelBinder.zan:257-261/700-716/723-725` 只能硬编码特判 10 个控件类型；POCO/JsonValue/JsonDoc/字典各写一遍取值，约 700 行 |
-| 弹层重复 | `App.AddOverlay(OverlayPopup)`（框架接口写死了一个具体控件）、`Control.OnPaintOverlay`、Layer 自带的队列、Modal 四条路径；SelectBox/DatePicker/ColorPicker 各自手搓弹层合计约 1,340 行，而 Dropdown 用共享的 OverlayPopup 只要 25 行；模态有两套 |
+| App 上帝对象 | App 主文件已瘦到 804 行（2026-11-09 实测），但职责仍揉在 `Core/App.*.zan` partial 里（合计约 6,955 行）：窗口、帧循环、故障护栏、事件分发、即时模式输入仲裁、脏区、壁纸与毛玻璃绘制、颜色计算、作用域 ID 栈、浮层列表、HTML 加载与链接导航、IME——DamageTracker/FrameLoop/WindowHost/BackdropPainter 等独立类尚未抽出，partial 拆分只拆了文件，没拆职责 |
+| 静态可变状态（2026-11-09 补） | 控件静态状态是跨实例污染源：`Core/WidgetId.zan:11-19` 全局 ID 栈（static seq/frameBase/localSeq + 两个 List 栈）；`Core/OverlayPopup.zan:20,28-34` static 遮挡/悬停字段（occl* 8 个 + lastRichHover）；`Widget/Layer.zan:41-243` 静态打开态队列族（RegisterOpen/TopmostDialog/Close…）；`Core/Ui.zan` 静态轮询查询族（状态读自 App 仲裁区） |
+| 输入在绘制时轮询 | 路由事件（隧道/冒泡）已经实现且 `App.ProcessEvent` 会先走它，但生产控件仍以绘制期 ClaimClick/BlockHitsRect + `Ui.Clicked` 轮询为主路径，命中目标依赖上一帧的绘制期登记 |
+| 双范式 | 控件既有保留式 OnPaint，又提供每帧调用的 `Render(App, x, y, …)` 入口——Zan.Gui 内实测 10 个文件（`Widget/ContextMenu、Menu、Ribbon、Layer、Tooltip、Ellipsis、Wizard.Preview`、`Component/Ribbon`、`Core/OverlayPopup`、`Core/ThemeDrawer`，2026-11-09 实测）；外部调用面（Charts 517 处 Draw、DataTable 75+、Designer 209、游戏 HUD、IDE 面板等）以 P6 第 7 步盘点为准 |
+| 4 套布局 | CSS flow/flex/grid 为正道；Dock 引擎（`Core/Dock.zan`、`Core/Serialize.zan`）已删（P5 第 1 步落地，2026-11-09 实测），剩解析期脱糖兜底：`Markup/Html.Build.zan:44,568-575` 的 data-dock/data-fx 分支；带 `data-dock/fx/span` 的设计器文档实测 43 个（原 42） |
+| 绑定 7 条通道 | data-bind/ModelBinder、`Binding<T>`、控件事件、GetProp/SetProp、Signal*、FormField/fname、z-mount。`Signal.Changed`/`ChangeTracker` 已删、SyncBinding 已由 `Control.RenderTree` 统一驱动（STDLIB_COMPONENT_STANDARDS §6）；但 Signal* 仍是 IDE 应用状态载体、ModelBinder 的 `is <控件>` 特判仍在（`Core/ModelBinder.zan:260`），可绑定值契约未落 |
+| 弹层重复 | `App.AddOverlay(OverlayPopup)` 仍写死具体控件（`Core/App.Render.zan:418`）、`Control.OnPaintOverlay` 6 处、Layer 自带静态队列、Modal——四条路径并存；`Core/OverlayHost.zan`（133 行）骨架已落；OverlayPopup 已减到 1,085 行，SelectBox 已拆入 `Widget/`（.Cascader/.Hierarchy/.Props） |
 | 文档漂移 | `zan.pkg` 声称包含 DataTable/Chart/CodeEditor（实际在兄弟包）；README 列出本包不存在的 `Gui.Reactive`/`Gui.Designer`；`docs/agent-kb/gui-development.md` 仍推荐已移除的 Signal 绑定 |
 
 成因：四代写法叠在一起，哪一代都没删——WinForms 式保留模式（Dock/Place/
@@ -89,7 +112,9 @@ Serialize）→ HTML 时代（标记 + CSS + 绑定）→ 设计器时代（Desi
    "类型→层"表，剥掉注释与字符串后检查向上的 `using` 与类型引用；现存违规记入
    基线，只拒新增。附带棘轮：Widget/Component 不得新增 `Render(App` 入口；不得新增
    App 仲裁 API 调用；设计器文档以外不得新增 `data-dock/data-fx/data-span`；
-   Zan.Gui 不得引用兄弟包命名空间；Zan.Gui 以外不得新增 `new Signal*`。
+   Zan.Gui 不得引用兄弟包命名空间；Zan.Gui 以外不得新增 `new Signal*`；
+   Gui.Core/Widget/Component 不得新增 static **可变**字段与控件静态逐帧入口
+   （static 纯函数助手除外，2026-11-09 裁定）。
 4. 清噪声、修文档：删死 using（Core 23、Widget 7）；修 `zan.pkg` 描述、README、
    `docs/agent-kb/gui-development.md` 的 Signal 推荐、gui-design skill 里已不存在的
    QualifyKind 描述（skills 三副本同步）。
@@ -202,16 +227,26 @@ UiDriver 五例。
 4. 拖拽类：Slider、SplitPanel、滚动拖拽改 CapturePointer。
 5. 文本栈：Input/TextArea/InputNumber/InputOtp 改路由按键/字符事件，焦点按控件
    引用，退役 PushId/GetId 稳定 id 方案。
-6. 复合控件与兄弟包：Tabs/TreeView/ListView/VirtualList/Pagination/Wizard/Transfer/
-   Ribbon/Layer；FilePicker/SessionList/BandGrid/PropertyGrid/LogView/GraphView/
-   ChatView/DockHost；DataTable/Charts/CodeEditor/Industrial 只改输入，Canvas 自绘保留。
+6. 复合控件与兄弟包（2026-11-09 裁定：画布例外取消，全部统一）：Tabs/TreeView/
+   ListView/VirtualList/Pagination/Wizard/Transfer/Ribbon/Layer；FilePicker/
+   SessionList/BandGrid/PropertyGrid/LogView/GraphView/ChatView；DockHost 退役，
+   IDE/Workplace 停靠改 Flex 分栏 + 拖拽逻辑；DataTable/Charts/CodeEditor/
+   Industrial 整体改写为范式二控件——外壳/骨架走 Children/ClassName 与 CSS，
+   曲线/指针/高亮等像素绘制收敛为各控件自己的 OnPaint 内部实现，公开 API 只留
+   控件挂载 + data/Binding 数据面，删全部 `Render(App…)` 入口与外部 Draw 调用面
+   （Charts 517 处、DataTable 75+ 处等）；游戏 HUD 视图（templates/game 的
+   OnPaint 视图）与 SceneDesigner/HUD 面板同理纳入（世界渲染不在此列）。
 7. 调用方迁移（514 处）：设计器预览改离屏渲染（`Form.CaptureSnapshot`、
    `App.Offscreen`）；Designer.Inspector/Designer.zan 改保留式属性行（复用
    PropertyGrid）；SceneDesigner 改保留式属性列表；IDE 面板逐个改保留式子树；
    `examples/gui_gallery` 并入 `examples/html_gallery` 后退役
-   （`policy_gallery_coverage` 改查后者）；改写 16 个即时模式测试。
+   （`policy_gallery_coverage` 改查后者）；`examples/gui_charts`、游戏模板与
+   `Zan.Game` 类目包的 HUD/面板调用方逐个改挂范式二控件；改写 16 个即时模式测试。
 8. 删除：控件 `Render(App, …)` 入口、InputArbiter、Ui.Activate*、WidgetEvents 轮询；
-   机检禁止回流。
+   **静态可变状态退役**（2026-11-09 补）：WidgetId 稳定 id 全局栈并入焦点树/
+   控件引用，OverlayPopup 的 static occl*/lastRichHover 改实例字段，Layer 静态
+   打开态队列并入 OverlayHost；`Rendering/Mat4.zan`、`Mesh3D.zan` 外迁
+   `Zan.Game` 引擎核心（Gui 包内零消费者）。机检禁止回流。
 
 每批验证：本批控件的 `conformance_gui_<控件>`、UiDriver 五例、路由事件测试
 （gui_visual_tree_routing、datatable_nested_visual_tree）、`perf_frame_budget`、
@@ -260,6 +295,9 @@ P4 先于 P6（弹层是输入轮询最密的地方）；P7 放最后（没有�
 - 机检严格模式下基线为空；Zan.Gui 不引用任何兄弟包命名空间。
 - App.zan 少于 1,000 行；ModelBinder 没有 `is <控件>` 特判；SelectBox 少于 1,200 行。
 - Widget/Component 没有 `Render(App` 入口，App 上没有仲裁 API。
+- 控件纯实例化：Gui.Core/Widget/Component 无 static 可变字段与控件静态逐帧入口
+  （static 纯函数助手除外）；除控件 OnPaint 内部实现外，全仓无 Canvas/Draw 创作
+  调用（图表/HMI/游戏 HUD 的像素绘制只出现在控件 OnPaint 内部）。
 - 运行时只有 CSS 一个布局引擎；设计器文档以外没有 `data-dock/data-fx/data-span`。
 - 绑定只剩 `data-bind`（HTML）与 `Binding<T>`（代码）两条正道，外加 GetProp/SetProp
   动态宿主协议。
@@ -281,3 +319,12 @@ P4 先于 P6（弹层是输入轮询最密的地方）；P7 放最后（没有�
   "AlertBox")`），审计初稿误记为 34 个。
 - 2026-11-06 更正（P0 机检落地时实测）：带旧布局属性的 42 个 html 全部是设计器文档，
   IDE 面板也在内。P5 只做运行时脱糖与删除 Dock 引擎，文件改写并入 P8。
+- 2026-11-09 用户裁定：GUI 组件只保留两范式（范式一 HTML+CSS；范式二声明式对象树
+  `Children`/`ClassName` + 纯 Flex/Grid/Flow），画布例外取消——原 P6 第 6 步
+  "DataTable/Charts/CodeEditor/Industrial 只改输入，Canvas 自绘保留"作废，全部统一
+  改写为范式二控件（OnPaint 仅为控件内部实现）；游戏 HUD 视图/SceneDesigner 面板
+  纳入，游戏世界渲染保留为引擎职责。同日补充裁定"控件纯实例化"：静态可变状态与
+  控件静态逐帧入口（WidgetId 全局栈、OverlayPopup static 遮挡/悬停字段、Layer
+  静态打开态队列、Ui 轮询族）随 P6 一并退役，static 纯函数助手保留。现状表按
+  2026-11-09 源码实测复核（App 主文件 804 行但职责仍在 partial、Dock 引擎已删、
+  OverlayHost 骨架已落、设计器方言文档实测 43 个）。

@@ -117,6 +117,13 @@ StyleBox r = this.BareBox(app, "listrow", Style.SNormal());
 
 ## 3. 一个新组件的十步
 
+> **范式定位（2026-11-09 裁定）**：GUI 组件只有两种创作范式——HTML+CSS 与
+> 声明式对象树（`Children`/`ClassName`，纯 Flex/Grid/Flow）。写一个新控件 =
+> 写一个范式二控件：子节点排布一律挂内嵌容器（`Children` + CSS 类），`OnPaint`
+> 只画控件**自身**的像素呈现（它是控件的内部实现，不是创作 API）——不做布局、
+> 不做输入轮询、不提供 `Render(App, …)` 静态逐帧入口；静态可变状态一律不允许
+> （状态只放实例字段），static 纯函数助手（几何/度量）除外。
+
 ```zan
 public class MyWidget : Control {
     // 1) 构造：InitControl 设名字与停靠方式。
@@ -241,8 +248,10 @@ panel.With(a).With(b);
 
 - 子控件**只有一个位置**。同一个实例挂进两处会重复绘制、丢焦点；
   收养前基类会判环并拒绝。
-- 复合控件（自己也是别人的子节点）不要在 `OnPaint` 里手摆子控件位置，
-  走 `OnMeasure` + `Arrange` + 自己的 `OnPaint`，否则父容器的布局算不准。
+- 复合控件（自己也是别人的子节点）的子排布**一律挂内嵌容器**（`Children` +
+  Flex/Grid/Flow CSS 类），不要在 `OnPaint` 或 `Arrange` 里手摆子控件坐标——
+  手摆绕开布局引擎，父容器算不准、窗口一缩放就散架（2026-11-09 裁定：排版
+  纯 Flex/Grid/Flow）。`OnMeasure` 只回答控件自身的首选尺寸。
 - **高阶复合与重型组件管线化**：对于复杂组件（如 DataTable、TreeGrid、Designer），严禁在单个文件内编写数千行巨石渲染代码；
   必须按单一职责拆解为独立管线（如 `RenderCell`, `RenderHeader`, `RenderFrozen`, `RenderBody`, `RenderFooter`, `RenderInteraction`），
   主渲染类仅作为流水线调度中枢。
