@@ -1,0 +1,195 @@
+using System;
+using System.Security.Cryptography;
+
+namespace Web3.Encoding;
+
+// RLP 元素类型枚举：原始字节串或子项列表
+public enum RlpType {
+    Bytes,
+    List
+}
+
+// RLP 结构化项，可表示单个字节串或嵌套列表
+public class RlpItem {
+    public RlpType Type;
+    public byte[] RawBytes;
+    public List<RlpItem> Items;
+
+    public RlpItem(byte[] bytes) {
+        Type = RlpType.Bytes;
+        RawBytes = bytes;
+        Items = new List<RlpItem>();
+    }
+
+    public RlpItem(List<RlpItem> list) {
+        Type = RlpType.List;
+        RawBytes = new byte[0];
+        Items = list != null ? list : new List<RlpItem>();
+    }
+
+    public static RlpItem FromBytes(byte[] bytes) {
+        return new RlpItem(bytes);
+    }
+
+    public static RlpItem FromString(string text) {
+        if (text == null) { return new RlpItem(new byte[0]); }
+        return new RlpItem(text.ToBytes());
+    }
+
+    public static RlpItem FromLong(long value) {
+        if (value == 0) {
+            return new RlpItem(new byte[0]);
+        }
+        // 计算无前导零的大端序字节
+        byte[] tmp = new byte[8];
+        int count = 0;
+        for (int i = 7; i >= 0; i = i - 1) {
+            tmp[i] = (byte)(value & 255);
+            value = (long)((ulong)value >> 8);
+        }
+        int start = 0;
+        while (start < 8 && tmp[start] == 0) {
+            start = start + 1;
+        }
+        int len = 8 - start;
+        byte[] b = new byte[len];
+        for (int i = 0; i < len; i = i + 1) {
+            b[i] = tmp[start + i];
+        }
+        return new RlpItem(b);
+    }
+
+    public static RlpItem FromList(List<RlpItem> list) {
+        return new RlpItem(list);
+    }
+}
+
+// 以太坊黄皮书标准的 RLP (Recursive Length Prefix) 编解码器。
+public class Rlp {
+
+    // 辅助函数：将长度值转为大端序字节数组（无前导零）
+    private static byte[] toBigEndianLen(int length) {
+        if (length == 0) { return new byte[0]; }
+        byte[] tmp = new byte[4];
+        tmp[0] = (byte)((length >> 24) & 255);
+        tmp[1] = (byte)((length >> 16) & 255);
+        tmp[2] = (byte)((length >> 8) & 255);
+        tmp[3] = (byte)(length & 255);
+
+        int start = 0;
+        while (start < 4 && tmp[start] == 0) {
+            start = start + 1;
+        }
+        int len = 4 - start;
+        byte[] res = new byte[len];
+        for (int i = 0; i < len; i = i + 1) {
+            res[i] = tmp[start + i];
+        }
+        return res;
+    }
+
+    // 编码原始字节串
+    public static byte[] EncodeBytes(byte[] bytes) {
+        if (bytes == null || bytes.Length == 0) {
+            byte[] empty = new byte[1];
+            empty[0] = 0x80;
+            return empty;
+        }
+
+        // 单字节且在 [0x00, 0x7f] 范围内直接返回本身
+        if (bytes.Length == 1 && (bytes[0] & 255) <= 0x7f) {
+            byte[] single = new byte[1];
+            single[0] = bytes[0];
+            return single;
+        }
+
+        // 长度在 [0, 55] 之间：前缀 0x80 + len
+        if (bytes.Length <= 55) {
+            byte[] res = new byte[1 + bytes.Length];
+            res[0] = (byte)(0x80 + bytes.Length);
+            for (int i = 0; i < bytes.Length; i = i + 1) {
+                res[1 + i] = bytes[i];
+            }
+            return res;
+        }
+
+        // 长度大于 55 字节：前缀 0xb7 + lenOfLen
+        byte[] lenBytes = toBigEndianLen(bytes.Length);
+        byte[] outb = new byte[1 + lenBytes.Length + bytes.Length];
+        outb[0] = (byte)(0xb7 + lenBytes.Length);
+        for (int i = 0; i < lenBytes.Length; i = i + 1) {
+            outb[1 + i] = lenBytes[i];
+        }
+        int offset = 1 + lenBytes.Length;
+        for (int i = 0; i < bytes.Length; i = i + 1) {
+            outb[offset + i] = bytes[i];
+        }
+        return outb;
+    }
+
+    // 编码字符串
+    public static byte[] EncodeString(string text) {
+        if (text == null) { return EncodeBytes(new byte[0]); }
+        return EncodeBytes(text.ToBytes());
+    }
+
+    // 编码已经序列化的子项列表
+    public static byte[] EncodeListRaw(List<byte[]> encodedItems) {
+        int totalPayloadLen = 0;
+        if (encodedItems != null) {
+            for (int i = 0; i < encodedItems.Count; i = i + 1) {
+                totalPayloadLen = totalPayloadLen + encodedItems[i].Length;
+            }
+        }
+
+        if (totalPayloadLen <= 55) {
+            byte[] res = new byte[1 + totalPayloadLen];
+            res[0] = (byte)(0xc0 + totalPayloadLen);
+            int pos = 1;
+            if (encodedItems != null) {
+                for (int i = 0; i < encodedItems.Count; i = i + 1) {
+                    byte[] item = encodedItems[i];
+                    for (int j = 0; j < item.Length; j = j + 1) {
+                        res[pos] = item[j];
+                        pos = pos + 1;
+                    }
+                }
+            }
+            return res;
+        }
+
+        // 长度大于 55：前缀 0xf7 + lenOfLen
+        byte[] lenBytes = toBigEndianLen(totalPayloadLen);
+        byte[] outb = new byte[1 + lenBytes.Length + totalPayloadLen];
+        outb[0] = (byte)(0xf7 + lenBytes.Length);
+        for (int i = 0; i < lenBytes.Length; i = i + 1) {
+            outb[1 + i] = lenBytes[i];
+        }
+        int offset = 1 + lenBytes.Length;
+        if (encodedItems != null) {
+            for (int i = 0; i < encodedItems.Count; i = i + 1) {
+                byte[] item = encodedItems[i];
+                for (int j = 0; j < item.Length; j = j + 1) {
+                    outb[offset] = item[j];
+                    offset = offset + 1;
+                }
+            }
+        }
+        return outb;
+    }
+
+    // 递归编码 RlpItem 结构
+    public static byte[] Encode(RlpItem item) {
+        if (item == null) {
+            return EncodeBytes(new byte[0]);
+        }
+        if (item.Type == RlpType.Bytes) {
+            return EncodeBytes(item.RawBytes);
+        }
+        List<byte[]> parts = new List<byte[]>();
+        for (int i = 0; i < item.Items.Count; i = i + 1) {
+            parts.Add(Encode(item.Items[i]));
+        }
+        return EncodeListRaw(parts);
+    }
+}

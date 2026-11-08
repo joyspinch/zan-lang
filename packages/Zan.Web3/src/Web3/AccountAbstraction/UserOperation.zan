@@ -1,0 +1,129 @@
+using System;
+using System.Security.Cryptography;
+using Web3.Types;
+using Web3.Encoding;
+
+namespace Web3.AccountAbstraction;
+
+// 以太坊 EIP-4337 现代智能合约账户抽象用户操作实体 (UserOperation)
+// 支撑下一代免助记词智能钱包、Gas 代付 (Paymaster)、社交恢复与会话密钥。
+public class UserOperation {
+
+    // 官方 EntryPoint 默认部署地址 (v0.6)
+    public static string DefaultEntryPoint = "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789";
+
+    public Address Sender;                  // 智能合约钱包地址
+    public BigInt Nonce;                    // 钱包防重放 Nonce
+    public byte[] InitCode;                 // 钱包初始化代码（首次部署填写工厂与参数，后续为空）
+    public byte[] CallData;                 // 实际调用的钱包执行数据（如 execute(to, value, data)）
+    public BigInt CallGasLimit;             // 业务执行 Gas 上限
+    public BigInt VerificationGasLimit;     // 签名与钱包验证 Gas 上限
+    public BigInt PreVerificationGas;       // Bundler 前置打包开销补偿 Gas
+    public BigInt MaxFeePerGas;             // 愿意支付的最高基础 Gas 单价
+    public BigInt MaxPriorityFeePerGas;     // 愿意支付的最高小费
+    public byte[] PaymasterAndData;         // 赞助商 Paymaster 合约地址及附加签名数据
+    public byte[] Signature;                // 钱包属主或签名权人的验签签名
+
+    public UserOperation() {
+        Sender = Address.Zero;
+        Nonce = BigInt.zero();
+        InitCode = new byte[0];
+        CallData = new byte[0];
+        CallGasLimit = BigInt.zero();
+        VerificationGasLimit = BigInt.zero();
+        PreVerificationGas = BigInt.zero();
+        MaxFeePerGas = BigInt.zero();
+        MaxPriorityFeePerGas = BigInt.zero();
+        PaymasterAndData = new byte[0];
+        Signature = new byte[0];
+    }
+
+    // 根据 EIP-4337 标准规范计算待签名散列 (GetUserOpHash)
+    // 算法: keccak256( abi.encode( keccak256(packUserOp), entryPoint, chainId ) )
+    public byte[] GetUserOpHash(Address entryPoint, long chainId) {
+        Address ep = entryPoint != null ? entryPoint : Address.Parse(DefaultEntryPoint);
+
+        // 1. 打包 10 个基本字段 (320 字节)
+        byte[] pack = new byte[320];
+
+        // 槽位 0: sender (32 字节)
+        byte[] senderSlot = Abi.EncodeAddress(Sender);
+        for (int i = 0; i < 32; i = i + 1) { pack[i] = senderSlot[i]; }
+
+        // 槽位 1: nonce (32 字节)
+        byte[] nonceSlot = Abi.EncodeUint256(Nonce);
+        for (int i = 0; i < 32; i = i + 1) { pack[32 + i] = nonceSlot[i]; }
+
+        // 槽位 2: keccak256(initCode)
+        byte[] initCodeHash = Keccak256.Hash(InitCode, InitCode != null ? InitCode.Length : 0);
+        for (int i = 0; i < 32; i = i + 1) { pack[64 + i] = initCodeHash[i]; }
+
+        // 槽位 3: keccak256(callData)
+        byte[] callDataHash = Keccak256.Hash(CallData, CallData != null ? CallData.Length : 0);
+        for (int i = 0; i < 32; i = i + 1) { pack[96 + i] = callDataHash[i]; }
+
+        // 槽位 4: callGasLimit
+        byte[] cglSlot = Abi.EncodeUint256(CallGasLimit);
+        for (int i = 0; i < 32; i = i + 1) { pack[128 + i] = cglSlot[i]; }
+
+        // 槽位 5: verificationGasLimit
+        byte[] vglSlot = Abi.EncodeUint256(VerificationGasLimit);
+        for (int i = 0; i < 32; i = i + 1) { pack[160 + i] = vglSlot[i]; }
+
+        // 槽位 6: preVerificationGas
+        byte[] pvgSlot = Abi.EncodeUint256(PreVerificationGas);
+        for (int i = 0; i < 32; i = i + 1) { pack[192 + i] = pvgSlot[i]; }
+
+        // 槽位 7: maxFeePerGas
+        byte[] mfgSlot = Abi.EncodeUint256(MaxFeePerGas);
+        for (int i = 0; i < 32; i = i + 1) { pack[224 + i] = mfgSlot[i]; }
+
+        // 槽位 8: maxPriorityFeePerGas
+        byte[] mpfSlot = Abi.EncodeUint256(MaxPriorityFeePerGas);
+        for (int i = 0; i < 32; i = i + 1) { pack[256 + i] = mpfSlot[i]; }
+
+        // 槽位 9: keccak256(paymasterAndData)
+        byte[] pmHash = Keccak256.Hash(PaymasterAndData, PaymasterAndData != null ? PaymasterAndData.Length : 0);
+        for (int i = 0; i < 32; i = i + 1) { pack[288 + i] = pmHash[i]; }
+
+        // 计算内部哈希
+        byte[] userOpPackHash = Keccak256.Hash(pack, 320);
+
+        // 2. 将 (userOpPackHash, entryPoint, chainId) 进行 96 字节拼接
+        byte[] finalPack = new byte[96];
+        for (int i = 0; i < 32; i = i + 1) { finalPack[i] = userOpPackHash[i]; }
+
+        byte[] epSlot = Abi.EncodeAddress(ep);
+        for (int i = 0; i < 32; i = i + 1) { finalPack[32 + i] = epSlot[i]; }
+
+        byte[] cidSlot = Abi.EncodeUint256(chainId);
+        for (int i = 0; i < 32; i = i + 1) { finalPack[64 + i] = cidSlot[i]; }
+
+        // 3. 得到权威 EIP-4337 UserOpHash
+        return Keccak256.Hash(finalPack, 96);
+    }
+
+    // 使用账户私钥对 UserOp 进行签名并填充 Signature 字段
+    public string Sign(Account signer, Address entryPoint, long chainId) {
+        if (signer == null || signer.PrivateKey == null) {
+            return null;
+        }
+
+        byte[] opHash = GetUserOpHash(entryPoint, chainId);
+        Secp256k1Signature sig = signer.SignHash(opHash);
+        if (sig == null) {
+            return null;
+        }
+
+        // 拼接标准 65 字节签名 (R || S || V)
+        byte[] sigBytes = new byte[65];
+        for (int i = 0; i < 32; i = i + 1) {
+            sigBytes[i] = sig.R[i];
+            sigBytes[32 + i] = sig.S[i];
+        }
+        sigBytes[64] = (byte)(sig.V + 27);
+        Signature = sigBytes;
+
+        return "0x" + Hex.Encode(sigBytes, 65);
+    }
+}

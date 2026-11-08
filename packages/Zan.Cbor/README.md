@@ -8,7 +8,7 @@ CBOR（RFC 8949，RFC 7049 的继任）for Zan：`System.Json.JsonValue` ↔
 
 ```zan
 using System.Json;
-using System.Cbor;
+using Formats.Cbor;
 
 JsonValue conf = JsonValue.Parse("{\"port\":8080,\"tags\":[\"a\",\"b\"]}");
 byte[] bytes = Cbor.Encode(conf);

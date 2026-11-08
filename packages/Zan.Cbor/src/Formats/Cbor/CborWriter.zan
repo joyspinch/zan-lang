@@ -1,0 +1,178 @@
+using System;
+using System.Buffers.Binary;
+using System.Text;
+
+namespace Formats.Cbor;
+
+// CBOR 编码原语（RFC 8949）：常规项确定长度（definite）编码，argument
+// 走规范最短形态（additional info 0-23 直接、24-27 定宽）。负整数按
+// major type 1（值 = -1 - n，n = ~v 免溢出）。字节缓冲倍增扩容整块
+// NativeMemory.Copy 搬移，数值大端。超过 ChunkBytes 的 text/byte 串
+// 写成 indefinite 分片（0x7F/0x5F + 定长块 + 0xFF）——读侧
+// TakeChunks 原生支持，且对有更小单-item 限的对端更友好；阈值以下
+// 保持 definite，输出与历史逐字节一致。
+public class CborWriter {
+    // 写侧总量上限：对齐读侧 512MB 载荷上限，超限抛 CborException。
+    // 容量算术全程 64 位——旧的 int 算术在 len+extra ≥ 2^31 时首判据
+    // 回绕误判"有空间"直接写穿，倍增循环在 >1GB 时同样回绕成死循环。
+    // 分片不改此限（缓冲仍整体驻内存），它解决的是形态正确性。
+    public static long MaxTotalBytes = 536870912;
+
+    // text/byte 串分片阈值：超过即写 indefinite 分片，每块 ≤ 此值。
+    // 64MB 在 512MB 单-item 限内留足余量，块头开销可忽略。
+    public static long ChunkBytes = 67108864;
+
+    public byte[] buf;
+    public int len;
+
+    public CborWriter() {
+        buf = new byte[64];
+        len = 0;
+    }
+
+    // 已编码字节数。
+    public int Length() { return len; }
+
+    public void EnsureRoom(int extra) {
+        long need = (long)len + (long)extra;
+        if (need > CborWriter.MaxTotalBytes) {
+            throw new CborException("encoded size "
+                + Convert.ToString(need) + " exceeds 512MB write limit");
+        }
+        if (need <= buf.Length) { return; }
+        long c = (long)buf.Length * 2;
+        if (c < 16) { c = 16; }
+        while (c < need) { c = c * 2; }
+        byte[] grown = new byte[(int)c];
+        NativeMemory.Copy((nint)grown, (nint)buf, len);
+        buf = grown;
+    }
+
+    public void RawU8(int b) {
+        EnsureRoom(1);
+        buf[len] = (byte)b;
+        len = len + 1;
+    }
+
+    public void RawU16BE(int v) {
+        EnsureRoom(2);
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(len, 2), (ushort)v);
+        len = len + 2;
+    }
+
+    public void RawU32BE(long v) {
+        EnsureRoom(4);
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(len, 4), (uint)v);
+        len = len + 4;
+    }
+
+    public void RawU64BE(long v) {
+        EnsureRoom(8);
+        BinaryPrimitives.WriteUInt64BigEndian(buf.AsSpan(len, 8), (ulong)v);
+        len = len + 8;
+    }
+
+    // 写 major type 头 + argument（规范最短：≤23 内联，24/25/26/27
+    // 定宽；明确不产 indefinite）。
+    public void Head(int major, long arg) {
+        int m = major << 5;
+        if (arg < 24) {
+            RawU8(m | (int)arg);
+        } else if (arg < 256) { RawU8(m | 24); RawU8((int)arg); }
+        else if (arg < 65536) { RawU8(m | 25); RawU16BE((int)arg); }
+        else if (arg < 4294967296) { RawU8(m | 26); RawU32BE(arg); }
+        else { RawU8(m | 27); RawU64BE(arg); }
+    }
+
+    // 无符号整数（major 0）。
+    public void WriteUint(long v) { Head(0, v); }
+
+    // 负整数（major 1，值 = -1 - n；n = ~v 对 long.MinValue 也不溢出）。
+    public void WriteNeg(long v) { Head(1, ~v); }
+
+    // text string（major 3）；超过 ChunkBytes 写 indefinite 分片。
+    public void WriteString(string s) {
+        byte[] b = Encoding.GetBytes(s);
+        if (b.Length > CborWriter.ChunkBytes) {
+            Chunked(3, b);
+            return;
+        }
+        Head(3, b.Length);
+        EnsureRoom(b.Length);
+        NativeMemory.Copy((nint)buf + len, (nint)b, b.Length);
+        len = len + b.Length;
+    }
+
+    // byte string（major 2）；超过 ChunkBytes 写 indefinite 分片。
+    public void WriteBytes(byte[] b) {
+        if (b.Length > CborWriter.ChunkBytes) {
+            Chunked(2, b);
+            return;
+        }
+        Head(2, b.Length);
+        EnsureRoom(b.Length);
+        NativeMemory.Copy((nint)buf + len, (nint)b, b.Length);
+        len = len + b.Length;
+    }
+
+    // indefinite 分片主体：起始字节（major|31）、逐块定长编码、
+    // break（0xFF）。等长分块，仅末块可短。
+    public void Chunked(int major, byte[] b) {
+        int m = major << 5;
+        RawU8(m | 31);
+        int off = 0;
+        while (off < b.Length) {
+            int n = b.Length - off;
+            if (n > (int)CborWriter.ChunkBytes) { n = (int)CborWriter.ChunkBytes; }
+            Head(major, n);
+            EnsureRoom(n);
+            NativeMemory.Copy((nint)buf + len, (nint)b + off, n);
+            len = len + n;
+            off = off + n;
+        }
+        RawU8(255);
+    }
+
+    // 数组头（major 4，确定长度）。
+    public void WriteArrayHeader(int n) { Head(4, n); }
+
+    // 映射头（major 5，确定长度）。
+    public void WriteMapHeader(int n) { Head(5, n); }
+
+    public void WriteBool(bool b) { RawU8(b ? 245 : 244); }
+    public void WriteNull() { RawU8(246); }
+
+    // float32（0xFA，固定 32 位）。
+    public void WriteFloat(float f) {
+        RawU8(250);
+        EnsureRoom(4);
+        BinaryPrimitives.WriteSingleBigEndian(buf.AsSpan(len, 4), f);
+        len = len + 4;
+    }
+
+    // float64（0xFB，固定 64 位——不做最短浮点规范化，文档化取舍）。
+    public void WriteDouble(double d) {
+        RawU8(251);
+        EnsureRoom(8);
+        BinaryPrimitives.WriteDoubleBigEndian(buf.AsSpan(len, 8), d);
+        len = len + 8;
+    }
+
+    // 任意 tag 头（major 6）。
+    public void WriteTag(long tag) { Head(6, tag); }
+
+    // 取出已编码字节（复制一份）。
+    public byte[] ToBytes() {
+        byte[] out2 = new byte[len];
+        NativeMemory.Copy((nint)out2, (nint)buf, len);
+        return out2;
+    }
+
+    // double 的 IEEE-754 位模式：编译器内建 bitcast
+    // （NativeMemory.AsI64，零开销、逐位精确——含次正规；NaN 归一为
+    // quiet 位型）。取代旧手工归一化（截断丢 1 ULP、次正规指数域
+    // 变负）。
+    public static long DoubleBits(double v) {
+        return NativeMemory.AsI64(v);
+    }
+}

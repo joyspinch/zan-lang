@@ -43,7 +43,7 @@
 
 ```zan
 using System;
-using System.Messaging;
+using Messaging;
 
 class OrderPlaced {
     public string customer;
@@ -117,5 +117,5 @@ ARC 守卫（`run_case_modes.cmake`）干净，`--check-leaks` 无泄漏。
 
 ## 放置
 
-包约定：`packages/Zan.Messaging/src/System/Messaging/*.zan`。
+包约定：`packages/Zan.Messaging/src/Messaging/*.zan`。
 非游戏领域能力走独立包并单独版本化，不进 stdlib。

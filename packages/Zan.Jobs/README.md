@@ -1,4 +1,4 @@
-# System.Jobs
+# Tasks.Jobs
 
 后台任务队列：持久化任务存储 + 显式处理器注册 + 重试退避 + 延迟/周期调度 +
 死信与人工重试 + 状态统计。纯 Zan，无反射，无原生依赖。
@@ -94,7 +94,7 @@ worker 捡起来才变成死信。接线错误越早暴露越好。
 
 ```zan
 using System;
-using System.Jobs;
+using Tasks.Jobs;
 
 // 1) 建存储（文件持久化 / 内存）
 FileJobStorage store = new FileJobStorage("data/jobs.jsonl");
@@ -167,5 +167,5 @@ conformance `jobs_scheduler`（38 条断言）：成功路径 / 未注册任务�
 
 ## 放置
 
-`packages/Zan.Jobs` —— 命名空间 `System.Jobs`，不依赖任何其它包
+`packages/Zan.Tasks.Jobs` —— 命名空间 `Tasks.Jobs`，不依赖任何其它包
 （cron 协作是可选的，调用方自己组合）。

@@ -1,6 +1,6 @@
-# System.Pdf
+# Document.Pdf
 
-`System.Pdf` 是 **PDF 生成器**：页面 + 画线 / 矩形 / 文本 + 表格 + PDF 1.4 写出器。
+`Document.Pdf` 是 **PDF 生成器**：页面 + 画线 / 矩形 / 文本 + 表格 + PDF 1.4 写出器。
 
 它补的是 QuestPDF（14,205★）那一档的**生成**侧：把数据排成页、写出去。
 纯 Zan 实现，无原生依赖，不嵌字体。
@@ -44,7 +44,7 @@
 ```zan
 using System;
 using System.Collections.Generic;
-using System.Pdf;
+using Document.Pdf;
 
 PdfDocument doc = new PdfDocument();
 doc.Title = "Quarterly Report";
@@ -97,5 +97,5 @@ double w = page.MeasureText("Hello", PdfFont.Helvetica(), 12);   // 27.336 点
 
 ## 放置
 
-包约定：`packages/Zan.Pdf/src/System/Pdf/*.zan`。
+包约定：`packages/Zan.Pdf/src/Document/Pdf/*.zan`。
 文档类能力（PDF / Office / 图片）走独立包并单独版本化，不进 stdlib。

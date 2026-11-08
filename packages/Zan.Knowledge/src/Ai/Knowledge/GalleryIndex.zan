@@ -1,0 +1,380 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+
+namespace Ai.Knowledge;
+
+// Generate 的产物：gallery JSON、条目/发现/模板计数与告警。
+public class GalleryIndex {
+    // 生成 gallery 索引：以 seed 的 entries 为基底，扫描 templates/ 与
+    // examples/ 里未被 seed 引用的模板和示例补入条目，topic 重复即抛
+    // 异常；models 节原样保留。
+    public static GalleryResult Generate(string root, string seedPath) {
+        GalleryResult r = new GalleryResult();
+        JsonValue seed = JsonValue.Parse(File.ReadAllText(seedPath));
+        JsonValue entries = seed.Get("entries");
+        if (entries == null || !entries.IsArray()) {
+            throw new Exception("gallery seed has no entries array");
+        }
+        JsonValue outEntries = JsonValue.NewArray();
+        List<string> referenced = new List<string>();
+        for (int i = 0; i < entries.Count(); i = i + 1) {
+            JsonValue e = entries.At(i);
+            outEntries.Append(e);
+            GalleryIndex.AddRefs(e, referenced);
+        }
+
+        List<JsonValue> extra = new List<JsonValue>();
+        GalleryIndex.ScanTemplates(root + "/templates", root, referenced, extra, r);
+        GalleryIndex.ScanExamples(root + "/examples", root, referenced, extra, r);
+        GalleryIndex.SortEntries(extra);
+        for (int i = 0; i < extra.Count; i = i + 1) {
+            outEntries.Append(extra[i]);
+        }
+        GalleryIndex.CheckTopics(outEntries);
+
+        JsonValue output = JsonValue.NewObject();
+        output.Put("version", seed.Get("version"));
+        output.Put("note", JsonValue.NewStr(
+            "Generated from templates, examples and the handwritten gallery seed."));
+        output.Put("models", seed.Get("models"));
+        output.Put("entries", outEntries);
+        r.json = output.ToJson();
+        r.entries = outEntries.Count();
+        return r;
+    }
+
+    // 收集条目 files 数组里引用的全部文件路径（去重）。
+    public static void AddRefs(JsonValue e, List<string> refs) {
+        JsonValue fs = e.Get("files");
+        if (fs == null || !fs.IsArray()) { return; }
+        for (int i = 0; i < fs.Count(); i = i + 1) {
+            string p = fs.At(i).AsString("");
+            if (!GalleryIndex.Has(refs, p)) { refs.Add(p); }
+        }
+    }
+
+    // 扫描 templates/<family>/<template>/：带 template.manifest 的目录
+    // 生成一条目（entry 文件 + 同名 .html 设计稿）；已由 seed 覆盖的目录跳过，
+    // 缺 entry 键记告警。
+    public static void ScanTemplates(string dir, string root, List<string> refs,
+                              List<JsonValue> outp, GalleryResult r) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            string family = ds[i];
+            string fd = dir + "/" + family;
+            List<string> ts = Directory.GetDirectories(fd);
+            for (int j = 0; j < ts.Count; j = j + 1) {
+                string td = fd + "/" + ts[j];
+                string mf = td + "/template.manifest";
+                if (!File.Exists(mf)) { continue; }
+                r.templates = r.templates + 1;
+                string entry = GalleryIndex.Manifest(mf, "entry");
+                if (entry == "") {
+                    r.warnings.Add("manifest has no entry: " + mf);
+                    continue;
+                }
+                string full = td + "/" + entry;
+                string rel = GalleryIndex.Rel(root, full);
+                string templateRel = GalleryIndex.Rel(root, td);
+                if (GalleryIndex.HasPrefix(refs, templateRel)) { continue; }
+                JsonValue e = JsonValue.NewObject();
+                string design = GalleryIndex.SameName(full, ".html");
+                JsonValue fs = JsonValue.NewArray();
+                fs.Append(JsonValue.NewStr(rel));
+                if (design != "") { fs.Append(JsonValue.NewStr(GalleryIndex.Rel(root, design))); }
+                e.Put("topic", JsonValue.NewStr(ts[j]));
+                e.Put("kind", JsonValue.NewStr(GalleryIndex.TemplateKind(
+                    family, design != "")));
+                e.Put("path", JsonValue.NewStr(
+                    GalleryIndex.Rel(root, GalleryIndex.DirOf(full))));
+                e.Put("summary", JsonValue.NewStr(GalleryIndex.TemplateSummary(mf)));
+                e.Put("files", fs);
+                outp.Add(e);
+                r.discovered = r.discovered + 1;
+            }
+        }
+    }
+
+    // 递归扫描 examples/ 下 .zan 文件（game 目录除外）：未被 seed
+    // 引用的生成条目；topic 取文件名（'_'、'/' 归一为 '-'），gui_ 前缀
+    // 的 kind 为 gui-immediate，其余 sample；summary 取文件头注释或
+    // README 首行。
+    public static void ScanExamples(string dir, string root, List<string> refs,
+                             List<JsonValue> outp, GalleryResult r) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> fs = Directory.GetFileNames(dir);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            string fn = fs[i];
+            if (!GalleryIndex.Ends(fn, ".zan")) { continue; }
+            string full = dir + "/" + fn;
+            string rel = GalleryIndex.Rel(root, full);
+            if (GalleryIndex.Has(refs, rel)) { continue; }
+            JsonValue e = JsonValue.NewObject();
+            string topic = rel;
+            if (GalleryIndex.Starts(topic, "examples/")) {
+                topic = topic.Substring(9, topic.Length - 9);
+            }
+            topic = GalleryIndex.Replace(topic, "_", "-");
+            topic = GalleryIndex.Replace(topic, "/", "-");
+            if (GalleryIndex.Ends(topic, ".zan")) {
+                topic = topic.Substring(0, topic.Length - 4);
+            }
+            bool immediate = GalleryIndex.Starts(rel, "examples/gui_")
+                || GalleryIndex.Find(rel, "/gui_", 0) >= 0;
+            string family = GalleryIndex.Rel(root, dir);
+            e.Put("topic", JsonValue.NewStr(topic));
+            e.Put("kind", JsonValue.NewStr(immediate ? "gui-immediate" : "sample"));
+            e.Put("path", JsonValue.NewStr(family));
+            e.Put("summary", JsonValue.NewStr(
+                GalleryIndex.Summary(full, dir, fn)));
+            JsonValue a = JsonValue.NewArray();
+            a.Append(JsonValue.NewStr(rel));
+            e.Put("files", a);
+            outp.Add(e);
+            r.discovered = r.discovered + 1;
+        }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            string child = dir + "/" + ds[i];
+            if (GalleryIndex.Rel(root, child) == "examples/game") { continue; }
+            GalleryIndex.ScanExamples(child, root, refs, outp, r);
+        }
+    }
+
+    // 读 manifest 的 "key=value" 行，返回 value；缺键为空串。
+    public static string Manifest(string path, string key) {
+        List<string> ls = GalleryIndex.Lines(File.ReadAllText(path));
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            string t = GalleryIndex.Trim(ls[i]);
+            int eq = GalleryIndex.Find(t, "=", 0);
+            if (eq >= 0 && GalleryIndex.Trim(t.Substring(0, eq)) == key) {
+                return GalleryIndex.Trim(t.Substring(eq + 1, t.Length - eq - 1));
+            }
+        }
+        return "";
+    }
+
+    // 模板家族 + 是否带 .html 设计稿 → 条目 kind（gui-designer/gui-immediate/
+    // server/console/library，其余小写家族名）。
+    public static string TemplateKind(string family, bool hasDesign) {
+        string f = GalleryIndex.Lower(family);
+        if (f == "gui") { return hasDesign ? "gui-designer" : "gui-immediate"; }
+        if (f == "server") { return "server"; }
+        if (f == "console") { return "console"; }
+        if (f == "library") { return "library"; }
+        return f;
+    }
+
+    // 模板摘要：manifest 的 desc 与 desc.zh 拼接（缺一取其一，全缺取
+    // manifest 文件名）。
+    public static string TemplateSummary(string manifest) {
+        string a = GalleryIndex.Manifest(manifest, "desc");
+        string b = GalleryIndex.Manifest(manifest, "desc.zh");
+        if (a != "" && b != "") { return a + " " + b; }
+        if (a != "") { return a; }
+        if (b != "") { return b; }
+        return GalleryIndex.BaseName(manifest);
+    }
+
+    // 示例文件的摘要：文件头部第一条 /// 注释，其次第一条 // 注释
+    // （跳过空行与纯装饰行），再次同目录 README.md 的首个非标题行，
+    // 最后回落文件名。
+    public static string Summary(string path, string dir, string fn) {
+        List<string> ls = GalleryIndex.Lines(File.ReadAllText(path));
+        string triple = "";
+        string dbl = "";
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            string raw = ls[i];
+            string t = GalleryIndex.Trim(raw);
+            bool isTriple = GalleryIndex.Starts(t, "///");
+            bool isDouble = GalleryIndex.Starts(t, "//");
+            if (isTriple || isDouble) {
+                string x = t.Substring(isTriple ? 3 : 2,
+                    t.Length - (isTriple ? 3 : 2));
+                if (x.Length > 0 && x.Substring(0, 1) == " ") {
+                    x = x.Substring(1, x.Length - 1);
+                }
+                x = GalleryIndex.Trim(x);
+                if (x == "" || GalleryIndex.Decoration(x)) { continue; }
+                if (isTriple && triple == "") { triple = x; }
+                if (isDouble && dbl == "") { dbl = x; }
+                continue;
+            }
+            if (t != "") { break; }
+        }
+        if (triple != "") { return triple; }
+        if (dbl != "") { return dbl; }
+        string readme = dir + "/README.md";
+        if (File.Exists(readme)) {
+            List<string> rs = GalleryIndex.Lines(File.ReadAllText(readme));
+            for (int i = 0; i < rs.Count; i = i + 1) {
+                string x = GalleryIndex.Trim(rs[i]);
+                if (x != "" && !GalleryIndex.Starts(x, "#")) { return x; }
+            }
+        }
+        return GalleryIndex.WithoutExt(fn);
+    }
+
+    // 是否纯装饰行（仅 = - * _ 空白）。
+    public static bool Decoration(string s) {
+        if (s == "") { return true; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string c = s.Substring(i, 1);
+            if (c != "=" && c != "-" && c != "*" && c != "_" &&
+                c != " " && c != "\t") { return false; }
+        }
+        return true;
+    }
+
+    // 同名不同扩展名的文件路径；不存在为空串。
+    public static string SameName(string path, string ext) {
+        string basep = GalleryIndex.WithoutExt(path);
+        string z = basep + ext;
+        return File.Exists(z) ? z : "";
+    }
+
+    // 路径规范化为相对 root 的 POSIX 风格显示路径。
+    public static string Rel(string root, string path) {
+        string p = GalleryIndex.Replace(path, "\\", "/");
+        string r = GalleryIndex.Replace(root, "\\", "/");
+        if (GalleryIndex.Starts(p, r + "/")) { return p.Substring(r.Length + 1, p.Length - r.Length - 1); }
+        return p;
+    }
+
+    // 去掉尾部斜杠后的最后一段目录/文件名。
+    public static string ParentName(string path) {
+        string p = GalleryIndex.Replace(path, "\\", "/");
+        int end = p.Length;
+        while (end > 0 && p.Substring(end - 1, 1) == "/") { end = end - 1; }
+        int i = end - 1;
+        while (i >= 0 && p.Substring(i, 1) != "/") { i = i - 1; }
+        return p.Substring(i + 1, end - i - 1);
+    }
+    // 文件路径的目录部分（无目录为空串）。
+    public static string DirOf(string path) {
+        string p = GalleryIndex.Replace(path, "\\", "/");
+        int i = p.Length - 1;
+        while (i >= 0 && p.Substring(i, 1) != "/") { i = i - 1; }
+        return i < 0 ? "" : p.Substring(0, i);
+    }
+
+    // 同 ParentName（基名）。
+    public static string BaseName(string path) { return GalleryIndex.ParentName(path); }
+    // 去掉最后一个 '.' 之后扩展名的路径（无扩展名原样返回）。
+    public static string WithoutExt(string path) {
+        int i = path.Length - 1;
+        while (i >= 0 && path.Substring(i, 1) != "/") { i = i - 1; }
+        int d = path.Length - 1;
+        while (d > i && path.Substring(d, 1) != ".") { d = d - 1; }
+        if (d <= i) { return path; }
+        return path.Substring(0, d);
+    }
+
+    // 按 topic 字符串插入排序（就地升序）。
+    public static void SortEntries(List<JsonValue> a) {
+        for (int i = 1; i < a.Count; i = i + 1) {
+            JsonValue x = a[i];
+            JsonValue topicValue = x.Get("topic");
+            string k = topicValue == null ? "" : topicValue.AsString("");
+            int j = i - 1;
+            JsonValue prevTopic = a[j].Get("topic");
+            string prev = prevTopic == null ? "" : prevTopic.AsString("");
+            while (j >= 0 && prev > k) {
+                a[j + 1] = a[j]; j = j - 1;
+                if (j >= 0) {
+                    prevTopic = a[j].Get("topic");
+                    prev = prevTopic == null ? "" : prevTopic.AsString("");
+                }
+            }
+            a[j + 1] = x;
+        }
+    }
+
+    // 校验条目 topic 无重复，重复即抛异常（列出重复项）。
+    public static void CheckTopics(JsonValue a) {
+        List<string> seen = new List<string>();
+        List<string> dup = new List<string>();
+        for (int i = 0; i < a.Count(); i = i + 1) {
+            JsonValue topicValue = a.At(i).Get("topic");
+            string t = topicValue == null ? "" : topicValue.AsString("");
+            if (GalleryIndex.Has(seen, t)) {
+                if (!GalleryIndex.Has(dup, t)) { dup.Add(t); }
+            } else { seen.Add(t); }
+        }
+        if (dup.Count > 0) {
+            string s = "";
+            for (int i = 0; i < dup.Count; i = i + 1) {
+                if (i > 0) { s = s + ", "; }
+                s = s + dup[i];
+            }
+            throw new Exception("duplicate gallery topics: " + s);
+        }
+    }
+
+    // 按 '\n' 切行（丢弃 '\r'）。
+    public static List<string> Lines(string s) {
+        List<string> r = new List<string>();
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string c = s.Substring(i, 1);
+            if (c == "\n") { r.Add(b.ToString()); b = new StringBuilder(); }
+            else if (c != "\r") { b.Append(c); }
+        }
+        r.Add(b.ToString());
+        return r;
+    }
+    // 列表是否含该字符串。
+    public static bool Has(List<string> a, string s) {
+        for (int i = 0; i < a.Count; i = i + 1) { if (a[i] == s) { return true; } }
+        return false;
+    }
+    // 列表里是否有该路径本身或其子路径（按目录前缀）。
+    public static bool HasPrefix(List<string> a, string prefix) {
+        string p = prefix + "/";
+        for (int i = 0; i < a.Count; i = i + 1) {
+            if (a[i] == prefix || GalleryIndex.Starts(a[i], p)) { return true; }
+        }
+        return false;
+    }
+    // 去除首尾空格/制表符。
+    public static string Trim(string s) {
+        int a = 0; int b = s.Length;
+        while (a < b && (s.Substring(a, 1) == " " || s.Substring(a, 1) == "\t")) { a = a + 1; }
+        while (b > a && (s.Substring(b - 1, 1) == " " || s.Substring(b - 1, 1) == "\t")) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+    // 转小写（转发给 ToLower）。
+    public static string Lower(string s) {
+        return s.ToLower();
+    }
+    // 前缀判断。
+    public static bool Starts(string s, string p) {
+        return s.Length >= p.Length && s.Substring(0, p.Length) == p;
+    }
+    // 后缀判断。
+    public static bool Ends(string s, string p) {
+        return s.Length >= p.Length && s.Substring(s.Length - p.Length, p.Length) == p;
+    }
+    // 从 start 起查找子串首次出现，返回下标；无则 -1（空模式命中 start）。
+    public static int Find(string s, string p, int start) {
+        if (p == "") { return start; }
+        for (int i = start; i + p.Length <= s.Length; i = i + 1) {
+            if (s.Substring(i, p.Length) == p) { return i; }
+        }
+        return -1;
+    }
+    // 全部替换（无正则）。
+    public static string Replace(string s, string a, string b) {
+        StringBuilder r = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            if (i + a.Length <= s.Length && s.Substring(i, a.Length) == a) {
+                r.Append(b); i = i + a.Length;
+            } else { r.Append(s.Substring(i, 1)); i = i + 1; }
+        }
+        return r.ToString();
+    }
+}

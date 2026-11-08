@@ -1,6 +1,6 @@
-# Zan.Caching
+# Zan.Data.Caching
 
-进程内 + 二层缓存，纯 Zan 实现，无原生依赖。`using System.Caching;` 即可。
+进程内 + 二层缓存，纯 Zan 实现，无原生依赖。`using Data.Caching;` 即可。
 
 ## 内容
 
@@ -14,7 +14,7 @@
 ## 用法
 
 ```zan
-using System.Caching;
+using Data.Caching;
 
 MemoryCache<string> tokens = MemoryCache<string>.Synchronized(4096, 60000);
 tokens.Set("user:42", "token-abc");            // 按默认 TTL 写入

@@ -1,9 +1,9 @@
-# Zan.Scripting
+# Zan.Scripting.Lua
 
-Zan 程序的进程内 Lua 嵌入（Lua 5.3 / 5.4）。`using System.Scripting;`
+Zan 程序的进程内 Lua 嵌入（Lua 5.3 / 5.4）。`using Scripting.Lua;`
 按需拉入，命名空间保留零破坏。
 
-## 内容（stdlib/System/Scripting 整目录迁入）
+## 内容（stdlib/System/Scripting.Lua 整目录迁入）
 
 | 文件 | 内容 |
 |---|---|

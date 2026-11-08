@@ -1,0 +1,154 @@
+using System;
+using System.Security.Cryptography;
+using Web3.Types;
+using Web3.Encoding;
+using Web3.Rpc;
+
+namespace Web3.Contracts;
+
+// ERC-1155 多代币 / 半同质化资产标准强类型智能合约包装类 (ERC-1155 Multi-Token Client)
+// 支持区块链游戏道具、装备锻造材料、批量资产管理等场景的元数据 URI 查询、余额校验与安全转账。
+public class Erc1155Token {
+
+    public Contract Contract;           // 底层智能合约门面
+
+    public Erc1155Token(Address tokenAddress, Web3Client client, long chainId) {
+        Contract = new Contract(tokenAddress, client, chainId);
+    }
+
+    public Address Address {
+        get { return Contract.ContractAddress; }
+    }
+
+    // 查询指定代币 ID 的元数据 URI (uri(uint256))
+    public string Uri(BigInt id) {
+        byte[] args = Abi.EncodeUint256(id);
+        return Contract.CallString("uri(uint256)", args);
+    }
+
+    public string Uri(long id) {
+        byte[] args = Abi.EncodeUint256(id);
+        return Contract.CallString("uri(uint256)", args);
+    }
+
+    // 查询特定账户持有的指定代币 ID 余额 (balanceOf(address,uint256))
+    public BigInt BalanceOf(Address account, BigInt id) {
+        byte[] addrSlot = Abi.EncodeAddress(account);
+        byte[] idSlot = Abi.EncodeUint256(id);
+        byte[] args = new byte[64];
+        for (int i = 0; i < 32; i = i + 1) { args[i] = addrSlot[i]; }
+        for (int i = 0; i < 32; i = i + 1) { args[32 + i] = idSlot[i]; }
+        return Contract.CallUint256("balanceOf(address,uint256)", args);
+    }
+
+    public BigInt BalanceOf(Address account, long id) {
+        byte[] addrSlot = Abi.EncodeAddress(account);
+        byte[] idSlot = Abi.EncodeUint256(id);
+        byte[] args = new byte[64];
+        for (int i = 0; i < 32; i = i + 1) { args[i] = addrSlot[i]; }
+        for (int i = 0; i < 32; i = i + 1) { args[32 + i] = idSlot[i]; }
+        return Contract.CallUint256("balanceOf(address,uint256)", args);
+    }
+
+    // 查询 operator 是否被授权管理 account 的所有 ERC-1155 资产
+    public bool IsApprovedForAll(Address account, Address operatorAddr) {
+        byte[] accSlot = Abi.EncodeAddress(account);
+        byte[] opSlot = Abi.EncodeAddress(operatorAddr);
+        byte[] args = new byte[64];
+        for (int i = 0; i < 32; i = i + 1) { args[i] = accSlot[i]; }
+        for (int i = 0; i < 32; i = i + 1) { args[32 + i] = opSlot[i]; }
+        return Contract.CallBool("isApprovedForAll(address,address)", args);
+    }
+
+    // 全局授权或撤销授权 (setApprovalForAll(address operator, bool approved))
+    public string SetApprovalForAll(Account signer, Address operatorAddr, bool approved) {
+        byte[] opSlot = Abi.EncodeAddress(operatorAddr);
+        byte[] appSlot = Abi.EncodeBool(approved);
+        byte[] args = new byte[64];
+        for (int i = 0; i < 32; i = i + 1) { args[i] = opSlot[i]; }
+        for (int i = 0; i < 32; i = i + 1) { args[32 + i] = appSlot[i]; }
+
+        return Contract.SendTransaction(
+            signer,
+            "setApprovalForAll(address,bool)",
+            args,
+            BigInt.zero(),
+            50000,
+            EtherUnit.FromGwei(25),
+            EtherUnit.FromGwei(2)
+        );
+    }
+
+    // 单代币安全转账 (safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes data))
+    public string SafeTransferFrom(
+        Account signer,
+        Address from,
+        Address to,
+        BigInt id,
+        BigInt amount,
+        byte[] data
+    ) {
+        byte[] fromSlot = Abi.EncodeAddress(from);
+        byte[] toSlot = Abi.EncodeAddress(to);
+        byte[] idSlot = Abi.EncodeUint256(id);
+        byte[] amountSlot = Abi.EncodeUint256(amount);
+
+        // data 是动态字节数组: 偏移量(32) + 长度(32) + 补齐 32 字节的数据
+        int dataLen = data != null ? data.Length : 0;
+        int dataPadded = (dataLen + 31) / 32 * 32;
+
+        // 5 个槽位: 4 个静态槽位 + 1 个动态相对偏移量槽位 (160 字节 = 0xa0) + 长度槽位 + 数据槽位
+        int totalArgsLen = 32 * 5 + 32 + dataPadded;
+        byte[] args = new byte[totalArgsLen];
+
+        // 0: from
+        for (int i = 0; i < 32; i = i + 1) { args[i] = fromSlot[i]; }
+        // 32: to
+        for (int i = 0; i < 32; i = i + 1) { args[32 + i] = toSlot[i]; }
+        // 64: id
+        for (int i = 0; i < 32; i = i + 1) { args[64 + i] = idSlot[i]; }
+        // 96: amount
+        for (int i = 0; i < 32; i = i + 1) { args[96 + i] = amountSlot[i]; }
+
+        // 128: data 的相对偏移量 (160 字节 = 5 * 32)
+        byte[] offsetSlot = Abi.EncodeUint256(160);
+        for (int i = 0; i < 32; i = i + 1) { args[128 + i] = offsetSlot[i]; }
+
+        // 160: data 长度
+        byte[] lenSlot = Abi.EncodeUint256(dataLen);
+        for (int i = 0; i < 32; i = i + 1) { args[160 + i] = lenSlot[i]; }
+
+        // 192: 实际 data 内容
+        for (int i = 0; i < dataLen; i = i + 1) {
+            args[192 + i] = data[i];
+        }
+
+        return Contract.SendTransaction(
+            signer,
+            "safeTransferFrom(address,address,uint256,uint256,bytes)",
+            args,
+            BigInt.zero(),
+            90000,
+            EtherUnit.FromGwei(25),
+            EtherUnit.FromGwei(2)
+        );
+    }
+
+    public string SafeTransferFrom(
+        Account signer,
+        Address from,
+        Address to,
+        long id,
+        long amount,
+        byte[] data
+    ) {
+        return SafeTransferFrom(
+            signer,
+            from,
+            to,
+            Abi.DecodeUint256(Abi.EncodeUint256(id), 0),
+            Abi.DecodeUint256(Abi.EncodeUint256(amount), 0),
+            data
+        );
+    }
+}

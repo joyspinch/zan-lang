@@ -50,7 +50,7 @@ try {
 不要直接编辑生成的文件：
 
 ```text
-stdlib/Sdk/Jd/Domain/        212 个共享业务实体（Sdk.Jd.Domain，每个 C# Domain 只生成一次）
+stdlib/Sdk/Jd/Models/        212 个共享业务实体（Sdk.Jd.Models，每个 C# Domain 只生成一次）
 stdlib/Sdk/Jd/Api/<模块>/    211 组方法 Request/Response 契约 + 44 个 Jd*Api 模块客户端
 ```
 
@@ -58,7 +58,7 @@ stdlib/Sdk/Jd/Api/<模块>/    211 组方法 Request/Response 契约 + 44 个 Jd
 会让任何用到它的程序全量编译。
 
 `Domain/` 是共享实体层；`Api/<模块>/` 中的 Request/Response 只是方法传输契约。
-多个接口引用同一个 C# Domain 时都指向同一个 `Sdk.Jd.Domain` 类型，不重复生成实体。
+多个接口引用同一个 C# Domain 时都指向同一个 `Sdk.Jd.Models` 类型，不重复生成实体。
 模块客户端负责执行、解包和反序列化，并把完整网关信封保存在 Response 的 `Raw` 字段。
 
 每个 Request 类携带自己的 API 名，参数是强类型链式 setter：

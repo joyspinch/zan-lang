@@ -24,8 +24,8 @@ MCP 是"让程序去用**别的程序**的工具"的一套约定：客户端握�
 
 ```zan
 using System;
-using System.Ai;
-using System.Mcp;
+using Ai;
+using Ai.Mcp;
 
 McpClient client = new McpClient("http://127.0.0.1:8080/mcp", "token");
 if (!await client.Initialize()) {
@@ -46,7 +46,7 @@ List<McpResource> resources = await client.ListResources();
 string text = await client.ReadResource(resources[0].uri);
 ```
 
-`McpTools` 在 `Zan.Ai` 里（`System.Ai`）——它是"远端工具 → 本地注册表"
+`McpTools` 在 `Zan.Ai` 里（`Ai`）——它是"远端工具 → 本地注册表"
 那一段翻译，需要 `ToolRegistry`。
 
 ## 协议

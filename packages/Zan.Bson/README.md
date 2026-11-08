@@ -33,7 +33,7 @@ BSON（Binary JSON，MongoDB 的存储/交换格式）的纯 Zan 实现：
 
 ```zan
 using System;
-using System.Bson;
+using Formats.Bson;
 using System.Json;
 
 class Demo {

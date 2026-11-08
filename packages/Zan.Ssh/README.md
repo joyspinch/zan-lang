@@ -54,7 +54,7 @@
 
 ```zan
 using System;
-using System.Ssh;
+using Net.Ssh;
 
 SshClient client = new SshClient("example.com", 22, "alice");
 client.options.pinnedFingerprint = "SHA256:...";   // 或给 knownHostsContent

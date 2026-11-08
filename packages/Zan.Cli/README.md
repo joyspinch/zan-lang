@@ -1,6 +1,6 @@
-# Zan.Cli
+# Zan.Tools.Cli
 
-终端输出工具箱（纯 Zan，无原生依赖）。`using System.Cli;` 按需拉入，
+终端输出工具箱（纯 Zan，无原生依赖）。`using Tools.Cli;` 按需拉入，
 命名空间保留零破坏。
 
 C# 参考 Spectre.Console / Terminal.Gui：ANSI 颜色、表格、进度条、交互提示，
@@ -16,7 +16,7 @@ C# 参考 Spectre.Console / Terminal.Gui：ANSI 颜色、表格、进度条、�
 | `Table.zan` | 表格：`Table` + `TableColumn`（Unicode / ASCII / 无边框） |
 | `Progress.zan` | 进度条：`ProgressBar`（纯渲染）+ `Progress`（写同一行） |
 | `Prompt.zan` | 交互提示：文本 / 确认 / 单选，读取器与输出 sink 均可注入 |
-| `Cli.zan` | 门面：`Cli.Success/Error/Warning/Info/Header/Rule/Table` |
+| `Tools.Cli.zan` | 门面：`Tools.Cli.Success/Error/Warning/Info/Header/Rule/Table` |
 
 ## 为什么是"纯渲染"
 
@@ -45,7 +45,7 @@ string mixed = Style.Bold().Apply("标题") + "：" + Style.Gray().Apply("详情
 | `TERM=dumb` | 关闭 |
 | 其余 | 开启 |
 
-也可以在代码里显式控制：`Cli.EnableColor(false)`。
+也可以在代码里显式控制：`Tools.Cli.EnableColor(false)`。
 
 ⚠ 运行时目前**没有 isatty 探测能力**（见 `TASKS.md`），所以上表判不出
 "输出被重定向到文件"这种情况——需要严格 TTY 语义的应用请自己显式关色。

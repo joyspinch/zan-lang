@@ -8,7 +8,7 @@ MessagePack for Zan：`System.Json.JsonValue` ↔ 线上字节的 schemaless
 
 ```zan
 using System.Json;
-using System.MsgPack;
+using Formats.MsgPack;
 
 // 编码：JsonValue → bytes
 JsonValue conf = JsonValue.Parse("{\"port\":8080,\"tags\":[\"a\",\"b\"]}");

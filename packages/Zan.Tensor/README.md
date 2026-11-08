@@ -1,6 +1,6 @@
 # Zan.Tensor
 
-张量与算子（纯 Zan，无原生依赖）。`using System.Tensor;` 按需拉入。
+张量与算子（纯 Zan，无原生依赖）。`using Ai.Tensor;` 按需拉入。
 
 ## 内容
 

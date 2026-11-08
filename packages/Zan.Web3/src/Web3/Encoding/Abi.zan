@@ -1,0 +1,186 @@
+using System;
+using System.Security.Cryptography;
+using Web3.Types;
+
+namespace Web3.Encoding;
+
+// 以太坊智能合约 ABI (Application Binary Interface) 编解码器与函数调用构造工具。
+public class Abi {
+
+    // 计算标准函数签名的 4 字节函数选择器（如 "transfer(address,uint256)" -> [0xa9, 0x05, 0x9c, 0xbb]）
+    public static byte[] GetFunctionSelector(string signature) {
+        if (signature == null) { return new byte[4]; }
+        byte[] hash = Keccak256.Hash(signature);
+        byte[] sel = new byte[4];
+        for (int i = 0; i < 4; i = i + 1) {
+            sel[i] = hash[i];
+        }
+        return sel;
+    }
+
+    // 计算并返回函数选择器的 8 位小写十六进制字符串（如 "a9059cbb"）
+    public static string GetFunctionSelectorHex(string signature) {
+        byte[] sel = GetFunctionSelector(signature);
+        return Hex.Encode(sel, 4);
+    }
+
+    // 将 20 字节以太坊地址填充为 32 字节 ABI 槽位（高位补 12 个 0x00）
+    public static byte[] EncodeAddress(Address addr) {
+        byte[] slot = new byte[32];
+        if (addr != null) {
+            byte[] b = addr.ToBytes();
+            for (int i = 0; i < 20; i = i + 1) {
+                slot[12 + i] = b[i];
+            }
+        }
+        return slot;
+    }
+
+    // 将布尔值编码为 32 字节 ABI 槽位
+    public static byte[] EncodeBool(bool val) {
+        byte[] slot = new byte[32];
+        slot[31] = (byte)(val ? 1 : 0);
+        return slot;
+    }
+
+    // 将 long 整数编码为 32 字节大端序无符号整数（高位补零）
+    public static byte[] EncodeUint256(long val) {
+        byte[] slot = new byte[32];
+        for (int i = 0; i < 8; i = i + 1) {
+            slot[31 - i] = (byte)((val >> (i * 8)) & 255);
+        }
+        return slot;
+    }
+
+    // 将 BigInt 大整数编码为 32 字节大端序槽位
+    public static byte[] EncodeUint256(BigInt val) {
+        byte[] slot = new byte[32];
+        if (val != null) {
+            byte[] be = val.ToBytesBE(32);
+            for (int i = 0; i < 32; i = i + 1) {
+                slot[i] = be[i];
+            }
+        }
+        return slot;
+    }
+
+    // 快速构造 ERC-20 transfer(address,uint256) 的 68 字节 calldata
+    public static byte[] EncodeErc20Transfer(Address recipient, BigInt amount) {
+        byte[] calldata = new byte[68]; // 4 字节 selector + 32 字节 address + 32 字节 uint256
+        byte[] sel = GetFunctionSelector("transfer(address,uint256)");
+        for (int i = 0; i < 4; i = i + 1) { calldata[i] = sel[i]; }
+
+        byte[] addrSlot = EncodeAddress(recipient);
+        for (int i = 0; i < 32; i = i + 1) { calldata[4 + i] = addrSlot[i]; }
+
+        byte[] amountSlot = EncodeUint256(amount);
+        for (int i = 0; i < 32; i = i + 1) { calldata[36 + i] = amountSlot[i]; }
+
+        return calldata;
+    }
+
+    // 快速构造 ERC-20 balanceOf(address) 的 36 字节 calldata
+    public static byte[] EncodeErc20BalanceOf(Address owner) {
+        byte[] calldata = new byte[36]; // 4 字节 selector + 32 字节 address
+        byte[] sel = GetFunctionSelector("balanceOf(address)");
+        for (int i = 0; i < 4; i = i + 1) { calldata[i] = sel[i]; }
+
+        byte[] addrSlot = EncodeAddress(owner);
+        for (int i = 0; i < 32; i = i + 1) { calldata[4 + i] = addrSlot[i]; }
+
+        return calldata;
+    }
+
+    // 辅助解析输入十六进制字符串为字节数组
+    private static byte[] cleanHexToBytes(string hex) {
+        if (hex == null) { return new byte[0]; }
+        string clean = hex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length == 0 || (clean.Length % 2) != 0) {
+            return new byte[0];
+        }
+        return Hex.Decode(clean, clean.Length);
+    }
+
+    // 从 32 字节槽位解码 uint256 大整数
+    public static BigInt DecodeUint256(byte[] data, int offset) {
+        if (data == null || data.Length < offset + 32) {
+            return BigInt.zero();
+        }
+        byte[] slot = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            slot[i] = data[offset + i];
+        }
+        return BigInt.FromBytesBE(slot, 32);
+    }
+
+    public static BigInt DecodeUint256(string hex) {
+        return DecodeUint256(cleanHexToBytes(hex), 0);
+    }
+
+    // 从 32 字节槽位解码以太坊地址（取低 20 字节）
+    public static Address DecodeAddress(byte[] data, int offset) {
+        if (data == null || data.Length < offset + 32) {
+            return Address.Zero;
+        }
+        byte[] raw = new byte[20];
+        for (int i = 0; i < 20; i = i + 1) {
+            raw[i] = data[offset + 12 + i];
+        }
+        return new Address(raw);
+    }
+
+    public static Address DecodeAddress(string hex) {
+        return DecodeAddress(cleanHexToBytes(hex), 0);
+    }
+
+    // 从 32 字节槽位解码布尔值
+    public static bool DecodeBool(byte[] data, int offset) {
+        if (data == null || data.Length < offset + 32) {
+            return false;
+        }
+        return data[offset + 31] != 0;
+    }
+
+    public static bool DecodeBool(string hex) {
+        return DecodeBool(cleanHexToBytes(hex), 0);
+    }
+
+    // 解码 Solidity 动态字符串（ABI 格式: 相对偏移量 -> 长度 -> 实际 UTF-8 字节）
+    public static string DecodeString(byte[] data, int offset) {
+        if (data == null || data.Length < offset + 64) {
+            return "";
+        }
+        // 读取相对偏移量（通常为 32）
+        int relOffset = 0;
+        for (int i = 0; i < 4; i = i + 1) {
+            relOffset = (relOffset << 8) | (data[offset + 28 + i] & 255);
+        }
+        int lenSlotOffset = offset + relOffset;
+        if (data.Length < lenSlotOffset + 32) {
+            return "";
+        }
+
+        // 读取字符串字节长度
+        int strLen = 0;
+        for (int i = 0; i < 4; i = i + 1) {
+            strLen = (strLen << 8) | (data[lenSlotOffset + 28 + i] & 255);
+        }
+        if (strLen <= 0 || data.Length < lenSlotOffset + 32 + strLen) {
+            return "";
+        }
+
+        // 截取字符串实际字节
+        byte[] strBytes = new byte[strLen];
+        for (int i = 0; i < strLen; i = i + 1) {
+            strBytes[i] = data[lenSlotOffset + 32 + i];
+        }
+        return strBytes;
+    }
+
+    public static string DecodeString(string hex) {
+        return DecodeString(cleanHexToBytes(hex), 0);
+    }
+}

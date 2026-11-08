@@ -13,7 +13,7 @@ S3 网关）。纯 Zan 实现，零原生依赖。
 ## 用法
 
 ```zan
-using System.Oss;
+using Cloud.Oss;
 
 OssConfig cfg = new OssConfig();
 cfg.driver = "aliyun_oss";          // aliyun_oss / tencent_cos / s3

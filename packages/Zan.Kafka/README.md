@@ -14,7 +14,7 @@ Pure Zan asynchronous Apache Kafka wire protocol client.
 
 ```zan
 using System;
-using Zan.Kafka;
+using Messaging.Kafka;
 
 class Program {
     static async void Main() {

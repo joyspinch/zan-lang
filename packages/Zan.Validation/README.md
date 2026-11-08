@@ -1,30 +1,30 @@
-# Zan.Validation
+# Zan.Data.Validation
 
-声明式校验（纯 Zan，无原生依赖）。`using System.Validation;` 按需拉入，
+声明式校验（纯 Zan，无原生依赖）。`using Data.Validation;` 按需拉入，
 命名空间保留零破坏。
 
-C# 参考 FluentValidation：规则链 + 错误聚合。**取值器在编译期绑定，
+C# 参考 FluentData.Validation：规则链 + 错误聚合。**取值器在编译期绑定，
 运行期零反射**——属性改名编译期就报错。
 
 ## 文件
 
 | 文件 | 内容 |
 |---|---|
-| `ValidationPlan.zan` | 引擎：规则链（`ValidationPlan<T>`）、规则声明、错误聚合、嵌套校验 |
-| `ValidationResult.zan` | 结果：`ValidationResult`（失败项列表 / 字典视图 / 文本视图 / JSON 视图） |
-| `ValidationFailure.zan` | 单条失败：`ValidationFailure`（property / message / code / attemptedValue） |
-| `ValidationContext.zan` | 上下文：`ValidationContext`（首错即停、属性名前缀） |
-| `ValidationException.zan` | 失败即抛：`ValidationException`（携带原始结果） |
-| `ValidationText.zan` | 文本原语：`ValidationText`（空/空白判定、通配符匹配） |
-| `Validation.zan` | 门面：`Validation.Ok/Ensure/Validate` |
+| `Data.ValidationPlan.zan` | 引擎：规则链（`Data.ValidationPlan<T>`）、规则声明、错误聚合、嵌套校验 |
+| `Data.ValidationResult.zan` | 结果：`Data.ValidationResult`（失败项列表 / 字典视图 / 文本视图 / JSON 视图） |
+| `Data.ValidationFailure.zan` | 单条失败：`Data.ValidationFailure`（property / message / code / attemptedValue） |
+| `Data.ValidationContext.zan` | 上下文：`Data.ValidationContext`（首错即停、属性名前缀） |
+| `Data.ValidationException.zan` | 失败即抛：`Data.ValidationException`（携带原始结果） |
+| `Data.ValidationText.zan` | 文本原语：`Data.ValidationText`（空/空白判定、通配符匹配） |
+| `Data.Validation.zan` | 门面：`Data.Validation.Ok/Ensure/Validate` |
 
 ## 用法
 
-继承 `ValidationPlan<T>` 就是校验器：
+继承 `Data.ValidationPlan<T>` 就是校验器：
 
 ```zan
 using System;
-using System.Validation;
+using Data.Validation;
 
 public class Signup {
     public string userName;
@@ -32,7 +32,7 @@ public class Signup {
     public int age;
 }
 
-public class SignupValidator : ValidationPlan<Signup> {
+public class SignupValidator : Data.ValidationPlan<Signup> {
     public SignupValidator() {
         this.NotEmpty("userName", s => s.userName, "is required");
         this.MaxLength("userName", s => s.userName, 16, "is too long");
@@ -42,7 +42,7 @@ public class SignupValidator : ValidationPlan<Signup> {
     }
 }
 
-ValidationResult r = new SignupValidator().Validate(signup);
+Data.ValidationResult r = new SignupValidator().Validate(signup);
 if (!r.IsValid) {
     Console.WriteLine(r.ToJson());
     // {"valid":false,"errors":[{"property":"userName","message":"is required","code":"NotEmpty"}]}
@@ -52,9 +52,9 @@ if (!r.IsValid) {
 规则集也能独立使用（跨校验器复用）：
 
 ```zan
-ValidationPlan<Signup> plan = new ValidationPlan<Signup>();
+Data.ValidationPlan<Signup> plan = new Data.ValidationPlan<Signup>();
 plan.NotEmpty("userName", s => s.userName, "is required");
-ValidationResult r = Validation.Validate(plan, signup);
+Data.ValidationResult r = Data.Validation.Validate(plan, signup);
 ```
 
 ## 规则一览
@@ -84,9 +84,9 @@ ValidationResult r = Validation.Validate(plan, signup);
 ## 上下文
 
 ```zan
-ValidationContext fast = new ValidationContext().FailFast();          // 首错即停
-ValidationContext pre  = new ValidationContext().WithPrefix("signup"); // 属性名前缀
-ValidationResult r = validator.ValidateWith(signup, fast);
+Data.ValidationContext fast = new Data.ValidationContext().FailFast();          // 首错即停
+Data.ValidationContext pre  = new Data.ValidationContext().WithPrefix("signup"); // 属性名前缀
+Data.ValidationResult r = validator.ValidateWith(signup, fast);
 ```
 
 ## 约束与已知边界
@@ -96,5 +96,5 @@ ValidationResult r = validator.ValidateWith(signup, fast);
 - 长度类规则按**字节**计（与 `string.Length` 一致）；需要按码点计用
   `RuneCount` 自行判断。
 - 依赖型泛型基类（`class V<T> : Plan<T>`）目前编译器尚未支持特化，因此
-  校验器直接继承 `ValidationPlan<T>`，不再多包一层 `AbstractValidator<T>`。
+  校验器直接继承 `Data.ValidationPlan<T>`，不再多包一层 `AbstractValidator<T>`。
   详见仓库 `TASKS.md`。

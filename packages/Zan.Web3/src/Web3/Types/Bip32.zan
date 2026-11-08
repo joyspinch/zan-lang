@@ -1,0 +1,229 @@
+using System;
+using System.Security.Cryptography;
+using Web3.Types;
+using Web3.Encoding;
+
+namespace Web3.Types;
+
+// BIP-32 扩展密钥节点（私钥与链码）
+public class ExtendedKey {
+    public byte[] Key;          // 32 字节私钥
+    public byte[] ChainCode;    // 32 字节链码
+    public int Depth;           // 派生深度
+    public int ChildNumber;     // 子节点编号
+
+    public ExtendedKey(byte[] key32, byte[] chainCode32, int depth, int childNumber) {
+        Key = key32;
+        ChainCode = chainCode32;
+        Depth = depth;
+        ChildNumber = childNumber;
+    }
+}
+
+// BIP-32 分层确定性分级派生实现 (Hierarchical Deterministic Wallets)
+public class Bip32 {
+
+    // Secp256k1 椭圆曲线阶 n:
+    // 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    private static int[] CurveOrderN = new int[32] {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+        0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+        0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41
+    };
+
+    // 纯 Zan 纯字节数组实现 HMAC-SHA512（分组大小 128 字节，输出 64 字节）
+    public static byte[] HmacSha512(byte[] key, int keyLen, byte[] data, int dataLen) {
+        byte[] k0 = new byte[128];
+        if (keyLen > 128) {
+            string kStr = key;
+            byte[] hk = Sha512.Hash(kStr, keyLen);
+            for (int i = 0; i < 64; i = i + 1) {
+                k0[i] = (byte)(hk[i] & 255);
+            }
+        } else {
+            for (int i = 0; i < keyLen; i = i + 1) {
+                k0[i] = (byte)(key[i] & 255);
+            }
+        }
+
+        // inner = Hash( (K0 ^ 0x36) || data )
+        byte[] innerBuf = new byte[128 + dataLen];
+        for (int i = 0; i < 128; i = i + 1) {
+            innerBuf[i] = (byte)((k0[i] & 255) ^ 0x36);
+        }
+        for (int i = 0; i < dataLen; i = i + 1) {
+            innerBuf[128 + i] = data[i];
+        }
+        string innerStr = innerBuf;
+        byte[] innerHash = Sha512.Hash(innerStr, 128 + dataLen);
+
+        // outer = Hash( (K0 ^ 0x5c) || innerHash )
+        byte[] outerBuf = new byte[128 + 64];
+        for (int i = 0; i < 128; i = i + 1) {
+            outerBuf[i] = (byte)((k0[i] & 255) ^ 0x5c);
+        }
+        for (int i = 0; i < 64; i = i + 1) {
+            outerBuf[128 + i] = innerHash[i];
+        }
+        string outerStr = outerBuf;
+        return Sha512.Hash(outerStr, 128 + 64);
+    }
+
+    // 从助记词派生的 Seed（例如 64 字节）构建 BIP-32 根节点
+    public static ExtendedKey FromSeed(byte[] seed) {
+        if (seed == null || seed.Length < 16) { return null; }
+        byte[] btcSeedKey = "Bitcoin seed".ToBytes();
+        byte[] iHash = HmacSha512(btcSeedKey, btcSeedKey.Length, seed, seed.Length);
+        if (iHash == null || iHash.Length < 64) { return null; }
+
+        byte[] masterPriv = new byte[32];
+        byte[] masterChain = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            masterPriv[i] = (byte)(iHash[i] & 255);
+            masterChain[i] = (byte)(iHash[32 + i] & 255);
+        }
+
+        return new ExtendedKey(masterPriv, masterChain, 0, 0);
+    }
+
+    // 模 Secp256k1 曲线阶 n 的 256 位大数加法: res = (a + b) mod n
+    private static byte[] addModN(byte[] a, byte[] b) {
+        byte[] sum = new byte[32];
+        int carry = 0;
+        for (int i = 31; i >= 0; i = i - 1) {
+            int s = (a[i] & 255) + (b[i] & 255) + carry;
+            sum[i] = (byte)(s & 255);
+            carry = s >> 8;
+        }
+
+        // 检查 sum 是否 >= n
+        bool gte = false;
+        if (carry > 0) {
+            gte = true;
+        } else {
+            for (int i = 0; i < 32; i = i + 1) {
+                int sv = sum[i] & 255;
+                int nv = CurveOrderN[i];
+                if (sv > nv) { gte = true; break; }
+                if (sv < nv) { gte = false; break; }
+            }
+        }
+
+        if (gte) {
+            // sum = sum - n
+            int borrow = 0;
+            for (int i = 31; i >= 0; i = i - 1) {
+                int sub = (sum[i] & 255) - CurveOrderN[i] - borrow;
+                if (sub < 0) {
+                    sub = sub + 256;
+                    borrow = 1;
+                } else {
+                    borrow = 0;
+                }
+                sum[i] = (byte)sub;
+            }
+        }
+
+        return sum;
+    }
+
+    // 派生子密钥节点 (CKDpriv)
+    // index: 子索引
+    // hardened: 是否强化派生 (i >= 0x80000000)
+    public static ExtendedKey DeriveChild(ExtendedKey parent, int index, bool hardened) {
+        if (parent == null || parent.Key == null || parent.ChainCode == null) {
+            return null;
+        }
+
+        byte[] data;
+        int dataLen;
+
+        long fullIndex = (long)index;
+        if (hardened) {
+            fullIndex = fullIndex | 0x80000000L;
+            // 强化派生: 0x00 || parentPrivKey[32] || index[4] (大端序)
+            data = new byte[37];
+            data[0] = 0;
+            for (int i = 0; i < 32; i = i + 1) {
+                data[1 + i] = parent.Key[i];
+            }
+            data[33] = (byte)((fullIndex >> 24) & 255);
+            data[34] = (byte)((fullIndex >> 16) & 255);
+            data[35] = (byte)((fullIndex >> 8) & 255);
+            data[36] = (byte)(fullIndex & 255);
+            dataLen = 37;
+        } else {
+            // 正常派生: parentPubKeyCompressed[33] || index[4] (大端序)
+            byte[] pubRaw64 = Secp256k1.GetPublicKeyRaw(parent.Key);
+            if (pubRaw64 == null) { return null; }
+            byte[] pubComp = new byte[33];
+            int lastY = pubRaw64[63] & 255;
+            pubComp[0] = (byte)((lastY & 1) != 0 ? 0x03 : 0x02);
+            for (int i = 0; i < 32; i = i + 1) {
+                pubComp[1 + i] = pubRaw64[i];
+            }
+
+            data = new byte[37];
+            for (int i = 0; i < 33; i = i + 1) {
+                data[i] = pubComp[i];
+            }
+            data[33] = (byte)((fullIndex >> 24) & 255);
+            data[34] = (byte)((fullIndex >> 16) & 255);
+            data[35] = (byte)((fullIndex >> 8) & 255);
+            data[36] = (byte)(fullIndex & 255);
+            dataLen = 37;
+        }
+
+        byte[] iHash = HmacSha512(parent.ChainCode, 32, data, dataLen);
+        if (iHash == null || iHash.Length < 64) { return null; }
+
+        byte[] il = new byte[32];
+        byte[] ir = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            il[i] = (byte)(iHash[i] & 255);
+            ir[i] = (byte)(iHash[32 + i] & 255);
+        }
+
+        // childKey = (il + parent.Key) mod n
+        byte[] childKey = addModN(il, parent.Key);
+
+        return new ExtendedKey(childKey, ir, parent.Depth + 1, (int)fullIndex);
+    }
+
+    // 根据 BIP-32 规范字符串路径从根节点逐级派生（如 "m/44'/60'/0'/0/0"）
+    public static ExtendedKey DerivePath(ExtendedKey root, string path) {
+        if (root == null || path == null) { return null; }
+        string p = path.Trim();
+        if (p.StartsWith("m/") || p.StartsWith("M/")) {
+            p = p.Substring(2);
+        }
+
+        List<string> segments = p.Split('/');
+        ExtendedKey curr = root;
+
+        for (int i = 0; i < segments.Count; i = i + 1) {
+            string seg = segments[i].Trim();
+            if (seg.Length == 0) { continue; }
+
+            bool hardened = false;
+            if (seg.EndsWith("'") || seg.EndsWith("h") || seg.EndsWith("H")) {
+                hardened = true;
+                seg = seg.Substring(0, seg.Length - 1);
+            }
+
+            int index = 0;
+            for (int j = 0; j < seg.Length; j = j + 1) {
+                int c = seg[j] - 48;
+                if (c >= 0 && c <= 9) {
+                    index = index * 10 + c;
+                }
+            }
+
+            curr = DeriveChild(curr, index, hardened);
+            if (curr == null) { return null; }
+        }
+
+        return curr;
+    }
+}

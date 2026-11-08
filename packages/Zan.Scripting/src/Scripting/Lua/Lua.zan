@@ -1,0 +1,872 @@
+using System;
+using System.Diagnostics;
+namespace Scripting.Lua;
+
+// Zan 的进程内 Lua 嵌入（Lua 5.3 / 5.4）。
+// 运行时定位 Lua 动态库，并通过 <see cref="Interop"/>
+// （LoadLibrary/GetProcAddress）在运行期解析所有入口点，因此
+// 从未用到 <c>System.Scripting</c> 的程序不会链接 Lua；
+// 没有 Lua 的机器只会得到 <see cref="Lua.IsAvailable"/> == false，
+// 而不是加载失败。这与其他可选原生依赖的处理方式一致。
+// Lua.Initialize();
+// // 直接调用，自动封送 double/long/string：
+// // 脚本与表达式：
+// Lua.Exec("answer = 6 * 7");
+// // 表既是数组也是字典：
+// LuaValue t = Lua.Eval("{1, 4, 9}");
+// t[3] = Lua.FromLong(99L);
+// p["lang"] = "Lua";
+// 回调反向运行，通过 <see cref="Lua.RegisterFunction"/>：
+// 静态、非捕获的 Zan 方法被包装为 lua_CFunction 并发布为全局
+// 名字，使 Lua 代码可以调用 Zan 代码。
+// 生命周期：Lua 是栈式 API，而 Zan 的值要活过单次调用，所以
+// <see cref="LuaValue"/> 把值存进 Lua 注册表（registry）的一个整数
+// 槽位里，并在 ARC 回收包装时把该槽位置 nil——于是 Lua 的 GC
+// 恰好在最后一个 Zan 引用消失后回收该值。所有 API 都在返回前
+// 把栈顶恢复到进入时的高度，因此 <see cref="Lua.Top"/> 在成对
+// 使用下始终回到 0。
+public class Lua {
+    // Lua 的伪索引：LUA_REGISTRYINDEX = -LUAI_MAXSTACK - 1000
+    // （5.2 起 LUAI_MAXSTACK 为 1000000，5.3/5.4 相同）。
+    public static int REGISTRY = 0 - 1001000;
+
+    // lua_type 的返回值。
+    public static int TNIL = 0;
+    public static int TBOOLEAN = 1;
+    public static int TNUMBER = 3;
+    public static int TSTRING = 4;
+    public static int TTABLE = 5;
+    public static int TFUNCTION = 6;
+
+    // ---- 已解析的符号地址（TryResolve 前为 0）--------------------
+    public static nint mod;
+    public static nint state;
+    public static nint addr_newstate;
+    public static nint addr_openlibs;
+    public static nint addr_close;
+    public static nint addr_loadstring;
+    public static nint addr_loadbufferx;
+    public static nint addr_pcallk;
+    public static nint addr_gettop;
+    public static nint addr_settop;
+    public static nint addr_type;
+    public static nint addr_toboolean;
+    public static nint addr_tonumberx;
+    public static nint addr_tointegerx;
+    public static nint addr_tolstring;
+    public static nint addr_pushnumber;
+    public static nint addr_pushinteger;
+    public static nint addr_pushstring;
+    public static nint addr_pushboolean;
+    public static nint addr_pushnil;
+    public static nint addr_pushvalue;
+    public static nint addr_pushcclosure;
+    public static nint addr_getglobal;
+    public static nint addr_setglobal;
+    public static nint addr_getfield;
+    public static nint addr_setfield;
+    public static nint addr_geti;
+    public static nint addr_seti;
+    public static nint addr_rawgeti;
+    public static nint addr_rawseti;
+    public static nint addr_rawlen;
+    public static nint addr_next;
+    public static nint addr_createtable;
+    public static nint addr_newthread;
+    public static nint addr_resume;
+    public static nint addr_yieldk;
+    public static nint addr_status;
+    public static nint addr_gc;
+
+    // 协程与执行状态码
+    public static int LUA_OK = 0;
+    public static int LUA_YIELD = 1;
+    public static int LUA_ERRRUN = 2;
+    public static int LUA_ERRSYNTAX = 3;
+    public static int LUA_ERRMEM = 4;
+    public static int LUA_ERRERR = 5;
+
+    // GC 控制常数
+    public static int LUA_GCSTOP = 0;
+    public static int LUA_GCRESTART = 1;
+    public static int LUA_GCCOLLECT = 2;
+    public static int LUA_GCCOUNT = 3;
+    public static int LUA_GCCOUNTB = 4;
+    public static int LUA_GCSTEP = 5;
+    public static int LUA_GCSETPAUSE = 6;
+    public static int LUA_GCSETSTEPMUL = 7;
+
+    public static bool resolved;
+    public static bool initialized;
+    // 注册表槽位分配器。1 和 2 被 Lua 自己占用
+    // （LUA_RIDX_MAINTHREAD / LUA_RIDX_GLOBALS），所以从高处开始。
+    public static long nextSlot;
+
+    // 能加载可用的 Lua 动态库时为 true。
+    public static bool IsAvailable() {
+        return Lua.TryResolve();
+    }
+
+    // <see cref="Initialize"/> 运行过且状态仍存活时为 true。
+    public static bool IsInitialized() {
+        return Lua.initialized && Lua.state != 0;
+    }
+
+    // 加载可用的 Lua 动态库、创建状态并打开标准库。幂等。
+    // 没有 Lua 运行时则抛出异常。
+    public static void Initialize() {
+        if (Lua.initialized) { return; }
+        if (!Lua.TryResolve()) {
+            throw new InvalidOperationException(
+                "Lua 运行时不可用:未找到 lua54/lua53 动态库(可调用 Lua.LoadPath 指定路径)");
+        }
+        Lua.OpenState();
+    }
+
+    // 加载指定的 Lua 动态库（如 "C:/lua/lua54.dll"）并初始化状态。
+    // Lua 不在 PATH 或库搜索路径中时，请调用它而不是
+    public static void LoadPath(string libPath) {
+        Lua.Finalize();
+        Lua.mod = Interop.Load(libPath);
+        if (Lua.mod == 0) {
+            throw new InvalidOperationException("无法加载 Lua 动态库: " + libPath);
+        }
+        if (!Lua.ResolveSymbols()) {
+            throw new InvalidOperationException("Lua 动态库缺少所需导出符号: " + libPath);
+        }
+        Lua.resolved = true;
+        Lua.OpenState();
+    }
+
+    // 关闭 Lua 状态并释放运行时库。
+    public static void Finalize() {
+        if (Lua.state != 0 && Lua.addr_close != 0) {
+            LuaVoid1Fn close = (LuaVoid1Fn)Lua.addr_close;
+            close(Lua.state);
+        }
+        Lua.state = 0;
+        Lua.initialized = false;
+        Lua.FreeModule();
+    }
+
+    // 收紧脚本环境（沙箱）：移除可逃逸宿主的全局入口——
+    // <c>os.execute/remove/rename/exit</c>（进程与文件系统）、<c>io</c>
+    // 整库、<c>dofile/loadfile</c>（文件加载）、<c>require/package</c>
+    // （模块加载同样落盘）、<c>load</c>（预编译 chunk 是 Lua 字节码
+    // 逃逸的惯用门：伪造的字节码可绕过语言级不变式直取 C 栈，沙箱
+    // 内不得加载任何预编译 chunk，文本片段除外也无必要——不可信
+    // 脚本拼源码再加载的场景应改由宿主 <see cref="Exec"/> 承担）。
+    // 宿主在 <see cref="Initialize"/> 之后对不可信脚本调用一次即可；
+    // 幂等。保留 <c>os.time/clock/date/getenv</c>、
+    // <c>math/string/table</c> 等纯计算库。
+    public static void Sandbox() {
+        Lua.EnsureReady();
+        // 用受信设置脚本实现，零新 extern；置 nil 等价于不存在
+        // （Lua 取不存在的全局同样得 nil）。宿主自己的 Exec/ExecBytes
+        // 走 C API（luaL_loadstring / luaL_loadbufferx），不经全局 load，
+        // 置 nil 不影响宿主装载。
+        Lua.Exec("os.execute = nil; os.remove = nil; os.rename = nil;" +
+                 " os.exit = nil\n" +
+                 "io = nil\n" +
+                 "dofile = nil; loadfile = nil; load = nil\n" +
+                 "require = nil; package = nil\n");
+    }
+
+    // 底层 lua_State*（未初始化时为 0）。
+    public static nint State() {
+        return Lua.state;
+    }
+
+    // 当前 Lua 栈高度；成对使用的 API 之后应为 0。
+    public static int Top() {
+        if (Lua.state == 0) { return 0; }
+        LuaIntFn f = (LuaIntFn)Lua.addr_gettop;
+        return f(Lua.state);
+    }
+
+    // 执行一段 Lua 代码（编译或运行出错时抛出异常）。
+    public static void Exec(string code) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        Lua.Load(code);
+        Lua.Protected(0, 0, mark, code);
+        Lua.SetTop(mark);
+    }
+
+    // 执行一段字节缓冲里的 Lua chunk（源码或 <c>luac</c> 字节码，
+    // 见 <see cref="LoadBytes"/>）。编译失败或运行出错时抛出异常。
+    public static void ExecBytes(byte[] chunk, string chunkName) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        Lua.LoadBytes(chunk, chunkName);
+        Lua.Protected(0, 0, mark, chunkName);
+        Lua.SetTop(mark);
+    }
+
+    // 求值一个 Lua 表达式并返回结果，如
+    // <c>Lua.Eval("{1, 4, 9}")</c>；表达式可引用
+    // <see cref="Exec"/> 定义的全局名字。
+    public static LuaValue Eval(string code) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        Lua.Load("return " + code);
+        Lua.Protected(0, 1, mark, code);
+        LuaValue v = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        return v;
+    }
+
+    // 读取全局名字（不存在则为 nil 值）。
+    public static LuaValue GetGlobal(string name) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        LuaGetGlobalFn g = (LuaGetGlobalFn)Lua.addr_getglobal;
+        int _t = g(Lua.state, name);
+        LuaValue v = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        return v;
+    }
+
+    // 写入全局名字，使脚本可以读到它。
+    public static void SetGlobal(string name, LuaValue v) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        v.Push();
+        LuaVoidStrFn s = (LuaVoidStrFn)Lua.addr_setglobal;
+        s(Lua.state, name);  // 弹出值
+        Lua.SetTop(mark);
+    }
+
+    // 以任意数量的参数调用 Lua 函数。名字可以是点分路径
+    // （<c>"math.floor"</c>、<c>"string.upper"</c>）：第一段从全局表取，
+    // 其余逐层取字段。
+    public static LuaValue Call(string name, params LuaValue[] args) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        Lua.PushPath(name, mark);
+        for (int i = 0; i < args.Length; i = i + 1) {
+            args[i].Push();
+        }
+        Lua.Protected(args.Length, 1, mark, name);
+        LuaValue v = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        return v;
+    }
+
+    // Call + double 封送：<c>Lua.CallD("math.floor", 22.3)</c>。
+    public static double CallD(string name, params double[] args) {
+        LuaValue[] vs = new LuaValue[args.Length];
+        for (int i = 0; i < args.Length; i = i + 1) {
+            vs[i] = Lua.FromDouble(args[i]);
+        }
+        return Lua.Call(name, vs).ToDouble();
+    }
+
+    // Call + long 封送：<c>Lua.CallL("math.max", 3L, 7L)</c>。
+    public static long CallL(string name, params long[] args) {
+        LuaValue[] vs = new LuaValue[args.Length];
+        for (int i = 0; i < args.Length; i = i + 1) {
+            vs[i] = Lua.FromLong(args[i]);
+        }
+        return Lua.Call(name, vs).ToLong();
+    }
+
+    // Call + string 封送：<c>Lua.CallS("string.upper", "zan")</c>。
+    public static string CallS(string name, params string[] args) {
+        LuaValue[] vs = new LuaValue[args.Length];
+        for (int i = 0; i < args.Length; i = i + 1) {
+            vs[i] = Lua.FromStr(args[i]);
+        }
+        return Lua.Call(name, vs).ToStr();
+    }
+
+    // ---- 协程与异步执行支持 -------------------------------------
+
+    // 创建一个新的 Lua 协程（线程）。
+    // 把协程对象保存在注册表中防止被 Lua GC 意外回收，并返回协程的 lua_State 指针与槽位号。
+    public static nint NewThread(out long threadSlot) {
+        Lua.EnsureReady();
+        if (Lua.addr_newthread == 0) {
+            throw new InvalidOperationException("当前 Lua 动态库缺少 lua_newthread 导出符号");
+        }
+        LuaNewThreadFn f = (LuaNewThreadFn)Lua.addr_newthread;
+        nint co = f(Lua.state);
+        if (co == 0) {
+            throw new InvalidOperationException("创建 Lua 协程线程失败(内存不足)");
+        }
+        threadSlot = Lua.StoreTop(); // 栈顶是新的 thread，弹出并存入注册表
+        return co;
+    }
+
+    // 恢复协程的执行（非阻塞单步驱动）。
+    // 返回状态码：LUA_OK(0)=运行结束，LUA_YIELD(1)=挂起等待下一次恢复，其它=发生错误。
+    public static int ResumeThread(nint co, int nargs, out int nresults) {
+        nresults = 0;
+        if (Lua.addr_resume == 0 || co == 0) { return Lua.LUA_ERRRUN; }
+        LuaResumeFn f = (LuaResumeFn)Lua.addr_resume;
+        nint resBuf = NativeMemory.Alloc(4);
+        try {
+            int rc = f(co, Lua.state, nargs, resBuf);
+            Span<byte> s = new Span<byte>(resBuf, 4);
+            nresults = (int)s[0] | ((int)s[1] << 8) | ((int)s[2] << 16) | ((int)s[3] << 24);
+            return rc;
+        } finally {
+            NativeMemory.Free(resBuf);
+        }
+    }
+
+    // 查询协程当前状态（LUA_OK=0, LUA_YIELD=1 等）。
+    public static int Status(nint co) {
+        if (Lua.addr_status == 0 || co == 0) { return Lua.LUA_OK; }
+        LuaStatusFn f = (LuaStatusFn)Lua.addr_status;
+        return f(co);
+    }
+
+    // 在 C/Zan 回调中挂起当前协程（出让执行权，非阻塞让出主线程）。
+    // 只能在协程环境内调用，返回值必须作为 lua_CFunction 的返回值返回给 Lua。
+    public static int Yield(nint L, int nresults) {
+        if (Lua.addr_yieldk == 0) {
+            throw new InvalidOperationException("当前 Lua 动态库缺少 lua_yieldk 导出符号");
+        }
+        LuaYieldKFn f = (LuaYieldKFn)Lua.addr_yieldk;
+        return f(L, nresults, 0, 0);
+    }
+
+    // 步进式增量垃圾回收（平摊每帧 GC 预算，彻底避免卡帧/GC Spike）。
+    // stepKBytes: 本次步进处理的内存量（KB），为 0 时根据 Lua 内部步长推进一步。
+    public static int StepGC(int stepKBytes) {
+        if (Lua.addr_gc == 0 || Lua.state == 0) { return 0; }
+        LuaGcFn f = (LuaGcFn)Lua.addr_gc;
+        return f(Lua.state, Lua.LUA_GCSTEP, stepKBytes);
+    }
+
+    // 受保护的函数调用：执行出错时不抛出异常，而是安全返回 false 并附带错误信息。
+    // 非常适合游戏主循环、NPC 交互等不能被单个脚本语法错误搞挂的场景。
+    public static bool TryCall(string name, out string error, params LuaValue[] args) {
+        error = "";
+        try {
+            Lua.EnsureReady();
+            int mark = Lua.Top();
+            Lua.PushPath(name, mark);
+            for (int i = 0; i < args.Length; i = i + 1) {
+                args[i].Push();
+            }
+            LuaPcallFn f = (LuaPcallFn)Lua.addr_pcallk;
+            int rc = f(Lua.state, args.Length, 1, 0, 0, 0);
+            if (rc != 0) {
+                error = Lua.TopString();
+                Lua.SetTop(mark);
+                return false;
+            }
+            Lua.SetTop(mark);
+            return true;
+        } catch (Exception ex) {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    // 内存解密并执行 Lua chunk（发布安全方案）。
+    // 密文在内存中原地解密，执行完成后立即清零缓冲区，杜绝明文落盘被抓包。
+    public static void ExecEncrypted(byte[] cipherBytes, string key, string chunkName) {
+        if (cipherBytes == null || cipherBytes.Length == 0) { return; }
+        byte[] plain = new byte[cipherBytes.Length];
+        int klen = key.Length;
+        if (klen == 0) {
+            for (int i = 0; i < cipherBytes.Length; i = i + 1) { plain[i] = cipherBytes[i]; }
+        } else {
+            // 对称流式密钥异或（兼顾极致加载速度与内存不落地安全）
+            for (int i = 0; i < cipherBytes.Length; i = i + 1) {
+                plain[i] = (byte)(cipherBytes[i] ^ (byte)key[i % klen]);
+            }
+        }
+        Lua.ExecBytes(plain, chunkName);
+    }
+
+    // 把静态 Zan 方法发布为 Lua 全局函数。方法必须是
+    // lua_CFunction 形式：
+    // double a = Lua.ArgDouble(L, 1);
+    // }
+    // 且不能捕获状态（Zan 委托为非捕获型），与 Input.Hook、
+    // Thread.Start 的回调一致。Lua 未就绪时返回 false。
+    public static bool RegisterFunction(string name, LuaCFunction fn) {
+        if (!Lua.TryResolve()) { return false; }
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        LuaPushCClosureFn push = (LuaPushCClosureFn)Lua.addr_pushcclosure;
+        push(Lua.state, (nint)fn, 0);
+        LuaVoidStrFn s = (LuaVoidStrFn)Lua.addr_setglobal;
+        s(Lua.state, name);
+        Lua.SetTop(mark);
+        return true;
+    }
+
+    // ---- 值封送：Zan -> Lua ------------------------------------
+
+    // nil 值。
+    public static LuaValue Nil() {
+        return LuaValue.Wrap(0);
+    }
+
+    // 把 double 包装为 Lua number。
+    public static LuaValue FromDouble(double v) {
+        Lua.EnsureReady();
+        LuaPushNumFn f = (LuaPushNumFn)Lua.addr_pushnumber;
+        f(Lua.state, v);
+        return LuaValue.CaptureTop();
+    }
+
+    // 把 64 位整数包装为 Lua integer。
+    public static LuaValue FromLong(long v) {
+        Lua.EnsureReady();
+        LuaPushIntFn f = (LuaPushIntFn)Lua.addr_pushinteger;
+        f(Lua.state, v);
+        return LuaValue.CaptureTop();
+    }
+
+    // 把字符串包装为 Lua string（UTF-8 原样传递）。
+    public static LuaValue FromStr(string s) {
+        Lua.EnsureReady();
+        LuaPushStrFn f = (LuaPushStrFn)Lua.addr_pushstring;
+        nint _p = f(Lua.state, s);
+        return LuaValue.CaptureTop();
+    }
+
+    // 把 bool 包装为 Lua boolean。
+    public static LuaValue FromBool(bool b) {
+        Lua.EnsureReady();
+        LuaVoidIntFn f = (LuaVoidIntFn)Lua.addr_pushboolean;
+        int v = 0;
+        if (b) { v = 1; }
+        f(Lua.state, v);
+        return LuaValue.CaptureTop();
+    }
+
+    // 把 LuaValue 列表包装为 Lua 数组表（下标从 1 起）。
+    public static LuaValue FromList(List<LuaValue> items) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        LuaCreateTableFn ct = (LuaCreateTableFn)Lua.addr_createtable;
+        ct(Lua.state, items.Count, 0);
+        LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            items[i].Push();
+            si(Lua.state, 0 - 2, (long)(i + 1));  // 弹出值
+        }
+        LuaValue t = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        return t;
+    }
+
+    // 把 double 列表包装为 Lua 数组表。
+    public static LuaValue FromListDouble(List<double> items) {
+        List<LuaValue> vs = new List<LuaValue>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            vs.Add(Lua.FromDouble(items[i]));
+        }
+        return Lua.FromList(vs);
+    }
+
+    // 把 long 列表包装为 Lua 数组表。
+    public static LuaValue FromListLong(List<long> items) {
+        List<LuaValue> vs = new List<LuaValue>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            vs.Add(Lua.FromLong(items[i]));
+        }
+        return Lua.FromList(vs);
+    }
+
+    // 把字符串列表包装为 Lua 数组表。
+    public static LuaValue FromListStr(List<string> items) {
+        List<LuaValue> vs = new List<LuaValue>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            vs.Add(Lua.FromStr(items[i]));
+        }
+        return Lua.FromList(vs);
+    }
+
+    // 把字符串键映射包装为 Lua 表。
+    public static LuaValue FromDict(Dictionary<string, LuaValue> map) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        LuaCreateTableFn ct = (LuaCreateTableFn)Lua.addr_createtable;
+        List<string> keys = map.Keys;
+        ct(Lua.state, 0, keys.Count);
+        LuaSetFieldFn sf = (LuaSetFieldFn)Lua.addr_setfield;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            map[keys[i]].Push();
+            sf(Lua.state, 0 - 2, keys[i]);  // 弹出值
+        }
+        LuaValue t = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        return t;
+    }
+
+    // 把字符串到字符串的映射包装为 Lua 表。
+    public static LuaValue FromDictStr(Dictionary<string, string> map) {
+        Dictionary<string, LuaValue> vs = new Dictionary<string, LuaValue>();
+        List<string> keys = map.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            vs[keys[i]] = Lua.FromStr(map[keys[i]]);
+        }
+        return Lua.FromDict(vs);
+    }
+
+    // ---- lua_CFunction 回调辅助（Lua -> Zan）------------------
+
+    // 把第 <paramref name="index"/> 个参数（从 1 起）读为 double。
+    public static double ArgDouble(nint L, int index) {
+        LuaNumFn f = (LuaNumFn)Lua.addr_tonumberx;
+        return f(L, index, 0);
+    }
+
+    // 把第 <paramref name="index"/> 个参数读为 64 位整数。
+    public static long ArgLong(nint L, int index) {
+        LuaIntegerFn f = (LuaIntegerFn)Lua.addr_tointegerx;
+        return f(L, index, 0);
+    }
+
+    // 把第 <paramref name="index"/> 个参数读为字符串。
+    public static string ArgStr(nint L, int index) {
+        LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
+        int t = ty(L, index);
+        if (t != Lua.TSTRING && t != Lua.TNUMBER) { return ""; }
+        LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
+        return f(L, index, 0);
+    }
+
+    // 把第 <paramref name="index"/> 个参数读为真值。
+    public static bool ArgBool(nint L, int index) {
+        LuaIdxIntFn f = (LuaIdxIntFn)Lua.addr_toboolean;
+        return f(L, index) != 0;
+    }
+
+    // 回调参数个数。
+    public static int ArgCount(nint L) {
+        LuaIntFn f = (LuaIntFn)Lua.addr_gettop;
+        return f(L);
+    }
+
+    // 回调返回一个 number（返回值即压入的结果个数）。
+    public static int ReturnDouble(nint L, double v) {
+        LuaPushNumFn f = (LuaPushNumFn)Lua.addr_pushnumber;
+        f(L, v);
+        return 1;
+    }
+
+    // 回调返回一个 integer。
+    public static int ReturnLong(nint L, long v) {
+        LuaPushIntFn f = (LuaPushIntFn)Lua.addr_pushinteger;
+        f(L, v);
+        return 1;
+    }
+
+    // 回调返回一个 string。
+    public static int ReturnStr(nint L, string s) {
+        LuaPushStrFn f = (LuaPushStrFn)Lua.addr_pushstring;
+        nint _p = f(L, s);
+        return 1;
+    }
+
+    // 回调返回一个 boolean。
+    public static int ReturnBool(nint L, bool b) {
+        LuaVoidIntFn f = (LuaVoidIntFn)Lua.addr_pushboolean;
+        int v = 0;
+        if (b) { v = 1; }
+        f(L, v);
+        return 1;
+    }
+
+    // 回调返回 nil。
+    public static int ReturnNil(nint L) {
+        LuaVoid1Fn f = (LuaVoid1Fn)Lua.addr_pushnil;
+        f(L);
+        return 1;
+    }
+
+
+    // 未初始化时自动 Initialize。
+    public static void EnsureReady() {
+        if (!Lua.initialized) { Lua.Initialize(); }
+    }
+
+    // 创建 lua_State、打开标准库，并把注册表槽位分配器复位到 1000。
+    public static void OpenState() {
+        LuaNewStateFn ns = (LuaNewStateFn)Lua.addr_newstate;
+        Lua.state = ns();
+        if (Lua.state == 0) {
+            throw new InvalidOperationException("Lua 状态创建失败(内存不足)");
+        }
+        LuaVoid1Fn open = (LuaVoid1Fn)Lua.addr_openlibs;
+        open(Lua.state);
+        Lua.nextSlot = 1000;
+        Lua.initialized = true;
+    }
+
+    // lua_settop：把栈高设为 n。
+    public static void SetTop(int n) {
+        LuaVoidIntFn f = (LuaVoidIntFn)Lua.addr_settop;
+        f(Lua.state, n);
+    }
+
+    // 编译一段代码并把生成的 chunk 压栈（编译失败时抛出异常）。
+    public static void Load(string code) {
+        LuaLoadFn f = (LuaLoadFn)Lua.addr_loadstring;
+        int rc = f(Lua.state, code);
+        if (rc != 0) {
+            Lua.Fail("Lua 代码编译失败");
+        }
+    }
+
+    // 编译一段字节缓冲（源码或 <c>luac</c> 字节码）并把生成的
+    // chunk 压栈（编译失败时抛出异常）。缓冲在加载后被立即清零，
+    // 供"密文随包、明文只在内存存活一瞬"的内嵌脚本方案使用。
+    // 字节码必须与运行时主次版本一致（5.4.x）。
+    // mode 保持 NULL（文本与字节码都收）：这是全 API 唯一的预编译
+    // chunk 入口，仅宿主可达——沙箱已把脚本侧 <c>load</c> 置 nil，
+    // 不可信脚本拿不到任何装载预编译 chunk 的口子。
+    public static void LoadBytes(byte[] chunk, string chunkName) {
+        if (chunk == null || chunk.Length == 0) {
+            throw new InvalidOperationException("Lua chunk 为空");
+        }
+        LuaLoadBufFn f = (LuaLoadBufFn)Lua.addr_loadbufferx;
+        int rc = f(Lua.state, chunk, chunk.Length, chunkName, null);
+        for (int i = 0; i < chunk.Length; i = i + 1) { chunk[i] = 0; }
+        if (rc != 0) {
+            Lua.Fail("Lua chunk 编译失败: " + chunkName);
+        }
+    }
+
+    // 保护调用栈顶的 chunk/函数：出错时把栈恢复到 mark 再抛异常，
+    // 因此调用方看不到半截的栈。
+    public static void Protected(int nargs, int nres, int mark, string what) {
+        LuaPcallFn f = (LuaPcallFn)Lua.addr_pcallk;
+        int rc = f(Lua.state, nargs, nres, 0, 0, 0);
+        if (rc != 0) {
+            Lua.Fail("Lua 执行失败: " + what);
+        }
+    }
+
+    // 读走栈顶的错误消息、清栈并抛出异常。
+    public static void Fail(string prefix) {
+        string msg = Lua.TopString();
+        Lua.SetTop(0);
+        throw new InvalidOperationException(prefix + ": " + msg);
+    }
+
+    // 栈顶值的错误消息；非 string/number 时返回占位文案。
+    public static string TopString() {
+        LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
+        int t = ty(Lua.state, 0 - 1);
+        if (t != Lua.TSTRING && t != Lua.TNUMBER) { return "(no message)"; }
+        LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
+        return f(Lua.state, 0 - 1, 0);
+    }
+
+    // 把点分路径解析出的值压栈（"string.upper" -> 全局 string 的 upper）。
+    public static void PushPath(string name, int mark) {
+        List<string> parts = name.Split(".");
+        LuaGetGlobalFn g = (LuaGetGlobalFn)Lua.addr_getglobal;
+        int t = g(Lua.state, parts[0]);
+        LuaGetFieldFn gf = (LuaGetFieldFn)Lua.addr_getfield;
+        for (int i = 1; i < parts.Count; i = i + 1) {
+            if (t != Lua.TTABLE) {
+                Lua.SetTop(mark);
+                throw new InvalidOperationException("Lua 找不到函数: " + name);
+            }
+            t = gf(Lua.state, 0 - 1, parts[i]);
+        }
+        if (t != Lua.TFUNCTION) {
+            Lua.SetTop(mark);
+            throw new InvalidOperationException("Lua 找不到函数: " + name);
+        }
+        // 只保留最终值：中间的表还压在下面。
+        if (parts.Count > 1) {
+            LuaValue fnv = LuaValue.CaptureTop();
+            Lua.SetTop(mark);
+            fnv.Push();
+        }
+    }
+
+    // 定位并加载可用的 Lua 动态库、解析全部入口点；成功后缓存结果。
+    public static bool TryResolve() {
+        if (Lua.resolved) { return true; }
+        if (Lua.mod == 0) {
+            // 按新旧排序；Windows 用 lua5x.dll，类 Unix 用 liblua5.x.so /
+            // .dylib，同时接受不带版本号的 soname。
+            string[] cands = new string[] {
+                "lua54.dll", "lua53.dll", "lua5.4.dll", "lua5.3.dll",
+                "liblua5.4.so", "liblua5.3.so", "liblua54.so", "liblua53.so",
+                "liblua.so.5.4", "liblua.so.5.3", "liblua.so",
+                "liblua5.4.dylib", "liblua5.3.dylib", "liblua.dylib"
+            };
+            // 先试 exe 目录限定路径：--publish 把 lua.bundle 铺在
+            // exe 旁，限定路径让随附副本确定性地赢下裸名搜索——裸名在
+            // Windows 上找不到时会继续查 CWD/PATH，可写目录放同名 DLL
+            // 即劫持；POSIX 限定路径含 / 按 literal 文件处理，缺了自然
+            // 落回下面的裸名表。
+            string appdir = ProcessHost.AppDir();
+            if (appdir != "") {
+                for (int i = 0; i < cands.Length; i = i + 1) {
+                    Lua.mod = Interop.Load(appdir + "/" + cands[i]);
+                    if (Lua.mod != 0) { break; }
+                }
+            }
+            for (int i = 0; Lua.mod == 0 && i < cands.Length; i = i + 1) {
+                Lua.mod = Interop.Load(cands[i]);
+                if (Lua.mod != 0) { break; }
+            }
+            if (Lua.mod == 0) { return false; }
+        }
+        if (!Lua.ResolveSymbols()) {
+            Interop.Unload(Lua.mod);
+            Lua.mod = 0;
+            return false;
+        }
+        Lua.resolved = true;
+        return true;
+    }
+
+    // 解析全部入口点地址；关键符号缺失时返回 false。
+    // 5.3 之前没有 lua_geti/lua_seti：退回 raw 访问（无 __index）。
+    public static bool ResolveSymbols() {
+        Lua.addr_newstate = Interop.Symbol(Lua.mod, "luaL_newstate");
+        Lua.addr_openlibs = Interop.Symbol(Lua.mod, "luaL_openlibs");
+        Lua.addr_close = Interop.Symbol(Lua.mod, "lua_close");
+        Lua.addr_loadstring = Interop.Symbol(Lua.mod, "luaL_loadstring");
+        // luaL_loadbuffer 是 luaL_loadbufferx 的宏（mode=NULL），DLL 只导出后者。
+        Lua.addr_loadbufferx = Interop.Symbol(Lua.mod, "luaL_loadbufferx");
+        // lua_pcall 自 5.2 起是 lua_pcallk 的宏包装，导出的只有后者。
+        Lua.addr_pcallk = Interop.Symbol(Lua.mod, "lua_pcallk");
+        Lua.addr_gettop = Interop.Symbol(Lua.mod, "lua_gettop");
+        Lua.addr_settop = Interop.Symbol(Lua.mod, "lua_settop");
+        Lua.addr_type = Interop.Symbol(Lua.mod, "lua_type");
+        Lua.addr_toboolean = Interop.Symbol(Lua.mod, "lua_toboolean");
+        Lua.addr_tonumberx = Interop.Symbol(Lua.mod, "lua_tonumberx");
+        Lua.addr_tointegerx = Interop.Symbol(Lua.mod, "lua_tointegerx");
+        Lua.addr_tolstring = Interop.Symbol(Lua.mod, "lua_tolstring");
+        Lua.addr_pushnumber = Interop.Symbol(Lua.mod, "lua_pushnumber");
+        Lua.addr_pushinteger = Interop.Symbol(Lua.mod, "lua_pushinteger");
+        Lua.addr_pushstring = Interop.Symbol(Lua.mod, "lua_pushstring");
+        Lua.addr_pushboolean = Interop.Symbol(Lua.mod, "lua_pushboolean");
+        Lua.addr_pushnil = Interop.Symbol(Lua.mod, "lua_pushnil");
+        Lua.addr_pushvalue = Interop.Symbol(Lua.mod, "lua_pushvalue");
+        Lua.addr_pushcclosure = Interop.Symbol(Lua.mod, "lua_pushcclosure");
+        Lua.addr_getglobal = Interop.Symbol(Lua.mod, "lua_getglobal");
+        Lua.addr_setglobal = Interop.Symbol(Lua.mod, "lua_setglobal");
+        Lua.addr_getfield = Interop.Symbol(Lua.mod, "lua_getfield");
+        Lua.addr_setfield = Interop.Symbol(Lua.mod, "lua_setfield");
+        Lua.addr_geti = Interop.Symbol(Lua.mod, "lua_geti");
+        Lua.addr_seti = Interop.Symbol(Lua.mod, "lua_seti");
+        Lua.addr_rawgeti = Interop.Symbol(Lua.mod, "lua_rawgeti");
+        Lua.addr_rawseti = Interop.Symbol(Lua.mod, "lua_rawseti");
+        Lua.addr_rawlen = Interop.Symbol(Lua.mod, "lua_rawlen");
+        Lua.addr_next = Interop.Symbol(Lua.mod, "lua_next");
+        Lua.addr_createtable = Interop.Symbol(Lua.mod, "lua_createtable");
+        Lua.addr_newthread = Interop.Symbol(Lua.mod, "lua_newthread");
+        Lua.addr_resume = Interop.Symbol(Lua.mod, "lua_resume");
+        Lua.addr_yieldk = Interop.Symbol(Lua.mod, "lua_yieldk");
+        Lua.addr_status = Interop.Symbol(Lua.mod, "lua_status");
+        Lua.addr_gc = Interop.Symbol(Lua.mod, "lua_gc");
+        // 5.3 之前没有 lua_geti/lua_seti：退回 raw 访问（无 __index）。
+        if (Lua.addr_geti == 0) { Lua.addr_geti = Lua.addr_rawgeti; }
+        if (Lua.addr_seti == 0) { Lua.addr_seti = Lua.addr_rawseti; }
+        return Lua.addr_newstate != 0 && Lua.addr_openlibs != 0
+            && Lua.addr_loadstring != 0 && Lua.addr_pcallk != 0
+            && Lua.addr_rawgeti != 0 && Lua.addr_rawseti != 0
+            && Lua.addr_tolstring != 0 && Lua.addr_createtable != 0;
+    }
+
+    // 卸载运行时并清空全部符号地址（状态须已先经 Finalize 关闭）。
+    public static void FreeModule() {
+        if (Lua.mod != 0) {
+            Interop.Unload(Lua.mod);
+            Lua.mod = 0;
+        }
+        Lua.resolved = false;
+        Lua.addr_newstate = 0;
+        Lua.addr_openlibs = 0;
+        Lua.addr_close = 0;
+        Lua.addr_loadstring = 0;
+        Lua.addr_loadbufferx = 0;
+        Lua.addr_pcallk = 0;
+        Lua.addr_gettop = 0;
+        Lua.addr_settop = 0;
+        Lua.addr_type = 0;
+        Lua.addr_toboolean = 0;
+        Lua.addr_tonumberx = 0;
+        Lua.addr_tointegerx = 0;
+        Lua.addr_tolstring = 0;
+        Lua.addr_pushnumber = 0;
+        Lua.addr_pushinteger = 0;
+        Lua.addr_pushstring = 0;
+        Lua.addr_pushboolean = 0;
+        Lua.addr_pushnil = 0;
+        Lua.addr_pushvalue = 0;
+        Lua.addr_pushcclosure = 0;
+        Lua.addr_getglobal = 0;
+        Lua.addr_setglobal = 0;
+        Lua.addr_getfield = 0;
+        Lua.addr_setfield = 0;
+        Lua.addr_geti = 0;
+        Lua.addr_seti = 0;
+        Lua.addr_rawgeti = 0;
+        Lua.addr_rawseti = 0;
+        Lua.addr_rawlen = 0;
+        Lua.addr_next = 0;
+        Lua.addr_createtable = 0;
+        Lua.addr_newthread = 0;
+        Lua.addr_resume = 0;
+        Lua.addr_yieldk = 0;
+        Lua.addr_status = 0;
+        Lua.addr_gc = 0;
+    }
+
+    // ---- 注册表槽位（LuaValue 的存储）---------------------------
+
+    // 把栈顶的值移入一个新的注册表槽位（弹出该值），返回槽位号。
+    public static long StoreTop() {
+        long slot = Lua.nextSlot;
+        Lua.nextSlot = Lua.nextSlot + 1;
+        LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
+        si(Lua.state, Lua.REGISTRY, slot);  // 弹出栈顶
+        return slot;
+    }
+
+    // 把槽位里的值压入指定状态机栈（槽位 0 表示 nil）。
+    public static void PushSlotTo(nint L, long slot) {
+        if (L == 0) { return; }
+        if (slot == 0) {
+            LuaVoid1Fn f = (LuaVoid1Fn)Lua.addr_pushnil;
+            f(L);
+            return;
+        }
+        LuaGetIFn g = (LuaGetIFn)Lua.addr_rawgeti;
+        int _t = g(L, Lua.REGISTRY, slot);
+    }
+
+    // 把槽位里的值压栈（槽位 0 表示 nil）。
+    public static void PushSlot(long slot) {
+        Lua.PushSlotTo(Lua.state, slot);
+    }
+
+    // 释放槽位（置 nil，让 Lua 的 GC 可以回收该值）。
+    public static void DropSlot(long slot) {
+        if (slot == 0 || Lua.state == 0 || !Lua.resolved) { return; }
+        LuaVoid1Fn nil = (LuaVoid1Fn)Lua.addr_pushnil;
+        nil(Lua.state);
+        LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
+        si(Lua.state, Lua.REGISTRY, slot);
+    }
+
+    // 槽位值的 lua_type；槽位 0 即 TNIL。
+    public static int TypeOfSlot(long slot) {
+        if (slot == 0) { return Lua.TNIL; }
+        int mark = Lua.Top();
+        Lua.PushSlot(slot);
+        LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
+        int t = ty(Lua.state, 0 - 1);
+        Lua.SetTop(mark);
+        return t;
+    }
+}

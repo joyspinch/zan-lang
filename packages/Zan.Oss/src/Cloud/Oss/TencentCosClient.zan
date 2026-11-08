@@ -1,0 +1,60 @@
+using System;
+using System.Net.Http;
+
+namespace Cloud.Oss;
+
+/// <summary>腾讯云 COS 客户端（XML API 签名，q-sign-algorithm=sha1）。
+/// 端点留空时按 桶名.cos.区域.myqcloud.com 推导；端点里可写 {bucket} 占位。</summary>
+public class TencentCosClient : OssClient {
+    public TencentCosClient(OssConfig cfg) : base(cfg) {
+        // 端点留空时按 桶名.cos.区域.myqcloud.com 推导；端点里的 {bucket}
+        // 占位由基类解析时替换。
+        if (this.config.endpoint == null || this.config.endpoint.Length == 0) {
+            this.config.endpointHost = this.config.bucket + ".cos." + this.config.region + ".myqcloud.com";
+            this.config.endpointPort = 443;
+            this.config.endpointTls = true;
+        }
+    }
+
+    public override string ProviderName() { return "tencent_cos"; }
+
+    public override string HostName() {
+        return this.config.endpointHost;
+    }
+
+    public override string RequestPath(string key) {
+        if (this.config.UsesBucketPrefix()) {
+            if (key == null || key.Length == 0) { return "/" + this.config.bucket + "/"; }
+            return "/" + this.config.bucket + "/" + key;
+        }
+        if (key == null || key.Length == 0) { return "/"; }
+        return "/" + key;
+    }
+
+    public override string BucketRequestPath() {
+        if (this.config.UsesBucketPrefix()) { return "/" + this.config.bucket + "/"; }
+        return "/";
+    }
+
+    /// <summary>参与签名的路径（与请求路径一致）。路径风格时含桶名前缀。</summary>
+    public override string SignPath(string key) {
+        string k = key == null ? "" : key;
+        if (this.config.UsesBucketPrefix()) { return this.config.bucket + "/" + k; }
+        return k;
+    }
+
+    public override void SignRequest(HttpClient http, string method, string key,
+                                     string contentType, byte[] body, long now) {
+        string keyTime = TencentCosSigner.KeyTime(now, 900);
+        http.SetHeader("Date", OssSigner.GmtDate(now));
+        http.SetHeader("Authorization",
+            TencentCosSigner.Authorization(this.config.accessKey, this.config.secretKey,
+                method, this.SignPath(key), keyTime));
+    }
+
+    public override string PublicUrlFor(string fullKey) {
+        if (fullKey == null || fullKey.Length == 0) { return ""; }
+        string scheme = this.config.endpointTls ? "https://" : "http://";
+        return scheme + this.HostName() + "/" + fullKey;
+    }
+}

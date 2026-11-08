@@ -4,7 +4,7 @@
 > 接口可能随工具链调整。
 
 设计器知识库：gallery 索引生成（CLI 与 MCP server 共用的
-source-driven 产物与告警）。`using System.Knowledge;` 按需拉入，
+source-driven 产物与告警）。`using Ai.Knowledge;` 按需拉入，
 命名空间保留零破坏。
 
 ## 内容（stdlib/System/Knowledge 整目录迁入）

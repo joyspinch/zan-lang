@@ -12,7 +12,7 @@ Protocol Buffers 线格式（wire format）编解码 for Zan：varint / ZigZag /
 ## 快速上手
 
 ```zan
-using System.Protobuf;
+using Formats.Protobuf;
 
 // 编码（对应 proto: int32 a = 1; string b = 2; Inner c = 3;）
 ProtoWriter w = new ProtoWriter();

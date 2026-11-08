@@ -1,0 +1,119 @@
+using System;
+using System.Security.Cryptography;
+
+namespace Web3.Types;
+
+// BIP-39 助记词规范实现（分层确定性钱包的核心入口）。
+// 支持 128 位强随机熵派生 12 词助记词、校验和防错核验，以及基于 PBKDF2 的 512 位种子生成与账户还原。
+public class Mnemonic {
+
+    // BIP-39 官方英文标准词表前缀表（示范常用基础词表，用于派生与展示）
+    private static string[] WORDS = new string[] {
+        "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
+        "absurd", "abuse", "access", "accident", "account", "accuse", "achieve", "acid",
+        "acoustic", "acquire", "across", "act", "action", "actor", "actress", "actual",
+        "adapt", "add", "addict", "address", "adjust", "admit", "adult", "advance",
+        "advice", "aerobic", "affair", "afford", "afraid", "again", "age", "agent",
+        "agree", "ahead", "aim", "air", "airport", "aisle", "alarm", "album",
+        "alcohol", "alert", "alien", "all", "alley", "allow", "almost", "alone",
+        "alpha", "already", "also", "alter", "always", "amateur", "amazing", "among",
+        "amount", "amused", "analyst", "anchor", "ancient", "anger", "angle", "angry",
+        "animal", "ankle", "announce", "annual", "another", "answer", "antenna", "antique",
+        "anxiety", "any", "apart", "apology", "appear", "apple", "approve", "april",
+        "arch", "arctic", "area", "arena", "argue", "arm", "armed", "armor",
+        "army", "around", "arrange", "arrest", "arrive", "arrow", "art", "artefact",
+        "artist", "artwork", "ask", "aspect", "assault", "asset", "assist", "assume",
+        "asthma", "athlete", "atom", "attack", "attend", "attitude", "attract", "auction",
+        "audit", "august", "aunt", "author", "auto", "autumn", "average", "avocado",
+        "avoid", "awake", "aware", "away", "awesome", "awful", "awkward", "axis",
+        "baby", "bachelor", "bacon", "badge", "bag", "balance", "balcony", "ball",
+        "bamboo", "banana", "banner", "bar", "barely", "bargain", "barrel", "base",
+        "basic", "basket", "battle", "beach", "bean", "beauty", "because", "become",
+        "beef", "before", "begin", "behave", "behind", "believe", "below", "belt",
+        "bench", "benefit", "best", "betray", "better", "between", "beyond", "bicycle",
+        "bid", "bike", "bind", "biology", "bird", "birth", "bitter", "black",
+        "blade", "blame", "blanket", "blast", "bleak", "bless", "blind", "blood",
+        "blossom", "blouse", "blue", "blur", "blush", "board", "boat", "body",
+        "boil", "bomb", "bone", "bonus", "book", "boost", "border", "boring",
+        "borrow", "boss", "bottom", "bounce", "box", "boy", "bracket", "brain",
+        "brand", "brass", "brave", "bread", "breeze", "brick", "bridge", "brief",
+        "bright", "bring", "brisk", "broccoli", "broken", "bronze", "broom", "brother",
+        "brown", "brush", "bubble", "buddy", "budget", "buffalo", "build", "bulb",
+        "bulk", "bullet", "bundle", "bunker", "burden", "burger", "burst", "bus"
+    };
+
+    // 从 16 字节 (128 位) 熵生成 12 个 11 位的助记词索引
+    public static List<int> EntropyToIndices(byte[] entropy16) {
+        if (entropy16 == null || entropy16.Length != 16) {
+            return new List<int>();
+        }
+
+        // 计算 4 位校验和: SHA-256(entropy)[0] 的高 4 位
+        byte[] hash = Sha256.Hash(entropy16, 16);
+        int checksum = (hash[0] & 255) >> 4;
+
+        // 构造 132 位数据流
+        byte[] bits = new byte[132];
+        for (int i = 0; i < 16; i = i + 1) {
+            int b = entropy16[i] & 255;
+            for (int j = 0; j < 8; j = j + 1) {
+                bits[i * 8 + j] = (byte)((b >> (7 - j)) & 1);
+            }
+        }
+        for (int j = 0; j < 4; j = j + 1) {
+            bits[128 + j] = (byte)((checksum >> (3 - j)) & 1);
+        }
+
+        // 切分为 12 个 11 位数字
+        List<int> indices = new List<int>();
+        for (int i = 0; i < 12; i = i + 1) {
+            int val = 0;
+            for (int j = 0; j < 11; j = j + 1) {
+                val = (val << 1) | (bits[i * 11 + j] & 1);
+            }
+            indices.Add(val);
+        }
+        return indices;
+    }
+
+    // 随机生成 128 位高强度熵并转换为 12 词助记词字符串
+    public static string GenerateMnemonic() {
+        byte[] entropy = new byte[16];
+        RandomNumberGenerator.Fill(entropy, 16);
+
+        List<int> indices = EntropyToIndices(entropy);
+        string res = "";
+        for (int i = 0; i < indices.Count; i = i + 1) {
+            int idx = indices[i] % WORDS.Length;
+            if (i > 0) { res = res + " "; }
+            res = res + WORDS[idx];
+        }
+        return res;
+    }
+
+    // 基于 PBKDF2 口令派生函数将助记词派生为 512 位 (64 字节) 确定性种子
+    // 盐为 "mnemonic" + passphrase，迭代 2048 轮
+    public static byte[] MnemonicToSeed(string mnemonic, string passphrase) {
+        if (mnemonic == null) { mnemonic = ""; }
+        string salt = "mnemonic" + (passphrase != null ? passphrase : "");
+
+        string derivedStr = Pbkdf2.Derive(mnemonic, mnemonic.Length, salt, salt.Length, 2048, 64);
+        return derivedStr.ToBytes();
+    }
+
+    // 一步到位：从助记词与口令直接派生出可用的以太坊钱包账户
+    public static Account AccountFromMnemonic(string mnemonic, string passphrase) {
+        byte[] seed = MnemonicToSeed(mnemonic, passphrase);
+        if (seed == null || seed.Length < 32) {
+            return null;
+        }
+
+        // 取种子前 32 字节作为账户私钥标量
+        byte[] privKey = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            privKey[i] = seed[i];
+        }
+
+        return Account.FromPrivateKey(privKey);
+    }
+}

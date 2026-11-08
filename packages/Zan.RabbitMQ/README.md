@@ -14,7 +14,7 @@ Pure Zan asynchronous AMQP 0-9-1 client for RabbitMQ.
 
 ```zan
 using System;
-using Zan.RabbitMQ;
+using Messaging.RabbitMQ;
 
 class Program {
     static async void Main() {

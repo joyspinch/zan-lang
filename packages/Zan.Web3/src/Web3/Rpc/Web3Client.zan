@@ -1,0 +1,319 @@
+using System;
+using System.Security.Cryptography;
+using Web3.Types;
+using Web3.Encoding;
+
+namespace Web3.Rpc;
+
+// 链上交易确认回执实体 (Transaction Receipt)
+public class TransactionReceipt {
+    public string TransactionHash;          // 交易哈希
+    public long BlockNumber;                // 打包该交易的区块高度
+    public int Status;                      // 1 表示成功，0 表示执行 Revert 失败
+    public long GasUsed;                    // 实际消耗的 Gas 总量
+    public Address From;                    // 发送方地址
+    public Address To;                      // 接收方地址
+    public Address ContractAddress;         // 合约部署时产生的新合约地址
+
+    public TransactionReceipt() {
+        TransactionHash = "";
+        BlockNumber = 0;
+        Status = 0;
+        GasUsed = 0;
+        From = Address.Zero;
+        To = Address.Zero;
+        ContractAddress = Address.Zero;
+    }
+}
+
+// RPC 传输驱动抽象接口（允许在真实网络传输、代理与离线仿真之间无缝切换）
+public interface IRpcTransport {
+    string Send(string host, int port, bool useTls, string path, string body);
+}
+
+// 模拟测试与离线回放用的 RPC 传输驱动
+public class MockRpcTransport : IRpcTransport {
+    public string MockResponse = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x10\"}";
+    public string LastSentBody = "";
+
+    public string Send(string host, int port, bool useTls, string path, string body) {
+        LastSentBody = body;
+        return MockResponse;
+    }
+}
+
+// 标准以太坊 JSON-RPC 生产客户端，涵盖节点通信、错误穿透、Gas 动态估算与交易确认轮询。
+public class Web3Client {
+
+    public string RpcUrl;
+    public string Host;
+    public int Port;
+    public bool UseTls;
+    public string Path;
+    public IRpcTransport Transport;
+
+    public string LastError = "";           // 记录最近一次 RPC 调用的服务端错误信息 (Revert / Insufficient funds 等)
+
+    private int _requestId = 1;
+
+    public Web3Client(string rpcUrl) {
+        RpcUrl = rpcUrl != null ? rpcUrl : "http://127.0.0.1:8545";
+        Transport = new MockRpcTransport(); // 默认传输器，可按需切换为真实 Socket/HTTP 驱动
+        parseUrl(RpcUrl);
+    }
+
+    public Web3Client(string rpcUrl, IRpcTransport transport) {
+        RpcUrl = rpcUrl != null ? rpcUrl : "http://127.0.0.1:8545";
+        Transport = transport != null ? transport : new MockRpcTransport();
+        parseUrl(RpcUrl);
+    }
+
+    // 解析标准 HTTP / HTTPS RPC URL
+    private void parseUrl(string url) {
+        string u = url.Trim();
+        if (u.StartsWith("https://") || u.StartsWith("HTTPS://")) {
+            UseTls = true;
+            Port = 443;
+            u = u.Substring(8);
+        } else if (u.StartsWith("http://") || u.StartsWith("HTTP://")) {
+            UseTls = false;
+            Port = 8545;
+            u = u.Substring(7);
+        } else {
+            UseTls = false;
+            Port = 8545;
+        }
+
+        int slashIdx = u.IndexOf("/");
+        if (slashIdx >= 0) {
+            Host = u.Substring(0, slashIdx);
+            Path = u.Substring(slashIdx);
+        } else {
+            Host = u;
+            Path = "/";
+        }
+
+        int colonIdx = Host.IndexOf(":");
+        if (colonIdx >= 0) {
+            string portStr = Host.Substring(colonIdx + 1);
+            Host = Host.Substring(0, colonIdx);
+            int p = 0;
+            for (int i = 0; i < portStr.Length; i = i + 1) {
+                int c = portStr[i] - 48;
+                if (c >= 0 && c <= 9) { p = p * 10 + c; }
+            }
+            if (p > 0) { Port = p; }
+        }
+    }
+
+    // 十六进制字符串转为 long 整数（处理形如 "0x1b4" 或 "0x0"）
+    public static long HexToLong(string hex) {
+        if (hex == null) { return 0; }
+        string clean = hex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length == 0) { return 0; }
+        long val = 0;
+        for (int i = 0; i < clean.Length; i = i + 1) {
+            int c = clean[i] & 255;
+            int digit = 0;
+            if (c >= 48 && c <= 57) { digit = c - 48; }
+            else if (c >= 97 && c <= 102) { digit = c - 97 + 10; }
+            else if (c >= 65 && c <= 70) { digit = c - 65 + 10; }
+            val = (val << 4) | (long)digit;
+        }
+        return val;
+    }
+
+    // 从 JSON 响应文本中提取 "error.message"（错误穿透防御，杜绝静默失败）
+    public static string ExtractError(string jsonResponse) {
+        if (jsonResponse == null) { return ""; }
+        string errTag = "\"error\":";
+        int errIdx = jsonResponse.IndexOf(errTag);
+        if (errIdx < 0) { return ""; }
+
+        string msgTag = "\"message\":";
+        int msgIdx = jsonResponse.IndexOf(msgTag, errIdx);
+        if (msgIdx < 0) { return "RPC Error"; }
+
+        int start = msgIdx + msgTag.Length;
+        while (start < jsonResponse.Length && (jsonResponse[start] == ' ' || jsonResponse[start] == '\t')) {
+            start = start + 1;
+        }
+        if (start >= jsonResponse.Length || jsonResponse[start] != '\"') { return "RPC Error"; }
+        start = start + 1;
+        int end = jsonResponse.IndexOf("\"", start);
+        if (end < 0) { return "RPC Error"; }
+        return jsonResponse.Substring(start, end - start);
+    }
+
+    // 从 JSON 响应文本中提取 "result" 字段的值（去除外层引号）
+    public static string ExtractResult(string jsonResponse) {
+        if (jsonResponse == null) { return ""; }
+
+        // 检查是否有错误
+        string errMsg = ExtractError(jsonResponse);
+        if (errMsg.Length > 0) {
+            return "";
+        }
+
+        string tag = "\"result\":";
+        int idx = jsonResponse.IndexOf(tag);
+        if (idx < 0) { return ""; }
+        int start = idx + tag.Length;
+        while (start < jsonResponse.Length && (jsonResponse[start] == ' ' || jsonResponse[start] == '\t')) {
+            start = start + 1;
+        }
+        if (start >= jsonResponse.Length) { return ""; }
+
+        if (jsonResponse[start] == '\"') {
+            start = start + 1;
+            int end = jsonResponse.IndexOf("\"", start);
+            if (end < 0) { return ""; }
+            return jsonResponse.Substring(start, end - start);
+        }
+
+        int endNonStr = start;
+        while (endNonStr < jsonResponse.Length && jsonResponse[endNonStr] != ',' && jsonResponse[endNonStr] != '}' && jsonResponse[endNonStr] != ']') {
+            endNonStr = endNonStr + 1;
+        }
+        return jsonResponse.Substring(start, endNonStr - start).Trim();
+    }
+
+    // 发送基础 JSON-RPC 请求并返回提取后的结果字符串
+    public string SendRpc(string method, string paramsJson) {
+        int id = _requestId;
+        _requestId = _requestId + 1;
+        string reqJson = JsonRpcBuilder.BuildRequest(method, paramsJson, id);
+        string respJson = Transport.Send(Host, Port, UseTls, Path, reqJson);
+
+        LastError = ExtractError(respJson);
+        return ExtractResult(respJson);
+    }
+
+    // 获取当前最新区块高度
+    public long GetBlockNumber() {
+        string res = SendRpc("eth_blockNumber", "[]");
+        return HexToLong(res);
+    }
+
+    // 查询账户以太币余额 (Wei)
+    public BigInt GetBalance(Address address, string blockTag) {
+        string addrHex = address != null ? address.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
+        string res = SendRpc("eth_getBalance", "[\"" + addrHex + "\",\"" + tag + "\"]");
+        return Abi.DecodeUint256(res);
+    }
+
+    // 查询网络当前实时 Gas 价格 (Wei)
+    public BigInt GetGasPrice() {
+        string res = SendRpc("eth_gasPrice", "[]");
+        return Abi.DecodeUint256(res);
+    }
+
+    // 动态估算交易所需 GasLimit (eth_estimateGas)
+    public long EstimateGas(Address from, Address to, string dataHex, BigInt value) {
+        string fromHex = from != null ? from.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string toHex = to != null ? to.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string valHex = value != null ? "0x" + Hex.Encode(value.ToBytesBE(32), 32) : "0x0";
+        string dHex = dataHex != null ? dataHex : "0x";
+
+        string callObj = "{\"from\":\"" + fromHex + "\",\"to\":\"" + toHex + "\",\"data\":\"" + dHex + "\",\"value\":\"" + valHex + "\"}";
+        string res = SendRpc("eth_estimateGas", "[" + callObj + "]");
+        return HexToLong(res);
+    }
+
+    // 查询账户当前确认的交易笔数 (Nonce)
+    public long GetTransactionCount(Address address, string blockTag) {
+        string addrHex = address != null ? address.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
+        string res = SendRpc("eth_getTransactionCount", "[\"" + addrHex + "\",\"" + tag + "\"]");
+        return HexToLong(res);
+    }
+
+    // 执行智能合约只读调用 (eth_call)
+    public string Call(Address to, string dataHex, string blockTag) {
+        string toHex = to != null ? to.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
+        string callObj = "{\"to\":\"" + toHex + "\",\"data\":\"" + dataHex + "\"}";
+        return SendRpc("eth_call", "[" + callObj + ",\"" + tag + "\"]");
+    }
+
+    // 广播已签名的原始交易十六进制字符串，返回交易哈希 (txHash)
+    public string SendRawTransaction(string rawTxHex) {
+        return SendRpc("eth_sendRawTransaction", "[\"" + rawTxHex + "\"]");
+    }
+
+    // 查询交易收据 (eth_getTransactionReceipt)
+    public TransactionReceipt GetTransactionReceipt(string txHash) {
+        if (txHash == null || txHash.Length == 0) { return null; }
+        int id = _requestId;
+        _requestId = _requestId + 1;
+        string reqJson = JsonRpcBuilder.BuildRequest("eth_getTransactionReceipt", "[\"" + txHash + "\"]", id);
+        string respJson = Transport.Send(Host, Port, UseTls, Path, reqJson);
+
+        if (respJson == null || respJson.IndexOf("\"result\":null") >= 0 || respJson.IndexOf("\"result\": null") >= 0) {
+            return null;
+        }
+
+        TransactionReceipt receipt = new TransactionReceipt();
+        receipt.TransactionHash = txHash;
+
+        // 提取 blockNumber
+        string bnStr = extractReceiptField(respJson, "blockNumber");
+        receipt.BlockNumber = HexToLong(bnStr);
+
+        // 提取 status (0x1 成功, 0x0 失败)
+        string stStr = extractReceiptField(respJson, "status");
+        receipt.Status = (int)HexToLong(stStr);
+
+        // 提取 gasUsed
+        string guStr = extractReceiptField(respJson, "gasUsed");
+        receipt.GasUsed = HexToLong(guStr);
+
+        return receipt;
+    }
+
+    private static string extractReceiptField(string json, string field) {
+        string pattern = "\"" + field + "\":";
+        int idx = json.IndexOf(pattern);
+        if (idx < 0) { return ""; }
+        int start = idx + pattern.Length;
+        while (start < json.Length && (json[start] == ' ' || json[start] == '\t')) {
+            start = start + 1;
+        }
+        if (start >= json.Length) { return ""; }
+        if (json[start] == '\"') {
+            start = start + 1;
+            int end = json.IndexOf("\"", start);
+            if (end < 0) { return ""; }
+            return json.Substring(start, end - start);
+        }
+        int endNonStr = start;
+        while (endNonStr < json.Length && json[endNonStr] != ',' && json[endNonStr] != '}' && json[endNonStr] != ']') {
+            endNonStr = endNonStr + 1;
+        }
+        return json.Substring(start, endNonStr - start).Trim();
+    }
+
+    // 轮询等待交易上链打包并返回回执 (生产必备)
+    public TransactionReceipt WaitForTransactionReceipt(string txHash, int maxRetries) {
+        int retries = maxRetries > 0 ? maxRetries : 30;
+        for (int i = 0; i < retries; i = i + 1) {
+            TransactionReceipt receipt = GetTransactionReceipt(txHash);
+            if (receipt != null && receipt.BlockNumber > 0) {
+                return receipt;
+            }
+        }
+        return null;
+    }
+
+    // 查询 ERC-20 代币余额
+    public BigInt CallErc20BalanceOf(Address tokenContract, Address account) {
+        byte[] calldata = Abi.EncodeErc20BalanceOf(account);
+        string calldataHex = "0x" + Hex.Encode(calldata, calldata.Length);
+        string resHex = Call(tokenContract, calldataHex, "latest");
+        return Abi.DecodeUint256(resHex);
+    }
+}

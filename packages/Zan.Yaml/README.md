@@ -61,7 +61,7 @@ copy: *b
 ## 快速上手
 
 ```zan
-using System.Yaml;
+using Formats.Yaml;
 using System.Json;
 
 JsonValue conf = Yaml.Parse(yamlText);     // 非法抛 YamlException（带行号）

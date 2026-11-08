@@ -50,7 +50,7 @@
 
 ```zan
 using System;
-using Zan.AppUpdate;
+using AppUpdate;
 
 class Publisher {
     static void Main() {
@@ -82,7 +82,7 @@ class Publisher {
 
 ```zan
 using System;
-using Zan.AppUpdate;
+using AppUpdate;
 
 class UpdaterDemo {
     static void Main() {
@@ -104,7 +104,7 @@ class UpdaterDemo {
 
 ```zan
 using System;
-using Zan.AppUpdate;
+using AppUpdate;
 
 class IntegrityCheckDemo {
     static void Main() {
@@ -145,7 +145,7 @@ class IntegrityCheckDemo {
 ```zan
 using System;
 using System.Security.Cryptography;
-using Zan.AppUpdate;
+using AppUpdate;
 
 // 发布端：打包后用 RSA 私钥签清单（密钥为 hex 大端字符串，可由 PEM 导出）
 UpdateManifest m = ReleasePackager.Pack(...);

@@ -1,0 +1,81 @@
+using System;
+
+namespace Messaging.RabbitMQ;
+
+// AMQP 0-9-1 二进制帧模型与分帧编解码器（RFC 规范严格定界）。
+public class AmqpFrame {
+    public int type;
+    public int channel;
+    public int length;
+    public byte[] payload;
+
+    public AmqpFrame() {
+        this.type = 0;
+        this.channel = 0;
+        this.length = 0;
+        this.payload = null;
+    }
+
+    public AmqpFrame(int type, int channel, byte[] payload, int length) {
+        this.type = type;
+        this.channel = channel;
+        this.length = length;
+        this.payload = payload;
+    }
+
+    // 编码 7 字节帧头：1 字节类型 + 2 字节频道 + 4 字节载荷长度。
+    public static byte[] EncodeHeader(int type, int channel, int payloadLength) {
+        byte[] hdr = new byte[7];
+        hdr[0] = (byte)(type & 255);
+        hdr[1] = (byte)((channel >> 8) & 255);
+        hdr[2] = (byte)(channel & 255);
+        hdr[3] = (byte)((payloadLength >> 24) & 255);
+        hdr[4] = (byte)((payloadLength >> 16) & 255);
+        hdr[5] = (byte)((payloadLength >> 8) & 255);
+        hdr[6] = (byte)(payloadLength & 255);
+        return hdr;
+    }
+
+    // 从缓冲区解码 7 字节帧头。
+    public static AmqpFrame DecodeHeader(byte[] buf, int offset) {
+        if (buf == null || offset < 0 || offset + 7 > buf.Length) { return null; }
+        AmqpFrame f = new AmqpFrame();
+        f.type = buf[offset] & 255;
+        f.channel = ((buf[offset + 1] & 255) << 8) | (buf[offset + 2] & 255);
+        f.length = ((buf[offset + 3] & 255) << 24) | ((buf[offset + 4] & 255) << 16)
+                 | ((buf[offset + 5] & 255) << 8) | (buf[offset + 6] & 255);
+        return f;
+    }
+
+    // 将类型、频道与载荷封包为完整的 AMQP 帧（带 0xCE 结束符）。
+    public static byte[] Encode(int type, int channel, byte[] payload, int payloadLen) {
+        int total = 7 + payloadLen + 1;
+        byte[] pkt = new byte[total];
+        pkt[0] = (byte)(type & 255);
+        pkt[1] = (byte)((channel >> 8) & 255);
+        pkt[2] = (byte)(channel & 255);
+        pkt[3] = (byte)((payloadLen >> 24) & 255);
+        pkt[4] = (byte)((payloadLen >> 16) & 255);
+        pkt[5] = (byte)((payloadLen >> 8) & 255);
+        pkt[6] = (byte)(payloadLen & 255);
+        if (payloadLen > 0 && payload != null) {
+            NativeMemory.Copy((nint)pkt + 7, (nint)payload, payloadLen);
+        }
+        pkt[total - 1] = (byte)AmqpConstants.FRAME_END;
+        return pkt;
+    }
+
+    // 构建心跳帧（Channel 0, Type 8, Length 0, End 0xCE）。
+    public static byte[] BuildHeartbeat() {
+        byte[] hb = new byte[8];
+        hb[0] = (byte)AmqpConstants.FRAME_HEARTBEAT;
+        hb[1] = 0;
+        hb[2] = 0;
+        hb[3] = 0;
+        hb[4] = 0;
+        hb[5] = 0;
+        hb[6] = 0;
+        hb[7] = (byte)AmqpConstants.FRAME_END;
+        return hb;
+    }
+}

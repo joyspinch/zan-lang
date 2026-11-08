@@ -12,60 +12,60 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
 
 ## 内容（namespace → 内容）
 
-- `System.Ai` — `AiClient`（统一 LLM 客户端：多厂商端点、流式/非流式、
+- `Ai` — `AiClient`（统一 LLM 客户端：多厂商端点、流式/非流式、
   重试、超时预算、Token 计数与成本核算）
-- `System.Ai` — `IChat`（对话后端的**统一契约**：工具声明是实体、消息是
+- `Ai` — `IChat`（对话后端的**统一契约**：工具声明是实体、消息是
   实体，线格式由各协议客户端自己渲染）+ `AnthropicClient`（Anthropic
   Messages API：`/v1/messages`、`x-api-key`、内容块数组、`tool_use`/
   `tool_result` 块）
-- `System.Ai` — `AiStream` / `AiStreamEvent` / `AiStreamResult`（流式的
+- `Ai` — `AiStream` / `AiStreamEvent` / `AiStreamResult`（流式的
   公共内核：SSE 收流、帧翻译、**工具调用的增量拼装**；事件是实体，种类
   在 `kind` 字段里）
-- `System.Ai` — `Embeddings`（OpenAI 兼容 `/v1/embeddings`：批量、
+- `Ai` — `Embeddings`（OpenAI 兼容 `/v1/embeddings`：批量、
   按 index 归位、向量归一化、维度校验）
-- `System.Ai` — `Chunking`（文档分块：递归字符分割 / token 窗口 /
+- `Ai` — `Chunking`（文档分块：递归字符分割 / token 窗口 /
   句子 / 段落）
-- `System.Ai` — `AiEndpoint`（base URL → scheme/host/port/path；
+- `Ai` — `AiEndpoint`（base URL → scheme/host/port/path；
   本地端点识别）
-- `System.Ai` — `VectorStore`（**内存**向量存储：embedding →
+- `Ai` — `VectorStore`（**内存**向量存储：embedding →
   `VectorIndex` 适配、入库/检索、导出导入往返）
-- `System.Ai` — `Retriever`（**内存**混合检索：向量语义 + BM25 字面，
+- `Ai` — `Retriever`（**内存**混合检索：向量语义 + BM25 字面，
   RRF 融合）
-- `System.Ai` — `ZanDbRetriever`（**持久化**混合检索：文档与索引存在
+- `Ai` — `ZanDbRetriever`（**持久化**混合检索：文档与索引存在
   `ZanDb` 里，走事务 + 检查点 + 原生混合检索。**生产路径用这个**）
-- `System.Ai` — `RemoteZanDbRetriever`（**远端**混合检索：文档与索引在
+- `Ai` — `RemoteZanDbRetriever`（**远端**混合检索：文档与索引在
   另一台机器的 `ZanDbServer` 上，客户端走 `ZanDbClient` 的 TCP 协议。
   **多机部署用这个**）
-- `System.Ai` — `Rag`（编排：分块 → 向量化 → 入库 → 检索 → 拼提示词 →
+- `Ai` — `Rag`（编排：分块 → 向量化 → 入库 → 检索 → 拼提示词 →
   生成；答案带引用溯源。**后端无关**：检索与写入都走接口，三档后端
   都能直接接进来）
-- `System.Ai` — `IRetriever` / `IIndexWriter`（检索与写入的统一契约，
+- `Ai` — `IRetriever` / `IIndexWriter`（检索与写入的统一契约，
   让 `Rag` 不绑定具体后端）
-- `System.Ai` — `IReranker`（重排的统一契约）+ `ApiReranker`（调
+- `Ai` — `IReranker`（重排的统一契约）+ `ApiReranker`（调
   `/v1/rerank` 的 cross-encoder 服务）+ `LlmReranker`（用通用大模型
   逐条打分）
-- `System.Ai` — `RerankHit`（重排结果：候选下标 + 分数）
-- `System.Ai` — `Conversation`（会话记忆：多轮对话的历史 + 按轮裁剪）
-- `System.Ai` — `AiMessage`（一条消息：角色 + 内容 + 工具调用 + 工具结果）
-- `System.Ai` — `ToolRegistry`（工具注册表：名字 → 委托、工具声明的
+- `Ai` — `RerankHit`（重排结果：候选下标 + 分数）
+- `Ai` — `Conversation`（会话记忆：多轮对话的历史 + 按轮裁剪）
+- `Ai` — `AiMessage`（一条消息：角色 + 内容 + 工具调用 + 工具结果）
+- `Ai` — `ToolRegistry`（工具注册表：名字 → 委托、工具声明的
   JSON、上限）
-- `System.Ai` — `ToolAgent`（工具调用循环：模型要调工具 → 执行 →
+- `Ai` — `ToolAgent`（工具调用循环：模型要调工具 → 执行 →
   结果回传 → 再问，直到给出答案）
-- `System.Ai` — `AiTool` / `AiToolCall` / `AiToolResult` / `AiToolTurn`
+- `Ai` — `AiTool` / `AiToolCall` / `AiToolResult` / `AiToolTurn`
   / `ToolEvent`（工具调用的实体：声明、调用、结果、回合、事件）
-- `System.Ai` — `McpToolBinding` / `McpTools`（把**远端 MCP 工具**接进
+- `Ai` — `McpToolBinding` / `McpTools`（把**远端 MCP 工具**接进
   本地工具注册表：远端 schema → 本地声明，本地调用 → 远端 `tools/call`。
   MCP 协议本身在 `Zan.Mcp` 包里）
-- `System.Ai` — `VectorStoreWriter`（内存档的写入适配器，把
+- `Ai` — `VectorStoreWriter`（内存档的写入适配器，把
   `VectorStore` 包成 `IIndexWriter` 契约）
-- `System.Ai` — 实体（`src/System/Ai/Models/`）：`AiConfig` /
+- `Ai` — 实体（`src/Ai/Models/`）：`AiConfig` /
   `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit`
 
 ## 快速上手
 
 ```zan
 using System;
-using System.Ai;
+using Ai;
 using System.Text;
 
 AiConfig cfg = new AiConfig("https://api.deepseek.com/v1", "sk-...", "deepseek-chat");
@@ -361,11 +361,11 @@ List<AiMessage> history = await agent.Run(questions);
 ## MCP：把远端工具接进工具循环
 
 MCP（Model Context Protocol）是"让程序去用**别的程序**的工具"的一套
-约定。协议本身在 `Zan.Mcp` 包（`System.Mcp`），本包提供**接进工具循环
+约定。协议本身在 `Zan.Mcp` 包（`Ai.Mcp`），本包提供**接进工具循环
 的那一段翻译**：
 
 ```zan
-using System.Mcp;
+using Ai.Mcp;
 
 McpClient client = new McpClient("http://127.0.0.1:8080/mcp", "token");
 if (!await client.Initialize()) {
@@ -406,7 +406,7 @@ OpenAI 兼容只是**一种**线格式。Anthropic 的 Messages API 差得不少
 上层循环不该知道这些差别，所以抽了一层契约 `IChat`：
 
 ```zan
-using System.Ai;
+using Ai;
 
 AnthropicClient client = new AnthropicClient(
     "https://api.anthropic.com", "sk-ant-...", "claude-sonnet-4-5");
@@ -451,7 +451,7 @@ Anthropic 要求 user 与 assistant 交替，而 OpenAI 的工具结果是一条
 `AiClient.Stream` 只做前者（文本增量）；`StreamWithTools` 两层都做。
 
 ```zan
-using System.Ai;
+using Ai;
 
 // onEvent 收到一个事件就返回一个 bool：false = 调用方主动停止。
 static bool OnEvent(AiStreamEvent e) {
@@ -602,7 +602,7 @@ AiStreamResult r = await client.StreamWithTools(messages, tools, 0.0, OnEvent);
   模型要用结构化结果时得自己从文本里读。
 - 工具是**同步或异步的单个委托**——不支持"需要确认才执行"这类多步
   人工介入的流程。
-- 导入 `System.Ai` 会连带解析 `System.Mcp`（本包的 `McpToolBinding` 要
+- 导入 `Ai` 会连带解析 `Ai.Mcp`（本包的 `McpToolBinding` 要
   用它）——**单独裁剪包文件**时要把 `Zan.Mcp` 一起带上。SDK 里两者是
   一起发布的，正常用不着管。
 - 无评估与可观测——这是后续的档位。

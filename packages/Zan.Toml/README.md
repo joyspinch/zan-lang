@@ -8,7 +8,7 @@ TOML v1.0 for Zan：递归下降解析器 + 写出器，解析结果落在
 
 ```zan
 using System.Json;
-using System.Toml;
+using Formats.Toml;
 
 // 解析（非法抛 TomlException，带行列号）
 JsonValue conf = Toml.Parse(tomlText);
