@@ -11,6 +11,7 @@
 #define ZAN_OBJ_RC_OFF    (-16)
 
 #define ZAN_OBJ_SITE_OFF  (-8)
+#define ZAN_OBJ_STACK_FLAG     UINT64_C(0x8000000000000000) /* 栈上提升对象标记 (免 free) */
 
 #define ZAN_STRING_MAGIC       UINT64_C(0x5a414e5354524d47) /* "ZANSTRMG" */
 #define ZAN_STRING_SENTINEL_RC UINT64_C(0xffffffffffffffff)

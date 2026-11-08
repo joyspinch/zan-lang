@@ -26,6 +26,13 @@ typedef struct {
 zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level);
 
 typedef struct {
+    int objects_analyzed;
+    int stack_promoted;
+} zan_escape_stats_t;
+
+zan_escape_stats_t zan_opt_escape(zan_irgen_t *g);
+
+typedef struct {
     int calls_devirtualized;
     int interfaces_resolved;
 } zan_devirt_stats_t;
@@ -56,6 +63,7 @@ typedef struct {
 zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level);
 
 typedef struct {
+    zan_escape_stats_t escape;
     zan_arc_opt_stats_t arc;
     zan_devirt_stats_t devirt;
     zan_constfold_stats_t constfold;

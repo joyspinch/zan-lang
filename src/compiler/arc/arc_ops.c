@@ -824,11 +824,19 @@ LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(b, entry);
     g->current_fn = fn;
     LLVMValueRef obj = LLVMGetParam(fn, 0);
+    LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+    LLVMValueRef site_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg8, 1, "sptr");
+    LLVMValueRef site_iptr = LLVMBuildBitCast(b, site_ptr, LLVMPointerType(i64, 0), "siptr");
+    LLVMValueRef site = LLVMBuildLoad2(b, i64, site_iptr, "site");
+    LLVMValueRef is_stack = zan_icmp(b, LLVMIntNE,
+        zan_and(b, site, LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0), "stkbit"),
+        LLVMConstInt(i64, 0, 0), "is_stack");
+    LLVMBasicBlockRef do_free_bb = LLVMAppendBasicBlockInContext(c, fn, "do_free");
+    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(c, fn, "ret");
+    LLVMBuildCondBr(b, is_stack, ret_bb, do_free_bb);
+
+    LLVMPositionBuilderAtEnd(b, do_free_bb);
     if (g->check_leaks) {
-        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
-        LLVMValueRef site_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg8, 1, "sptr");
-        LLVMValueRef site_iptr = LLVMBuildBitCast(b, site_ptr, LLVMPointerType(i64, 0), "siptr");
-        LLVMValueRef site = LLVMBuildLoad2(b, i64, site_iptr, "site");
         emit_leak_counter_add(g, g->g_live, -1);
         LLVMValueRef ltbl = LLVMBuildLoad2(b, LLVMPointerType(i64, 0),
             g->g_site_live, "ltbl");
@@ -850,6 +858,9 @@ LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
         zan_call2(b, free_fn_type, g->fn_free, &header_ptr, 1, "");
     }
+    LLVMBuildBr(b, ret_bb);
+
+    LLVMPositionBuilderAtEnd(b, ret_bb);
     LLVMBuildRetVoid(b);
     g->current_fn = saved_fn;
     if (saved_bb) LLVMPositionBuilderAtEnd(b, saved_bb);
