@@ -1,0 +1,144 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+using System.Linq;
+using Tasks.Jobs;
+
+[Table(Name = "t_cron_probe_item")]
+public class ProbeItem {
+    [Column(IsIdentity = true)]
+    public int id;
+    public string category;
+    public int value;
+
+    public static ProbeItem Of(string category, int val) {
+        ProbeItem p = new ProbeItem();
+        p.category = category;
+        p.value = val;
+        return p;
+    }
+}
+
+public class ProbeItemRepository : BaseRepository<ProbeItem> {
+    public ProbeItemRepository(IZanSql zsql) : base(zsql) {}
+}
+
+public class UserRecord {
+    public int id;
+    public string name;
+
+    public static UserRecord Of(int id, string name) {
+        UserRecord u = new UserRecord();
+        u.id = id;
+        u.name = name;
+        return u;
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Main() {
+        // -------------------------------------------------------------
+        // 1. 测试 Zan.Jobs CronExpression 标准 5 段式解析与时间推进
+        // -------------------------------------------------------------
+        // 每 15 分钟触发一次
+        CronExpression cron15 = CronExpression.Parse("*/15 * * * *");
+        Check(cron15.minutes[0] && cron15.minutes[15] && cron15.minutes[30] && cron15.minutes[45], "cron15 minutes step parsed");
+        Check(!cron15.minutes[1] && !cron15.minutes[14], "cron15 non-step minutes false");
+
+        // 每天凌晨 2 点整
+        CronExpression cronDaily = CronExpression.Parse("0 2 * * *");
+        Check(cronDaily.minutes[0] && !cronDaily.minutes[1], "cronDaily minute 0");
+        Check(cronDaily.hours[2] && !cronDaily.hours[3], "cronDaily hour 2");
+
+        // 工作日（周一至周五）早上 9 点整
+        CronExpression cronWorkday = CronExpression.Parse("0 9 * * 1-5");
+        Check(cronWorkday.weekdays[1] && cronWorkday.weekdays[5], "cronWorkday weekdays 1 and 5 true");
+        Check(!cronWorkday.weekdays[0] && !cronWorkday.weekdays[6], "cronWorkday weekend false");
+
+        // 测试 GetNext
+        // 假定基准时间为 2026-03-01 01:10:00 (epoch: 1772327400, 2026-03-01 01:10:00 UTC)
+        DateTime baseTime = new DateTime(1772327400L * 1000L, 0);
+        DateTime next15 = cron15.GetNext(baseTime);
+        Check(next15 != null, "cron15 next not null");
+        Check(next15.minute == 15, "cron15 next minute is 15");
+        Check(next15.hour == baseTime.hour, "cron15 next hour matches");
+
+        DateTime nextDaily = cronDaily.GetNext(baseTime);
+        Check(nextDaily != null, "cronDaily next not null");
+        Check(nextDaily.hour == 2 && nextDaily.minute == 0, "cronDaily next is 02:00");
+        Check(nextDaily.day == baseTime.day, "cronDaily next is today 02:00");
+
+        // -------------------------------------------------------------
+        // 2. 测试 Zan.Linq: UnionBy, IntersectBy, ExceptBy 现代键控集合算子
+        // -------------------------------------------------------------
+        List<UserRecord> listA = new List<UserRecord>();
+        listA.Add(UserRecord.Of(1, "Alice"));
+        listA.Add(UserRecord.Of(2, "Bob"));
+        listA.Add(UserRecord.Of(3, "Charlie"));
+
+        List<UserRecord> listB = new List<UserRecord>();
+        listB.Add(UserRecord.Of(2, "Bob_Updated"));
+        listB.Add(UserRecord.Of(4, "David"));
+
+        // UnionBy 按 id 求并集（保留首次出现的元素）
+        List<UserRecord> union = listA.UnionBy(listB, (u) => u.id);
+        Check(union.Count == 4, "unionby count 4 (1, 2, 3, 4)");
+        Check(union[0].id == 1 && union[1].id == 2 && union[2].id == 3 && union[3].id == 4, "unionby ids matched");
+        Check(union[1].name == "Bob", "unionby preserved first occurrence from listA");
+
+        // IntersectBy 按 id 求交集
+        List<UserRecord> intersect = listA.IntersectBy(listB, (u) => u.id);
+        Check(intersect.Count == 1, "intersectby count 1");
+        Check(intersect[0].id == 2 && intersect[0].name == "Bob", "intersectby element is Bob");
+
+        // ExceptBy 按 id 求差集（A 中有但 B 中没有）
+        List<UserRecord> except = listA.ExceptBy(listB, (u) => u.id);
+        Check(except.Count == 2, "exceptby count 2");
+        Check(except[0].id == 1 && except[1].id == 3, "exceptby ids 1 and 3");
+
+        // -------------------------------------------------------------
+        // 3. 测试 Zan.Data: BaseRepository Any(expr) 条件存在性探测
+        // -------------------------------------------------------------
+        string dbPath = "_scratch/test_probe_any_expr.db";
+        try { File.Delete(dbPath); } catch (Exception) {}
+
+        IZanSql zsql = new ZanSqlBuilder()
+            .UseConnectionString(DbProvider.SQLite, dbPath)
+            .Build();
+
+        zsql.CodeFirst().SyncStructure<ProbeItem>();
+        ProbeItemRepository repo = new ProbeItemRepository(zsql);
+
+        List<ProbeItem> batch = new List<ProbeItem>();
+        batch.Add(ProbeItem.Of("fruit", 100));
+        batch.Add(ProbeItem.Of("fruit", 200));
+        batch.Add(ProbeItem.Of("drink", 50));
+        repo.InsertBatch(batch);
+
+        // 测试 Any 存在性探测
+        Check(repo.Any((ProbeItem p) => p.category == "fruit"), "any fruit exists true");
+        Check(repo.Any((ProbeItem p) => p.value > 150), "any value > 150 exists true");
+        Check(!repo.Any((ProbeItem p) => p.category == "meat"), "any meat exists false");
+        Check(!repo.Any((ProbeItem p) => p.value > 1000), "any value > 1000 exists false");
+
+        try { File.Delete(dbPath); } catch (Exception) {}
+
+        if (Program.failures == 0) {
+            Console.WriteLine("ok ecosystem cron and linq extensions suite passed");
+        }
+    }
+}

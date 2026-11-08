@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Generic;
+
+namespace Tasks.Jobs;
+
+// 标准 5 段式 Unix Cron 表达式解析与时间计算引擎。
+// 格式：`minute hour day-of-month month day-of-week`
+// 各字段取值范围：
+//   - minute: 0..59
+//   - hour: 0..23
+//   - day-of-month: 1..31
+//   - month: 1..12
+//   - day-of-week: 0..6 (0=星期日, 6=星期六，7 也兼容解析为星期日)
+//
+// 支持语法：
+//   - `*` : 匹配该字段全范围
+//   - `*/step` : 步长匹配（如 `*/15`）
+//   - `start-end` : 闭区间范围匹配（如 `1-5`）
+//   - `start-end/step` : 带步长的范围匹配（如 `1-9/2`）
+//   - `a,b,c` : 逗号分隔的离散值列表（如 `1,15,30`）
+public class CronExpression {
+    private string raw;
+    public List<bool> minutes;     // 0..59
+    public List<bool> hours;       // 0..23
+    public List<bool> days;        // 1..31 (下标 0 不使用)
+    public List<bool> months;      // 1..12 (下标 0 不使用)
+    public List<bool> weekdays;    // 0..6 (0=星期日)
+
+    public string RawExpression { get { return this.raw; } }
+
+    public CronExpression(string expr) {
+        if (expr == null || expr.Trim().Length == 0) {
+            throw new ArgumentException("Cron expression cannot be empty");
+        }
+        this.raw = expr.Trim();
+        this.minutes = CronExpression.CreateBitList(60);
+        this.hours = CronExpression.CreateBitList(24);
+        this.days = CronExpression.CreateBitList(32);
+        this.months = CronExpression.CreateBitList(13);
+        this.weekdays = CronExpression.CreateBitList(7);
+
+        this.ParseInternal(this.raw);
+    }
+
+    public static CronExpression Parse(string expr) {
+        return new CronExpression(expr);
+    }
+
+    private static List<bool> CreateBitList(int size) {
+        List<bool> list = new List<bool>();
+        for (int i = 0; i < size; i = i + 1) {
+            list.Add(false);
+        }
+        return list;
+    }
+
+    private void ParseInternal(string expr) {
+        List<string> parts = expr.Split(" ");
+        List<string> tokens = new List<string>();
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string t = parts[i].Trim();
+            if (t.Length > 0) {
+                tokens.Add(t);
+            }
+        }
+        if (tokens.Count != 5) {
+            throw new FormatException("Expected 5 fields in cron expression, got " + tokens.Count.ToString());
+        }
+
+        CronExpression.ParseField(tokens[0], 0, 59, this.minutes, false);
+        CronExpression.ParseField(tokens[1], 0, 23, this.hours, false);
+        CronExpression.ParseField(tokens[2], 1, 31, this.days, false);
+        CronExpression.ParseField(tokens[3], 1, 12, this.months, false);
+        CronExpression.ParseField(tokens[4], 0, 6, this.weekdays, true);
+    }
+
+    private static void ParseField(string token, int min, int max, List<bool> bits, bool isWeekday) {
+        List<string> commaItems = token.Split(",");
+        for (int ci = 0; ci < commaItems.Count; ci = ci + 1) {
+            string item = commaItems[ci].Trim();
+            if (item.Length == 0) { continue; }
+
+            int step = 1;
+            int slashPos = item.IndexOf("/");
+            string rangePart = item;
+            if (slashPos >= 0) {
+                rangePart = item.Substring(0, slashPos);
+                string stepStr = item.Substring(slashPos + 1);
+                step = Convert.ToInt32(stepStr);
+                if (step <= 0) {
+                    throw new FormatException("Invalid step in cron: " + item);
+                }
+            }
+
+            int start = min;
+            int end = max;
+            if (rangePart == "*") {
+                start = min;
+                end = max;
+            } else {
+                int dashPos = rangePart.IndexOf("-");
+                if (dashPos >= 0) {
+                    start = Convert.ToInt32(rangePart.Substring(0, dashPos));
+                    end = Convert.ToInt32(rangePart.Substring(dashPos + 1));
+                } else {
+                    start = Convert.ToInt32(rangePart);
+                    end = slashPos >= 0 ? max : start;
+                }
+            }
+
+            if (isWeekday) {
+                if (start == 7) { start = 0; }
+                if (end == 7) { end = 0; }
+            }
+
+            if (start < min || end > max || start > end) {
+                if (!(isWeekday && (start == 0 || end == 0))) {
+                    throw new ArgumentOutOfRangeException("Cron value out of range [" + min.ToString() + ".." + max.ToString() + "]: " + item);
+                }
+            }
+
+            for (int v = start; v <= end; v = v + step) {
+                int target = (isWeekday && v == 7) ? 0 : v;
+                bits[target] = true;
+            }
+        }
+    }
+
+    // 判断给定时刻是否精准匹配本表达式
+    public bool IsMatching(DateTime dt) {
+        if (dt == null) { return false; }
+        if (!this.minutes[dt.minute]) { return false; }
+        if (!this.hours[dt.hour]) { return false; }
+        if (!this.days[dt.day]) { return false; }
+        if (!this.months[dt.month]) { return false; }
+        if (!this.weekdays[dt.dayOfWeek]) { return false; }
+        return true;
+    }
+
+    // 计算给定基准时刻之后的下一次触发时刻（向未来搜索，跳步算法 O(1) 毫秒级返回）
+    public DateTime GetNext(DateTime fromTime) {
+        if (fromTime == null) { return null; }
+        // 截断到下一分钟整分起步
+        long startMs = (fromTime.epochMs / 60000) * 60000 + 60000;
+        DateTime cur = DateTime.FromUnixMilliseconds(startMs);
+
+        // 搜索上限为 1 年（约 525600 分钟）
+        for (int i = 0; i < 525600; i = i + 1) {
+            // 1. 月份不匹配，直接跳到下个月 1 号 00:00
+            if (!this.months[cur.month]) {
+                int daysLeft = DateTime.DaysInMonth(cur.year, cur.month) - cur.day + 1;
+                cur = cur.AddDays(daysLeft);
+                cur = new DateTime((cur.epochMs / 86400000) * 86400000, 0);
+                continue;
+            }
+
+            // 2. 日期或星期不匹配，直接跳到下一天 00:00
+            if (!this.days[cur.day] || !this.weekdays[cur.dayOfWeek]) {
+                cur = cur.AddDays(1);
+                cur = new DateTime((cur.epochMs / 86400000) * 86400000, 0);
+                continue;
+            }
+
+            // 3. 小时不匹配，直接跳到下一个小时 00 分
+            if (!this.hours[cur.hour]) {
+                cur = cur.AddHours(1);
+                cur = new DateTime((cur.epochMs / 3600000) * 3600000, 0);
+                continue;
+            }
+
+            // 4. 分钟匹配，命中返回
+            if (this.minutes[cur.minute]) {
+                return cur;
+            }
+
+            cur = cur.AddMinutes(1);
+        }
+        return null;
+    }
+}
