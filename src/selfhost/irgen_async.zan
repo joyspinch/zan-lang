@@ -392,18 +392,13 @@ partial class Irgen {
         int thisExtra = 0; if (!stat) { thisExtra = 1; }
         List<string> pn = new List<string>();
         List<Node> pt = new List<Node>();
+        List<int> pr = new List<int>();
         int i = 0;
         while (i < m.kids.Count) {
             Node p = m.kids[i];
             if (p.kind == AK.Param()) {
-                if (p.ival == 1) {
-                    // a by-ref parameter: the async frame copies the
-                    // parameters by value, so the callee could not write
-                    // back into the caller's slot -- refuse instead of
-                    // silently lowering a by-value parameter
-                    diags.Error("a ref/out parameter in an async method is not supported by the self-hosted compiler yet", p.line, p.col);
-                }
                 pn.Add(p.sval); pt.Add(p.type);
+                pr.Add(p.ival);
             }
             i = i + 1;
         }
@@ -453,7 +448,11 @@ partial class Irgen {
         j = 0;
         while (j < pn.Count) {
             if (np > 0) { sig = sig + ", "; }
-            sig = sig + MapType(pt[j]) + " %p" + j;
+            if (pr[j] == 1) {
+                sig = sig + MapType(pt[j]) + "* %p" + j;
+            } else {
+                sig = sig + MapType(pt[j]) + " %p" + j;
+            }
             np = np + 1;
             j = j + 1;
         }
@@ -481,9 +480,15 @@ partial class Irgen {
         j = 0;
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
-            string vi = ToI64("%p" + j, lt);
-            L("  store i64 " + vi + ", i64* " + FrameGep("%ff", paramBase + j));
-            EmitArcRetain("%p" + j, pt[j]);
+            if (pr[j] == 1) {
+                string vi = NT();
+                L("  " + vi + " = ptrtoint " + lt + "* %p" + j + " to i64");
+                L("  store i64 " + vi + ", i64* " + FrameGep("%ff", paramBase + j));
+            } else {
+                string vi = ToI64("%p" + j, lt);
+                L("  store i64 " + vi + ", i64* " + FrameGep("%ff", paramBase + j));
+                EmitArcRetain("%p" + j, pt[j]);
+            }
             j = j + 1;
         }
         L("  ret i8* " + raw);
@@ -527,9 +532,18 @@ partial class Irgen {
         j = 0;
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
-            string reg = AddLocal(pn[j], pt[j]);
-            L("  " + reg + " = alloca " + lt);
-            asyncSlotReg.Add(reg); asyncSlotTy.Add(pt[j]); asyncSlotIdx.Add(paramBase + j);
+            if (pr[j] == 1) {
+                string tr = NT();
+                L("  " + tr + " = load i64, i64* " + FrameGep("%ff", paramBase + j));
+                string reg = NT();
+                L("  " + reg + " = inttoptr i64 " + tr + " to " + lt + "*");
+                locName.Add(pn[j]); locType.Add(pt[j]); locReg.Add(reg);
+                locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(true);
+            } else {
+                string reg = AddLocal(pn[j], pt[j]);
+                L("  " + reg + " = alloca " + lt);
+                asyncSlotReg.Add(reg); asyncSlotTy.Add(pt[j]); asyncSlotIdx.Add(paramBase + j);
+            }
             j = j + 1;
         }
         asyncLocalRegs = new List<string>();
@@ -605,7 +619,7 @@ partial class Irgen {
         // it owns, marks itself done and wakes its awaiter. The frame itself
         // is NOT freed here: the awaiter reads the result and frees it.
         Label(lCancel);
-        EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, paramBase, lnames, ltypes, localBase, false);
+        EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, pr, paramBase, lnames, ltypes, localBase, false);
         EmitAsyncComplete("0");
         L("}");
         obody.Append(entryAllocas.ToString());
@@ -624,7 +638,7 @@ partial class Irgen {
         L("define internal void @" + sym + "$cleanup(i8* %fp) {");
         L("entry:");
         L("  %ff = bitcast i8* %fp to i64*");
-        EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, paramBase, lnames, ltypes, localBase, true);
+        EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, pr, paramBase, lnames, ltypes, localBase, true);
         L("  ret void");
         L("}");
     }
@@ -634,7 +648,7 @@ partial class Irgen {
     // authority across a suspension. `freeFrame` also releases the frame
     // itself: the cleanup function does, the cancelled path does not (its
     // awaiter still reads the result and frees the frame).
-    void EmitAsyncFrameRelease(bool hasThis, Node thisTy, int thisSlot, List<string> pn, List<Node> pt,
+    void EmitAsyncFrameRelease(bool hasThis, Node thisTy, int thisSlot, List<string> pn, List<Node> pt, List<int> pr,
         int paramBase, List<string> lnames, List<Node> ltypes, int localBase, bool freeFrame) {
         if (hasThis && thisTy != null && ArcManaged(thisTy)) {
             string ctp = FrameGep("%ff", thisSlot);
@@ -643,7 +657,7 @@ partial class Irgen {
         }
         int j = 0;
         while (j < pn.Count) {
-            if (ArcManaged(pt[j])) {
+            if (pr[j] == 0 && ArcManaged(pt[j])) {
                 string cpp = FrameGep("%ff", paramBase + j);
                 string cpi = NT(); L("  " + cpi + " = load i64, i64* " + cpp);
                 EmitArcRelease(FromI64(cpi, MapType(pt[j])), pt[j]);
