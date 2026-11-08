@@ -140,10 +140,101 @@ public class JobWorker {
 
         JobResult result = null;
         try {
+            if (handler.IsAsync()) {
+                rec.state = JobState.Dead;
+                rec.endAt = DateTime.GetCurrentUnixMilliseconds();
+                rec.error = "async handler must be executed via ProcessJobAsync";
+                this.storage.Append(rec);
+                return rec;
+            }
             result = handler.run(handler.Normalize(rec.args));
         } catch (Exception e) {
             // 处理器抛异常按"可重试"处理——多数异常是临时的（网络、锁），
             // 真正不可重试的情况让处理器自己返回 JobResult.Fail。
+            result = JobResult.Retry(e.Message != null ? e.Message : "handler threw");
+        }
+        if (result == null) {
+            rec.state = JobState.Dead;
+            rec.endAt = DateTime.GetCurrentUnixMilliseconds();
+            rec.error = "handler returned null result";
+            this.storage.Append(rec);
+            return rec;
+        }
+
+        long finishedAt = DateTime.GetCurrentUnixMilliseconds();
+        if (result.ok) {
+            rec.state = JobState.Succeeded;
+            rec.endAt = finishedAt;
+            rec.error = "";
+            this.storage.Append(rec);
+            if (rec.interval > 0) {
+                this.ScheduleNext(rec, finishedAt);
+            }
+            return rec;
+        }
+
+        rec.endAt = finishedAt;
+        rec.error = result.message;
+        if (result.retryable && rec.attempts < this.policy.maxAttempts) {
+            rec.state = JobState.Failed;
+            rec.retry = rec.attempts;
+            rec.runAt = finishedAt + this.policy.DelayFor(rec.attempts);
+            this.storage.Append(rec);
+            return rec;
+        }
+        rec.state = JobState.Dead;
+        rec.retry = rec.attempts;
+        this.storage.Append(rec);
+        return rec;
+    }
+
+    // 异步处理一轮：把当前到期的任务跑一遍，支持同步与异步处理器无缝混跑，返回处理条数。
+    public async int ProcessOnceAsync() {
+        long now = DateTime.GetCurrentUnixMilliseconds();
+        List<JobRecord> all = this.storage.Snapshot();
+        int handled = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            JobRecord r = all[i];
+            if (!JobWorker.IsRunnable(r, now)) { continue; }
+            await this.ProcessJobAsync(r);
+            handled = handled + 1;
+        }
+        return handled;
+    }
+
+    // 异步执行一个任务，返回写回存储后的终态记录。
+    public async JobRecord ProcessJobAsync(JobRecord source) {
+        if (source == null) { return null; }
+        JobRecord current = this.storage.Find(source.id);
+        long now = DateTime.GetCurrentUnixMilliseconds();
+        if (current == null || !JobWorker.IsRunnable(current, now)) {
+            return null;
+        }
+        JobRecord rec = current.Copy();
+        rec.state = JobState.Processing;
+        rec.startAt = now;
+        rec.attempts = current.attempts + 1;
+        rec.worker = this.workerId;
+        rec.error = "";
+        this.storage.Append(rec);
+
+        JobHandler handler = this.registry.Find(rec.name);
+        if (handler == null) {
+            rec.state = JobState.Dead;
+            rec.endAt = DateTime.GetCurrentUnixMilliseconds();
+            rec.error = "no handler registered for job: " + rec.name;
+            this.storage.Append(rec);
+            return rec;
+        }
+
+        JobResult result = null;
+        try {
+            if (handler.IsAsync()) {
+                result = await handler.runAsync(handler.Normalize(rec.args));
+            } else {
+                result = handler.run(handler.Normalize(rec.args));
+            }
+        } catch (Exception e) {
             result = JobResult.Retry(e.Message != null ? e.Message : "handler threw");
         }
         if (result == null) {

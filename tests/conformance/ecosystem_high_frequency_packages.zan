@@ -1,0 +1,185 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using Data.Caching;
+using Data.Mapping;
+using Tasks.Jobs;
+
+// 用于映射测试的实体与 DTO
+public class SourceUser {
+    public int id;
+    public string name;
+    public string role;
+
+    public static SourceUser Of(int id, string name, string role) {
+        SourceUser u = new SourceUser();
+        u.id = id;
+        u.name = name;
+        u.role = role;
+        return u;
+    }
+}
+
+public class TargetUserDto {
+    public int userId;
+    public string displayName;
+    public bool isAdmin;
+}
+
+// 模拟二层远端缓存
+public class MockRemoteCache : IStringCache {
+    private Dictionary<string, string> store = new Dictionary<string, string>();
+
+    public string Get(string key) {
+        string v;
+        if (this.store.TryGetValue(key, out v)) { return v; }
+        return null;
+    }
+
+    public void Set(string key, string value, long ttlMs) {
+        this.store[key] = value;
+    }
+
+    public bool Remove(string key) {
+        return this.store.Remove(key);
+    }
+
+    public bool Contains(string key) {
+        return this.store.ContainsKey(key);
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static async JobResult SampleAsyncJob(string args) {
+        await Thread.SleepAsync(5);
+        if (args == "fail") {
+            return JobResult.Fail("explicit failure");
+        }
+        return JobResult.Success();
+    }
+
+    static async int RunTests() {
+        // ---------------------------------------------------------
+        // 1. Zan.Caching: MemoryCache & LayeredCache GetOrCreate 测试
+        // ---------------------------------------------------------
+        MemoryCache<string> mem = new MemoryCache<string>();
+        mem.SetCapacity(100);
+        mem.SetTtl(5000);
+
+        int fetchCounter = 0;
+        Func<string> dbFetcher = () => {
+            fetchCounter = fetchCounter + 1;
+            return "db_value_" + Convert.ToString(fetchCounter);
+        };
+
+        // 第一次调用：未命中，调用 factory 生成并写入缓存
+        string val1 = mem.GetOrCreate("k1", dbFetcher);
+        Check(val1 == "db_value_1", "memcache getorcreate first miss calls factory");
+        Check(fetchCounter == 1, "fetchCounter incremented to 1");
+
+        // 第二次调用：命中缓存，直接返回，不再调用 factory
+        string val2 = mem.GetOrCreate("k1", dbFetcher);
+        Check(val2 == "db_value_1", "memcache getorcreate second hit returns cached");
+        Check(fetchCounter == 1, "fetchCounter remains 1");
+
+        // 测试 LayeredCache 的 GetOrCreate
+        MockRemoteCache remote = new MockRemoteCache();
+        LayeredCache layered = new LayeredCache(remote, 50, 2000);
+
+        int remoteFetchCounter = 0;
+        Func<string> remoteFetcher = () => {
+            remoteFetchCounter = remoteFetchCounter + 1;
+            return "remote_gen_" + Convert.ToString(remoteFetchCounter);
+        };
+
+        string layVal1 = layered.GetOrCreate("lay_k1", 10000, remoteFetcher);
+        Check(layVal1 == "remote_gen_1", "layered getorcreate miss calls factory");
+        Check(remote.Contains("lay_k1"), "remote cache received key");
+
+        // 从远端及本地二级缓存复查命中
+        string layVal2 = layered.GetOrCreate("lay_k1", 10000, remoteFetcher);
+        Check(layVal2 == "remote_gen_1", "layered getorcreate hit cached");
+        Check(remoteFetchCounter == 1, "remoteFetchCounter remains 1");
+
+        // ---------------------------------------------------------
+        // 2. Zan.Mapping: MapList & TryMapList 集合批量映射测试
+        // ---------------------------------------------------------
+        MapProfile<SourceUser, TargetUserDto> profile = new MapProfile<SourceUser, TargetUserDto>(() => new TargetUserDto());
+        profile.Member("userId", (s, d) => { d.userId = s.id; return d; });
+        profile.Member("displayName", (s, d) => { d.displayName = s.name.ToUpper(); return d; });
+        profile.Member("isAdmin", (s, d) => { d.isAdmin = (s.role == "admin"); return d; });
+
+        List<SourceUser> srcList = new List<SourceUser>();
+        srcList.Add(SourceUser.Of(1, "alice", "admin"));
+        srcList.Add(SourceUser.Of(2, "bob", "user"));
+        srcList.Add(SourceUser.Of(3, "charlie", "user"));
+
+        List<TargetUserDto> dtoList = profile.MapList(srcList);
+        Check(dtoList.Count == 3, "maplist count 3");
+        Check(dtoList[0].userId == 1 && dtoList[0].displayName == "ALICE" && dtoList[0].isAdmin, "item 0 mapped");
+        Check(dtoList[1].userId == 2 && dtoList[1].displayName == "BOB" && !dtoList[1].isAdmin, "item 1 mapped");
+        Check(dtoList[2].userId == 3 && dtoList[2].displayName == "CHARLIE" && !dtoList[2].isAdmin, "item 2 mapped");
+
+        // 测试 TryMapList 结果对象
+        MappingResult<TargetUserDto> tryMapped = profile.TryMapList(srcList);
+        Check(!tryMapped.IsError, "trymaplist success");
+        Check(tryMapped.Targets.Count == 3, "trymaplist targets count 3");
+        Check(tryMapped.Targets[0].userId == 1, "trymaplist element 0 mapped");
+
+        // ---------------------------------------------------------
+        // 3. Zan.Jobs: 异步任务处理器 (JobRunnerAsync) 与 ProcessJobAsync
+        // ---------------------------------------------------------
+        JobStorage storage = new InMemoryJobStorage();
+        JobRegistry registry = new JobRegistry();
+        RetryPolicy retryPolicy = RetryPolicy.Default();
+        JobWorker worker = new JobWorker(storage, registry, retryPolicy);
+
+        // 注册异步任务处理器
+        registry.RegisterAsync("async_send_email", SampleAsyncJob);
+
+        // 入队一个正常异步任务
+        JobQueue queue = new JobQueue(storage);
+        string jobId1 = queue.Enqueue("async_send_email", "{\"to\":\"user@example.com\"}");
+        Check(jobId1.Length > 0, "async job enqueued");
+
+        // 异步执行该任务
+        int processed = await worker.ProcessOnceAsync();
+        Check(processed == 1, "worker processed 1 async job");
+
+        JobRecord rec1 = storage.Find(jobId1);
+        Check(rec1 != null, "job record found");
+        Check(rec1.state == JobState.Succeeded, "async job succeeded");
+
+        // 入队一个显式失败异步任务
+        string jobId2 = queue.Enqueue("async_send_email", "fail");
+        int processed2 = await worker.ProcessOnceAsync();
+        Check(processed2 == 1, "worker processed second async job");
+
+        JobRecord rec2 = storage.Find(jobId2);
+        Check(rec2 != null, "second job record found");
+        Check(rec2.state == JobState.Dead, "failed non-retryable job marked Dead");
+        Check(rec2.error == "explicit failure", "error message recorded");
+
+        // 清理工作
+        if (Program.failures == 0) {
+            Console.WriteLine("ok ecosystem high frequency packages suite passed");
+            return 0;
+        }
+        return 1;
+    }
+
+    static void Main() {
+        int r = await RunTests();
+    }
+}
