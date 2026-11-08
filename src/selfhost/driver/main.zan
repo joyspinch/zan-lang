@@ -297,7 +297,59 @@ public partial class Program {
         }
     }
 
-    static void LinkExe(string outPath, string llPath) {
+    static string FindClang() {
+        string envClang = Environment.GetEnvironmentVariable("ZAN_CLANG");
+        if (envClang != null && envClang.Length > 0 && File.Exists(envClang)) {
+            return envClang;
+        }
+        string exe = Environment.ExeDir();
+        if (File.Exists(exe + "/clang.exe")) { return exe + "/clang.exe"; }
+        if (File.Exists(exe + "/clang")) { return exe + "/clang"; }
+        if (File.Exists(exe + "/../bin/clang.exe")) { return exe + "/../bin/clang.exe"; }
+        if (File.Exists(exe + "/../llvm/bin/clang.exe")) { return exe + "/../llvm/bin/clang.exe"; }
+
+        string envLlvm = Environment.GetEnvironmentVariable("ZAN_LLVM_ROOT");
+        if (envLlvm == null || envLlvm.Length == 0) {
+            envLlvm = Environment.GetEnvironmentVariable("LLVM_ROOT");
+        }
+        if (envLlvm == null || envLlvm.Length == 0) {
+            envLlvm = Environment.GetEnvironmentVariable("LLVM_HOME");
+        }
+        if (envLlvm != null && envLlvm.Length > 0) {
+            if (File.Exists(envLlvm + "/bin/clang.exe")) { return envLlvm + "/bin/clang.exe"; }
+            if (File.Exists(envLlvm + "/clang.exe")) { return envLlvm + "/clang.exe"; }
+            if (File.Exists(envLlvm + "/bin/clang")) { return envLlvm + "/bin/clang"; }
+        }
+
+        string user = Environment.GetEnvironmentVariable("USERPROFILE");
+        if (user != null && user.Length > 0) {
+            string moz = user + "/.mozbuild/clang/bin/clang.exe";
+            if (File.Exists(moz)) { return moz; }
+        }
+
+        string pf = Environment.GetEnvironmentVariable("ProgramFiles");
+        if (pf != null && pf.Length > 0) {
+            string pfLlvm = pf + "/LLVM/bin/clang.exe";
+            if (File.Exists(pfLlvm)) { return pfLlvm; }
+            string vsComm = pf + "/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clang.exe";
+            if (File.Exists(vsComm)) { return vsComm; }
+            string vsPro = pf + "/Microsoft Visual Studio/2022/Professional/VC/Tools/Llvm/x64/bin/clang.exe";
+            if (File.Exists(vsPro)) { return vsPro; }
+            string vsEnt = pf + "/Microsoft Visual Studio/2022/Enterprise/VC/Tools/Llvm/x64/bin/clang.exe";
+            if (File.Exists(vsEnt)) { return vsEnt; }
+        }
+        string pfW64 = Environment.GetEnvironmentVariable("ProgramW6432");
+        if (pfW64 != null && pfW64.Length > 0) {
+            string pfLlvm = pfW64 + "/LLVM/bin/clang.exe";
+            if (File.Exists(pfLlvm)) { return pfLlvm; }
+            string vsComm = pfW64 + "/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clang.exe";
+            if (File.Exists(vsComm)) { return vsComm; }
+        }
+
+        return "clang";
+    }
+
+    static void LinkExe(string outPath, string llPath, string optLevel) {
         string exe = Environment.ExeDir();
         string rtDir = exe;
         if (!File.Exists(rtDir + "/zanrt_sh_rt_file.obj")) {
@@ -307,7 +359,13 @@ public partial class Program {
                 rtDir = exe + "/../build";
             }
         }
-        string cmd = "clang -O2 \"" + llPath + "\" ";
+        string clangBin = FindClang();
+        string clangStr = clangBin;
+        if (clangStr.IndexOf(" ") >= 0) {
+            clangStr = "\"" + clangStr + "\"";
+        }
+        string opt = optLevel != null && optLevel.Length > 0 ? optLevel : "-O2";
+        string cmd = clangStr + " " + opt + " -Wno-override-module \"" + llPath + "\" ";
         if (File.Exists(rtDir + "/zanrt_sh_rt_file.obj")) {
             cmd = cmd + "\"" + rtDir + "/zanrt_sh_rt_file.obj\" "
                       + "\"" + rtDir + "/zanrt_sh_rt_io.obj\" "
@@ -334,6 +392,9 @@ public partial class Program {
             }
         }
         cmd = cmd + "-lkernel32 -lshell32 -luser32 -ladvapi32 -lversion -lws2_32 -lbcrypt -o \"" + outPath + "\"";
+        if (clangStr.Length > 0 && (int)clangStr[0] == 34) {
+            cmd = "\"" + cmd + "\"";
+        }
         int rc = Nio.system(cmd);
         if (rc != 0) {
             throw "zanc: linking failed with exit code " + rc;
@@ -349,6 +410,7 @@ public partial class Program {
         string outPath = "";
         bool hasDashO = false;
         bool emitLib = false;
+        string optLevel = "-O2";
         List<string> rawInputs = new List<string>();
         int i = 0;
         while (i < argc) {
@@ -357,6 +419,21 @@ public partial class Program {
                 outPath = Environment.ArgAt(i + 1);
                 hasDashO = true;
                 i = i + 2;
+                continue;
+            }
+            if (a == "-O0" || a == "-O1" || a == "-O2" || a == "-O3" || a == "-Os" || a == "-Oz") {
+                optLevel = a;
+                i = i + 1;
+                continue;
+            }
+            if (a == "-g" || a == "--debug") {
+                optLevel = "-O0";
+                i = i + 1;
+                continue;
+            }
+            if (a == "--publish") {
+                optLevel = "-Os";
+                i = i + 1;
                 continue;
             }
             if (a == "--package-project" && i + 1 < argc) {
@@ -505,7 +582,7 @@ public partial class Program {
             if (isExe && !emitLib) {
                 string llPath = outPath + ".tmp.ll";
                 File.WriteAllText(llPath, ir);
-                LinkExe(outPath, llPath);
+                LinkExe(outPath, llPath, optLevel);
                 File.Delete(llPath);
             } else {
                 File.WriteAllText(outPath, ir);
