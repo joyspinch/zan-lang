@@ -1,4 +1,4 @@
-> **归档说明（2026-09-21）**：本文档为 GUI 自研 GPU 光栅化渲染后端切分方案设计，后端抽象 vtable 已完全在运行时落地。现行实现请参考 `src/runtime/gui_backend.h` 与 [docs/ARCHITECTURE.md](../ARCHITECTURE.md)。
+> **归档说明（2026-09-21）**：本文档为 GUI 自研 GPU 光栅化渲染后端切分方案设计，后端抽象 vtable 已完全在运行时落地。现行实现请参考 `src/runtime/gui/gui_backend.h` 与 [docs/ARCHITECTURE.md](../ARCHITECTURE.md)。
 
 # GUI 渲染后端切分方案（自研 GPU 光栅，零外部依赖，跨平台）
 
@@ -8,7 +8,7 @@
 
 - 绘制原语全部通过 `stdlib/Gui/Render.zan` 里 **45 个 `zan_gui_*` C extern** 落到运行时；
   Zan 侧只有 `Canvas` 一个类持有 `surfaceId`（int 句柄），没有任何控件直接摸像素。
-- 运行时 `src/runtime/gui_runtime.c` 里这些导出直接对 `zan_surface_t{pixels,stride,clip}` 做 CPU 光栅。
+- 运行时 `src/runtime/gui/gui_runtime.c` 里这些导出直接对 `zan_surface_t{pixels,stride,clip}` 做 CPU 光栅。
 - 窗口/事件外壳：Windows = 原生 Win32；Linux = 原生 X11（`gui_runtime_x11.c`）；
   macOS = 原生 Cocoa（`gui_runtime_mac.m`）；Android = NativeActivity 壳、
   OHOS = 原生壳。（曾有的可选 SDL3 统一外壳已随 SDL3 退役删除。）

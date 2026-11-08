@@ -67,7 +67,8 @@ mirrors the module structure of the C host in `src/compiler/`:
 | `irgen.zan`   | Lowering to LLVM IR **text**                               |
 | `irgen_expr.zan` | Irgen part: expression codegen (assignment, member access, indexing, …) |
 | `irgen_stmt.zan` | Irgen part: statement codegen, vtable emission for polymorphic classes |
-| `irgen_async.zan` | Irgen part: async/await CPS lowering (heap frames, resume steps) |
+| `irgen_async*.zan` | Irgen part: async/await CPS lowering, ANF normalization, Task & sched runtime |
+| `irgen_method.zan` | Irgen part: method/constructor codegen, static ctor, main wrapper |
 | `lsp.zan`     | Language-server surface used by the driver                    |
 | `nio.zan`     | Binary file output helper                                     |
 | `ngen*.zan`   | Cross-platform machine-code generator (x86/ARM, Mach-O/ELF/COFF/Wasm) |

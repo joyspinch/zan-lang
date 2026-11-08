@@ -14,7 +14,7 @@
 
 | # | 事实 | 出处 |
 |---|------|------|
-| 1 | GL 后端 vtable `blit_image = NULL`：贴图精灵在 GPU 路径未实现，每贴图走 CPU 光栅 + 帧缓冲上传；一帧混图片/模糊/影子即整体 CPU-GPU 同步 | `src/runtime/gui_gl_backend.c:1663`、`:527` |
+| 1 | GL 后端 vtable `blit_image = NULL`：贴图精灵在 GPU 路径未实现，每贴图走 CPU 光栅 + 帧缓冲上传；一帧混图片/模糊/影子即整体 CPU-GPU 同步 | `src/runtime/gui/gui_gl_backend.c:1663`、`:527` |
 | 2 | 批处理只覆盖几何与文本：rect/circle/radial 顶点批按 mode 聚合、文本有字形图集。传奇/RTS/卡牌的画面主体（成百上千图集精灵、图块）是全栈最弱原语 | `gui_gl_backend.c:857+` |
 | 3 | CanvasPrims 每帧程序化重画光晕（FillRadial 逐像素径向衰减）；缺少纹理烘焙层，canvas 化丢失了烘焙优化 | `packages/Zan.Game/src/Game/Kit/CanvasPrims.zan` |
 | 4 | Kit.SpriteBatch 是假批：计数器封装，逐图元 FFI 调 CDraw | `SpriteBatch.zan:10-60` |

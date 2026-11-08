@@ -1706,7 +1706,7 @@ conformance `game_debug`（44 项断言）：实体行格式化 · 过滤（id �
    `v' = M*v`）与 `System.Numerics.Matrix4x4`（行向量 `v' = v*M`）。渲染
    管线吃的是列向量那套，本包一律用 `Gui.Mat4`，不造第三套——两套约定
    之间的转换地雷已经够踩了。
-3. **光照在 CPU 上算**。当前 GPU 后端（`src/runtime/zan_game.c`）的 3D
+3. **光照在 CPU 上算**。当前 GPU 后端（`src/runtime/game/zan_game.c`）的 3D
    片元着色器把键光方向写死在 GLSL 里，没有材质与光源 uniform。本包在 CPU
    上算好着色、作为每实例 tint 传给 GPU，画面依然受材质与光照影响；原生侧
    接上多光源后可以直接切换。
@@ -1731,7 +1731,7 @@ conformance `game_render3d`（53 项断言，纯逻辑层）：相机（默认�
 复用与确定性）· 后处理（曝光 / 色调映射 / 雾 / 钳位）· 绘制层空输入。
 
 **已知边界**：**移动端 3D 未实测**——GPU 后端的 EGL/GLES 上下文路径是有的
-（`src/runtime/gui_gl_context.c`），单发 3D 没有 API 障碍，但**实例化批次**
+（`src/runtime/gui/gui_gl_context.c`），单发 3D 没有 API 障碍，但**实例化批次**
 （`Gui.MeshBatch`）依赖 `DrawElementsInstanced` / `VertexAttribDivisor`
 （GL 3.3 / GLES 3.1 core 特性，GLES 3.0 只有 ANGLE 扩展），本机无设备无法
 验证，见 `TASKS.md` A490 · **GPU 后端自带一层固定键光**，画面是"CPU 着色 ×

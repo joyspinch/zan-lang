@@ -142,7 +142,7 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   restrictions.
 
 ### macOS GUI cross (Cocoa) — link-complete for arm64 and x64
-- `src/runtime/gui_runtime_mac.m` is Objective-C against Cocoa/CoreText/QuartzCore/
+- `src/runtime/gui/gui_runtime_mac.m` is Objective-C against Cocoa/CoreText/QuartzCore/
   IOSurface/WebKit headers, which only the Apple SDK provides, so it is built on a
   Mac by `.github/workflows/drivers.yml` and the resulting `libzan_gui.dylib` is
   committed under `packages/Zan.Gui/src/Gui/drivers/macos-<arch>/`.
