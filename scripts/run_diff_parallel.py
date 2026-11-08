@@ -27,12 +27,18 @@ def log(msg):
         print(msg, flush=True)
 
 
-def run_cmd(cmd, workdir):
-    """Run a subprocess, capturing output the way execute_process does."""
+def run_cmd(cmd, workdir, timeout=0):
+    """Run a subprocess, capturing output the way execute_process does.
+    A timeout kills the process: unvetted corpus cases can miscompile into
+    a spin or a memory hog, and one runaway must not take the pool down."""
     try:
         p = subprocess.run(cmd, cwd=workdir, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE)
+                           stderr=subprocess.PIPE, timeout=timeout or None)
         return p.returncode, p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode(errors="replace")
+        err = (e.stderr or b"").decode(errors="replace")
+        return -9, out, err
     except OSError as e:
         return -1, "", str(e)
 
@@ -62,16 +68,22 @@ def run_case(case, a):
             os.remove(f)
 
     why = ""
-    rc, out, err = run_cmd([a.gen1, ll, src], a.workdir)
-    if rc != 0:
+    rc, out, err = run_cmd([a.gen1, ll, src], a.workdir, a.emit_timeout)
+    if rc == -9:
+        why = "gen1 emit timed out after %ds (miscompile spin?)" % a.emit_timeout
+    elif rc != 0:
         why = "gen1 failed to compile it (rc=%d): %s" % (rc, out)
     elif a.clang and a.rtobjs:
-        rc, out, err = run_cmd([a.clang, ll] + a.rtobjs + a.syslibs + ["-o", exe], a.workdir)
-        if rc != 0:
+        rc, out, err = run_cmd([a.clang, ll] + a.rtobjs + a.syslibs + ["-o", exe], a.workdir, a.link_timeout)
+        if rc == -9:
+            why = "clang link timed out after %ds" % a.link_timeout
+        elif rc != 0:
             why = "clang rejected the emitted IR (rc=%d): %s%s" % (rc, out, err)
     if why == "":
-        rc, out, err = run_cmd([exe], a.workdir)
-        if rc != 0:
+        rc, out, err = run_cmd([exe], a.workdir, a.run_timeout)
+        if rc == -9:
+            why = "the program timed out after %ds (spin or hang)" % a.run_timeout
+        elif rc != 0:
             why = "the program exited with %d: %s%s" % (rc, out, err)
         elif os.path.exists(os.path.join(a.case_dir, case + ".out")):
             exp = normalize(read_golden(os.path.join(a.case_dir, case + ".out")))
@@ -131,6 +143,9 @@ def main():
     ap.add_argument("--reject-dir", default="")
     ap.add_argument("--workdir", default=os.getcwd())
     ap.add_argument("--jobs", type=int, default=0)
+    ap.add_argument("--emit-timeout", type=int, default=120)
+    ap.add_argument("--link-timeout", type=int, default=180)
+    ap.add_argument("--run-timeout", type=int, default=5)
     a = ap.parse_args()
 
     os.makedirs(a.outdir, exist_ok=True)
