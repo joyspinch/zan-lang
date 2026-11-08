@@ -1,0 +1,353 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+// DataTable.Summary.zan - 页脚合计汇总、分组合计归并、色阶范围与 Top/Bottom 统计排名
+public partial class DataTable {
+    // 格式化字符串，使汇总行每帧重绘零成本。
+    // 基础聚合（求和/平均/最小/最大）在 SINGLE 一次遍历中收集：
+    // 所有此类列一起累加，N 个聚合列
+    // 只需一次遍历而非各一次。派生列
+    // （summary==6）再以 O(1) 从缓存聚合计算，
+    // 不再触碰行。
+    public static void ComputeSummary(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int nc = cols.Count;
+        while (st.aggMode.Count < nc) { st.aggMode.Add(0); }
+        int n = st.order.Count;
+
+        // 逐列累加器 + 需要扫描的列的紧凑集合
+        List<double> sumV = new List<double>();
+        List<double> minV = new List<double>();
+        List<double> maxV = new List<double>();
+        List<int> baseCols = new List<int>();
+        for (int col = 0; col < nc; col = col + 1) {
+            sumV.Add(0.0);
+            minV.Add(0.0);
+            maxV.Add(0.0);
+            int m = st.aggMode[col];
+            if (m >= 1 && m <= 4) { baseCols.Add(col); }
+        }
+
+        // ---- 在可见行上累加每个基础列 ----
+        // 累加保持在标量中，在行循环外一次性写回
+        // 逐列列表：在百万次迭代的热循环内按下标写列表
+        // 会触发 -O0 代码生成泄漏栈的 bug。
+        // 仍是每个 (基础列, 行) 一次 CellNum 读取——与
+        // 单次交错遍历的总工作量相同——而且只扫描
+        // 需要聚合的列。
+        for (int bi = 0; bi < baseCols.Count; bi = bi + 1) {
+            int bc = baseCols[bi];
+            bool realCol = cols[bc].decimals > 0;
+            bool fcol = cols[bc].formula.Length > 0;
+            double s = 0.0;
+            double mn = 0.0;
+            double mx = 0.0;
+            for (int k = 0; k < n; k = k + 1) {
+                double v = 0.0;
+                if (fcol) {
+                    // 计算列：聚合公式值；求值失败的行按 0 计入。
+                    if (!DataTable.FormulaTryReal(cols, src, st.order[k], bc, out v)) { v = 0.0; }
+                }
+                else if (realCol) { v = src.CellReal(st.order[k], bc); }
+                else { v = (double)src.CellNum(st.order[k], bc); }
+                s = s + v;
+                if (k == 0) { mn = v; mx = v; }
+                else {
+                    if (v < mn) { mn = v; }
+                    if (v > mx) { mx = v; }
+                }
+            }
+            sumV[bc] = s;
+            minV[bc] = mn;
+            maxV[bc] = mx;
+        }
+
+        DataTable.FinalizeSummary(st, cols, sumV, minV, maxV, n, src);
+    }
+
+    // 把逐列基础累加器（对 `n` 行的求和/最小/最大）转为
+    // 缓存页脚：基础模式直接解析，派生（模式 6）列读取
+    // 已完成的基础聚合，所有内容只格式化一次。
+    // 由扁平行扫描路径（ComputeSummary）和分组合并路径
+    // （ComputeSummaryFromGroups）共用，两者生成字节一致的页脚。
+    // 透视视图例外：总计行由物化聚合精确写出
+    // （PivotFinalizeSummary），常规扫描看不到格内权重。
+    public static void FinalizeSummary(DataTableState st, List<DataColumn> cols,
+                                List<double> sumV, List<double> minV,
+                                List<double> maxV, int n, DataSource src) {
+        if (st.pivotView) {
+            DataTable.PivotFinalizeSummary(st, cols);
+            return;
+        }
+        int nc = cols.Count;
+        st.aggValue.Clear();
+        st.aggReal.Clear();
+        int col = 0;
+        for (; col < nc; col = col + 1) { st.aggValue.Add(0); st.aggReal.Add(0.0); }
+        col = 0;
+        while (col < nc) {
+            int m = st.aggMode[col];
+            if (m == 1) { st.aggReal[col] = sumV[col]; }
+            else if (m == 2) { if (n > 0) { st.aggReal[col] = sumV[col] / (double)n; } }
+            else if (m == 3) { st.aggReal[col] = minV[col]; }
+            else if (m == 4) { st.aggReal[col] = maxV[col]; }
+            else if (m == 5) { st.aggReal[col] = (double)n; }
+            else if (m == 7) {
+                // 勾选行数（DevExpress Selection 汇总等位）。
+                int selN = 0;
+                for (int si = 0; si < st.selected.Count; si = si + 1) {
+                    if (st.selected[si]) { selN = selN + 1; }
+                }
+                st.aggReal[col] = (double)selN;
+            }
+            st.aggValue[col] = (int)st.aggReal[col];
+            col = col + 1;
+        }
+        col = 0;
+        while (col < nc) {
+            if (st.aggMode[col] == 6) {
+                st.aggValue[col] = DataTable.DeriveValue(cols[col], st.aggValue);
+                st.aggReal[col] = DataTable.DeriveReal(cols[col], st.aggReal);
+            }
+            col = col + 1;
+        }
+
+        // 格式化（不扫描行）。页脚只显示聚合结果本身——
+        // Σ/avg/min/max 等计算方式标记不再写进文本：
+        // 商业网格的合计行都只放数值，聚合方式是配置期
+        // 的决定，不该每帧占用宝贵的列宽（列窄时会挤掉数字）。
+        st.summaryText.Clear();
+        col = 0;
+        while (col < nc) {
+            int m = st.aggMode[col];
+            int dec = cols[col].decimals;
+            // 平均值总是保留小数，即使整数列也是如此。
+            int showDec = dec;
+            if (m == 2 && showDec == 0) { showDec = 2; }
+            string val = DataTable.FormatCell(cols[col], DataTable.FormatReal(st.aggReal[col], showDec));
+            string txt = "";
+            if (m >= 1 && m <= 4) { txt = val; }
+            else if (m == 5) { txt = Convert.ToString(n); }
+            else if (m == 7) { txt = Convert.ToString(st.aggValue[col]); }
+            else if (m == 6) {
+                int ddec = dec;
+                if (cols[col].deriveOp == 0 || cols[col].deriveOp == 1 ||
+                    cols[col].deriveOp == 5) {
+                    if (ddec == 0) { ddec = 2; }
+                }
+                // 老 DevExpress 页脚只显示数值本身（CustomSummaryCalculate
+                // 的 TotalValue 走列的 {0:0.00} 格式），不带 % 等单位。
+                txt = DataTable.FormatReal(st.aggReal[col], ddec);
+            }
+            // 聚合文案模板（老 DevExpress DisplayFormat）：{0} 替换为
+            // 默认渲染的聚合文本，{0:0.##} 等带格式说明的占位符按
+            // 说明渲染聚合值（ApplySummaryTemplate，未识别回退默认）。
+            if (txt.Length > 0 && cols[col].summaryFmt.Length > 0) {
+                txt = DataTable.ApplySummaryTemplate(cols[col].summaryFmt, txt,
+                    st.aggReal[col]);
+            }
+            // 自定义汇总计算器（CustomSummaryProvider，支持每列或全局覆写汇总计算逻辑）
+            if (cols[col].customSummary != null) {
+                string ctxt = cols[col].customSummary.CalculateSummary(st, cols, src, col);
+                if (ctxt != null && ctxt.Length > 0) { txt = ctxt; }
+            } else if (st.customSummaryProvider != null) {
+                string gtxt = st.customSummaryProvider.CalculateSummary(st, cols, src, col);
+                if (gtxt != null && gtxt.Length > 0) { txt = gtxt; }
+            }
+            st.summaryText.Add(txt);
+            col = col + 1;
+        }
+
+        // 同步维护强类型 ColumnAggregateState 实体集合（主表示）
+        if (st.aggregates == null) { st.aggregates = new List<ColumnAggregateState>(); }
+        st.aggregates.Clear();
+        for (int i = 0; i < nc; i = i + 1) {
+            int m = i < st.aggMode.Count ? st.aggMode[i] : 0;
+            int v = i < st.aggValue.Count ? st.aggValue[i] : 0;
+            double rv = i < st.aggReal.Count ? st.aggReal[i] : 0.0;
+            string stxt = i < st.summaryText.Count ? st.summaryText[i] : "";
+            st.aggregates.Add(new ColumnAggregateState(m, v, rv, stxt));
+        }
+    }
+
+    // 分组页脚：合并 BuildDisplay/FillGroupAgg 已收集的每组基础聚合
+    // （L==0 组的 st.aggSumR/aggMinR/aggMaxR，
+    // 这些组恰好划分每行一次）为总计，
+    // 无需第二次百万行扫描。组和之和 = 总和，
+    // 组最小之最小 = 总最小，组最大之最大 = 总最大，平均值 = 总和
+    // / 总行数——页脚与扁平重算结果完全一致。
+    public static void ComputeSummaryFromGroups(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int nc = cols.Count;
+        while (st.aggMode.Count < nc) { st.aggMode.Add(0); }
+        int n = st.order.Count;
+        List<double> sumV = new List<double>();
+        List<double> minV = new List<double>();
+        List<double> maxV = new List<double>();
+        for (int col = 0; col < nc; col = col + 1) {
+            double sv = 0.0;
+            double mnv = 0.0;
+            double mxv = 0.0;
+            if (col < st.aggSumR.Count) { sv = st.aggSumR[col]; }
+            if (col < st.aggMinR.Count) { mnv = st.aggMinR[col]; }
+            if (col < st.aggMaxR.Count) { mxv = st.aggMaxR[col]; }
+            // 没有任何组贡献（如空表）：回退为 0，
+            // 使页脚与对零行重算的结果一致。
+            if (mnv > 0.9e300) { mnv = 0.0; }
+            if (mxv < -0.9e300) { mxv = 0.0; }
+            sumV.Add(sv);
+            minV.Add(mnv);
+            maxV.Add(mxv);
+        }
+        DataTable.FinalizeSummary(st, cols, sumV, minV, maxV, n, src);
+    }
+
+    // 重置 FillGroupAgg 喂入的总计累加器。min/max 以
+    // 哨兵值起步，使首个贡献的组无需逐列
+    // "已见"标志即可播种；没有扫描行的列通过 FinalizeSummary
+    // 的 aggMode 分支保持聚合为 0。
+    public static void ResetGrandAgg(DataTableState st, int nc) {
+        st.aggSumR.Clear();
+        st.aggMinR.Clear();
+        st.aggMaxR.Clear();
+        for (int col = 0; col < nc; col = col + 1) {
+            st.aggSumR.Add(0.0);
+            st.aggMinR.Add(1.0e300);
+            st.aggMaxR.Add(-1.0e300);
+        }
+    }
+
+    // 筛选集合上的逐列 min/max，用于数据条和色阶
+    // 归一化。只扫描 cfMode 为 1 或 2 的列。
+    public static void ComputeColStats(DataTableState st, List<DataColumn> cols, DataSource src) {
+        st.cfMin.Clear();
+        st.cfMax.Clear();
+        st.cfMinR.Clear();
+        st.cfMaxR.Clear();
+        st.cfRank.Clear();
+        int n = st.order.Count;
+        // Top/Bottom 命中判定按显示序查名次：仅当存在规则列时
+        // 维护行->显示序字典，渲染 O(1) 查表——原实现在每个可见
+        // 格上对 st.order 做线性查找，大表每帧 O(可见格×n)。
+        bool anyRank = false;
+        for (int rc = 0; rc < cols.Count; rc = rc + 1) {
+            if (cols[rc].cfMode == 5 || cols[rc].cfMode == 6) { anyRank = true; rc = cols.Count; }
+        }
+        if (anyRank) {
+            if (st.cfOrderPos == null) { st.cfOrderPos = new Dict<int, int>(); }
+            st.cfOrderPos.Clear();
+            for (int op = 0; op < n; op = op + 1) { st.cfOrderPos[st.order[op]] = op; }
+        } else if (st.cfOrderPos != null) {
+            st.cfOrderPos.Clear();
+        }
+        if (st.cfExtents == null) { st.cfExtents = new List<ColumnCfExtents>(); }
+        st.cfExtents.Clear();
+        for (int col = 0; col < cols.Count; col = col + 1) {
+            double mn = 0.0;
+            double mx = 0.0;
+            if (cols[col].cfMode == 1 || cols[col].cfMode == 2) {
+                bool realCol = cols[col].decimals > 0;
+                bool fcol = cols[col].formula.Length > 0;
+                for (int k = 0; k < n; k = k + 1) {
+                    double v = 0.0;
+                    if (fcol) {
+                        if (!DataTable.FormulaTryReal(cols, src, st.order[k], col, out v)) { v = 0.0; }
+                    }
+                    else if (realCol) { v = src.CellReal(st.order[k], col); }
+                    else { v = (double)src.CellNum(st.order[k], col); }
+                    if (k == 0) { mn = v; mx = v; }
+                    else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
+                }
+            }
+            st.cfExtents.Add(new ColumnCfExtents((int)mn, (int)mx, mn, mx));
+            st.cfMinR.Add(mn);
+            st.cfMaxR.Add(mx);
+            st.cfMin.Add((int)mn);
+            st.cfMax.Add((int)mx);
+            // Top/Bottom 规则（cfMode 5/6）：本列过滤集合的降序名次
+            // 缓存。名次 = 严格大于该值的行数，并列值同名次（Excel
+            // Top N 的宽判定）——降序稳定归并后同值段的首位即严格
+            // 大于计数，O(n log n)。早期实现是 O(n²) 逐对计数，
+            // 4 万行一次 Recompute 要 5.6 秒。
+            if (cols[col].cfMode == 5 || cols[col].cfMode == 6) {
+                bool realCol2 = cols[col].decimals > 0;
+                bool fcol2 = cols[col].formula.Length > 0;
+                List<double> vals = new List<double>();
+                for (int k = 0; k < n; k = k + 1) {
+                    double v = 0.0;
+                    if (fcol2) {
+                        if (!DataTable.FormulaTryReal(cols, src, st.order[k], col, out v)) { v = 0.0; }
+                    }
+                    else if (realCol2) { v = src.CellReal(st.order[k], col); }
+                    else { v = (double)src.CellNum(st.order[k], col); }
+                    vals.Add(v);
+                }
+                List<int> ranks = new List<int>();
+                DataTable.RankByValue(vals, ranks);
+                for (int k = 0; k < n; k = k + 1) { st.cfRank.Add(ranks[k]); }
+            } else {
+                for (int k = 0; k < n; k = k + 1) { st.cfRank.Add(0); }
+            }
+        }
+    }
+
+    // Top/Bottom 名次：ranks[k] = vals 中严格大于 vals[k] 的个数
+    // （并列值同名次，与旧 O(n²) 逐对计数语义一致）。索引数组按
+    // 值降序稳定归并排序，同值段的首位即该段的名次。
+    public static void RankByValue(List<double> vals, List<int> ranks) {
+        int n = vals.Count;
+        ranks.Clear();
+        for (int i = 0; i < n; i = i + 1) { ranks.Add(0); }
+        if (n < 2) { return; }
+        List<int> idx = new List<int>();
+        List<int> tmp = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { idx.Add(i); tmp.Add(0); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.RankMerge(vals, idx, lo, mid, hi, tmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+        int s = 0;
+        while (s < n) {
+            int e = s + 1;
+            while (e < n && vals[idx[e]] == vals[idx[s]]) { e = e + 1; }
+            int k = s;
+            while (k < e) { ranks[idx[k]] = s; k = k + 1; }
+            s = e;
+        }
+    }
+
+    // RankByValue 的一趟合并：按值降序，相等保留原序（稳定）。
+    public static void RankMerge(List<double> vals, List<int> idx, int lo, int mid, int hi, List<int> tmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            if (vals[idx[j]] > vals[idx[i]]) { tmp[k] = idx[j]; j = j + 1; }
+            else { tmp[k] = idx[i]; i = i + 1; }
+            k = k + 1;
+        }
+        while (i < mid) { tmp[k] = idx[i]; i = i + 1; k = k + 1; }
+        while (j < hi) { tmp[k] = idx[j]; j = j + 1; k = k + 1; }
+        int p = lo;
+        while (p < hi) { idx[p] = tmp[p]; p = p + 1; }
+    }
+
+    // 行源索引在过滤集合（st.order）中的显示序；没有 Top/Bottom
+    // 规则列时字典不维护，恒 -1。渲染的 Top/Bottom 命中判定
+    // 用它替代对 st.order 的线性查找。
+    public static int CfOrderPos(DataTableState st, int row) {
+        if (st.cfOrderPos == null) { return 0 - 1; }
+        if (!st.cfOrderPos.ContainsKey(row)) { return 0 - 1; }
+        return st.cfOrderPos[row];
+    }
+}

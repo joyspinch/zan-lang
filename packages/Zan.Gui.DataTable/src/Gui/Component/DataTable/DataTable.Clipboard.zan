@@ -1,0 +1,177 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+// DataTable.Clipboard.zan - 单元格范围选区与剪贴板/CSV 导出文本构建
+public partial class DataTable {
+    // ---------- 选择 / 剪贴板 / 导出辅助 ----------
+
+    // 两者中较小的整数。
+    public static int MinI(int a, int b) { if (a < b) { return a; } return b; }
+    // 两者中较大的整数。
+    public static int MaxI(int a, int b) { if (a > b) { return a; } return b; }
+
+    // 当前存在单元格范围选择时为 true。
+    public static bool HasRange(DataTableState st) {
+        return st.rangeR0 >= 0 && st.rangeC0 >= 0;
+    }
+
+    // 当前已有任意选中行（勾选框或范围选中）时为 true。
+    public static bool HasSelection(DataTableState st) {
+        for (int i = 0; i < st.selected.Count; i = i + 1) {
+            if (st.selected[i]) { return true; }
+        }
+        return false;
+    }
+
+    // 转义单个 CSV 字段（含逗号、引号或换行时加引号，内嵌引号翻倍）。
+    public static string CsvField(string v) {
+        bool needsQuote = false;
+        int i = 0;
+        while (i < v.Length) {
+            char ch = v[i];
+            int cc = (int)ch;
+            if (cc == 44 || cc == 34 || cc == 10 || cc == 13) { needsQuote = true; i = v.Length; }
+            else { i = i + 1; }
+        }
+        if (!needsQuote) { return v; }
+        // 将内嵌引号翻倍；用 Substring 复制片段，
+        // 使非 ASCII 字符完整保留（不做逐字符重建）。
+        string body = "";
+        int start = 0;
+        for (int k = 0; k < v.Length; k = k + 1) {
+            if ((int)v[k] == 34) {
+                body = body + v.Substring(start, k - start + 1) + "\"";
+                start = k + 1;
+            }
+        }
+        body = body + v.Substring(start, v.Length - start);
+        return "\"" + body + "\"";
+    }
+
+    // 为当前单元格范围构建制表符分隔（剪贴板）或逗号分隔（CSV）文本块；
+    // 无范围则用勾选的行，
+    // 否则用整个（过滤/排序后的）视图。`csv` 决定分隔符和转义方式；
+    // `withHeader` 在前面加上列标题。
+    // Ctrl 追加出的多区域选区按区域顺序逐块拼接（Excel 同款：
+    // 每个区域独立成段，区域间不共享行）。
+    public static string BuildText(DataTableState st, List<DataColumn> cols, DataSource src, bool csv, bool withHeader) {
+        string sep = "\t";
+        if (csv) { sep = ","; }
+        string nl = "\r\n";
+        string outp = "";
+
+        // 多区域：逐区域追加文本段。
+        if (DataTable.RangeCount(st) > 1) {
+            int n = DataTable.RangeCount(st);
+            for (int mi = 0; mi < n; mi = mi + 1) {
+                int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
+                if (!DataTable.RangeAt(st, mi, out mr0, out mc0, out mr1, out mc1)) { continue; }
+                if (withHeader) {
+                    string hline = "";
+                    int hc = mc0;
+                    while (hc <= mc1) {
+                        string h = cols[hc].title;
+                        if (csv) { h = DataTable.CsvField(h); }
+                        if (hc > mc0) { hline = hline + sep; }
+                        hline = hline + h;
+                        hc = hc + 1;
+                    }
+                    outp = outp + hline + nl;
+                }
+                int mrr = mr0;
+                while (mrr <= mr1) {
+                    if (mrr >= 0 && mrr < st.order.Count) {
+                        int srcRow = st.order[mrr];
+                        string line = "";
+                        int cc = mc0;
+                        while (cc <= mc1) {
+                            string v = DataTable.CellTextRouted(cols, src, srcRow, cc);
+                            if (csv) { v = DataTable.CsvField(v); }
+                            if (cc > mc0) { line = line + sep; }
+                            line = line + v;
+                            cc = cc + 1;
+                        }
+                        outp = outp + line + nl;
+                    }
+                    mrr = mrr + 1;
+                }
+            }
+            return outp;
+        }
+
+        int c0 = 0;
+        int c1 = cols.Count - 1;
+        bool rangeMode = DataTable.HasRange(st);
+        if (rangeMode) {
+            c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+            c1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+            // 与多区域路径同一口径：列集可能在选取后被重建
+            // （画廊每帧重建列），复制前夹到现存列，宁少不越界。
+            if (c0 < 0) { c0 = 0; }
+            if (c1 > cols.Count - 1) { c1 = cols.Count - 1; }
+            if (c0 > c1) { return ""; }
+        }
+
+        if (withHeader) {
+            string line = "";
+            int cc = c0;
+            while (cc <= c1) {
+                string h = cols[cc].title;
+                if (csv) { h = DataTable.CsvField(h); }
+                if (cc > c0) { line = line + sep; }
+                line = line + h;
+                cc = cc + 1;
+            }
+            outp = line + nl;
+        }
+
+        if (rangeMode) {
+            int r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+            int r1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            int rr = r0;
+            while (rr <= r1) {
+                if (rr >= 0 && rr < st.order.Count) {
+                    int srcRow = st.order[rr];
+                    string line = "";
+                    int cc = c0;
+                    while (cc <= c1) {
+                        string v = DataTable.CellTextRouted(cols, src, srcRow, cc);
+                        if (csv) { v = DataTable.CsvField(v); }
+                        if (cc > c0) { line = line + sep; }
+                        line = line + v;
+                        cc = cc + 1;
+                    }
+                    outp = outp + line + nl;
+                }
+                rr = rr + 1;
+            }
+            return outp;
+        }
+
+        // 否则：选中的行；未勾选任何行时用整个视图
+        bool anySel = false;
+        int s = 0;
+        while (s < st.order.Count) { if (DataTable.IsSelected(st, src, st.order[s])) { anySel = true; s = st.order.Count; } else { s = s + 1; } }
+        for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
+            int ri = st.order[oi];
+            if (!anySel || DataTable.IsSelected(st, src, ri)) {
+                string line = "";
+                int cc = c0;
+                while (cc <= c1) {
+                    string v = DataTable.CellTextRouted(cols, src, ri, cc);
+                    if (csv) { v = DataTable.CsvField(v); }
+                    if (cc > c0) { line = line + sep; }
+                    line = line + v;
+                    cc = cc + 1;
+                }
+                outp = outp + line + nl;
+            }
+        }
+        return outp;
+    }
+}

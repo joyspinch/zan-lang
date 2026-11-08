@@ -1,0 +1,337 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// DataTable.TreeDetail.zan - 树状层级折叠展开与主从明细面板 (Tree & Master-Detail)
+public partial class DataTable {
+    // 启用树模式（传入适配器）或关闭（null）。`treeColumn`
+    // 是渲染缩进与展开箭头的列索引（-1 = 首列）。关闭时
+    // 展开状态一并清空；开启时保持干净状态。
+    public static void SetTreeAdapter(DataTableState st, TreeAdapter adapter, int treeColumn) {
+        st.treeAdapter = adapter;
+        st.expandedTree.Clear();
+        if (treeColumn < -1) { treeColumn = -1; }
+        st.treeCol = treeColumn;
+        DataTable.InvalidateData(st);
+    }
+
+    // 一键开启单表自关联树形层级模式（AG Grid treeData & DevExpress TreeList 对标，零样板代码）：
+    public static void SetTreeHierarchy(DataTableState st, int idCol, int parentCol, int displayCol) {
+        DataTable.SetTreeAdapter(st, new IdTreeAdapter(idCol, parentCol), displayCol);
+    }
+
+    // 根据字段名一键开启单表自关联树形层级模式：
+    public static void SetTreeHierarchy(DataTableState st, List<DataColumn> cols, string idField, string parentField, string displayField) {
+        int ic = DataTable.Col(cols, idField);
+        int pc = DataTable.Col(cols, parentField);
+        int dc = DataTable.Col(cols, displayField);
+        if (ic >= 0 && pc >= 0 && dc >= 0) {
+            DataTable.SetTreeHierarchy(st, ic, pc, dc);
+        }
+    }
+
+    // 树模式是否启用。
+    public static bool HasTree(DataTableState st) { return st.treeAdapter != null; }
+
+    // 补齐按源行索引对齐的展开标志列表。
+    public static void TreeReserve(DataTableState st, DataSource src) {
+        if (st.expandedTree == null) { st.expandedTree = new List<bool>(); }
+        while (st.expandedTree.Count < src.RowCount()) { st.expandedTree.Add(false); }
+    }
+
+    // `row`（源索引）是否展开。折叠/叶子/越界均为 false。
+    public static bool IsTreeExpanded(DataTableState st, DataSource src, int row) {
+        if (st.treeAdapter == null || row < 0 || row >= st.expandedTree.Count) {
+            return false;
+        }
+        return st.expandedTree[row];
+    }
+
+    // `row` 是否有子行（可展开）。适配器为 null 或行越界
+    // 时为 false。懒加载行在子行尚未取回时同样可展开——
+    // 展开本身就是取回的触发器。
+    public static bool CanTreeExpand(DataTableState st, DataSource src, int row) {
+        if (st.treeAdapter == null || src == null) { return false; }
+        if (row < 0 || row >= src.RowCount()) { return false; }
+        if (st.treeAdapter.ChildCount(src, row) > 0) { return true; }
+        return st.treeAdapter.IsLazy(src, row)
+            && !st.treeAdapter.ChildrenLoaded(src, row);
+    }
+
+    // 展开 `row`。叶子或已展开的行保持不变。
+    public static void TreeExpand(DataTableState st, DataSource src, int row) {
+        if (!DataTable.CanTreeExpand(st, src, row)) { return; }
+        DataTable.TreeReserve(st, src);
+        if (st.expandedTree[row]) { return; }
+        // 懒加载行首次展开：置 loading（树列显示 spinner 占位）
+        // 并调用适配器开始取回。展开标志同样置位——子行插入
+        // 数据源后 BuildTreeDisplay 下一帧自然长出，应用无需
+        // 再补一次展开状态。
+        if (st.treeAdapter.ChildCount(src, row) == 0
+            && st.treeAdapter.IsLazy(src, row)
+            && !st.treeAdapter.ChildrenLoaded(src, row)) {
+            while (st.treeLoading.Count <= row) { st.treeLoading.Add(false); }
+            st.treeLoading[row] = true;
+            st.treeAdapter.LoadChildren(src, row);
+            // 同步完成的适配器（LoadChildren 返回即已就绪）就地
+            // 清标志；异步适配器取回后调用 TreeLoaded 清。
+            if (st.treeAdapter.ChildrenLoaded(src, row)) {
+                st.treeLoading[row] = false;
+            }
+        }
+        st.expandedTree[row] = true;
+        DataTable.InvalidateView(st);
+    }
+
+    // 懒加载进行中的行（树列绘制占位指示）。
+    public static bool TreeIsLoading(DataTableState st, int row) {
+        return row >= 0 && row < st.treeLoading.Count && st.treeLoading[row];
+    }
+
+    // 应用取回懒加载子行后调用：解除 loading 标记并触发
+    // 重算，已插入数据源的子行在下一帧出现。
+    public static void TreeLoaded(DataTableState st, DataSource src, int row) {
+        if (row >= 0 && row < st.treeLoading.Count) { st.treeLoading[row] = false; }
+        st.dirty = true;
+        DataTable.InvalidateView(st);
+    }
+
+    // 树形递归 Rollup 聚合计算（aggMode: 0=Sum, 1=Avg, 2=Min, 3=Max, 4=Count）
+    public static double TreeRollup(TreeAdapter tree, DataSource src, int row, int col, int aggMode) {
+        if (tree == null) { return 0.0; }
+        return tree.Rollup(src, row, col, aggMode);
+    }
+
+    public static double TreeRollupSum(TreeAdapter tree, DataSource src, int row, int col) {
+        if (tree == null) { return 0.0; }
+        return tree.RollupSum(src, row, col);
+    }
+
+    public static double TreeRollupAvg(TreeAdapter tree, DataSource src, int row, int col) {
+        if (tree == null) { return 0.0; }
+        return tree.RollupAvg(src, row, col);
+    }
+
+    public static double TreeRollupMin(TreeAdapter tree, DataSource src, int row, int col) {
+        if (tree == null) { return 0.0; }
+        return tree.RollupMin(src, row, col);
+    }
+
+    public static double TreeRollupMax(TreeAdapter tree, DataSource src, int row, int col) {
+        if (tree == null) { return 0.0; }
+        return tree.RollupMax(src, row, col);
+    }
+
+    public static int TreeRollupCount(TreeAdapter tree, DataSource src, int row) {
+        if (tree == null) { return 0; }
+        return tree.RollupCount(src, row);
+    }
+
+    // 折叠 `row`。未展开的行保持不变。
+    public static void TreeCollapse(DataTableState st, DataSource src, int row) {
+        if (st.treeAdapter == null || row < 0 || row >= st.expandedTree.Count) {
+            return;
+        }
+        if (!st.expandedTree[row]) { return; }
+        st.expandedTree[row] = false;
+        DataTable.InvalidateView(st);
+    }
+
+    // 切换 `row` 的展开与折叠。
+    public static void TreeToggle(DataTableState st, DataSource src, int row) {
+        if (DataTable.IsTreeExpanded(st, src, row)) {
+            DataTable.TreeCollapse(st, src, row);
+        } else {
+            DataTable.TreeExpand(st, src, row);
+        }
+    }
+
+    // 展开全部含子行的行。远程/懒加载源上慎用：
+    // 这会对每个行调用一次 ChildCount。
+    public static void TreeExpandAll(DataTableState st, DataSource src) {
+        if (st.treeAdapter == null || src == null) { return; }
+        DataTable.TreeReserve(st, src);
+        bool changed = false;
+        for (int row = 0; row < src.RowCount(); row = row + 1) {
+            if (!st.expandedTree[row] && st.treeAdapter.ChildCount(src, row) > 0) {
+                st.expandedTree[row] = true;
+                changed = true;
+            }
+        }
+        if (changed) { DataTable.InvalidateView(st); }
+    }
+
+    // 折叠全部行（根行保留）。
+    public static void TreeCollapseAll(DataTableState st, DataSource src) {
+        if (st.treeAdapter == null) { return; }
+        bool changed = false;
+        for (int i = 0; i < st.expandedTree.Count; i = i + 1) {
+            if (st.expandedTree[i]) { st.expandedTree[i] = false; changed = true; }
+        }
+        if (changed) { DataTable.InvalidateView(st); }
+    }
+
+    // 展开到指定深度：深度 < level 的祖先全部展开，
+    // 深度 >= level 的行折叠。level 0 = 只显示根，
+    // level 1 = 根 + 直接子行，以此类推。负值按 0 处理。
+    // 深度来自适配器的层级投影（BuildTreeDisplay 与本
+    // 方法共享同一 DFS 定义）。
+    public static void TreeExpandToLevel(DataTableState st, DataSource src, int level) {
+        if (st.treeAdapter == null || src == null) { return; }
+        if (level < 0) { level = 0; }
+        DataTable.TreeCollapseAll(st, src);
+        // 与 BuildTreeDisplay 相同的迭代 DFS：把深度 < level
+        // 的祖先行标记为展开。子行关系直接问适配器，
+        // 不依赖显示模型。
+        List<int> stRow = new List<int>();
+        List<int> stDepth = new List<int>();
+        int roots = st.treeAdapter.RootCount(src);
+        for (int i = roots - 1; i >= 0; i = i - 1) {
+            int root = st.treeAdapter.RootAt(src, i);
+            if (root >= 0) { stRow.Add(root); stDepth.Add(0); }
+        }
+        DataTable.TreeReserve(st, src);
+        while (stRow.Count > 0) {
+            int last = stRow.Count - 1;
+            int row = stRow[last];
+            int depth = stDepth[last];
+            stRow.RemoveAt(last);
+            stDepth.RemoveAt(last);
+            if (depth >= level) { continue; }
+            int n = st.treeAdapter.ChildCount(src, row);
+            if (n <= 0) { continue; }
+            if (row >= st.expandedTree.Count) { continue; }
+            st.expandedTree[row] = true;
+            for (int k = n - 1; k >= 0; k = k - 1) {
+                int child = st.treeAdapter.ChildOf(src, row, k);
+                if (child >= 0 && child < src.RowCount()) {
+                    stRow.Add(child);
+                    stDepth.Add(depth + 1);
+                }
+            }
+        }
+        DataTable.InvalidateView(st);
+    }
+
+    // ---------- 主从详情 ----------
+    // 行可在其下方展开面板：子表、表单或图表。
+    // 展开状态按*源*行索引跟踪，行在排序和筛选后
+    // 仍跟随该行，而非固定在显示位置。
+
+    // 挂接绘制详情面板的钩子以启用该功能。传入
+    // null 可关闭（所有行折叠；其余状态不受影响）。
+    public static void SetDetail(DataTableState st, DetailProvider p) {
+        st.detail = p;
+        if (p == null) {
+            st.expandedRows.Clear();
+            st.expandedKeys.Clear();
+            st.expandedByKey = false;
+        }
+        DataTable.InvalidateView(st);
+    }
+
+    // 挂接真 Control 行明细模板（零胶水代码，一行挂载任意真实 Gui.Control 作为行详情模板）：
+    public static void SetDetailControl(DataTableState st, DetailControlFactory f, int slots) {
+        DataTable.SetDetail(st, new ControlDetailProvider(f, slots));
+    }
+
+    // 主从详情是否处于启用状态。
+    public static bool HasDetail(DataTableState st) { return st.detail != null; }
+
+    // 详情 band 的高度，以整行高计，至少 1。向
+    // provider 询问使每行不同大小（如每条子记录一个槽位）成为可能。
+    public static int DetailSlots(DataTableState st, DataSource src, int row) {
+        if (st.detail == null) { return 0; }
+        int n = st.detail.Slots(src, row);
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    // `row`（源索引）当前是否已展开。旧重载保留给
+    // 只持有源索引的兼容调用；内部渲染优先使用 key 重载。
+    public static bool IsExpanded(DataTableState st, int row) {
+        return st.expandedRows.IndexOf(row) >= 0;
+    }
+
+    // `row` 是否展开（key 模式按业务键匹配，否则按源行索引）。
+    public static bool IsExpanded(DataTableState st, DataSource src, int row) {
+        if (st.expandedByKey) {
+            RowKey key = DataTable.RowKeyAt(st, src, row);
+            if (key == null) { return false; }
+            for (int i = 0; i < st.expandedKeys.Count; i = i + 1) {
+                if (st.expandedKeys[i].Same(key)) { return true; }
+            }
+            return false;
+        }
+        return st.expandedRows.IndexOf(row) >= 0;
+    }
+
+    // `row` 是否提供详情面板——功能关闭或
+    // provider 拒绝该行时返回 false，此时不绘制箭头。
+    public static bool CanExpand(DataTableState st, DataSource src, int row) {
+        if (st.detail == null) { return false; }
+        if (row < 0 || row >= src.RowCount()) { return false; }
+        return st.detail.CanExpand(src, row);
+    }
+
+    // 打开 `row` 的详情面板。provider 拒绝的行或已打开的
+    // 行保持不变。
+    public static void ExpandRow(DataTableState st, DataSource src, int row) {
+        if (!DataTable.CanExpand(st, src, row)) { return; }
+        if (DataTable.IsExpanded(st, src, row)) { return; }
+        if (st.expandedByKey) {
+            RowKey key = DataTable.RowKeyAt(st, src, row);
+            if (key != null) { st.expandedKeys.Add(key); }
+        } else {
+            st.expandedRows.Add(row);
+        }
+        DataTable.InvalidateView(st);
+    }
+
+    // 关闭 `row` 的详情面板。未打开的行保持不变。
+    public static void CollapseRow(DataTableState st, int row) {
+        int i = st.expandedRows.IndexOf(row);
+        if (i < 0) { return; }
+        st.expandedRows.RemoveAt(i);
+        DataTable.InvalidateView(st);
+    }
+
+    // CollapseRow 的 key 感知重载：key 模式按业务键移除，
+    // 否则委托给源索引重载。
+    public static void CollapseRow(DataTableState st, DataSource src, int row) {
+        if (st.expandedByKey) {
+            RowKey key = DataTable.RowKeyAt(st, src, row);
+            int i = 0;
+            while (i < st.expandedKeys.Count) {
+                if (st.expandedKeys[i].Same(key)) { st.expandedKeys.RemoveAt(i); }
+                else { i = i + 1; }
+            }
+            DataTable.InvalidateView(st);
+            return;
+        }
+        DataTable.CollapseRow(st, row);
+    }
+
+    // 切换 `row` 详情面板的展开与收起。
+    public static void ToggleDetail(DataTableState st, DataSource src, int row) {
+        if (DataTable.IsExpanded(st, src, row)) { DataTable.CollapseRow(st, src, row); }
+        else { DataTable.ExpandRow(st, src, row); }
+    }
+
+    // 关闭所有已展开的详情面板。
+    public static void CollapseAllDetail(DataTableState st) {
+        if (st.expandedRows.Count == 0 && st.expandedKeys.Count == 0) { return; }
+        st.expandedRows.Clear();
+        st.expandedKeys.Clear();
+        DataTable.InvalidateView(st);
+    }
+
+    // 当前有多少行的详情面板处于展开状态。
+    public static int ExpandedCount(DataTableState st) {
+        if (st.expandedByKey) { return st.expandedKeys.Count; }
+        return st.expandedRows.Count;
+    }
+}
