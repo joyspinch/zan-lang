@@ -1,0 +1,127 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+using Data.Caching;
+
+[Table(Name = "t_seek_log_entry")]
+public class LogEntry {
+    [Column(IsIdentity = true)]
+    public int id;
+    public string message;
+    public long timestamp;
+
+    public static LogEntry Of(string msg, long ts) {
+        LogEntry e = new LogEntry();
+        e.message = msg;
+        e.timestamp = ts;
+        return e;
+    }
+}
+
+public class LogEntryRepository : BaseRepository<LogEntry> {
+    public LogEntryRepository(IZanSql zsql) : base(zsql) {}
+}
+
+class Program {
+    static int failures = 0;
+    static int factoryCallCount = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static async string AsyncUserLoader() {
+        Program.factoryCallCount = Program.factoryCallCount + 1;
+        return "user_data_payload_v1";
+    }
+
+    static async int RunTests() {
+        // -------------------------------------------------------------
+        // 1. 测试 MemoryCache 异步读穿透回填 (GetOrCreateAsync)
+        // -------------------------------------------------------------
+        MemoryCache<string> cache = new MemoryCache<string>();
+        Program.factoryCallCount = 0;
+
+        // 第一次：未命中，调用 AsyncUserLoader
+        string val1 = await cache.GetOrCreateAsync("user:1001", 60000, AsyncUserLoader);
+        Check(val1 == "user_data_payload_v1", "cache getorcreateasync returned value");
+        Check(Program.factoryCallCount == 1, "async factory called once on miss");
+
+        // 第二次：命中缓存，不再触发异步 factory
+        string val2 = await cache.GetOrCreateAsync("user:1001", 60000, AsyncUserLoader);
+        Check(val2 == "user_data_payload_v1", "cache getorcreateasync returned cached value");
+        Check(Program.factoryCallCount == 1, "async factory NOT called again on hit");
+
+        // -------------------------------------------------------------
+        // 2. 测试 ORM 数据库批量分块写入 (InsertBatchChunked)
+        // -------------------------------------------------------------
+        string dbPath = "_scratch/test_seek_cache.db";
+        try { File.Delete(dbPath); } catch (Exception) {}
+
+        IZanSql zsql = new ZanSqlBuilder()
+            .UseConnectionString(DbProvider.SQLite, dbPath)
+            .Build();
+
+        zsql.CodeFirst().SyncStructure<LogEntry>();
+        LogEntryRepository repo = new LogEntryRepository(zsql);
+
+        // 构造 35 条日志记录，按 chunkSize = 10 插入（应触发 4 个分块批次）
+        List<LogEntry> logs = new List<LogEntry>();
+        for (int i = 1; i <= 35; i = i + 1) {
+            logs.Add(LogEntry.Of("log_msg_" + i.ToString(), 1770000000000L + (long)i));
+        }
+
+        int aff = repo.InsertBatchChunked(logs, 10);
+        Check(aff == 35, "insertbatchchunked total affected 35");
+        Check(repo.Count() == 35, "repo count matches 35");
+
+        // -------------------------------------------------------------
+        // 3. 测试 ORM 大表键控游标分页 (SeekPage) 升序遍历
+        // -------------------------------------------------------------
+        // 第 1 批：游标 0，批大小 10 -> 返回 id 1..10, hasMore = true, lastCursor = 10
+        SeekResult<LogEntry> p1 = repo.SeekPage(0, 10, true);
+        Check(p1.count == 10, "page 1 count 10");
+        Check(p1.hasMore == true, "page 1 hasMore true");
+        Check(p1.items[0].id == 1 && p1.items[9].id == 10, "page 1 items id 1..10");
+        Check(p1.lastCursor == 10, "page 1 lastCursor is 10");
+
+        // 第 2 批：游标 10，批大小 10 -> 返回 id 11..20, hasMore = true, lastCursor = 20
+        SeekResult<LogEntry> p2 = repo.SeekPage(p1.lastCursor, 10, true);
+        Check(p2.count == 10, "page 2 count 10");
+        Check(p2.hasMore == true, "page 2 hasMore true");
+        Check(p2.items[0].id == 11 && p2.items[9].id == 20, "page 2 items id 11..20");
+        Check(p2.lastCursor == 20, "page 2 lastCursor is 20");
+
+        // 第 3 批：游标 20，批大小 10 -> 返回 id 21..30, hasMore = true, lastCursor = 30
+        SeekResult<LogEntry> p3 = repo.SeekPage(p2.lastCursor, 10, true);
+        Check(p3.count == 10, "page 3 count 10");
+        Check(p3.hasMore == true, "page 3 hasMore true");
+        Check(p3.lastCursor == 30, "page 3 lastCursor is 30");
+
+        // 第 4 批：游标 30，批大小 10 -> 返回剩余 5 条 (id 31..35), hasMore = false
+        SeekResult<LogEntry> p4 = repo.SeekPage(p3.lastCursor, 10, true);
+        Check(p4.count == 5, "page 4 count 5 (last page)");
+        Check(p4.hasMore == false, "page 4 hasMore false (end of table)");
+        Check(p4.items[0].id == 31 && p4.items[4].id == 35, "page 4 items id 31..35");
+        Check(p4.lastCursor == 35, "page 4 lastCursor is 35");
+
+        try { File.Delete(dbPath); } catch (Exception) {}
+
+        if (Program.failures == 0) {
+            Console.WriteLine("ok orm seek and cache async suite passed");
+        }
+        return Program.failures;
+    }
+
+    static async int Main() {
+        return await RunTests();
+    }
+}

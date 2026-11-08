@@ -501,6 +501,100 @@ public class SelectQuery<T> {
         return new PageResult<T>(list, total, page, pageSize);
     }
 
+    public Col PkCol() {
+        if (this.meta != null) {
+            return this.meta.PkCol();
+        }
+        return null;
+    }
+
+    public string PkName() {
+        Col pk = this.PkCol();
+        return pk != null ? pk.Col : "id";
+    }
+
+    public long ExtractLongPk(T item) {
+        if (item == null) { return 0L; }
+        Col pk = this.PkCol();
+        string fname = pk != null ? pk.Field : "id";
+        object obj = (object)item;
+        try {
+            if (pk != null && pk.I64) {
+                return obj.GetFieldLong(fname);
+            }
+            return (long)obj.GetFieldInt(fname);
+        } catch (Exception) {
+            try {
+                return obj.GetFieldLong(fname);
+            } catch (Exception) {
+                return 0L;
+            }
+        }
+    }
+
+    // 执行基于主键游标的流式分页（Keyset/Seek Pagination），规避千万级深翻页 OFFSET 扫描劣化的性能悬崖。
+    // lastCursor: 上一页最后一条记录的主键游标（首次传 0）。
+    // pageSize: 批次拉取条数。
+    // asc: true 为升序（大于 lastCursor），false 为降序（小于 lastCursor）。
+    public SeekResult<T> ToSeekResult(long lastCursor, int pageSize, bool asc = true) {
+        if (pageSize <= 0) { pageSize = 10; }
+        string pk = this.PkName();
+        if (lastCursor > 0) {
+            if (asc) {
+                this.Where(pk + " > " + lastCursor.ToString());
+            } else {
+                this.Where(pk + " < " + lastCursor.ToString());
+            }
+        }
+        if (asc) {
+            this.OrderBy(pk + " ASC");
+        } else {
+            this.OrderBy(pk + " DESC");
+        }
+        List<T> fetch = this.Limit(pageSize + 1, 0).ToList();
+        bool hasMore = fetch.Count > pageSize;
+        List<T> items = new List<T>();
+        int limit = hasMore ? pageSize : fetch.Count;
+        for (int i = 0; i < limit; i = i + 1) {
+            items.Add(fetch[i]);
+        }
+        long nextCursor = lastCursor;
+        if (items.Count > 0) {
+            nextCursor = this.ExtractLongPk(items[items.Count - 1]);
+        }
+        return new SeekResult<T>(items, hasMore, nextCursor);
+    }
+
+    // 异步执行基于主键游标的流式分页。
+    public async SeekResult<T> ToSeekResultAsync(long lastCursor, int pageSize, bool asc = true) {
+        if (pageSize <= 0) { pageSize = 10; }
+        string pk = this.PkName();
+        if (lastCursor > 0) {
+            if (asc) {
+                this.Where(pk + " > " + lastCursor.ToString());
+            } else {
+                this.Where(pk + " < " + lastCursor.ToString());
+            }
+        }
+        if (asc) {
+            this.OrderBy(pk + " ASC");
+        } else {
+            this.OrderBy(pk + " DESC");
+        }
+        List<T> fetch = await this.Limit(pageSize + 1, 0).ToListAsync();
+        bool hasMore = fetch.Count > pageSize;
+        List<T> items = new List<T>();
+        int limit = hasMore ? pageSize : fetch.Count;
+        for (int i = 0; i < limit; i = i + 1) {
+            items.Add(fetch[i]);
+        }
+        long nextCursor = lastCursor;
+        if (items.Count > 0) {
+            nextCursor = this.ExtractLongPk(items[items.Count - 1]);
+        }
+        return new SeekResult<T>(items, hasMore, nextCursor);
+    }
+
     public SelectQuery<T> Include<TNav>(Func<T, TNav> expr) {
         this.navTypeInfo = typeof(TNav);
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
