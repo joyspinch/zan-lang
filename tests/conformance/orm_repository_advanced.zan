@@ -1,0 +1,124 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+[Table(Name = "t_repo_item")]
+public class RepoItem {
+    [Column(IsIdentity = true)]
+    public int id;
+    public string name;
+    public int score;
+
+    public static RepoItem Of(string name, int score) {
+        RepoItem item = new RepoItem();
+        item.name = name;
+        item.score = score;
+        return item;
+    }
+}
+
+public class ItemRepository : BaseRepository<RepoItem> {
+    public ItemRepository(IZanSql zsql) : base(zsql) {}
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static async int Run() {
+        string dbPath = "_scratch/test_orm_repo_adv.tmp.db";
+        try { File.Delete(dbPath); } catch (Exception) {}
+
+        IZanSql zsql = new ZanSqlBuilder()
+            .UseConnectionString(DbProvider.SQLite, dbPath)
+            .Build();
+
+        zsql.CodeFirst().SyncStructure<RepoItem>();
+
+        ItemRepository repo = new ItemRepository(zsql);
+
+        // 1. 批量插入基础测试数据 (15 条记录)
+        List<RepoItem> batch = new List<RepoItem>();
+        for (int i = 1; i <= 15; i = i + 1) {
+            batch.Add(RepoItem.Of("item_" + Convert.ToString(i), i * 10));
+        }
+        int inserted = repo.InsertBatch(batch);
+        Check(inserted == 15, "insert batch 15 items");
+        Check(repo.Count() == 15, "repo count 15");
+
+        // 2. 测试 PageResult (总数 15，页大小 4 -> 总页数 4)
+        PageResult<RepoItem> p1 = repo.PageResult(1, 4);
+        Check(p1.total == 15, "page 1 total 15");
+        Check(p1.page == 1, "page 1 current page 1");
+        Check(p1.pageSize == 4, "page 1 page size 4");
+        Check(p1.totalPages == 4, "page 1 total pages 4");
+        Check(p1.items.Count == 4, "page 1 items count 4");
+        Check(p1.items[0].name == "item_1", "page 1 first item");
+
+        // 3. 测试异步 PageResultAsync (第 4 页，只剩 3 条)
+        PageResult<RepoItem> p4 = await repo.PageResultAsync(4, 4);
+        Check(p4.items.Count == 3, "page 4 items count 3 (15 - 4*3)");
+        Check(p4.totalPages == 4, "page 4 total pages 4");
+
+        // 4. 测试 FindByIds 批量查询
+        List<int> queryIds = new List<int>();
+        queryIds.Add(2);
+        queryIds.Add(5);
+        queryIds.Add(9);
+        List<RepoItem> found = repo.FindByIds(queryIds);
+        Check(found.Count == 3, "find by ids count 3");
+        Check(found[0].id == 2 && found[1].id == 5 && found[2].id == 9, "find by ids order matched");
+
+        List<RepoItem> foundAsync = await repo.FindByIdsAsync(queryIds);
+        Check(foundAsync.Count == 3, "find by ids async count 3");
+
+        // 5. 测试 UpdateBatch 批量更新
+        found[0].score = 999;
+        found[1].score = 888;
+        int affUpd = repo.UpdateBatch(found);
+        Check(affUpd == 3, "update batch affected rows 3");
+        RepoItem reloaded = repo.FindById(2);
+        Check(reloaded.score == 999, "reloaded item score updated to 999");
+
+        // 6. 测试 DeleteByIds 批量删除
+        List<int> delIds = new List<int>();
+        delIds.Add(1);
+        delIds.Add(2);
+        delIds.Add(3);
+        int affDel = repo.DeleteByIds(delIds);
+        Check(affDel == 3, "delete by ids affected 3");
+        Check(repo.Count() == 12, "count decreased to 12");
+        Check(repo.FindById(2) == null, "deleted item 2 is null");
+
+        // 7. 测试异步 DeleteByIdsAsync
+        List<int> delIdsAsync = new List<int>();
+        delIdsAsync.Add(4);
+        delIdsAsync.Add(5);
+        int affDelAsync = await repo.DeleteByIdsAsync(delIdsAsync);
+        Check(affDelAsync == 2, "delete by ids async affected 2");
+        Check(repo.Count() == 10, "count decreased to 10");
+
+        try { File.Delete(dbPath); } catch (Exception) {}
+
+        if (Program.failures == 0) {
+            Console.WriteLine("ok orm repository advanced suite passed");
+            return 0;
+        }
+        return 1;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

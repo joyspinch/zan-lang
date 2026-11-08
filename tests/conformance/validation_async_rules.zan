@@ -1,0 +1,101 @@
+using System;
+using Data.Validation;
+
+class UserDto {
+    public string username;
+    public string email;
+    public int age;
+
+    public UserDto(string u, string e, int a) {
+        this.username = u;
+        this.email = e;
+        this.age = a;
+    }
+}
+
+// 模拟异步数据库唯一性校验规则
+class UniqueEmailRule : IAsyncValidationRule<UserDto> {
+    public async ValidationResult ValidateAsync(UserDto instance) {
+        await Task.Delay(1);
+        if (instance.email == "taken@corp.com") {
+            return ValidationResult.One("email", "Email is already taken", "DuplicateEmail", instance.email);
+        }
+        return null;
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static async int Run() {
+        ValidationPlan<UserDto> plan = new ValidationPlan<UserDto>();
+        plan.Required("username", u => u.username, "Username required");
+        plan.RangeInt("age", u => u.age, 18, 120, "Age must be >= 18");
+        plan.AddAsyncRule(new UniqueEmailRule());
+
+        Check(plan.RuleCount() == 3, "total rule count 3");
+
+        // 1. 全部合规
+        UserDto u1 = new UserDto("alice", "alice@corp.com", 25);
+        ValidationResult r1 = await plan.ValidateAsync(u1);
+        Check(r1.IsValid, "u1 is valid");
+        Check(await plan.IsValidAsync(u1), "u1 IsValidAsync true");
+
+        // 2. 仅异步规则失败
+        UserDto u2 = new UserDto("bob", "taken@corp.com", 30);
+        ValidationResult r2 = await plan.ValidateAsync(u2);
+        Check(!r2.IsValid, "u2 fails validation");
+        Check(r2.ErrorCount == 1, "u2 1 error");
+        Check(r2.failures[0].property == "email", "u2 error is email");
+        Check(r2.failures[0].code == "DuplicateEmail", "u2 error code DuplicateEmail");
+
+        // 3. 同步规则与异步规则同时失败 (非 stopOnFirstFailure)
+        UserDto u3 = new UserDto("", "taken@corp.com", 16);
+        ValidationResult r3 = await plan.ValidateAsync(u3);
+        Check(!r3.IsValid, "u3 fails validation");
+        Check(r3.ErrorCount == 3, "u3 3 errors (2 sync + 1 async)");
+
+        // 4. stopOnFirstFailure: 同步规则失败即停止，不触发后续异步规则
+        ValidationContext ctx = new ValidationContext();
+        ctx.stopOnFirstFailure = true;
+        ValidationResult r4 = await plan.ValidateAsyncWith(u3, ctx);
+        Check(r4.ErrorCount == 1, "u3 stopOnFirstFailure stopped at 1st error");
+        Check(r4.failures[0].property == "username", "u3 stopped at username");
+
+        // 5. 门面测试 Validation.ValidateAsync
+        ValidationResult r5 = await Validation.ValidateAsync(plan, u1);
+        Check(r5.IsValid, "facade ValidateAsync passed");
+
+        // 6. ValidateOrThrowAsync 正常与异常分支
+        await plan.ValidateOrThrowAsync(u1);
+        Check(true, "ValidateOrThrowAsync on valid user passed without throwing");
+
+        bool threw = false;
+        try {
+            await plan.ValidateOrThrowAsync(u2);
+        } catch (ValidationException ex) {
+            threw = true;
+            Check(ex.result.ErrorCount == 1, "caught ValidationException with 1 error");
+        }
+        Check(threw, "ValidateOrThrowAsync threw exception");
+
+        if (Program.failures == 0) {
+            Console.WriteLine("ok validation async rules suite passed");
+            return 0;
+        }
+        return 1;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

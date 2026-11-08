@@ -1,0 +1,163 @@
+using System;
+using System.Interop;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using Cloud.Oss;
+
+class Program {
+    static const int PORT = 29093;
+    static int failures = 0;
+    static TcpListener serverListener;
+    static bool serverRunning = true;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static async void HandleMockClient(nint sock) {
+        try {
+            Socket.SetNoDelay(sock);
+            byte[] buf = new byte[8192];
+            int n = await Socket.RecvPtrAsync(sock, (nint)buf, 8192);
+            if (n <= 0) { return; }
+            string req = buf.ToStr(0, n);
+
+            // 解析 HTTP 首行
+            int lineEnd = req.IndexOf("\r\n");
+            if (lineEnd < 0) { return; }
+            string firstLine = req.Substring(0, lineEnd);
+            List<string> parts = firstLine.Split(" ");
+            if (parts.Count < 2) { return; }
+            string method = parts[0];
+            string path = parts[1];
+
+            string respHeader = "";
+            string respBody = "";
+
+            if (method == "POST" && path.Contains("?uploads")) {
+                // 1. 初始化分块上传响应
+                respBody = "<InitiateMultipartUploadResult><UploadId>mock-upload-tx-888</UploadId></InitiateMultipartUploadResult>";
+                respHeader = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " + Convert.ToString(respBody.Length) + "\r\nConnection: close\r\n\r\n";
+            } else if (method == "PUT" && path.Contains("partNumber=1")) {
+                // 2. 上传 Part 1 响应
+                respHeader = "HTTP/1.1 200 OK\r\nETag: \"etag-part-1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            } else if (method == "PUT" && path.Contains("partNumber=2")) {
+                // 3. 上传 Part 2 响应
+                respHeader = "HTTP/1.1 200 OK\r\nETag: \"etag-part-2\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            } else if (method == "POST" && path.Contains("uploadId=")) {
+                // 4. 完成分块上传响应
+                respBody = "<CompleteMultipartUploadResult><ETag>\"final-multipart-hash-777\"</ETag></CompleteMultipartUploadResult>";
+                respHeader = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nETag: \"final-multipart-hash-777\"\r\nContent-Length: " + Convert.ToString(respBody.Length) + "\r\nConnection: close\r\n\r\n";
+            } else if (method == "DELETE" && path.Contains("uploadId=")) {
+                // 5. 中止分块上传响应
+                respHeader = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            } else {
+                respHeader = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            }
+
+            string fullResp = respHeader + respBody;
+            byte[] respBytes = fullResp.ToBytes();
+            await Socket.SendAsync(sock, respBytes, respBytes.Length);
+        } finally {
+            Socket.Close(sock);
+        }
+    }
+
+    static async void RunMockServer() {
+        TcpListener l = new TcpListener("127.0.0.1", Program.PORT);
+        l.Start();
+        Program.serverListener = l;
+
+        while (Program.serverRunning) {
+            nint sock = await l.AcceptAsync();
+            if (sock >= 0) {
+                Task.Spawn(Program.HandleMockClient(sock));
+            }
+        }
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        // 1. XML 标签提取单测
+        string xmlTest = "<Result><UploadId>abc-123-xyz</UploadId><Bucket>test-bucket</Bucket></Result>";
+        Check(OssClient.ExtractXmlTag(xmlTest, "UploadId") == "abc-123-xyz", "extract xml UploadId");
+        Check(OssClient.ExtractXmlTag(xmlTest, "Bucket") == "test-bucket", "extract xml Bucket");
+        Check(OssClient.ExtractXmlTag(xmlTest, "Missing") == "", "extract xml missing");
+
+        // 2. 启动进程内 Mock 对象存储服务器
+        Task.Spawn(Program.RunMockServer());
+        await Task.Delay(100);
+
+        // 3. 配置客户端连接本地 Mock 存储服务
+        OssConfig cfg = new OssConfig();
+        cfg.driver = "s3";
+        cfg.endpoint = "http://127.0.0.1:29093";
+        cfg.bucket = "my-bucket";
+        cfg.accessKey = "mock-ak";
+        cfg.secretKey = "mock-sk";
+        cfg.pathStyle = true;
+        cfg.Parse();
+
+        OssClient client = OssClient.Create(cfg);
+        Check(client != null, "oss client created");
+
+        // 4. 初始化分块上传
+        string objectKey = "video/data.mp4";
+        OssMultipartResult initRes = await client.InitiateMultipartUpload(objectKey, "video/mp4");
+        Check(initRes.ok, "initiate multipart upload success");
+        Check(initRes.uploadId == "mock-upload-tx-888", "uploadId parsed correctly: " + initRes.uploadId);
+
+        // 5. 分块 1 上传
+        byte[] chunk1 = new byte[1024];
+        for (int i = 0; i < 1024; i = i + 1) { chunk1[i] = 65; }
+        OssResult part1Res = await client.UploadPart(objectKey, initRes.uploadId, 1, chunk1);
+        Check(part1Res.ok, "upload part 1 success");
+        Check(part1Res.etag == "\"etag-part-1\"", "part 1 etag received: " + part1Res.etag);
+
+        // 6. 分块 2 上传
+        byte[] chunk2 = new byte[1024];
+        for (int i = 0; i < 1024; i = i + 1) { chunk2[i] = 66; }
+        OssResult part2Res = await client.UploadPart(objectKey, initRes.uploadId, 2, chunk2);
+        Check(part2Res.ok, "upload part 2 success");
+        Check(part2Res.etag == "\"etag-part-2\"", "part 2 etag received: " + part2Res.etag);
+
+        // 7. 完成分块合并
+        List<OssUploadPart> parts = new List<OssUploadPart>();
+        parts.Add(new OssUploadPart(1, part1Res.etag));
+        parts.Add(new OssUploadPart(2, part2Res.etag));
+
+        OssResult completeRes = await client.CompleteMultipartUpload(objectKey, initRes.uploadId, parts);
+        Check(completeRes.ok, "complete multipart upload success");
+        Check(completeRes.etag == "\"final-multipart-hash-777\"", "final object etag matched");
+
+        // 8. 中止分块清理
+        OssResult abortRes = await client.AbortMultipartUpload(objectKey, "mock-upload-to-abort");
+        Check(abortRes.ok, "abort multipart upload success");
+
+        // 9. 清理并退出
+        Program.serverRunning = false;
+        if (Program.serverListener != null) {
+            Program.serverListener.Stop();
+            Program.serverListener = null;
+        }
+
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        if (Program.failures == 0) {
+            Console.WriteLine("ok oss multipart upload suite passed");
+            return 0;
+        }
+        return 1;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

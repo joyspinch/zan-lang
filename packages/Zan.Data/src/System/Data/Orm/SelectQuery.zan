@@ -1,0 +1,1009 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+
+namespace System.Data.Orm;
+
+// 为实体字段提供流式断言扩展方法，确保在 IDE 中编码与自动补全（IntelliSense）时能流畅提示。
+public static class FieldExtensions {
+    public static bool Eq<T>(this T field, T val) { return field == val; }
+    public static bool Ne<T>(this T field, T val) { return field != val; }
+    public static bool Gt(this int field, int val) { return field > val; }
+    public static bool Ge(this int field, int val) { return field >= val; }
+    public static bool Lt(this int field, int val) { return field < val; }
+    public static bool Le(this int field, int val) { return field <= val; }
+    public static bool Between(this int field, int low, int high) { return field >= low && field <= high; }
+    public static bool NotBetween(this int field, int low, int high) { return field < low || field > high; }
+    public static bool IsNull(this object field) { return field == null; }
+    public static bool IsNotNull(this object field) { return field != null; }
+    public static bool IsNull(this string field) { return field == null; }
+    public static bool IsNotNull(this string field) { return field != null; }
+
+    public static bool Like(this string field, string pattern) {
+        if (field == null || pattern == null) { return false; }
+        if (pattern == "%") { return true; }
+        if (pattern.StartsWith("%") && pattern.EndsWith("%") && pattern.Length > 2) {
+            return field.Contains(pattern.Substring(1, pattern.Length - 2));
+        }
+        if (pattern.EndsWith("%")) {
+            return field.StartsWith(pattern.Substring(0, pattern.Length - 1));
+        }
+        if (pattern.StartsWith("%")) {
+            return field.EndsWith(pattern.Substring(1, pattern.Length - 1));
+        }
+        return field == pattern;
+    }
+
+    public static bool In<T>(this T field, List<T> values) {
+        if (values == null) { return false; }
+        for (int i = 0; i < values.Count; i = i + 1) {
+            if (field == values[i]) { return true; }
+        }
+        return false;
+    }
+
+    public static bool NotIn<T>(this T field, List<T> values) {
+        return !field.In(values);
+    }
+}
+
+public class OrmAggContext {
+    public static List<object> current;
+}
+
+public static class OrmAggregates {
+    public static long Sum<T, V>(this T item, Func<T, V> expr) {
+        if (OrmAggContext.current == null || OrmAggContext.current.Count == 0) return 0;
+        long s = 0;
+        for (int i = 0; i < OrmAggContext.current.Count; i = i + 1) {
+            s = s + Convert.ToInt64(expr((T)OrmAggContext.current[i]));
+        }
+        return s;
+    }
+
+    public static long Max<T, V>(this T item, Func<T, V> expr) {
+        if (OrmAggContext.current == null || OrmAggContext.current.Count == 0) return 0;
+        long m = Convert.ToInt64(expr((T)OrmAggContext.current[0]));
+        for (int i = 1; i < OrmAggContext.current.Count; i = i + 1) {
+            long v = Convert.ToInt64(expr((T)OrmAggContext.current[i]));
+            if (v > m) m = v;
+        }
+        return m;
+    }
+
+    public static long Min<T, V>(this T item, Func<T, V> expr) {
+        if (OrmAggContext.current == null || OrmAggContext.current.Count == 0) return 0;
+        long m = Convert.ToInt64(expr((T)OrmAggContext.current[0]));
+        for (int i = 1; i < OrmAggContext.current.Count; i = i + 1) {
+            long v = Convert.ToInt64(expr((T)OrmAggContext.current[i]));
+            if (v < m) m = v;
+        }
+        return m;
+    }
+
+    public static double Avg<T, V>(this T item, Func<T, V> expr) {
+        if (OrmAggContext.current == null || OrmAggContext.current.Count == 0) return 0.0;
+        double s = 0.0;
+        for (int i = 0; i < OrmAggContext.current.Count; i = i + 1) {
+            s = s + Convert.ToDouble(expr((T)OrmAggContext.current[i]));
+        }
+        return s / (double)OrmAggContext.current.Count;
+    }
+
+    public static int Count<T>(this T item) {
+        if (OrmAggContext.current == null) return 0;
+        return OrmAggContext.current.Count;
+    }
+}
+
+// 动态探针式列名推断专用探测值（无表达式树环境下的属性反推机制）
+internal static class OrmProbeConstants {
+    public const int PROBE_INT_MAGIC = 987654;
+    public const long PROBE_LONG_MAGIC = 9876543210L;
+    public const double PROBE_DOUBLE_MAGIC = 987654.25;
+    public const string PROBE_STRING_MAGIC = "__detect_marker__";
+}
+
+// 泛型 SELECT 查询驱动：结合元数据缓存与原生类型反射，提供流式查询。
+public class SelectQuery<T> {
+    public IDbExecutor db;
+    public Select inner;
+    public Meta meta;
+    public Func<T, bool> predicate;
+    public List<Func<T, bool>> predicates;
+    public List<string> includeFields;
+    public Func<T, bool> havingPredicate;
+    public TypeInfo navTypeInfo;
+    public Func<T, string> groupByStringFn;
+    public Func<T, long> orderByLongFn;
+    public bool orderByDesc;
+
+    public SelectQuery(IDbExecutor db) {
+        this.db = db;
+        this.meta = Meta.For<T>();
+        this.inner = Select.Create(db, this.meta);
+        this.predicates = new List<Func<T, bool>>();
+        this.includeFields = new List<string>();
+    }
+
+    public SelectQuery(IDbExecutor db, Meta meta) {
+        this.db = db;
+        this.meta = meta;
+        this.inner = Select.Create(db, this.meta);
+        this.predicates = new List<Func<T, bool>>();
+        this.includeFields = new List<string>();
+    }
+
+    public string DetectColInt(Func<T, int> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        object dummy = ti.CreateInstance();
+        if (dummy == null) { return ""; }
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 0) {
+                if (c.I64) {
+                    dummy.SetFieldLong(c.Field, (long)OrmProbeConstants.PROBE_INT_MAGIC);
+                } else {
+                    dummy.SetFieldInt(c.Field, OrmProbeConstants.PROBE_INT_MAGIC);
+                }
+                try {
+                    int res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_INT_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                    // 探针反射探测：非目标字段触发异常时跳过该候选列
+                }
+                if (c.I64) { dummy.SetFieldLong(c.Field, 0L); }
+                else { dummy.SetFieldInt(c.Field, 0); }
+            }
+        }
+        return "";
+    }
+
+    public string DetectColLong(Func<T, long> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        object dummy = ti.CreateInstance();
+        if (dummy == null) { return ""; }
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 0) {
+                if (c.I64) {
+                    dummy.SetFieldLong(c.Field, OrmProbeConstants.PROBE_LONG_MAGIC);
+                    try {
+                        long res = expr((T)dummy);
+                        if (res == OrmProbeConstants.PROBE_LONG_MAGIC) { return c.Col; }
+                    } catch (Exception _ex) {
+                        // 探针反射探测：非目标字段触发异常时跳过该候选列
+                    }
+                    dummy.SetFieldLong(c.Field, 0L);
+                } else {
+                    dummy.SetFieldInt(c.Field, OrmProbeConstants.PROBE_INT_MAGIC);
+                    try {
+                        long res = expr((T)dummy);
+                        if (res == (long)OrmProbeConstants.PROBE_INT_MAGIC) { return c.Col; }
+                    } catch (Exception _ex) {
+                        // 探针反射探测：非目标字段触发异常时跳过该候选列
+                    }
+                    dummy.SetFieldInt(c.Field, 0);
+                }
+            }
+        }
+        return "";
+    }
+
+    public string DetectColDouble(Func<T, double> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        object dummy = ti.CreateInstance();
+        if (dummy == null) { return ""; }
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 1) {
+                dummy.SetFieldDouble(c.Field, OrmProbeConstants.PROBE_DOUBLE_MAGIC);
+                try {
+                    double res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_DOUBLE_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                    // 探针反射探测：非目标字段触发异常时跳过该候选列
+                }
+                dummy.SetFieldDouble(c.Field, 0.0);
+            }
+        }
+        return "";
+    }
+
+    public string DetectColString(Func<T, string> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        object dummy = ti.CreateInstance();
+        if (dummy == null) { return ""; }
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 3) {
+                dummy.SetFieldString(c.Field, OrmProbeConstants.PROBE_STRING_MAGIC);
+                try {
+                    string res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_STRING_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                    // 探针反射探测：非目标字段触发异常时跳过该候选列
+                }
+                dummy.SetFieldString(c.Field, "");
+            }
+        }
+        return "";
+    }
+
+    public SelectQuery<T> Where(Func<T, bool> predicate) {
+        if (predicate != null) {
+            if (this.predicates == null) {
+                this.predicates = new List<Func<T, bool>>();
+            }
+            this.predicates.Add(predicate);
+        }
+        this.predicate = predicate;
+        return this;
+    }
+
+    public SelectQuery<T> Where(string sql) {
+        this.inner.Where(sql);
+        return this;
+    }
+
+    public SelectQuery<T> WhereIf(bool condition, Func<T, bool> predicate) {
+        if (condition && predicate != null) {
+            this.Where(predicate);
+        }
+        return this;
+    }
+
+    public SelectQuery<T> WhereIf(bool condition, string sql) {
+        if (condition) {
+            this.inner.Where(sql);
+        }
+        return this;
+    }
+
+    public SelectQuery<T> WhereEq(string col, string val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public SelectQuery<T> WhereEq(string col, int val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public SelectQuery<T> WhereEq(string col, long val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public SelectQuery<T> Where(ExprNode expr) {
+        this.inner.WExpr(expr);
+        return this;
+    }
+
+    public SelectQuery<T> Where(Expr<T> expr) {
+        if (expr != null && expr.Root != null) {
+            this.inner.WExpr(expr.Root);
+        }
+        return this;
+    }
+
+    public SelectQuery<T> WhereConds(List<Cond> cs) {
+        this.inner.WhereConds(cs);
+        return this;
+    }
+
+    public SelectQuery<T> WhereConds(List<OrmCond> cs) {
+        if (cs != null) {
+            List<Cond> list = new List<Cond>();
+            for (int i = 0; i < cs.Count; i = i + 1) {
+                list.Add(cs[i]);
+            }
+            this.inner.WhereConds(list);
+        }
+        return this;
+    }
+
+    public SelectQuery<T> WherePk(int id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public SelectQuery<T> WherePk(long id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public SelectQuery<T> WherePk(string id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public SelectQuery<T> WhereDict(DbValues v) {
+        this.inner.WhereDict(v);
+        return this;
+    }
+
+    public string ExtractColFromExpr(ExprNode expr) {
+        if (expr == null) { return ""; }
+        if (expr.Kind == 0) {
+            Col c = this.meta.Find(expr.Name);
+            if (c != null) { return c.Col; }
+            for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+                if (this.meta.Cols[i].Field == expr.Name) { return this.meta.Cols[i].Col; }
+            }
+            return expr.Name;
+        }
+        if (expr.Kind == 4 && expr.A != null) {
+            return this.ExtractColFromExpr(expr.A);
+        }
+        return "";
+    }
+
+    public SelectQuery<T> OrderBy(string col) {
+        this.inner.OrderBy(col);
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(ExprNode expr) {
+        string col = this.ExtractColFromExpr(expr);
+        if (col.Length > 0) { this.inner.OrderBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(Expr<T> expr) {
+        if (expr != null) { return this.OrderBy(expr.Root); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(Func<T, long> expr) {
+        this.orderByLongFn = expr;
+        this.orderByDesc = false;
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.OrderBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(Func<T, int> expr) {
+        this.orderByLongFn = (T item) => (long)expr(item);
+        this.orderByDesc = false;
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.OrderBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(Func<T, string> expr) {
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.OrderBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(string col) {
+        this.inner.OBD(col);
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(ExprNode expr) {
+        string col = this.ExtractColFromExpr(expr);
+        if (col.Length > 0) { this.inner.OBD(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(Expr<T> expr) {
+        if (expr != null) { return this.OrderByDescending(expr.Root); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(Func<T, long> expr) {
+        this.orderByLongFn = expr;
+        this.orderByDesc = true;
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.OBD(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(Func<T, int> expr) {
+        this.orderByLongFn = (T item) => (long)expr(item);
+        this.orderByDesc = true;
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.OBD(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(Func<T, string> expr) {
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.OBD(col); }
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(string col) {
+        this.inner.GroupBy(col);
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(ExprNode expr) {
+        string col = this.ExtractColFromExpr(expr);
+        if (col.Length > 0) { this.inner.GroupBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(Expr<T> expr) {
+        if (expr != null) { return this.GroupBy(expr.Root); }
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(Func<T, string> expr) {
+        this.groupByStringFn = expr;
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.GroupBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.GroupBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> Having(string condition) {
+        this.inner.Having(condition);
+        return this;
+    }
+
+    public SelectQuery<T> Having(Func<T, bool> predicate) {
+        this.havingPredicate = predicate;
+        return this;
+    }
+
+    public SelectQuery<T> Distinct() {
+        this.inner.Distinct();
+        return this;
+    }
+
+    public SelectQuery<T> Skip(int offset) {
+        this.inner.offN = offset;
+        return this;
+    }
+
+    public SelectQuery<T> Take(int limit) {
+        this.inner.limN = limit;
+        return this;
+    }
+
+    public SelectQuery<T> Limit(int limit) {
+        this.inner.limN = limit;
+        return this;
+    }
+
+    public SelectQuery<T> Limit(int limit, int offset) {
+        this.inner.limN = limit;
+        this.inner.offN = offset;
+        return this;
+    }
+
+    public SelectQuery<T> Page(int page, int pageSize) {
+        if (page < 1) { page = 1; }
+        int off = (page - 1) * pageSize;
+        return this.Limit(pageSize, off);
+    }
+
+    // 执行分页查询并返回封装总记录数与分页明细的 PageResult。
+    public PageResult<T> ToPageResult(int page, int pageSize) {
+        int total = this.Count();
+        List<T> list = this.Page(page, pageSize).ToList();
+        return new PageResult<T>(list, total, page, pageSize);
+    }
+
+    // 异步执行分页查询并返回封装总记录数与分页明细的 PageResult。
+    public async PageResult<T> ToPageResultAsync(int page, int pageSize) {
+        int total = await this.CountAsync();
+        List<T> list = await this.Page(page, pageSize).ToListAsync();
+        return new PageResult<T>(list, total, page, pageSize);
+    }
+
+    public SelectQuery<T> Include<TNav>(Func<T, TNav> expr) {
+        this.navTypeInfo = typeof(TNav);
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < ti.FieldCount; i = i + 1) {
+            string fname = ti.GetFieldName(i);
+            string fkField = fname + "Id";
+            if (ti.HasField(fkField) || ti.HasField(fname + "id")) {
+                this.includeFields.Add(fname);
+            }
+        }
+        return this;
+    }
+
+    public bool HasPredicates() {
+        return this.predicate != null || (this.predicates != null && this.predicates.Count > 0);
+    }
+
+    public bool MatchPredicates(T item) {
+        if (this.predicates != null && this.predicates.Count > 0) {
+            for (int i = 0; i < this.predicates.Count; i = i + 1) {
+                if (!this.predicates[i](item)) { return false; }
+            }
+            return true;
+        }
+        if (this.predicate != null) {
+            return this.predicate(item);
+        }
+        return true;
+    }
+
+    public int Count() {
+        if (this.HasPredicates()) {
+            return this.ToList().Count;
+        }
+        return this.inner.Count();
+    }
+
+    public async int CountAsync() {
+        if (this.HasPredicates()) {
+            return (await this.ToListAsync()).Count;
+        }
+        DbResult r = await this.inner.AggRAsync("COUNT(*)");
+        if (r == null || r.RowCount() == 0) { return 0; }
+        return r.GetInt(0, 0);
+    }
+
+    public int Sum(Func<T, int> expr) {
+        if (this.predicate != null) {
+            List<T> list = this.ToList();
+            int s = 0;
+            for (int i = 0; i < list.Count; i = i + 1) {
+                s = s + expr(list[i]);
+            }
+            return s;
+        }
+        string col = this.DetectColInt(expr);
+        return this.inner.AggI("SUM(" + col + ")");
+    }
+
+    public int Max(Func<T, int> expr) {
+        if (this.predicate != null) {
+            List<T> list = this.ToList();
+            if (list.Count == 0) { return 0; }
+            int m = expr(list[0]);
+            for (int i = 1; i < list.Count; i = i + 1) {
+                int val = expr(list[i]);
+                if (val > m) { m = val; }
+            }
+            return m;
+        }
+        string col = this.DetectColInt(expr);
+        return this.inner.AggI("MAX(" + col + ")");
+    }
+
+    public int Min(Func<T, int> expr) {
+        if (this.predicate != null) {
+            List<T> list = this.ToList();
+            if (list.Count == 0) { return 0; }
+            int m = expr(list[0]);
+            for (int i = 1; i < list.Count; i = i + 1) {
+                int val = expr(list[i]);
+                if (val < m) { m = val; }
+            }
+            return m;
+        }
+        string col = this.DetectColInt(expr);
+        return this.inner.AggI("MIN(" + col + ")");
+    }
+
+    public double Avg(Func<T, double> expr) {
+        if (this.predicate != null) {
+            List<T> list = this.ToList();
+            if (list.Count == 0) { return 0.0; }
+            double sum = 0.0;
+            for (int i = 0; i < list.Count; i = i + 1) {
+                sum = sum + expr(list[i]);
+            }
+            return sum / (double)list.Count;
+        }
+        string col = this.DetectColDouble(expr);
+        return this.inner.AggD("AVG(" + col + ")");
+    }
+
+    // 列名至结果集列索引预解析，避免在行遍历内层高频重复字典查表
+    public static List<int> ResolveColIndices(DbResult r, Meta meta) {
+        List<int> colIndices = new List<int>();
+        if (r == null || meta == null) { return colIndices; }
+        int totalCols = r.ColumnCount();
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            Col c = meta.Cols[i];
+            int colIdx = r.GetColumnIndex(c.Col);
+            if (colIdx < 0) {
+                colIdx = i;
+            }
+            if (colIdx >= totalCols) {
+                colIdx = -1;
+            }
+            colIndices.Add(colIdx);
+        }
+        return colIndices;
+    }
+
+    // 从 DbResult 当前行映射生成实体实例（带预解析列索引缓存，O(1) 零查找）
+    public static T MapRow(DbResult r, int row, Meta meta, List<int> colIndices) {
+        TypeInfo ti = (meta != null && meta.Type.Name.Length > 0) ? meta.Type : typeof(T);
+        object obj = ti.CreateInstance();
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            int colIdx = -1;
+            if (colIndices != null && i < colIndices.Count) {
+                colIdx = colIndices[i];
+            } else {
+                colIdx = r.GetColumnIndex(meta.Cols[i].Col);
+                if (colIdx < 0) { colIdx = i; }
+                if (colIdx >= r.ColumnCount()) { continue; }
+            }
+            if (colIdx < 0) {
+                continue;
+            }
+            Col c = meta.Cols[i];
+            if (c.Kind == 3) {
+                if (r.IsNull(row, colIdx)) {
+                    obj.SetFieldObject(c.Field, null);
+                } else {
+                    obj.SetFieldString(c.Field, r.GetString(row, colIdx));
+                }
+            } else if (c.Kind == 1) {
+                obj.SetFieldDouble(c.Field, r.GetDouble(row, colIdx));
+            } else if (c.Kind == 2) {
+                obj.SetFieldBool(c.Field, r.GetInt(row, colIdx) != 0);
+            } else if (c.Kind == 0 && c.I64) {
+                obj.SetFieldLong(c.Field, r.GetLong(row, colIdx));
+            } else {
+                obj.SetFieldInt(c.Field, r.GetInt(row, colIdx));
+            }
+        }
+        return (T)obj;
+    }
+
+    // 从 DbResult 当前行映射生成实体实例
+    public static T MapRow(DbResult r, int row, Meta meta) {
+        return MapRow(r, row, meta, null);
+    }
+
+    public List<T> ToList() {
+        int savedLim = this.inner.limN;
+        int savedOff = this.inner.offN;
+        if (this.HasPredicates()) {
+            // 客户端委托过滤安全门：若指定了 Take/Limit，设置合理的预读上限（默认 50 倍窗口，最多 10000 条），
+            // 阻断大表被无界 SELECT * 拖穿内存导致 OOM；
+            // 需全表精确分页推荐改用编译期语法树下推：Where((ExprNode x) => ...)
+            if (savedLim >= 0) {
+                int safeScan = (savedOff > 0 ? savedOff : 0) + savedLim;
+                int maxFetch = safeScan * 50;
+                if (maxFetch < 1000) { maxFetch = 1000; }
+                if (maxFetch > 10000) { maxFetch = 10000; }
+                this.inner.limN = maxFetch;
+                this.inner.offN = 0;
+            } else {
+                this.inner.limN = -1;
+                this.inner.offN = -1;
+            }
+        }
+        DbResult r = this.inner.Rows();
+        this.inner.limN = savedLim;
+        this.inner.offN = savedOff;
+        List<T> list = new List<T>();
+        if (r == null) { return list; }
+        int count = r.RowCount();
+        List<int> colIndices = ResolveColIndices(r, this.meta);
+        for (int i = 0; i < count; i = i + 1) {
+            T item = MapRow(r, i, this.meta, colIndices);
+            if (this.MatchPredicates(item)) {
+                if (this.havingPredicate == null || this.havingPredicate(item)) {
+                    if (this.includeFields.Count > 0) {
+                        this.PopulateNavigations(item);
+                    }
+                    list.Add(item);
+                }
+            }
+        }
+        if (this.HasPredicates() && (savedLim >= 0 || savedOff > 0)) {
+            List<T> paged = new List<T>();
+            int start = savedOff > 0 ? savedOff : 0;
+            int take = savedLim >= 0 ? savedLim : list.Count;
+            for (int i = start; i < list.Count && paged.Count < take; i = i + 1) {
+                paged.Add(list[i]);
+            }
+            return paged;
+        }
+        return list;
+    }
+
+    public void PopulateNavigations(T item) {
+        if (item == null || this.db == null) { return; }
+        object obj = (object)item;
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int k = 0; k < this.includeFields.Count; k = k + 1) {
+            string navField = this.includeFields[k];
+            string fkField = navField + "Id";
+            if (!ti.HasField(fkField)) {
+                fkField = navField + "id";
+            }
+            if (ti.HasField(fkField)) {
+                int fkid = obj.GetFieldInt(fkField);
+                for (int f = 0; f < ti.FieldCount; f = f + 1) {
+                    if (ti.GetFieldName(f) == navField) {
+                        string navType = ti.GetFieldType(f);
+                        DbParams navPs = new DbParams();
+                        navPs.AddInt(fkid);
+                        DbResult navR = this.db.Query("SELECT * FROM " + QueryBuilder.RequireIdent(navType) + " WHERE id = ?", navPs);
+                        if (navR != null && navR.RowCount() > 0) {
+                            TypeInfo navTi = ti.GetFieldTypeInfo(f);
+                            object navObj = navTi.CreateInstance();
+                            for (int nf = 0; nf < navTi.FieldCount; nf = nf + 1) {
+                                string colName = navTi.GetFieldName(nf);
+                                int col = navR.GetColumnIndex(colName);
+                                if (col >= 0) {
+                                    string cfType = navTi.GetFieldType(nf);
+                                    if (cfType == "string") {
+                                        navObj.SetFieldString(colName, navR.GetString(0, col));
+                                    } else if (cfType == "bool") {
+                                        navObj.SetFieldBool(colName, navR.GetInt(0, col) != 0);
+                                    } else if (cfType == "double" || cfType == "float") {
+                                        navObj.SetFieldDouble(colName, navR.GetDouble(0, col));
+                                    } else if (cfType == "long" || cfType == "ulong") {
+                                        navObj.SetFieldLong(colName, navR.GetLong(0, col));
+                                    } else {
+                                        navObj.SetFieldInt(colName, navR.GetInt(0, col));
+                                    }
+                                }
+                            }
+                            obj.SetFieldObject(navField, navObj);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    public async List<T> ToListAsync() {
+        return this.ToList();
+    }
+
+    public List<string> ToList(Func<T, string> selector) {
+        List<T> raw = this.ToList();
+        List<string> res = new List<string>();
+        for (int i = 0; i < raw.Count; i = i + 1) {
+            res.Add(selector(raw[i]));
+        }
+        return res;
+    }
+
+    public async List<string> ToListAsync(Func<T, string> selector) {
+        return this.ToList(selector);
+    }
+
+    public List<TReturn> ToList<TReturn>(Func<T, TReturn> selector) {
+        Func<T, bool> savedHaving = this.havingPredicate;
+        int savedLim = this.inner.limN;
+        int savedOff = this.inner.offN;
+        if (this.groupByStringFn != null) {
+            this.havingPredicate = null;
+            this.inner.limN = -1;
+            this.inner.offN = -1;
+        }
+        List<T> rawList = this.ToList();
+        this.havingPredicate = savedHaving;
+        this.inner.limN = savedLim;
+        this.inner.offN = savedOff;
+
+        List<TReturn> result = new List<TReturn>();
+        if (rawList.Count == 0) return result;
+
+        if (this.groupByStringFn != null) {
+            Dictionary<string, List<object>> groups = new Dictionary<string, List<object>>();
+            List<string> groupKeys = new List<string>();
+            for (int i = 0; i < rawList.Count; i = i + 1) {
+                T item = rawList[i];
+                string key = this.groupByStringFn(item);
+                if (!groups.ContainsKey(key)) {
+                    groups[key] = new List<object>();
+                    groupKeys.Add(key);
+                }
+                groups[key].Add((object)item);
+            }
+
+            if (this.orderByLongFn != null && groupKeys.Count > 1) {
+                for (int i = 0; i < groupKeys.Count - 1; i = i + 1) {
+                    for (int j = 0; j < groupKeys.Count - 1 - i; j = j + 1) {
+                        List<object> g1 = groups[groupKeys[j]];
+                        List<object> g2 = groups[groupKeys[j + 1]];
+                        OrmAggContext.current = g1;
+                        long v1 = this.orderByLongFn((T)g1[0]);
+                        OrmAggContext.current = g2;
+                        long v2 = this.orderByLongFn((T)g2[0]);
+                        OrmAggContext.current = null;
+                        bool swap = this.orderByDesc ? (v1 < v2) : (v1 > v2);
+                        if (swap) {
+                            string tmp = groupKeys[j];
+                            groupKeys[j] = groupKeys[j + 1];
+                            groupKeys[j + 1] = tmp;
+                        }
+                    }
+                }
+            }
+
+            for (int k = 0; k < groupKeys.Count; k = k + 1) {
+                string key = groupKeys[k];
+                List<object> group = groups[key];
+                OrmAggContext.current = group;
+                T first = (T)group[0];
+                if (savedHaving != null && !savedHaving(first)) {
+                    continue;
+                }
+                TReturn stat = selector(first);
+                result.Add(stat);
+            }
+            OrmAggContext.current = null;
+        } else {
+            OrmAggContext.current = new List<object>();
+            for (int i = 0; i < rawList.Count; i = i + 1) {
+                OrmAggContext.current.Add((object)rawList[i]);
+            }
+            T first = rawList[0];
+            TReturn stat = selector(first);
+            OrmAggContext.current = null;
+            result.Add(stat);
+            return result;
+        }
+
+        if (savedLim >= 0 || savedOff > 0) {
+            List<TReturn> paged = new List<TReturn>();
+            int start = savedOff > 0 ? savedOff : 0;
+            int take = savedLim >= 0 ? savedLim : result.Count;
+            for (int i = start; i < result.Count && paged.Count < take; i = i + 1) {
+                paged.Add(result[i]);
+            }
+            return paged;
+        }
+
+        return result;
+    }
+
+    public async List<TReturn> ToListAsync<TReturn>(Func<T, TReturn> selector) {
+        return this.ToList<TReturn>(selector);
+    }
+
+    public TReturn ToOne<TReturn>(Func<T, TReturn> selector) {
+        List<TReturn> list = this.ToList<TReturn>(selector);
+        if (list.Count > 0) {
+            return list[0];
+        }
+        return null;
+    }
+
+    public async TReturn ToOneAsync<TReturn>(Func<T, TReturn> selector) {
+        return this.ToOne<TReturn>(selector);
+    }
+
+    // 反向关系：取某个父行的子集合。关系从子实体的导航声明反推
+    // （外键列 = <导航字段名>Id，与正向 Include 同一约定），调用方不写
+    // 外键列名。子实体有多个导航时 Children 抛异常——「反查哪个父」
+    // 只有调用方能回答，用 ChildrenOf 指明父表；没有导航或父表未知
+    // 返回空集合。
+    public List<T> Children(int id) {
+        return this.ChildrenOf("", id);
+    }
+
+    public List<T> Children(string id) {
+        return this.ChildrenOf("", id);
+    }
+
+    public List<T> ChildrenOf(string table, int id) {
+        Rel rel = Rel.Derive(this.meta, table);
+        if (rel == null) { return new List<T>(); }
+        Select q = Select.Create(this.db, this.meta);
+        rel.Apply(q, (long)id);
+        return this.MapAll(q.Rows());
+    }
+
+    public List<T> ChildrenOf(string table, string id) {
+        Rel rel = Rel.Derive(this.meta, table);
+        if (rel == null) { return new List<T>(); }
+        Select q = Select.Create(this.db, this.meta);
+        rel.Apply(q, id);
+        return this.MapAll(q.Rows());
+    }
+
+    public async List<T> ChildrenAsync(int id) {
+        return this.Children(id);
+    }
+
+    public async List<T> ChildrenAsync(string id) {
+        return this.Children(id);
+    }
+
+    public async List<T> ChildrenOfAsync(string table, int id) {
+        return this.ChildrenOf(table, id);
+    }
+
+    public async List<T> ChildrenOfAsync(string table, string id) {
+        return this.ChildrenOf(table, id);
+    }
+
+    List<T> MapAll(DbResult r) {
+        List<T> list = new List<T>();
+        if (r == null) { return list; }
+        Console.WriteLine("TL 3"); List<int> colIndices = ResolveColIndices(r, this.meta); Console.WriteLine("TL 4");
+        int totalRows = r.RowCount();
+        for (int i = 0; i < totalRows; i = i + 1) {
+            list.Add(MapRow(r, i, this.meta, colIndices));
+        }
+        return list;
+    }
+
+    public T First() {
+        if (this.predicate == null) {
+            this.inner.One();
+        }
+        List<T> list = this.ToList();
+        return list.Count > 0 ? list[0] : null;
+    }
+
+    public async T FirstAsync() {
+        if (this.predicate == null) {
+            this.inner.One();
+        }
+        List<T> list = await this.ToListAsync();
+        return list.Count > 0 ? list[0] : null;
+    }
+
+    public T ToOne() {
+        return this.First();
+    }
+
+    public async T ToOneAsync() {
+        return await this.FirstAsync();
+    }
+
+    public bool Any() {
+        return this.First() != null;
+    }
+
+    public async bool AnyAsync() {
+        return (await this.FirstAsync()) != null;
+    }
+}
+
+// 实体行的反射取值集合
+public class EntityRows<T> : IRows {
+    public List<T> items;
+
+    public EntityRows() {
+        this.items = new List<T>();
+    }
+
+    public void Add(T item) {
+        this.items.Add(item);
+    }
+
+    public int RowCount() {
+        return this.items.Count;
+    }
+
+    public void BindCol(int row, Col c, DbParams ps) {
+        T item = this.items[row];
+        if (item == null) {
+            ps.AddNull();
+            return;
+        }
+        if (c.Kind == 3) {
+            ps.Add(((object)item).GetFieldString(c.Field));
+        } else if (c.Kind == 1) {
+            ps.AddDouble(((object)item).GetFieldDouble(c.Field));
+        } else if (c.Kind == 2) {
+            bool b = ((object)item).GetFieldBool(c.Field);
+            ps.AddInt(b ? 1 : 0);
+        } else if (c.Kind == 0 && c.I64) {
+            ps.AddLong(((object)item).GetFieldLong(c.Field));
+        } else {
+            ps.AddInt(((object)item).GetFieldInt(c.Field));
+        }
+    }
+}
+

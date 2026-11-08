@@ -1,0 +1,449 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Data;
+using System.Threading;
+
+namespace System.Data.Orm;
+
+// INSERT 写入驱动
+public class InsertQuery<T> {
+    public Insert inner;
+    public Meta meta;
+
+    public InsertQuery(IDbExecutor db, object entity, Meta meta) {
+        this.meta = meta;
+        this.inner = Insert.Create(db, this.meta);
+        if (entity != null) {
+            DbValues v = new DbValues();
+            for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+                Col c = this.meta.Cols[i];
+                if (c.IsIdent) {
+                    continue;
+                }
+                if (c.Kind == 3) {
+                    string sv = ((object)entity).GetFieldString(c.Field);
+                    if (sv == null) {
+                        v.SetNull(c.Col);
+                    } else {
+                        v.Set(c.Col, sv);
+                    }
+                } else if (c.Kind == 1) {
+                    v.Set(c.Col, entity.GetFieldDouble(c.Field));
+                } else if (c.Kind == 2) {
+                    v.Set(c.Col, entity.GetFieldBool(c.Field));
+                } else if (c.Kind == 0 && c.I64) {
+                    v.Set(c.Col, entity.GetFieldLong(c.Field));
+                } else {
+                    v.Set(c.Col, entity.GetFieldInt(c.Field));
+                }
+            }
+            this.inner.AddDict(v);
+        }
+    }
+
+    public string DetectColInt(Func<T, int> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 0) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldInt(c.Field, OrmProbeConstants.PROBE_INT_MAGIC);
+                try {
+                    int res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_INT_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                    // 探针反射探测：非目标字段触发异常时跳过该候选列
+                }
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public string DetectColLong(Func<T, long> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 0 && c.I64) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldLong(c.Field, OrmProbeConstants.PROBE_LONG_MAGIC);
+                try {
+                    long res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_LONG_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                    // 探针反射探测：非目标字段触发异常时跳过该候选列
+                }
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public string DetectColString(Func<T, string> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 3) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldString(c.Field, OrmProbeConstants.PROBE_STRING_MAGIC);
+                try {
+                    string res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_STRING_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                    // 探针反射探测：非目标字段触发异常时跳过该候选列
+                }
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    // 只插入该列（可多次调用；与 Skip 互斥语义）。
+    public InsertQuery<T> Only(string col) {
+        this.inner.Only(col);
+        return this;
+    }
+
+    // 跳过该列（可多次调用）。
+    public InsertQuery<T> Skip(string col) {
+        this.inner.Skip(col);
+        return this;
+    }
+
+    public InsertQuery<T> AppendDict(DbValues v) {
+        this.inner.AddDict(v);
+        return this;
+    }
+
+    public InsertQuery<T> AppendDict(List<DbValues> vs) {
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            this.inner.AddDict(vs[i]);
+        }
+        return this;
+    }
+
+    public InsertQuery<T> OnConflict(string col) {
+        this.inner.OC(col);
+        return this;
+    }
+
+    public InsertQuery<T> OnConflict(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.OC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> OnConflict(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.OC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> OnConflict(Func<T, string> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        bool any = false;
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            object d1 = ti.CreateInstance();
+            object d2 = ti.CreateInstance();
+            if (d1 == null || d2 == null) { break; }
+            if (c.Kind == 0) {
+                if (c.I64) {
+                    d2.SetFieldLong(c.Field, 987654L);
+                } else {
+                    d2.SetFieldInt(c.Field, 987654);
+                }
+            } else if (c.Kind == 1) {
+                d2.SetFieldDouble(c.Field, 987654.25);
+            } else if (c.Kind == 3) {
+                d2.SetFieldString(c.Field, OrmProbeConstants.PROBE_STRING_MAGIC);
+            }
+            try {
+                string s1 = expr((T)d1);
+                string s2 = expr((T)d2);
+                if (s1 != s2) {
+                    this.inner.OC(c.Col);
+                    any = true;
+                }
+            } catch (Exception _ex) {
+                // 比较探针异常跳过
+            }
+        }
+        if (!any) {
+            string col = this.DetectColString(expr);
+            if (col.Length > 0) { this.inner.OC(col); }
+        }
+        return this;
+    }
+
+    public InsertQuery<T> IfExistsDoNothing() {
+        this.inner.NOP();
+        return this;
+    }
+
+    public InsertQuery<T> SetIncr(string col) {
+        this.inner.ACC(col);
+        return this;
+    }
+
+    public InsertQuery<T> SetIncr(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.ACC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetIncr(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.ACC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetMax(string col) {
+        this.inner.GMX(col);
+        return this;
+    }
+
+    public InsertQuery<T> SetMax(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.GMX(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetMax(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.GMX(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetMin(string col) {
+        this.inner.GMN(col);
+        return this;
+    }
+
+    public InsertQuery<T> SetMin(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.GMN(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetMin(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.GMN(col); }
+        return this;
+    }
+
+    public int ExecuteAffrows() {
+        return this.inner.ExecuteAffrows();
+    }
+
+    public async int ExecuteAffrowsAsync() {
+        return await this.inner.ExecuteAffrowsAsync();
+    }
+
+    public int ExecuteIdentity() {
+        return this.inner.ExecuteIdentity();
+    }
+
+    public async int ExecuteIdentityAsync() {
+        return await this.inner.ExecuteIdentityAsync();
+    }
+}
+
+// DELETE 删除驱动
+public class DeleteQuery<T> {
+    public Delete inner;
+    public Meta meta;
+
+    public DeleteQuery(IDbExecutor db, Meta meta) {
+        this.meta = meta;
+        this.inner = Delete.Create(db, this.meta);
+    }
+
+    /* bool 谓词是黑盒，无法还原成 SQL 文本；旧实现用"逐列置 1 试真"的
+     * 值探针猜列，命中后把该列绑成常量 1——`a.ts < cut` 会被探成
+     * `id = 1`，静默删错行。与 SelectQuery.Where 同一策略：候选行物化
+     * 成实体，在内存里执行同一谓词，命中的主键集合经 WhereIn/元组组
+     * 下推回 DELETE。 */
+    public DeleteQuery<T> Where(Func<T, bool> expr) {
+        if (expr == null) { return this; }
+        List<string> pks = this.meta.PkCols();
+        bool byRowId = pks.Count == 0;
+        if (byRowId && this.inner.db.GetProvider() != DbProvider.SQLite) {
+            throw new Exception(this.meta.Entity
+                + ": lambda Where needs a primary key to target rows");
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT ");
+        if (byRowId) { sb.Append("rowid, "); }
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(this.meta.Cols[i].Col);
+        }
+        sb.Append(" FROM ");
+        sb.Append(this.inner.tbl);
+        DbResult r = this.inner.db.Query(sb.ToString(), new DbParams());
+        if (r == null) { this.inner.WhereNone(); return this; }
+        List<int> colIdx = SelectQuery<T>.ResolveColIndices(r, this.meta);
+        /* PkCols 与 Cols 同序，先记下每个主键列在 Cols 里的位置。 */
+        int[] pkPos = new int[pks.Count];
+        int p = 0;
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            if (!byRowId && this.meta.Cols[i].IsPk && p < pkPos.Length) {
+                pkPos[p] = i;
+                p = p + 1;
+            }
+        }
+        List<int> hits = new List<int>();
+        int count = r.RowCount();
+        for (int i = 0; i < count; i = i + 1) {
+            T item = SelectQuery<T>.MapRow(r, i, this.meta, colIdx);
+            if (expr(item)) { hits.Add(i); }
+        }
+        if (hits.Count == 0) { this.inner.WhereNone(); return this; }
+        if (byRowId) {
+            if (hits.Count > 2000) {
+                throw new Exception(this.meta.Entity
+                    + ": lambda Where matched " + Convert.ToString(hits.Count)
+                    + " rows; use an explicit column predicate for bulk statements");
+            }
+            int rid = r.GetColumnIndex("rowid");
+            StringBuilder rw = new StringBuilder();
+            rw.Append("rowid IN (");
+            for (int k = 0; k < hits.Count; k = k + 1) {
+                if (k > 0) { rw.Append(", "); }
+                rw.Append("?");
+            }
+            rw.Append(")");
+            this.inner.W(rw.ToString());
+            for (int k = 0; k < hits.Count; k = k + 1) {
+                this.inner.Pl(r.GetLong(hits[k], rid));
+            }
+            return this;
+        }
+        if (pks.Count == 1) {
+            int at = colIdx[pkPos[0]];
+            if (this.meta.KindOf(pks[0]) == 3) {
+                List<string> sv = new List<string>();
+                for (int k = 0; k < hits.Count; k = k + 1) {
+                    sv.Add(r.GetString(hits[k], at));
+                }
+                this.inner.WhereIn(pks[0], sv);
+            } else {
+                List<long> lv = new List<long>();
+                for (int k = 0; k < hits.Count; k = k + 1) {
+                    lv.Add(r.GetLong(hits[k], at));
+                }
+                this.inner.WhereIn(pks[0], lv);
+            }
+            return this;
+        }
+        if (hits.Count * pks.Count > 2000) {
+            throw new Exception(this.meta.Entity
+                + ": lambda Where matched " + Convert.ToString(hits.Count)
+                + " rows; use an explicit column predicate for bulk deletes");
+        }
+        /* 复合主键：整组元组下推，组内 AND 括号、组间 OR（W 片段之间
+         * 是 AND，单个片段内自行组织 OR）；参数按占位符出现顺序行优先
+         * 追加。 */
+        StringBuilder w = new StringBuilder();
+        for (int k = 0; k < hits.Count; k = k + 1) {
+            if (k > 0) { w.Append(" OR "); }
+            w.Append("(");
+            for (int j = 0; j < pks.Count; j = j + 1) {
+                if (j > 0) { w.Append(" AND "); }
+                w.Append(pks[j] + " = ?");
+            }
+            w.Append(")");
+        }
+        this.inner.W(w.ToString());
+        for (int k = 0; k < hits.Count; k = k + 1) {
+            for (int j = 0; j < pks.Count; j = j + 1) {
+                int at = colIdx[pkPos[j]];
+                if (this.meta.KindOf(pks[j]) == 3) {
+                    this.inner.P(r.GetString(hits[k], at));
+                } else {
+                    this.inner.Pl(r.GetLong(hits[k], at));
+                }
+            }
+        }
+        return this;
+    }
+
+    public DeleteQuery<T> Where(string sql) {
+        this.inner.W(sql);
+        return this;
+    }
+
+    // 表达式树过滤条件（编译期 ExprNode 下推，直接生成参数化 DELETE，零反射零装箱）
+    public DeleteQuery<T> Where(ExprNode expr) {
+        this.inner.WExpr(expr);
+        return this;
+    }
+
+    public DeleteQuery<T> Where(Expr<T> expr) {
+        if (expr != null && expr.Root != null) {
+            this.inner.WExpr(expr.Root);
+        }
+        return this;
+    }
+
+    public DeleteQuery<T> WhereIf(bool condition, Func<T, bool> expr) {
+        if (condition && expr != null) {
+            this.Where(expr);
+        }
+        return this;
+    }
+
+    public DeleteQuery<T> WhereIf(bool condition, string sql) {
+        if (condition) {
+            this.inner.W(sql);
+        }
+        return this;
+    }
+
+    public DeleteQuery<T> WhereEq(string col, string val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public DeleteQuery<T> WhereEq(string col, int val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public DeleteQuery<T> WhereEq(string col, long val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public DeleteQuery<T> WherePk(int id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public DeleteQuery<T> WherePk(long id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public DeleteQuery<T> WherePk(string id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public DeleteQuery<T> WhereDict(DbValues v) {
+        this.inner.WhereDict(v);
+        return this;
+    }
+
+    public int ExecuteAffrows() {
+        return this.inner.ExecuteAffrows();
+    }
+
+    public async int ExecuteAffrowsAsync() {
+        return await this.inner.ExecuteAffrowsAsync();
+    }
+}
+
+// UPDATE 更新驱动

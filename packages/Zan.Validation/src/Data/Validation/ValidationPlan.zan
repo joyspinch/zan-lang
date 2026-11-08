@@ -30,20 +30,28 @@ public class ValidationPlan<T> {
     // 规则链。每条规则返回 null 表示通过，返回非 null 的结果表示
     // 失败（结果里可以有多条失败项，嵌套校验用）。
     public List<Func<T, ValidationResult>> rules;
+    // 异步规则链。
+    public List<IAsyncValidationRule<T>> asyncRules;
 
     public ValidationPlan() {
         this.rules = new List<Func<T, ValidationResult>>();
+        this.asyncRules = new List<IAsyncValidationRule<T>>();
     }
 
-    // 规则条数。
+    // 规则条数（同步规则数与异步规则数总和）。
     public int RuleCount() {
-        return this.rules.Count;
+        return this.rules.Count + this.asyncRules.Count;
     }
 
     // 追加一条自定义规则：返回 null 表示通过。返回非 null 结果时
     // 其中的失败项会被聚合进总结果（属性名前缀照上下文处理）。
     public void AddRule(Func<T, ValidationResult> rule) {
         if (rule != null) { this.rules.Add(rule); }
+    }
+
+    // 追加一条自定义异步校验规则。
+    public void AddAsyncRule(IAsyncValidationRule<T> asyncRule) {
+        if (asyncRule != null) { this.asyncRules.Add(asyncRule); }
     }
 
     /* ---------- 文本规则 ---------- */
@@ -284,6 +292,44 @@ public class ValidationPlan<T> {
             }
         }
         return result;
+    }
+
+    // 异步执行校验（包含同步规则与异步规则），聚合全部失败。
+    public async ValidationResult ValidateAsync(T instance) {
+        return await this.ValidateAsyncWith(instance, new ValidationContext());
+    }
+
+    // 带上下文的异步校验：先跑同步规则链，若未中断再依次执行异步规则。
+    public async ValidationResult ValidateAsyncWith(T instance, ValidationContext context) {
+        if (context == null) { context = new ValidationContext(); }
+        // 1. 同步规则校验
+        ValidationResult result = this.ValidateWith(instance, context);
+        if (context.stopOnFirstFailure && !result.IsValid) {
+            return result;
+        }
+
+        // 2. 异步规则校验
+        for (int i = 0; i < this.asyncRules.Count; i = i + 1) {
+            IAsyncValidationRule<T> rule = this.asyncRules[i];
+            ValidationResult r = await rule.ValidateAsync(instance);
+            if (r != null && r.ErrorCount > 0) {
+                this.Merge(result, r, context.propertyPrefix);
+                if (context.stopOnFirstFailure) { break; }
+            }
+        }
+        return result;
+    }
+
+    // 异步判断是否校验通过。
+    public async bool IsValidAsync(T instance) {
+        ValidationResult r = await this.ValidateAsync(instance);
+        return r.IsValid;
+    }
+
+    // 异步校验，不通过就抛 ValidationException。
+    public async void ValidateOrThrowAsync(T instance) {
+        ValidationResult result = await this.ValidateAsync(instance);
+        if (!result.IsValid) { throw new ValidationException(result); }
     }
 
     // 只问通过与否。

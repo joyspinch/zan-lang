@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Net.Http;
 using System.Net.Http.Client;
 
@@ -49,6 +50,12 @@ public class OssClient {
     /// 参数里的 key 是拼好 basePath 的完整键。</summary>
     public virtual void SignRequest(HttpClient http, string method, string key,
                                      string contentType, byte[] body, long now) { }
+
+    /// <summary>带查询参数的请求签名（分块上传、分段列举等）。默认回退到 SignRequest。</summary>
+    public virtual void SignRequestWithQuery(HttpClient http, string method, string key,
+                                             List<string> queryPairs, string contentType, byte[] body, long now) {
+        this.SignRequest(http, method, key, contentType, body, now);
+    }
 
     /// <summary>对象的公网直链（空串 = 该提供方不给直链）。参数是完整键。</summary>
     public virtual string PublicUrlFor(string fullKey) { return ""; }
@@ -149,6 +156,122 @@ public class OssClient {
         r.ok = true;
         r.statusCode = 200;
         return r;
+    }
+
+    /// <summary>从 XML 响应中轻量提取指定标签的文本内容。</summary>
+    public static string ExtractXmlTag(string xml, string tag) {
+        if (xml == null || tag == null) { return ""; }
+        string openTag = "<" + tag + ">";
+        string closeTag = "</" + tag + ">";
+        int start = xml.IndexOf(openTag);
+        if (start < 0) { return ""; }
+        start = start + openTag.Length;
+        int end = xml.IndexOf(closeTag, start);
+        if (end < 0) { return ""; }
+        return xml.Substring(start, end - start).Trim();
+    }
+
+    /// <summary>初始化分块上传，返回包含 uploadId 的回执。</summary>
+    public async OssMultipartResult InitiateMultipartUpload(string key, string contentType) {
+        OssMultipartResult r = new OssMultipartResult();
+        if (key == null || key.Length == 0) { r.error = "对象键为空"; return r; }
+        string ct = contentType == null || contentType.Length == 0 ? "application/octet-stream" : contentType;
+        HttpClient http = this.NewClient();
+        if (http == null) { r.error = "端点配置无效"; return r; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        List<string> q = new List<string>();
+        q.Add("uploads");
+        this.SignRequestWithQuery(http, "POST", objKey, q, ct, null, now);
+        http.SetHeader("Content-Type", ct);
+        HttpResponse resp = await http.SendBytesAsync("POST", this.RequestPath(objKey) + "?uploads", new byte[0], 0);
+        OssResult res = OssResult.Of(resp);
+        r.ok = res.ok;
+        r.statusCode = res.statusCode;
+        r.error = res.error;
+        r.body = res.body;
+        r.bodyLength = res.bodyLength;
+        if (r.ok) {
+            string xml = r.BodyText();
+            r.uploadId = OssClient.ExtractXmlTag(xml, "UploadId");
+            if (r.uploadId.Length == 0) {
+                r.uploadId = OssClient.ExtractXmlTag(xml, "uploadId");
+            }
+        }
+        return r;
+    }
+
+    /// <summary>上传一个分块。partNumber 为块编号（1..10000），成功后返回含 ETag 的回执。</summary>
+    public async OssResult UploadPart(string key, string uploadId, int partNumber, byte[] partBody) {
+        OssResult r = new OssResult();
+        if (key == null || key.Length == 0) { r.error = "对象键为空"; return r; }
+        if (uploadId == null || uploadId.Length == 0) { r.error = "UploadId为空"; return r; }
+        if (partBody == null) { partBody = new byte[0]; }
+        HttpClient http = this.NewClient();
+        if (http == null) { r.error = "端点配置无效"; return r; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        List<string> q = new List<string>();
+        q.Add("partNumber=" + Convert.ToString(partNumber));
+        q.Add("uploadId=" + uploadId);
+        string ct = "application/octet-stream";
+        this.SignRequestWithQuery(http, "PUT", objKey, q, ct, partBody, now);
+        http.SetHeader("Content-Type", ct);
+        string url = this.RequestPath(objKey) + "?partNumber=" + Convert.ToString(partNumber) + "&uploadId=" + uploadId;
+        HttpResponse resp = await http.SendBytesAsync("PUT", url, partBody, partBody.Length);
+        return OssResult.Of(resp);
+    }
+
+    /// <summary>完成分块上传，将各分块组合成最终对象。</summary>
+    public async OssResult CompleteMultipartUpload(string key, string uploadId, List<OssUploadPart> parts) {
+        OssResult r = new OssResult();
+        if (key == null || key.Length == 0) { r.error = "对象键为空"; return r; }
+        if (uploadId == null || uploadId.Length == 0) { r.error = "UploadId为空"; return r; }
+        if (parts == null || parts.Count == 0) { r.error = "分块列表为空"; return r; }
+        
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<CompleteMultipartUpload>");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            OssUploadPart p = parts[i];
+            sb.Append("<Part><PartNumber>");
+            sb.Append(Convert.ToString(p.partNumber));
+            sb.Append("</PartNumber><ETag>");
+            sb.Append(p.etag);
+            sb.Append("</ETag></Part>");
+        }
+        sb.Append("</CompleteMultipartUpload>");
+        string xml = sb.ToString();
+        byte[] body = xml.ToBytes();
+
+        HttpClient http = this.NewClient();
+        if (http == null) { r.error = "端点配置无效"; return r; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        List<string> q = new List<string>();
+        q.Add("uploadId=" + uploadId);
+        string ct = "application/xml";
+        this.SignRequestWithQuery(http, "POST", objKey, q, ct, body, now);
+        http.SetHeader("Content-Type", ct);
+        string url = this.RequestPath(objKey) + "?uploadId=" + uploadId;
+        HttpResponse resp = await http.SendBytesAsync("POST", url, body, body.Length);
+        return OssResult.Of(resp);
+    }
+
+    /// <summary>中止并清理指定的分块上传事务。</summary>
+    public async OssResult AbortMultipartUpload(string key, string uploadId) {
+        OssResult r = new OssResult();
+        if (key == null || key.Length == 0) { r.error = "对象键为空"; return r; }
+        if (uploadId == null || uploadId.Length == 0) { r.error = "UploadId为空"; return r; }
+        HttpClient http = this.NewClient();
+        if (http == null) { r.error = "端点配置无效"; return r; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        List<string> q = new List<string>();
+        q.Add("uploadId=" + uploadId);
+        this.SignRequestWithQuery(http, "DELETE", objKey, q, "", null, now);
+        string url = this.RequestPath(objKey) + "?uploadId=" + uploadId;
+        HttpResponse resp = await http.SendBytesAsync("DELETE", url, new byte[0], 0);
+        return OssResult.Of(resp);
     }
 
     /// <summary>凭证体检：发一次桶级签名请求。返回错误文本（空串 = 通过）。</summary>
