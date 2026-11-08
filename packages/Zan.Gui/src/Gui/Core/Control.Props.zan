@@ -1,0 +1,288 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui;
+
+// Control.Props.zan - 控件设计器属性、插槽挂载、数据绑定契约与状态尺寸档位
+public partial class Control {
+    // --- 设计器/序列化模型（通过虚方法统一、免强转）---
+
+    // 用于重建此节点的稳定类型标签（见 ControlFactory）。每个
+    // 具体控件都重写它；基类标签只是回退。
+    public virtual string Kind() {
+        return "Control";
+    }
+
+    // 供检查器和序列化器使用的控件专属可编辑属性。
+    // 通用几何（dock/pad/gap/size/pos/name）由 Serialize 处理，
+    // 因此这里只返回控件独有的属性。基类没有。
+    public virtual List<PropSpec> Props() {
+        return new List<PropSpec>();
+    }
+
+    // 一切由字段支撑的属性仅由 Props() 提供。
+    public virtual string GetExtra(string key) {
+        return "";
+    }
+
+    // 写入一个额外属性；控件没有该键时返回 false，
+    // 基类此时回退为把它当作样式类处理。
+    public virtual bool SetExtra(string key, string val) {
+        return false;
+    }
+
+    // 设计里放进容器某个“位”的子控件（标签页的页、分栏的
+    // 窗格）真正的父节点。容器重写它，把设计文档的 `childTab`
+    // 映射到自己的内部容器；普通容器直接收下子节点。
+    public virtual Control SlotHost(int slot) {
+        return this;
+    }
+
+    // 具名插槽宿主容器：复合组件（Tabs/SplitPanel/Card/Dialog 等）根据 slot 名字
+    // 映射到具体的内部容器（如 "header"、"footer"、"left"、"right" 或数字页码）。
+    public virtual Control NamedSlotHost(string slot) {
+        if (slot == "" || slot == "default") { return this; }
+        if (Control.IsNumericSlot(slot)) {
+            return this.SlotHost(Convert.ToInt32(slot));
+        }
+        return null;
+    }
+
+    // 将子控件挂载到指定具名槽位：若成功消费槽位则返回 true。
+    public virtual bool MountSlot(string slot, Control c) {
+        Control host = this.NamedSlotHost(slot);
+        if (host != null && host != this) {
+            host.Add(c);
+            return true;
+        }
+        return false;
+    }
+
+    public static bool IsNumericSlot(string s) {
+        if (s == "") { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = (int)s[i];
+            if (ch < 48 || ch > 57) { return false; }
+        }
+        return true;
+    }
+
+    // 通过控件在 Props() 中绑定的访问器，按键以文本形式读取属性——
+    // 这样控件只需发布每个属性一次，无需自己的
+    // 字符串映射。`class`、`name` 和 `disabled` 对所有控件都有应答。
+    public virtual string GetProp(string key) {
+        if (key == "class") { return Class; }
+        if (key == "name") { return name; }
+        PropSpec p = this.PropOf(key);
+        if (p != null && p.IsBound()) { return p.Read(); }
+        // `disabled` 是基类字段（沿树继承的禁用标志）——每个控件都
+        // 有这个状态，属性协议必须应答它。控件自己没声明该属性时，
+        // 设计器写进去的"禁用"落不到控件上（基类兜底会把它当样式
+        // 类，控件本身没被禁用）。
+        if (key == "disabled") { return PropSpec.Flag(this.Disabled.Get()); }
+        string extra = this.GetExtra(key);
+        if (extra != "") { return extra; }
+        if (p != null) { return p.Read(); }
+        return "";
+    }
+
+    // 从文本按键写入属性（GetProp 的逆操作）。未知的
+    // 键改指样式类，要么是标志（`"round": true`），要么是
+    // 变体名（`"size": "small"`），文档正是借此设置
+    // 控件没有字段对应的视觉变体。
+    public virtual void SetProp(string key, string val) {
+        if (key == "class") { Class = val; return; }
+        if (key == "style") {
+            // 内联 CSS 声明即时落控件（布局键落字段、视觉键落 style*
+            // 覆盖字段）。清掉常态样式缓存：SetProp 可能发生在首绘
+            // 之后，不清缓存下一帧还会拿旧的解析结果画。
+            StyleSheet.ApplyInline(this, val);
+            computedStyle = null;
+            return;
+        }
+        if (key == "name") {
+            // 组件自带同名属性（IconView 的图标名等）优先于控件
+            // 标识名：直接写标识名会让这类属性在任何声明通道
+            // （data-x-props/原生属性）下永远喂不进去。
+            PropSpec np = this.PropOf(key);
+            if (np != null && np.IsBound()) {
+                np.Write(val);
+                if (np.syncName) { name = val; }
+                return;
+            }
+            if (this.SetExtra(key, val)) {
+                if (np != null && np.syncName) { name = val; }
+                return;
+            }
+            name = val;
+            return;
+        }
+        PropSpec p = this.PropOf(key);
+        if (p != null && p.IsBound()) {
+            p.Write(val);
+            if (p.syncName) { name = val; }
+            return;
+        }
+        if (this.SetExtra(key, val)) {
+            if (p != null && p.syncName) { name = val; }
+            return;
+        }
+        if (p != null) {
+            p.Write(val);
+            if (p.syncName) { name = val; }
+            return;
+        }
+        // `disabled` 落基类字段（见 GetProp 的同名分支）。控件自
+        // 己声明了 disabled 属性时走上面的 spec——同一个字段。
+        if (key == "disabled") {
+            this.Disabled.Set(PropSpec.IsOn(val));
+            return;
+        }
+        if (this.SetExtra(key, val)) { return; }
+        if (val == "true") { this.AddClass(key); }
+        else if (val != "" && val != "false") { this.AddClass(val); }
+    }
+
+    // 应用设计器里的标题文本。只有声明了 `text` 属性的控件
+    // 会接受它：容器的 label 是设计期说明，不是内容，所以
+    // 不能像 SetProp 那样退化成样式类。
+    void SetDesignText(string txt) {
+        if (txt == "") { return; }
+        PropSpec p = this.PropOf("text");
+        if (p == null) { return; }
+        p.Write(txt);
+        if (p.syncName) { name = txt; }
+    }
+
+    // 添加动态属性绑定规则
+    void AddBindProp(string prop, string expr) {
+        ControlExtra e = this.EnsureExtra();
+        if (e.bindProps == null) {
+            e.bindProps = new List<BindPropEntry>();
+        }
+        e.bindProps.Add(new BindPropEntry(prop, expr));
+    }
+
+    // 若样式类尚不存在则添加它。
+    void AddClass(string cls) {
+        if (cls == "" || Style.Has(Class, cls)) { return; }
+        if (Class == "") { Class = cls; return; }
+        Class = Class + " " + cls;
+    }
+
+    // 判断控件是否包含指定的样式类。
+    bool HasClass(string cls) {
+        if (cls == "" || Class == null || Class == "") { return false; }
+        return Style.Has(Class, cls);
+    }
+
+    // 把 `Class` 里属于 `group`（空格分隔的候选集）的类全部去掉，
+    // 再加上 `cls`（`cls` 为空则只做清除）。
+    // 同一根轴上的变体是互斥的：`justify-center` 与 `justify-end`
+    // 同时挂着时，最终生效的是样式表里靠后那条规则，作者每换一次
+    // 对齐方式都得自己先去清掉上一次留下的类。这个方法把互斥
+    // 关系收在一处，供 Flex/Grid 这类有多组变体的容器使用。
+    void SetClassIn(string group, string cls) {
+        List<string> drop = Style.Classes(group);
+        List<string> cur = Style.Classes(Class);
+        string kept = "";
+        for (int i = 0; i < cur.Count; i = i + 1) {
+            bool inGroup = false;
+            for (int j = 0; j < drop.Count; j = j + 1) {
+                if (cur[i] == drop[j]) { inGroup = true; }
+            }
+            if (inGroup) { continue; }
+            if (kept == "") { kept = cur[i]; } else { kept = kept + " " + cur[i]; }
+        }
+        Class = kept;
+        this.AddClass(cls);
+    }
+
+    // Naive UI `size` prop 值对应的 class 片段：四档一一对应
+    // （tiny/small/medium/large），空串表示"不附加"（默认档）。
+    //
+    // 过去 tiny 被并进 small，于是 base.css 里写好的 `.tiny` 规则
+    // （button.tiny / switch.tiny / tag.tiny / radio.tiny）永远不可达，
+    // "同一档在不同组件上不是一个量"。现在四档各自成类，档位几何
+    // 统一取自 Style.RootFromTheme 导出的 --height-* / --font-size-*
+    // 令牌；没有 `.medium` 规则的组件落在默认档，与 medium 等价。
+    static string SizeClass(string size) {
+        if (size == "tiny" || size == "small" || size == "medium"
+            || size == "large") {
+            return size;
+        }
+        return "";
+    }
+
+    // 实例侧便捷：解析本控件的 `Size` 绑定字段并映射为档位
+    // class 片段。Binding<string> 型的 Size 字段直接调用即可。
+    string SizeCls() {
+        Binding<string> sz = this.SizeOf();
+        if (sz == null) { return ""; }
+        return Control.SizeClass(sz.Get());
+    }
+
+    // 把尺寸档落到样式类上——控件支持尺寸档时的**统一入口**。
+    //
+    // 档位类互斥：挂新档之前先把 Class 里其它档位去掉，所以
+    // `Class = "small"` 与 `Size = "large"` 同时存在时是 large 说了算，
+    // 不会留下两个高度规则互相打架。用户手写的其它类（primary /
+    // ghost / outline…）不受影响。
+    //
+    // **medium 是默认档，不覆盖用户写的档位**：设计器的尺寸行默认
+    // 选中 medium，若它也去覆盖，`Class = "primary small"` 这种既有
+    // 写法会被无声改成 medium 档（按钮集体变大）。所以：
+    //   - 绑定为空 → 什么都不做（Class 原样）；
+    //   - 绑定为 medium（默认）或非法值 → 什么都不做；
+    //   - 绑定为 tiny/small/large → 挂上该档并清掉其它档。
+    //
+    // 控件在解析样式前调用它，并在解析后把 Class 还原——档位因此
+    // 只是"这一帧的排布"，不会污染作者写下的 Class。
+    void ApplySizeClass() {
+        Binding<string> sz = this.SizeOf();
+        if (sz == null) { return; }
+        string cls = Control.SizeClass(sz.Get());
+        if (cls == "" || cls == "medium") { return; }
+        this.SetClassIn("tiny small medium large", cls);
+    }
+
+    // 设计器属性：尺寸档。控件在 Props() 里加一行
+    // `ps.Add(this.SizeProp())` 即可，与各控件自己拼 PropSpec 的
+    // 写法一致。
+    PropSpec SizeProp() {
+        PropSpec sz = PropSpec.Enum("size", "Size", PropSpec.Sizes());
+        sz.str = this.SizeOf();
+        return sz;
+    }
+
+    // 校验状态类名（Naive UI status prop）。输入族控件
+    // （Input/TextArea）把 `FieldStatus` 映射为这些 class，
+    // base.css 的 `.success/.warning/.error` 规则负责描边。
+    // 校验成功状态类名（"success"）。
+    static string StatusSuccess() { return "success"; }
+    // 校验警告状态类名（"warning"）。
+    static string StatusWarning() { return "warning"; }
+    // 校验错误状态类名（"error"）。
+    static string StatusError() { return "error"; }
+
+    // 校验状态白名单归一：只认 success/warning/error，其余一律
+    // 落回 ""（无状态）。设计器/绑定路径写进来的任意字符串先过
+    // 这里，脏值不会长出一个没人认识的 class。
+    static string StatusSanitize(string v) {
+        if (v == Control.StatusSuccess() || v == Control.StatusWarning()
+            || v == Control.StatusError()) { return v; }
+        return "";
+    }
+
+    // 反射在 Zan 里没有：子类用 `new` 覆写 SizeOf 返回自己的
+    // Size 绑定字段；基类返回 null。
+    public virtual Binding<string> SizeOf() { return null; }
+
+    // 双向绑定的统一拉取点：把外部 `Binding<T>` 的当前值拉进
+    // 控件内部状态（model -> UI）。基类空实现；有绑定通道的
+    // 控件 override。由 RenderTree 在每帧 OnPaint 前统一调用，
+    // 控件不必在 OnPaint 开头自调（事件时机的回写仍走
+    // `data.Set(...)`，与本契约无关）。契约见
+    public virtual void SyncBinding() { }
+}

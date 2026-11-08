@@ -1,0 +1,235 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+using Gui;
+
+namespace Gui;
+
+// ModelBinder.Expr.zan - 属性表达式、条件比较、三元运算符与插值模板计算引擎
+public partial class ModelBinder {
+    static bool Truthy(JsonValue v) {
+        if (v == null) { return false; }
+        if (v.IsBool()) { return v.AsBool(false); }
+        if (v.IsNumber()) { return v.AsInt(0) != 0; }
+        string s = v.AsString("");
+        return s != "" && s != "false";
+    }
+
+    bool EvalExpr(Control c, string expr) {
+        if (expr == "") { return false; }
+        string s = expr.Trim();
+        if (s == "") { return false; }
+
+        int orIdx = s.IndexOf("||");
+        if (orIdx >= 0) {
+            string left = s.Substring(0, orIdx);
+            string right = s.Substring(orIdx + 2);
+            return this.EvalExpr(c, left) || this.EvalExpr(c, right);
+        }
+
+        int andIdx = s.IndexOf("&&");
+        if (andIdx >= 0) {
+            string left = s.Substring(0, andIdx);
+            string right = s.Substring(andIdx + 2);
+            return this.EvalExpr(c, left) && this.EvalExpr(c, right);
+        }
+
+        if (s.StartsWith("!")) {
+            return !this.EvalExpr(c, s.Substring(1));
+        }
+
+        string op = "";
+        int opIdx = -1;
+        int opLen = 0;
+
+        int idx = s.IndexOf("==");
+        if (idx >= 0) { op = "=="; opIdx = idx; opLen = 2; }
+        else {
+            idx = s.IndexOf("!=");
+            if (idx >= 0) { op = "!="; opIdx = idx; opLen = 2; }
+            else {
+                idx = s.IndexOf(">=");
+                if (idx >= 0) { op = ">="; opIdx = idx; opLen = 2; }
+                else {
+                    idx = s.IndexOf("<=");
+                    if (idx >= 0) { op = "<="; opIdx = idx; opLen = 2; }
+                    else {
+                        idx = s.IndexOf(">");
+                        if (idx >= 0) { op = ">"; opIdx = idx; opLen = 1; }
+                        else {
+                            idx = s.IndexOf("<");
+                            if (idx >= 0) { op = "<"; opIdx = idx; opLen = 1; }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (op != "") {
+            string leftStr = s.Substring(0, opIdx).Trim();
+            string rightStr = s.Substring(opIdx + opLen).Trim();
+            return this.EvalCompare(c, leftStr, op, rightStr);
+        }
+
+        return this.ResolveTruthy(c, s);
+    }
+
+    bool EvalCompare(Control c, string leftStr, string op, string rightStr) {
+        bool isLeftNum = false;
+        bool isRightNum = false;
+        double leftNum = this.ParseOperandNum(c, leftStr, out isLeftNum);
+        double rightNum = this.ParseOperandNum(c, rightStr, out isRightNum);
+
+        if (isLeftNum && isRightNum) {
+            switch (op) {
+                case "==": return leftNum == rightNum;
+                case "!=": return leftNum != rightNum;
+                case ">":  return leftNum > rightNum;
+                case "<":  return leftNum < rightNum;
+                case ">=": return leftNum >= rightNum;
+                case "<=": return leftNum <= rightNum;
+                default:   return false;
+            }
+        }
+
+        string leftVal = this.ResolveOperandStr(c, leftStr);
+        string rightVal = this.ResolveOperandStr(c, rightStr);
+        switch (op) {
+            case "==": return leftVal == rightVal;
+            case "!=": return leftVal != rightVal;
+            case ">":  return leftVal > rightVal;
+            case "<":  return leftVal < rightVal;
+            case ">=": return leftVal >= rightVal;
+            case "<=": return leftVal <= rightVal;
+            default:   return false;
+        }
+    }
+
+    double ParseOperandNum(Control c, string operand, out bool isNum) {
+        isNum = false;
+        if (operand == "") { return 0.0; }
+        if (operand.StartsWith("'") || operand.StartsWith("\"")) {
+            return 0.0;
+        }
+        if (operand == "true" || operand == "false") {
+            return 0.0;
+        }
+        if (IsNumericLiteral(operand)) {
+            isNum = true;
+            return operand.ToDouble();
+        }
+        double d = 0.0;
+        if (this.TryResolveDouble(c, operand, out d)) {
+            isNum = true;
+            return d;
+        }
+        return 0.0;
+    }
+
+    static bool IsNumericLiteral(string s) {
+        if (s == "") { return false; }
+        int start = 0;
+        if (s.StartsWith("-") || s.StartsWith("+")) {
+            start = 1;
+            if (s.Length <= 1) { return false; }
+        }
+        bool hasDot = false;
+        for (int i = start; i < s.Length; i = i + 1) {
+            int ch = (int)s[i];
+            if (ch == 46) {
+                if (hasDot) { return false; }
+                hasDot = true;
+            } else if (ch < 48 || ch > 57) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    string ResolveOperandStr(Control c, string operand) {
+        if (operand == "") { return ""; }
+        if ((operand.StartsWith("'") && operand.EndsWith("'")) ||
+            (operand.StartsWith("\"") && operand.EndsWith("\""))) {
+            if (operand.Length >= 2) {
+                return operand.Substring(1, operand.Length - 2);
+            }
+            return "";
+        }
+        if (operand == "true") { return "true"; }
+        if (operand == "false") { return "false"; }
+        if (operand == "null") { return ""; }
+        string sval = "";
+        if (this.TryResolveString(c, operand, out sval)) {
+            return sval;
+        }
+        return "";
+    }
+
+    string EvalAttrExpr(Control c, string expr) {
+        if (expr == "") { return ""; }
+        string s = expr.Trim();
+        if (s == "") { return ""; }
+        int qIdx = 0 - 1;
+        int colonIdx = 0 - 1;
+        bool inQuote = false;
+        int quoteChar = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = (int)s[i];
+            if (ch == 39 || ch == 34) {
+                if (!inQuote) {
+                    inQuote = true;
+                    quoteChar = ch;
+                } else if (quoteChar == ch) {
+                    inQuote = false;
+                }
+            } else if (!inQuote) {
+                if (ch == 63 && qIdx < 0) {
+                    qIdx = i;
+                } else if (ch == 58 && qIdx >= 0 && colonIdx < 0) {
+                    colonIdx = i;
+                    break;
+                }
+            }
+        }
+        if (qIdx >= 0 && colonIdx > qIdx) {
+            string cond = s.Substring(0, qIdx).Trim();
+            string trueBranch = s.Substring(qIdx + 1, colonIdx - (qIdx + 1)).Trim();
+            string falseBranch = s.Substring(colonIdx + 1).Trim();
+            bool condVal = this.EvalExpr(c, cond);
+            string chosen = condVal ? trueBranch : falseBranch;
+            return this.ResolveOperandStr(c, chosen);
+        }
+        return this.ResolveOperandStr(c, s);
+    }
+
+    string EvalClassExpr(Control c, string expr) {
+        return this.EvalAttrExpr(c, expr);
+    }
+
+    string EvalInterpolation(Control c, string tpl) {
+        if (tpl == "" || tpl.IndexOf("{{") < 0) { return tpl; }
+        StringBuilder sb = new StringBuilder();
+        int cur = 0;
+        while (cur < tpl.Length) {
+            int open = tpl.IndexOf("{{", cur);
+            if (open < 0) {
+                sb.Append(tpl.Substring(cur));
+                break;
+            }
+            if (open > cur) {
+                sb.Append(tpl.Substring(cur, open - cur));
+            }
+            int close = tpl.IndexOf("}}", open + 2);
+            if (close < 0) {
+                sb.Append(tpl.Substring(open));
+                break;
+            }
+            string expr = tpl.Substring(open + 2, close - (open + 2)).Trim();
+            string val = this.EvalAttrExpr(c, expr);
+            sb.Append(val);
+            cur = close + 2;
+        }
+        return sb.ToString();
+    }
+}
