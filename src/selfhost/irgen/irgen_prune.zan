@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- whole-module dead-code pruning (G8 round 2) ----
+    //
+    // The stdlib demand-pull hands the emitter whole files, so a program
+    // that touches one Encoding helper shipped Encoding_Sha1, four
+    // QuickSort variants and the full Base64/Unicode machinery it never
+    // calls -- the `arithmetic` case was 52k lines of prelude for a main of
+    // 62. The shim-only prune barely helped (469 lines); the mass is user
+    // code. So the pass runs over the WHOLE module text:
+    //
+    // roots = every @symbol on a line that is not inside a `define` block
+    //         (global initializers -- vtables and function-pointer tables
+    //         are data, so their targets stay reachable -- plus declares
+    //         and attributes) + the `main` entry the linker references
+    //         externally + the weak coroutine set the linked C runtime
+    //         references from outside the module;
+    // kept  = the transitive closure over define blocks' internal @refs.
+    //
+    // Every call edge in LLVM IR is a textual `@name`, so a missed edge is
+    // impossible to lose silently: the link fails loudly with LNK2019
+    // instead of misbehaving. Dropped blocks are ones nothing can call.
+    //
+    // Order matters for determinism: this runs after all emission (including
+    // the deferred generic specializations) and before the module text is
+    // returned, so two successive self-compiles see the same input and stay
+    // a fixed point.
+
+    string PruneDeadCode(string modText) {
+        // slice into lines (index/length pairs, no copying)
+        List<int> lineStart = new List<int>();
+        List<int> lineLen = new List<int>();
+        int pos = 0;
+        while (pos <= modText.Length) {
+            int nl = modText.IndexOf("\n", pos);
+            if (nl < 0) {
+                lineStart.Add(pos);
+                lineLen.Add(modText.Length - pos);
+                break;
+            }
+            lineStart.Add(pos);
+            lineLen.Add(nl - pos);
+            pos = nl + 1;
+        }
+        int lnCount = lineLen.Count;
+
+        // walk the lines, slicing out the `define` blocks (a block runs from
+        // its define line through its closing '}' at column 0)
+        List<int> defStart = new List<int>();
+        List<int> defEnd = new List<int>();
+        List<string> defName = new List<string>();
+        int i = 0;
+        while (i < lnCount) {
+            string ln = modText.Substring(lineStart[i], lineLen[i]);
+            if (ln.StartsWith("define ")) {
+                int st = i;
+                string nm = HeadSymbol(ln);
+                while (i < lnCount) {
+                    string bl = modText.Substring(lineStart[i], lineLen[i]);
+                    if (bl == "}") { break; }
+                    i = i + 1;
+                }
+                defStart.Add(st);
+                defEnd.Add(i);
+                defName.Add(nm);
+            }
+            i = i + 1;
+        }
+        if (defName.Count == 0) { return modText; }
+
+        List<int> blockScanned = new List<int>();
+        int k = 0;
+        while (k < defName.Count) { blockScanned.Add(0); k = k + 1; }
+
+        // roots: the @symbols on every NON-define line (global initializers
+        // -- vtables and function-pointer tables are data, so their targets
+        // stay reachable -- plus declares and attributes) and the `main`
+        // entry the linker references externally
+        List<string> keep = new List<string>();
+        i = 0;
+        int defRun = 0;
+        while (i < lnCount) {
+            if (defRun < defName.Count && defStart[defRun] == i) {
+                i = defEnd[defRun] + 1;
+                defRun = defRun + 1;
+                continue;
+            }
+            CollectHeadRefs(modText.Substring(lineStart[i], lineLen[i]), keep);
+            i = i + 1;
+        }
+        keep.Add("main");
+        // the weak coroutine set: the linked C runtime references these from
+        // outside the module, so reachability inside the module never sees them
+        keep.Add("zan_co_ready"); keep.Add("zan_co_sched_init");
+        keep.Add("zan_co_sched_run"); keep.Add("zan_co_delay");
+        keep.Add("zan_io_pump"); keep.Add("zan_io_pump_timeout");
+        keep.Add("__zan_async_unwind"); keep.Add("__zan_co_frame_free");
+        keep.Add("__zan_co_now_ms"); keep.Add("__zan_co_reap");
+
+        int wi = 0;
+        while (wi < keep.Count) {
+            string want = keep[wi];
+            wi = wi + 1;
+            int bi = BlockOf(defName, want);
+            if (bi < 0) { continue; }
+            if (blockScanned[bi] == 1) { continue; }
+            blockScanned[bi] = 1;
+            int from = lineStart[defStart[bi]];
+            int to = lineStart[defEnd[bi]] + lineLen[defEnd[bi]];
+            CollectHeadRefs(modText.Substring(from, to - from), keep);
+        }
+
+        // rebuild the module: skip define blocks that stayed unreachable
+        StringBuilder result = new StringBuilder();
+        i = 0;
+        int defIdx = 0;
+        while (i < lnCount) {
+            if (defIdx < defName.Count && defStart[defIdx] == i) {
+                if (blockScanned[defIdx] == 0) {
+                    // drop the whole block: fast-forward past its closing '}'
+                    i = defEnd[defIdx] + 1;
+                    defIdx = defIdx + 1;
+                    continue;
+                }
+                defIdx = defIdx + 1;
+            }
+            result.Append(modText.Substring(lineStart[i], lineLen[i]));
+            result.Append("\n");
+            i = i + 1;
+        }
+        return result.ToString();
+    }
+
+    int BlockOf(List<string> names, string want) {
+        int k = 0;
+        while (k < names.Count) {
+            if (names[k] == want) { return k; }
+            k = k + 1;
+        }
+        return -1;
+    }
+
+    // the symbol name of a `define ... @name(...)` line
+    string HeadSymbol(string line) {
+        int at = line.IndexOf("@");
+        if (at < 0) { return ""; }
+        int j = at + 1;
+        while (j < line.Length) {
+            int c = (int)line[j];
+            bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 46 || c == 36;
+            if (!ok) { break; }
+            j = j + 1;
+        }
+        return line.Substring(at + 1, j - at - 1);
+    }
+
+    // every @symbol mentioned in the text, in order (duplicates fine: the
+    // worklist skips already-scanned blocks)
+    void CollectHeadRefs(string text, List<string> into) {
+        int i = 0;
+        while (i < text.Length) {
+            if ((int)text[i] == 64) { // '@'
+                int j = i + 1;
+                while (j < text.Length) {
+                    int c = (int)text[j];
+                    bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 46 || c == 36;
+                    if (!ok) { break; }
+                    j = j + 1;
+                }
+                if (j > i + 1) { into.Add(text.Substring(i + 1, j - i - 1)); }
+                i = j;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+}
