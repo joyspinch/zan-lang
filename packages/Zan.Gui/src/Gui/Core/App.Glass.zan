@@ -1,0 +1,604 @@
+using System;
+using Gui.Backend;
+
+namespace Gui;
+
+public partial class App {
+    void NoteHoverDamage(int oldId, int newId) {
+        if (this.ForceFullFrames()) { partialPending = false; return; }
+        // 同一批事件里已经有人要求过整窗重绘（RequestRedraw，说不清
+        // 改了哪些像素）：悬停不得反过来把它降级成一条条带，否则
+        // 那次状态变化改的像素永远不重画，一直就留在屏上。
+        if (partialBlocked) {
+            this.NoteRedrawWhy("hover-blocked");
+            partialPending = false;
+            return;
+        }
+        if (this.HasOverlays() || this.PointerCaptured()) {
+            this.NoteRedrawWhy("hover-blocked");
+            partialPending = false;
+            return;
+        }
+        int raX, raY, raW, raH;
+        int rbX, rbY, rbW, rbH;
+        bool hasRa = hitTester.TryGetRect(oldId, out raX, out raY, out raW, out raH);
+        bool hasRb = hitTester.TryGetRect(newId, out rbX, out rbY, out rbW, out rbH);
+        if (!hasRa && !hasRb) {
+            this.NoteRedrawWhy("hover-norect");
+            partialPending = false;
+            return;
+        }
+        int pad = this.Scale(6);
+        int x0 = canvas.Width();
+        int y0 = canvas.Height();
+        int x1 = 0;
+        int y1 = 0;
+        if (hasRa) {
+            if (raX < x0) { x0 = raX; }
+            if (raY < y0) { y0 = raY; }
+            if (raX + raW > x1) { x1 = raX + raW; }
+            if (raY + raH > y1) { y1 = raY + raH; }
+        }
+        if (hasRb) {
+            if (rbX < x0) { x0 = rbX; }
+            if (rbY < y0) { y0 = rbY; }
+            if (rbX + rbW > x1) { x1 = rbX + rbW; }
+            if (rbY + rbH > y1) { y1 = rbY + rbH; }
+        }
+        x0 = x0 - pad;
+        y0 = y0 - pad;
+        x1 = x1 + pad;
+        y1 = y1 + pad;
+        // 本批事件里已声明的损伤（NoteDamage：勾选框、换标签、滚动……）
+        // 要一并算进来。悬停条带直接覆盖它们的话，那些区域既不重画
+        // 也不上传，屏上就挂着旧像素，直到下一次整窗重绘。
+        if (partialPending) {
+            if (dmgX < x0) { x0 = dmgX; }
+            if (dmgY < y0) { y0 = dmgY; }
+            if (dmgX + dmgW > x1) { x1 = dmgX + dmgW; }
+            if (dmgY + dmgH > y1) { y1 = dmgY + dmgH; }
+        }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        if (x1 - x0 <= 0 || y1 - y0 <= 0) {
+            partialPending = false;
+            return;
+        }
+        dmgX = x0;
+        dmgY = y0;
+        dmgW = x1 - x0;
+        dmgH = y1 - y0;
+        partialPending = true;
+    }
+
+    // 滚轮帧的裁剪条带（TakeDueFrame 在动画条带不适用时调用）。
+    // 滚轮的消费与损伤声明都发生在渲染期，而声明者几何就是上一帧
+    // 的 wheelCap 矩形（滚轮不改变布局，跨帧稳定）——本帧裁剪到它，
+    // 条带外的控件既无输入也无输出。合并以下来源后仍收不住（接近
+    // 整窗、无上一帧认领）时返回 false，调用方退回整帧：
+    // - 上一帧认领视口（wheelCapW>0）：主来源。触摸拖动/滚轮连续
+    // 滚动时每一帧的声明都落在这里面；
+    // - 本帧已声明的损伤（dmgW>0，页面滚动 NotePageScrollDamage
+    // 在事件期先行声明）：一并包住；
+    // - 指针邻域（Scale(24)）：悬停高亮随内容滚到新行的过渡帧，
+    // RefreshScrollHover 补的条带下一帧自己会画，这里只要不把
+    // 指针底下那一小块留在上一帧的样子。
+    // 判 false 的兜底：无认领（指针刚跨入滚动区，整帧——这正是
+    // wheel-unclaimed 注释描述的吞格场景，整帧才认得出新声明者）、
+    // 页面级滚动（内容区近乎整窗，条带无利可图）、弹层/按住（这
+    // 两类在泵分支已整帧承诺，走不到这里）。
+    bool TakeDueWheelRect() {
+        if (this.ForceFullFrames()) { return false; }
+        if (this.HasOverlays() || blocksInputBelow || focus.pressedId >= 0) {
+            return false;
+        }
+        // 没有上一帧认领：渲染期仲裁的结果无从预知，整帧兜底。
+        if (wheelCapW <= 0 || wheelCapH <= 0) { return false; }
+        int x0 = wheelCapX;
+        int y0 = wheelCapY;
+        int x1 = wheelCapX + wheelCapW;
+        int y1 = wheelCapY + wheelCapH;
+        if (dmgW > 0 && dmgH > 0) {
+            if (dmgX < x0) { x0 = dmgX; }
+            if (dmgY < y0) { y0 = dmgY; }
+            if (dmgX + dmgW > x1) { x1 = dmgX + dmgW; }
+            if (dmgY + dmgH > y1) { y1 = dmgY + dmgH; }
+        }
+        // 指针不在认领视口里（页面滚动越过边缘、嵌套区外滚动）也要
+        // 覆盖指针邻域，悬停预览不留旧像。
+        int pad = this.Scale(24);
+        if (mouseX - pad < x0) { x0 = mouseX - pad; }
+        if (mouseY - pad < y0) { y0 = mouseY - pad; }
+        if (mouseX + pad > x1) { x1 = mouseX + pad; }
+        if (mouseY + pad > y1) { y1 = mouseY + pad; }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        int w = x1 - x0;
+        int h = y1 - y0;
+        if (w <= 0 || h <= 0) { return false; }
+        // 近整窗（或内容高已声明为页面滚动）时条带不值当：页面滚动
+        // 的损伤区是「侧栏以右」的全部，几乎总是整窗。
+        if (contentHeight > 0) { return false; }
+        if (w * h * 2 > canvas.Width() * canvas.Height()) { return false; }
+        dmgX = x0;
+        dmgY = y0;
+        dmgW = w;
+        dmgH = h;
+        partialPending = true;
+        return true;
+    }
+
+    void BeginIdScope(string scopeName) {
+        focus.PushId(scopeName);
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        if (scopeEndUs > 0) {
+            int gap = now - scopeEndUs;
+            if (gap > phaseSecTopUs) {
+                phaseSecTopUs = gap;
+                phaseSecTop = "after" + Convert.ToString(scopeEndId);
+            }
+        }
+        scopeId = IdHash.HashString(scopeName);
+        scopeAtUs = now;
+    }
+
+    void BeginIdScope(int first) {
+        focus.PushIds(first);
+        // 分析器开着时把每个 id 段当作一个可计时的区域：它们正好是
+        // 宕机把界面分开的那几块（功能区、编辑区、各个面板），于是
+        // 不需要在宿主里另埋一套标记点。
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        // 两个 id 段之间的活（宿主在面板之外直接画的东西）也要有人认：
+        // 否则尖尖那一帧只能看到“整棑很贵、每段都很便宜”。
+        if (scopeEndUs > 0) {
+            int gap = now - scopeEndUs;
+            if (gap > phaseSecTopUs) {
+                phaseSecTopUs = gap;
+                phaseSecTop = "after" + Convert.ToString(scopeEndId);
+            }
+        }
+        scopeId = first;
+        scopeAtUs = now;
+    }
+
+    void EndIdScope() {
+        focus.PopIds();
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int us = now - scopeAtUs;
+        scopeEndUs = now;
+        scopeEndId = scopeId;
+        if (us > phaseSecTopUs) {
+            phaseSecTopUs = us;
+            phaseSecTop = Convert.ToString(scopeId);
+        }
+    }
+
+    // 压入字符串命名的 ID 作用域（Path Hash ID Stack）。
+    void PushId(string strKey) { focus.PushId(strKey); }
+
+    // 压入整数命名的 ID 作用域（如循环下标 i）。
+    void PushId(int intKey) { focus.PushId(intKey); }
+
+    // 弹出当前 ID 作用域。
+    void PopId() { focus.PopId(); }
+
+    // 计算指定字符串 key 在当前作用域下的唯一哈希 ID。
+    int GetId(string strKey) { return focus.GetId(strKey); }
+
+    // 计算指定整数 key 在当前作用域下的唯一哈希 ID。
+    int GetId(int intKey) { return focus.GetId(intKey); }
+
+    // StyleBox 在画玻璃时登记面板矩形（本帧内有效）。见 glassPanels 与 glassRects。
+    void NoteGlassRect(int x, int y, int w, int h) {
+        // 一屏玻璃面板的合理上限；超过就不再登记——损伤扩展退化成
+        // 整窗帧，正确性不受影响。
+        if (glassPanels != null && glassPanels.Count >= 64) { return; }
+        if (glassPanels == null) { glassPanels = new List<Rect>(); }
+        glassPanels.Add(new Rect(x, y, w, h));
+        if (glassRects.Count < 256) {
+            glassRects.Add(x);
+            glassRects.Add(y);
+            glassRects.Add(w);
+            glassRects.Add(h);
+        }
+    }
+
+    // 损伤条带跨出了玻璃面板：把下一帧的裁剪从条带扩到
+    // 「条带 ∪ 相交面板」的并集，使面板模糊从一整块本帧新画的
+    // 背景重算。没有任何相交面板（miss 来自已关闭的面板）或并集
+    // 大到接近整窗时返回 false，调用方退回整窗重绘。
+    bool WidenDamageToGlass() {
+        int x0 = dmgX;
+        int y0 = dmgY;
+        int x1 = dmgX + dmgW;
+        int y1 = dmgY + dmgH;
+        bool any = false;
+        if (glassPanels != null && glassPanels.Count > 0) {
+            for (int p = 0; p < glassPanels.Count; p = p + 1) {
+                Rect r = glassPanels[p];
+                if (r == null) { continue; }
+                int gx = r.x;
+                int gy = r.y;
+                int gw = r.width;
+                int gh = r.height;
+                if (gx + gw <= x0 || x1 <= gx) { continue; }
+                if (gy + gh <= y0 || y1 <= gy) { continue; }
+                if (gx < x0) { x0 = gx; }
+                if (gy < y0) { y0 = gy; }
+                if (gx + gw > x1) { x1 = gx + gw; }
+                if (gy + gh > y1) { y1 = gy + gh; }
+                any = true;
+            }
+        } else {
+            int i = 0;
+            while (i + 3 < glassRects.Count) {
+                int gx = glassRects[i];
+                int gy = glassRects[i + 1];
+                int gw = glassRects[i + 2];
+                int gh = glassRects[i + 3];
+                i = i + 4;
+                if (gx + gw <= x0 || x1 <= gx) { continue; }
+                if (gy + gh <= y0 || y1 <= gy) { continue; }
+                if (gx < x0) { x0 = gx; }
+                if (gy < y0) { y0 = gy; }
+                if (gx + gw > x1) { x1 = gx + gw; }
+                if (gy + gh > y1) { y1 = gy + gh; }
+                any = true;
+            }
+        }
+        if (!any) { return false; }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        int w = x1 - x0;
+        int h = y1 - y0;
+        if (w <= 0 || h <= 0) { return false; }
+        // 扩出来的面积已经逼近整窗时，裁剪省下的上传就不值当
+        // 额外的光栅了：直接整窗更诚实。
+        if (w * h * 2 > canvas.Width() * canvas.Height()) { return false; }
+        dmgX = x0;
+        dmgY = y0;
+        dmgW = w;
+        dmgH = h;
+        partialPending = true;
+        return true;
+    }
+
+    // 滚动串结束后的玻璃还账：串里暂用旧模糊的面板攒在
+    // glassDeferredRects，这里在串结束后武装一帧「条带 ∪ 欠账
+    // 面板」的扩展刷新，让它们的模糊从整块新鲜背景重算。整窗帧
+    // 渲染过则一切像素本就新鲜，直接销账。每帧 EndFrame 调用。
+    void SettleGlassRefresh() {
+        if (!partialFrame) {
+            glassRefreshOwe = false;
+            glassRefreshArmedAt = 0 - 1;
+            if (glassDeferredPanels != null) { glassDeferredPanels.Clear(); }
+            glassDeferredRects.Clear();
+            glassDeferred = false;
+            return;
+        }
+        if (glassDeferred) { return; }
+        if (!glassRefreshOwe || this.ScrollBurstActive()) { return; }
+        if (glassRefreshArmedAt >= 0) {
+            if (glassRefreshArmedAt != frameCount) {
+                // 还账帧已渲染：裁剪罩住了全部欠账面板，模糊重算过，
+                // 销账。期间若又有新的暂用（玻璃Deferred），NoteGlassDeferred
+                // 已把 armedAt 拍回 -1，走不到这里。
+                glassRefreshOwe = false;
+                glassRefreshArmedAt = 0 - 1;
+                if (glassDeferredPanels != null) { glassDeferredPanels.Clear(); }
+                glassDeferredRects.Clear();
+            }
+            return;
+        }
+        int x0 = dmgX;
+        int y0 = dmgY;
+        int x1 = dmgX + dmgW;
+        int y1 = dmgY + dmgH;
+        if (glassDeferredPanels != null && glassDeferredPanels.Count > 0) {
+            for (int p = 0; p < glassDeferredPanels.Count; p = p + 1) {
+                Rect r = glassDeferredPanels[p];
+                if (r == null) { continue; }
+                int gx = r.x;
+                int gy = r.y;
+                int gw = r.width;
+                int gh = r.height;
+                if (gx < x0) { x0 = gx; }
+                if (gy < y0) { y0 = gy; }
+                if (gx + gw > x1) { x1 = gx + gw; }
+                if (gy + gh > y1) { y1 = gy + gh; }
+            }
+        } else {
+            int i = 0;
+            while (i + 3 < glassDeferredRects.Count) {
+                int gx = glassDeferredRects[i];
+                int gy = glassDeferredRects[i + 1];
+                int gw = glassDeferredRects[i + 2];
+                int gh = glassDeferredRects[i + 3];
+                i = i + 4;
+                if (gx < x0) { x0 = gx; }
+                if (gy < y0) { y0 = gy; }
+                if (gx + gw > x1) { x1 = gx + gw; }
+                if (gy + gh > y1) { y1 = gy + gh; }
+            }
+        }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        int w = x1 - x0;
+        int h = y1 - y0;
+        needsRedraw = true;
+        if (w <= 0 || h <= 0
+            || w * h * 2 > canvas.Width() * canvas.Height()) {
+            partialBlocked = true;
+            forceFullNext = true;
+            this.NoteRedrawWhy("glass-partial-blur");
+            return;
+        }
+        dmgX = x0;
+        dmgY = y0;
+        dmgW = w;
+        dmgH = h;
+        partialPending = true;
+        glassRefreshArmedAt = frameCount;
+        this.NoteRedrawWhy("glass-refresh");
+    }
+
+    // 声明本次状态变化只改变 [x,y,w,h] 这块像素：下一帧被裁剪
+    // 到它（与本帧其他声明合并），而不是重绘整个窗口。切换
+    // 标签页、勾选复选框一类的控件用它取代 RequestRedraw；
+    // 同一帧里任何 RequestRedraw 都会让下一帧回到整窗重绘。
+    void NoteDamage(int x, int y, int w, int h) {
+        if (this.ForceFullFrames()) { partialBlocked = true; }
+        needsRedraw = true;
+        if (partialBlocked || this.HasOverlays()) {
+            if (partialBlocked) { this.NoteRedrawWhy("dmg-blocked"); }
+            else { this.NoteRedrawWhy("dmg-overlay"); }
+            partialPending = false;
+            return;
+        }
+        this.NoteRedrawWhy("dmg");
+        int x0 = x;
+        int y0 = y;
+        int x1 = x + w;
+        int y1 = y + h;
+        if (partialPending) {
+            if (dmgX < x0) { x0 = dmgX; }
+            if (dmgY < y0) { y0 = dmgY; }
+            if (dmgX + dmgW > x1) { x1 = dmgX + dmgW; }
+            if (dmgY + dmgH > y1) { y1 = dmgY + dmgH; }
+        }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        if (x1 - x0 <= 0 || y1 - y0 <= 0) {
+            partialPending = false;
+            return;
+        }
+        dmgX = x0;
+        dmgY = y0;
+        dmgW = x1 - x0;
+        dmgH = y1 - y0;
+        partialPending = true;
+        if (App.PerfOn()) {
+            File.AppendAllText("zan_frame_perf.log",
+                "damage_decl=" + Convert.ToString(dmgX) + ","
+                + Convert.ToString(dmgY) + "+"
+                + Convert.ToString(dmgW) + "x"
+                + Convert.ToString(dmgH) + "\n");
+        }
+    }
+
+    // 滚轮把某块可滚动区域的内容平移了一段：变的只有这块像素，
+    // 于是把它声明成损伤区，而不是整窗重绘。区域为空或声明不成立
+    // 时 NoteDamage 自己会退回整窗。
+    void NoteScrollDamage(int x, int y, int w, int h) {
+        // 顺带续上滚动串的时间窗：串内的玻璃面板暂用旧模糊
+        // （BackdropDirtyIn），串结束由 EndFrame 武装一帧扩展刷新。
+        scrollBusyUntilMs = nowMs + 140;
+        if (App.PerfOn()) {
+            File.AppendAllText("zan_frame_perf.log",
+                "scroll_damage=" + Convert.ToString(x) + ","
+                + Convert.ToString(y) + "+"
+                + Convert.ToString(w) + "x"
+                + Convert.ToString(h) + "\n");
+        }
+        this.NoteDamage(x, y, w, h);
+    }
+
+    // 页面滚动影响的区域：标题栏以下、侧边栏（若有）以右的全部内容。
+    void NotePageScrollDamage() {
+        int x0 = 0;
+        if (splitX > 0) { x0 = splitX; }
+        this.NoteScrollDamage(x0, titlebarH, canvas.Width() - x0,
+                              canvas.Height() - titlebarH);
+    }
+
+    // 强制下一帧完整重绘（任何非单纯
+    // 悬停移动的情况：滚动、输入、缩放、动画、换肤……）。
+    void CancelPartialFrame() {
+        partialPending = false;
+    }
+
+    // 向下一次 Present 宣告扁平的 [x,y,w,h,...] 损伤矩形列表。
+    void MarkPresentDirty(List<int> rects) {
+        if (rects == null) { return; }
+        int i = 0;
+        while (i + 3 < rects.Count) {
+            window.PresentDirty(rects[i], rects[i + 1], rects[i + 2], rects[i + 3]);
+            i = i + 4;
+        }
+    }
+
+    int ChromeButtonCount() {
+        int count = this.showCloseButton ? 1 : 0;
+        if (showThemeButton) { count = count + 1; }
+        if (showPinButton) { count = count + 1; }
+        if (showMinimizeButton) { count = count + 1; }
+        if (showMaximizeButton) { count = count + 1; }
+        if (capActionIds != null) { count = count + capActionIds.Length; }
+        return count;
+    }
+
+    void SetChromeButtons(
+        bool themeButton,
+        bool pinButton,
+        bool minimizeButton,
+        bool maximizeButton
+    ) {
+        if (isChildWindow) {
+            themeButton = false;
+            pinButton = false;
+        }
+        showThemeButton = themeButton;
+        showPinButton = pinButton;
+        showMinimizeButton = minimizeButton;
+        showMaximizeButton = maximizeButton;
+        window.SetCaptionButtons(ChromeButtonCount());
+        // 最大化按钮没了，放大通路（双击标题栏 / Win+Up）也必须
+        // 一起断掉：外壳看不到客户区画的按钮，得显式告诉它。
+        window.SetMaximizable(maximizeButton);
+        this.NoteRedrawWhy("SetChromeButtons");
+        needsRedraw = true;
+    }
+
+    void SetChildMode(bool child) {
+        isChildWindow = child;
+        if (child) {
+            showThemeButton = false;
+            showPinButton = false;
+            window.SetCaptionButtons(ChromeButtonCount());
+        }
+    }
+
+    bool IsChildMode() { return isChildWindow; }
+
+    // 悬停在某个标题按钮上够久（提示该露出来了）。
+    // 声明给动画的重绘范围必须把按钮下方那条提示一起圈进去：提示是这次悬停
+    // 动画画出来的东西，只声明按钮自己那一格的话，被动画唤醒的那一帧就裁到
+    // 那 46x33 —— 提示画在标题栏下方，整条都在裁剪框外，于是它一个像素也落
+    // 不到屏幕上（只有别的原因触发整窗重绘时才闪一下）。
+    bool CaptionTipShown(int id, int bx, int bw, int hbar) {
+        int rh = hbar + this.Scale(80);
+        int ty = this.ShapeOffY();
+        return Ui.HoverLevelMsIn(this, id, 0, this.CaptionTipX(bx, bw), ty,
+            this.Scale(300), rh) >= 900;
+    }
+
+    // 标题提示区的左边（提示居中挂在按钮下方）。
+    int CaptionTipX(int bx, int bw) {
+        return bx + bw / 2 - this.Scale(300) / 2;
+    }
+
+    // 记下这一帧哪条标题提示露着（`id` 为 0 表示一条也没有），并为
+    // “浮出/消失”那一刻额外要一帧。
+    // 提示是指针刚进按钮那一帧画出来的，而那一帧的重绘范围是悬停损伤
+    // （只有离开与进入的那两格按钮），提示整条都在裁剪框外，于是一个
+    // 像素也落不到屏幕上（只有别的原因触发整窗重绘时才闪一下）；指针移开
+    // 时反过来：没人重画提示占过的那块，那条提示就挂在那里不走。
+    void NoteCaptionTip(int id, int bx, int bw, int hbar) {
+        if (id == capTipId) { return; }
+        int tipW = this.Scale(300);
+        int tipH = hbar + this.Scale(80);
+        // hbar 已含阴影带顶偏移（RenderCaptionButtons 传 stripH +
+        // ShapeOffY），失效矩形从画布顶算起即可覆盖旧/新位置。
+        if (capTipId != 0) {
+            this.RequestAnimationFrameIn(capTipX, 0, tipW, tipH);
+        }
+        if (id != 0) {
+            int nx = this.CaptionTipX(bx, bw);
+            this.RequestAnimationFrameIn(nx, 0, tipW, tipH);
+            capTipX = nx;
+        }
+        capTipId = id;
+    }
+
+    // 标题按钮的悬停提示文案。默认是中文；宿主界面不是中文时，
+    // 切界面语言时把这一套文案换掉即可 —— 标题栏是窗口自己画的，
+    // 它上面的字不跟着界面语言走，换文案只影响这五个提示。
+    void SetCaptionTips(
+        string theme,
+        string pin,
+        string minimize,
+        string maximize,
+        string restore,
+        string close
+    ) {
+        themeTipText = theme;
+        pinTipText = pin;
+        minimizeTipText = minimize;
+        maximizeTipText = maximize;
+        restoreTipText = restore;
+        closeTipText = close;
+    }
+
+    // 照抄 `src` 的标题提示文案：副窗口的标题栏归框架画，
+    // 界面语言归主窗口的宿主管，所以它只能跟着主窗口。
+    void FollowCaptionTips(App src) {
+        this.SetCaptionTips(src.themeTipText, src.pinTipText,
+            src.minimizeTipText, src.maximizeTipText, src.restoreTipText,
+            src.closeTipText);
+    }
+
+    // 将 OS 窗口左上角移动到屏幕工作区像素坐标 (x, y)。
+    public void SetWindowPos(int x, int y) {
+        window.SetPosition(x, y);
+    }
+
+    // 把 OS 窗口客户区调整为 (w, h) 逻辑像素：登录小窗长成主窗口
+    // 这类形态切换用。画布随 WM_SIZE 自动重铺。
+    public void SetClientSize(int w, int h) {
+        window.SetClientSize(w, h);
+    }
+
+    // 精确设置客户区（**设备**像素，不加 OS 框架补偿）。见
+    // Window.SetClientSizeDev：照参考图定尺寸的小窗用这个，
+    // SetClientSize 会把客户区撑大一圈。
+    public void SetClientSizeDev(int wDev, int hDev) {
+        window.SetClientSizeDev(wDev, hDev);
+    }
+
+    // 将 OS 窗口在其显示器工作区居中。
+    public void CenterWindow() {
+        window.Center();
+    }
+
+    // 换掉渲染表面。损伤裁剪帧、动画矩形与 fx 快照都以
+    // 「表面里还留着上一帧」为前提，而新表面的像素是未初始化的：
+    // 不清掉这些状态，换表面后的第一帧只画出损伤条带，其余部分
+    // 是内存垃圾——看起来就是黑屏加几块残影。
+    void SwapCanvas(int w, int h) {
+        // 先建新表面再销毁旧的：表面 id 取自空槽位，若先销毁，新表面
+        // 会立刻复用同一个 id，而外壳按 hwnd 记着这个 id，WM_PAINT /
+        // WM_SIZE（拖边框时来自 OS 的模态循环）就会把这块还没画过的
+        // 表面贴上屏——里面是分配器交还的旧表面内容。
+        Canvas old = canvas;
+        canvas = new Canvas(w, h);
+        old.Destroy();
+        // vw/vh 与媒体查询随实际视口变化，控件上的解析缓存也要作废。
+        bgThemeGen = bgThemeGen + 1;
+        partialPending = false;
+        partialFrame = false;
+        dmgW = 0;
+        dmgH = 0;
+        animRectValid = false;
+        animRectAll = false;
+        inputNeedsFrame = false;
+        animPrevValid = false;
+        fxSnapValid = false;
+        fxDamage = null;
+        fxTouched = null;
+        fxTouchedFull = false;
+    }
+
+}

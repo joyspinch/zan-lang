@@ -1,0 +1,627 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+using Gui.Markup;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    // --- 表格列属性（extra["columns"]，声明式列同表） ------
+    // 列属性条目与 options 按下标对齐（设计器移动/删除行时同步
+    // 移动/删除条目）。键缺省 = 引擎缺省：width/align/type 只在
+    // 偏离缺省时落键，sortable/resizable 只在 false 时落键，
+    // editable 只在 true 时落键——文档保持干净，挂载的产出
+    // 与手写声明同形。条目里设计器不认识的键（money/sum/pin/
+    // band/formula…）原样保留，往返不丢。
+
+    // 第 `i` 列的 columns 条目（没有或不是对象返回 null = 全缺省）。
+    static JsonValue ColEntry(FormField f, int i) {
+        if (f.extra == null) { return null; }
+        JsonValue cols = f.extra.Get("columns");
+        if (cols == null || !cols.IsArray()) { return null; }
+        if (i < 0 || i >= cols.Count()) { return null; }
+        JsonValue e = cols.At(i);
+        if (e == null || !e.IsObject()) { return null; }
+        return e;
+    }
+
+    // extra["columns"] 数组（不存在或不是数组返回 null）。
+    static JsonValue ColsArray(FormField f) {
+        if (f.extra == null) { return null; }
+        JsonValue cols = f.extra.Get("columns");
+        if (cols == null || !cols.IsArray()) { return null; }
+        return cols;
+    }
+
+    // 从 JSON 对象里删掉一个键（键不存在时无操作）。
+    static void DropKey(JsonValue o, string key) {
+        if (o == null || !o.IsObject()) { return; }
+        o.Remove(key);
+    }
+
+    // 选中列的声明式属性读进暂存字段（选中行变化时随
+    // LoadRowScratch 一起调）。内部通过 ColumnConfig 强类型实体统一反序列化。
+    void LoadColScratch(FormField f, int i) {
+        ColumnConfig cfg = ColumnConfig.FromJson(Designer.ColEntry(f, i));
+        colEdWidth = cfg.width;
+        colEdAlign = cfg.align;
+        colEdType = cfg.type;
+        colEdSortable = cfg.sortable;
+        colEdResizable = cfg.resizable;
+        colEdEditable = cfg.editable;
+        colEdDecimals = cfg.decimals;
+        colEdMoney = cfg.money;
+        colEdPercent = cfg.percent;
+        colEdPrefix = cfg.prefix;
+        colEdSuffix = cfg.suffix;
+        colEdGrouped = cfg.grouped;
+        colEdSummary = cfg.summary;
+        colEdPin = cfg.pin;
+        colEdBand = cfg.band;
+        colEdClick = cfg.click;
+    }
+
+    // 列条目里的布尔键（缺/false）。
+    static bool ColBool(JsonValue e, string key) {
+        JsonValue v = e.Get(key);
+        return v != null && v.IsBool() && v.AsBool(false);
+    }
+
+    // 暂存值对应的声明键值（偏离缺省的才进表）。先归一为 ColumnConfig 强类型
+    // 实体，再由实体导出落盘属性清单，杜绝零散的动态键构造。
+    List<JsonProperty> ColDesired() {
+        List<JsonProperty> props = new List<JsonProperty>();
+        ColumnConfig cfg = new ColumnConfig();
+        cfg.width = colEdWidth;
+        cfg.align = colEdAlign;
+        cfg.type = colEdType;
+        cfg.sortable = colEdSortable;
+        cfg.resizable = colEdResizable;
+        cfg.editable = colEdEditable;
+        cfg.decimals = colEdDecimals;
+        cfg.money = colEdMoney;
+        cfg.percent = colEdPercent;
+        cfg.prefix = colEdPrefix;
+        cfg.suffix = colEdSuffix;
+        cfg.grouped = colEdGrouped;
+        cfg.summary = colEdSummary;
+        cfg.pin = colEdPin;
+        cfg.band = colEdBand;
+        cfg.click = colEdClick;
+
+        if (cfg.width > 0) {
+            props.Add(new JsonProperty("width", JsonValue.NewNum(Convert.ToString(cfg.width))));
+        }
+        if (cfg.align == 1) { props.Add(new JsonProperty("align", JsonValue.NewStr("center"))); }
+        if (cfg.align == 2) { props.Add(new JsonProperty("align", JsonValue.NewStr("right"))); }
+        if (cfg.type == 1) { props.Add(new JsonProperty("type", JsonValue.NewStr("num"))); }
+        if (cfg.type == 2) { props.Add(new JsonProperty("type", JsonValue.NewStr("real"))); }
+        if (cfg.type == 3) { props.Add(new JsonProperty("type", JsonValue.NewStr("bool"))); }
+        if (cfg.type == 4) { props.Add(new JsonProperty("type", JsonValue.NewStr("date"))); }
+        if (cfg.type == 2 && cfg.decimals != 2) {
+            props.Add(new JsonProperty("decimals", JsonValue.NewNum(Convert.ToString(cfg.decimals))));
+        }
+        if (StyleSheet.Trim(cfg.money) != "") {
+            props.Add(new JsonProperty("money", JsonValue.NewStr(StyleSheet.Trim(cfg.money))));
+        }
+        if (cfg.percent) { props.Add(new JsonProperty("percent", JsonValue.NewBool(true))); }
+        if (StyleSheet.Trim(cfg.prefix) != "") {
+            props.Add(new JsonProperty("prefix", JsonValue.NewStr(StyleSheet.Trim(cfg.prefix))));
+        }
+        if (StyleSheet.Trim(cfg.suffix) != "") {
+            props.Add(new JsonProperty("suffix", JsonValue.NewStr(StyleSheet.Trim(cfg.suffix))));
+        }
+        if (cfg.grouped) { props.Add(new JsonProperty("grouped", JsonValue.NewBool(true))); }
+        if (cfg.summary == 1) { props.Add(new JsonProperty("sum", JsonValue.NewBool(true))); }
+        if (cfg.summary == 2) { props.Add(new JsonProperty("avg", JsonValue.NewBool(true))); }
+        if (cfg.summary == 3) { props.Add(new JsonProperty("min", JsonValue.NewBool(true))); }
+        if (cfg.summary == 4) { props.Add(new JsonProperty("max", JsonValue.NewBool(true))); }
+        if (cfg.summary == 5) { props.Add(new JsonProperty("count", JsonValue.NewBool(true))); }
+        if (cfg.pin == 1) { props.Add(new JsonProperty("pin", JsonValue.NewStr("left"))); }
+        if (cfg.pin == 2) { props.Add(new JsonProperty("pin", JsonValue.NewStr("right"))); }
+        if (StyleSheet.Trim(cfg.band) != "") {
+            props.Add(new JsonProperty("band", JsonValue.NewStr(StyleSheet.Trim(cfg.band))));
+        }
+        if (StyleSheet.Trim(cfg.click) != "") {
+            props.Add(new JsonProperty("click", JsonValue.NewStr(StyleSheet.Trim(cfg.click))));
+        }
+        if (!cfg.sortable) { props.Add(new JsonProperty("sortable", JsonValue.NewBool(false))); }
+        if (!cfg.resizable) { props.Add(new JsonProperty("resizable", JsonValue.NewBool(false))); }
+        if (cfg.editable) { props.Add(new JsonProperty("editable", JsonValue.NewBool(true))); }
+        return props;
+    }
+
+    // 帧末把列属性暂存写回 extra["columns"][i]：全部键都在缺省
+    // 且条目不存在时不动文档；需要条目时按需补位（空对象占位，
+    // GenForm 对缺 field 的条目整条跳过，占位无副作用）。
+    void WriteBackCol(App app, FormField f) {
+        if (rowsEdSel < 0 || rowsEdSel >= f.OptionCount()) { return; }
+        if (f.ftype != 23 && f.ftype != 41) { return; }
+        int i = rowsEdSel;
+        List<JsonProperty> dprops = this.ColDesired();
+        JsonValue e = Designer.ColEntry(f, i);
+        if (e == null) {
+            if (dprops.Count == 0) { return; }
+            // 补位到 i 并落新条目：field/title 取当前选项。
+            if (f.extra == null) { f.extra = JsonValue.NewObject(); }
+            JsonValue cols = f.extra.Get("columns");
+            JsonValue narr = JsonValue.NewArray();
+            int old = (cols != null && cols.IsArray()) ? cols.Count() : 0;
+            for (int k = 0; k < old; k = k + 1) { narr.Append(cols.At(k)); }
+            while (narr.Count() <= i) { narr.Append(JsonValue.NewObject()); }
+            JsonValue ne = narr.At(i);
+            ne.Set("field", JsonValue.NewStr(Designer.ColField(f.OptionAt(i))));
+            ne.Set("title", JsonValue.NewStr(Designer.ColTitle(f.OptionAt(i))));
+            f.extra.Set("columns", narr);
+            e = ne;
+        }
+        bool dirty = false;
+        for (int k = 0; k < dprops.Count; k = k + 1) {
+            JsonProperty prop = dprops[k];
+            JsonValue cur = e.Get(prop.key);
+            bool same = cur != null
+                && cur.PrettyToJson() == prop.val.PrettyToJson();
+            if (!same) { e.Set(prop.key, prop.val); dirty = true; }
+        }
+        // 回到缺省的键从条目里删掉（如 sortable 改回 true、汇总
+        // 改回无、冻结改回无）。清单 = ColDesired 可能落的所有键。
+        string[] known = new string[20];
+        known[0] = "width"; known[1] = "align"; known[2] = "type";
+        known[3] = "decimals"; known[4] = "money"; known[5] = "percent";
+        known[6] = "prefix"; known[7] = "suffix"; known[8] = "grouped";
+        known[9] = "sum"; known[10] = "avg"; known[11] = "min";
+        known[12] = "max"; known[13] = "count"; known[14] = "pin";
+        known[15] = "band"; known[16] = "sortable"; known[17] = "resizable";
+        known[18] = "editable"; known[19] = "click";
+        for (int k = 0; k < 20; k = k + 1) {
+            bool want = false;
+            for (int d = 0; d < dprops.Count; d = d + 1) {
+                if (dprops[d].key == known[k]) { want = true; }
+            }
+            if (!want && e.Get(known[k]) != null) {
+                e.Remove(known[k]);
+                dirty = true;
+            }
+        }
+        if (dirty) { app.RequestRedraw(); }
+    }
+
+    // columns 条目跟随 options 移动（下标对齐约定）。
+    static void MoveColEntry(FormField f, int from, int to) {
+        JsonValue cols = Designer.ColsArray(f);
+        if (cols == null) { return; }
+        if (from < 0 || from >= cols.Count()) { return; }
+        if (to < 0 || to >= cols.Count()) { return; }
+        if (from == to) { return; }
+        JsonValue mv = cols.At(from);
+        JsonValue rest = JsonValue.NewArray();
+        for (int k = 0; k < cols.Count(); k = k + 1) {
+            if (k != from) { rest.Append(cols.At(k)); }
+        }
+        JsonValue fin = JsonValue.NewArray();
+        bool placed = false;
+        for (int k = 0; k < rest.Count(); k = k + 1) {
+            if (k == to && !placed) { fin.Append(mv); placed = true; }
+            fin.Append(rest.At(k));
+        }
+        if (!placed) { fin.Append(mv); }
+        f.extra.Set("columns", fin);
+    }
+
+    // columns 条目跟随 options 删除。
+    static void RemoveColEntry(FormField f, int i) {
+        JsonValue cols = Designer.ColsArray(f);
+        if (cols == null || i < 0 || i >= cols.Count()) { return; }
+        JsonValue narr = JsonValue.NewArray();
+        for (int k = 0; k < cols.Count(); k = k + 1) {
+            if (k != i) { narr.Append(cols.At(k)); }
+        }
+        f.extra.Set("columns", narr);
+    }
+
+    // 复制列时属性条目跟随：from 处有条目就在 to 处放副本
+    // （按需补位），没有条目就把 to 处清成空对象。
+    static void CopyColEntry(FormField f, int from, int to) {
+        JsonValue cols = Designer.ColsArray(f);
+        if (cols == null) { return; }
+        JsonValue narr = JsonValue.NewArray();
+        for (int k = 0; k < cols.Count(); k = k + 1) { narr.Append(cols.At(k)); }
+        while (narr.Count() <= to) { narr.Append(JsonValue.NewObject()); }
+        JsonValue src = (from >= 0 && from < cols.Count()) ? cols.At(from) : null;
+        if (src != null && src.IsObject()) {
+            narr.SetAt(to, src.Clone());
+        } else {
+            narr.SetAt(to, JsonValue.NewObject());
+        }
+        f.extra.Set("columns", narr);
+    }
+
+    // --- 工具条项属性（extra["items"]，GenForm 声明式项点击） ------
+    static string GetToolItemClick(FormField f, int i) {
+        JsonValue e = Designer.ToolItemEntry(f, i);
+        if (e == null) { return ""; }
+        return e.Str("click", "");
+    }
+
+    static void SetToolItemClick(FormField f, int i, string ck) {
+        if (f == null || i < 0) { return; }
+        if (f.extra == null) { f.extra = JsonValue.NewObject(); }
+        JsonValue items = f.extra.Get("items");
+        JsonValue narr = JsonValue.NewArray();
+        int old = (items != null && items.IsArray()) ? items.Count() : 0;
+        for (int k = 0; k < old; k = k + 1) { narr.Append(items.At(k)); }
+        while (narr.Count() <= i) { narr.Append(JsonValue.NewObject()); }
+        JsonValue ne = narr.At(i);
+        if (ck != "") {
+            ne.Set("click", JsonValue.NewStr(ck));
+        } else {
+            ne.Remove("click");
+        }
+        f.extra.Set("items", narr);
+    }
+
+    static JsonValue ToolItemEntry(FormField f, int i) {
+        if (f.extra == null) { return null; }
+        JsonValue items = f.extra.Get("items");
+        if (items == null || !items.IsArray()) { return null; }
+        if (i < 0 || i >= items.Count()) { return null; }
+        JsonValue e = items.At(i);
+        if (e == null || !e.IsObject()) { return null; }
+        return e;
+    }
+
+    static JsonValue ToolItemsArray(FormField f) {
+        if (f.extra == null) { return null; }
+        JsonValue items = f.extra.Get("items");
+        if (items == null || !items.IsArray()) { return null; }
+        return items;
+    }
+
+    void WriteBackToolItem(App app, FormField f) {
+        if (rowsEdSel < 0 || rowsEdSel >= f.OptionCount()) { return; }
+        if (f.ftype != 58) { return; }
+        int i = rowsEdSel;
+        string ck = StyleSheet.Trim(toolEdClick);
+        JsonValue e = Designer.ToolItemEntry(f, i);
+        if (e == null) {
+            if (ck == "") { return; }
+            if (f.extra == null) { f.extra = JsonValue.NewObject(); }
+            JsonValue items = f.extra.Get("items");
+            JsonValue narr = JsonValue.NewArray();
+            int old = (items != null && items.IsArray()) ? items.Count() : 0;
+            for (int k = 0; k < old; k = k + 1) { narr.Append(items.At(k)); }
+            while (narr.Count() <= i) { narr.Append(JsonValue.NewObject()); }
+            JsonValue ne = narr.At(i);
+            ne.Set("click", JsonValue.NewStr(ck));
+            f.extra.Set("items", narr);
+            app.RequestRedraw();
+            return;
+        }
+        string cur = e.Str("click", "");
+        if (cur != ck) {
+            if (ck != "") {
+                e.Set("click", JsonValue.NewStr(ck));
+            } else {
+                e.Remove("click");
+            }
+            app.RequestRedraw();
+        }
+    }
+
+    static void MoveToolItemEntry(FormField f, int from, int to) {
+        JsonValue items = Designer.ToolItemsArray(f);
+        if (items == null) { return; }
+        if (from < 0 || from >= items.Count()) { return; }
+        if (to < 0 || to >= items.Count()) { return; }
+        if (from == to) { return; }
+        JsonValue mv = items.At(from);
+        JsonValue rest = JsonValue.NewArray();
+        for (int k = 0; k < items.Count(); k = k + 1) {
+            if (k != from) { rest.Append(items.At(k)); }
+        }
+        JsonValue fin = JsonValue.NewArray();
+        bool placed = false;
+        for (int k = 0; k < rest.Count(); k = k + 1) {
+            if (k == to && !placed) { fin.Append(mv); placed = true; }
+            fin.Append(rest.At(k));
+        }
+        if (!placed) { fin.Append(mv); }
+        f.extra.Set("items", fin);
+    }
+
+    static void RemoveToolItemEntry(FormField f, int idx) {
+        JsonValue items = Designer.ToolItemsArray(f);
+        if (items == null) { return; }
+        if (idx < 0 || idx >= items.Count()) { return; }
+        JsonValue narr = JsonValue.NewArray();
+        for (int k = 0; k < items.Count(); k = k + 1) {
+            if (k != idx) { narr.Append(items.At(k)); }
+        }
+        f.extra.Set("items", narr);
+    }
+
+    static void CopyToolItemEntry(FormField f, int src, int dest) {
+        JsonValue items = Designer.ToolItemsArray(f);
+        if (items == null) { return; }
+        if (src < 0 || src >= items.Count()) { return; }
+        JsonValue narr = JsonValue.NewArray();
+        for (int k = 0; k < items.Count(); k = k + 1) { narr.Append(items.At(k)); }
+        while (narr.Count() <= dest) { narr.Append(JsonValue.NewObject()); }
+        JsonValue item = (src >= 0 && src < items.Count()) ? items.At(src) : null;
+        if (item != null && item.IsObject()) {
+            narr.SetAt(dest, item.Clone());
+        } else {
+            narr.SetAt(dest, JsonValue.NewObject());
+        }
+        f.extra.Set("items", narr);
+    }
+
+    // 把 columns 数组按 options 的顺序重排（field 名匹配，退而
+    // 按 title，再退按位置）。GenForm 先行的设计稿里列声明顺序
+    // 可能与 options 不同，设计器以 options 为列序真相。条目数
+    // 可以少于 options（缺 = 全缺省），匹配不上的原样保留在尾部
+    // （不吞键，GenForm 对它们照常发射）。
+    // 内部全部按 List<ColumnConfig> 强类型实体完成重排与实体化，仅在出口返回标准 JSON 数组。
+    static JsonValue NormalizedColumns(FormField f, JsonValue cols) {
+        if (cols == null) { return JsonValue.NewArray(); }
+        int count = cols.Count();
+        bool[] used = new bool[count];
+        List<ColumnConfig> configs = new List<ColumnConfig>();
+        for (int k = 0; k < count; k = k + 1) {
+            configs.Add(ColumnConfig.FromJson(cols.At(k)));
+        }
+
+        JsonValue narr = JsonValue.NewArray();
+        for (int i = 0; i < f.OptionCount(); i = i + 1) {
+            string fld = Designer.ColField(f.OptionAt(i));
+            string tit = Designer.ColTitle(f.OptionAt(i));
+            int hit = 0 - 1;
+            for (int k = 0; k < count; k = k + 1) {
+                if (used[k]) { continue; }
+                JsonValue e = cols.At(k);
+                if (e == null || !e.IsObject()) { continue; }
+                if (fld.Length > 0 && e.Str("field", "") == fld) { hit = k; break; }
+            }
+            if (hit < 0) {
+                for (int k = 0; k < count; k = k + 1) {
+                    if (used[k]) { continue; }
+                    JsonValue e = cols.At(k);
+                    if (e == null || !e.IsObject()) { continue; }
+                    if (e.Str("title", "") == tit) { hit = k; break; }
+                }
+            }
+            if (hit < 0 && i < count && !used[i]) {
+                JsonValue e = cols.At(i);
+                if (e != null && e.IsObject()) { hit = i; }
+            }
+            if (hit >= 0) {
+                used[hit] = true;
+                narr.Append(configs[hit].ToJsonObject());
+            } else {
+                narr.Append(new ColumnConfig().ToJsonObject());
+            }
+        }
+        for (int k = 0; k < count; k = k + 1) {
+            if (!used[k]) { narr.Append(configs[k].ToJsonObject()); }
+        }
+        return narr;
+    }
+
+    // 选项/列编辑窗口（LayerState 仿真窗口，可拖动/缩放）。商业
+    // 组件设计器同款的主从布局，每帧调用；内容几何从窗口实时
+    // x/y/w/h 读出，拖动/缩放自动跟随：
+    // //   ┌ 工具条：选项 (N) ··················· [↑][↓] [添加][复制][删除] ┐
+    // ├ 筛选…   ┬ 行属性 · 第 i/N 行                                   ┤
+    // │ 行列表   │ PropertyGrid（标题 / 图标或字段 / 分隔条 / 靠右）      ┤
+    // ├ 说明区：选中行原文 · 格式 · 绑定路径 ················ [关闭] ──┤
+
+    // 相对化路径：如果在当前目录内，转为相对于工作目录的路径，统一使用正斜杠
+    static string RelativizePath(string fullPath) {
+        if (fullPath == null || fullPath == "") { return ""; }
+        string p = fullPath.Replace("\\", "/");
+        string cur = Directory.GetCurrentDirectory();
+        if (cur != null && cur != "") {
+            string c = cur.Replace("\\", "/");
+            if (!c.EndsWith("/")) { c = c + "/"; }
+            if (p.StartsWith(c)) {
+                return p.Substring(c.Length);
+            }
+        }
+        return p;
+    }
+
+    // 打开文件/资源选择弹窗：锁定写回目标输入框，过滤图像与常用媒体文件
+    void OpenAssetPicker(App app, Input target) {
+        assetPickTarget = target;
+        if (assetPicker == null) {
+            assetPicker = new FilePicker();
+            assetPicker.Accepted.Add(this.OnAssetPicked);
+        }
+        ChildWindows.RegisterComponentPicker(assetPicker);
+        if (app != null) { assetPicker.ApplySkin(app.ThemeMenuIndex()); }
+        List<FileFilter> filters = new List<FileFilter>();
+        filters.Add(new FileFilter(
+            Designer.T("Image / Media (*.png;*.jpg;*.jpeg;*.svg;*.bmp;*.gif;*.webp)",
+                "图像/多媒体文件 (*.png;*.jpg;*.jpeg;*.svg;*.bmp;*.gif;*.webp)"),
+            "*.png;*.jpg;*.jpeg;*.svg;*.bmp;*.gif;*.webp"));
+        filters.Add(new FileFilter(
+            Designer.T("All Files (*.*)", "所有文件 (*.*)"), "*.*"));
+        assetPicker.BeginOpenFileFilters("", filters, Designer.T("Choose Resource / Image", "选择资源 / 图像"));
+        if (app != null) { app.RequestRedraw(); }
+    }
+
+    void OnAssetPicked() {
+        if (assetPicker != null && assetPickTarget != null) {
+            string p = assetPicker.SelectedPath();
+            if (p != "") {
+                string rel = Designer.RelativizePath(p);
+                assetPickTarget.SetText(rel);
+            }
+        }
+    }
+
+    // 点图标格旁的格子按钮：开选择器窗口，锁定写回目标输入框。
+    void OpenIconPicker(App app, Input target) {
+        iconPickTarget = target;
+        iconPickSearch.SetText("");
+        iconWin = this.NewEditorWindow(app, app.Scale(480), app.Scale(520),
+            Designer.T("Pick an icon", "选择图标"));
+    }
+
+    // 图标选择器窗口：网格铺开 Icon.Names() 的全部内置
+    // 图标（图标 + 名字），顶部搜索框按名字过滤；点选写回发起
+    // 的输入框并收起。当前值命中的格子高亮。几何随窗口实时读。
+    void RenderIconPicker(App app, Canvas c, Theme t) {
+        if (iconWin == null) { return; }
+        Layer.Render(app, iconWin);
+        if (!iconWin.open) {
+            iconWin = null;
+            iconPickTarget = null;
+            return;
+        }
+        int pad = app.Scale(14);
+        int ix = iconWin.x + pad;
+        int iw = iconWin.w - pad * 2;
+        // 与外框的入场动画同偏移：Layer.Render 画标题栏时把 y 上移 EntranceDy，
+        // 正文不用同一偏移就会在入场那 180ms 内外框在动、内容不动。
+        int animY = iconWin.y - Layer.EntranceDy(app, iconWin);
+        int fs = Style.FontFallback(app, "tiny");
+
+        // 搜索框：按名字包含过滤（大小写不敏感）。
+        iconPickSearch.Render(app, ix, animY + Layer.BarH(app) + pad,
+            iw - app.Scale(120), app.Scale(28));
+        string q = StyleSheet.Trim(iconPickSearch.GetText());
+        List<string> all = Icon.Names();
+        List<string> names = new List<string>();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (Designer.NameHas(all[i], q)) { names.Add(all[i]); }
+        }
+
+        // 网格：每格 = 圆形图标按钮 + 名字，宽度对齐 内容宽/列数。
+        int cell = app.Scale(66);
+        int cols = iw / cell;
+        if (cols < 3) { cols = 3; }
+        int cw = iw / cols;
+        string cur = iconPickTarget != null ? iconPickTarget.GetText() : "";
+        int gy = animY + Layer.BarH(app) + pad + app.Scale(38);
+        int gridH = animY + iconWin.h - app.Scale(12) - gy;
+        int maxRows = gridH / cell;
+        for (int i = 0; i < names.Count && i < maxRows * cols; i = i + 1) {
+            int col = i % cols;
+            int row = i / cols;
+            int cx = ix + col * cw;
+            int cy = gy + row * cell;
+            bool sel = cur == names[i];
+            if (sel) {
+                c.FillRoundRect(cx + app.Scale(3), cy + app.Scale(2),
+                    cw - app.Scale(6), cell - app.Scale(4), app.Scale(6),
+                    Style.Fade(Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0), 60));
+            }
+            int bid = SmallIconBtn(app, names[i], 0,
+                cx + (cw - app.Scale(30)) / 2, cy + app.Scale(4), app.Scale(30));
+            c.DrawTextCentered(cx, cy + app.Scale(42), cw, Canvas.FontHeight(fs),
+                Ellipsis.Fit(names[i], cw - app.Scale(6), fs),
+                Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            if (Ui.Clicked(app, bid)) {
+                if (iconPickTarget != null) {
+                    this.PushUndo();
+                    iconPickTarget.SetText(names[i]);
+                    // 行编辑器的图标走隐藏 Input 转交：同步写回暂存
+                    // 字段，右侧属性表下一帧经 Sync 跟上。
+                    if (iconPickTarget == iconHolder) { rowEdField = names[i]; }
+                }
+                iconWin.open = false;
+                iconWin = null;
+                iconPickTarget = null;
+                app.RequestRedraw();
+                return;
+            }
+        }
+    }
+
+    // 大小写不敏感的子串测试（图标搜索过滤用）。
+    static bool NameHas(string hay, string sub) {
+        if (sub.Length == 0) { return true; }
+        if (sub.Length > hay.Length) { return false; }
+        string h = hay.ToLower();
+        string nn = sub.ToLower();
+        int last = h.Length - nn.Length;
+        for (int i = 0; i <= last; i = i + 1) {
+            if (h.Substring(i, nn.Length) == nn) { return true; }
+        }
+        return false;
+    }
+
+    // --- 行列表的展示文本（主从弹窗左栏用，只读不改暂存字段） ----
+
+    // 第 `i` 行选项的主文本：标题；工具条/功能区的分隔条行显示
+    // 「— 分隔条 —」。解析与 LoadRowScratch 同拆法。
+    static string RowMainText(FormField f, int i) {
+        string raw = f.OptionAt(i);
+        bool tool = (f.ftype == 58);
+        bool ribbon = (f.ftype == 53);
+        if (tool && raw.Length > 0 && raw.Substring(0, 1) == ">") {
+            raw = raw.Substring(1, raw.Length - 1);
+        }
+        if (raw == "-" && (tool || ribbon)) {
+            return Designer.T("— separator —", "— 分隔条 —");
+        }
+        if (tool || ribbon) {
+            int p = Designer.IndexOfColon(raw);
+            if (p < 0) { return raw; }
+            if (ribbon) { return raw.Substring(p + 1, raw.Length - p - 1); }
+            return raw.Substring(0, p);
+        }
+        if (f.ftype == 23 || f.ftype == 41) { return Designer.ColTitle(raw); }
+        return raw;
+    }
+
+    // 第 `i` 行选项的副文本：数据字段键 / 图标名（没有则 ""）。
+    static string RowSubText(FormField f, int i) {
+        bool tool = (f.ftype == 58);
+        bool ribbon = (f.ftype == 53);
+        bool table = (f.ftype == 23 || f.ftype == 41);
+        if (!tool && !ribbon && !table) { return ""; }
+        string raw = f.OptionAt(i);
+        if (tool && raw.Length > 0 && raw.Substring(0, 1) == ">") {
+            raw = raw.Substring(1, raw.Length - 1);
+        }
+        if (raw == "-") { return ""; }
+        int p = Designer.IndexOfColon(raw);
+        if (p < 0) { return ""; }
+        if (ribbon) { return raw.Substring(0, p); }
+        return raw.Substring(p + 1, raw.Length - p - 1);
+    }
+
+    // 第 `i` 行是否是分隔条（工具条/功能区的 "-"）。
+    static bool RowIsSep(FormField f, int i) {
+        bool tool = (f.ftype == 58);
+        bool ribbon = (f.ftype == 53);
+        if (!tool && !ribbon) { return false; }
+        string raw = f.OptionAt(i);
+        if (tool && raw.Length > 0 && raw.Substring(0, 1) == ">") {
+            raw = raw.Substring(1, raw.Length - 1);
+        }
+        return raw == "-";
+    }
+
+    // extra["props"] 里是否已有键 `key`（props 新增键的去重用）。
+    static bool HasCompProp(FormField f, string key) {
+        if (f.extra == null) { return false; }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) { return false; }
+        for (int i = 0; i < props.Count(); i = i + 1) {
+            if (props.KeyAt(i) == key) { return true; }
+        }
+        return false;
+    }
+
+    // 组件属性（extra["props"] 直通表）弹窗编辑器：与行编辑器同一
+    // 套主从布局——左侧键列表（可筛选，副文本是当前值），右侧选中
+    // 键的键/值属性表，底部说明。键名就是控件 SetProp 认的名字，
+    // 生成代码与画布预览共用同一张表。
+}

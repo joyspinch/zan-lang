@@ -1,0 +1,637 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Threading;
+using System.Data.ZanDb.Storage;
+
+namespace System.Data.ZanDb;
+
+public partial class RecordTable {
+    // 为列构建二级索引
+    public void EnsureIndex(string colName) {
+        this.tlock.EnterWrite();
+        try {
+            RecordColumn col = this.schema.FindColumn(colName);
+            if (col != null) { colName = col.name; }
+            if (this.indexes.ContainsKey(colName)) { return; }
+            Dictionary<string, List<int>> idx = new Dictionary<string, List<int>>();
+            this.indexes[colName] = idx;
+            List<string> sortedKeys = new List<string>();
+            this.indexKeysSorted[colName] = sortedKeys;
+
+            // 扫描当前所有活跃行填充索引
+            for (int id = 1; id <= this.totalRows; id = id + 1) {
+                if (!this.tombstones.ContainsKey(id)) {
+                    RecordRow r = this.GetLocked(id);
+                    if (r != null) {
+                        string key = this.ExtractColKey(r, colName);
+                        if (key != null) {
+                            if (!idx.ContainsKey(key)) {
+                                idx[key] = new List<int>();
+                                RecordTable.InsertSortedKey(sortedKeys, key);
+                            }
+                            idx[key].Add(id);
+                        }
+                    }
+                }
+            }
+            this.SaveIndexesLocked();
+        } finally {
+            this.tlock.ExitWrite();
+        }
+    }
+
+    public void IndexRowLocked(RecordRow r) {
+        if (this.indexes.Count == 0 || r == null) { return; }
+        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+            string colName = this.schema.columns[i].name;
+            if (this.indexes.ContainsKey(colName)) {
+                Dictionary<string, List<int>> idx = this.indexes[colName];
+                string key = this.ExtractColKey(r, colName);
+                if (key != null) {
+                    if (!idx.ContainsKey(key)) {
+                        idx[key] = new List<int>();
+                        if (this.indexKeysSorted.ContainsKey(colName)) {
+                            RecordTable.InsertSortedKey(this.indexKeysSorted[colName], key);
+                        }
+                    }
+                    bool exists = false;
+                    for (int j = 0; j < idx[key].Count; j = j + 1) {
+                        if (idx[key][j] == r.id) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) {
+                        idx[key].Add(r.id);
+                    }
+                }
+            }
+        }
+    }
+
+    public void UnindexRowLocked(RecordRow r) {
+        if (this.indexes.Count == 0 || r == null) { return; }
+        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+            string colName = this.schema.columns[i].name;
+            if (this.indexes.ContainsKey(colName)) {
+                Dictionary<string, List<int>> idx = this.indexes[colName];
+                string key = this.ExtractColKey(r, colName);
+                if (key != null && idx.ContainsKey(key)) {
+                    List<int> list = idx[key];
+                    for (int j = 0; j < list.Count; j = j + 1) {
+                        if (list[j] == r.id) {
+                            list.RemoveAt(j);
+                            break;
+                        }
+                    }
+                    if (list.Count == 0) {
+                        idx.Remove(key);
+                        if (this.indexKeysSorted != null && this.indexKeysSorted.ContainsKey(colName)) {
+                            RecordTable.RemoveSortedKey(this.indexKeysSorted[colName], key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public static string FormatIntKey(int v) {
+        long u = (long)v + 2147483648L;
+        return Convert.ToString(u).PadLeft(10, "0");
+    }
+
+    public static string FormatInt64Key(long v) {
+        int hi = (int)(v >> 32);
+        int lo = (int)(v & 4294967295L);
+        long uHi = (long)hi + 2147483648L;
+        long uLo = (long)lo & 4294967295L;
+        return Convert.ToString(uHi).PadLeft(10, "0") + "_" + Convert.ToString(uLo).PadLeft(10, "0");
+    }
+
+    public static string FormatFloat64Key(double v) {
+        long bits = BitConverter.DoubleToInt64Bits(v);
+        if (bits < 0L) {
+            long inv = ~bits;
+            return "0_" + Convert.ToString(inv).PadLeft(19, "0");
+        } else {
+            return "1_" + Convert.ToString(bits).PadLeft(19, "0");
+        }
+    }
+
+    public string NormalizeIndexKey(string colName, string val) {
+        if (val == null) { return ""; }
+        RecordColumn col = this.schema.FindColumn(colName);
+        if (col == null) { return val; }
+        if (col.dataType == RecordDataType.Int32) {
+            try {
+                return RecordTable.FormatIntKey(Convert.ToInt32(val));
+            } catch (Exception e) {
+                return val;
+            }
+        } else if (col.dataType == RecordDataType.Int64) {
+            try {
+                return RecordTable.FormatInt64Key(Convert.ToInt64(val));
+            } catch (Exception e) {
+                return val;
+            }
+        } else if (col.dataType == RecordDataType.Float64) {
+            try {
+                return RecordTable.FormatFloat64Key(Convert.ToDouble(val));
+            } catch (Exception e) {
+                return val;
+            }
+        }
+        return val;
+    }
+
+    public static void RemoveSortedKey(List<string> list, string key) {
+        if (list == null || key == null) { return; }
+        int lo = 0;
+        int hi = list.Count - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int cmp = String.CompareOrdinal(list[mid], key);
+            if (cmp == 0) {
+                list.RemoveAt(mid);
+                return;
+            }
+            if (cmp < 0) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+    }
+
+    public static void InsertSortedKey(List<string> list, string key) {
+        if (list == null || key == null) { return; }
+        int lo = 0;
+        int hi = list.Count - 1;
+        int ins = list.Count;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int cmp = String.CompareOrdinal(list[mid], key);
+            if (cmp == 0) { return; }
+            if (cmp < 0) {
+                lo = mid + 1;
+            } else {
+                ins = mid;
+                hi = mid - 1;
+            }
+        }
+        if (lo > ins) { ins = lo; }
+        if (ins >= list.Count) {
+            list.Add(key);
+        } else {
+            list.Insert(ins, key);
+        }
+    }
+
+    public string ExtractColKey(RecordRow r, string colName) {
+        RecordColumn col = this.schema.FindColumn(colName);
+        if (col == null) { return null; }
+        if (col.dataType == RecordDataType.Int32) {
+            return RecordTable.FormatIntKey(r.GetInt32(colName));
+        } else if (col.dataType == RecordDataType.FixedStr) {
+            return r.GetStr(colName);
+        } else if (col.dataType == RecordDataType.VarStr) {
+            return r.GetVarStr(colName);
+        } else if (col.dataType == RecordDataType.Int64) {
+            return RecordTable.FormatInt64Key(r.GetInt64(colName));
+        } else if (col.dataType == RecordDataType.Float64) {
+            return RecordTable.FormatFloat64Key(r.GetFloat64(colName));
+        } else if (col.dataType == RecordDataType.Bool) {
+            return r.GetBool(colName) ? "1" : "0";
+        }
+        return null;
+    }
+
+    public bool HasIndex(string colName) {
+        if (this.indexes == null || colName == null) { return false; }
+        if (this.indexes.ContainsKey(colName)) { return true; }
+        RecordColumn col = this.schema.FindColumn(colName);
+        if (col != null && this.indexes.ContainsKey(col.name)) {
+            return true;
+        }
+        string lower = colName.ToLower();
+        List<string> keys = this.indexes.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (keys[i].ToLower() == lower) { return true; }
+        }
+        return false;
+    }
+
+    // 二级索引键匹配 ID 列表
+    public List<int> FindIdsByIndex(string colName, string val) {
+        this.tlock.EnterRead();
+        try {
+            List<int> res = new List<int>();
+            if (!this.indexes.ContainsKey(colName)) {
+                RecordColumn col = this.schema.FindColumn(colName);
+                if (col != null && this.indexes.ContainsKey(col.name)) {
+                    colName = col.name;
+                } else {
+                    string lower = colName.ToLower();
+                    List<string> keys = this.indexes.Keys;
+                    for (int i = 0; i < keys.Count; i = i + 1) {
+                        if (keys[i].ToLower() == lower) {
+                            colName = keys[i];
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!this.indexes.ContainsKey(colName)) {
+                throw new InvalidOperationException("index not found on column: " + colName);
+            }
+            string searchKey = this.NormalizeIndexKey(colName, val);
+            Dictionary<string, List<int>> idx = this.indexes[colName];
+            if (!idx.ContainsKey(searchKey)) { return res; }
+            List<int> ids = idx[searchKey];
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                int id = ids[i];
+                if (!this.tombstones.ContainsKey(id)) {
+                    res.Add(id);
+                }
+            }
+            return res;
+        } finally {
+            this.tlock.ExitRead();
+        }
+    }
+
+    // 基于二级索引等值查找
+    public List<RecordRow> FindByIndex(string colName, string val) {
+        List<int> ids = this.FindIdsByIndex(colName, val);
+        List<RecordRow> res = new List<RecordRow>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            RecordRow r = this.Get(ids[i]);
+            if (r != null) { res.Add(r); }
+        }
+        return res;
+    }
+
+    // 范围索引匹配 ID 列表（支持 <, <=, >, >=, BETWEEN）
+    public List<int> FindIdsByRange(string colName, string lo, string hi) {
+        this.tlock.EnterRead();
+        try {
+            List<int> res = new List<int>();
+            if (!this.indexes.ContainsKey(colName)) {
+                RecordColumn col = this.schema.FindColumn(colName);
+                if (col != null && this.indexes.ContainsKey(col.name)) {
+                    colName = col.name;
+                } else {
+                    string lower = colName.ToLower();
+                    List<string> keys = this.indexes.Keys;
+                    for (int i = 0; i < keys.Count; i = i + 1) {
+                        if (keys[i].ToLower() == lower) {
+                            colName = keys[i];
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!this.indexes.ContainsKey(colName)) {
+                throw new InvalidOperationException("index not found on column: " + colName);
+            }
+            string loKey = this.NormalizeIndexKey(colName, lo);
+            string hiKey = this.NormalizeIndexKey(colName, hi);
+
+            if (!this.indexKeysSorted.ContainsKey(colName)) {
+                return res;
+            }
+            List<string> keys = this.indexKeysSorted[colName];
+            Dictionary<string, List<int>> map = this.indexes[colName];
+
+            int startIdx = 0;
+            int endIdx = keys.Count - 1;
+
+            if (lo != null && lo.Length > 0) {
+                int loPos = 0;
+                int hiPos = keys.Count - 1;
+                startIdx = keys.Count;
+                while (loPos <= hiPos) {
+                    int mid = (loPos + hiPos) / 2;
+                    int cmp = String.CompareOrdinal(keys[mid], loKey);
+                    if (cmp >= 0) {
+                        startIdx = mid;
+                        hiPos = mid - 1;
+                    } else {
+                        loPos = mid + 1;
+                    }
+                }
+            }
+
+            if (hi != null && hi.Length > 0) {
+                int loPos = 0;
+                int hiPos = keys.Count - 1;
+                endIdx = 0 - 1;
+                while (loPos <= hiPos) {
+                    int mid = (loPos + hiPos) / 2;
+                    int cmp = String.CompareOrdinal(keys[mid], hiKey);
+                    if (cmp <= 0) {
+                        endIdx = mid;
+                        loPos = mid + 1;
+                    } else {
+                        hiPos = mid - 1;
+                    }
+                }
+            }
+
+            for (int k = startIdx; k <= endIdx; k = k + 1) {
+                string key = keys[k];
+                if (map.ContainsKey(key)) {
+                    List<int> ids = map[key];
+                    for (int i = 0; i < ids.Count; i = i + 1) {
+                        int id = ids[i];
+                        if (!this.tombstones.ContainsKey(id)) {
+                            res.Add(id);
+                        }
+                    }
+                }
+            }
+            return res;
+        } finally {
+            this.tlock.ExitRead();
+        }
+    }
+
+    // 范围索引检索（支持 <, <=, >, >=）
+    public List<RecordRow> FindRange(string colName, string lo, string hi) {
+        List<int> ids = this.FindIdsByRange(colName, lo, hi);
+        List<RecordRow> rows = new List<RecordRow>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            RecordRow r = this.Get(ids[i]);
+            if (r != null) { rows.Add(r); }
+        }
+        return rows;
+    }
+
+    // 二级索引持久化写入 .zidx 文件
+    public void SaveIndexesLocked() {
+        if (this.indexes == null || this.indexes.Count == 0) {
+            if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
+            return;
+        }
+        ByteBuffer b = ByteBuffer.Alloc(1024);
+        b.WriteRaw(MAGIC_IDX, 4);
+        b.WriteU32((long)VERSION);
+        b.WriteU32((long)this.indexes.Count);
+        b.WriteU64((long)this.totalRows);
+        b.WriteU64((long)this.activeRows);
+        b.WriteU32(0L); // reserved
+
+        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+            string colName = this.schema.columns[i].name;
+            if (this.indexes.ContainsKey(colName)) {
+                Dictionary<string, List<int>> map = this.indexes[colName];
+                byte[] nb = Encoding.GetBytes(colName);
+                int nlen = nb != null ? nb.Length : 0;
+                b.WriteU8(nlen);
+                for (int j = 0; j < nlen; j = j + 1) { b.WriteU8((int)nb[j]); }
+
+                List<string> keys = map.Keys;
+                b.WriteU32((long)keys.Count);
+                for (int k = 0; k < keys.Count; k = k + 1) {
+                    string key = keys[k];
+                    byte[] kb = Encoding.GetBytes(key);
+                    int klen = kb != null ? kb.Length : 0;
+                    b.WriteU16(klen);
+                    for (int j = 0; j < klen; j = j + 1) { b.WriteU8((int)kb[j]); }
+                    List<int> idList = map[key];
+                    int idCount = idList != null ? idList.Count : 0;
+                    b.WriteU32((long)idCount);
+                    for (int j = 0; j < idCount; j = j + 1) {
+                        b.WriteU32((long)idList[j]);
+                    }
+                }
+            }
+        }
+
+        PageFile pf = PageFile.Open(this.idxPath);
+        if (pf != null && pf.IsOpen()) {
+            pf.WriteAt(0, b.Raw(), b.Length());
+            pf.Sync();
+            pf.Close();
+        }
+        b.Free();
+    }
+
+    // 从 .zidx 文件装载二级索引
+    public bool LoadIndexesLocked() {
+        if (!File.Exists(this.idxPath)) { return false; }
+        PageFile pf = PageFile.OpenExisting(this.idxPath);
+        if (pf == null || !pf.IsOpen()) { return false; }
+
+        int fsize = pf.Size();
+        if (fsize < IDX_HEADER_SIZE) {
+            pf.Close();
+            return false;
+        }
+
+        ByteBuffer b = ByteBuffer.Alloc(fsize);
+        if (pf.ReadAt(0, b, fsize) != fsize) {
+            b.Free();
+            pf.Close();
+            return false;
+        }
+        pf.Close();
+
+        b.SeekRead(0);
+        string magic = b.Str(0, 4);
+        b.SeekRead(4);
+        int ver = (int)b.ReadU32();
+        int idxColCount = (int)b.ReadU32();
+        long tRows = b.ReadU64();
+        long aRows = b.ReadU64();
+        b.ReadU32(); // reserved
+
+        if (magic != MAGIC_IDX || ver != VERSION || (int)tRows != this.totalRows || (int)aRows != this.activeRows) {
+            b.Free();
+            return false;
+        }
+
+        this.indexes.Clear();
+        this.indexKeysSorted.Clear();
+        for (int c = 0; c < idxColCount; c = c + 1) {
+            int nlen = b.ReadU8();
+            byte[] nb = new byte[nlen];
+            for (int j = 0; j < nlen; j = j + 1) { nb[j] = (byte)b.ReadU8(); }
+            string colName = Encoding.GetString(nb, 0, nlen);
+
+            Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
+            List<string> sortedKeys = new List<string>();
+            int kCount = (int)b.ReadU32();
+            for (int k = 0; k < kCount; k = k + 1) {
+                int klen = b.ReadU16();
+                byte[] kb = new byte[klen];
+                for (int j = 0; j < klen; j = j + 1) { kb[j] = (byte)b.ReadU8(); }
+                string key = Encoding.GetString(kb, 0, klen);
+
+                int idCount = (int)b.ReadU32();
+                List<int> ids = new List<int>();
+                for (int j = 0; j < idCount; j = j + 1) {
+                    ids.Add((int)b.ReadU32());
+                }
+                map[key] = ids;
+                RecordTable.InsertSortedKey(sortedKeys, key);
+            }
+            this.indexes[colName] = map;
+            this.indexKeysSorted[colName] = sortedKeys;
+        }
+        b.Free();
+        return true;
+    }
+
+    // 零拷贝全表顺序扫描
+    public void Scan(RecordRowVisitor visitor) {
+        this.tlock.EnterRead();
+        try {
+            if (visitor == null || !this.IsOpen()) { return; }
+            for (int id = 1; id <= this.totalRows; id = id + 1) {
+                if (!this.tombstones.ContainsKey(id)) {
+                    RecordRow r = this.GetLocked(id);
+                    if (r != null) {
+                        bool cont = visitor(id, r);
+                        if (!cont) { break; }
+                    }
+                }
+            }
+        } finally {
+            this.tlock.ExitRead();
+        }
+    }
+
+    // 强类型查询构造器入口
+    public RecordQuery Query() {
+        return new RecordQuery(this);
+    }
+
+    public RecordQuery Where(ExprNode expr) {
+        return new RecordQuery(this).Where(expr);
+    }
+
+    // 物理整理（Vacuum）：回收墓碑空洞与 .zblob 垃圾空间，并重建并持久化二级索引
+    public void Vacuum() {
+        this.tlock.EnterWrite();
+        try {
+            if (!this.IsOpen()) { return; }
+            List<string> oldIndexCols = this.indexes.Keys;
+            string vacBase = this.tabPath + ".vac";
+            RecordTable tmp = RecordTable.Open(vacBase, this.name, this.schema);
+            for (int id = 1; id <= this.totalRows; id = id + 1) {
+                if (!this.tombstones.ContainsKey(id)) {
+                    RecordRow r = this.GetLocked(id);
+                    if (r != null) {
+                        // 预先取出变长内容，确保搬迁至新库新 blob 文件
+                        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+                            RecordColumn col = this.schema.columns[i];
+                            if (col.dataType == RecordDataType.VarStr) {
+                                r.varStrs[col.name] = r.GetVarStr(col.name);
+                            } else if (col.dataType == RecordDataType.Blob) {
+                                r.blobs[col.name] = r.GetBlob(col.name);
+                            }
+                        }
+                        tmp.Add(r);
+                    }
+                }
+            }
+            // 为新紧凑表重建原有二级索引
+            for (int i = 0; i < oldIndexCols.Count; i = i + 1) {
+                tmp.EnsureIndex(oldIndexCols[i]);
+            }
+            tmp.Flush();
+            tmp.Close();
+            this.file.Close();
+            if (this.blobFile != null && this.blobFile.IsOpen()) {
+                this.blobFile.Close();
+            }
+            if (this.walFile != null && this.walFile.IsOpen()) {
+                this.walFile.Close();
+            }
+
+            string tmpFile = vacBase + "." + this.name + ".ztab";
+            string tmpBlob = vacBase + "." + this.name + ".zblob";
+            string tmpIdx = vacBase + "." + this.name + ".zidx";
+            string tmpWal = vacBase + "." + this.name + ".zwal";
+
+            if (File.Exists(this.tabPath)) { File.Delete(this.tabPath); }
+            File.Move(tmpFile, this.tabPath);
+            if (File.Exists(tmpBlob)) {
+                if (File.Exists(this.blobPath)) { File.Delete(this.blobPath); }
+                File.Move(tmpBlob, this.blobPath);
+            }
+            if (File.Exists(tmpIdx)) {
+                if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
+                File.Move(tmpIdx, this.idxPath);
+            } else if (File.Exists(this.idxPath)) {
+                File.Delete(this.idxPath);
+            }
+            if (File.Exists(tmpWal)) { File.Delete(tmpWal); }
+            if (File.Exists(this.walPath)) { File.Delete(this.walPath); }
+
+            // 重新挂接文件
+            this.file = PageFile.OpenExisting(this.tabPath);
+            this.OpenOrCreateBlobFileLocked();
+            this.OpenOrCreateWalFileLocked();
+            this.totalRows = tmp.TotalRows();
+            this.activeRows = tmp.Count();
+            this.tombstones.Clear();
+            this.LoadIndexesLocked();
+        } finally {
+            this.tlock.ExitWrite();
+        }
+    }
+
+    public void Flush() {
+        this.tlock.EnterWrite();
+        try {
+            if (this.IsOpen()) {
+                this.WriteHeaderLocked();
+                Mutex.Lock(this.ioMtx);
+                try {
+                    this.file.Sync();
+                    if (this.blobFile != null && this.blobFile.IsOpen()) {
+                        this.blobFile.Sync();
+                    }
+                } finally {
+                    Mutex.Unlock(this.ioMtx);
+                }
+                this.SaveIndexesLocked();
+                this.ResetWalLocked();
+            }
+        } finally {
+            this.tlock.ExitWrite();
+        }
+    }
+
+    public void Close() {
+        this.tlock.EnterWrite();
+        try {
+            if (this.file != null && this.file.IsOpen()) {
+                this.WriteHeaderLocked();
+                this.SaveIndexesLocked();
+                this.file.Sync();
+                this.file.Close();
+            }
+            if (this.blobFile != null && this.blobFile.IsOpen()) {
+                this.WriteBlobHeaderLocked();
+                this.blobFile.Sync();
+                this.blobFile.Close();
+            }
+            if (this.walFile != null && this.walFile.IsOpen()) {
+                this.ResetWalLocked();
+                this.walFile.Close();
+            }
+            if (this.ioMtx != 0) {
+                Mutex.Destroy(this.ioMtx);
+                this.ioMtx = 0;
+            }
+            this.tlock.Close();
+        } finally {
+            // 已完全释放
+        }
+    }
+
+}

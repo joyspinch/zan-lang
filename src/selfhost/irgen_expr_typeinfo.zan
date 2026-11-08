@@ -492,11 +492,55 @@ partial class Irgen {
         return new ExprVal("null", MkType("object"));
     }
 
+    bool MethodAcceptsCall(Node m, Node invCall) {
+        if (m == null || invCall == null) { return false; }
+        int argc = invCall.kids.Count;
+        if (!AcceptsArity(m, argc)) { return false; }
+        int i = 0;
+        while (i < argc) {
+            Node pt = ParamTypeNode(m, i);
+            Node arg = invCall.kids[i];
+            if (pt != null && arg != null) {
+                Node atn = ArgTypeNode(arg);
+                if (atn != null && atn.sval != null && atn.sval != "") {
+                    // Primitive cannot convert to custom struct/class (unless object or generic)
+                    if (binder.IsPrimitive(atn.sval) && !binder.IsPrimitive(pt.sval)
+                        && pt.sval != "object" && !MentionsTypeParam(pt)) {
+                        return false;
+                    }
+                    // Custom class cannot convert to primitive
+                    if (!binder.IsPrimitive(atn.sval) && binder.IsPrimitive(pt.sval)
+                        && atn.sval != "object" && !MentionsTypeParam(pt)) {
+                        return false;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    bool ClassHasMethodWithCall(Node cls, string name, Node invCall) {
+        Node c = cls;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name && MethodAcceptsCall(m, invCall)) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+        }
+        return false;
+    }
+
     ExprVal EmitReflInstCall(ExprVal recv, string mname, Node e) {
         if (mname == "HasMethod") {
             string methName = e.kids.Count > 0 && e.kids[0].kind == AK.StringLit() ? e.kids[0].sval : "";
             Node cls0 = ClassOf(recv.ty);
-            if (cls0 != null && methName != "") {
+            if (cls0 != null && cls0.sval != "object" && methName != "") {
                 return new ExprVal(FindMethodUp(cls0, methName) != null ? "1" : "0", MkType("bool"));
             }
             ExprVal ti = EmitGetType(recv);
@@ -516,7 +560,7 @@ partial class Irgen {
             }
 
             Node cls0 = ClassOf(recv.ty);
-            if (cls0 != null && methName != "") {
+            if (cls0 != null && cls0.sval != "object" && methName != "") {
                 Node meth = FindMethodUp(cls0, methName);
                 if (meth == null) {
                     if (mname == "Invoke") { return new ExprVal("0", MkType("bool")); }
@@ -557,7 +601,7 @@ partial class Irgen {
                 while (tii < tidNames.Count) {
                     string cn = tidNames[tii];
                     Node cdecl = binder.FindType(cn);
-                    if (cdecl != null && FindMethodUp(cdecl, methName) != null) {
+                    if (cdecl != null && ClassHasMethodWithCall(cdecl, methName, invCall)) {
                         cands.Add(cn);
                     }
                     tii = tii + 1;

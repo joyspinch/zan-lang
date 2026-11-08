@@ -234,14 +234,22 @@ partial class Irgen {
     Node LambdaRetType(Node lam) {
         if (lam == null || lam.a == null) { return null; }
         Node b = lam.a;
-        if (b.kind == AK.Ident()) {
-            int i = 0;
-            while (i < lam.kids.Count) {
-                Node p = lam.kids[i];
-                if (p.kind == AK.Param() && p.sval == b.sval) { return p.type; }
-                i = i + 1;
+        int i = 0;
+        while (i < lam.kids.Count) {
+            Node p = lam.kids[i];
+            if (p.kind == AK.Param()) {
+                if (b.kind == AK.Ident() && p.sval == b.sval) { return p.type; }
+                if (b.kind == AK.MemberAccess() && b.a != null && b.a.kind == AK.Ident() && p.sval == b.a.sval && p.type != null) {
+                    Node tc = binder.FindType(p.type.sval);
+                    if (tc != null) {
+                        Node fty = FieldType(tc, b.sval);
+                        if (fty != null) { return SubstRecvTy(fty, p.type); }
+                        Node gm = FindMethodUp(tc, "get_" + b.sval);
+                        if (gm != null) { return SubstRecvTy(gm.type, p.type); }
+                    }
+                }
             }
-            return null;
+            i = i + 1;
         }
         return ArgTypeNode(b);
     }
@@ -711,10 +719,7 @@ partial class Irgen {
         return FindMethodUp(cls, arg.sval);
     }
 
-    // The C host's method_group_score (src/compiler/irgen_expr_core.c:836):
-    // a method group fits a delegate-typed parameter when the arity matches;
-    // the return types must be compatible (the same type scores higher, a
-    // different family rules the candidate out). -1 means "does not fit".
+    // Method group fits delegate-typed parameter when arity matches.
     int MethodGroupScore(Node m, Node pt) {
         if (m == null) { return -1; }
         if (pt == null || !IsDelegate(pt)) { return -1; }
@@ -746,9 +751,7 @@ partial class Irgen {
     int ScoreCand(Node m, Node e, int argc, bool wantStatic) {
         int score = 0;
         if (IsStatic(m) == wantStatic) { score = score + 1; }
-        // explicit type arguments pick the generic overload: `M<int>(x)`
-        // must reach the method with one type parameter, not a plain
-        // overload with the same parameter list
+        // explicit type arguments pick generic overload
         Node targs = ExplicitTypeArgs(e);
         if (targs != null) {
             int ntp = TParams(m).Count;
@@ -760,16 +763,26 @@ partial class Irgen {
             Node pt = ParamTypeNode(m, a);
             Node arg = e.kids[a];
             if (arg.kind == AK.Lambda()) {
-                // score a lambda argument by its result type against the
-                // delegate parameter's declared return type
-                Node dd = null;
-                if (pt != null) { dd = binder.FindDelegate(pt.sval); }
-                if (dd != null) {
-                    Node lrt = LambdaRetType(arg);
-                    if (lrt != null && !MentionsTypeParam(dd.type)) {
-                        if (TypeTag(lrt) == TypeTag(dd.type)) { score = score + 4; }
-                        else { score = score - 1; }
+                if (pt != null && (pt.sval.StartsWith("Func") || pt.sval.StartsWith("Action")
+                    || pt.sval.StartsWith("Predicate") || IsDelegate(pt))) {
+                    score = score + 8;
+                    Node dd = null;
+                    if (pt != null) { dd = binder.FindDelegate(pt.sval); }
+                    if (dd != null) {
+                        Node lrt = LambdaRetType(arg);
+                        if (lrt != null && !MentionsTypeParam(dd.type)) {
+                            if (TypeTag(lrt) == TypeTag(dd.type)) { score = score + 4; }
+                            else { score = score - 1; }
+                        }
+                    } else if (pt.sval == "Func" && pt.kids.Count > 0) {
+                        Node retType = pt.kids[pt.kids.Count - 1];
+                        Node lrt = LambdaRetType(arg);
+                        if (lrt != null && TypeTag(lrt) == TypeTag(retType)) { score = score + 4; }
                     }
+                } else if (pt != null && pt.sval.StartsWith("Expr")) {
+                    score = score + 2;
+                } else if (pt != null && (pt.sval == "string" || binder.IsPrimitive(pt.sval))) {
+                    score = score - 10;
                 }
                 a = a + 1;
                 continue;
@@ -835,6 +848,33 @@ partial class Irgen {
         return HasMod(m, MOD.Extern());
     }
 
+    void CollectMethodCandidates(Node c, string name, List<Node> cands, int depth) {
+        if (c == null || depth > 64) { return; }
+        int i = 0;
+        while (i < c.kids.Count) {
+            Node m = c.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name && !HasSameSig(cands, m)) { cands.Add(m); }
+            i = i + 1;
+        }
+        if (c.interfaces != null) {
+            int ii = 0;
+            while (ii < c.interfaces.Count) {
+                string iname = c.interfaces[ii];
+                int ilt = iname.IndexOf("<");
+                string baseIf = ilt > 0 ? iname.Substring(0, ilt) : iname;
+                Node iface = binder.FindType(baseIf);
+                if (iface != null) {
+                    CollectMethodCandidates(iface, name, cands, depth + 1);
+                }
+                ii = ii + 1;
+            }
+        }
+        Node bc = BaseClassOf(c);
+        if (bc != null) {
+            CollectMethodCandidates(bc, name, cands, depth + 1);
+        }
+    }
+
     // default-argument calls still resolve, and the self-host fixed point --
     // which has no overloads -- emits byte-identical IR). With several
     // overloads we keep those whose arity admits the call, then pick the best
@@ -849,19 +889,7 @@ partial class Irgen {
         // reaches the base's overload). A base overload with the same
         // signature is hidden, so it is not a candidate.
         List<Node> cands = new List<Node>();
-        Node c = cls;
-        int cg = 0;
-        while (c != null) {
-            int i = 0;
-            while (i < c.kids.Count) {
-                Node m = c.kids[i];
-                if (m.kind == AK.MethodDecl() && m.sval == name && !HasSameSig(cands, m)) { cands.Add(m); }
-                i = i + 1;
-            }
-            c = BaseClassOf(c);
-            cg = cg + 1;
-            if (cg > 512) { c = null; }
-        }
+        CollectMethodCandidates(cls, name, cands, 0);
         if (cands.Count == 0) { return null; }
         int argc = e.kids.Count;
         List<Node> fit = new List<Node>();
@@ -889,11 +917,8 @@ partial class Irgen {
         while (i < fit.Count) {
             if (sc[i] == mx) { if (cntMax == 0) { best = fit[i]; } cntMax = cntMax + 1; }
             i = i + 1;
-        }        // The C host has NO "ambiguous call to overloaded '...'" diagnostic
-        // (grep src/compiler: no such message): it resolves the call by its
-        // own best-match rules and never refuses it. Refusing here made the
-        // self-host reject programs the host compiles, so a tie now keeps
-        // the first best-scoring candidate.
+        }
+        // Match host: keep first best-scoring candidate on tie
         return best;
     }
 

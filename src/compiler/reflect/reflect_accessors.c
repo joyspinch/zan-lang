@@ -613,7 +613,9 @@ LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
         LLVMBuildIsNull(g->builder, obj, "refl.objnull"), fb, tbl);
 
     LLVMPositionBuilderAtEnd(g->builder, tbl);
-    LLVMValueRef site = refl_hdr_i64(g, obj, ZAN_OBJ_SITE_OFF, "refl.site");
+    LLVMValueRef raw_site = refl_hdr_i64(g, obj, ZAN_OBJ_SITE_OFF, "refl.site.raw");
+    LLVMValueRef site = LLVMBuildAnd(g->builder, raw_site,
+        LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0), "refl.site");
     LLVMValueRef in_range;
     if (!g->desc_hdr) {
         LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64, g->g_site_count,

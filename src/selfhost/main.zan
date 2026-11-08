@@ -61,7 +61,13 @@ public partial class Program {
     static List<string> inclSrcs;
 
     static string NormPath(string p) {
-        return NormalizePath(p);
+        if (p == null || p == "") { return ""; }
+        string s = NormalizePath(p);
+        if (!s.StartsWith("/") && (s.Length < 2 || s[1] != ':')) {
+            string cwd = NormalizePath(Directory.GetCurrentDirectory());
+            if (cwd != "") { s = NormalizePath(cwd + "/" + s); }
+        }
+        return s.ToLower();
     }
 
     static bool Included(string norm) {
@@ -208,29 +214,37 @@ public partial class Program {
     // packages' source trees, scanned in the C host's store order ----
     static string pkgProjectRoot;   // nearest zan.proj owner of the input
     static string pkgExeStore;      // toolchain sibling packages/
+    static string pkgRepoStore;     // repository root packages/
     static string pkgGlobalStore;   // ~/.local/share/zan/packages (or XDG)
 
     static string PkgParentDir(string path) {
-        int last = -1;
-        int i = 0;
-        while (i < path.Length) {
-            if (path.Substring(i, 1) == "/") { last = i; }
-            i = i + 1;
+        if (path == null || path.Length == 0) { return "."; }
+        string p = path.Replace("\\", "/");
+        while (p.Length > 1 && p.EndsWith("/")) {
+            p = p.Substring(0, p.Length - 1);
         }
+        int last = p.LastIndexOf("/");
         if (last <= 0) { return "."; }
-        return path.Substring(0, last);
+        return p.Substring(0, last);
     }
 
-    // walk up from the input file to the nearest zan.proj manifest,
-    // defaulting to the working directory (resolve_package_project_root)
+    // walk up from the input file to find nearest zan.proj or packages directory,
+    // prioritizing the true repository root containing packages/ (resolve_package_project_root)
     static string ResolvePkgProjectRoot(string input) {
         string dir = PkgParentDir(input);
+        string foundProj = "";
         for (;;) {
-            if (File.Exists(dir + "/zan.proj")) { return dir; }
+            if (foundProj == "" && File.Exists(dir + "/zan.proj")) {
+                foundProj = dir;
+            }
+            if (Directory.Exists(dir + "/packages")) {
+                return dir;
+            }
             string parent = PkgParentDir(dir);
-            if (parent == dir) { break; }
+            if (parent == dir || parent == "") { break; }
             dir = parent;
         }
+        if (foundProj != "") { return foundProj; }
         return ".";
     }
 
@@ -254,7 +268,7 @@ public partial class Program {
         return s;
     }
 
-    static void DedupTopTypes(Node unit) {
+    public static void DedupTopTypes(Node unit) {
         List<string> seen = new List<string>();
         int i = 0;
         while (i < unit.kids.Count) {
@@ -264,9 +278,10 @@ public partial class Program {
                 || k == AK.EnumDecl() || k == AK.DelegateDecl();
             bool dup = false;
             if (isType) {
+                string full = d.nsName != null && d.nsName != "" ? d.nsName + "." + d.sval : d.sval;
                 int j = 0;
                 while (j < seen.Count) {
-                    if (seen[j] == d.sval) { dup = true; break; }
+                    if (seen[j] == full) { dup = true; break; }
                     j = j + 1;
                 }
             }
@@ -274,7 +289,10 @@ public partial class Program {
                 unit.kids.RemoveAt(i);
                 continue;
             }
-            if (isType) { seen.Add(d.sval); }
+            if (isType) {
+                string full = d.nsName != null && d.nsName != "" ? d.nsName + "." + d.sval : d.sval;
+                seen.Add(full);
+            }
             i = i + 1;
         }
     }
@@ -428,8 +446,6 @@ public partial class Program {
             Parser ps = new Parser(toks, d);
             ps.SetFileBounds(fileStarts);
             Node unit = ps.ParseUnit();
-
-            DedupTopTypes(unit);
 
             Binder b = new Binder();
             b.Bind(unit);

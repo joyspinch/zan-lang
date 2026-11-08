@@ -413,9 +413,11 @@ LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
     LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
     LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
         x, &neg8, 1, "is.sptr");
-    LLVMValueRef site = LLVMBuildLoad2(g->builder, i64,
+    LLVMValueRef raw_site = LLVMBuildLoad2(g->builder, i64,
         LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "is.sp"),
-        "is.site");
+        "is.site.raw");
+    LLVMValueRef site = zan_and(g->builder, raw_site,
+        LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0), "is.site");
     LLVMValueRef isstr = zan_hdr_is_string(g, site, "is.str");
     LLVMBuildCondBr(g->builder, isstr, str_bb, oob_bb);
 

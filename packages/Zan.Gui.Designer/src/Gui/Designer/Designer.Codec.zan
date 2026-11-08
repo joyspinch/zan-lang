@@ -1,0 +1,826 @@
+using System;
+using Gui.Widget;
+using Gui;
+using System.Json;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    string SaveJson() {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("name", JsonValue.NewStr(formNameInput.GetText()));
+        // 组件文档（role: "control"）必须存回它的 role，否则另存一次
+        // 就退化成窗口文档。
+        if (docRole != "") { o.Put("role", JsonValue.NewStr(docRole)); }
+        // 目标设备画像（"" = 桌面自由尺寸即文档缺省，不写键）。
+        if (device != "") { o.Put("device", JsonValue.NewStr(device)); }
+        o.Put("labelPos", JsonValue.NewNum(Convert.ToString(labelPos)));
+        o.Put("formSize", JsonValue.NewNum(Convert.ToString(formSize)));
+        o.Put("labelWidth", JsonValue.NewNum(Convert.ToString(labelWidth)));
+        o.Put("hideStar", JsonValue.NewBool(hideStar));
+        o.Put("showSubmit", JsonValue.NewBool(showSubmit));
+        o.Put("showReset", JsonValue.NewBool(showReset));
+        o.Put("submit", JsonValue.NewStr(submitInput.GetText()));
+        o.Put("winW", JsonValue.NewNum(Convert.ToString(winW)));
+        o.Put("winH", JsonValue.NewNum(Convert.ToString(winH)));
+        o.Put("winTitle", JsonValue.NewStr(winTitle));
+        o.Put("winResizable", JsonValue.NewBool(winResizable));
+        o.Put("winTool", JsonValue.NewBool(winTool));
+        o.Put("winTopMost", JsonValue.NewBool(winTopMost));
+        if (winMinWidth > 0) { o.Put("winMinWidth", JsonValue.NewNum(Convert.ToString(winMinWidth))); }
+        if (winMinHeight > 0) { o.Put("winMinHeight", JsonValue.NewNum(Convert.ToString(winMinHeight))); }
+        o.Put("winCenter", JsonValue.NewBool(winCenter));
+        o.Put("winPosX", JsonValue.NewNum(Convert.ToString(winPosX)));
+        o.Put("winPosY", JsonValue.NewNum(Convert.ToString(winPosY)));
+        o.Put("layoutMode", JsonValue.NewNum(Convert.ToString(layoutMode)));
+        o.Put("winZoom", JsonValue.NewNum(Convert.ToString(winZoom)));
+        o.Put("winRound", JsonValue.NewBool(winRound));
+        o.Put("winShape", this.ShapeJson());
+        o.Put("winShapeRadius", JsonValue.NewNum(Convert.ToString(winShapeRadius)));
+        o.Put("winChrome", JsonValue.NewBool(winChrome));
+        o.Put("winGlass", JsonValue.NewBool(winGlass));
+        o.Put("winOpacity", JsonValue.NewNum(Convert.ToString(winOpacity)));
+        o.Put("winShadow", JsonValue.NewNum(Convert.ToString(winShadow)));
+        for (int e = 0; e < winEvents.Count; e = e + 1) {
+            if (winEvents[e].val != "") {
+                o.Put("on" + winEvents[e].key, JsonValue.NewStr(winEvents[e].val));
+            }
+        }
+        JsonValue fieldsArr = JsonValue.NewArray();
+        for (int fi = 0; fi < fields.Count; fi = fi + 1) {
+            fieldsArr.Append(this.FieldJson(fields[fi]));
+        }
+        o.Put("fields", fieldsArr);
+        if (docSource != null && docSource.IsObject()) {
+            for (int i = 0; i < docSource.Count(); i = i + 1) {
+                string key = docSource.KeyAt(i);
+                if (!o.Has(key)) { o.Put(key, docSource.ValAt(i)); }
+            }
+        }
+        if (docSource != null && docSource.Has("bodyContent")) {
+            o.Set("bodyContent", this.RemapDesignContent(docSource.Get("bodyContent"),
+                docSource.Get("fields"), fields));
+        }
+        return o.PrettyToJson() + "\n";
+    }
+
+    // winShape 的 JSON：Rect/Rounded/Ellipse 为普通整数，
+    // 自定义并集形状为区域数组（"t,x,y,w,h,r;..." -> [{"t":..},..]）。
+    JsonValue ShapeJson() {
+        if (winShape != 3) { return JsonValue.NewNum(Convert.ToString(winShape)); }
+        JsonValue arr = JsonValue.NewArray();
+        List<string> parts = winShapeSpec.Split(";");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            List<string> n = parts[i].Split(",");
+            if (n.Count >= 6) {
+                JsonValue r = JsonValue.NewObject();
+                r.Put("t", JsonValue.NewNum(n[0]));
+                r.Put("x", JsonValue.NewNum(n[1]));
+                r.Put("y", JsonValue.NewNum(n[2]));
+                r.Put("w", JsonValue.NewNum(n[3]));
+                r.Put("h", JsonValue.NewNum(n[4]));
+                r.Put("r", JsonValue.NewNum(n[5]));
+                arr.Append(r);
+            }
+        }
+        return arr;
+    }
+
+    // ShapeJson 的逆操作：winShape 区域数组 -> 运行时消费的紧凑
+    // "t,x,y,w,h,r;..." 规格。
+    string ShapeSpecFromJson(JsonValue arr) { return Designer.PreparedShapeSpec(arr); }
+
+    static string PreparedShapeSpec(JsonValue arr) {
+        string s = "";
+        int i = 0;
+        while (i < arr.Count()) {
+            JsonValue r = arr.At(i);
+            int t = r.Int("t", 1);
+            int x = r.Int("x", 0);
+            int y = r.Int("y", 0);
+            int w = r.Int("w", 0);
+            int h = r.Int("h", 0);
+            int rr = r.Int("r", 0);
+            if (w <= 0 || h <= 0) { i = i + 1; continue; }
+            if (s.Length > 0) { s = s + ";"; }
+            s = s + Convert.ToString(t) + "," + Convert.ToString(x) + ","
+                + Convert.ToString(y) + "," + Convert.ToString(w) + ","
+                + Convert.ToString(h) + "," + Convert.ToString(rr);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // 从 FormField 构建一个字段对象，递归进入容器
+    // `kids`，使 JSON 往返包含所有设计器事件绑定、选项和
+    // 子节点。读取器（FieldFromJson）与此键集镜像对应。
+    JsonValue RemapDesignContent(JsonValue content, JsonValue sourceKids,
+            List<FormField> currentKids) {
+        return Designer.PreparedRemapContent(content, sourceKids, currentKids);
+    }
+
+    static JsonValue PreparedRemapContent(JsonValue content, JsonValue sourceKids,
+            List<FormField> currentKids) {
+        JsonValue result = JsonValue.NewArray();
+        if (content == null || !content.IsArray()) { return result; }
+        for (int i = 0; i < content.Count(); i = i + 1) {
+            JsonValue item = content.At(i);
+            if (item == null) { continue; }
+            if (item.IsString()) { result.Append(item); continue; }
+            if (!item.IsNumber() || sourceKids == null || !sourceKids.IsArray()) { continue; }
+            int oldIndex = item.AsInt(0 - 1);
+            if (oldIndex < 0 || oldIndex >= sourceKids.Count()) { continue; }
+            JsonValue source = sourceKids.At(oldIndex);
+            for (int k = 0; k < currentKids.Count; k = k + 1) {
+                if (currentKids[k].designSource == source) {
+                    result.Append(JsonValue.NewNum(Convert.ToString(k)));
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    void ReorderDesignContent(FormField owner, List<FormField> before,
+            List<FormField> after) {
+        JsonValue source = owner == null ? docSource : owner.designSource;
+        JsonValue metadata = owner == null ? docSource : owner.extra;
+        string contentKey = owner == null ? "bodyContent" : "htmlContent";
+        string kidsKey = owner == null ? "fields" : "kids";
+        if (source == null || metadata == null || !metadata.Has(contentKey)) { return; }
+        JsonValue sourceKids = source.Get(kidsKey);
+        if (sourceKids == null || !sourceKids.IsArray()) { return; }
+        JsonValue current = this.RemapDesignContent(metadata.Get(contentKey), sourceKids, before);
+        JsonValue order = JsonValue.NewArray();
+        for (int i = 0; i < after.Count; i = i + 1) {
+            FormField field = after[i];
+            if (field.designSource == null) { field.designSource = this.FieldJson(field); }
+            int index = 0 - 1;
+            for (int k = 0; k < sourceKids.Count(); k = k + 1) {
+                if (sourceKids.At(k) == field.designSource) { index = k; break; }
+            }
+            if (index < 0) {
+                index = sourceKids.Count();
+                sourceKids.Append(field.designSource);
+            }
+            order.Append(JsonValue.NewNum(Convert.ToString(index)));
+        }
+        JsonValue result = JsonValue.NewArray();
+        int next = 0;
+        for (int i = 0; i < current.Count(); i = i + 1) {
+            JsonValue item = current.At(i);
+            if (item == null) { continue; }
+            if (item.IsString()) { result.Append(item); }
+            else if (item.IsNumber() && next < order.Count()) {
+                result.Append(order.At(next));
+                next = next + 1;
+            }
+        }
+        while (next < order.Count()) {
+            result.Append(order.At(next));
+            next = next + 1;
+        }
+        metadata.Set(contentKey, result);
+    }
+
+    JsonValue FieldJson(FormField f) { return Designer.PreparedFieldJson(f); }
+
+    static JsonValue PreparedFieldJson(FormField f) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("kind", JsonValue.NewStr(f.KindName()));
+        // 用户组件引用节点：显式携带 ref，挂载/预览据此
+        // 展开组件文档（HeavyControls 注册的源码类组件没有 ref，
+        // 仍走 new <Kind>()）。
+        if (f.compRef) { o.Put("ref", JsonValue.NewStr(f.customKind)); }
+        o.Put("label", JsonValue.NewStr(f.label));
+        o.Put("name", JsonValue.NewStr(f.fname));
+        o.Put("placeholder", JsonValue.NewStr(f.placeholder));
+        o.Put("bind", JsonValue.NewStr(f.bindPath));
+        o.Put("bindProp", JsonValue.NewStr(f.bindProp));
+        o.Put("required", JsonValue.NewBool(f.required));
+        if (f.disabled) { o.Put("disabled", JsonValue.NewBool(true)); }
+        if (!f.visible) { o.Put("visible", JsonValue.NewBool(false)); }
+        if (f.tooltipText != "") { o.Put("tooltip", JsonValue.NewStr(f.tooltipText)); }
+        if (f.ftype == 15 || f.ftype == 16) {
+            o.Put("wrap", JsonValue.NewBool(f.wrap));
+        }
+        bool isSbOut = (f.ftype == 59 || f.kind == "StatusBar");
+        bool isTsOut = (f.ftype == 58 || f.kind == "ToolStrip");
+        if (isSbOut) {
+            f.dockSide = 2;
+            f.position = 0;
+            f.fx = 0;
+            f.anchor = 0;
+            if (f.fh <= 0) { f.fh = FormField.DefaultHFor(f.ftype); }
+        } else if (isTsOut) {
+            if (f.dockSide == 0) { f.dockSide = 1; }
+            f.position = 0;
+            f.fx = 0;
+            f.anchor = 0;
+            if (f.fh <= 0) { f.fh = FormField.DefaultHFor(f.ftype); }
+        }
+        o.Put("span", JsonValue.NewNum(Convert.ToString(f.span)));
+        if (f.designSource == null || f.designSource.Has("fx") || f.fx != 0) {
+            o.Put("fx", JsonValue.NewNum(Convert.ToString(f.fx)));
+        }
+        if (f.designSource == null || f.designSource.Has("fy") || f.fy != 0) {
+            o.Put("fy", JsonValue.NewNum(Convert.ToString(f.fy)));
+        }
+        if (f.designSource == null || f.designSource.Has("fw") || f.fw != 0) {
+            o.Put("fw", JsonValue.NewNum(Convert.ToString(f.fw)));
+        }
+        // 高度：什么时候文档带高度，决定了运行时的行高从哪来。
+        // 1) 内容型控件（多行文本/附件/表格/树/图表…）：一律带，值是
+        //    类型标准行高或作者改过的值——它们没有样式表默认高度，
+        //    不带就会塌成一行高、和下一行叠在一起。
+        // 2) 其它类型：只在作者显式定过高度时带。皮肤定高的类型
+        //    （输入框/下拉/开关…）的高度归尺寸档，容器（面板/卡片/
+        //    标签页…）按内容自适应，都不写高度。
+        // 运行时按声明排（声明优先于样式表，见 Control.StyleHeightIn）。
+        bool fhAuthored = f.fh > 0
+            && (!f.IsFixedHeight() || f.fh != FormField.DefaultHFor(f.ftype));
+        if (FormField.DocHeightType(f.ftype) || fhAuthored) {
+            o.Put("fh", JsonValue.NewNum(Convert.ToString(f.fh)));
+        }
+        if (f.dockSide != 0 || (f.designSource != null && f.designSource.Has("dock"))) {
+            o.Put("dock", JsonValue.NewNum(Convert.ToString(f.dockSide)));
+        }
+        if (f.position != 0 || f.designSource == null || f.designSource.Has("position")) {
+            o.Put("position", JsonValue.NewNum(Convert.ToString(f.position)));
+        }
+        if (f.anchor != 0) {
+            o.Put("anchor", JsonValue.NewNum(Convert.ToString(f.anchor)));
+        }
+        if (f.flexGrow != 0) {
+            o.Put("flexGrow", JsonValue.NewNum(Convert.ToString(f.flexGrow)));
+        }
+        if (f.margin != 0 || (f.designSource != null && f.designSource.Has("margin"))) {
+            o.Put("margin", JsonValue.NewNum(Convert.ToString(f.margin)));
+        }
+        if (f.padding != 0 || (f.designSource != null && f.designSource.Has("padding"))) {
+            o.Put("padding", JsonValue.NewNum(Convert.ToString(f.padding)));
+        }
+        if (f.gap != 0 || (f.designSource != null && f.designSource.Has("gap"))) {
+            o.Put("gap", JsonValue.NewNum(Convert.ToString(f.gap)));
+        }
+        if (f.flexDir != 0 || f.ftype == 15 || f.ftype == 16 || (f.designSource != null && f.designSource.Has("flexDir"))) {
+            o.Put("flexDir", JsonValue.NewNum(Convert.ToString(f.flexDir)));
+        }
+        if (f.justify != 0) {
+            o.Put("justify", JsonValue.NewNum(Convert.ToString(f.justify)));
+        }
+        if (f.alignItems != 0) {
+            o.Put("alignItems", JsonValue.NewNum(Convert.ToString(f.alignItems)));
+        }
+        if (f.flexWrap) {
+            o.Put("flexWrap", JsonValue.NewBool(true));
+        }
+        if (f.altRects != "") {
+            o.Put("alt", JsonValue.NewStr(f.altRects));
+        }
+        if (f.locked) { o.Put("locked", JsonValue.NewBool(true)); }
+        if (f.compRef && !f.pvPreview) { o.Put("pvOff", JsonValue.NewBool(true)); }
+        o.Put("defOn", JsonValue.NewBool(f.defOn));
+        o.Put("childTab", JsonValue.NewNum(Convert.ToString(f.childTab)));
+        o.Put("activeTab", JsonValue.NewNum(Convert.ToString(f.uiState.Get())));
+        // Tabs 标签条方向：横排是默认，写选项名让设计稿可读
+        // （挂载时原样发射为 SetProp("orient", ...)）。
+        if (f.kind == "Tabs") {
+            string orv = "horizontal";
+            if (f.tabOrient == 1) { orv = "vertical"; }
+            o.Put("orient", JsonValue.NewStr(orv));
+        }
+        List<string> evs = f.Events();
+        for (int e = 0; e < evs.Count; e = e + 1) {
+            string h = f.GetHandler(evs[e]);
+            if (h != "") {
+                o.Put("on" + evs[e], JsonValue.NewStr(h));
+            }
+        }
+        // 带参事件声明：FieldFromJson 对称读回 "arg"。
+        if (f.handlerArg != "") {
+            o.Put("arg", JsonValue.NewStr(f.handlerArg));
+        }
+        JsonValue opts = JsonValue.NewArray();
+        for (int op = 0; op < f.OptionCount(); op = op + 1) {
+            opts.Append(JsonValue.NewStr(f.OptionAt(op)));
+        }
+        o.Put("options", opts);
+        if (f.Class != "") { o.Put("class", JsonValue.NewStr(f.Class)); }
+        // 内联 CSS 声明：与元素 style 属性同键同名（.html 设计稿里
+        // 就是元素的 style 属性），解码端按同一属性名读回。
+        if (f.styleText != "") { o.Put("style", JsonValue.NewStr(f.styleText)); }
+        // 未建模的键(DataGrid 的 "of"/"columns"、"props" 直通表…)
+        // 原样写回:手写设计稿里设计器不认识的声明不能因为
+        // 往返一次就消失。
+        if (f.extra != null && f.extra.IsObject()) {
+            for (int x = 0; x < f.extra.Count(); x = x + 1) {
+                o.Set(f.extra.KeyAt(x), f.extra.ValAt(x));
+            }
+        }
+        // 只要挂着子级就一定写出来：手写/工具生成的设计稿会把
+        // kids 挂在设计器还没登记成容器的类型上，写回时漏掉它们
+        // 等于把整份设计稿改坏（生成代码里对应的控件字段全没了）。
+        if (f.IsContainer() || f.kids.Count > 0) {
+            JsonValue kids = JsonValue.NewArray();
+            for (int ki = 0; ki < f.kids.Count; ki = ki + 1) {
+                kids.Append(Designer.PreparedFieldJson(f.kids[ki]));
+            }
+            o.Put("kids", kids);
+        }
+        if (f.designSource != null && o.Has("htmlContent")) {
+            o.Set("htmlContent", Designer.PreparedRemapContent(o.Get("htmlContent"),
+                f.designSource.Get("kids"), f.kids));
+        }
+        return o;
+    }
+
+    // 根据 SaveJson 生成（或
+    // 手写/工具生成的）JSON 设计文档重建表单。用真正的 JSON 解析器读取，因此任意
+    // 合法格式——美化打印、紧凑、或键乱序——加载结果都一致，
+    // 而不依赖每行一个键的布局。
+    // 把一份设计 JSON 恢复到模型上。Undo/Redo 走这里：保持历史栈不变。
+    // 打开新文档用 LoadJson。
+    void ApplyJson(string s) {
+        fields = new List<FormField>();
+        sel = null;
+        selPrev = null;
+        activeContainer = null;
+        docRole = "";
+        docSource = null;
+        pvDocKey = "";
+        pvDocRoot = null;
+        pvDocNodes = null;
+        this.MarkDocDirty();
+        loadError = false;
+        // 严格解析：截断/损坏的设计稿不能被宽松解析静默降级成
+        // 半份表单（下一次编辑就会把降级文档覆盖回盘）。
+        // IDE 打开前已用 ParseableJson 拦过一次，这里兜底防御。
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(s);
+        } catch (JsonException ex) {
+            loadError = true;
+            lastError = ex.Message;
+            seq = 0;
+            return;
+        }
+        if (root == null || !root.IsObject()) {
+            loadError = true;
+            lastError = "document is not a JSON object";
+            seq = 0;
+            return;
+        }
+        if (root.Has("name")) { formNameInput.SetText(root.Str("name", formNameInput.GetText())); }
+        docSource = root;
+        docRole = root.Str("role", "");
+        labelPos = root.Int("labelPos", labelPos);
+        formSize = root.Int("formSize", formSize);
+        labelWidth = root.Int("labelWidth", labelWidth);
+        hideStar = root.Bool("hideStar", hideStar);
+        showSubmit = root.Bool("showSubmit", showSubmit);
+        showReset = root.Bool("showReset", showReset);
+        if (root.Has("submit")) { submitInput.SetText(root.Str("submit", "")); }
+        winW = root.Int("winW", winW);
+        winH = root.Int("winH", winH);
+        // 目标设备画像：未知 id 回退桌面；锁定类画像把画布钉回
+        // 基准视口（方向按文档宽高推断）——手改 JSON 的 winW/winH
+        // 由此自愈，锁定的语义不靠文档自觉。
+        device = root.Str("device", "");
+        DeviceProfile loadDev = DeviceProfile.ById(device);
+        if (loadDev == null) {
+            device = "";
+        } else if (loadDev.Locked()) {
+            int orL = 0;
+            if (loadDev.Rotatable() && winW > winH) { orL = 1; }
+            winW = loadDev.CanvasW(orL);
+            winH = loadDev.CanvasH(orL);
+        }
+        if (root.Has("winTitle")) { winTitle = root.Str("winTitle", winTitle); }
+        winResizable = root.Bool("winResizable", winResizable);
+        // 锁定画像的另一半自愈：文档里 winResizable:true 与钉死的
+        // 画布矛盾——挂载据此不发 SetResizable(false)，"整块
+        // 表面"的移动端窗口会变成可拉伸。与上面画布钉回同一契约。
+        if (loadDev != null && loadDev.Locked()) { winResizable = false; }
+        winTool = root.Bool("winTool", winTool);
+        winTopMost = root.Bool("winTopMost", winTopMost);
+        winMinWidth = root.Int("winMinWidth", winMinWidth);
+        winMinHeight = root.Int("winMinHeight", winMinHeight);
+        winCenter = root.Bool("winCenter", winCenter);
+        winPosX = root.Int("winPosX", winPosX);
+        winPosY = root.Int("winPosY", winPosY);
+        layoutMode = root.Int("layoutMode", layoutMode);
+        // 0 = 适应视口（模板的默认值）。设计比编辑器视口大时
+        // 100% 只能看到中间一小块，所以这个值必须保留，不能
+        // 被夹回 100%。
+        winZoom = root.Int("winZoom", winZoom);
+        if (winZoom < 0) { winZoom = 0; }
+        // 只钳上限；下限不动——100..249 的存量值被钳到 250 会在
+        // 加载期静默改写文档（保存后 zoom 就变了），运行时自身
+        // 能正确渲染这些档位。
+        if (winZoom > 2000) { winZoom = 2000; }
+        winRound = root.Bool("winRound", winRound);
+        // winRound 随画像走：解析出的画像不是圆表盘（含未知 id、
+        // 桌面缺省）时一律回落 false——改名的 watch id 留下的
+        // winRound:true 不该把桌面/手机文档渲染并保存成椭圆窗口。
+        // 反向同样自愈：watch 文档缺了 winRound 也补回 true，锁定
+        // 语义不靠文档自觉。手绘圆角走 winShape==2，不经此键。
+        if (loadDev != null) {
+            winRound = loadDev.Round();
+        } else {
+            winRound = false;
+        }
+        JsonValue wsh = root.Get("winShape");
+        if (wsh != null && wsh.IsArray()) {
+            winShape = 3;
+            winShapeSpec = ShapeSpecFromJson(wsh);
+        } else {
+            winShape = root.Int("winShape", winShape);
+            winShapeSpec = "";
+        }
+        winShapeRadius = root.Int("winShapeRadius", winShapeRadius);
+        winChrome = root.Bool("winChrome", winChrome);
+        winGlass = root.Bool("winGlass", winGlass);
+        winOpacity = root.Int("winOpacity", winOpacity);
+        if (winOpacity <= 0) { winOpacity = 100; }
+        winShadow = root.Int("winShadow", 10);
+        if (winShapeRadius <= 0 && winShape == 1) { winShapeRadius = 12; }
+        if (layoutMode < 0 || layoutMode > 1) { layoutMode = 0; }
+        winEvents = new List<EventBinding>();
+        List<string> wEvs = Designer.WindowEventNames();
+        for (int e = 0; e < wEvs.Count; e = e + 1) {
+            string key = "on" + wEvs[e];
+            if (root.Has(key)) {
+                this.WinSetHandler(wEvs[e], root.Str(key, ""));
+            }
+        }
+        JsonValue arr = root.Get("fields");
+        if (arr != null && arr.IsArray()) {
+            BuildFieldsFromJson(arr, fields);
+        }
+        int effH = (this.winChrome ? (winH - 32) : winH);
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            FormField f = fields[i];
+            if (f != null && (f.ftype == 59 || f.kind == "StatusBar")) {
+                f.dockSide = 2;
+                f.position = 0;
+                f.anchor = 0;
+                f.flexGrow = 0;
+                f.fx = 0;
+                f.fw = winW;
+                if (f.fh <= 0) { f.fh = FormField.DefaultHFor(f.ftype); }
+                f.fy = effH - f.fh;
+                if (f.fy < 0) { f.fy = 0; }
+                this.DesignDeclareRect(f);
+            }
+        }
+        designAppliedW = winW;
+        designAppliedH = winH;
+        seq = CountFields(fields);
+    }
+
+    // 打开/换入一份新文档：恢复模型后清空撤销/重做历史——快照
+    // 是整份设计 JSON，不清理的话，上一个文档的撤销会把别的设计
+    // 灌进当前画布并在帧末落盘覆盖本文件（IDE 所有设计稿标签页
+    // 共用一个设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
+    // 解析失败（loadError）保持历史。
+    void LoadJson(string s) {
+        this.ApplyJson(s);
+        if (!loadError) { this.ResetHistoryLocked(); }
+    }
+
+    // 载入新文档时清空撤销/重做历史：快照是整份设计 JSON，
+    // 不清理的话，上一个文档的撤销会把别的设计灌进当前画布
+    // 并在帧末落盘覆盖本文件（IDE 所有设计稿标签页共用一个
+    // 设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
+    void ResetHistoryLocked() {
+        undoStack = new List<string>();
+        redoStack = new List<string>();
+    }
+
+    // 上一次 LoadJson 是否失败（文档损坏被拒绝）。宿主（IDE）
+    // 据此提示；失败时表单被清空，lastError 带原因。
+    bool loadError;
+    string lastError;
+
+    // 仅解析设计 JSON 的 "fields" 数组到一个新列表，用于
+    // 在不触碰表单的情况下实例化已保存的用户组件。接受
+    // 完整设计文档或纯 fields 数组。
+    List<FormField> ParseComponentFields(string s) {
+        List<FormField> outp = new List<FormField>();
+        JsonValue root = JsonValue.ParseLenient(s);
+        if (root == null) { return outp; }
+        JsonValue arr = root.Get("fields");
+        if (arr == null && root.IsArray()) { arr = root; }
+        if (arr != null && arr.IsArray()) {
+            BuildFieldsFromJson(arr, outp);
+        }
+        return outp;
+    }
+
+    // 将 JSON 数组中的每个对象追加为 FormField（递归处理
+    // 容器 "kids"），保持顺序。
+    void BuildFieldsFromJson(JsonValue arr, List<FormField> dst) {
+        Designer.BuildPreparedFields(arr, dst);
+    }
+
+    static void BuildPreparedFields(JsonValue arr, List<FormField> dst) {
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue o = arr.At(i);
+            if (o != null && o.IsObject()) {
+                dst.Add(Designer.PreparedFieldFromJson(o));
+            }
+        }
+    }
+
+    // 把设计文档改到 devW x devH 画布，并把绝对定位的控件夹回
+    // 新画布内。就地编辑 JSON：设计文档每个字段携带的状态（kind、
+    // placeholder、绑定、事件、options、容器 kids）远多于这里要动的
+    // 几何，任何「反序列化到模型再序列化回去」的写法都会静默丢掉
+    // 其余键——控件会全部退化成默认 Input。
+    // 返回 true 表示文档被改动。
+    static bool RetargetDoc(JsonValue doc, int devW, int devH) {
+        return Designer.RetargetDoc(doc, devW, devH, "");
+    }
+
+    // RetargetDoc 带目标设备画像 id（"" = 桌面自由尺寸，不写键）：
+    // 锁定类画像把 device 写进文档、关掉 resizable（移动端运行时
+    // 窗口就是整块表面），圆表盘画像顺带声明 winRound。
+    static bool RetargetDoc(JsonValue doc, int devW, int devH, string devId) {
+        if (doc == null || !doc.IsObject()) { return false; }
+        JsonValue fields = doc.Get("fields");
+        if (fields == null || !fields.IsArray()) { return false; }
+        DeviceProfile rtDev = DeviceProfile.ById(devId);
+        bool changed = false;
+        if (rtDev != null && rtDev.Locked()) {
+            if (doc.Str("device", "") != devId) {
+                doc.Set("device", JsonValue.NewStr(devId));
+                changed = true;
+            }
+            if (doc.Bool("winResizable", true)) {
+                doc.Set("winResizable", JsonValue.NewBool(false));
+                changed = true;
+            }
+            if (rtDev.Round() && !doc.Bool("winRound", false)) {
+                doc.Set("winRound", JsonValue.NewBool(true));
+                changed = true;
+            }
+        } else if (rtDev != null && doc.Bool("winRound", false)) {
+            // 非圆画像重定向：清掉上一画像残留的 winRound，否则
+            // watch 模板重定向到手机后会得到一个椭圆手机窗口。
+            doc.Set("winRound", JsonValue.NewBool(false));
+            changed = true;
+        }
+        if (doc.Int("winW", 0) == devW && doc.Int("winH", 0) == devH
+                && !changed) {
+            return false;
+        }
+        Designer.FitFieldsToCanvas(fields, devW, devH, 16);
+        doc.Set("winW", JsonValue.NewNum(Convert.ToString(devW)));
+        doc.Set("winH", JsonValue.NewNum(Convert.ToString(devH)));
+        return true;
+    }
+
+    // 把每个字段的绝对矩形夹进 boxW x boxH，边距 margin。容器的 kids
+    // 用的是父级坐标系，所以递归时换成父级矩形、不再留窗口边距。
+    static void FitFieldsToCanvas(JsonValue fields, int boxW, int boxH, int margin) {
+        for (int k = 0; k < fields.Count(); k = k + 1) {
+            JsonValue f = fields.At(k);
+            if (f == null || !f.IsObject()) { continue; }
+            JsonValue kids = f.Get("kids");
+            // 流式布局的字段没有矩形；在这里补一个会把它钉死在
+            // 设计从未指定的绝对位置上。
+            if (!f.Has("fx") && !f.Has("fy")
+                && !f.Has("fw") && !f.Has("fh")) {
+                if (kids != null && kids.IsArray()) {
+                    Designer.FitFieldsToCanvas(kids, boxW, boxH, margin);
+                }
+                continue;
+            }
+            int fx = f.Int("fx", 0);
+            int fy = f.Int("fy", 0);
+            int fw = f.Int("fw", 0);
+            int fh = f.Int("fh", 0);
+            if (fw > boxW - 2 * margin) { fw = boxW - 2 * margin; }
+            if (fh > boxH - 2 * margin) { fh = boxH - 2 * margin; }
+            if (fw < 0) { fw = 0; }
+            if (fh < 0) { fh = 0; }
+            if (fx + fw > boxW - margin) { fx = boxW - margin - fw; }
+            if (fx < margin) { fx = margin; }
+            if (fy + fh > boxH - margin) { fy = boxH - margin - fh; }
+            if (fy < margin) { fy = margin; }
+            f.Set("fx", JsonValue.NewNum(Convert.ToString(fx)));
+            f.Set("fy", JsonValue.NewNum(Convert.ToString(fy)));
+            f.Set("fw", JsonValue.NewNum(Convert.ToString(fw)));
+            f.Set("fh", JsonValue.NewNum(Convert.ToString(fh)));
+            if (kids != null && kids.IsArray()) {
+                Designer.FitFieldsToCanvas(kids, fw, fh, 0);
+            }
+        }
+    }
+
+    // 从 JSON 对象构建一个 FormField。先应用 "type"，这样
+    // 字段的事件集（Events()）和容器属性反映真实类型，
+    // 然后才读取 handlers、options 和子级。
+    FormField FieldFromJson(JsonValue o) { return Designer.PreparedFieldFromJson(o); }
+
+    static FormField PreparedFieldFromJson(JsonValue o) {
+        FormField f = new FormField(0);
+        f.SetOptionsFrom("");
+        string kd = o.Str("kind", "");
+        if (kd == "") { kd = FormField.TypeKey(o.Int("type", 0)); }
+        f.kind = kd;
+        f.ftype = FormField.TypeForKey(kd);
+        f.customKind = o.Str("custom", "");
+        if (f.ftype == 0 && kd != "Input" && kd != "input") {
+            f.ftype = 100;
+            f.customKind = kd;
+        } else if (f.ftype != 100) {
+            f.kind = FormField.KindForType(f.ftype);
+        }
+        // 用户组件引用：ref 键是权威标记（名字与 kind 相同）。
+        // 组件可以故意与内置控件同名，所以 ref 出现时强制回到
+        // 自定义组件形态。
+        if (o.Str("ref", "") != "") {
+            f.compRef = true;
+            f.customKind = o.Str("ref", "");
+            f.kind = f.customKind;
+            f.ftype = 100;
+        } else {
+            f.compRef = false;
+        }
+        f.pvPreview = !o.Bool("pvOff", false);
+        // 类型是从 kind 反查出来的，构造时按输入框播下的默认标题 /
+        // 占位得跟着换成真实类型的：否则一个没写 label 的 Panel 会
+        // 被当成「Text field / Please enter」显示，写回时还会把这两个
+        // 假默认值落进设计稿。
+        if (f.ftype == 100) {
+            f.label = f.customKind;
+            f.placeholder = "";
+        } else {
+            f.label = FormField.DefaultLabel(f.ftype);
+            f.placeholder = FormField.DefaultPlaceholder(f.ftype);
+        }
+        f.designSource = o;
+        f.label = o.Str("label", "");
+        f.fname = o.Str("name", f.fname);
+        f.name = f.fname;
+        f.placeholder = o.Str("placeholder", "");
+        f.bindPath = o.Str("bind", f.bindPath);
+        f.bindProp = o.Str("bindProp", f.bindProp);
+        f.required = o.Bool("required", f.required);
+        f.disabled = o.Bool("disabled", false);
+        f.visible = o.Bool("visible", true);
+        f.tooltipText = o.Str("tooltip", "");
+        f.wrap = o.Bool("wrap", f.wrap);
+        f.Class = o.Str("class", f.Class);
+        f.styleText = o.Str("style", f.styleText);
+        f.span = o.Int("span", f.span);
+        f.fx = o.Int("fx", 0);
+        f.fy = o.Int("fy", 0);
+        f.fw = o.Int("fw", 0);
+        f.fh = o.Int("fh", 0);
+        // 旧文档里的 fh=32 是当年给每个字段写死的默认，不是作者的意思：
+        // 当成"没写高度"处理。内容型控件（多行文本/附件/表格…）随后
+        // 还原成类型标准行高——否则它们永远是一行高、和下一行叠在一起；
+        // 容器还原成自适应高度，皮肤定高的类型归尺寸档。
+        if (f.fh == 32) { f.fh = 0; }
+        if (f.IsFullWidthBanner()) {
+            f.fx = 0;
+        }
+        if (f.fh <= 0 && (FormField.DocHeightType(f.ftype) || f.IsFixedHeight())) {
+            f.fh = FormField.DefaultHFor(f.ftype);
+        }
+        f.position = o.Int("position", f.position);
+        f.anchor = o.Int("anchor", f.anchor);
+        f.flexGrow = o.Int("flexGrow", f.flexGrow);
+        f.margin = o.Int("margin", f.margin);
+        f.padding = o.Int("padding", f.padding);
+        f.gap = o.Int("gap", f.gap);
+        f.flexDir = o.Int("flexDir", f.flexDir);
+        f.justify = o.Int("justify", f.justify);
+        f.alignItems = o.Int("alignItems", f.alignItems);
+        f.flexWrap = o.Bool("flexWrap", f.flexWrap);
+        f.altRects = o.Str("alt", f.altRects);
+        f.locked = o.Bool("locked", f.locked);
+        f.defOn = o.Bool("defOn", f.defOn);
+        f.dockSide = o.Int("dock", o.Int("dockSide", 0));
+        if (f.ftype == 58 || f.kind == "ToolStrip") {
+            if (f.dockSide == 0) { f.dockSide = 1; }
+            f.position = 0;
+            f.anchor = 0;
+        }
+        if (f.ftype == 59 || f.kind == "StatusBar") {
+            f.dockSide = 2;
+            f.position = 0;
+            f.anchor = 0;
+        }
+        f.childTab = o.Int("childTab", f.childTab);
+        // Tabs 标签条方向：文档里存选项名，容忍旧的数字写法。
+        string ors = o.Str("orient", "");
+        if (ors == "vertical" || ors == "1") { f.tabOrient = 1; }
+        else if (ors == "horizontal" || ors == "0") { f.tabOrient = 0; }
+        f.uiState.Set(o.Int("activeTab", f.uiState.Get()));
+        List<string> evs = f.Events();
+        for (int e = 0; e < evs.Count; e = e + 1) {
+            string key = "on" + evs[e];
+            if (o.Has(key)) { f.SetHandler(evs[e], o.Str(key, "")); }
+        }
+        if (o.Has("change")) { f.SetHandler("Change", o.Str("change", "")); }
+        // 带参事件声明（ DesignerHtml data-arg 属性 ↔ "arg" 键）：
+        // 落 handlerArg，ChildWindow 二次接线据此发 WireArg。
+        f.handlerArg = o.Str("arg", f.handlerArg);
+        JsonValue opts = o.Get("options");
+        if (opts != null && opts.IsArray()) {
+            f.SetOptionsFrom("");
+            for (int k = 0; k < opts.Count(); k = k + 1) {
+                f.AddOption(opts.At(k).AsString(""));
+            }
+        }
+        if (opts != null && opts.IsString()) { f.SetOptionsFrom(opts.AsString("")); }
+        // 列声明（extra["columns"]）顺序对齐 options：设计器以
+        // options 为列序真相，先行的设计稿里两者可能不同
+        // 序。条目数可以少于 options（缺 = 全缺省）；对齐后的数组
+        // 写回 o，随 UnmodeledKeys 进 extra，未匹配条目保留尾部。
+        JsonValue cols0 = o.Get("columns");
+        if (opts != null && opts.IsArray() && opts.Count() > 0
+                && cols0 != null && cols0.IsArray()) {
+            o.Set("columns", Designer.NormalizedColumns(f, cols0));
+        }
+        JsonValue kids = o.Get("kids");
+        if (kids != null && kids.IsArray()) {
+            Designer.BuildPreparedFields(kids, f.kids);
+        }
+        f.extra = Designer.UnmodeledKeys(o);
+        return f;
+    }
+
+    // 收集字段对象里设计器没有建模的键(FieldFromJson 读的之外
+    // 的一切,含 DataGrid 的 "of"/"columns"/"rowFactory" 和 "props"
+    // 直通表),供 FieldJson 原样写回。没有时返回 null。
+    static JsonValue UnmodeledKeys(JsonValue o) {
+        JsonValue extra = null;
+        for (int i = 0; i < o.Count(); i = i + 1) {
+            string key = o.KeyAt(i);
+            if (Designer.IsModeledKey(key)) { continue; }
+            if (extra == null) { extra = JsonValue.NewObject(); }
+            extra.Put(key, o.ValAt(i));
+        }
+        return extra;
+    }
+
+    // FieldJson / FieldFromJson 已经读写的键集(事件处理器是
+    // "on" 前缀的动态键)。与两者的键集镜像对应:新建模一个键
+    // 时这里同步加上,否则会重复写出。
+    static bool IsModeledKey(string k) {
+        if (k.Length > 2 && k.Substring(0, 2) == "on") { return true; }
+        return k == "kind" || k == "type" || k == "custom" || k == "label"
+            || k == "name" || k == "placeholder" || k == "bind"
+            || k == "bindProp" || k == "required" || k == "wrap"
+            || k == "disabled" || k == "visible" || k == "tooltip"
+            || k == "class" || k == "style" || k == "span" || k == "fx"
+            || k == "fy"
+            || k == "fw" || k == "fh" || k == "alt" || k == "locked"
+            || k == "defOn" || k == "dock" || k == "childTab"
+            || k == "position" || k == "anchor" || k == "flexGrow"
+            || k == "margin" || k == "padding" || k == "gap"
+            || k == "flexDir" || k == "justify" || k == "alignItems" || k == "flexWrap"
+            || k == "activeTab" || k == "options" || k == "kids"
+            || k == "orient" || k == "arg"
+            || k == "change" || k == "ref" || k == "pvOff";
+    }
+
+    // 字段总数（含嵌套容器子级）；加载后为唯一名计数器
+    // 提供初始值。
+    int CountFields(List<FormField> lst) { return Designer.CountPreparedFields(lst); }
+
+    static int CountPreparedFields(List<FormField> lst) {
+        int total = 0;
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            total = total + 1 + Designer.CountPreparedFields(lst[i].kids);
+        }
+        return total;
+    }
+
+    // nn 是否已被 except（含其子级）之外的其它组件占用。
+    // 重名会让编译期投影生成重复字段，提交前拒绝。
+    bool UsedFieldName(FormField except, string nn) {
+        if (nn.Length == 0) { return false; }
+        return this.FieldNameIn(fields, except, nn);
+    }
+
+    // UsedFieldName 的递归实现：在 lst（含各级容器子级）里查
+    // 除 except 之外是否有组件叫 nn。
+    bool FieldNameIn(List<FormField> lst, FormField except, string nn) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            FormField f = lst[i];
+            if (f != except) {
+                if (f.fname == nn) { return true; }
+                if (this.FieldNameIn(f.kids, except, nn)) { return true; }
+            } else {
+                if (this.FieldNameIn(f.kids, except, nn)) { return true; }
+            }
+        }
+        return false;
+    }
+}

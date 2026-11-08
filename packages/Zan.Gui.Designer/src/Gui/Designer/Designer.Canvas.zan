@@ -1,0 +1,1146 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+using Gui.Markup;
+
+namespace Gui.Designer;
+
+partial class Designer {
+
+    // 大纲树一键全部展开/折叠所有目录节点
+    void OutlineExpandAll(bool expand) {
+        if (outlineTv == null) { return; }
+        if (expand) { outlineTv.ExpandAll(); }
+        else { outlineTv.CollapseAll(); }
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 打开快速组件插入浮动面板 (Spotlight Quick Insert)
+    void OpenQuickInsert(App app) {
+        quickInsertOpen = true;
+        quickInsertInput.SetText("");
+        quickInsertLastQ = "";
+        quickInsertSelIdx = 0;
+        quickInsertX = app.mouseX;
+        quickInsertY = app.mouseY;
+        quickInsertDesX = 40;
+        quickInsertDesY = 40;
+        if (sel != null) {
+            quickInsertDesX = sel.fx + 24;
+            quickInsertDesY = sel.fy + 24;
+        }
+        this.FilterQuickInsert("");
+        quickInsertInput.Focus();
+    }
+
+    // 过滤候选组件列表
+    void FilterQuickInsert(string q) {
+        quickInsertMatches = new List<int>();
+        quickInsertLastQ = q;
+        if (q == "") {
+            quickInsertMatches.Add(-1); // Preset: Classic App
+            quickInsertMatches.Add(-2); // Preset: Split Workspace
+            quickInsertMatches.Add(-3); // Preset: Form Row
+            quickInsertMatches.Add(-4); // Preset: Dialog Actions
+            quickInsertMatches.Add(15); // Button
+            quickInsertMatches.Add(0);  // Input
+            quickInsertMatches.Add(18); // Card
+            quickInsertMatches.Add(23); // Table
+            quickInsertMatches.Add(36); // Tabs
+            quickInsertMatches.Add(45); // Panel
+            quickInsertMatches.Add(58); // ToolStrip
+            quickInsertMatches.Add(73); // Flex
+            quickInsertMatches.Add(6);  // Select
+            quickInsertMatches.Add(4);  // Radio
+            quickInsertMatches.Add(5);  // Checkbox
+            quickInsertMatches.Add(14); // RichText
+            quickInsertMatches.Add(59); // StatusBar
+            quickInsertMatches.Add(60); // Splitter
+            return;
+        }
+
+        // 预设复合模板快速匹配
+        string lowerQ = q.ToLower();
+        if (Designer.Contains(lowerQ, "preset") || Designer.Contains(lowerQ, "骨架") || Designer.Contains(lowerQ, "模板")
+                || Designer.Contains(lowerQ, "app") || Designer.Contains(lowerQ, "main") || Designer.Contains(lowerQ, "tool")) {
+            quickInsertMatches.Add(-1);
+        }
+        if (Designer.Contains(lowerQ, "preset") || Designer.Contains(lowerQ, "骨架") || Designer.Contains(lowerQ, "模板")
+                || Designer.Contains(lowerQ, "split") || Designer.Contains(lowerQ, "side") || Designer.Contains(lowerQ, "分栏")) {
+            quickInsertMatches.Add(-2);
+        }
+        if (Designer.Contains(lowerQ, "preset") || Designer.Contains(lowerQ, "骨架") || Designer.Contains(lowerQ, "模板")
+                || Designer.Contains(lowerQ, "form") || Designer.Contains(lowerQ, "row") || Designer.Contains(lowerQ, "表单")) {
+            quickInsertMatches.Add(-3);
+        }
+        if (Designer.Contains(lowerQ, "preset") || Designer.Contains(lowerQ, "骨架") || Designer.Contains(lowerQ, "模板")
+                || Designer.Contains(lowerQ, "dialog") || Designer.Contains(lowerQ, "action") || Designer.Contains(lowerQ, "弹窗") || Designer.Contains(lowerQ, "底")) {
+            quickInsertMatches.Add(-4);
+        }
+
+        for (int ft = 0; ft <= 85; ft = ft + 1) {
+            string name = FormField.TypeName(ft);
+            string desc = this.FieldDesc(ft);
+            if (Designer.Contains(name, q) || Designer.Contains(desc, q)) {
+                quickInsertMatches.Add(ft);
+                if (quickInsertMatches.Count >= 20) { break; }
+            }
+        }
+        if (quickInsertSelIdx >= quickInsertMatches.Count) {
+            quickInsertSelIdx = 0;
+        }
+    }
+
+    // 提交并生成选中的组件或预设骨架
+    void CommitQuickInsert(int ft) {
+        quickInsertOpen = false;
+        if (ft < 0) {
+            this.InsertStarterPreset(-ft);
+            return;
+        }
+        this.AddField(ft);
+        if (sel != null && layoutMode == 1) {
+            sel.fx = quickInsertDesX;
+            sel.fy = quickInsertDesY;
+            this.DesignDeclareRect(sel);
+        }
+        msg = Designer.T("inserted: ", "已插入: ") + FormField.TypeName(ft);
+        this.MarkDocDirty();
+    }
+
+    // 绘制快速组件插入浮动面板 (Quick Insert Spotlight HUD)
+    void RenderQuickInsert(App app, Canvas c, Theme t, int screenW, int screenH) {
+        if (!quickInsertOpen) { return; }
+        int w = app.Scale(320);
+        int itemH = app.Scale(28);
+        int headerH = app.Scale(42);
+        int maxItems = 7;
+        int listCount = quickInsertMatches.Count;
+        if (listCount > maxItems) { listCount = maxItems; }
+        int h = headerH + listCount * itemH + app.Scale(12);
+
+        int qx = quickInsertX;
+        int qy = quickInsertY;
+        if (qx + w > screenW - app.Scale(16)) { qx = screenW - w - app.Scale(16); }
+        if (qy + h > screenH - app.Scale(16)) { qy = screenH - h - app.Scale(16); }
+        if (qx < app.Scale(16)) { qx = app.Scale(16); }
+        if (qy < app.Scale(16)) { qy = app.Scale(16); }
+
+        int fs = Style.FontFallback(app, "small");
+        int fsTiny = Style.FontFallback(app, "tiny");
+        if (fsTiny <= 0) { fsTiny = fs; }
+
+        // 面板要占住自己这块：先注册阻挡区，下面的组件树/检查器/
+        // 功能区就不会再收到落在面板上的点击（此前面板只是画出来，
+        // 点一行会「既插入组件、又换了下面树里的选中项」）。
+        // 阻挡区先于面板内的输入框注册，输入框仍能点。
+        app.BlockHitsRect(qx, qy, w, h);
+
+        int bg = Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0);
+        int border = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BorderOr(0);
+        int shadow = Style.Part(app, "designer", "shadow", "", "", "", Style.SNormal()).BgOr(0);
+
+        c.FillRoundRect(qx + 2, qy + 2, w, h, app.Scale(8), shadow);
+        c.FillRoundRect(qx, qy, w, h, app.Scale(8), bg);
+        c.DrawRoundRect(qx, qy, w, h, app.Scale(8), border, 1);
+
+        int inX = qx + app.Scale(10);
+        int inY = qy + app.Scale(8);
+        int inW = w - app.Scale(20);
+        int inH = app.Scale(26);
+        quickInsertInput.Render(app, inX, inY, inW, inH);
+
+        string curQ = quickInsertInput.GetText();
+        if (curQ != quickInsertLastQ) {
+            this.FilterQuickInsert(curQ);
+        }
+
+        int lineY = inY + inH + app.Scale(6);
+        c.FillRect(qx + app.Scale(8), lineY, w - app.Scale(16), 1, Style.Fade(border, 40));
+
+        int ly = lineY + app.Scale(4);
+        int hoveredItem = 0 - 1;
+        for (int i = 0; i < listCount; i = i + 1) {
+            int ft = quickInsertMatches[i];
+            int iy = ly + i * itemH;
+            bool isSel = (i == quickInsertSelIdx);
+            bool isHov = InRect(app.mouseX, app.mouseY, qx + app.Scale(6), iy, w - app.Scale(12), itemH);
+            if (isHov) { hoveredItem = i; }
+
+            if (isSel || isHov) {
+                int fillCol = isSel ? Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0)
+                                    : Style.Fade(border, 30);
+                c.FillRoundRect(qx + app.Scale(6), iy, w - app.Scale(12), itemH - app.Scale(2), app.Scale(4), fillCol);
+            }
+
+            int textCol = isSel ? Style.Part(app, "designer", "badge", "", "", "", Style.SNormal()).FgOr(0)
+                                : Style.Part(app, "designer", "text", "", "", "", Style.SNormal()).FgOr(0);
+            int descCol = isSel ? textCol : Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
+
+            string iconName = "layout";
+            string name = "";
+            string desc = "";
+            if (ft < 0) {
+                if (ft == -1) {
+                    name = Designer.T("Preset: Classic App", "预设: 经典主窗口");
+                    desc = Designer.T("Toolbar + Content + StatusBar", "工具栏 + 内容工作区 + 状态栏");
+                    iconName = "layout";
+                } else if (ft == -2) {
+                    name = Designer.T("Preset: Split Workspace", "预设: 左右分栏工作区");
+                    desc = Designer.T("Sidebar Left + Main View Fill", "左侧导航栏 + 右侧主工作区");
+                    iconName = "split";
+                } else if (ft == -3) {
+                    name = Designer.T("Preset: Standard Form Row", "预设: 标准表单行");
+                    desc = Designer.T("Label + Input Fill + Button", "标签 + 输入框撑满 + 操作按钮");
+                    iconName = "input";
+                } else if (ft == -4) {
+                    name = Designer.T("Preset: Dialog Actions", "预设: 对话框底部操作栏");
+                    desc = Designer.T("Right-aligned Cancel + OK", "右对齐 取消 + 确定按钮排");
+                    iconName = "button";
+                }
+            } else {
+                iconName = this.FieldIcon(ft);
+                name = FormField.TypeName(ft);
+                desc = this.FieldDesc(ft);
+            }
+            c.DrawGlyphIn(iconName, qx + app.Scale(14), iy + app.Scale(5), app.Scale(16), app.Scale(16), app.Scale(14), textCol);
+            c.DrawText(qx + app.Scale(36), iy + app.Scale(5), name, textCol, fs);
+
+            int nw = Canvas.MeasureText(name, fs);
+            c.DrawText(qx + app.Scale(44) + nw, iy + app.Scale(6), " · " + desc, descCol, fsTiny);
+
+            if (isHov && app.EventKind() == 3) {
+                this.CommitQuickInsert(ft);
+                // 这次点击属于「插入组件」这一个手势：认领掉，面板
+                // 底下的组件树/检查器不再收到同一次释放。
+                app.ClaimClick();
+                app.RequestRedraw();
+                return;
+            }
+        }
+        if (hoveredItem >= 0) {
+            quickInsertSelIdx = hoveredItem;
+        }
+
+        if (app.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 38) {
+                if (quickInsertMatches.Count > 0) {
+                    quickInsertSelIdx = (quickInsertSelIdx - 1 + quickInsertMatches.Count) % quickInsertMatches.Count;
+                    app.RequestRedraw();
+                }
+            } else if (kc == 40) {
+                if (quickInsertMatches.Count > 0) {
+                    quickInsertSelIdx = (quickInsertSelIdx + 1) % quickInsertMatches.Count;
+                    app.RequestRedraw();
+                }
+            } else if (kc == 13) {
+                if (quickInsertSelIdx >= 0 && quickInsertSelIdx < quickInsertMatches.Count) {
+                    this.CommitQuickInsert(quickInsertMatches[quickInsertSelIdx]);
+                    app.RequestRedraw();
+                }
+            } else if (kc == 27) {
+                quickInsertOpen = false;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    // 绘制设计器快捷键速查面板 (CheatSheet HUD)
+    void RenderKeymapHelp(App app, Canvas c, Theme t, int screenW, int screenH) {
+        if (!keymapHelpOpen) { return; }
+        int maskCol = Style.Fade(0, 140);
+        c.FillRect(0, 0, screenW, screenH, maskCol);
+        // 这层变暗是模态：铺全窗阻挡区，面板底下的一切（组件树、
+        // 检查器、功能区按钮）都不得再收到点击。此前只是画出来，
+        // 点 X 会「既关掉面板、又顺手点了 X 底下的工具栏按钮」。
+        app.BlockHitsBelow();
+
+        int w = app.Scale(560);
+        int h = app.Scale(500);
+        int x = (screenW - w) / 2;
+        int y = (screenH - h) / 2;
+
+        if (app.EventKind() == 2 && app.window.EventButton() == 0) {
+            if (!InRect(app.mouseX, app.mouseY, x, y, w, h)) {
+                keymapHelpOpen = false;
+                app.RequestRedraw();
+                return;
+            }
+        }
+
+        int bg = Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0);
+        int border = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BorderOr(0);
+        int shadow = Style.Part(app, "designer", "shadow", "", "", "", Style.SNormal()).BgOr(0);
+
+        c.FillRoundRect(x + 4, y + 4, w, h, app.Scale(10), shadow);
+        c.FillRoundRect(x, y, w, h, app.Scale(10), bg);
+        c.DrawRoundRect(x, y, w, h, app.Scale(10), border, 1);
+
+        int fsTitle = Style.FontFallback(app, "normal");
+        int fs = Style.FontFallback(app, "small");
+        int fsTiny = Style.FontFallback(app, "tiny");
+        if (fsTiny <= 0) { fsTiny = fs; }
+
+        int titleCol = Style.Part(app, "designer", "text", "", "", "", Style.SNormal()).FgOr(0);
+        int hintCol = Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
+        int accentCol = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+
+        c.DrawText(x + app.Scale(20), y + app.Scale(16), Designer.T("Keyboard Shortcuts Guide", "设计器快捷键速查指南"), titleCol, fsTitle);
+        int closeW = app.Scale(24);
+        int closeH = app.Scale(24);
+        int closeX = x + w - app.Scale(36);
+        int closeY = y + app.Scale(14);
+        bool closeHov = InRect(app.mouseX, app.mouseY, closeX, closeY, closeW, closeH);
+        if (closeHov) {
+            c.FillRoundRect(closeX, closeY, closeW, closeH, app.Scale(4), Style.Fade(border, 40));
+            if (app.EventKind() == 3) {
+                keymapHelpOpen = false;
+                app.RequestRedraw();
+                return;
+            }
+        }
+        c.DrawText(closeX + app.Scale(7), closeY + app.Scale(3), "x", hintCol, fs);
+
+        int lineY = y + app.Scale(48);
+        c.FillRect(x + app.Scale(16), lineY, w - app.Scale(32), 1, Style.Fade(border, 40));
+
+        int col1X = x + app.Scale(20);
+        int col2X = x + w / 2 + app.Scale(10);
+        int colW = w / 2 - app.Scale(30);
+
+        int curY = lineY + app.Scale(14);
+        c.DrawText(col1X, curY, Designer.T("Component & Edit", "组件与常用编辑"), accentCol, fs);
+        curY = curY + app.Scale(22);
+
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+I", Designer.T("Spotlight Quick Insert", "快捷插入组件面板"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+X / C / V", Designer.T("Cut / Copy / Paste", "剪切 / 复制 / 粘贴"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+Shift+H / V", Designer.T("Distribute H / V", "水平均分 / 垂直均分"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+D", Designer.T("Duplicate Component", "创建副本"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "F2 / DoubleClick", Designer.T("Rename Inline", "原地编辑文案 / 属性"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+L", Designer.T("Lock / Unlock", "锁定 / 解锁"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+G", Designer.T("Group", "一键成组"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+Shift+G", Designer.T("Ungroup", "解散成组"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Del / Backspace", Designer.T("Delete Selected", "删除选中组件"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+Z / Ctrl+Y", Designer.T("Undo / Redo", "撤销 / 重做"), fs, fsTiny, titleCol, hintCol, border);
+
+        curY = lineY + app.Scale(14);
+        c.DrawText(col2X, curY, Designer.T("Canvas & Navigation", "图层与视口漫游"), accentCol, fs);
+        curY = curY + app.Scale(22);
+
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Ctrl + Wheel", Designer.T("Smooth Zoom (Anchor)", "光标锚点平滑缩放"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Space / MidDrag", Designer.T("Pan Viewport", "抓手平移画布"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Alt Hover", Designer.T("Measure Spacing", "测量控件外间距标尺"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Alt + Drag", Designer.T("Clone Component", "拖拽快速克隆副本"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Shift + Drag", Designer.T("Axis Constrained Move", "正交水平/垂直平移锁定"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "PageUp / Down", Designer.T("Z-Order Move", "上移 / 下移一层"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Ctrl + ↑ / ↓", Designer.T("Reorder Sibling", "同级前后调序"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Ctrl+Home / End", Designer.T("Bring to Front / Back", "置于顶层 / 置于底层"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Arrows", Designer.T("Nudge Move (1px/10px)", "微调位置 (步长1/10px)"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Alt + Arrows", Designer.T("Resize Step (1px/10px)", "微调尺寸 (步长1/10px)"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Ctrl+R", Designer.T("Toggle Pixel Rulers", "显示 / 隐藏像素标尺"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Ctrl+;", Designer.T("Toggle Guide Lines", "显示 / 隐藏参考线"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Ctrl+0 / Ctrl+1", Designer.T("Zoom 100% / Fit", "缩放 100% / 铺满视口"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col2X, curY, colW, "Esc", Designer.T("Cancel / Close", "取消选择 / 关闭弹窗"), fs, fsTiny, titleCol, hintCol, border);
+
+        int botY = y + h - app.Scale(28);
+        c.DrawText(x + app.Scale(20), botY, Designer.T("Press Esc or click outside to close", "按 Esc 或点击外部即可关闭本指南"), hintCol, fsTiny);
+
+        if (app.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 27 || kc == 112) {
+                keymapHelpOpen = false;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    void DrawShortcutRow(App app, Canvas c, int rx, int ry, int rw, string key, string desc, int fs, int fsTiny, int textCol, int hintCol, int border) {
+        int kw = Canvas.MeasureText(key, fsTiny) + app.Scale(10);
+        int kh = app.Scale(18);
+        c.FillRoundRect(rx, ry, kw, kh, app.Scale(3), Style.Fade(border, 30));
+        c.DrawRoundRect(rx, ry, kw, kh, app.Scale(3), Style.Fade(border, 60), 1);
+        c.DrawText(rx + app.Scale(5), ry + app.Scale(2), key, textCol, fsTiny);
+        c.DrawText(rx + kw + app.Scale(8), ry + app.Scale(2), desc, hintCol, fsTiny);
+    }
+
+    // 快捷设置选中组件的排版与锚定方式（Flex 流式 vs 浮动与锚点）。
+    void SetSelLayoutMode(int posMode, int anchorMode) {
+        if (sel == null) { return; }
+        this.PushUndo();
+        sel.position = posMode;
+        sel.anchor = anchorMode;
+        if (posMode == 0) {
+            msg = Designer.T("layout: flow", "排版: Flex 流式");
+        } else {
+            if (anchorMode == 10) {
+                msg = Designer.T("layout: float stretch", "排版: 浮动铺满");
+            } else if (anchorMode == 1) {
+                msg = Designer.T("layout: float top-left", "排版: 浮动左上");
+            } else if (anchorMode == 3) {
+                msg = Designer.T("layout: float top-right", "排版: 浮动右上");
+            } else if (anchorMode == 7) {
+                msg = Designer.T("layout: float bottom-left", "排版: 浮动左下");
+            } else if (anchorMode == 9) {
+                msg = Designer.T("layout: float bottom-right", "排版: 浮动右下");
+            } else {
+                msg = Designer.T("layout: float", "排版: 浮动自由");
+            }
+        }
+    }
+
+    // 快捷设置选中组件的 Dock 停靠模式
+    void SetSelDockMode(int dockSide) {
+        if (sel == null) { return; }
+        this.PushUndoAction(Designer.T("set dock", "设置停靠方式"));
+        sel.dockSide = dockSide;
+        if (dockSide > 0) {
+            sel.position = 0;
+            sel.fx = 0;
+            sel.fy = 0;
+        }
+        this.DesignDeclareRect(sel);
+        this.MarkDocDirty();
+        string dsName = "None";
+        if (dockSide == 1) { dsName = "Top"; }
+        else if (dockSide == 2) { dsName = "Bottom"; }
+        else if (dockSide == 3) { dsName = "Left"; }
+        else if (dockSide == 4) { dsName = "Right"; }
+        else if (dockSide == 5) { dsName = "Fill"; }
+        msg = Designer.T("Dock set: ", "停靠方式: ") + dsName;
+    }
+
+    // 全流式模式下一键撑满剩余高度 (Fill Height: flexGrow=1, fh=0)
+    void SetSelFillHeight() {
+        if (sel == null) { return; }
+        this.PushUndoAction(Designer.T("fill height", "撑满剩余高度"));
+        sel.position = 0;
+        sel.flexGrow = 1;
+        sel.fh = 0;
+        this.DesignDeclareRect(sel);
+        this.MarkDocDirty();
+        msg = Designer.T("Height: Fill (Grow=1)", "高度: 撑满剩余高度 (Grow=1)");
+    }
+
+    // 全流式模式下一键自适应内容高度 (Auto Height: flexGrow=0, fh=0)
+    void SetSelAutoHeight() {
+        if (sel == null) { return; }
+        this.PushUndoAction(Designer.T("auto height", "内容自适应高度"));
+        sel.position = 0;
+        sel.flexGrow = 0;
+        sel.fh = 0;
+        this.DesignDeclareRect(sel);
+        this.MarkDocDirty();
+        msg = Designer.T("Height: Auto (Fit Content)", "高度: 内容自适应 (fh=0)");
+    }
+
+    List<string> CanvasMenuLabels() {
+        List<string> r = new List<string>();
+        if (sel != null) {
+            bool isMulti = (freeExtra != null && freeExtra.Count > 0);
+            if (isMulti) {
+                // 多选控件时的 Visual Studio 标准上下文菜单
+                r.Add(Designer.T("Cut", "剪切") + "  Ctrl+X");
+                r.Add(Designer.T("Copy", "复制") + "  Ctrl+C");
+                r.Add(Designer.T("Delete", "删除") + "  Del");
+                r.Add("-");
+                r.Add(Designer.T("Align Left", "← 左对齐"));
+                r.Add(Designer.T("Align Center H", "| 水平居中"));
+                r.Add(Designer.T("Align Right", "→ 右对齐"));
+                r.Add(Designer.T("Align Top", "↑ 顶对齐"));
+                r.Add(Designer.T("Align Middle V", "- 垂直居中"));
+                r.Add(Designer.T("Align Bottom", "↓ 底对齐"));
+                r.Add("-");
+                r.Add(Designer.T("Match Width", "↔ 等宽"));
+                r.Add(Designer.T("Match Height", "↕ 等高"));
+                r.Add(Designer.T("Match Size", "⤢ 等尺寸"));
+                r.Add("-");
+                r.Add(Designer.T("Distribute Horizontally", "⇹ 水平均分"));
+                r.Add(Designer.T("Distribute Vertically", "⇳ 垂直均分"));
+                r.Add("-");
+                r.Add(Designer.T("Group", "成组") + "  Ctrl+G");
+                r.Add("-");
+                if (sel.locked) { r.Add(Designer.T("Unlock", "解锁") + "  Ctrl+L"); }
+                else { r.Add(Designer.T("Lock", "锁定") + "  Ctrl+L"); }
+                r.Add("-");
+                r.Add(Designer.T("Properties", "属性") + "  F4");
+            } else {
+                // 单选控件时的 Visual Studio 标准上下文菜单
+                if (Designer.CanNavigateCodeBehind(sel)) {
+                    r.Add(Designer.T("View Code", "查看代码") + "  F7");
+                    r.Add("-");
+                }
+                r.Add(Designer.T("Cut", "剪切") + "  Ctrl+X");
+                r.Add(Designer.T("Copy", "复制") + "  Ctrl+C");
+                r.Add(Designer.T("Paste", "粘贴") + "  Ctrl+V");
+                r.Add(Designer.T("Delete", "删除") + "  Del");
+                r.Add("-");
+                r.Add(Designer.T("Rename", "重命名") + "  F2");
+                r.Add(Designer.T("Duplicate", "创建副本") + "  Ctrl+D");
+                if (FormField.IsContainerOf(sel.ftype) && sel.kids != null && sel.kids.Count > 0) {
+                    r.Add(Designer.T("Ungroup", "解散成组") + "  Ctrl+Shift+G");
+                }
+                r.Add("-");
+                r.Add(Designer.T("Bring to Front", "置于顶层") + "  Ctrl+Home");
+                r.Add(Designer.T("Bring Forward", "上移一层") + "  PageUp");
+                r.Add(Designer.T("Send Backward", "下移一层") + "  PageDown");
+                r.Add(Designer.T("Send to Back", "置于底层") + "  Ctrl+End");
+                r.Add("-");
+                if (sel.locked) { r.Add(Designer.T("Unlock", "解锁") + "  Ctrl+L"); }
+                else { r.Add(Designer.T("Lock", "锁定") + "  Ctrl+L"); }
+                r.Add("-");
+                r.Add(Designer.T("Properties", "属性") + "  F4");
+            }
+        } else {
+            // 空白画布 (Form 根节点) 时的 Visual Studio 标准上下文菜单
+            r.Add(Designer.T("View Code", "查看代码") + "  F7");
+            r.Add("-");
+            r.Add(Designer.T("Paste", "粘贴") + "  Ctrl+V");
+            r.Add(Designer.T("Select All", "全选") + "  Ctrl+A");
+            r.Add("-");
+            if (snapGrid) { r.Add(Designer.T("Disable Snap", "关闭网格吸附")); }
+            else { r.Add(Designer.T("Enable Snap", "开启网格吸附")); }
+            if (showRulers) { r.Add(Designer.T("Hide Pixel Rulers", "隐藏像素标尺") + "  Ctrl+R"); }
+            else { r.Add(Designer.T("Show Pixel Rulers", "显示像素标尺") + "  Ctrl+R"); }
+            r.Add("-");
+            r.Add(Designer.T("Lock All Controls", "锁定所有控件"));
+            r.Add("-");
+            r.Add(Designer.T("Properties", "属性") + "  F4");
+        }
+        return r;
+    }
+
+    void HandleCanvasMenu(App app, int cc) {
+        List<string> items = this.CanvasMenuLabels();
+        if (cc < 0 || cc >= items.Count) { return; }
+        string it = items[cc];
+        if (it == "" || it == "-") { return; }
+        if (sel != null) {
+            if (it.StartsWith(Designer.T("View Code", "查看代码"))) {
+                if (Designer.CanNavigateCodeBehind(sel)) {
+                    string defEv = Designer.DefaultEventName(sel);
+                    string h = sel.GetHandler(defEv);
+                    if (h == "") {
+                        h = Designer.SuggestHandler(sel, defEv);
+                        sel.SetHandler(defEv, h);
+                    }
+                    this.RequestOpenCodeBehindHandler(h);
+                }
+            }
+            else if (it.StartsWith(Designer.T("Cut", "剪切"))) { this.CutSel(); }
+            else if (it.StartsWith(Designer.T("Copy", "复制"))) { this.CopySel(); }
+            else if (it.StartsWith(Designer.T("Paste", "粘贴"))) { this.PasteClip(); }
+            else if (it.StartsWith(Designer.T("Delete", "删除"))) { this.DeleteSelGroup(); }
+            else if (it.StartsWith(Designer.T("Rename", "重命名"))) { this.StartInlineRename(); }
+            else if (it.StartsWith(Designer.T("Duplicate", "创建副本"))) { this.DuplicateSel(); }
+            else if (it.StartsWith(Designer.T("Group", "成组"))) { this.GroupSel(); }
+            else if (it.StartsWith(Designer.T("Ungroup", "解散成组"))) { this.UngroupSel(); }
+            else if (it.StartsWith(Designer.T("Align Left", "← 左对齐"))) { this.AlignSelGroup(0); }
+            else if (it.StartsWith(Designer.T("Align Center H", "| 水平居中"))) { this.AlignSelGroup(1); }
+            else if (it.StartsWith(Designer.T("Align Right", "→ 右对齐"))) { this.AlignSelGroup(2); }
+            else if (it.StartsWith(Designer.T("Align Top", "↑ 顶对齐"))) { this.AlignSelGroup(3); }
+            else if (it.StartsWith(Designer.T("Align Middle V", "- 垂直居中"))) { this.AlignSelGroup(4); }
+            else if (it.StartsWith(Designer.T("Align Bottom", "↓ 底对齐"))) { this.AlignSelGroup(5); }
+            else if (it.StartsWith(Designer.T("Match Width", "↔ 等宽"))) { this.SizeSelGroup(0); }
+            else if (it.StartsWith(Designer.T("Match Height", "↕ 等高"))) { this.SizeSelGroup(1); }
+            else if (it.StartsWith(Designer.T("Match Size", "⤢ 等尺寸"))) { this.SizeSelGroup(2); }
+            else if (it.StartsWith(Designer.T("Distribute Horizontally", "⇹ 水平均分"))) { this.DistributeSelGroup(0); }
+            else if (it.StartsWith(Designer.T("Distribute Vertically", "⇳ 垂直均分"))) { this.DistributeSelGroup(1); }
+            else if (it.StartsWith(Designer.T("Bring to Front", "置于顶层"))) { this.SelToEdge(1); }
+            else if (it.StartsWith(Designer.T("Bring Forward", "上移一层"))) { this.MoveSel(1); }
+            else if (it.StartsWith(Designer.T("Send Backward", "下移一层"))) { this.MoveSel(0 - 1); }
+            else if (it.StartsWith(Designer.T("Send to Back", "置于底层"))) { this.SelToEdge(0); }
+            else if (it.StartsWith(Designer.T("Unlock", "解锁")) || it.StartsWith(Designer.T("Lock", "锁定"))) { this.ToggleLockSel(); }
+            else if (it.StartsWith(Designer.T("Properties", "属性"))) {
+                this.inspTab = 0;
+                app.RequestRedraw();
+            }
+        } else {
+            if (it.StartsWith(Designer.T("View Code", "查看代码"))) {
+                this.RequestOpenCodeBehindHandler("");
+            }
+            else if (it.StartsWith(Designer.T("Paste", "粘贴"))) { this.PasteClip(); }
+            else if (it.StartsWith(Designer.T("Select All", "全选"))) {
+                this.ClearExtraSel();
+                if (fields != null && fields.Count > 0) {
+                    sel = fields[0];
+                    for (int i = 1; i < fields.Count; i = i + 1) {
+                        freeExtra.Add(fields[i]);
+                    }
+                    this.SyncFreeSelBase();
+                    app.RequestRedraw();
+                }
+            }
+            else if (it.StartsWith(Designer.T("Disable Snap", "关闭网格吸附")) || it.StartsWith(Designer.T("Enable Snap", "开启网格吸附"))) {
+                snapGrid = !snapGrid;
+                app.RequestRedraw();
+            }
+            else if (it.StartsWith(Designer.T("Hide Pixel Rulers", "隐藏像素标尺")) || it.StartsWith(Designer.T("Show Pixel Rulers", "显示像素标尺"))) {
+                showRulers = !showRulers;
+                app.RequestRedraw();
+            }
+            else if (it.StartsWith(Designer.T("Lock All Controls", "锁定所有控件"))) {
+                if (fields != null) {
+                    for (int i = 0; i < fields.Count; i = i + 1) {
+                        fields[i].locked = true;
+                    }
+                    msg = Designer.T("All controls locked", "已锁定所有控件");
+                    app.RequestRedraw();
+                }
+            }
+            else if (it.StartsWith(Designer.T("Properties", "属性"))) {
+                this.inspTab = 0;
+                this.sel = null;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    // --- 顶层布局 ----------------------------------------------------
+
+    // 每帧入口：基于 Path Hash ID 作用域绘制整个设计器，
+    // 确保即时模式控件每帧获得稳定唯一的层级路径 ID，
+    // 与保留式长生命周期控件（Input 等）完全物理隔离。
+    void Render(App app, int x, int y, int w, int h) {
+        app.PushId("Designer");
+        if (rowsEdField != null) { app.PushId("RowsEditor"); }
+        else if (propsEdField != null) { app.PushId("PropsEditor"); }
+        RenderPinned(app, x, y, w, h);
+        if (rowsEdField != null || propsEdField != null) { app.PopId(); }
+        app.PopId();
+    }
+
+    // 宿主把组件面板和属性面板画进自己的 dock 面板里。
+    // 分别使用独立的作用域隔离，两面板互不影响。
+    void RenderHostPanels(App app, Rect toolRect, Rect propRect) {
+        hostPanels = true;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (toolRect != null && toolRect.width > 1 && toolRect.height > 1 && toolRect.x > -1000) {
+            app.PushId("DesignerPalette");
+            RenderPalette(app, c, t, toolRect.x, toolRect.y, toolRect.width, toolRect.height);
+            app.PopId();
+        }
+        if (propRect != null && propRect.width > 1 && propRect.height > 1 && propRect.x > -1000) {
+            app.PushId("DesignerInspector");
+            RenderInspector(app, c, t, propRect.x, propRect.y, propRect.width, propRect.height);
+            app.PopId();
+        }
+    }
+
+    // 设计器本体的一帧：功能区、画布（或 JSON 抽屉）、组件托盘、
+    // 左右面板与状态栏；处理键盘快捷键、拖拽收尾、工具箱
+    // tooltip、拖拽幽灵块与缩放下拉菜单。
+    void RenderPinned(App app, int x, int y, int w, int h) {
+        this.hostApp = app;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int statusH = app.Scale(32);
+        int top = y + app.Scale(6);
+        int bot = y + h - statusH - app.Scale(4);
+
+        // 三栏宽度跟着宿主面板走：宿主窄了先按比例压缩面板和
+        // 检查器，压不动就收起来，绝不把内容画到面板外。
+        int pad = app.Scale(12);
+        // 功能区横跨整个设计器（不只是画布那一栏），
+        // 这样命令有地方排，也不会挤到画布上。
+        int barH = this.RibbonH(app);
+        int bodyY = top + barH + app.Scale(6);
+        int palX = x + pad;
+        int avail = w - pad * 5;
+        if (avail < app.Scale(80)) { avail = app.Scale(80); }
+        int palW = app.Scale(176);
+        int inspW = app.Scale(288);
+        if (hostPanels) { palW = 0; inspW = 0; avail = w - pad * 2; }
+        int minCan = app.Scale(220);
+        // 宿主模式（hostPanels）下两栏都归零，"按比例压缩"整段没有意义：
+        // 跳过它（分母 sum = palW + inspW = 0，除法没有意义——窄区会
+        // 除零，把整个 IDE 崩掉）。画布照可用宽度铺满即可。
+        // 非宿主模式下 sum = Scale(176) + Scale(288) 恒为正，除法安全。
+        if (!hostPanels && palW + inspW + minCan > avail) {
+            int side = avail - minCan;
+            if (side < 0) { side = 0; }
+            int sum = palW + inspW;
+            palW = side * palW / sum;
+            inspW = side - palW;
+            if (palW < app.Scale(130)) { inspW = inspW + palW; palW = 0; }
+            if (inspW < app.Scale(190)) { palW = palW + inspW; inspW = 0; }
+            if (palW > 0 && palW < app.Scale(130)) { palW = 0; }
+        }
+        int canW = avail - palW - inspW;
+        if (canW < app.Scale(80)) { canW = app.Scale(80); }
+        int canX = palX + pad;
+        if (palW > 0) { canX = palX + palW + pad; }
+        if (hostPanels) { canX = palX; }
+        int inspX = canX + canW + pad;
+        int bodyH = bot - bodyY;
+
+        // 设计器整体裁剪在宿主给的矩形内。
+        c.PushClip(x, y, w, h);
+        RenderRibbon(app, c, t, palX, top, w - pad * 2);
+
+        int ek = app.EventKind();
+        // 拖拽进行中跟踪指针；实际放置由
+        // RenderForm 解析（它掌握行几何）。
+        if (dragging && ek == 1) {
+            if (app.mouseX != dragMouseX || app.mouseY != dragMouseY) { dragMoved = true; }
+            dragMouseX = app.mouseX;
+            dragMouseY = app.mouseY;
+            app.RequestRedraw();
+        }
+
+        hoverFt = -1;
+        // 键盘编辑：Delete 删除选中组，Ctrl+Z/Y 撤销重做，
+        // Ctrl+C/V 复制粘贴，Ctrl+D 复制副本，方向键按网格步长
+        // 微调整组（Shift = 1px，仅自由布局）。文本框持有键盘
+        // 焦点时全部忽略，避免影响输入。Ctrl+字母以控制码到达
+        // （^Z=26 ^Y=25 ^C=3 ^V=22 ^D=4），和场景设计器一致。
+        // 大编辑弹窗开着时整块让位：弹窗里的 Delete/方向键归
+        // 弹窗的行/键列表，不能同时改到画布选中的组件。
+        if (!preview && app.focus.focusedId < 0 && !app.PointerCaptured()
+                && !this.BigEditorOpen()) {
+            if (ek == 6) {
+                int cc = app.window.EventKeyCode();
+                if (cc == 1) { this.SelectAll(); app.RequestRedraw(); }
+                else if (cc == 26) { this.Undo(); app.RequestRedraw(); }
+                else if (cc == 25) { this.Redo(); app.RequestRedraw(); }
+                else if (cc == 24 && sel != null) { this.CutSel(); app.RequestRedraw(); }
+                else if (cc == 3) { this.CopySel(); app.RequestRedraw(); }
+                else if (cc == 22) { this.PasteClip(); app.RequestRedraw(); }
+                else if (cc == 4 && sel != null) { this.DuplicateSel(); app.RequestRedraw(); }
+                else if (cc == 12 && sel != null) { this.ToggleLockSel(); app.RequestRedraw(); }
+            } else if (ek == 4) {
+                int kc = app.window.EventKeyCode();
+                bool hasCtrl = Modifiers.HasCtrl(app.window.EventMods());
+                bool hasShift = Modifiers.HasShift(app.window.EventMods());
+                if (hasCtrl && (kc == 90 || kc == 122) && !hasShift) {
+                    this.Undo();
+                    app.RequestRedraw();
+                } else if (hasCtrl && ((kc == 89 || kc == 121) || ((kc == 90 || kc == 122) && hasShift))) {
+                    this.Redo();
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 65 || kc == 97)) {
+                    this.SelectAll();
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 88 || kc == 120) && sel != null) {
+                    this.CutSel();
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 67 || kc == 99)) {
+                    this.CopySel();
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 86 || kc == 118)) {
+                    if (hasShift) {
+                        this.DistributeSelGroup(1);
+                    } else {
+                        this.PasteClip();
+                    }
+                    app.RequestRedraw();
+                } else if (hasCtrl && hasShift && (kc == 72 || kc == 104)) {
+                    this.DistributeSelGroup(0);
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 68 || kc == 100) && sel != null) {
+                    this.DuplicateSel();
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 76 || kc == 108) && sel != null) {
+                    this.ToggleLockSel();
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 73 || kc == 105)) {
+                    this.OpenQuickInsert(app);
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 82 || kc == 114)) {
+                    showRulers = !showRulers;
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 186 || kc == 59)) {
+                    showGuides = !showGuides;
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 48 || kc == 96)) {
+                    winZoom = 1000;
+                    freePanX = 0;
+                    freePanY = 0;
+                    msg = Designer.T("zoom: 100%", "缩放: 100%");
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 49 || kc == 97)) {
+                    winZoom = 0;
+                    freePanX = 0;
+                    freePanY = 0;
+                    msg = Designer.T("zoom: fit to window", "缩放: 适应窗口大小");
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 187 || kc == 61)) {
+                    int curZ = winZoom;
+                    if (curZ <= 0) { curZ = lastFitPct; }
+                    curZ = curZ + 100;
+                    if (curZ > 2000) { curZ = 2000; }
+                    winZoom = curZ;
+                    msg = Designer.T("zoom: ", "缩放: ") + Convert.ToString(winZoom / 10) + "%";
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 189 || kc == 45 || kc == 173)) {
+                    int curZ = winZoom;
+                    if (curZ <= 0) { curZ = lastFitPct; }
+                    curZ = curZ - 100;
+                    if (curZ < 250) { curZ = 250; }
+                    winZoom = curZ;
+                    msg = Designer.T("zoom: ", "缩放: ") + Convert.ToString(winZoom / 10) + "%";
+                    app.RequestRedraw();
+                } else if (kc == 112) {
+                    keymapHelpOpen = !keymapHelpOpen;
+                    app.RequestRedraw();
+                } else if (kc == 191 && !hasCtrl) {
+                    keymapHelpOpen = !keymapHelpOpen;
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 71 || kc == 103)) {
+                    if (hasShift) { this.UngroupSel(); }
+                    else { this.GroupSel(); }
+                    app.RequestRedraw();
+                } else if (kc == 32) {
+                    spacePressed = true;
+                    app.RequestRedraw();
+                } else if (inlineRenaming && kc == 13) {
+                    this.CommitInlineRename();
+                } else if (inlineRenaming && kc == 27) {
+                    this.CancelInlineRename();
+                } else if (kc == 113 && sel != null) {
+                    this.StartInlineRename();
+                } else if (kc == 27) {
+                    if (sel != null || (freeExtra != null && freeExtra.Count > 0)) {
+                        sel = null;
+                        this.ClearExtraSel();
+                        app.RequestRedraw();
+                    }
+                } else if ((kc == 46 || kc == 8) && sel != null) {
+                    DeleteSelGroup();
+                    app.RequestRedraw();
+                } else if (kc == 33 && sel != null) {
+                    MoveSel(1);
+                    msg = Designer.T("moved forward", "上移一层");
+                    app.RequestRedraw();
+                } else if (kc == 34 && sel != null) {
+                    MoveSel(0 - 1);
+                    msg = Designer.T("moved back", "下移一层");
+                    app.RequestRedraw();
+                } else if (kc == 36 && Modifiers.HasCtrl(app.window.EventMods()) && sel != null) {
+                    this.SelToEdge(1);
+                    msg = Designer.T("brought to front", "已置顶");
+                    app.RequestRedraw();
+                } else if (kc == 35 && Modifiers.HasCtrl(app.window.EventMods()) && sel != null) {
+                    this.SelToEdge(0);
+                    msg = Designer.T("sent to back", "已置底");
+                    app.RequestRedraw();
+                } else if (sel != null && kc >= 37 && kc <= 40) {
+                    bool hasCtrlKey = Modifiers.HasCtrl(app.window.EventMods());
+                    if (hasCtrlKey) {
+                        if (kc == 37 || kc == 38) {
+                            this.MoveSel(0 - 1);
+                            msg = Designer.T("reordered backward", "同级调序: 向前移动一位");
+                        } else if (kc == 39 || kc == 40) {
+                            this.MoveSel(1);
+                            msg = Designer.T("reordered forward", "同级调序: 向后移动一位");
+                        }
+                        app.RequestRedraw();
+                    } else if (sel.position == 0) {
+                        bool hasAlt = Modifiers.HasAlt(app.window.EventMods());
+                        if (hasAlt) {
+                            int step = 1;
+                            if (Modifiers.HasShift(app.window.EventMods())) {
+                                step = 8;
+                                if (snapGrid && gridSize > 0) { step = gridSize; }
+                            }
+                            int dw = 0;
+                            int dh = 0;
+                            if (kc == 37) { dw = 0 - step; }
+                            else if (kc == 39) { dw = step; }
+                            else if (kc == 38) { dh = 0 - step; }
+                            else if (kc == 40) { dh = step; }
+                            this.ResizeSelByKey(dw, dh);
+                        } else {
+                            if (kc == 37 || kc == 38) {
+                                this.MoveSel(0 - 1);
+                                msg = Designer.T("flow reordered backward", "流式调序: 向前移动一位");
+                            } else if (kc == 39 || kc == 40) {
+                                this.MoveSel(1);
+                                msg = Designer.T("flow reordered forward", "流式调序: 向后移动一位");
+                            }
+                        }
+                        app.RequestRedraw();
+                    } else {
+                        int step = 1;
+                        if (Modifiers.HasShift(app.window.EventMods())) {
+                            step = 8;
+                            if (snapGrid && gridSize > 0) { step = gridSize; }
+                        }
+                        bool hasAlt = Modifiers.HasAlt(app.window.EventMods());
+                        if (hasAlt) {
+                            int dw = 0;
+                            int dh = 0;
+                            if (kc == 37) { dw = 0 - step; }
+                            else if (kc == 39) { dw = step; }
+                            else if (kc == 38) { dh = 0 - step; }
+                            else if (kc == 40) { dh = step; }
+                            this.ResizeSelByKey(dw, dh);
+                        } else {
+                            int ndx = 0;
+                            int ndy = 0;
+                            if (kc == 37) { ndx = 0 - step; }
+                            else if (kc == 39) { ndx = step; }
+                            else if (kc == 38) { ndy = 0 - step; }
+                            else if (kc == 40) { ndy = step; }
+                            this.NudgeSel(ndx, ndy);
+                        }
+                        app.RequestRedraw();
+                    }
+                    app.RequestRedraw();
+                }
+            } else if (ek == 5) {
+                int kc = app.window.EventKeyCode();
+                if (kc == 32) {
+                    spacePressed = false;
+                    app.RequestRedraw();
+                }
+            }
+        }
+        if (jsonOpen) {
+            RenderJsonPanel(app, c, t, canX, bodyY, canW, bodyH);
+        } else {
+            // 画布下方的 WinForms 风格组件托盘：非可视
+            // 组件（右键菜单、图层、定时器、弹窗等）放在这里，
+            // 而不占用被设计窗口内的空间。
+            int trayH = app.Scale(46);
+            RenderForm(app, c, t, canX, bodyY, canW, bodyH - trayH - app.Scale(8));
+            RenderTray(app, c, t, canX, bodyY + bodyH - trayH, canW, trayH);
+            if (inlineRenaming && sel != null) {
+                int rw = app.Scale(260);
+                int rh = app.Scale(36);
+                int rx = canX + app.Scale(16);
+                int ry = bodyY + app.Scale(16);
+                if (lastSelViewRect != null && lastSelViewRect.width > 0 && lastSelViewRect.height > 0) {
+                    rx = lastSelViewRect.x + (lastSelViewRect.width - rw) / 2;
+                    ry = lastSelViewRect.y - rh - app.Scale(6);
+                    if (ry < bodyY + app.Scale(8)) {
+                        ry = lastSelViewRect.y + lastSelViewRect.height + app.Scale(6);
+                    }
+                    if (rx < canX + app.Scale(8)) { rx = canX + app.Scale(8); }
+                    if (rx + rw > canX + canW - app.Scale(8)) { rx = canX + canW - rw - app.Scale(8); }
+                    if (ry + rh > bodyY + bodyH - app.Scale(8)) { ry = bodyY + bodyH - rh - app.Scale(8); }
+                }
+                c.FillRoundRect(rx, ry, rw, rh, t.borderRadiusSmall,
+                    Style.Part(app, "designer", "shadow", "", "", "", Style.SNormal()).BgOr(0));
+                c.FillRoundRect(rx - 1, ry - 1, rw, rh, t.borderRadiusSmall,
+                    Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BgOr(0));
+                c.DrawRoundRect(rx - 1, ry - 1, rw, rh, t.borderRadiusSmall,
+                    Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BorderOr(0), 1);
+                int btnW = app.Scale(44);
+                int inW = rw - btnW * 2 - app.Scale(20);
+                inlineRenameInput.Render(app, rx + app.Scale(6), ry + app.Scale(4), inW, rh - app.Scale(8));
+                if (inlineRenameFocusNeeded) {
+                    inlineRenameInput.Focus();
+                    inlineRenameInput.SelectAll();
+                    inlineRenameFocusNeeded = false;
+                }
+                int okId = SmallBtn(app, Designer.T("OK", "确定"), 1, rx + inW + app.Scale(8), ry + app.Scale(4), btnW);
+                int cancelId = SmallBtn(app, Designer.T("Cancel", "取消"), 0, rx + inW + btnW + app.Scale(12), ry + app.Scale(4), btnW);
+                if (Ui.Clicked(app, okId)) {
+                    this.CommitInlineRename();
+                }
+                if (Ui.Clicked(app, cancelId)) {
+                    this.CancelInlineRename();
+                }
+            }
+        }
+        if (palW > 0) { RenderPalette(app, c, t, palX, bodyY, palW, bodyH); }
+        if (inspW > 0) { RenderInspector(app, c, t, inspX, bodyY, inspW, bodyH); }
+        if (hostPanels) { inspX = palX + avail; }
+        RenderStatus(app, c, t, palX, bot, inspX + inspW - palX, statusH);
+
+        // 在表单外结束的拖拽直接取消。指针没动过就是一次点击，
+        // 按工具箱的点击添加处理。
+        if (dragging && ek == 3) {
+            if (dragFromPalette && !dragMoved) { this.PalClickRelease(); }
+            palClickPending = false;
+            dragging = false;
+            dragFromPalette = false;
+            dragMoved = false;
+            dragIndex = -1;
+            dragUserComp = -1;
+            dropContainer = null;
+            app.RequestRedraw();
+        }
+
+        // 面板 tooltip（名称 + 描述），绘制在所有面板之上。
+        if (hoverFt >= 0 && !dragging) {
+            Tooltip.RenderRich(app, hoverX, hoverY,
+                FormField.TypeName(hoverFt), FieldDesc(hoverFt));
+        }
+        // 拖拽时跟随光标的幽灵块——无论是从面板拖出的
+        // 新字段还是被重排的现有行——这样
+        // 始终清楚正在拖哪个组件。
+        if (dragging && dragMoved) {
+            int gkind = dragKind;
+            if (!dragFromPalette && dragIndex >= 0 && dragIndex < fields.Count) {
+                gkind = fields[dragIndex].ftype;
+            }
+            string gl = FormField.TypeName(gkind);
+            if (gkind == 200 && dragUserComp >= 0 && dragUserComp < userComps.Count) {
+                gl = userComps[dragUserComp].name;
+                gkind = 18;
+            }
+            int gh = app.Scale(26);
+            int icoW = app.Scale(22);
+            int gw = icoW + Canvas.MeasureText(gl, Style.FontFallback(app, "small")) + app.Scale(16);
+            int gx = dragMouseX + app.Scale(8);
+            int gy = dragMouseY - gh / 2;
+            c.FillRoundRect(gx + 1, gy + 2, gw, gh, t.borderRadiusSmall,
+                Style.Part(app, "designer", "shadow", "", "", "", Style.SNormal()).BgOr(0));
+            c.FillRoundRect(gx, gy, gw, gh, t.borderRadiusSmall, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawGlyphIn(FieldIcon(gkind), gx + app.Scale(4), gy, icoW, gh,
+                Style.FontFallback(app, "small"), Style.Part(app, "designer", "badge", "", "", "", Style.SNormal()).FgOr(0));
+            c.DrawText(gx + icoW + app.Scale(4), gy + app.Scale(6), gl, Style.Part(app, "designer", "badge", "", "", "", Style.SNormal()).FgOr(0), Style.FontFallback(app, "small"));
+        }
+
+        // 缩放下拉菜单（50%–200%）：画在所有面板之上。开启的
+        // 那一帧忽略触发点击（zoomMenuArm），选中档位后设 winZoom。
+        if (zoomMenuOpen && rowsEdField == null && propsEdField == null) {
+            int zc = ContextMenu.Render(app, zoomMenuX, zoomMenuY, this.ZoomMenuLabels());
+            if (!zoomMenuArm) {
+                zoomMenuArm = true;
+                app.RequestRedraw();
+            } else if (zc == 0 - 2) {
+                zoomMenuOpen = false;
+                app.RequestRedraw();
+            } else if (zc >= 0) {
+                List<int> zps = this.ZoomPresets();
+                if (zc < zps.Count) { winZoom = zps[zc]; }
+                zoomMenuOpen = false;
+                app.RequestRedraw();
+            }
+        }
+
+        // 功能区溢出菜单：条带放不下的命令收进「»」的弹出菜单，
+        // 画在所有面板之上。arm 跳过打开当帧的那次点击。
+        if (ribbonMenuOpen && rowsEdField == null && propsEdField == null) {
+            int rc = ContextMenu.Render(app, ribbonMenuX, ribbonMenuY, ribbonMenuLabels);
+            if (!ribbonMenuArm) {
+                ribbonMenuArm = true;
+                app.RequestRedraw();
+            } else if (rc == 0 - 2) {
+                ribbonMenuOpen = false;
+                Ribbon.SetOverflowMenuOpen(false);
+                app.RequestRedraw();
+            } else if (rc >= 0) {
+                ribbonMenuOpen = false;
+                Ribbon.SetOverflowMenuOpen(false);
+                app.RequestRedraw();
+                if (rc < ribbonMenuActs.Count) {
+                    this.RunRibbon(app, ribbonMenuActs[rc]);
+                }
+            }
+        }
+
+        if (dpiMenuOpen && rowsEdField == null && propsEdField == null) {
+            int dc = ContextMenu.Render(app, dpiMenuX, dpiMenuY, this.DpiMenuLabels());
+            if (!dpiMenuArm) {
+                dpiMenuArm = true;
+                app.RequestRedraw();
+            } else if (dc == 0 - 2) {
+                dpiMenuOpen = false;
+                app.RequestRedraw();
+            } else if (dc >= 0) {
+                List<int> dps = this.DpiPresets();
+                if (dc < dps.Count) { this.SetDesignTargetDpi(app, dps[dc]); }
+                dpiMenuOpen = false;
+                app.RequestRedraw();
+            }
+        }
+
+        // 画板右键上下文菜单：画在所有面板之上。
+        if (canvasMenuOpen && rowsEdField == null && propsEdField == null) {
+            int cc = ContextMenu.Render(app, canvasMenuX, canvasMenuY, this.CanvasMenuLabels());
+            if (!canvasMenuArm) {
+                canvasMenuArm = true;
+                app.RequestRedraw();
+            } else if (cc == 0 - 2) {
+                canvasMenuOpen = false;
+                app.RequestRedraw();
+            } else if (cc >= 0) {
+                this.HandleCanvasMenu(app, cc);
+                canvasMenuOpen = false;
+                app.RequestRedraw();
+            }
+        }
+        c.PopClip();
+
+        if (quickInsertOpen) {
+            this.RenderQuickInsert(app, c, t, app.canvas.Width(), app.canvas.Height());
+        }
+        if (keymapHelpOpen) {
+            this.RenderKeymapHelp(app, c, t, app.canvas.Width(), app.canvas.Height());
+        }
+
+        // 弹窗式大编辑器画在裁剪区之外的最上层：Layer.Modal 的遮罩
+        // 与居中坐标都是全画布的，裁在设计器矩形里会把遮罩裁成
+        // 一块，宿主面板一窄弹窗边缘也被截掉。
+        if (rowsEdField != null) { this.RenderRowsEditor(app, c, t); }
+        else if (propsEdField != null) { this.RenderPropsEditor(app, c, t); }
+    }
+
+    // --- 工具栏 -------------------------------------------------------------
+
+    // 开启 HTML 预览时替代画布显示的只读抽屉：渲染 SaveHtml()
+    // 的落盘内容，回答"这个设计存出来是什么样"。设计改动在画布
+    // 和检查器上做——P7a 之后 JSON 只是内部模型，这里不给它
+    // 编辑入口（原 Apply→LoadJson 通道已删）。
+    void RenderJsonPanel(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        int fs = Style.FontFallback(app, "small");
+        c.FillRoundRect(x, y, w, h, app.Scale(6), Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BgOr(0));
+        c.DrawRoundRect(x, y, w, h, app.Scale(6), Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
+        int pad = app.Scale(12);
+        int ix = x + pad;
+        int iw = w - pad * 2;
+        int iy = y + app.Scale(10);
+        c.DrawText(ix, iy, Designer.T(".html DESIGN DOC  ·  read-only preview", ".html 设计稿  ·  只读预览"), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+        iy = iy + app.Scale(24);
+        int btnH = app.Scale(30);
+        int taH = y + h - iy - btnH - app.Scale(20);
+        if (taH < app.Scale(80)) { taH = app.Scale(80); }
+        jsonArea.Render(app, ix, iy, iw, taH);
+        int by = iy + taH + app.Scale(8);
+        int dumpId = SmallBtn(app, Designer.T("Refresh", "刷新"), 0,
+            ix, by, app.Scale(80));
+        if (Ui.Clicked(app, dumpId)) {
+            jsonArea.SetText(SaveHtml());
+            msg = Designer.T("refreshed the .html preview from the current design", "已根据当前设计刷新 .html 预览");
+        }
+        int closeId = SmallBtn(app, Designer.T("Close", "关闭"), 0,
+            ix + iw - app.Scale(70), by, app.Scale(70));
+        if (Ui.Clicked(app, closeId)) { jsonOpen = false; }
+    }
+
+    // --- 字段面板 / 大纲树 -------------------------------------------------
+
+    // 组件工具箱与大纲树选项卡：
+    // palTab == 0: 组件工具箱 TreeView（分组与组件叶子）
+}

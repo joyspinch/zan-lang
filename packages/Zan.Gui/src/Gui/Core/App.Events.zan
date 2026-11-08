@@ -1,0 +1,705 @@
+using System;
+using Gui.Backend;
+
+namespace Gui;
+
+public partial class App {
+    void SetPollEventMode() {
+        pollPending = true;
+    }
+
+    // 以非阻塞轮询方式处理一个挂起的 OS 消息/事件：
+    // 返回 1 = 成功分发了一个事件；
+    // 返回 0 = 当前队列无挂起事件（已排空）；
+    // 返回 -1 = 收到窗口关闭请求 (WM_QUIT)。
+    int PollOneEvent() {
+        this.SetPollEventMode();
+        if (!this.ProcessEvent()) { return 0 - 1; }
+        if (this.lastPollResult == 0) { return 1; }
+        return 0;
+    }
+
+    bool ProcessEvent() {
+        // 推进活动的自动化脚本（注入合成事件，
+        // 由同一循环随后轮询并分发）。未启用驱动时为空操作。
+        UiDriver.Tick();
+        this.PerfMark("sh.evdriver");
+        // 如果重绘已挂起（例如点击处理程序在帧中修改了状态），
+        // 不要阻塞等待下一个 OS 事件——改为轮询，
+        // 让新状态立即绘制。否则阻塞直到事件到达。
+        int result;
+        int loopT0 = 0;
+        int loopPath = 2;
+        if (App.PerfOn()) { loopT0 = Window.GetTickMs(); }
+        if (needsRedraw || pollPending) {
+            bool explicitPoll = pollPending;
+            pollPending = false;
+            loopPath = 0;
+            result = window.PollEvent();
+            // 先取输入，队列为空才等下一显示帧。等待可由输入和 App.Post 唤醒。
+            if (result == 1 && needsRedraw && !explicitPoll) {
+                int wait = window.RequestDisplayFrame()
+                    ? 100 : frameCadence.WaitMilliseconds(Stopwatch.GetMicroseconds());
+                if (wait > 0) { result = window.WaitEventTimeout(wait); }
+            } else if (result == 1 && !needsRedraw && !explicitPoll) {
+                // 只有"要求轮询"没有"挂起重绘"（自动化驱动在等时间
+                // 或等注入批次排空）：在内核里小睡到下一个事件或最多
+                // 8ms——注入的事件会立刻唤醒等待，而循环不再以
+                // 数十万圈每秒空转烧掉半个核。
+                int now = Window.GetTickMs();
+                int slice = 8;
+                int dl = animNextMs;
+                if (dl < 0 || (wakeNextMs >= 0 && wakeNextMs < dl)) { dl = wakeNextMs; }
+                if (dl < 0 || (wakeFrameNextMs >= 0 && wakeFrameNextMs < dl)) { dl = wakeFrameNextMs; }
+                if (dl < 0 || (fxNextMs >= 0 && fxNextMs < dl)) { dl = fxNextMs; }
+                if (dl >= 0) {
+                    int d = dl - now;
+                    if (d < 1) { d = 1; }
+                    if (d < slice) { slice = d; }
+                }
+                result = window.WaitEventTimeout(slice);
+            }
+        } else if (animNextMs >= 0 || wakeNextMs >= 0
+                   || wakeFrameNextMs >= 0 || fxNextMs >= 0) {
+            loopPath = 1;
+            // 先取出输入/生命周期事件，到期帧在 Surface 和输入处理后兑现。
+            int now = Window.GetTickMs();
+            int deadline = animNextMs;
+            if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) {
+                deadline = wakeNextMs;
+            }
+            if (deadline < 0
+                || (wakeFrameNextMs >= 0 && wakeFrameNextMs < deadline)) {
+                deadline = wakeFrameNextMs;
+            }
+            if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) {
+                deadline = fxNextMs;
+            }
+            if (deadline < 0 || now >= deadline) { result = window.PollEvent(); }
+            else { result = window.WaitEventTimeout(deadline - now); }
+        } else {
+            result = window.WaitEvent();
+        }
+        bool displayReady = window.TakeDisplayFrame();
+        bool displayAnimationDue = displayReady && displayAnimationPending;
+        bool displayFxDue = displayReady && displayFxPending;
+        if (displayReady) {
+            displayAnimationPending = false;
+            displayFxPending = false;
+        }
+        if (App.PerfOn()) { this.PerfLoopTick(loopT0, loopPath); }
+        this.lastPollResult = result;
+        if (result < 0) {
+            return this.HandleCloseRequest();
+        }
+
+        // 在 UI 线程上运行从后台线程调度来的工作。
+        // Wake() 仅投递一个空事件（kind 0）来触发此逻辑。
+        DrainPosts();
+        this.PerfMark("sh.posts");
+
+        int kind = this.NormalizedKind();
+        if (displayAnimationDue) { animNextMs = Window.GetTickMs(); }
+        if (displayFxDue && fxNextMs >= 0 && this.FxActive()) {
+            fxNextMs = Window.GetTickMs();
+        }
+        // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
+        // 滚轮（13）记入 wheelScrollInput：滚轮的消费发生在渲染期
+        // （CaptureWheel 仲裁），本帧收窄为上一帧认领视口的条带而非
+        // 整窗——见该字段与 TakeDueWheelRect 的注释。
+        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) {
+            inputNeedsFrame = true;
+        }
+        if (kind == 13) { wheelScrollInput = true; }
+        // 新的释放事件：解除上一释放的帧绑定，让本次点击
+        // 重新锁定到处理它的那一帧（见 ClickFrameCurrent）。
+        // 只认没见过的新事件：动画到期路径可能不泵就出帧，
+        // EventKind 回读旧值，单看 kind==3 会把同一次释放
+        // 每帧都当成新的。
+        if (kind == 3 && window.EventSeq() != clickEvSeq) {
+            clickSeenSeq = 0 - 1;
+            clickEvSeq = window.EventSeq();
+        }
+
+        // 纯动画重绘在无 OS 事件（kind 0）时唤醒：玻璃背后的内容
+        // 未变化，因此其模糊 + 静态壁纸可以直接从缓存恢复。
+        // 任何真实事件（输入/调整大小等）都会将背景
+        // 标记为脏，以便本帧重新计算——除非是纯悬停
+        // 移动（kind 1 且未按住按钮）。移动指针永远不会改变
+        // 玻璃背后的像素：壁纸是静态的，悬停高亮
+        // 绘制在玻璃上方的前景控件上，而非其后。每次光标
+        // 划过控件就重新模糊整个框架，正是导致
+        // 磨砂主题卡顿的原因，因此悬停复用缓存的模糊 +
+        // 壁纸快照。按住拖拽（pressedId >= 0）可能滚动/选择
+        // 玻璃背后的内容，因此仍会使背景变脏。
+        // 按键在此与悬停移动类似：它绘制光标和
+        // 编辑中的文本在前景控件上，永远不会在玻璃后面。
+        bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
+        bool typed = (kind == 4) || (kind == 5) || (kind == 6);
+        backdropDirty = (kind != 0) && !hoverOnly && !typed;
+
+        // 多窗口应用（主窗 + 子窗 + 悬浮窗 + 文件选择器）共享线程事件
+        // 队列：泵出的原生事件可能属于别的窗口。不属于本窗口的事件
+        // 在这里就地交给拥有它的那个顶层窗口，本窗口的交互状态一律
+        // 不动——否则子窗口的关闭（kind==8）会结束主窗口的循环，
+        // 兄弟窗口的点击也会被当成自己的。
+        // 路由职责收口在事件泵里：宿主循环（Form.Run、自带循环的
+        // 应用、外壳）只管调 ProcessEvent，不必知道 hwnd 这回事。
+        // 少了这一步，子窗口只会被 PumpAll 画出来、收不到任何输入
+        // ——点不动、拖不动、关不掉。
+        nint evh = Window.EventHwnd();
+        if (evh != 0 && evh != window.GetHandle()) {
+            ChildWindows.RouteEvent(evh);
+            return true;
+        }
+
+        if (kind == 8) {
+            return this.HandleCloseRequest();
+        }
+
+        // 让渲染表面始终与真实窗口大小一致。最大化/还原
+        // 会在 ShowWindow 内部同步发送 WM_SIZE，且一次性 resize
+        // 事件在我们读取前可能已被清除——因此应以
+        // 持久的窗口尺寸为准，而非一次性的 kind==7 事件。
+        // 这保证 Present() 1:1 拷贝（绝不拉伸/模糊），且布局
+        // 和命中测试与鼠标使用相同的坐标系。
+        this.SyncSurface();
+        this.PerfMark("sh.surface");
+
+        bool vtHandled = false;
+        if (kind == 1 || kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 13) {
+            int ex = window.EventX();
+            int ey = window.EventY();
+            int ek = window.EventKeyCode();
+            int ed = (kind == 13) ? window.EventKeyCode() : 0;
+            vtHandled = this.DispatchVisualTree(kind, ex, ey, ek, ed);
+            if (vtHandled) {
+                needsRedraw = true;
+            }
+        }
+
+        // 失焦（kind 9）需要渲染一帧：打开中的浮层（右键菜单、
+        // 下拉）在渲染阶段才能看到失焦并自行关闭。失焦也意味着
+        // 抬键会落到别的窗口，按住状态就地清掉，免得留下一个
+        // 永远“按着”的指针让之后每次移动都白重绘。
+        if (kind == 9) {
+            pointerDown = false;
+            this.NoteRedrawWhy("blur");
+            needsRedraw = true;
+        }
+
+        // 还原/重露出表面（kind 14，移动端）：系统在最小化期间
+        // 销毁并重建了渲染表面，缓冲里的像素不可信，必须整帧
+        // 重画。这个事件也负责唤醒停在 WaitEvent 上的空闲循环
+        // ——没有它，还原后页面会一直黑到下一次触摸。
+        if (kind == 14) {
+            this.NoteRedrawWhy("exposed");
+            needsRedraw = true;
+            forceFullNext = true;
+        }
+
+        if (kind == 1) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int hitId = hitTester.HitTest(mouseX, mouseY);
+            int oldHover = focus.hoveredId;
+            focus.SetHovered(hitId);
+            if (hitId != oldHover) {
+                if (!needsRedraw) { this.NoteHoverDamage(oldHover, hitId); }
+                else { this.NoteRedrawWhy("hover-late"); }
+                needsRedraw = true;
+            }
+            // 当控件被按住（如滑块/滚动条拖拽）时，
+            // 随指针移动持续重绘，使数值实时跟随光标。
+            if (focus.pressedId >= 0) {
+                this.NoteRedrawWhy("drag");
+                needsRedraw = true;
+            }
+            // 按住按钮：即时模式的拖拽（设计器抓手/框选/缩放手柄）写在
+            // 渲染代码里，按在空白处时没有任何控件被按下，所以必须
+            // 单看按键状态让每次移动都到达一帧，否则拖不动。
+            if (pointerDown) {
+                this.NoteRedrawWhy("pointer-down");
+                needsRedraw = true;
+            }
+            int cursorId = hitId;
+            if (focus.pressedId >= 0) { cursorId = focus.pressedId; }
+            int wtype = hitTester.GetWidgetType(cursorId);
+            if (wtype == 0) {
+                Window.SetCursor(1);
+            } else if (wtype == 1) {
+                Window.SetCursor(2);
+            } else if (wtype == 4) {
+                Window.SetCursor(3);
+            } else if (wtype == 5) {
+                Window.SetCursor(4);
+            } else if (wtype == 6) {
+                Window.SetCursor(6);
+            } else if (wtype == 7) {
+                Window.SetCursor(7);
+            } else if (wtype == 8) {
+                Window.SetCursor(8);
+            } else {
+                Window.SetCursor(0);
+            }
+        }
+
+        if (kind == 2) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int hitId = hitTester.AnchorAt(0, mouseX, mouseY, false);
+            if (window.EventButton() == 1) {
+                // 次要按钮：记录 Ui.RightClicked 的目标，
+                // 但不动主焦点/按下状态，这样右键
+                // 点击永远不会抢走键盘焦点或触发主点击。
+                rightPressTargetId = hitTester.AnchorAt(2, mouseX, mouseY,
+                    menuBlockPrevious);
+                // 主目标是跨帧保留的（上一次左键点在哪个控件上），
+                // 而 Ui.Pressed/Ui.Clicked 只看事件类型不看按钮，
+                // 所以必须在这里清掉：否则右键会把上一次左键点过的
+                // 控件（例如功能区的“发布”）重新触发一次。
+                pressTargetId = -1;
+                hitTester.ClearAnchor(0);
+            } else {
+                focus.SetPressed(hitId);
+                focus.SetFocused(hitId);
+                hitTester.ClearAnchor(2);
+                hitTester.ClearAnchor(3);
+                rightPressTargetId = -1;
+                rightClickTargetId = -1;
+                pressTargetId = hitId;
+                pressOnBlocker = this.PressHitBlocker(hitId, mouseX, mouseY);
+                pointerDown = true;
+                NotePressStart(hitId, mouseX, mouseY);
+            }
+            this.NoteRedrawWhy("NotePressStart");
+            needsRedraw = true;
+        }
+
+        if (kind == 3) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int hitId = hitTester.AnchorAt(1, mouseX, mouseY, false);
+            if (window.EventButton() == 1) {
+                // 次要按钮释放：仅解析右键点击目标，并清掉主点击
+                // 目标，这样这一帧没有任何控件看到 Ui.Clicked。
+                rightClickTargetId = hitTester.AnchorAt(3, mouseX, mouseY,
+                    menuBlockPrevious);
+                clickTargetId = -1;
+                hitTester.ClearAnchor(1);
+            } else {
+                pointerDown = false;
+                // 对照上一帧仍然完整的
+                // 命中区域（含弹层，最上层优先）解析点击目标，
+                // 在 BeginFrame 清除它们之前完成，使本帧恰好一个控件看到 Ui.Clicked。
+                // 触摸拖拽的收尾释放不是点击（EventFlag==1，驱动在
+                // 手势松手时打的标记）：点击目标不发布（保持 -1），
+                // 所有只认 ClickTarget 的表面——Ribbon/Wizard 命令、
+                // Layer 遮罩与关闭钮、表头排序、标题栏按钮、Dock 标签
+                // ——在拖拽松手时统一失活；Ui.Clicked/ClickAvailable
+                // 另有各自的同款防线。释放本身照常完成拖拽收尾
+                // （MouseReleased 语义、ClearPress），滚动条/滑块/
+                // 窗口拖动不受影响。
+                if (window.EventFlag() == 1) {
+                    clickTargetId = -1;
+                    NoteRelease(mouseX, mouseY);
+                    focus.ClearPress();
+                } else if (pressOnBlocker) {
+                    // 按下落在阻挡区/空白（弹层遮罩、模态变暗层或
+                    // 无命中区的表面）：这是弹层「按外部关闭」的那
+                    // 一下按下。弹层会在本帧渲染时读到 kind==2 并把
+                    // 自己关掉，于是释放帧快照里弹层已经不存在——
+                    // 若仍把释放解析成点击目标，该点恰好落到其下的
+                    // 控件上，同一次手势就先关菜单再点穿到后面的内
+                    // 容（下拉/菜单/抽屉/layer 的“点击穿透”）。
+                    // 发布保持 -1、双击基线不更新，释放本身照常完成
+                    // 拖拽收尾；各弹层自带的 ClaimClick 防线（打开
+                    // 那一帧）与本防线（关闭那一手势）互补。
+                    clickTargetId = -1;
+                    NoteRelease(mouseX, mouseY);
+                    focus.ClearPress();
+                } else {
+                    clickTargetId = hitId;
+                    NoteRelease(mouseX, mouseY);
+                    NoteClickTarget(clickTargetId);
+                    focus.ClearPress();
+                }
+            }
+            this.NoteRedrawWhy("click");
+            needsRedraw = true;
+        }
+
+        // Tab / Shift+Tab 在上一帧构建的可聚焦环上移动键盘焦点
+        // （见 FocusManager.RegisterFocusable）。
+        if (kind == 4 && window.EventKeyCode() == 9) {
+            if (!this.HasOverlays() && !blocksInputBelow && tabHoldId < 0) {
+                int dir = 1;
+                if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
+                focus.FocusStep(dir);
+            }
+            this.NoteRedrawWhy("focus-tab");
+            needsRedraw = true;
+        }
+
+        if (kind == 13) {
+            int delta = window.EventKeyCode();
+            int viewH = canvas.Height() - titlebarH;
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            // 滚动把新内容挪到了指针底下：悬停按出帧后的命中区重算
+            // （此刻命中区还是上一帧的，只能在 PresentFrame 之后做）。
+            this.scrollHoverDirty = true;
+            if (this.PressOwnsWheel()) {
+                // 按住拖拽拥有手势：滑块/滚动条/选区正在跟随指针，
+                // 滚轮此刻只更新指针位置（上面已做），不得再滚动
+                // 任何内容——否则触摸拖滑块时页面还在背后滚。
+                // 触摸上未认领拖拽的按压不进这里（手势分扬，
+                // 见 PressOwnsWheel）：滚轮放行为正常滚动。
+                this.NoteRedrawWhy("wheel-pressed");
+                needsRedraw = true;
+            } else if (this.HasOverlays() || blocksInputBelow) {
+                // 弹层和模态遮罩拥有本输入帧。让它们的
+                // 渲染路径消费滚轮，而不是移动
+                // 浮动表面下方的内容。
+                this.NoteRedrawWhy("wheel-blocked");
+                needsRedraw = true;
+            } else if (mouseX >= wheelCapX && mouseX < wheelCapX + wheelCapW
+                       && mouseY >= wheelCapY && mouseY < wheelCapY + wheelCapH) {
+                // 指针位于内部滚动的控件上（如
+                // DataTable 主体）；让它在渲染期间处理滚轮，
+                // 而不是滚动整个页面。变的只有这块视口。
+                this.NoteScrollDamage(wheelCapX, wheelCapY, wheelCapW,
+                                      wheelCapH);
+            } else {
+                // 页面级滚动：仅当宿主用 SetContentHeight 声明过可滚
+                // 页（contentHeight>0）时才有意义。
+                if (contentHeight > 0) {
+                    int oldScroll = scrollY;
+                    scrollY = scrollY - delta * scrollSpeed / 120;
+                    if (scrollY < 0) { scrollY = 0; }
+                    int maxScroll = contentHeight - viewH;
+                    if (maxScroll < 0) { maxScroll = 0; }
+                    if (scrollY > maxScroll) { scrollY = maxScroll; }
+                    if (scrollY != oldScroll) {
+                        this.NotePageScrollDamage();
+                    }
+                }
+                // 没滚页面也必须出一帧：滚轮消费全部发生在渲染期
+                // （CaptureWheel 仲裁），而本分支的触发判据用的是上一
+                // 帧的 cap 矩形——指针刚跨入滚动区时该判据已过期，本
+                // 帧渲染里其实有声明者会消费这一格。若此处不留整帧承
+                // 诺，RunLoop 见 needsRedraw=false 直接跳过渲染，这一
+                // 格滚轮就被静默吞掉：滚轮经过区域边界时偶发丢格，步
+                // 幅忽大忽小，用户感知为“滚动跳跃”。
+                if (!needsRedraw) {
+                    this.NoteRedrawWhy("wheel-unclaimed");
+                    needsRedraw = true;
+                }
+            }
+        }
+
+        // 字符输入（WM_CHAR）/ 按键按下：重绘，使聚焦的文本框
+        // （如 DataTable 过滤搜索框）能在本帧消费按键。
+        // 事件槽仍保留该字符供控件读取。
+        if (kind == 6 || kind == 4 || kind == 5) {
+            this.NoteRedrawWhy("key");
+            needsRedraw = true;
+        }
+
+        // 真实输入（按下/抬起/滚轮/按键/字符，以及指针真的动了的
+        // 移动）记时：环境特效的心跳降速以此为准。
+        if (kind >= 2 && kind <= 6) {
+            lastInputMs = Window.GetTickMs();
+        } else if (kind == 1 && (mouseX != lastInX || mouseY != lastInY)) {
+            lastInputMs = Window.GetTickMs();
+            lastInX = mouseX;
+            lastInY = mouseY;
+        }
+
+        // 窗口重新可见时恢复暂停的环境特效。失焦但仍可见的窗口
+        // 不会被暂停。
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive()
+            && window.IsVisible()) {
+            fxNextMs = Window.GetTickMs();
+        }
+
+        if (!needsRedraw) { this.PumpDueFrame(); }
+        this.PerfMark("sh.eventend");
+        return true;
+    }
+
+    // 此应用窗口的原生句柄（用于多窗口事件路由）。
+    nint WindowHandle() { return window.GetHandle(); }
+
+    // 当事件源于本窗口时，将当前已泵出的原生事件
+    // 应用于本窗口（evHwnd == 本窗口）。这使单个
+    // 进程能从共享的事件泵驱动多个顶层窗口
+    // （如 IDE 加一个悬浮对话框）：循环泵出一次，读取事件
+    // hwnd，再通过 ApplyEvent 把事件提供给每个 App。
+    // 若本窗口收到关闭事件则返回 false。
+    bool ApplyEvent(nint evHwnd) {
+        bool mine = evHwnd == window.GetHandle();
+        int kind = this.NormalizedKind();
+        // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
+        // 滚轮（13）记入 wheelScrollInput：滚轮的消费发生在渲染期
+        // （CaptureWheel 仲裁），本帧收窄为上一帧认领视口的条带而非
+        // 整窗——见该字段与 TakeDueWheelRect 的注释。
+        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) {
+            inputNeedsFrame = true;
+        }
+        if (kind == 13) { wheelScrollInput = true; }
+        // 新的释放事件：解除上一释放的帧绑定（见 ClickFrameCurrent）。
+        // 与 ProcessEvent 相同，只认没见过的新事件——自定义循环
+        // （gallery 等）的动画分支不泵就出帧，EventKind 会回读
+        // 上一次释放的旧值，不设防就把一次点击每帧重放一遍。
+        if (kind == 3 && window.EventSeq() != clickEvSeq) {
+            clickSeenSeq = 0 - 1;
+            clickEvSeq = window.EventSeq();
+        }
+        // 与 ProcessEvent 相同的帧内快速路径：由
+        // 多窗口泵驱动的窗口不能为每次鼠标移动和按键
+        // 都付出完整的重新模糊代价——在 IDE 尺寸的表面上，
+        // 这决定了 50ms 与几毫秒帧的差别。悬停移动和按键都
+        // 绘制在玻璃上方的前景控件上，其后的模糊
+        // 由缓存提供；按住拖拽可能滚动玻璃后的内容，因此
+        // 仍会使背景变脏。
+        bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
+        bool typed = (kind == 4) || (kind == 5) || (kind == 6);
+        backdropDirty = mine && kind != 0 && !hoverOnly && !typed;
+
+        // 与 ProcessEvent 相同的约定：运行控件和后台线程
+        // 调度到 UI 线程的工作。多窗口泵通过这里
+        // 而非 ProcessEvent 驱动其窗口，因此缺了这一步，
+        // 每个投递的处理程序（TreeView.Context、Select 等）都会永远排队，
+        // 依赖它们的功能——尤其是上下文菜单——全部失效。
+        if (mine) { DrainPosts(); }
+
+        if (mine && kind == 8) {
+            return this.HandleCloseRequest();
+        }
+        if (!mine) {
+            // 不是本窗口的事件：所有交互状态
+            // 保持原样。控件不再检测共享的原生事件类型（它们
+            // 经由 App.EventKind，此处会报告"无事件"），因此
+            // 兄弟窗口的点击无法到达本窗口的控件，
+            // 而清除按下/点击/焦点状态反而会破坏本窗口中
+            // 正常活动的拖拽或按住的按钮。
+            return true;
+        }
+
+        int curW = window.ClientWidth();
+        int curH = window.ClientHeight();
+        if (curW > 0 && curH > 0) {
+            if (curW != canvas.Width() || curH != canvas.Height()) {
+                this.SwapCanvas(curW, curH);
+                int viewH = curH - titlebarH;
+                int maxScroll = contentHeight - viewH;
+                if (maxScroll < 0) { maxScroll = 0; }
+                if (scrollY > maxScroll) { scrollY = maxScroll; }
+                if (scrollY < 0) { scrollY = 0; }
+                this.NoteRedrawWhy("ApplyEvent");
+                needsRedraw = true;
+            }
+        }
+
+        // 失焦（kind 9）需要渲染一帧，让打开中的浮层自行关闭
+        // （与 ProcessEvent 相同的约定）。
+        if (kind == 9) {
+            this.NoteRedrawWhy("blur");
+            needsRedraw = true;
+        }
+
+        // 还原/重露出表面（kind 14）：整帧重画（与 ProcessEvent
+        // 相同的约定）。
+        if (kind == 14) {
+            this.NoteRedrawWhy("exposed");
+            needsRedraw = true;
+            forceFullNext = true;
+        }
+
+        if (kind == 1) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int hitId = hitTester.HitTest(mouseX, mouseY);
+            int oldHover = focus.hoveredId;
+            focus.SetHovered(hitId);
+            if (hitId != oldHover) {
+                // 将下一帧裁剪到离开和进入的控件，
+                // 但仅当悬停是唯一的重绘原因时：
+                // 状态变化请求的重绘可能触及任意
+                // 像素，裁剪掉它会丢失该更新。
+                if (!needsRedraw) { this.NoteHoverDamage(oldHover, hitId); }
+                this.NoteRedrawWhy("ApplyEvent");
+                needsRedraw = true;
+            }
+            if (focus.pressedId >= 0) {
+                this.NoteRedrawWhy("press-hold");
+                needsRedraw = true;
+            }
+            // 按住按钮：即时模式拖拽逻辑（画布元素、选框、
+            // 缩放手柄）位于渲染代码中，因此指针按下期间
+            // 的每次移动都必须到达一帧，即使不在任何控件上。
+            if (pointerDown) {
+                this.NoteRedrawWhy("pointer-down");
+                needsRedraw = true;
+            }
+            int cursorId = hitId;
+            if (focus.pressedId >= 0) { cursorId = focus.pressedId; }
+            int wtype = hitTester.GetWidgetType(cursorId);
+            if (wtype == 0) { Window.SetCursor(1); }
+            else if (wtype == 1) { Window.SetCursor(2); }
+            else if (wtype == 4) { Window.SetCursor(3); }
+            else if (wtype == 5) { Window.SetCursor(4); }
+            else if (wtype == 6) { Window.SetCursor(6); }
+            else if (wtype == 7) { Window.SetCursor(7); }
+            else if (wtype == 8) { Window.SetCursor(8); }
+            else { Window.SetCursor(0); }
+        }
+
+        if (kind == 2) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int hitId = hitTester.AnchorAt(0, mouseX, mouseY, false);
+            if (window.EventButton() == 1) {
+                rightPressTargetId = hitTester.AnchorAt(2, mouseX, mouseY,
+                    menuBlockPrevious);
+                pressTargetId = -1;
+                hitTester.ClearAnchor(0);
+            } else {
+                focus.SetPressed(hitId);
+                focus.SetFocused(hitId);
+                // 主键按下作废上一次右键解析出的目标：否则被右键
+                // 点过的控件会一直认为自己是次要目标，之后在别处的
+                // 每一次点击它都会跟着响应（树行被莫名展开/折叠）。
+                hitTester.ClearAnchor(2);
+                hitTester.ClearAnchor(3);
+                rightPressTargetId = -1;
+                rightClickTargetId = -1;
+                pressTargetId = hitId;
+                pressOnBlocker = this.PressHitBlocker(hitId, mouseX, mouseY);
+                pointerDown = true;
+                NotePressStart(hitId, mouseX, mouseY);
+            }
+            this.NoteRedrawWhy("NotePressStart");
+            needsRedraw = true;
+        }
+
+        if (kind == 3) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int hitId = hitTester.AnchorAt(1, mouseX, mouseY, false);
+            if (window.EventButton() == 1) {
+                rightClickTargetId = hitTester.AnchorAt(3, mouseX, mouseY,
+                    menuBlockPrevious);
+                clickTargetId = -1;
+                hitTester.ClearAnchor(1);
+            } else {
+                // 与 ProcessEvent 的点击发布同语义（见彼处注释）：
+                // 触摸拖拽收尾释放不发布点击目标，只完成拖拽收尾。
+                pointerDown = false;
+                if (window.EventFlag() == 1) {
+                    clickTargetId = -1;
+                    NoteRelease(mouseX, mouseY);
+                    focus.ClearPress();
+                } else if (pressOnBlocker) {
+                    // 按下落在阻挡区/空白（弹层遮罩、模态变暗层或
+                    // 无命中区的表面）：这是弹层「按外部关闭」的那
+                    // 一下按下。弹层会在本帧渲染时读到 kind==2 并把
+                    // 自己关掉，于是释放帧快照里弹层已经不存在——
+                    // 若仍把释放解析成点击目标，该点恰好落到其下的
+                    // 控件上，同一次手势就先关菜单再点穿到后面的内
+                    // 容（下拉/菜单/抽屉/layer 的“点击穿透”）。
+                    // 发布保持 -1、双击基线不更新，释放本身照常完成
+                    // 拖拽收尾；各弹层自带的 ClaimClick 防线（打开
+                    // 那一帧）与本防线（关闭那一手势）互补。
+                    clickTargetId = -1;
+                    NoteRelease(mouseX, mouseY);
+                    focus.ClearPress();
+                } else {
+                    clickTargetId = hitId;
+                    NoteRelease(mouseX, mouseY);
+                    NoteClickTarget(clickTargetId);
+                    focus.ClearPress();
+                }
+            }
+            this.NoteRedrawWhy("click");
+            needsRedraw = true;
+        }
+
+        if (kind == 4 && window.EventKeyCode() == 9) {
+            if (!this.HasOverlays() && !blocksInputBelow && tabHoldId < 0) {
+                int dir = 1;
+                if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
+                focus.FocusStep(dir);
+            }
+            this.NoteRedrawWhy("focus-tab");
+            needsRedraw = true;
+        }
+
+        if (kind == 13) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int delta = window.EventKeyCode();
+            int viewH = canvas.Height() - titlebarH;
+            if (focus.pressedId >= 0) {
+                // 与 ProcessEvent 的滚轮分支同语义：按住拖拽拥有
+                // 手势，滚轮只更新指针位置，不滚动任何内容。
+                this.NoteRedrawWhy("wheel-pressed");
+                needsRedraw = true;
+            } else if (this.HasOverlays() || blocksInputBelow) {
+                this.NoteRedrawWhy("wheel-blocked");
+                needsRedraw = true;
+            } else if (mouseX >= wheelCapX && mouseX < wheelCapX + wheelCapW
+                && mouseY >= wheelCapY && mouseY < wheelCapY + wheelCapH) {
+                this.NoteScrollDamage(wheelCapX, wheelCapY, wheelCapW,
+                                      wheelCapH);
+            } else {
+                // 与 ProcessEvent 的滚轮分支同语义（见彼处注释）：
+                // 页面级滚动只在声明过可滚页时尝试；无论滚没滚，
+                // 本帧都必须渲染——渲染期的 CaptureWheel 声明者才是
+                // 滚轮真正的消费者，边界处的过期 cap 判据不能把这一
+                // 格吞掉。
+                if (contentHeight > 0) {
+                    int oldScroll = scrollY;
+                    scrollY = scrollY - delta * scrollSpeed / 120;
+                    if (scrollY < 0) { scrollY = 0; }
+                    int maxScroll = contentHeight - viewH;
+                    if (maxScroll < 0) { maxScroll = 0; }
+                    if (scrollY > maxScroll) { scrollY = maxScroll; }
+                    if (scrollY != oldScroll) {
+                        this.NotePageScrollDamage();
+                    }
+                }
+                if (!needsRedraw) {
+                    this.NoteRedrawWhy("wheel-unclaimed");
+                    needsRedraw = true;
+                }
+            }
+        }
+
+        if (kind == 6 || kind == 4 || kind == 5) {
+            this.NoteRedrawWhy("key");
+            needsRedraw = true;
+        }
+
+        // 真实输入（按下/抬起/滚轮/按键/字符，以及指针真的动了的
+        // 移动）记时：环境特效的心跳降速以此为准。
+        if (kind >= 2 && kind <= 6) {
+            lastInputMs = Window.GetTickMs();
+        } else if (kind == 1 && (mouseX != lastInX || mouseY != lastInY)) {
+            lastInputMs = Window.GetTickMs();
+            lastInX = mouseX;
+            lastInY = mouseY;
+        }
+
+        // 窗口重新可见时恢复暂停的环境特效。失焦但仍可见的窗口
+        // 不会被暂停。
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive()
+            && window.IsVisible()) {
+            fxNextMs = Window.GetTickMs();
+        }
+
+        return true;
+    }
+
+}

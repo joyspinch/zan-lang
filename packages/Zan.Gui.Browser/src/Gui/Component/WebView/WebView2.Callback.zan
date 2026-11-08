@@ -1,0 +1,341 @@
+using System;
+using Gui;
+
+namespace Gui.Component.WebView;
+
+public partial class WebView2 {
+    // ---- 回调（普通函数地址；视图通过句柄查找）----
+
+    // WebView2 只索取它拿到的接口，因此对任何 riid 都返回
+    // `this` 是完成处理器惯常的应答方式。
+    public static int OnQueryInterface(nint self, nint riid, nint ppv) {
+        if (ppv == 0) { return Com.Fail(); }
+        new Span<long>(ppv, 1)[0] = self;
+        return 0;
+    }
+
+    // 回调对象与视图同生命周期，因此引用计数只是名义上的。
+    public static int OnAddRef(nint self) { return 2; }
+    // Release 回调：恒返回 1；回调对象随视图一起释放，不单独回收。
+    public static int OnRelease(nint self) { return 1; }
+
+    // Environment 创建完成回调（COM）：成功则保留 env 引用，
+    // 并立刻发起 Controller 的异步创建（无需消息泵轮询等待）。
+    public static int OnEnvironment(nint self, int hr, nint result) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (Com.Ok(hr) && result != 0) {
+            w.env = Com.Keep(result);
+            w.ctlSink = w.Sink((nint)WebView2.OnController);
+            int chr = Com.Call2(w.env, WebView2.SlotCreateController(), w.host, w.ctlSink);
+            if (!Com.Ok(chr)) {
+                w.initFailed = true;
+                w.readyGate.Signal();
+            }
+        } else {
+            w.initFailed = true;
+            w.readyGate.Signal();
+        }
+        return 0;
+    }
+
+    // Controller 创建完成回调（COM）：成功则保留 ctrl 并取 core，
+    // 自动挂载事件与设置，唤醒等待方，零阻塞完成就绪。
+    public static int OnController(nint self, int hr, nint result) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (Com.Ok(hr) && result != 0) {
+            w.ctrl = Com.Keep(result);
+            w.core = Com.Get(w.ctrl, WebView2.SlotGetCoreWebView2());
+            w.AttachCore();
+            w.ready = true;
+        } else {
+            w.initFailed = true;
+        }
+        w.readyGate.Signal();
+        return 0;
+    }
+
+    // 导航开始回调（COM）：记录目标 URL 到 lastRequest，置 loading
+    // （完成时由 OnNavigationCompleted 解除）。
+    public static int OnNavigationStarting(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (args != 0) {
+            w.lastRequest = Com.GetString(args, WebView2.SlotArgsUri());
+        }
+        w.loading = true;
+        return 0;
+    }
+
+    // 导航完成回调（COM）：记录近似 HTTP 状态（成功 200，失败
+    // 400+WebView2 错误枚举）、URL/标题，navSeq 自增解除 loading。
+    public static int OnNavigationCompleted(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (args != 0) {
+            int ok = Com.GetInt(args, WebView2.SlotIsSuccess());
+            int status = Com.GetInt(args, WebView2.SlotWebErrorStatus());
+            // 以近似 HTTP 的状态报告：加载成功为 200，
+            // 否则为 400 + WebView2 错误枚举，调用方可区分
+            // 各类失败而无需 WebView2 专属词汇。
+            if (ok != 0) { w.lastStatus = 200; }
+            else { w.lastStatus = 400 + status; }
+        }
+        if (sender != 0) {
+            w.url = Com.GetString(sender, WebView2.SlotGetSource());
+            w.title = Com.GetString(sender, WebView2.SlotGetDocumentTitle());
+        }
+        w.loading = false;
+        w.navSeq = w.navSeq + 1;
+        return 0;
+    }
+
+    // SPA 导航无需完整加载即可改变 URL；此回调保持 Url()
+    // 的真实性。
+    public static int OnSourceChanged(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (sender != 0) {
+            w.url = Com.GetString(sender, WebView2.SlotGetSource());
+        }
+        w.navSeq = w.navSeq + 1;
+        return 0;
+    }
+
+    // 页面消息回调（COM）：window.chrome.webview.postMessage 的正文
+    // （shim 已带 "通道名\t正文" 前缀）进有界队列，宿主逐帧取走。
+    public static int OnWebMessageReceived(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (args != 0) {
+            string line = Com.GetString(args, WebView2.SlotTryGetWebMessage());
+            if (line != "") { w.PushMessage(line); }
+        }
+        return 0;
+    }
+
+    // 新窗口请求回调（COM）：与 macOS 后端同策略——接管请求、在本视图
+    // 就地加载目标地址，不弹原生窗口。回调里只记目标，导航由下一帧的
+    // 轮询消费（避免在事件回调内重入导航）。
+    public static int OnNewWindowRequested(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (args != 0) {
+            string uri = Com.GetString(args, WebView2.SlotNewWinUri());
+            Com.Call1(args, WebView2.SlotNewWinHandled(), (nint)1);
+            if (uri != "") { w.pendingWindowNav = uri; }
+        }
+        return 0;
+    }
+
+    // 网络响应到达回调（COM）：当 HTTP 请求完成时由内核直接触发
+    public static int OnWebResourceResponseReceived(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null || args == 0) { return 0; }
+        nint req = Com.Get(args, 3);
+        if (req == 0) { return 0; }
+        string url = Com.GetString(req, 3);
+        Com.Release(req);
+
+        nint resp = Com.Get(args, 4);
+        if (resp == 0) { return 0; }
+        int statusCode = Com.GetInt(resp, 4);
+
+        if (statusCode == 200 && WebView2.IsTargetResponseUrl(url)) {
+            if (WebView2.respContexts == null) {
+                WebView2.respContexts = new List<WvResponseContext>();
+            }
+            int ctxId = WebView2.nextRespId;
+            WebView2.nextRespId = WebView2.nextRespId + 1;
+
+            ComVtbl v = ComVtbl.Create(4);
+            v.Add((nint)WebView2.OnQueryInterface);
+            v.Add((nint)WebView2.OnAddRef);
+            v.Add((nint)WebView2.OnRelease);
+            v.Add((nint)WebView2.OnGetContentCompleted);
+            nint contentSink = v.Build();
+            v.SetState(ctxId);
+
+            WvResponseContext ctx = new WvResponseContext(ctxId, w.handle, url, statusCode, contentSink);
+            WebView2.respContexts.Add(ctx);
+
+            // 槽位 6: GetContent(handler)
+            Com.Call1(resp, 6, contentSink);
+        }
+        Com.Release(resp);
+        return 0;
+    }
+
+    // 读取响应流完成回调（COM）：从 IStream 提取正文并派发给宿主
+    public static int OnGetContentCompleted(nint self, int hr, nint stream) {
+        int ctxId = ComVtbl.State(self);
+        WvResponseContext ctx = null;
+        if (WebView2.respContexts != null) {
+            for (int i = 0; i < WebView2.respContexts.Count; i = i + 1) {
+                if (WebView2.respContexts[i].id == ctxId) {
+                    ctx = WebView2.respContexts[i];
+                    WebView2.respContexts.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        if (ctx == null) { return 0; }
+
+        string body = "";
+        if (Com.Ok(hr) && stream != 0) {
+            nint buf = NativeMemory.Alloc(4096);
+            nint pRead = NativeMemory.Alloc(4);
+            StringBuilder sb = new StringBuilder();
+            while (true) {
+                new Span<int>(pRead, 1)[0] = 0;
+                int rhr = Com.Call3(stream, 3, buf, (nint)4096, pRead);
+                int read = new Span<int>(pRead, 1)[0];
+                if (read <= 0 || !Com.Ok(rhr)) { break; }
+                sb.Append(NativeMemory.GetString(buf, 0, read));
+            }
+            NativeMemory.Free(buf);
+            NativeMemory.Free(pRead);
+            body = sb.ToString();
+        }
+
+        WebView2 w = WebView2.Get(ctx.handle);
+        if (w != null) {
+            w.DispatchResourceResponse(ctx.url, ctx.status, body);
+        }
+        return 0;
+    }
+
+    public void DispatchResourceResponse(string url, int status, string body) {
+        if (this.onResourceResponse != null) {
+            this.onResourceResponse(url, status, body);
+        }
+    }
+
+    public static bool IsTargetResponseUrl(string url) {
+        if (url == null || url == "") { return false; }
+        return url.IndexOf("jdy.resource.shop.info.get") >= 0 ||
+            url.IndexOf("member/checkAccess.json") >= 0 ||
+            url.IndexOf("supplierHome/accountInfo") >= 0 ||
+            url.IndexOf("supplier/queryCurrent") >= 0 ||
+            url.IndexOf("supplier/listAllSub") >= 0 ||
+            url.IndexOf("secondSuppliers") >= 0 ||
+            url.IndexOf("gw/brand/api/v1/account/me") >= 0 ||
+            url.IndexOf("loginmyseller.taobao.com") >= 0;
+    }
+
+    // AddScriptToExecuteOnDocumentCreated 完成回调（COM）：记下脚本 id
+    // （Remove 用），唤醒 gate。id 串归引擎所有、回调返回后失效，只读
+    // 不释放——按 CoTaskMemFree 释放会触发堆损坏（实测）。
+    public static int OnDocScriptAdded(nint self, int hr, nint id) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (Com.Ok(hr) && id != 0) {
+            string sid = Wide.Read(id);
+            if (sid != "") {
+                w.pendingScriptId = sid;
+                w.scriptIds.Add(sid);
+            }
+        }
+        return 0;
+    }
+
+    // Eval 完成回调（COM）：成功则记下 JSON 结果，唤醒 Eval 的 gate。
+    // 结果串归引擎所有（见 OnDocScriptAdded 注），不能释放。
+    public static int OnScriptCompleted(nint self, int hr, nint json) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (Com.Ok(hr)) { w.evalResult = Wide.Read(json); }
+        w.evalGate.Signal();
+        return 0;
+    }
+
+    // GetCookies 完成回调（COM）：序列化 Cookie 列表到 cookieResult，
+    // 唤醒 gate。list 与完成回调的其他参数一样归引擎所有，不得
+    // Release（过释放会让后续 COM 调用在 STA 里挂死，实测）。
+    public static int OnCookiesCompleted(nint self, int hr, nint list) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (Com.Ok(hr) && list != 0) {
+            w.cookieResult = WebView2.Serialize(list);
+            w.cookieDetailsResult = WebView2.SerializeDetails(list);
+            w.cookieListResult = WebView2.ExtractCookies(list);
+        }
+        w.cookieGate.Signal();
+        return 0;
+    }
+
+    // 将 Cookie 列表呈现为 "name=value; name2=value2"。
+    public static string Serialize(nint list) {
+        int n = Com.GetInt(list, WebView2.SlotCookieCount());
+        string outp = "";
+        for (int i = 0; i < n; i = i + 1) {
+            nint cell = NativeMemory.Alloc(8);
+            new Span<long>(cell, 1)[0] = 0;
+            int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
+            nint cookie = new Span<long>(cell, 1)[0];
+            NativeMemory.Free(cell);
+            if (Com.Ok(hr) && cookie != 0) {
+                string name = Com.GetString(cookie, WebView2.SlotCookieName());
+                string val = Com.GetString(cookie, WebView2.SlotCookieValue());
+                if (name != "") {
+                    if (outp != "") { outp = outp + "; "; }
+                    outp = outp + name + "=" + val;
+                }
+                Com.Release(cookie);
+            }
+        }
+        return outp;
+    }
+
+    // 将 Cookie 列表呈现为包含完整信息的制表符分隔行（每行一个：name\tvalue\tdomain\tpath\n）。
+    public static string SerializeDetails(nint list) {
+        int n = Com.GetInt(list, WebView2.SlotCookieCount());
+        string outp = "";
+        for (int i = 0; i < n; i = i + 1) {
+            nint cell = NativeMemory.Alloc(8);
+            new Span<long>(cell, 1)[0] = 0;
+            int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
+            nint cookie = new Span<long>(cell, 1)[0];
+            NativeMemory.Free(cell);
+            if (Com.Ok(hr) && cookie != 0) {
+                string name = Com.GetString(cookie, WebView2.SlotCookieName());
+                string val = Com.GetString(cookie, WebView2.SlotCookieValue());
+                string dom = Com.GetString(cookie, WebView2.SlotCookieDomain());
+                string path = Com.GetString(cookie, WebView2.SlotCookiePath());
+                if (name != "") {
+                    outp = outp + name + "\t" + val + "\t" + dom + "\t" + path + "\n";
+                }
+                Com.Release(cookie);
+            }
+        }
+        return outp;
+    }
+
+    // 直接从 COM 接口解构出强类型 List<WebCookie>，零中间字符串，完全保留所有原生字段。
+    public static List<WebCookie> ExtractCookies(nint list) {
+        List<WebCookie> result = new List<WebCookie>();
+        if (list == 0) { return result; }
+        int n = Com.GetInt(list, WebView2.SlotCookieCount());
+        for (int i = 0; i < n; i = i + 1) {
+            nint cell = NativeMemory.Alloc(8);
+            new Span<long>(cell, 1)[0] = 0;
+            int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
+            nint cookie = new Span<long>(cell, 1)[0];
+            NativeMemory.Free(cell);
+            if (Com.Ok(hr) && cookie != 0) {
+                string name = Com.GetString(cookie, WebView2.SlotCookieName());
+                string val = Com.GetString(cookie, WebView2.SlotCookieValue());
+                string dom = Com.GetString(cookie, WebView2.SlotCookieDomain());
+                string path = Com.GetString(cookie, WebView2.SlotCookiePath());
+                if (name != "") {
+                    result.Add(new WebCookie(name, val, dom, path));
+                }
+                Com.Release(cookie);
+            }
+        }
+        return result;
+    }
+
+
+}

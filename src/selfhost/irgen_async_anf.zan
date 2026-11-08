@@ -1,0 +1,834 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// Irgen part: async/await CPS lowering (heap frames, resume steps) and
+// await A-normal-form normalization.
+partial class Irgen {
+    // ===== async / await CPS lowering =====
+    // Uniform heap frame is a flat i64 array. The header is the C host's
+    // numbering, so the released runtime can drive a self-hosted frame
+    // (zan_co_fhdr: the CO_* bits and the pending step come first):
+    //   0=sched 1=sched_step 2=state 3=done 4=awaiter 5=awaiter_step
+    //   6=result 7=cleanup 8=hcount 9=own_resume
+    // `sched` and `sched_step` belong to the scheduler (the runtime writes
+    // the CO_* bits and the pending step there); the self-host leaves them
+    // zero. Then (for instance methods) the receiver, then params, then
+    // frame-resident locals, then one sub-task slot per await point.
+    // `cleanup` is a void(i8*) fn releasing every owned slot and freeing the
+    // frame; `hcount` counts this frame's armed try handlers. Both drive
+    // @__zan_async_unwind: an exception longjmps straight to its handler,
+    // skipping suspended frames in between, and the unwinder walks the
+    // awaiter chain calling each skipped frame's cleanup, stopping at the
+    // first frame with an armed handler (execution resumes there).
+    //
+    // Ownership across suspension: the frame owns exactly one +1 reference for
+    // every live ARC value it captures. The receiver and ARC params are
+    // retained once in the ramp (so they outlive the caller's frame) and
+    // released once when the coroutine completes. ARC locals get their +1 from
+    // their initializer / assignment (mirroring normal codegen) and are
+    // released by the same completion epilogue. Reload/save across an await
+    // only copies the pointer bits -- it never changes a refcount.
+    string ToI64(string v, string lt) {
+        if (lt == "i64") { return v; }
+        string r = NT();
+        if (lt == "double") { L("  " + r + " = bitcast double " + v + " to i64"); return r; }
+        if (lt == "i1" || lt == "i8" || lt == "i16" || lt == "i32") {
+            L("  " + r + " = zext " + lt + " " + v + " to i64");
+            return r;
+        }
+        if (v == "null" || v == "0") { return "0"; }
+        L("  " + r + " = ptrtoint " + lt + " " + v + " to i64");
+        return r;
+    }
+    string FromI64(string v, string lt) {
+        if (lt == "i64") { return v; }
+        string r = NT();
+        if (lt == "double") { L("  " + r + " = bitcast i64 " + v + " to double"); return r; }
+        if (lt == "i1" || lt == "i8" || lt == "i16" || lt == "i32") {
+            L("  " + r + " = trunc i64 " + v + " to " + lt);
+            return r;
+        }
+        L("  " + r + " = inttoptr i64 " + v + " to " + lt);
+        return r;
+    }
+    string FrameGep(string bp, int idx) {
+        string p = NT();
+        L("  " + p + " = getelementptr i64, i64* " + bp + ", i64 " + idx);
+        return p;
+    }
+    // ---- the coroutine's exception plumbing ----
+    //
+    // The exception-handler stack (@__exc_sp / @__exc_stack / @__exc_bufs)
+    // is global, but a handler may only be longjmp-ed into while the
+    // invocation that armed it is still on the stack: a coroutine that
+    // suspends kills its invocation, and a longjmp into that dead frame
+    // is what made `try { await X(); } catch` die with 0xC0000028.
+    //
+    // The C host solves this the same way (src/compiler/irgen_async.c:
+    // emit_async_eh_prologue / emit_async_eh_unarm): every resume
+    // invocation
+    //   - remembers the handler-stack depth it started at,
+    //   - arms a trampoline handler on top of it. The trampoline is the
+    //     coroutine's last resort: an exception that no try block of the
+    //     coroutine catches leaves the coroutine through the frame (the
+    //     awaiter re-throws it in its own context),
+    //   - restores the depth when it suspends, so the next coroutine
+    //     starts from a clean stack.
+    // A try block inside the coroutine arms its handler above the
+    // trampoline. After a suspension that handler has to be armed again:
+    // the setjmp that armed it ran in an invocation whose stack is dead.
+    void EmitAsyncEhPrologue() {
+        string ed = NT();
+        L("  " + ed + " = alloca i64");
+        string sp0 = NT(); L("  " + sp0 + " = load i64, i64* @__exc_sp");
+        L("  store i64 " + sp0 + ", i64* " + ed);
+        asyncEhDepth = ed;
+        string sp = NT(); L("  " + sp + " = load i64, i64* @__exc_sp");
+        string bufe = NT(); L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
+        string bufp = NT(); L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
+        string slot = NT(); L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
+        L("  store i8* " + bufp + ", i8** " + slot);
+        string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* null)");
+        string c = NT(); L("  " + c + " = icmp ne i32 " + r + ", 0");
+        int ltr = NL();
+        L("  br i1 " + c + ", label %L" + ltr + ", label %co.pre");
+        asyncTrampLbl = ltr;
+        L("co.pre:");
+        term = false; curLbl = "co.pre";
+    }
+    // The invocation suspends: drop every handler it armed (the trampoline
+    // included) so the next coroutine starts from a clean stack. The
+    // handlers are armed again when the coroutine resumes.
+    void EmitAsyncSuspend() {
+        if (!curAsync) { return; }
+        if (asyncEhDepth == "") { return; }
+        string edv = NT(); L("  " + edv + " = load i64, i64* " + asyncEhDepth);
+        L("  store i64 " + edv + ", i64* @__exc_sp");
+    }
+    // Arm the handlers of the try blocks that enclose this point again.
+    // The setjmp that armed them ran in an invocation that has returned
+    // (the coroutine suspended inside the try body), so a longjmp into it
+    // would land in a dead frame.
+    void EmitAsyncRearm() {
+        if (!curAsync) { return; }
+        if (asyncEhDepth == "") { return; }
+        // only the trampoline stays armed; the try handlers are pushed again
+        string edv = NT(); L("  " + edv + " = load i64, i64* " + asyncEhDepth);
+        string ed1 = NT(); L("  " + ed1 + " = add i64 " + edv + ", 1");
+        L("  store i64 " + ed1 + ", i64* @__exc_sp");
+        int i = 0;
+        while (i < asyncTryLbl.Count) {
+            int lbl = asyncTryLbl[i];
+            string sp = NT(); L("  " + sp + " = load i64, i64* @__exc_sp");
+            string bufe = NT(); L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
+            string bufp = NT(); L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
+            string slot = NT(); L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
+            L("  store i8* " + bufp + ", i8** " + slot);
+            string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
+            L("  store i64 " + sp1 + ", i64* @__exc_sp");
+            string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* null)");
+            string c = NT(); L("  " + c + " = icmp ne i32 " + r + ", 0");
+            int lnext = NL();
+            L("  br i1 " + c + ", label %L" + lbl + ", label %L" + lnext);
+            Label(lnext);
+            i = i + 1;
+        }
+    }
+    // An async method called as a statement (fire-and-forget): the call itself
+    // only allocates the frame -- the body runs from $resume. Hand the frame
+    // to the cooperative scheduler, or the body never runs at all (the C host
+    // does the same at the call site, irgen_call.c emit_detach_async_call).
+    // The resume entry is read from the frame's slot 9 (the ramp wrote it
+    // there), so this also works when the callee was reached through a
+    // dispatch instead of a named symbol.
+    void EmitAsyncDetach(ExprVal v) {
+        if (!v.asyncCall) { return; }
+        string subv = v.op;
+        string subh = NT();
+        L("  " + subh + " = bitcast i8* " + subv + " to i64*");
+        string orp = FrameGep(subh, 9);
+        string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
+        string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
+        L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
+    }
+    // The frame pointer an async call returns (the ramp allocated it).
+    ExprVal AsyncFrame(string op, Node ty) {
+        ExprVal v = new ExprVal(op, ty);
+        v.asyncCall = true;
+        return v;
+    }
+    void EmitAsyncSaveSlots() {
+        int i = 0;
+        while (i < asyncSlotReg.Count) {
+            string lt = MapType(asyncSlotTy[i]);
+            string v = NT();
+            L("  " + v + " = load " + lt + ", " + lt + "* " + asyncSlotReg[i]);
+            string vi = ToI64(v, lt);
+            string p = FrameGep("%ff", asyncSlotIdx[i]);
+            L("  store i64 " + vi + ", i64* " + p);
+            i = i + 1;
+        }
+    }
+    // adjust this frame's armed-try-handler count (header slot 8)
+    void EmitAsyncHcAdd(int d) {
+        string p = FrameGep("%ff", 8);
+        string v = NT();
+        L("  " + v + " = load i64, i64* " + p);
+        string v1 = NT();
+        L("  " + v1 + " = add i64 " + v + ", " + d);
+        L("  store i64 " + v1 + ", i64* " + p);
+    }
+    void EmitAsyncReloadSlots() {
+        int i = 0;
+        while (i < asyncSlotReg.Count) {
+            string lt = MapType(asyncSlotTy[i]);
+            string p = FrameGep("%ff", asyncSlotIdx[i]);
+            string vi = NT();
+            L("  " + vi + " = load i64, i64* " + p);
+            string v = FromI64(vi, lt);
+            L("  store " + lt + " " + v + ", " + lt + "* " + asyncSlotReg[i]);
+            i = i + 1;
+        }
+    }
+    bool IsAwaitStmt(Node s) {
+        if (s == null) { return false; }
+        int k = s.kind;
+        if (k == AK.VarDecl()) { return s.b != null && s.b.kind == AK.AwaitExpr(); }
+        if (k == AK.ReturnStmt()) { return s.a != null && s.a.kind == AK.AwaitExpr(); }
+        if (k == AK.ExprStmt()) {
+            Node e = s.a;
+            if (e == null) { return false; }
+            if (e.kind == AK.AwaitExpr()) { return true; }
+            if (e.kind == AK.Assignment() && e.b != null && e.b.kind == AK.AwaitExpr()) { return true; }
+            return false;
+        }
+        return false;
+    }
+
+    // ---- await normalization ----
+    // CPS lowering suspends with `ret void` and re-enters at a resume label, so
+    // SSA values computed earlier in the same expression would not dominate the
+    // resume block. Statements are therefore rewritten so `await` only appears
+    // in the root positions GenAwaitStmt lowers: each embedded await is hoisted
+    // into a fresh temp declared immediately before the statement, preserving
+    // left-to-right await order.
+    public int awHoistN;
+
+    bool ExprHasAwait(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Lambda()) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return true; }
+        if (ExprHasAwait(e.a)) { return true; }
+        if (ExprHasAwait(e.b)) { return true; }
+        if (ExprHasAwait(e.c)) { return true; }
+        if (ExprHasAwait(e.d)) { return true; }
+        int i = 0;
+        while (i < e.kids.Count) {
+            if (ExprHasAwait(e.kids[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Declared type of a name: method params, then VarDecls in the body.
+    Node DeclTypeOf(Node m, string name) {
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param() && p.sval == name) { return p.type; }
+            i = i + 1;
+        }
+        return VarDeclTypeIn(m.d, name);
+    }
+    Node VarDeclTypeIn(Node s, string name) {
+        if (s == null) { return null; }
+        if (s.kind == AK.Lambda()) { return null; }
+        if (s.kind == AK.VarDecl() && s.sval == name) { return s.type; }
+        Node t = VarDeclTypeIn(s.a, name);
+        if (t != null) { return t; }
+        t = VarDeclTypeIn(s.b, name);
+        if (t != null) { return t; }
+        t = VarDeclTypeIn(s.c, name);
+        if (t != null) { return t; }
+        t = VarDeclTypeIn(s.d, name);
+        if (t != null) { return t; }
+        int i = 0;
+        while (i < s.kids.Count) {
+            t = VarDeclTypeIn(s.kids[i], name);
+            if (t != null) { return t; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // Best-effort static result type of an awaited call (the callee's declared
+    // return type). Null when unresolvable; the temp then defaults to int.
+    // The callee is resolved the way the CALL SITE resolves it -- by argument
+    // type -- not "the first method with that name": with two overloads the
+    // by-name pick hands the awaited temp the other overload's return type
+    // (a class pointer where a string belongs -> invalid IR).
+    Node AwaitCallTy(Node cls, Node m, Node callExpr) {
+        if (callExpr == null || callExpr.kind != AK.Call()) { return null; }
+        Node callee = callExpr.a;
+        if (callee == null) { return null; }
+        if (callee.kind == AK.Ident()) {
+            Node mm = AwaitTarget(cls, callee.sval, m, callExpr, false);
+            if (mm != null) { return SubstCallType(mm, CurThisTy(), callExpr); }
+            Node dt = DeclTypeOf(m, callee.sval);
+            if (dt != null) {
+                Node dr = DelegRet(dt);
+                if (dr != null) { return dr; }
+            }
+            return null;
+        }
+        if (callee.kind == AK.MemberAccess()) {
+            Node r = callee.a;
+            if (r == null) { return null; }
+            if (r.kind == AK.ThisExpr()) {
+                Node mt = AwaitTarget(cls, callee.sval, m, callExpr, false);
+                if (mt != null) { return SubstCallType(mt, CurThisTy(), callExpr); }
+                return null;
+            }
+            if (r.kind == AK.Ident()) {
+                Node rc = binder.FindType(r.sval);
+                if (rc != null) {
+                    Node ms = AwaitTarget(rc, callee.sval, m, callExpr, true);
+                    if (ms != null) { return SubstCallType(ms, null, callExpr); }
+                    return null;
+                }
+                Node vt = DeclTypeOf(m, r.sval);
+                if (vt != null) {
+                    Node rc2 = binder.FindType(vt.sval);
+                    if (rc2 != null) {
+                        Node mi = AwaitTarget(rc2, callee.sval, m, callExpr, true);
+                        // the receiver's own instantiation binds the class's
+                        // type parameters (`Pool<string>` -> T = string)
+                        if (mi != null) { return SubstCallType(mi, vt, callExpr); }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // The overload an awaited call resolves to: every candidate named `name`
+    // in `cls` and its bases, filtered by the argument count and scored by
+    // the argument types -- the call site's rule.
+    Node AwaitTarget(Node cls, string name, Node m, Node callExpr, bool wantStatic) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node mm = c.kids[i];
+                if (mm.kind == AK.MethodDecl() && mm.sval == name) { cands.Add(mm); }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        if (cands.Count == 0) { return null; }
+        int argc = callExpr.kids.Count;
+        // explicit type arguments pick the overload: a candidate whose
+        // type-parameter count differs from the call's type-argument count is
+        // not a candidate at all (the C host's rule, checker.c:1681)
+        Node targs = ExplicitTypeArgs(callExpr);
+        int targc = 0;
+        if (targs != null) { targc = targs.kids.Count; }
+        List<Node> fit = new List<Node>();
+        int i = 0;
+        while (i < cands.Count) {
+            if (targc > 0 && TParams(cands[i]).Count != targc) { i = i + 1; continue; }
+            if (AcceptsArity(cands[i], argc)) { fit.Add(cands[i]); }
+            i = i + 1;
+        }
+        if (fit.Count == 0) { return cands[0]; }
+        if (fit.Count == 1) { return fit[0]; }
+        int best = -1000000;
+        Node pick = fit[0];
+        i = 0;
+        while (i < fit.Count) {
+            int s = AwaitScore(fit[i], m, callExpr, argc, wantStatic);
+            if (s > best) { best = s; pick = fit[i]; }
+            i = i + 1;
+        }
+        return pick;
+    }
+
+    // Score an overload candidate for an awaited call (the call site's
+    // scoring, with the argument types taken from the enclosing method's
+    // parameters -- the body's locals do not exist yet at this point).
+    int AwaitScore(Node cand, Node m, Node callExpr, int argc, bool wantStatic) {
+        int score = 0;
+        if (IsStatic(cand) == wantStatic) { score = score + 1; }
+        int a = 0;
+        while (a < argc) {
+            Node pt = ParamTypeNode(cand, a);
+            Node aty = AwaitArgType(m, callExpr.kids[a]);
+            if (aty != null) {
+                string at = TypeTag(aty);
+                if (at != "") {
+                    if (at == TypeTag(pt)) { score = score + 4; }
+                    else if (MentionsTypeParam(pt)) { score = score + 2; }
+                    else { score = score - 1; }
+                }
+            }
+            a = a + 1;
+        }
+        return score;
+    }
+
+    // The type of an argument expression, as far as it is knowable while the
+    // await is normalized: the body's locals do not exist yet, so an
+    // identifier argument is typed from the enclosing method's parameters.
+    Node AwaitArgType(Node m, Node arg) {
+        if (arg == null) { return null; }
+        if (arg.kind == AK.Ident() && m != null) {
+            int i = 0;
+            while (i < m.kids.Count) {
+                Node p = m.kids[i];
+                if (p.kind == AK.Param() && p.sval == arg.sval) { return p.type; }
+                i = i + 1;
+            }
+        }
+        return ArgTypeNode(arg);
+    }
+
+    Node MakeAwaitTemp(Node cls, Node m, Node aw, List<Node> pre) {
+        Node d = new Node(AK.VarDecl());
+        d.sval = "__aw$" + awHoistN;
+        awHoistN = awHoistN + 1;
+        d.type = AwaitCallTy(cls, m, aw.a);
+        d.b = aw;
+        d.line = aw.line; d.col = aw.col;
+        pre.Add(d);
+        Node id = new Node(AK.Ident());
+        id.sval = d.sval;
+        id.line = aw.line; id.col = aw.col;
+        return id;
+    }
+
+    // Rewrite an expression tree: hoist every embedded await into `pre` and
+    // replace it with a reference to the hoisted temp.
+    Node HoistExpr(Node cls, Node m, Node e, List<Node> pre) {
+        if (e == null) { return null; }
+        if (e.kind == AK.Lambda()) { return e; }
+        e.a = HoistExpr(cls, m, e.a, pre);
+        e.b = HoistExpr(cls, m, e.b, pre);
+        e.c = HoistExpr(cls, m, e.c, pre);
+        e.d = HoistExpr(cls, m, e.d, pre);
+        int i = 0;
+        while (i < e.kids.Count) {
+            e.kids[i] = HoistExpr(cls, m, e.kids[i], pre);
+            i = i + 1;
+        }
+        if (e.kind == AK.AwaitExpr()) { return MakeAwaitTemp(cls, m, e, pre); }
+        return e;
+    }
+
+    // Hoist awaits nested inside a root-position await's own arguments.
+    void HoistInsideRootAwait(Node cls, Node m, Node aw, List<Node> pre) {
+        Node call = aw.a;
+        if (call == null) { return; }
+        call.a = HoistExpr(cls, m, call.a, pre);
+        int i = 0;
+        while (i < call.kids.Count) {
+            call.kids[i] = HoistExpr(cls, m, call.kids[i], pre);
+            i = i + 1;
+        }
+    }
+
+    Node WrapBlock(Node s) {
+        if (s == null || s.kind == AK.Block()) { return s; }
+        Node b = new Node(AK.Block());
+        b.Add(s);
+        return b;
+    }
+
+    // Normalize one statement; hoisted temp decls are appended to `pre` and
+    // must be emitted before the statement.
+    void NormStmt(Node cls, Node m, Node s, List<Node> pre) {
+        if (s == null) { return; }
+        int k = s.kind;
+        if (k == AK.Block()) { NormBlock(cls, m, s); return; }
+        if (k == AK.VarDecl()) {
+            if (s.b != null && s.b.kind == AK.AwaitExpr()) { HoistInsideRootAwait(cls, m, s.b, pre); return; }
+            s.b = HoistExpr(cls, m, s.b, pre);
+            return;
+        }
+        if (k == AK.ReturnStmt()) {
+            if (s.a != null && s.a.kind == AK.AwaitExpr()) { HoistInsideRootAwait(cls, m, s.a, pre); return; }
+            s.a = HoistExpr(cls, m, s.a, pre);
+            return;
+        }
+        if (k == AK.ExprStmt()) {
+            Node e = s.a;
+            if (e == null) { return; }
+            if (e.kind == AK.AwaitExpr()) { HoistInsideRootAwait(cls, m, e, pre); return; }
+            if (e.kind == AK.Assignment() && e.b != null && e.b.kind == AK.AwaitExpr()) {
+                HoistInsideRootAwait(cls, m, e.b, pre);
+                return;
+            }
+            s.a = HoistExpr(cls, m, e, pre);
+            return;
+        }
+        if (k == AK.IfStmt()) {
+            s.a = HoistExpr(cls, m, s.a, pre);
+            s.b = WrapBlock(s.b); NormStmt(cls, m, s.b, pre);
+            s.c = WrapBlock(s.c); NormStmt(cls, m, s.c, pre);
+            return;
+        }
+        if (k == AK.WhileStmt()) {
+            if (ExprHasAwait(s.a)) {
+                // while (..await..) body  =>  while (true) { <temps>; if (cond) { body } else { break; } }
+                List<Node> cpre = new List<Node>();
+                Node cond = HoistExpr(cls, m, s.a, cpre);
+                Node brk = new Node(AK.Block());
+                brk.Add(new Node(AK.BreakStmt()));
+                Node ifs = new Node(AK.IfStmt());
+                ifs.a = cond;
+                ifs.b = WrapBlock(s.b);
+                ifs.c = brk;
+                Node nb = new Node(AK.Block());
+                int ci = 0;
+                while (ci < cpre.Count) { nb.Add(cpre[ci]); ci = ci + 1; }
+                nb.Add(ifs);
+                Node tl = new Node(AK.BoolLit());
+                tl.ival = 1;
+                s.a = tl;
+                s.b = nb;
+            }
+            s.b = WrapBlock(s.b); NormStmt(cls, m, s.b, pre);
+            return;
+        }
+        if (k == AK.ForStmt()) {
+            if (s.a != null) { NormStmt(cls, m, s.a, pre); }
+            s.d = WrapBlock(s.d); NormStmt(cls, m, s.d, pre);
+            return;
+        }
+        if (k == AK.ForeachStmt()) {
+            s.b = HoistExpr(cls, m, s.b, pre);
+            s.d = WrapBlock(s.d); NormStmt(cls, m, s.d, pre);
+            return;
+        }
+        if (k == AK.TryStmt()) {
+            s.a = WrapBlock(s.a); NormStmt(cls, m, s.a, pre);
+            if (s.b != null && s.b.a != null) { s.b.a = WrapBlock(s.b.a); NormStmt(cls, m, s.b.a, pre); }
+            s.c = WrapBlock(s.c); NormStmt(cls, m, s.c, pre);
+            return;
+        }
+        if (k == AK.SwitchStmt()) {
+            s.a = HoistExpr(cls, m, s.a, pre);
+            int i = 0;
+            while (i < s.kids.Count) {
+                Node cse = s.kids[i];
+                List<Node> ck = new List<Node>();
+                int j = 0;
+                while (j < cse.kids.Count) {
+                    Node cs = cse.kids[j];
+                    List<Node> cpre = new List<Node>();
+                    NormStmt(cls, m, cs, cpre);
+                    int cj = 0;
+                    while (cj < cpre.Count) { ck.Add(cpre[cj]); cj = cj + 1; }
+                    ck.Add(cs);
+                    j = j + 1;
+                }
+                cse.kids = ck;
+                i = i + 1;
+            }
+            return;
+        }
+    }
+
+    void NormBlock(Node cls, Node m, Node blk) {
+        if (blk == null) { return; }
+        List<Node> outk = new List<Node>();
+        int i = 0;
+        while (i < blk.kids.Count) {
+            Node s = blk.kids[i];
+            List<Node> pre = new List<Node>();
+            NormStmt(cls, m, s, pre);
+            int j = 0;
+            while (j < pre.Count) { outk.Add(pre[j]); j = j + 1; }
+            outk.Add(s);
+            i = i + 1;
+        }
+        blk.kids = outk;
+    }
+
+    void NormalizeAwaits(Node cls, Node m) {
+        if (m.d == null) { return; }
+        if (CountAwaits(m.d) == 0) { return; }
+        awHoistN = 0;
+        Node body = WrapBlock(m.d);
+        m.d = body;
+        NormBlock(cls, m, body);
+    }
+    // Detect `await Socket.<Intrinsic>(...)` -- the IO-reactor primitives the
+    // C host lowers to zan_io_{wait,recv,accept}_co (ReadReady/WriteReady are a
+    // readiness probe yielding no value; RecvOv/AcceptOv post a real op and the
+    // reactor writes the byte count / accepted fd into this frame's result slot
+    // before re-readying it). These suspend the CURRENT frame (no sub-task).
+    bool IsSocketIntrinsic(Node callExpr) {
+        if (callExpr == null || callExpr.kind != AK.Call()) { return false; }
+        Node c = callExpr.a;
+        if (c == null || c.kind != AK.MemberAccess()) { return false; }
+        if (c.a == null || c.a.kind != AK.Ident()) { return false; }
+        string cn = c.a.sval; string mn = c.sval;
+        if (cn == "Task" && mn == "Delay") { return true; }
+        if (cn == "Task" && mn == "Yield") { return true; }
+        if (cn == "Task" && mn == "JoinWait") { return true; }
+        if (cn == "Gate" && mn == "Park") { return true; }
+        if (cn != "Socket") { return false; }
+        if (mn == "ResolveSockAddr" && callExpr.kids.Count == 4) { return true; }
+        if (mn == "ResolveAsync" && callExpr.kids.Count == 1) { return true; }
+        return mn == "ReadReady" || mn == "WriteReady" || mn == "RecvOv" || mn == "AcceptOv" || mn == "RecvToOv";
+    }
+    string ArgI64(Node a) {
+        ExprVal v = GenExpr(a);
+        return ToI64(v.op, MapType(v.ty));
+    }
+    ExprVal EmitSocketIntrinsic(Node callExpr) {
+        string cn = callExpr.a.a.sval;
+        string mn = callExpr.a.sval;
+        int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
+        int st = seq + 1;
+        if (cn == "Task" && mn == "Delay") {
+            string ms = ArgI64(callExpr.kids[0]);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_co_delay(i64 " + ms + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            return new ExprVal("0", MkType("int"));
+        }
+        if (cn == "Task" && mn == "Yield") {
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_co_ready(i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            return new ExprVal("0", MkType("int"));
+        }
+        if (cn == "Task" && mn == "JoinWait") {
+            // Task.JoinWait returns 2 to signal fallback to TaskJoin.WhenAllPoll / WhenAnyPoll
+            if (!term) { L("  br label %resume_" + st); }
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            return new ExprVal("2", MkType("int"));
+        }
+        if (cn == "Gate" && mn == "Park") {
+            // event-driven wait: the frame is re-readied by zan_gate_signal
+            string gh = ArgI64(callExpr.kids[0]);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_gate_park(i64 " + gh + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            return new ExprVal("0", MkType("int"));
+        }
+        if (mn == "ReadReady" || mn == "WriteReady") {
+            string fd = ArgI64(callExpr.kids[0]);
+            string interest = "1"; if (mn == "WriteReady") { interest = "2"; }
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_wait_co(i64 " + fd + ", i32 " + interest + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            return new ExprVal("0", MkType("int"));
+        }
+        if (mn == "RecvOv") {
+            string fd = ArgI64(callExpr.kids[0]);
+            ExprVal bufv = GenExpr(callExpr.kids[1]);
+            string buf = bufv.op;
+            if (MapType(bufv.ty) != "i8*") {
+                string bt = NT();
+                string bty = MapType(bufv.ty);
+                if (bty == "i64" || bty == "i32") {
+                    L("  " + bt + " = inttoptr " + bty + " " + buf + " to i8*");
+                } else {
+                    L("  " + bt + " = bitcast " + bty + " " + buf + " to i8*");
+                }
+                buf = bt;
+            }
+            string lenv = ArgI64(callExpr.kids[2]);
+            string len32 = NT(); L("  " + len32 + " = trunc i64 " + lenv + " to i32");
+            string outn = FrameGep("%ff", 6);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_recv_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            string rs = FrameGep("%ff", 6);
+            string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
+            return new ExprVal(rv, MkType("int"));
+        }
+        if (mn == "RecvToOv") {
+            // recv with a deadline: same shape as RecvOv plus the timeout --
+            // the reactor races the recv against the deadline and delivers
+            // the byte count (0 = peer close) or -1 (timeout) into slot 6.
+            string fd = ArgI64(callExpr.kids[0]);
+            ExprVal bufv = GenExpr(callExpr.kids[1]);
+            string buf = bufv.op;
+            if (MapType(bufv.ty) != "i8*") {
+                string bt = NT();
+                string bty = MapType(bufv.ty);
+                if (bty == "i64" || bty == "i32") {
+                    L("  " + bt + " = inttoptr " + bty + " " + buf + " to i8*");
+                } else {
+                    L("  " + bt + " = bitcast " + bty + " " + buf + " to i8*");
+                }
+                buf = bt;
+            }
+            string lenv = ArgI64(callExpr.kids[2]);
+            string len32 = NT(); L("  " + len32 + " = trunc i64 " + lenv + " to i32");
+            string tmo = ArgI64(callExpr.kids[3]);
+            string outn = FrameGep("%ff", 6);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_recv_to_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i64 " + tmo + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            string rs = FrameGep("%ff", 6);
+            string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
+            return new ExprVal(rv, MkType("int"));
+        }
+        // AcceptOv
+        if (mn == "AcceptOv") {
+            string fd2 = ArgI64(callExpr.kids[0]);
+            string outfd = FrameGep("%ff", 6);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_accept_co(i64 " + fd2 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outfd + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            string rs2 = FrameGep("%ff", 6);
+            string rv2 = NT(); L("  " + rv2 + " = load i64, i64* " + rs2);
+            return new ExprVal(rv2, MkType("int"));
+        }
+        // ResolveSockAddr(name, port, buf, cap): the runtime resolves the host
+        // name in a worker thread and writes the sockaddr length into the
+        // frame's result slot (an i32 there, the host's result slot is the
+        // same field -- irgen_expr_core.c ASYNC_FRAME_RESULT).
+        if (mn == "ResolveSockAddr") {
+            ExprVal namev = GenExpr(callExpr.kids[0]);
+            string nm = namev.op;
+            if (MapType(namev.ty) != "i8*") {
+                string nt = NT();
+                string nty = MapType(namev.ty);
+                if (nty == "i64" || nty == "i32") {
+                    L("  " + nt + " = inttoptr " + nty + " " + nm + " to i8*");
+                } else {
+                    L("  " + nt + " = bitcast " + nty + " " + nm + " to i8*");
+                }
+                nm = nt;
+            }
+            string portv = ArgI64(callExpr.kids[1]);
+            string port32 = NT(); L("  " + port32 + " = trunc i64 " + portv + " to i32");
+            ExprVal bufv = GenExpr(callExpr.kids[2]);
+            string buf = bufv.op;
+            if (MapType(bufv.ty) != "i8*") {
+                string bt = NT();
+                string bty = MapType(bufv.ty);
+                if (bty == "i64" || bty == "i32") {
+                    L("  " + bt + " = inttoptr " + bty + " " + buf + " to i8*");
+                } else {
+                    L("  " + bt + " = bitcast " + bty + " " + buf + " to i8*");
+                }
+                buf = bt;
+            }
+            string capv = ArgI64(callExpr.kids[3]);
+            string cap32 = NT(); L("  " + cap32 + " = trunc i64 " + capv + " to i32");
+            string outp = FrameGep("%ff", 6);
+            string out32 = NT(); L("  " + out32 + " = bitcast i64* " + outp + " to i32*");
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_resolve_sa_co(i8* " + nm + ", i32 " + port32 + ", i8* " + buf + ", i32 " + cap32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            string rs = FrameGep("%ff", 6);
+            string rs32 = NT(); L("  " + rs32 + " = bitcast i64* " + rs + " to i32*");
+            string rv = NT(); L("  " + rv + " = load i32, i32* " + rs32);
+            string rv64 = NT(); L("  " + rv64 + " = zext i32 " + rv + " to i64");
+            return new ExprVal(rv64, MkType("int"));
+        }
+        // ResolveAsync(hostname): the runtime resolves the host name to an
+        // IPv4 address (host byte order) in a worker thread.
+        if (mn == "ResolveAsync") {
+            ExprVal hostv = GenExpr(callExpr.kids[0]);
+            string host = hostv.op;
+            if (MapType(hostv.ty) != "i8*") {
+                string ht = NT();
+                string hty = MapType(hostv.ty);
+                if (hty == "i64" || hty == "i32") {
+                    L("  " + ht + " = inttoptr " + hty + " " + host + " to i8*");
+                } else {
+                    L("  " + ht + " = bitcast " + hty + " " + host + " to i8*");
+                }
+                host = ht;
+            }
+            string outp = FrameGep("%ff", 6);
+            string out32 = NT(); L("  " + out32 + " = bitcast i64* " + outp + " to i32*");
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_resolve_co(i8* " + host + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            string rs = FrameGep("%ff", 6);
+            string rs32 = NT(); L("  " + rs32 + " = bitcast i64* " + rs + " to i32*");
+            string rv = NT(); L("  " + rv + " = load i32, i32* " + rs32);
+            string rv64 = NT(); L("  " + rv64 + " = zext i32 " + rv + " to i64");
+            return new ExprVal(rv64, MkType("int"));
+        }
+        // an unknown intrinsic must not answer with a constant: the program
+        // would silently get wrong answers
+        diags.Error("await Socket." + mn + " is not supported by the self-hosted "
+            + "compiler yet", callExpr.line, callExpr.col);
+        return new ExprVal("0", MkType("int"));
+    }
+    // The result type of an awaited call: `Task<T>` -> T, a bare `Task` ->
+    // void (no result). A declared return type spelled `Task<T>` is the C#
+    // spelling of an async method -- the awaited value is the element.
+}

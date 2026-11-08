@@ -1,0 +1,1142 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+using Gui.Markup;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    // 宿主 IDE 提供从表单配对的 code-behind 文件
+    // 扫描出的可绑定变量名（见检查器的绑定路径选择器）。
+    void SetBindVars(List<string> vars) {
+        bindVars = vars;
+        bindPickOpen = false;
+    }
+
+    // 宿主 IDE 提供从表单配对的 code-behind 文件
+    // 扫描出的候选事件处理器方法清单（用于检查器事件下拉推荐）。
+    void SetCandidateHandlers(List<string> handlers) {
+        if (handlers == null) { candidateHandlers = new List<string>(); }
+        else { candidateHandlers = handlers; }
+    }
+
+    // 宿主 IDE 提供项目保存的用户组件（每个组件一个实体，
+    // 来自 components/*.zcomp）。组件文档可能随时被重新加载
+    // 或保存，引用节点据此作废预览缓存。
+    void SetUserComponents(List<UserComponent> comps) {
+        userComps = comps;
+        UserComponentRegistry.SetAll(comps);
+        pvCompGen = pvCompGen + 1;
+        this.MarkDocDirty();
+    }
+
+    // 组件名对应的 .zcomp 文档原文；不存在返回 ""。
+    string UserCompJson(string name) {
+        for (int i = 0; i < userComps.Count; i = i + 1) {
+            if (userComps[i].name == name) { return userComps[i].json; }
+        }
+        return "";
+    }
+
+    // 用户请求把当前设计保存为可复用组件后，恰好返回一次 true；
+    // 宿主 IDE 持久化它并重新加载列表。
+    bool ConsumeSaveComponent() {
+        if (saveCompRequested) { saveCompRequested = false; return true; }
+        return false;
+    }
+
+    // 表单名称输入框的当前文本（宿主保存组件时用作文件名）。
+    string FormNameText() {
+        return formNameInput.GetText();
+    }
+
+    // 双击引用节点后恰好返回一次组件名（"" 表示无请求）；宿主
+    // 打开 components/<名>.zcomp 文档本身供编辑。
+    string ConsumeOpenComponent() {
+        if (openCompRequested) {
+            openCompRequested = false;
+            return openCompName;
+        }
+        return "";
+    }
+
+    // 双击普通字段/控件后恰好返回一次控件名称（"" 表示无请求）；宿主
+    // 自动切换到 code-behind（.zan）源码并定位/生成事件桩。
+    string ConsumeOpenCodeBehind() {
+        if (openCodeBehindRequested) {
+            openCodeBehindRequested = false;
+            return openCodeBehindField;
+        }
+        return "";
+    }
+
+    // 消费控件重命名事件：返回 "旧名:新名"，供宿主 IDE 同步更新 code-behind 源码。
+    string ConsumeRenamedField() {
+        if (renamedOldField != "" && renamedNewField != "") {
+            string r = renamedOldField + ":" + renamedNewField;
+            renamedOldField = "";
+            renamedNewField = "";
+            return r;
+        }
+        return "";
+    }
+
+    // 在表单上放置一个已保存用户组件的**引用**节点：设计文档里
+    // 只写 {"kind":名,"ref":名,...}——组件设计的每次进化自动
+    // 跟随所有实例（WinForms UserControl 语义），要改内部就打开
+    // 组件本身，检查器提供「解包为内联副本」作逃生门。默认矩形
+    // 取组件文档自己的画布尺寸（winW/winH），缺省 240x一行高。
+    // 画布预览按组件文档用 FormBuilder 建真控件渲染。
+    void AddUserComponent(int k) {
+        if (k < 0 || k >= userComps.Count) { return; }
+        this.DropDeadRefs();
+        FormField f = FormField.NewCustom(userComps[k].name, seq);
+        seq = seq + 1;
+        f.compRef = true;
+        JsonValue doc = JsonValue.ParseLenient(userComps[k].json);
+        int dw = 240;
+        int dh = 0;
+        if (doc != null) {
+            dw = doc.Int("winW", 240);
+            dh = doc.Int("winH", 0);
+        }
+        if (dw < 60) { dw = 60; } else if (dw > 2000) { dw = 2000; }
+        if (dh <= 0) { dh = f.RowUnits(); }
+        if (dh < 28) { dh = 28; } else if (dh > 2000) { dh = 2000; }
+        f.fw = dw;
+        f.fh = dh;
+        if (activeContainer != null) {
+            f.childTab = 0;
+            if (activeContainer.kind == "Tabs") {
+                f.childTab = Designer.TabActivePage(activeContainer);
+            }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        msg = Designer.T("added ", "已添加 ") + userComps[k].name
+            + Designer.T(" (reference)", "（引用）");
+    }
+
+    // 「解包为内联副本」：把引用节点换成组件文档的字段树
+    // （单容器文档直接换成那个容器，多字段的包一层同名
+    // Card），首节点继承引用的矩形/停靠/跨度。解包后的副本
+    // 与组件脱钩，之后组件进化不再跟随。
+    void UnpackUserComponent(FormField f) {
+        string doc = this.UserCompJson(f.customKind);
+        if (doc == "") {
+            msg = Designer.T("component not found: ", "找不到组件：")
+                + f.customKind;
+            return;
+        }
+        List<FormField> parsed = this.ParseComponentFields(doc);
+        if (parsed.Count == 0) {
+            msg = Designer.T("component has no fields: ", "组件没有字段：")
+                + f.customKind;
+            return;
+        }
+        this.PushUndo();
+        List<FormField> host = fields;
+        FormField owner = this.ParentContainerOf(f);
+        if (owner != null) { host = owner.kids; }
+        int idx = IndexIn(host, f);
+        if (idx < 0) { return; }
+        FormField head = null;
+        if (parsed.Count == 1 && parsed[0].IsContainer()) {
+            head = parsed[0];
+        } else {
+            head = FormField.New(18, seq);
+            seq = seq + 1;
+            head.label = f.customKind;
+            head.kids = parsed;
+            for (int ci = 0; ci < parsed.Count; ci = ci + 1) { parsed[ci].childTab = 0; }
+        }
+        head.fname = f.fname;
+        head.name = f.name;
+        head.fx = f.fx;
+        head.fy = f.fy;
+        head.fw = f.fw;
+        head.fh = f.fh;
+        head.dockSide = f.dockSide;
+        head.span = f.span;
+        head.childTab = f.childTab;
+        host[idx] = head;
+        sel = head;
+        msg = Designer.T("unpacked ", "已解包 ") + f.customKind;
+    }
+
+    // 组件文档根上声明的对外属性（"props":[{key,label,kind,
+    // target,prop,def}]，v1 只消费 text 型），解析进强类型实体缓存，
+    // 缓存键为 组件名|代次。组件没声明或文档缺失时表为空。
+    void EnsureCompPropDecls(string compName) {
+        string id = compName + "|" + Convert.ToString(pvCompGen);
+        if (compPropFor == id) { return; }
+        compPropFor = id;
+        compPropDecls.Clear();
+        string doc = this.UserCompJson(compName);
+        if (doc == "") { return; }
+        JsonValue root = JsonValue.ParseLenient(doc);
+        if (root == null) { return; }
+        JsonValue decls = root.Get("props");
+        if (decls == null || !decls.IsArray()) { return; }
+        for (int i = 0; i < decls.Count(); i = i + 1) {
+            JsonValue dd = decls.At(i);
+            if (dd == null || !dd.IsObject()) { continue; }
+            string key = dd.Str("key", "");
+            string target = dd.Str("target", "");
+            if (key == "" || target == "") { continue; }
+            compPropDecls.Add(new CompPropDecl(key, dd.Str("label", key), dd.Str("def", "")));
+        }
+    }
+
+    // 引用节点实例值读/写：存 f.extra 的 "props" 直通对象
+    // （"props" 不在 IsModeledKey 里，SaveJson/LoadJson 原样
+    // 透传，挂载展开时落给目标内部控件）。
+    static string CompPropValue(FormField f, string key, string def) {
+        if (f.extra == null) { return def; }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) { return def; }
+        return props.Str(key, def);
+    }
+
+    static void SetCompPropValue(FormField f, string key, string val) {
+        if (f.extra == null) { f.extra = JsonValue.NewObject(); }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) {
+            props = JsonValue.NewObject();
+            f.extra.Put("props", props);
+        }
+        props.Set(key, JsonValue.NewStr(val));
+    }
+
+    // 告警横幅语义词 → Layer 通知类型（2 info / 3 success /
+    // 4 warning / 5 error）；数字串与角色词都认，其余落 info。
+    static int AlertLevelOf(string spec) {
+        if (spec == "success" || spec == "3") { return 3; }
+        if (spec == "warning" || spec == "4") { return 4; }
+        if (spec == "error" || spec == "5") { return 5; }
+        return 2;
+    }
+
+    // 把 props 直通表里的 `from` 键改名为 `to`（值随迁）。三种情况
+    // 拒绝并原样返回 false：`to` 已存在（先 Drop 再 Set 会把已有
+    // 键的值静默覆盖掉——改名是编辑意图，吞别人的值属于数据丢
+    // 失，调用方可用 HasCompProp 预检给出提示）、`from` 不存在、
+    // from == to。返回是否真的发生了改名。
+    static bool RenameCompProp(FormField f, string from, string to) {
+        if (from == to) { return false; }
+        if (HasCompProp(f, to)) { return false; }
+        if (!HasCompProp(f, from)) { return false; }
+        string val = Designer.CompPropValue(f, from, "");
+        Designer.DropCompProp(f, from);
+        Designer.SetCompPropValue(f, to, val);
+        return true;
+    }
+
+    // 从 props 直通表里删掉 `key`（不存在则无操作）。
+    static void DropCompProp(FormField f, string key) {
+        if (f.extra == null) { return; }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) { return; }
+        props.Remove(key);
+    }
+
+    // 识别属性是否为布尔型（以 Switch 开关进行展示与编辑）。
+    static bool IsBoolProp(string key, string label, string val) {
+        if (label.IndexOf("(true/false)") >= 0 || label.IndexOf("(false/true)") >= 0) {
+            return true;
+        }
+        if (val == "true" || val == "false") {
+            return true;
+        }
+        if (key == "round" || key == "loading" || key == "striped" || key == "rowNumbers"
+            || key == "selectable" || key == "summary" || key == "filterRow" || key == "statusBar"
+            || key == "groupPanel" || key == "allowAddRow" || key == "autoplay" || key == "showIndicator"
+            || key == "range" || key == "vertical" || key == "reverse" || key == "stepMark"
+            || key == "tooltip" || key == "showTooltip" || key == "keyboard" || key == "allowHalf"
+            || key == "clearable" || key == "filterable" || key == "indeterminate" || key == "bordered"
+            || key == "closable" || key == "checkable" || key == "clickable" || key == "showTotal"
+            || key == "jumper" || key == "blink" || key == "grid" || key == "sign"
+            || key == "dot" || key == "autoFill" || key == "oneWay" || key == "searchable"
+            || key == "checks" || key == "multi" || key == "reorder" || key == "expandable"
+            || key == "showAdd" || key == "mask" || key == "readonly") {
+            return true;
+        }
+        return false;
+    }
+
+    // 清理属性标签中用于提示类型的冗余后缀（例如 "(true/false)"），
+    // 使设计器属性面板的 Label 干净利落，不被无谓文字挤占。
+    static string CleanPropLabel(string rawLabel) {
+        string clean = rawLabel;
+        int tfIdx = clean.IndexOf("(true/false)");
+        if (tfIdx >= 0) {
+            clean = clean.Substring(0, tfIdx);
+        } else {
+            int ftIdx = clean.IndexOf("(false/true)");
+            if (ftIdx >= 0) {
+                clean = clean.Substring(0, ftIdx);
+            }
+        }
+        int p1 = clean.IndexOf("(");
+        int p2 = clean.IndexOf(")");
+        if (p1 >= 0 && p2 > p1) {
+            string inner = clean.Substring(p1 + 1, p2 - p1 - 1);
+            if (inner.Contains("/")) {
+                clean = clean.Substring(0, p1);
+            }
+        }
+        return StyleSheet.Trim(clean);
+    }
+
+    // 从属性提示标签提取枚举选项（如 "Type (primary/info/success)" -> ["", "primary", "info", "success"]）。
+    // 第一个为 ""（默认/清空），方便重置为缺省样式。
+    static List<string> ExtractPropOptions(string rawLabel) {
+        List<string> res = new List<string>();
+        if (rawLabel == null) { return res; }
+        if (rawLabel.Contains("(true/false)") || rawLabel.Contains("(false/true)")) {
+            return res;
+        }
+        int p1 = rawLabel.IndexOf("(");
+        int p2 = rawLabel.IndexOf(")");
+        if (p1 < 0 || p2 <= p1) { return res; }
+        string inner = rawLabel.Substring(p1 + 1, p2 - p1 - 1);
+        if (!inner.Contains("/")) { return res; }
+        List<string> parts = inner.Split("/");
+        if (parts.Count < 2) { return res; }
+        res.Add(""); // 缺省项
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string itm = StyleSheet.Trim(parts[i]);
+            // 剔除包含中文或等号说明（例如 "0=cold"）的非纯净枚举
+            if (itm != "" && !itm.Contains("=") && !itm.Contains(" ") && !res.Contains(itm)) {
+                res.Add(itm);
+            }
+        }
+        if (res.Count <= 2) { res.Clear(); } // 至少有2个及以上有效备选项
+        return res;
+    }
+
+    // 清洗字符生成合法的标识符片段（严格限制为 ASCII 字母、数字和下划线，避免中文或特殊字符导致编译器报语法错误）
+    static string CleanIdentifier(string s) {
+        if (s == null) { return ""; }
+        // 针对 GUI 常见高频中文动作做自然英文映射
+        string src = s;
+        if (src.Contains("粘贴")) { src = src.Replace("粘贴", "Paste"); }
+        if (src.Contains("复制")) { src = src.Replace("复制", "Copy"); }
+        if (src.Contains("剪切")) { src = src.Replace("剪切", "Cut"); }
+        if (src.Contains("撤销")) { src = src.Replace("撤销", "Undo"); }
+        if (src.Contains("重做")) { src = src.Replace("重做", "Redo"); }
+        if (src.Contains("全选")) { src = src.Replace("全选", "SelectAll"); }
+        if (src.Contains("保存")) { src = src.Replace("保存", "Save"); }
+        if (src.Contains("新建")) { src = src.Replace("新建", "New"); }
+        if (src.Contains("打开")) { src = src.Replace("打开", "Open"); }
+        if (src.Contains("关闭")) { src = src.Replace("关闭", "Close"); }
+        if (src.Contains("删除")) { src = src.Replace("删除", "Delete"); }
+        if (src.Contains("查找")) { src = src.Replace("查找", "Find"); }
+        if (src.Contains("替换")) { src = src.Replace("替换", "Replace"); }
+        if (src.Contains("刷新")) { src = src.Replace("刷新", "Refresh"); }
+        if (src.Contains("设置")) { src = src.Replace("设置", "Settings"); }
+        if (src.Contains("帮助")) { src = src.Replace("帮助", "Help"); }
+        if (src.Contains("确定")) { src = src.Replace("确定", "Ok"); }
+        if (src.Contains("取消")) { src = src.Replace("取消", "Cancel"); }
+        if (src.Contains("退出")) { src = src.Replace("退出", "Exit"); }
+        if (src.Contains("运行")) { src = src.Replace("运行", "Run"); }
+        if (src.Contains("调试")) { src = src.Replace("调试", "Debug"); }
+        if (src.Contains("停止")) { src = src.Replace("停止", "Stop"); }
+        if (src.Contains("重置")) { src = src.Replace("重置", "Reset"); }
+        if (src.Contains("清除")) { src = src.Replace("清除", "Clear"); }
+        if (src.Contains("清空")) { src = src.Replace("清空", "Clear"); }
+        if (src.Contains("导出")) { src = src.Replace("导出", "Export"); }
+        if (src.Contains("导入")) { src = src.Replace("导入", "Import"); }
+        if (src.Contains("添加")) { src = src.Replace("添加", "Add"); }
+        if (src.Contains("移除")) { src = src.Replace("移除", "Remove"); }
+        if (src.Contains("编辑")) { src = src.Replace("编辑", "Edit"); }
+        if (src.Contains("查看")) { src = src.Replace("查看", "View"); }
+        if (src.Contains("关于")) { src = src.Replace("关于", "About"); }
+        if (src.Contains("搜索")) { src = src.Replace("搜索", "Search"); }
+        if (src.Contains("下载")) { src = src.Replace("下载", "Download"); }
+        if (src.Contains("上传")) { src = src.Replace("上传", "Upload"); }
+        if (src.Contains("提交")) { src = src.Replace("提交", "Submit"); }
+        if (src.Contains("确认")) { src = src.Replace("确认", "Confirm"); }
+        if (src.Contains("应用")) { src = src.Replace("应用", "Apply"); }
+        if (src.Contains("开始")) { src = src.Replace("开始", "Start"); }
+        if (src.Contains("暂停")) { src = src.Replace("暂停", "Pause"); }
+        if (src.Contains("继续")) { src = src.Replace("继续", "Resume"); }
+        if (src.Contains("重试")) { src = src.Replace("重试", "Retry"); }
+
+        string res = "";
+        for (int i = 0; i < src.Length; i = i + 1) {
+            int ch = src[i];
+            // 只允许 ASCII 字母 A-Z, a-z, 数字 0-9, 下划线 _
+            if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || (ch >= 48 && ch <= 57) || ch == 95) {
+                res = res + src.Substring(i, 1);
+            }
+        }
+        if (res.Length == 0) { res = "Item"; }
+        int first = res[0];
+        if (first >= 48 && first <= 57) {
+            res = "_" + res;
+        }
+        return res;
+    }
+
+    // 判定是否为资源/图片路径属性（提供文件浏览拾取器）
+    static bool IsAssetProp(string key) {
+        if (key == null) { return false; }
+        return key == "src" || key == "image" || key == "avatar" || key == "asset"
+            || key == "filePath" || key.EndsWith("Path") || key.EndsWith("Image");
+    }
+
+    // 判定是否为颜色属性（给真取色器）
+    static bool IsColorProp(string key) {
+        if (key == null) { return false; }
+        return key == "color" || key == "textColor" || key == "bgColor"
+            || key == "backgroundColor" || key == "borderColor"
+            || key == "fill" || key == "stroke"
+            || key == "tint" || key == "accent"
+            || key == "dark" || key == "light"
+            || key.EndsWith("Color");
+    }
+
+    // 颜色属性取值文本 → 颜色。解析不出（非字面色，如 var(--x)）
+    // 返回未设置色（None）。十进制整数字面按历史形态（打包色）读。
+    static Color ParseColorValue(string text) {
+        if (text == null) { return Color.None(); }
+        string t = text.Trim();
+        if (t == "") { return Color.None(); }
+        if (PropSpec.IsIntText(t)) {
+            int p = Convert.ToInt32(t);
+            return Color.FromRGBA((p >> 16) & 255, (p >> 8) & 255, p & 255,
+                                  (p >> 24) & 255);
+        }
+        return Color.Parse(t);
+    }
+
+    // 打包色 → 颜色属性取值文本（CSS 规范形：#rrggbb，半透明时
+    // #aarrggbb）。与 STYLE 通道、控件 PropSpec 认的形态一致。
+    static string ColorValueText(int packed) {
+        int a = (packed >> 24) & 255;
+        int r = (packed >> 16) & 255;
+        int g = (packed >> 8) & 255;
+        int b = packed & 255;
+        Color c = Color.FromRGBA(r, g, b, a);
+        return c.ToCss();
+    }
+
+    // 内置组件的直通属性行：kind → "键|双语标签" 列表。值存
+    // f.extra["props"]——与引用节点实例值同一张直通表，挂载时
+    // 泛化发射 SetProp、画布预览经 ApplyFieldProps 落到真控件。
+    // 只列设计期有意义的形态/展示属性；运行态开关（如 Countdown
+    // 的 active）不进来。键全部取自各控件 Props()/SetExtra 的
+    // 已支持集，新增前先核对控件源码。没有行的 kind 返回 null。
+    static List<string> BuiltinPropRows(string kind) {
+        if (kind == "Button") {
+            List<string> r = new List<string>();
+            r.Add("icon|" + Designer.T("Icon", "图标"));
+            r.Add("type|" + Designer.T("Type (primary/info/success/warning/error)", "类型 (primary/info/success/warning/error)"));
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)", "尺寸 (tiny/small/medium/large)"));
+            r.Add("round|" + Designer.T("Round (true/false)", "圆角 (true/false)"));
+            r.Add("circle|" + Designer.T("Circle (true/false)", "圆形 (true/false)"));
+            r.Add("loading|" + Designer.T("Loading (true/false)", "加载中 (true/false)"));
+            r.Add("disabled|" + Designer.T("Disabled (true/false)", "禁用 (true/false)"));
+            r.Add("tertiary|" + Designer.T("Tertiary (true/false)", "次要平坦 (true/false)"));
+            r.Add("quaternary|" + Designer.T("Quaternary (true/false)", "卡片平坦 (true/false)"));
+            r.Add("strong|" + Designer.T("Strong (true/false)", "粗体 (true/false)"));
+            r.Add("iconPlacement|" + Designer.T("Icon placement (left/right)", "图标位置 (left/right)"));
+            r.Add("tip|" + Designer.T("Tooltip", "悬停提示"));
+            r.Add("tipSide|" + Designer.T("Tip side (bottom/top/left/right)", "提示方位 (bottom/top/left/right)"));
+            // 颜色键：底色与文字色（0 = 由 class 决定）。有真取色器
+            // 之后不再排除——当初排除的理由就是"没有颜色编辑器"。
+            r.Add("color|" + Designer.T("Background color", "背景色"));
+            r.Add("textColor|" + Designer.T("Text color", "文字色"));
+            return r;
+        }
+        if (kind == "Input") {
+            List<string> r = new List<string>();
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)", "尺寸 (tiny/small/medium/large)"));
+            r.Add("icon|" + Designer.T("Leading icon", "前缀图标"));
+            r.Add("prefix|" + Designer.T("Prefix text", "前缀文本"));
+            r.Add("suffix|" + Designer.T("Suffix text", "后缀文本"));
+            r.Add("clearable|" + Designer.T("Clearable (true/false)", "可清空 (true/false)"));
+            r.Add("password|" + Designer.T("Password (true/false)", "密码框 (true/false)"));
+            r.Add("round|" + Designer.T("Round (true/false)", "圆角 (true/false)"));
+            r.Add("loading|" + Designer.T("Loading (true/false)", "加载中 (true/false)"));
+            r.Add("status|" + Designer.T("Status (success/warning/error)", "状态 (success/warning/error)"));
+            r.Add("maxlen|" + Designer.T("Max length", "最大字数"));
+            r.Add("showCount|" + Designer.T("Show count (true/false)", "字数统计 (true/false)"));
+            r.Add("autoselect|" + Designer.T("Autoselect on focus (true/false)", "获焦全选 (true/false)"));
+            r.Add("disabled|" + Designer.T("Disabled (true/false)", "禁用 (true/false)"));
+            return r;
+        }
+        if (kind == "InputNumber") {
+            List<string> r = new List<string>();
+            r.Add("min|" + Designer.T("Min value", "最小值"));
+            r.Add("max|" + Designer.T("Max value", "最大值"));
+            r.Add("step|" + Designer.T("Step", "步长"));
+            r.Add("precision|" + Designer.T("Precision (decimals)", "小数位数"));
+            r.Add("group|" + Designer.T("Group digits (true/false)", "千分位 (true/false)"));
+            r.Add("placement|" + Designer.T("Button placement (both/right)", "按钮位置 (both/right)"));
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)", "尺寸 (tiny/small/medium/large)"));
+            r.Add("prefix|" + Designer.T("Prefix text", "前缀文本"));
+            r.Add("suffix|" + Designer.T("Suffix text", "后缀文本"));
+            r.Add("disabled|" + Designer.T("Disabled (true/false)", "禁用 (true/false)"));
+            return r;
+        }
+        if (kind == "TextArea") {
+            List<string> r = new List<string>();
+            r.Add("autoHeight|" + Designer.T("Auto height (true/false)", "自适应高度 (true/false)"));
+            r.Add("readOnly|" + Designer.T("Read only (true/false)", "只读 (true/false)"));
+            r.Add("status|" + Designer.T("Status (success/warning/error)", "状态 (success/warning/error)"));
+            r.Add("maxlen|" + Designer.T("Max length", "最大字数"));
+            r.Add("showCount|" + Designer.T("Show count (true/false)", "字数统计 (true/false)"));
+            r.Add("round|" + Designer.T("Round (true/false)", "圆角 (true/false)"));
+            r.Add("disabled|" + Designer.T("Disabled (true/false)", "禁用 (true/false)"));
+            return r;
+        }
+        if (kind == "ToolStrip") {
+            List<string> r = new List<string>();
+            r.Add("options|" + Designer.T("Items (e.g. Paste:paste|-|Copy:copy)", "工具项 (例如: 粘贴:paste|-|复制:copy)"));
+            r.Add("iconOnly|" + Designer.T("Icon only (true/false)", "仅图标 (true/false)"));
+            r.Add("tint|" + Designer.T("Tint color", "背景着色"));
+            return r;
+        }
+        if (kind == "StatusBar") {
+            List<string> r = new List<string>();
+            r.Add("options|" + Designer.T("Items spec (e.g. Ready|>UTF-8)", "项规格 (例如: 就绪|>UTF-8)"));
+            r.Add("tint|" + Designer.T("Tint color", "背景着色"));
+            r.Add("size|" + Designer.T("Size (small/medium)", "尺寸 (small/medium)"));
+            return r;
+        }
+        if (kind == "DatePicker") {
+            List<string> r = new List<string>();
+            r.Add("type|" + Designer.T("Type (date/datetime/daterange/datetimerange/month/year)", "类型 (date/datetime/daterange/datetimerange/month/year)"));
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)", "尺寸 (tiny/small/medium/large)"));
+            return r;
+        }
+        if (kind == "ColorPicker") {
+            List<string> r = new List<string>();
+            r.Add("mode|" + Designer.T("Mode (rgb/hex/hsl/hsb)", "模式 (rgb/hex/hsl/hsb)"));
+            r.Add("showAlpha|" + Designer.T("Show alpha (true/false)", "透明度滑块 (true/false)"));
+            return r;
+        }
+        if (kind == "Dropdown") {
+            List<string> r = new List<string>();
+            r.Add("hint|" + Designer.T("Hint / placeholder", "提示文字"));
+            return r;
+        }
+        if (kind == "Upload") {
+            List<string> r = new List<string>();
+            r.Add("action|" + Designer.T("Action URL", "上传地址"));
+            r.Add("fieldName|" + Designer.T("Field name", "文件字段名"));
+            r.Add("accept|" + Designer.T("Accept (e.g. png,jpg)", "接受类型 (如 png,jpg)"));
+            r.Add("max|" + Designer.T("Max files", "文件上限"));
+            r.Add("autoUpload|" + Designer.T("Auto upload (true/false)", "自动上传 (true/false)"));
+            r.Add("multiple|" + Designer.T("Multiple (true/false)", "多选文件 (true/false)"));
+            r.Add("triggerText|" + Designer.T("Trigger button text", "触发按钮文字"));
+            r.Add("dragger|" + Designer.T("Drag upload zone (true/false)", "拖拽上传区 (true/false)"));
+            r.Add("dragText|" + Designer.T("Drag hint text", "拖拽提示文字"));
+            r.Add("showRemoveButton|" + Designer.T("Show remove button (true/false)", "显示删除按钮 (true/false)"));
+            r.Add("showDownloadButton|" + Designer.T("Show download button (true/false)", "显示下载按钮 (true/false)"));
+            return r;
+        }
+        if (kind == "Label") {
+            List<string> r = new List<string>();
+            r.Add("wrap|" + Designer.T("Word wrap (true/false)", "自动换行 (true/false)"));
+            return r;
+        }
+        if (kind == "Switch") {
+            List<string> r = new List<string>();
+            r.Add("value|" + Designer.T("On / checked (true/false)", "开启状态 (true/false)"));
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)", "尺寸 (tiny/small/medium/large)"));
+            r.Add("round|" + Designer.T("Capsule track (true/false)", "胶囊轨道 (true/false)"));
+            r.Add("loading|" + Designer.T("Loading (true/false)", "加载中 (true/false)"));
+            r.Add("disabled|" + Designer.T("Disabled (true/false)", "禁用 (true/false)"));
+            r.Add("checkedText|" + Designer.T("On text", "开态文字"));
+            r.Add("uncheckedText|" + Designer.T("Off text", "关态文字"));
+            r.Add("checkedIcon|" + Designer.T("On icon", "开态图标"));
+            r.Add("uncheckedIcon|" + Designer.T("Off icon", "关态图标"));
+            // 颜色键：开关两态的轨道色（0 = 皮肤默认）。
+            r.Add("checkedColor|" + Designer.T("Checked track color", "开态轨道色"));
+            r.Add("uncheckedColor|" + Designer.T("Unchecked track color", "关态轨道色"));
+            return r;
+        }
+        if (kind == "Progress") {
+            List<string> r = new List<string>();
+            r.Add("percent|" + Designer.T("Percent (0-100)", "进度百分比 (0-100)"));
+            r.Add("type|" + Designer.T("Type (default/info/success/warning/error)", "类型 (default/info/success/warning/error)"));
+            r.Add("shape|" + Designer.T("Shape (bar/ring/multi/dashboard)", "形态 (bar/ring/multi/dashboard)"));
+            r.Add("showIndicator|" + Designer.T("Show percent label (true/false)", "显示百分比 (true/false)"));
+            r.Add("strokeWidth|" + Designer.T("Stroke width", "描边宽度"));
+            // 颜色键：填充色与轨道色（0 = 皮肤默认）。
+            r.Add("color|" + Designer.T("Fill color", "填充色"));
+            r.Add("railColor|" + Designer.T("Rail color", "轨道色"));
+            return r;
+        }
+        if (kind == "Slider") {
+            List<string> r = new List<string>();
+            r.Add("min|" + Designer.T("Minimum", "最小值"));
+            r.Add("max|" + Designer.T("Maximum", "最大值"));
+            r.Add("step|" + Designer.T("Step (0 = any)", "步长 (0 = 任意)"));
+            r.Add("value|" + Designer.T("Value", "当前值"));
+            r.Add("range|" + Designer.T("Range (two handles, true/false)", "双钮区间 (true/false)"));
+            r.Add("vertical|" + Designer.T("Vertical (true/false)", "竖向 (true/false)"));
+            r.Add("reverse|" + Designer.T("Reverse (true/false)", "反向 (true/false)"));
+            r.Add("stepMark|" + Designer.T("Snap to marks (true/false)", "取值限定在标记 (true/false)"));
+            r.Add("tooltip|" + Designer.T("Value bubble on drag (true/false)", "拖动显示值气泡 (true/false)"));
+            r.Add("showTooltip|" + Designer.T("Bubble always visible (true/false)", "值气泡常显 (true/false)"));
+            r.Add("keyboard|" + Designer.T("Keyboard stepping (true/false)", "键盘步进 (true/false)"));
+            r.Add("tipFormat|" + Designer.T("Bubble template, v = value", "气泡模板，v 为值"));
+            r.Add("marks|" + Designer.T("Marks (0=cold|50=warm|100=hot)", "刻度 (0=冷|50=温|100=热)"));
+            r.Add("disabled|" + Designer.T("Disabled (true/false)", "禁用 (true/false)"));
+            return r;
+        }
+        if (kind == "Rate") {
+            List<string> r = new List<string>();
+            r.Add("max|" + Designer.T("Stars (1-10)", "星数 (1-10)"));
+            r.Add("value|" + Designer.T("Rating value", "当前评分"));
+            r.Add("allowHalf|" + Designer.T("Allow half (true/false)", "允许半星 (true/false)"));
+            r.Add("readonly|" + Designer.T("ReadOnly (true/false)", "只读 (true/false)"));
+            r.Add("clearable|" + Designer.T("Clearable (true/false)", "可清空 (true/false)"));
+            r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
+            r.Add("icon|" + Designer.T("Selected icon", "选中态图标"));
+            r.Add("voidIcon|" + Designer.T("Empty icon", "空态图标"));
+            return r;
+        }
+        if (kind == "Badge") {
+            List<string> r = new List<string>();
+            r.Add("count|" + Designer.T("Count", "徽标数字"));
+            r.Add("max|" + Designer.T("Max count (shows 99+)", "上限 (显示 99+)"));
+            r.Add("dot|" + Designer.T("Dot mode (true/false)", "仅红点 (true/false)"));
+            return r;
+        }
+        if (kind == "Tag") {
+            List<string> r = new List<string>();
+            r.Add("icon|" + Designer.T("Icon", "图标"));
+            r.Add("closable|" + Designer.T("Closable (true/false)", "可关闭 (true/false)"));
+            r.Add("checkable|" + Designer.T("Checkable (true/false)", "可勾选 (true/false)"));
+            r.Add("checked|" + Designer.T("Checked (true/false)", "已选中 (true/false)"));
+            return r;
+        }
+        if (kind == "Alert" || kind == "AlertBox") {
+            List<string> r = new List<string>();
+            r.Add("type|" + Designer.T("Type (info/success/warning/error)", "类型 (info/success/warning/error)"));
+            return r;
+        }
+        if (kind == "Avatar") {
+            List<string> r = new List<string>();
+            r.Add("text|" + Designer.T("Initials", "文字头像"));
+            r.Add("icon|" + Designer.T("Icon", "图标"));
+            r.Add("size|" + Designer.T("Size px", "边长 px"));
+            r.Add("shape|" + Designer.T("Shape (circle/rounded/square)", "形状 (circle/rounded/square)"));
+            return r;
+        }
+        if (kind == "Card") {
+            List<string> r = new List<string>();
+            r.Add("title|" + Designer.T("Title", "标题"));
+            r.Add("lifted|" + Designer.T("Lifted shadow (true/false)", "阴影浮起 (true/false)"));
+            r.Add("bordered|" + Designer.T("Bordered (true/false)", "边框 (true/false)"));
+            r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
+            return r;
+        }
+        if (kind == "Pagination") {
+            List<string> r = new List<string>();
+            r.Add("total|" + Designer.T("Page count", "总页数"));
+            r.Add("page|" + Designer.T("Current page", "当前页码"));
+            r.Add("itemCount|" + Designer.T("Item count (derives pages)", "总条数 (推算页数)"));
+            r.Add("pageSize|" + Designer.T("Page size", "每页条数"));
+            r.Add("pageSizes|" + Designer.T("Page size options (10,20,50)", "可选页大小 (10,20,50)"));
+            r.Add("showTotal|" + Designer.T("Show total pages (true/false)", "显示共 N 页 (true/false)"));
+            r.Add("jumper|" + Designer.T("Jump input (true/false)", "跳页输入 (true/false)"));
+            r.Add("order|" + Designer.T("Segment order (total,pager,jumper)", "段顺序 (total,pager,jumper)"));
+            r.Add("pagerCount|" + Designer.T("Pager button count (odd, >=5)", "页钮数 (奇数, >=5)"));
+            return r;
+        }
+        if (kind == "Divider") {
+            List<string> r = new List<string>();
+            r.Add("text|" + Designer.T("Text", "文本"));
+            return r;
+        }
+        if (kind == "Tree" || kind == "TreeView") {
+            List<string> r = new List<string>();
+            r.Add("checks|" + Designer.T("Checkboxes (true/false)", "复选框 (true/false)"));
+            r.Add("multi|" + Designer.T("Multi select (true/false)", "多选行 (true/false)"));
+            r.Add("reorder|" + Designer.T("Drag reorder (true/false)", "拖拽重排 (true/false)"));
+            r.Add("empty|" + Designer.T("Empty text", "空数据提示"));
+            return r;
+        }
+        if (kind == "Tabs") {
+            List<string> r = new List<string>();
+            r.Add("style|" + Designer.T("Style (line/card/segment)", "形态 (line/card/segment)"));
+            r.Add("orient|" + Designer.T("Orientation (horizontal/vertical)", "方向 (horizontal/vertical)"));
+            r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
+            r.Add("showAdd|" + Designer.T("Show add button (true/false)", "显示添加按钮 (true/false)"));
+            r.Add("closable|" + Designer.T("All closable (true/false)", "全部可关闭 (true/false)"));
+            r.Add("active|" + Designer.T("Active tab index", "激活标签页"));
+            return r;
+        }
+        if (kind == "Collapse") {
+            List<string> r = new List<string>();
+            r.Add("titles|" + Designer.T("Panel titles (comma separated)", "面板标题 (逗号分隔)"));
+            r.Add("bodies|" + Designer.T("Panel bodies (comma separated)", "面板正文 (逗号分隔)"));
+            r.Add("active|" + Designer.T("Open panel (-1 = none)", "展开项 (-1 = 全折叠)"));
+            r.Add("arrowPlacement|" + Designer.T("Arrow placement (left/right)", "箭头位置 (left/right)"));
+            r.Add("expandable|" + Designer.T("Expandable / multi (true/false)", "多面板同时展开 (true/false)"));
+            return r;
+        }
+        if (kind == "Breadcrumb") {
+            List<string> r = new List<string>();
+            r.Add("separator|" + Designer.T("Separator", "分隔符"));
+            return r;
+        }
+        if (kind == "Timeline") {
+            List<string> r = new List<string>();
+            r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
+            return r;
+        }
+        if (kind == "ButtonGroup") {
+            List<string> r = new List<string>();
+            r.Add("vertical|" + Designer.T("Vertical (true/false)", "纵向排列 (true/false)"));
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)", "尺寸 (tiny/small/medium/large)"));
+            return r;
+        }
+        if (kind == "Empty") {
+            List<string> r = new List<string>();
+            r.Add("description|" + Designer.T("Description text", "提示文本"));
+            r.Add("icon|" + Designer.T("Icon", "图标"));
+            return r;
+        }
+        if (kind == "Popover") {
+            List<string> r = new List<string>();
+            r.Add("title|" + Designer.T("Title", "标题"));
+            r.Add("content|" + Designer.T("Content", "内容"));
+            r.Add("placement|" + Designer.T("Placement (top/bottom/left/right)", "弹出方位 (top/bottom/left/right)"));
+            return r;
+        }
+        if (kind == "Chart") {
+            List<string> r = new List<string>();
+            r.Add("type|" + Designer.T(
+                "Type (line/bar/area/stacked/hbar/pie/donut/scatter/gauge/funnel/radar/wordCloud)",
+                "类型 (line/bar/area/stacked/hbar/pie/donut/scatter/gauge/funnel/radar/wordCloud)"));
+            r.Add("title|" + Designer.T("Title", "标题"));
+            return r;
+        }
+        if (kind == "Image" || kind == "ImageView") {
+            List<string> r = new List<string>();
+            r.Add("src|" + Designer.T("Src (path / URL)", "图片路径 (本地/网络)"));
+            r.Add("fit|" + Designer.T("Fit (contain/cover/fill/none)",
+                "适配 (contain/cover/fill/none)"));
+            r.Add("alt|" + Designer.T("Alt text", "替代文本"));
+            return r;
+        }
+        if (kind == "Countdown") {
+            List<string> r = new List<string>();
+            r.Add("duration|" + Designer.T("Duration (ms)", "时长 (毫秒)"));
+            r.Add("format|" + Designer.T("Format", "格式"));
+            return r;
+        }
+        if (kind == "NumberAnimation") {
+            List<string> r = new List<string>();
+            r.Add("from|" + Designer.T("From (scaled)", "起点 (放大值)"));
+            r.Add("to|" + Designer.T("To (scaled)", "终点 (放大值)"));
+            r.Add("duration|" + Designer.T("Duration (ms)", "时长 (毫秒)"));
+            r.Add("precision|" + Designer.T("Precision", "小数位"));
+            r.Add("separator|" + Designer.T("Separator", "千分位符"));
+            return r;
+        }
+        if (kind == "InputOtp") {
+            List<string> r = new List<string>();
+            r.Add("length|" + Designer.T("Length", "字符数"));
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)",
+                "尺寸 (tiny/small/medium/large)"));
+            r.Add("mask|" + Designer.T("Mask (true/false)", "掩码 (true/false)"));
+            r.Add("readonly|" + Designer.T("ReadOnly (true/false)",
+                "只读 (true/false)"));
+            return r;
+        }
+        if (kind == "DataGrid") {
+            // 表格字段级外观开关（键 = DataGrid Props()/SetExtra）。
+            // 列级属性（宽/对齐/类型/排序…）在选项「编辑」弹窗。
+            List<string> r = new List<string>();
+            r.Add("striped|" + Designer.T("Striped (true/false)", "斑马纹 (true/false)"));
+            r.Add("rowNumbers|" + Designer.T("Row numbers (true/false)", "行号列 (true/false)"));
+            r.Add("selectable|" + Designer.T("Selection column (true/false)", "勾选列 (true/false)"));
+            r.Add("rowHeight|" + Designer.T("Row height px (0 = theme)", "行高 px (0 = 主题)"));
+            r.Add("summary|" + Designer.T("Summary row (true/false)", "汇总行 (true/false)"));
+            r.Add("filterRow|" + Designer.T("Filter row (true/false)", "筛选行 (true/false)"));
+            r.Add("statusBar|" + Designer.T("Status bar (true/false)", "状态栏 (true/false)"));
+            r.Add("groupPanel|" + Designer.T("Group panel (true/false)", "分组面板 (true/false)"));
+            r.Add("allowAddRow|" + Designer.T("Add-row placeholder (true/false)", "新增行占位 (true/false)"));
+            return r;
+        }
+        if (kind == "Panel") {
+            // 设计器的卡片/面板/停靠面板（ftype 18/45/61）kind
+            // 都是 Panel，生成代码也是 new Panel()——卡片形态即
+            // style=card。键 = Panel Props() 原样。
+            List<string> r = new List<string>();
+            r.Add("style|" + Designer.T("Style (card/plain/section/layout)",
+                "形态 (card=卡片/plain/section/layout)"));
+            r.Add("layout|" + Designer.T("Child layout (none/column/row)",
+                "子控布局 (none/column/row)"));
+            r.Add("title|" + Designer.T("Caption", "面板标题"));
+            // 颜色键（0 = 皮肤默认）。有真取色器之后收录——当初排
+            // 除的理由正是"没有颜色编辑器"，那个理由已经不成立。
+            r.Add("surfaceColor|" + Designer.T("Surface color", "面底色"));
+            return r;
+        }
+        if (kind == "SplitPanel") {
+            List<string> r = new List<string>();
+            r.Add("orient|" + Designer.T("Orientation (vertical/horizontal)", "方向 (vertical/horizontal)"));
+            r.Add("size|" + Designer.T("First pane size", "首格尺寸"));
+            r.Add("minFirst|" + Designer.T("First pane min", "首格最小"));
+            r.Add("minSecond|" + Designer.T("Second pane min", "次格最小"));
+            return r;
+        }
+        if (kind == "Carousel") {
+            List<string> r = new List<string>();
+            r.Add("autoplay|" + Designer.T("Autoplay (true/false)", "自动轮播 (true/false)"));
+            r.Add("interval|" + Designer.T("Interval ms (500-60000)", "间隔毫秒 (500-60000)"));
+            r.Add("dotPlacement|" + Designer.T("Dots (bottom/top/left/right)", "指示点 (bottom/top/left/right)"));
+            r.Add("direction|" + Designer.T("Direction (horizontal/vertical)", "方向 (horizontal/vertical)"));
+            return r;
+        }
+        if (kind == "SelectBox") {
+            List<string> r = new List<string>();
+            r.Add("clearable|" + Designer.T("Clearable (true/false)", "可清除 (true/false)"));
+            r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
+            r.Add("placement|" + Designer.T("Popup (auto/bottom/top)", "弹层方向 (auto/bottom/top)"));
+            r.Add("filterable|" + Designer.T("Filterable (true/false)", "可过滤 (true/false)"));
+            return r;
+        }
+        if (kind == "Checkbox") {
+            List<string> r = new List<string>();
+            r.Add("indeterminate|" + Designer.T("Indeterminate (true/false)", "半选 (true/false)"));
+            return r;
+        }
+        if (kind == "Radio") {
+            List<string> r = new List<string>();
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)", "尺寸 (tiny/small/medium/large)"));
+            r.Add("bordered|" + Designer.T("Bordered (true/false)", "边框变体 (true/false)"));
+            return r;
+        }
+        if (kind == "Statistic") {
+            List<string> r = new List<string>();
+            r.Add("text|" + Designer.T("Caption", "标题文字"));
+            r.Add("value|" + Designer.T("Value text", "数值文本"));
+            return r;
+        }
+        if (kind == "Result") {
+            List<string> r = new List<string>();
+            r.Add("desc|" + Designer.T("Description", "描述文字"));
+            r.Add("icon|" + Designer.T("Icon", "图标"));
+            return r;
+        }
+        if (kind == "Skeleton") {
+            List<string> r = new List<string>();
+            r.Add("width|" + Designer.T("Width", "宽度"));
+            r.Add("height|" + Designer.T("Height", "高度"));
+            return r;
+        }
+        if (kind == "Spin") {
+            List<string> r = new List<string>();
+            r.Add("size|" + Designer.T("Diameter px", "直径 px"));
+            r.Add("tip|" + Designer.T("Caption text", "旁注文字"));
+            // 颜色键：转圈点的强调色（0 = 皮肤默认）。
+            r.Add("accent|" + Designer.T("Accent color", "强调色"));
+            return r;
+        }
+        if (kind == "Steps") {
+            List<string> r = new List<string>();
+            r.Add("current|" + Designer.T("Initial step", "初始步"));
+            r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
+            r.Add("placement|" + Designer.T("Extra text right (right)", "副文字靠右 (right)"));
+            r.Add("status|" + Designer.T("Overall status (success/error/warning)", "整体状态 (success/error/warning)"));
+            r.Add("finishIcon|" + Designer.T("Finish icon", "完成态图标"));
+            r.Add("errorIcon|" + Designer.T("Error icon", "错误态图标"));
+            r.Add("clickable|" + Designer.T("Clickable steps (true/false)", "步骤可点击 (true/false)"));
+            return r;
+        }
+        if (kind == "PageHeader") {
+            List<string> r = new List<string>();
+            r.Add("subtitle|" + Designer.T("Subtitle", "副标题"));
+            r.Add("icon|" + Designer.T("Back icon", "返回图标"));
+            return r;
+        }
+        if (kind == "FloatButton") {
+            List<string> r = new List<string>();
+            r.Add("icon|" + Designer.T("Icon", "图标"));
+            r.Add("size|" + Designer.T("Diameter px", "直径 px"));
+            return r;
+        }
+        if (kind == "Led") {
+            List<string> r = new List<string>();
+            r.Add("blink|" + Designer.T("Blink on alarm (true/false)", "报警闪烁 (true/false)"));
+            return r;
+        }
+        if (kind == "Digital") {
+            List<string> r = new List<string>();
+            r.Add("unit|" + Designer.T("Engineering unit", "工程量单位"));
+            r.Add("scale|" + Designer.T("Decimal digits", "小数位"));
+            return r;
+        }
+        if (kind == "Gauge") {
+            List<string> r = new List<string>();
+            r.Add("unit|" + Designer.T("Unit", "单位"));
+            r.Add("min|" + Designer.T("Range min", "量程下限"));
+            r.Add("max|" + Designer.T("Range max", "量程上限"));
+            return r;
+        }
+        if (kind == "Bargraph") {
+            List<string> r = new List<string>();
+            r.Add("min|" + Designer.T("Range min", "量程下限"));
+            r.Add("max|" + Designer.T("Range max", "量程上限"));
+            r.Add("orient|" + Designer.T("Orientation (vertical/horizontal)", "方向 (vertical/horizontal)"));
+            return r;
+        }
+        if (kind == "Trend") {
+            List<string> r = new List<string>();
+            r.Add("min|" + Designer.T("Range min", "量程下限"));
+            r.Add("max|" + Designer.T("Range max", "量程上限"));
+            r.Add("window|" + Designer.T("Sample window", "采样窗点数"));
+            r.Add("grid|" + Designer.T("Grid (true/false)", "网格 (true/false)"));
+            return r;
+        }
+        if (kind == "NumPad") {
+            List<string> r = new List<string>();
+            r.Add("sign|" + Designer.T("Sign key (true/false)", "负号键 (true/false)"));
+            r.Add("dot|" + Designer.T("Decimal key (true/false)", "小数点键 (true/false)"));
+            return r;
+        }
+        if (kind == "EquipPanel") {
+            List<string> r = new List<string>();
+            r.Add("cardW|" + Designer.T("Card width", "卡片宽"));
+            r.Add("cardH|" + Designer.T("Card height", "卡片高"));
+            return r;
+        }
+        if (kind == "QrCode") {
+            List<string> r = new List<string>();
+            r.Add("text|" + Designer.T("Encoded content", "编码内容"));
+            r.Add("ecl|" + Designer.T("Error correction (L/M/Q/H)", "纠错级别 (L/M/Q/H)"));
+            r.Add("size|" + Designer.T("Size px (0 = auto)", "边长 px (0 = 自动)"));
+            r.Add("margin|" + Designer.T("Quiet zone (0-16)", "静区模块数 (0-16)"));
+            r.Add("logo|" + Designer.T("Center logo image", "中心叠加图片"));
+            r.Add("logoPct|" + Designer.T("Logo size pct (1-30)", "logo 占比 (1-30)"));
+            // 颜色键：码点与底色（0 = 皮肤默认）。
+            r.Add("dark|" + Designer.T("Dark modules", "码点色"));
+            r.Add("light|" + Designer.T("Light modules", "底色"));
+            return r;
+        }
+        if (kind == "Watermark") {
+            List<string> r = new List<string>();
+            r.Add("content|" + Designer.T("Watermark text", "水印文字"));
+            r.Add("src|" + Designer.T("Watermark image", "水印图片"));
+            r.Add("fontpx|" + Designer.T("Font size", "字号"));
+            r.Add("rotate|" + Designer.T("Rotation angle", "旋转角"));
+            r.Add("gapx|" + Designer.T("Horizontal gap", "水平间距"));
+            r.Add("gapy|" + Designer.T("Vertical gap", "垂直间距"));
+            r.Add("textalign|" + Designer.T("Align (left/center/right)", "对齐 (left/center/right)"));
+            // 颜色键：水印文字色（0 = 皮肤默认）。
+            r.Add("color|" + Designer.T("Watermark color", "水印色"));
+            return r;
+        }
+        if (kind == "Marquee") {
+            List<string> r = new List<string>();
+            r.Add("speed|" + Designer.T("Speed px/s (1-1000)", "速度 px/s (1-1000)"));
+            r.Add("autoFill|" + Designer.T("Repeat to fill width (true/false)", "内容重复填满 (true/false)"));
+            return r;
+        }
+        if (kind == "DynamicTags") {
+            List<string> r = new List<string>();
+            r.Add("closable|" + Designer.T("Tag close X (true/false)", "标签可关闭 (true/false)"));
+            r.Add("max|" + Designer.T("Max tags (0 = unlimited)", "标签上限 (0 = 不限)"));
+            r.Add("addText|" + Designer.T("Add trigger text", "添加触发器文字"));
+            r.Add("size|" + Designer.T("Size (tiny/small/medium/large)", "尺寸 (tiny/small/medium/large)"));
+            return r;
+        }
+        if (kind == "Transfer") {
+            List<string> r = new List<string>();
+            r.Add("oneWay|" + Designer.T("One-way (true/false)", "只右移 (true/false)"));
+            r.Add("searchable|" + Designer.T("Search inputs (true/false)", "过滤输入 (true/false)"));
+            r.Add("emptyText|" + Designer.T("Empty text", "空态文字"));
+            return r;
+        }
+        if (kind == "VirtualList") {
+            List<string> r = new List<string>();
+            r.Add("rowHeight|" + Designer.T("Row height px (0 = theme)", "行高 px (0 = 主题)"));
+            return r;
+        }
+        if (kind == "Calendar") {
+            List<string> r = new List<string>();
+            r.Add("text|" + Designer.T("Selected date (YYYY-MM-DD)", "选中日期 (YYYY-MM-DD)"));
+            r.Add("mode|" + Designer.T("Mode (month/panel)", "形态 (month/panel)"));
+            return r;
+        }
+        if (kind == "TreeView") {
+            List<string> r = new List<string>();
+            r.Add("checks|" + Designer.T("Node checkboxes (true/false)", "节点勾选框 (true/false)"));
+            r.Add("multi|" + Designer.T("Multi select (true/false)", "多选 (true/false)"));
+            r.Add("reorder|" + Designer.T("Drag reorder (true/false)", "拖拽换位 (true/false)"));
+            r.Add("empty|" + Designer.T("Empty text", "空态文字"));
+            return r;
+        }
+        if (kind == "Collapse") {
+            List<string> r = new List<string>();
+            r.Add("arrowPlacement|" + Designer.T("Arrow (left/right)", "箭头 (left/right)"));
+            r.Add("expandable|" + Designer.T("Multiple open (true/false)", "多面板同开 (true/false)"));
+            return r;
+        }
+        if (kind == "Empty") {
+            List<string> r = new List<string>();
+            r.Add("icon|" + Designer.T("Empty graphic", "空态图形"));
+            return r;
+        }
+        if (kind == "Tabs") {
+            List<string> r = new List<string>();
+            r.Add("style|" + Designer.T("Header style (line/card/segment)", "页头外观 (line/card/segment)"));
+            r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
+            r.Add("closable|" + Designer.T("Closable tabs (true/false)", "标签可关闭 (true/false)"));
+            r.Add("showAdd|" + Designer.T("Add button (true/false)", "尾随新增按钮 (true/false)"));
+            return r;
+        }
+        if (kind == "Breadcrumb") {
+            List<string> r = new List<string>();
+            r.Add("separator|" + Designer.T("Separator icon", "分隔符图标"));
+            return r;
+        }
+        if (kind == "Timeline") {
+            List<string> r = new List<string>();
+            r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
+            return r;
+        }
+        return null;
+    }
+
+
+    // 把字段 extra["props"] 直通表落到真控件上（画布预览用）：
+    // 预览件每帧新建，逐键 SetProp；控件不认的键走基类 fallback
+    // 退化为样式类，无副作用。
+    static void ApplyFieldProps(Control ctl, FormField f) {
+        if (ctl == null || f.extra == null) { return; }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) { return; }
+        for (int i = 0; i < props.Count(); i = i + 1) {
+            ctl.SetProp(props.KeyAt(i), props.ValAt(i).AsString(""));
+        }
+    }
+
+    // 预览树上应用组件属性：与运行期注册表（UserComponentRegistry.
+    // ApplyProps）共用同一语义——实例值优先，缺省取声明里的 def，
+    // 落到目标控件（预览树按组件文档原名查找）。实例值存
+    // f.extra 的 "props" 直通对象。
+    void ApplyCompProps(Control root, JsonValue compRoot, FormField f) {
+        JsonValue inst = f.extra == null ? null : f.extra.Get("props");
+        UserComponentRegistry.ApplyProps(root, compRoot, inst);
+    }
+
+    // 引用节点画布预览的构建缓存：组件文档只在代次变化时
+    // 重建（SetUserComponents / 尺寸变化 / 实例属性变化），
+    // 其余帧复用整棵 FormBuilder 树只重渲染。找不到组件或
+    // 解析失败返回 null，调用方退回占位块。新构建的树按声明
+    // 接线预览分发，缓存命中直接复用已接线的树。
+    Control PvCompCtl(App app, FormField f, int w, int h) {
+        if (f.customKind == "") { return null; }
+        string doc = this.UserCompJson(f.customKind);
+        if (doc == "") { return null; }
+        string instFp = "";
+        if (f.extra != null) {
+            JsonValue ip = f.extra.Get("props");
+            if (ip != null) { instFp = ip.PrettyToJson(); }
+        }
+        string key = Convert.ToString(pvCompGen) + "|" + f.customKind
+            + "|" + Convert.ToString(w) + "x" + Convert.ToString(h)
+            + "|" + instFp;
+        for (int i = 0; i < pvCompCache.Count; i = i + 1) {
+            if (pvCompCache[i].key == key) { return pvCompCache[i].control; }
+        }
+        JsonValue root = null;
+        string html = "";
+        string trimmed = doc.Trim();
+        if (trimmed.StartsWith("<")) {
+            html = trimmed;
+            root = JsonValue.ParseLenient(DesignerHtml.DocOf(HtmlParser.Parse(trimmed, "")));
+        } else {
+            root = JsonValue.ParseLenient(doc);
+            if (root != null) { html = DesignerHtml.FromJsonDoc(doc); }
+        }
+        if (html == "" || root == null) { return null; }
+        HtmlDoc hd = Html.Parse(html, "", null);
+        Control ctl = hd != null ? hd.root : null;
+        if (ctl == null) { return null; }
+        this.ApplyCompProps(ctl, root, f);
+        this.ApplyPreviewFormSize(ctl, root.Int("formSize", 1));
+        this.WirePreviewEvents(app, ctl);
+        // 宿主设计稿在引用节点上声明的 on<Event>：组件文档里没有，
+        // 单独绑到树的根控件（运行期 WireNode 解析的就是这批）。
+        for (int i = 0; i < f.events.Count; i = i + 1) {
+            string fe = f.events[i].key;
+            string fh = f.events[i].val;
+            if (fe == "" || fh == "") { continue; }
+            ctl.BindEventS(fe, (Control s) => { this.PvFlash(app, fe, fh, s); });
+        }
+        pvCompCache.Add(new PreviewControlCache(key, ctl));
+        if (pvCompCache.Count > 64) {
+            pvCompCache.Clear();
+        }
+        return ctl;
+    }
+
+    // 给预览真控件树按声明绑定分发反馈：ChildWindow.
+    // WireNode 的设计器版——处理器名没有注册表可解析，改成状态条
+    // 闪现反馈。基类 FireCommon 只给有订阅的控件注册命中区
+    // （`!On.Any()` 即返回），所以绑定本身就让"点了没反应"的
+    // 声明控件变成可点的活预览。闭包按迭代捕获，
+    // 循环内绑定各拿各的 evt/hn。
+    void WirePreviewEvents(App app, Control root) {
+        if (root == null) { return; }
+        for (int i = 0; i < root.events.Count; i = i + 1) {
+            string evt = root.events[i].key;
+            string hn = root.events[i].val;
+            if (evt == "" || hn == "") { continue; }
+            root.BindEventS(evt, (Control s) => { this.PvFlash(app, evt, hn, s); });
+        }
+        for (int j = 0; j < root.children.Count; j = j + 1) {
+            this.WirePreviewEvents(app, root.children[j]);
+        }
+    }
+
+    // 预览态事件分发反馈：状态条闪现 "事件 → 处理器名"，sender
+    // 非空时附控件种类。预览里声明的处理器没有真身可调，这条
+    // 反馈本身就是"这里会触发"的所见即所得。
+    void PvFlash(App app, string evt, string hname, Control sender) {
+        string who = "";
+        if (sender != null) { who = " · " + sender.Kind(); }
+        msg = Designer.T("preview ", "预览 ") + evt + " → " + hname + who;
+        if (app != null) { app.RequestRedraw(); }
+    }
+
+    // 添加运行期注册（HeavyControls）的自定义组件
+    // 到表单/活动容器，与内置组件的 AddField 对应。
+    void AddCustomField(string kind) {
+        this.DropDeadRefs();
+        FormField f = FormField.NewCustom(kind, seq);
+        seq = seq + 1;
+        if (activeContainer != null) {
+            f.childTab = 0;
+            if (activeContainer.kind == "Tabs") {
+                f.childTab = Designer.TabActivePage(activeContainer);
+            }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        msg = Designer.T("added ", "已添加 ") + kind;
+    }
+
+}

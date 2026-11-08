@@ -99,6 +99,7 @@ public partial class Checker {
             }
             if (k == AK.Binary() && n.op == TK.QQ()) { InferType(n); }
             if (k == AK.Assignment()) {
+                CheckClosureCycleWarning(n.a, n.b, n.line, n.col);
                 CheckTaskNoResult(InferType(n.a), InferType(n.b), "assignment", n.line, n.col);
             }
             return;
@@ -374,14 +375,19 @@ public partial class Checker {
         Node callee = n.a;
         bool hasNamed = false;
         Node callTargetMethod = null;
+        Node callTargetCls = null;
+        Node callTargetOt = null;
         if (callee != null) {
             if (callee.kind == AK.Ident()) {
                 callTargetMethod = MethodUp(curClass, callee.sval);
+                callTargetCls = curClass;
             } else if (callee.kind == AK.MemberAccess()) {
                 Node ot = InferType(callee.a);
                 Node cls = ClassOf(ot);
                 if (cls != null) {
                     callTargetMethod = MethodUpCall(cls, callee.sval, n);
+                    callTargetCls = cls;
+                    callTargetOt = ot;
                 }
             }
         }
@@ -390,7 +396,9 @@ public partial class Checker {
             if (n.kids[i].argName != "") { hasNamed = true; }
             Node prevArgTarget = curTargetType;
             if (callTargetMethod != null) {
-                curTargetType = NthParamType(callTargetMethod, i);
+                Node rawPt = NthParamType(callTargetMethod, i);
+                curTargetType = SubstTypeParams(rawPt, callTargetCls, callTargetOt);
+                curTargetType = SubstMethodTypeParams(curTargetType, callTargetMethod, n);
             }
             if (curTargetType != null && binder.DelegateIsAsync(curTargetType.sval) && n.kids[i] != null && n.kids[i].kind == AK.Lambda()) {
                 diags.Error("[E3104] cannot convert a lambda to async delegate '" + curTargetType.sval
@@ -604,6 +612,78 @@ public partial class Checker {
             Node it = n.kids[i];
             if (it.kind == AK.Assignment()) { CheckExpr(it.b); } else { CheckExpr(it); }
             i = i + 1;
+        }
+    }
+
+    bool ExprCapturesThis(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.ThisExpr() || e.sval == "this") { return true; }
+        if (e.kind == AK.Ident()) {
+            if (curClass != null && !ScopeHas(e.sval)) {
+                Node f = FieldUp(curClass, e.sval);
+                if (f != null && !HasMod(f, MOD.Static())) { return true; }
+                Node m = MethodUp(curClass, e.sval);
+                if (m != null && !HasMod(m, MOD.Static())) { return true; }
+            }
+        }
+        if (ExprCapturesThis(e.a)) { return true; }
+        if (ExprCapturesThis(e.b)) { return true; }
+        if (ExprCapturesThis(e.c)) { return true; }
+        if (ExprCapturesThis(e.d)) { return true; }
+        int i = 0;
+        while (i < e.kids.Count) {
+            if (ExprCapturesThis(e.kids[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    bool HasClosureCapturingThis(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Lambda()) {
+            if (ExprCapturesThis(e.a) || ExprCapturesThis(e.d)) { return true; }
+        }
+        if (HasClosureCapturingThis(e.a)) { return true; }
+        if (HasClosureCapturingThis(e.b)) { return true; }
+        if (HasClosureCapturingThis(e.c)) { return true; }
+        if (HasClosureCapturingThis(e.d)) { return true; }
+        int i = 0;
+        while (i < e.kids.Count) {
+            if (HasClosureCapturingThis(e.kids[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    bool TargetsThis(Node lhs) {
+        if (lhs == null || curClass == null) { return false; }
+        if (lhs.kind == AK.MemberAccess()) {
+            Node obj = lhs.a;
+            while (obj != null && obj.kind == AK.MemberAccess()) {
+                obj = obj.a;
+            }
+            if (obj != null && (obj.kind == AK.ThisExpr() || obj.sval == "this")) {
+                return true;
+            }
+            if (obj != null && obj.kind == AK.Ident()) {
+                if (!ScopeHas(obj.sval)) {
+                    Node f = FieldUp(curClass, obj.sval);
+                    if (f != null && !HasMod(f, MOD.Static())) { return true; }
+                }
+            }
+        } else if (lhs.kind == AK.Ident()) {
+            if (!ScopeHas(lhs.sval)) {
+                Node f = FieldUp(curClass, lhs.sval);
+                if (f != null && !HasMod(f, MOD.Static())) { return true; }
+            }
+        }
+        return false;
+    }
+
+    void CheckClosureCycleWarning(Node lhs, Node rhs, int line, int col) {
+        if (curClass == null || lhs == null || rhs == null) { return; }
+        if (TargetsThis(lhs) && HasClosureCapturingThis(rhs)) {
+            diags.Warning("closure captures 'this' while assigned to a member of 'this'; this creates a potential strong reference cycle under ARC", line, col);
         }
     }
 }

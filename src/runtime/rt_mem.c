@@ -861,7 +861,7 @@ void zan_rt_register_site_field_graphs(void **graphs, void **tynames, int64_t co
 
 static const char *zan_get_object_tyname(void *obj) {
     if (!obj) return "null";
-    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF);
+    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
     if ((site >> 32) == ZAN_STRING_TAG) {
         return "string";
     }
@@ -894,7 +894,7 @@ typedef void (*zan_edge_cb_t)(void *from, void *to, void *ctx);
 
 static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
     if (!obj) return;
-    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF);
+    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
     if ((site >> 32) == ZAN_STRING_TAG) {
         return;
     }

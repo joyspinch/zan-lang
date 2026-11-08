@@ -292,6 +292,86 @@ public partial class Checker {
         }
         return null;
     }
+
+    Node CopyTypeNode(Node t) {
+        if (t == null) { return null; }
+        Node n = new Node(t.kind);
+        n.sval = t.sval; n.op = t.op; n.ival = t.ival; n.sval2 = t.sval2;
+        n.line = t.line; n.col = t.col; n.mods = t.mods;
+        int i = 0;
+        while (i < t.kids.Count) { n.Add(CopyTypeNode(t.kids[i])); i = i + 1; }
+        return n;
+    }
+
+    Node SubstType(Node t, List<string> names, List<Node> reps) {
+        if (t == null) { return null; }
+        if (t.ival >= 1) {
+            Node el = new Node(AK.TypeRef());
+            el.sval = t.sval;
+            Node se = SubstType(el, names, reps);
+            if (se == null) { return t; }
+            Node r = CopyTypeNode(se);
+            r.ival = t.ival;
+            return r;
+        }
+        if (t.kids.Count == 0) {
+            int i = 0;
+            while (i < names.Count) {
+                if (names[i] == t.sval) { return CopyTypeNode(reps[i]); }
+                i = i + 1;
+            }
+            return t;
+        }
+        Node n = CopyTypeNode(t);
+        n.kids = new List<Node>();
+        int ki = 0;
+        while (ki < t.kids.Count) {
+            n.kids.Add(SubstType(t.kids[ki], names, reps));
+            ki = ki + 1;
+        }
+        return n;
+    }
+
+    Node SubstTypeParams(Node t, Node cls, Node ot) {
+        if (t == null || cls == null || ot == null || ot.kids.Count == 0) { return t; }
+        List<string> names = new List<string>();
+        List<Node> reps = new List<Node>();
+        int pi = 0;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            if (cls.kids[i].kind == AK.TypeParam()) {
+                if (pi < ot.kids.Count) {
+                    names.Add(cls.kids[i].sval);
+                    reps.Add(ot.kids[pi]);
+                    pi = pi + 1;
+                }
+            }
+            i = i + 1;
+        }
+        if (names.Count == 0) { return t; }
+        return SubstType(t, names, reps);
+    }
+
+    Node SubstMethodTypeParams(Node t, Node m, Node call) {
+        if (t == null || m == null || call == null || call.d == null) { return t; }
+        if (call.d.kind != AK.TypeRef() || call.d.sval != "__typeargs") { return t; }
+        List<string> names = new List<string>();
+        List<Node> reps = new List<Node>();
+        int pi = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.TypeParam()) {
+                if (pi < call.d.kids.Count) {
+                    names.Add(m.kids[i].sval);
+                    reps.Add(call.d.kids[pi]);
+                    pi = pi + 1;
+                }
+            }
+            i = i + 1;
+        }
+        if (names.Count == 0) { return t; }
+        return SubstType(t, names, reps);
+    }
     bool AccAlreadyReported(Node n) {
         if (accReported == null) { return false; }
         int i = 0;
@@ -573,13 +653,30 @@ public partial class Checker {
             Node p = ParamAtNode(cand, a);
             if (p == null) { break; }
             Node pty = p.type;
-            Node aty = InferType(call.kids[a]);
-            if (pty != null && aty != null && pty.sval != "" && aty.sval != "") {
-                if (pty.sval == aty.sval) { score = score + 4; }
-                else {
-                    int pc2 = PrimCat(pty.sval);
-                    int ac2 = PrimCat(aty.sval);
-                    if (pc2 != 0 && ac2 != 0 && pc2 != ac2) { score = score - 1; }
+            Node arg = call.kids[a];
+            if (arg != null && arg.kind == AK.Lambda()) {
+                if (pty != null && (pty.sval.StartsWith("Func") || pty.sval.StartsWith("Action")
+                    || pty.sval.StartsWith("Predicate") || binder.IsDelegateName(pty.sval))) {
+                    score = score + 8;
+                    if (pty.sval == "Func" && pty.kids.Count > 0 && arg.a != null) {
+                        Node retType = pty.kids[pty.kids.Count - 1];
+                        Node lrt = InferType(arg.a);
+                        if (lrt != null && lrt.sval == retType.sval) { score = score + 4; }
+                    }
+                } else if (pty != null && pty.sval.StartsWith("Expr")) {
+                    score = score + 2;
+                } else if (pty != null && (pty.sval == "string" || PrimCat(pty.sval) != 0)) {
+                    score = score - 10;
+                }
+            } else {
+                Node aty = InferType(arg);
+                if (pty != null && aty != null && pty.sval != "" && aty.sval != "") {
+                    if (pty.sval == aty.sval) { score = score + 4; }
+                    else {
+                        int pc2 = PrimCat(pty.sval);
+                        int ac2 = PrimCat(aty.sval);
+                        if (pc2 != 0 && ac2 != 0 && pc2 != ac2) { score = score - 1; }
+                    }
                 }
             }
             a = a + 1;
@@ -644,6 +741,19 @@ public partial class Checker {
                     if (lastP != null && lastP.op == 1 && argc >= req - 1) { return true; }
                 }
                 i = i + 1;
+            }
+            if (c.interfaces != null) {
+                int ii = 0;
+                while (ii < c.interfaces.Count) {
+                    string iname = c.interfaces[ii];
+                    int ilt = iname.IndexOf("<");
+                    string baseIf = ilt > 0 ? iname.Substring(0, ilt) : iname;
+                    Node iface = binder.FindType(baseIf);
+                    if (iface != null && AcceptsArgc(iface, name, argc)) {
+                        return true;
+                    }
+                    ii = ii + 1;
+                }
             }
             c = binder.FindType(c.sval2);
             cg3 = cg3 + 1;

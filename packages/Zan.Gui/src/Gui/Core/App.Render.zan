@@ -1,0 +1,839 @@
+using System;
+using Gui.Backend;
+
+namespace Gui;
+
+public partial class App {
+    void RenderFrameOverlays() {
+        RunOverlays();
+        Widget.Tooltip.Flush(this);
+        if (presentTails != null) {
+            for (int i = 0; i < presentTails.Count; i = i + 1) {
+                presentTails[i](this);
+            }
+        }
+    }
+
+    void PresentFrame() {
+        if (window.GetHandle() == 0) { this.EndOffscreenFrame(); return; }
+        int perfT0 = 0;
+        if (App.PerfOn()) { perfT0 = Window.GetTickMs(); }
+        // 最后绘制并分发弹层，使其位于所有内容之上并拥有
+        // 最顶层命中区域（框架拥有的遮罩/层叠层）。
+        this.RenderFrameOverlays();
+        // 弹层落定之后再结算原生浮层：此刻本帧所有拦截区都已注册，
+        // 能算出网页视图真正该露出的区域（菜单/对话框压住的部分被
+        // 裁掉），否则原生层会盖住它上面的一切。
+        NativeLayer.Flush(this);
+        int perfT1 = 0;
+        if (App.PerfOn()) { perfT1 = Window.GetTickMs(); }
+        // 标志性皮肤动画：快照完成后的帧（槽位 7），然后
+        // 在其上合成特效层。之后的纯特效 tick 恢复
+        // 快照并重新合成（FxPresent），无需重新渲染。
+        if (this.FxActive()) {
+            Canvas fc = canvas;
+            // 快照仅用于让之后的*空闲* tick 无需重新渲染即可重新合成
+            // 特效。当帧连续快速跟上（滚动、输入、拖拽）时，
+            // 下一帧本来就是完整渲染，因此每帧复制整个表面
+            // 纯属开销——在 2646x1646 的窗口上，它是
+            // 帧内最大的像素流量块。在该突发期间跳过它，
+            // 并在活动停止后不久安排一次唤醒；那一帧距其前帧
+            // 足够远，可以快照并恢复空闲 tick。
+            // 将悬停/焦点/按下快照为本帧的"上一帧"基线，
+            int fxNow = Window.GetTickMs();
+            if (partialFrame) {
+                // 只有损伤条带被重绘（因此那里是合成前的像素），
+                // 裁剪仍然生效：以上一整帧的相位重新合成
+                // 特效，只覆盖该条带，其余像素保持已合成的状态。
+                if (fxSnapValid) {
+                    // 只把页面条带的干净像素补进整窗快照。条带即使超过
+                    // 半窗也必须补齐，否则下一拍恢复会抹掉新页面内容。
+                    fc.SnapshotPatchRect(presentX, presentY, presentW,
+                                         presentH, App.FxSnapSlot());
+                }
+                BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, fc.Width(),
+                                  fc.Height(), fxFrameMs, theme, dpiScale);
+                BackdropFx.TakeDamage();
+                if (!fxPagePending) {
+                    fxDamage = null;
+                    fxTouched = null;
+                    fxTouchedFull = false;
+                    if (fxNextMs < 0 || fxNow >= fxNextMs) {
+                        // 本拍没有提前推进整窗 Fx，下一圈补上条带外相位。
+                        fxNextMs = fxNow;
+                    }
+                }
+                // 同拍 Fx 已记录整窗新旧损伤和相位；条带只按同相位
+                // 补画，不丢修复清单，也不在页面呈现前重排下一拍。
+            } else {
+            // 突发判定只看上一*整窗*帧（条带帧不计，快照的条带区域
+            // 随后回写保鲜）：整帧连发（滚动/拖拽风暴）时下一帧反正
+            // 还是整帧重栅，复制整个表面纯属开销，跳过；其余情况
+            // 一律快照，让特效拍走"恢复+合成+提交"的廉价路径。
+            bool burst = lastFullFrameMs > 0
+                && fxNow - lastFullFrameMs < 120;
+            if (burst) {
+                fxSnapValid = false;
+                fxDamage = null;
+                fxTouched = null;
+                fxTouchedFull = false;
+                this.ScheduleFxFrame();
+            } else {
+                fc.SnapshotRect(0, 0, fc.Width(), fc.Height(),
+                                App.FxSnapSlot());
+                fxSnapValid = true;
+                if (App.PerfOn()) {
+                    File.AppendAllText("zan_frame_perf.log", "fframe snap=1\n");
+                }
+            }
+            BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
+                              fxNow, theme, dpiScale);
+            if (!burst) {
+                fxDamage = BackdropFx.TakeDamage();
+                // 新快照 = 干净基线：累计损伤从此刻的特效矩形重新
+                // 起算（与 fxDamage 先共享同一份清单，FxPresent 里
+                // 并入新损伤之前 fxDamage 已换到新列表，不会互扰）。
+                fxTouched = fxDamage;
+                fxTouchedFull = fxDamage.Count / 4 > 1024;
+                this.ScheduleFxFrame();
+            } else {
+                BackdropFx.TakeDamage();
+            }
+            fxFrameMs = fxNow;
+            if (!window.IsVisible()) { fxNextMs = -1; }
+            }
+        } else {
+            fxNextMs = -1;
+        }
+        int perfPreMs = 0;
+        if (App.PerfOn()) {
+            perfPreMs = Window.GetTickMs();
+            perfOverlayMs = perfOverlayMs + (perfT1 - perfT0);
+            perfFxMs = perfFxMs + (perfPreMs - perfT1);
+        }
+        // 计数器每帧都读，否则整窗帧会把上一帧的欠账带过来。
+        int blurMiss = Canvas.TakeBlurPartialMiss();
+        if (partialFrame) {
+            canvas.PopClip();
+            // 上传矩形用 PushClip 时锁定的 presentX..，而不是现读
+            // dmg：渲染期间 dmg 还会增长（渲染中的 NoteDamage、下面
+            // 的 WidenDamageToGlass），那些区域本帧没渲染过，画布上
+            // 是上一帧的旧像素——上传它们就是拖影与阶梯状残块。扩大的
+            // 裁剪经 partialPending 留给下一帧真正渲染后再上屏。
+            // 有玻璃面板跨出了损伤条带、且没有可复用的缓存模糊：条带里
+            // 的磨砂是拿上一帧的合成结果当背景糊出来的，与整帧渲染不
+            // 等价（背景内容变化大时就是可见的拖影）。下一帧把裁剪
+            // 扩到相交面板并集重新算；没有可用的并集（或大到接近
+            // 整窗）时才升级成整窗重绘。
+            if (blurMiss > 0) {
+                blurMissStreak = blurMissStreak + 1;
+                // 扩裁剪重算过的帧若仍报 miss，模糊核的取样边缘越出了
+                // 一切条带，widen 已无力——按 g_blur_partial_miss 的
+                // 契约把下一帧升级成整窗，别让滚动串帧帧欠账。
+                if (!this.WidenDamageToGlass() || blurMissStreak >= 2) {
+                    partialBlocked = true;
+                    forceFullNext = true;
+                    blurMissStreak = 0;
+                    this.NoteRedrawWhy("glass-partial-blur");
+                } else {
+                    this.NoteRedrawWhy("glass-strip-widen");
+                }
+                needsRedraw = true;
+            } else {
+                blurMissStreak = 0;
+            }
+            if (App.PerfOn()) {
+                File.AppendAllText("zan_frame_perf.log",
+                    "pframe present=" + Convert.ToString(presentX) + ","
+                    + Convert.ToString(presentY) + "+"
+                    + Convert.ToString(presentW) + "x"
+                    + Convert.ToString(presentH)
+                    + " miss=" + Convert.ToString(blurMiss)
+                    + "\n");
+            }
+            window.PresentDirty(presentX, presentY, presentW, presentH);
+        } else {
+            // 整窗帧重画了每一个像素，就声明整窗上传：呈现范围由
+            // 自己的声明决定，而不是运行时的差分影子。影子只依据
+            // “上传过什么”，不依据“屏幕上是什么”——一次没上屏的
+            // 上传之后，影子与屏幕永久失步，差异比对会把旧帧内容
+            // 当作已呈现，滚动停下的残带就是这样留下的。
+            window.PresentFull();
+            if (fxPagePending) {
+                // BeginFrame 因输入/DPI/修复升级成整帧时，提前登记的 Fx
+                // 矩形也不能把原生上传收窄为旧表面的范围。
+                window.PresentDirty(0, 0, canvas.Width(), canvas.Height());
+            }
+            lastFullFrameMs = Window.GetTickMs();
+        }
+        this.SettleGlassRefresh();
+        // 完整帧结束时刷新事件解析基准：条带帧不刷新，条带外沿用
+        // 最近一次整帧的命中区（见 HitTester.KeepFullSnapshot）。
+        if (!partialFrame) { hitTester.KeepFullSnapshot(); }
+        window.Present(canvas);
+        if (fxPagePending) {
+            fxPagePending = false;
+            if (partialFrame && this.FxActive() && window.IsVisible()) {
+                this.ScheduleFxFrame();
+            }
+        }
+        // 滚轮两段式认领的第二段：渲染期有声明者（指针在其内）却
+        // 无人消费——典型是指针刚跨入滚动区、上一帧无人认领
+        // （ownerOrder=0），第一格被全体声明者拒绝——就把同一格
+        // 滚轮回灌事件队列，下一帧认领已武装，由正确声明者（嵌套
+        // 时最内层最后认领）消费。armed 保证每条事件链至多回放
+        // 一次：回放格再无人消费（渲染树抖动致认领序错位）就维持
+        // 旧行为丢弃，绝不循环回放；非滚轮事件到达即解除武装。
+        if (this.EventKind() == 13) {
+            if (wheelClaimSeen && !wheelConsumed && !wheelReplayArmed) {
+                wheelReplayArmed = true;
+                window.InjectEvent(13, window.EventX(), window.EventY(),
+                                   0, window.EventKeyCode(),
+                                   window.EventMods());
+            }
+        } else {
+            wheelReplayArmed = false;
+        }
+        UiDriver.NotifyPresented(this);
+        if (App.PerfOn()) {
+            int endMs = Window.GetTickMs();
+            this.RecordFramePerf(perfBeginMs, perfPreMs, endMs, partialFrame);
+        }
+        frameCount = frameCount + 1;
+        lastPresentMs = Window.GetTickMs();
+        // 将悬停/焦点/按下快照为本帧的"上一帧"基线，
+        // 使下一渲染帧能检测进入/离开和焦点/失焦转换
+        focus.RollFrame();
+        // 滚轮把内容挪到指针底下的那一帧在出完帧后重算悬停目标：
+        // 此时命中区已按滚动后的新位置注册完毕，重算才是准的。
+        // （放在 PresentFrame 而不是 SafeFrame/RunLoop——自托管应用
+        // 大多写自己的循环，只有这里是所有应用共用的收口。）
+        this.RefreshScrollHover();
+
+        // 开帧（BeginFrame）清除了主窗口的截止时间；若主窗口自身无动画，
+        // 在出帧收尾处将子窗口的动画截止时间重新折叠进来，
+        // 避免主循环随后的 ProcessEvent 进入无限阻塞睡死。
+        if (!isChildWindow && window != null && window.GetHandle() != 0) {
+            ChildWindows.FoldDeadlines(this);
+        }
+    }
+
+
+    Widget.TooltipRequest offscreenTooltip;
+    App offscreenFrameParent;
+    bool offscreenFrameActive;
+    bool offscreenWheelPending;
+    int offscreenWheelX;
+    int offscreenWheelY;
+    int offscreenWheelKey;
+    int offscreenWheelMods;
+    int offscreenWheelFlag;
+    long offscreenWheelSeq;
+
+
+
+
+
+
+
+    void BeginFrame() {
+        displayAnimationPending = false;
+        frameCadence.SetRate(window.RefreshRate());
+        frameCadence.Begin(Stopwatch.GetMicroseconds());
+        if (window.GetHandle() == 0) { this.BeginOffscreenFrame(); return; }
+        this.SyncNativeDpi();
+        if (App.PerfOn()) { perfBeginMs = Window.GetTickMs(); }
+        if (App.PerfOn()) { Canvas.TextStatEnable(true); }
+        // 在任何绘制之前应用新选的内置皮肤，
+        // 使整个窗口（内容 + 框架）本帧以新主题重绘。
+        this.SyncSkin();
+        // 推进动画时钟。AnimTo() 以 (nowMs - lastFrameMs) 作为
+        // 流逝步长，缓动按真实时钟速率运行，与帧率无关。
+        if (freezeAnimClock) {
+            lastFrameMs = nowMs;
+        } else {
+            lastFrameMs = nowMs;
+            nowMs = Window.GetTickMs();
+        }
+        // 帧开始时清除重绘标志；本帧内调用的处理程序
+        // 可再次设置它，请求立即的后续重绘。
+        if (App.PerfOn()) {
+            if (redrawWhy == "") {
+                if (needsRedraw) { redrawWhy = "silent"; }
+                else { redrawWhy = "unrequested"; }
+            }
+            if (frameWhy != "" && redrawWhy == "") {
+                // 这一帧之前已经有人交接过理由，却又走了一次
+                // BeginFrame：说明一次 Present 对应了两次开帧。
+                frameWhy = "rebegin:" + frameWhy;
+            } else {
+                frameWhy = redrawWhy;
+                frameWhyN = redrawCount;
+            }
+            redrawWhy = "";
+            redrawCount = 0;
+        }
+        needsRedraw = false;
+        // 同样清除节流动画的截止时间；仍在运行的动画
+        // （spinner 等）会在渲染期间通过 RequestAnimationFrame 重新武装。
+        animNextMs = -1;
+        wakeNextMs = -1;
+        wakeFrameNextMs = -1;
+        animRectValid = false;
+        animRectAll = false;
+        // inputNeedsFrame 此处不清：TakeDueFrame 与本函数下方的条带
+        // 裁剪决策都要读它，消费后再复位（见 partialFrame 判定之后）。
+        // 槽位 7 的 fx 快照是否过期要到下面 partialFrame 判定之后才能
+        // 下结论：条带帧只重画条带，条带外的快照像素仍然准确，条带
+        // 分支会把条带的干净基面回写快照，整体继续有效；整帧才作废。
+        // 匿名玻璃表面的逐帧编号从头开始（有身份的面板走
+        // BlurSlotFor 的常驻表，跨帧保持自己的槽）。
+        blurSlotSeq = 0;
+        wheelOwnerOrder = wheelCapOrder;
+        wheelClaimSeq = 0;
+        wheelCapOrder = 0;
+        wheelCapW = 0;
+        wheelCapH = 0;
+        wheelClaimSeen = false;
+        wheelConsumed = false;
+        tabHoldId = -1;
+        inputBlockPrevious = blocksInputBelow;
+        blocksInputBelow = false;
+        menuBlockPrevious = menuBlock;
+        menuBlock = false;
+        frameSeq = frameSeq + 1;
+        clickClaimed = false;
+        // pressOnBlocker 不在此复位：本帧的 BeginFrame 在
+        // ProcessEvent（按下置位）之后、释放帧的 ProcessEvent（读取）
+        // 之前各跑一次，复位会把跨帧手势状态抹掉。写入点只有
+        // kind==2 主键按下分支（每次按下无条件重写）。
+        hitTester.Clear();
+        glassRects.Clear();
+        window.ClearHitGuards();
+        focus.ResetIds();
+        overlays.Clear();
+        nativeLayers.Clear();
+        nativeOccluders.Clear();
+        hitOnlyBlockers.Clear();
+        partialFrame = false;
+        partialBlocked = false;
+        glassDeferred = false;
+        // 控件内容哈希只在本应用开了局部帧时计数（）。
+        paintHashOn = this.PartialFrames();
+        // 输入事件（按下/释放/按键）触发的帧不得继承上一帧遗留的
+        // 条带裁剪：条带外的控件本帧不渲染、不注册命中区，锚点认领
+        // 与 Ui.Clicked 都会落空——表现为点击无响应/迟钝。条带是
+        // 纯动画帧自己声明的，输入帧永远整帧（见 inputNeedsFrame）。
+        // 滚轮条带（TakeDueWheelRect 声明）不受此限：滚轮不发布点击
+        // 目标（ClickAvailable 只认 kind==3），条带外的控件不需要本
+        // 帧注册命中区，HitTester 上一帧快照继续有效。
+        if (inputNeedsFrame) { partialPending = false; }
+        if (partialPending && dmgW > 0 && dmgH > 0) {
+            partialFrame = true;
+        }
+        partialPending = false;
+        // 上一帧留下的“下一帧必须整窗”比任何局部声明优先：它记的是
+        // 表面上已经有不可信的像素，只重画一条条带永远纠不回来。
+        if (forceFullNext) {
+            partialFrame = false;
+            forceFullNext = false;
+            this.NoteRedrawWhy("force-full");
+        }
+        // 输入帧的整帧承诺已兑现（partialPending 已被上面的判定
+        // 消费），复位给下一个事件周期。滚轮批次同拍复位：条带
+        // 判定只属于泵出它的那一帧。
+        inputNeedsFrame = false;
+        wheelScrollInput = false;
+        // 整窗帧重画了每一个像素，动画的旧位置已被覆盖：
+        // 下一次动画帧不必再把它算进裁剪。
+        if (!partialFrame) { animPrevValid = false; }
+        // 本帧正在重新渲染：整帧会覆盖整个画布，槽位 7 的 fx 快照
+        // 从此过期，交给帧尾的突发判定/非突发整帧重建；条带帧只
+        // 覆盖条带，快照其余部分仍准确，保持有效使特效拍在持续
+        // 动画（倒计时条带）期间仍能廉价整窗推进（条带分支回写）。
+        if (!partialFrame) { fxSnapValid = false; }
+        if (partialFrame) {
+            // 下方内容照常绘制；裁剪将其限制在
+            // 损坏条带内，上一帧未触及的像素得以保留。
+            canvas.PushClip(dmgX, dmgY, dmgW, dmgH);
+            presentX = dmgX;
+            presentY = dmgY;
+            presentW = dmgW;
+            presentH = dmgH;
+        }
+        if (shapeMode != 0) {
+            // 实时缩放露出的边距由外壳按此色填充（见
+            // Window.SetResizeBackground）：拖动窗口边框时 OS 先放大窗口、
+            // 应用才画出新尺寸的一帧，这条边距若按默认的 0 填充就是闪黑边。
+            int resizeBg = 0;
+            if (resizeBg != lastResizeBg) {
+                lastResizeBg = resizeBg;
+                Window.SetResizeBackground(resizeBg);
+            }
+            // 异形窗口：将整个表面清为完全透明，
+            // 轮廓仅由树绘制的像素定义（系统以逐像素 alpha
+            // 和抗锯齿边缘合成它）。
+            if (partialFrame) {
+                canvas.ClearRect(dmgX, dmgY, dmgW, dmgH, 0);
+            } else {
+                canvas.Clear(0);
+            }
+        } else {
+            StyleBox bgStyle = Style.Full(this, "windowbg", "", "",
+                                          Style.SNormal());
+            // 实时缩放露出的边距由外壳按此色填充（见
+            // Window.SetResizeBackground）：拖动窗口边框时 OS 先放大窗口、
+            // 应用才画出新尺寸的一帧，这条边距若按默认的 0 填充就是闪黑边。
+            int resizeBg = bgStyle.BgOr(0);
+            if (resizeBg != lastResizeBg) {
+                lastResizeBg = resizeBg;
+                Window.SetResizeBackground(resizeBg);
+            }
+            if (glassNative) {
+                StyleBox glassStyle = Style.Part(this, "windowbg", "glass", "",
+                                                 "", "", Style.SNormal());
+                // 磨砂表面：将整个窗口清为*半透明*色调
+                // （而非完全透明），使系统背景均匀透出
+                // 模糊，同时窗口保持为实心带边框的玻璃面板。
+                // 完全透明的清除会让窗口在浅色背景上
+                // 显得通透/发白（且无边框）。
+                if (partialFrame) {
+                    canvas.ClearRect(dmgX, dmgY, dmgW, dmgH,
+                                     glassStyle.BgOr(0));
+                } else {
+                    canvas.Clear(glassStyle.BgOr(0));
+                }
+            } else {
+                if (partialFrame) {
+                    canvas.ClearRect(dmgX, dmgY, dmgW, dmgH, bgStyle.BgOr(0));
+                } else {
+                    canvas.Clear(bgStyle.BgOr(0));
+                }
+            }
+        }
+    }
+
+    // 将弹层排队，在主内容绘制之后绘制并分发，
+    // 使其位于一切之上并拥有最顶层命中区域。
+    void AddOverlay(OverlayPopup p) {
+        overlays.Add(p);
+        // 在损坏裁剪帧期间出现的弹层/工具提示会被
+        // 裁剪掉：注册后立即请求一帧完整重绘。
+        if (partialFrame) {
+            this.NoteRedrawWhy("overlay-in-partial");
+            needsRedraw = true;
+        }
+    }
+
+    // 按注册顺序绘制并分发本帧注册的所有遮罩。
+    // 在主渲染之后、PresentFrame 之前调用一次。
+    void RunOverlays() {
+        for (int i = 0; i < overlays.Count; i = i + 1) {
+            OverlayPopup p = overlays[i];
+            // 每个浮层自成一段独立作用域：一个下拉打开时会多领两个
+            // 拦截区 id，若共用一条递增序号，排在它后面的
+            // 浮层（以及浮层里的行）就会整体移位。
+            // 使用作用域 Hash 栈消除 950000 魔数号段，各浮层完全隔离。
+            focus.PushId("App.Overlay");
+            focus.PushId(i);
+            p.Render(this);
+            focus.PopId();
+            focus.PopId();
+        }
+        if (this.overlayHost != null) {
+            this.overlayHost.RenderAll(this);
+        }
+    }
+
+    // 本帧有活动的弹层层时为真。
+    bool HasOverlays() {
+        return overlays.Count > 0 || (overlayHost != null && overlayHost.HasActive());
+    }
+
+    // 当模态遮罩/弹层遮罩拥有指针时为真——无论是本帧
+    // （执行了 BlockHitsRect/BlockHitsBelow）还是上一帧
+    // （弹层已存在）。直接读取 mouseX/mouseY 的即时模式控件
+    // 必须用 `!PointerCaptured()` 约束其悬停/按下/点击，
+    // 防止指针穿过弹层落到其下方的层。
+    bool PointerCaptured() {
+        if (blocksInputBelow || inputBlockPrevious) { return true; }
+        // 矩形范围的拦截器（浮动窗口、popover、下拉弹层、加载
+        // 遮罩）在自身区域上捕获指针，而无需设置
+        // 全局全窗口标志。其下的内容在遮罩注册之前
+        // 渲染，因此读取上一帧的拦截器；
+        // 拦截器自身主体（本帧已铺设遮罩）通过
+        // BlockerAt 排除，以保持可交互。
+        return hitTester.PrevBlockerAt(mouseX, mouseY)
+            && !hitTester.BlockerAt(mouseX, mouseY);
+    }
+
+    // 注册一个吞掉 [x,y,w,h] 区域点击的命中区域，
+    // 使模态/弹层表面拦截其下的控件。HitTester
+    // 后注册者优先，且遮罩在页面内容之后绘制，因此
+    // 在绘制背景时调用它——且在遮罩自身
+    // 按钮注册之前——可使拦截器除这些按钮外
+    // 处处优先。返回拦截器 id。
+    int BlockHitsRect(int x, int y, int w, int h) {
+        int id = focus.AllocId();
+        hitTester.RegisterRect(id, x, y, w, h, -1);
+        return id;
+    }
+
+    // 为客户端区域抢占 [x,y,w,h]，对抗窗口边框的
+    // 边缘缩放手柄。紧贴窗口边缘绘制的控件——如滚动条
+    // 位于最后几像素——否则在那里无法点击：边框的
+    // 手柄先响应系统命中测试，按下永远到不了
+    // 客户区，只有滚轮还能滚动。角手柄保持优先，
+    // 保证对角缩放仍可操作。绘制期间每帧调用一次。
+    void ReserveEdgeHit(int x, int y, int w, int h) {
+        window.AddHitGuard(x, y, w, h);
+    }
+
+    // 为浮层（上下文菜单、下拉弹层）抢占 [x,y,w,h] 的系统命中，
+    // 与 ReserveEdgeHit 同一机制、同一每帧清除节奏，画弹层时调用。
+    // 无边框外壳的标题条整条按 HTCAPTION 交给 OS，弹层矩形伸进
+    // 标题条时里面的按下会被当成拖拽标题吞掉——菜单行看得见
+    // 点不到；登记后这部分命中还给客户区。
+    void ReservePopupHit(int x, int y, int w, int h) {
+        window.AddHitGuard(x, y, w, h);
+    }
+
+    // 全窗口 BlockHitsRect：模态遮罩的标准遮罩，其
+    // 变暗背景覆盖整个窗口。
+    // 上下文菜单专用的全窗口阻挡：和 BlockHitsBelow 一样吞掉
+    // 主键，但右键仍解析到菜单下方的控件，于是在别处右键会把
+    // 菜单换到新位置重开（Windows 的一贯行为），而不是要求先
+    // 手动关掉当前菜单。
+    int BlockHitsMenu() {
+        menuBlock = true;
+        return this.BlockHitsBelow();
+    }
+
+    // 右键的命中目标。菜单的遮罩不拥有次要按钮，所以这里越过
+    // 阻挡区，解析到其下方的控件。
+    int RightHitTest(int px, int py) {
+        if (menuBlockPrevious) { return hitTester.HitTestBelowBlockers(px, py); }
+        return hitTester.HitTest(px, py);
+    }
+
+    int BlockHitsBelow() {
+        bool firstBlock = !blocksInputBelow;
+        blocksInputBelow = true;
+        int id = BlockHitsRect(0, 0, canvas.Width(), canvas.Height());
+        hitOnlyBlockers.Add(id);
+        if (firstBlock && !inputBlockPrevious) {
+            focus.SetFocused(id);
+            // 模态在本帧出现，因此正在
+            // 分发的点击（打开它的那次）已消耗：否则，
+            // 新模态内部与打开按钮同坐标处绘制的表面
+            // 会收到同一次点击。
+            clickClaimed = true;
+        }
+        return id;
+    }
+
+    // 事件分发前的规范化（本类三处读取点共用）：
+    // 按压被控件持有（pressedId>=0）时到来的滚轮重标为移动。
+    // 触屏拖动手势的每个采样都以滚轮形式到达（驱动只把不足
+    // 一格的余量合成移动事件），而滚轮在按住时本就不滚动
+    // （见 ProcessEvent/ApplyEvent 的 wheel-pressed 分支）——
+    // 它携带的唯一有效信息就是指针新位置。不重标的话，
+    // Layer 窗口拖动/缩放、文本选区延伸等一切以“kind==1
+    // 且按住”驱动的事件期拖拽在触屏上收不到任何移动采样
+    // （按住拖动、控件纹丝不动，手势被下层当成了滚动）。
+    // 桌面真滚轮按住时重标为移动是安全的：滚轮不改变指针
+    // 位置，拖拽按同一坐标重算，等于无操作。
+    int NormalizedKind() {
+        int k = window.EventKind();
+        if (k == 13 && this.PressOwnsWheel()) { return 1; }
+        return k;
+    }
+
+    // 按住期间到达的滚轮是否归按住的控件所有（拖拽手势）。
+    // 桌面恒归控件：拖拽中误滚不再滚动任何内容，维持原语义。
+    // 触摸上手势分扬：只有认领了拖拽（ClaimDrag：滑块/滚动条/
+    // 分隔条/图表平移这类几何拖拽点）或命中区注册为文本(1)/
+    // 缩放(4-8)光标类型——类型即"按住拖动"语义——的按压才拦住
+    // 滚轮；列表行、按钮等普通命中区上，按住拖动就是滚动页面，
+    // 与移动端惯例一致。
+    bool PressOwnsWheel() {
+        if (focus.pressedId < 0) { return false; }
+        if (!this.TouchDevice()) { return true; }
+        if (this.dragClaimId == focus.pressedId) { return true; }
+        int wt = hitTester.GetWidgetType(focus.pressedId);
+        return wt == 1 || (wt >= 4 && wt <= 8);
+    }
+
+    // 当前按压的控件认领后续的按住拖动（触摸手势分扬）。
+    // 拖拽语义不在命中区类型里体现的控件（几何判定的滚动条
+    // 滑块、分隔手柄、图表平移、专用拖拽把手）在按压帧调用；
+    // 幂等，重复调用无害。桌面无作用（滚轮本就恒归控件）。
+    void ClaimDrag() { dragClaimId = focus.pressedId; }
+
+    // 游戏宿主每帧挂住的事件 kind（HoldEventKind 设置，0 = 本帧
+    // 无事件）与所属窗口。普通 GUI 应用从不挂住，恒为未武装。
+    int holdEvKind;
+    nint holdEvHwnd;
+    bool holdEvArmed;
+
+    // 游戏宿主（GuiHost.Run）每帧排空事件后调用。排空循环的最后
+    // 一次"队列已空"轮询会经 ClearEvent 清掉原生"正在处理的事件"
+    // 状态，而保留树控件（HUD 挂件、HTML 场景按钮）在渲染期才经
+    // EventKind() 读它——不挂住的话 Ui.Clicked 的 kind==3 永远
+    // 不成立，标准控件在游戏窗口里收不到任何点击。挂住值只对
+    // 本帧渲染期有效：宿主下一帧会用新值（无事件帧挂 0）覆盖，
+    // 不会泄漏到后续帧。
+    void HoldEventKind(int kind) {
+        this.holdEvKind = kind;
+        this.holdEvHwnd = this.window.GetHandle();
+        this.holdEvArmed = true;
+    }
+
+    // ---- 键盘事件的「一次性消费」 -------------------------------------
+    // 原生事件槽里的键盘事件（kind 4 按下 / 5 抬起 / 6 字符）一直留到
+    // 下一次轮询为止；这段时间里窗口可能渲染多帧（子窗几乎每帧都脏，
+    // 一次按键会引发「输入框变了 → 标脏 → 再渲染」），于是同一个字符
+    // 被反复投递给输入框：输一个 "4" 得 "44"，退格一次删两个字符。
+    //
+    // 修法：控件真正吃下这个键时记下事件序号，EventKind() 之后不再
+    // 把它投递出去——一个键只归一个消费者（与 ClaimClick 同思路，
+    // 但按事件序号而不是按帧：跨帧的重复渲染也要挡住）。
+    bool keyClaimed;
+    long keyClaimSeq;
+
+    // 标记当前键盘事件已被本窗口的控件消费。
+    void ClaimKey() {
+        this.keyClaimed = true;
+        this.keyClaimSeq = Window.EventSeqGlobal();
+    }
+
+    // 当前键盘事件是否已被消费（同一件事件序号才算）。
+    bool KeyConsumed() {
+        return this.keyClaimed &&
+            this.keyClaimSeq == Window.EventSeqGlobal();
+    }
+
+    // 正在处理的 OS 事件类型；当事件属于
+    // 其他窗口时为 0（"无事件"）。原生事件状态是
+    // 进程全局的：直接读取 window.EventKind() 的表面也会看到
+    // 投递给兄弟或子窗口的点击和按键，并在 id 恰好
+    // 对齐时触发自己的控件。每个窗口拥有的表面
+    // 都必须询问其 App，而非共享的原生状态。
+    // 原生状态已被清（排空后的空轮询）且宿主挂住了本帧事件时，
+    // 回退到挂住值（见 HoldEventKind）。
+    // 键盘事件是否已被控件消费掉（只有 kind 4/5/6 受此闸门约束；
+    // 鼠标/滚轮事件另有 ClaimClick 之类的闸门）。
+    bool KeyBlocked(int kind) {
+        return (kind == 4 || kind == 5 || kind == 6) && this.KeyConsumed();
+    }
+
+    int EventKind() {
+        if (window.GetHandle() == 0) {
+            int kind0 = this.NormalizedKind();
+            return this.KeyBlocked(kind0) ? 0 : kind0;
+        }
+        nint evh = Window.EventHwnd();
+        if (evh != window.GetHandle()) {
+            if (evh == 0 && this.holdEvArmed
+                && this.holdEvHwnd == window.GetHandle()) {
+                return this.holdEvKind;
+            }
+            return 0;
+        }
+        int kind = this.NormalizedKind();
+        /* 已被控件消费掉的键盘事件不再重复投递（见 ClaimKey）。 */
+        return this.KeyBlocked(kind) ? 0 : kind;
+    }
+
+    // 当正在处理的事件投递到了本 App 的窗口时为真。
+    bool EventIsMine() { return window.GetHandle() == 0 || Window.EventHwnd() == window.GetHandle(); }
+
+    // 当主点击（mouse-up）事件在本帧有效且
+    // 可由当前渲染的表面处理时为真。即时模式
+    // 表面应测试此函数而非 window.EventKind() == 3：
+    // 点击被认领（此点击恰好打开了模态）时为 false，
+    // 对绘制在*打开的模态遮罩之下*的内容也为 false——
+    // 模态上一帧已存在（inputBlockPrevious），但其 BlockHitsBelow
+    // 本帧尚未运行，意味着询问的代码渲染在其下方。
+    // 模态自身的内部在其遮罩之后渲染，那里此函数为 true，
+    // 因此点击永远不会穿过模态落到下面的页面。
+    // 一次释放只属于它首次被读到的那一帧。持续动画（星空、
+    // spinner）会在下个事件到来前反复出帧，而 EventKind 停留
+    // 在 3；不锁定的话按钮会在每个动画帧重新触发。同一帧内
+    // 多个表面照常都能读到（绑定只记帧序，不做独占）。
+    bool ClickFrameCurrent() {
+        if (this.clickSeenSeq < 0) { this.clickSeenSeq = this.frameSeq; }
+        return this.clickSeenSeq == this.frameSeq;
+    }
+
+    // 当前帧序号（BeginFrame 递增）。诊断用。
+    int FrameSeq() { return frameSeq; }
+
+    // 按下是否落在阻挡区（浮层遮罩/模态变暗层）上。
+    // 判据必须看「按下命中的那个区域是不是阻挡区」，而不是
+    // 「有没有命中任何东西」：AnchorAt 解析上一帧快照时并不跳过
+    // wtype==-1 的遮罩（HitTester.zan 的 skip 只在 below=true 时
+    // 生效），所以按在遮罩上时 hitId 就是遮罩自己的 id（>=0），
+    // `hitId < 0` 恒为假——pressOnBlocker 形同虚设，「按外部关闭」
+    // 的浮层在按下帧关掉自己后（遮罩随之不在该帧快照里），释放
+    // 照常解析成下层控件的点击目标，同一次手势就先关菜单再点穿
+    // 到后面的内容（下拉/菜单/抽屉/layer 的「点击穿透」）。
+    // 两段判据：命中了遮罩（AnchorTypeOf 为 -1）算按在遮罩上；
+    // 什么都没命中但当前帧有遮罩盖住该点（遮罩比快照新）也算。
+    bool PressHitBlocker(int hitId, int px, int py) {
+        if (hitId >= 0) { return hitTester.AnchorTypeOf(0) == 0 - 1; }
+        return hitTester.BlockerAt(px, py);
+    }
+
+    // 本次释放所属的手势是否按在阻挡区上。跨越按下帧与释放帧
+    // 保持（BeginFrame 不复位，见字段注释）。Ui.Clicked 据此拒绝
+    // 向被遮罩的控件投递这次点击；ClickAvailable 另有同源的一道。
+    bool PressOnBlocker() { return pressOnBlocker; }
+
+    bool ClickAvailable() {
+        if (this.EventKind() != 3 || clickClaimed) { return false; }
+        if (this.window.EventFlag() == 1) { return false; }
+        if (this.longPressFired) { return false; }
+        if (this.pressOnBlocker && !this.hitTester.BlockerAt(this.mouseX, this.mouseY)) { return false; }
+        if (!this.ClickFrameCurrent()) { return false; }
+        if (window.EventButton() != 0) { return false; }
+        if (inputBlockPrevious && !blocksInputBelow) { return false; }
+        if (hitTester.PrevBlockerAt(mouseX, mouseY)
+            && !hitTester.BlockerAt(mouseX, mouseY)) { return false; }
+        return true;
+    }
+
+    // 将当前点击标记为本帧余下时间内已被消费。
+    void ClaimClick() { clickClaimed = true; }
+
+    // 当前释放是否已被某表面认领（见 ClaimClick）。
+    bool ClickClaimed() { return clickClaimed; }
+
+    // 当前点击（mouse-up）落到的控件 id，无则 -1。
+    int ClickTarget() { return hitTester.AnchorIdOf(1); }
+
+    // 当前按下（mouse-down）落到的控件 id，无则 -1。
+    int PressTarget() { return hitTester.AnchorIdOf(0); }
+
+    // 当前次要（右键）点击落到的控件 id，无则 -1。
+    int RightClickTarget() { return hitTester.AnchorIdOf(3); }
+
+    // 当前次要（右键）按下落到的控件 id，无则 -1。
+    int RightPressTarget() { return hitTester.AnchorIdOf(2); }
+
+    // 当完成的点击在双击时间窗内是同一控件上的第二次点击时
+    // 为真（见 Ui.DoubleClicked）。
+    bool DoubleClickNow() { return doubleClickNow; }
+
+    // 记录 `id` 上的完成点击，并在 400 ms 内
+    // 同一 id 重复时标记双击。由鼠标释放路径调用。
+    void NoteClickTarget(int id) {
+        int t = Window.GetTickMs();
+        if (id >= 0 && id == lastClickId && (t - lastClickMs) <= 400) {
+            doubleClickNow = true;
+        } else {
+            doubleClickNow = false;
+        }
+        lastClickId = id;
+        lastClickMs = t;
+    }
+
+    // 快照按下目标/位置/时间，使手势（滑动、长按）
+    // 可从按下起推导。由鼠标按下路径调用。
+    void NotePressStart(int id, int x, int y) {
+        pressStartId = id;
+        pressStartX = x;
+        pressStartY = y;
+        pressStartMs = Window.GetTickMs();
+        longPressFired = false;
+        swipeDir = 0;
+        dragClaimId = 0 - 1;
+    }
+
+    // 把本次按下的手势锚点改记为哨兵 id：即时模式表面
+    // （DataTable 单元格）的按压落在无 id 的几何区域上，
+    // 长按轮询无法与真实控件区分。表面在按压时调用它，
+    // 使随后的 PollLongPress(-2) 之类哨兵查询认领这次按压。
+    // 不动焦点/按下状态，只改手势快照。
+    void NotePressSentinel(int id) {
+        pressStartId = id;
+        longPressFired = false;
+    }
+
+    // 根据按下到释放的位移推导滑动方向：0 无，
+    // 1 左、2 右、3 上、4 下。由鼠标释放路径调用，
+    // 因此在释放帧通过 SwipeDir 读取是有效的。
+    void NoteRelease(int x, int y) {
+        int dx = x - pressStartX;
+        int dy = y - pressStartY;
+        int adx = dx; if (adx < 0) { adx = -adx; }
+        int ady = dy; if (ady < 0) { ady = -ady; }
+        swipeDir = 0;
+        if (adx >= 48 || ady >= 48) {
+            if (adx >= ady) {
+                if (dx < 0) { swipeDir = 1; } else { swipeDir = 2; }
+            } else {
+                if (dy < 0) { swipeDir = 3; } else { swipeDir = 4; }
+            }
+        }
+    }
+
+    // 当前释放帧解析出的滑动方向（见 NoteRelease）。
+    int SwipeDir() { return swipeDir; }
+    // 进行中的手势起始控件（按下目标）。
+    int SwipeTarget() { return pressStartId; }
+
+    // 触摸优先设备（无鼠标悬停）：ANDROID/OHOS 编译期判定，与
+    // 构造函数隐藏窗口 chrome 的闸门一致。依赖悬停才出现的交互
+    // （悬停显隐的手柄/图标、悬停提示、右键菜单）在此为 true 时
+    // 应改走常显与长按等移动端等价物。桌面构建恒为 false——
+    // UiDriver 注入的合成事件与真实鼠标走同一条路径，悬停
+    // 行为不受影响。
+    bool TouchDevice() {
+        #if ANDROID || OHOS || IOS
+        return true;
+        #else
+        return false;
+        #endif
+    }
+
+    // 当指针在 `id` 上按住超过阈值且未大幅移动时
+    // 报告长按。按住期间安排低频后续帧，
+    // 即使没有更多输入计时器也能推进；
+    // 每次按下恰好返回一次 true。移动超过小容差则取消
+    // （该手势随后成为拖拽/滑动，而非长按）。
+    // `id` 允许负数哨兵（配合 NotePressSentinel）：哨兵查询
+    // 无法与 focus.pressedId 比对（那里记录的是命中的真实
+    // 控件 id，如表格行矩形），改查主键是否仍按住。
+    bool PollLongPress(int id) {
+        if (longPressFired) { return false; }
+        if (id < 0) {
+            if (!pointerDown) { return false; }
+        } else if (focus.pressedId != id) { return false; }
+        if (pressStartId != id) { return false; }
+        int mdx = mouseX - pressStartX; if (mdx < 0) { mdx = -mdx; }
+        int mdy = mouseY - pressStartY; if (mdy < 0) { mdy = -mdy; }
+        if (mdx > 12 || mdy > 12) { longPressFired = true; return false; }
+        int t = Window.GetTickMs();
+        if ((t - pressStartMs) >= 500) {
+            longPressFired = true;
+            RequestRedraw();
+            return true;
+        }
+        RequestWakeFrameIn(80);
+        return false;
+    }
+
+    // 当前按住的手势已触发过长按时为真（见 PollLongPress）。
+    // 标志在下一次按下时复位，因此释放帧仍能读到——
+    // 上下文菜单据此忽略终结长按的那次释放（否则菜单
+    // 刚打开就被松手当"点击外部"关掉）。
+    bool LongPressFired() { return longPressFired; }
+
+    // 本次按压已持续的毫秒数；无按压时值无意义。
+    // 触摸上的"长按提示"门控（Ui.HoldTipIn）用它把
+    // 按住时长当作悬停稳定时长的等价物。
+    int HeldPressMs() {
+        return Window.GetTickMs() - pressStartMs;
+    }
+}

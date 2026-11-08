@@ -273,7 +273,9 @@
             LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
             LLVMBuildCondBr(g->builder, hasd, calld, fb);
         } else {
-            LLVMValueRef desc = LLVMBuildLoad2(g->builder, i64, siptr, "desc");
+            LLVMValueRef raw_desc = LLVMBuildLoad2(g->builder, i64, siptr, "desc.raw");
+            LLVMValueRef desc = zan_and(g->builder, raw_desc,
+                LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0), "desc");
             LLVMValueRef is_arr_magic = zan_icmp(g->builder, LLVMIntEQ, desc,
                 LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrmagic");
             LLVMValueRef is_rank = zan_and(g->builder,

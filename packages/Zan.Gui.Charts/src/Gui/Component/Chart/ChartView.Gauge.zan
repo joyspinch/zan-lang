@@ -1,0 +1,798 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// ChartView.Gauge.zan - 仪表盘、径向柱与漏斗图视图渲染器
+public partial class ChartView {
+    // ---- 仪表盘（每序列一个表盘；Canvas 角度顺时针） ----
+
+    // 仪表盘扫掠角（度）：start-end 顺时针跨距，非正回绕加 360，
+    // 超过 360 钳为整圈。
+    public static int GaugeSweep(GaugeOption gauge) {
+        int sweep = gauge.startAngle - gauge.endAngle;
+        while (sweep <= 0) { sweep = sweep + 360; }
+        if (sweep > 360) { sweep = 360; }
+        return sweep;
+    }
+
+    // 仪表盘起始边屏幕角：ECharts 数学角（0=3 点钟逆时针）换算为
+    // Canvas 顺时针域（90-start），回绕到 [0,360)。
+    public static int GaugeStart(GaugeOption gauge) {
+        int start = 90 - gauge.startAngle;
+        while (start < 0) { start = start + 360; }
+        while (start >= 360) { start = start - 360; }
+        return start;
+    }
+
+    // ChartScalar -> 像素：百分比标量按 extent 取比例，固定值
+    // 标量按 DPI 缩放。scalar == null 与运行时宽容语义一致（按 0
+    // 处理，调用方已有各自缺省兜底），但不再刷 null 引用错误日志
+    // （pie/gauge/polar 各车道「整标量直传」的存量形态，sweep
+    // 全量每帧数百条）。
+    public static int GaugeScalar(App app, ChartScalar scalar, int extent) {
+        if (scalar == null) { return 0; }
+        if (scalar.percent) { return extent * scalar.amount / 100; }
+        return app.Scale(scalar.amount);
+    }
+
+    // FillSector 以 12 点钟方向为 0 度并顺时针递增。保持
+    // 仪表盘的矢量几何处于同一坐标系。
+    public static int GaugeX(int angle) { return ChartView.SinDeg(angle); }
+    // 仪表角（12 点钟为 0°、顺时针递增）的 Y 分量 = -cos(angle)。
+    public static int GaugeY(int angle) { return 0 - ChartView.CosDeg(angle); }
+
+    // 以 (start, sweep) 画仪表弧段；跨 0° 时拆成两段 FillSector。
+    public static void GaugeSector(Canvas c, int cx, int cy, int inner, int outer,
+                            int start, int sweep, int color) {
+        if (sweep <= 0 || outer <= inner) { return; }
+        while (start < 0) { start = start + 360; }
+        while (start >= 360) { start = start - 360; }
+        int first = sweep;
+        if (start + first > 360) { first = 360 - start; }
+        if (first > 0) { c.FillSector(cx, cy, inner, outer, start, start + first, color); }
+        int rest = sweep - first;
+        if (rest > 0) { c.FillSector(cx, cy, inner, outer, 0, rest, color); }
+    }
+
+    // 千分比进度对应的轴带色阶色：取第一个 stop >= perMille 的
+    // 色阶，超出取末档；未配色阶返回 0。
+    public static int GaugeColor(GaugeOption gauge, int perMille) {
+        for (int i = 0; i < gauge.axisLine.colors.Count; i = i + 1) {
+            GaugeColorStop stop = gauge.axisLine.colors[i];
+            if (perMille <= stop.stop) { return stop.color; }
+        }
+        if (gauge.axisLine.colors.Count > 0) {
+            return gauge.axisLine.colors[gauge.axisLine.colors.Count - 1].color;
+        }
+        return 0;
+    }
+
+    // 仪表文字大小：表盘的标签、标题和读数按表盘定尺寸，
+    // 而非窗口。固定 px 字号（ECharts 的 30px detail）只在
+    // demo 的表盘尺寸下合适 —— 小卡片上同样字号会盖住
+    // 刻度标签并溢出圆弧，这正是此前
+    // 仪表与参照完全不像的原因。`permilleOfRadius` 把
+    // 请求字号限制在半径的一定比例内。
+    public static int GaugeFont(App app, int requested, int fallback, int radius,
+                         int permilleOfRadius) {
+        int size = fallback;
+        if (requested > 0) { size = app.Scale(requested); }
+        int cap = radius * permilleOfRadius / 1000;
+        if (cap < 8) { cap = 8; }
+        if (size > cap) { size = cap; }
+        if (size < 8) { size = 8; }
+        return size;
+    }
+
+    // 仪表盘渲染入口：每条可见 Gauge 系列一个表盘——轴带色阶
+    // （随 g 生长）、刻度/分隔线、刻度标签、指针（含阴影）、
+    // 标题与读数（detail 背景/边框、防重叠钳制）；整盘命中
+    // （Gauge 事件，单数据点语义）+ tooltip。
+    public static void DrawGauge(App app, int x, int y, int w, int h,
+                          ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        // 覆盖层 option：不重画面板底/头（mix11 仪表盘+漏斗同图）。
+        int top = y + pad;
+        if (!o.overlay) { top = ChartView.PanelHead(app, x, y, w, h, o.title); }
+        int bodyX = x + pad;
+        int bodyY = top;
+        int bodyW = w - pad * 2;
+        int bodyH = y + h - pad - top;
+        int baseSize = bodyW;
+        if (bodyH < baseSize) { baseSize = bodyH; }
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (!s.hidden && s.type == ChartType.Gauge) {
+                GaugeOption gauge = s.gauge;
+                int min = gauge.min;
+                int max = gauge.max;
+                double rawVal = (double)min;
+                if (s.Count() > 0) { rawVal = s.Number(0); }
+                if (rawVal < (double)min) { rawVal = (double)min; }
+                if (rawVal > (double)max) { rawVal = (double)max; }
+                int val = (int)rawVal;
+                int span = max - min;
+                if (span < 1) { span = 1; }
+                int perMille = (int)((rawVal - (double)min) * 1000.0 / (double)span);
+                int startAngle = ChartView.GaugeStart(gauge);
+                int sweep = ChartView.GaugeSweep(gauge);
+                int cx = bodyX + ChartView.GaugeScalar(app, gauge.center.x, bodyW);
+                int cy = bodyY + ChartView.GaugeScalar(app, gauge.center.y, bodyH);
+                int radius = ChartView.GaugeScalar(app, gauge.radius, baseSize / 2);
+                if (radius < app.Scale(12)) { radius = app.Scale(12); }
+                int axisW = app.Scale(gauge.axisLine.lineStyle.width);
+                if (axisW < 1) { axisW = 1; }
+                // innerRadius（环形仪表）：轴带从内半径铺到外半径；
+                // 未设置（0）时退化为外缘轴宽带。
+                int innerR = ChartView.GaugeScalar(app, gauge.innerRadius, radius);
+                if (innerR < 0) { innerR = 0; }
+                int bandInner = radius - axisW;
+                if (bandInner < innerR) { bandInner = innerR; }
+
+                if (gauge.axisLine.show) {
+                    int prev = 0;
+                    for (int stops = 0; stops < gauge.axisLine.colors.Count; stops = stops + 1) {
+                        GaugeColorStop colorStop = gauge.axisLine.colors[stops];
+                        int stop = colorStop.stop;
+                        int col = colorStop.color;
+                        if (stop < prev) { stop = prev; }
+                        if (stop > 1000) { stop = 1000; }
+                        int segStart = startAngle + sweep * prev / 1000;
+                        int segSweep = sweep * (stop - prev) / 1000;
+                        int grown = sweep * g / 1000;
+                        int rel = segStart - startAngle;
+                        if (rel < grown) {
+                            if (rel + segSweep > grown) { segSweep = grown - rel; }
+                            ChartView.GaugeSector(c, cx, cy, bandInner, radius,
+                                segStart, segSweep, col);
+                        }
+                        prev = stop;
+                    }
+                }
+
+                if ((gauge.axisTick.show || gauge.splitLine.show) && gauge.splitNumber > 0) {
+                    int minor = gauge.axisTick.splitNumber;
+                    if (minor < 1) { minor = 1; }
+                    int totalTicks = gauge.splitNumber * minor;
+                    for (int ti = 0; ti <= totalTicks; ti = ti + 1) {
+                        bool major = ti % minor == 0;
+                        int len = app.Scale(gauge.axisTick.length);
+                        int thick = app.Scale(gauge.axisTick.lineStyle.width);
+                        int tickColor = gauge.axisTick.lineStyle.color;
+                        bool showTick = gauge.axisTick.show;
+                        if (major) {
+                            len = app.Scale(gauge.splitLine.length);
+                            thick = app.Scale(gauge.splitLine.lineStyle.width);
+                            tickColor = gauge.splitLine.lineStyle.color;
+                            showTick = gauge.splitLine.show;
+                        }
+                        int ang = startAngle + sweep * ti / totalTicks;
+                        int x0 = cx + ChartView.GaugeX(ang) * (radius - axisW) / 1000;
+                        int y0 = cy + ChartView.GaugeY(ang) * (radius - axisW) / 1000;
+                        int x1 = cx + ChartView.GaugeX(ang) * (radius - axisW - len) / 1000;
+                        int y1 = cy + ChartView.GaugeY(ang) * (radius - axisW - len) / 1000;
+                        if (showTick) { c.DrawLine(x0, y0, x1, y1, tickColor, thick); }
+                    }
+                }
+
+                if (gauge.axisLabel.show && gauge.splitNumber > 0) {
+                    for (int li = 0; li <= gauge.splitNumber; li = li + 1) {
+                        int ang2 = startAngle + sweep * li / gauge.splitNumber;
+                        int lv = min + span * li / gauge.splitNumber;
+                        string ls = Convert.ToString(lv);
+                        if (gauge.axisLabel.formatter.Length > 0) {
+                            ls = gauge.axisLabel.formatter.Replace("{value}", ls);
+                        }
+                        int labelSize = ChartView.GaugeFont(app,
+                            gauge.axisLabel.textStyle.fontSize, ChartFonts.AxisLabel(app),
+                            radius, 150);
+                        // 标签紧贴分隔线内侧。钳制环半径
+                        // 可在表盘小到刻度 + 间隙几乎占据整个
+                        // 半径时，避免标签与标题/读数
+                        // 重叠。
+                        int lr = radius - axisW - app.Scale(gauge.splitLine.length)
+                            - labelSize;
+                        int lrMin = radius * 55 / 100;
+                        if (lr < lrMin) { lr = lrMin; }
+                        int labelColor = gauge.axisLabel.textStyle.color;
+                        if (labelColor == 0) {
+                            labelColor = Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0);
+                        }
+                        int lx = cx + ChartView.GaugeX(ang2) * lr / 1000;
+                        int ly = cy + ChartView.GaugeY(ang2) * lr / 1000;
+                        c.DrawText(lx - Canvas.MeasureText(ls, labelSize) / 2,
+                            Canvas.CenterTextYAt(ly, labelSize),
+                            ls, labelColor, labelSize);
+                    }
+                }
+
+                int valueSweep = sweep * perMille / 1000;
+                valueSweep = valueSweep * g / 1000;
+                if (gauge.progress.show && valueSweep > 0) {
+                    int progW = gauge.progress.width > 0 ? app.Scale(gauge.progress.width) : axisW;
+                    int progInner = radius - progW;
+                    if (progInner < 0) { progInner = 0; }
+                    int progCol = gauge.progress.color;
+                    if (progCol == 0) { progCol = ChartView.GaugeColor(gauge, perMille); }
+                    if (progCol == 0) { progCol = ChartColor.Palette(app.theme, 0); }
+                    ChartView.GaugeSector(c, cx, cy, progInner, radius,
+                        startAngle, valueSweep, progCol);
+                }
+                int pointerAngle = startAngle + valueSweep;
+                int pointerR = ChartView.GaugeScalar(app, gauge.pointer.length, radius);
+                int px = cx + ChartView.GaugeX(pointerAngle) * pointerR / 1000;
+                int py = cy + ChartView.GaugeY(pointerAngle) * pointerR / 1000;
+                // ECharts pointer.color 默认 'auto' = 轴线色阶当前
+                // 段色；除显式 pointer.color 外不接受系列色 ——
+                // 物化副本的 s.color 恒为调色板色，掺进来会把
+                // auto 劫持成调色板色（gauge1 指针发青的根因）。
+                int pointerColor = gauge.pointer.color;
+                if (pointerColor == 0) { pointerColor = ChartView.GaugeColor(gauge, perMille); }
+                // ECharts 指针：细长矛头形，轮毂处最宽，
+                // 尖端收成一点。以一系列抗锯齿圆盘光栅化成锥体，
+                // 主体无空隙、边缘平滑
+                // —— 逐行垂直扫描线会留下可见的
+                // 对角网格，而在数值角对面绘制尾翼
+                // 会产生从表盘远侧刺出的尖刺。
+                int halfPointerW = app.Scale(gauge.pointer.width) / 2;
+                if (halfPointerW < 1) { halfPointerW = 1; }
+                if (gauge.pointer.show && pointerR > 0) {
+                    int ux = ChartView.GaugeX(pointerAngle);
+                    int uy = ChartView.GaugeY(pointerAngle);
+                    // 指针阴影：沿指针方向有限偏移的合成圆盘
+                    // （无真实模糊，确定性）。
+                    if (gauge.pointer.shadowBlur > 0 && gauge.pointer.shadowColor != 0) {
+                        int soff = app.Scale(gauge.pointer.shadowBlur);
+                        if (soff < 1) { soff = 1; }
+                        if (soff > radius / 3) { soff = radius / 3; }
+                        int pmx = cx + ux * pointerR / 2 / 1000;
+                        int pmy = cy + uy * pointerR / 2 / 1000;
+                        c.FillCircle(pmx + ux * soff / 1000, pmy + uy * soff / 1000,
+                            halfPointerW * 2 / 3 + 1,
+                            ChartColor.WithAlpha(gauge.pointer.shadowColor, 120));
+                    }
+                    int tail = halfPointerW;
+                    int step = 0 - tail;
+                    while (step <= pointerR) {
+                        int rr;
+                        if (step < 0) { rr = halfPointerW * (tail + step) / tail; }
+                        else { rr = halfPointerW * (pointerR - step) / pointerR; }
+                        if (rr < 1) { rr = 1; }
+                        int ax = cx + ux * step / 1000;
+                        int ay = cy + uy * step / 1000;
+                        c.FillCircle(ax, ay, rr, pointerColor);
+                        step = step + 1;
+                    }
+                    c.FillCircle(cx, cy, halfPointerW + app.Scale(1), pointerColor);
+                }
+                if (gauge.anchor.show) {
+                    int ancR = app.Scale(gauge.anchor.size) / 2;
+                    if (ancR < 1) { ancR = 1; }
+                    int ancCol = gauge.anchor.color != 0 ? gauge.anchor.color : pointerColor;
+                    c.FillCircle(cx, cy, ancR, ancCol);
+                    if (gauge.anchor.borderWidth > 0 && gauge.anchor.borderColor != 0) {
+                        c.DrawCircle(cx, cy, ancR, gauge.anchor.borderColor, app.Scale(gauge.anchor.borderWidth));
+                    }
+                }
+
+                string titleText = s.name;
+                if (s.data.Count > 0 && s.data[0].name.Length > 0) {
+                    titleText = s.data[0].name;
+                }
+                int titleSize = ChartView.GaugeFont(app,
+                    gauge.title.textStyle.fontSize, ChartFonts.AxisLabel(app),
+                    radius, 180);
+                int titleBottom = cy
+                    + ChartView.GaugeScalar(app, gauge.title.offsetCenter.y, radius)
+                    + titleSize / 2;
+                bool titleDrawn = gauge.title.show && titleText.Length > 0;
+                if (titleDrawn) {
+                    int titleColor = gauge.title.textStyle.color;
+                    if (titleColor == 0) {
+                        titleColor = Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0);
+                    }
+                    int tx = cx + ChartView.GaugeScalar(app, gauge.title.offsetCenter.x, radius);
+                    int ty = titleBottom - titleSize / 2;
+                    c.DrawText(tx - Canvas.MeasureText(titleText, titleSize) / 2,
+                        Canvas.CenterTextY(ty - titleSize / 2, titleSize, titleSize),
+                        titleText, titleColor, titleSize);
+                }
+                if (gauge.detail.show) {
+                    string detail = gauge.detail.formatter;
+                    if (detail.Length == 0) { detail = "{value}"; }
+                    string valueText = Convert.ToString(val);
+                    if (gauge.precision > 0) {
+                        valueText = Chart.FormatFixed(rawVal, gauge.precision);
+                    } else if (rawVal != (double)val) {
+                        valueText = Convert.ToString(rawVal);
+                    }
+                    detail = detail.Replace("{value}", valueText);
+                    int detailSize = ChartView.GaugeFont(app,
+                        gauge.detail.textStyle.fontSize, Style.FontFallback(app, "large"),
+                        radius, 300);
+                    int detailColor = gauge.detail.textStyle.color;
+                    if (detailColor == 0) {
+                        detailColor = Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0);
+                    }
+                    int dx = cx + ChartView.GaugeScalar(app, gauge.detail.offsetCenter.x, radius);
+                    int dy = cy + ChartView.GaugeScalar(app, gauge.detail.offsetCenter.y, radius);
+                    // 读数与上方的名称保持间距：两个偏移
+                    // 都相对同一圆心，小表盘上配置的
+                    // 20%/40% 环间距会小于两者的
+                    // 字形高度，导致文字互相重叠。
+                    int detailTopMin = titleBottom + app.Scale(2) + detailSize / 2;
+                    if (titleDrawn && dy < detailTopMin) { dy = detailTopMin; }
+                    // 富文本读数（gauge-speed "{value} {unit|km/h}"）：
+                    // 块自带盒样式（detail 级 backgroundColor/border/
+                    // borderRadius 已解析进 textStyle 的盒字段），锚在
+                    // offsetCenter 上、整块居中。
+                    if (gauge.detail.textStyle.rich != null
+                        && detail.IndexOf("{") >= 0) {
+                        RichBlock blk = ChartView.RichLayout(app,
+                            Chart.RichTokenize(detail, gauge.detail.textStyle),
+                            gauge.detail.textStyle, detailSize);
+                        ChartView.RichDraw(app, c, dx - blk.w / 2, dy - blk.h / 2,
+                            blk, detailColor);
+                    } else {
+                    // 读数背景 + 边框（detail.backgroundColor / borderColor /
+                    // borderWidth / width / height；0 宽度/透明背景则无框）。
+                    int dTextW = Canvas.MeasureText(detail, detailSize);
+                    int boxW = app.Scale(gauge.detail.width);
+                    if (dTextW + app.Scale(10) > boxW) { boxW = dTextW + app.Scale(10); }
+                    int boxH = app.Scale(gauge.detail.height);
+                    if (detailSize + app.Scale(6) > boxH) { boxH = detailSize + app.Scale(6); }
+                    int bx = dx - boxW / 2;
+                    int by = dy - boxH / 2;
+                    if (gauge.detail.backgroundColor != 0) {
+                        c.FillRoundRect(bx, by, boxW, boxH, t.borderRadiusSmall,
+                            gauge.detail.backgroundColor);
+                    }
+                    if (gauge.detail.borderWidth > 0) {
+                        c.DrawRoundRect(bx, by, boxW, boxH, t.borderRadiusSmall,
+                            gauge.detail.borderColor, app.Scale(gauge.detail.borderWidth));
+                    }
+                    c.DrawText(dx - Canvas.MeasureText(detail, detailSize) / 2,
+                        Canvas.CenterTextY(dy - detailSize / 2, detailSize, detailSize),
+                        detail, detailColor, detailSize);
+                    }
+                }
+            }
+        }
+
+        // 命中几何与 tooltip 展示解耦：关闭 tooltip 不能关闭
+        // 仪表盘的 Hover/MouseOut/Click 事件（整盘命中，即
+        // ECharts gauge 系列的单数据点）。
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        // 指针被上层弹层/抽屉接管时命中与 tooltip 整体静默（悬停穿透）。
+        bool gaugeHover = !ChartView.HoverBlocked(app);
+        int hit = o.series.Count - 1;
+        while (hit >= 0 && gaugeHover) {
+            ChartSeries hs = o.series[hit];
+            if (!hs.hidden && hs.type == ChartType.Gauge) {
+                GaugeOption hitGauge = hs.gauge;
+                int hcx = bodyX + ChartView.GaugeScalar(app, hitGauge.center.x, bodyW);
+                int hcy = bodyY + ChartView.GaugeScalar(app, hitGauge.center.y, bodyH);
+                int hr = ChartView.GaugeScalar(app, hitGauge.radius, baseSize / 2);
+                int ddx = mx - hcx;
+                int ddy = my - hcy;
+                if (ChartView.ISqrt(ddx * ddx + ddy * ddy) <= hr) {
+                    double hitRaw = (double)hitGauge.min;
+                    if (hs.Count() > 0) { hitRaw = hs.Number(0); }
+                    if (ChartView.activeEventView != null) {
+                        ChartHit gh = ChartHit.Of(ChartElementType.Gauge,
+                            hit, hs.name, 0, hs.name, (int)hitRaw, mx, my);
+                        gh.axisIndex = hs.axisIndex;
+                        ChartView.OfferActiveHit(gh);
+                    }
+                    if (o.showTooltip) {
+                        string hitValue = Convert.ToString((int)hitRaw);
+                        if (hitGauge.precision > 0 || hitRaw != (double)((int)hitRaw)) {
+                            hitValue = Convert.ToString(hitRaw);
+                        }
+                        List<TooltipRow> rows = new List<TooltipRow>();
+                        rows.Add(TooltipRow.Of(0, o.title));
+                        string hitDetail = hitGauge.detail.formatter;
+                        if (hitDetail.Length == 0) { hitDetail = "{value}"; }
+                        hitDetail = hitDetail.Replace("{value}", hitValue);
+                        rows.Add(TooltipRow.Of(hs.color, hs.name + "  " + hitDetail
+                            + "  [" + Convert.ToString(hitGauge.min) + ", " + Convert.ToString(hitGauge.max) + "]"));
+                        ChartView.TooltipCard(app, mx, my, x + w, rows);
+                    }
+                    break;
+                }
+            }
+            hit = hit - 1;
+        }
+    }
+
+    // ---- 径向柱状图（同心进度环；扫掠角随 g 增长） ----
+
+    // 径向柱状图渲染入口：每条系列一个同心进度环（环序自外向
+    // 内），扫掠角 = 值/gaugeMax 并随 g 生长；右侧值图例 +
+    // 环带 hover tooltip。
+    public static void DrawRadialBars(App app, int x, int y, int w, int h,
+                               ChartOption o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+
+        int max = o.gaugeMax;
+        if (max <= 0) { max = 100; }
+        int n = o.series.Count;
+        if (n < 1) { return; }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rMax = areaW / 2;
+        if (areaH / 2 < rMax) { rMax = areaH / 2; }
+        if (rMax < app.Scale(20)) { rMax = app.Scale(20); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+
+        int band = rMax * 78 / 100 / n;
+        int gap = app.Scale(3);
+        if (gap > band / 3) { gap = band / 3; }
+        for (int i = 0; i < n; i = i + 1) {
+            ChartSeries ring = o.series[i];
+            int ringOuter = rMax - i * band;
+            int ringInner = ringOuter - band + gap;
+            if (ringInner < 0) { ringInner = 0; }
+            int val = 0;
+            if (o.series[i].Count() > 0) { val = o.series[i].Value(0); }
+            if (val < 0) { val = 0; }
+            if (val > max) { val = max; }
+            c.FillSector(cx, cy, ringInner, ringOuter, 0, 360,
+                Style.Part(app, "chart", "cell", "", "", "", Style.SNormal()).BgOr(0));
+            int sweep = 360 * val / max;
+            sweep = sweep * g / 1000;
+            if (sweep > 0) {
+                c.FillSector(cx, cy, ringInner, ringOuter, 0, sweep, o.series[i].color);
+            }
+        }
+
+        // 图例：色块 + 名称 + 值。
+        int lx = x + w - pad - legendW;
+        int ly = Chart.LegendStartY(app, y, top);
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(ChartFonts.Legend(app)) + app.Scale(6);
+        for (int j = 0; j < n; j = j + 1) {
+            int val = 0;
+            if (o.series[j].Count() > 0) { val = o.series[j].Value(0); }
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, o.series[j].color);
+            string lbl = o.series[j].name + "  " + Convert.ToString(val);
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl,
+                Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
+                ChartFonts.SeriesLabel(app));
+            ly = ly + lh;
+        }
+
+        if (o.showTooltip) {
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            if (ChartView.HoverBlocked(app)) { return; }
+            int ddx = mx - cx;
+            int ddy = my - cy;
+            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+            for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+                int ringOuter = rMax - i2 * band;
+                int ringInner = ringOuter - band + gap;
+                if (ringInner < 0) { ringInner = 0; }
+                if (dist >= ringInner && dist <= ringOuter) {
+                    int v2 = 0;
+                    if (o.series[i2].Count() > 0) { v2 = o.series[i2].Value(0); }
+                    List<TooltipRow> rows = new List<TooltipRow>{
+                        TooltipRow.Of(0, o.title),
+                        TooltipRow.Of(o.series[i2].color,
+                            o.series[i2].name + "  " + Convert.ToString(v2)
+                            + " / " + Convert.ToString(max)) };
+                    ChartView.TooltipCard(app, mx, my, x + w, rows);
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---- 热力图（行=序列，列=数值索引；强度随 g 渐显） ----
+    // 收集漏斗/金字塔/玫瑰图各阶段：每阶段一个值+颜色+名称，来源为
+    // 多个单值系列或一个多值系列；隐藏系列/数据项被跳过。
+    public static List<ChartStage> GatherStages(App app, List<ChartSeries> series) {
+        Theme t = app.theme;
+        List<ChartStage> stages = new List<ChartStage>();
+        // 过滤隐藏系列——legend toggle 隐藏后立即不画（重绘时
+        // GatherStages 在 DrawFunnel/DrawRose 入口被调用，stage
+        // 集合随 hidden 同步缩放）。
+        if (series.Count > 1) {
+            for (int i = 0; i < series.Count; i = i + 1) {
+                if (series[i].hidden) { continue; }
+                int v = 0;
+                if (series[i].Count() > 0) { v = series[i].Value(0); }
+                int col = series[i].color;
+                if (col == 0) { col = ChartColor.Palette(t, i); }
+                stages.Add(new ChartStage(v, col, series[i].name, i));
+            }
+        } else if (series.Count == 1) {
+            int n = series[0].Count();
+            for (int i = 0; i < n; i = i + 1) {
+                if (series[0].data[i].hidden) { continue; }
+                int col = ChartColor.Palette(t, i);
+                if (series[0].data[i].color != 0) { col = series[0].data[i].color; }
+                string nm = series[0].data[i].name;
+                ChartStage st = new ChartStage(series[0].Value(i), col, nm, 0);
+                st.dataIndex = i;
+                stages.Add(st);
+            }
+        }
+        return stages;
+    }
+
+    public static List<ChartStage> GatherStagesForSeries(App app, ChartSeries s, int seriesIndex) {
+        List<ChartStage> stages = new List<ChartStage>();
+        Theme t = app.theme;
+        int n = s.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            if (s.data[i].hidden) { continue; }
+            int col = ChartColor.Palette(t, i);
+            if (s.data[i].color != 0) { col = s.data[i].color; }
+            string nm = s.data[i].name;
+            ChartStage st = new ChartStage(s.Value(i), col, nm, seriesIndex);
+            st.dataIndex = i;
+            stages.Add(st);
+        }
+        return stages;
+    }
+
+    // ---- 漏斗图 / 金字塔图 ----
+
+    public static void DrawFunnelStages(App app, int curX, int curY, int curW, int curH,
+                                 ChartSeries s, List<ChartStage> stages,
+                                 int g, bool isPyramid, ChartOption o, int userSi) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int n = stages.Count;
+        if (n < 1) { return; }
+        int maxV = 1;
+        foreach (ChartStage st in stages) { if (st.val > maxV) { maxV = st.val; } }
+
+        string fAlign = s != null ? s.funnelAlign : "";
+        int fGap = s != null ? s.funnelGap : 0 - 1;
+        bool fPct = s != null && s.funnelPercent;
+        int cx = curX + curW / 2;
+        if (fAlign == "left") { cx = curX; }
+        else if (fAlign == "right") { cx = curX + curW; }
+        int gapPx = 0;
+        if (fGap >= 0) { gapPx = app.Scale(fGap); }
+        int maxW = curW;
+        if (s != null && s.maxSizePct > 0 && s.maxSizePct < 100) {
+            maxW = curW * s.maxSizePct / 100;
+        }
+        int rowH = curH / n;
+        if (rowH < 1) { rowH = 1; }
+
+        for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+            int idx = i2;
+            if (isPyramid) { idx = n - 1 - i2; }
+            int vTop = stages[idx].val;
+            int vBot = vTop;
+            int nextIdx = idx + 1;
+            if (isPyramid) { nextIdx = idx - 1; }
+            if (nextIdx >= 0 && nextIdx < n) { vBot = stages[nextIdx].val; }
+            int wTop = (int)((long)vTop * maxW * g / ((long)maxV * 1000L));
+            int wBot = (int)((long)vBot * maxW * g / ((long)maxV * 1000L));
+            int ry = curY + i2 * rowH;
+            int col = stages[idx].color;
+            int strip = rowH - gapPx;
+            if (strip < 1) { strip = 1; }
+            int wTopF = wTop * 256;
+            int wBotF = wBot * 256;
+            int cxF = cx * 256;
+            for (int r = 0; r < strip; r = r + 1) {
+                int tt = 0;
+                if (strip > 0) { tt = r * 1000 / strip; }
+                int wwF = wTopF + (wBotF - wTopF) * tt / 1000;
+                int xlF = cxF - wwF / 2;
+                int xrF = xlF + wwF;
+                int xl = xlF / 256;
+                if (xlF < 0) { xl = (xlF - 255) / 256; }
+                int xr = (xrF + 255) / 256;
+                int yRow = ry + r;
+                int lcov = (xl + 1) * 256 - xlF;
+                if (lcov >= 256) { c.FillRect(xl, yRow, 1, 1, col); }
+                else if (lcov > 0) { c.FillRect(xl, yRow, 1, 1, ChartColor.WithAlpha(col, lcov)); }
+                int m0 = xl + 1;
+                int m1 = xr - 1;
+                if (m1 > m0) { c.FillRect(m0, yRow, m1 - m0, 1, col); }
+                int rcov = xrF - (xr - 1) * 256;
+                if (rcov >= 256) { c.FillRect(xr - 1, yRow, 1, 1, col); }
+                else if (rcov > 0) { c.FillRect(xr - 1, yRow, 1, 1, ChartColor.WithAlpha(col, rcov)); }
+            }
+            string lbl = stages[idx].name;
+            if (lbl.Length == 0) { lbl = Convert.ToString(stages[idx].val); }
+            if (fPct) { lbl = lbl + ChartView.FunnelPct(stages, idx); }
+            if (s != null && s.funnelLabelOut && stages[idx].name.Length > 0) {
+                int ox = cx + (wTop > wBot ? wTop : wBot) / 2 + app.Scale(6);
+                if (ox + app.Scale(60) > curX + curW) {
+                    ox = curX + curW - app.Scale(60);
+                }
+                c.DrawText(ox, ry + (rowH - Canvas.FontHeight(ChartFonts.SeriesLabel(app))) / 2, lbl,
+                    Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
+                    ChartFonts.SeriesLabel(app));
+            } else {
+                c.DrawTextCentered(cx - curW / 2, ry + rowH / 2 - Canvas.FontHeight(ChartFonts.Legend(app)) / 2,
+                    curW, Canvas.FontHeight(ChartFonts.SeriesLabel(app)), lbl,
+                    Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0),
+                    ChartFonts.SeriesLabel(app));
+            }
+        }
+
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        if (ChartView.HoverBlocked(app)) { return; }
+        if (mx >= curX && mx < curX + curW && my >= curY && my < curY + curH) {
+            int idx = (my - curY) / rowH;
+            if (idx < 0) { idx = 0; }
+            if (idx > n - 1) { idx = n - 1; }
+            ChartStage st = stages[idx];
+            string nm = st.name;
+            if (nm.Length == 0) { nm = ChartView.StageName(idx); }
+            if (ChartView.activeEventView != null) {
+                ChartHit fh = ChartHit.Of(ChartElementType.FunnelStage,
+                    userSi, s != null ? s.name : "", idx, nm, st.val, mx, my);
+                if (s != null) { fh.axisIndex = s.axisIndex; }
+                ChartView.OfferActiveHit(fh);
+            }
+            if (o.showTooltip) {
+                int cy2 = curY + idx * rowH + rowH / 2;
+                int crossCol = Style.Part(app, "chart", "crosshair", "", "", "", Style.SNormal()).BgOr(0);
+                c.FillRect(curX, cy2, curW, 1, ChartColor.WithAlpha(crossCol, 200));
+                string lblF = nm + "  " + Convert.ToString(st.val);
+                if (fPct) { lblF = lblF + ChartView.FunnelPct(stages, idx); }
+                int fs = ChartFonts.SeriesLabel(app);
+                int lw = Canvas.MeasureText(lblF, fs);
+                int labelX = curX - lw - app.Scale(6);
+                if (labelX < 0) { labelX = 0; }
+                int labelY = cy2 - Canvas.FontHeight(fs) / 2;
+                c.FillRoundRect(labelX - app.Scale(2), labelY, lw + app.Scale(4),
+                    Canvas.FontHeight(fs), app.Scale(2), crossCol);
+                c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
+                    "crosshair-label", "", "", "", Style.SNormal()).FgOr(crossCol), fs);
+                List<TooltipRow> rows = new List<TooltipRow>();
+                string sTitle = s != null && s.name.Length > 0 ? s.name : o.title;
+                rows.Add(TooltipRow.Of(0, sTitle));
+                rows.Add(TooltipRow.Of(st.color, nm + "  " + Convert.ToString(st.val)
+                    + (fPct ? ChartView.FunnelPct(stages, idx) : "")));
+                ChartView.TooltipCard(app, mx, my, curX + curW, rows);
+            }
+        }
+    }
+
+    // 漏斗（pyramid=false）/金字塔（pyramid=true，阶段序反转）
+    // 渲染入口：阶段宽度 ∝ 值/maxV，逐行按 1/256 亚像素覆盖率
+    // 画斜边；支持单漏斗与多漏斗独立盒模型排版；右侧可选
+    // 图例；行命中（FunnelStage 事件）+ 横向指示线 + tooltip。
+    public static void DrawFunnel(App app, int x, int y, int w, int h,
+                           ChartOption o, int g, bool pyramid) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        // 覆盖层 option：不重画面板底/头（mix11 双漏斗与仪表盘同图）。
+        int top = y + pad;
+        if (!o.overlay) { top = ChartView.PanelHead(app, x, y, w, h, o.title); }
+
+        ChartView.ApplyDataLegend(app, o);
+        int legendW = 0;
+        if (o.showLegend) { legendW = app.Scale(120); }
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+
+        bool multiFunnel = false;
+        int funnelCount = 0;
+        for (int fi = 0; fi < o.series.Count; fi = fi + 1) {
+            ChartSeries fs = o.series[fi];
+            if (!fs.hidden && fs.type == ChartType.Funnel) {
+                funnelCount = funnelCount + 1;
+                if (fs.data.Count > 1) { multiFunnel = true; }
+            }
+        }
+
+        if (multiFunnel && funnelCount > 1) {
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries s = o.series[si];
+                if (s.hidden || s.type != ChartType.Funnel) { continue; }
+                List<ChartStage> stages = ChartView.GatherStagesForSeries(app, s, si);
+                if (stages.Count < 1) { continue; }
+                int subX = x + pad;
+                int subY = top;
+                int subW = areaW;
+                int subH = areaH;
+                if (s.boxLeft != null) { subX = x + ChartView.GaugeScalar(app, s.boxLeft, w); }
+                if (s.boxTop != null) { subY = y + ChartView.GaugeScalar(app, s.boxTop, h); }
+                if (s.boxWidth != null) { subW = ChartView.GaugeScalar(app, s.boxWidth, w); }
+                if (s.boxHeight != null) { subH = ChartView.GaugeScalar(app, s.boxHeight, h); }
+                bool isPyr = s.sort == "ascending" || pyramid;
+                ChartView.DrawFunnelStages(app, subX, subY, subW, subH, s, stages, g, isPyr, o, si);
+            }
+        } else {
+            List<ChartStage> stages = ChartView.GatherStages(app, o.series);
+            if (stages.Count > 0) {
+                ChartSeries fs0 = ChartView.LeadSeries(o);
+                bool isPyr = (fs0 != null && fs0.sort == "ascending") || pyramid;
+                int subX = x + pad;
+                int subY = top;
+                int subW = areaW;
+                int subH = areaH;
+                if (fs0 != null) {
+                    if (fs0.boxLeft != null) { subX = x + ChartView.GaugeScalar(app, fs0.boxLeft, w); }
+                    if (fs0.boxTop != null) { subY = y + ChartView.GaugeScalar(app, fs0.boxTop, h); }
+                    if (fs0.boxWidth != null) { subW = ChartView.GaugeScalar(app, fs0.boxWidth, w); }
+                    if (fs0.boxHeight != null) { subH = ChartView.GaugeScalar(app, fs0.boxHeight, h); }
+                }
+                ChartView.DrawFunnelStages(app, subX, subY, subW, subH, fs0, stages, g, isPyr, o, 0);
+            }
+        }
+
+        if (o.showLegend) {
+            int lx = x + w - pad - legendW;
+            int ly = Chart.LegendStartY(app, y, top);
+            ChartView.DrawStageLegend(app, o, lx, ly, legendW);
+        }
+    }
+
+    // 阶段缺省名："Stage N"（N 从 1 起）。
+    public static string StageName(int i) { return "Stage " + Convert.ToString(i + 1); }
+
+    // 转化率（ECharts funnel 的逐层转化）：相对上一阶段的百分比
+    // 后缀 " (x%)"；顶层恒 100%；除零返回空串。
+    public static string FunnelPct(List<ChartStage> stages, int idx) {
+        if (idx == 0) { return " (100%)"; }
+        if (idx < 1 || idx >= stages.Count) { return ""; }
+        int prev = stages[idx - 1].val;
+        if (prev < 1) { return ""; }
+        return " (" + Convert.ToString(stages[idx].val * 100 / prev) + "%)";
+    }
+
+
+    // 漏斗/玫瑰等"阶段图"的图例绘制（单列定宽）。
+    public static void DrawStageLegend(App app, ChartOption o, int lx, int ly, int legendW) {
+        Theme t = app.theme;
+        int lh = Canvas.FontHeight(ChartFonts.Legend(app)) + app.Scale(6);
+        if (o.series.Count > 1) {
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries s = o.series[si];
+                int col = s.color;
+                if (col == 0) { col = ChartColor.Palette(t, si); }
+                string nm = s.name;
+                if (nm.Length == 0) { nm = ChartView.StageName(si); }
+                int v = 0;
+                if (s.Count() > 0) { v = s.Value(0); }
+                int key = 0;
+                if (o.iwid != 0) { key = Chart.LegendKey(o.iwid, si); }
+                Chart.DrawLegendChip(app, lx, ly, legendW, lh, col,
+                    nm + "  " + Convert.ToString(v), s.hidden, key);
+                ly = ly + lh;
+            }
+        } else if (o.series.Count == 1) {
+            ChartSeries s = o.series[0];
+            for (int di = 0; di < s.data.Count; di = di + 1) {
+                int col = ChartColor.Palette(t, di);
+                if (s.data[di].color != 0) { col = s.data[di].color; }
+                string nm = s.data[di].name;
+                if (nm.Length == 0) { nm = ChartView.StageName(di); }
+                int key = 0;
+                if (o.iwid != 0) { key = Chart.LegendSliceKey(o.iwid, 0, di); }
+                Chart.DrawLegendChip(app, lx, ly, legendW, lh, col,
+                    nm + "  " + Chart.SeriesNumText(s, di),
+                    s.data[di].hidden, key);
+                ly = ly + lh;
+            }
+        }
+    }
+
+    // ---- 玫瑰图 / 南丁格尔图（等角，半径按值） ----
+
+}

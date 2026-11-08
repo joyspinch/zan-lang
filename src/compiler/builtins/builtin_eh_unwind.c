@@ -526,8 +526,10 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, rel_arr_work);
     LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
     LLVMValueRef site_p = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), vobj, &neg8, 1, "arr.sitep");
-    LLVMValueRef site_val = LLVMBuildLoad2(g->builder, i64t,
-        LLVMBuildBitCast(g->builder, site_p, LLVMPointerType(i64t, 0), "arr.siteip"), "arr.site");
+    LLVMValueRef raw_site = LLVMBuildLoad2(g->builder, i64t,
+        LLVMBuildBitCast(g->builder, site_p, LLVMPointerType(i64t, 0), "arr.siteip"), "arr.site.raw");
+    LLVMValueRef site_val = zan_and(g->builder, raw_site,
+        LLVMConstInt(i64t, ~ZAN_OBJ_STACK_FLAG, 0), "arr.site");
     LLVMValueRef is_magic = zan_icmp(g->builder, LLVMIntEQ, site_val,
         LLVMConstInt(i64t, ZAN_ARRAY_MAGIC, 0), "arr.ismagic");
     LLVMValueRef is_rank = zan_and(g->builder,

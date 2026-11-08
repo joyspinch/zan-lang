@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
+
+# ---- Guard against in-source builds (AGENTS.md rule 3 & WORKSPACE_CONVENTIONS.md §3) ----
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+    message(FATAL_ERROR
+        "In-source builds are strictly forbidden.\n"
+        "Please create a separate build directory, e.g. 'cmake -B build -G Ninja ...'\n"
+        "Remove CMakeCache.txt and CMakeFiles/ from the source tree if created.")
+endif()
 # CXX is enabled so that targets linking LLVM's C++ static libraries can be
 # driven by the C++ linker where needed (see the MinGW case below).
 project(zan-lang C CXX)
@@ -2996,7 +3004,6 @@ set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed shard_d
 # 出现，修好了就翻红提醒把它从名单里拿掉。
 set(_known_leaky
   closure_cycle_warning
-  designer_html
 )
 # golden 必须取未插桩普通版的用例：泄漏报告打在 stdout 上，插桩版多一行报告
 # 就比不过 golden（已知会漏的那八条 + arc_leak_site_label），另有插桩自己会改
@@ -3936,6 +3943,27 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/packages)
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_repo.cmake)
   set_tests_properties(selfhost_repo_packages PROPERTIES TIMEOUT 7200)
 endif()
+
+# ---- Self-hosting golden-IR regression gate ----
+# Pins gen1's emitted IR per differential case with per-function content
+# hashes (scripts/normalize_ir.py --fnhash; see tests/run_selfhost_ir_golden.cmake
+# for why a cross-compiler IR diff is not tractable and why names are
+# erased). A commit that changes the emission path shows up as a diff even
+# when every stdout still matches -- the B-ID180 class of divergence. Bless
+# deliberately in the same commit as the emitter change:
+#   cmake -D... -DBLESS=1 -P tests/run_selfhost_ir_golden.cmake
+add_test(NAME selfhost_ir_golden
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_repo/gen1${_exe_ext}
+    -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_repo
+    -DCASE_DIR=${CMAKE_SOURCE_DIR}/tests/conformance
+    -DCASES=${CMAKE_SOURCE_DIR}/tests/selfhost/diff_cases.txt
+    -DGOLDEN_DIR=${CMAKE_SOURCE_DIR}/tests/selfhost/ir_golden
+    -DNORM=${CMAKE_SOURCE_DIR}/scripts/normalize_ir.py
+    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_ir_golden.cmake)
+set_tests_properties(selfhost_ir_golden PROPERTIES TIMEOUT 2400)
 
 # ---- Self-hosting: jsongen must fail closed on unsupported field types ----
 # The ok program maps a class whose int[] field is [JsonIgnore]-annotated

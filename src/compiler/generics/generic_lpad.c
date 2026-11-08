@@ -119,6 +119,18 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         }
     }
     if (e->kind == AST_CALL) {
+        if (e->call.callee && e->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *sc = e->call.callee;
+            zan_type_t *st = infer_expr_type(g, sc->member.object, locals);
+            if (st && type_named(st, "StringBuilder", 13)) {
+                zan_istr_t nm = sc->member.name;
+                if ((nm.len == 6 && memcmp(nm.str, "Append", 6) == 0) ||
+                    (nm.len == 10 && memcmp(nm.str, "AppendLine", 10) == 0) ||
+                    (nm.len == 5 && memcmp(nm.str, "Clear", 5) == 0)) {
+                    return expr_yields_owned_rc_value(g, sc->member.object, locals);
+                }
+            }
+        }
         /* NativeMemory */
         if (is_call_to(e, "NativeMemory", "GetString") && e->call.args.count == 3)
             return 1;

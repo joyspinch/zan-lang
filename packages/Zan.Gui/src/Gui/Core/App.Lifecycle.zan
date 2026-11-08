@@ -1,0 +1,943 @@
+using System;
+using Gui.Backend;
+
+namespace Gui;
+
+public partial class App {
+    public void Show() {
+        window.Show();
+        int realW = window.ClientWidth();
+        int realH = window.ClientHeight();
+        if (realW != canvas.Width() || realH != canvas.Height()) {
+            this.SwapCanvas(realW, realH);
+        }
+        dpiScale = window.GetDpiScale();
+        // 桌面保持窗口的真实 DPI；工作区钳制只改变 viewport，不能
+        // 降低字体和控件比例，否则首帧与后续原生 DPI 同步不一致。
+        #if ANDROID || OHOS || IOS
+        // 移动全屏宿主的表面尺寸由 activity / XComponent 决定，
+        // 保留整页拟合策略；缩放不得低于原生密度，超出的内容滚动。
+        if (realW > 0 && realH > 0 && designW > 0 && designH > 0) {
+            int wantW = designW * dpiScale / 100;
+            int wantH = designH * dpiScale / 100;
+            if (wantW > realW || wantH > realH) {
+                int fitX = realW * 100 / designW;
+                int fitY = realH * 100 / designH;
+                int fit = fitX < fitY ? fitX : fitY;
+                if (fit < 50) { fit = 50; }
+                if (fit > 400) { fit = 400; }
+                if (fit < dpiScale) { fit = dpiScale; }
+                if (fit < dpiScale) { dpiScale = fit; }
+            }
+        }
+        #endif
+        if (physicalStage) {
+            // 舞台内容按物理像素 1:1 绘制，只有 chrome 度量跟随 DPI。
+            dpiScale = window.GetDpiScale();
+        }
+        this.ScaleThemeMetrics();
+        scrollSpeed = 40 * dpiScale / 100;
+        titlebarH = window.GetTitlebarHeight();
+        captionBtnW = window.GetCaptionButtonWidth();
+        if (titlebarH < 24) { titlebarH = Scale(32); }
+        if (captionBtnW < 24) { captionBtnW = Scale(32); }
+        int nCap = 0;
+        if (showChrome) { nCap = ChromeButtonCount(); }
+        window.SetCaptionButtons(nCap);
+        // 设置 ZAN_UI_SCRIPT 时启用 AI 自动化驱动（否则不生效）。
+        UiDriver.Begin(this);
+    }
+
+    // 显示窗口并运行标准事件循环直至关闭，
+    // 每帧仅绘制标题栏边框。这是简单窗口的
+    // 一次调用便捷方法；要绘制自己的内容，请直接驱动
+    // BeginFrame / RenderChrome / PresentFrame 循环。
+    public void Run(string title) {
+        this.RunLoop(() => { this.RenderChrome(title); });
+    }
+
+    // 原生 DPI 先于表面尺寸同步；相同尺寸也可能需要重排字体与 chrome。
+    void SyncNativeDpi() {
+        #if WINDOWS
+        if (window.GetHandle() == 0) { return; }
+        int scale = window.GetDpiScale();
+        int bar = window.GetTitlebarHeight();
+        int button = window.GetCaptionButtonWidth();
+        bool metricsChanged = dpiScale != scale;
+        if (!metricsChanged && titlebarH == bar && captionBtnW == button) { return; }
+        dpiScale = scale;
+        titlebarH = bar;
+        captionBtnW = button;
+        scrollSpeed = 40 * scale / 100;
+        if (metricsChanged) {
+            this.ScaleThemeMetrics();
+            bgThemeGen = bgThemeGen + 1;
+        }
+        backdropDirty = true;
+        fxSnapValid = false;
+        partialPending = false;
+        forceFullNext = true;
+        this.NoteRedrawWhy("SyncNativeDpi");
+        needsRedraw = true;
+        #endif
+    }
+
+    // 让渲染表面跟上真实的窗口大小（并把滚动限制到
+    // 新视口）。由 ProcessEvent 每次事件调用，也由窗口过程
+    // 驱动的重绘调用。
+    void SyncSurface() {
+        this.SyncNativeDpi();
+        int curW = window.ClientWidth();
+        int curH = window.ClientHeight();
+        if (curW <= 0 || curH <= 0) { return; }
+
+        // 窗口最大化与还原状态下的异形/圆角生命周期自动同步：
+        // 无论通过标题栏按钮、双击标题栏、Win+Up/Down 或 Snap 布局触发最大化/还原，
+        // 均以真实窗口状态 window.IsMaximized() 为准：
+        // 1. 进入最大化状态：临时暂存并清除异形规格，确保铺满屏幕直角显示；
+        // 2. 退出最大化状态：若之前存有异形/阴影规格，自动完整复原异形遮罩与阴影；
+        // 3. 亦同步触发 DWM 圆角策略的重新应用。
+        if (window.IsMaximized()) {
+            if (shapeMode != 0) {
+                maxSavedShapeSpec = shapeSpec;
+                maxSavedShapeDesc = shapeDescription != null ? shapeDescription.Clone() : null;
+                maxSavedShapeShadow = shapeShadow;
+                shapeShadow = 0;
+                this.SetWindowShape("");
+            }
+        } else {
+            if (maxSavedShapeDesc != null && !maxSavedShapeDesc.IsEmpty()) {
+                WindowShapeDescription restoreDesc = maxSavedShapeDesc;
+                int restoreShadow = maxSavedShapeShadow;
+                maxSavedShapeDesc = null;
+                maxSavedShapeSpec = "";
+                maxSavedShapeShadow = 0;
+                this.SetWindowShape(restoreDesc);
+                if (restoreShadow > 0 && !restoreDesc.HasShadowBand()) {
+                    this.SetWindowShadow(restoreShadow);
+                }
+            } else if (maxSavedShapeSpec != "") {
+                string restoreSpec = maxSavedShapeSpec;
+                int restoreShadow = maxSavedShapeShadow;
+                maxSavedShapeDesc = null;
+                maxSavedShapeSpec = "";
+                maxSavedShapeShadow = 0;
+                this.SetWindowShape(restoreSpec);
+                if (restoreShadow > 0) {
+                    this.SetWindowShadow(restoreShadow);
+                }
+            } else if (shapeMode == 0) {
+                this.ApplyRoundCorners();
+            }
+        }
+
+        if (curW == canvas.Width() && curH == canvas.Height()) { return; }
+        this.SwapCanvas(curW, curH);
+
+        // 将滚动限制到新视口，而非跳到顶部——调整大小
+        // 不应跳变用户的滚动位置。
+        int viewH = curH - titlebarH;
+        int maxScroll = contentHeight - viewH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (scrollY > maxScroll) { scrollY = maxScroll; }
+        if (scrollY < 0) { scrollY = 0; }
+        this.NoteRedrawWhy("SyncSurface");
+        needsRedraw = true;
+    }
+
+    // 注册每帧的绘制内容，供框架在应用循环之外
+    // 也能画帧：拖动窗口边框会进入系统模态尺寸调整循环，
+    // 它在松手前不会回到应用的循环，没有帧体时表面就停在
+    // 旧尺寸上，新露出的一条一直空白。自己写循环的应用在
+    // Show() 之后注册一次，循环体照旧。RunLoop 会自动注册。
+    public void SetFrameBody(FrameBody body) {
+        frameBody = body;
+        App.frameApp = this;
+        Window.SetSizePaint(() => { App.PaintFromWndProc(); });
+    }
+
+    // 从窗口过程就地画一帧(先让表面跟上新的窗口
+    // 尺寸)。没有注册帧体时为空操作。支持主 App 和 ChildWindow:
+    // 按当前 eventHwnd 路由到对应的窗口。
+    public static void PaintFromWndProc() {
+        if (App.wndProcPainting) { return; }
+        // 窗口过程正在处理的消息所属的窗口。不能用 EventHwnd():
+        // 那一个只在应用泵出事件时更新,而模态尺寸调整循环期间
+        // 应用拿不到事件,它会停留在拖动开始前的旧值上。
+        nint hwnd = Window.SizePaintWindow();
+        // 先尝试路由给 ChildWindow(IDE 的子窗口)。
+        if (ChildWindows.PaintForResize(hwnd)) { return; }
+        // 不是子窗口,回退到主 App。
+        App a = App.frameApp;
+        if (a == null || a.frameBody == null) { return; }
+        if (hwnd != a.WindowHandle()) { return; }
+        App.wndProcPainting = true;
+        a.SyncSurface();
+        a.SafeFrame(a.frameBody);
+        App.wndProcPainting = false;
+    }
+
+    // 受保护的标准事件循环：每一轮的事件分发与
+    // 绘制都包在异常保护里，一帧里抛出的异常只丢掉这一帧（并记入
+    // UiErrorLog），而不是结束进程。<paramref name="body"/> 只负责画
+    // 内容：BeginFrame/PresentFrame 由循环完成。
+    public void RunLoop(FrameBody body) {
+        Show();
+        if (frameBody == null) { this.SetFrameBody(body); }
+        while (isRunning) {
+            if (!this.PumpGuarded()) { break; }
+            if (!needsRedraw) { continue; }
+            // 最小化（或整窗被遮住）时不画：这时候客户区是 0×0，
+            // 所有停靠都被压成零宽，而按宽度换行的内容（聊天记录、
+            // 表格）会按最小宽度把整份内容重排一遍，而且没一个像素
+            // 给人看。needsRedraw 留着，恢复时那一帧照旧尺寸重新画。
+            if (!window.IsVisible()) { continue; }
+            this.FrameGuarded(body);
+        }
+    }
+
+    // 护栏调用的目标只能是静态函数指针（原生侧拿不到实例），因此
+    // 这一圈要处理的 App/帧体先放到这里，再由 GuardBody 取回。
+    static App guardApp;
+    static FrameBody guardBody;
+    // 0 = 事件分发（PumpSafe），1 = 画一帧（SafeFrame）。
+    static int guardWhat;
+    static bool guardPumpAlive;
+
+    static void GuardBody(nint arg) {
+        App a = App.guardApp;
+        if (a == null) { return; }
+        if (App.guardWhat == 0) { App.guardPumpAlive = a.PumpSafe(); }
+        else { a.SafeFrame(App.guardBody); }
+    }
+
+    // PumpSafe 再加一层原生故障护栏：Zan 异常由 PumpSafe
+    // 捕获，而硬故障（越界、空指针、除零，以及生成代码里失败的
+    // 运行时检查）由护栏记录后丢掉这一次事件——两者都不再让
+    // 进程消失。
+    bool PumpGuarded() {
+        App.guardApp = this;
+        App.guardWhat = 0;
+        App.guardPumpAlive = isRunning;
+        if (!Window.GuardCall((nint)App.GuardBody, 0)) {
+            // 这次事件在原生层崩了：记录（zan_crash.log 里已有带
+            // 回溯的记录）、重画一帧，然后继续泵下一个事件。
+            this.NoteFrameError("event", "native fault recovered");
+            this.RequestRedraw();
+            return isRunning;
+        }
+        return App.guardPumpAlive;
+    }
+
+    // SafeFrame 再加一层原生故障护栏：这一帧里的硬故障
+    // 只丢掉这一帧。
+    bool FrameGuarded(FrameBody body) {
+        App.guardApp = this;
+        App.guardWhat = 1;
+        App.guardBody = body;
+        if (!Window.GuardCall((nint)App.GuardBody, 0)) {
+            this.NoteFrameError("frame", "native fault recovered");
+            // 这一帧半途而废：脏区裁剪已经不可信，下一帧整窗重画。
+            this.CancelPartialFrame();
+            this.RequestRedraw();
+            return false;
+        }
+        return true;
+    }
+
+    // 本次运行被原生护栏吞掉的硬故障次数。
+    static int NativeFaultCount() { return Window.GuardRecovered(); }
+
+    // ProcessEvent 的受保护版本：事件处理（回调、
+    // 命令、绑定）里抛出的异常不再终止进程。
+    // 返回 false 只表示窗口要求退出。
+    bool PumpSafe() {
+        try {
+            return ProcessEvent();
+        } catch (Exception ex) {
+            this.NoteFrameError("event", ex.Message);
+            return isRunning;
+        }
+    }
+
+    // 在异常保护下画一帧（BeginFrame → body →
+    // PresentFrame）。返回 false 表示这一帧失败并已记录；
+    // 写自己循环的应用可以直接用它换掉裸的
+    // BeginFrame/PresentFrame 对。
+    bool SafeFrame(FrameBody body) {
+        try {
+            BeginFrame();
+            body();
+            PresentFrame();
+            return true;
+        } catch (Exception ex) {
+            this.NoteFrameError("frame", ex.Message);
+            // 这一帧残缺：丢掉那个脏区裁剪，下一帧全重绘。
+            this.CancelPartialFrame();
+            this.RequestRedraw();
+            return false;
+        }
+    }
+
+    // 滚轮把内容挪到指针底下之后重算悬停目标。滚轮帧处理时命中
+    // 区还是上一帧（滚动前）的，就地 HitTest 只会得到同样过期的
+    // 目标——所以在出帧之后按新注册的矩形重算；变了就补一条
+    // 悬停条带帧，把新旧两个目标的预览都画对。没有这一步，滚轮
+    // 滚过后悬停预览一直挂在滚动前的那一行上（指针明明已经在
+    // 另一行上），直到下一次指针移动才被纠正。
+    void RefreshScrollHover() {
+        if (!this.scrollHoverDirty) { return; }
+        this.scrollHoverDirty = false;
+        int nh = hitTester.HitTest(mouseX, mouseY);
+        if (nh == focus.hoveredId) { return; }
+        int oh = focus.hoveredId;
+        focus.SetHovered(nh);
+        this.NoteRedrawWhy("scroll-hover");
+        if (!needsRedraw) { this.NoteHoverDamage(oh, nh); }
+        needsRedraw = true;
+    }
+
+    // 记录一条被捕获的界面异常。
+    void NoteFrameError(string origin, string message) {
+        lastFrameError = origin + ": " + message;
+        frameErrors = UiErrorLog.Record(origin, message);
+    }
+
+    // 本次运行被捕获的界面异常数。
+    int FrameErrorCount() { return frameErrors; }
+
+    // 最后一条被捕获的界面异常（没有则为空串）。
+    string LastFrameError() { return lastFrameError; }
+
+    // 屏幕安全区边距（设备像素，避开刘海/灵动岛与底部手势横条）
+    int SafeAreaTop() { return window.GetSafeAreaTop(); }
+    int SafeAreaBottom() { return window.GetSafeAreaBottom(); }
+    int SafeAreaLeft() { return window.GetSafeAreaLeft(); }
+    int SafeAreaRight() { return window.GetSafeAreaRight(); }
+
+    // 自定义标题栏占用的高度；内容应从其下方开始。
+    // 边框隐藏时：移动端自动返回安全区顶部边距（避开刘海/灵动岛），桌面返回 0。
+    int ContentTop() {
+        if (!showChrome) {
+            #if ANDROID || OHOS || IOS
+            return this.SafeAreaTop();
+            #else
+            return 0;
+            #endif
+        }
+        return titlebarH;
+    }
+
+    // 暴露客户区逻辑尺寸供排版布局使用，隔离底层 Canvas 画布。
+    // 控件与表单根节点排版参照尺寸。
+    // 阴影带外扩的异形窗口扣掉两侧 band，返回内容区尺寸。
+    public int ClientWidth() {
+        return canvas.Width() - this.ShapeOffX() * 2;
+    }
+    public int ClientHeight() {
+        return canvas.Height() - this.ShapeOffY() * 2;
+    }
+
+    // 离屏预览保留声明的逻辑视口；原生窗口按实际客户区换算 CSS 逻辑长度。
+    public int CssViewportWidth() {
+        if (window.GetHandle() == 0) { return designW; }
+        int scale = dpiScale > 0 ? dpiScale : 100;
+        return (this.ClientWidth() * 100 + scale / 2) / scale;
+    }
+
+    public int CssViewportHeight() {
+        if (window.GetHandle() == 0) { return designH; }
+        int scale = dpiScale > 0 ? dpiScale : 100;
+        return (this.ClientHeight() * 100 + scale / 2) / scale;
+    }
+
+
+
+    // 获取整窗重绘原因（分析器与测试使用）。
+    public string RedrawWhy() {
+        return redrawWhy;
+    }
+
+    public void RequestRedraw() {
+        // 未声明范围的重绘：无法知道哪些像素变了，因此
+        // 下一帧整窗重绘（NoteDamage 是声明了范围的那一个）。
+        if (App.PerfOn()) {
+            string why = markNow;
+            if (why == "") { why = "ev@" + Convert.ToString(scopeId); }
+            this.NoteRedrawWhy(why);
+        }
+        partialBlocked = true;
+        partialPending = false;
+        needsRedraw = true;
+        // 上一整帧留下的 fx 快照（槽位 7）从此不可信：状态请求的重绘
+        // 可能是「擦除」性质的（模态蒙版消失、弹层关闭），旧快照恰好
+        // 保存着蒙版在屏的画面。请求若未被及时渲染，事件循环睡到 fx
+        // 拍时 FxPresent 会整窗恢复这份快照，把已被关闭的蒙版重新钉回
+        // 屏幕上（gallery「Esc 后蒙版滞留约 0.5 秒」的根因）。作废它，
+        // fx 拍就不再恢复，直到下一整帧重建为止。
+        fxSnapValid = false;
+        // 由状态（而非单纯悬停移动）请求的重绘可能触及任意
+        // 像素，因此它会取消悬停移动在同一事件处理中
+        // 早些时候武装的损伤裁剪帧。
+        partialPending = false;
+    }
+
+    // 连续视觉动画使用显示器节奏；定时内容仍可显式指定毫秒间隔。
+    int DisplayFrameDelay() {
+        if (window.RequestDisplayFrame()) {
+            displayAnimationPending = true;
+            // 显示回调负责唤醒；超时兜底覆盖 Surface 切换期间丢失的回调。
+            return 100;
+        }
+        return frameCadence.WaitMilliseconds(Stopwatch.GetMicroseconds());
+    }
+
+    public double RefreshRate() { return window.RefreshRate(); }
+
+    // 从任意线程或子窗口唤醒阻塞在 WaitEvent 中的 UI 线程，使事件循环立即出帧。
+    public void Wake() {
+        if (window != null) { window.Wake(); }
+    }
+
+    public void RequestWakeIn(int minIntervalMs) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (wakeNextMs < 0 || due < wakeNextMs) { wakeNextMs = due; }
+    }
+
+    void RequestWakeAt(int dueMs) {
+        if (wakeNextMs < 0 || dueMs < wakeNextMs) { wakeNextMs = dueMs; }
+    }
+
+    void RequestWakeFrameAt(int dueMs) {
+        if (wakeFrameNextMs < 0 || dueMs < wakeFrameNextMs) {
+            wakeFrameNextMs = dueMs;
+        }
+    }
+
+    void RequestWakeFrameIn(int minIntervalMs) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (wakeFrameNextMs < 0 || due < wakeFrameNextMs) {
+            wakeFrameNextMs = due;
+        }
+    }
+
+    // 当本帧玻璃表面之后的内容可能已变化时为 true
+    // （任何 OS 输入/缩放/主题变更），若本帧只是背景不变的
+    // 纯动画帧则为 false。玻璃表面将其传给
+    // Canvas.BlurRectCached，使旋转指示器/提示条复用缓存的模糊。
+    bool BackdropDirty() {
+        return backdropDirty;
+    }
+
+    // 这块玻璃区域本帧是否需要重新模糊。整窗帧同 BackdropDirty()；
+    // 损伤裁剪帧只有与脏矩形相交的区域才算脏——条带外的面板一个
+    // 像素也写不出去，重算纯属白费（连校验和都不用算）。
+    // 另外 slot 本帧刚换手时必须重算：里面是上一位主人的像素。
+    // 滚动串（连续的滚轮/拖拽，见 NoteScrollDamage）里再放宽一档：
+    // 与条带相交的面板也暂用缓存的旧模糊。此时重卷积只能拿到条带
+    // 外上一帧的合成像素，结果注定不准、还得把下一帧扩成面板并集
+    // 重来；不如先欠着——细条带照常便宜地走，串一结束由 EndFrame
+    // 武装一帧「条带 ∪ 欠账面板」的扩展刷新统一还账。磨砂玻璃对
+    // 快速滚动中的一两帧模糊滞后不敏感，账还清后像素严格正确。
+    // 「与条带相交」其实不够——矩形跨出条带的玻璃同样不能真算
+    // （冻结测试时钟下悬停补间的条带帧就是这一类，曾让同一区域
+    // 条带帧与整帧渲染出两种色调）。判定改成「完整落在条带内」：
+    // 只有源像素全是本帧新画的才现场重卷积，其余一律欠账还账。
+    bool BackdropDirtyIn(int slot, int x, int y, int w, int h) {
+        if (slot < 0) { return true; }
+        bool clipCovers = !partialFrame || this.RectInDamage(x, y, w, h);
+        if (freezeAnimClock) { return clipCovers; }
+        if (slot < blurSlots.Count && blurSlots[slot].lastNew == frameCount) {
+            return true;
+        }
+        if (glassRefreshOwe && partialFrame && !this.ScrollBurstActive()
+            && this.RectHitsDamage(x, y, w, h)) {
+            // 还账帧：裁剪已扩到欠账面板，这里必须真算。
+            return true;
+        }
+        if (!backdropDirty) { return false; }
+        if (!partialFrame) { return true; }
+        if (!this.RectHitsDamage(x, y, w, h)) { return false; }
+        if (!clipCovers || this.ScrollBurstActive()) {
+            this.NoteGlassDeferred(x, y, w, h);
+            return false;
+        }
+        return true;
+    }
+
+    bool ScrollBurstActive() {
+        return nowMs < scrollBusyUntilMs;
+    }
+
+    bool RectHitsDamage(int x, int y, int w, int h) {
+        if (x + w <= dmgX || dmgX + dmgW <= x) { return false; }
+        if (y + h <= dmgY || dmgY + dmgH <= y) { return false; }
+        return true;
+    }
+
+    // 矩形是否完整落在本帧损伤条带内。重算玻璃模糊的源必须是
+    // 本帧新画的像素；只要跨出条带一步，卷积就会混入上一帧的
+    // 已合成像素（见 BackdropDirtyIn）。
+    bool RectInDamage(int x, int y, int w, int h) {
+        if (dmgW <= 0 || dmgH <= 0) { return false; }
+        return x >= dmgX && y >= dmgY
+            && x + w <= dmgX + dmgW && y + h <= dmgY + dmgH;
+    }
+
+    // 登记一块在滚动串里暂用旧模糊的面板（还账清单）。
+    void NoteGlassDeferred(int x, int y, int w, int h) {
+        glassDeferred = true;
+        glassRefreshOwe = true;
+        // 串里又欠了新的：之前武装过的还账帧不再算数（它没罩住
+        // 这块新面板），串结束后按更全的清单重新武装。
+        glassRefreshArmedAt = 0 - 1;
+        if (glassDeferredRects.Count >= 128) { return; }
+        glassDeferredRects.Add(x);
+        glassDeferredRects.Add(y);
+        glassDeferredRects.Add(w);
+        glassDeferredRects.Add(h);
+    }
+
+    void ReuseBackdrop() {
+        backdropDirty = false;
+    }
+
+    bool PointerPressed() {
+        return focus.pressedId >= 0;
+    }
+
+    // 为匿名玻璃表面（没有控件身份可用）取模糊缓存槽：以
+    // 「本帧第 n 个匿名面板」为身份，等价于旧的按绘制顺序分配。
+    int NextBlurSlot() {
+        blurSlotSeq = blurSlotSeq + 1;
+        return this.BlurSlotFor(0 - blurSlotSeq);
+    }
+
+    // 玻璃面板的身份键。控件 id（StyleBox.fxId 之类）给 idKey；
+    // 没有 id 可用时用 BlurKey(kind, 几何)：位置/尺寸不变的面板
+    // 至少能每帧拿回同一个槽。两者分奇偶两个命名空间（id 键为奇、
+    // 几何键为偶），不会互相撞车；匿名面板用负键。
+    int BlurKeyId(int id) {
+        if (id == 0) { return 0; }
+        int k = id;
+        if (k < 0) { k = 0 - k; }
+        return k * 2 + 1;
+    }
+
+    int BlurKey(int kind, int x, int y, int w, int h) {
+        int k = kind * 1000003 + x * 9176 + y * 313 + w * 31 + h;
+        if (k < 0) { k = 0 - k; }
+        return k * 2 + 2;
+    }
+
+    // 按稳定身份 `key` 取该玻璃面板的模糊缓存槽：同一元素每帧
+    // 拿到同一个槽，因此绘制顺序变化、别处的面板出现或消失都不再
+    // 让它丢掉缓存。key=0 视为匿名，退回按绘制顺序。返回 -1 表示
+    // 无槽可用（回退为未缓存模糊）。
+    int BlurSlotFor(int key) {
+        if (key == 0) { return this.NextBlurSlot(); }
+        int free = -1;
+        int lru = 0;
+        int lruUse = -1;
+        int i = 0;
+        while (i < 64) {
+            BlurSlot s = blurSlots[i];
+            if (s.key == key) {
+                s.lastUse = frameCount;
+                return i;
+            }
+            if (s.key == 0) {
+                if (free < 0) { free = i; }
+            } else if (s.lastUse != frameCount
+                       && (lruUse < 0 || s.lastUse < lruUse)) {
+                // 本帧已经用过的槽不参与淘汰：否则一屏超过 64 块
+                // 玻璃时，后面的面板会抢走前面面板刚拿到的槽，
+                // 每帧互相踢来踢去，谁的缓存都留不住。
+                lru = i;
+                lruUse = s.lastUse;
+            }
+            i = i + 1;
+        }
+        int slot = free;
+        if (slot < 0) {
+            if (lruUse < 0) { return -1; }
+            slot = lru;
+        }
+        BlurSlot target = blurSlots[slot];
+        target.key = key;
+        target.lastUse = frameCount;
+        target.lastNew = frameCount;
+        return slot;
+    }
+
+    // 上报焦点文本控件的插入符位置（客户区像素），使 IME
+    // 组合/候选窗口跟随光标，而非固定在
+    // 窗口原点。聚焦期间由 Input/TextArea 每帧调用。
+    void SetImeCaret(int x, int y) {
+        if (window.GetHandle() == 0) { return; }
+        Ime.SetCaret(x, y);
+    }
+
+    // 将委托封送到该窗口的 UI 线程——相当于
+    // C# 的 <c>Control.Invoke</c>/<c>BeginInvoke</c>。可从任意
+    // 线程安全调用：委托入队（运行时内用 OS 互斥锁保护）并
+    // 在下一帧开始时于 UI 线程运行，之后
+    // 请求重绘。后台工作线程用它把结果交回，
+    // 而无需在非 UI 线程触碰界面状态。窗口关闭后，
+    // 委托被丢弃而非入队：已没有 UI 线程可运行它，
+    // 且让它在*下一个*窗口运行也是错误的。
+    public void Post(Action handler) {
+        if (!isRunning) { return; }
+        Dispatcher.Post(handler);
+        if (window != null) { window.Wake(); }
+    }
+
+    public void Post(Action handler, string tag) {
+        this.Post(handler);
+    }
+
+    // 结束事件循环，并丢弃所有仍通过
+    // <see cref="Post"/> 排队的委托。在每次窗口关闭路径上调用：
+    // 为已关闭窗口投递的后台工作不得在下一个
+    // 窗口上运行，其帧循环复用了同一个全局分派队列。
+    public void StopLoop() {
+        isRunning = false;
+        Dispatcher.Clear();
+    }
+
+    Action closeRequest;
+    bool closePending;
+    // 关闭拦截器：收到「请求关闭」时先问它，返回 true 表示同意关闭，
+    // false 表示否决（窗口继续留着，事件循环不退出）。
+    // 未注册时行为与从前一致：直接停循环退出。
+    Func<bool> closeGuard;
+
+    public void OnCloseRequest(Action handler) {
+        closeRequest = handler;
+        closePending = false;
+    }
+
+    // 注册关闭拦截器。handler 在「请求关闭」时于 UI 线程被调用，
+    // 返回 true = 同意关闭（随后照常停循环退出），false = 否决关闭
+    // （窗口与事件循环都继续存在）。
+    //
+    // 跨平台语义一致：
+    //   * macOS/X11 的原生层本来就只投递关闭事件、不销毁窗口；
+    //   * Windows 的窗口过程在收到 WM_CLOSE 时先投递事件、由本层
+    //     决定是否真的销毁（见 Win32Shell 的 WM_CLOSE 分支）。
+    // 因此 handler 里弹模态确认框是安全的：窗口此刻还活着。
+    public void OnCloseGuard(Func<bool> handler) {
+        closeGuard = handler;
+        if (handler != null) {
+            // 登记后，Windows 的 WM_CLOSE 只投递事件、不当场销毁窗口；
+            // macOS/X11 的原生层本来就是这样。子窗口不受影响。
+            this.window.SetCloseIntercept(true);
+        }
+    }
+
+    // 「请求关闭」：先问拦截器，再按既有语义收尾。
+    // 同意 → 通知 closeRequest（一次性）并停循环退出；
+    // 否决 → 什么都不做，窗口继续存在。
+    bool HandleCloseRequest() {
+        if (this.closeGuard != null) {
+            if (!this.closeGuard()) { return true; }
+            // 同意关闭：Windows 上窗口此刻还活着（WM_CLOSE 被拦下
+            // 没销毁），这里显式销毁它，让窗口真正消失。
+            this.window.Destroy();
+            // 同意过就别再问第二次：销毁之后事件循环的下一次等待会
+            // 报「窗口没了」（result < 0），那条路同样走到这里，
+            // 再弹一次确认框就成了「点了确定又问一遍」。
+            this.closeGuard = null;
+        }
+        if (closeRequest == null) {
+            this.StopLoop();
+            return false;
+        }
+        if (!closePending) {
+            closePending = true;
+            closeRequest();
+        }
+        return isRunning;
+    }
+
+    // 编程式关闭窗口：等效于点击标题栏的关闭按钮
+    // （post WM_CLOSE，随后从事件循环正常退出）。供自绘
+    // 退出按钮、场景切换（"OpenScene" 动作结束当前场景）这类
+    // 代码侧触发"该窗口该关了"的路径使用。
+    public void RequestClose() {
+        window.Close();
+    }
+
+    // 最小化窗口。
+    public void MinimizeWindow() {
+        if (window != null) { window.Minimize(); }
+    }
+
+    // 在最大化与还原之间切换。
+    public void ToggleMaximizeWindow() {
+        if (window != null) { window.ToggleMaximize(); }
+    }
+
+    // 在 UI 线程上运行所有通过 <see cref="Post"/> 排队的委托，
+    // 若有运行则请求重绘。每个事件循环
+    // 迭代由 ProcessEvent 自动调用；手写循环也可直接调用。
+    void DrainPosts() {
+        Action handler = Dispatcher.Take();
+        while (handler != null) {
+            handler();
+            this.NoteRedrawWhy("handler");
+            needsRedraw = true;
+            handler = Dispatcher.Take();
+        }
+    }
+
+    // 按千分值 p (0..1000) 在 a 和 b 之间线性插值。
+    static int Lerp(int a, int b, int p) {
+        return a + (b - a) * p / 1000;
+    }
+
+    // 按千分值 p (0..1000) 混合两个打包的 ARGB 颜色，alpha 与 RGB
+    // 一同插值（两端不透明时结果仍不透明）。对以负符号整数
+    // 存储的颜色同样稳健。
+    static int LerpColor(int c0, int c1, int p) {
+        if (c0 == c1) { return c0; }
+        if (p <= 0) { return c0; }
+        if (p >= 1000) { return c1; }
+        int a0 = (c0 >> 24) & 255;
+        int r0 = (c0 >> 16) & 255;
+        int g0 = (c0 >> 8) & 255;
+        int b0 = c0 & 255;
+        int a1 = (c1 >> 24) & 255;
+        int r1 = (c1 >> 16) & 255;
+        int g1 = (c1 >> 8) & 255;
+        int b1 = c1 & 255;
+        int a = a0 + (a1 - a0) * p / 1000;
+        int r = r0 + (r1 - r0) * p / 1000;
+        int g = g0 + (g1 - g0) * p / 1000;
+        int b = b0 + (b1 - b0) * p / 1000;
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    // 按千分值 p (0..1000) 将打包颜色向不透明黑色调暗：
+    // 一个命名的阴影锚点，控件无需内联写出黑色常量。
+    static int Darken(int color, int p) { return App.LerpColor(color, (int)4278190080, p); }
+
+    // 按千分值 p (0..1000) 将打包颜色向不透明白色调亮。
+    static int Lighten(int color, int p) { return App.LerpColor(color, (int)4294967295, p); }
+
+    // 按千分值 p (0..1000) 缩放打包颜色已有的 alpha 通道，
+    // 保留其 RGB。p=1000 返回原色，p=0 使其完全
+    // 透明。对不透明颜色和已带 alpha 的颜色（如玻璃色板）都有效，
+    // 因此填充/遮罩可以淡入淡出。
+    // 对符号整数颜色打包稳健（见 LerpColor）。
+    static int ScaleAlpha(int color, int p) {
+        if (p >= 1000) { return color; }
+        if (p <= 0) { return color & 16777215; }
+        int a = (((color >> 24) & 255) * p) / 1000;
+        return (color & 16777215) | (a << 24);
+    }
+
+    // 可滚动控件在渲染期间调用它，以在悬停时抢占滚轮。
+    // 最后悬停的声明者成为下一输入帧的拥有者，
+    // 因此嵌套视图消费滚轮时不会同时滚动父级。
+    bool CaptureWheel(int x, int y, int w, int h) {
+        bool inside = mouseX >= x && mouseX < x + w
+            && mouseY >= y && mouseY < y + h;
+        if (!inside) { return false; }
+        wheelClaimSeq = wheelClaimSeq + 1;
+        wheelCapX = x;
+        wheelCapY = y;
+        wheelCapW = w;
+        wheelCapH = h;
+        wheelCapOrder = wheelClaimSeq;
+        bool ev = this.EventKind() == 13;
+        if (ev) { wheelClaimSeen = true; }
+        bool owns = ev && wheelOwnerOrder == wheelClaimSeq;
+        if (owns) {
+            wheelConsumed = true;
+            wheelReplayArmed = false;
+        }
+        return owns;
+    }
+
+    void SetContentHeight(int h) {
+        contentHeight = h;
+    }
+
+    int ViewportHeight() {
+        return canvas.Height();
+    }
+
+    int Scale(int v) {
+        return v * dpiScale / 100;
+    }
+
+    // SetWindowShadow 外扩时内容轮廓相对画布原点的偏移
+    // （物理像素）。异形窗口的阴影/填充/自绘标题栏都以
+    // 它为基准定位；矩形窗口恒为 0。
+    int ShapeOffX() { return shapeOffX * dpiScale / 100; }
+    int ShapeOffY() { return shapeOffY * dpiScale / 100; }
+
+    // 填充结构性框架表面（侧边栏、标签条、工具面板）：
+    // 玻璃皮肤下会磨砂背景，使整个外壳呈现玻璃质感；
+    // 否则为普通的主题填充。`radius` 为 0 时填充方形。
+    void FillChrome(int x, int y, int w, int h, int radius, int color) {
+        if (theme.glass != 0) {
+            this.FillGlass(x, y, w, h, radius, color, 1000);
+        } else if (radius > 0) {
+            canvas.FillRoundRect(x, y, w, h, radius, color);
+        } else {
+            canvas.FillRect(x, y, w, h, color);
+        }
+    }
+
+    // 填充遮罩表面：皮肤为玻璃且表面
+    // 稳定后（`a`，千分比淡入 alpha，>= 900）磨砂：背景模糊加
+    // 主题色调，壁纸色相仍能透出。真正的系统玻璃
+    // 已模糊桌面，只需轻微着色。其余情况
+    // 为普通（可选淡入淡出）填充。
+    void FillGlass(int x, int y, int w, int h, int radius, int color, int a) {
+        if (glassNative && a >= 900) {
+            canvas.FillRoundRect(x, y, w, h, radius, Style.Fade(color, 300));
+        } else if (theme.glass != 0 && a >= 900) {
+            // 将磨砂模糊裁剪到面板的圆角半径内，
+            // 使角落保留锐利的壁纸；方形模糊上叠加半透明圆角色调
+            // 永远无法把模糊的角落重新画回背景。
+            int gslot = this.BlurSlotFor(this.BlurKey(1, x, y, w, h));
+            bool gdirty = this.BackdropDirtyIn(gslot, x, y, w, h);
+            if (radius > 0) {
+                canvas.BlurRoundCached(x, y, w, h, this.Scale(36),
+                                       gslot, gdirty, radius, 15);
+            } else {
+                canvas.BlurRectCached(x, y, w, h, this.Scale(36),
+                                      gslot, gdirty);
+            }
+            canvas.FillRoundRect(x, y, w, h, radius, Style.Fade(color, 520));
+        } else {
+            canvas.FillRoundRect(x, y, w, h, radius, Style.Fade(color, a));
+        }
+    }
+
+    // 已到期的帧截止时间（动画 / 唤醒 / 皮肤特效）就地兑现：标记这一帧
+    // 要画，并在纯动画唤醒时把它裁剪到动画自己声明的范围。返回 false
+    // 表示这一拍已由特效层就地呈现、还该继续等下一拍。
+    bool TakeDueFrame(int now) {
+        bool fxOnly = animNextMs < 0 || now < animNextMs;
+        bool fxDue = fxNextMs >= 0 && now >= fxNextMs;
+        bool pageDue = !fxOnly || needsRedraw || this.inputNeedsFrame
+            || (wakeNextMs >= 0 && now >= wakeNextMs)
+            || (wakeFrameNextMs >= 0 && now >= wakeFrameNextMs);
+        if (fxDue && !pageDue && this.FxPresent()) {
+            return false;
+        }
+        if (!pageDue && fxOnly && animNextMs >= 0
+            && animNextMs - now <= this.FxIntervalMs()
+            && !(wakeNextMs >= 0 && now >= wakeNextMs)
+            && !(wakeFrameNextMs >= 0 && now >= wakeFrameNextMs)
+            && (this.ForceFullFrames() || !animRectValid || animRectAll
+                || this.HasOverlays())) {
+            // 特效拍没能就地呈现（突发期快照被跳过/失效），但下一个
+            // 页面帧已排定且就在一拍之内，而且那一帧会是整窗渲染：
+            // 等它。页面帧本就要整窗渲染，顺路以新相位合成特效，背景
+            // 动画照常推进。原先这一拍会立即再排一帧整窗重栅——持续
+            // 动画（倒计时 100ms/16ms）把页面帧压密之后，特效拍全部
+            // 退化成整窗重栅，10~60 次/秒把 CPU 光栅打满，正是
+            // "倒计时一动，背景动画一卡一卡"。
+            // 局部帧开启且动画声明了范围时页面帧只是条带，条带外的
+            // 特效不会推进，不能等——维持原来的立即整窗渲染。
+            return false;
+        }
+        if (fxOnly && wakeFrameNextMs >= 0 && now >= wakeFrameNextMs) {
+            wakeFrameNextMs = -1;
+            if (wakeNextMs >= 0 && now >= wakeNextMs) {
+                wakeNextMs = -1;
+            }
+            this.NoteRedrawWhy("wake");
+            needsRedraw = true;
+        } else if (fxOnly && wakeNextMs >= 0 && now >= wakeNextMs) {
+            wakeNextMs = -1;
+        } else {
+            this.NoteRedrawWhy("ProcessEvent");
+            needsRedraw = true;
+        }
+        // 纯动画唤醒：若上一帧所有动画都声明了范围，
+        // 把这一帧裁剪到它们的并集。输入事件触发的帧不裁剪：
+        // 点击/按键改变哪些像素只有控件渲染时读到 Ui.Clicked
+        // 才知道，无法提前声明；而裁剪帧只渲染条带内的控件，
+        // 点击目标在条带外时点击既不被处理也不被重绘。
+        // 滚轮是例外（见 wheelScrollInput）：它的消费与损伤都在
+        // 渲染期声明，且声明者几何=上一帧认领视口，可以收窄。
+        bool wheelFrame = !fxOnly && this.wheelScrollInput
+            && !this.inputNeedsFrame && this.TakeDueWheelRect();
+        if (wheelFrame) { this.NoteRedrawWhy("wheel-strip"); }
+        if (!wheelFrame && !fxOnly && animRectValid && !animRectAll
+            && !this.inputNeedsFrame
+            && !this.ForceFullFrames()
+            && !this.HasOverlays()) {
+            int adX = animRX;
+            int adY = animRY;
+            int adR = animRX + animRW;
+            int adB = animRY + animRH;
+            // 上一帧的动画像素也要进这一帧的裁剪，
+            // 否则移动中的动画会沿路径留下残影。
+            if (animPrevValid) {
+                if (animPX < adX) { adX = animPX; }
+                if (animPY < adY) { adY = animPY; }
+                if (animPX + animPW > adR) {
+                    adR = animPX + animPW;
+                }
+                if (animPY + animPH > adB) {
+                    adB = animPY + animPH;
+                }
+            }
+            dmgX = adX;
+            dmgY = adY;
+            dmgW = adR - adX;
+            dmgH = adB - adY;
+            // 记下的是这一帧*声明*的范围，不是刚算出的并集。存并集会
+            // 让「上一帧画过的」逐帧吞进更早各帧的范围而永不收缩：几十
+            // 帧之后裁剪矩形就是全窗，于是每个动画帧都整窗光栅一遍 ——
+            // 名义上是局部帧，代价却是整窗帧。
+            animPrevValid = true;
+            animPX = animRX;
+            animPY = animRY;
+            animPW = animRW;
+            animPH = animRH;
+            partialPending = true;
+        }
+        // 整窗页在 PresentFrame 直接合成当前 Fx；局部页先推进条带外，
+        // 只声明损伤，页面帧尾合成条带并呈现一次。快照失效时重建整页。
+        if (fxDue && partialPending && !forceFullNext
+            && !this.inputNeedsFrame && !fxPagePending) {
+            if (!this.FxPresent(false)) { partialPending = false; }
+        }
+        return true;
+    }
+
+    // 帧截止时间到了就兑现（不等待）。轮询那一路（有人挂起了重绘、
+    // 或自动化驱动每圈都要求轮询）以前完全绕过截止时间：动画帧只在
+    // “阻塞等下一拍”那一路才产生，于是驱动一开，悬停缓动、提示浮出、
+    // toast 收拢这些纯动画帧一帧也不来，界面就停在最后那帧上。
+    void PumpDueFrame() {
+        int now = Window.GetTickMs();
+        int deadline = animNextMs;
+        if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) {
+            deadline = wakeNextMs;
+        }
+        if (deadline < 0
+            || (wakeFrameNextMs >= 0 && wakeFrameNextMs < deadline)) {
+            deadline = wakeFrameNextMs;
+        }
+        if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) {
+            deadline = fxNextMs;
+        }
+        if (deadline < 0 || now < deadline) { return; }
+        this.TakeDueFrame(now);
+    }
+
+    // 要求下一次 ProcessEvent 以轮询方式进行，绝不阻塞等待 OS 事件。
+    // 供外部驱动帧循环的宿主（如 Game.Ui.GameHud：游戏主循环负责帧
+    // 节奏，每帧都会来取事件）设置。否则空闲时走到阻塞 WaitEvent 的
+    // 那一路，会在没有独立消息泵的窗口上永久睡死（外部驱动帧循环
+    // 自主轮询事件，HUD 合成循环不调阻塞等待）。
+}

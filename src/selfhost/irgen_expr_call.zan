@@ -70,7 +70,17 @@ partial class Irgen {
             if (cn == "Task" && mn == "JoinWait" && e.kids.Count == 1) {
                 return new ExprVal("2", MkType("int"));
             }
-            if (cn == "Task" && mn != "Delay") {
+            if (cn == "Task" && mn == "Delay" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string ms = ToI64(a.op, MapType(a.ty));
+                if (!ExternSeen("zan_co_sync_sleep")) {
+                    externDecls.Add("zan_co_sync_sleep");
+                    H("declare void @zan_co_sync_sleep(i64)");
+                }
+                L("  call void @zan_co_sync_sleep(i64 " + ms + ")");
+                return new ExprVal("0", MkType("int"));
+            }
+            if (cn == "Task") {
                 diags.Error("call to 'Task." + mn + "' is not supported by the self-hosted "
                     + "compiler yet", e.line, e.col);
                 return new ExprVal("0", MkType("int"));
@@ -299,6 +309,7 @@ partial class Irgen {
             string prn = callee.a.sval;
             bool intRecv = prn == "int" || prn == "long" || prn == "Int32" || prn == "Int64";
             bool dblRecv = prn == "double" || prn == "float" || prn == "Double" || prn == "Single";
+            bool boolRecv = prn == "bool" || prn == "Boolean";
             // EnumType.TryParse(text, out value): the member-name probe (the
             // host lowers it in irgen_call.c -- a case-sensitive strcmp over
             // the members in declaration order)
@@ -348,6 +359,23 @@ partial class Irgen {
                     L("  " + nz + " = icmp ne i32 " + pr + ", 0");
                     return new ExprVal(nz, MkType("bool"));
                 }
+            }
+            if (boolRecv && callee.sval == "Parse" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                if (!ExternSeen("strcasecmp")) { externDecls.Add("strcasecmp"); H("declare i32 @strcasecmp(i8*, i8*)"); }
+                string s_safe = ParseStrGuard(e, a.op);
+                string s_true = RawCString("true");
+                string s_false = RawCString("false");
+                string st = NT(); L("  " + st + " = call i32 @strcasecmp(i8* " + s_safe + ", i8* " + s_true + ")");
+                string sf = NT(); L("  " + sf + " = call i32 @strcasecmp(i8* " + s_safe + ", i8* " + s_false + ")");
+                string is_t = NT(); L("  " + is_t + " = icmp eq i32 " + st + ", 0");
+                string is_f = NT(); L("  " + is_f + " = icmp eq i32 " + sf + ", 0");
+                string ok = NT(); L("  " + ok + " = or i1 " + is_t + ", " + is_f);
+                string bad = NT(); L("  " + bad + " = xor i1 " + ok + ", 1");
+                EmitRuntimeCheckIf(e, bad, "bool.Parse: input is not a valid Boolean");
+                string v = NT(); L("  " + v + " = select i1 " + is_t + ", i64 1, i64 0");
+                string safe = NT(); L("  " + safe + " = select i1 " + ok + ", i64 " + v + ", i64 0");
+                return new ExprVal(safe, MkType("bool"));
             }
             if ((intRecv || dblRecv) && callee.sval == "Parse" && e.kids.Count == 1) {
                 ExprVal a = GenExpr(e.kids[0]);
@@ -410,15 +438,23 @@ partial class Irgen {
                 L("  " + dsafe + " = select i1 " + db2 + ", double 0.0, double " + r);
                 return new ExprVal(dsafe, MkType("double"));
             }
-            if ((intRecv || dblRecv) && callee.sval == "TryParse" && e.kids.Count == 2
-                && e.kids[1].kind == AK.OutArg()) {
+            if ((intRecv || dblRecv || boolRecv) && callee.sval == "TryParse" && e.kids.Count == 2) {
+                Node oa = e.kids[1];
+                if (oa != null && oa.kind != AK.OutArg() && (oa.kind == AK.Ident() || oa.kind == AK.Index() || oa.kind == AK.MemberAccess())) {
+                    Node ow = new Node(AK.OutArg());
+                    ow.a = oa; ow.line = oa.line; ow.col = oa.col;
+                    oa = ow;
+                }
+                if (oa == null || oa.kind != AK.OutArg()) {
+                    diags.Error(prn + ".TryParse requires an out argument", e.line, e.col);
+                    return new ExprVal("0", MkType("bool"));
+                }
                 ExprVal a = GenExpr(e.kids[0]);
                 string isn = NT();
                 L("  " + isn + " = icmp eq i8* " + a.op + ", null");
                 string empty = RawCString("");
                 string s_safe = NT();
                 L("  " + s_safe + " = select i1 " + isn + ", i8* " + empty + ", i8* " + a.op);
-                Node oa = e.kids[1];
                 Node oty = null;
                 string outp = "";
                 if (oa.type != null) {
@@ -431,6 +467,25 @@ partial class Irgen {
                     if (onm == "" && oa.a != null && oa.a.kind == AK.Ident()) { onm = oa.a.sval; }
                     int li = LocalIdx(onm);
                     if (li >= 0) { oty = locType[li]; outp = locReg[li]; }
+                }
+                if (boolRecv) {
+                    if (!ExternSeen("strcasecmp")) { externDecls.Add("strcasecmp"); H("declare i32 @strcasecmp(i8*, i8*)"); }
+                    string s_true = RawCString("true");
+                    string s_false = RawCString("false");
+                    string st = NT(); L("  " + st + " = call i32 @strcasecmp(i8* " + s_safe + ", i8* " + s_true + ")");
+                    string sf = NT(); L("  " + sf + " = call i32 @strcasecmp(i8* " + s_safe + ", i8* " + s_false + ")");
+                    string is_t = NT(); L("  " + is_t + " = icmp eq i32 " + st + ", 0");
+                    string is_f = NT(); L("  " + is_f + " = icmp eq i32 " + sf + ", 0");
+                    string match = NT(); L("  " + match + " = or i1 " + is_t + ", " + is_f);
+                    string not_null = NT(); L("  " + not_null + " = xor i1 " + isn + ", 1");
+                    string ok = NT(); L("  " + ok + " = and i1 " + not_null + ", " + match);
+                    string stored = NT(); L("  " + stored + " = select i1 " + is_t + ", i64 1, i64 0");
+                    if (outp != "") {
+                        L("  store i64 " + stored + ", i64* " + outp);
+                    }
+                    string okz = NT();
+                    L("  " + okz + " = zext i1 " + ok + " to i64");
+                    return new ExprVal(okz, MkType("bool"));
                 }
                 string endp = NT();
                 EA(endp, "i8*");

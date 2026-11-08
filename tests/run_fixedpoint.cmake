@@ -121,3 +121,16 @@ endif()
 string(LENGTH "${_g2}" _l2)
 math(EXPR _b2 "${_l2} / 2")
 message(STATUS "OK: self-hosting fixed point holds -- g2.ll == g3.ll (${_b2} bytes)")
+
+# ---- publish the fixed-point fingerprint (B-ID189) ----
+# The SHA256 of g2.ll is the version-independent identity of this bootstrap
+# closure: a later session can diff "the fixed point I saw" against this file
+# without rerunning the 20-minute closure. Written next to the gate's other
+# artifacts, never committed.
+file(SHA256 ${G2LL} _fp_sha)
+if(NOT DEFINED FPSHA)
+  get_filename_component(_fp_dir "${G2LL}" DIRECTORY)
+  set(FPSHA "${_fp_dir}/fixedpoint.sha")
+endif()
+file(WRITE ${FPSHA} "${_fp_sha}  g2.ll==g3.ll (${_b2} bytes)\n")
+message(STATUS "fixed-point fingerprint: ${_fp_sha} -> ${FPSHA}")
