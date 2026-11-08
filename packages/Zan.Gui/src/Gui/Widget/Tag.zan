@@ -3,39 +3,34 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 标签 / 徽章。与 Button 形状相同：简单赋值，所有视觉都是
-// 类，框及其内容由共享层绘制。
-// 可识别的类只是皮肤定义的选择器：
-// tag                                        默认
-// .primary .info .success .warning .error     语义类型
-// .tiny .small .medium .large                 尺寸（与按钮共用）
-// .round                                     形状
+// 标签/徽章组件。纯 Flex 弹性行容器，外观完全由 CSS 决定，支持图文与子组件互嵌。
+//
+// 基础用法：
+//   Tag t = new Tag("运行中");
+//   t.Closable = true;
+//   t.Close += () => { OnClosed(); };
+//
+// 复合互嵌（DOM 组合）：
+//   Tag custom = new Tag().With(new IconView("check")).With(new Label("已验证"));
+//
+// 样式类：
+//   .primary .info .success .warning .error (语义角色)
+//   .tiny .small .medium .large             (尺寸档位)
+//   .round                                  (圆角胶囊形态)
 public class Tag : Control {
-    // 标签文本（Binding<string>，可响应式绑定模型字段）。
     public Binding<string> Text;
-    // 前置图标字形名；"" = 无。
     public string Icon;
-    // 添加尾部关闭字形，点击时触发 Close。
     public bool Closable;
-    // 可选中：标签变成 toggle 按钮，点击切换 Checked 并触发 Change。
-    // 对应 Naive UI Tag 的 `checkable` prop。
     public bool Checkable;
-    // Checkable=true 时绑定到 bool 模型；切换时在皮肤
-    // 中进入 `tag:selected` 状态（类似 button:checked）。
     public Binding<bool> Checked;
-    public int wid;
-    // 点击关闭字形时触发；像 Button.Click 一样在 UI 线程排队，
-    // 处理器可从中移除模型中的该标签。
+    public int wid { get { return this.WidgetId(); } set { this.commonId = value; } }
     public UiEvent Close;
-    // Checkable 切换时触发（`tag.Change += h;`）。
     public UiEvent Change;
-
-    // 尺寸档（Naive UI size prop）：tiny / small / medium / large。
-    // 标签是紧凑件族，四档高度取 --height-micro-*（16/20）与
-    // --height-tiny/-small（24/28）。
     public Binding<string> Size;
 
-    // 初始化：以标签文本注册，置默认字段并自管 Close/Change 事件。
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
+
     private void InitTag(string label) {
         this.InitControl(label, 1);
         Text = label;
@@ -43,138 +38,71 @@ public class Tag : Control {
         Closable = false;
         Checkable = false;
         Checked = false;
-        wid = WidgetId.Next();
         wiresOwnEvents = false;
         Close = new UiEvent();
         Change = new UiEvent();
         Size = "medium";
+
+        if (label != "") {
+            this.Add(new Label(label));
+        }
     }
 
-    // 空标签（设计器用）。
-    public Tag() { InitTag(""); }
-    // 给定初值文本的标签。
-    public Tag(string label) { InitTag(label); }
+    // ---- 内联标签助手（static 纯函数）--------------------------------
+    // 供自行管理布局的绘制者复用（StyledText 名称条、Gallery/IDE 行内
+    // 标签）：吃与真 Tag 同一套 `tag` 规则，宿主不必自持样式解析。
 
-    // 当前文本；Text 为 null 时返回空串。
-    public string Label() {
-        if (Text == null) { return ""; }
-        return Text.Get();
-    }
-
-    // 解析标签自身的样式盒（`tag` 规则 + 类/名字 + 尺寸档）。
-    public StyleBox ResolvedStyle(App app) {
-        string origClass = Class;
-        this.ApplySizeClass();
-        StyleBox s = this.BoxState(app, Style.SNormal());
-        Class = origClass;
-        return s;
-    }
-
-    // 按当前文本与样式算出的自然宽度。
-    public int AutoWidth(App app) { return Tag.Width(app, this.Label(), Class); }
-
-    // 按自然宽度绘制；返回控件 id。
-    public int Render(App app, int x, int y) {
-        return this.RenderW(app, x, y, this.AutoWidth(app));
-    }
-
-    // 以给定宽度绘制（统一走标准 DOM Arrange 与 RenderTree 管线）。
-    public int RenderW(App app, int x, int y, int w) {
-        int h = this.prefH;
-        if (h <= 0) { h = app.theme.heightTiny; }
-        this.Arrange(x, y, w, h);
-        this.RenderTree(app);
-        return this.CommonId();
-    }
-
-    // Checkable 时的当前选中态；未绑定 Checked 为 false。
-    public bool IsChecked() {
-        if (Checked == null) { return false; }
-        return Checked.Get();
-    }
-
-    // `text` 在 `cls` 样式下占据的宽度，使一行标签的布局
-    // 与 Render 绘制的间距完全一致。
+    // `text` 在 `cls` 样式下占据的宽度。
     public static int Width(App app, string text, string cls) {
         Theme t = app.theme;
         StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
         int fontPx = s.FontOr(Style.FontFallback(app, "small"));
-        return BoxContent.Width("", text, "", fontPx, s.GapOr(t.gapSmall))
-            + s.PadLOr(t.paddingSmall) + s.PadROr(t.paddingSmall);
+        int textW = text != "" ? Canvas.MeasureText(text, fontPx) : 0;
+        return textW + s.PadLOr(t.paddingSmall) + s.PadROr(t.paddingSmall);
     }
 
-    // `cls` 样式下标签的高度，使自行布局行的绘制者
-    // 能按 Chip 实际绘制的高度预留空间，而不是靠猜（行
-    // 比标签矮正是名称条与下方线条重叠的原因
-    // ）。
+    // `cls` 样式下标签的高度。
     public static int Height(App app, string cls) {
         StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
         return s.HeightOr(app.theme.heightTiny);
     }
 
-    // 供自行管理布局的绘制者使用的立即模式标签（列表行、
-    // 设计器浮层）：同样的框和内容，无需实例。
+    // 内联标签渲染助手：绘制带样式框的标签文本。
     public static void Chip(App app, int x, int y, string text, string cls) {
         StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
         int w = Tag.Width(app, text, cls);
         int h = Tag.Height(app, cls);
-        BoxContent.Paint(app, 0, "tag", cls, "", s, x, y, w, h, "", text, "",
-                         false, false);
-    }
-
-    // 立即模式可关闭标签；返回关闭字形的命中 id。
-    public static int ChipClosable(App app, int x, int y, string text, string cls) {
-        Theme t = app.theme;
-        StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
-        int id = app.focus.AllocId();
+        s.Paint(app, x, y, w, h);
         int fontPx = s.FontOr(Style.FontFallback(app, "small"));
-        int gap = s.GapOr(t.gapSmall);
-        int glyph = BoxContent.GlyphSize(fontPx);
-        int w = Tag.Width(app, text, cls) + gap + glyph;
-        int h = s.HeightOr(t.heightTiny);
-        int closeX = BoxContent.Paint(app, id, "tag", cls, "", s, x, y, w, h,
-                                      "", text, "close", false, false);
-        app.hitTester.RegisterRect(id, closeX, y, glyph, h, 0);
-        return id;
+        Canvas c = app.canvas;
+        c.DrawTextCentered(x, y, w, h, text, s.FgOr(0), fontPx);
     }
 
-    // 可关闭形式占据的宽度，使一行标签精确布局。
-    public static int ClosableWidth(App app, string text, string cls) {
-        Theme t = app.theme;
-        StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
-        int fontPx = s.FontOr(Style.FontFallback(app, "small"));
-        return Tag.Width(app, text, cls) + s.GapOr(t.gapSmall)
-            + BoxContent.GlyphSize(fontPx);
+    public Tag() { InitTag(""); }
+    public Tag(string label) { InitTag(label); }
+
+    public string Label() {
+        if (Text == null) { return ""; }
+        return Text.Get();
     }
 
-    // 流式排布的立即模式标签：从游标 (cx, cy) 起顺排，越过
-    // [x, x+wrapW] 右缘就换行（行距 8）。新游标 (nx, ny) 经
-    // out 返回、由调用方持有，连续调用即组成一串自动换行的
-    // 标签行——窄容器（手机卡片）靠它把标签排进可见区，而
-    // 不是按桌面固定偏移排到界外。
-    public static void ChipFlow(App app, int x, int wrapW, string text, string cls,
-                         int cx, int cy, out int nx, out int ny) {
-        int w = Tag.Width(app, text, cls);
-        int h = Tag.Height(app, cls);
-        if (cx + w > x + wrapW && cx > x) {
-            cx = x;
-            cy = cy + h + app.Scale(8);
+    public void SetText(string v) {
+        Text = v;
+        if (children.Count > 0 && children[0] is Label) {
+            ((Label)children[0]).Text = v;
+        } else if (v != "") {
+            this.Add(new Label(v));
         }
-        Tag.Chip(app, cx, cy, text, cls);
-        nx = cx + w + app.Scale(8);
-        ny = cy;
     }
 
-    // ---- 设计器 / 序列化模型 -------------------------------------
+    public bool IsChecked() {
+        if (Checked == null) { return false; }
+        return Checked.Get();
+    }
 
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "Tag"; }
-
-    // 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
     public override Binding<string> SizeOf() { return Size; }
 
-    // 覆写：返回设计器属性清单（text/icon/closable/checkable/
-    // checked/size）。
     public override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec text = PropSpec.Text("text", "Text");
@@ -197,38 +125,23 @@ public class Tag : Control {
         return ps;
     }
 
-    // 覆写：公共事件之外提供 "Close"。
     public override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Close");
+        e.Add("Change");
         return e;
     }
 
-    // 将关闭字形的 Close 路由到其 UiEvent 字段；其余事件
-    // 全部落入 `On` 的公共绑定。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Close") { Close.Add(a); return; }
+        if (evt == "Change") { Change.Add(a); return; }
         On.AddByName(evt, a);
     }
 
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Close") { Close.AddS(a); return; }
+        if (evt == "Change") { Change.AddS(a); return; }
         On.AddByNameS(evt, a);
-    }
-
-
-    // ---- 保留式钩子（Control） --------------------------------------
-
-    // 覆写：宽度取样式表或自然宽度，高度取样式表或主题小行高。
-    public override void OnMeasure(App app) {
-        string origClass = Class;
-        this.ApplySizeClass();
-        StyleBox s = this.ResolveStyleAs(app, "tag", Class, Style.SNormal());
-        Class = origClass;
-        prefW = s.WidthOr(this.AutoWidth(app));
-        prefH = s.HeightOr(app.theme.heightTiny);
     }
 
     public override void SyncBinding() {
@@ -236,32 +149,16 @@ public class Tag : Control {
         this.ApplySizeClass();
     }
 
-    // 覆写：保留模式绘制 = 基类 PaintStyleBox 统一完成外盒（背景/边框/圆角/阴影），此处仅绘制内容图元。
     public override void OnPaint(App app) {
         if (bw <= 0) { return; }
-        if (computedStyle == null) {
-            this.ResolveStyle(app, Style.SNormal());
-        }
-        string trailing = "";
-        if (Closable) { trailing = "close"; }
-        int closeX = BoxContent.PaintContent(app, this.CommonId(), "tag", Class, name,
-                                             computedStyle, bx, by, bw, bh,
-                                             Icon, this.Label(), trailing, false, false);
-        if (Closable) {
-            int glyph = BoxContent.GlyphSize(computedStyle.FontOr(Style.FontFallback(app, "small")));
-            if (Ui.Activate(app, this.CommonId(), closeX, by, glyph, bh)) {
-                Close.PostS(this);
-                App a = this.FindApp();
-                if (a != null && a.window != null) { a.window.Wake(); }
-            }
-        }
-        if (Checkable) {
-            if (Ui.Activate(app, this.CommonId(), bx, by, bw, bh)) {
-                Checked.Set(!this.IsChecked());
-                Change.PostS(this);
-                App a = this.FindApp();
-                if (a != null && a.window != null) { a.window.Wake(); }
-            }
+        int id = this.CommonId();
+        app.focus.RegisterFocusable(id);
+
+        if (Checkable && Ui.Clicked(app, id)) {
+            Checked.Set(!this.IsChecked());
+            Change.PostS(this);
+            App a = this.FindApp();
+            if (a != null && a.window != null) { a.window.Wake(); }
         }
     }
 }
