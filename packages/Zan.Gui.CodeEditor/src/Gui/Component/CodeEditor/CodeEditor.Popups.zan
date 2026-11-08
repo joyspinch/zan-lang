@@ -1,0 +1,712 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+// CodeEditor 分部：小地图标尺、自动补全弹窗、签名帮助与行内调试值渲染
+public partial class CodeEditor {
+    // 右侧代码缩略图（Minimap）与概览标尺（Overview Ruler）：
+    // 渲染代码微缩轮廓、视口滑块与错误位置高亮指示，支持点击快速跳转与拖动定位。
+    public void RenderOverviewRuler(App app, Rect area, int visLines) {
+        Canvas c = app.canvas;
+        Gui.Theme t = app.theme;
+        EditorPalette pal = EditorPalette.For(t);
+
+        int minimapW = app.Scale(56);
+        if (area.width < app.Scale(360)) { minimapW = 0; }
+        int scrollBarW = app.Scale(14);
+        int rightStripW = minimapW + scrollBarW;
+        int minimapX = area.x + area.width - rightStripW;
+        int scrollBarX = area.x + area.width - scrollBarW;
+
+        int total = lines.Count;
+        if (total < 1) { total = 1; }
+
+        // 1. 缩略图背景与微缩代码轮廓
+        if (minimapW > 0) {
+            c.FillRect(minimapX, area.y, minimapW, area.height, pal.minimapBg);
+            c.FillRect(minimapX, area.y, app.Scale(1), area.height, pal.border);
+
+            int maxLines = area.height;
+            int step = total > maxLines ? (total / maxLines + 1) : 1;
+            for (int li = 0; li < lines.Count; li = li + step) {
+                string lntxt = lines[li];
+                if (lntxt.Length == 0) { continue; }
+                int ly = area.y + li * area.height / total;
+                int indent = CodeEditor.LeadWs(lntxt).Length;
+                int lx = minimapX + app.Scale(3) + indent * app.Scale(1);
+                int lw = (lntxt.Length - indent) * app.Scale(1);
+                if (lx + lw > minimapX + minimapW - app.Scale(3)) {
+                    lw = minimapX + minimapW - app.Scale(3) - lx;
+                }
+                if (lw > 0) {
+                    c.FillRect(lx, ly, lw, 1, (pal.plain & 0x00FFFFFF) | 0x30000000);
+                }
+            }
+        }
+
+        // 2. 收集所有错误行（编译器错误 + 本地启发式错误）
+        List<int> errLines = new List<int>();
+        for (int mi = 0; mi < errors.Count; mi = mi + 1) {
+            if (errors[mi].line == curLine && errors[mi].msg == "Missing ';' after using") { continue; }
+            int el = errors[mi].line;
+            if (el >= 0 && el < lines.Count) {
+                bool exists = false;
+                for (int ei = 0; ei < errLines.Count; ei = ei + 1) {
+                    if (errLines[ei] == el) { exists = true; break; }
+                }
+                if (!exists) { errLines.Add(el); }
+            }
+        }
+        if (!CompilerDiagStale() && compErrors != null) {
+            for (int ci2 = 0; ci2 < compErrors.Count; ci2 = ci2 + 1) {
+                int el2 = compErrors[ci2].line;
+                if (el2 >= 0 && el2 < lines.Count) {
+                    bool exists2 = false;
+                    for (int ei2 = 0; ei2 < errLines.Count; ei2 = ei2 + 1) {
+                        if (errLines[ei2] == el2) { exists2 = true; break; }
+                    }
+                    if (!exists2) { errLines.Add(el2); }
+                }
+            }
+        }
+
+        // 3. 在缩略图与滚动条上鲜明标注错误位置
+        for (int ei = 0; ei < errLines.Count; ei = ei + 1) {
+            int eln = errLines[ei];
+            int ely = area.y + eln * area.height / total;
+            if (minimapW > 0) {
+                // 缩略图红色高亮条与左侧标记
+                c.FillRoundRect(minimapX + app.Scale(2), ely - app.Scale(1),
+                    minimapW - app.Scale(4), app.Scale(3), app.Scale(1), pal.error);
+                c.FillRect(minimapX, ely - app.Scale(1), app.Scale(2), app.Scale(3), pal.error);
+            }
+            // 滚动条上的刻度
+            c.FillRect(scrollBarX + app.Scale(2), ely, scrollBarW - app.Scale(4), app.Scale(3), pal.error);
+        }
+
+        // 4. 计算视口滑块（Viewport Indicator）
+        int thumbH = visLines * area.height / total;
+        if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+        if (thumbH > area.height) { thumbH = area.height; }
+        int travel = area.height - thumbH;
+        int thumbY = area.y;
+        if (travel > 0 && maxScrollY > 0) {
+            thumbY = area.y + scrollY * travel / maxScrollY;
+        } else {
+            thumbY = area.y + scrollLine * area.height / total;
+        }
+        if (thumbY + thumbH > area.y + area.height) { thumbY = area.y + area.height - thumbH; }
+        if (thumbY < area.y) { thumbY = area.y; }
+
+        // 缩略图上的视口框
+        if (minimapW > 0) {
+            c.FillRoundRect(minimapX + app.Scale(1), thumbY, minimapW - app.Scale(2), thumbH, app.Scale(2), (pal.minimapThumb & 0x00FFFFFF) | 0x20000000);
+            c.SurfaceRoundRect(minimapX + app.Scale(1), thumbY, minimapW - app.Scale(2), thumbH, app.Scale(2), 0, (pal.plain & 0x00FFFFFF) | 0x30000000, 1);
+        }
+
+        // 5. 右侧滚动条
+        c.FillRect(scrollBarX, area.y, scrollBarW, area.height, pal.minimapBg);
+        c.FillRect(scrollBarX, area.y, app.Scale(1), area.height, pal.border);
+        c.FillRoundRect(scrollBarX + app.Scale(3), thumbY, scrollBarW - app.Scale(6), thumbH, app.Scale(3), pal.minimapThumb);
+    }
+
+    // 自动补全弹窗 + 种类过滤条 + 描述面板，
+    // 补全激活时绘制在光标下方。
+    public void RenderAcPopup(App app, Rect area, int lineH, int textX, int fontSize, bool focused, int visLines) {
+        Canvas c = app.canvas;
+        Gui.Theme t = app.theme;
+        EditorPalette pal = EditorPalette.For(t);
+        // ---- 自动补全弹窗（绘制在光标下方，带图标） ----
+        if (InStringOrCommentContext()) {
+            acActive = false;
+            acDot = false;
+        }
+        // 描述面板的命中矩形每帧重算：弹窗没开时清零，免得上一帧
+        // 的矩形继续被当成浮层区域（那时点它本该落在文本区）。
+        descW = 0;
+        if (acActive && focused && acAllCandidates.Count > 0
+            && LineTopY(curLine) >= 0) {
+            int pRowY = LineTopY(curLine);
+            int px = textX + Canvas.MeasureText(Text.Left(lines[curLine], acStart), fontSize);
+            int maxShow = 10;
+            int shown = acItems.Count;
+            if (shown > maxShow) { shown = maxShow; }
+            int itemH2 = lineH + app.Scale(2);
+            int popH2 = shown * itemH2 + app.Scale(4);
+            if (shown == 0) { popH2 = itemH2 + app.Scale(4); }
+            int iconW = app.Scale(22);
+            int popW2 = app.Scale(220);
+            for (int k = 0; k < acItems.Count; k = k + 1) {
+                int wpx = Canvas.MeasureText(acItems[k], fontSize) + iconW + app.Scale(16);
+                if (wpx > popW2) { popW2 = wpx; }
+            }
+            if (popW2 > app.Scale(400)) { popW2 = app.Scale(400); }
+            int popY2 = pRowY + lineH;
+            // 确保弹窗保持在可见区域内
+            if (popY2 + popH2 > area.y + area.height) { popY2 = pRowY - popH2; }
+            if (px + popW2 > area.x + area.width) { px = area.x + area.width - popW2 - 4; }
+            int first2 = 0;
+            if (acSel >= maxShow) { first2 = acSel - maxShow + 1; }
+            // 保存弹窗几何供点击检测
+            popX = px; popY = popY2; popW = popW2; popH = popH2;
+            popItemH = itemH2; popFirst = first2; popShown = shown;
+            // 绘制阴影
+            c.FillRoundRect(px + 2, popY2 + 2, popW2, popH2, app.Scale(4), pal.shadowSoft);
+            // 绘制弹窗背景
+            c.SurfaceRoundRect(px, popY2, popW2, popH2, app.Scale(4), pal.popupBg, pal.border, 1);
+            // 光标已输入的待补全字词部分：在每条目内
+            // 以强调色绘制，类似 VS 加粗
+            // 匹配字符，让列表展示条目入选的原因。
+            string typed = "";
+            if (acStart >= 0 && curCol > acStart
+                && curCol <= lines[curLine].Length) {
+                typed = lines[curLine].Substring(acStart, curCol - acStart);
+            }
+            for (int r2 = 0; r2 < shown; r2 = r2 + 1) {
+                int idx = first2 + r2;
+                if (idx < acItems.Count) {
+                    int iy = popY2 + app.Scale(2) + r2 * itemH2;
+                    int tcol = pal.menuText;
+                    if (idx == acSel) {
+                        c.FillRect(px + 2, iy, popW2 - 4, itemH2, pal.selBg);
+                        tcol = pal.textSel;
+                    }
+                    int ity = Canvas.CenterTextY(iy, itemH2, fontSize);
+                    // 绘制种类图标/指示符
+                    string kind2 = "";
+                    if (idx < acKinds.Count) { kind2 = acKinds[idx]; }
+                    int iconColor = pal.accent;
+                    string iconLetter = "?";
+                    if (kind2 == "M") { iconColor = pal.iconMethod; iconLetter = "M"; }
+                    else if (kind2 == "P") { iconColor = pal.accent; iconLetter = "P"; }
+                    else if (kind2 == "T") { iconColor = pal.iconType; iconLetter = "T"; }
+                    else if (kind2 == "K") { iconColor = pal.accent; iconLetter = "K"; }
+                    else if (kind2 == "S") { iconColor = pal.iconSnippet; iconLetter = "S"; }
+                    else if (kind2 == "F") { iconColor = pal.signature; iconLetter = "F"; }
+                    else if (kind2 == "E") { iconColor = pal.iconEnum; iconLetter = "E"; }
+                    else { iconColor = pal.iconDefault; iconLetter = "W"; }
+                    c.FillRoundRect(px + app.Scale(3), ity, app.Scale(16), app.Scale(16), app.Scale(3), iconColor);
+                    c.DrawText(px + app.Scale(6), ity + app.Scale(1), iconLetter, pal.iconGlyph, Style.FontFallback(app, "small"));
+                    string item2 = acItems[idx];
+                    int mlen = 0;
+                    if (typed.Length > 0 && typed.Length <= item2.Length
+                        && CodeEditor.StartsWithI(item2, typed)) {
+                        mlen = typed.Length;
+                    }
+                    if (mlen > 0 && idx != acSel) {
+                        string mpart = item2.Substring(0, mlen);
+                        c.DrawText(px + iconW, ity, mpart, pal.accent, fontSize);
+                        c.DrawText(px + iconW + Canvas.MeasureText(mpart, fontSize),
+                            ity, item2.Substring(mlen, item2.Length - mlen),
+                            tcol, fontSize);
+                    } else {
+                        c.DrawText(px + iconW, ity, item2, tcol, fontSize);
+                    }
+                }
+            }
+            // 条目更多时显示滚动条提示
+            if (acItems.Count > maxShow) {
+                int sbH = popH2 * shown / acItems.Count;
+                if (sbH < app.Scale(10)) { sbH = app.Scale(10); }
+                int sbY = popY2 + (popH2 - sbH) * first2 / (acItems.Count - shown);
+                c.FillRoundRect(px + popW2 - app.Scale(6), sbY, app.Scale(4), sbH, app.Scale(2), pal.scrollThumb);
+            }
+
+            // 活动过滤器隐藏全部条目时显示占位文本。
+            if (acItems.Count == 0) {
+                int hy = Canvas.CenterTextY(popY2, itemH2, fontSize) + app.Scale(2);
+                c.DrawText(px + app.Scale(8), hy, "no " + CodeEditor.KindWord(acFilter) + " here", pal.muted, fontSize);
+            }
+
+            // ---- 种类过滤条（点击只显示一种） ----
+            List<string> fkinds = CodeEditor.GetFilterKinds();
+            int fbH = app.Scale(22);
+            int fbY = popY2 + popH2;
+            filtX = px; filtY = fbY; filtW = popW2; filtH = fbH;
+            c.FillRect(px, fbY, popW2, fbH, pal.panelBg);
+            c.DrawRect(px, fbY, popW2, fbH, pal.border, 1);
+            int isz = app.Scale(16);
+            int fgap = app.Scale(4);
+            int fbx = px + app.Scale(5);
+            int fiy = fbY + (fbH - isz) / 2;
+            for (int fki = 0; fki < fkinds.Count; fki = fki + 1) {
+                string fk = fkinds[fki];
+                bool present = fk == "" || HasKind(fk);
+                bool seld = acFilter == fk;
+                string flet = "*";
+                int fcol = pal.iconDefault;
+                if (fk == "M") { fcol = pal.iconMethod; flet = "M"; }
+                else if (fk == "P") { fcol = pal.accent; flet = "P"; }
+                else if (fk == "F") { fcol = pal.signature; flet = "F"; }
+                else if (fk == "E") { fcol = pal.iconEnum; flet = "E"; }
+                else if (fk == "T") { fcol = pal.iconType; flet = "T"; }
+                else if (fk == "K") { fcol = pal.accent; flet = "K"; }
+                else if (fk == "S") { fcol = pal.iconSnippet; flet = "S"; }
+                if (!present) { fcol = pal.iconDisabled; }
+                if (seld) {
+                    c.FillRoundRect(fbx - app.Scale(2), fiy - app.Scale(2), isz + app.Scale(4), isz + app.Scale(4), app.Scale(3), pal.selBg);
+                }
+                c.FillRoundRect(fbx, fiy, isz, isz, app.Scale(3), fcol);
+                int tc = pal.iconGlyph;
+                if (!present) { tc = pal.iconGlyphDisabled; }
+                c.DrawText(fbx + app.Scale(4), fiy + app.Scale(1), flet, tc, Style.FontFallback(app, "small"));
+                fbx = fbx + isz + fgap;
+            }
+
+            // ---- 高亮条目的描述面板 ----
+            if (acSel >= 0 && acSel < acItems.Count) {
+                string dName = acItems[acSel];
+                string dKind = "";
+                if (acSel < acKinds.Count) { dKind = acKinds[acSel]; }
+                CodeCompletionItem semantic = acVisibleCandidates[acSel].semantic;
+                string dSig = semantic != null ? semantic.detail : "";
+                string dDoc = semantic != null ? semantic.doc : "";
+                if (dSig.Length == 0) {
+                    if (acDot && acDotReceiverType.Length > 0) {
+                        dSig = SigHelpFor(acDotReceiverType + "." + dName);
+                    }
+                    if (dSig.Length == 0) { dSig = SigHelpFor(dName); }
+                }
+                if (dDoc.Length == 0) { dDoc = CodeEditor.DescDoc(dName); }
+                if (dDoc.Length == 0) { dDoc = CodeEditor.DescKeyword(dName); }
+                string sigLine = dSig;
+                if (sigLine.Length == 0) { sigLine = dName; }
+                string kindLine = "(" + CodeEditor.KindWord(dKind) + ")";
+                if (dDoc.Length == 0 && dKind == "S") {
+                    dDoc = "Press Tab to insert the '" + dName + "' code template.";
+                }
+
+                int maxDw = app.Scale(380);
+                if (maxDw > area.width - app.Scale(24)) { maxDw = area.width - app.Scale(24); }
+                if (maxDw < app.Scale(220)) { maxDw = app.Scale(220); }
+                int dpad = app.Scale(8);
+                int maxInnerW = maxDw - dpad * 2;
+                int fh = Canvas.FontHeight(fontSize);
+                int sfh = Canvas.FontHeight(Style.FontFallback(app, "small"));
+
+                if (s_hoverSiglines == null) { s_hoverSiglines = new List<string>(); } else { s_hoverSiglines.Clear(); }
+                List<string> siglines = s_hoverSiglines;
+                CodeEditor.WrapText(sigLine, maxInnerW, fontSize, siglines, 6);
+                if (siglines.Count == 0) { siglines.Add(sigLine); }
+
+                if (s_hoverHlines == null) { s_hoverHlines = new List<string>(); } else { s_hoverHlines.Clear(); }
+                List<string> wrapped = s_hoverHlines;
+                if (dDoc.Length > 0) {
+                    CodeEditor.WrapText(dDoc, maxInnerW, Style.FontFallback(app, "small"), wrapped, 8);
+                }
+
+                int widest = 0;
+                for (int sli = 0; sli < siglines.Count; sli = sli + 1) {
+                    int lw = Canvas.MeasureText(siglines[sli], fontSize);
+                    if (lw > widest) { widest = lw; }
+                }
+                if (kindLine.Length > 0) {
+                    int kw = Canvas.MeasureText(kindLine, Style.FontFallback(app, "small"));
+                    if (kw > widest) { widest = kw; }
+                }
+                for (int dli = 0; dli < wrapped.Count; dli = dli + 1) {
+                    int lw = Canvas.MeasureText(wrapped[dli], Style.FontFallback(app, "small"));
+                    if (lw > widest) { widest = lw; }
+                }
+                int minInnerW = app.Scale(180);
+                if (widest < minInnerW) { widest = minInnerW; }
+                if (widest > maxInnerW) { widest = maxInnerW; }
+                int dw = widest + dpad * 2;
+
+                int dh = dpad * 2 + siglines.Count * fh;
+                if (kindLine.Length > 0) {
+                    dh = dh + app.Scale(4) + sfh;
+                }
+                if (wrapped.Count > 0) {
+                    dh = dh + app.Scale(6) + wrapped.Count * (sfh + app.Scale(2));
+                }
+                // 优先放弹窗右侧；放不下回退到左侧。
+                int dx = px + popW2 + app.Scale(6);
+                if (dx + dw > area.x + area.width) { dx = px - dw - app.Scale(6); }
+                if (dx < area.x) { dx = area.x + app.Scale(2); }
+                int dy = popY2;
+                if (dy + dh > area.y + area.height) { dy = area.y + area.height - dh; }
+                if (dy < area.y) { dy = area.y; }
+
+                c.FillRoundRect(dx + 2, dy + 2, dw, dh, app.Scale(4), pal.shadowSoft);
+                c.SurfaceRoundRect(dx, dy, dw, dh, app.Scale(4), pal.panelBg, pal.border, 1);
+                // 落库命中矩形：描述面板在列表本体之外，命中判定
+                // 必须把它算作弹窗的一部分，否则点它会穿透到文本区
+                // （光标跳行、补全弹窗被顺带关掉）。
+                descX = dx; descY = dy; descW = dw; descH = dh;
+                int ty = dy + dpad;
+                for (int sl = 0; sl < siglines.Count; sl = sl + 1) {
+                    c.DrawText(dx + dpad, ty, siglines[sl], pal.signature, fontSize);
+                    ty = ty + fh;
+                }
+                if (kindLine.Length > 0) {
+                    ty = ty + app.Scale(4);
+                    c.DrawText(dx + dpad, ty, kindLine, pal.muted, Style.FontFallback(app, "small"));
+                    ty = ty + sfh;
+                }
+                if (wrapped.Count > 0) {
+                    ty = ty + app.Scale(6);
+                    for (int wl = 0; wl < wrapped.Count; wl = wl + 1) {
+                        c.DrawText(dx + dpad, ty, wrapped[wl], pal.text, Style.FontFallback(app, "small"));
+                        ty = ty + sfh + app.Scale(2);
+                    }
+                }
+            }
+        }
+    }
+
+    // 参数信息（VS 的"签名帮助"）：光标位于
+    // 调用实参列表内时，在行上方绘制被调用者签名，
+    // 高亮正在输入的参数，并在其下显示
+    // 该参数的单行文档。
+    // // 它让位于补全弹窗 —— 两者都想要光标下方的空间，
+    // 而那时键盘驱动的是列表 —— 成本是
+    // 光标行的一次从右到左扫描加一次记忆化签名查找。
+    public void RenderSigHelp(App app, Rect area, int lineH, int textX, int fontSize,
+                       bool focused, int visLines) {
+        // 气泡本体的命中矩形每帧重算：不画的时候清零，免得上一帧
+        // 的矩形继续被当成浮层区域（那时点它本该落在文本区）。
+        sigGW = 0;
+        // 两个重载箭头的矩形另有一层讲究：被别的浮层盖住时必须清
+        // （补全弹窗打开后旧箭头会把点击整个吞掉）；只是焦点不在
+        // 时不清——焦点可能被别处抢走，此时气泡确实不再绘制，但
+        // 用户刚看见的那个箭头仍要点得动。
+        if (acActive || ctxOpen || refPopOpen) {
+            sigPrevW = 0;
+            sigNextW = 0;
+        }
+        if (acActive || !focused || ctxOpen || refPopOpen) { return; }
+        if (LineTopY(curLine) < 0) { return; }
+        // 声明不是调用：输入其自身参数列表不应
+        // 在它上方弹出自己的签名。
+        if (CodeEditor.SigFromLine(CodeEditor.TrimStr(lines[curLine])).Length > 0) {
+            return;
+        }
+        List<int> argOut = new List<int>();
+        string callee = CallAtCaret(argOut);
+        if (callee.Length == 0 || argOut.Count == 0) { return; }
+        // 有重载列表就按列表显示（VS 的「◀ 2/3 ▶」），否则退回单条签名。
+        List<CodeSignatureItem> overloads = this.SigOverloadsFor(callee);
+        int overloadIdx = 0;
+        string sig = "";
+        string overloadDoc = "";
+        if (overloads != null && overloads.Count > 0) {
+            overloadIdx = this.SigOverloadIndex(argOut[0]);
+            sig = overloads[overloadIdx].label;
+            overloadDoc = overloads[overloadIdx].doc;
+        } else {
+            sig = SigHelpFor(callee);
+        }
+        if (sig.Length == 0) { return; }
+        Canvas c = app.canvas;
+        Gui.Theme t = app.theme;
+        EditorPalette pal = EditorPalette.For(t);
+        string doc = "";
+        if (this.sigPinnedCallee == callee && overloadDoc.Length > 0) {
+            doc = overloadDoc;
+        } else {
+            doc = this.SigDocFor(callee);
+            if (doc.Length == 0) { doc = overloadDoc; }
+        }
+        if (doc.Length == 0) { doc = CodeEditor.DescDoc(callee); }
+        int pad = app.Scale(8);
+        int fh = Canvas.FontHeight(fontSize);
+        int sfh = Canvas.FontHeight(Style.FontFallback(app, "small"));
+
+        int maxBoxW = area.width - app.Scale(16);
+        if (maxBoxW > app.Scale(480)) { maxBoxW = app.Scale(480); }
+        if (maxBoxW < app.Scale(240)) { maxBoxW = app.Scale(240); }
+        int maxInnerW = maxBoxW - pad * 2;
+
+        List<string> siglines = new List<string>();
+        CodeEditor.WrapText(sig, maxInnerW, fontSize, siglines, 4);
+        if (siglines.Count == 0) { siglines.Add(sig); }
+
+        List<string> doclines = new List<string>();
+        if (doc.Length > 0) {
+            CodeEditor.WrapText(doc, maxInnerW, Style.FontFallback(app, "small"), doclines, 4);
+        }
+
+        int widest = 0;
+        for (int si = 0; si < siglines.Count; si = si + 1) {
+            int lw = Canvas.MeasureText(siglines[si], fontSize);
+            if (lw > widest) { widest = lw; }
+        }
+        for (int di = 0; di < doclines.Count; di = di + 1) {
+            int lw = Canvas.MeasureText(doclines[di], Style.FontFallback(app, "small"));
+            if (lw > widest) { widest = lw; }
+        }
+        int minInnerW = app.Scale(160);
+        if (widest < minInnerW) { widest = minInnerW; }
+        if (widest > maxInnerW) { widest = maxInnerW; }
+        // 重载计数（VS 的「◀ 2/3 ▶」）占浮层右侧一块，不压在签名文字上。
+        string counter = "";
+        int counterW = 0;
+        if (overloads != null && overloads.Count > 1) {
+            counter = "◀ " + Convert.ToString(overloadIdx + 1)
+                + "/" + Convert.ToString(overloads.Count) + " ▶";
+            counterW = Canvas.MeasureText(counter, Style.FontFallback(app, "small"));
+        }
+        int boxW = widest + pad * 2;
+        if (counterW > 0) { boxW = boxW + counterW + app.Scale(10); }
+
+        int boxH = pad * 2 + siglines.Count * fh;
+        if (doclines.Count > 0) {
+            boxH = boxH + app.Scale(4) + doclines.Count * (sfh + app.Scale(2));
+        }
+
+        int px = textX;
+        int rowY = LineTopY(curLine);
+        int py = rowY - boxH - app.Scale(2);
+        if (py < area.y) { py = rowY + lineH + app.Scale(2); }
+        if (py + boxH > area.y + area.height) { py = area.y; }
+        if (px + boxW > area.x + area.width) {
+            px = area.x + area.width - boxW - app.Scale(4);
+        }
+        if (px < area.x) { px = area.x + app.Scale(2); }
+        c.FillRoundRect(px + 2, py + 2, boxW, boxH, app.Scale(4), pal.shadowSoft);
+        c.SurfaceRoundRect(px, py, boxW, boxH, app.Scale(4), pal.popupBg,
+            pal.border, 1);
+        // 落库命中矩形：气泡画在光标行上方、直接压着文本，命中
+        // 判定必须把它算作浮层的一部分，否则点气泡正文会穿透到
+        // 文本区（光标跳行、签名帮助随之消失）。
+        sigGX = px; sigGY = py; sigGW = boxW; sigGH = boxH;
+
+        // 活动参数用强调色，签名其余部分用柔和的签名色，长实参列表保持可读。
+        List<int> span = new List<int>();
+        CodeEditor.ParamSpan(sig, argOut[0], span);
+        string activeMid = "";
+        if (span.Count == 2 && span[0] + span[1] <= sig.Length) {
+            activeMid = sig.Substring(span[0], span[1]);
+        }
+        int ty = py + pad;
+        bool midDrawn = false;
+        for (int sl = 0; sl < siglines.Count; sl = sl + 1) {
+            string slTxt = siglines[sl];
+            if (!midDrawn && activeMid.Length > 0 && slTxt.Contains(activeMid)) {
+                int mPos = slTxt.IndexOf(activeMid);
+                string head = slTxt.Substring(0, mPos);
+                string tail = slTxt.Substring(mPos + activeMid.Length);
+                int cx = px + pad;
+                if (head.Length > 0) {
+                    c.DrawText(cx, ty, head, pal.signature, fontSize);
+                    cx = cx + Canvas.MeasureText(head, fontSize);
+                }
+                c.DrawText(cx, ty, activeMid, pal.accent, fontSize);
+                cx = cx + Canvas.MeasureText(activeMid, fontSize);
+                if (tail.Length > 0) {
+                    c.DrawText(cx, ty, tail, pal.signature, fontSize);
+                }
+                midDrawn = true;
+            } else {
+                c.DrawText(px + pad, ty, slTxt, pal.signature, fontSize);
+            }
+            ty = ty + fh;
+        }
+
+        // 重载计数画在浮层右上角：左右箭头可点（VS 的「◀ 2/3 ▶」）。
+        if (counterW > 0) {
+            int cFont = Style.FontFallback(app, "small");
+            int ccx = px + boxW - pad - counterW;
+            int ccy = py + pad;
+            c.DrawText(ccx, ccy, counter, pal.muted, cFont);
+            int third = counterW / 3;
+            if (third < app.Scale(6)) { third = app.Scale(6); }
+            this.sigPrevX = ccx; this.sigPrevY = ccy;
+            this.sigPrevW = third; this.sigPrevH = sfh;
+            this.sigNextX = ccx + counterW - third; this.sigNextY = ccy;
+            this.sigNextW = third; this.sigNextH = sfh;
+        } else {
+            this.sigPrevW = 0; this.sigNextW = 0;
+        }
+
+        if (doclines.Count > 0) {
+            ty = ty + app.Scale(4);
+            for (int dl = 0; dl < doclines.Count; dl = dl + 1) {
+                c.DrawText(px + pad, ty, doclines[dl], pal.muted, Style.FontFallback(app, "small"));
+                ty = ty + sfh + app.Scale(2);
+            }
+        }
+    }
+
+    // `line[col]` 所在的标识符词（列上无标识符字符为 ""）。
+    public static string WordAt(string line, int col) {
+        if (col < 0 || col >= line.Length) { return ""; }
+        // 查找字词边界
+        int start = col;
+        while (start > 0) {
+            if (CodeEditor.IsIdentByte(line[start - 1] & 255)) { start = start - 1; }
+            else { break; }
+        }
+        int end = col;
+        while (end < line.Length) {
+            if (CodeEditor.IsIdentByte(line[end] & 255)) { end = end + 1; }
+            else { break; }
+        }
+        if (start == end) { return ""; }
+        return line.Substring(start, end - start);
+    }
+
+    // 单字符是否属于标识符（字母/数字/下划线）。
+    public static bool IsIdentChar(string ch) {
+        if (ch.Length == 0) { return false; }
+        return CodeEditor.IsIdentByte(ch[0]);
+    }
+
+    // 标识符字节判定。文本扫描逐字符调用它，切一个
+    // 单字符子串再比较字符串会为每个字符分配一次，
+    // 因此热路径按字节问。
+    public static bool IsIdentByte(int b) {
+        if (b == 95) { return true; }                 // '_'
+        if (b >= 97 && b <= 122) { return true; }     // a-z
+        if (b >= 65 && b <= 90) { return true; }      // A-Z
+        if (b >= 48 && b <= 57) { return true; }      // 0-9
+        return false;
+    }
+
+    // 调试变量的一行摘要文本 "name : type = val"（不存在为 ""）。
+    public static string LookupVar(List<DbgVar> vars, string name) {
+        for (int i = 0; i < vars.Count; i = i + 1) {
+            DbgVar v = vars[i];
+            if (v.name == name) {
+                return v.name + " : " + v.type + " = " + v.val;
+            }
+        }
+        return "";
+    }
+
+    // 与 LookupVar 类似，但返回条目本身，调用方可渲染
+    // 可展开的格式化提示。名称不存在时返回 null。
+    public static DbgVar LookupVarRaw(List<DbgVar> vars, string name) {
+        for (int i = 0; i < vars.Count; i = i + 1) {
+            DbgVar v = vars[i];
+            if (v.name == name) { return v; }
+        }
+        return null;
+    }
+
+    // 执行行的行内即时值：扫描该行引用到的局部变量（跳过字符串
+    // 与字符字面量、成员访问右侧段），按出现顺序生成 `名 = 值`
+    // 段串，显示在行尾灰字。变量名去重，值取调试器原样文本。
+    public string InlineValuesFor(string text) {
+        string outp = "";
+        List<string> seen = new List<string>();
+        int i = 0;
+        int n = text.Length;
+        string q = "";
+        while (i < n) {
+            int c = text[i] & 255;
+            if (q.Length > 0) {
+                if (c == 92) { i = i + 2; continue; }
+                if (c == (q[0] & 255)) { q = ""; }
+                i = i + 1;
+                continue;
+            }
+            if (c == 34 || c == 39) { q = text.Substring(i, 1); i = i + 1; continue; }
+            if (CodeEditor.IsIdentByte(c)
+                    && (i == 0 || !CodeEditor.IsIdentByte(text[i - 1] & 255))
+                    && (i == 0 || (text[i - 1] & 255) != 46)) {
+                int e = i;
+                while (e < n && CodeEditor.IsIdentByte(text[e] & 255)) { e = e + 1; }
+                string word = text.Substring(i, e - i);
+                DbgVar v = CodeEditor.LookupVarRaw(dbgVars, word);
+                if (v != null && v.val.Length > 0 && !seen.Contains(word)) {
+                    seen.Add(word);
+                    if (outp.Length > 0) { outp = outp + "   "; }
+                    outp = outp + word + " = " + v.val;
+                }
+                i = e;
+                continue;
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    // `line` 的前导空白，使画在行上方的标注
+    // 能与该行精确对齐缩进。
+    public static string LeadWs(string line) {
+        int i = 0;
+        int n = line.Length;
+        for (; i < n; i = i + 1) {
+            int c = line[i] & 255;
+            if (c != 32 && c != 9) { break; }
+        }
+        return line.Substring(0, i);
+    }
+
+    // n 层缩进的空格串（每层 2 格，至多 12 层）。
+    public static string Indent(int n) {
+        string s = "";
+        for (int i = 0; i < n && i < 12; i = i + 1) { s = s + "  "; }
+        return s;
+    }
+
+    // 把类 JSON 的值字符串美化打印为缩进行。忽略
+    // 引号字符串内部的结构，限制 maxLines 行，截断超长
+    // 行，且最多读取 8000 个输入字符（大数据安全）。
+    public static void PrettyJson(string s, List<string> out2, int maxLines) {
+        int indent = 0;
+        string cur = "";
+        bool inStr = false;
+        int limit = s.Length;
+        if (limit > 8000) { limit = 8000; }
+        for (int i = 0; i < limit; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (inStr) {
+                cur = cur + ch;
+                if (ch == "\"") { inStr = false; }
+                else if (ch == "\\" && i + 1 < limit) { cur = cur + s.Substring(i + 1, 1); i = i + 1; }
+            } else if (ch == "\"") {
+                cur = cur + ch; inStr = true;
+            } else if (ch == "{" || ch == "[") {
+                cur = cur + ch;
+                out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur));
+                cur = "";
+                indent = indent + 1;
+            } else if (ch == "}" || ch == "]") {
+                if (cur.Length > 0) { out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur)); cur = ""; }
+                indent = indent - 1;
+                if (indent < 0) { indent = 0; }
+                out2.Add(CodeEditor.Indent(indent) + ch);
+            } else if (ch == ",") {
+                cur = cur + ch;
+                out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur));
+                cur = "";
+            } else if (ch == ":") {
+                cur = cur + ": ";
+            } else if (ch == " " || ch == "\n" || ch == "\t" || ch == "\r") {
+                // 字符串外无意义的空白
+            } else {
+                cur = cur + ch;
+            }
+            if (out2.Count >= maxLines) { out2.Add("  ...(truncated)"); return; }
+        }
+        if (cur.Length > 0) { out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur)); }
+    }
+
+    // 截断单条提示行，超长值不会撑爆提示框。
+    public static string Clip(string s) {
+        if (s.Length > 200) { return s.Substring(0, 200) + " ..."; }
+        return s;
+    }
+
+    // 构建调试悬停提示中显示的行：头部
+    // （`name : type`）后跟值，若值看起来像
+    // JSON / 数组 / 对象则美化打印。
+    public static void BuildHoverLines(DbgVar v, List<string> out2) {
+        out2.Add(v.name + " : " + v.type);
+        int a = 0;
+        int vlen = v.val.Length;
+        for (; a < vlen && (v.val[a] & 255) == 32; a = a + 1) { }
+        string vt = v.val.Substring(a, vlen - a);
+        if (vt.Length > 0 && ((vt[0] & 255) == 123 || (vt[0] & 255) == 91)) {
+            CodeEditor.PrettyJson(vt, out2, 60);
+        } else {
+            out2.Add("= " + CodeEditor.Clip(v.val));
+        }
+    }
+
+}

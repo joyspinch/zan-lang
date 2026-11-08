@@ -1,0 +1,475 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+// CodeEditor 分部：语法高亮引擎、多语言关键字字典与词法着色
+public partial class CodeEditor {
+    // ---- 语法高亮 ----
+
+    // 单字符字符串 `ch` 出现在 `set` 中时返回 true。
+    public static bool InSet(string chars, string ch) {
+        if (chars == null || ch == null || ch.Length == 0) { return false; }
+        return chars.IndexOf(ch) >= 0;
+    }
+
+    // `hay` 包含子串 `needle` 时返回 true。
+    public static bool ContainsSub(string hay, string needle) {
+        if (hay == null || needle == null) { return false; }
+        return hay.IndexOf(needle) >= 0;
+    }
+
+    static Dict<string, bool> s_zanKeywords;
+    static Dict<string, bool> s_luaKeywords;
+    static Dict<string, bool> s_pyKeywords;
+
+    public static void PopulateKwDict(Dict<string, bool> d, string kws) {
+        List<string> parts = kws.Split(" ");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string p = parts[i];
+            if (p != "") { d.Add(p, true); }
+        }
+    }
+
+    // `w` 是 Zan/C# 风格语言关键字时返回 true（O(1) 哈希查询，消除逐词临时字符串拼接与全表线性扫描开销）。
+    public static bool IsKeyword(string w) {
+        if (w == null || w.Length == 0) { return false; }
+        if (s_zanKeywords == null) {
+            s_zanKeywords = new Dict<string, bool>();
+            PopulateKwDict(s_zanKeywords, "using namespace class struct enum interface static void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof");
+        }
+        return s_zanKeywords.ContainsKey(w);
+    }
+
+    // `w` 是 Lua 关键字（含 5.4 的 goto）时返回 true。
+    public static bool IsLuaKeyword(string w) {
+        if (w == null || w.Length == 0) { return false; }
+        if (s_luaKeywords == null) {
+            s_luaKeywords = new Dict<string, bool>();
+            PopulateKwDict(s_luaKeywords, "and break do else elseif end false for function goto if in local nil not or repeat return then true until while self");
+        }
+        return s_luaKeywords.ContainsKey(w);
+    }
+
+    // `w` 是 Python 关键字或内置软关键字时返回 true。
+    public static bool IsPyKeyword(string w) {
+        if (w == null || w.Length == 0) { return false; }
+        if (s_pyKeywords == null) {
+            s_pyKeywords = new Dict<string, bool>();
+            PopulateKwDict(s_pyKeywords, "False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case self");
+        }
+        return s_pyKeywords.ContainsKey(w);
+    }
+
+    // 按语言（0=Zan、1=Lua、2=Python）判定关键字。
+    public static bool IsKeywordLang(string w, int lang) {
+        if (lang == 1) { return CodeEditor.IsLuaKeyword(w); }
+        if (lang == 2) { return CodeEditor.IsPyKeyword(w); }
+        return CodeEditor.IsKeyword(w);
+    }
+
+    // 从 `from` 起找本语言块注释/长字符串的结束符，返回其后
+    // 一个位置；本行内未闭合则返回 -1。Zan 用 "*/"，Lua 用
+    // "]]"，Python 用三引号。
+    public static int BlockEnd(string line, int from, int lang) {
+        int n = line.Length;
+        int j = from;
+        if (lang == 1) {
+            while (j + 1 < n) {
+                if (line[j] == 93 && line[j + 1] == 93) { return j + 2; }
+                j = j + 1;
+            }
+            return -1;
+        }
+        if (lang == 2) {
+            while (j + 2 < n) {
+                if (line[j] == 34 && line[j + 1] == 34 && line[j + 2] == 34) {
+                    return j + 3;
+                }
+                j = j + 1;
+            }
+            return -1;
+        }
+        while (j + 1 < n) {
+            if (line[j] == 42 && line[j + 1] == 47) { return j + 2; }
+            j = j + 1;
+        }
+        return -1;
+    }
+
+    // 活动语法调色板的廉价签名；变化时
+    // 整个高亮缓存被丢弃，使颜色跟随主题/覆盖切换。
+    public int HlThemeSig(Gui.Theme t, int defaultText) {
+        int s = defaultText;
+        s = s ^ synKw ^ synTy ^ synStr ^ synCom ^ synNum ^ synText;
+        s = s ^ cssKw ^ cssTy ^ cssStr ^ cssCom ^ cssNum;
+        if (t.IsLightBg()) { s = s ^ 0x5A5A5A5A; }
+        return s;
+    }
+
+    // 返回 `ln` 行的缓存高亮，仅当
+    // 行文本（或调色板）变化时重新分词。稳定帧中每个可见行
+    // 都命中缓存，滚动时无分词、无分配。
+    // 块注释状态自上而下传递：以未闭合的
+    // /* 结尾的行会把后续行着为注释色，直到出现闭合的
+    // */。当前一行尚未缓存时（跳转后首次绘制），
+    // 从最近的已缓存行向前分词重新推导状态，
+    // 直至本行。
+    public CeHlLine GetHl(int ln, string text, Theme t, int defaultText) {
+        if (analysisApp != null) {
+            if (ln >= 0 && ln < hlCache.Count && hlCache[ln] != null && hlCache[ln].src == text) {
+                return hlCache[ln];
+            }
+            // 语义分析结果未就绪或当前行正在编辑时，采用本地轻量分词即时着色，消除单色黑白闪烁
+            CeHlLine fallback = new CeHlLine();
+            fallback.src = text;
+            fallback.spans = new List<CodeSpan>();
+            fallback.blockOpen = Highlight(text, t, defaultText, false, fallback.spans);
+            return fallback;
+        }
+        int sig = HlThemeSig(t, defaultText);
+        if (sig != hlThemeSig) {
+            hlCache = new List<CeHlLine>();
+            hlThemeSig = sig;
+        }
+        while (hlCache.Count <= ln) { hlCache.Add(null); }
+        CeHlLine cur = hlCache[ln];
+        if (cur != null && cur.src == text) {
+            if (cur.spans == null) {
+                cur.spans = new List<CodeSpan>();
+                cur.blockOpen = Highlight(text, t, defaultText, cur.blockIn, cur.spans);
+            }
+            return cur;
+        }
+
+        bool inBlock = false;
+        if (ln > 0) {
+            int prev = ln - 1;
+            if (prev < hlCache.Count && hlCache[prev] != null) {
+                inBlock = hlCache[prev].blockOpen;
+            } else {
+                // 取上方最近的已缓存行，再向前分词到 ln-1，
+                // 使光标跳转后块状态依然正确。
+                int baseLine = prev;
+                while (baseLine >= 0 &&
+                       (baseLine >= hlCache.Count || hlCache[baseLine] == null)) {
+                    baseLine = baseLine - 1;
+                }
+                if (baseLine >= 0) {
+                    inBlock = hlCache[baseLine].blockOpen;
+                    int k = baseLine + 1;
+                    List<CodeSpan> scratch = new List<CodeSpan>();
+                    while (k < ln) {
+                        string kt = lines[k];
+                        CeHlLine ke = new CeHlLine();
+                        ke.src = kt;
+                        ke.spans = null;
+                        ke.blockIn = inBlock;
+                        // 快速推导：绝大多数普通代码行不含块注释定界符，inBlock 状态保持不变，
+                        // 无需为屏幕外行构造分词与对象分配，极大加速跨行滚动。
+                        bool canQuick = false;
+                        bool quick = false;
+                        if (!inBlock) {
+                            if (syntaxLang == 0 && kt.IndexOf("/*") < 0) { quick = false; canQuick = true; }
+                            else if (syntaxLang == 1 && kt.IndexOf("--[[") < 0) { quick = false; canQuick = true; }
+                            else if (syntaxLang == 2 && kt.IndexOf("\"\"\"") < 0 && kt.IndexOf("'''") < 0) { quick = false; canQuick = true; }
+                        } else {
+                            if (syntaxLang == 0 && kt.IndexOf("*/") < 0) { quick = true; canQuick = true; }
+                            else if (syntaxLang == 1 && kt.IndexOf("]]") < 0) { quick = true; canQuick = true; }
+                            else if (syntaxLang == 2 && kt.IndexOf("\"\"\"") < 0 && kt.IndexOf("'''") < 0) { quick = true; canQuick = true; }
+                        }
+                        if (canQuick) {
+                            ke.blockOpen = quick;
+                        } else {
+                            scratch.Clear();
+                            ke.blockOpen = Highlight(kt, t, defaultText, inBlock, scratch);
+                        }
+                        inBlock = ke.blockOpen;
+                        while (hlCache.Count <= k) { hlCache.Add(null); }
+                        hlCache[k] = ke;
+                        k = k + 1;
+                    }
+                }
+                // baseLine < 0：上方无缓存，从文件顶部开始
+                // （inBlock 保持 false）。
+            }
+        }
+
+        CeHlLine ne = new CeHlLine();
+        ne.src = text;
+        ne.spans = new List<CodeSpan>();
+        ne.blockIn = inBlock;
+        ne.blockOpen = Highlight(text, t, defaultText, inBlock, ne.spans);
+        hlCache[ln] = ne;
+        return ne;
+    }
+
+    // 把 `line` 拆成彩色区间：关键字、类型（大写开头
+    // 的标识符）、字符串、注释和数字各用不同颜色；
+    // 其余用默认文本色。`inBlock` 继承自
+    // 上一行，返回值是该行结束时的状态。
+    public bool Highlight(string line, Theme t, int defaultText, bool inBlock,
+                   List<CodeSpan> spans) {
+        // 默认值跟随当前外观：浅色背景用
+        // 适配浅色的调色板，深色背景保留经典深色调色板。
+        EditorPalette pal = EditorPalette.For(t);
+        int kwC = pal.keyword;
+        int tyC = pal.type;
+        int strC = pal.str;
+        int comC = pal.comment;
+        int numC = pal.number;
+        int def = defaultText;
+        // 皮肤 CSS 的语法部件（base.css 默认映射 --code-* token），
+        // 再被宿主点名的预设覆盖。
+        if (cssKw != 0) { kwC = cssKw; }
+        if (cssTy != 0) { tyC = cssTy; }
+        if (cssStr != 0) { strC = cssStr; }
+        if (cssCom != 0) { comC = cssCom; }
+        if (cssNum != 0) { numC = cssNum; }
+        if (synKw != 0) { kwC = synKw; }
+        if (synTy != 0) { tyC = synTy; }
+        if (synStr != 0) { strC = synStr; }
+        if (synCom != 0) { comC = synCom; }
+        if (synNum != 0) { numC = synNum; }
+        if (synText != 0) { def = synText; }
+        return CodeEditor.HighlightSpansLang(line, kwC, tyC, strC, comC, numC,
+                                            def, inBlock, syntaxLang, spans);
+    }
+
+    // 编辑器和只读代码视图（如
+    // 组件画廊）共用的静态分词器。用给定调色板追加彩色区间。
+    // `inBlock` 是继承的 /* 块注释状态；返回
+    // 行结束时的状态。
+    public static bool HighlightSpans(string line, int kwC, int tyC, int strC,
+            int comC, int numC, int def, bool inBlock, List<CodeSpan> spans) {
+        return CodeEditor.HighlightSpansLang(line, kwC, tyC, strC, comC, numC,
+                                            def, inBlock, 0, spans);
+    }
+
+    // 同 <see cref="HighlightSpans"/>，但按 `lang` 分词
+    // （0=Zan、1=Lua、2=Python）：注释引导符、块注释/长字符串
+    // 与关键字表都随语言切换，单引号字符串只在 Lua/Python 中
+    // 成立。
+    public static bool HighlightSpansLang(string line, int kwC, int tyC, int strC,
+            int comC, int numC, int def, bool inBlock, int lang,
+            List<CodeSpan> spans) {
+        // 按原始字节码（line[i]）分类，每个 token 只做一次
+        // Substring，而非每字节分配单字符字符串并
+        // 扫描字符集合。ASCII 标识符/关键字/数字/字符串
+        // 按字节范围识别；任何 >= 128 的字节（UTF-8 多字节文本）
+        // 与之前一样落入默认区间。
+        int n = line.Length;
+        int i = 0;
+        int pstart = -1;   // 当前默认色区间的起点，-1 = 无
+        if (inBlock) {
+            // 行以块注释（Python 为三引号字符串）内部开始：
+            // 扫描本语言的结束符。
+            int e = CodeEditor.BlockEnd(line, i, lang);
+            if (e < 0) {
+                spans.Add(new CodeSpan(line.Substring(i, n - i), comC));
+                return true;
+            }
+            spans.Add(new CodeSpan(line.Substring(i, e - i), comC));
+            i = e;
+            inBlock = false;
+        }
+        while (i < n) {
+            int b = line[i];
+            // 块注释（Lua 的 --[[ / Python 的三引号）开头
+            bool blockStart = false;
+            int bodyAt = i;
+            if (lang == 0) {
+                if (b == 47 && i + 1 < n && line[i + 1] == 42) {
+                    blockStart = true; bodyAt = i + 2;
+                }
+            } else if (lang == 1) {
+                if (b == 45 && i + 3 < n && line[i + 1] == 45
+                    && line[i + 2] == 91 && line[i + 3] == 91) {
+                    blockStart = true; bodyAt = i + 4;
+                }
+            } else {
+                if (b == 34 && i + 2 < n && line[i + 1] == 34 && line[i + 2] == 34) {
+                    blockStart = true; bodyAt = i + 3;
+                }
+            }
+            // 行注释引导符：Zan "//"、Lua "--"、Python "#"
+            bool lineCom = false;
+            if (lang == 0) { lineCom = (b == 47 && i + 1 < n && line[i + 1] == 47); }
+            else if (lang == 1) { lineCom = (b == 45 && i + 1 < n && line[i + 1] == 45); }
+            else { lineCom = (b == 35); }
+            if (blockStart) {
+                if (pstart >= 0) { spans.Add(new CodeSpan(line.Substring(pstart, i - pstart), def)); pstart = -1; }
+                int j = CodeEditor.BlockEnd(line, bodyAt, lang);
+                if (j >= 0) {
+                    spans.Add(new CodeSpan(line.Substring(i, j - i), comC));
+                    i = j;
+                } else {
+                    spans.Add(new CodeSpan(line.Substring(i, n - i), comC));
+                    return true;
+                }
+            } else if (lineCom) {
+                if (pstart >= 0) { spans.Add(new CodeSpan(line.Substring(pstart, i - pstart), def)); pstart = -1; }
+                spans.Add(new CodeSpan(line.Substring(i, n - i), comC));
+                i = n;
+            } else if (b == 34 || (b == 39 && lang > 0)) {              // 字符串字面量
+                if (pstart >= 0) { spans.Add(new CodeSpan(line.Substring(pstart, i - pstart), def)); pstart = -1; }
+                int q = b;
+                int j = i + 1;
+                while (j < n) {
+                    int cj = line[j];
+                    if (cj == 92 && j + 1 < n) { j = j + 2; }
+                    else if (cj == q) { j = j + 1; break; }
+                    else { j = j + 1; }
+                }
+                spans.Add(new CodeSpan(line.Substring(i, j - i), strC));
+                i = j;
+            } else if (b >= 48 && b <= 57) {                          // 数字
+                if (pstart >= 0) { spans.Add(new CodeSpan(line.Substring(pstart, i - pstart), def)); pstart = -1; }
+                int j = i;
+                while (j < n) {
+                    int cj = line[j];
+                    bool hex = (cj >= 97 && cj <= 102) || (cj >= 65 && cj <= 70);
+                    if ((cj >= 48 && cj <= 57) || cj == 46 || cj == 120 || hex) { j = j + 1; }
+                    else { break; }
+                }
+                spans.Add(new CodeSpan(line.Substring(i, j - i), numC));
+                i = j;
+            } else if ((b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95) { // 标识符
+                if (pstart >= 0) { spans.Add(new CodeSpan(line.Substring(pstart, i - pstart), def)); pstart = -1; }
+                int j = i;
+                while (j < n) {
+                    int cj = line[j];
+                    if ((cj >= 97 && cj <= 122) || (cj >= 65 && cj <= 90)
+                        || (cj >= 48 && cj <= 57) || cj == 95) { j = j + 1; }
+                    else { break; }
+                }
+                string w = line.Substring(i, j - i);
+                int col = def;
+                if (CodeEditor.IsKeywordLang(w, lang)) { col = kwC; }
+                else if (b >= 65 && b <= 90) { col = tyC; }
+                spans.Add(new CodeSpan(w, col));
+                i = j;
+            } else {
+                if (pstart < 0) { pstart = i; }
+                i = i + 1;
+            }
+        }
+        if (pstart >= 0) {
+            spans.Add(new CodeSpan(line.Substring(pstart, n - pstart), def));
+        }
+        return false;
+    }
+
+    // 选区高亮色调，选在当前外观下可读的颜色。
+    public static int SelColor(Gui.Theme t) {
+        return EditorPalette.For(t).selection;
+    }
+
+    // 在行 `ln` 上绘制本行命中的选区高亮条（首/末行按列截断，
+    // 中间行整行；不在选区内不画）。
+    public static void DrawSelHighlight(Canvas c, App app,
+            int aL, int aC, int cL, int cC,
+            int ln, string text, int textX, int rowY, int lineH, int fontSize, Rect area) {
+        int sL = aL; int sC = aC; int eL = cL; int eC = cC;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tL = sL; sL = eL; eL = tL;
+            int tC = sC; sC = eC; eC = tC;
+        }
+        if (ln < sL || ln > eL) { return; }
+        int startC = 0;
+        int endC = text.Length;
+        if (ln == sL) { startC = sC; }
+        if (ln == eL) { endC = eC; }
+        if (startC > text.Length) { startC = text.Length; }
+        if (endC > text.Length) { endC = text.Length; }
+        if (startC >= endC && ln != sL && ln != eL) {
+            startC = 0; endC = text.Length;
+        }
+        if (startC >= endC) { return; }
+        int xStart = textX + Canvas.MeasureText(Text.Left(text, startC), fontSize);
+        int xEnd = textX + Canvas.MeasureText(Text.Left(text, endC), fontSize);
+        c.FillRect(xStart, rowY, xEnd - xStart, lineH, CodeEditor.SelColor(app.theme));
+    }
+
+    // 在行 `ln` 上绘制与光标下单词匹配的所有出现位置的高亮框（VS 风格 Occurrence Highlight）。
+    public static void DrawWordOccurrences(Canvas c, string text, string targetWord, int textX, int rowY,
+            int lineH, int fontSize, int color) {
+        if (targetWord == null || targetWord.Length == 0 || text == null || text.Length < targetWord.Length) {
+            return;
+        }
+        int wlen = targetWord.Length;
+        int idx = 0;
+        while (idx <= text.Length - wlen) {
+            int p = text.IndexOf(targetWord, idx);
+            if (p < 0) { break; }
+            bool leftBound = (p == 0) || !CodeEditor.IsIdentByte(text[p - 1] & 255);
+            bool rightBound = (p + wlen >= text.Length) || !CodeEditor.IsIdentByte(text[p + wlen] & 255);
+            if (leftBound && rightBound) {
+                int x1 = textX + Canvas.MeasureText(Text.Left(text, p), fontSize);
+                int x2 = textX + Canvas.MeasureText(Text.Left(text, p + wlen), fontSize);
+                if (x2 > x1) {
+                    c.FillRect(x1, rowY + 1, x2 - x1, lineH - 2, color);
+                }
+            }
+            idx = p + wlen;
+        }
+    }
+
+    // 在行的 `col` 格画一枚括号配对描边框（列→x 与选区/光标同
+    // 一映射，保证框正好套住那一格）。
+    public static void DrawBracketBox(Canvas c, string text, int col, int textX,
+            int rowY, int lineH, int fontSize, int color) {
+        if (col < 0 || col >= text.Length) { return; }
+        int x1 = textX + Canvas.MeasureText(Text.Left(text, col), fontSize);
+        int x2 = textX + Canvas.MeasureText(Text.Left(text, col + 1), fontSize);
+        if (x2 <= x1) { return; }
+        c.DrawRoundRect(x1, rowY + 1, x2 - x1, lineH - 2, 2, color, 1);
+    }
+
+    // 波浪下划线（VS 的诊断波浪线）：在 [x0, x1) 内画一段段上下起伏
+    // 的短笔。`step` 是笔高（像素），每一段的宽度是它的两倍。
+    public static void DrawSquiggle(Canvas c, int x0, int x1, int y, int color, int step) {
+        if (x1 <= x0) { return; }
+        int h = step;
+        if (h < 1) { h = 1; }
+        int seg = h * 2;
+        int x = x0;
+        bool down = false;
+        while (x < x1) {
+            int w = seg;
+            if (x + w > x1) { w = x1 - x; }
+            c.FillRect(x, down ? y + h : y, w, h, color);
+            down = !down;
+            x = x + w;
+        }
+    }
+
+    // 诊断列表里 `line` 行的消息（无则 ""）。
+    public static string DiagMsg(List<Diagnostic> ds, int line) {
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            if (ds[i].line == line) {
+                return ds[i].msg;
+            }
+        }
+        return "";
+    }
+
+    // 任何诊断位于 `line` 行时返回 true。
+    public static bool DiagHas(List<Diagnostic> ds, int line) {
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            if (ds[i].line == line) { return true; }
+        }
+        return false;
+    }
+
+    // 任何快速修复指向 `line` 行时返回 true。
+    public static bool QuickFixHas(List<QuickFix> qs, int line) {
+        for (int i = 0; i < qs.Count; i = i + 1) {
+            if (qs[i].line == line) { return true; }
+        }
+        return false;
+    }
+
+
+}
