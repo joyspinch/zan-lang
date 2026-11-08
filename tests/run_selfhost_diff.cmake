@@ -22,7 +22,12 @@
 #         -DGEN1=<exe> -DOUTDIR=<dir> -DCLANG=<clang> -DRTOBJS=<objs> \
 #         -DSYSLIBS=<libs> -DCASES=<cases.txt> -DGAPS=<gaps.txt> \
 #         [-DREJECTS=<reject_cases.txt> -DREJECT_DIR=<dir>] \
-#         [-DWORKDIR=<dir>] -P run_selfhost_diff.cmake
+#         [-DWORKDIR=<dir>] [-DJOBS=<n>] -P run_selfhost_diff.cmake
+#
+# The per-case loop (emit -> link -> run -> compare) runs on a Python thread
+# pool (scripts/run_diff_parallel.py) -- 230 independent clang links were the
+# gate's whole wall-clock cost, and CMake script mode has no job control. The
+# summary line and the exit boundary are unchanged.
 
 cmake_policy(SET CMP0012 NEW)
 
@@ -52,25 +57,10 @@ endif()
 file(MAKE_DIRECTORY ${OUTDIR})
 
 # ---- known gaps ------------------------------------------------------------
-set(_gaps)
-if(GAPS)
-  if(NOT EXISTS ${GAPS})
-    message(FATAL_ERROR "run_selfhost_diff.cmake: the known-gaps file '${GAPS}' does not exist (pass an absolute path)")
-  endif()
-  file(STRINGS ${GAPS} _gap_lines)
-  foreach(_g IN LISTS _gap_lines)
-    string(STRIP "${_g}" _g)
-    if(_g STREQUAL "" OR _g MATCHES "^#")
-      continue()
-    endif()
-    # "case -- reason": the reason is documentation, the name is the key
-    string(FIND "${_g}" " --" _sep)
-    if(NOT _sep EQUAL -1)
-      string(SUBSTRING "${_g}" 0 ${_sep} _g)
-      string(STRIP "${_g}" _g)
-    endif()
-    list(APPEND _gaps "${_g}")
-  endforeach()
+# The driver (scripts/run_diff_parallel.py) parses the gap/reject lists from
+# the same files; cmake only fail-fasts on a missing path.
+if(GAPS AND NOT EXISTS ${GAPS})
+  message(FATAL_ERROR "run_selfhost_diff.cmake: the known-gaps file '${GAPS}' does not exist (pass an absolute path)")
 endif()
 
 # ---- build gen1 once -------------------------------------------------------
@@ -85,198 +75,52 @@ if(NOT build_rc EQUAL 0)
   message(FATAL_ERROR "gen1 build failed (rc=${build_rc})\n${build_out}${build_err}")
 endif()
 
-# ---- the case list ---------------------------------------------------------
-file(STRINGS ${CASES} _case_lines)
-set(_cases)
-foreach(_c IN LISTS _case_lines)
-  string(STRIP "${_c}" _c)
-  if(_c STREQUAL "" OR _c MATCHES "^#")
-    continue()
-  endif()
-  list(APPEND _cases "${_c}")
-endforeach()
-
-set(_failures 0)
-set(_gap_hits 0)
-set(_passed 0)
-set(_rejected 0)
-
-# ---- programs the self-host must reject ------------------------------------
-# A "reject" case is a program the self-hosted compiler must refuse: the exit
-# code has to be non-zero and no IR may be written. It guards a fail-closed
-# boundary -- the self-host must report a diagnostic instead of emitting IR it
-# cannot lower (the C host may accept the same program; that is fine).
-#
-# A reject line may also pin the diagnostic: `name|||expected substring`. The
-# substring is matched literally (not as a regex) against the compiler's
-# output, so a case can assert that the self-host refuses the program for the
-# intended reason -- not for some later, unrelated one.
-set(_rejects)
-if(REJECTS)
-  if(NOT EXISTS ${REJECTS})
-    message(FATAL_ERROR "run_selfhost_diff.cmake: the reject list '${REJECTS}' does not exist (pass an absolute path)")
-  endif()
-  file(STRINGS ${REJECTS} _reject_lines)
-  foreach(_r IN LISTS _reject_lines)
-    string(STRIP "${_r}" _r)
-    if(_r STREQUAL "" OR _r MATCHES "^#")
-      continue()
-    endif()
-    list(APPEND _rejects "${_r}")
-  endforeach()
+# ---- hand the per-case loop to the parallel driver --------------------------
+# CMake keeps the front half (gen1 build) and owns the exit boundary: a
+# non-zero driver exit is fatal, mirroring the sequential SEND_ERROR ->
+# FATAL_ERROR flow. A "reject" case (a program the self-host must refuse,
+# fail-closed, optionally with the diagnostic pinned on both compilers) is
+# parsed and checked by the driver.
+if(REJECTS AND NOT EXISTS ${REJECTS})
+  message(FATAL_ERROR "run_selfhost_diff.cmake: the reject list '${REJECTS}' does not exist (pass an absolute path)")
 endif()
 
-foreach(_case IN LISTS _cases)
-  set(_src "${CASE_DIR}/${_case}.zan")
-  set(_golden "${CASE_DIR}/${_case}.out")
-  if(NOT EXISTS ${_src})
-    message(FATAL_ERROR "case source not found: ${_src}")
-  endif()
-  set(_ll "${OUTDIR}/${_case}.ll")
-  set(_exe "${OUTDIR}/${_case}.exe")
-  file(REMOVE ${_ll} ${_exe})
+find_program(PYTHON_EXE python)
+if(NOT PYTHON_EXE)
+  message(FATAL_ERROR "run_selfhost_diff.cmake: python is required for the parallel differential loop (scripts/run_diff_parallel.py)")
+endif()
 
-  set(_why "")
-  execute_process(
-    COMMAND ${GEN1} ${_ll} ${_src}
-    WORKING_DIRECTORY ${WORKDIR}
-    RESULT_VARIABLE gen_rc
-    OUTPUT_VARIABLE gen_out
-    ERROR_VARIABLE gen_err)
-  if(NOT gen_rc EQUAL 0)
-    set(_why "gen1 failed to compile it (rc=${gen_rc}): ${gen_out}")
-  else()
-    if(CLANG AND RTOBJS)
-      execute_process(
-        COMMAND ${CLANG} ${_ll} ${RTOBJS} ${SYSLIBS} -o ${_exe}
-        RESULT_VARIABLE cc_rc
-        OUTPUT_VARIABLE cc_out
-        ERROR_VARIABLE cc_err)
-      if(NOT cc_rc EQUAL 0)
-        set(_why "clang rejected the emitted IR (rc=${cc_rc}): ${cc_out}${cc_err}")
-      endif()
-    endif()
-  endif()
+get_filename_component(_script_dir "${CMAKE_SCRIPT_MODE_FILE}" DIRECTORY)
+set(_driver "${_script_dir}/../scripts/run_diff_parallel.py")
+if(NOT EXISTS "${_driver}")
+  message(FATAL_ERROR "run_selfhost_diff.cmake: the parallel driver '${_driver}' is missing")
+endif()
 
-  if(_why STREQUAL "")
-    execute_process(
-      COMMAND ${_exe}
-      WORKING_DIRECTORY ${WORKDIR}
-      RESULT_VARIABLE run_rc
-      OUTPUT_VARIABLE run_out
-      ERROR_VARIABLE run_err)
-    if(NOT run_rc EQUAL 0)
-      set(_why "the program exited with ${run_rc}: ${run_out}${run_err}")
-    elseif(EXISTS ${_golden})
-      file(READ ${_golden} _exp)
-      string(REPLACE "\r\n" "\n" _exp "${_exp}")
-      string(REPLACE "\r\n" "\n" run_out "${run_out}")
-      string(REGEX REPLACE "[ \t\r\n]+$" "" _exp "${_exp}")
-      string(REGEX REPLACE "[ \t\r\n]+$" "" run_out "${run_out}")
-      if(NOT run_out STREQUAL _exp)
-        set(_why "stdout differs from the C host's golden output\n--- expected ---\n${_exp}\n--- actual ---\n${run_out}")
-      endif()
-    endif()
-  endif()
+set(_drv_args
+  --zanc "${ZANC}" --gen1 "${GEN1}" --outdir "${OUTDIR}"
+  --case-dir "${CASE_DIR}" --cases "${CASES}" --workdir "${WORKDIR}")
+if(CLANG)
+  list(APPEND _drv_args --clang "${CLANG}")
+endif()
+if(RTOBJS)
+  list(APPEND _drv_args --rtobjs ${RTOBJS})
+endif()
+# SYSLIBS is not threaded through: the driver derives the same per-OS list
+# itself (the cmake->python argv boundary mangles ';'-separated values).
+if(GAPS)
+  list(APPEND _drv_args --gaps "${GAPS}")
+endif()
+if(REJECTS)
+  list(APPEND _drv_args --rejects "${REJECTS}" --reject-dir "${REJECT_DIR}")
+endif()
+if(JOBS)
+  list(APPEND _drv_args --jobs "${JOBS}")
+endif()
 
-  if(_why STREQUAL "")
-    math(EXPR _passed "${_passed} + 1")
-    message(STATUS "PASS ${_case}")
-    if("${_case}" IN_LIST _gaps)
-      # the gap is closed but the list still names it: report it so the list
-      # gets pruned (a warning, not a failure -- the behaviour is correct now)
-      message(WARNING "known gap '${_case}' now passes: delete it from ${GAPS}")
-    endif()
-  elseif("${_case}" IN_LIST _gaps)
-    math(EXPR _gap_hits "${_gap_hits} + 1")
-    message(STATUS "GAP  ${_case}: ${_why}")
-  else()
-    math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL ${_case}: ${_why}")
-  endif()
-endforeach()
-
-foreach(_r IN LISTS _rejects)
-  # `name|||expected substring` pins the diagnostic; a bare `name` only asks
-  # for a refusal. A third field (`name|||self|||host`) additionally pins the
-  # C host's diagnostic: both compilers must refuse the program with the same
-  # wording.
-  string(REPLACE "|||" ";" _rparts "${_r}")
-  list(LENGTH _rparts _rnp)
-  list(GET _rparts 0 _rname)
-  set(_rtext "")
-  if(_rnp GREATER 1)
-    list(GET _rparts 1 _rtext)
-  endif()
-  set(_rsrc "${REJECT_DIR}/${_rname}.zan")
-  if(NOT EXISTS ${_rsrc})
-    message(FATAL_ERROR "reject case source not found: ${_rsrc}")
-  endif()
-  # A sibling `<name>_helper.zan` joins the compile (both compilers): a
-  # visibility case needs two namespaces, and a file holds exactly one.
-  set(_rextra)
-  if(EXISTS "${REJECT_DIR}/${_rname}_helper.zan")
-    set(_rextra "${REJECT_DIR}/${_rname}_helper.zan")
-  endif()
-  set(_rll "${OUTDIR}/reject_${_rname}.ll")
-  file(REMOVE ${_rll})
-  execute_process(
-    COMMAND ${GEN1} ${_rll} ${_rsrc} ${_rextra}
-    WORKING_DIRECTORY ${WORKDIR}
-    RESULT_VARIABLE rej_rc
-    OUTPUT_VARIABLE rej_out
-    ERROR_VARIABLE rej_err)
-  if(rej_rc EQUAL 0)
-    math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL reject ${_rname}: the self-hosted compiler accepted a program it must reject")
-  elseif(EXISTS ${_rll})
-    math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL reject ${_rname}: the self-hosted compiler wrote IR for a program it must reject")
-  elseif(NOT _rtext STREQUAL "")
-    string(FIND "${rej_out}${rej_err}" "${_rtext}" _rhit)
-    if(_rhit EQUAL -1)
-      math(EXPR _failures "${_failures} + 1")
-      message(SEND_ERROR "FAIL reject ${_rname}: the diagnostic does not contain '${_rtext}' -- refused for another reason")
-    else()
-      math(EXPR _rejected "${_rejected} + 1")
-      message(STATUS "REJECT ${_rname}: refused as expected")
-    endif()
-  else()
-    math(EXPR _rejected "${_rejected} + 1")
-    message(STATUS "REJECT ${_rname}: refused as expected")
-  endif()
-
-  # An optional third field pins the C host's diagnostic too:
-  # `name|||self-host substring|||host substring`. Such a case asserts that
-  # both compilers refuse the program with the *same wording* -- the
-  # self-host may not answer a program the host rejects with a diagnostic of
-  # its own.
-  if(_rnp GREATER 2)
-    list(GET _rparts 2 _rhost)
-    set(_rhexe "${OUTDIR}/reject_${_rname}_host.exe")
-    file(REMOVE ${_rhexe})
-    execute_process(
-      COMMAND ${ZANC} ${_rsrc} ${_rextra} --auto-stdlib -o ${_rhexe}
-      WORKING_DIRECTORY ${WORKDIR}
-      RESULT_VARIABLE host_rc
-      OUTPUT_VARIABLE host_out
-      ERROR_VARIABLE host_err)
-    if(host_rc EQUAL 0)
-      math(EXPR _failures "${_failures} + 1")
-      message(SEND_ERROR "FAIL reject ${_rname}: the C host accepted the program the self-host must reject")
-    else()
-      string(FIND "${host_out}${host_err}" "${_rhost}" _rhost_hit)
-      if(_rhost_hit EQUAL -1)
-        math(EXPR _failures "${_failures} + 1")
-        message(SEND_ERROR "FAIL reject ${_rname}: the C host's diagnostic does not contain '${_rhost}' -- the two compilers do not agree on the wording")
-      else()
-        message(STATUS "REJECT ${_rname}: the C host refuses it with the same wording")
-      endif()
-    endif()
-  endif()
-endforeach()
-
-message(STATUS "selfhost differential: ${_passed} passed, ${_gap_hits} known gaps, ${_rejected} rejected, ${_failures} failures")
-if(_failures GREATER 0)
-  message(FATAL_ERROR "selfhost differential gate: ${_failures} case(s) disagree with the C host")
+execute_process(
+  COMMAND ${PYTHON_EXE} ${_driver} ${_drv_args}
+  WORKING_DIRECTORY ${WORKDIR}
+  RESULT_VARIABLE _drv_rc)
+if(NOT _drv_rc EQUAL 0)
+  message(FATAL_ERROR "selfhost differential gate: the parallel driver exited with ${_drv_rc} (see the failures above)")
 endif()

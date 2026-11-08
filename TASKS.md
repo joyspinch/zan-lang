@@ -56,6 +56,9 @@
 - [ ] B-ID189 防倒退指纹：① gen1/gen0 `--version` 输出代次 + selfhost_sources.txt 内容 SHA256（差分报告可复现）；② run_fixedpoint 把 g2 SHA256 写 `build/fixedpoint.sha`、bootstrap.md 维护最近固定点 SHA；③ pre-commit 增检：diff 触及 src/selfhost/** 或 src/compiler/** 时提交说明须含 `selfhost-verified:` 标记（只机检标记存在，真跑仍按 WC §8 定向执行）；④ `scripts/check_selfhost_docs.py` 机检 selfhost_sources.txt 与 bootstrap.md 文件表的存在性。
 - [ ] B-ID190〔独占大项〕parser 错误恢复：错误后继续 parse，服务 LSP/IDE 体验；单开计划，不与 B-ID187/188 混线。
 - [x] B-ID191 G8 第一轮 IR 发射消减：静态全常量数组折叠——`static T[] f = new T[]{…}`（一维、8 字节整数槽、全字面量元素）在 EmitStaticFieldInits 折叠为 `internal global [N+2 x i64]`（保持 [pad][len][elements] bundle 布局、槽指元素基址、可变 global 支持运行期变异），main 里逐元素 GEP+store 展开退役；GenNew 数组初始化器元素 0 复用基址 GEP（ToArray/StrToBytes 核实为动态索引循环无静态重复）。实测 arithmetic 用例 IR 83990→52883 行、main 31177→63 行，fixedpoint g2.ll 42182181→41102400 字节。新增 conformance/static_const_array.zan（读回/foreach/变异/bool-char-byte-double 混合，双端金标），selfhost_gen1、selfhost_ir_golden（231 金标 BLESS 同提交）、selfhost_diff（全案+reject）、selfhost_fixed_point（g2==g3 逐字节，SHA 6f2ffc3a…）四门全绿。double/string/byte 元素折叠、复合赋值双寻址、~50k 行运行时垫片留下轮。
+- [x] B-ID192 多行字符串换行归一（预存缺陷，差分门首红暴露）：gen1 的 Verbatim/InterpVerbatim 把源文件原始 CRLF 直接收进字符串值——CRLF 源文件上 `@"line 1
+line 2"` 与 `$@"..."` 的字符串内容带 \r\n，WriteLine 后输出 \r\r\n，与 C 宿主（按 C# 规范把多行字符串内换行归一为 \n）逐字节分歧；三引号 Raw() 本已有正确归一先例，Verbatim/InterpVerbatim 缺同款。修复：两处 CR 分支按 Raw() 同款归一。用 verbatim_interpolated_string 双端差分实证（pre-G8 gen1 与 HEAD gen1 输出逐字节相同证实与 B-ID191 无关，系该用例入册后门首次跑红被串行版 tail 截断掩盖）。ir_golden 231 金标重 BLESS，selfhost_diff（231 案 0 缺口 49 拒绝 0 失败）、selfhost_gen1、selfhost_fixed_point（g2==g3）三门全绿。
+- [x] B-ID193 selfhost_diff 门并行化：CMake 脚本模式无作业控制，230 案串行 clang 链接是全门墙钟大头（1039s）。新增 scripts/run_diff_parallel.py 线程池驱动（emit→link→run→归一化 stdout 对比、GAP 报告不失败、reject fail-closed + 双编译器措辞锁定语义逐条保留；syslibs 按平台内置，绕开 cmake→python 的分号实参边界），run_selfhost_diff.cmake 收缩为 gen1 构建 + 委托 + 退出码边界，ctest 注册零改动。全门实测 1039s→415s（-60%），231 案结果与串行版逐字一致。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 
