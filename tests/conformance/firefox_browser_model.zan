@@ -1,0 +1,148 @@
+// Firefox 浏览器组件的离线模型测试：FingerprintProfile 指纹防关联生成与 JSON 序列化、
+// BrowserConfig/GeckoViewConfig 装配模型、PageSnapshot 语义解析、FirefoxBrowserBox 控件模型与缺省运行时防御。
+using System;
+using System.Collections.Generic;
+using Gui;
+using Browser.Firefox;
+
+class Program {
+    static int bad;
+
+    static void Eq(string got, string want, string label) {
+        if (got != want) {
+            Console.WriteLine("FAIL " + label + ": got '" + got + "' want '" + want + "'");
+            bad = bad + 1;
+        }
+    }
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + label);
+            bad = bad + 1;
+        }
+    }
+
+    static void TestFingerprintProfile() {
+        // 1. 纯净默认预设 (CleanDefault)
+        FingerprintProfile clean = FingerprintProfile.CleanDefault();
+        Check(!clean.enabled, "clean default profile is disabled");
+        Check(!clean.canvasNoise, "clean default canvas noise disabled");
+        Check(!clean.audioNoise, "clean default audio noise disabled");
+        Check(clean.seed == 0, "clean default seed is 0");
+
+        // 2. 链式装配与自定义参数
+        FingerprintProfile custom = new FingerprintProfile();
+        custom.WithSeed(12345)
+              .WithHardware(16, 32)
+              .WithScreen(1920, 1080, 1.0)
+              .WithTimezone("Asia/Shanghai", -480)
+              .WithWebGL("NVIDIA Corporation", "GeForce RTX 4090")
+              .WithUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/128.0", "Win32")
+              .WithNoise(true, true);
+
+        Check(custom.enabled, "custom profile enabled");
+        Check(custom.seed == 12345, "custom seed set");
+        Check(custom.hardwareConcurrency == 16, "custom hardware cores");
+        Check(custom.deviceMemory == 32, "custom memory gb");
+        Check(custom.screenWidth == 1920 && custom.screenHeight == 1080, "custom resolution");
+        Check(custom.screenAvailWidth == 1920 && custom.screenAvailHeight == 1040, "custom available screen height deducted");
+        Eq(custom.timezone, "Asia/Shanghai", "custom timezone");
+        Check(custom.timezoneOffset == -480, "custom timezone offset");
+        Eq(custom.webglVendor, "NVIDIA Corporation", "custom webgl vendor");
+
+        // 3. 序列化 ToJson 验证
+        string json = custom.ToJson();
+        Check(json.Contains("\"enabled\":true"), "json contains enabled");
+        Check(json.Contains("\"seed\":12345"), "json contains seed");
+        Check(json.Contains("\"hardwareConcurrency\":16"), "json contains cores");
+        Check(json.Contains("\"timezone\":\"Asia/Shanghai\""), "json contains timezone");
+        Check(json.Contains("\"webglVendor\":\"NVIDIA Corporation\""), "json contains webglVendor");
+
+        // 4. 店铺预设隔离性 (PresetStore)
+        FingerprintProfile storeUS = FingerprintProfile.PresetStore(1001, "US");
+        Check(storeUS.enabled, "store US enabled");
+        Eq(storeUS.language, "en-US", "store US language");
+        Eq(storeUS.timezone, "America/New_York", "store US timezone");
+
+        FingerprintProfile storeJP = FingerprintProfile.PresetStore(1002, "JP");
+        Eq(storeJP.language, "ja-JP", "store JP language");
+        Eq(storeJP.timezone, "Asia/Tokyo", "store JP timezone");
+    }
+
+    static void TestBrowserAndGeckoConfig() {
+        // 1. GeckoViewConfig 默认配置
+        GeckoViewConfig gvc = GeckoViewConfig.CreateDefault();
+        Check(gvc.structSize == 96, "gvc struct size 96");
+        Check(gvc.frameRate == 60, "gvc frame rate 60");
+        Check(gvc.memoryCacheMb == 16, "gvc memory cache 16MB");
+        Check(gvc.antiThrottling, "gvc anti-throttling active");
+        Check(gvc.disableBatteryApi, "gvc battery api disabled");
+
+        // 2. BrowserConfig 装配
+        BrowserConfig bc = BrowserConfig.ForStore(5, "US", "https://sellercentral.amazon.com");
+        Check(bc.userContextId == 5, "bc user context id");
+        Eq(bc.startUrl, "https://sellercentral.amazon.com", "bc start url");
+        Check(bc.persistentStorage, "bc persistent storage");
+        Check(bc.fingerprint != null, "bc fingerprint assigned");
+    }
+
+    static void TestSemanticSnapshotParser() {
+        string mockDomJson = "{\"title\":\"Dashboard Overview\",\"url\":\"https://example.com/dash\",\"elements\":[" +
+            "{\"ref\":\"e1\",\"tag\":\"input\",\"type\":\"text\",\"text\":\"Search items\",\"selector\":\"#search\",\"x\":10,\"y\":20,\"w\":200,\"h\":32}," +
+            "{\"ref\":\"e2\",\"tag\":\"button\",\"type\":\"submit\",\"text\":\"Query\",\"selector\":\"#btn-submit\",\"x\":220,\"y\":20,\"w\":80,\"h\":32}" +
+            "]}";
+
+        PageSnapshot snap = PageSnapshot.FromJson(mockDomJson);
+        Eq(snap.Title, "Dashboard Overview", "snapshot title");
+        Eq(snap.Url, "https://example.com/dash", "snapshot url");
+        Check(snap.Elements.Count == 2, "snapshot parsed 2 elements");
+
+        PageElement e1 = snap.Elements[0];
+        Eq(e1.Ref, "e1", "e1 ref");
+        Eq(e1.Tag, "input", "e1 tag");
+        Eq(e1.Type, "text", "e1 type");
+        Eq(e1.Text, "Search items", "e1 text");
+        Eq(e1.Selector, "#search", "e1 selector");
+        Check(e1.X == 10 && e1.Y == 20 && e1.W == 200 && e1.H == 32, "e1 bounds");
+
+        PageElement e2 = snap.Elements[1];
+        Eq(e2.Ref, "e2", "e2 ref");
+        Eq(e2.Tag, "button", "e2 tag");
+        Eq(e2.Text, "Query", "e2 text");
+    }
+
+    static void TestBrowserBoxControlModel() {
+        BrowserConfig cfg = BrowserConfig.ForStore(7, "DE", "https://amazon.de");
+        FirefoxBrowserBox box = new FirefoxBrowserBox(cfg);
+
+        Eq(box.Kind(), "FirefoxBrowserBox", "box kind");
+        Eq(box.StartUrl(), "https://amazon.de", "box start url");
+        Eq(box.CurrentUrl(), "https://amazon.de", "box current url fallback");
+        Eq(box.CurrentTitle(), "", "box current title default");
+        Check(box.contextId == 7, "box context id matches");
+
+        box.SetStartUrl("https://example.org");
+        Eq(box.StartUrl(), "https://example.org", "box update start url");
+
+        // 缺省运行时环境下的安全防御检查 (不崩溃、不报空指针)
+        Check(box.GetAgent() == null, "no native runtime: agent is null");
+        box.Navigate("https://fallback.org");
+        box.Hide();
+        box.Destroy();
+        Check(box.GetAgent() == null, "destroyed: agent remains null");
+    }
+
+    static int Main() {
+        TestFingerprintProfile();
+        TestBrowserAndGeckoConfig();
+        TestSemanticSnapshotParser();
+        TestBrowserBoxControlModel();
+
+        if (bad == 0) {
+            Console.WriteLine("FIREFOX_BROWSER_MODEL_OK");
+            return 0;
+        }
+        Console.WriteLine("FAILURES: " + bad.ToString());
+        return 1;
+    }
+}

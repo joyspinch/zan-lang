@@ -109,8 +109,8 @@ if (Test-Path packages\Zan.Linq) {
 if (Test-Path packages\Zan.Scripting) {
     $files += (Get-ChildItem packages\Zan.Scripting\src -Recurse -Include *.zan).FullName
 }
-if (Test-Path packages\Zan.Knowledge) {
-    $files += (Get-ChildItem packages\Zan.Knowledge\src -Recurse -Include *.zan).FullName
+if (Test-Path packages\Zan.Ai\src\Ai\Knowledge) {
+    $files += (Get-ChildItem packages\Zan.Ai\src\Ai\Knowledge\src -Recurse -Include *.zan).FullName
 }
 if (Test-Path packages\Zan.Globalization) {
     $files += (Get-ChildItem packages\Zan.Globalization\src -Recurse -Include *.zan).FullName

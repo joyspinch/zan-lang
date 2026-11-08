@@ -55,7 +55,7 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   / `ToolEvent`（工具调用的实体：声明、调用、结果、回合、事件）
 - `Ai` — `McpToolBinding` / `McpTools`（把**远端 MCP 工具**接进
   本地工具注册表：远端 schema → 本地声明，本地调用 → 远端 `tools/call`。
-  MCP 协议本身在 `Zan.Mcp` 包里）
+  MCP 协议客户端内置于本包 `Ai.Mcp` 命名空间中）
 - `Ai` — `VectorStoreWriter`（内存档的写入适配器，把
   `VectorStore` 包成 `IIndexWriter` 契约）
 - `Ai` — 实体（`src/Ai/Models/`）：`AiConfig` /
@@ -361,7 +361,7 @@ List<AiMessage> history = await agent.Run(questions);
 ## MCP：把远端工具接进工具循环
 
 MCP（Model Context Protocol）是"让程序去用**别的程序**的工具"的一套
-约定。协议本身在 `Zan.Mcp` 包（`Ai.Mcp`），本包提供**接进工具循环
+约定。协议本身由本包的 `Ai.Mcp` 命名空间提供，本包提供**接进工具循环
 的那一段翻译**：
 
 ```zan
@@ -593,7 +593,7 @@ AiStreamResult r = await client.StreamWithTools(messages, tools, 0.0, OnEvent);
   `tool_calls` 响应）与 **Anthropic Messages API**（`tool_use`/`tool_result`
   块）；不做各厂商的私有函数调用协议（Gemini 的 `functionDeclarations` 等）。
   远端 MCP 工具可以接进来（`McpTools.RegisterAll`），但 MCP 自己的协议
-  在 `Zan.Mcp` 包里。
+  已内置于本包 `Ai.Mcp` 命名空间。
 - **Anthropic 侧也有流式**（`AnthropicClient.StreamWithTools`）：Anthropic 的
   SSE 事件（`content_block_start` / `content_block_delta` / `message_delta`）
   与 OpenAI 兼容那套帧格式不同，翻译在 `AiStream.AnthropicEvents` 里，
