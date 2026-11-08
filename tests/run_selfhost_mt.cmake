@@ -53,7 +53,7 @@ endif()
 list(GET SELFHOST_SOURCES 0 _first)
 list(REMOVE_AT SELFHOST_SOURCES 0)
 execute_process(
-  COMMAND ${ZANC} ${_first} ${SELFHOST_SOURCES} --auto-stdlib -o ${GEN1}
+  COMMAND ${ZANC} ${_first} ${SELFHOST_SOURCES} --auto-stdlib -O0 -o ${GEN1}
   RESULT_VARIABLE build_rc
   OUTPUT_VARIABLE build_out
   ERROR_VARIABLE build_err)

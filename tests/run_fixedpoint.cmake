@@ -68,7 +68,7 @@ list(GET _srcs 0 _first)
 set(_rest ${_srcs})
 list(REMOVE_AT _rest 0)
 execute_process(
-  COMMAND ${ZANC} ${_first} ${_rest} --auto-stdlib -o ${GEN1}
+  COMMAND ${ZANC} ${_first} ${_rest} --auto-stdlib -O0 -o ${GEN1}
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "gen0 -> gen1 failed (rc=${rc})\n${out}${err}")
