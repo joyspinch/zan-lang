@@ -353,12 +353,88 @@ partial class Irgen {
     // local, then a field of the enclosing class, and only then a type. A
     // field named like a type shadows that type -- `Collapse.Add(...)` with
     // a `Collapse` field is a call on the field, not on the class.
-    bool ShadowsTypeName(string name) {
+    //
+    bool TypeHasInstanceMember(Node ty, string member) {
+        if (ty == null || member == "") { return false; }
+        if (ty.ival >= 1) {
+            return member == "Length";
+        }
+        if (IsListType(ty)) {
+            return member == "Count" || member == "Add" || member == "Clear"
+                || member == "RemoveAt" || member == "Contains" || member == "IndexOf"
+                || member == "Insert" || member == "Remove" || member == "ToArray"
+                || member == "Reverse" || member == "Sort";
+        }
+        if (IsDictType(ty)) {
+            return member == "Count" || member == "Add" || member == "ContainsKey"
+                || member == "Remove" || member == "Clear" || member == "Keys"
+                || member == "Values";
+        }
+        if (ty.sval == "string") {
+            return member == "Length" || member == "Substring" || member == "IndexOf"
+                || member == "Contains" || member == "StartsWith" || member == "EndsWith"
+                || member == "ToLower" || member == "ToUpper" || member == "Trim"
+                || member == "Split" || member == "Replace" || member == "ToCharArray";
+        }
+        if (IsSbType(ty)) {
+            return member == "Length" || member == "Capacity" || member == "Append"
+                || member == "AppendLine" || member == "ToString" || member == "Clear";
+        }
+        Node fcls = ClassOf(ty);
+        if (fcls != null) {
+            if (FieldIndex(fcls, member) >= 0) { return true; }
+            Node ig = FindMethodUp(fcls, "get_" + member);
+            if (ig != null && !HasMod(ig, MOD.Static())) { return true; }
+            Node iset = FindMethodUp(fcls, "set_" + member);
+            if (iset != null && !HasMod(iset, MOD.Static())) { return true; }
+            Node im = FindMethodUp(fcls, member);
+            if (im != null && !HasMod(im, MOD.Static())) { return true; }
+        }
+        return false;
+    }
+
+    // C# spec §12.8.5.2 ("Color Color" rule): when an identifier matches both a
+    // field/property and a type name (e.g. `public Address Address;`), access to
+    // a member `name.member` resolves to the static member of the type if the
+    // field's type does not declare an instance member of that name, or if we are
+    // inside a static method where instance fields cannot be accessed.
+    bool ShadowsTypeName(string name, string member) {
         if (curClass == "") { return false; }
         Node cls = binder.FindType(curClass);
         if (cls == null) { return false; }
-        if (FieldIndex(cls, name) >= 0) { return true; }
-        return FindStaticField(cls, name) != null;
+        if (!curHasThis) {
+            // In static context, instance fields are completely inaccessible.
+            Node sf = FindStaticField(cls, name);
+            if (sf == null) { return false; }
+            if (member == "") { return true; }
+            return TypeHasInstanceMember(sf.type, member);
+        }
+        Node fty = FieldType(cls, name);
+        if (fty == null) {
+            Node sf = FindStaticField(cls, name);
+            if (sf != null) { fty = sf.type; }
+        }
+        if (fty == null) { return false; }
+        if (member == "") { return true; }
+        if (TypeHasInstanceMember(fty, member)) { return true; }
+        if ((name == "Vector128" || name == "Vector256") && (member == "Zero" || member == "AllBitsSet")) {
+            return false;
+        }
+        Node tc = binder.FindType(name);
+        if (tc != null) {
+            if (FindStaticField(tc, member) != null) { return false; }
+            Node sm = FindMethodUp(tc, member);
+            if (sm != null && HasMod(sm, MOD.Static())) { return false; }
+            Node sg = FindMethodUp(tc, "get_" + member);
+            if (sg != null && HasMod(sg, MOD.Static())) { return false; }
+            Node ss = FindMethodUp(tc, "set_" + member);
+            if (ss != null && HasMod(ss, MOD.Static())) { return false; }
+            if (tc.kind == AK.EnumDecl()) { return false; }
+        }
+        return true;
+    }
+    bool ShadowsTypeName(string name) {
+        return ShadowsTypeName(name, "");
     }
 
     // The built-in scalar type constants (int.MaxValue, uint.MinValue,
@@ -630,7 +706,7 @@ partial class Irgen {
     }
 
     ExprVal GenMember(Node e) {
-        if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && !ShadowsTypeName(e.a.sval)) {
+        if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && !ShadowsTypeName(e.a.sval, e.sval)) {
             // Console.ForegroundColor / Console.BackgroundColor: the current
             // color, kept in a module-level slot by the C host.
             if (e.a.sval == "Console" && binder.FindType("Console") == null) {
