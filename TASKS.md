@@ -55,6 +55,7 @@
 - [ ] B-ID188 reject 金标：reject_cases.txt 每用例配 `.stderr` 金标（先只锁 `code: 摘要` 两字段，容忍位置差异），run_selfhost_diff reject 分支从"rc≠0 即过"升级为"rc≠0 且 stderr 匹配金标"；前置 B-ID187（金标依赖 code 字段）。
 - [ ] B-ID189 防倒退指纹：① gen1/gen0 `--version` 输出代次 + selfhost_sources.txt 内容 SHA256（差分报告可复现）；② run_fixedpoint 把 g2 SHA256 写 `build/fixedpoint.sha`、bootstrap.md 维护最近固定点 SHA；③ pre-commit 增检：diff 触及 src/selfhost/** 或 src/compiler/** 时提交说明须含 `selfhost-verified:` 标记（只机检标记存在，真跑仍按 WC §8 定向执行）；④ `scripts/check_selfhost_docs.py` 机检 selfhost_sources.txt 与 bootstrap.md 文件表的存在性。
 - [ ] B-ID190〔独占大项〕parser 错误恢复：错误后继续 parse，服务 LSP/IDE 体验；单开计划，不与 B-ID187/188 混线。
+- [x] B-ID191 G8 第一轮 IR 发射消减：静态全常量数组折叠——`static T[] f = new T[]{…}`（一维、8 字节整数槽、全字面量元素）在 EmitStaticFieldInits 折叠为 `internal global [N+2 x i64]`（保持 [pad][len][elements] bundle 布局、槽指元素基址、可变 global 支持运行期变异），main 里逐元素 GEP+store 展开退役；GenNew 数组初始化器元素 0 复用基址 GEP（ToArray/StrToBytes 核实为动态索引循环无静态重复）。实测 arithmetic 用例 IR 83990→52883 行、main 31177→63 行，fixedpoint g2.ll 42182181→41102400 字节。新增 conformance/static_const_array.zan（读回/foreach/变异/bool-char-byte-double 混合，双端金标），selfhost_gen1、selfhost_ir_golden（231 金标 BLESS 同提交）、selfhost_diff（全案+reject）、selfhost_fixed_point（g2==g3 逐字节，SHA 6f2ffc3a…）四门全绿。double/string/byte 元素折叠、复合赋值双寻址、~50k 行运行时垫片留下轮。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 

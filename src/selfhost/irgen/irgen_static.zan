@@ -370,6 +370,7 @@ partial class Irgen {
         while (j < d.kids.Count) {
             Node m = d.kids[j];
             if (m.kind == AK.FieldDecl() && IsStatic(m) && m.b != null) {
+                if (FoldStaticArrayInit(d, m, args)) { j = j + 1; continue; }
                 ExprVal iv = GenExpr(m.b);
                 Node fty = m.type;
                 string savedScope = typeScopeCls;
@@ -411,6 +412,65 @@ partial class Irgen {
             j = j + 1;
         }
         curInstArgs = sargs; curInstCls = scls;
+    }
+
+    // A static field whose initializer is `new T[] { ... }` with an
+    // all-constant element list folds into one internal global. The
+    // per-element GEP+store expansion of a 1400-entry stdlib table turned
+    // main into tens of thousands of lines (G8 round 1) -- the same bytes
+    // as a global initializer cost none. The global keeps the runtime
+    // bundle layout ([i64 pad][i64 len][elements...], the field slot
+    // pointing at the element base, GEP index 2) so reads, writes and
+    // runtime type tests see the same shape; it is `global` and not
+    // `constant` because the array is mutable at runtime. Only 8-byte
+    // integer-ish slots fold: a double element needs its IEEE bits, a
+    // byte[] is byte-packed, string/class/nullable elements are pointers
+    // or boxed slots -- all stay on the GenNew expansion path.
+    bool FoldStaticArrayInit(Node d, Node m, List<Node> args) {
+        Node b = m.b;
+        if (b == null || b.kind != AK.NewExpr() || b.ival != 1 || b.b != null) { return false; }
+        string rkl = b.arrRanks;
+        if (rkl == null) { rkl = ""; }
+        if (Node.ArrRankCount(rkl) != 1) { return false; }
+        Node ty = m.type;
+        if (ty == null) { return false; }
+        // the same type-node derivation GenNew uses, so the element
+        // nullable flag and the rank travel identically
+        Node at = MkType(ty.sval); at.ival = 1; at.op = ty.op; at.kids = ty.kids; at.arrRanks = rkl;
+        Node et = ArrElemOf(at);
+        if (et == null || IsNullableValue(et) || IsStructTy(et) || IsFloatTy(et)) { return false; }
+        if (et.sval == "byte" || et.sval == "sbyte") { return false; }
+        if (MapType(et) != "i64") { return false; }
+        int n = b.kids.Count;
+        string vals = "";
+        int i = 0;
+        while (i < n) {
+            Node el = b.kids[i];
+            if (!IsConstSlotElem(el)) { return false; }
+            if (i > 0) { vals = vals + ", "; }
+            vals = vals + "i64 " + ConstSlotElemText(el);
+            i = i + 1;
+        }
+        starrn = starrn + 1;
+        string g = "@.starr" + starrn;
+        H(g + " = internal global [" + (n + 2) + " x i64] [i64 0, i64 " + n + (n > 0 ? ", " + vals : "") + "]");
+        string p = NT();
+        L("  " + p + " = getelementptr inbounds [" + (n + 2) + " x i64], [" + (n + 2) + " x i64]* " + g + ", i64 0, i64 2");
+        L("  store i64* " + p + ", i64** " + StaticGlobal(d.sval, m.sval, args));
+        return true;
+    }
+
+    bool IsConstSlotElem(Node e) {
+        if (e == null) { return false; }
+        int k = e.kind;
+        if (k == AK.BoolLit() || k == AK.CharLit()) { return true; }
+        return IsConstInt(e);
+    }
+
+    string ConstSlotElemText(Node e) {
+        int k = e.kind;
+        if (k == AK.BoolLit() || k == AK.CharLit()) { return "" + e.ival; }
+        return "" + EvalConstInt(e);
     }
 
 }

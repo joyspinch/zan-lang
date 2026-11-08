@@ -16,7 +16,9 @@ point (two successive self-compiles produce byte-identical output).
 > **✅ 固定点已恢复（2026-10-20）。** 此前长期红的 `selfhost_fixed_point` 门
 > （2026-08-08 记为 `TASKS.md` B6-SH1：`ref`/`out` 形参解析缺口 + `Stopwatch.Start`
 > 缺口）已修复合拢：gen1 → g2.ll → gen2 → g3.ll 全链打通，**g2.ll 与 g3.ll
-> 逐字节相同**（15,815,207 字节，SHA256 相同）。恢复过程中修掉的是自举后端的
+> 逐字节相同**（2026-11-08 复核：41,102,400 字节，SHA256
+> `6f2ffc3a…`，见 `build/fixedpoint.sha`；G8 第一轮静态常量数组折叠后）。
+> 恢复过程中修掉的是自举后端的
 > 一整类缺陷（ARC 临时值支配违规、手工发标签导致 phi 前驱错、delegate 调用
 > 签名错、写文件用文本模式导致 CRLF 差异、内联协程调度器与运行时重名），
 > 详见 `.agents/skills/zan-compiler-internals/references/selfhost-closure.md`。
@@ -24,8 +26,8 @@ point (two successive self-compiles produce byte-identical output).
 **The self-compilation fixed point holds when `g2.ll` and `g3.ll` are
 byte-identical.** At that point the compiler is a fixed point of itself: gen1
 and gen2 implement the same translation, so feeding the compiler through itself
-no longer changes the output. Current verification: both are 15,815,207 bytes
-(~15.1 MB) with identical SHA256 — the size tracks the current sources, so
+no longer changes the output. Current verification: both are 41,102,400 bytes
+(~39.2 MB) with identical SHA256 — the size tracks the current sources, so
 re-run the closure to confirm the two generations still match.
 
 Note that gen1 (produced by the C host) and gen2 (produced by the self-hosted
@@ -154,7 +156,7 @@ Where clang is available, the `selfhost_fixed_point` ctest additionally runs the
 **full closure** (`gen0 -> gen1 -> g2.ll -> clang -> gen2 -> g3.ll`) and asserts
 `g2.ll == g3.ll` byte-for-byte — the fixed-point gate. It is skipped
 automatically when clang is absent (`tests/run_fixedpoint.cmake`).
-**Green on HEAD** (verified 2026-10-20: `g2.ll == g3.ll`, 15,815,207 bytes).
+**Green on HEAD** (verified 2026-11-08: `g2.ll == g3.ll`, 41,102,400 bytes).
 
 ### The fixed point is not the whole story
 
@@ -306,7 +308,7 @@ as a bullet, tracking refs in `TASKS.md` where noted):
 | G5 | String interpolation coverage | bullet 4 | — |
 | G6 | EH: single catch clause per try, no type dispatch / rethrow-to-outer; ARC edge cases (throw escaping catch, async unwind) | bullet 4 | — |
 | G7 | Diagnostics: limited positions, no recovery, no `code` field | bullet 5 | — |
-| G8 | No optimization (naive IR; bare on the `ngen` path) | bullet 6 | — |
+| G8 | No optimization (naive IR; `ngen` path bare; round 1 done: all-constant static arrays fold into internal globals, `GenNew` element-0 GEP reuse) | bullet 6 | — |
 | G9 | Nested erased generic slot read-back (`List<List<int>>`) | Generics section | — |
 | G10 | C-host passes without selfhost counterpart (entity-mapper / ORM / attr synthesis) | file-table note | — |
 
@@ -358,7 +360,24 @@ as a bullet, tracking refs in `TASKS.md` where noted):
   handler, the selfhost releases the exception through the catch-variable
   local on normal handler exit.
 - **Diagnostics** are basic (limited positions, no recovery).
-- **No optimization**: the emitted IR is naive.
+- **No optimization**: the emitted IR is naive, but round 1 of the G8
+  reduction landed (2026-11-08): a static field whose initializer is a
+  rank-1 `new T[] { ... }` with an all-constant 8-byte integer-ish element
+  list folds into one `internal global [N+2 x i64]` (the runtime bundle
+  layout, `[pad][len][elements...]`, field slot pointing at the element
+  base; `global`, not `constant`, because the array is mutable). The
+  `UnicodeCase` tables alone were tens of thousands of per-element GEP+
+  store pairs inside `main` — the `arithmetic` differential case went from
+  83,990 IR lines to 52,883, and its `main` from 31,177 lines to 63.
+  Element 0 of a `GenNew` array initializer reuses the array-base GEP
+  instead of emitting a second identical one (`ToArray`/`StrToBytes` were
+  checked and are dynamic-index loops — no static duplicate). A new
+  conformance case `static_const_array` pins the folded globals (read
+  back, foreach, runtime mutation, bool/char/byte/double mixes). Still
+  open on this path: double/string/byte element folding (double needs its
+  IEEE bits at compile time, byte[] is byte-packed), compound-assignment
+  double addressing (`a[i] += v` re-computes the address), and the ~50k
+  lines of runtime shim the backend inlines into every program.
 
 ### Generics, numeric and equality semantics
 
