@@ -210,10 +210,14 @@ partial class Irgen {
         List<string> tns = new List<string>();
         List<Node> trs = new List<Node>();
         UnifyTP(ParamTypeNode(m, 0), recv.ty, mtps, tns, trs);
+        if (mtps.Count > 0) {
+            if (!BindTypeArgs(m, e, mtps, tns, trs)) {
+                BindFromArgs(m, e, 1, mtps, tns, trs);
+            }
+        }
         string sym = MethodSym(owner, m);
         bool spec = false;
         if (mtps.Count > 0 && CanSpecialize(m)) {
-            BindFromArgs(m, e, 1, mtps, tns, trs);
             string tag = SpecTag(m, mtps, tns, trs);
             if (tag != "") { sym = SpecQueue(owner, m, tns, trs, tag); spec = true; }
         }
@@ -289,21 +293,24 @@ partial class Irgen {
         List<Node> ctypes = new List<Node>();
         if (m != null && CanSpecialize(m)) {
             List<string> mtps = TParams(m);
-            List<string> ctps = TParams(cls);
+            Node declCls = binder.FindType(owner);
+            if (declCls == null) { declCls = cls; }
+            List<string> ctps = TParams(declCls);
             bool clsSpec = false;
-            // only a method declared by the generic class ITSELF: an
-            // inherited one lives in a base class that has no type
-            // parameters, and a virtual one is dispatched through the
-            // vtable (which points at the unspecialized definition)
-            if (ctps.Count > 0 && owner == clsName && recv.ty != null
-                && recv.ty.kids.Count == ctps.Count) {
-                int ci = 0;
-                while (ci < ctps.Count) {
-                    stns.Add(ctps[ci]); strs.Add(recv.ty.kids[ci]);
-                    ctypes.Add(recv.ty.kids[ci]);
-                    ci = ci + 1;
+            // a method declared by the generic class itself or an inherited generic base:
+            // bound type arguments are resolved along the inheritance chain
+            if (ctps.Count > 0 && recv.ty != null) {
+                Node rcls = binder.FindType(recv.ty.sval);
+                List<Node> bargs = TypeArgsForAncestor(rcls, owner, recv.ty.kids);
+                if (bargs != null && bargs.Count == ctps.Count) {
+                    int ci = 0;
+                    while (ci < ctps.Count) {
+                        stns.Add(ctps[ci]); strs.Add(bargs[ci]);
+                        ctypes.Add(bargs[ci]);
+                        ci = ci + 1;
+                    }
+                    clsSpec = true;
                 }
-                clsSpec = true;
             }
             if (mtps.Count > 0) {
                 if (!BindTypeArgs(m, e, mtps, stns, strs)) {
@@ -313,7 +320,8 @@ partial class Irgen {
             if (clsSpec || mtps.Count > 0) {
                 string tag = SpecTagC(m, ctypes, mtps, stns, strs, clsSpec ? "I" : "");
                 if (tag != "") {
-                    sym = SpecQueueTy(owner, m, stns, strs, tag, clsSpec ? recv.ty : null);
+                    Node instThisTy = clsSpec ? InstType(owner, ctypes) : recv.ty;
+                    sym = SpecQueueTy(owner, m, stns, strs, tag, instThisTy);
                     spec = true;
                 }
             }
@@ -660,9 +668,20 @@ partial class Irgen {
         if (!MentionsTypeParam(retTy)) { return retTy; }
         Node rcls = binder.FindType(recvTy.sval);
         if (rcls == null) { return retTy; }
-        List<string> tps = TParams(rcls);
-        if (tps.Count == 0 || recvTy.kids.Count != tps.Count) { return retTy; }
-        return SubstTP(retTy, tps, recvTy.kids);
+        string owner = DeclOwnerOf(rcls, m);
+        if (owner == "") { owner = recvTy.sval; }
+        Node declCls = binder.FindType(owner);
+        if (declCls == null) { declCls = rcls; }
+        List<string> tps = TParams(declCls);
+        List<Node> bargs = TypeArgsForAncestor(rcls, owner, recvTy.kids);
+        if (bargs != null && bargs.Count == tps.Count) {
+            return SubstTP(retTy, tps, bargs);
+        }
+        List<string> rtps = TParams(rcls);
+        if (rtps.Count > 0 && recvTy.kids.Count == rtps.Count) {
+            return SubstTP(retTy, rtps, recvTy.kids);
+        }
+        return retTy;
     }
 
 }

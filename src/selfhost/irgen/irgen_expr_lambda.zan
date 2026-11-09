@@ -786,6 +786,115 @@ partial class Irgen {
         return new ExprVal(t, retTy);
     }
 
+    // Delegate equality: mirrors C host emit_delegate_equals (arc_ops.c).
+    // Compares bare pointers first; if unequal and both are tagged closures,
+    // compares target function pointer and bound receiver.
+    string EmitDelegateEquals(ExprVal a, ExprVal b) {
+        string ao = a.op; string bo = b.op;
+        string alt = MapType(a.ty); string blt = MapType(b.ty);
+        if (alt != "i8*") {
+            string ta = NT();
+            L("  " + ta + " = bitcast " + alt + " " + ao + " to i8*");
+            ao = ta;
+        }
+        if (blt != "i8*") {
+            string tb = NT();
+            L("  " + tb + " = bitcast " + blt + " " + bo + " to i8*");
+            bo = tb;
+        }
+        string ai = NT();
+        L("  " + ai + " = ptrtoint i8* " + ao + " to i64");
+        string bi = NT();
+        L("  " + bi + " = ptrtoint i8* " + bo + " to i64");
+        string same = NT();
+        L("  " + same + " = icmp eq i64 " + ai + ", " + bi);
+        string bita = NT();
+        L("  " + bita + " = and i64 " + ai + ", 1");
+        string bitb = NT();
+        L("  " + bitb + " = and i64 " + bi + ", 1");
+        string taga = NT();
+        L("  " + taga + " = icmp ne i64 " + bita + ", 0");
+        string tagb = NT();
+        L("  " + tagb + " = icmp ne i64 " + bitb + ", 0");
+        string both = NT();
+        L("  " + both + " = and i1 " + taga + ", " + tagb);
+        string nsame = NT();
+        L("  " + nsame + " = xor i1 " + same + ", 1");
+        string go = NT();
+        L("  " + go + " = and i1 " + both + ", " + nsame);
+
+        int lcmp = NL(); int lrcv = NL(); int lenv = NL(); int lend = NL();
+        string bpre = curLbl;
+        L("  br i1 " + go + ", label %L" + lcmp + ", label %L" + lend);
+
+        Label(lcmp);
+        string cra = NT();
+        L("  " + cra + " = and i64 " + ai + ", -2");
+        string crb = NT();
+        L("  " + crb + " = and i64 " + bi + ", -2");
+        string ra = NT();
+        L("  " + ra + " = inttoptr i64 " + cra + " to i8**");
+        string rb = NT();
+        L("  " + rb + " = inttoptr i64 " + crb + " to i8**");
+        string fa = NT();
+        L("  " + fa + " = load i8*, i8** " + ra);
+        string fb = NT();
+        L("  " + fb + " = load i8*, i8** " + rb);
+        string fai = NT();
+        L("  " + fai + " = ptrtoint i8* " + fa + " to i64");
+        string fbi = NT();
+        L("  " + fbi + " = ptrtoint i8* " + fb + " to i64");
+        string feq = NT();
+        L("  " + feq + " = icmp eq i64 " + fai + ", " + fbi);
+
+        string eap = NT();
+        L("  " + eap + " = getelementptr i8*, i8** " + ra + ", i64 1");
+        string ebp = NT();
+        L("  " + ebp + " = getelementptr i8*, i8** " + rb + ", i64 1");
+        string ea = NT();
+        L("  " + ea + " = load i8*, i8** " + eap);
+        string eb = NT();
+        L("  " + eb + " = load i8*, i8** " + ebp);
+        string eai = NT();
+        L("  " + eai + " = ptrtoint i8* " + ea + " to i64");
+        string ebi = NT();
+        L("  " + ebi + " = ptrtoint i8* " + eb + " to i64");
+        string esame = NT();
+        L("  " + esame + " = icmp eq i64 " + eai + ", " + ebi);
+        string eann = NT();
+        L("  " + eann + " = icmp ne i64 " + eai + ", 0");
+        string ebnn = NT();
+        L("  " + ebnn + " = icmp ne i64 " + ebi + ", 0");
+        string bothnn = NT();
+        L("  " + bothnn + " = and i1 " + eann + ", " + ebnn);
+        L("  br i1 " + bothnn + ", label %L" + lrcv + ", label %L" + lenv);
+
+        Label(lrcv);
+        string eapi = NT();
+        L("  " + eapi + " = bitcast i8* " + ea + " to i64*");
+        string ebpi = NT();
+        L("  " + ebpi + " = bitcast i8* " + eb + " to i64*");
+        string rcva = NT();
+        L("  " + rcva + " = load i64, i64* " + eapi);
+        string rcvb = NT();
+        L("  " + rcvb + " = load i64, i64* " + ebpi);
+        string rcveq = NT();
+        L("  " + rcveq + " = icmp eq i64 " + rcva + ", " + rcvb);
+        L("  br label %L" + lenv);
+
+        Label(lenv);
+        string enveq = NT();
+        L("  " + enveq + " = phi i1 [ " + esame + ", %L" + lcmp + " ], [ " + rcveq + ", %L" + lrcv + " ]");
+        string deq = NT();
+        L("  " + deq + " = and i1 " + feq + ", " + enveq);
+        L("  br label %L" + lend);
+
+        Label(lend);
+        string r = NT();
+        L("  " + r + " = phi i1 [ " + same + ", %" + bpre + " ], [ " + deq + ", %L" + lenv + " ]");
+        return r;
+    }
+
     // Can this name be resolved as a value in the current context? Mirrors
     // GenIdent's lookup order (local, this-field, this-property, static
     // field, static method group). The call path uses it to tell an
