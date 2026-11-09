@@ -54,7 +54,7 @@ may be absent; it is **not** the reference semantics.
 
 ## Architecture
 
-`src/selfhost/` (117 files structured into `driver/`, `frontend/`, `irgen/`, `ngen/`, `tools/`)
+`src/selfhost/` (structured into `driver/`, `frontend/`, `irgen/`, `tools/`)
 mirrors the module structure of the C host in `src/compiler/`:
 
 | File          | Role                                                       |
@@ -72,8 +72,7 @@ mirrors the module structure of the C host in `src/compiler/`:
 | `irgen_async.zan` | Irgen part: async/await CPS lowering, ANF normalization, Task & sched runtime |
 | `irgen_method.zan` | Irgen part: method/constructor codegen, static ctor, main wrapper |
 | `lsp.zan`     | Language-server surface used by the driver                    |
-| `nio.zan`     | Binary file output helper                                     |
-| `ngen.zan`    | Cross-platform machine-code generator (x86/ARM, Mach-O/ELF/COFF/Wasm) |
+| `nio.zan`     | Process / system invocation helper                            |
 | `main.zan`    | Driver: read files, run the pipeline, write `.ll`          |
 
 C-host passes with **no self-hosted counterpart** (code compiled by gen1 cannot
@@ -308,7 +307,7 @@ as a bullet, tracking refs in `TASKS.md` where noted):
 | G5 | String interpolation coverage | bullet 4 | — |
 | G6 | EH: single catch clause per try, no type dispatch / rethrow-to-outer; ARC edge cases (throw escaping catch, async unwind) | bullet 4 | — |
 | G7 | Diagnostics: limited positions, no recovery, no `code` field | bullet 5 | — |
-| G8 | No optimization (naive IR; `ngen` path bare; round 1 done: all-constant static arrays fold into internal globals, `GenNew` element-0 GEP reuse) | bullet 6 | — |
+| G8 | No optimization (naive IR; round 1 done: all-constant static arrays fold into internal globals, `GenNew` element-0 GEP reuse) | bullet 6 | — |
 | G9 | Nested erased generic slot read-back (`List<List<int>>`) | Generics section | — |
 | G10 | C-host passes without selfhost counterpart (entity-mapper / ORM / attr synthesis) | file-table note | — |
 
