@@ -1,0 +1,146 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Net.Http.Client;
+using System.Net.Mqtt;
+using System.Threading;
+
+namespace Zan.Web;
+
+// Webhook 转发投递审计日志条目。
+public class MqttWebhookLog {
+    public int timestamp;
+    public string topic;
+    public string clientId;
+    public int qos;
+    public bool success;
+    public string detail;
+
+    public MqttWebhookLog(int timestamp, string topic, string clientId, int qos, bool success, string detail) {
+        this.timestamp = timestamp;
+        this.topic = topic;
+        this.clientId = clientId;
+        this.qos = qos;
+        this.success = success;
+        this.detail = detail;
+    }
+}
+
+// MQTT 规则与外部 Webhook 异步派发服务（EMQX 风格数据集成）。
+public class MqttWebhook {
+    public static int totalForwarded = 0;
+    public static int successCount = 0;
+    public static int failCount = 0;
+    public static string lastStatus = "idle";
+    public static List<MqttWebhookLog> recentLogs = new List<MqttWebhookLog>();
+
+    // 安装拦截器至指定的 MqttBroker。
+    public static void Install(MqttBroker broker) {
+        if (broker == null) { return; }
+        broker.SetMessageHook(MqttWebhook.OnMessage);
+    }
+
+    // Broker 消息到达回调入口。
+    public static void OnMessage(string clientId, string topic, string payload, int qos, bool retain) {
+        if (!MqttCfg.webhookEnabled) { return; }
+        if (MqttCfg.webhookUrl.Length == 0) { return; }
+        if (!MqttBroker.TopicMatches(MqttCfg.webhookRuleTopic, topic)) { return; }
+
+        // 非阻塞异步派发，绝不卡顿 MQTT 核心事件驱动线程
+        Task.Spawn(MqttWebhook.DispatchAsync(clientId, topic, payload, qos, retain));
+    }
+
+    private static async void DispatchAsync(string clientId, string topic, string payload, int qos, bool retain) {
+        MqttWebhook.totalForwarded = MqttWebhook.totalForwarded + 1;
+        int now = MqttBroker.Now();
+
+        // 构造 JSON 事件载荷
+        JsonValue ev = JsonValue.NewObject();
+        ev.Put("event", JsonValue.NewStr("message_publish"));
+        ev.Put("client_id", JsonValue.NewStr(clientId));
+        ev.Put("topic", JsonValue.NewStr(topic));
+        ev.Put("payload", JsonValue.NewStr(payload));
+        ev.Put("qos", JsonValue.NewInt((long)qos));
+        ev.Put("retain", JsonValue.NewBool(retain));
+        ev.Put("timestamp", JsonValue.NewInt((long)now));
+        string jsonBody = ev.ToJson();
+
+        // 解析 URL（支持 http://host:port/path 格式）
+        string rawUrl = MqttCfg.webhookUrl;
+        string host = "127.0.0.1";
+        int port = 80;
+        string path = "/";
+
+        if (rawUrl.StartsWith("http://")) {
+            rawUrl = rawUrl.Substring(7);
+        } else if (rawUrl.StartsWith("https://")) {
+            rawUrl = rawUrl.Substring(8);
+            port = 443;
+        }
+
+        int slash = rawUrl.IndexOf("/");
+        string hostPart = slash >= 0 ? rawUrl.Substring(0, slash) : rawUrl;
+        if (slash >= 0) {
+            path = rawUrl.Substring(slash);
+        }
+
+        int colon = hostPart.IndexOf(":");
+        if (colon >= 0) {
+            host = hostPart.Substring(0, colon);
+            port = Convert.ToInt32(hostPart.Substring(colon + 1));
+        } else {
+            host = hostPart;
+        }
+
+        try {
+            HttpClient client = new HttpClient(host, port);
+            client.SetTimeout(3);
+            if (MqttCfg.webhookSecret.Length > 0) {
+                client.SetHeader("X-IoT-Secret", MqttCfg.webhookSecret);
+            }
+            string resp = await client.PostJsonAsync(path, jsonBody);
+            MqttWebhook.successCount = MqttWebhook.successCount + 1;
+            MqttWebhook.lastStatus = "200 OK (" + Convert.ToString(now) + ")";
+            MqttWebhook.RecordLog(now, topic, clientId, qos, true, "delivered");
+        } catch (Exception ex) {
+            MqttWebhook.failCount = MqttWebhook.failCount + 1;
+            string err = ex.Message;
+            MqttWebhook.lastStatus = "ERR: " + err;
+            MqttWebhook.RecordLog(now, topic, clientId, qos, false, err);
+        }
+    }
+
+    private static void RecordLog(int timestamp, string topic, string clientId, int qos, bool success, string detail) {
+        if (MqttWebhook.recentLogs.Count >= 20) {
+            MqttWebhook.recentLogs.RemoveAt(0);
+        }
+        MqttWebhook.recentLogs.Add(new MqttWebhookLog(timestamp, topic, clientId, qos, success, detail));
+    }
+
+    // 导出 Webhook 运行期统计与审计日志 JSON。
+    public static string StatsJson() {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("enabled", JsonValue.NewBool(MqttCfg.webhookEnabled));
+        o.Put("url", JsonValue.NewStr(MqttCfg.webhookUrl));
+        o.Put("rule_topic", JsonValue.NewStr(MqttCfg.webhookRuleTopic));
+        o.Put("total_forwarded", JsonValue.NewInt((long)MqttWebhook.totalForwarded));
+        o.Put("success_count", JsonValue.NewInt((long)MqttWebhook.successCount));
+        o.Put("fail_count", JsonValue.NewInt((long)MqttWebhook.failCount));
+        o.Put("last_status", JsonValue.NewStr(MqttWebhook.lastStatus));
+
+        JsonValue logsArr = JsonValue.NewArray();
+        for (int i = MqttWebhook.recentLogs.Count - 1; i >= 0; i = i - 1) {
+            MqttWebhookLog log = MqttWebhook.recentLogs[i];
+            JsonValue lo = JsonValue.NewObject();
+            lo.Put("time", JsonValue.NewInt((long)log.timestamp));
+            lo.Put("topic", JsonValue.NewStr(log.topic));
+            lo.Put("client_id", JsonValue.NewStr(log.clientId));
+            lo.Put("qos", JsonValue.NewInt((long)log.qos));
+            lo.Put("success", JsonValue.NewBool(log.success));
+            lo.Put("detail", JsonValue.NewStr(log.detail));
+            logsArr.items.Add(lo);
+        }
+        o.Put("recent_logs", logsArr);
+        return o.ToJson();
+    }
+}

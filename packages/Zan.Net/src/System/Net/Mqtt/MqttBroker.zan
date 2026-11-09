@@ -10,6 +10,9 @@ namespace System.Net.Mqtt;
 // 返回 true 放行连接，返回 false 回复 CONNACK 0x04 (Bad user name or password) 并断开连接。
 public delegate bool MqttAuthHandler(string clientId, string username, string password);
 
+// 消息到达/发布拦截钩子（用于数据流转、规则审计或外部 Webhook 异步派发）。
+public delegate void MqttMessageHook(string clientId, string topic, string payload, int qos, bool retain);
+
 // 会话订阅的主题过滤器及授予的 QoS 实体记录。
 public class MqttBroker : IDisposable {
     public List<MqttSession> sessions;
@@ -18,6 +21,7 @@ public class MqttBroker : IDisposable {
     public List<MqttInflightMessage> inflightMessages;
     public MqttWal wal;
     public MqttAuthHandler authHandler;
+    public MqttMessageHook messageHook;
     private bool keepAliveRunning;
     private MqttSharedBus sharedBus;
 
@@ -42,6 +46,7 @@ public class MqttBroker : IDisposable {
         this.inflightMessages = new List<MqttInflightMessage>();
         this.wal = null;
         this.authHandler = null;
+        this.messageHook = null;
         this.keepAliveRunning = false;
         this.nextId = 0;
         this.startedAt = MqttBroker.Now();
@@ -55,6 +60,11 @@ public class MqttBroker : IDisposable {
     // 设置客户端连接鉴权委托
     public void SetAuthHandler(MqttAuthHandler handler) {
         this.authHandler = handler;
+    }
+
+    // 设置消息到达与发布拦截钩子
+    public void SetMessageHook(MqttMessageHook hook) {
+        this.messageHook = hook;
     }
 
     // 启用磁盘预写日志（WAL）与崩溃恢复引擎。
@@ -227,7 +237,7 @@ public class MqttBroker : IDisposable {
 
     // 过滤器是否匹配具体主题：`#` 匹配剩余所有层，`+` 匹配单层，
     // 其余按层相等；层数必须一致。
-    private static bool TopicMatches(string filter, string topic) {
+    public static bool TopicMatches(string filter, string topic) {
         if (filter == topic) { return true; }
         if (filter == "#") { return true; }
         if (filter.IndexOf("+") < 0 && filter.IndexOf("#") < 0) {
@@ -463,10 +473,21 @@ public class MqttBroker : IDisposable {
     // 它会向其他客户端写入，而这些协程正停靠在可读性上，
     // 因此使用直接的非阻塞 send，而非可 await 的路径。
     public int Publish(string topic, string payload) {
+        return this.Publish(topic, payload, 0, false);
+    }
+
+    // 增强发布接口：支持指定 QoS 与 Retain 标记。
+    public int Publish(string topic, string payload, int qos, bool retain) {
         int payloadLen = payload.Length;
         this.msgsIn = this.msgsIn + 1;
         this.bytesIn = this.bytesIn + payloadLen;
         this.Touch(topic, payload);
+        if (retain) {
+            this.SaveRetained(topic, payload, payloadLen, qos);
+        }
+        if (this.messageHook != null) {
+            this.messageHook("", topic, payload, qos, retain);
+        }
         byte[] packet = BuildPublish(topic, payload, payloadLen);
         int packetLen = this.PublishPacketLen(topic, payloadLen);
         int sent = 0;
@@ -611,6 +632,49 @@ public class MqttBroker : IDisposable {
         o.Put("bytes_in", JsonValue.NewInt((long)this.bytesIn));
         o.Put("bytes_out", JsonValue.NewInt((long)this.bytesOut));
         return o.ToJson();
+    }
+
+    // 全部保留消息的管理 JSON。
+    public string RetainedJson() {
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < this.retainedMessages.Count; i = i + 1) {
+            MqttRetainedMessage r = this.retainedMessages[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("topic", JsonValue.NewStr(r.topic));
+            o.Put("payload", JsonValue.NewStr(r.payload));
+            o.Put("len", JsonValue.NewInt((long)r.payloadLen));
+            o.Put("qos", JsonValue.NewInt((long)r.qos));
+            arr.items.Add(o);
+        }
+        return arr.ToJson();
+    }
+
+    // 清除指定主题的保留消息；topic 为空时清除所有。
+    public bool ClearRetained(string topic) {
+        bool cleared = false;
+        if (topic == null || topic.Length == 0) {
+            if (this.retainedMessages.Count > 0) {
+                cleared = true;
+                if (this.wal != null) {
+                    for (int i = 0; i < this.retainedMessages.Count; i = i + 1) {
+                        this.wal.LogRetainDelete(this.retainedMessages[i].topic);
+                    }
+                }
+                this.retainedMessages.Clear();
+            }
+            return cleared;
+        }
+        for (int i = this.retainedMessages.Count - 1; i >= 0; i = i - 1) {
+            if (this.retainedMessages[i].topic == topic) {
+                this.retainedMessages.RemoveAt(i);
+                if (this.wal != null) {
+                    this.wal.LogRetainDelete(topic);
+                }
+                cleared = true;
+                break;
+            }
+        }
+        return cleared;
     }
 
     // 启动 KeepAlive 心跳定时巡检协程（MQTT-3.1.2.10）。
@@ -797,6 +861,9 @@ public class MqttBroker : IDisposable {
         if (retain) {
             this.SaveRetained(topic, payload, payloadLen, qos);
         }
+        if (this.messageHook != null) {
+            this.messageHook(sess.clientId, topic, payload, qos, retain);
+        }
         int _r = await this.PublishToSubscribers(topic, payload, payloadLen);
         if (qos == 1) {
             byte[] puback = new byte[5];
@@ -835,7 +902,7 @@ public class MqttBroker : IDisposable {
             offset = offset + fLen;
             int reqQos = body[offset] & 255;
             offset = offset + 1;
-            if (reqQos > 1) { reqQos = 1; } // QoS 2 已降级
+            if (reqQos > 2) { reqQos = 2; }
             if (quotaExceeded) {
                 grantedQos.Add(128);
                 continue;

@@ -1,0 +1,102 @@
+
+using System;
+using System.Net;
+using System.Net.Mqtt;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    static string lastHookTopic = "";
+    static string lastHookPayload = "";
+    static int lastHookQos = -1;
+    static bool lastHookRetain = false;
+    static int hookTriggerCount = 0;
+
+    static void OnHook(string clientId, string topic, string payload, int qos, bool retain) {
+        lastHookTopic = topic;
+        lastHookPayload = payload;
+        lastHookQos = qos;
+        lastHookRetain = retain;
+        hookTriggerCount = hookTriggerCount + 1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        int port = 28849;
+        Worker broker = new Worker("mqtt", "127.0.0.1", port);
+        WorkerMqtt.Install();
+        nint listenSock = broker.BindSocket(false);
+        if (listenSock < 0) {
+            Console.WriteLine("bind failed");
+            return 1;
+        }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
+
+        MqttBroker b = MqttBroker.Global();
+        b.SetMessageHook(Program.OnHook);
+
+        // 1. 验证通过 broker.Publish(topic, payload, qos, retain) 触发 hook 与 Retained
+        b.Publish("sensors/temp", "25.0C", 1, true);
+        if (hookTriggerCount != 1 || lastHookTopic != "sensors/temp" || lastHookPayload != "25.0C" || !lastHookRetain) {
+            Console.WriteLine("broker publish hook failed: count=" + Convert.ToString(hookTriggerCount));
+            return 2;
+        }
+
+        // 2. 验证 RetainedJson
+        string retJson = b.RetainedJson();
+        if (retJson.IndexOf("sensors/temp") < 0) {
+            Console.WriteLine("RetainedJson missing topic: " + retJson);
+            return 3;
+        }
+
+        // 3. 验证 ClearRetained
+        bool cleared = b.ClearRetained("sensors/temp");
+        if (!cleared) {
+            Console.WriteLine("ClearRetained returned false");
+            return 4;
+        }
+        string retJsonAfter = b.RetainedJson();
+        if (retJsonAfter.IndexOf("sensors/temp") >= 0) {
+            Console.WriteLine("RetainedJson still contains topic: " + retJsonAfter);
+            return 5;
+        }
+
+        // 4. 验证客户端发布触发 hook
+        MqttClient client = null;
+        for (int i = 0; i < 50; i = i + 1) {
+            client = await MqttClient.ConnectAsync("127.0.0.1", port, "hook-tester");
+            if (client.IsConnected()) { break; }
+            Thread.Sleep(20);
+        }
+        if (!client.IsConnected()) {
+            Console.WriteLine("client connect failed");
+            return 6;
+        }
+
+        await client.PublishAsync("events/alarm", "HIGH_TEMP", MqttQos.AtLeastOnce, false);
+        Thread.Sleep(50);
+        if (hookTriggerCount != 2 || lastHookTopic != "events/alarm" || lastHookPayload != "HIGH_TEMP" || lastHookRetain) {
+            Console.WriteLine("client publish hook failed: count=" + Convert.ToString(hookTriggerCount));
+            return 7;
+        }
+
+        await client.DisconnectAsync();
+
+        broker.Stop();
+        Socket.Close(listenSock);
+        WorkerMqtt.Uninstall();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        Console.WriteLine("MQTT_RETAIN_HOOK_OK");
+        return 0;
+    }
+
+    static void Main() {
+        int code = await Program.Run();
+        if (code != 0) {
+            Environment.Exit(code);
+        }
+    }
+}

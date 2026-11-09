@@ -583,6 +583,22 @@ public partial class Parser {
             n.sval = nm;
             return n;
         }
+        // sizeof(T) folds to a Call node so irgen can lower to integer size
+        if (k == TK.Ident() && Cur().text == "sizeof" && K1() == TK.LParen()) {
+            Next(); Next(); // sizeof (
+            Node ty = ParseType();
+            Expect(TK.RParen());
+            Node n = new Node(AK.Call());
+            Node callee = new Node(AK.Ident());
+            callee.sval = "sizeof";
+            n.a = callee;
+            n.kids = new List<Node>();
+            Node tn = new Node(AK.TypeRef());
+            tn.sval = TypeName(ty);
+            tn.type = ty;
+            n.kids.Add(tn);
+            return n;
+        }
         if (k == TK.IntLit()) {
             Node n = new Node(AK.IntLit());
             Token it = Next();
@@ -778,17 +794,65 @@ public partial class Parser {
         return lam;
     }
 
+    Node MkConvertToString(Node arg, int line, int col) {
+        Node cid = new Node(AK.Ident());
+        cid.sval = "Convert";
+        cid.line = line; cid.col = col;
+        Node cmem = new Node(AK.MemberAccess());
+        cmem.a = cid;
+        cmem.sval = "ToString";
+        cmem.line = line; cmem.col = col;
+        Node call = new Node(AK.Call());
+        call.a = cmem;
+        call.line = line; call.col = col;
+        call.Add(arg);
+        return call;
+    }
+
     Node ParseNew() {
+        int newl = Cur().line; int newc = Cur().col;
         Next(); // new
-        Node n = new Node(AK.NewExpr());
-        // anonymous new: `new { a, b = expr, ... }`. The members are plain
-        // expressions / assignments; only the database codegen consumes
-        // them (query lambdas), so the node carries no type.
+        // 匿名对象字面量 `new { a, b = expr, ... }` 降解（对齐 C 宿主 parser_expr_primary.c）：
+        // 直接在语法树层降解为 Convert.ToString(a) + "\t" + Convert.ToString(b) + ...
+        // 供 OnConflict 等 ORM/LINQ 探针以 string 委托接收并逐列比对
         if (At(TK.LBrace())) {
-            n.ival = 2;
-            ParseBraceItems(n);
-            return n;
+            Next(); // {
+            Node res = null;
+            while (!At(TK.RBrace()) && !At(TK.Eof())) {
+                Node arg = ParseExpr();
+                if (arg.kind == AK.Assignment()) {
+                    arg = arg.b;
+                }
+                Node call = MkConvertToString(arg, newl, newc);
+                if (res == null) {
+                    res = call;
+                } else {
+                    Node tab = new Node(AK.StringLit());
+                    tab.sval = "\t";
+                    tab.line = newl; tab.col = newc;
+                    Node add1 = new Node(AK.Binary());
+                    add1.op = TK.Plus();
+                    add1.a = res;
+                    add1.b = tab;
+                    add1.line = newl; add1.col = newc;
+                    Node add2 = new Node(AK.Binary());
+                    add2.op = TK.Plus();
+                    add2.a = add1;
+                    add2.b = call;
+                    add2.line = newl; add2.col = newc;
+                    res = add2;
+                }
+                if (!Eat(TK.Comma())) { break; }
+            }
+            Expect(TK.RBrace());
+            if (res == null) {
+                res = new Node(AK.StringLit());
+                res.sval = "";
+                res.line = newl; res.col = newc;
+            }
+            return res;
         }
+        Node n = new Node(AK.NewExpr());
         n.type = ParseTypeNoArray();
         if (At(TK.LBracket())) {
             Next();

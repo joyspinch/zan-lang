@@ -202,6 +202,19 @@ partial class Irgen {
             L("  " + t + " = sitofp i64 " + v.op + " to double");
             return t;
         }
+        if (vt == "i64" && (llty == "i32" || llty == "i16" || llty == "i8")) {
+            if (v.op.StartsWith("%") || v.op.StartsWith("@")) {
+                string t = NT();
+                L("  " + t + " = trunc i64 " + v.op + " to " + llty);
+                return t;
+            }
+            return v.op;
+        }
+        if (vt == "double" && llty == "float") {
+            string t = NT();
+            L("  " + t + " = fptrunc double " + v.op + " to float");
+            return t;
+        }
         return v.op;
     }
 
@@ -416,7 +429,21 @@ partial class Irgen {
         if (!term) {
             L("  br label %L" + lc);
             Label(lc);
-            string c = GenCond(s.a);
+            string c = "";
+            if (s.a != null && s.a.kind == AK.Block()) {
+                int bi = 0;
+                while (bi < s.a.kids.Count) {
+                    Node bs = s.a.kids[bi];
+                    if (bi == s.a.kids.Count - 1 && bs.kind == AK.ExprStmt()) {
+                        c = GenCond(bs.a);
+                    } else {
+                        GenStmt(bs);
+                    }
+                    bi = bi + 1;
+                }
+            } else {
+                c = GenCond(s.a);
+            }
             L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
         }
         Label(lend);
@@ -451,7 +478,13 @@ partial class Irgen {
         GenStmt(s.d);
         if (!term) { L("  br label %L" + linc); }
         Label(linc);
-        if (s.c != null) { GenExpr(s.c); }
+        if (s.c != null) {
+            if (s.c.kind == AK.Block() || s.c.kind == AK.ExprStmt()) {
+                GenStmt(s.c);
+            } else {
+                GenExpr(s.c);
+            }
+        }
         L("  br label %L" + lc);
         Label(lend);
         ReleaseLocalsFrom(forScope);
@@ -798,7 +831,6 @@ partial class Irgen {
     // Returns false when the collection does not speak the protocol (the
     // caller then reports the collection as unsupported).
     bool GenForeachEnumerable(Node s, ExprVal coll) {
-        if (curAsync) { return false; }   // no frame slot for the enumerator yet
         Node cls = ClassOf(coll.ty);
         if (cls == null) { return false; }
         Node gm = FindMethodUp(cls, "GetEnumerator");
@@ -843,7 +875,15 @@ partial class Irgen {
         // the element variable is a per-iteration capture: every closure made
         // in the body keeps its own element
         locIter[locName.Count - 1] = true;
-        if (ShouldBox(s.sval)) { ereg = BoxLocal(locName.Count - 1); } else { EA(ereg, elt); }
+        if (curAsync) {
+            EA(ereg, elt);
+            asyncSlotReg.Add(enReg); asyncSlotTy.Add(enumTy); asyncSlotIdx.Add(s.ival);
+            asyncSlotReg.Add(ereg); asyncSlotTy.Add(elemTy); asyncSlotIdx.Add(s.ival + 2);
+        } else if (ShouldBox(s.sval)) {
+            ereg = BoxLocal(locName.Count - 1);
+        } else {
+            EA(ereg, elt);
+        }
         if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
@@ -854,24 +894,30 @@ partial class Irgen {
         loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
+        ExprVal curEn = en;
+        if (curAsync) {
+            string enVal = NT();
+            L("  " + enVal + " = load " + enTy + ", " + enTy + "* " + enReg);
+            curEn = new ExprVal(enVal, enumTy);
+        }
         Node call1 = new Node(AK.Call()); call1.kids = new List<Node>();
-        ExprVal mn = EmitInstanceCall(en, ecls.sval, "MoveNext", call1);
+        ExprVal mn = EmitInstanceCall(curEn, ecls.sval, "MoveNext", call1);
         string c = NT();
         L("  " + c + " = icmp ne i64 " + mn.op + ", 0");
         L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
         Label(lb);
         ExprVal ev;
         if (curIsField) {
-            ev = LoadField(en.op, enumTy, "Current");
+            ev = LoadField(curEn.op, enumTy, "Current");
         } else if (curGetter != null) {
             Node call2 = new Node(AK.Call()); call2.kids = new List<Node>();
             // the dispatch already converts an erased return to the concrete
             // type (FromSlot at the call boundary); wrapping it again applied
             // inttoptr to an already-pointer register and clang refused it
-            ev = EmitInstanceCall(en, ecls.sval, "get_Current", call2);
+            ev = EmitInstanceCall(curEn, ecls.sval, "get_Current", call2);
         } else {
             Node call2 = new Node(AK.Call()); call2.kids = new List<Node>();
-            ev = EmitInstanceCall(en, ecls.sval, "Current", call2);
+            ev = EmitInstanceCall(curEn, ecls.sval, "Current", call2);
         }
         if (ArcManaged(elemTy)) {
             string old = NT();

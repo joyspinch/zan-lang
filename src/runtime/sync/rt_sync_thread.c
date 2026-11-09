@@ -8,15 +8,38 @@ static void *zan_delegate_record(void *d);
 static void zan_delegate_retain(void *d);
 static void zan_delegate_release(void *d);
 
+static int zan_is_code_pointer(void *p) {
+    if (!p) return 0;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi))) {
+        DWORD prot = mbi.Protect;
+        if (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) {
+            return 1;
+        }
+    }
+    return 0;
+#else
+    return 1;
+#endif
+}
+
 static void zan_thread_invoke(void *body) {
     void *rec = zan_delegate_record(body);
     if (!rec) {
         ((zan_thread_body_fn)body)();
         return;
     }
-    void (*fn)(void *) =
-        *(void (**)(void *))((char *)rec + ZAN_CLOSURE_FN_OFF);
-    if (fn) fn(rec);
+    void **slots = (void **)rec;
+    void (*fn)(void *) = (void (*)(void *))slots[0];
+    void *second = slots[1];
+    /* C 宿主闭包：slots[1] 为 dtor（代码段函数指针），调用传 rec 本身：fn(rec)
+     * 自举后端闭包：slots[1] 为 env（堆数据指针或 NULL），调用传 env：fn(env) */
+    if (zan_is_code_pointer(second)) {
+        if (fn) fn(rec);
+    } else {
+        if (fn) fn(second);
+    }
 }
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -356,6 +379,10 @@ static void *zan_delegate_record(void *d) {
 static void zan_delegate_retain(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
+    void **slots = (void **)rec;
+    /* 仅 C 宿主带 ARC 头且 slots[1] 为 dtor 的闭包记录需要递增引用计数；
+     * 自举后端裸 malloc(16) 闭包无 ARC 头 */
+    if (!zan_is_code_pointer(slots[1])) return;
     volatile int64_t *rc = (volatile int64_t *)((char *)rec + ZAN_OBJ_RC_OFF);
 #ifdef _WIN32
     InterlockedIncrement64((volatile LONG64 *)rc);
@@ -367,7 +394,10 @@ static void zan_delegate_retain(void *d) {
 static void zan_delegate_release(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
-    void *dtor = *(void **)((char *)rec + ZAN_CLOSURE_DTOR_OFF);
+    void **slots = (void **)rec;
+    /* 仅 C 宿主闭包具有 dtor（代码指针），自举后端 slots[1] 为 env 数据指针不得调用 */
+    if (!zan_is_code_pointer(slots[1])) return;
+    void *dtor = slots[1];
     if (dtor) ((void (*)(void *))dtor)(rec);
 }
 

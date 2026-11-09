@@ -42,7 +42,7 @@ GUI 的"标准库"就是本包 `packages/Zan.Gui`——`using X.Y;` 按路径按
 | :--- | :--- | :--- |
 | **`Gui`** (`src/Gui/` 根) | **GUI 核心内核**。提供应用程序生命周期、事件总线、排版引擎、样式系统、渲染画布与声明式工厂。 | `App`, `Control`, `Element`, `Event`, `Layout`, `Style`, `Html` |
 | **`Gui.Widget`** (`src/Gui/Widget/`) | **原子与复合控件集**。轻量、结构明确的基础 UI 输入/展示控件与工具条。 | `Button`, `TextBox`, `Label`, `CheckBox`, `ComboBox`, `Slider`, `QrCode`, `Ribbon` |
-| **`Gui.Component`** (`src/Gui/Component/`) | **高级业务组件**。具备独立状态机、复杂视口与重型交互的高级控件与特效。 | `ChatView`, `ConsoleView`, `LogView`, `TreeView`, `MarkdownViewer`, `RibbonFx` |
+| **`Gui.Component`** (`src/Gui/Component/`) | **高级业务组件**。具备独立状态机、复杂视口与重型交互的高级控件与视图。 | `TreeView`, `BandGrid`, `FilePicker`, `GraphView` |
 | **`Gui.Backend`** (`src/Gui/Backend/`) | **底层图形后端适配**。对接 Windows GDI/DirectWrite、Software Rasterizer 等本地驱动。 | `GdiBackend`, `SoftwareBackend` |
 
 数据绑定走两条正道：HTML 窗口用 `data-bind`（ModelBinder），代码侧用

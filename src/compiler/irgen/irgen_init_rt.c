@@ -258,7 +258,9 @@
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef dpp;
         if (!g->desc_hdr) {
-            LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
+            LLVMValueRef raw_site = LLVMBuildLoad2(g->builder, i64, siptr, "site.raw");
+            LLVMValueRef site = zan_and(g->builder, raw_site,
+                LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0), "site");
             LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64,
                 g->g_site_count, "bound");
             LLVMValueRef inrange = zan_icmp(g->builder, LLVMIntULT, site,

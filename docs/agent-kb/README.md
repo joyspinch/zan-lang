@@ -12,7 +12,7 @@
 | --- | --- |
 | [project-map.md](project-map.md) | 每次开工第一份：目录 → 职责 → 入口文件 → 改这类需求该动哪儿 |
 | [debugging-playbook.md](debugging-playbook.md) | 编译报错 / 运行崩 / 结果不对：分层定位 + 最小探针 + 根因修复的完整方法论 |
-| [gui-development.md](gui-development.md) | 改控件、主题、设计器、HMI：立即模式渲染约定、Theme token、控件清单 |
+| [gui-development.md](gui-development.md) | 改控件、主题、设计器、HMI：两范式开发约定（HTML+CSS 与声明式对象树）、Theme token、控件清单 |
 | [templates-and-wizard.md](templates-and-wizard.md) | 改模板 / 新建项目向导 / 项目脚手架：manifest 字段与数据流 |
 | [testing.md](testing.md) | 提交前：选哪个测试层级、哪些测试互斥、怎么加回归 |
 | [agent-workflow.md](agent-workflow.md) | 完整闭环：需求 → 拆解 → 计划 → 实施 → 自检 → 回归 → 交付 → 沉淀 |

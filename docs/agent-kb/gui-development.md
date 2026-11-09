@@ -1,15 +1,17 @@
 # GUI / 主题 / 设计器 / HMI 开发速查
 
-## 心智模型：HTML+CSS 画界面，Zan 双向绑定
+## 核心心智模型：两大标准创作范式
 
-Zan.Gui 只做两件事（`docs/GUI_ARCHITECTURE.md`）：**用 .html + .css 描述并绘制界面**——
-标签长成保留式控件树；**Zan 数据与界面双向绑定**——HTML 窗口用 `data-bind`，代码侧用
-`Binding<T> data` 字段。应用代码每帧调用 `widget.Render(app, x, y, …)` 的即时模式是历史
-包袱，按 B-ID177 逐步下线，新代码不得新增（pre-commit 棘轮拦截，见
-`docs/WORKSPACE_CONVENTIONS.md` §17 第 5 条）。
-- 控件树（`Control`）具备长生命周期的树状对象图（`parent` 弱引用、`children` 列表、`MeasureTree`、`Arrange` 绝对坐标边界 `bx, by, bw, bh`、`RenderTree` 裁切栈）。
-- 事件分发的 **Visual Tree 路由分发**（`Tunneling` 隧穿向下 + `Bubbling` 冒泡向上，`RoutedEventArgs` 携带 `originalSource`、`source` 与 `handled` 消费标记，支持指针捕获 `App.CapturePointer`）已经实现，`App.ProcessEvent` 会先走它；但存量控件大多仍在绘制期用 `ClaimClick`/`BlockHitsRect` 轮询输入，按 B-ID177 分批迁到路由事件。
-- 存量即时模式代码用 **作用域 Hash 栈（Scoped ID Hash Stack）** 隔离控件 ID；保留式控件按对象引用识别，不需要 ID，这套机制随即时模式一起退役。
+Zan.Gui 遵循两大标准创作范式：
+
+1. **范式一：HTML + CSS**：`Gui.Markup/Html` 将标记解析为现代盒模型，外观完全由 CSS 级联与 Theme token 决定，排版纯走 CSS（Flex/Grid/Flow）引擎；数据通过 `data-bind` 双向同步。
+2. **范式二：保留模式声明式对象树**：代码侧使用 `Children = [ ... ]`、`ClassName = "..."` 声明建树，排版纯走 Flex/Grid/Flow；动态宿主（设计器、PropertyGrid）走 `GetProp/SetProp` 属性协议；数据通过控件的 `Binding<T> data` 字段双向绑定。
+
+**核心铁律**：
+- **禁止外部自绘**：全仓所有 UI 元素（包括图表曲线、仪表指针、代码高亮、游戏 HUD 等）一律封装为标准范式二控件。像素绘制严格封存在控件内部 `OnPaint` 中，对外仅暴露声明式属性配置与数据绑定。
+- **长生命周期控件树**：`Control` 具备完整的树状对象图（`parent` 弱引用、`children` 列表、`MeasureTree`、`Arrange` 绝对坐标边界 `bx, by, bw, bh`、`RenderTree` 裁切栈）。
+- **统一路由事件分发**：全面走 **Visual Tree 路由分发**（`Tunneling` 隧穿向下 + `Bubbling` 冒泡向上，`RoutedEventArgs` 携带 `originalSource`、`source` 与 `handled` 消费标记，支持指针捕获 `App.CapturePointer`）。
+- **控件纯实例化**：控件为纯实例对象，按对象引用识别，状态仅保存在控件实例字段与树可达宿主中。无全局 ID 依赖，无全局静态可变状态，天然支持同屏多实例、多弹层与多窗口完全隔离。
 
 典型应用程序循环（`Gui/App.zan` / `Form.zan`）：
 
@@ -18,23 +20,17 @@ Form form = new MainForm();
 form.Run(); // 自动挂载 rootControl 到 App 并开启事件驱动渲染循环
 ```
 
-由此推出几条**必须遵守**的现代架构约定：
+由此推出几条必须遵守的标准架构约定：
 
-1. **新控件的事件与输入处理走 Visual Tree 路由分发**：
+1. **事件与输入处理走 Visual Tree 路由分发**：
    - 控件重写 `OnRoutedEvent(RoutedEventArgs e)` 或 `OnPreviewRoutedEvent(RoutedEventArgs e)` 处理事件；
    - 消费事件时显式调用 `e.Handle()`，冒泡派发自动终止；
-   - 拖拽手势（分割条、滑块、窗口移动）在按下时调用 `app.CapturePointer(this)`，释放时调用 `app.ReleasePointerCapture()`，后续位移与抬键直接定向派发，无需各处手动打脏标记。
-   - 不要在新代码里新增 `app.ClaimClick` / `BlockHitsRect` 等即时模式仲裁调用（机检拦截）。
+   - 拖拽手势（分割条、滑块、窗口移动）在按下时调用 `app.CapturePointer(this)`，释放时调用 `app.ReleasePointerCapture()`，后续位移与抬键直接定向派发。
 
-2. **存量即时模式代码杜绝硬编码号段魔数，统一使用作用域 Hash 栈（Scoped ID Stack）**：
-   - **严禁**使用 `WidgetId.SetSeq(850000)` 等魔数号段（已彻底废除，跨实例必冲突踩踏）；
-   - 需局部隔离 ID 空间或循环派生项时，统一使用：
-     ```zan
-     WidgetId.Push("sub_component_name"); // 或 Push(index)
-     // ... 构造控件或执行局部渲染
-     WidgetId.Pop();
-     ```
-   - 栈式 Hash 自动结合父级 Hash 生成均匀分布的高位隔离 ID，天然支持无限层级嵌套与同类组件同屏多实例。
+2. **控件纯实例化与状态隔离**：
+   - 控件是纯实例对象，状态只存在于控件实例字段与树可达宿主上；
+   - 控件按对象引用与 Visual Tree 路径识别，禁止跨实例全局静态可变状态；
+   - 天然支持多实例、同屏多弹层与多窗口完全隔离。
 
 3. **数据绑定只有两条正道**：HTML 窗口用 `data-bind`（ModelBinder 自动双向同步，
    `<template data-for>` 展开列表行）；代码侧用控件的 `Binding<T> data` 字段
@@ -175,14 +171,14 @@ x 移除。`Closable` 默认 true；`Max` 限制数量、达到后触发器置�
 DynamicTags tags = new DynamicTags();
 tags.SetItems(new List<string>{ "调查中", "已发布" });
 tags.Change += () => { Save(tags.Items()); };   // 增删时触发（SetItems 不触发）
-tags.Render(app, 40, 80);
+// 范式二挂载：加入父级容器 Children 声明式树
+container.Children.Add(tags);
 ```
 
 实现要点：组件自持 `List<string>`（无列表绑定），内联编辑器是成员 `Input` 保留
 实例、原位渲染并 `focus.SetFocused` 接管键盘；回车/Esc 在它渲染前轮询读取
-（SessionList 同款），失焦提交靠"上一帧焦点快照"。每标签一对命中 id 从
-`WidgetId.Block(1024)` 段按下标分配（tagBase+i / tagBase+512+i），关 x 后注册、
-命中测试取最后注册者。触发器走 `tag.add` 皮肤规则（虚线框）。设计器序列化经
+（SessionList 同款），失焦提交靠"上一帧焦点快照"。标签与删除按钮通过 Visual Tree
+路由事件处理交互与焦点，无全局 ID 栈依赖。触发器走 `tag.add` 皮肤规则（虚线框）。设计器序列化经
 `GetExtra/SetExtra("options")`（`|` 连接，Tabs.SetItemsText 同款）。
 
 ### 倒计时 Gui.Widget.Countdown（Naive UI n-countdown）
@@ -196,7 +192,8 @@ tags.Render(app, 40, 80);
 ```zan
 Countdown cd = new Countdown(5 * 60000, "mm:ss");
 cd.Finish += () => { status.Text = "Done"; };
-cd.RenderInside(app, new Rect(40, 60, 140, 34));
+// 范式二挂载：声明式加入容器
+panel.Children.Add(cd);
 ```
 
 实现要点：剩余时刻由 tick 差值推得（`Tick(nowMs)` 以 `Window.GetTickMs()` 推进，测试
@@ -242,11 +239,15 @@ smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size
 | 想要 | 去哪 |
 | --- | --- |
 | 基础控件（58 个） | `packages/Zan.Gui/src/Gui/Widget/`：Button Input SelectBox Image Table Tabs TreeView ListView VirtualList Slider Switch Steps Timeline Pagination Progress Rate Tag Card Panel Collapse Popover Tooltip Dropdown Menu ContextMenu Breadcrumb PageHeader Result Empty Skeleton Spin Statistic … |
-| 外壳容器 | `Widget/ToolStrip.zan` `StatusBar.zan` `SplitPanel.zan` `Split.zan` `Ribbon.zan` `Component/Dock.zan`（DockPanel）；自定义标题栏见 `App.RenderChrome` |
+| 外壳容器 | `Widget/ToolStrip.zan` `StatusBar.zan` `SplitPanel.zan` `Split.zan` `Ribbon.zan`；自定义标题栏见 `Core/App.Chrome.zan` |
 | 向导/对话框 | `Widget/Wizard.zan`（新建项目/新建文件都用它）、`Widget/Prompt.zan`、`Widget/Layer.zan`（通知/浮层） |
-| 复合组件 | `Component/`：`Chart` `DataTable` `CodeEditor` `WebView` `PivotTable` `LogView` `FilePicker` `SessionList` |
-| 工控 HMI | `Gui/Hmi/`：`IoTag`（位号绑定）`Indicator`（LED/数显）`Gauge` `Trend`（趋势曲线）`Alarm`（报警横幅+列表）`NumPad`（工业键盘）`EquipPanel`（设备卡/状态面板） |
-| 设计器 | `Gui/Designer/Designer.zan` / `Designer.Form.zan` / `Designer.Inspector.zan` |
+| 基础复合件 | `packages/Zan.Gui/src/Gui/Component/`：`FilePicker` `GraphView` `BandGrid` 等 |
+| 图表控件包 | `packages/Zan.Gui.Charts/`（`Gui.Charts`：折线、柱状、饼图、仪表、散点、热力等范式二图表组件） |
+| 高性能表格包 | `packages/Zan.Gui.DataTable/`（`Gui.DataTable`：千万级虚拟化报表组件） |
+| 代码编辑器包 | `packages/Zan.Gui.CodeEditor/`（`Gui.CodeEditor`：语法高亮与代码编辑组件） |
+| 浏览器控件包 | `packages/Zan.Gui.Browser/`（`WebView` / `CefBrowser`） |
+| 工控 HMI 包 | `packages/Zan.Industrial/`（`Gui.Hmi`：`IoTag` 位号、`Indicator` LED、`Gauge` 仪表、`Trend` 趋势曲线、`Alarm` 报警） |
+| 可视化设计器 | `packages/Zan.Gui.Designer/` |
 
 新增控件的落地清单：`Widget/<Name>.zan` → 在 gallery 里加演示 → 需要能被设计器摆放的话
 补 `PropSpec`/`ControlFactory` 注册 → `standard` + gallery 构建 + 截图。
@@ -282,24 +283,21 @@ IDE 见 `src/ide_zan/src/components/IdeBootstrap.zan`，画廊在 `gui_gallery.z
 - 周期回调里只更新数据 + `RequestRedraw()`，绘制仍在帧里做。
 - 报警/趋势的数据量要有上限（环形缓冲），否则长时间运行内存持续增长。
 
-## 铁律：控件自己负责绘制，使用处只配置
+## 铁律：控件自己负责内部绘制，使用处只做声明与绑定（取消画布例外）
 
-**禁止在使用处自绘控件元素。** 示例、gallery、模板只能：实例化组件 → 配置属性 →
-喂数据 → 摆位置。仪表的圆弧、趋势的折线、柱状的条、LED 的灯珠，一律画在
-`packages/Zan.Gui/src/Gui/Hmi/*` 或 `packages/Zan.Gui.Charts/src/Gui/Component/Chart/*` 里面。
+**全仓严禁在使用处自绘控件元素，彻底取消画布例外。**
+2026-11-09 用户裁定：所有 UI 界面（包括图表、HMI、代码高亮、游戏 HUD）一律收编为**范式二控件**。
+- 控件骨架、外壳与排版走 `Children`/`ClassName` 与标准 CSS（Flex/Grid/Flow）；
+- 曲线、指针、仪表圆弧、LED 灯珠等像素绘制**完全封装在控件自己的 `OnPaint` 内部**；
+- 外部使用处只能：**挂载组件 → 配置属性 → 绑定数据**；绝不允许向外暴露即时模式 `Render(app, …)` 入口或任何应用侧 `Draw*` 调用。
 
 为什么不是风格问题：同一个控件存在两份绘制，组件修好之后示例还在按旧的错的画法
 显示，于是「组件是对的，demo 是错的」——gallery 的仪表演示就是这么歪的。
 
 - 守门测试 `policy_no_widget_drawing`（smoke 层）扫 `examples/` 与 `templates/`，
   出现 `FillSector/DrawSector/FillArc/DrawArc/FillPie/DrawPie` 直接失败并打印行号。
-  这些原语除了表盘/圆环/饼图没别的用处，所以是很准的信号。
-- 游戏例外（`templates/game/`）：游戏本来就自己渲染整个场景，不是在冒充控件。
-- 示例画自己的外壳（面板、标题、表格行这些 `FillRect`/`DrawText`）是允许的——
-  界限是「有没有在重画一个已经存在的控件」。
-- 审过一遍的结论（2026-08）：`examples/`、`templates/` 里没有 HMI/图表自绘，
-  gallery 的仪表演示全是 `ChartSeries.Gauge(...)` 配置。所以仪表画错要去
-  `packages/Zan.Gui.Charts/src/Gui/Component/Chart/ChartView.Pie.zan`（仪表标度走 `ChartView.GaugeScalar`，指针/刻度模型在同包 `Models/Gauge*.zan`）里查，别改 demo。
+- 游戏世界渲染（GameViewport / Entity.OnRender）是引擎内部职责，但游戏 HUD、面板、菜单必须使用标准范式二控件。
+- 示例与应用代码严禁自绘现有控件。仪表画错去 `packages/Zan.Gui.Charts` 或 `packages/Zan.Industrial` 改控件自己的 OnPaint，绝不在调用处修补。
 
 ## 设计器窗体（`.html` 设计稿）的数据流
 

@@ -1,0 +1,131 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// 韦恩图的一个集合圆（布局输出）。
+public class VennCircle {
+    public string name;  // 集合名，"" = 由渲染器回退
+    public int value;
+    public int cx;
+    public int cy;
+    public int r;
+
+    // 构造一个集合圆（name 为 "" 时由渲染器回退命名）。
+    public static VennCircle Of(string name, int value, int cx, int cy, int r) {
+        VennCircle v = new VennCircle();
+        v.name = name;
+        v.value = value;
+        v.cx = cx;
+        v.cy = cy;
+        v.r = r;
+        return v;
+    }
+}
+
+// 两圆韦恩图布局：data[0]=A、data[1]=B、data[2]=A∩B（缺失按 0）。
+// hidden 数据项按 0 处理（不进布局）。半径按面积比例
+// （r ∝ sqrt(v)）由 rMax 缩放；圆心距按重叠比例 vI/vMin
+// 从相离 (rA+rB+gap) 线性压向包含，全部确定性整数运算。
+// 输出两圆圆心/半径、圆心距、重叠千分比、包含标志和
+// 三个标签锚点（A-only / B-only / 交集中心）。
+public class VennLayout {
+    public VennCircle a;
+    public VennCircle b;
+    public int d;  // 圆心距
+    public int overlap;  // vI/vMin 千分比，0..1000
+    public bool contained;  // overlap >= 1000：小圆含于大圆
+    public int gap;
+    public int ax;  // A-only 标签锚点
+    public int ay;
+    public int bx;  // B-only 标签锚点
+    public int by;
+    public int ix;  // 交集标签锚点
+    public int iy;
+
+    // 按类注释的规则布局：rMax 为最大半径（像素），gap 为相离时
+    // 的圆心间距，(cx0, cy0) 为整体中心。
+    public static VennLayout Of(List<ChartData> data, int rMax, int gap, int cx0, int cy0) {
+        VennLayout l = new VennLayout();
+        l.gap = gap;
+        if (rMax < 1) { rMax = 1; }
+        int vA = 0;
+        int vB = 0;
+        int vI = 0;
+        string nA = "";
+        string nB = "";
+        string nI = "";
+        if (data.Count > 0) { vA = VennLayout.Val(data[0]); nA = data[0].name; }
+        if (data.Count > 1) { vB = VennLayout.Val(data[1]); nB = data[1].name; }
+        if (data.Count > 2) { vI = VennLayout.Val(data[2]); nI = data[2].name; }
+
+        int vMax = vA;
+        if (vB > vMax) { vMax = vB; }
+        if (vI > vMax) { vMax = vI; }
+        int rA = VennLayout.Rad(vA, vMax, rMax);
+        int rB = VennLayout.Rad(vB, vMax, rMax);
+
+        // 重叠比例：vI 相对较小集合的千分比。
+        int vMin = vA;
+        if (vB < vMin) { vMin = vB; }
+        int overlap = 0;
+        if (vI > 0 && vMin > 0) {
+            if (vI >= vMin) { overlap = 1000; } else { overlap = vI * 1000 / vMin; }
+        }
+        bool contained = overlap >= 1000;
+
+        // 圆心距：相离 / 部分重叠 / 包含三种形态。
+        int d = 0;
+        if (rA >= 1 || rB >= 1) {
+            int dr = rA - rB;
+            if (dr < 0) { dr = 0 - dr; }
+            if (overlap == 0) {
+                d = rA + rB + gap;  // 相离
+            } else if (contained) {
+                d = dr * 3 / 4;  // 包含：两心贴近
+                if (d < 1) { d = 1; }
+            } else {
+                d = (rA + rB) * (1000 - overlap) / 1000;
+                if (d < dr) { d = dr; }  // 钳制：不许完全吞入
+                if (d < 1) { d = 1; }
+            }
+        }
+        l.a = VennCircle.Of(nA, vA, cx0 - d / 2, cy0, rA);
+        l.b = VennCircle.Of(nB, vB, cx0 + (d - d / 2), cy0, rB);
+        l.d = d;
+        l.overlap = overlap;
+        l.contained = contained;
+
+        // 标签锚点：A-only 在 A 远离 B 的一侧，B-only 对称，
+        // 交集在两圆心中点。
+        if (d == 0) {
+            l.ax = cx0 - rA / 2;
+            l.ay = cy0 - rA / 2;
+            l.bx = cx0 + rB / 2;
+            l.by = cy0 + rB / 2;
+            l.ix = cx0;
+            l.iy = cy0;
+        } else {
+            l.ax = l.a.cx - rA * 3 / 4;
+            l.ay = cy0;
+            l.bx = l.b.cx + rB * 3 / 4;
+            l.by = cy0;
+            l.ix = (l.a.cx + l.b.cx) / 2;
+            l.iy = cy0;
+        }
+        return l;
+    }
+
+    // 数据项取值：hidden 按 0 处理（不进布局）。
+    public static int Val(ChartData d) {
+        if (d.hidden) { return 0; }
+        return d.val;
+    }
+
+    // 半径按面积比例缩放：r = rMax * sqrt(v / vMax)。
+    public static int Rad(int v, int vMax, int rMax) {
+        if (v <= 0 || vMax <= 0) { return 0; }
+        return rMax * ChartView.ISqrt(v * 10000 / vMax) / 100;
+    }
+}

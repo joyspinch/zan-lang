@@ -214,6 +214,16 @@ partial class Irgen {
     // ---- new ----
     ExprVal GenNew(Node e) {
         Node ty = e.type;
+        if (ty == null) {
+            int i = 0;
+            while (i < e.kids.Count) {
+                Node it = e.kids[i];
+                if (it.kind == AK.Assignment()) { GenExpr(it.b); }
+                else { GenExpr(it); }
+                i = i + 1;
+            }
+            return new ExprVal("null", MkType("object"));
+        }
         if (e.ival != 1 && IsSpanType(ty)) {
             // new Span<T>(base, len): a view value is just its base address;
             // the length is evaluated for its side effects only.
@@ -407,7 +417,10 @@ partial class Irgen {
             return new ExprVal(oraw, ty);
         }
         Node cls = binder.FindType(cn);
-        if (cls == null) { return new ExprVal("null", ty); }
+        if (cls == null) {
+            if (IsErasedType(ty)) { return new ExprVal("0", ty); }
+            return new ExprVal("null", ty);
+        }
         string szp = NT();
         L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
         string szi = NT();
@@ -523,7 +536,39 @@ partial class Irgen {
                     diags.Error("[E2017] no constructor of '" + cn + "' accepts " + argc
                         + " arguments", e.line, e.col);
                 }
-                if (HasChainFieldInits(cls)) {
+                Node bcls = BaseClassOf(cls);
+                Node bctor = null;
+                Node bctorCls = null;
+                Node curBase = bcls;
+                while (curBase != null) {
+                    bctor = binder.FindCtorArity(curBase, 0);
+                    if (bctor != null) {
+                        bctorCls = curBase;
+                        break;
+                    }
+                    if (binder.FindCtor(curBase) != null) {
+                        break;
+                    }
+                    curBase = BaseClassOf(curBase);
+                }
+                if (bctor != null && bctorCls != null) {
+                    Node c = cls;
+                    while (c != null && c != bctorCls) {
+                        string cop = obj;
+                        if (c.sval != cn) {
+                            cop = NT();
+                            L("  " + cop + " = bitcast %" + cn + "* " + obj + " to %" + c.sval + "*");
+                        }
+                        EmitFieldInits(c, cop);
+                        c = BaseClassOf(c);
+                    }
+                    string bthis = obj;
+                    if (bctorCls.sval != cn) {
+                        bthis = NT();
+                        L("  " + bthis + " = bitcast %" + cn + "* " + obj + " to %" + bctorCls.sval + "*");
+                    }
+                    L("  call void @" + CtorSym(bctorCls.sval, bctor) + "(%" + bctorCls.sval + "* " + bthis + ")");
+                } else if (HasChainFieldInits(cls)) {
                     L("  call void @" + FieldInitsSym(cls) + "(%" + cn + "* " + obj + ")");
                 }
             }

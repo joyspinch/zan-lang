@@ -12,6 +12,7 @@ namespace Zan.Web.Iot;
    MqttBroker.Instance() 读取实时代理注册表。信封是包 ApiController
    的 {code:0, msg, data, traceId}。 */
 [Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
 [Description("MQTT代理")]
 public class IotController : ApiController {
     [HttpGet]
@@ -70,7 +71,52 @@ public class IotController : ApiController {
         this.Ok(MqttBroker.Instance().MetricsJson());
     }
 
-    /* 以代理身份向主题注入消息（扇出给所有匹配订阅者）；topic 必填，payload 原样取用。 */
+    /* 全部保留消息（Retained Messages）列表。 */
+    [HttpGet]
+    [Route("/iot/retained")]
+    [Description("保留消息列表")]
+    public async void Retained() {
+        this.Ok(MqttBroker.Instance().RetainedJson());
+    }
+
+    /* 清除指定主题的保留消息；未指定 topic 时清空所有。 */
+    [HttpPost]
+    [Route("/iot/retained/clear")]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Description("清除保留消息")]
+    public async void ClearRetained() {
+        string topic = this.In("topic");
+        bool cleared = MqttBroker.Instance().ClearRetained(topic);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("cleared", cleared ? "true" : "false");
+        w.WriteProperty("topic", topic.Length > 0 ? topic : "*");
+        w.EndObject();
+        this.Ok(w.ToJson());
+    }
+
+    /* Webhook 转发运行期统计与审计日志。 */
+    [HttpGet]
+    [Route("/iot/webhook/stats")]
+    [Description("Webhook运行统计")]
+    public async void WebhookStats() {
+        this.Ok(MqttWebhook.StatsJson());
+    }
+
+    /* Webhook 本地演示接收桩（供开箱即用测试与验证）。 */
+    [HttpPost]
+    [Route("/iot/webhook/mock")]
+    [Description("Webhook演示接收端")]
+    public async void WebhookMock() {
+        string raw = this.InRaw("raw");
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("status", "mock_received");
+        w.EndObject();
+        this.Ok(w.ToJson());
+    }
+
+    /* 以代理身份向主题注入消息（支持 QoS 0/1/2 与 Retain 标记）；topic 必填。 */
     [HttpPost]
     [Custom(Authorization = CustomAuthorization.Login)]
     [Description("发布消息")]
@@ -81,11 +127,23 @@ public class IotController : ApiController {
             return;
         }
         string payload = this.InRaw("payload");
-        int n = MqttBroker.Instance().Publish(topic, payload);
+        int qos = 0;
+        string qosStr = this.In("qos");
+        if (qosStr.Length > 0) {
+            qos = Convert.ToInt32(qosStr);
+            if (qos < 0) { qos = 0; }
+            if (qos > 2) { qos = 2; }
+        }
+        string retStr = this.In("retain");
+        bool retain = retStr == "1" || retStr == "true";
+
+        int n = MqttBroker.Instance().Publish(topic, payload, qos, retain);
         JsonWriter w = new JsonWriter();
         w.StartObject();
         w.WriteProperty("topic", topic);
         w.WriteProperty("delivered", n.ToString());
+        w.WriteProperty("qos", qos.ToString());
+        w.WriteProperty("retain", retain ? "true" : "false");
         w.EndObject();
         this.Ok(w.ToJson());
     }

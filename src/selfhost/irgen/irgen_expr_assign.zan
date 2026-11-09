@@ -3,6 +3,46 @@ using System.Collections.Generic;
 namespace Zan;
 
 partial class Irgen {
+    bool IsTrivialLhs(Node n) {
+        if (n == null) { return true; }
+        int k = n.kind;
+        if (k == AK.Ident() || k == AK.ThisExpr()
+            || k == AK.IntLit() || k == AK.FloatLit()
+            || k == AK.StringLit() || k == AK.CharLit()
+            || k == AK.BoolLit() || k == AK.NullLit()) {
+            return true;
+        }
+        return false;
+    }
+
+    Node HoistSubExpr(Node n) {
+        if (n == null || IsTrivialLhs(n)) { return n; }
+        ExprVal v = GenExpr(n);
+        string tname = "__zca_" + locName.Count;
+        string reg = AddLocal(tname, v.ty);
+        string lt = MapType(v.ty);
+        L("  " + reg + " = alloca " + lt);
+        string sv = Coerce(v, lt);
+        L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
+        if (ArcManaged(v.ty)) { EmitArcRetain(sv, v.ty); }
+        Node id = new Node(AK.Ident());
+        id.sval = tname;
+        id.type = v.ty;
+        id.line = n.line;
+        id.col = n.col;
+        return id;
+    }
+
+    void HoistCompoundSpine(Node lhs) {
+        if (lhs == null) { return; }
+        if (lhs.kind == AK.Index()) {
+            lhs.a = HoistSubExpr(lhs.a);
+            lhs.b = HoistSubExpr(lhs.b);
+        } else if (lhs.kind == AK.MemberAccess()) {
+            lhs.a = HoistSubExpr(lhs.a);
+        }
+    }
+
     // ---- assignment ----
     ExprVal GenAssign(Node e) {
         ExprVal rhs;
@@ -18,6 +58,7 @@ partial class Irgen {
             StoreTo(e.a, rhs);
             return rhs;
         }
+        HoistCompoundSpine(e.a);
         // "a ??= b" lowers to "a = (a ?? b)" reusing the ARC-safe ?? codegen.
         if (e.op == TK.QQEq()) {
             Node q = new Node(AK.Binary());
@@ -640,7 +681,7 @@ partial class Irgen {
             L("  store i8* " + sv + ", i8** " + p);
             return;
         }
-        string ft = MapType(fty);
+        string ft = cls != null && cls.kind == AK.StructDecl() ? MapFieldType(fty) : MapType(fty);
         ExprVal src = StrSlotConv(fty, v);
         src = NarrowToDeclared(src, fty);
         if (WeakTy(fty) && ft.EndsWith("*")) {
@@ -901,6 +942,7 @@ partial class Irgen {
         while (i < n) {
             ExprVal ev = GenExpr(e.kids[i]);
             tty.Add(ev.ty);
+            if (ArcManaged(ev.ty)) { EmitArcRetain(ev.op, ev.ty); }
             string slot = NT();
             L("  " + slot + " = getelementptr i64, i64* " + p + ", i64 " + i);
             L("  store i64 " + ToSlot(ev, ev.ty) + ", i64* " + slot);

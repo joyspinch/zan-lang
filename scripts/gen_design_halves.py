@@ -277,7 +277,7 @@ def registry_lines(refs, designed):
                            open(cf, encoding='utf-8').read(), re.M)
             ns = ns.group(1) if ns else ''
         full = ns + '.' + k if ns else k
-        lines.append('        HeavyControls.Register("%s", (string k) => new %s());'
+        lines.append('        ControlFactory.Register("%s", (string k) => new %s());'
                      % (k, full))
     return lines
 

@@ -232,6 +232,18 @@ public partial class Checker {
         return binder.FindExtension(tyName, name, owner) != null;
     }
 
+    bool AcceptsExtArgc(string tyName, string name, int argc) {
+        List<Node> extMs = new List<Node>();
+        List<string> extOwners = new List<string>();
+        binder.FindExtensionAll(tyName, name, extMs, extOwners);
+        int i = 0;
+        while (i < extMs.Count) {
+            if (AcceptsArgcOf(extMs[i], argc)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
     // The user class/struct declaration a type refers to, or null.
     Node ClassOf(Node t) {
         if (t == null) { return null; }
@@ -571,6 +583,24 @@ public partial class Checker {
         return false;
     }
 
+    bool IsOpenGenericScope() {
+        if (curClass != null) {
+            int i = 0;
+            while (i < curClass.kids.Count) {
+                if (curClass.kids[i].kind == AK.TypeParam()) { return true; }
+                i = i + 1;
+            }
+        }
+        if (curMethodNode != null) {
+            int j = 0;
+            while (j < curMethodNode.kids.Count) {
+                if (curMethodNode.kids[j].kind == AK.TypeParam()) { return true; }
+                j = j + 1;
+            }
+        }
+        return false;
+    }
+
     // ---- overload arity ----
     // The overload of `name` a call reaches. The candidates are the whole
     // class chain; the C host resolves an overload by the argument types
@@ -595,32 +625,6 @@ public partial class Checker {
             cg4 = cg4 + 1;
             if (cg4 > 512) { c = null; }
         }
-        if (cands.Count == 0 && cls.interfaces != null) {
-            int ii = 0;
-            while (ii < cls.interfaces.Count) {
-                string iname = cls.interfaces[ii];
-                int ilt = iname.IndexOf("<");
-                string baseIf = ilt > 0 ? iname.Substring(0, ilt) : iname;
-                Node iface = binder.FindType(baseIf);
-                if (iface != null) {
-                    Node im = MethodUpCall(iface, name, call);
-                    if (im != null) { return im; }
-                }
-                ii = ii + 1;
-            }
-        }
-        if (cands.Count == 0) {
-            List<Node> extMs = new List<Node>();
-            List<string> extOwners = new List<string>();
-            binder.FindExtensionAll(cls.sval, name, extMs, extOwners);
-            int ei = 0;
-            while (ei < extMs.Count) {
-                cands.Add(extMs[ei]);
-                ei = ei + 1;
-            }
-        }
-        if (cands.Count == 0) { return null; }
-        if (cands.Count == 1) { return cands[0]; }
         int argc = 0;
         if (call != null) { argc = call.kids.Count; }
         List<Node> fit = new List<Node>();
@@ -629,17 +633,54 @@ public partial class Checker {
             if (AcceptsArgcOf(cands[i], argc)) { fit.Add(cands[i]); }
             i = i + 1;
         }
-        if (fit.Count == 0) { return cands[0]; }
-        if (fit.Count == 1) { return fit[0]; }
-        Node pick = fit[0];
-        int best = CallScore(fit[0], call);
-        i = 1;
-        while (i < fit.Count) {
-            int s = CallScore(fit[i], call);
-            if (s > best) { best = s; pick = fit[i]; }
-            i = i + 1;
+        if (fit.Count > 0) {
+            if (fit.Count == 1) { return fit[0]; }
+            Node pick = fit[0];
+            int best = CallScore(fit[0], call);
+            i = 1;
+            while (i < fit.Count) {
+                int s = CallScore(fit[i], call);
+                if (s > best) { best = s; pick = fit[i]; }
+                i = i + 1;
+            }
+            return pick;
         }
-        return pick;
+        if (cls.interfaces != null) {
+            int ii = 0;
+            while (ii < cls.interfaces.Count) {
+                string iname = cls.interfaces[ii];
+                int ilt = iname.IndexOf("<");
+                string baseIf = ilt > 0 ? iname.Substring(0, ilt) : iname;
+                Node iface = binder.FindType(baseIf);
+                if (iface != null) {
+                    Node im = MethodUpCall(iface, name, call);
+                    if (im != null && AcceptsArgcOf(im, argc)) { return im; }
+                }
+                ii = ii + 1;
+            }
+        }
+        List<Node> extMs = new List<Node>();
+        List<string> extOwners = new List<string>();
+        binder.FindExtensionAll(cls.sval, name, extMs, extOwners);
+        int ei = 0;
+        while (ei < extMs.Count) {
+            if (AcceptsArgcOf(extMs[ei], argc)) { fit.Add(extMs[ei]); }
+            ei = ei + 1;
+        }
+        if (fit.Count > 0) {
+            if (fit.Count == 1) { return fit[0]; }
+            Node pick = fit[0];
+            int best = CallScore(fit[0], call);
+            int k = 1;
+            while (k < fit.Count) {
+                int s = CallScore(fit[k], call);
+                if (s > best) { best = s; pick = fit[k]; }
+                k = k + 1;
+            }
+            return pick;
+        }
+        if (cands.Count > 0) { return cands[0]; }
+        return null;
     }
     // How well the candidate's parameter types match the call's arguments:
     // +4 for an exact type match, -1 for a known mismatch (an implicit
@@ -709,8 +750,14 @@ public partial class Checker {
             }
             j = j + 1;
         }
+        if (m.ival == 1) {
+            tot = tot - 1;
+            req = req - 1;
+            if (req < 0) { req = 0; }
+        }
         if (argc >= req && argc <= tot) { return true; }
         if (lastP != null && lastP.op == 1 && argc >= req - 1) { return true; }
+        if ((m.mods & MOD.Variadic()) != 0 && argc >= req) { return true; }
         return false;
     }
     // True if some method named `name` (up the base chain) can accept `argc`
@@ -739,6 +786,7 @@ public partial class Checker {
                     if (argc >= req && argc <= tot) { return true; }
                     // `params T[]` tail accepts any argc >= fixed params
                     if (lastP != null && lastP.op == 1 && argc >= req - 1) { return true; }
+                    if ((m.mods & MOD.Variadic()) != 0 && argc >= req) { return true; }
                 }
                 i = i + 1;
             }

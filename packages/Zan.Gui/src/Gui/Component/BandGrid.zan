@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using Gui;
+using Gui.Widget;
 
 namespace Gui.Component;
 
@@ -10,8 +12,7 @@ public delegate int BandGridColorOf(int row, int col, string text, int num);
 // BandGrid：带分组表头的通用单元格网格（DevExpress BandedGrid
 // 的轻量等位）。每格一个显示文本 + 一个可选数值；支持单元格级
 // 着色回调、格内数据条、点选 / 拖选矩形 / 右键 / 双击，选中格
-// 可批量赋值。即时模式自绘（GraphView 同款 RegisterRect +
-// ClickTarget 协议），数据变更后调 Poke()。
+// 可批量赋值。结合 CSS Grid 列轨与 VirtualList 视口行复用，数据变更后调 Poke()。
 // 用法：
 // .ColorOf(MyColorOf);
 // g.SetNum(r, c, 100);            // 逐格赋值（数值+文本）
@@ -39,6 +40,8 @@ public class BandGrid : Control {
     private int accent;
     private int heatDeep;
     private App lastApp;
+    private ScrollView scroll;
+    private Rect viewportArea;
     public UiEvent Changed;
     public UiEvent Context;
     public UiEvent CellActivate;
@@ -69,6 +72,8 @@ public class BandGrid : Control {
         // bandgrid::accent / 主题主色解析覆盖；无 App 独立测试时兜底。
         accent = 0;
         lastApp = null;
+        scroll = new ScrollView();
+        viewportArea = new Rect(0, 0, 0, 0);
         Changed = new UiEvent();
         Context = new UiEvent();
         CellActivate = new UiEvent();
@@ -287,19 +292,42 @@ public class BandGrid : Control {
         return ps;
     }
 
+    // 属性协议（动态宿主与范式二绑定）
+    public override string GetProp(string name) {
+        if (name == "bandSpan") { return Convert.ToString(bandSpan); }
+        if (name == "cellW") { return Convert.ToString(cellW); }
+        if (name == "cellH") { return Convert.ToString(cellH); }
+        if (name == "barMax") { return Convert.ToString(barMax); }
+        if (name == "accent") { return Convert.ToString(accent); }
+        return base.GetProp(name);
+    }
+
+    public override void SetProp(string name, string val) {
+        if (name == "bandSpan") { bandSpan = Convert.ToInt32(val); return; }
+        if (name == "cellW") { cellW = Convert.ToInt32(val); return; }
+        if (name == "cellH") { cellH = Convert.ToInt32(val); return; }
+        if (name == "barMax") { barMax = Convert.ToInt32(val); return; }
+        if (name == "accent") { accent = Convert.ToInt32(val); return; }
+        base.SetProp(name, val);
+    }
+
     public override void OnPaint(App app) {
         lastApp = app;
         if (rows <= 0 || cols <= 0 || cells.Count < rows * cols) {
             return;
         }
         Canvas c = app.canvas;
+        int labW = this.LabelW(app);
         int cw = app.Scale(cellW);
+        // 弹性网格列宽：cellW <= 0 时自适应可用空间均分
+        if (cellW <= 0 && cols > 0 && bw > labW) {
+            cw = (bw - labW) / cols;
+            if (cw < app.Scale(8)) { cw = app.Scale(8); }
+        }
         int ch = app.Scale(cellH);
         int fs = app.Scale(11);
-        int labW = this.LabelW(app);
         int bandH = this.BandH(app);
         int ox = bx + labW;
-        int oy = by + bandH;
 
         StyleBox head = Style.Part(app, "bandgrid", "head", "panel",
                                    "", "", Style.SNormal());
@@ -307,63 +335,78 @@ public class BandGrid : Control {
                                    "", "", Style.SNormal());
         int headBg = head.BgOr(0);
         int bodyBg = body.BgOr(0);
-        // 0 = 未声明/透明，回退主题文本色而不是画黑字
-        // （head 默认继承 panel 族，CSS 未声明 color 时 FgOr 是 0）。
         int fg = head.FgOr(0);
         if (fg == 0) { fg = body.FgOr(0); }
         if (fg == 0) { fg = app.theme.textPrimary; }
-        // 表头底色同理：panel 族在透明主题下可能给出带 alpha 的
-        // 表面色，直接垫身底；全 0 才用身底兜底。
-        if (headBg == 0) { headBg = bodyBg; }
-        // 选中框/数据条主色：未显式指定（accent == 0）时随主题主色，
-        // 与 datatable::accent 同一套 token。显式 Accent(...) 优先。
+        if (headBg == 0) { headBg = bodyBg != 0 ? bodyBg : app.theme.bgTertiary; }
+        if (bodyBg == 0) { bodyBg = app.theme.bgPrimary; }
         if (accent == 0) {
             int themed = Style.Part(app, "bandgrid", "accent", "panel",
                                     "", "", Style.SNormal()).BgOr(0);
             accent = themed != 0 ? themed : app.theme.primary;
         }
-        // 热力梯度浅端：每帧从本帧表面色向锚色混 16%，随皮肤
-        // 表面走（亮色皮肤 ≈ 声明锚色对的粉彩浅端，暗色皮肤
-        // 得暗色调）。colorOf 显式回调优先，热力带不生效。
         int heatLo = 0;
         if (heatDeep != 0 && colorOf == null) {
             heatLo = App.LerpColor(bodyBg, heatDeep, 160);
         }
 
         c.FillRect(bx, by, bw, bh, bodyBg);
-        int i;
-        for (i = 0; i < bandLabels.Count; i = i + 1) {
-            int x0 = ox + i * bandSpan * cw;
-            c.FillRect(x0, by, bandSpan * cw, bandH, headBg);
-            c.DrawTextCentered(x0, by, bandSpan * cw, bandH,
-                               bandLabels[i], fg, fs);
+
+        // 顶部分组表头（固定在顶部，不随内容纵向滚动）
+        if (bandH > 0) {
+            c.FillRect(bx, by, labW, bandH, headBg);
+            for (int i = 0; i < bandLabels.Count; i = i + 1) {
+                int x0 = ox + i * bandSpan * cw;
+                int spanW = bandSpan * cw;
+                c.FillRect(x0, by, spanW, bandH, headBg);
+                c.DrawTextCentered(x0, by, spanW, bandH,
+                                   bandLabels[i], fg, fs);
+            }
+            c.DrawLine(bx, by + bandH - 1, bx + bw, by + bandH - 1, app.theme.divider, 1);
         }
-        int r;
-        for (r = 0; r < rows; r = r + 1) {
-            int y0 = oy + r * ch;
+
+        // 视口与行虚拟化（VirtualList 视口复用范式）
+        int viewX = bx;
+        int viewY = by + bandH;
+        int viewW = bw;
+        int viewH = bh - bandH;
+        if (viewH <= 0) { return; }
+
+        int totalH = rows * ch;
+        viewportArea.x = viewX;
+        viewportArea.y = viewY;
+        viewportArea.width = viewW;
+        viewportArea.height = viewH;
+
+        int scrollY = scroll.Begin(app, viewportArea, totalH);
+
+        int r0 = scrollY / ch;
+        if (r0 < 0) { r0 = 0; }
+        int r1 = (scrollY + viewH) / ch + 1;
+        if (r1 > rows) { r1 = rows; }
+
+        bool showText = cw >= app.Scale(22);
+        hoverR = 0 - 1;
+        hoverC = 0 - 1;
+
+        for (int r = r0; r < r1; r = r + 1) {
+            int y0 = viewY + r * ch - scrollY;
+            // 行首标签
             c.FillRect(bx, y0, labW, ch, headBg);
             if (r < rowLabels.Count) {
                 c.DrawTextCentered(bx, y0, labW, ch, rowLabels[r], fg, fs);
             }
-        }
 
-        // 格内文本只在格子足够宽时画（窄格以色阶/数据条表达）。
-        bool showText = cw >= app.Scale(22);
-        hoverR = 0 - 1;
-        hoverC = 0 - 1;
-        for (r = 0; r < rows; r = r + 1) {
+            // 行内单元格
             for (int k = 0; k < cols; k = k + 1) {
                 int idx = r * cols + k;
                 int x0 = ox + k * cw;
-                int y0 = oy + r * ch;
                 int id = app.focus.AllocId();
                 app.hitTester.RegisterRect(id, x0, y0, cw, ch, 0);
 
                 int colBg = bodyBg;
                 if (colorOf != null) {
                     colBg = colorOf(r, k, cells[idx].text, cells[idx].num);
-                    // 契约：0 = 用默认底色。0 直接 FillRect 是透明
-                    // 无操作，格底会露出父层（热力图零值格透白）。
                     if (colBg == 0) { colBg = bodyBg; }
                 } else if (heatDeep != 0) {
                     int hv = cells[idx].num;
@@ -372,7 +415,7 @@ public class BandGrid : Control {
                         colBg = App.LerpColor(heatLo, heatDeep, hv * 200);
                     }
                 }
-                // 留 1px 缝出网格感。
+
                 c.FillRect(x0, y0, cw - 1, ch - 1, colBg);
                 int nv = cells[idx].num;
                 if (nv > 0 && barMax > 0) {
@@ -428,15 +471,17 @@ public class BandGrid : Control {
             }
         }
 
+        scroll.End(app, viewportArea);
+
         if (anchorR >= 0) {
             if (app.PointerPressed() && hoverR >= 0) {
-                int r0 = anchorR < hoverR ? anchorR : hoverR;
-                int r1 = anchorR > hoverR ? anchorR : hoverR;
-                int c0 = anchorC < hoverC ? anchorC : hoverC;
-                int c1 = anchorC > hoverC ? anchorC : hoverC;
+                int r0Sel = anchorR < hoverR ? anchorR : hoverR;
+                int r1Sel = anchorR > hoverR ? anchorR : hoverR;
+                int c0Sel = anchorC < hoverC ? anchorC : hoverC;
+                int c1Sel = anchorC > hoverC ? anchorC : hoverC;
                 bool dirty = false;
-                for (int rr = r0; rr <= r1; rr = rr + 1) {
-                    for (int cc = c0; cc <= c1; cc = cc + 1) {
+                for (int rr = r0Sel; rr <= r1Sel; rr = rr + 1) {
+                    for (int cc = c0Sel; cc <= c1Sel; cc = cc + 1) {
                         int idx = rr * cols + cc;
                         int want = dragSet ? 1 : 0;
                         if (cells[idx].mark != want) {

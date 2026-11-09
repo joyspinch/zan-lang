@@ -79,7 +79,7 @@ full 2860 条，full ≈10.6 CPU·h；数字会漂移，现查 `ctest -N -L <tie
   金样/诊断，有同名测试用例就**单跑该用例**（`ctest -R "^case_<name>$"`，秒级）。
 - **命中面预算（机检）**：定向跑一次 ≤ 80 条——`scripts/test.ps1` 对任何档位先
   `ctest -N` 数命中，超了直接拒绝并给收窄提示；smoke 裸跑（≈428 条）同样被拒。
-  收窄用 `tools\agent\verify.ps1 -Paths <改动文件>`：stdlib/packages/examples 按
+  收窄用 `tools\agent\verify.ps1 -Paths <改动文件>`：stdlib/、packages/、examples/ 按
   **import 依赖**现推最小命中面（旧映射 `^conformance_` 一次命中 1181 条，且根本
   匹配不到 `tests/conformance` 生成的 `case_*`，双重错误，已废）。
 - **单跑用锚定正则**：`ctest -R "^case_<name>$"`。不锚定会误中

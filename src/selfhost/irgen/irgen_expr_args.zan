@@ -138,9 +138,22 @@ partial class Irgen {
             return "null";
         }
         if (place.kind == AK.MemberAccess()) {
+            if (place.a != null && place.a.kind == AK.Ident() && LocalIdx(place.a.sval) < 0) {
+                Node tc = binder.FindType(place.a.sval);
+                if (tc != null && FindStaticField(tc, place.sval) != null) {
+                    string sown = StaticFieldOwner(tc, place.sval);
+                    string gv = StaticGlobal(sown, place.sval, CurInstFor(sown));
+                    if (lt != "i64") {
+                        string cast = NT();
+                        L("  " + cast + " = bitcast i64* " + gv + " to " + lt + "*");
+                        return cast;
+                    }
+                    return gv;
+                }
+            }
             // obj.field: the address of the field itself
             ExprVal obj = GenExpr(place.a);
-            string cn = obj.ty.sval;
+            string cn = obj.ty != null ? obj.ty.sval : "";
             Node ocls = binder.FindType(cn);
             if (ocls == null || FieldIndex(ocls, place.sval) < 0) {
                 diags.Error("[E3049] ref/out argument must be a variable, a field, or an element", place.line, place.col);
@@ -150,12 +163,28 @@ partial class Irgen {
             return FieldPlacePtr(obj.op, cn, place.sval, fty, lt);
         }
         if (place.kind == AK.Index()) {
-            // arr[i]: the address of the element.
+            // arr[i] / lst[i]: the address of the element.
             ExprVal obj = GenExpr(place.a);
             ExprVal idx = GenExpr(place.b);
+            if (obj.ty != null && IsListType(obj.ty)) {
+                string lp = NT();
+                L("  " + lp + " = bitcast i8* " + obj.op + " to %zlist*");
+                string dp = NT();
+                L("  " + dp + " = getelementptr %zlist, %zlist* " + lp + ", i32 0, i32 2");
+                string data = NT();
+                L("  " + data + " = load i64*, i64** " + dp);
+                string ep = NT();
+                L("  " + ep + " = getelementptr i64, i64* " + data + ", i64 " + idx.op);
+                if (lt != "i64") {
+                    string cast = NT();
+                    L("  " + cast + " = bitcast i64* " + ep + " to " + lt + "*");
+                    return cast;
+                }
+                return ep;
+            }
             Node et = ArrayElemType(obj.ty);
             if (et == null) {
-                diags.Error("ref/out argument must be a variable, a field, or an element", place.line, place.col);
+                diags.Error("[E3049] ref/out argument must be a variable, a field, or an element", place.line, place.col);
                 return "null";
             }
             if (IsByteArr(obj.ty)) {
@@ -167,6 +196,11 @@ partial class Irgen {
             }
             string p2 = NT();
             L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
+            if (lt != "i64") {
+                string cast = NT();
+                L("  " + cast + " = bitcast i64* " + p2 + " to " + lt + "*");
+                return cast;
+            }
             return p2;
         }
         diags.Error("ref/out argument must be a variable, a field, or an element", place.line, place.col);
@@ -461,6 +495,9 @@ partial class Irgen {
             }
         }
         if (e.kids.Count > np) {
+            if ((m.mods & MOD.Variadic()) != 0) {
+                return e.kids;
+            }
             diags.Error("too many arguments to '" + m.sval + "' (expected "
                 + np + ", got " + e.kids.Count + ")", e.line, e.col);
         }
@@ -486,7 +523,13 @@ partial class Irgen {
         int k = 0;
         while (k < np) {
             if (slots[k] == null) {
-                if (pdefault[k] != null) { slots[k] = pdefault[k]; }
+                if (k == np - 1 && lastParam != null && lastParam.op == 1) {
+                    Node packed = new Node(AK.NewExpr());
+                    packed.ival = 1;
+                    packed.type = lastParam.type;
+                    packed.line = e.line; packed.col = e.col;
+                    slots[k] = packed;
+                } else if (pdefault[k] != null) { slots[k] = pdefault[k]; }
                 else {
                     diags.Error("missing required argument for parameter '"
                         + pnames[k] + "' of '" + m.sval + "'", e.line, e.col);
@@ -576,6 +619,24 @@ partial class Irgen {
         bool freeArgIsStr = false;
         int i = 0;
         while (i < aargs.Count) {
+            if (m != null && (m.mods & MOD.Variadic()) != 0 && i >= MethodParamCount(m)) {
+                ExprVal av = GenExpr(aargs[i]);
+                if (i > 0) { args = args + ", "; }
+                string vllty = MapType(av.ty);
+                if (IsStr(av.ty)) {
+                    args = args + "i8* " + CallArg(av, av.ty, true);
+                } else if (vllty == "double") {
+                    args = args + "double " + av.op;
+                } else if (vllty == "float") {
+                    string ext = NT();
+                    L("  " + ext + " = fpext float " + av.op + " to double");
+                    args = args + "double " + ext;
+                } else {
+                    args = args + "i64 " + av.op;
+                }
+                i = i + 1;
+                continue;
+            }
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
             if (spec) { pty = SubstTP(pty, stns, strs); }
             if (m != null && IsRefParam(m, i) && aargs[i] != null
@@ -606,8 +667,31 @@ partial class Irgen {
             }
             i = i + 1;
         }
-        if (rt == "void") {
-            L("  call void @" + sym + "(" + args + ")");
+        bool isVariadic = (m != null && (m.mods & MOD.Variadic()) != 0);
+        string callFnTy = "";
+        string crt = rt;
+        if (isVariadic) {
+            crt = MapFieldType(m.type);
+            string fparams = "";
+            int pi = 0;
+            while (pi < m.kids.Count) {
+                Node p = m.kids[pi];
+                if (p.kind == AK.Param()) {
+                    if (fparams.Length > 0) { fparams = fparams + ", "; }
+                    fparams = fparams + MapFieldType(p.type);
+                }
+                pi = pi + 1;
+            }
+            if (fparams.Length > 0) { fparams = fparams + ", "; }
+            fparams = fparams + "...";
+            callFnTy = crt + " (" + fparams + ")";
+        }
+        if (crt == "void") {
+            if (callFnTy.Length > 0) {
+                L("  call " + callFnTy + " @" + sym + "(" + args + ")");
+            } else {
+                L("  call void @" + sym + "(" + args + ")");
+            }
             // C `free(s)` consumes the string: null out the freed lvalue so
             // ARC never touches the dangling pointer again
             if (m != null && HasMod(m, MOD.Extern()) && ExternName(m) == "free"
@@ -618,7 +702,30 @@ partial class Irgen {
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+        if (callFnTy.Length > 0) {
+            L("  " + t + " = call " + callFnTy + " @" + sym + "(" + args + ")");
+            if (crt == "i32") {
+                string ext = NT();
+                L("  " + ext + " = sext i32 " + t + " to i64");
+                t = ext;
+            } else if (crt == "i16") {
+                string ext = NT();
+                L("  " + ext + " = sext i16 " + t + " to i64");
+                t = ext;
+            } else if (crt == "i8") {
+                string ext = NT();
+                L("  " + ext + " = sext i8 " + t + " to i64");
+                t = ext;
+            }
+        } else {
+            if (m != null && HasMod(m, MOD.Extern()) && (sym == "calloc" || sym == "malloc" || sym == "realloc") && rt == "i64") {
+                string rawP = NT();
+                L("  " + rawP + " = call i8* @" + sym + "(" + args + ")");
+                L("  " + t + " = ptrtoint i8* " + rawP + " to i64");
+            } else {
+                L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+            }
+        }
         if (m != null && HasMod(m, MOD.Extern()) && IsStr(m.type)) {
             // an extern hands back a plain C string: wrap it into the managed
             // layout so its length is exact
@@ -675,6 +782,17 @@ partial class Irgen {
             if (np - 1 == e.kids.Count) { score = 100; }
             score = score + MatchTypeScore(ParamTypeNode(m, 0), recvTy, TParams(m));
             score = score + LambdaArgScore(m, recvTy, e);
+            int a = 0;
+            while (a < e.kids.Count) {
+                Node arg = e.kids[a];
+                if (arg != null && arg.kind != AK.Lambda()) {
+                    Node aty = ArgTypeNode(arg);
+                    if (aty != null) {
+                        score = score + MatchTypeScore(ParamTypeNode(m, a + 1), aty, TParams(m));
+                    }
+                }
+                a = a + 1;
+            }
             if (score > bestScore) { bestScore = score; best = i; }
             i = i + 1;
         }

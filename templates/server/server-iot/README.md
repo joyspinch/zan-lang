@@ -11,57 +11,66 @@ The template holds config, the `[mqtt]` config shim, controllers and views.
 
 ## Features
 
-- **MQTT 3.1.1 broker** (`System.Net.Mqtt`): CONNECT/CONNACK, PUBLISH (QoS 0 & 1),
-  SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT.
+- **MQTT 3.1.1 broker** (`System.Net.Mqtt`): CONNECT/CONNACK, PUBLISH (QoS 0/1/2),
+  SUBSCRIBE/SUBACK (支持 QoS 0/1/2), UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT.
 - **Topic routing** with `+` (single-level) and `#` (multi-level) wildcards.
+- **Retained messages (保留消息)**: 自动保存/替换最新主题状态，磁盘 WAL 恢复，后台可视化列表与一键清除。
 - **Client / device management**: live session registry (client id, address,
   keepalive, per-client in/out counters), force-disconnect (kick).
-- **Subscription & topic management**: enumerate every subscription and every
-  topic seen, with last payload + message counts.
-- **Publish API**: inject a message onto any topic from the console (fans out to
-  all matching subscribers).
-- **Performance monitoring** (`/admin/stats`, `/iot/metrics`): uptime, connected
-  vs. cumulative clients, subscription/topic counts, message + byte throughput,
-  and the full HTTP runtime metrics snapshot.
-- **Attribute-driven routes** (`[HttpGet]`/`[HttpPost]`/`[Route]`/
-  `[Custom(Authorization = ...)]`/`[Lock]`/`[Description]`) generated into
-  `__AttrRoutes` at compile time — same convention as the Zan.Mvc package.
+- **Rule & Webhook forwarding (异步数据流转)**: 非阻塞异步 HTTP POST 转发、主题规则过滤 (`#` / `+`)、签名校验与最近 20 条投递审计日志。
+- **Zan.Mvc Admin 后台系统**: 深度继承 `AdminController` 体系，支持侧边栏菜单、多标签页 (Tabs)、RBAC 权限守卫与深色科技风格看板。
+- **Publish API & 在线测试台**: 支持从控制台指定 QoS (0/1/2) 和 Retain 标记注入消息，实时事件日志流。
+- **Performance monitoring** (`/admin/stats`, `/iot/metrics`, `/iot/webhook/stats`): 吞吐量、连接数、订阅数、Webhook 成功率等。
 
 ## Layout
 
 ```
-config/app.json            server/mqtt/auth/database settings (edit, no recompile)
-views/Home/HomeController.Index.html   dashboard (polls the /iot/ JSON APIs)
-src/main.zan               package wiring + Worker("mqtt") + Worker("http"), Worker.RunAll
-src/controller/            HTTP actions (Iot / Auth / Home), package ApiController base
-src/Framework/MqttCfg.zan  template-only [mqtt] config section over package Cfg
+config/app.json                         server/mqtt/webhook/auth/database settings
+views/Admin/IotAdminController.*.html   Zan.Mvc 企业级后台视图 (Index, Clients, Retained, Webhooks, Console)
+src/main.zan                            Worker("mqtt") + Worker("http"), MqttWebhook 注入
+src/Framework/MqttCfg.zan               配置加载器 (包含 [mqtt] 与 [webhook] 节)
+src/Framework/MqttWebhook.zan           非阻塞异步 Webhook 数据转发与审计引擎
+src/controller/Admin/IotAdminController.zan  Zan.Mvc 后台管理控制器 (带侧边栏与权限)
+src/controller/IotController.zan        REST API (clients, kick, retained, webhook, publish)
 ```
 
 ## Build & run
 
 ```
-# 1. compile everything
+# 1. 编译全部源码
 zanc (all src/**/*.zan) --auto-stdlib -o app.exe
 
-# 2. run — MQTT on :1883, console on http://127.0.0.1:8080
+# 2. 启动服务 — MQTT 监听 :1883，管理后台监听 http://127.0.0.1:8080
 app.exe
 ```
 
-## HTTP API
+## Management UI & HTTP API
+
+### 管理后台页面 (基于 Zan.Mvc AdminController)
+- `/admin/iot`：IoT 核心指标看板与快速发布大屏
+- `/admin/iot/clients`：在线客户端连接与一键强制下线 (Kick)
+- `/admin/iot/retained`：保留消息列表查看与一键清除
+- `/admin/iot/webhooks`：规则与 Webhook 转发状态及实时审计流水
+- `/admin/iot/console`：在线调试控制台 (支持 QoS 0/1/2 与 Retain)
+
+### 核心 REST API
 
 | Method & path                 | Auth      | Purpose                          |
 |-------------------------------|-----------|----------------------------------|
-| `GET  /`                      | —         | dashboard                        |
-| `GET  /health`                | —         | liveness probe (`?deep=1` adds a database roundtrip; the broker itself does not depend on the database) |
-| `GET  /iot/clients`           | —         | connected clients                |
-| `GET  /iot/clients/{id}`      | —         | one client + its subscriptions   |
-| `POST /iot/clients/{id}/kick` | login     | force-disconnect (global lock)   |
-| `GET  /iot/subscriptions`     | —         | all subscriptions                |
-| `GET  /iot/topics`            | —         | all topics + last payload        |
-| `GET  /iot/metrics`           | —         | broker performance snapshot      |
-| `POST /iot/publish`           | login     | inject a message (`topic`,`payload`) |
-| `GET  /admin/stats`           | login     | broker + HTTP metrics            |
-| `POST /auth/login`            | —         | `admin` / `[auth].bootstrapPassword` (default `admin-bootstrap-2026`) → session cookie + bearer token |
+| `GET  /`                      | —         | 重定向至 `/admin/iot` (自动引导登录) |
+| `GET  /iot/clients`           | —         | 获取在线客户端列表               |
+| `GET  /iot/clients/{id}`      | —         | 获取指定客户端详情与订阅         |
+| `POST /iot/clients/{id}/kick` | login     | 强制客户端下线 (断开连接)        |
+| `GET  /iot/subscriptions`     | —         | 全局订阅关系列表                 |
+| `GET  /iot/topics`            | —         | 主题列表与最新一条 payload       |
+| `GET  /iot/metrics`           | —         | Broker 核心指标快照              |
+| `GET  /iot/retained`          | —         | 当前生效的保留消息列表           |
+| `POST /iot/retained/clear`    | login     | 清除指定主题 (或全部) 保留消息   |
+| `GET  /iot/webhook/stats`     | —         | Webhook 运行指标与最近审计日志   |
+| `POST /iot/webhook/mock`      | —         | 本地 Webhook 接收桩 (开箱即用)   |
+| `POST /iot/publish`           | login     | 注入消息 (`topic`, `payload`, `qos`, `retain`) |
+| `GET  /admin/stats`           | login     | Broker + HTTP 双重运行期指标     |
+| `POST /auth/login`            | —         | 管理员认证鉴权获取 Token         |
 
 Read frontend params through `this.In(...)` / `this.InRaw(...)` on the package
 controller base; JSON API replies use the package envelope `{"code":0,"msg","data","traceId"}`.

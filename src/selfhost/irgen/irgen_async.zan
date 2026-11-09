@@ -46,11 +46,8 @@ partial class Irgen {
         // the host awaits nothing and hands the value on.
         if (!sub.asyncCall) {
             if (sub.ty != null && sub.ty.sval == "Task") {
-                ExprVal r = EmitAwaitTaskHandle(sub);
-                EmitAwaitNoSuspend();
-                return r;
+                return EmitAwaitTaskHandle(sub);
             }
-            EmitAwaitNoSuspend();
             return sub;
         }
         Node resTy = MkType("int");
@@ -73,7 +70,7 @@ partial class Irgen {
         if (curAsync) {
             int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
             int st = seq + 1;
-            string ssp = FrameGep("%ff", curSubBase + seq);
+            string ssp = FrameGep("%ff", curSubBase);
             string subi = NT(); L("  " + subi + " = ptrtoint i8* " + subv + " to i64");
             L("  store i64 " + subi + ", i64* " + ssp);
             string selfi = NT(); L("  " + selfi + " = ptrtoint i8* %fp to i64");
@@ -92,7 +89,7 @@ partial class Irgen {
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
             EmitAsyncRearm();
-            string ssp2 = FrameGep("%ff", curSubBase + seq);
+            string ssp2 = FrameGep("%ff", curSubBase);
             string subi2 = NT(); L("  " + subi2 + " = load i64, i64* " + ssp2);
             string subh2 = NT(); L("  " + subh2 + " = inttoptr i64 " + subi2 + " to i64*");
             string fv = NT(); L("  " + fv + " = inttoptr i64 " + subi2 + " to i8*");
@@ -146,22 +143,9 @@ partial class Irgen {
         EmitRaise();
         Label(lok);
     }
-    // An await that does NOT suspend: the awaited value is already there (the
-    // host awaits nothing and hands the value on) or the task handle was
-    // waited for synchronously. The async frame numbers its resume labels by
-    // the await points in the body, so the label has to exist even though
-    // nothing ever reaches it -- otherwise the frame's switch refers to a
-    // label nobody emitted ("use of undefined value '%resume_2'").
-    void EmitAwaitNoSuspend() {
-        if (!curAsync) { return; }
-        int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
-        int st = seq + 1;
-        // the label starts a new basic block: the block before it has to be
-        // terminated first (the suspending path ends with `ret void`)
-        if (!term) { L("  br label %resume_" + st + ";"); }
-        L("resume_" + st + ":");
-        term = false; curLbl = "resume_" + st;
-    }
+    // An await that does not suspend does not need a resume state: the value
+    // is already available synchronously and passes through directly.
+    void EmitAwaitNoSuspend() { }
 
     // `await <task handle>`: the handle is a frame pointer -- pump the
     // cooperative scheduler until the frame is done, then take its result
@@ -423,8 +407,9 @@ partial class Irgen {
         // inside the body. The frame is heap memory, so it survives the
         // suspension.
         int feCount = 0; if (m.d != null) { feCount = CountAsyncForeach(m.d); }
-        int nfields = subBase + awaitCount + feCount * 4;
-        asyncForeachBase = subBase + awaitCount;
+        int subSlots = 1;
+        int nfields = subBase + subSlots + feCount * 4;
+        asyncForeachBase = subBase + subSlots;
         asyncForeachNext = 0;
         if (m.d != null) { AssignAsyncForeachSlots(m.d); }
         usesAsync = true;
@@ -587,18 +572,18 @@ partial class Irgen {
         string cfc = NT();
         L("  " + cfc + " = icmp ne i64 " + cfl + ", 0");
         int lCancel = NL();
-        L("  br i1 " + cfc + ", label %L" + lCancel + ", label %co.go");
-        L("co.go:");
-        term = false; curLbl = "co.go";
-        string sw = "  switch i64 " + st + ", label %co.start [ i64 0, label %co.start";
-        int a2 = 1;
-        while (a2 <= awaitCount) { sw = sw + " i64 " + a2 + ", label %resume_" + a2; a2 = a2 + 1; }
-        L(sw + " ]");
+        L("  br i1 " + cfc + ", label %L" + lCancel + ", label %co.dispatch");
         L("co.start:");
         term = false; curLbl = "co.start";
         EmitAsyncReloadSlots();
         if (m.d != null) { GenStmt(m.d); }
         if (!term) { EmitAsyncEpilogue(); EmitAsyncComplete("0"); }
+        L("co.dispatch:");
+        term = false; curLbl = "co.dispatch";
+        string sw = "  switch i64 " + st + ", label %co.start [ i64 0, label %co.start";
+        int a2 = 1;
+        while (a2 <= curAwaitSeq) { sw = sw + " i64 " + a2 + ", label %resume_" + a2; a2 = a2 + 1; }
+        L(sw + " ]");
         // the trampoline's landing: the exception leaves the coroutine
         // through the frame -- the awaiter reads it and re-throws it in its
         // own context, where its own try blocks can catch it.

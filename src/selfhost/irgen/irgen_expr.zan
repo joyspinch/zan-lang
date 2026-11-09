@@ -38,6 +38,7 @@ partial class Irgen {
         if (k == AK.Lambda()) { return GenLambda(e); }
         if (k == AK.SwitchExpr()) { return GenSwitchExpr(e); }
         if (k == AK.Conditional()) { return GenConditional(e); }
+        if (k == AK.WithExpr()) { return GenWithExpr(e); }
         if (k == AK.TupleExpr()) { return GenTuple(e); }
         if (k == AK.IsExpr()) { return GenIs(e); }
         if (k == AK.MemberAccess()) {
@@ -54,6 +55,71 @@ partial class Irgen {
             return GenExpr(e.a);
         }
         return new ExprVal("0", MkType("int"));
+    }
+
+    ExprVal GenWithExpr(Node e) {
+        ExprVal recv = GenExpr(e.a);
+        if (recv == null || recv.ty == null) { return new ExprVal("null", MkType("object")); }
+        Node cls = binder.FindType(recv.ty.sval);
+        if (cls == null) { return recv; }
+        bool hasUnoverridden = false;
+        int fi0 = 0;
+        while (fi0 < cls.kids.Count) {
+            Node m = cls.kids[fi0];
+            if (m.kind == AK.FieldDecl()) {
+                bool found = false;
+                int ai = 0;
+                while (ai < e.kids.Count) {
+                    Node asg = e.kids[ai];
+                    if (asg != null && asg.a != null && asg.a.sval == m.sval) {
+                        found = true;
+                        break;
+                    }
+                    ai = ai + 1;
+                }
+                if (!found) { hasUnoverridden = true; break; }
+            }
+            fi0 = fi0 + 1;
+        }
+        Node recvNode = e.a;
+        if (hasUnoverridden && e.a.kind != AK.Ident()) {
+            string tmp = AddLocal("__with_recv", recv.ty);
+            string rll = MapType(recv.ty);
+            EA(tmp, rll);
+            if (ArcManaged(recv.ty)) { EmitArcRetain(recv.op, recv.ty); }
+            L("  store " + rll + " " + recv.op + ", " + rll + "* " + tmp);
+            recvNode = new Node(AK.Ident());
+            recvNode.sval = "__with_recv";
+            recvNode.type = recv.ty;
+        }
+        Node call = new Node(AK.Call());
+        call.kids = new List<Node>();
+        int fi = 0;
+        while (fi < cls.kids.Count) {
+            Node m = cls.kids[fi];
+            if (m.kind == AK.FieldDecl()) {
+                Node arg = null;
+                int ai = 0;
+                while (ai < e.kids.Count) {
+                    Node asg = e.kids[ai];
+                    if (asg != null && asg.a != null && asg.a.sval == m.sval) {
+                        arg = asg.b;
+                        break;
+                    }
+                    ai = ai + 1;
+                }
+                if (arg == null) {
+                    Node ma = new Node(AK.MemberAccess());
+                    ma.a = recvNode;
+                    ma.sval = m.sval;
+                    ma.type = m.type;
+                    arg = ma;
+                }
+                call.kids.Add(arg);
+            }
+            fi = fi + 1;
+        }
+        return EmitInstanceCall(recv, cls.sval, "__CloneWith", call);
     }
 
     // The receiver's static type in the method being emitted: the concrete
@@ -161,11 +227,22 @@ partial class Irgen {
         // `List<double>`): the storage keeps the erased shape, the VALUE
         // gets its real type back
         Node vty = SubstRecvTy(fty, recvTy);
-        string ft = MapType(fty);
+        string ft = cls != null && cls.kind == AK.StructDecl() ? MapFieldType(fty) : MapType(fty);
         string p = NT();
         L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
         string t = NT();
         L("  " + t + " = load " + ft + ", " + ft + "* " + p);
+        if (cls != null && cls.kind == AK.StructDecl() && ft != "i64" && (ft == "i8" || ft == "i16" || ft == "i32")) {
+            string ext = NT();
+            string op = SpanZext(fty) ? "zext" : "sext";
+            L("  " + ext + " = " + op + " " + ft + " " + t + " to i64");
+            t = ext;
+        }
+        if (cls != null && cls.kind == AK.StructDecl() && ft == "float") {
+            string ext = NT();
+            L("  " + ext + " = fpext float " + t + " to double");
+            t = ext;
+        }
         // erased field: storage is i64; unpack to the concrete type when known
         if (IsErasedType(fty)) { return FromSlot(t, vty); }
         return new ExprVal(t, vty);
@@ -238,6 +315,9 @@ partial class Irgen {
     }
 
     ExprVal GenUnary(Node e) {
+        if (e.op == TK.PlusPlus() || e.op == TK.MinusMinus()) {
+            HoistCompoundSpine(e.a);
+        }
         ExprVal v = GenExpr(e.a);
         if (e.op == TK.PlusPlus() || e.op == TK.MinusMinus()) {
             // user-defined operator ++/-- (parser names it op_inc/op_dec):
@@ -337,9 +417,27 @@ partial class Irgen {
 
     ExprVal GenPostfix(Node e) {
         if (e.op == TK.Bang()) {
-            return GenExpr(e.a);
+            ExprVal v = GenExpr(e.a);
+            if (v.ty != null && IsNullableValue(v.ty)) {
+                string ult = UnderLL(v.ty);
+                string p = NT();
+                L("  " + p + " = bitcast i8* " + v.op + " to " + ult + "*");
+                string val = NT();
+                L("  " + val + " = load " + ult + ", " + ult + "* " + p);
+                Node uuty = MkType(v.ty.sval);
+                return new ExprVal(val, uuty);
+            }
+            if (v.ty != null && v.ty.op == 1) {
+                Node nonNull = MkType(v.ty.sval);
+                nonNull.ival = v.ty.ival;
+                int ki = 0;
+                while (ki < v.ty.kids.Count) { nonNull.kids.Add(v.ty.kids[ki]); ki = ki + 1; }
+                return new ExprVal(v.op, nonNull);
+            }
+            return v;
         }
         // x++ / x-- : return old value, update slot
+        HoistCompoundSpine(e.a);
         ExprVal cur = GenExpr(e.a);
         // user-defined operator ++/--: same call as prefix, postfix yields
         // the OLD value (cur is already the pre-call value)

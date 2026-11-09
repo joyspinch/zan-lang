@@ -78,8 +78,8 @@
 | `packages/Zan.Gui/src/Gui/Component/` | 复合组件：Chart、DataTable、CodeEditor、WebView、Dock、FilePicker、PivotTable… |
 | `packages/Zan.Industrial/src/Gui/Hmi/` | 工控：`IoTag`、`Indicator`(LED/数显)、`Gauge`、`Trend`、`Alarm`、`NumPad`、`EquipPanel` |
 | `packages/Zan.Gui.Designer/src/Gui/Designer/` | 表单设计器（`Designer.zan`、`Designer.Form.zan`、`Designer.Inspector.zan`） |
-| `packages/Zan.Gui/skins/`, `src/Gui/drivers/`, `Backend/` | 皮肤资源、原生驱动绑定、后端 |
-| `packages/Zan.Game*/`、`packages/Zan.Sdk.*`、`packages/Zan.Platform.Compat` | 游戏引擎族、第三方 SDK、平台 API 兼容层 |
+| `packages/Zan.Gui/skins/`, `src/drivers/gui/`, `packages/Zan.Gui/src/Gui/Backend/` | 皮肤资源、原生驱动绑定、后端 |
+| `packages/Zan.Game*/`、`packages/Zan.Sdk.*`、`packages/Zan.Desktop` | 游戏引擎族、第三方 SDK、桌面与平台能力 |
 
 ## 常见需求 → 落点
 
@@ -95,7 +95,7 @@
 | IDE 面板/命令 | `panels/*Panel.zan` + `shell/ZanIDE.zan`（命令分发）+ `shell/ZanIDE.State.zan`（状态） |
 | 补全/跳转/悬停 | `src/lsp/` + `LspSession.zan` |
 | 调试器 | `src/dap/` + `DebugSession.zan`, `ZanIDE.Dap.zan` |
-| Web 路由/接口文档 | `packages/Zan.Web/src/System/Web/Router.zan`, `ApiDocs.zan` |
+| Web 路由/接口文档 | `packages/Zan.Web/src/System/Web/Routing/Router.zan`, `packages/Zan.Web/src/System/Web/Navigation/ApiDocs.zan` |
 
 ## 工具链命令（都在仓库根执行）
 

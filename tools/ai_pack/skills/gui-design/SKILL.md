@@ -37,7 +37,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   重写控件，布局与交互复用标准 Gui，风格配置集中进游戏皮肤与语义类。
   游戏内面板间距都走 4 的倍数档位。同屏混排(自绘 HUD + Gui 面板)时,
   缩放路径的边界按下文“缩放纪律”划分，字号必须同源。
-- 立即模式心智模型/控件目录:`docs/agent-kb/gui-development.md`
+- 两范式开发心智模型/控件目录:`docs/agent-kb/gui-development.md`
 - 样式解析规则:`docs/STDLIB_COMPONENT_STANDARDS.md`《附录:取色与取字的统一封装》(Tailwind 原子类引擎已移除,皮肤走语义类 + token)
 
 ## 三条尺寸阶梯(硬规则)
@@ -337,12 +337,6 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   不调用的程序整个家族被 DCE 删光,发布目录不再出现浏览器 DLL。给
   其他重尾控件扩同类时,走 `HeavyControls.Register(kind, fn)` 同一
   注册表,别往主 switch 加分支。
-- **立即模式 WebView 的矩形是物理像素、内容区从 titlebarH 下开始**:
-  裸用 `WebView`(不经 WebViewBox/布局)直调 `view.Render(app, x, y, w, h)`
-  时,坐标是画布物理像素,且 y 要加 `app.titlebarH`——标题栏由
-  `app.RenderChrome(title)` 每帧最后叠画,PresentFrame 时 NativeLayer
-  把被盖住区域从原生视图裁掉。曾按 600x400 逻辑值直传,150% DPI 屏幕
-  上页面只盖住左上 2/3 还压住标题栏,被当成"组件位移 bug"白查一轮。
 - **WebView2 完成回调的参数归引擎所有,不得释放**: 手写 COM 桥里完成
   handler 收到的结果串(`ExecuteScript` 的 JSON、`AddScript...` 的
   脚本 id)和 `GetCookies` 的列表指针,Invoke 返回后引擎自己回收——
@@ -475,10 +469,6 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   自己的条带——FireCommon 只给 `On.Any` 的控件注册命中区,宿主只用
   `TabChanged.Add` 类型化接线(On 为空)时,按页签=按空白,命中解析不到
   任何控件(既不是控件也不是遮罩),释放就没有归属,页签永远切不动。
-- **立即模式点击先过 `app.ClickAvailable`，再检查命中与可用性**:
-  Ribbon 曾只读 `EventKind==3` 与 `ClickTarget`，不泵新事件的重绘
-  会再次执行同一次释放。公共点击判定还包含遮罩、拖拽、长按与消费状态，
-  不要局部重写；回归须验证首次释放生效、同事件下一帧不生效、新点击恢复。
 - **PropSpec 的 str/num/flag 必须绑字段本身,不能绑 getter 返回值**
   (ListItem 教训):`text.str = this.Label` 绑到的是一份值快照,设计
   通道的 SetProp 写进死快照,界面永不出现;绑 `Text` 字段才拿到编译器

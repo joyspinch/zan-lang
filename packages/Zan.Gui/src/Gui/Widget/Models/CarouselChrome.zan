@@ -1,49 +1,135 @@
 using System;
+using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
 
 namespace Gui.Widget;
 
-// 轮播图：带上一张/下一张箭头和指示点的滑动面板。当前
-// 页为双向绑定；`Animate(anim)` 在变化时
-// 水平滑动面板。
-// 轮播的覆盖层：箭头与指示点必须浮在控件页（图片页）之上，而
-// RenderTree 先画父节点自己的 OnPaint 再画子树，父级里画的部件
-// 会被图片页盖住。覆盖层作为最后一个子控件参与子树绘制，天然
-// 位于所有页面之上；箭头/指示点的命中登记与点击处理也在这里做，
-// 保持"同一帧内先登记后派发"的次序。
+// 轮播图覆盖层：以声明式 Button 构成上一张/下一张导航与指示点，
+// 彻底消除裸画布微绘与手工 hitTester / EventKind 判定。
 public class CarouselChrome : Control {
     public Carousel owner;
+    public Button prevBtn;
+    public Button nextBtn;
+    public List<Button> dotBtns;
+    private int builtCount;
 
-    // 初始化：以 "carousel-chrome" 注册为无子控件覆盖层，记下宿主并自管命中事件。
     private void InitChrome(Carousel c) {
-        this.InitControl("carousel-chrome", 0);
+        this.InitControl("carousel-chrome", 1);
+        this.ClassName = "carousel-chrome";
         owner = c;
-        wiresOwnEvents = true;
+        wiresOwnEvents = false;
+        builtCount = 0;
+        dotBtns = new List<Button>();
+
+        prevBtn = new Button("").Ghost().Small();
+        prevBtn.ClassName = "carousel-arrow carousel-arrow-prev";
+        prevBtn.Icon = "arrow-left";
+        prevBtn.Click.Add(() => {
+            if (owner != null) {
+                App a = this.FindApp();
+                owner.Prev(a);
+            }
+        });
+        this.Add(prevBtn);
+
+        nextBtn = new Button("").Ghost().Small();
+        nextBtn.ClassName = "carousel-arrow carousel-arrow-next";
+        nextBtn.Icon = "arrow-right";
+        nextBtn.Click.Add(() => {
+            if (owner != null) {
+                App a = this.FindApp();
+                owner.Next(a);
+            }
+        });
+        this.Add(nextBtn);
+
+        this.SyncDots();
     }
 
-    // 构造：转发到 InitChrome。
     public CarouselChrome(Carousel c) { InitChrome(c); }
 
-    // 覆写：画箭头与指示点覆盖层，并处理各自命中（上/下一张、跳到指定页）。
-    public override void OnPaint(App app) {
+    public void SyncDots() {
         if (owner == null) { return; }
-        owner.EnsureIds();
+        int count = owner.slides.Count;
+        if (count == builtCount) { return; }
+        // 移除旧指示点按钮
+        for (int i = 0; i < dotBtns.Count; i = i + 1) {
+            this.children.Remove(dotBtns[i]);
+        }
+        dotBtns.Clear();
+        for (int i = 0; i < count; i = i + 1) {
+            int targetIdx = i;
+            Button dot = new Button("").Ghost().Small();
+            dot.ClassName = "carousel-dot";
+            dot.Click.Add(() => {
+                if (owner != null) {
+                    App a = this.FindApp();
+                    owner.GoTo(a, targetIdx);
+                }
+            });
+            dotBtns.Add(dot);
+            this.Add(dot);
+        }
+        builtCount = count;
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        base.Arrange(px, py, pw, ph);
+        if (owner == null) { return; }
+        this.SyncDots();
         int count = owner.slides.Count;
         if (count == 0) { return; }
         int cur = owner.model.Get();
         if (cur < 0) { cur = 0; }
         if (cur >= count) { cur = count - 1; }
-        owner.PaintChrome(app, count, cur);
-        if (this.IsDisabled() || app.EventKind() != 3) { return; }
-        int hit = app.ClickTarget();
-        if (hit == owner.baseId) {
-            owner.GoTo(app, owner.model.Get() - 1);
-        } else if (hit == owner.baseId + 1) {
-            owner.GoTo(app, owner.model.Get() + 1);
-        } else if (hit >= owner.baseId + 2
-            && hit < owner.baseId + 2 + count) {
-            owner.GoTo(app, hit - owner.baseId - 2);
+
+        int pad = 12;
+        int ab = 28;
+        if (owner.Vert()) {
+            prevBtn.Icon = "arrow-up";
+            nextBtn.Icon = "arrow-down";
+            int prevX = px + (pw - ab) / 2;
+            int prevY = py + pad;
+            prevBtn.Arrange(prevX, prevY, ab, ab);
+            nextBtn.Arrange(prevX, py + ph - ab - pad, ab, ab);
+        } else {
+            prevBtn.Icon = "arrow-left";
+            nextBtn.Icon = "arrow-right";
+            int prevY = py + (ph - ab) / 2;
+            prevBtn.Arrange(px + pad, prevY, ab, ab);
+            nextBtn.Arrange(px + pw - ab - pad, prevY, ab, ab);
         }
+
+        // 排布指示点
+        int dot = 8;
+        int dotGap = 6;
+        int dotsW = count * dot + (count - 1) * dotGap;
+        bool dotsCol = (owner.dotPlacement == "left" || owner.dotPlacement == "right");
+        int dx = px + (pw - dotsW) / 2;
+        int dy = py + ph - 24;
+        if (owner.dotPlacement == "top") {
+            dy = py + pad;
+        } else if (dotsCol) {
+            dx = (owner.dotPlacement == "left") ? px + pad : px + pw - pad - dot;
+            dy = py + (ph - dotsW) / 2;
+        }
+
+        for (int i = 0; i < dotBtns.Count; i = i + 1) {
+            int dw = (i == cur) ? dot * 2 : dot;
+            dotBtns[i].Arrange(dx, dy, dw, dot);
+            if (i == cur) {
+                dotBtns[i].AddClass("active");
+            } else {
+                dotBtns[i].RemoveClass("active");
+            }
+            if (dotsCol) { dy = dy + dw + dotGap; }
+            else { dx = dx + dw + dotGap; }
+        }
+    }
+
+    public override void OnPaint(App app) {
+        if (owner == null) { return; }
+        this.SyncDots();
     }
 }
