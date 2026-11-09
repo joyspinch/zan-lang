@@ -3,7 +3,9 @@
 > 2026-11-06 立。台账：B-ID171～B-ID179（`TASKS.md`）。本文是 Zan.Gui 分层重构的
 > 唯一设计依据——阶段内容、验证门与完成标志以此为准；执行中结论变化时改正文，
 > 并在文末「决策记录」留一行。2026-11-09 用户裁定两范式全统一并取消画布例外
-> （见 §1 与决策记录），现状数据已按同日源码实测复核。
+> （见 §1 与决策记录）；同日下午二次复核更新现状表（Render 入口包内清零、
+> WidgetId 作用域栈退役、OverlayPopup 状态转实例、HMI 包环已断），并裁定
+> 以工业级标准彻底清理全部不合理封装（见决策记录）。
 
 ## 1. 设计意图
 
@@ -46,16 +48,16 @@ SelectBox/Input/Button 的外观全部走 CSS（零硬编码颜色）。臃肿�
 
 | 问题 | 证据 |
 |---|---|
-| 分层没有边界 | Core/Layout/Styling/Rendering/Text/Media 同属扁平 `namespace Gui`。编译器的 `internal` 按命名空间生效、没有包级可见性，zan.pkg 都不声明依赖，任何层都能调用任何层。Core 的 `using Gui.Widget;` 死引用已从 23 清到 5（P0 ④ 部分落地，2026-11-09 实测） |
-| 包级环 | `Core/ControlBootstrap.zan:3` 写着 `using Gui.Hmi;`，并直接 new 出 Zan.Industrial 的 9 个 HMI 控件；同样是扩展控件，Chart/DataGrid 走的却是 `HeavyControls.Register` 注册表 |
-| App 上帝对象 | App 主文件已瘦到 804 行（2026-11-09 实测），但职责仍揉在 `Core/App.*.zan` partial 里（合计约 6,955 行）：窗口、帧循环、故障护栏、事件分发、即时模式输入仲裁、脏区、壁纸与毛玻璃绘制、颜色计算、作用域 ID 栈、浮层列表、HTML 加载与链接导航、IME——DamageTracker/FrameLoop/WindowHost/BackdropPainter 等独立类尚未抽出，partial 拆分只拆了文件，没拆职责 |
-| 静态可变状态（2026-11-09 补） | 控件静态状态是跨实例污染源：`Core/WidgetId.zan:11-19` 全局 ID 栈（static seq/frameBase/localSeq + 两个 List 栈）；`Core/OverlayPopup.zan:20,28-34` static 遮挡/悬停字段（occl* 8 个 + lastRichHover）；`Widget/Layer.zan:41-243` 静态打开态队列族（RegisterOpen/TopmostDialog/Close…）；`Core/Ui.zan` 静态轮询查询族（状态读自 App 仲裁区） |
+| 分层没有边界 | Core/Layout/Styling/Rendering/Text/Media 同属扁平 `namespace Gui`。编译器的 `internal` 按命名空间生效、没有包级可见性，zan.pkg 都不声明依赖，任何层都能调用任何层。Core 的 `using Gui.Widget;` 已从 23 个文件清到 6 个（2026-11-09 下午实测；ControlBootstrap/ModelBinder 为活引用，随 P1/P2 清零） |
+| 注册机制过渡态（包环已断） | ControlBootstrap 的 `using Gui.Hmi` 与 9 个 HMI 分支已删（4d81e9010）；HeavyControls 第二梯子正由并发会话并入 `ControlFactory.Register`；kind→new 大开关仍躺在 Core（P1 移 Widget/），终态待编译器生成控件清单（P1 ① 小设计先行） |
+| App 上帝对象 | App 主文件已瘦到 804 行（2026-11-09 实测），但职责仍揉在 `Core/App.*.zan` partial 里（合计约 6,981 行，2026-11-09 下午实测）：窗口、帧循环、故障护栏、事件分发、即时模式输入仲裁、脏区、壁纸与毛玻璃绘制、颜色计算、作用域 ID 栈、浮层列表、HTML 加载与链接导航、IME——DamageTracker/FrameLoop/WindowHost/BackdropPainter 等独立类尚未抽出，partial 拆分只拆了文件，没拆职责 |
+| 静态可变状态（2026-11-09 下午复核） | e7cad1a60 已退役 WidgetId 作用域栈（仅剩全局计数器 seq）、OverlayPopup 的 occl*/lastRichHover 转实例字段（剩余 static 全为纯工厂/几何助手）；Layer 打开态队列改 per-App AppLayerContext，仅剩 `Widget/Layer.zan:15` 静态 fallbackContext 兜底；`Core/Ui.zan` 静态轮询查询族（状态读自 App 仲裁区）与 WidgetId 全局计数器仍待 P6 退役 |
 | 输入在绘制时轮询 | 路由事件（隧道/冒泡）已经实现且 `App.ProcessEvent` 会先走它，但生产控件仍以绘制期 ClaimClick/BlockHitsRect + `Ui.Clicked` 轮询为主路径，命中目标依赖上一帧的绘制期登记 |
-| 双范式 | 控件既有保留式 OnPaint，又提供每帧调用的 `Render(App, x, y, …)` 入口——Zan.Gui 内实测 10 个文件（`Widget/ContextMenu、Menu、Ribbon、Layer、Tooltip、Ellipsis、Wizard.Preview`、`Component/Ribbon`、`Core/OverlayPopup`、`Core/ThemeDrawer`，2026-11-09 实测）；外部调用面（Charts 517 处 Draw、DataTable 75+、Designer 209、游戏 HUD、IDE 面板等）以 P6 第 7 步盘点为准 |
+| 双范式（包内入口已清零） | Zan.Gui 内 10 个 `Render(App, …)` 即时入口已由 e7cad1a60 清零（2026-11-09 下午实测全包零命中）；外部调用面（Charts 517 处 Draw、DataTable 75+、Designer 209、游戏 HUD、IDE 面板等）仍是即时模式，以 P6 第 6/7 步改写与盘点为准 |
 | 4 套布局 | CSS flow/flex/grid 为正道；Dock 引擎（`Core/Dock.zan`、`Core/Serialize.zan`）已删（P5 第 1 步落地，2026-11-09 实测），剩解析期脱糖兜底：`Markup/Html.Build.zan:44,568-575` 的 data-dock/data-fx 分支；带 `data-dock/fx/span` 的设计器文档实测 43 个（原 42） |
 | 绑定 7 条通道 | data-bind/ModelBinder、`Binding<T>`、控件事件、GetProp/SetProp、Signal*、FormField/fname、z-mount。`Signal.Changed`/`ChangeTracker` 已删、SyncBinding 已由 `Control.RenderTree` 统一驱动（STDLIB_COMPONENT_STANDARDS §6）；但 Signal* 仍是 IDE 应用状态载体、ModelBinder 的 `is <控件>` 特判仍在（`Core/ModelBinder.zan:260`），可绑定值契约未落 |
 | 弹层重复 | `App.AddOverlay(OverlayPopup)` 仍写死具体控件（`Core/App.Render.zan:418`）、`Control.OnPaintOverlay` 6 处、Layer 自带静态队列、Modal——四条路径并存；`Core/OverlayHost.zan`（133 行）骨架已落；OverlayPopup 已减到 1,085 行，SelectBox 已拆入 `Widget/`（.Cascader/.Hierarchy/.Props） |
-| 文档漂移 | `zan.pkg` 声称包含 DataTable/Chart/CodeEditor（实际在兄弟包）；README 列出本包不存在的 `Gui.Reactive`/`Gui.Designer`；`docs/agent-kb/gui-development.md` 仍推荐已移除的 Signal 绑定 |
+| 文档漂移（收口中） | zan.pkg 描述与 README 已在并发会话工作树重写（兄弟包边界已澄清，待其提交）；`docs/agent-kb/gui-development.md` 有在飞改动，Signal 推荐清理以该会话收口为准；本文 §2 现状表已于本轮完成下午二次复核 |
 
 成因：四代写法叠在一起，哪一代都没删——WinForms 式保留模式（Dock/Place/
 Serialize）→ HTML 时代（标记 + CSS + 绑定）→ 设计器时代（DesignerHtml 方言、
@@ -121,9 +123,12 @@ Serialize）→ HTML 时代（标记 + CSS + 绑定）→ 设计器时代（Desi
 
 ### P1 断开包环，按目标层摆目录（B-ID172）
 
-1. HMI 注册外移：新建 `packages/Zan.Industrial/src/Gui/Hmi/HmiBootstrap.zan`
-   （照 `DataTableBootstrap.zan` 写法）；`ControlBootstrap.zan` 删 `using Gui.Hmi`
-   与 9 个 HMI 分支；用到 HMI 标签的调用方补 `HmiBootstrap.Install()`。
+1. 注册梯子退役（2026-11-09 裁定：Install() 类手工注册属不可行历史方案，
+   原 HmiBootstrap 外移方案作废）：候选替代为编译器生成控件清单——类型在
+   编译图内即自动可按 kind 构造、miss 显式报错，替代 ControlBootstrap/
+   DataTableBootstrap/ChartBootstrap/CefControlBootstrap 全部手工注册；
+   小设计先行为本步前置。HMI 包环已删（4d81e9010）；HeavyControls→
+   ControlFactory 归并由并发会话落地中。
 2. 按目标层落目录，命名空间暂不变（调用方零改动）：新建 `Forms/`、`Binding/`、
    `Testing/`，基元移到 `src/Gui/` 根；同步按物理路径枚举源码的构建脚本
    （`scripts/build_gallery*.ps1`、`build_charts.ps1`、`build_ide.ps1`）。
@@ -319,6 +324,14 @@ P4 先于 P6（弹层是输入轮询最密的地方）；P7 放最后（没有�
   "AlertBox")`），审计初稿误记为 34 个。
 - 2026-11-06 更正（P0 机检落地时实测）：带旧布局属性的 42 个 html 全部是设计器文档，
   IDE 面板也在内。P5 只做运行时脱糖与删除 Dock 引擎，文件改写并入 P8。
+- 2026-11-09（下午）用户裁定：以工业级高可用高扩展标准执行彻底清理——全部
+  不合理封装、不必要文件、臃肿不可扩展组件都在清理范围，不限于路线点名项；
+  两范式与控件纯实例化裁定不变。同日二次复核落地项：Render 入口包内清零、
+  WidgetId 作用域栈退役、OverlayPopup 状态转实例（e7cad1a60），HMI 包环删除
+  （4d81e9010），Component 重控件迁出 Workplace（bdea08a5b）；§2 现状表随改。
+- 2026-11-09 注册机制裁定（自 B-ID172 台账同步）：Install() 类注册属不可行
+  历史方案，退役；HmiBootstrap 外移方案作废；候选替代为编译器生成控件清单，
+  小设计先行（见 §4 P1 ①）。
 - 2026-11-09 用户裁定：GUI 组件只保留两范式（范式一 HTML+CSS；范式二声明式对象树
   `Children`/`ClassName` + 纯 Flex/Grid/Flow），画布例外取消——原 P6 第 6 步
   "DataTable/Charts/CodeEditor/Industrial 只改输入，Canvas 自绘保留"作废，全部统一
