@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Threading;
 using Zan.Web.Core;
 
 namespace Zan.Web.Services;
@@ -17,29 +18,47 @@ public class Presence {
 
     private static int pages = 0;
     private static List<string> ips = new List<string>();
+    private static nint presenceLock = Mutex.Create();
 
     /* 记录一个来自 ip 的打开页面。 */
     public static void Enter(string ip) {
+        Mutex.Lock(Presence.presenceLock);
         pages = pages + 1;
         ips.Add(ip);
+        Mutex.Unlock(Presence.presenceLock);
     }
 
     /* 移除对应的打开页面。 */
     public static void Leave(string ip) {
+        Mutex.Lock(Presence.presenceLock);
         if (pages > 0) { pages = pages - 1; }
         for (int i = 0; i < ips.Count; i = i + 1) {
-            if (ips[i] == ip) { ips.RemoveAt(i); return; }
+            if (ips[i] == ip) {
+                ips.RemoveAt(i);
+                Mutex.Unlock(Presence.presenceLock);
+                return;
+            }
         }
+        Mutex.Unlock(Presence.presenceLock);
     }
 
     /* 发布本 worker 的页面数与 IP 列表到缓存。 */
     public static async void Publish() {
-        string body = Convert.ToString(pages);
+        int curPages = 0;
+        List<string> snapshotIps = new List<string>();
+        Mutex.Lock(Presence.presenceLock);
+        curPages = pages;
         int n = ips.Count;
         if (n <= MaxIps) {
             for (int i = 0; i < n; i = i + 1) {
-                body = body + "," + ips[i];
+                snapshotIps.Add(ips[i]);
             }
+        }
+        Mutex.Unlock(Presence.presenceLock);
+
+        string body = Convert.ToString(curPages);
+        for (int i = 0; i < snapshotIps.Count; i = i + 1) {
+            body = body + "," + snapshotIps[i];
         }
         await Cache.SetTtlAsync(Key(ProcessHost.WorkerId()), body,
                                 Ttl);
@@ -53,7 +72,12 @@ public class Presence {
             if (v.Length == 0) { continue; }
             total = total + Head(v);
         }
-        if (total == 0) { return pages; }
+        if (total == 0) {
+            Mutex.Lock(Presence.presenceLock);
+            int p = pages;
+            Mutex.Unlock(Presence.presenceLock);
+            return p;
+        }
         return total;
     }
 

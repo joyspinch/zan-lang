@@ -468,7 +468,7 @@ public class Socket {
                         return client;
                     }
                     int error = Pal.Network.GetLastSocketError();
-                    Socket.lastError = error;
+                    Socket.SetLastError(error);
                     if (!Socket.IsTransientAcceptError(error)) { return -1; }
                     if (error == 4) { continue; }  // EINTR: retry the interrupted syscall.
                     if (cancellation != null && cancellation.IsCancellationRequested) { return -1; }
@@ -738,14 +738,17 @@ public class Socket {
     // 关闭时为 true。通过同步辅助函数写入，因为在 async 方法内给
     // 静态变量赋值会被按值捕获。
     public static bool LastRecvTimedOut() {
-        return Socket.recvTimedOut;
+        if (Socket.tlRecvTimedOut == null) { return false; }
+        return Socket.tlRecvTimedOut.Value;
     }
 
-    private static bool recvTimedOut = false;
+    private static ThreadLocal<bool> tlRecvTimedOut = new ThreadLocal<bool>();
 
     // 更新 LastRecvTimedOut 报告的标志（见带超时 RecvAsync）。
     private static void MarkRecvTimeout(bool timedOut) {
-        Socket.recvTimedOut = timedOut;
+        if (Socket.tlRecvTimedOut != null) {
+            Socket.tlRecvTimedOut.Value = timedOut;
+        }
     }
 
     // 挂起直到可读，然后最多接收 <paramref
@@ -827,11 +830,11 @@ public class Socket {
         }
         if (n < 0) { n = 0; }
         if (n > 0) {
-            lastPeerPort = ((fromAddr[2] & 255) << 8) + (fromAddr[3] & 255);
-            lastPeerIp = Socket.SockAddrIpText(fromAddr);
+            int port = ((fromAddr[2] & 255) << 8) + (fromAddr[3] & 255);
+            string ip = Socket.SockAddrIpText(fromAddr);
+            Socket.SetLastPeer(ip, port);
         } else {
-            lastPeerPort = 0;
-            lastPeerIp = "";
+            Socket.SetLastPeer("", 0);
         }
         return n;
     }
@@ -845,21 +848,28 @@ public class Socket {
     }
 
     // 最近一次 RecvFromPeer/RecvFromPeerAsync 收到数据报的发送方地址。
-    // 单线程运行时：请在 recv 后、该协程下一次 await 之前
-    // 通过 PeerIp/PeerPort 立即读取。
-    private static string lastPeerIp = "";
-    private static int lastPeerPort = 0;
+    // 采用 ThreadLocal 隔离，杜绝跨线程/跨协程串流。
+    private static ThreadLocal<string> tlLastPeerIp = new ThreadLocal<string>();
+    private static ThreadLocal<int> tlLastPeerPort = new ThreadLocal<int>();
+
+    private static void SetLastPeer(string ip, int port) {
+        if (Socket.tlLastPeerIp != null) { Socket.tlLastPeerIp.Value = ip; }
+        if (Socket.tlLastPeerPort != null) { Socket.tlLastPeerPort.Value = port; }
+    }
 
     // 最近一次通过 RecvFromPeer / RecvFromPeerAsync
-    // 收到数据报的发送方 IPv4 地址。
+    // 收到数据报的发送方 IPv4/IPv6 地址。
     public static string PeerIp() {
-        return lastPeerIp;
+        if (Socket.tlLastPeerIp == null) { return ""; }
+        string ip = Socket.tlLastPeerIp.Value;
+        return ip != null ? ip : "";
     }
 
     // 最近一次通过 RecvFromPeer / RecvFromPeerAsync
     // 收到数据报的发送方 UDP 端口。
     public static int PeerPort() {
-        return lastPeerPort;
+        if (Socket.tlLastPeerPort == null) { return 0; }
+        return Socket.tlLastPeerPort.Value;
     }
 
     // 接收一个 UDP 数据报并记录发送方地址，以便
@@ -879,11 +889,11 @@ public class Socket {
         if (n > 0) {
             // 端口在 sockaddr_in / sockaddr_in6 的同一偏移（2），
             // 均为网络字节序；地址文本由 C 端按族格式化。
-            lastPeerPort = ((fromAddr[2] & 255) << 8) + (fromAddr[3] & 255);
-            lastPeerIp = Socket.SockAddrIpText(fromAddr);
+            int port = ((fromAddr[2] & 255) << 8) + (fromAddr[3] & 255);
+            string ip = Socket.SockAddrIpText(fromAddr);
+            Socket.SetLastPeer(ip, port);
         } else {
-            lastPeerPort = 0;
-            lastPeerIp = "";
+            Socket.SetLastPeer("", 0);
         }
         return buf.ToStr(0, n);
     }
@@ -935,7 +945,8 @@ public class Socket {
     // 构造诊断信息——之前 CreateTcp/Bind/Listen 的失败
     // 被静默吞掉，调用方只知道操作失败了。
     public static int LastSocketError() {
-        return Socket.lastError;
+        if (Socket.tlLastError == null) { return 0; }
+        return Socket.tlLastError.Value;
     }
 
     // WSAGetLastError / errno 是线程局部的，且会被任何后续
@@ -943,22 +954,34 @@ public class Socket {
     // 失败路径往往在读取错误码之前还要关闭 fd 清理资源，因此
     // 错误码必须在失败检查点（上述调用返回失败时）立即捕获，
     // 而不是事后查询。LastSocketError() 返回的就是这个缓存。
-    private static int lastError;
-    private static bool resolveFailed;
+    // 采用 ThreadLocal 严格隔离各线程/协程错误状态。
+    private static ThreadLocal<int> tlLastError = new ThreadLocal<int>();
+    private static ThreadLocal<bool> tlResolveFailed = new ThreadLocal<bool>();
 
     // 失败检查点处立即捕获平台错误码（见 lastError 上的说明）。
     public static void CaptureLastError() {
-        Socket.lastError = Pal.Network.GetLastSocketError();
+        if (Socket.tlLastError != null) {
+            Socket.tlLastError.Value = Pal.Network.GetLastSocketError();
+        }
+    }
+
+    public static void SetLastError(int error) {
+        if (Socket.tlLastError != null) {
+            Socket.tlLastError.Value = error;
+        }
     }
 
     // 最近一次解析是否失败（BuildSockAddrAsync / ConnectAsync 置位）。
     private static bool LastResolveFailed() {
-        return Socket.resolveFailed;
+        if (Socket.tlResolveFailed == null) { return false; }
+        return Socket.tlResolveFailed.Value;
     }
 
     // 更新 LastResolveFailed 报告的标志。
     private static void MarkResolveFailed(bool failed) {
-        Socket.resolveFailed = failed;
+        if (Socket.tlResolveFailed != null) {
+            Socket.tlResolveFailed.Value = failed;
+        }
     }
 
     // IPv4 文本 → 整数（字节序与 <c>inet_addr</c> 一致，第一段在低

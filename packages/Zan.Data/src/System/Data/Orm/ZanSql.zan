@@ -1,17 +1,24 @@
 using System;
 using System.Data;
+using System.Threading;
 namespace System.Data.Orm;
 
 public delegate IZanSql ZanSqlProvider();
 public delegate void TransactionAction();
+public delegate void TransactionWithOrmAction(IZanSql orm);
 
 public class ZanSql : IZanSql {
     public static IZanSql DefaultInstance;
     public static ZanSqlProvider CurrentProvider;
+    private static ThreadLocal<IZanSql> threadLocalOrm = new ThreadLocal<IZanSql>();
 
-    // 核心环境门面：优先取动态上下文解析器，其次回退到全局默认连接池门面
+    // 核心环境门面：优先取当前线程事务上下文，其次取动态上下文解析器，最后回退到全局默认连接池门面
     public static IZanSql Current {
         get {
+            if (threadLocalOrm != null) {
+                IZanSql local = threadLocalOrm.Value;
+                if (local != null) { return local; }
+            }
             if (CurrentProvider != null) {
                 IZanSql s = CurrentProvider();
                 if (s != null) { return s; }
@@ -31,24 +38,46 @@ public class ZanSql : IZanSql {
         CurrentProvider = provider;
     }
 
-    // 自动事务闭包：内部自动创建 UnitOfWork 并在当前上下文中隔离执行
+    // 自动事务闭包：内部自动创建 UnitOfWork 并在当前线程上下文中隔离执行，绝不篡改全局 DefaultInstance
     public static void Transaction(TransactionAction action) {
         IZanSql currentOrm = ZanSql.Current;
         if (currentOrm == null) {
             throw new Exception("ZanSql.Transaction: no active database connection or pool in current context");
         }
         IUnitOfWork uow = currentOrm.CreateUnitOfWork();
-        IZanSql previous = DefaultInstance;
+        IZanSql previous = threadLocalOrm.Value;
         IZanSql uowOrm = ZanSql.FromConnection(uow.GetConnection());
         try {
-            DefaultInstance = uowOrm;
+            threadLocalOrm.Value = uowOrm;
             action();
             uow.Commit();
         } catch (Exception ex) {
             uow.Rollback();
             throw ex;
         } finally {
-            DefaultInstance = previous;
+            threadLocalOrm.Value = previous;
+            uow.Dispose();
+        }
+    }
+
+    // 自动事务闭包（带显式事务 ORM 注入）：推荐写法，彻底杜绝全局状态隐式依赖
+    public static void Transaction(TransactionWithOrmAction action) {
+        IZanSql currentOrm = ZanSql.Current;
+        if (currentOrm == null) {
+            throw new Exception("ZanSql.Transaction: no active database connection or pool in current context");
+        }
+        IUnitOfWork uow = currentOrm.CreateUnitOfWork();
+        IZanSql previous = threadLocalOrm.Value;
+        IZanSql uowOrm = ZanSql.FromConnection(uow.GetConnection());
+        try {
+            threadLocalOrm.Value = uowOrm;
+            action(uowOrm);
+            uow.Commit();
+        } catch (Exception ex) {
+            uow.Rollback();
+            throw ex;
+        } finally {
+            threadLocalOrm.Value = previous;
             uow.Dispose();
         }
     }

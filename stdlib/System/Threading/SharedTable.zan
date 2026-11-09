@@ -14,6 +14,7 @@ public class SharedTable : IDisposable {
 
     // 当前进程映射的所有共享内存表清单（按句柄索引），供监控看板查询。
     static List<SharedTableEntry> openEntries = null;
+    static nint entriesLock = Mutex.Create();
 
     [DllImport("crt", EntryPoint = "zan_shared_table_create")]
     static extern nint NativeCreate(string name, int capacity, int keySize, string schema);
@@ -158,6 +159,7 @@ public class SharedTable : IDisposable {
     // 都会走到；重复登记只更新标签）。
     private static void Track(SharedTable table) {
         if (table.handle == 0) { return; }
+        Mutex.Lock(SharedTable.entriesLock);
         if (SharedTable.openEntries == null) {
             SharedTable.openEntries = new List<SharedTableEntry>();
         }
@@ -166,21 +168,29 @@ public class SharedTable : IDisposable {
         for (int i = 0; i < SharedTable.openEntries.Count; i = i + 1) {
             if (SharedTable.openEntries[i].handle == table.handle) {
                 SharedTable.openEntries[i].label = label;
+                Mutex.Unlock(SharedTable.entriesLock);
                 return;
             }
         }
         SharedTable.openEntries.Add(new SharedTableEntry(table.handle, label));
+        Mutex.Unlock(SharedTable.entriesLock);
     }
 
     // 把句柄从本进程的打开表列表移除。
     private static void Untrack(nint handle) {
-        if (SharedTable.openEntries == null) { return; }
+        Mutex.Lock(SharedTable.entriesLock);
+        if (SharedTable.openEntries == null) {
+            Mutex.Unlock(SharedTable.entriesLock);
+            return;
+        }
         for (int i = 0; i < SharedTable.openEntries.Count; i = i + 1) {
             if (SharedTable.openEntries[i].handle == handle) {
                 SharedTable.openEntries.RemoveAt(i);
+                Mutex.Unlock(SharedTable.entriesLock);
                 return;
             }
         }
+        Mutex.Unlock(SharedTable.entriesLock);
     }
     public void Dispose() {
         Close();
@@ -405,19 +415,19 @@ public class SharedTable : IDisposable {
     // 报告内存时必须用 Resident，而不是 Reserved。
 
     // Stat 项：整块映射的预留大小（字节）。
-    static int STAT_RESERVED = 0;
+    public const int STAT_RESERVED = 0;
     // Stat 项：本进程驻留物理内存的部分（字节），不支持时为 -1。
-    static int STAT_RESIDENT = 1;
+    public const int STAT_RESIDENT = 1;
     // Stat 项：表的行容量（向上取整到 2 的幂）。
-    static int STAT_CAPACITY = 2;
+    public const int STAT_CAPACITY = 2;
     // Stat 项：当前行数。
-    static int STAT_COUNT = 3;
+    public const int STAT_COUNT = 3;
     // Stat 项：每行字节数（键 + 各列 + 行头）。
-    static int STAT_ROW_STRIDE = 4;
+    public const int STAT_ROW_STRIDE = 4;
     // Stat 项：键的最大字节数。
-    static int STAT_KEY_SIZE = 5;
+    public const int STAT_KEY_SIZE = 5;
     // Stat 项：列数。
-    static int STAT_COLUMNS = 6;
+    public const int STAT_COLUMNS = 6;
 
     // 整块映射的大小（预留的虚拟地址空间，不是内存占用）。
     public long ReservedBytes() {
@@ -453,22 +463,46 @@ public class SharedTable : IDisposable {
 
     // 本进程当前映射着的共享表数量。
     public static int OpenCount() {
-        if (SharedTable.openEntries == null) { return 0; }
-        return SharedTable.openEntries.Count;
+        Mutex.Lock(SharedTable.entriesLock);
+        if (SharedTable.openEntries == null) {
+            Mutex.Unlock(SharedTable.entriesLock);
+            return 0;
+        }
+        int count = SharedTable.openEntries.Count;
+        Mutex.Unlock(SharedTable.entriesLock);
+        return count;
     }
 
     // 第 `index` 张表的标签（Label() 设置的名字）。
     public static string OpenLabel(int index) {
-        if (SharedTable.openEntries == null) { return ""; }
-        if (index < 0 || index >= SharedTable.openEntries.Count) { return ""; }
-        return SharedTable.openEntries[index].label;
+        Mutex.Lock(SharedTable.entriesLock);
+        if (SharedTable.openEntries == null) {
+            Mutex.Unlock(SharedTable.entriesLock);
+            return "";
+        }
+        if (index < 0 || index >= SharedTable.openEntries.Count) {
+            Mutex.Unlock(SharedTable.entriesLock);
+            return "";
+        }
+        string lbl = SharedTable.openEntries[index].label;
+        Mutex.Unlock(SharedTable.entriesLock);
+        return lbl;
     }
 
     // 第 `index` 张表的某项统计，取值见 STAT_* 常量。
     public static long OpenStat(int index, int what) {
-        if (SharedTable.openEntries == null) { return 0; }
-        if (index < 0 || index >= SharedTable.openEntries.Count) { return 0; }
-        return NativeStat(SharedTable.openEntries[index].handle, what);
+        Mutex.Lock(SharedTable.entriesLock);
+        if (SharedTable.openEntries == null) {
+            Mutex.Unlock(SharedTable.entriesLock);
+            return 0;
+        }
+        if (index < 0 || index >= SharedTable.openEntries.Count) {
+            Mutex.Unlock(SharedTable.entriesLock);
+            return 0;
+        }
+        nint h = SharedTable.openEntries[index].handle;
+        Mutex.Unlock(SharedTable.entriesLock);
+        return NativeStat(h, what);
     }
 
     // 左对齐补空格到 width 宽，再追加一个空格作列间隔。

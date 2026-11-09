@@ -24,16 +24,14 @@ public class DownloadJob {
     // 正在跑的任务（同一时刻只驱动一个：更新器天然是串行的）。
     private static DownloadJob sCur;
     // 交给 worker 但还没被领走的任务，以及保护它和共享状态的锁。
-    private static List<DownloadJob> sPend;
-    #if WINDOWS
-    private static nint sLock;
-    #else
-    private static nint sLock;
-    #endif
+    private static List<DownloadJob> sPend = new List<DownloadJob>();
+    private static nint sLock = Mutex.Create();
     // 取消标志。原子而非受锁，因为 HttpClient 的探针每 64 KB 问一次。
-    private static AtomicInt sCancel;
+    private static AtomicInt sCancel = new AtomicInt(0);
 
     private List<DownloadItem> items;
+    // 实例级独立取消标志（支持多任务独立取消，消除全局锁死）
+    public AtomicInt cancelGate;
     // 每个 worker 请求绑定的外部调用预算；null = 使用下载默认预算。
     private ExternalCallPolicy callPolicy;
     // 开跑前补齐条目的回调，null = 条目已经齐了。
@@ -65,15 +63,11 @@ public class DownloadJob {
         this.running = false;
         this.got = 0;
         this.total = 0;
+        this.cancelGate = new AtomicInt(0);
     }
 
-    // 惰性初始化进程级任务队列、锁与取消标志。
+    // 惰性初始化保底空实现
     private static void EnsureShared() {
-        if (DownloadJob.sPend == null) {
-            DownloadJob.sPend = new List<DownloadJob>();
-            DownloadJob.sLock = Mutex.Create();
-            DownloadJob.sCancel = new AtomicInt(0);
-        }
     }
 
     // 锁住进程级共享状态（首次使用时先惰性初始化）。
@@ -166,8 +160,18 @@ public class DownloadJob {
     // 请求取消：下载在下一块正文的边界退出，已下载的部分留着
     // 续传。不强杀线程，因此调用后任务还会“运行”一小会儿。
     public void Cancel() {
-        DownloadJob.EnsureShared();
-        DownloadJob.sCancel.Store(1);
+        if (this.cancelGate != null) {
+            this.cancelGate.Store(1);
+        }
+        if (DownloadJob.sCancel != null) {
+            DownloadJob.sCancel.Store(1);
+        }
+    }
+
+    // 实例级检查是否已请求取消
+    public bool IsCancelRequested() {
+        if (this.cancelGate == null) { return false; }
+        return this.cancelGate.Load() != 0;
     }
 
     // HttpClient 的取消探针（装到客户端上的那个静态委托）。
