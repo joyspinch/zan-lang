@@ -1,4 +1,7 @@
+using System;
+using System.Collections.Generic;
 using Gui;
+using Gui.Widget;
 
 namespace Gui.Component.Chart;
 
@@ -18,6 +21,10 @@ public class ChartHost : Control {
     ChartView view;
     ChartOption opt;
     string chartType;
+    bool widgetToolbox;
+    ButtonGroup toolboxGroup;
+    List<Button> toolboxButtons;
+    int lastToolboxActionsHash;
 
     // 自注册入口（B-ID44 约定）：按需注册到 ControlFactory
     public static void Install() {
@@ -32,6 +39,10 @@ public class ChartHost : Control {
         chartType = "bar";
         opt = ChartHost.SampleOf("bar");
         view = ChartView.Of(opt);
+        widgetToolbox = false;
+        toolboxGroup = null;
+        toolboxButtons = null;
+        lastToolboxActionsHash = 0;
     }
 
     // 显式指定 ChartOption 构建
@@ -40,6 +51,10 @@ public class ChartHost : Control {
         opt = o != null ? o : ChartHost.SampleOf("bar");
         chartType = opt.series.Count > 0 ? ChartKinds.TypeName(opt.series[0].type) : "bar";
         view = ChartView.Of(opt);
+        widgetToolbox = false;
+        toolboxGroup = null;
+        toolboxButtons = null;
+        lastToolboxActionsHash = 0;
     }
 
     public override string Kind() { return "ChartHost"; }
@@ -49,13 +64,112 @@ public class ChartHost : Control {
     public override string GetProp(string key) {
         if (key == "type") { return chartType; }
         if (key == "title") { return opt.title; }
+        if (key == "widgetToolbox") { return widgetToolbox ? "true" : "false"; }
         return base.GetProp(key);
     }
 
     public override void SetProp(string key, string val) {
         if (key == "type") { this.SetChartType(val); return; }
         if (key == "title") { opt.title = val; return; }
+        if (key == "widgetToolbox") { this.SetWidgetToolbox(val == "true" || val == "1"); return; }
         base.SetProp(key, val);
+    }
+
+    // 启用/禁用外挂控件模式工具箱（ButtonGroup/Button 挂载）
+    public void SetWidgetToolbox(bool enable) {
+        widgetToolbox = enable;
+        if (!enable && toolboxGroup != null) {
+            toolboxGroup.Visible = false;
+        }
+    }
+
+    public bool IsWidgetToolbox() { return widgetToolbox; }
+
+    private void EnsureToolboxGroup() {
+        if (toolboxGroup == null) {
+            toolboxGroup = new ButtonGroup("chart-toolbox-bar row");
+            toolboxButtons = new List<Button>();
+            this.Add(toolboxGroup);
+        }
+    }
+
+    private void RefreshToolboxButtons() {
+        if (toolboxGroup != null) {
+            toolboxGroup.ClearSegs();
+            if (toolboxButtons != null) { toolboxButtons.Clear(); }
+            lastToolboxActionsHash = 0;
+        }
+    }
+
+    private void SyncToolboxWidget(App app) {
+        if (opt == null || !opt.toolboxShow) {
+            if (toolboxGroup != null) { toolboxGroup.Visible = false; }
+            return;
+        }
+        this.EnsureToolboxGroup();
+        List<int> ids = ChartToolbox.Actions(opt);
+        if (ids.Count < 1) {
+            toolboxGroup.Visible = false;
+            return;
+        }
+
+        int h = 0;
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            h = h * 31 + ids[i];
+        }
+        if (h != lastToolboxActionsHash) {
+            toolboxGroup.ClearSegs();
+            toolboxButtons.Clear();
+            string[] icons = new string[]{
+                "table", "chart-line", "chart-bar", "undo", "save", "search" };
+            string[] tips = new string[]{
+                "数据视图", "切换为折线", "切换为柱状", "还原", "保存为图片", "区域缩放" };
+            for (int k = 0; k < ids.Count; k = k + 1) {
+                int act = ids[k];
+                Button b = new Button(new IconView(icons[act], 14));
+                b.Tip = tips[act];
+                b.Class = "toolbox-btn ghost small";
+                b.Click.Add(() => {
+                    this.OnToolboxAction(act);
+                });
+                toolboxButtons.Add(b);
+                toolboxGroup.AddButton(b);
+            }
+            lastToolboxActionsHash = h;
+        }
+
+        int wid = view.Wid();
+        int magic = app.StateGet(Chart.TbMagicKey(wid), 0);
+        int zOn = app.StateGet(Chart.TbZoomKey(wid), 0);
+        for (int k = 0; k < ids.Count; k = k + 1) {
+            int act = ids[k];
+            bool on = (act == 1 && magic == 1) || (act == 2 && magic == 2)
+                || (act == 5 && zOn != 0);
+            if (k < toolboxButtons.Count) {
+                toolboxButtons[k].Checked = on;
+            }
+        }
+
+        int btn = ChartToolbox.Btn(app);
+        int gap = ChartToolbox.Gap(app);
+        int pad = ChartToolbox.Pad(app);
+        int n = ids.Count;
+        int rowW = n * btn + (n - 1) * gap;
+        int baseX = bx + bw - pad - rowW;
+        int baseY = by + pad;
+
+        toolboxGroup.Visible = true;
+        toolboxGroup.Arrange(baseX, baseY, rowW, btn);
+    }
+
+    private void OnToolboxAction(int action) {
+        App app = this.FindApp();
+        if (app == null || opt == null || view == null) { return; }
+        int wid = view.Wid();
+        int magic = app.StateGet(Chart.TbMagicKey(wid), 0);
+        int zOn = app.StateGet(Chart.TbZoomKey(wid), 0);
+        ChartToolbox.Click(app, action, wid, opt, bx, by, bw, bh, magic, zOn);
+        app.RequestRedraw();
     }
 
     // 切换图型并重拼示例 option。宿主已用 SetOption 接管数据后
@@ -64,6 +178,7 @@ public class ChartHost : Control {
         chartType = s;
         opt = ChartHost.SampleOf(s);
         view = ChartView.Of(opt);
+        this.RefreshToolboxButtons();
     }
 
     // 整体替换 option（类型、图例、系列全由调用方定）；null
@@ -72,6 +187,7 @@ public class ChartHost : Control {
         if (o == null) { return; }
         opt = o;
         view = ChartView.Of(o);
+        this.RefreshToolboxButtons();
     }
 
     // 获取当前配置选项
@@ -87,15 +203,24 @@ public class ChartHost : Control {
 
     // 示例尺寸（自由画布/流式布局都可再覆写宽高）。
     public override void OnMeasure(App app) {
+        app = this.ResolveApp(app);
         // 基线图表主题懒装载（App 不再构造即装载，见 ChartTheme）。
-        ChartTheme.EnsureDefault(app);
+        if (app != null) { ChartTheme.EnsureDefault(app); }
         prefW = 320;
         prefH = 200;
     }
 
     public override void OnPaint(App app) {
+        app = this.ResolveApp(app);
         // 兜底：跳过测量的画布路径也能拿到基线主题。
-        ChartTheme.EnsureDefault(app);
+        if (app != null) { ChartTheme.EnsureDefault(app); }
+        if (widgetToolbox && opt != null && opt.toolboxShow) {
+            view.suppressCanvasToolbox = true;
+            this.SyncToolboxWidget(app);
+        } else {
+            view.suppressCanvasToolbox = false;
+            if (toolboxGroup != null) { toolboxGroup.Visible = false; }
+        }
         view.Render(app, bx, by, bw, bh);
     }
 
