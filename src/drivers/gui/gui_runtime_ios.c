@@ -845,6 +845,40 @@ EXPORT i32 zan_gui_safe_area_right(void) {
     }
     return 0;
 }
+
+static int g_ios_keyboard_height = 0;
+
+EXPORT void zan_gui_ios_set_keyboard_height(i32 height) {
+    if (height >= 0) g_ios_keyboard_height = (int)height;
+}
+
+EXPORT i32 zan_gui_keyboard_height(void) {
+    return g_ios_keyboard_height;
+}
+
+EXPORT i32 zan_gui_haptic_feedback(i32 type) {
+    if (!g_bridge.initialized) zan_ios_init_bridge();
+    if (!g_bridge.objc_getClass || !g_bridge.sel_registerName || !g_bridge.objc_msgSend) return 0;
+    zan_class_t cls_impact = g_bridge.objc_getClass("UIImpactFeedbackGenerator");
+    if (cls_impact) {
+        zan_sel_t sel_alloc = g_bridge.sel_registerName("alloc");
+        zan_sel_t sel_style = g_bridge.sel_registerName("initWithStyle:");
+        zan_sel_t sel_prepare = g_bridge.sel_registerName("prepare");
+        zan_sel_t sel_occurred = g_bridge.sel_registerName("impactOccurred");
+        typedef zan_id_t (*zan_msg_alloc_fn)(zan_id_t, zan_sel_t);
+        typedef zan_id_t (*zan_msg_style_fn)(zan_id_t, zan_sel_t, long);
+        zan_msg_alloc_fn fn_alloc = (zan_msg_alloc_fn)g_bridge.objc_msgSend;
+        zan_msg_style_fn fn_style = (zan_msg_style_fn)g_bridge.objc_msgSend;
+        zan_id_t raw = fn_alloc((zan_id_t)cls_impact, sel_alloc);
+        long style = (type == 0) ? 0 : (type == 1 ? 1 : 2);
+        zan_id_t gen = fn_style(raw, sel_style, style);
+        if (gen) {
+            ((zan_msg0_fn)g_bridge.objc_msgSend)(gen, sel_prepare);
+            ((zan_msg0_fn)g_bridge.objc_msgSend)(gen, sel_occurred);
+        }
+    }
+    return 0;
+}
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val) { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on) { (void)h; (void)on; return 0; }
