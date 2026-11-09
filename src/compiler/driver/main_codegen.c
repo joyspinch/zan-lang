@@ -684,48 +684,110 @@
             }
         }
 
-        if (resolved_stdlib_root[0] &&
-            zan_driver_prefix_live(&irgen, &driver_prefixes, "IconSvgData_")) {
-            char icons_dir[1200];
-            if (zan_resolve_gui_resource_dir(resolved_stdlib_root, "Gui/icons",
-                                             icons_dir, sizeof(icons_dir))) {
-                char *icon_spec = (char *)malloc(strlen(icons_dir) + 32);
-                if (icon_spec) {
-                    snprintf(icon_spec, strlen(icons_dir) + 32,
-                             "%s=icons", icons_dir);
-                    if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
-                        embed_specs[embed_spec_count++] = icon_spec;
-                    } else {
-                        fprintf(stderr, "warning: cannot auto-embed Gui icon "
-                                "packs from '%s'; --embed resources limit "
-                                "reached\n", icons_dir);
-                        free(icon_spec);
+        /* 包清单 [embed] 声明式资源扫描：解耦所有包内嵌资源 */
+        int mcap = 64;
+        char (*mdirs)[1024] = (char (*)[1024])malloc((size_t)mcap * sizeof(*mdirs));
+        if (mdirs) {
+            int mcnt = zan_pkg_all_manifest_dirs(package_project_root, mdirs, mcap);
+            for (int m = 0; m < mcnt; m++) {
+                char mpath[1200];
+                snprintf(mpath, sizeof(mpath), "%s/zan.pkg", mdirs[m]);
+                zan_package_t pkg;
+                if (!zan_pkg_load(&pkg, mpath)) continue;
+                for (int e = 0; e < pkg.embed_count; e++) {
+                    const zan_pkg_embed_t *emb = &pkg.embeds[e];
+                    if (emb->sym_prefix[0] &&
+                        !zan_driver_prefix_live(&irgen, &driver_prefixes, emb->sym_prefix)) {
+                        continue;
                     }
-                }
-            }
-        }
+                    bool staged = false;
+                    for (int es = 0; es < embed_spec_count && !staged; es++) {
+                        const char *seq = strrchr(embed_specs[es], '=');
+                        if (seq && strcmp(seq + 1, emb->mount) == 0) staged = true;
+                    }
+                    if (staged) continue;
 
-        /* Pinyin: System */
-        if (zan_driver_prefix_live(&irgen, &driver_prefixes, "Pinyin_")) {
-            char pinyin_path[1200];
-            if (zan_resolve_gui_resource_dir(resolved_stdlib_root,
-                                            "System/Text/data/pinyin.txt",
-                                            pinyin_path, sizeof(pinyin_path))
-                ) {
-                char *pinyin_spec = (char *)malloc(strlen(pinyin_path) + 32);
-                if (pinyin_spec) {
-                    snprintf(pinyin_spec, strlen(pinyin_path) + 32,
-                             "%s=text/pinyin.txt", pinyin_path);
-                    if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
-                        embed_specs[embed_spec_count++] = pinyin_spec;
-                    } else {
-                        fprintf(stderr, "warning: cannot auto-embed the "
-                                "pinyin dictionary from '%s'; --embed "
-                                "resources limit reached\n", pinyin_path);
-                        free(pinyin_spec);
+                    char res_path[1200];
+                    if (!zan_resolve_package_resource(mdirs[m], resolved_stdlib_root,
+                                                      emb->rel_path, res_path, sizeof(res_path))) {
+                        continue;
+                    }
+
+                    char *spec_str = (char *)malloc(strlen(res_path) + strlen(emb->mount) + 8);
+                    if (!spec_str) continue;
+                    snprintf(spec_str, strlen(res_path) + strlen(emb->mount) + 8, "%s=%s", res_path, emb->mount);
+                    if (embed_spec_count >= ZAN_MAX_EMBED_SPECS) {
+                        fprintf(stderr, "warning: cannot auto-embed resource '%s' from '%s'; --embed limit reached\n",
+                                emb->mount, res_path);
+                        free(spec_str);
+                        continue;
+                    }
+                    int spec_at = embed_spec_count++;
+                    embed_specs[spec_at] = spec_str;
+
+                    if (emb->gate_key[0] || emb->filter_key[0] || emb->baseline[0]) {
+                        if (!load_proj_android_keys_done && project_root_has_manifest()) {
+                            load_proj_android_keys();
+                            load_proj_android_keys_done = true;
+                        }
+                        const char *gate_val = emb->gate_key[0] ? zan_proj_get(emb->gate_key) : NULL;
+                        bool gate_enabled = !emb->gate_key[0] || (gate_val && strcmp(gate_val, "1") == 0);
+
+                        char *keep[64];
+                        int keep_count = 0;
+                        if (emb->baseline[0]) {
+                            char base_copy[128];
+                            strncpy(base_copy, emb->baseline, sizeof(base_copy) - 1);
+                            base_copy[sizeof(base_copy) - 1] = 0;
+                            char *save_b = NULL;
+                            char *b_tok = strtok_r(base_copy, ",", &save_b);
+                            while (b_tok && keep_count < 64) {
+                                while (*b_tok == ' ') b_tok++;
+                                size_t blen = strlen(b_tok);
+                                while (blen > 0 && b_tok[blen - 1] == ' ') b_tok[--blen] = 0;
+                                if (b_tok[0]) keep[keep_count++] = strdup(b_tok);
+                                b_tok = strtok_r(NULL, ",", &save_b);
+                            }
+                        }
+                        if (gate_enabled && emb->filter_key[0]) {
+                            const char *fval = zan_proj_get(emb->filter_key);
+                            if (fval && fval[0]) {
+                                char fval_copy[512];
+                                strncpy(fval_copy, fval, sizeof(fval_copy) - 1);
+                                fval_copy[sizeof(fval_copy) - 1] = 0;
+                                char *save_f = NULL;
+                                char *f_tok = strtok_r(fval_copy, ",", &save_f);
+                                while (f_tok && keep_count < 64) {
+                                    while (*f_tok == ' ') f_tok++;
+                                    size_t flen = strlen(f_tok);
+                                    while (flen > 0 && f_tok[flen - 1] == ' ') f_tok[--flen] = 0;
+                                    if (f_tok[0] && strcmp(f_tok, "-") != 0) {
+                                        bool dup = false;
+                                        for (int j = 0; j < keep_count; j++) {
+                                            if (strcmp(keep[j], f_tok) == 0) { dup = true; break; }
+                                        }
+                                        if (!dup) keep[keep_count++] = strdup(f_tok);
+                                    }
+                                    f_tok = strtok_r(NULL, ",", &save_f);
+                                }
+                            }
+                        }
+                        if (keep_count > 0) {
+                            spec_subdirs[spec_at] = (char **)malloc((size_t)keep_count * sizeof(char *));
+                            if (spec_subdirs[spec_at]) {
+                                for (int k = 0; k < keep_count; k++) {
+                                    spec_subdirs[spec_at][k] = keep[k];
+                                }
+                                spec_subdir_counts[spec_at] = keep_count;
+                            } else {
+                                for (int k = 0; k < keep_count; k++) free(keep[k]);
+                            }
+                        }
                     }
                 }
+                zan_pkg_destroy(&pkg);
             }
+            free(mdirs);
         }
 
         /* 设计稿：--publish 且源码是窗口类形态（" : Form"）时，把工程
@@ -756,105 +818,6 @@
                 fprintf(stderr, "note: auto-embedded %d design html file(s) "
                         "from '%s/src' (encrypted in publish output)\n",
                         nd, design_root);
-            }
-        }
-
-        if (resolved_stdlib_root[0] &&
-            zan_driver_prefix_live(&irgen, &driver_prefixes, "Skin_")) {
-            bool skins_staged = false;
-            for (int es = 0; es < embed_spec_count && !skins_staged; es++) {
-                const char *seq = strrchr(embed_specs[es], '=');
-                if (!seq || strcmp(seq + 1, "skins") != 0) { continue; }
-                char base_css[1240];
-                int dirlen = (int)(seq - embed_specs[es]);
-                if (dirlen <= 0 || dirlen > (int)sizeof(base_css) - 16) {
-                    continue;
-                }
-                memcpy(base_css, embed_specs[es], (size_t)dirlen);
-                memcpy(base_css + dirlen, "/base.css", 10);
-                if (zan_file_exists(base_css)) { skins_staged = true; }
-            }
-            if (!skins_staged) {
-                char skins_dir[1200];
-                if (zan_resolve_gui_resource_dir(resolved_stdlib_root,
-                                                 "Gui/skins", skins_dir,
-                                                 sizeof(skins_dir))) {
-                    char *skin_spec = (char *)malloc(strlen(skins_dir) + 32);
-                    if (skin_spec) {
-                        snprintf(skin_spec, strlen(skins_dir) + 32,
-                                 "%s=skins", skins_dir);
-                        if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
-                            int spec_at = embed_spec_count++;
-                            embed_specs[spec_at] = skin_spec;
-                            if (!load_proj_android_keys_done &&
-                                project_root_has_manifest()) {
-                                load_proj_android_keys();
-                                load_proj_android_keys_done = true;
-                            }
-                            static const char *baseline[2] = { "dark", "light" };
-                            const char *keep[18];
-                            int keep_count = 0;
-                            for (int b = 0; b < 2; b++) keep[keep_count++] = baseline[b];
-                            if (proj_skins_enabled && proj_skin_name_count > 0) {
-                                for (int k = 0; k < proj_skin_name_count
-                                        && keep_count < 18; k++) {
-                                    bool dup = false;
-                                    for (int j = 0; j < keep_count; j++) {
-                                        if (strcmp(keep[j],
-                                                   proj_skin_names[k]) == 0) {
-                                            dup = true; break;
-                                        }
-                                    }
-                                    if (!dup) keep[keep_count++] = proj_skin_names[k];
-                                }
-                            }
-                            skin_filter = (const char **)malloc(
-                                (size_t)keep_count * sizeof(char *));
-                            if (skin_filter) {
-                                memcpy(skin_filter, keep,
-                                       (size_t)keep_count * sizeof(char *));
-                                skin_filter_count = keep_count;
-                            }
-                        } else {
-                            fprintf(stderr, "warning: cannot auto-embed Gui "
-                                    "skin packs from '%s'; --embed resources "
-                                    "limit reached\n", skins_dir);
-                            free(skin_spec);
-                        }
-                    }
-                }
-            }
-        }
-
-        if (resolved_stdlib_root[0] &&
-            zan_driver_prefix_live(&irgen, &driver_prefixes, "Chart_")) {
-            bool chartthemes_staged = false;
-            for (int es = 0; es < embed_spec_count && !chartthemes_staged;
-                 es++) {
-                const char *seq = strrchr(embed_specs[es], '=');
-                if (seq && strcmp(seq + 1, "chartthemes") == 0)
-                    chartthemes_staged = true;
-            }
-            if (!chartthemes_staged) {
-                char themes_dir[1200];
-                snprintf(themes_dir, sizeof(themes_dir),
-                         "%s/Gui/Component/Chart/themes",
-                         resolved_stdlib_root);
-                if (zan_file_exists(themes_dir)) {
-                    char *theme_spec = (char *)malloc(strlen(themes_dir) + 32);
-                    if (theme_spec) {
-                        snprintf(theme_spec, strlen(themes_dir) + 32,
-                                 "%s=chartthemes", themes_dir);
-                        if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
-                            embed_specs[embed_spec_count++] = theme_spec;
-                        } else {
-                            fprintf(stderr, "warning: cannot auto-embed chart "
-                                    "theme packs from '%s'; --embed resources "
-                                    "limit reached\n", themes_dir);
-                            free(theme_spec);
-                        }
-                    }
-                }
             }
         }
 
@@ -924,8 +887,23 @@
         }
 
         if (embed_spec_count > 0 || irgen.uses_embed_api) {
-            int nres = zan_embed_emit_specs_filtered(&irgen, embed_specs,
-                embed_spec_count, skin_filter, skin_filter_count);
+            zan_embed_spec_t *spec_items = (zan_embed_spec_t *)calloc((size_t)embed_spec_count, sizeof(zan_embed_spec_t));
+            if (spec_items) {
+                for (int es = 0; es < embed_spec_count; es++) {
+                    spec_items[es].spec = embed_specs[es];
+                    spec_items[es].subdirs = (const char *const *)spec_subdirs[es];
+                    spec_items[es].subdir_count = spec_subdir_counts[es];
+                }
+            }
+            int nres = spec_items ? zan_embed_emit_spec_list(&irgen, spec_items, embed_spec_count) : -1;
+            free(spec_items);
+            for (int es = 0; es < embed_spec_count; es++) {
+                if (spec_subdirs[es]) {
+                    for (int k = 0; k < spec_subdir_counts[es]; k++) free(spec_subdirs[es][k]);
+                    free(spec_subdirs[es]);
+                    spec_subdirs[es] = NULL;
+                }
+            }
             if (nres < 0) {
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
