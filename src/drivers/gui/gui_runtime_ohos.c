@@ -43,6 +43,18 @@ static int  g_window_width  = 0;
 static int  g_window_height = 0;
 static int  g_dpi           = 96;
 
+static int  g_safe_area_top    = 0;
+static int  g_safe_area_bottom = 0;
+static int  g_safe_area_left   = 0;
+static int  g_safe_area_right  = 0;
+
+EXPORT void zan_gui_ohos_set_safe_area(i32 top, i32 bottom, i32 left, i32 right) {
+    if (top >= 0) g_safe_area_top = (int)top;
+    if (bottom >= 0) g_safe_area_bottom = (int)bottom;
+    if (left >= 0) g_safe_area_left = (int)left;
+    if (right >= 0) g_safe_area_right = (int)right;
+}
+
 typedef struct { int e[8]; iptr win; } zan_oev_t;
 #define ZAN_OQ_CAP 512
 static zan_oev_t g_oq[ZAN_OQ_CAP];
@@ -853,10 +865,10 @@ EXPORT i32 zan_gui_window_focused(iptr hwnd_val)   { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_titlebar_height(void)           { return 0; }
 EXPORT i32 zan_gui_caption_button_width(void)      { return 0; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr h, i32 n) { (void)h; (void)n; return 0; }
-EXPORT i32 zan_gui_safe_area_top(void)             { return 0; }
-EXPORT i32 zan_gui_safe_area_bottom(void)          { return 0; }
-EXPORT i32 zan_gui_safe_area_left(void)            { return 0; }
-EXPORT i32 zan_gui_safe_area_right(void)           { return 0; }
+EXPORT i32 zan_gui_safe_area_top(void)             { return g_safe_area_top; }
+EXPORT i32 zan_gui_safe_area_bottom(void)          { return g_safe_area_bottom; }
+EXPORT i32 zan_gui_safe_area_left(void)            { return g_safe_area_left; }
+EXPORT i32 zan_gui_safe_area_right(void)           { return g_safe_area_right; }
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val)    { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0; }
@@ -956,8 +968,46 @@ EXPORT void zan_gui_ohos_set_files_dir(const char *path) {
     snprintf(g_files_dir, sizeof(g_files_dir), "%s", path);
 }
 
-EXPORT i32 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 1; }
-EXPORT const char *zan_gui_get_clipboard(void)     { return ""; }
+static char g_ohos_clip_buf[2048] = {0};
+static pthread_mutex_t g_ohos_clip_lock = PTHREAD_MUTEX_INITIALIZER;
+
+EXPORT i32 zan_gui_set_clipboard(const char *utf8) {
+    if (!utf8) return 1;
+    pthread_mutex_lock(&g_ohos_clip_lock);
+    strncpy(g_ohos_clip_buf, utf8, sizeof(g_ohos_clip_buf) - 1);
+    g_ohos_clip_buf[sizeof(g_ohos_clip_buf) - 1] = '\0';
+    pthread_mutex_unlock(&g_ohos_clip_lock);
+    return 0;
+}
+
+EXPORT const char *zan_gui_get_clipboard(void) {
+    return g_ohos_clip_buf;
+}
+
+typedef int (*FnHiLogPrint)(int type, int level, unsigned int domain, const char *tag, const char *fmt, ...);
+static FnHiLogPrint g_hilog_print = NULL;
+static int g_hilog_inited = 0;
+
+static void ohos_log_init(void) {
+    if (g_hilog_inited) return;
+    g_hilog_inited = 1;
+    g_hilog_print = (FnHiLogPrint)dlsym(RTLD_DEFAULT, "OH_LOG_Print");
+}
+
+EXPORT void zan_gui_ohos_log(i32 level, const char *tag, const char *fmt, ...) {
+    ohos_log_init();
+    va_list ap;
+    va_start(ap, fmt);
+    if (g_hilog_print) {
+        char buf[1024];
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        g_hilog_print(3 /* LOG_APP */, (int)level, 0xD002500, tag ? tag : "ZanApp", "%{public}s", buf);
+    } else {
+        vfprintf(stderr, fmt, ap);
+        fputc('\n', stderr);
+    }
+    va_end(ap);
+}
 EXPORT int  zan_gui_drop_pending(void)             { return 0; }
 EXPORT const char *zan_gui_drop_take(void)         { return ""; }
 EXPORT void zan_gui_set_ime_pos(i32 x, i32 y)      { (void)x; (void)y; }

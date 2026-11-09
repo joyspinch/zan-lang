@@ -1089,14 +1089,66 @@ EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) { (void)hwnd_val; (vo
 
 EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) { (void)x; (void)y; }
 
-static char g_ios_clipboard_buf[256] = {0};
+static char g_ios_clipboard_buf[2048] = {0};
+static pthread_mutex_t g_ios_clip_lock = PTHREAD_MUTEX_INITIALIZER;
+
 EXPORT i32 zan_gui_set_clipboard(const char *utf8) {
-    if (!utf8) return 0;
+    if (!utf8) return 1;
+    pthread_mutex_lock(&g_ios_clip_lock);
     strncpy(g_ios_clipboard_buf, utf8, sizeof(g_ios_clipboard_buf) - 1);
-    return 1;
+    g_ios_clipboard_buf[sizeof(g_ios_clipboard_buf) - 1] = '\0';
+
+    /* 若 UIKit 桥接就绪，尝试写入 UIPasteboard.generalPasteboard */
+    if (g_bridge.initialized && g_bridge.objc_getClass && g_bridge.objc_msgSend && g_bridge.sel_registerName) {
+        zan_class_t cls_pb = g_bridge.objc_getClass("UIPasteboard");
+        zan_sel_t sel_gen = g_bridge.sel_registerName("generalPasteboard");
+        zan_sel_t sel_set_str = g_bridge.sel_registerName("setString:");
+        zan_class_t cls_nsstr = g_bridge.objc_getClass("NSString");
+        zan_sel_t sel_str_utf8 = g_bridge.sel_registerName("stringWithUTF8String:");
+
+        if (cls_pb && sel_gen && sel_set_str && cls_nsstr && sel_str_utf8) {
+            zan_msg0_fn fn_gen = (zan_msg0_fn)g_bridge.objc_msgSend;
+            zan_id_t pb = fn_gen((zan_id_t)cls_pb, sel_gen);
+            zan_msg1_str_fn fn_str = (zan_msg1_str_fn)g_bridge.objc_msgSend;
+            zan_id_t ns_text = fn_str((zan_id_t)cls_nsstr, sel_str_utf8, utf8);
+            if (pb && ns_text) {
+                zan_msg1_fn fn_set = (zan_msg1_fn)g_bridge.objc_msgSend;
+                fn_set(pb, sel_set_str, ns_text);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_ios_clip_lock);
+    return 0;
 }
 
 EXPORT const char *zan_gui_get_clipboard(void) {
+    pthread_mutex_lock(&g_ios_clip_lock);
+    /* 若 UIKit 桥接就绪，尝试从 UIPasteboard.generalPasteboard 读取最新字符串 */
+    if (g_bridge.initialized && g_bridge.objc_getClass && g_bridge.objc_msgSend && g_bridge.sel_registerName) {
+        zan_class_t cls_pb = g_bridge.objc_getClass("UIPasteboard");
+        zan_sel_t sel_gen = g_bridge.sel_registerName("generalPasteboard");
+        zan_sel_t sel_get_str = g_bridge.sel_registerName("string");
+        zan_sel_t sel_utf8 = g_bridge.sel_registerName("UTF8String");
+
+        if (cls_pb && sel_gen && sel_get_str && sel_utf8) {
+            zan_msg0_fn fn_gen = (zan_msg0_fn)g_bridge.objc_msgSend;
+            zan_id_t pb = fn_gen((zan_id_t)cls_pb, sel_gen);
+            if (pb) {
+                zan_msg0_fn fn_str = (zan_msg0_fn)g_bridge.objc_msgSend;
+                zan_id_t ns_text = fn_str(pb, sel_get_str);
+                if (ns_text) {
+                    typedef const char *(*zan_msg_utf8_fn)(zan_id_t, zan_sel_t);
+                    zan_msg_utf8_fn fn_utf8 = (zan_msg_utf8_fn)g_bridge.objc_msgSend;
+                    const char *s = fn_utf8(ns_text, sel_utf8);
+                    if (s) {
+                        strncpy(g_ios_clipboard_buf, s, sizeof(g_ios_clipboard_buf) - 1);
+                        g_ios_clipboard_buf[sizeof(g_ios_clipboard_buf) - 1] = '\0';
+                    }
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_ios_clip_lock);
     return g_ios_clipboard_buf;
 }
 

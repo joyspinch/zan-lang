@@ -84,6 +84,18 @@ static int  g_window_width  = 0;
 static int  g_window_height = 0;
 static int  g_dpi           = 96;
 
+static int  g_safe_area_top    = 0;
+static int  g_safe_area_bottom = 0;
+static int  g_safe_area_left   = 0;
+static int  g_safe_area_right  = 0;
+
+EXPORT void zan_gui_android_set_safe_area(i32 top, i32 bottom, i32 left, i32 right) {
+    if (top >= 0) g_safe_area_top = (int)top;
+    if (bottom >= 0) g_safe_area_bottom = (int)bottom;
+    if (left >= 0) g_safe_area_left = (int)left;
+    if (right >= 0) g_safe_area_right = (int)right;
+}
+
 typedef struct { int e[8]; iptr win; } zan_aev_t;
 #define ZAN_AQ_CAP 512
 static zan_aev_t g_aq[ZAN_AQ_CAP];
@@ -960,10 +972,10 @@ EXPORT i32 zan_gui_window_focused(iptr hwnd_val)   { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_titlebar_height(void)           { return 0; }
 EXPORT i32 zan_gui_caption_button_width(void)      { return 0; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr h, i32 n) { (void)h; (void)n; return 0; }
-EXPORT i32 zan_gui_safe_area_top(void)             { return 0; }
-EXPORT i32 zan_gui_safe_area_bottom(void)          { return 0; }
-EXPORT i32 zan_gui_safe_area_left(void)            { return 0; }
-EXPORT i32 zan_gui_safe_area_right(void)           { return 0; }
+EXPORT i32 zan_gui_safe_area_top(void)             { return g_safe_area_top; }
+EXPORT i32 zan_gui_safe_area_bottom(void)          { return g_safe_area_bottom; }
+EXPORT i32 zan_gui_safe_area_left(void)            { return g_safe_area_left; }
+EXPORT i32 zan_gui_safe_area_right(void)           { return g_safe_area_right; }
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val)    { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0; }
