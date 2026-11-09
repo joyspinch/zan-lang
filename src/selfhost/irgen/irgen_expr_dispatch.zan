@@ -381,7 +381,7 @@ partial class Irgen {
             AddTemp(t, srt);
             return new ExprVal(t, srt);
         }
-        if (m != null && IsErasedTypeDecl(m.type, owner)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
+        if (m != null && IsErasedTypeDecl(m.type, owner)) { return FromSlot(t, ConcreteRetTy(m, recv.ty)); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);
         return new ExprVal(t, retTy);
@@ -505,9 +505,10 @@ partial class Irgen {
                 Node tt = MkType("__task"); tt.a = m.type;
                 return AsyncFrame(callRes, tt);
             }
-            if (IsErasedTypeDecl(m.type, declCls) || (rt == "i64" && MentionsTypeParam(m.type))) { return FromSlot(callRes, ConcreteTP(m.type, recv.ty)); }
-            AddTemp(callRes, m.type);
-            return new ExprVal(callRes, m.type);
+            if (IsErasedTypeDecl(m.type, declCls) || (rt == "i64" && MentionsTypeParam(m.type))) { return FromSlot(callRes, ConcreteRetTy(m, recv.ty)); }
+            Node crt0 = ConcreteRetTy(m, recv.ty);
+            AddTemp(callRes, crt0);
+            return new ExprVal(callRes, crt0);
         }
 
         // 4. Multiple candidates: runtime vtable tag comparison chain.
@@ -577,9 +578,10 @@ partial class Irgen {
             Node tt = MkType("__task"); tt.a = m.type;
             return AsyncFrame(finalRes, tt);
         }
-        if (IsErasedTypeDecl(m.type, declCls) || (rt == "i64" && MentionsTypeParam(m.type))) { return FromSlot(finalRes, ConcreteTP(m.type, recv.ty)); }
-        AddTemp(finalRes, m.type);
-        return new ExprVal(finalRes, m.type);
+        if (IsErasedTypeDecl(m.type, declCls) || (rt == "i64" && MentionsTypeParam(m.type))) { return FromSlot(finalRes, ConcreteRetTy(m, recv.ty)); }
+        Node crt1 = ConcreteRetTy(m, recv.ty);
+        AddTemp(finalRes, crt1);
+        return new ExprVal(finalRes, crt1);
     }
 
     ExprVal EmitVirtualCall(ExprVal recv, Node cls, string name, Node m, Node e) {
@@ -642,6 +644,24 @@ partial class Irgen {
         if (IsErasedTypeDecl(m.type, declCls) || (rt == "i64" && MentionsTypeParam(m.type))) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         AddTemp(t, m.type);
         return new ExprVal(t, m.type);
+    }
+
+    // The declared return of a generic class's method carries the class's
+    // type params (`ReadOnlyCollectionEnumerator<T>`); left raw, the caller's
+    // next hop could not map its own params and an erased i64 slot leaked
+    // into a pointer slot (G9: the generic GetEnumerator result fed
+    // `store i8* %i64val`). Substitute the RECEIVER's concrete type
+    // arguments into the declared return -- deep, so `List<T>` returns
+    // become `List<string>`.
+    Node ConcreteRetTy(Node m, Node recvTy) {
+        Node retTy = m.type;
+        if (retTy == null || recvTy == null) { return retTy; }
+        if (!MentionsTypeParam(retTy)) { return retTy; }
+        Node rcls = binder.FindType(recvTy.sval);
+        if (rcls == null) { return retTy; }
+        List<string> tps = TParams(rcls);
+        if (tps.Count == 0 || recvTy.kids.Count != tps.Count) { return retTy; }
+        return SubstTP(retTy, tps, recvTy.kids);
     }
 
 }
