@@ -96,7 +96,7 @@ stdlib/
 │   ├── TaskJoin.zan                 # async task join helpers
 │   ├── ZanVersion.zan               # version constants
 │   │
-│   ├── Exceptions/                  # namespace System — Exception base + concrete types
+│   ├── Exceptions/                  # namespace System — 核心运行时与IO异常基类（领域异常如 HttpRequest/Json/Regex/Socket 分别归属对应包）
 │   ├── Interop/                     # namespace System — FFI/marshaling: NativeMemory, Marshal, Com, Wide
 │   ├── Extensions/                  # namespace System — ListExtensions, StringExtensions, MemoryExtensions
 │   │
