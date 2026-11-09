@@ -78,7 +78,7 @@
 | `packages/Zan.Gui/src/Gui/Component/` | 复合组件：Chart、DataTable、CodeEditor、WebView、Dock、FilePicker、PivotTable… |
 | `packages/Zan.Industrial/src/Gui/Hmi/` | 工控：`IoTag`、`Indicator`(LED/数显)、`Gauge`、`Trend`、`Alarm`、`NumPad`、`EquipPanel` |
 | `packages/Zan.Gui.Designer/src/Gui/Designer/` | 表单设计器（`Designer.zan`、`Designer.Form.zan`、`Designer.Inspector.zan`） |
-| `packages/Zan.Gui/src/Gui/skins/`, `drivers/`, `Backend/` | 皮肤资源、原生驱动绑定、后端 |
+| `packages/Zan.Gui/skins/`, `src/Gui/drivers/`, `Backend/` | 皮肤资源、原生驱动绑定、后端 |
 | `packages/Zan.Game*/`、`packages/Zan.Sdk.*`、`packages/Zan.Platform.Compat` | 游戏引擎族、第三方 SDK、平台 API 兼容层 |
 
 ## 常见需求 → 落点
