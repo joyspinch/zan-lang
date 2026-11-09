@@ -61,6 +61,15 @@ bool zan_range_intersect(const zan_version_range_t *a, const zan_version_range_t
 bool zan_version_satisfies_range(const zan_version_t *v, const zan_version_range_t *r);
 
 typedef struct {
+    char mount[64];
+    char rel_path[256];
+    char sym_prefix[64];
+    char filter_key[64];
+    char gate_key[64];
+    char baseline[128];
+} zan_pkg_embed_t;
+
+typedef struct {
     char name[128];
     char source[512];
     char checksum[65];
@@ -70,12 +79,18 @@ typedef struct {
     char author[128];
     char license[64];
     char entry_point[256];
+    char subsystem[32];          /* e.g. "windows", "console" */
+    char subsystem_sym[64];      /* 触发子系统的符号前缀，如 "Gui_" */
+    char subsystem_driver[64];   /* 触发子系统使用的驱动名，如 "zan_gui" */
     zan_dependency_t *deps;      /* dependencies */
     int dep_count;
     int dep_cap;
     char **source_dirs;
     int source_dir_count;
     char plugin_id[64];          /* 商业插件包标识 */
+    zan_pkg_embed_t *embeds;     /* [embed] 声明资源清单 */
+    int embed_count;
+    int embed_cap;
 } zan_package_t;
 
 typedef struct {
@@ -132,6 +147,10 @@ int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
 /* 遍历所有包存储区内可见的包源码根目录 */
 int zan_pkg_all_source_roots(const char *project_dir,
                              char (*out_roots)[1024], int max_roots);
+
+/* 遍历所有包存储区内可见的包根目录（即含有 zan.pkg 的目录） */
+int zan_pkg_all_manifest_dirs(const char *project_dir,
+                              char (*out_dirs)[1024], int max_dirs);
 
 /* 按声明的命名空间访问已安装包文件（忽略物理目录结构） */
 typedef void (*zan_pkg_source_visitor_t)(const char *path, void *context);

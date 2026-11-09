@@ -591,6 +591,80 @@ int zan_pkg_all_source_roots(const char *project_dir,
     return count;
 }
 
+static int pkg_store_manifest_dirs(const char *store,
+                                   char (*out_dirs)[1024], int count,
+                                   int max_dirs) {
+    if (!pkg_is_dir(store)) return count;
+    int n = 0;
+    char **names = pkg_dir_names_sorted(store, &n);
+    if (!names) return count;
+    for (int i = 0; i < n; i++) {
+        const char *name = names[i];
+        if (!pkg_safe_component(name)) continue;
+        char pkg_dir[1024];
+        if (snprintf(pkg_dir, sizeof(pkg_dir), "%s" PATH_SEP "%s", store, name)
+            >= (int)sizeof(pkg_dir)) continue;
+#ifdef _WIN32
+        DWORD attr = GetFileAttributesA(pkg_dir);
+        if (attr == INVALID_FILE_ATTRIBUTES ||
+            (attr & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            !(attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
+#else
+        struct stat st;
+        if (lstat(pkg_dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            S_ISLNK(st.st_mode)) continue;
+#endif
+        char cand[1024];
+        pkg_store_canonical(pkg_dir, cand, sizeof(cand));
+        if (count >= max_dirs || pkg_dir_in_list(out_dirs, count, cand)) continue;
+        snprintf(out_dirs[count++], 1024, "%s", cand);
+    }
+    pkg_dir_names_free(names, n);
+    return count;
+}
+
+int zan_pkg_all_manifest_dirs(const char *project_dir,
+                              char (*out_dirs)[1024], int max_dirs) {
+    if (!project_dir || !project_dir[0] || !out_dirs || max_dirs <= 0)
+        return 0;
+    char store[1024];
+    int count = 0;
+    if (project_dir && project_dir[0]) {
+        snprintf(store, sizeof(store), "%s/packages", project_dir);
+        count = pkg_store_manifest_dirs(store, out_dirs, count, max_dirs);
+        snprintf(store, sizeof(store), "%s/.zan-packages", project_dir);
+        count = pkg_store_manifest_dirs(store, out_dirs, count, max_dirs);
+    }
+    char exe_dir[1024] = {0};
+#ifdef _WIN32
+    if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
+        char *sep = strrchr(exe_dir, '\\'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
+        count = pkg_store_manifest_dirs(store, out_dirs, count, max_dirs);
+        snprintf(store, sizeof(store), "%s\\packages", exe_dir);
+        count = pkg_store_manifest_dirs(store, out_dirs, count, max_dirs);
+    }
+#elif defined(__APPLE__)
+    uint32_t size = sizeof(exe_dir);
+    if (_NSGetExecutablePath(exe_dir, &size) == 0) {
+        char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+        count = pkg_store_manifest_dirs(store, out_dirs, count, max_dirs);
+    }
+#else
+    ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+    if (len > 0) {
+        exe_dir[len] = 0;
+        char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+        count = pkg_store_manifest_dirs(store, out_dirs, count, max_dirs);
+    }
+#endif
+    if (zan_pkg_global_store(store, sizeof(store)))
+        count = pkg_store_manifest_dirs(store, out_dirs, count, max_dirs);
+    return count;
+}
+
 int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
                            char (*out_dirs)[1024], int max_dirs) {
     if (!project_dir || !project_dir[0] ||
@@ -817,6 +891,7 @@ bool zan_pkg_api_validate(const char *api_url, char *status, size_t status_size)
 void zan_pkg_destroy(zan_package_t *pkg) {
     free(pkg->deps);
     free(pkg->source_dirs);
+    free(pkg->embeds);
     memset(pkg, 0, sizeof(*pkg));
 }
 
