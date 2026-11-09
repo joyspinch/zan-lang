@@ -1,116 +1,75 @@
 using System;
 using System.Collections.Generic;
+using System.Buffers.Binary;
 
 namespace Messaging.RabbitMQ;
 
 // AMQP 0-9-1 二进制大端序数据反序列化读取器。
+// 底层委托至 System.Buffers.Binary.BinaryBufferReader 高性能流式原语。
 public class AmqpReader {
-    private byte[] buf;
-    private int offset;
-    private int limit;
+    private BinaryBufferReader reader;
     private int bitMask;
     private int bitPos;
 
     public AmqpReader(byte[] buf) {
-        this.buf = buf;
-        this.offset = 0;
-        this.limit = buf != null ? buf.Length : 0;
+        this.reader = new BinaryBufferReader(buf);
         this.bitMask = 0;
         this.bitPos = 8;
     }
 
     public AmqpReader(byte[] buf, int offset, int length) {
-        this.buf = buf;
-        this.offset = offset;
-        this.limit = offset + length;
-        if (this.limit > buf.Length) { this.limit = buf.Length; }
+        this.reader = new BinaryBufferReader(buf, offset, length);
         this.bitMask = 0;
         this.bitPos = 8;
     }
 
-    public int Offset() { return this.offset; }
-    public int Remaining() { return this.limit - this.offset; }
-    public bool HasRemaining() { return this.offset < this.limit; }
+    public int Offset() { return this.reader.Position(); }
+    public int Remaining() { return this.reader.Remaining(); }
+    public bool HasRemaining() { return this.reader.HasRemaining(); }
 
     public int ReadOctet() {
         this.bitPos = 8;
-        if (this.offset >= this.limit) { return 0; }
-        int v = this.buf[this.offset] & 255;
-        this.offset = this.offset + 1;
-        return v;
+        return this.reader.ReadUInt8();
     }
 
     public int ReadShort() {
         this.bitPos = 8;
-        if (this.offset + 2 > this.limit) { return 0; }
-        int v = ((this.buf[this.offset] & 255) << 8) | (this.buf[this.offset + 1] & 255);
-        this.offset = this.offset + 2;
-        return v;
+        return this.reader.ReadUInt16BE();
     }
 
     public int ReadLong() {
         this.bitPos = 8;
-        if (this.offset + 4 > this.limit) { return 0; }
-        int v = ((this.buf[this.offset] & 255) << 24)
-              | ((this.buf[this.offset + 1] & 255) << 16)
-              | ((this.buf[this.offset + 2] & 255) << 8)
-              | (this.buf[this.offset + 3] & 255);
-        this.offset = this.offset + 4;
-        return v;
+        return this.reader.ReadInt32BE();
     }
 
     public long ReadLongLong() {
         this.bitPos = 8;
-        if (this.offset + 8 > this.limit) { return 0; }
-        long hi = ((long)(this.buf[this.offset] & 255) << 24)
-                | ((long)(this.buf[this.offset + 1] & 255) << 16)
-                | ((long)(this.buf[this.offset + 2] & 255) << 8)
-                | (long)(this.buf[this.offset + 3] & 255);
-        long lo = ((long)(this.buf[this.offset + 4] & 255) << 24)
-                | ((long)(this.buf[this.offset + 5] & 255) << 16)
-                | ((long)(this.buf[this.offset + 6] & 255) << 8)
-                | (long)(this.buf[this.offset + 7] & 255);
-        this.offset = this.offset + 8;
-        return (hi << 32) | (lo & 4294967295L);
+        return this.reader.ReadInt64BE();
     }
 
     public string ReadShortString() {
         this.bitPos = 8;
-        int len = this.ReadOctet();
+        int len = this.reader.ReadUInt8();
         if (len <= 0) { return ""; }
-        if (this.offset + len > this.limit) { len = this.limit - this.offset; }
-        string s = NativeMemory.GetString((nint)this.buf, this.offset, len);
-        this.offset = this.offset + len;
-        return s;
+        return this.reader.ReadStringUtf8(len);
     }
 
     public string ReadLongString() {
         this.bitPos = 8;
-        int len = this.ReadLong();
+        int len = this.reader.ReadInt32BE();
         if (len <= 0) { return ""; }
-        if (this.offset + len > this.limit) { len = this.limit - this.offset; }
-        string s = NativeMemory.GetString((nint)this.buf, this.offset, len);
-        this.offset = this.offset + len;
-        return s;
+        return this.reader.ReadStringUtf8(len);
     }
 
     public byte[] ReadBytes(int count) {
         this.bitPos = 8;
-        if (count <= 0) { return new byte[0]; }
-        if (this.offset + count > this.limit) { count = this.limit - this.offset; }
-        byte[] res = new byte[count];
-        if (count > 0) {
-            NativeMemory.Copy((nint)res, (nint)this.buf + (nint)this.offset, count);
-            this.offset = this.offset + count;
-        }
-        return res;
+        return this.reader.ReadBytes(count);
     }
 
     public bool ReadBit() {
         if (this.bitPos >= 8) {
-            if (this.offset >= this.limit) { return false; }
-            this.bitMask = this.buf[this.offset] & 255;
-            this.offset = this.offset + 1;
+            if (this.reader.Remaining() <= 0) { return false; }
+            this.bitMask = this.reader.ReadUInt8();
             this.bitPos = 0;
         }
         bool val = (this.bitMask & (1 << this.bitPos)) != 0;
@@ -123,13 +82,13 @@ public class AmqpReader {
         this.bitPos = 8;
         Dictionary<string, string> table = new Dictionary<string, string>();
         int tblLen = this.ReadLong();
-        if (tblLen <= 0 || this.offset + tblLen > this.limit) {
+        if (tblLen <= 0 || tblLen > this.reader.Remaining()) {
             return table;
         }
-        int tblEnd = this.offset + tblLen;
-        while (this.offset < tblEnd) {
+        int tblEnd = this.reader.Position() + tblLen;
+        while (this.reader.Position() < tblEnd) {
             string key = this.ReadShortString();
-            if (this.offset >= tblEnd) { break; }
+            if (this.reader.Position() >= tblEnd) { break; }
             int typeTag = this.ReadOctet();
             if (typeTag == 83) { // 'S': Long String
                 string val = this.ReadLongString();
@@ -159,7 +118,9 @@ public class AmqpReader {
                 break;
             }
         }
-        this.offset = tblEnd;
+        if (this.reader.Position() < tblEnd) {
+            this.reader.Seek(tblEnd);
+        }
         return table;
     }
 }

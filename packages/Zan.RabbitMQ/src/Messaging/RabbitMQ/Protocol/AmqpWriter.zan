@@ -1,135 +1,95 @@
 using System;
 using System.Collections.Generic;
+using System.Buffers.Binary;
 
 namespace Messaging.RabbitMQ;
 
 // AMQP 0-9-1 二进制大端序数据编码写入器。
+// 底层委托至 System.Buffers.Binary.BinaryBufferWriter 高性能流式原语。
 public class AmqpWriter {
-    private byte[] buf;
-    private int len;
-    private int cap;
-    private int bitMask;
+    private BinaryBufferWriter writer;
     private int bitPos;
 
     public AmqpWriter() {
-        this.cap = 256;
-        this.buf = new byte[this.cap];
-        this.len = 0;
-        this.bitMask = 0;
+        this.writer = new BinaryBufferWriter(256);
         this.bitPos = 0;
     }
 
     public AmqpWriter(int initialCap) {
-        this.cap = initialCap > 16 ? initialCap : 16;
-        this.buf = new byte[this.cap];
-        this.len = 0;
-        this.bitMask = 0;
+        this.writer = new BinaryBufferWriter(initialCap);
         this.bitPos = 0;
     }
 
     public int Length() {
-        return this.len;
+        return this.writer.Length();
     }
 
     public void Ensure(int count) {
-        if (this.len + count <= this.cap) { return; }
-        int nextCap = this.cap * 2;
-        while (nextCap < this.len + count) {
-            nextCap = nextCap * 2;
-        }
-        byte[] nb = new byte[nextCap];
-        if (this.len > 0) {
-            NativeMemory.Copy((nint)nb, (nint)this.buf, this.len);
-        }
-        this.buf = nb;
-        this.cap = nextCap;
+        this.writer.EnsureCapacity(count);
     }
 
     public void WriteOctet(int val) {
         this.FlushBits();
-        this.Ensure(1);
-        this.buf[this.len] = (byte)(val & 255);
-        this.len = this.len + 1;
+        this.writer.WriteUInt8(val);
     }
 
     public void WriteShort(int val) {
         this.FlushBits();
-        this.Ensure(2);
-        this.buf[this.len] = (byte)((val >> 8) & 255);
-        this.buf[this.len + 1] = (byte)(val & 255);
-        this.len = this.len + 2;
+        this.writer.WriteInt16BE(val);
     }
 
     public void WriteLong(int val) {
         this.FlushBits();
-        this.Ensure(4);
-        this.buf[this.len] = (byte)((val >> 24) & 255);
-        this.buf[this.len + 1] = (byte)((val >> 16) & 255);
-        this.buf[this.len + 2] = (byte)((val >> 8) & 255);
-        this.buf[this.len + 3] = (byte)(val & 255);
-        this.len = this.len + 4;
+        this.writer.WriteInt32BE(val);
     }
 
     public void WriteLongLong(long val) {
         this.FlushBits();
-        this.Ensure(8);
-        this.buf[this.len] = (byte)((val >> 56) & 255);
-        this.buf[this.len + 1] = (byte)((val >> 48) & 255);
-        this.buf[this.len + 2] = (byte)((val >> 40) & 255);
-        this.buf[this.len + 3] = (byte)((val >> 32) & 255);
-        this.buf[this.len + 4] = (byte)((val >> 24) & 255);
-        this.buf[this.len + 5] = (byte)((val >> 16) & 255);
-        this.buf[this.len + 6] = (byte)((val >> 8) & 255);
-        this.buf[this.len + 7] = (byte)(val & 255);
-        this.len = this.len + 8;
+        this.writer.WriteInt64BE(val);
     }
 
     public void WriteShortString(string s) {
         this.FlushBits();
         if (s == null || s.Length == 0) {
-            this.WriteOctet(0);
+            this.writer.WriteUInt8(0);
             return;
         }
         int slen = s.Length;
         if (slen > 255) { slen = 255; }
-        this.Ensure(1 + slen);
-        this.buf[this.len] = (byte)slen;
-        this.len = this.len + 1;
-        NativeMemory.PutString((nint)this.buf, this.len, s, slen);
-        this.len = this.len + slen;
+        this.writer.WriteUInt8(slen);
+        if (slen == s.Length) {
+            this.writer.WriteStringUtf8(s);
+        } else {
+            this.writer.WriteStringUtf8(s.Substring(0, slen));
+        }
     }
 
     public void WriteLongString(string s) {
         this.FlushBits();
         if (s == null) {
-            this.WriteLong(0);
+            this.writer.WriteInt32BE(0);
             return;
         }
-        int slen = s.Length;
-        this.WriteLong(slen);
-        if (slen > 0) {
-            this.Ensure(slen);
-            NativeMemory.PutString((nint)this.buf, this.len, s, slen);
-            this.len = this.len + slen;
+        this.writer.WriteInt32BE(s.Length);
+        if (s.Length > 0) {
+            this.writer.WriteStringUtf8(s);
         }
     }
 
     public void WriteBytes(byte[] data, int dataLen) {
         this.FlushBits();
         if (data == null || dataLen <= 0) { return; }
-        this.Ensure(dataLen);
-        NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)data, dataLen);
-        this.len = this.len + dataLen;
+        this.writer.WriteBytes(data, 0, dataLen);
     }
 
     public void WriteBit(bool bit) {
+        // AMQP 0-9-1 规范规定位打包为 LSB-first（从 bit 0 往 bit 7 排布）
         if (this.bitPos == 0) {
-            this.Ensure(1);
-            this.buf[this.len] = 0;
-            this.len = this.len + 1;
+            this.writer.WriteUInt8(0);
         }
         if (bit) {
-            this.buf[this.len - 1] = (byte)(this.buf[this.len - 1] | (1 << this.bitPos));
+            int pos = this.writer.Position() - 1;
+            this.writer.Buffer()[pos] = (byte)(this.writer.Buffer()[pos] | (1 << this.bitPos));
         }
         this.bitPos = this.bitPos + 1;
         if (this.bitPos >= 8) {
@@ -164,10 +124,6 @@ public class AmqpWriter {
 
     public byte[] ToBytes() {
         this.FlushBits();
-        byte[] res = new byte[this.len];
-        if (this.len > 0) {
-            NativeMemory.Copy((nint)res, (nint)this.buf, this.len);
-        }
-        return res;
+        return this.writer.ToArray();
     }
 }

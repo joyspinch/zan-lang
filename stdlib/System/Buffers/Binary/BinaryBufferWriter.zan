@@ -1,0 +1,230 @@
+using System;
+using System.Interop;
+
+namespace System.Buffers.Binary;
+
+// 高性能二进制流式缓冲写入器。
+// 支持大端/小端快速写入、Zigzag/LEB128 变长整数编码、位压缩 (Bit Packing) 与报文头回填。
+public class BinaryBufferWriter {
+    private byte[] buffer;
+    private int capacity;
+    private int position;
+    private int bitMask;
+    private int bitPos;
+
+    public BinaryBufferWriter() {
+        this.Init(256);
+    }
+
+    public BinaryBufferWriter(int initialCapacity) {
+        this.Init(initialCapacity > 16 ? initialCapacity : 16);
+    }
+
+    private void Init(int cap) {
+        this.capacity = cap;
+        this.buffer = new byte[cap];
+        this.position = 0;
+        this.bitMask = 0;
+        this.bitPos = 8;
+    }
+
+    public int Position() { return this.position; }
+    public int Length() { return this.position; }
+    public int Capacity() { return this.capacity; }
+
+    public void EnsureCapacity(int required) {
+        if (this.position + required <= this.capacity) {
+            return;
+        }
+        int nextCap = this.capacity * 2;
+        int minCap = this.position + required + 64;
+        if (nextCap < minCap) {
+            nextCap = minCap;
+        }
+        byte[] newBuf = new byte[nextCap];
+        if (this.position > 0) {
+            NativeMemory.Copy((nint)newBuf, (nint)this.buffer, this.position);
+        }
+        this.buffer = newBuf;
+        this.capacity = nextCap;
+    }
+
+    public void FlushBits() {
+        if (this.bitPos < 8) {
+            this.EnsureCapacity(1);
+            this.buffer[this.position] = (byte)this.bitMask;
+            this.position = this.position + 1;
+            this.bitMask = 0;
+            this.bitPos = 8;
+        }
+    }
+
+    public void WriteBit(bool bit) {
+        if (this.bitPos == 0) {
+            this.FlushBits();
+        }
+        if (this.bitPos == 8) {
+            this.bitMask = 0;
+        }
+        this.bitPos = this.bitPos - 1;
+        if (bit) {
+            this.bitMask = this.bitMask | (1 << this.bitPos);
+        }
+    }
+
+    public void WriteInt8(int v) {
+        this.FlushBits();
+        this.EnsureCapacity(1);
+        this.buffer[this.position] = (byte)(v & 255);
+        this.position = this.position + 1;
+    }
+
+    public void WriteUInt8(int v) {
+        this.WriteInt8(v);
+    }
+
+    // ---- 大端写入 (Big-Endian) ----
+
+    public void WriteInt16BE(int v) {
+        this.FlushBits();
+        this.EnsureCapacity(2);
+        this.buffer[this.position] = (byte)((v >> 8) & 255);
+        this.buffer[this.position + 1] = (byte)(v & 255);
+        this.position = this.position + 2;
+    }
+
+    public void WriteInt32BE(int v) {
+        this.FlushBits();
+        this.EnsureCapacity(4);
+        this.buffer[this.position] = (byte)((v >> 24) & 255);
+        this.buffer[this.position + 1] = (byte)((v >> 16) & 255);
+        this.buffer[this.position + 2] = (byte)((v >> 8) & 255);
+        this.buffer[this.position + 3] = (byte)(v & 255);
+        this.position = this.position + 4;
+    }
+
+    public void WriteInt64BE(long v) {
+        this.FlushBits();
+        this.EnsureCapacity(8);
+        this.buffer[this.position] = (byte)((v >> 56) & 255);
+        this.buffer[this.position + 1] = (byte)((v >> 48) & 255);
+        this.buffer[this.position + 2] = (byte)((v >> 40) & 255);
+        this.buffer[this.position + 3] = (byte)((v >> 32) & 255);
+        this.buffer[this.position + 4] = (byte)((v >> 24) & 255);
+        this.buffer[this.position + 5] = (byte)((v >> 16) & 255);
+        this.buffer[this.position + 6] = (byte)((v >> 8) & 255);
+        this.buffer[this.position + 7] = (byte)(v & 255);
+        this.position = this.position + 8;
+    }
+
+    // ---- 小端写入 (Little-Endian) ----
+
+    public void WriteInt16LE(int v) {
+        this.FlushBits();
+        this.EnsureCapacity(2);
+        this.buffer[this.position] = (byte)(v & 255);
+        this.buffer[this.position + 1] = (byte)((v >> 8) & 255);
+        this.position = this.position + 2;
+    }
+
+    public void WriteInt32LE(int v) {
+        this.FlushBits();
+        this.EnsureCapacity(4);
+        this.buffer[this.position] = (byte)(v & 255);
+        this.buffer[this.position + 1] = (byte)((v >> 8) & 255);
+        this.buffer[this.position + 2] = (byte)((v >> 16) & 255);
+        this.buffer[this.position + 3] = (byte)((v >> 24) & 255);
+        this.position = this.position + 4;
+    }
+
+    public void WriteInt64LE(long v) {
+        this.FlushBits();
+        this.EnsureCapacity(8);
+        this.buffer[this.position] = (byte)(v & 255);
+        this.buffer[this.position + 1] = (byte)((v >> 8) & 255);
+        this.buffer[this.position + 2] = (byte)((v >> 16) & 255);
+        this.buffer[this.position + 3] = (byte)((v >> 24) & 255);
+        this.buffer[this.position + 4] = (byte)((v >> 32) & 255);
+        this.buffer[this.position + 5] = (byte)((v >> 40) & 255);
+        this.buffer[this.position + 6] = (byte)((v >> 48) & 255);
+        this.buffer[this.position + 7] = (byte)((v >> 56) & 255);
+        this.position = this.position + 8;
+    }
+
+    // ---- 变长整数编码 (Varint / LEB128 / Zigzag) ----
+
+    public void WriteVarint32(int v, bool zigzag) {
+        this.FlushBits();
+        int u = zigzag ? ((v << 1) ^ (v >> 31)) : v;
+        while ((u & ~127) != 0) {
+            this.WriteInt8((u & 127) | 128);
+            u = (int)((uint)u >> 7);
+        }
+        this.WriteInt8(u & 127);
+    }
+
+    public void WriteVarint64(long v, bool zigzag) {
+        this.FlushBits();
+        long u = zigzag ? ((v << 1) ^ (v >> 63)) : v;
+        while ((u & ~127L) != 0L) {
+            this.WriteInt8((int)(u & 127L) | 128);
+            u = (long)((ulong)u >> 7);
+        }
+        this.WriteInt8((int)(u & 127L));
+    }
+
+    // ---- 字节与字符串写入 ----
+
+    public void WriteBytes(byte[] data, int offset, int length) {
+        if (data == null || length <= 0) { return; }
+        this.FlushBits();
+        this.EnsureCapacity(length);
+        NativeMemory.Copy((nint)this.buffer + (nint)this.position, (nint)data + (nint)offset, length);
+        this.position = this.position + length;
+    }
+
+    public void WriteBytes(byte[] data) {
+        if (data != null) {
+            this.WriteBytes(data, 0, data.Length);
+        }
+    }
+
+    public void WriteStringUtf8(string s) {
+        if (s == null || s.Length == 0) { return; }
+        this.FlushBits();
+        int len = s.Length;
+        this.EnsureCapacity(len);
+        NativeMemory.PutString((nint)this.buffer, this.position, s, len);
+        this.position = this.position + len;
+    }
+
+    // ---- 回填 (Patch) ----
+
+    public void PatchInt32BE(int offset, int v) {
+        if (offset >= 0 && offset + 4 <= this.position) {
+            this.buffer[offset] = (byte)((v >> 24) & 255);
+            this.buffer[offset + 1] = (byte)((v >> 16) & 255);
+            this.buffer[offset + 2] = (byte)((v >> 8) & 255);
+            this.buffer[offset + 3] = (byte)(v & 255);
+        }
+    }
+
+    public void Reset() {
+        this.position = 0;
+        this.bitMask = 0;
+        this.bitPos = 8;
+    }
+
+    public byte[] Buffer() {
+        return this.buffer;
+    }
+
+    public byte[] ToArray() {
+        this.FlushBits();
+        byte[] result = new byte[this.position];
+        if (this.position > 0) {
+            NativeMemory.Copy((nint)result, (nint)this.buffer, this.position);
+        }
+        return result;
+    }
+}

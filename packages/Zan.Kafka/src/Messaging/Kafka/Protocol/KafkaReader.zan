@@ -1,117 +1,60 @@
 using System;
-using System.Interop;
+using System.Buffers.Binary;
 
 namespace Messaging.Kafka;
 
-// Kafka 二进制网络协议大端序反序列化解析器
+// Kafka 二进制网络协议大端序反序列化解析器（基于 System.Buffers.Binary.BinaryBufferReader）
 public class KafkaReader {
-    private byte[] buffer;
-    private int offset;
-    private int limit;
+    private BinaryBufferReader reader;
 
     public KafkaReader(byte[] buffer) {
-        this.buffer = buffer;
-        this.offset = 0;
-        this.limit = buffer != null ? buffer.Length : 0;
+        this.reader = new BinaryBufferReader(buffer);
     }
 
     public KafkaReader(byte[] buffer, int offset, int length) {
-        this.buffer = buffer;
-        this.offset = offset;
-        this.limit = offset + length;
-        if (this.buffer != null && this.limit > this.buffer.Length) {
-            this.limit = this.buffer.Length;
-        }
+        this.reader = new BinaryBufferReader(buffer, offset, length);
     }
 
     public int Position() {
-        return this.offset;
+        return this.reader.Position();
     }
 
     public int Remaining() {
-        return this.limit - this.offset;
+        return this.reader.Remaining();
     }
 
     public void Seek(int newPosition) {
-        if (newPosition >= 0 && newPosition <= this.limit) {
-            this.offset = newPosition;
-        }
+        this.reader.Seek(newPosition);
     }
 
     public int ReadInt8() {
-        if (this.Remaining() < 1) { return 0; }
-        byte b = this.buffer[this.offset];
-        this.offset = this.offset + 1;
-        if (b >= 128) { return (int)b - 256; }
-        return (int)b;
+        return this.reader.ReadInt8();
     }
 
     public int ReadUInt8() {
-        if (this.Remaining() < 1) { return 0; }
-        byte b = this.buffer[this.offset];
-        this.offset = this.offset + 1;
-        return (int)b & 255;
+        return this.reader.ReadUInt8();
     }
 
     public int ReadInt16() {
-        if (this.Remaining() < 2) { return 0; }
-        int b0 = (int)this.buffer[this.offset] & 255;
-        int b1 = (int)this.buffer[this.offset + 1] & 255;
-        this.offset = this.offset + 2;
-        int v = (b0 << 8) | b1;
-        if (v >= 32768) { return v - 65536; }
-        return v;
+        return this.reader.ReadInt16BE();
     }
 
     public int ReadInt32() {
-        if (this.Remaining() < 4) { return 0; }
-        int b0 = (int)this.buffer[this.offset] & 255;
-        int b1 = (int)this.buffer[this.offset + 1] & 255;
-        int b2 = (int)this.buffer[this.offset + 2] & 255;
-        int b3 = (int)this.buffer[this.offset + 3] & 255;
-        this.offset = this.offset + 4;
-        return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        return this.reader.ReadInt32BE();
     }
 
     public long ReadInt64() {
-        if (this.Remaining() < 8) { return 0L; }
-        long b0 = (long)((int)this.buffer[this.offset] & 255);
-        long b1 = (long)((int)this.buffer[this.offset + 1] & 255);
-        long b2 = (long)((int)this.buffer[this.offset + 2] & 255);
-        long b3 = (long)((int)this.buffer[this.offset + 3] & 255);
-        long b4 = (long)((int)this.buffer[this.offset + 4] & 255);
-        long b5 = (long)((int)this.buffer[this.offset + 5] & 255);
-        long b6 = (long)((int)this.buffer[this.offset + 6] & 255);
-        long b7 = (long)((int)this.buffer[this.offset + 7] & 255);
-        this.offset = this.offset + 8;
-        return (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) |
-               (b4 << 24) | (b5 << 16) | (b6 << 8) | b7;
+        return this.reader.ReadInt64BE();
     }
 
     // Zigzag 解码 Varint (32位变长整数)
     public int ReadVarint() {
-        int value = 0;
-        int shift = 0;
-        while (this.Remaining() > 0) {
-            int b = this.ReadUInt8();
-            value = value | ((b & 127) << shift);
-            if ((b & 128) == 0) { break; }
-            shift = shift + 7;
-        }
-        return (int)((uint)value >> 1) ^ (-(value & 1));
+        return this.reader.ReadVarint32(true);
     }
 
     // Zigzag 解码 Varlong (64位变长整数)
     public long ReadVarlong() {
-        long value = 0L;
-        int shift = 0;
-        while (this.Remaining() > 0) {
-            int b = this.ReadUInt8();
-            value = value | (((long)(b & 127)) << shift);
-            if ((b & 128) == 0) { break; }
-            shift = shift + 7;
-        }
-        return (long)((ulong)value >> 1) ^ (-(value & 1L));
+        return this.reader.ReadVarint64(true);
     }
 
     // 读取标准 Kafka 字符串：2 字节大端有符号长度（-1 为 null）
@@ -120,16 +63,12 @@ public class KafkaReader {
         if (len < 0) { return null; }
         if (len == 0) { return ""; }
         if (this.Remaining() < len) { return ""; }
-        string s = NativeMemory.GetString((nint)this.buffer, this.offset, len);
-        this.offset = this.offset + len;
-        return s;
+        return this.reader.ReadStringUtf8(len);
     }
 
     public string ReadStringRaw(int len) {
         if (len <= 0 || this.Remaining() < len) { return ""; }
-        string s = NativeMemory.GetString((nint)this.buffer, this.offset, len);
-        this.offset = this.offset + len;
-        return s;
+        return this.reader.ReadStringUtf8(len);
     }
 
     // 读取标准 Kafka 字节数组：4 字节大端有符号长度（-1 为 null）
@@ -138,18 +77,12 @@ public class KafkaReader {
         if (len < 0) { return null; }
         if (len == 0) { return new byte[0]; }
         if (this.Remaining() < len) { return null; }
-        byte[] bytes = new byte[len];
-        NativeMemory.Copy((nint)bytes, (nint)this.buffer + (nint)this.offset, len);
-        this.offset = this.offset + len;
-        return bytes;
+        return this.reader.ReadBytes(len);
     }
 
     public byte[] ReadRaw(int count) {
         if (count <= 0 || this.Remaining() < count) { return new byte[0]; }
-        byte[] bytes = new byte[count];
-        NativeMemory.Copy((nint)bytes, (nint)this.buffer + (nint)this.offset, count);
-        this.offset = this.offset + count;
-        return bytes;
+        return this.reader.ReadBytes(count);
     }
 
     public int ReadArrayHeader() {
