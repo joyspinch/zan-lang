@@ -574,6 +574,8 @@
 
         char embed_driver_specs[128][1300];
         int embed_driver_spec_count = 0;
+        char **spec_subdirs[ZAN_MAX_EMBED_SPECS] = {0};
+        int spec_subdir_counts[ZAN_MAX_EMBED_SPECS] = {0};
         if (target.os == ZAN_OS_WINDOWS && link_static_drivers) {
             for (int d = 0; d < used_driver_count; d++) {
                 if (!used_driver_runtime[d] || !driver_dirs[d][0]) continue;
