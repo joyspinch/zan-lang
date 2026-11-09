@@ -31,7 +31,7 @@
 
    | 区块 | 截图物理px | 倍数 | 设计px | 原语映射 + token |
    |---|---|---|---|---|
-   | 侧栏 | 372 | 1.5 | 248 | Dock(3) → Prefer(230,0) 取整 |
+   | 侧栏 | 372 | 1.5 | 248 | flex-direction: row; 侧栏 width: 248px 取整 |
    | 指标行列距 | 16 | 1.5 | 11 | Grid.Of(4).Gap(12) 归档 |
 
    **账本必须带"物理px"与"倍数"两列**：换算只发生在账本里一次，
@@ -160,18 +160,18 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
 
 ## 2. 原语映射决策树
 
-- 通栏横条（顶部工具区/底部状态条）→ `Dock(1)`/`Dock(2)` + `Prefer(0,h)`
-- 通栏竖条（侧栏/导航）→ `Dock(3)`/`Dock(4)` + `Prefer(w,0)`
-- 其余内容区 → `Dock(5)`，内部按截图结构选：
-  - 纵向堆叠的区块 → `Panel.Column.Gap(档)`
-  - 一行多物（不等宽、工具行）→ `Panel.Row` / `Flex`；左右两端对齐
-    （左标题右按钮）→ `Flex.Row.Between.AlignCenter`
-  - 等宽卡片行/指标行 → `Grid.Of(n)`（**n 从截图里数出来**）
-  - 左列表右详情（1:1 或 1:2）→ `Panel.Row` 两子 `Grow`，不要用
-    两个 `Dock(5)`（会互相叠）
-  - 表单 → `FormBuilder` 或标签列固定宽的 `Panel.Row`
-  - 可滚动内容 → `ScrollView`/`ScrollColumn`
-  - 弹层/抽屉 → `OverlayPopup`/`Layer`
+- 窗口骨架首选 HTML 模板声明（`.html` 运行期装载定式），CSS 弹性布局：
+  - 通栏横条（顶部工具区/底部状态条）→ `<header>` / `<footer>` 或 `Panel.Row()`，CSS `width: 100%; height: var(--height-medium);`
+  - 通栏竖条（侧栏/导航）→ `<aside>`，CSS `width: 240px; height: 100%; flex-shrink: 0;`
+  - 其余内容区 → `<main class="grow">`，CSS `flex: 1; overflow: auto;`
+- 内容区内部按截图结构选：
+  - 纵向堆叠的区块 → `Panel.Column()` + CSS gap，或 HTML `<div class="flex flex-col gap-3">`
+  - 一行多物（不等宽、工具行）→ `Flex.Row()` 或 HTML `<div class="flex flex-row items-center justify-between">`
+  - 等宽卡片行/指标行 → `Grid.Of(n)`（**n 从截图里数出来**）或 CSS `grid-template-columns: repeat(n, 1fr)`
+  - 左列表右详情（1:1 或 1:2）→ `Flex.Row()` 两子元素挂 `grow` 类
+  - 表单 → `FormBuilder` 或标准化 HTML `<form>` 表单行
+  - 可滚动内容 → `ScrollView` 或 CSS `overflow-y: auto;`
+  - 弹层/抽屉 → 统一收口至 `OverlayHost` / `Modal` 保留式挂载
 - 手摆 `mx/my` 坐标在还原里**永远不出现**——截图是像素的，但还原产物
   必须是结构的，这样窗口缩放才不散。
 
@@ -234,40 +234,71 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
 
 | 区块 | 物理px | 倍数 | 设计px | 原语映射 + token |
 |---|---|---|---|---|
-| 侧栏（品牌+菜单+底部网关态） | 372 | 1.5 | 248 | Dock(3) → Prefer(230,0)；内部 brand Dock(1)/menu Dock(5)/状态 Dock(2) |
-| 头行：眉题+标题 左，刷新/更多 右 | 高 66 | 1.5 | 44 | Flex.Row.Between.AlignCenter；高度按内容 |
+| 侧栏（品牌+菜单+底部网关态） | 372 | 1.5 | 248 | `<aside>` width: 240px; flex-shrink: 0; 内部纵向 flex |
+| 头行：眉题+标题 左，刷新/更多 右 | 高 66 | 1.5 | 44 | `Flex.Row().Between().AlignCenter()` 或 HTML flex row between |
 | 指标行：4 张等宽卡 | 列距 16 | 1.5 | 11 | Grid.Of(4).Gap(12) 归档 |
-| 双栏：实时路由 \| 快速控制 | 1:1 | — | — | Panel.Row 两 Card Grow |
+| 双栏：实时路由 \| 快速控制 | 1:1 | — | — | Flex.Row() 两卡挂 grow |
 | 用量统计通栏卡 | 高 ~220 | 1.5 | ~146 | Card 进内容列末行；高度按内容 |
 
 （截图原稿的巨型刷新钮、被裁的"…"、宽窄不齐的指标卡是原生成 AI 手摆
 的病，还原时按铁律 2 归一——结构位置不变，尺寸回档位。）
 
-还原代码骨架（已验证：编译通过，1200×800 下 Arrange 重叠命中 0）：
+还原推荐骨架（现代正典 HTML 模板声明式装载）：
+
+```html
+<div class="window-root flex flex-row w-full h-full">
+  <!-- 侧栏 -->
+  <aside class="sidebar flex flex-col w-60 border-r border-secondary p-3">
+    <div class="brand mb-4">...</div>
+    <nav class="menu flex-1 flex flex-col gap-1">...</nav>
+    <div class="gateway-status mt-auto">...</div>
+  </aside>
+
+  <!-- 内容区 -->
+  <main class="content flex-1 flex flex-col gap-3 p-4 overflow-auto">
+    <header class="flex flex-row items-center justify-between">...</header>
+    <section class="grid grid-cols-4 gap-3">...</section>
+    <div class="flex flex-row gap-3">
+      <div class="card flex-1">...</div>
+      <div class="card flex-1">...</div>
+    </div>
+    <div class="card w-full">...</div>
+  </main>
+</div>
+```
+
+若采用代码声明建树（严格方法调用，绝无全局伪静态污染）：
 
 ```zan
-Panel root = new Panel;
-Panel side = Panel.Column;                       // 侧栏
-side.Dock(3).Prefer(230, 0);
-Panel brand = Panel.Column; brand.Dock(1);       // 品牌:名+副题
-Panel menu  = Panel.Column; menu.Dock(5);        // 菜单项逐行 With
-Panel gw    = Panel.Column; gw.Dock(2);          // 底部网关状态
-side.With(brand); side.With(menu); side.With(gw);
-root.With(side);
+Panel root = Panel.Row();
+Panel side = Panel.Column();
+side.Prefer(240, 0);
 
-Panel content = Panel.Column.Gap(12);            // 内容列
-content.Dock(5).Pad(4);
-Flex head = Flex.Row.Between.AlignCenter;    // 头行
-head.With(左标题列).With(右侧按钮行);
-content.With(head);
-Grid metrics = Grid.Of(4).Gap(12);                 // 指标行:四张等宽卡
-metrics.With(MetricCard("本地代理", "运行中"));     // …×4
-content.With(metrics);
-Panel mid = Panel.Row.Gap(12);                   // 双栏 1:1
-mid.With(路由卡.Grow).With(快速控制卡.Grow);
-content.With(mid);
-content.With(用量卡);                               // 通栏收尾
-root.With(content);
+Panel brand = Panel.Column();
+Panel menu = Panel.Column().Grow();
+Panel gw = Panel.Column();
+side.Add(brand);
+side.Add(menu);
+side.Add(gw);
+root.Add(side);
+
+Panel content = Panel.Column().Pad(4).Grow();
+Flex head = Flex.Row().Between().AlignCenter();
+head.Add(leftTitleCol);
+head.Add(rightBtnRow);
+content.Add(head);
+
+Grid metrics = Grid.Of(4).Gap(12);
+metrics.Add(MetricCard("本地代理", "运行中"));
+content.Add(metrics);
+
+Flex mid = Flex.Row().Gap(12);
+mid.Add(routerCard.Grow());
+mid.Add(controlCard.Grow());
+content.Add(mid);
+
+content.Add(usageCard);
+root.Add(content);
 ```
 
 验证产物：`_scratch/overlap_probe/router.zan`（编译 + Arrange 零重叠）；

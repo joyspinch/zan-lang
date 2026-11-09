@@ -172,11 +172,10 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
 - **游戏皮肤的 `window { background }` 必须透明**：RenderTree 先画
   Form 自身的 window 样式表面——写 opaque 底色就是全屏遮罩，表现为
   "HUD 在、世界全黑"。根 Panel（Panel.Root，style=3）天然透明，别画蛇添足。
-- **自由几何要 `data-position="1"`**（+`data-anchor`，10=stretch）：
-  缺了 pos=0 一律 Dock(Top) 通栏堆叠——面板全宽、层层压顶，整屏像
-  工具表单（用户："这是要把游戏改成工具吗"）。且 body 直接子级只吃
-  dock；悬浮面板必须包进一个 `data-dock="5"` 的裸 div 宿主再写 fx/fy
-  （wuwei Menu 同款）。
+- **自由几何推荐使用绝对定位 CSS**：
+  悬浮面板推荐声明 `style="position: absolute; left: ...; top: ...;"` 或包进一个
+  全屏弹性宿主容器中，避免流式堆叠导致面板全宽压顶。
+  悬浮面板包进一个满宽宿主再定位。
 - **裸 `<stack>` 标签不是 Stack 控件**：TagKind 兜底成自由 Panel，
   子级全叠原点。纵列用 `<zan-flex class="column">`。
 - **事件键是 `"Click"` 不是 `"click"`**：生成器发

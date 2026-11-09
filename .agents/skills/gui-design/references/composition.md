@@ -25,11 +25,26 @@ SKILL.md 是规则主干;这里是可以直接照抄的组合模式(全部用 Za
 ### 表单(标签列固定宽)
 
 ```zan
-Panel form = Panel.Column.Gap(2);                 // 行距 8px(档位)
-Panel row1 = Panel.Row.Gap(2);
-row1.Class = "items-center";                        // CSS 类经 Control.Class 生效
-Label lbl1 = new Label("名称:"); lbl1.Prefer(90, 0);  // 全表同一列宽
-row1.With(lbl1).With(new Input);                  // 输入列吃剩余空间
+Panel form = Panel.Column();
+Flex row1 = Flex.Row().Gap(8).AlignCenter();
+Label lbl1 = new Label("名称:");
+lbl1.Prefer(90, 0);  // 全表同一列宽
+Input input1 = new Input();
+input1.Grow();       // 输入列吃剩余空间
+row1.Add(lbl1);
+row1.Add(input1);
+form.Add(row1);
+```
+
+或使用 HTML 模板声明（推荐）：
+
+```html
+<div class="flex flex-col gap-2">
+  <div class="flex flex-row items-center gap-2">
+    <label class="w-24 text-secondary">名称:</label>
+    <input class="flex-1" placeholder="请输入..." />
+  </div>
+</div>
 ```
 
 多行表单:所有标签列同宽、所有输入框同高(默认 medium),主操作按钮
@@ -43,8 +58,10 @@ primary 变体,次动作 secondary/ghost。全部 small 档 + `px-2`。
 ### 卡片网格
 
 ```zan
-Grid g = Grid.Of(3).Gap(12);                        // 或原子类 grid-cols-3 gap-3
-g.With(new Card(...)).With(new Card(...)) ...;
+Grid g = Grid.Of(3).Gap(12);
+g.Add(new Card("卡片1"));
+g.Add(new Card("卡片2"));
+g.Add(new Card("卡片3"));
 ```
 
 卡片内边距统一 `p-3`,标题 small + text-secondary,正文 medium,
