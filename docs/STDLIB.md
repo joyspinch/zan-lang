@@ -103,13 +103,18 @@ stdlib/
 │   ├── IO/                          # System.IO 原语基石
 │   │   ├── File.zan                 # 基础文件读写与同步/异步双轨 API
 │   │   ├── Directory.zan            # 目录扫描、创建与双轨异步操作
+│   │   ├── Path.zan                 # 跨平台路径解析、规范化与合成
 │   │   ├── Stream.zan               # 基础抽象流
 │   │   ├── FileStream.zan           # 文件流
+│   │   ├── MemoryStream.zan         # 内存流
+│   │   ├── StreamReader.zan         # 文本读取流
+│   │   ├── StreamWriter.zan         # 文本写入流
+│   │   ├── FileAccess.zan           # 文件访问权限枚举
+│   │   ├── FileMode.zan             # 文件打开模式枚举
 │   │   ├── ByteBuffer.zan           # 可增长字节缓冲区
 │   │   ├── FileInfo.zan             # 文件元数据
 │   │   ├── FileInfoEx.zan           # 文件扩展信息与属性探针
 │   │   └── SeekOrigin.zan           # 偏移枚举
-│   │   # 注：Path 托管实现位于 packages/Zan.IO，命名空间仍为 System.IO
 │   │
 │   ├── Collections/Generic/         # System.Collections.Generic 基础集合容器
 │   │   ├── HashSet.zan              # 哈希集合
@@ -615,8 +620,7 @@ after the join. `TaskGroup` does not exist; the join helpers live in
 `CreateUnbounded()` / `CreateBounded(capacity)`, `TryWrite(T)` /
 `async bool Write(T)`, `TryRead(out T)` / `async bool Read(out T)`, `Count()`,
 `IsCompleted()`, `Complete()`, `Close()`. A closed-and-drained channel reports
-failure instead of blocking. `StringChannel` is the string-only variant kept
-for compatibility (`Send(string)` / `async string Receive()`).
+failure instead of blocking.
 
 **Cancellation** — `CancellationToken`, `CancellationTokenSource` and
 `CancellationTokenRegistration` (`stdlib/System/Threading/`). A source offers

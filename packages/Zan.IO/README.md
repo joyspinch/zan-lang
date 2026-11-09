@@ -1,18 +1,14 @@
 # Zan.IO
 
-扩展 I/O：路径、文本流、压缩族与文件监视（纯 Zan，无原生依赖）。
+扩展 I/O：高级文件、压缩族与文件监视（纯 Zan，无原生依赖）。
 `using System.IO;` / `using System.IO.Compression;` / `using System.IO.Watch;`
 按需拉入，命名空间保留零破坏。
 
-## 内容（System/IO 拆半：核心 8 文件留守 stdlib，其余迁入）
+## 内容（基础 I/O 原语位于 stdlib，高级扩展位于本包）
 
 | 文件 | 内容 |
 |---|---|
-| `Path.zan` | 路径组合/解析与扩展（判扩展名、规范化、Glob匹配） |
-| `MemoryStream.zan` | 内存流（Stream 公共基类的内存实现） |
-| `StreamReader.zan` / `StreamWriter.zan` | 文本读写流 |
 | `MemoryMappedFile.zan` | 内存映射文件 |
-| `FileAccess.zan` / `FileMode.zan` | 打开语义枚举 |
 | `IniFile.zan` | INI 解析/写回（IniFile/IniSection/IniEntry） |
 | `KnownFolders.zan` | 系统 known folders（桌面/下载/AppData…） |
 | `Shortcut.zan` | Windows .lnk 解析（Shortcut/ShortcutInfo） |
