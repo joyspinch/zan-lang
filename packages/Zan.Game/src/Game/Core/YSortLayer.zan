@@ -1,0 +1,134 @@
+using System;
+
+namespace Game.Core;
+
+// 深度序渲染回调：实体 id、类型槽位、脚底 y（屏幕系）。
+// 仓里没有多元 Action 泛型（System.Linq 只有 Action<T> 一元，
+// Gui.Action 是零元），多参回调一律声明具名委托。
+public delegate void SortedRenderFn(int entityId, int entityType, double footY);
+
+// 2.5D 遮挡关系 Y 轴动态深度排序层（YSort）。
+// 解决树木、建筑物、玩家、怪物、NPC 之间的相互遮挡层级。
+// 零 GC 预分配，支持千级实体每帧原位快速排序。
+public class YSortLayer {
+    public int capacity;
+    public int count;
+
+    public int[] entityIds;
+    public int[] entityTypes;  // 区分玩家、怪物、建筑、掉落物
+    public double[] footY;  // 排序基准脚底 Y 坐标
+    public int[] orderIndices;  // 排序后的索引序列
+
+    public YSortLayer(int cap) {
+        this.capacity = cap > 0 ? cap : 2048;
+        this.count = 0;
+
+        this.entityIds = new int[capacity];
+        this.entityTypes = new int[capacity];
+        this.footY = new double[capacity];
+        this.orderIndices = new int[capacity];
+    }
+
+    public static YSortLayer Create(int cap) {
+        return new YSortLayer(cap);
+    }
+
+    public int Count { get { return count; } }
+
+    public void Clear() {
+        count = 0;
+    }
+
+    // 登记一个待渲染实体及其脚底世界 Y 坐标。
+    public bool Push(int id, int type, double y) {
+        if (count >= capacity) { return false; }
+        entityIds[count] = id;
+        entityTypes[count] = type;
+        footY[count] = y;
+        orderIndices[count] = count;
+        count = count + 1;
+        return true;
+    }
+
+    // 原位快速排序，按 footY 从小到大排定渲染顺序。
+    public void Sort() {
+        if (count <= 1) { return; }
+        QuickSort(0, count - 1);
+    }
+
+    public void QuickSort(int left, int right) {
+        if (left >= right) { return; }
+
+        // 小切片（< 16）改用插入排序：消减浅层递归开销，且在帧间物体几乎有序时接近 O(n)
+        if (right - left < 16) {
+            for (int p = left + 1; p <= right; p = p + 1) {
+                int keyIdx = orderIndices[p];
+                double keyY = footY[keyIdx];
+                int q = p - 1;
+                while (q >= left && footY[orderIndices[q]] > keyY) {
+                    orderIndices[q + 1] = orderIndices[q];
+                    q = q - 1;
+                }
+                orderIndices[q + 1] = keyIdx;
+            }
+            return;
+        }
+
+        int i = left;
+        int j = right;
+        // 三数取中枢轴：横向卷轴/排队场景里 footY 帧间接近有序，
+        // 固定取中点元素会退化成 O(n^2)；取首/中/尾的中位数保证期望 O(n log n)
+        double aY = footY[orderIndices[left]];
+        double mY = footY[orderIndices[(left + right) >> 1]];
+        double zY = footY[orderIndices[right]];
+        double pivotY = mY;
+        if ((aY - mY) * (zY - mY) > 0.0) {
+            // mY 不是中位数（aY 与 zY 在 mY 同侧）：取 aY/zY 中居中的那个
+            if ((mY - aY) * (zY - aY) <= 0.0) { pivotY = aY; }
+            else { pivotY = zY; }
+        }
+
+        while (i <= j) {
+            while (footY[orderIndices[i]] < pivotY) { i = i + 1; }
+            while (footY[orderIndices[j]] > pivotY) { j = j - 1; }
+
+            if (i <= j) {
+                int temp = orderIndices[i];
+                orderIndices[i] = orderIndices[j];
+                orderIndices[j] = temp;
+                i = i + 1;
+                j = j - 1;
+            }
+        }
+
+        if (left < j) { QuickSort(left, j); }
+        if (i < right) { QuickSort(i, right); }
+    }
+
+    // 获取排序后第 i 个槽位的实体 ID（0 分配直通）。
+    public int GetSortedEntityId(int i) {
+        if (i < 0 || i >= count) { return -1; }
+        return entityIds[orderIndices[i]];
+    }
+
+    // 获取排序后第 i 个槽位的实体类型。
+    public int GetSortedEntityType(int i) {
+        if (i < 0 || i >= count) { return 0; }
+        return entityTypes[orderIndices[i]];
+    }
+
+    // 获取排序后第 i 个槽位的脚底 Y 坐标。
+    public double GetSortedFootY(int i) {
+        if (i < 0 || i >= count) { return 0.0; }
+        return footY[orderIndices[i]];
+    }
+
+    // 依正确的深度遮挡顺序逐个提取实体渲染。
+    public void ForEachSorted(SortedRenderFn renderAction) {
+        if (renderAction == null) { return; }
+        for (int i = 0; i < count; i = i + 1) {
+            int slot = orderIndices[i];
+            renderAction(entityIds[slot], entityTypes[slot], footY[slot]);
+        }
+    }
+}

@@ -1,0 +1,148 @@
+using System;
+
+namespace Game.Core;
+
+// 2.5D 等轴测（Isometric）斜 45 度菱形地图映射引擎。
+// 专为传奇类、暗黑类、经典模拟经营游戏设计。
+// 采用工业界标准的 2:1 等轴测投影变换（例如 64x32 菱形地砖）。
+public class IsoTileMap {
+    public int mapWidth;  // 地图瓦片横向格数
+    public int mapHeight;  // 地图瓦片纵向格数
+    public int tileWidth;  // 瓦片菱形外接矩形宽（例如 64）
+    public int tileHeight;  // 瓦片菱形外接矩形高（例如 32，刚好为 2:1）
+    public int halfTileW;
+    public int halfTileH;
+    public double dHalfTileW;
+    public double dHalfTileH;
+    public double invHalfTileW;
+    public double invHalfTileH;
+
+    public int[] groundTiles;  // 地表地砖类型 ID
+    public byte[] collision;  // 阻挡图层：0 为可行走，1 为实体墙壁/悬崖障碍
+
+    public IsoTileMap(int mapW, int mapH, int tileW, int tileH) {
+        this.mapWidth = mapW > 0 ? mapW : 128;
+        this.mapHeight = mapH > 0 ? mapH : 128;
+        this.tileWidth = tileW > 0 ? tileW : 64;
+        this.tileHeight = tileH > 0 ? tileH : 32;
+        this.halfTileW = this.tileWidth >> 1;
+        this.halfTileH = this.tileHeight >> 1;
+        this.dHalfTileW = (double)this.halfTileW;
+        this.dHalfTileH = (double)this.halfTileH;
+        this.invHalfTileW = 1.0 / this.dHalfTileW;
+        this.invHalfTileH = 1.0 / this.dHalfTileH;
+
+        int total = this.mapWidth * this.mapHeight;
+        this.groundTiles = new int[total];
+        this.collision = new byte[total];
+    }
+
+    public static IsoTileMap Create(int mapW, int mapH, int tileW, int tileH) {
+        return new IsoTileMap(mapW, mapH, tileW, tileH);
+    }
+
+    public int MapWidth { get { return mapWidth; } }
+    public int MapHeight { get { return mapHeight; } }
+    public int TileWidth { get { return tileWidth; } }
+    public int TileHeight { get { return tileHeight; } }
+
+    public int Index(int gx, int gy) {
+        return gy * mapWidth + gx;
+    }
+
+    public void SetTile(int gx, int gy, int tileId, bool blocked) {
+        if (gx < 0 || gx >= mapWidth || gy < 0 || gy >= mapHeight) { return; }
+        int idx = Index(gx, gy);
+        groundTiles[idx] = tileId;
+        collision[idx] = blocked ? (byte)1 : (byte)0;
+    }
+
+    public int GetTile(int gx, int gy) {
+        if (gx < 0 || gx >= mapWidth || gy < 0 || gy >= mapHeight) { return -1; }
+        return groundTiles[Index(gx, gy)];
+    }
+
+    public bool IsBlocked(int gx, int gy) {
+        if (gx < 0 || gx >= mapWidth || gy < 0 || gy >= mapHeight) { return true; }
+        return collision[Index(gx, gy)] != (byte)0;
+    }
+
+    // 网格坐标 (gx, gy) 转换为屏幕空间坐标 (sx, sy)。
+    // 菱形地表中心点。
+    public void GridToWorld(int gx, int gy, out double sx, out double sy) {
+        sx = (double)(gx - gy) * dHalfTileW;
+        sy = (double)(gx + gy) * dHalfTileH;
+    }
+
+    // 世界/屏幕拾取坐标 (sx, sy) 逆转换为网格坐标 (gx, gy)。
+    // 鼠标点击寻路、移动落点的核心算子。
+    public void WorldToGrid(double sx, double sy, out int gx, out int gy) {
+        double divX = sx * invHalfTileW;
+        double divY = sy * invHalfTileH;
+        gx = (int)Math.Floor((divY + divX) * 0.5);
+        gy = (int)Math.Floor((divY - divX) * 0.5);
+    }
+
+    // 根据摄像机当前可视世界范围 [viewLeft, viewTop, viewRight, viewBottom]
+    // 计算需要被遍历渲染的等轴测网格瓦片包围盒 [minGx, maxGx, minGy, maxGy]。
+    // 自动附加 padding 瓦片边距以消除边缘地块裁切闪烁，并裁剪至地图有效范围。
+    public void GetVisibleGridBounds(
+        double viewLeft, double viewTop, double viewRight, double viewBottom,
+        int padding,
+        out int minGx, out int maxGx, out int minGy, out int maxGy
+    ) {
+        double divXL = viewLeft * invHalfTileW;
+        double divXR = viewRight * invHalfTileW;
+        double divYT = viewTop * invHalfTileH;
+        double divYB = viewBottom * invHalfTileH;
+
+        int gxTL = (int)Math.Floor((divYT + divXL) * 0.5);
+        int gyTL = (int)Math.Floor((divYT - divXL) * 0.5);
+        int gxTR = (int)Math.Floor((divYT + divXR) * 0.5);
+        int gyTR = (int)Math.Floor((divYT - divXR) * 0.5);
+        int gxBL = (int)Math.Floor((divYB + divXL) * 0.5);
+        int gyBL = (int)Math.Floor((divYB - divXL) * 0.5);
+        int gxBR = (int)Math.Floor((divYB + divXR) * 0.5);
+        int gyBR = (int)Math.Floor((divYB - divXR) * 0.5);
+
+        int minX = gxTL < gxBL ? gxTL : gxBL;
+        int maxX = gxTR > gxBR ? gxTR : gxBR;
+        int minY = gyTL < gyTR ? gyTL : gyTR;
+        int maxY = gyBL > gyBR ? gyBL : gyBR;
+
+        minX = minX - padding;
+        maxX = maxX + padding;
+        minY = minY - padding;
+        maxY = maxY + padding;
+
+        if (minX < 0) { minX = 0; }
+        if (maxX >= mapWidth) { maxX = mapWidth - 1; }
+        if (minY < 0) { minY = 0; }
+        if (maxY >= mapHeight) { maxY = mapHeight - 1; }
+
+        minGx = minX;
+        maxGx = maxX;
+        minGy = minY;
+        maxGy = maxY;
+    }
+
+    // 计算 8 方向朝向索引（0: 上, 1: 右上, 2: 右, 3: 右下, 4: 下, 5: 左下, 6: 左, 7: 左上）。
+    // ARPG 角色移动、砍怪朝向判定的标准算法。
+    public static int GetDirection8(double fromX, double fromY, double toX, double toY) {
+        double dx = toX - fromX;
+        double dy = toY - fromY;
+        double absDx = dx < 0.0 ? -dx : dx;
+        double absDy = dy < 0.0 ? -dy : dy;
+        if (absDx < 0.001 && absDy < 0.001) {
+            return 4;  // 默认朝南
+        }
+        // Atan2 输出角度 [-PI .. PI]，预计算 180.0 / PI = 57.29577951308232
+        double angleDeg = Math.Atan2(dy, dx) * 57.29577951308232;
+        if (angleDeg < 0.0) { angleDeg = angleDeg + 360.0; }
+
+        // 将 360 度分为 8 个 45 度扇区（乘倒数代替除法，掩码 & 7 代替取余）
+        int sector = ((int)Math.Floor((angleDeg + 22.5) * 0.022222222222222223)) & 7;
+        // sector: 0:东(右), 1:东南(右下), 2:南(下), 3:西南(左下), 4:西(左), 5:西北(左上), 6:北(上), 7:东北(右上)
+        return sector;
+    }
+}
