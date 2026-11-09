@@ -7,6 +7,14 @@
 
 #include "irgen.h"
 
+typedef struct {
+    const char *spec;
+    const char *const *subdirs;
+    int subdir_count;
+} zan_embed_spec_t;
+
+int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int count);
+
 int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count);
 
 int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,

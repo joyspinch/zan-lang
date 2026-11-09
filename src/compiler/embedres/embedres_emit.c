@@ -680,15 +680,14 @@ int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
     return zan_embed_emit_specs_filtered(g, specs, count, NULL, 0);
 }
 
-int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
-                                  int count, const char *const *filter,
-                                  int filter_count) {
+int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int count) {
     zan_embed_list_t files;
     memset(&files, 0, sizeof(files));
 
     for (int i = 0; i < count; i++) {
+        if (!specs[i].spec || !specs[i].spec[0]) continue;
         char path[1024];
-        snprintf(path, sizeof(path), "%s", specs[i]);
+        snprintf(path, sizeof(path), "%s", specs[i].spec);
         char *eq = strrchr(path, '=');
         const char *prefix = NULL;
         if (eq) { *eq = 0; prefix = eq + 1; }
@@ -699,16 +698,15 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         }
 #endif
         int before = files.n;
-        int filtering = filter != NULL && filter_count > 0
-                        && embed_is_dir(path)
-                        && prefix != NULL && strcmp(prefix, "skins") == 0;
+        int filtering = specs[i].subdirs != NULL && specs[i].subdir_count > 0
+                        && embed_is_dir(path);
         if (filtering) embed_walk_filtered(&files, path, prefix,
-                                           filter, filter_count);
+                                           specs[i].subdirs, specs[i].subdir_count);
         else if (embed_is_dir(path)) embed_walk(&files, path, prefix);
         else embed_add_file(&files, path, prefix);
         if (files.n == before) {
             fprintf(stderr, "error: --embed '%s' matched no readable file\n",
-                    specs[i]);
+                    specs[i].spec);
             for (int f = 0; f < files.n; f++) {
                 free(files.v[f].name);
                 free(files.v[f].data);
