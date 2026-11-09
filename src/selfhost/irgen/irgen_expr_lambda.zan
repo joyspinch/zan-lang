@@ -38,6 +38,7 @@ partial class Irgen {
     void CollectCapturedNames(Node n, List<string> outv) {
         if (n == null) { return; }
         if (n.kind == AK.Lambda()) {
+            if (IsTreeLambda(n)) { return; }
             List<string> used = new List<string>();
             CollectIdents(n.a, used);
             CollectIdents(n.d, used);
@@ -110,6 +111,7 @@ partial class Irgen {
             return false;
         }
         if (k == AK.Lambda()) {
+            if (IsTreeLambda(n)) { return false; }
             // a nested closure: its own declarations shadow the outer ones
             List<string> inner = new List<string>();
             int i = 0;
@@ -151,6 +153,11 @@ partial class Irgen {
 
     // copy delegate parameter/return types onto a lambda's params + return slot
     void AnnotateLambda(Node lam, Node dty) {
+        if (IsTreeLambda(lam)) {
+            diags.Error("[E3103] expression tree lambda cannot convert to delegate type '" + dty.sval
+                + "': bind it to an ExprNode/Expr<T> parameter", lam.line, lam.col);
+            return;
+        }
         if (dty != null && (IsAsyncDelegate(dty) || binder.DelegateIsAsync(dty.sval))) {
             diags.Error("[E3104] cannot convert a lambda to async delegate '" + dty.sval
                 + "': a lambda is not a coroutine; assign an async method group instead", lam.line, lam.col);
@@ -385,7 +392,197 @@ partial class Irgen {
         return new ExprVal(TagClosure(rec), DelegTypeOf(retTy, pt));
     }
 
+    public bool IsTreeLambda(Node n) {
+        if (n == null || n.kind != AK.Lambda()) { return false; }
+        if (n.kids.Count != 1) { return false; }
+        if (n.d != null) { return false; }
+        Node p0 = n.kids[0];
+        if (p0 == null || p0.kind != AK.Param() || p0.type == null) { return false; }
+        string ts = p0.type.sval;
+        if (ts == "ExprNode" || ts == "System.Linq.ExprNode") { return true; }
+        if (ts == "Expr" || ts == "System.Linq.Expr") { return true; }
+        if (ts.StartsWith("Expr<") || ts.StartsWith("System.Linq.Expr<")) { return true; }
+        return false;
+    }
+
+    Node TreeCall0(string fn, int line, int col) {
+        Node id = new Node(AK.Ident()); id.sval = "ExprNode"; id.line = line; id.col = col;
+        Node mem = new Node(AK.MemberAccess()); mem.a = id; mem.sval = fn; mem.line = line; mem.col = col;
+        Node call = new Node(AK.Call()); call.a = mem; call.line = line; call.col = col;
+        call.type = MkType("ExprNode");
+        return call;
+    }
+
+    Node TreeCall1(string fn, Node a0, int line, int col) {
+        Node call = TreeCall0(fn, line, col);
+        call.Add(a0);
+        return call;
+    }
+
+    Node TreeCall2(string fn, Node a0, Node a1, int line, int col) {
+        Node call = TreeCall0(fn, line, col);
+        call.Add(a0);
+        call.Add(a1);
+        return call;
+    }
+
+    Node TreeCall3(string fn, Node a0, Node a1, Node a2, int line, int col) {
+        Node call = TreeCall0(fn, line, col);
+        call.Add(a0);
+        call.Add(a1);
+        call.Add(a2);
+        return call;
+    }
+
+    Node TreeStr(string s, int line, int col) {
+        Node lit = new Node(AK.StringLit());
+        lit.sval = s; lit.line = line; lit.col = col;
+        return lit;
+    }
+
+    Node BuildExprTree(Node e, string pn) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        int line = e.line; int col = e.col;
+        if (k == AK.IntLit()) {
+            return TreeCall1("Const", e, line, col);
+        }
+        if (k == AK.FloatLit()) {
+            return TreeCall1("Const", e, line, col);
+        }
+        if (k == AK.StringLit()) {
+            return TreeCall1("Const", e, line, col);
+        }
+        if (k == AK.BoolLit()) {
+            return TreeCall1("Const", e, line, col);
+        }
+        if (k == AK.NullLit()) {
+            return TreeCall0("NullConst", line, col);
+        }
+        if (k == AK.CharLit()) {
+            string s = "";
+            s = s + (char)e.ival;
+            return TreeCall1("Const", TreeStr(s, line, col), line, col);
+        }
+        if (k == AK.Unary()) {
+            if (e.op == TK.Bang()) {
+                Node a = BuildExprTree(e.a, pn);
+                if (a == null) { return null; }
+                return TreeCall1("Not", a, line, col);
+            }
+            if (e.op == TK.Minus()) {
+                if (e.a != null && e.a.kind == AK.IntLit()) {
+                    Node lit = new Node(AK.IntLit());
+                    lit.ival = -e.a.ival; lit.line = line; lit.col = col;
+                    return TreeCall1("Const", lit, line, col);
+                }
+                if (e.a != null && e.a.kind == AK.FloatLit()) {
+                    Node lit = new Node(AK.FloatLit());
+                    lit.sval = "-" + e.a.sval; lit.line = line; lit.col = col;
+                    return TreeCall1("Const", lit, line, col);
+                }
+            }
+            if (e.op == TK.Plus()) {
+                return BuildExprTree(e.a, pn);
+            }
+            diags.Error("[E3103] expression tree lambda: unary operator has no ExprNode form", line, col);
+            return null;
+        }
+        if (k == AK.Binary()) {
+            string opStr = "";
+            int op = e.op;
+            if (op == TK.EqEq()) { opStr = "=="; }
+            else if (op == TK.BangEq()) { opStr = "!="; }
+            else if (op == TK.Less()) { opStr = "<"; }
+            else if (op == TK.Greater()) { opStr = ">"; }
+            else if (op == TK.LessEq()) { opStr = "<="; }
+            else if (op == TK.GreaterEq()) { opStr = ">="; }
+            else if (op == TK.Plus()) { opStr = "+"; }
+            else if (op == TK.Minus()) { opStr = "-"; }
+            else if (op == TK.Star()) { opStr = "*"; }
+            else if (op == TK.Slash()) { opStr = "/"; }
+            else if (op == TK.Percent()) { opStr = "%"; }
+            else if (op == TK.AmpAmp()) { opStr = "&&"; }
+            else if (op == TK.PipePipe()) { opStr = "||"; }
+            if (opStr == "") {
+                diags.Error("[E3103] expression tree lambda: operator has no ExprNode form", line, col);
+                return null;
+            }
+            Node left = BuildExprTree(e.a, pn);
+            Node right = BuildExprTree(e.b, pn);
+            if (left == null || right == null) { return null; }
+            return TreeCall3("Binary", TreeStr(opStr, line, col), left, right, line, col);
+        }
+        if (k == AK.MemberAccess()) {
+            Node obj = e.a;
+            if (obj == null || obj.kind != AK.Ident() || obj.sval != pn) {
+                diags.Error("[E3103] expression tree lambda: only direct member access on the lambda parameter (x.F) is supported", line, col);
+                return null;
+            }
+            return TreeCall1("Member", TreeStr(e.sval, line, col), line, col);
+        }
+        if (k == AK.Call()) {
+            Node cal = e.a;
+            Node robj = (cal != null && cal.kind == AK.MemberAccess()) ? cal.a : null;
+            Node fld = null;
+            if (cal != null && cal.kind == AK.MemberAccess() && robj != null && robj.kind == AK.MemberAccess()
+                && robj.a != null && robj.a.kind == AK.Ident() && robj.a.sval == pn) {
+                fld = robj;
+            }
+            if (fld == null) {
+                diags.Error("[E3103] expression tree lambda: only x.F.Method(arg) calls on a lambda-parameter member are supported", line, col);
+                return null;
+            }
+            string mn = cal.sval;
+            if (mn != "StartsWith" && mn != "EndsWith" && mn != "Contains") {
+                diags.Error("[E3103] expression tree lambda: method '" + mn + "' has no ExprNode form (v1 supports StartsWith/EndsWith/Contains with a constant argument)", line, col);
+                return null;
+            }
+            if (e.kids.Count != 1) {
+                diags.Error("[E3103] expression tree lambda: method '" + mn + "' expects 1 argument", line, col);
+                return null;
+            }
+            Node recv = TreeCall1("Member", TreeStr(fld.sval, line, col), line, col);
+            Node arg = BuildExprTree(e.kids[0], pn);
+            if (arg == null) { return null; }
+            return TreeCall3("Call", TreeStr(mn, line, col), recv, arg, line, col);
+        }
+        if (k == AK.Ident()) {
+            if (e.sval == pn) {
+                diags.Error("[E3103] expression tree lambda: cannot reference the lambda parameter itself; access a member (x.F) instead", line, col);
+            } else {
+                diags.Error("[E3103] expression tree lambda: outer variables cannot be captured (v1 translates literals only)", line, col);
+            }
+            return null;
+        }
+        diags.Error("[E3103] expression tree lambda: this expression form cannot be translated", line, col);
+        return null;
+    }
+
+    ExprVal GenTreeLambda(Node lam) {
+        if (lam.kids.Count == 0 || lam.a == null) {
+            return new ExprVal("null", MkType("ExprNode"));
+        }
+        string pn = lam.kids[0].sval;
+        Node tree = BuildExprTree(lam.a, pn);
+        if (tree == null) {
+            return new ExprVal("null", MkType("ExprNode"));
+        }
+        Node p0 = lam.kids[0];
+        if (p0.type != null && (p0.type.sval == "Expr" || p0.type.sval.StartsWith("Expr<") || p0.type.sval == "System.Linq.Expr" || p0.type.sval.StartsWith("System.Linq.Expr<"))) {
+            Node id = new Node(AK.Ident()); id.sval = "Expr"; id.line = lam.line; id.col = lam.col;
+            Node mem = new Node(AK.MemberAccess()); mem.a = id; mem.sval = "From"; mem.line = lam.line; mem.col = lam.col;
+            Node call = new Node(AK.Call()); call.a = mem; call.line = lam.line; call.col = lam.col;
+            call.Add(tree);
+            return GenExpr(call);
+        }
+        return GenExpr(tree);
+    }
+
     ExprVal GenLambda(Node lam) {
+        if (IsTreeLambda(lam)) {
+            return GenTreeLambda(lam);
+        }
         int id = lamCount; lamCount = lamCount + 1;
         string fname = "@__lambda_" + id;
 
