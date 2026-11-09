@@ -670,8 +670,8 @@ struct zan_irgen {
     bool external_async_executor;
     bool mf_native;           /* 本机宿主平台构建标记 (x64/arm64) */
 
-    char prefix_cache[32][64];
-    bool prefix_cache_val[32];
+    char prefix_cache[128][64];
+    bool prefix_cache_val[128];
     int  prefix_cache_count;
 
     /* DWARF 调试信息构建器状态 (-g 选项激活) */

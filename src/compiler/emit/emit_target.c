@@ -509,7 +509,7 @@ bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix) {
             break;
         }
     }
-    if (g->prefix_cache_count < 32) {
+    if (g->prefix_cache_count < 128) {
         snprintf(g->prefix_cache[g->prefix_cache_count],
                  sizeof(g->prefix_cache[0]), "%s", prefix);
         g->prefix_cache_val[g->prefix_cache_count] = found;

@@ -103,6 +103,29 @@ static void parse_dep_spec(const char *spec, char *out_name, size_t name_cap, ch
     }
 }
 
+static void zan_pkg_add_embed(zan_package_t *pkg, const char *mount, const char *rel,
+                              const char *sym, const char *filter, const char *gate,
+                              const char *baseline) {
+    if (pkg->embed_count >= pkg->embed_cap) {
+        int ncap = pkg->embed_cap > 0 ? pkg->embed_cap * 2 : 8;
+        zan_pkg_embed_t *grown = (zan_pkg_embed_t *)realloc(
+            pkg->embeds, sizeof(zan_pkg_embed_t) * (size_t)ncap);
+        if (!grown) {
+            zan_host_oom();
+        }
+        pkg->embeds = grown;
+        pkg->embed_cap = ncap;
+    }
+    zan_pkg_embed_t *e = &pkg->embeds[pkg->embed_count++];
+    memset(e, 0, sizeof(*e));
+    if (mount) strncpy(e->mount, mount, sizeof(e->mount) - 1);
+    if (rel) strncpy(e->rel_path, rel, sizeof(e->rel_path) - 1);
+    if (sym) strncpy(e->sym_prefix, sym, sizeof(e->sym_prefix) - 1);
+    if (filter) strncpy(e->filter_key, filter, sizeof(e->filter_key) - 1);
+    if (gate) strncpy(e->gate_key, gate, sizeof(e->gate_key) - 1);
+    if (baseline) strncpy(e->baseline, baseline, sizeof(e->baseline) - 1);
+}
+
 bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
     FILE *f = fopen(manifest_path, "rb");
     if (!f) return false;
@@ -197,6 +220,7 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
     const char *p = buf;
     bool in_deps = false;
     bool in_deps_array = false;
+    bool in_embed = false;
     while (*p) {
         char line[1024];
         int li = 0;
@@ -211,6 +235,7 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
         if (*lp == '#' || *lp == 0) continue;
         if (*lp == '[') {
             in_deps = (strncmp(lp, "[deps]", 6) == 0 || strncmp(lp, "[dependencies]", 14) == 0);
+            in_embed = (strncmp(lp, "[embed]", 7) == 0 || strncmp(lp, "[embeds]", 8) == 0);
             in_deps_array = false;
             continue;
         }
@@ -244,7 +269,60 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
         if (*lp == '=') lp++;
         skip_ws(&lp);
 
-        if (!in_deps) {
+        if (in_embed) {
+            char rel_path[256] = {0};
+            char sym_prefix[64] = {0};
+            char filter_key[64] = {0};
+            char gate_key[64] = {0};
+            char baseline[128] = {0};
+            if (*lp == '"') {
+                read_qstr(&lp, rel_path, sizeof(rel_path));
+            } else {
+                int ri = 0;
+                while (*lp && !isspace((unsigned char)*lp) && ri < (int)sizeof(rel_path) - 1) {
+                    rel_path[ri++] = *lp++;
+                }
+                rel_path[ri] = 0;
+            }
+            while (*lp) {
+                skip_ws(&lp);
+                if (strncmp(lp, "if", 2) == 0 && isspace((unsigned char)lp[2])) {
+                    lp += 2;
+                    skip_ws(&lp);
+                    int si = 0;
+                    while (*lp && !isspace((unsigned char)*lp) && si < (int)sizeof(sym_prefix) - 1) {
+                        sym_prefix[si++] = *lp++;
+                    }
+                    sym_prefix[si] = 0;
+                } else if (strncmp(lp, "filter=", 7) == 0) {
+                    lp += 7;
+                    int fi = 0;
+                    while (*lp && !isspace((unsigned char)*lp) && fi < (int)sizeof(filter_key) - 1) {
+                        filter_key[fi++] = *lp++;
+                    }
+                    filter_key[fi] = 0;
+                } else if (strncmp(lp, "gate=", 5) == 0) {
+                    lp += 5;
+                    int gi = 0;
+                    while (*lp && !isspace((unsigned char)*lp) && gi < (int)sizeof(gate_key) - 1) {
+                        gate_key[gi++] = *lp++;
+                    }
+                    gate_key[gi] = 0;
+                } else if (strncmp(lp, "baseline=", 9) == 0) {
+                    lp += 9;
+                    int bi = 0;
+                    while (*lp && !isspace((unsigned char)*lp) && bi < (int)sizeof(baseline) - 1) {
+                        baseline[bi++] = *lp++;
+                    }
+                    baseline[bi] = 0;
+                } else {
+                    lp++;
+                }
+            }
+            if (key[0] && rel_path[0]) {
+                zan_pkg_add_embed(pkg, key, rel_path, sym_prefix, filter_key, gate_key, baseline);
+            }
+        } else if (!in_deps) {
             if ((strcmp(key, "deps") == 0 || strcmp(key, "dependencies") == 0) && *lp == '[') {
                 lp++;
                 in_deps_array = true;
@@ -269,7 +347,7 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
             }
             char val[256] = {0};
             if (*lp == '"') { read_qstr(&lp, val, sizeof(val)); }
-            else { int vi = 0; while (*lp && *lp != '\n' && *lp != '\r' && vi < 255) { val[vi++] = *lp; lp++; } val[vi] = 0; }
+            else { int vi = 0; while (*lp && *lp != '\n' && *lp != '\r' && !isspace((unsigned char)*lp) && vi < 255) { val[vi++] = *lp; lp++; } val[vi] = 0; }
             if (strcmp(key, "name") == 0) strncpy(pkg->name, val, sizeof(pkg->name) - 1);
             else if (strcmp(key, "version") == 0) {
                 pkg->has_version = zan_version_parse(val, &pkg->version);
@@ -279,6 +357,30 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
             else if (strcmp(key, "license") == 0) strncpy(pkg->license, val, sizeof(pkg->license) - 1);
             else if (strcmp(key, "entry") == 0) strncpy(pkg->entry_point, val, sizeof(pkg->entry_point) - 1);
             else if (strcmp(key, "plugin_id") == 0) strncpy(pkg->plugin_id, val, sizeof(pkg->plugin_id) - 1);
+            else if (strcmp(key, "subsystem") == 0) {
+                strncpy(pkg->subsystem, val, sizeof(pkg->subsystem) - 1);
+                while (*lp) {
+                    skip_ws(&lp);
+                    if (strncmp(lp, "if", 2) == 0 && isspace((unsigned char)lp[2])) {
+                        lp += 2;
+                        skip_ws(&lp);
+                        int si = 0;
+                        while (*lp && !isspace((unsigned char)*lp) && si < (int)sizeof(pkg->subsystem_sym) - 1) {
+                            pkg->subsystem_sym[si++] = *lp++;
+                        }
+                        pkg->subsystem_sym[si] = 0;
+                    } else if (strncmp(lp, "driver=", 7) == 0) {
+                        lp += 7;
+                        int di = 0;
+                        while (*lp && !isspace((unsigned char)*lp) && di < (int)sizeof(pkg->subsystem_driver) - 1) {
+                            pkg->subsystem_driver[di++] = *lp++;
+                        }
+                        pkg->subsystem_driver[di] = 0;
+                    } else {
+                        lp++;
+                    }
+                }
+            }
         } else {
             if (pkg->dep_count >= pkg->dep_cap) {
                 int ncap = pkg->dep_cap * 2;
@@ -385,6 +487,24 @@ bool zan_pkg_save(const zan_package_t *pkg, const char *manifest_path) {
         if (pkg->license[0]) fprintf(f, "license = \"%s\"\n", pkg->license);
         if (pkg->entry_point[0]) fprintf(f, "entry = \"%s\"\n", pkg->entry_point);
         if (pkg->plugin_id[0]) fprintf(f, "plugin_id = \"%s\"\n", pkg->plugin_id);
+        if (pkg->subsystem[0]) {
+            fprintf(f, "subsystem = \"%s\"", pkg->subsystem);
+            if (pkg->subsystem_sym[0]) fprintf(f, " if %s", pkg->subsystem_sym);
+            if (pkg->subsystem_driver[0]) fprintf(f, " driver=%s", pkg->subsystem_driver);
+            fprintf(f, "\n");
+        }
+        if (pkg->embed_count > 0) {
+            fprintf(f, "\n[embed]\n");
+            for (int i = 0; i < pkg->embed_count; i++) {
+                const zan_pkg_embed_t *e = &pkg->embeds[i];
+                fprintf(f, "%s = \"%s\"", e->mount, e->rel_path);
+                if (e->sym_prefix[0]) fprintf(f, " if %s", e->sym_prefix);
+                if (e->filter_key[0]) fprintf(f, " filter=%s", e->filter_key);
+                if (e->gate_key[0]) fprintf(f, " gate=%s", e->gate_key);
+                if (e->baseline[0]) fprintf(f, " baseline=%s", e->baseline);
+                fprintf(f, "\n");
+            }
+        }
         fprintf(f, "\n[deps]\n");
         for (int i = 0; i < pkg->dep_count; i++) {
             const zan_dependency_t *d = &pkg->deps[i];
