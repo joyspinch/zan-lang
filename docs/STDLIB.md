@@ -99,6 +99,7 @@ stdlib/
 │   ├── Exceptions/                  # namespace System — 核心运行时与IO异常基类（领域异常如 HttpRequest/Json/Regex/Socket 分别归属对应包）
 │   ├── Interop/                     # namespace System — FFI/marshaling: NativeMemory, Marshal, Com, Wide
 │   ├── Extensions/                  # namespace System — ListExtensions, StringExtensions, MemoryExtensions
+│   ├── Diagnostics/                 # namespace System.Diagnostics — Process 子进程派生、输出捕获与 Tracing
 │   │
 │   ├── IO/                          # System.IO 原语基石
 │   │   ├── File.zan                 # 基础文件读写与同步/异步双轨 API
@@ -138,7 +139,7 @@ stdlib/
 packages/                            # 独立拆解的高性能可复用包生态
 ├── Zan.Configuration/               # 配置提供程序体系（IConfiguration, ConfigurationBuilder, JsonFile, EnvFile 等）
 ├── Zan.Json/                        # 完整 JSON 栈：JsonValue, JsonDoc, Schema, JsonPath, JsonPatch
-├── Zan.IO/                          # 扩展 I/O：Path、MemoryStream、StreamReader/Writer、Compression (Deflate, GZip, Zip, Tar, Zstd)
+├── Zan.IO/                          # 扩展 I/O：MemoryMappedFile、DirectoryTree、DirectoryWatcher、Compression (Deflate, GZip, Zip, Tar, Zstd)
 ├── Zan.Net/                         # 完整网络栈：Socket, Tcp/Udp, Http/Https, Tls, WebSocket, Mqtt, Sse, Rpc
 ├── Zan.Desktop/                     # 桌面与操作系统服务：Process, Display, Device, Media, Clipboard
 ├── Zan.Data/                        # 数据访问与持久化：Sqlite, SqlServer, Redis, Orm, ZanDb

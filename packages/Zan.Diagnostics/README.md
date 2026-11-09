@@ -1,9 +1,9 @@
 # Zan.Diagnostics
 
-进程控制与服务端可观测性（纯 Zan，无原生依赖）。`using System.Diagnostics;`
-按需拉入，命名空间保留零破坏。
+高级进程控制与服务端可观测性（纯 Zan，无原生依赖）。`using System.Diagnostics;`
+按需拉入，命名空间保留零破坏。（注：基础 `Process`/`ProcessResult` 原语已回归标准库 `stdlib/System/Diagnostics/` 内建）。
 
-## 内容（stdlib/System/Diagnostics 整目录迁入）
+## 内容
 
 | 文件 | 内容 |
 |---|---|
@@ -18,7 +18,6 @@
 | `Sinks/FileLogSink.zan` | 滚动文件落地端 |
 | `Sinks/MemoryLogSink.zan` | 内存环形缓冲落地端（自测断言/进程内日志面板） |
 | `ServerMetrics.zan` | 请求/SQL/慢路径指标与错误汇点（WebApp 监控数据源） |
-| `Process.zan` | 子进程派生、输出捕获及系统关联程序打开（Process/ProcessResult） |
 | `ProcessControl.zan` | 进程树控制（挂起/恢复/终止） |
 | `ProcessList.zan` | 系统进程枚举（ProcessEntry） |
 | `ProcessHost.zan` | 常驻子进程宿主（保活与重启） |
