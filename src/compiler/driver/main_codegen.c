@@ -535,20 +535,40 @@
         }
 
         if (target.os == ZAN_OS_WINDOWS && link_subsystem == NULL) {
-            bool is_gui_app = false;
-            if (!is_gui_app) {
-                for (int d = 0; d < used_driver_count; d++) {
-                    if (used_driver_len[d] == 7 && memcmp(used_drivers[d], "zan_gui", 7) == 0) {
-                        is_gui_app = true;
-                        break;
+            int mcap = 64;
+            char (*mdirs)[1024] = (char (*)[1024])malloc((size_t)mcap * sizeof(*mdirs));
+            if (mdirs) {
+                int mcnt = zan_pkg_all_manifest_dirs(package_project_root, mdirs, mcap);
+                for (int m = 0; m < mcnt && link_subsystem == NULL; m++) {
+                    char mpath[1200];
+                    snprintf(mpath, sizeof(mpath), "%s/zan.pkg", mdirs[m]);
+                    zan_package_t pkg;
+                    if (zan_pkg_load(&pkg, mpath)) {
+                        if (pkg.subsystem[0]) {
+                            bool match = false;
+                            if (pkg.subsystem_driver[0]) {
+                                int slen = (int)strlen(pkg.subsystem_driver);
+                                for (int d = 0; d < used_driver_count; d++) {
+                                    if (used_driver_len[d] == slen &&
+                                        memcmp(used_drivers[d], pkg.subsystem_driver, (size_t)slen) == 0) {
+                                        match = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!match && pkg.subsystem_sym[0] &&
+                                zan_driver_prefix_live(&irgen, &driver_prefixes, pkg.subsystem_sym)) {
+                                match = true;
+                            }
+                            if (match) {
+                                if (strcmp(pkg.subsystem, "windows") == 0) link_subsystem = "windows";
+                                else if (strcmp(pkg.subsystem, "console") == 0) link_subsystem = "console";
+                            }
+                        }
+                        zan_pkg_destroy(&pkg);
                     }
                 }
-            }
-            if (!is_gui_app && zan_driver_prefix_live(&irgen, &driver_prefixes, "Gui_")) {
-                is_gui_app = true;
-            }
-            if (is_gui_app) {
-                link_subsystem = "windows";
+                free(mdirs);
             }
         }
 

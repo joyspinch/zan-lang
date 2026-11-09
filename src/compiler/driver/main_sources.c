@@ -735,16 +735,28 @@ static char proj_android_label[256];
 static bool proj_android_keys_ok = true;
 static char proj_android_perms[128][128];
 static int proj_android_perm_count = 0;
-static char proj_skin_names[128][64];
-static int proj_skin_name_count = 0;
-static bool proj_skins_enabled = false;
+
+typedef struct {
+    char key[64];
+    char val[512];
+} zan_proj_kv_t;
+
+static zan_proj_kv_t proj_kvs[128];
+static int proj_kv_count = 0;
+
+static const char *zan_proj_get(const char *key) {
+    if (!key || !key[0]) return NULL;
+    for (int i = 0; i < proj_kv_count; i++) {
+        if (strcmp(proj_kvs[i].key, key) == 0) return proj_kvs[i].val;
+    }
+    return NULL;
+}
+
 /* zan.proj 的 type 键（"gui" 等）：DocApp 入口 shim 的工程级门控——
  * type=gui 且用户没写 Main 时合成 __ZanDocMain（B-ID147）。 */
 static char proj_app_type[16] = "";
 static char proj_entry_file[1400] = "";   /* zan.proj entry：窗口入口合成优先于 CLI 基名 */
 static bool load_proj_android_keys_done = false;
-static const char **skin_filter = NULL;
-static int skin_filter_count = 0;
 
 static char *proj_trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -766,9 +778,12 @@ static void load_proj_android_keys(void) {
         *eq = 0;
         char *key = proj_trim(line);
         char *val = proj_trim(eq + 1);
-        if (strcmp(key, "skins") == 0) {
-            proj_skins_enabled = strcmp(val, "1") == 0;
-        } else if (strcmp(key, "type") == 0) {
+        if (proj_kv_count < 128 && key[0]) {
+            strncpy(proj_kvs[proj_kv_count].key, key, sizeof(proj_kvs[0].key) - 1);
+            strncpy(proj_kvs[proj_kv_count].val, val, sizeof(proj_kvs[0].val) - 1);
+            proj_kv_count++;
+        }
+        if (strcmp(key, "type") == 0) {
             snprintf(proj_app_type, sizeof(proj_app_type), "%s", val);
         } else if (strcmp(key, "entry") == 0) {
             snprintf(proj_entry_file, sizeof(proj_entry_file), "%s", val);
@@ -813,18 +828,6 @@ static void load_proj_android_keys(void) {
                     } else {
                         proj_android_perm_count++;
                     }
-                }
-                tok = strtok_r(NULL, ",", &save);
-            }
-        } else if (strcmp(key, "skinlist") == 0) {
-            char *save = NULL;
-            char *tok = strtok_r(val, ",", &save);
-            while (tok && proj_skin_name_count < 128) {
-                char *p = proj_trim(tok);
-                if (*p && strcmp(p, "-") != 0) {
-                    snprintf(proj_skin_names[proj_skin_name_count],
-                             sizeof(proj_skin_names[0]), "%s", p);
-                    proj_skin_name_count++;
                 }
                 tok = strtok_r(NULL, ",", &save);
             }

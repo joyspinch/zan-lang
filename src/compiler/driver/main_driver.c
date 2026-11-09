@@ -273,9 +273,14 @@ static bool zan_find_static_library(const char *stdlib_root,
     return true;
 }
 
-static bool zan_resolve_gui_resource_dir(const char *stdlib_root,
-                                        const char *rel, char *out,
-                                        size_t cap) {
+static bool zan_resolve_package_resource(const char *pkg_dir,
+                                           const char *stdlib_root,
+                                           const char *rel, char *out,
+                                           size_t cap) {
+    if (pkg_dir && pkg_dir[0]) {
+        snprintf(out, cap, "%s/%s", pkg_dir, rel);
+        if (zan_file_exists(out)) return true;
+    }
     if (stdlib_root && stdlib_root[0]) {
         snprintf(out, cap, "%s/%s", stdlib_root, rel);
         if (zan_file_exists(out)) return true;
@@ -538,11 +543,26 @@ static void zan_driver_capture_conditions(zan_irgen_t *g, zan_arena_t *arena,
                                           const char *override_dir,
                                           zan_driver_prefix_snapshot_t *snapshot) {
     if (snapshot->captured) return;
-    static const char *resource_prefixes[] = {
-        "Gui_", "IconSvgData_", "Pinyin_", "Skin_", "Chart_"
-    };
-    for (size_t p = 0; p < sizeof(resource_prefixes) / sizeof(resource_prefixes[0]); p++)
-        zan_driver_prefix_record(g, arena, snapshot, resource_prefixes[p]);
+    int mcap = 64;
+    char (*mdirs)[1024] = (char (*)[1024])malloc((size_t)mcap * sizeof(*mdirs));
+    if (mdirs) {
+        int mcnt = zan_pkg_all_manifest_dirs(package_project_root, mdirs, mcap);
+        for (int m = 0; m < mcnt; m++) {
+            char mpath[1200];
+            snprintf(mpath, sizeof(mpath), "%s/zan.pkg", mdirs[m]);
+            zan_package_t pkg;
+            if (zan_pkg_load(&pkg, mpath)) {
+                if (pkg.subsystem_sym[0])
+                    zan_driver_prefix_record(g, arena, snapshot, pkg.subsystem_sym);
+                for (int e = 0; e < pkg.embed_count; e++) {
+                    if (pkg.embeds[e].sym_prefix[0])
+                        zan_driver_prefix_record(g, arena, snapshot, pkg.embeds[e].sym_prefix);
+                }
+                zan_pkg_destroy(&pkg);
+            }
+        }
+        free(mdirs);
+    }
     for (int d = 0; d < reg->count; d++) {
         const zan_driver_entry_t *driver = &reg->entries[d];
         zan_driver_prefix_record(g, arena, snapshot, driver->sym);
