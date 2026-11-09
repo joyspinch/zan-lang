@@ -1,0 +1,174 @@
+using System;
+using Gui;
+using Gui.Core;
+
+namespace Gui.Widget;
+
+// 移动端手势识别与交互感知容器（GestureDetector）：
+// 封装触控事件流（Down/Move/Up），自动聚合计算并分发：
+// 1. 点击 (Tap) 与 双击 (DoubleTap，300ms 阈值窗口)
+// 2. 长按 (LongPress，500ms 保持)
+// 3. 拖拽滑动 (Pan，实时 dx/dy 位移增量)
+// 4. 惯性动量滑行 (Fling，脱手瞬时初速度 vx/vy)
+public class GestureDetector : Panel {
+    private VelocityTracker tracker;
+
+    private int downTimeMs;
+    private int downX;
+    private int downY;
+    private int lastX;
+    private int lastY;
+
+    private int lastTapTimeMs;
+    private int lastTapX;
+    private int lastTapY;
+
+    private bool isDragging;
+    private bool longPressTriggered;
+
+    public GestureCoordHandler onTouchTap;
+    public GestureCoordHandler onTouchDoubleTap;
+    public GestureCoordHandler onTouchLongPress;
+    public GestureDeltaHandler onTouchPan;
+    public GestureDeltaHandler onTouchFling;
+
+    public GestureDetector() : base() {
+        InitGestureDetector();
+    }
+
+    public GestureDetector(string name) : base(name) {
+        InitGestureDetector();
+    }
+
+    private void InitGestureDetector() {
+        tracker = new VelocityTracker();
+        downTimeMs = 0;
+        downX = 0;
+        downY = 0;
+        lastX = 0;
+        lastY = 0;
+        lastTapTimeMs = 0;
+        lastTapX = 0;
+        lastTapY = 0;
+        isDragging = false;
+        longPressTriggered = false;
+    }
+
+    public GestureDetector OnTap(GestureCoordHandler h) {
+        onTouchTap = h;
+        return this;
+    }
+
+    public GestureDetector OnDoubleTap(GestureCoordHandler h) {
+        onTouchDoubleTap = h;
+        return this;
+    }
+
+    public GestureDetector OnLongPress(GestureCoordHandler h) {
+        onTouchLongPress = h;
+        return this;
+    }
+
+    public GestureDetector OnPan(GestureDeltaHandler h) {
+        onTouchPan = h;
+        return this;
+    }
+
+    public GestureDetector OnFling(GestureDeltaHandler h) {
+        onTouchFling = h;
+        return this;
+    }
+
+    // 触控按下
+    public void HandleTouchDown(int timeMs, int x, int y) {
+        downTimeMs = timeMs;
+        downX = x;
+        downY = y;
+        lastX = x;
+        lastY = y;
+        isDragging = false;
+        longPressTriggered = false;
+
+        tracker.Clear();
+        tracker.AddMovement(timeMs, x, y);
+    }
+
+    // 触控移动
+    public void HandleTouchMove(int timeMs, int x, int y) {
+        tracker.AddMovement(timeMs, x, y);
+
+        int dx = x - lastX;
+        int dy = y - lastY;
+        lastX = x;
+        lastY = y;
+
+        int totalDx = x - downX;
+        if (totalDx < 0) { totalDx = 0 - totalDx; }
+        int totalDy = y - downY;
+        if (totalDy < 0) { totalDy = 0 - totalDy; }
+
+        // 滑动启动死区（8px 防误触抖动）
+        if (!isDragging && (totalDx > 8 || totalDy > 8)) {
+            isDragging = true;
+        }
+
+        if (isDragging && this.onTouchPan != null) {
+            this.onTouchPan((float)dx, (float)dy);
+            this.Invalidate();
+        }
+    }
+
+    // 触控释放
+    public void HandleTouchUp(int timeMs, int x, int y) {
+        tracker.AddMovement(timeMs, x, y);
+
+        int totalDx = x - downX;
+        if (totalDx < 0) { totalDx = 0 - totalDx; }
+        int totalDy = y - downY;
+        if (totalDy < 0) { totalDy = 0 - totalDy; }
+
+        int pressDuration = timeMs - downTimeMs;
+
+        if (isDragging) {
+            // 计算手指脱手瞬间的动量速度（1000 = px/s，上限 8000 px/s）
+            tracker.ComputeCurrentVelocity(1000, 8000.0f);
+            float vx = tracker.XVelocity();
+            float vy = tracker.YVelocity();
+
+            float absVx = vx < 0.0f ? (0.0f - vx) : vx;
+            float absVy = vy < 0.0f ? (0.0f - vy) : vy;
+            // 速度大于 200px/s 判定为有效 Fling 惯性滑动
+            if ((absVx > 200.0f || absVy > 200.0f) && this.onTouchFling != null) {
+                this.onTouchFling(vx, vy);
+            }
+        } else if (pressDuration > 500) {
+            // 长按手势
+            if (this.onTouchLongPress != null) {
+                this.onTouchLongPress(x, y);
+            }
+        } else {
+            // 单击 / 双击判定
+            int tapDx = x - lastTapX;
+            if (tapDx < 0) { tapDx = 0 - tapDx; }
+            int tapDy = y - lastTapY;
+            if (tapDy < 0) { tapDy = 0 - tapDy; }
+
+            if (lastTapTimeMs > 0 && (timeMs - lastTapTimeMs) < 300 && tapDx < 20 && tapDy < 20) {
+                // 双击
+                if (this.onTouchDoubleTap != null) {
+                    this.onTouchDoubleTap(x, y);
+                }
+                lastTapTimeMs = 0;
+            } else {
+                // 单击
+                if (this.onTouchTap != null) {
+                    this.onTouchTap(x, y);
+                }
+                lastTapTimeMs = timeMs;
+                lastTapX = x;
+                lastTapY = y;
+            }
+        }
+        isDragging = false;
+    }
+}

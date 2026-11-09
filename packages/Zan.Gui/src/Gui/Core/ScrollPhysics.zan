@@ -1,0 +1,94 @@
+using System;
+
+namespace Gui.Core;
+
+// 惯性滑行动量状态
+public class FlingState {
+    public float velocity;
+
+    public FlingState(float v) {
+        this.velocity = v;
+    }
+
+    public float Step(int dtMs) {
+        return ScrollPhysics.StepFlingState(this, dtMs);
+    }
+}
+
+// 弹簧阻尼回弹状态
+public class SpringState {
+    public float displacement;
+    public float velocity;
+
+    public SpringState(float disp) {
+        this.displacement = disp;
+        this.velocity = 0.0f;
+    }
+
+    public bool Step(int dtMs) {
+        return ScrollPhysics.StepSpringState(this, dtMs);
+    }
+}
+
+// 移动端滚动物理动力学与橡皮筋回弹模拟引擎（ScrollPhysics）：
+// 提供工业级物理惯性滑动（Fling）、边缘非线性阻尼拉伸（Rubber-band）与阻尼弹簧回弹（Spring）。
+public class ScrollPhysics {
+    // 摩擦力衰减系数（标准值 0.0025f）
+    public static float Friction = 0.0025f;
+    // 停止滚动的速度临界阈值 (px/s)
+    public static float MinVelocity = 15.0f;
+    // 弹簧回弹刚度系数
+    public static float SpringStiffness = 180.0f;
+    // 弹簧阻尼系数
+    public static float SpringDamping = 22.0f;
+
+    // 1. 边缘橡皮筋非线性拉伸阻尼算法：
+    // 将线性的手指拖拽距离 overRaw，转换为非线性递增阻尼位移，防止过度拉出屏幕。
+    public static float RubberBandClamp(float overRaw, float dimension) {
+        if (dimension <= 0.0f) { dimension = 300.0f; }
+        bool neg = overRaw < 0.0f;
+        float absOver = neg ? (0.0f - overRaw) : overRaw;
+        float factor = (absOver * 0.55f) / dimension;
+        float rubber = (1.0f - (1.0f / (factor + 1.0f))) * dimension;
+        return neg ? (0.0f - rubber) : rubber;
+    }
+
+    // 2. 惯性动量衰减单步积分
+    public static float StepFlingState(FlingState state, int dtMs) {
+        if (state == null || dtMs <= 0) { return 0.0f; }
+        float dtSec = (float)dtMs / 1000.0f;
+        float delta = state.velocity * dtSec;
+
+        // 指数阻尼衰减
+        float decay = 1.0f - (Friction * (float)dtMs);
+        if (decay < 0.0f) { decay = 0.0f; }
+        state.velocity = state.velocity * decay;
+
+        float absV = state.velocity < 0.0f ? (0.0f - state.velocity) : state.velocity;
+        if (absV < MinVelocity) {
+            state.velocity = 0.0f;
+        }
+        return delta;
+    }
+
+    // 3. 弹簧回弹单步积分：
+    // 在手指释放后，将边缘拉伸形变 displacement (px) 驱动回弹至 0。
+    public static bool StepSpringState(SpringState state, int dtMs) {
+        if (state == null || dtMs <= 0) { return false; }
+        float dt = (float)dtMs / 1000.0f;
+        if (dt > 0.05f) { dt = 0.05f; } // 防止极端大卡顿产生数值发散
+
+        float force = (0.0f - SpringStiffness) * state.displacement - (SpringDamping * state.velocity);
+        state.velocity = state.velocity + force * dt;
+        state.displacement = state.displacement + state.velocity * dt;
+
+        float absD = state.displacement < 0.0f ? (0.0f - state.displacement) : state.displacement;
+        float absV = state.velocity < 0.0f ? (0.0f - state.velocity) : state.velocity;
+        if (absD < 0.5f && absV < 5.0f) {
+            state.displacement = 0.0f;
+            state.velocity = 0.0f;
+            return true; // 已经静止
+        }
+        return false;
+    }
+}
