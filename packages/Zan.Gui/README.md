@@ -15,7 +15,7 @@ Namespaces today (the per-layer split is phase P7 of the architecture plan):
   the `ControlExtra` sparse property container, `VirtualScrollHost` viewport
   primitives, CSS styling/skins, layout, canvas, text shaping and media.
 - `Gui.Widget`, `Gui.Component` — the control library (buttons, inputs, tabs,
-  VirtualList, ChatView, ConsoleView, Ribbon, Wizard, DockHost, ...).
+  VirtualList, ChatView, ConsoleView, Ribbon, Wizard, ...).
 - `Gui.Markup` — HTML parsing and markup-to-control-tree building.
 - `Gui.Animation` — tweens and transitions.
 - `Gui.Backend` — the Zan-side half of the native window shells (Win32/X11/
@@ -34,14 +34,15 @@ in `Zan.Industrial`.
 ## 架构要点
 
 1. **保留式控件树与路由事件（Retained Control Tree & Routed Events）**
-   - **适用场景**：常规业务界面（Form、Card、Tabs、Button、Input、VirtualList、ChatView 等），由 HTML 标签长成长生命周期的 `Control` 树。
-   - **Visual Tree 路由分发（Tunneling & Bubbling）**：自 Root 向叶子的隧道阶段与自叶子向 Root 的冒泡阶段已经实现，`e.Handle()` 终止冒泡，`App.CapturePointer` 做指针捕获，`App.ProcessEvent` 会先走这条路径。存量控件大多仍在绘制期轮询输入，按 B-ID177 分批迁到路由事件。
+   - **适用场景**：所有业务界面与扩展组件（Form、Card、Tabs、Button、Input、VirtualList、ChatView 等），由 HTML 标签或声明式代码长成长生命周期的 `Control` 树。
+   - **Visual Tree 路由分发（Tunneling & Bubbling）**：自 Root 向叶子的隧道阶段与自叶子向 Root 的冒泡阶段，`e.Handle()` 终止冒泡，`App.CapturePointer` 做指针捕获。
    - **稀疏属性容器（`ControlExtra`）**：将数据绑定、浮动布局、动画过渡、事件槽位与无障碍语义（`a11yRole`, `a11yLabel`）等 38 个低频字段收拢于按需分配的 `ControlExtra` 容器，使基础 `Control` 节点体积缩减 62%（约 280 字节），支撑上万节点无GC停顿。
    - **无障碍与自动化测试（A11y Semantic Tagging）**：核心控件原生支持角色与标签标注，`UiDriver` 可直接通过 `@role:label` 进行语义化断言与点击，免受像素坐标漂移影响。
 
-2. **即时模式 API 正在下线**
-   - 应用代码每帧调用 `widget.Render(app, x, y, …)`、配合 `WidgetId.Push(name/index)` 作用域 Hash 栈派生控件 ID 的即时模式写法是历史包袱，按 B-ID177 逐步迁移后删除。
-   - pre-commit 棘轮禁止新增即时模式入口与 `ClaimClick` 一类输入仲裁调用（`docs/WORKSPACE_CONVENTIONS.md` §17 第 5 条）。
+2. **两大创作范式（Two-Paradigm Standard）**
+   - **范式一：HTML + CSS**：Markup 标签由底座解析为现代盒模型，外观完全由 CSS 级联与 Theme token 决定，排版纯走 CSS（Flex/Grid/Flow）。
+   - **范式二：保留模式声明式对象树**：代码侧使用 `Children = [ ... ]`、`ClassName = "..."` 声明建树，排版纯走 CSS（Flex/Grid/Flow）；动态宿主走 `GetProp/SetProp` 协议；数据通过控件的 `Binding<T> data` 字段双向绑定。
+   - **零外部自绘**：全仓图表、HMI、代码高亮等扩展控件一律为标准范式二控件，像素绘制严格封装在控件内部 OnPaint 中，对外只暴露声明式属性与数据绑定。
 
 3. **数据驱动虚拟化视口（Data-Driven Viewports）**
    - **适用场景**：高吞吐数据流、海量数据报表与动态图表（`DataTable`、`ChartView`）。

@@ -23,36 +23,44 @@ namespace Gui;
 // data-on-<evt>="名" 经 HtmlHandlers 注册表接 BindEvent，
 // data-bind → bindPath，data-if → bindIf。其余属性（Element 进
 // 原始属性表；真控件忽略）。
-// // 与 App 的解耦（auto-stdlib 按需拉取，活名才入编译图）：契约类型
-// HtmlDoc/HtmlHandlers 在 Gui.HtmlApi（App.LoadHtml 的签名只背它们），
-// 装载实现在本文件，经 <see cref="Install"/> 注册进 App 的装载槽。
-// 只经 `app.LoadHtml(...)` 用 HTML 的宿主需在启动时调用一次 Install；
-// 拼写了任何 Html.* 构建入口的程序会被自动安装。不安装的程序
-// App 编译图不背解析器/渲染器/Gui.Markup。
+// // 与 App 的解耦（auto-stdlib 按需拉取，活名才入编译图）：装载入口
+// Html.Load(app, ...) 在本文件，内部经 Parse→Install 自动装声明层；
+// App 只做组合根，不背 HTML 装载职责。拼写了任何 Html.* 入口的程序
+// 会被自动拉入本层；不用的程序 App 编译图不背解析器/渲染器/Gui.Markup。
+// Install 另向 App 注册链接扫描/模板克隆两个委托槽（Core 的 ModelBinder
+// 经 App.AutoLinkTree/CloneTree 反转调用，不向上认识 Markup）。
 public partial class Html {
     private static bool loaderInstalled;
 
-    // 向 App 注册 HTML 装载与链接扫描实现（App.LoadHtmlWith 的
-    // 后端、ChildWindow.WireNode 的扫描通道），并补齐 Element 的
-    // title 提示、模板行克隆与远端图片三个通道。
+    // 向 App 注册链接扫描与模板行克隆两个委托槽（ModelBinder.WireNode
+    // /For 经 App.AutoLinkTree/CloneTree 反转调用），并补齐 Element 的
+    // title 提示与远端图片通道。HTML 装载入口是 Html.Load，不经槽。
     public static void Install() {
         if (loaderInstalled) { return; }
         loaderInstalled = true;
         ControlBootstrap.Install();
-        App.SetHtmlLoader(LoadForApp);
         App.SetLinkScanner(AutoLinkTree);
         Element.SetTipPainter(Html.PaintTip);
         App.SetCloneTree(Html.Clone);
         ImageHttp.Install();
     }
 
-    public static Control LoadForApp(App app, string html, HtmlHandlers handlers,
+    // HTML 装载入口（范式一）：解析建树 → 领作用域类 → 作用域 CSS
+    // 并进 appCss 链、整树补类 → <a href> 缺省导航接线。App 只做组合
+    // 根，装载职责归本层（Gui.Markup）；宿主拼 `Html.Load(app, ...)`
+    // 即自动拉入声明层（Parse 内部 Install）。app 为发起装载的宿主。
+    public static Control Load(App app, string html) {
+        return Html.Load(app, html, null, "");
+    }
+
+    // 完整形态：带处理器注册表与 `<link>` 的基目录。
+    public static Control Load(App app, string html, HtmlHandlers handlers,
                               string baseDir) {
         HtmlDoc doc = Html.Parse(html, baseDir, handlers);
         string zs = app.NextLoadScope();
         string scoped = doc.css == "" ? "" : HtmlScope.Styles(doc.css, zs);
         app.ApplyScopedTree(doc.root, scoped, zs);
-        App.AutoLinkTree(doc.root, app);
+        Html.AutoLinkTree(doc.root, app);
         return doc.root;
     }
 
@@ -540,12 +548,12 @@ public partial class Html {
     }
 
     // ---- <a> 链接导航（P5 链接语义） --------------------------------
-    // 桌面映射：<a href="http..."> 缺省路由到 App.linkNavigator（
+    // 桌面映射：<a href="http..."> 缺省路由到 Html.linkNavigator（
     // WebView 家族经 WebViewBootstrap.Install 注册：宿主经
     // WebViewBootstrap.UseAsLinkTarget 登记的就地图优先，没有就
     // App 级链接窗口；未安装 WebView 家族的程序直开系统浏览器），
     // target="_blank"（新弹窗）直接弹系统浏览器。三个入口共用
-    // AutoLink：LoadHtmlWith 装载扫描、ChildWindow.WireNode 二次
+    // AutoLink：Html.Load 装载扫描、ModelBinder.WireNode 二次
     // 接线（模板行克隆等）、宿主对手搭/生成树的 AutoLinkTree。
 
     // 给一个元素接上缺省导航。已有 Click 监听（data-on-click 或
@@ -559,10 +567,10 @@ public partial class Html {
         string href = c.CssAttr("href");
         if (!Html.Navigable(href)) { return; }
         bool blank = c.CssAttr("target") == "_blank";
-        c.BindEvent("Click", () => { app.OpenLink(href, blank); });
+        c.BindEvent("Click", () => { Html.OpenLink(app, href, blank); });
     }
 
-    // 对一棵树做链接扫描（LoadHtmlWith / 宿主自挂的手搭或生成树）。
+    // 对一棵树做链接扫描（Html.Load / 宿主自挂的手搭或生成树）。
     public static void AutoLinkTree(Control root, App app) {
         Install();
         if (root == null) { return; }
@@ -583,5 +591,40 @@ public partial class Html {
             || HtmlText.StartsWith(low, "https://");
     }
 
+    // <a href> 的缺省路由（P5 链接语义）。newWindow（target="_blank"
+    // 新弹窗）直接弹系统浏览器；否则优先走内嵌导航器——安装了 WebView
+    // 家族的程序由 WebViewBootstrap.Install() 注册（宿主就地图 Navigate，
+    // 没有就懒建 App 级链接窗口全程复用；WebView 运行时不可用时首帧
+    // 回落系统浏览器）。未安装 WebView 家族的程序一律系统浏览器，
+    // 编译图因此不背 WebView。app 为发起导航的宿主。
+    public static void OpenLink(App app, string url, bool newWindow) {
+        if (!newWindow && linkNavigator != null) {
+            linkNavigator(app, url);
+            return;
+        }
+        Html.OpenInSystemBrowser(url);
+    }
+
+    // 系统关联程序打开 URI（内嵌导航不可用时的回落通道）。
+    // 平台选择与参数封送由 Process.OpenUrl 统一处理，不经 shell 解释 URI。
+    public static void OpenInSystemBrowser(string url) {
+        Process.OpenUrl(url);
+    }
+
+    // <a href> 内嵌导航器槽：WebView 就地图与 App 级链接窗口都住在
+    // Gui.Component.WebView 侧，由 WebViewBootstrap.Install() 经
+    // SetLinkNavigator 注册进来。未注册 = 链接一律直开系统浏览器。
+    static LinkNavigateFn linkNavigator;
+
+    // WebView 家族向声明层注册 <a href> 内嵌导航的入口，由
+    // Gui.Component.WebView.WebViewBootstrap.Install() 调用；业务代码
+    // 不要直接调。
+    public static void SetLinkNavigator(LinkNavigateFn fn) { linkNavigator = fn; }
+
 }
+
+// <a href> 内嵌导航器（Html.linkNavigator）：由 WebView 家族经
+// Html.SetLinkNavigator 注册；app=发起导航的宿主。返回 true =
+// 已处理（含 WebView 不可用时转交系统浏览器的内部回落）。
+public delegate bool LinkNavigateFn(App app, string url);
 
