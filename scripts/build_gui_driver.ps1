@@ -18,7 +18,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $build = if ([IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $root $BuildDir }
 $owners = @{
     zan_gui = "packages\Zan.Gui\src\Gui\drivers"
-    zan_image = "packages\Zan.Image\src\System\Drawing\Imaging\drivers"
+    zan_image = "packages\Zan.Drawing\src\System\Drawing\Imaging\drivers"
     zan_audio = "packages\Zan.Desktop\src\System\Media\drivers"
     zan_game = "packages\Zan.Game\src\Game\Graphics\drivers"
 }

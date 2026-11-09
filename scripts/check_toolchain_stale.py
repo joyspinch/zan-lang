@@ -357,7 +357,7 @@ for platform in ("win", "linux", "macos", "android", "ohos"):
         target = f"{platform}-{arch}"
         for driver, owner, sources in (
             ("zan_gui", "packages/Zan.Gui/src/Gui/drivers", GUI),
-            ("zan_image", "packages/Zan.Image/src/System/Drawing/Imaging/drivers", IMAGE),
+            ("zan_image", "packages/Zan.Drawing/src/System/Drawing/Imaging/drivers", IMAGE),
             ("zan_audio", "packages/Zan.Desktop/src/System/Media/drivers", AUDIO),
             ("zan_game", "packages/Zan.Game/src/Game/Graphics/drivers", GAME),
         ):

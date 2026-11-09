@@ -133,7 +133,7 @@ export const ecosystemGroups = [
       'Zan.Bson',
       'Zan.Json',
       'Zan.Text',
-      'Zan.Image',
+      'Zan.Drawing',
     ],
   },
   {
@@ -388,12 +388,12 @@ export const ecosystemPackages = [
     status: '源码可用',
   },
   {
-    name: 'Zan.Image',
+    name: 'Zan.Drawing',
     category: 'data',
-    title: '图像解码与缓存',
-    description: '解码常见位图并缓存像素，支持矢量图栅格化与图标内嵌的压缩图像。',
+    title: '绘图与图像编解码',
+    description: '基础绘图、像素操作、打印与图像解码缓存，支持矢量图栅格化与图标内嵌。',
     icon: 'box',
-    tags: ['PNG / JPEG', 'WebP', 'SVG'],
+    tags: ['Drawing', 'PNG/JPEG', 'SVG'],
     status: '源码可用',
   },
   {

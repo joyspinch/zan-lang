@@ -153,7 +153,7 @@ foreach ($rt in (Get-ChildItem -LiteralPath $Build -File -ErrorAction SilentlyCo
 # built native products for callers that use the toolchain as --driver-dir.
 $nativeOwners = @{
     zan_gui = 'packages/Zan.Gui/src/Gui/drivers'
-    zan_image = 'packages/Zan.Image/src/System/Drawing/Imaging/drivers'
+    zan_image = 'packages/Zan.Drawing/src/System/Drawing/Imaging/drivers'
     zan_audio = 'packages/Zan.Desktop/src/System/Media/drivers'
     zan_game = 'packages/Zan.Game/src/Game/Graphics/drivers'
 }

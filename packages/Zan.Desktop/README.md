@@ -12,8 +12,6 @@ toolchain-relative `packages/` store).
 - `System.Media` — audio device playback; `System.Audio` (a namespace-`System`
   compat entry) delegates to it.
 - `System.Automation` — UI automation over windows and elements.
-- `System.Drawing` — image buffers, pixel ops, primitives, and printing
-  (`System.Drawing.Printing`).
 - `System.Management` — CPU/memory/storage/display/device/power/registry/
   system info and task scheduling (raw OS APIs, not WMI). Windows is the
   primary target; Linux and macOS cover the query-shaped classes (Cpu,
@@ -23,6 +21,8 @@ toolchain-relative `packages/` store).
   stay Windows-only and throw PlatformNotSupportedException elsewhere.
   Works headless; consumers include Zan.Gui.Browser (cache sizing) and
   Zan.Commercial (device fingerprint).
+
+> 注：基础 2D 图形与几何基元、像素操作、打印（`System.Drawing` / `System.Drawing.Printing`）以及图像解码（`System.Drawing.Imaging`）已独立收敛至专用官方包 `Zan.Drawing`。
 
 Portable clipboard entry points are `Clipboard.SetText/GetText` and
 `Clipboard.SetFiles/GetFiles/HasFiles`. Windows file lists use CF_HDROP;

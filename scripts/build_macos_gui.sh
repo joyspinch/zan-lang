@@ -13,7 +13,7 @@ build() {
     local target="$1" arch="$2" driver dest
     local work="build/native_drivers/$target"
     local gui="packages/Zan.Gui/src/Gui/drivers/$target"
-    local image="packages/Zan.Image/src/System/Drawing/Imaging/drivers/$target"
+    local image="packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/$target"
     local audio="packages/Zan.Desktop/src/System/Media/drivers/$target"
     local game="packages/Zan.Game/src/Game/Graphics/drivers/$target"
     local flags=(-O2 -g0 -DNDEBUG -fPIC -arch "$arch" -mmacosx-version-min=11.0 -I src/drivers -I src/third_party -I src/runtime)

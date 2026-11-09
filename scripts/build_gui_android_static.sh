@@ -59,7 +59,7 @@ build() { # triple driver-target
   local triple="$1" target="$2" f m feature directory
   local work="$WORK/$target"
   local gui="$REPO/packages/Zan.Gui/src/Gui/drivers/$target"
-  local image="$REPO/packages/Zan.Image/src/System/Drawing/Imaging/drivers/$target"
+  local image="$REPO/packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/$target"
   local audio="$REPO/packages/Zan.Desktop/src/System/Media/drivers/$target"
   local game="$REPO/packages/Zan.Game/src/Game/Graphics/drivers/$target"
   local target_flags=(--sysroot="$SYSROOT" -target "$triple")

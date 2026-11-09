@@ -27,7 +27,7 @@ esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GUI="$ROOT/packages/Zan.Gui/src/Gui/drivers/$TARGET"
-IMAGE="$ROOT/packages/Zan.Image/src/System/Drawing/Imaging/drivers/$TARGET"
+IMAGE="$ROOT/packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/$TARGET"
 AUDIO="$ROOT/packages/Zan.Desktop/src/System/Media/drivers/$TARGET"
 GAME="$ROOT/packages/Zan.Game/src/Game/Graphics/drivers/$TARGET"
 DEST="$GUI/static"

@@ -87,7 +87,7 @@ build_arch() {  # build_arch <arch>   (x64 | arm64)
   if [ "$a" = "x64" ]; then triple=x86_64-linux-ohos; else triple=aarch64-linux-ohos; fi
   ftlib="freetype_$a"
   drv="$REPO/packages/Zan.Gui/src/Gui/drivers/ohos-$a"
-  image="$REPO/packages/Zan.Image/src/System/Drawing/Imaging/drivers/ohos-$a"
+  image="$REPO/packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/ohos-$a"
   audio="$REPO/packages/Zan.Desktop/src/System/Media/drivers/ohos-$a"
   game="$REPO/packages/Zan.Game/src/Game/Graphics/drivers/ohos-$a"
   mkdir -p "$OUT/obj/$a" "$drv/static" "$image/static" "$audio/static" "$game/static"
