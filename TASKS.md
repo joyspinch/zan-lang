@@ -39,11 +39,11 @@
 
 ### 批次 5 · 自举工业化（自举闭环已达 L5 固定点；当前主线 = 能力对齐，性能优化待能力追平后再启动。蓝本 docs/agent-kb/bootstrap.md "Known limitations" G1~G10）
 
-- [ ] B-ID199〔主线〕gen1 能力对齐 C 宿主，按类修复：台账 tests/selfhost/corpus_gaps.txt（382 真缺口，每案过绿毕业进 diff_cases.txt，STALE 段勿修）。当前按类欠账：G9 嵌套擦除泛型读回（Queue/List<List<int>> 型接收者类型节点 kids 被提前剥空，ConcreteRetTy 无实参可映射；审计线索 cast.zan:512 与元素 store 旁路，插桩记录在 corpus_gaps.txt collections_foreach 条目）；undefined value 22 案；crash 0xC0000005 110 案；reject-async 31 案（foreach/循环条件/花括号体未降级）；timeout 31 案；wrong-stdout 91 案。link-env 29 案是差分门链接环境不公平（sqlite3/SetupDi/原生驱动束/openssl），另册处理不算 gen1 缺陷。纪律：探针 → 根因 → conformance 单跑 → 自然写法（WC §10），修一类毕业一类，不无脑修。
+- [ ] B-ID199〔主线〕gen1 能力对齐 C 宿主，按类修复：台账 tests/selfhost/corpus_gaps.txt（369 真缺口，每案过绿毕业进 diff_cases.txt，STALE 段勿修）。当前按类欠账：undefined value 22 案；crash 0xC0000005 110 案；reject-async 31 案（foreach/循环条件/花括号体未降级）；timeout 31 案；wrong-stdout 91 案。link-env 29 案是差分门链接环境不公平（sqlite3/SetupDi/原生驱动束/openssl），另册处理不算 gen1 缺陷。纪律：探针 → 根因 → conformance 单跑 → 自然写法（WC §10），修一类毕业一类，不无脑修。
 - [ ] B-ID186 差分 Fuzzer 种子变异：`scripts/fuzz_mutate.py` 以 diff_cases 243 用例为变异源（数值边界 0/MIN/MAX/NaN/±Inf、null 注入、越界索引、try/catch 包裹剥离、整型宽度翻转）；驱动放 `_scratch/`（一次性，不进 tests）；猎物缩减最小复现 → conformance 双端金标入库 → WC §10 收口。
 - [ ] B-ID187 诊断表驱动：DIAGNOSTIC_CODES.md 表格单源机器可读，C 宿主与 selfhost `Diag` 同表生成（C 侧 diag_codes.h、selfhost 侧 .zan 常量片段，生成物进提交）；已对齐 E3012/E3049/E3052/E3053/E3060/E3086 先迁作模板。
 - [ ] B-ID188 reject 金标：reject_cases.txt 每用例配 `.stderr` 金标（先只锁 `code: 摘要` 两字段，容忍位置差异），run_selfhost_diff reject 分支从"rc≠0 即过"升级为"rc≠0 且 stderr 匹配金标"；前置 B-ID187（金标依赖 code 字段）。
-- [ ] B-ID189 防倒退指纹（② fixedpoint.sha 已落地移出）：① gen1/gen0 `--version` 输出代次 + selfhost_sources.txt 内容 SHA256（差分报告可复现）；③ pre-commit 增检：diff 触及 src/selfhost/** 或 src/compiler/** 时提交说明须含 `selfhost-verified:` 标记（只机检标记存在，真跑仍按 WC §8 定向执行）；④ `scripts/check_selfhost_docs.py` 机检 selfhost_sources.txt 与 bootstrap.md 文件表的存在性。
+- [ ] B-ID189 防倒退指纹（②fixedpoint.sha、③commit-msg 的 `selfhost-verified:` 机检、④check_selfhost_docs.py 已落地移出）：① gen1/gen0 `--version` 输出代次 + selfhost_sources.txt 内容 SHA256（差分报告可复现）；gen1 driver 目前无 `--version`。
 - [ ] B-ID190〔独占大项〕parser 错误恢复：错误后继续 parse，服务 LSP/IDE 体验；单开计划，不与 B-ID187/188 混线。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
