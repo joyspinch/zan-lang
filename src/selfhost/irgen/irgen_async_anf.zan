@@ -30,6 +30,7 @@ partial class Irgen {
     // released by the same completion epilogue. Reload/save across an await
     // only copies the pointer bits -- it never changes a refcount.
     string ToI64(string v, string lt) {
+        if (v == "null" || v == "0") { return "0"; }
         if (lt == "i64") { return v; }
         string r = NT();
         if (lt == "double") { L("  " + r + " = bitcast double " + v + " to i64"); return r; }
@@ -37,7 +38,6 @@ partial class Irgen {
             L("  " + r + " = zext " + lt + " " + v + " to i64");
             return r;
         }
-        if (v == "null" || v == "0") { return "0"; }
         L("  " + r + " = ptrtoint " + lt + " " + v + " to i64");
         return r;
     }
@@ -509,12 +509,56 @@ partial class Irgen {
         }
         if (k == AK.ForStmt()) {
             if (s.a != null) { NormStmt(cls, m, s.a, pre); }
+            if (s.b != null && ExprHasAwait(s.b)) {
+                List<Node> cpre = new List<Node>();
+                Node cond = HoistExpr(cls, m, s.b, cpre);
+                Node brk = new Node(AK.Block());
+                brk.Add(new Node(AK.BreakStmt()));
+                Node ifs = new Node(AK.IfStmt());
+                ifs.a = cond;
+                ifs.b = WrapBlock(s.d);
+                ifs.c = brk;
+                Node nb = new Node(AK.Block());
+                int ci = 0;
+                while (ci < cpre.Count) { nb.Add(cpre[ci]); ci = ci + 1; }
+                nb.Add(ifs);
+                Node tl = new Node(AK.BoolLit());
+                tl.ival = 1;
+                s.b = tl;
+                s.d = nb;
+            }
+            if (s.c != null && ExprHasAwait(s.c)) {
+                List<Node> spre = new List<Node>();
+                Node stp = HoistExpr(cls, m, s.c, spre);
+                Node sblk = new Node(AK.Block());
+                int si = 0;
+                while (si < spre.Count) { sblk.Add(spre[si]); si = si + 1; }
+                Node ses = new Node(AK.ExprStmt());
+                ses.a = stp;
+                sblk.Add(ses);
+                s.c = sblk;
+            }
             s.d = WrapBlock(s.d); NormStmt(cls, m, s.d, pre);
             return;
         }
         if (k == AK.ForeachStmt()) {
             s.b = HoistExpr(cls, m, s.b, pre);
-            s.d = WrapBlock(s.d); NormStmt(cls, m, s.d, pre);
+            s.c = WrapBlock(s.c); NormStmt(cls, m, s.c, pre);
+            return;
+        }
+        if (k == AK.DoWhileStmt()) {
+            if (s.a != null && ExprHasAwait(s.a)) {
+                List<Node> cpre = new List<Node>();
+                Node cond = HoistExpr(cls, m, s.a, cpre);
+                Node cblk = new Node(AK.Block());
+                int ci = 0;
+                while (ci < cpre.Count) { cblk.Add(cpre[ci]); ci = ci + 1; }
+                Node es = new Node(AK.ExprStmt());
+                es.a = cond;
+                cblk.Add(es);
+                s.a = cblk;
+            }
+            s.b = WrapBlock(s.b); NormStmt(cls, m, s.b, pre);
             return;
         }
         if (k == AK.TryStmt()) {
@@ -528,18 +572,8 @@ partial class Irgen {
             int i = 0;
             while (i < s.kids.Count) {
                 Node cse = s.kids[i];
-                List<Node> ck = new List<Node>();
-                int j = 0;
-                while (j < cse.kids.Count) {
-                    Node cs = cse.kids[j];
-                    List<Node> cpre = new List<Node>();
-                    NormStmt(cls, m, cs, cpre);
-                    int cj = 0;
-                    while (cj < cpre.Count) { ck.Add(cpre[cj]); cj = cj + 1; }
-                    ck.Add(cs);
-                    j = j + 1;
-                }
-                cse.kids = ck;
+                if (cse.a != null) { cse.a = HoistExpr(cls, m, cse.a, pre); }
+                if (cse.b != null) { NormBlock(cls, m, cse.b); }
                 i = i + 1;
             }
             return;
@@ -597,6 +631,10 @@ partial class Irgen {
     ExprVal EmitSocketIntrinsic(Node callExpr) {
         string cn = callExpr.a.a.sval;
         string mn = callExpr.a.sval;
+        if (cn == "Task" && mn == "JoinWait") {
+            // Task.JoinWait returns 2 to signal fallback to TaskJoin.WhenAllPoll / WhenAnyPoll
+            return new ExprVal("2", MkType("int"));
+        }
         int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
         int st = seq + 1;
         if (cn == "Task" && mn == "Delay") {
@@ -623,13 +661,6 @@ partial class Irgen {
             EmitAsyncReloadSlots();
             EmitAsyncRearm();
             return new ExprVal("0", MkType("int"));
-        }
-        if (cn == "Task" && mn == "JoinWait") {
-            // Task.JoinWait returns 2 to signal fallback to TaskJoin.WhenAllPoll / WhenAnyPoll
-            if (!term) { L("  br label %resume_" + st); }
-            L("resume_" + st + ":");
-            term = false; curLbl = "resume_" + st;
-            return new ExprVal("2", MkType("int"));
         }
         if (cn == "Gate" && mn == "Park") {
             // event-driven wait: the frame is re-readied by zan_gate_signal

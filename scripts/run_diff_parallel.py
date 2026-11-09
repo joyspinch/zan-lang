@@ -14,6 +14,7 @@
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -156,6 +157,13 @@ def main():
     if sys.platform == "win32":
         a.syslibs = ["-lkernel32", "-lshell32", "-luser32", "-ladvapi32",
                      "-lversion", "-lws2_32", "-lbcrypt", "-lpsapi"]
+        sqlite_dir = os.path.join(a.workdir, "packages", "Zan.Data", "src", "System", "Data", "Sqlite", "drivers", "win-x64")
+        sqlite_lib = os.path.join(sqlite_dir, "libsqlite3.dll.a")
+        if os.path.exists(sqlite_lib):
+            a.syslibs.append(sqlite_lib)
+            sqlite_dll = os.path.join(sqlite_dir, "libsqlite3-0.dll")
+            if os.path.exists(sqlite_dll):
+                shutil.copy2(sqlite_dll, a.outdir)
     else:
         a.syslibs = ["-ldl", "-lpthread", "-lm"]
 
