@@ -1,0 +1,119 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui.Core;
+
+// 移动端与跨平台轻量级音效缓冲池与并发管理器（SoundPool）：
+// 针对短小高频的 UI/游戏音效（按键音、弹窗提示音、碰撞音效）提供池化缓存与低延迟并发混音。
+public class SoundPool {
+    [DllImport("zan_audio")]
+    private static extern int zan_audio_open();
+
+    [DllImport("zan_audio")]
+    private static extern void zan_audio_close();
+
+    [DllImport("zan_audio")]
+    private static extern int zan_audio_is_open();
+
+    [DllImport("zan_audio")]
+    private static extern nint zan_audio_load_wav(string path);
+
+    [DllImport("zan_audio")]
+    private static extern nint zan_audio_load_wav_mem(byte[] data, int len);
+
+    [DllImport("zan_audio")]
+    private static extern void zan_audio_free_clip(nint clip);
+
+    [DllImport("zan_audio")]
+    private static extern long zan_audio_play(nint clip, double gain, int loop);
+
+    private static Dict<string, nint> clips;
+    private static bool audioOpened = false;
+
+    // 确保底层音频设备已打开（WASAPI / AAudio / CoreAudio / OH Audio）
+    public static bool EnsureOpen() {
+        if (audioOpened && zan_audio_is_open() != 0) {
+            return true;
+        }
+        int ok = zan_audio_open();
+        audioOpened = (ok != 0);
+        return audioOpened;
+    }
+
+    private static void EnsureClips() {
+        if (clips == null) {
+            clips = new Dict<string, nint>();
+        }
+    }
+
+    // 预加载本地 WAV 资源
+    public static bool Preload(string name, string path) {
+        if (!EnsureOpen()) { return false; }
+        EnsureClips();
+
+        nint clip = zan_audio_load_wav(path);
+        if (clip == 0) { return false; }
+
+        if (clips.ContainsKey(name)) {
+            zan_audio_free_clip(clips[name]);
+        }
+        clips[name] = clip;
+        return true;
+    }
+
+    // 从内存 WAV 字节流加载并缓存
+    public static bool PreloadBytes(string name, byte[] wavBytes) {
+        if (wavBytes == null || wavBytes.Length <= 44) { return false; }
+        if (!EnsureOpen()) { return false; }
+        EnsureClips();
+
+        nint clip = zan_audio_load_wav_mem(wavBytes, wavBytes.Length);
+        if (clip == 0) { return false; }
+
+        if (clips.ContainsKey(name)) {
+            zan_audio_free_clip(clips[name]);
+        }
+        clips[name] = clip;
+        return true;
+    }
+
+    // 播发指定具名音效（支持并发多声道混音叠加）
+    public static long Play(string name, double volume) {
+        if (!EnsureOpen()) { return 0; }
+        EnsureClips();
+
+        // 懒加载内置程序化音效
+        if (!clips.ContainsKey(name)) {
+            if (name == "tick") {
+                byte[] tickWav = ToneGenerator.CreateTickWav(25, 1200);
+                PreloadBytes("tick", tickWav);
+            } else if (name == "chime") {
+                byte[] chimeWav = ToneGenerator.CreateChimeWav(120, 880);
+                PreloadBytes("chime", chimeWav);
+            } else {
+                return 0;
+            }
+        }
+
+        if (!clips.ContainsKey(name)) { return 0; }
+        nint clip = clips[name];
+        if (clip == 0) { return 0; }
+
+        return zan_audio_play(clip, volume, 0);
+    }
+
+    // 便捷播发预置音效
+    public static void PlayTick()  { Play("tick", 0.6); }
+    public static void PlayChime() { Play("chime", 0.8); }
+
+    // 释放所有已缓存的音效并关闭设备
+    public static void Dispose() {
+        if (clips != null) {
+            foreach (string k in clips.Keys) {
+                nint c = clips[k];
+                if (c != 0) { zan_audio_free_clip(c); }
+            }
+            clips.Clear();
+        }
+    }
+}

@@ -1,0 +1,96 @@
+using System;
+
+namespace Gui.Core;
+
+// 纯算法零依赖程序化微音效合成器（ToneGenerator）：
+// 无需外部 wav/ogg 资源文件，在内存中直接合成标准的 16-bit 44.1kHz 单声道 PCM/WAV 字节流，
+// 供 UI 交互反馈、按键音、成功鸣音使用，实现完全的零资源依赖与零冷启动延迟。
+public class ToneGenerator {
+    // 写入 16 位小端整数
+    private static void WriteI16(byte[] buf, int offset, int val) {
+        buf[offset] = (byte)(val & 0xFF);
+        buf[offset + 1] = (byte)((val >> 8) & 0xFF);
+    }
+
+    // 写入 32 位小端整数
+    private static void WriteI32(byte[] buf, int offset, int val) {
+        buf[offset] = (byte)(val & 0xFF);
+        buf[offset + 1] = (byte)((val >> 8) & 0xFF);
+        buf[offset + 2] = (byte)((val >> 16) & 0xFF);
+        buf[offset + 3] = (byte)((val >> 24) & 0xFF);
+    }
+
+    // 构建标准 RIFF/WAVE 文件头（44 字节）
+    private static void WriteWavHeader(byte[] buf, int pcmDataBytes, int sampleRate) {
+        // "RIFF"
+        buf[0] = (byte)82; buf[1] = (byte)73; buf[2] = (byte)70; buf[3] = (byte)70;
+        WriteI32(buf, 4, pcmDataBytes + 36);
+        // "WAVE"
+        buf[8] = (byte)87; buf[9] = (byte)65; buf[10] = (byte)86; buf[11] = (byte)69;
+        // "fmt "
+        buf[12] = (byte)102; buf[13] = (byte)109; buf[14] = (byte)116; buf[15] = (byte)32;
+        WriteI32(buf, 16, 16);             // Subchunk1Size = 16 for PCM
+        WriteI16(buf, 20, 1);              // AudioFormat = 1 (PCM)
+        WriteI16(buf, 22, 1);              // NumChannels = 1 (Mono)
+        WriteI32(buf, 24, sampleRate);     // SampleRate
+        WriteI32(buf, 28, sampleRate * 2); // ByteRate (SampleRate * 1 channel * 2 bytes)
+        WriteI16(buf, 32, 2);              // BlockAlign (1 channel * 2 bytes)
+        WriteI16(buf, 34, 16);             // BitsPerSample = 16
+        // "data"
+        buf[36] = (byte)100; buf[37] = (byte)97; buf[38] = (byte)116; buf[39] = (byte)97;
+        WriteI32(buf, 40, pcmDataBytes);
+    }
+
+    // 生成按键微咔哒声（短时高频衰减冲击，约 25ms）
+    public static byte[] CreateTickWav(int durationMs, int freq) {
+        if (durationMs <= 0) { durationMs = 25; }
+        if (freq <= 0) { freq = 1200; }
+        int sampleRate = 44100;
+        int numSamples = (sampleRate * durationMs) / 1000;
+        int pcmBytes = numSamples * 2;
+        byte[] wav = new byte[44 + pcmBytes];
+        WriteWavHeader(wav, pcmBytes, sampleRate);
+
+        float angularFreq = 6.2831853f * (float)freq / (float)sampleRate;
+        for (int i = 0; i < numSamples; i = i + 1) {
+            // 指数包络衰减
+            float envelope = 1.0f - ((float)i / (float)numSamples);
+            envelope = envelope * envelope * envelope; // 立方衰减产生清脆感
+            float phase = angularFreq * (float)i;
+            float sample = (float)Math.Sin((double)phase) * envelope * 24000.0f;
+            int s16 = (int)sample;
+            if (s16 > 32767) { s16 = 32767; }
+            else if (s16 < -32768) { s16 = -32768; }
+            WriteI16(wav, 44 + i * 2, s16);
+        }
+        return wav;
+    }
+
+    // 生成成功操作愉悦提示鸣音（带二次谐波的清脆双音，约 120ms）
+    public static byte[] CreateChimeWav(int durationMs, int baseFreq) {
+        if (durationMs <= 0) { durationMs = 120; }
+        if (baseFreq <= 0) { baseFreq = 880; } // A5
+        int sampleRate = 44100;
+        int numSamples = (sampleRate * durationMs) / 1000;
+        int pcmBytes = numSamples * 2;
+        byte[] wav = new byte[44 + pcmBytes];
+        WriteWavHeader(wav, pcmBytes, sampleRate);
+
+        float f1 = 6.2831853f * (float)baseFreq / (float)sampleRate;
+        float f2 = 6.2831853f * ((float)baseFreq * 1.5f) / (float)sampleRate; // 五度泛音
+
+        for (int i = 0; i < numSamples; i = i + 1) {
+            float progress = (float)i / (float)numSamples;
+            float envelope = 1.0f - progress;
+            envelope = envelope * envelope;
+
+            float s = (float)Math.Sin((double)(f1 * (float)i)) * 0.7f
+                    + (float)Math.Sin((double)(f2 * (float)i)) * 0.3f;
+            int s16 = (int)(s * envelope * 26000.0f);
+            if (s16 > 32767) { s16 = 32767; }
+            else if (s16 < -32768) { s16 = -32768; }
+            WriteI16(wav, 44 + i * 2, s16);
+        }
+        return wav;
+    }
+}
