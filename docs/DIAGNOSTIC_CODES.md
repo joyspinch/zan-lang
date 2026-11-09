@@ -367,7 +367,7 @@
 
 ### selfhost 侧现状
 
-selfhost 前端（`src/selfhost/lexer.zan` + `parser.zan`）不重放 C 前端的逐条
+selfhost 前端（`src/selfhost/frontend/`）不重放 C 前端的逐条
 报错：lexer 无诊断出口，parser 只有 16 个报错点且多为笼统的
 `syntax error: unexpected ...`。其中与 C 侧**逐字同文案**的 6 处已带同号：
 E0005 / E0006（整型溢出）、E0039 / E0040（join）、E0041（group）、
@@ -376,5 +376,5 @@ E0043（select）；E1016（析构器不支持）同号。
 名字/绑定与类型段（1000/2000）落地时已对齐的孪生：E1016、E1019、E2017 /
 E2018 / E2019 / E2022 / E2041 / E2049 / E2057 / E2073。代码生成段（3000）落地时
 已对齐的孪生：E3012 / E3049 / E3052 / E3053 / E3060 / E3086。其余 selfhost
-报错没有 C 侧孪生（如 ngen 后端专属、笼统 syntax error），不编号，留待
+报错没有 C 侧孪生（如笼统 syntax error），不编号，留待
 其语义所属段次落地时统一对齐。

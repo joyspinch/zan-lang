@@ -3946,8 +3946,6 @@ add_test(NAME selfhost_ir_golden
     -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_ir_golden.cmake)
 set_tests_properties(selfhost_ir_golden PROPERTIES TIMEOUT 2400)
 
-# ---- Self-hosting: jsongen must fail closed on unsupported field types ----
-# The ok program maps a class whose int[] field is [JsonIgnore]-annotated
 # ---- Gui conformance: headless layout/text math (needs the zan_gui lib) ----
 # These programs import Gui modules that reference [DllImport("zan_gui")], so the
 # produced executable must link zan_gui. zanc resolves [DllImport] libs against

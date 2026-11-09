@@ -40,27 +40,10 @@ else()
     ${SELFHOST_DIR}/diag.zan
     ${SELFHOST_DIR}/parser.zan
     ${SELFHOST_DIR}/lexer.zan
-    ${SELFHOST_DIR}/ngen.zan
-    ${SELFHOST_DIR}/ngen_macho.zan
-    ${SELFHOST_DIR}/ngen_obj.zan
-    ${SELFHOST_DIR}/ngen_x86.zan
-    ${SELFHOST_DIR}/ngen_host.zan
-    ${SELFHOST_DIR}/ngen_numeric.zan
-    ${SELFHOST_DIR}/ngen_guard.zan
-    ${SELFHOST_DIR}/ngen_string.zan
-    ${SELFHOST_DIR}/ngen_layout.zan
-    ${SELFHOST_DIR}/ngen_conversion.zan
-    ${SELFHOST_DIR}/ngen_delegate.zan
-    ${SELFHOST_DIR}/ngen_binding.zan
     ${SELFHOST_DIR}/nio.zan
     ${SELFHOST_DIR}/ast.zan
     ${SELFHOST_DIR}/token.zan
-    ${SELFHOST_DIR}/ngen_async.zan
-    ${SELFHOST_DIR}/ngen_elf.zan
-    ${SELFHOST_DIR}/ngen_coff.zan
-    ${SELFHOST_DIR}/ngen_reflect.zan
-    ${SELFHOST_DIR}/lsp.zan
-    ${SELFHOST_DIR}/ngen_wasm.zan)
+    ${SELFHOST_DIR}/lsp.zan)
 endif()
 
 # ---- gen0 -> gen1 ----
