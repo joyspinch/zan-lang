@@ -1,9 +1,5 @@
 using System;
 using System.IO;
-using System.Net.Http;
-using System.Net.Http.Client;
-using System.Net.External;
-using System.Threading;
 using Gui;
 using Gui.Component;
 using Gui.Widget;
@@ -103,13 +99,10 @@ class UploadTest {
         if (made != null) { EqStr("factory kind", made.Kind(), "Upload"); }
         Eq("default autoUpload", m.AutoUpload ? 1 : 0, 1);
         EqStr("default trigger", m.TriggerText, "上传文件");
-        EqStr("default field", m.FieldName, "file");
         // 全部设计器字段可往返。
         m.SetProp("triggerText", "选择文件");
         m.SetProp("dragText", "拖到这里");
         m.SetProp("tip", "不超过 2MB");
-        m.SetProp("action", "http://127.0.0.1:9549/upload");
-        m.SetProp("fieldName", "media");
         m.SetProp("accept", "png,jpg");
         m.SetProp("max", "3");
         m.SetProp("autoUpload", "false");
@@ -123,8 +116,6 @@ class UploadTest {
         EqStr("roundtrip triggerText", m.GetProp("triggerText"), "选择文件");
         EqStr("roundtrip dragText", m.GetProp("dragText"), "拖到这里");
         EqStr("roundtrip tip", m.GetProp("tip"), "不超过 2MB");
-        EqStr("roundtrip action", m.GetProp("action"), "http://127.0.0.1:9549/upload");
-        EqStr("roundtrip fieldName", m.GetProp("fieldName"), "media");
         EqStr("roundtrip accept", m.GetProp("accept"), "png,jpg");
         EqStr("roundtrip max", m.GetProp("max"), "3");
         EqStr("roundtrip autoUpload", m.GetProp("autoUpload"), "false");
@@ -135,7 +126,7 @@ class UploadTest {
         EqStr("roundtrip showTrigger", m.GetProp("showTrigger"), "false");
         EqStr("roundtrip showRemoveButton", m.GetProp("showRemoveButton"), "false");
         EqStr("roundtrip showDownloadButton", m.GetProp("showDownloadButton"), "true");
-        Eq("props count", m.Props().Count, 15);
+        Eq("props count", m.Props().Count, 13);
         List<string> evs = m.Events();
         True("events", HasEv(evs, "Change") && HasEv(evs, "Upload")
             && HasEv(evs, "Finish") && HasEv(evs, "Error") && HasEv(evs, "Remove")
@@ -259,7 +250,9 @@ class UploadTest {
         view.Thumbnail = true;
         UploadFile t1 = view.AddFile("photo.jpg", "", "http://host/p.jpg");
         Eq("view item success", t1.status, UploadStatus.Success());
-        int wid = view.Render(app, 40, 50, 320);
+        view.Arrange(40, 50, 320, 200);
+        view.RenderTree(app);
+        int wid = view.BaseId();
         Eq("render returns base", wid, view.BaseId());
         List<int> tr = app.hitTester.RectOf(wid);
         True("trigger rect", tr != null);
@@ -295,7 +288,9 @@ class UploadTest {
         Wire(dr);
         dr.Dragger = true;
         dr.Tip = "支持 png/jpg";
-        int dwid = dr.Render(app, 60, 70, 360);
+        dr.Arrange(60, 70, 360, 200);
+        dr.RenderTree(app);
+        int dwid = dr.BaseId();
         List<int> drect = app.hitTester.RectOf(dwid + 1);
         True("dragger rect", drect != null);
         if (drect != null) {
@@ -310,7 +305,9 @@ class UploadTest {
         Wire(pc);
         pc.PictureCard = true;
         UploadFile t2 = pc.AddFile("c1.jpg", "", "http://host/c1.jpg");
-        int pwid = pc.Render(app, 500, 50, 300);
+        pc.Arrange(500, 50, 300, 200);
+        pc.RenderTree(app);
+        int pwid = pc.BaseId();
         List<int> tile = app.hitTester.RectOf(pwid + 8);
         List<int> add = app.hitTester.RectOf(pwid + 2);
         True("tile rect", tile != null);
@@ -320,55 +317,6 @@ class UploadTest {
             Eq("tile x", tile[0], 500);
         }
         True("card drop zone", pc.WantsDropAt(510, 60));
-
-        // ---- Action 传输端到端：环回服务器 + 后台线程 + App.Post 封送 ----
-        // 临时文件走真实 multipart 通道上传到本进程内的 HttpServer；
-        // 主循环交替 Task.Delay（推进服务端协程）与 app.DrainPosts
-        // （兑现工作线程封送回 UI 的进度/完成），不依赖真实事件回路。
-        {
-            int xlen = 5000;
-            string xpath = "upload_test_xfer.bin";
-            byte[] xd = new byte[xlen];
-            int xi = 0;
-            while (xi < xlen) { xd[xi] = (byte)((xi * 3 + 7) & 255); xi = xi + 1; }
-            File.WriteAllBytes(xpath, xd);
-
-            Socket.Initialize();
-            HttpServer xsrv = new HttpServer("127.0.0.1", 9551);
-            xsrv.OnRequest(UploadTest.XHandle);
-            Task.Spawn(xsrv.Start());
-            await Task.Delay(50);
-
-            App tapp = new App("uploadxfer", 400, 300);
-            Upload tr = new Upload();
-            Wire(tr);
-            tr.Render(tapp, 10, 10, 300);
-            tr.WithCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp());
-            tr.WithAction("http://127.0.0.1:9551/up", "");
-            UploadFile tf = tr.AddFile("xfer.bin", xpath, "");
-            Eq("xfer uploading", tf.status, UploadStatus.Uploading());
-            int xtries = 0;
-            while (tf.status == UploadStatus.Uploading() && xtries < 400) {
-                await Task.Delay(10);
-                tapp.DrainPosts();
-                xtries = xtries + 1;
-            }
-            Eq("xfer finish once", finishCount, 1);
-            Eq("xfer status success", tf.status, UploadStatus.Success());
-            EqStr("xfer response", tf.response, "ok");
-            Eq("xfer percent 100", tf.percent, 100);
-            Eq("server fails", xsrvFails, 0);
-            True("progress advanced", tf.percent >= 0);
-
-            File.Delete(xpath);
-            xsrv.Stop();
-            int drain = 0;
-            while (drain < 20) {
-                await Task.Delay(10);
-                tapp.DrainPosts();
-                drain = drain + 1;
-            }
-        }
 
         // ---- Multiple：内建弹窗走多选模式 -----------------------------
         // 弹窗本体是 FilePicker 的独立窗口，这里只钉住组件侧的路由与
@@ -506,23 +454,6 @@ class UploadTest {
         } else {
             Console.WriteLine("upload_test FAILURES " + fails);
         }
-    }
-
-    // Action 端到端的服务端：核对 bodyLength 与首尾字节即可（逐字节全量
-    // 校验由 http_upload_bytes 承担，这里证明组件把数据真的送出去了）。
-    static int xsrvFails;
-    static async HttpResponse XHandle(HttpRequest req) {
-        if (req.path == "/up" && req.method == "POST") {
-            int blen = req.bodyLength;
-            // 5000 字节正文 + multipart 头尾；下限 5000 且上限 5500 内。
-            if (blen < 5000 || blen > 5600) {
-                xsrvFails = xsrvFails + 1;
-                Console.WriteLine("FAIL xfer body-length " + blen);
-            }
-            return HttpResponse.Text("ok");
-        }
-        xsrvFails = xsrvFails + 1;
-        return HttpResponse.NotFound();
     }
 
     static int aliasHits;

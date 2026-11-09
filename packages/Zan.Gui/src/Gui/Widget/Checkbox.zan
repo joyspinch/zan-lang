@@ -3,137 +3,69 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 带勾选图标和响应式布尔绑定的复选框。
-// agree.Change += () => { ... };   // 每次切换时触发
-// agree.Render(app, x, y);
-public class Checkbox : Control {
-    // 显示的标题文本（SetLabel / 设计器 label 属性写它）。
+// 复选框组件。纯 Flex 弹性行容器，支持双向布尔绑定与子组件互嵌。
+//
+// 基础用法：
+//   Checkbox cb = new Checkbox("同意服务条款");
+//   cb.Change += () => { OnAgreeChanged(); };
+//
+// 响应式数据绑定：
+//   cb.data = model.isAgreed;
+//
+// 复合互嵌（DOM 组合）：
+//   Checkbox custom = new Checkbox().With(new IconView("shield")).With(new Label("高级安全保护"));
+//
+// 样式类：
+//   .tiny .small .medium .large (尺寸档位)
+//   .bordered                   (边框变体)
+public class Checkbox : ToggleControl {
     public string label;
-    // 勾选状态信号（true = 选中）。
-    public SignalBool model;
-    // 双向绑定状态：`cb.data = user.agreed;` 使模型字段
-    // 与复选框双向同步（编译器降级的 Binding）。
-    public Binding<bool> data;
-    public int wid;
-    // 选中状态切换时触发（C# 风格：`cb.Change += h;`）。
-    public UiEvent Change;
-    // 半选态（Naive UI indeterminate prop）：绘制横线而不是勾。
-    // 用于"全选父项"语义——部分子项选中时为 true。点击仍然
-    // 在 on/off 间切换；Binding<bool> 可绑定到模型字段实现
-    // `全选 = 子项全部勾选` 的派生值。
+    public SignalBool model { get { return onSig; } set { onSig = value; } }
     public Binding<bool> Indeterminate;
 
-    // 尺寸档（Naive UI size prop）：tiny / small / medium / large。
-    // 勾选框的档位调方框尺寸与标签字号（base.css 的
-    // checkbox.* / radio.* 规则）。
-    public Binding<string> Size;
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
 
-    // 初始化：标题与勾选信号（默认非半选）。
     private void InitCheckbox(string lbl, SignalBool m) {
-        this.InitControl(lbl, 1);
+        this.InitToggle(lbl);
         label = lbl;
-        model = m;
-        wid = WidgetId.Next();
-        wiresOwnEvents = true;
-        Change = new UiEvent();
+        onSig = m != null ? m : new SignalBool(false);
         Indeterminate = false;
-        Size = "medium";
+        this.Add(new CheckboxIndicator(this));
+        if (lbl != "") {
+            this.Add(new Label(lbl));
+        }
     }
 
     public Checkbox() {
         InitCheckbox("", false);
     }
 
-    // 保留模式构造函数：`Checkbox agree = new Checkbox("I agree");`
     public Checkbox(string lbl) {
         InitCheckbox(lbl, false);
     }
 
-    // 绑定到模型信号的复选框：勾选状态随 model 双向同步。
     public static Checkbox Bind(string label, SignalBool model) {
         Checkbox cb = new Checkbox(label);
         cb.model = model;
         return cb;
     }
 
-    // 当前显示的标题。唯一的标题通道就是 `label` 字段：
-    // `Props()` 把它以活绑定暴露给 GetProp/SetProp（设计器、
-    // 设计稿宿主与运行期 SetProp("label"/"text") 全部同路），保证标题通道唯一。
-    public string Str() {
-        return label;
-    }
+    public string Str() { return label; }
 
-    // 运行期改写标题；与 `Label.Text = ...` 保持一致。
     public void SetLabel(string v) {
         label = v;
-    }
-
-    // 当前是否选中（模型信号的当前值）。
-    public bool IsChecked() { return model.Get(); }
-    // 程序化设置选中态：写模型信号，绑定了 data 时同步写回模型
-    // 字段。不触发 Change（那是用户切换的事件）。
-    public void SetChecked(bool v) {
-        model.Set(v);
-        if (data != null) { data.Set(v); }
-    }
-
-    // 将绑定的模型值拉入本地信号（模型 -> UI）。
-    public override void SyncBinding() {
-        if (data == null) { return; }
-        bool cur = data.Get();
-        if (cur != model.Get()) { model.Set(cur); }
-    }
-
-    // 保留模式渲染：绘制、分发自身的点击/键盘切换并
-    // 触发 Change。返回控件 id。
-    public int Render(App app, int x, int y) {
-        return this.RenderIn(app, x, y, 0);
-    }
-
-    // 当前是否处于半选态。
-    public bool IsIndeterminate() {
-        if (Indeterminate == null) { return false; }
-        return Indeterminate.Get();
-    }
-
-    // 即时模式兼容入口：统一走标准 DOM Arrange 与 RenderTree 管线。
-    public int RenderIn(App app, int x, int y, int h) {
-        int w = this.prefW;
-        if (w <= 0) {
-            this.OnMeasure(app);
-            w = this.prefW;
+        if (children.Count > 1 && children[1] is Label) {
+            ((Label)children[1]).Text = v;
         }
-        if (h <= 0) { h = this.prefH > 0 ? this.prefH : app.theme.heightMedium; }
-        this.Arrange(x, y, w, h);
-        this.RenderTree(app);
-        return wid;
     }
 
-    // 模拟一次用户切换（无头测试/仿真也走这条）：翻转选中态、触发
-    // Change，并经 weak parent 向容器冒泡（Control.OnChildEvent）。
-    // 程序化静默改值用 SetChecked。
-    public void Toggle() {
-        model.Toggle();
-        if (data != null) { data.Set(model.Get()); }
-        Change.RaiseS(this);
-        if (parent != null) { parent.OnChildEvent(this, "Change"); }
+    public bool IsIndeterminate() {
+        return Indeterminate != null ? Indeterminate.Get() : false;
     }
 
-    // 覆写：公共事件之外提供 "Change" 与 "Toggle"。
-    public override List<string> Events() {
-        List<string> e = Control.CommonEvents();
-        e.Add("Change");
-        e.Add("Toggle");
-        return e;
-    }
-
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "Checkbox"; }
 
-    // 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
-    public override Binding<string> SizeOf() { return Size; }
-
-    // 覆写：返回设计器属性清单（标题 / 选中态 / 半选）。
     public override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec text = PropSpec.Text("label", "Label");
@@ -144,137 +76,31 @@ public class Checkbox : Control {
         on.sflag = model;
         on.Also("checked");
         ps.Add(on);
-        PropSpec def = PropSpec.Bool("defOn", "Default on");
-        def.sflag = model;
-        def.WithTip("Design default-on: FormBuilder/Designer mount projects "
-                    + "it as a SetProp, so the control starts checked.");
-        ps.Add(def);
         PropSpec ind = PropSpec.Bool("indeterminate", "Indeterminate");
         ind.flag = Indeterminate;
-        ind.WithTip("Dash state for 'select all' parents (Naive UI "
-                    + "indeterminate).");
         ps.Add(ind);
         ps.Add(this.SizeProp());
         return ps;
     }
 
-    // 覆写："Change"/"Toggle" 都挂 Change 事件，其余按名称走通用路由。
-    public override void BindEvent(string evt, Action a) {
-        if (evt == "Change" || evt == "Toggle") { Change.Add(a); return; }
-        On.AddByName(evt, a);
+    public override void OnPaint(App app) {
+        int id = this.CommonId();
+        SyncBinding();
+        app.focus.RegisterFocusable(id);
+        string a11y = this.EffectiveA11yRole("checkbox") + ":" + this.EffectiveA11yLabel(label);
+        app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);
+        On.Fire(app, id, this);
     }
 
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
-    public override void BindEventS(string evt, ControlEvent a) {
-        if (evt == "Change" || evt == "Toggle") { Change.AddS(a); return; }
-        On.AddByNameS(evt, a);
-    }
+    // ---- 内联方框助手（static 纯函数）--------------------------------
+    // 供 TreeView 三态框这类"画在自己 OnPaint 里"的宿主复用：吃的是
+    // 与真复选框同一套 `checkbox::box` / `::check` 规则，宿主自己
+    // 不必再持一份样式解析。
 
-
-    // 同三参版本，非半选。
-    public int PaintStyled(App app, int id, int x, int y, int h, string text,
-                    bool checked) {
-        return this.PaintStyled(app, id, x, y, h, text, checked, false);
-    }
-
-    // 绘制勾选框 + 标签并登记命中矩形：选中态经约 130ms 淡入
-    // 交叉淡化，indet 为 true 时画半选横线。返回控件 id。
-    public int PaintStyled(App app, int id, int x, int y, int h, string text,
-                    bool checked, bool indet) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        // 尺寸档（tiny/small/medium/large）临时并入 Class：档位改
-        // 方框尺寸与标签字号，绘制结束后还原。
-        string origClass = Class;
-        this.ApplySizeClass();
-        int target = 0;
-        if (checked || indet) { target = 1000; }
-        int animW = this.prefW;
-        if (animW <= 0) {
-            StyleBox measureLabel = Style.Part(app, "checkbox", "label", "",
-                                               Class, "", Style.SNormal());
-            animW = app.Scale(18) + app.Scale(8)
-                + Canvas.MeasureText(text,
-                    measureLabel.FontOr(Style.FontFallback(app, "medium")));
-        }
-        int animH = h;
-        if (animH <= 0) { animH = this.prefH; }
-        if (animH <= 0) { animH = t.heightMedium; }
-        int e = app.AnimToIn(IdHash.HashInt(id, 201), target, 130,
-                             x, y, animW, animH);
-        int latched = Style.SChecked();
-        StyleBox root = this.ResolveEasedLatchedStyleAsIn(
-            app, id, "checkbox", Class, false, latched, e,
-            x, y, animW, animH);
-        StyleBox boxStyle = this.ResolveEasedLatchedPartAsIn(
-            app, id, "checkbox", "box", "", Class, false, latched, e,
-            x, y, animW, animH);
-        StyleBox checkStyle = this.ResolveEasedLatchedPartAsIn(
-            app, id, "checkbox", "check", "", Class, false, latched, e,
-            x, y, animW, animH);
-        StyleBox labelStyle = this.ResolveEasedLatchedPartAsIn(
-            app, id, "checkbox", "label", "", Class, false, latched, e,
-            x, y, animW, animH);
-
-        int boxSize = boxStyle.WidthOr(app.Scale(18));
-        int boxH = boxStyle.HeightOr(boxSize);
-                int fontSize = labelStyle.FontOr(
-                    root.FontOr(Style.FontFallback(app, "medium")));
-        int gp = root.GapOr(app.Scale(8));
-        int totalH = root.HeightOr(t.heightMedium);
-        if (h > 0) { totalH = h; }
-        int totalW = root.WidthOr(boxSize + gp + Canvas.MeasureText(text, fontSize));
-        root.Paint(app, x, y, totalW, totalH);
-
-        // 方框随 DPI 缩放，行高却可能是调用方给死的：方框比行
-        // 还高时，相邻两行的边框会焊在一起（看起来就是没有行距）。
-        if (boxH > totalH) { boxH = totalH; }
-        if (boxSize > totalH) { boxSize = totalH; }
-        int boxY = y + (totalH - boxH) / 2;
-        // 颜色全部来自 `checkbox::box` / `::check` 的 CSS 规则：hover 淡变
-        // 和 :checked 交叉淡化已由 ResolveEasedLatchedPartAs 混好，
-        // 这里只剩几何。
-        boxStyle.SetRadius(boxStyle.RadiusOr(t.borderRadiusSmall));
-        SubBox.Paint(app, boxStyle, x, boxY, boxSize, boxH);
-        if (e > 120) {
-            int inset = checkStyle.PadLOr(app.Scale(3));
-            int fullSize = boxSize - inset * 2;
-            if (indet) {
-                // 半选：填充态方框中央一条短横线（同 PaintBoxIndeterminate）。
-                int lineW = boxSize - checkStyle.PadLOr(app.Scale(6)) * 2;
-                int lineH = app.Scale(2);
-                c.FillRoundRect(x + (boxSize - lineW) / 2,
-                                boxY + (boxH - lineH) / 2,
-                                lineW, lineH, lineH / 2, checkStyle.FgOr(root.fg));
-            } else {
-                int icoSize = App.Lerp(0, fullSize, e);
-                int icoX = x + (boxSize - icoSize) / 2;
-                int icoY = boxY + (boxH - icoSize) / 2;
-                c.DrawGlyph("check", icoX, icoY, icoSize,
-                          checkStyle.FgOr(root.fg));
-            }
-        }
-
-        int labelX = x + boxSize + gp;
-        int labelY = Canvas.CenterTextY(y, totalH, fontSize);
-        c.DrawText(labelX, labelY, text, labelStyle.FgOr(root.fg), fontSize);
-        string a11y = this.EffectiveA11yRole("checkbox") + ":" + this.EffectiveA11yLabel(text);
-        app.hitTester.RegisterRectL(id, x, y, totalW, totalH, 2, a11y);
-        Class = origClass;
-        return id;
-    }
-
-    // 绘制方框 + 标签并注册点击区域。保留模式与
-    // 旧模式路径共用，保证两者外观一致。
-    // 仅绘制复选框图形（无标签、无点击区域），使需要
-    // 内联复选框的控件画出与真实复选框相同的图形，而无需
-    // 自行绘制。`level` 在 0（未选中）~1000（选中）间交叉淡化。
+    // 勾选框：`level` 0..1000 在 off/on 两份样式间交叉淡化。
     public static void PaintBox(App app, int x, int y, int size, int level) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        // 内联方框与真正的复选框吃同一套 `checkbox::box` / `::check`
-        // 规则：off/on 两份样式按 `level` 交叉淡化。
         StyleBox off = Style.Part(app, "checkbox", "box", "", "", "",
                                   Style.SNormal());
         StyleBox on = Style.Part(app, "checkbox", "box", "", "", "",
@@ -297,8 +123,7 @@ public class Checkbox : Control {
         }
     }
 
-    // 半选态的内联方框：填充态方框中央一条短横线（与 PaintBox
-    // 同一套 checkbox::box / ::check 规则）。
+    // 半选态的内联方框：填充态方框中央一条短横线。
     public static void PaintBoxIndeterminate(App app, int x, int y, int size) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -313,50 +138,46 @@ public class Checkbox : Control {
         c.FillRoundRect(x + (size - lineW) / 2, y + (size - lineH) / 2,
                         lineW, lineH, lineH / 2, check.FgOr(0));
     }
+}
 
-    // 尺寸自检的自愿者：勾选框的宽高同样由方框+标签自算。
-    public override bool LintLeafSize() { return true; }
+// 复选框指示器（小方框）：纯 Flex 节点，完全由 CSS 盒模型渲染。
+public class CheckboxIndicator : Control {
+    Checkbox owner;
+    IconView checkIcon;
+    Control barNode;
 
-    // 覆写：按选中态解析样式，宽 = 方框 + 间距 + 标签宽，高取样式行高。
-    public override void OnMeasure(App app) {
-        Theme t = app.theme;
-        int latched = 0;
-        if (model.Get()) { latched = Style.SChecked(); }
-        // 尺寸档在解析前临时并入 Class：档位改方框尺寸与标签字号。
-        string origClass = Class;
-        this.ApplySizeClass();
-        StyleBox root = this.ResolveStyleAs(app, "checkbox", Class, latched);
-        StyleBox boxStyle = this.ResolvePartAs(app, "checkbox", "box", "",
-                                               Class, latched);
-        StyleBox labelStyle = this.ResolvePartAs(app, "checkbox", "label", "",
-                                                 Class, latched);
-        Class = origClass;
-        int boxSize = boxStyle.WidthOr(app.Scale(18));
-            int fontSize = labelStyle.FontOr(
-                root.FontOr(Style.FontFallback(app, "medium")));
-        prefH = root.HeightOr(t.heightMedium);
-        prefW = root.WidthOr(boxSize + root.GapOr(app.Scale(8))
-                             + Canvas.MeasureText(label, fontSize));
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
+
+    public CheckboxIndicator(Checkbox o) {
+        owner = o;
+        this.InitControl("box", 1);
+        this.ClassName = "checkbox-indicator align-center justify-center";
+        checkIcon = new IconView("check", 12);
+        checkIcon.ClassName = "checkbox-check";
+        barNode = new Control { ClassName = "checkbox-bar" };
+        this.Add(checkIcon);
+        this.Add(barNode);
     }
 
-    // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bh) 完成绘制与事件交互。
-    public override void OnPaint(App app) {
-        int id = wid;
-        SyncBinding();
-        string lbl = this.Str();
-        this.PaintStyled(app, id, bx, by, bh, lbl, model.Get(),
-                         this.IsIndeterminate());
-        app.focus.RegisterFocusable(id);
-
-        bool fire = Ui.Clicked(app, id) && !this.IsDisabled();
-        if (Ui.Focused(app, id) && app.EventKind() == 4) {
-            int kc = app.window.EventKeyCode();
-            if (kc == 32 || kc == 13) { fire = true; }
+    public override void SyncBinding() {
+        base.SyncBinding();
+        if (owner == null) { return; }
+        if (owner.IsIndeterminate()) {
+            this.AddClass("indeterminate");
+            this.RemoveClass("checked");
+            if (checkIcon != null) { checkIcon.Visible = false; }
+            if (barNode != null) { barNode.Visible = true; }
+        } else if (owner.IsChecked()) {
+            this.AddClass("checked");
+            this.RemoveClass("indeterminate");
+            if (checkIcon != null) { checkIcon.Visible = true; }
+            if (barNode != null) { barNode.Visible = false; }
+        } else {
+            this.RemoveClass("checked");
+            this.RemoveClass("indeterminate");
+            if (checkIcon != null) { checkIcon.Visible = false; }
+            if (barNode != null) { barNode.Visible = false; }
         }
-        if (fire) {
-            this.Toggle();
-            app.RequestRedraw();
-        }
-        On.Fire(app, id, this);
     }
 }

@@ -3,92 +3,41 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 按钮。外观完全由 CSS 决定，皮肤无需一行代码即可重设样式，
-// 代码侧只需赋值——没有 setter 方法：
-// save.Click += () => { ... };
-// save.Disabled = busy;
-// 可识别的 class 只是皮肤可以定义的选择器：
-// button                                      默认
-// .primary .info .success .warning .error     语义类型
-// .outline .text .dashed                      填充处理
-// .secondary .ghost .specular .loading        修饰符
-// .round .circle                              形状
-// .tiny .small .medium .large                 尺寸（高度/字体/内边距）
-// .stacked                                    图标在标签上方
-// .align-left                                 内容靠起始边缘
-// 满宽按钮不需要专门的 prop：停靠成一列时按钮本来就占满容器宽度，
-// 放在 Flex 里给它挂 `.grow`（flex-grow: 1）即可——这就是
-// Naive UI `block` 的效果。
-// `Style` 把主题默认 -> 皮肤规则 -> 悬停/按下状态解析为一个
-// StyleBox，`BoxContent` 在该盒子里绘制图标和标签，
-// `Ui.Activate` 使其可点击——所以本类只负责测量自身并
-// 触发 Click。
+// 按钮组件。纯 Flex 弹性容器，支持图文与子组件自由互嵌。
+//
+// 基础用法：
+//   Button btn = new Button("保存").Primary();
+//   btn.Click += () => { Save(); };
+//
+// 复合互嵌（DOM 组合）：
+//   Button custom = new Button().With(new IconView("star")).With(new Label("收藏"));
+//
+// 样式类（由皮肤控制盒模型与视觉）：
+//   .primary .info .success .warning .error  (语义角色)
+//   .secondary .ghost .dashed .outline       (视觉变体)
+//   .tiny .small .medium .large              (尺寸档位)
+//   .stacked                                 (纵向堆叠排布)
 public class Button : Control {
-    // 可绑定标签：`btn.Text = vm.title;` 每帧重新读取模型字段
-    // （编译器降级的 Binding）；`btn.Text = "OK";` 存储常量。
     public Binding<string> Text;
-    // 图标字形名；"" = 无。只有图标没有文本的按钮按方形测量。
     public string Icon;
-    // 可绑定的开/关状态。绑定到模型字段（`btn.Checked = vm.bold;`）
-    // 后按钮即成为切换开关：点击翻转该字段，解析出的
-    // 样式进入 `selected` 状态（皮肤中的 `button:checked`）。
     public Binding<bool> Checked;
-    // 悬停说明，悬停稳定后显示在按钮下方。空
-    // 表示无提示。
-    public string Tip;
-    // 提示气泡出现在按钮的哪一侧："bottom"（默认）、"top"、
-    // "left"、"right"。窄条上的图标按钮（导航栏、工具条）
-    // 常用 "right"，气泡不会被窗口边缘截住。
-    public string TipSide;
-    public int wid;
-    // 按钮被激活的帧为 true，供轮询一组按钮
-    // 的宿主（ribbon、工具栏）使用，而非给每个按钮绑定处理器。
-    // `Disabled` 继承自 Control（可绑定，且沿树
-    // 向下继承，禁用一组即禁用其所有命令）。
+    public int wid { get { return this.WidgetId(); } set { this.commonId = value; } }
     public bool clicked;
-    // 按钮哪些角保持圆角（默认 Corner.All）。
-    // 分组通过把按钮间的接缝变方来焊接按钮，使
-    // 整条看起来像一个两端圆角的控件。
     public int corners;
-    // 按钮被点击的帧触发（C# 风格：`btn.Click += h;`）。
-    // 处理器经 UI 线程派发队列（App.DrainPosts）执行，因此
-    // 处理器可以重建控件树、打开对话框或启动后台
-    // 任务，而不会改动正在绘制的控件树。
-    // 常用事件集（Enter/Leave/MouseDown/...）由 Control.On 继承。
-    public UiEvent Click;
 
-    // 背景色，Binding 支持可响应式更新。为 0 表示跟随 Class 中的
-    // 角色类型（primary/info/success/warning/error）。非 0 时
-    // 运行时向样式表注入 `[class*="custom-"]` 规则，自动派生
-    // hover（+10% Lighten）和 pressed（+10% Darken）色。
-    // 这是 Naive UI Button 的 `color` prop 语义。
     public Binding<int> Color;
-
-    // 文字色，0 表示由 Class 决定。Color != 0 时生效。
     public Binding<int> TextColor;
-
-    // tertiary（次要平坦）和 quaternary（卡片内按钮）变体，
-    // 渲染时等价于 Class 里写 tertiary / quaternary。
-    // 对应 Naive UI 的 tertiary / quaternary 按钮。
     public bool Tertiary;
     public bool Quaternary;
-
-    // 粗体字（font-weight: 700）。Naive UI Button 的 strong 属性。
     public bool Strong;
-
-    // 图标在标签的哪一侧：`""`/`"left"` 前置（默认），`"right"` 后置。
-    // 对应 Naive UI 的 icon-placement。后置图标走 BoxContent 的
-    // trailing 槽位，所以宽度、间距和居中逻辑与前置完全一致
-    // （"下一步 →"、"更多 ▾" 这类按钮）。
-    // 图标在标签**上方**是另一回事，用 `Class = "stacked"`。
     public string IconPlacement;
-
-    // 尺寸档（Naive UI size prop）：tiny / small / medium / large。
-    // 档位 class 与档位名一一对应（base.css 的 button.* 规则负责
-    // 高度、字号与内边距）；与 `Class` 里手写的档位互斥，绑定说了算。
     public Binding<string> Size;
 
-    // 初始化：标签文本与默认状态（全圆角、非切换、无覆盖色）。
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() {
+        return Style.Has(Class, "stacked") ? 1 : 0; // 0=row, 1=column
+    }
+
     private void InitButton(string label) {
         this.InitControl(label, 1);
         Text = label;
@@ -97,9 +46,7 @@ public class Button : Control {
         Tip = "";
         clicked = false;
         corners = Corner.All();
-        wid = WidgetId.Next();
         wiresOwnEvents = false;
-        Click = new UiEvent();
         Color = 0;
         TextColor = 0;
         Tertiary = false;
@@ -107,14 +54,15 @@ public class Button : Control {
         Strong = false;
         IconPlacement = "";
         Size = "medium";
+
+        if (label != "") {
+            this.Add(new Label(label));
+        }
     }
 
     public Button() { InitButton(""); }
-
-    // `new Button("Save")` —— 同样的东西，标签前置。
     public Button(string label) { InitButton(label); }
 
-    // 快捷包裹自定义子控件的复合按钮（支持放置任意 Row/图文/图标）
     public static Button Of(Control content) {
         Button b = new Button("");
         if (content != null) {
@@ -123,207 +71,51 @@ public class Button : Control {
         return b;
     }
 
-    // 设置主要角色按钮（.primary）
     public Button Primary() { this.AddClass("primary"); return this; }
-    // 设置次要/平坦角色（.secondary）
     public Button Secondary() { this.AddClass("secondary"); return this; }
-    // 设置成功角色（.success）
     public Button Success() { this.AddClass("success"); return this; }
-    // 设置警告角色（.warning）
     public Button Warning() { this.AddClass("warning"); return this; }
-    // 设置危险/错误角色（.error）
     public Button Danger() { this.AddClass("error"); return this; }
-    // 设置小号尺寸（.small）
     public Button Small() { this.AddClass("small"); return this; }
-    // 设置大号尺寸（.large）
     public Button Large() { this.AddClass("large"); return this; }
-    // 设置幽灵/线框按钮（.ghost）
     public Button Ghost() { this.AddClass("ghost"); return this; }
 
-    // 当前标签文本（通过绑定解析）。
     public string Label() {
         if (Text == null) { return ""; }
         return Text.Get();
     }
 
-    // 当前切换状态（非切换按钮时为 false）。
-    public bool IsChecked() { return Checked.Get(); }
+    public void SetText(string v) {
+        Text = v;
+        if (children.Count > 0 && children[children.Count - 1] is Label) {
+            ((Label)children[children.Count - 1]).Text = v;
+        } else if (v != "") {
+            this.Add(new Label(v));
+        }
+    }
 
-    // Checked 绑定到模型字段的按钮即切换开关：点击
-    // 翻转该字段，而不仅仅是触发 Click。
-    public bool IsToggle() { return Checked.IsLive(); }
-
-    // 按钮被激活的帧为 true——与 Click 对应的
-    // 轮询版本。
+    public bool IsChecked() { return Checked != null ? Checked.Get() : false; }
+    public bool IsToggle() { return Checked != null && Checked.IsLive(); }
     public bool WasClicked() { return clicked; }
-
-    // 按钮的主动作就是点击，因此遍历整棵子树问「谁被按了」的宿主
-    // （Control.FiredIn）不必知道 Button 这个类型。
     public override bool Fired() { return clicked; }
 
-    // 悬停气泡显示的内容：标签，其下方是命令的
-    // 作用（仅标签看不出新意）。
-    public string TipText() {
+    public override string TipText() {
         if (Tip == "") { return this.Label(); }
         if (this.Label() == "") { return Tip; }
         return this.Label() + "\n" + Tip;
     }
 
-    // 该按钮当前解析出的样式（大小、内边距、颜色）。
-    // 尺寸档在解析前临时并入 Class：档位决定高度与内边距，量出来的
-    // 尺寸必须与渲染一致。
     public StyleBox ResolvedStyle(App app) {
         string origClass = Class;
         this.ApplySizeClass();
-        StyleBox s = this.ResolveStyleCached(app, "button", Class,
-                                            Style.SNormal());
+        StyleBox s = this.ResolveStyleCached(app, "button", Class, Style.SNormal());
         Class = origClass;
         return s;
     }
 
-    // 应用解析样式后的自然宽度，Render 布局时用的就是它——
-    // 用这种方式测量按钮的条状控件，绝不会省略
-    // 明明放得下的标签。
-    public int AutoWidth(App app) {
-        Theme t = app.theme;
-        StyleBox s = this.ResolvedStyle(app);
-        if (Style.Has(Class, "circle")) { return s.HeightOr(t.heightMedium); }
-        // 只有图标没有文字的按钮（列表行的关闭、工具条上的图标命令）
-        // 是正方形：文本按钮左右各一个大内边距，用在 16px 的图标上
-        // 就把它撑成一块比图标宽三倍的板子。
-        if (Icon != "" && this.Label() == "" && !Style.Has(Class, "stacked")) {
-            return this.AutoHeight(app);
-        }
-        int fontPx = s.FontOr(Style.FontFallback(app, "medium"));
-        int defaultPad = (Style.Has(Class, "small") || Style.Has(Class, "tiny"))
-            ? t.paddingSmall : t.paddingMedium;
-        int pads = s.PadLOr(defaultPad) + s.PadROr(defaultPad);
-        if (children.Count > 0 && this.Label() == "" && Icon == "") {
-            int kidsW = 0;
-            for (int i = 0; i < children.Count; i = i + 1) {
-                if (children[i].prefW > kidsW) { kidsW = children[i].prefW; }
-            }
-            return kidsW + pads;
-        }
-        if (Style.Has(Class, "stacked")) {
-            return BoxContent.StackedWidth(app, Icon, this.Label(), fontPx) + pads;
-        }
-        return BoxContent.Width(Icon, this.Label(), "", fontPx, s.GapOr(t.gapSmall))
-            + pads;
-    }
-
-    // 高度来自解析出的尺寸类；堆叠按钮则取内容高度，
-    // 因为其图标位于标签上方。
-    public int AutoHeight(App app) {
-        Theme t = app.theme;
-        StyleBox s = this.ResolvedStyle(app);
-        if (children.Count > 0 && this.Label() == "" && Icon == "") {
-            int kidsH = 0;
-            for (int i = 0; i < children.Count; i = i + 1) {
-                if (children[i].prefH > kidsH) { kidsH = children[i].prefH; }
-            }
-            int padV = s.PadTOr(t.paddingSmall) + s.PadBOr(t.paddingSmall);
-            int baseH = s.HeightOr(t.heightMedium);
-            if (kidsH + padV > baseH) { return kidsH + padV; }
-            return baseH;
-        }
-        if (Style.Has(Class, "stacked")) {
-            int fontPx = s.FontOr(Style.FontFallback(app, "medium"));
-            return s.HeightOr(BoxContent.StackedHeight(app, Icon, this.Label(),
-                                                       fontPx, s.GapOr(t.paddingTiny))
-                              + s.PadTOr(t.paddingSmall) + s.PadBOr(t.paddingSmall));
-        }
-        return s.HeightOr(t.heightMedium);
-    }
-
-    // 在 (x, y) 绘制：宽度 w ≤ 0 时取自然宽度，高度取样式高度；
-    // 返回控件 id。
-    public int Render(App app, int x, int y, int w) {
-        return this.RenderIn(app, x, y, w, 0);
-    }
-
-    // 把按钮绘制到显式盒子中（统一走标准 DOM Arrange 与 RenderTree 管线）。
-    public int RenderIn(App app, int x, int y, int w, int h) {
-        if (w <= 0) { w = this.AutoWidth(app); }
-        if (h <= 0) { h = this.AutoHeight(app); }
-        this.Arrange(x, y, w, h);
-        this.RenderTree(app);
-        return this.CommonId();
-    }
-
-    // ---- 自定义 Color 注入 ------------------------------------------------
-
-    // 解析样式前确保 Color 的 CSS 规则已注入 sheet。
-    // 颜色变化时（1）重新注入派生 CSS（2）触发样式缓存失效。
-    // 判重只能查 sheet 里是否已有该色值的规则——不能用按钮
-    // 自身的实例字段，也不能用 bgThemeGen：立即模式的界面
-    // （演示页、设计器画布）每帧重建控件，实例字段到下一帧
-    // 就归零；而注入本身会递增代次，拿代次当守卫时下一帧必然
-    // 判作"已变化"。两者的结局相同：每个 Color 按钮每帧重新
-    // 注入并再次递增 bgThemeGen，整张样式缓存与 baseSheets
-    // 每帧作废重建，一帧里把 base.css 重解析数次，帧耗时以秒
-    // 计，事件循环被饿死，窗口进入"未响应"。按色值选择器的
-    // 存在性判重后，每个色值在每张 sheet 上只注入一次；换肤
-    // 换掉整张 sheet，规则随之消失，这里自然重新注入。
-    private void EnsureColorInjected(App app) {
-        int c = 0;
-        if (Color != null) { c = Color.Get(); }
-        if (c == 0 || app.sheet == null) { return; }
-        if (app.sheet.Block(Button.CustomSelector(c)) != null) { return; }
-        string css = this.BuildColorCss(c);
-        StyleSheet tmp = StyleSheet.FromCss(css);
-        app.sheet.MergeSheet(tmp);
-        app.bgThemeGen = app.bgThemeGen + 1;
-    }
-
-    // Color 派生规则的选择器：`button[class*="custom-<hex>"]`。
-    // 片段按色值取键，同页多个 Color 按钮互不覆盖；带 `button`
-    // 类型前缀使特异性与 base.css 的默认外观规则
-    // `button[class*="custom-"]` 持平，而应用 sheet 在基础层
-    // 之后应用、同权重时后规则胜出，派生色因此覆盖默认外观。
-    // BuildColorCss 与判重共用同一份文本。
-    public static string CustomSelector(int c) {
-        string hex = Style.Hex8(c);
-        if (hex.Length == 8) { hex = hex.Substring(2, 6); }
-        return "button[class*=\"custom-" + hex + "\"]";
-    }
-
-    // 编码 Color 值为 `custom-{hex}` class 片段，附加到 Class 末尾。
-    private string AppendCustomClass(string orig, int c) {
-        string hex = Style.Hex8(c);
-        if (hex.Length == 8) { hex = hex.Substring(2, 6); }
-        string frag = "custom-" + hex;
-        if (Style.Has(orig, frag)) { return orig; }
-        if (orig == "") { return frag; }
-        return orig + " " + frag;
-    }
-
-    // 从 Color 值生成 hover/pressed 派生色 CSS 规则。
-    // 选择器按色值取片段匹配，见 CustomSelector。
-    private string BuildColorCss(int c) {
-        string sel = Button.CustomSelector(c);
-        string selH = sel + ":hover";
-        string selA = sel + ":active";
-        int hov = App.Lighten(c, 100);
-        int prs = App.Darken(c, 100);
-        string css = sel + " { background: #" + Style.Hex8(c)
-            + "; border: 0 #" + Style.Hex8(c) + "; }\n";
-        css = css + selH + " { background: #" + Style.Hex8(hov)
-            + "; border-color: #" + Style.Hex8(hov) + "; }\n";
-        css = css + selA + " { background: #" + Style.Hex8(prs)
-            + "; border-color: #" + Style.Hex8(prs) + "; }\n";
-        return css;
-    }
-
-    // ---- 设计器 / 序列化模型 -------------------------------------
-
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "Button"; }
-
-    // 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
     public override Binding<string> SizeOf() { return Size; }
 
-    // 覆写：返回设计器属性清单（文本 / 图标 / 提示 / 开关与变体布尔等）。
     public override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec text = PropSpec.Text("text", "Text");
@@ -335,11 +127,6 @@ public class Button : Control {
         PropSpec tip = PropSpec.Text("tip", "Tip");
         tip.str = Tip;
         ps.Add(tip);
-        // 提示方位：字段与渲染都实现了，但此前没进 Props()——设计器
-        // 那一行写进的是样式类，按钮的提示气泡方位纹丝不动。
-        PropSpec ts = PropSpec.Text("tipSide", "Tip side");
-        ts.str = TipSide;
-        ps.Add(ts);
         ps.Add(this.SizeProp());
         PropSpec off = PropSpec.Bool("disabled", "Disabled");
         off.flag = Disabled;
@@ -356,43 +143,23 @@ public class Button : Control {
         PropSpec strg = PropSpec.Bool("strong", "Strong");
         strg.flag = Strong;
         ps.Add(strg);
-        PropSpec ip = PropSpec.Text("iconPlacement", "Icon placement");
-        ip.str = IconPlacement;
-        ps.Add(ip);
-        PropSpec col = PropSpec.Color("color", "Color");
-        col.num = Color;
-        col.WithTip("Custom background colour, injected as a custom-{hex} "
-                    + "class fragment. 0 = class-determined.");
-        ps.Add(col);
-        PropSpec tcol = PropSpec.Color("textColor", "Text color");
-        tcol.num = TextColor;
-        tcol.WithTip("Custom text colour. 0 = class-determined.");
-        ps.Add(tcol);
         return ps;
     }
 
-    // 覆写：Click 已属于常用事件集，无需额外声明。
     public override List<string> Events() {
-        // Click 已属于常用事件集，无需额外声明。
         return Control.CommonEvents();
     }
 
-    // 把 Click 路由到 Click UiEvent 字段（与 `btn.Click += h` 同一队列），
-    // 而非基类的 `On` 事件集，使 JSON/设计器的 `onClick`
-    // 处理器与代码处理器走同一通道并按序执行。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Click") { Click.Add(a); return; }
         On.AddByName(evt, a);
     }
 
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Click") { Click.AddS(a); return; }
         On.AddByNameS(evt, a);
     }
 
-    // 覆写：设置属性。type/size 变体走分组互斥（切换时自动替换旧类名）。
     public override void SetProp(string key, string val) {
         if (key == "type") {
             this.SetClassIn("default primary info success warning error", val);
@@ -405,35 +172,52 @@ public class Button : Control {
         base.SetProp(key, val);
     }
 
-
-    // ---- 保留模式钩子（Control）-------------------------------------
-
-    // 首选尺寸由解析样式 + 内容得出，停靠/自动布局
-    // 无需手算坐标即可确定按钮大小。
-    public override void OnMeasure(App app) {
-        StyleBox s = this.ResolvedStyle(app);
-        prefH = s.HeightOr(this.AutoHeight(app));
-        prefW = s.WidthOr(this.AutoWidth(app));
+    public override void OnClick(RoutedEventArgs e) {
+        if (this.IsDisabled()) { return; }
+        this.TriggerEvent("Click");
+        e.Handle();
     }
 
-    // 尺寸自检的自愿者：按钮的宽高有唯一正解（文字+皮肤内边距），
-    // 手写尺寸或被拉成巨块都值得报给作者。
-    public override bool LintLeafSize() { return true; }
+    public override void OnPointerDown(RoutedEventArgs e) {
+        if (this.IsDisabled()) { return; }
+        base.OnPointerDown(e);
+        App a = this.FindApp();
+        if (a != null) {
+            a.CapturePointer(this);
+            a.RequestRedraw();
+        }
+    }
 
-    // 覆写：交互命中注册与点击事件响应由通用事件管线调度，绝不在 OnPaint 中轮询或抢占。
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        App a = this.FindApp();
+        if (a != null) {
+            a.ReleasePointerCapture();
+            a.RequestRedraw();
+        }
+    }
+
+    public override void OnPointerEnter(RoutedEventArgs e) {
+        base.OnPointerEnter(e);
+        App a = this.FindApp();
+        if (a != null) { a.RequestRedraw(); }
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        App a = this.FindApp();
+        if (a != null) { a.RequestRedraw(); }
+    }
+
     public override void FireCommon(App app) {
         if (this.IsDisabled()) { return; }
         if (bw <= 0 || bh <= 0) { return; }
         int id = this.CommonId();
         string a11y = this.EffectiveA11yRole("button") + ":" + this.EffectiveA11yLabel(this.Label());
         app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);
-        if (Ui.Clicked(app, id)) {
-            this.TriggerEvent("Click");
-        }
         On.Fire(app, id, this);
     }
 
-    // 事件调度中枢：统一处理 Click（触发轮询标志、翻转切换状态、广播专有 UiEvent、唤醒渲染）
     public override void TriggerEvent(string evt) {
         if (evt == "Click") {
             if (this.IsDisabled()) { return; }
@@ -447,67 +231,16 @@ public class Button : Control {
         base.TriggerEvent(evt);
     }
 
-    // 在样式解析与外盒绘制前，将 Color、尺寸档与修饰布尔同步至 Class
     public override void SyncBinding() {
         base.SyncBinding();
-        App a = this.FindApp();
-        if (a != null) { this.EnsureColorInjected(a); }
-        int c = 0;
-        if (Color != null) { c = Color.Get(); }
-        if (c != 0) { Class = this.AppendCustomClass(Class, c); }
         if (Tertiary) { this.AddClass("tertiary"); }
         if (Quaternary) { this.AddClass("quaternary"); }
         if (Strong) { this.AddClass("strong"); }
         this.ApplySizeClass();
     }
 
-    // 覆写：保留模式绘制 = 基类 PaintStyleBox 统一完成外盒（背景/边框/圆角/阴影），此处仅绘制内容图元与提示框。
     public override void OnPaint(App app) {
-        bool busy = Style.Has(Class, "loading");
-        bool off = this.IsDisabled();
-        clicked = false;
-        string lead = Icon;
-        string tail = "";
-        if (IconPlacement == "right") { lead = ""; tail = Icon; }
-
-        if (computedStyle == null) {
-            this.ResolveStyle(app, Style.SNormal());
-        }
-        BoxContent.PaintContent(app, this.CommonId(), "button", Class, name,
-                                computedStyle, bx, by, bw, bh,
-                                lead, this.Label(), tail, busy, off);
-
-        if (Tip != "" && (Ui.HoverLevelMsIn(app, this.CommonId(), 0, bx, by, bw, bh) >= 900
-                          || Ui.HoldTipIn(app, this.CommonId(), bx, by, bw, bh))) {
-            int place = Tooltip.Bottom();
-            if (TipSide == "top") { place = Tooltip.Top(); }
-            else if (TipSide == "left") { place = Tooltip.Left(); }
-            else if (TipSide == "right") { place = Tooltip.Right(); }
-            Tooltip.RequestBox(app, bx, by, bw, bh, this.TipText(), place,
-                               app.Scale(260));
-        }
-    }
-
-    // 覆写：存在自定义子组件时，将其自动居中布局在内容盒内部。
-    public override void Arrange(int px, int py, int pw, int ph) {
-        base.Arrange(px, py, pw, ph);
-        if (children.Count > 0 && this.Label() == "" && Icon == "") {
-            int cx = bx + padL;
-            int cy = by + padT;
-            int cw = bw - padL - padR;
-            int ch = bh - padT - padB;
-            if (cw < 0) { cw = 0; }
-            if (ch < 0) { ch = 0; }
-            for (int i = 0; i < children.Count; i = i + 1) {
-                Control c = children[i];
-                int kw = c.prefW;
-                int kh = c.prefH;
-                if (kw <= 0 || kw > cw) { kw = cw; }
-                if (kh <= 0 || kh > ch) { kh = ch; }
-                int kx = cx + (cw - kw) / 2;
-                int ky = cy + (ch - kh) / 2;
-                c.Arrange(kx, ky, kw, kh);
-            }
-        }
+        int id = this.CommonId();
+        app.focus.RegisterFocusable(id);
     }
 }

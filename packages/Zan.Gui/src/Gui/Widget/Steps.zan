@@ -44,10 +44,6 @@ public class Steps : Control {
     // `on-update:current` 存在时可点）。true 时每步注册命中矩形，
     // 点击 >= 0 且 < 当前步的落点写入模型。
     public bool Clickable;
-    // 命中 id 块首（Clickable 时每步一个，依次递增）。
-    private int baseId;
-    // baseId 是否已保留。
-    private bool idTaken;
     // 点击已到达步骤时触发（`Clickable` 下命中才触发）。
     public UiEvent Change;
     // 步骤图标的兜底尺寸（标题字号）。
@@ -65,7 +61,6 @@ public class Steps : Control {
         FinishIcon = "";
         ErrorIcon = "";
         Clickable = false;
-        idTaken = false;
         Change = new UiEvent();
         iconPx = 0;
     }
@@ -121,14 +116,6 @@ public class Steps : Control {
     // 纵向/右列模式的行距。
     private int RowGap(App app) { return app.Scale(48); }
 
-    // 点击命中的连续 id 块：需要时一次保留 steps.Count 个，
-    // 保证帧间稳定（每帧重建演示也不漂移）。
-    private void EnsureIds() {
-        if (idTaken) { return; }
-        baseId = WidgetId.Block(steps.Count);
-        idTaken = true;
-    }
-
     // `Status` 白名单归一：只认 success / error / warning，脏值回 ""。
     public static string StatusNorm(string v) {
         if (v == "success" || v == "error" || v == "warning") { return v; }
@@ -163,321 +150,88 @@ public class Steps : Control {
         Class = origClass;
     }
 
-    // 覆写：保留模式绘制 = 在自身矩形 RenderAt。
-    public override void OnPaint(App app) {
-        this.RenderAt(app, bx, by, bw);
-    }
+    public override int StyleDisplay() { return 1; } // Flex
+    public override int StyleFlexDir() { return this.IsVertical() ? 1 : 0; }
 
-    // 立即模式入口：在 (x, y) 处按给定宽度绘制，返回保留的
-    // 命中 id 块首（`Clickable` 时每步一个 id，依次递增）。
-    public int RenderAt(App app, int x, int y, int w) {
-        SyncBinding();
-        // Size 字段映射为 Class 片段（small/medium/large），皮肤
-        // 通过 steps.small/.large 规则提供圆点尺寸。
-        string origClass = Class;
-        this.ApplySizeClass();
-        this.AddClass(this.StatusCls());
-        if (this.IsVertical()) {
-            this.PaintBodyVertical(app, x, y, w);
-        } else if (this.IsRight()) {
-            this.PaintBodyRight(app, x, y, w);
-        } else {
-            this.PaintBodyHorizontal(app, x, y, w);
-        }
-        Class = origClass;
-        return baseId;
-    }
-
-    // 横向：圆点一行，标题/描述列在各自圆点下方（按分格居中）。
-    private void PaintBodyHorizontal(App app, int bx, int by, int bw) {
-        int current = model.Get();
+    // 声明式构建步骤条子树
+    public void BuildSteps() {
+        this.children.Clear();
+        int current = model != null ? model.Get() : 0;
         int errorIndex = ErrorIndex;
-        string cls = Class;
-
-        Canvas c = app.canvas;
         int count = steps.Count;
-        if (count == 0) { return; }
-        if (Clickable && !idTaken) { this.EnsureIds(); }
-
-        int stepW = bw / count;
-        int circleR = this.Radius(app, cls);
-        int fsTitle = this.TitleFont(app, cls);
-        int titleH = Canvas.FontHeight(fsTitle);
         for (int i = 0; i < count; i = i + 1) {
-            int cx = bx + i * stepW + stepW / 2;
-            if (i > 0) {
-                int prevCx = bx + (i - 1) * stepW + stepW / 2;
-                this.Line(app, prevCx + circleR + app.Scale(2), by + circleR,
-                           cx - circleR - app.Scale(2), by + circleR, i, current,
-                           errorIndex, cls);
-            }
-            this.Circle(app, cx, by + circleR, circleR, i, current, errorIndex,
-                         cls);
-            if (Clickable) {
-                app.hitTester.RegisterRect(baseId + i, cx - circleR,
-                    by, circleR * 2, circleR * 2, 0);
-            }
+            Step st = steps[i];
+            string state = "pending";
+            if (i == errorIndex) { state = "error"; }
+            else if (i < current) { state = "done"; }
+            else if (i == current) { state = "active"; }
 
-            // 横向步骤的标签与竖向共用 `steps::title` 一族规则
-            // （text-secondary，活动态 text-primary，出错 error）；
-            // 皮肤未提供该部件时回退主题主文本色，而不是 0（黑）。
-            StyleBox ls = Style.Part(app, "steps", "title", "",
-                                     Steps.StateClass(cls, i, current,
-                                                      errorIndex),
-                                     "", Style.SNormal());
-            int fs = ls.FontOr(fsTitle);
-            // 标题 + 描述作为整列放在分格内：与圆点同轴左对齐
-            // 会溢出格子，因此先量出两行的最大宽，再以圆点为中轴
-            // 居中。描述为空的步骤只有一个标题行。
-            string label = steps[i].label;
-            string desc = steps[i].desc;
-            int labelW = Canvas.MeasureText(label, fs);
-            int textTop = by + circleR * 2 + app.Scale(8);
-            if (desc == "") {
-                int tx = cx - labelW / 2;
-                if (tx < bx + i * stepW) { tx = bx + i * stepW; }
-                c.DrawText(tx, textTop, label,
-                           ls.FgOr(app.theme.textPrimary), fs);
+            Control stepNode = new Control();
+            stepNode.ClassName = "step-item " + (this.IsVertical() ? "col" : "row") + " align-center " + state;
+
+            // 1. 指示标记（圆点/图标）
+            Control marker = new Control();
+            marker.ClassName = "step-marker align-center justify-center";
+            string ic = st.icon;
+            if (ic == "" && state == "done") { ic = FinishIcon != "" ? FinishIcon : "check"; }
+            if (ic == "" && state == "error") { ic = ErrorIcon != "" ? ErrorIcon : "close"; }
+            if (ic != "") {
+                IconView iv = new IconView(ic, 16);
+                marker.Add(iv);
             } else {
-                StyleBox ds = Style.Part(app, "steps", "description", "",
-                                         Steps.StateClass(cls, i, current,
-                                                          errorIndex),
-                                         "", Style.SNormal());
-                int df = ds.FontOr(Style.FontFallback(app, "small"));
-                // 描述按分格宽换行（贪心断词），整列以圆点为中轴居中。
-                int descW = stepW - app.Scale(12);
-                if (descW < app.Scale(40)) { descW = app.Scale(40); }
-                List<string> lines = Tooltip.WrapLines(desc, df, descW);
-                int blockW = labelW;
-                int j = 0;
-                while (j < lines.Count) {
-                    int lw = Canvas.MeasureText(lines[j], df);
-                    if (lw > blockW) { blockW = lw; }
-                    j = j + 1;
-                }
-                int tx = cx - blockW / 2;
-                if (tx < bx + i * stepW) { tx = bx + i * stepW; }
-                c.DrawText(tx, textTop, label,
-                           ls.FgOr(app.theme.textPrimary), fs);
-                int dy = textTop + titleH;
-                j = 0;
-                while (j < lines.Count) {
-                    c.DrawText(tx, dy, lines[j],
-                               ds.FgOr(app.theme.textSecondary), df);
-                    dy = dy + Canvas.FontHeight(df);
-                    j = j + 1;
-                }
+                Label numLbl = new Label(Convert.ToString(i + 1));
+                numLbl.ClassName = "step-number";
+                marker.Add(numLbl);
             }
-        }
-        this.HandleClick(app, current);
-    }
+            stepNode.Add(marker);
 
-    // 横向、次要信息在标题右列（Naive UI vertical 变体）：
-    // 圆点一列，标题 + 描述左对齐成两行，行高由两者撑开。
-    private void PaintBodyRight(App app, int bx, int by, int bw) {
-        int current = model.Get();
-        int errorIndex = ErrorIndex;
-        string cls = Class;
-
-        Canvas c = app.canvas;
-        int count = steps.Count;
-        if (count == 0) { return; }
-        if (Clickable && !idTaken) { this.EnsureIds(); }
-
-        int rowGap = this.RowGap(app);
-        int circleR = this.Radius(app, cls);
-        for (int i = 0; i < count; i = i + 1) {
-            int cy = by + i * rowGap + circleR;
-            if (i > 0) {
-                int prevCy = by + (i - 1) * rowGap + circleR;
-                this.Line(app, bx + circleR, prevCy + circleR + app.Scale(2),
-                           bx + circleR, cy - circleR - app.Scale(2), i, current,
-                           errorIndex, cls);
+            // 2. 文本区（标题 + 可选描述）
+            Control textNode = new Control();
+            textNode.ClassName = "step-content col";
+            Label titleLbl = new Label(st.label);
+            titleLbl.ClassName = "step-title";
+            textNode.Add(titleLbl);
+            if (st.desc != "") {
+                Label descLbl = new Label(st.desc);
+                descLbl.ClassName = "step-desc text-tertiary";
+                textNode.Add(descLbl);
             }
-            this.Circle(app, bx + circleR, cy, circleR, i, current, errorIndex,
-                         cls);
-            if (Clickable) {
-                app.hitTester.RegisterRect(baseId + i, bx,
-                    cy - circleR, circleR * 2, circleR * 2, 0);
+            stepNode.Add(textNode);
+
+            // 3. 点击切换
+            if (Clickable && i <= current && i != errorIndex) {
+                int targetIdx = i;
+                stepNode.Click.Add(() => {
+                    if (model.Get() != targetIdx) {
+                        model.Set(targetIdx);
+                        if (data != null) { data.Set(targetIdx); }
+                        Change.RaiseS(this);
+                        this.BuildSteps();
+                    }
+                });
             }
-            this.PaintText(app, i, current, errorIndex, cls,
-                           bx + circleR * 2 + app.Scale(12), cy,
-                           bw - circleR * 2 - app.Scale(12));
-        }
-        this.HandleClick(app, current);
-    }
 
-    // 纵向（`vertical` 类）：与右列模式同形，圆点一列、文字在右。
-    private void PaintBodyVertical(App app, int bx, int by, int bw) {
-        int rowGap = this.RowGap(app);
-        int current = model.Get();
-        int errorIndex = ErrorIndex;
-        string cls = Class;
-
-        Canvas c = app.canvas;
-        int count = steps.Count;
-        if (count == 0) { return; }
-        if (Clickable && !idTaken) { this.EnsureIds(); }
-
-        int circleR = this.Radius(app, cls);
-        for (int i = 0; i < count; i = i + 1) {
-            int cy = by + i * rowGap + circleR;
-            if (i > 0) {
-                int prevCy = by + (i - 1) * rowGap + circleR;
-                this.Line(app, bx + circleR, prevCy + circleR + app.Scale(2),
-                           bx + circleR, cy - circleR - app.Scale(2), i, current,
-                           errorIndex, cls);
+            // 4. 连接线（除最后一步外）
+            if (i < count - 1) {
+                Control conn = new Control();
+                conn.ClassName = "step-connector flex-1 " + (i < current ? "done" : "pending");
+                stepNode.Add(conn);
             }
-            this.Circle(app, bx + circleR, cy, circleR, i, current, errorIndex,
-                         cls);
-            if (Clickable) {
-                app.hitTester.RegisterRect(baseId + i, bx,
-                    cy - circleR, circleR * 2, circleR * 2, 0);
-            }
-            // 两行块（标签在上、描述在下）以圆点为中心垂直居中，
-            // 两者都左对齐，因此永不相叠。
-            this.PaintText(app, i, current, errorIndex, cls,
-                           bx + circleR * 2 + app.Scale(12), cy,
-                           bw - circleR * 2 - app.Scale(12));
-        }
-        this.HandleClick(app, current);
-    }
 
-    // 标题 + 可选描述两行块，圆点右侧、以圆点为轴垂直居中。
-    // 横向与纵向共用（样式与回退一致，只是落点不同）。
-    private void PaintText(App app, int i, int current, int errorIndex, string cls,
-                   int tx, int cy, int availW) {
-        Canvas c = app.canvas;
-        string state = Steps.StateClass(cls, i, current, errorIndex);
-        StyleBox ls = Style.Part(app, "steps", "title", "", state, "",
-                                 Style.SNormal());
-        StyleBox ds = Style.Part(app, "steps", "description", "", state,
-                                 "", Style.SNormal());
-        int lf = ls.FontOr(Style.FontFallback(app, "medium"));
-        int df = ds.FontOr(Style.FontFallback(app, "small"));
-        // 皮肤未提供部件规则时回退主题文本色，而不是 0（黑）：
-        // 深色皮肤上黑字完全不可见。
-        int labelColor = ls.FgOr(app.theme.textPrimary);
-        int fh = Canvas.FontHeight(lf);
-        Step st = steps[i];
-        if (st.desc == "") {
-            c.DrawText(tx, cy - fh / 2, st.label, labelColor, lf);
-            return;
-        }
-        int descW = availW;
-        if (descW < app.Scale(40)) { descW = app.Scale(40); }
-        List<string> lines = Tooltip.WrapLines(st.desc, df, descW);
-        int blockTop = cy - (fh + Canvas.FontHeight(df) * lines.Count) / 2;
-        c.DrawText(tx, blockTop, st.label, labelColor, lf);
-        int dy = blockTop + fh;
-        int j = 0;
-        while (j < lines.Count) {
-            c.DrawText(tx, dy, lines[j], ds.FgOr(app.theme.textSecondary), df);
-            dy = dy + Canvas.FontHeight(df);
-            j = j + 1;
+            this.Add(stepNode);
         }
     }
 
-    // `Clickable`：点击已到达（i <= current，出错步除外）的圆点
-    // 切换当前步骤并写回绑定。用 ClickAvailable 门控——一次释放
-    // 只被消费一帧，弹层认领的点击不穿透。
-    private void HandleClick(App app, int current) {
-        if (!Clickable || !app.ClickAvailable()) { return; }
-        int hit = app.ClickTarget();
-        if (hit < baseId || hit >= baseId + steps.Count) { return; }
-        int idx = hit - baseId;
-        int errorIndex = ErrorIndex;
-        if (idx == current || idx == errorIndex) { return; }
-        if (idx > current) { return; }
-        model.Set(idx);
-        if (data != null) { data.Set(idx); }
-        Change.RaiseS(this);
-        app.RequestRedraw();
+    // 覆写：保留模式绘制——基于自身盒模型统一排布。
+    public override void OnPaint(App app) {
+        int id = this.CommonId();
+        SyncBinding();
+        app.focus.RegisterFocusable(id);
+        app.hitTester.RegisterRect(id, bx, by, bw, bh, 0);
+        On.Fire(app, id, this);
     }
 
-    // 圆点半径：皮肤 `steps { height }` 给直径（与 MarkerSize 同源），
-    // 缺省按尺寸档缩放——small 10 / medium 13 / large 16（逻辑 px，
-    // app.Scale 出物理像素）。
-    private int Radius(App app, string cls) {
-        StyleBox ms = Style.Part(app, "steps", "marker", "", cls, "",
-                                 Style.SNormal());
-        int d = ms.HeightOr(0);
-        if (d <= 0) {
-            if (Style.Has(cls, "small")) { d = 20; }
-            else if (Style.Has(cls, "large")) { d = 32; }
-            else { d = 26; }
-        }
-        int r = d / 2;
-        if (r < app.Scale(6)) { r = app.Scale(6); }
-        return r;
-    }
-
-    // 标题字号：`steps::title { font-size }`，缺省按尺寸档。
-    private int TitleFont(App app, string cls) {
-        StyleBox ls = Style.Part(app, "steps", "title", "", cls, "",
-                                 Style.SNormal());
-        return ls.FontOr(Style.FontFallback(app, "small"));
-    }
-
-    // 步骤在序列中的位置所对应的类列表，使步骤的每个
-    // 部件（圆点、标签、描述）都由同一个状态解析。
-    // 状态名是设计系统共享的序列词汇。
-    public static string StateClass(string cls, int index, int current,
-                             int errorIndex) {
-        return cls + " " + Style.StateClass(index, current, errorIndex);
-    }
-
-    // 步骤圆点：已完成（对勾 / FinishIcon）、出错（! / ErrorIcon）、
-    // 活动或待处理（数字）；声明了每步图标（AddStepIcon）则优先。
-    private void Circle(App app, int cx, int cy, int r, int index, int current,
-                       int errorIndex, string cls) {
-        Canvas c = app.canvas;
-        string state = Steps.StateClass(cls, index, current, errorIndex);
-        StyleBox cs = Style.Part(app, "steps", "marker", "", state, "",
-                                 Style.SNormal());
-        int fill = cs.BgOr(0);
-        int glyph = cs.Fade(cs.FgOr(0));
-
-        c.FillCircle(cx, cy, r, fill);
-        int fs = cs.FontOr(Style.FontFallback(app, "small"));
-        int fh = Canvas.FontHeight(fs);
-        string icon = steps[index].icon;
-        if (icon != "") {
-            // 每步图标占据圆点（约直径大小），颜色取 ::marker 的
-            // 前景——随状态走（完成/活动/出错各成一类）。
-            c.DrawGlyph(icon, cx - r + app.Scale(2), cy - r + app.Scale(2),
-                        r * 2 - app.Scale(4), glyph);
-            return;
-        }
-        if (index == errorIndex) {
-            if (ErrorIcon != "") {
-                c.DrawGlyph(ErrorIcon, cx - r + app.Scale(2),
-                            cy - r + app.Scale(2), r * 2 - app.Scale(4), glyph);
-                return;
-            }
-            c.DrawTextCentered(cx - r, cy - fh / 2, r * 2, fh, "!", glyph, fs);
-            return;
-        }
-        if (index < current) {
-            string done = FinishIcon != "" ? FinishIcon : "check";
-            c.DrawGlyph(done, cx - r + app.Scale(2), cy - r + app.Scale(2),
-                        r * 2 - app.Scale(4), glyph);
-            return;
-        }
-        c.DrawTextCentered(cx - r, cy - fh / 2, r * 2, fh,
-                           Convert.ToString(index + 1), glyph, fs);
-    }
-
-    // 两个圆点之间的连接线，采用后续步骤选定的样式。
-    private void Line(App app, int x0, int y0, int x1, int y1, int index,
-                     int current, int errorIndex, string cls) {
-        StyleBox ls = Style.Part(app, "steps", "connector", "",
-                                 Steps.StateClass(cls, index, current,
-                                                  errorIndex),
-                                 "", Style.SNormal());
-        app.canvas.DrawLine(x0, y0, x1, y1, ls.Fade(ls.BgOr(0)),
-                            ls.HeightOr(app.Scale(1)));
-    }
+    // ---- 设计器 / 序列化模型 -------------------------------------
 
     // ---- 设计器 / 序列化模型 -------------------------------------
 
@@ -547,8 +301,7 @@ public class Steps : Control {
                 this.AddStep(it);
             }
         }
-        if (idTaken && baseId > 0) { baseId = WidgetId.Block(steps.Count); }
-        idTaken = steps.Count > 0 ? idTaken : false;
+        this.BuildSteps();
     }
 
     // 覆写：应答扩展属性键，"items" 为步骤往返串。

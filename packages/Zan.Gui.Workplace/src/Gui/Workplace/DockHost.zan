@@ -1,0 +1,734 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component;
+
+// 停靠布局管理器——IDE 风格窗口的外壳。面板位于
+// 停靠到左、右、下或中央的标签组中；每个组都可以
+// 拖动分隔手柄调整大小，每个标签可拖到另一个
+// 组（或拖到边缘以在那里新建组）并关闭，整个
+// 布局会序列化为字符串，重启后仍能恢复。
+// 保留模式：宿主只创建一次、面板只注册一次，然后每帧
+// 在 Begin 与 End 之间驱动它，把每个面板画进宿主交回的矩形
+// 中：
+// // 仅一次：
+// dock.RegisterFixed("editor", "Editor");            // 中央文档区
+// dock.LoadLayout(File.ReadAllText(layoutPath));     // 可选
+// // 每帧：
+// RenderExplorer(app, dock.Content("explorer"));     // 隐藏时为空矩形
+// dock.End(app);                                     // 拖拽幽灵 + 放置提示
+// 关闭的面板只是隐藏而不会被遗忘：HiddenIds() 为"恢复
+// 面板"菜单提供数据，Show(id) 可将其停靠回原位置。
+public partial class DockHost {
+    private List<DockPanel> panels;
+    private List<DockGroup> groups;
+
+    // 各侧尺寸（像素）：左右为宽度，底部为高度。
+    private int leftW;
+    private int rightW;
+    private int bottomH;
+    private bool sized;
+    private int dpiScale;
+    private bool logicalLayoutPending;
+
+    // 拖拽状态：正在拖拽的面板和已解析的放置目标。
+    // dropKind：0 = 无，1 = 并入 `dropGroup`，2 = 在 `dropSide` 新建组
+    // ，索引为 `dropIndex`。
+    private bool dragging;
+    private bool dragArmed;
+    private string dragId;
+    private int dropKind;
+    private int dropGroup;
+    private int dropSide;
+    private int dropIndex;
+    private Rect dropRect;
+
+    // 面板菜单（右键标签条）：列出已关闭的面板，以便
+    // 重新停靠。无关闭面板时显示 `emptyMenuLabel`，它
+    // 可设置，方便宿主本地化。
+    private bool menuOpen;
+    private int menuX;
+    private int menuY;
+    private string emptyMenuLabel;
+    // 触摸长按开菜单的哨兵一次性闸门：EventKind 跨帧滞留
+    // （动画帧回读旧值），哨兵若每帧都补记会把 longPressFired
+    // 反复清零，释放帧就再也读不到"刚长按过"。按事件序号
+    // 只在真正的新按压帧记一次。
+    private int stripSentinelSeq;
+
+    // Ribbon 面板开关：它们对应的 id 以及在
+    // 宿主命令列表中的起始位置（见 AddSwitches）。
+    private List<string> switchIds;
+    private int switchBase;
+    // 点击开关会做什么，附加到其提示中（见 SetSwitchHints）。
+    private string switchHideHint;
+    private string switchShowHint;
+
+    private string lastClosed;
+    private bool changed;
+    // 正在进行的调整大小拖拽：松开时提升为 `changed`，让宿主
+    // 持久化布局时只写入一次，而不是每帧一次。
+    private bool pendingResize;
+    private Rect area;
+    private int headerH;
+
+    // 空布局：无面板、无分组，尺寸未定（首帧取默认值）。
+    public DockHost() {
+        this.panels = new List<DockPanel>();
+        this.groups = new List<DockGroup>();
+        this.leftW = 0;
+        this.rightW = 0;
+        this.bottomH = 0;
+        this.sized = false;
+        this.dpiScale = 100;
+        this.logicalLayoutPending = false;
+        this.dragging = false;
+        this.dragArmed = false;
+        this.dragId = "";
+        this.dropKind = 0;
+        this.dropGroup = -1;
+        this.dropSide = -1;
+        this.dropIndex = 0;
+        this.dropRect = new Rect(0, 0, 0, 0);
+        this.menuOpen = false;
+        this.menuX = 0;
+        this.menuY = 0;
+        this.emptyMenuLabel = "No closed panels";
+        this.stripSentinelSeq = 0;
+        this.switchIds = new List<string>();
+        this.switchBase = 0 - 1;
+        this.switchHideHint = "Click to hide this panel";
+        this.switchShowHint = "Click to show this panel";
+        this.lastClosed = "";
+        this.changed = false;
+        this.pendingResize = false;
+        this.area = new Rect(0, 0, 0, 0);
+        this.headerH = 0;
+    }
+
+    // ---- 模型 ----
+
+    // 按 id 查面板；未注册为 null。
+    public DockPanel Find(string id) {
+        for (int i = 0; i < panels.Count; i = i + 1) {
+            if (panels[i].id == id) { return panels[i]; }
+        }
+        return null;
+    }
+
+    // 包含 `id` 的组索引；面板已关闭时为 -1。
+    public int GroupOf(string id) {
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            DockGroup g = groups[i];
+            for (int j = 0; j < g.ids.Count; j = j + 1) {
+                if (g.ids[j] == id) { return i; }
+            }
+        }
+        return -1;
+    }
+
+    // 注册面板。`newGroup` 在该侧新建一个标签组；
+    // 否则面板加入该侧最后一个组。注册是
+    // 幂等的，因此宿主可以在恢复的布局上重建。
+    public void Register(string id, string title, int side, bool closable, bool newGroup) {
+        if (this.Find(id) != null) { return; }
+        DockPanel p = new DockPanel(id, title, closable);
+        p.home = side;
+        panels.Add(p);
+        DockGroup g = null;
+        if (!newGroup) { g = this.LastGroupOf(side); }
+        if (g == null) {
+            g = new DockGroup(side, 100);
+            groups.Add(g);
+        }
+        g.ids.Add(id);
+    }
+
+    // 注册固定文档区：一个无标题栏、不可关闭的中央面板，
+    // 其他面板围绕它停靠（宿主不为它绘制标签，因此
+    // 屏幕上只有调用方自己的文档标签栏）。
+    public void RegisterFixed(string id, string title) {
+        this.Register(id, title, DockSide.Center(), false, true);
+        DockPanel p = this.Find(id);
+        if (p != null) { p.headerless = true; }
+    }
+
+    // `side` 侧最后一个组（无组为 null）——Register/Show 的并入目标。
+    public DockGroup LastGroupOf(int side) {
+        DockGroup found = null;
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].side == side) { found = groups[i]; }
+        }
+        return found;
+    }
+
+    // 为包含 `id` 的组设置其所在侧交叉轴的初始占比
+    // （相对于该侧其他组）。用户拖动过手柄或恢复过保存的布局后
+    // 此设置将被忽略。
+    public void SetWeight(string id, int weight) {
+        int gi = this.GroupOf(id);
+        if (gi < 0) { return; }
+        groups[gi].weight = weight;
+    }
+
+    // 设置某一侧的像素尺寸（左右为宽度，底部为高度）。
+    public void SetSideExtent(int side, int px) {
+        if (side == 0) { leftW = px; }
+        else if (side == 1) { rightW = px; }
+        else if (side == 2) { bottomH = px; }
+        sized = true;
+    }
+
+    // 面板当前是否可见（未隐藏且上次布局分到了非零内容区）。
+    public bool Visible(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return false; }
+        if (p.hidden) { return false; }
+        return p.body.width > 0 && p.body.height > 0;
+    }
+
+    // 上一次 Begin() 解析出的内容矩形。隐藏（或未激活）的
+    // 面板得到零尺寸矩形，调用方可以用
+    // 单个 `if (r.width <= 0) { }` 守卫跳过渲染，或直接画到空处。
+    public Rect Content(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return new Rect(0, 0, 0, 0); }
+        return p.body;
+    }
+
+    // 与 Content 类似，但隐藏面板得到一个停在屏幕外远处的 1x1 矩形，
+    // 而不是零尺寸矩形。始终渲染（并注册命中区域）的即时模式内容
+    // 可以不加守卫：它只是画在屏幕外而已。
+    public Rect ContentParked(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null || p.hidden || p.body.width <= 0 || p.body.height <= 0) {
+            return new Rect(0 - 30000, 0 - 30000, 1, 1);
+        }
+        return p.body;
+    }
+
+    // 面板标题（未注册为 ""）。
+    public string Title(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return ""; }
+        return p.title;
+    }
+
+    // 重命名面板标题（例如跟随 UI 语言切换）。
+    public void SetTitle(string id, string title) {
+        DockPanel p = this.Find(id);
+        if (p != null) { p.title = title; }
+    }
+
+    // 设置面板 Ribbon 开关显示的图标。
+    public void SetIcon(string id, string icon) {
+        DockPanel p = this.Find(id);
+        if (p != null) { p.icon = icon; }
+    }
+
+    // 描述面板用途；其 Ribbon 开关悬停时显示该描述。
+    public void SetTip(string id, string text) {
+        DockPanel p = this.Find(id);
+        if (p != null) { p.tip = text; }
+    }
+
+    // 让面板不进宿主的通用面板开关列表（AddSwitchGroup / AddSwitches）：
+    // 宿主给它准备了更显眼的专属入口（功能区大按钮、快捷键）时，再在
+    // 通用列表里列一遍只会让人犯迷糊——两个入口指向同一个东西。
+    public void SetNoSwitch(string id, bool on) {
+        DockPanel p = this.Find(id);
+        if (p != null) { p.noSwitch = on; }
+    }
+
+    // 附加到每个开关提示的本地化"点击作用"说明。
+    public void SetSwitchHints(string hideHint, string showHint) {
+        switchHideHint = hideHint;
+        switchShowHint = showHint;
+    }
+
+    // 开关的悬停提示：面板描述与「点击会隐藏/显示」说明按行拼接
+    // （缺哪段就省哪段）。
+    public string SwitchTip(DockPanel p) {
+        string hint = switchShowHint;
+        if (!p.hidden) { hint = switchHideHint; }
+        if (p.tip == "") { return hint; }
+        if (hint == "") { return p.tip; }
+        return p.tip + "\n" + hint;
+    }
+
+    // ---- 面板开关 ----
+
+    // 为每个可关闭面板向 ribbon 命令列表追加一个图标开关——
+    // 即工具栏的"面板"区段。开关位于列表尾部，
+    // 因此宿主仍可按索引访问自己的命令，
+    // HandleRibbon() 消费它们的点击。（重新）构建命令列表后立即调用；
+    // 返回开关起始的索引。
+    // dock.AddSwitches(cmds);                    // 在 BuildRibbon() 之后
+    // dock.SyncSwitches(cmds);                   // 每帧
+    public int AddSwitches(List<RibbonCmd> cmds) {
+        switchBase = cmds.Count;
+        switchIds = new List<string>();
+        for (int i = 0; i < panels.Count; i = i + 1) {
+            DockPanel p = panels[i];
+            if (p.closable && !p.headerless && !p.noSwitch) {
+                switchIds.Add(p.id);
+                cmds.Add(RibbonCmd.Switch(p.icon, p.title, !p.hidden));
+            }
+        }
+        return switchBase;
+    }
+
+    // 向选项卡式 ribbon 的组列表追加一个带标题的"面板"图标开关区段（每个可关闭面板一个）——
+    // 即 View 选项卡对应的停靠版本。
+    // 每帧构建组，开关承载实时的
+    // 可见性；HandleRibbon() 消费它们的点击：
+    // else { dock.ClearSwitches(); }
+    public void AddSwitchGroup(List<RibbonGroup> groups, string title) {
+        switchBase = 0;
+        for (int g = 0; g < groups.Count; g = g + 1) {
+            switchBase = switchBase + groups[g].items.Count;
+        }
+        switchIds = new List<string>();
+        RibbonGroup grp = new RibbonGroup(title);
+        for (int i = 0; i < panels.Count; i = i + 1) {
+            DockPanel p = panels[i];
+            if (p.closable && !p.headerless && !p.noSwitch) {
+                switchIds.Add(p.id);
+                grp.Add(RibbonItem.Toggle(p.icon, p.title, !p.hidden)
+                    .SetTip(this.SwitchTip(p)));
+            }
+        }
+        groups.Add(grp);
+    }
+
+    // 丢弃开关映射——用于显示它们的工具栏消失时（另一个 ribbon 选项卡），
+    // 这样任何点击都不会被误认为是开关点击。
+    public void ClearSwitches() {
+        switchIds = new List<string>();
+        switchBase = 0 - 1;
+    }
+
+    // 根据实时布局刷新开关的点亮状态（和标签）。
+    public void SyncSwitches(List<RibbonCmd> cmds) {
+        for (int i = 0; i < switchIds.Count; i = i + 1) {
+            int at = switchBase + i;
+            if (at >= cmds.Count) { return; }
+            DockPanel p = this.Find(switchIds[i]);
+            if (p != null) {
+                cmds[at].SetOn(!p.hidden);
+                cmds[at].label = p.title;
+                cmds[at].icon = p.icon;
+            }
+        }
+    }
+
+    // 切换 ribbon 点击命中的面板。点击是面板开关时返回 true
+    // （宿主不应将其作为命令分发）。
+    public bool HandleRibbon(int pos) {
+        if (switchBase < 0) { return false; }
+        int i = pos - switchBase;
+        if (i < 0 || i >= switchIds.Count) { return false; }
+        this.Toggle(switchIds[i]);
+        return true;
+    }
+
+    // 隐藏面板并将其移出所在组（若它是最后一个标签则删除该组）。
+    // 面板仍保持注册状态，可随时恢复。
+    public void Close(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return; }
+        if (p.hidden) { return; }
+        this.NoteHome(p);
+        p.hidden = true;
+        p.body = new Rect(0, 0, 0, 0);
+        this.Detach(id);
+        lastClosed = id;
+        changed = true;
+    }
+
+    // 记住面板当前所在的分组、标签序号和该分组在同侧的序号，
+    // 供 Show() 原位恢复。
+    public void NoteHome(DockPanel p) {
+        int gi = this.GroupOf(p.id);
+        if (gi < 0) { return; }
+        DockGroup g = groups[gi];
+        p.home = g.side;
+        p.homeKey = g.key;
+        p.homeAt = this.IndexIn(g, p.id);
+        p.homeSideIdx = this.SideIndexOf(gi);
+    }
+
+    // 分组在同侧分组中的序号（0 = 该侧第一个）。
+    public int SideIndexOf(int gi) {
+        int n = 0;
+        for (int i = 0; i < gi; i = i + 1) {
+            if (groups[i].side == groups[gi].side) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 同侧第 `at` 个分组在 groups 列表中的插入位置。
+    public int InsertPosFor(int side, int at) {
+        int n = 0;
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].side != side) { continue; }
+            if (n == at) { return i; }
+            n = n + 1;
+        }
+        return groups.Count;
+    }
+
+    // 按 key 找组的下标；不存在为 -1。
+    public int GroupWithKey(int key) {
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].key == key) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // 把面板移出所在组并把它选中后的活动标签修好；组空了就解散。
+    public void Detach(string id) {
+        int gi = this.GroupOf(id);
+        if (gi < 0) { return; }
+        DockGroup g = groups[gi];
+        for (int j = 0; j < g.ids.Count; j = j + 1) {
+            if (g.ids[j] == id) {
+                g.ids.RemoveAt(j);
+                if (g.active > j) { g.active = g.active - 1; }
+                if (g.active >= g.ids.Count) { g.active = g.ids.Count - 1; }
+                if (g.active < 0) { g.active = 0; }
+                break;
+            }
+        }
+        if (g.ids.Count == 0) { groups.RemoveAt(gi); }
+    }
+
+    // 重新停靠已关闭的面板：若 `side` 上有打开的组则并入其中，
+    // 否则在该侧新建组。同时选中该面板。
+    public void ShowOn(string id, int side) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return; }
+        p.hidden = false;
+        p.home = side;
+        if (this.GroupOf(id) < 0) {
+            DockGroup g = this.LastGroupOf(side);
+            if (g == null) {
+                g = new DockGroup(side, 100);
+                groups.Add(g);
+            }
+            g.ids.Add(id);
+        }
+        int gi = this.GroupOf(id);
+        if (gi >= 0) { groups[gi].active = this.IndexIn(groups[gi], id); }
+        changed = true;
+    }
+
+    // 面板是否处于关闭（隐藏）状态；未注册视为隐藏。
+    public bool IsHidden(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return true; }
+        return p.hidden;
+    }
+
+    // 面板的显示/隐藏开关——"面板"工具栏按钮所驱动的内容。
+    public void Toggle(string id) {
+        if (this.IsHidden(id)) { this.Show(id); } else { this.Close(id); }
+    }
+
+    // 把已关闭的面板放回关闭前的位置：原分组还在就插回原来的
+    // 标签序号，原分组已经空掉被移除就在同侧原来的位置重建它。
+    public void Show(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return; }
+        if (!p.hidden) { this.Focus(id); return; }
+        if (this.GroupOf(id) >= 0) { this.ShowOn(id, p.home); return; }
+        int gi = this.GroupWithKey(p.homeKey);
+        if (gi < 0) {
+            DockGroup ng = new DockGroup(p.home, 100);
+            int at = this.InsertPosFor(p.home, p.homeSideIdx);
+            groups.Insert(at, ng);
+            gi = this.GroupWithKey(ng.key);
+        }
+        DockGroup g = groups[gi];
+        int slot = p.homeAt;
+        if (slot < 0) { slot = 0; }
+        if (slot > g.ids.Count) { slot = g.ids.Count; }
+        g.ids.Insert(slot, id);
+        p.hidden = false;
+        p.home = g.side;
+        g.active = this.IndexIn(g, id);
+        changed = true;
+    }
+
+    // `id` 在组内的标签序号（不在组内为 0）。
+    public int IndexIn(DockGroup g, string id) {
+        for (int j = 0; j < g.ids.Count; j = j + 1) {
+            if (g.ids[j] == id) { return j; }
+        }
+        return 0;
+    }
+
+    // 所有已关闭面板的 id，按注册顺序——供"恢复面板"菜单
+    // 作为数据模型。
+    public List<string> HiddenIds() {
+        List<string> outIds = new List<string>();
+        for (int i = 0; i < panels.Count; i = i + 1) {
+            if (panels[i].hidden) { outIds.Add(panels[i].id); }
+        }
+        return outIds;
+    }
+
+    // 将面板带到其组的最前面（若已关闭，先停靠回原位
+    // ）。
+    public void Focus(string id) {
+        DockPanel p = this.Find(id);
+        if (p == null) { return; }
+        if (p.hidden) {
+            this.Show(id);
+            return;
+        }
+        int gi = this.GroupOf(id);
+        if (gi >= 0) { groups[gi].active = this.IndexIn(groups[gi], id); }
+    }
+
+    // 自上次调用以来被关闭的面板，或 ""——让宿主记录它或
+    // 销毁面板的资源。
+    public string TakeClosed() {
+        string s = lastClosed;
+        lastClosed = "";
+        return s;
+    }
+
+    // 布局发生变化（调整大小、停靠、关闭、恢复）时返回一次 true——
+    // 提示应持久化 SaveLayout()。
+    public bool TakeChanged() {
+        bool c = changed;
+        changed = false;
+        return c;
+    }
+
+    // ---- 持久化 ----
+
+    // 物理像素 → 逻辑像素（按 dpiScale 折算，用于序列化，跨 DPI 搬运）。
+    public int PersistLogical(int px) {
+        int scale = dpiScale;
+        if (scale <= 0) { scale = 100; }
+        return px * 100 / scale;
+    }
+
+    // 逻辑像素 → 物理像素（LoadLayout 恢复时按当前 DPI 折算回）。
+    public int PersistPhysical(int logical) {
+        int scale = dpiScale;
+        if (scale <= 0) { scale = 100; }
+        return logical * scale / 100;
+    }
+
+    // 将各侧、组和隐藏面板序列化为一行，例如
+    // （隐藏面板携带它应恢复到的侧边）。
+    // 加载时跳过未知 id，因此该格式能容忍不同版本间
+    // 出现和消失的面板。
+    public string SaveLayout() {
+        string s = "v2;S=" + Convert.ToString(PersistLogical(leftW)) + ","
+            + Convert.ToString(PersistLogical(rightW)) + ","
+            + Convert.ToString(PersistLogical(bottomH));
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            DockGroup g = groups[i];
+            s = s + ";G=" + Convert.ToString(g.side) + ","
+                + Convert.ToString(PersistLogical(g.extent)) + ","
+                + Convert.ToString(g.active);
+            for (int j = 0; j < g.ids.Count; j = j + 1) {
+                if (j == 0) { s = s + ","; } else { s = s + "|"; }
+                s = s + g.ids[j];
+            }
+        }
+        string hid = "";
+        for (int k = 0; k < panels.Count; k = k + 1) {
+            if (panels[k].hidden) {
+                if (hid != "") { hid = hid + "|"; }
+                hid = hid + panels[k].id + ":" + Convert.ToString(panels[k].home);
+            }
+        }
+        if (hid != "") { s = s + ";H=" + hid; }
+        return s;
+    }
+
+    // 恢复 SaveLayout 写入的布局。布局未提及的面板
+    // 保留其注册位置；布局提到但未注册的 id 被忽略。
+    // 当字符串不是本版本能理解的布局时返回 false
+    // （调用方此时保留默认设置）。
+    public bool LoadLayout(string text) {
+        if (text == null) { return false; }
+        List<string> parts = DockHost.SplitOn(text, ";");
+        if (parts.Count == 0) { return false; }
+        bool logical = parts[0] == "v2";
+        if (!logical && parts[0] != "v1") { return false; }
+        logicalLayoutPending = logical;
+
+        List<DockGroup> loaded = new List<DockGroup>();
+        List<string> hidden = new List<string>();
+        int i = 1;
+        while (i < parts.Count) {
+            string seg = parts[i];
+            if (DockHost.HasPrefix(seg, "S=")) {
+                List<string> nums = DockHost.SplitOn(DockHost.After(seg, 2), ",");
+                if (nums.Count >= 3) {
+                    leftW = Convert.ToInt32(nums[0]);
+                    rightW = Convert.ToInt32(nums[1]);
+                    bottomH = Convert.ToInt32(nums[2]);
+                    sized = true;
+                }
+            } else if (DockHost.HasPrefix(seg, "G=")) {
+                List<string> f = DockHost.SplitOn(DockHost.After(seg, 2), ",");
+                if (f.Count >= 4) {
+                    DockGroup g = new DockGroup(Convert.ToInt32(f[0]), 100);
+                    g.extent = Convert.ToInt32(f[1]);
+                    g.active = Convert.ToInt32(f[2]);
+                    List<string> ids = DockHost.SplitOn(f[3], "|");
+                    for (int j = 0; j < ids.Count; j = j + 1) {
+                        if (this.Find(ids[j]) != null) { g.ids.Add(ids[j]); }
+                    }
+                    if (g.ids.Count > 0) {
+                        if (g.active >= g.ids.Count) { g.active = g.ids.Count - 1; }
+                        if (g.active < 0) { g.active = 0; }
+                        loaded.Add(g);
+                    }
+                }
+            } else if (DockHost.HasPrefix(seg, "H=")) {
+                List<string> hs = DockHost.SplitOn(DockHost.After(seg, 2), "|");
+                for (int hi = 0; hi < hs.Count; hi = hi + 1) {
+                    List<string> hf = DockHost.SplitOn(hs[hi], ":");
+                    if (hf.Count >= 1) {
+                        hidden.Add(hf[0]);
+                        DockPanel hp = this.Find(hf[0]);
+                        if (hp != null && hf.Count >= 2) {
+                            hp.home = Convert.ToInt32(hf[1]);
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if (loaded.Count == 0) { return false; }
+
+        // 保留保存的布局从未提及的面板：将它们重新停靠到
+        // 其注册所在侧的最后一个组（或新建组）。
+        List<string> placed = new List<string>();
+        for (int gi = 0; gi < loaded.Count; gi = gi + 1) {
+            for (int j = 0; j < loaded[gi].ids.Count; j = j + 1) {
+                placed.Add(loaded[gi].ids[j]);
+            }
+        }
+        List<DockGroup> old = groups;
+        groups = loaded;
+        for (int p = 0; p < panels.Count; p = p + 1) {
+            DockPanel pan = panels[p];
+            pan.hidden = DockHost.ListHas(hidden, pan.id);
+            if (!DockHost.ListHas(placed, pan.id) && !pan.hidden) {
+                int side = DockHost.SideOfIn(old, pan.id);
+                DockGroup g = this.LastGroupOf(side);
+                if (g == null) {
+                    g = new DockGroup(side, 100);
+                    groups.Add(g);
+                }
+                g.ids.Add(pan.id);
+            }
+        }
+        // 记住每个停靠面板最终所在的位置，这样关闭后再恢复
+        // 它时能回到同一侧。
+        for (int hp2 = 0; hp2 < panels.Count; hp2 = hp2 + 1) {
+            int hg = this.GroupOf(panels[hp2].id);
+            if (hg >= 0) { panels[hp2].home = groups[hg].side; }
+        }
+        return true;
+    }
+
+    // `id` 在 `gs` 这组布局里的所在侧；找不到为 Left。
+    public static int SideOfIn(List<DockGroup> gs, string id) {
+        for (int i = 0; i < gs.Count; i = i + 1) {
+            for (int j = 0; j < gs[i].ids.Count; j = j + 1) {
+                if (gs[i].ids[j] == id) { return gs[i].side; }
+            }
+        }
+        return DockSide.Left();
+    }
+
+    // 列表是否含有 `v`。
+    public static bool ListHas(List<string> xs, string v) {
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i] == v) { return true; }
+        }
+        return false;
+    }
+
+    // 前缀测试。
+    public static bool HasPrefix(string s, string p) {
+        if (s.Length < p.Length) { return false; }
+        return s.Substring(0, p.Length) == p;
+    }
+
+    // 去掉前 n 个字符；不足 n 时为 ""。
+    public static string After(string s, int n) {
+        if (s.Length <= n) { return ""; }
+        return s.Substring(n, s.Length - n);
+    }
+
+    // 按单字符分隔符拆分，丢弃空段。
+    public static List<string> SplitOn(string s, string sep) {
+        List<string> outp = new List<string>();
+        if (s == null || sep == null || sep.Length == 0) { return outp; }
+        int start = 0;
+        int n = s.Length;
+        if (sep.Length == 1) {
+            int target = sep[0] & 255;
+            for (int i = 0; i < n; i = i + 1) {
+                if ((s[i] & 255) == target) {
+                    if (i > start) { outp.Add(s.Substring(start, i - start)); }
+                    start = i + 1;
+                }
+            }
+        } else {
+            int seplen = sep.Length;
+            int pos = s.IndexOf(sep, start);
+            while (pos >= 0) {
+                if (pos > start) { outp.Add(s.Substring(start, pos - start)); }
+                start = pos + seplen;
+                pos = s.IndexOf(sep, start);
+            }
+        }
+        if (n > start) { outp.Add(s.Substring(start, n - start)); }
+        return outp;
+    }
+
+    // ---- 布局 ----
+
+    // 该侧是否有任一可见分组（决定布局时该侧是否占空间）。
+    public bool SideHasVisible(int side) {
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].side == side && this.GroupHasVisible(groups[i])) { return true; }
+        }
+        return false;
+    }
+
+    // 组内是否有任一未隐藏的面板。
+    public bool GroupHasVisible(DockGroup g) {
+        for (int j = 0; j < g.ids.Count; j = j + 1) {
+            DockPanel p = this.Find(g.ids[j]);
+            if (p != null && !p.hidden) { return true; }
+        }
+        return false;
+    }
+
+    // 该侧含可见面板的分组（按列表顺序）。
+    public List<DockGroup> VisibleGroups(int side) {
+        List<DockGroup> gs = new List<DockGroup>();
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].side == side && this.GroupHasVisible(groups[i])) { gs.Add(groups[i]); }
+        }
+        return gs;
+    }
+
+    // 在 `a` 内布置整个停靠区，绘制分隔手柄和每个
+    // 组的标签条，并处理调整大小拖拽、标签点击、关闭和
+    // 标签拖拽的开始。每帧在绘制面板之前调用一次。
+}

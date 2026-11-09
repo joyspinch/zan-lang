@@ -24,12 +24,15 @@ public class InputOtp : Control {
     private List<string> cells;
     // 当前活动格索引（0 基）。
     private int active;
-    // 整框命中 id。
-    private int wid;
     // 字符格数。
     private int length;
     // 上一帧渲染的宿主：Focus/Blur 要在没有 app 形参的回调里用。
     private App liveApp;
+    public List<Control> cellNodes;
+    public List<Label> cellLabels;
+
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
     // 双向绑定验证码：`otp.data = form.code;`（编译器降级的
     // Binding）。未设置时只编辑内部格子。
     public Binding<string> data;
@@ -115,6 +118,27 @@ public class InputOtp : Control {
         return false;
     }
 
+    public void BuildCells() {
+        this.children.Clear();
+        cellNodes = new List<Control>();
+        cellLabels = new List<Label>();
+        int sepCount = this.SeparatorCount();
+        string sep = Separator != "" ? Separator : "-";
+        for (int i = 0; i < length; i = i + 1) {
+            Control cell = new Control { ClassName = "otp-cell align-center justify-center" };
+            Label lbl = new Label("");
+            lbl.ClassName = "otp-text";
+            cell.Add(lbl);
+            cellNodes.Add(cell);
+            cellLabels.Add(lbl);
+            this.Add(cell);
+            if (this.SepAfter(i) && sepCount > 0) {
+                Label sepLabel = new Label(sep) { ClassName = "otp-separator" };
+                this.Add(sepLabel);
+            }
+        }
+    }
+
     // 公共初始化（各构造共用）。
     public void InitOtp(int n) {
         this.InitControl("otp", 1);
@@ -123,7 +147,6 @@ public class InputOtp : Control {
         cells = new List<string>();
         for (int i = 0; i < length; i = i + 1) { cells.Add(""); }
         active = 0;
-        wid = WidgetId.Next();
         liveApp = null;
         Size = "medium";
         MaskMode = false;
@@ -139,15 +162,14 @@ public class InputOtp : Control {
         wiresOwnEvents = true;
         Change = new UiEvent();
         Complete = new UiEvent();
+        this.ClassName = "input-otp row align-center";
+        this.BuildCells();
     }
 
     // 设计器默认构造：6 格。
     public InputOtp() { this.InitOtp(6); }
 
     public InputOtp(int n) { this.InitOtp(n); }
-
-    // 整框命中 id（宿主查焦点用）。
-    public override int WidgetId() { return wid; }
 
     // 字符格数（<1 钳到 1）。缩小时保留已填的前缀。
     public void SetLength(int n) {
@@ -235,14 +257,14 @@ public class InputOtp : Control {
     // 聚焦整框（禁用态不响应）。
     public void Focus() {
         if (liveApp == null || this.IsDisabled()) { return; }
-        liveApp.focus.SetFocused(wid);
+        liveApp.focus.SetFocused(this.WidgetId());
         liveApp.RequestRedraw();
     }
 
     // 交出焦点。
     public void Blur() {
         if (liveApp == null) { return; }
-        if (liveApp.focus.IsFocused(wid)) { liveApp.focus.ClearFocus(); }
+        if (liveApp.focus.IsFocused(this.WidgetId())) { liveApp.focus.ClearFocus(); }
         liveApp.RequestRedraw();
     }
 
@@ -417,19 +439,6 @@ public class InputOtp : Control {
         }
     }
 
-    // 把绑定模型的变更拉进格子（model -> UI）。长度对齐即可，
-    // 相同就不动（避免每帧重写 active）。
-    public override void SyncBinding() {
-        if (data == null) { return; }
-        string cur = data.Get();
-        if (cur != this.GetCode()) {
-            int wantActive = active;
-            this.SetCode(cur);
-            active = wantActive;
-            if (active > length - 1) { active = length - 1; }
-        }
-    }
-
     // 第 i 格的显示文本；掩码模式返回掩码字符（默认 "•"）。
     public string CellDisplay(int i) {
         string v = cells[i];
@@ -441,142 +450,29 @@ public class InputOtp : Control {
         return v;
     }
 
-    // 每帧渲染与交互（立即模式入口；停靠布局经 OnPaint 进入）：
-    // 分组/分隔符几何、逐格状态与指针定位。
-    public int Render(App app, int x, int y, int w, int h) {
-        int id = wid;
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        liveApp = app;
-
-        bool off = this.IsDisabled();
-        app.focus.RegisterFocusable(id);
-        app.focus.RegisterTextEditable(id);
-        bool focused = app.focus.IsFocused(id) && !off;
-
-        string origClass = Class;
-        this.ApplySizeClass();
-        string stCls = Control.StatusSanitize(FieldStatus);
-        if (stCls != "") { this.AddClass(stCls); }
-        // 设计器/绑定可能直写脏值，渲染沿兜底归一。
-        FieldStatus = stCls;
-
-        if (focused) { this.HandleKeys(app); }
-        this.SyncBinding();
-
-        // 基样式：默认态整框解析一次，取格子的静态外观。
-        StyleBox baseS = this.ResolveEasedStyleAsIn(
-            app, id, "otp", Class, off, false, x, y, w, h);
-        int fs = baseS.FontOr(Style.FontFallback(app, "medium"));
-        int cellSize = baseS.HeightOr(t.heightMedium);
-        int gap = baseS.PadLOr(app.Scale(8));
-        int n = length;
-        int sepCount = this.SeparatorCount();
-        string sep = Separator;
-        if (sep == "") { sep = "-"; }
-        int sepTextW = 0;
-        if (sepCount > 0) { sepTextW = Canvas.MeasureText(sep, fs); }
-        // 一格的横向步距：格宽 + 一个缝；组界处额外多一个「缝+分隔文字+缝」槽。
-        int cellW = cellSize;
-        int totalW = n * cellSize + (n - 1) * gap
-                   + sepCount * (sepTextW + gap);
-        if (Block) {
-            totalW = w;
-            int fixedW = (n - 1) * gap + sepCount * (sepTextW + gap);
-            cellW = (w - fixedW) / n;
-            if (cellW < app.Scale(12)) { cellW = app.Scale(12); }
-        } else if (totalW > w) {
-            // 窄视口（手机卡片）：定宽格子装不下时按 w 收缩，
-            // 与 Block 同款下限，避免右缘直接裁掉后半排格子。
-            int fixedW = (n - 1) * gap + sepCount * (sepTextW + gap);
-            cellW = (w - fixedW) / n;
-            if (cellW < app.Scale(12)) { cellW = app.Scale(12); }
-            totalW = n * cellW + fixedW;
-        }
-        int cellH = cellSize;
-        if (Block) { cellH = h; }
-        if (h < cellH) { cellH = h; }
-        int cy = y + (h - cellH) / 2;
-        int cx = x;
-        if (!Block && totalW < w) { cx = x + (w - totalW) / 2; }
-
-        // 悬停格：整框命中（框架算好遮挡）+ 指针几何定位到格。
-        int hoverCell = -1;
-        if (!off && app.focus.IsHovered(id)) {
-            hoverCell = this.CellIndexAt(x, cx, cellW, gap, sepTextW, w,
-                                         app.mouseX);
-        }
-        if (Ui.Clicked(app, id) && !off) {
-            int clicked = this.CellIndexAt(x, cx, cellW, gap, sepTextW, w,
-                                           app.mouseX);
-            if (clicked >= 0 && clicked != active) {
-                active = clicked;
-                app.RequestRedraw();
+    // 把绑定模型的变更拉进格子（model -> UI）。长度对齐即可，
+    // 相同就不动；重写格子内容时保留光标格（避免每帧重写 active）。
+    public override void SyncBinding() {
+        base.SyncBinding();
+        if (data != null) {
+            string cur = data.Get();
+            if (cur != this.GetCode()) {
+                int wantActive = active;
+                this.SetCode(cur);
+                active = wantActive;
+                if (active > length - 1) { active = length - 1; }
             }
         }
-
-        // 逐格：状态位（禁用 / 活动格聚焦 / 悬停）解析对应样式，
-        StyleBox sepS = this.ResolvePartAs(app, "otp", "separator", "",
-                                           Class, Style.SNormal());
-        for (int i = 0; i < n; i = i + 1) {
-            int state = Style.SNormal();
-            if (off) { state = Style.SDisabled(); }
-            else if (focused && i == active) { state = Style.SFocus(); }
-            else if (i == hoverCell) { state = Style.SHover(); }
-            StyleBox cs = baseS;
-            if (state != Style.SNormal()) {
-                cs = this.ResolveStyleAs(app, "otp", Class, state);
-            }
-            cs.Paint(app, cx, cy, cellW, cellH);
-            string disp = this.CellDisplay(i);
-            if (disp != "") {
-                int tw = Canvas.MeasureText(disp, fs);
-                int th = Canvas.FontHeight(fs);
-                c.DrawText(cx + (cellW - tw) / 2, cy + (cellH - th) / 2,
-                           disp, cs.FgOr(baseS.fg), fs);
-            }
-            if (focused && i == active && !off && !ReadOnly && disp == "") {
-                // 空格的插入符；有字符时强调描边已经够响，不叠线。
-                int cw2 = cs.WidthOr(app.Scale(1));
-                int ch2 = Canvas.FontHeight(fs);
-                c.FillRect(cx + cellW / 2, cy + (cellH - ch2) / 2,
-                           cw2, ch2,
-                           cs.AccentOr(baseS.AccentOr(cs.FgOr(baseS.fg))));
-            }
-            cx = cx + cellW + gap;
-            if (this.SepAfter(i) && sepCount > 0) {
-                int sh = Canvas.FontHeight(fs);
-                c.DrawText(cx, cy + (cellH - sh) / 2, sep,
-                           sepS.FgOr(baseS.fg), fs);
-                cx = cx + sepTextW + gap;
+        if (cellNodes != null && cellLabels != null) {
+            for (int i = 0; i < length && i < cellLabels.Count; i = i + 1) {
+                cellLabels[i].Text = this.CellDisplay(i);
+                if (i == active) {
+                    cellNodes[i].AddClass("focused");
+                } else {
+                    cellNodes[i].RemoveClass("focused");
+                }
             }
         }
-
-        app.hitTester.RegisterRect(id, x, y, w, h, 1);
-
-        // Tab 误聚焦时激活沿：首格聚焦后 Complete 重新武装。
-        if (focused && !wasFull) { completeArmed = false; }
-
-        Class = origClass;
-        On.Fire(app, id, this);
-        return id;
-    }
-
-    // 指针 x -> 格索引（落在分隔符/空隙返回 -1）。步距几何与
-    // Render 的逐格推进完全一致：格宽 + 缝，组界处多一个分隔槽。
-    public int CellIndexAt(int boxX, int startX, int cellW, int gap, int sepTextW,
-                    int boxW, int px) {
-        if (px < boxX || px >= boxX + boxW) { return -1; }
-        int cx = startX;
-        for (int i = 0; i < length; i = i + 1) {
-            if (px >= cx && px < cx + cellW) { return i; }
-            cx = cx + cellW + gap;
-            if (this.SepAfter(i) && sepTextW > 0) {
-                if (px < cx + sepTextW) { return -1; }
-                cx = cx + sepTextW + gap;
-            }
-        }
-        return -1;
     }
 
     // --- 设计器 / 序列化模型 ---
@@ -688,33 +584,17 @@ public class InputOtp : Control {
 
     // --- 保留模式钩子（Control） ---
 
-    // 覆写：宽 = 格宽 x 格数 + 间距与分隔符，高 = 单元格边长（按尺寸档）。
-    public override void OnMeasure(App app) {
-        Theme t = app.theme;
-        string origClass = Class;
-        this.ApplySizeClass();
-        string stCls = Control.StatusSanitize(FieldStatus);
-        if (stCls != "") { this.AddClass(stCls); }
-        StyleBox s = this.ResolveStyleAs(app, "otp", Class, Style.SNormal());
-        int cellSize = s.HeightOr(t.heightMedium);
-        int gap = s.PadLOr(app.Scale(8));
-        int sepCount = this.SeparatorCount();
-        int sepW = 0;
-        if (sepCount > 0) {
-            string sep = Separator;
-            if (sep == "") { sep = "-"; }
-            sepW = Canvas.MeasureText(sep, s.FontOr(Style.FontFallback(app, "medium")))
-                 + gap;
-        }
-        int n = length;
-        prefH = cellSize;
-        prefW = n * cellSize + (n - 1) * gap + sepCount * sepW
-              + app.Scale(8);
-        Class = origClass;
-    }
-
-    // 覆写：保留模式绘制 = 以自身矩形 Render。
     public override void OnPaint(App app) {
-        this.Render(app, bx, by, bw, bh);
+        int id = this.CommonId();
+        liveApp = app;
+        bool off = this.IsDisabled();
+        app.focus.RegisterFocusable(id);
+        app.focus.RegisterTextEditable(id);
+        bool focused = app.focus.IsFocused(id) && !off;
+        if (focused) { this.HandleKeys(app); }
+        SyncBinding();
+        string a11y = this.EffectiveA11yRole("textbox") + ":" + this.EffectiveA11yLabel("OTP");
+        app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);
+        On.Fire(app, id, this);
     }
 }

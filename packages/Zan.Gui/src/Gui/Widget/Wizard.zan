@@ -3,961 +3,105 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 渲染浮动 "wizard" 子窗口的完整内容：标题栏
-// （带关闭按钮）、左侧可选择的模板列表、右侧的名称（和
-// 可选位置）输入框、所选模板的实时描述，
-// 以及 Create / Cancel 按钮。
-// 与 Modal/Dialog（在主窗口内绘制遮罩）不同，Wizard
-// 旨在填充一个真实的二级顶层窗口，用户可将其拖到
-// 桌面任意位置——调用方拥有该窗口的 App 和事件循环，
-// 每帧只需调用 Wizard.Render(childApp, ...)。
-// 返回 0 无操作、1 创建、2 取消/关闭。
-public partial class Wizard : Control {
-    // 宿主 IDE 在渲染前设置此项，使标签跟随应用语言。
-    public static string lang = "zh";
+// 步骤式向导（Wizard）：组合 Steps 步骤指示器、步骤内容面板与上一步/下一步/完成控制。
+// 纯声明式对象树与 CSS 盒模型，无任何应用层业务逻辑与即时微绘。
+public class Wizard : Control {
+    public Steps steps;
+    public Control content;
+    public Button prevBtn;
+    public Button nextBtn;
+    public Button finishBtn;
+    public SignalInt currentStep;
+    public UiEvent StepChange;
+    public UiEvent Finish;
 
-    // 可选的一行提示，以主题错误色绘制在
-    // Create/Cancel 按钮旁边（如 "目标文件夹不为空"）。宿主
-    // 拒绝 Create 时设置它，对话框关闭时清除。
-    public static string notice = "";
+    public override int StyleDisplay() { return 1; } // Flex
+    public override int StyleFlexDir() { return 1; } // Column
 
-    // null 信号换成一个本地 0 初值信号，其余原样返回。
-    private static SignalInt Scroller(SignalInt s) {
-        if (s == null) { return new SignalInt(0); }
-        return s;
-    }
-
-    // 行列表视口的滚动量：处理滚轮、把偏移夹在
-    // [0, contentH - h]，返回本帧应使用的偏移。
-    private static int ScrollOffset(App app, int x, int y, int w, int h,
-                            int contentH, SignalInt off) {
-        Scrollbar.HandleWheel(app, x, y, w, h, contentH, off);
-        int maxOff = contentH - h;
-        if (maxOff < 0) { maxOff = 0; }
-        if (off.Get() > maxOff) { off.Set(maxOff); }
-        if (off.Get() < 0) { off.Set(0); }
-        return off.Get();
-    }
-
-    // 内置文案走键式查找（System.Globalization.Lang）：英文原文
-    // 作键、内置中文为缺省串；语言包未加载时回退缺省串。
-    public static string TW(string en, string zh) {
-        return Lang.Tr(en, zh);
-    }
-
-    // 目标 id 的 OS 前缀（"windows-x64" -> "windows"，无 - 则原样）。
-    public static string OsOf(string tid) {
-        for (int j = 0; j < tid.Length; j = j + 1) {
-            if (tid.Substring(j, 1) == "-") { return tid.Substring(0, j); }
-        }
-        return tid;
-    }
-
-    // 该模板是否支持目标平台 id：按 OS 前缀在模板声明的
-    // `platforms=`（逗号分隔）里找。模板未声明、或 chip 没有
-    // id 时视为不限，一律可勾。
-    public static bool TplSupports(WizardTemplate tpl, string tid) {
-        if (tpl == null || tpl.plats == "" || tid == "") { return true; }
-        string wrapped = "," + tpl.plats + ",";
-        string needle = "," + Wizard.OsOf(tid) + ",";
-        // stdlib string 无子串查找，朴素匹配（plats 最长几十字节）。
-        for (int k = 0; k + needle.Length <= wrapped.Length; k = k + 1) {
-            bool hit = true;
-            for (int m = 0; m < needle.Length; m = m + 1) {
-                if (wrapped.Substring(k + m, 1) != needle.Substring(m, 1)) { hit = false; break; }
-            }
-            if (hit) { return true; }
-        }
-        return false;
-    }
-
-    // `platforms=` 里 OS 前缀的显示名。专有名词两种语言同形，
-    // 不走 TW。
-    public static string OsName(string os) {
-        if (os == "windows") { return "Windows"; }
-        if (os == "macos") { return "macOS"; }
-        if (os == "linux") { return "Linux"; }
-        if (os == "android") { return "Android"; }
-        if (os == "ohos") { return "HarmonyOS"; }
-        return os;
-    }
-
-    // 声明里写全 id（"windows-x64"）也能容错，取 - 前的 OS。
-    public static string PrettyPlats(string spec) {
-        string pretty = "";
-        string cur = "";
-        // i 数到 Length：给末尾补一个虚拟分隔符，最后一段走同一
-        // 条处理路径（否则尾段的 - 前缀切不掉，"ohos-arm64"
-        // 会原样透出而不是 HarmonyOS）。
-        for (int i = 0; i <= spec.Length; i = i + 1) {
-            string ch = ",";
-            if (i < spec.Length) { ch = spec.Substring(i, 1); }
-            if (ch == ",") {
-                if (cur != "") {
-                    if (pretty != "") { pretty = pretty + " / "; }
-                    pretty = pretty + Wizard.OsName(Wizard.OsOf(cur));
-                }
-                cur = "";
-            } else {
-                cur = cur + ch;
-            }
-        }
-        return pretty;
-    }
-
-    // ---- 保留式实例 ----------------------------------------------
-    // Wizard 对象拥有向导窗口所需的状态（标题、条目列表、
-    // 选择信号、名称/位置输入），宿主持有一个实例
-    // 并每帧调用 `wiz.Show(app)`，而不是把每个字段
-    // 穿过立即模式静态调用传递。
-    private string iTitle;
-    private bool iCategorized;
-    private List<WizardItem> iItems;
-    private SignalInt iSel;
-    private Input iName;
-    private Input iLoc;
-    private bool iShowLoc;
-    private List<string> iCatNames;
-    private SignalInt iCatSel;
-    private List<WizardTemplate> iTpls;
-    private SignalInt iTplSel;
-    private List<WizardTarget> iTargets;
-    private List<string> iGroups;
-    // 为生成设计窗口的文件模板提供的可选窗口尺寸预设选择
-    // （参见 SizePresetW/H/Name）。null 隐藏该区域。
-    private SignalInt iSizeSel;
-    // 可选的宽/高自定义输入，绘制在预设网格下方
-    // （null 隐藏自定义行）。点击预设会回填这些输入，宿主
-    // 从这些输入读取最终尺寸。
-    private Input iSizeW;
-    private Input iSizeH;
-    // 目标设备画像选择（DeviceProfile.All() 的下标）与横竖屏
-    // 方向（0 竖屏 / 1 横屏）。null 隐藏目标设备行（保持旧的
-    // 纯尺寸预设行为）。选中锁定类设备时尺寸行收起，画布
-    // 尺寸由画像给出并回填 iSizeW/iSizeH——宿主仍从这两个
-    // 输入读取最终尺寸，契约不变。
-    private SignalInt iDevSel;
-    private SignalInt iDevRot;
-
-    // 实例级滚动信号（支持多窗口/多向导实例并发状态隔离）。
-    public SignalInt listScroll;
-    public SignalInt catScroll;
-    public SignalInt tplScroll;
-
-    // 设计器用无参构造；状态由静态工厂（Categorized）或实例构造器填充。
     public Wizard() {
-        this.InitControl("wizard", 5);
-        this.iTitle = "";
-        this.iShowLoc = false;
-        this.listScroll = new SignalInt(0);
-        this.catScroll = new SignalInt(0);
-        this.tplScroll = new SignalInt(0);
+        this.InitControl("wizard", 1);
+        this.ClassName = "wizard col";
+        currentStep = new SignalInt(0);
+        StepChange = new UiEvent();
+        Finish = new UiEvent();
+        steps = new Steps(currentStep);
+        content = new Control();
+        content.ClassName = "wizard-content flex-1 col";
+
+        prevBtn = new Button("上一步");
+        prevBtn.ClassName = "wizard-prev";
+        prevBtn.Click.Add(() => { this.Prev(); });
+
+        nextBtn = new Button("下一步");
+        nextBtn.ClassName = "wizard-next primary";
+        nextBtn.Click.Add(() => { this.Next(); });
+
+        finishBtn = new Button("完成");
+        finishBtn.ClassName = "wizard-finish primary";
+        finishBtn.Click.Add(() => { this.OnFinish(); });
+
+        this.BuildTree();
     }
 
-    // 控件类型标识（序列化/设计器用）。
-    public override string Kind() { return "Wizard"; }
-
-    // 覆写：返回设计器属性清单（title/showLocation）。
-    public override List<PropSpec> Props() {
-        List<PropSpec> ps = new List<PropSpec>();
-        PropSpec title = PropSpec.Text("title", "Title");
-        title.str = iTitle;
-        title.WithTip("Title shown in the wizard window.");
-        ps.Add(title);
-        PropSpec loc = PropSpec.Bool("showLocation", "Show location");
-        loc.flag = iShowLoc;
-        loc.WithTip("Show the destination location field.");
-        ps.Add(loc);
-        return ps;
+    public void AddStep(string title, Control pane) {
+        steps.AddStep(title);
+        content.Add(pane);
+        this.SyncStepView();
     }
 
-    // 单列表向导：`new Wizard(title, items, sel, name, loc, showLoc)`。
-    public Wizard(string title, List<WizardItem> items, SignalInt sel,
-           Input nameInput, Input locInput, bool showLoc) {
-        this.InitControl("wizard", 5);
-        this.iTitle = title;
-        this.iItems = items;
-        this.iSel = sel;
-        this.iName = nameInput;
-        this.iLoc = locInput;
-        this.iShowLoc = showLoc;
-        this.iCategorized = false;
-        this.iSizeSel = null;
-    }
-
-    // 带可选尺寸预设行的单列表向导（`sizeSel` 选择
-    // Phone/Tablet/Desktop/Default；传 null 则不显示尺寸行）。
-    public Wizard(string title, List<WizardItem> items, SignalInt sel,
-           Input nameInput, Input locInput, bool showLoc,
-           SignalInt sizeSel) {
-        this.InitControl("wizard", 5);
-        this.iTitle = title;
-        this.iItems = items;
-        this.iSel = sel;
-        this.iName = nameInput;
-        this.iLoc = locInput;
-        this.iShowLoc = showLoc;
-        this.iCategorized = false;
-        this.iSizeSel = sizeSel;
-    }
-
-    // 带完整尺寸预设网格和自定义
-    // 宽/高输入的单列表向导（传 null 输入可隐藏自定义行）。
-    public Wizard(string title, List<WizardItem> items, SignalInt sel,
-           Input nameInput, Input locInput, bool showLoc,
-           SignalInt sizeSel, Input sizeW, Input sizeH) {
-        this.InitControl("wizard", 5);
-        this.iTitle = title;
-        this.iItems = items;
-        this.iSel = sel;
-        this.iName = nameInput;
-        this.iLoc = locInput;
-        this.iShowLoc = showLoc;
-        this.iCategorized = false;
-        this.iSizeSel = sizeSel;
-        this.iSizeW = sizeW;
-        this.iSizeH = sizeH;
-    }
-
-    // 共享的设计尺寸预设，与自由画布设计器的
-    // 下拉一致：LVGL 显示尺寸 + 手机/平板/桌面 + 手表/手环。
-    public static List<int> SizePresetW() {
-        return new List<int>{ 320, 480, 800, 1024, 390, 768, 1280, 1366, 1920,
-                              466, 368, 194 };
-    }
-    // 与 SizePresetW 平行的预设高度表（下标一一对应）。
-    public static List<int> SizePresetH() {
-        return new List<int>{ 240, 320, 480, 600, 844, 1024, 720, 768, 1080,
-                              466, 448, 368 };
-    }
-    // 第 i 个尺寸预设的显示名（部分随 UI 语言）。
-    public static string SizePresetName(int i) {
-        if (i == 0) { return "QVGA"; }
-        if (i == 1) { return "HVGA"; }
-        if (i == 2) { return "WVGA"; }
-        if (i == 3) { return "WSVGA"; }
-        if (i == 4) { return Wizard.TW("Phone", "手机"); }
-        if (i == 5) { return Wizard.TW("Tablet", "平板"); }
-        if (i == 6) { return "HD"; }
-        if (i == 7) { return "WXGA"; }
-        if (i == 8) { return "FHD"; }
-        if (i == 9) { return Wizard.TW("Watch ○", "手表圆"); }
-        if (i == 10) { return Wizard.TW("Watch □", "手表方"); }
-        return Wizard.TW("Band", "手环");
-    }
-
-    // `sketch` 记号列表里是否含有 `token`。
-    public static bool SketchHas(string sketch, string token) {
-        if (sketch == "") { return false; }
-        List<string> parts = sketch.Split(",");
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            if (parts[i].Trim() == token) { return true; }
-        }
-        return false;
-    }
-
-
-    // 可选择的模板行垂直列表（图标 + 标签），绑定到
-    // SignalInt 选择。任何选择器风格的窗口都可复用。
-    public static void RenderList(App app, int x, int y, int w, int h, List<WizardItem> items,
-                           SignalInt sel) {
-        Wizard.RenderList(app, x, y, w, h, items, sel, null);
-    }
-
-    public static void RenderList(App app, int x, int y, int w, int h, List<WizardItem> items,
-                           SignalInt sel, SignalInt scroll) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        StyleBox panelStyle = Style.Part(app, "wizard", "list", "",
-                                         "", "", Style.SNormal());
-        StyleBox rowIconStyle = Style.Part(app, "wizard", "list-row-icon", "",
-                                           "", "", Style.SNormal());
-        StyleBox rowLabelStyle = Style.Part(app, "wizard", "list-row-label", "",
-                                            "", "", Style.SNormal());
-        StyleBox rowHoverStyle = Style.Part(app, "wizard", "list-row", "",
-                                            "", "", Style.SHover());
-        StyleBox rowActiveStyle = Style.Part(app, "wizard", "list-row", "",
-                                             "", "", Style.SActive());
-        StyleBox rowIconActiveStyle = Style.Part(app, "wizard", "list-row-icon",
-                                                 "", "", "", Style.SActive());
-        StyleBox rowLabelActiveStyle = Style.Part(app, "wizard", "list-row-label",
-                                                  "", "", "", Style.SActive());
-        StyleBox accentStyle = Style.Part(app, "wizard", "list-accent", "",
-                                          "", "", Style.SNormal());
-        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, panelStyle.BgOr(0));
-        if (items == null || h <= 0) { return; }
-
-        int rowH = app.Scale(42);
-        int n = items.Count;
-        int contentH = n * rowH;
-        SignalInt sc = scroll;
-        if (sc == null) {
-            sc = new SignalInt(0);
-        }
-        int off = Wizard.ScrollOffset(app, x, y, w, h, contentH, sc);
-        bool overflow = contentH > h;
-        int barW = app.Scale(10);
-        int rowW = w;
-        if (overflow) { rowW = w - barW; }
-
-        int firstId = app.focus.AllocId();
-        for (int i = 1; i < n; i = i + 1) { app.focus.AllocId(); }
-
-        int selv = sel.Get();
-        int glyph = rowIconStyle.FontOr(Style.FontFallback(app, "large"));
-        c.PushClip(x, y, w, h);
-        for (int k = 0; k < n; k = k + 1) {
-            WizardItem item = items[k];
-            int id = firstId + k;
-            int rowY = y + k * rowH - off;
-            if (rowY + rowH <= y || rowY >= y + h) { continue; }
-            bool hovered = app.focus.IsHovered(id);
-            bool active = k == selv;
-            if (active) {
-                c.FillRect(x, rowY, rowW, rowH, rowActiveStyle.BgOr(0));
-                c.FillRect(x, rowY, app.Scale(3), rowH, accentStyle.BgOr(0));
-            } else if (hovered) {
-                c.FillRect(x, rowY, rowW, rowH, rowHoverStyle.BgOr(0));
-            }
-            int iconColor = rowIconStyle.FgOr(0);
-            int textColor = rowLabelStyle.FgOr(0);
-            int rowGlyph = glyph;
-            int rowFont = rowLabelStyle.FontOr(
-                Style.FontFallback(app, "medium"));
-            if (active) {
-                iconColor = rowIconActiveStyle.FgOr(0);
-                textColor = rowLabelActiveStyle.FgOr(0);
-                rowGlyph = rowIconActiveStyle.FontOr(
-                    Style.FontFallback(app, "large"));
-                rowFont = rowLabelActiveStyle.FontOr(
-                    Style.FontFallback(app, "medium"));
-            }
-            c.DrawGlyphIn(item.icon, x + t.paddingMedium, rowY,
-                          rowGlyph, rowH, rowGlyph, iconColor);
-            int textX = x + t.paddingMedium + rowGlyph + t.gapMedium;
-            int textY = Canvas.CenterTextY(rowY, rowH, rowFont);
-            c.DrawText(textX, textY, item.name, textColor, rowFont);
-            app.hitTester.RegisterRectL(id, x, rowY, rowW, rowH, 0,
-                                        item.name);
-        }
-        c.PopClip();
-        if (overflow) {
-            Scrollbar.RenderVerticalScrollIn(app, x + w - barW, y, h, h,
-                contentH, sc, x, y, w, h);
-        }
-
-        if (app.EventKind() == 3) {
-            int hitv = app.ClickTarget();
-            int idx = hitv - firstId;
-            if (idx >= 0 && idx < n) {
-                sel.Set(idx);
-                app.RequestRedraw();
-            }
+    public void Prev() {
+        int cur = currentStep.Get();
+        if (cur > 0) {
+            currentStep.Set(cur - 1);
+            StepChange.RaiseS(this);
+            this.SyncStepView();
         }
     }
 
-    // 两级项目选择器：左侧分类列表，所选分类中的模板
-    // 居中，名称/位置输入框和实时
-    // 描述在右侧。模板以单一实体列表提供
-    // （每个携带其分类 / 名称 / 图标 / 描述）；tplSel 保存
-    // 所选模板的全局索引。返回 0 无、1 创建、2 取消。
-    public static int RenderCategorized(App app, string title, List<string> catNames, SignalInt catSel,
-                                 List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
-                                 List<WizardTarget> targets, List<string> groupNames) {
-        return Wizard.RenderCategorized(app, title, catNames, catSel, tpls, tplSel,
-                                        nameInput, locInput, targets, groupNames,
-                                        null, null, null);
+    public void Next() {
+        int cur = currentStep.Get();
+        if (cur < steps.steps.Count - 1) {
+            currentStep.Set(cur + 1);
+            StepChange.RaiseS(this);
+            this.SyncStepView();
+        }
     }
 
-    // 完整版两级向导：分类/模板列表加尺寸预设行。返回值同上。
-    public static int RenderCategorized(App app, string title, List<string> catNames, SignalInt catSel,
-                                 List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
-                                 List<WizardTarget> targets, List<string> groupNames,
-                                 SignalInt sizeSel, Input sizeW, Input sizeH) {
-        return Wizard.RenderCategorized(app, title, catNames, catSel, tpls, tplSel,
-                                        nameInput, locInput, targets, groupNames,
-                                        sizeSel, sizeW, sizeH, null, null);
+    public void OnFinish() {
+        Finish.RaiseS(this);
     }
 
-    // 完整版两级向导（带目标设备画像行）。devSel/devRot 为
-    // null 时目标设备行隐藏，等同上一重载。
-    public static int RenderCategorized(App app, string title, List<string> catNames, SignalInt catSel,
-                                 List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
-                                 List<WizardTarget> targets, List<string> groupNames,
-                                 SignalInt sizeSel, Input sizeW, Input sizeH,
-                                 SignalInt devSel, SignalInt devRot) {
-        return Wizard.RenderCategorized(app, title, catNames, catSel, tpls, tplSel,
-                                        nameInput, locInput, targets, groupNames,
-                                        sizeSel, sizeW, sizeH, devSel, devRot, null, null);
+    public void SyncStepView() {
+        int cur = currentStep.Get();
+        int count = steps.steps.Count;
+        prevBtn.Disabled = cur <= 0;
+        nextBtn.Visible = cur < count - 1;
+        finishBtn.Visible = cur == count - 1;
+        for (int i = 0; i < content.children.Count; i = i + 1) {
+            content.children[i].Visible = (i == cur);
+        }
     }
 
-    public static int RenderCategorized(App app, string title, List<string> catNames, SignalInt catSel,
-                                 List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
-                                 List<WizardTarget> targets, List<string> groupNames,
-                                 SignalInt sizeSel, Input sizeW, Input sizeH,
-                                 SignalInt devSel, SignalInt devRot,
-                                 SignalInt catScrollSig, SignalInt tplScrollSig) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int W = c.Width();
-        int H = c.Height();
-        StyleBox barStyle = Style.Part(app, "wizard", "bar", "",
-                                       "", "", Style.SNormal());
-        StyleBox titleStyle = Style.Part(app, "wizard", "title", "",
-                                         "", "", Style.SNormal());
-        StyleBox dividerStyle = Style.Part(app, "wizard", "divider", "",
-                                           "", "", Style.SNormal());
-        StyleBox closeStyle = Style.Part(app, "wizard", "close", "",
-                                         "", "", Style.SNormal());
-        StyleBox closeHoverStyle = Style.Part(app, "wizard", "close", "",
-                                              "", "", Style.SHover());
-        StyleBox labelStyle = Style.Part(app, "wizard", "label", "",
-                                         "", "", Style.SNormal());
-        StyleBox descriptionStyle = Style.Part(app, "wizard", "description", "",
-                                               "", "", Style.SNormal());
-        StyleBox categoryPanelStyle = Style.Part(app, "wizard", "category-panel",
-                                                 "", "", "", Style.SNormal());
-        StyleBox templatePanelStyle = Style.Part(app, "wizard", "template-panel",
-                                                 "", "", "", Style.SNormal());
-        StyleBox categoryRowStyle = Style.Part(app, "wizard", "category-row",
-                                               "", "", "", Style.SNormal());
-        StyleBox categoryHoverStyle = Style.Part(app, "wizard", "category-row",
-                                                 "", "", "", Style.SHover());
-        StyleBox categoryActiveStyle = Style.Part(app, "wizard", "category-row",
-                                                  "", "", "", Style.SActive());
-        StyleBox templateIconStyle = Style.Part(app, "wizard", "template-row-icon",
-                                                "", "", "", Style.SNormal());
-        StyleBox templateLabelStyle = Style.Part(app, "wizard", "template-row-label",
-                                                 "", "", "", Style.SNormal());
-        StyleBox templateHoverStyle = Style.Part(app, "wizard", "template-row",
-                                                 "", "", "", Style.SHover());
-        StyleBox templateActiveStyle = Style.Part(app, "wizard", "template-row",
-                                                  "", "", "", Style.SActive());
-        StyleBox templateIconActiveStyle = Style.Part(app, "wizard", "template-row-icon",
-                                                      "", "", "", Style.SActive());
-        StyleBox templateLabelActiveStyle = Style.Part(app, "wizard", "template-row-label",
-                                                       "", "", "", Style.SActive());
-        StyleBox accentStyle = Style.Part(app, "wizard", "accent", "",
-                                          "", "", Style.SNormal());
-        StyleBox targetStyle = Style.Part(app, "wizard", "target", "",
-                                          "", "", Style.SNormal());
-        StyleBox targetHoverStyle = Style.Part(app, "wizard", "target", "",
-                                               "", "", Style.SHover());
-        StyleBox targetActiveStyle = Style.Part(app, "wizard", "target", "",
-                                                "", "", Style.SActive());
-        StyleBox noticeStyle = Style.Part(app, "wizard", "notice", "",
-                                          "", "", Style.SNormal());
+    public void BuildTree() {
+        this.children.Clear();
+        this.Add(steps);
+        this.Add(content);
 
-        // 主题化背景（渐变 / 玻璃壁纸），使对话框匹配
-        // 父窗口的皮肤，而不是纯色填充。
-        app.RenderBackground(0, 0, W, H, 6);
+        Control footer = new Control();
+        footer.ClassName = "wizard-footer row justify-end align-center gap-medium";
+        footer.Add(prevBtn);
+        footer.Add(nextBtn);
+        footer.Add(finishBtn);
+        this.Add(footer);
 
-        int barH = app.titlebarH;
-        if (barH < app.Scale(32)) { barH = app.Scale(32); }
-        c.FillRect(0, 0, W, barH, barStyle.BgOr(0));
-        int titleFont = titleStyle.FontOr(Style.FontFallback(app, "large"));
-        int titleY = Canvas.CenterTextY(0, barH, titleFont);
-        c.DrawText(app.Scale(16), titleY, title, titleStyle.FgOr(0),
-                   titleFont);
-        c.FillRect(0, barH, W, 1, dividerStyle.BgOr(0));
+        this.SyncStepView();
+    }
 
-        int result = 0;
-
-        int closeId = app.focus.AllocId();
-        int cbw = app.Scale(44);
-        int closeX = W - cbw;
-        if (app.focus.IsHovered(closeId)) {
-            c.FillRect(closeX, 0, cbw, barH, closeHoverStyle.BgOr(0));
-        }
-        c.DrawGlyphIn("close", closeX, 0, cbw, barH, t.iconSizeSmall,
-                      closeStyle.FgOr(0));
-        app.hitTester.RegisterRect(closeId, closeX, 0, cbw, barH, 0);
-        if (app.EventKind() == 3 && app.ClickTarget() == closeId) {
-            result = 2;
-        }
-
-        int pad = t.paddingLarge;
-        int contentY = barH + pad;
-        int listH = H - contentY - app.Scale(74);
-        int rowH = app.Scale(40);
-        int glyph = templateIconStyle.FontOr(
-            Style.FontFallback(app, "large"));
-
-        // ---- 分类列 ----
-        int catX = pad;
-        int catW = app.Scale(150);
-        c.FillRoundRect(catX, contentY, catW, listH, t.borderRadiusMedium,
-                        categoryPanelStyle.BgOr(0));
-        int nCat = catNames.Count;
-        int catContentH = nCat * rowH;
-        int barW = app.Scale(10);
-        SignalInt cs = catScrollSig;
-        if (cs == null) {
-            cs = new SignalInt(0);
-        }
-        int catOff = Wizard.ScrollOffset(app, catX, contentY, catW, listH,
-                                        catContentH, cs);
-        bool catOverflow = catContentH > listH;
-        int catRowW = catW;
-        if (catOverflow) { catRowW = catW - barW; }
-        int catFirstId = app.focus.AllocId();
-        for (int ci = 1; ci < nCat; ci = ci + 1) { app.focus.AllocId(); }
-        int catSelV = catSel.Get();
-        c.PushClip(catX, contentY, catW, listH);
-        for (int k = 0; k < nCat; k = k + 1) {
-            int id = catFirstId + k;
-            int rowY = contentY + k * rowH - catOff;
-            if (rowY + rowH <= contentY || rowY >= contentY + listH) { continue; }
-            bool active = k == catSelV;
-            if (active) {
-                c.FillRect(catX, rowY, catRowW, rowH, categoryActiveStyle.BgOr(0));
-                c.FillRect(catX, rowY, app.Scale(3), rowH, accentStyle.BgOr(0));
-            } else if (app.focus.IsHovered(id)) {
-                c.FillRect(catX, rowY, catRowW, rowH, categoryHoverStyle.BgOr(0));
-            }
-            int tc = categoryRowStyle.FgOr(0);
-            int catFont = categoryRowStyle.FontOr(
-                Style.FontFallback(app, "medium"));
-            if (active) {
-                tc = categoryActiveStyle.FgOr(0);
-                catFont = categoryActiveStyle.FontOr(
-                    Style.FontFallback(app, "medium"));
-            }
-            int ty = Canvas.CenterTextY(rowY, rowH, catFont);
-            c.DrawText(catX + t.paddingMedium, ty, catNames[k], tc, catFont);
-            app.hitTester.RegisterRectL(id, catX, rowY, catRowW, rowH, 0,
-                                        catNames[k]);
-        }
-        c.PopClip();
-        if (catOverflow) {
-            Scrollbar.RenderVerticalScrollIn(app, catX + catW - barW,
-                contentY, listH, listH, catContentH, cs,
-                catX, contentY, catW, listH);
-        }
-
-        string catLabel = "";
-        if (catSelV >= 0 && catSelV < nCat) { catLabel = catNames[catSelV]; }
-
-        // ---- 模板列（按分类过滤） ----
-        List<int> vis = new List<int>();
-        for (int ti = 0; ti < tpls.Count; ti = ti + 1) {
-            if (tpls[ti].cat == catLabel) { vis.Add(ti); }
-        }
-        // 让 tplSel 保持在可见集合内。
-        int cur = tplSel.Get();
-        bool curVisible = false;
-        foreach (int gi in vis) {
-            if (gi == cur) { curVisible = true; }
-        }
-        if (!curVisible) {
-            if (vis.Count > 0) { tplSel.Set(vis[0]); } else { tplSel.Set(-1); }
-            app.RequestRedraw();
-        }
-        int tplSelV = tplSel.Get();
-
-        int tplX = catX + catW + pad;
-        int tplW = app.Scale(240);
-        c.FillRoundRect(tplX, contentY, tplW, listH, t.borderRadiusMedium,
-                        templatePanelStyle.BgOr(0));
-        int tplContentH = vis.Count * rowH;
-        SignalInt ts = tplScrollSig;
-        if (ts == null) {
-            ts = new SignalInt(0);
-        }
-        int tplOff = Wizard.ScrollOffset(app, tplX, contentY, tplW, listH,
-                                        tplContentH, ts);
-        bool tplOverflow = tplContentH > listH;
-        int tplRowW = tplW;
-        if (tplOverflow) { tplRowW = tplW - barW; }
-        int tplFirstId = app.focus.AllocId();
-        for (int vi = 1; vi < vis.Count; vi = vi + 1) { app.focus.AllocId(); }
-        c.PushClip(tplX, contentY, tplW, listH);
-        for (int r2 = 0; r2 < vis.Count; r2 = r2 + 1) {
-            int gi = vis[r2];
-            WizardTemplate tpl = tpls[gi];
-            int id = tplFirstId + r2;
-            int rowY = contentY + r2 * rowH - tplOff;
-            if (rowY + rowH <= contentY || rowY >= contentY + listH) { continue; }
-            bool active = gi == tplSelV;
-            if (active) {
-                c.FillRect(tplX, rowY, tplRowW, rowH, templateActiveStyle.BgOr(0));
-                c.FillRect(tplX, rowY, app.Scale(3), rowH, accentStyle.BgOr(0));
-            } else if (app.focus.IsHovered(id)) {
-                c.FillRect(tplX, rowY, tplRowW, rowH, templateHoverStyle.BgOr(0));
-            }
-            int iconColor = templateIconStyle.FgOr(0);
-            int textColor = templateLabelStyle.FgOr(0);
-            int rowFont = templateLabelStyle.FontOr(
-                Style.FontFallback(app, "medium"));
-            int rowGlyph = glyph;
-            if (active) {
-                iconColor = templateIconActiveStyle.FgOr(0);
-                textColor = templateLabelActiveStyle.FgOr(0);
-                rowGlyph = templateIconActiveStyle.FontOr(
-                    Style.FontFallback(app, "large"));
-                rowFont = templateLabelActiveStyle.FontOr(
-                    Style.FontFallback(app, "medium"));
-            }
-            c.DrawGlyphIn(tpl.icon, tplX + t.paddingMedium, rowY,
-                          rowGlyph, rowH, rowGlyph, iconColor);
-            int textX = tplX + t.paddingMedium + rowGlyph + t.gapMedium;
-            int textY = Canvas.CenterTextY(rowY, rowH, rowFont);
-            c.DrawText(textX, textY, tpl.name, textColor, rowFont);
-            app.hitTester.RegisterRectL(id, tplX, rowY, tplRowW, rowH, 0,
-                                        tpl.name);
-        }
-        c.PopClip();
-        if (tplOverflow) {
-            Scrollbar.RenderVerticalScrollIn(app, tplX + tplW - barW,
-                contentY, listH, listH, tplContentH, ts,
-                tplX, contentY, tplW, listH);
-        }
-
-        WizardTemplate selTpl = null;
-        if (tplSelV >= 0 && tplSelV < tpls.Count) { selTpl = tpls[tplSelV]; }
-
-        // ---- 预览 ----
-        // 预览不再占右上一列：设备/尺寸/平台三段收紧占满右列，
-        // 预览画在平台区之下、按钮行之上的剩余空间；窗口窄到
-        // 放不下时预览自行让位。
-        int prevW = app.Scale(300);
-        int availRight = W - pad - (tplX + tplW + pad);
-        if (availRight < app.Scale(640)) { prevW = 0; }
-
-        // ---- 右列：名称 / 位置 / 描述 ----
-        int fx = tplX + tplW + pad;
-        int fw = W - pad - fx;
-        int fy = contentY;
-        int labelFont = labelStyle.FontOr(Style.FontFallback(app, "small"));
-        int descriptionFont = descriptionStyle.FontOr(
-            Style.FontFallback(app, "small"));
-        c.DrawText(fx, fy, Wizard.TW("Name", "名称"), labelStyle.FgOr(0),
-                   labelFont);
-        nameInput.Render(app, fx, fy + app.Scale(20), fw, t.heightMedium);
-        int ny = fy + app.Scale(20) + t.heightMedium + app.Scale(14);
-        c.DrawText(fx, ny, Wizard.TW("Location", "位置"), labelStyle.FgOr(0),
-                   labelFont);
-        int browseW = app.Scale(96);
-        int browseGap = app.Scale(8);
-        int locW = fw - browseW - browseGap;
-        if (locW < app.Scale(140)) { locW = fw; browseW = 0; }
-        locInput.Render(app, fx, ny + app.Scale(20), locW, t.heightMedium);
-        if (browseW > 0) {
-            int browseId = new Button { Text = Wizard.TW("Browse...", "浏览...") }.Render(app, fx + locW + browseGap, ny + app.Scale(20), browseW);
-            if (Ui.Clicked(app, browseId)) { result = 3; }
-        }
-        ny = ny + app.Scale(20) + t.heightMedium + app.Scale(16);
-        if (selTpl != null) {
-            c.DrawText(fx, ny, selTpl.desc, descriptionStyle.FgOr(0),
-                       descriptionFont);
-        }
-        // 能力标签行：模板声明了 caps 才占一行，把生态面
-        // （gui / network / crypto / game …）亮给创建者。
-        if (selTpl != null && selTpl.caps != "") {
-            ny = ny + app.Scale(20);
-            c.DrawText(fx, ny,
-                       Wizard.TW("Capabilities", "能力") + ": "
-                           + selTpl.caps,
-                       labelStyle.FgOr(0), labelFont);
-        }
-        // 支持平台行：模板声明了 platforms= 才占一行。选择模板
-        // 的当下就亮出它能跑的 OS，创建者不必等创建时被
-        // CreateProjectT 的交集拦截才发现选错了目标。
-        if (selTpl != null && selTpl.plats != "") {
-            ny = ny + app.Scale(20);
-            c.DrawText(fx, ny,
-                       Wizard.TW("Supported on", "支持平台") + ": "
-                           + Wizard.PrettyPlats(selTpl.plats),
-                       labelStyle.FgOr(0), labelFont);
-        }
-
-        // ---- 目标设备 + 设备尺寸（仅针对产出设计窗口的模板）----
-        // 目标设备决定画布契约：桌面/2in1 自由尺寸（分辨率预设 +
-        // 自定义宽高），手机/平板/电视/车机/穿戴锁定为画像的基准
-        // 视口，只允许画像声明的横竖屏切换。碎片化的物理尺寸
-        // （手机有大小、折叠屏会变形）由运行时的流式重排与画布
-        // 拟合兜住，设计期锁的是基准视口，不是物理屏幕。
-        int devW = 0;
-        int devH = 0;
-        if (selTpl != null) {
-            devW = selTpl.defW;
-            devH = selTpl.defH;
-        }
-        bool wantSize = selTpl != null && selTpl.sizeable && sizeSel != null;
-        bool wantDev = wantSize && devSel != null;
-        if (wantDev) {
-            int dy0 = ny + app.Scale(20);
-            c.DrawText(fx, dy0, Wizard.TW("Target device", "目标设备"),
-                       labelStyle.FgOr(0), labelFont);
-            List<DeviceProfile> dps = DeviceProfile.All();
-            int nDev = dps.Count;
-            int gapD = app.Scale(6);
-            int devBtnW = (fw - (nDev - 1) * gapD) / nDev;
-            int devY = dy0 + app.Scale(18);
-            int devCur = devSel.Get();
-            for (int k = 0; k < nDev; k = k + 1) {
-                string cls = "small";
-                if (k == devCur) { cls = "primary small"; }
-                int bid = new Button { Text = dps[k].Label(Wizard.lang), Class = cls }
-                    .Render(app, fx + k * (devBtnW + gapD), devY, devBtnW);
-                if (Ui.Clicked(app, bid)) {
-                    devSel.Set(k);
-                    if (devRot != null) { devRot.Set(0); }
-                    if (dps[k].Locked() && sizeW != null && sizeH != null) {
-                        sizeW.SetText(Convert.ToString(dps[k].CanvasW(0)));
-                        sizeH.SetText(Convert.ToString(dps[k].CanvasH(0)));
-                    }
-                    app.RequestRedraw();
-                }
-            }
-            int rowY3 = devY + t.heightSmall + app.Scale(4);
-            DeviceProfile dcur = DeviceProfile.At(devCur);
-            if (dcur != null && dcur.Locked()) {
-                // 锁定类设备：只允许画像声明的横竖屏切换，画布
-                // 尺寸由画像给出；尺寸预设与自定义宽高收起。
-                int orientV = 0;
-                if (devRot != null) { orientV = devRot.Get(); }
-                if (dcur.Rotatable() && devRot != null) {
-                    c.DrawText(fx, rowY3 + app.Scale(8),
-                               Wizard.TW("Orientation", "方向"),
-                               labelStyle.FgOr(0), labelFont);
-                    int orW = app.Scale(96);
-                    int oY = rowY3 + app.Scale(22);
-                    for (int o = 0; o < 2; o = o + 1) {
-                        string lbl = Wizard.TW("Portrait", "竖屏");
-                        if (o == 1) { lbl = Wizard.TW("Landscape", "横屏"); }
-                        string ocls = "small";
-                        if (o == orientV) { ocls = "primary small"; }
-                        int oid = new Button { Text = lbl, Class = ocls }
-                            .Render(app, fx + o * (orW + gapD), oY, orW);
-                        if (Ui.Clicked(app, oid)) {
-                            devRot.Set(o);
-                            if (sizeW != null) { sizeW.SetText(Convert.ToString(dcur.CanvasW(o))); }
-                            if (sizeH != null) { sizeH.SetText(Convert.ToString(dcur.CanvasH(o))); }
-                            app.RequestRedraw();
-                        }
-                    }
-                    rowY3 = oY + t.heightSmall;
-                }
-                devW = dcur.CanvasW(orientV);
-                devH = dcur.CanvasH(orientV);
-                string cap = Wizard.TW("Canvas ", "画布 ") + Convert.ToString(devW)
-                    + " × " + Convert.ToString(devH)
-                    + Wizard.TW(" (locked by device)", "（由设备锁定）");
-                c.DrawText(fx, rowY3 + app.Scale(12), cap,
-                           descriptionStyle.FgOr(0), descriptionFont);
-                ny = rowY3 + t.heightSmall;
-                // 尺寸由画像决定：跳过下面的自由尺寸行。
-                wantSize = false;
-            } else {
-                // 桌面自由尺寸：预设行接在设备 chips 行之下，
-                // 不推进 ny 会两行叠在同一位置。
-                ny = rowY3;
-            }
-        }
-        if (wantSize) {
-            // 设备/尺寸二选一：带目标设备行时锁定设备由画像定画布
-            // （上方分支已收起本行），桌面/2in1 只留一行"画布尺寸
-            // [W] x [H]"；预设网格只服务没有设备行的旧调用（新建
-            // 文件向导等）。
-            bool showPresets = !wantDev;
-            int sy = ny + app.Scale(12);
-            string sizeLbl = Wizard.TW("Canvas size", "画布尺寸");
-            if (showPresets) { sizeLbl = Wizard.TW("Device size", "设备尺寸"); }
-            List<int> szW = Wizard.SizePresetW();
-            List<int> szH = Wizard.SizePresetH();
-            int nSz = szW.Count;
-            int curv = sizeSel.Get();
-            if (showPresets) {
-                c.DrawText(fx, sy, sizeLbl, labelStyle.FgOr(0), labelFont);
-                int perRow = 4;
-                int gap2 = app.Scale(6);
-                int btnW = (fw - (perRow - 1) * gap2) / perRow;
-                int rowH2 = t.heightSmall + app.Scale(6);
-                int by2 = sy + app.Scale(20);
-                for (int k = 0; k < nSz; k = k + 1) {
-                    int col = k % perRow;
-                    int rowi = k / perRow;
-                    string cls = "small";
-                    if (k == curv) { cls = "primary small"; }
-                    int bid = new Button { Text = Wizard.SizePresetName(k), Class = cls }
-                        .Render(app, fx + col * (btnW + gap2), by2 + rowi * rowH2, btnW);
-                    if (Ui.Clicked(app, bid)) {
-                        sizeSel.Set(k);
-                        if (sizeW != null) { sizeW.SetText(Convert.ToString(szW[k])); }
-                        if (sizeH != null) { sizeH.SetText(Convert.ToString(szH[k])); }
-                        app.RequestRedraw();
-                    }
-                }
-                int cy2 = by2 + ((nSz + perRow - 1) / perRow) * rowH2 + app.Scale(4);
-                if (sizeW != null && sizeH != null) {
-                    string custom = Wizard.TW("Custom", "自定义");
-                    c.DrawText(fx, cy2 + app.Scale(6), custom, labelStyle.FgOr(0),
-                               labelFont);
-                    int lw = Canvas.MeasureText(custom, labelFont) + app.Scale(10);
-                    int inW2 = app.Scale(72);
-                    sizeW.Render(app, fx + lw, cy2, inW2, t.heightSmall);
-                    c.DrawText(fx + lw + inW2 + app.Scale(5), cy2 + app.Scale(6), "x",
-                               labelStyle.FgOr(0), labelFont);
-                    sizeH.Render(app, fx + lw + inW2 + app.Scale(16), cy2, inW2, t.heightSmall);
-                    int cw = Wizard.ParseDim(sizeW.GetText());
-                    int chh = Wizard.ParseDim(sizeH.GetText());
-                    if (cw > 0 && chh > 0) { devW = cw; devH = chh; }
-                } else if (curv >= 0 && curv < nSz) {
-                    devW = szW[curv];
-                    devH = szH[curv];
-                }
-                ny = cy2 + t.heightSmall;
-            } else {
-                // 单行画布尺寸，与目标设备行同一节奏。
-                if (sizeW != null && sizeH != null) {
-                    int lw = Canvas.MeasureText(sizeLbl, labelFont) + app.Scale(14);
-                    int inW2 = app.Scale(72);
-                    int inY = sy - app.Scale(2);
-                    c.DrawText(fx, sy + app.Scale(6), sizeLbl, labelStyle.FgOr(0),
-                               labelFont);
-                    sizeW.Render(app, fx + lw, inY, inW2, t.heightSmall);
-                    c.DrawText(fx + lw + inW2 + app.Scale(5), sy + app.Scale(6), "x",
-                               labelStyle.FgOr(0), labelFont);
-                    sizeH.Render(app, fx + lw + inW2 + app.Scale(16), inY, inW2,
-                                 t.heightSmall);
-                    int cw = Wizard.ParseDim(sizeW.GetText());
-                    int chh = Wizard.ParseDim(sizeH.GetText());
-                    if (cw > 0 && chh > 0) { devW = cw; devH = chh; }
-                }
-                ny = sy + t.heightSmall;
-            }
-        }
-
-        // ---- 目标平台：每个 OS 一列（组），架构
-        // 垂直堆叠在下方，每个都是多选开关 ----
-        // 设备/尺寸/平台三段收紧上移，预览挪到平台区之下、
-        // 按钮行之上的剩余空间。
-        int nTgt = targets.Count;
-        int numCols = groupNames.Count;
-        // 空目标/空分组整段跳过：下面 perCol 与列宽自适应都要除以
-        // numCols，传空列表的调用方不该收到除零。
-        bool tgtOn = nTgt > 0 && numCols > 0;
-        int tgtFirstId = 0;
-        if (tgtOn) {
-        int perCol = nTgt / numCols;
-        int obh = t.heightMedium;
-        int colGap = app.Scale(14);
-        int chipGap = app.Scale(8);
-        // 列宽自适应右列宽（预览挪走后右列占满全宽），上限防过宽。
-        int obw = (fw - (numCols - 1) * colGap) / numCols;
-        int obwMax = app.Scale(150);
-        if (obw > obwMax) { obw = obwMax; }
-        int oy2 = ny + app.Scale(14);
-        c.DrawText(fx, oy2, Wizard.TW("Platforms", "目标平台"),
-                   labelStyle.FgOr(0), labelFont);
-        int headerY = oy2 + app.Scale(20);
-        int chipsY = headerY + app.Scale(16);
-        for (int gh = 0; gh < numCols; gh = gh + 1) {
-            int cx = fx + gh * (obw + colGap);
-            c.DrawText(cx, headerY, groupNames[gh], descriptionStyle.FgOr(0),
-                       descriptionFont);
-        }
-        tgtFirstId = app.focus.AllocId();
-        for (int oi2 = 1; oi2 < nTgt; oi2 = oi2 + 1) { app.focus.AllocId(); }
-        for (int oi = 0; oi < nTgt; oi = oi + 1) {
-            WizardTarget tgt = targets[oi];
-            int oid = tgtFirstId + oi;
-            int coli = oi / perCol;
-            int rowi = oi - coli * perCol;
-            int ox = fx + coli * (obw + colGap);
-            int oyy = chipsY + rowi * (obh + chipGap);
-            bool osel = tgt.selected == 1;
-            bool odis = !Wizard.TplSupports(selTpl, tgt.id);
-            int obg = targetStyle.BgOr(0);
-            int otc = targetStyle.FgOr(0);
-            if (osel) {
-                obg = targetActiveStyle.BgOr(0);
-                otc = targetActiveStyle.FgOr(0);
-            } else if (!odis && app.focus.IsHovered(oid)) {
-                obg = targetHoverStyle.BgOr(0);
-            }
-            if (odis && !osel) {
-                // 置灰 = 文字走半透明 alpha（0x88），原生后端逐像素
-                // 混合；底色不动，已选中的不置灰（还能点掉）。
-                otc = (otc & 0x00FFFFFF) | (int)0x88000000;
-            }
-            c.FillRoundRect(ox, oyy, obw, obh, t.borderRadiusMedium, obg);
-            int targetFont = targetStyle.FontOr(
-                Style.FontFallback(app, "medium"));
-            if (osel) {
-                targetFont = targetActiveStyle.FontOr(
-                    Style.FontFallback(app, "medium"));
-            }
-            int otw = Canvas.MeasureText(tgt.name, targetFont);
-            int otx = ox + (obw - otw) / 2;
-            int oty = Canvas.CenterTextY(oyy, obh, targetFont);
-            c.DrawText(otx, oty, tgt.name, otc, targetFont);
-            // 语义标签 = 目标平台 id（windows-x64 这类数据键），
-            // 驱动脚本 clickid @linux-x64 即点此处，不随布局漂移。
-            app.hitTester.RegisterRectL(oid, ox, oyy, obw, obh, 0,
-                                        tgt.id);
-        }
-
-        // ---- 预览：平台区之下的剩余空间（画布 mock 按比例
-        // 缩放居中，底部标注画布尺寸）----
-        if (prevW > 0) {
-            int prowY = chipsY + perCol * (obh + chipGap) + app.Scale(14);
-            int prowH = (H - t.heightMedium - pad - app.Scale(16)) - prowY;
-            if (prowH > app.Scale(72)) {
-                Wizard.RenderPreview(app, fx, prowY, fw, prowH,
-                                     selTpl, devW, devH);
-            }
-        }
-        }
-
-        // ---- 点击 ----
-        if (app.EventKind() == 3) {
-            int hitv = app.ClickTarget();
-            int catIdx = hitv - catFirstId;
-            int tplIdx = hitv - tplFirstId;
-            int tgtIdx = hitv - tgtFirstId;
-            if (catIdx >= 0 && catIdx < nCat) {
-                catSel.Set(catIdx);
-                app.RequestRedraw();
-            } else if (tplIdx >= 0 && tplIdx < vis.Count) {
-                tplSel.Set(vis[tplIdx]);
-                app.RequestRedraw();
-            } else if (tgtOn && tgtIdx >= 0 && tgtIdx < nTgt) {
-                WizardTarget tgtc = targets[tgtIdx];
-                if (tgtc.selected == 1) {
-                    // 取消勾选永远允许（换模板前先松手）。
-                    tgtc.selected = 0;
-                    app.RequestRedraw();
-                } else if (!Wizard.TplSupports(selTpl, tgtc.id)) {
-                    // 模板 platforms= 不含此 OS：当场拒绝并说明，
-                    // 不让用户到创建时才被 CreateProjectT 拦下。
-                    string osn = Wizard.OsName(Wizard.OsOf(tgtc.id));
-                    Wizard.notice = Wizard.TW(
-                        "Template '" + selTpl.name + "' doesn't run on " + osn + ".",
-                        "模板 '" + selTpl.name + "' 不支持 " + osn + "。");
-                    app.RequestRedraw();
-                } else {
-                    tgtc.selected = 1;
-                    app.RequestRedraw();
-                }
-            }
-        }
-
-        int bw = app.Scale(104);
-        int by = H - t.heightMedium - pad;
-        int okX = W - pad - bw;
-        int cancelX = okX - t.gapMedium - bw;
-        if (Wizard.notice != "") {
-            c.DrawText(pad, by + app.Scale(6), Wizard.notice,
-                       noticeStyle.FgOr(0),
-                       noticeStyle.FontOr(Style.FontFallback(app, "small")));
-        }
-        int cancelId = new Button { Text = Wizard.TW("Cancel", "取消") }.Render(app, cancelX, by, bw);
-        if (Ui.Clicked(app, cancelId)) { result = 2; }
-        int okId = new Button { Text = Wizard.TW("Create", "创建"), Class = "primary" }.Render(app, okX, by, bw);
-        if (Ui.Clicked(app, okId)) { result = 1; }
-
-        return result;
+    public override void OnPaint(App app) {
+        int id = this.CommonId();
+        SyncBinding();
+        app.focus.RegisterFocusable(id);
+        app.hitTester.RegisterRect(id, bx, by, bw, bh, 0);
+        On.Fire(app, id, this);
     }
 }

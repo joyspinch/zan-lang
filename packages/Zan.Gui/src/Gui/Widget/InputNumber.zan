@@ -57,12 +57,13 @@ public class InputNumber : Control {
     public string editBuf;
     // 上一帧是否聚焦（进入聚焦灌缓冲、离开聚焦提交的跳变沿）。
     public bool hadFocus;
-    // 字段命中 id。
-    public int wid;
-    // − 钮命中 id。
-    public int minusId;
-    // + 钮命中 id。
-    public int plusId;
+    public Button minusBtn;
+    public Input inputNode;
+    public Button plusBtn;
+
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
+
     // 值被用户改变时触发（C# 风格：`n.Change += h;`）。
     public UiEvent Change;
     // 回车提交编辑缓冲时触发（Naive UI 的键盘提交沿）。
@@ -109,9 +110,6 @@ public class InputNumber : Control {
         hint = "";
         editBuf = "";
         hadFocus = false;
-        wid = WidgetId.Next();
-        minusId = WidgetId.Next();
-        plusId = WidgetId.Next();
         wiresOwnEvents = true;
         Change = new UiEvent();
         Submit = new UiEvent();
@@ -127,6 +125,23 @@ public class InputNumber : Control {
         Parser = null;
         Check = null;
         invalidFlag = false;
+        this.ClassName = "input-number row align-center";
+
+        minusBtn = new Button("-");
+        minusBtn.Class = "input-number-btn";
+        inputNode = new Input();
+        inputNode.Class = "input-number-input flex-1";
+        plusBtn = new Button("+");
+        plusBtn.Class = "input-number-btn";
+
+        minusBtn.Click.Add(() => { this.StepDown(); });
+        plusBtn.Click.Add(() => { this.StepUp(); });
+        inputNode.Change.Add(() => { this.OnInputChange(); });
+        inputNode.Submit.Add(() => { this.OnInputSubmit(); });
+
+        this.Add(minusBtn);
+        this.Add(inputNode);
+        this.Add(plusBtn);
     }
 
     // Default design-time constructor（范围 0..100）。
@@ -361,18 +376,6 @@ public class InputNumber : Control {
         this.SetRaw(v);
     }
 
-    // 把绑定的模型值拉入本地信号并钳制（model -> UI）。
-    public override void SyncBinding() {
-        if (data == null) { return; }
-        int cur = data.Get();
-        if (cur < minV) { cur = minV; }
-        if (cur > maxV) { cur = maxV; }
-        if (cur != model.Get()) {
-            model.Set(cur);
-            data.Set(cur);
-        }
-    }
-
     // 宽松整数解析（非法/溢出回 def）。
     public static int ParseInt(string s, int def) {
         if (s == null) { return def; }
@@ -403,239 +406,27 @@ public class InputNumber : Control {
         this.SetRaw(v);
     }
 
-    // ---- rendering ------------------------------------------------------
-
-    // 每帧渲染与交互（立即模式入口；停靠布局经 OnPaint 进入）：
-    // 聚焦沿、步进钮与键盘。
-    public int Render(App app, int x, int y, int w, int h) {
-        int id = wid;
-        SyncBinding();
-
-        bool focused = Ui.Focused(app, id) && !this.IsDisabled() && !Loading;
-        // 进入聚焦：把当前值的原始（未分组）文本灌进编辑缓冲；
-        // 离开聚焦：提交缓冲。
-        if (focused && !hadFocus && editBuf == "") {
-            editBuf = this.PlainText(model.Get());
-        }
-        if (!focused && hadFocus) { this.CommitBuffer(); }
-        hadFocus = focused;
-
-        this.PaintBox(app, x, y, w, h);
-        app.focus.RegisterFocusable(id);
-        app.focus.RegisterTextEditable(id);
-
-        if (!this.IsDisabled() && !Loading) {
-            if (Ui.Clicked(app, minusId)) {
-                this.CommitBuffer();
-                this.SetRaw(this.StepDownVal(model.Get()));
-                app.RequestRedraw();
-            }
-            if (Ui.Clicked(app, plusId)) {
-                this.CommitBuffer();
-                this.SetRaw(this.StepUpVal(model.Get()));
-                app.RequestRedraw();
-            }
-            this.HandleKeys(app, focused);
-        }
-        On.Fire(app, id, this);
-        return id;
+    public void StepDown() {
+        if (this.IsDisabled() || Loading) { return; }
+        this.SetRaw(this.StepDownVal(model.Get()));
     }
 
-    // 绘制字段盒、前后缀、步进钮（或加载圆点）与中间数值。颜色来自
-    // 解析样式盒（input 类规则）与 `input::icon` / `input::prefix` /
-    private void PaintBox(App app, int x, int y, int w, int h) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        string pfx = "";
-        if (Prefix != null) { pfx = Prefix.Get(); }
-        string sfx = "";
-        if (Suffix != null) { sfx = Suffix.Get(); }
-        bool rightBtns = (Placement != null && Placement.Get() == "right");
-        // Size 字段映射为档位 class（input.small/.large 重设高度/字号）。
-        string origClass = Class;
-        this.ApplySizeClass();
-        bool off = this.IsDisabled() || Loading;
-        StyleBox s = this.ResolveEasedStyleAsIn(
-            app, wid, "input", Class, off, false, x, y, w, h);
-        s.Paint(app, x, y, w, h);
-        int fs = s.FontOr(Style.FontFallback(app, "medium"));
-        int btnW = app.Scale(26);
-        int pad = app.Scale(6);
-
-        // 步进钮占位：both=左右各一；right=右侧两枚并排。加载态占
-        // 右侧两枚的位置画圆点（不可点）。
-        int leftBtnW = (rightBtns || Loading) ? 0 : btnW;
-        int rightBtnW = btnW * ((rightBtns || Loading) ? 2 : 1);
-        int minusX = x;
-        int plusX = x + w - btnW;
-        if (rightBtns && !Loading) {
-            minusX = x + w - btnW * 2;
-            plusX = x + w - btnW;
-        }
-
-        // 前后缀占位（贴数值两侧）。
-        int slotGap = app.Scale(4);
-        int rawPfxW = (pfx != "") ? Canvas.MeasureText(pfx, fs) : 0;
-        int rawSfxW = (sfx != "") ? Canvas.MeasureText(sfx, fs) : 0;
-        int pfxSlot = (rawPfxW > 0) ? rawPfxW + slotGap : 0;
-        int sfxSlot = (rawSfxW > 0) ? rawSfxW + slotGap : 0;
-
-        // 校验失败：`input::error` 的 2px 红描边压在盒上（与 Input 同族）。
-        if (invalidFlag) {
-            StyleBox errStyle = Style.Part(app, "input", "error", "",
-                                           Class, "", Style.SNormal());
-            c.DrawRect(x, y, w, h, errStyle.BorderOr(errStyle.fg),
-                       errStyle.BorderWOr(2));
-        }
-
-        if (!Loading) {
-            StyleBox iconBase = Style.Part(app, "input", "icon", "", Class,
-                                           "", Style.SNormal());
-            int glyphColor = iconBase.FgOr(s.fg);
-            int minusColor = glyphColor;
-            int plusColor = glyphColor;
-            if (!this.IsDisabled()) {
-                StyleBox iconHover = Style.Part(app, "input", "icon", "", Class,
-                                                "", Style.SHover());
-                if (Ui.Hovered(app, minusId)) { minusColor = iconHover.FgOr(glyphColor); }
-                if (Ui.Hovered(app, plusId)) { plusColor = iconHover.FgOr(glyphColor); }
-            }
-            int glyphSz = fs;
-            c.DrawGlyphIn("minus", minusX + (btnW - glyphSz) / 2, y,
-                          glyphSz, h, glyphSz, minusColor);
-            c.DrawGlyphIn("plus", plusX + (btnW - glyphSz) / 2, y,
-                          glyphSz, h, glyphSz, plusColor);
-            app.hitTester.RegisterRect(minusId, minusX, y, btnW, h, 2);
-            app.hitTester.RegisterRect(plusId, plusX, y, btnW, h, 2);
-        } else {
-            // 加载态：右侧钮位换成旋转圆点（8 点相位，与 Spin 同款），
-            // 不注册命中区。
-            StyleBox accentStyle = Style.Part(app, "spin", "accent", "spin",
-                                              "", "", Style.SNormal());
-            StyleBox restStyle = Style.Part(app, "spin", "rest", "spin",
-                                            "", "", Style.SNormal());
-            int accent = accentStyle.FgOr(s.accent);
-            int rest = restStyle.FgOr(s.fg);
-            this.PaintSpinnerDots(app, x + w - btnW - app.Scale(4),
-                                  y + h / 2, app.Scale(8), accent, rest);
-        }
-
-        int innerX = x + leftBtnW + pad + pfxSlot;
-        int innerW = w - leftBtnW - rightBtnW - pad * 2 - pfxSlot - sfxSlot;
-        if (innerW < 0) { innerW = 0; }
-        c.PushClip(innerX, y, innerW, h);
-        string txt = "";
-        if (editBuf != "") { txt = this.EditDisplay(); }
-        else if (!(hint != "" && !hadFocus && model.Get() == 0)) {
-            txt = this.DisplayText();
-        } else { txt = ""; }
-        if (txt == "") {
-            StyleBox phStyle = Style.Part(app, "input", "placeholder", "",
-                                         Class, "", Style.SNormal());
-            c.DrawText(innerX, Canvas.CenterTextY(y, h, fs), hint,
-                       phStyle.FgOr(s.fg), fs);
-        } else {
-            string disp = txt;
-            if (Canvas.MeasureText(disp, fs) > innerW) {
-                disp = Ellipsis.Fit(disp, innerW, fs);
-            }
-            int tw = Canvas.MeasureText(disp, fs);
-            int tx = innerX + (innerW - tw) / 2;
-            c.DrawText(tx, Canvas.CenterTextY(y, h, fs), disp, s.fg, fs);
-            // 编辑光标线：贴在文本末尾。
-            if (editBuf != "") {
-                StyleBox caretStyle = Style.Part(app, "input", "caret", "",
-                                                Class, "", Style.SNormal());
-                int caretH = Canvas.FontHeight(fs);
-                int cx0 = tx + tw;
-                c.FillRect(cx0, y + (h - caretH) / 2, caretStyle.WidthOr(1),
-                           caretH, caretStyle.BgOr(s.accent));
-            }
-        }
-        c.PopClip();
-
-        // 前后缀画在数值裁剪区外（贴数值两侧），颜色取 `input::prefix` /
-        // `input::suffix`（缺省回退字段前景色）。
-        if (pfx != "") {
-            StyleBox pStyle = Style.Part(app, "input", "prefix", "input",
-                                         Class, "", Style.SNormal());
-            c.DrawText(x + leftBtnW + pad, Canvas.CenterTextY(y, h, fs), pfx,
-                       pStyle.FgOr(s.fg), pStyle.FontOr(fs));
-        }
-        if (sfx != "") {
-            StyleBox stStyle = Style.Part(app, "input", "suffix", "input",
-                                          Class, "", Style.SNormal());
-            c.DrawText(x + w - rightBtnW - pad - rawSfxW,
-                       Canvas.CenterTextY(y, h, fs), sfx,
-                       stStyle.FgOr(s.fg), stStyle.FontOr(fs));
-        }
-        Class = origClass;
+    public void StepUp() {
+        if (this.IsDisabled() || Loading) { return; }
+        this.SetRaw(this.StepUpVal(model.Get()));
     }
 
-    // 一圈 8 枚小圆点的加载指示（与 Spin 同相位规则），画在钮位上。
-    private void PaintSpinnerDots(App app, int cx, int cy, int radius,
-                                  int accent, int rest) {
-        Canvas c = app.canvas;
-        int phase = Spin.DotPhase(Window.GetTickMs());
-        int dotR = app.Scale(2);
-        for (int i = 0; i < 8; i = i + 1) {
-            int px = cx + Spin.OffX(i) * radius / 1000;
-            int py = cy + Spin.OffY(i) * radius / 1000;
-            int col = App.LerpColor(rest, accent, Spin.DotLevel(phase, i, 0));
-            c.FillCircle(px, py, dotR, col);
+    private void OnInputChange() {
+        if (inputNode == null) { return; }
+        string t = inputNode.GetText();
+        if (t != "") {
+            this.SetRaw(Convert.ToInt32(t));
         }
-        // 720ms 一圈，颜色连续插值，按宿主显示刷新率调度。
-        int span = radius + dotR + app.Scale(2);
-        app.RequestAnimationFrameIn(cx - span, cy - span, span * 2, span * 2);
     }
 
-    // 键处理：↑/↓ 步进；数字/小数点/逗号写入缓冲；回车提交；Esc 还原。
-    private void HandleKeys(App app, bool focused) {
-        int kind = app.EventKind();
-        if (kind == 4) {
-            int kc = app.window.EventKeyCode();
-            if (kc == 38) {
-                this.CommitBuffer();
-                this.SetRaw(this.StepUpVal(model.Get()));
-                app.RequestRedraw();
-            } else if (kc == 40) {
-                this.CommitBuffer();
-                this.SetRaw(this.StepDownVal(model.Get()));
-                app.RequestRedraw();
-            } else if (kc == 13 && focused) {
-                this.CommitBuffer();
-                Submit.RaiseS(this);
-                app.RequestRedraw();
-            } else if (kc == 27 && focused) {
-                editBuf = "";
-                app.RequestRedraw();
-            } else if (kc == 8 && focused && editBuf != "") {
-                editBuf = Text.Left(editBuf, editBuf.Length - 1);
-                app.RequestRedraw();
-            }
-            return;
-        }
-        if (kind == 6 && focused) {
-            int code = app.window.EventKeyCode();
-            string ch = Text.CharStr(code);
-            if (ch.Length == 0 || ch < " ") { return; }
-            if (ch >= "0" && ch <= "9" && editBuf.Length < 16) {
-                editBuf = editBuf + ch;
-                app.RequestRedraw();
-            } else if (ch == "." && this.Decimals() > 0 && editBuf.IndexOf(".") < 0
-                       && editBuf.Length < 16) {
-                if (editBuf == "" || editBuf == "-") { editBuf = editBuf + "0."; }
-                else { editBuf = editBuf + "."; }
-                app.RequestRedraw();
-            } else if (ch == "," && GroupDigits && editBuf.Length < 16) {
-                // 分组逗号原样收下，提交时统一剥除。
-                editBuf = editBuf + ch;
-                app.RequestRedraw();
-            } else if (ch == "-" && editBuf == "" && minV < 0) {
-                editBuf = "-";
-                app.RequestRedraw();
-            }
-        }
+    private void OnInputSubmit() {
+        OnInputChange();
+        if (Submit != null) { Submit.RaiseS(this); }
     }
 
     // ---- 设计器 / 序列化模型 -------------------------------------------
@@ -764,19 +555,26 @@ public class InputNumber : Control {
 
     // ---- 保留模式钩子 ---------------------------------------------------
 
-    // 覆写：按尺寸档解析 input 样式，高取样式行高，宽缺省 140。
-    public override void OnMeasure(App app) {
-        Theme t = app.theme;
-        string origClass = Class;
-        this.ApplySizeClass();
-        StyleBox s = this.ResolveStyleAs(app, "input", Class, Style.SNormal());
-        prefH = s.HeightOr(t.heightMedium);
-        prefW = s.WidthOr(app.Scale(140));
-        Class = origClass;
+    public override void SyncBinding() {
+        base.SyncBinding();
+        if (data != null) {
+            int cur = data.Get();
+            if (cur < minV) { cur = minV; }
+            if (cur > maxV) { cur = maxV; }
+            if (cur != model.Get()) {
+                model.Set(cur);
+                data.Set(cur);
+            }
+        }
+        if (inputNode != null) {
+            string expected = this.DisplayText();
+            if (inputNode.GetText() != expected) {
+                inputNode.SetText(expected);
+            }
+        }
     }
 
-    // 覆写：保留模式绘制 = 以自身矩形 Render。
     public override void OnPaint(App app) {
-        this.Render(app, bx, by, bw, bh);
+        SyncBinding();
     }
 }

@@ -8,7 +8,8 @@ public class RadioGroup : ChoiceGroup {
     public SignalInt model;
     // 组级双向绑定：写的是选中选项的 value（越界/禁用的值不生效）。
     public Binding<int> data;
-    // 连体按钮段形态（RadioButtonGroup 渲染，本容器只当轨道）。
+    // 连体按钮段形态开关：true 时子项是段形态 Radio（`radiobutton`
+    // 样式族），false 是圆点 Radio。两种形态同一套子项管理。
     public Binding<bool> Buttons;
     // 尺寸档位（Naive UI size prop）。
     public Binding<string> Size;
@@ -20,8 +21,6 @@ public class RadioGroup : ChoiceGroup {
     private List<RadioOptionMeta> optionMetas;
     // 组事件：任一选项被用户切换时触发。
     public UiEvent Change;
-    // 按钮形态的承载控件（懒建，作为组的唯一子项）。
-    public RadioButtonGroup buttonGroup;
 
     // 构造：默认选中 value 0（第 0 项）。
     public RadioGroup() {
@@ -138,43 +137,25 @@ public class RadioGroup : ChoiceGroup {
             }
         }
         string sizeCls = Control.SizeClass(this.Size.Get());
-        if (!this.Buttons.Get()) {
-            for (int i = 0; i < this.children.Count; i = i + 1) {
-                Control c = this.children[i];
-                if (!(c is Radio)) { continue; }
-                Radio r = (Radio)c;
-                if (i < this.optionMetas.Count) {
-                    r.optionValue = this.optionMetas[i].value;
-                    r.Disabled = this.optionMetas[i].disabled;
-                }
-                if (sizeCls != "") { r.AddClass(sizeCls); }
+        bool segForm = this.Buttons.Get();
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            Control c = this.children[i];
+            if (!(c is Radio)) { continue; }
+            Radio r = (Radio)c;
+            if (i < this.optionMetas.Count) {
+                r.optionValue = this.optionMetas[i].value;
+                r.Disabled = this.optionMetas[i].disabled;
             }
-            return;
-        }
-        this.ReconcileButtons();
-        RadioButtonGroup bg = this.buttonGroup;
-        bg.SetSize(sizeCls);
-        // 连体按钮形态的列缝恒 0（SetGap 契约）：段间留缝就散成
-        // 一排独立方块，接缝（rb-first/rb-last）失去意义；行距仍
-        // 用于折行。
-        bg.SetGap(this.RowGapPx(), 0);
-        bg.LayoutRows(this.InnerW(this.bw));
-        for (int i = 0; i < bg.items.Count; i = i + 1) {
-            RadioButton it = bg.items[i];
-            it.Disabled = this.optionDisabledAt(i);
-            it.SetMeta(this.valueAt(i), sizeCls);
-            string seam = "";
-            int r0 = bg.RowOf(i);
-            int c0 = bg.ColOf(i);
-            int last = bg.LastColOf(r0);
-            if (c0 == 0) { seam = seam + " rb-first"; }
-            if (c0 == last) { seam = seam + " rb-last"; }
-            it.SetSeam(seam);
+            if (sizeCls != "") { r.AddClass(sizeCls); }
+            if (segForm) {
+                // 连体段接缝：首段恢复左边框、尾段收外侧圆角
+                // （`rb-first`/`rb-last` 类，CSS 段规则配套）。
+                if (i == 0) { r.AddClass("rb-first"); } else { r.RemoveClass("rb-first"); }
+                if (i == this.children.Count - 1) { r.AddClass("rb-last"); } else { r.RemoveClass("rb-last"); }
+            }
         }
     }
 
-    // 第 i 个选项的标签。
-    private string labelOf(int i) { return this.labels[i]; }
     // 第 i 个选项的 value（缺元数据时 = 下标）。
     private int valueAt(int i) {
         if (i < this.optionMetas.Count) { return this.optionMetas[i].value; }
@@ -191,34 +172,16 @@ public class RadioGroup : ChoiceGroup {
         if (data != null) { data.Set(this.model.Get()); }
     }
 
-    // 按钮段列表与组选项对齐（数量不一致才重建；逐项状态在
-    // SyncGroup 每帧下发）。
-    private void ReconcileButtons() {
-        if (buttonGroup != null && buttonGroup.items.Count == this.labels.Count) {
-            return;
-        }
-        buttonGroup = new RadioButtonGroup(this.model);
-        // 段切换的组级联动经 OnChildEvent 冒泡（见下），不再挂捕获
-        // 组的闭包——组→段→事件表→闭包→组是 ARC 不回收的引用环。
-        for (int i = 0; i < this.labels.Count; i = i + 1) {
-            buttonGroup.AddOption(this.labels[i], this.valueAt(i));
-        }
-        // 按钮形态：children 只挂这一个组（Radio 子项由 labels 重建）。
-        this.children.Clear();
-        this.Add(buttonGroup);
-    }
-
     // 清空全部选项（两种形态共用）：用于从文本/JSON 重建选项；
-    // 覆写基类以连元数据与按钮组一起清。
+    // 覆写基类以连元数据一起清。
     public override void ClearOptions() {
         this.children.Clear();
         this.labels.Clear();
         this.optionMetas.Clear();
-        buttonGroup = null;
     }
 
-    // 覆写：为下标造一个真实 Radio（写选项 value，禁用位与组
-    // Change 冒泡），并把落后的元数据列表就地补齐。
+    // 覆写：为下标造一个 Radio（段形态跟组开关，写选项 value，禁用位
+    // 与组 Change 冒泡），并把落后的元数据列表就地补齐。
     public override Control MakeItem(int index, string text) {
         // 基类 AddOption 先 MakeItem 再挂子项；子类三参 AddOption 已把
         // 元数据入列，基类单参路径（SetOptionsText）则没有——落后的
@@ -227,7 +190,8 @@ public class RadioGroup : ChoiceGroup {
         while (this.optionMetas.Count <= index) {
             this.optionMetas.Add(new RadioOptionMeta(this.optionMetas.Count, false));
         }
-        Radio r = new Radio(this.model, this.optionMetas[index].value, text);
+        Radio r = new Radio(this.model, this.optionMetas[index].value, text,
+            this.Buttons.Get());
         r.Disabled = this.optionMetas[index].disabled;
         // 组级联动经 OnChildEvent 冒泡（见下），不再挂捕获组的闭包
         // ——组→子→事件表→闭包→组是 ARC 不回收的引用环。
@@ -243,29 +207,16 @@ public class RadioGroup : ChoiceGroup {
         }
     }
 
-    // 覆写：先同步组状态；按钮形态量按钮段加内边距，圆点形态走基类。
+    // 覆写：先同步组状态；两种形态都是真实子控件，排布走基类。
     public override void OnMeasure(App app) {
         this.SyncGroup();
-        if (!this.Buttons.Get()) { base.OnMeasure(app); return; }
-        this.StylePadL();
-        this.StylePadR();
-        this.StylePadT();
-        this.StylePadB();
-        this.prefW = buttonGroup.prefW + this.StylePadL() + this.StylePadR();
-        this.prefH = buttonGroup.prefH + this.StylePadT() + this.StylePadB();
+        base.OnMeasure(app);
     }
 
-    // 覆写：按钮形态把段的绘制/命中整体交给按钮组子控件，
-    // 圆点形态走基类轨道。
+    // 覆写：先同步组状态，绘制/命中走基类轨道（段的绘制/命中是
+    // 子控件自己的 OnPaint）。
     public override void OnPaint(App app) {
         this.SyncGroup();
-        if (this.Buttons.Get()) {
-            // 按钮形态：轨道表面照常，段的绘制/命中整体交给按钮组
-            // （RenderTree 自带其 OnPaint 与 Clip）。
-            base.OnPaint(app);
-            this.buttonGroup.RenderTree(app);
-            return;
-        }
         base.OnPaint(app);
     }
 
@@ -276,13 +227,11 @@ public class RadioGroup : ChoiceGroup {
             bool want = val == "button" || val == "buttons" || val == "true";
             if (want != this.Buttons.Get()) {
                 this.Buttons.Set(want);
-                if (!want && buttonGroup != null) {
-                    // 切回圆点形态：按钮组占掉了 children，按 labels 重建。
-                    this.children.Clear();
-                    for (int i = 0; i < this.labels.Count; i = i + 1) {
-                        this.Add(this.MakeItem(i, this.labels[i]));
-                    }
-                    buttonGroup = null;
+                // 形态切换：children 按新形态整体重建（圆点=圆环+标签，
+                // 段=单标签），labels 与元数据不动。
+                this.children.Clear();
+                for (int i = 0; i < this.labels.Count; i = i + 1) {
+                    this.Add(this.MakeItem(i, this.labels[i]));
                 }
             }
             return true;

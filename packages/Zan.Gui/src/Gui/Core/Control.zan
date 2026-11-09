@@ -6,36 +6,24 @@ using Gui.Widget;
 
 namespace Gui;
 
-// 保留模式组件树（与即时模式控件共存）。
+// 保留模式现代组件树。
 // 每个节点都是一个 `Control`：有稳定的 `name`、父节点、有序的
-// 子节点列表、停靠提示和已解析的边界矩形。容器用 `Add` 追加
+// 子节点列表与已解析的边界矩形。容器用 `Add` 追加
 // 子节点；任何节点都可用 `Find(name)` 定位后代。
-// 布局是 WinForms 风格的停靠（见 `Arrange`）：停靠的子节点吸附到
-// 边缘并按插入顺序占用空间，`Fill` 子节点占据剩余部分，
-// `Manual` 子节点位于父节点内的显式偏移处。绘制是
-// 多态的——子类重写 `OnPaint`，框架通过 `Paint` 递归，
-// 把每个子树裁剪到父节点的矩形内，内容不会
-// 溢出（复用原生裁剪栈）。
-// 注意：基类方法名刻意不寻常（Paint/Arrange/
-// MeasureTree/InitControl/OnPaint/OnMeasure），以免与
-// 继承 Control 的控件自身的方法冲突——编译器仅按名称
-// 解析调用（无重载），因此子类若以不同签名复用基类名称
-// 会编译出错。
+// 布局完全由现代声明式标准排版驱动（CSS Flexbox / CSS Grid /
+// 标准 Flow 块级流与行内行盒流，见 `Arrange`）。绘制由
+// 渲染管道递归——子类重写 `OnPaint`，框架通过 `Paint` 递归裁剪
+// 并装配图元，内容不会溢出（复用原生裁剪栈）。
 public partial class Control {
     string name;
-    // 通过 With() 添加的子节点的自动流式布局：0 无，1 列，2 行。
-    // 容器（见 Panel.Column/Row）设置此项，使每个 With() 子节点
-    // 自动沿流式布局轴停靠。
+    // 容器流式标记（兼容 Flex 方向判定：0 无，1 列，2 行）
     int layout;
-    // 为 true 时，此节点应增长以填满其流式父节点的
-    // 剩余主轴空间（dock == fill），覆盖流式布局的默认停靠。
+    // 为 true 时，此节点增长以填满流式父节点的剩余主轴空间（flex-grow: 1）
     bool grow;
-    // 停靠时使用的首选主轴尺寸（top/bottom 为高度，
-    // left/right 为宽度）。对 Fill 子节点忽略。控件的 OnMeasure
-    // 通常根据主题设置这些值。
+    // 控件 OnMeasure 或样式计算出的首选尺寸
     int prefW;
     int prefH;
-    // dock == 0 时在父内容框内的手动偏移。
+    // 手动绝对定位偏移（由 CSS position: absolute 统摄）
     int mx;
     int my;
     int padL;
@@ -106,7 +94,17 @@ public partial class Control {
     int scrollExtentX;
     ScrollState scroll;
     weak Control parent;
-    List<Control> children;
+    public List<Control> children;
+    public List<Control> Children {
+        get { return children; }
+        set {
+            if (value != null) {
+                for (int i = 0; i < value.Count; i = i + 1) {
+                    this.Add(value[i]);
+                }
+            }
+        }
+    }
     private static List<EventBinding> emptyEvents = new List<EventBinding>();
     // 供设计器/序列化器使用的事件处理器绑定：把事件名
     // （见 Events()）映射到处理器标识符。未绑定时为空。
@@ -164,6 +162,24 @@ public partial class Control {
             return e.Hide;
         }
         set { this.EnsureExtra().Hide = value; }
+    }
+    // 主点击事件：HTML `@click` 与代码侧 `ctl.Click.Add(...)` 的同一
+    // 通道。自持交互控件（wiresOwnEvents）在自己的 OnPaint/FireCommon
+    // 里触发；普通控件由 RenderTree 经 FireCommon 在命中帧触发。
+    public UiEvent Click {
+        get {
+            ControlExtra e = this.EnsureExtra();
+            if (e.Click == null) { e.Click = new UiEvent(); }
+            return e.Click;
+        }
+        set { this.EnsureExtra().Click = value; }
+    }
+    // 可见性开关（HTML `hidden` 属性的同一真相）：false 时本控件不
+    // 测量、不绘制、不命中（与 CSS display:none 在 StyleVisible 合流）。
+    // 包内既有代码直接读写 visible 字段，公开面统一走本属性。
+    public bool Visible {
+        get { return visible; }
+        set { visible = value; }
     }
     int lastBw;
     int lastBh;
@@ -266,6 +282,15 @@ public partial class Control {
     // 以空格分隔的 CSS 类：`btn.Class = "primary small";`（直接赋值，
     // 无 setter）——控件拥有的每个视觉变体都对应其中一个类。
     string Class;
+    public string ClassName { get { return Class; } set { Class = value; } }
+    // 悬停气泡提示文本（"" = 无提示）与对齐侧（"top"/"bottom"/"left"/"right"）
+    public string Tip;
+    public string TipSide;
+
+    // 默认悬停提示内容（子类如 Button 可覆写以追加快捷键或说明）
+    public virtual string TipText() {
+        return this.Tip;
+    }
     // 双向禁用标志，沿树向下继承：`grp.Disabled = vm.busy;`
     // 会置灰并禁用整个子树（见 IsDisabled）。
     Binding<bool> Disabled;
@@ -348,7 +373,7 @@ public partial class Control {
     }
 
     // 所有子类在工厂/构造函数中调用的基础初始化方法。
-    void InitControl(string n, int d) {
+    void InitControl(string n) {
         name = n;
         prefW = 0;
         prefH = 0;
@@ -376,6 +401,8 @@ public partial class Control {
         On = new WidgetEvents();
         commonId = 0;
         wiresOwnEvents = false;
+        Tip = "";
+        TipSide = "";
         lastBw = 0;
         lastBh = 0;
         lastVisible = false;
@@ -395,6 +422,18 @@ public partial class Control {
         computedStyleCtx = "";
         styleTypeLower = "";
         styleSurfaceOwned = false;
+    }
+
+    void InitControl(string n, int d) {
+        this.InitControl(n);
+    }
+
+    public Control() {
+        this.InitControl("");
+    }
+
+    public Control(string n) {
+        this.InitControl(n);
     }
 
     // 追加一个子节点，返回该子节点本身，调用方可内联持有引用，
@@ -556,22 +595,10 @@ public partial class Control {
         return this;
     }
 
-    // 历史停靠方法收敛（现代排版全面走标准 CSS 流式与 Flex/Grid，兼容历史调用）：
-    Control DockTop() { return this; }
-    Control DockBottom() { return this; }
-    Control DockLeft() { return this; }
-    Control DockRight() { return this; }
-    Control DockFill() { return this.Grow(); }
-    Control DockManual() { return this; }
-
-    // 现代 Float / Absolute 与 Anchor 锚定原语。
+    // 现代 Float / Absolute 绝对定位原语。
     Control Float(int left, int top) {
         return this.Place(left, top);
     }
-    Control AnchorTop() { return this; }
-    Control AnchorBottom() { return this; }
-    Control AnchorLeft() { return this; }
-    Control AnchorRight() { return this; }
 
     // 流式 id 设置器，内联构建的节点之后仍可用
     // Find() 定位，或被设计器/序列化器定位。
@@ -708,7 +735,7 @@ public partial class Control {
     // `new Panel.Row() { Children = { a, b, c } }` 对它逐个 Add，
     // 每次 Add 都走 `With` 的完整收养语义；这是唯一预期的用法，
     // 返回的包装对象是一次性的，不值得在初始化器之外持有。
-    ControlChildren Children {
+    public ControlChildren ChildrenCollection {
         get { return new ControlChildren(this); }
     }
 

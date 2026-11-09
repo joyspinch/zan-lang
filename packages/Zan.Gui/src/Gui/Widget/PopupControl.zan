@@ -1,0 +1,137 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Widget;
+
+// 通用浮层控件基类（PopupControl）：
+// 统一管理带弹出/下拉浮层组件（Popover、Dropdown、SelectBox、DatePicker、ColorPicker）
+// 的生命周期、状态机、OverlayHost 挂载与外部点击关闭保护。
+public class PopupControl : Control {
+    public SignalBool open;
+    public int triggerId;
+    public int placement; // 0 = Bottom (default), 1 = Top, 2 = Auto
+    public int popupWidth;
+    public int popupHeight;
+    public Control popupPanel;
+    public Control customTrigger;
+
+    // 事件通知
+    public UiEvent OpenEvent;
+    public UiEvent CloseEvent;
+
+    protected void InitPopup(string kind, int w, int h) {
+        this.InitControl(kind != "" ? kind : "popup", 1);
+        this.open = new SignalBool(false);
+        this.triggerId = this.WidgetId();
+        this.placement = 2; // Auto 边缘自适应翻转
+        this.popupWidth = w > 0 ? w : 260;
+        this.popupHeight = h > 0 ? h : 0;
+        this.popupPanel = null;
+        this.customTrigger = null;
+        this.OpenEvent = new UiEvent();
+        this.CloseEvent = new UiEvent();
+        this.wiresOwnEvents = true;
+    }
+
+    public PopupControl() {
+        this.InitPopup("popup", 260, 0);
+    }
+
+    public PopupControl(string kind, int w, int h) {
+        this.InitPopup(kind, w, h);
+    }
+
+    // 浮层当前是否展开
+    public virtual bool IsOpen() {
+        return this.open != null ? this.open.Get() : false;
+    }
+
+    // 切换浮层展开/关闭
+    public virtual void ToggleOpen() {
+        this.SetOpen(!this.IsOpen());
+    }
+
+    // 主动关闭当前浮层
+    public virtual void DismissPopup() {
+        this.SetOpen(false);
+    }
+
+    // 设置浮层内容子节点
+    public virtual void SetPopupContent(Control content) {
+        this.popupPanel = content;
+        if (content != null && !this.children.Contains(content)) {
+            this.Add(content);
+        }
+    }
+
+    public virtual Control GetPopupContent() {
+        return this.popupPanel;
+    }
+
+    // 子类钩子：当未显式挂载 popupPanel 时，构建默认弹层子树
+    public virtual Control BuildDefaultPopup(App app) {
+        return null;
+    }
+
+    // 确保弹层控件实例已就绪并完成测量
+    public virtual void EnsurePopup(App app) {
+        if (this.popupPanel == null) {
+            Control def = this.BuildDefaultPopup(app);
+            if (def != null) {
+                this.SetPopupContent(def);
+            }
+        }
+        if (this.popupPanel != null) {
+            if (this.popupWidth > 0) { this.popupPanel.prefW = this.popupWidth; }
+            if (this.popupHeight > 0) { this.popupPanel.prefH = this.popupHeight; }
+            if (app != null) {
+                this.popupPanel.OnMeasure(app);
+            }
+        }
+    }
+
+    // 打开或关闭弹层，统一接入 OverlayHost 生命周期
+    public virtual void SetOpen(bool want) {
+        if (this.open.Get() == want) { return; }
+        this.open.Set(want);
+        App a = this.FindApp();
+        if (a == null) { a = App.FrameApp(); }
+
+        if (want) {
+            this.EnsurePopup(a);
+            if (this.popupPanel != null) {
+                OverlayHost.ShowPopup(a, this, this.popupPanel);
+            }
+            if (this.OpenEvent != null) { this.OpenEvent.RaiseS(this); }
+        } else {
+            OverlayHost.DismissPopup();
+            if (this.CloseEvent != null) { this.CloseEvent.RaiseS(this); }
+        }
+        if (a != null && a.window != null) { a.window.Wake(); }
+    }
+
+    // 响应 OverlayHost 外部点击关闭或 Escape 键关闭
+    public override void OnPopupDismissed() {
+        if (this.open != null && this.open.Get()) {
+            this.open.Set(false);
+            if (this.CloseEvent != null) { this.CloseEvent.RaiseS(this); }
+            App a = this.FindApp();
+            if (a != null && a.window != null) { a.window.Wake(); }
+        }
+    }
+
+    // 插槽支持：允许外部直接通过 MountSlot 传入任意复杂的控件树作为弹层或自定义触发器
+    public override bool MountSlot(string slot, Control c) {
+        if (slot == "popup" || slot == "dropdown" || slot == "content" || slot == "body") {
+            this.SetPopupContent(c);
+            return true;
+        }
+        if (slot == "trigger" || slot == "extra") {
+            this.customTrigger = c;
+            this.Add(c);
+            return true;
+        }
+        return base.MountSlot(slot, c);
+    }
+}

@@ -3,12 +3,15 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 带表头和斑马纹行的数据表（DOM 容器组件，支持组件任意互嵌）。
-// 既支持标准 DOM 容器化写法（Table -> TableRow -> TableCell -> 任意组件），
-// 亦完整保留静态工具方法供旧代码零破坏调用。
+// 数据表格（Table）：纯声明式对象树与 CSS 盒模型（Flex 列排布），包含 TableRow 子节点。
+// 彻底物理消除所有画布坐标微绘（DrawText、SubBox.Paint、cx/cy 手工运算）与即时度量。
 public class Table : Control {
+    public override int StyleDisplay() { return 1; } // Flex
+    public override int StyleFlexDir() { return 1; } // Column
+
     public Table() {
         this.InitControl("table", 1);
+        this.ClassName = "table col";
     }
 
     public Table AddRow(TableRow row) {
@@ -20,165 +23,11 @@ public class Table : Control {
 
     public override string Kind() { return "Table"; }
 
-    public override void OnMeasure(App app) {
-        // 先度量所有行和各单元格
-        int totalH = 0;
-        int maxW = 0;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control r = children[i];
-            r.OnMeasure(app);
-            totalH = totalH + r.prefH;
-            if (r.prefW > maxW) { maxW = r.prefW; }
-        }
-        prefW = maxW;
-        prefH = totalH;
-    }
-
     public override void OnPaint(App app) {
-        if (bw <= 0 || bh <= 0) { return; }
-        // 按流式垂直堆叠排布并渲染所有行
-        int cy = by;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control r = children[i];
-            int rh = r.prefH;
-            if (rh <= 0) { rh = app.theme.heightMedium; }
-            r.Arrange(bx, cy, bw, rh);
-            r.RenderTree(app);
-            cy = cy + rh;
-        }
-    }
-
-    // ---- 静态兼容入口（保留旧调用 100% 正常运行） ------------------------
-
-    // 强类型实体主方法：表头行。
-    public static void RenderHeaderCols(App app, int x, int y, List<TableColumnSpec> cols) {
-        if (cols == null) { return; }
-        List<string> columns = new List<string>();
-        List<int> widths = new List<int>();
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            columns.Add(cols[i].title);
-            widths.Add(cols[i].width);
-        }
-        Table.RenderHeader(app, x, y, columns, widths);
-    }
-
-    // 表头行（主题中等控件高）：columns/widths 按下标配对，长表头
-    // 在列宽内省略，底部画分隔线。
-    public static void RenderHeader(App app, int x, int y, List<string> columns, List<int> widths) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        StyleBox header = Style.Part(app, "table", "header", "", "", "",
-                                     Style.SNormal());
-        StyleBox divider = Style.Part(app, "table", "divider", "", "", "",
-                                      Style.SNormal());
-        int headerFont = header.FontOr(Style.FontFallback(app, "medium"));
-        StyleBox cell = Style.Part(app, "table", "cell", "", "", "",
-                                   Style.SNormal());
-
-        int rowH = t.heightMedium;
-        int totalW = 0;
-        int i = 0;
-        for (; i < widths.Count; i = i + 1) {
-            totalW = totalW + widths[i];
-        }
-        header.bg = header.BgOr(0);
-        SubBox.Paint(app, header, x, y, totalW, rowH);
-
-        int cx = x;
-        i = 0;
-        while (i < columns.Count && i < widths.Count) {
-            // 将每个表头单元格裁剪到其列内，长标签被截断
-            // 而不是渗入下一列。
-            c.PushClip(cx, y, widths[i], rowH);
-            int cellMaxW = widths[i] - t.paddingSmall * 2;
-            c.DrawText(cx + t.paddingSmall, Canvas.CenterTextY(y, rowH, headerFont),
-                       Ellipsis.Fit(columns[i], cellMaxW, headerFont),
-                       header.FgOr(cell.FgOr(0)),
-                       headerFont);
-            c.PopClip();
-            cx = cx + widths[i];
-            i = i + 1;
-        }
-
-        divider.bg = divider.BgOr(0);
-        SubBox.Paint(app, divider, x, y + rowH - 1, totalW, 1);
-    }
-
-    // 强类型实体主方法：数据行渲染（带选中态）。
-    public static void RenderRowCellsSel(App app, int x, int y, List<TableCellItem> cells,
-                                         bool striped, bool selected) {
-        if (cells == null) { return; }
-        List<string> cellTexts = new List<string>();
-        List<int> widths = new List<int>();
-        for (int i = 0; i < cells.Count; i = i + 1) {
-            cellTexts.Add(cells[i].text);
-            widths.Add(cells[i].width);
-        }
-        Table.RenderRowSel(app, x, y, cellTexts, widths, striped, selected);
-    }
-
-    // 强类型实体主方法：普通数据行渲染。
-    public static void RenderRowCells(App app, int x, int y, List<TableCellItem> cells, bool striped) {
-        Table.RenderRowCellsSel(app, x, y, cells, striped, false);
-    }
-
-    // 普通数据行（无选中）：striped 为 true 时铺斑马纹底。
-    public static void RenderRow(App app, int x, int y, List<string> cells, List<int> widths, bool striped) {
-        Table.RenderRowSel(app, x, y, cells, widths, striped, false);
-    }
-
-    // 带选中态的行：选中行铺 `table::row:selected` 的主色浅底
-    // 并在左缘画强调条——与 VirtualList / DataTable 的选中语言
-    // 一致，静态演示也能表达"哪一行是选中的"。
-    public static void RenderRowSel(App app, int x, int y, List<string> cells, List<int> widths,
-                                    bool striped, bool selected) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        // 选中优先于斑马纹：同一行不会既是选中又是斑马纹。
-        StyleBox row = Style.Part(app, "table", "row", "",
-                                  selected ? "" : (striped ? "striped" : ""), "",
-                                  selected ? Style.SSelected() : Style.SNormal());
-        StyleBox accent = Style.Part(app, "table", "accent", "", "", "",
-                                     Style.SNormal());
-        StyleBox cell = Style.Part(app, "table", "cell", "", "", "",
-                                   Style.SNormal());
-        StyleBox divider = Style.Part(app, "table", "divider", "", "", "",
-                                      Style.SNormal());
-        int cellFont = cell.FontOr(Style.FontFallback(app, "medium"));
-
-        int rowH = t.heightMedium;
-        int totalW = 0;
-        int i = 0;
-        for (; i < widths.Count; i = i + 1) {
-            totalW = totalW + widths[i];
-        }
-
-        if (selected || striped) {
-            row.bg = row.BgOr(0);
-            SubBox.Paint(app, row, x, y, totalW, rowH);
-        }
-
-        int cx = x;
-        i = 0;
-        while (i < cells.Count && i < widths.Count) {
-            // 将每个单元格裁剪到其列内，长值被截断
-            // 而不是渗入下一列 / 超出表格。
-            c.PushClip(cx, y, widths[i], rowH);
-            int cellMaxW = widths[i] - t.paddingSmall * 2;
-            c.DrawText(cx + t.paddingSmall, Canvas.CenterTextY(y, rowH, cellFont),
-                       Ellipsis.Fit(cells[i], cellMaxW, cellFont),
-                       cell.FgOr(0),
-                       cellFont);
-            c.PopClip();
-            cx = cx + widths[i];
-            i = i + 1;
-        }
-
-        if (selected) {
-            accent.bg = accent.BgOr(0);
-            SubBox.Paint(app, accent, x, y, app.Scale(3), rowH);
-        }
-        divider.bg = divider.BgOr(0);
-        SubBox.Paint(app, divider, x, y + rowH - 1, totalW, 1);
+        int id = this.CommonId();
+        SyncBinding();
+        app.focus.RegisterFocusable(id);
+        app.hitTester.RegisterRect(id, bx, by, bw, bh, 0);
+        On.Fire(app, id, this);
     }
 }

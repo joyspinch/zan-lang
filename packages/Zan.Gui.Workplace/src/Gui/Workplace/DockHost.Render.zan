@@ -1,0 +1,744 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component;
+
+public partial class DockHost {
+    public void Begin(App app, Rect a) {
+        area = a;
+        dpiScale = app.dpiScale;
+        if (dpiScale <= 0) { dpiScale = 100; }
+        if (logicalLayoutPending) {
+            leftW = PersistPhysical(leftW);
+            rightW = PersistPhysical(rightW);
+            bottomH = PersistPhysical(bottomH);
+            for (int li = 0; li < groups.Count; li = li + 1) {
+                groups[li].extent = PersistPhysical(groups[li].extent);
+            }
+            logicalLayoutPending = false;
+        }
+        if (pendingResize && app.EventKind() == 3) {
+            pendingResize = false;
+            changed = true;
+        }
+        headerH = app.theme.heightMedium;
+        int hs = app.Scale(5);
+        int minSide = app.Scale(140);
+        int minCenter = app.Scale(240);
+        int minBottom = app.Scale(72);
+
+        if (!sized) {
+            leftW = app.Scale(240);
+            rightW = app.Scale(280);
+            bottomH = app.Scale(170);
+            sized = true;
+        }
+
+        for (int i = 0; i < panels.Count; i = i + 1) {
+            if (panels[i].body == null) {
+                panels[i].body = new Rect(0, 0, 0, 0);
+            } else {
+                panels[i].body.Set(0, 0, 0, 0);
+            }
+        }
+
+        bool hasL = this.SideHasVisible(DockSide.Left());
+        bool hasR = this.SideHasVisible(DockSide.Right());
+        bool hasB = this.SideHasVisible(DockSide.Bottom());
+
+        int lw = 0;
+        int rw = 0;
+        int bh = 0;
+        int hl = 0;
+        int hr = 0;
+        int hb = 0;
+        if (hasL) { lw = leftW; hl = hs; }
+        if (hasR) { rw = rightW; hr = hs; }
+        if (hasB) { bh = bottomH; hb = hs; }
+
+        // 最小化的窗口会报告一个极小的客户区矩形（如 237x39），而且窗口
+        // 可以被缩得远小于侧边面板所需。此处的
+        // 钳制在这种情况下仅用于显示：写回钳制后的
+        // 宽度会永久缩小用户调好的面板，因此
+        // 最小化 -> 恢复会让每个分隔跳到最小值。只有
+        // 实际未被钳制布局过的尺寸才应持久化。
+        bool lClamped = false;
+        bool rClamped = false;
+        bool bClamped = false;
+        if (hasL && lw < minSide) { lw = minSide; lClamped = true; }
+        if (hasR && rw < minSide) { rw = minSide; rClamped = true; }
+        int budget = a.width - hl - hr - minCenter;
+        if (budget < 0) { budget = 0; }
+        int over = lw + rw - budget;
+        if (over > 0) {
+            int cut = over;
+            if (cut > rw) { cut = rw; }
+            rw = rw - cut;
+            if (cut > 0) { rClamped = true; }
+            over = over - cut;
+            if (over > 0) {
+                lw = lw - over;
+                if (lw < 0) { lw = 0; }
+                lClamped = true;
+            }
+        }
+        if (hasB) {
+            int maxB = a.height - hb - app.Scale(120);
+            if (bh > maxB) { bh = maxB; bClamped = true; }
+            // minBottom 让位于 maxB：窗口高度不足时两者冲突，
+            // 保中心区可用高度优先——原顺序先压到 maxB 再抬回
+            // minBottom，矮窗口下底栏会把中心区挤成负高溢出。
+            // 冲突时底栏塌到 maxB（可能为负→下一行归零），且
+            // 标记 bClamped 不写回，还原窗口后用户原尺寸仍在。
+            if (bh < minBottom && minBottom <= maxB) { bh = minBottom; bClamped = true; }
+            if (bh < 0) { bh = 0; bClamped = true; }
+        }
+        if (hasL && !lClamped) { leftW = lw; }
+        if (hasR && !rClamped) { rightW = rw; }
+        if (hasB && !bClamped) { bottomH = bh; }
+
+        int midX = a.x + lw + hl;
+        int midW = a.width - lw - hl - rw - hr;
+        if (midW < 0) { midW = 0; }
+
+        // ---- 侧边分隔手柄 ----
+        if (hasL) {
+            int nx = this.Handle(app, a.x + lw, a.y, hs, a.height, true);
+            if (nx >= 0) { leftW = nx - a.x; pendingResize = true; }
+        }
+        if (hasR) {
+            int nx = this.Handle(app, a.Right() - rw - hs, a.y, hs, a.height, true);
+            if (nx >= 0) { rightW = a.Right() - nx - hs; pendingResize = true; }
+        }
+        int centerH = a.height;
+        if (hasB) {
+            centerH = a.height - bh - hb;
+            int ny = this.Handle(app, midX, a.y + centerH, midW, hs, false);
+            if (ny >= 0) { bottomH = a.Bottom() - ny - hs; pendingResize = true; }
+        }
+        if (centerH < 0) { centerH = 0; }
+
+        // ---- 各侧组布局 ----
+        if (hasL) {
+            this.LayoutSide(app, this.VisibleGroups(DockSide.Left()),
+                new Rect(a.x, a.y, lw, a.height), true, hs);
+        }
+        if (hasR) {
+            this.LayoutSide(app, this.VisibleGroups(DockSide.Right()),
+                new Rect(a.Right() - rw, a.y, rw, a.height), true, hs);
+        }
+        this.LayoutSide(app, this.VisibleGroups(DockSide.Center()),
+            new Rect(midX, a.y, midW, centerH), false, hs);
+        if (hasB) {
+            this.LayoutSide(app, this.VisibleGroups(DockSide.Bottom()),
+                new Rect(midX, a.Bottom() - bh, midW, bh), false, hs);
+        }
+    }
+
+    // 单个分隔手柄。拖动时返回新的起始坐标
+    // （垂直手柄返回 x，水平手柄返回 y），否则返回 -1。
+    public int Handle(App app, int x, int y, int w, int h, bool vertical) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        bool live = app.focus.IsHovered(id) || app.focus.IsPressed(id);
+        StyleBox splitter = Control.BareBox(app, "splitter",
+                                            live ? Style.SHover() : Style.SNormal());
+        int col = splitter.BgOr(0);
+        c.FillRect(x, y, w, h, col);
+        int cursor = 4;
+        if (!vertical) { cursor = 5; }
+        app.hitTester.RegisterRect(id, x, y, w, h, cursor);
+        if (app.focus.IsPressed(id) && !dragging) {
+            app.RequestRedraw();
+            if (vertical) { return app.mouseX; }
+            return app.mouseY;
+        }
+        return -1;
+    }
+
+    // 沿交叉轴在侧边各组之间分割 `r`，在相邻组之间绘制
+    // 手柄以及每个组的边框装饰。
+    public void LayoutSide(App app, List<DockGroup> gs, Rect r, bool vertical, int hs) {
+        int n = gs.Count;
+        if (n == 0) { return; }
+        int total = r.width;
+        if (vertical) { total = r.height; }
+        total = total - hs * (n - 1);
+        if (total < n) { total = n; }
+        int minG = app.Scale(56);
+        // 窗口太小，无法给每个组最小尺寸（最小化的
+        // 窗口报告极小客户区，如 237x39）时，不得重新缩放
+        // 已持久化的尺寸：窗口不可用时布局仅用于显示，
+        // 这样恢复时绝不会移动用户的分隔
+        // 位置。`tiny` 用于阻止下方的尺寸写入生效。
+        bool tiny = minG * n > total;
+        if (minG * n > total) { minG = total / n; }
+
+        // 首次根据权重具体化尺寸，之后保持其总和
+        // 等于可用交叉轴，这样窗口缩放时会按比例调整。
+        int sum = 0;
+        int wsum = 0;
+        int unset = 0;
+        int i = 0;
+        for (; i < n; i = i + 1) {
+            if (gs[i].extent <= 0) { unset = unset + 1; wsum = wsum + gs[i].weight; }
+            else { sum = sum + gs[i].extent; }
+        }
+        if (unset > 0 && !tiny) {
+            int rest = total - sum;
+            if (rest < unset * minG) { rest = unset * minG; }
+            if (wsum <= 0) { wsum = unset; }
+            i = 0;
+            while (i < n) {
+                if (gs[i].extent <= 0) {
+                    gs[i].extent = rest * gs[i].weight / wsum;
+                    if (gs[i].extent < minG) { gs[i].extent = minG; }
+                    sum = sum + gs[i].extent;
+                }
+                i = i + 1;
+            }
+        }
+        if (sum != total && sum > 0 && !tiny) {
+            int acc = 0;
+            i = 0;
+            while (i < n - 1) {
+                int e = gs[i].extent * total / sum;
+                if (e < minG) { e = minG; }
+                gs[i].extent = e;
+                acc = acc + e;
+                i = i + 1;
+            }
+            int last = total - acc;
+            if (last < minG) { last = minG; }
+            gs[n - 1].extent = last;
+        }
+
+        // 分隔条拖动只在相邻两组之间挪高度，其余组一律不动。
+        // 必须等整轮布局跑完再写回：循环中途改 gs[i + 1].extent
+        // 会让本帧后面的组按新值排布，末组再把差额吃掉，
+        // 结果就是拖第一条分隔线时第三组也跟着变。
+        int rsAt = 0 - 1;
+        int rsA1 = 0;
+        int rsA2 = 0;
+
+        int pos = r.y;
+        if (!vertical) { pos = r.x; }
+        i = 0;
+        while (i < n) {
+            DockGroup g = gs[i];
+            int ext = g.extent;
+            if (i == n - 1) {
+                if (vertical) { ext = r.Bottom() - pos; }
+                else { ext = r.Right() - pos; }
+                if (ext < 1) { ext = 1; }
+                // 最后一个组总是吸收余量，但该
+                // 余量只有在窗口足够大、能正常布局时才是真实尺寸；
+                // 窗口很小时它仅用于显示。
+                if (!tiny) { g.extent = ext; }
+            }
+            if (vertical) {
+                if (g.bounds == null) { g.bounds = new Rect(r.x, pos, r.width, ext); }
+                else { g.bounds.Set(r.x, pos, r.width, ext); }
+            } else {
+                if (g.bounds == null) { g.bounds = new Rect(pos, r.y, ext, r.height); }
+                else { g.bounds.Set(pos, r.y, ext, r.height); }
+            }
+            this.RenderGroup(app, g);
+            pos = pos + ext;
+
+            if (i < n - 1) {
+                int nv = -1;
+                if (vertical) { nv = this.Handle(app, r.x, pos, r.width, hs, false); }
+                else { nv = this.Handle(app, pos, r.y, hs, r.height, true); }
+                if (nv >= 0 && rsAt < 0) {
+                    int start = g.bounds.y;
+                    if (!vertical) { start = g.bounds.x; }
+                    int delta = nv - start - ext;
+                    int a1 = ext + delta;
+                    int a2 = gs[i + 1].extent - delta;
+                    if (a1 >= minG && a2 >= minG) {
+                        rsAt = i;
+                        rsA1 = a1;
+                        rsA2 = a2;
+                    }
+                }
+                pos = pos + hs;
+            }
+            i = i + 1;
+        }
+
+        if (rsAt >= 0) {
+            gs[rsAt].extent = rsA1;
+            gs[rsAt + 1].extent = rsA2;
+            pendingResize = true;
+        }
+    }
+
+    // 绘制一个组的表面和标签条，解析活动面板的
+    // 内容矩形，并处理其标签上的选择/关闭/开始拖拽。
+    public void RenderGroup(App app, DockGroup g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        Rect b = g.bounds;
+
+        List<string> vis = new List<string>();
+        int i = 0;
+        for (; i < g.ids.Count; i = i + 1) {
+            DockPanel p = this.Find(g.ids[i]);
+            if (p != null && !p.hidden) { vis.Add(p.id); }
+        }
+        if (vis.Count == 0) { return; }
+        if (g.active >= g.ids.Count) { g.active = g.ids.Count - 1; }
+        if (g.active < 0) { g.active = 0; }
+        string activeId = g.ids[g.active];
+        DockPanel ap = this.Find(activeId);
+        if (ap == null || ap.hidden) {
+            activeId = vis[0];
+            g.active = this.IndexIn(g, activeId);
+            ap = this.Find(activeId);
+        }
+
+        bool chrome = !ap.headerless || vis.Count > 1;
+        int hh = 0;
+        if (chrome) { hh = headerH; }
+        if (hh > b.height) { hh = b.height; }
+        g.header = new Rect(b.x, b.y, b.width, hh);
+        g.body = new Rect(b.x, b.y + hh, b.width, b.height - hh);
+
+        // 停靠区拥有所有面板表面（包括固定中央区）：
+        // 半透明宿主（文档、起始页）与相邻面板看起来材质一致，
+        // 而不是让窗口壁纸透出来
+        // 形成更暗、更杂乱的表面。自行绘制表面的宿主
+        // （编辑器填充文档区）直接覆盖它即可。
+        // 材质（色调/磨砂/光泽/边框）来自 CSS 的 `dockgroup` 规则，
+        // 因此玻璃皮肤不需要在这里多一个分支。
+        StyleBox gb = Control.BareBox(app, "dockgroup", Style.SNormal());
+        gb.Paint(app, b.x, b.y, b.width, b.height);
+        if (!chrome) {
+            ap.body = g.body;
+            return;
+        }
+
+        // 标签条与面板表面共用同一底色——单独的 bgSecondary
+        // 填充会让每个停靠面板与相邻面板
+        // 色调不同。只用分隔线区分即可。
+        StyleBox tsb = Control.BareBox(app, "docktabs", Style.SNormal());
+        tsb.Paint(app, b.x, b.y, b.width, hh);
+
+        // 右键单击标签条打开面板菜单（恢复已关闭的面板）。
+        // 触摸上以长按等价：按压帧把手势锚点改记为 -3 哨兵，
+        // 按住不动超过阈值即开菜单；拖拽中的按住不算。
+        // 触摸外壳在手指落下时就合成按压（支持按住类手势），
+        // 桌面构建 TouchDevice() 恒为 false，整段无副作用。
+        bool touchUi = app.TouchDevice();
+        if (touchUi && app.EventKind() == 2
+            && app.window.EventSeq() != stripSentinelSeq) {
+            stripSentinelSeq = app.window.EventSeq();
+            if (Ui.Over(app, b.x, b.y, b.width, hh)) {
+                app.NotePressSentinel(0 - 3);
+            }
+        }
+        if (app.EventKind() == 2 && app.window.EventButton() == 1
+            && Ui.Over(app, b.x, b.y, b.width, hh)) {
+            menuOpen = true;
+            menuX = app.mouseX;
+            menuY = app.mouseY;
+            app.RequestRedraw();
+        }
+        if (touchUi && !dragging && app.PollLongPress(0 - 3)) {
+            menuOpen = true;
+            menuX = app.mouseX;
+            menuY = app.mouseY;
+            app.RequestRedraw();
+        }
+
+        c.PushClip(b.x, b.y, b.width, hh);
+
+        int fontSize = Style.FontFallback(app, "small");
+        int padX = t.paddingMedium;
+        int gap = t.gapSmall;
+        int closeBox = fontSize;
+        int textY = Canvas.CenterTextY(b.y, hh, fontSize);
+        int tabX = b.x;
+
+        i = 0;
+        while (i < vis.Count) {
+            DockPanel p = this.Find(vis[i]);
+            int tabId = app.focus.AllocId();
+            int closeId = app.focus.AllocId();
+            int labelW = Canvas.MeasureText(p.title, fontSize);
+            int tabW = padX + labelW + padX;
+            if (p.closable) { tabW = padX + labelW + gap + closeBox + padX; }
+            bool isActive = p.id == activeId;
+            bool hovered = app.focus.IsHovered(tabId);
+            bool closeHover = app.focus.IsHovered(closeId);
+
+            // 单个标签的底色、文字色与选中下划线由 CSS 的
+            // `docktab` / `:hover` / `:selected` 规则声明，控件只定几何。
+            int tabState = Style.SNormal();
+            if (isActive) { tabState = tabState + Style.SSelected(); }
+            if (hovered || closeHover) { tabState = tabState + Style.SHover(); }
+            StyleBox tab = Control.BareBox(app, "docktab", tabState);
+            tab.Paint(app, tabX, b.y, tabW, hh);
+            StyleBox label = Style.Part(app, "docktab", "label", "", "", "",
+                                        Style.SNormal());
+            int textColor = tab.FgOr(label.FgOr(0));
+            c.DrawText(tabX + padX, textY, p.title, textColor, fontSize);
+
+            // 标签整体先注册，关闭按钮后注册：命中测试取最后注册的
+            // 区域，关闭按钮才不会被标签吞掉。
+            this.RegisterClipped(app, tabId, tabX, b.y, tabW, hh, b.x, b.width);
+            if (p.closable) {
+                int cbx = tabX + padX + labelW + gap;
+                int cby = b.y + (hh - closeBox) / 2;
+                StyleBox close = Style.Part(app, "docktab", "close", "", "", "",
+                                            closeHover ? Style.SHover() : Style.SNormal());
+                int closeColor = close.FgOr(0);
+                if (closeHover) {
+                    c.FillRoundRect(cbx - 2, cby - 2, closeBox + 4, closeBox + 4,
+                        close.RadiusOr(t.borderRadiusSmall), close.BgOr(0));
+                }
+                c.DrawGlyphIn("close", cbx, cby, closeBox, closeBox, closeBox - 3, closeColor);
+                // 触摸上放大命中热区：整条标签条高 + 横向加宽，
+                // 桌面维持图标原大小（悬停精确）。
+                int hbw = closeBox + 4;
+                int hbh = closeBox + 4;
+                int hbx = cbx - 2;
+                int hby = cby - 2;
+                if (app.TouchDevice()) {
+                    hbw = closeBox + app.Scale(24);
+                    hbh = hh;
+                    hbx = cbx + closeBox / 2 - hbw / 2;
+                    hby = b.y;
+                }
+                this.RegisterClipped(app, closeId, hbx, hby, hbw, hbh, b.x, b.width);
+            }
+
+            // 在标签上按下并移动会开始停靠拖拽；从未移动的按下
+            // 保持为普通点击（选择），在松开时处理。
+            if (app.focus.IsPressed(tabId) && !dragging) {
+                int dx = app.mouseX - app.pressStartX;
+                int dy = app.mouseY - app.pressStartY;
+                if (dx < 0) { dx = 0 - dx; }
+                if (dy < 0) { dy = 0 - dy; }
+                if (dx + dy > app.Scale(6)) {
+                    dragging = true;
+                    dragId = p.id;
+                    app.RequestRedraw();
+                }
+            }
+
+            // 长按开过菜单的那次释放不算点击：菜单已在按住时
+            // 打开，松手再选中/关闭标签等于一次手势双触发。
+            if (app.EventKind() == 3 && !dragging && !dragArmed
+                && !app.LongPressFired()) {
+                int hit = app.ClickTarget();
+                if (p.closable && hit == closeId) {
+                    this.Close(p.id);
+                    app.RequestRedraw();
+                } else if (hit == tabId) {
+                    g.active = this.IndexIn(g, p.id);
+                    activeId = p.id;
+                    app.RequestRedraw();
+                }
+            }
+
+            tabX = tabX + tabW;
+            i = i + 1;
+        }
+        c.PopClip();
+
+        ap = this.Find(activeId);
+        if (ap != null && !ap.hidden) { ap.body = g.body; }
+    }
+
+    // 绘制右键单击标签条打开的面板菜单：每个
+    // 关闭的面板一个条目，选中即将其停靠回原位置。
+    public void RenderMenu(App app) {
+        if (!menuOpen) { return; }
+        List<string> ids = this.HiddenIds();
+        List<string> labels = new List<string>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            labels.Add(this.Title(ids[i]));
+        }
+        if (labels.Count == 0) { labels.Add(emptyMenuLabel); }
+        int pick = ContextMenu.Render(app, menuX, menuY, labels);
+        if (pick == 0 - 2) {
+            menuOpen = false;
+            app.RequestRedraw();
+        } else if (pick >= 0) {
+            if (pick < ids.Count) { this.Show(ids[pick]); }
+            menuOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+    // 注册命中区前先按组的横向裁剪收拢矩形（标签条可能被裁出组外）；
+    // 完全落在裁剪外时不注册。
+    public void RegisterClipped(App app, int id, int rx, int ry, int rw, int rh, int clipX, int clipW) {
+        int x0 = rx;
+        int x1 = rx + rw;
+        if (x0 < clipX) { x0 = clipX; }
+        if (x1 > clipX + clipW) { x1 = clipX + clipW; }
+        if (x1 <= x0) { return; }
+        app.hitTester.RegisterRect(id, x0, ry, x1 - x0, rh, 0);
+    }
+
+    // ---- 拖拽与放置 ----
+
+    // 结束一帧：标签拖拽期间解析放置
+    // 目标、高亮它并绘制拖拽幽灵；松开时
+    // 重新停靠面板。每帧在绘制面板之后调用一次，这样
+    // 提示会绘制在最上层。
+    public void End(App app) {
+        this.RenderMenu(app);
+        if (!dragging) {
+            dragArmed = false;
+            return;
+        }
+        dragArmed = true;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        this.ResolveDrop(app);
+        if (dropKind != 0) {
+            StyleBox drop = Style.Part(app, "dockgroup", "drop", "", "", "",
+                                       Style.SNormal());
+            c.FillRect(dropRect.x, dropRect.y, dropRect.width, dropRect.height,
+                       drop.BgOr(0));
+            c.DrawRoundRect(dropRect.x, dropRect.y, dropRect.width, dropRect.height,
+                drop.RadiusOr(t.borderRadiusSmall), drop.BorderOr(0),
+                drop.BorderWOr(2));
+        }
+
+        DockPanel p = this.Find(dragId);
+        if (p != null) {
+            int fontSize = Style.FontFallback(app, "small");
+            int pad = t.paddingMedium;
+            int gw = Canvas.MeasureText(p.title, fontSize) + pad * 2;
+            int gh = headerH;
+            int gx = app.mouseX + app.Scale(8);
+            int gy = app.mouseY + app.Scale(8);
+            StyleBox ghost = Style.Part(app, "dockgroup", "ghost", "", "", "",
+                                        Style.SNormal());
+            c.SurfaceRoundRect(gx, gy, gw, gh, ghost.RadiusOr(t.borderRadiusSmall),
+                               ghost.BgOr(0), ghost.BorderOr(0), ghost.BorderWOr(1));
+            c.DrawTextCentered(gx, gy, gw, gh, p.title, ghost.FgOr(0), fontSize);
+        }
+        app.RequestRedraw();
+
+        if (app.EventKind() == 3 && app.window.EventButton() == 0) {
+            this.ApplyDrop();
+            dragging = false;
+            dragArmed = false;
+            dragId = "";
+            dropKind = 0;
+            app.RequestRedraw();
+        }
+    }
+
+    // 选取指针下方的放置目标：组的标签条或其中部并入该组，
+    // 组的边缘带在旁侧新建组，
+    // 整个停靠区的外侧带停靠到相应侧边。
+    public void ResolveDrop(App app) {
+        dropKind = 0;
+        dropGroup = -1;
+        dropSide = -1;
+        dropIndex = 0;
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        if (!area.Contains(mx, my)) { return; }
+
+        for (int gi = 0; gi < groups.Count; gi = gi + 1) {
+            DockGroup g = groups[gi];
+            if (this.GroupHasVisible(g) && g.bounds.Contains(mx, my)) {
+                if (g.header.height > 0 && g.header.Contains(mx, my)) {
+                    dropKind = 1;
+                    dropGroup = gi;
+                    dropRect = g.bounds;
+                    return;
+                }
+                int zone = DockHost.EdgeZone(g.bounds, mx, my);
+                if (zone == 0) {
+                    dropKind = 1;
+                    dropGroup = gi;
+                    dropRect = g.bounds;
+                    return;
+                }
+                bool vertical = g.side == DockSide.Left() || g.side == DockSide.Right();
+                bool along = false;
+                if (vertical && (zone == 3 || zone == 4)) { along = true; }
+                if (!vertical && (zone == 1 || zone == 2)) { along = true; }
+                if (along) {
+                    dropKind = 2;
+                    dropSide = g.side;
+                    dropIndex = this.SideIndexOf(g);
+                    if (zone == 2 || zone == 4) { dropIndex = dropIndex + 1; }
+                    dropRect = DockHost.HalfRect(g.bounds, zone);
+                    return;
+                }
+                // 跨越组的排列方向：停靠到边缘所指的宿主侧，
+                // 而不是以错误方向拆分该组。
+                dropKind = 2;
+                dropSide = DockHost.SideForZone(zone);
+                dropIndex = this.SideCount(dropSide);
+                if (dropSide == DockSide.Left() && zone == 1) { dropIndex = 0; }
+                dropRect = this.SideStrip(app, dropSide);
+                return;
+            }
+        }
+
+        int zoneA = DockHost.EdgeZone(area, mx, my);
+        if (zoneA == 0) { zoneA = 2; }
+        dropKind = 2;
+        dropSide = DockHost.SideForZone(zoneA);
+        dropIndex = this.SideCount(dropSide);
+        dropRect = this.SideStrip(app, dropSide);
+    }
+
+    // 0 = 中部，1 = 左带，2 = 右带，3 = 顶带，4 = 底带。
+    public static int EdgeZone(Rect r, int mx, int my) {
+        int bx = r.width / 4;
+        int by = r.height / 4;
+        if (bx < 8) { bx = 8; }
+        if (by < 8) { by = 8; }
+        int dl = mx - r.x;
+        int dr = r.Right() - mx;
+        int dt = my - r.y;
+        int db = r.Bottom() - my;
+        int best = 0;
+        int bestD = 0;
+        if (dl < bx) { best = 1; bestD = dl; }
+        if (dr < bx && (best == 0 || dr < bestD)) { best = 2; bestD = dr; }
+        if (dt < by && (best == 0 || dt < bestD)) { best = 3; bestD = dt; }
+        if (db < by && (best == 0 || db < bestD)) { best = 4; bestD = db; }
+        return best;
+    }
+
+    // `zone` 所指那一半的矩形（新建组的放置提示）。
+    public static Rect HalfRect(Rect r, int zone) {
+        if (zone == 1) { return new Rect(r.x, r.y, r.width / 2, r.height); }
+        if (zone == 2) { return new Rect(r.x + r.width / 2, r.y, r.width / 2, r.height); }
+        if (zone == 3) { return new Rect(r.x, r.y, r.width, r.height / 2); }
+        return new Rect(r.x, r.y + r.height / 2, r.width, r.height / 2);
+    }
+
+    // 边缘带 → 宿主侧：1=左、2=右、4=下，其余（含顶带）归中央。
+    public static int SideForZone(int zone) {
+        if (zone == 1) { return DockSide.Left(); }
+        if (zone == 2) { return DockSide.Right(); }
+        if (zone == 4) { return DockSide.Bottom(); }
+        return DockSide.Center();
+    }
+
+    // 某一侧将占据的条带，用作侧边停靠的放置提示。
+    public Rect SideStrip(App app, int side) {
+        int w = leftW;
+        if (side == DockSide.Right()) { w = rightW; }
+        if (w <= 0) { w = app.Scale(240); }
+        if (side == DockSide.Center()) { return area; }
+        if (side == DockSide.Left()) { return new Rect(area.x, area.y, w, area.height); }
+        if (side == DockSide.Right()) { return new Rect(area.Right() - w, area.y, w, area.height); }
+        int h = bottomH;
+        if (h <= 0) { h = app.Scale(170); }
+        return new Rect(area.x, area.Bottom() - h, area.width, h);
+    }
+
+    // `g` 在其所在侧各组中的位置。
+    public int SideIndexOf(DockGroup g) {
+        int n = 0;
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].key == g.key) { return n; }
+            if (groups[i].side == g.side) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 该侧当前的分组数（新组排在末尾用）。
+    public int SideCount(int side) {
+        int n = 0;
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].side == side) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 新组成为 `side` 的第 `k` 组时的全局索引。
+    public int InsertPos(int side, int k) {
+        int n = 0;
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].side == side) {
+                if (n == k) { return i; }
+                n = n + 1;
+            }
+        }
+        return groups.Count;
+    }
+
+    // 松开时执行放置：dropKind=1 把面板并入目标组（目标组若因
+    // Detach 解散则中止）；dropKind=2 在 `dropSide` 第 `dropIndex`
+    // 处新建组——但该侧原本只剩被拖面板自己那一个组时退化为
+    // 重排序，不拆组。两种都会更新面板 home 并置 changed。
+    public void ApplyDrop() {
+        if (dropKind == 0) { return; }
+        DockPanel p = this.Find(dragId);
+        if (p == null) { return; }
+        if (dropKind == 1) {
+            if (dropGroup < 0 || dropGroup >= groups.Count) { return; }
+            DockGroup target = groups[dropGroup];
+            if (DockHost.ListHas(target.ids, dragId)) {
+                target.active = this.IndexIn(target, dragId);
+                return;
+            }
+            int tkey = target.key;
+            this.Detach(dragId);
+            // Detach 可能已解散了目标之前被清空的组。
+            int ti = this.IndexOfKey(tkey);
+            if (ti < 0) { return; }
+            groups[ti].ids.Add(dragId);
+            groups[ti].active = groups[ti].ids.Count - 1;
+            p.home = groups[ti].side;
+            changed = true;
+            return;
+        }
+
+        int side = dropSide;
+        int k = dropIndex;
+        p.home = side;
+        int fromGroup = this.GroupOf(dragId);
+        if (fromGroup >= 0 && groups[fromGroup].side == side
+            && groups[fromGroup].ids.Count == 1) {
+            // 该侧已是唯一组：只需重新排序。
+            DockGroup solo = groups[fromGroup];
+            groups.RemoveAt(fromGroup);
+            int pos = this.InsertPos(side, k);
+            if (pos > groups.Count) { pos = groups.Count; }
+            groups.Insert(pos, solo);
+            changed = true;
+            return;
+        }
+        this.Detach(dragId);
+        DockGroup ng = new DockGroup(side, 100);
+        ng.ids.Add(dragId);
+        ng.active = 0;
+        int at = this.InsertPos(side, k);
+        if (at > groups.Count) { at = groups.Count; }
+        groups.Insert(at, ng);
+        changed = true;
+    }
+
+    // 按 key 找组（ApplyDrop 在 Detach 后重找目标组用）；无则 -1。
+    public int IndexOfKey(int key) {
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (groups[i].key == key) { return i; }
+        }
+        return -1;
+    }
+
+    // 标签正在拖拽时为 true——宿主可以抑制自己本帧的
+    // 悬停/拖拽处理。
+    public bool Dragging() { return dragging; }
+}

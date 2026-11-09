@@ -14,7 +14,13 @@ partial class Designer {
     // 一律是小图标 + 一行标签、每组两行堆叠，这样一屏
     // 放得下又不占画布高度。命令的登记顺序必须与 acts
     // 一一对应：Ribbon 返回的是被点命令的全局序号。
-    int RibbonH(App app) { return Ribbon.HeightGroups(app); }
+    // 功能区高度：RenderRibbon 每帧实测后写入 ribbonLastH，其余调用
+    // 方读上一帧的值（首帧回退 72 逻辑像素）。
+    int ribbonLastH;
+    int RibbonH(App app) {
+        if (ribbonLastH > 0) { return ribbonLastH; }
+        return app.Scale(72);
+    }
 
     // 渲染窗口顶部的功能区：按当前选择与布局模式组装五组命令并
     // 控制可用性，命令排完剩下的空档够时在右端补只读状态（布局
@@ -173,13 +179,25 @@ partial class Designer {
         acts.Add("dpimenu");
         groups.Add(gv);
 
-        int hit = Ribbon.RenderGroups(app, x, y, w, groups);
-        if (hit == Ribbon.OverflowRequest) {
-            // 点了右端的「»」：条带放不下的命令（排版组的右半、
-            // 层次等）进弹出菜单，不再被裁掉就点不着。
-            this.OpenRibbonOverflow(acts);
-            hit = 0 - 1;
-        }
+        // 声明式功能区（迁移自 Ribbon.RenderGroups 即时渲染）：
+        // groups → Ribbon 控件树，条目可用/开关/提示映射为控件状态，
+        // 命中经 CommandClicked 对应回 acts 下标。溢出「»」收编随
+        // P6 弹层统一恢复，当前条带按自然宽铺开。
+        Ribbon rb = new Ribbon();
+        for (int gi = 0; gi < groups.Count; gi = gi + 1) { rb.AddGroup(groups[gi]); }
+        rb.BuildTree();
+        rb.CommandClicked.Add(() => {
+            if (rb.lastAct >= 0 && rb.lastAct < acts.Count) {
+                this.RunRibbon(app, acts[rb.lastAct]);
+            }
+        });
+        rb.MeasureTree(app);
+        int rh = rb.prefH;
+        if (rh < 1) { rh = app.Scale(72); }
+        ribbonLastH = rh;
+        rb.Arrange(x, y, w, rh);
+        rb.RenderTree(app);
+        int hit = 0 - 1;
 
         // 右端只读状态：布局模型、设计尺寸、当前缩放。
         string info = Designer.T("Snap", "自动吸附");
@@ -189,7 +207,7 @@ partial class Designer {
         int iw2 = Canvas.MeasureText(info, Style.FontFallback(app, "small"));
         // 命令排完剩下的空档才写状态；挤不下就交给状态栏，
         // 免得字压在命令上。
-        int usedW = Ribbon.BandWidthFitted(app, groups, this.RibbonH(app), 2, w);
+        int usedW = rb.prefW;
         if (usedW + iw2 + app.Scale(20) <= w) {
             c.DrawText(x + w - app.Scale(10) - iw2,
                 Canvas.CenterTextY(y, this.RibbonH(app), Style.FontFallback(app, "small")),
@@ -201,29 +219,10 @@ partial class Designer {
         app.RequestRedraw();
     }
 
-    // 打开功能区溢出菜单：条带放不下的命令做成菜单项。动作码
-    // 当场从动作表取——动作表每帧重建，菜单开着也不怕对不上。
+    // 打开功能区溢出菜单：旧 Ribbon.RenderGroups 的溢出度量
+    // （RibbonSlot/LastOverflow）随即时渲染一并退役；声明式功能区的
+    // 溢出收编随 P6 弹层统一恢复，当前为无操作。
     void OpenRibbonOverflow(List<string> acts) {
-        List<RibbonSlot> over = Ribbon.LastOverflow();
-        ribbonMenuLabels = new List<string>();
-        ribbonMenuActs = new List<string>();
-        Rect btn = Ribbon.LastOverflowButton();
-        for (int i = 0; i < over.Count; i = i + 1) {
-            RibbonSlot s = over[i];
-            // 禁用的命令不进菜单（菜单里没有"灰的"这一说）。
-            if (s.cmd == null || !s.cmd.enabled) { continue; }
-            ribbonMenuLabels.Add(s.cmd.label);
-            string act = "";
-            if (s.flat >= 0 && s.flat < acts.Count) { act = acts[s.flat]; }
-            ribbonMenuActs.Add(act);
-        }
-        if (ribbonMenuLabels.Count == 0) { return; }
-        ribbonMenuOpen = true;
-        ribbonMenuX = btn.x;
-        ribbonMenuY = btn.y + btn.height;
-        ribbonMenuArm = false;
-        // 菜单开着时不给「»」按钮挂提示气泡（气泡会盖住菜单首项）。
-        Ribbon.SetOverflowMenuOpen(true);
     }
 
     // 执行功能区命令。动作码与 RenderRibbon 里登记的

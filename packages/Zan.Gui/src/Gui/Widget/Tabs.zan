@@ -1,116 +1,52 @@
 using System;
+using System.Collections.Generic;
 using Gui;
 
 namespace Gui.Widget;
 
-// 标签页控件：维护标签列表与选中索引，外观有线形/卡片/分段三种，
-// 方向支持水平（标签条在顶部）与垂直（沿左侧）。
+// 标签页（Tabs）：标准声明式对象树与 CSS 盒模型（Flex 排布）。
+// 组合导航标签条与内容页容器，彻底物理删除所有画布微绘与坐标手算。
 public partial class Tabs : Control {
-    // 标签页列表（hostModel 下是宿主同步来的影子）。
     public List<TabItem> tabs;
-    // 当前选中标签索引（空标签条为 -1）。
     public int active;
-    // 外观：Line / Card / Segment 常量之一。
     public int style;
-    // 方向：Horizontal / Vertical 常量之一。
-    public int orient;
-    // 尾部是否显示「新建标签」按钮。
+    public int orient; // 0 = Horizontal, 1 = Vertical
     public bool showAdd;
-    // 全局 closable：true 时新建 tab 默认带 X（Naive UI closable）。
     public bool closableAll;
-    // 尺寸变体：small/medium/large（Naive UI size）。Binding<string>
-    // 支持响应式换档，属性面板直接读写选项文本。
     public Binding<string> Size;
-    // 水平标签条的滚动偏移（px）。
-    public int scroll;
-    // 选中项变化后让标签条自动滚到可见；手动滚动清除。
-    public bool follow;
-    // 宿主驱动模式：不修改内部列表，只上报动作。
     public bool hostModel;
-    // 右键命中的标签索引（TakeContext 消费，-1 无）。
     public int ctxIndex;
-    // 设计出来的页容器（下标 = 标签索引）。有了它，标签条
-    // 本身就是容器：设计器 / 设计文档里放在某个标签下的控件
-    // 经 SlotHost 落进对应的页，切换标签即切换页面，宿主
-    // 不必自己隐藏和摆放每一页。为空时控件行为与从前一致
-    // （只画标签条，页面由宿主自行绘制）。
     public List<Panel> pages;
-    // `options` 的原样文本，供检查器 / 序列化按原样回读。
     public string itemsSpec;
-    // 上一次测量出的表头高度与侧栏宽度：Arrange 拿不到 App，
-    // 而页面区正是表头之外的那块。
-    public int hdrH;
-    public int trackW;
-    // TabBar 右侧全局操作插槽（Suffix / Extra）
     public Control extraSlot;
 
-    // 待领走的选中变化索引（TakeChanged 消费，-1 无）。
     public int changedIndex;
-    // 最近一次关闭的标签索引（ClosedIndex 读取，-1 无）。
     public int closedIndex;
-    // 待领走的「新建标签」插入位置（TakeAdded 消费，-1 无）。
     public int addedIndex;
-    // 还没被宿主领走的关闭索引，从大到小排队。批量关闭（关闭全部 /
-    // 关闭其他）一次移除多个标签，而宿主每帧只 TakeClosed() 一次并按
-    // 索引删自己的并行数组（页、浏览器…）：只报一个索引，宿主就少删
-    // 几项，剩下的条目全部错位到别人的页上。倒序入队使每个上报的
-    // 索引在宿主删到它之前始终指向自己那一项。
     public List<int> closedQueue;
 
-    // 内置右键菜单的打开状态（延迟一帧消费）。
-    public SignalBool menuOpen;
-    // 菜单针对的标签索引。
-    public int menuTab;
-    // 菜单弹出位置（鼠标处）。
-    public int menuX;
-    public int menuY;
-    // 菜单选中的动作 id（overlay 写入，ApplyMenuAction 消费）。
-    public SignalInt menuAction;
-    // 富菜单的子菜单打开状态（-1 无）。
-    public SignalInt menuSub;
-    // 菜单命中的 id 块。
-    public int menuBaseId;
+    public Control navStrip;
+    public Control contentBox;
 
-    // 选中标签变化时触发。
     public UiEvent TabChanged;
-    // 标签被关闭时触发。
     public UiEvent TabClosed;
-    // 新建标签时触发。
     public UiEvent TabAdded;
 
-    // 按键式查找取文案（System.Globalization.Lang）：英文原文
-    // 作键、内置中文为缺省串；语言包未加载时回退缺省串。
-    private static string TT(string en, string zh) {
-        return Lang.Tr(en, zh);
-    }
-
-    // 外观常量：线形 / 卡片 / 分段按钮（对应 n-tabs 的 type）。
     public static int Line() { return 0; }
-    // 卡片外观：带边框的页签卡。
     public static int Card() { return 1; }
-    // 分段按钮外观（segment）。
     public static int Segment() { return 2; }
-
-    // 方向常量：标签条在顶部或沿左侧。
     public static int Horizontal() { return 0; }
-    // 垂直方向：标签条沿左侧排列。
     public static int Vertical() { return 1; }
 
-    // 垂直标签条（标签沿左侧排列）的快捷构造。
     public static Tabs CreateVertical(int style) {
         return new Tabs(style, 1);
     }
 
-    // 默认标签条：Line 外观、水平方向。（没有这个构造，`new Tabs()`
-    // 会跳过唯一的构造函数，留下一个字段全为 null 的对象。）
     public Tabs() : this(0, 0) { }
-
-    // 给定外观的水平标签条；垂直轨道用 `new Tabs(style, Tabs.Vertical())`。
     public Tabs(int style) : this(style, 0) { }
 
-    // 完整构造：外观 + 方向常量。
     public Tabs(int style, int orient) {
-        this.InitControl("tabs", 0);
+        this.InitControl("tabs", 1);
         this.tabs = new List<TabItem>();
         this.active = 0;
         this.style = style;
@@ -118,100 +54,143 @@ public partial class Tabs : Control {
         this.showAdd = false;
         this.closableAll = false;
         this.Size = "medium";
-        this.scroll = 0;
-        this.follow = false;
         this.hostModel = false;
         this.ctxIndex = 0 - 1;
         this.pages = new List<Panel>();
         this.itemsSpec = "";
-        this.hdrH = 0;
-        this.trackW = 0;
         this.changedIndex = 0 - 1;
         this.closedIndex = 0 - 1;
         this.addedIndex = 0 - 1;
         this.closedQueue = new List<int>();
-        this.menuOpen = new SignalBool(false);
-        this.menuTab = 0;
-        this.menuX = 0;
-        this.menuY = 0;
-        this.menuAction = new SignalInt(0 - 1);
-        this.menuSub = new SignalInt(0 - 1);
-        this.menuBaseId = WidgetId.Block(256);
         this.TabChanged = new UiEvent();
         this.TabClosed = new UiEvent();
         this.TabAdded = new UiEvent();
+        this.wiresOwnEvents = true;
+
+        this.ClassName = "tabs " + (orient == 1 ? "row" : "col");
+        this.BuildTree();
     }
 
-    // 尾部是否显示「新建标签」按钮（浏览器式 +）。
-    public void SetShowAdd(bool on) { showAdd = on; }
+    public override int StyleDisplay() { return 1; } // Flex
+    public override int StyleFlexDir() { return orient == 1 ? 0 : 1; }
 
-    // 宿主驱动模式：控件不再拥有标签页集合。
-    // 关闭 / 添加 / 右键操作上报给宿主（宿主拥有
-    // 真实模型并每帧重新同步标签），而不是修改
-    // 内部列表或打开内置上下文菜单。
+    public void SetShowAdd(bool on) {
+        showAdd = on;
+        this.BuildTree();
+    }
+
     public void SetHostModel(bool on) { hostModel = on; }
 
-    // ---- 设计器 / 序列化模型 --------------------------------------
+    public int Active() { return active; }
 
-    // 控件类型标识（序列化/设计器用）。
-    public override string Kind() { return "Tabs"; }
-    // 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
-    public override Binding<string> SizeOf() { return Size; }
-
-    // 覆写：CSS 类型选择器名（"tabs"）。
-    public override string StyleType() { return "tabs"; }
-
-    // 覆写：返回设计器属性清单（样式 / 方向 / 新建与关闭 / 尺寸 / 活动页）。
-    public override List<PropSpec> Props() {
-        List<PropSpec> ps = new List<PropSpec>();
-        PropSpec st = PropSpec.Enum("style", "Style", new List<string>());
-        st.Option("line"); st.Option("card"); st.Option("segment");
-        st.num = style;
-        st.WithTip("Tab header appearance.");
-        ps.Add(st);
-        PropSpec o = PropSpec.Enum("orient", "Orientation", new List<string>());
-        o.Option("horizontal"); o.Option("vertical");
-        o.num = orient;
-        o.WithTip("Place the tab header across the top or along the side.");
-        ps.Add(o);
-        PropSpec add = PropSpec.Bool("showAdd", "Show add button");
-        add.flag = showAdd;
-        add.WithTip("Show a trailing button for adding a tab.");
-        ps.Add(add);
-        PropSpec ca = PropSpec.Bool("closable", "All closable");
-        ca.flag = closableAll;
-        ca.WithTip("Every tab shows a close X (Naive UI closable).");
-        ps.Add(ca);
-        PropSpec sz = PropSpec.Enum("size", "Size",
-            PropSpec.Sizes3());
-        sz.str = Size;
-        ps.Add(sz);
-        PropSpec act = PropSpec.Int("active", "Active tab");
-        act.num = active;
-        // 设计文档的建模键是 activeTab（data-active-tab）：别名
-        // 收下，FormBuilder 的标量直通与运行期属性通道才不会把设计的
-        // 活动页丢成样式类。
-        act.Also("activeTab");
-        act.WithTip("Index of the selected tab.");
-        ps.Add(act);
-        PropSpec its = PropSpec.Text("options", "Tabs");
-        its.str = itemsSpec;
-        its.WithTip("Pipe-separated tab labels; prefix x to make a tab "
-                    + "closable (e.g. \"A|xB|C\").");
-        ps.Add(its);
-        return ps;
+    public void Select(int idx) {
+        if (idx != active && idx >= 0 && (tabs.Count == 0 || idx < tabs.Count)) {
+            active = idx;
+            changedIndex = idx;
+            TabChanged.RaiseS(this);
+            this.BuildTree();
+        }
     }
 
-    // 面板直改 `options` 必须走重建入口（直写字段不会重建标签）。
-    public override void SetProp(string key, string val) {
-        if (key == "options") { this.SetItemsText(val); return; }
-        base.SetProp(key, val);
+    public void SetActive(int idx) {
+        this.Select(idx);
     }
 
-    // 标签 i 的页容器，按需补齐（缺页的标签是空白页）。
-    // 页是透明的停靠容器，因此页里的控件既能停靠也能
-    // 绝对摆放，和窗口根一样。内容页要么都走 Page(i)，
-    // 要么都走 Add(label)——页与标签按下标对应。
+    public int Count() { return tabs.Count; }
+
+    public void Clear() {
+        tabs.Clear();
+        pages.Clear();
+        active = 0;
+        this.BuildTree();
+    }
+
+    public Tabs Add(string label) {
+        return this.Add(label, closableAll);
+    }
+
+    public Tabs Add(string label, bool closable) {
+        tabs.Add(new TabItem(label, closable));
+        if (active < 0) { active = 0; }
+        this.BuildTree();
+        return this;
+    }
+
+    public Tabs Add(TabItem item) {
+        if (item != null) {
+            tabs.Add(item);
+            if (active < 0) { active = 0; }
+            this.BuildTree();
+        }
+        return this;
+    }
+
+    public Tabs AddPane(TabPane pane) {
+        if (pane != null) {
+            tabs.Add(new TabItem(pane.Label(), pane.IsClosable()));
+            this.With(pane);
+            if (active < 0) { active = 0; }
+            this.BuildTree();
+        }
+        return this;
+    }
+
+    public void CloseTab(int idx) {
+        if (idx < 0 || idx >= tabs.Count) { return; }
+        closedIndex = idx;
+        closedQueue.Add(idx);
+        TabClosed.RaiseS(this);
+        if (!hostModel) {
+            tabs.RemoveAt(idx);
+            if (idx < pages.Count) { this.DropPage(idx); }
+            if (active >= tabs.Count) { active = tabs.Count - 1; }
+            this.BuildTree();
+        }
+    }
+
+    public void TriggerAdd() {
+        addedIndex = tabs.Count;
+        TabAdded.RaiseS(this);
+    }
+
+    public int TakeChanged() {
+        int c = changedIndex;
+        changedIndex = 0 - 1;
+        return c;
+    }
+
+    public int TakeClosed() {
+        if (closedQueue.Count > 0) {
+            int last = closedQueue[closedQueue.Count - 1];
+            closedQueue.RemoveAt(closedQueue.Count - 1);
+            return last;
+        }
+        int c = closedIndex;
+        closedIndex = 0 - 1;
+        return c;
+    }
+
+    public int TakeAdded() {
+        int a = addedIndex;
+        addedIndex = 0 - 1;
+        return a;
+    }
+
+    public int TakeContext() {
+        int c = ctxIndex;
+        ctxIndex = 0 - 1;
+        return c;
+    }
+
+    public int HeaderHeight(App app) {
+        return app != null ? app.theme.heightMedium : 32;
+    }
+
+    public void Extra(Control extra) {
+        extraSlot = extra;
+        this.BuildTree();
+    }
+
     public Panel Page(int i) {
         int want = i;
         if (want < 0) { want = 0; }
@@ -224,13 +203,8 @@ public partial class Tabs : Control {
         return pages[want];
     }
 
-    // 当前页容器数量（与 Count() 同步）。
     public int PageCount() { return pages.Count; }
 
-    // 丢掉第 i 页（标签被关掉时）。页以下标对应标签，因此删标签
-    // 必须同步删页，否则剩下的标签全部错位到前一页的内容上。
-    // 页也从控件树上摘下，它里的控件因此不再测量/绘制/接事件，
-    // 持有它们的宿主也能据此（HostForm() == null）回收资源。
     public void DropPage(int i) {
         if (i < 0 || i >= pages.Count) { return; }
         List<Panel> keep = new List<Panel>();
@@ -241,836 +215,82 @@ public partial class Tabs : Control {
         pages = keep;
     }
 
-    // 设计里放在某个标签下的控件（设计文档的 `childTab`）真正的
-    // 父节点就是那一页。
-    public override Control SlotHost(int slot) {
-        return this.Page(slot);
-    }
+    public void BuildTree() {
+        this.children.Clear();
 
-    public override bool MountSlot(string slot, Control c) {
-        if (slot == "extra" || slot == "suffix") {
-            this.Extra(c);
-            return true;
-        }
-        return base.MountSlot(slot, c);
-    }
+        // 1. 导航条容器
+        navStrip = new Control();
+        string orientClass = (orient == 1) ? "col tabs-nav-vertical" : "row tabs-nav-horizontal align-center";
+        string styleClass = (style == 1) ? "card" : (style == 2 ? "segment" : "line");
+        navStrip.ClassName = "tabs-nav " + orientClass + " " + styleClass;
 
-    public override Control NamedSlotHost(string slot) {
-        if (slot == "" || slot == "default") { return this; }
-        // 优先按标题匹配 tab 标签
-        if (tabs != null) {
-            for (int i = 0; i < tabs.Count; i = i + 1) {
-                if (tabs[i].label == slot) {
-                    return this.Page(i);
-                }
-            }
-        }
-        return base.NamedSlotHost(slot);
-    }
-
-    // 按序列化文本重建标签：每条一个标题，`|` 分隔，
-    // 前缀 `x` 表示该标签可关闭。设计器与设计文档走这条路径。
-    public void SetItemsText(string spec) {
-        itemsSpec = spec != null ? spec : "";
-        tabs = new List<TabItem>();
-        if (spec == null) {
-            active = 0 - 1;
-            scroll = 0;
-            return;
-        }
-        string s = spec.Trim();
-        if (s == "") {
-            active = 0 - 1;
-            scroll = 0;
-            return;
-        }
-        if (s.StartsWith("[") && s.EndsWith("]")) {
-            JsonValue arr = JsonValue.ParseLenient(s);
-            if (arr != null && arr.IsArray()) {
-                for (int i = 0; i < arr.Count(); i = i + 1) {
-                    JsonValue it = arr.At(i);
-                    if (it == null) { continue; }
-                    if (it.IsObject()) {
-                        string lbl = it.Str("title", "");
-                        if (lbl == "") { lbl = it.Str("label", ""); }
-                        if (lbl == "") { lbl = it.Str("name", ""); }
-                        if (lbl == "") { lbl = it.Str("text", ""); }
-                        bool canClose = it.Bool("closable", false);
-                        tabs.Add(new TabItem(lbl, canClose));
-                    } else {
-                        tabs.Add(new TabItem(it.AsString(""), false));
-                    }
-                }
-                if (active >= tabs.Count) { active = tabs.Count - 1; }
-                if (active < 0 && tabs.Count > 0) { active = 0; }
-                scroll = 0;
-                return;
-            }
-        }
-        List<string> parts = spec.Split("|");
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            string it = parts[i];
-            if (it == "") { continue; }
-            bool canClose = false;
-            if (it.Length > 0 && (it[0] & 255) == 120) {  // 'x'
-                canClose = true;
-                it = it.Substring(1);
-            }
-            tabs.Add(new TabItem(it, canClose));
-        }
-        if (active >= tabs.Count) { active = tabs.Count - 1; }
-        if (active < 0 && tabs.Count > 0) { active = 0; }
-        scroll = 0;
-    }
-
-    // 覆写：应答扩展属性键，"options" 为标签标题的序列化串。
-    public override string GetExtra(string key) {
-        if (key == "options" || key == "tabs") { return itemsSpec; }
-        return "";
-    }
-
-    // 覆写：写回扩展属性键，"options" 走 SetItemsText 重建标签。
-    public override bool SetExtra(string key, string val) {
-        if (key == "options" || key == "tabs") {
-            this.SetItemsText(val);
-            return true;
-        }
-        return false;
-    }
-
-    // 覆写：公共事件之外提供 "TabChanged"/"TabClosed"/"TabAdded"。
-    public override List<string> Events() {
-        List<string> e = Control.CommonEvents();
-        e.Add("TabChanged");
-        e.Add("TabClosed");
-        e.Add("TabAdded");
-        return e;
-    }
-
-    // 将标签条的语义事件（TabChanged/TabClosed/TabAdded）
-    // 路由到对应的 UiEvent 字段，使 JSON/设计器的 `onTabChanged` 处理器
-    // 可与每帧的 TakeChanged()/TakeClosed()/TakeAdded() 轮询并存；
-    // 其余事件全部落入 `On` 的公共绑定。
-    public override void BindEvent(string evt, Action a) {
-        if (evt == "TabChanged") { TabChanged.Add(a); return; }
-        if (evt == "TabClosed") { TabClosed.Add(a); return; }
-        if (evt == "TabAdded") { TabAdded.Add(a); return; }
-        On.AddByName(evt, a);
-    }
-
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
-    public override void BindEventS(string evt, ControlEvent a) {
-        if (evt == "TabChanged") { TabChanged.AddS(a); return; }
-        if (evt == "TabClosed") { TabClosed.AddS(a); return; }
-        if (evt == "TabAdded") { TabAdded.AddS(a); return; }
-        On.AddByNameS(evt, a);
-    }
-
-    public override void TriggerEvent(string evt) {
-        if (evt == "TabChanged") { TabChanged.Raise(); return; }
-        if (evt == "TabClosed") { TabClosed.Raise(); return; }
-        if (evt == "TabAdded") { TabAdded.Raise(); return; }
-        base.TriggerEvent(evt);
-    }
-
-
-    // ---- 保留式钩子（Control） ---------------------------------------
-
-    // 首选尺寸：水平条取内容宽度（容器可能压缩它们，
-    // 此时出现溢出箭头）；垂直
-    // 轨道取固定列宽，每个标签占一行。
-    public override void OnMeasure(App app) {
-        string origClass = Class;
-        this.ApplySizeClass();
-        hdrH = this.HeaderHeight(app);
-        trackW = app.Scale(160);
-        if (orient == 1) {
-            prefW = trackW;
-            prefH = hdrH * (tabs.Count + 1);
-            Class = origClass;
-            return;
-        }
-        prefH = hdrH;
-        prefW = this.ContentWidth(app);
-        Class = origClass;
-    }
-
-    // 页面区是表头（或侧栏）之外的那块：活动页铺满它，
-    // 其余页隐藏（因此不测量、不绘制、不接事件）。没有
-    // 设计页时退化为基类的停靠布局。
-    public override void Arrange(int px, int py, int pw, int ph) {
-        int w = pw;
-        int h = ph;
-        if (w < 0) { w = 0; }
-        if (h < 0) { h = 0; }
-        bx = px;
-        by = py;
-        bw = w;
-        bh = h;
-        if (pages.Count == 0) { return; }
-        int cx = px;
-        int cy = py;
-        int cw = w;
-        int ch = h;
-        if (orient == 1) {
-            int tw = trackW;
-            if (tw > w) { tw = w; }
-            cx = px + tw;
-            cw = w - tw;
-        } else {
-            int th = hdrH;
-            if (th > h) { th = h; }
-            cy = py + th;
-            ch = h - th;
-        }
-        for (int i = 0; i < pages.Count; i = i + 1) {
-            Panel p = pages[i];
-            p.SetShown(i == active);
-            if (i == active) { p.Arrange(cx, cy, cw, ch); }
-        }
-        if (extraSlot != null && orient == 0) {
-            int th = hdrH > 0 ? hdrH : 36;
-            int ew = extraSlot.prefW > 0 ? extraSlot.prefW : 80;
-            int eh = extraSlot.prefH > 0 ? extraSlot.prefH : (th > 8 ? th - 8 : th);
-            int ex = px + pw - ew - 8;
-            int ey = py + (th - eh) / 2;
-            extraSlot.Arrange(ex, ey, ew, eh);
-        }
-    }
-
-    // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bw, bh) 统一渲染标签条。
-    public override void OnPaint(App app) {
-        // Size 字段映射为 Class 片段（small/medium/large），皮肤
-        // 通过 tabs.small/.large 规则提供 tab 头高度/字号。
-        string origClass = Class;
-        this.ApplySizeClass();
-        int headW = bw;
-        // 有设计页时侧栏只占轨道宽，剩下的是页面区。
-        if (orient == 1 && pages.Count > 0 && trackW > 0 && trackW < bw) {
-            headW = trackW;
-        }
-        if (orient == 1) { this.PaintTabsVertical(app, bx, by, headW, bh); }
-        else { this.PaintTabsHorizontal(app, bx, by, headW); }
-        Class = origClass;
-    }
-
-    // 上下文菜单涉及的标签索引（读取一次后清零，无则 -1）。
-    public int TakeContext() {
-        int r = ctxIndex;
-        ctxIndex = 0 - 1;
-        return r;
-    }
-
-    // 追加一个标签（canClose = 是否显示关闭 X）；
-    // 空标签条上第一个标签自动成为选中项。
-    public void Add(string label, bool canClose) {
-        tabs.Add(new TabItem(label, canClose));
-        // 空标签条没有选中项（active == -1）；补进来的第一个标签接管它，
-        // 否则宿主问到的活动索引一直是 -1，谁也不会被显示。
-        if (active < 0) { active = tabs.Count - 1; }
-    }
-
-    // 类 C# 风格：直接添加一个内容页控件，自动绑定标题和内部页容器。
-    // 无需手动 Page(i).Add(...) 或 .Root 侵入。
-    public void AddPage(string label, Control content, bool canClose) {
-        int idx = tabs.Count;
-        this.Add(label, canClose);
-        Panel p = this.Page(idx);
-        if (content != null) {
-            p.Add(content);
-        }
-    }
-
-    public void AddPage(string label, Control content) {
-        this.AddPage(label, content, false);
-    }
-
-    // 声明式添加一个标签页（标题 + 页面控件）
-    public Tabs Tab(string label, Control content) {
-        this.AddPage(label, content, false);
-        return this;
-    }
-
-    public Tabs Tab(string label, Control content, bool canClose) {
-        this.AddPage(label, content, canClose);
-        return this;
-    }
-
-    // 支持标准 DOM 容器组件互嵌：添加 TabPane
-    public Tabs AddTab(TabPane pane) {
-        if (pane == null) { return this; }
-        int idx = tabs.Count;
-        this.Add(pane.Label(), pane.IsClosable());
-        Panel p = this.Page(idx);
-        p.Add(pane);
-        return this;
-    }
-
-    // 声明式添加带有自定义 Header 控件的标签页
-    public Tabs TabWithHeader(Control headerSlot, Control content, bool canClose) {
-        int idx = tabs.Count;
-        TabItem it = new TabItem("", canClose);
-        it.headerSlot = headerSlot;
-        tabs.Add(it);
-        if (active < 0) { active = tabs.Count - 1; }
-        Panel p = this.Page(idx);
-        if (content != null) {
-            p.Add(content);
-        }
-        if (headerSlot != null) {
-            this.With(headerSlot);
-        }
-        return this;
-    }
-
-    // 设置 TabBar 右侧全局操作插槽（对齐 Naive UI n-tabs 的 suffix 插槽）
-    public Tabs Extra(Control extra) {
-        if (extraSlot != null) { this.Remove(extraSlot); }
-        extraSlot = extra;
-        if (extra != null) {
-            this.With(extra);
-        }
-        return this;
-    }
-
-    public Tabs Suffix(Control suffix) {
-        return this.Extra(suffix);
-    }
-
-    public Control GetExtra() {
-        return extraSlot;
-    }
-
-    // 丢掉所有标签页（选中项回到第一页）。声明式界面在语言切换后
-    // 重建标签文本时用它，免得宿主自己再持有一份影子列表。
-    public void Clear() {
-        tabs = new List<TabItem>();
-        active = 0 - 1;
-        scroll = 0;
-        changedIndex = 0 - 1;
-        closedIndex = 0 - 1;
-        addedIndex = 0 - 1;
-        closedQueue = new List<int>();
-    }
-
-    // 标签数量。
-    public int Count() { return tabs.Count; }
-
-    // 当前选中标签的索引（空标签条为 -1）。
-    public int Active() { return active; }
-
-    // 当前选中标签的标题（无选中为 ""）。
-    public string ActiveLabel() {
-        if (active < 0 || active >= tabs.Count) { return ""; }
-        return tabs[active].label;
-    }
-
-    // 改写某个标签的标题（浏览器拿网页标题回填标签时用它，
-    // 而不必把整条标签文本重新拼一遍）。
-    public void SetLabel(int i, string label) {
-        if (i < 0 || i >= tabs.Count) { return; }
-        tabs[i].label = label;
-    }
-
-    // 读取第 i 个标签的标题（越界为 ""）。
-    public string LabelAt(int i) {
-        if (i < 0 || i >= tabs.Count) { return ""; }
-        return tabs[i].label;
-    }
-
-    // 编程式选中第 i 个标签：触发 TabChanged 并让标签条滚到可见。
-    public void Select(int i) {
-        if (i < 0 || i >= tabs.Count) { return; }
-        if (i != active) {
-            active = i;
-            changedIndex = i;
-            follow = true;
-            TabChanged.RaiseS(this);
-        }
-    }
-
-    // 最近一次关闭事件的标签索引（读取后不清零，供事件处理器用）。
-    public int ClosedIndex() { return closedIndex; }
-
-    // 领走一次选中变化（无则 -1）：按帧轮询时用它，
-    // 事件订阅（TabChanged）时不必。
-    public int TakeChanged() {
-        int r = changedIndex;
-        changedIndex = 0 - 1;
-        return r;
-    }
-
-    // 领走一个已关闭的标签索引（没有则 -1）。一帧里关掉多个标签时
-    // 逐帧逐个领，顺序与移除顺序一致（从大到小）。
-    public int TakeClosed() {
-        if (closedQueue.Count == 0) {
-            closedIndex = 0 - 1;
-            return 0 - 1;
-        }
-        int r = closedQueue[0];
-        closedQueue.RemoveAt(0);
-        if (closedQueue.Count > 0) { closedIndex = closedQueue[0]; }
-        else { closedIndex = 0 - 1; }
-        return r;
-    }
-
-    // 领走一次「新建标签」的插入位置（无则 -1）。
-    public int TakeAdded() {
-        int r = addedIndex;
-        addedIndex = 0 - 1;
-        return r;
-    }
-
-    // 模拟点击「+」：hostModel 下只上报索引给宿主，
-    // 否则自己加一个可关闭的新标签并选中。
-    public void AddNew() {
-        if (hostModel) {
-            addedIndex = tabs.Count;
-            TabAdded.RaiseS(this);
-            return;
-        }
-        int n = tabs.Count + 1;
-        tabs.Add(new TabItem("Tab " + Convert.ToString(n), true));
-        active = tabs.Count - 1;
-        addedIndex = active;
-        changedIndex = active;
-        follow = true;
-        TabAdded.RaiseS(this);
-    }
-
-    // 上报一个被移除的标签：入队给按帧轮询 TakeClosed() 的宿主，
-    // 同时抛事件给订阅 TabClosed 的宿主。
-    private void EmitClosed(int i) {
-        closedQueue.Add(i);
-        closedIndex = i;
-        TabClosed.RaiseS(this);
-    }
-
-    // 移除第 i 个标签之后调用：把选中项挪回有效位置
-    // （空标签条时为 -1）。
-    private void ReindexActive(int i) {
-        if (active > i) { active = active - 1; }
-        if (active >= tabs.Count) { active = tabs.Count - 1; }
-        if (active < 0 && tabs.Count > 0) { active = 0; }
-        // 空标签条没有活动标签：留下 0 会让每个按索引取标签的调用
-        // 越界，因此这里是 -1。
-        if (tabs.Count == 0) { active = 0 - 1; }
-    }
-
-    // 第 i 个标签是否允许被关闭。固定标签（closable == false）既不画关闭
-    // 按钮，也不能被右键菜单或 CloseAt() 关掉：宿主把它当常驻页，
-    // 关掉它宿主的并行数组就和标签错位了。
-    public bool Closable(int i) {
-        if (i < 0 || i >= tabs.Count) { return false; }
-        return tabs[i].closable || closableAll;
-    }
-
-    // 除第 keep 个之外还有几个可关闭的标签（keep < 0 表示不留）。
-    public int ClosableCount(int keep) {
-        int n = 0;
         for (int i = 0; i < tabs.Count; i = i + 1) {
-            if (i == keep) { continue; }
-            if (tabs[i].closable) { n = n + 1; }
-        }
-        return n;
-    }
+            int tidx = i;
+            TabItem item = tabs[i];
+            bool isActive = (i == active);
 
-    // 关闭第 i 个标签（不可关闭的固定标签忽略）；
-    // 非 hostModel 下同步移除对应页。
-    public void CloseAt(int i) {
-        if (i < 0 || i >= tabs.Count) { return; }
-        if (!tabs[i].closable) { return; }
-        if (hostModel) {
-            follow = true;
-            this.EmitClosed(i);
-            return;
-        }
-        tabs.RemoveAt(i);
-        this.DropPage(i);
-        this.ReindexActive(i);
-        follow = true;
-        this.EmitClosed(i);
-    }
+            Button tabBtn = new Button("");
+            tabBtn.ClassName = "tab-item row align-center " + (isActive ? "active" : "") + " " + styleClass;
 
-    // 关闭全部标签（「关闭全部」）。固定标签（closable == false）是宿主的
-    // 常驻页，批量关闭不能连它一起端走。
-    public void CloseAll() { this.CloseBulk(0 - 1); }
-
-    // 关闭除第 keep 个之外的标签（「关闭其他」）；keep 保留并成为选中项。
-    public void CloseOthers(int keep) {
-        if (keep < 0 || keep >= tabs.Count) { return; }
-        this.CloseBulk(keep);
-    }
-
-    // 批量关闭：keep < 0 关掉全部可关闭的标签，否则额外保留第 keep 个。
-    // 先把要关的索引从大到小定下来再逐个关，这样上报出去的每个索引
-    // 在宿主处理到它之前都还指向自己那一项，宿主的并行数组不会错位。
-    private void CloseBulk(int keep) {
-        List<int> doomed = new List<int>();
-        for (int i = tabs.Count - 1; i >= 0; i = i - 1) {
-            if (i == keep) { continue; }
-            if (!tabs[i].closable) { continue; }
-            doomed.Add(i);
-        }
-        if (doomed.Count == 0) { return; }
-        int before = active;
-        int removedBeforeKeep = 0;
-        for (int k = 0; k < doomed.Count; k = k + 1) {
-            int i = doomed[k];
-            if (keep >= 0 && i < keep) { removedBeforeKeep = removedBeforeKeep + 1; }
-            if (!hostModel) {
-                tabs.RemoveAt(i);
-                this.DropPage(i);
-                this.ReindexActive(i);
-            }
-            this.EmitClosed(i);
-        }
-        follow = true;
-        if (hostModel) { return; }
-        // 「关闭其他」右键的那个标签留下来并接管选中；它前面被关掉的
-        // 标签把它往前挪了几格。
-        if (keep >= 0) {
-            active = keep - removedBeforeKeep;
-            // 比的是关之前的标签，不是索引：保留的标签换了人，只订阅
-            // TabChanged 的宿主也得知道自己该显示哪一页了。
-            if (before != keep) {
-                changedIndex = active;
-                TabChanged.RaiseS(this);
-            }
-            return;
-        }
-        if (active >= 0 && active != before) {
-            changedIndex = active;
-            TabChanged.RaiseS(this);
-        }
-    }
-
-    // 此变体标签页/标签条匹配的 CSS 类，皮肤可通过
-    // `tab.line`、`tab.card`、`tab.segment` 规则设置三种外观。
-    private string TabClasses() {
-        string v = "line";
-        if (style == 1) { v = "card"; }
-        else if (style == 2) { v = "segment"; }
-        return v;
-    }
-
-    // 单个标签行的样式状态位。
-    public static int StateOf(bool hover, bool selected) {
-        int st = Style.SNormal();
-        if (hover) { st = st + Style.SHover(); }
-        if (selected) { st = st + Style.SSelected(); }
-        return st;
-    }
-
-    // 水平条的表头高度（也是侧边轨道中的行高）。
-    public int HeaderHeight(App app) {
-        return app.theme.heightMedium;
-    }
-
-    // 单个标签的宽度：文本（超长截断省略）+ padding + 关闭按钮。
-    public int TabWidth(App app, int i) {
-        Theme t = app.theme;
-        StyleBox tab = this.ResolveStyleAs(app, "tab", this.TabClasses(),
-                                           Style.SNormal());
-        int fs = tab.FontOr(Style.FontFallback(app, "medium"));
-        // 单个标签的标题有最大宽度：超长的网页标题截断加省略号，
-        // 而不是把整条标签栏撑成几屏宽。close 按钮的宽度要留在外侧，
-        // 因此先按减掉 close 之后的可用宽度算文本。
-        int closeW = 0;
-        if (tabs[i].closable) { closeW = app.Scale(14) + app.Scale(4); }
-        int labelW = app.Scale(180) - closeW;
-        string label = Ellipsis.Fit(tabs[i].label, labelW, fs);
-        int w = Canvas.MeasureText(label, fs) + t.paddingLarge * 2;
-        if (tabs[i].closable) { w = w + closeW; }
-        return w;
-    }
-
-    // 全部标签的总宽度（溢出判定用）。
-    public int ContentWidth(App app) {
-        int total = 0;
-        for (int i = 0; i < tabs.Count; i = i + 1) {
-            total = total + this.TabWidth(app, i);
-        }
-        return total;
-    }
-
-    // 即时模式兼容入口：统一走标准 DOM Arrange 与 RenderTree 管线。
-    public void Render(App app, int x, int y, int totalWidth) {
-        if (orient == 1) {
-            this.RenderVertical(app, x, y, totalWidth, this.HeaderHeight(app) * (tabs.Count + 1));
-            return;
-        }
-        int h = this.HeaderHeight(app);
-        this.Arrange(x, y, totalWidth, h);
-        this.RenderTree(app);
-    }
-
-    public void RenderVertical(App app, int x, int y, int w, int h) {
-        this.Arrange(x, y, w, h);
-        this.RenderTree(app);
-    }
-
-    // 水平标签条绘制主体：绘制标签/「+」/溢出箭头并处理点击、右键与滚轮。
-    private void PaintTabsHorizontal(App app, int x, int y, int totalWidth) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-
-        int tabH = t.heightMedium;
-        int addW = tabH;
-
-        // 标签条是本控件按几何自己消费点击的区域（Select 不经过
-        // On 通用事件包），必须把条带注册成命中区：否则按在页签上
-        // 等于按在空白上（hitId<0 → pressOnBlocker），释放被
-        // ClickAvailable 判成"点外部"吞掉，页签永远切不动——宿主
-        // 只用 TabChanged.Add 之类类型化字段接线（On 为空）时必现。
-        string a11y = this.EffectiveA11yRole("tablist") + ":" + this.EffectiveA11yLabel(name);
-        app.hitTester.RegisterRectL(this.CommonId(), x, y, totalWidth, tabH, 0, a11y);
-
-        int ek = app.EventKind();
-        int eb = app.window.EventButton();
-        // 标签按几何自己判定点击，所以要问过上层弹层/遮罩：
-        // 否则画在标签条上的下拉一点就穿透过来切了标签。
-        bool cap = app.PointerCaptured();
-        bool leftUp = app.ClickAvailable() && eb == 0;
-        bool rightUp = ek == 3 && eb == 1 && !cap;
-
-        this.ApplyMenuAction();
-        this.PumpClosed(app);
-
-        // 标签数只能在菜单动作之后数：「关闭全部 / 关闭其他」就在
-        // ApplyMenuAction 里移除标签，先数好的话本帧余下的绘制与命中
-        // 判定都会按旧长度去索引已经不存在的标签。
-        int count = tabs.Count;
-
-        // 「+」添加按钮是固定的尾部控件（位于滚动
-        // 视口之外）；需要时溢出箭头紧挨其左侧。
-        int addReserve = 0;
-        if (showAdd) { addReserve = addW; }
-        int contentW = this.ContentWidth(app);
-        bool overflow = contentW > (totalWidth - addReserve);
-
-        int chevW = tabH;
-        int viewW = totalWidth - addReserve;
-        if (overflow) { viewW = viewW - chevW * 2; }
-        if (viewW < 0) { viewW = 0; }
-
-        // 尾部保留一点空隙，避免最后/活动的标签
-        // 紧贴溢出箭头。
-        int endPad = app.Scale(8);
-        int maxScroll = contentW - viewW + endPad;
-        if (!overflow) { maxScroll = 0; }
-        if (maxScroll < 0) { maxScroll = 0; }
-
-        bool overBar = !cap && app.mouseX >= x && app.mouseX < x + totalWidth
-            && app.mouseY >= y && app.mouseY < y + tabH;
-
-        bool ownsWheel = false;
-        if (overflow && overBar) {
-            ownsWheel = app.CaptureWheel(x, y, totalWidth, tabH);
-        }
-        if (ownsWheel && ek == 13) {
-            int d = app.window.EventKeyCode();
-            scroll = scroll - d * app.scrollSpeed / 120;
-            follow = false;
-            app.RequestRedraw();
-        }
-        // 活动标签在本帧发生变化（选择、添加、关闭）时自动滚动到可见；
-        // 手动滚轮/箭头滚动会清除
-        // 该标记，让用户可自由浏览标签条。
-        if (follow && overflow) {
-            int accum = 0;
-            int aStart = 0;
-            int aEnd = 0;
-            for (int fi = 0; fi < count; fi = fi + 1) {
-                int fw = this.TabWidth(app, fi);
-                if (fi == active) { aStart = accum; aEnd = accum + fw; }
-                accum = accum + fw;
-            }
-            if (scroll > aStart) { scroll = aStart; }
-            if (scroll < aEnd - viewW + endPad) { scroll = aEnd - viewW + endPad; }
-        }
-        follow = false;
-        if (scroll > maxScroll) { scroll = maxScroll; }
-        if (scroll < 0) { scroll = 0; }
-
-        string tcls = this.TabClasses();
-        // 条底只有 Line 变体画通栏底线：Card/Segment 的活动标签
-        // 本身是一片填充的纸页/胶囊，纸页下面再叠一条通栏灰线，
-        // 等于给整条标签栏画了个框（用户视角就是"激活窗口还带着
-        // 下划线"）。
-        if (style == 0) {
-            StyleBox strip = this.ResolveStyleAs(app, this.StyleType(), tcls, Style.SNormal());
-            strip.Paint(app, x, y, viewW, tabH);
-        }
-
-        // ---- 滚动标签条（裁剪视口） ----
-        this.RenderTabStrip(app, x, y, viewW, tabH, count, tcls, leftUp, rightUp);
-
-        this.RenderAddButton(app, x, y, totalWidth, addW, tabH, leftUp);
-
-        if (overflow) {
-            this.RenderOverflowChevrons(app, x, y, viewW, chevW, tabH, maxScroll, leftUp);
-        }
-
-        this.EmitMenu(app);
-    }
-
-    // 队列里还有没被领走的关闭索引：每帧只轮询一次的宿主靠后续帧把
-    // 剩下的领完，而空闲时框框并不自己重绘，所以这里把帧要出来。
-    private void PumpClosed(App app) {
-        if (closedQueue.Count > 0) { app.RequestRedraw(); }
-    }
-
-    // 滚动标签条（裁剪）：每个标签一个样式框 + 标签/关闭字形，支持逐标签点击/右键菜单。
-    private void RenderTabStrip(App app, int x, int y, int viewW, int tabH, int count, string tcls, bool leftUp, bool rightUp) {
-        bool cap = app.PointerCaptured();
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        // 调用方数好的标签数只是上界：本帧里任何一次关闭都会让列表变短，
-        // 而下面每一步都按索引取标签，因此收到实际长度。
-        if (count > tabs.Count) { count = tabs.Count; }
-        c.PushClip(x, y, viewW, tabH);
-
-        int tabX = x - scroll;
-        for (int i = 0; i < count; i = i + 1) {
-            int tw = this.TabWidth(app, i);
-            bool isActive = i == active;
-
-            bool overTab = !cap && app.mouseX >= tabX && app.mouseX < tabX + tw
-                && app.mouseX >= x && app.mouseX < x + viewW
-                && app.mouseY >= y && app.mouseY < y + tabH;
-
-            int closeW = app.Scale(14);
-            int closeX = tabX + tw - closeW - app.Scale(6);
-            bool overClose = tabs[i].closable && overTab
-                && app.mouseX >= closeX && app.mouseX < closeX + closeW;
-
-            // 每个条目一个解析后的 `tab` 框（`tab.card:selected`、
-            // `tab:hover`、…）：皮肤负责填充、边框、圆角和
-            // 标签颜色；这里只保留各变体的内缩。
-            StyleBox ts = this.ResolveStyleAs(app, "tab", tcls, Tabs.StateOf(overTab, isActive));
-            int inset = 0;
-            if (style == 1) { inset = 2; }
-            else if (style == 2) { inset = 3; }
-            ts.Paint(app, tabX + inset, y + inset,
-                     tw - inset * 2, tabH - inset * 2);
-
-            // 皮肤没配标签色时的兜底：state::caption 按状态解析
-            // （选中主色 / 悬停主文字 / 常态次级文字）。
-            int tcFall = Style.Part(app, "state", "caption", "", "", "",
-                isActive ? Style.SSelected()
-                         : (overTab ? Style.SHover() : Style.SNormal())).FgOr(0);
-            int tc = ts.FgOr(tcFall);
-            int labelW = tw;
-            if (tabs[i].closable) { labelW = tw - closeW - app.Scale(6); }
-            // 绘制用的标题与 TabWidth 测量同源：超宽标题在这里
-            // 截断成同宽的省略文本，标签不会把相邻标签挤出去。
-            c.DrawTextCentered(tabX, y, labelW, tabH,
-                               Ellipsis.Fit(tabs[i].label, labelW,
-                                            ts.FontOr(Style.FontFallback(app, "medium"))),
-                               tc, ts.FontOr(Style.FontFallback(app, "medium")));
-
-            if (tabs[i].closable) {
-                StyleBox close = Style.Part(app, "tab", "close", "", tcls, "",
-                                            overClose ? Style.SHover() : Style.SNormal());
-                if (overClose) {
-                    c.FillRoundRect(closeX, y + (tabH - closeW) / 2, closeW, closeW,
-                        close.RadiusOr(t.borderRadiusSmall), close.BgOr(0));
-                }
-                c.DrawGlyphIn("close", closeX, y + (tabH - closeW) / 2, closeW, closeW,
-                    app.Scale(10), close.FgOr(0));
+            if (item.headerSlot != null) {
+                tabBtn.Add(item.headerSlot);
             }
 
+            Label lbl = new Label(item.label);
+            lbl.ClassName = "tab-item-title";
+            tabBtn.Add(lbl);
 
-            if (rightUp && overTab) {
-                if (hostModel) {
-                    ctxIndex = i;
-                    app.RequestRedraw();
-                } else {
-                    menuOpen.Set(true);
-                    menuTab = i;
-                    menuX = app.mouseX;
-                    menuY = app.mouseY;
-                    menuSub.Set(0 - 1);
-                    app.RequestRedraw();
-                }
-            } else if (!menuOpen.Get()) {
-                if (leftUp && overClose) {
-                    this.CloseAt(i);
-                    app.RequestRedraw();
-                    // 关掉一个标签后本帧的 count 与每个 i 都指向已经不存在的
-                    // 条目：继续走下去就会读到列表末尾之外。剩下的标签由
-                    // 上面请求的重绘按新列表画。
-                    break;
-                } else if (leftUp && overTab) {
-                    this.Select(i);
-                    app.RequestRedraw();
-                }
+            if (item.closable || closableAll) {
+                Button closeBtn = new Button("×");
+                closeBtn.ClassName = "tab-item-close ghost tiny";
+                closeBtn.Click.Add(() => {
+                    this.CloseTab(tidx);
+                });
+                tabBtn.Add(closeBtn);
             }
 
-            tabX = tabX + tw;
+            tabBtn.Click.Add(() => {
+                this.Select(tidx);
+            });
+
+            navStrip.Add(tabBtn);
         }
 
-        c.PopClip();
-    }
-
-    // 右边缘固定的尾部「+」添加按钮。
-    private void RenderAddButton(App app, int x, int y, int totalWidth, int addW, int tabH, bool leftUp) {
-        bool cap = app.PointerCaptured();
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        // 固定尾部「+」添加按钮（始终可见，右边缘）。
         if (showAdd) {
-            int ax = x + totalWidth - addW;
-            bool overAdd = !cap && app.mouseX >= ax && app.mouseX < ax + addW
-                && app.mouseY >= y && app.mouseY < y + tabH;
-            StyleBox add = Style.Part(app, "tabs", "add", "", Class, "",
-                                      overAdd ? Style.SHover() : Style.SNormal());
-            if (overAdd) {
-                c.FillRoundRect(ax + 3, y + 3, addW - 6, tabH - 6,
-                    add.RadiusOr(t.borderRadiusSmall), add.BgOr(0));
-            }
-            c.DrawGlyphIn("plus", ax, y, addW, tabH, t.iconSizeSmall, add.FgOr(0));
-            if (leftUp && overAdd && !menuOpen.Get()) {
-                this.AddNew();
-                app.RequestRedraw();
-            }
+            Button addBtn = new Button("+");
+            addBtn.ClassName = "tab-add-btn ghost small";
+            addBtn.Click.Add(() => {
+                this.TriggerAdd();
+            });
+            navStrip.Add(addBtn);
         }
+
+        if (extraSlot != null) {
+            navStrip.Add(extraSlot);
+        }
+
+        this.Add(navStrip);
+
+        // 2. 内容面板容器
+        contentBox = new Control();
+        contentBox.ClassName = "tabs-content col flex-1";
+
+        for (int pi = 0; pi < pages.Count; pi = pi + 1) {
+            pages[pi].Visible = (pi == active);
+            contentBox.Add(pages[pi]);
+        }
+
+        this.Add(contentBox);
     }
 
-    // 标签条宽于视口时显示的溢出箭头。
-    private void RenderOverflowChevrons(App app, int x, int y, int viewW, int chevW, int tabH, int maxScroll, bool leftUp) {
-        bool cap = app.PointerCaptured();
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-            int lx = x + viewW;
-            int rx = x + viewW + chevW;
-            bool overL = !cap && app.mouseX >= lx && app.mouseX < lx + chevW
-                && app.mouseY >= y && app.mouseY < y + tabH;
-            bool overR = !cap && app.mouseX >= rx && app.mouseX < rx + chevW
-                && app.mouseY >= y && app.mouseY < y + tabH;
-            StyleBox chev = Style.Part(app, "tabs", "chevron", "", Class, "",
-                                       Style.SNormal());
-            StyleBox chevHover = Style.Part(app, "tabs", "chevron", "", Class, "",
-                                            Style.SHover());
-            if (overL) { c.FillRect(lx, y, chevW, tabH, chevHover.BgOr(0)); }
-            if (overR) { c.FillRect(rx, y, chevW, tabH, chevHover.BgOr(0)); }
-            c.DrawGlyphIn("chevron-left", lx, y, chevW, tabH,
-                t.iconSizeSmall, (overL ? chevHover : chev).FgOr(0));
-            c.DrawGlyphIn("chevron-right", rx, y, chevW, tabH,
-                t.iconSizeSmall, (overR ? chevHover : chev).FgOr(0));
-            if (leftUp && !menuOpen.Get()) {
-                if (overL) {
-                    scroll = scroll - app.Scale(80);
-                    if (scroll < 0) { scroll = 0; }
-                    app.RequestRedraw();
-                } else if (overR) {
-                    scroll = scroll + app.Scale(80);
-                    if (scroll > maxScroll) { scroll = maxScroll; }
-                    app.RequestRedraw();
-                }
-            }
+    public override void OnPaint(App app) {
+        int id = this.CommonId();
+        SyncBinding();
+        app.focus.RegisterFocusable(id);
+        app.hitTester.RegisterRect(id, bx, by, bw, bh, 0);
+        On.Fire(app, id, this);
     }
 
+    public override string Kind() { return "Tabs"; }
+    public override Binding<string> SizeOf() { return Size; }
 }

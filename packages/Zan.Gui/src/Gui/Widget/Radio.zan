@@ -3,116 +3,127 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 带响应式 int 绑定（选中索引）的单选按钮。
-// C# 风格的有状态实例（每个选项一个）：
-// a.Change += () => { ... };
-// a.Render(app, x, y, "Option A");
-public class Radio : Control {
-    // 组内共享的选中信号：值为选中项的 optionValue（控件族内部
-    // 组装；应用代码经 data 绑定到同一模型字段）。
+// 单选按钮组件：一个类、两种形态，形态差异纯 CSS——
+// 圆点形态（`radio` 样式族：RadioIndicator 圆环 + 标签）与
+// 连体按钮段形态（`radiobutton` 样式族：单标签节点，整段即盒）。
+// 组态由 RadioGroup 统一（Buttons 开关），也支持独立使用
+// （自持信号 + `data` 双向绑定）。
+//
+// 基础用法：
+//   Radio r = new Radio(1, "选项一");
+//   r.Change += () => { OnSelected(); };
+//
+// 响应式数据绑定：
+//   r.data = form.selectedOption;
+//
+// 复合互嵌（DOM 组合，圆点形态）：
+//   Radio custom = new Radio(2, "").With(new Label("VIP会员")).With(new Tag("推荐"));
+//
+// 样式类：
+//   .tiny .small .medium .large (尺寸档位)
+//   .bordered                   (边框变体，圆点形态)
+public class Radio : InteractiveControl {
     public SignalInt model;
-    // 双向绑定的选中值：`r.data = form.gender;` 使模型字段与组选择
-    // 双向保持同步（编译器降级的
-    // Binding）。组内每个单选按钮都绑定同一字段。
     public Binding<int> data;
-    // 本按钮代表的选项值（组信号等于它时本按钮选中）。
     public int optionValue;
-    public int wid;
-    // 按钮文本。
     public string label;
-    // 尺寸档位（Naive UI size prop）：tiny/small/medium/large，
-    // 档位映射为 `radio.small` / `radio.large` 样式类（几何在
-    // base.css 的尺寸规则里）。
-    public Binding<string> Size;
-    // 边框变体（Element Plus el-radio border）：整个选项画成带
-    // 描边圆角盒，选中描边走强调色，语义色类照常联动。
     public Binding<bool> Bordered;
-    // 该选项被选中时触发（C# 风格：`r.Change += h;`）。
-    public UiEvent Change;
+    // 连体按钮段形态：true 时 Kind() 报 "RadioButton"（CSS 类型选择器
+    // 与序列化 kind 都按段形态走），子节点只有标签，无圆环。
+    public bool buttonForm;
 
-    // 初始化：组信号、本项选项值与标题。
-    private void InitRadio(SignalInt m, int ov, string lbl) {
-        this.InitControl(lbl, 1);
-        model = m;
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
+
+    private void InitRadio(SignalInt m, int ov, string lbl, bool button) {
+        this.InitInteractive(lbl);
+        model = m != null ? m : new SignalInt(0);
         optionValue = ov;
         label = lbl;
-        wid = WidgetId.Next();
-        wiresOwnEvents = true;
-        Size = "medium";
         Bordered = false;
-        Change = new UiEvent();
+        buttonForm = button;
+        if (button) {
+            this.ClassName = "radiobutton align-center justify-center";
+        }
+        this.BuildNodes();
+    }
+
+    // 按形态（重）建子节点：圆点 = 圆环 + 标签；按钮段 = 标签。
+    // 形态切换与标签变更都经这里保持子树与状态一致。
+    public void BuildNodes() {
+        this.children.Clear();
+        if (buttonForm) {
+            if (label != "") {
+                Label ln = new Label(label);
+                ln.ClassName = "radiobutton-label";
+                this.Add(ln);
+            }
+            return;
+        }
+        this.Add(new RadioIndicator(this));
+        if (label != "") {
+            this.Add(new Label(label));
+        }
     }
 
     public Radio() {
-        InitRadio(new SignalInt(0), 0, "");
+        InitRadio(null, 0, "", false);
     }
 
-    // 自持信号：`Radio a = new Radio(0, "Option A");`，随后通过 `.data`
-    // 在组内每个单选按钮上绑定同一模型字段——调用处无需任何信号
-    // 连接代码；组互斥由共享字段经 SyncBinding 协调。
     public Radio(int ov, string lbl) {
-        InitRadio(new SignalInt(0), ov, lbl);
+        InitRadio(null, ov, lbl, false);
     }
 
-    // 共享组信号构造器——**控件族内部组装专用**（ChoiceGroup 以此
-    // 把子 Radio 接到组状态上）。应用代码不要用：外部通道只有
-    // `Radio(ov, lbl)` + `data`（§6.1）。
     public Radio(SignalInt m, int ov, string lbl) {
-        InitRadio(m, ov, lbl);
+        InitRadio(m, ov, lbl, false);
     }
 
-    // 是否为当前选中项：绑定的组信号值等于本按钮的
-    // optionValue。同一组内恰好只有一个按钮为 true。
+    // 连体按钮段形态构造（el-radio-button 对应物；一般由
+    // RadioGroup 按钮形态经 MakeItem 造，独立段也可自持信号）。
+    public Radio(SignalInt m, int ov, string lbl, bool button) {
+        InitRadio(m, ov, lbl, button);
+    }
+
     public bool IsSelected() { return model.Get() == optionValue; }
 
     public void SetSelected(bool sel) {
         if (sel) { this.Select(); }
     }
 
-    // 运行期改写标题（老窗体切优化目标时改档位文案
-    // 「低 62-75%」/「低 0.05-0.07元」）。不触发重绘，调用方需自行
-    // RequestRedraw。
     public void SetLabel(string v) {
         label = v;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            if (children[i] is Label) {
+                ((Label)children[i]).Text = v;
+                return;
+            }
+        }
     }
 
-    // 控件类型标识（序列化/设计器用）。
-    public override string Kind() { return "Radio"; }
-    // 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
-    public override Binding<string> SizeOf() { return Size; }
+    // 控件类型标识：段形态报 "RadioButton"（HTML `<radiobutton>` 与
+    // 设计器 kind 的序列化往返不变），圆点形态报 "Radio"。
+    public override string Kind() {
+        return buttonForm ? "RadioButton" : "Radio";
+    }
 
-    // 把尺寸档位与边框变体落到样式类上（档位类互斥：挂新档前先
-    // 清掉旧档，用户自设的语义色类不受影响）。
     private void ApplyVariants() {
         this.ApplySizeClass();
-        if (Bordered.Get()) { this.AddClass("bordered"); }
+        if (!buttonForm && Bordered != null && Bordered.Get()) { this.AddClass("bordered"); }
     }
 
-    // 将绑定的模型值拉入本地信号（model -> UI）。
     public override void SyncBinding() {
-        if (data == null) { return; }
-        int cur = data.Get();
-        if (cur != model.Get()) { model.Set(cur); }
-    }
-
-    // 即时模式兼容入口：统一走标准 DOM Arrange 与 RenderTree 管线。
-    public int Render(App app, int x, int y, string label) {
-        this.label = label;
-        int w = this.prefW;
-        if (w <= 0) {
-            this.OnMeasure(app);
-            w = this.prefW;
+        base.SyncBinding();
+        if (!buttonForm) { return; }
+        // 段形态的选中态是自己的类（`.radiobutton.selected`，与
+        // `:checked` 双通道并存）；圆点形态的状态类由 RadioIndicator
+        // 自己的 SyncBinding 维护。
+        if (this.IsSelected()) {
+            this.AddClass("selected");
+        } else {
+            this.RemoveClass("selected");
         }
-        int h = this.prefH;
-        if (h <= 0) { h = app.theme.heightMedium; }
-        this.Arrange(x, y, w, h);
-        this.RenderTree(app);
-        return wid;
     }
 
-    // 选中本项（静默判重）：写组信号与 data 绑定、触发 Change，并经
-    // weak parent 向容器冒泡（RadioGroup.OnChildEvent）。无头测试 /
-    // 仿真的用户切换入口。
     public void Select() {
         if (model.Get() == optionValue) { return; }
         model.Set(optionValue);
@@ -121,15 +132,6 @@ public class Radio : Control {
         if (parent != null) { parent.OnChildEvent(this, "Change"); }
     }
 
-    // 设计器事件清单：公共事件外加 Change。
-    public override List<string> Events() {
-        List<string> e = Control.CommonEvents();
-        e.Add("Change");
-        return e;
-    }
-
-    // 设计器属性清单：label(=text)、option、value（优先指向
-    // 活的外部绑定，§6.1 单协议）、size 档位、bordered 变体。
     public override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec text = PropSpec.Text("label", "Label");
@@ -140,150 +142,76 @@ public class Radio : Control {
         opt.num = optionValue;
         ps.Add(opt);
         PropSpec sel = PropSpec.Int("value", "Selected");
-        // 属性通道优先指向活的外部绑定（§6.1 单协议）。
         if (data != null) { sel.num = data; } else { sel.snum = model; }
         ps.Add(sel);
-        PropSpec sz = PropSpec.Enum("size", "Size",
-            PropSpec.Sizes());
-        sz.str = Size;
-        ps.Add(sz);
-        PropSpec bd = PropSpec.Bool("bordered", "Bordered");
-        bd.flag = Bordered;
-        ps.Add(bd);
+        ps.Add(this.SizeProp());
+        if (!buttonForm) {
+            PropSpec bd = PropSpec.Bool("bordered", "Bordered");
+            bd.flag = Bordered;
+            ps.Add(bd);
+        }
         return ps;
     }
 
-    // 事件路由：Change 走语义事件，其余按名转发给 On。
-    public override void BindEvent(string evt, Action a) {
-        if (evt == "Change") { Change.Add(a); return; }
-        On.AddByName(evt, a);
-    }
-
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
-    public override void BindEventS(string evt, ControlEvent a) {
-        if (evt == "Change") { Change.AddS(a); return; }
-        On.AddByNameS(evt, a);
-    }
-
-
-    // 立即模式绘制主体：解析根/指示环/圆点/标签四个样式
-    // 分区，处理选中淡入动画（约 130ms）与边框变体内边距，最后登记
-    // 命中矩形。颜色全部来自 radio::indicator / ::dot 的 CSS 规则。
-    public int PaintStyled(App app, int id, int x, int y, string text, bool selected) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int target = 0;
-        if (selected) { target = 1000; }
-        int animW = this.prefW;
-        if (animW <= 0) {
-            StyleBox measureRoot = this.BoxState(app, Style.SNormal());
-            StyleBox measureLabel = Style.Part(app, "radio", "label", "",
-                                               Class, "", Style.SNormal());
-            animW = measureRoot.PadLOr(0) + measureRoot.PadROr(0)
-                + app.Scale(18) + app.Scale(8)
-                + Canvas.MeasureText(text,
-                    measureLabel.FontOr(Style.FontFallback(app, "medium")));
+    public override void OnClick(RoutedEventArgs e) {
+        if (this.IsDisabled()) { return; }
+        if (model.Get() != optionValue) {
+            this.Select();
+            App a = this.FindApp();
+            if (a != null) { a.RequestRedraw(); }
         }
-        int animH = this.prefH;
-        if (animH <= 0) { animH = t.heightMedium; }
-        int e = app.AnimToIn(IdHash.HashInt(id, 211), target, 130,
-                             x, y, animW, animH);
-        int latched = Style.SChecked();
-        bool off = this.IsDisabled();
-        StyleBox root = this.ResolveEasedLatchedStyleAsIn(
-            app, id, "radio", Class, off, latched, e,
-            x, y, animW, animH);
-        StyleBox indicatorStyle = this.ResolveEasedLatchedPartAsIn(
-            app, id, "radio", "indicator", "", Class, off, latched, e,
-            x, y, animW, animH);
-        StyleBox dotStyle = this.ResolveEasedLatchedPartAsIn(
-            app, id, "radio", "dot", "", Class, off, latched, e,
-            x, y, animW, animH);
-        StyleBox labelStyle = this.ResolveEasedLatchedPartAsIn(
-            app, id, "radio", "label", "", Class, off, latched, e,
-            x, y, animW, animH);
+        e.Handle();
+    }
 
-        int diameter = indicatorStyle.WidthOr(app.Scale(18));
-        int r = diameter / 2;
-        int fontSize = labelStyle.FontOr(
-            root.FontOr(Style.FontFallback(app, "medium")));
-        int gp = root.GapOr(app.Scale(8));
-        // 边框变体 / 皮肤的根内边距：指示环与标签整体向右让位，
-        // 宽度兜底同样计入（否则 bordered 的文字贴住右边框）。
-        int padL = root.PadLOr(0);
-        int padR = root.PadROr(0);
-        int totalH = root.HeightOr(t.heightMedium);
-        int totalW = root.WidthOr(padL + padR + diameter + gp
-                                  + Canvas.MeasureText(text, fontSize));
-        root.Paint(app, x, y, totalW, totalH);
-
-        int cx = x + padL + r;
-        int cy = y + totalH / 2;
-        // 颜色全部来自 `radio::indicator` / `::dot` 的 CSS 规则（语义
-        // class 在 :checked 时为整组重新着色）；hover 淡变与选中
-        // 交叉淡化已由 ResolveEasedLatchedPartAs 混好，统一经 SubBox 绘制。
-        indicatorStyle.borderColor = indicatorStyle.BorderOr(root.fg);
-        indicatorStyle.borderW = indicatorStyle.BorderWOr(App.Lerp(1, app.Scale(2), e));
-        indicatorStyle.bg = indicatorStyle.BgOr(0);
-        SubBox.PaintCircle(app, indicatorStyle, cx, cy, r);
-        if (e > 0) {
-            int dotFull = dotStyle.WidthOr(app.Scale(8));
-            int dotSize = App.Lerp(0, dotFull, e);
-            int dotR = dotSize / 2;
-            if (dotR > 0) {
-                dotStyle.bg = dotStyle.BgOr(dotStyle.AccentOr(dotStyle.FgOr(root.accent)));
-                SubBox.PaintCircle(app, dotStyle, cx, cy, dotR);
+    public override void OnKeyDown(RoutedEventArgs e) {
+        if (!this.IsDisabled() && (e.keyCode == 32 || e.keyCode == 13)) {
+            if (model.Get() != optionValue) {
+                this.Select();
+                App a = this.FindApp();
+                if (a != null) { a.RequestRedraw(); }
             }
+            e.Handle();
+            return;
         }
-
-        int labelX = x + padL + diameter + gp;
-        int labelY = Canvas.CenterTextY(y, totalH, fontSize);
-        c.DrawText(labelX, labelY, text, labelStyle.FgOr(root.fg), fontSize);
-        app.hitTester.RegisterRect(id, x, y, totalW, totalH, 2);
-        return id;
+        base.OnKeyDown(e);
     }
 
-    // 测布局：按样式规则（含边框变体）计算首选宽高，
-    // 宽度兜底 = 左右内边距 + 指示环直径 + 间距 + 文本宽。
-    public override void OnMeasure(App app) {
-        Theme t = app.theme;
-        this.ApplyVariants();
-        int latched = 0;
-        if (model.Get() == optionValue) { latched = Style.SChecked(); }
-        if (this.IsDisabled()) { latched = latched + Style.SDisabled(); }
-        StyleBox root = this.ResolveStyleAs(app, "radio", Class, latched);
-        StyleBox indicatorStyle = this.ResolvePartAs(app, "radio", "indicator", "",
-                                                     Class, latched);
-        StyleBox labelStyle = this.ResolvePartAs(app, "radio", "label", "",
-                                                 Class, latched);
-        int diameter = indicatorStyle.WidthOr(app.Scale(18));
-        int fontSize = labelStyle.FontOr(
-            root.FontOr(Style.FontFallback(app, "medium")));
-        int padW = root.PadLOr(0) + root.PadROr(0);
-        prefH = root.HeightOr(t.heightMedium);
-        prefW = root.WidthOr(padW + diameter + root.GapOr(app.Scale(8))
-                             + Canvas.MeasureText(label, fontSize));
-    }
-
-    // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bh) 完成绘制与事件交互。
     public override void OnPaint(App app) {
-        int id = wid;
+        int id = this.CommonId();
         bool off = this.IsDisabled();
         this.ApplyVariants();
         SyncBinding();
-        this.PaintStyled(app, id, bx, by, label, model.Get() == optionValue);
         if (!off) { app.focus.RegisterFocusable(id); }
-
-        bool fire = Ui.Clicked(app, id) && !off;
-        if (!off && Ui.Focused(app, id) && app.EventKind() == 4) {
-            int kc = app.window.EventKeyCode();
-            if (kc == 32 || kc == 13) { fire = true; }
-        }
-        if (fire && model.Get() != optionValue) {
-            this.Select();
-            app.RequestRedraw();
-        }
+        string a11y = this.EffectiveA11yRole("radio") + ":" + this.EffectiveA11yLabel(label);
+        app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);
         if (!off) { On.Fire(app, id, this); }
+    }
+}
+
+// 单选框指示器（小圆环）：纯 Flex 节点，完全由 CSS 盒模型渲染。
+public class RadioIndicator : Control {
+    Radio owner;
+    Control dotNode;
+
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
+
+    public RadioIndicator(Radio o) {
+        owner = o;
+        this.InitControl("indicator", 1);
+        this.ClassName = "radio-indicator align-center justify-center";
+        dotNode = new Control { ClassName = "radio-dot" };
+        this.Add(dotNode);
+    }
+
+    public override void SyncBinding() {
+        base.SyncBinding();
+        if (owner != null && owner.IsSelected()) {
+            this.AddClass("selected");
+            if (dotNode != null) { dotNode.Visible = true; }
+        } else {
+            this.RemoveClass("selected");
+            if (dotNode != null) { dotNode.Visible = false; }
+        }
     }
 }

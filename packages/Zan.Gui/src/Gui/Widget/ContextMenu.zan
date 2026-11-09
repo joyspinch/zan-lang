@@ -3,204 +3,74 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 悬浮的右键上下文菜单。在 (mx, my) 绘制，位置被限制在
-// 窗口内，拦截下层点击，并在本帧报告用户的选择：
-// -1 = 尚无选择，-2 = 已关闭（点击外部），或所选
-// 标签的索引。内容为 "-" 或 "" 的条目渲染为分隔线。
-public class ContextMenu {
-    public static bool IsSep(string s) {
-        return s == "-" || s == "" || s == "---";
+// 上下文菜单（ContextMenu）：纯声明式浮层组件，继承自 Control。
+// 仅支持声明式对象树与 CSS 盒模型，物理删除所有 Canvas 手动微绘与即时模式 Render 入口。
+public class ContextMenu : Control {
+    public List<MenuItem> items;
+    public UiEvent ActionSelected;
+
+    public override int StyleDisplay() { return 1; } // Flex
+    public override int StyleFlexDir() { return 1; } // Column
+
+    public ContextMenu() {
+        this.InitControl("contextmenu", 1);
+        this.ClassName = "contextmenu col";
+        this.items = new List<MenuItem>();
+        this.ActionSelected = new UiEvent();
+        this.wiresOwnEvents = true;
     }
 
-    public static string ParseMainLabel(string raw) {
-        if (raw == null) { return ""; }
-        int tabIdx = raw.IndexOf("\t");
-        if (tabIdx >= 0) { return raw.Substring(0, tabIdx); }
-        int spIdx = raw.IndexOf("  ");
-        if (spIdx >= 0) { return raw.Substring(0, spIdx); }
-        return raw;
+    // 与 items 平行的动作表：MenuItem.action 是宿主动作码（int），
+    // 保留式菜单的动作回调由本类持有，BuildTree 时接到对应按钮。
+    List<Action> itemActions;
+
+    public void AddItem(string label, Action a) {
+        if (itemActions == null) { itemActions = new List<Action>(); }
+        MenuItem mi = MenuItem.Item(label, "", itemActions.Count);
+        items.Add(mi);
+        itemActions.Add(a);
+        this.BuildTree();
     }
 
-    public static string ParseAccel(string raw) {
-        if (raw == null) { return ""; }
-        int tabIdx = raw.IndexOf("\t");
-        if (tabIdx >= 0) { return raw.Substring(tabIdx + 1, raw.Length - (tabIdx + 1)).Trim(); }
-        int spIdx = raw.IndexOf("  ");
-        if (spIdx >= 0) { return raw.Substring(spIdx + 2, raw.Length - (spIdx + 2)).Trim(); }
-        return "";
+    public void AddSeparator() {
+        MenuItem sep = MenuItem.Separator();
+        items.Add(sep);
+        this.BuildTree();
     }
 
-    // 菜单行：悬停高亮、标签以及可选的右对齐
-    // 快捷键/勾选标记。公开出来，使自带菜单的控件
-    // （表头菜单、设计器）获得一致的行，而无需重复绘制。
-    public static void PaintItem(App app, int x, int y, int w, int h,
-                          string label, string accel, bool hovered) {
-        Canvas c = app.canvas;
-        StyleBox s;
-        int state = Style.SNormal();
-        if (hovered) { state = Style.SHover(); }
-        s = Style.Part(app, "contextmenu", "item", "", "", "", state);
-        int fs = s.FontOr(Style.FontFallback(app, "small"));
-        int ty = Canvas.CenterTextY(y, h, fs);
-        if (hovered && s.bg != 0) {
-            c.FillRoundRect(x + app.Scale(3), y, w - app.Scale(6), h, app.Scale(3), s.bg);
-        }
-        int textX = x + app.Scale(12);
-        string drawLbl = label;
-        if (drawLbl != null && drawLbl.StartsWith("✓ ")) {
-            int gsz = app.Scale(12);
-            int gy = y + (h - gsz) / 2;
-            c.DrawGlyphIn("check", textX, gy, gsz, gsz, gsz, s.fg);
-            textX = textX + gsz + app.Scale(6);
-            drawLbl = drawLbl.Substring(2);
-        } else if (drawLbl != null && drawLbl.StartsWith("   ")) {
-            textX = textX + app.Scale(18);
-            drawLbl = drawLbl.Substring(3);
-        }
-        c.DrawText(textX, ty, drawLbl, s.fg, fs);
-        if (accel.Length > 0) {
-            if (accel == "✓") {
-                int gsz = app.Scale(12);
-                int gy = y + (h - gsz) / 2;
-                c.DrawGlyphIn("check", x + w - gsz - app.Scale(14), gy, gsz, gsz, gsz, s.fg);
-            } else {
-                StyleBox asx = Style.Part(app, "contextmenu", "accel", "", "",
-                                          "", Style.SNormal());
-                int afg = asx.fg != 0 ? asx.fg : Style.Fade(s.fg, 120);
-                int aw = Canvas.MeasureText(accel, fs);
-                c.DrawText(x + w - aw - app.Scale(14), ty, accel, afg, fs);
+    public void BuildTree() {
+        this.children.Clear();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            MenuItem it = items[i];
+            if (it.kind == 1) {
+                Control sepNode = new Control();
+                sepNode.ClassName = "contextmenu-separator";
+                this.Add(sepNode);
+                continue;
             }
+            if (it.kind == 2) {
+                Label header = new Label(it.label);
+                header.ClassName = "contextmenu-header";
+                this.Add(header);
+                continue;
+            }
+            Button btn = new Button(it.label);
+            btn.ClassName = "contextmenu-item row align-center";
+            if (it.disabled) { btn.Disabled = true; }
+            int ai = it.action;
+            if (ai >= 0 && itemActions != null && ai < itemActions.Count) {
+                Action act = itemActions[ai];
+                btn.Click.Add(act);
+            }
+            this.Add(btn);
         }
     }
 
-    // 菜单内的分隔行。
-    public static void PaintSeparator(App app, int x, int y, int w) {
-        StyleBox s = Style.Part(app, "contextmenu", "separator", "", "", "",
-                                Style.SNormal());
-        int lineCol = s.bg != 0 ? s.bg : app.theme.borderSecondary;
-        app.canvas.FillRect(x + app.Scale(8), y, w - app.Scale(16), 1, lineCol);
-    }
-
-    // `labels` 将占用的高度，使调用方把菜单锚定在按钮上方时
-    // （如面板底部的输入行）能传入正确的 `my`，
-    // 而不依赖会把菜单挤到窗口边缘的裁剪逻辑。
-    public static int Height(App app, List<string> labels) {
-        StyleBox s = Style.Part(app, "contextmenu", "item", "", "", "",
-                                Style.SNormal());
-        int itemH = Canvas.FontHeight(
-            s.FontOr(Style.FontFallback(app, "small"))) + app.Scale(8);
-        if (itemH < app.Scale(26)) { itemH = app.Scale(26); }
-        int sepH = app.Scale(7);
-        int h = app.Scale(4) * 2;
-        for (int i = 0; i < labels.Count; i = i + 1) {
-            if (ContextMenu.IsSep(labels[i])) { h = h + sepH; } else { h = h + itemH; }
-        }
-        return h;
-    }
-
-    // 在 (mx, my) 绘制菜单并处理本帧交互：返回 -1 尚无选择、
-    // -2 已关闭（点击外部/在菜单外右键），其余为所选条目下标。
-    // 宽度按最宽条目自适应，位置钳制到窗口内。
-    public static int Render(App app, int mx, int my, List<string> labels) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        StyleBox itemStyle = Style.Part(app, "contextmenu", "item", "", "",
-                                        "", Style.SNormal());
-        int fontSize = itemStyle.FontOr(Style.FontFallback(app, "small"));
-        int itemH = Canvas.FontHeight(fontSize) + app.Scale(8);
-        if (itemH < app.Scale(26)) { itemH = app.Scale(26); }
-        int sepH = app.Scale(7);
-        int mW = app.Scale(140);
-        for (int i = 0; i < labels.Count; i = i + 1) {
-            string raw = labels[i];
-            if (!ContextMenu.IsSep(raw)) {
-                string ml = ContextMenu.ParseMainLabel(raw);
-                string ac = ContextMenu.ParseAccel(raw);
-                int lw = Canvas.MeasureText(ml, fontSize) + app.Scale(28);
-                if (ac.Length > 0) {
-                    lw = lw + Canvas.MeasureText(ac, fontSize) + app.Scale(24);
-                }
-                if (lw > mW) { mW = lw; }
-            }
-        }
-        int mH = ContextMenu.Height(app, labels);
-
-        int winW = c.Width();
-        int winH = c.Height();
-        if (mx + mW > winW) { mx = winW - mW - app.Scale(4); }
-        if (my + mH > winH) { my = winH - mH - app.Scale(4); }
-        if (mx < 0) { mx = 0; }
-        if (my < app.titlebarH) { my = app.titlebarH; }
-
-        app.BlockHitsMenu();
-
-        int hovRow = 0 - 1;
-        int hy = my + app.Scale(4);
-        for (int hi = 0; hi < labels.Count; hi = hi + 1) {
-            int rh = itemH;
-            if (ContextMenu.IsSep(labels[hi])) { rh = sepH; }
-            else if (app.mouseX >= mx && app.mouseX < mx + mW
-                     && app.mouseY >= hy && app.mouseY < hy + rh) {
-                hovRow = hi;
-            }
-            hy = hy + rh;
-        }
-        if (hovRow != app.menuHoverRow) {
-            app.menuHoverRow = hovRow;
-            app.RequestRedraw();
-        }
-
-        StyleBox s = Style.Of(app, "contextmenu", "", Style.SNormal());
-        c.FillRoundRect(mx + s.shadowDx, my + s.shadowDy, mW, mH,
-                        app.Scale(4), s.shadow);
-        app.canvas.SurfaceRoundRect(mx, my, mW, mH,
-            s.RadiusOr(app.theme.borderRadiusLarge), s.bg,
-            s.borderColor, s.BorderWOr(1));
-        app.BlockHitsRect(mx, my, mW, mH);
-
-        int ry = my + app.Scale(4);
-        for (int ri = 0; ri < labels.Count; ri = ri + 1) {
-            string raw = labels[ri];
-            if (ContextMenu.IsSep(raw)) {
-                ContextMenu.PaintSeparator(app, mx, ry + sepH / 2, mW);
-                ry = ry + sepH;
-            } else {
-                bool hov = app.mouseX >= mx && app.mouseX < mx + mW
-                           && app.mouseY >= ry && app.mouseY < ry + itemH;
-                string ml = ContextMenu.ParseMainLabel(raw);
-                string ac = ContextMenu.ParseAccel(raw);
-                ContextMenu.PaintItem(app, mx, ry, mW, itemH, ml, ac, hov);
-                ry = ry + itemH;
-            }
-        }
-
-        // 在菜单外右键：菜单让位。
-        if (app.EventKind() == 2 && app.window.EventButton() == 1) {
-            bool onMenu = app.mouseX >= mx && app.mouseX < mx + mW
-                          && app.mouseY >= my && app.mouseY < my + mH;
-            if (!onMenu) { return 0 - 2; }
-        }
-
-        if (app.ClickAvailable() && app.window.EventButton() == 0) {
-            bool inside = app.mouseX >= mx && app.mouseX < mx + mW
-                          && app.mouseY >= my && app.mouseY < my + mH;
-            if (inside) {
-                int cy = my + app.Scale(4);
-                for (int ci = 0; ci < labels.Count; ci = ci + 1) {
-                    int rh = itemH;
-                    if (ContextMenu.IsSep(labels[ci])) { rh = sepH; }
-                    else if (app.mouseY >= cy && app.mouseY < cy + rh) {
-                        app.ClaimClick();
-                        return ci;
-                    }
-                    cy = cy + rh;
-                }
-                app.ClaimClick();
-                return 0 - 1;
-            }
-            app.ClaimClick();
-            return 0 - 2;
-        }
-        return 0 - 1;
+    public override void OnPaint(App app) {
+        int id = this.CommonId();
+        SyncBinding();
+        app.focus.RegisterFocusable(id);
+        app.hitTester.RegisterRect(id, bx, by, bw, bh, 0);
+        On.Fire(app, id, this);
     }
 }

@@ -33,6 +33,12 @@ public class Progress : Control {
     // 多圆环各环的百分比与颜色变体。`AddCircle` 填充；设计器 /
     // 设计文档经 `circles` 额外属性按 `"72:0,45:2"` 原样回填。
     public List<ProgressRing> rings;
+    public Control trackNode;
+    public Control fillNode;
+    public Label labelNode;
+
+    public override int StyleDisplay() { return shape == 0 ? 1 : 0; } // CSS display: flex for bar
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
 
     // 初始化：置百分比/变体并清零其余字段（条形、显示指示文本）。
     private void InitProgress(int pct, int pt) {
@@ -48,6 +54,13 @@ public class Progress : Control {
         format = "";
         ringSize = 0;
         rings = new List<ProgressRing>();
+        this.ClassName = "progress align-center";
+        trackNode = new Control { ClassName = "progress-track flex-1" };
+        fillNode = new Control { ClassName = "progress-fill" };
+        trackNode.Add(fillNode);
+        labelNode = new Label { ClassName = "progress-text" };
+        this.Add(trackNode);
+        this.Add(labelNode);
     }
 
     public Progress() : this(0, 1) { }
@@ -291,77 +304,20 @@ public class Progress : Control {
         return r;
     }
 
-    // 线性轨道条：轨道 + 填充 + 右侧指示文本；processing 时在填充上
-    // 叠加流动斜纹并驱动该区域重绘。
-    private void PaintBar(App app, int pct) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        string variant = this.PartCls();
-        StyleBox trackStyle = this.ResolvePartAs(app, "progress", "track", "",
-                                                 variant, Style.SNormal());
-        StyleBox fillStyle = this.ResolvePartAs(app, "progress", "fill", "",
-                                                variant, Style.SNormal());
-        StyleBox labelStyle = this.ResolvePartAs(app, "progress", "label", "",
-                                                 variant, Style.SNormal());
-        int fs = labelStyle.FontOr(Style.FontFallback(app, "small"));
-        // showIndicator 控制是否绘制右侧百分比文本（Naive UI show-indicator）。
-        bool showLabel = showIndicator
-                         && labelStyle.display != 2
-                         && labelStyle.visible != 0;
-        int gp = t.gapSmall;
-        if (computedStyle != null) { gp = computedStyle.GapOr(gp); }
-        int labelW = 0;
-        // 用 100% 时的文本量宽，条宽不随当前百分比抖动。
-        if (showLabel) {
-            labelW = Canvas.MeasureText(this.IndicatorText(100), fs) + gp;
-        }
-        int barW = bw - labelW;
-        if (barW < app.Scale(20)) { barW = bw; labelW = 0; showLabel = false; }
-        int trackH = trackStyle.HeightOr(app.Scale(8));
-        if (strokeWidth > 0) { trackH = strokeWidth; }
-        if (trackH < 1) { trackH = 1; }
-        int trackY = by + (bh - trackH) / 2;
-        int fillW = pct * barW / 100;
-        if (railColor != 0) { trackStyle.bg = railColor; }
-        trackStyle.SetRadius(trackStyle.RadiusOr(trackH / 2));
-        SubBox.Paint(app, trackStyle, bx, trackY, barW, trackH);
-
-        if (fillW > 0) {
-            int fillH = fillStyle.HeightOr(trackH);
-            if (fillH < 1) { fillH = 1; }
-            int fillY = trackY + (trackH - fillH) / 2;
-            int fillCol = fillColor;
-            if (fillCol == 0) { fillCol = fillStyle.BgOr(0); }
-            fillStyle.bg = fillCol;
-            fillStyle.SetRadius(fillStyle.RadiusOr(fillH / 2));
-            SubBox.Paint(app, fillStyle, bx, fillY, fillW, fillH);
-            // 处理中：填充上叠加向右流动的 45° 高光斜纹
-            // （Naive UI processing），并驱动区域重绘。
-            if (processing) {
-                int period = app.Scale(12);
-                int th = app.Scale(4);
-                if (period < 1) { period = 1; }
-                if (th < 2) { th = 2; }
-                double phase = Progress.StripePhase(Window.GetTickMs(), period);
-                c.PushClip(bx, fillY, fillW, fillH);
-                int sx = -fillH - period;
-                while (sx < fillW + period) {
-                    int stripeX = bx + sx - (int)phase;
-                    c.DrawLine(stripeX, fillY + fillH,
-                               stripeX + fillH, fillY,
-                               Progress.MixWhite(fillCol, 45), th);
-                    sx = sx + period;
-                }
-                c.PopClip();
-                if (Progress.RectOnScreen(app, bx, fillY, fillW, fillH)) {
-                    app.RequestAnimationFrameIn(bx, fillY, fillW, fillH);
+    public override void SyncBinding() {
+        base.SyncBinding();
+        if (shape == 0) {
+            int pct = MathUtil.Clamp(this.Percent(), 0, 100);
+            if (labelNode != null) {
+                labelNode.Visible = showIndicator;
+                labelNode.Text = this.IndicatorText(pct);
+            }
+            if (trackNode != null && fillNode != null) {
+                int tw = trackNode.bw;
+                if (tw > 0) {
+                    fillNode.Arrange(trackNode.bx, trackNode.by, tw * pct / 100, trackNode.bh > 0 ? trackNode.bh : 8);
                 }
             }
-        }
-        if (showLabel) {
-            int ty = Canvas.CenterTextY(by, bh, fs);
-            c.DrawText(bx + barW + gp, ty, this.IndicatorText(pct),
-                       labelStyle.FgOr(0), fs);
         }
     }
 
@@ -542,8 +498,9 @@ public class Progress : Control {
         prefW = root.WidthOr(app.Scale(200));
     }
 
-    // 覆写：按 shape 分派到多圆环/仪表盘/圆环/条形的绘制。
+    // 覆写：按 shape 分派到多圆环/仪表盘/圆环的绘制（条形由子节点树自动渲染）。
     public override void OnPaint(App app) {
+        SyncBinding();
         int pct = MathUtil.Clamp(Percent(), 0, 100);
         if (shape == 2) {
             this.PaintMulti(app);
@@ -551,8 +508,6 @@ public class Progress : Control {
             this.PaintRing(app, pct, 135, 270);
         } else if (shape == 1) {
             this.PaintRing(app, pct, 0, 360);
-        } else {
-            this.PaintBar(app, pct);
         }
     }
 

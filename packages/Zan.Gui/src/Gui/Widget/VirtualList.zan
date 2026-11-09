@@ -90,9 +90,44 @@ public class VirtualList : Control {
         prefH = app.Scale(160);
     }
 
-    // 覆写：在自身矩形内做虚拟化绘制（见 Render）。
+    // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bw, bh) 统一渲染。
     public override void OnPaint(App app) {
-        this.Render(app, bx, by, bw, bh);
+        int id = this.CommonId();
+        SyncBinding();
+        app.focus.RegisterFocusable(id);
+        app.hitTester.RegisterRect(id, bx, by, bw, bh, 0);
+
+        int rh = this.ResolveRowH(app);
+        int n = this.Count();
+        int contentH = n * rh;
+        this.viewportArea.Set(bx + 1, by + 1, bw - 2, bh - 2);
+        Rect area = this.viewportArea;
+        int dy = scroll.Begin(app, area, contentH);
+        bool templated = rowAt != null;
+
+        int first = dy / rh;
+        if (first < 0) { first = 0; }
+        int visible = area.height / rh + 2;
+        int last = first + visible;
+        if (last > n) { last = n; }
+        if (templated) { this.BuildVisible(app, first, last); }
+
+        int rowW = area.width;
+        if (scroll.Overflowing()) { rowW = rowW - 12; }
+        if (rowW < 0) { rowW = 0; }
+
+        int i = first;
+        while (i < last) {
+            int ry = area.y + i * rh - dy;
+            if (templated && i - first < children.Count) {
+                Control row = children[i - first];
+                row.Arrange(area.x, ry, rowW, rh);
+                row.visible = true;
+            }
+            i = i + 1;
+        }
+        scroll.End(app, area);
+        On.Fire(app, id, this);
     }
 
     // 每行独占的 WidgetId 数：够放一行十来个控件还有余。
@@ -200,153 +235,4 @@ public class VirtualList : Control {
         }
     }
 
-    // 渲染视口、可见行与滚动条，并处理滚轮/拖动/悬停/选择；
-    // 作为控件树子节点时经 OnPaint 每帧调用。
-    public void Render(App app, int x, int y, int w, int h) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        StyleBox root = this.BareBox(app, this.StyleType(), Style.SNormal());
-        StyleBox divider = Style.Part(app, "virtuallist", "divider", "", "", "",
-                                      Style.SNormal());
-        int rowFont = root.FontOr(Style.FontFallback(app, "medium"));
-
-        c.SurfaceRoundRect(x, y, w, h, root.RadiusOr(t.borderRadiusMedium),
-                           root.BgOr(0), root.BorderOr(0), root.BorderWOr(1));
-
-        int rh = this.ResolveRowH(app);
-        int n = this.Count();
-        int contentH = n * rh;
-
-        this.viewportArea.Set(x + 1, y + 1, w - 2, h - 2);
-        Rect area = this.viewportArea;
-        int dy = scroll.Begin(app, area, contentH);
-        int accent = app.Scale(3);
-        bool templated = rowAt != null;
-
-        // 只遍历与视口相交的行。
-        int first = dy / rh;
-        if (first < 0) { first = 0; }
-        int visible = area.height / rh + 2;
-        int last = first + visible;
-        if (last > n) { last = n; }
-        if (templated) { this.BuildVisible(app, first, last); }
-
-        // 滚动条沟槽：模板行不排进去。
-        int rowW = area.width;
-        if (scroll.Overflowing()) { rowW = rowW - app.Scale(12); }
-        if (rowW < 0) { rowW = 0; }
-
-        // 将行裁剪到视口，使边缘处多画/画一半的行
-        // 不会渗出带边框的区域。
-        c.PushClip(area.x, area.y, area.width, area.height);
-        bool tipSeen = false;
-        int i = first;
-        while (i < last) {
-            int ry = area.y + i * rh - dy;
-            bool over = app.mouseX >= area.x && app.mouseX < area.x + rowW
-                && app.mouseY >= ry && app.mouseY < ry + rh
-                && app.mouseY >= area.y && app.mouseY < area.y + area.height;
-            bool isSel = i == selected;
-
-            if (templated) {
-                Control row = children[i - first];
-                row.Arrange(area.x, ry, rowW, rh);
-                row.visible = true;
-                // 行矩形登记进命中区：行内子控件在本行之后才绘制、
-                // 矩形叠在其上，点击解析（按上一帧完整命中区）会把
-                // 子控件上的点击判给子控件，行只收到空白处的点击。
-                int rid = app.focus.AllocId();
-                app.hitTester.RegisterRect(rid, area.x, ry, rowW, rh, 0);
-                if (app.focus.IsHovered(rid)) { over = true; }
-                if (app.ClickTarget() == rid && app.ClickAvailable()) {
-                    selected = i;
-                    activated = i;
-                    app.NoteDamage(x, y, w, h);
-                    app.window.Wake();
-                }
-            }
-
-            // 行底色走皮肤 state:: 调色板：悬停 hover、选中 selected
-            // （常态不填，透出面板底）；选中行左缘再补一条主色轨道。
-            if (isSel || over) {
-                c.FillRect(area.x, ry, rowW, rh,
-                    Style.Part(app, "state", "surface", "", "", "",
-                        isSel ? Style.SSelected() : Style.SHover()).BgOr(0));
-            }
-            if (isSel) {
-                c.FillRect(area.x, ry, accent, rh,
-                    Style.Part(app, "state", "accent", "", "", "",
-                        Style.SNormal()).BgOr(0));
-            }
-            if (i > 0) { c.FillRect(area.x, ry, rowW, 1, divider.BgOr(0)); }
-
-            if (!templated) {
-                int tc = Style.Part(app, "state", "label", "", "", "",
-                    isSel ? Style.SSelected() : Style.SNormal()).FgOr(0);
-                int ty = Canvas.CenterTextY(ry, rh, rowFont);
-                c.DrawText(area.x + t.paddingLarge, ty,
-                    Ellipsis.Fit(items[i], rowW - t.paddingLarge * 2, rowFont),
-                    tc, rowFont);
-                // 放不下被截断的行：悬停片刻弹出完整文本，
-                // 计时器在指针换行/离开时重置；等待期间持续
-                // 请求该行重绘，让计时器有帧可用。
-                if (over && items[i].Length > 0
-                    && Canvas.MeasureText(items[i], rowFont) > rowW - t.paddingLarge * 2) {
-                    int tipNowMs = Window.GetTickMs();
-                    if (this.tipIdx != i) {
-                        this.tipIdx = i;
-                        this.tipSinceMs = tipNowMs;
-                    }
-                    if (tipNowMs - this.tipSinceMs < Tooltip.DefaultDelayMs()) {
-                        app.RequestAnimationFrameIn(0, area.x, ry, rowW, rh);
-                    } else {
-                        Tooltip.RequestBox(app, area.x, ry, rowW, rh, items[i],
-                                           Tooltip.Bottom(), app.Scale(280));
-                    }
-                    tipSeen = true;
-                }
-            }
-            i = i + 1;
-        }
-        c.PopClip();
-        if (!tipSeen) { this.tipIdx = 0 - 1; }
-
-        // 空态：列表没有条目时给一句提示，而不是一片空白。
-        if (n == 0) {
-            StyleBox sHint = Style.Part(app, "virtuallist", "hint", "", "", "",
-                                        Style.SNormal());
-            c.DrawTextCentered(area.x, area.y, area.width, area.height,
-                               "暂无数据  No items", sHint.FgOr(0),
-                               Style.FontFallback(app, "small"));
-        }
-
-        scroll.End(app, area);
-
-        // 行选择（在视口内点击）；模板行已在上面经命中区处理，
-        // 这里只剩字符串行的按坐标选择。
-        bool leftUp = app.ClickAvailable() && app.window.EventButton() == 0;
-        bool inArea = app.mouseX >= area.x && app.mouseX < area.x + area.width
-            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
-        if (leftUp && inArea && !templated) {
-            if (!scroll.Overflowing()) {
-                this.HitSelect(app, area, rh, dy);
-            } else {
-                // 忽略落在滚动条沟槽上的点击。
-                int gutter = area.x + area.width - app.Scale(12);
-                if (app.mouseX < gutter) {
-                    this.HitSelect(app, area, rh, dy);
-                }
-            }
-        }
-    }
-
-    // 字符串行按坐标选中：由点击 y 与滚动量算出行号并记为选中/激活。
-    private void HitSelect(App app, Rect area, int rh, int dy) {
-        int idx = (app.mouseY - area.y + dy) / rh;
-        if (idx >= 0 && idx < items.Count) {
-            selected = idx;
-            activated = idx;
-            app.RequestRedraw();
-        }
-    }
 }

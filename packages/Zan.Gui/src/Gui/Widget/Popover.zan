@@ -5,28 +5,22 @@ using Gui;
 namespace Gui.Widget;
 
 // 气泡卡片（Popover）：标准声明式浮层组件。
-// 点击触发器后在锚点下方（空间不足时自动上翻）弹出内容卡片，
-// 统一接入 OverlayHost 生命周期，天然置于顶层、具备外部点击自动关闭，
-// 彻底消灭手工 BlockHitsBelow、BlockHitsRect 与画布三角形手绘。
-public class Popover : Control {
+// 继承自统一的 PopupControl 浮层基类，接入 OverlayHost 生命周期，
+// 天然置于顶层并具备外部点击自动关闭。
+public class Popover : PopupControl {
     private string trigLabel;
     private string title;
     private string body;
     private int panelW;
-    private int trigId;
-    private SignalBool open;
-    private Card popupCard;
+    public int trigId { get { return this.triggerId; } set { this.triggerId = value; } }
 
     // 初始化：以 "popover" 注册，置触发文本/标题/正文/面板宽并保持关闭。
     private void InitPopover(string trig, string ti, string bo, int w) {
-        this.InitControl("popover", 1);
-        trigLabel = trig;
-        title = ti;
-        body = bo;
-        panelW = w > 0 ? w : 260;
-        trigId = WidgetId.Next();
-        open = new SignalBool(false);
-        popupCard = null;
+        this.InitPopup("popover", w > 0 ? w : 260, 0);
+        this.trigLabel = trig;
+        this.title = ti;
+        this.body = bo;
+        this.panelW = w > 0 ? w : 260;
     }
 
     public Popover() {
@@ -41,73 +35,17 @@ public class Popover : Control {
         InitPopover(trig, ti, bo, w);
     }
 
-    public bool IsOpen() { return open.Get(); }
-
-    private void EnsurePopupCard(App app) {
-        if (popupCard == null) {
-            popupCard = new Card(title);
-            popupCard.Class = "popover-card";
-            if (body != "") {
-                Label lbl = new Label(body);
-                lbl.wrap = true;
-                popupCard.With(lbl);
-            }
+    // 覆写默认浮层构造：生成 Popover 专属的卡片与文本子树
+    public override Control BuildDefaultPopup(App app) {
+        Card card = new Card(title);
+        card.Class = "popover-card";
+        if (body != "") {
+            Label lbl = new Label(body);
+            lbl.wrap = true;
+            card.With(lbl);
         }
-        popupCard.prefW = panelW;
-        if (app != null) {
-            popupCard.OnMeasure(app);
-        }
-    }
-
-    public void SetOpen(bool want) {
-        if (open.Get() == want) { return; }
-        open.Set(want);
-        App a = this.FindApp();
-        if (a == null) { a = App.FrameApp(); }
-        if (want) {
-            this.EnsurePopupCard(a);
-            OverlayHost.ShowPopup(a, this, popupCard);
-        } else {
-            OverlayHost.DismissPopup();
-        }
-        if (a != null && a.window != null) { a.window.Wake(); }
-    }
-
-    public override void OnPopupDismissed() {
-        if (open.Get()) {
-            open.Set(false);
-            App a = this.FindApp();
-            if (a != null && a.window != null) { a.window.Wake(); }
-        }
-    }
-
-    // 插槽支持：支持通过 slot="popup" 挂载任意复杂组件作为气泡内容
-    public override bool MountSlot(string slot, Control c) {
-        if (slot == "popup" || slot == "content" || slot == "body") {
-            if (c is Card) {
-                this.popupCard = (Card)c;
-            } else {
-                this.popupCard = new Card("");
-                this.popupCard.Class = "popover-card";
-                this.popupCard.With(c);
-            }
-            if (!children.Contains(this.popupCard)) {
-                this.Add(this.popupCard);
-            }
-            return true;
-        }
-        return base.MountSlot(slot, c);
-    }
-
-    // 绘制触发器并处理点击开合；返回触发器 id。
-    public int Render(App app, int x, int y, int w, int h) {
-        DropdownChrome.PaintTrigger(app, trigId, x, y, w, h, trigLabel, open.Get());
-        app.focus.RegisterFocusable(trigId);
-
-        if (Ui.Clicked(app, trigId)) {
-            this.SetOpen(!open.Get());
-        }
-        return trigId;
+        card.prefW = panelW;
+        return card;
     }
 
     // 覆写：设计器属性（触发文本/标题/正文/面板宽/开合缺省）。
@@ -141,28 +79,17 @@ public class Popover : Control {
         prefW = app != null ? app.Scale(120) : 120;
     }
 
-    // 覆写：在自身矩形内画触发器并处理点击开合。
-    public override void OnPaint(App app) {
-        this.Render(app, bx, by, bw, bh);
+    public override void OnClick(RoutedEventArgs e) {
+        this.ToggleOpen();
+        App a = this.FindApp();
+        if (a != null) { a.RequestRedraw(); }
+        e.Handle();
     }
 
-    // 立即模式兼容版本：可见性由调用方管理。
-    public static void Render(App app, int anchorX, int anchorY, int w, int h,
-                              string title, string body) {
-        if (app == null) { return; }
-        Card card = new Card(title);
-        card.Class = "popover-card";
-        if (body != "") {
-            Label lbl = new Label(body);
-            lbl.wrap = true;
-            card.With(lbl);
-        }
-        card.prefW = w > 0 ? w : 260;
-        card.OnMeasure(app);
-        int popH = card.prefH > 0 ? card.prefH : app.Scale(120);
-        int popX = OverlayPopup.FitX(app, anchorX - w / 2, card.prefW);
-        int popY = OverlayPopup.FitY(app, anchorY + app.Scale(4), h, popH);
-        card.Arrange(popX, popY, card.prefW, popH);
-        card.RenderTree(app);
+    // 覆写：在自身矩形内画触发器。
+    public override void OnPaint(App app) {
+        int id = this.CommonId();
+        DropdownChrome.PaintTrigger(app, id, bx, by, bw, bh, trigLabel, open.Get());
+        app.focus.RegisterFocusable(id);
     }
 }

@@ -3,65 +3,52 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 手风琴（NaiveUI n-collapse）。同时只展开一个面板；`Active` 保存
-// 展开面板的索引（-1 = 全部折叠），可双向绑定：
-// c.Active = vm.openPanel;
+// 折叠面板（手风琴）：纯 Flex 纵向容器，由 CollapseItem 声明式子节点构成。
+// 彻底物理消除手算高度、Canvas.DrawText、Canvas.FillRect 与逐帧手动 Arrange。
 public class Collapse : Control {
-    // 面板列表（AddPanel 追加，旧纯文本兼容）。
-    public List<CollapsePanel> panels;
-    // 现代组件化子项列表（AddItem 追加，支持任意复杂组件互嵌）。
-    public List<CollapseItem> items;
-    // 内部展开索引信号（-1 = 全折叠），与 Active 双向同步。
     public SignalInt open;
-    // 双向绑定的展开索引；-1 折叠所有面板。
     public Binding<int> Active;
-    // 点击标题切换展开面板时触发。
     public UiEvent Change;
-    private int baseId;
-    private int idCount;
-    // 折叠箭头位置：left / right（Naive UI arrow-placement）。
-    public string arrowPlacement;
-    // true=accordion 模式（同时只开一个），false=可同时多开
-    // （Naive UI expandX / accordion 取反语义）。
-    public bool expander;
+    public bool Accordion;
 
-    // 初始化：共享展开索引信号（-1 = 全折叠），默认手风琴、箭头居左。
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 1; } // flex-direction: column
+
     private void InitCollapse(SignalInt m) {
         this.InitControl("collapse", 1);
-        panels = new List<CollapsePanel>();
-        items = new List<CollapseItem>();
-        open = m;
-        baseId = 0;
-        idCount = 0;
+        open = m != null ? m : new SignalInt(0 - 1);
+        Accordion = true;
         wiresOwnEvents = true;
         Change = new UiEvent();
-        arrowPlacement = "left";
-        expander = true;
     }
 
-    // 空手风琴（之后 AddPanel 或 AddItem）。
-    public Collapse() { InitCollapse(new SignalInt(0 - 1)); }
-
-    // 共享展开索引信号（-1 = 全折叠）。
+    public Collapse() { InitCollapse(null); }
     public Collapse(SignalInt m) { InitCollapse(m); }
 
-    // 追加一个面板（标题 + 正文文本）。
-    public void AddPanel(string title, string body) {
-        panels.Add(new CollapsePanel(title, body));
-    }
-
-    // 追加一个已构建的面板记录。
-    public void AddPanel(CollapsePanel panel) { panels.Add(panel); }
-
-    // 追加一个现代组件化面板（支持任意组件互嵌）
     public void AddItem(CollapseItem item) {
         if (item == null) { return; }
-        if (!items.Contains(item)) { items.Add(item); }
-        if (!children.Contains(item)) { this.Children.Add(item); }
+        int idx = this.children.Count;
+        item.Toggle.Add(() => {
+            if (item.IsExpanded && Accordion) {
+                // 手风琴模式：收起其他项
+                for (int i = 0; i < this.children.Count; i = i + 1) {
+                    if (this.children[i] is CollapseItem && i != idx) {
+                        ((CollapseItem)this.children[i]).SetExpanded(false);
+                    }
+                }
+            }
+            if (open != null) {
+                open.Set(item.IsExpanded ? idx : (0 - 1));
+            }
+            if (Active != null) {
+                Active.Set(item.IsExpanded ? idx : (0 - 1));
+            }
+            if (Change != null) { Change.RaiseS(this); }
+        });
+        this.Add(item);
     }
 
     public override Control Add(Control child) {
-        if (child == null) { return null; }
         if (child is CollapseItem) {
             this.AddItem((CollapseItem)child);
             return child;
@@ -69,274 +56,35 @@ public class Collapse : Control {
         return base.Add(child);
     }
 
-    public List<CollapseItem> GetItems() { return this.items; }
-
-    // 基于现有面板记录构建手风琴。
-    public static Collapse Of(List<CollapsePanel> items, SignalInt m) {
-        Collapse col = new Collapse(m);
-        for (int i = 0; i < items.Count; i = i + 1) {
-            col.AddPanel(items[i]);
-        }
-        return col;
-    }
-
-    // 面板标题行高（主题 heightLarge，部件样式可覆盖）。
-    public static int HeaderHeight(App app) {
-        return app.theme.heightLarge;
-    }
-
-    // 展开面板正文行高（同上）。
-    public static int BodyHeight(App app) {
-        return app.theme.heightLarge;
-    }
-
-    // 总高度：count 个标题行 + 展开时一行正文。
-    public static int Height(App app, int count, SignalInt openIdx) {
-        int h = count * Collapse.HeaderHeight(app);
-        if (openIdx.Get() >= 0) { h = h + Collapse.BodyHeight(app); }
-        return h;
-    }
-
-    // 每个面板标题占一个 id，作为连续块预留，使
-    // 面板列表不变时点击 id 保持稳定。
-    private void EnsureIds() {
-        int cnt = items.Count > 0 ? items.Count : panels.Count;
-        if (idCount >= cnt) { return; }
-        baseId = WidgetId.Block(cnt);
-        idCount = cnt;
-    }
-
-    // 覆写：把 Active 绑定的值拉入本地展开信号（model -> UI）。
     public override void SyncBinding() {
+        base.SyncBinding();
         if (Active == null) { return; }
         int cur = Active.Get();
-        if (cur != open.Get()) { open.Set(cur); }
-    }
-
-    // 覆写：高 = 标题行数 x 行高 +（有展开面板时）正文行高，宽缺省 240。
-    public override void OnMeasure(App app) {
-        StyleBox s = this.ResolveStyleAs(app, "collapse", Class,
-                                         Style.SNormal());
-        StyleBox hs = this.ResolvePartAs(app, "collapse", "header", "",
-                                         Class, Style.SNormal());
-        StyleBox bs = this.ResolvePartAs(app, "collapse", "body", "",
-                                         Class, Style.SNormal());
-        int headerH = hs.HeightOr(Collapse.HeaderHeight(app));
-        int bodyH = bs.HeightOr(Collapse.BodyHeight(app));
-        int opened = open.Get();
-        if (Active != null) { opened = Active.Get(); }
-
-        int totalH = 0;
-        if (items.Count > 0) {
-            totalH = items.Count * headerH;
-            if (opened >= 0 && opened < items.Count) {
-                CollapseItem cur = items[opened];
-                Control content = cur.GetContent();
-                if (content != null) {
-                    content.OnMeasure(app);
-                    int ch = content.prefH > 0 ? content.prefH + app.theme.paddingSmall * 2 : bodyH;
-                    totalH = totalH + ch;
-                } else {
-                    totalH = totalH + bodyH;
-                }
-            }
-        } else {
-            totalH = panels.Count * headerH + (opened >= 0 ? bodyH : 0);
-        }
-        prefH = totalH;
-        prefW = s.WidthOr(app.Scale(240));
-    }
-
-    // 覆写：画各面板标题行（箭头 + 标题 + 分隔线）与展开面板正文，
-    // 处理点击展开/折叠并写回 Active 绑定。
-    public override void OnPaint(App app) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        this.SyncBinding();
-        this.EnsureIds();
-        string origClass = Class;
-        if (arrowPlacement == "right") { this.AddClass("arrow-right"); }
-        StyleBox hs = this.ResolvePartAs(app, "collapse", "header", "", Class,
-                                         Style.SNormal());
-        StyleBox as2 = this.ResolvePartAs(app, "collapse", "arrow", "", Class,
-                                          Style.SNormal());
-        StyleBox bs = this.ResolvePartAs(app, "collapse", "body", "", Class,
-                                         Style.SNormal());
-        StyleBox ds = this.ResolvePartAs(app, "collapse", "divider", "",
-                                         Class, Style.SNormal());
-        int headerH = hs.HeightOr(Collapse.HeaderHeight(app));
-        int bodyH = bs.HeightOr(Collapse.BodyHeight(app));
-        int headFont = hs.FontOr(Style.FontFallback(app, "medium"));
-        int bodyFont = bs.FontOr(Style.FontFallback(app, "small"));
-        int ico = as2.WidthOr(t.iconSizeSmall);
-        int n = items.Count > 0 ? items.Count : panels.Count;
-        int opened = open.Get();
-        int cy = by;
-
-        c.PushClip(bx, by, bw, bh);
-        for (int i = 0; i < n; i = i + 1) {
-            string pTitle = "";
-            string pBody = "";
-            Control extra = null;
-            Control content = null;
-            if (items.Count > 0) {
-                CollapseItem ci = items[i];
-                pTitle = ci.Title();
-                pBody = ci.BodyText();
-                extra = ci.GetExtra();
-                content = ci.GetContent();
-            } else {
-                CollapsePanel panel = panels[i];
-                pTitle = panel.title;
-                pBody = panel.body;
-            }
-
-            int id = baseId + i;
-            bool isOpen = i == opened;
-            if (i > 0) { c.FillRect(bx, cy, bw, 1, ds.bg); }
-            int hbg = hs.bg;
-            if (app.focus.IsHovered(id)) {
-                hbg = this.ResolvePartAs(app, "collapse", "header", "",
-                                         Class, Style.SHover()).bg;
-            }
-            c.FillRect(bx, cy + 1, bw, headerH - 1, hbg);
-
-            string ar = "chevron-right";
-            if (isOpen) { ar = "chevron-down"; }
-            c.DrawGlyph(ar, bx + t.paddingMedium, cy + (headerH - ico) / 2, ico,
-                        as2.fg);
-
-            int textX = bx + t.paddingMedium + ico + t.gapMedium;
-            int textMaxW = bx + bw - t.paddingMedium - textX;
-
-            if (extra != null) {
-                extra.OnMeasure(app);
-                int ew = extra.prefW > 0 ? extra.prefW : app.Scale(60);
-                int eh = extra.prefH > 0 ? extra.prefH : headerH - t.paddingSmall * 2;
-                extra.Arrange(bx + bw - t.paddingMedium - ew, cy + (headerH - eh) / 2, ew, eh);
-                textMaxW = textMaxW - ew - t.gapSmall;
-                if (textMaxW < 0) { textMaxW = 0; }
-            }
-
-            c.DrawText(textX, Canvas.CenterTextY(cy, headerH, headFont),
-                       Ellipsis.Fit(pTitle, textMaxW, headFont),
-                       hs.fg, headFont);
-
-            app.hitTester.RegisterRect(id, bx, cy, bw, headerH, 0);
-            cy = cy + headerH;
-
-            if (isOpen) {
-                if (content != null) {
-                    content.OnMeasure(app);
-                    int curBodyH = content.prefH > 0 ? content.prefH + t.paddingSmall * 2 : bodyH;
-                    c.FillRect(bx, cy, bw, curBodyH, bs.bg);
-                    content.Arrange(textX, cy + t.paddingSmall, textMaxW, curBodyH - t.paddingSmall * 2);
-                    cy = cy + curBodyH;
-                } else {
-                    c.FillRect(bx, cy, bw, bodyH, bs.bg);
-                    c.DrawText(textX,
-                               Canvas.CenterTextY(cy, bodyH, bodyFont),
-                               Ellipsis.Fit(pBody, textMaxW, bodyFont),
-                               bs.fg, bodyFont);
-                    cy = cy + bodyH;
+        if (cur != open.Get()) {
+            open.Set(cur);
+            for (int i = 0; i < this.children.Count; i = i + 1) {
+                if (this.children[i] is CollapseItem) {
+                    ((CollapseItem)this.children[i]).SetExpanded(i == cur);
                 }
             }
         }
-        c.PopClip();
-
-        if (this.IsDisabled() || app.EventKind() != 3) { return; }
-        int hit = app.ClickTarget();
-        if (hit < baseId || hit >= baseId + n) { return; }
-        int idx = hit - baseId;
-        if (expander) {
-            if (open.Get() == idx) { idx = 0 - 1; }
-        }
-        open.Set(idx);
-        if (Active != null) { Active.Set(idx); }
-        Change.RaiseS(this);
-        app.RequestRedraw();
-        Class = origClass;
     }
 
-    // ---- 设计器 / 序列化模型 ----
-
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "Collapse"; }
 
-    // 覆写：返回设计器属性清单（标题 / 正文 / 展开项 / 箭头位置 / 多开）。
-    public override List<PropSpec> Props() {
-        List<PropSpec> ps = new List<PropSpec>{
-            PropSpec.Text("titles", "Panel titles (comma separated)"),
-            PropSpec.Text("bodies", "Panel bodies (comma separated)") };
-        PropSpec act = PropSpec.Int("active", "Open panel (-1 = none)");
-        // 属性通道优先指向活的外部绑定（§6.1 单协议）。
-        if (Active != null) { act.num = Active; } else { act.snum = open; }
-        ps.Add(act);
-        PropSpec ap = PropSpec.Enum("arrowPlacement", "Arrow placement",
-            new List<string>{ "left", "right" });
-        ap.str = arrowPlacement;
-        ps.Add(ap);
-        PropSpec multi = PropSpec.Bool("expandable", "Expandable (multi)");
-        multi.flag = expander;
-        multi.WithTip("Allow multiple panels open simultaneously (Naive UI accordion=off).");
-        ps.Add(multi);
-        return ps;
-    }
-
-    // 设计器额外键：`titles`/`bodies` 以逗号分隔文本与面板列表
-    // 互相转换（运行时实体仍是 CollapsePanel 列表）。
-    public override string GetExtra(string key) {
-        List<string> values = new List<string>();
-        for (int i = 0; i < panels.Count; i = i + 1) {
-            if (key == "titles") { values.Add(panels[i].title); }
-            else if (key == "bodies") { values.Add(panels[i].body); }
-            else { return ""; }
-        }
-        return string.Join(",", values);
-    }
-
-    // 设计器写入 `titles`/`bodies`（逗号分隔）；其他键返回 false。
-    public override bool SetExtra(string key, string val) {
-        if (key != "titles" && key != "bodies") { return false; }
-        List<string> values = val.Split(",");
-        List<CollapsePanel> next = new List<CollapsePanel>();
-        int count = panels.Count;
-        if (values.Count > count) { count = values.Count; }
-        for (int i = 0; i < count; i = i + 1) {
-            string title = "";
-            string body = "";
-            if (i < panels.Count) {
-                title = panels[i].title;
-                body = panels[i].body;
-            }
-            if (i < values.Count) {
-                if (key == "titles") { title = values[i]; }
-                else { body = values[i]; }
-            }
-            next.Add(new CollapsePanel(title, body));
-        }
-        panels = next;
-        return true;
-    }
-
-    // 覆写：公共事件之外提供 "Change"。
     public override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Change");
         return e;
     }
 
-    // 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
-
 }

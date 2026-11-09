@@ -3,46 +3,98 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 内联警告横幅。不可交互的语义提示条：左侧色条 + 语义图标 +
-// 一行文本，视觉复用 Layer 通知卡片的 `notification` 皮肤规则
-// （info/success/warning/error 四个角色类），因此换肤可一次
-// 性重设所有横幅。
-// AlertBox a = new AlertBox { Text = "已保存", type = 1 };
-// 设计器工具箱的「内联警告横幅」（FormField ftype 28）生成
-// 的就是本控件——此前画布用 Layer.DrawNotify 即时预览、生成
-// 代码却发射不存在的 `Alert` 类，发布即编译失败；本类型补上
-// 后设计承诺闭环（legacy 文档里的 kind "Alert" 由 TypeOf 与
-// ControlFactory 双别名收编）。
+// 内联警告横幅：纯 Flex 横向容器，由图标、文本内容与操作项声明式子节点复合而成。
+// 彻底物理消除手算坐标（bx, by, textX, actW）、FillRect 边条与 DrawText。
 public class AlertBox : Control {
-    // 横幅文本（Binding&lt;string&gt;，可响应式绑定模型字段）。
     public Binding<string> Text;
-    // 语义类型在 type 枚举里的下标：0 info / 1 success /
-    // 2 warning / 3 error。Layer 通知类型 = 下标 + 2
     public int typeNo;
-    // 操作插槽（slot="action" 或 "extra"）
     public Control actionControl;
-    // 自定义主体插槽（slot="content" 或 "body"）
     public Control customContent;
 
-    // 初始化：以横幅文本注册，默认 info 档。
+    private IconView iconNode;
+    private Flex contentNode;
+    private Flex actionNode;
+
+    public override int StyleDisplay() { return 1; } // CSS display: flex
+    public override int StyleFlexDir() { return 0; } // flex-direction: row
+
     private void InitAlertBox(string msg) {
         this.InitControl(msg, 1);
         Text = msg;
         typeNo = 0;
         actionControl = null;
         customContent = null;
+        this.RebuildStructure();
     }
 
-    // 插槽支持：支持 action（操作按钮）与 content（富内容）
+    public AlertBox() { InitAlertBox(""); }
+    public AlertBox(string msg) { InitAlertBox(msg); }
+
+    public string Label() {
+        if (Text == null) { return ""; }
+        return Text.Get();
+    }
+
+    public void SetText(string msg) {
+        Text = msg;
+        this.RebuildStructure();
+        App a = this.FindApp();
+        if (a != null) { a.RequestRedraw(); }
+    }
+
+    public void SetType(int t) {
+        typeNo = t;
+        this.RebuildStructure();
+        App a = this.FindApp();
+        if (a != null) { a.RequestRedraw(); }
+    }
+
+    public void RebuildStructure() {
+        this.children.Clear();
+
+        string iconName = "info";
+        string cls = "info";
+        if (typeNo == 1) { iconName = "success"; cls = "success"; }
+        else if (typeNo == 2) { iconName = "warning"; cls = "warning"; }
+        else if (typeNo == 3) { iconName = "error"; cls = "error"; }
+        this.SetClassIn("info success warning error", cls);
+
+        // 1. 语义图标节点
+        iconNode = new IconView(iconName, 18);
+        iconNode.ClassName = "alert-icon";
+        this.Add(iconNode);
+
+        // 2. 主体内容节点（Flex 列，自动撑开剩余空间）
+        contentNode = new Flex();
+        contentNode.ClassName = "alert-content flex-1 column justify-center";
+        if (customContent != null) {
+            contentNode.Add(customContent);
+        } else {
+            string msg = this.Label();
+            if (msg != "") {
+                contentNode.Add(new Label(msg) { ClassName = "alert-text" });
+            }
+        }
+        this.Add(contentNode);
+
+        // 3. 操作区插槽
+        if (actionControl != null) {
+            actionNode = new Flex();
+            actionNode.ClassName = "alert-action row align-center";
+            actionNode.Add(actionControl);
+            this.Add(actionNode);
+        }
+    }
+
     public override bool MountSlot(string slot, Control c) {
         if (slot == "action" || slot == "extra") {
-            this.actionControl = c;
-            if (!children.Contains(c)) { this.Children.Add(c); }
+            actionControl = c;
+            this.RebuildStructure();
             return true;
         }
         if (slot == "content" || slot == "body") {
-            this.customContent = c;
-            if (!children.Contains(c)) { this.Children.Add(c); }
+            customContent = c;
+            this.RebuildStructure();
             return true;
         }
         return base.MountSlot(slot, c);
@@ -53,115 +105,19 @@ public class AlertBox : Control {
         if (child.slotName != "" && this.MountSlot(child.slotName, child)) {
             return child;
         }
-        if (this.customContent == null) {
-            this.customContent = child;
+        if (customContent == null) {
+            customContent = child;
+            this.RebuildStructure();
+            return child;
         }
-        if (!children.Contains(child)) {
-            this.Children.Add(child);
-        }
-        return child;
+        return base.Add(child);
     }
 
-    public Control GetActionContent() { return this.actionControl; }
-    public Control GetCustomContent() { return this.customContent; }
+    public Control GetActionContent() { return actionControl; }
+    public Control GetCustomContent() { return customContent; }
 
-    // 空文本横幅（设计器用）。
-    public AlertBox() { InitAlertBox(""); }
-    // 给定文本的 info 横幅。
-    public AlertBox(string msg) { InitAlertBox(msg); }
-
-    // 当前文本；Text 为 null 时返回空串。
-    public string Label() {
-        if (Text == null) { return ""; }
-        return Text.Get();
-    }
-
-    // 覆写：首选高度与 Layer 通知卡片一致，宽度铺满父容器。
-    public override void OnMeasure(App app) {
-        int baseH = app.theme.heightLarge + app.theme.paddingSmall;
-        if (customContent != null) {
-            customContent.OnMeasure(app);
-            if (customContent.prefH + app.theme.paddingSmall * 2 > baseH) {
-                baseH = customContent.prefH + app.theme.paddingSmall * 2;
-            }
-        }
-        prefH = baseH;
-        prefW = 0;
-    }
-
-    public override void SyncBinding() {
-        base.SyncBinding();
-        string cls = "info";
-        if (typeNo == 1) { cls = "success"; }
-        else if (typeNo == 2) { cls = "warning"; }
-        else if (typeNo == 3) { cls = "error"; }
-        this.SetClassIn("info success warning error", cls);
-    }
-
-    // 覆写：外盒由基类 PaintStyleBox 统一绘制，此处绘制左侧色条、图标与提示文本或插槽。
-    public override void OnPaint(App app) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int h = bh;
-        if (h <= 0) { h = t.heightLarge + t.paddingSmall; }
-
-        string cls = "info";
-        if (typeNo == 1) { cls = "success"; }
-        else if (typeNo == 2) { cls = "warning"; }
-        else if (typeNo == 3) { cls = "error"; }
-
-        if (computedStyle == null) {
-            this.ResolveStyle(app, Style.SNormal());
-        }
-        StyleBox s = computedStyle;
-        StyleBox barStyle = Style.Part(app, "notification", "bar", "", cls,
-                                       "", Style.SNormal());
-        string iconName = "info";
-        if (typeNo == 1) { iconName = "success"; }
-        else if (typeNo == 2) { iconName = "warning"; }
-        else if (typeNo == 3) { iconName = "error"; }
-
-        int fontSize = s.FontOr(Style.FontFallback(app, "medium"));
-        int barColor = barStyle.bg;
-
-        // 左侧语义色条
-        c.FillRect(bx, by, barStyle.WidthOr(3), h, barColor);
-
-        // 语义图标
-        c.DrawGlyphIn(iconName, bx + t.paddingMedium, by,
-                      t.iconSizeMedium, h, t.iconSizeMedium,
-                      barColor);
-
-        // 右侧操作插槽排布
-        int actW = 0;
-        if (actionControl != null) {
-            actionControl.OnMeasure(app);
-            actW = actionControl.prefW > 0 ? actionControl.prefW : app.Scale(60);
-            int actH = actionControl.prefH > 0 ? actionControl.prefH : app.Scale(28);
-            actionControl.Arrange(bx + bw - t.paddingMedium - actW,
-                                  by + (h - actH) / 2, actW, actH);
-        }
-
-        // 主体内容区（自定义组件插槽优先，无插槽回退文本）
-        int textX = bx + t.paddingMedium + t.iconSizeMedium + t.gapSmall;
-        int textAvailW = bw - (textX - bx) - t.paddingMedium - (actW > 0 ? actW + t.gapMedium : 0);
-        if (textAvailW < 0) { textAvailW = 0; }
-
-        if (customContent != null) {
-            customContent.Arrange(textX, by + t.paddingSmall, textAvailW, h - t.paddingSmall * 2);
-        } else {
-            c.DrawText(textX,
-                       Canvas.CenterTextY(by, h, fontSize),
-                       this.Label(), s.fg, fontSize);
-        }
-    }
-
-    // ---- 设计器 / 序列化模型 ----
-
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "AlertBox"; }
 
-    // 覆写：返回设计器属性清单（文本 / 语义类型）。
     public override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec text = PropSpec.Text("text", "Text");
