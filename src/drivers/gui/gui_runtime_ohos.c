@@ -925,6 +925,42 @@ EXPORT i32 zan_gui_notification_send(const char *title, const char *body, const 
     // 鸿蒙 NDK OH_Notification_PublishNotification 调度出口
     return 0;
 }
+
+static int g_network_type = 1; // 默认 1: Wifi
+static int g_dark_mode = 0;    // 默认 0: 浅色模式
+static int g_permissions[8] = { 0, 0, 0, 0, 0, 0, 0, 0 }; // 默认 0: Granted
+
+EXPORT i32 zan_gui_network_type(void) { return g_network_type; }
+EXPORT void zan_gui_set_network_type(i32 type) { if (type >= 0 && type <= 3) g_network_type = (int)type; }
+
+EXPORT i32 zan_gui_is_dark_mode(void) { return g_dark_mode; }
+EXPORT void zan_gui_set_dark_mode(i32 dark) { g_dark_mode = dark ? 1 : 0; }
+
+EXPORT i32 zan_gui_share_text(const char *text, const char *title) {
+    (void)text; (void)title;
+    return 0;
+}
+
+EXPORT i32 zan_gui_pick_file(const char *filter, char *out_path, i32 max_len) {
+    (void)filter;
+    if (!out_path || max_len <= 0) return -1;
+    out_path[0] = '\0';
+    return 0;
+}
+
+EXPORT i32 zan_gui_permission_check(i32 perm_type) {
+    if (perm_type >= 0 && perm_type < 8) return g_permissions[perm_type];
+    return 1; // Denied
+}
+
+EXPORT i32 zan_gui_permission_request(i32 perm_type) {
+    if (perm_type >= 0 && perm_type < 8) return g_permissions[perm_type];
+    return 1; // Denied
+}
+
+EXPORT void zan_gui_set_permission(i32 perm_type, i32 status) {
+    if (perm_type >= 0 && perm_type < 8) g_permissions[perm_type] = status;
+}
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val)    { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0; }
