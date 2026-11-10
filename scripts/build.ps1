@@ -101,7 +101,6 @@ if ($SkipGate) {
 #
 # 退出码经临时文件回传：`& $gate` 在子作用域里跑，$script: 变量穿不过去
 # （各自的 script scope），闭包里的 $LASTEXITCODE 同样出不来。
-$gate = Join-Path $PSScriptRoot 'build_gate.ps1'
 $schedPath = Join-Path $PSScriptRoot 'sched.ps1'
 $codeFile = Join-Path $env:TEMP "zan_build_code_$PID.txt"
 & $gate -Name 'build' -Script {
@@ -122,6 +121,3 @@ if (Test-Path $codeFile) {
 if ($code -eq 0) { Write-Host "[build] OK" -ForegroundColor Green }
 else { Write-Host "[build] FAILED exit=$code" -ForegroundColor Red }
 exit $code
-
-Write-Host "[build] OK" -ForegroundColor Green
-exit 0

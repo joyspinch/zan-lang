@@ -6932,13 +6932,13 @@ add_test(NAME tool_zandoc
 #
 #   ctest -L smoke      compiler gates only: goldens, diagnostics, ABI,
 #                       runtimes, tools, GUI cases -- opt-in sanity check
-#                       (428 tests as of 2026-11-04; bare runs are refused by
-#                        scripts/test.ps1's hit-budget guard)
+#                       (bare runs are refused by scripts/test.ps1's
+#                        hit-budget guard)
 #   ctest -L standard   smoke + every conformance program + library emission
-#                       -- release gate / CI only (1653 tests; do NOT run during routine dev)
+#                       -- release gate / CI only; do NOT run during routine dev
 #   ctest -L full       everything, including the determinism and leakcheck
 #                       twins and self-hosting -- final release gate / CI only
-#                       (2860 tests, ~10.6 CPU-hours measured)
+#                       (~10.6 CPU-hours measured)
 #
 # Counts drift as cases are added; `ctest -N -L <tier>` is the live number.
 # Labels are derived from the test names so new tests are classified the moment

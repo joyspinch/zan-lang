@@ -1,6 +1,6 @@
 # docs 索引
 
-本目录共 18 份现行文档（+1 份数据文件）。2026-09-26 深度整合：AI 系文档移至
+本目录共 29 份现行文档。2026-09-26 深度整合：AI 系文档移至
 `tools/ai_pack/docs/`（随 SDK 发布，dist 布局不变），同主题文档并入对应主文档
 （RELEASE、HTML_UI、STDLIB_COMPONENT_STANDARDS、WORKSPACE_CONVENTIONS、
 GAME_ENGINE_GUIDE 各自的附录），逐文件仓库地图与编译器架构总览分别由
