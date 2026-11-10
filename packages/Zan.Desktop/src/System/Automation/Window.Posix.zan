@@ -1,0 +1,306 @@
+#if !WINDOWS
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Input;
+
+namespace System.Automation;
+
+// Window.Posix.zan - 非 Windows 平台（Linux X11/XWayland 与 macOS）窗口管理后端
+// 通过 xdotool 与 osascript 实现真实跨平台控制；在无工具或 Wayland 隔离环境时显式抛出 PlatformNotSupportedException。
+public partial class Window {
+
+    // 探测当前平台可用的窗口管理工具链后端。
+    // 缺失或处于不可穿透沙箱环境时抛出带指引的 PlatformNotSupportedException，绝不静默假装成功。
+    private static int PosixBackend() {
+        #if MACOS
+        if (InputTool.Have("osascript")) {
+            return 3; // MacOs
+        }
+        throw new PlatformNotSupportedException(
+            "Window automation on macOS requires /usr/bin/osascript with Accessibility permissions.");
+        #else
+        // Linux 环境
+        if (ProcessHost.Env("DISPLAY").Length > 0 && InputTool.Have("xdotool")) {
+            return 1; // Xdotool
+        }
+        if (ProcessHost.Env("WAYLAND_DISPLAY").Length > 0 && ProcessHost.Env("DISPLAY").Length == 0) {
+            throw new PlatformNotSupportedException(
+                "Wayland compositor isolates window surfaces by security policy; window automation requires X11/XWayland with xdotool.");
+        }
+        throw new PlatformNotSupportedException(
+            "Window automation on Linux requires xdotool (install via: sudo apt-get install xdotool).");
+        #endif
+    }
+
+    public static nint PosixFindWindow(string cls, string title, int pid, int tid) {
+        int backend = Window.PosixBackend();
+        if (backend == 1) { // Linux xdotool
+            List<string> args = new List<string>();
+            args.Add("search");
+            args.Add("--onlyvisible");
+            if (cls != "") { args.Add("--class"); args.Add(cls); }
+            if (pid > 0) { args.Add("--pid"); args.Add(Convert.ToString(pid)); }
+            if (title != "") { args.Add("--name"); args.Add(title); }
+            ProcessResult r = Process.CaptureSafe("xdotool", args);
+            if (r.lines != null && r.lines.Count > 0) {
+                for (int i = 0; i < r.lines.Count; i = i + 1) {
+                    string line = r.lines[i].Trim();
+                    if (line != "") {
+                        return (nint)Convert.ToInt64(line);
+                    }
+                }
+            }
+            return (nint)0;
+        } else if (backend == 3) { // macOS osascript
+            string script = "tell application \"System Events\"\n"
+                + "set procList to every process whose visible is true\n"
+                + "repeat with p in procList\n"
+                + "    try\n"
+                + "        set wList to every window of p\n"
+                + "        repeat with w in wList\n";
+            if (title != "") {
+                script = script + "            if name of w contains \"" + title + "\" then return id of w\n";
+            } else {
+                script = script + "            return id of w\n";
+            }
+            script = script + "        end repeat\n"
+                + "    end try\n"
+                + "end repeat\n"
+                + "return 0\n"
+                + "end tell";
+            List<string> args = new List<string>();
+            args.Add("-e");
+            args.Add(script);
+            ProcessResult r = Process.CaptureSafe("/usr/bin/osascript", args);
+            if (r.lines != null && r.lines.Count > 0) {
+                string line = r.lines[0].Trim();
+                if (line != "" && line != "0") {
+                    return (nint)Convert.ToInt64(line);
+                }
+            }
+            return (nint)0;
+        }
+        return (nint)0;
+    }
+
+    public static string PosixGetText(nint hwnd) {
+        if (hwnd <= 0) { return ""; }
+        int backend = Window.PosixBackend();
+        if (backend == 1) {
+            List<string> args = new List<string>();
+            args.Add("getwindowname");
+            args.Add(Convert.ToString((long)hwnd));
+            ProcessResult r = Process.CaptureSafe("xdotool", args);
+            if (r.lines != null && r.lines.Count > 0) {
+                return r.lines[0].Trim();
+            }
+            return "";
+        } else if (backend == 3) {
+            List<string> args = new List<string>();
+            args.Add("-e");
+            args.Add("tell application \"System Events\" to get name of (first window whose id is " + Convert.ToString((long)hwnd) + ")");
+            ProcessResult r = Process.CaptureSafe("/usr/bin/osascript", args);
+            if (r.lines != null && r.lines.Count > 0) {
+                return r.lines[0].Trim();
+            }
+            return "";
+        }
+        return "";
+    }
+
+    public static bool PosixSetText(nint hwnd, string text) {
+        if (hwnd <= 0) { return false; }
+        Window.PosixBackend();
+        // X11 / Wayland / macOS 不支持跨进程直接修改其他程序窗口标题（属于目标应用私有属性）
+        throw new PlatformNotSupportedException(
+            "SetText (WM_SETTEXT) on foreign windows is not supported by POSIX window protocols.");
+    }
+
+    public static bool PosixIsWindow(nint hwnd) {
+        if (hwnd <= 0) { return false; }
+        int backend = Window.PosixBackend();
+        if (backend == 1) {
+            List<string> args = new List<string>();
+            args.Add("getwindowname");
+            args.Add(Convert.ToString((long)hwnd));
+            return Process.CaptureSafe("xdotool", args).exitCode == 0;
+        } else if (backend == 3) {
+            List<string> args = new List<string>();
+            args.Add("-e");
+            args.Add("tell application \"System Events\" to exists (first window whose id is " + Convert.ToString((long)hwnd) + ")");
+            ProcessResult r = Process.CaptureSafe("/usr/bin/osascript", args);
+            if (r.lines != null && r.lines.Count > 0) {
+                return r.lines[0].Trim() == "true";
+            }
+            return false;
+        }
+        return false;
+    }
+
+    public static WindowRect PosixGetRect(nint hwnd) {
+        if (hwnd <= 0) { return new WindowRect(0, 0, 0, 0); }
+        int backend = Window.PosixBackend();
+        if (backend == 1) {
+            List<string> args = new List<string>();
+            args.Add("getwindowgeometry");
+            args.Add("--shell");
+            args.Add(Convert.ToString((long)hwnd));
+            ProcessResult r = Process.CaptureSafe("xdotool", args);
+            int x = 0;
+            int y = 0;
+            int w = 0;
+            int h = 0;
+            if (r.lines != null) {
+                for (int i = 0; i < r.lines.Count; i = i + 1) {
+                    string line = r.lines[i].Trim();
+                    if (line.StartsWith("X=")) {
+                        x = Convert.ToInt32(line.Substring(2, line.Length - 2));
+                    } else if (line.StartsWith("Y=")) {
+                        y = Convert.ToInt32(line.Substring(2, line.Length - 2));
+                    } else if (line.StartsWith("WIDTH=")) {
+                        w = Convert.ToInt32(line.Substring(6, line.Length - 6));
+                    } else if (line.StartsWith("HEIGHT=")) {
+                        h = Convert.ToInt32(line.Substring(7, line.Length - 7));
+                    }
+                }
+            }
+            return new WindowRect(x, y, w, h);
+        } else if (backend == 3) {
+            List<string> args = new List<string>();
+            args.Add("-e");
+            args.Add("tell application \"System Events\"\n"
+                + "set w to (first window whose id is " + Convert.ToString((long)hwnd) + ")\n"
+                + "set p to position of w\n"
+                + "set s to size of w\n"
+                + "return (item 1 of p as text) & \",\" & (item 2 of p as text) & \",\" & (item 1 of s as text) & \",\" & (item 2 of s as text)\n"
+                + "end tell");
+            ProcessResult r = Process.CaptureSafe("/usr/bin/osascript", args);
+            if (r.lines != null && r.lines.Count > 0) {
+                string[] parts = r.lines[0].Trim().Split(',');
+                if (parts.Length == 4) {
+                    return new WindowRect(
+                        Convert.ToInt32(parts[0].Trim()),
+                        Convert.ToInt32(parts[1].Trim()),
+                        Convert.ToInt32(parts[2].Trim()),
+                        Convert.ToInt32(parts[3].Trim()));
+                }
+            }
+        }
+        return new WindowRect(0, 0, 0, 0);
+    }
+
+    public static bool PosixMove(nint hwnd, int x, int y, int w, int h) {
+        if (hwnd <= 0) { return false; }
+        int backend = Window.PosixBackend();
+        if (backend == 1) {
+            List<string> margs = new List<string>();
+            margs.Add("windowmove");
+            margs.Add(Convert.ToString((long)hwnd));
+            margs.Add(Convert.ToString(x));
+            margs.Add(Convert.ToString(y));
+            bool ok1 = Process.CaptureSafe("xdotool", margs).exitCode == 0;
+            if (w > 0 && h > 0) {
+                List<string> sargs = new List<string>();
+                sargs.Add("windowsize");
+                sargs.Add(Convert.ToString((long)hwnd));
+                sargs.Add(Convert.ToString(w));
+                sargs.Add(Convert.ToString(h));
+                bool ok2 = Process.CaptureSafe("xdotool", sargs).exitCode == 0;
+                return ok1 && ok2;
+            }
+            return ok1;
+        } else if (backend == 3) {
+            List<string> args = new List<string>();
+            args.Add("-e");
+            args.Add("tell application \"System Events\" to set position of (first window whose id is "
+                + Convert.ToString((long)hwnd) + ") to {" + Convert.ToString(x) + ", " + Convert.ToString(y) + "}");
+            bool ok1 = Process.CaptureSafe("/usr/bin/osascript", args).exitCode == 0;
+            if (w > 0 && h > 0) {
+                List<string> sargs = new List<string>();
+                sargs.Add("-e");
+                sargs.Add("tell application \"System Events\" to set size of (first window whose id is "
+                    + Convert.ToString((long)hwnd) + ") to {" + Convert.ToString(w) + ", " + Convert.ToString(h) + "}");
+                bool ok2 = Process.CaptureSafe("/usr/bin/osascript", sargs).exitCode == 0;
+                return ok1 && ok2;
+            }
+            return ok1;
+        }
+        return false;
+    }
+
+    public static bool PosixResize(nint hwnd, int w, int h) {
+        if (hwnd <= 0 || w <= 0 || h <= 0) { return false; }
+        int backend = Window.PosixBackend();
+        if (backend == 1) {
+            List<string> sargs = new List<string>();
+            sargs.Add("windowsize");
+            sargs.Add(Convert.ToString((long)hwnd));
+            sargs.Add(Convert.ToString(w));
+            sargs.Add(Convert.ToString(h));
+            return Process.CaptureSafe("xdotool", sargs).exitCode == 0;
+        } else if (backend == 3) {
+            List<string> sargs = new List<string>();
+            sargs.Add("-e");
+            sargs.Add("tell application \"System Events\" to set size of (first window whose id is "
+                + Convert.ToString((long)hwnd) + ") to {" + Convert.ToString(w) + ", " + Convert.ToString(h) + "}");
+            return Process.CaptureSafe("/usr/bin/osascript", sargs).exitCode == 0;
+        }
+        return false;
+    }
+
+    public static bool PosixSetForeground(nint hwnd) {
+        if (hwnd <= 0) { return false; }
+        int backend = Window.PosixBackend();
+        if (backend == 1) {
+            List<string> args = new List<string>();
+            args.Add("windowactivate");
+            args.Add(Convert.ToString((long)hwnd));
+            return Process.CaptureSafe("xdotool", args).exitCode == 0;
+        } else if (backend == 3) {
+            List<string> args = new List<string>();
+            args.Add("-e");
+            args.Add("tell application \"System Events\" to set frontmost of (first process whose windows contains (first window whose id is "
+                + Convert.ToString((long)hwnd) + ")) to true");
+            return Process.CaptureSafe("/usr/bin/osascript", args).exitCode == 0;
+        }
+        return false;
+    }
+
+    public static bool PosixClose(nint hwnd) {
+        if (hwnd <= 0) { return false; }
+        int backend = Window.PosixBackend();
+        if (backend == 1) {
+            List<string> args = new List<string>();
+            args.Add("windowclose");
+            args.Add(Convert.ToString((long)hwnd));
+            return Process.CaptureSafe("xdotool", args).exitCode == 0;
+        } else if (backend == 3) {
+            List<string> args = new List<string>();
+            args.Add("-e");
+            args.Add("tell application \"System Events\" to click (button 1 of (first window whose id is "
+                + Convert.ToString((long)hwnd) + "))");
+            return Process.CaptureSafe("/usr/bin/osascript", args).exitCode == 0;
+        }
+        return false;
+    }
+
+    public static bool PosixMinimize(nint hwnd) {
+        if (hwnd <= 0) { return false; }
+        int backend = Window.PosixBackend();
+        if (backend == 1) {
+            List<string> args = new List<string>();
+            args.Add("windowminimize");
+            args.Add(Convert.ToString((long)hwnd));
+            return Process.CaptureSafe("xdotool", args).exitCode == 0;
+        } else if (backend == 3) {
+            List<string> args = new List<string>();
+            args.Add("-e");
+            args.Add("tell application \"System Events\" to set miniaturized of (first window whose id is "
+                + Convert.ToString((long)hwnd) + ") to true");
+            return Process.CaptureSafe("/usr/bin/osascript", args).exitCode == 0;
+        }
+        return false;
+    }
+}
+#endif
