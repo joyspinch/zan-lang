@@ -45,8 +45,28 @@
 - [ ] B-ID188 reject 金标：reject_cases.txt 每用例配 `.stderr` 金标（先只锁 `code: 摘要` 两字段，容忍位置差异），run_selfhost_diff reject 分支从"rc≠0 即过"升级为"rc≠0 且 stderr 匹配金标"；前置 B-ID187（金标依赖 code 字段）。
 - [ ] B-ID189 防倒退指纹（②fixedpoint.sha、③commit-msg 的 `selfhost-verified:` 机检、④check_selfhost_docs.py 已落地移出）：① gen1/gen0 `--version` 输出代次 + selfhost_sources.txt 内容 SHA256（差分报告可复现）；gen1 driver 目前无 `--version`。
 - [ ] B-ID190〔独占大项〕parser 错误恢复：错误后继续 parse，服务 LSP/IDE 体验；单开计划，不与 B-ID187/188 混线。
+- [ ] B-ID200〔主线〕zan-lsp 全特性对齐 C 宿主。首片已落地（commit 7e196a4be）：src/selfhost/tools/lsp.zan 复用 selfhost 前端（Lexer/Parser/Binder/Checker）真诊断 + 符号索引（documentSymbol 嵌套/definition/references 词边界近似/hover/补全），tool_lsp_zan + tool_lsp_zan_session 守门。余量：rename/inlayHint/semanticTokens/folding/formatting；项目级符号解析（现单文档语义视图，using 指向的外部类型误报 undefined）；UTF-16 列口径（现 UTF-8 字节）；references 语义过滤。边界决议（2026-11-10）：**C 运行时（src/runtime）与 third_party 保留不 zan 化；工具链 + 编译器缺口（B-ID199）是 zan 化主线**。
+- [ ] B-ID201 zan-dap 重写为 Zan（src/dap → src/selfhost/tools/dap.zan 首切片起步）。〔前置 B-ID202〕活进程管道原语首片已落地；POSIX 管道与断点事件通道按 DAP 语义需要再补。
+- [ ] B-ID202 stdlib Process 活进程管道原语。首片已落地（commit 341efe035）：ProcessSpawn（Spawn/ReadAvailable/WriteLine/Kill/WaitExitCode/Dispose/Pid，双匿名管道 + STARTF_USESTDHANDLES，Windows-first）+ unit_process_spawn（cmd.exe 交互回环守门）。余量：POSIX 管道版（Spawn 现显式返回 null）、stderr 分管道、按需的 stdin 二进制写。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 
 - [ ] B-ID170 结构收口二件：① 中风险拆分（Designer 三件套：Designer.Form.zan 4301行已于 commit 3b8cdd439 按 partial 拆出 Ribbon/Layout/Free/Canvas/Ruler/Preview 6切面并完成 RenderDesignCanvas 巨函数拆解；余 Designer.zan 6909 与 Designer.Inspector.zan 3466、SceneDesigner 2951——后两者将在 B-ID177 改写为保留式，拆前先评估；App.zan 已并入 B-ID174）；② 命名空间三前缀统一（System.* 被 stdlib/packages 同名分仓、Game 裸名——独立大工程，动前定一尊；Gui 已定案并入 B-ID178）。
 - [ ] B-ID178〔前置 B-ID172～B-ID177〕GUI 分层重构 P7 按层拆命名空间：目录即命名空间，codemod 原子提交（约 1,285 个调用方文件 + 977 处限定引用），兄弟包各占己名，机检切严格（承接 B-ID170 ② 的 Gui 部分）。
+
+### 批次 4 附件 · 编译器缺陷档案与顺延（取证存档 2026-11-10）
+
+**E3090 编译器缺陷（未修，lambda ARC 跨函数引用）**：
+- 症状：`LLVM verification failed in lambda_2: Referring to an instruction in another function!` —— lambda_2 的 ARC 释放序列引用了宿主函数（LspSession.Start）的 `%box.owner` alloca。
+- 定位：src/ide_zan/src/services/LspSession.zan:71 的 Thread.Start lambda（4 捕获 + try/finally + TrySetResult）。捕获登记 box_owned=0（src/compiler/lambda/lambda_closure.c:519-529），释放路径 release_boxed_local（src/compiler/generic_lpad.c:515-526）走 owner 槽；把 owner 槽写进外层 alloca 的机制未定位（赋值路径 ops_assign.c:73-107 全用传入 locals，静态排查无跨函数引用通道）。
+- 排查工具：`ZANC_DUMP_BAD_IR=1 build/zanc.exe <src> --auto-stdlib -o out.exe` 转储坏函数 IR（bad_lambda_2.txt）；`--emit-ir` 拿不到半成品 IR（验证器先跑，失败即退出），必须用 ZANC_DUMP_BAD_IR；全局 lambda 命名计数（lambda_tree.c:396 lambda_id）从 IR 名反查宿主函数。
+- 复现：`pwsh scripts/test.ps1 -Match "^lsp_session_editor$"`（tests/lsp/run_lsp_session_test.py 现场编译 client 触发）。
+- 备注：前置修复 E2002 私有 API 拦截（Socket 公共 API，commit 5245df9f3）后本缺陷才暴露。
+
+**Gallery.zan 拆类顺延（配方已验证，待并发会话批次落地后执行）**：
+- 目标形态：单类 12,188 行 → Gallery 壳（Main/导航/GalleryPack）+ `examples/gui_gallery/demos/DemoXxx.zan` 逐控件家族；RenderPreviewEx（:5240-11503，约 300 分支）保留 name 分发，分支体迁 demos：`rendered = DemoButton.Render(app, c, t, name, px, py, y, w);`
+- 配方：① else-if 链花括号配平解析（闭括号是下一链头行前缀 `} else if`，body 切片不含闭括号，生成器须补）② build_gallery.ps1 加 demos/ 文件清单 ③ 先做外部引用清单（Button 家族 15 分支仅依赖 Gallery.Btn/IconBtn/LayoutAuto/PreviewPadTop/ShowAt/evtClicks/popTipOn + px/py 参数，无 rendered 写点）④ 逐家族编译推进，每家族一提交。
+- 硬门：生成物必须过花括号配平断言（Gallery.zan 与 DemoXxx.zan 各自 `{`/`}` 计数为 0）再编译——2026-11-10 首迁 Button 家族的生成物是坏中间态（Gallery.zan -15、DemoButton.zan -13，分支头重复嵌套、链闭括号错位），已整体回退不入库。
+- 顺延原因：并发会话活跃于 templates/packages/examples 区域，避免手工冲突（WC §11）。
+
+**模板与根目录清理顺延**：templates/server/server-collab/ 的 app.db-wal、e2e_*.log、m4.log、*.pyc 已提交残留；根目录未跟踪杂物（zan_leaks.log、CMakeCache.txt、Testing/）。均在并发会话活跃区，下轮收口。
