@@ -52,6 +52,13 @@ int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16)
 int64_t zan_hw_ghash_update(const uint8_t *h16, const uint8_t *data, int64_t len, uint8_t *y16);
 
 #pragma pack(push, 1)
+
+/* GCM 上下文 ABI 版本：编译器 emit 侧只透传调用方分配的字节缓冲，布局
+ * 知识只活在本结构定义里——布局一变（老 zanc 配新 libzancrypto，或反之）
+ * 靠 magic 无法察觉。改布局必须同步递增本版本号，init 写入、两个 _ctx
+ * 入口校验，漂移即显式 -1 而不是静默错位。 */
+#define ZAN_GCM_CTX_VERSION 2
+
 typedef struct {
     uint32_t magic;      /* 0x47434D31 ('GCM1') */
     int32_t keybits;
@@ -60,6 +67,7 @@ typedef struct {
     uint8_t rkb[15][16];
     uint8_t h_bswap[16];
     uint8_t h_powers[8][16]; /* H^1, H^2, H^3, H^4, H^5, H^6, H^7, H^8 */
+    uint32_t version;    /* ZAN_GCM_CTX_VERSION，尾部追加保历史前缀布局 */
 } zan_gcm_ctx_t;
 #pragma pack(pop)
 

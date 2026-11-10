@@ -481,6 +481,7 @@ int64_t zan_hw_aes_gcm_init(uint8_t *ctxBuf, int64_t ctxLen, const uint8_t *key,
     zan_gcm_ctx_t *ctx = (zan_gcm_ctx_t*)ctxBuf;
     memset(ctx, 0, sizeof(*ctx));
     ctx->magic = 0x47434D31;
+    ctx->version = ZAN_GCM_CTX_VERSION;
     ctx->keybits = keybits;
 
     zan_aes_expand_key(key, keybits, ctx->rkb, &ctx->nr);
@@ -512,6 +513,7 @@ int64_t zan_hw_aes_gcm_encrypt_ctx(const uint8_t *ctxBuf,
     if (!ctxBuf || !iv12 || !tag16) return -1;
     const zan_gcm_ctx_t *ctx = (const zan_gcm_ctx_t*)ctxBuf;
     if (ctx->magic != 0x47434D31) return -1;
+    if (ctx->version != ZAN_GCM_CTX_VERSION) return -1;
     if (aadLen < 0 || inLen < 0) return -1;
     if (aadLen > 0 && !aad) return -1;
     if (inLen > 0 && (!in || !out)) return -1;
@@ -581,6 +583,7 @@ int64_t zan_hw_aes_gcm_decrypt_ctx(const uint8_t *ctxBuf,
     if (!ctxBuf || !iv12 || !tag16) return -1;
     const zan_gcm_ctx_t *ctx = (const zan_gcm_ctx_t*)ctxBuf;
     if (ctx->magic != 0x47434D31) return -1;
+    if (ctx->version != ZAN_GCM_CTX_VERSION) return -1;
     if (aadLen < 0 || inLen < 0) return -1;
     if (aadLen > 0 && !aad) return -1;
     if (inLen > 0 && (!in || !out)) return -1;
