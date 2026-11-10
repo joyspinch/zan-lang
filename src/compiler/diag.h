@@ -20,7 +20,7 @@ typedef struct {
     zan_diag_level_t level;
     zan_loc_t        loc;
     int              code;   /* 诊断编号（A382 编号规范），0 = 未编号 */
-    char             message[512];
+    char             message[1024];
 } zan_diag_entry_t;
 
 /* #pragma warning disable/restore 记下的生效区间（A382③） */

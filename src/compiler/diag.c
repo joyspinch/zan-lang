@@ -238,7 +238,7 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
                            zan_loc_t loc, int code, const char *fmt,
                            va_list args) {
-    char msgbuf[512];
+    char msgbuf[1024];
     char prefix[16];
     if (code > 0) {
         snprintf(prefix, sizeof(prefix), "[%c%04d] ",
@@ -248,7 +248,27 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
     }
     int plen = (int)strlen(prefix);
     memcpy(msgbuf, prefix, (size_t)plen);
-    vsnprintf(msgbuf + plen, sizeof(msgbuf) - (size_t)plen, fmt, args);
+    /* 消息缓冲固定 1024：超长签名/标识符在此安全截断。vsnprintf 返回全长度，
+     * 达到容量即发生截断——从尾部回退到 UTF-8 码点边界再补 "..."。截断点落
+     * 在多字节序列中间会产生非法 UTF-8，LSP 把 message 原样透传 JSON 时
+     * 直接断流（lsp_main.c）。 */
+    int produced = vsnprintf(msgbuf + plen, sizeof(msgbuf) - (size_t)plen,
+                             fmt, args);
+    if (produced < 0) {
+        msgbuf[plen] = '\0'; /* 编码失败：退化为前缀 */
+    } else if (produced >= (int)(sizeof(msgbuf) - (size_t)plen)) {
+        /* vsnprintf 实写内容止于 sizeof-2（NUL 在 sizeof-1）。先给 "..."
+         * 预留 3 字节再回退码点边界——顺序不能反：回退后再 clamp 会把
+         * 已合法的尾字节吞掉给省略号腾位。 */
+        size_t end = sizeof(msgbuf) - 4;
+        while (end > (size_t)plen &&
+               ((unsigned char)msgbuf[end - 1] & 0xC0) == 0x80)
+            end--; /* 回跳 continuation bytes（0x80-0xBF） */
+        if (end > (size_t)plen && ((unsigned char)msgbuf[end - 1] & 0x80) != 0)
+            end--; /* 剩余首字节是多字节序列的 lead（续字节已被上一步清空）：
+                    * 序列必然残缺，丢弃整个码点 */
+        memcpy(msgbuf + end, "...", 4);
+    }
 
     if (level == DIAG_WARNING && diag->treat_warnings_as_errors) {
         level = DIAG_ERROR;
