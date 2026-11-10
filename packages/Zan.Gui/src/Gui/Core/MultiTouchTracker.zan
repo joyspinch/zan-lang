@@ -1,0 +1,168 @@
+using System;
+
+namespace Gui.Core;
+
+// 单个活跃触控点
+class PointerState {
+    public int id;
+    public int x;
+    public int y;
+    public bool active;
+
+    public PointerState() {
+        this.id = -1;
+        this.x = 0;
+        this.y = 0;
+        this.active = false;
+    }
+}
+
+// 多点触控几何追踪器（MultiTouchTracker）：
+// 实时跟踪多点触控（最多 5 点），提取双指欧氏距离（Span）、几何中心锚点（Focus/Pivot）
+// 与相对缩放比（ScaleDelta），为折叠屏与移动端大屏双指捏合缩放（Pinch-to-zoom）提供精确几何源。
+public class MultiTouchTracker {
+    private PointerState[] pointers;
+    private float prevSpan;
+    private float currentSpan;
+    private float focusX;
+    private float focusY;
+    private float prevFocusX;
+    private float prevFocusY;
+
+    public MultiTouchTracker() {
+        pointers = new PointerState[5];
+        for (int i = 0; i < 5; i = i + 1) {
+            pointers[i] = new PointerState();
+        }
+        prevSpan = 0.0f;
+        currentSpan = 0.0f;
+        focusX = 0.0f;
+        focusY = 0.0f;
+        prevFocusX = 0.0f;
+        prevFocusY = 0.0f;
+    }
+
+    public void PointerDown(int id, int x, int y) {
+        int slot = -1;
+        for (int i = 0; i < 5; i = i + 1) {
+            if (pointers[i].active && pointers[i].id == id) {
+                slot = i;
+                break;
+            }
+            if (slot == -1 && !pointers[i].active) {
+                slot = i;
+            }
+        }
+        if (slot != -1) {
+            pointers[slot].id = id;
+            pointers[slot].x = x;
+            pointers[slot].y = y;
+            pointers[slot].active = true;
+        }
+        Recalculate(true);
+    }
+
+    public void PointerMove(int id, int x, int y) {
+        for (int i = 0; i < 5; i = i + 1) {
+            if (pointers[i].active && pointers[i].id == id) {
+                pointers[i].x = x;
+                pointers[i].y = y;
+                break;
+            }
+        }
+        Recalculate(false);
+    }
+
+    public void PointerUp(int id) {
+        for (int i = 0; i < 5; i = i + 1) {
+            if (pointers[i].active && pointers[i].id == id) {
+                pointers[i].active = false;
+                pointers[i].id = -1;
+                break;
+            }
+        }
+        Recalculate(true);
+    }
+
+    public int ActiveCount() {
+        int n = 0;
+        for (int i = 0; i < 5; i = i + 1) {
+            if (pointers[i].active) { n = n + 1; }
+        }
+        return n;
+    }
+
+    private void Recalculate(bool resetBaseline) {
+        int p0 = -1;
+        int p1 = -1;
+        for (int i = 0; i < 5; i = i + 1) {
+            if (pointers[i].active) {
+                if (p0 == -1) { p0 = i; }
+                else if (p1 == -1) { p1 = i; break; }
+            }
+        }
+
+        prevFocusX = focusX;
+        prevFocusY = focusY;
+
+        if (p0 != -1 && p1 != -1) {
+            // 双指在场：计算欧氏距离与中心点
+            float dx = (float)(pointers[p1].x - pointers[p0].x);
+            float dy = (float)(pointers[p1].y - pointers[p0].y);
+            float span = (float)Math.Sqrt((double)(dx * dx + dy * dy));
+            if (span < 1.0f) { span = 1.0f; }
+
+            currentSpan = span;
+            focusX = (float)(pointers[p0].x + pointers[p1].x) * 0.5f;
+            focusY = (float)(pointers[p0].y + pointers[p1].y) * 0.5f;
+
+            if (resetBaseline || prevSpan <= 0.0f) {
+                prevSpan = currentSpan;
+                prevFocusX = focusX;
+                prevFocusY = focusY;
+            }
+        } else if (p0 != -1) {
+            // 单指在场
+            currentSpan = 0.0f;
+            prevSpan = 0.0f;
+            focusX = (float)pointers[p0].x;
+            focusY = (float)pointers[p0].y;
+            if (resetBaseline) {
+                prevFocusX = focusX;
+                prevFocusY = focusY;
+            }
+        } else {
+            // 无手指
+            currentSpan = 0.0f;
+            prevSpan = 0.0f;
+        }
+    }
+
+    // 相对上一帧的相对缩放比例（增量比例，例如 1.02f 代表放大 2%）
+    public float ScaleDelta() {
+        if (prevSpan <= 0.0f || currentSpan <= 0.0f) {
+            return 1.0f;
+        }
+        float ratio = currentSpan / prevSpan;
+        prevSpan = currentSpan; // 步进基线
+        return ratio;
+    }
+
+    // 双指几何中心焦点 X
+    public float FocusX() { return focusX; }
+    // 双指几何中心焦点 Y
+    public float FocusY() { return focusY; }
+
+    // 焦点中心移动增量（用于边捏合缩放边平移画布）
+    public float FocusDeltaX() {
+        float dx = focusX - prevFocusX;
+        prevFocusX = focusX;
+        return dx;
+    }
+
+    public float FocusDeltaY() {
+        float dy = focusY - prevFocusY;
+        prevFocusY = focusY;
+        return dy;
+    }
+}
