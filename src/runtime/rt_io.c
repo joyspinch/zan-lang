@@ -86,25 +86,10 @@ static ZAN_MAYBE_UNUSED void zan_io_fd_cloexec(int fd) {
 #endif
 #include "../common/host_oom.h"
 
-#if !defined(_WIN32)
-typedef long LONG;
-#ifndef InterlockedIncrement
-#define InterlockedIncrement(dst) \
-    (LONG)__sync_add_and_fetch((LONG volatile *)(dst), 1)
-#endif
-#ifndef InterlockedDecrement
-#define InterlockedDecrement(dst) \
-    (LONG)__sync_sub_and_fetch((LONG volatile *)(dst), 1)
-#endif
-#ifndef InterlockedExchangeAdd
-#define InterlockedExchangeAdd(dst, val) \
-    (LONG)__sync_fetch_and_add((LONG volatile *)(dst), (LONG)(val))
-#endif
-#ifndef InterlockedExchange
-#define InterlockedExchange(dst, val) \
-    (LONG)__sync_lock_test_and_set((LONG volatile *)(dst), (LONG)(val))
-#endif
-#endif /* !_WIN32 */
+/* POSIX 面 Win32 原语 shim（LONG/Interlocked/CRITICAL_SECTION/TLS/时间）
+ * 自包含于 io/rt_io_posix_compat.c；co_pool/co_sched 的 UNITY-ORDER
+ * 标注保证本 TU 内先于消费者拼入。 */
+#include "io/rt_io_posix_compat.c"
 
 /* 逻辑处理器数（Environment.ProcessorCount 的探针）：Windows 用
  * GetSystemInfo，POSIX 用 sysconf(_SC_NPROCESSORS_ONLN)，查询失败

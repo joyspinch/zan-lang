@@ -1,6 +1,7 @@
 /* rt_io_co_sched.c: M:N 协程调度引擎、工作线程池与时间片监控实现 */
-/* UNITY-ORDER: after io/rt_io_co_pool.c —— co_sched 的跨平台原语依赖
- * co_pool 先拼入提供的 pthread→Win32 shim（scripts/unity_order_check.py 门禁）。 */
+/* 跨平台原语 shim 已自包含（rt_io_posix_compat.c），不再依赖拼接巧合。 */
+/* UNITY-ORDER: after io/rt_io_posix_compat.c */
+/* UNITY-ORDER: after io/rt_io_co_pool.c —— 调度引擎消费 co_pool 的文件级 static（co_self 等） */
 
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
 int zan_co_poll(void) {
