@@ -111,6 +111,21 @@ public class LspPos {
     }
 }
 
+/// 代码行格式化扫描元数据（同 C 宿主 fmt_line_t）。
+public class FmtLine {
+    public int Level;
+    public int Lead;
+    public string Content;
+    public bool Blank;
+
+    public FmtLine(int level, int lead, string content, bool blank) {
+        Level = level;
+        Lead = lead;
+        Content = content;
+        Blank = blank;
+    }
+}
+
 public class LspServer {
     [DllImport("crt")] public static extern int getchar();
     [DllImport("crt")] public static extern int putchar(int c);
@@ -727,6 +742,8 @@ public class LspServer {
                 + "\"renameProvider\":{\"prepareProvider\":true},"
                 + "\"documentHighlightProvider\":true,"
                 + "\"foldingRangeProvider\":true,"
+                + "\"documentFormattingProvider\":true,"
+                + "\"documentRangeFormattingProvider\":true,"
                 + "\"semanticTokensProvider\":{"
                 + "\"legend\":{\"tokenTypes\":["
                 + "\"namespace\",\"type\",\"class\",\"enum\",\"interface\","
@@ -813,6 +830,16 @@ public class LspServer {
 
         if (method == "textDocument/foldingRange") {
             HandleFoldingRange(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/formatting") {
+            HandleFormatting(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/rangeFormatting") {
+            HandleRangeFormatting(id, pms);
             return;
         }
 
@@ -1282,6 +1309,246 @@ public class LspServer {
                     break;
                 }
             }
+        }
+        sb.Append("]}");
+        SendResponse(sb.ToString());
+    }
+
+    // ===================== formatting / rangeFormatting =====================
+
+    /// 偏移量（字节）→ 行号与 UTF-16 列号（同 C 宿主 offset_to_linecol）。
+    static LspPos OffsetToLineCol(string text, int offset) {
+        if (text == null || offset <= 0) { return new LspPos(0, 0); }
+        int ln = 0;
+        int col = 0;
+        int i = 0;
+        int limit = offset < text.Length ? offset : text.Length;
+        while (i < limit) {
+            int c = text[i] & 255;
+            if (c == 10) {
+                ln = ln + 1;
+                col = 0;
+                i = i + 1;
+                continue;
+            }
+            int bytes = 1;
+            int cu = 1;
+            if (c >= 240 && i + 3 < text.Length) { bytes = 4; cu = 2; }
+            else if (c >= 224 && i + 2 < text.Length) { bytes = 3; cu = 1; }
+            else if (c >= 192 && i + 1 < text.Length) { bytes = 2; cu = 1; }
+            if (i + bytes > limit) {
+                col = col + cu;
+                break;
+            }
+            col = col + cu;
+            i = i + bytes;
+        }
+        return new LspPos(ln, col);
+    }
+
+    /// 行级缩进深度与空白扫描（同 C 宿主 fmt_scan；括号深度状态机）。
+    static List<FmtLine> FmtScan(string text) {
+        List<FmtLine> lines = new List<FmtLine>();
+        if (text == null || text.Length == 0) { return lines; }
+
+        bool inBlock = false;
+        bool inStr = false;
+        int depth = 0;
+        int p = 0;
+        int len = text.Length;
+
+        while (p < len) {
+            int lead = 0;
+            while (p < len && (text[p] == ' ' || text[p] == '\t')) {
+                lead = lead + 1;
+                p = p + 1;
+            }
+            int cs = p;
+            int le = p;
+            while (le < len && text[le] != '\n') {
+                le = le + 1;
+            }
+            int ce = le;
+            while (ce > cs && (text[ce - 1] == ' ' || text[ce - 1] == '\t' || text[ce - 1] == '\r')) {
+                ce = ce - 1;
+            }
+            string content = (ce > cs) ? text.Substring(cs, ce - cs) : "";
+            bool blank = (content.Length == 0);
+
+            bool endsOpen = false;
+            int q = cs;
+            while (q < ce) {
+                char c = text[q];
+                if (inBlock) {
+                    if (c == '*' && q + 1 < ce && text[q + 1] == '/') {
+                        inBlock = false;
+                        q = q + 2;
+                    } else {
+                        q = q + 1;
+                    }
+                    continue;
+                }
+                if (inStr) {
+                    if (c == '\\') {
+                        q = q + 2;
+                        continue;
+                    }
+                    if (c == '"') { inStr = false; }
+                    q = q + 1;
+                    continue;
+                }
+                if (c == '"') {
+                    inStr = true;
+                    q = q + 1;
+                    continue;
+                }
+                if (c == '/' && q + 1 < ce && text[q + 1] == '/') {
+                    break;
+                }
+                if (c == '/' && q + 1 < ce && text[q + 1] == '*') {
+                    inBlock = true;
+                    q = q + 2;
+                    continue;
+                }
+                endsOpen = (c == '{');
+                q = q + 1;
+            }
+
+            if (!blank && content.Length > 0 && content[0] == '}') {
+                depth = depth - 1;
+                if (depth < 0) { depth = 0; }
+            }
+            int lvl = depth;
+            if (endsOpen) { depth = depth + 1; }
+
+            lines.Add(new FmtLine(lvl, lead, content, blank));
+
+            if (le < len && text[le] == '\n') {
+                p = le + 1;
+            } else {
+                p = le;
+            }
+        }
+        return lines;
+    }
+
+    /// textDocument/formatting：全文档单范围替换 Edit（(0,0) 到文档末尾）。
+    static void HandleFormatting(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        LspDocument doc = uri != "" ? FindDocument(uri) : null;
+        if (doc == null || doc.Text.Length == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":[]}");
+            return;
+        }
+
+        List<FmtLine> lines = FmtScan(doc.Text);
+        StringBuilder outText = new StringBuilder();
+        int blanks = 0;
+        int i = 0;
+        while (i < lines.Count) {
+            FmtLine L = lines[i];
+            if (L.Blank) {
+                blanks = blanks + 1;
+                if (blanks <= 1) {
+                    outText.Append('\n');
+                }
+                i = i + 1;
+                continue;
+            }
+            blanks = 0;
+            int spaces = L.Level * 4;
+            int s = 0;
+            while (s < spaces) {
+                outText.Append(' ');
+                s = s + 1;
+            }
+            outText.Append(L.Content);
+            outText.Append('\n');
+            i = i + 1;
+        }
+
+        if (outText.Length == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":[]}");
+            return;
+        }
+
+        LspPos endPos = OffsetToLineCol(doc.Text, doc.Text.Length);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":");
+        sb.Append(endPos.Line);
+        sb.Append(",\"character\":");
+        sb.Append(endPos.Col);
+        sb.Append("}},\"newText\":");
+        sb.Append(EncodeJsonString(outText.ToString()));
+        sb.Append("}]}");
+        SendResponse(sb.ToString());
+    }
+
+    /// textDocument/rangeFormatting：按行重写前导缩进空格。
+    static void HandleRangeFormatting(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        LspDocument doc = uri != "" ? FindDocument(uri) : null;
+        if (doc == null || doc.Text.Length == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":[]}");
+            return;
+        }
+
+        string rg = ExtractJsonContainer(pms, "range");
+        string startObj = ExtractJsonContainer(rg, "start");
+        string endObj = ExtractJsonContainer(rg, "end");
+        int l0 = ExtractJsonInt(startObj, "line", 0);
+        int l1 = ExtractJsonInt(endObj, "line", l0);
+        if (l1 < l0) {
+            int t = l0;
+            l0 = l1;
+            l1 = t;
+        }
+
+        List<FmtLine> lines = FmtScan(doc.Text);
+        if (lines.Count == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":[]}");
+            return;
+        }
+
+        if (l1 > lines.Count - 1) {
+            l1 = lines.Count - 1;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[");
+        bool first = true;
+        int i = l0;
+        while (i <= l1) {
+            FmtLine L = lines[i];
+            if (!L.Blank) {
+                int want = L.Level * 4;
+                if (want != L.Lead) {
+                    if (!first) { sb.Append(','); }
+                    first = false;
+                    sb.Append("{\"range\":{\"start\":{\"line\":");
+                    sb.Append(i);
+                    sb.Append(",\"character\":0},\"end\":{\"line\":");
+                    sb.Append(i);
+                    sb.Append(",\"character\":");
+                    sb.Append(L.Lead);
+                    sb.Append("}},\"newText\":");
+                    StringBuilder pad = new StringBuilder();
+                    int s = 0;
+                    while (s < want) {
+                        pad.Append(' ');
+                        s = s + 1;
+                    }
+                    sb.Append(EncodeJsonString(pad.ToString()));
+                    sb.Append("}");
+                }
+            }
+            i = i + 1;
         }
         sb.Append("]}");
         SendResponse(sb.ToString());

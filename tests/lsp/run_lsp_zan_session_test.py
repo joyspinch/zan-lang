@@ -21,6 +21,8 @@ script drives one full session and asserts the B-ID200 first-slice behaviors:
   semanticTokens                 real-lexer token stream, symbol-index
                                  classified, delta-encoded; CJK string
                                  length in UTF-16
+  formatting                     full-document indent rewrite edit
+  rangeFormatting                line-range indent adjustment; empty on clean
   didChange                      re-analysis, version bump
   syntax error                   parser diagnostics
   cjk utf-16 columns             diagnostics/hover positions after CJK
@@ -75,11 +77,20 @@ SRC_CJK = (
     "    string s = \"中文备注\"; Missing m = null; // 中文尾注 Val\n"
     "}\n"
 )
+SRC_FMT = (
+    "class FmtDemo {\n"
+    "int a;\n"
+    "void M() {\n"
+    "int b;\n"
+    "}\n"
+    "}\n"
+)
 
 OK_URI = "file:///t/Ok.zan"
 BAD_URI = "file:///t/Bad.zan"
 SYN_URI = "file:///t/Syn.zan"
 CJK_URI = "file:///t/Cjk.zan"
+FMT_URI = "file:///t/Fmt.zan"
 
 
 class Session(object):
@@ -178,6 +189,7 @@ def main():
                 "documentSymbolProvider", "hoverProvider",
                 "completionProvider", "renameProvider",
                 "documentHighlightProvider", "foldingRangeProvider",
+                "documentFormattingProvider", "documentRangeFormattingProvider",
                 "semanticTokensProvider"):
         if key not in caps:
             fail("initialize", "missing capability %s in %s" % (key, caps))
@@ -456,6 +468,54 @@ def main():
     if (3, cjk_line.index("string"), 6, 1) not in st:
         fail("semanticTokens cjk", "expected builtin string -> type, got %r"
              % (st,))
+
+    # formatting / rangeFormatting
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": FMT_URI, "languageId": "zan", "version": 1, "text": SRC_FMT}})
+
+    # formatting: full document format edit
+    fmt_res = s.request("textDocument/formatting", {
+        "textDocument": {"uri": FMT_URI},
+        "options": {"tabSize": 4, "insertSpaces": True}}).get("result")
+    want_fmt_text = (
+        "class FmtDemo {\n"
+        "    int a;\n"
+        "    void M() {\n"
+        "        int b;\n"
+        "    }\n"
+        "}\n"
+    )
+    if not isinstance(fmt_res, list) or len(fmt_res) != 1:
+        fail("formatting", "expected 1 full edit, got %r" % (fmt_res,))
+    if fmt_res[0].get("newText") != want_fmt_text:
+        fail("formatting", "expected formatted text %r, got %r"
+             % (want_fmt_text, fmt_res[0].get("newText")))
+
+    # rangeFormatting: format lines 1..3 of FMT_URI
+    rf_res = s.request("textDocument/rangeFormatting", {
+        "textDocument": {"uri": FMT_URI},
+        "range": {"start": {"line": 1, "character": 0},
+                  "end": {"line": 3, "character": 0}},
+        "options": {"tabSize": 4, "insertSpaces": True}}).get("result")
+    # line 1 (int a;) -> 4 spaces, line 2 (void M() {) -> 4 spaces, line 3 (int b;) -> 8 spaces
+    want_rf = [
+        {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": "    "},
+        {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 0}}, "newText": "    "},
+        {"range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 0}}, "newText": "        "},
+    ]
+    if rf_res != want_rf:
+        fail("rangeFormatting", "expected %r, got %r" % (want_rf, rf_res))
+
+    # rangeFormatting on already-clean lines produces empty edits []
+    rf_clean = s.request("textDocument/rangeFormatting", {
+        "textDocument": {"uri": OK_URI},
+        "range": {"start": {"line": 0, "character": 0},
+                  "end": {"line": 2, "character": 0}},
+        "options": {"tabSize": 4, "insertSpaces": True}}).get("result")
+    if rf_clean != []:
+        fail("rangeFormatting clean", "expected [], got %r" % (rf_clean,))
+
+    s.notify("textDocument/didClose", {"textDocument": {"uri": FMT_URI}})
 
     # didClose clears diagnostics
     s.notify("textDocument/didClose", {"textDocument": {"uri": SYN_URI}})
