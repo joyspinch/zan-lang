@@ -492,6 +492,16 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         "    </array>\n"
         "    <key>CFBundleIconFile</key>\n"
         "    <string>AppIcon60x60</string>\n"
+        "    <key>NSLocationWhenInUseUsageDescription</key>\n"
+        "    <string>This application requires access to location for navigation and local positioning services.</string>\n"
+        "    <key>NSFaceIDUsageDescription</key>\n"
+        "    <string>This application requires Face ID for biometric identity verification and security.</string>\n"
+        "    <key>NSPhotoLibraryUsageDescription</key>\n"
+        "    <string>This application requires access to photo library to select media files.</string>\n"
+        "    <key>NSCameraUsageDescription</key>\n"
+        "    <string>This application requires camera access to capture photos and videos.</string>\n"
+        "    <key>NSMicrophoneUsageDescription</key>\n"
+        "    <string>This application requires microphone access for audio input.</string>\n"
         "</dict>\n"
         "</plist>\n",
         app_name, bundle_id, app_name, display_name, version) != 0) {

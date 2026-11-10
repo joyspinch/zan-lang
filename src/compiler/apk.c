@@ -654,6 +654,12 @@ static int ensure_java(char *out, size_t outsz) {
 
 
 static int ensure_keystore(char *out, size_t outsz) {
+    const char *custom_ks = getenv("ZAN_ANDROID_KEYSTORE");
+    if (custom_ks && custom_ks[0] && file_exists(custom_ks)) {
+        if (zan_fmt_checked(out, outsz, "custom keystore path", "%s", custom_ks) == 0) {
+            return 0;
+        }
+    }
     const char *home = getenv("USERPROFILE");
     if (!home || !home[0]) home = getenv("HOME");
     if (!home || !home[0]) return -1;
@@ -873,16 +879,24 @@ success_zip: ;
         printf("  generated debug keystore ? %s\n", ks);
     }
 
+    const char *ks_pass = getenv("ZAN_ANDROID_KEYSTORE_PASS");
+    if (!ks_pass || !ks_pass[0]) ks_pass = "android";
+    const char *ks_alias = getenv("ZAN_ANDROID_KEY_ALIAS");
+    char alias_opt[300] = "";
+    if (ks_alias && ks_alias[0]) {
+        snprintf(alias_opt, sizeof(alias_opt), " --ks-key-alias \"%s\"", ks_alias);
+    }
+
     char scmd[4000];
 #ifdef _WIN32
     if (zan_fmt_checked(scmd, sizeof(scmd), "apksigner command",
-             "\"\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:android"
-             " --out \"%s\" \"%s\"\"", java, signer, ks, apk_path,
+             "\"\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:%s%s"
+             " --out \"%s\" \"%s\"\"", java, signer, ks, ks_pass, alias_opt, apk_path,
              tmp_apk) != 0) { remove(tmp_apk); return 1; }
 #else
     if (zan_fmt_checked(scmd, sizeof(scmd), "apksigner command",
-             "\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:android"
-             " --out \"%s\" \"%s\" >/dev/null 2>&1", java, signer, ks,
+             "\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:%s%s"
+             " --out \"%s\" \"%s\" >/dev/null 2>&1", java, signer, ks, ks_pass, alias_opt,
              apk_path, tmp_apk) != 0) { remove(tmp_apk); return 1; }
 #endif
     if (run_quiet(scmd) != 0) {
