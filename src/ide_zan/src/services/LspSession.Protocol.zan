@@ -136,12 +136,16 @@ partial class LspSession {
         return true;
     }
 
-    static void ExtractWorkspaceEdit(JsonDoc doc, int resNode, List<LspRenameEdit> output) {
-        if (resNode < 0 || doc.KindAt(resNode) != 5) { return; }
+    /// WorkspaceEdit 抽取；返回 false = 结构不支持，调用方必须整体拒绝
+    /// （返回 null），与 JsonValue 版的"拒绝而非静默跳过"语义一致。
+    static bool ExtractWorkspaceEdit(JsonDoc doc, int resNode, List<LspRenameEdit> output) {
+        if (resNode < 0 || doc.KindAt(resNode) != 5) { return true; }
         int changes = doc.Get(resNode, "changes");
         int docChanges = doc.Get(resNode, "documentChanges");
-        if (changes >= 0 && docChanges >= 0) { return; }
-        if (changes >= 0 && doc.KindAt(changes) == 5) {
+        if (changes >= 0 && docChanges >= 0) { return false; }
+        if (changes >= 0 && doc.KindAt(changes) != 5) { return false; }
+        if (docChanges >= 0 && doc.KindAt(docChanges) != 4) { return false; }
+        if (changes >= 0) {
             int p = (int)(doc.slots[changes].a >> 8);
             while (p >= 0) {
                 JsonPair pair = doc.pairs[p];
@@ -150,44 +154,51 @@ partial class LspSession {
                     : doc.escPool[pair.keyLen];
                 int edits = pair.valueSlot;
                 if (edits >= 0 && doc.KindAt(edits) == 4) {
-                    LspSession.AppendRenameEditsFromDoc(output, uri, doc, edits, -1);
+                    if (!LspSession.AppendRenameEditsFromDoc(output, uri, doc, edits, -1)) { return false; }
                 }
                 p = pair.nextPair;
             }
-        } else if (docChanges >= 0 && doc.KindAt(docChanges) == 4) {
+        } else if (docChanges >= 0) {
             int entry = doc.FirstChild(docChanges);
             while (entry >= 0) {
-                if (doc.KindAt(entry) == 5 && doc.Get(entry, "kind") < 0) {
-                    int document = doc.Get(entry, "textDocument");
-                    if (document >= 0 && doc.KindAt(document) == 5) {
-                        string uri = doc.Str(document, "uri", "");
-                        int version = (int)doc.Long(document, "version", -1L);
-                        int edits = doc.Get(entry, "edits");
-                        if (edits >= 0 && doc.KindAt(edits) == 4) {
-                            LspSession.AppendRenameEditsFromDoc(output, uri, doc, edits, version);
-                        }
-                    }
+                // 带 kind 的条目是 create/rename/delete 资源操作，不支持即整体拒绝。
+                if (doc.KindAt(entry) != 5 || doc.Get(entry, "kind") >= 0) { return false; }
+                int document = doc.Get(entry, "textDocument");
+                if (document < 0 || doc.KindAt(document) != 5) { return false; }
+                string uri = doc.Str(document, "uri", "");
+                int vslot = doc.Get(document, "version");
+                int version = -1;
+                if (vslot >= 0 && doc.KindAt(vslot) != 0) {
+                    version = (int)doc.Long(document, "version", -1L);
+                    if (version < 0) { return false; }
+                }
+                int edits = doc.Get(entry, "edits");
+                if (edits >= 0 && doc.KindAt(edits) == 4) {
+                    if (!LspSession.AppendRenameEditsFromDoc(output, uri, doc, edits, version)) { return false; }
                 }
                 entry = doc.NextSibling(entry);
             }
         }
+        return true;
     }
 
     static List<LspRenameEdit> ParseWorkspaceEdit(string m) {
         List<LspRenameEdit> output = new List<LspRenameEdit>();
         if (m == null || m.Length == 0) { return null; }
+        bool rejected = false;
         try {
             JsonDoc.ParseScoped(m, doc => {
                 int root = doc.root;
                 if (doc.KindAt(root) != 5 || doc.Get(root, "error") >= 0) { return; }
                 int result = doc.Get(root, "result");
                 if (result >= 0 && doc.KindAt(result) == 5) {
-                    LspSession.ExtractWorkspaceEdit(doc, result, output);
+                    if (!LspSession.ExtractWorkspaceEdit(doc, result, output)) { rejected = true; }
                 }
             });
         } catch (Exception) {
             return null;
         }
+        if (rejected) { return null; }
         return output;
     }
 

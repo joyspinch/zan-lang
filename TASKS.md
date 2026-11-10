@@ -63,10 +63,6 @@
 - 排查工具：`ZANC_DUMP_BAD_IR=1 build/zanc.exe <src> --auto-stdlib -o out.exe` 转储坏函数 IR（_scratch/bad_<fn>.txt）；`--emit-ir` 拿不到半成品 IR（验证器先跑，失败即退出）；全局 lambda 命名计数（lambda_tree.c lambda_id）从 IR 名反查宿主函数。
 - 备注：前置修复 E2002 私有 API 拦截（Socket 公共 API，commit 5245df9f3）后本缺陷才暴露。
 
-**〔前置〕lsp_session_editor 运行期挂起（E3090 修复后新暴露的下一层）**：
-- 现状：client 编译通过（E3090 已消），但 TCP 假服务器协议序列未完成——tests/lsp/run_lsp_session_test.py 断言"假服务器未完成协议序列"（约 145s 处失败）。E3090 挡住编译时该测试到不了协议阶段，故非回归而是新暴露。
-- 待查：ide_zan LspSession 的 TCP 会话实现运行期行为（连接/帧时序或 hang），属 B-ID199 timeout/运行期类缺口。
-
 **Gallery.zan 拆类顺延（配方已验证，待并发会话批次落地后执行）**：
 - 目标形态：单类 12,188 行 → Gallery 壳（Main/导航/GalleryPack）+ `examples/gui_gallery/demos/DemoXxx.zan` 逐控件家族；RenderPreviewEx（:5240-11503，约 300 分支）保留 name 分发，分支体迁 demos：`rendered = DemoButton.Render(app, c, t, name, px, py, y, w);`
 - 配方：① else-if 链花括号配平解析（闭括号是下一链头行前缀 `} else if`，body 切片不含闭括号，生成器须补）② build_gallery.ps1 加 demos/ 文件清单 ③ 先做外部引用清单（Button 家族 15 分支仅依赖 Gallery.Btn/IconBtn/LayoutAuto/PreviewPadTop/ShowAt/evtClicks/popTipOn + px/py 参数，无 rendered 写点）④ 逐家族编译推进，每家族一提交。
