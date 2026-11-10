@@ -22,203 +22,79 @@ public class WorkerWs {
         WorkerWs.EnableSharedBus("zan_ws_worker_bus");
     }
 
-    // 停掉跨进程总线轮询并解除静态持有。sharedBus/
-    // busConsumer 是 WsSharedBus→SharedTable 链在泄漏探测里的
-    // 保持根，退出前需显式拆卸避免残留。
-    public static void DisableSharedBus() {
-        if (WorkerWs.sharedBus != null) { WorkerWs.sharedBus.Stop(); }
-        WorkerWs.sharedBus = null;
-        WorkerWs.busConsumer = null;
+    // ---- 面向对象 WebSocketHub 服务委托 ----
+    public static WebSocketHub defaultHub = new WebSocketHub();
+    public static WebSocketHub Hub { get { return WorkerWs.defaultHub; } }
+
+    public static WsSharedBus sharedBus {
+        get { return WorkerWs.defaultHub.sharedBus; }
+        set { WorkerWs.defaultHub.sharedBus = value; }
+    }
+    public static WorkerWsConsumer busConsumer {
+        get { return WorkerWs.defaultHub.busConsumer; }
+        set { WorkerWs.defaultHub.busConsumer = value; }
+    }
+    public static Dict<string, List<Connection>> channels {
+        get { return WorkerWs.defaultHub.channels; }
+    }
+    public static nint chanLock {
+        get { return WorkerWs.defaultHub.chanLock; }
+        set { WorkerWs.defaultHub.chanLock = value; }
+    }
+    public static Dict<int, WsLink> conns {
+        get { return WorkerWs.defaultHub.conns; }
+    }
+    public static nint regLock {
+        get { return WorkerWs.defaultHub.regLock; }
+        set { WorkerWs.defaultHub.regLock = value; }
     }
 
-    // 进程退出前的拆卸入口：解除协议分片并停总线，
-    // 与 Install() 对称。
+    public static void ChanInit() { WorkerWs.defaultHub.ChanInit(); }
+    public static void RegInit() { WorkerWs.defaultHub.RegInit(); }
+
+    public static void EnableSharedBus(string busName) {
+        WorkerWs.defaultHub.EnableSharedBus(busName);
+    }
+
+    public static void DisableSharedBus() {
+        WorkerWs.defaultHub.DisableSharedBus();
+    }
+
     public static void Uninstall() {
         Worker.wsEntry = null;
-        WorkerWs.DisableSharedBus();
-        if (WorkerWs.chanLock != 0) {
-            Mutex.Lock(WorkerWs.chanLock);
-            WorkerWs.channels.Clear();
-            Mutex.Unlock(WorkerWs.chanLock);
-        }
-        if (WorkerWs.regLock != 0) {
-            Mutex.Lock(WorkerWs.regLock);
-            WorkerWs.conns.Clear();
-            Mutex.Unlock(WorkerWs.regLock);
-        }
+        WorkerWs.defaultHub.Clear();
     }
 
-    // ---- 跨进程消息总线与频道/房间管理 ----
-    public static WsSharedBus sharedBus = null;
-    public static WorkerWsConsumer busConsumer = null;
-    public static Dict<string, List<Connection>> channels = new Dict<string, List<Connection>>();
-    public static nint chanLock = Mutex.Create();
-
-    public static void ChanInit() {
-        if (WorkerWs.chanLock == 0) { WorkerWs.chanLock = Mutex.Create(); }
-    }
-
-    // 启用基于 SharedTable 共享内存的跨 Worker 进程 WebSocket 消息总线。
-    public static void EnableSharedBus(string busName) {
-        if (WorkerWs.sharedBus != null) { return; }
-        WorkerWs.sharedBus = new WsSharedBus(busName, 128);
-        if (WorkerWs.sharedBus.IsAvailable()) {
-            WorkerWs.busConsumer = new WorkerWsConsumer();
-            WorkerWs.sharedBus.StartPolling(WorkerWs.busConsumer);
-        }
-    }
-
-    // 订阅者加入频道/房间。
     public static void Join(string channel, Connection conn) {
-        if (conn == null || channel == "") { return; }
-        WorkerWs.ChanInit();
-        Mutex.Lock(WorkerWs.chanLock);
-        List<Connection> list = null;
-        if (WorkerWs.channels.ContainsKey(channel)) {
-            list = WorkerWs.channels[channel];
-        } else {
-            list = new List<Connection>();
-            WorkerWs.channels.Add(channel, list);
-        }
-        int id = conn.GetId();
-        bool exists = false;
-        for (int i = 0; i < list.Count; i = i + 1) {
-            if (list[i].GetId() == id) {
-                exists = true;
-                break;
-            }
-        }
-        if (!exists) {
-            list.Add(conn);
-        }
-        Mutex.Unlock(WorkerWs.chanLock);
+        WorkerWs.defaultHub.Join(channel, conn);
     }
 
-    // 订阅者离开频道/房间。
     public static void Leave(string channel, Connection conn) {
-        if (conn == null || channel == "") { return; }
-        WorkerWs.ChanInit();
-        Mutex.Lock(WorkerWs.chanLock);
-        if (WorkerWs.channels.ContainsKey(channel)) {
-            List<Connection> list = WorkerWs.channels[channel];
-            int id = conn.GetId();
-            for (int i = 0; i < list.Count; i = i + 1) {
-                if (list[i].GetId() == id) {
-                    list.RemoveAt(i);
-                    break;
-                }
-            }
-            if (list.Count == 0) {
-                WorkerWs.channels.Remove(channel);
-            }
-        }
-        Mutex.Unlock(WorkerWs.chanLock);
+        WorkerWs.defaultHub.Leave(channel, conn);
     }
 
-    // 断开时从所有频道中自动清理该连接。
     public static void LeaveAllChannels(Connection conn) {
-        if (conn == null) { return; }
-        WorkerWs.ChanInit();
-        Mutex.Lock(WorkerWs.chanLock);
-        int id = conn.GetId();
-        List<string> keys = WorkerWs.channels.Keys;
-        for (int k = 0; k < keys.Count; k = k + 1) {
-            string ch = keys[k];
-            List<Connection> list = WorkerWs.channels[ch];
-            for (int i = 0; i < list.Count; i = i + 1) {
-                if (list[i].GetId() == id) {
-                    list.RemoveAt(i);
-                    break;
-                }
-            }
-        }
-        Mutex.Unlock(WorkerWs.chanLock);
+        WorkerWs.defaultHub.LeaveAllChannels(conn);
     }
 
-    // ---- 连接注册表（对标 workerman $server->connections）----
-
-    // Upgrade 成功时登记，连接结束/回调关闭后移除。
-    // 使用 Dict<int, WsLink> 确保高并发长连接增删查与反查均为严格 O(1)。
-    // 多 worker 进程时注册表是进程内的——跨进程广播经 WsSharedBus 分发。
-    public static Dict<int, WsLink> conns = new Dict<int, WsLink>();
-    // 同步段进出 WS 连接协程用的互斥（--async-workers 下连接协程跑在
-    // 不同线程，Dict 本身不是线程安全）。
-    public static nint regLock = Mutex.Create();
-
-    // 惰性创建注册表用的互斥锁。
-    public static void RegInit() {
-        if (WorkerWs.regLock == 0) { WorkerWs.regLock = Mutex.Create(); }
-    }
-
-    // Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）：
-    // 出站 writer/client 挂到连接的注册项上，Push/Broadcast 经 id 找回。
     public static void Attach(Connection conn, WsWriter writer, TcpClient client) {
-        WorkerWs.RegInit();
-        Mutex.Lock(WorkerWs.regLock);
-        WsLink link = new WsLink();
-        link.conn = conn;
-        link.writer = writer;
-        link.client = client;
-        int id = conn.GetId();
-        if (WorkerWs.conns.ContainsKey(id)) {
-            WorkerWs.conns.Remove(id);
-        }
-        WorkerWs.conns.Add(id, link);
-        Mutex.Unlock(WorkerWs.regLock);
-        if (WorkerWs.sharedBus != null) {
-            WorkerWs.sharedBus.OnConnChange(1);
-        }
+        WorkerWs.defaultHub.Attach(conn, writer, client);
     }
 
-    // 连接结束后由 HandleWebSocket 调用（O(1) 删除）。
     public static void ConnRemove(Connection conn) {
-        WorkerWs.RegInit();
-        Mutex.Lock(WorkerWs.regLock);
-        int id = conn.GetId();
-        if (WorkerWs.conns.ContainsKey(id)) {
-            WsLink link = WorkerWs.conns[id];
-            link.Unlock();
-            while (link.waiters != null && link.waiters.Count > 0) {
-                AsyncGate g = link.waiters[0];
-                link.waiters.RemoveAt(0);
-                g.Signal();
-            }
-            WorkerWs.conns.Remove(id);
-        }
-        Mutex.Unlock(WorkerWs.regLock);
-        WorkerWs.LeaveAllChannels(conn);
-        if (WorkerWs.sharedBus != null) {
-            WorkerWs.sharedBus.OnConnChange(-1);
-        }
+        WorkerWs.defaultHub.ConnRemove(conn);
     }
 
-    // 按连接 id 找注册项；不存在（已断开）返回 null（O(1) 哈希查找）。
     public static WsLink LinkOf(int id) {
-        WorkerWs.RegInit();
-        Mutex.Lock(WorkerWs.regLock);
-        WsLink found = null;
-        if (WorkerWs.conns.ContainsKey(id)) {
-            found = WorkerWs.conns[id];
-        }
-        Mutex.Unlock(WorkerWs.regLock);
-        return found;
+        return WorkerWs.defaultHub.LinkOf(id);
     }
 
-    // 本进程当前在线 WebSocket 连接数。
     public static int ConnCount() {
-        WorkerWs.RegInit();
-        Mutex.Lock(WorkerWs.regLock);
-        int n = WorkerWs.conns.Count;
-        Mutex.Unlock(WorkerWs.regLock);
-        return n;
+        return WorkerWs.defaultHub.ConnCount();
     }
 
-    // 获取集群跨 Worker 实时在线 WebSocket 连接总数。
     public static int ClusterConnCount() {
-        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
-            return WorkerWs.sharedBus.GetTotalConnCount();
-        }
-        return WorkerWs.ConnCount();
+        return WorkerWs.defaultHub.ClusterConnCount();
     }
 
     // 按连接 id 取在线连接；不存在（已断开）返回 null。
@@ -591,6 +467,182 @@ public class WorkerWs {
             w.DropConn();
             ConnectionCloseHandler onDown = w.onClose;
             if (onDown != null) { await onDown(conn); }
+        }
+    }
+}
+
+// WebSocket 业务连接中枢与广播 Hub 服务（面向对象化封装）
+public class WebSocketHub {
+    public WsSharedBus sharedBus = null;
+    public WorkerWsConsumer busConsumer = null;
+    public Dict<string, List<Connection>> channels = new Dict<string, List<Connection>>();
+    public nint chanLock = Mutex.Create();
+    public Dict<int, WsLink> conns = new Dict<int, WsLink>();
+    public nint regLock = Mutex.Create();
+
+    public void ChanInit() {
+        if (this.chanLock == 0) { this.chanLock = Mutex.Create(); }
+    }
+
+    public void RegInit() {
+        if (this.regLock == 0) { this.regLock = Mutex.Create(); }
+    }
+
+    public void EnableSharedBus(string busName) {
+        if (this.sharedBus != null) { return; }
+        this.sharedBus = new WsSharedBus(busName, 128);
+        if (this.sharedBus.IsAvailable()) {
+            this.busConsumer = new WorkerWsConsumer();
+            this.sharedBus.StartPolling(this.busConsumer);
+        }
+    }
+
+    public void DisableSharedBus() {
+        if (this.sharedBus != null) { this.sharedBus.Stop(); }
+        this.sharedBus = null;
+        this.busConsumer = null;
+    }
+
+    public void Join(string channel, Connection conn) {
+        if (conn == null || channel == "") { return; }
+        this.ChanInit();
+        Mutex.Lock(this.chanLock);
+        List<Connection> list = null;
+        if (this.channels.ContainsKey(channel)) {
+            list = this.channels[channel];
+        } else {
+            list = new List<Connection>();
+            this.channels.Add(channel, list);
+        }
+        int id = conn.GetId();
+        bool exists = false;
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].GetId() == id) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            list.Add(conn);
+        }
+        Mutex.Unlock(this.chanLock);
+    }
+
+    public void Leave(string channel, Connection conn) {
+        if (conn == null || channel == "") { return; }
+        this.ChanInit();
+        Mutex.Lock(this.chanLock);
+        if (this.channels.ContainsKey(channel)) {
+            List<Connection> list = this.channels[channel];
+            int id = conn.GetId();
+            for (int i = 0; i < list.Count; i = i + 1) {
+                if (list[i].GetId() == id) {
+                    list.RemoveAt(i);
+                    break;
+                }
+            }
+            if (list.Count == 0) {
+                this.channels.Remove(channel);
+            }
+        }
+        Mutex.Unlock(this.chanLock);
+    }
+
+    public void LeaveAllChannels(Connection conn) {
+        if (conn == null) { return; }
+        this.ChanInit();
+        Mutex.Lock(this.chanLock);
+        int id = conn.GetId();
+        List<string> keys = this.channels.Keys;
+        for (int k = 0; k < keys.Count; k = k + 1) {
+            string ch = keys[k];
+            List<Connection> list = this.channels[ch];
+            for (int i = 0; i < list.Count; i = i + 1) {
+                if (list[i].GetId() == id) {
+                    list.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        Mutex.Unlock(this.chanLock);
+    }
+
+    public void Attach(Connection conn, WsWriter writer, TcpClient client) {
+        this.RegInit();
+        Mutex.Lock(this.regLock);
+        WsLink link = new WsLink();
+        link.conn = conn;
+        link.writer = writer;
+        link.client = client;
+        int id = conn.GetId();
+        if (this.conns.ContainsKey(id)) {
+            this.conns.Remove(id);
+        }
+        this.conns.Add(id, link);
+        Mutex.Unlock(this.regLock);
+        if (this.sharedBus != null) {
+            this.sharedBus.OnConnChange(1);
+        }
+    }
+
+    public void ConnRemove(Connection conn) {
+        this.RegInit();
+        Mutex.Lock(this.regLock);
+        int id = conn.GetId();
+        if (this.conns.ContainsKey(id)) {
+            WsLink link = this.conns[id];
+            link.Unlock();
+            while (link.waiters != null && link.waiters.Count > 0) {
+                AsyncGate g = link.waiters[0];
+                link.waiters.RemoveAt(0);
+                g.Signal();
+            }
+            this.conns.Remove(id);
+        }
+        Mutex.Unlock(this.regLock);
+        this.LeaveAllChannels(conn);
+        if (this.sharedBus != null) {
+            this.sharedBus.OnConnChange(-1);
+        }
+    }
+
+    public WsLink LinkOf(int id) {
+        this.RegInit();
+        Mutex.Lock(this.regLock);
+        WsLink found = null;
+        if (this.conns.ContainsKey(id)) {
+            found = this.conns[id];
+        }
+        Mutex.Unlock(this.regLock);
+        return found;
+    }
+
+    public int ConnCount() {
+        this.RegInit();
+        Mutex.Lock(this.regLock);
+        int n = this.conns.Count;
+        Mutex.Unlock(this.regLock);
+        return n;
+    }
+
+    public int ClusterConnCount() {
+        if (this.sharedBus != null && this.sharedBus.IsAvailable()) {
+            return this.sharedBus.GetTotalConnCount();
+        }
+        return this.ConnCount();
+    }
+
+    public void Clear() {
+        this.DisableSharedBus();
+        if (this.chanLock != 0) {
+            Mutex.Lock(this.chanLock);
+            this.channels.Clear();
+            Mutex.Unlock(this.chanLock);
+        }
+        if (this.regLock != 0) {
+            Mutex.Lock(this.regLock);
+            this.conns.Clear();
+            Mutex.Unlock(this.regLock);
         }
     }
 }
