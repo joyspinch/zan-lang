@@ -157,3 +157,34 @@ gate_check_code_standards() {
     fi
     return 0
 }
+
+# ---- check: composite-include (unity) splice order -------------------------
+# WORKSPACE_CONVENTIONS.md §10 / scripts/unity_order_check.py: composite
+# dispatcher TUs carry order-bearing splices (e.g. rt_io_co_pool.c must be
+# spliced before rt_io_co_sched.c so its pthread->Win32 shim is in scope).
+# Natural-language comments stating such constraints have rotted twice
+# already (irgen_call_async.c A550, reflect_thunks.c); machine-readable
+# UNITY-ORDER: markers keep them checked.
+gate_check_unity_order() {
+    _guo_py=""
+    if command -v python3 >/dev/null 2>&1; then
+        _guo_py="python3"
+    elif command -v python >/dev/null 2>&1; then
+        _guo_py="python"
+    fi
+    if [ -z "$_guo_py" ]; then
+        return 0
+    fi
+    _guo_top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    _guo_script="$_guo_top/scripts/unity_order_check.py"
+    if [ ! -f "$_guo_script" ]; then
+        return 0
+    fi
+    # 只有触及编译器/运行时 .c 的提交才值得全树扫一遍拼接图。
+    if ! git diff --cached --name-only -- src/compiler src/runtime 2>/dev/null |
+         grep -q '\.c$'; then
+        return 0
+    fi
+    "$_guo_py" "$_guo_script" --root "$_guo_top" >&2 || return 1
+    return 0
+}

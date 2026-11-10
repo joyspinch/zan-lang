@@ -188,14 +188,6 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
         mattrs }, 8);
 }
 
-/* Unity 前向声明：定义在 irgen_builtins.c / irgen_expr_ops.c（unity 序列
-   在本文件之后）。 */
-void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj);
-void emit_eh_tmp_pop(zan_irgen_t *g);
-void emit_implicit_field_initializers(zan_irgen_t *g,
-    zan_symbol_t *type_sym, zan_type_t *recv_type, LLVMValueRef object_ptr,
-    local_scope_t *locals);
-
 static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
                                          LLVMValueRef ctor_fn,
                                          LLVMTypeRef ctor_ty) {

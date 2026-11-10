@@ -5893,6 +5893,17 @@ add_test(NAME policy_no_widget_drawing
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_no_widget_drawing.cmake)
 
+# ---- Policy: composite-include (unity) splices keep order and markers ----
+# Order-bearing splices are stated with UNITY-ORDER: markers and checked by
+# scripts/unity_order_check.py (same gate the pre-commit hook runs when
+# compiler/runtime .c changes). Registered only when a python interpreter was
+# found at configure time, mirroring csharp_compat_oracle above.
+if(ZAN_PYTHON_EXE)
+  add_test(NAME policy_unity_order
+    COMMAND ${ZAN_PYTHON_EXE} ${CMAKE_SOURCE_DIR}/scripts/unity_order_check.py
+      --root ${CMAKE_SOURCE_DIR})
+endif()
+
 add_test(NAME policy_gallery_coverage
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_gallery_coverage.cmake)

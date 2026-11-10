@@ -1,10 +1,5 @@
 #include "irgen_internal.h"
 
-/* bool -> 托管串（irgen_generics.c）："true" / "false" */
-LLVMValueRef emit_bool_to_cstr(zan_irgen_t *g, LLVMValueRef v);
-
-/* A550：定义在 irgen_stmt.c（unity 排序在其后），这里前置声明。 */
-bool call_is_async_callee(zan_irgen_t *g, zan_ast_node_t *call, local_scope_t *locals);
 LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
                                            bool keep_result, bool is_explicit_spawn) {
     if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind)
