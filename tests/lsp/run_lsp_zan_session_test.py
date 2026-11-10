@@ -18,6 +18,9 @@ script drives one full session and asserts the B-ID200 first-slice behaviors:
   documentHighlight              word-boundary hits in current doc, kind=1
   foldingRange                   brace regions via string/comment state
                                  machine; same-line braces skipped
+  semanticTokens                 real-lexer token stream, symbol-index
+                                 classified, delta-encoded; CJK string
+                                 length in UTF-16
   didChange                      re-analysis, version bump
   syntax error                   parser diagnostics
   cjk utf-16 columns             diagnostics/hover positions after CJK
@@ -174,9 +177,15 @@ def main():
     for key in ("definitionProvider", "referencesProvider",
                 "documentSymbolProvider", "hoverProvider",
                 "completionProvider", "renameProvider",
-                "documentHighlightProvider", "foldingRangeProvider"):
+                "documentHighlightProvider", "foldingRangeProvider",
+                "semanticTokensProvider"):
         if key not in caps:
             fail("initialize", "missing capability %s in %s" % (key, caps))
+    sem_legend = caps["semanticTokensProvider"].get("legend", {})
+    if sem_legend.get("tokenTypes", [])[2] != "class" or \
+            not caps["semanticTokensProvider"].get("full"):
+        fail("initialize", "semanticTokens legend/full wrong: %r"
+             % (caps["semanticTokensProvider"],))
     if not caps["renameProvider"].get("prepareProvider"):
         fail("initialize", "renameProvider.prepareProvider missing: %r"
              % (caps["renameProvider"],))
@@ -401,6 +410,52 @@ def main():
     ]
     if hl != want_hl:
         fail("documentHighlight", "expected %r, got %r" % (want_hl, hl))
+
+    # semanticTokens/full：真 Lexer 流，delta 还原绝对 (line, char, len,
+    # type) 后断关键分类。legend：11 keyword 1 type 2 class 8 property
+    # 10 method 7 variable 12 string
+    def decode_sem(data):
+        out, pl, pc = [], 0, 0
+        for k in range(0, len(data), 5):
+            dl, ds, ln, ty = data[k], data[k + 1], data[k + 2], data[k + 3]
+            line = pl + dl
+            char = (pc + ds) if dl == 0 else ds
+            out.append((line, char, ln, ty))
+            pl, pc = line, char
+        return out
+
+    line0 = SRC_OK.splitlines()[0]   # 'class ZDemo {'
+    g1 = line2.index("Get")
+    st = decode_sem(s.request("textDocument/semanticTokens/full", {
+        "textDocument": {"uri": OK_URI}}).get("result", {}).get("data", []))
+    want_st = {
+        (0, 0, 5, 11),                       # class
+        (0, line0.index("ZDemo"), 5, 2),     # ZDemo → class 符号
+        (1, v1, 3, 8),                       # Val → field/property
+        (2, g1, 3, 10),                      # Get → method
+        (1, line1.index("int"), 3, 1),       # int → 内建类型
+        (2, line2.index("return"), 6, 11),   # return → keyword
+    }
+    missing = want_st - set(st)
+    if missing:
+        fail("semanticTokens", "missing tokens %r in %r" % (missing, st))
+    # 相对编码单调性：行不减，同行内列不减
+    for a, b in zip(st, st[1:]):
+        if (b[0], b[1]) < (a[0], a[1]):
+            fail("semanticTokens", "non-monotonic order: %r then %r" % (a, b))
+
+    # CJK 行：字符串字面量 length 走 UTF-16。"中文备注" 是 BMP 汉字
+    # （UTF-16 每字 1 unit，非 4 字节 UTF-8 代理对）：4 units + 2 引号 = 6
+    st = decode_sem(s.request("textDocument/semanticTokens/full", {
+        "textDocument": {"uri": CJK_URI}}).get("result", {}).get("data", []))
+    cjk_line = SRC_CJK.splitlines()[3]
+    q = cjk_line.index('"')
+    if (3, q, 6, 12) not in st:
+        fail("semanticTokens cjk", "expected (3,%d,6,12) string literal, "
+             "got %r" % (q, st))
+    if (3, cjk_line.index("string"), 6, 1) not in st:
+        fail("semanticTokens cjk", "expected builtin string -> type, got %r"
+             % (st,))
 
     # didClose clears diagnostics
     s.notify("textDocument/didClose", {"textDocument": {"uri": SYN_URI}})

@@ -16,6 +16,8 @@ namespace Zan;
 ///   同一近似口径，语义过滤顺延）；新名校验与 C 宿主 lsp_main.c 同形。
 /// - documentHighlight/foldingRange：当前文档词边界高亮（kind=1 Text）+
 ///   花括号折叠区间（跨字符串/注释状态机，与 C 宿主同口径）。
+/// - semanticTokens/full：真前端 Lexer token 流 + 符号索引分类，相对
+///   编码五元组，legend 与 C 宿主同表（15 类），列/长度出站 UTF-16。
 /// - hover：符号索引信息（种类+声明位置）；内建类型写死描述。
 /// - completion：符号索引 + 关键字/内建类型，按光标前缀过滤。
 /// 已知局限（后续切片收敛，见 TASKS.md B-ID200）：
@@ -724,7 +726,13 @@ public class LspServer {
                 + "\"documentSymbolProvider\":true,"
                 + "\"renameProvider\":{\"prepareProvider\":true},"
                 + "\"documentHighlightProvider\":true,"
-                + "\"foldingRangeProvider\":true"
+                + "\"foldingRangeProvider\":true,"
+                + "\"semanticTokensProvider\":{"
+                + "\"legend\":{\"tokenTypes\":["
+                + "\"namespace\",\"type\",\"class\",\"enum\",\"interface\","
+                + "\"struct\",\"parameter\",\"variable\",\"property\","
+                + "\"function\",\"method\",\"keyword\",\"string\",\"number\","
+                + "\"operator\"],\"tokenModifiers\":[]},\"full\":true}"
                 + "}}}";
             SendResponse(res);
             return;
@@ -805,6 +813,11 @@ public class LspServer {
 
         if (method == "textDocument/foldingRange") {
             HandleFoldingRange(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/semanticTokens/full") {
+            HandleSemanticTokens(id, pms);
             return;
         }
 
@@ -1271,6 +1284,115 @@ public class LspServer {
             }
         }
         sb.Append("]}");
+        SendResponse(sb.ToString());
+    }
+
+    // ===================== semanticTokens =====================
+
+    // legend 与 C 宿主 lsp_main.c 同表：0 namespace 1 type 2 class 3 enum
+    // 4 interface 5 struct 6 parameter 7 variable 8 property 9 function
+    // 10 method 11 keyword 12 string 13 number 14 operator
+
+    /// 内建类型关键字（归 type=1，与 C 宿主 map_token_type 同表）。
+    static bool IsBuiltinTypeToken(int kind) {
+        return kind == TK.Bool() || kind == TK.Byte() || kind == TK.Char()
+            || kind == TK.Double() || kind == TK.Float() || kind == TK.Int()
+            || kind == TK.Long() || kind == TK.Object() || kind == TK.Short()
+            || kind == TK.String() || kind == TK.Var() || kind == TK.Void()
+            || kind == TK.Uint() || kind == TK.Ulong() || kind == TK.Ushort()
+            || kind == TK.Sbyte() || kind == TK.Decimal() || kind == TK.Nint();
+    }
+
+    /// 符号索引种类 → legend 类型（与 C 宿主 isym→legend 映射同表；
+    /// 本索引无 namespace/parameter/variable 符号，未匹配走大小写兜底）。
+    static int SymTokenType(LspSymbol sym) {
+        if (sym.Kind == LspSymbol.KindClass()) { return 2; }
+        if (sym.Kind == LspSymbol.KindStruct()) { return 5; }
+        if (sym.Kind == LspSymbol.KindEnum()) { return 3; }
+        if (sym.Kind == LspSymbol.KindInterface()) { return 4; }
+        if (sym.Kind == LspSymbol.KindMethod()
+                || sym.Kind == LspSymbol.KindCtor()) { return 10; }
+        if (sym.Kind == LspSymbol.KindField()) { return 8; }
+        if (sym.Kind == LspSymbol.KindDelegate()) { return 9; }
+        return -1;
+    }
+
+    /// textDocument/semanticTokens/full：真前端 Lexer token 流 + 符号索引
+    /// 分类，输出相对编码五元组 [deltaLine, deltaStart, length, type, 0]。
+    /// 列与长度出站均 UTF-16。已知口径：字符串/字符字面量的 Token.text 是
+    /// 不含引号的值，length +2 补引号（插值串分段近似同口径）；
+    /// 括号/分号等结构标点不产出（同 C 宿主 default -1）；C 宿主把
+    /// operator 归 keyword(11)，selfhost 按语义归 operator(14)——legend
+    /// 由本表声明，客户端按表着色。
+    static void HandleSemanticTokens(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        LspDocument doc = FindDocument(uri);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":{\"data\":[");
+        if (doc != null) {
+            Lexer lx = new Lexer(doc.Text);
+            List<Token> toks = lx.Run();
+            int prevLine = 0;
+            int prevChar = 0;
+            int emitted = 0;
+            int i = 0;
+            while (i < toks.Count) {
+                Token tok = toks[i];
+                i = i + 1;
+                int ttype = -1;
+                int tlenBytes = tok.text.Length;
+                if (tok.kind == TK.Ident()) {
+                    LspSymbol sym = FindSymbol(tok.text);
+                    if (sym != null) { ttype = SymTokenType(sym); }
+                    if (ttype < 0) {
+                        // 无符号匹配：首字母大写兜底 type，否则 variable
+                        // （与 C 宿主 fallback 同口径）
+                        if (tlenBytes > 0 && tok.text[0] >= 'A'
+                                && tok.text[0] <= 'Z') {
+                            ttype = 1;
+                        } else {
+                            ttype = 7;
+                        }
+                    }
+                } else if (tok.kind == TK.StringLit()
+                        || tok.kind == TK.CharLit()) {
+                    ttype = 12;
+                    tlenBytes = tok.text.Length + 2; // 补两侧引号
+                } else if (tok.kind == TK.IntLit()
+                        || tok.kind == TK.FloatLit()) {
+                    ttype = 13;
+                } else if (IsBuiltinTypeToken(tok.kind)) {
+                    ttype = 1;
+                } else if (tok.kind >= TK.Arrow()) {
+                    // => 与算术/比较/逻辑/赋值/移位族
+                    ttype = 14;
+                } else if (tok.kind >= TK.Abstract() && tok.kind < TK.LParen()) {
+                    ttype = 11;
+                }
+                if (ttype < 0 || tlenBytes <= 0) { continue; }
+                int line0 = tok.line - 1;
+                if (line0 < 0) { line0 = 0; }
+                int u16s = Utf16ColOf(doc.Text, line0, tok.col - 1);
+                int u16e = Utf16ColOf(doc.Text, line0,
+                    tok.col - 1 + tlenBytes);
+                int len16 = u16e - u16s;
+                if (len16 <= 0) { continue; }
+                int dLine = line0 - prevLine;
+                int dStart = dLine == 0 ? u16s - prevChar : u16s;
+                if (emitted > 0) { sb.Append(','); }
+                emitted = emitted + 1;
+                sb.Append(dLine + "," + dStart + "," + len16 + "," + ttype
+                    + ",0");
+                prevLine = line0;
+                prevChar = u16s;
+            }
+        }
+        // ] 收 data 数组，} 收 result 对象，} 收根对象——result 比其他
+        // handler 多嵌套一层（对象包数组），收尾三字符缺一不可
+        sb.Append("]}}");
         SendResponse(sb.ToString());
     }
 
