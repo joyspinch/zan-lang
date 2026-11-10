@@ -1,5 +1,6 @@
 #include "irgen_internal.h"
-/* irgen_expr.c: 表达式代码生成、NativeMemory 原语、Lambda 发射与泛型方法推导 (由 irgen.c 包含) */
+/* expr_span.c: Span<T> 发射——存储布局、Slice 窗口越界检查与 span 调用分派。
+ * 拼接片段（fragment）：由 irgen_expr.c #include，非独立编译单元。 */
 LLVMValueRef get_async_result_ptr(zan_irgen_t *g);
 LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g);
 
