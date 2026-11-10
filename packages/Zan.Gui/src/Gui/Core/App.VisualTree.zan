@@ -15,6 +15,21 @@ public partial class App {
     // 鼠标按下目标缓存（用于手势判定：按下和抬起在同一个控件上时才合成 Click）
     Control pointerDownTarget;
 
+    // 当前输入设备的指针类型（0: Mouse 默认桌面鼠标, 1: Touch 触屏, 2: Pen 触控笔）
+    public int currentPointerType;
+    int touchDownX;
+    int touchDownY;
+    bool touchSlopExceeded;
+    const int TOUCH_SLOP_PX = 8; // 8px 触控手势防抖阈值
+
+    public void SetPointerDeviceType(int type) {
+        this.currentPointerType = type;
+    }
+
+    public int GetPointerDeviceType() {
+        return this.currentPointerType;
+    }
+
     // 捕获指针输入：后续所有的 PointerMove / PointerUp 将直接定向投递给该控件，
     // 即使鼠标已移出控件边界或窗口边界。
     public void CapturePointer(Control ctl) {
@@ -36,29 +51,53 @@ public partial class App {
         this.rootControl = root;
     }
 
-    // 将底层 OS 输入事件尝试分发给 Visual Tree 路由管线。
+    // 将底层 OS 输入事件尝试分发给 Visual Tree 路由管线（默认采用当前指针类型）。
     // 返回 true 表示 Visual Tree 已完全消费（e.handled == true），无需继续走老式 HitTester 扁平查表。
     public bool DispatchVisualTree(int eventKind, int x, int y, int keyCode, int delta) {
+        return this.DispatchVisualTree(eventKind, x, y, keyCode, delta, this.currentPointerType);
+    }
+
+    // 双模混合指针输入路由核心仲裁器：
+    // - 鼠标模式 (0): 1px 像素级命中、高精度悬停穿越、零延迟点击
+    // - 触控模式 (1): 44px 热区容差吸附、8px 防抖死区判定、滑动时取消按压、抬手消除 Sticky Hover
+    // - 笔模式 (2): 高精度触控笔与压感
+    public bool DispatchVisualTree(int eventKind, int x, int y, int keyCode, int delta, int pointerType) {
+        this.currentPointerType = pointerType;
         if (this.rootControl == null && this.capturedPointerControl == null) {
             return false;
         }
 
         Control target = this.capturedPointerControl;
         if (target == null && this.rootControl != null) {
-            target = this.rootControl.HitTest(x, y);
+            target = this.rootControl.HitTest(x, y, pointerType);
         }
 
-        // 处理鼠标移动带来的 Hover 穿越（PointerEnter / PointerLeave）
-        if (eventKind == 1) {
-            if (this.lastHoveredControl != target) {
-                if (this.lastHoveredControl != null) {
-                    RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", this.lastHoveredControl, x, y);
-                    Control.RouteEvent(this.lastHoveredControl, leave);
+        // 处理鼠标移动与触控滑动带来的状态流转
+        if (eventKind == 1) { // PointerMove
+            if (pointerType == 1) {
+                // 触控滑动状态机：检测手指位移是否突破防抖死区（8px）
+                if (this.pointerDownTarget != null && !this.touchSlopExceeded) {
+                    int dx = x - this.touchDownX;
+                    int dy = y - this.touchDownY;
+                    if (dx * dx + dy * dy >= TOUCH_SLOP_PX * TOUCH_SLOP_PX) {
+                        this.touchSlopExceeded = true;
+                        // 确认突破防抖死区：手势意图由「点击」升级为「滑动/滚动」，向被按压控件发送取消通知
+                        RoutedEventArgs cancelEvt = new RoutedEventArgs("PointerCancel", this.pointerDownTarget, x, y, pointerType);
+                        Control.RouteEvent(this.pointerDownTarget, cancelEvt);
+                    }
                 }
-                this.lastHoveredControl = target;
-                if (target != null) {
-                    RoutedEventArgs enter = new RoutedEventArgs("PointerEnter", target, x, y);
-                    Control.RouteEvent(target, enter);
+            } else {
+                // 鼠标模式：标准的实时 Hover 穿越（PointerEnter / PointerLeave）
+                if (this.lastHoveredControl != target) {
+                    if (this.lastHoveredControl != null) {
+                        RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", this.lastHoveredControl, x, y, pointerType);
+                        Control.RouteEvent(this.lastHoveredControl, leave);
+                    }
+                    this.lastHoveredControl = target;
+                    if (target != null) {
+                        RoutedEventArgs enter = new RoutedEventArgs("PointerEnter", target, x, y, pointerType);
+                        Control.RouteEvent(target, enter);
+                    }
                 }
             }
         }
@@ -79,18 +118,24 @@ public partial class App {
             return false;
         }
 
-        RoutedEventArgs e = new RoutedEventArgs(evtName, target, x, y);
+        RoutedEventArgs e = new RoutedEventArgs(evtName, target, x, y, pointerType);
         e.keyCode = keyCode;
         e.delta = delta;
 
-        if (eventKind == 2) {
+        if (eventKind == 2) { // PointerDown
             this.pointerDownTarget = target;
+            if (pointerType == 1) { // 触控记录初次落点以计算防抖死区
+                this.touchDownX = x;
+                this.touchDownY = y;
+                this.touchSlopExceeded = false;
+                this.lastHoveredControl = target;
+            }
         }
 
         // 执行完整的隧穿与冒泡路由
         Control.RouteEvent(target, e);
 
-        // 如果是鼠标按下，将焦点同步转移给命中目标（双轨兼顾）
+        // 如果是按下，将焦点同步转移给命中目标（双轨兼顾）
         if (eventKind == 2 && target != null) {
             if (this.focus != null) {
                 this.focus.SetFocused(target.WidgetId());
@@ -99,14 +144,27 @@ public partial class App {
 
         // 如果是点击释放且在同一个目标上释放，合成标准 Click 路由事件
         if (eventKind == 3 && target != null && !e.handled) {
-            if (this.pointerDownTarget == target) {
-                RoutedEventArgs clickEvt = new RoutedEventArgs("Click", target, x, y);
+            // 防抖与滑动保护：若在触屏上移动距离超出了防抖阈值（如列表滚动手势），严禁合成 Click
+            bool allowClick = true;
+            if (pointerType == 1 && this.touchSlopExceeded) {
+                allowClick = false;
+            }
+
+            if (allowClick && this.pointerDownTarget == target) {
+                RoutedEventArgs clickEvt = new RoutedEventArgs("Click", target, x, y, pointerType);
                 Control.RouteEvent(target, clickEvt);
                 if (clickEvt.handled) {
                     e.Handle();
                 }
             }
             this.pointerDownTarget = null;
+
+            // 触屏关键治理：手指离屏后立即清除悬停态，彻底根除桌面 Hover 粘滞残留（Sticky Hover）
+            if (pointerType == 1 && this.lastHoveredControl != null) {
+                RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", this.lastHoveredControl, x, y, pointerType);
+                Control.RouteEvent(this.lastHoveredControl, leave);
+                this.lastHoveredControl = null;
+            }
         }
 
         return e.handled;
