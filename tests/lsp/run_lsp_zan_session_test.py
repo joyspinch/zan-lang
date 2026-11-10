@@ -5,12 +5,16 @@ exe (entry: tests/selfhost/lsp_zan_session_entry.zan, built by CMake). This
 script drives one full session and asserts the B-ID200 first-slice behaviors:
 
   initialize capabilities        full sync + diag/completion/hover/definition/
-                                 references/documentSymbol providers
+                                 references/documentSymbol/rename providers
   real diagnostics               semantic error (undefined type) with position
   clean document                 empty diagnostics, version echoed
   documentSymbol                 class with nested field/method children
   definition / references / hover   symbol-index based lookups
   completion                     keyword + symbol filtering by cursor prefix
+  prepareRename                  word range + placeholder; null on whitespace
+  rename                         WorkspaceEdit across hits (incl. CJK line,
+                                 UTF-16 columns); null on invalid newName;
+                                 error -32602 on keyword newName
   didChange                      re-analysis, version bump
   syntax error                   parser diagnostics
   cjk utf-16 columns             diagnostics/hover positions after CJK
@@ -166,9 +170,12 @@ def main():
     caps = s.request("initialize", {}).get("result", {}).get("capabilities", {})
     for key in ("definitionProvider", "referencesProvider",
                 "documentSymbolProvider", "hoverProvider",
-                "completionProvider"):
+                "completionProvider", "renameProvider"):
         if key not in caps:
             fail("initialize", "missing capability %s in %s" % (key, caps))
+    if not caps["renameProvider"].get("prepareProvider"):
+        fail("initialize", "renameProvider.prepareProvider missing: %r"
+             % (caps["renameProvider"],))
     s.notify("initialized", {})
 
     # didOpen clean document -> empty diagnostics, version echoed
@@ -283,6 +290,94 @@ def main():
     if "Val" not in hv_text or "field" not in hv_text:
         fail("cjk hover", "expected Val field hover via UTF-16 col, got %r"
              % (hv,))
+
+    # ---- rename / prepareRename（词边界近似口径）----
+    # 期望列全部从源码现算，避免手数错位
+    line1 = SRC_OK.splitlines()[1]   # '    public int Val;'
+    line2 = SRC_OK.splitlines()[2]   # '    public int Get() { return Val; }'
+    v1 = line1.index("Val")
+    v2 = line2.index("Val")
+    on_val = {"line": 1, "character": v1 + 1}
+
+    # prepareRename：光标在 Val → 词 range + placeholder
+    pr = s.request("textDocument/prepareRename", {
+        "textDocument": {"uri": OK_URI}, "position": on_val}).get("result")
+    if not pr or pr.get("placeholder") != "Val" or \
+            pr["range"]["start"] != {"line": 1, "character": v1} or \
+            pr["range"]["end"] != {"line": 1, "character": v1 + 3}:
+        fail("prepareRename", "expected Val range at char %d, got %r"
+             % (v1, pr))
+
+    # prepareRename 在空白处 → null
+    pr = s.request("textDocument/prepareRename", {
+        "textDocument": {"uri": OK_URI},
+        "position": {"line": 1, "character": 2}}).get("result")
+    if pr is not None:
+        fail("prepareRename whitespace", "expected null, got %r" % (pr,))
+
+    # rename Val→Count：声明 + return 共 2 处；CJK 行尾注释里的 Val
+    # 跨文档也命中（词边界近似，含全部打开文档）
+    ren = s.request("textDocument/rename", {
+        "textDocument": {"uri": OK_URI},
+        "position": on_val, "newName": "Count"}).get("result") or {}
+    edits = (ren.get("changes") or {}).get(OK_URI)
+    if not edits or len(edits) != 2:
+        fail("rename", "expected 2 edits for Val, got %r" % (ren,))
+    want_starts = [{"line": 1, "character": v1}, {"line": 2, "character": v2}]
+    if [e["range"]["start"] for e in edits] != want_starts:
+        fail("rename", "expected starts %r, got %r"
+             % (want_starts, [e["range"]["start"] for e in edits]))
+    if edits[0]["range"]["end"] != {"line": 1, "character": v1 + 3} or \
+            any(e["newText"] != "Count" for e in edits):
+        fail("rename", "bad edit shape: %r" % (edits,))
+    # SRC_CJK 第 1 行同款字段声明 + 第 3 行行尾注释，共 2 处
+    cjk_val = (ren.get("changes") or {}).get(CJK_URI)
+    want_cjk = [
+        {"line": 1, "character": line1.index("Val")},
+        {"line": 3, "character": utf16_length(
+            '    string s = "中文备注"; Missing m = null; // 中文尾注 ')},
+    ]
+    if not cjk_val or [e["range"]["start"] for e in cjk_val] != want_cjk:
+        fail("rename cross-doc", "expected CJK_URI hits %r, got %r"
+             % (want_cjk, cjk_val))
+
+    # rename 非法新名 → null；关键字新名 → error -32602
+    for bad in ("9Bad", "a-b", ""):
+        ren = s.request("textDocument/rename", {
+            "textDocument": {"uri": OK_URI},
+            "position": on_val, "newName": bad}).get("result")
+        if ren is not None:
+            fail("rename invalid", "newName %r: expected null, got %r"
+                 % (bad, ren))
+    resp = s.request("textDocument/rename", {
+        "textDocument": {"uri": OK_URI},
+        "position": on_val, "newName": "class"})
+    if resp.get("error", {}).get("code") != -32602:
+        fail("rename keyword", "expected -32602, got %r" % (resp,))
+
+    # CJK 行 rename：错误 token Missing（UTF-16 列口径）→ Gone；
+    # BAD 文档里的 Missing 同词跨文档命中
+    cjk_char = utf16_length('    string s = "中文备注"; ')
+    ren = s.request("textDocument/rename", {
+        "textDocument": {"uri": CJK_URI},
+        "position": {"line": 3, "character": cjk_char},
+        "newName": "Gone"}).get("result") or {}
+    cjk_edits = (ren.get("changes") or {}).get(CJK_URI)
+    if not cjk_edits or len(cjk_edits) != 1 or \
+            cjk_edits[0]["range"]["start"] != {"line": 3, "character": cjk_char}:
+        fail("cjk rename", "expected 1 edit at UTF-16 col %d, got %r"
+             % (cjk_char, ren))
+    bad_edits = (ren.get("changes") or {}).get(BAD_URI)
+    if not bad_edits or len(bad_edits) != 1:
+        fail("cjk rename cross-doc", "expected BAD_URI Missing hit, got %r"
+             % (ren,))
+    pr = s.request("textDocument/prepareRename", {
+        "textDocument": {"uri": CJK_URI},
+        "position": {"line": 3, "character": cjk_char}}).get("result")
+    if not pr or pr.get("placeholder") != "Missing" or \
+            pr["range"]["start"] != {"line": 3, "character": cjk_char}:
+        fail("cjk prepareRename", "expected Missing at col %d, got %r"
+             % (cjk_char, pr))
 
     # didClose clears diagnostics
     s.notify("textDocument/didClose", {"textDocument": {"uri": SYN_URI}})

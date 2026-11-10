@@ -12,6 +12,8 @@ namespace Zan;
 ///   前端 ParseClass 不回填 line/col）。
 /// - definition：打开文档的类/方法/字段声明符号索引跳转。
 /// - references：跨打开文档的词边界文本匹配（近似，非语义解析）。
+/// - rename/prepareRename：跨打开文档的词边界统一改写（与 references
+///   同一近似口径，语义过滤顺延）；新名校验与 C 宿主 lsp_main.c 同形。
 /// - hover：符号索引信息（种类+声明位置）；内建类型写死描述。
 /// - completion：符号索引 + 关键字/内建类型，按光标前缀过滤。
 /// 已知局限（后续切片收敛，见 TASKS.md B-ID200）：
@@ -547,11 +549,11 @@ public class LspServer {
         return -1;
     }
 
-    /// 光标处词：先向左扩到词首再向右扩到词尾；光标左邻不是词字符时
-    /// 取右侧词（光标停在词首前仍可选中）。
-    static string WordAt(string text, int line0, int char0) {
+    /// 光标处词的首字节列（与 WordAt 同一扩展规则）；光标处无词返回 -1。
+    /// prepareRename 取 range 起点用。
+    static int WordStartAt(string text, int line0, int char0) {
         int ls = LineStartOf(text, line0);
-        if (ls < 0) { return ""; }
+        if (ls < 0) { return -1; }
         int le = ls;
         while (le < text.Length && text[le] != '\n') { le = le + 1; }
         int rel = char0;
@@ -560,7 +562,20 @@ public class LspServer {
         while (s > 0 && IsWordChar(text[ls + s - 1])) { s = s - 1; }
         int e = rel;
         while (e < le - ls && IsWordChar(text[ls + e])) { e = e + 1; }
-        if (e <= s) { return ""; }
+        return e > s ? s : -1;
+    }
+
+    /// 光标处词：先向左扩到词首再向右扩到词尾；光标左邻不是词字符时
+    /// 取右侧词（光标停在词首前仍可选中）。
+    static string WordAt(string text, int line0, int char0) {
+        int s = WordStartAt(text, line0, char0);
+        if (s < 0) { return ""; }
+        int ls = LineStartOf(text, line0);
+        int e = s;
+        while (ls + e < text.Length && text[ls + e] != '\n'
+                && IsWordChar(text[ls + e])) {
+            e = e + 1;
+        }
         return text.Substring(ls + s, e - s);
     }
 
@@ -612,6 +627,22 @@ public class LspServer {
     /// 符号列转换（目标文档未打开时原样透传字节列）。
     static int SymColOf(string text, int line0, int byteCol0) {
         return text != null ? Utf16ColOf(text, line0, byteCol0) : byteCol0;
+    }
+
+    /// 关键字表（bootstrap subset 全集；completion 补全与 rename 校验共用）。
+    static List<string> KeywordList() {
+        string kws = "abstract as base bool break byte case char class const continue"
+            + " default do double else enum false finally float for foreach get if"
+            + " in int interface is long namespace new null object out override"
+            + " params private protected public readonly ref return set short"
+            + " static string struct switch this throw true try typeof uint ulong"
+            + " ushort using virtual void while";
+        return kws.Split(" ");
+    }
+
+    /// 关键字判定（rename 拒绝以关键字为词/新名，同 C 宿主 intel_is_keyword）。
+    static bool IsKeywordWord(string w) {
+        return KeywordList().Contains(w);
     }
 
     /// 词边界全文匹配（references 用）：命中处前后都不是词字符。
@@ -688,7 +719,8 @@ public class LspServer {
                 + "\"hoverProvider\":true,"
                 + "\"definitionProvider\":true,"
                 + "\"referencesProvider\":true,"
-                + "\"documentSymbolProvider\":true"
+                + "\"documentSymbolProvider\":true,"
+                + "\"renameProvider\":{\"prepareProvider\":true}"
                 + "}}}";
             SendResponse(res);
             return;
@@ -752,6 +784,16 @@ public class LspServer {
             return;
         }
 
+        if (method == "textDocument/rename") {
+            HandleRename(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/prepareRename") {
+            HandlePrepareRename(id, pms);
+            return;
+        }
+
         if (method == "textDocument/documentSymbol") {
             HandleDocumentSymbol(id, pms);
             return;
@@ -791,14 +833,7 @@ public class LspServer {
         sb.Append(id);
         sb.Append(",\"result\":[");
         bool first = true;
-        // 关键字表（bootstrap subset 全集）
-        string kws = "abstract as base bool break byte case char class const continue"
-            + " default do double else enum false finally float for foreach get if"
-            + " in int interface is long namespace new null object out override"
-            + " params private protected public readonly ref return set short"
-            + " static string struct switch this throw true try typeof uint ulong"
-            + " ushort using virtual void while";
-        List<string> kwList = kws.Split(" ");
+        List<string> kwList = KeywordList();
         int i = 0;
         while (i < kwList.Count) {
             string kw = kwList[i];
@@ -980,6 +1015,121 @@ public class LspServer {
         }
         sb.Append("]}");
         SendResponse(sb.ToString());
+    }
+
+    /// textDocument/prepareRename：光标处词存在且非关键字即可重命名
+    /// （词边界近似口径，不做语义可改性判定）。返回 {range, placeholder}，
+    /// 列为 UTF-16；无文档/无词/关键字 → null。
+    static void HandlePrepareRename(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        string pos = ExtractJsonContainer(pms, "position");
+        int line = ExtractJsonInt(pos, "line", 0);
+        int character = ExtractJsonInt(pos, "character", 0);
+        LspDocument doc = FindDocument(uri);
+        if (doc == null) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        int bcol = ByteColAt(doc.Text, line, character);
+        string word = WordAt(doc.Text, line, bcol);
+        if (word.Length == 0 || IsKeywordWord(word)) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        int scol = WordStartAt(doc.Text, line, bcol);
+        int u16s = Utf16ColOf(doc.Text, line, scol);
+        int u16e = Utf16ColOf(doc.Text, line, scol + word.Length);
+        SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{"
+            + "\"range\":{\"start\":" + PosJson(line, u16s)
+            + ",\"end\":" + PosJson(line, u16e)
+            + "},\"placeholder\":" + EncodeJsonString(word) + "}}");
+    }
+
+    /// textDocument/rename：目标词在全部打开文档的词边界出现处统一改写
+    /// （与 references 同一近似口径，含语义过滤顺延；声明处本就是词出现
+    /// 之一，天然包含）。newName 空/首字符非字母下划线/含非词字符 → null；
+    /// newName 是关键字 → error -32602（与 C 宿主 handle_rename 同形）。
+    static void HandleRename(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        string pos = ExtractJsonContainer(pms, "position");
+        int line = ExtractJsonInt(pos, "line", 0);
+        int character = ExtractJsonInt(pos, "character", 0);
+        string newName = ExtractJsonField(pms, "newName");
+        if (newName.Length == 0 || !IsIdentStart(newName[0])) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        int ni = 1;
+        while (ni < newName.Length) {
+            if (!IsWordChar(newName[ni])) {
+                SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id
+                    + ",\"result\":null}");
+                return;
+            }
+            ni = ni + 1;
+        }
+        if (IsKeywordWord(newName)) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id
+                + ",\"error\":{\"code\":-32602,"
+                + "\"message\":\"newName is a keyword\"}}");
+            return;
+        }
+        LspDocument doc = FindDocument(uri);
+        if (doc == null) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        string word = WordAt(doc.Text, line, ByteColAt(doc.Text, line, character));
+        if (word.Length == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        // WorkspaceEdit.changes 按打开文档顺序拼接，每文档一组词边界命中
+        EnsureInit();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":{\"changes\":{");
+        bool firstDoc = true;
+        int di = 0;
+        while (di < documents.Count) {
+            LspDocument d = documents[di];
+            List<LspPos> hits = WordPositions(d.Text, word);
+            if (hits.Count > 0) {
+                if (!firstDoc) { sb.Append(','); }
+                firstDoc = false;
+                sb.Append(EncodeJsonString(d.Uri));
+                sb.Append(":[");
+                int i = 0;
+                bool firstEdit = true;
+                while (i < hits.Count) {
+                    LspPos p = hits[i];
+                    int u16s = Utf16ColOf(d.Text, p.Line, p.Col);
+                    int u16e = Utf16ColOf(d.Text, p.Line, p.Col + word.Length);
+                    if (!firstEdit) { sb.Append(','); }
+                    firstEdit = false;
+                    sb.Append("{\"range\":{\"start\":");
+                    sb.Append(PosJson(p.Line, u16s));
+                    sb.Append(",\"end\":");
+                    sb.Append(PosJson(p.Line, u16e));
+                    sb.Append("},\"newText\":");
+                    sb.Append(EncodeJsonString(newName));
+                    sb.Append("}");
+                    i = i + 1;
+                }
+                sb.Append("]");
+            }
+            di = di + 1;
+        }
+        sb.Append("}}}");
+        SendResponse(sb.ToString());
+    }
+
+    /// 标识符首字符：字母或下划线（rename 新名校验，同 C 宿主 isalpha||'_'）。
+    static bool IsIdentStart(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
     }
 
     /// 嵌套 DocumentSymbol：类/接口/枚举为父，方法/字段/构造器为 children。
