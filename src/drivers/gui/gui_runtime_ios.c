@@ -879,6 +879,44 @@ EXPORT i32 zan_gui_haptic_feedback(i32 type) {
     }
     return 0;
 }
+
+static float g_sensor_accel[3] = { 0.0f, 9.8f, 0.0f };
+static float g_sensor_gyro[3]  = { 0.0f, 0.0f, 0.0f };
+static float g_sensor_compass  = 0.0f;
+
+EXPORT i32 zan_gui_sensor_get(i32 sensor_type, float *out_x, float *out_y, float *out_z) {
+    if (!out_x || !out_y || !out_z) return -1;
+    if (sensor_type == 1) {
+        *out_x = g_sensor_accel[0]; *out_y = g_sensor_accel[1]; *out_z = g_sensor_accel[2];
+        return 0;
+    } else if (sensor_type == 2) {
+        *out_x = g_sensor_gyro[0]; *out_y = g_sensor_gyro[1]; *out_z = g_sensor_gyro[2];
+        return 0;
+    } else if (sensor_type == 3) {
+        *out_x = g_sensor_compass; *out_y = 0.0f; *out_z = 0.0f;
+        return 0;
+    }
+    return -1;
+}
+
+EXPORT i32 zan_gui_sensor_set(i32 sensor_type, float x, float y, float z) {
+    if (sensor_type == 1) {
+        g_sensor_accel[0] = x; g_sensor_accel[1] = y; g_sensor_accel[2] = z;
+        return 0;
+    } else if (sensor_type == 2) {
+        g_sensor_gyro[0] = x; g_sensor_gyro[1] = y; g_sensor_gyro[2] = z;
+        return 0;
+    } else if (sensor_type == 3) {
+        g_sensor_compass = x;
+        return 0;
+    }
+    return -1;
+}
+
+EXPORT i32 zan_gui_notification_send(const char *title, const char *body, const char *action, i32 badge, const char *sound) {
+    (void)title; (void)body; (void)action; (void)badge; (void)sound;
+    return 0;
+}
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val) { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on) { (void)h; (void)on; return 0; }
