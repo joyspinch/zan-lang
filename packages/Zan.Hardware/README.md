@@ -9,3 +9,7 @@
 - **系统原生分享面板**：`Share`（ShareSheet 调起）
 - **系统相册与文件选择器**：`NativePicker`（系统原生 PhotoPicker / DocumentPicker）
 - **统一动态权限中枢**：`Permissions`（定位、相机、麦克风、通知、相册授权）
+- **屏幕防休眠与亮度控制**：`Screen`（防熄屏 KeepAwake、窗口亮度调节与还原）
+- **GPS 高精度物理定位**：`Geolocation`（经纬度、海拔、精度、速度及运动快照）
+- **设备标识与运行环境**：`DeviceInfo`（型号、制造商、系统版本、折叠屏硬件识别）
+- **生物识别与安全认证**：`Biometrics`（TEE 安全人脸 Face ID / 屏下指纹鉴权）

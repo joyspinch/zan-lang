@@ -1061,6 +1061,106 @@ EXPORT i32 zan_gui_permission_request(i32 perm_type) {
 EXPORT void zan_gui_set_permission(i32 perm_type, i32 status) {
     if (perm_type >= 0 && perm_type < 8) g_permissions[perm_type] = status;
 }
+
+/* --- 屏幕防休眠与亮度控制 --- */
+static int g_screen_keep_awake = 0;
+static float g_screen_brightness = -1.0f;
+
+EXPORT void zan_gui_screen_keep_awake(i32 enable) {
+    g_screen_keep_awake = enable ? 1 : 0;
+}
+
+EXPORT i32 zan_gui_screen_is_keep_awake(void) {
+    return g_screen_keep_awake;
+}
+
+EXPORT void zan_gui_screen_set_brightness(float brightness) {
+    g_screen_brightness = brightness;
+}
+
+EXPORT float zan_gui_screen_get_brightness(void) {
+    return g_screen_brightness;
+}
+
+/* --- GPS 地理定位 --- */
+static double g_location_lat = 0.0;
+static double g_location_lon = 0.0;
+static double g_location_alt = 0.0;
+static float  g_location_acc = 0.0f;
+static float  g_location_speed = 0.0f;
+
+EXPORT i32 zan_gui_location_get(double *out_coords, float *out_metrics) {
+    if (out_coords) {
+        out_coords[0] = g_location_lat;
+        out_coords[1] = g_location_lon;
+        out_coords[2] = g_location_alt;
+    }
+    if (out_metrics) {
+        out_metrics[0] = g_location_acc;
+        out_metrics[1] = g_location_speed;
+    }
+    return 0;
+}
+
+EXPORT void zan_gui_location_set(double lat, double lon, double alt, float acc, float speed) {
+    g_location_lat = lat;
+    g_location_lon = lon;
+    g_location_alt = alt;
+    g_location_acc = acc;
+    g_location_speed = speed;
+}
+
+/* --- 设备与平台信息 --- */
+static char g_dev_model[64] = "Pixel 8 Pro";
+static char g_dev_manufacturer[64] = "Google";
+static char g_dev_platform[32] = "Android";
+static char g_dev_os_version[32] = "14.0";
+static int  g_dev_is_foldable = 0;
+
+EXPORT const char *zan_gui_device_info_get(i32 info_key) {
+    if (info_key == 1) return g_dev_model;
+    if (info_key == 2) return g_dev_manufacturer;
+    if (info_key == 3) return g_dev_platform;
+    if (info_key == 4) return g_dev_os_version;
+    return "";
+}
+
+EXPORT i32 zan_gui_device_is_foldable(void) {
+    return g_dev_is_foldable;
+}
+
+EXPORT void zan_gui_device_info_set(i32 info_key, const char *val) {
+    if (!val) return;
+    if (info_key == 1) { strncpy(g_dev_model, val, sizeof(g_dev_model)-1); g_dev_model[sizeof(g_dev_model)-1] = '\0'; }
+    else if (info_key == 2) { strncpy(g_dev_manufacturer, val, sizeof(g_dev_manufacturer)-1); g_dev_manufacturer[sizeof(g_dev_manufacturer)-1] = '\0'; }
+    else if (info_key == 3) { strncpy(g_dev_platform, val, sizeof(g_dev_platform)-1); g_dev_platform[sizeof(g_dev_platform)-1] = '\0'; }
+    else if (info_key == 4) { strncpy(g_dev_os_version, val, sizeof(g_dev_os_version)-1); g_dev_os_version[sizeof(g_dev_os_version)-1] = '\0'; }
+    else if (info_key == 5) { g_dev_is_foldable = (atoi(val) != 0) ? 1 : 0; }
+}
+
+/* --- 生物识别与安全认证 --- */
+static int g_bio_can_auth = 1;
+static int g_bio_type = 1; /* 1: Fingerprint (安卓屏下指纹) */
+static int g_bio_auth_result = 1; /* 1: Success */
+
+EXPORT i32 zan_gui_biometrics_can_authenticate(void) {
+    return g_bio_can_auth;
+}
+
+EXPORT i32 zan_gui_biometrics_type(void) {
+    return g_bio_type;
+}
+
+EXPORT i32 zan_gui_biometrics_authenticate(const char *title, const char *subtitle) {
+    (void)title; (void)subtitle;
+    return g_bio_auth_result;
+}
+
+EXPORT void zan_gui_biometrics_set_mock(i32 can_auth, i32 bio_type, i32 auth_result) {
+    g_bio_can_auth = can_auth ? 1 : 0;
+    g_bio_type = bio_type;
+    g_bio_auth_result = auth_result ? 1 : 0;
+}
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val)    { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0; }
