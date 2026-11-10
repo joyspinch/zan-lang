@@ -330,9 +330,11 @@ partial class Irgen {
                 if (cm == "ToUpper" || cm == "ToLower") {
                     bool cup = cm == "ToUpper";
                     if (binder.FindType("UnicodeCase") != null) {
-                        Node fa = new Node(AK.IntLit());
-                        fa.ival = cup ? 1 : 0;
-                        e.kids[0] = fa;
+                        // CaseToUpper/CaseToLower 是单参（方向由函数名区分）：
+                        // kids[0] 保持原码点参数不动——曾往 kids[0] 塞方向
+                        // flag(1/0)，原参数被丢弃，char.ToUpper 恒返回 1，
+                        // 拖垮 UnicodeCase.ToUpper(string) 的逐码点循环
+                        // （unicode_normalization_casefold 红的根因）。
                         callee.a.sval = "UnicodeCase";
                         callee.sval = cup ? "CaseToUpper" : "CaseToLower";
                         return GenExpr(e);
@@ -424,18 +426,15 @@ partial class Irgen {
                 string dep = NT();
                 L("  " + dep + " = load i8*, i8** " + dendp);
                 string dbad = ParseBadPred(dstr, dep);
-                string dpinf = NT();
-                L("  " + dpinf + " = fcmp oeq double " + r + ", 0x7FF0000000000000");
-                string dninf = NT();
-                L("  " + dninf + " = fcmp oeq double " + r + ", 0xFFF0000000000000");
-                string dinf = NT();
-                L("  " + dinf + " = or i1 " + dpinf + ", " + dninf);
-                string db2 = NT();
-                L("  " + db2 + " = or i1 " + dbad + ", " + dinf);
-                EmitRuntimeCheckIf(e, db2,
-                    "double.Parse: input is not a valid number (or out of range)");
+                // 判坏只走 endp 零消费谓词：strtod 上溢由 zan_rt_dbl_parse
+                // 把 endp 拨回起点接住；"Infinity"/"-Infinity"/"NaN" 特殊
+                // 拼写是合法回读（endp 正常推进），不能按 ±INF 值判坏——
+                // 曾按值判 INF 把合法的 double.Parse("Infinity") 误杀
+                // （C 宿主 builtin_math.c 同款教训，case_double_format）。
+                EmitRuntimeCheckIf(e, dbad,
+                    "double.Parse: input is not a valid number");
                 string dsafe = NT();
-                L("  " + dsafe + " = select i1 " + db2 + ", double 0.0, double " + r);
+                L("  " + dsafe + " = select i1 " + dbad + ", double 0.0, double " + r);
                 return new ExprVal(dsafe, MkType("double"));
             }
             if ((intRecv || dblRecv || boolRecv) && callee.sval == "TryParse" && e.kids.Count == 2) {
