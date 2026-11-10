@@ -457,6 +457,25 @@ partial class LspSession {
         // 没人占的段上。
         int portBase = 47411 + ((Environment.ProcessId + lspStartSeq * 4) % 89) * 4;
         lspStartSeq = lspStartSeq + 1;
+        // bind 预检：pid 猜算只保证分布均匀，不保证段上没人占（旧实例
+        // 还没退、别的程序占了 474xx 段）。4 个端口逐个试绑，绑得上的
+        // 段才作为首选；全占用维持原值走下面的 attempt 循环兜底。预检
+        // 到 spawn 之间仍有毫秒级 TOCTOU 窗口，同样由 attempt 循环自然
+        // 换下端口。故意不带 SO_REUSEADDR：zan-lsp 自己监听时是带的
+        // （Windows 上 REUSEADDR 允许抢绑），裸 bind 才能真实探得占用。
+        int probe = 0;
+        bool found = false;
+        while (probe < 4 && !found) {
+            nint p = Socket.CreateTcp();
+            if (p >= 0) {
+                if (Socket.Bind(p, "127.0.0.1", portBase + probe) == 0) {
+                    portBase = portBase + probe;
+                    found = true;
+                }
+                Socket.Close(p);
+            }
+            probe = probe + 1;
+        }
         for (int attempt = 0; attempt < 4; attempt = attempt + 1) {
             if (cancellation != null && cancellation.IsCancellationRequested) { return null; }
             int port = portBase + attempt;
