@@ -636,15 +636,16 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 34. 照抄宿主的调用前，先确认这个符号在自举产物里解析到**哪一份实现**
 
-- 坑（实测）：宿主在程序入口调 `zan_co_sched_init`（`irgen_emit.c` 的
-  `emit_main`），自举的程序入口没有这一句。照抄过来就以为"对齐了"——但自举
-  产物里的 `zan_co_sched_init` 是**自举自己发的弱符号**（`irgen_async.zan` 的
-  `EmitAsyncPumpReady`），而自举运行时对象**根本没有 `zan_co_*` 强符号**
+- 坑（2026-10-20 实测）：宿主在程序入口调 `zan_co_sched_init`
+  （`src/compiler/irgen_emit.c:132`），自举的程序入口没有这一句。照抄过来就
+  以为"对齐了"——但自举产物里的 `zan_co_sched_init` 是**自举自己发的弱符号**
+  （`irgen_async.zan` 的 `EmitAsyncPumpReady`），而自举运行时对象
+  （`build/zanrt_shd_rt_io.obj` 等）**根本没有 `zan_co_*` 强符号**
   （`llvm-nm --defined-only` 查过），于是这句调用今天只重置自举自己的调度器
-  状态：**结构对齐，行为没变**。等帧布局对齐到宿主的 `zan_co_fhdr` 之后链接
-  完整运行时，强符号胜出，这句才真的装上 timer ready hook（`rt_io.c` 的
-  `zan_co_sched_init`），把延迟帧重新入队而不是在定时器线程上直接恢复协程
-  （`rt_timer.c` 的延迟派发）。
+  状态：**结构对齐，行为没变**。等 A385（帧布局对齐 `zan_co_fhdr`）后链接
+  完整运行时，强符号胜出，这句才真的装上 timer ready hook
+  （`src/runtime/rt_io.c:4242`），把延迟帧重新入队而不是在定时器线程上直接
+  恢复协程（`src/runtime/rt_timer.c:729`）。
 - 做法：往自举产物里加一个**外部符号**之前，先问三件事——
   1. 自举侧自己发的是什么（弱回退？强定义？）；
   2. 链接进去的运行时对象里有没有同名**强符号**（`llvm-nm --defined-only
@@ -658,11 +659,11 @@ kernel32、shell32、user32、advapi32、version）。
 
 - 动作：自举实现任务句柄族（`Task.Run` / `Task.Spawn` / `t.Wait()` /
   `t.Result` / `t.IsCompleted` / `Task.IsDone`）时，**没有**去对齐宿主的
-  协程帧头，而是降级到自举**自己**的扁平 i64 帧上：句柄 = 帧指针，
-  done 标志 = 槽 1，结果 = 槽 4。宿主是同一套协议、另一套字节
+  `zan_co_fhdr` 帧头（A385），而是降级到自举**自己**的扁平 i64 帧上：句柄
+  = 帧指针，done 标志 = 槽 1，结果 = 槽 4。宿主是同一套协议、另一套字节
   （`irgen_expr_core.c` 的 `emit_task_member`：test/pump 循环 → 读结果 →
-  回收）。差分门比的是 **stdout 逐字**，不是帧布局——所以"布局没对齐"从来
-  不是"降级做不了"的理由，只有**行为**对齐才是。
+  回收）。差分门比的是 **stdout 逐字**，不是帧布局——所以"布局没对齐"从来不
+  是"降级做不了"的理由，只有**行为**对齐才是。
 - 坑一：**完成即释放 = 句柄读的是已释放内存**。句柄在任务完成后还要能读
   done 标志（`t.IsCompleted`），所以 action 帧不能在完成路径里释放。宿主靠
   运行时的**活跃帧登记表**（`zan_co_live_add/has`）回收，自举没有 → 只能
@@ -683,8 +684,8 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 36. lambda 返回的是**自己**的值：返回类型未知时不要查 `return`
 
-- 坑（实测）：自举的检查器把 **lambda 的函数体**按**外层方法**的返回类型查
-  `return`——于是在 void 方法里写
+- 坑（2026-10-20 实测）：自举的检查器把 **lambda 的函数体**按**外层方法**的
+  返回类型查 `return`——于是在 void 方法里写
   `Func<int> f = delegate () { return 5; };` 被报成
   "cannot return a value from a void method"，而 C 宿主**编译并运行**这个程序
   （输出 5）。这是**假阳性**：lambda 返回的是它自己的值，跟外层方法无关。
@@ -706,7 +707,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 37. 诊断对齐要连**位置**和**条数**一起对齐；类型解析照抄宿主的三步
 
-- 坑（实测）：自举的类型诊断只对齐了**一部分**——未定义类型报
+- 坑（2026-10-20 实测）：自举的类型诊断只对齐了**一部分**——未定义类型报
   "unknown type 'X'"（宿主是 "undefined type 'X'"），而且**位置停在 0:0**：
   类型节点根本没记自己的行列，诊断指不到类型名头上。泛型实参个数更是各说
   各话：宿主是 "using the generic type 'List' requires 1 type arguments
@@ -741,7 +742,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 38. async 形状在**解析期**就定形：ValueTask 与"没方法体的 Task 返回类型"
 
-- 坑（实测）：自举的 parser 不做宿主那步定形，于是两个形状对不上：
+- 坑（2026-10-20 实测）：自举的 parser 不做宿主那步定形，于是两个形状对不上：
   1. `async ValueTask<int>`：宿主在 `desugar_async_task_method` 里把它改写掉，
      `ValueTask` 这个名字**从来不需要进 binder**（宿主的 binder 只认 `Task`）；
      自举不认这个名字 → 报 "undefined type 'ValueTask'"。
@@ -767,7 +768,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 39. 镜像一条规则时，把它**周围的规则**一起列出来
 
-- 坑（实测）：自举已经实现了宿主 Task 相关的**一条**赋值规则
+- 坑（2026-10-20 实测）：自举已经实现了宿主 Task 相关的**一条**赋值规则
   （"无结果句柄塞进 `Task<T>`" → "carries no result"），于是自举以为 Task 的
   赋值规则做完了。实际宿主还有一条更基本的：**Task 形状的槽位只收任务句柄**
   ——`Task<double> t = Half(5.0);` 宿主报 "cannot convert 'double' to 'Task'
@@ -788,9 +789,9 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 40. 没有差分门 ≠ 没有检查：后端路径也得**先查类型再落码**
 
-- 坑（实测）：自举的 ngen（原生后端）分支在 `main.zan` 里**早于检查器**就
-  return 了——于是一个用了未定义类型的程序，ngen 照样 rc=0 写出 66KB 的目标
-  码。IR 路径（irgen）是查的，宿主也是查的，只有 ngen 不查。
+- 坑（2026-10-20 实测）：自举的 ngen（原生后端）分支在 `main.zan` 里**早于
+  检查器**就 return 了——于是一个用了未定义类型的程序，ngen 照样 rc=0 写出
+  66KB 的目标码。IR 路径（irgen）是查的，宿主也是查的，只有 ngen 不查。
 - 教训：**"这条路径没有差分门"不等于"这条路径没有检查"**。差分门缺的是
   *参照实现*，而类型检查不需要参照实现——它只需要和 IR 路径共用同一个
   Checker。宿主就是"先查类型再落后端"的次序，自举的每条后端路径都该照抄。
@@ -803,14 +804,14 @@ kernel32、shell32、user32、advapi32、version）。
   `build\zanc.exe` 的时间戳，别急着怀疑自己的改动。
 ## 41. 值类型在"没有聚合值"的后端里 = 指针 + **边界拷贝**
 
-- 坑（实测）：自举 IR 后端没有聚合值，`struct` 实例被表示成堆对象
+- 坑（2026-10-20 实测）：自举 IR 后端没有聚合值，`struct` 实例被表示成堆对象
   （`zalloc` + 字段偏移），于是**赋值 / 传参 / 入容器都只拷指针**——而 C 宿主
   把 struct 按值拷贝。同一个程序：宿主 `list.Add(p)` 后改 `p.x` 读出 `1`，
   自举读出 `99`；`P3 r = q; r.x = 42;` 宿主读 `q.x` 得 `3`，自举得 `42`。
 - 教训：后端的**表示**可以不同（堆对象 vs LLVM 聚合值），**可观察语义**不能。
   表示换了，拷贝点就得**逐个补齐**：宿主在哪里按值拷，自举就在哪里显式拷内容。
   "以后改成聚合值就好了"不能作为现在语义不对的理由。
-- 做法（`irgen_struct.zan`）：拷贝 = 分配新实例 + **逐字段**拷，
+- 做法（`src/selfhost/irgen_struct.zan`）：拷贝 = 分配新实例 + **逐字段**拷，
   字段的分裂照抄宿主：
   - struct 字段 → **递归深拷贝**（嵌套实例也要分配）；
   - class 字段 → **共享**（拷贝方 retain 一次，源方那一份不动）。
@@ -829,7 +830,8 @@ kernel32、shell32、user32、advapi32、version）。
   判不出来，泛型容器里的 struct 仍是别名（记为边界，别假装修好了）。
 - 坑：自举的**数组没有析构器**（元素从不释放）→ 拷进数组的副本也永远不释放。
   这与"数组里的 class 元素也不释放"同源，别算成新引入的泄漏。
-- 门禁：用例 `struct_value_copy.zan`（8 个形态）与差分门一起钉住。
+- 门禁：用例 `tests/conformance/struct_value_copy.zan`（8 个形态）与差分门
+  一起钉住。
 
 ## 42. 运行期类型判定：没有类声明的类型也要有**类标识**
 
@@ -882,8 +884,9 @@ kernel32、shell32、user32、advapi32、version）。
   8 字节里），自举的扁平数组把它放在偏移 24——所以运行时的 join 路径
   （`rt_timer.c` 的 `JOIN_OFF_DONE`）**不适用于自举帧**；自举自己降级
   `Task.WhenAll`/Join，不走那条路。
-- 门禁：新增 `selfhost_shipped_runtime`——自举产物链**发行版** mt 运行时
-  （`zanrt_io_mt.o` + 捆绑 `mingw/lib`），输出与宿主逐字一致。发行版的
+- 门禁：新增 `selfhost_shipped_runtime`（`tests/run_selfhost_mt.cmake` +
+  `tests/selfhost/mt/`）——自举产物链**发行版** mt 运行时
+  （`toolchain/win-x64/zanrt_io_mt.o`），输出与宿主逐字一致。发行版的
   `zan_co_ready`/`zan_co_sched_init` 是强符号，压过自举的 weak 回退：帧真的
   被发行版的多 worker 调度器驱动，定时器的 ready hook 也是运行时的。
 
@@ -942,6 +945,7 @@ kernel32、shell32、user32、advapi32、version）。
   从**外层方法的形参**取（`AwaitArgType`）。
 - 门禁：`overload_resolution` / `overload_inherited_arity` /
   `overload_same_arity_return` 进差分门（逐字一致）。
+
 ## 46. 字段初始化器与构造器：**分配点**才是它们的家，顺序按基类链
 
 - 坑（实测）：自举把字段初始化器塞进"隐式构造器"里，于是两处都错：
@@ -1172,7 +1176,7 @@ kernel32、shell32、user32、advapi32、version）。
   错位）。
 - 宿主口径：`Find` 的返回值是**相对基址 p 的绝对下标**（`at - p`），窗口
   偏移已经包含在 memchr 的起始地址里，**不能再加一次**。
-- 做法：自举 IR 后端的 `Find` 内建只保留 `rel = at - base0`，
+- 做法：自举 `irgen.zan` 的 `Find` 内建只保留 `rel = at - base0`，
   `base0` 是 p（不带 off）。
 - 连带：`ByteBuffer.IndexOfByte(from, b)` 是 `Find(data, from, b, len-from)`，
   所以同一个错位会让"续找/最后一个/越界起点"三类断言一起挂。
@@ -1183,22 +1187,22 @@ kernel32、shell32、user32、advapi32、version）。
   `val == null`（`val: T`）发出来的是 `icmp eq i64 %t1, null` —— LLVM 直接
   报 "null must be a pointer type"，链接都到不了（用例
   `generic_type_param_null_check` BAD-IR）。
-- 宿主口径：宿主按实参把泛型类单态化，槽位是指针，比的是 null；自举的槽
-  是 i64（指针的 ptrtoint 值），**0 就是 null**。
-- 做法：自举 IR 后端的 null 比较与 `EmitNonNullVal` 都按值的 LLVM 类型选
+- 宿主口径：宿主按实参把 `Binding<T>`/`Container<T>` 单态化，槽位是指针，
+  比的是 null；自举的槽是 i64（指针的 ptrtoint 值），**0 就是 null**。
+- 做法：`GenBinary` 的 null 比较与 `EmitNonNullVal` 都按值的 LLVM 类型选
   零：`IsPtrLL(ty)` 为真才用 `null`，否则用 `0`。
 - 连带：同一个错位也会出现在 `x is null`（那里早就按类型分叉了）。
 
 ## 60. 自举检查器不得比宿主更严：宿主没有的诊断要删掉
 
 - 坑（实测）：自举检查器有一条 "not all code paths return a value in 'X'"
-  ——**宿主根本没有这条诊断**。于是方法体以 `lock (this) { ... }` 收尾的
-  正常程序（连接池这类资源管理代码就是这么写的）被自举判成错误，整个
-  packages 用例编译不过。
-- 口径：**宿主是规格**。自举检查器多出来的诊断 = 自举拒收宿主接受的程序
+  ——**宿主根本没有这条诊断**（`src/compiler/checker.c` 里搜不到）。于是
+  方法体以 `lock (this) { ... }` 收尾的正常程序（packages 里的连接池就是
+  这么写的）被自举判成错误，整个 packages 用例编译不过。
+- 口径：**宿主是规格**。自举检查器多出来的诊断 = 自举拒收宿主接受 programs
   = 行为不一致；这种"更严"不是安全网，是偏差。
 - 做法：删掉那条诊断（连同只服务于它的 `DefinitelyReturns`/`HasBreak`/
-  `IsTrueLit`）。自举 IR 后端在方法尾部本来就会补默认返回（`ret i64 0` /
+  `IsTrueLit`）。自举 irgen 在方法尾部本来就会补默认返回（`ret i64 0` /
   `ret <ptr> null`），IR 不会缺返回块。
 
 ## 61. 裸名：类里的字段 / 属性（实例与静态）
@@ -1233,7 +1237,7 @@ kernel32、shell32、user32、advapi32、version）。
   而被调方的形参是 `%Box** %p0`：**类型不匹配**。clang 对 `.ll` 默认不跑
   verifier，这种错配会静默通过，运行期解引用空指针 → 0xC0000005，一个输出
   都没有（用例 `out_param_field`）。
-- 宿主口径（宿主 `emit_ref_arg`）：
+- 宿主口径（`src/compiler/irgen_expr.c` 的 `emit_ref_arg`）：
   - `out T name`（**声明**形式）：新建一个零初始化的槽，登记为局部，传地址；
   - `out x` / `ref x`（**place** 形式）：传该 place 的地址（局部 alloca、
     字段地址、元素地址）；
@@ -1259,8 +1263,8 @@ kernel32、shell32、user32、advapi32、version）。
   当成普通赋值，把字符串指针 bitcast 成 `%Binding*` 存进槽位——后面
   `Binding_Get` 拿到的是野指针，程序一个输出都没有（5 个 binding 用例全
   DIFF）。
-- 口径（宿主 `emit_binding_value`）：赋给 `Binding<T>` 槽的**非 Binding
-  表达式**要包成一个新建的 Binding 对象
+- 口径（宿主 `src/compiler/irgen_expr.c` 的 `emit_binding_value`）：赋给
+  `Binding<T>` 槽的**非 Binding 表达式**要包成一个新建的 Binding 对象
   {target, getter, setter, live, constVal, version}：
   - 右值是**字段左值**（`obj.field`，含类内裸字段名 = `this.field`）→
     **活绑定**：target = 接收者（**非持有**的弱引用，否则 model<->view 成环
@@ -1290,17 +1294,17 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 65. 泛型重载：符号要带类型参数，显式类型实参要参与打分
 
-- 坑（实测）：自举 IR 后端的 `MethodSym`（`irgen_stmt.zan`）只按"类名_方法名_
-  形参类型标签"拼符号，**不带方法自己的类型参数**。于是
+- 坑（2026-10-20 实测）：自举 IR 后端的 `MethodSym`（`src/selfhost/irgen_stmt.zan`）
+  只按"类名_方法名_形参类型标签"拼符号，**不带方法自己的类型参数**。于是
   `class Box { async string GetAsync(string k); async T GetAsync<T>(string k); }`
   的两个重载撞成同一个 `Box_GetAsync___string` —— LLVM 报 "invalid
   redefinition of function"，程序一个输出都没有（用例
   `generic_overload_type_arity`）。宿主是按实参单态化后拼
-  `mangle_inst_suffix`（`irgen_emit.c`），自举擦除版要对齐的是"泛型与非泛型
-  不能同名"。
+  `mangle_inst_suffix`（`src/compiler/irgen_emit.c`），自举擦除版要对齐的
+  是"泛型与非泛型不能同名"。
 - 做法：`MethodSym` 在重载符号里追加方法自身的类型参数标记（泛型重载变成
   `Box_GetAsync___T_string`），两个重载不再撞名。
-- 坑（实测）：**显式类型实参在 parser 里被 `StripTypeArgs` 丢掉了**，
+- 坑（2026-10-20 实测）：**显式类型实参在 parser 里被 `StripTypeArgs` 丢掉了**，
   只留在 call 节点的 `d` 槽里（`__typeargs` 容器，kids 是 TypeRef）。重载解析
   此前完全不看它 → `b.Pick<User>(u)` 选中非泛型的 `Pick(string)`，返回值类型
   都不对（宿主选泛型那个）。
@@ -1312,7 +1316,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 66. 宿主没有的诊断要删；调用要能推断类型；闭包要保留类上下文
 
-- 坑（实测）：自举检查器有两条宿主**根本没有**的诊断：
+- 坑（2026-10-21 实测）：自举检查器有两条宿主**根本没有**的诊断：
   - "cannot return a value from a void method" / "must return a value"
     —— 宿主 grep `src/compiler` 找不到这两条；`static void Main() { ...;
     return 0; }` 是宿主编译并运行的正常程序，自举却整份拒收（用例
@@ -1325,14 +1329,14 @@ kernel32、shell32、user32、advapi32、version）。
   `ArgTypeNode` 不认 `Call` → `Sha1.Hash(b.Data(), b.Len())` 的实参类型全是
   "未知" → 所有重载同分 → 判成歧义。补上 Call 的返回类型推断后，
   `Hash(byte[], int)` 才压过 `Hash(string, int)`。
-- 坑（实测）：**闭包里裸调的静态方法会丢掉类名**。自举在发射 lambda 体时
-  把 `curClass` 清空（"没捕获 this 就没有类上下文"），于是
+- 坑（2026-10-21 实测）：**闭包里裸调的静态方法会丢掉类名**。自举在发射
+  lambda 体时把 `curClass` 清空（"没捕获 this 就没有类上下文"），于是
   `CaptureSafe(exe, args)` 变成 `EmitStaticCall("", ...)` → 符号
   `_CaptureSafe`（无类前缀）、返回类型退化成 i64 → 链接期 "use of undefined
   value '@_CaptureSafe'"（用例 `log_structured`）。
   正确做法：**类上下文与接收者上下文是两回事**——`curClass` 始终保留，
   只有 `curHasThis` 随捕获走。静态字段/属性/方法在闭包里照样可解析。
-- 坑（实测）：**对象初始化器里的属性要走 setter**。
+- 坑（2026-10-21 实测）：**对象初始化器里的属性要走 setter**。
   `new A { Mixed = 50 }`（`Mixed` 是带访问器的属性）此前一律当字段存 →
   字段下标 -1 → "invalid getelementptr indices"；自动属性（`{ get; set; }`）
   在自举里是**后备字段**（没有访问器方法），仍走字段存。
@@ -1343,7 +1347,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 67. 泛型字段：存储形状按声明类型，值类型按接收者的具体实参
 
-- 坑（实测）：自举把泛型类的类型参数擦除成 i64 槽之后，**字段读回
+- 坑（2026-10-21 实测）：自举把泛型类的类型参数擦除成 i64 槽之后，**字段读回
   来的值类型也跟着丢了**：`Box<double>.values` 的声明类型是 `List<T>`，读出来
   仍是 `List<T>`（元素类型 T 依旧擦除）→ 元素被当成 i64 槽读 → 打印出位模式
   而不是 double（用例 `generic_field_value_type`）。
@@ -1354,7 +1358,7 @@ kernel32、shell32、user32、advapi32、version）。
   i64），接收者静态类型 `recvTy` 决定**值类型**——`SubstRecvTy(fty, recvTy)`
   用接收者类型里的具体类型实参，替换字段声明里提到的类级类型参数；擦除字段
   用 `FromSlot(t, vty)` 还原。
-- 连带坑（实测）：`SubstTP` 之前**丢掉了数组的秩**——`T[]` 替换成
+- 连带坑（2026-10-21 实测）：`SubstTP` 之前**丢掉了数组的秩**——`T[]` 替换成
   实参后变成裸元素类型（`T[]` → `int` 而不是 `int[]`），字段存的数组指针和读出
   的元素类型对不上。数组类型节点用 `ival` 记秩、`sval` 记元素类型名，替换时只
   换元素、保留 `ival`/`sval2`。
@@ -1367,7 +1371,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 68. 泛型方法单态化：显式类型实参要一路带进克隆体；约束是模板体唯一的线索
 
-- 坑（实测）：自举有方法级单态化的骨架（`SpecQueue` / `CloneSubst`
+- 坑（2026-10-21 实测）：自举有方法级单态化的骨架（`SpecQueue` / `CloneSubst`
   / `SpecTag`），但**实例调用**（`EmitInstanceCall`）根本没走这条路——只有扩展
   方法（`EmitExtensionCall`）和静态调用（`EmitStaticCall`）接了。于是
   `p.Describe<Conn>(c)` 选中的是**擦除**的方法体：体里的 `c` 类型是 `T`，成员
@@ -1375,18 +1379,18 @@ kernel32、shell32、user32、advapi32、version）。
 - 做法：实例调用也走 `SpecQueue`——把方法自己的类型参数绑出来（**显式类型实参
   优先**，其次从实参类型推断），算 tag，克隆一份具体化的方法体，调用点指向克隆
   的符号。静态调用也改成显式类型实参优先。
-- 坑（实测）：`CloneSubst` 之前**只替换节点的 `type` 槽，不替换类型
+- 坑（2026-10-21 实测）：`CloneSubst` 之前**只替换节点的 `type` 槽，不替换类型
   名**。类型节点（`AK.TypeRef`）的名字在 `sval` 里 → 克隆体里的显式类型实参还是
   `T`，嵌套调用（`Both<T>` 里的 `this.Describe<T>(c)`）于是又落回擦除形态。修法：
   `CloneSubst` 对 `AK.TypeRef` 节点改走 `SubstTP`（按 `sval` + `kids` 重建类型
   节点）。`SubstTP` 的数组分支还要保住 `op`（可空标记）与行列号。
-- 坑（实测）：**擦除形态的方法体里，类型参数上的成员访问不能报错**。
+- 坑（2026-10-21 实测）：**擦除形态的方法体里，类型参数上的成员访问不能报错**。
   宿主对类型参数做成员访问是**静默**的——`checker.c` 的成员检查只对 class /
   struct / interface 报 "has no member"，因为泛型体只是**模板**：真正的成员访问
   发生在单态化之后的体里。自举原来报 "is not supported by the self-hosted
-  compiler yet" → 把宿主接受的程序拒了。修法：接收者类型是擦除类型参数时，
+  compiler yet" → 把宿主接受的程序整份拒了。修法：接收者类型是擦除类型参数时，
   模板体返回该擦除类型的零值（不报错）；单态化克隆体干真活。
-- 坑（实测）：`where T : IConn` 这样的**约束**原来被 parser 直接丢弃
+- 坑（2026-10-21 实测）：`where T : IConn` 这样的**约束**原来被 parser 直接丢弃
   （`SkipWhereClauses`）。约束是模板体里唯一的"接收者能干什么"的线索：丢掉它，
   `T` 上的成员就只能等单态化，而**类**的方法体没有单态化。修法：约束存进类型
   参数节点（`b` 槽），IR 期按**当前作用域**查（方法自己的类型参数遮蔽类的——
@@ -1401,7 +1405,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 69. 类级单态化：类的类型参数要从**接收者的静态类型**里绑出来
 
-- 坑（实测）：泛型**类**的方法体是共享的一份**擦除体** → 体里
+- 坑（2026-10-21 实测）：泛型**类**的方法体是共享的一份**擦除体** → 体里
   `this.item` 的类型还是 `T`（不是 `string`），方法级单态化管不着（它只绑方法
   自己的类型参数）。宿主是连**类的类型参数**一起单态化（`irgen_generics.c` 的
   `generic_insts` + `find_generic_fn`）→ 每个实例化一份方法体。
@@ -1410,11 +1414,11 @@ kernel32、shell32、user32、advapi32、version）。
   这些实参，与方法自身的类型参数**合并成一次克隆**（不是两次——两次会克隆出两个
   体，符号还会撞）。克隆体的 `this` 静态类型 = 具体实例化（`Pool<string>`）→
   体里的字段读回才有真实值类型。
-- 坑（实测）：克隆体和普通体在同一个队列里，符号名是
+- 坑（2026-10-21 实测）：克隆体和普通体在同一个队列里，符号名是
   `Owner_Method__SP<tag>`。类级和方法级若参数列表相同 → 同一 tag → 抢同一符号
   → **先注册的体赢**，后面所有调用点都打到错的体上。修法：tag 加前缀区分类级
   （`"I"`）与方法级（`""`）。
-- 坑（实测）：`this` 的静态类型不是 `curClass`，而是"当前发射的方法的
+- 坑（2026-10-21 实测）：`this` 的静态类型不是 `curClass`，而是"当前发射的方法的
   接收者类型"。引入 `CurThisTy()`（`curThisTy` 字段，默认 `MkType(curClass)`），
   克隆体发射期间由 drain 循环设成 `specThis[sp]`（**保存/恢复**，否则后续普通
   方法会继承克隆体的 `this` 类型）。
@@ -1425,7 +1429,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 70. async 方法的函数类型**恒**返回协程帧指针（`async void` 也不例外）
 
-- 坑（实测）：`MethodFnTypeThis` 用**声明的**返回类型 → `async void`
+- 坑（2026-10-21 实测）：`MethodFnTypeThis` 用**声明的**返回类型 → `async void`
   的函数类型是 `void (%Pool*)`，而**定义**返回的是协程帧 `i8*` → vtable 项与定义
   的类型不一致；而且 await 拿不到帧指针 → "this operand is not lowered as a
   coroutine frame"。
@@ -1437,7 +1441,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 71. 泛型类型作形参类型：parser 的"定形"前瞻要扫平衡尖括号
 
-- 坑（实测）：`using (ConcurrentDictionary<string, int> cd = ...)` 报
+- 坑（2026-10-21 实测）：`using (ConcurrentDictionary<string, int> cd = ...)` 报
   "syntax error: unexpected ','"。`LooksLikeTypedParam` 的前瞻只认 `ident ident`，
   遇到 `Name<...> name` 就判成表达式 → 把 `Name<` 当比较表达式解析 → 在 `,` 上炸。
 - 做法：前瞻里跳过**平衡的**尖括号组（`<` / `>` / `>>` 一起计数），再看后面是不是
@@ -1447,7 +1451,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 72. try/finally：`return` / `break` / `continue` 必须跑 finally（否则死锁）
 
-- 坑（实测）：自举的 `GenTry` 只在 try 体**正常结束**时跑 finally
+- 坑（2026-10-21 实测）：自举的 `GenTry` 只在 try 体**正常结束**时跑 finally
   （`if (!term) { ...; GenStmt(s.c); }`）。try 体里一个 `return` 让 `term` 变成
   true → **finally 被跳过**。`ConcurrentQueue.Count()` 正好是这个形状：
   `try { return this.inner.Count(); } finally { Mutex.Unlock(this.mtx); }`
@@ -1461,13 +1465,13 @@ kernel32、shell32、user32、advapi32、version）。
   递归。break/continue 只跑**循环内部**打开的 finally（记一个循环基线）。
 - 连带坑：finally 体在 try 体的**正常路径**和 **catch 路径**上各有一份拷贝
   （原代码就是这么发的），别以为 finally 只发一次。
-- 坑（实测）：finally 体在 try 区域里被**内联复制**到每个退出点上，
+- 坑（2026-10-21 实测）：finally 体在 try 区域里被**内联复制**到每个退出点上，
   所以 finally 体不能假设"只被发一次"；发两份以上时，局部变量槽位会重复注册，
   作用域要各自收干净。
 
 ## 73. 泛型擦除必须**按作用域**判定：用户类名不能被同名类型参数击穿
 
-- 坑（实测）：自举的擦除判定用一份**全局**类型参数名表
+- 坑（2026-10-21 实测）：自举的擦除判定用一份**全局**类型参数名表
   （`tparamNames`），于是 `class T`（用户类）和 `Binding<T>`（类型参数 T）
   同名时，`T` 处处被当成擦除类型 → 用户类被降成 i64 槽 → 程序把指针存进
   i64 槽，`store i64 %t66, i64* %v.victim.4` 直接是坏 IR（用例
@@ -1490,7 +1494,7 @@ kernel32、shell32、user32、advapi32、version）。
   查不到就抛异常。
 ## 74. 泛型类的构造器：实参推断用**具体类型**，调用 ABI 仍是**擦除形**
 
-- 坑（实测）：`LabelOf<Opt>` 这类泛型类的构造器，形参是委托类型
+- 坑（2026-10-21 实测）：`LabelOf<Opt>` 这类泛型类的构造器，形参是委托类型
   `delegate Label<Opt> (Opt)`。自举用**声明的形参类型**（`T` → 擦除的 i64 槽）去推断
   实参 → 传进去的 lambda 拿到的是**擦除的形参类型** → lambda 体里写什么都不生效
   （用例 `generic_nested_generic_field`）。
@@ -1504,7 +1508,7 @@ kernel32、shell32、user32、advapi32、version）。
   调用方释放临时后字段悬空 → 下一次读是 use-after-free → 堆损坏。
 ## 75. 泛型类的静态成员按**实例化**隔离（宿主的 mangle_inst_suffix 语义）
 
-- 坑（实测）：自举给泛型类的静态字段只发一个全局
+- 坑（2026-10-21 实测）：自举给泛型类的静态字段只发一个全局
   （`@__zan_sf_Stat_s`），于是 `Stat<int>.s` 与 `Stat<double>.s` 是同一格，
   `Stat<int>.Bump()` 加的是所有实例化共享的计数（用例 `generic_statics`：
   自举 i=6/d=6/s=6/f=7，宿主 i=4/d=4/s=5/f=5）。静态字段的**初始化器**同理：
@@ -1534,7 +1538,7 @@ kernel32、shell32、user32、advapi32、version）。
      定位存储：克隆的接收者静态类型（`curThisTy`）就带着实参。
 ## 76. 无类型的 lambda 参数在推断 body 类型时要换成委托的形参类型
 
-- 坑（实测）：`us.MinBy(u => u.name)`（`MinBy<T, R>(this List<T>, Sel<T, R>)`）
+- 坑（2026-10-21 实测）：`us.MinBy(u => u.name)`（`MinBy<T, R>(this List<T>, Sel<T, R>)`）
   在自举里把方法类型参数 **R 绑成了 `var`**：克隆体的符号名是
   `Ext_MinBy__SP_double_var_List.T_Sel.T.R`——`var` 是 parser 给**无类型**
   lambda 参数写的占位类型（`parser.zan` 的 `ParseLambda`：`p.type =
@@ -1551,7 +1555,6 @@ kernel32、shell32、user32、advapi32、version）。
   R 绑到真正的类型，克隆体里的 `R mk` 才是 double/string 而不是指针。
 - 通用教训：**"没写类型"和"类型未知"在 AST 里是两种表示**（null vs
   `"var"`），凡是"没有就用上下文补"的地方，两种都要认。
-
 ## 77. 硬件内建要复刻宿主的降级表；自举 IR 不能用目标特性 intrinsic
 
 - 坑（2026-10-21 实测）：自举把 `NativeMemory.AesCbcEncrypt` 这类硬件内建
@@ -1581,6 +1584,7 @@ kernel32、shell32、user32、advapi32、version）。
   小端），语义与硬件指令一致。
 - 通用教训：**宿主是规格**——自举要复刻的是宿主的**降级表**（符号名 + 参数
   顺序 + 类型宽度 + 可移植实现），不是"能编译过"就行。
+
 ## 78. byte[] 在自举里必须真的是字节数组（一字节一个元素）
 
 - 坑（2026-10-21 实测）：自举的数组一律按 **8 字节槽**存元素，但宿主里
@@ -1690,18 +1694,18 @@ kernel32、shell32、user32、advapi32、version）。
   件事的两种写法，分开实现就会漏掉其中一种的转换规则。
 ## 84. 委托重载打平，多半是**参与打分的类型没推出来**
 
-- 坑（实测）：`items.OrderBy(x => x.Length)`（x 是 string）在自举里
-  选中了 `StrKeySelector` 重载而不是 `KeySelector`（int 返回），委托按
-  string 返回而 lambda 返回 int，运行时崩（exit -1073741819）。宿主靠
-  "lambda 体类型 == 委托返回类型"给候选加分（`irgen_expr_core.c`：
-  `types_concrete_equal(bt, pt->delegate_ret_type)` → +2）。自举的
-  `ArgTypeNode` 对成员访问**只查类字段**，`x.Length` 的接收者是 string
-  这个内建类型 → 查不到 → 返回类型推不出来 → 三个同名重载全部打平 →
-  按声明顺序选中第一个（`Enumerable.zan` 里 `OrderBy` 的第一个重载就是
-  `StrKeySelector`）。
+- 坑（2026-10-21 实测）：`items.OrderBy(x => x.Length)`（x 是 string）
+  在自举里选中了 `StrKeySelector` 重载而不是 `KeySelector`（int 返回），
+  委托按 string 返回而 lambda 返回 int，运行时崩（exit -1073741819）。
+  宿主靠"lambda 体类型 == 委托返回类型"给候选加分
+  （`src/compiler/irgen_expr_core.c`：`types_concrete_equal(bt,
+  pt->delegate_ret_type)` → +2）。自举的 `ArgTypeNode` 对成员访问
+  **只查类字段**，`x.Length` 的接收者是 string 这个内建类型 → 查不到
+  → 返回类型推不出来 → 三个同名重载全部打平 → 按声明顺序选中第一个
+  （`Enumerable.zan` 里 `OrderBy` 的第一个重载就是 `StrKeySelector`）。
 - 做法：
-  - `ArgTypeNode` 的成员访问按宿主 `builtin_api.c` 的属性表补内建成员：
-    string.Length、List.Count、Dict.Count/Keys/Values、
+  - `ArgTypeNode` 的成员访问按宿主 `src/compiler/builtin_api.c` 的属性表
+    补内建成员：string.Length、List.Count、Dict.Count/Keys/Values、
     StringBuilder.Length，以及数组的 Length/Count。
   - 块体 lambda 的返回类型按宿主 `stmt_lambda_return_type` 收集：所有
     `return` 的类型必须一致（第一个说了算）；裸 `return;`、循环体、
@@ -1714,13 +1718,13 @@ kernel32、shell32、user32、advapi32、version）。
   加分制不是扣分制。
 ## 85. 字符串转义解码只有一份实现（宿主在**词法期**解）
 
-- 坑（实测）：`"\u0001"` 在自举里解成了 "u0001" —— 自举的 `DecodeStr`
-  只认 `\n \r \t \0`，其余转义原样落成字母。宿主在**词法期**就把转义
-  解掉（`lexer.c` 的 `lexer_escape_seq`）：`\xNN`（1..4 位十六进制）与
-  `\uNNNN`（4 位）解成码点，再按 UTF-8 编码（`zan_utf8_encode`）；代理
-  码点（D800..DFFF）不接受。表现：
-  `Log.EscapeJson("x\u0001y").Contains("\u0001")` 在自举里恒为真 →
-  断言反转 → `log_structured` 第 6 行输出 false（宿主 true）。
+- 坑（2026-10-21 实测）：`"\u0001"` 在自举里解成了 "u0001" —— 自举的
+  `DecodeStr` 只认 `\n \r \t \0`，其余转义原样落成字母。宿主在**词法期**
+  就把转义解掉（`src/compiler/lexer.c` 的 `lexer_escape_seq`）：`\xNN`
+  （1..4 位十六进制）与 `\uNNNN`（4 位）解成码点，再按 UTF-8 编码
+  （`zan_utf8_encode`）；代理码点（D800..DFFF）不接受。
+  表现：`Log.EscapeJson("x\u0001y").Contains("\u0001")` 在自举里恒为真
+  → 断言反转 → `log_structured` 第 6 行输出 false（宿主 true）。
 - 做法：转义解码只留一份实现（`ast.zan` 的 `StrEsc`），运行期字符串
   （`irgen`）、属性字面量（`parser`）、编译期元数据（`attrgen`）三处都
   走它。原生后端那套早就自己解了 `\x` `\u`（`ngen.zan` 的
@@ -1730,15 +1734,15 @@ kernel32、shell32、user32、advapi32、version）。
   自举在生成期解——位置可以不同，规则必须只有一份。
 ## 86. 泛型类的构造器要**按实例特化**（宿主 find_generic_ctor）
 
-- 坑（实测）：`class Bag<T> { List<T> src; Bag(...) { src = new List<T>(); } }`
+- 坑（2026-10-21 实测）：`class Bag<T> { List<T> src; Bag(...) { src = new List<T>(); } }`
   在自举里构造器是**所有实例共用的那一份**（`Bag_ctor__TextOf.T`），于是
   `new List<T>()` 的元素类型是擦除的 T → 列表建出来是
   `zlist_new(i64 0)`（**不拥有元素**）→ 元素没被 retain → lambda 读完
   字段就 release 掉 → 之后再读就是 use-after-free → 堆损坏
   （exit 0xC0000374，离崩溃点很远）。
-  宿主按实例特化构造器（`irgen_expr.c` 的 `find_generic_ctor`）：
-  `Bag<Item>` 的构造器里 `new List<Item>()` 的列表带元素描述符、**拥有**
-  元素。
+  宿主按实例特化构造器（`src/compiler/irgen_expr.c` 的
+  `find_generic_ctor`）：`Bag<Item>` 的构造器里 `new List<Item>()` 的
+  列表带元素描述符、**拥有**元素。
 - 做法：泛型类的 `new` 调用点按类实例特化构造器（符号带类型实参），
   构造器体用**代入后的** AST（`CloneSubst`）生成，接收者的静态类型带上
   具体类型实参（`curThisTy`/`curInstArgs`），字段读回来才是
@@ -1748,46 +1752,47 @@ kernel32、shell32、user32、advapi32、version）。
   一份，自举就得跟上，否则表现为远处的堆损坏。
 ## 87. 泛型类里的委托字段：签名要按接收者特化（宿主 subst_delegate_sig）
 
-- 坑（实测）：`class Bag<T> { TextOf<T> text; string TextAt(int i) { return text(src[i]); } }`
+- 坑（2026-10-21 实测）：`class Bag<T> { TextOf<T> text; string TextAt(int i) { return text(src[i]); } }`
   在自举里 `text` 的类型是擦除的 `TextOf<T>` → 委托调用按
   `i8* (i8*, i64)*` 发出，把元素**当整数**传进去；而闭包
   （`__lambda_0`）的形参是 `%Item*` → 闭包把整数当指针解 → 崩。
-  宿主在 `irgen_expr.c` 的 `subst_delegate_sig` 里按**接收者的类型实参**
-  特化委托签名（`T` → `Item`）。
+  宿主在 `src/compiler/irgen_expr.c` 的 `subst_delegate_sig` 里按
+  **接收者的类型实参**特化委托签名（`T` → `Item`）。
 - 做法：委托调用发射前，按当前实例（`curInstCls`/`curInstArgs`）把委托
   类型的类型实参代入（`InstDelegateType`）。
 - 通用教训：**擦除的槽位形状和真实的值形状要分开**——存储用擦除形，
   值的类型按实例还原；漏了还原就是"把整数当指针"。
 ## 88. 构造器重载：lambda 实参**只**匹配委托形参（宿主 find_ctor）
 
-- 坑（实测）：`new Bag<Item>(i => i.name)`（`Bag<T>` 有
+- 坑（2026-10-21 实测）：`new Bag<Item>(i => i.name)`（`Bag<T>` 有
   `Bag(List<string>)`、`Bag(TextOf<T>)`、`Bag(RowOf<T>)` 三个构造器），
   自举按"实参类型未知"把三个都打平 → 按声明顺序选中
   `Bag(List<string>)` → lambda 的形参没有类型 → 体里的 `i.name` 报
   "member 'name' of type 'int'"。
-  宿主的 `find_ctor`（`irgen_expr_core.c:917`）把不匹配的候选**排除**
-  （compatible=false）：lambda 实参只匹配委托形参，且委托的形参个数必须
-  与 lambda 的相同。
+  宿主的 `find_ctor`（`src/compiler/irgen_expr_core.c:917`）把不匹配的
+  候选**排除**（compatible=false）：lambda 实参只匹配委托形参，且委托的
+  形参个数必须与 lambda 的相同。
 - 做法：构造器候选筛选阶段加这条规则（`CtorTakesLambda`）。
 - 通用教训：**"实参类型未知"不等于"实参适配任何形参"**——宿主在实参
   类型推不出来时按**形状**（是不是 lambda、委托的元数）先筛一遍。
 ## 89. 重载评分：形参提到类型参数时按"模类型参数"匹配
 
-- 坑（实测）：`new Bag<Item>(new Col<Item>("Name", Cells.NameOf))`
+- 坑（2026-10-21 实测）：`new Bag<Item>(new Col<Item>("Name", Cells.NameOf))`
   （`Bag<T>` 有 `Bag(List<Col<T>>)`、`Bag(Col<T>)`、`Bag(RowOf<T>)` 三个
   构造器）在自举里三个候选都拿到同样的 +2（"形参提到了类型参数"就加分）
   → 打平 → 按声明顺序选中 `Bag(List<Col<T>>)` → 列数不对。
   宿主只在实参**模掉类型参数**后与形参同形时才加分
-  （`irgen_expr_core.c` 的 `types_match_modulo_tp` → +3）：`Col<T>` 匹配
-  `Col<Item>`（+3），`List<Col<T>>` 与 `RowOf<T>` 都不匹配（+0）。
+  （`src/compiler/irgen_expr_core.c` 的 `types_match_modulo_tp` → +3）：
+  `Col<T>` 匹配 `Col<Item>`（+3），`List<Col<T>>` 与 `RowOf<T>` 都不匹配
+  （+0）。
 - 做法：`ScoreCand` 把"形参提到类型参数"这一支从"无条件 +2"改成
   "模类型参数匹配得上 +3，否则 0"（`TypesMatchModuloTP`）。
 - 通用教训：**"提到了类型参数"不等于"匹配"**——泛型形参要比的是**去掉
   类型参数后的形状**（类名 + 层数 + 其余类型实参），不是"有没有提到"。
 ## 90. 方法组实参只匹配委托形参（宿主 arg_method_group）
 
-- 坑（实测）：`new Bag<Item>(Rows.Of)`（`Rows.Of` 是静态方法，当委托值用）
-  在自举里选中了 `Bag(List<Col<T>>)` → 委托字段是空的 → 崩。
+- 坑（2026-10-21 实测）：`new Bag<Item>(Rows.Of)`（`Rows.Of` 是静态方法，
+  当委托值用）在自举里选中了 `Bag(List<Col<T>>)` → 委托字段是空的 → 崩。
   宿主把方法组实参**排除**在非委托形参之外（`find_ctor` 的
   compatible=false 规则 + `method_group_score`：必须是委托形参、参数个数
   相同、返回类型同族）。
@@ -1797,8 +1802,8 @@ kernel32、shell32、user32、advapi32、version）。
   "类型未知"）去筛候选。
 ## 91. 命名空间限定的静态接收者也要走命名空间解析
 
-- 坑（实测）：`Widget.Tooltip.Flush(this)`（`namespace Gui;` 里的
-  `Gui.Widget.Tooltip`）在自举里报 "unresolved identifier 'Widget'"。
+- 坑（2026-10-21 实测）：`Widget.Tooltip.Flush(this)`（`namespace Gui;`
+  里的 `Gui.Widget.Tooltip`）在自举里报 "unresolved identifier 'Widget'"。
   自举的 nsresolve 只对**单段**接收者（`Cls.Method`）做命名空间解析，
   限定接收者（`A.B.C`）只做**全名精确匹配**——"Widget.Tooltip" 不是
   任何声明的全名（"Gui.Widget.Tooltip" 才是），于是没被折叠成那个声明。
@@ -1810,9 +1815,9 @@ kernel32、shell32、user32、advapi32、version）。
   命名空间解析，缺口就会出现在"带点号的名字"上。
 ## 92. `base.M()` 是**直调**，绕过虚表
 
-- 坑（实测）：`base.Name()` 在自举里报 "call to 'Name' is not supported by
-  the self-hosted compiler yet"——自举根本没处理 base 接收者。
-  宿主把 `base.M()` 降成**直调**（`irgen_call.c` 的 base_recv →
+- 坑（2026-10-21 实测）：`base.Name()` 在自举里报 "call to 'Name' is not
+  supported by the self-hosted compiler yet"——自举根本没处理 base 接收者。
+  宿主把 `base.M()` 降成**直调**（`src/compiler/irgen_call.c` 的 base_recv →
   `emit_dispatch_call` 传 NULL 类，绕过虚表）：基类自己的函数体执行，不是
   虚函数分发。
 - 做法：`EmitInstanceCall` 加 `direct` 开关（跳过虚表），`EmitBaseCall`
@@ -1821,7 +1826,7 @@ kernel32、shell32、user32、advapi32、version）。
   与 `this.M()` 相反，实现时不能复用虚分发那条路。
 ## 93. async 泛型方法按实例特化（与同步泛型方法同一套）
 
-- 坑（实测）：`await s.Echo<int>(42)`（async 泛型方法）在自举里
+- 坑（2026-10-21 实测）：`await s.Echo<int>(42)`（async 泛型方法）在自举里
   报 "not supported by the self-hosted compiler yet"——`CanSpecialize` 里
   一句 `if (IsAsync(m)) return false;` 把所有 async 方法挡在特化之外，
   调用点只能打到**擦除**的共享体（`async U Echo<U>(U x)` 的 `U` 是 i64 槽）。
@@ -1835,7 +1840,7 @@ kernel32、shell32、user32、advapi32、version）。
   不能特化的理由。
 ## 94. 调用点的返回类型要代入类型实参（接收者实例化 + 显式类型实参）
 
-- 坑（实测）：`await ps.Get<int>(1)`（`Pool<string>` 的方法，
+- 坑（2026-10-21 实测）：`await ps.Get<int>(1)`（`Pool<string>` 的方法，
   返回 `T`）在自举里把结果打成了一串指针数字（`140698019280840`）而不是
   `hello`：await 临时量的类型来自 `AwaitCallTy` → 克隆方法**声明的**返回
   类型 `T`（擦除），没有代入。宿主在检查器里就代入了
@@ -1848,7 +1853,7 @@ kernel32、shell32、user32、advapi32、version）。
   返回类型里出现类型参数的地方，都要问"这次调用把它代入成什么了"。
 ## 95. 方法签名含**类型参数个数**（泛型重载与普通重载并存）
 
-- 坑（实测）：`b.GetAsync<User>("k")` 与 `b.GetAsync("k")`
+- 坑（2026-10-21 实测）：`b.GetAsync<User>("k")` 与 `b.GetAsync("k")`
   指向同一对重载（`GetAsync(string)` 与 `GetAsync<T>(string)`），自举的
   候选去重按**参数类型标签**（`ParamTags`）判"同签名"，于是泛型那个被当
   成重复候选丢掉 → 显式类型实参选不到它。C# 的方法签名含类型参数的
@@ -1860,7 +1865,7 @@ kernel32、shell32、user32、advapi32、version）。
   列表相同但类型参数元数不同的两个方法，在 C# 里是两个重载。
 ## 96. `Task.Cancel` = 帧上的取消标志 + resume 时中止
 
-- 坑（实测）：自举对 `Task.Cancel(handle)` 报 "not supported"，
+- 坑（2026-10-21 实测）：自举对 `Task.Cancel(handle)` 报 "not supported"，
   根因是自举把任务句柄降级成**自己的扁平帧**（句柄就是帧指针），而帧头
   里没有取消标志这一格。宿主在协程帧头里有 `ASYNC_FRAME_CANCEL`，取消
   时置位（`src/compiler/irgen_async.c` 的 `get_co_cancel_fn`），帧在
@@ -1873,7 +1878,7 @@ kernel32、shell32、user32、advapi32、version）。
   杀线程；标志放在**帧**上（不是全局表）才能随帧一起被复用与回收。
 ## 97. async 跨帧异常：longjmp 的目标帧可能已经死了（已知缺口）
 
-- 坑（实测）：`await s.Thrown()`（被 await 的 async 方法里
+- 坑（2026-10-21 实测）：`await s.Thrown()`（被 await 的 async 方法里
   `throw`）在自举里**堆损坏**（0xC0000374），宿主正常。原因：自举的
   异常传播是 `longjmp` 到**外层** try 的 setjmp 缓冲，而那个 setjmp 是在
   awaiter **上一次** resume 调用里下的——那次调用在挂起时已经返回，栈帧
@@ -1887,7 +1892,7 @@ kernel32、shell32、user32、advapi32、version）。
   rsp/rip 仍然指向死栈）。
 ## 98. 取消要沿"等待关系"下传（自举与宿主的已知差异）
 
-- 坑（实测）：宿主的 `__zan_co_cancel` 不止置目标帧的
+- 坑（2026-10-21 实测）：宿主的 `__zan_co_cancel` 不止置目标帧的
   `ASYNC_FRAME_CANCEL`，还沿帧头的 `ASYNC_FRAME_CHILD` 链把**后代帧**
   一起置位；自举的 `Task.Cancel` 只置目标帧的槽 10——父帧没有"当前正在
   等的那个子帧"这一格可循。
@@ -1898,7 +1903,7 @@ kernel32、shell32、user32、advapi32、version）。
   了"自己那一层"；要补齐得先有"当前子帧"指针（父帧记住正在等的子帧）。
 ## 99. reject 用例的"钉子"会随实现推进失效——要改钉，不是删用例
 
-- 坑（实测）：`reject_cases.txt` 里的
+- 坑（2026-10-21 实测）：`tests/selfhost/reject_cases.txt` 里的
   `unsupported_builtin_call` 拿 `Task.Cancel` 当"自举还没实现的 C 宿主
   内建"的钉子；自举把 `Task.Cancel` 实现之后，这条用例反而**编译通过了**
   → 差分门判 "the self-hosted compiler accepted a program it must reject"。
@@ -1911,7 +1916,7 @@ kernel32、shell32、user32、advapi32、version）。
   时边界要跟着搬家，否则会出现"实现变好 → 门变红"的反向激励。
 ## 100. struct 有隐式无参构造器（宿主对 struct 跳过构造器检查）
 
-- 坑（实测）：`new Matrix4x4()`（`Matrix4x4` 是 **struct**，只有
+- 坑（2026-10-21 实测）：`new Matrix4x4()`（`Matrix4x4` 是 **struct**，只有
   一个 16 个 float 的构造器）在自举里报 "no constructor of 'Matrix4x4' takes 0
   argument(s); a class that declares constructors has no implicit parameterless
   one"，宿主却编译通过。根因：宿主检查器的构造器可用性检查第一句就是
@@ -1926,7 +1931,7 @@ kernel32、shell32、user32、advapi32、version）。
   报错文案时，要先确认那条规则的对象是"类型"还是"类"。
 ## 101. 浮点字面量的 `f` 后缀决定类型（宿主 lit_suffix ? float : double）
 
-- 坑（实测）：`Vector4.Multiply(a, 2.0f)` 在自举里选中了
+- 坑（2026-10-21 实测）：`Vector4.Multiply(a, 2.0f)` 在自举里选中了
   `Multiply(Vector4, Vector4)` 重载，把 `2.0f` 当成一个 Vector4 传下去 →
   clang 报 "floating point constant invalid for type"。根因：自举的词法器把
   `f/F/m/M` 后缀**吃掉**了（只留在文本之外），于是 `2.0f` 与 `2.0` 在类型
@@ -1939,7 +1944,7 @@ kernel32、shell32、user32、advapi32、version）。
   词法器"顺手吃掉"后缀时，后面所有按类型选候选的逻辑都会悄悄偏一格。
 ## 102. float 与 double 互相可隐式转换：重载评分不算"不匹配"
 
-- 坑（实测）：`Foo(double)` 与 `Foo(float)` 两个重载，传 `2.0f`
+- 坑（2026-10-21 实测）：`Foo(double)` 与 `Foo(float)` 两个重载，传 `2.0f`
   时若按"名字不同即不匹配"扣分，float 那个重载会被判成不可用。
 - 做法：`ScoreCand` 里 float/double 这一对不再扣分（只是拿不到精确匹配的
   加分）——宿主允许 float 实参进 double 形参（加宽），也允许反向。
@@ -1947,7 +1952,7 @@ kernel32、shell32、user32、advapi32、version）。
   被判出局，只是排序靠后。
 ## 103. `await` 有三种形态：协程帧 / 任务句柄 / 普通值透传
 
-- 坑（实测）：`await sqlite3_step(stmt)`（一个返回 int 的
+- 坑（2026-10-21 实测）：`await sqlite3_step(stmt)`（一个返回 int 的
   extern 调用）在自举里报 "'await' expects an async call in the self-hosted
   compiler -- this operand is not lowered as a coroutine frame"，宿主却编译
   通过。宿主的三种形态在 `src/compiler/irgen_expr.c: emit_expr_await_expr`：
@@ -1962,7 +1967,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 104. 实例方法组要绑定接收者（`obj.Method` 当委托值）
 
-- 坑（实测）：`Action<int> f = probe.Probe;`（把实例方法当委托
+- 坑（2026-10-21 实测）：`Action<int> f = probe.Probe;`（把实例方法当委托
   值传出去）在自举里报 "member 'Probe' of type 'Probe' is not supported"，宿主
   却编译通过。宿主的 `emit_method_group_closure`
   （`src/compiler/irgen_expr.c`）把方法组变成一条**带接收者的闭包记录**：
@@ -1975,7 +1980,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 105. `nint` 是关键字：词法、语法、类型名三处都要有
 
-- 坑（实测）：`(nint)-1` 在自举报 "unresolved identifier
+- 坑（2026-10-21 实测）：`(nint)-1` 在自举报 "unresolved identifier
   'nint'"，宿主编译通过。宿主有 `TK_NINT`（`src/compiler/lexer.c`），绑定器
   也认识 `nint` 这个类型名（`binder.c` 的 `type_nint`）；自举的绑定器早就能
   解析 `nint` 这个类型名，缺的是**词法与语法**把它当类型关键字。
@@ -1988,7 +1993,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 106. 数组级优先于元素名：`List<string>[]` 的元素是 `List<string>`
 
-- 坑（实测）：`List<string>[] a; a[0].Add("x");` 在自举把
+- 坑（2026-10-21 实测）：`List<string>[] a; a[0].Add("x");` 在自举把
   `a[0]` 定型成 **string**（报 "string method 'Add' is not supported"），
   宿主正常。两处根因：① 检查器 `InferType` 的 `AK.Index` 分支先判
   `sval == "List"` 就返回类型实参（`kids[0]`），没先看数组级——`List<string>[]`
@@ -2005,7 +2010,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 107. 裸 `throw;` 是重抛
 
-- 坑（实测）：`catch { ...; throw; }`（把捕获的异常原样再抛）
+- 坑（2026-10-21 实测）：`catch { ...; throw; }`（把捕获的异常原样再抛）
   在自举里被降成 `bitcast i64 0 to i8*`——clang 报 "invalid cast opcode for
   cast from 'i64' to 'ptr'"。自举原来只有 `throw <expr>`，裸 `throw;` 的
   表达式是 null，被当成"抛 0"处理。
@@ -2018,7 +2023,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 108. `await` 的隐藏内建：`Socket.ResolveSockAddr` / `Socket.ResolveAsync`
 
-- 坑（实测）：标准库的 `Socket.BuildSockAddrAsync` 里
+- 坑（2026-10-21 实测）：标准库的 `Socket.BuildSockAddrAsync` 里
   `await Socket.ResolveSockAddr(ip, port, addr, 28)` 在自举里编译出对
   未定义函数 `@Socket_ResolveSockAddr` 的调用；`Socket.ResolveAsync` 同理。
   这两个不是普通方法：宿主在 `emit_expr_await_expr` 里把它们**识别成
@@ -2035,7 +2040,7 @@ kernel32、shell32、user32、advapi32、version）。
   槽位宽度）来，不能照抄别处内建的形状。
 ## 109. 插值的格式说明符要走 printf 语义（`x.ToString("D4")`）
 
-- 坑（实测）：`$"{v:D4}"` 在自举里报 "call to 'v.ToString' is
+- 坑（2026-10-21 实测）：`$"{v:D4}"` 在自举里报 "call to 'v.ToString' is
   not supported by the self-hosted compiler yet"——自举的词法器把插值洞
   `{v:D4}` 拼成 `v.ToString("D4")`，而 irgen 后端只认**无参**的
   `ToString`。宿主则把说明符映射成 printf 模式
@@ -2053,7 +2058,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 110. 插值里的 `{{` / `}}` 是转义花括号
 
-- 坑（实测）：`$"{{{n}}}"` 在自举里报 "syntax error: unexpected
+- 坑（2026-10-21 实测）：`$"{{{n}}}"` 在自举里报 "syntax error: unexpected
   ':'"——自举的词法器（`lexer.zan` 的 `InterpStr`）见到 `{` 就开一个洞，
   不认 `{{` 是转义的左花括号，于是把 `{n` 当成洞的内容。
   宿主在 `lexer_interp_string_segment` 里明确：`{{` 是一个字面 `{`，
@@ -2066,7 +2071,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 111. 自举的插值是 `+` 链，bool/nullable 空洞因此对不上（已知缺口）
 
-- 坑（实测）：`$"{flag}"`（bool）在宿主输出 "true"，在自举输出
+- 坑（2026-10-21 实测）：`$"{flag}"`（bool）在宿主输出 "true"，在自举输出
   "1"；`$"{u}"`（`ulong?`）在宿主输出载荷或空串，在自举直接生成坏 IR
   （把可空槽当 i64 喂给 snprintf）。根因：自举的词法器把插值**降成
   `+` 拼接链**，于是空洞和普通拼接操作数无法区分——而宿主的
@@ -2082,7 +2087,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 112. `%E` 的指数位数是 C 运行时的差异，不是编译器的差异
 
-- 坑（实测）：`$"{f:E2}"` 在宿主输出 "3.14E+000"（指数三位），
+- 坑（2026-10-21 实测）：`$"{f:E2}"` 在宿主输出 "3.14E+000"（指数三位），
   在自举产物里输出 "3.14E+00"（指数两位）。两边发射的格式串都是
   `%.2E`，差别在**链接时的 C 运行时**：宿主 zanc 的链接行是
   `-lmingw32 -lgcc -lmoldname -lmingwex -lmsvcrt`（`src/compiler/main.c`），
@@ -2095,7 +2100,7 @@ kernel32、shell32、user32、advapi32、version）。
   运行时，输出就变；先确认差异出在哪一层，再决定改哪边。
 ## 113. extern（DllImport）实参要传原始缓冲：byte[] 不是字符串
 
-- 坑（实测）：自举编译的程序一碰 SQLite 就崩（0xC0000005），
+- 坑（2026-10-21 实测）：自举编译的程序一碰 SQLite 就崩（0xC0000005），
   而 stdout 因为块缓冲全丢，看起来像"跑到退出时才崩"——实际是崩在
   `SqliteConnection.Open` 里。根因：自举把 `byte[]` 实参**复制成一个
   新的托管字符串**（`zstr_new` + 逐字节拷贝）再交给 C，宿主却是
@@ -2118,7 +2123,7 @@ kernel32、shell32、user32、advapi32、version）。
   对象。判据：实参那块内存**会不会被 C 侧写**——会，就不能复制。
 ## 114. 宿主把 `Math.PI` 和 `Cpu.*` 当内建：自举照抄，连宿主的"恒 0"一起照抄
 
-- 坑（实测）：`packages/Zan.Gui` 里的 `Math.PI` 和
+- 坑（2026-10-21 实测）：`packages/Zan.Gui` 里的 `Math.PI` 和
   `stdlib` 里的 `Cpu.HasSse42` 让自举**直接拒绝编译**两个用例
   （"Math is a built-in type and cannot be used as a value" +
   "unresolved identifier 'Cpu'"）。宿主这边：
@@ -2145,7 +2150,7 @@ kernel32、shell32、user32、advapi32、version）。
   写明"这是宿主的保守回退"，免得后人当成自举的缺陷去"修"。
 ## 115. 字符串实参可以是 char；span 的 float 要显式窄化
 
-- 坑（实测）：`s.Split(',')` 在自举里发出
+- 坑（2026-10-21 实测）：`s.Split(',')` 在自举里发出
   `call i8* @zstr_split(i8* %s, i8* 10)`——clang 直接报
   "integer constant must have integer type"。根因：宿主把"能当字符串用的
   实参"抽象成 `is_string_like_expr`（`src/compiler/irgen_call.c:536`：
@@ -2170,7 +2175,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 116. LLVM 的 `null` 实参必须带类型——裸 `null` 不是实参
 
-- 坑（实测，A484）：自举拼出来的 IR 里出现了裸 `null` 当调用实参，
+- 坑（2026-10-21 实测，A484）：自举拼出来的 IR 里出现了裸 `null` 当调用实参，
   clang 报 "expected type"：
 
   ```
@@ -2192,7 +2197,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 117. 通用可赋值性检查：先量矩阵，再照着写
 
-- 坑（实测，A477）：自举的检查器**没有**宿主那种通用的隐式转换检查——
+- 坑（2026-10-21 实测，A477）：自举的检查器**没有**宿主那种通用的隐式转换检查——
   `int y = "hello";` 在自举里编译通过（IR 照写），宿主报
   `cannot convert 'string' to 'int' in initializer: no implicit conversion`。
   自举原来只有两条 Task 专属规则（`CheckTaskNoResult` / `CheckTaskOnlyHandle`）。
@@ -2262,9 +2267,10 @@ kernel32、shell32、user32、advapi32、version）。
 - 通用教训：**"逐字一致"不只是诊断措辞**。同一个表达式的**求值时机**（在哪一步窄化、
   谁来选重载、裸 return 返回什么）同样是宿主行为的一部分；照抄时要把宿主那段代码
   读到底，再决定自举在哪一步做这件事。
+
 ## 120. 窄化是独立的一条规则：浮点进整型槽、常量越界，措辞还不一样
 
-- 坑（实测，A485）：宿主判可赋值性时**先**判窄化，窄化有自己的措辞：
+- 坑（2026-10-21 实测，A485）：宿主判可赋值性时**先**判窄化，窄化有自己的措辞：
   `narrowing conversion from 'X' to 'Y' in <what> needs an explicit cast (C# rules)`
   ——和通用的 `cannot convert 'X' to 'Y' in <what>: no implicit conversion` 是两条
   不同的诊断。自举只学了后者，前者整条缺失。
@@ -2275,7 +2281,7 @@ kernel32、shell32、user32、advapi32、version）。
      （`byte b = someLong` 也不报）——只有字面量常量才查范围；
   3. **`decimal` 不是浮点**：宿主有独立的 decimal 类型，`int v = 5.0m` 报的是
      *cannot convert*（不是窄化），`double` 与 `decimal` 互不隐式转换。
-- 更贵的坑：**自举把 `decimal` 类型映射成 `double`**（自举的 parser），AST 里
+- 更贵的坑：**自举把 `decimal` 类型映射成 `double`**（`parser.zan`），AST 里
   `decimal` 目标与 `double` 目标分不出来。第一版按"能区分"实现，结果把
   `decimal d = 5.0m;`（合法程序）判成了错。
 - 通用教训：**误报比漏报贵得多**——漏报只是放过一个该拒的程序，误报是拒绝一个
@@ -2285,7 +2291,7 @@ kernel32、shell32、user32、advapi32、version）。
   规格），再照着实现；凭直觉写的规则集在第二版几乎必然要返工。
 ## 121. 取串路径有"汇合点"：同一个 bool 在四条路径上长得不一样
 
-- 坑（实测，A441）：同一个 bool 在四条路径上给出三种字符串——
+- 坑（2026-10-22 实测，A441）：同一个 bool 在四条路径上给出三种字符串——
   `Console.WriteLine(b)` -> "true"，`b.ToString()` -> "true"，
   `Convert.ToString(b)` -> "1"，`"x" + b` -> "x1"。
 - 原因不是"忘了在某处加分支"，而是**每条取串路径各写各的**：宿主有四处
@@ -2304,30 +2310,32 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 122. 整数字面量的类型看**进制**：`0xFFFFFFFF` 是 int（值 -1），`4294967295` 是 long
 
-- 坑（实测，A490）：自举按"值是否超出 int32"给字面量定型，十六进制字面量因此被
-  判成 `long` → `int h0 = 0x67452301;` 这类**合法**程序被自举拒绝
-  （`narrowing conversion from 'long' to 'int'`），标准库里的若干文件全中招 →
-  **整个标准库编译不过**，一大批用例卡在 SELFHOST-REFUSED。
-- 宿主是这么定的（检查器的 `AST_INT_LITERAL -> lit_radix`）：**无后缀的 2/8/16
-  进制字面量，只要值在 uint 范围内就是 `int`**，值取 int 域（发射时截断成
-  int32：`0xFFFFFFFF` 是 **-1**）；同样的数值写成十进制则是 `long`
-  （`4294967295` 超 int32）。所以 `int x = 0xFFFFFFFF;` 合法，
+- 坑（2026-10-22 实测，A490）：自举按"值是否超出 int32"给字面量定型，
+  十六进制字面量因此被判成 `long` → `int h0 = 0x67452301;` 这类**合法**程序被
+  自举拒绝（`narrowing conversion from 'long' to 'int'`），而 packages 里的
+  Sha1 / FocusManager / QrCode 全中招 → **整个 packages 编译不过**，
+  一大批用例卡在 SELFHOST-REFUSED。
+- 宿主是这么定的（`src/compiler/checker.c` 的 `AST_INT_LITERAL -> lit_radix`）：
+  **无后缀的 2/8/16 进制字面量，只要值在 uint 范围内就是 `int`**，值取 int 域
+  （`irgen_expr.c` 发射时截断成 int32：`0xFFFFFFFF` 是 **-1**）；同样的数值写成
+  十进制则是 `long`（`4294967295` 超 int32）。所以 `int x = 0xFFFFFFFF;` 合法，
   `int x = 4294967295;` 是窄化错误——**同一个数值，两种写法，两个类型**。
 - 做法：把**进制**也记进 AST（宿主有 `lit_radix`，自举把进制折进 suffix 字段：
-  8 = 二进制、16 = 十六进制、24 = 八进制；类型后缀取 `suffix % 8`），定型与取值
-  都按进制裁决。八进制也要折：`0o37777777777` = 4294967295 > int32max，不折就会
-  被当成十进制 long 而误报。
+  8 = 二进制、16 = 十六进制、24 = 八进制；类型后缀取 `suffix % 8`），定型
+  （`IntLitTypeName`）与取值（`IntLitValue`）都按进制裁决。八进制也要折：
+  `0o37777777777` = 4294967295 > int32max，不折就会被当成十进制 long 而误报。
 - 通用教训：**字面量的类型不只看值，还看写法**。诊断里点的类型名（`'long'` vs
   `'int'`）、窄化判定、运行期值全都跟着写法变；只按值推断类型必然对不上。
-- 连带的一条：**窄化规则要照抄整条判定链**，不能只抄"常量是否越界"。宿主的顺序
-  是：① 浮点进整型槽 → 报；② 整型槽收整型值：先看**值类型的整个范围**能不能装进
+- 连带的一条：**窄化规则要照抄整条判定链**，不能只抄"常量是否越界"。宿主
+  `checker_check_assignable` 的顺序是：
+  ① 浮点进整型槽 → 报；② 整型槽收整型值：先看**值类型的整个范围**能不能装进
   目标范围（int→int、int→long 直接过），**再**看常量本身；③ `nint` 只能进
   `long`/`nint`；④ `ulong` 槽收任何整数字面量。
   只实现 ② 的后半段，就会把 `int x = 0xFFFFFFFF;`（同类型、int 域）误判成越界。
 - 通用教训：**"值类型的范围能装进目标"这条捷径在判定链的最前面**——它让"同类型
   赋值"永远不窄化。任何"拿常量值直接比目标范围"的实现，都会在同类型赋值上误报，
-  而且误报的规模是"整个标准库"这种量级。
-- 补一条：宿主对**超过 int64 的字面量**另有一条规则（词法器的 strtoull 路径）：
+  而且误报的规模是"所有 packages"这种量级。
+- 补一条：宿主对**超过 int64 的字面量**另有一条规则（`lexer_radix_int_value`）：
   `0xFFFFFFFFFFFFFFFF` 这种值装不进有符号 64 位，就把后缀提升成 **UL**
   （类型是 ulong，值是那个比特模式）；带 `L` 后缀则是错误
   （`integer literal is too large for 'long'`）。自举的词法器没有诊断通道，
@@ -2338,9 +2346,9 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 123. 裸调用要先查**字段**再查方法：静态委托字段是合法的调用目标
 
-- 坑（实测，A491）：`static CloneTreeFn cloneTree;` 这种**静态委托字段**不带限定符
-  直接调用（`cloneTree(root)`）时，自举把它当成方法调用，发出不存在的
-  `@App_cloneTree` 符号 → **链接失败**（不是编译失败，差分门里表现为
+- 坑（2026-10-22 实测，A491）：`static CloneTreeFn cloneTree;` 这种**静态委托
+  字段**不带限定符直接调用（`cloneTree(root)`）时，自举把它当成方法调用，发出
+  不存在的 `@App_cloneTree` 符号 → **链接失败**（不是编译失败，差分门里表现为
   "SELFHOST-BAD-IR"，容易误判成 IR 生成坏了）。
 - 原因：裸调用路径只问"这个类里有没有同名方法"，没问"有没有同名字段"。宿主把
   裸名字先按**符号**解析，字段（尤其是委托字段）是合法的调用目标。
@@ -2353,8 +2361,8 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 124. 宿主的 `int` 是 32 位、自举的 `int` 是 64 位：位运算的结果要按 int 域回读
 
-- 坑（实测，A492）：`BitOperations.RotateRight(0x12345678, 4)` 在宿主里是
-  **-2128007553**（宿主在 i32 上转，返回的是 i32），自举却给 2166959747
+- 坑（2026-10-22 实测，A492）：`BitOperations.RotateRight(0x12345678, 4)` 在宿主里
+  是 **-2128007553**（宿主在 i32 上转，返回的是 i32），自举却给 2166959747
   （自举在 i64 上转，`zext` 回来）。这个差异平时被"字面量也按 long 算"掩盖着：
   字面量 `0x81234567` 在自举里是 long（正数），两边碰巧相等；一旦字面量按宿主
   的规则定型成 int（int 域的负数），这个被掩盖的差异就露出来了。
@@ -2368,13 +2376,13 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 125. 显式窄转换要按宿主的宽度截断：byte / short / int 各有各的域
 
-- 坑（实测，A493）：自举只实现了 uint / ushort / sbyte 三个窄转换，
-  `(byte)x` 与 `(short)x` 原样透传 → `(byte)4886718345` 打印成 4886718345
-  （宿主是 137）、`(short)70000` 打印成 70000（宿主是 4464）。
-- 宿主的口径（发射端的 `emit_expr_cast_expr`）：先把值截到目标类型的宽度，再
-  按目标的符号性回读——byte / uint / ushort **零扩展**，sbyte / short / int
-  **符号扩展**，char / long / ulong 保持 64 位不动（宿主里 char 是 i64、int 是
-  i32，所以 `(char)x` 不截断、`(int)x` 截 32 位）。
+- 坑（2026-10-22 实测，A493）：自举只实现了 uint / ushort / sbyte 三个窄转换，
+  `(byte)x` 与 `(short)x` 原样透传 → `unsigned_widths` 的 `(byte)4886718345`
+  打印成 4886718345（宿主是 137）、`(short)70000` 打印成 70000（宿主是 4464）。
+- 宿主的口径（`src/compiler/irgen_expr.c` 的 `emit_expr_cast_expr`）：先把值
+  截到目标类型的宽度，再按目标的符号性回读——byte / uint / ushort **零扩展**，
+  sbyte / short / int **符号扩展**，char / long / ulong 保持 64 位不动
+  （宿主里 char 是 i64、int 是 i32，所以 `(char)x` 不截断、`(int)x` 截 32 位）。
 - 做法：自举的 int 是 i64，于是 `(int)x` 要 `shl 32 / ashr 32`（截 32 位再符号
   扩展）、`(short)x` 是 `shl 48 / ashr 48`、`(byte)x` 是 `and 255`。
 - 通用教训：**显式转换的目标宽度就是语义的一部分**。"自举的槽都是 i64" 不能成为
@@ -2382,30 +2390,30 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 126. 原始类型的常量是编译期常量：int.MaxValue / double.NaN / float.Epsilon
 
-- 坑（实测，A494）：`int.MaxValue`、`uint.MaxValue`、
+- 坑（2026-10-22 实测，A494）：`int.MaxValue`、`uint.MaxValue`、
   `double.PositiveInfinity`、`float.Epsilon` 这些**原始类型的常量**在自举里
   根本编不过（"'int' is a built-in type and cannot be used as a value"），
-  于是对应用例失败，**连标准库都编不过**（数值库里用了
-  `double.NegativeInfinity`）。
-- 宿主把它们折成编译期常量（发射端的那张表），程序里的 `int.MaxValue` 就是个
-  字面量。
+  于是 `primitive_constants` 整个用例失败，**连标准库都编不过**
+  （`stdlib/System/Numerics/MathUtil.zan` 用了 `double.NegativeInfinity`）。
+- 宿主把它们折成编译期常量（`irgen_expr.c` 的那张表），程序里的
+  `int.MaxValue` 就是个字面量。
 - 做法：在成员访问这一层先判"对象是一个原始类型名 + 成员是常量名"，直接给
   常量，**不要去求值那个类型名**（自举原来把类型名当值去求，才报"不能当值用"）。
 - 通用教训：**内建类型的成员是常量，不是运行时查找**。常量要在**访问点**截住。
 - 通用教训：**一个内建缺失不只是少一个用例**——标准库会用到它，编译期阻塞的
-  扩散面比用例大得多（`double.PositiveInfinity` 一个常量就让用到它的用例整个
-  编不过）。
+  扩散面比用例大得多（`double.PositiveInfinity` 一个常量就让 math_numerics
+  整个用例编不过）。
 
 ## 127. 枚举成员的值要按声明顺序折叠：连续规则 + 可以引用早期成员
 
-- 坑（实测，A495）：自举只认"整数字面量"的枚举成员值，
+- 坑（2026-10-22 实测，A495）：自举只认"整数字面量"的枚举成员值，
   `enum Color { Red = -5, Green, Blue = Red + 10 }` 变成 0/1/2（宿主的
   -5 / -4 / 5）。负号、二元表达式、对早期成员的引用，全都不认。
-- 宿主的口径（绑定期的 `fold_enum_member_value` + 发射端的枚举成员发射）：成员
-  **按声明顺序**绑定，每个值表达式折叠成常量；值可以是字面量、一元 +/-、二元
-  + - * / & |，或者**引用一个已经折叠过的早期成员**（所以 `Blue = Red + 10`
-  = 5）。没有显式值的成员**接着上一个继续**（+1），所以 `Green` = -4 而不是 1。
-  发射时值按 32 位**零扩展**。
+- 宿主的口径（`src/compiler/binder.c` 的 `fold_enum_member_value` +
+  `irgen_expr.c` 的枚举成员发射）：成员**按声明顺序**绑定，每个值表达式折叠成
+  常量；值可以是字面量、一元 +/-、二元 + - * / & |，或者**引用一个已经折叠过
+  的早期成员**（所以 `Blue = Red + 10` = 5）。没有显式值的成员**接着上一个
+  继续**（+1），所以 `Green` = -4 而不是 1。发射时值按 32 位**零扩展**。
 - 做法：按顺序折叠，前面折好的值放进一张表，标识符只查这张表（后来的成员查
   不到 → 折叠失败 → 报宿主那句 "enum member 'X' initializer must be an
   integer constant expression"）。
@@ -2417,7 +2425,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 128. "能转成字符串"不是白名单：`Convert.ToString` 按**类型种类**拒绝引用类型
 
-- 坑（实测，A442）：自举侧 `Convert.ToString(<类实例>)` 吐出对象的
+- 坑（2026-10-22 实测，A442）：自举侧 `Convert.ToString(<类实例>)` 吐出对象的
   **指针地址**（"140737488xxxx"），宿主侧已经 fail-closed 报
   `cannot convert 'Box' to a string -- call .ToString() on the value instead`。
   同一个源文件，两个后端一个报错、一个输出地址——地址本身也是信息泄露。
@@ -2484,10 +2492,10 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 131. 改了**全局**渲染口径，要回头扫全部 golden——差分门只覆盖 92 个用例
 
-- 坑（A441 的余账，实测）：A441 把宿主的 bool→字符串统一成
-  "true"/"false"，我只改了**一个** golden，还写下"现有 golden 里没有
-  把 bool 的 1 固化的用例"。**这条结论是错的**：当时只查了
-  `Convert.ToString` 的 230 处调用，漏了别的取串路径
+- 坑（A441 的余账，2026-10-22 实测）：A441 把宿主的 bool→字符串统一成
+  "true"/"false"，我只改了 `tests/conformance/string_char_args.out` 一个
+  golden，还写下"现有 golden 里没有把 bool 的 1 固化的用例"。**这条结论是
+  错的**：当时只查了 `Convert.ToString` 的 230 处调用，漏了别的取串路径
   （`+` 拼接、插值、`Console.WriteLine(bool)`、`Cpu.Has*` 属性、比较表达式），
   实际有 123 个 golden 把 bool 记成了 "1"/"0"——宿主改了、golden 没改，
   conformance 与差分门一起红。
@@ -2695,7 +2703,7 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 138. 数值转换的守卫：判据要**分两套**，守卫要落在**分派入口**
 
-- 坑（实测）：自举的 `ToDbl` 对任何非 double 实参一律
+- 坑（2026-10-22 实测）：自举的 `ToDbl` 对任何非 double 实参一律
   `sitofp i64 <v> to double`——类实例是**指针**，造出 `sitofp i64 i8*`，
   LLVM 校验失败（非法 IR）；`Convert.ToInt32/ToInt` 更狠，无条件
   `call i64 @atoi(i8* <a.op>)`，把**对象指针**当 C 字符串读，静默得到 0。
@@ -2718,7 +2726,7 @@ kernel32、shell32、user32、advapi32、version）。
   误拒（宿主放行，`Color.Green` → 1）。
 - 坑：可空值在 `Convert.*` 路径上宿主给 0（整型路径），自举也必须给 0；
   `ToDouble` 路径宿主会读装箱单元给出垃圾值（实测 2.12e-314），自举给 0.0
-  即可——真装箱语义另立条目修，别在这条路上"对齐"到宿主的垃圾值。
+  即可——真装箱语义归 A454，别在这条路上"对齐"到宿主的垃圾值。
 - 通用教训：**判据不同的两个入口，白名单不能共用一张表**。共用会同时错两次：
   放行了不该放行的，又拒掉了不该拒的。判据先分清，守卫再落。
 - 通用教训：**"两边都错"要分清谁对谁错**：宿主把 `bool` 当**有符号**整数
@@ -2821,7 +2829,7 @@ kernel32、shell32、user32、advapi32、version）。
 ## 143. 字典键的**比较方式**跟声明的键类型走：非字符串键是不透明的 64 位 token
 
 - 坑（2026-10-22 实测）：宿主给字典调用发一个 `is_str` 标志，只有键类型
-  **正好是 string** 时才是 1（`compiler/irgen_expr.c:3391`）；其余键类型
+  **正好是 string** 时才是 1（`src/compiler/irgen_expr.c:3391`）；其余键类型
   按**身份**比较（不透明 64 位 token）。自举早期一律按字符串比，于是
   `Dictionary<int,V>.Keys` 交回的是字符串指针（`Dictionary<int,Bm25Document>`
   的 `Keys` 被当成 `List<string>`），下游取整数 id 拿到垃圾 → 空指针解引用。
@@ -2844,7 +2852,7 @@ kernel32、shell32、user32、advapi32、version）。
   **合并点之后**统一释放 —— 于是**没走到的那个分支的槽（还是 null）也被
   release 一次** → `zrelease(null)` → 堆损坏（表现为后面的 Access violation，
   崩点随机，跟三元表达式看着毫无关系）。
-- 宿主（`compiler/irgen_expr.c` 的 `emit_expr_conditional`）的做法是**在
+- 宿主（`src/compiler/irgen_expr.c` 的 `emit_expr_conditional`）的做法是**在
   分支内**把所有权对齐：两分支所有权不一致时，对"不 owned"的那一侧在分支
   末尾 retain，使两侧都是 owned，phi 的结果就是 owned。
 - 修法照抄同文件里**已经写对的 `??`**：每个分支用**隔离的临时槽列表**，
@@ -2871,7 +2879,21 @@ kernel32、shell32、user32、advapi32、version）。
 
 ## 146. 表达式代码生成严禁对子树无条件重复求值（避免 AST 深度指数爆炸）
 
-- 坑（2026-10-23 实测）：自举 `selfhost/irgen_expr.zan` 在二元运算符 `+`、`-`、`*`、`/`、`%` 上增加了可空数值类型（`int?` 等）的 lifted 运算支持，但在进入前无条件调用了 `ExprVal la = GenExpr(e.a)`。若 `la.ty` 不是可空（99.9% 场景），则直接穿透到后续的普通二元求值路径，并在那里再次执行 `ExprVal a = GenExpr(e.a)`。
+- 坑（2026-10-23 实测）：自举 `irgen_expr.zan` 在二元运算符 `+`、`-`、`*`、`/`、`%` 上增加了可空数值类型（`int?` 等）的 lifted 运算支持，但在进入前无条件调用了 `ExprVal la = GenExpr(e.a)`。若 `la.ty` 不是可空（99.9% 场景），则直接穿透到后续的普通二元求值路径，并在那里再次执行 `ExprVal a = GenExpr(e.a)`。
 - 对于嵌套二元表达式（例如 `n = n + Count(a) + Count(b) + Count(c) + Count(d)`），每增加一层链式加法，左操作树的 `GenExpr` 求值次数翻倍成 $O(2^{\text{depth}})$，导致深层 AST 遍历（如 `CountAwaits`）产生数十亿次递归调用与庞大的重复指令，造成 `fixedpoint_gen2` 在 `g3.ll` 生成时假死超时（>1200s）。
 - 修法：在求值前先用 `ArgTypeNode(e.a)` 做无开销的静态类型预判，仅在左臂明确可能为可空时才先求值；若非可空，复用第一次求得的 `la` 或仅求值一次，严禁对同一 AST 节点调用两次 `GenExpr`。
 - 判据：IR 生成阶段的所有 helper 必须严格保持单遍（single-pass）发射。任何试探性分支若需求值子表达式，必须将结果缓存传递或确保提前返回，绝不允许穿透后丢弃并重复发射。
+
+## 147. 字符串头与对象 ARC 头不通用：动态调用返回值不能对字符串字面量 `@zretain`
+
+- 坑（2026-11-10 实测）：在泛型容器（如 `List<T>`）的动态反射调用（`InvokeString`/`InvokeObject`）中，对返回指针如果统一调用 `@zretain`，当被反射方法返回的是字符串常量时，由于字符串在只读 `.rdata` 常量区，其对象头布局为 `[-24]=0, [-16]=len, [-8]=magic (TSNZ/1515082580)`，而不是 ARC 类对象的 `[-24]=cid, [-16]=rc, [-8]=dtor`。调用 `@zretain` 会在 `lock incq -0x10(%rcx)` 处尝试原子递增只读段中的字符串长度字段，直接触发 Windows 0xC0000005 写入访问冲突崩溃。
+- 口径：字符串（不管是字面量还是动态分配的托管串）不走类对象的 `@zretain` 引用计数机制，动态反射调用返回字符串/类对象时，应将原始 `inttoptr` 后的指针直接存入结果槽位，绝不能误加 `@zretain`。
+- 判据：`tests/selfhost/diff_cases.txt` 收录 `reflect_builtin_list` 钉住。
+
+## 148. 重载候选评分必须考虑接口实现与基类继承（子类型实参精准匹配）
+
+- 坑（2026-11-10 实测）：`ScoreCand` 原先只在 `TypeTag(atn) == TypeTag(pt)` 完全相等时加 4 分，其它任何类型不匹配都减 1 分。当调用传入一个具体实现类（如 `SqliteConnection`），而类上重载分别接收接口（`Create(IDbConnection)` vs `Create(IUnitOfWork)`），两者在原先评分算法中得分相同（均为 -1）。平局时按候选列表第一个决胜，导致传入数据库连接却意外绑定到工作单元重载。在后续 `Dispose` 访问字段时，将 `SqliteConnection` 的数据字段解引用当成 vtable 调用直接崩溃（`rcx = 1, mov (%rcx), %rax` 0xC0000005）。
+- 连带效应：自举后端在生成非虚/非接口调用时会进行无用代码剔除（tree-shaking），未被解析选中的方法根本不会发射到 LLVM IR，使问题表现为“重载方法丢失/未生成”。
+- 修法：在 `irgen_resolve.zan` 中实现 `TypeImplementsOrDerives`，递归沿着 `interfaces` 与基类链查找目标类型。在 `ScoreCand` 中，接口实现或派生匹配给予适中奖励（+2 分），确保当实参类型满足接口契约时，能够压倒不相关的接口或基类，精准选中正确的接口重载。
+- 判据：`tests/selfhost/diff_cases.txt` 收录 `data_connectors_hardening`, `data_orm_hardening`, `orm_transaction_scope` 三案钉住。
+

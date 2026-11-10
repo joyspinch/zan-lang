@@ -2883,3 +2883,17 @@ kernel32、shell32、user32、advapi32、version）。
 - 对于嵌套二元表达式（例如 `n = n + Count(a) + Count(b) + Count(c) + Count(d)`），每增加一层链式加法，左操作树的 `GenExpr` 求值次数翻倍成 $O(2^{\text{depth}})$，导致深层 AST 遍历（如 `CountAwaits`）产生数十亿次递归调用与庞大的重复指令，造成 `fixedpoint_gen2` 在 `g3.ll` 生成时假死超时（>1200s）。
 - 修法：在求值前先用 `ArgTypeNode(e.a)` 做无开销的静态类型预判，仅在左臂明确可能为可空时才先求值；若非可空，复用第一次求得的 `la` 或仅求值一次，严禁对同一 AST 节点调用两次 `GenExpr`。
 - 判据：IR 生成阶段的所有 helper 必须严格保持单遍（single-pass）发射。任何试探性分支若需求值子表达式，必须将结果缓存传递或确保提前返回，绝不允许穿透后丢弃并重复发射。
+
+## 147. 字符串头与对象 ARC 头不通用：动态调用返回值不能对字符串字面量 `@zretain`
+
+- 坑（2026-11-10 实测）：在泛型容器（如 `List<T>`）的动态反射调用（`InvokeString`/`InvokeObject`）中，对返回指针如果统一调用 `@zretain`，当被反射方法返回的是字符串常量时，由于字符串在只读 `.rdata` 常量区，其对象头布局为 `[-24]=0, [-16]=len, [-8]=magic (TSNZ/1515082580)`，而不是 ARC 类对象的 `[-24]=cid, [-16]=rc, [-8]=dtor`。调用 `@zretain` 会在 `lock incq -0x10(%rcx)` 处尝试原子递增只读段中的字符串长度字段，直接触发 Windows 0xC0000005 写入访问冲突崩溃。
+- 口径：字符串（不管是字面量还是动态分配的托管串）不走类对象的 `@zretain` 引用计数机制，动态反射调用返回字符串/类对象时，应将原始 `inttoptr` 后的指针直接存入结果槽位，绝不能误加 `@zretain`。
+- 判据：`tests/selfhost/diff_cases.txt` 收录 `reflect_builtin_list` 钉住。
+
+## 148. 重载候选评分必须考虑接口实现与基类继承（子类型实参精准匹配）
+
+- 坑（2026-11-10 实测）：`ScoreCand` 原先只在 `TypeTag(atn) == TypeTag(pt)` 完全相等时加 4 分，其它任何类型不匹配都减 1 分。当调用传入一个具体实现类（如 `SqliteConnection`），而类上重载分别接收接口（`Create(IDbConnection)` vs `Create(IUnitOfWork)`），两者在原先评分算法中得分相同（均为 -1）。平局时按候选列表第一个决胜，导致传入数据库连接却意外绑定到工作单元重载。在后续 `Dispose` 访问字段时，将 `SqliteConnection` 的数据字段解引用当成 vtable 调用直接崩溃（`rcx = 1, mov (%rcx), %rax` 0xC0000005）。
+- 连带效应：自举后端在生成非虚/非接口调用时会进行无用代码剔除（tree-shaking），未被解析选中的方法根本不会发射到 LLVM IR，使问题表现为“重载方法丢失/未生成”。
+- 修法：在 `irgen_resolve.zan` 中实现 `TypeImplementsOrDerives`，递归沿着 `interfaces` 与基类链查找目标类型。在 `ScoreCand` 中，接口实现或派生匹配给予适中奖励（+2 分），确保当实参类型满足接口契约时，能够压倒不相关的接口或基类，精准选中正确的接口重载。
+- 判据：`tests/selfhost/diff_cases.txt` 收录 `data_connectors_hardening`, `data_orm_hardening`, `orm_transaction_scope` 三案钉住。
+
