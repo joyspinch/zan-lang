@@ -15,6 +15,9 @@ script drives one full session and asserts the B-ID200 first-slice behaviors:
   rename                         WorkspaceEdit across hits (incl. CJK line,
                                  UTF-16 columns); null on invalid newName;
                                  error -32602 on keyword newName
+  documentHighlight              word-boundary hits in current doc, kind=1
+  foldingRange                   brace regions via string/comment state
+                                 machine; same-line braces skipped
   didChange                      re-analysis, version bump
   syntax error                   parser diagnostics
   cjk utf-16 columns             diagnostics/hover positions after CJK
@@ -170,7 +173,8 @@ def main():
     caps = s.request("initialize", {}).get("result", {}).get("capabilities", {})
     for key in ("definitionProvider", "referencesProvider",
                 "documentSymbolProvider", "hoverProvider",
-                "completionProvider", "renameProvider"):
+                "completionProvider", "renameProvider",
+                "documentHighlightProvider", "foldingRangeProvider"):
         if key not in caps:
             fail("initialize", "missing capability %s in %s" % (key, caps))
     if not caps["renameProvider"].get("prepareProvider"):
@@ -378,6 +382,25 @@ def main():
             pr["range"]["start"] != {"line": 3, "character": cjk_char}:
         fail("cjk prepareRename", "expected Missing at col %d, got %r"
              % (cjk_char, pr))
+
+    # foldingRange：两个类体区间；同行闭合的 Get/Go 花括号不报
+    fold = s.request("textDocument/foldingRange", {
+        "textDocument": {"uri": OK_URI}}).get("result")
+    if fold != [{"startLine": 0, "endLine": 2}, {"startLine": 4, "endLine": 5}]:
+        fail("foldingRange", "expected [{0,2},{4,5}], got %r" % (fold,))
+
+    # documentHighlight：Val 两处（声明 + return），kind=1 Text
+    hl = s.request("textDocument/documentHighlight", {
+        "textDocument": {"uri": OK_URI},
+        "position": {"line": 1, "character": v1 + 1}}).get("result")
+    want_hl = [
+        {"range": {"start": {"line": 1, "character": v1},
+                   "end": {"line": 1, "character": v1 + 3}}, "kind": 1},
+        {"range": {"start": {"line": 2, "character": v2},
+                   "end": {"line": 2, "character": v2 + 3}}, "kind": 1},
+    ]
+    if hl != want_hl:
+        fail("documentHighlight", "expected %r, got %r" % (want_hl, hl))
 
     # didClose clears diagnostics
     s.notify("textDocument/didClose", {"textDocument": {"uri": SYN_URI}})

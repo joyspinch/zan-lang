@@ -14,6 +14,8 @@ namespace Zan;
 /// - references：跨打开文档的词边界文本匹配（近似，非语义解析）。
 /// - rename/prepareRename：跨打开文档的词边界统一改写（与 references
 ///   同一近似口径，语义过滤顺延）；新名校验与 C 宿主 lsp_main.c 同形。
+/// - documentHighlight/foldingRange：当前文档词边界高亮（kind=1 Text）+
+///   花括号折叠区间（跨字符串/注释状态机，与 C 宿主同口径）。
 /// - hover：符号索引信息（种类+声明位置）；内建类型写死描述。
 /// - completion：符号索引 + 关键字/内建类型，按光标前缀过滤。
 /// 已知局限（后续切片收敛，见 TASKS.md B-ID200）：
@@ -720,7 +722,9 @@ public class LspServer {
                 + "\"definitionProvider\":true,"
                 + "\"referencesProvider\":true,"
                 + "\"documentSymbolProvider\":true,"
-                + "\"renameProvider\":{\"prepareProvider\":true}"
+                + "\"renameProvider\":{\"prepareProvider\":true},"
+                + "\"documentHighlightProvider\":true,"
+                + "\"foldingRangeProvider\":true"
                 + "}}}";
             SendResponse(res);
             return;
@@ -791,6 +795,16 @@ public class LspServer {
 
         if (method == "textDocument/prepareRename") {
             HandlePrepareRename(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/documentHighlight") {
+            HandleDocumentHighlight(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/foldingRange") {
+            HandleFoldingRange(id, pms);
             return;
         }
 
@@ -1130,6 +1144,134 @@ public class LspServer {
     /// 标识符首字符：字母或下划线（rename 新名校验，同 C 宿主 isalpha||'_'）。
     static bool IsIdentStart(char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    }
+
+    /// textDocument/documentHighlight：光标词在当前文档的词边界出现处
+    /// （与 references 同一近似口径，仅单文档，kind=1 Text；无语义过滤顺延）。
+    static void HandleDocumentHighlight(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        string pos = ExtractJsonContainer(pms, "position");
+        int line = ExtractJsonInt(pos, "line", 0);
+        int character = ExtractJsonInt(pos, "character", 0);
+        string word = "";
+        LspDocument doc = FindDocument(uri);
+        if (doc != null) {
+            word = WordAt(doc.Text, line, ByteColAt(doc.Text, line, character));
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[");
+        if (word.Length > 0 && doc != null) {
+            List<LspPos> hits = WordPositions(doc.Text, word);
+            int i = 0;
+            while (i < hits.Count) {
+                LspPos p = hits[i];
+                int u16s = Utf16ColOf(doc.Text, p.Line, p.Col);
+                int u16e = Utf16ColOf(doc.Text, p.Line, p.Col + word.Length);
+                if (i > 0) { sb.Append(','); }
+                sb.Append("{\"range\":{\"start\":");
+                sb.Append(PosJson(p.Line, u16s));
+                sb.Append(",\"end\":");
+                sb.Append(PosJson(p.Line, u16e));
+                sb.Append("},\"kind\":1}");
+                i = i + 1;
+            }
+        }
+        sb.Append("]}");
+        SendResponse(sb.ToString());
+    }
+
+    /// textDocument/foldingRange：花括号折叠区间——跨字符串/行注释/块注释
+    /// 的状态机逐行扫描（与 C 宿主 handle_folding_range 同口径：花括号进
+    /// 字符串字面量与注释不算配对）。startLine/endLine 0-based，endLine 为
+    /// 闭括号前一行（LSP 含端点）；同行闭合的单行区间不报。栈 1024 封顶。
+    static void HandleFoldingRange(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        LspDocument doc = FindDocument(uri);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[");
+        if (doc != null) {
+            bool inStr = false;
+            bool inBlock = false;
+            int[] starts = new int[1024];
+            int sp = 0;
+            int line = 0;
+            int i = 0;
+            int emitted = 0;
+            while (i < doc.Text.Length) {
+                // 行内扫描：行注释折断本行，块注释状态跨行
+                while (i < doc.Text.Length && doc.Text[i] != '\n') {
+                    char c = doc.Text[i];
+                    if (inBlock) {
+                        if (c == '*' && i + 1 < doc.Text.Length
+                                && doc.Text[i + 1] == '/') {
+                            inBlock = false;
+                            i = i + 2;
+                            continue;
+                        }
+                        i = i + 1;
+                        continue;
+                    }
+                    if (inStr) {
+                        if (c == '\\') {
+                            if (i + 1 < doc.Text.Length
+                                    && doc.Text[i + 1] != '\n') {
+                                i = i + 2;
+                            } else {
+                                i = i + 1;
+                            }
+                            continue;
+                        }
+                        if (c == '"') { inStr = false; }
+                        i = i + 1;
+                        continue;
+                    }
+                    if (c == '"') { inStr = true; i = i + 1; continue; }
+                    if (c == '/' && i + 1 < doc.Text.Length
+                            && doc.Text[i + 1] == '/') { break; }
+                    if (c == '/' && i + 1 < doc.Text.Length
+                            && doc.Text[i + 1] == '*') {
+                        inBlock = true;
+                        i = i + 2;
+                        continue;
+                    }
+                    if (c == '{') {
+                        if (sp < 1024) {
+                            starts[sp] = line;
+                            sp = sp + 1;
+                        }
+                    } else if (c == '}') {
+                        if (sp > 0) {
+                            sp = sp - 1;
+                            int s0 = starts[sp];
+                            if (line - 1 > s0) {
+                                if (emitted > 0) { sb.Append(','); }
+                                emitted = emitted + 1;
+                                sb.Append("{\"startLine\":");
+                                sb.Append(s0);
+                                sb.Append(",\"endLine\":");
+                                sb.Append(line - 1);
+                                sb.Append("}");
+                            }
+                        }
+                    }
+                    i = i + 1;
+                }
+                if (i < doc.Text.Length && doc.Text[i] == '\n') {
+                    line = line + 1;
+                    i = i + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        sb.Append("]}");
+        SendResponse(sb.ToString());
     }
 
     /// 嵌套 DocumentSymbol：类/接口/枚举为父，方法/字段/构造器为 children。
