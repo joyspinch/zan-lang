@@ -1,10 +1,10 @@
-/* FRAGMENT（拼接片段，非独立 TU）：由 main.c 的 main() 函数体 #include，
+/* FRAGMENT: host=main
+ * 拼接片段（非独立 TU）：由 main.c 的 main() 函数体 #include，
  * 位于 source 读入与 --dump-tokens 早退之后、main_codegen.c 之前。
- * consumes: source/source_len, input_file(s)/input_count, target,
+ * consumes: source, source_len, input_file, input_count, target,
  *   publish_mode, cross_compiling, resolved_stdlib_root, do_deny_warnings,
- *   check_leaks_opt, arc_guard_opt, phase()/probe_phase_mem()
- * defines: arena(=g_main_arena), diag, ast, binder, checker, irgen,
- *   ir_arena, check_leaks, arc_guard, arc_net, native_arch, want_shard
+ *   check_leaks_opt, arc_guard_opt
+ * defines: arena, diag, ast, binder, irgen, ir_arena, native_arch, want_shard
  * （下游 main_codegen.c / main_linker.c 在同一 main() 作用域继续消费。） */
     /* parse */
     zan_arena_t *arena = zan_arena_new();

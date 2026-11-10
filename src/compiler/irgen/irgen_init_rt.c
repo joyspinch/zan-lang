@@ -1,8 +1,8 @@
-/* FRAGMENT（拼接片段，非独立 TU）：由 irgen_init.c 的 zan_irgen_init()
- * 函数体末尾 #include（return ZAN_OK 之前）。
- * consumes: g（zan_irgen_t 上下文：g->mod/g->ctx/g->builder/g->check_leaks）
- * defines: g->fn_* 运行时助手 LLVM 声明（供发射 IR call）、
- *   __zan_arc_trace 全局与 arc_ra/arc_ev 泄漏追踪回调（check_leaks 分支） */
+/* FRAGMENT: host=zan_irgen_init
+ * 拼接片段（非独立 TU）：由 irgen_init.c 的 zan_irgen_init() 函数体末尾 #include。
+ * consumes: g
+ * defines: none
+ * （运行时助手 LLVM 声明与泄漏追踪初始化，修改 g 上下文。） */
     LLVMValueRef arc_trace_ev = NULL;
     LLVMTypeRef arc_ra_ty = NULL;
     LLVMTypeRef arc_ev_ty = NULL;

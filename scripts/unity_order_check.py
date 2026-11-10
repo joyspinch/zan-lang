@@ -17,7 +17,11 @@ irgen_call_async.c 与 reflect/reflect_thunks.c 描述的"unity 排序"在两者
   2. 标注文件与目标必须在至少一个真实拼接 TU 中共现，且相对顺序成立；
   3. 同一单元不得被同一 TU 重复拼入（直接或嵌套）；
   4. 同一 TU 内同守卫组的单元之间，文件级 static 名不得冲突——编译器只能在
-     实际编译该分支的平台上发现这类冲突，Windows 开发机永远编不到 Linux 分支。
+     实际编译该分支的平台上发现这类冲突，Windows 开发机永远编不到 Linux 分支；
+  5. 函数体拼接片段（FRAGMENT: host=<fn>）契约机检：
+     - 片段必须被 #include 于宿主函数的函数体内；
+     - consumes 清单变量必须在宿主函数该包含点前已在作用域中，且在片段内被引用；
+     - defines 清单变量必须在片段内声明/赋值，且在宿主后续片段或函数体延续部分被消费。
 
 用法：python3 scripts/unity_order_check.py [--root REPO_ROOT]
 退出码：0 干净；1 有违规（逐条打到 stdout）。
@@ -47,6 +51,96 @@ TYPE_KEYWORDS = frozenset((
 ))
 STATIC_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 STATIC_CUT_RE = re.compile(r"[=(\[]")
+
+FRAGMENT_RE = re.compile(
+    r"/\*.*?\bFRAGMENT:\s*host=([A-Za-z0-9_]+)(?:\(\))?\b(.*?)\*/", re.DOTALL
+)
+
+
+def parse_fragment_contract(content: str):
+    m = FRAGMENT_RE.search(content[:2000])
+    if not m:
+        return None
+    host_fn = m.group(1)
+    body = m.group(2)
+    lines = [re.sub(r"^\s*\*\s*", "", l) for l in body.splitlines()]
+    cleaned = "\n".join(lines)
+
+    m_cons = re.search(r"consumes:\s*(.*?)(?=\bdefines:|[（(]|$)", cleaned, re.DOTALL)
+    m_defs = re.search(r"defines:\s*(.*?)(?=\bconsumes:|[（(]|$)", cleaned, re.DOTALL)
+
+    consumes = []
+    if m_cons:
+        consumes = [w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", m_cons.group(1)) if w != "none"]
+    defines = []
+    if m_defs:
+        defines = [w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", m_defs.group(1)) if w != "none"]
+
+    return host_fn, consumes, defines
+
+
+def find_function_body(content: str, fn_name: str):
+    pat = re.compile(r"\b" + fn_name + r"\s*\([^)]*\)\s*\{", re.MULTILINE)
+    m = pat.search(content)
+    if not m:
+        return None
+    start = m.start()
+    brace_start = m.end() - 1
+    depth = 1
+    i = brace_start + 1
+    in_str = False
+    in_line_comment = False
+    in_block_comment = False
+    while i < len(content):
+        c = content[i]
+        if in_line_comment:
+            if c == "\n":
+                in_line_comment = False
+        elif in_block_comment:
+            if c == "*" and i + 1 < len(content) and content[i + 1] == "/":
+                in_block_comment = False
+                i += 1
+        elif in_str:
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                in_str = False
+        else:
+            if c == "/" and i + 1 < len(content):
+                if content[i + 1] == "/":
+                    in_line_comment = True
+                    i += 1
+                elif content[i + 1] == "*":
+                    in_block_comment = True
+                    i += 1
+            elif c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return start, brace_start, i + 1
+        i += 1
+    return start, brace_start, len(content)
+
+
+def get_fragment_full_content(path: Path, resolve_fn, visited=None) -> str:
+    if visited is None:
+        visited = set()
+    if path in visited or not path.is_file():
+        return ""
+    visited.add(path)
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    out = [content]
+    for m in re.finditer(r'^\s*#include\s*"([^"]+\.c)"', content, re.MULTILINE):
+        sub_path = resolve_fn(path, m.group(1))
+        if sub_path and sub_path.is_file():
+            out.append(get_fragment_full_content(sub_path, resolve_fn, visited))
+    return "\n".join(out)
 
 
 def norm_rel(path: Path, root: Path) -> str:
@@ -117,6 +211,7 @@ class Checker:
         self.files = {}      # abs Path -> scan result
         self.rel_of = {}     # abs Path -> display rel string
         self.tus = []        # list of dicts: top, units, index_by_rel
+        self.fragments = {}  # abs Path -> (host_fn, consumes, defines)
         self.violations = []
 
     def load_all(self):
@@ -127,6 +222,13 @@ class Checker:
             for path in sorted(base.rglob("*.c")):
                 self.files[path] = scan_file(path)
                 self.rel_of[path] = norm_rel(path, self.root)
+                try:
+                    txt = path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                contract = parse_fragment_contract(txt)
+                if contract:
+                    self.fragments[path] = contract
 
     def resolve(self, includer: Path, raw: str):
         """Resolve an #include target: includer-relative, then scan-root, then repo-root."""
@@ -247,11 +349,107 @@ class Checker:
                     else:
                         seen[key] = (rel, lineno)
 
+    def check_fragment_contracts(self):
+        for frag_path, (host_fn, consumes, defines) in sorted(self.fragments.items()):
+            frag_rel = self.rel_of[frag_path]
+            includers = []
+            for file_path, (includes, _, _) in self.files.items():
+                for lineno, raw, _ in includes:
+                    if self.resolve(file_path, raw) == frag_path:
+                        includers.append((file_path, lineno))
+            if not includers:
+                self.violations.append(
+                    f"{frag_rel}: FRAGMENT declared host={host_fn}, "
+                    f"but file is never included in any compilation unit"
+                )
+                continue
+
+            for host_file, inc_lineno in includers:
+                host_rel = self.rel_of[host_file]
+                try:
+                    host_content = host_file.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                fn_info = find_function_body(host_content, host_fn)
+                if not fn_info:
+                    self.violations.append(
+                        f"{frag_rel}: FRAGMENT declared host={host_fn}, "
+                        f"but host function '{host_fn}()' was not found in includer {host_rel}"
+                    )
+                    continue
+
+                fn_start, brace_start, fn_end = fn_info
+                fn_body = host_content[brace_start:fn_end]
+                inc_matches = list(re.finditer(r'^\s*#include\s*"([^"]+\.c)"', fn_body, re.MULTILINE))
+
+                target_inc = None
+                for inc in inc_matches:
+                    if self.resolve(host_file, inc.group(1)) == frag_path:
+                        target_inc = inc
+                        break
+
+                if not target_inc:
+                    self.violations.append(
+                        f"{frag_rel}: FRAGMENT declared host={host_fn}, "
+                        f"but is included outside {host_fn}() body in {host_rel}:{inc_lineno}"
+                    )
+                    continue
+
+                fn_scope = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", host_content[:brace_start]))
+                last_pos = 0
+                frag_tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*",
+                                             get_fragment_full_content(frag_path, self.resolve)))
+
+                for idx, inc in enumerate(inc_matches):
+                    resolved = self.resolve(host_file, inc.group(1))
+                    chunk = fn_body[last_pos:inc.start()]
+                    fn_scope.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", chunk))
+                    last_pos = inc.end()
+
+                    if resolved == frag_path:
+                        for c in consumes:
+                            if c not in fn_scope:
+                                self.violations.append(
+                                    f"{frag_rel}: consumes '{c}', but it is not in scope "
+                                    f"prior to inclusion in {host_fn}() of {host_rel}"
+                                )
+                            if c not in frag_tokens:
+                                self.violations.append(
+                                    f"{frag_rel}: consumes '{c}', but it is never referenced "
+                                    f"in fragment"
+                                )
+
+                        downstream_tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", fn_body[inc.end():]))
+                        for sub_idx in range(idx + 1, len(inc_matches)):
+                            sub_res = self.resolve(host_file, inc_matches[sub_idx].group(1))
+                            if sub_res:
+                                downstream_tokens.update(
+                                    re.findall(r"[A-Za-z_][A-Za-z0-9_]*",
+                                               get_fragment_full_content(sub_res, self.resolve))
+                                )
+
+                        for d in defines:
+                            if d not in frag_tokens:
+                                self.violations.append(
+                                    f"{frag_rel}: defines '{d}', but it is never declared or assigned "
+                                    f"in fragment"
+                                )
+                            if d not in downstream_tokens:
+                                self.violations.append(
+                                    f"{frag_rel}: defines '{d}', but it is never consumed downstream "
+                                    f"in {host_fn}() continuation or subsequent fragments"
+                                )
+
+                    if resolved in self.fragments:
+                        _, _, res_defs = self.fragments[resolved]
+                        fn_scope.update(res_defs)
+
     def run(self):
         self.load_all()
         self.build_tus()
         self.check_markers()
         self.check_static_collisions()
+        self.check_fragment_contracts()
         return self.violations
 
 
@@ -266,16 +464,17 @@ def main():
 
     n_units = sum(len(tu["units"]) for tu in checker.tus)
     n_markers = sum(len(info[1]) for info in checker.files.values())
+    n_frags = len(checker.fragments)
     if violations:
         for v in violations:
             print(v)
         print(f"unity_order_check: {len(violations)} violation(s) across "
               f"{len(checker.tus)} composite TU(s) / {n_units} spliced units / "
-              f"{n_markers} marker(s)")
+              f"{n_markers} marker(s) / {n_frags} fragment contract(s)")
         return 1
     print(f"unity_order_check: OK - {len(checker.tus)} composite TU(s), "
-          f"{n_units} spliced units, {n_markers} marker(s) verified, "
-          f"static namespaces clean")
+          f"{n_units} spliced units, {n_markers} marker(s), "
+          f"{n_frags} fragment contract(s) verified, static namespaces clean")
     return 0
 
 

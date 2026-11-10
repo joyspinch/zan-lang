@@ -1,9 +1,10 @@
-/* FRAGMENT（拼接片段，非独立 TU）：由 main.c 的 main() 函数体 #include，
+/* FRAGMENT: host=main
+ * 拼接片段（非独立 TU）：由 main.c 的 main() 函数体 #include，
  * 位于 main_frontend.c 之后、main_linker.c 之前。
- * consumes: main_frontend.c 产出的 irgen/ast/target/arena/ir_arena/
- *   source/want_shard/native_arch/publish_mode 与 phase()/probe_phase_mem()
- * defines: mf/mf_built, effective_opt, driver_reg/driver_prefixes,
- *   shard_n, generated_objects, obj_tmp（链接阶段消费） */
+ * consumes: irgen, ast, target, arena, ir_arena, source, want_shard,
+ *   native_arch, publish_mode, binder
+ * defines: generated_objects, obj_tmp, obj_path, driver_reg, driver_prefixes, mf
+ * （链接与清理阶段在同一 main() 作用域继续消费。） */
     zan_prepare_static_runtime(&irgen, &target);
 
     phase("irgen");
