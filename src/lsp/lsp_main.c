@@ -712,9 +712,12 @@ static void method_call_context(const char *text, size_t offset,
 
 /* diagnostics */
 
-static void publish_empty_diagnostics(lsp_server_t *s, const char *uri) {
+static void publish_empty_diagnostics(lsp_server_t *s, const char *uri, int version) {
     json_value *params = json_new_obj();
     json_obj_set(params, "uri", json_new_str(uri));
+    /* LSP 3.17：publishDiagnostics 携带 version，客户端据此丢弃
+     * 旧版本文档的迟到诊断。 */
+    json_obj_set(params, "version", json_new_num(version));
     json_obj_set(params, "diagnostics", json_new_arr());
     json_value *note = json_new_obj();
     json_obj_set(note, "jsonrpc", json_new_str("2.0"));
@@ -726,11 +729,11 @@ static void publish_empty_diagnostics(lsp_server_t *s, const char *uri) {
     json_free(note);
 }
 
-static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *text) {
+static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *text, int version) {
     size_t ul = strlen(uri);
     if ((ul > 5 && strcmp(uri + ul - 5, ".html") == 0) ||
         (ul > 4 && strcmp(uri + ul - 4, ".htm") == 0)) {
-        publish_empty_diagnostics(s, uri);
+        publish_empty_diagnostics(s, uri, version);
         return;
     }
 
@@ -800,6 +803,7 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
 
     json_value *params = json_new_obj();
     json_obj_set(params, "uri", json_new_str(uri));
+    json_obj_set(params, "version", json_new_num(version));
     json_obj_set(params, "diagnostics", arr);
 
     json_value *note = json_new_obj();
@@ -1428,18 +1432,23 @@ static void handle_did_open(lsp_server_t *s, json_value *params) {
     const char *uri = json_get_str(json_obj_get(td, "uri"));
     const char *text = json_get_str(json_obj_get(td, "text"));
     if (!uri || !text) return;
+    lsp_doc_lock(s);
     lsp_set_doc(s, uri, text);
 
     json_value *ver_j = json_obj_get(td, "version");
     int over = ver_j ? (int)json_get_num(ver_j, 0) : 0;
     lsp_doc_t *d = lsp_find_doc(s, uri);
-    if (d && over > 0) d->version = over;
+    if (d) {
+        if (over > 0) d->version = over;
+        /* 与 didChange 同路径：交诊断线程去抖发布，不阻塞 worker。 */
+        d->last_change_ms = lsp_now_ms();
+        d->diag_pending = true;
+    }
+    lsp_doc_unlock(s);
 
     ensure_project_indexed(s);
     update_project_index(s, uri, text);
     ensure_packages_indexed(s);
-
-    publish_diagnostics(s, uri, text);
 }
 
 static void lsp_doc_apply_change(lsp_doc_t *d, json_value *change) {
@@ -1488,7 +1497,10 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     json_value *ver_j = json_obj_get(td, "version");
     int incoming = ver_j ? (int)json_get_num(ver_j, 0) : 0;
 
-    lsp_doc_t *d = lsp_find_doc(s, uri);
+    lsp_doc_t *d = NULL;
+    /* 写侧与诊断线程的读侧快照互斥（doc_lock）。 */
+    lsp_doc_lock(s);
+    d = lsp_find_doc(s, uri);
     if (!d) {
         for (int i = 0; i < n && !d; i++) {
             json_value *ch = json_arr_at(changes, i);
@@ -1500,9 +1512,15 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
                 }
             }
         }
-        if (!d) return;
+        if (!d) {
+            lsp_doc_unlock(s);
+            return;
+        }
     } else {
-        if (incoming > 0 && incoming <= d->version) return;
+        if (incoming > 0 && incoming <= d->version) {
+            lsp_doc_unlock(s);
+            return;
+        }
         for (int i = 0; i < n; i++)
             lsp_doc_apply_change(d, json_arr_at(changes, i));
     }
@@ -1510,6 +1528,7 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     d->version = incoming > 0 ? incoming : d->version + 1;
     d->last_change_ms = lsp_now_ms();
     d->diag_pending = true;
+    lsp_doc_unlock(s);
 
     update_project_index(s, uri, d->text);
 }
@@ -1548,9 +1567,14 @@ static void handle_did_close(lsp_server_t *s, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
     const char *uri = json_get_str(json_obj_get(td, "uri"));
     if (!uri) return;
+    int last_version = 0;
+    lsp_doc_lock(s);
+    lsp_doc_t *d = lsp_find_doc(s, uri);
+    if (d) last_version = d->version;
     lsp_remove_doc(s, uri);
+    lsp_doc_unlock(s);
     doc_intel_invalidate(uri);
-    publish_diagnostics(s, uri, "");
+    publish_diagnostics(s, uri, "", last_version);
 }
 
 
@@ -1558,6 +1582,7 @@ static int diag_worker_loop(lsp_server_t *s) {
     while (!s->diag_stop) {
         lsp_sleep_ms(20);
         char *uri = NULL, *text = NULL;
+        int version = 0;
         lsp_doc_lock(s);
         uint64_t now = lsp_now_ms();
         for (int i = 0; i < s->doc_count; i++) {
@@ -1565,13 +1590,14 @@ static int diag_worker_loop(lsp_server_t *s) {
             if (d->diag_pending && now - d->last_change_ms >= LSP_DIAG_QUIET_MS) {
                 uri = dup_str(d->uri);
                 text = dup_str(d->text);
+                version = d->version;
                 d->diag_pending = false;
                 break;
             }
         }
         lsp_doc_unlock(s);
         if (!uri) continue;
-        publish_diagnostics(s, uri, text);
+        publish_diagnostics(s, uri, text, version);
         free(uri);
         free(text);
     }
@@ -3909,6 +3935,15 @@ static void run_leak_check(lsp_server_t *s, const char *uri) {
 
     json_value *params = json_new_obj();
     json_obj_set(params, "uri", json_new_str(uri));
+    {
+        /* 泄漏诊断同样携带 version，客户端按文档当前版归并。 */
+        int lv = 0;
+        lsp_doc_lock(s);
+        lsp_doc_t *ld = lsp_find_doc(s, uri);
+        if (ld) lv = ld->version;
+        lsp_doc_unlock(s);
+        json_obj_set(params, "version", json_new_num(lv));
+    }
     json_obj_set(params, "diagnostics", arr);
     json_value *note = json_new_obj();
     json_obj_set(note, "jsonrpc", json_new_str("2.0"));
