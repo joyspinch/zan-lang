@@ -248,12 +248,17 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
     }
     int plen = (int)strlen(prefix);
     memcpy(msgbuf, prefix, (size_t)plen);
+    /* msgbuf 从 args 的副本格式化：调用方 va_list 保持未消费，
+     * dedup 块还要用它做一次完整串格式化（B-ID206③）。 */
+    va_list msg_args;
+    va_copy(msg_args, args);
     /* 消息缓冲固定 1024：超长签名/标识符在此安全截断。vsnprintf 返回全长度，
      * 达到容量即发生截断——从尾部回退到 UTF-8 码点边界再补 "..."。截断点落
      * 在多字节序列中间会产生非法 UTF-8，LSP 把 message 原样透传 JSON 时
      * 直接断流（lsp_main.c）。 */
     int produced = vsnprintf(msgbuf + plen, sizeof(msgbuf) - (size_t)plen,
-                             fmt, args);
+                             fmt, msg_args);
+    va_end(msg_args);
     if (produced < 0) {
         msgbuf[plen] = '\0'; /* 编码失败：退化为前缀 */
     } else if (produced >= (int)(sizeof(msgbuf) - (size_t)plen)) {
@@ -285,23 +290,52 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
     /* B-ID106：精确重复诊断（同 file/line/col/level/消息）去重——回溯重扫
      * 曾同错重报。在计数前去重，重复不消耗 -ferror-limit 预算、不触发
      * 单行级联帽；capture 模式（LSP）同口径，结构化表也不再收重复项。
-     * 签名线性表 4096 条封顶（内存有界），超顶不再登记、退化为不去重。 */
+     * 签名线性表 4096 条封顶（内存有界），超顶不再登记、退化为不去重。
+     * B-ID206③：签名比完整格式化串，不是截断后的 msgbuf——两个超长诊断
+     * 截到同一 1024 字节前缀但尾部不同时，截断串比对会把两条不同的错误
+     * 误判成同一条（单元钉 unit_diag_dedup::test_diag_dedup_full_string）。
+     * 量长+落盘各一次 va_copy；失败退回截断串，宁重报不误吞。 */
     if (level == DIAG_ERROR || level == DIAG_WARNING) {
+        char *full_msg = NULL;
+        va_list len_args;
+        va_copy(len_args, args);
+        int full_len = vsnprintf(NULL, 0, fmt, len_args);
+        va_end(len_args);
+        if (full_len > 0) {
+            full_msg = (char *)malloc((size_t)full_len + 1);
+            if (full_msg) {
+                va_list put_args;
+                va_copy(put_args, args);
+                if (vsnprintf(full_msg, (size_t)full_len + 1, fmt, put_args)
+                        < 0) {
+                    free(full_msg);
+                    full_msg = NULL;
+                }
+                va_end(put_args);
+            }
+        }
+        const char *sig = full_msg ? full_msg : msgbuf;
         bool dup = false;
         for (int i = 0; i < diag->dedup_count; i++) {
             const zan_diag_dedup_sig_t *s = &diag->dedup_sigs[i];
             if (s->file_id == loc.file_id && s->line == loc.line &&
                 s->col == loc.col && s->level == (int)level &&
-                strcmp(s->msg, msgbuf) == 0) { dup = true; break; }
+                strcmp(s->msg, sig) == 0) { dup = true; break; }
         }
-        if (dup) { return; }
+        if (dup) {
+            free(full_msg);
+            return;
+        }
         if (diag->dedup_count < 4096) {
             if (diag->dedup_count == diag->dedup_cap) {
                 int ncap = diag->dedup_cap ? diag->dedup_cap * 2 : 64;
                 zan_diag_dedup_sig_t *grown = (zan_diag_dedup_sig_t *)realloc(
                     diag->dedup_sigs,
                     sizeof(zan_diag_dedup_sig_t) * (size_t)ncap);
-                if (!grown) return; /* OOM 保守退化：宁重报不误吞 */
+                if (!grown) {
+                    free(full_msg);
+                    return; /* OOM 保守退化：宁重报不误吞 */
+                }
                 diag->dedup_sigs = grown;
                 diag->dedup_cap = ncap;
             }
@@ -310,9 +344,16 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
             s->line = loc.line;
             s->col = loc.col;
             s->level = (int)level;
-            s->msg = (char *)malloc(strlen(msgbuf) + 1);
-            if (!s->msg) zan_host_oom();
-            strcpy(s->msg, msgbuf);
+            if (full_msg) {
+                s->msg = full_msg; /* 所有权移交，zan_diag_free_buffers 释放 */
+            } else {
+                s->msg = (char *)malloc(strlen(msgbuf) + 1);
+                if (!s->msg) zan_host_oom();
+                strcpy(s->msg, msgbuf);
+            }
+        } else {
+            /* 4096 封顶：不再登记，完整串即弃 */
+            free(full_msg);
         }
     }
 

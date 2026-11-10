@@ -117,10 +117,44 @@ static void test_diag_ir_handoff_no_double_free(void) {
     zan_arena_free(ir_arena);
 }
 
+static void test_diag_dedup_full_string(void) {
+    /* B-ID206③：去重签名必须比完整格式化串，不是截断后的 msgbuf——
+     * 两个超长诊断（>1024 字节）前 1023 字节相同、尾部不同时，截断串
+     * 比对会把两条不同的错误判成同一条吞掉。 */
+    zan_arena_t *arena = zan_arena_new();
+    zan_diag_t *diag = zan_diag_new(arena);
+    zan_diag_set_max_errors(diag, 100);
+    zan_diag_add_file(diag, "test.zan", "int a = 1;\n");
+
+    zan_loc_t loc = { .file_id = 0, .line = 1, .col = 1 };
+    char long_a[1400], long_b[1400];
+    memset(long_a, 'A', 1200);
+    memset(long_b, 'A', 1200);
+    snprintf(long_a + 1200, 200, "tail-alpha");
+    snprintf(long_b + 1200, 200, "tail-beta");
+
+    /* 尾部不同的两条超长诊断：完整串不同，都必须存活。
+     * 修复前这里 error_count == 1（前 1023 字节相同被截断串误判去重）。 */
+    zan_diag_emit(diag, DIAG_ERROR, loc, "%s", long_a);
+    zan_diag_emit(diag, DIAG_ERROR, loc, "%s", long_b);
+    EXPECT(diag->error_count == 2,
+           "long msgs differing past the truncation point must both count, "
+           "got %d", diag->error_count);
+
+    /* 完整串相同的超长诊断仍然去重。 */
+    zan_diag_emit(diag, DIAG_ERROR, loc, "%s", long_a);
+    EXPECT(diag->error_count == 2,
+           "identical long msgs must still dedup, got %d", diag->error_count);
+
+    zan_diag_free_buffers(diag);
+    zan_arena_free(arena);
+}
+
 int main(void) {
     test_diag_dedup_basic();
     test_diag_capture_dedup();
     test_diag_ir_handoff_no_double_free();
+    test_diag_dedup_full_string();
 
     if (failures == 0) {
         printf("ALL DIAG DEDUP TESTS PASSED\n");

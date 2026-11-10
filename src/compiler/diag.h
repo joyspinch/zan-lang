@@ -32,7 +32,9 @@ typedef struct {
 } zan_diag_pragma_range_t;
 
 /* 去重签名（B-ID106）：同 file/line/col/level/消息 的诊断只报一次——
- * 回溯重扫曾同错重报。msg 为 malloc 副本，zan_diag_free_buffers 释放 */
+ * 回溯重扫曾同错重报。msg 为完整格式化串的 malloc 副本（B-ID206③：
+ * 比截断后的 msgbuf——超长诊断截到同一 1024 字节前缀但尾部不同时，
+ * 截断串比对会误吞两条不同的错误），zan_diag_free_buffers 释放 */
 typedef struct {
     uint32_t file_id;
     uint32_t line;
