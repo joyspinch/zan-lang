@@ -1161,6 +1161,59 @@ EXPORT void zan_gui_biometrics_set_mock(i32 can_auth, i32 bio_type, i32 auth_res
     g_bio_type = bio_type;
     g_bio_auth_result = auth_result ? 1 : 0;
 }
+
+/* --- 系统状态栏与导航栏控制 --- */
+static int g_status_bar_visible = 1;
+static int g_status_bar_style = 0; /* 0: Default, 1: LightIcons (白字深底), 2: DarkIcons (黑字浅底) */
+static uint32_t g_status_bar_color = 0x00000000;
+static int g_nav_bar_visible = 1;
+
+EXPORT void zan_gui_system_bar_set_status(i32 visible, i32 style, u32 color) {
+    g_status_bar_visible = visible ? 1 : 0;
+    if (style >= 0 && style <= 2) g_status_bar_style = style;
+    g_status_bar_color = color;
+}
+
+EXPORT i32 zan_gui_system_bar_get_status_visible(void) {
+    return g_status_bar_visible;
+}
+
+EXPORT i32 zan_gui_system_bar_get_status_style(void) {
+    return g_status_bar_style;
+}
+
+EXPORT i32 zan_gui_system_bar_get_status_color(void) {
+    return (i32)g_status_bar_color;
+}
+
+EXPORT void zan_gui_system_bar_set_nav_visible(i32 visible) {
+    g_nav_bar_visible = visible ? 1 : 0;
+}
+
+EXPORT i32 zan_gui_system_bar_get_nav_visible(void) {
+    return g_nav_bar_visible;
+}
+
+/* --- 深度链接与外部唤醒 --- */
+static char g_pending_open_url[512] = "";
+
+EXPORT const char *zan_gui_take_open_url(void) {
+    static char s_take_buf[512];
+    if (g_pending_open_url[0] == '\0') return "";
+    strncpy(s_take_buf, g_pending_open_url, sizeof(s_take_buf)-1);
+    s_take_buf[sizeof(s_take_buf)-1] = '\0';
+    g_pending_open_url[0] = '\0';
+    return s_take_buf;
+}
+
+EXPORT void zan_gui_inject_open_url(const char *url) {
+    if (!url) {
+        g_pending_open_url[0] = '\0';
+        return;
+    }
+    strncpy(g_pending_open_url, url, sizeof(g_pending_open_url)-1);
+    g_pending_open_url[sizeof(g_pending_open_url)-1] = '\0';
+}
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val)    { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0; }

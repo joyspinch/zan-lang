@@ -13,3 +13,5 @@
 - **GPS 高精度物理定位**：`Geolocation`（经纬度、海拔、精度、速度及运动快照）
 - **设备标识与运行环境**：`DeviceInfo`（型号、制造商、系统版本、折叠屏硬件识别）
 - **生物识别与安全认证**：`Biometrics`（TEE 安全人脸 Face ID / 屏下指纹鉴权）
+- **沉浸式系统状态栏控制**：`SystemBar`（深/浅色文字图标切换、底色配置、全屏沉浸隐显）
+- **外部深度链接与唤醒**：`DeepLink`（URL Scheme / Universal Link 取出与协议解析）
