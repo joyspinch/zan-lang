@@ -23,6 +23,7 @@ script drives one full session and asserts the B-ID200 first-slice behaviors:
                                  length in UTF-16
   formatting                     full-document indent rewrite edit
   rangeFormatting                line-range indent adjustment; empty on clean
+  inlayHint                      inferred types (kind 1) + param names (kind 2)
   didChange                      re-analysis, version bump
   syntax error                   parser diagnostics
   cjk utf-16 columns             diagnostics/hover positions after CJK
@@ -85,12 +86,23 @@ SRC_FMT = (
     "}\n"
     "}\n"
 )
+SRC_HINT = (
+    "class Greeter {\n"
+    "    static void Hello(string name, int age) {\n"
+    "    }\n"
+    "    static void Run() {\n"
+    "        var x = 100;\n"
+    "        Hello(\"world\", 42);\n"
+    "    }\n"
+    "}\n"
+)
 
 OK_URI = "file:///t/Ok.zan"
 BAD_URI = "file:///t/Bad.zan"
 SYN_URI = "file:///t/Syn.zan"
 CJK_URI = "file:///t/Cjk.zan"
 FMT_URI = "file:///t/Fmt.zan"
+HINT_URI = "file:///t/Hint.zan"
 
 
 class Session(object):
@@ -190,6 +202,7 @@ def main():
                 "completionProvider", "renameProvider",
                 "documentHighlightProvider", "foldingRangeProvider",
                 "documentFormattingProvider", "documentRangeFormattingProvider",
+                "inlayHintProvider",
                 "semanticTokensProvider"):
         if key not in caps:
             fail("initialize", "missing capability %s in %s" % (key, caps))
@@ -516,6 +529,43 @@ def main():
         fail("rangeFormatting clean", "expected [], got %r" % (rf_clean,))
 
     s.notify("textDocument/didClose", {"textDocument": {"uri": FMT_URI}})
+
+    # inlayHint: Greeter with var x and Hello("world", 42) call
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": HINT_URI, "languageId": "zan", "version": 1, "text": SRC_HINT}})
+
+    hints = s.request("textDocument/inlayHint", {
+        "textDocument": {"uri": HINT_URI}}).get("result") or []
+    # 期望 3 条 hint：
+    # 1. var x: line 4, label ": int", kind 1, paddingLeft True
+    # 2. arg "world": line 5, label "name:", kind 2, paddingRight True
+    # 3. arg 42: line 5, label "age:", kind 2, paddingRight True
+    type_hints = [h for h in hints if h.get("kind") == 1]
+    param_hints = [h for h in hints if h.get("kind") == 2]
+    if len(type_hints) != 1 or type_hints[0].get("label") != ": int" or \
+            not type_hints[0].get("paddingLeft"):
+        fail("inlayHint", "expected 1 type hint ': int', got %r" % (type_hints,))
+    if type_hints[0].get("position", {}).get("line") != 4:
+        fail("inlayHint", "expected type hint on line 4, got %r" % (type_hints[0],))
+
+    p_labels = [h.get("label") for h in param_hints]
+    if "name:" not in p_labels or "age:" not in p_labels:
+        fail("inlayHint", "expected parameter hints 'name:' and 'age:', got %r"
+             % (param_hints,))
+    for ph in param_hints:
+        if ph.get("position", {}).get("line") != 5 or not ph.get("paddingRight"):
+            fail("inlayHint", "wrong param hint pos/padding: %r" % (ph,))
+
+    # range 过滤：只查第 4 行
+    line4_hints = s.request("textDocument/inlayHint", {
+        "textDocument": {"uri": HINT_URI},
+        "range": {"start": {"line": 4, "character": 0},
+                  "end": {"line": 4, "character": 30}}}).get("result") or []
+    if len(line4_hints) != 1 or line4_hints[0].get("label") != ": int":
+        fail("inlayHint range", "expected only ': int' for line 4, got %r"
+             % (line4_hints,))
+
+    s.notify("textDocument/didClose", {"textDocument": {"uri": HINT_URI}})
 
     # didClose clears diagnostics
     s.notify("textDocument/didClose", {"textDocument": {"uri": SYN_URI}})

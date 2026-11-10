@@ -46,6 +46,8 @@ public class LspSymbol {
     public int Kind;
     public int Line;   // 1-based（与前端一致）
     public int Col;    // 1-based
+    public List<string> ParamNames;
+    public string TypeName;
 
     public LspSymbol(string uri, string name, int kind, int line, int col) {
         Uri = uri;
@@ -53,6 +55,8 @@ public class LspSymbol {
         Kind = kind;
         Line = line;
         Col = col;
+        ParamNames = new List<string>();
+        TypeName = "";
     }
 
     public static int KindClass() { return 0; }
@@ -123,6 +127,21 @@ public class FmtLine {
         Lead = lead;
         Content = content;
         Blank = blank;
+    }
+}
+
+/// InlayHint 数据结构（同 C 宿主 intel_inlay_hint_t）。
+public class LspInlayHint {
+    public int Line;
+    public int Col;
+    public string Label;
+    public int Kind; // 1 = Type, 2 = Parameter
+
+    public LspInlayHint(int line, int col, string label, int kind) {
+        Line = line;
+        Col = col;
+        Label = label;
+        Kind = kind;
     }
 }
 
@@ -470,13 +489,35 @@ public class LspServer {
                 while (j < d.kids.Count) {
                     Node m = d.kids[j];
                     if (m.kind == AK.MethodDecl()) {
-                        symbols.Add(new LspSymbol(uri, m.sval,
-                            LspSymbol.KindMethod(), m.line, m.col));
+                        LspSymbol msym = new LspSymbol(uri, m.sval,
+                            LspSymbol.KindMethod(), m.line, m.col);
+                        if (m.type != null && m.type.sval != null) {
+                            msym.TypeName = m.type.sval;
+                        }
+                        int pi = 0;
+                        while (pi < m.kids.Count) {
+                            Node p = m.kids[pi];
+                            if (p.kind == AK.Param() && p.sval != null && p.sval != "") {
+                                msym.ParamNames.Add(p.sval);
+                            }
+                            pi = pi + 1;
+                        }
+                        symbols.Add(msym);
                     } else if (m.kind == AK.FieldDecl()) {
                         AddFieldSymbol(uri, m);
                     } else if (m.kind == AK.CtorDecl()) {
-                        symbols.Add(new LspSymbol(uri, d.sval,
-                            LspSymbol.KindCtor(), m.line, m.col));
+                        LspSymbol csym = new LspSymbol(uri, d.sval,
+                            LspSymbol.KindCtor(), m.line, m.col);
+                        csym.TypeName = d.sval;
+                        int pi = 0;
+                        while (pi < m.kids.Count) {
+                            Node p = m.kids[pi];
+                            if (p.kind == AK.Param() && p.sval != null && p.sval != "") {
+                                csym.ParamNames.Add(p.sval);
+                            }
+                            pi = pi + 1;
+                        }
+                        symbols.Add(csym);
                     } else if (m.kind == AK.EnumDecl()) {
                         int k = 0;
                         while (k < m.kids.Count) {
@@ -744,6 +785,7 @@ public class LspServer {
                 + "\"foldingRangeProvider\":true,"
                 + "\"documentFormattingProvider\":true,"
                 + "\"documentRangeFormattingProvider\":true,"
+                + "\"inlayHintProvider\":{\"resolveProvider\":false},"
                 + "\"semanticTokensProvider\":{"
                 + "\"legend\":{\"tokenTypes\":["
                 + "\"namespace\",\"type\",\"class\",\"enum\",\"interface\","
@@ -840,6 +882,11 @@ public class LspServer {
 
         if (method == "textDocument/rangeFormatting") {
             HandleRangeFormatting(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/inlayHint") {
+            HandleInlayHint(id, pms);
             return;
         }
 
@@ -1548,6 +1595,277 @@ public class LspServer {
                     sb.Append("}");
                 }
             }
+            i = i + 1;
+        }
+        sb.Append("]}");
+        SendResponse(sb.ToString());
+    }
+
+    // ===================== inlayHint =====================
+
+    static bool IsIdentStartChar(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    }
+
+    /// 在 AST 子树中查找局部变量的推导类型。
+    static string FindInferredVarType(Node node, string varName) {
+        if (node == null) { return ""; }
+        if (node.kind == AK.VarDecl()) {
+            if (node.sval == varName && node.type != null && node.type.sval != null
+                    && node.type.sval != "" && node.type.sval != "var" && node.type.sval != "void") {
+                return node.type.sval;
+            }
+            int di = 0;
+            while (di < node.kids.Count) {
+                Node dk = node.kids[di];
+                if (dk.sval == varName && dk.type != null && dk.type.sval != null
+                        && dk.type.sval != "" && dk.type.sval != "var" && dk.type.sval != "void") {
+                    return dk.type.sval;
+                }
+                di = di + 1;
+            }
+        }
+        int i = 0;
+        while (i < node.kids.Count) {
+            string t = FindInferredVarType(node.kids[i], varName);
+            if (t != "") { return t; }
+            i = i + 1;
+        }
+        if (node.a != null) {
+            string t = FindInferredVarType(node.a, varName);
+            if (t != "") { return t; }
+        }
+        if (node.b != null) {
+            string t = FindInferredVarType(node.b, varName);
+            if (t != "") { return t; }
+        }
+        if (node.c != null) {
+            string t = FindInferredVarType(node.c, varName);
+            if (t != "") { return t; }
+        }
+        if (node.d != null) {
+            string t = FindInferredVarType(node.d, varName);
+            if (t != "") { return t; }
+        }
+        return "";
+    }
+
+    /// 收集文档的 InlayHints（类型标注 kind=1 + 参数名提示 kind=2，同 C 宿主 intel_collect_inlay_hints）。
+    static List<LspInlayHint> CollectInlayHints(string uri, string text, int r0, int r1) {
+        List<LspInlayHint> hints = new List<LspInlayHint>();
+        if (text == null || text.Length == 0) { return hints; }
+
+        EnsureInit();
+
+        // 1. 类型标注（kind 1）：对 `var <name> = ...` 变量声明
+        Lexer lx = new Lexer(text);
+        List<Token> toks = lx.Run();
+        Diags dg = new Diags();
+        Parser ps = new Parser(toks, dg);
+        Node unit = ps.ParseDeclsOnly();
+        Binder b = new Binder();
+        b.Bind(unit);
+        Checker ck = new Checker(b, dg);
+        ck.Check(unit);
+
+        int ti = 0;
+        while (ti < toks.Count && hints.Count < 256) {
+            if (toks[ti].kind == TK.Var()) {
+                int vi = ti + 1;
+                if (vi < toks.Count && toks[vi].kind == TK.Ident()) {
+                    string varName = toks[vi].text;
+                    int line0 = toks[vi].line - 1; // 0-based
+                    if (line0 >= r0 && line0 <= r1) {
+                        int byteCol0 = toks[vi].col - 1 + varName.Length;
+                        string tyName = FindInferredVarType(unit, varName);
+                        if (tyName != "") {
+                            int utf16Col = Utf16ColOf(text, line0, byteCol0);
+                            hints.Add(new LspInlayHint(line0, utf16Col, ": " + tyName, 1));
+                        }
+                    }
+                }
+            }
+            ti = ti + 1;
+        }
+
+        // 2. 参数名标注（kind 2）：对调用 `fn(...)`
+        int p = 0;
+        int end = text.Length;
+        int lineNum = 0;
+        int lineStart = 0;
+
+        while (p < end && hints.Count < 256) {
+            char c = text[p];
+            if (c == '\n') {
+                lineNum = lineNum + 1;
+                p = p + 1;
+                lineStart = p;
+                continue;
+            }
+            if (c == '"') {
+                p = p + 1;
+                while (p < end && text[p] != '"') {
+                    if (text[p] == '\\' && p + 1 < end) { p = p + 1; }
+                    if (text[p] == '\n') {
+                        lineNum = lineNum + 1;
+                        lineStart = p + 1;
+                    }
+                    p = p + 1;
+                }
+                if (p < end) { p = p + 1; }
+                continue;
+            }
+            if (c == '/' && p + 1 < end && text[p + 1] == '/') {
+                while (p < end && text[p] != '\n') { p = p + 1; }
+                continue;
+            }
+            if (c == '/' && p + 1 < end && text[p + 1] == '*') {
+                p = p + 2;
+                while (p + 1 < end && !(text[p] == '*' && text[p + 1] == '/')) {
+                    if (text[p] == '\n') {
+                        lineNum = lineNum + 1;
+                        lineStart = p + 1;
+                    }
+                    p = p + 1;
+                }
+                if (p + 1 < end) { p = p + 2; }
+                continue;
+            }
+
+            if (IsIdentStartChar(c)) {
+                int wStart = p;
+                while (p < end && IsWordChar(text[p])) { p = p + 1; }
+                string fnName = text.Substring(wStart, p - wStart);
+
+                int peek = p;
+                while (peek < end && (text[peek] == ' ' || text[peek] == '\t')) { peek = peek + 1; }
+                if (peek < end && text[peek] == '(') {
+                    if (fnName == "if" || fnName == "while" || fnName == "for"
+                            || fnName == "foreach" || fnName == "switch" || fnName == "catch") {
+                        p = peek + 1;
+                        continue;
+                    }
+
+                    // 排除方法/构造函数自身的声明头
+                    bool isDecl = false;
+                    int di = 0;
+                    while (di < symbols.Count) {
+                        LspSymbol ds = symbols[di];
+                        if (ds.Uri == uri && ds.Line == lineNum + 1 && ds.Name == fnName
+                                && (ds.Kind == LspSymbol.KindMethod() || ds.Kind == LspSymbol.KindCtor())) {
+                            isDecl = true;
+                            break;
+                        }
+                        di = di + 1;
+                    }
+                    if (isDecl) {
+                        p = peek + 1;
+                        continue;
+                    }
+
+                    LspSymbol methodSym = null;
+                    int si = 0;
+                    while (si < symbols.Count) {
+                        LspSymbol s = symbols[si];
+                        if ((s.Kind == LspSymbol.KindMethod() || s.Kind == LspSymbol.KindCtor())
+                                && s.Name == fnName && s.ParamNames.Count > 0) {
+                            methodSym = s;
+                            break;
+                        }
+                        si = si + 1;
+                    }
+
+                    if (methodSym != null) {
+                        int argP = peek + 1;
+                        int argIdx = 0;
+                        int parenLvl = 1;
+                        while (argP < end && parenLvl > 0 && argIdx < methodSym.ParamNames.Count
+                                && hints.Count < 256) {
+                            while (argP < end && (text[argP] == ' ' || text[argP] == '\t')) {
+                                argP = argP + 1;
+                            }
+                            if (argP >= end || text[argP] == ')') { break; }
+
+                            if (lineNum >= r0 && lineNum <= r1) {
+                                int argByteCol = argP - lineStart;
+                                int argCol = Utf16ColOf(text, lineNum, argByteCol);
+                                hints.Add(new LspInlayHint(lineNum, argCol,
+                                    methodSym.ParamNames[argIdx] + ":", 2));
+                            }
+                            argIdx = argIdx + 1;
+
+                            while (argP < end && parenLvl > 0) {
+                                char ac = text[argP];
+                                if (ac == '(') {
+                                    parenLvl = parenLvl + 1;
+                                } else if (ac == ')') {
+                                    parenLvl = parenLvl - 1;
+                                    if (parenLvl == 0) { break; }
+                                } else if (ac == ',' && parenLvl == 1) {
+                                    argP = argP + 1;
+                                    break;
+                                } else if (ac == '\n') {
+                                    lineNum = lineNum + 1;
+                                    lineStart = argP + 1;
+                                }
+                                argP = argP + 1;
+                            }
+                        }
+                        p = argP;
+                        continue;
+                    }
+                }
+            }
+            p = p + 1;
+        }
+
+        return hints;
+    }
+
+    /// textDocument/inlayHint：返回参数名提示（kind=2）与 var 推导类型标注（kind=1）。
+    static void HandleInlayHint(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        LspDocument doc = uri != "" ? FindDocument(uri) : null;
+        if (doc == null || doc.Text.Length == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":[]}");
+            return;
+        }
+
+        string rg = ExtractJsonContainer(pms, "range");
+        int r0 = 0;
+        int r1 = 1000000000;
+        if (rg != "") {
+            string startObj = ExtractJsonContainer(rg, "start");
+            string endObj = ExtractJsonContainer(rg, "end");
+            r0 = ExtractJsonInt(startObj, "line", 0);
+            r1 = ExtractJsonInt(endObj, "line", 1000000000);
+            if (r1 < r0) { int t = r0; r0 = r1; r1 = t; }
+        }
+
+        List<LspInlayHint> hints = CollectInlayHints(uri, doc.Text, r0, r1);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[");
+        int i = 0;
+        while (i < hints.Count) {
+            LspInlayHint h = hints[i];
+            if (i > 0) { sb.Append(','); }
+            sb.Append("{\"position\":{\"line\":");
+            sb.Append(h.Line);
+            sb.Append(",\"character\":");
+            sb.Append(h.Col);
+            sb.Append("},\"label\":");
+            sb.Append(EncodeJsonString(h.Label));
+            sb.Append(",\"kind\":");
+            sb.Append(h.Kind);
+            if (h.Kind == 1) {
+                sb.Append(",\"paddingLeft\":true");
+            } else if (h.Kind == 2) {
+                sb.Append(",\"paddingRight\":true");
+            }
+            sb.Append("}");
             i = i + 1;
         }
         sb.Append("]}");
