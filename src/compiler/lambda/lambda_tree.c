@@ -482,6 +482,20 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         saved_catches = zan_arena_alloc(g->arena, bytes);
         memcpy(saved_catches, g->catch_cleanups, bytes);
     }
+    /* lpad 栈同理必须切换：宿主方法的方法级 lpad entry（含已注册的宿主
+     * ARC/boxed 局部清单）若滞留栈上，lambda 体内的异常传播兜底
+     * （emit_eh_propagate_tail_lpad 对 lpad_stack[0] 的清理，见
+     * stmt_helpers.c）就会在 lambda 函数的 builder 里 load/store 宿主
+     * 函数的 alloca——跨函数 IR 引用，LLVM verification 直接拒绝
+     * （E3090：LspSession.Start 的 Thread.Start lambda 即此因）。 */
+    int saved_lpad_depth = g->lpad_depth;
+    zan_lpad_entry_t *saved_lpad_entries = NULL;
+    if (saved_lpad_depth > 0) {
+        size_t lbytes = sizeof(g->lpad_stack[0]) * (size_t)saved_lpad_depth;
+        saved_lpad_entries = zan_arena_alloc(g->arena, lbytes);
+        memcpy(saved_lpad_entries, g->lpad_stack, lbytes);
+    }
+    g->lpad_depth = 0;
     int saved_eh_c = g->eh_armed_count;
     int saved_eh_b = g->eh_armed_base;
     int saved_eh_lb = g->eh_armed_loop_base;
@@ -628,6 +642,11 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         memcpy(g->catch_cleanups, saved_catches,
                sizeof(g->catch_cleanups[0]) * (size_t)saved_catch_cc);
     }
+    if (saved_lpad_entries) {
+        memcpy(g->lpad_stack, saved_lpad_entries,
+               sizeof(g->lpad_stack[0]) * (size_t)saved_lpad_depth);
+    }
+    g->lpad_depth = saved_lpad_depth;
     g->eh_armed_count = saved_eh_c;
     g->eh_armed_base = saved_eh_b;
     g->eh_armed_loop_base = saved_eh_lb;

@@ -56,12 +56,16 @@
 
 ### 批次 4 附件 · 编译器缺陷档案与顺延（取证存档 2026-11-10）
 
-**E3090 编译器缺陷（未修，lambda ARC 跨函数引用）**：
+**E3090 编译器缺陷（已修，lambda ARC 跨函数引用）**：
 - 症状：`LLVM verification failed in lambda_2: Referring to an instruction in another function!` —— lambda_2 的 ARC 释放序列引用了宿主函数（LspSession.Start）的 `%box.owner` alloca。
-- 定位：src/ide_zan/src/services/LspSession.zan:71 的 Thread.Start lambda（4 捕获 + try/finally + TrySetResult）。捕获登记 box_owned=0（src/compiler/lambda/lambda_closure.c:519-529），释放路径 release_boxed_local（src/compiler/generic_lpad.c:515-526）走 owner 槽；把 owner 槽写进外层 alloca 的机制未定位（赋值路径 ops_assign.c:73-107 全用传入 locals，静态排查无跨函数引用通道）。
-- 排查工具：`ZANC_DUMP_BAD_IR=1 build/zanc.exe <src> --auto-stdlib -o out.exe` 转储坏函数 IR（bad_lambda_2.txt）；`--emit-ir` 拿不到半成品 IR（验证器先跑，失败即退出），必须用 ZANC_DUMP_BAD_IR；全局 lambda 命名计数（lambda_tree.c:396 lambda_id）从 IR 名反查宿主函数。
-- 复现：`pwsh scripts/test.ps1 -Match "^lsp_session_editor$"`（tests/lsp/run_lsp_session_test.py 现场编译 client 触发）。
+- 根因：lambda 函数体 emit 切换函数上下文时保存了 finallys/catches/eh 等十几个清单但**漏了 lpad 栈**（src/compiler/lambda/lambda_tree.c）；宿主方法的方法级 lpad entry（emit_methods.c:216 起，含已注册 ARC/boxed 局部）滞留栈上，lambda 体内 try/finally 的 landing pad 异常传播兜底（stmt_helpers.c emit_eh_propagate_tail_lpad 对 lpad_stack[0] 的 emit_lpad_cleanups）在 lambda 函数的 builder 里 load/store 宿主 alloca → 跨函数 IR 引用。
+- 修复：lambda_tree.c 切换上下文时按 finallys/catches 同款 memcpy 模式保存/恢复 lpad 栈段并清 lpad_depth；红-绿验证（回退补丁重建旧 zanc 复现 E3090，恢复后零错）+ 回归锁 tests/conformance/lambda_lpad_stack（宿主 ARC 局部 + lambda 内 try/finally 正常/异常双路径）。
+- 排查工具：`ZANC_DUMP_BAD_IR=1 build/zanc.exe <src> --auto-stdlib -o out.exe` 转储坏函数 IR（_scratch/bad_<fn>.txt）；`--emit-ir` 拿不到半成品 IR（验证器先跑，失败即退出）；全局 lambda 命名计数（lambda_tree.c lambda_id）从 IR 名反查宿主函数。
 - 备注：前置修复 E2002 私有 API 拦截（Socket 公共 API，commit 5245df9f3）后本缺陷才暴露。
+
+**〔前置〕lsp_session_editor 运行期挂起（E3090 修复后新暴露的下一层）**：
+- 现状：client 编译通过（E3090 已消），但 TCP 假服务器协议序列未完成——tests/lsp/run_lsp_session_test.py 断言"假服务器未完成协议序列"（约 145s 处失败）。E3090 挡住编译时该测试到不了协议阶段，故非回归而是新暴露。
+- 待查：ide_zan LspSession 的 TCP 会话实现运行期行为（连接/帧时序或 hang），属 B-ID199 timeout/运行期类缺口。
 
 **Gallery.zan 拆类顺延（配方已验证，待并发会话批次落地后执行）**：
 - 目标形态：单类 12,188 行 → Gallery 壳（Main/导航/GalleryPack）+ `examples/gui_gallery/demos/DemoXxx.zan` 逐控件家族；RenderPreviewEx（:5240-11503，约 300 分支）保留 name 分发，分支体迁 demos：`rendered = DemoButton.Render(app, c, t, name, px, py, y, w);`
