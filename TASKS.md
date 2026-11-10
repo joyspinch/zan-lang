@@ -48,6 +48,7 @@
 - [ ] B-ID200〔主线〕zan-lsp 全特性对齐 C 宿主。首片已落地（commit 7e196a4be）：src/selfhost/tools/lsp.zan 复用 selfhost 前端（Lexer/Parser/Binder/Checker）真诊断 + 符号索引（documentSymbol 嵌套/definition/references 词边界近似/hover/补全），tool_lsp_zan + tool_lsp_zan_session 守门。余量：rename/inlayHint/semanticTokens/folding/formatting；项目级符号解析（现单文档语义视图，using 指向的外部类型误报 undefined）；UTF-16 列口径（现 UTF-8 字节）；references 语义过滤。边界决议（2026-11-10）：**C 运行时（src/runtime）与 third_party 保留不 zan 化；工具链 + 编译器缺口（B-ID199）是 zan 化主线**。
 - [ ] B-ID201 zan-dap 重写为 Zan（src/dap → src/selfhost/tools/dap.zan 首切片起步）。〔前置 B-ID202〕活进程管道原语首片已落地；POSIX 管道与断点事件通道按 DAP 语义需要再补。
 - [ ] B-ID202 stdlib Process 活进程管道原语。首片已落地（commit 341efe035）：ProcessSpawn（Spawn/ReadAvailable/WriteLine/Kill/WaitExitCode/Dispose/Pid，双匿名管道 + STARTF_USESTDHANDLES，Windows-first）+ unit_process_spawn（cmd.exe 交互回环守门）。余量：POSIX 管道版（Spawn 现显式返回 null）、stderr 分管道、按需的 stdin 二进制写。
+- [ ] B-ID206 结构加固顺延包（2026-11-10 五项结构风险批次落地后余量，来源会话存档）：① main.c（main_frontend/main_codegen/main_linker）与 irgen_init.c（irgen_init_rt）函数体 fragment 的拼接契约已有 FRAGMENT 注释（3fa383707），缺机检机制化——校验 consumes/defines 清单与宿主函数局部实际匹配；② LSP 端口发现升级：bind 预检已落地（047aa…0474aa56e），真发现 = zan-lsp bind 成功后 getsockname 回显实际端口，客户端免猜算（Socket 包 + lsp_main.c 双端）；③ 诊断去重签名仍比截断后 msgbuf（diag.c vemit），改完整格式化串比对（vasprintf 一次）。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 
