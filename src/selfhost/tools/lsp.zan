@@ -1,16 +1,26 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 
 namespace Zan;
 
 /// <summary>
-/// 纯 Zan Language Server Protocol (LSP) 服务端——桩实现（B-ID200 首切片前状态）。
-/// 尚不具备替代 C 宿主（src/lsp/lsp_main.c + intellisense.c）的能力。
-/// 当前实际能力：JSON-RPC 2.0 帧读写、文档全量同步、发布空诊断、
-/// 写死的关键字/类型补全、静态 hover 文本、definition 原样回显。
-/// 全特性对齐（真诊断/符号索引/definition/references 等）由 TASKS.md 批次 5
-/// B-ID200 追踪。
+/// 纯 Zan Language Server Protocol (LSP) 服务端 —— B-ID200 首切片。
+/// 复用自举前端（src/selfhost/frontend/）做真诊断与符号索引：
+/// - 真诊断：Lexer + Parser(ParseDeclsOnly) + Binder + Checker 的完整管线，
+///   语法与语义错误映射为 LSP Diagnostics（行列来自前端 token/AST 位置）。
+/// - documentSymbol：AST 顶层/成员声明（类声明位置由 token 扫描补位——
+///   前端 ParseClass 不回填 line/col）。
+/// - definition：打开文档的类/方法/字段声明符号索引跳转。
+/// - references：跨打开文档的词边界文本匹配（近似，非语义解析）。
+/// - hover：符号索引信息（种类+声明位置）；内建类型写死描述。
+/// - completion：符号索引 + 关键字/内建类型，按光标前缀过滤。
+/// 已知局限（后续切片收敛，见 TASKS.md B-ID200）：
+/// - 语义诊断是单文档视图：using 指向的外部包/项目内其他文件的类型
+///   会被报 undefined，尚未做项目级符号解析。
+/// - 行列按 UTF-8 字节口径（与前端 lexer 一致），客户端 UTF-16 口径在
+///   含多字节字符的行上会偏移。
+/// - JSON 只覆盖 LSP 会话实际用到的子集；字符串转义完整处理。
+/// 入口：zanc --lsp 派发 Run()（driver/main.zan）。
 /// </summary>
 public class LspDocument {
     public string Uri;
@@ -24,16 +34,93 @@ public class LspDocument {
     }
 }
 
+/// 打开文档的声明符号。内部 Kind 用本类常量，映射到 LSP 的
+/// SymbolKind / CompletionItemKind 两套数值。
+public class LspSymbol {
+    public string Uri;
+    public string Name;
+    public int Kind;
+    public int Line;   // 1-based（与前端一致）
+    public int Col;    // 1-based
+
+    public LspSymbol(string uri, string name, int kind, int line, int col) {
+        Uri = uri;
+        Name = name;
+        Kind = kind;
+        Line = line;
+        Col = col;
+    }
+
+    public static int KindClass() { return 0; }
+    public static int KindInterface() { return 1; }
+    public static int KindStruct() { return 2; }
+    public static int KindEnum() { return 3; }
+    public static int KindMethod() { return 4; }
+    public static int KindField() { return 5; }
+    public static int KindCtor() { return 6; }
+    public static int KindDelegate() { return 7; }
+
+    /// LSP SymbolKind：Class=5 Interface=11 Enum=10 Method=6 Field=8
+    /// Constructor=9 Function=12；struct 无专属值，按 Class 报。
+    public int SymbolKind() {
+        if (Kind == KindInterface()) { return 11; }
+        if (Kind == KindEnum()) { return 10; }
+        if (Kind == KindMethod()) { return 6; }
+        if (Kind == KindField()) { return 8; }
+        if (Kind == KindCtor()) { return 9; }
+        if (Kind == KindDelegate()) { return 12; }
+        return 5;
+    }
+
+    /// LSP CompletionItemKind：Class=7 Interface=8 Enum=13 Field=5
+    /// Method=2 Constructor=4 Keyword=14。
+    public int CompletionKind() {
+        if (Kind == KindInterface()) { return 8; }
+        if (Kind == KindEnum()) { return 13; }
+        if (Kind == KindMethod()) { return 2; }
+        if (Kind == KindField()) { return 5; }
+        if (Kind == KindCtor()) { return 4; }
+        if (Kind == KindDelegate()) { return 2; }
+        return 7;
+    }
+
+    public string KindText() {
+        if (Kind == KindInterface()) { return "interface"; }
+        if (Kind == KindEnum()) { return "enum"; }
+        if (Kind == KindStruct()) { return "struct"; }
+        if (Kind == KindMethod()) { return "method"; }
+        if (Kind == KindField()) { return "field"; }
+        if (Kind == KindCtor()) { return "constructor"; }
+        if (Kind == KindDelegate()) { return "delegate"; }
+        return "class";
+    }
+}
+
+/// 0-based 源位置（词扫描中间结果）。
+public class LspPos {
+    public int Line;
+    public int Col;
+
+    public LspPos(int line, int col) {
+        Line = line;
+        Col = col;
+    }
+}
+
 public class LspServer {
     [DllImport("crt")] public static extern int getchar();
     [DllImport("crt")] public static extern int putchar(int c);
 
     static List<LspDocument> documents;
+    static List<LspSymbol> symbols;
     static bool isRunning = true;
 
     static void EnsureInit() {
         if (documents == null) {
             documents = new List<LspDocument>();
+        }
+        if (symbols == null) {
+            symbols = new List<LspSymbol>();
         }
     }
 
@@ -71,6 +158,439 @@ public class LspServer {
         }
     }
 
+    static void RemoveSymbolsOf(string uri) {
+        int i = 0;
+        while (i < symbols.Count) {
+            if (symbols[i].Uri == uri) {
+                symbols.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    // ============================ JSON 层 ============================
+    // LSP 会话实际用到的 JSON 子集。字符串扫描全部转义感知（\" \\ 不截断）。
+
+    /// 把字符串编码为 JSON 字符串字面量（含两侧引号）。
+    public static string EncodeJsonString(string s) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append('"');
+        int i = 0;
+        while (i < s.Length) {
+            char c = s[i];
+            if (c == '"') { sb.Append("\\\""); }
+            else if (c == '\\') { sb.Append("\\\\"); }
+            else if (c == '\n') { sb.Append("\\n"); }
+            else if (c == '\r') { sb.Append("\\r"); }
+            else if (c == '\t') { sb.Append("\\t"); }
+            else if ((int)c < 32) {
+                sb.Append("\\u00");
+                int hi = ((int)c) / 16;
+                int lo = ((int)c) % 16;
+                if (hi < 10) { sb.Append((char)((int)'0' + hi)); }
+                else { sb.Append((char)((int)'a' + hi - 10)); }
+                if (lo < 10) { sb.Append((char)((int)'0' + lo)); }
+                else { sb.Append((char)((int)'a' + lo - 10)); }
+            } else { sb.Append(c); }
+            i = i + 1;
+        }
+        sb.Append('"');
+        return sb.ToString();
+    }
+
+    /// s[i] 必须是开引号；返回对应闭引号下标（跳过 \\" 与 \\\\），未闭合 -1。
+    static int JsonSkipString(string s, int i) {
+        int j = i + 1;
+        while (j < s.Length) {
+            if (s[j] == '\\') { j = j + 2; }
+            else if (s[j] == '"') { return j; }
+            else { j = j + 1; }
+        }
+        return -1;
+    }
+
+    /// 从 from 起找作为 key 出现的 "field"（后跟 ':'），返回其值的首 token
+    /// 下标；未命中 -1。字符串字面量整段跳过，不会被值内部的 "field" 误命中。
+    static int JsonFindValueFrom(string s, string field, int from) {
+        string pattern = "\"" + field + "\"";
+        int i = from;
+        while (i < s.Length) {
+            if (s[i] == '"') {
+                int e = JsonSkipString(s, i);
+                if (e < 0) { return -1; }
+                if (s.Substring(i, e - i + 1) == pattern) {
+                    int k = e + 1;
+                    while (k < s.Length && (s[k] == ' ' || s[k] == '\t'
+                            || s[k] == '\n' || s[k] == '\r')) { k = k + 1; }
+                    if (k < s.Length && s[k] == ':') {
+                        k = k + 1;
+                        while (k < s.Length && (s[k] == ' ' || s[k] == '\t'
+                                || s[k] == '\n' || s[k] == '\r')) { k = k + 1; }
+                        if (k < s.Length) { return k; }
+                        return -1;
+                    }
+                }
+                i = e + 1;
+            } else { i = i + 1; }
+        }
+        return -1;
+    }
+
+    /// 值起点 start 处的值结束下标（exclusive）：字符串越过闭引号，
+    /// 对象/数组做转义感知的括号平衡，标量扫到分隔符。
+    static int JsonScanValue(string s, int start) {
+        char c = s[start];
+        if (c == '"') {
+            int e = JsonSkipString(s, start);
+            return e < 0 ? s.Length : e + 1;
+        }
+        if (c == '{' || c == '[') {
+            int depth = 0;
+            int i = start;
+            while (i < s.Length) {
+                if (s[i] == '"') {
+                    int e = JsonSkipString(s, i);
+                    if (e < 0) { return s.Length; }
+                    i = e + 1;
+                    continue;
+                }
+                if (s[i] == '{' || s[i] == '[') { depth = depth + 1; }
+                else if (s[i] == '}' || s[i] == ']') {
+                    depth = depth - 1;
+                    if (depth == 0) { return i + 1; }
+                }
+                i = i + 1;
+            }
+            return s.Length;
+        }
+        if (c == 't' || c == 'f' || c == 'n') {
+            int i = start;
+            while (i < s.Length && ((s[i] >= 'a' && s[i] <= 'z'))) { i = i + 1; }
+            return i;
+        }
+        int j = start;
+        while (j < s.Length && ((s[j] >= '0' && s[j] <= '9') || s[j] == '-'
+                || s[j] == '+' || s[j] == '.' || s[j] == 'e' || s[j] == 'E')) {
+            j = j + 1;
+        }
+        return j;
+    }
+
+    /// 解码 JSON 字符串值（不含两侧引号的片段）：\\" \\\\ \\/ \b \f \n \r \t
+    /// \uXXXX（含成对代理对）。码点按 UTF-8 编码落进 Zan 字符串（char=字节）。
+    static string DecodeJsonBody(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            char c = s[i];
+            if (c == '\\' && i + 1 < s.Length) {
+                char n = s[i + 1];
+                if (n == '"') { sb.Append('"'); i = i + 2; }
+                else if (n == '\\') { sb.Append('\\'); i = i + 2; }
+                else if (n == '/') { sb.Append('/'); i = i + 2; }
+                else if (n == 'b') { sb.Append((char)8); i = i + 2; }
+                else if (n == 'f') { sb.Append((char)12); i = i + 2; }
+                else if (n == 'n') { sb.Append('\n'); i = i + 2; }
+                else if (n == 'r') { sb.Append('\r'); i = i + 2; }
+                else if (n == 't') { sb.Append('\t'); i = i + 2; }
+                else if (n == 'u') {
+                    int cp = JsonHex4(s, i + 2);
+                    i = i + 6;
+                    if (cp >= 0 && cp >= 0xD800 && cp <= 0xDBFF
+                            && i + 1 < s.Length && s[i] == '\\' && s[i + 1] == 'u') {
+                        int lo = JsonHex4(s, i + 2);
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            i = i + 6;
+                        }
+                    }
+                    if (cp >= 0) { AppendUtf8(sb, cp); }
+                } else { sb.Append(n); i = i + 2; }
+            } else { sb.Append(c); i = i + 1; }
+        }
+        return sb.ToString();
+    }
+
+    static int JsonHex4(string s, int at) {
+        if (at + 4 > s.Length) { return -1; }
+        int v = 0;
+        int i = 0;
+        while (i < 4) {
+            char c = s[at + i];
+            int d;
+            if (c >= '0' && c <= '9') { d = (int)c - (int)'0'; }
+            else if (c >= 'a' && c <= 'f') { d = (int)c - (int)'a' + 10; }
+            else if (c >= 'A' && c <= 'F') { d = (int)c - (int)'A' + 10; }
+            else { return -1; }
+            v = v * 16 + d;
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static void AppendUtf8(StringBuilder sb, int cp) {
+        if (cp < 0x80) {
+            sb.Append((char)cp);
+        } else if (cp < 0x800) {
+            sb.Append((char)(0xC0 + (cp >> 6)));
+            sb.Append((char)(0x80 + (cp & 63)));
+        } else if (cp < 0x10000) {
+            sb.Append((char)(0xE0 + (cp >> 12)));
+            sb.Append((char)(0x80 + ((cp >> 6) & 63)));
+            sb.Append((char)(0x80 + (cp & 63)));
+        } else {
+            sb.Append((char)(0xF0 + (cp >> 18)));
+            sb.Append((char)(0x80 + ((cp >> 12) & 63)));
+            sb.Append((char)(0x80 + ((cp >> 6) & 63)));
+            sb.Append((char)(0x80 + (cp & 63)));
+        }
+    }
+
+    /// 提取字段值：字符串 → 解码后的内容；标量 → 原文；未命中 ""。
+    public static string ExtractJsonField(string json, string field) {
+        int start = JsonFindValueFrom(json, field, 0);
+        if (start < 0) { return ""; }
+        int end = JsonScanValue(json, start);
+        if (json[start] == '"') {
+            return DecodeJsonBody(json.Substring(start + 1, end - start - 2));
+        }
+        return json.Substring(start, end - start);
+    }
+
+    /// 整数字段（缺省/非数值返回 dflt）。
+    static int ExtractJsonInt(string json, string field, int dflt) {
+        string raw = ExtractJsonField(json, field);
+        if (raw.Length == 0) { return dflt; }
+        bool ok = true;
+        int i = 0;
+        int v = 0;
+        int sign = 1;
+        if (raw[0] == '-') { sign = -1; i = 1; }
+        while (i < raw.Length) {
+            if (raw[i] < '0' || raw[i] > '9') { ok = false; break; }
+            v = v * 10 + ((int)raw[i] - (int)'0');
+            i = i + 1;
+        }
+        if (!ok) { return dflt; }
+        return sign * v;
+    }
+
+    /// 提取字段值为对象/数组的平衡片段原文；未命中或非容器返回 ""。
+    static string ExtractJsonContainer(string json, string field) {
+        int start = JsonFindValueFrom(json, field, 0);
+        if (start < 0) { return ""; }
+        if (json[start] != '{' && json[start] != '[') { return ""; }
+        int end = JsonScanValue(json, start);
+        return json.Substring(start, end - start);
+    }
+
+    // ============================ 分析层 ============================
+
+    /// 解析文档：发布真诊断并重建该文档的声明符号索引。
+    static void Analyze(string uri, string text, int version) {
+        RemoveSymbolsOf(uri);
+        Lexer lx = new Lexer(text);
+        List<Token> toks = lx.Run();
+        CollectTopLevelSymbols(uri, toks);
+
+        Diags dg = new Diags();
+        Parser ps = new Parser(toks, dg);
+        Node unit = ps.ParseDeclsOnly();
+        Binder b = new Binder();
+        b.Bind(unit);
+        Checker ck = new Checker(b, dg);
+        ck.Check(unit);
+        CollectMemberSymbols(uri, unit);
+
+        PublishDiagnostics(uri, version, DiagArray(dg));
+    }
+
+    /// 顶层类型声明位置：前端 ParseClass/ParseInterface/ParseEnum 不回填
+    /// line/col，声明行从 token 流取（关键字后的标识符）。
+    /// delegate 不是关键字 token（上下文关键字），首切片不收。
+    static void CollectTopLevelSymbols(string uri, List<Token> toks) {
+        int i = 0;
+        while (i < toks.Count) {
+            int k = toks[i].kind;
+            if (k == TK.Class() || k == TK.Interface() || k == TK.Struct()
+                    || k == TK.Enum()) {
+                int j = i + 1;
+                while (j < toks.Count && toks[j].kind != TK.Ident()
+                        && toks[j].kind != TK.Eof()) { j = j + 1; }
+                if (j < toks.Count && toks[j].kind == TK.Ident()) {
+                    int kind;
+                    if (k == TK.Interface()) { kind = LspSymbol.KindInterface(); }
+                    else if (k == TK.Enum()) { kind = LspSymbol.KindEnum(); }
+                    else if (k == TK.Struct()) { kind = LspSymbol.KindStruct(); }
+                    else { kind = LspSymbol.KindClass(); }
+                    symbols.Add(new LspSymbol(uri, toks[j].text, kind,
+                        toks[j].line, toks[j].col));
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// 成员符号（方法/字段/构造器/枚举成员）来自 AST：这些节点的
+    /// line/col 由前端回填，可直接用。字段的多声明符在 kids 里拍平。
+    /// 接口与类同为 AK.ClassDecl()（mods 带If位），不单独区分。
+    /// namespace 声明递归下钻，覆盖其内层的类型。
+    static void CollectMemberSymbols(string uri, Node unit) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.NamespaceDecl()) {
+                CollectMemberSymbols(uri, d);
+            } else if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int j = 0;
+                while (j < d.kids.Count) {
+                    Node m = d.kids[j];
+                    if (m.kind == AK.MethodDecl()) {
+                        symbols.Add(new LspSymbol(uri, m.sval,
+                            LspSymbol.KindMethod(), m.line, m.col));
+                    } else if (m.kind == AK.FieldDecl()) {
+                        AddFieldSymbol(uri, m);
+                    } else if (m.kind == AK.CtorDecl()) {
+                        symbols.Add(new LspSymbol(uri, d.sval,
+                            LspSymbol.KindCtor(), m.line, m.col));
+                    } else if (m.kind == AK.EnumDecl()) {
+                        int k = 0;
+                        while (k < m.kids.Count) {
+                            Node em = m.kids[k];
+                            if (em.kind == AK.EnumMember()) {
+                                symbols.Add(new LspSymbol(uri, em.sval,
+                                    LspSymbol.KindEnum(), em.line, em.col));
+                            }
+                            k = k + 1;
+                        }
+                    }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    static void AddFieldSymbol(string uri, Node f) {
+        symbols.Add(new LspSymbol(uri, f.sval, LspSymbol.KindField(),
+            f.line, f.col));
+        int i = 0;
+        while (i < f.kids.Count) {
+            Node k = f.kids[i];
+            if (k.kind == AK.FieldDecl()) { AddFieldSymbol(uri, k); }
+            i = i + 1;
+        }
+    }
+
+    /// Diags.items → LSP diagnostics 数组 JSON（行列 1-based → 0-based；
+    /// 列按 UTF-8 字节口径，见头部局限说明）。
+    static string DiagArray(Diags dg) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append('[');
+        int i = 0;
+        while (i < dg.items.Count) {
+            Diag d = dg.items[i];
+            if (i > 0) { sb.Append(','); }
+            sb.Append("{\"severity\":");
+            sb.Append(d.warn ? "2" : "1");
+            sb.Append(",\"range\":{\"start\":{\"line\":");
+            sb.Append(d.line > 0 ? d.line - 1 : 0);
+            sb.Append(",\"character\":");
+            sb.Append(d.col > 0 ? d.col - 1 : 0);
+            sb.Append("},\"end\":{\"line\":");
+            sb.Append(d.line > 0 ? d.line - 1 : 0);
+            sb.Append(",\"character\":");
+            sb.Append(d.col > 0 ? d.col : 1);
+            sb.Append("}},\"source\":\"zan\",");
+            sb.Append("\"message\":");
+            sb.Append(EncodeJsonString(d.msg));
+            sb.Append('}');
+            i = i + 1;
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    static void PublishDiagnostics(string uri, int version, string diagJson) {
+        string res = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{"
+            + "\"uri\":" + EncodeJsonString(uri) + ","
+            + "\"version\":" + version + ","
+            + "\"diagnostics\":" + diagJson
+            + "}}";
+        SendResponse(res);
+    }
+
+    // ============================ 位置/词工具 ============================
+
+    static bool IsWordChar(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_';
+    }
+
+    /// 0-based 行号 → 行首偏移（行按 '\n' 计，与 LSP 口径一致）。
+    static int LineStartOf(string text, int line0) {
+        if (line0 <= 0) { return 0; }
+        int line = 0;
+        int i = 0;
+        while (i < text.Length) {
+            if (text[i] == '\n') {
+                line = line + 1;
+                if (line == line0) { return i + 1; }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// 光标处词：先向左扩到词首再向右扩到词尾；光标左邻不是词字符时
+    /// 取右侧词（光标停在词首前仍可选中）。
+    static string WordAt(string text, int line0, int char0) {
+        int ls = LineStartOf(text, line0);
+        if (ls < 0) { return ""; }
+        int le = ls;
+        while (le < text.Length && text[le] != '\n') { le = le + 1; }
+        int rel = char0;
+        if (rel > le - ls) { rel = le - ls; }
+        int s = rel;
+        while (s > 0 && IsWordChar(text[ls + s - 1])) { s = s - 1; }
+        int e = rel;
+        while (e < le - ls && IsWordChar(text[ls + e])) { e = e + 1; }
+        if (e <= s) { return ""; }
+        return text.Substring(ls + s, e - s);
+    }
+
+    /// 词边界全文匹配（references 用）：命中处前后都不是词字符。
+    /// 返回 0-based 位置列表（近似——不含语义过滤，见头部局限说明）。
+    static List<LspPos> WordPositions(string text, string word) {
+        List<LspPos> outp = new List<LspPos>();
+        if (word.Length == 0) { return outp; }
+        int line = 0;
+        int lineStart = 0;
+        int i = 0;
+        while (i + word.Length <= text.Length) {
+            if (text[i] == '\n') {
+                line = line + 1;
+                lineStart = i + 1;
+                i = i + 1;
+                continue;
+            }
+            if ((i == 0 || !IsWordChar(text[i - 1]))
+                    && (i + word.Length == text.Length
+                        || !IsWordChar(text[i + word.Length]))) {
+                if (text.Substring(i, word.Length) == word) {
+                    outp.Add(new LspPos(line, i - lineStart));
+                    i = i + word.Length;
+                    continue;
+                }
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    // ============================ 请求处理 ============================
+
     // 格式化输出 JSON-RPC 2.0 响应 (包含 Content-Length 头部)
     public static void SendResponse(string jsonBody) {
         int len = jsonBody.Length;
@@ -87,112 +607,98 @@ public class LspServer {
         }
     }
 
-    // 简单高效的 JSON 提取器助手
-    public static string ExtractJsonField(string json, string field) {
-        string pattern = "\"" + field + "\":";
-        int idx = json.IndexOf(pattern);
-        if (idx < 0) { return ""; }
-        int start = idx + pattern.Length;
-        while (start < json.Length && (json[start] == ' ' || json[start] == '\t')) {
-            start = start + 1;
-        }
-        if (start >= json.Length) { return ""; }
-        if (json[start] == '"') {
-            int end = json.IndexOf("\"", start + 1);
-            if (end < 0) { return ""; }
-            return json.Substring(start + 1, end - start - 1);
-        } else {
-            int end = start;
-            while (end < json.Length && json[end] != ',' && json[end] != '}' && json[end] != ']') {
-                end = end + 1;
-            }
-            return json.Substring(start, end - start).Trim();
-        }
+    /// LSP 位置对象 JSON（行列 0-based 直传）。
+    static string PosJson(int line, int character) {
+        return "{\"line\":" + line + ",\"character\":" + character + "}";
     }
 
-    // 处理一条 LSP 消息
+    static string LocationJson(string uri, int line0, int col0) {
+        return "{\"uri\":" + EncodeJsonString(uri)
+            + ",\"range\":{\"start\":" + PosJson(line0, col0)
+            + ",\"end\":" + PosJson(line0, col0 + 1) + "}}";
+    }
+
+    // 处理一条 LSP 消息（params 是潜在关键字面，局部用 pms）
     public static void HandleMessage(string rawJson) {
         string method = ExtractJsonField(rawJson, "method");
         string id = ExtractJsonField(rawJson, "id");
+        string pms = ExtractJsonContainer(rawJson, "params");
 
         if (method == "initialize") {
-            // 返回服务端能力：文档全量同步、代码补全、悬停、定义跳转
+            // 能力如实声明：全量同步 + 诊断 + 补全/悬停/定义/引用/文档符号
             string res = "{\"jsonrpc\":\"2.0\",\"id\":" + (id == "" ? "1" : id) + ",\"result\":{"
                 + "\"capabilities\":{"
                 + "\"textDocumentSync\":1,"
-                + "\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\",\"::\"]},"
+                + "\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},"
                 + "\"hoverProvider\":true,"
-                + "\"definitionProvider\":true"
+                + "\"definitionProvider\":true,"
+                + "\"referencesProvider\":true,"
+                + "\"documentSymbolProvider\":true"
                 + "}}}";
             SendResponse(res);
             return;
         }
 
         if (method == "textDocument/didOpen") {
-            string uri = ExtractJsonField(rawJson, "uri");
-            string text = ExtractJsonField(rawJson, "text");
-            string verStr = ExtractJsonField(rawJson, "version");
-            int ver = verStr == "" ? 1 : int.Parse(verStr);
+            string td = ExtractJsonContainer(pms, "textDocument");
+            string uri = ExtractJsonField(td, "uri");
+            string text = ExtractJsonField(td, "text");
+            int ver = ExtractJsonInt(td, "version", 1);
             StoreDocument(uri, text, ver);
-            PublishDiagnostics(uri, text);
+            Analyze(uri, text, ver);
             return;
         }
 
         if (method == "textDocument/didChange") {
-            string uri = ExtractJsonField(rawJson, "uri");
-            string text = ExtractJsonField(rawJson, "text");
-            string verStr = ExtractJsonField(rawJson, "version");
-            int ver = verStr == "" ? 1 : int.Parse(verStr);
+            // textDocumentSync=1 全量同步：取 contentChanges[0].text
+            string td = ExtractJsonContainer(pms, "textDocument");
+            string uri = ExtractJsonField(td, "uri");
+            int ver = ExtractJsonInt(td, "version", 1);
+            string changes = ExtractJsonContainer(pms, "contentChanges");
+            string text = "";
+            if (changes.StartsWith("[") && changes.Length > 1) {
+                // 第一个元素的 text 字段（全量同步下通常只有一个变更）
+                text = ExtractJsonField(changes.Substring(1), "text");
+            }
             StoreDocument(uri, text, ver);
-            PublishDiagnostics(uri, text);
+            Analyze(uri, text, ver);
             return;
         }
 
         if (method == "textDocument/didClose") {
-            string uri = ExtractJsonField(rawJson, "uri");
+            string td = ExtractJsonContainer(pms, "textDocument");
+            string uri = ExtractJsonField(td, "uri");
+            LspDocument doc = FindDocument(uri);
+            int lastVer = doc != null ? doc.Version : 0;
             RemoveDocument(uri);
+            RemoveSymbolsOf(uri);
+            // 清空诊断（带最后已知版本号，与 C 宿主行为一致）
+            PublishDiagnostics(uri, lastVer, "[]");
             return;
         }
 
         if (method == "textDocument/completion") {
-            // 提供核心关键字与基础类型补全
-            string completions = "["
-                + "{\"label\":\"class\",\"kind\":14,\"detail\":\"keyword class\"},"
-                + "{\"label\":\"struct\",\"kind\":14,\"detail\":\"keyword struct\"},"
-                + "{\"label\":\"interface\",\"kind\":14,\"detail\":\"keyword interface\"},"
-                + "{\"label\":\"enum\",\"kind\":14,\"detail\":\"keyword enum\"},"
-                + "{\"label\":\"static\",\"kind\":14,\"detail\":\"keyword static\"},"
-                + "{\"label\":\"public\",\"kind\":14,\"detail\":\"keyword public\"},"
-                + "{\"label\":\"private\",\"kind\":14,\"detail\":\"keyword private\"},"
-                + "{\"label\":\"int\",\"kind\":7,\"detail\":\"32-bit signed integer\"},"
-                + "{\"label\":\"long\",\"kind\":7,\"detail\":\"64-bit signed integer\"},"
-                + "{\"label\":\"string\",\"kind\":7,\"detail\":\"UTF-8 string\"},"
-                + "{\"label\":\"bool\",\"kind\":7,\"detail\":\"boolean type\"},"
-                + "{\"label\":\"void\",\"kind\":7,\"detail\":\"void return type\"},"
-                + "{\"label\":\"Console\",\"kind\":7,\"detail\":\"System.Console\"},"
-                + "{\"label\":\"WriteLine\",\"kind\":3,\"detail\":\"Console.WriteLine(string)\"}"
-                + "]";
-            string res = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + completions + "}";
-            SendResponse(res);
+            HandleCompletion(id, pms);
             return;
         }
 
         if (method == "textDocument/hover") {
-            string res = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{"
-                + "\"contents\":{\"kind\":\"markdown\",\"value\":\"**Zan Language** Native Type\"}"
-                + "}}";
-            SendResponse(res);
+            HandleHover(id, pms);
             return;
         }
 
         if (method == "textDocument/definition") {
-            // 默认返回自身当前行作为安全降级定义
-            string uri = ExtractJsonField(rawJson, "uri");
-            string res = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{"
-                + "\"uri\":\"" + uri + "\","
-                + "\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}"
-                + "}}";
-            SendResponse(res);
+            HandleDefinition(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/references") {
+            HandleReferences(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/documentSymbol") {
+            HandleDocumentSymbol(id, pms);
             return;
         }
 
@@ -206,20 +712,272 @@ public class LspServer {
             return;
         }
 
+        // 未知通知（initialized、$/cancelRequest 等）静默忽略；
         // 未知带 ID 请求返回空结果
         if (id != "") {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
         }
     }
 
-    // 运行语法分析并发布 LSP 诊断报告
-    public static void PublishDiagnostics(string uri, string text) {
-        // 当源文件为空或格式良好时发布零错误清空诊断
-        string res = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{"
-            + "\"uri\":\"" + uri + "\","
-            + "\"diagnostics\":[]"
-            + "}}";
+    static void HandleCompletion(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        string pos = ExtractJsonContainer(pms, "position");
+        int line = ExtractJsonInt(pos, "line", 0);
+        int character = ExtractJsonInt(pos, "character", 0);
+        string prefix = "";
+        LspDocument doc = FindDocument(uri);
+        if (doc != null && character > 0) {
+            prefix = WordAt(doc.Text, line, character - 1);
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[");
+        bool first = true;
+        // 关键字表（bootstrap subset 全集）
+        string kws = "abstract as base bool break byte case char class const continue"
+            + " default do double else enum false finally float for foreach get if"
+            + " in int interface is long namespace new null object out override"
+            + " params private protected public readonly ref return set short"
+            + " static string struct switch this throw true try typeof uint ulong"
+            + " ushort using virtual void while";
+        List<string> kwList = kws.Split(" ");
+        int i = 0;
+        while (i < kwList.Count) {
+            string kw = kwList[i];
+            if (prefix == "" || kw.StartsWith(prefix)) {
+                if (!first) { sb.Append(','); }
+                first = false;
+                sb.Append("{\"label\":");
+                sb.Append(EncodeJsonString(kw));
+                sb.Append(",\"kind\":14,\"detail\":\"keyword\"}");
+            }
+            i = i + 1;
+        }
+        // 内建类型
+        string builtins = "sbyte ushort uint ulong nint nfloat double decimal"
+            + " char object List Dictionary Task StringBuilder Console Convert Math";
+        List<string> biList = builtins.Split(" ");
+        i = 0;
+        while (i < biList.Count) {
+            string bi = biList[i];
+            if ((prefix == "" || bi.StartsWith(prefix)) && !kwList.Contains(bi)) {
+                if (!first) { sb.Append(','); }
+                first = false;
+                sb.Append("{\"label\":");
+                sb.Append(EncodeJsonString(bi));
+                sb.Append(",\"kind\":7,\"detail\":\"built-in type\"}");
+            }
+            i = i + 1;
+        }
+        // 打开文档的声明符号
+        EnsureInit();
+        i = 0;
+        while (i < symbols.Count) {
+            LspSymbol sym = symbols[i];
+            if ((prefix == "" || sym.Name.StartsWith(prefix))
+                    && !kwList.Contains(sym.Name)) {
+                if (!first) { sb.Append(','); }
+                first = false;
+                sb.Append("{\"label\":");
+                sb.Append(EncodeJsonString(sym.Name));
+                sb.Append(",\"kind\":");
+                sb.Append(sym.CompletionKind());
+                sb.Append(",\"detail\":");
+                sb.Append(EncodeJsonString(sym.KindText()));
+                sb.Append("}");
+            }
+            i = i + 1;
+        }
+        sb.Append("]}");
+        SendResponse(sb.ToString());
+    }
+
+    /// hover / definition 共用的符号查找：先声明索引，再内建类型。
+    static LspSymbol FindSymbol(string name) {
+        EnsureInit();
+        int i = 0;
+        while (i < symbols.Count) {
+            if (symbols[i].Name == name) { return symbols[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    static void HandleHover(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        string pos = ExtractJsonContainer(pms, "position");
+        int line = ExtractJsonInt(pos, "line", 0);
+        int character = ExtractJsonInt(pos, "character", 0);
+        string word = "";
+        LspDocument doc = FindDocument(uri);
+        if (doc != null) { word = WordAt(doc.Text, line, character); }
+        if (word.Length == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        string kindText = "";
+        string whereTxt = "";
+        LspSymbol sym = FindSymbol(word);
+        if (sym != null) {
+            kindText = sym.KindText();
+            whereTxt = "declared at " + sym.Uri + ":" + sym.Line;
+        } else if (IsBuiltinType(word)) {
+            kindText = "built-in type";
+            whereTxt = "zan core";
+        }
+        if (kindText == "") {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        string md = "`" + word + "` — " + kindText + "\n\n" + whereTxt;
+        string res = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{"
+            + "\"contents\":{\"kind\":\"markdown\",\"value\":"
+            + EncodeJsonString(md) + "}}}";
         SendResponse(res);
+    }
+
+    static bool IsBuiltinType(string name) {
+        return name == "int" || name == "long" || name == "short"
+            || name == "byte" || name == "sbyte" || name == "uint"
+            || name == "ulong" || name == "ushort" || name == "bool"
+            || name == "string" || name == "char" || name == "double"
+            || name == "float" || name == "object" || name == "void"
+            || name == "decimal" || name == "nint";
+    }
+
+    static void HandleDefinition(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        string pos = ExtractJsonContainer(pms, "position");
+        int line = ExtractJsonInt(pos, "line", 0);
+        int character = ExtractJsonInt(pos, "character", 0);
+        string word = "";
+        LspDocument doc = FindDocument(uri);
+        if (doc != null) { word = WordAt(doc.Text, line, character); }
+        LspSymbol sym = word.Length > 0 ? FindSymbol(word) : null;
+        if (sym == null) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        string res = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":"
+            + LocationJson(sym.Uri, sym.Line - 1, sym.Col - 1) + "}";
+        SendResponse(res);
+    }
+
+    static void HandleReferences(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        string pos = ExtractJsonContainer(pms, "position");
+        int line = ExtractJsonInt(pos, "line", 0);
+        int character = ExtractJsonInt(pos, "character", 0);
+        string word = "";
+        LspDocument doc = FindDocument(uri);
+        if (doc != null) { word = WordAt(doc.Text, line, character); }
+        if (word.Length == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":[]}");
+            return;
+        }
+        // 声明处排最前，随后按打开文档顺序做词边界文本匹配（近似）
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[");
+        bool first = true;
+        LspSymbol sym = FindSymbol(word);
+        if (sym != null) {
+            sb.Append(LocationJson(sym.Uri, sym.Line - 1, sym.Col - 1));
+            first = false;
+        }
+        EnsureInit();
+        int di = 0;
+        while (di < documents.Count) {
+            LspDocument d = documents[di];
+            List<LspPos> hits = WordPositions(d.Text, word);
+            int i = 0;
+            while (i < hits.Count) {
+                LspPos p = hits[i];
+                // 声明位置已单独报过，跳过重复
+                if (!(sym != null && d.Uri == sym.Uri
+                        && p.Line == sym.Line - 1 && p.Col == sym.Col - 1)) {
+                    if (!first) { sb.Append(','); }
+                    first = false;
+                    sb.Append(LocationJson(d.Uri, p.Line, p.Col));
+                }
+                i = i + 1;
+            }
+            di = di + 1;
+        }
+        sb.Append("]}");
+        SendResponse(sb.ToString());
+    }
+
+    /// 嵌套 DocumentSymbol：类/接口/枚举为父，方法/字段/构造器为 children。
+    /// 类节点在 AST 无行列，range 用 token 扫描得到的名字位置（见头部说明）。
+    static void HandleDocumentSymbol(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[");
+        EnsureInit();
+        bool first = true;
+        int i = 0;
+        while (i < symbols.Count) {
+            LspSymbol top = symbols[i];
+            if (top.Uri != uri || IsMemberKind(top.Kind)) { i = i + 1; continue; }
+            if (!first) { sb.Append(','); }
+            first = false;
+            sb.Append("{\"name\":");
+            sb.Append(EncodeJsonString(top.Name));
+            sb.Append(",\"kind\":");
+            sb.Append(top.SymbolKind());
+            sb.Append(",\"range\":{\"start\":");
+            sb.Append(PosJson(top.Line - 1, top.Col - 1));
+            sb.Append(",\"end\":");
+            sb.Append(PosJson(top.Line - 1, top.Col - 1));
+            sb.Append("},\"selectionRange\":{\"start\":");
+            sb.Append(PosJson(top.Line - 1, top.Col - 1));
+            sb.Append(",\"end\":");
+            sb.Append(PosJson(top.Line - 1, top.Col - 1));
+            sb.Append("},\"children\":[");
+            int j = 0;
+            bool mfirst = true;
+            while (j < symbols.Count) {
+                LspSymbol m = symbols[j];
+                if (m.Uri == uri && IsMemberKind(m.Kind)) {
+                    if (!mfirst) { sb.Append(','); }
+                    mfirst = false;
+                    sb.Append("{\"name\":");
+                    sb.Append(EncodeJsonString(m.Name));
+                    sb.Append(",\"kind\":");
+                    sb.Append(m.SymbolKind());
+                    sb.Append(",\"range\":{\"start\":");
+                    sb.Append(PosJson(m.Line - 1, m.Col - 1));
+                    sb.Append(",\"end\":");
+                    sb.Append(PosJson(m.Line - 1, m.Col - 1));
+                    sb.Append("},\"selectionRange\":{\"start\":");
+                    sb.Append(PosJson(m.Line - 1, m.Col - 1));
+                    sb.Append(",\"end\":");
+                    sb.Append(PosJson(m.Line - 1, m.Col - 1));
+                    sb.Append("}}");
+                }
+                j = j + 1;
+            }
+            sb.Append("]}");
+            i = i + 1;
+        }
+        sb.Append("]}");
+        SendResponse(sb.ToString());
+    }
+
+    static bool IsMemberKind(int kind) {
+        return kind == LspSymbol.KindMethod() || kind == LspSymbol.KindField()
+            || kind == LspSymbol.KindCtor() || kind == LspSymbol.KindEnum()
+            || kind == LspSymbol.KindDelegate();
     }
 
     // 启动基于标准输入的 LSP 主事件循环

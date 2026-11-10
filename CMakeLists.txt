@@ -6924,6 +6924,57 @@ add_test(NAME tool_zandoc
     -DOUTFILE=${CMAKE_BINARY_DIR}/zandoc_out.md
     -P ${CMAKE_SOURCE_DIR}/tests/run_zandoc.cmake)
 
+# ---- lsp.zan (pure-Zan LSP server, B-ID200 first slice) ----
+# Frontend list mirrors scripts/selfhost_sources.txt (selfhost/frontend/* +
+# selfhost/tools/lsp); keep the two in sync when the frontend grows files.
+# The entry file comes first: zanc only generates Main for paths[0].
+set(_lspzan_srcs
+  ${CMAKE_SOURCE_DIR}/tests/selfhost/lsp_zan_session_entry.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/token.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/ast.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/diag.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/lexer.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_scan.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_decl.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_member.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_stmt.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_expr.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_query.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_desugar.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_resolve.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/binder.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/checker.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/checker_type.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/checker_expr.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/tools/lsp.zan
+)
+set(_lspzan_exe ${CMAKE_BINARY_DIR}/cases/tool_lsp_zan_session${_exe_ext})
+add_custom_command(OUTPUT ${_lspzan_exe}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/cases
+  COMMAND $<TARGET_FILE:zanc>
+          ${_lspzan_srcs}
+          --auto-stdlib -o ${_lspzan_exe}
+  DEPENDS zanc ${_lspzan_srcs}
+  COMMENT "Building the pure-Zan LSP server test binary")
+add_custom_target(lsp_zan_tool ALL DEPENDS ${_lspzan_exe})
+
+# Build gate: binary exists and exits cleanly on EOF stdin.
+add_test(NAME tool_lsp_zan
+  COMMAND ${CMAKE_COMMAND}
+    -DEXE=${_lspzan_exe}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_lsp_zan_build.cmake)
+set_tests_properties(tool_lsp_zan PROPERTIES TIMEOUT 60)
+
+# Behavior gate: one full stdio session (diagnostics/symbols/definition/
+# references/hover/completion/didClose/exit).
+if(Python3_Interpreter_FOUND)
+  add_test(NAME tool_lsp_zan_session
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lsp/run_lsp_zan_session_test.py
+      --exe ${_lspzan_exe})
+  set_tests_properties(tool_lsp_zan_session PROPERTIES TIMEOUT 120)
+endif()
+
 # ---- Test tiers -------------------------------------------------------------
 # The suite is thousands of tests because every conformance program is also
 # built for determinism and leak checking; running all of it for a one-line
