@@ -13,6 +13,8 @@ script drives one full session and asserts the B-ID200 first-slice behaviors:
   completion                     keyword + symbol filtering by cursor prefix
   didChange                      re-analysis, version bump
   syntax error                   parser diagnostics
+  cjk utf-16 columns             diagnostics/hover positions after CJK
+                                 content on the same line (UTF-16, not bytes)
   didClose                       diagnostics cleared notification
   shutdown/exit                  process exits 0
 
@@ -22,6 +24,11 @@ Failure prints the offending frame and exits 1; success prints PASS.
 import json
 import subprocess
 import sys
+
+
+def utf16_length(text):
+    """LSP character = UTF-16 code units（与 run_lsp_session_test.py 同口径）。"""
+    return len(text.encode("utf-16-le")) // 2
 
 
 def frame(msg):
@@ -49,10 +56,20 @@ SRC_SYN = (
     "class SyntaxErr {\n"
     "    int f( }\n"
 )
+# CJK 列口径用例：诊断错误 token 与 hover 目标词都落在同行的 CJK 内容
+# 之后——byte 列与 UTF-16 列相差 2 units/字，任何一侧没转口径都会偏。
+SRC_CJK = (
+    "class CDemo {\n"
+    "    public int Val;\n"
+    "    public string Tag() { return \"中文标签\"; }\n"
+    "    string s = \"中文备注\"; Missing m = null; // 中文尾注 Val\n"
+    "}\n"
+)
 
 OK_URI = "file:///t/Ok.zan"
 BAD_URI = "file:///t/Bad.zan"
 SYN_URI = "file:///t/Syn.zan"
+CJK_URI = "file:///t/Cjk.zan"
 
 
 class Session(object):
@@ -239,6 +256,33 @@ def main():
     msgs = [d["message"] for d in (diag or {}).get("diagnostics", [])]
     if not any("syntax error" in m for m in msgs):
         fail("syntax diagnostics", "expected syntax error, got %r" % (msgs,))
+
+    # CJK UTF-16 列口径：错误 token 在同行 CJK 之后，出站列必须是 UTF-16
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": CJK_URI, "languageId": "zan", "version": 1, "text": SRC_CJK}})
+    diag = s.diag_for(CJK_URI)
+    miss = [d for d in (diag or {}).get("diagnostics", [])
+            if "undefined type 'Missing'" in d.get("message", "")]
+    if not miss:
+        fail("cjk diagnostics", "expected undefined type 'Missing', got %r"
+             % (diag,))
+    want_char = utf16_length('    string s = "中文备注"; ')
+    got = miss[0]["range"]["start"]
+    if got != {"line": 3, "character": want_char}:
+        fail("cjk diagnostics",
+             "expected UTF-16 col %d after CJK, got %r (byte col would be %d)"
+             % (want_char, got, len('    string s = "中文备注"; ')))
+
+    # 入站：hover 词在同行 CJK 注释之后，客户端给 UTF-16 列
+    hover_pos = utf16_length(
+        '    string s = "中文备注"; Missing m = null; // 中文尾注 ')
+    hv = s.request("textDocument/hover", {
+        "textDocument": {"uri": CJK_URI},
+        "position": {"line": 3, "character": hover_pos}}).get("result")
+    hv_text = hv.get("contents", {}).get("value", "") if hv else ""
+    if "Val" not in hv_text or "field" not in hv_text:
+        fail("cjk hover", "expected Val field hover via UTF-16 col, got %r"
+             % (hv,))
 
     # didClose clears diagnostics
     s.notify("textDocument/didClose", {"textDocument": {"uri": SYN_URI}})

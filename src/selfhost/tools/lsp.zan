@@ -17,8 +17,6 @@ namespace Zan;
 /// 已知局限（后续切片收敛，见 TASKS.md B-ID200）：
 /// - 语义诊断是单文档视图：using 指向的外部包/项目内其他文件的类型
 ///   会被报 undefined，尚未做项目级符号解析。
-/// - 行列按 UTF-8 字节口径（与前端 lexer 一致），客户端 UTF-16 口径在
-///   含多字节字符的行上会偏移。
 /// - JSON 只覆盖 LSP 会话实际用到的子集；字符串转义完整处理。
 /// 入口：zanc --lsp 派发 Run()（driver/main.zan）。
 /// </summary>
@@ -172,31 +170,32 @@ public class LspServer {
     // ============================ JSON 层 ============================
     // LSP 会话实际用到的 JSON 子集。字符串扫描全部转义感知（\" \\ 不截断）。
 
-    /// 把字符串编码为 JSON 字符串字面量（含两侧引号）。
     public static string EncodeJsonString(string s) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append('"');
+        // 字节收集 + ToStr 还原：Append(char) 对 ≥0x80 的字节会做
+        // Latin-1→UTF-8 二次编码（char 是码点不是字节），非 ASCII 消息
+        // 出站即成乱码。
+        List<byte> outp = new List<byte>();
+        outp.Add(34);
         int i = 0;
         while (i < s.Length) {
-            char c = s[i];
-            if (c == '"') { sb.Append("\\\""); }
-            else if (c == '\\') { sb.Append("\\\\"); }
-            else if (c == '\n') { sb.Append("\\n"); }
-            else if (c == '\r') { sb.Append("\\r"); }
-            else if (c == '\t') { sb.Append("\\t"); }
-            else if ((int)c < 32) {
-                sb.Append("\\u00");
-                int hi = ((int)c) / 16;
-                int lo = ((int)c) % 16;
-                if (hi < 10) { sb.Append((char)((int)'0' + hi)); }
-                else { sb.Append((char)((int)'a' + hi - 10)); }
-                if (lo < 10) { sb.Append((char)((int)'0' + lo)); }
-                else { sb.Append((char)((int)'a' + lo - 10)); }
-            } else { sb.Append(c); }
+            int c = s[i] & 255;
+            if (c == 34) { outp.Add(92); outp.Add(34); }
+            else if (c == 92) { outp.Add(92); outp.Add(92); }
+            else if (c == 10) { outp.Add(92); outp.Add(110); }
+            else if (c == 13) { outp.Add(92); outp.Add(114); }
+            else if (c == 9) { outp.Add(92); outp.Add(116); }
+            else if (c < 32) {
+                outp.Add(92); outp.Add(117); outp.Add(48); outp.Add(48);
+                int hi = c / 16;
+                int lo = c % 16;
+                outp.Add((byte)(hi < 10 ? 48 + hi : 87 + hi));
+                outp.Add((byte)(lo < 10 ? 48 + lo : 87 + lo));
+            } else { outp.Add((byte)c); }
             i = i + 1;
         }
-        sb.Append('"');
-        return sb.ToString();
+        outp.Add(34);
+        byte[] arr = outp.ToArray();
+        return arr.ToStr(0, arr.Length);
     }
 
     /// s[i] 必须是开引号；返回对应闭引号下标（跳过 \\" 与 \\\\），未闭合 -1。
@@ -277,39 +276,42 @@ public class LspServer {
         return j;
     }
 
-    /// 解码 JSON 字符串值（不含两侧引号的片段）：\\" \\\\ \\/ \b \f \n \r \t
-    /// \uXXXX（含成对代理对）。码点按 UTF-8 编码落进 Zan 字符串（char=字节）。
+    /// 解码 JSON 字符串值（不含两侧引号的片段）：转义序列与 \uXXXX
+    /// （含成对代理对）。按字节收集后 ToStr 还原——Append(char) 对 ≥0x80
+    /// 的字节会二次 UTF-8 编码（同 EncodeJsonString）。
     static string DecodeJsonBody(string s) {
-        StringBuilder sb = new StringBuilder();
+        List<byte> outp = new List<byte>();
         int i = 0;
         while (i < s.Length) {
-            char c = s[i];
-            if (c == '\\' && i + 1 < s.Length) {
-                char n = s[i + 1];
-                if (n == '"') { sb.Append('"'); i = i + 2; }
-                else if (n == '\\') { sb.Append('\\'); i = i + 2; }
-                else if (n == '/') { sb.Append('/'); i = i + 2; }
-                else if (n == 'b') { sb.Append((char)8); i = i + 2; }
-                else if (n == 'f') { sb.Append((char)12); i = i + 2; }
-                else if (n == 'n') { sb.Append('\n'); i = i + 2; }
-                else if (n == 'r') { sb.Append('\r'); i = i + 2; }
-                else if (n == 't') { sb.Append('\t'); i = i + 2; }
-                else if (n == 'u') {
+            int c = s[i] & 255;
+            if (c == 92 && i + 1 < s.Length) {
+                int n = s[i + 1] & 255;
+                if (n == 34) { outp.Add(34); i = i + 2; }
+                else if (n == 92) { outp.Add(92); i = i + 2; }
+                else if (n == 47) { outp.Add(47); i = i + 2; }
+                else if (n == 98) { outp.Add(8); i = i + 2; }
+                else if (n == 102) { outp.Add(12); i = i + 2; }
+                else if (n == 110) { outp.Add(10); i = i + 2; }
+                else if (n == 114) { outp.Add(13); i = i + 2; }
+                else if (n == 116) { outp.Add(9); i = i + 2; }
+                else if (n == 117) {
                     int cp = JsonHex4(s, i + 2);
                     i = i + 6;
-                    if (cp >= 0 && cp >= 0xD800 && cp <= 0xDBFF
-                            && i + 1 < s.Length && s[i] == '\\' && s[i + 1] == 'u') {
+                    if (cp >= 0xD800 && cp <= 0xDBFF
+                            && i + 1 < s.Length && (s[i] & 255) == 92
+                            && (s[i + 1] & 255) == 117) {
                         int lo = JsonHex4(s, i + 2);
                         if (lo >= 0xDC00 && lo <= 0xDFFF) {
                             cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                             i = i + 6;
                         }
                     }
-                    if (cp >= 0) { AppendUtf8(sb, cp); }
-                } else { sb.Append(n); i = i + 2; }
-            } else { sb.Append(c); i = i + 1; }
+                    if (cp >= 0) { AppendUtf8Bytes(outp, cp); }
+                } else { outp.Add((byte)n); i = i + 2; }
+            } else { outp.Add((byte)c); i = i + 1; }
         }
-        return sb.ToString();
+        byte[] arr = outp.ToArray();
+        return arr.ToStr(0, arr.Length);
     }
 
     static int JsonHex4(string s, int at) {
@@ -329,21 +331,21 @@ public class LspServer {
         return v;
     }
 
-    static void AppendUtf8(StringBuilder sb, int cp) {
+    static void AppendUtf8Bytes(List<byte> outp, int cp) {
         if (cp < 0x80) {
-            sb.Append((char)cp);
+            outp.Add((byte)cp);
         } else if (cp < 0x800) {
-            sb.Append((char)(0xC0 + (cp >> 6)));
-            sb.Append((char)(0x80 + (cp & 63)));
+            outp.Add((byte)(0xC0 + (cp >> 6)));
+            outp.Add((byte)(0x80 + (cp & 63)));
         } else if (cp < 0x10000) {
-            sb.Append((char)(0xE0 + (cp >> 12)));
-            sb.Append((char)(0x80 + ((cp >> 6) & 63)));
-            sb.Append((char)(0x80 + (cp & 63)));
+            outp.Add((byte)(0xE0 + (cp >> 12)));
+            outp.Add((byte)(0x80 + ((cp >> 6) & 63)));
+            outp.Add((byte)(0x80 + (cp & 63)));
         } else {
-            sb.Append((char)(0xF0 + (cp >> 18)));
-            sb.Append((char)(0x80 + ((cp >> 12) & 63)));
-            sb.Append((char)(0x80 + ((cp >> 6) & 63)));
-            sb.Append((char)(0x80 + (cp & 63)));
+            outp.Add((byte)(0xF0 + (cp >> 18)));
+            outp.Add((byte)(0x80 + ((cp >> 12) & 63)));
+            outp.Add((byte)(0x80 + ((cp >> 6) & 63)));
+            outp.Add((byte)(0x80 + (cp & 63)));
         }
     }
 
@@ -403,7 +405,7 @@ public class LspServer {
         ck.Check(unit);
         CollectMemberSymbols(uri, unit);
 
-        PublishDiagnostics(uri, version, DiagArray(dg));
+        PublishDiagnostics(uri, version, DiagArray(dg, text));
     }
 
     /// 顶层类型声明位置：前端 ParseClass/ParseInterface/ParseEnum 不回填
@@ -484,24 +486,26 @@ public class LspServer {
     }
 
     /// Diags.items → LSP diagnostics 数组 JSON（行列 1-based → 0-based；
-    /// 列按 UTF-8 字节口径，见头部局限说明）。
-    static string DiagArray(Diags dg) {
+    /// 列出站转 UTF-16 口径，text 为该文档正文）。
+    static string DiagArray(Diags dg, string text) {
         StringBuilder sb = new StringBuilder();
         sb.Append('[');
         int i = 0;
         while (i < dg.items.Count) {
             Diag d = dg.items[i];
             if (i > 0) { sb.Append(','); }
+            int dl = d.line > 0 ? d.line - 1 : 0;
+            int dc = d.col > 0 ? Utf16ColOf(text, dl, d.col - 1) : 0;
             sb.Append("{\"severity\":");
             sb.Append(d.warn ? "2" : "1");
             sb.Append(",\"range\":{\"start\":{\"line\":");
-            sb.Append(d.line > 0 ? d.line - 1 : 0);
+            sb.Append(dl);
             sb.Append(",\"character\":");
-            sb.Append(d.col > 0 ? d.col - 1 : 0);
+            sb.Append(dc);
             sb.Append("},\"end\":{\"line\":");
-            sb.Append(d.line > 0 ? d.line - 1 : 0);
+            sb.Append(dl);
             sb.Append(",\"character\":");
-            sb.Append(d.col > 0 ? d.col : 1);
+            sb.Append(dc + 1);
             sb.Append("}},\"source\":\"zan\",");
             sb.Append("\"message\":");
             sb.Append(EncodeJsonString(d.msg));
@@ -558,6 +562,56 @@ public class LspServer {
         while (e < le - ls && IsWordChar(text[ls + e])) { e = e + 1; }
         if (e <= s) { return ""; }
         return text.Substring(ls + s, e - s);
+    }
+
+    /// 行内字节列（0-based）→ UTF-16 code unit 列（LSP 口径）。
+    /// 每字节序列 1 unit（ASCII/2 字节/3 字节）或 2 units（4 字节代理对），
+    /// 与 C 宿主 lsp_main.c utf8_seq_info 同表。
+    static int Utf16ColOf(string text, int line0, int byteCol0) {
+        if (text == null) { return byteCol0; }
+        int ls = LineStartOf(text, line0);
+        if (ls < 0) { return byteCol0; }
+        int end = ls + byteCol0;
+        if (end > text.Length) { end = text.Length; }
+        int units = 0;
+        int i = ls;
+        while (i < end) {
+            int c = text[i] & 255;
+            if (c >= 240 && i + 3 < text.Length) { i = i + 4; units = units + 2; }
+            else if (c >= 224) { i = i + 3; units = units + 1; }
+            else if (c >= 192 && i + 1 < text.Length) { i = i + 2; units = units + 1; }
+            else { i = i + 1; units = units + 1; }
+        }
+        return units;
+    }
+
+    /// UTF-16 code unit 列（LSP 入站）→ 行内字节列。落在代理对中间
+    /// （units + 2 > 目标）时取该码点起点，与客户端点击语义一致。
+    static int ByteColAt(string text, int line0, int utf16Col) {
+        if (text == null || utf16Col <= 0) { return 0; }
+        int ls = LineStartOf(text, line0);
+        if (ls < 0) { return 0; }
+        int le = ls;
+        while (le < text.Length && text[le] != '\n') { le = le + 1; }
+        int units = 0;
+        int i = ls;
+        while (i < le && units < utf16Col) {
+            int c = text[i] & 255;
+            int step = 1;
+            int u = 1;
+            if (c >= 240 && i + 3 < text.Length) { step = 4; u = 2; }
+            else if (c >= 224) { step = 3; u = 1; }
+            else if (c >= 192 && i + 1 < text.Length) { step = 2; u = 1; }
+            if (units + u > utf16Col) { break; }
+            i = i + step;
+            units = units + u;
+        }
+        return i - ls;
+    }
+
+    /// 符号列转换（目标文档未打开时原样透传字节列）。
+    static int SymColOf(string text, int line0, int byteCol0) {
+        return text != null ? Utf16ColOf(text, line0, byteCol0) : byteCol0;
     }
 
     /// 词边界全文匹配（references 用）：命中处前后都不是词字符。
@@ -626,6 +680,7 @@ public class LspServer {
 
         if (method == "initialize") {
             // 能力如实声明：全量同步 + 诊断 + 补全/悬停/定义/引用/文档符号
+            // 位置口径：UTF-16 code unit（LSP 默认；出入站均在协议边界转换）
             string res = "{\"jsonrpc\":\"2.0\",\"id\":" + (id == "" ? "1" : id) + ",\"result\":{"
                 + "\"capabilities\":{"
                 + "\"textDocumentSync\":1,"
@@ -728,7 +783,8 @@ public class LspServer {
         string prefix = "";
         LspDocument doc = FindDocument(uri);
         if (doc != null && character > 0) {
-            prefix = WordAt(doc.Text, line, character - 1);
+            int bcol = ByteColAt(doc.Text, line, character);
+            if (bcol > 0) { prefix = WordAt(doc.Text, line, bcol - 1); }
         }
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
@@ -813,7 +869,9 @@ public class LspServer {
         int character = ExtractJsonInt(pos, "character", 0);
         string word = "";
         LspDocument doc = FindDocument(uri);
-        if (doc != null) { word = WordAt(doc.Text, line, character); }
+        if (doc != null) {
+            word = WordAt(doc.Text, line, ByteColAt(doc.Text, line, character));
+        }
         if (word.Length == 0) {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
             return;
@@ -856,14 +914,18 @@ public class LspServer {
         int character = ExtractJsonInt(pos, "character", 0);
         string word = "";
         LspDocument doc = FindDocument(uri);
-        if (doc != null) { word = WordAt(doc.Text, line, character); }
+        if (doc != null) {
+            word = WordAt(doc.Text, line, ByteColAt(doc.Text, line, character));
+        }
         LspSymbol sym = word.Length > 0 ? FindSymbol(word) : null;
         if (sym == null) {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
             return;
         }
+        LspDocument tdoc = FindDocument(sym.Uri);
+        int tcol = SymColOf(tdoc != null ? tdoc.Text : null, sym.Line - 1, sym.Col - 1);
         string res = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":"
-            + LocationJson(sym.Uri, sym.Line - 1, sym.Col - 1) + "}";
+            + LocationJson(sym.Uri, sym.Line - 1, tcol) + "}";
         SendResponse(res);
     }
 
@@ -875,7 +937,9 @@ public class LspServer {
         int character = ExtractJsonInt(pos, "character", 0);
         string word = "";
         LspDocument doc = FindDocument(uri);
-        if (doc != null) { word = WordAt(doc.Text, line, character); }
+        if (doc != null) {
+            word = WordAt(doc.Text, line, ByteColAt(doc.Text, line, character));
+        }
         if (word.Length == 0) {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":[]}");
             return;
@@ -888,7 +952,10 @@ public class LspServer {
         bool first = true;
         LspSymbol sym = FindSymbol(word);
         if (sym != null) {
-            sb.Append(LocationJson(sym.Uri, sym.Line - 1, sym.Col - 1));
+            LspDocument tdoc = FindDocument(sym.Uri);
+            int tcol = SymColOf(tdoc != null ? tdoc.Text : null,
+                sym.Line - 1, sym.Col - 1);
+            sb.Append(LocationJson(sym.Uri, sym.Line - 1, tcol));
             first = false;
         }
         EnsureInit();
@@ -904,7 +971,8 @@ public class LspServer {
                         && p.Line == sym.Line - 1 && p.Col == sym.Col - 1)) {
                     if (!first) { sb.Append(','); }
                     first = false;
-                    sb.Append(LocationJson(d.Uri, p.Line, p.Col));
+                    sb.Append(LocationJson(d.Uri, p.Line,
+                        Utf16ColOf(d.Text, p.Line, p.Col)));
                 }
                 i = i + 1;
             }
@@ -924,11 +992,14 @@ public class LspServer {
         sb.Append(id);
         sb.Append(",\"result\":[");
         EnsureInit();
+        LspDocument sdoc = FindDocument(uri);
+        string stext = sdoc != null ? sdoc.Text : null;
         bool first = true;
         int i = 0;
         while (i < symbols.Count) {
             LspSymbol top = symbols[i];
             if (top.Uri != uri || IsMemberKind(top.Kind)) { i = i + 1; continue; }
+            int tc0 = SymColOf(stext, top.Line - 1, top.Col - 1);
             if (!first) { sb.Append(','); }
             first = false;
             sb.Append("{\"name\":");
@@ -936,19 +1007,20 @@ public class LspServer {
             sb.Append(",\"kind\":");
             sb.Append(top.SymbolKind());
             sb.Append(",\"range\":{\"start\":");
-            sb.Append(PosJson(top.Line - 1, top.Col - 1));
+            sb.Append(PosJson(top.Line - 1, tc0));
             sb.Append(",\"end\":");
-            sb.Append(PosJson(top.Line - 1, top.Col - 1));
+            sb.Append(PosJson(top.Line - 1, tc0));
             sb.Append("},\"selectionRange\":{\"start\":");
-            sb.Append(PosJson(top.Line - 1, top.Col - 1));
+            sb.Append(PosJson(top.Line - 1, tc0));
             sb.Append(",\"end\":");
-            sb.Append(PosJson(top.Line - 1, top.Col - 1));
+            sb.Append(PosJson(top.Line - 1, tc0));
             sb.Append("},\"children\":[");
             int j = 0;
             bool mfirst = true;
             while (j < symbols.Count) {
                 LspSymbol m = symbols[j];
                 if (m.Uri == uri && IsMemberKind(m.Kind)) {
+                    int mc0 = SymColOf(stext, m.Line - 1, m.Col - 1);
                     if (!mfirst) { sb.Append(','); }
                     mfirst = false;
                     sb.Append("{\"name\":");
@@ -956,13 +1028,13 @@ public class LspServer {
                     sb.Append(",\"kind\":");
                     sb.Append(m.SymbolKind());
                     sb.Append(",\"range\":{\"start\":");
-                    sb.Append(PosJson(m.Line - 1, m.Col - 1));
+                    sb.Append(PosJson(m.Line - 1, mc0));
                     sb.Append(",\"end\":");
-                    sb.Append(PosJson(m.Line - 1, m.Col - 1));
+                    sb.Append(PosJson(m.Line - 1, mc0));
                     sb.Append("},\"selectionRange\":{\"start\":");
-                    sb.Append(PosJson(m.Line - 1, m.Col - 1));
+                    sb.Append(PosJson(m.Line - 1, mc0));
                     sb.Append(",\"end\":");
-                    sb.Append(PosJson(m.Line - 1, m.Col - 1));
+                    sb.Append(PosJson(m.Line - 1, mc0));
                     sb.Append("}}");
                 }
                 j = j + 1;
@@ -1000,15 +1072,19 @@ public class LspServer {
                 // 读取随后的空行 (\r\n)
                 c = getchar();
                 while (c >= 0 && c != 10) { c = getchar(); }
-                // 读取指定长度的 JSON 请求体
-                string body = "";
+                // 读取指定长度的 JSON 请求体：逐字节入 buf 后 ToStr 还原
+                // UTF-8。不能走 (char)c 再 ToString——char 是码点，
+                // ≥0x80 的字节会被 Latin-1→UTF-8 二次编码（CJK 全坏，
+                // 列口径整体漂移；见 B-ID200 UTF-16 切片）。
+                byte[] buf = new byte[contentLen > 0 ? contentLen : 1];
                 int count = 0;
                 while (count < contentLen) {
                     c = getchar();
                     if (c < 0) { break; }
-                    body = body + Convert.ToString((char)c);
+                    buf[count] = (byte)c;
                     count = count + 1;
                 }
+                string body = buf.ToStr(0, count);
                 if (body.Length > 0) {
                     HandleMessage(body);
                 }
