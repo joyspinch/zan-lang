@@ -848,3 +848,200 @@ public class Process {
         return lines;
     }
 }
+
+/// 活进程管道句柄集：spawn 后子进程 stdin/stdout 保持接线，父进程可随时
+/// 写命令、非阻塞读输出、终止或等待退出。与 CaptureSafe（等子进程死再收
+/// 全部输出）互补，本类面向交互式子进程（REPL、长驻工具）。
+/// Windows-first：POSIX 侧 Spawn 返回 null，管道版为后续切片。
+public class ProcessSpawn {
+    nint hProcess;
+    nint hThread;
+    int pid;
+    nint stdinWrite;   // 子进程 stdin 的父侧写端（子读端已关）
+    nint stdoutRead;   // 子进程 stdout 的父侧读端（子写端已关）
+    bool disposed;
+
+    ProcessSpawn(nint process, nint thread, int processId,
+            nint inWrite, nint outRead) {
+        hProcess = process;
+        hThread = thread;
+        pid = processId;
+        stdinWrite = inWrite;
+        stdoutRead = outRead;
+        disposed = false;
+    }
+
+    // ---- kernel32：仅本类需要的窄面（部分与 Process 内声明同型） ----
+    [DllImport("kernel32", EntryPoint = "CreatePipe")]
+    private static extern int WinCreatePipe(byte[] hRead, byte[] hWrite, byte[] sa, int nSize);
+    [DllImport("kernel32", EntryPoint = "SetHandleInformation")]
+    private static extern int WinSetHandleInformation(nint handle, int mask, int flags);
+    [DllImport("kernel32", EntryPoint = "ReadFile")]
+    private static extern int WinReadFile(nint handle, byte[] buf, int nBytes, byte[] numRead,
+                                  nint overlapped);
+    [DllImport("kernel32", EntryPoint = "WriteFile")]
+    private static extern int WinWriteFile(nint handle, byte[] buf, int nBytes, byte[] numWritten,
+                                   nint overlapped);
+    [DllImport("kernel32", EntryPoint = "PeekNamedPipe")]
+    private static extern int WinPeekNamedPipe(nint handle, nint buf, int bufSize,
+                                       nint numRead, byte[] totalAvail, nint left);
+    [DllImport("kernel32", EntryPoint = "CreateProcessW")]
+    private static extern int WinCreateProcess(nint appName, nint cmdLine, nint pa, nint ta,
+                                       int inherit, int flags, nint env, nint cwd,
+                                       byte[] si, byte[] pi);
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    private static extern int WinWaitForSingleObject(nint handle, int ms);
+    [DllImport("kernel32", EntryPoint = "GetExitCodeProcess")]
+    private static extern int WinGetExitCodeProcess(nint handle, byte[] code);
+    [DllImport("kernel32", EntryPoint = "TerminateProcess")]
+    private static extern int WinTerminateProcess(nint handle, int code);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    private static extern int WinCloseHandle(nint handle);
+
+    private static nint WinHandleAt(byte[] pi, int off) {
+        nint h = 0;
+        nint mul = 1;
+        for (int k = 0; k < 8; k = k + 1) {
+            h = h + (pi[off + k] & 255) * mul;
+            mul = mul * 256;
+        }
+        return h;
+    }
+
+    private static void WinPutHandle(byte[] buf, int off, nint h) {
+        nint v = h;
+        for (int k = 0; k < 8; k = k + 1) {
+            buf[off + k] = (byte)(v % 256);
+            v = v / 256;
+        }
+    }
+
+    private static void WinPutInt(byte[] buf, int off, int v) {
+        buf[off] = (byte)(v & 255);
+        buf[off + 1] = (byte)((v >> 8) & 255);
+        buf[off + 2] = (byte)((v >> 16) & 255);
+        buf[off + 3] = (byte)((v >> 24) & 255);
+    }
+
+    private static int ReadIntLE(byte[] buf, int off) {
+        return buf[off] + buf[off + 1] * 256 + buf[off + 2] * 65536
+            + buf[off + 3] * 16777216;
+    }
+
+    /// 启动子进程并接好 stdin/stdout 管道；失败返回 null。
+    public static ProcessSpawn Spawn(string exe, List<string> args) {
+        #if WINDOWS
+        // 双命名管道：子读端/子写端可继承，父侧两端私有（读端/写端各关
+        // 掉继承位，避免句柄泄漏进孙进程）。
+        byte[] sa = new byte[24];
+        WinPutInt(sa, 0, 24);
+        WinPutInt(sa, 16, 1); // bInheritHandle = TRUE
+        byte[] inReadB = new byte[8];
+        byte[] inWriteB = new byte[8];
+        if (WinCreatePipe(inReadB, inWriteB, sa, 0) == 0) { return null; }
+        byte[] outReadB = new byte[8];
+        byte[] outWriteB = new byte[8];
+        if (WinCreatePipe(outReadB, outWriteB, sa, 0) == 0) {
+            WinCloseHandle(WinHandleAt(inReadB, 0));
+            WinCloseHandle(WinHandleAt(inWriteB, 0));
+            return null;
+        }
+        nint inRead = WinHandleAt(inReadB, 0);
+        nint inWrite = WinHandleAt(inWriteB, 0);
+        nint outRead = WinHandleAt(outReadB, 0);
+        nint outWrite = WinHandleAt(outWriteB, 0);
+        int HANDLE_FLAG_INHERIT = 1;
+        WinSetHandleInformation(inWrite, HANDLE_FLAG_INHERIT, 0);
+        WinSetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0);
+
+        byte[] si = new byte[128];
+        si[0] = 104; // cb
+        int STARTF_USESTDHANDLES = 256;
+        WinPutInt(si, 60, STARTF_USESTDHANDLES);
+        WinPutHandle(si, 80, inRead);   // hStdInput
+        WinPutHandle(si, 88, outWrite); // hStdOutput
+        WinPutHandle(si, 96, outWrite); // hStdError
+
+        byte[] pi = new byte[32];
+        int CREATE_NO_WINDOW = 134217728;
+        string cmdline = Process.BuildCommandLine(exe, args);
+        nint wcmd = Wide.Of(cmdline);
+        int ok = WinCreateProcess(0, wcmd, 0, 0, 1, CREATE_NO_WINDOW, 0, 0, si, pi);
+        Wide.Free(wcmd);
+        // 子侧两端立即关：创建后父进程只持 stdinWrite/stdoutRead
+        WinCloseHandle(inRead);
+        WinCloseHandle(outWrite);
+
+        if (ok == 0) {
+            WinCloseHandle(inWrite);
+            WinCloseHandle(outRead);
+            return null;
+        }
+        return new ProcessSpawn(WinHandleAt(pi, 0), WinHandleAt(pi, 8),
+            ReadIntLE(pi, 16), inWrite, outRead);
+        #else
+        // POSIX 管道版后续切片；显式失败而非假成功
+        return null;
+        #endif
+    }
+
+    /// 子进程 ID（Spawn 成功后有效）。
+    public int Pid() {
+        return pid;
+    }
+
+    /// 非阻塞读取子进程 stdout 当前已就绪的字节；无数据/管道断开返回 ""。
+    public string ReadAvailable() {
+        if (disposed || stdoutRead == 0) { return ""; }
+        byte[] avail = new byte[4];
+        if (WinPeekNamedPipe(stdoutRead, 0, 0, 0, avail, 0) == 0) { return ""; }
+        int n = ReadIntLE(avail, 0);
+        if (n <= 0) { return ""; }
+        byte[] buf = new byte[n];
+        byte[] numRead = new byte[4];
+        if (WinReadFile(stdoutRead, buf, n, numRead, 0) == 0) { return ""; }
+        int got = ReadIntLE(numRead, 0);
+        if (got <= 0) { return ""; }
+        return buf.ToStr(0, got);
+    }
+
+    /// 向子进程 stdin 写一行（UTF-8 字节 + '\n'）；管道断开返回 false。
+    public bool WriteLine(string line) {
+        if (disposed || stdinWrite == 0) { return false; }
+        int len = line.Length;
+        byte[] buf = new byte[len + 1];
+        for (int i = 0; i < len; i = i + 1) {
+            buf[i] = (byte)((int)line[i] & 255);
+        }
+        buf[len] = 10; // '\n'
+        byte[] numWritten = new byte[4];
+        return WinWriteFile(stdinWrite, buf, len + 1, numWritten, 0) != 0;
+    }
+
+    /// 强制终止子进程。
+    public bool Kill() {
+        if (disposed || hProcess == 0) { return false; }
+        return WinTerminateProcess(hProcess, 1) != 0;
+    }
+
+    /// 等待退出并返回退出码；timeoutMs <= 0 表示无限等。超时返回 -258
+    /// （WAIT_TIMEOUT 的显式记号，不代杀；调用方自行 Kill 后再收尸）。
+    public int WaitExitCode(int timeoutMs) {
+        if (disposed || hProcess == 0) { return 0 - 1; }
+        int waitMs = timeoutMs > 0 ? timeoutMs : (0 - 1);
+        if (WinWaitForSingleObject(hProcess, waitMs) == 258) { return 0 - 258; }
+        byte[] cb = new byte[8];
+        WinGetExitCodeProcess(hProcess, cb);
+        return ReadIntLE(cb, 0);
+    }
+
+    /// 关闭全部句柄。之后 Read/Write/Kill 一律失败。
+    public void Dispose() {
+        if (disposed) { return; }
+        disposed = true;
+        if (stdinWrite != 0) { WinCloseHandle(stdinWrite); stdinWrite = 0; }
+        if (stdoutRead != 0) { WinCloseHandle(stdoutRead); stdoutRead = 0; }
+        if (hThread != 0) { WinCloseHandle(hThread); hThread = 0; }
+        if (hProcess != 0) { WinCloseHandle(hProcess); hProcess = 0; }
+    }
+}

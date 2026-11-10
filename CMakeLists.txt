@@ -6975,6 +6975,19 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(tool_lsp_zan_session PROPERTIES TIMEOUT 120)
 endif()
 
+# ---- ProcessSpawn (live-process pipe primitives, B-ID202) ----
+# Interactive: drives cmd.exe over stdin/stdout pipes (echo roundtrip + exit
+# code). POSIX prints the single-line SKIP marker (Windows-first slice).
+add_test(NAME unit_process_spawn
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/unit/process_spawn_case.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/unit/process_spawn.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/unit_process_spawn${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(unit_process_spawn PROPERTIES TIMEOUT 120)
+
 # ---- Test tiers -------------------------------------------------------------
 # The suite is thousands of tests because every conformance program is also
 # built for determinism and leak checking; running all of it for a one-line

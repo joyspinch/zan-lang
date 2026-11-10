@@ -1,0 +1,67 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
+
+/// unit_process_spawn：验证 ProcessSpawn 活进程管道原语。
+/// 交互式驱动 cmd.exe：stdin 写 `echo`，stdout 非阻塞读回，然后 `exit`
+/// 收尸断言退出码 0。POSIX 侧 ProcessSpawn.Spawn 尚未实现（Windows-first），
+/// 按 harness 的 SKIP 约定单行跳过。
+public static class ProcessSpawnCase {
+    static string acc = "";
+
+    /// 轮询读 stdout 直到出现 needle 或超时（50ms x 80 = 4s）。
+    static bool WaitOutput(ProcessSpawn p, string needle) {
+        int polls = 0;
+        while (polls < 80) {
+            acc = acc + p.ReadAvailable();
+            if (acc.Contains(needle)) { return true; }
+            Thread.Sleep(50);
+            polls = polls + 1;
+        }
+        return acc.Contains(needle);
+    }
+
+    static void RunCase() {
+        List<string> args = new List<string>();
+        args.Add("/Q"); // echo off：stdout 只留命令结果，噪音最小
+        ProcessSpawn p = ProcessSpawn.Spawn("cmd.exe", args);
+        if (p == null) {
+            Console.WriteLine("FAIL spawn returned null");
+            return;
+        }
+        if (!p.WriteLine("echo zanspawn_ok")) {
+            Console.WriteLine("FAIL stdin write rejected");
+            p.Dispose();
+            return;
+        }
+        if (!WaitOutput(p, "zanspawn_ok")) {
+            Console.WriteLine("FAIL stdout never contained zanspawn_ok, got: "
+                + acc);
+            p.Kill();
+            p.Dispose();
+            return;
+        }
+        if (!p.WriteLine("exit")) {
+            Console.WriteLine("FAIL exit write rejected");
+            p.Dispose();
+            return;
+        }
+        int code = p.WaitExitCode(10000);
+        if (code != 0) {
+            Console.WriteLine("FAIL exit code " + Convert.ToString(code));
+            p.Dispose();
+            return;
+        }
+        p.Dispose();
+        Console.WriteLine("PASS process_spawn");
+    }
+
+    public static void Main() {
+        #if WINDOWS
+        RunCase();
+        #else
+        Console.WriteLine("SKIP: ProcessSpawn is Windows-first; POSIX pipes are a later slice");
+        #endif
+    }
+}
