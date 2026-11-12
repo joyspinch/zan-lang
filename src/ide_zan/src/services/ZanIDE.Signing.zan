@@ -1,0 +1,158 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+partial class ZanIDE {
+
+    // 获取指定平台证书签名的当前配置概要（用于界面提示与发布日志）
+    public static string SigningSummary(string root, string platform) {
+        if (platform == "android") {
+            string ks = ZanIDE.ProjField(root, "androidKeystore");
+            if (ks != "") {
+                string alias = ZanIDE.ProjField(root, "androidKeyAlias");
+                string aliasInfo = alias != "" ? " (Alias: " + alias + ")" : "";
+                return "[OK] " + ks + aliasInfo;
+            }
+            return ZanIDE.T("(none — default debug.keystore is used)", "（未设置 — 默认使用 Debug 调试证书）");
+        }
+
+        if (platform == "ios") {
+            string cert = ZanIDE.ProjField(root, "iosCert");
+            if (cert != "") {
+                string prof = ZanIDE.ProjField(root, "iosProfile");
+                string profInfo = prof != "" ? " + " + Path.GetFileName(prof) : "";
+                return "[OK] " + cert + profInfo;
+            }
+            return ZanIDE.T("(none — unsigned standard IPA)", "（未设置 — 默认生成未签名 IPA 格式包）");
+        }
+
+        if (platform == "ohos") {
+            string cer = ZanIDE.ProjField(root, "ohosCert");
+            if (cer != "") {
+                string p7b = ZanIDE.ProjField(root, "ohosProfile");
+                string p7bInfo = p7b != "" ? " + " + Path.GetFileName(p7b) : "";
+                return "[OK] " + cer + p7bInfo;
+            }
+            return ZanIDE.T("(none — unsigned HAP debug package)", "（未设置 — 默认生成未签名 HAP 调试包）");
+        }
+
+        if (platform == "windows") {
+            string pfx = ZanIDE.ProjField(root, "windowsCert");
+            if (pfx != "") {
+                return "[OK] " + pfx;
+            }
+            return ZanIDE.T("(none — unsigned binary)", "（未设置 — 默认不进行 Authenticode 代码签名）");
+        }
+
+        return "";
+    }
+
+    // 为指定平台配置证书与签名凭据并持久化写入 zan.proj
+    public static void SetSigningConfig(string root, string platform, string cert, string profile, string keyPass, string keyAlias) {
+        if (platform == "android") {
+            if (cert != null) { ZanIDE.SetProjField(root, "androidKeystore", cert); }
+            if (keyPass != null) { ZanIDE.SetProjField(root, "androidKeyPass", keyPass); }
+            if (keyAlias != null) { ZanIDE.SetProjField(root, "androidKeyAlias", keyAlias); }
+        } else if (platform == "ios") {
+            if (cert != null) { ZanIDE.SetProjField(root, "iosCert", cert); }
+            if (profile != null) { ZanIDE.SetProjField(root, "iosProfile", profile); }
+        } else if (platform == "ohos") {
+            if (cert != null) { ZanIDE.SetProjField(root, "ohosCert", cert); }
+            if (profile != null) { ZanIDE.SetProjField(root, "ohosProfile", profile); }
+            if (keyPass != null) { ZanIDE.SetProjField(root, "ohosKeyPass", keyPass); }
+            if (keyAlias != null) { ZanIDE.SetProjField(root, "ohosKeyAlias", keyAlias); }
+        } else if (platform == "windows") {
+            if (cert != null) { ZanIDE.SetProjField(root, "windowsCert", cert); }
+            if (keyPass != null) { ZanIDE.SetProjField(root, "windowsCertPass", keyPass); }
+        }
+    }
+
+    // 生成发布编译命令行前缀或附带环境变量（未配置证书时安全降级，不中断编译）
+    public static string SigningEnvPrefix(string root, string platform, List<string> log) {
+        if (platform == "android") {
+            string ks = ZanIDE.ProjField(root, "androidKeystore");
+            if (ks == "") {
+                if (log != null) {
+                    log.Add(ZanIDE.T("> Android signing: default debug keystore (no custom keystore configured).",
+                                     "> Android 签名：使用默认调试证书（未配置商用证书）。"));
+                }
+                return "";
+            }
+            string fullKs = ks;
+            if (!File.Exists(fullKs) && root != "") { fullKs = root + "/" + ks; }
+            string ksPass = ZanIDE.ProjField(root, "androidKeyPass");
+            string ksAlias = ZanIDE.ProjField(root, "androidKeyAlias");
+            if (log != null) {
+                log.Add(ZanIDE.T("> Android signing: commercial keystore (" + ks + ").",
+                                 "> Android 签名：已启用商用证书（" + ks + "）。"));
+            }
+            #if WINDOWS
+            string env = "set \"ZAN_ANDROID_KEYSTORE=" + ZanIDE.ToWinPath(fullKs) + "\" && ";
+            if (ksPass != "") { env = env + "set \"ZAN_ANDROID_KEYSTORE_PASS=" + ksPass + "\" && "; }
+            if (ksAlias != "") { env = env + "set \"ZAN_ANDROID_KEY_ALIAS=" + ksAlias + "\" && "; }
+            return env;
+            #else
+            string env = "ZAN_ANDROID_KEYSTORE=\"" + fullKs + "\" ";
+            if (ksPass != "") { env = env + "ZAN_ANDROID_KEYSTORE_PASS=\"" + ksPass + "\" "; }
+            if (ksAlias != "") { env = env + "ZAN_ANDROID_KEY_ALIAS=\"" + ksAlias + "\" "; }
+            return env;
+            #endif
+        }
+
+        if (platform == "ios") {
+            string cert = ZanIDE.ProjField(root, "iosCert");
+            if (cert == "") {
+                if (log != null) {
+                    log.Add(ZanIDE.T("> iOS signing: none (unsigned standard IPA).",
+                                     "> iOS 签名：无（生成标准未签名 IPA 格式包）。"));
+                }
+                return "";
+            }
+            string prof = ZanIDE.ProjField(root, "iosProfile");
+            if (log != null) {
+                log.Add(ZanIDE.T("> iOS signing: developer certificate (" + cert + ").",
+                                 "> iOS 签名：已启用开发者证书（" + cert + "）。"));
+            }
+            #if WINDOWS
+            string env = "set \"ZAN_IOS_CERT=" + cert + "\" && ";
+            if (prof != "") { env = env + "set \"ZAN_IOS_PROFILE=" + ZanIDE.ToWinPath(prof) + "\" && "; }
+            return env;
+            #else
+            string env = "ZAN_IOS_CERT=\"" + cert + "\" ";
+            if (prof != "") { env = env + "ZAN_IOS_PROFILE=\"" + prof + "\" "; }
+            return env;
+            #endif
+        }
+
+        if (platform == "ohos") {
+            string cer = ZanIDE.ProjField(root, "ohosCert");
+            if (cer == "") {
+                if (log != null) {
+                    log.Add(ZanIDE.T("> HarmonyOS signing: none (unsigned HAP debug package).",
+                                     "> 鸿蒙签名：无（生成未签名 HAP 调试包）。"));
+                }
+                return "";
+            }
+            string p7b = ZanIDE.ProjField(root, "ohosProfile");
+            string fullP7b = p7b;
+            if (p7b != "" && !File.Exists(fullP7b) && root != "") { fullP7b = root + "/" + p7b; }
+            string fullCer = cer;
+            if (!File.Exists(fullCer) && root != "") { fullCer = root + "/" + cer; }
+            if (log != null) {
+                log.Add(ZanIDE.T("> HarmonyOS signing: commercial certificate (" + cer + ").",
+                                 "> 鸿蒙签名：已启用商用证书（" + cer + "）。"));
+            }
+            #if WINDOWS
+            string env = "set \"ZAN_OHOS_CERT=" + ZanIDE.ToWinPath(fullCer) + "\" && ";
+            if (fullP7b != "") { env = env + "set \"ZAN_OHOS_PROFILE=" + ZanIDE.ToWinPath(fullP7b) + "\" && "; }
+            return env;
+            #else
+            string env = "ZAN_OHOS_CERT=\"" + fullCer + "\" ";
+            if (fullP7b != "") { env = env + "ZAN_OHOS_PROFILE=\"" + fullP7b + "\" "; }
+            return env;
+            #endif
+        }
+
+        return "";
+    }
+}

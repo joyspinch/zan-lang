@@ -12,7 +12,8 @@ public class MarketplaceClient {
     static string savePath;
     static int operation;
     static SseSink sink;
-    static SseSink workerSink;
+    static List<long> workers;
+    static bool closing;
 
     static int FindByte(string s, int b, int from) {
         for (int i = from; i < s.Length; i = i + 1) {
@@ -89,37 +90,37 @@ public class MarketplaceClient {
         return policy;
     }
 
-    static void Worker() {
+    static async void Worker(SseSink target, HttpClient client, string requestPath,
+        int op, string targetPath) {
         Socket.Initialize();
         string result = "";
         try {
-            HttpClient cli;
-            if (MarketplaceClient.tls) {
-                cli = HttpClient.CreateHttps(MarketplaceClient.host,
-                    MarketplaceClient.port);
-            } else {
-                cli = new HttpClient(MarketplaceClient.host,
-                    MarketplaceClient.port);
-            }
-            cli.SetCallPolicy(MarketplaceClient.CallPolicy());
-            cli.SetTimeout(15000);
-            result = await cli.GetAsync(MarketplaceClient.path);
-            if (MarketplaceClient.operation == 3 && result != "") {
-                File.WriteAllText(MarketplaceClient.savePath, result);
-                result = "saved:" + MarketplaceClient.savePath;
+            result = await client.GetAsync(requestPath);
+            if (op == 3 && result != "") {
+                File.WriteAllText(targetPath, result);
+                result = "saved:" + targetPath;
             }
         } catch (Exception ex) {
-            MarketplaceClient.workerSink.Publish("err:" + ex.Message);
+            target.Publish("err:" + ex.Message);
             return;
         }
         if (result == "") {
-            MarketplaceClient.workerSink.Publish("err:empty response");
+            target.Publish("err:empty response");
             return;
         }
-        MarketplaceClient.workerSink.Publish("ok:" + result);
+        target.Publish("ok:" + result);
+    }
+
+    static void BeginShutdown() { MarketplaceClient.closing = true; }
+
+    static async void DrainAsync() {
+        MarketplaceClient.BeginShutdown();
+        if (MarketplaceClient.workers != null) { await Task.WhenAll(MarketplaceClient.workers); }
+        MarketplaceClient.sink = null;
     }
 
     static string Start(int op, string suffix, string targetPath) {
+        if (MarketplaceClient.closing) { return "IDE is closing"; }
         if (MarketplaceClient.sink != null
             && MarketplaceClient.sink.Done() == "") {
             return "request already running";
@@ -129,11 +130,17 @@ public class MarketplaceClient {
         MarketplaceClient.SetUrl(MarketplaceClient.BaseUrl() + suffix);
         SseSink s = SseSink.ToMemory();
         MarketplaceClient.sink = s;
-        MarketplaceClient.workerSink = s;
-        if (!Thread.Start(MarketplaceClient.Worker)) {
-            MarketplaceClient.sink = null;
-            return "could not start marketplace request";
+        HttpClient client;
+        if (MarketplaceClient.tls) {
+            client = HttpClient.CreateHttps(MarketplaceClient.host, MarketplaceClient.port);
+        } else {
+            client = new HttpClient(MarketplaceClient.host, MarketplaceClient.port);
         }
+        client.SetCallPolicy(MarketplaceClient.CallPolicy());
+        client.SetTimeout(15000);
+        if (MarketplaceClient.workers == null) { MarketplaceClient.workers = new List<long>(); }
+        long worker = Task.Run(MarketplaceClient.Worker(s, client, MarketplaceClient.path, op, targetPath));
+        MarketplaceClient.workers.Add(worker);
         return "";
     }
 

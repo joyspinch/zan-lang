@@ -3,14 +3,18 @@ using Gui;
 using Gui.Widget;
 using Gui.Component;
 
-// 本测试通过 Open 连接假服务器，Start 的 IDE 路径依赖不参与测试。
+// 路径由测试指定；实际解析、启动与协议逻辑使用真实 LspSession。
 class ZanIDE {
-    static string ToolchainDir() { return ""; }
-    static string ExeDir() { return ""; }
-    static string ExeSuffix() { return ""; }
+    static string toolchainDir = "";
+    static string baseDir = "";
+    static string exeDir = "";
+    static string suffix = "";
+    static string ToolchainDir() { return ZanIDE.toolchainDir; }
+    static string BaseDir() { return ZanIDE.baseDir; }
+    static string ExeDir() { return ZanIDE.exeDir; }
+    static string ExeSuffix() { return ZanIDE.suffix; }
 
-    // LspSession 的启动器读 ZAN_IDE_LSP_EXE 覆盖项；测试客户端只直连
-    // Open()，用不到它，但编译期符号必须在。
+    // 严格覆盖仍从当前进程环境读取。
     [DllImport("crt")]
     static extern string getenv(string name);
 }
@@ -37,7 +41,7 @@ class IdleProbe {
 
 class Program {
     static void Assert(bool condition, string message) {
-        if (!condition) { Console.WriteLine("FAIL: " + message); Environment.Exit(1); }
+        if (!condition) { throw new InvalidOperationException("FAIL: " + message); }
     }
 
     static void AwaitCompletion(LspSession session, CodeEditor editor, string label) {
@@ -206,13 +210,45 @@ class Program {
             "resource operation rejected");
     }
 
+    static void ResolveExecutable(string[] args) {
+        LspStartReport report = new LspStartReport();
+        report.detail = "";
+        string resolved = LspSession.ResolveExecutable(args[1], args[2], args[3], args[4], args[5], report);
+        Assert(resolved == args[6], "executable selection: " + resolved);
+        Assert(report.detail == args[7], "executable search diagnostic: " + report.detail);
+        Assert(report.code == Convert.ToInt32(args[8]), "executable resolution status");
+        Assert(report.attempts == 0, "resolution does not spawn a server");
+        Console.WriteLine("PASS LspSession executable resolution");
+    }
+
     static void RealServer(int port, string workspace) {
         LspSession session = null;
-        for (int retry = 0; retry < 100 && session == null; retry = retry + 1) {
-            session = LspSession.Open(port, workspace);
-            if (session == null) { System.Threading.Thread.Sleep(20); }
+        if (port == 0) {
+            LspStartReport report = new LspStartReport();
+            session = LspSession.Start(workspace, report);
+            Assert(session != null, "natural server discovery: " + report.detail);
+            Assert(report.attempts > 0, "natural server startup report");
+        } else {
+            for (int retry = 0; retry < 100 && session == null; retry = retry + 1) {
+                session = LspSession.Open(port, workspace);
+                if (session == null) { System.Threading.Thread.Sleep(20); }
+            }
         }
         Assert(session != null, "real server initialize");
+        if (port == 0) {
+            string fault = ZanIDE.getenv("ZAN_LSP_TEST_FAULT");
+            if (fault == "timeout" || fault == "exit") {
+                System.IO.File.WriteAllText(workspace + "/fault-ready", fault);
+            }
+            if (fault == "exit") { Environment.Exit(23); }
+            if (fault == "timeout") { for (;;) { System.Threading.Thread.Sleep(100); } }
+        }
+        try { Program.CheckRealServer(session, workspace); }
+        finally { session.Shutdown(); }
+        Console.WriteLine("PASS real CodeEditor LspSession zan-lsp");
+    }
+
+    static void CheckRealServer(LspSession session, string workspace) {
         CodeEditor editor = new CodeEditor();
         editor.documentPath = workspace + "/unsaved.zan";
         string source = "class RealBox {\n    public string Multi\n        (int value) { return \"ok\"; }\n}\n"
@@ -248,11 +284,17 @@ Assert(definition != null && definition.line == 0 && definition.column == source
         Assert(edits != null && edits.Count == 2, "real WorkspaceEdit parsed");
         LspEditApplication renamed = LspSession.ApplyTextEdits(source, edits, editor.documentPath);
         Assert(renamed.valid && renamed.text == source.Replace("value", "renamed"), "real rename applies server ranges");
-        session.Shutdown();
-        Console.WriteLine("PASS real CodeEditor LspSession zan-lsp");
     }
 
     static void Main(string[] args) {
+        if (args[0] == "resolve") { Program.ResolveExecutable(args); return; }
+        if (args[0] == "start") {
+            ZanIDE.toolchainDir = args[2]; ZanIDE.baseDir = args[3];
+            ZanIDE.exeDir = args[4]; ZanIDE.suffix = args[5];
+            Program.RealServer(0, args[1]);
+            Console.WriteLine("PASS LspSession natural SDK sibling discovery");
+            return;
+        }
         Program.NavigationParsing();
         int port = Convert.ToInt32(args[0]);
         if (args.Length > 1 && args[1] == "idle") { Program.Idle(port); return; }

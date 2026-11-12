@@ -1,0 +1,74 @@
+using System;
+using System.Net.External;
+using System.Security.Cryptography;
+
+// Pure marketplace protocol rules; trusted key material is supplied independently by the caller.
+public class MarketplaceProtocol {
+    public static bool SafeName(string name) {
+        if (name == "" || name.StartsWith(".") || name.Contains("..")) { return false; }
+        for (int i = 0; i < name.Length; i = i + 1) {
+            int c = name[i] & 255;
+            if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || (c >= 48 && c <= 57) || c == 45 || c == 46 || c == 95)) { return false; }
+        }
+        return true;
+    }
+
+    public static bool SafeVersion(string value) {
+        if (value == "" || value.Length > 128) { return false; }
+        return MarketplaceProtocol.SafeName(value.Replace("+", "-"));
+    }
+
+    public static bool ValidSha256(string sha) {
+        if (sha.Length != 64) { return false; }
+        for (int i = 0; i < sha.Length; i = i + 1) {
+            int c = sha[i] & 255;
+            if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) { return false; }
+        }
+        return true;
+    }
+
+    public static bool ValidUrl(string url) {
+        ExternalTarget target = ExternalTarget.Parse(url);
+        if (target == null) { return false; }
+        return ExternalTargetPolicy.IsAllowedTarget(target, true, true);
+    }
+
+    // Absolute HTTPS survives unchanged; HTTP is restricted to loopback.
+    public static string ResolveUrl(string url, string baseUrl) {
+        if (url == "" || url.StartsWith("//") || url.Contains("\\")) { return ""; }
+        if (url.IndexOf(":") >= 0 && !url.StartsWith("https://")
+            && !url.StartsWith("http://")) { return ""; }
+        string resolved = url;
+        if (!url.StartsWith("https://") && !url.StartsWith("http://")) {
+            string origin = baseUrl;
+            if (!MarketplaceProtocol.ValidUrl(origin)) { return ""; }
+            resolved = origin + (url.StartsWith("/") ? "" : "/") + url;
+        }
+        return MarketplaceProtocol.ValidUrl(resolved) ? resolved : "";
+    }
+
+    public static string BrowserUrl(MarketplacePackage package, string baseUrl) {
+        string url = package.IsFree() ? package.productUrl : package.purchaseUrl;
+        if (url == "") { url = package.productUrl; }
+        if (url == "") {
+            if (package.id == "") { return ""; }
+            for (int i = 0; i < package.id.Length; i = i + 1) {
+                if (package.id[i] < 48 || package.id[i] > 57) { return ""; }
+            }
+            url = "/mall/product?id=" + package.id;
+        }
+        return MarketplaceProtocol.ResolveUrl(url, baseUrl);
+    }
+    public static string SignedMessage(string slug, string version, string sha) {
+        return slug + "\n" + version + "\n" + sha;
+    }
+
+    public static bool VerifySignature(string trustedPem, string slug, string version,
+        string sha, string signature) {
+        if (!MarketplaceProtocol.SafeName(slug) || !MarketplaceProtocol.SafeVersion(version)
+            || !MarketplaceProtocol.ValidSha256(sha) || signature == "") { return false; }
+        return TrustedRsaKeys.VerifyBase64(TrustedRsaKeys.FromPemBundle(trustedPem),
+            MarketplaceProtocol.SignedMessage(slug, version, sha), signature);
+    }
+}

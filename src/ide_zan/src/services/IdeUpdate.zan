@@ -3,10 +3,12 @@ using System.Json;
 using System.Net.Http.Client;
 using System.Net.External;
 using System.Net.Sockets;
+using AppUpdate;
 
 public class IdeUpdate {
     static SseSink sink;
-    static SseSink workerSink;
+    static List<long> workers;
+    static bool closing;
     static int pending;
     static int channel;
     static string host;
@@ -93,24 +95,43 @@ public class IdeUpdate {
         return policy;
     }
 
-    static void Worker() {
+    // Request state and result ownership belong to this task across await.
+    // Shutdown joins the task before static fields can be released.
+    static async void RequestWorker(SseSink target, HttpClient client,
+        string requestPath, string body, bool post) {
         Socket.Initialize();
         string result = "";
         try {
-            HttpClient cli;
-            if (IdeUpdate.tls) {
-                cli = HttpClient.CreateHttps(IdeUpdate.host, IdeUpdate.port);
-            } else {
-                cli = new HttpClient(IdeUpdate.host, IdeUpdate.port);
-            }
-            cli.SetCallPolicy(IdeUpdate.CallPolicy());
-            cli.SetTimeout(15000);
-            result = await cli.GetAsync(IdeUpdate.path);
+            if (post) { result = await client.PostAsync(requestPath, body); }
+            else { result = await client.GetAsync(requestPath); }
         } catch (Exception ex) {
-            IdeUpdate.workerSink.Publish("err:" + ex.Message);
+            target.Publish("err:" + ex.Message);
             return;
         }
-        IdeUpdate.workerSink.Publish("ok:" + result);
+        target.Publish("ok:" + result);
+    }
+
+    static void StartRequest(SseSink target, string body, bool post) {
+        HttpClient client;
+        if (IdeUpdate.tls) {
+            client = HttpClient.CreateHttps(IdeUpdate.host, IdeUpdate.port);
+        } else {
+            client = new HttpClient(IdeUpdate.host, IdeUpdate.port);
+        }
+        client.SetCallPolicy(IdeUpdate.CallPolicy());
+        client.SetTimeout(15000);
+        if (IdeUpdate.workers == null) { IdeUpdate.workers = new List<long>(); }
+        long worker = Task.Run(IdeUpdate.RequestWorker(target, client, IdeUpdate.path, body, post));
+        IdeUpdate.workers.Add(worker);
+    }
+
+    static void BeginShutdown() { IdeUpdate.closing = true; }
+
+    static async void DrainAsync() {
+        IdeUpdate.BeginShutdown();
+        if (IdeUpdate.workers != null) { await Task.WhenAll(IdeUpdate.workers); }
+        IdeUpdate.pending = 0;
+        IdeUpdate.sink = null;
     }
 
     // 启动时对三条发布线各发一次检查；已在跑则忽略。
@@ -128,25 +149,21 @@ public class IdeUpdate {
     }
 
     static void Check(int ch) {
+        if (IdeUpdate.closing) { return; }
         if (IdeUpdate.sink != null && IdeUpdate.sink.Done() == "") {
             return;  // 一次只飞一个请求；结果到了再排下一条线
         }
         IdeUpdate.channel = ch;
         IdeUpdate.pending = ch;
         string current = IdeUpdate.CurrentVersion(ch);
-        string clientId = "ide-" + ProcessHost.Env("COMPUTERNAME")
-            + "-" + IdeVersion.Number();
+        string clientId = "ide-" + ProcessHost.Env("COMPUTERNAME");
         string url = IdeUpdate.BaseUrl() + "/api/channel/check?channel="
             + IdeUpdate.ChannelName(ch) + "&platform=" + IdeUpdate.Platform()
             + "&current=" + current + "&client_id=" + clientId;
         IdeUpdate.SetUrl(url);
         SseSink s = SseSink.ToMemory();
         IdeUpdate.sink = s;
-        IdeUpdate.workerSink = s;
-        if (!Thread.Start(IdeUpdate.Worker)) {
-            IdeUpdate.sink = null;
-            IdeUpdate.pending = 0;
-        }
+        IdeUpdate.StartRequest(s, "", false);
     }
 
     static string Platform() {
@@ -164,6 +181,7 @@ public class IdeUpdate {
 
     // UI 每帧调用：请求完成时解析并排下一条线。
     static void Poll() {
+        if (IdeUpdate.closing) { return; }
         if (IdeUpdate.pending == 0) { return; }
         if (IdeUpdate.sink == null) { IdeUpdate.pending = 0; return; }
         string done = IdeUpdate.sink.Done();
@@ -226,20 +244,15 @@ public class IdeUpdate {
         return "";
     }
 
-    /* ---- 增量同步面（清单比对，IdeFileSync 执行面在其上落盘） ----
-     * 客户端把 {path: md5} 发给 /api/channel/sync，服务端回
-     * {total, match, download:[{path,md5,size}]}；本地不在服务端清单
-     * 的文件（服务端已移除）由客户端对照 files 全集自行删除。 */
+    // Sync metadata is verified as a typed signed manifest before staging.
     static IdeSyncPlan syncPlan;
 
     // 最近一次增量比对的计划（null = 尚未比对或远端无清单）。
     static IdeSyncPlan SyncPlan() { return IdeUpdate.syncPlan; }
 
-    // 同步 ide 频道：paths/md5s 为本地安装目录的平行清单（扫描方产出，
-    // StrMap 无键枚举故用平行 List）。返回 "" = 已发起后台比对；
-    // 非空 = 未发起的原因。未比对的本地文件 = 全量清单请求由服务端
-    // 处理（client 空 = 全量）。
-    static string BeginSync(List<string> paths, List<string> md5s) {
+    // Local inventory is typed; the response must name the signed target release.
+    static string BeginSync(List<UpdateFileEntry> files) {
+        if (IdeUpdate.closing) { return "IDE is closing"; }
         if (IdeUpdate.sink != null && IdeUpdate.sink.Done() == "") {
             return "another channel request is running";
         }
@@ -248,13 +261,15 @@ public class IdeUpdate {
         w.StartObject();
         w.WriteProperty("channel", "ide");
         w.WriteProperty("platform", IdeUpdate.Platform());
-        w.WriteProperty("version", IdeVersion.Number());
-        if (paths != null) {
+        // Empty version selects the channel pointer, including a historical rollback.
+        w.WriteProperty("version", "");
+        w.WriteProperty("current", IdeVersion.Number());
+        w.WriteProperty("client_id", "ide-" + ProcessHost.Env("COMPUTERNAME"));
+        if (files != null) {
             w.WriteKey("client");
             w.StartObject();
-            for (int i = 0; i < paths.Count; i = i + 1) {
-                string hash = i < md5s.Count ? md5s[i] : "";
-                w.WriteProperty(paths[i], hash);
+            for (int i = 0; i < files.Count; i = i + 1) {
+                w.WriteProperty(files[i].path, files[i].sha256);
             }
             w.EndObject();
         }
@@ -263,39 +278,13 @@ public class IdeUpdate {
         IdeUpdate.SetUrl(IdeUpdate.BaseUrl() + "/api/channel/sync");
         SseSink s = SseSink.ToMemory();
         IdeUpdate.sink = s;
-        IdeUpdate.workerSink = s;
         IdeUpdate.pending = 9;  // sync 阶段
-        if (!Thread.Start(IdeUpdate.SyncWorker)) {
-            IdeUpdate.sink = null;
-            IdeUpdate.pending = 0;
-            return "could not start sync request";
-        }
+        IdeUpdate.StartRequest(s, IdeUpdate.syncBody, true);
         return "";
     }
 
     // sync 请求体（BeginSync 装好，SyncWorker 读走）。
     static string syncBody;
-
-    static void SyncWorker() {
-        string body = IdeUpdate.syncBody;
-        Socket.Initialize();
-        string result = "";
-        try {
-            HttpClient cli;
-            if (IdeUpdate.tls) {
-                cli = HttpClient.CreateHttps(IdeUpdate.host, IdeUpdate.port);
-            } else {
-                cli = new HttpClient(IdeUpdate.host, IdeUpdate.port);
-            }
-            cli.SetCallPolicy(IdeUpdate.CallPolicy());
-            cli.SetTimeout(15000);
-            result = await cli.PostAsync(IdeUpdate.path, body);
-        } catch (Exception ex) {
-            IdeUpdate.workerSink.Publish("err:" + ex.Message);
-            return;
-        }
-        IdeUpdate.workerSink.Publish("ok:" + result);
-    }
 
     // Poll 看到 pending==9 时走这里：解析差异为计划。
     static void PollSync(string done) {

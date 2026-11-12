@@ -13,6 +13,7 @@ using Gui.Backend;
 partial class ZanIDE {
     IdeJobMonitor jobMonitor;
     IdeJobSnapshot jobSnapshot;
+    IdeJobSnapshot marketplaceResumeContext;
     int jobSerial;
     int jobMonitorEpoch;
     int jobAiSession;
@@ -105,9 +106,24 @@ partial class ZanIDE {
             }
         }
         if (input.debug || dbg != null) { input.watches = IdeJobMonitor.CopyVars(dbgWatches); }
+        // Recovery keeps the original build/debug/AI context even if a tab changed.
+        IdeJobSnapshot resume = marketplaceResumeContext;
+        if (input.build && resume != null) {
+            input.root = resume.root;
+            input.session = resume.session;
+            input.aiBuild = resume.aiBuild;
+            input.aiUiPending = resume.aiUiPending;
+            input.aiUiScript = resume.aiUiScript;
+            input.uiTool = resume.uiTool;
+            if (resume.debug) {
+                input.breakpoints = resume.breakpoints;
+                input.debugText = resume.debugText;
+                input.watches = resume.watches;
+            }
+        }
         input.ui = aiUiRunning;
         input.uiDeadline = aiUiDeadline;
-        input.uiTool = aiUiTool;
+        input.uiTool = input.build && resume != null ? resume.uiTool : aiUiTool;
         input.uiSeq = prev != null ? prev.uiSeq : 0;
         if (input.ui && (prev == null || !prev.ui || prev.uiDeadline != input.uiDeadline)) { input.uiSeq = ++jobSerial; }
         input.pub = pubBusy;
@@ -143,8 +159,18 @@ partial class ZanIDE {
             && a.aiLaunchSeq == b.aiLaunchSeq;
     }
 
-    void BeginBuildJob(string target, bool thenRun, bool debug = false, bool hot = false) {
+    void BeginBuildJob(string target, bool thenRun, bool debug = false, bool hot = false,
+        IdeJobSnapshot resume = null) {
         if (buildBusy || pubBusy || shuttingDown) { return; }
+        if (resume == null) {
+            this.FinishMarketplaceRecovery(false);
+            this.ClearMarketplaceRecovery();
+            marketplaceRecoveryAttempted = false;
+            marketplaceSdkRestored = new List<string>();
+            lastAutoRestoredPackage = "";
+        }
+        marketplaceResumeContext = resume;
+        marketplaceBuildHot = hot;
         this.StartJobMonitor();
         if (jobMonitor == null) { return; }
         buildBusy = true;
@@ -389,6 +415,7 @@ partial class ZanIDE {
         }
         buildLogLen = result.consumed;
         if (!result.complete) { return; }
+        marketplaceResumeContext = null;
         buildBusy = false;
         if (result.timeout) {
             dbgBuildPending = false;
@@ -405,6 +432,48 @@ partial class ZanIDE {
             editor.SetCompilerDiagnostics(result.diagnostics);
             if (result.diagnostics.Count > 0) {
                 log.Add("> " + Convert.ToString(result.diagnostics.Count) + " error(s) in this file; jumped to the first.");
+            }
+        }
+        // Resolve missing namespaces before finalizing debug/AI failure handling.
+        if (!result.ok && result.missingPackage != null && result.missingPackage != ""
+            && !marketplaceRecoveryAttempted) {
+            string missingNs = result.missingPackage;
+            string pkgName = AiAgent.FindPackageForNamespace(missingNs);
+            string target = result.target != null && result.target != ""
+                ? result.target : result.input.buildTarget;
+            string projRoot = ZanIDE.TargetRoot(result.input.root, target);
+            if (pkgName != "" && AiAgent.HasPackage(pkgName)) {
+                if (marketplaceSdkRestored == null) { marketplaceSdkRestored = new List<string>(); }
+                if (marketplaceSdkRestored.Contains(pkgName)) {
+                    marketplaceRecoveryAttempted = true;
+                } else {
+                    marketplaceSdkRestored.Add(pkgName);
+                    lastAutoRestoredPackage = pkgName;
+                    log.Add(ZanIDE.T("> Auto-restoring SDK package: ", "> 正在恢复 SDK 依赖包：") + pkgName);
+                    string installed = AiAgent.PkgInstall(projRoot, pkgName);
+                    if (installed.IndexOf("error:") < 0) {
+                        this.BeginBuildJob(target, result.input.thenRun, result.input.debug,
+                            marketplaceBuildHot, result.input);
+                        return;
+                    }
+                    log.Add(ZanIDE.T("> Auto-restore failed: ", "> 自动补齐失败：") + installed);
+                    marketplaceRecoveryAttempted = true;
+                }
+            } else {
+                marketplaceRecoveryAttempted = true;
+                marketplaceRetryBuild = true;
+                marketplaceFailedBuild = result;
+                marketplaceMissingNamespace = missingNs;
+                marketplacePendingHot = marketplaceBuildHot;
+                marketplaceInstallPackage = "";
+                marketplaceInstallPending = false;
+                marketplaceLocated = false;
+                if (marketplaceWin == null || !marketplaceWin.IsOpen()) {
+                    marketplaceWin = MarketplaceWindow.Open(app, ZanIDE.uiLang);
+                }
+                log.Add(ZanIDE.T("> Locate missing namespace in Extensions: ",
+                    "> 正在扩展中心定位缺失命名空间：") + missingNs);
+                return;
             }
         }
         if (dbgBuildPending) {
@@ -426,29 +495,6 @@ partial class ZanIDE {
                 }
             }
         } else if (!result.ok) {
-            if (result.missingPackage != null && result.missingPackage != "") {
-                string missingNs = result.missingPackage;
-                string pkgName = AiAgent.FindPackageForNamespace(missingNs);
-                if (pkgName == "") { pkgName = "Zan." + missingNs; }
-                string projRoot = ZanIDE.TargetRoot(documentWorkspace, buildTargetPath);
-                if (AiAgent.HasPackage(pkgName) && lastAutoRestoredPackage != pkgName) {
-                    lastAutoRestoredPackage = pkgName;
-                    log.Add(ZanIDE.T("> Detected missing package, auto-restoring: ", "> 检测到缺失依赖包，正在自动补齐：")
-                        + pkgName + " (" + missingNs + ")...");
-                    string installRes = AiAgent.PkgInstall(projRoot, pkgName);
-                    if (installRes.IndexOf("error:") < 0) {
-                        log.Add(ZanIDE.T("> Package installed successfully. Retrying build...", "> 依赖包安装成功，正在重新构建..."));
-                        this.BeginBuildJob(buildTargetPath, buildThenRun, dbgBuildPending);
-                        return;
-                    } else {
-                        log.Add(ZanIDE.T("> Auto-restore failed: ", "> 自动补齐失败：") + installRes);
-                    }
-                } else {
-                    log.Add(ZanIDE.T("> Missing package: ", "> 缺少依赖包：") + pkgName
-                        + " [" + missingNs + "]"
-                        + ZanIDE.T(" (install it from Extensions)", "（可到「扩展」中心搜索安装）"));
-                }
-            }
             lastAutoRestoredPackage = "";
             log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
             dock.Focus("errors");

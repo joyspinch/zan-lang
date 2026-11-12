@@ -79,22 +79,112 @@ partial class ZanIDE {
         }
     }
 
+    void ClearMarketplaceRecovery() {
+        marketplaceRetryBuild = false;
+        marketplaceFailedBuild = null;
+        marketplaceMissingNamespace = "";
+        marketplaceInstallPackage = "";
+        marketplaceInstallPending = false;
+        marketplaceLocated = false;
+    }
+
+    bool MarketplaceContextCurrent() {
+        IdeJobResult failed = marketplaceFailedBuild;
+        if (failed == null || failed.input == null || shuttingDown) { return false; }
+        bool sameRoot = root == failed.input.root
+            || ZanIDE.SamePath(root, failed.input.root);
+        return documentWorkspace == failed.input.workspace
+            && jobMonitorEpoch == failed.input.monitor
+            && sameRoot
+            && (!failed.input.aiBuild || this.IsJobAiSessionCurrent(failed.input));
+    }
+
+    void FinishMarketplaceRecovery(bool installed) {
+        if (!marketplaceRetryBuild) { return; }
+        IdeJobResult failed = marketplaceFailedBuild;
+        bool current = this.MarketplaceContextCurrent();
+        bool hot = marketplacePendingHot;
+        this.ClearMarketplaceRecovery();
+        if (!current || failed == null) { return; }
+        // Consume the pending build before dispatch. A failed retry cannot reopen recovery.
+        if (installed && !buildBusy && !pubBusy) {
+            string target = failed.target != null && failed.target != ""
+                ? failed.target : failed.input.buildTarget;
+            aiBuildForAi = failed.input.aiBuild;
+            aiUiPending = failed.input.aiUiPending;
+            aiUiScript = failed.input.aiUiScript;
+            aiUiTool = failed.input.uiTool;
+            log.Add(ZanIDE.T("> Package installed; retrying the original build once.",
+                "> 依赖已安装，正在重试原构建（一次）。"));
+            this.BeginBuildJob(target, failed.input.thenRun, failed.input.debug,
+                hot, failed.input);
+        } else {
+            // Preserve the existing debug/AI failure completion path, with no new build.
+            this.ApplyBuildJobResult(failed);
+        }
+    }
+
+    void LocateMarketplaceNamespace() {
+        if (!marketplaceRetryBuild || marketplaceLocated) { return; }
+        MarketplaceCatalog cat = MarketplaceCatalog.current;
+        if (cat == null || cat.Loading()) { return; }
+        marketplaceLocated = true;
+        List<MarketplacePackage> packages = cat.Packages();
+        int best = -1;
+        int length = 0;
+        bool ambiguous = false;
+        for (int i = 0; i < packages.Count; i = i + 1) {
+            int match = packages[i].NamespaceMatchLength(marketplaceMissingNamespace);
+            if (match > length) { best = i; length = match; ambiguous = false; }
+            else if (match > 0 && match == length) { ambiguous = true; }
+        }
+        if (best >= 0 && !ambiguous) {
+            cat.Select(packages[best]);
+            cat.selectedRow = best;
+        } else {
+            cat.status = ambiguous
+                ? ZanIDE.T("Multiple extensions provide this namespace: ", "多个扩展提供此命名空间：")
+                    + marketplaceMissingNamespace
+                : ZanIDE.T("Namespace is not listed in Extensions: ", "扩展中心未收录命名空间：")
+                    + marketplaceMissingNamespace;
+            log.Add("> " + cat.status);
+        }
+        marketplaceWin.RequestRedraw();
+    }
+
     void PumpMarketplaceWindow() {
+        if (marketplaceRetryBuild && !this.MarketplaceContextCurrent()) {
+            this.ClearMarketplaceRecovery();
+        }
         if (marketplaceWin == null) { return; }
+        this.LocateMarketplaceNamespace();
         MarketplacePackage package = marketplaceWin.TakeInstall();
         if (package != null) {
             // 真正的安装交给执行器（下载→校验→解包→入包仓库），在
             // 后台线程里跑；这里只把意图交出去并展示"已在安装"。
-            string err = MarketplaceInstall.Start(package);
+            bool recover = marketplaceRetryBuild && this.MarketplaceContextCurrent()
+                && package.Provides(marketplaceMissingNamespace);
+            string projectRoot = haveProject ? root : "";
+            if (recover) {
+                IdeJobResult failed = marketplaceFailedBuild;
+                string target = failed.target != null && failed.target != ""
+                    ? failed.target : failed.input.buildTarget;
+                projectRoot = ZanIDE.TargetRoot(failed.input.root, target);
+            }
+            string err = MarketplaceInstall.Start(package, projectRoot);
             if (err.Length > 0) {
                 log.Add(ZanIDE.T("> Cannot install ", "> 无法安装：") + err);
+                if (recover) { this.FinishMarketplaceRecovery(false); }
             } else {
+                marketplaceInstallPending = recover;
+                marketplaceInstallPackage = recover ? package.packageName : "";
                 log.Add(ZanIDE.T("> Installing ", "> 正在安装：")
                     + package.packageName + "...");
             }
             marketplaceWin.RequestRedraw();
             app.RequestRedraw();
         } else if (marketplaceWin.TakeClose() || !marketplaceWin.IsOpen()) {
+            this.FinishMarketplaceRecovery(false);
             marketplaceWin.Close();
             marketplaceWin = null;
             app.RequestRedraw();

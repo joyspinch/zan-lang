@@ -96,6 +96,31 @@ partial class AiAgent {
                 ret = "requirement card written (.zan/requirement.md).";
                 return;
             }
+            if (tool == "signing_config") {
+                string act = v.Str(0, "action", "get");
+                string plat = v.Str(0, "platform", "");
+                if (act == "set") {
+                    string cert = v.Str(0, "cert", "");
+                    string prof = v.Str(0, "profile", "");
+                    string pass = v.Str(0, "key_pass", "");
+                    string alias = v.Str(0, "key_alias", "");
+                    ZanIDE.SetSigningConfig(root, plat, cert, prof, pass, alias);
+                    ret = "signing configuration updated for platform '" + plat + "': "
+                        + ZanIDE.SigningSummary(root, plat);
+                    return;
+                }
+                if (plat != "") {
+                    ret = plat + " signing: " + ZanIDE.SigningSummary(root, plat);
+                    return;
+                }
+                string summary = "Platform Signing Configuration:\n"
+                    + "  - Android   : " + ZanIDE.SigningSummary(root, "android") + "\n"
+                    + "  - iOS       : " + ZanIDE.SigningSummary(root, "ios") + "\n"
+                    + "  - HarmonyOS : " + ZanIDE.SigningSummary(root, "ohos") + "\n"
+                    + "  - Windows   : " + ZanIDE.SigningSummary(root, "windows");
+                ret = summary;
+                return;
+            }
             if (tool == "write_file") {
                 ret = AiAgent.WriteFile(root, v.Str(0, "path", ""),
                                          v.Str(0, "content", ""));
@@ -202,7 +227,13 @@ partial class AiAgent {
         int max = limit;
         if (max < 1) { max = 1; }
         if (max > 600) { max = 600; }
-        string raw = File.ReadAllText(full);
+        string raw = "";
+        StagedFile sfRead = AiStaging.Get(path);
+        if (sfRead != null && !sfRead.accepted) {
+            raw = sfRead.stagedText;
+        } else {
+            raw = File.ReadAllText(full);
+        }
         if (AiAgent.LooksBinary(raw)) {
             return "error: this is a binary file (not text); skipping " + path + ".";
         }
@@ -460,14 +491,10 @@ partial class AiAgent {
     static string WriteFile(string root, string path, string content) {
         string full = AiAgent.SafePath(root, path);
         if (full == "") { return "error: path outside the project: " + path; }
-        string dir = ZanIDE.DirOf(full);
-        if (dir != "" && dir != "." && !Directory.Exists(dir)) {
-            Directory.CreateDirectoryRecursive(dir);
-        }
-        File.WriteAllText(full, content);
+        StagedFile sf = AiStaging.Stage(root, path, content);
         List<string> lines = ZanIDE.Lines(content);
-        return "wrote " + path + " (" + Convert.ToString(lines.Count)
-            + " lines, " + Convert.ToString(content.Length) + " chars)";
+        return "staged " + path + " (" + Convert.ToString(lines.Count)
+            + " lines; +" + Convert.ToString(sf.adds) + " -" + Convert.ToString(sf.dels) + ", pending review)";
     }
 
     static string EditFile(string root, string path, string oldS, string newS) {
@@ -476,12 +503,18 @@ partial class AiAgent {
         }
         string full = AiAgent.SafePath(root, path);
         if (full == "") { return "error: path outside the project: " + path; }
-        if (!File.Exists(full)) { return "error: no such file: " + path; }
-        if (File.GetSize(full) > AiAgent.MaxFileBytes()) {
-            return "error: file too large to edit (" + Convert.ToString(File.GetSize(full))
-                + " bytes); this tool only edits source-sized text files.";
+        string body = "";
+        StagedFile existing = AiStaging.Get(path);
+        if (existing != null && !existing.accepted) {
+            body = existing.stagedText;
+        } else {
+            if (!File.Exists(full)) { return "error: no such file: " + path; }
+            if (File.GetSize(full) > AiAgent.MaxFileBytes()) {
+                return "error: file too large to edit (" + Convert.ToString(File.GetSize(full))
+                    + " bytes); this tool only edits source-sized text files.";
+            }
+            body = File.ReadAllText(full);
         }
-        string body = File.ReadAllText(full);
         int first = ZanIDE.IndexOfStr(body, oldS);
         if (first < 0) {
             return "error: 'old' text not found in " + path
@@ -494,9 +527,9 @@ partial class AiAgent {
                 + "; include more surrounding lines so the match is unique.";
         }
         string updated = body.Substring(0, first) + newS + rest;
-        File.WriteAllText(full, updated);
-        return "edited " + path + " (replaced 1 occurrence, now "
-            + Convert.ToString(updated.Length) + " chars)";
+        StagedFile sf = AiStaging.Stage(root, path, updated);
+        return "staged edit on " + path + " (replaced 1 occurrence; +"
+            + Convert.ToString(sf.adds) + " -" + Convert.ToString(sf.dels) + ", pending review)";
     }
 
     static string BuildResult(List<string> lines, bool ok, bool ran) {

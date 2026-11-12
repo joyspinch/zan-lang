@@ -1,88 +1,68 @@
 using System;
+using System.IO;
+using System.Diagnostics;
 using System.Json;
-using System.Net.Http.Client;
-using System.Net.External;
-using System.Net.Sockets;
+using System.Text;
+using System.Security.Cryptography;
+using AppUpdate;
 
 public class IdeSyncPlan {
-    List<IdeDownloadItem> items;
-    long downloadBytes;
+    UpdateManifest manifest;
+    string release;
     int matchCount;
-    string error;
+    string error = "invalid sync response";
 
     static IdeSyncPlan Parse(string done) {
         IdeSyncPlan plan = new IdeSyncPlan();
-        plan.items = new List<IdeDownloadItem>();
-        plan.error = "";
-        if (done.Length > 4 && done.Substring(0, 4) == "err:") {
-            plan.error = done.Substring(4, done.Length - 4);
-            return plan;
-        }
-        if (done.Length < 3 || done.Substring(0, 3) != "ok:") {
-            plan.error = "invalid sync response";
-            return plan;
-        }
+        if (done.StartsWith("err:")) { plan.error = done.Substring(4); return plan; }
+        if (!done.StartsWith("ok:")) { return plan; }
         try {
-            string json = done.Substring(3, done.Length - 3);
-            JsonDoc.ParseScoped(json, doc => {
-                int root = doc.root;
-                if (doc.KindAt(root) != 5 || doc.Str(root, "code", "") != "0000") {
-                    plan.error = "sync rejected";
-                    return;
-                }
-                int data = doc.Get(root, "data");
-                if (data < 0 || doc.KindAt(data) != 5) { return; }
-                int downloads = doc.Get(data, "download");
-                if (downloads >= 0 && doc.KindAt(downloads) == 4) {
-                    int child = doc.FirstChild(downloads);
-                    while (child >= 0) {
-                        if (doc.KindAt(child) == 5) {
-                            string p = doc.Str(child, "path", "");
-                            string m = doc.Str(child, "md5", "");
-                            long s = IdeSyncPlan.ParseLong(doc.Str(child, "size", "0"));
-                            plan.items.Add(new IdeDownloadItem(p, m, s));
-                            plan.downloadBytes = plan.downloadBytes + s;
-                        }
-                        child = doc.NextSibling(child);
-                    }
-                }
-                plan.matchCount = (int)doc.Long(data, "match", 0L);
-            });
-        } catch (Exception) {
-            plan.error = "sync rejected";
-            return plan;
-        }
+            JsonDoc doc = JsonDoc.Parse(done.Substring(3));
+            if (doc == null || doc.KindAt(doc.root) != 5) { return plan; }
+            string code = doc.Str(doc.root, "code", "");
+            if (code != "0" && code != "0000") { plan.error = "sync rejected"; return plan; }
+            int data = doc.Get(doc.root, "data");
+            if (data < 0 || doc.KindAt(data) != 5) { return plan; }
+            int signed = doc.Get(data, "manifest");
+            if (signed < 0 || doc.KindAt(signed) != 5) { return plan; }
+            UpdateManifest manifest = UpdateManifest.Parse(doc.ToJson(signed));
+            if (!IdeSyncPlan.Trusted(manifest)) { plan.error = "untrusted update manifest"; return plan; }
+            string release = AppUpdater.HashBytes(Encoding.UTF8.GetBytes(manifest.ToJson()));
+            if (doc.Str(data, "release", "") != release) { plan.error = "release binding mismatch"; return plan; }
+            plan.manifest = manifest;
+            plan.release = release;
+            plan.matchCount = (int)doc.Long(data, "match", 0L);
+            plan.error = "";
+        } catch (Exception ex) { plan.error = "invalid sync response"; }
         return plan;
     }
 
-    // 无依赖的十进制解析（IDE 不编 System.Web 的 Filter）。
-    static long ParseLong(string s) {
-        long v = 0;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            int c = s[i] & 255;
-            if (c < 48 || c > 57) { break; }
-            v = v * 10 + c - 48;
-        }
-        return v;
+    // The pin is provisioned with the installed IDE. No key from the remote
+    // manifest or mall response can establish update trust.
+    static bool ConfigureSigner() {
+        string path = ProcessHost.Env("ZAN_UPDATE_PUBLIC_KEYSET_FILE");
+        if (path.Length == 0) { path = ProcessHost.Env("ZAN_UPDATE_PUBLIC_KEY_FILE"); }
+        AppUpdater.SetTrustedSigner("", "");
+        if (path.Length == 0 || !File.Exists(path) || File.GetSize64(path) > 16384) { return false; }
+        try {
+            return AppUpdater.SetTrustedSignerPemBundle(File.ReadAllText(path));
+        } catch (Exception ex) { return false; }
     }
 
-    List<IdeDownloadItem> Items() { return items; }
-    List<string> DownloadPaths() {
-        List<string> paths = new List<string>();
-        for (int i = 0; i < items.Count; i = i + 1) {
-            paths.Add(items[i].Path());
-        }
-        return paths;
+    static bool Trusted(UpdateManifest manifest) {
+        return IdeSyncPlan.TrustedFor(manifest, "ide", IdeUpdate.PlatformOf());
     }
-    List<string> DownloadMd5s() {
-        List<string> md5s = new List<string>();
-        for (int i = 0; i < items.Count; i = i + 1) {
-            md5s.Add(items[i].Md5());
-        }
-        return md5s;
+
+    static bool TrustedFor(UpdateManifest manifest, string channel, string platform) {
+        if (manifest == null || manifest.appName != "zan-channel/" + channel + "/" + platform) { return false; }
+        if (!IdeSyncPlan.ConfigureSigner()) { return false; }
+        return AppUpdater.VerifyManifestSignature(manifest, null);
     }
-    long DownloadBytes() { return downloadBytes; }
-    int MatchCount() { return matchCount; }
-    string Error() { return error; }
-    bool Ok() { return error == ""; }
+
+    UpdateManifest Manifest() { return this.manifest; }
+    string Release() { return this.release; }
+    long DownloadBytes() { return this.manifest != null ? this.manifest.packageSize : 0L; }
+    int MatchCount() { return this.matchCount; }
+    string Error() { return this.error; }
+    bool Ok() { return this.error == "" && this.manifest != null; }
 }

@@ -1,5 +1,6 @@
 using System;
 using System.Json;
+using AppUpdate;
 
 // 版本频道检查的客户端侧结果：一次 GET /api/channel/check 的解析产物。
 // update_available = 灰度内且远端比本地新；update_required = 低于安全线
@@ -31,7 +32,8 @@ public class IdeUpdateInfo {
         try {
             JsonDoc.ParseScoped(body, doc => {
                 int root = doc.root;
-                if (doc.KindAt(root) != 5 || doc.Str(root, "code", "") != "0000") {
+                string code = doc.Str(root, "code", "");
+                if (doc.KindAt(root) != 5 || (code != "0" && code != "0000")) {
                     info.error = "invalid channel response";
                     return;
                 }
@@ -41,13 +43,21 @@ public class IdeUpdateInfo {
                     return;
                 }
                 info.platform = doc.Str(data, "platform", "");
-                info.latest = doc.Str(data, "latest", "");
-                info.updateAvailable = doc.Long(data, "update_available", 0L) == 1L;
-                info.updateRequired = doc.Long(data, "update_required", 0L) == 1L;
-                info.installerUrl = doc.Str(data, "installer_url", "");
-                info.sha256 = doc.Str(data, "sha256", "");
-                info.signature = doc.Str(data, "signature", "");
-                info.releaseNotes = doc.Str(data, "release_notes", "");
+                int signed = doc.Get(data, "manifest");
+                UpdateManifest manifest = signed >= 0 ? UpdateManifest.Parse(doc.ToJson(signed)) : null;
+                if (!IdeSyncPlan.TrustedFor(manifest, channel, info.platform)
+                    || info.platform != IdeUpdate.PlatformOf()
+                    || manifest.version != doc.Str(data, "latest", "")) {
+                    info.error = "untrusted channel manifest";
+                    return;
+                }
+                info.latest = manifest.version;
+                info.updateAvailable = doc.Bool(data, "update_available", false);
+                info.updateRequired = doc.Bool(data, "update_required", false);
+                info.installerUrl = manifest.packageUrl;
+                info.sha256 = manifest.packageSha256;
+                info.signature = manifest.Signature();
+                info.releaseNotes = manifest.changelog;
             });
         } catch (Exception) {
             info.error = "invalid channel response";

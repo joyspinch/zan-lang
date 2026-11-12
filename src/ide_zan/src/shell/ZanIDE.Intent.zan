@@ -1,0 +1,176 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+partial class ZanIDE {
+    // 派发全局意图与快捷命令 (Ctrl+K)
+    public void DispatchIntentCommand(string raw) {
+        if (raw == null) { return; }
+        string text = raw.Trim();
+        if (text.Length == 0) { return; }
+
+        if (text.StartsWith(">")) {
+            text = text.Substring(1).Trim();
+        }
+        string lower = text.ToLower();
+
+        // 1. 直达动作匹配
+        if (lower == "run" || lower == "r" || lower == "运行") {
+            this.RunRibbonCommand(app, 4);
+            return;
+        }
+        if (lower == "debug" || lower == "d" || lower == "调试") {
+            this.RunRibbonCommand(app, 7);
+            return;
+        }
+        if (lower == "publish" || lower == "pub" || lower == "发布") {
+            this.RunRibbonCommand(app, 6);
+            return;
+        }
+        if (lower == "hot" || lower == "热重载") {
+            this.RunRibbonCommand(app, 11);
+            return;
+        }
+        if (lower == "save" || lower == "s" || lower == "保存") {
+            this.RunRibbonCommand(app, 3);
+            return;
+        }
+        if (lower == "format" || lower == "fmt" || lower == "格式化") {
+            ZanIDE.FormatDocument(editor, log);
+            Layer.Msg(ZanIDE.T("Formatted document", "已格式化当前文档"), 2);
+            app.RequestRedraw();
+            return;
+        }
+        if (lower == "new" || lower == "新建") {
+            this.RunRibbonCommand(app, 1);
+            return;
+        }
+        if (lower == "open" || lower == "打开") {
+            this.RunRibbonCommand(app, 2);
+            return;
+        }
+        if (lower == "folder" || lower == "打开项目") {
+            this.RunRibbonCommand(app, 16);
+            return;
+        }
+        if (lower == "agent" || lower == "ai" || lower == "智能体") {
+            this.ToggleAgent();
+            return;
+        }
+        if (lower == "diff" || lower == "差异" || lower == "审查") {
+            List<StagedFile> pending = AiStaging.All();
+            if (pending.Count > 0) {
+                string firstPath = pending[0].path;
+                ZanIDE.OpenPath(tabs, activeTab, "@diff:" + firstPath, "Diff: " + Path.GetFileName(firstPath));
+            } else {
+                log.Add(ZanIDE.T("> [Diff] No pending staged changes to review.", "> [差异] 没有待审阅的文件变更。"));
+                Layer.Msg(ZanIDE.T("No pending diffs", "没有待审阅的文件变更"), 2);
+            }
+            app.RequestRedraw();
+            return;
+        }
+        if (lower == "cert" || lower == "signing" || lower == "证书" || lower == "签名") {
+            log.Add("---- " + ZanIDE.T("Project Digital Signing Status", "工程各大平台数字证书签名状态") + " ----");
+            log.Add("  Android: " + ZanIDE.SigningSummary(root, "android"));
+            log.Add("  iOS:     " + ZanIDE.SigningSummary(root, "ios"));
+            log.Add("  OHOS:    " + ZanIDE.SigningSummary(root, "ohos"));
+            log.Add("  Windows: " + ZanIDE.SigningSummary(root, "windows"));
+            dock.Focus("output");
+            Layer.Msg(ZanIDE.T("Signing status printed to Output", "证书状态已输出到控制台"), 2);
+            app.RequestRedraw();
+            return;
+        }
+        if (lower == "header" || lower == "compact" || lower == "ribbon" || lower == "精简" || lower == "功能区") {
+            this.compactHeader = !this.compactHeader;
+            log.Add(ZanIDE.T("> Compact header: ", "> 极简紧凑工作面：") + (this.compactHeader ? "ON" : "OFF"));
+            ZanIDE.WriteEditorPrefs(this.edThemeIdx, this.edFontPx, this.compactHeader);
+            app.RequestRedraw();
+            return;
+        }
+        if (lower == "git") {
+            dock.Focus("git");
+            app.RequestRedraw();
+            return;
+        }
+        if (lower == "terminal" || lower == "终端") {
+            dock.Focus("terminal");
+            app.RequestRedraw();
+            return;
+        }
+        if (lower == "output" || lower == "输出") {
+            dock.Focus("output");
+            app.RequestRedraw();
+            return;
+        }
+        if (lower == "errors" || lower == "错误") {
+            dock.Focus("errors");
+            app.RequestRedraw();
+            return;
+        }
+
+        // 2. 意图直达：未能直接识别为内置简略指令的，全量路由给 AI Agent
+        if (!this.AgentOn()) {
+            this.ToggleAgent();
+        }
+        dock.Focus("agent");
+        this.PostAgentPrompt(text);
+        log.Add("> [Agent Intent] " + text);
+        Layer.Msg(ZanIDE.T("Agent intent submitted…", "意图已提交给智能体…"), 2);
+        app.RequestRedraw();
+    }
+
+    // 派发行内智能体代码协作 (Ctrl+I)
+    public void DispatchInlineAgentEdit(string raw) {
+        if (raw == null) { return; }
+        string text = raw.Trim();
+        if (text.Length == 0) { return; }
+
+        int act = activeTab.Get();
+        if (act < 0 || act >= tabs.Count || tabs[act].path.StartsWith("@")) {
+            Layer.Msg(ZanIDE.T("Please open a source file first", "请先在编辑器中打开源文件"), 2);
+            return;
+        }
+
+        string targetPath = tabs[act].path;
+        string sel = "";
+        int curLine = editor.CurLine() + 1;
+        string locDesc = "line " + Convert.ToString(curLine);
+
+        if (editor.HasSelection()) {
+            sel = editor.GetSelectedText();
+            locDesc = "selection around line " + Convert.ToString(curLine);
+        } else {
+            sel = editor.LineAt(editor.CurLine());
+        }
+
+        string prompt = "【行内代码编辑请求】\n"
+            + "目标文件: " + targetPath + " (" + locDesc + ")\n"
+            + "用户需求: " + text + "\n"
+            + "待修改或参照的代码:\n"
+            + "```zan\n" + sel + "\n```\n"
+            + "请使用 edit_file 或 write_file 工具提出变更（变更将被暂存至差异审阅沙箱）。";
+
+        if (!this.AgentOn()) {
+            this.ToggleAgent();
+        }
+        dock.Focus("agent");
+        this.PostAgentPrompt(prompt);
+        log.Add("> [Inline Agent] " + targetPath + " (" + locDesc + "): " + text);
+        Layer.Msg(ZanIDE.T("Inline agent edit requested…", "行内编辑已提交，等待差异审阅…"), 2);
+        app.RequestRedraw();
+    }
+
+    // 向 AI 智能体提交提示语并触发流式推理
+    public void PostAgentPrompt(string prompt) {
+        if (aiPanel != null && prompt != null && prompt.Trim().Length > 0) {
+            TextArea box = aiPanel.PromptBox();
+            if (box != null) {
+                box.SetText(prompt.Trim());
+                ZanIDE.AiSendClicked();
+            }
+        }
+    }
+}

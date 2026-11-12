@@ -130,6 +130,7 @@ partial class ZanIDE {
             sceneMode = false;
         }
 
+        if (sceneDesigner != null) { sceneDesigner.SetInspectorVisible(sceneMode); }
         this.HandleFrameHotkeys(kind);
         app.PerfMark("sh.input");
 
@@ -143,6 +144,9 @@ partial class ZanIDE {
         string installDone = MarketplaceInstall.Poll();
         if (installDone.Length > 0) {
             log.Add(installDone);
+            if (marketplaceInstallPending && marketplaceInstallPackage == MarketplaceInstall.packageName) {
+                this.FinishMarketplaceRecovery(MarketplaceInstall.LastSucceeded());
+            }
             app.RequestRedraw();
         }
         // 增量更新执行面：比对计划落地后接管下载/暂存，结果一行进日志。
@@ -211,7 +215,7 @@ partial class ZanIDE {
             savedW = W * 100 / dscale;
             savedH = H * 100 / dscale;
             int top = app.titlebarH;
-            int ribbonH = Ribbon.HeightTabbed(app);
+            int ribbonH = compactHeader ? app.Scale(34) : Ribbon.HeightTabbed(app);
             int sbH = app.Scale(22);
 
             int atE = activeTab.Get();
@@ -229,12 +233,30 @@ partial class ZanIDE {
             } else {
                 dock.ClearSwitches();
             }
-            // 每个大区域在自己的即时模式 id 段里绘制（见 App.BeginIdScope）：
-            // 某个面板这一帧多画 / 少画一个控件，不会把其他区域的 id 推着走，
-            // 点击也就不会落到别的控件上。功能区的画与点都在
-            // RenderAndRunRibbon 里（见 ZanIDE.Ribbon）。
-            this.RenderAndRunRibbon(app, 0, top, W, ribbonTabs, ribbonTab,
-                ribbonGroups, ribbonActions, dock);
+            if (compactHeader) {
+                if (compactHeaderView == null) { compactHeaderView = new CompactHeader(); }
+                string curProj = haveProject ? Path.GetFileName(root) : "";
+                compactHeaderView.SyncState(curProj, canRun, haveProj, this.AgentOn());
+                compactHeaderView.RenderInside(app, new Rect(0, top, W, ribbonH));
+                int chAct = compactHeaderView.TakeAction();
+                if (chAct == 10) {
+                    findMode = 10;
+                    app.RequestRedraw();
+                } else if (chAct == 99) {
+                    compactHeader = false;
+                    ZanIDE.WriteEditorPrefs(edThemeIdx, edFontPx, compactHeader);
+                    app.RequestRedraw();
+                } else if (chAct > 0) {
+                    this.RunRibbonCommand(app, chAct);
+                }
+            } else {
+                // 每个大区域在自己的即时模式 id 段里绘制（见 App.BeginIdScope）：
+                // 某个面板这一帧多画 / 少画一个控件，不会把其他区域的 id 推着走，
+                // 点击也就不会落到别的控件上。功能区的画与点都在
+                // RenderAndRunRibbon 里（见 ZanIDE.Ribbon）。
+                this.RenderAndRunRibbon(app, 0, top, W, ribbonTabs, ribbonTab,
+                    ribbonGroups, ribbonActions, dock);
+            }
 
             // 调试工具条（正在调试时）：按钮由 views/DebugToolbar.html
             // 声明，这里只把它给出的动作接到调试会话上。
@@ -330,7 +352,7 @@ partial class ZanIDE {
             editorTabs.TakeChanged();
             int tabH = editorTabs.HeaderHeight(app);
             app.BeginIdScope("ide_editor_tabs");
-            editorTabs.Render(app, ea.x, ea.y, ea.width);
+            editorTabs.RenderInside(app, new Rect(ea.x, ea.y, ea.width, tabH));
             app.EndIdScope();
             app.PerfMark("sh.tabs");
             int ctxTab = editorTabs.TakeContext();
@@ -361,6 +383,7 @@ partial class ZanIDE {
             Rect edRect = new Rect(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
             bool activeIsStart = (act >= 0 && act < tabs.Count && tabs[act].path == "@start");
             bool activeIsDocs = (act >= 0 && act < tabs.Count && tabs[act].path == "@docs");
+            bool activeIsDiff = (act >= 0 && act < tabs.Count && tabs[act].path != null && tabs[act].path.StartsWith("@diff:"));
 
             // 设计 | 代码 标签条（WinForms 同款）：窗体/场景设计稿的活动
             // 文档在编辑区左上角挂两个标签，独占一行，内容整体下移。
@@ -484,6 +507,38 @@ partial class ZanIDE {
                                 app.RequestRedraw();
                             }
                         }
+                    }
+                }
+            } else if (activeIsDiff) {
+                if (diffView != null) {
+                    diffView.BindPath(tabs[act].path);
+                    diffView.RenderInside(app, edRect);
+                    int dact = diffView.TakeAction();
+                    if (dact == 1) {
+                        string dpath = diffView.CurrentPath();
+                        AiStaging.Accept(root, dpath);
+                        log.Add(ZanIDE.T("> Accepted AI changes: " + dpath, "> 已接受并落盘 AI 修改: " + dpath));
+                        string fullP = AiStaging.ResolveFullPath(root, dpath);
+                        int tabIdx = ZanIDE.FindTabByPath(tabs, fullP);
+                        if (tabIdx < 0) { tabIdx = ZanIDE.FindTabByPath(tabs, dpath); }
+                        if (tabIdx >= 0 && tabIdx < tabs.Count) {
+                            if (File.Exists(fullP)) {
+                                tabs[tabIdx].body = File.ReadAllText(fullP);
+                                tabs[tabIdx].preparedBody = "";
+                                tabs[tabIdx].preparedText = null;
+                            }
+                        }
+                        diffView.BindPath(tabs[act].path);
+                        app.RequestRedraw();
+                    } else if (dact == 2) {
+                        string dpath = diffView.CurrentPath();
+                        AiStaging.Reject(dpath);
+                        log.Add(ZanIDE.T("> Discarded AI changes: " + dpath, "> 已丢弃 AI 修改: " + dpath));
+                        tabs.RemoveAt(act);
+                        if (act >= tabs.Count) { act = tabs.Count - 1; }
+                        activeTab.Set(act);
+                        lastActive = 0 - 1;
+                        app.RequestRedraw();
                     }
                 }
             } else if (activeIsDocs) {
@@ -749,7 +804,7 @@ partial class ZanIDE {
             if (lspNow == 3) { statusBar.SetColor(sbLspItem, t.warning); }
             else if (lspNow == 2) { statusBar.SetColor(sbLspItem, sbText); }
             else { statusBar.SetColor(sbLspItem, sbMuted); }
-            statusBar.RenderAt(app, 0, sbY, W, sbH);
+            statusBar.RenderInside(app, new Rect(0, sbY, W, sbH));
             app.PerfMark("sh.status");
             // 语言服务状态项的命中区：点一下 = 重连语言服务。
             app.PushId("LspStatus");

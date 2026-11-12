@@ -1,298 +1,239 @@
 using System;
 using System.IO;
 using System.Json;
+using System.Net.Http;
 using System.Net.Http.Client;
 using System.Net.External;
 using System.Net.Sockets;
-using System.Security.Cryptography;
+using AppUpdate;
 
-// IDE 工具链的增量更新执行面：把 IdeUpdate 的"比对"变成
-// "落盘"。老版本 IDE 的可执行文件可能正被占用（Windows 锁着运行中的
-// exe），所以所有新文件先下进待应用目录 <UserConfigDir>/pending-sync/，
-// 下一次启动时再原子替换进安装目录——本进程启动早期文件还没被打开，
-// 可以安全覆盖；zanc.exe 这类也会在下一拍构建时重新生成。
-// 流程（IdeFileSync.Start 发起，后台线程执行，IdeFileSync.Poll 收）：
-// 1. 扫描安装目录（BaseDir）全部文件，逐个 md5，得到本地清单；
-// 2. IdeUpdate.BeginSync 上报，服务端按快照比对回 download 列表；
-// 3. 逐个 GET /api/channel/file 下载到 pending-sync/<rel>，
-// 落盘前复验 md5 == 服务端清单值；
-// 4. 计划写好后提示"重启应用更新"。
-// 启动侧（ApplyPending，由 Startup 在主窗出现前调用）：把 pending-sync
-// 的文件按相对路径覆盖到安装目录，清空 pending 目录。
-// 与 MarketplaceInstall / IdeUpdate 同一形态：静态状态 + 非捕获
-// Worker 线程 + SseSink 回传 + UI 每帧 Poll。
+// Dedicated updater: stage an authenticated release archive, then install via
+// Zan.AppUpdate's recoverable transaction. Pending directories are never copied wholesale.
 public class IdeFileSync {
     static SseSink sink;
-    static SseSink workerSink;
-    // "" = 空闲；否则当前正在做的事（用于状态条）。
+    static List<long> workers;
+    static bool closing;
     static string progress;
-    // 上一轮比对的计划（下载了哪些文件）。
     static IdeSyncPlan plan;
-    // 扫描+比对+下载阶段的状态标记：0 空闲，1 进行中，9 已落计划。
     static int phase;
-    static string basePath;
 
     static string T(string en, string zh) { return Lang.Tr(en, zh); }
-
-    static bool Busy() { return IdeFileSync.phase == 1; }
-
+    static bool Busy() { return IdeFileSync.phase == 1 || IdeFileSync.phase == 2; }
     static string Progress() { return IdeFileSync.progress; }
+    static string PendingDir() { return ZanIDE.UserConfigDir() + "/pending-sync"; }
 
-    // 待应用目录（UserConfigDir/pending-sync）。
-    static string PendingDir() {
-        return ZanIDE.UserConfigDir() + "/pending-sync";
-    }
-
-    // 发起一次增量同步。返回 "" = 已发起；非空 = 原因。
     static string Start() {
+        if (IdeFileSync.closing) { return "IDE is closing"; }
         if (IdeFileSync.Busy()) { return T("sync already running", "同步已在进行中"); }
-        // 上一次同步暂存的文件还没应用（等重启），再扫一遍也是同样的差异。
-        if (Directory.Exists(IdeFileSync.PendingDir())
-            && Directory.GetFiles(IdeFileSync.PendingDir()).Count > 0) {
-            return T("update already staged, restart to apply", "更新已暂存，重启后应用");
+        if (Directory.Exists(IdeFileSync.PendingDir())) {
+            return T("update staging exists; restart or inspect the failed update", "更新暂存已存在，请重启或检查失败的更新");
         }
-        IdeFileSync.basePath = ZanIDE.BaseDir();
+        if (!IdeSyncPlan.ConfigureSigner()) { return "trusted update public key is not configured"; }
         IdeFileSync.plan = null;
         IdeFileSync.phase = 1;
-        IdeFileSync.progress = T("Scanning local files...", "正在扫描本地文件...");
-        IdeFileSync.sink = SseSink.ToMemory();
-        IdeFileSync.workerSink = IdeFileSync.sink;
-        if (!Thread.Start(IdeFileSync.ScanWorker)) {
-            IdeFileSync.phase = 0;
-            IdeFileSync.progress = "";
-            return "could not start sync scan";
-        }
-        return "";
-    }
-
-    // IdeUpdate.poll 一次只有一个请求在飞；扫描先在单独线程里做
-    // （几百个文件的 md5 不该卡 UI），扫完立刻接上 BeginSync。
-    static void ScanWorker() {
-        List<string> paths = new List<string>();
-        List<string> md5s = new List<string>();
-        IdeFileSync.Walk(IdeFileSync.basePath, "", paths, md5s);
         IdeFileSync.progress = T("Comparing with server...", "正在与服务端比对...");
-        string err = IdeUpdate.BeginSync(paths, md5s);
-        if (err.Length > 0) {
-            IdeFileSync.workerSink.Publish("err:" + err);
-            return;
-        }
-        IdeFileSync.workerSink.Publish("ok:sent");
+        // The signed archive is the installation unit. No scan of user files and
+        // no parallel path/hash arrays are needed to request the complete target.
+        string error = IdeUpdate.BeginSync(new List<UpdateFileEntry>());
+        if (error.Length > 0) { IdeFileSync.phase = 0; IdeFileSync.progress = ""; }
+        return error;
     }
 
-    // 递归收集相对路径与内容 md5（平行列表）。目录读不到就跳过。
-    static void Walk(string absDir, string relPrefix, List<string> paths,
-                     List<string> md5s) {
-        if (!Directory.Exists(absDir)) { return; }
-        List<string> files = Directory.GetFiles(absDir);
-        for (int i = 0; i < files.Count; i = i + 1) {
-            string name = files[i];
-            int cut = 0 - 1;
-            for (int k = 0; k < name.Length; k = k + 1) {
-                string ch = name.Substring(k, 1);
-                if (ch == "/" || ch == "\\") { cut = k; }
-            }
-            if (cut >= 0) { name = name.Substring(cut + 1); }
-            string rel = relPrefix.Length > 0 ? relPrefix + "/" + name : name;
-            // 配置/缓存不属于发布树，同步会覆盖用户数据。
-            if (rel == "config/config.cfg" || rel.StartsWith("config/")) { continue; }
-            string full = absDir + "/" + name;
-            if (rel == "zanc.exe" || rel == "zanc") { continue; }
-            byte[] data = File.ReadAllBytes(full);
-            if (data == null) { continue; }
-            paths.Add(rel);
-            md5s.Add(Hex.Encode(Md5.Hash(data, data.Length), 16));
-        }
-        List<string> dirs = Directory.GetDirectories(absDir);
-        for (int j = 0; j < dirs.Count; j = j + 1) {
-            string name = dirs[j];
-            int cut = 0 - 1;
-            for (int k = 0; k < name.Length; k = k + 1) {
-                string ch = name.Substring(k, 1);
-                if (ch == "/" || ch == "\\") { cut = k; }
-            }
-            if (cut >= 0) { name = name.Substring(cut + 1); }
-            if (name == "config" || name == "cache" || name == ".zan-packages"
-                || name == "build" || name == "publish") { continue; }
-            string rel = relPrefix.Length > 0 ? relPrefix + "/" + name : name;
-            IdeFileSync.Walk(absDir + "/" + name, rel, paths, md5s);
-        }
-    }
-
-    // UI 每帧调用。返回 "" = 无事；非空 = 给日志的一行。
-    // BeginSync 的结果由 IdeUpdate.Poll 落进 IdeSyncPlan；这里看到
-    // 计划出现就接管下载。
     static string Poll() {
-        if (IdeFileSync.phase == 0) { return ""; }
-        // 阶段 1：等 IdeUpdate 的比对计划落地。
-        IdeSyncPlan p = IdeUpdate.SyncPlan();
-        if (p == null) {
-            if (!IdeUpdate.SyncDone()) { return ""; }
+        if (IdeFileSync.closing) { return ""; }
+        if (IdeFileSync.phase == 2) {
+            string done = IdeFileSync.sink != null ? IdeFileSync.sink.Done() : "";
+            if (done.Length == 0) { return ""; }
+            IdeFileSync.sink = null;
+            IdeFileSync.phase = done == "ok:staged" ? 9 : 0;
+            IdeFileSync.progress = "";
+            if (done == "ok:staged") { return T("> Update staged; restart to apply.", "> 更新已暂存，重启后应用。"); }
+            return "> Update failed: " + (done.StartsWith("err:") ? done.Substring(4) : done);
+        }
+        if (IdeFileSync.phase != 1) { return ""; }
+        IdeSyncPlan plan = IdeUpdate.SyncPlan();
+        if (plan == null && !IdeUpdate.SyncDone()) { return ""; }
+        if (plan == null || !plan.Ok()) {
             IdeFileSync.phase = 0;
             IdeFileSync.progress = "";
-            return T("> Incremental sync: server unreachable.", "> 增量同步：服务端不可达。");
+            return "> Update failed: " + (plan != null ? plan.Error() : "server unreachable");
         }
-        if (!p.Ok()) {
-            IdeFileSync.phase = 0;
-            IdeFileSync.progress = "";
-            return T("> Incremental sync failed: ", "> 增量同步失败：") + p.Error();
-        }
-        if (p.DownloadPaths().Count == 0) {
-            IdeFileSync.phase = 0;
-            IdeFileSync.progress = "";
-            return T("> Already up to date (", "> 已是最新（")
-                + Convert.ToString(p.MatchCount())
-                + T(" files verified).", " 个文件与服务器一致）。");
-        }
-        IdeFileSync.plan = p;
+        IdeFileSync.plan = plan;
         IdeFileSync.phase = 2;
-        IdeFileSync.progress = T("Downloading ", "正在下载 ")
-            + Convert.ToString(p.DownloadPaths().Count) + T(" files...", " 个文件...");
+        IdeFileSync.progress = T("Downloading signed update...", "正在下载已签名更新...");
         IdeFileSync.sink = SseSink.ToMemory();
-        IdeFileSync.workerSink = IdeFileSync.sink;
-        if (!Thread.Start(IdeFileSync.DownloadWorker)) {
-            IdeFileSync.phase = 0;
-            IdeFileSync.progress = "";
-            return "> could not start download worker";
-        }
+        if (IdeFileSync.workers == null) { IdeFileSync.workers = new List<long>(); }
+        long worker = Task.Run(IdeFileSync.DownloadWorker(IdeFileSync.sink, plan, IdeFileSync.PendingDir()));
+        IdeFileSync.workers.Add(worker);
         return "";
     }
 
-    static void DownloadWorker() {
-        string err = IdeFileSync.DownloadAll();
-        if (err.Length > 0) {
-            IdeFileSync.workerSink.Publish("err:" + err);
-        } else {
-            IdeFileSync.workerSink.Publish("ok:staged");
-        }
+    static async void DownloadWorker(SseSink target, IdeSyncPlan plan, string pending) {
+        try {
+            string error = await IdeFileSync.DownloadAll(plan, pending);
+            target.Publish(error.Length == 0 ? "ok:staged" : "err:" + error);
+        } catch (Exception ex) { target.Publish("err:" + ex.Message); }
     }
 
-    static string DownloadAll() {
-        IdeSyncPlan p = IdeFileSync.plan;
-        List<IdeDownloadItem> items = p.Items();
-        string pend = IdeFileSync.PendingDir();
-        Directory.CreateDirectoryRecursive(pend);
-        string url = IdeUpdate.BaseUrl() + "/api/channel/file?channel=ide"
-            + "&platform=" + IdeUpdate.PlatformOf() + "&path=";
-        for (int i = 0; i < items.Count; i = i + 1) {
-            IdeDownloadItem item = items[i];
-            string rel = item.Path();
-            if (!IdeFileSync.PathSafe(rel)) { return "unsafe path in plan: " + rel; }
-            IdeFileSync.progress = T("Downloading ", "正在下载 ")
-                + Convert.ToString(i + 1) + "/" + Convert.ToString(items.Count)
-                + ": " + rel;
-            string err = IdeFileSync.FetchOne(url + IdeUpdate.UrlEncode(rel),
-                item.Md5(), pend + "/" + rel);
-            if (err.Length > 0) { return err; }
-        }
+    static void BeginShutdown() { IdeFileSync.closing = true; }
+
+    static async void DrainAsync() {
+        IdeFileSync.BeginShutdown();
+        if (IdeFileSync.workers != null) { await Task.WhenAll(IdeFileSync.workers); }
+        IdeFileSync.sink = null;
+        IdeFileSync.phase = 0;
+        IdeFileSync.progress = "";
+    }
+
+    static async string DownloadAll(IdeSyncPlan plan, string pending) {
+        UpdateManifest manifest = plan.Manifest();
+        if (!IdeSyncPlan.Trusted(manifest)) { return "untrusted update manifest"; }
+        if (!AppUpdater.SafeDestination(pending, "release.zip")
+            || !AppUpdater.SafeDestination(pending, "manifest.json")) { return "unsafe update staging"; }
+        // Construct the fixed mall route locally. Never fetch a metadata-supplied host.
+        string url = IdeUpdate.BaseUrl() + "/api/channel/file?channel=ide&platform="
+            + IdeUpdate.PlatformOf() + "&version=" + IdeUpdate.UrlEncode(manifest.version)
+            + "&release=" + plan.Release() + "&path=_release.zip";
+        byte[] bytes = await IdeFileSync.Fetch(url);
+        if (bytes == null || bytes.Length != manifest.packageSize
+            || AppUpdater.HashBytes(bytes) != manifest.packageSha256.ToLower()) { return "release SHA-256 or size mismatch"; }
+        Directory.CreateDirectoryRecursive(pending);
+        File.WriteAllBytes(pending + "/release.zip", bytes);
+        // The signed manifest is the ready marker; partial downloads never become installable.
+        manifest.SaveToFile(pending + "/manifest.json");
         return "";
     }
 
-    // 下载单个文件并复验 md5，然后落盘到 pending 目录（先建父目录）。
-    static string FetchOne(string url, string expectMd5, string target) {
-        ExternalTarget t = ExternalTarget.Parse(url);
-        if (t == null) { return "bad file url"; }
-        HttpClient cli;
-        if (t.scheme == "https") {
-            cli = HttpClient.CreateHttps(t.Host(), t.Port());
-        } else {
-            cli = new HttpClient(t.Host(), t.Port());
+    static async byte[] Fetch(string url) {
+        ExternalTarget target = ExternalTarget.Parse(url);
+        if (target == null) { return null; }
+        Socket.Initialize();
+        HttpClient client;
+        if (target.IsTls()) { client = HttpClient.CreateHttps(target.Host(), target.Port()); }
+        else { client = new HttpClient(target.Host(), target.Port()); }
+        client.SetCallPolicy(IdeUpdate.FilePolicy(target.Host()));
+        client.SetTimeout(120000);
+        HttpResponse response = await client.SendBytesAsync("GET", target.Path() + target.Query(), "");
+        if (response.statusCode != 200) { return null; }
+        if (response.IsBinary()) {
+            // HttpClient keeps a trailing byte in its backing buffer; only
+            // BodyLength() bytes belong to the authenticated archive payload.
+            int length = response.BodyLength();
+            byte[] buffer = response.bodyBytes;
+            if (buffer == null || length < 0 || length > buffer.Length) { return null; }
+            if (length == buffer.Length) { return buffer; }
+            byte[] payload = new byte[length];
+            for (int i = 0; i < length; i = i + 1) { payload[i] = buffer[i]; }
+            return payload;
         }
-        cli.SetCallPolicy(IdeUpdate.FilePolicy(t.Host()));
-        cli.SetTimeout(60000);
-        HttpResponse resp = await cli.SendBytesAsync("GET",
-            t.Path() + t.Query(), "");
-        if (resp.statusCode != 200) {
-            return "HTTP " + Convert.ToString(resp.statusCode) + " for " + t.Path();
-        }
-        byte[] data;
-        int len;
-        if (resp.IsBinary()) {
-            data = resp.bodyBytes;
-            len = resp.BodyLength();
-        } else {
-            data = new byte[resp.body.Length];
-            for (int i = 0; i < resp.body.Length; i = i + 1) {
-                data[i] = resp.body[i] & 255;
-            }
-            len = resp.body.Length;
-        }
-        if (len <= 0) { return "empty file: " + t.Path(); }
-        string got = Hex.Encode(Md5.Hash(data, len), 16);
-        if (got != expectMd5) {
-            return T("md5 mismatch: ", "md5 不符：") + t.Path();
-        }
-        int cut = 0 - 1;
-        for (int i = 0; i < target.Length; i = i + 1) {
-            string ch = target.Substring(i, 1);
-            if (ch == "/" || ch == "\\") { cut = i; }
-        }
-        if (cut > 0) {
-            Directory.CreateDirectoryRecursive(target.Substring(0, cut));
-        }
-        File.WriteAllBytes(target, data);
-        return "";
+        byte[] bytes = new byte[response.body.Length];
+        for (int i = 0; i < response.body.Length; i = i + 1) { bytes[i] = response.body[i] & 255; }
+        return bytes;
     }
 
-    static bool PathSafe(string rel) {
-        if (rel.Length == 0 || rel.StartsWith("/")) { return false; }
-        if (rel.Contains("..") || rel.Contains("\\")) { return false; }
+    static bool PathSafe(string path) {
+        return path != null && !path.Contains("\\") && UpdateFileEntry.SafeRelPath(path);
+    }
+
+    // Only files in the last successfully installed signed manifest are eligible
+    // for removal. Projects, configuration and other local files are never inferred.
+    static bool RemoveObsolete(string root, UpdateManifest previous, UpdateManifest target) {
+        if (previous == null) { return true; }
+        if (!IdeSyncPlan.Trusted(previous)) { return false; }
+        for (int i = 0; i < previous.files.Count; i = i + 1) {
+            UpdateFileEntry old = previous.files[i];
+            if (target.FindFile(old.path) != null) { continue; }
+            if (!AppUpdater.SafeDestination(root, old.path)) { return false; }
+            string full = root + "/" + old.path;
+            if (!File.Exists(full)) { continue; }
+            // Preserve a locally modified formerly managed file.
+            if (File.GetSize64(full) != old.size) { continue; }
+            byte[] bytes = File.ReadAllBytes(full);
+            if (bytes == null || AppUpdater.HashBytes(bytes) != old.sha256.ToLower()) { continue; }
+            File.Delete(full);
+            if (File.Exists(full)) { return false; }
+        }
         return true;
     }
 
-    // 启动时把 pending-sync 应用进安装目录（Startup 在主窗
-    // 出现前调用，此刻本进程没锁任何发布文件）。返回应用的文件数。
-    static int ApplyPending() {
-        string pend = IdeFileSync.PendingDir();
-        if (!Directory.Exists(pend)) { return 0; }
-        int applied = 0;
-        List<string> files = new List<string>();
-        List<string> rels = new List<string>();
-        IdeFileSync.Collect(pend, "", files, rels);
-        for (int i = 0; i < files.Count; i = i + 1) {
-            string dest = IdeFileSync.basePathFor() + "/" + rels[i];
-            int cut = 0 - 1;
-            for (int k = 0; k < dest.Length; k = k + 1) {
-                string ch = dest.Substring(k, 1);
-                if (ch == "/" || ch == "\\") { cut = k; }
-            }
-            if (cut > 0) {
-                Directory.CreateDirectoryRecursive(dest.Substring(0, cut));
-            }
-            File.Copy(files[i], dest);
-            applied = applied + 1;
-        }
-        Directory.DeleteRecursive(pend);
-        return applied;
+    static bool SamePath(string a, string b) {
+        #if WINDOWS
+        return Path.GetFullPath(a).Replace("\\", "/").ToLower() == Path.GetFullPath(b).Replace("\\", "/").ToLower();
+        #else
+        return Path.GetFullPath(a) == Path.GetFullPath(b);
+        #endif
     }
 
-    static string basePathFor() { return ZanIDE.BaseDir(); }
+    // target is bound by UpdateBootstrap to the opened original process image.
+    // Key selection remains independent installed host configuration.
+    static int BootstrapPending(string target, string pending, string manifestHash, bool install) {
+        string configured = Environment.GetEnvironmentVariable("ZAN_APP_DIR");
+        if (configured.Length > 0 && !IdeFileSync.SamePath(configured, target)) { return 0; }
+        string config = Environment.GetEnvironmentVariable("ZAN_IDE_CONFIG_DIR");
+        if (config.Length == 0) { config = target + "/config"; }
+        if (!IdeFileSync.SamePath(pending, config + "/pending-sync")
+            || !AppUpdater.SafeDestination(pending, "manifest.json")
+            || !AppUpdater.SafeDestination(pending, "release.zip")
+            || AppUpdater.HashBytes(File.ReadAllBytes(pending + "/manifest.json")) != manifestHash) { return 0; }
+        UpdateManifest manifest = UpdateManifest.LoadFromFile(pending + "/manifest.json");
+        if (!IdeSyncPlan.Trusted(manifest) || !File.Exists(pending + "/release.zip")
+            || File.GetSize64(pending + "/release.zip") != manifest.packageSize
+            || AppUpdater.HashBytes(File.ReadAllBytes(pending + "/release.zip")) != manifest.packageSha256.ToLower()) { return 0; }
+        if (!install) { return 1; }
+        return IdeFileSync.ApplyPendingAt(target, pending);
+    }
 
-    static void Collect(string absDir, string relPrefix, List<string> files,
-                        List<string> rels) {
-        List<string> fs = Directory.GetFiles(absDir);
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            string name = fs[i];
-            int cut = 0 - 1;
-            for (int k = 0; k < name.Length; k = k + 1) {
-                string ch = name.Substring(k, 1);
-                if (ch == "/" || ch == "\\") { cut = k; }
-            }
-            if (cut >= 0) { name = name.Substring(cut + 1); }
-            files.Add(absDir + "/" + name);
-            rels.Add(relPrefix.Length > 0 ? relPrefix + "/" + name : name);
-        }
-        List<string> subs = Directory.GetDirectories(absDir);
-        for (int j = 0; j < subs.Count; j = j + 1) {
-            string name = subs[j];
-            int cut = 0 - 1;
-            for (int k = 0; k < name.Length; k = k + 1) {
-                string ch = name.Substring(k, 1);
-                if (ch == "/" || ch == "\\") { cut = k; }
-            }
-            if (cut >= 0) { name = name.Substring(cut + 1); }
-            string rel = relPrefix.Length > 0 ? relPrefix + "/" + name : name;
-            IdeFileSync.Collect(absDir + "/" + name, rel, files, rels);
-        }
+    // 0: nothing staged; 1: acknowledged handoff; -1: fail closed before UI.
+    static int BootstrapStart(string[] args) {
+        try {
+            if (!Directory.Exists(IdeFileSync.PendingDir())) { return 0; }
+            #if WINDOWS
+            // Resolve inherited local configuration before changing the helper cwd.
+            string keyset = Environment.GetEnvironmentVariable("ZAN_UPDATE_PUBLIC_KEYSET_FILE");
+            string key = Environment.GetEnvironmentVariable("ZAN_UPDATE_PUBLIC_KEY_FILE");
+            if (keyset.Length == 0 && key.Length == 0) { return -1; }
+            if (keyset.Length > 0) { Environment.SetEnvironmentVariable("ZAN_UPDATE_PUBLIC_KEYSET_FILE", Path.GetFullPath(keyset)); }
+            if (key.Length > 0) { Environment.SetEnvironmentVariable("ZAN_UPDATE_PUBLIC_KEY_FILE", Path.GetFullPath(key)); }
+            string config = Environment.GetEnvironmentVariable("ZAN_IDE_CONFIG_DIR");
+            if (config.Length > 0) { Environment.SetEnvironmentVariable("ZAN_IDE_CONFIG_DIR", Path.GetFullPath(config)); }
+            string root = Environment.GetEnvironmentVariable("ZAN_APP_DIR");
+            if (root.Length > 0) { Environment.SetEnvironmentVariable("ZAN_APP_DIR", Path.GetFullPath(root)); }
+            string pending = IdeFileSync.PendingDir();
+            UpdateManifest manifest = UpdateManifest.LoadFromFile(pending + "/manifest.json");
+            if (!IdeSyncPlan.Trusted(manifest)) { return -1; }
+            if (!UpdateBootstrap.Begin(ZanIDE.BaseDir(), pending, Path.GetTempPath() + "/Zan.AppUpdate", manifest, args)) { return -1; }
+            return 1;
+            #else
+            Console.WriteLine("Staged IDE update requires an external bootstrap on this platform.");
+            return -1;
+            #endif
+        } catch (Exception ex) { return -1; }
+    }
+
+    static int ApplyPending() { return IdeFileSync.ApplyPendingAt(ZanIDE.BaseDir(), IdeFileSync.PendingDir()); }
+
+    static int ApplyPendingAt(string root, string pending) {
+        if (!Directory.Exists(pending)) { return 0; }
+        try {
+            if (!AppUpdater.SafeDestination(pending, "manifest.json")
+                || !AppUpdater.SafeDestination(pending, "release.zip")) { return 0; }
+            UpdateManifest manifest = UpdateManifest.LoadFromFile(pending + "/manifest.json");
+            if (!IdeSyncPlan.Trusted(manifest)) { return 0; }
+            string installed = "update.installed.manifest.json";
+            if (!AppUpdater.SafeDestination(root, installed)) { return 0; }
+            UpdateManifest previous = UpdateManifest.LoadFromFile(root + "/" + installed);
+            if (File.Exists(root + "/" + installed) && !IdeSyncPlan.Trusted(previous)) { return 0; }
+            // ApplyPackage verifies the signature, ZIP SHA-256, full inventory and
+            // every entry before its journalled install begins. Failure leaves staging for retry.
+            if (!AppUpdater.ApplyPackage(pending + "/release.zip", manifest, root, true, null)) { return 0; }
+            if (!IdeFileSync.RemoveObsolete(root, previous, manifest)) { return 0; }
+            if (!AppUpdater.SafeDestination(root, installed + ".tmp")) { return 0; }
+            manifest.SaveToFile(root + "/" + installed + ".tmp");
+            File.Move(root + "/" + installed + ".tmp", root + "/" + installed);
+            File.Delete(pending + "/manifest.json");
+            File.Delete(pending + "/release.zip");
+            Directory.Delete(pending);
+            return manifest.files.Count;
+        } catch (Exception ex) { return 0; }
     }
 }

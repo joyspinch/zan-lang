@@ -1,0 +1,183 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+
+// 暂存文件条目：记录待审阅修改的原始快照、目标文本与结构化差异
+public class StagedFile {
+    public string path;         // 工程相对路径（如 src/App.zan）
+    public string fullPath;     // 物理绝对路径
+    public string originalText; // 改动前的基准文本
+    public string stagedText;   // AI 生成的目标暂存文本
+    public List<DiffLine> diffs;// 差异行清单
+    public int adds;            // 增加行数
+    public int dels;            // 删除行数
+    public bool accepted;       // 是否已被用户接受并落盘
+
+    public StagedFile(string path, string fullPath, string originalText, string stagedText, List<DiffLine> diffs, int adds, int dels) {
+        this.path = path != null ? path : "";
+        this.fullPath = fullPath != null ? fullPath : "";
+        this.originalText = originalText != null ? originalText : "";
+        this.stagedText = stagedText != null ? stagedText : "";
+        this.diffs = diffs;
+        this.adds = adds;
+        this.dels = dels;
+        this.accepted = false;
+    }
+
+    public string Summary() {
+        if (this.accepted) {
+            return this.path + " (已接受)";
+        }
+        return this.path + "  +" + Convert.ToString(this.adds) + " -" + Convert.ToString(this.dels) + " (待审阅)";
+    }
+}
+
+// 虚拟文件变更暂存管理器（Virtual Diff Staging Service）
+// 在用户明确审查接受之前，所有的 edit_file / write_file 均仅保存在内存中，
+// 绝不直接覆盖破坏磁盘物理文件。
+public class AiStaging {
+    static List<StagedFile> entries = new List<StagedFile>();
+
+    // 格式化相对路径（统一使用正斜杠并去除开头的斜杠）
+    public static string NormalizePath(string path) {
+        if (path == null) { return ""; }
+        string p = path.Replace("\\", "/");
+        while (p.StartsWith("/")) {
+            p = p.Substring(1, p.Length - 1);
+        }
+        return p;
+    }
+
+    // 构造物理绝对路径
+    public static string ResolveFullPath(string root, string path) {
+        string rel = AiStaging.NormalizePath(path);
+        if (root == null || root.Length == 0) {
+            return rel;
+        }
+        string r = root.Replace("\\", "/");
+        if (r.EndsWith("/")) {
+            return r + rel;
+        }
+        return r + "/" + rel;
+    }
+
+    // 暂存一个文件的修改
+    public static StagedFile Stage(string root, string path, string newContent) {
+        string rel = AiStaging.NormalizePath(path);
+        string full = AiStaging.ResolveFullPath(root, rel);
+        string oldText = "";
+        if (File.Exists(full)) {
+            oldText = File.ReadAllText(full);
+        }
+
+        List<DiffLine> diffs = AiDiff.Compare(oldText, newContent);
+        int adds = 0;
+        int dels = 0;
+        AiDiff.CountChanges(diffs, out adds, out dels);
+
+        // 查找是否已存在暂存项
+        for (int i = 0; i < AiStaging.entries.Count; i = i + 1) {
+            StagedFile item = AiStaging.entries[i];
+            if (item.path == rel) {
+                item.fullPath = full;
+                item.stagedText = newContent;
+                item.diffs = diffs;
+                item.adds = adds;
+                item.dels = dels;
+                item.accepted = false;
+                return item;
+            }
+        }
+
+        StagedFile created = new StagedFile(rel, full, oldText, newContent, diffs, adds, dels);
+        AiStaging.entries.Add(created);
+        return created;
+    }
+
+    // 按相对路径查找暂存项
+    public static StagedFile Get(string path) {
+        string rel = AiStaging.NormalizePath(path);
+        for (int i = 0; i < AiStaging.entries.Count; i = i + 1) {
+            StagedFile item = AiStaging.entries[i];
+            if (item.path == rel) {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    // 获取所有暂存项
+    public static List<StagedFile> All() {
+        return AiStaging.entries;
+    }
+
+    // 获取待审阅未接受的暂存文件数量
+    public static int PendingCount() {
+        int count = 0;
+        for (int i = 0; i < AiStaging.entries.Count; i = i + 1) {
+            if (!AiStaging.entries[i].accepted) {
+                count = count + 1;
+            }
+        }
+        return count;
+    }
+
+    // 接受指定文件的修改并落盘
+    public static bool Accept(string root, string path) {
+        string rel = AiStaging.NormalizePath(path);
+        StagedFile file = AiStaging.Get(rel);
+        if (file == null) { return false; }
+
+        string full = file.fullPath;
+        if (full == null || full.Length == 0) {
+            full = AiStaging.ResolveFullPath(root, rel);
+        }
+
+        // 确保父目录存在
+        string dir = Path.GetDirectoryName(full);
+        if (dir != null && dir.Length > 0 && !Directory.Exists(dir)) {
+            Directory.CreateDirectory(dir);
+        }
+
+        File.WriteAllText(full, file.stagedText);
+        file.accepted = true;
+        return true;
+    }
+
+    // 拒绝/丢弃指定文件的修改
+    public static bool Reject(string path) {
+        string rel = AiStaging.NormalizePath(path);
+        for (int i = 0; i < AiStaging.entries.Count; i = i + 1) {
+            if (AiStaging.entries[i].path == rel) {
+                AiStaging.entries.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 批量接受所有暂存文件并落盘
+    public static int AcceptAll(string root) {
+        int count = 0;
+        for (int i = 0; i < AiStaging.entries.Count; i = i + 1) {
+            StagedFile item = AiStaging.entries[i];
+            if (!item.accepted) {
+                if (AiStaging.Accept(root, item.path)) {
+                    count = count + 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    // 批量丢弃所有暂存文件
+    public static void RejectAll() {
+        AiStaging.entries.Clear();
+    }
+
+    // 清空暂存区
+    public static void Clear() {
+        AiStaging.entries.Clear();
+    }
+}

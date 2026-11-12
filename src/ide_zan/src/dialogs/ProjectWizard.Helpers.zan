@@ -1,0 +1,353 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.Chart;
+
+// IDE project/file wizard helpers. The generic Gui.Widget.Wizard is a stepper;
+// project templates and creation actions belong to the IDE.
+public partial class Wizard {
+    Control singleView;
+    List<Button> singleItems;
+    List<Button> singleSizes;
+    Label singleDescription;
+    Label singleNotice;
+    Button singleCreate;
+    Button singleCancel;
+    Button singleClose;
+    Control singleSizeSection;
+    Control previewView;
+    Control previewDevice;
+    Label previewCaption;
+    Label previewTitle;
+    WizardTemplate previewTemplate;
+    string previewLanguage;
+    List<WizardTemplate> previewTemplates;
+    List<Control> previewContents;
+
+    // Preserve the old free-text dimension contract: take the first digit run,
+    // allowing whitespace/units around it, and return zero when absent.
+    public static int ParseDim(string s) {
+        if (s == null) { return 0; }
+        int n = 0;
+        bool any = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch >= 48 && ch <= 57) {
+                n = n * 10 + ch - 48;
+                any = true;
+            } else if (any) {
+                break;
+            }
+        }
+        return n;
+    }
+
+    public static Wizard Categorized(string title, List<string> catNames, SignalInt catSel,
+            List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
+            List<WizardTarget> targets, List<string> groupNames) {
+        return Wizard.Categorized(title, catNames, catSel, tpls, tplSel,
+            nameInput, locInput, targets, groupNames, null, null, null, null, null);
+    }
+
+    public static Wizard Categorized(string title, List<string> catNames, SignalInt catSel,
+            List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
+            List<WizardTarget> targets, List<string> groupNames,
+            SignalInt sizeSel, Input sizeW, Input sizeH) {
+        return Wizard.Categorized(title, catNames, catSel, tpls, tplSel,
+            nameInput, locInput, targets, groupNames, sizeSel, sizeW, sizeH, null, null);
+    }
+
+    public static Wizard Categorized(string title, List<string> catNames, SignalInt catSel,
+            List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
+            List<WizardTarget> targets, List<string> groupNames,
+            SignalInt sizeSel, Input sizeW, Input sizeH, SignalInt devSel, SignalInt devRot) {
+        Wizard w = new Wizard();
+        w.iTitle = title;
+        w.iCategorized = true;
+        w.iCatNames = catNames;
+        w.iCatSel = catSel;
+        w.iTpls = tpls;
+        w.iTplSel = tplSel;
+        w.iName = nameInput;
+        w.iLoc = locInput;
+        w.iShowLoc = true;
+        w.iTargets = targets;
+        w.iGroups = groupNames;
+        w.iSizeSel = sizeSel;
+        w.iSizeW = sizeW;
+        w.iSizeH = sizeH;
+        w.iDevSel = devSel;
+        w.iDevRot = devRot;
+        return w;
+    }
+
+    public int Show(App app) {
+        if (iCategorized) { return this.ShowCategorized(app); }
+        return this.ShowSingle(app);
+    }
+
+    static Panel Column(string css) {
+        Panel p = Panel.Column();
+        p.SetProp("style", "display:flex;flex-direction:column;min-height:0;" + css);
+        return p;
+    }
+
+    void BuildSingle() {
+        singleItems = new List<Button>();
+        singleSizes = new List<Button>();
+        Panel root = Wizard.Column("padding:var(--padding-large);gap:var(--gap-large);");
+        Panel header = Panel.Row();
+        header.SetProp("style", "display:flex;align-items:center;flex-shrink:0;");
+        Label title = new Label(iTitle).Large();
+        title.Grow();
+        header.Add(title);
+        // Button content owns measurement; the legacy Icon property alone
+        // does not create a child and leaves an empty button at zero width.
+        singleClose = new Button(new IconView("x"));
+        singleClose.Class = "ghost small";
+        header.Add(singleClose);
+        root.Add(header);
+
+        Panel body = Panel.Row();
+        body.SetProp("style", "display:flex;flex-grow:1;min-height:0;gap:var(--gap-large);");
+        Panel choices = Wizard.Column("width:230px;flex-shrink:0;overflow-y:auto;gap:var(--gap-small);");
+        if (iItems != null) {
+            for (int i = 0; i < iItems.Count; i = i + 1) {
+                Button item = new Button(iItems[i].name);
+                item.Add(new IconView(iItems[i].icon));
+                item.SetProp("style", "flex-shrink:0;");
+                choices.Add(item);
+                singleItems.Add(item);
+            }
+        }
+        body.Add(choices);
+        Panel form = Wizard.Column("flex-grow:1;overflow-y:auto;gap:var(--gap-medium);");
+        form.Add(new Label(Wizard.TW("Name", "名称")));
+        form.Add(iName);
+        if (iShowLoc && iLoc != null) {
+            form.Add(new Label(Wizard.TW("Location", "位置")));
+            form.Add(iLoc);
+        }
+        singleDescription = new Label("").SetWrap(true).Muted();
+        form.Add(singleDescription);
+        Panel sizeSection = Wizard.Column("gap:var(--gap-medium);");
+        sizeSection.Add(new Label(Wizard.TW("Device size", "设备尺寸")));
+        Panel presets = new Panel();
+        presets.SetProp("style", "display:grid;grid-template-columns:repeat(4,1fr);gap:var(--gap-small);");
+        List<int> widths = Wizard.SizePresetW();
+        for (int i = 0; i < widths.Count; i = i + 1) {
+            Button b = new Button(Wizard.SizePresetName(i));
+            b.Class = "small";
+            presets.Add(b);
+            singleSizes.Add(b);
+        }
+        sizeSection.Add(presets);
+        if (iSizeW != null && iSizeH != null) {
+            Panel custom = Panel.Row();
+            custom.SetProp("style", "display:flex;align-items:center;gap:var(--gap-medium);");
+            custom.Add(new Label(Wizard.TW("Custom", "自定义")));
+            iSizeW.SetProp("style", "width:72px;");
+            iSizeH.SetProp("style", "width:72px;");
+            custom.Add(iSizeW);
+            custom.Add(new Label("×"));
+            custom.Add(iSizeH);
+            sizeSection.Add(custom);
+        }
+        singleSizeSection = sizeSection;
+        form.Add(sizeSection);
+        body.Add(form);
+        root.Add(body);
+        singleNotice = new Label("").Error().SetWrap(true);
+        root.Add(singleNotice);
+        Panel footer = Panel.Row();
+        footer.SetProp("style", "display:flex;justify-content:flex-end;flex-shrink:0;gap:var(--gap-medium);");
+        singleCancel = new Button(Wizard.TW("Cancel", "取消"));
+        singleCreate = new Button(Wizard.TW("Create", "创建")).Primary();
+        footer.Add(singleCancel);
+        footer.Add(singleCreate);
+        root.Add(footer);
+        singleView = root;
+    }
+
+    int ShowSingle(App app) {
+        if (singleView == null) { this.BuildSingle(); }
+        // RenderInside lays out and paints only. The persistent tree must also
+        // be the window root so pointer routing reaches buttons and inputs.
+        app.SetRootControl(singleView);
+        int selected = iSel != null ? iSel.Get() : -1;
+        for (int i = 0; i < singleItems.Count; i = i + 1) {
+            singleItems[i].Class = i == selected ? "primary" : "";
+        }
+        string desc = "";
+        if (iItems != null && selected >= 0 && selected < iItems.Count) { desc = iItems[selected].desc; }
+        singleDescription.Text.Set(desc);
+        singleNotice.Text.Set(Wizard.notice);
+        singleNotice.Visible = Wizard.notice != "";
+        singleSizeSection.Visible = iSizeSel != null;
+        for (int i = 0; i < singleSizes.Count; i = i + 1) {
+            bool active = iSizeSel != null && iSizeSel.Get() == i;
+            singleSizes[i].Class = active ? "primary small" : "small";
+        }
+        singleView.RenderInside(app, new Rect(0, 0, app.canvas.Width(), app.canvas.Height()));
+        for (int i = 0; i < singleItems.Count; i = i + 1) {
+            if (Ui.Clicked(app, singleItems[i].WidgetId())) {
+                if (iSel != null) { iSel.Set(i); }
+                app.RequestRedraw();
+            }
+        }
+        if (iSizeSel != null) {
+            List<int> widths = Wizard.SizePresetW();
+            List<int> heights = Wizard.SizePresetH();
+            for (int i = 0; i < singleSizes.Count; i = i + 1) {
+                if (Ui.Clicked(app, singleSizes[i].WidgetId())) {
+                    iSizeSel.Set(i);
+                    if (iSizeW != null) { iSizeW.SetText(Convert.ToString(widths[i])); }
+                    if (iSizeH != null) { iSizeH.SetText(Convert.ToString(heights[i])); }
+                    app.RequestRedraw();
+                }
+            }
+        }
+        if (Ui.Clicked(app, singleClose.WidgetId()) || Ui.Clicked(app, singleCancel.WidgetId())) { return 2; }
+        if (Ui.Clicked(app, singleCreate.WidgetId())) { return 1; }
+        return 0;
+    }
+
+    // Template previews are standard retained controls. No Canvas mock widgets.
+    void SyncPreview(WizardTemplate tpl, int devW, int devH, int availableW, bool round) {
+        if (previewView == null || previewTemplate != tpl || previewLanguage != Wizard.lang) {
+            this.BuildPreview(tpl);
+        }
+        string caption = Wizard.TW("Free layout", "自由布局");
+        if (devW > 0 && devH > 0) { caption = Convert.ToString(devW) + " × " + Convert.ToString(devH); }
+        previewCaption.Text.Set(caption);
+        int rw = devW > 0 ? devW : 16;
+        int rh = devH > 0 ? devH : 10;
+        int dw = availableW;
+        int dh = 150;
+        if (dw < 1) { dw = 1; }
+        if ((long)dw * rh > (long)dh * rw) { dw = (int)((long)dh * rw / rh); }
+        else { dh = (int)((long)dw * rh / rw); }
+        previewDevice.Prefer(dw, dh);
+        string radius = round ? "var(--radius-full)" : "var(--radius-small)";
+        previewDevice.SetProp("style", "display:flex;flex-direction:column;flex-shrink:0;overflow:hidden;background:var(--surface-bg);border:1px solid var(--border-secondary);border-radius:" + radius + ";");
+    }
+
+    void BuildPreview(WizardTemplate tpl) {
+        if (previewView == null) {
+            Panel root = Wizard.Column("padding:var(--padding-medium);gap:var(--gap-small);align-items:center;border:1px solid var(--border-secondary);border-radius:var(--radius-medium);flex-shrink:0;");
+            root.SetProp("name", "wizard-preview");
+            root.Disabled = true;
+            previewTitle = new Label(Wizard.TW("Preview", "预览")).Small().Muted();
+            root.Add(previewTitle);
+            Panel device = Wizard.Column("flex-shrink:0;overflow:hidden;background:var(--surface-bg);border:1px solid var(--border-secondary);border-radius:var(--radius-small);");
+            device.SetProp("name", "wizard-preview-device");
+            previewDevice = device;
+            root.Add(device);
+            previewCaption = new Label("").Small().Muted();
+            previewCaption.SetProp("name", "wizard-preview-caption");
+            root.Add(previewCaption);
+            previewView = root;
+            previewTemplates = new List<WizardTemplate>();
+            previewContents = new List<Control>();
+        }
+        if (previewLanguage != Wizard.lang) {
+            previewDevice.RemoveAll();
+            previewTemplates.Clear();
+            previewContents.Clear();
+            previewTitle.Text.Set(Wizard.TW("Preview", "预览"));
+        }
+        previewTemplate = tpl;
+        previewLanguage = Wizard.lang;
+        int selected = -1;
+        for (int i = 0; i < previewTemplates.Count; i = i + 1) {
+            if (previewTemplates[i] == tpl) { selected = i; }
+        }
+        if (selected < 0 && tpl != null) {
+            Panel content = Wizard.Column("flex-grow:1;min-width:0;overflow:hidden;");
+            if (tpl.preview != "") {
+                Image image = new Image(tpl.preview, tpl.name, "contain");
+                image.Grow();
+                content.Add(image);
+            } else {
+                this.BuildSketch(content, tpl);
+            }
+            selected = previewTemplates.Count;
+            previewTemplates.Add(tpl);
+            previewContents.Add(content);
+            previewDevice.Add(content);
+        }
+        for (int i = 0; i < previewContents.Count; i = i + 1) {
+            previewContents[i].Visible = i == selected;
+        }
+        string radius = tpl != null && tpl.round ? "var(--radius-full)" : "var(--radius-small)";
+        previewDevice.SetProp("style", "display:flex;flex-direction:column;flex-shrink:0;overflow:hidden;background:var(--surface-bg);border:1px solid var(--border-secondary);border-radius:" + radius + ";");
+    }
+
+    void BuildSketch(Panel device, WizardTemplate tpl) {
+        string sk = tpl.sketch;
+        if (Wizard.SketchHas(sk, "titlebar") || Wizard.SketchHas(sk, "custom_titlebar")) {
+            device.Add(new Label(tpl.name).Small());
+        }
+        if (Wizard.SketchHas(sk, "ribbon") || Wizard.SketchHas(sk, "toolbar")) {
+            ToolStrip tools = new ToolStrip();
+            tools.AddRight(Wizard.TW("New", "新建"), "file-plus");
+            tools.AddRight(Wizard.TW("Save", "保存"), "device-floppy");
+            device.Add(tools);
+        }
+        if (Wizard.SketchHas(sk, "tabs")) {
+            Tabs tabs = new Tabs();
+            tabs.Add(Wizard.TW("Page 1", "页面 1"));
+            tabs.Add(Wizard.TW("Page 2", "页面 2"));
+            device.Add(tabs);
+        }
+        Panel body = Panel.Row();
+        body.SetProp("style", "display:flex;flex-grow:1;min-height:0;gap:var(--gap-small);");
+        if (Wizard.SketchHas(sk, "sidebar")) {
+            Panel sidebar = Wizard.Column("width:25%;gap:var(--gap-small);");
+            for (int i = 0; i < 3; i = i + 1) { sidebar.Add(new Label(Wizard.TW("Item ", "项目 ") + Convert.ToString(i + 1)).Small()); }
+            body.Add(sidebar);
+        }
+        Panel content = Wizard.Column("flex-grow:1;gap:var(--gap-small);");
+        if (Wizard.SketchHas(sk, "alarms")) {
+            content.Add(new AlertBox(Wizard.TW("Alarms", "告警")));
+        }
+        if (Wizard.SketchHas(sk, "console")) {
+            TextArea console = new TextArea();
+            console.SetText("> Zan\n> " + tpl.name);
+            console.ReadOnly(true);
+            console.Grow();
+            content.Add(console);
+        } else if (Wizard.SketchHas(sk, "webview")) {
+            Input address = new Input("https://");
+            content.Add(address);
+            Card page = new Card(tpl.name);
+            page.Grow();
+            content.Add(page);
+        } else if (Wizard.SketchHas(sk, "form")) {
+            for (int i = 0; i < 2; i = i + 1) {
+                content.Add(new Label(Wizard.TW("Field ", "字段 ") + Convert.ToString(i + 1)).Small());
+                content.Add(new Input());
+            }
+            content.Add(new Button(Wizard.TW("Create", "创建")).Primary());
+        } else if (Wizard.SketchHas(sk, "list")) {
+            for (int i = 0; i < 3; i = i + 1) { content.Add(new Button(Wizard.TW("Item ", "项目 ") + Convert.ToString(i + 1))); }
+        } else if (Wizard.SketchHas(sk, "cards") || Wizard.SketchHas(sk, "server") || Wizard.SketchHas(sk, "library")) {
+            for (int i = 0; i < 3; i = i + 1) { content.Add(new Card(tpl.name)); }
+        } else if (Wizard.SketchHas(sk, "chart") || Wizard.SketchHas(sk, "gauges")) {
+            string option = "{\"animation\":false,\"xAxis\":{\"type\":\"category\",\"data\":[\"A\",\"B\",\"C\"]},\"yAxis\":{},\"series\":[{\"type\":\"line\",\"data\":[1,3,2]}]}";
+            if (!Wizard.SketchHas(sk, "chart")) { option = "{\"animation\":false,\"series\":[{\"type\":\"gauge\",\"data\":[{\"value\":60}]}]}"; }
+            ChartHost chart = new ChartHost(ChartOption.FromJson(option));
+            chart.Grow();
+            content.Add(chart);
+        } else {
+            content.Add(new Empty(tpl.name));
+        }
+        body.Add(content);
+        device.Add(body);
+        if (Wizard.SketchHas(sk, "statusbar")) {
+            StatusBar status = new StatusBar();
+            status.AddLeft(Wizard.TW("Ready", "就绪"));
+            device.Add(status);
+        }
+    }
+}

@@ -1,6 +1,9 @@
 """用 TCP 假服务器验证真实 LspSession，客户端由调用者独立编译。"""
 import argparse
+import ctypes
 import json
+import os
+import secrets
 import socket
 import subprocess
 import threading
@@ -249,6 +252,179 @@ def project_probe(server_path):
             server.communicate()
 
 
+def executable_resolution_probe(client):
+    # Empty marker files exercise discovery only; no compiler/server/source copies.
+    output_dir = client.resolve().parent / "test-out"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="lsp_paths_", dir=output_dir) as temporary:
+        root = Path(temporary)
+        directories = [root / "SDK with spaces 中%" / "toolchain",
+                       root / "SDK with spaces 中%", root / "isolated candidate"]
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+
+        def check(override, suffix, expected, detail="", code=0):
+            result = subprocess.run([str(client.resolve()), "resolve", str(override),
+                                     *[p.as_posix() for p in directories], suffix,
+                                     str(expected), detail, str(code)],
+                                    capture_output=True, text=True, errors="replace", timeout=10)
+            assert result.returncode == 0 and "PASS LspSession executable resolution" in result.stdout, result.stdout + result.stderr
+
+        for suffix in (".exe", ""):
+            candidates = [directory / ("zan-lsp" + suffix) for directory in directories]
+            for mask in range(8):
+                for index, candidate in enumerate(candidates):
+                    if mask & (1 << index):
+                        candidate.touch()
+                    else:
+                        candidate.unlink(missing_ok=True)
+                present = [candidate.as_posix() for index, candidate in enumerate(candidates)
+                           if mask & (1 << index)]
+                detail = " / ".join(p.as_posix() for p in candidates) if not present else ""
+                check("", suffix, present[0] if present else "", detail, 0 if present else 1)
+            explicit = root / ("explicit server" + suffix)
+            explicit.touch()
+            check(explicit.as_posix(), suffix, explicit.as_posix())
+            missing = (root / ("missing explicit" + suffix)).as_posix()
+            check(missing, suffix, "", missing, 1)
+            for candidate in candidates:
+                candidate.unlink(missing_ok=True)
+    print("PASS executable resolution: 20 cases, strict override, all candidate priorities, missing paths, spaces Unicode percent and both suffixes")
+
+
+def launcher_identity(pid):
+    if os.name == "nt":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel.OpenProcess(0x100001, False, pid)
+        assert handle, f"cannot retain owned launcher {pid}"
+        kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        return kernel, handle
+    return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart=", "-o", "comm="], text=True).strip()
+
+
+def reap_launcher(pid, identity):
+    if os.name == "nt":
+        kernel, handle = identity
+        try:
+            if kernel.WaitForSingleObject(handle, 5000) == 258:
+                assert kernel.TerminateProcess(handle, 1), f"launcher termination failed: {pid}"
+            assert kernel.WaitForSingleObject(handle, 5000) == 0, f"launcher remains: {pid}"
+        finally:
+            kernel.CloseHandle(handle)
+    else:
+        for _ in range(100):
+            current = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=", "-o", "comm="], capture_output=True, text=True, timeout=5).stdout.strip()
+            if not current or current != identity:
+                return
+            time.sleep(0.05)
+        raise AssertionError(f"owned launcher did not exit: {pid}")
+
+
+LSP_STARTUP_TIMEOUT = 90
+LSP_CLIENT_TIMEOUT = 120
+
+
+def natural_discovery_probe(client, server, launcher, mode="normal"):
+    output_dir = client.resolve().parent / "test-out"
+    with tempfile.TemporaryDirectory(prefix="lsp_start_", dir=output_dir) as workspace:
+        environment = os.environ.copy()
+        environment.pop("ZAN_IDE_LSP_EXE", None)
+        root = Path(workspace)
+        toolchain, candidate = root / "missing toolchain", root / "isolated candidate"
+        toolchain.mkdir(); candidate.mkdir()
+        errors, servers, launchers = [], [], []
+        stop = threading.Event()
+        registered = threading.Event()
+        token = secrets.token_hex(24)
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0)); listener.listen(4); listener.settimeout(0.1)
+            environment["ZAN_LSP_TEST_OWNER_PORT"] = str(listener.getsockname()[1])
+            environment["ZAN_LSP_TEST_OWNER_TOKEN"] = token
+            environment["ZAN_LSP_TEST_FAULT"] = mode
+
+            def own_servers():
+                try:
+                    while not stop.is_set():
+                        try:
+                            connection, _ = listener.accept()
+                        except socket.timeout:
+                            continue
+                        with connection:
+                            connection.settimeout(5)
+                            request = connection.makefile("rb").readline(200).decode("ascii").split()
+                            assert len(request) == 3 and request[0] == token, request
+                            pid, port = int(request[1]), int(request[2])
+                            assert not servers and 0 < port < 65536, "duplicate or invalid server registration"
+                            launchers.append((pid, launcher_identity(pid)))
+                            real = subprocess.Popen([str(server.resolve()), "--port", str(port)],
+                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            servers.append(real)
+                            connection.sendall(b"\x01")
+                            registered.set()
+                except BaseException as error:
+                    errors.append(error)
+                    registered.set()
+
+            owner = threading.Thread(target=own_servers, daemon=True)
+            owner.start()
+            process = subprocess.Popen([str(client.resolve()), "start", str(root),
+                                        toolchain.as_posix(), launcher.parent.as_posix(),
+                                        candidate.as_posix(), launcher.suffix], env=environment,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, errors="replace")
+            timed_out = False
+            try:
+                startup_deadline = time.monotonic() + LSP_STARTUP_TIMEOUT
+                assert registered.wait(LSP_STARTUP_TIMEOUT), "launcher did not register an owned server"
+                if errors:
+                    raise errors[0]
+                if mode != "normal":
+                    while not (root / "fault-ready").exists() and process.poll() is None and time.monotonic() < startup_deadline:
+                        time.sleep(0.02)
+                    assert (root / "fault-ready").read_text() == mode, "client did not reach fault injection after initialize"
+                try:
+                    stdout, stderr = process.communicate(timeout=2 if mode == "timeout" else LSP_CLIENT_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    if mode != "timeout":
+                        raise
+                if mode == "normal":
+                    assert process.returncode == 0 and "PASS LspSession natural SDK sibling discovery" in stdout and "runtime error:" not in (stdout + stderr).lower(), stdout + stderr
+                    print(stdout.strip())
+                elif mode == "timeout":
+                    assert timed_out, "timeout fault did not hang the client"
+                else:
+                    assert process.returncode == 23, f"exit fault returned {process.returncode}, expected 23"
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+                stop.set(); owner.join(timeout=6)
+                assert not owner.is_alive(), "server owner did not stop"
+                for real in servers:
+                    if mode == "normal":
+                        try:
+                            real.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    if real.poll() is None:
+                        real.terminate()
+                    try:
+                        real.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        real.kill(); real.communicate(timeout=5)
+                    assert real.poll() is not None, f"owned server remains: {real.pid}"
+                for pid, identity in launchers:
+                    reap_launcher(pid, identity)
+                assert not errors, errors
+                assert servers, "no real server was owned"
+                print(f"PASS natural discovery cleanup mode={mode}: server PIDs={[p.pid for p in servers]} exited, launcher PIDs={[p for p, _ in launchers]} exited")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--client", type=Path, required=True)
@@ -271,6 +447,7 @@ def main():
                                   cwd=root, capture_output=True, text=True, errors="replace", timeout=240)
         output = (compiled.stdout or "") + (compiled.stderr or "")
         assert compiled.returncode == 0 and "error:" not in output.lower() and args.client.exists(), output
+    executable_resolution_probe(args.client)
     errors = []
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -317,6 +494,17 @@ def main():
                 if server.poll() is None:
                     server.kill()
                     server.communicate()
+        assert args.zanc, "natural discovery regression requires --zanc for its test launcher"
+        output_dir = args.client.resolve().parent / "test-out"
+        with tempfile.TemporaryDirectory(prefix="lsp_launcher_", dir=output_dir) as temporary:
+            launcher = Path(temporary) / ("zan-lsp" + args.server.suffix)
+            root = Path(__file__).resolve().parents[2]
+            compiled = subprocess.run([str(args.zanc.resolve()), str(root / "tests/lsp/lsp_launcher_test.zan"),
+                                       "--auto-stdlib", "-o", str(launcher)], cwd=root,
+                                      capture_output=True, text=True, errors="replace", timeout=90)
+            assert compiled.returncode == 0 and launcher.exists(), compiled.stdout + compiled.stderr
+            for mode in ("normal", "timeout", "exit"):
+                natural_discovery_probe(args.client, args.server, launcher, mode)
         project_probe(args.server)
 
 

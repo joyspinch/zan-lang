@@ -4,7 +4,11 @@ using System.Json;
 
 public class MarketplacePackage {
     string id;
+    string slug;
     string packageName;
+    List<string> providedNamespaces;
+    string productUrl;
+    string purchaseUrl;
     string displayName;
     string description;
     string category;
@@ -18,13 +22,57 @@ public class MarketplacePackage {
     int pricePoints;
     List<MarketplacePlan> plans;
     List<MarketplaceVersion> versions;
+    bool detailPricing;
+
+    // Catalog minimums are display hints. Only a complete detail response carries
+    // the server's enabled-plan set (ProductJson omits the enabled field).
+    bool HasKnownPricing() {
+        if (!detailPricing || pricePoints < 0 || plans.Count == 0) { return false; }
+        int minimum = -1;
+        for (int i = 0; i < plans.Count; i = i + 1) {
+            MarketplacePlan plan = plans[i];
+            if (plan == null || plan.id == "" || plan.pricePoints < 0) { return false; }
+            if (minimum < 0 || plan.pricePoints < minimum) { minimum = plan.pricePoints; }
+        }
+        return minimum == pricePoints;
+    }
+
+    bool CanInstallFree() { return this.IsExtension() && this.IsFree() && this.HasKnownPricing(); }
 
     MarketplacePackage() {
+        providedNamespaces = new List<string>();
         plans = new List<MarketplacePlan>();
         versions = new List<MarketplaceVersion>();
     }
 
+    // Missing/invalid pricing is unknown, never a free install permission.
     bool IsFree() { return pricePoints == 0; }
+    bool IsExtension() { return productType == "extension" || productType == "plugin"; }
+
+    bool Provides(string ns) {
+        return this.NamespaceMatchLength(ns) > 0;
+    }
+
+    int NamespaceMatchLength(string ns) {
+        int longest = 0;
+        if (!this.IsExtension() || ns == "") { return longest; }
+        for (int i = 0; i < providedNamespaces.Count; i = i + 1) {
+            string provided = providedNamespaces[i];
+            if (provided.Length > longest && (ns == provided
+                || ns.StartsWith(provided + "."))) { longest = provided.Length; }
+        }
+        return longest;
+    }
+
+    string NamespaceLabel() {
+        string label = "";
+        for (int i = 0; i < providedNamespaces.Count; i = i + 1) {
+            if (i > 0) { label = label + ", "; }
+            label = label + providedNamespaces[i];
+        }
+        return label;
+    }
+
     bool IsApp() { return productType == "app"; }
     bool IsPlugin() { return productType == "plugin"; }
 
@@ -33,28 +81,69 @@ public class MarketplacePackage {
         return versions[0];
     }
 
+    public static int Price(JsonDoc doc, int node, string key) {
+        int slot = doc.Get(node, key);
+        // KindAt includes fractions; LongAt truncates them and coerces strings/bools.
+        // Prices require an unsigned integer token, parsed with an explicit overflow gate.
+        if (slot < 0 || doc.KindAt(slot) != 2) { return -1; }
+        string text = doc.StrAt(slot, "");
+        if (text == "") { return -1; }
+        int price = 0;
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int digit = (text[i] & 255) - 48;
+            if (digit < 0 || digit > 9) { return -1; }
+            if (price > 214748364 || (price == 214748364 && digit > 7)) { return -1; }
+            price = price * 10 + digit;
+        }
+        return price;
+    }
+
+    public static string DocId(JsonDoc doc, int node, string key) {
+        string id = doc.Str(node, key, "");
+        if (id != "") { return id; }
+        long number = doc.Long(node, key, -1L);
+        return number >= 0L ? Convert.ToString(number) : "";
+    }
+
     public static MarketplacePackage FromCatalogDoc(JsonDoc doc, int node) {
         MarketplacePackage package = new MarketplacePackage();
-        package.id = doc.Str(node, "id", "");
-        package.packageName = doc.Str(node, "slug", "");
+        package.id = MarketplacePackage.DocId(doc, node, "id");
+        package.slug = doc.Str(node, "slug", "");
+        package.packageName = doc.Str(node, "package_name", "");
+        package.productUrl = doc.Str(node, "product_url", "");
+        package.purchaseUrl = doc.Str(node, "purchase_url", "");
+        int namespaces = doc.Get(node, "provided_namespaces");
+        if (namespaces >= 0 && doc.KindAt(namespaces) == 4) {
+            int child = doc.FirstChild(namespaces);
+            int count = doc.Count(namespaces);
+            for (int i = 0; i < count && child >= 0; i = i + 1) {
+                string ns = doc.StrAt(child, "");
+                if (ns != "") { package.providedNamespaces.Add(ns); }
+                child = doc.NextSibling(child);
+            }
+        }
         package.displayName = doc.Str(node, "name", "");
         package.description = doc.Str(node, "description", "");
         package.category = doc.Str(node, "category", "");
         package.productType = doc.Str(node, "product_type", "extension");
         package.pluginId = doc.Str(node, "plugin_id", "");
         package.pubkeyFp = doc.Str(node, "pubkey_fp", "");
-        package.pricePoints = (int)doc.Long(node, "price_points", 0L);
+        package.pricePoints = MarketplacePackage.Price(doc, node, "min_price_points");
         return package;
     }
 
     public static MarketplacePackage FromProductDoc(JsonDoc doc, int node) {
         MarketplacePackage package = MarketplacePackage.FromCatalogDoc(doc, node);
         int planValues = doc.Get(node, "plans");
-        if (planValues >= 0 && doc.KindAt(planValues) == 4) {
+        package.detailPricing = planValues >= 0 && doc.KindAt(planValues) == 4;
+        if (package.detailPricing) {
             int child = doc.FirstChild(planValues);
-            while (child >= 0) {
+            int count = doc.Count(planValues);
+            for (int i = 0; i < count && child >= 0; i = i + 1) {
                 if (doc.KindAt(child) == 5) {
                     package.plans.Add(MarketplacePlan.FromDoc(doc, child));
+                } else {
+                    package.detailPricing = false;
                 }
                 child = doc.NextSibling(child);
             }
@@ -62,7 +151,8 @@ public class MarketplacePackage {
         int versionValues = doc.Get(node, "versions");
         if (versionValues >= 0 && doc.KindAt(versionValues) == 4) {
             int child = doc.FirstChild(versionValues);
-            while (child >= 0) {
+            int count = doc.Count(versionValues);
+            for (int i = 0; i < count && child >= 0; i = i + 1) {
                 if (doc.KindAt(child) == 5) {
                     package.versions.Add(MarketplaceVersion.FromDoc(doc, child));
                 }

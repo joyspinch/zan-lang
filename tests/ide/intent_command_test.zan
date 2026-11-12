@@ -1,0 +1,124 @@
+// IDE 全局意图与命令分发 (Ctrl+K) 及行内智能体协作 (Ctrl+I) 回归用例
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+class IntentCommandTest {
+    static int bad = 0;
+
+    static void Check(string what, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + what);
+            IntentCommandTest.bad = IntentCommandTest.bad + 1;
+        }
+    }
+
+    // 辅助测试调度器：模拟 ZanIDE.DispatchIntentCommand 的意图匹配核心规范
+    static int RouteCommand(string raw, out string agentIntent) {
+        agentIntent = "";
+        if (raw == null) { return -1; }
+        string text = raw.Trim();
+        if (text.Length == 0) { return -1; }
+
+        if (text.StartsWith(">")) {
+            text = text.Substring(1).Trim();
+        }
+        string lower = text.ToLower();
+
+        if (lower == "run" || lower == "r" || lower == "运行") { return 4; }
+        if (lower == "debug" || lower == "d" || lower == "调试") { return 7; }
+        if (lower == "publish" || lower == "pub" || lower == "发布") { return 6; }
+        if (lower == "hot" || lower == "热重载") { return 11; }
+        if (lower == "save" || lower == "s" || lower == "保存") { return 3; }
+        if (lower == "format" || lower == "fmt" || lower == "格式化") { return 90; }
+        if (lower == "new" || lower == "新建") { return 1; }
+        if (lower == "open" || lower == "打开") { return 2; }
+        if (lower == "folder" || lower == "打开项目") { return 16; }
+        if (lower == "agent" || lower == "ai" || lower == "智能体") { return 19; }
+        if (lower == "diff" || lower == "差异" || lower == "审查") { return 91; }
+        if (lower == "cert" || lower == "signing" || lower == "证书" || lower == "签名") { return 92; }
+        if (lower == "header" || lower == "compact" || lower == "ribbon" || lower == "精简" || lower == "功能区") { return 20; }
+        if (lower == "git") { return 93; }
+        if (lower == "terminal" || lower == "终端") { return 94; }
+        if (lower == "output" || lower == "输出") { return 95; }
+        if (lower == "errors" || lower == "错误") { return 96; }
+
+        // 未命中任何快捷指令，全量作为自然语言意图直达 AI Agent
+        agentIntent = text;
+        return 100;
+    }
+
+    static string BuildInlineAgentPrompt(string path, string locDesc, string userPrompt, string selCode) {
+        return "【行内代码编辑请求】\n"
+            + "目标文件: " + path + " (" + locDesc + ")\n"
+            + "用户需求: " + userPrompt + "\n"
+            + "待修改或参照的代码:\n"
+            + "```zan\n" + selCode + "\n```\n"
+            + "请使用 edit_file 或 write_file 工具提出变更（变更将被暂存至差异审阅沙箱）。";
+    }
+
+    static void Main() {
+        string intent = "";
+
+        // ---- 1. 直达动作与别名匹配测试 ----
+        Check("cmd-run", RouteCommand("run", out intent) == 4 && intent == "");
+        Check("cmd-r", RouteCommand("r", out intent) == 4);
+        Check("cmd-run-zh", RouteCommand("运行", out intent) == 4);
+        Check("cmd-run-upper", RouteCommand("RUN", out intent) == 4);
+        Check("cmd-run-gt", RouteCommand("> run", out intent) == 4);
+
+        Check("cmd-debug", RouteCommand("debug", out intent) == 7);
+        Check("cmd-d", RouteCommand("d", out intent) == 7);
+        Check("cmd-debug-zh", RouteCommand("调试", out intent) == 7);
+
+        Check("cmd-publish", RouteCommand("publish", out intent) == 6);
+        Check("cmd-pub", RouteCommand("pub", out intent) == 6);
+        Check("cmd-publish-zh", RouteCommand("发布", out intent) == 6);
+
+        Check("cmd-hot", RouteCommand("hot", out intent) == 11);
+        Check("cmd-hot-zh", RouteCommand("热重载", out intent) == 11);
+
+        Check("cmd-save", RouteCommand("save", out intent) == 3);
+        Check("cmd-format", RouteCommand("format", out intent) == 90);
+        Check("cmd-fmt", RouteCommand("fmt", out intent) == 90);
+
+        Check("cmd-cert", RouteCommand("cert", out intent) == 92);
+        Check("cmd-signing", RouteCommand("signing", out intent) == 92);
+        Check("cmd-signing-zh", RouteCommand("签名", out intent) == 92);
+
+        Check("cmd-compact", RouteCommand("compact", out intent) == 20);
+        Check("cmd-header", RouteCommand("header", out intent) == 20);
+        Check("cmd-compact-zh", RouteCommand("精简", out intent) == 20);
+
+        Check("cmd-diff", RouteCommand("diff", out intent) == 91);
+        Check("cmd-diff-zh", RouteCommand("差异", out intent) == 91);
+
+        // ---- 2. 自然语言意图直达测试 ----
+        int nl1 = RouteCommand("帮我优化这几个热路径循环的内存分配", out intent);
+        Check("intent-nl-code", nl1 == 100);
+        Check("intent-nl-text", intent == "帮我优化这几个热路径循环的内存分配");
+
+        int nl2 = RouteCommand("add user authentication and token refresh logic", out intent);
+        Check("intent-nl2-code", nl2 == 100);
+        Check("intent-nl2-text", intent == "add user authentication and token refresh logic");
+
+        int nl3 = RouteCommand("> 把所有图表绘制改成零分配上下文池", out intent);
+        Check("intent-nl3-code", nl3 == 100);
+        Check("intent-nl3-text", intent == "把所有图表绘制改成零分配上下文池");
+
+        // ---- 3. 行内智能体指令构造测试 ----
+        string prompt = BuildInlineAgentPrompt("src/render/Chart.zan", "line 42", "重构为 zero-alloc 静态池", "for (int i = 0; i < n; i++) { ... }");
+        Check("inline-prompt-target", prompt.IndexOf("src/render/Chart.zan") >= 0);
+        Check("inline-prompt-loc", prompt.IndexOf("line 42") >= 0);
+        Check("inline-prompt-req", prompt.IndexOf("重构为 zero-alloc 静态池") >= 0);
+        Check("inline-prompt-code", prompt.IndexOf("for (int i = 0; i < n; i++)") >= 0);
+        Check("inline-prompt-sandbox", prompt.IndexOf("差异审阅沙箱") >= 0);
+
+        // ---- 4. 空白与边界测试 ----
+        Check("cmd-null", RouteCommand(null, out intent) == -1);
+        Check("cmd-empty", RouteCommand("   ", out intent) == -1);
+
+        Console.WriteLine("ide-intent-command-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        Environment.Exit(bad == 0 ? 0 : 1);
+    }
+}

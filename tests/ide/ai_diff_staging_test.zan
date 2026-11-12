@@ -1,0 +1,119 @@
+// IDE AI 虚拟差异暂存 (AiDiff & AiStaging) 回归用例
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+class AiDiffStagingTest {
+    static int bad = 0;
+
+    static void Check(string what, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + what);
+            AiDiffStagingTest.bad = AiDiffStagingTest.bad + 1;
+        }
+    }
+
+    static void Main() {
+        // ---- 1. 行切分与规范化测试 ----
+        List<string> lines = AiDiff.SplitLines("Line 1\r\nLine 2\nLine 3");
+        Check("split-count", lines.Count == 3);
+        Check("split-line1", lines[0] == "Line 1");
+        Check("split-line2", lines[1] == "Line 2");
+        Check("split-line3", lines[2] == "Line 3");
+
+        // ---- 2. 差异算法基础：相同文本 ----
+        string src1 = "alpha\nbeta\ngamma\n";
+        List<DiffLine> diffs1 = AiDiff.Compare(src1, src1);
+        int adds1 = 0;
+        int dels1 = 0;
+        AiDiff.CountChanges(diffs1, out adds1, out dels1);
+        Check("same-diffs-count", diffs1.Count == 3);
+        Check("same-adds", adds1 == 0);
+        Check("same-dels", dels1 == 0);
+
+        // ---- 3. 差异算法：单行插入、删除与修改 ----
+        string oldText = "line 1\nline 2\nline 3\nline 4\n";
+        string newText = "line 1\nline 2 (modified)\nline 3\nline 3.5 (added)\nline 4\n";
+        List<DiffLine> diffs2 = AiDiff.Compare(oldText, newText);
+        int adds2 = 0;
+        int dels2 = 0;
+        AiDiff.CountChanges(diffs2, out adds2, out dels2);
+        Check("mod-adds", adds2 == 2);
+        Check("mod-dels", dels2 == 1);
+
+        // ---- 4. 差异算法边界：从无到有 (全增) 与从有到无 (全删) ----
+        List<DiffLine> diffsAllAdd = AiDiff.Compare("", "one\ntwo\nthree\n");
+        int adds3 = 0;
+        int dels3 = 0;
+        AiDiff.CountChanges(diffsAllAdd, out adds3, out dels3);
+        Check("alladd-adds", adds3 == 3);
+        Check("alladd-dels", dels3 == 0);
+
+        List<DiffLine> diffsAllDel = AiDiff.Compare("one\ntwo\n", "");
+        int adds4 = 0;
+        int dels4 = 0;
+        AiDiff.CountChanges(diffsAllDel, out adds4, out dels4);
+        Check("alldel-adds", adds4 == 0);
+        Check("alldel-dels", dels4 == 2);
+
+        // ---- 5. AiStaging 路径规范化 ----
+        Check("norm-path-1", AiStaging.NormalizePath("src\\App.zan") == "src/App.zan");
+        Check("norm-path-2", AiStaging.NormalizePath("/src/core/utils.zan") == "src/core/utils.zan");
+
+        // ---- 6. AiStaging 暂存、审阅、接受与丢弃生命周期 ----
+        AiStaging.Clear();
+        Check("init-pending", AiStaging.PendingCount() == 0);
+
+        string testRoot = "_scratch/test_ai_diff";
+        string testRel = "src/Sub/Foo.zan";
+        string fullTestPath = AiStaging.ResolveFullPath(testRoot, testRel);
+
+        if (File.Exists(fullTestPath)) {
+            File.Delete(fullTestPath);
+        }
+        string parentDir = Path.GetDirectoryName(fullTestPath);
+        if (!Directory.Exists(parentDir)) {
+            Directory.CreateDirectory(parentDir);
+        }
+        File.WriteAllText(fullTestPath, "original line 1\noriginal line 2\n");
+
+        // 暂存修改（不应直接写盘）
+        string stagedContent = "original line 1\nmodified line 2\nnew line 3\n";
+        StagedFile sf = AiStaging.Stage(testRoot, testRel, stagedContent);
+        Check("staged-not-null", sf != null);
+        Check("staged-pending-count", AiStaging.PendingCount() == 1);
+        Check("staged-disk-untouched", File.ReadAllText(fullTestPath) == "original line 1\noriginal line 2\n");
+
+        // 接受修改（写盘并标记已接受）
+        bool acceptOk = AiStaging.Accept(testRoot, testRel);
+        Check("accept-ok", acceptOk);
+        Check("accept-pending-count", AiStaging.PendingCount() == 0);
+        Check("disk-updated", File.ReadAllText(fullTestPath) == stagedContent);
+
+        // 再次暂存后丢弃
+        AiStaging.Stage(testRoot, testRel, "should be discarded\n");
+        Check("discard-pending-count", AiStaging.PendingCount() == 1);
+        bool rejectOk = AiStaging.Reject(testRel);
+        Check("reject-ok", rejectOk);
+        Check("reject-pending-count", AiStaging.PendingCount() == 0);
+        Check("disk-still-staged-content", File.ReadAllText(fullTestPath) == stagedContent);
+
+        // 清理临时文件
+        if (File.Exists(fullTestPath)) {
+            File.Delete(fullTestPath);
+        }
+        if (Directory.Exists(parentDir)) {
+            Directory.Delete(parentDir);
+        }
+        string testSub = Path.GetDirectoryName(parentDir);
+        if (Directory.Exists(testSub)) {
+            Directory.Delete(testSub);
+        }
+        if (Directory.Exists(testRoot)) {
+            Directory.Delete(testRoot);
+        }
+
+        Console.WriteLine("ide-ai-diff-staging-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        Environment.Exit(bad == 0 ? 0 : 1);
+    }
+}
