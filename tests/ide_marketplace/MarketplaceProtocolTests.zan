@@ -1,0 +1,128 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+// Compile with the actual MarketplacePackage/Plan/Version/Response/Protocol sources.
+// GUI-free regression; the parent session owns compile/run serialization.
+class Program {
+    static void Check(bool condition, string message) {
+        if (!condition) { throw new Exception("marketplace regression: " + message); }
+    }
+
+    static MarketplacePackage Product(string fields) {
+        return MarketplaceResponse.Product("{\"code\":0,\"data\":{" + fields + "}}");
+    }
+
+    static void Responses() {
+        Check(MarketplaceResponse.IsRegistryResponse("{\"code\":0,\"data\":[]}"), "current numeric success");
+        Check(MarketplaceResponse.IsRegistryResponse("{\"code\":\"0000\",\"data\":[]}"), "legacy success");
+        Check(!MarketplaceResponse.IsRegistryResponse("{\"data\":[]}"), "missing code rejected");
+        Check(!MarketplaceResponse.IsRegistryResponse("{\"code\":null,\"data\":[]}"), "null code rejected");
+        Check(!MarketplaceResponse.IsRegistryResponse("{\"code\":false,\"data\":[]}"), "boolean code rejected");
+        Check(!MarketplaceResponse.IsRegistryResponse("{\"code\":\"0\",\"data\":[]}"), "string zero rejected");
+        Check(!MarketplaceResponse.IsRegistryResponse("{\"code\":1,\"data\":[]}"), "failure code rejected");
+        Check(!MarketplaceResponse.IsRegistryResponse("{\"code\":0.5,\"data\":[]}"), "fractional code rejected");
+        Check(!MarketplaceResponse.IsRegistryResponse("{\"code\":-0.5,\"data\":[]}"), "negative fraction code rejected");
+        Check(!MarketplaceResponse.IsRegistryResponse("{\"code\":1e-9999,\"data\":[]}"), "nonzero underflow code rejected");
+        Check(MarketplaceResponse.IsRegistryResponse("{\"code\":0.0,\"data\":[]}"), "exact decimal zero succeeds");
+        Check(MarketplaceResponse.IsRegistryResponse("{\"code\":-0e10,\"data\":[]}"), "exact exponent zero succeeds");
+        Check(!MarketplaceResponse.IsRegistryResponse("malformed"), "malformed response rejected");
+        Check(MarketplaceResponse.Catalog("{\"code\":0,\"data\":[{\"id\":17,\"slug\":\"widget\"}]}").Count == 1,
+            "catalog accepts current response");
+    }
+
+    static void Models() {
+        MarketplacePackage unknown = Product("\"slug\":\"widget\",\"price_points\":0");
+        Check(unknown != null, "unknown-price product parses");
+        Check(!unknown.IsFree() && unknown.pricePoints == -1, "legacy price never grants free install");
+        MarketplacePackage huge = Product("\"min_price_points\":2147483648");
+        Check(huge != null && !huge.IsFree(), "price overflow fails closed");
+        MarketplacePackage invalid = Product("\"min_price_points\":\"oops\"");
+        Check(invalid != null && !invalid.IsFree(), "invalid price fails closed");
+        MarketplacePackage booleanPrice = Product("\"min_price_points\":false");
+        Check(booleanPrice != null && !booleanPrice.IsFree(), "boolean price fails closed");
+        MarketplacePackage fractionalPrice = Product("\"min_price_points\":0.5");
+        Check(fractionalPrice != null && !fractionalPrice.IsFree(), "fractional price fails closed");
+        MarketplacePackage exponentPrice = Product("\"min_price_points\":1e-9999");
+        Check(exponentPrice != null && exponentPrice.pricePoints == -1, "exponent price cannot underflow to free");
+        MarketplacePackage negativeFraction = Product("\"min_price_points\":-0.5");
+        Check(negativeFraction != null && negativeFraction.pricePoints == -1, "negative fraction cannot truncate to free");
+        MarketplacePackage planFraction = Product("\"min_price_points\":1,\"plans\":[{\"price_points\":0.5}]");
+        Check(planFraction != null && planFraction.plans.Count == 1 && planFraction.plans[0].pricePoints == -1,
+            "detail plan prices use the same strict integer path");
+        MarketplacePackage maximumPrice = Product("\"min_price_points\":2147483647");
+        Check(maximumPrice != null && maximumPrice.pricePoints == 2147483647, "maximum supported integer price");
+        MarketplacePackage package = Product("\"id\":17,\"slug\":\"widget-product\",\"package_name\":\"Acme.Widgets\","
+            + "\"min_price_points\":25,\"product_type\":\"extension\","
+            + "\"provided_namespaces\":[\"Acme.UI\",\"Acme.UI.Charts\"],"
+            + "\"plans\":[{\"id\":7,\"name\":\"Annual\",\"price_points\":25,\"duration_days\":365,\"license_mode\":\"subscription\"}],"
+            + "\"versions\":[{\"version\":\"1.2.3+build.4\",\"artifact_signature\":\"signed-base64\"}]");
+        Check(package != null, "detail parses");
+        Check(package.id == "17" && package.slug == "widget-product" && package.packageName == "Acme.Widgets",
+            "numeric identity and package name stay separate");
+        Check(package.pricePoints == 25 && !package.IsFree(), "minimum price used");
+        Check(package.Provides("Acme.UI.Charts.Axis"), "provided namespace prefix matches");
+        Check(package.NamespaceMatchLength("Acme.UI.Charts.Axis") == 14, "longest namespace wins");
+        Check(!package.Provides("Acme.UITools") && !package.Provides("Acme"), "namespace boundary respected");
+        Check(package.plans.Count == 1 && package.plans[0].pricePoints == 25
+            && package.plans[0].durationDays == 365, "detail plans preserved");
+        MarketplaceVersion version = package.LatestVersion();
+        Check(version != null && version.artifactSignature == "signed-base64", "signature field preserved");
+        MarketplacePackage app = Product("\"product_type\":\"app\",\"min_price_points\":0,\"provided_namespaces\":[\"Acme.UI\"]");
+        Check(app != null && app.IsApp() && !app.IsExtension() && !app.Provides("Acme.UI"), "apps never resolve extensions");
+        MarketplacePackage free = Product("\"product_type\":\"extension\",\"min_price_points\":0");
+        Check(free != null && free.IsFree() && free.IsExtension(), "explicit free extension");
+    }
+
+    static void UrlsAndSigning() {
+        string origin = "https://mall.example";
+        Check(MarketplaceProtocol.ResolveUrl("https://cdn.example/file.zip", origin)
+            == "https://cdn.example/file.zip", "absolute artifact URL remains absolute");
+        Check(MarketplaceProtocol.ResolveUrl("/api/mall/artifact?version_id=3", origin)
+            == origin + "/api/mall/artifact?version_id=3", "protected relative artifact URL");
+        Check(MarketplaceProtocol.ResolveUrl("packages/a.zip", origin) == origin + "/packages/a.zip", "relative artifact URL");
+        Check(MarketplaceProtocol.ResolveUrl("//evil.example/a", origin) == "", "scheme-relative rejected");
+        Check(MarketplaceProtocol.ResolveUrl("javascript:alert(1)", origin) == "", "script scheme rejected");
+        Check(MarketplaceProtocol.ResolveUrl("file:///tmp/a.zip", origin) == "", "file scheme rejected");
+        Check(MarketplaceProtocol.ResolveUrl("https://user@evil.example/a", origin) == "", "credentials rejected");
+        Check(MarketplaceProtocol.ResolveUrl("http://cdn.example/a", origin) == "", "public plaintext rejected");
+        Check(MarketplaceProtocol.ResolveUrl("http://127.0.0.1:8080/a", origin) != "", "local development HTTP supported");
+        MarketplacePackage paid = Product("\"id\":17,\"min_price_points\":25");
+        Check(paid != null && MarketplaceProtocol.BrowserUrl(paid, origin) == origin + "/mall/product?id=17",
+            "purchase fallback uses real product route");
+        string sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        Check(MarketplaceProtocol.ValidSha256(sha), "canonical SHA256");
+        Check(!MarketplaceProtocol.ValidSha256("") && !MarketplaceProtocol.ValidSha256(sha.ToUpper()), "missing/noncanonical SHA rejected");
+        Check(MarketplaceProtocol.SafeVersion("1.2.3+build.4"), "semver build metadata");
+        Check(!MarketplaceProtocol.SafeName("../escape") && !MarketplaceProtocol.SafeName("name;command"), "unsafe identities rejected");
+        Check(MarketplaceProtocol.SignedMessage("widget", "1.2.3", sha) == "widget\n1.2.3\n" + sha,
+            "exact signature bytes with no trailing LF");
+        Check(!MarketplaceProtocol.VerifySignature("", "widget", "1.2.3", sha, "arbitrary-server-signature"),
+            "signature cannot establish trust without independent trusted key");
+    }
+
+    static void Signatures(string[] args) {
+        Check(args.Length == 3, "independent OpenSSL public key/signature/other-key fixtures required");
+        string pem = File.ReadAllText(args[0]);
+        string signature = File.ReadAllText(args[1]).Trim();
+        string otherPem = File.ReadAllText(args[2]);
+        string sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        Check(MarketplaceProtocol.VerifySignature(pem, "widget", "1.2.3", sha, signature), "independent valid signature");
+        Check(!MarketplaceProtocol.VerifySignature(otherPem, "widget", "1.2.3", sha, signature), "wrong trusted signer rejected");
+        Check(MarketplaceProtocol.VerifySignature(otherPem + "\n" + pem, "widget", "1.2.3", sha, signature), "rotation overlap verifies previous signer");
+        Check(!MarketplaceProtocol.VerifySignature(pem + "\ninvalid", "widget", "1.2.3", sha, signature), "invalid keyset tail fails closed");
+        Check(!MarketplaceProtocol.VerifySignature(pem + "\n" + pem, "widget", "1.2.3", sha, signature), "duplicate keyset fails closed");
+        Check(!MarketplaceProtocol.VerifySignature(pem, "other", "1.2.3", sha, signature), "slug tamper rejected");
+        Check(!MarketplaceProtocol.VerifySignature(pem, "widget", "2.0.0", sha, signature), "version tamper rejected");
+        Check(!MarketplaceProtocol.VerifySignature(pem, "widget", "1.2.3", sha.Substring(0, 63) + "0", signature), "digest tamper rejected");
+        Check(!MarketplaceProtocol.VerifySignature(pem, "widget", "1.2.3", sha, "bad-base64!"), "malformed signature rejected");
+    }
+
+    static void Main(string[] args) {
+        Program.Responses();
+        Program.Models();
+        Program.UrlsAndSigning();
+        Program.Signatures(args);
+        Console.WriteLine("marketplace protocol regressions passed");
+    }
+}

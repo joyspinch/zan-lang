@@ -1,0 +1,102 @@
+using System;
+using System.Collections.Generic;
+
+// Compile actual MarketplaceResponse/Package/Plan/Version/Protocol and
+// MarketplaceInstall (plus its normal dependencies). No decision stubs.
+// These GUI host collaborators are outside the pricing decision. Any call is
+// a test failure: rejection must happen before the installation pipeline.
+class PluginUsage {
+    static void Observe(string text) { throw new Exception("unexpected plugin side effect"); }
+}
+class ZanIDE {
+    static void EnsureCacheDir() { throw new Exception("unexpected cache creation"); }
+    static string CacheDir() { throw new Exception("unexpected cache lookup"); }
+    static string Zanc() { throw new Exception("unexpected compiler lookup"); }
+    static string StdlibDir() { throw new Exception("unexpected stdlib lookup"); }
+    static List<string> SplitLinesOf(string text) { throw new Exception("unexpected installer output"); }
+}
+class MarketplacePriceGateTests {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("marketplace price gate: " + label); }
+    }
+    static string Detail(string pricing) {
+        return "{\"code\":0,\"data\":{\"id\":17,\"slug\":\"price-gate\","
+            + "\"package_name\":\"Zan.PriceGate\",\"product_type\":\"extension\","
+            + "\"provided_namespaces\":[\"Zan.PriceGate\"]," + pricing + ","
+            + "\"versions\":[{\"version\":\"1.0.0\",\"artifact_url\":\"file:///price-gate-never-download.zip\","
+            + "\"artifact_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+            + "\"artifact_signature\":\"not-used-before-url-validation\"}],\"after_versions\":{\"version\":\"must-not-parse\"}}}";
+    }
+    static string Plan(string price) {
+        return "{\"id\":7,\"name\":\"Plan\",\"license_mode\":\"once\",\"duration_days\":0,\"price_points\":" + price + "}";
+    }
+    static void StartWithoutEffects(MarketplacePackage package, string expected, string label) {
+        // An invalid artifact URL is a downstream tripwire: a price regression
+        // fails the exact rejection assertion without initiating network work.
+        // Do not BeginShutdown: that would bypass the production pricing gate.
+        Check(!MarketplaceInstall.closing && !MarketplaceInstall.Busy(), label + " idle precondition");
+        int step = MarketplaceInstall.step;
+        int workers = MarketplaceInstall.workers == null ? 0 : MarketplaceInstall.workers.Count;
+        string progress = MarketplaceInstall.Progress();
+        string artifact = MarketplaceInstall.artifactUrl;
+        string root = MarketplaceInstall.installRoot;
+        string outcome = MarketplaceInstall.outcome;
+        bool succeeded = MarketplaceInstall.LastSucceeded();
+        string error = MarketplaceInstall.Start(package, "build/test-out/marketplace-price-gate-never-install");
+        Check(error == expected, label + " exact gate rejection");
+        Check(!MarketplaceInstall.Busy() && MarketplaceInstall.step == step, label + " no download started");
+        int afterWorkers = MarketplaceInstall.workers == null ? 0 : MarketplaceInstall.workers.Count;
+        Check(afterWorkers == workers, label + " no worker dispatched");
+        Check(MarketplaceInstall.Progress() == progress && MarketplaceInstall.artifactUrl == artifact
+            && MarketplaceInstall.installRoot == root && MarketplaceInstall.outcome == outcome
+            && MarketplaceInstall.LastSucceeded() == succeeded, label + " installer state untouched");
+    }
+    static void Reject(string label, string response) {
+        MarketplacePackage package = MarketplaceResponse.Product(response);
+        if (package != null) { Check(!package.CanInstallFree(), label + " no free authorization"); }
+        StartWithoutEffects(package, MarketplaceInstall.T("use the product page to purchase or download",
+            "请到商品页购买或下载"), label);
+    }
+    static void Main() {
+        Reject("missing minimum", Detail("\"plans\":[" + Plan("0") + "]"));
+        Reject("legacy price only", Detail("\"price_points\":0,\"plans\":[" + Plan("0") + "]"));
+        Reject("null minimum", Detail("\"min_price_points\":null"));
+        Reject("negative minimum", Detail("\"min_price_points\":-1"));
+        Reject("string minimum", Detail("\"min_price_points\":\"0\""));
+        Reject("boolean minimum", Detail("\"min_price_points\":false"));
+        Reject("fraction minimum", Detail("\"min_price_points\":0.5"));
+        Reject("underflow minimum", Detail("\"min_price_points\":1e-9999"));
+        Reject("overflow minimum", Detail("\"min_price_points\":2147483648"));
+        Reject("missing plans", Detail("\"min_price_points\":0"));
+        Reject("empty plans", Detail("\"min_price_points\":0,\"plans\":[]"));
+        Reject("null plans", Detail("\"min_price_points\":0,\"plans\":null"));
+        Reject("wrong plans type", Detail("\"min_price_points\":0,\"plans\":{}"));
+        Reject("missing plan price", Detail("\"min_price_points\":0,\"plans\":[{\"id\":7}]"));
+        Reject("missing plan identity", Detail("\"min_price_points\":0,\"plans\":[{\"price_points\":0}]"));
+        Reject("negative plan", Detail("\"min_price_points\":0,\"plans\":[" + Plan("-1") + "]"));
+        Reject("string plan", Detail("\"min_price_points\":0,\"plans\":[" + Plan("\"0\"") + "]"));
+        Reject("fraction plan", Detail("\"min_price_points\":0,\"plans\":[" + Plan("0.5") + "]"));
+        Reject("inconsistent paid plan", Detail("\"min_price_points\":0,\"plans\":[" + Plan("25") + "]"));
+        Reject("partially malformed plans", Detail("\"min_price_points\":0,\"plans\":[" + Plan("0") + ",null]"));
+        Reject("mixed invalid plans", Detail("\"min_price_points\":0,\"plans\":[" + Plan("0") + "," + Plan("-1") + "]"));
+        Reject("malformed response", "{\"code\":0,\"data\":");
+        Reject("failure envelope", "{\"code\":1,\"data\":{\"min_price_points\":0}}");
+        MarketplacePackage free = MarketplaceResponse.Product(Detail("\"min_price_points\":0,\"plans\":[" + Plan("0") + "]"));
+        Check(free != null && free.IsFree() && free.HasKnownPricing() && free.CanInstallFree(), "actual enabled zero-plan detail allowed");
+        Check(free.plans.Count == 1 && free.versions.Count == 1 && free.providedNamespaces.Count == 1,
+            "server field order preserves array boundaries");
+        StartWithoutEffects(free, "invalid artifact URL", "valid free passes price gate only");
+        MarketplacePackage mixed = MarketplaceResponse.Product(Detail("\"min_price_points\":0,\"plans\":[" + Plan("25") + "," + Plan("0") + "]"));
+        Check(mixed != null && mixed.CanInstallFree() && mixed.plans.Count == 2 && mixed.versions.Count == 1,
+            "multiple enabled plans before versions retain minimum and boundaries");
+        MarketplacePackage paid = MarketplaceResponse.Product(Detail("\"min_price_points\":25,\"plans\":[" + Plan("25") + "]"));
+        Check(paid != null && paid.HasKnownPricing() && !paid.CanInstallFree(), "known paid remains known");
+        Reject("known paid", Detail("\"min_price_points\":25,\"plans\":[" + Plan("25") + "]"));
+        List<MarketplacePackage> catalog = MarketplaceResponse.Catalog("{\"code\":0,\"data\":[{\"min_price_points\":0}]}");
+        Check(catalog.Count == 1 && catalog[0].IsFree() && !catalog[0].HasKnownPricing()
+            && !catalog[0].CanInstallFree(), "catalog free display grants no install permission");
+        StartWithoutEffects(catalog[0], MarketplaceInstall.T("use the product page to purchase or download",
+            "请到商品页购买或下载"), "catalog cannot install");
+        Console.WriteLine("marketplace price gate PASS");
+    }
+}

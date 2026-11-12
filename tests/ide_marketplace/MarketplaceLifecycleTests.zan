@@ -1,0 +1,144 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Net.Http.Client;
+using System.Security.Cryptography;
+using AppUpdate;
+
+// Compile the actual services and protocol models; GUI-only collaborators are
+// inert so these tests exercise native HTTP, worker ownership and package install.
+class PluginUsage { static void Observe(string text) { } }
+class ZanIDE {
+    static void EnsureCacheDir() { Directory.CreateDirectoryRecursive(ZanIDE.CacheDir()); }
+    static string CacheDir() { return Environment.GetEnvironmentVariable("LIFECYCLE_ROOT") + "/cache"; }
+    static string UserConfigDir() { return Environment.GetEnvironmentVariable("LIFECYCLE_ROOT") + "/config"; }
+    static string BaseDir() { return Environment.GetEnvironmentVariable("LIFECYCLE_ROOT") + "/ide"; }
+    static string Zanc() { return Environment.GetEnvironmentVariable("LIFECYCLE_COMPILER"); }
+    static string StdlibDir() { return Environment.GetEnvironmentVariable("LIFECYCLE_STDLIB"); }
+    static List<string> SplitLinesOf(string text) { return text.Split("\n"); }
+}
+class Program {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new InvalidOperationException(message); }
+        Console.WriteLine("PASS " + message);
+    }
+    static async void WaitSeen(string root) {
+        for (int i = 0; i < 500; i = i + 1) {
+            if (File.Exists(root + "/request-seen")) { return; }
+            await Task.Delay(10);
+        }
+        throw new InvalidOperationException("request did not reach fixture");
+    }
+    static MarketplacePackage Package(string mode) {
+        MarketplacePackage package = MarketplaceResponse.Product("{\"code\":0,\"data\":{"
+            + "\"slug\":\"lifecycle-probe\",\"package_name\":\"Zan.LifecycleProbe\","
+            + "\"product_type\":\"extension\",\"min_price_points\":0,"
+            + "\"plans\":[{\"id\":1,\"name\":\"Free\",\"license_mode\":\"once\",\"price_points\":0,\"duration_days\":0}],\"versions\":[]}}");
+        Program.Check(package != null && package.CanInstallFree(), "real free detail is installable");
+        MarketplaceVersion version = new MarketplaceVersion();
+        version.version = "1.0.0";
+        version.artifactUrl = "/artifact.zip";
+        version.artifactSha256 = Environment.GetEnvironmentVariable("LIFECYCLE_SHA256");
+        version.artifactSignature = Environment.GetEnvironmentVariable("LIFECYCLE_SIGNATURE");
+        if (mode == "reject-hash") { version.artifactSha256 = "0000000000000000000000000000000000000000000000000000000000000000"; }
+        if (mode == "reject-signature") { version.artifactSignature = "AAAA"; }
+        package.versions.Add(version);
+        return package;
+    }
+    static async void Run(string mode) {
+        string root = Environment.GetEnvironmentVariable("LIFECYCLE_ROOT");
+        if (mode == "prepare-manifest") {
+            UpdateManifest manifest = UpdateManifest.LoadFromFile(Environment.GetEnvironmentVariable("LIFECYCLE_MANIFEST"));
+            File.WriteAllText(root + "/manifest-payload.bin", manifest.SigningPayload());
+            return;
+        }
+        if (mode == "idle") {
+            IdeUpdate.BeginShutdown();
+            IdeFileSync.BeginShutdown();
+            MarketplaceClient.BeginShutdown();
+            MarketplaceInstall.BeginShutdown();
+            await IdeUpdate.DrainAsync();
+            await IdeFileSync.DrainAsync();
+            await MarketplaceClient.DrainAsync();
+            await MarketplaceInstall.DrainAsync();
+            Program.Check(IdeUpdate.pending == 0 && !MarketplaceInstall.Busy(), "idle close drained");
+            return;
+        }
+        if (mode == "active-archive") {
+            UpdateManifest manifest = UpdateManifest.LoadFromFile(Environment.GetEnvironmentVariable("LIFECYCLE_MANIFEST"));
+            Program.Check(IdeSyncPlan.Trusted(manifest), "independent signed archive manifest trusted");
+            IdeSyncPlan plan = new IdeSyncPlan();
+            plan.manifest = manifest;
+            plan.release = "lifecycle-release";
+            plan.error = "";
+            IdeUpdate.syncPlan = plan;
+            IdeUpdate.syncDone = true;
+            IdeFileSync.phase = 1;
+            IdeFileSync.Poll();
+            await Program.WaitSeen(root);
+            Program.Check(IdeFileSync.Busy() && IdeFileSync.sink.Done() == "", "close begins during real pending archive HTTP");
+            IdeFileSync.BeginShutdown();
+            await IdeFileSync.DrainAsync();
+            Program.Check(!IdeFileSync.Busy(), "active archive task drained");
+            string pending = IdeFileSync.PendingDir();
+            Program.Check(File.Exists(pending + "/manifest.json"), "signed ready manifest persisted before close");
+            byte[] bytes = File.ReadAllBytes(pending + "/release.zip");
+            Program.Check(bytes != null && bytes.Length == manifest.packageSize
+                && AppUpdater.HashBytes(bytes) == manifest.packageSha256, "archive staged exact signed bytes before close");
+            Program.Check(IdeFileSync.Start() == "IDE is closing", "closing archive downloader rejects new work");
+            return;
+        }
+        if (mode == "active-catalog") {
+            Program.Check(MarketplaceClient.StartCatalog() == "", "catalog dispatched");
+            await Program.WaitSeen(root);
+            Program.Check(MarketplaceClient.sink.Done() == "", "close begins during real pending catalog HTTP");
+            MarketplaceClient.BeginShutdown();
+            await MarketplaceClient.DrainAsync();
+            Program.Check(MarketplaceClient.sink == null, "active catalog task drained");
+            Program.Check(MarketplaceClient.StartCatalog() == "IDE is closing", "closing catalog rejects new work");
+            return;
+        }
+        if (mode == "active-update") {
+            IdeUpdate.Check(1);
+            await Program.WaitSeen(root);
+            Program.Check(IdeUpdate.pending == 1 && IdeUpdate.sink.Done() == "", "close begins during real pending update HTTP");
+            IdeUpdate.BeginShutdown();
+            await IdeUpdate.DrainAsync();
+            IdeUpdate.Poll();
+            IdeUpdate.Check(2);
+            Program.Check(IdeUpdate.pending == 0 && IdeUpdate.sink == null, "active update drained and chained check blocked");
+            return;
+        }
+        MarketplacePackage package = Program.Package(mode);
+        string destination = root + "/project";
+        Program.Check(MarketplaceInstall.Start(package, destination) == "", "signed free extension dispatched");
+        await Program.WaitSeen(root);
+        if (mode == "active-install") {
+            Program.Check(MarketplaceInstall.Busy(), "close begins during real pending install HTTP");
+            MarketplaceInstall.BeginShutdown();
+            await MarketplaceInstall.DrainAsync();
+            Program.Check(!MarketplaceInstall.Busy(), "active install task fully drained");
+        } else {
+            string done = "";
+            for (int i = 0; i < 1000 && done == ""; i = i + 1) {
+                done = MarketplaceInstall.Poll();
+                if (done == "") { await Task.Delay(10); }
+            }
+            Program.Check(done != "", "installer completion observed");
+            if (mode == "reject-hash" || mode == "reject-signature") {
+                Program.Check(!MarketplaceInstall.LastSucceeded(), "invalid artifact rejected");
+                Program.Check(!File.Exists(destination + "/.zan-packages/Zan.LifecycleProbe/zan.pkg"), "rejected artifact never installed");
+                await MarketplaceInstall.DrainAsync();
+                return;
+            }
+            Program.Check(MarketplaceInstall.LastSucceeded(), "signed extension installed successfully");
+            await MarketplaceInstall.DrainAsync();
+        }
+        Program.Check(File.Exists(destination + "/.zan-packages/Zan.LifecycleProbe/zan.pkg"), "package installed into captured project");
+        byte[] zip = File.ReadAllBytes(ZanIDE.CacheDir() + "/mall/mall-Zan.LifecycleProbe.zip");
+        string hash = Hex.Encode(Sha256.Hash(zip, zip.Length), 32);
+        Program.Check(hash == Environment.GetEnvironmentVariable("LIFECYCLE_SHA256"), "download exact bytes preserve signed SHA256");
+        Program.Check(MarketplaceInstall.Start(package, destination) == "IDE is closing", "closing installer rejects new work");
+    }
+    static void Main(string[] args) { await Program.Run(args[0]); }
+}

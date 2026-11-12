@@ -1,0 +1,174 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+// The production selection partial is compiled unchanged into this offscreen
+// host. It performs the real measurement projection; no synchronization logic
+// is reproduced in the test.
+partial class MarketplaceView : Control {
+    public MarketplaceCatalog catalog;
+    public Control list;
+    public int measures;
+    public MarketplaceView(bool factory) {
+        this.InitControl("marketplace-selection-host", 5);
+        if (factory) {
+            HtmlDoc doc = Html.Parse("<listview id='Packages' data-of='MarketplacePackage'></listview>", "", null);
+            list = doc.root.children[0];
+            doc.root.RemoveAll();
+        } else {
+            list = new ListView<MarketplacePackage>();
+            list.name = "Packages";
+        }
+        this.Add(list);
+    }
+    public ListView<MarketplacePackage> Packages {
+        get { return (ListView<MarketplacePackage>)list; }
+    }
+    public override void OnMeasure(App app) {
+        measures = measures + 1;
+        this.SyncSelection(catalog);
+    }
+}
+
+class MarketplaceSelectionTests {
+    static int fails;
+    MarketplaceView view;
+    int picked;
+    MarketplacePackage pickedPackage;
+
+    static void Check(string label, bool ok) {
+        if (!ok) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+    public void Picked() {
+        picked = picked + 1;
+        if (view.Packages.HasSelection()) {
+            pickedPackage = view.Packages.Selected();
+            view.catalog.Select(pickedPackage);
+        }
+    }
+    static MarketplacePackage Package(string id) {
+        MarketplacePackage p = new MarketplacePackage();
+        p.id = id;
+        p.slug = id;
+        p.packageName = "Zan." + id;
+        p.displayName = id;
+        return p;
+    }
+    static void Drain(App app) { app.DrainPosts(); }
+    static void Frame(App app, MarketplaceView root) {
+        app.BeginOffscreenFrame();
+        root.MeasureTree(app);
+        root.Arrange(20, 20, 900, 320);
+        root.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+    void ClickWithExtraFrame(App app, int index, MarketplacePackage expected, string label) {
+        picked = 0;
+        pickedPackage = null;
+        ListView<MarketplacePackage> list = view.Packages;
+        int x = list.bx + 40;
+        int y = list.by + list.HeaderHeight(app) + index * list.RowHeight(app) + list.RowHeight(app) / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        Frame(app, view);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Frame(app, view);
+        Check(label + " row input selected", list.SelectedIndex() == index);
+        List<MarketplacePackage> same = view.catalog.Packages();
+        list.Bind(same);
+        Check(label + " same Bind keeps input", list.SelectedIndex() == index);
+        int prior = view.measures;
+        Frame(app, view);
+        Check(label + " extra frame really measured", view.measures > prior);
+        Check(label + " extra frame preserves input", list.SelectedIndex() == index);
+        Drain(app);
+        Check(label + " callback once", picked == 1);
+        Check(label + " callback package identity", pickedPackage == expected);
+        Check(label + " real catalog selected identity", view.catalog.SelectedPackage() == expected);
+        Frame(app, view);
+        Drain(app);
+    }
+    void Run(bool factory) {
+        string label = factory ? "factory" : "direct";
+        App app = App.CreateOffscreen("marketplace selection " + label, 960, 400);
+        view = new MarketplaceView(factory);
+        MarketplaceCatalog cat = new MarketplaceCatalog();
+        cat.packages = new List<MarketplacePackage>();
+        cat.selectedRow = -1;
+        view.catalog = cat;
+        view.Packages.Column("Package", p => p.displayName);
+        view.Packages.OnSelect(this.Picked);
+        view.UseApp(app);
+        app.SetRootControl(view);
+        Frame(app, view);
+        Check(label + " initial empty", view.Packages.Count() == 0 && !view.Packages.HasSelection());
+        MarketplacePackage first = Package("First");
+        MarketplacePackage second = Package("Second");
+        cat.packages.Add(first);
+        cat.packages.Add(second);
+        Frame(app, view);
+        Check(label + " first populated unselected", view.Packages.Count() == 2 && !view.Packages.HasSelection());
+        ClickWithExtraFrame(app, 0, first, label + " first click");
+        ClickWithExtraFrame(app, 1, second, label + " second click");
+
+        cat.selectedPackage = null;
+        Frame(app, view);
+        Drain(app);
+        Check(label + " external clear", !view.Packages.HasSelection() && cat.selectedRow == -1);
+        cat.selectedPackage = first;
+        Frame(app, view);
+        Drain(app);
+        Check(label + " external select", view.Packages.SelectedIndex() == 0 && view.Packages.Selected() == first);
+
+        List<MarketplacePackage> replacement = new List<MarketplacePackage>();
+        replacement.Add(second);
+        replacement.Add(first);
+        cat.packages = replacement;
+        Frame(app, view);
+        Drain(app);
+        Check(label + " replacement list reorders selection", view.Packages.SelectedIndex() == 1 && view.Packages.Selected() == first);
+
+        MarketplacePackage refreshed = Package("First");
+        replacement = new List<MarketplacePackage>();
+        replacement.Add(refreshed);
+        cat.packages = replacement;
+        Frame(app, view);
+        Drain(app);
+        Check(label + " refreshed same id projects current row", view.Packages.SelectedIndex() == 0 && view.Packages.Selected() == refreshed);
+        Check(label + " callback updates catalog refreshed identity", cat.SelectedPackage() == refreshed);
+        cat.selectedPackage = Package("First");
+        Frame(app, view);
+        Drain(app);
+        Check(label + " same id selected object change", view.Packages.SelectedIndex() == 0 && view.Packages.Selected() == refreshed);
+
+        replacement = new List<MarketplacePackage>();
+        replacement.Add(second);
+        cat.packages = replacement;
+        Frame(app, view);
+        Drain(app);
+        Check(label + " removed selected clears", !view.Packages.HasSelection() && cat.selectedRow == -1);
+        MarketplaceCatalog other = new MarketplaceCatalog();
+        other.packages = cat.packages;
+        other.selectedPackage = second;
+        view.catalog = other;
+        Frame(app, view);
+        Drain(app);
+        Check(label + " catalog replacement", view.Packages.SelectedIndex() == 0 && view.Packages.Selected() == second);
+        view.Packages.Select.Clear();
+        app.SetRootControl(null);
+        view = null;
+    }
+    static void Main() {
+        // Catalog.Select executes its real state transition; shutdown rejects
+        // requests synchronously, keeping this regression entirely offline.
+        MarketplaceClient.BeginShutdown();
+        MarketplaceSelectionTests test = new MarketplaceSelectionTests();
+        test.Run(false);
+        test.Run(true);
+        if (fails > 0) { throw new Exception("marketplace selection failures=" + Convert.ToString(fails)); }
+        Console.WriteLine("marketplace selection PASS");
+    }
+}
