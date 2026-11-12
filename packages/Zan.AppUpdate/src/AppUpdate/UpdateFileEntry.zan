@@ -7,6 +7,7 @@ namespace AppUpdate;
 public class UpdateFileEntry {
     public string path;  // 相对路径（统一使用正斜杠 /）
     public long size;  // 文件字节大小
+    public string sha256 = "";
     public string md5;  // 32 位小写 MD5 校验和
     public bool required;  // 是否核心必需文件
 
@@ -26,9 +27,9 @@ public class UpdateFileEntry {
         return e;
     }
 
-    // 统一路径分隔符为正斜杠，去除开头的斜杠。
+    // Only normalize separators after rejecting unsafe or absolute paths.
     public static string NormalizePath(string p) {
-        if (p == null) { return ""; }
+        if (!SafeRelPath(p)) { return ""; }
         string res = "";
         for (int i = 0; i < p.Length; i = i + 1) {
             string ch = p.Substring(i, 1);
@@ -38,9 +39,6 @@ public class UpdateFileEntry {
                 res = res + ch;
             }
         }
-        while (res.StartsWith("/")) {
-            res = res.Substring(1);
-        }
         if (!UpdateFileEntry.SafeRelPath(res)) { return ""; }
         return res;
     }
@@ -48,17 +46,20 @@ public class UpdateFileEntry {
     // 归档内相对路径防逃逸检查。
     public static bool SafeRelPath(string p) {
         if (p == null || p.Length == 0) { return false; }
-        int c0 = p[0] & 255;
-        if (c0 == 47 || c0 == 92) { return false; }  // 绝对路径
-        if (p.Length >= 2 && (p[1] & 255) == 58) { return false; }  // "C:" 盘符
-        int n = p.Length;
         int seg = 0;
-        for (int i = 0; i <= n; i = i + 1) {
-            int c = i < n ? (p[i] & 255) : 47;
+        for (int i = 0; i <= p.Length; i = i + 1) {
+            int c = i < p.Length ? (p[i] & 255) : 47;
+            if (i < p.Length && (c < 32 || c == 127 || c == 58 || c == 42 || c == 63 || c == 34 || c == 60 || c == 62 || c == 124)) { return false; }
             if (c == 47 || c == 92) {
-                if (i - seg == 2 && (p[seg] & 255) == 46 && (p[seg + 1] & 255) == 46) {
-                    return false;  // ".." 段
-                }
+                int len = i - seg;
+                if (len == 0) { return false; }
+                string part = p.Substring(seg, len);
+                if (part == "." || part == ".." || part.EndsWith(".") || part.EndsWith(" ")) { return false; }
+                string device = part.ToLower();
+                int dot = device.IndexOf(".");
+                if (dot >= 0) { device = device.Substring(0, dot); }
+                if (device == "con" || device == "prn" || device == "aux" || device == "nul" || device == "conin$" || device == "conout$") { return false; }
+                if (device.Length == 4 && (device.StartsWith("com") || device.StartsWith("lpt")) && device[3] >= 49 && device[3] <= 57) { return false; }
                 seg = i + 1;
             }
         }
@@ -71,6 +72,7 @@ public class UpdateFileEntry {
         obj.PutStr("path", this.path);
         obj.PutInt("size", this.size);
         obj.PutStr("md5", this.md5);
+        obj.PutStr("sha256", this.sha256);
         obj.PutBool("required", this.required);
         return obj;
     }
@@ -81,7 +83,8 @@ public class UpdateFileEntry {
         UpdateFileEntry e = new UpdateFileEntry();
         e.path = NormalizePath(obj.Str("path", ""));
         e.size = obj.Long("size", 0);
-        e.md5 = obj.Str("md5", "").ToLower();
+        e.md5 = obj.Str("md5", "");
+        e.sha256 = obj.Str("sha256", "");
         e.required = obj.Bool("required", true);
         return e;
     }
@@ -92,7 +95,8 @@ public class UpdateFileEntry {
         UpdateFileEntry e = new UpdateFileEntry();
         e.path = NormalizePath(doc.Str(slot, "path", ""));
         e.size = doc.Long(slot, "size", 0L);
-        e.md5 = doc.Str(slot, "md5", "").ToLower();
+        e.md5 = doc.Str(slot, "md5", "");
+        e.sha256 = doc.Str(slot, "sha256", "");
         e.required = doc.Bool(slot, "required", true);
         return e;
     }

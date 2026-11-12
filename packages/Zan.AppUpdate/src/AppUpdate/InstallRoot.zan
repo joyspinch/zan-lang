@@ -1,0 +1,57 @@
+using System;
+using System.IO;
+
+namespace AppUpdate;
+
+internal class InstallRoot {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "CreateFileW")]
+    private static extern nint OpenDirectory(nint path, int access, int share, nint security, int disposition, int flags, nint template);
+    [DllImport("kernel32", EntryPoint = "GetFileInformationByHandle")]
+    private static extern int FileInformation(nint handle, byte[] info);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    private static extern int CloseDirectory(nint handle);
+    #endif
+
+    internal static string Normalize(string root) {
+        string full = Path.GetFullPath(root);
+        while (full.Length > 1) {
+            bool separator = full.EndsWith("/");
+            #if WINDOWS
+            separator = separator || full.EndsWith("\\");
+            if (full.Length == 3 && full[1] == 58) { break; }
+            #endif
+            if (!separator) { break; }
+            full = full.Substring(0, full.Length - 1);
+        }
+        return full;
+    }
+
+    internal static string Identity(string root) {
+        if (!AppUpdater.SafeDestination(root, "_appupdate")) { throw new IOException("Unsafe install root"); }
+        #if WINDOWS
+        nint path = Wide.Of(root);
+        nint handle = 0;
+        try {
+            // OPEN_EXISTING + FILE_FLAG_BACKUP_SEMANTICS opens the directory.
+            // Sharing does not weaken the separate exclusive installer lock.
+            handle = OpenDirectory(path, 128, 7, 0, 3, 0x02000000, 0);
+            if (handle == (nint)(-1) || handle == 0) { throw new IOException("Could not identify install directory"); }
+            // BY_HANDLE_FILE_INFORMATION is thirteen DWORDs (52 bytes): volume
+            // serial at 28, file index high/low at 44/48. No pointer-sized fields.
+            byte[] info = new byte[52];
+            if (FileInformation(handle, info) == 0) { throw new IOException("Could not read install directory identity"); }
+            byte[] identity = new byte[12];
+            for (int i = 0; i < 4; i = i + 1) { identity[i] = info[28 + i]; }
+            for (int i = 0; i < 8; i = i + 1) { identity[4 + i] = info[44 + i]; }
+            return "win-file-id:" + Hex.Encode(identity, 12);
+        } finally {
+            if (handle != 0 && handle != (nint)(-1)) { CloseDirectory(handle); }
+            Wide.Free(path);
+        }
+        #else
+        // Reparse ancestry is rejected above; only '/' is a POSIX separator.
+        return "path:" + Normalize(root);
+        #endif
+    }
+}

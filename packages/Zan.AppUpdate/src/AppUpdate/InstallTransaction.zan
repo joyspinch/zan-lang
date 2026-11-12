@@ -1,0 +1,371 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Text;
+using System.Json;
+using System.Collections.Generic;
+
+namespace AppUpdate;
+
+// Local state has the same trust boundary as the installed executable. The checksum
+// detects corruption; it is not a signature against writers to that trusted directory.
+internal class InstallTransaction {
+    internal static string Digest(string text) {
+        return AppUpdater.HashBytes(Encoding.UTF8.GetBytes(text));
+    }
+
+    private static string Text(JsonValue value, string key) {
+        JsonValue item = value.Get(key);
+        if (item == null || !item.IsString()) { throw new IOException("Invalid install journal field"); }
+        return item.strVal;
+    }
+
+    private static string FileHash(string path) {
+        if (Directory.Exists(path)) { throw new IOException("Install destination is a directory"); }
+        if (!File.Exists(path)) { return ""; }
+        // Bound reads of preexisting local files as well as downloaded payloads.
+        long size = File.GetSize64(path);
+        if (size < 0 || size > 67108864L) { throw new IOException("Install snapshot exceeds 64 MiB"); }
+        byte[] bytes = File.ReadAllBytes(path);
+        if (bytes == null || bytes.Length != size) { throw new IOException("Could not read install snapshot"); }
+        return AppUpdater.HashBytes(bytes);
+    }
+
+    private static void Safe(string root, string rel) {
+        if (!AppUpdater.SafeDestination(root, rel)) { throw new IOException("Unsafe install path"); }
+    }
+
+    private static string Slot(int index, string kind) {
+        return "_appupdate/" + Convert.ToString(index) + "." + kind;
+    }
+
+    private static void AtomicText(string root, string rel, string text, InstallPersistence persistence, string boundary) {
+        Safe(root, rel);
+        Safe(root, rel + ".tmp");
+        File.WriteAllText(root + "/" + rel + ".tmp", text);
+        persistence.SyncFile(root + "/" + rel + ".tmp", boundary + "-file");
+        File.Move(root + "/" + rel + ".tmp", root + "/" + rel);
+        persistence.SyncDirectory(Path.GetDirectoryName(root + "/" + rel), boundary + "-renamed");
+    }
+
+    internal static void Phase(string root, string status, int count) {
+        Phase(root, status, count, new InstallPersistence());
+    }
+
+    internal static void Phase(string root, string status, int count, InstallPersistence persistence) {
+        string payload = "3:" + status + ":" + Convert.ToString(count);
+        AtomicText(root, "_appupdate/phase", payload + ":" + Digest(InstallRoot.Identity(root) + ":" + payload), persistence, "phase-" + status);
+    }
+
+    private static void Replace(string root, string source, string dest, string hash, bool executable, InstallPersistence persistence) {
+        Safe(root, source);
+        Safe(root, dest);
+        Safe(root, "_appupdate/swap");
+        persistence.CreateDirectories(Path.GetDirectoryName(root + "/" + dest));
+        File.Copy(root + "/" + source, root + "/_appupdate/swap");
+        if (FileHash(root + "/_appupdate/swap") != hash) { throw new IOException("Install copy mismatch"); }
+        if (!File.SetExecutable(root + "/_appupdate/swap", executable)) { throw new IOException("Could not stage executable mode"); }
+        persistence.SyncFile(root + "/_appupdate/swap", "replacement-file");
+        File.Move(root + "/_appupdate/swap", root + "/" + dest);
+        persistence.SyncDirectory(Path.GetDirectoryName(root + "/" + dest), "replacement-destination");
+        persistence.SyncDirectory(root + "/_appupdate", "replacement-source");
+    }
+
+    // Validate the entire flat state directory before deleting anything. Never use
+    // recursive cleanup on a directory containing untrusted/unexpected entries.
+    internal static bool Cleanup(string root, int count) {
+        return Cleanup(root, count, new InstallPersistence());
+    }
+
+    private static bool Cleanup(string root, int count, InstallPersistence persistence) {
+        Safe(root, "_appupdate");
+        if (!Directory.Exists(root + "/_appupdate")) {
+            persistence.SyncParents(root, "cleanup-absent");
+            return !File.Exists(root + "/_appupdate");
+        }
+        if (Directory.GetDirectories(root + "/_appupdate").Count != 0) { return false; }
+        Dictionary<string, bool> allowed = new Dictionary<string, bool>();
+        allowed.Add("journal", true);
+        allowed.Add("journal.tmp", true);
+        allowed.Add("phase", true);
+        allowed.Add("phase.tmp", true);
+        allowed.Add("swap", true);
+        for (int i = 0; i < count; i = i + 1) {
+            allowed.Add(Convert.ToString(i) + ".new", true);
+            allowed.Add(Convert.ToString(i) + ".old", true);
+            allowed.Add(Convert.ToString(i) + ".backup", true);
+        }
+        List<string> names = Directory.GetFileNames(root + "/_appupdate");
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (!allowed.ContainsKey(names[i])) { return false; }
+            Safe(root, "_appupdate/" + names[i]);
+        }
+        // Remove the phase last: interrupted cleanup must never look like a new
+        // publishing transaction with missing rollback originals.
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (names[i] == "phase" || names[i] == "journal") { continue; }
+            File.Delete(root + "/_appupdate/" + names[i]);
+            if (File.Exists(root + "/_appupdate/" + names[i])) { return false; }
+        }
+        File.Delete(root + "/_appupdate/journal");
+        if (File.Exists(root + "/_appupdate/journal")) { return false; }
+        persistence.SyncDirectory(root + "/_appupdate", "cleanup-inventory");
+        File.Delete(root + "/_appupdate/phase");
+        if (File.Exists(root + "/_appupdate/phase")) { return false; }
+        persistence.SyncDirectory(root + "/_appupdate", "cleanup-phase");
+        Directory.Delete(root + "/_appupdate");
+        persistence.SyncDirectory(root, "cleanup-state");
+        return !Directory.Exists(root + "/_appupdate");
+    }
+
+    internal static JsonValue Prepare(string root, UpdateManifest expected, List<ZipEntry> entries, bool backupOld) {
+        return Prepare(root, expected, entries, backupOld, new InstallPersistence());
+    }
+
+    internal static JsonValue Prepare(string root, UpdateManifest expected, List<ZipEntry> entries, bool backupOld, InstallPersistence persistence) {
+        Safe(root, "_appupdate");
+        persistence.CreateDirectories(root + "/_appupdate");
+        Phase(root, "preparing", expected.files.Count, persistence);
+        JsonValue plan = JsonValue.NewObject();
+        plan.PutStr("format", "3");
+        plan.PutStr("root", InstallRoot.Identity(root));
+        plan.PutStr("expected", Digest(expected.SigningPayload() + ":" + expected.Signature().ToLower()));
+        plan.PutStr("backup", backupOld ? "yes" : "no");
+        plan.PutStr("token", Hex.Encode(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16), 16));
+        JsonValue files = JsonValue.NewArray();
+        long total = 0;
+        for (int i = 0; i < expected.files.Count; i = i + 1) {
+            UpdateFileEntry file = expected.files[i];
+            Safe(root, file.path);
+            if (backupOld) { Safe(root, "_backup/" + file.path); }
+            string oldHash = FileHash(root + "/" + file.path);
+            string backupHash = backupOld ? FileHash(root + "/_backup/" + file.path) : "";
+            if (oldHash.Length > 0) { total = total + File.GetSize64(root + "/" + file.path); }
+            if (backupHash.Length > 0) { total = total + File.GetSize64(root + "/_backup/" + file.path); }
+            total = total + file.size;
+            if (total > 805306368L) { throw new IOException("Install snapshots exceed 768 MiB"); }
+            JsonValue row = JsonValue.NewObject();
+            row.PutStr("old", oldHash);
+            row.PutStr("backup", backupHash);
+            row.PutStr("oldMode", oldHash.Length > 0 && File.IsExecutable(root + "/" + file.path) ? "x" : "-");
+            row.PutStr("backupMode", backupHash.Length > 0 && File.IsExecutable(root + "/_backup/" + file.path) ? "x" : "-");
+            files.Append(row);
+            Safe(root, Slot(i, "new"));
+            ZipEntry entry = null;
+            for (int k = 0; k < entries.Count; k = k + 1) {
+                if (entries[k].name == file.path) { entry = entries[k]; break; }
+            }
+            if (entry == null) { throw new IOException("Missing staged entry"); }
+            File.WriteAllBytes(root + "/" + Slot(i, "new"), entry.data);
+            AppUpdater.RestoreExecutablePermissionIfNeeded(root + "/" + Slot(i, "new"), entry.data);
+            if (file.path.EndsWith(".sh")) {
+                if (!File.SetExecutable(root + "/" + Slot(i, "new"), true)) { throw new IOException("Could not stage script mode"); }
+            }
+            persistence.SyncFile(root + "/" + Slot(i, "new"), "prepared-new");
+            if (oldHash.Length > 0) {
+                Safe(root, Slot(i, "old"));
+                File.Copy(root + "/" + file.path, root + "/" + Slot(i, "old"));
+                if (FileHash(root + "/" + Slot(i, "old")) != oldHash) { throw new IOException("Original snapshot mismatch"); }
+                persistence.SyncFile(root + "/" + Slot(i, "old"), "prepared-old");
+            }
+            if (backupHash.Length > 0) {
+                Safe(root, Slot(i, "backup"));
+                File.Copy(root + "/_backup/" + file.path, root + "/" + Slot(i, "backup"));
+                if (FileHash(root + "/" + Slot(i, "backup")) != backupHash) { throw new IOException("Backup snapshot mismatch"); }
+                persistence.SyncFile(root + "/" + Slot(i, "backup"), "prepared-backup");
+            }
+        }
+        plan.Put("files", files);
+        string payload = plan.ToJson();
+        JsonValue envelope = JsonValue.NewObject();
+        envelope.PutStr("payload", payload);
+        envelope.PutStr("sha256", Digest(payload));
+        string journal = envelope.ToJson();
+        if (journal.Length > 8388608) { throw new IOException("Install journal exceeds 8 MiB"); }
+        AtomicText(root, "_appupdate/journal", journal, persistence, "journal");
+        Validate(root, expected, plan, true);
+        persistence.SyncDirectory(root + "/_appupdate", "prepared-inventory");
+        Phase(root, "publishing", expected.files.Count, persistence);
+        return plan;
+    }
+
+    private static void Validate(string root, UpdateManifest expected, JsonValue plan, bool stage) {
+        if (!plan.IsObject() || (Text(plan, "format") != "2" && Text(plan, "format") != "3") || Text(plan, "root") != InstallRoot.Identity(root) || Text(plan, "expected") != Digest(expected.SigningPayload() + ":" + expected.Signature().ToLower()) || !AppUpdater.IsHex(Text(plan, "token"), 32, 32)) { throw new IOException("Install plan mismatch"); }
+        string backup = Text(plan, "backup");
+        if (backup != "yes" && backup != "no") { throw new IOException("Invalid backup plan"); }
+        JsonValue rows = plan.Get("files");
+        if (rows == null || !rows.IsArray() || rows.Count() != expected.files.Count) { throw new IOException("Invalid install plan count"); }
+        for (int i = 0; i < expected.files.Count; i = i + 1) {
+            JsonValue row = rows.At(i);
+            if (row == null || !row.IsObject()) { throw new IOException("Invalid install plan row"); }
+            string oldHash = Text(row, "old");
+            string backupHash = Text(row, "backup");
+            string oldMode = Text(row, "oldMode");
+            string backupMode = Text(row, "backupMode");
+            if ((oldHash != "" && !AppUpdater.IsHex(oldHash, 64, 64)) || (backupHash != "" && !AppUpdater.IsHex(backupHash, 64, 64)) || (oldMode != "x" && oldMode != "-") || (backupMode != "x" && backupMode != "-")) { throw new IOException("Invalid snapshot metadata"); }
+            if (backup == "no" && backupHash != "") { throw new IOException("Unexpected backup metadata"); }
+            string rel = expected.files[i].path;
+            Safe(root, rel);
+            Safe(root, Slot(i, "old"));
+            Safe(root, Slot(i, "backup"));
+            if (FileHash(root + "/" + Slot(i, "old")) != oldHash || FileHash(root + "/" + Slot(i, "backup")) != backupHash) { throw new IOException("Invalid rollback snapshot"); }
+            string current = FileHash(root + "/" + rel);
+            if (current != oldHash && current != expected.files[i].sha256.ToLower()) { throw new IOException("Destination differs from install plan"); }
+            if (backup == "yes") {
+                Safe(root, "_backup/" + rel);
+                current = FileHash(root + "/_backup/" + rel);
+                if (current != backupHash && current != oldHash) { throw new IOException("Backup differs from install plan"); }
+            }
+            if (stage) {
+                Safe(root, Slot(i, "new"));
+                if (FileHash(root + "/" + Slot(i, "new")) != expected.files[i].sha256.ToLower()) { throw new IOException("Invalid staged payload"); }
+            }
+        }
+    }
+
+    internal static void PublishOne(string root, UpdateManifest expected, JsonValue plan, int index) {
+        PublishOne(root, expected, plan, index, new InstallPersistence());
+    }
+
+    internal static void PublishOne(string root, UpdateManifest expected, JsonValue plan, int index, InstallPersistence persistence) {
+        JsonValue rows = plan.Get("files");
+        JsonValue row = rows.At(index);
+        string rel = expected.files[index].path;
+        string oldHash = Text(row, "old");
+        if (Text(plan, "backup") == "yes" && oldHash.Length > 0) {
+            Replace(root, Slot(index, "old"), "_backup/" + rel, oldHash, Text(row, "oldMode") == "x", persistence);
+        }
+        Replace(root, Slot(index, "new"), rel, expected.files[index].sha256.ToLower(), File.IsExecutable(root + "/" + Slot(index, "new")), persistence);
+    }
+
+    private static void SyncExistingParents(string path, InstallPersistence persistence, string boundary) {
+        string parent = Path.GetDirectoryName(path);
+        while (parent != null && parent.Length > 0 && !Directory.Exists(parent)) {
+            string next = Path.GetDirectoryName(parent);
+            if (next == parent) { break; }
+            parent = next;
+        }
+        if (parent != null && parent.Length > 0) { persistence.SyncParents(parent, boundary); }
+    }
+
+    private static void Restore(string root, string rel, string slot, string hash, bool executable, InstallPersistence persistence) {
+        Safe(root, rel);
+        if (FileHash(root + "/" + rel) == hash) {
+            if (hash.Length > 0) {
+                if (!File.SetExecutable(root + "/" + rel, executable)) { throw new IOException("Could not restore executable mode"); }
+                #if WINDOWS
+                // Windows replacement cannot overwrite a read-only destination;
+                // matching read-only bytes are untouched originals. Do not require
+                // write access just to roll back earlier files. Executable mode is
+                // not a Windows file metadata mutation.
+                FileInfo info = new FileInfo(root + "/" + rel);
+                if (!info.IsReadOnly()) { persistence.SyncFile(root + "/" + rel, "restored-existing"); }
+                #else
+                persistence.SyncFile(root + "/" + rel, "restored-existing");
+                #endif
+            }
+            SyncExistingParents(root + "/" + rel, persistence, "restored-parents");
+            return;
+        }
+        if (hash.Length > 0) { Replace(root, slot, rel, hash, executable, persistence); }
+        else {
+            File.Delete(root + "/" + rel);
+            if (File.Exists(root + "/" + rel)) { throw new IOException("Could not remove new install file"); }
+            SyncExistingParents(root + "/" + rel, persistence, "restored-absence");
+        }
+    }
+
+    internal static bool Recover(string root, UpdateManifest expected) {
+        return Recover(root, expected, new InstallPersistence());
+    }
+
+    internal static bool Recover(string root, UpdateManifest expected, InstallPersistence persistence) {
+        Safe(root, "_appupdate");
+        if (!Directory.Exists(root + "/_appupdate")) {
+            persistence.SyncParents(root, "recovery-absent");
+            return !File.Exists(root + "/_appupdate");
+        }
+        Safe(root, "_appupdate/phase");
+        if (!File.Exists(root + "/_appupdate/phase")) { return Cleanup(root, 10000, persistence); }
+        if (File.GetSize64(root + "/_appupdate/phase") > 128) { return false; }
+        string phase = File.ReadAllText(root + "/_appupdate/phase");
+        List<string> fields = phase.Split(":");
+        if (fields.Count != 4 || (fields[0] != "2" && fields[0] != "3")) { return false; }
+        int count = AppUpdater.ParseIntSafe(fields[2]);
+        if (count < 1 || count > 10000 || Convert.ToString(count) != fields[2] || fields[3] != Digest(InstallRoot.Identity(root) + ":" + fields[0] + ":" + fields[1] + ":" + fields[2])) { return false; }
+        if (fields[0] == "3" && fields[1] == "preparing") { return Cleanup(root, count, persistence); }
+        // Format 2 remains recoverable under its original process-interruption
+        // contract. Only format 3 records were produced with ordered barriers.
+        // Finished rollback uses the same cleanup-only phase as a successful commit.
+        // Its own bounded inventory survives a retry using a different release.
+        if (fields[1] == "committed") {
+            // A visible rename may precede a failed directory barrier. Retry that
+            // barrier before deleting any recovery evidence, even on a fresh call.
+            persistence.SyncFile(root + "/_appupdate/phase", "committed-existing");
+            persistence.SyncParents(root + "/_appupdate", "committed-confirmed");
+            return Cleanup(root, count, persistence);
+        }
+        if (fields[1] != "publishing" || count != expected.files.Count) { return false; }
+        Safe(root, "_appupdate/journal");
+        if (!File.Exists(root + "/_appupdate/journal") || File.GetSize64(root + "/_appupdate/journal") > 8388608L) { return false; }
+        JsonValue envelope = JsonValue.Parse(File.ReadAllText(root + "/_appupdate/journal"));
+        string payload = Text(envelope, "payload");
+        if (Text(envelope, "sha256") != Digest(payload)) { return false; }
+        JsonValue plan = JsonValue.Parse(payload);
+        if (Text(plan, "format") != fields[0]) { return false; }
+        Validate(root, expected, plan, false);
+        // Retained format-2 state may predate persistence barriers. Establish its
+        // immutable rollback evidence before changing any destination.
+        for (int i = 0; i < count; i = i + 1) {
+            if (File.Exists(root + "/" + Slot(i, "old"))) { persistence.SyncFile(root + "/" + Slot(i, "old"), "recovery-old"); }
+            if (File.Exists(root + "/" + Slot(i, "backup"))) { persistence.SyncFile(root + "/" + Slot(i, "backup"), "recovery-backup"); }
+        }
+        persistence.SyncFile(root + "/_appupdate/journal", "recovery-journal");
+        persistence.SyncFile(root + "/_appupdate/phase", "recovery-phase");
+        persistence.SyncParents(root + "/_appupdate", "recovery-inventory");
+        JsonValue rows = plan.Get("files");
+        for (int i = expected.files.Count - 1; i >= 0; i = i - 1) {
+            JsonValue row = rows.At(i);
+            string rel = expected.files[i].path;
+            Restore(root, rel, Slot(i, "old"), Text(row, "old"), Text(row, "oldMode") == "x", persistence);
+            if (Text(plan, "backup") == "yes") {
+                Restore(root, "_backup/" + rel, Slot(i, "backup"), Text(row, "backup"), Text(row, "backupMode") == "x", persistence);
+            }
+        }
+        Phase(root, "committed", expected.files.Count, persistence);
+        return Cleanup(root, expected.files.Count, persistence);
+    }
+
+    internal static bool Install(string root, UpdateManifest expected, List<ZipEntry> entries, bool backupOld) {
+        return Install(root, expected, entries, backupOld, new InstallPersistence());
+    }
+
+    internal static bool Install(string root, UpdateManifest expected, List<ZipEntry> entries, bool backupOld, InstallPersistence persistence) {
+        if (root == null || root.Length == 0) { return false; }
+        root = InstallRoot.Normalize(root);
+        if (root == null || root.Length == 0) { return false; }
+        Safe(root, "_appupdate.lock");
+        Safe(root, "_appupdate");
+        persistence.CreateDirectories(root);
+        long handle = File.TryLock(root + "/_appupdate.lock");
+        if (handle == 0) { return false; }
+        bool commitStarted = false;
+        try {
+            if (!Recover(root, expected, persistence)) { return false; }
+            JsonValue plan = Prepare(root, expected, entries, backupOld, persistence);
+            for (int i = 0; i < expected.files.Count; i = i + 1) { PublishOne(root, expected, plan, i, persistence); }
+            commitStarted = true;
+            Phase(root, "committed", expected.files.Count, persistence);
+            // Installation has committed even when cleanup must be retried next time.
+            try { Cleanup(root, expected.files.Count, persistence); } catch (Exception cleanupError) { }
+            return true;
+        } catch (Exception ex) {
+            // Commit rename may be visible while its barrier failed. Preserve all
+            // evidence for a later explicit recovery instead of cleaning it now.
+            if (!commitStarted) {
+                try { Recover(root, expected, persistence); } catch (Exception recoveryError) { }
+            }
+            return false;
+        } finally { File.Unlock(handle); }
+    }
+}

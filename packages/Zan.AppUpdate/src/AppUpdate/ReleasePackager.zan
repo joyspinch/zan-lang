@@ -6,7 +6,7 @@ using System.Security.Cryptography;
 
 namespace AppUpdate;
 
-// 版本发布打包器：扫描程序目录、计算所有文件 MD5、生成更新清单、压缩为 Zip 包。
+// 版本发布打包器：扫描程序目录、计算所有文件 SHA-256、生成更新清单、压缩为 Zip 包。
 public class ReleasePackager {
     // 递归收集目录下的所有相对路径文件。
     public static void CollectFiles(string baseDir, string relDir, List<string> outList) {
@@ -77,7 +77,7 @@ public class ReleasePackager {
 
         List<ZipEntry> zipEntries = new List<ZipEntry>();
 
-        // 逐一扫描、读取数据、计算 MD5 并加入 Zip 条目
+        // 逐一扫描、读取数据、计算哈希并加入 Zip 条目
         for (int i = 0; i < totalFiles; i = i + 1) {
             string rel = relFiles[i];
             string fullPath = appDir + "/" + rel;
@@ -87,6 +87,7 @@ public class ReleasePackager {
             string fileMd5 = Md5.HashToHex(fileBytes);
 
             UpdateFileEntry entry = UpdateFileEntry.Create(rel, fileSize, fileMd5, true);
+            entry.sha256 = AppUpdater.HashBytes(fileBytes);
             manifest.AddFile(entry);
 
             ZipEntry ze = new ZipEntry(rel);
@@ -96,7 +97,7 @@ public class ReleasePackager {
 
             if (cb != null) {
                 int percent = ((i + 1) * 60) / totalFiles;
-                cb(UpdateProgressInfo.Progress(UpdatePhase.Checking, percent, i + 1, totalFiles, rel, "已计算 MD5 校验码"));
+                cb(UpdateProgressInfo.Progress(UpdatePhase.Checking, percent, i + 1, totalFiles, rel, "已计算 SHA-256 校验码"));
             }
         }
 
@@ -117,6 +118,7 @@ public class ReleasePackager {
         // 计算生成 Zip 包的整体大小与 MD5
         manifest.packageSize = zipData.Length;
         manifest.packageMd5 = Md5.HashToHex(zipData);
+        manifest.packageSha256 = AppUpdater.HashBytes(zipData);
 
         if (cb != null) {
             cb(UpdateProgressInfo.Create(UpdatePhase.Extracting, 90, "", "正在写入 Manifest 清单..."));
@@ -136,8 +138,8 @@ public class ReleasePackager {
     public static string SignManifest(UpdateManifest manifest, string modulusHex, string privateExponentHex) {
         if (manifest == null) { return ""; }
         if (modulusHex == null || privateExponentHex == null) { return ""; }
-        if (modulusHex.Length == 0 || (modulusHex.Length % 2) != 0) { return ""; }
-        if (privateExponentHex.Length == 0 || (privateExponentHex.Length % 2) != 0) { return ""; }
+        if (!AppUpdater.IsHex(modulusHex, 512, 1024)) { return ""; }
+        if (!AppUpdater.IsHex(privateExponentHex, 2, modulusHex.Length)) { return ""; }
         int k = modulusHex.Length / 2;
         string payload = manifest.SigningPayload();
         byte[] nBuf = Hex.Decode(modulusHex);

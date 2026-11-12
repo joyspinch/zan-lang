@@ -24,6 +24,7 @@ public class LicenseClient {
     // 证书缺失/验签失败一律拒绝（fail-closed）。
     public string vendorKeyHex = "";
     public string vendorKeyExpHex = "010001";
+    private string vendorKeys = "";
 
     public static LicenseClient shared;
 
@@ -53,9 +54,24 @@ public class LicenseClient {
     // 不配置则 signed 模式直接视为无效状态——离线证书没有可验证的
     // 信任锚就不该被采信。
     public void VendorPublicKey(string modulusHex, string exponentHex) {
-        this.vendorKeyHex = modulusHex != null ? modulusHex.ToLower() : "";
-        this.vendorKeyExpHex = exponentHex != null && exponentHex.Length > 0
-            ? exponentHex.ToLower() : "010001";
+        this.vendorKeys = "";
+        this.vendorKeyHex = "";
+        this.vendorKeyExpHex = "";
+        string exponent = exponentHex != null && exponentHex.Length > 0 ? exponentHex : "010001";
+        if (TrustedRsaKeys.Single(modulusHex, exponent) == "") { return; }
+        this.vendorKeyHex = modulusHex.ToLower();
+        this.vendorKeyExpHex = exponent.ToLower();
+    }
+
+    public bool VendorPublicKeys(string serializedKeys) {
+        this.vendorKeyHex = "";
+        this.vendorKeyExpHex = "";
+        this.vendorKeys = TrustedRsaKeys.FromHex(serializedKeys);
+        return this.vendorKeys != "";
+    }
+
+    public bool VendorPublicKeyPemBundle(string trustedPem) {
+        return this.VendorPublicKeys(TrustedRsaKeys.FromPemBundle(trustedPem));
     }
 
     // ---- 状态文件认证 ----
@@ -129,17 +145,12 @@ public class LicenseClient {
 
     // signed 模式的证书验签：发行方公钥已配置 + 证书签名存在且有效。
     public bool SignedCertOk() {
-        if (this.vendorKeyHex.Length == 0) { return false; }
-        if (this.state.certSig.Length == 0) { return false; }
-        int k = this.vendorKeyHex.Length / 2;
-        if (this.state.certSig.Length != 2 * k) { return false; }
+        if (this.state == null || this.state.certSig == null) { return false; }
+        string anchors = this.vendorKeys;
+        if (anchors == "") { anchors = TrustedRsaKeys.Single(this.vendorKeyHex, this.vendorKeyExpHex); }
         string canonical = LicenseClient.CertCanonical(this.state.product,
             this.state.deviceFp, this.state.subject, this.state.expiresAt);
-        byte[] sig = Hex.Decode(this.state.certSig);
-        byte[] nBuf = Hex.Decode(this.vendorKeyHex);
-        byte[] eBuf = Hex.Decode(this.vendorKeyExpHex);
-        return Rsa.VerifyPkcs1Sha256(canonical, canonical.Length, sig,
-            nBuf, k, eBuf, this.vendorKeyExpHex.Length / 2);
+        return TrustedRsaKeys.VerifyHex(anchors, canonical, this.state.certSig);
     }
 
     // 安装发行方签发的离线证书（signed 模式激活入口）。

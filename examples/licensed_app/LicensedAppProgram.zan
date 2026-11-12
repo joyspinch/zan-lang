@@ -1,86 +1,113 @@
 using System;
-using Security.Commercial;
 using System.IO;
+using System.Security.Cryptography;
+using Security.Commercial;
 
-// 商业成品软件接入授权 SDK 的最小完整示例。
-// 演示 C 端成品软件的标准接入姿势（约五行核心）：
-//   1. LicenseClient.Shared() 拿共享客户端；
-//   2. Server()/Product() 指向部署好的授权服务端与产品标识；
-//   3. Check() 总校验：本地状态在宽限期内直接放行（离线可用），
-//      本地无授权则提示用户激活/登录；
-//   4. 激活码 Activate("XXXX-XXXX-XXXX-XXXX") 或账号密码 Login()；
-//   5. 运行期可定期 Heartbeat() 占座，登出 LogoutOnline() 释放座位。
-//
-// 编译运行（在仓库根目录，配 templates/server/server-licensing 使用）：
-//   build/zanc.exe examples/licensed_app/LicensedAppProgram.zan --auto-stdlib -o licensed_app.exe
-//   ./licensed_app.exe http:  // 127.0.0.1:8096 demo-app
-//
-// 服务端模板自带种子产品 demo-app 与演示激活码 ZPQ-D1QJ-M8RR-K3SA（30 天）/
-// ETJ-3FGW-HG62-UU1D（终身）；管理后台 /admin 可发放更多（admin/admin1234）。
+/* Real LicenseClient integration. Configuration comes from the deployment;
+ * no endpoint, activation code, account or issuer key is supplied by default.
+ * Product must match the mall's exact slug@major-N identity. */
 public class LicensedAppProgram {
-    static async void Main() {
-        string server = ProcessHost.Env("ZAN_LICENSE_SERVER");
-        if (server == "") { server = "http://127.0.0.1:8096"; }
-        string product = ProcessHost.Env("ZAN_LICENSE_PRODUCT");
-        if (product == "") { product = "demo-app"; }
-        if (Environment.ArgCount() > 0) { server = Environment.ArgAt(0); }
-        if (Environment.ArgCount() > 1) { product = Environment.ArgAt(1); }
-
-        LicenseClient lic = LicenseClient.Shared();
-        lic.Server(server, "ZanSoft");
-        lic.Product(product);
-
-        /* 1) 启动总校验：本地授权在宽限期内即放行，无网也能跑。 */
-        LicenseCheckResult r = await lic.Check();
-        if (r.ok) {
-            Console.WriteLine("[licensed_app] 授权有效：mode=" + r.reason);
-            LicensedMain();
-            return;
+    static bool ProductValid(string product) {
+        int marker = product.IndexOf("@major-");
+        if (marker <= 0) { return false; }
+        string slug = product.Substring(0, marker);
+        string major = product.Substring(marker + 7);
+        if (major.Length == 0 || major[0] < 49 || major[0] > 57) { return false; }
+        for (int i = 0; i < slug.Length; i++) {
+            int c = slug[i];
+            if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45)) {
+                return false;
+            }
         }
-        Console.WriteLine("[licensed_app] 未授权：" + r.message);
-
-        /* 2) 交互式激活：输入 A 用激活码，输入 L 用账号密码。 */
-        Console.Write("激活方式 A=激活码 / L=账号密码（回车退出）> ");
-        /* 管道/控制台两种输入都按去掉首尾空白比较与上送。 */
-        string choice = Console.ReadLine().Trim();
-        if (choice == "A" || choice == "a") {
-            Console.Write("激活码（形如 XXXX-XXXX-XXXX-XXXX）> ");
-            string code = Console.ReadLine().Trim();
-            r = await lic.Activate(code);
-        } else if (choice == "L" || choice == "l") {
-            Console.Write("账号 > ");
-            string account = Console.ReadLine().Trim();
-            Console.Write("密码 > ");
-            string password = Console.ReadLine().Trim();
-            r = await lic.Login(account, password);
-        } else {
-            Console.WriteLine("[licensed_app] 未激活，退出。");
-            return;
+        for (int i = 0; i < major.Length; i++) {
+            if (major[i] < 48 || major[i] > 57) { return false; }
         }
-        if (!r.ok) {
-            Console.WriteLine("[licensed_app] 激活失败：" + r.message);
-            return;
-        }
-        Console.WriteLine("[licensed_app] 激活成功，进入主功能。");
-        LicensedMain();
+        return true;
     }
 
-    /* 激活后才允许进入的业务主体。真实软件里这里之后就是你的窗口/主循环；
-       本示例只展示授权有效期并演示一次心跳与登出。 */
-    static async void LicensedMain() {
-        LicenseClient lic = LicenseClient.Shared();
-        LicenseCheckResult r = await lic.Heartbeat();
-        if (r.ok) {
-            string life = r.expiresAt == 0 ? "终身"
-                : "至 epoch " + Convert.ToString(r.expiresAt);
-            Console.WriteLine("[licensed_app] 心跳 OK，授权 " + life
-                + "，宽限 " + Convert.ToString(r.graceSeconds) + "s");
-        } else {
-            Console.WriteLine("[licensed_app] 心跳失败：" + r.message);
+    static bool PinIssuer(LicenseClient lic) {
+        string path = ProcessHost.Env("ZAN_LICENSE_PUBLIC_KEYSET_PATH");
+        if (path.Length == 0) { path = ProcessHost.Env("ZAN_LICENSE_PUBLIC_KEY_PATH"); }
+        lic.VendorPublicKey("", "");
+        if (path.Length == 0 || !File.Exists(path) || File.GetSize64(path) > 16384) { return false; }
+        // Deployment-owned public PEM bundle; HTTP responses cannot add anchors.
+        try { return lic.VendorPublicKeyPemBundle(File.ReadAllText(path)); }
+        catch (Exception ex) { return false; }
+    }
+
+    static async int Run() {
+        string product = ProcessHost.Env("ZAN_LICENSE_PRODUCT");
+        if (!LicensedAppProgram.ProductValid(product)) {
+            Console.WriteLine("[licensed_app] 请配置有效的 ZAN_LICENSE_PRODUCT（slug@major-N）。");
+            return 2;
+        }
+        string server = ProcessHost.Env("ZAN_LICENSE_SERVER");
+        LicenseClient lic = new LicenseClient();
+        lic.Server(server, "LicensedAppExample");
+        lic.Product(product);
+        if (!LicensedAppProgram.PinIssuer(lic)) {
+            Console.WriteLine("[licensed_app] 缺少或无法解析可信发行方公钥。");
+            return 2;
         }
 
-        /* 心跳失败不再满足授权时，应用应回到激活界面（此处省略 UI）。 */
-        LicenseCheckResult quit = await lic.LogoutOnline();
-        Console.WriteLine("[licensed_app] " + quit.message);
+        string certificatePath = ProcessHost.Env("ZAN_LICENSE_CERTIFICATE_PATH");
+        if (certificatePath.Length > 0) {
+            LicenseCheckResult installed = lic.InstallCertificate(File.ReadAllText(certificatePath));
+            if (!installed.ok) {
+                Console.WriteLine("[licensed_app] 证书安装失败。");
+                return 1;
+            }
+        }
+        /* InstallCertificate persists data; only Check verifies the signature,
+         * exact product, device and expiry. Never enter business code first. */
+        LicenseCheckResult result = await lic.Check();
+        if (!result.ok && certificatePath.Length == 0 && server.Length > 0) {
+            string code = ProcessHost.Env("ZAN_LICENSE_ACTIVATION_CODE");
+            string account = ProcessHost.Env("ZAN_LICENSE_ACCOUNT");
+            string password = ProcessHost.Env("ZAN_LICENSE_PASSWORD");
+            if (code.Length > 0) {
+                result = await lic.Activate(code);
+            } else if (account.Length > 0 && password.Length > 0) {
+                result = await lic.Login(account, password);
+            }
+            if (result.ok) { result = await lic.Check(); }
+        }
+        if (!result.ok) {
+            Console.WriteLine("[licensed_app] 授权校验未通过，主功能未启动。");
+            return 1;
+        }
+        return await LicensedAppProgram.LicensedMain(lic);
+    }
+
+    /* A real app starts its window/main loop here and schedules Heartbeat for
+     * online sessions. Signed certificates are checked locally, without HTTP. */
+    static async int LicensedMain(LicenseClient lic) {
+        if (lic.state.mode != "signed") {
+            LicenseCheckResult heartbeat = await lic.Heartbeat();
+            if (!heartbeat.ok) {
+                Console.WriteLine("[licensed_app] 在线心跳未通过，主功能未启动。");
+                return 1;
+            }
+        }
+        Console.WriteLine("[licensed_app] 授权有效，进入主功能。");
+        /* Keep state by default so the next process exercises persisted Check.
+         * Explicit online logout clears local state even if notification fails. */
+        if (lic.state.mode != "signed" && ProcessHost.Env("ZAN_LICENSE_LOGOUT") == "1") {
+            LicenseCheckResult logout = await lic.LogoutOnline();
+            Console.WriteLine(logout.ok
+                ? "[licensed_app] 已清除本地授权并发送登出请求。"
+                : "[licensed_app] 已清除本地授权，登出通知未成功。");
+        }
+        return 0;
+    }
+
+    static async int Main() {
+        try { return await LicensedAppProgram.Run(); }
+        catch (Exception error) {
+            /* Endpoint responses, credentials and certificate contents must not
+             * be copied from exception messages into application logs. */
+            Console.WriteLine("[licensed_app] 配置读取或授权操作失败。");
+            return 1;
+        }
     }
 }

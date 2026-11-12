@@ -6,53 +6,103 @@ using System.Security.Cryptography;
 
 namespace AppUpdate;
 
-// 客户端版本更新总控引擎。
-// 提供版本比对、更新包校验、旧版备份、Zip 解压覆盖与防篡改自检自愈的一体化工作流。
 public class AppUpdater {
+    private static string signerKeyHex = "";
 
-    // 发行方 RSA 公钥（hex 大端模数与指数）
-    public static string signerModulusHex = "";
-    public static string signerExponentHex = "010001";
-
-    // 配置发行方 RSA 公钥（hex 模数、hex 指数）。
+    // Trust anchors come from the installed application, never downloaded metadata.
+    // Invalid configuration clears the previous anchor and fails closed.
     public static void SetTrustedSigner(string modulusHex, string exponentHex) {
-        AppUpdater.signerModulusHex = modulusHex != null ? modulusHex.ToLower() : "";
-        AppUpdater.signerExponentHex = exponentHex != null && exponentHex.Length > 0
-            ? exponentHex.ToLower() : "010001";
+        AppUpdater.signerKeyHex = TrustedRsaKeys.Single(modulusHex, exponentHex);
     }
 
-    // 校验清单签名（RSASSA-PKCS1-v1_5/SHA-256）。
-    public static bool VerifyManifestSignature(UpdateManifest manifest, UpdateProgressCallback cb) {
-        if (manifest == null) { return false; }
-        string sigHex = manifest.Signature();
-        if (AppUpdater.signerModulusHex.Length == 0) { return true; }  // 未配置公钥 = 未启用强制验签
-        int k = AppUpdater.signerModulusHex.Length / 2;
-        if (sigHex == null || sigHex.Length == 0 || (sigHex.Length % 2) != 0 || sigHex.Length != 2 * k) {
-            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新清单签名格式非法，已拒绝更新")); }
-            return false;
-        }
-        string payload = manifest.SigningPayload();
-        byte[] sig = Hex.Decode(sigHex);
-        byte[] nBuf = Hex.Decode(AppUpdater.signerModulusHex);
-        byte[] eBuf = Hex.Decode(AppUpdater.signerExponentHex);
-        bool ok = Rsa.VerifyPkcs1Sha256(payload, payload.Length, sig, nBuf, k, eBuf, AppUpdater.signerExponentHex.Length / 2);
-        if (!ok) {
-            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新清单签名验证失败，更新包可能被篡改，已拒绝更新")); }
-            return false;
+    // Each line is public modulusHex:exponentHex; invalid replacement clears trust.
+    public static bool SetTrustedSigners(string serializedKeys) {
+        string snapshot = TrustedRsaKeys.FromHex(serializedKeys);
+        AppUpdater.signerKeyHex = snapshot;
+        return snapshot != "";
+    }
+
+    public static bool SetTrustedSignerPemBundle(string trustedPem) {
+        return AppUpdater.SetTrustedSigners(TrustedRsaKeys.FromPemBundle(trustedPem));
+    }
+
+    public static bool IsHex(string value, int minLength, int maxLength) {
+        if (value == null || value.Length < minLength || value.Length > maxLength || value.Length % 2 != 0) { return false; }
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int c = value[i];
+            if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) { return false; }
         }
         return true;
     }
 
-    // 比较本地版本号与远程版本号。若 remoteVersion 比 currentVersion 新返回 true。
+    public static string HashBytes(byte[] bytes) {
+        if (bytes == null) { return ""; }
+        return Hex.Encode(Sha256.Hash(bytes), 32);
+    }
+
+    public static bool ValidManifest(UpdateManifest manifest) {
+        if (manifest == null || manifest.files == null || manifest.files.Count == 0 || manifest.files.Count > 10000) { return false; }
+        if (manifest.packageSize <= 0 || manifest.packageSize > 268435456L || !IsHex(manifest.packageSha256, 64, 64)) { return false; }
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        long total = 0;
+        for (int i = 0; i < manifest.files.Count; i = i + 1) {
+            UpdateFileEntry f = manifest.files[i];
+            if (f == null || !UpdateFileEntry.SafeRelPath(f.path) || f.path != UpdateFileEntry.NormalizePath(f.path)) { return false; }
+            if (f.size < 0 || f.size > 67108864L || !IsHex(f.sha256, 64, 64)) { return false; }
+            string key = f.path.ToLower();
+            if (key == "_backup" || key.StartsWith("_backup/") || seen.ContainsKey(key)) { return false; }
+            // Parent and child installations may share this tree: no payload may
+            // replace another install's lock inode or transaction state.
+            List<string> segments = key.Split("/");
+            for (int k = 0; k < segments.Count; k = k + 1) {
+                if (segments[k] == "_appupdate" || segments[k] == "_appupdate.lock") { return false; }
+            }
+            seen.Add(key, true);
+            total = total + f.size;
+            if (total > 268435456L) { return false; }
+        }
+        for (int i = 0; i < manifest.files.Count; i = i + 1) {
+            string key = manifest.files[i].path.ToLower();
+            int slash = key.IndexOf("/");
+            while (slash >= 0) {
+                if (seen.ContainsKey(key.Substring(0, slash))) { return false; }
+                slash = key.IndexOf("/", slash + 1);
+            }
+        }
+        return true;
+    }
+
+    public static bool VerifyManifestSignature(UpdateManifest manifest, UpdateProgressCallback cb) {
+        string anchors = AppUpdater.signerKeyHex;
+        if (!ValidManifest(manifest) || anchors == "") {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "Missing trusted signer, signature or SHA-256 metadata")); }
+            return false;
+        }
+        bool ok = TrustedRsaKeys.VerifyHex(anchors, manifest.SigningPayload(), manifest.Signature());
+        if (!ok && cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "Manifest signature rejected")); }
+        return ok;
+    }
+
+    // Check ancestry as well as the leaf: a safe relative name can traverse an existing link.
+    public static bool SafeDestination(string root, string rel) {
+        if (root == null || root.Length == 0 || !UpdateFileEntry.SafeRelPath(rel)) { return false; }
+        string current = Path.GetFullPath(root + "/" + rel);
+        if (current == null || current.Length == 0) { return false; }
+        while (current.Length > 0) {
+            if (File.IsReparsePoint(current)) { return false; }
+            string parent = Path.GetDirectoryName(current);
+            if (parent == null || parent == current) { break; }
+            current = parent;
+        }
+        return true;
+    }
+
     public static bool HasNewVersion(string currentVersion, string remoteVersion) {
         if (remoteVersion == null || remoteVersion.Length == 0) { return false; }
         if (currentVersion == null || currentVersion.Length == 0) { return true; }
         if (currentVersion == remoteVersion) { return false; }
-
-        // 简易语义版本三段式对比 (major.minor.patch)
         List<string> cParts = SplitVersion(currentVersion);
         List<string> rParts = SplitVersion(remoteVersion);
-
         int maxLen = cParts.Count > rParts.Count ? cParts.Count : rParts.Count;
         for (int i = 0; i < maxLen; i = i + 1) {
             int cNum = i < cParts.Count ? ParseIntSafe(cParts[i]) : 0;
@@ -69,17 +119,10 @@ public class AppUpdater {
         for (int i = 0; i < v.Length; i = i + 1) {
             string ch = v.Substring(i, 1);
             if (ch == "." || ch == "-" || ch == "_") {
-                if (cur.Length > 0) {
-                    res.Add(cur);
-                    cur = "";
-                }
-            } else {
-                cur = cur + ch;
-            }
+                if (cur.Length > 0) { res.Add(cur); cur = ""; }
+            } else { cur = cur + ch; }
         }
-        if (cur.Length > 0) {
-            res.Add(cur);
-        }
+        if (cur.Length > 0) { res.Add(cur); }
         return res;
     }
 
@@ -88,248 +131,140 @@ public class AppUpdater {
         int n = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
             int code = s[i];
-            if (code >= 48 && code <= 57) {
-                n = n * 10 + (code - 48);
-            } else {
-                break;
-            }
+            if (code < 48 || code > 57 || n > 214748364 || (n == 214748364 && code > 55)) { break; }
+            n = n * 10 + code - 48;
         }
         return n;
     }
 
-    // 校验下载得到的 Zip 更新包 MD5 是否与清单一致。
-    public static bool VerifyZipPackage(string zipPath, string expectedMd5, UpdateProgressCallback cb) {
-        if (!File.Exists(zipPath)) {
-            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包文件不存在: " + zipPath)); }
-            return false;
-        }
-
-        if (cb != null) {
-            cb(UpdateProgressInfo.Create(UpdatePhase.Verifying, 50, zipPath, "正在校验更新包整包 MD5 完整性..."));
-        }
-
-        string actualMd5 = Md5.HashFile(zipPath);
-        if (expectedMd5 != null && expectedMd5.Length > 0 && actualMd5.ToLower() != expectedMd5.ToLower()) {
-            if (cb != null) {
-                cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包 MD5 校验失败！期望: " + expectedMd5 + ", 实际: " + actualMd5));
-            }
-            return false;
-        }
-
-        if (cb != null) {
-            cb(UpdateProgressInfo.Create(UpdatePhase.Verifying, 100, zipPath, "更新包 MD5 校验通过"));
-        }
-        return true;
+    // A diagnostic digest check does not authorize installation.
+    public static bool VerifyZipPackage(string zipPath, string expectedSha256, UpdateProgressCallback cb) {
+        if (!IsHex(expectedSha256, 64, 64) || !File.Exists(zipPath) || File.GetSize64(zipPath) > 268435456L) { return false; }
+        byte[] bytes = File.ReadAllBytes(zipPath);
+        return bytes != null && HashBytes(bytes) == expectedSha256.ToLower();
     }
 
-    // 解压 Zip 更新包并应用到目标应用程序目录（支持先备份旧版本）。
-    public static bool ApplyPackage(string zipPath, string targetAppDir, bool backupOld, UpdateProgressCallback cb) {
-        if (!File.Exists(zipPath)) {
-            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "找不到更新包: " + zipPath)); }
-            return false;
-        }
+    private static int ReadU16(byte[] bytes, int pos) {
+        return (bytes[pos] & 255) | ((bytes[pos + 1] & 255) << 8);
+    }
 
-        if (!Directory.Exists(targetAppDir)) {
-            Directory.CreateDirectory(targetAppDir);
-        }
+    private static long ReadU32(byte[] bytes, int pos) {
+        return (long)ReadU16(bytes, pos) | ((long)ReadU16(bytes, pos + 2) << 16);
+    }
 
-        string backupDir = "";
-        if (backupOld) {
-            if (cb != null) {
-                cb(UpdateProgressInfo.Create(UpdatePhase.Extracting, 10, "", "正在备份当前版本文件..."));
-            }
-            backupDir = targetAppDir + "/_backup";
-            if (!Directory.Exists(backupDir)) {
-                Directory.CreateDirectory(backupDir);
-            }
-        }
-
-        byte[] zipBytes = File.ReadAllBytes(zipPath);
-        if (zipBytes == null || zipBytes.Length == 0) {
-            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包数据为空")); }
-            return false;
-        }
-
-        List<ZipEntry> entries = Zip.Read(zipBytes);
-        if (entries == null) {
-            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包 Zip 损坏或解析失败")); }
-            return false;
-        }
-        int total = entries.Count;
-
-        string token = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
-
-        for (int i = 0; i < total; i = i + 1) {
+    private static List<ZipEntry> ReadVerifiedPackage(string zipPath, UpdateManifest manifest) {
+        if (!File.Exists(zipPath) || File.GetSize64(zipPath) != manifest.packageSize) { return null; }
+        byte[] bytes = File.ReadAllBytes(zipPath);
+        if (bytes == null || bytes.Length != manifest.packageSize || HashBytes(bytes) != manifest.packageSha256.ToLower()) { return null; }
+        List<ZipEntry> entries = Zip.Read(bytes);
+        if (entries == null || entries.Count != manifest.files.Count) { return null; }
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        for (int i = 0; i < entries.Count; i = i + 1) {
             ZipEntry e = entries[i];
+            if (e == null || e.isDirectory || !UpdateFileEntry.SafeRelPath(e.name)) { return null; }
             string rel = UpdateFileEntry.NormalizePath(e.name);
-            if (rel.Length == 0) {
-                if (cb != null) {
-                    cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包含不安全路径条目（路径逃逸），已中止: " + e.name));
-                }
-                return false;
+            string key = rel.ToLower();
+            if (seen.ContainsKey(key)) { return null; }
+            seen.Add(key, true);
+            UpdateFileEntry f = manifest.FindFile(rel);
+            if (f == null || f.size != e.uncompressedSize || e.compressedSize < 0 || e.compressedSize > 268435456) { return null; }
+            if (e.method != 0 && e.method != 8) { return null; }
+            // Disallow Zip.Extract's scan fallback and local/central size disagreement.
+            int pos = e.localHeaderOffset;
+            if (pos < 0 || (long)pos + 30L > bytes.Length || ReadU32(bytes, pos) != Zip.SigLocal) { return null; }
+            int flags = ReadU16(bytes, pos + 6);
+            int nameLen = ReadU16(bytes, pos + 26);
+            int extraLen = ReadU16(bytes, pos + 28);
+            long dataPos = (long)pos + 30L + nameLen + extraLen;
+            if ((flags & 1) != 0 || ReadU16(bytes, pos + 8) != e.method || nameLen != e.name.Length || dataPos + e.compressedSize > bytes.Length) { return null; }
+            for (int k = 0; k < nameLen; k = k + 1) {
+                if ((bytes[pos + 30 + k] & 255) != (e.name[k] & 255)) { return null; }
             }
-            string destFile = targetAppDir + "/" + rel;
-
-            string dir = Path.GetDirectoryName(destFile);
-            if (dir != null && dir.Length > 0 && !Directory.Exists(dir)) {
-                Directory.CreateDirectory(dir);
-            }
-
-            if (backupDir.Length > 0 && File.Exists(destFile)) {
-                string backupPath = backupDir + "/" + rel;
-                string backupSubDir = Path.GetDirectoryName(backupPath);
-                if (backupSubDir != null && backupSubDir.Length > 0 && !Directory.Exists(backupSubDir)) {
-                    Directory.CreateDirectory(backupSubDir);
-                }
-                File.Copy(destFile, backupPath);
-            }
-
-            byte[] extracted = Zip.Extract(zipBytes, e);
-            string tmpFile = destFile + "." + token + ".tmp";
-            try {
-                File.WriteAllBytes(tmpFile, extracted);
-                File.Move(tmpFile, destFile);
-            } catch (Exception ex) {
-                if (File.Exists(tmpFile)) { File.Delete(tmpFile); }
-                throw ex;
-            }
-            RestoreExecutablePermissionIfNeeded(destFile, extracted);
-
-            if (cb != null) {
-                int percent = ((i + 1) * 100) / total;
-                cb(UpdateProgressInfo.Progress(
-                    UpdatePhase.Extracting,
-                    percent,
-                    i + 1,
-                    total,
-                    rel,
-                    "正在解压释放更新文件..."
-                ));
-            }
+            long localCompressed = ReadU32(bytes, pos + 18);
+            long localSize = ReadU32(bytes, pos + 22);
+            if (!((localCompressed == e.compressedSize && localSize == e.uncompressedSize) || ((flags & 8) != 0 && localCompressed == 0 && localSize == 0))) { return null; }
+            byte[] extracted = Zip.Extract(bytes, e);
+            if (extracted == null || extracted.Length != f.size || HashBytes(extracted) != f.sha256.ToLower()) { return null; }
+            e.name = rel;
+            e.data = extracted;
         }
+        return entries;
+    }
 
+    // Isolate mutable caller metadata while preserving every signed field's
+    // exact representation and order. Signature verification follows the copy.
+    internal static UpdateManifest Snapshot(UpdateManifest source) {
+        try {
+            if (!ValidManifest(source)) { return null; }
+            UpdateManifest copy = new UpdateManifest();
+            copy.appName = source.appName;
+            copy.version = source.version;
+            copy.releaseDate = source.releaseDate;
+            copy.packageUrl = source.packageUrl;
+            copy.packageSize = source.packageSize;
+            copy.packageSha256 = source.packageSha256;
+            copy.packageMd5 = source.packageMd5;
+            copy.changelog = source.changelog;
+            copy.signature = source.signature;
+            for (int i = 0; i < source.files.Count; i = i + 1) {
+                UpdateFileEntry item = source.files[i];
+                UpdateFileEntry entry = new UpdateFileEntry();
+                entry.path = item.path;
+                entry.size = item.size;
+                entry.sha256 = item.sha256;
+                entry.md5 = item.md5;
+                entry.required = item.required;
+                copy.files.Add(entry);
+            }
+            return copy;
+        } catch (Exception ex) { return null; }
+    }
+
+    // No unsigned overload: every production write requires a signed manifest.
+    public static bool ApplyPackage(string zipPath, UpdateManifest manifest, string targetAppDir, bool backupOld, UpdateProgressCallback cb) {
+        if (!ValidManifest(manifest)) { return false; }
+        UpdateManifest snapshot = Snapshot(manifest);
+        if (!VerifyManifestSignature(snapshot, null)) { return false; }
+        List<ZipEntry> entries = ReadVerifiedPackage(zipPath, snapshot);
+        if (entries == null) { return false; }
+        try {
+            if (!InstallTransaction.Install(targetAppDir, snapshot, entries, backupOld)) { return false; }
+        } catch (Exception ex) { return false; }
+        if (cb != null) { cb(UpdateProgressInfo.Create(UpdatePhase.Completed, 100, "", "Authenticated package installed")); }
         return true;
     }
 
-    public static bool ApplyPackage(string zipPath, string targetAppDir, UpdateProgressCallback cb, bool backupOld) {
-        return ApplyPackage(zipPath, targetAppDir, backupOld, cb);
-    }
-
-    // 执行更新后防篡改检测并自动还原被篡改文件。
-    public static IntegrityReport VerifyAndSelfHeal(
-        string targetAppDir,
-        UpdateManifest manifest,
-        string recoveryZipPath,
-        UpdateProgressCallback cb
-    ) {
+    public static IntegrityReport VerifyAndSelfHeal(string targetAppDir, UpdateManifest manifest, string recoveryZipPath, UpdateProgressCallback cb) {
+        IntegrityReport report = TamperDetector.Check(targetAppDir, manifest, null);
+        if (!report.isClean && report.issues.Count > 0 && recoveryZipPath != null && recoveryZipPath.Length > 0) {
+            TamperDetector.RestoreFromZip(targetAppDir, manifest, report, recoveryZipPath, null);
+        }
         if (cb != null) {
-            cb(UpdateProgressInfo.Create(UpdatePhase.SelfHealing, 0, "", "开始进行文件防篡改自检与自愈..."));
+            cb(UpdateProgressInfo.Create(report.isClean ? UpdatePhase.Completed : UpdatePhase.Failed, 100, "", report.isClean ? "Integrity verified" : "Integrity or recovery rejected"));
         }
-
-        // 1. 进行 MD5 比对检测
-        IntegrityReport report = TamperDetector.Check(targetAppDir, manifest, cb);
-
-        // 2. 若发现异常且提供了恢复包，立即执行自动还原
-        if (!report.isClean && recoveryZipPath != null && recoveryZipPath.Length > 0) {
-            if (cb != null) {
-                cb(UpdateProgressInfo.Create(
-                    UpdatePhase.SelfHealing,
-                    50,
-                    "",
-                    "检测到文件被篡改或缺失，正在从官方更新包自动还原修复..."
-                ));
-            }
-
-            TamperDetector.RestoreFromZip(targetAppDir, report, recoveryZipPath, cb);
-        }
-
-        if (cb != null) {
-            if (report.isClean) {
-                cb(UpdateProgressInfo.Create(UpdatePhase.Completed, 100, "", "防篡改自检通过：所有文件纯净完整！"));
-            } else {
-                cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "自愈后仍存在部分文件异常，请检查网络或恢复包！"));
-            }
-        }
-
         return report;
     }
 
-    // 执行完整更新流程：版本检查 -> 整包 MD5 校验 -> 解压覆盖 -> MD5 防篡改比对与自愈还原。
-    public static bool UpdateTo(
-        string currentVersion,
-        string manifestPath,
-        string localZipPath,
-        string targetAppDir,
-        bool backupOld,
-        UpdateProgressCallback cb
-    ) {
-        if (cb != null) {
-            cb(UpdateProgressInfo.Create(UpdatePhase.Checking, 0, "", "正在读取更新清单并检查版本..."));
-        }
-
+    public static bool UpdateTo(string currentVersion, string manifestPath, string localZipPath, string targetAppDir, bool backupOld, UpdateProgressCallback cb) {
         UpdateManifest manifest = UpdateManifest.LoadFromFile(manifestPath);
-        if (manifest == null) {
-            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "无法加载更新清单: " + manifestPath)); }
-            return false;
-        }
-
-        if (AppUpdater.signerModulusHex.Length > 0) {
-            if (cb != null) {
-                cb(UpdateProgressInfo.Create(UpdatePhase.Checking, 20, "", "正在验证更新清单发行方签名..."));
-            }
-            if (!AppUpdater.VerifyManifestSignature(manifest, cb)) {
-                return false;
-            }
-        }
-
-        if (!HasNewVersion(currentVersion, manifest.version)) {
-            if (cb != null) {
-                cb(UpdateProgressInfo.Create(UpdatePhase.Completed, 100, "", "当前已是最新版本 (" + currentVersion + ")，无需更新"));
-            }
-            return true;
-        }
-
-        // 1. 校验整包 MD5
-        if (!VerifyZipPackage(localZipPath, manifest.packageMd5, cb)) {
-            return false;
-        }
-
-        // 2. 解压覆盖更新文件
-        if (!ApplyPackage(localZipPath, targetAppDir, backupOld, cb)) {
-            return false;
-        }
-
-        // 3. 执行防篡改比对自检
-        IntegrityReport report = VerifyAndSelfHeal(targetAppDir, manifest, localZipPath, cb);
+        if (manifest == null) { return false; }
+        if (!VerifyManifestSignature(manifest, null)) { return false; }
+        if (!HasNewVersion(currentVersion, manifest.version)) { return true; }
+        if (!ApplyPackage(localZipPath, manifest, targetAppDir, backupOld, null)) { return false; }
+        IntegrityReport report = TamperDetector.Check(targetAppDir, manifest, cb);
         return report.isClean;
     }
 
-    // 若写入的文件属于可执行文件，在 POSIX 平台上自动赋予可执行权限 (0755)。
     public static void RestoreExecutablePermissionIfNeeded(string filePath, byte[] content) {
         #if !WINDOWS
-        if (filePath == null || content == null || content.Length < 2) {
-            return;
+        if (filePath == null || content == null || content.Length < 2) { return; }
+        bool isExec = filePath.EndsWith(".sh") || (content[0] == 35 && content[1] == 33);
+        if (content.Length >= 4) {
+            if (content[0] == 0x7F && content[1] == 0x45 && content[2] == 0x4C && content[3] == 0x46) { isExec = true; }
+            if ((content[0] == 0xCF || content[0] == 0xCE) && content[1] == 0xFA && content[2] == 0xED && content[3] == 0xFE) { isExec = true; }
+            if (content[0] == 0xCA && content[1] == 0xFE && content[2] == 0xBA && content[3] == 0xBE) { isExec = true; }
         }
-        bool isExec = false;
-        if (filePath.EndsWith(".sh")) {
-            isExec = true;
-        } else if (content.Length >= 4) {
-            if (content[0] == 0x7F && content[1] == 0x45 && content[2] == 0x4C && content[3] == 0x46) {
-                isExec = true;
-            }
-            else if ((content[0] == 0xCF && content[1] == 0xFA && content[2] == 0xED && content[3] == 0xFE)
-                  || (content[0] == 0xCE && content[1] == 0xFA && content[2] == 0xED && content[3] == 0xFE)
-                  || (content[0] == 0xFE && content[1] == 0xED && content[2] == 0xFA && content[3] == 0xCF)
-                  || (content[0] == 0xCA && content[1] == 0xFE && content[2] == 0xBA && content[3] == 0xBE)) {
-                isExec = true;
-            }
-            else if (content[0] == 0x23 && content[1] == 0x21) {
-                isExec = true;
-            }
-        }
-        if (isExec) {
-            File.SetExecutable(filePath, true);
-        }
+        if (isExec) { File.SetExecutable(filePath, true); }
         #endif
     }
 }

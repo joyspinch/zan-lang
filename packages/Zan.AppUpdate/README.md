@@ -1,200 +1,209 @@
-# Zan.AppUpdate 通用版本更新与防篡改自愈包
+# Zan.AppUpdate
 
-`Zan.AppUpdate` 是为 Zan 语言桌面应用、游戏与服务端打造的通用版本管理、发布打包、客户端更新调度与文件完整性自愈框架。
+Authenticated ZIP release installation and integrity recovery for Zan applications.
 
----
+`ReleasePackager.Pack` creates a ZIP and an **unsigned** manifest containing package size,
+`packageSha256`, and each file's size and `sha256`. MD5 fields remain diagnostic metadata;
+installation and recovery never use them as a security check.
 
-## 核心特性
-
-1. **版本发布打包（ReleasePackager）**
-   - 递归扫描指定发布目录（支持无限层级子目录），自动收集全部文件。
-   - 对每个文件提取大小并计算 32 位 MD5 校验和。
-   - 一键生成标准规范的 `update.manifest.json` 版本清单文件。
-   - 基于标准库 `Zip` 高效压缩打包为 `.zip` 发布包，同时可将清单打包入 Zip 或独立导出。
-   - 计算 Zip 包自身 MD5 与总大小，确保发布包整体防篡改与完整性。
-
-2. **版本进度实时更新与监控（UpdateProgress）**
-   - 精细化状态机阶段：`Checking`（检查版本）、`Downloading`（下载）、`Verifying`（校验完整性）、`Extracting`（解压安装）、`SelfHealing`（防篡改自愈）、`Completed`（完成）、`Failed`（失败）。
-   - 携带实时百分比（0 - 100%）、已传输/处理字节数、总字节数、当前处理文件名与状态提示语。
-   - 纯委托回调机制（`UpdateProgressCallback`），方便控制台 CLI、GUI 界面进度条或游戏 HUD 零摩擦接入。
-   - 内置开箱即用的 `ConsoleProgressRenderer` 控制台字符进度条。
-
-3. **MD5 防篡改比对与精准自愈（TamperDetector）**
-   - 本地全文件 MD5 完整性巡检：启动时或更新后对所有关键程序/资源文件进行指纹比对。
-   - 自动识别三种异常状态：`Missing`（文件丢失/被误删）、`Tampered`（文件被篡改/损坏/哈希不匹配）、`Ok`（正常）。
-   - **自动精准还原自愈**：从官方 `.zip` 压缩包中按需提取被篡改或丢失的文件，覆盖写入本地目标路径并自动进行二次 MD5 复检，确保程序快速恢复至官方纯净状态，抵御恶意文件篡改与资源损坏。
-
-4. **安全升级与版本覆盖（AppUpdater）**
-   - 支持语义化版本判断与增量/全量更新调度。
-   - 支持解压前对整包 Zip 进行 MD5 预校验，杜绝网络传输损毁或劫持。
-   - 支持升级前旧版本自动备份（`_backup/v_<timestamp>`），出现意外可快速回退。
-
----
-
-## 架构组件清单
-
-| 类名 / 文件 | 职责说明 |
-| :--- | :--- |
-| `UpdateFileEntry` | 单个文件的路径、大小、MD5 指纹与必需标志，支持 JSON 互转 |
-| `UpdateManifest` | 包含版本号、发布时间、更新日志、包 MD5 与文件列表的清单模型 |
-| `ReleasePackager` | 服务端/发布端：扫描目录、计算哈希、生成 Manifest 并 Zip 压缩 |
-| `UpdateProgressInfo` / `UpdatePhase` | 进度数据结构、阶段枚举与状态文案转换 |
-| `TamperDetector` | 客户端防篡改比对器与基于 Zip 的受损文件精准还原自愈引擎 |
-| `AppUpdater` | 客户端一键更新管理器，串联版本检查、解压安装与防篡改闭环 |
-
----
-
-## 快速上手
-
-### 1. 服务端 / 发布端：制作版本发布包
+The publisher signs the complete canonical `manifest.SigningPayload()` using
+RSASSA-PKCS1-v1_5/SHA-256. Signing changes the in-memory manifest; save it afterwards:
 
 ```zan
-using System;
-using AppUpdate;
-
-class Publisher {
-    static void Main() {
-        string appDir = "dist/myapp";
-        string outZip = "releases/myapp_1.2.0.zip";
-        string outManifest = "releases/myapp_1.2.0.manifest.json";
-
-        UpdateProgressCallback onProgress = info => {
-            Console.WriteLine(info.percent + "% - " + info.message);
-        };
-
-        UpdateManifest manifest = ReleasePackager.Pack(
-            appDir,
-            outZip,
-            outManifest,
-            "MyApp",
-            "1.2.0",
-            "1. 支持暗黑主题\n2. 修复已知性能问题",
-            "https://updates.example.com/myapp_1.2.0.zip",
-            onProgress
-        );
-
-        Console.WriteLine("打包完成，Zip MD5: " + manifest.packageMd5);
-    }
+UpdateManifest manifest = ReleasePackager.Pack(
+    releaseDir, zipPath, manifestPath, "MyApp", "2.0.0", "Release notes", packageUrl, null);
+if (manifest == null) { return 1; }
+if (ReleasePackager.SignManifest(manifest, publisherModulusHex, privateExponentHex).Length == 0) {
+    return 1;
 }
+manifest.SaveToFile(manifestPath);
 ```
 
-### 2. 客户端：版本更新与解压安装
+Private keys belong only in the publisher's protected signing process. A real client
+ships its trusted public key independently of downloaded data:
 
 ```zan
-using System;
-using AppUpdate;
-
-class UpdaterDemo {
-    static void Main() {
-        AppUpdater updater = new AppUpdater();
-
-        // 绑定通用控制台进度条
-        updater.onProgress = ConsoleProgressRenderer.Render;
-
-        // 校验整包 MD5 并解压更新（自动备份旧版本）
-        bool ok = updater.ApplyPackage("downloads/myapp_1.2.0.zip", "C:/Program Files/MyApp", null, true);
-        if (ok) {
-            Console.WriteLine("更新成功！");
-        }
-    }
-}
+AppUpdater.SetTrustedSigner(installedPublisherModulusHex, "010001");
+bool installed = AppUpdater.UpdateTo(
+    currentVersion, downloadedManifestPath, downloadedZipPath, applicationDirectory, true, null);
 ```
 
-### 3. 客户端：防篡改自检与文件自动还原
+Missing or malformed trust anchors, missing/invalid signatures, and manifests without
+SHA-256 bindings fail closed. Invalid signer configuration clears the previous anchor.
+RSA moduli must be 2048–4096 bits with the high bit set and odd, and exponents must be odd
+and at least 3. Signer fields are private; configure once before starting concurrent work.
+A manifest claiming no newer version is still authenticated before returning success.
+
+For public-key rotation use `SetTrustedSigners("nHex:eHex\nnHex:eHex")` or
+`SetTrustedSignerPemBundle(localPublicPemBundle)`. Both replace the complete trust set,
+accept at most five distinct public keys, and clear trust on any invalid entry. The old
+`SetTrustedSigner` replaces the set with one key. Keep the current and previous public
+keys during overlap; remove the previous key to revoke it. Signing retains only the
+active private key. Manifest bytes and hexadecimal signatures are unchanged.
+
+The IDE reads `ZAN_UPDATE_PUBLIC_KEYSET_FILE` (a local public PEM bundle), falling back to
+`ZAN_UPDATE_PUBLIC_KEY_FILE` only when the keyset variable is absent. An invalid configured
+keyset fails closed. These files must be provisioned independently of pending updates;
+the bootstrap resolves their paths before changing its working directory.
+
+For direct installation use the authenticated overload:
 
 ```zan
-using System;
-using AppUpdate;
-
-class IntegrityCheckDemo {
-    static void Main() {
-        string appDir = "C:/Program Files/MyApp";
-        string manifestPath = appDir + "/manifest.json";
-        string recoveryZip = "cache/myapp_latest.zip";
-
-        // 1. 加载官方发布清单
-        UpdateManifest manifest = UpdateManifest.LoadFromFile(manifestPath);
-
-        // 2. 检查本地文件 MD5 防篡改状态
-        IntegrityReport report = TamperDetector.Check(appDir, manifest, ConsoleProgressRenderer.Render);
-        Console.WriteLine(report.Summary());
-
-        // 3. 若发现文件被篡改或丢失，自动从 Zip 恢复纯净版本
-        if (!report.isClean) {
-            Console.WriteLine("发现文件异常，开始执行自动自愈还原...");
-            int restored = TamperDetector.RestoreFromZip(appDir, report, recoveryZip, ConsoleProgressRenderer.Render);
-            Console.WriteLine("成功自愈文件数: " + restored);
-
-            // 4. 二次复核
-            IntegrityReport checkAgain = TamperDetector.Check(appDir, manifest, null);
-            if (checkAgain.isClean) {
-                Console.WriteLine("自愈完毕，程序文件已恢复官方纯净状态！");
-            }
-        }
-    }
-}
+bool installed = AppUpdater.ApplyPackage(zipPath, manifest, applicationDirectory, true, null);
+IntegrityReport report = AppUpdater.VerifyAndSelfHeal(
+    applicationDirectory, manifest, zipPath, null);
 ```
 
----
+`TamperDetector.Check(directory, manifest, callback)` requires authenticated metadata.
+Null/invalid/untrusted manifests produce a non-clean report. Recovery is also available
+as `TamperDetector.RestoreFromZip(directory, manifest, report, zipPath, callback)`.
+The mutable report is output, never installation authority. Recovery authenticates and
+reinstalls the complete package, then checks disk contents again. It returns the number
+of previously damaged/missing files recovered only when the final check succeeds.
+The old unsigned `ApplyPackage` and report-only recovery overloads have been removed.
+`VerifyZipPackage` is a diagnostic SHA-256 comparison and does not authorize installation.
 
-### 4. 发行方签名（防更新链劫持，生产必配）
+Every archive entry must match exactly one signed file path, size and SHA-256 digest.
+All entries are extracted and checked before the first destination write. Duplicate
+case aliases, file/directory collisions, absolute/traversal paths, dot/empty segments,
+Windows device names, alternate data streams, trailing dots/spaces and existing reparse
+ancestors are rejected (POSIX symbolic links, including dangling links, are checked
+at the leaf and each ancestor). Explicit ZIP directory entries and methods other than stored
+or deflate are unsupported. Local headers must agree with central-directory metadata;
+encrypted entries and fallback local-header scanning are rejected.
 
-整包 MD5 只保证**完整性**不保证**真实性**——能同时替换清单与 Zip 的通道攻击者可以
-两者一起换。清单签名把信任锚定在发行方私钥上：
+Limits are 8 MiB manifest text, 10,000 files, 64 MiB per expanded file, 256 MiB total
+expanded content and 256 MiB package bytes. These limits apply before extraction.
+The ZIP decoder also checks CRC and bounds its deflate expansion.
 
-```zan
-using System;
-using System.Security.Cryptography;
-using AppUpdate;
+Installation takes a nonblocking exclusive OS file lock at `_appupdate.lock`; another
+installer returns `false`. It stages every validated new file and immutable snapshots of
+existing destination files before publishing. The root-bound, checksum-protected local
+journal records the exact expected signed manifest and the old file/backup hashes.
+On Windows, the root binding uses the actual directory's volume/file identity so case
+and short-name aliases can retry the same installation without conflating distinct
+case-sensitive directories. POSIX root normalization preserves literal backslashes;
+only `/` is a directory separator. State copied to a different Windows directory is
+rejected. Transaction format 3 preserves this root binding and adds ordered persistence
+barriers. Retained format-2 state remains recoverable under its original process-interruption
+contract; its earlier writes cannot retrospectively acquire a power-loss guarantee.
+Version-1 path-bound state is rejected without deleting it; finish that older in-flight
+transaction using its compatible updater before installing with this version.
+Publication uses individual same-volume renames into the existing application layout.
+An I/O failure triggers reverse rollback, including removal of newly created files.
+This provides a recoverable transaction, not instantaneous atomic visibility of the
+whole directory: stop application activity during installation. Empty directories created
+during a failed attempt may remain.
 
-// 发布端：打包后用 RSA 私钥签清单（密钥为 hex 大端字符串，可由 PEM 导出）
-UpdateManifest m = ReleasePackager.Pack(...);
-ReleasePackager.SignManifest(m, nHex, dHex);   // 签名写入 m.signature
-m.SaveToFile(manifestPath);                    // 签名后重新保存清单
+On the next `ApplyPackage` call, a pending publishing transaction is rolled back before
+another installation starts. **Retain and retry the exact signed manifest and matching
+ZIP used by the interrupted attempt.** A different expected manifest/package is rejected
+while rollback is pending; a retained older signed manifest never independently authorizes
+rollback. Original snapshots remain intact during rollback so an interrupted rollback can
+be retried, including when a destination was restored before restoring its caller
+backup failed. Committed cleanup can also resume after some snapshots or the
+journal have already been removed. Corrupt journals, changed snapshot/destination bytes, unsafe paths, and failed
+rollback leave the transaction state in place and return `false`; restore trusted local
+state before retrying. A committed transaction is cleanup-only and can never trigger
+rollback. Once the commit barriers succeed, installation returns `true` even when cleanup
+must be retried on a later installation. A visible `committed` rename whose barrier failed
+returns `false` and retains recovery material; recovery confirms the marker barriers before
+cleanup. Keep the exact inputs until recovery resolves this uncertain result. Format 3
+writes a synchronized `preparing` marker before staging; interrupted preparation has not
+changed payload files and only its bounded flat staging inventory is cleaned.
 
-// 客户端：启动时配置发行方公钥（hex 模数、hex 指数）
-AppUpdater.SetTrustedSigner(nHex, "010001");
-// 之后所有 UpdateTo 强制验签：清单无签名或验签失败直接中止（fail-closed）。
-// 不配置公钥则维持"仅整包 MD5"的兼容模式——仅供开发环境使用。
-```
+Transaction state is private to `_appupdate`, separate from the caller-facing `_backup`.
+With `backupOld=true`, success replaces `_backup/<path>` with the pre-install destination
+where one existed, preserving the existing API behavior. A failed install restores any
+preexisting caller backup and removes backups newly created by that attempt. Rollback
+snapshots are always kept until commit, even with `backupOld=false`. Releases cannot use
+the top-level `_backup` subtree, or `_appupdate` / `_appupdate.lock` as any path segment,
+including nested installation roots' state and lock files. These reservations compare
+case-insensitively on every platform.
+Existing destination and caller backup files are conservatively limited to 64 MiB each;
+new payload plus old destination/backup snapshots are limited to 768 MiB in total.
+Oversized snapshots fail before payload publication. Journals are limited to 8 MiB.
 
-安全基线（本包内置，无需配置）：
+Format 3 orders preparation, publication, rollback and cleanup through `File.FlushToDisk`
+and, on POSIX, `Directory.FlushToDisk`. Snapshot files and journal entries are synchronized
+before publication; replacement files and directory entries precede the commit marker.
+Matching rollback bytes still require mode restoration and synchronization. Cleanup synchronizes
+inventory deletion before removing the phase, then synchronizes phase and state-directory
+removal. Any required POSIX barrier failure blocks progress and can be retried. Creating
+new parent directories also synchronizes their ancestor chain.
 
-- **zip-slip 防护**：更新包/恢复包内条目路径经 `UpdateFileEntry.SafeRelPath`
-  检查，含 `..` 段、盘符或绝对路径的条目一律拒绝并中止整包（fail-closed），
-  与 stdlib `Tar.SafeName` 同规则。
-- **原子覆盖**：所有覆盖写先落同目录随机 token 临时文件再 rename 替换
-  （`MOVEFILE_REPLACE_EXISTING`），断电/崩溃不会截断活文件，只可能留下
-  可清理的 `.tmp`。
-- **真备份**：`backupOld=true` 时，每个将被覆盖的旧文件先复制进
-  `_backup/<原相对路径>`，回滚可用（`_backup` 不参与打包扫描）。
+Windows uses file barriers only: directory synchronization remains unsupported, so durable
+namespace publication is not established there. Matching read-only original files on Windows
+are left untouched; they do not prevent rollback of earlier replacements. WASM persistence
+barriers are unsupported. Filesystem/device behavior and real power-loss recovery require
+separate acceptance; software fault injection or process interruption does not establish that
+result. The application directory and every ancestor,
+including transaction state and the lock file, must be trusted local storage with write
+access controlled as strictly as the installed executables. Journal checksums detect
+corruption and are not authentication against an actor able to rewrite that trusted
+storage. Recovery derives write paths only from the caller's authenticated expected plan;
+transaction slots use fixed numeric names. Reparse ancestry checks and flat cleanup avoid
+following links, but cannot prevent simultaneous hostile directory mutation by a local
+writer. Progress callbacks run after security-sensitive work so they cannot alter
+authenticated metadata during installation.
 
----
+The signed format now includes `packageSha256` and per-file `sha256`; regenerate and
+re-sign older manifests. Existing signatures over the old MD5-only payload are rejected.
+`TamperFileIssue.expectedSha256` / `actualSha256` and report summaries expose SHA-256.
 
-## 清单文件（Manifest）规范样例
+`examples/QuickStart.zan` combines a publisher and client for demonstration. Configure a
+**disposable** RSA key with `ZAN_APPUPDATE_DEMO_MODULUS` and
+`ZAN_APPUPDATE_DEMO_PRIVATE_EXPONENT` (big-endian hex, exponent 65537), then run it from the
+repository root. It writes under `_scratch/appupdate_demo`. Never configure a production
+private key for this demo. The conformance test uses a public test-only key fixture.
 
-```json
-{
-  "appName": "MyApp",
-  "version": "1.2.0",
-  "releaseDate": "2026-09-21 12:00:00",
-  "packageUrl": "https://updates.example.com/myapp_1.2.0.zip",
-  "packageSize": 2564810,
-  "packageMd5": "e61278c46e75fde5cff4711de4bbdaf8",
-  "changelog": "更新日志描述...",
-  "files": [
-    {
-      "path": "bin/myapp.exe",
-      "size": 184520,
-      "md5": "bb1a652836b87b59a11c656b5e39f155",
-      "required": true
-    },
-    {
-      "path": "config.json",
-      "size": 128,
-      "md5": "bf8c257d57bbf841fb7f2173bbf71623",
-      "required": true
-    }
-  ]
-}
-```
+
+## Windows loaded-image updates
+
+A loaded Windows executable cannot replace itself. Dispatch
+`UpdateBootstrap.Handle(args, HostApply)` at the very start of `Main(string[] args)`,
+before GUI registration, worker startup or other application initialization. A return
+value of `-1` means ordinary startup; every other value is the helper exit code.
+
+After independently configuring the installed signer and checking the product/channel,
+call `UpdateBootstrap.Begin(targetRoot, pendingRoot, workRoot, manifest, relaunchArgs)`.
+The current executable must be directly inside `targetRoot` and included in the signed
+manifest. Pending staging contains `manifest.json` and `release.zip`. `workRoot` must
+be outside the installation and on a trusted local filesystem; staging may be in a
+configuration subtree inside the installation. The work directory and installed files
+must not be writable by less trusted users. The request checksum binds a snapshot; it
+is not an authorization token against another process with the same user's write access.
+
+This bootstrap supports native hosts whose non-system DLL dependencies are deployed
+beside their executable. It copies the trusted installed executable and adjacent DLLs
+into a random work subdirectory, launches that copy without a shell, opens the exact
+original parent using PID, creation time and image path, then acknowledges readiness.
+Only a `true` result authorizes the caller to return normally from Main; a `false`
+result must preserve staging and report failure. The parent has a 30-second ready
+limit. The helper waits up to two minutes for the opened parent handle to signal exit.
+
+The `BootstrapApply` callback receives `(targetRoot, pendingRoot, manifestSha256,
+install)`. With `install=false`, it must independently configure the trusted signer,
+check host-owned product/platform policy and fixed staging location, authenticate the
+bound manifest and archive, and return a positive value without installing. It runs
+before the ready handshake. With `install=true`, it must repeat those checks and use
+`AppUpdater.ApplyPackage` plus the host's existing managed inventory bookkeeping;
+return a positive value only after full success. Never choose a key from request data.
+The target is bound to the opened parent's original executable path. If host policy
+also configures an installation root, check that independently in the callback.
+
+After parent exit, the helper rechecks the request and pending snapshot, invokes the
+callback, checks the complete installed signed inventory and rejects adjacent DLLs
+missing from that inventory. The release must therefore include the complete native
+DLL deployment. It relaunches only the fixed original host path with bounded arguments.
+It never launches after a failed application or verification. Failed pending data is
+left for inspection/retry by the host's application logic. Relaunch failure after a
+successful commit is reported separately and does not roll back a completed install.
+
+`result.json` contains a fixed status without paths, keys or exception bodies. On a
+later Begin, cleanup considers at most 32 terminal work directories with at most 264
+flat files each. It deletes the helper executable first; Windows rejects deletion of
+a loaded image, leaving all its dependencies untouched. In-progress handoffs are
+preserved. Abruptly interrupted helpers without a terminal marker may require local
+inspection. Non-Windows helper dispatch returns 40 and Begin returns false; hosts must
+provide an explicit unsupported-platform result rather than applying a loaded image.

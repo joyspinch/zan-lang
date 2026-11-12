@@ -1,0 +1,181 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Security.Cryptography;
+
+// A snapshot contains only public n:e pairs. Its immutable string representation
+// prevents callers from mutating a published trust set. Duplicate anchors are errors.
+public class TrustedRsaKeys {
+    public static int MaxKeys() { return 5; }
+
+    public static bool IsHex(string value, int minLength, int maxLength) {
+        if (value == null || value.Length < minLength || value.Length > maxLength || value.Length % 2 != 0) { return false; }
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int c = value[i];
+            if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) { return false; }
+        }
+        return true;
+    }
+
+    public static string Single(string modulusHex, string exponentHex) {
+        if (!TrustedRsaKeys.IsHex(modulusHex, 512, 1024)
+            || !TrustedRsaKeys.IsHex(exponentHex, 2, 8)) { return ""; }
+        byte[] n = Hex.Decode(modulusHex);
+        byte[] e = Hex.Decode(exponentHex);
+        int nLength = modulusHex.Length / 2;
+        int eLength = exponentHex.Length / 2;
+        if (n[0] < 128 || (n[nLength - 1] & 1) == 0 || e[0] == 0
+            || (e[eLength - 1] & 1) == 0 || (eLength == 1 && e[0] < 3)) { return ""; }
+        return modulusHex.ToLower() + ":" + exponentHex.ToLower();
+    }
+
+    // Serialized key sets are local configuration, never signed/downloaded metadata.
+    // Validate the entire set before returning any anchor; a bad tail invalidates all.
+    public static string FromHex(string serialized) {
+        if (serialized == null || serialized.Length == 0 || serialized.Length > 5200) { return ""; }
+        List<string> entries = serialized.Split("\n");
+        if (entries.Count < 1 || entries.Count > TrustedRsaKeys.MaxKeys()) { return ""; }
+        string snapshot = "";
+        List<string> seen = new List<string>();
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            string entry = entries[i];
+            int colon = entry.IndexOf(":");
+            if (colon <= 0) { return ""; }
+            string key = TrustedRsaKeys.Single(entry.Substring(0, colon), entry.Substring(colon + 1));
+            if (key == "" || seen.Contains(key)) { return ""; }
+            seen.Add(key);
+            snapshot = snapshot + (i == 0 ? "" : "\n") + key;
+        }
+        return snapshot;
+    }
+
+    // Accept only complete public-key PEM blocks separated by whitespace. Reject
+    // private keys, certificates, mixed material and unknown/trailing text explicitly.
+    public static string FromPemBundle(string pem) {
+        if (pem == null || pem.Length == 0 || pem.Length > 16384) { return ""; }
+        string remaining = pem.Trim();
+        string snapshot = "";
+        int count = 0;
+        while (remaining.Length > 0) {
+            if (count >= TrustedRsaKeys.MaxKeys()) { return ""; }
+            string begin = "-----BEGIN PUBLIC KEY-----";
+            string end = "-----END PUBLIC KEY-----";
+            if (remaining.StartsWith("-----BEGIN RSA PUBLIC KEY-----")) {
+                begin = "-----BEGIN RSA PUBLIC KEY-----";
+                end = "-----END RSA PUBLIC KEY-----";
+            }
+            if (!remaining.StartsWith(begin)) { return ""; }
+            int finish = remaining.IndexOf(end, begin.Length);
+            if (finish < 0) { return ""; }
+            string body = remaining.Substring(begin.Length, finish - begin.Length);
+            string encoded = body.Replace("\r", "").Replace("\n", "").Replace(" ", "").Replace("\t", "");
+            List<int> decodedLength = new List<int>(); decodedLength.Add(0);
+            byte[] decoded = Base64.Decode(encoded, decodedLength);
+            if (decoded == null || !TrustedRsaKeys.CompletePublicDer(decoded, decodedLength[0], begin == "-----BEGIN RSA PUBLIC KEY-----")
+                || Base64.Encode(decoded, decodedLength[0]) != encoded) { return ""; }
+            int length = finish + end.Length;
+            RsaKey key = RsaKey.FromPublicPem(remaining.Substring(0, length));
+            if (key == null) { return ""; }
+            string entry = TrustedRsaKeys.Single(Hex.Encode(key.modulus, key.modulusLength),
+                Hex.Encode(key.publicExponent, key.publicExponentLength));
+            if (entry == "") { return ""; }
+            snapshot = snapshot + (count == 0 ? "" : "\n") + entry;
+            count = count + 1;
+            remaining = remaining.Substring(length).Trim();
+        }
+        return TrustedRsaKeys.FromHex(snapshot);
+    }
+
+    // cursor advances only past the header; callers must consume exactly to the
+    // returned end within their parent. RsaKey's general parser does not enforce it.
+    private static int DerElement(byte[] der, List<int> cursor, int limit, int tag) {
+        int pos = cursor[0];
+        if (pos < 0 || pos + 2 > limit || (der[pos] & 255) != tag) { return -1; }
+        int payload = der[pos + 1] & 255;
+        pos = pos + 2;
+        if (payload >= 128) {
+            int bytes = payload & 127;
+            if (bytes < 1 || bytes > 2 || pos + bytes > limit || der[pos] == 0) { return -1; }
+            payload = 0;
+            for (int i = 0; i < bytes; i = i + 1) { payload = payload * 256 + (der[pos + i] & 255); }
+            pos = pos + bytes;
+            if (payload < 128 || (bytes == 2 && payload < 256)) { return -1; }
+        }
+        if (payload > limit - pos) { return -1; }
+        cursor[0] = pos;
+        return pos + payload;
+    }
+
+    private static bool DerPositiveInteger(byte[] der, List<int> cursor, int limit) {
+        int end = TrustedRsaKeys.DerElement(der, cursor, limit, 2);
+        int pos = cursor[0];
+        if (end <= pos || (der[pos] & 128) != 0) { return false; }
+        // DER permits a leading zero only to protect a positive high-bit value.
+        if (der[pos] == 0 && (end - pos < 2 || (der[pos + 1] & 128) == 0)) { return false; }
+        cursor[0] = end;
+        return true;
+    }
+
+    private static bool CompletePkcs1(byte[] der, List<int> cursor, int limit) {
+        int end = TrustedRsaKeys.DerElement(der, cursor, limit, 48);
+        if (end < 0 || end != limit) { return false; }
+        return TrustedRsaKeys.DerPositiveInteger(der, cursor, end)
+            && TrustedRsaKeys.DerPositiveInteger(der, cursor, end) && cursor[0] == end;
+    }
+
+    private static bool CompletePublicDer(byte[] der, int length, bool pkcs1) {
+        if (length < 4) { return false; }
+        List<int> cursor = new List<int>(); cursor.Add(0);
+        if (pkcs1) { return TrustedRsaKeys.CompletePkcs1(der, cursor, length); }
+        int outerEnd = TrustedRsaKeys.DerElement(der, cursor, length, 48);
+        if (outerEnd != length) { return false; }
+        int algorithmEnd = TrustedRsaKeys.DerElement(der, cursor, outerEnd, 48);
+        if (algorithmEnd < 0) { return false; }
+        int oidEnd = TrustedRsaKeys.DerElement(der, cursor, algorithmEnd, 6);
+        // rsaEncryption (1.2.840.113549.1.1.1), with optional DER NULL parameters.
+        if (oidEnd < 0 || oidEnd - cursor[0] != 9) { return false; }
+        string rsaOid = "2a864886f70d010101";
+        byte[] expected = Hex.Decode(rsaOid);
+        for (int i = 0; i < 9; i = i + 1) {
+            if (der[cursor[0] + i] != expected[i]) { return false; }
+        }
+        cursor[0] = oidEnd;
+        if (cursor[0] < algorithmEnd) {
+            int nullEnd = TrustedRsaKeys.DerElement(der, cursor, algorithmEnd, 5);
+            if (nullEnd < 0 || nullEnd != cursor[0]) { return false; }
+        }
+        if (cursor[0] != algorithmEnd) { return false; }
+        int bitEnd = TrustedRsaKeys.DerElement(der, cursor, outerEnd, 3);
+        if (bitEnd != outerEnd || cursor[0] >= bitEnd || der[cursor[0]] != 0) { return false; }
+        cursor[0] = cursor[0] + 1;
+        return TrustedRsaKeys.CompletePkcs1(der, cursor, bitEnd);
+    }
+
+    public static bool VerifyHex(string snapshot, string message, string signature) {
+        if (message == null || !TrustedRsaKeys.IsHex(signature, 512, 1024)) { return false; }
+        return TrustedRsaKeys.VerifyRaw(snapshot, message, Hex.Decode(signature), signature.Length / 2);
+    }
+
+    public static bool VerifyBase64(string snapshot, string message, string signature) {
+        if (message == null || signature == null || signature.Length == 0 || signature.Length > 684) { return false; }
+        List<int> length = new List<int>(); length.Add(0);
+        byte[] raw = Base64.Decode(signature, length);
+        if (raw == null || Base64.Encode(raw, length[0]) != signature) { return false; }
+        return TrustedRsaKeys.VerifyRaw(snapshot, message, raw, length[0]);
+    }
+
+    private static bool VerifyRaw(string snapshot, string message, byte[] signature, int length) {
+        string validated = TrustedRsaKeys.FromHex(snapshot);
+        if (validated == "") { return false; }
+        List<string> entries = validated.Split("\n");
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            string entry = entries[i];
+            int colon = entry.IndexOf(":");
+            string n = entry.Substring(0, colon);
+            string e = entry.Substring(colon + 1);
+            if (length == n.Length / 2 && Rsa.VerifyPkcs1Sha256(message, message.Length, signature,
+                Hex.Decode(n), n.Length / 2, Hex.Decode(e), e.Length / 2)) { return true; }
+        }
+        return false;
+    }
+}

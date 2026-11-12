@@ -24,7 +24,10 @@
   `lic.VendorPublicKey(nHex, eHex)` 配置发行方 RSA 公钥并对证书验签；未配置公钥或
   证书签名不符即拒绝。发行方签发证书用 `LicenseClient.MakeCertificate(product,
   deviceFp, subject, expiresAt, nHex, dHex)`（RSA 私钥 hex），客户端经
-  `lic.InstallCertificate(certJson)` 安装。
+  `lic.InstallCertificate(certJson)` 安装。轮换时用 `lic.VendorPublicKeys("nHex:eHex\nnHex:eHex")`
+  或 `lic.VendorPublicKeyPemBundle(localPublicPemBundle)` 替换完整本地信任集合（最多五把，重复也拒绝）。
+  任一项非法会清空信任；旧 `VendorPublicKey` 替换为 singleton 并清除 previous keys。
+  重叠期保留当前及前任公钥，撤销时移除前任；签发只使用 active 私钥，证书 canonical 与 hex 签名不变。
   注意：HMAC 的密钥在本机可推导，防的是"改字段/拷机器"这类低门槛篡改；
   高价值产品必须使用 signed 模式（攻击者无私钥无法伪造证书）。
 - **非阻塞与高健壮性**：网络故障、超时统一返回结构化结果对象，不中断程序正常退出流程。
