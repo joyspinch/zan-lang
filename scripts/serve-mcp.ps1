@@ -40,7 +40,7 @@ if ($Exe -eq '') {
     }
 }
 if ($Exe -eq '' -or -not (Test-Path $Exe)) {
-    throw "zan-mcp.exe not found. Build it first: build\zanc.exe --stdlib-path stdlib tools\mcp_server\*.zan -o tools\zan-mcp.exe   (or pass -Exe)"
+    throw "zan-mcp.exe not found. Build it first: build\zanc.exe --stdlib-path stdlib tools\mcp_server\McpServer.zan tools\mcp_server\PendingJob.zan tools\shared\gallery\GalleryIndex.zan tools\shared\gallery\GalleryResult.zan tools\shared\semantic_index\SemanticIndex.zan tools\shared\semantic_index\IndexedField.zan -o build\zan-mcp.exe   (or pass -Exe)"
 }
 if (-not (Test-Path $Workspace)) { throw "workspace not found: $Workspace" }
 if ($BindHost -eq '') { $BindHost = '127.0.0.1' }

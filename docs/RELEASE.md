@@ -127,16 +127,16 @@ Rules:
 ### 5.1 Windows x64 (shipping)
 
 ```powershell
-# 1. compiler + CLIs + runtime + bundled linker toolchain
+# Configure once using the approved Windows toolchain environment.
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
       -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
       -DCMAKE_LINKER=lld-link -DLLVM_DIR=<llvm>/lib/cmake/llvm `
-      -DZAN_MINGW_ROOT=C:/TDM-GCC-64
-cmake --build build
-# 2. IDE (scripts\build_ide.ps1: zan.proj project, entry src/IdeForm.html; GUI runtime statically linked in; also compiles the app icon)
-powershell -ExecutionPolicy Bypass -File scripts\build_ide.ps1
-# 3. assemble the self-contained bundle into dist\win-x64 (bumps VERSION unless -NoBump)
-powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1 -SkipBuild
+      -DZAN_MINGW_ROOT=C:/TDM-GCC-64 -DZAN_REQUIRE_CROSS_RUNTIME=ON
+# Capture -> complete build/preparation -> Seal -> release gate (see §6.1/6.2).
+# Only after that identity and its receipts verify:
+powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1 -SkipBuild -NoBump
+python -I -B scripts/sdk_stage_manifest.py consume --sdk dist/win-x64 `
+    --output build/test-out/sdk-consumption
 ```
 
 Prerequisites: LLVM (for `find_package(LLVM)`), `clang`/`llvm-*` on PATH, and
@@ -159,10 +159,32 @@ cross-platform; the compiler/stdlib/templates/examples are already portable.
 
 ## 6. Release process checklist
 
-1. `publish_ide.ps1` bumps the root `VERSION` automatically
-   (`scripts\bump_version.ps1`; pass `-NoBump` to skip). There is no
-   `CHANGELOG.md` to update.
-2. Green CI on all target platforms (build + `ctest`).
+1. Select the root `VERSION` before capture/build, consistently across platforms
+   (`scripts\bump_version.ps1` is the explicit version-selection helper).
+   `publish_ide.ps1` requires `-NoBump` and never edits a sealed build's version.
+   There is no `CHANGELOG.md` to update.
+2. Green CI on all target platforms (build + `ctest`). Each release build must
+   run `cmake -DBUILD_DIR=build -P scripts/release_quality_gate.cmake` before
+   packaging. The gate requires a nonempty `full` suite and the fixed-point,
+   differential, production-differential, gen1, IR-golden and exception-ownership
+   bootstrap tests; missing tests or any failure
+   stop packaging. It validates the same build directory that supplies the bundle.
+   JUnit reports are written to `build/test-out/release-*.xml`. Ordinary development
+   continues to use targeted tests; this full run is reserved for releases.
+   Configure release builds with `-DZAN_REQUIRE_CROSS_RUNTIME=ON`; the gate rejects
+   a build without this cache option. Library tests then recompile even when an
+   artifact exists and fail on missing cross-runtime objects. Ordinary development
+   defaults to OFF so an incomplete cross-toolchain checkout remains usable.
+   Linux installs GDB explicitly and pins `ZAN_GDB`. Windows pins `ZAN_GDB` and
+   `ZAN_GDB_DIR` before validation, then packages that same debugger; a missing
+   MinGW GDB fails the job.
+
+   macOS DAP remains a release blocker: the adapter currently requires GDB/MI.
+   macOS x64 needs a signed, trusted GDB with working process-debug permissions;
+   macOS arm64 has no verified native GDB backend in this release recipe. Installing
+   LLVM/LLDB does not satisfy that dependency. Both platforms must pass the real
+   breakpoint integration test; do not opt out, remove the test, or narrow the
+   advertised platform scope to make this gate pass.
 3. Build the bundle on each platform (§5) and smoke-test:
    launch IDE → New Project (each template) → Build → Run → Debug (breakpoint) →
    Publish. The bundle must work on a machine with **no** dev toolchain.
@@ -171,6 +193,145 @@ cross-platform; the compiler/stdlib/templates/examples are already portable.
 6. Verify each archive unzips and launches on a clean VM per OS.
 
 ---
+
+### 6.1 Observed release build identity
+
+Current implementation, checked against `scripts/build.ps1`,
+`release_build_identity.ps1`, `release_source_manifest.py` and
+`release_quality_gate.cmake` on 2026-11-11. On Windows, configure the existing
+main build tree with the release runtime requirement, then use the locked build
+entry point with `-ReleaseIdentity`:
+
+```powershell
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DZAN_REQUIRE_CROSS_RUNTIME=ON
+pwsh -File scripts/build.ps1 -Build build -ReleaseIdentity
+cmake -DBUILD_DIR=build -P scripts/release_quality_gate.cmake
+```
+
+The first command assumes the Windows toolchain environment from
+`BUILD_TOOLCHAIN.md`. Do not add `-Configure` to this sequence: the current
+`build.ps1 -Configure` recipe selects `RelWithDebInfo`. A normal build without
+`-ReleaseIdentity` does not create or refresh release evidence. It cannot replace
+the observed build step, even if its outputs appear current. `-ReleaseIdentity`
+rejects `-SkipGate`; `-NativeInput` and `-Artifact` require `-ReleaseIdentity`.
+
+The build wrapper holds the shared lock, completes any requested configuration,
+captures inputs before building, and seals the identity only after that build
+succeeds with unchanged inputs. Capture invalidates an older sealed identity;
+a failed build or seal cannot leave it usable. No post-build capture can prove
+which source bytes an earlier build used.
+
+The source manifest records raw SHA256 identities for the complete union of Git
+tracked files and non-ignored untracked files, including deleted tracked paths
+and symlink targets. It records HEAD as context, the dirty state, and a digest of
+the actual source manifest. A dirty worktree is accepted when those inputs stay
+stable; source content changes, file additions/deletions or other recorded input
+drift fail seal or verification and require a new observed build. Changes to
+unrelated non-ignored tracked files also invalidate this conservative manifest.
+
+The identity additionally covers the complete `CMakeCache.txt`, checks its
+`CMAKE_HOME_DIRECTORY` against the worktree, hashes configured C/C++ compiler,
+linker and build-program files, and binds the main build's `zanc` output. Ignored
+build/toolchain trees are not recursively inventoried. Explicitly name ignored
+native libraries, runtime objects, target tool files or other inputs that this
+release needs with `-NativeInput`; name additional existing build outputs with
+`-Artifact`. These arrays accept individual file paths, not directories or globs.
+For example, from a PowerShell session at the repository root:
+
+```powershell
+# Extend these lists to cover the actual release's native inputs and outputs.
+$releaseNativeInputs = @(
+    'toolchain/win-x64/mingw/lib/libkernel32.a',
+    'packages/Zan.Data/src/System/Data/Sqlite/drivers/win-x64/libsqlite3.dll.a'
+)
+$releaseArtifacts = @('build/zan-lsp.exe', 'build/zan-dap.exe')
+& ./scripts/build.ps1 -Build build -ReleaseIdentity `
+    -NativeInput $releaseNativeInputs -Artifact $releaseArtifacts
+cmake -DBUILD_DIR=build -P scripts/release_quality_gate.cmake
+```
+
+That list is illustrative, not an exhaustive dependency recipe. `-Artifact`
+requires the named outputs to exist when the successful build is sealed; it does
+not build them or cover an IDE/archive created later. Tool binaries plus named
+native inputs provide bounded evidence, not a hermetic build closure. Archive
+checksums in §4 remain necessary for the final packaged outputs.
+
+Evidence lives under `build/test-out/`: `release-build-pending.json` before the
+build, `release-build-identity.json` after seal, and
+`release-source-before.json` / `release-source-after.json` for gate verification.
+The gate rejects absent/stale identities, source/cache/tool/native/artifact
+changes, or replacement of the identity during validation. A failed invocation
+removes any previous gate acceptance receipt. Both verification phases must bind
+the same identity before the gate reports success. Keep the validated inputs and
+artifacts stable through packaging; rerun verification if they change.
+
+### 6.2 Complete Windows SDK staging and consumption
+
+`scripts/publish_ide.ps1 -PrepareOnly -NoBump` prepares a fresh IDE, MCP executable
+and four knowledge indexes under `build/`, without touching `dist/`. Run it under
+the same shared build gate between Capture and Seal. Generated design source
+must already be stable before Capture; a source change during preparation is a
+failed identity, not permission to recapture an already completed build.
+Preparation removes old MCP/index outputs before generating replacements so a
+failed producer cannot accidentally qualify stale bytes.
+
+The SDK inventory reuses `release_source_manifest.py`; it does not establish a
+second build provenance mechanism. SDK Capture must pass `-SdkNativeOutputs`:
+the repository-defined 24 Windows driver products (four owners, each DLL/import
+archive/bundle/def/static archive/libs) are declared before build, excluded from
+source inputs even when tracked, and automatically required as artifacts at
+Seal. Seal and verify validate that exact fixed declaration; arbitrary source
+exclusions are not accepted. Third-party payloads remain native inputs.
+Before Capture, enumerate ignored native
+inputs with `sdk_stage_manifest.py native-inputs --native-dir stdlib --native-dir
+packages` plus the selected GDB and every DLL beside it and host `llvm-ar` as
+`--native-input` files. Include the existing release runtime/tool inputs from
+§6.1. After preparation, discover the exact payload and Seal all its build files:
+
+```powershell
+& ./scripts/publish_ide.ps1 -SkipBuild -NoBump -PlanOnly
+python -I -B scripts/sdk_stage_manifest.py inputs --repo . --build build `
+    --plan build/test-out/sdk-stage-plan.json --output build/test-out/sdk-build-inputs.json
+$sdkInputs = Get-Content build/test-out/sdk-build-inputs.json -Raw | ConvertFrom-Json
+& ./scripts/release_build_identity.ps1 -Action Seal -Build build -Artifact @($sdkInputs.artifacts)
+```
+
+`-PlanOnly` discovers material and writes the plan; it grants no acceptance.
+`-PreflightOnly -SkipBuild -NoBump` verifies the complete closure without changing
+the old output. `-SkipBuild` never compiles MCP or indexes. Packaging requires the
+IDE dependency list and every DLL it names, five compiler/editor CLIs, both
+Windows linkers, MinGW runtime, archive tool, native runtime objects, Linux x64
+sysroot, package bundles and conditional payloads, examples, templates, tools,
+AI pack and indexes. Missing material fails before output cleanup. Source trees
+exclude development artifacts; examples/templates/tools select Git-tracked plus
+nonignored source bytes, preventing local databases/uploads from entering a
+release. All shipped ignored package/native files require explicit identity.
+
+Outputs must be dedicated children of repository `dist/` or `_scratch/`, with no
+reparse points. The shared parent itself, source ancestors and arbitrary external
+paths are rejected. Development toolchain staging additionally permits dedicated
+children of `build/`. A future mtime never establishes equality: file staging
+compares SHA256. Output cleanup errors stop packaging. Portable GDB is copied
+with its adjacent DLLs and actually started with only Windows system directories
+on PATH. Its `debugger/bin/` is retained.
+
+The final `sdk-manifest.json` records every payload file's SHA256/length, selected
+version, build identity and validation scope. Default packaging requires matching
+`release-source-before.json` and `release-source-after.json`. Explicit
+`-LocalStage` instead records `local-build-only`, still requiring the fresh sealed
+build and complete payload; it neither runs nor claims the full release gate.
+This is for local deliverable preparation with the existing development cache.
+
+After staging, `sdk_stage_manifest.py verify --sdk <directory>` checks the complete
+inventory. `consume --sdk <directory> --output <new-build/test-out-directory>`
+invokes the existing official template harness with the staged root, compiler,
+stdlib and driver directory. The default `console/console-args` template is linked
+and actually run with a sentinel argument. `sdk-consumption.json` is written only
+on success, binds the unchanged manifest and result/log hashes, and preserves the
+local-vs-release scope. A failed invocation removes the older consumption receipt.
+Passing a selected template is bounded evidence, not a clean-VM/full-template or
+GUI/production-signing claim. Windows CI archives the SDK platform directory
+itself under `zan-ide-<version>-win-x64/`, avoiding an extra `win-x64/` layer.
 
 ## 7. Current deliverable vs. gaps
 

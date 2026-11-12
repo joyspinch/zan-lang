@@ -46,7 +46,7 @@ endfunction()
 
 # ---- compile the library ----
 zan_artifact_is_current(_current ${OUT})
-if(NOT _current)
+if(NOT _current OR ZAN_REQUIRE_CROSS_RUNTIME)
   set(_args ${ZANC} ${SRC} --auto-stdlib)
   if(TARGET)
     list(APPEND _args --target ${TARGET})
@@ -58,7 +58,8 @@ if(NOT _current)
     OUTPUT_VARIABLE compile_out
     ERROR_VARIABLE  compile_err)
   if(NOT compile_rc EQUAL 0)
-    if(compile_err MATCHES "runtime object not found at.*toolchain")
+    if(NOT ZAN_REQUIRE_CROSS_RUNTIME AND
+       compile_err MATCHES "runtime object not found at.*toolchain")
       message(STATUS "cross runtime object not present for ${TARGET}; skipping test")
       return()
     endif()

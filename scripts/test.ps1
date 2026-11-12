@@ -25,7 +25,8 @@ param(
     [int]$MaxMatch = 80,
     [int]$RecheckMin = 10,
     [switch]$ReleaseGate,
-    [switch]$Force
+    [switch]$Force,
+    [string]$Build = (Join-Path $PSScriptRoot '../build')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,7 +39,8 @@ if ($Jobs -le 0) { $Jobs = [Environment]::ProcessorCount }
 $TierExplicit = $PSBoundParameters.ContainsKey('Tier')
 $TierName = if ($TierExplicit) { $Tier } elseif ($Match -ne '') { 'targeted' } else { $Tier }
 $gateSkip = $Force -or $ReleaseGate -or $env:CI -or $env:ZAN_RELEASE_GATE
-$ctestBase = @('--test-dir', (Join-Path $root 'build'), '-C', 'Release')
+$buildDir = [IO.Path]::GetFullPath($Build)
+$ctestBase = @('--test-dir', $buildDir, '-C', 'Release')
 
 # ---- 防呆门 1：整档（无 -Match）是发布门，日常验证拒绝 ----------------------
 # （standard/full 裸跑在这里被拒；smoke 裸跑 ≈406 条，由门 2 的预算机检拦住）
@@ -113,7 +115,6 @@ Write-Host "[test] tier=$TierName jobs=$Jobs$(if ($Match) { " match=$Match" })$(
 # 用例产物已经全部收进 build\cases\（CMakeLists 里统一改的路径），跑完只按
 # "最近用过就留、老的就扔"清扫——它是缓存，不是垃圾，热的工作集要保住。
 # 同时把 ctest 那堆一次性输出合并成一份日志，别再每个用例散一个文件。
-$buildDir = Join-Path $root 'build'
 $cleanScript = Join-Path $PSScriptRoot 'clean_build.ps1'
 
 # ctest 的临时日志残留（它自己不会清），跑之前先扫掉
@@ -133,12 +134,14 @@ $gate = Join-Path $PSScriptRoot 'build_gate.ps1'
 $schedPath = Join-Path $PSScriptRoot 'sched.ps1'
 $codeFile = Join-Path $env:TEMP "zan_ctest_code_$PID.txt"
 $logFile  = Join-Path $env:TEMP "zan_ctest_log_$PID.txt"
+Remove-Item -LiteralPath $codeFile -Force -ErrorAction SilentlyContinue
 & $gate -Name 'build' -Script {
     # 顺手回收上一轮留下的副本（过期任务租约 + 没人引用的仓库外 worktree）。
     # 在闸里跑，与编译互斥。
     if (Test-Path $schedPath) { & $schedPath reap -Apply | Out-Null }
     & ctest @ctestArgs 2>&1 | Tee-Object -FilePath $logFile
-    $ct = $LASTEXITCODE
+    # Child scripts (reap) can shadow LASTEXITCODE locally; native exits are global.
+    $ct = $global:LASTEXITCODE
     # ctest 遇到"没匹配到任何用例"时返回 0，但那不是"验证通过"，是
     # "什么都没跑"。把它判成失败——否则一次拼错的 -Match 会伪装成绿灯。
     if ($ct -eq 0 -and (Select-String -Path $logFile -Pattern 'No tests were found' -Quiet)) {
@@ -146,6 +149,7 @@ $logFile  = Join-Path $env:TEMP "zan_ctest_log_$PID.txt"
     }
     Set-Content -Path $codeFile -Value $ct -Encoding ASCII
 }.GetNewClosure()
+$gateExit = $LASTEXITCODE
 
 $code = 1
 if (Test-Path $codeFile) {
@@ -153,6 +157,8 @@ if (Test-Path $codeFile) {
     if ($raw -match '^\d+$') { $code = [int]$raw }
     Remove-Item -LiteralPath $codeFile -Force -ErrorAction SilentlyContinue
 }
+
+if ($gateExit -ne 0) { $code = $gateExit }
 
 # ---- 产物收口（收尾）：本次跑出来的东西不留着下次再堆 --------------------
 # 1) 失败用例名（留它们的 .ll 供排查，其余中间产物清掉）
@@ -189,7 +195,7 @@ Get-ChildItem -LiteralPath $buildDir -Directory -Filter 'selfhost_diff*' -ErrorA
 #    不是把缓存一把删光——run_case.cmake 会按"源文件/编译器/stdlib 没变就复用
 #    旧 exe"来加速，全删等于每轮都重编一千多个程序。
 if (Test-Path $cleanScript) {
-    & $cleanScript -Apply
+    & $cleanScript -Apply -Build $buildDir
 }
 
 if ($removedMid -gt 0) {

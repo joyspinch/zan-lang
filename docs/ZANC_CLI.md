@@ -93,6 +93,27 @@ build/zanc --emit-symbols index.json src/...                 # 类型/成员索�
 build/zanc --gen-meta meta.json src/...                      # 编译单元元数据 JSON 后退出
 ```
 
+### CPU 要求（x86-64）
+
+`--cpu-profile baseline|avx2` 显式选择 x86-64 的 CPU 要求，适用于宿主及
+`--target` 指定的 x86-64 目标；其他架构传此选项会报错。
+
+- 不传选项：保持历史默认，桌面 x86-64 使用 AVX2/FMA/BMI/AES 等扩展；
+  Android x86-64 保持原来的 SSE4.2/POPCNT/CX16 ABI 基线。
+- `baseline`：x86-64 SSE2 基线，关闭 AVX/AVX2/FMA/BMI/AES 等额外扩展。
+  Vector128/Vector256 优先使用已有的通用向量和软件降级；不能降级的实际
+  硬件 intrinsic 调用在代码生成前明确报错。仅导入标准库或保留未使用声明不报错。
+- `avx2`：显式使用现有桌面扩展集合（含 SSE4.2/CRC32/AES/AVX2/FMA/BMI）；
+  部署设备必须满足该集合。此选项不做运行时 CPU 自动分派。
+
+```bash
+build/zanc app.zan --auto-stdlib --cpu-profile baseline -o app.exe
+build/zanc app.zan --target linux-x64 --cpu-profile avx2 --emit-ir > app.ll
+```
+
+主模块、优化器及 shard 的 TargetMachine 共用所选特性，`--emit-ir` 头部的
+`zanc-target-cpu` / `zanc-target-features` 写出实际选择；外部 LLVM 工具应照用。
+
 ### 1.5 诊断三板斧（编译器/运行时排查）
 
 ```bash

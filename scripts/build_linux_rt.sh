@@ -7,7 +7,8 @@
 # machine and no cross toolchain are needed -- the same reason
 # scripts/build_macos_rt.sh needs no Mac.
 #
-#   scripts/build_linux_rt.sh [path-to-zig]
+#   scripts/build_linux_rt.sh [path-to-zig] [linux-musl|linux-arm64|linux-riscv64]
+# Also requires Python 3 to read Zig's actual linker argv for sysroot staging.
 #
 # 契约：工程辅助自动化与脚本执行规范
 # The objects are committed (they are our own code; *.o is gitignored, so
@@ -21,11 +22,35 @@ RT="$ROOT/src/runtime"
 ACCEL="$ROOT/src/accel"
 EMBED="$ROOT/src/embed"
 
+selection=${2:-all}
+case "$selection" in
+    all|linux-musl|linux-arm64|linux-riscv64) ;;
+    *) printf 'Unknown Linux runtime target: %s\n' "$selection" >&2; exit 2 ;;
+esac
+work="$ROOT/build/linux-runtime-staging"
+mkdir -p "$work"
+stage=$(mktemp -d "$work/run.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+"$ZIG" env > "$stage/zig-env.json"
+printf '%s\n' '#include <stdexcept>' \
+    'int main() { try { throw std::runtime_error("runtime"); } catch (const std::exception &) { return 0; } }' \
+    > "$stage/exception.cpp"
+
 for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     sub=${pair%%:*}
     arch=${pair#*:}
-    out="$ROOT/toolchain/$sub"
+    if [ "$selection" != all ] && [ "$selection" != "$sub" ]; then continue; fi
+    out="$stage/$sub"
     mkdir -p "$out"
+    # A successful target link selects compatible musl, startup, C++ ABI,
+    # unwind and compiler-rt inputs. Never select cache files by recency.
+    "$ZIG" c++ -target "$arch-linux-musl" -O2 -static -fexceptions -funwind-tables -v \
+        "$stage/exception.cpp" -o "$stage/exception-$arch" 2> "$stage/link-$sub.log"
+    python3 -I "$ROOT/scripts/stage_linux_sysroot.py" --zig-env "$stage/zig-env.json" \
+        "$stage/link-$sub.log" "$out"
     # -fPIC throughout: the same objects are linked both into static
     # executables (where ld.lld relaxes the PIC sequences) and into shared
     # libraries, which reject the absolute and static-TLS relocations a
@@ -86,5 +111,16 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
         "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
             -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_mem.c" -o "$out/zanrt_mem.o"
     fi
-    echo "built toolchain/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o zanrt_crash.o libzancrypto.a zan_embed_api.o zan_inflate.o"
+    # Record evidence before installation; no trace/manifest files enter the
+    # toolchain. A failure here leaves the existing target untouched.
+    evidence="$ROOT/build/test-out/linux-runtime/$sub"
+    mkdir -p "$evidence"
+    cp "$out/zig-sysroot-inputs.json" "$evidence/"
+    cp "$stage/link-$sub.log" "$evidence/zig-sysroot-link.log"
+    # Preserve optional existing libraries in a sibling candidate, then swap
+    # directories with rollback on failure. The caller holds the shared build
+    # gate throughout; no consumer can observe the brief rename interval.
+    python3 -I "$ROOT/scripts/stage_linux_sysroot.py" --publish \
+        "$out" "$ROOT/toolchain/$sub"
+    echo "built toolchain/$sub: runtime objects, musl startup/libc, C++ ABI, unwind and compiler-rt"
 done

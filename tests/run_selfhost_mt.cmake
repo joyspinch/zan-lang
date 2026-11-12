@@ -2,14 +2,16 @@
 #
 # The C host's coroutine frames start with the scheduler's header
 # (`zan_co_fhdr`: the CO_* bits and the pending step), and the shipped
-# multi-worker runtime (zanrt_io_mt.o) drives those frames. The self-hosted
+# source-matched multi-worker runtime from the current build drives those
+# frames (RTOBJS includes zanrt_io_mt with the build's object suffix). The self-hosted
 # backend used to lay its frames out differently, so a self-hosted program
 # could not be linked against the shipped runtime at all -- its own (weak)
 # cooperative scheduler had to be used instead.
 #
-# This gate links a self-hosted program against the SHIPPED runtime objects
-# (the same way the C host links a win-x64 program: ld.lld plus the bundled
-# MinGW runtime) and compares its output with the C host's. The shipped
+# This gate links a self-hosted program against source-matched runtime objects
+# from the current build, passed explicitly as RTOBJS, and compares its output
+# with the C host's. Only the MinGW CRT/system libraries come from the bundled
+# toolchain sysroot; no prebuilt Zan runtime objects are taken from it. The shipped
 # runtime's zan_co_ready / zan_co_sched_init are strong symbols, so they win
 # over the self-host's weak fallback: the frames really are driven by the
 # shipped multi-worker scheduler, and the timer ready hook is the runtime's.
@@ -18,7 +20,7 @@
 #
 # Invoked as:
 #   cmake -DZANC=<zanc> -DSELFHOST_SOURCES=<list> -DGEN1=<exe> -DOUTDIR=<dir>
-#         -DCLANG=<clang> -DLLD=<ld.lld> -DRUNTIME_DIR=<dir with the .o files>
+#         -DCLANG=<clang> -DLLD=<ld.lld> -DRTOBJS=<current build runtime object list>
 #         -DMINGW_LIB=<bundled mingw lib dir> -DCASE_DIR=<dir> -DCASES=<list file>
 #         [-DWORKDIR=<dir>] -P run_selfhost_mt.cmake
 #
@@ -26,12 +28,20 @@
 # gate's list); the program is <CASE_DIR>/<stem>.zan.
 
 cmake_policy(SET CMP0012 NEW)
-if(NOT ZANC OR NOT GEN1 OR NOT OUTDIR OR NOT CLANG OR NOT LLD OR NOT RUNTIME_DIR)
-  message(FATAL_ERROR "run_selfhost_mt.cmake: ZANC, GEN1, OUTDIR, CLANG, LLD and RUNTIME_DIR are required")
+if(NOT ZANC OR NOT GEN1 OR NOT OUTDIR OR NOT CLANG OR NOT LLD OR NOT RTOBJS)
+  message(FATAL_ERROR "run_selfhost_mt.cmake: ZANC, GEN1, OUTDIR, CLANG, LLD and RTOBJS are required")
 endif()
 if(NOT MINGW_LIB)
   message(FATAL_ERROR "run_selfhost_mt.cmake: MINGW_LIB is required")
 endif()
+# Fail before compiling gen1 when this build's runtime or required linker/CRT
+# is unavailable; never substitute stale committed runtime objects.
+foreach(_required IN ITEMS "${ZANC}" "${CLANG}" "${LLD}"
+    "${MINGW_LIB}/crt2.o" "${MINGW_LIB}/crtbegin.o" ${RTOBJS})
+  if(NOT EXISTS "${_required}")
+    message(FATAL_ERROR "selfhost shipped runtime prerequisite missing: ${_required}")
+  endif()
+endforeach()
 if(NOT CASES)
   message(FATAL_ERROR "run_selfhost_mt.cmake: CASES is required")
 endif()
@@ -139,20 +149,12 @@ foreach(_case ${_cases})
     continue()
   endif()
 
-  set(_crypto_lib "")
-  if(EXISTS "${RUNTIME_DIR}/libzancrypto.a")
-    set(_crypto_lib "${RUNTIME_DIR}/libzancrypto.a")
-  endif()
-
   # ---- link against the shipped runtime, the way the C host links win-x64 ----
   file(REMOVE ${_exe})
   execute_process(
     COMMAND ${LLD} -m i386pep --stack 268435456 -o ${_exe}
             "${MINGW_LIB}/crt2.o" "${MINGW_LIB}/crtbegin.o" ${_obj}
-            "${RUNTIME_DIR}/zanrt_timer.o" "${RUNTIME_DIR}/zanrt_io_mt.o"
-            "${RUNTIME_DIR}/zanrt_sync.o" "${RUNTIME_DIR}/zanrt_file.o"
-            "${RUNTIME_DIR}/zan_inflate.o" "${RUNTIME_DIR}/zan_embed_api.o"
-            ${_crypto_lib}
+            ${RTOBJS}
             "-L${MINGW_LIB}"
             --start-group
             -lmingw32 -lmoldname -lmingwex -lmsvcrt

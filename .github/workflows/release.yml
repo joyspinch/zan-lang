@@ -30,6 +30,32 @@ permissions:
   contents: read
 
 jobs:
+  runtime-sanitizers:
+    name: Release runtime (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Execute release multiworker soak
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+          CC: gcc
+        run: |
+          mkdir -p build/test-out
+          set -o pipefail
+          bash tests/runtime/run_multiworker_soak.sh release "$SANITIZER" 2>&1 | tee "build/test-out/release-runtime-$SANITIZER.log"
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-runtime-${{ matrix.sanitizer }}
+          path: build/test-out/release-runtime-*.log
+          if-no-files-found: error
+
   # --------------------------------------------------------------- Linux ----
   linux:
     strategy:
@@ -55,13 +81,50 @@ jobs:
                      /etc/apt/sources.list.d/azure-cli.list \
                      /etc/apt/sources.list.d/azure-cli.sources || true
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake ninja-build gdb
+          release_gdb=$(command -v gdb)
+          test -x "$release_gdb"
+          echo "ZAN_GDB=$release_gdb" >> "$GITHUB_ENV"
 
       - name: Build toolchain
         run: |
+          set -euo pipefail
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" \
-            -DZAN_BUILD_GUI=OFF -DZAN_BUILD_GUI_TESTS=OFF
-          cmake --build build -j --target zanc zan-lsp zan-dap zanfmt zandoc
+            -DZAN_BUILD_GUI=OFF -DZAN_BUILD_GUI_TESTS=OFF -DZAN_REQUIRE_CROSS_RUNTIME=ON
+          # Hosted runners are isolated; observe the existing build in place.
+          release_native=(--native-input "$LLVM_DIR/LLVMConfig.cmake")
+          for tool in ld.lld ld64.lld llvm-ar; do
+            release_native+=(--native-input "$(command -v "$tool")")
+          done
+          if [ -n "${ZAN_GDB:-}" ]; then
+            release_native+=(--native-input "$ZAN_GDB")
+          fi
+          for target in linux-musl macos/x64; do
+            for file in zanrt_timer.o zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zan_embed_api.o zan_inflate.o libzancrypto.a; do
+              release_native+=(--native-input "$PWD/toolchain/$target/$file")
+            done
+            if [ -f "toolchain/$target/zanrt_crash.o" ]; then
+              release_native+=(--native-input "$PWD/toolchain/$target/zanrt_crash.o")
+            fi
+          done
+          for file in linux-musl/libc.a linux-musl/crt1.o linux-musl/crti.o linux-musl/crtn.o macos/libSystem.tbd; do
+            release_native+=(--native-input "$PWD/toolchain/$file")
+          done
+          python3 -I -B scripts/release_source_manifest.py capture --repo "$PWD" --build build "${release_native[@]}"
+          cmake --build build -j
+          python3 -I -B scripts/release_source_manifest.py seal --repo "$PWD" --build build \
+            --artifact build/zan-lsp --artifact build/zan-dap --artifact build/zanfmt --artifact build/zandoc
+
+      - name: Validate release build
+        run: cmake -DBUILD_DIR=build -P scripts/release_quality_gate.cmake
+
+      - name: Upload release validation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-validation-${{ runner.os }}-${{ matrix.arch }}
+          path: build/test-out/release-*
+          if-no-files-found: error
 
       - name: Package bundle
         run: bash scripts/package_bundle.sh linux ${{ matrix.arch }}
@@ -87,12 +150,47 @@ jobs:
         run: |
           brew install llvm@17 ninja
           echo "LLVM_DIR=$(brew --prefix llvm@17)/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "$(brew --prefix llvm@17)/bin" >> "$GITHUB_PATH"
 
       - name: Build toolchain
         run: |
+          set -euo pipefail
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" \
-            -DZAN_BUILD_GUI=OFF -DZAN_BUILD_GUI_TESTS=OFF
-          cmake --build build -j --target zanc zan-lsp zan-dap zanfmt zandoc
+            -DZAN_BUILD_GUI=OFF -DZAN_BUILD_GUI_TESTS=OFF -DZAN_REQUIRE_CROSS_RUNTIME=ON
+          # Hosted runners are isolated; observe the existing build in place.
+          release_native=(--native-input "$LLVM_DIR/LLVMConfig.cmake")
+          for tool in ld.lld ld64.lld llvm-ar; do
+            release_native+=(--native-input "$(command -v "$tool")")
+          done
+          if [ -n "${ZAN_GDB:-}" ]; then
+            release_native+=(--native-input "$ZAN_GDB")
+          fi
+          for target in linux-musl macos/x64; do
+            for file in zanrt_timer.o zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zan_embed_api.o zan_inflate.o libzancrypto.a; do
+              release_native+=(--native-input "$PWD/toolchain/$target/$file")
+            done
+            if [ -f "toolchain/$target/zanrt_crash.o" ]; then
+              release_native+=(--native-input "$PWD/toolchain/$target/zanrt_crash.o")
+            fi
+          done
+          for file in linux-musl/libc.a linux-musl/crt1.o linux-musl/crti.o linux-musl/crtn.o macos/libSystem.tbd; do
+            release_native+=(--native-input "$PWD/toolchain/$file")
+          done
+          python3 -I -B scripts/release_source_manifest.py capture --repo "$PWD" --build build "${release_native[@]}"
+          cmake --build build -j
+          python3 -I -B scripts/release_source_manifest.py seal --repo "$PWD" --build build \
+            --artifact build/zan-lsp --artifact build/zan-dap --artifact build/zanfmt --artifact build/zandoc
+
+      - name: Validate release build
+        run: cmake -DBUILD_DIR=build -P scripts/release_quality_gate.cmake
+
+      - name: Upload release validation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-validation-${{ runner.os }}-${{ matrix.arch }}
+          path: build/test-out/release-*
+          if-no-files-found: error
 
       - name: Package bundle
         run: bash scripts/package_bundle.sh macos ${{ matrix.arch }}
@@ -132,16 +230,25 @@ jobs:
           $want = (Select-String -Path deps/checksums.txt -Pattern '^[0-9a-f]{64}  llvm\.tar\.xz$').Line.Substring(0, 64)
           $got = (Get-FileHash llvm.tar.xz -Algorithm SHA256).Hash.ToLower()
           if ($want -ne $got) { throw "LLVM archive checksum mismatch: got $got" }
-          New-Item -ItemType Directory -Force llvm-dist | Out-Null
-          tar -xf llvm.tar.xz -C llvm-dist --strip-components=1
+          New-Item -ItemType Directory -Force build/llvm-dist | Out-Null
+          tar -xf llvm.tar.xz -C build/llvm-dist --strip-components=1
           Remove-Item llvm.tar.xz
-          if (-not (Test-Path llvm-dist/lib/cmake/llvm/LLVMConfig.cmake)) {
+          if (-not (Test-Path build/llvm-dist/lib/cmake/llvm/LLVMConfig.cmake)) {
             throw "LLVMConfig.cmake missing from the LLVM archive"
           }
-          "LLVM_ROOT=$PWD/llvm-dist" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$PWD/llvm-dist/bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LLVM_ROOT=$PWD/build/llvm-dist" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$PWD/build/llvm-dist/bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Install MinGW (bundled linker source for self-contained zanc)
         run: choco install mingw --no-progress -y
+
+      - name: Pin debugger for validation and packaging
+        shell: pwsh
+        run: |
+          $gccDir = Split-Path -Parent (Get-Command gcc -ErrorAction Stop).Source
+          $gdb = Join-Path $gccDir 'gdb.exe'
+          if (-not (Test-Path -PathType Leaf $gdb)) { throw "Required MinGW debugger missing: $gdb" }
+          "ZAN_GDB=$gdb" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ZAN_GDB_DIR=$gccDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # LLVM's DebugInfoPDB component links diaguids.lib from the DIA SDK, and
       # the prebuilt archive's CMake exports bake the absolute path from the VS
@@ -202,21 +309,75 @@ jobs:
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_LINKER=lld-link -DLLVM_DIR="$env:LLVM_ROOT/lib/cmake/llvm" `
-            -DZAN_MINGW_ROOT="$mingw"
+            -DZAN_MINGW_ROOT="$mingw" -DZAN_REQUIRE_CROSS_RUNTIME=ON
+          if ($LASTEXITCODE -ne 0) { throw 'Release configure failed' }
+          # Isolated CI runner: use the helper around this existing build.
+          $releaseNative = @("$env:LLVM_ROOT/lib/cmake/llvm/LLVMConfig.cmake", $env:ZAN_GDB)
+          foreach ($tool in @('ld.lld', 'ld64.lld', 'llvm-ar')) {
+            $releaseNative += (Get-Command $tool -ErrorAction Stop).Source
+          }
+          foreach ($target in @('linux-musl', 'macos/x64')) {
+            foreach ($file in @('zanrt_timer.o', 'zanrt_io.o', 'zanrt_io_mt.o', 'zanrt_sync.o', 'zanrt_file.o', 'zanrt_decimal.o', 'zan_embed_api.o', 'zan_inflate.o', 'libzancrypto.a')) {
+              $releaseNative += Join-Path $PWD "toolchain/$target/$file"
+            }
+            $crash = Join-Path $PWD "toolchain/$target/zanrt_crash.o"
+            if (Test-Path -PathType Leaf $crash) { $releaseNative += $crash }
+          }
+          foreach ($file in @('linux-musl/libc.a', 'linux-musl/crt1.o', 'linux-musl/crti.o', 'linux-musl/crtn.o', 'macos/libSystem.tbd')) {
+            $releaseNative += Join-Path $PWD "toolchain/$file"
+          }
+          # Include the debugger's portable DLL closure and ignored package inputs
+          # before compilation; post-build inventory cannot establish those inputs.
+          $sdkNativeArgs = @('native-inputs', '--repo', "$PWD", '--output', 'build/test-out/sdk-native-inputs.json',
+            '--native-dir', 'stdlib', '--native-dir', 'packages')
+          foreach ($file in @(Get-Item $env:ZAN_GDB) + @(Get-ChildItem (Split-Path -Parent $env:ZAN_GDB) -Filter '*.dll' -File)) {
+            $sdkNativeArgs += @('--native-input', $file.FullName)
+          }
+          . ./scripts/sdk_stage.ps1
+          $portableGdb = Resolve-SdkGdb
+          $portableBin = Split-Path -Parent $portableGdb
+          $sdkNativeArgs += @('--native-input', $portableGdb, '--payload-native-dir', $portableBin)
+          $gdbShare = Join-Path (Split-Path -Parent $portableBin) 'share'
+          if (Test-Path -PathType Container $gdbShare) { $sdkNativeArgs += @('--payload-native-dir', $gdbShare) }
+          $sdkNativeArgs += @('--native-input', (Get-Command llvm-ar -ErrorAction Stop).Source)
+          python -I -B scripts/sdk_stage_manifest.py @sdkNativeArgs
+          if ($LASTEXITCODE -ne 0) { throw 'SDK native input discovery failed' }
+          $releaseNative += (Get-Content build/test-out/sdk-native-inputs.json -Raw | ConvertFrom-Json).native_inputs
+          python -I -B scripts/gen_design_halves.py
+          if ($LASTEXITCODE -ne 0) { throw 'IDE design generation failed before capture' }
+          & ./scripts/release_build_identity.ps1 -Action Capture -Build build -NativeInput $releaseNative -SdkNativeOutputs
           cmake --build build -j
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed; identity remains unsealed' }
+          & ./scripts/publish_ide.ps1 -PrepareOnly -NoBump -SkipDesignGeneration
+          & ./scripts/publish_ide.ps1 -SkipBuild -NoBump -PlanOnly
+          python -I -B scripts/sdk_stage_manifest.py inputs --repo "$PWD" --build build `
+            --plan build/test-out/sdk-stage-plan.json --output build/test-out/sdk-build-inputs.json
+          if ($LASTEXITCODE -ne 0) { throw 'SDK artifact discovery failed' }
+          $sdkInputs = Get-Content build/test-out/sdk-build-inputs.json -Raw | ConvertFrom-Json
+          & ./scripts/release_build_identity.ps1 -Action Seal -Build build `
+            -Artifact @($sdkInputs.artifacts)
 
-      - name: Build IDE
+      - name: Validate release build
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File scripts\build_ide.ps1
+        run: cmake -DBUILD_DIR=build -P scripts/release_quality_gate.cmake
+
+      - name: Upload release validation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-validation-Windows-x64
+          path: build/test-out/release-*
+          if-no-files-found: error
 
       - name: Publish self-contained bundle
         shell: pwsh
         run: |
-          # Bundle the debugger (gdb) from the installed MinGW so the released
-          # IDE debugs out-of-the-box; publish_ide.ps1 reads ZAN_GDB_DIR.
-          $gccDir = Split-Path -Parent (Get-Command gcc).Source
-          if (Test-Path (Join-Path $gccDir 'gdb.exe')) { $env:ZAN_GDB_DIR = $gccDir }
-          powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1 -SkipBuild
+          # ZAN_GDB_DIR is pinned before validation to the tested debugger.
+          if (-not (Test-Path -PathType Leaf $env:ZAN_GDB)) { throw "Validated debugger missing: $env:ZAN_GDB" }
+          & ./scripts/publish_ide.ps1 -SkipBuild -NoBump
+          python -I -B scripts/sdk_stage_manifest.py consume --sdk dist/win-x64 `
+            --output build/test-out/sdk-consumption --filter '^console/console-args$'
+          if ($LASTEXITCODE -ne 0) { throw 'Staged SDK consumption failed' }
 
       - name: Package archive
         shell: pwsh
@@ -224,11 +385,18 @@ jobs:
           $v = (Get-Content VERSION).Trim()
           New-Item -ItemType Directory -Force out | Out-Null
           $name = "zan-ide-$v-win-x64"
-          Rename-Item dist $name
-          Compress-Archive -Path $name -DestinationPath "out/$name.zip"
-          (Get-FileHash "out/$name.zip" -Algorithm SHA256).Hash + "  $name.zip" |
-            Set-Content "out/$name.zip.sha256"
-          Rename-Item $name dist
+          # Archive the platform SDK root; renaming dist itself adds an unwanted
+          # win-x64 layer between the archive root and ZanIDE/toolchain.
+          $platform = Join-Path $PWD 'dist/win-x64'
+          $archiveRoot = Join-Path $PWD "dist/$name"
+          Move-Item -LiteralPath $platform -Destination $archiveRoot
+          try {
+            Compress-Archive -LiteralPath $archiveRoot -DestinationPath "out/$name.zip"
+            (Get-FileHash "out/$name.zip" -Algorithm SHA256).Hash + "  $name.zip" |
+              Set-Content "out/$name.zip.sha256"
+          } finally {
+            Move-Item -LiteralPath $archiveRoot -Destination $platform
+          }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -238,7 +406,7 @@ jobs:
   # ------------------------------------------------------------- Release ----
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, macos, windows]
+    needs: [linux, macos, windows, runtime-sanitizers]
     runs-on: ubuntu-latest
     # Publishes the GitHub Release: the one job that legitimately writes.
     permissions:

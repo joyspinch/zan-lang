@@ -79,6 +79,10 @@ if ($gateCode -ne 0) {
 
 $code = 0
 try {
+    # lock is a child script: its exit creates a local LASTEXITCODE which would
+    # hide subsequent native exits in the global scope. Start with no shadow.
+    Remove-Variable LASTEXITCODE -Scope Local -ErrorAction SilentlyContinue
+    $global:LASTEXITCODE = 0
     & $Script
     $code = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } else { 0 }
 } catch {

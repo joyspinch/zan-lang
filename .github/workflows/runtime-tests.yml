@@ -9,6 +9,15 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      soak_mode:
+        description: Multiworker duration (release runs 1000 pool cycles per worker count)
+        type: choice
+        options: [short, release]
+        default: short
+  release:
+    types: [published]
 
 jobs:
   runtime-tests:
@@ -43,6 +52,25 @@ jobs:
         run: |
           gcc -O2 -Wall -Wextra -I. tests\runtime\rt_io_addr_test.c src\runtime\rt_io.c src\runtime\rt_co.c src\runtime\rt_crash.c src\runtime\rt_timer.c -o rt_io_addr_test.exe -lws2_32 -lmswsock
           rt_io_addr_test.exe
+
+  # Separate instrumented executions of the real multiworker driver. Any
+  # sanitizer finding or watchdog timeout fails the job; no suppressions.
+  runtime-multiworker:
+    name: runtime-multiworker (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and execute bounded multiworker test
+        env:
+          SOAK_MODE: ${{ github.event_name == 'release' && 'release' || inputs.soak_mode || 'short' }}
+          SANITIZER: ${{ matrix.sanitizer }}
+          CC: gcc
+        run: bash tests/runtime/run_multiworker_soak.sh "$SOAK_MODE" "$SANITIZER"
 
   # Same runtime suite under AddressSanitizer + UndefinedBehaviorSanitizer on
   # Linux. Catches memory errors (use-after-free, OOB, leaks) and UB in the

@@ -27,10 +27,18 @@
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1
 #         Add  -SkipBuild  to package the existing build\ artifacts as-is.
-#         Add  -NoBump     to suppress auto-bumping patch version.
+#         -NoBump is required: select VERSION before the observed build.
 #         Add  -OutDir <d> to publish directly to custom path (e.g. D:\Zan).
 
-param([switch]$SkipBuild, [switch]$NoBump, [string]$OutDir)
+param([switch]$SkipBuild, [switch]$NoBump, [string]$OutDir,
+      [switch]$PrepareOnly, [switch]$LocalStage, [switch]$PreflightOnly, [switch]$PlanOnly, [switch]$SkipDesignGeneration)
+
+if ($PrepareOnly -and ($SkipBuild -or -not $NoBump)) {
+    throw 'PUBLISH_FAILED: PrepareOnly requires NoBump and cannot use SkipBuild'
+}
+if (($PreflightOnly -or $PlanOnly) -and (-not $SkipBuild -or -not $NoBump)) {
+    throw 'PUBLISH_FAILED: PreflightOnly requires SkipBuild and NoBump'
+}
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -38,442 +46,111 @@ Set-Location $root
 
 $dist = if ($OutDir -and $OutDir.Trim() -ne "") { $OutDir.Trim() } else { Join-Path $root 'dist\win-x64' }
 
-# Every publish is a release, so it gets its own version: the patch component is
-# raised before the build that stamps it into the binaries. -NoBump republishes
-# the current version (e.g. re-packaging after a failed run), and a release that
-# raises major/minor runs scripts\bump_version.ps1 -Part first.
-if (-not $NoBump) {
-    & (Join-Path $root 'scripts\bump_version.ps1')
-    if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_FAILED: version bump"; exit 1 }
-}
+# Packaging cannot mutate VERSION after observed inputs were captured. Version
+# selection is an explicit step before capture, shared by every release platform.
+if (-not $NoBump) { throw 'PUBLISH_FAILED: NoBump is required; choose VERSION before the observed build' }
 $version = (Get-Content (Join-Path $root 'VERSION') -Raw).Trim()
 Write-Output "Publishing version $version"
 
+. (Join-Path $PSScriptRoot 'sdk_stage.ps1')
+# All build-producing operations are confined to preparation, under the caller's
+# shared gate. SkipBuild only consumes these outputs; it never invokes zanc.
 if (-not $SkipBuild) {
-    Write-Output "[1/6] Building the IDE (scripts\build_ide.ps1) ..."
-    & (Join-Path $root 'scripts\build_ide.ps1')
-    if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_FAILED: build error"; exit 1 }
-}
-
-# ---- required inputs ----
-$b       = Join-Path $root 'build'
-$ideExe  = Join-Path $b 'ZanIDE.exe'
-$zancExe = Join-Path $b 'zanc.exe'
-$stdlib  = Join-Path $root 'stdlib'
-$packages = Join-Path $root 'packages'
-foreach ($p in @($ideExe, $zancExe, $stdlib)) {
-    if (-not (Test-Path $p)) { Write-Output "PUBLISH_FAILED: missing $p"; exit 1 }
-}
-
-# ---- self-nesting guard -----------------------------------------------------
-# Everything below recursively copies a source tree into $dist (stdlib\,
-# examples\, templates\, and build\ pieces -> toolchain\). If $dist ever sits
-# inside one of those sources -- or a source inside $dist -- Copy-Item drops
-# the destination into itself and recurses until the disk fills: build\toolchain
-# once grew 32 layers / 1.29 GB exactly this way (A47-2; stage_dev_toolchain.ps1
-# carries the same guard for the dev tree, plus the junction handling). Fail
-# fast here so a future path change cannot silently reintroduce it.
-$distFull = [IO.Path]::GetFullPath($dist)
-foreach ($src in @($b, $stdlib, $packages,
-                   (Join-Path $root 'examples'),
-                   (Join-Path $root 'templates'))) {
-    $srcFull = [IO.Path]::GetFullPath($src)
-    $nested = $srcFull -eq $distFull -or $distFull -eq $srcFull -or
-              $distFull.StartsWith($srcFull + [IO.Path]::DirectorySeparatorChar,
-                                   [StringComparison]::OrdinalIgnoreCase) -or
-              $srcFull.StartsWith($distFull + [IO.Path]::DirectorySeparatorChar,
-                                   [StringComparison]::OrdinalIgnoreCase)
-    if ($nested) {
-        Write-Output (("PUBLISH_FAILED: dist '{0}' overlaps recursive-copy " +
-                       "source '{1}' (self-nesting guard, A47-2)") -f
-                      $distFull, $srcFull)
-        exit 1
+    & (Join-Path $root 'scripts\build_ide.ps1') -SkipDesignGeneration:$SkipDesignGeneration
+    if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: IDE build error' }
+    $buildZanc = Join-Path $root 'build\zanc.exe'
+    $builtKnowledge = Join-Path $root 'build\knowledge'
+    foreach ($name in @('symbols.json', 'gallery.json', 'packages-catalog.json', 'examples-catalog.json')) {
+        Remove-Item -LiteralPath (Join-Path $builtKnowledge $name) -Force -ErrorAction SilentlyContinue
     }
-}
-
-# ---- clean + recreate dist (release output only) ----
-Write-Output "[2/6] Preparing clean dist directory: $dist"
-if (Test-Path $dist) {
-    # (dist\ itself may hold other platform folders; only win-x64 is rebuilt)
-    try { Remove-Item $dist -Recurse -Force -ErrorAction Stop }
-    catch {
-        # The dist folder itself is held by another process (e.g. an Explorer
-        # window open on it, or a shell whose current directory is inside it),
-        # so it can't be deleted. Clearing its contents and reusing the folder
-        # works around the lock on the directory node.
-        Get-ChildItem -Path $dist -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    & (Join-Path $root 'scripts\gen_knowledge.ps1') -Zanc $buildZanc `
+        -Stdlib (Join-Path $root 'stdlib') -OutDir $builtKnowledge `
+        -GallerySrc (Join-Path $root 'tools\mcp_server\gallery.json')
+    foreach ($name in @('symbols.json', 'gallery.json', 'packages-catalog.json', 'examples-catalog.json')) {
+        Assert-SdkFile (Join-Path $builtKnowledge $name)
     }
-}
-if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist -Force | Out-Null }
-
-# ---- copy the toolchain ----
-Write-Output "[3/6] Copying IDE + compiler + stdlib ..."
-$distTc = Join-Path $dist 'toolchain'
-New-Item -ItemType Directory -Path $distTc | Out-Null
-Copy-Item $ideExe (Join-Path $dist 'ZanIDE.exe')
-# The dev build carries DWARF line tables (build_ide.ps1 passes -g) so
-# build\zan_crash.log can name source lines. An end user has no source tree to
-# resolve them against and they are ~1.6 MB of the image, so strip the
-# published copy; build\ZanIDE.exe keeps its debug info.
-$distIde = Join-Path $dist 'ZanIDE.exe'
-$stripped = $false
-foreach ($stripTool in @('llvm-strip', 'strip')) {
-    if (Get-Command $stripTool -ErrorAction SilentlyContinue) {
-        & $stripTool $distIde
-        if ($LASTEXITCODE -eq 0) { $stripped = $true; break }
-    }
-}
-if ($stripped) {
-    Write-Output ("Stripped ZanIDE.exe -> {0:N1} MB" -f ((Get-Item $distIde).Length / 1MB))
-} else {
-    Write-Output 'PUBLISH_WARN: no llvm-strip/strip on PATH; ZanIDE.exe ships with debug info'
-}
-
-# The GUI runtime is statically linked into ZanIDE.exe (build_ide.ps1).
-# ships beside the IDE.
-Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
-if (Test-Path $packages) {
-    Copy-Item $packages (Join-Path $dist 'packages') -Recurse
-}
-
-# ---- the IDE's own page-layout stylesheet is baked into the exe ------------
-# ide.css travels as an embedded resource (scripts\gen_embed.ps1 -Prefix ide,
-# linked in by build_ide.ps1) and is read from memory, so nothing ships in the
-# install root. A file next to the exe still wins, which is how a user overrides
-# the layout without a rebuild -- we just do not create one.
-
-# ---- native driver DLLs the IDE itself loads at run time -------------------
-# ZanIDE.exe imports the driver DLLs of the stdlib namespaces it uses (TLS ->
-# libssl/libcrypto, Sqlite -> libsqlite3). zanc stages them next to the exe it
-# produces and reports each one, and build_ide.ps1 records that report in
-# build\ZanIDE.deps.txt; ship exactly those files. Without them the published
-# IDE cannot start on a machine that has no copy of them on PATH.
-$depsList = Join-Path $b 'ZanIDE.deps.txt'
-if (Test-Path $depsList) {
-    foreach ($dep in (Get-Content $depsList | Where-Object { $_.Trim() -ne "" })) {
-        $depSrc = Join-Path $b $dep.Trim()
-        if (Test-Path $depSrc) { Copy-Item $depSrc (Join-Path $dist $dep.Trim()) -Force }
-        else { Write-Output "PUBLISH_WARN: missing build\$dep (the IDE will not start without it)" }
-    }
-} else {
-    Write-Output "PUBLISH_WARN: build\ZanIDE.deps.txt missing (run scripts\build_ide.ps1); driver DLLs the IDE needs may be absent from the release"
-}
-
-# The Help topics travel inside the exe as well (embed group 'docs'), so no
-# topics.json ships here. A docs\topics.json next to the exe still wins (see
-# DocsData.DiskPaths), which is how a user replaces the documentation without a
-# new build -- we just do not create one.
-
-# ---- skin packs are baked into ZanIDE.exe as embedded resources -----------
-# (scripts\gen_embed.ps1, linked in by build_ide.ps1). The skin picker reads
-# them from the exe in memory, so no external skins\ folder ships at the root.
-# The filesystem is only a fallback for user overrides (an on-disk skins\ or
-# packages\Zan.Gui\src\Gui\skins still wins if present).
-
-# ---- copy the app icon so the IDE can stamp new projects with it ----
-# zanc also carries a compiled-in copy (see CMakeLists.txt), so a produced .exe
-# has an icon even when this file is missing.
-$assetsIco = Join-Path $root 'assets\zan.ico'
-if (Test-Path $assetsIco) {
-    $distAssets = Join-Path $dist 'assets'
-    New-Item -ItemType Directory -Force -Path $distAssets | Out-Null
-    Copy-Item $assetsIco (Join-Path $distAssets 'zan.ico')
-} else {
-    Write-Output "PUBLISH_WARN: assets\zan.ico missing (new projects get no icon file)"
-}
-
-# Everything the compiler needs travels together in dist\toolchain, laid out
-# exactly as next to zanc in the build tree: the IDE resolves zanc here, and
-# zanc finds its linker / sysroot / runtime objects as its own siblings (no
-# nested toolchain\toolchain). Companion CLIs (zan-lsp, zan-dap) live here too.
-#   compiler + CLIs : zanc.exe, zan-lsp.exe, zan-dap.exe,
-#                     zanfmt.exe, zandoc.exe
-#   linker bundle   : ld.exe, mingw\            (Windows self-contained linking)
-#   cross sysroot   : linux-musl\               (--target linux-* static ELF)
-#   runtime objects : zanrt_io*, zanrt_sync*    (socket-async / sync runtimes)
-Copy-Item $zancExe (Join-Path $distTc 'zanc.exe')
-foreach ($cli in @('zan-lsp.exe', 'zan-dap.exe',
-                   'zanfmt.exe', 'zandoc.exe')) {
-    $p = Join-Path $b $cli
-    if (Test-Path $p) { Copy-Item $p (Join-Path $distTc $cli) }
-    else { Write-Output "PUBLISH_WARN: missing build\$cli (skipped)" }
-}
-$ld = Join-Path $b 'ld.exe'
-if (Test-Path $ld) {
-    Copy-Item $ld (Join-Path $distTc 'ld.exe')
-    $lld = Join-Path $b 'ld.lld.exe'
-    if (Test-Path $lld) { Copy-Item $lld (Join-Path $distTc 'ld.lld.exe') }
-    else { Write-Output "PUBLISH_WARN: build\ld.lld.exe missing; large Windows programs may fail to link" }
-    Copy-Item (Join-Path $b 'mingw') (Join-Path $distTc 'mingw') -Recurse
-} else {
-    Write-Output "PUBLISH_WARN: build\ld.exe missing; dist zanc will need a system LLVM/clang on PATH"
-}
-# --emit-lib uses a real indexed archive; ship the host LLVM tool next to zanc.
-function Find-HostLlvmAr([string]$buildDir) {
-    $candidates = @((Join-Path $buildDir "llvm-ar.exe"))
-    $cache = Join-Path $buildDir "CMakeCache.txt"
-    if (Test-Path -LiteralPath $cache -PathType Leaf) {
-        foreach ($key in @("LLVM_TOOLS_BINARY_DIR", "LLVM_DIR", "CMAKE_C_COMPILER")) {
-            $entry = Select-String -LiteralPath $cache -Pattern "^${key}:[^=]*=(.+)$" |
-                     Select-Object -First 1
-            if (-not $entry) { continue }
-            $value = $entry.Matches[0].Groups[1].Value.Trim()
-            switch ($key) {
-                "LLVM_TOOLS_BINARY_DIR" { $candidates += Join-Path $value "llvm-ar.exe" }
-                "LLVM_DIR" { $candidates += Join-Path $value "../../../bin/llvm-ar.exe" }
-                "CMAKE_C_COMPILER" {
-                    $parent = Split-Path -Parent $value
-                    if ($parent -and $parent.Trim() -ne "") {
-                        $candidates += Join-Path $parent "llvm-ar.exe"
-                    }
-                }
-            }
-        }
-    }
-    foreach ($prefix in @($env:LLVM_ROOT, $env:LLVM_PATH)) {
-        if ($prefix) { $candidates += Join-Path $prefix "bin/llvm-ar.exe" }
-    }
-    $onPath = Get-Command llvm-ar.exe -CommandType Application -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-    if ($onPath) { $candidates += $onPath.Source }
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return [IO.Path]::GetFullPath($candidate)
-        }
-    }
-    return $null
-}
-$llvmAr = Find-HostLlvmAr $b
-if (-not $llvmAr) { throw "PUBLISH_FAILED: host llvm-ar.exe missing; install the configured LLVM tools" }
-Copy-Item -LiteralPath $llvmAr -Destination (Join-Path $distTc 'llvm-ar.exe') -Force
-
-foreach ($sub in @('linux-musl', 'linux-arm64', 'linux-riscv64', 'win-x64', 'win-arm64', 'wasm32', 'riscv64', 'macos', 'ios', 'ohos-x64', 'ohos-arm64')) {
-    $sys = Join-Path $b $sub
-    if (-not (Test-Path $sys)) {
-        # Fallback to source tree toolchain/ if build/ has not staged it yet
-        $sys = Join-Path (Join-Path $root 'toolchain') $sub
-    }
-    if (Test-Path $sys) { Copy-Item $sys (Join-Path $distTc $sub) -Recurse }
-}
-foreach ($rt in (Get-ChildItem $b -File -ErrorAction SilentlyContinue |
-                 Where-Object { ($_.Name -like 'zanrt_*' -or $_.Name -like 'zan_inflate*' -or $_.Name -like 'zan_embed_api*' -or $_.Name -like 'libzancrypto*') -and $_.Extension -in '.o','.obj','.a' })) {
-    Copy-Item $rt.FullName (Join-Path $distTc $rt.Name)
-}
-
-# ---- independent native drivers (legacy toolchain lookup support) ---------
-# Canonical shared/static bundles remain in each package owner directory.
-# Also keep every freshly built DLL and both import formats beside zanc for
-# callers that explicitly select this directory with --driver-dir.
-$nativeOwners = @{
-    zan_gui = 'packages/Zan.Gui/src/Gui/drivers'
-    zan_image = 'packages/Zan.Drawing/src/System/Drawing/Imaging/drivers'
-    zan_audio = 'packages/Zan.Desktop/src/System/Media/drivers'
-    zan_game = 'packages/Zan.Game/src/Game/Graphics/drivers'
-}
-foreach ($driver in @('zan_gui', 'zan_image', 'zan_audio', 'zan_game')) {
-    foreach ($name in @("$driver.dll", "$driver.lib", "lib$driver.dll.a")) {
-        $nativeFile = Join-Path $b $name
-        if (Test-Path $nativeFile) { Copy-Item $nativeFile (Join-Path $distTc $name) }
-    }
-    $ownerDir = Join-Path (Join-Path $root $nativeOwners[$driver]) 'win-x64'
-    $bundleName = "$driver.bundle"
-    $bundle = Join-Path $b $bundleName
-    if (-not (Test-Path -LiteralPath $bundle -PathType Leaf)) { $bundle = Join-Path $ownerDir $bundleName }
-    if (Test-Path -LiteralPath $bundle -PathType Leaf) {
-        Copy-Item -LiteralPath $bundle -Destination (Join-Path $distTc $bundleName) -Force
-        # Carry conditional runtime payloads (e.g. WebView2Loader if WebView).
-        foreach ($entry in (Get-Content -LiteralPath $bundle)) {
-            if ($entry -match '^\s*([^#@\s]+)\s+if\s+\S+\s*$') {
-                $payloadName = $Matches[1]
-                $payload = Join-Path $b $payloadName
-                if (-not (Test-Path -LiteralPath $payload -PathType Leaf)) { $payload = Join-Path $ownerDir $payloadName }
-                if (Test-Path -LiteralPath $payload -PathType Leaf) {
-                    Copy-Item -LiteralPath $payload -Destination (Join-Path $distTc $payloadName) -Force
-                }
-            }
-        }
-    }
-}
-
-# ---- bundle the native debugger (gdb) so debugging is out-of-the-box ----
-# zan-dap resolves gdb next to itself first (toolchain\debugger\bin\gdb.exe),
-# so a published IDE debugs with no system install. The shared probe tries
-# ZAN_GDB_DIR/ZAN_GDB, then PATH, then the MinGW install roots it derives from
-# the environment (MSYS2, TDM-GCC, scoop, ...) -- no fixed drive letters here.
-. (Join-Path $PSScriptRoot 'toolchain_paths.ps1')
-
-$gdbTried = $null
-$gdbExe = Resolve-ZanExecutable -Name 'gdb' `
-    -EnvVars @('ZAN_GDB_DIR', 'ZAN_GDB', 'MINGW_ROOT', 'MINGW_HOME') `
-    -Commands @('gdb.exe', 'gdb') `
-    -Roots (Get-ZanMinGWRoots) `
-    -Relative @('gdb.exe', 'bin\gdb.exe') `
-    -Tried ([ref]$gdbTried)
-$gdbSrcDir = if ($gdbExe) { Split-Path -Parent $gdbExe } else { $null }
-if ($gdbExe -and (Test-Path -LiteralPath $gdbExe)) {
-    $dbgBin = Join-Path $distTc 'debugger\bin'
-    New-Item -ItemType Directory -Path $dbgBin -Force | Out-Null
-    Copy-Item $gdbExe (Join-Path $dbgBin 'gdb.exe')
-    # gdb.exe links against the MinGW runtime DLLs shipped in the same bin dir;
-    # copy them so the bundled debugger runs on a machine with no TDM-GCC.
-    foreach ($dll in (Get-ChildItem $gdbSrcDir -Filter '*.dll' -File -ErrorAction SilentlyContinue)) {
-        Copy-Item $dll.FullName (Join-Path $dbgBin $dll.Name) -Force
-    }
-    # Verify the relocated gdb actually runs. Some distributions (e.g. TDM-GCC)
-    # ship a launcher stub that bakes in its install path and cannot be moved;
-    # shipping that would give a broken debugger. If the copy fails to run,
-    # drop the bundle so zan-dap falls back to a system/known gdb instead.
-    $bundledGdb = Join-Path $dbgBin 'gdb.exe'
-    $gdbOk = $false
-    try { & $bundledGdb --version *> $null; $gdbOk = ($LASTEXITCODE -eq 0) } catch { $gdbOk = $false }
-    if ($gdbOk) {
-        Write-Output "Bundled gdb from $gdbSrcDir -> toolchain\debugger\bin"
-    } else {
-        Remove-Item (Join-Path $distTc 'debugger') -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Output "PUBLISH_WARN: gdb at $gdbSrcDir is not relocatable; not bundling (zan-dap will use a system/known gdb)"
-    }
-} else {
-    Write-Output (Format-ZanProbeFailure -Name 'gdb' `
-        -EnvVars @('ZAN_GDB_DIR', 'ZAN_GDB', 'MINGW_ROOT') -Tried $gdbTried)
-    Write-Output "PUBLISH_WARN: gdb.exe not found (set ZAN_GDB_DIR); debugging will need a system gdb/ZAN_GDB"
-}
-
-# ---- copy a small set of example programs, if present ----
-# robocopy + /XD：模板/示例树里可能躺着 gitignore 掉的 _scratch\ 和
-# build\（legend 的调试产物、server-mvc 的 19M 编译产物），
-# Copy-Item -Recurse 会整树照搬，把发布包塞满与发布无关的产物。
-# robocopy 退出码 >=8 才是失败。
-$examples = Join-Path $root 'examples'
-if (Test-Path $examples) {
-    robocopy $examples (Join-Path $dist 'examples') /E /XD _scratch build /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { Write-Output "PUBLISH_WARN: examples robocopy failed ($LASTEXITCODE)" }
-}
-
-# ---- copy the built-in project templates (data-driven; read at runtime) ----
-# The IDE scans <ExeDir>\templates for template.manifest folders, so editing or
-# adding a template needs no rebuild. Keep this folder next to ZanIDE.exe.
-$templates = Join-Path $root 'templates'
-if (Test-Path $templates) {
-    robocopy $templates (Join-Path $dist 'templates') /E /XD _scratch build /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { Write-Output "PUBLISH_WARN: templates robocopy failed ($LASTEXITCODE)" }
-} else {
-    Write-Output "PUBLISH_WARN: templates\ missing; New Project will use the built-in fallback set"
-}
-
-# ---- copy the shipped IDE tools (Tools panel; run on double-click) ----
-# The IDE scans <ExeDir>\tools for .zan tools, so this folder must travel
-# next to ZanIDE.exe in the published tree.
-$toolsDir = Join-Path $root 'tools'
-if (Test-Path $toolsDir) {
-    Copy-Item $toolsDir (Join-Path $dist 'tools') -Recurse
-} else {
-    Write-Output "PUBLISH_WARN: tools\ missing; the Tools panel will be empty"
-}
-
-# ---- knowledge base for the built-in assistant (offline API index + example
-#      catalog) -------------------------------------------------------------
-# The IDE's assistant reads <ExeDir>\knowledge\symbols.json (RepoMap index of
-# the shipped stdlib) and <ExeDir>\knowledge\gallery.json (golden-example
-# catalog) via its api_search / example tools, so it answers from a generated
-# index instead of grepping the raw stdlib. Same data the server-side MCP
-# serves. Non-fatal: the assistant falls back to stdlib_grep if this is absent.
-$knowledgeDir = Join-Path $dist 'knowledge'
-New-Item -ItemType Directory -Force -Path $knowledgeDir | Out-Null
-$gallerySeed = Join-Path $root 'tools\mcp_server\gallery.json'
-if (Test-Path $gallerySeed) {
-    Copy-Item $gallerySeed (Join-Path $knowledgeDir 'gallery.seed.json') -Force
-} else {
-    Write-Output "PUBLISH_WARN: gallery seed missing; server-side refresh is unavailable"
-}
-& (Join-Path $root 'scripts\gen_knowledge.ps1') `
-    -Zanc $zancExe -Stdlib $stdlib -OutDir $knowledgeDir `
-    -GallerySrc $gallerySeed
-
-# ---- AI onboarding pack (AGENTS.md + skills + stdio MCP + client configs) --
-# Any external AI tool (Claude Code / Cursor / Copilot / Windsurf) can drive
-# this SDK without reading its sources: it launches zan-mcp.exe --stdio and
-# calls zan_start_here. The pack is what makes that a copy-one-file step, so it
-# ships with the release. Non-fatal throughout: a missing piece degrades the
-# assistance, it does not break the IDE.
-Write-Output "[4/6] Building the AI onboarding pack ..."
-$aiPack = Join-Path $root 'tools\ai_pack'
-$mcpSrc = Join-Path $root 'tools\mcp_server\McpServer.zan'
-$distTools = Join-Path $dist 'tools'
-New-Item -ItemType Directory -Force -Path $distTools | Out-Null
-$mcpExe = Join-Path $distTools 'zan-mcp.exe'
-if (Test-Path $mcpSrc) {
-    # Under tools\ so the install root stays clean: the server resolves
-    # knowledge\, toolchain\zanc.exe and stdlib\ from the SDK root it finds one
-    # level up (McpServer.ResolveSdkDir), so the tree stays relocatable.
-    # zanc writes its optimization report to stderr, and under
-    # $ErrorActionPreference = "Stop" PowerShell turns a native command's stderr
-    # into a terminating error whichever way the streams are redirected. Launch
-    # it as a process instead so its output only ever reaches the log files, and
-    # judge the result by the exit code.
-    $mcpLog = Join-Path $root '_scratch\publish_zan_mcp.log'
-    New-Item -ItemType Directory -Force -Path (Split-Path $mcpLog) | Out-Null
-    $mcpSources = @(Get-ChildItem -Path (Split-Path -Parent $mcpSrc) -Filter *.zan | Select-Object -ExpandProperty FullName)
-    $mcpArgs = @($mcpSources) + @('--auto-stdlib', '--publish', '-o', $mcpExe)
-    $mcpProc = Start-Process -FilePath $zancExe -Wait -PassThru -NoNewWindow `
-        -ArgumentList $mcpArgs `
+    $mcpSources = @(Get-ChildItem -LiteralPath (Join-Path $root 'tools\mcp_server') -Filter '*.zan' -File | Select-Object -ExpandProperty FullName)
+    $mcpSources += @('gallery\GalleryIndex.zan', 'gallery\GalleryResult.zan', 'semantic_index\SemanticIndex.zan', 'semantic_index\IndexedField.zan') |
+        ForEach-Object { Join-Path (Join-Path $root 'tools\shared') $_ }
+    foreach ($source in $mcpSources) { Assert-SdkFile $source }
+    $mcpLog = Join-Path $root 'build\test-out\prepare-zan-mcp.log'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $mcpLog) | Out-Null
+    $mcpArgs = @($mcpSources) + @('--auto-stdlib', '--publish', '-o', (Join-Path $root 'build\zan-mcp.exe'))
+    $quotedArgs = @($mcpArgs | ForEach-Object { '"' + $_.Replace('"', '\"') + '"' })
+    Remove-Item -LiteralPath (Join-Path $root 'build\zan-mcp.exe') -Force -ErrorAction SilentlyContinue
+    $proc = Start-Process -FilePath $buildZanc -Wait -PassThru -NoNewWindow -ArgumentList $quotedArgs `
         -RedirectStandardOutput $mcpLog -RedirectStandardError "$mcpLog.err"
-    if ($mcpProc.ExitCode -ne 0) {
-        Write-Output "PUBLISH_WARN: zanc exited $($mcpProc.ExitCode) building zan-mcp.exe; see $mcpLog.err"
-    }
-    if (Test-Path $mcpExe) {
-        Write-Output "PUBLISH_MCP_OK -> $mcpExe"
-    } else {
-        Write-Output "PUBLISH_WARN: could not build tools\zan-mcp.exe; AI clients must run tools\mcp_server\McpServer.zan themselves"
-    }
-} else {
-    Write-Output "PUBLISH_WARN: tools\mcp_server\McpServer.zan missing; no MCP server published"
+    if ($proc.ExitCode -ne 0) { throw "PUBLISH_FAILED: MCP build error ($($proc.ExitCode)); see $mcpLog.err" }
+    Assert-SdkFile (Join-Path $root 'build\zan-mcp.exe')
+    if ($PrepareOnly) { Write-Output 'PUBLISH_PREPARE_OK (IDE, MCP, knowledge; no dist mutation)'; return }
 }
 
-if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
-    # The pack ships as a TEMPLATE under ai\, never as live config in the
-    # install root: AGENTS.md / .mcp.json / .cursor\ / .vscode\ only mean
-    # anything inside the project you are working on, and nobody develops inside
-    # the SDK folder. "tools\zan-mcp.exe --init-agent <project>" (or the IDE
-    # assistant's one-click button) copies it into a project and expands
-    # <ZAN_MCP> / <ZAN_SDK> / <ZAN_PROJECT> there -- which is also why the
-    # placeholders are left intact here.
-    $distAi = Join-Path $dist 'ai'
-    New-Item -ItemType Directory -Force -Path $distAi | Out-Null
-    Copy-Item (Join-Path $aiPack 'AGENTS.md') (Join-Path $distAi 'AGENTS.md') -Force
-    foreach ($cfg in @('mcp.json', 'cursor.mcp.json', 'vscode.mcp.json')) {
-        $srcCfg = Join-Path $aiPack $cfg
-        if (Test-Path $srcCfg) { Copy-Item $srcCfg (Join-Path $distAi $cfg) -Force }
-    }
-    $aiReadme = Join-Path $aiPack 'README.md'
-    if (Test-Path $aiReadme) { Copy-Item $aiReadme (Join-Path $distAi 'README.md') -Force }
-    $distSkills = Join-Path $distAi 'skills'
-    New-Item -ItemType Directory -Force -Path $distSkills | Out-Null
-    Get-ChildItem (Join-Path $aiPack 'skills') -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Copy-Item $_.FullName $distSkills -Recurse -Force }
-
-    $onboarding = Join-Path $root 'tools\ai_pack\docs\AI_ONBOARDING.md'
-    if (Test-Path $onboarding) {
-        New-Item -ItemType Directory -Force -Path (Join-Path $dist 'docs') | Out-Null
-        Copy-Item $onboarding (Join-Path $dist 'docs\AI_ONBOARDING.md') -Force
-    }
-    # The human-facing "how AI uses this SDK" guide ships at the install root,
-    # next to README.txt and llms.txt, so it is found without opening docs\.
-    $aiGuide = Join-Path $root 'tools\ai_pack\docs\AI_README.md'
-    if (Test-Path $aiGuide) { Copy-Item $aiGuide (Join-Path $dist 'AI_README.md') -Force }
-    # TOOLING.md is a repo doc; the AI docs live in the ai_pack source tree.
-    # Dist layout is unchanged: all four land in dist\docs\.
-    foreach ($doc in @('TOOLING.md')) {
-        $p = Join-Path $root "docs\$doc"
-        if (Test-Path $p) { Copy-Item $p (Join-Path $dist "docs\$doc") -Force }
-    }
-    foreach ($doc in @('ai-assist.md', 'MCP_HOSTING.md', 'AI_DEV_INFRASTRUCTURE.md')) {
-        $p = Join-Path $root "tools\ai_pack\docs\$doc"
-        if (Test-Path $p) { Copy-Item $p (Join-Path $dist "docs\$doc") -Force }
-    }
-    Write-Output "PUBLISH_AIPACK_OK -> ai\ (AGENTS.md, skills\, mcp configs), docs\AI_ONBOARDING.md"
-} else {
-    Write-Output "PUBLISH_WARN: tools\ai_pack missing; released SDK has no AGENTS.md/skills for AI clients"
+# ---- complete preflight, before deleting any old output ----
+$b = Join-Path $root 'build'
+$dist = Assert-SdkStagePath $dist $root @((Join-Path $root 'dist'), (Join-Path $root '_scratch'))
+$distTc = Join-Path $dist 'toolchain'
+$work = Join-Path $root 'build\test-out'
+New-Item -ItemType Directory -Force -Path $work | Out-Null
+$toolInputs = Join-Path $work 'sdk-toolchain-inputs.json'
+$planFile = Join-Path $work 'sdk-stage-plan.json'
+$ticket = Join-Path $work 'sdk-stage-preflight.json'
+& (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc `
+    -IncludeDebugger -PreflightOnly -InputList $toolInputs
+$copies = [Collections.Generic.List[object]]::new()
+function Add-SdkCopy([string]$Source, [string]$Destination, [switch]$Tree) {
+    $kind = if ($Tree) { 'Container' } else { 'Leaf' }
+    if (-not (Test-Path -LiteralPath $Source -PathType $kind)) { throw "PUBLISH_FAILED: required input missing: $Source" }
+    $copies.Add([pscustomobject]@{ source = [IO.Path]::GetFullPath($Source); destination = $Destination; tree = [bool]$Tree; source_only = ($Tree -and $Destination -notin @('stdlib', 'packages')) })
 }
+foreach ($tree in @('stdlib', 'packages', 'examples', 'templates', 'tools')) {
+    Add-SdkCopy (Join-Path $root $tree) $tree -Tree
+}
+Assert-SdkFile (Join-Path $root 'examples\html_gallery\zan.proj')
+Add-SdkCopy (Join-Path $b 'ZanIDE.exe') 'ZanIDE.exe'
+Add-SdkCopy (Join-Path $b 'ZanIDE.deps.txt') 'ZanIDE.deps.txt'
+foreach ($dep in (Get-Content -LiteralPath (Join-Path $b 'ZanIDE.deps.txt'))) {
+    $dep = $dep.Trim()
+    if (-not $dep) { continue }
+    if ([IO.Path]::GetFileName($dep) -ne $dep -or $dep -notmatch '\.dll$') { throw "PUBLISH_FAILED: unsafe IDE dependency: $dep" }
+    Add-SdkCopy (Join-Path $b $dep) $dep
+}
+Add-SdkCopy (Join-Path $b 'zan-mcp.exe') 'tools/zan-mcp.exe'
+foreach ($name in @('symbols.json', 'gallery.json', 'packages-catalog.json', 'examples-catalog.json')) {
+    Add-SdkCopy (Join-Path (Join-Path $b 'knowledge') $name) "knowledge/$name"
+}
+Add-SdkCopy (Join-Path $root 'tools\mcp_server\gallery.json') 'knowledge/gallery.seed.json'
+Add-SdkCopy (Join-Path $root 'assets\zan.ico') 'assets/zan.ico'
+$aiPack = Join-Path $root 'tools\ai_pack'
+foreach ($name in @('AGENTS.md', 'mcp.json', 'cursor.mcp.json', 'vscode.mcp.json', 'README.md')) {
+    Add-SdkCopy (Join-Path $aiPack $name) "ai/$name"
+}
+Add-SdkCopy (Join-Path $aiPack 'skills') 'ai/skills' -Tree
+Add-SdkCopy (Join-Path $aiPack 'docs\AI_README.md') 'AI_README.md'
+foreach ($name in @('AI_ONBOARDING.md', 'ai-assist.md', 'MCP_HOSTING.md', 'AI_DEV_INFRASTRUCTURE.md')) {
+    Add-SdkCopy (Join-Path (Join-Path $aiPack 'docs') $name) "docs/$name"
+}
+Add-SdkCopy (Join-Path $root 'docs\TOOLING.md') 'docs/TOOLING.md'
+$toolPlan = Get-Content -LiteralPath $toolInputs -Raw | ConvertFrom-Json
+$plan = @{ repo = $root; toolchain = @($toolPlan | ForEach-Object { $_ }); copies = @($copies.ToArray()) }
+ConvertTo-Json -InputObject $plan -Depth 8 | Set-Content -LiteralPath $planFile -Encoding UTF8
+# Include exact gallery file references missing from the regular payload trees.
+$manifestTool = Join-Path $PSScriptRoot 'sdk_stage_manifest.py'
+& python -I -B $manifestTool gallery-plan --plan $planFile
+if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: gallery payload closure validation failed' }
+if ($PlanOnly) { Write-Output "PUBLISH_PLAN_OK -> $planFile (no identity approval, no output mutation)"; return }
+$manifestArgs = @('--repo', $root, '--build', $b, '--plan', $planFile, '--ticket', $ticket)
+if ($LocalStage) { $manifestArgs += '--local-stage' }
+& python -I -B $manifestTool preflight @manifestArgs
+if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: SDK identity/preflight validation failed; previous output preserved' }
+if ($PreflightOnly) { Write-Output 'PUBLISH_PREFLIGHT_OK (previous output preserved)'; return }
+
+# All source/identity failures above preserve an old output for inspection. An
+# output that cannot be cleaned is an error, never a partly mixed release.
+if (Test-Path -LiteralPath $dist) { Remove-Item -LiteralPath $dist -Recurse -Force -ErrorAction Stop }
+New-Item -ItemType Directory -Path $dist -Force | Out-Null
+& python -I -B $manifestTool copy-sources --plan $planFile --sdk $dist
+if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: SDK source copy failed' }
+& (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc -IncludeDebugger
 
 # ---- release readme ---------------------------------------------------------
 Write-Output "[5/6] Writing README.txt + AI entry index ..."
@@ -516,7 +193,7 @@ Contents
                    packages-catalog.json Package catalog index (pkg_search/pkg_install)
                    examples-catalog.json Examples catalog index
                  The assistant queries these instead of grepping the stdlib.
-  examples\      Sample programs shown in the IDE's Examples pane (optional).
+  examples\      Sample programs shown in the IDE's Examples pane.
   templates\     Built-in New Project templates (one folder each, with a
                  template.manifest). Edit or drop in your own folders to add
                  templates -- no rebuild needed.
@@ -628,7 +305,7 @@ Zan IDE 自包含发布包
                    packages-catalog.json 扩展包元数据索引（包查找与自动修复用）
                    examples-catalog.json 官方范例索引（功能参考用）
                  助手查这些索引，而不是去 grep 标准库源码。
-  examples\      IDE 示例面板展示的示例程序（可选）。
+  examples\      IDE 示例面板展示的示例程序。
   templates\     内置"新建项目"模板（每个模板一个目录，含 template.manifest）。
                  编辑或放入新目录即可增删模板——无需重新构建。
   tools\         IDE 工具面板展示的 Zan 工具（双击运行），以及 zan-mcp.exe——
@@ -690,48 +367,12 @@ AI 编程工具（Claude Code / Cursor / Copilot / Windsurf）
 "@
 Set-Content -Path (Join-Path $dist 'README.CN.txt') -Value $readmeCn -Encoding UTF8
 
-# ---- AI entry index (llms.txt) ------------------------------------------------
-# Fixed path at the SDK root, regenerated from what actually got staged: the
-# file-channel twin of zan_start_here for agents without an MCP connection.
-# Non-fatal: its absence degrades onboarding, it does not break the release.
+# Generated entry index is required; the manifest records its final bytes.
 & (Join-Path $root 'scripts\gen_ai_index.ps1') -Dist $dist -Version $version
-if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_WARN: llms.txt generation failed (non-fatal)" }
-
-# ---- strip transient build artifacts and dev files from published tree ------
-Write-Output "Sweeping transient and intermediate artifacts from dist ..."
-# 1. Sweep transient build directories (.build, build, _scratch, bin, obj, logs)
-Get-ChildItem -Path $dist -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -in @('.build', 'build', '_scratch', 'bin', 'obj', 'logs', '.git', '.github') } |
-    ForEach-Object {
-        try { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-    }
-
-# 2. Sweep developer/intermediate files (*.log, *.tmp, *.bak, *.pdb, *.ilk, *.exp, .gitignore, .gitattributes)
-Get-ChildItem -Path $dist -Recurse -File -Force -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.Name -in @('.gitignore', '.gitattributes', '.DS_Store', 'Thumbs.db') -or
-        $_.Extension -in @('.log', '.tmp', '.bak', '.pdb', '.ilk', '.exp')
-    } |
-    ForEach-Object {
-        try { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
-    }
-
-$n = (Get-ChildItem $dist -Recurse -File | Measure-Object).Count
-Write-Output "STAGE_OK -> $dist ($n files)"
-
-# ---- flat layout: the real IDE exe runs from the install dir ---------------
-# No self-extract wrapper. ZanIDE.exe (the real IDE) ships loose in $dist and
-# runs right here, so ide.css/stdlib/toolchain resolve from the exe's own
-# directory -- no %LOCALAPPDATA% extraction, no ZAN_APP_DIR indirection.
-Write-Output "[6/6] Finalizing flat layout (real exe, no dlls) ..."
-
-# No self-extract launcher ships any more, for the IDE or for user programs:
-# a single-file publish bakes the resources into the exe with zanc --embed and
-# links the native drivers statically, so nothing is ever unpacked into a cache
-# directory and run from there. Drop a stub left by an older publish.
-Remove-Item (Join-Path $distTc 'pkg_stub.exe') -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $distTc 'pack_single.ps1') -Force -ErrorAction SilentlyContinue
-
-if (-not (Test-Path (Join-Path $dist 'ZanIDE.exe'))) { Write-Output "PUBLISH_FAILED: dist\ZanIDE.exe missing"; exit 1 }
-$sz = (Get-Item (Join-Path $dist 'ZanIDE.exe')).Length
-Write-Output "PUBLISH_OK v$version -> $dist\ZanIDE.exe (flat, real exe, $sz bytes; GUI runtime statically linked)"
+Assert-SdkFile (Join-Path $dist 'llms.txt')
+& python -I -B $manifestTool seal @manifestArgs --sdk $dist
+if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: final SDK input/output identity validation failed' }
+& python -I -B $manifestTool verify --sdk $dist
+if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: final SDK inventory verification failed' }
+$n = (Get-ChildItem -LiteralPath $dist -Recurse -File | Measure-Object).Count
+Write-Output "PUBLISH_OK v$version -> $dist ($n files; manifest sealed; template consumption pending)"

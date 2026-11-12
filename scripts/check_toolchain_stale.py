@@ -45,14 +45,29 @@ import shutil
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
-RT_IO = ["src/runtime/rt_io.c"]
-RT_SYNC = ["src/runtime/rt_sync.c"]
-RT_FILE = ["src/runtime/rt_file.c"]
+def _implementation_sources(directory):
+    """Textually included implementations and headers, including nested splits."""
+    return sorted(p.replace("\\", "/")
+                  for suffix in ("c", "h")
+                  for p in glob.glob(f"{directory}/**/*.{suffix}", recursive=True))
+
+
+RT_IO = ["src/runtime/rt_io.c", "src/runtime/rt_io.h", "src/runtime/rt_co.h",
+         "src/runtime/rt_timer.h", "src/runtime/rt_crash.h",
+         "src/common/host_oom.h"] + _implementation_sources("src/runtime/io")
+RT_SYNC = ["src/runtime/rt_sync.c", "src/runtime/rt_sync.h",
+           "src/runtime/rt_timer.h", "src/runtime/rt_oom.h",
+           "src/common/zan_abi.h"] + _implementation_sources("src/runtime/sync")
+RT_FILE = ["src/runtime/rt_file.c"] + _implementation_sources("src/runtime/file")
 RT_DECIMAL = ["src/runtime/rt_decimal.c", "src/runtime/rt_decimal.h"]
 RT_TIMER = ["src/runtime/rt_timer.c", "src/runtime/rt_timer.h",
-            "src/runtime/rt_crash.h"]
-RT_CRASH = ["src/runtime/rt_crash.c", "src/runtime/rt_crash.h"]
-RT_CRYPTO = ["src/accel/zan_hw_accel.c", "src/accel/zan_hw_accel.h"]
+            "src/runtime/rt_crash.h", "src/runtime/rt_oom.h",
+            "src/runtime/rt_siphash.h", "src/common/host_oom.h",
+            "src/common/zan_abi.h"] + _implementation_sources("src/runtime/timer")
+RT_CRASH = ["src/runtime/rt_crash.c", "src/runtime/rt_crash.h"] + \
+    _implementation_sources("src/runtime/crash")
+RT_CRYPTO = ["src/accel/zan_hw_accel.c", "src/accel/zan_hw_accel.h"] + \
+    _implementation_sources("src/accel/hw")
 RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
                                      # links alongside as its own object (build_cross_rt.cmd)
 RT_GUI_MAC = ["src/drivers/gui/gui_compat_mac.c"]

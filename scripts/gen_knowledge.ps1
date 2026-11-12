@@ -24,7 +24,11 @@ $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $RepomapSrc) { $RepomapSrc = Join-Path $root 'tools\repomap\RepoMap.zan' }
 if (-not $GallerySrc) { $GallerySrc = Join-Path $root 'tools\mcp_server\gallery.json' }
-$genKnowledgeSrc = Join-Path $root 'tools\genknowledge\GenKnowledge.zan'
+$genKnowledgeSources = @(
+  (Join-Path $root 'tools\genknowledge\GenKnowledge.zan')
+  (Join-Path $root 'tools\shared\gallery\GalleryIndex.zan')
+  (Join-Path $root 'tools\shared\gallery\GalleryResult.zan')
+)
 
 # Everything past a Push-Location must be an absolute path.
 $Zanc   = (Resolve-Path $Zanc).Path
@@ -64,10 +68,10 @@ if (Test-Path $RepomapSrc) {
 }
 
 # ---- gallery index through the cross-platform Zan tool --------------------
-if ((Test-Path $genKnowledgeSrc) -and (Test-Path $GallerySrc) -and (Test-Path $Stdlib)) {
+if ((Test-Path $genKnowledgeSources) -notcontains $false -and (Test-Path $GallerySrc) -and (Test-Path $Stdlib)) {
   $genKnowledgeExe = Join-Path $toolDir 'genknowledge.exe'
   try {
-    & $Zanc $genKnowledgeSrc --stdlib-path $Stdlib -o $genKnowledgeExe
+    & $Zanc @genKnowledgeSources --stdlib-path $Stdlib -o $genKnowledgeExe
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $genKnowledgeExe)) {
       throw "GenKnowledge compile failed (exit code $LASTEXITCODE)"
     }

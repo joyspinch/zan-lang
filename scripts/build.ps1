@@ -27,13 +27,22 @@
 param(
     [string]$Target = '',
     [switch]$Configure,
-    [switch]$SkipGate
+    [switch]$SkipGate,
+    [string]$Build = (Join-Path $PSScriptRoot '../build'),
+    [switch]$ReleaseIdentity,
+    [string[]]$NativeInput = @(),
+    [string[]]$Artifact = @()
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$buildDir = Join-Path $root 'build'
+$buildDir = [IO.Path]::GetFullPath($Build)
 $gate = Join-Path $PSScriptRoot 'build_gate.ps1'
+$identityHelper = Join-Path $PSScriptRoot 'release_build_identity.ps1'
+if ($ReleaseIdentity -and $SkipGate) { throw 'Release identity requires the shared build lock' }
+if (($NativeInput.Count -gt 0 -or $Artifact.Count -gt 0) -and -not $ReleaseIdentity) {
+    throw 'NativeInput and Artifact require -ReleaseIdentity'
+}
 
 if (-not (Test-Path (Join-Path $buildDir 'CMakeCache.txt'))) {
     Write-Host "[build] 未配置，先 cmake -B build" -ForegroundColor Yellow
@@ -42,7 +51,7 @@ if (-not (Test-Path (Join-Path $buildDir 'CMakeCache.txt'))) {
 
 $doConfigure = {
     & cmake -B $buildDir -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    if ($LASTEXITCODE -ne 0) { throw "cmake configure 失败 exit=$LASTEXITCODE" }
+    if ($global:LASTEXITCODE -ne 0) { throw "cmake configure 失败 exit=$global:LASTEXITCODE" }
 }
 
 $doBuild = {
@@ -62,7 +71,7 @@ $doBuild = {
         $ErrorActionPreference = 'Continue'
         try {
             $out = & cmake --build $buildDir $(if ($Target -ne '') { @('--target', $Target) }) 2>&1
-            $rc = $LASTEXITCODE
+            $rc = $global:LASTEXITCODE
         } finally {
             $ErrorActionPreference = $prevEap
         }
@@ -92,7 +101,7 @@ if ($SkipGate) {
     Write-Host "[build] 跳过串行闸（逃生口）" -ForegroundColor Yellow
     if ($Configure) { & $doConfigure }
     & $doBuild
-    exit $LASTEXITCODE
+    exit $global:LASTEXITCODE
 }
 
 # 闸的锁名与 test.ps1 共用同一把 'build' 锁——编译与测试必须互斥：
@@ -100,17 +109,21 @@ if ($SkipGate) {
 # 假红的排查成本远高于多等一会儿。
 #
 # 退出码经临时文件回传：`& $gate` 在子作用域里跑，$script: 变量穿不过去
-# （各自的 script scope），闭包里的 $LASTEXITCODE 同样出不来。
+# （各自的 script scope），用临时文件保留本次操作的结果。
 $schedPath = Join-Path $PSScriptRoot 'sched.ps1'
 $codeFile = Join-Path $env:TEMP "zan_build_code_$PID.txt"
+Remove-Item -LiteralPath $codeFile -Force -ErrorAction SilentlyContinue
 & $gate -Name 'build' -Script {
     # 顺手回收上一轮留下的副本：过期任务租约、没人引用的仓库外 worktree。
     # 放在闸里跑，跟编译/测试互斥，不会跟别人的构建抢同一个目录。
     if (Test-Path $schedPath) { & $schedPath reap -Apply | Out-Null }
     if ($Configure) { & $doConfigure }
+    if ($ReleaseIdentity) { & $identityHelper -Action Capture -Build $buildDir -NativeInput $NativeInput }
     & $doBuild
-    Set-Content -Path $codeFile -Value $LASTEXITCODE -Encoding ASCII
+    if ($ReleaseIdentity) { & $identityHelper -Action Seal -Build $buildDir -Artifact $Artifact }
+    Set-Content -Path $codeFile -Value $global:LASTEXITCODE -Encoding ASCII
 }.GetNewClosure()
+$gateExit = $LASTEXITCODE
 
 $code = 1
 if (Test-Path $codeFile) {
@@ -118,6 +131,7 @@ if (Test-Path $codeFile) {
     if ($raw -match '^\d+$') { $code = [int]$raw }
     Remove-Item -LiteralPath $codeFile -Force -ErrorAction SilentlyContinue
 }
+if ($gateExit -ne 0) { $code = $gateExit }
 if ($code -eq 0) { Write-Host "[build] OK" -ForegroundColor Green }
 else { Write-Host "[build] FAILED exit=$code" -ForegroundColor Red }
 exit $code

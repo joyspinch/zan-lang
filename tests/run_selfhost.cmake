@@ -56,6 +56,19 @@ if(NOT build_rc EQUAL 0)
   message(FATAL_ERROR "gen1 build failed (rc=${build_rc})\n${build_out}${build_err}")
 endif()
 
+# Exercise the freshly built driver, so option checks cannot use a stale gen1.
+get_filename_component(_driver_test_root "${OUTLL}" DIRECTORY)
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" "-DGEN1=${GEN1}"
+    "-DOUTDIR=${_driver_test_root}/test-out/selfhost-driver"
+    -P "${CMAKE_CURRENT_LIST_DIR}/run_selfhost_driver.cmake"
+  RESULT_VARIABLE driver_rc
+  OUTPUT_VARIABLE driver_out
+  ERROR_VARIABLE driver_err)
+if(NOT driver_rc EQUAL 0)
+  message(FATAL_ERROR "gen1 driver contracts failed\n${driver_out}${driver_err}")
+endif()
+
 # ---- Stage 2: run gen1 to emit IR for a real program ----
 file(REMOVE ${OUTLL})
 execute_process(

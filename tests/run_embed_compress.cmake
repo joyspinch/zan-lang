@@ -26,6 +26,7 @@ string(REPEAT "THE-QUICK-BROWN-FOX-" 60 big_content)
 string(REPEAT "SMALL-RAW-ASSET-" 6 small_content)
 file(WRITE ${asset_dir}/assets/big.txt ${big_content})
 file(WRITE ${asset_dir}/assets/small.txt ${small_content})
+file(WRITE ${asset_dir}/assets/empty.txt "")
 
 execute_process(
   COMMAND ${ZANC} ${SRC} --publish --embed ${asset_dir}/assets -o ${OUT_EXE}

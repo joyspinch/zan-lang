@@ -1,17 +1,12 @@
-# Golden-IR regression gate: gen1's emitted IR per case is pinned by a
-# normalized golden file, so any commit that changes the emission path shows
-# up as a diff -- including changes that keep the program's stdout identical
-# (the stdout differential gate cannot see those; B-ID180's fptosi poison was
-# exactly such a divergence).
+# Raw function fingerprint gate: scripts/normalize_ir.py --fnhash hashes
+# each original function signature and body, including names and whitespace.
+# It does not call normalize(); pure SSA/label renames also cause differences.
+# Module-level globals, types, declarations and attributes are not covered.
+# Fingerprints detect textual emission changes even when stdout matches;
+# they do not prove semantic equivalence or complete module equivalence.
 #
-# Why normalized goldens and not raw .ll: every gen1 refactor renames
-# mnemonic SSA temps, labels and internal globals without changing semantics;
-# scripts/normalize_ir.py erases exactly that noise (names become positions),
-# so a pure rename is invisible and a real change to the instruction stream
-# survives. The cross-compiler variant of this idea (diffing gen0's IR against
-# gen1's) was evaluated first (B-ID185) and is not tractable: for the same
-# program gen0 emits ~7.5k lines and gen1 ~84k (different pull strategy,
-# runtime inlining, lowering model) -- a byte diff there is 100% noise.
+# Cross-compiler IR diffing (gen0 against gen1) was evaluated first (B-ID185)
+# and is not tractable: their pull strategies and lowering models differ.
 #
 # A mismatch is a FAILURE, not a report: the goldens are the recorded shape of
 # the current emitter. Changing them deliberately (emitter improvement, twin
@@ -45,6 +40,38 @@ if(NOT WORKDIR)
   get_filename_component(WORKDIR "${_script_dir}/.." ABSOLUTE)
 endif()
 
+# Check the complete acceptance surface before starting an expensive gen1 build.
+# Explicit BLESS may create goldens, but it still requires every case source.
+file(STRINGS ${CASES} _case_lines)
+set(_cases)
+set(_missing_sources)
+set(_missing_goldens)
+foreach(_c IN LISTS _case_lines)
+  string(STRIP "${_c}" _c)
+  if(_c STREQUAL "" OR _c MATCHES "^#")
+    continue()
+  endif()
+  list(APPEND _cases "${_c}")
+  if(NOT EXISTS "${CASE_DIR}/${_c}.zan")
+    list(APPEND _missing_sources "${_c}")
+  endif()
+  if(NOT BLESS AND NOT EXISTS "${GOLDEN_DIR}/${_c}.hashes")
+    list(APPEND _missing_goldens "${_c}")
+  endif()
+endforeach()
+if(_missing_sources OR _missing_goldens)
+  set(_incomplete "IR golden preflight failed:")
+  if(_missing_sources)
+    list(JOIN _missing_sources ", " _names)
+    string(APPEND _incomplete "\nMissing case sources: ${_names}")
+  endif()
+  if(_missing_goldens)
+    list(JOIN _missing_goldens ", " _names)
+    string(APPEND _incomplete "\nMissing golden files: ${_names}")
+  endif()
+  message(FATAL_ERROR "${_incomplete}")
+endif()
+
 file(MAKE_DIRECTORY ${OUTDIR})
 
 # ---- build gen1 once -------------------------------------------------------
@@ -67,16 +94,6 @@ if(NOT SKIP_GEN1_BUILD)
     message(FATAL_ERROR "gen1 build failed (rc=${build_rc})\n${build_out}${build_err}")
   endif()
 endif()
-
-file(STRINGS ${CASES} _case_lines)
-set(_cases)
-foreach(_c IN LISTS _case_lines)
-  string(STRIP "${_c}" _c)
-  if(_c STREQUAL "" OR _c MATCHES "^#")
-    continue()
-  endif()
-  list(APPEND _cases "${_c}")
-endforeach()
 
 set(_failures 0)
 set(_blessed 0)
