@@ -7,6 +7,12 @@ namespace System.IO;
 // 目录操作。底层操作系统调用下沉至平台抽象层（Pal.FileSystem），
 // 统一提供跨平台 UTF-8 编码路径与强类型参数接口。
 public class Directory {
+    // Synchronize existing directory entries where supported (POSIX fsync).
+    // Unsupported platforms throw; file contents require File.FlushToDisk too.
+    public static void FlushToDisk(string path) {
+        Pal.FileSystem.FlushDirectoryToDisk(path);
+    }
+
     // 只读资源的落地位置：相对路径在当前工作目录下不存在时，运行时会
     // 依次回退到单文件包的解包目录（ZAN_PKG_DIR）与可执行文件所在目录，
     // 返回第一个真实存在的路径，都不存在（或本来就存在）时返回 ""。
@@ -236,6 +242,64 @@ public class Directory {
             }
         }
         return outp;
+    }
+
+    // 递归或非递归按模式列出目录中的文件（返回值均为完整路径，C# 口径）。
+    // recursive 为 true 时深入遍历全部子目录树。
+    public static List<string> GetFiles(string path, string searchPattern, bool recursive) {
+        if (!recursive) {
+            return Directory.GetFiles(path, searchPattern);
+        }
+        List<string> result = new List<string>();
+        Directory.CollectFilesRecursive(result, path, searchPattern);
+        return result;
+    }
+
+    private static void CollectFilesRecursive(List<string> outp, string path, string searchPattern) {
+        List<string> directFiles = Directory.GetFiles(path, searchPattern);
+        for (int i = 0; i < directFiles.Count; i = i + 1) {
+            outp.Add(directFiles[i]);
+        }
+        List<string> subDirs = Directory.GetDirectoryPaths(path);
+        for (int j = 0; j < subDirs.Count; j = j + 1) {
+            Directory.CollectFilesRecursive(outp, subDirs[j], searchPattern);
+        }
+    }
+
+    // 递归或非递归列出子目录完整路径（支持 searchPattern 模式匹配）。
+    // recursive 为 true 时深入遍历全部子目录树。
+    public static List<string> GetDirectories(string path, string searchPattern, bool recursive) {
+        if (!recursive) {
+            List<string> dirs = Directory.GetDirectoryPaths(path);
+            if (searchPattern == null || searchPattern.Length == 0) { return dirs; }
+            List<string> outp = new List<string>();
+            for (int i = 0; i < dirs.Count; i = i + 1) {
+                string d = dirs[i];
+                int at = Directory.AfterLastSeparator(d);
+                string name = d.Substring(at, d.Length - at);
+                if (Directory.NameMatch(searchPattern, 0, name, 0)) {
+                    outp.Add(d);
+                }
+            }
+            return outp;
+        }
+        List<string> result = new List<string>();
+        Directory.CollectDirectoriesRecursive(result, path, searchPattern);
+        return result;
+    }
+
+    private static void CollectDirectoriesRecursive(List<string> outp, string path, string searchPattern) {
+        List<string> subDirs = Directory.GetDirectoryPaths(path);
+        for (int j = 0; j < subDirs.Count; j = j + 1) {
+            string d = subDirs[j];
+            int at = Directory.AfterLastSeparator(d);
+            string name = d.Substring(at, d.Length - at);
+            bool match = searchPattern == null || searchPattern.Length == 0 || Directory.NameMatch(searchPattern, 0, name, 0);
+            if (match) {
+                outp.Add(d);
+            }
+            Directory.CollectDirectoriesRecursive(outp, d, searchPattern);
+        }
     }
 
     // 最后一个路径分隔符之后的索引，没有分隔符时为 0

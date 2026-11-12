@@ -28,9 +28,14 @@ public class Gate : IDisposable {
     // 挂起直到有人 Signal（暂存信号可立即消费）；门已 Close 时返回 false。
     public async bool Wait() {
         long h = 0;
-        lock (this) { h = this.handle; }
-        if (h == 0) { return false; }
-        await Gate.Park(h);
+        long ticket = 0;
+        lock (this) {
+            h = this.handle;
+            if (h == 0) { return false; }
+            ticket = Gate.zan_gate_prepare(h);
+        }
+        if (ticket == 0) { return false; }
+        await Gate.Park(h, ticket);
         return true;
     }
 
@@ -46,16 +51,15 @@ public class Gate : IDisposable {
             if (h == 0) { return false; }
             if (timeoutMs > 0) {
                 ticket = Gate.zan_gate_arm(h);
+            } else {
+                ticket = Gate.zan_gate_prepare(h);
             }
         }
-        if (timeoutMs <= 0) {
-            await Gate.Park(h);
-            return true;
-        }
         if (ticket == 0) { return false; }
-
-        Task.Spawn(Gate.Watchdog(h, ticket, timeoutMs));
-        await Gate.Park(h);
+        if (timeoutMs > 0) {
+            Task.Spawn(Gate.Watchdog(h, ticket, timeoutMs));
+        }
+        await Gate.Park(h, ticket);
         return true;
     }
 
@@ -114,6 +118,8 @@ public class Gate : IDisposable {
     public static extern long zan_gate_new();
     [DllImport("crt", EntryPoint = "zan_gate_arm")]
     public static extern long zan_gate_arm(long h);
+    [DllImport("crt", EntryPoint = "zan_gate_prepare")]
+    internal static extern long zan_gate_prepare(long h);
     [DllImport("crt", EntryPoint = "zan_gate_signal")]
     public static extern void zan_gate_signal(long h);
     [DllImport("crt", EntryPoint = "zan_gate_signal_all")]

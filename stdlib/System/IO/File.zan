@@ -21,6 +21,9 @@ public class File {
     internal static extern int fclose(nint fp);
 
     [DllImport("crt")]
+    internal static extern int ferror(nint fp);
+
+    [DllImport("crt")]
     internal static extern int fseek(nint fp, int offset, int origin);
 
     // 64 位文件位置：ftell 返回 long，避免 2GB 截断；
@@ -182,7 +185,11 @@ public class File {
                 throw new IOException("Could not write file: " + path);
             }
         }
-        fclose(fp);
+        // Small writes can stay buffered until close; fwrite success alone is
+        // insufficient to confirm that the complete file reached the OS.
+        if (fclose(fp) != 0) {
+            throw new IOException("Could not close written file: " + path);
+        }
     }
 
     // 异步写入文件内容（完全对齐 C# .NET 异步 TAP 契约）。
@@ -207,7 +214,9 @@ public class File {
                 throw new IOException("Could not append to file: " + path);
             }
         }
-        fclose(fp);
+        if (fclose(fp) != 0) {
+            throw new IOException("Could not close appended file: " + path);
+        }
     }
 
     // 异步追加文本（与 WriteAllTextAsync 同族的 TAP 契约：await 挂起
@@ -249,6 +258,13 @@ public class File {
     // false。进程退出时无需显式调用。
     public static bool Unlock(long handle) {
         return zan_file_unlock(handle) != 0;
+    }
+
+    // Flush OS-cached data for an existing regular file. Close/flush all writers
+    // first; Windows requires write access. This does not persist its directory
+    // entry or guarantee hardware behavior.
+    public static void FlushToDisk(string path) {
+        Pal.FileSystem.FlushFileToDisk(path);
     }
 
     // 设置或清除文件的可执行位（委托 PAL 平台实现）。
@@ -310,8 +326,15 @@ public class File {
                 throw new IOException("Could not write file: " + dest);
             }
         }
+        int readError = ferror(fpSrc);
         fclose(fpSrc);
-        fclose(fpDst);
+        int closeResult = fclose(fpDst);
+        if (readError != 0) {
+            throw new IOException("Could not read complete file: " + source);
+        }
+        if (closeResult != 0) {
+            throw new IOException("Could not close copied file: " + dest);
+        }
     }
 
     // 获取文件大小（字节）。
@@ -532,9 +555,12 @@ public class File {
             throw new IOException("Could not open file for writing: " + path);
         }
         long written = fwrite(data, 1, data.Length, fp);
-        fclose(fp);
+        int closeResult = fclose(fp);
         if (written != (long)data.Length) {
             throw new IOException("Could not write complete file: " + path);
+        }
+        if (closeResult != 0) {
+            throw new IOException("Could not close written file: " + path);
         }
     }
 
@@ -637,8 +663,8 @@ public class File {
         return Pal.FileSystem.CreateHardLink(link, target);
     }
 
-    // 当 path 是 reparse point（目录 junction、符号链接或 OneDrive 占位文件）时返回 true。
-    // 仅 Windows；其他平台返回 false。
+    // Windows 检查 reparse point（junction、符号链接或占位文件）；POSIX 检查符号链接，含悬空链接。
+    // 只查询最后一个路径分量；安全路径检查仍须逐级检查祖先，并控制并发目录修改。
     public static bool IsReparsePoint(string path) {
         return Pal.FileSystem.IsReparsePoint(path);
     }
