@@ -1,4 +1,4 @@
-import { examples, aiSteps, packages, guides, searchItems, downloadsUrl } from './content.js';
+import { examples, aiSteps, packages, guides, searchItems } from './content.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -152,7 +152,7 @@ function renderPackages(filter = packageState.filter, query = packageState.query
   if (!matches.length) {
     grid.innerHTML = `<div class="packages-empty"><strong>还没有这个关键词的包</strong><p>试试另一个场景，或清除筛选重新探索。</p><button type="button" data-clear-packages aria-controls="packages-grid">清除筛选</button></div>`;
   } else {
-    grid.innerHTML = visible.map((item) => `<a class="package-card" href="${downloadsUrl}" title="在发布页查找 ${escapeHtml(item.name)} 的可用版本" target="_blank" rel="noopener noreferrer">${icon(item.icon)}<h3>${escapeHtml(item.name)}${icon('diagonal')}</h3><p>${escapeHtml(item.description)}</p><div class="package-tags">${item.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join('')}${item.status && item.status !== '源码可用' ? `<span class="package-status">${escapeHtml(item.status)}</span>` : ''}</div></a>`).join('');
+    grid.innerHTML = visible.map((item) => `<a class="package-card" href="${escapeHtml(item.href)}">${icon(item.icon)}<h3>${escapeHtml(item.title)}${icon('arrow')}</h3><span class="package-name">${escapeHtml(item.name)}</span><p>${escapeHtml(item.description)}</p><div class="package-tags">${item.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join('')}${item.status && item.status !== '源码可用' ? `<span class="package-status">${escapeHtml(item.status)}</span>` : ''}</div><span class="package-read">查看能力、命名空间与许可 <span aria-hidden="true">→</span></span></a>`).join('');
   }
   const context = [filterLabel, normalized ? `搜索“${query.trim()}”` : ''].filter(Boolean).join(' · ');
   const count = visible.length < matches.length ? `精选 ${visible.length} / ${matches.length} 个扩展包` : `${matches.length} 个可探索的扩展包`;
@@ -332,22 +332,10 @@ function scrollToSection(id) {
 }
 
 function openGuide(id = 'overview') {
-  if (!guides[id]) id = 'overview';
-  const guide = guides[id];
-  const dialog = $('#guide-dialog');
-  const switchingChapter = dialog.open;
-  $('#guide-kicker').textContent = guide.kicker;
-  $('#guide-title').textContent = guide.title;
-  $('#guide-body').innerHTML = guide.body;
-  $('#guide-nav').innerHTML = Object.entries(guides).map(([key, item]) => `<button type="button" data-guide-nav="${escapeHtml(key)}" aria-current="${key === id ? 'page' : 'false'}">${escapeHtml(item.nav)}</button>`).join('');
-  $$('#guide-nav [data-guide-nav]').forEach((button) => button.addEventListener('click', () => openGuide(button.dataset.guideNav)));
-  openDialog(dialog, switchingChapter ? $('#guide-nav [aria-current="page"]') : $('.close-dialog', dialog));
-  dialog.scrollTop = 0;
-  $('.guide-content', dialog).scrollTop = 0;
+  window.location.href = (guides[id] || guides.overview).href;
 }
 
 function initGuides() {
-  initDialog($('#guide-dialog'));
   document.addEventListener('click', (event) => {
     const trigger = event.target.closest('[data-guide]');
     if (trigger) {
@@ -381,7 +369,7 @@ function selectSearchResult(index, scroll = true) {
 
 function renderSearchResults(query = '') {
   const normalized = query.trim().toLowerCase();
-  const results = searchItems.filter((item) => !normalized || `${item.title} ${item.description} ${item.kind}`.toLowerCase().includes(normalized)).slice(0, 8);
+  const results = searchItems.filter((item) => !normalized || `${item.title} ${item.description} ${item.keywords || ''} ${item.text || ''} ${item.kind}`.toLowerCase().includes(normalized)).slice(0, 8);
   const target = $('#search-results');
   target.innerHTML = results.length ? results.map((item, index) => `<div role="option" id="search-option-${index}" class="search-result" data-search-index="${index}" data-result-type="${escapeHtml(item.kind.toLowerCase())}" data-result-id="${escapeHtml(item.guide || item.package || item.section || '')}" aria-selected="false">${icon(item.icon)}<span><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.description)}</small></span><b>${escapeHtml(item.kind)}</b></div>`).join('') : '<div class="search-empty" role="status">没有匹配结果。试试 “ARC”、 “GUI” 或 “Zan.Net”。</div>';
   $$('.search-result', target).forEach((result) => {
@@ -415,10 +403,24 @@ function initSearch() {
   input.setAttribute('aria-expanded', 'false');
   $('#search-results').setAttribute('role', 'listbox');
   $('#search-results').setAttribute('aria-label', '站点搜索结果');
+  let documentSearch;
   $('.search-trigger').addEventListener('click', () => {
     openDialog(dialog, input);
     input.value = '';
     renderSearchResults();
+    documentSearch ||= fetch(new URL('../docs/search.json', import.meta.url)).then(response => {
+      if (!response.ok) throw new Error(`Documentation search: ${response.status}`);
+      return response.json();
+    }).then(records => {
+      for (const record of records) {
+        const item = searchItems.find(item => item.guide === record.id);
+        if (item) item.text = record.text;
+      }
+      if (dialog.open) renderSearchResults(input.value);
+    }).catch(error => {
+      console.warn(error);
+      documentSearch = null;
+    });
   });
   input.addEventListener('input', () => renderSearchResults(input.value));
   input.addEventListener('keydown', (event) => {

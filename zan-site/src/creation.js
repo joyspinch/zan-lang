@@ -50,7 +50,7 @@ export function mountCreationDemo(root = document.getElementById('creation-demo'
       </header>
 
       <label class="creation-scenario-picker"><span>试个想法</span>
-        <select class="creation-select creation-scenario" aria-label="选择创作场景">
+        <select class="zan-select creation-select creation-scenario" aria-label="选择创作场景">
           ${Object.entries(creationScenarios).map(([key, scenario]) => `<option value="${key}">${scenario.label}</option>`).join('')}
         </select>
       </label>
@@ -106,7 +106,7 @@ export function mountCreationDemo(root = document.getElementById('creation-demo'
             <div class="creation-app-body" data-creation-preview="csv" hidden>
               <h3>换组数据，看看汇总。</h3>
               <label class="creation-sample-picker"><span>样例</span>
-                <select class="creation-select creation-sample" aria-label="选择 CSV 样例数据">
+                <select class="zan-select creation-select creation-sample" aria-label="选择 CSV 样例数据">
                   ${Object.entries(creationSamples).map(([key, sample]) => `<option value="${key}">${sample.label}</option>`).join('')}
                 </select>
               </label>
@@ -127,7 +127,7 @@ export function mountCreationDemo(root = document.getElementById('creation-demo'
       </div>
 
       <footer class="creation-footer">
-        <a class="creation-start" href="#ai-start">用这个项目开始 ${creationArrow}</a>
+        <a class="creation-start" href="#project-builder">用这个项目开始 ${creationArrow}</a>
         <p class="creation-disclaimer" id="creation-disclaimer">交互示意 · 非在线编译 · 不保存</p>
       </footer>
     </section>`;

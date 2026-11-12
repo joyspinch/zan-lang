@@ -1,4 +1,5 @@
 import { copyFile, lstat, mkdir, readdir } from 'node:fs/promises';
+import { generateDocs } from './generate-docs.mjs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -32,4 +33,15 @@ async function copyKnown(source, target) {
 await ensureDirectory(resolve(output, '..'));
 await ensureDirectory(output);
 for (const entry of entries) await copyKnown(join(root, entry), join(output, entry));
-console.log(`Built Zan site to ${output}`);
+// The repository VI is the only source for published brand artwork.
+const brandAssets = [
+  ['logo/zan-mark.svg', 'mark.svg'],
+  ['logo/zan-wordmark-white.svg', 'wordmark.svg'],
+  ['mascot/zanzi-hero.png', 'zanzi-hero.png'],
+  ['banner/zan-banner.png', 'social.png'],
+];
+for (const [source, target] of brandAssets) {
+  await copyKnown(resolve(root, '../assets/brand', source), join(output, 'assets', target));
+}
+const result = await generateDocs(root, output);
+console.log(`Built Zan site to ${output}: ${result.documents} document pages, ${result.packages} packages, Markdown and llms-full.txt`);

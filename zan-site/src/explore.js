@@ -1,6 +1,6 @@
-import { audiences, setupCommand, editorConfigs, projectPrompt } from './onboarding.js';
+import { audiences, setupCommand, projectPrompt } from './onboarding.js';
 import { ecosystemGroups, standardLibrary } from './ecosystem.js';
-import { guides, searchItems, downloadsUrl } from './content.js';
+import { searchItems, downloadsUrl } from './content.js';
 import { differences, platforms } from './capabilities.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -117,7 +117,7 @@ function initPlatforms() {
     linux: 'ARM64 有 QEMU 探针记录，尚非 ARM 硬件 GUI 验收。',
     macos: '完整 GUI 待真实 Mac 验收，签名、公证与 SDK 交付链待补齐。',
     android: '已验证 x64 模拟器；ARM 手机待实测，正式发布需正式签名。',
-    ios: '无 iPhone / iPad 验收记录，GUI 支持未完整，IPA 封装不等于可安装发布。',
+    ios: '已有 UIKit GUI 实现；设备验收、安装授权与正式签名仍需核对。',
     openharmony: 'ARM 硬件待验收；HAP 需外部宿主工程。',
     wasi: '当前单线程，网络能力不完整；正式发布需自行整合宿主。',
   };
@@ -148,9 +148,6 @@ function initEcosystem() {
 }
 
 function enhanceGuides() {
-  guides.ai.body = `<p>以 Windows SDK 根目录 <code>D:\\Zan</code>、项目目录 <code>D:\\work\\hello-zan</code> 为例。请替换成实际路径。</p><h3>初始化 AI 接入</h3><pre><code>${escape(setupCommand)}</code></pre><p>初始化器安装项目约定、技能和客户端配置，默认跳过已有文件。已有 MCP 配置时，手动合并下面的 zan 节点。此步骤不会生成应用源码。</p>${Object.values(editorConfigs).map((item) => `<h3>${item.title} · ${item.file}</h3><pre><code>${escape(JSON.stringify(item.config, null, 2))}</code></pre>`).join('')}<h3>确认已连接</h3><p>用编辑器打开项目，启用该 MCP 服务，让 AI 先调用 <code>zan_start_here</code>。正常情况下由客户端启动 stdio 子进程，无需另开一个常驻终端。</p><h3>第一个请求</h3><p>让 AI 先读规则与示例、查询 API，再实现一个小功能，最后编译整个项目并运行。若项目入口不在默认路径，显式传入入口。编译通过之后仍需验证实际行为。</p><p>${downloadLink('获取 IDE / SDK')} · <a href="./agent-guide.md" target="_blank">机器可读指南 ↗</a></p>`;
-  guides.platforms.body = `<p>各目标的编译、实机证据与 GUI 能力分开列出。原生目标不代表所有包、驱动和系统 API 都已支持。</p>${platforms.map((item) => `<h3>${item.title} · ${item.status}</h3><p><strong>${item.arch}</strong></p><ul><li>编译：${item.compile}</li><li>运行：${item.run}</li><li>GUI：${item.gui}</li><li>交付：${item.ship}</li><li>限制：${item.limit}</li></ul>`).join('')}<p>${downloadLink('查看各版本的平台与下载说明')}</p>`;
-  guides.quickstart.body = `<p>从 ${downloadLink('官方发布仓库')} 获取 IDE / SDK 与相关包。初次使用可以让 AI 引导准备，或从 ZanIDE 的“新建项目”选择模板。</p><h3>下载、解压、打开</h3><ol><li>在仓库页面点击 <strong>Code → Download ZIP</strong>，下载当前 Windows SDK。</li><li>完整解压，保留 <code>toolchain</code>、<code>stdlib</code> 和随附 DLL。</li><li>双击 <code>ZanIDE.exe</code>，从“新建项目”开始。</li></ol><p>日常使用无需单独安装 LLVM / clang，也无需构建编译器。其他系统和额外包以仓库发布说明为准。</p><h3>手动使用编译器</h3><p>Windows SDK 的编译器位于 <code>toolchain/zanc.exe</code>。以下命令供希望手动编译的开发者使用。</p><h3>创建 hello.zan</h3><pre><code>using System;\nclass Program {\n    static void Main() {\n        Console.WriteLine("Hello, Zan!");\n    }\n}</code></pre><h3>Windows PowerShell</h3><p>在保存了 hello.zan 的目录运行，SDK 路径按实际位置替换：</p><pre><code>&amp; "D:\\Zan\\toolchain\\zanc.exe" .\\hello.zan -o .\\hello.exe\nif ($LASTEXITCODE -eq 0) { .\\hello.exe }</code></pre><h3>Linux CLI（工具链已就绪）</h3><pre><code>zanc hello.zan -o hello\n./hello</code></pre><h3>发布构建</h3><p>加上 <code>--publish</code> 可使用发布优化与符号裁剪。目标平台的原生依赖仍需要匹配。</p><p>更多参数、模板与 API 说明请查阅下载包随附文档或 ZanIDE。${downloadLink('查看版本说明与相关包')}</p>`;
   searchItems.push(...[
     ['为什么选择 Zan', '开发者、新手、AI 智能体的三条入门路径', 'why-zan', 'spark'],
     ['用 AI 开始', '复制一句话，让 AI 引导下载 IDE、准备环境并做出作品', 'ai-start', 'spark'],

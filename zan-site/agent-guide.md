@@ -2,11 +2,38 @@
 
 Zan is an independent language with C#-style syntax, LLVM AOT compilation, and ARC. It is not a .NET runtime and does not directly consume NuGet assemblies. This document describes a local SDK workflow; the showcase website does not compile code or connect to a user's MCP server.
 
+Reviewed against repository sources: **2026-11-11**. Installed SDKs may lag behind the repository. This page is also included in the generated full-text bundle.
+
+## Read the language before generating code
+
+- [Documentation index](./docs/index.md) and [llms.txt](./llms.txt) list the recommended reading order.
+- [Full text](./llms-full.txt) contains every chapter and the complete current package catalog. Read individual chapters when the context window is limited.
+- Start with [overview](./docs/overview.md), [syntax](./docs/language.md) and [types](./docs/types.md), then [memory](./docs/memory.md), [async](./docs/async.md) and [interop](./docs/interop.md).
+- For implementation, consult [libraries](./docs/libraries.md), [package metadata](./docs/packages.json), [tooling](./docs/tooling.md) and [platform boundaries](./docs/platforms.md).
+- [Document manifest](./docs/manifest.json) provides URLs, provenance and Markdown content hashes. The HTML pages contain full text without requiring JavaScript.
+
+These files provide retrievable context; publishing them does not automatically train an AI model or make every client read them.
+
+## Essential differences from C# and .NET
+
+| Topic | Zan behavior to account for |
+| --- | --- |
+| Runtime | Native AOT plus a Zan runtime, not CLR or JVM. Native libraries and system dependencies still vary by application. |
+| Memory | ARC releases objects when strong references reach zero. Strong cycles require ownership design or weak references. User destructors are rejected; resources use explicit Close/Dispose or supported using scopes. |
+| Strings | Immutable UTF-8; Length and indexing operate on bytes, not C# UTF-16 character positions. Use encoding APIs for code points. |
+| Collections | Assignment aliases the same array/list/dictionary storage. It does not provide copy-on-write isolation. |
+| Types | Classes and structs differ in identity and copy semantics. Do not infer all boxing, generic constraints or nullable behavior from C#. Read the current type reference. |
+| Async | Direct async calls and Task.Run/Task.Spawn have distinct result and scheduling contracts. Await is also supported in certain synchronous contexts; genuinely suspending I/O primitives have stricter requirements. |
+| I/O | An Async suffix is not evidence of nonblocking kernel I/O. Some file helpers yield and then invoke synchronous disk operations. |
+| Libraries | Compiler builtins, core standard library and extension packages are separate layers. A System.* namespace can come from a package. Do not invent a NuGet dependency or infer a namespace from a directory. |
+| GUI | HTML/CSS is a supported GUI markup subset projected into Zan controls. It is not a complete browser DOM/CSS engine. |
+| License | The root toolchain uses ZCSL with a runtime/output exception. Package metadata declares individual licenses; do not describe the whole language as MIT. |
+
 ## Get the IDE and packages
 
 The official distribution repository is https://github.com/joyspinch/zanlang. It contains the packaged Windows SDK, including `ZanIDE.exe`, compiler, DLLs and standard library. Its documented download path is GitHub's **Code → Download ZIP**; extract the whole archive and open `ZanIDE.exe`. Keep `toolchain/`, `stdlib/` and the bundled DLLs together. Ordinary use does not require installing LLVM / clang separately or building the compiler.
 
-Read https://github.com/joyspinch/zanlang/blob/main/AI_README.md and the repository's current README before setup. At the time of this website update, the Releases list is empty, so do not send the user there as the only download route or invent release asset filenames. Runtime/sysroot directories for other targets do not establish the availability of native IDE downloads for those systems. Additional packages and platform downloads depend on what the distribution repository actually provides.
+Read https://github.com/joyspinch/zanlang/blob/main/AI_README.md and the repository's current README before setup. Check its current files and download instructions; do not assume a Releases asset exists or invent filenames. Runtime/sysroot directories for other targets do not establish the availability of native IDE downloads for those systems. Additional packages and platform downloads depend on what the distribution repository actually provides.
 
 For a beginner, inspect their operating system and existing tools, then guide one setup step at a time in plain language. Prefer the packaged SDK and its documentation; the user does not need to browse the language's source repository or build the compiler. If the available SDK does not match the user's system, explain what is missing before proceeding.
 
@@ -34,7 +61,7 @@ This command does not create application source, compile the project, or install
 1. Call `zan_start_here` when MCP is available. Verify the project root and actual entry point.
 2. Use `zan_example` to inspect an appropriate example, and `zan_api_search` / `zan_lookup_symbol` / `zan_list_members` to obtain real API signatures. Read focused source through `zan_read_context` when needed.
 3. Implement one small, testable application behavior using existing packages and components.
-4. Compile the whole project using `zan_build_project`, explicitly supplying a nondefault entry. `zan_compile` is useful for snippets. Read `ok`, `exitCode`, `diagnostics`, and raw output rather than assuming success.
+4. Compile all project sources using the project's actual build command. The current `zan_build_project` tool passes a single entry file to zanc; it does not enumerate sibling application files. For multi-file projects, use the project's build command or explicitly enumerate the source inputs. `zan_compile` is useful for snippets. Read `ok`, `exitCode`, `diagnostics`, and raw output rather than assuming success.
 5. Run the affected program and verify the requested behavior. Compiler success is not a runtime test. For a GUI, inspect the actual window and interaction.
 6. Report changed files, commands executed, observed results, and remaining limitations. Never report an unexecuted check as passing.
 

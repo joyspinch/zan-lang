@@ -56,5 +56,6 @@ const projects = {
 
 export function projectPrompt(key = 'todo', custom = '') {
   const idea = custom.trim().replace(/\s+/g, ' ') || projects[key] || projects.todo;
-  return `我不懂编程，请用 Zan 帮我做：${idea}。请先读官方入门说明 ${distributionRepo}/blob/main/AI_README.md ，从该发布仓库获取适合我电脑的 IDE 和相关包，用白话引导我准备环境，做出可以运行的版本，实际验证后告诉我怎么打开。`;
+  const siteContext = typeof window === 'undefined' ? '' : `请先读取官网的语言文档索引 ${new URL('llms.txt', window.location.href).href} 和按需的完整资料 ${new URL('llms-full.txt', window.location.href).href}；若无法访问官网地址，请使用本地 SDK 文档。`;
+  return `我不懂编程，请用 Zan 帮我做：${idea}。${siteContext}再读官方安装说明 ${distributionRepo}/blob/main/AI_README.md ，从该发布仓库获取适合我电脑的 IDE 和相关包，查询真实 Zan API，不把 C# / .NET 接口直接当作 Zan 接口。用白话引导我准备环境，做出可以运行的版本，实际验证后告诉我怎么打开。`;
 }
