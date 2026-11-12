@@ -19,11 +19,11 @@ namespace System.Data.Orm;
 public class ExprSql {
     // 将常量节点渲染为文本（用于组装 LIKE 模式）。
     public static string EvalText(ExprNode n) {
-        if (n == null) { return ""; }
+        if (n == null) { throw new NotSupportedException("SQL expression requires a constant value"); }
         if (n.Kind == 1 && n.TVal == 2) { return n.SVal; }
         if (n.Kind == 1 && n.TVal == 0) { return Convert.ToString(n.IVal); }
         if (n.Kind == 1 && n.TVal == 5) { return Convert.ToString(n.LVal); }
-        return "";
+        throw new NotSupportedException("SQL LIKE requires a text or integer constant");
     }
 
     // n 是否 null 常量节点（TVal 4）。等值比较撞上它必须译
@@ -70,17 +70,56 @@ public class ExprSql {
         return true;
     }
 
+    // Validate before binding: rejected subtrees must not leave stray parameters.
+    public static void Validate(ExprNode n) {
+        if (n == null) { throw new NotSupportedException("SQL expression is missing a node"); }
+        if (n.Kind == 0) {
+            if (n.Name == null || n.Name.Length == 0 || n.Name.Length > 128) {
+                throw new NotSupportedException("Invalid SQL member name");
+            }
+            for (int i = 0; i < n.Name.Length; i = i + 1) {
+                if (n.Name[i] < 32) { throw new NotSupportedException("Invalid SQL member name"); }
+            }
+            return;
+        }
+        if (n.Kind == 1) {
+            if (n.TVal < 0 || n.TVal > 5) { throw new NotSupportedException("Unsupported SQL constant type"); }
+            return;
+        }
+        if (n.Kind == 4 || n.Kind == 5) { Validate(n.A); return; }
+        if (n.Kind == 2) {
+            string op = n.Name;
+            if (op != "==" && op != "!=" && op != "<" && op != ">" &&
+                op != "<=" && op != ">=" && op != "+" && op != "-" &&
+                op != "*" && op != "/" && op != "%" && op != "&&" && op != "||") {
+                throw new NotSupportedException("Unsupported SQL operator: " + op);
+            }
+            Validate(n.A); Validate(n.B); return;
+        }
+        if (n.Kind == 3 && (n.Name == "StartsWith" || n.Name == "EndsWith" || n.Name == "Contains")) {
+            Validate(n.A);
+            string text = EvalText(n.B);
+            return;
+        }
+        throw new NotSupportedException("Unsupported SQL expression: " + n.Name);
+    }
+
     // 为以 n 为根的树构建 WHERE 片段。
     public static void Build(ExprNode n, StringBuilder sb, DbParams ps) {
-        if (n == null) { return; }
+        Validate(n);
+        Render(n, sb, ps);
+    }
+
+    static void Render(ExprNode n, StringBuilder sb, DbParams ps) {
         if (n.Kind == 4) {
-            Build(n.A, sb, ps);
+            Render(n.A, sb, ps);
         } else if (n.Kind == 0) {
             sb.Append("t.");
             if (IsSafeIdent(n.Name)) {
                 sb.Append(n.Name);
             } else {
-                sb.Append(Dialect.QuoteIdentifier(0, n.Name));
+                // A member is one column, never a prequoted fragment or qualified path.
+                sb.Append("\"" + n.Name.Replace("\"", "\"\"") + "\"");
             }
         } else if (n.Kind == 1) {
             if (n.TVal == 2) {
@@ -107,48 +146,48 @@ public class ExprSql {
                     sb.Append(n.Name == "==" ? "1=1" : "1=0");
                 } else if (la || lb) {
                     sb.Append("(");
-                    Build(la ? n.B : n.A, sb, ps);
+                    Render(la ? n.B : n.A, sb, ps);
                     sb.Append(" IS ");
                     if (n.Name == "!=") { sb.Append("NOT "); }
                     sb.Append("NULL)");
                 } else {
                     sb.Append("(");
-                    Build(n.A, sb, ps);
+                    Render(n.A, sb, ps);
                     sb.Append(" ");
                     sb.Append(SqlOp(n.Name));
                     sb.Append(" ");
-                    Build(n.B, sb, ps);
+                    Render(n.B, sb, ps);
                     sb.Append(")");
                 }
             } else if (n.Name == "&&") {
                 sb.Append("(");
-                Build(n.A, sb, ps);
+                Render(n.A, sb, ps);
                 sb.Append(" AND ");
-                Build(n.B, sb, ps);
+                Render(n.B, sb, ps);
                 sb.Append(")");
             } else if (n.Name == "||") {
                 sb.Append("(");
-                Build(n.A, sb, ps);
+                Render(n.A, sb, ps);
                 sb.Append(" OR ");
-                Build(n.B, sb, ps);
+                Render(n.B, sb, ps);
                 sb.Append(")");
             } else {
                 sb.Append("(");
-                Build(n.A, sb, ps);
+                Render(n.A, sb, ps);
                 sb.Append(" ");
                 sb.Append(SqlOp(n.Name));
                 sb.Append(" ");
-                Build(n.B, sb, ps);
+                Render(n.B, sb, ps);
                 sb.Append(")");
             }
         } else if (n.Kind == 5) {
             sb.Append("NOT (");
-            Build(n.A, sb, ps);
+            Render(n.A, sb, ps);
             sb.Append(")");
         } else if (n.Kind == 3) {
             if (n.Name == "StartsWith" || n.Name == "EndsWith" ||
                 n.Name == "Contains") {
-                Build(n.A, sb, ps);
+                Render(n.A, sb, ps);
                 // ESCAPE '\'（B-ID65）：用户文本经 EscapeLike 原义化，
                 // 通配语义只留给这里补的 %。
                 sb.Append(" LIKE ? ESCAPE '\\'");
@@ -162,10 +201,10 @@ public class ExprSql {
                 }
                 ps.Add(pat);
             } else {
-                sb.Append("1=1");
+                throw new NotSupportedException("Unsupported SQL expression: " + n.Name);
             }
         } else {
-            sb.Append("1=1");
+            throw new NotSupportedException("Unsupported SQL expression: " + n.Name);
         }
     }
 }

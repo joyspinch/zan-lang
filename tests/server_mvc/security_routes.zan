@@ -12,6 +12,86 @@ class ApiProbe : ApiController {
     void Broken() { this.ServerError(""); }
 }
 
+/* 授权声明覆盖矩阵：路由标志是 HTTP 门、菜单与文档共同使用的安全契约。 */
+[Route("/authorization/public")]
+[Custom(Authorization = CustomAuthorization.None)]
+class PublicDefaultController : Controller {
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Login, IsMenu = true)]
+    public void Index() { this.Ctx().Text("login"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.ApiAuth, IsMenu = true)]
+    public void Api() { this.Ctx().Text("api"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Grant, IsMenu = true)]
+    public void Granted() { this.Ctx().Text("grant"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Auth, IsMenu = true)]
+    public void Optional() { this.Ctx().Text("optional"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Unknown, IsMenu = true)]
+    public void Unknown() { this.Ctx().Text("unknown"); }
+    [HttpGet]
+    [Custom(IsMenu = true)]
+    public void Inherit() { this.Ctx().Text("public"); }
+}
+
+[Route("/authorization/grant")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+class GrantDefaultController : Controller {
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Login, IsMenu = true)]
+    public void Index() { this.Ctx().Text("login"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.None, IsMenu = true)]
+    public void Public() { this.Ctx().Text("public"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Auth, IsMenu = true)]
+    public void Optional() { this.Ctx().Text("optional"); }
+    [HttpGet]
+    [Custom(IsMenu = true)]
+    public void Inherit() { this.Ctx().Text("grant"); }
+}
+
+[Route("/authorization/login")]
+[Custom(Authorization = CustomAuthorization.Login)]
+class LoginDefaultController : Controller {
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.None)]
+    public void Public() { this.Ctx().Text("public"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.ApiAuth)]
+    public void Api() { this.Ctx().Text("api"); }
+    [HttpGet]
+    [Custom(IsMenu = true)]
+    public void Inherit() { this.Ctx().Text("login"); }
+}
+
+[Route("/authorization/optional")]
+[Custom(Authorization = CustomAuthorization.Auth)]
+class OptionalDefaultController : Controller {
+    [HttpGet]
+    public void Index() { this.Ctx().Text("optional"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    public void Protected() { this.Ctx().Text("login"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.ApiAuth)]
+    public void Api() { this.Ctx().Text("api"); }
+}
+
+[Route("/authorization/default")]
+class UndeclaredDefaultController : Controller {
+    [HttpGet]
+    public void Index() { this.Ctx().Text("default login"); }
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.None)]
+    public void Public() { this.Ctx().Text("public"); }
+    [HttpGet]
+    [Description("Authorization=NoneX")]
+    public void UnrelatedText() { this.Ctx().Text("default login"); }
+}
+
 class ProbeConnection : IDbConnection {
     bool live = true;
     DbResult Query(string sql) { throw new Exception("SECRET: db credentials"); }
@@ -78,6 +158,71 @@ class Program {
         await c.AfterAsync();
     }
 
+    static void Flags(WebApp app, string path, bool login, bool auth) {
+        HttpContext ctx = Program.Ctx(path, "");
+        Route route = app.Router().Match(ctx);
+        Program.Check(route != null, "authorization route exists " + path);
+        if (route != null) {
+            Program.Check(route.NeedsLogin() == login && route.NeedsAuth() == auth,
+                "authorization flags " + path);
+        }
+    }
+
+    static bool MenuHas(List<MenuNode> nodes, string path) {
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            if (nodes[i].Path() == path) { return true; }
+        }
+        return false;
+    }
+
+    static async bool Deny(string uid, string action) { return false; }
+
+    static async void AuthorizationOverrides(WebApp app) {
+        Program.Flags(app, "/authorization/public", true, false);
+        Program.Flags(app, "/authorization/public/index", true, false);
+        Program.Flags(app, "/authorization/public/api", true, true);
+        Program.Flags(app, "/authorization/public/granted", true, true);
+        Program.Flags(app, "/authorization/public/optional", false, false);
+        Program.Flags(app, "/authorization/public/unknown", true, false);
+        Program.Flags(app, "/authorization/public/inherit", false, false);
+        Program.Flags(app, "/authorization/grant", true, false);
+        Program.Flags(app, "/authorization/grant/index", true, false);
+        Program.Flags(app, "/authorization/grant/public", false, false);
+        Program.Flags(app, "/authorization/grant/optional", false, false);
+        Program.Flags(app, "/authorization/grant/inherit", true, true);
+        Program.Flags(app, "/authorization/login/public", false, false);
+        Program.Flags(app, "/authorization/login/api", true, true);
+        Program.Flags(app, "/authorization/login/inherit", true, false);
+        Program.Flags(app, "/authorization/optional", false, false);
+        Program.Flags(app, "/authorization/optional/index", false, false);
+        Program.Flags(app, "/authorization/optional/protected", true, false);
+        Program.Flags(app, "/authorization/optional/api", true, true);
+        Program.Flags(app, "/authorization/default", true, false);
+        Program.Flags(app, "/authorization/default/index", true, false);
+        Program.Flags(app, "/authorization/default/public", false, false);
+        Program.Flags(app, "/authorization/default/unrelatedtext", true, false);
+
+        app.PermissionResolver(Program.Deny);
+        List<MenuNode> anonymous = await MenuBuilder.ForUser(app, "", "");
+        Program.Check(!Program.MenuHas(anonymous, "/authorization/public")
+            && !Program.MenuHas(anonymous, "/authorization/public/api")
+            && !Program.MenuHas(anonymous, "/authorization/public/granted")
+            && !Program.MenuHas(anonymous, "/authorization/public/unknown"),
+            "class None cannot expose protected action menus to anonymous users");
+        Program.Check(Program.MenuHas(anonymous, "/authorization/public/inherit")
+            && Program.MenuHas(anonymous, "/authorization/public/optional")
+            && Program.MenuHas(anonymous, "/authorization/grant/public")
+            && Program.MenuHas(anonymous, "/authorization/grant/optional"),
+            "explicit public and optional actions stay available anonymously");
+        List<MenuNode> denied = await MenuBuilder.ForUser(app, "42", "");
+        Program.Check(Program.MenuHas(denied, "/authorization/public")
+            && Program.MenuHas(denied, "/authorization/grant")
+            && !Program.MenuHas(denied, "/authorization/public/api")
+            && !Program.MenuHas(denied, "/authorization/public/granted")
+            && !Program.MenuHas(denied, "/authorization/grant/inherit"),
+            "Login overrides require identity without grant while protected actions remain denied");
+    }
+
     static async void Main() {
         string trace = "tr-\"quoted\\path";
         string header = "X-Request-Id: " + trace + "\r\n";
@@ -142,6 +287,7 @@ class Program {
         WebApp app = new WebApp("127.0.0.1", 0);
         __AttrRoutes.RegisterFramework(app);
         __AttrRoutes.Register(app);
+        await Program.AuthorizationOverrides(app);
         List<Route> routes = app.Router().All();
         bool hasSum = false;
         bool hasDisable = false;
@@ -152,7 +298,7 @@ class Program {
             Route r = routes[i];
             if (r.Pattern() == "/admin/dev/txprobe/sum") { hasSum = true; }
             if (r.Pattern() == "/admin/dev/txprobe/disable"
-                || r.Action() == "TxProbe.Disable") { hasDisable = true; }
+                || r.Action() == typeof(Zan.Web.Admin.Dev.TxProbeController).FullName + ".Disable") { hasDisable = true; }
             if (r.Pattern() == "/admin/monitor/data" && r.InMenu()) { bareDataMenu = true; }
             if (r.Pattern() == "/admin/monitor/sql/detail") {
                 hasSqlDetail = true;

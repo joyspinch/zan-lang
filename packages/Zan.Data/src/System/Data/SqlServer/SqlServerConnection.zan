@@ -40,25 +40,25 @@ public class SqlServerConnection : IDbConnection {
     public bool inTxn;
 
     async bool AcquireLock() {
-        if (!this.busy) {
-            this.busy = true;
-            return true;
+        AsyncGate g = null;
+        lock (this) {
+            if (!this.busy) { this.busy = true; return true; }
+            g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+            this.waiters.Add(g);
         }
-        AsyncGate g = new AsyncGate();
-        if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
-        this.waiters.Add(g);
         await g.Wait();
         g.Close();
         return true;
     }
 
     void ReleaseLock() {
-        if (this.waiters != null && this.waiters.Count > 0) {
-            AsyncGate g = this.waiters[0];
-            this.waiters.RemoveAt(0);
-            g.Signal();
-        } else {
-            this.busy = false;
+        lock (this) {
+            if (this.waiters != null && this.waiters.Count > 0) {
+                AsyncGate g = this.waiters[0];
+                this.waiters.RemoveAt(0);
+                g.Signal();
+            } else { this.busy = false; }
         }
     }
 
@@ -400,6 +400,7 @@ public class SqlServerConnection : IDbConnection {
             if (!this.connected) {
                 payload.Release();
                 this.lastError = "not connected";
+                this.fail();
                 return new TdsResponse();
             }
             this.packetId = 1;
@@ -407,11 +408,13 @@ public class SqlServerConnection : IDbConnection {
             payload.Release();
             if (!sent) {
                 this.connected = false;
+                this.fail();
                 return new TdsResponse();
             }
             TdsBytes body = await this.recvMessage();
             if (body == null) {
                 this.connected = false;
+                this.fail();
                 return new TdsResponse();
             }
             TdsResponse resp = TdsMessage.Decode(body);
@@ -420,6 +423,7 @@ public class SqlServerConnection : IDbConnection {
             if (resp.Failed()) {
                 this.lastError = resp.Error();
                 this.lastNumber = resp.ErrorNumber();
+                this.fail();
             }
             return resp;
         } finally {
@@ -599,12 +603,13 @@ public class SqlServerConnection : IDbConnection {
     // 调用方）再关套接字。安全唤醒所有门控等待者。
     public void Close() {
         this.connected = false;
-        while (this.waiters != null && this.waiters.Count > 0) {
-            AsyncGate g = this.waiters[0];
-            this.waiters.RemoveAt(0);
-            g.Signal();
+        lock (this) {
+            while (this.waiters != null && this.waiters.Count > 0) {
+                AsyncGate g = this.waiters[0];
+                this.waiters.RemoveAt(0);
+                g.Signal();
+            }
         }
-        this.busy = false;
         if (this.tls != null) {
             this.tls.Close();
             this.tls = null;

@@ -609,6 +609,10 @@ public static void CleanTargetFiles(string target, long maxSegId) {
 // 最后执行独立恢复巡检校验；目标存在则清理覆盖。
 // 失败抛出明确异常并清理半成品，不毒化当前运行中句柄。
 public void Backup(string targetPath) {
+    this.BackupWithPersistence(targetPath, new BackupPersistence());
+}
+
+internal void BackupWithPersistence(string targetPath, BackupPersistence persistence) {
     if (this.closed || !this.IsOpen()) {
         throw new InvalidOperationException("cannot backup closed store: " + this.GetError());
     }
@@ -633,6 +637,9 @@ public void Backup(string targetPath) {
     if (!this.IsOpen()) {
         throw new IOException("flush before backup failed: " + this.GetError());
     }
+    if (this.log.Size() != 0L || this.log.PendingBytes() != 0) {
+        throw new IOException("backup checkpoint left a nonempty WAL");
+    }
 
     // 2. 截取不可变快照状态：段清单、日志水位、段游标。
     List<long> snapIds = this.SegIdList();
@@ -643,22 +650,21 @@ public void Backup(string targetPath) {
     ZanStore.CleanTargetFiles(target, snapNextId);
 
     try {
-        // 4. 逐段物理拷贝（段文件格式是不可变分块+CRC，零撕裂）。
+        // 4. 逐段复制并同步；CRC 巡检验证本次导出内容。
         for (int i = 0; i < snapIds.Count; i = i + 1) {
             string srcSeg = ZanStore.SegPath(this.basePath, snapIds[i]);
             string dstSeg = ZanStore.SegPath(target, snapIds[i]);
             if (!File.Exists(srcSeg)) {
                 throw new FileNotFoundException("source segment missing: " + srcSeg);
             }
-            File.Copy(srcSeg, dstSeg);
+            persistence.Copy(srcSeg, dstSeg);
         }
 
-        // 5. 日志文件拷贝（若源日志存在则拷贝，否则创建空日志）。
-        if (File.Exists(this.basePath)) {
-            File.Copy(this.basePath, target);
-        } else {
-            File.WriteAllText(target, "");
-        }
+        // Checkpoint covered all committed frames. Keep the source WAL lock held;
+        // a second Windows handle cannot read through its compatibility byte lock.
+        File.WriteAllText(target, "");
+        persistence.SyncFile(target);
+        persistence.SyncParents(targetDir == "" ? "." : targetDir, "backup-files");
 
         // 6. 构造目标双槽清单（双槽写入相同代数与有效 CRC，保证高冗余度）。
         Manifest targetMan = new Manifest();
@@ -670,9 +676,7 @@ public void Backup(string targetPath) {
             throw new IOException("failed to write target manifest slot 1: " + targetMan.GetError());
         }
         string syncDir = targetDir == "" ? "." : targetDir;
-        if (!PageFile.DirSync(syncDir)) {
-            throw new IOException("failed to sync target directory");
-        }
+        persistence.SyncParents(syncDir, "backup-manifests");
 
         // 7. 恢复巡检校验（对位 SQLite backup 校验契约）：
         // 独立以 DUR_SYNC 方式重开备份库，执行全段 CRC 扫描、索引指向、WAL 与双槽完整性巡检。
@@ -682,8 +686,12 @@ public void Backup(string targetPath) {
             probe.Close();
             throw new IOException("backup verification open failed: " + openErr);
         }
-        List<string> problems = probe.IntegrityCheck();
-        probe.Close();
+        List<string> problems = null;
+        try { problems = probe.IntegrityCheck(); }
+        finally { probe.Close(); }
+        if (probe.GetError() != "") {
+            throw new IOException("backup verification close failed: " + probe.GetError());
+        }
         if (problems.Count > 0) {
             string msg = "";
             for (int i = 0; i < problems.Count; i = i + 1) {
@@ -692,6 +700,11 @@ public void Backup(string targetPath) {
             }
             throw new IOException("backup integrity check failed: " + msg);
         }
+        // Verification closes its WAL after checking it; confirm those final writes.
+        persistence.SyncFile(target);
+        persistence.SyncFile(target + ".m0");
+        persistence.SyncFile(target + ".m1");
+        persistence.SyncParents(syncDir, "backup-store-verified");
     } catch (Exception ex) {
         ZanStore.CleanTargetFiles(target, snapNextId);
         throw;

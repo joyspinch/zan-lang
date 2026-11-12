@@ -1,0 +1,255 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace Tasks.Jobs;
+
+// A serial, persistent cron dispatcher. Drive ProcessOnce from a host loop or
+// directly. Use one CronJobs owner per storage; there is no distributed claim.
+public class CronJobs {
+    JobStorage storage;
+    JobWorker worker;
+    RetryPolicy policy;
+    Mutex syncLock;
+    bool dispatching;
+    bool stopped;
+
+    public CronJobs(JobStorage storage, JobRegistry registry, RetryPolicy policy) {
+        this.storage = storage;
+        this.policy = policy != null ? policy : RetryPolicy.Default();
+        this.worker = new JobWorker(storage, registry, this.policy);
+        this.syncLock = new Mutex();
+    }
+
+    public bool Upsert(string id, string expression, string name, string args) {
+        return this.Upsert(id, expression, name, args, false);
+    }
+
+    // The compatibility flag is persisted with the expression, so reopening
+    // the same data never changes how its dates match.
+    public bool Upsert(string id, string expression, string name, string args, bool hostingDays) {
+        if (id == null || id == "") { return false; }
+        CronExpression cron = CronJobs.ReadCron(expression, hostingDays);
+        if (cron == null) { return false; }
+        this.syncLock.WaitOne();
+        try {
+            if (this.stopped) { return false; }
+            JobRecord previous = this.storage.Find(id);
+            if (previous != null && previous.cron == "") { return false; }
+            string jobName = name != null ? name : "";
+            // Hosts commonly re-register definitions at startup. Keep the
+            // existing due time, retry budget, and recovery marker when the
+            // definition is identical.
+            if (previous != null && CronJobs.IsSchedule(previous) && previous.name == jobName
+                && previous.cron == expression && previous.cronHostingDays == hostingDays
+                && (args == null || previous.args == args)) { return true; }
+            JobRecord record = new JobRecord();
+            if (previous != null && previous.state != JobState.Deleted) {
+                record = previous.Copy();
+            }
+            record.id = id;
+            record.name = jobName;
+            record.args = args != null ? args : record.args;
+            record.cron = expression;
+            record.cronHostingDays = hostingDays;
+            record.state = JobState.Scheduled;
+            record.runAt = CronJobs.NextAt(cron, DateTime.GetCurrentUnixMilliseconds());
+            record.attempts = 0;
+            record.cronRetriesLeft = 0;
+            record.endAt = 0;
+            record.error = "";
+            this.storage.Append(record);
+            return true;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+    }
+
+    public bool Remove(string id) {
+        this.syncLock.WaitOne();
+        try {
+            if (this.stopped) { return false; }
+            JobRecord record = this.storage.Find(id);
+            if (record == null || !CronJobs.IsSchedule(record)) { return false; }
+            record = record.Copy();
+            record.state = JobState.Deleted;
+            record.runAt = 0;
+            record.args = "";
+            this.storage.Append(record);
+            return true;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+    }
+
+    public bool TriggerNow(string id) {
+        this.syncLock.WaitOne();
+        try {
+            if (this.stopped) { return false; }
+            JobRecord record = this.storage.Find(id);
+            if (record == null || !CronJobs.IsSchedule(record) || record.state == JobState.Processing) { return false; }
+            record = record.Copy();
+            record.runAt = DateTime.GetCurrentUnixMilliseconds();
+            record.endAt = 0;
+            this.storage.Append(record);
+            return true;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+    }
+
+    public List<JobRecord> Snapshot() {
+        this.syncLock.WaitOne();
+        try {
+            List<JobRecord> result = new List<JobRecord>();
+            if (this.stopped) { return result; }
+            List<JobRecord> all = this.storage.Snapshot();
+            foreach (JobRecord record in all) {
+                if (CronJobs.IsSchedule(record)) { result.Add(record.Copy()); }
+            }
+            return result;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+    }
+
+    // Seal this dispatcher only when idle so its caller can close the storage.
+    public bool TryStop() {
+        this.syncLock.WaitOne();
+        try {
+            if (this.dispatching) { return false; }
+            this.stopped = true;
+            return true;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+    }
+
+    public int ProcessOnce(CancellationToken token) {
+        return this.ProcessOnce(token, this.policy, null);
+    }
+
+    // The compatibility host supplies its bool callback adapter and fixed delay.
+    public int ProcessOnce(CancellationToken token, RetryPolicy policy, Func<JobRecord, JobResult> adapter) {
+        this.syncLock.WaitOne();
+        try {
+            if (this.stopped || this.dispatching) { return 0; }
+            this.dispatching = true;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+        try {
+            long dueAt = DateTime.GetCurrentUnixMilliseconds();
+            RetryPolicy retry = policy != null ? policy : this.policy;
+            int count = 0;
+            foreach (JobRecord candidate in this.Snapshot()) {
+                if (token.IsCancellationRequested) { break; }
+                if (!CronJobs.IsDue(candidate, dueAt)) { continue; }
+                JobRecord record = this.Claim(candidate.id, dueAt, retry);
+                if (record == null) { continue; }
+                JobResult result = this.worker.RunCronHandler(record.Copy(), adapter);
+                this.Complete(record.id, result, retry);
+                count = count + 1;
+            }
+            return count;
+        } finally {
+            this.syncLock.WaitOne();
+            this.dispatching = false;
+            this.syncLock.ReleaseMutex();
+        }
+    }
+
+    JobRecord Claim(string id, long dueAt, RetryPolicy policy) {
+        this.syncLock.WaitOne();
+        try {
+            JobRecord record = this.storage.Find(id);
+            if (record == null || !CronJobs.IsDue(record, dueAt)) { return null; }
+            record = record.Copy();
+            if (CronJobs.ReadCron(record.cron, record.cronHostingDays) == null) {
+                record.state = JobState.Scheduled;
+                record.runAt = 0;
+                record.cronRetriesLeft = 0;
+                record.error = "invalid stored cron expression";
+                this.storage.Append(record);
+                return null;
+            }
+            if (record.state == JobState.Failed) {
+                record.attempts = record.attempts + 1;
+                if (record.cronRetriesLeft > 0) {
+                    record.cronRetriesLeft = record.cronRetriesLeft - 1;
+                }
+            } else if (record.state != JobState.Processing) {
+                record.attempts = 1;
+                record.cronRetriesLeft = policy.maxAttempts > 1 ? policy.maxAttempts - 1 : 0;
+            }
+            // A Processing row from a previous run replays the same attempt.
+            record.state = JobState.Processing;
+            record.startAt = DateTime.GetCurrentUnixMilliseconds();
+            record.endAt = 0;
+            this.storage.Append(record);
+            return record;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+    }
+
+    void Complete(string id, JobResult result, RetryPolicy policy) {
+        this.syncLock.WaitOne();
+        try {
+            JobRecord record = this.storage.Find(id);
+            // A callback may remove or replace its schedule. Its old outcome
+            // must not overwrite that change.
+            if (record == null || record.state != JobState.Processing) { return; }
+            record = record.Copy();
+            long now = DateTime.GetCurrentUnixMilliseconds();
+            record.endAt = now;
+            if (result == null) { result = JobResult.Fail("handler returned null result"); }
+            if (result.ok) {
+                record.cronRuns = record.cronRuns + 1;
+                record.error = "";
+            } else {
+                record.cronFails = record.cronFails + 1;
+                record.error = result.message != null && result.message != "" ? result.message : "handler failed";
+                if (result.retryable && record.cronRetriesLeft > 0) {
+                    record.state = JobState.Failed;
+                    long delay = policy.DelayFor(record.attempts);
+                    record.runAt = delay > long.MaxValue - now ? long.MaxValue : now + delay;
+                    this.storage.Append(record);
+                    return;
+                }
+            }
+            record.state = JobState.Scheduled;
+            record.cronRetriesLeft = 0;
+            record.runAt = CronJobs.NextAt(CronJobs.ReadCron(record.cron, record.cronHostingDays), now);
+            this.storage.Append(record);
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+    }
+
+    static bool IsSchedule(JobRecord record) {
+        return record != null && record.cron != "" && record.state != JobState.Deleted && record.state != JobState.Dead;
+    }
+
+    static bool IsDue(JobRecord record, long now) {
+        return CronJobs.IsSchedule(record) && (record.state == JobState.Processing
+            || (record.runAt > 0 && record.runAt <= now));
+    }
+
+    static CronExpression ReadCron(string expression, bool hostingDays) {
+        if (hostingDays) { return CronExpression.ParseHosting(expression); }
+        try {
+            return CronExpression.Parse(expression);
+        } catch (FormatException e) {
+            return null;
+        } catch (ArgumentException e) {
+            return null;
+        }
+    }
+
+    static long NextAt(CronExpression cron, long now) {
+        if (cron == null) { return -1; }
+        DateTime next = cron.GetNext(DateTime.FromUnixMilliseconds(now));
+        return next == null ? -1L : next.ToUnixMilliseconds();
+    }
+}

@@ -1,0 +1,125 @@
+using System;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+using System.Diagnostics;
+using System.IO;
+using Tasks.Jobs;
+
+namespace System.Hosting;
+
+// Called under the CronJobs owner's lock. Preserve job:<id>:<field> and
+// param:<id>; add phase, attempts and error for durable execution state.
+internal class ZanStoreCronStorage : JobStorage {
+    ZanStore store;
+
+    public ZanStoreCronStorage(string path) {
+        Log.EnsureDirFor(path);
+        this.store = ZanStore.Open(path, ZanStore.DUR_SYNC);
+    }
+
+    public bool IsOpen() { return this.store.IsOpen(); }
+    public string GetError() { return this.store.GetError(); }
+    public void Close() { this.store.Close(); }
+
+    public override JobRecord Find(string id) {
+        string prefix = "job:" + id + ":";
+        string cron = this.store.Get(prefix + "cron");
+        if (cron == null || cron == "") { return null; }
+        JobRecord record = new JobRecord();
+        record.id = id;
+        record.cron = cron;
+        record.cronHostingDays = true;
+        record.name = this.ReadText(prefix + "name");
+        record.args = this.ReadText("param:" + id);
+        record.runAt = this.ReadLong(prefix + "next");
+        record.startAt = this.ReadLong(prefix + "last");
+        record.cronRetriesLeft = (int)this.ReadLong(prefix + "retry");
+        record.cronRuns = this.ReadLong(prefix + "runs");
+        record.cronFails = this.ReadLong(prefix + "fails");
+        record.attempts = (int)this.ReadLong(prefix + "attempts");
+        record.error = this.ReadText(prefix + "error");
+        string phase = this.ReadText(prefix + "phase");
+        if (phase == "processing") {
+            record.state = JobState.Processing;
+        } else if (phase == "retry" || (phase == "" && record.cronRetriesLeft > 0)) {
+            record.state = JobState.Failed;
+        } else {
+            record.state = JobState.Scheduled;
+        }
+        return record;
+    }
+
+    public override List<JobRecord> Snapshot() {
+        List<string> ids = new List<string>();
+        this.store.ScanBetween("job:", "job;", delegate(string key, string value) {
+            if (key.EndsWith(":cron")) { ids.Add(key.Substring(4, key.Length - 9)); }
+            return true;
+        });
+        List<JobRecord> result = new List<JobRecord>();
+        foreach (string id in ids) {
+            JobRecord record = this.Find(id);
+            if (record != null) { result.Add(record); }
+        }
+        return result;
+    }
+
+    public override void Append(JobRecord record) {
+        string prefix = "job:" + record.id + ":";
+        string param = "param:" + record.id;
+        this.store.Begin();
+        try {
+            if (record.state == JobState.Deleted) {
+                this.store.Delete(prefix + "name");
+                this.store.Delete(prefix + "cron");
+                this.store.Delete(prefix + "next");
+                this.store.Delete(prefix + "last");
+                this.store.Delete(prefix + "retry");
+                this.store.Delete(prefix + "runs");
+                this.store.Delete(prefix + "fails");
+                this.store.Delete(prefix + "phase");
+                this.store.Delete(prefix + "attempts");
+                this.store.Delete(prefix + "error");
+                this.store.Delete(param);
+            } else {
+                this.store.Put(prefix + "name", record.name);
+                this.store.Put(prefix + "cron", record.cron);
+                this.store.Put(prefix + "next", Convert.ToString(record.runAt));
+                this.store.Put(prefix + "last", Convert.ToString(record.startAt));
+                this.store.Put(prefix + "runs", Convert.ToString(record.cronRuns));
+                this.store.Put(prefix + "fails", Convert.ToString(record.cronFails));
+                if (record.cronRetriesLeft > 0) {
+                    this.store.Put(prefix + "retry", Convert.ToString(record.cronRetriesLeft));
+                } else {
+                    this.store.Delete(prefix + "retry");
+                }
+                this.store.Put(prefix + "attempts", Convert.ToString(record.attempts));
+                this.store.Put(prefix + "error", record.error);
+                if (record.state == JobState.Processing) {
+                    this.store.Put(prefix + "phase", "processing");
+                    this.store.Put(param, record.args);
+                } else if (record.state == JobState.Failed) {
+                    this.store.Put(prefix + "phase", "retry");
+                    this.store.Put(param, record.args);
+                } else {
+                    this.store.Delete(prefix + "phase");
+                    if (record.endAt > 0 && record.error == "") { this.store.Delete(param); }
+                }
+            }
+            if (!this.store.Commit()) { throw new IOException(this.store.GetError()); }
+        } finally {
+            this.store.Rollback();
+        }
+    }
+
+    string ReadText(string key) {
+        string value = this.store.Get(key);
+        return value != null ? value : "";
+    }
+
+    long ReadLong(string key) {
+        string value = this.ReadText(key);
+        long number = 0;
+        if (long.TryParse(value, out number)) { return number; }
+        return 0;
+    }
+}

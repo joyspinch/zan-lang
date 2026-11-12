@@ -68,42 +68,44 @@ public class MySqlSyncConnection : IDbConnection {
 
     // 读取一个协议数据包，返回其有效载荷，
     // 长度记录在 <c>lastLen</c>；连接关闭时返回 null。
-    // 支持 MySQL 协议大于 16MB (0xFFFFFF) 的多包分片流式拼装。
+    // Continuations share a 64 MiB logical-message budget; a zero-length
+    // terminator is valid even at the budget. An incomplete message cannot
+    // leave a reusable session or return its already-received prefix.
     byte[] readPacket() {
         byte[] hdr = new byte[5];
-        int got = this.recvExact(hdr, 0, 4);
-        if (got < 4) { this.lastLen = -1; return null; }
-        int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
-        this.lastSeq = hdr[3] & 255;
-        this.lastLen = len;
-        byte[] pay = new byte[len + 1];
-        if (len > 0) {
-            int g2 = this.recvExact(pay, 0, len);
-            if (g2 < len) { this.lastLen = -1; return null; }
-        }
-        if (len == 16777215) {
-            int totalLen = len;
-            while (len == 16777215) {
-                int gotH = this.recvExact(hdr, 0, 4);
-                if (gotH < 4) { break; }
-                len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
+        byte[] pay = new byte[1];
+        int totalLen = 0;
+        this.lastLen = -1;
+        bool complete = false;
+        try {
+            while (true) {
+                int got = this.recvExact(hdr, 0, 4);
+                if (got < 4) { this.lastError = "truncated MySQL packet header"; return null; }
+                int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
                 this.lastSeq = hdr[3] & 255;
-                byte[] nextChunk = new byte[len + 1];
-                if (len > 0) {
-                    int g3 = this.recvExact(nextChunk, 0, len);
-                    if (g3 < len) { break; }
+                int nextLen = MySqlPacketBounds.AppendLength(totalLen, len);
+                if (nextLen < 0) {
+                    this.lastError = "MySQL message exceeds 64 MiB receive limit";
+                    return null;
                 }
-                byte[] merged = new byte[totalLen + len + 1];
-                NativeMemory.Copy((nint)merged, (nint)pay, totalLen);
                 if (len > 0) {
-                    NativeMemory.Copy((nint)merged + (nint)totalLen, (nint)nextChunk, len);
+                    byte[] merged = new byte[nextLen + 1];
+                    if (totalLen > 0) { NativeMemory.Copy((nint)merged, (nint)pay, totalLen); }
+                    pay = merged;
+                    int body = this.recvExact(pay, totalLen, len);
+                    if (body < len) { this.lastError = "truncated MySQL packet body"; return null; }
                 }
-                pay = merged;
-                totalLen = totalLen + len;
+                totalLen = nextLen;
+                if (len < MySqlPacketBounds.MaxChunkBytes) {
+                    this.lastLen = totalLen;
+                    complete = true;
+                    return pay;
+                }
             }
-            this.lastLen = totalLen;
+        } finally {
+            // Any failed/throwing read leaves framing uncertain; never pool it.
+            if (!complete) { this.Close(); }
         }
-        return pay;
     }
 
     // 写入一个协议数据包（4 字节包头 + 有效载荷）。超 16MB 时按 MySQL 规范自动分片。
@@ -356,7 +358,7 @@ public class MySqlSyncConnection : IDbConnection {
         byte[] resp = new byte[respLen + 1];
         int q = 0;
         resp[q] = (byte)(caps2&255); resp[q+1] = (byte)((caps2>>8)&255); resp[q+2] = (byte)((caps2>>16)&255); resp[q+3] = (byte)((caps2>>24)&255); q=q+4;
-        resp[q] = (byte)(0); resp[q+1] = (byte)(0); resp[q+2] = (byte)(0); resp[q+3] = (byte)(1); q=q+4;
+        MySqlPacketBounds.Advertise(resp, q); q=q+4;
         resp[q] = (byte)(45); q=q+1;
         q = q + 23;
         i = 0; while (i < userLen) { resp[q+i] = (byte)(user[i] & 255); i = i + 1; } q = q + userLen;

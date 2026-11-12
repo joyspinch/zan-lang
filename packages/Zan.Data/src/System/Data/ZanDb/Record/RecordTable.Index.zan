@@ -410,12 +410,14 @@ public partial class RecordTable {
         }
 
         PageFile pf = PageFile.Open(this.idxPath);
-        if (pf != null && pf.IsOpen()) {
-            pf.WriteAt(0, b.Raw(), b.Length());
-            pf.Sync();
-            pf.Close();
+        try {
+            this.RequireIo(pf != null && pf.IsOpen(), "open index checkpoint", pf);
+            this.RequireIo(pf.WriteAt(0, b.Raw(), b.Length()) == b.Length(), "write index checkpoint", pf);
+            this.RequireIo(pf.Sync(), "sync index checkpoint", pf);
+        } finally {
+            if (pf != null) { pf.Close(); }
+            b.Free();
         }
-        b.Free();
     }
 
     // 从 .zidx 文件装载二级索引
@@ -584,53 +586,61 @@ public partial class RecordTable {
         }
     }
 
+    // Reset the recovery log only after every checkpoint dependency has succeeded.
+    private void CheckpointLocked() {
+        this.RequireWritable();
+        if (this.inTx) { throw new InvalidOperationException("cannot checkpoint RecordTable during transaction"); }
+        this.RequireIo(this.walFile != null && this.walFile.IsOpen(), "WAL file is closed", this.walFile);
+        this.WriteHeaderLocked();
+        this.WriteBlobHeaderLocked();
+        Mutex.Lock(this.ioMtx);
+        try {
+            this.BeforePersistenceIo("table-sync");
+            this.RequireIo(this.file.Sync(), "sync table checkpoint", this.file);
+            this.BeforePersistenceIo("blob-sync");
+            this.RequireIo(this.blobFile.Sync(), "sync blob checkpoint", this.blobFile);
+        } finally {
+            Mutex.Unlock(this.ioMtx);
+        }
+        this.SaveIndexesLocked();
+        this.ResetWalLocked();
+    }
+
     public void Flush() {
+        if (this.ioMtx == 0) { return; }
         this.tlock.EnterWrite();
         try {
-            if (this.IsOpen()) {
-                this.WriteHeaderLocked();
-                Mutex.Lock(this.ioMtx);
-                try {
-                    this.file.Sync();
-                    if (this.blobFile != null && this.blobFile.IsOpen()) {
-                        this.blobFile.Sync();
-                    }
-                } finally {
-                    Mutex.Unlock(this.ioMtx);
-                }
-                this.SaveIndexesLocked();
-                this.ResetWalLocked();
-            }
+            this.CheckpointLocked();
+        } catch (IOException ex) {
+            if (this.lastError == "") { this.lastError = "checkpoint failed: " + ex.Message; }
+            throw;
         } finally {
             this.tlock.ExitWrite();
         }
     }
 
     public void Close() {
+        if (this.ioMtx == 0) { return; }
         this.tlock.EnterWrite();
         try {
-            if (this.file != null && this.file.IsOpen()) {
-                this.WriteHeaderLocked();
-                this.SaveIndexesLocked();
-                this.file.Sync();
-                this.file.Close();
+            // Failed/active-transaction handles release resources without publishing staged state.
+            if (this.lastError == "" && !this.inTx && this.schema != null && this.file != null) {
+                this.CheckpointLocked();
             }
-            if (this.blobFile != null && this.blobFile.IsOpen()) {
-                this.WriteBlobHeaderLocked();
-                this.blobFile.Sync();
-                this.blobFile.Close();
-            }
-            if (this.walFile != null && this.walFile.IsOpen()) {
-                this.ResetWalLocked();
-                this.walFile.Close();
-            }
-            if (this.ioMtx != 0) {
-                Mutex.Destroy(this.ioMtx);
-                this.ioMtx = 0;
-            }
-            this.tlock.Close();
+        } catch (IOException ex) {
+            // Close is also used by facade cleanup: retain the failure without stopping other releases.
+            if (this.lastError == "") { this.lastError = "close checkpoint failed: " + ex.Message; }
         } finally {
-            // 已完全释放
+            if (this.file != null) { this.file.Close(); }
+            if (this.blobFile != null) { this.blobFile.Close(); }
+            if (this.walFile != null) { this.walFile.Close(); }
+            this.txOps.Clear();
+            this.inTx = false;
+            this.beforePersistenceIo = null;
+            this.tlock.ExitWrite();
+            Mutex.Destroy(this.ioMtx);
+            this.ioMtx = 0;
+            this.tlock.Close();
         }
     }
 

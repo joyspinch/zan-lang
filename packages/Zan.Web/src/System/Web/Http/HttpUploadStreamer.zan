@@ -1,65 +1,117 @@
 using System;
 using System.IO;
-using System.Net.Sockets;
+using System.Interop;
 using System.Net.Http;
 using System.Threading;
 
 namespace System.Web;
 
-// HTTP 大文件流式接收与磁盘暂存器：
-// 针对路由标记为 streamUpload 的请求，在收到头部后直接通过 socket 边接收边写入磁盘临时文件，
-// 避免整个大文件（数十 MB 至数 GB）常驻内存引发 GC 停顿或内存溢出。
+// The streamer owns a partial spool until every byte and fclose succeed.
+// A successful return transfers ownership to the request's HttpContext.
 public class HttpUploadStreamer {
-    [DllImport("crt")]
-    private static extern long time(nint ptr);
+#if WINDOWS
+    private static const int OpenExclusiveBinary = 0x0001 | 0x0100 | 0x0400 | 0x8000;
+    private static const int ShareDenyNone = 0x0040;
+    private static const int ReadWriteMode = 0x0180;
 
+    [DllImport("crt", EntryPoint = "_wsopen_s")]
+    private static extern int OpenWide(ref int fd, nint path, int flags, int sharing, int mode);
+
+    [DllImport("crt", EntryPoint = "_fdopen")]
+    private static extern nint OpenDescriptor(int fd, string mode);
+
+    [DllImport("crt", EntryPoint = "_close")]
+    private static extern int CloseDescriptor(int fd);
+#else
     [DllImport("crt")]
     private static extern nint fopen(string path, string mode);
+#endif
 
     [DllImport("crt")]
-    private static extern long fwrite(string buf, long size, long count, nint fp);
+    private static extern long fwrite(nint buf, long size, long count, nint fp);
 
     [DllImport("crt")]
     private static extern int fclose(nint fp);
 
-    // 将请求正文以流式方式直写到指定上传目录的临时文件，返回落盘文件绝对路径；失败返回空串 ""。
+    private static nint OpenExclusive(string path) {
+#if WINDOWS
+        // The supported legacy Windows CRT does not recognize fopen("wbx").
+        nint wide = Wide.Of(path);
+        if (wide == 0) { return 0; }
+        int fd = -1;
+        int result = HttpUploadStreamer.OpenWide(ref fd, wide, OpenExclusiveBinary,
+            ShareDenyNone, ReadWriteMode);
+        Wide.Free(wide);
+        if (result != 0) { return 0; }
+        nint fp = HttpUploadStreamer.OpenDescriptor(fd, "wb");
+        if (fp == 0) {
+            int closed = HttpUploadStreamer.CloseDescriptor(fd);
+            HttpUploadStreamer.DeletePartial(path);
+        }
+        return fp;
+#else
+        return HttpUploadStreamer.fopen(path, "wbx");
+#endif
+    }
+
+    private static void DeletePartial(string path) {
+        try {
+            if (File.Exists(path)) { File.Delete(path); }
+        } catch (Exception e) {
+            // Preserve the original IO failure; report failed cleanup.
+            Console.WriteLine("[WebApp upload cleanup] " + e.Message);
+        }
+    }
+
     public static async string StreamToFile(nint sock, HttpFramer framer,
                                            HttpRequest request, string uploadDir,
                                            AtomicInt uploadSeq) {
-        if (sock == 0 || framer == null || request == null) { return ""; }
+        if (sock == 0) { return ""; }
+        return await HttpUploadStreamer.StreamToFile(framer, request, uploadDir, uploadSeq);
+    }
+
+    public static async string StreamToFile(HttpFramer framer, HttpRequest request,
+                                           string uploadDir, AtomicInt uploadSeq) {
+        if (framer == null || request == null || request.chunked
+            || request.contentLength <= 0 || request.bodyStart < 0
+            || request.bodyStart > framer.Pending()) { return ""; }
         if (!Directory.Exists(uploadDir)) {
             Directory.CreateDirectoryRecursive(uploadDir);
         }
+        string id = Guid.New();
+        if (id.Length == 0) { return ""; }
         int seq = uploadSeq != null ? uploadSeq.Increment() : 1;
-        string tmp = uploadDir + "/upload_" + Convert.ToString(HttpUploadStreamer.time(0))
-            + "_" + Convert.ToString(seq) + ".bin";
-        nint fp = HttpUploadStreamer.fopen(tmp, "wb");
+        string tmp = Path.Combine(uploadDir, "upload_" + id + "_" + Convert.ToString(seq) + ".bin");
+        // The name is random across workers and the open cannot replace an existing file.
+        nint fp = HttpUploadStreamer.OpenExclusive(tmp);
         if (fp == 0) { return ""; }
-        int total = request.contentLength;
-        int have = 0;
-        int headerEnd = request.bodyStart;
-        int bodyInBuf = framer.Pending() - headerEnd;
-        if (bodyInBuf > total) { bodyInBuf = total; }
-        if (bodyInBuf > 0) {
-            string firstChunk = framer.Slice(headerEnd, bodyInBuf);
-            int _w0 = (int)HttpUploadStreamer.fwrite(firstChunk, 1, bodyInBuf, fp);
-            if (_w0 < bodyInBuf) { int _c0 = HttpUploadStreamer.fclose(fp); return ""; }
-            have = bodyInBuf;
+        bool complete = false;
+        try {
+            int remaining = request.contentLength;
+            framer.Consume(request.bodyStart);
+            while (remaining > 0) {
+                int count = framer.Pending();
+                if (count == 0) {
+                    // This bound also applies to decrypted bytes already in the
+                    // TLS record buffer. The next request stays with its reader.
+                    count = await framer.FillTo(remaining);
+                    if (count <= 0) { return ""; }
+                }
+                if (count > remaining) { count = remaining; }
+                StringView chunk = framer.SliceView(0, count);
+                long written = HttpUploadStreamer.fwrite(chunk.ptr, 1, count, fp);
+                if (written != count) { return ""; }
+                framer.Consume(count);
+                remaining = remaining - count;
+            }
+            int closed = HttpUploadStreamer.fclose(fp);
+            fp = 0;
+            if (closed != 0) { return ""; }
+            complete = true;
+            return tmp;
+        } finally {
+            if (fp != 0) { int closed = HttpUploadStreamer.fclose(fp); }
+            if (!complete) { HttpUploadStreamer.DeletePartial(tmp); }
         }
-        framer.Consume(headerEnd + have);
-        byte[] buf = new byte[HttpLimits.IoChunkBytes + 1];
-        while (have < total) {
-            int n = await Socket.RecvIntoAsync(sock, buf, HttpLimits.IoChunkBytes);
-            if (n <= 0) { int _c1 = HttpUploadStreamer.fclose(fp); return ""; }
-            if (have + n > total) { n = total - have; }
-            // fwrite 短写（磁盘满/配额）必须当失败处理：不校验的话
-            // have 照常推进，落盘文件被静默截断，调用方拿到一个
-            // 看似成功的残缺文件。
-            int _w = (int)HttpUploadStreamer.fwrite(buf, 1, n, fp);
-            if (_w < n) { int _c3 = HttpUploadStreamer.fclose(fp); return ""; }
-            have = have + n;
-        }
-        int _c2 = HttpUploadStreamer.fclose(fp);
-        return tmp;
     }
 }

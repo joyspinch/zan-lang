@@ -96,21 +96,41 @@ if (!host.AddFrom(sp, "svc.outbox")) { Log.Warn("outbox service missing"); }
   `ticks`/`lastTickUs` 是整数累加，读状态不分配对象。
 - `Status()` 才分配快照对象，热路径零分配。
 
+## 持久化 cron 任务
+
+`PersistentJobs(path)` 可以像其他 `BackgroundService` 一样加入 `AppHost`。
+用 `StoreOk()` / `StoreError()` 检查打开结果，设置
+`handler = delegate(string id, string name, string param) { return true; };`，
+再用 `Upsert(id, expression, name)` 注册任务。`TriggerNow(id)` 使任务在下一轮可执行，
+`Snapshot()` 返回定义及状态，`Remove(id)` 删除定义和参数。启动时重复注册同一份定义会保留执行状态。回调参数保持原样；未存参数时传空串。
+
+- cron 按 UTC 分钟匹配。日与星期都受限时取并集，与旧 `System.Hosting.Cron` 一致。
+  轮询间隔只决定检查频率。停机时错过的多个触发合并为一次；完成后从当前时间找下次。
+- `maxRetries` 是每次触发首次执行之外的重试次数，`retryDelayMs` 是固定等待毫秒。
+  回调返回 `false` 或抛异常均记失败；重试耗尽后恢复 cron。`runs` / `fails`
+  分别累计成功和失败的执行，`inFlight` / `retryPending` 分别表示执行中和等待重试。
+- 保留旧 `job:<id>:name|cron|next|last|retry|runs|fails` 和 `param:<id>` 键，
+  并增加 `phase`、`attempts`、`error`。调用回调前以同步事务提交执行中状态；重开时
+  重放该次尝试。成功后清除参数；失败时保留。旧记录单有 `param:<id>` 无法证明执行中，
+  仍按原 `next` 和 `retry` 处理。
+  回调副作用与结果提交之间中断会导致重放，回调应可重复执行。
+- 一个存储由一个服务实例串行调度；`maxParallel` 保留字段，非零设置会报告参数错误并拒绝执行。
+  停止时取消后续派发，并等待当前同步回调。先确认 `StopAsync`（或随后 `Join`）成功，再
+  调用 `Close()`；关闭不会中断正在执行的回调，未退出时会拒绝关闭。
+
 ## 跨平台与依赖
 
 只依赖 `System`（`Console`/`Exception`/`Convert`/`Stopwatch`）、
 `System.Threading`（`CancellationToken`/`Gate`）与 `System.DependencyInjection`
 （仅为 `AddFrom` 的可选集成）；无平台分支，Windows / Linux / macOS / 嵌入式
-同一份代码。
+同一份代码。持久化 cron 另使用 `Zan.Jobs` 派发和 `Zan.Data` 的 ZanStore 兼容存储。
 
 ## 边界
 
 - **不接管进程信号**：Zan 标准库当前没有 `SIGINT`/`Ctrl+C` 钩子，"什么时候
   该关"由调用方决定（信号处理、管理端点、测试代码）。宿主只提供"关闭请求
   到达之后怎么干净收摊"。
-- **不做定时调度**：没有 cron、没有持久化任务表、没有分布式抢单。需要
-  "到点执行 + 多实例唯一"的场景用 `Zan.Mvc` 的 `JobHost`（数据库乐观锁抢单）
-  或自建；本包只管进程内生命周期。
+- **不做分布式抢单**：需要多实例唯一执行时，使用有明确抢单契约的调度服务。
 - **不做服务自动发现**：注册就是 `Add(...)`/`AddFrom(...)`，没有反射扫描。
 - `BackgroundService` 是**单循环**模型：一个服务一个循环；要并发跑多份就
   装多个服务实例（宿主的启动/停止顺序对它们一视同仁）。

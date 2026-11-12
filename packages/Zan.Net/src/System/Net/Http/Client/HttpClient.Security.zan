@@ -8,29 +8,49 @@ namespace System.Net.Http.Client;
 
 // HttpClient.Security.zan - 传输安全(SPKI公钥固定/双向证书认证)、响应内容解码(Content-Encoding)与探针治理
 public partial class HttpClient {
-    // 为此客户端设置内容解码器（如 gzip/deflate/br）。
-    // 解码器的签名是 (string encoding, byte[] encoded) -> byte[]；
-    // 典型装配：
-    //     http.SetContentDecoder(System.IO.Compression.ContentCoding.Decode);
-    //
-    // 没装解码器又碰上带编码的响应时**直接报错**，不把压缩字节当正文
-    // 悄悄返回——那样调用方拿到的是一堆乱码，却没有任何提示。
-    public HttpClient SetContentDecoder(HttpContentDecoder fn) {
-        this.contentDecoder = fn;
+    // First use and setters share a mutex: pooled connections always retain the
+    // security configuration with which they were opened. Close never unfreezes.
+    private void RequireMutableSecurity() {
+        if (this.securityFrozen) {
+            throw new InvalidOperationException("HTTP security configuration is frozen after first use");
+        }
+    }
+
+    private void FreezeSecurity() {
+        this.securityGate.WaitOne();
+        try { this.securityFrozen = true; }
+        finally { this.securityGate.ReleaseMutex(); }
+    }
+
+    // Copy both on input and output; external mutation cannot alter idle-pool policy.
+    private static ExternalCallPolicy CopyCallPolicy(ExternalCallPolicy source) {
+        if (source == null) { return null; }
+        ExternalCallPolicy copy = ExternalCallPolicy.Default()
+            .ConnectTimeout(source.ConnectTimeoutMs()).WriteTimeout(source.WriteTimeoutMs())
+            .ReadTimeout(source.ReadTimeoutMs()).IdleTimeout(source.IdleTimeoutMs())
+            .RequestLimit(source.MaxRequestBytes()).ResponseLimit(source.MaxResponseBytes())
+            .ErrorLimit(source.MaxErrorBytes()).StreamLimit(source.MaxStreamBytes())
+            .Redirects(source.MaxRedirects()).RetryAttempts(source.RetryAttempts())
+            .RetryBackoff(source.RetryBackoffMs())
+            .RetryNetwork(source.CanRetry("GET", false, 0));
+        if (source.TotalTimeoutMs() > 0) { copy.TotalTimeout(source.TotalTimeoutMs()); }
+        else { copy.NoTotalTimeout(); }
+        if (source.LocalHttpOnly()) { copy.AllowLocalHttp(); }
+        else if (source.AllowsLoopback()) { copy.AllowLoopback(); }
+        if (source.AllowsPrivate()) { copy.AllowPrivate(); }
+        if (source.IsIdempotent()) { copy.Idempotent(source.IdempotencyKey()); }
+        return copy;
+    }
+
+    // Must enforce maxDecodedBytes DURING decoding, before excess allocation or
+    // output. Return null/throw on exhaustion. Every encoding layer gets a budget.
+    public HttpClient SetBoundedContentDecoder(HttpBoundedContentDecoder fn) {
+        this.boundedContentDecoder = fn;
         return this;
     }
 
-    // 全局默认的内容解码器：应用里客户端很多、逐个装配太啰嗦时在这里
-    // 装一次，没有单独设置解码器的客户端都用它。单个客户端的
-    // SetContentDecoder 优先。
-    public static void SetDefaultContentDecoder(HttpContentDecoder fn) {
-        HttpClient.defaultContentDecoder = fn;
-    }
-
-    // 本客户端实际使用的解码器（自己的优先，其次全局默认）。
-    private HttpContentDecoder Decoder() {
-        if (this.contentDecoder != null) { return this.contentDecoder; }
-        return HttpClient.defaultContentDecoder;
+    public static void SetDefaultBoundedContentDecoder(HttpBoundedContentDecoder fn) {
+        HttpClient.defaultBoundedContentDecoder = fn;
     }
 
     // 拆分 Content-Encoding 的取值：可能是逗号分隔的多段
@@ -74,20 +94,33 @@ public partial class HttpClient {
         // 此时不报错——一个"空的 gzip 正文"和"根本没发正文"在线路上
         // 分不开，硬解只会得到一个假失败。
         if (resp.body == null || resp.body.Length == 0) { return resp; }
-        HttpContentDecoder decoder = this.Decoder();
+        HttpBoundedContentDecoder decoder = this.boundedContentDecoder;
+        if (decoder == null) {
+            decoder = HttpClient.defaultBoundedContentDecoder;
+        }
         if (decoder == null) {
             throw new HttpRequestException("response is " + header
-                + "-encoded but no content decoder is configured");
+                + "-encoded but no content decoder with a decode budget is configured");
         }
         bool wasBinary = resp.IsBinary();
-        byte[] cur = resp.body.ToBytes();
+        int encodedLength = wasBinary ? resp.bodyBytesLen : resp.body.Length;
+        int limit = this.ResponseLimit();
+        if (encodedLength < 0 || encodedLength > limit
+            || (wasBinary && (resp.bodyBytes == null || encodedLength > resp.bodyBytes.Length))) {
+            throw new HttpRequestException("encoded response body exceeds budget or has invalid length");
+        }
+        // ToBytes uses strlen: copy the tracked count, preserving embedded NUL.
+        byte[] cur = new byte[encodedLength];
+        for (int j = 0; j < encodedLength; j = j + 1) {
+            cur[j] = wasBinary ? resp.bodyBytes[j] : (byte)resp.body[j];
+        }
         for (int i = codings.Count - 1; i >= 0; i = i - 1) {
             string coding = codings[i];
             if (coding == "identity") { continue; }
-            byte[] decoded = decoder(coding, cur);
-            if (decoded == null) {
-                throw new HttpRequestException("failed to decode "
-                    + coding + "-encoded response body");
+            byte[] decoded = decoder(coding, cur, limit);
+            if (decoded == null || decoded.Length > limit) {
+                throw new HttpRequestException("failed to decode or over-budget "
+                    + coding + " response decode");
             }
             cur = decoded;
         }
@@ -136,21 +169,32 @@ public partial class HttpClient {
     // 本可被系统信任——从而阻止 MITM 代理。调用两次可为轮换
     // 固定一个备用密钥。
     public HttpClient PinPublicKey(string spkiSha256Base64) {
-        if (this.tlsPins == null) { this.tlsPins = new List<string>(); }
-        this.tlsPins.Add(spkiSha256Base64);
-        this.pinningEnabled = true;
-        this.useTls = true;
-        return this;
+        this.securityGate.WaitOne();
+        try {
+            this.RequireMutableSecurity();
+            if (spkiSha256Base64 == null || spkiSha256Base64.Length == 0) {
+                throw new ArgumentException("TLS public key pin must not be empty");
+            }
+            if (this.tlsPins == null) { this.tlsPins = new List<string>(); }
+            this.tlsPins.Add(spkiSha256Base64);
+            this.pinningEnabled = true;
+            this.useTls = true;
+            return this;
+        } finally { this.securityGate.ReleaseMutex(); }
     }
 
     // 仅开发用的应急通道，放宽固定限制，使本地
     // 代理或自签名开发服务器可用。由 ZAN_DEV 保护，因此发布
     // 构建会将其编译掉并始终强制执行已配置的固定值。
     public HttpClient DisablePinning() {
-        #if ZAN_DEV
-        this.pinningEnabled = false;
-        #endif
-        return this;
+        this.securityGate.WaitOne();
+        try {
+            this.RequireMutableSecurity();
+            #if ZAN_DEV
+            this.pinningEnabled = false;
+            #endif
+            return this;
+        } finally { this.securityGate.ReleaseMutex(); }
     }
 
     // 将已配置的固定值复制到新建的客户端上下文上并
@@ -163,12 +207,9 @@ public partial class HttpClient {
         ctx.RequirePinning(true);
     }
 
-    // 配置 PEM 证书链和匹配的 PEM 私钥，
-    // 用于双向 TLS 客户端认证。
+    // Reserved compatibility API. Client authentication is not implemented;
+    // reject at configuration rather than silently making an anonymous request.
     public HttpClient SetClientCertificate(string certFile, string keyFile) {
-        this.clientCertificateFile = certFile;
-        this.clientPrivateKeyFile = keyFile;
-        this.useTls = true;
-        return this;
+        throw new NotSupportedException("TLS client certificate authentication is not implemented");
     }
 }

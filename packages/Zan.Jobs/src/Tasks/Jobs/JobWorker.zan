@@ -100,7 +100,7 @@ public class JobWorker {
 
     // 这条任务现在该不该被执行。
     static bool IsRunnable(JobRecord r, long now) {
-        if (r == null) { return false; }
+        if (r == null || r.cron != "") { return false; }
         if (r.state != JobState.Enqueued && r.state != JobState.Failed
             && r.state != JobState.Scheduled) {
             return false;
@@ -138,21 +138,14 @@ public class JobWorker {
             return rec;
         }
 
-        JobResult result = null;
-        try {
-            if (handler.IsAsync()) {
-                rec.state = JobState.Dead;
-                rec.endAt = DateTime.GetCurrentUnixMilliseconds();
-                rec.error = "async handler must be executed via ProcessJobAsync";
-                this.storage.Append(rec);
-                return rec;
-            }
-            result = handler.run(handler.Normalize(rec.args));
-        } catch (Exception e) {
-            // 处理器抛异常按"可重试"处理——多数异常是临时的（网络、锁），
-            // 真正不可重试的情况让处理器自己返回 JobResult.Fail。
-            result = JobResult.Retry(e.Message != null ? e.Message : "handler threw");
+        if (handler.IsAsync()) {
+            rec.state = JobState.Dead;
+            rec.endAt = DateTime.GetCurrentUnixMilliseconds();
+            rec.error = "async handler must be executed via ProcessJobAsync";
+            this.storage.Append(rec);
+            return rec;
         }
+        JobResult result = JobWorker.InvokeSync(handler, rec.args);
         if (result == null) {
             rec.state = JobState.Dead;
             rec.endAt = DateTime.GetCurrentUnixMilliseconds();
@@ -186,6 +179,28 @@ public class JobWorker {
         rec.retry = rec.attempts;
         this.storage.Append(rec);
         return rec;
+    }
+
+    static JobResult InvokeSync(JobHandler handler, string args) {
+        try {
+            return handler.run(handler.Normalize(args));
+        } catch (Exception e) {
+            return JobResult.Retry(e.Message != null ? e.Message : "handler threw");
+        }
+    }
+
+    internal JobResult RunCronHandler(JobRecord record, Func<JobRecord, JobResult> adapter) {
+        if (adapter != null) {
+            try {
+                return adapter(record);
+            } catch (Exception e) {
+                return JobResult.Retry(e.Message != null ? e.Message : "handler threw");
+            }
+        }
+        JobHandler handler = this.registry.Find(record.name);
+        if (handler == null) { return JobResult.Fail("no handler registered for job: " + record.name); }
+        if (handler.IsAsync()) { return JobResult.Fail("cron dispatch requires a synchronous handler"); }
+        return JobWorker.InvokeSync(handler, record.args);
     }
 
     // 异步处理一轮：把当前到期的任务跑一遍，支持同步与异步处理器无缝混跑，返回处理条数。

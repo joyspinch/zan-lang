@@ -151,12 +151,12 @@ public partial class HttpClient {
 
     // 为重定向的下一跳派生客户端：继承 TLS/验证/固定值/证书/
     // 策略/超时/cookie 与共享 totalDeadlineUs，按 sameOrigin 与动作改写
-    // 过滤默认头。中转客户端是一次性连接（kaEnabled=false），池仍归
+    // 过滤默认头。中转客户端是一次性连接（keepAliveEnabled=false），池仍归
     // 发起客户端独有。
     private HttpClient RedirectNextClient(HttpClient current, ExternalTarget target,
             bool sameOrigin, bool dropEntityHeaders) {
         HttpClient next = new HttpClient(target.Host(), target.Port());
-        next.kaEnabled = false;
+        next.keepAliveEnabled = false;
         next.useTls = target.IsTls();
         next.verifyTls = current.verifyTls;
         next.clientCertificateFile = current.clientCertificateFile;
@@ -186,13 +186,6 @@ public partial class HttpClient {
     // 原样返回。301/302/303 的动作改写同时把请求正文清空——字节通道
     // 的实体无法安全降级重放，下载驱动的 Range 语义由驱动端用 method
     // 参数表达。
-    private async HttpResponse FollowBytesRedirects(string method, string path,
-            string body, HttpBytesDriver driver) {
-        this.ArmTotalBudget();
-        HttpResponse resp = await driver(this, method, path, body);
-        return await this.FollowBytesFromResponse(method, path, body, driver, resp);
-    }
-
     private async HttpResponse FollowBytesFromResponse(string method, string path,
             string body, HttpBytesDriver driver, HttpResponse resp) {
         if (!this.RedirectWanted(resp, 0)) { return resp; }
@@ -208,7 +201,7 @@ public partial class HttpClient {
             int code = resp.statusCode;
             string location = resp.GetHeader("Location");
             if (HttpResponse.HasCrlf(location)) {
-                current.DropAlive();
+                current.ClosePoolConnections();
                 throw new HttpRequestException(
                     "redirect Location header injection rejected");
             }
@@ -217,13 +210,13 @@ public partial class HttpClient {
                 current.useTls, current.host, current.port);
             ExternalTarget target = ExternalTarget.Parse(resolved);
             if (target == null || visited.Contains(target.Canonical())) {
-                current.DropAlive();
+                current.ClosePoolConnections();
                 throw new HttpRequestException(
                     "redirect target is invalid or repeated");
             }
             visited.Add(target.Canonical());
             if (current.useTls && !target.IsTls()) {
-                current.DropAlive();
+                current.ClosePoolConnections();
                 throw new HttpRequestException(
                     "insecure redirect: HTTPS to HTTP downgrade forbidden");
             }
@@ -233,11 +226,11 @@ public partial class HttpClient {
             string nextMethod = "";
             if (!current.RedirectReplay(currentMethod, code, sameOrigin,
                     out nextMethod)) {
-                current.DropAlive();
+                current.ClosePoolConnections();
                 throw new HttpRequestException("unsafe redirect replay");
             }
             bool dropEntityHeaders = nextMethod != currentMethod;
-            if (current == this) { current.DropAlive(); }
+            if (current == this) { current.ClosePoolConnections(); }
             HttpClient next = current.RedirectNextClient(current, target,
                 sameOrigin, dropEntityHeaders);
             // 动作改写（301/302/303 → GET）后字节通道的请求正文一律

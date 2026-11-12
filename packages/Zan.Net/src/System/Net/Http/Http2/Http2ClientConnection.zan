@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Net.Tls;
@@ -10,11 +11,7 @@ using System.Threading;
 
 namespace System.Net.Http.Http2;
 
-// HTTP/2 客户端多路复用连接引擎（RFC 7540 标准实现）。
-// 核心能力：
-// 1. 单 TCP 连接并发承载多个独立双向数据流（Stream Multiplexing），消除队头阻塞。
-// 2. 完整的 HPACK 头部编解码（静态表索引、动态表维护、霍夫曼解压）。
-// 3. 严格的 RFC 7540 状态机与控制帧处理（SETTINGS ACK、PING 应答、WINDOW_UPDATE 流量控制、RST_STREAM 取消）。
+// Bounded HTTP2 client. Push, informational responses and trailers are explicitly rejected.
 public class Http2ClientConnection : IDisposable {
     public string host;
     public int port;
@@ -26,11 +23,21 @@ public class Http2ClientConnection : IDisposable {
     private int nextStreamId;
     private int outboundConnWindow;
     private int inboundConsumed;
+    private int initialStreamWindow = 65535;
+    private Http2HeaderBlock headerBlock;
+    private bool settingsReceived;
+    private int peerMaxStreams = 16;
+    private int bufferedResponseBytes;
+    private AsyncGate wireGate;
+    public int maxHeaderBytes = 65536;
+    public int maxResponseBytes = 8388608;
+    public int maxConcurrentStreams = 16;
+    public int timeoutMs = 30000;
 
     private HpackContext inboundHpack;
     private HpackContext outboundHpack;
     private List<Http2Stream> activeStreams;
-    private Mutex sendLock;
+
 
     public bool IsConnected() {
         return this.connected;
@@ -48,9 +55,12 @@ public class Http2ClientConnection : IDisposable {
         this.outboundConnWindow = Http2Settings.DEFAULT_INITIAL_WINDOW_SIZE; // RFC 7540 默认初始流控窗口
         this.inboundConsumed = 0;
         this.inboundHpack = new HpackContext(Http2Settings.DEFAULT_HEADER_TABLE_SIZE);
-        this.outboundHpack = new HpackContext(Http2Settings.DEFAULT_HEADER_TABLE_SIZE);
+        this.outboundHpack = new HpackContext(0);
+        this.headerBlock = new Http2HeaderBlock(65536);
+        this.wireGate = new AsyncGate();
+        this.wireGate.Signal();
         this.activeStreams = new List<Http2Stream>();
-        this.sendLock = new Mutex();
+
     }
 
     // 连接服务端并完成 HTTP/2 序言握手。
@@ -67,11 +77,20 @@ public class Http2ClientConnection : IDisposable {
 
         // 1. 发送 24 字节客户端连接序言（RFC 7540 §3.5）
         byte[] prefaceBytes = Http2Frame.PREFACE.ToBytes();
-        int _sp = await Socket.SendAsync(s, prefaceBytes, prefaceBytes.Length);
+        HttpDeadlineToken watch = HttpDeadline.Arm(s, 30000, 30000);
+        try {
+        int _sp = await conn.SendRawAsync(prefaceBytes, 24);
 
         // 2. 发送初始 SETTINGS 帧（RFC 7540 §6.5）
-        byte[] initSettings = Http2Frame.EncodeHeader(0, Http2FrameType.SETTINGS, 0, 0);
-        int _ss = await Socket.SendAsync(s, initSettings, 9);
+        byte[] initSettings = new byte[15];
+        byte[] settingsHeader = Http2Frame.EncodeHeader(6, Http2FrameType.SETTINGS, 0, 0);
+        NativeMemory.Copy((nint)initSettings, (nint)settingsHeader, 9);
+        initSettings[10] = 2; // SETTINGS_ENABLE_PUSH = 0
+        int _ss = await conn.SendRawAsync(initSettings, initSettings.Length);
+        } catch (Exception ex) {
+            // Connection boundary: a partial preface cannot be retried.
+            conn.Close(); conn.ReleaseTransport(); return null;
+        } finally { HttpDeadline.Disarm(watch); }
 
         // 3. 启动后台帧派发协程
         Task.Spawn(conn.RunFrameLoopAsync());
@@ -99,24 +118,34 @@ public class Http2ClientConnection : IDisposable {
             ctx.DisableVerify();
         }
         ctx.alpnProtocols.Add("h2");
-        ctx.alpnProtocols.Add("http/1.1");
+
         TlsStream ts = await TlsStream.ConnectAsync(ctx, s, host, 10000);
         if (ts == null) {
             client.Close();
             ctx.Free();
             return null;
         }
+        if (ts.NegotiatedAlpn() != "h2") { ts.Close(); client.Close(); ctx.Free(); return null; }
         conn.tls = ts;
         conn.tlsCtx = ctx;
         conn.connected = true;
 
         // 1. 发送 24 字节客户端连接序言（RFC 7540 §3.5）
         byte[] prefaceBytes = Http2Frame.PREFACE.ToBytes();
-        int _sp = await ts.SendBytesAsync(prefaceBytes, prefaceBytes.Length);
+        HttpDeadlineToken watch = HttpDeadline.Arm(s, 30000, 30000);
+        try {
+        int _sp = await conn.SendRawAsync(prefaceBytes, 24);
 
         // 2. 发送初始 SETTINGS 帧（RFC 7540 §6.5）
-        byte[] initSettings = Http2Frame.EncodeHeader(0, Http2FrameType.SETTINGS, 0, 0);
-        int _ss = await ts.SendBytesAsync(initSettings, 9);
+        byte[] initSettings = new byte[15];
+        byte[] settingsHeader = Http2Frame.EncodeHeader(6, Http2FrameType.SETTINGS, 0, 0);
+        NativeMemory.Copy((nint)initSettings, (nint)settingsHeader, 9);
+        initSettings[10] = 2; // SETTINGS_ENABLE_PUSH = 0
+        int _ss = await conn.SendRawAsync(initSettings, initSettings.Length);
+        } catch (Exception ex) {
+            // Connection boundary: a partial preface cannot be retried.
+            conn.Close(); conn.ReleaseTransport(); return null;
+        } finally { HttpDeadline.Disarm(watch); }
 
         // 3. 启动后台帧派发协程
         Task.Spawn(conn.RunFrameLoopAsync());
@@ -125,267 +154,254 @@ public class Http2ClientConnection : IDisposable {
 
     // 后台帧调度循环：按帧边界持续读取并分发到各并发 Stream。
     private async void RunFrameLoopAsync() {
-        byte[] hdrBuf = new byte[9];
-        while (this.connected) {
-            int rHdr = await this.ReadExactAsync(hdrBuf, 9);
-            if (rHdr < 9) {
-                break;
+        try {
+            byte[] hdr = new byte[9];
+            while (this.connected) {
+                int got = await this.ReadExactAsync(hdr, 9);
+                if (got != 9) { break; }
+                Http2Frame frame = Http2Frame.DecodeHeader(hdr, 0);
+                if (frame == null || frame.length > 16384) { break; }
+                if (!this.settingsReceived && (frame.type != Http2FrameType.SETTINGS || (frame.flags & Http2Flags.ACK) != 0)) { break; }
+                byte[] payload = new byte[frame.length];
+                int n = await this.ReadExactAsync(payload, frame.length);
+                if (n != frame.length) { break; }
+                await this.DispatchFrameAsync(frame, payload);
             }
-            Http2Frame frame = Http2Frame.DecodeHeader(hdrBuf, 0);
-            if (frame == null) {
-                break; // 帧头畸形或协议违规
-            }
-            byte[] payload = null;
-            if (frame.length > 0) {
-                payload = new byte[frame.length];
-                int rPayload = await this.ReadExactAsync(payload, frame.length);
-                if (rPayload < frame.length) {
-                    break;
-                }
-            }
-            this.DispatchFrame(frame, payload);
-        }
-        this.Close();
+        } catch (Exception ex) {
+            // Frame-loop boundary: malformed peer input fails all outstanding requests.
+            this.connected = false;
+        } finally { this.Close(); this.ReleaseTransport(); }
     }
 
     // 帧分发路由核心。
-    private void DispatchFrame(Http2Frame frame, byte[] payload) {
+    private async Task DispatchFrameAsync(Http2Frame frame, byte[] payload) {
+        byte[] block = this.headerBlock.Accept(frame, payload);
         if (frame.type == Http2FrameType.SETTINGS) {
-            if ((frame.flags & Http2Flags.ACK) == 0) {
-                // 收到服务端 SETTINGS，回复确认帧（SETTINGS ACK）
-                byte[] ack = Http2Frame.BuildSettingsAck();
-                this.SendRaw(ack, ack.Length);
+            this.settingsReceived = true;
+            if ((frame.flags & Http2Flags.ACK) != 0) { return; }
+            for (int p = 0; p < frame.length; p = p + 6) {
+                int id = ((payload[p] & 255) << 8) | (payload[p + 1] & 255);
+                long value = ((long)(payload[p + 2] & 255) << 24) | ((long)(payload[p + 3] & 255) << 16)
+                    | ((long)(payload[p + 4] & 255) << 8) | (long)(payload[p + 5] & 255);
+                if (id == 2 || (id == 4 && value > 2147483647) || (id == 5 && (value < 16384 || value > 16777215))) { throw new IOException("Invalid HTTP2 server settings"); }
+                if (id == 3) { this.peerMaxStreams = value < 16 ? (int)value : 16; }
+                if (id == 4) {
+                    lock (this.activeStreams) {
+                        int delta = (int)value - this.initialStreamWindow;
+                        for (int i = 0; i < this.activeStreams.Count; i = i + 1) {
+                            long next = (long)this.activeStreams[i].outboundWindow + delta;
+                            if (next > 2147483647 || next < -2147483647) { throw new IOException("HTTP2 window overflow"); }
+                            this.activeStreams[i].outboundWindow = (int)next;
+                        }
+                        this.initialStreamWindow = (int)value;
+                    }
+                }
             }
+            byte[] ack = Http2Frame.BuildSettingsAck();
+            await this.SendRawAsync(ack, ack.Length);
         } else if (frame.type == Http2FrameType.PING) {
             if ((frame.flags & Http2Flags.ACK) == 0) {
-                // 收到服务端 PING，回复相同的 8 字节不透明数据（PING ACK）
-                byte[] pingAck = Http2Frame.BuildPing(payload, true);
-                this.SendRaw(pingAck, pingAck.Length);
+                byte[] ack = Http2Frame.BuildPing(payload, true);
+                await this.SendRawAsync(ack, ack.Length);
             }
-        } else if (frame.type == Http2FrameType.HEADERS) {
-            Http2Stream st = this.FindStream(frame.streamId);
-            if (st != null && payload != null) {
-                List<HpackHeader> headers = this.inboundHpack.DecodeHeaderBlock(payload, 0, payload.Length);
-                for (int i = 0; i < headers.Count; i = i + 1) {
-                    st.AddHeader(headers[i].name, headers[i].value);
-                }
-                if ((frame.flags & Http2Flags.END_STREAM) != 0) {
-                    st.Complete();
-                }
-            }
+        } else if (frame.type == Http2FrameType.HEADERS || frame.type == Http2FrameType.CONTINUATION) {
+            Http2Stream stream = this.FindStream(frame.streamId);
+            if (stream == null || stream.completed || stream.headersReceived) { throw new IOException("Unexpected HTTP2 headers or unsupported trailers"); }
+            if (block == null) { return; }
+            this.inboundHpack.maxHeaderBytes = this.maxHeaderBytes;
+            List<HpackHeader> headers = this.inboundHpack.DecodeHeaderBlock(block, 0, block.Length);
+            stream.declaredLength = Http2HeaderBlock.Validate(headers, false);
+            if (stream.declaredLength > stream.maxBodyBytes && !stream.suppressBody) { throw new IOException("HTTP2 response content-length limit"); }
+            for (int i = 0; i < headers.Count; i = i + 1) { stream.AddHeader(headers[i].name, headers[i].value); }
+            stream.headersReceived = true;
+            if (stream.responseStatus == 204 || stream.responseStatus == 304) { stream.suppressBody = true; }
+            if (this.headerBlock.endStream) { stream.Complete(); }
         } else if (frame.type == Http2FrameType.DATA) {
-            Http2Stream st = this.FindStream(frame.streamId);
-            if (st != null && payload != null) {
-                st.AppendBody(payload, 0, payload.Length);
-                if ((frame.flags & Http2Flags.END_STREAM) != 0) {
-                    st.Complete();
-                }
+            Http2Stream stream = this.FindStream(frame.streamId);
+            if (stream == null || !stream.headersReceived || stream.completed) { throw new IOException("Unexpected HTTP2 DATA"); }
+            int offset = Http2HeaderBlock.DataOffset(frame, payload);
+            int count = Http2HeaderBlock.DataLength(frame, payload);
+            stream.inboundWindow = stream.inboundWindow - frame.length;
+            this.inboundConsumed = this.inboundConsumed + frame.length;
+            if (stream.inboundWindow < 0 || this.inboundConsumed > 65535) { throw new IOException("HTTP2 receive window exceeded"); }
+            lock (this.activeStreams) {
+                if (count > 8388608 - this.bufferedResponseBytes) { throw new IOException("HTTP2 aggregate response budget"); }
+                stream.AppendBody(payload, offset, count);
+                this.bufferedResponseBytes = this.bufferedResponseBytes + count;
             }
-            // 流控回补：向服务端回发 WINDOW_UPDATE 恢复窗口
-            if (payload != null && payload.Length > 0) {
-                this.inboundConsumed = this.inboundConsumed + payload.Length;
-                if (this.inboundConsumed >= 32768) {
-                    this.SendWindowUpdate(0, this.inboundConsumed);
-                    this.inboundConsumed = 0;
-                }
-                if (frame.streamId > 0 && (frame.flags & Http2Flags.END_STREAM) == 0) {
-                    this.SendWindowUpdate(frame.streamId, payload.Length);
-                }
+            if ((frame.flags & Http2Flags.END_STREAM) != 0) { stream.Complete(); }
+            if (frame.length > 0) {
+                await this.SendWindowUpdateAsync(0, frame.length);
+                this.inboundConsumed = this.inboundConsumed - frame.length;
+                if (!stream.completed) { await this.SendWindowUpdateAsync(frame.streamId, frame.length); stream.inboundWindow = stream.inboundWindow + frame.length; }
             }
         } else if (frame.type == Http2FrameType.WINDOW_UPDATE) {
-            if (payload != null && payload.Length >= 4) {
-                int increment = ((payload[0] & 127) << 24) | ((payload[1] & 255) << 16)
-                              | ((payload[2] & 255) << 8) | (payload[3] & 255);
-                if (increment <= 0) {
-                    this.Close();
-                    return;
-                }
+            int increment = ((payload[0] & 127) << 24) | ((payload[1] & 255) << 16) | ((payload[2] & 255) << 8) | (payload[3] & 255);
+            if (increment == 0) { throw new IOException("Zero HTTP2 window update"); }
+            lock (this.activeStreams) {
                 if (frame.streamId == 0) {
-                    this.stateLockWait();
-                    this.outboundConnWindow = this.outboundConnWindow + increment;
-                    this.stateLockRelease();
+                    long next = (long)this.outboundConnWindow + increment;
+                    if (next > 2147483647) { throw new IOException("HTTP2 connection window overflow"); }
+                    this.outboundConnWindow = (int)next;
+                } else {
+                    if (frame.streamId >= this.nextStreamId) { throw new IOException("HTTP2 window update on idle stream"); }
+                    for (int i = 0; i < this.activeStreams.Count; i = i + 1) {
+                        Http2Stream stream = this.activeStreams[i];
+                        if (stream.streamId == frame.streamId) {
+                            long next = (long)stream.outboundWindow + increment;
+                            if (next > 2147483647) { throw new IOException("HTTP2 stream window overflow"); }
+                            stream.outboundWindow = (int)next;
+                        }
+                    }
                 }
             }
         } else if (frame.type == Http2FrameType.RST_STREAM) {
-            Http2Stream st = this.FindStream(frame.streamId);
-            if (st != null) {
-                int err = 0;
-                if (payload != null && payload.Length >= 4) {
-                    err = ((payload[0] & 255) << 24) | ((payload[1] & 255) << 16)
-                        | ((payload[2] & 255) << 8) | (payload[3] & 255);
-                }
-                st.Reset(err);
-            }
-        } else if (frame.type == Http2FrameType.GOAWAY) {
-            int lastStreamId = 0;
-            if (payload != null && payload.Length >= 4) {
-                lastStreamId = ((payload[0] & 127) << 24) | ((payload[1] & 255) << 16)
-                             | ((payload[2] & 255) << 8) | (payload[3] & 255);
-            }
-            this.stateLockWait();
-            for (int i = 0; i < this.activeStreams.Count; i = i + 1) {
-                if (this.activeStreams[i].streamId > lastStreamId) {
-                    this.activeStreams[i].Reset(Http2Error.REFUSED_STREAM);
-                }
-            }
-            this.stateLockRelease();
-        }
+            if (frame.streamId >= this.nextStreamId) { throw new IOException("HTTP2 reset on idle stream"); }
+            Http2Stream stream = this.FindStream(frame.streamId);
+            if (stream != null) { stream.Reset(Http2Error.CANCEL); }
+        } else if (frame.type == Http2FrameType.PUSH_PROMISE) { throw new IOException("HTTP2 push unsupported"); }
+        else if (frame.type == Http2FrameType.PRIORITY) {
+            int dependency = ((payload[0] & 127) << 24) | ((payload[1] & 255) << 16) | ((payload[2] & 255) << 8) | (payload[3] & 255);
+            if (dependency == frame.streamId) { throw new IOException("HTTP2 priority self dependency"); }
+        } else if (frame.type == Http2FrameType.GOAWAY) { this.Close(); }
     }
 
     private Http2Stream FindStream(int id) {
-        this.stateLockWait();
-        for (int i = 0; i < this.activeStreams.Count; i = i + 1) {
-            if (this.activeStreams[i].streamId == id) {
-                Http2Stream s = this.activeStreams[i];
-                this.stateLockRelease();
-                return s;
+        lock (this.activeStreams) {
+            for (int i = 0; i < this.activeStreams.Count; i = i + 1) {
+                if (this.activeStreams[i].streamId == id) { return this.activeStreams[i]; }
             }
         }
-        this.stateLockRelease();
         return null;
-    }
-
-    private void stateLockWait() {
-        this.sendLock.WaitOne();
-    }
-
-    private void stateLockRelease() {
-        this.sendLock.ReleaseMutex();
     }
 
     // 在当前单条 HTTP/2 多路复用连接上发起异步请求并等待本流完成。
     public async HttpResponse SendAsync(string method, string path, string hostHeader, List<HpackHeader> extraHeaders, string body) {
         if (!this.connected) { return null; }
-        int sid = 0;
-        Http2Stream stream = null;
-
-        this.stateLockWait();
-        sid = this.nextStreamId;
-        this.nextStreamId = this.nextStreamId + 2;
-        stream = new Http2Stream(sid);
-        this.activeStreams.Add(stream);
-        this.stateLockRelease();
-
-        // 1. 构建 HTTP/2 伪头部（RFC 7540 §8.1.2.3）
         List<HpackHeader> headers = new List<HpackHeader>();
         headers.Add(new HpackHeader(":method", method));
         headers.Add(new HpackHeader(":path", path != null && path.Length > 0 ? path : "/"));
         headers.Add(new HpackHeader(":scheme", this.isSecure ? "https" : "http"));
         headers.Add(new HpackHeader(":authority", hostHeader != null ? hostHeader : this.host));
-
         if (extraHeaders != null) {
             for (int i = 0; i < extraHeaders.Count; i = i + 1) {
+                if (extraHeaders[i].name.StartsWith(":")) { throw new IOException("Extra HTTP2 pseudo-header"); }
                 headers.Add(extraHeaders[i]);
             }
         }
-
-        bool hasBody = body != null && body.Length > 0;
-        if (hasBody) {
-            headers.Add(new HpackHeader("content-length", Convert.ToString(body.Length)));
+        int bodyLength = body == null ? 0 : body.Length;
+        if (bodyLength > 8388608) { throw new IOException("HTTP2 request body limit"); }
+        int declared = Http2HeaderBlock.Validate(headers, true);
+        if (declared >= 0 && declared != bodyLength) { throw new IOException("HTTP2 request content-length mismatch"); }
+        if (declared < 0 && bodyLength > 0) { headers.Add(new HpackHeader("content-length", Convert.ToString(bodyLength))); }
+        int headerBytes = 0;
+        for (int i = 0; i < headers.Count; i = i + 1) {
+            headerBytes = headerBytes + headers[i].name.Length + headers[i].value.Length + 32;
+            if (headers.Count > 128 || headerBytes > this.maxHeaderBytes || headerBytes > 65536) { throw new IOException("HTTP2 request header limit"); }
         }
-
-        // 2. 编码 HPACK 头部载荷
-        byte[] hpackBlock = null;
-        this.stateLockWait();
-        hpackBlock = this.outboundHpack.EncodeHeaders(headers, true);
-        this.stateLockRelease();
-
-        // 3. 发送 HEADERS 帧
-        int hdrFlags = Http2Flags.END_HEADERS;
-        if (!hasBody) {
-            hdrFlags = hdrFlags | Http2Flags.END_STREAM;
+        await this.wireGate.Wait();
+        Http2Stream stream = null;
+        lock (this.activeStreams) {
+            if (this.activeStreams.Count >= this.maxConcurrentStreams || this.activeStreams.Count >= this.peerMaxStreams || this.activeStreams.Count >= 16 || this.nextStreamId > 2147483645) { this.wireGate.Signal(); return null; }
+            stream = new Http2Stream(this.nextStreamId);
+            this.nextStreamId = this.nextStreamId + 2;
+            stream.outboundWindow = this.initialStreamWindow;
+            stream.maxBodyBytes = this.maxResponseBytes > 0 && this.maxResponseBytes <= 8388608 ? this.maxResponseBytes : 8388608;
+            stream.suppressBody = method == "HEAD";
+            this.activeStreams.Add(stream);
         }
-        byte[] hdrFrameHdr = Http2Frame.EncodeHeader(hpackBlock.Length, Http2FrameType.HEADERS, hdrFlags, sid);
-        byte[] fullHdrPkt = new byte[9 + hpackBlock.Length];
-        NativeMemory.Copy((nint)fullHdrPkt, (nint)hdrFrameHdr, 9);
-        NativeMemory.Copy((nint)fullHdrPkt + 9, (nint)hpackBlock, hpackBlock.Length);
-        await this.SendRawAsync(fullHdrPkt, fullHdrPkt.Length);
-
-        // 4. 发送可选的 DATA 帧（RFC 7540 §4.1: 严格切片为不超过 16KB 帧上限的序列）
-        if (hasBody) {
-            byte[] bodyBytes = body.ToBytes();
-            int offset = 0;
-            int totalLen = bodyBytes.Length;
-            int maxChunk = Http2Settings.DEFAULT_MAX_FRAME_SIZE; // RFC 7540 默认单帧上限
-
-            while (offset < totalLen) {
-                int remaining = totalLen - offset;
-                int chunkSize = remaining < maxChunk ? remaining : maxChunk;
-                bool isLast = (offset + chunkSize >= totalLen);
-                int dataFlags = isLast ? Http2Flags.END_STREAM : 0;
-
-                byte[] dataFrameHdr = Http2Frame.EncodeHeader(chunkSize, Http2FrameType.DATA, dataFlags, sid);
-                byte[] fullDataPkt = new byte[9 + chunkSize];
-                NativeMemory.Copy((nint)fullDataPkt, (nint)dataFrameHdr, 9);
-                NativeMemory.Copy((nint)fullDataPkt + 9, (nint)bodyBytes + offset, chunkSize);
-                await this.SendRawAsync(fullDataPkt, fullDataPkt.Length);
-
-                offset = offset + chunkSize;
+        int sid = stream.streamId;
+        int budget = this.timeoutMs > 0 ? this.timeoutMs : 30000;
+        long deadline = Stopwatch.GetMilliseconds() + budget;
+        HttpDeadlineToken watch = HttpDeadline.Arm(this.sock, budget, budget);
+        try {
+            try {
+                byte[] encoded = this.outboundHpack.EncodeHeaders(headers, false);
+                int offset = 0;
+                bool first = true;
+                while (offset < encoded.Length || first) {
+                    int size = encoded.Length - offset;
+                    if (size > 16384) { size = 16384; }
+                    int flags = offset + size == encoded.Length ? Http2Flags.END_HEADERS : 0;
+                    if (first && bodyLength == 0) { flags = flags | Http2Flags.END_STREAM; }
+                    byte[] packet = this.Packet(first ? Http2FrameType.HEADERS : Http2FrameType.CONTINUATION, flags, sid, encoded, offset, size);
+                    await this.SendUnlockedAsync(packet, packet.Length);
+                    offset = offset + size;
+                    first = false;
+                }
+            } finally { this.wireGate.Signal(); }
+            if (bodyLength > 0) {
+                byte[] bodyBytes = body.ToBytes();
+                int offset = 0;
+                while (offset < bodyLength && this.connected && !stream.completed) {
+                    int size = 0;
+                    lock (this.activeStreams) {
+                        size = bodyLength - offset;
+                        if (size > 16384) { size = 16384; }
+                        if (size > this.outboundConnWindow) { size = this.outboundConnWindow; }
+                        if (size > stream.outboundWindow) { size = stream.outboundWindow; }
+                        if (size > 0) { this.outboundConnWindow = this.outboundConnWindow - size; stream.outboundWindow = stream.outboundWindow - size; }
+                    }
+                    if (Stopwatch.GetMilliseconds() >= deadline) { this.Close(); return null; }
+                    if (size <= 0) { await Task.Delay(2); continue; }
+                    byte[] packet = this.Packet(Http2FrameType.DATA, offset + size == bodyLength ? Http2Flags.END_STREAM : 0, sid, bodyBytes, offset, size);
+                    await this.SendRawAsync(packet, packet.Length);
+                    offset = offset + size;
+                }
             }
-        }
-
-        // 5. 在当前流的专属门语上异步挂起，等待响应数据到达唤醒
-        await stream.gate.Wait();
-        stream.gate.Close();
-
-        // 6. 从活跃流列表移除
-        this.stateLockWait();
-        for (int k = 0; k < this.activeStreams.Count; k = k + 1) {
-            if (this.activeStreams[k].streamId == sid) {
-                this.activeStreams.RemoveAt(k);
-                break;
+            while (!stream.completed && this.connected) {
+                if (Stopwatch.GetMilliseconds() >= deadline) { this.Close(); return null; }
+                await Task.Delay(2);
             }
-        }
-        this.stateLockRelease();
-
-        if (stream.errorCode != 0) {
+            if (!stream.completed || stream.errorCode != 0 || !stream.headersReceived) { return null; }
+            HttpResponse response = new HttpResponse();
+            response.statusCode = stream.responseStatus;
+            response.body = stream.responseBody.ToString();
+            for (int i = 0; i < stream.responseHeaders.Count; i = i + 1) {
+                HpackHeader h = stream.responseHeaders[i];
+                if (!h.name.StartsWith(":")) { response.SetHeader(h.name, h.value); }
+            }
+            return response;
+        } catch (Exception ex) {
+            // Transport boundary: discard a potentially partial frame before returning failure.
+            this.Close();
             return null;
-        }
-
-        HttpResponse resp = new HttpResponse();
-        resp.statusCode = stream.responseStatus;
-        resp.body = stream.responseBody.ToString();
-        for (int h = 0; h < stream.responseHeaders.Count; h = h + 1) {
-            HpackHeader rh = stream.responseHeaders[h];
-            if (!rh.name.StartsWith(":")) {
-                resp.SetHeader(rh.name, rh.value);
+        } finally {
+            HttpDeadline.Disarm(watch);
+            stream.gate.Close();
+            lock (this.activeStreams) {
+                for (int i = 0; i < this.activeStreams.Count; i = i + 1) {
+                    if (this.activeStreams[i].streamId == sid) { this.bufferedResponseBytes = this.bufferedResponseBytes - stream.bodyLength; this.activeStreams.RemoveAt(i); break; }
+                }
             }
         }
-        return resp;
+    }
+    private byte[] Packet(int type, int flags, int id, byte[] data, int offset, int count) {
+        byte[] packet = new byte[9 + count];
+        byte[] hdr = Http2Frame.EncodeHeader(count, type, flags, id);
+        NativeMemory.Copy((nint)packet, (nint)hdr, 9);
+        if (count > 0) { NativeMemory.Copy((nint)packet + 9, (nint)data + offset, count); }
+        return packet;
     }
 
-    // 辅助同步直接发送原始控制报文（受出站锁保护）。
-    private void SendRaw(byte[] buf, int len) {
-        if (buf == null || len <= 0) { return; }
-        this.stateLockWait();
-        try {
-            if (this.tls != null) {
-                this.tls.SendBytesAsync(buf, len);
-            } else if (this.sock >= 0) {
-                Socket.Send(this.sock, buf, len);
-            }
-        } catch (Exception ex) {
-            this.connected = false;
+    private async int SendUnlockedAsync(byte[] buf, int len) {
+        int offset = 0;
+        while (offset < len && this.connected) {
+            byte[] part = buf;
+            if (offset > 0) { part = new byte[len - offset]; NativeMemory.Copy((nint)part, (nint)buf + offset, part.Length); }
+            int sent = 0;
+            if (this.tls != null) { sent = await this.tls.SendBytesAsync(part, len - offset); }
+            else if (this.sock >= 0) { sent = await Socket.SendAsync(this.sock, part, len - offset); }
+            if (sent <= 0 || sent > len - offset) { throw new IOException("HTTP2 send failed"); }
+            offset = offset + sent;
         }
-        this.stateLockRelease();
+        if (offset != len) { throw new IOException("HTTP2 connection closed"); }
+        return offset;
     }
-
-    // 异步串行发送完整数据帧。
     private async int SendRawAsync(byte[] buf, int len) {
-        if (buf == null || len <= 0) { return 0; }
-        this.stateLockWait();
-        int sent = 0;
-        try {
-            if (this.tls != null) {
-                sent = await this.tls.SendBytesAsync(buf, len);
-            } else if (this.sock >= 0) {
-                sent = await Socket.SendAsync(this.sock, buf, len);
-            }
-        } catch (Exception ex) {
-            this.connected = false;
-        }
-        this.stateLockRelease();
-        return sent;
+        await this.wireGate.Wait();
+        try { return await this.SendUnlockedAsync(buf, len); }
+        finally { this.wireGate.Signal(); }
     }
 
     // 精确读取指定字节数。
@@ -410,31 +426,23 @@ public class Http2ClientConnection : IDisposable {
 
     public void Close() {
         this.connected = false;
-        if (this.tls != null) {
-            this.tls.Close();
-            this.tls = null;
+        if (this.sock >= 0) { Socket.ShutdownBoth(this.sock); }
+        lock (this.activeStreams) {
+            for (int i = 0; i < this.activeStreams.Count; i = i + 1) { this.activeStreams[i].Reset(Http2Error.CONNECT_ERROR); }
         }
-        if (this.tlsCtx != null) {
-            this.tlsCtx.Free();
-            this.tlsCtx = null;
-        }
-        if (this.sock >= 0) {
-            Socket.Close(this.sock);
-            this.sock = -1;
-        }
-        this.stateLockWait();
-        for (int i = 0; i < this.activeStreams.Count; i = i + 1) {
-            this.activeStreams[i].Reset(Http2Error.CONNECT_ERROR);
-        }
-        this.activeStreams.Clear();
-        this.stateLockRelease();
+    }
+
+    private void ReleaseTransport() {
+        if (this.tls != null) { this.tls.Close(); this.tls = null; }
+        if (this.tlsCtx != null) { this.tlsCtx.Free(); this.tlsCtx = null; }
+        if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
     }
 
     // 发送 WINDOW_UPDATE 帧更新指定流（或连接级 streamId=0）的接收窗口配额
     public void SendWindowUpdate(int streamId, int increment) {
         if (increment <= 0) { return; }
         byte[] wu = Http2Frame.BuildWindowUpdate(streamId, increment);
-        this.SendRaw(wu, wu.Length);
+        Task.Spawn(this.SendWindowUpdateAsync(streamId, increment));
     }
 
     public async Task SendWindowUpdateAsync(int streamId, int increment) {

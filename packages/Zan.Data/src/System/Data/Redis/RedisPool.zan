@@ -114,55 +114,28 @@ public partial class RedisPool : IDisposable {
     }
 
     void NoteOpenEpisode(string detail) {
-        if (!this.core.OpenFailing()) {
-            Console.WriteLine("[redispool] " + this.host + ":"
-                + Convert.ToString(this.port) + " " + detail);
-        }
+        if (!this.core.OpenFailing()) { this.WriteOpenError(detail); }
+    }
+
+    void WriteOpenError(string detail) {
+        Console.WriteLine("[redispool] " + this.host + ":"
+            + Convert.ToString(this.port) + " " + detail);
     }
 
     // 借出一个客户端。
     public async RedisClient AcquireAsync() {
-        PoolWait wait = new PoolWait();
-        while (true) {
-            if (this.core.IsClosed()) { return null; }
-            RedisClient pooled = this.core.TakeIdle();
-            while (pooled != null) {
-                if (pooled.IsConnected()) { return pooled; }
-                this.core.Drop(pooled);
-                pooled = this.core.TakeIdle();
-            }
-            if (this.core.OpenBlocked()) {
-                return null;
-            }
-            if (this.core.TryReserve()) {
-                RedisClient opened = null;
-                try {
-                    opened = await this.OpenOne();
-                } catch (Exception ex) {
-                    this.NoteOpenEpisode("open error: " + ex.Message);
-                    this.core.NoteOpenFailed();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                if (opened == null || !opened.IsConnected()) {
-                    this.core.NoteOpenFailed();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                if (this.core.IsClosed()) {
-                    opened.Close();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                this.core.NoteOpenOk();
-                this.core.Borrow(opened);
-                return opened;
-            }
-            if (!await this.core.WaitForRelease(wait)) {
-                return null;
-            }
-        }
-        return null;
+        PoolOpenAsync<RedisClient> open = this.OpenOne;
+        Predicate<RedisClient> connected = RedisPool.IsUsable;
+        Action<RedisClient> close = RedisPool.CloseConnection;
+        PoolOpenFailure<RedisClient> failed = this.ReportOpenFailure;
+        return await this.core.AcquireAsync(open, connected, close, failed);
+    }
+
+    static bool IsUsable(RedisClient c) { return c.IsConnected(); }
+    static void CloseConnection(RedisClient c) { c.Close(); }
+
+    void ReportOpenFailure(RedisClient c, Exception error) {
+        if (error != null) { this.WriteOpenError("open error: " + error.Message); }
     }
 
     // 归还一个客户端。
@@ -173,7 +146,7 @@ public partial class RedisPool : IDisposable {
             this.core.Drop(client);
             return;
         }
-        this.core.Pool(client);
+        if (!this.core.Pool(client)) { client.Close(); }
     }
 
     public int IdleCount() { return this.core.IdleCount(); }
@@ -185,11 +158,11 @@ public partial class RedisPool : IDisposable {
     // 关闭池：关闭所有连接并唤醒等待者。
     public void Close() {
         this.core.MarkClosed();
-        RedisClient client = this.core.TakeIdle();
+        RedisClient client = this.core.TakeClosing();
         while (client != null) {
             client.Close();
             this.core.Drop(client);
-            client = this.core.TakeIdle();
+            client = this.core.TakeClosing();
         }
         this.core.WakeAll();
     }

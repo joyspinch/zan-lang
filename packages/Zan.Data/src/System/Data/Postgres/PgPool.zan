@@ -17,12 +17,10 @@ namespace System.Data.Postgres;
 public class PgPool : IDisposable {
     string conninfo;
     PoolCore<PgConnection> core;
-    string lastOpenError;
 
     public PgPool(string conninfo, int maxSize) {
         this.conninfo = conninfo;
         this.core = new PoolCore<PgConnection>(maxSize);
-        this.lastOpenError = "";
     }
 
     // 以主机/端口/库/用户/密码构造连接池（内部拼成 conninfo）。
@@ -35,12 +33,7 @@ public class PgPool : IDisposable {
 
     // 新建一条物理连接（池扩容时由 AcquireAsync 调用）；失败返回 null。
     async PgConnection OpenOne() {
-        try {
-            return await PgConnection.OpenAsync(this.conninfo);
-        } catch (Exception ex) {
-            this.lastOpenError = ex.Message;
-            return null;
-        }
+        return await PgConnection.OpenAsync(this.conninfo);
     }
 
     // 借出连接：优先复用空闲连接，
@@ -48,63 +41,20 @@ public class PgPool : IDisposable {
     // 硬上限（见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
     // 连接池关闭后返回 null。
     public async PgConnection AcquireAsync() {
-        PoolWait wait = new PoolWait();
-        while (true) {
-            if (this.core.IsClosed()) {
-                return null;
-            }
-            PgConnection pooled = this.core.TakeIdle();
-            while (pooled != null) {
-                // 连接在停泊期间可能失效（服务器重启、空闲
-                // 超时）：将其驱逐，为等待者腾出槽位。
-                if (pooled.IsConnected()) {
-                    return pooled;
-                }
-                this.core.Drop(pooled);
-                pooled = this.core.TakeIdle();
-            }
-            // 上一次建连失败后退避：后端不可达时，若每次获取都重试建连，
-            // 失败本身就成了每请求的固定开销（失败的本地 open 也要约
-            // 125us），足以让命中路由的吞吐掉一个数量级。
-            if (this.core.OpenBlocked()) {
-                return null;
-            }
-            if (this.core.TryReserve()) {
-                PgConnection opened = await this.OpenOne();
-                if (opened == null || !opened.IsConnected()) {
-                    if (opened != null) {
-                        opened.Close();
-                    }
-                    /* 契约：借出失败折进 null（下面随即记退避）。根因只在
-                       失败 episode 的首条记录诊断，退避期内零星重试静默。 */
-                    if (!this.core.OpenFailing()) {
-                        string why = opened != null ? opened.lastError : this.lastOpenError;
-                        Console.WriteLine("[pgpool] connect failed: "
-                            + (why.Length > 0 ? why
-                                : "refused, timeout, or auth rejected"));
-                    }
-                    this.lastOpenError = "";
-                    this.core.NoteOpenFailed();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                if (this.core.IsClosed()) {
-                    opened.Close();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                this.core.NoteOpenOk();
-                this.lastOpenError = "";
-                this.core.Borrow(opened);
-                return opened;
-            }
-            // 连接池已满：交给共享的有界等待（见 PoolWait），
-            // 预算耗尽以 null 快速失败。
-            if (!await this.core.WaitForRelease(wait)) {
-                return null;
-            }
-        }
-        return null;
+        PoolOpenAsync<PgConnection> open = this.OpenOne;
+        Predicate<PgConnection> connected = PgPool.IsUsable;
+        Action<PgConnection> close = PgPool.CloseConnection;
+        PoolOpenFailure<PgConnection> failed = PgPool.ReportOpenFailure;
+        return await this.core.AcquireAsync(open, connected, close, failed);
+    }
+
+    static bool IsUsable(PgConnection c) { return c.IsConnected(); }
+    static void CloseConnection(PgConnection c) { c.Close(); }
+
+    static void ReportOpenFailure(PgConnection c, Exception error) {
+        string why = error != null ? error.Message : (c != null ? c.lastError : "");
+        Console.WriteLine("[pgpool] connect failed: "
+            + (why.Length > 0 ? why : "refused, timeout, or auth rejected"));
     }
 
     // 将连接归还连接池。已损坏或 Close() 之后的
@@ -133,7 +83,7 @@ public class PgPool : IDisposable {
                 return;
             }
         }
-        this.core.Pool(c);
+        if (!this.core.Pool(c)) { c.Close(); }
     }
 
     // 空闲（已入池、立即可用）连接数。
@@ -155,11 +105,11 @@ public class PgPool : IDisposable {
     // 被借出的连接在归还时关闭。
     public void Close() {
         this.core.MarkClosed();
-        PgConnection c = this.core.TakeIdle();
+        PgConnection c = this.core.TakeClosing();
         while (c != null) {
             c.Close();
             this.core.Drop(c);
-            c = this.core.TakeIdle();
+            c = this.core.TakeClosing();
         }
         this.core.WakeAll();
     }

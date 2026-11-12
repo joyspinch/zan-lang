@@ -2,42 +2,58 @@ using System;
 
 namespace System.IO.Compression;
 
-// HTTP 内容编码的解码桥：把 Content-Encoding 头指名的编码映射到本包
-// 的编解码实现。装到 HTTP 客户端上，客户端就自动解压：
-//
-//     http.SetContentDecoder(System.IO.Compression.ContentCoding.Decode);
-//
-// 为什么是"注入"而不是客户端直接调用：gzip/deflate 的实现在压缩包里，
-// 网络包不能硬依赖压缩包——压缩包不装，网络包就连带编译不过。压缩包
-// 提供实现，调用方把解码器注入给客户端，两边都不绑死。
+// 压缩包提供预算感知的解码桥，网络包不反向依赖压缩实现。
+// http.SetBoundedContentDecoder(ContentCoding.DecodeBounded);
 public class ContentCoding {
-    // 按 Content-Encoding 解码响应正文。gzip / x-gzip / deflate；
-    // 其它编码或解码失败返回 null（调用方据此报错，不把压缩字节当正文）。
+    // 独立解码使用包级硬上限；HTTP 调用方必须传递自己的响应预算。
     public static byte[] Decode(string encoding, byte[] data) {
-        if (encoding == null || data == null) { return null; }
+        return ContentCoding.DecodeBounded(encoding, data, 268435456);
+    }
+
+    // 不支持、格式损坏或输出超过预算均返回 null。
+    public static byte[] DecodeBounded(string encoding, byte[] data, int maxOut) {
+        if (encoding == null || data == null || maxOut <= 0 || maxOut > 268435456) { return null; }
         string enc = encoding.Trim().ToLower();
         if (enc == "gzip" || enc == "x-gzip") {
-            return GZip.Decompress(data);
+            return GZip.DecompressBounded(data, maxOut);
         }
         if (enc == "deflate") {
-            return ContentCoding.InflateDeflate(data);
+            return ContentCoding.InflateDeflate(data, maxOut);
         }
         return null;
     }
 
-    // deflate 在 HTTP 里有两种线上形态：RFC 1950 的 zlib 包装（2 字节头
-    // + deflate 流 + adler32 尾）和裸 DEFLATE 流，服务器两种都发过。
-    // 按 zlib 头判定（CM=8，且 (CMF<<8|FLG) 是 31 的倍数）决定要不要
-    // 跳过那 2 字节——猜错就会解出一堆垃圾或直接失败。
-    static byte[] InflateDeflate(byte[] data) {
-        if (data.Length >= 2) {
+    // HTTP deflate 兼容 zlib 包装与裸流；包装必须完整且校验通过。
+    private static byte[] InflateDeflate(byte[] data, int maxOut) {
+        int offset = 0;
+        int length = data.Length;
+        bool zlib = false;
+        if (length >= 2) {
             int cmf = data[0] & 255;
             int flg = data[1] & 255;
-            bool zlib = (cmf & 15) == 8 && ((cmf * 256 + flg) % 31) == 0;
+            zlib = (cmf & 15) == 8 && ((cmf * 256 + flg) % 31) == 0;
             if (zlib) {
-                return Deflate.Inflate(data, 2, data.Length - 2, 0);
+                if ((cmf >> 4) > 7 || (flg & 32) != 0 || length < 6) { return null; }
+                offset = 2;
+                length = length - 6;
             }
         }
-        return Deflate.Inflate(data, 0, data.Length, 0);
+        int consumed = 0;
+        byte[] decoded = Deflate.InflateConsumed(data, offset, length, maxOut, ref consumed);
+        if (decoded == null || consumed != length) { return null; }
+        if (zlib) {
+            int a = 1;
+            int b = 0;
+            for (int i = 0; i < decoded.Length; i = i + 1) {
+                a = (a + (decoded[i] & 255)) % 65521;
+                b = (b + a) % 65521;
+            }
+            int trailer = data.Length - 4;
+            if ((data[trailer] & 255) != (b >> 8) || (data[trailer + 1] & 255) != (b & 255)
+                || (data[trailer + 2] & 255) != (a >> 8) || (data[trailer + 3] & 255) != (a & 255)) {
+                return null;
+            }
+        }
+        return decoded;
     }
 }

@@ -1,0 +1,185 @@
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Net.Tls;
+
+namespace System.Net.Http.Client;
+
+public partial class HttpClient {
+    // A physical channel carries no pool permit. The caller owns it until it
+    // either returns it to the pool or disposes it. Streaming callers own their
+    // reads directly and do not need a buffered response framer.
+    private async PooledHttpConnection OpenChannel(bool buffered) {
+        TcpClient conn = await this.ConnectTarget();
+        if (conn == null) { return null; }
+        TlsContext ctx = null;
+        TlsStream stream = null;
+        bool opened = false;
+        try {
+            if (this.useTls) {
+                ctx = this.ClientTlsContext();
+                if (ctx == null) {
+                    string err = TlsStream.LastError();
+                    if (err == "") { err = "TLS 上下文初始化失败"; }
+                    throw new HttpRequestException(err);
+                }
+                if (!this.verifyTls) { ctx.DisableVerify(); }
+                this.ApplyPinning(ctx);
+                stream = await this.ConnectTls(ctx, conn.Sock());
+                if (stream == null) {
+                    string err = TlsStream.LastError();
+                    if (err == "") { err = "TLS 握手失败"; }
+                    throw new HttpRequestException(err);
+                }
+            }
+            HttpFramer fr = null;
+            if (buffered) {
+                if (stream != null) { fr = HttpFramerTls.Create(stream); }
+                else { fr = HttpFramer.Create(conn.Sock()); }
+            }
+            PooledHttpConnection channel = new PooledHttpConnection(conn, stream, ctx, fr);
+            opened = true;
+            return channel;
+        } finally {
+            if (!opened) {
+                if (stream != null) { stream.Close(); }
+                conn.Close();
+                if (ctx != null) { ctx.Free(); }
+            }
+        }
+    }
+
+    private async int WriteTextRequest(PooledHttpConnection channel, string req) {
+        if (channel.tls != null) { return await channel.tls.SendAsync(req, req.Length); }
+        return await channel.conn.SendAsync(req);
+    }
+
+    private async int WriteStringBytes(PooledHttpConnection channel, string data, int length) {
+        if (channel.tls != null) { return await channel.tls.SendAsync(data, length); }
+        return await channel.conn.SendBytesAsync(data, length);
+    }
+
+    private async int WriteRawBytes(PooledHttpConnection channel, byte[] data, int length) {
+        if (channel.tls != null) { return await channel.tls.SendBytesAsync(data, length); }
+        return await channel.conn.SendBytesAsync(data, length);
+    }
+
+    private static bool ResponseHasNoBody(HttpResponse response, string method) {
+        return method == "HEAD" || response.statusCode == 204
+            || response.statusCode == 304 || response.statusCode == 101;
+    }
+
+    // Only EOF before a final head returns null. The caller decides whether
+    // that is a stale pooled connection or a failed one-shot request.
+    // The header cap is separate from the response body budget for every
+    // buffered entry, including text requests with keep-alive disabled.
+    private async HttpResponse ReadFramedResponse(HttpFramer fr, string path,
+            string method, HttpDeadlineToken watch, bool binary) {
+        HttpDeadline.Touch(watch, this.ReadBudget());
+        int he = 0;
+        string head = "";
+        HttpResponse resp = null;
+        while (true) {
+            he = await fr.ReadHead(65536);
+            if (he == 0) { return null; }
+            if (he < 0) {
+                throw new HttpRequestException("response header block exceeds 65536 bytes");
+            }
+            head = fr.Head(he);
+            resp = HttpResponse.Parse(head);
+            if (resp.statusCode < 100) {
+                throw new HttpRequestException("response framing malformed");
+            }
+            if (resp.statusCode >= 200 || resp.statusCode == 101) { break; }
+            fr.Consume(he);
+        }
+        int limit = this.ResponseLimit();
+        if (HttpClient.ResponseHasNoBody(resp, method)) {
+            fr.Consume(he);
+        } else {
+            if (resp.framingChunked || resp.framingHasLength) {
+                int state = await fr.ReadResponseBody(resp, he, limit);
+                if (state == -1) {
+                    if (HttpDeadline.Expired(watch)) { this.FailTimeout(); }
+                    throw new HttpRequestException(
+                        "connection closed in the middle of the response body");
+                }
+                if (state == 413) { HttpClient.FailResponseLimit(limit); }
+                if (state != 0) {
+                    throw new HttpRequestException("malformed chunked response body");
+                }
+                fr.Consume(fr.RequestBytes());
+            } else {
+                await this.ReadEofBody(fr, he, limit, resp);
+            }
+            if (binary) {
+                int length = resp.bodyBytesLen;
+                byte[] bytes = new byte[length + 1];
+                if (length > 0) {
+                    NativeMemory.PutString((nint)bytes, 0, resp.body, length);
+                }
+                resp.bodyBytes = bytes;
+            } else {
+                resp.bodyBytesLen = 0;
+            }
+        }
+        if (HttpDeadline.Expired(watch)) { this.FailTimeout(); }
+        this.AbsorbCookies(path, head);
+        return resp;
+    }
+
+    private static void FailResponseLimit(int limit) {
+        throw new HttpRequestException("response body exceeds "
+            + Convert.ToString(limit) + " bytes");
+    }
+
+    private async void ReadEofBody(HttpFramer fr, int headLength, int limit,
+            HttpResponse resp) {
+        int initial = fr.Pending() - headLength;
+        if (initial > limit) { HttpClient.FailResponseLimit(limit); }
+        ByteBuffer acc = ByteBuffer.Alloc(8192);
+        try {
+            if (initial > 0) { acc.WriteRaw(fr.Slice(headLength, initial), initial); }
+            fr.Consume(fr.Pending());
+            while (!fr.Closed()) {
+                int n = await fr.Fill();
+                if (n > 0) {
+                    if (acc.Length() > limit - n) { HttpClient.FailResponseLimit(limit); }
+                    acc.WriteRaw(fr.Slice(0, n), n);
+                    fr.Consume(n);
+                }
+            }
+            resp.body = acc.ToStr();
+            resp.bodyBytesLen = acc.Length();
+        } finally {
+            acc.Free();
+        }
+    }
+
+    private void FailMissingResponse(HttpDeadlineToken watch) {
+        if (HttpDeadline.Expired(watch)) { this.FailTimeout(); }
+        throw new HttpRequestException("connection closed before a response arrived");
+    }
+
+    private async HttpResponse RequestUnpooledAsync(string method, string path, string body) {
+        string req = this.BuildRequest(method, path, body, true);
+        PooledHttpConnection channel = await this.OpenChannel(true);
+        if (channel == null) { this.FailConnect(); }
+        HttpDeadlineToken watch = null;
+        try {
+            watch = HttpDeadline.Arm(channel.conn.Sock(), this.WriteBudget(), this.TotalBudget());
+            int sent = await this.WriteTextRequest(channel, req);
+            if (sent != req.Length) {
+                throw new HttpRequestException("request write failed");
+            }
+            HttpResponse resp = await this.ReadFramedResponse(channel.framer, path,
+                method, watch, false);
+            if (resp == null) { this.FailMissingResponse(watch); }
+            return resp;
+        } finally {
+            HttpDeadline.Disarm(watch);
+            channel.Dispose();
+        }
+    }
+}

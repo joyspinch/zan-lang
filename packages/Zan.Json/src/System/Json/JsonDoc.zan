@@ -59,15 +59,33 @@ public partial class JsonDoc {
         return JsonDoc.scratchPool.Value;
     }
 
+    // A scoped document borrows its tape until the callback returns. Nested
+    // Parse/ParseScoped calls must lease another tape, including on exceptions.
+    // Keep one reusable workspace per nesting depth on the current thread.
+    private static JsonScratch RentScratch() {
+        JsonScratch sc = JsonDoc.GetScratch();
+        while (sc.leased) {
+            if (sc.next == null) { sc.next = new JsonScratch(); }
+            sc = sc.next;
+        }
+        sc.leased = true;
+        return sc;
+    }
+
     // 零分配瞬时解析：将 JSON 字符串解析进线程局部复用缓冲并执行回调，
     // 执行期间 0 堆内存分配；回调结束后工作区自动复位，适用于控制器只读提取字段。
     public static T ParseScoped<T>(string src, JsonDocScopeFunc<T> fn) {
+        JsonScratch sc = JsonDoc.RentScratch();
+        try { return JsonDoc.ParseScopedWithScratch<T>(src, fn, sc); }
+        finally { sc.leased = false; }
+    }
+
+    private static T ParseScopedWithScratch<T>(string src, JsonDocScopeFunc<T> fn, JsonScratch sc) {
         if (src == null) { throw new JsonException("JSON source cannot be null"); }
         if (fn == null) { throw new JsonException("Scoped function cannot be null"); }
         int len = src.Length;
         int slotCap = len / 4 + 32;
         int pairCap = len / 8 + 16;
-        JsonScratch sc = JsonDoc.GetScratch();
         sc.EnsureCapacity(len, slotCap, pairCap);
         NativeMemory.PutString(sc.buf, 0, src, len);
         long ret = NativeMemory.JsonParseFast(sc.buf, (long)len, sc.slots, (long)sc.slots.Length, sc.pairs, (long)sc.pairs.Length, sc.counts);
@@ -101,12 +119,17 @@ public partial class JsonDoc {
 
     // 零分配瞬时解析无返回值重载。
     public static void ParseScoped(string src, JsonDocScopeAction fn) {
+        JsonScratch sc = JsonDoc.RentScratch();
+        try { JsonDoc.ParseScopedWithScratch(src, fn, sc); }
+        finally { sc.leased = false; }
+    }
+
+    private static void ParseScopedWithScratch(string src, JsonDocScopeAction fn, JsonScratch sc) {
         if (src == null) { throw new JsonException("JSON source cannot be null"); }
         if (fn == null) { throw new JsonException("Scoped action cannot be null"); }
         int len = src.Length;
         int slotCap = len / 4 + 32;
         int pairCap = len / 8 + 16;
-        JsonScratch sc = JsonDoc.GetScratch();
         sc.EnsureCapacity(len, slotCap, pairCap);
         NativeMemory.PutString(sc.buf, 0, src, len);
         long ret = NativeMemory.JsonParseFast(sc.buf, (long)len, sc.slots, (long)sc.slots.Length, sc.pairs, (long)sc.pairs.Length, sc.counts);
@@ -169,6 +192,12 @@ public partial class JsonDoc {
     }
 
     private static JsonDoc ParseInternal(byte[] buf, int off, int len, string src) {
+        JsonScratch sc = JsonDoc.RentScratch();
+        try { return JsonDoc.ParseInternalWithScratch(buf, off, len, src, sc); }
+        finally { sc.leased = false; }
+    }
+
+    private static JsonDoc ParseInternalWithScratch(byte[] buf, int off, int len, string src, JsonScratch sc) {
         JsonDoc d = new JsonDoc();
         d.src = src;
         d.buf = buf;
@@ -176,7 +205,6 @@ public partial class JsonDoc {
 
         int slotCap = len / 4 + 32;
         int pairCap = len / 8 + 16;
-        JsonScratch sc = JsonDoc.GetScratch();
         sc.EnsureCapacity(len, slotCap, pairCap);
 
         long ret = NativeMemory.JsonParseFast(buf, (long)len, sc.slots, (long)sc.slots.Length, sc.pairs, (long)sc.pairs.Length, sc.counts);

@@ -15,6 +15,7 @@ public abstract class AppController : Controller {
     IDbConnection lease;
     IDbConnection readLease;
     bool inTx;
+    bool commitFailed;
     bool readOnlyIntent;
     bool leaseIsRead;
 
@@ -145,17 +146,27 @@ public abstract class AppController : Controller {
     /* 提交失败（包括 false）保留 inTx，供失败路径回滚。 */
     protected async void Commit() {
         if (!this.inTx) { return; }
-        if (!await this.lease.CommitAsync()) {
-            throw new Exception("commit failed");
+        try {
+            if (!await this.lease.CommitAsync()) {
+                throw new Exception("commit failed");
+            }
+        } catch (Exception commitError) {
+            this.commitFailed = true;
+            throw;
         }
         this.inTx = false;
     }
 
-    /* 回滚失败（包括 false）保留 inTx，使收尾可重试或弃用脏连接。 */
+    /* 回滚失败即弃用状态不明的连接，收尾不得重试并覆盖原提交异常。 */
     protected async void Rollback() {
         if (!this.inTx) { return; }
-        if (!await this.lease.RollbackAsync()) {
-            throw new Exception("rollback failed");
+        try {
+            if (!await this.lease.RollbackAsync()) {
+                throw new Exception("rollback failed");
+            }
+        } catch (Exception rollbackError) {
+            this.DiscardLease();
+            throw;
         }
         this.inTx = false;
     }
@@ -211,7 +222,7 @@ public abstract class AppController : Controller {
         catch (Exception doneError) {
             if (failure == null) { failure = doneError; }
         }
-        if (failure != null) { throw failure; }
+        if (failure != null && !this.commitFailed) { throw failure; }
     }
 
     /* 供子类做每请求清理；覆盖此而非 OnAfterAsync()，后者负责释放连接。 */

@@ -20,8 +20,8 @@ public delegate void HttpUploadProgressFn(int sentBytes, int totalBytes);
 
 // 内容编码解码器：按 Content-Encoding 的值解码响应正文（gzip /
 // deflate 等）。返回 null 表示解码失败或不支持该编码。
-// 见 <see cref="HttpClient.SetContentDecoder"/>。
-public delegate byte[] HttpContentDecoder(string encoding, byte[] data);
+// See HttpClient.SetBoundedContentDecoder; enforce the budget during decode.
+public delegate byte[] HttpBoundedContentDecoder(string encoding, byte[] data, int maxDecodedBytes);
 
 // 字节通道的重定向驱动：在给定客户端上以指定方法发出一次
 // 请求并返回响应。HttpClient 的字节重定向循环以它为回调在当前/下一跳
@@ -64,6 +64,8 @@ public partial class HttpClient : IDisposable {
     private int port;
     private int timeout;
     private bool useTls;
+    private System.Threading.Mutex securityGate;
+    private bool securityFrozen;
     private bool verifyTls;
     private string clientCertificateFile;
     private string clientPrivateKeyFile;
@@ -81,11 +83,11 @@ public partial class HttpClient : IDisposable {
     private HttpCancelFn cancelProbe;
     // 上传进度探针；null = 不报进度（见 SetUploadProbe）。
     private HttpUploadProgressFn uploadProbe;
-    // 内容解码器；null = 不解码（见 SetContentDecoder）。没装解码器又
+    // 内容解码器；null = 不解码（见 SetBoundedContentDecoder）。没装解码器又
     // 碰上带 Content-Encoding 的响应时直接报错，不把压缩字节当正文。
-    private HttpContentDecoder contentDecoder;
+    private HttpBoundedContentDecoder boundedContentDecoder;
     // 全局默认的内容解码器：逐个客户端装配太啰嗦时装一次。
-    private static HttpContentDecoder defaultContentDecoder;
+    private static HttpBoundedContentDecoder defaultBoundedContentDecoder;
     // 共享外部调用预算；null 使用兼容的客户端 timeout 行为。
     private ExternalCallPolicy callPolicy;
     private string lastDownloadError;
@@ -95,13 +97,8 @@ public partial class HttpClient : IDisposable {
     // 时刻，阶段/总预算取总剩余时间的较小值——多跳链路、慢速滴流都
     // 无法把一次外呼拖过 policy 的 total。
     private long totalDeadlineUs;
-    // ---- keep-alive 连接复用（见 RequestAliveAsync）----
-    private HttpFramer ka;  // 非空 = 池中有一条空闲可复用的连接
-    private TcpClient kaConn;
-    private TlsStream kaTls;
-    private TlsContext kaCtx;
-    private bool kaBusy;  // 在途请求标志：并发请求退回一次性通道
-    private bool kaEnabled;
+    // ---- keep-alive 连接池 ----
+    private bool keepAliveEnabled;
     private HttpConnectionPool pool;
     private string traceParent;
 
@@ -134,6 +131,8 @@ public partial class HttpClient : IDisposable {
         this.port = port;
         this.timeout = 30000;
         this.useTls = false;
+        this.securityGate = new System.Threading.Mutex();
+        this.securityFrozen = false;
         this.verifyTls = true;
         this.clientCertificateFile = "";
         this.clientPrivateKeyFile = "";
@@ -146,12 +145,7 @@ public partial class HttpClient : IDisposable {
         this.callPolicy = null;
         this.lastDownloadError = "";
         this.totalDeadlineUs = 0;
-        this.ka = null;
-        this.kaConn = null;
-        this.kaTls = null;
-        this.kaCtx = null;
-        this.kaBusy = false;
-        this.kaEnabled = true;
+        this.keepAliveEnabled = true;
         this.pool = HttpConnectionPool.CreateDefault();
         this.traceParent = "";
     }
@@ -163,17 +157,27 @@ public partial class HttpClient : IDisposable {
         return client;
     }
 
+    // Security setters must finish before first use (including failed requests).
+    // Subsequent changes throw InvalidOperationException; use a new client.
     // 为此客户端启用 TLS（https）。
     public HttpClient UseTls() {
-        this.useTls = true;
-        return this;
+        this.securityGate.WaitOne();
+        try {
+            this.RequireMutableSecurity();
+            this.useTls = true;
+            return this;
+        } finally { this.securityGate.ReleaseMutex(); }
     }
 
     // 禁用服务器证书校验（仅用于开发/
     // 自签名服务器）。
     public HttpClient DisableTlsVerify() {
-        this.verifyTls = false;
-        return this;
+        this.securityGate.WaitOne();
+        try {
+            this.RequireMutableSecurity();
+            this.verifyTls = false;
+            return this;
+        } finally { this.securityGate.ReleaseMutex(); }
     }
 
     // 设置证书策略：链/主机名校验不通过（verify_result
@@ -183,12 +187,17 @@ public partial class HttpClient : IDisposable {
     // 典型用途是老系统缺根证书时按已知签发者（GlobalSign/
     // Certum 签发的 Alibaba 证书）放行。
     public HttpClient SetCertPolicy(CertPolicyFn fn) {
-        this.certPolicy = fn;
-        return this;
+        this.securityGate.WaitOne();
+        try {
+            this.RequireMutableSecurity();
+            this.certPolicy = fn;
+            return this;
+        } finally { this.securityGate.ReleaseMutex(); }
     }
 
     // 客户端 TLS 上下文（客户端证书/策略统一在此挂上）。
     public TlsContext ClientTlsContext() {
+        this.FreezeSecurity();
         TlsContext ctx;
         if (this.clientCertificateFile.Length > 0
             && this.clientPrivateKeyFile.Length > 0) {
@@ -238,7 +247,7 @@ public partial class HttpClient : IDisposable {
         return this;
     }
 
-    // 内容解码 (SetContentDecoder/ApplyContentEncoding)、探针治理、
+    // 内容解码 (SetBoundedContentDecoder/ApplyContentEncoding)、探针治理、
     // SPKI 公钥固定 (PinPublicKey) 与 mTLS 客户端证书见 HttpClient.Security.zan。
 
     // 按名称移除默认请求头（大小写不敏感）。
@@ -299,19 +308,19 @@ public partial class HttpClient : IDisposable {
     // 绑定统一外部调用预算。连接/读写仍复用现有 HTTP
     // 实现；请求/响应大小和重试能力由调用方按 policy 显式声明。
     public HttpClient SetCallPolicy(ExternalCallPolicy policy) {
-        this.callPolicy = policy;
-        if (policy != null) {
-            this.timeout = policy.TotalTimeoutMs();
-        }
-        // 新策略立刻生效：丢掉上一策略武装的总截止时间，下一次请求
-        // 按新 total 重新武装。
-        this.totalDeadlineUs = 0;
-        return this;
+        this.securityGate.WaitOne();
+        try {
+            this.RequireMutableSecurity();
+            this.callPolicy = HttpClient.CopyCallPolicy(policy);
+            if (this.callPolicy != null) { this.timeout = this.callPolicy.TotalTimeoutMs(); }
+            this.totalDeadlineUs = 0;
+            return this;
+        } finally { this.securityGate.ReleaseMutex(); }
     }
 
-    // 当前外部调用预算；未绑定时返回 null。
+    // 当前外部调用预算的独立副本；未绑定时返回 null。
     public ExternalCallPolicy CallPolicy() {
-        return this.callPolicy;
+        return HttpClient.CopyCallPolicy(this.callPolicy);
     }
 
     // 绑定 policy 后，目标必须在建连前通过同一个 URL/地址策略；
@@ -319,6 +328,7 @@ public partial class HttpClient : IDisposable {
     // ExternalTargetPolicy。DNS 多地址复核仍由 socket 层继续补齐。
     // 不允许时抛 HttpRequestException。
     private void CheckTargetPolicy() {
+        this.FreezeSecurity();
         if (this.callPolicy == null) { return; }
         bool ok = ExternalTargetPolicy.IsClientAllowed(this.host, this.port,
             this.useTls, this.callPolicy.AllowsLoopback(),
@@ -410,6 +420,7 @@ public partial class HttpClient : IDisposable {
     // 已武装时不重置：一次外呼（含 UploadFileBytesAsync 先行武装、
     // 通道随后调用）从第一跳起点计时，重定向各跳继承同一时刻。
     private void ArmTotalBudget() {
+        this.FreezeSecurity();
         if (this.callPolicy == null) {
             this.totalDeadlineUs = 0;
             return;
@@ -431,38 +442,28 @@ public partial class HttpClient : IDisposable {
     // 使用：下一次请求会重新建立连接。进程退出前或长寿命客户端
     // 空闲时调用，避免悬挂的半开连接。
     public void Close() {
-        this.DropAlive();
-        if (this.pool != null) { this.pool.CloseAll(); }
+        this.ClosePoolConnections();
     }
 
     public void Dispose() {
+        this.FreezeSecurity();
         this.Close();
         if (this.pool != null) {
             this.pool.Dispose();
             this.pool = null;
         }
+        this.securityGate.Dispose();
     }
 
     // 禁用连接复用：每个请求各建一条连接并在响应后关闭
     // （与旧版行为一致）。返回自身以便链式调用。
     public HttpClient DisableKeepAlive() {
-        this.kaEnabled = false;
-        this.DropAlive();
-        if (this.pool != null) { this.pool.CloseAll(); }
+        this.keepAliveEnabled = false;
+        this.ClosePoolConnections();
         return this;
     }
 
-    // 丢弃池中的连接。连接可能已被对端半关或处于错误状态，
-    // 因此四个句柄都要收干净；幂等，可在任何时候调用。
-    private void DropAlive() {
-        if (this.ka != null) { this.ka.Dispose(); }
-        this.ka = null;
-        if (this.kaTls != null) { this.kaTls.Close(); }
-        this.kaTls = null;
-        if (this.kaConn != null) { this.kaConn.Close(); }
-        this.kaConn = null;
-        if (this.kaCtx != null) { this.kaCtx.Free(); }
-        this.kaCtx = null;
+    private void ClosePoolConnections() {
         if (this.pool != null) { this.pool.CloseAll(); }
     }
 
@@ -522,12 +523,12 @@ public partial class HttpClient : IDisposable {
     }
 
     // 构建原始 HTTP/1.1 请求文本。<paramref name="close"/> 选择帧结构：
-    // true 发 Connection: close 并读至对端关闭（读至 EOF 的调用方）；
+    // true 发 Connection: close，读取完成后释放一次性连接；
     // false 发 Connection: keep-alive，供连接复用路径使用。
     // 请求头部半区：请求行 + Host + 默认头 + Content-Length +
     // Cookie + Connection + 空行。bodyLen <= 0 时不写 Content-Length，
     // 与旧 BuildRequest 的空正文行为一致。二进制正文的调用方
-    // （SendBytesBodyAsync/SendBytesBodyTlsAsync）拿到头部后把
+    // （SendBytesBodyAsync）拿到头部后把
     // 文件字节单独按显式长度发送。
     // 请求目标（request-target）是否可安全写入请求行：CR/LF/NUL/DEL
     // 会把一行撕成两行（请求行注入/第二个请求），空格会把请求行切成
@@ -698,11 +699,11 @@ public partial class HttpClient : IDisposable {
     // 相对 Location 和循环会拒绝；到达显式跳数上限时返回当前 3xx，
     // 不会猜测另一个目标，也不会继续发出请求。逐跳规则（跳数/防环/
     // 动作改写/下一跳派生）与字节通道共用同一组 helper
-    private async string RequestAsync(string method, string path, string body) {
+    private async HttpResponse RequestAsync(string method, string path, string body) {
         this.ResetTotalBudget();
-        string raw = await this.RequestOnceWithRetry(method, path, body);
+        HttpResponse response = await this.RequestOnceWithRetry(method, path, body);
         if (this.callPolicy == null || this.callPolicy.MaxRedirects() <= 0) {
-            return raw;
+            return response;
         }
         List<string> visited = new List<string>();
         string initial = this.CanonicalRequestTarget(path);
@@ -714,12 +715,11 @@ public partial class HttpClient : IDisposable {
         string currentPath = path;
         int hops = 0;
         while (true) {
-            HttpResponse response = HttpResponse.Parse(raw);
-            if (!this.RedirectWanted(response, hops)) { return raw; }
+            if (!this.RedirectWanted(response, hops)) { return response; }
             int code = response.statusCode;
             string location = response.GetHeader("Location");
             if (HttpResponse.HasCrlf(location)) {
-                current.DropAlive();
+                current.ClosePoolConnections();
                 throw new HttpRequestException(
                     "redirect Location header injection rejected");
             }
@@ -729,13 +729,13 @@ public partial class HttpClient : IDisposable {
                 current.useTls, current.host, current.port);
             ExternalTarget target = ExternalTarget.Parse(resolved);
             if (target == null || visited.Contains(target.Canonical())) {
-                current.DropAlive();
+                current.ClosePoolConnections();
                 throw new HttpRequestException(
                     "redirect target is invalid or repeated");
             }
             visited.Add(target.Canonical());
             if (current.useTls && !target.IsTls()) {
-                current.DropAlive();
+                current.ClosePoolConnections();
                 throw new HttpRequestException(
                     "insecure redirect: HTTPS to HTTP downgrade forbidden");
             }
@@ -745,16 +745,16 @@ public partial class HttpClient : IDisposable {
             string nextMethod = "";
             if (!current.RedirectReplay(currentMethod, code, sameOrigin,
                     out nextMethod)) {
-                current.DropAlive();
+                current.ClosePoolConnections();
                 throw new HttpRequestException("unsafe redirect replay");
             }
             bool dropEntityHeaders = nextMethod != currentMethod;
-            if (current == this) { current.DropAlive(); }
+            if (current == this) { current.ClosePoolConnections(); }
             HttpClient next = current.RedirectNextClient(current, target,
                 sameOrigin, dropEntityHeaders);
             // 动作改写（301/302/303 → GET）后请求正文一律丢弃。
             string nextBody = nextMethod == currentMethod ? currentBody : "";
-            raw = await next.RequestOnceWithRetry(nextMethod,
+            response = await next.RequestOnceWithRetry(nextMethod,
                 target.Path() + target.Query(), nextBody);
             current = next;
             currentMethod = nextMethod;
@@ -765,42 +765,11 @@ public partial class HttpClient : IDisposable {
     }
 
 
-    // 发送 HTTP 请求并返回原始响应。当连接（或 TLS 握手）失败
-    // 或请求未在超时内完成时，抛出
-    // HttpRequestException。
-    // 连接在请求文本构建之前建立，因此
-    // 连接失败抛出时，本帧内没有存活的分配。
-    // 默认走 keep-alive 复用通道（同一客户端同时只允许一个在途
-    // 请求）；已有请求在途时，并发调用退回一次性 Connection: close
-    // 通道，各自读到对端关闭为止。
-    private void ValidateTextResponse(string raw, string method) {
-        int end = HttpClient.IndexOf(raw, "\r\n\r\n", 0);
-        if (end < 0) {
-            throw new HttpRequestException("connection closed before a response arrived");
-        }
-        string head = raw.Substring(0, end + 4);
-        int code = HttpClient.HeadStatus(head);
-        if (code < 100) {
-            throw new HttpRequestException("invalid response status line");
-        }
-        HttpResponse frame = HttpResponse.Parse(head);
-        if (frame.statusCode < 100 || !frame.ParseFraming()) {
-            throw new HttpRequestException("response framing malformed");
-        }
-        if (method == "HEAD" || code == 204 || code == 304) { return; }
-        if (frame.framingHasLength
-            && raw.Length - head.Length < frame.framingLength) {
-            throw new HttpRequestException(
-                "connection closed in the middle of the response body");
-        }
-    }
-
-    private async string RequestOnceAsync(string method, string path, string body) {
+    private async HttpResponse RequestOnceAsync(string method, string path, string body) {
         this.CheckRequestLimit(body.Length);
         this.CheckTargetPolicy();
-        if (this.kaEnabled && this.pool != null) {
-            string alive = await this.RequestPooledAsync(method, path, body);
-            return alive;
+        if (this.keepAliveEnabled && this.pool != null) {
+            return await this.RequestPooledAsync(method, path, body);
         }
         return await this.RequestUnpooledAsync(method, path, body);
     }
@@ -815,7 +784,7 @@ public partial class HttpClient : IDisposable {
     // 只捕获 HttpRequestException：传输层的连接失败、超时、对端关闭、
     // 帧格式错都归这一种，而编程错误（空引用之类）不会被误当成网络
     // 抖动重试。
-    private async string RequestOnceWithRetry(string method, string path, string body) {
+    private async HttpResponse RequestOnceWithRetry(string method, string path, string body) {
         ExternalCallPolicy policy = this.callPolicy;
         if (policy == null || policy.RetryAttempts() <= 0) {
             return await this.RequestOnceAsync(method, path, body);
@@ -827,12 +796,12 @@ public partial class HttpClient : IDisposable {
         int maxAttempts = policy.RetryAttempts();
         int attempt = 0;
         while (true) {
-            string raw = "";
+            HttpResponse response = null;
             int status = 0;
             HttpRequestException failure = null;
             try {
-                raw = await this.RequestOnceAsync(method, path, body);
-                status = HttpResponse.Parse(raw).statusCode;
+                response = await this.RequestOnceAsync(method, path, body);
+                status = response.statusCode;
             } catch (HttpRequestException ex) {
                 failure = ex;
                 status = 0;
@@ -847,7 +816,7 @@ public partial class HttpClient : IDisposable {
                 continue;
             }
             if (failure != null) { throw failure; }
-            return raw;
+            return response;
         }
     }
 
@@ -856,187 +825,6 @@ public partial class HttpClient : IDisposable {
         if (method == null) { return false; }
         string m = method.ToUpper();
         return m == "GET" || m == "HEAD";
-    }
-
-    private async string RequestUnpooledAsync(string method, string path, string body) {
-        if (this.useTls) {
-            string raw = await RequestTlsAsync(method, path, body);
-            return raw;
-        }
-
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) {
-            FailConnect();
-        }
-        // 从这里起，截止时间由清扫器接管：接受连接后
-        // 就沉默不语的对端会让本协程永久挂起，
-        // 因为 reactor 唤醒无法取消。
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string requestData = BuildRequest(method, path, body, true);
-        int _sent = await conn.SendAsync(requestData);
-        if (_sent != requestData.Length) {
-            HttpDeadline.Disarm(watch);
-            conn.Close();
-            requestData = "";
-            throw new HttpRequestException("request write failed");
-        }
-        requestData = "";
-        HttpDeadline.Touch(watch, this.ReadBudget());
-
-        // 读取响应。chunk 被提到循环外并在之后清空，
-        // 因为超时是通过 `throw` 展开的，而它不会
-        // 释放存活的局部变量——包括循环作用域内的
-        StringBuilder respSb = new StringBuilder();
-        int responseBytes = 0;
-        int responseLimit = this.ResponseLimit();
-        bool reading = true;
-        string chunk = "";
-        while (reading) {
-            chunk = await conn.RecvAsync(65536);
-            if (chunk.Length == 0) {
-                reading = false;
-            } else {
-                if (responseBytes > responseLimit - chunk.Length) {
-                    chunk = "";
-                    respSb = null;
-                    HttpDeadline.Disarm(watch);
-                    conn.Close();
-                    conn = null;
-                    throw new HttpRequestException(
-                        "response exceeds " + Convert.ToString(responseLimit)
-                        + " bytes");
-                }
-                respSb.Append(chunk);
-                responseBytes = responseBytes + chunk.Length;
-            }
-        }
-        chunk = "";
-
-        string result = respSb.ToString();
-        respSb = null;
-        bool late = HttpDeadline.Expired(watch);
-        HttpDeadline.Disarm(watch);
-        conn.Close();
-        conn = null;
-        if (late) {
-            // 在展开前丢弃不完整的响应和连接：
-            // throw 时仍存活的局部变量不会被释放
-            result = "";
-            method = "";
-            path = "";
-            body = "";
-            FailTimeout();
-        }
-        this.ValidateTextResponse(result, method);
-        this.AbsorbCookies(path, result);
-        return result;
-    }
-
-    // 建立一条全新的 TLS 连接（连接或握手失败时抛出 HttpRequestException，
-    // 且发生在任何请求分配之前），然后发送
-    // 请求并读取完整响应（Connection: close 帧结构）。
-    // 一次性 TLS 请求：新建 TLS 连接后发送请求并读取完整响应。
-    private async string RequestTlsAsync(string method, string path, string body) {
-        Socket.Initialize();
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) {
-            FailConnect();
-        }
-        TlsContext ctx;
-        if (this.clientCertificateFile.Length > 0
-            && this.clientPrivateKeyFile.Length > 0) {
-            ctx = TlsContext.CreateClientWithCertificate(
-                this.clientCertificateFile, this.clientPrivateKeyFile);
-        } else {
-            ctx = TlsContext.CreateClient();
-        }
-        if (ctx != null && this.certPolicy != null) {
-            ctx.SetCertPolicy(this.certPolicy);
-        }
-        if (ctx == null) {
-            conn.Close();
-            string tlsError = TlsStream.LastError();
-            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
-            throw new HttpRequestException(tlsError);
-        }
-        if (!this.verifyTls) {
-            ctx.DisableVerify();
-        }
-        this.ApplyPinning(ctx);
-        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
-        if (stream == null) {
-            conn.Close();
-            ctx.Free();
-            string tlsHandshakeError = TlsStream.LastError();
-            if (tlsHandshakeError == "") {
-                tlsHandshakeError = "TLS 握手失败";
-            }
-            throw new HttpRequestException(tlsHandshakeError);
-        }
-
-        // 握手已完成；像普通路径那样，用相同方式约束
-        // 数据交换本身。
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string requestData = BuildRequest(method, path, body, true);
-        int _sent = await stream.SendAsync(requestData, requestData.Length);
-        if (_sent != requestData.Length) {
-            HttpDeadline.Disarm(watch);
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-            requestData = "";
-            throw new HttpRequestException("request write failed");
-        }
-        HttpDeadline.Touch(watch, this.ReadBudget());
-
-        StringBuilder respSb = new StringBuilder();
-        int responseBytes = 0;
-        int responseLimit = this.ResponseLimit();
-        bool reading = true;
-        string chunk = "";
-        while (reading) {
-            chunk = await stream.RecvAsync(65536);
-            if (chunk.Length == 0) {
-                reading = false;
-            } else {
-                if (responseBytes > responseLimit - chunk.Length) {
-                    chunk = "";
-                    respSb = null;
-                    HttpDeadline.Disarm(watch);
-                    stream.Close();
-                    conn.Close();
-                    ctx.Free();
-                    throw new HttpRequestException(
-                        "response exceeds " + Convert.ToString(responseLimit)
-                        + " bytes");
-                }
-                respSb.Append(chunk);
-                responseBytes = responseBytes + chunk.Length;
-            }
-        }
-        chunk = "";
-
-        string result = respSb.ToString();
-        respSb = null;
-        bool late = HttpDeadline.Expired(watch);
-        HttpDeadline.Disarm(watch);
-        stream.Close();
-        conn.Close();
-        ctx.Free();
-        stream = null;
-        conn = null;
-        ctx = null;
-        if (late) {
-            result = "";
-            requestData = "";
-            method = "";
-            path = "";
-            body = "";
-            FailTimeout();
-        }
-        this.ValidateTextResponse(result, method);
-        this.AbsorbCookies(path, result);
-        return result;
     }
 
     // TLS 握手也必须挂到同一个 deadline sweep：TlsStream 的 timeout 参数
@@ -1063,8 +851,8 @@ public partial class HttpClient : IDisposable {
     // 状态行和头部，而不只是正文：来自网关的 502
     // 与一个负载古怪的 200 响应本来无法区分。
     public async HttpResponse SendAsync(string method, string path, string body) {
-        string raw = await RequestAsync(method, path, body);
-        return this.ApplyContentEncoding(HttpResponse.Parse(raw));
+        HttpResponse response = await this.RequestAsync(method, path, body);
+        return this.ApplyContentEncoding(response);
     }
 
 }

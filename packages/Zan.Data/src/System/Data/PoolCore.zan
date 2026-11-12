@@ -2,11 +2,14 @@ using System;
 using System.Threading;
 namespace System.Data;
 
+public async delegate T PoolOpenAsync<T>();
+public delegate void PoolOpenFailure<T>(T connection, Exception error);
+
 public class PoolCore<T> {
     int maxSize;
     List<T> idle;
     List<T> borrowed;  // 当前已借出、尚未归还的连接
-    int liveCount;  // 已打开的连接总数（空闲 + 借出）
+    int liveCount;  // 已占用的槽位（建连中 + 空闲 + 借出）
     int waiting;  // 当前停泊等待连接的协程数
     Gate gate;  // 面向等待者的事件驱动唤醒（取代轮询）
     bool closed;
@@ -32,13 +35,87 @@ public class PoolCore<T> {
         this.retryEvery = 64;
     }
 
+    // The async opener must be an async method group. Pass callbacks per call so
+    // an instance opener does not form an ARC cycle with its owning pool.
+    public async T AcquireAsync(PoolOpenAsync<T> open, Predicate<T> connected,
+                                Action<T> close, PoolOpenFailure<T> failed) {
+        PoolWait wait = null;
+        while (!this.IsClosed()) {
+            T pooled = this.TryAcquireIdle(connected, close);
+            if (pooled != null) { return pooled; }
+            if (this.OpenBlocked()) { return null; }
+            if (this.TryReserve()) {
+                T opened = null;
+                bool pending = true;
+                try {
+                    try {
+                        opened = await open();
+                    } catch (Exception error) {
+                        this.ReportOpenFailure(opened, error, failed);
+                        return null;
+                    }
+                    if (opened == null || !connected(opened)) {
+                        this.ReportOpenFailure(opened, null, failed);
+                        return null;
+                    }
+                    bool borrowed = this.CompleteReserve(opened, true);
+                    pending = false;  // CompleteReserve consumes the slot even if Close won.
+                    if (!borrowed) {
+                        close(opened);
+                        return null;
+                    }
+                    return opened;
+                } finally {
+                    if (pending) {
+                        try {
+                            if (opened != null) { close(opened); }
+                        } finally {
+                            this.UndoReserve();
+                        }
+                    }
+                }
+            }
+            if (this.IsClosed()) { return null; }
+            if (wait == null) { wait = new PoolWait(); }
+            if (!await this.WaitForRelease(wait)) { return null; }
+        }
+        return null;
+    }
+
+    // Only inspect idle connections. Neither wait nor open when the idle list runs out.
+    public T TryAcquireIdle(Predicate<T> connected, Action<T> close) {
+        T pooled = this.TakeIdle();
+        while (pooled != null) {
+            bool usable = false;
+            try {
+                usable = connected(pooled);
+                if (usable) { return pooled; }
+            } finally {
+                if (!usable) {
+                    try {
+                        close(pooled);
+                    } finally {
+                        this.Drop(pooled);
+                    }
+                }
+            }
+            pooled = this.TakeIdle();
+        }
+        return null;
+    }
+
+    // Claim the first diagnostic under the lock; run driver code after releasing it.
+    void ReportOpenFailure(T connection, Exception error, PoolOpenFailure<T> failed) {
+        if (this.BeginOpenFailure() && failed != null) { failed(connection, error); }
+    }
+
     // 从空闲列表取出最近归还的连接，
     // 列表为空时返回 null。调用方检查其是否仍可用，
     // 对停泊期间已失效的连接调用 <see cref="Drop"/>
     // （服务器重启、空闲超时）。
     public T TakeIdle() {
         lock (this) {
-            if (this.idle.Count == 0) {
+            if (this.closed || this.idle.Count == 0) {
                 return null;
             }
             int last = this.idle.Count - 1;
@@ -51,15 +128,32 @@ public class PoolCore<T> {
 
     // 将可用连接放入空闲列表并唤醒一个等待者。
     // 仅接受当前处于借出状态的连接，重复归还会被忽略。
-    public void Pool(T c) {
+    // false means Close won: caller must dispose; its slot is already released.
+    // Duplicate returns report true so a current borrower is never closed by the old owner.
+    public bool Pool(T c) {
         lock (this) {
-            if (!this.RemoveBorrowed(c)) {
-                return;
+            if (!this.RemoveBorrowed(c)) { return true; }
+            if (this.closed) {
+                if (this.liveCount > 0) { this.liveCount = this.liveCount - 1; }
+                return false;
             }
             this.idle.Add(c);
             if (this.waiting > 0) {
                 this.gate.Signal();
             }
+            return true;
+        }
+    }
+
+    // Closing drains idle entries after acquisitions have been stopped.
+    public T TakeClosing() {
+        lock (this) {
+            if (!this.closed || this.idle.Count == 0) { return null; }
+            int last = this.idle.Count - 1;
+            T c = this.idle[last];
+            this.idle.RemoveAt(last);
+            this.borrowed.Add(c);
+            return c;
         }
     }
 
@@ -85,9 +179,23 @@ public class PoolCore<T> {
 
     // 记录新打开的连接已借出。在 <see cref="TryReserve"/>
     // 预留槽位并成功打开后调用。
-    public void Borrow(T c) {
+    // false means the pool closed while opening: caller must dispose the new connection.
+    public bool Borrow(T c) {
+        return this.CompleteReserve(c, false);
+    }
+
+    bool CompleteReserve(T c, bool clearBackoff) {
         lock (this) {
+            if (this.closed) {
+                if (this.liveCount > 0) { this.liveCount = this.liveCount - 1; }
+                return false;
+            }
             this.borrowed.Add(c);
+            if (clearBackoff) {
+                this.openFailed = false;
+                this.skipped = 0;
+            }
+            return true;
         }
     }
 
@@ -96,7 +204,7 @@ public class PoolCore<T> {
     // 有空位而超出上限。
     public bool TryReserve() {
         lock (this) {
-            if (this.liveCount < this.maxSize) {
+            if (!this.closed && this.liveCount < this.maxSize) {
                 this.liveCount = this.liveCount + 1;
                 return true;
             }
@@ -157,9 +265,15 @@ public class PoolCore<T> {
 
     // 登记一次失败的建连，开启（或延续）退避。
     public void NoteOpenFailed() {
+        this.BeginOpenFailure();
+    }
+
+    bool BeginOpenFailure() {
         lock (this) {
+            bool first = !this.openFailed;
             this.openFailed = true;
             this.skipped = 0;
+            return first;
         }
     }
 
@@ -208,7 +322,7 @@ public class PoolCore<T> {
         }
     }
 
-    // 存活连接总数（空闲 + 借出）。
+    // 已占用的槽位（建连中 + 空闲 + 借出）。
     public int LiveCount() {
         lock (this) {
             return this.liveCount;
@@ -263,9 +377,19 @@ public class PoolCore<T> {
     // 记在调用方自备的 <see cref="PoolWait"/> 里，跨整个获取循环累计。
     public async bool WaitForRelease(PoolWait w) {
         if (w.gated < PoolWait.MaxGateWaits) {
-            this.EnterWait();
-            await this.Waiter().Wait(PoolWait.GateWaitMs);
-            this.LeaveWait();
+            lock (this) {
+                // Recheck under the same lock used by release and close; either
+                // observe their change now or get included in their wakeup.
+                if (this.closed || this.idle.Count > 0 || this.liveCount < this.maxSize) {
+                    return true;
+                }
+                this.waiting = this.waiting + 1;
+            }
+            try {
+                await this.gate.Wait(PoolWait.GateWaitMs);
+            } finally {
+                this.LeaveWait();
+            }
             w.gated = w.gated + 1;
             return true;
         }

@@ -1,0 +1,245 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Threading;
+
+namespace System.Net.WebSocket;
+
+// Client-only frame/session state. Handshakes remain in the TCP/TLS facades.
+internal class WsClientSession {
+    private object sync;
+    private TcpClient conn;
+    private TlsStream stream;
+    private TlsContext context;
+    private WsReader reader;
+    private WsAssembler assembler;
+    private bool connected;
+    private bool sendBusy;
+    private bool receiveBusy;
+    private List<AsyncGate> sendWaiters;
+    private int lastOpcode;
+    private int lastLen;
+
+    public WsClientSession() {
+        this.sync = new object();
+        this.assembler = new WsAssembler(16777216);
+        this.sendWaiters = new List<AsyncGate>();
+    }
+
+    // Transfer transport ownership only after a successful HTTP upgrade. The
+    // same reader retains any frame bytes coalesced with the response headers.
+    public void Open(TcpClient conn, TlsStream stream, TlsContext context, WsReader reader) {
+        this.conn = conn;
+        this.stream = stream;
+        this.context = context;
+        this.reader = reader;
+        this.connected = true;
+    }
+
+    public bool IsConnected() {
+        lock (this.sync) { return this.connected; }
+    }
+    public int LastOpcode() { return this.lastOpcode; }
+    public int LastLength() { return this.lastLen; }
+
+    private async bool AcquireSend() {
+        AsyncGate waiter = null;
+        lock (this.sync) {
+            if (!this.connected) { return false; }
+            if (!this.sendBusy) {
+                this.sendBusy = true;
+                return true;
+            }
+            waiter = new AsyncGate();
+            this.sendWaiters.Add(waiter);
+        }
+        await waiter.Wait();
+        waiter.Close();
+        return this.IsConnected();
+    }
+
+    private void ReleaseSend() {
+        lock (this.sync) {
+            if (this.sendWaiters.Count > 0) {
+                AsyncGate waiter = this.sendWaiters[0];
+                this.sendWaiters.RemoveAt(0);
+                waiter.Signal();
+            } else {
+                this.sendBusy = false;
+            }
+        }
+    }
+
+    private bool ValidSend(int opcode, int len) {
+        return this.IsConnected() && len >= 0 && len <= 16777216
+            && (opcode == WsOpcode.Text || opcode == WsOpcode.Binary
+                || opcode == WsOpcode.Close || opcode == WsOpcode.Ping || opcode == WsOpcode.Pong)
+            && (opcode < 8 || len <= 125);
+    }
+
+    private async bool Send(WsFrame frame) {
+        bool acquired = await this.AcquireSend();
+        if (!acquired) { return false; }
+        WsReader owner = null;
+        try {
+            TcpClient tcp = null;
+            TlsStream tls = null;
+            lock (this.sync) {
+                if (!this.connected || this.reader == null) { return false; }
+                if (!this.reader.AcquireSend()) { return false; }
+                owner = this.reader;
+                tcp = this.conn;
+                tls = this.stream;
+            }
+            byte[] encoded = frame.EncodeMasked();
+            int total = WsFrame.HeaderLen(frame.payloadLen) + 4 + frame.payloadLen;
+            int sent = 0;
+            if (tls != null) {
+                sent = await tls.SendBytesAsync(encoded, 0, total);
+            } else if (tcp != null) {
+                sent = await tcp.SendBytesAsync(encoded, total);
+            }
+            if (sent != total) { this.CloseNow(); return false; }
+            return true;
+        } catch (Exception e) {
+            this.CloseNow();
+            return false;
+        } finally {
+            try {
+                if (owner != null) { owner.ReleaseSend(); }
+            } finally {
+                this.ReleaseSend();
+            }
+        }
+    }
+
+    public async bool SendFrame(int opcode, string payload, int len) {
+        if (payload == null || !this.ValidSend(opcode, len)) { return false; }
+        return await this.Send(WsFrame.RawFrame(opcode, payload, len));
+    }
+
+    public async bool SendFrameBytes(int opcode, byte[] payload, int offset, int len) {
+        if (payload == null || !this.ValidSend(opcode, len) || offset < 0
+            || offset > payload.Length || len > payload.Length - offset) { return false; }
+        return await this.Send(WsFrame.RawBytes(opcode, payload, offset, len));
+    }
+
+    // A single receive owns reader/assembler until delivery or idle timeout.
+    // Text and binary APIs share control handling and fragmented message state.
+    private async bool Receive(WsReader input, int timeoutMs) {
+        while (this.IsConnected()) {
+            int total = input.FrameSize();
+            while (total < 0) {
+                if (total == -2 || total == -3) { this.CloseNow(); return false; }
+                int n = await input.FillMore(timeoutMs);
+                if (!this.IsConnected()) { return false; }
+                if (n == 0) { this.CloseNow(); return false; }
+                if (n < 0) { return false; }
+                total = input.FrameSize();
+            }
+            WsFrame frame = input.TakeFrame(total);
+            if (!WsFrame.ValidInbound(frame, false)) { this.CloseNow(); return false; }
+            if (frame.opcode == WsOpcode.Close) {
+                int replyLen = frame.payloadLen >= 2 ? 2 : 0;
+                await this.SendFrame(WsOpcode.Close, frame.payload, replyLen);
+                this.CloseNow();
+                return false;
+            }
+            if (frame.opcode == WsOpcode.Ping) {
+                await this.SendFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            int feed = this.assembler.Feed(frame);
+            if (feed < 0) { this.CloseNow(); return false; }
+            if (feed == 0) { continue; }
+            if (!this.assembler.ValidComplete()) { this.CloseNow(); return false; }
+            this.lastOpcode = this.assembler.MessageOpcode();
+            this.lastLen = this.assembler.MessageLen();
+            return true;
+        }
+        return false;
+    }
+
+    private WsReader AcquireReceive() {
+        lock (this.sync) {
+            if (!this.connected || this.receiveBusy) { return null; }
+            this.receiveBusy = true;
+            return this.reader;
+        }
+    }
+
+    private void ReleaseReceive() {
+        lock (this.sync) { this.receiveBusy = false; }
+    }
+
+    public async string RecvText(int timeoutMs) {
+        WsReader input = this.AcquireReceive();
+        if (input == null) { return ""; }
+        try {
+            bool ready = await this.Receive(input, timeoutMs);
+            return ready ? this.assembler.Complete() : "";
+        } catch (Exception e) {
+            this.CloseNow();
+            return "";
+        } finally {
+            this.ReleaseReceive();
+        }
+    }
+
+    public async byte[] RecvBinary(int timeoutMs) {
+        WsReader input = this.AcquireReceive();
+        if (input == null) { return null; }
+        try {
+            bool ready = await this.Receive(input, timeoutMs);
+            if (!ready) { return null; }
+            return this.assembler.CompleteBytes();
+        } catch (Exception e) {
+            this.CloseNow();
+            return null;
+        } finally {
+            this.ReleaseReceive();
+        }
+    }
+
+    public void CloseNow() {
+        WsReader input = null;
+        TcpClient conn = null;
+        TlsStream stream = null;
+        TlsContext context = null;
+        List<AsyncGate> waiters = null;
+        lock (this.sync) {
+            this.connected = false;
+            input = this.reader;
+            conn = this.conn;
+            stream = this.stream;
+            context = this.context;
+            this.reader = null;
+            this.conn = null;
+            this.stream = null;
+            this.context = null;
+            this.sendBusy = false;
+            waiters = this.sendWaiters;
+            this.sendWaiters = new List<AsyncGate>();
+        }
+        // Stop admission before shutdown; the active FillMore retains ownership
+        // until its await completes. Closing outside sync avoids lock inversion
+        // with reader completion and TLS/send wakeups.
+        try {
+            if (input != null) { input.CloseTransport(conn, stream, context); }
+            else {
+                if (stream != null) { stream.Close(); }
+                if (conn != null) { conn.Close(); }
+                if (context != null) { context.Free(); }
+            }
+        } finally {
+            foreach (AsyncGate waiter in waiters) { waiter.Signal(); }
+        }
+    }
+
+    public async void Close() {
+        if (this.IsConnected()) { await this.SendFrame(WsOpcode.Close, "", 0); }
+        this.CloseNow();
+    }
+}

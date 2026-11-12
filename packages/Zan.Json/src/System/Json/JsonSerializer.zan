@@ -175,10 +175,12 @@ public class Json {
         string elemKind = elemTi.Kind;
 
         if (Json.IsListType(elemName)) {
-            List<object> rows = (List<object>)listObj;
-            for (int r = 0; r < rows.Count; r = r + 1) {
+            // Closed List<T> types are invariant. Read through the existing
+            // reflection thunks, which retain the actual element representation.
+            int count = listObj.InvokeInt("Count");
+            for (int r = 0; r < count; r = r + 1) {
                 if (r > 0) { sb.Append(","); }
-                Json.SerializeList(sb, elemTi, rows[r]);
+                Json.SerializeList(sb, elemTi, listObj.InvokeObject("Get", r));
             }
         } else if (elemName == "string") {
             List<string> list = (List<string>)listObj;
@@ -192,10 +194,10 @@ public class Json {
                 }
             }
         } else if (elemName == "int" || elemName == "short" || elemName == "byte" || elemKind == "enum") {
-            List<int> list = (List<int>)listObj;
-            for (int j = 0; j < list.Count; j = j + 1) {
+            int count = listObj.InvokeInt("Count");
+            for (int j = 0; j < count; j = j + 1) {
                 if (j > 0) { sb.Append(","); }
-                sb.Append(Convert.ToString(list[j]));
+                sb.Append(Convert.ToString(listObj.InvokeInt("Get", j)));
             }
         } else if (elemName == "long") {
             List<long> list = (List<long>)listObj;
@@ -204,10 +206,10 @@ public class Json {
                 sb.Append(Convert.ToString(list[j]));
             }
         } else if (elemName == "double" || elemName == "float") {
-            List<double> list = (List<double>)listObj;
-            for (int j = 0; j < list.Count; j = j + 1) {
+            int count = listObj.InvokeInt("Count");
+            for (int j = 0; j < count; j = j + 1) {
                 if (j > 0) { sb.Append(","); }
-                sb.Append(Convert.ToString(list[j]));
+                sb.Append(Convert.ToString(listObj.InvokeDouble("Get", j)));
             }
         } else if (elemName == "bool") {
             List<bool> list = (List<bool>)listObj;
@@ -216,25 +218,28 @@ public class Json {
                 sb.Append(list[j] ? "true" : "false");
             }
         } else if (elemName == "JsonValue") {
-            List<object> list = (List<object>)listObj;
-            for (int j = 0; j < list.Count; j = j + 1) {
+            int count = listObj.InvokeInt("Count");
+            for (int j = 0; j < count; j = j + 1) {
                 if (j > 0) { sb.Append(","); }
-                if (list[j] == null) { sb.Append("null"); }
-                else { sb.Append(((JsonValue)list[j]).ToJson()); }
+                object item = listObj.InvokeObject("Get", j);
+                if (item == null) { sb.Append("null"); }
+                else { sb.Append(((JsonValue)item).ToJson()); }
             }
         } else if (Json.IsDictType(elemName)) {
-            List<object> list = (List<object>)listObj;
-            for (int j = 0; j < list.Count; j = j + 1) {
+            int count = listObj.InvokeInt("Count");
+            for (int j = 0; j < count; j = j + 1) {
                 if (j > 0) { sb.Append(","); }
-                if (list[j] == null) { sb.Append("null"); }
-                else { Json.SerializeDict(sb, elemTi, list[j]); }
+                object item = listObj.InvokeObject("Get", j);
+                if (item == null) { sb.Append("null"); }
+                else { Json.SerializeDict(sb, elemTi, item); }
             }
         } else {
-            List<object> list = (List<object>)listObj;
-            for (int j = 0; j < list.Count; j = j + 1) {
+            int count = listObj.InvokeInt("Count");
+            for (int j = 0; j < count; j = j + 1) {
                 if (j > 0) { sb.Append(","); }
-                if (list[j] == null) { sb.Append("null"); }
-                else { Json.SerializeObject(sb, elemTi, list[j]); }
+                object item = listObj.InvokeObject("Get", j);
+                if (item == null) { sb.Append("null"); }
+                else { Json.SerializeObject(sb, elemTi, item); }
             }
         }
         sb.Append("]");
@@ -513,139 +518,62 @@ public class Json {
     }
 
     public static object DeserializeList(JsonDoc doc, int at, TypeInfo listTi) {
+        if (at >= 0 && at < doc.slotCount && doc.KindAt(at) == 0) { return null; }
+        object list = listTi.CreateInstance();
+        if (list == null) { throw new Exception("Cannot create JSON list: " + listTi.Name); }
         TypeInfo elemTi = listTi;
-        if (listTi.TypeArgCount > 0) {
-            elemTi = listTi.GetTypeArg(0);
+        if (listTi.TypeArgCount > 0) { elemTi = listTi.GetTypeArg(0); }
+        if (at >= 0 && at < doc.slotCount) {
+            if (doc.KindAt(at) == 4) {
+                int count = doc.Count(at);
+                int child = doc.FirstChild(at);
+                for (int i = 0; i < count; i = i + 1) {
+                    Json.DeserializeListItem(list, elemTi, doc, child);
+                    child = doc.NextSibling(child);
+                }
+            } else if (!Json.IsListType(elemTi.Name)) {
+                // Preserve the existing lenient scalar/object-to-single-item behavior.
+                Json.DeserializeListItem(list, elemTi, doc, at);
+            }
         }
+        return list;
+    }
+
+    public static void DeserializeListItem(object list, TypeInfo elemTi, JsonDoc doc, int at) {
         string elemName = elemTi.Name;
         string elemKind = elemTi.Kind;
-
-        if (Json.IsListType(elemName)) {
-            List<object> rows = new List<object>();
-            if (at >= 0 && at < doc.slotCount && doc.KindAt(at) == 4) {
-                int count = doc.Count(at);
-                int c = doc.FirstChild(at);
-                for (int i = 0; i < count; i = i + 1) {
-                    rows.Add(Json.DeserializeList(doc, c, elemTi));
-                    c = doc.NextSibling(c);
-                }
-            }
-            return (object)rows;
-        } else if (elemName == "string") {
-            List<string> list = new List<string>();
-            if (at >= 0 && at < doc.slotCount) {
-                if (doc.KindAt(at) == 4) {
-                    int count = doc.Count(at);
-                    int c = doc.FirstChild(at);
-                    for (int i = 0; i < count; i = i + 1) {
-                        list.Add(doc.StrAt(c, ""));
-                        c = doc.NextSibling(c);
-                    }
-                } else if (doc.KindAt(at) != 0) {
-                    list.Add(doc.StrAt(at, ""));
-                }
-            }
-            return (object)list;
-        } else if (elemName == "int" || elemName == "short" || elemName == "byte" || elemKind == "enum") {
-            List<int> list = new List<int>();
-            if (at >= 0 && at < doc.slotCount) {
-                if (doc.KindAt(at) == 4) {
-                    int count = doc.Count(at);
-                    int c = doc.FirstChild(at);
-                    for (int i = 0; i < count; i = i + 1) {
-                        list.Add(doc.IntAt(c, 0));
-                        c = doc.NextSibling(c);
-                    }
-                } else if (doc.KindAt(at) != 0) {
-                    list.Add(doc.IntAt(at, 0));
-                }
-            }
-            return (object)list;
+        bool added = false;
+        if (elemName == "int" || elemKind == "enum") {
+            added = list.Invoke("Add", doc.IntAt(at, 0));
+        } else if (elemName == "short") {
+            added = list.Invoke("Add", (short)doc.IntAt(at, 0));
+        } else if (elemName == "byte") {
+            added = list.Invoke("Add", (byte)doc.IntAt(at, 0));
         } else if (elemName == "long") {
-            List<long> list = new List<long>();
-            if (at >= 0 && at < doc.slotCount) {
-                if (doc.KindAt(at) == 4) {
-                    int count = doc.Count(at);
-                    int c = doc.FirstChild(at);
-                    for (int i = 0; i < count; i = i + 1) {
-                        list.Add(doc.LongAt(c, 0L));
-                        c = doc.NextSibling(c);
-                    }
-                } else if (doc.KindAt(at) != 0) {
-                    list.Add(doc.LongAt(at, 0L));
-                }
-            }
-            return (object)list;
-        } else if (elemName == "double" || elemName == "float") {
-            List<double> list = new List<double>();
-            if (at >= 0 && at < doc.slotCount) {
-                if (doc.KindAt(at) == 4) {
-                    int count = doc.Count(at);
-                    int c = doc.FirstChild(at);
-                    for (int i = 0; i < count; i = i + 1) {
-                        list.Add(doc.DoubleAt(c, 0.0));
-                        c = doc.NextSibling(c);
-                    }
-                } else if (doc.KindAt(at) != 0) {
-                    list.Add(doc.DoubleAt(at, 0.0));
-                }
-            }
-            return (object)list;
+            added = list.Invoke("Add", doc.LongAt(at, 0L));
+        } else if (elemName == "float") {
+            added = list.Invoke("Add", (float)doc.DoubleAt(at, 0.0));
+        } else if (elemName == "double") {
+            added = list.Invoke("Add", doc.DoubleAt(at, 0.0));
         } else if (elemName == "bool") {
-            List<bool> list = new List<bool>();
-            if (at >= 0 && at < doc.slotCount) {
-                if (doc.KindAt(at) == 4) {
-                    int count = doc.Count(at);
-                    int c = doc.FirstChild(at);
-                    for (int i = 0; i < count; i = i + 1) {
-                        list.Add(doc.BoolAt(c, false));
-                        c = doc.NextSibling(c);
-                    }
-                } else if (doc.KindAt(at) != 0) {
-                    list.Add(doc.BoolAt(at, false));
-                }
+            added = list.Invoke("Add", doc.BoolAt(at, false));
+        } else if (doc.KindAt(at) == 0) {
+            added = list.Invoke("Add", (object)null);
+        } else if (elemName == "string") {
+            added = list.Invoke("Add", doc.StrAt(at, ""));
+        } else if (Json.IsJsonValueType(elemName)) {
+            added = list.Invoke("Add", (object)JsonValue.FromDoc(doc, at));
+        } else if (Json.IsListType(elemName)) {
+            added = list.Invoke("Add", Json.DeserializeList(doc, at, elemTi));
+        } else if (doc.KindAt(at) == 5) {
+            if (Json.IsDictType(elemName)) {
+                added = list.Invoke("Add", Json.DeserializeDict(doc, at, elemTi));
+            } else {
+                added = list.Invoke("Add", Json.DeserializeObject(doc, at, elemTi));
             }
-            return (object)list;
-        } else if (elemName == "JsonValue") {
-            List<object> list = new List<object>();
-            if (at >= 0 && at < doc.slotCount) {
-                if (doc.KindAt(at) == 4) {
-                    int count = doc.Count(at);
-                    int c = doc.FirstChild(at);
-                    for (int i = 0; i < count; i = i + 1) {
-                        list.Add((object)JsonValue.FromDoc(doc, c));
-                        c = doc.NextSibling(c);
-                    }
-                } else if (doc.KindAt(at) != 0) {
-                    list.Add((object)JsonValue.FromDoc(doc, at));
-                }
-            }
-            return (object)list;
         } else {
-            List<object> list = new List<object>();
-            if (at >= 0 && at < doc.slotCount) {
-                if (doc.KindAt(at) == 4) {
-                    int count = doc.Count(at);
-                    int c = doc.FirstChild(at);
-                    for (int i = 0; i < count; i = i + 1) {
-                        if (doc.KindAt(c) == 5) {
-                            if (Json.IsDictType(elemName)) {
-                                list.Add(Json.DeserializeDict(doc, c, elemTi));
-                            } else {
-                                list.Add(Json.DeserializeObject(doc, c, elemTi));
-                            }
-                        }
-                        c = doc.NextSibling(c);
-                    }
-                } else if (doc.KindAt(at) == 5) {
-                    if (Json.IsDictType(elemName)) {
-                        list.Add(Json.DeserializeDict(doc, at, elemTi));
-                    } else {
-                        list.Add(Json.DeserializeObject(doc, at, elemTi));
-                    }
-                }
-            }
-            return (object)list;
+            return;
         }
+        if (!added) { throw new Exception("Cannot append JSON list item: " + elemName); }
     }
 }

@@ -22,6 +22,7 @@ public async delegate bool RouteDispatchHandler(HttpContext ctx, string actionKe
 public class __AttrRoutes {
 
     private static RouteDispatchHandler CustomDispatcher = null;
+    private static RouteDispatchHandler FrameworkDispatcher = null;
 
     public static void SetCustomDispatcher(RouteDispatchHandler dispatcher) {
         CustomDispatcher = dispatcher;
@@ -38,6 +39,9 @@ public class __AttrRoutes {
                 return;
             }
         }
+        if (FrameworkDispatcher != null) {
+            if (await FrameworkDispatcher(ctx, act)) { return; }
+        }
         ctx.Status(404, "Not Found");
         ctx.Text("Action not found: " + act);
     }
@@ -51,6 +55,25 @@ public class __AttrRoutes {
         return attrs.Substring(start, end - start);
     }
 
+    /* 只取完整元数据字段，避免 Custom 描述文本或值的子串被当成授权声明。
+       空串表示未声明，Unknown/未知值仍是显式声明，后续统一 fail-closed。 */
+    static string AuthorizationOf(string attrs) {
+        List<string> fields = attrs.Split(";");
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            string field = fields[i];
+            int equals = field.IndexOf("=");
+            if (equals < 0) { continue; }
+            string key = field.Substring(0, equals);
+            if (key != "Custom.Authorization" && key != "Authorization") { continue; }
+            string value = field.Substring(equals + 1);
+            if (value.StartsWith("CustomAuthorization.")) {
+                value = value.Substring(20);
+            }
+            return value.Length > 0 ? value : "Unknown";
+        }
+        return "";
+    }
+
     static string DeriveControllerPath(string fullName, string attrs) {
         string explicitRoute = __AttrRoutes.ExtractAttr(attrs, "Route=");
         if (explicitRoute.Length > 0 && explicitRoute.StartsWith("/")) {
@@ -58,10 +81,14 @@ public class __AttrRoutes {
         }
 
         int lastDot = fullName.LastIndexOf(".");
-        int lastUnder = fullName.LastIndexOf("_");
-        if (lastUnder > lastDot) { lastDot = lastUnder; }
         string className = lastDot >= 0 ? fullName.Substring(lastDot + 1) : fullName;
         string ns = lastDot >= 0 ? fullName.Substring(0, lastDot) : "";
+        /* 同名类型的反射身份保留内部改名；URL 只消费一次源码命名空间。
+           不按最后一个下划线切分，否则命名空间被重复映射进路径。 */
+        string collisionPrefix = ns.Replace(".", "_") + "_";
+        if (ns.Length > 0 && className.StartsWith(collisionPrefix)) {
+            className = className.Substring(collisionPrefix.Length);
+        }
 
         string ctrl = className;
         if (ctrl.EndsWith("Controller")) {
@@ -100,37 +127,25 @@ public class __AttrRoutes {
     }
 
     static string ExtractVerb(string mattrs) {
-        if (mattrs.Contains("HttpPost=true") || mattrs.Contains("HttpPut=true") || mattrs.Contains("HttpPatch=true")) {
-            return "POST";
-        }
+        if (mattrs.Contains("HttpPost=true")) { return "POST"; }
+        if (mattrs.Contains("HttpPut=true")) { return "PUT"; }
+        if (mattrs.Contains("HttpPatch=true")) { return "PATCH"; }
+        if (mattrs.Contains("HttpHead=true")) { return "HEAD"; }
+        if (mattrs.Contains("HttpOptions=true")) { return "OPTIONS"; }
         if (mattrs.Contains("HttpDelete=true")) {
             return "DELETE";
         }
         return "GET";
     }
 
-    static void RegisterController(WebApp app, TypeInfo ti) {
-        /* 命名空间派生路径取 FullName：B-ID107 之后 TypeInfo.Name 是短名
-           （对齐 C#），拿它推不出 /admin/system 这类命名空间段，约定路由
-           会全部塌到根一级。动作键仍按短名算（见下）。 */
+    static void RegisterController(WebApp app, TypeInfo ti, bool framework = false) {
+        /* 路径和动作键均取 FullName。不同命名空间可以声明同名控制器，
+           短名无法区分它们；动作键须与编译器合成派发器的完整身份一致。 */
         string fullName = ti.FullName;
         string classAttrs = ti.GetCustomAttributes();
         string basePath = __AttrRoutes.DeriveControllerPath(fullName, classAttrs);
 
-        string shortSrc = ti.Name;
-        int lastDot = shortSrc.LastIndexOf(".");
-        int lastUnder = shortSrc.LastIndexOf("_");
-        if (lastUnder > lastDot) { lastDot = lastUnder; }
-        string shortName = lastDot >= 0 ? shortSrc.Substring(lastDot + 1) : shortSrc;
-
-        bool classNeedsAuth = classAttrs.Contains("Authorization=CustomAuthorization.Grant")
-            || classAttrs.Contains("Authorization=Grant")
-            || classAttrs.Contains("Authorization=CustomAuthorization.ApiAuth")
-            || classAttrs.Contains("Authorization=ApiAuth");
-        bool classNeedsLogin = classAttrs.Contains("Authorization=CustomAuthorization.Login")
-            || classAttrs.Contains("Authorization=Login");
-        bool classIsNone = classAttrs.Contains("Authorization=CustomAuthorization.None")
-            || classAttrs.Contains("Authorization=None");
+        string classAuthorization = __AttrRoutes.AuthorizationOf(classAttrs);
         bool classIsMenu = classAttrs.Contains("Custom.IsMenu=true") || classAttrs.Contains("IsMenu=true");
         string classDesc = __AttrRoutes.ExtractAttr(classAttrs, "Description=");
         string classIcon = __AttrRoutes.ExtractAttr(classAttrs, "Custom.Icon=");
@@ -152,7 +167,10 @@ public class __AttrRoutes {
             /* 判定是否为 Action：显式声明了 Route/Http 动词/Description/Custom，或者是 Index 约定动作 */
             bool isIndex = (mname == "Index");
             bool hasWebAttr = mattrs.Contains("Route=") || mattrs.Contains("HttpGet")
-                || mattrs.Contains("HttpPost") || mattrs.Contains("Description=")
+                || mattrs.Contains("HttpPost") || mattrs.Contains("HttpPut")
+                || mattrs.Contains("HttpPatch") || mattrs.Contains("HttpDelete")
+                || mattrs.Contains("HttpHead") || mattrs.Contains("HttpOptions")
+                || mattrs.Contains("Description=")
                 || mattrs.Contains("Custom.") || mattrs.Contains("Action=") || mattrs.Contains("Action;");
             if (!hasWebAttr && !isIndex) {
                 continue;
@@ -173,7 +191,8 @@ public class __AttrRoutes {
             }
 
             string verb = __AttrRoutes.ExtractVerb(mattrs);
-            string actionKey = shortName + "." + mname;
+            /* 应用和框架使用同一完整身份协议，避免同名控制器派发到其他动作。 */
+            string actionKey = fullName + "." + mname;
 
             Route r = app.Map(verb, actionPath, __AttrRoutes.Dispatch);
             r.Named(actionKey);
@@ -186,18 +205,13 @@ public class __AttrRoutes {
                 r.Title(classDesc);
             }
 
-            /* 授权与认证声明：对齐原架构 Fail-Closed 规范（零硬编码路径）
-               1. 显式 None/Auth：公开访问（不强制登录）
-               2. 显式 Grant/ApiAuth：权限拦截（.Auth()）
-               3. 显式 Login 或默认缺省：统一要求登录（.Login()，安全兜底） */
-            bool isNone = classIsNone
-                || mattrs.Contains("Authorization=CustomAuthorization.None")
-                || mattrs.Contains("Authorization=None");
-            bool needsAuth = !isNone && (classNeedsAuth
-                || mattrs.Contains("Authorization=CustomAuthorization.Grant")
-                || mattrs.Contains("Authorization=Grant")
-                || mattrs.Contains("Authorization=CustomAuthorization.ApiAuth")
-                || mattrs.Contains("Authorization=ApiAuth"));
+            /* 方法显式声明完整覆盖类默认值；其他 Custom 字段不影响继承。
+               None/Auth 不强制登录，Grant/ApiAuth 要权限；未声明或未知值
+               按 Login fail-closed。Index 别名复用同一组最终标志。 */
+            string authorization = __AttrRoutes.AuthorizationOf(mattrs);
+            if (authorization.Length == 0) { authorization = classAuthorization; }
+            bool isNone = authorization == "None" || authorization == "Auth";
+            bool needsAuth = authorization == "Grant" || authorization == "ApiAuth";
             bool needsLogin = !isNone && !needsAuth;
 
             if (needsAuth) {
@@ -312,7 +326,11 @@ public class __AttrRoutes {
         }
     }
 
-    public static void RegisterFramework(WebApp app) {
+    public static void RegisterFramework(WebApp app, RouteDispatchHandler dispatcher = null) {
+        if (app == null) { return; }
+        /* 编译器在显式调用点供给框架动作派发器；与应用派发器独立保存，
+           后续 Register(app) 不会覆盖已选择的框架动作。 */
+        if (dispatcher != null) { FrameworkDispatcher = dispatcher; }
         TypeInfo[] f = new TypeInfo[] {
             typeof(Zan.Web.Admin.LoginController),
             typeof(Zan.Web.Admin.DashboardController),
@@ -341,7 +359,7 @@ public class __AttrRoutes {
             typeof(Zan.Web.Health.HealthController)
         };
         for (int i = 0; i < f.Length; i = i + 1) {
-            __AttrRoutes.RegisterController(app, f[i]);
+            __AttrRoutes.RegisterController(app, f[i], true);
         }
     }
 

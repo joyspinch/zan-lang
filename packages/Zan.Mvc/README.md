@@ -15,7 +15,7 @@ structure, an external config file, and the ORM and cache wired in by default.
   配置/DB/缓存上下文、鉴权 RBAC、设置、Schema + 种子挂点、指标、任务宿主、
   sys 实体与 DAO、三个控制器基类（`AppController` / `ApiController` /
   `AdminController`），以及管理台与前台控制器、随包视图与静态资产。
-- **`System.Web` 标准库** — Web 内核：`WebApp`、`Router`、`HttpContext`、
+- **`Zan.Web` 包（`System.Web` 命名空间）** — Web 内核：`WebApp`、`Router`、`HttpContext`、
   `Controller`、`View`、`WebServer`，与 `RouteTable` / `RouteStats` /
   `PermTable`；GEO 协议件（`GeoMeta` / `GeoSchema` / `Sitemap` /
   `RobotsTxt` / `LlmsTxt`）与内容源委托（`SitemapSource` /
@@ -526,50 +526,38 @@ included) and synthesizes `__AttrRoutes.Register(app)`, which the composition
 root calls once — no generated file to maintain, no reflection.
 
 ```zan
-class ApiController {
-    [Post]                 // HTTP verb: [Get] [Post] [Put] [Delete] [Patch]
-    [Title("收集数据")]     // human label (admin menu / docs)
-    [Auth]                 // permission check required (implies login)
-    [Rank(3)]              // minimum principal rank
-    [Lock("user")]         // per-user request lock (double-submit guard)
-    static void Gather(HttpContext ctx) { ... }   // -> POST /api/gather
+[Route("api/data/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+class DataController : ApiController {
+    [HttpPost]
+    [Description("收集数据")]
+    [Custom(Authorization = CustomAuthorization.Login, Lock = "user")]
+    public void Gather() {
+        this.Ok("{}");
+    }   // -> POST /api/data/gather
 }
 ```
 
+Use the current attribute names and named `Custom` properties:
+
 | Attribute | Effect |
 |---|---|
-| `[Get] [Post] [Put] [Delete] [Patch]` | HTTP verb (required to mark a method as a route) |
-| `[Route("/custom")]` | override the convention path |
-| `[Title("...")]` | label for the admin menu / docs |
-| `[Login]` | a logged-in principal is required (401 otherwise) |
-| `[Auth]` | RBAC permission check (implies `[Login]`, 403 on failure) |
-| `[Rank(n)]` | minimum principal rank |
-| `[Lock("user"\|"global")]` | request lock; second concurrent call gets 429 |
-| `[Limit(n)]` | per-route rate limit (requests/sec) |
-| `[Upload]` | stream the request body to disk |
-| `[Menu]` | surface this route in the admin menu (`/admin/menu`) |
+| `[HttpGet] [HttpPost] [HttpPut] [HttpDelete] [HttpPatch]` | HTTP verb |
+| `[Route("/custom")]` | explicit route or class-level route template |
+| `[Description("...")]` | human-readable title |
+| `[Custom(Authorization = CustomAuthorization.None)]` | anonymous access |
+| `[Custom(Authorization = CustomAuthorization.Login)]` | logged-in principal required |
+| `[Custom(Authorization = CustomAuthorization.Grant, Perm = PermBit.View)]` | RBAC permission check; choose the operation's permission bit |
+| `[Custom(Lock = "user")]` | per-user request lock |
+| `[Custom(ApiMax = 100)]` | per-route rate limit |
+| `[Custom(Upload = true)]` | stream the request body to disk |
+| `[Custom(IsMenu = true)]` | include the route in the permission-filtered menu |
 
-**Shorthand: one combined `[Api(...)]` attribute.** Instead of stacking many
-lines you can declare everything in one, mixing bare flags and `key=value`:
-
-```zan
-[Api(post, route="/api/gather", title="收集数据", auth, rank=3, lock="user")]
-static void Gather(HttpContext ctx) { ... }
-```
-
-Keys: `get/post/put/delete/patch` (or `method="POST"`), `route="/x"`,
-`title="…"`, `login`, `auth`, `rank=n`, `lock="user"|"global"`, `limit=n`,
-`upload`, `menu` — booleans may be bare (`menu`) or explicit (`menu=true`). The
-single attributes above still work and can be mixed with `[Api(...)]`.
-
-**Routes follow the directory structure.** The path is
-`<folders under src/controller> + controller name (minus "Controller") + action`,
-lower-cased — `ApiController.Status` → `/api/status`, `Admin/UserController.List`
-→ `/admin/user/list`. `Index` maps to the folder root. `[Route("...")]` overrides
-the convention when you need an exception.
-
-Custom rank/RBAC logic plugs in without touching the framework:
-`app.RankResolver(fn)` where `fn(uid) -> int` (default: uid "1" is rank 9).
+The source examples are `Modules/Sys/Controller/Api/DataController.zan` and the
+admin controllers. Use explicit class-level route templates such as
+`[Route("api/data/[action]")]`; physical source directories alone do not declare
+URLs. The old `[Post]`/`[Auth]`/`[Rank]`/`[Api(...)]` examples and
+`RankResolver` configuration are not the current public route API.
 
 ## Safe request input
 
@@ -870,44 +858,44 @@ every sign-in "wrong password").
 
 ## Endpoints
 
-- `GET /` — HTML landing page from the in-memory template cache
-- `GET /blog`, `GET /blog/{id}`, `POST /blog/create` — server-rendered blog (author = signed-in account)
-- `GET /blog?tag=X` — tag archive (whole-tag match, not substring)
-- `GET /rss.xml` — RSS 2.0 feed of the latest 20 published posts
-- `GET /sitemap.xml` — home, blog index and every published post (absolute URLs only; empty until `site.url` is set)
-- `GET /robots.txt` — allows the public site, denies `/admin/` and `/api/admin/`, points at the sitemap and llms.txt
-- `GET /llms.txt`, `GET /.well-known/llms.txt` — LLM-readable site guide (site summary + navigation + published posts)
-- `GET /.well-known/llms-full.txt` — same source in aggregated long form (article bodies included)
-- `GET /admin/login`, `POST /admin/login`, `GET /admin/logout` — admin sign-in (seed: `admin` / `admin1234`)
-- `GET /admin` — admin dashboard (uptime, requests, CPU/RSS, slow requests, pool/cache)
-- `GET /admin/system/users`, `POST /admin/system/users/status`, `POST /admin/system/users/logout` — account administration
-- `GET /admin/content/posts`, `POST /admin/content/posts/state` — content administration (drafts included)
-- `GET /users` — ORM + cache demo (503 until a database is configured)
-- `GET /user/{id}` — route parameter demo (JSON envelope)
-- `GET /api/status` — request statistics
-- `GET /admin/stats` — runtime diagnostics (CPU, memory, requests, slow requests/queries) — **protect before exposing**
-- `POST /api/echo` — rate-limited (100 req/s) echo
-- `POST /api/gather` — `[Auth] [Rank(3)] [Lock("user")]` permissioned + locked demo
-- `POST /api/login` — `user=admin&pass=admin` issues a session token
-- `GET /api/me` — requires `Authorization: Bearer <token>` or session cookie
-- `GET /admin/menu` — admin menu built from `[Menu]` routes (`[Auth] [Rank(9)]`)
-- `POST /upload` — streaming upload
+The following is a selection of current controller routes, available when the
+application registers the package's attribute routes. GEO protocol endpoints also
+require the corresponding source registration; blog content comes from the
+registered blog contributor.
 
-## Database & ORM (ZanSql, bidirectional)
+- `GET /` — public landing page.
+- `GET /blog`, `GET /blog/{id}`, `GET /blog?tag=X` — public blog index, detail and whole-tag archive. Article writes belong to the admin content routes.
+- `POST /blog/{id}/reply` — blog comment submission.
+- `GET /rss.xml` — RSS feed of published posts; requires a configured public site address.
+- `GET /sitemap.xml` — registered public URLs; empty until `site.url` is configured.
+- `GET /robots.txt` — crawler instructions, including disallow rules for `/admin/` and `/api/admin/`; these rules do not enforce access control. Sitemap and llms.txt pointers require `site.url`.
+- `GET /llms.txt`, `GET /.well-known/llms.txt`, `GET /.well-known/llms-full.txt` — registered site content in guide or aggregated form.
+- `GET /admin/login`, `POST /admin/login/submit`, `GET /admin/logout` — admin login page, credential submission and logout. There is no fixed default password: an empty database requires `auth.bootstrapPassword` or `ZAN_BOOTSTRAP_ADMIN_PASSWORD` (at least 12 characters) to seed the `admin` account.
+- `GET /admin/dashboard` — dashboard; login required. The post-login landing page is selected from the account's accessible menu entries.
+- `GET /admin/system/users`, `POST /admin/system/users/status`, `POST /admin/system/users/kick` — account list, status changes and session invalidation; Grant authorization with View for the list and Update for these writes.
+- `GET /admin/content/posts`, `POST /admin/content/posts/field` — content administration, including drafts and allow-listed field changes; Grant authorization with View and Update respectively.
+- `GET /users`, `GET /user/{id}` — ORM/cache and route-parameter demos; login required.
+- `GET /admin/stats` — runtime diagnostics; Grant authorization and the monitor screen's View permission are already required.
+- `POST /api/data/echo` — anonymous echo, configured with `ApiMax = 100`.
+- `POST /api/data/gather` — login required, with a per-user request lock; no rank-3 requirement is declared.
+- `POST /api/data/upload` — streamed upload; login required, with a per-user request lock.
+- `POST /api/auth/login` — validates `user` and `pass` against stored account credentials; on success returns a token and sets the `zsession` cookie. Token signing requires a configured authentication secret.
+- `GET /api/auth/me` — current user ID; requires a valid Bearer token or session cookie.
+- `GET /api/admin/menu`, `GET /api/admin/summary` — permission-filtered menu and dashboard summary; login required. Menu inclusion uses `Custom(IsMenu = true)`, and returned entries are filtered for the current account.
 
-`System.Data.Orm.Model` maps both directions:
+## Database & ORM (ZanSql)
 
-- **Model -> table** (code first): `Model.Define("users").Column(...).CreateTable(db)`
-  (see `src/model/User.zan`).
-- **Table -> model** (database first): `Model.FromTable(db, "users")` reflects an
-  existing table's schema (SQLite `PRAGMA table_info`, MySQL/MariaDB
-  `SHOW COLUMNS`, otherwise the ANSI `information_schema` catalog) into a Model,
-  auto-detecting the provider. `Model.FromTable(db, "users").ToDefineCode()`
-  emits the `Model.Define(...)` source to scaffold a model file from a table.
+For a known schema, map a class with `[Table]` and use
+`db.SyncStructure<SysUser>()` to create a missing table. Query typed
+rows with `db.Select<SysUser>()`, and put reusable data operations in a concrete
+DAO such as `SysUserDao : BaseRepository<SysUser>`.
 
-```
-Model users = Model.FromTable(Db.Conn(), "users");   // reflect schema
-Console.WriteLine(users.ToDefineCode());               // print model source
+For a table name chosen at runtime, `DbSchema.ColumnsAsync(db, table)` lists
+its columns and `DbTable.Of(db, table)` provides parameterized queries:
+
+```zan
+DbResult rows = await DbTable.Of(db, "sys_user").Query()
+    .WhereEq("id", userId).ToResultAsync();
 ```
 
 ## Static assets
@@ -918,17 +906,19 @@ The composition root mounts `wwwroot/` at `/static` before auth and routing:
 StaticFiles.Mount(app, "/static", "wwwroot");   // GET /static/css/app.css
 ```
 
-**`wwwroot/` is the whole public surface.** One mounted directory, nothing else:
-`src/`, `config/app.json`, `data/` and every log sit outside it, so no path
-trick reaches them even if a check were wrong — the files simply are not under
-the served root. A file becomes downloadable by being moved into `wwwroot/`,
-which makes "is this public?" a question about the directory rather than about
-the path parser.
+`wwwroot/` is the default static root. `StaticFiles.Mount` and `WebApp.Mount`
+support multiple mounts, so review every mounted directory as public content;
+keep source, configuration, databases and logs outside those roots. The path
+filter rejects segments starting with a dot, backslashes and characters outside
+`[A-Za-z0-9._-]` (with `/` separating segments). This lexical filter is not a
+filesystem containment guarantee: keep mounted directories and their links under
+trusted control.
 
-Bodies are read once per worker and then served from memory with
-`Cache-Control: public, max-age=86400`; a path is rejected unless every segment
-is plain `[A-Za-z0-9._-]`, so `..`, backslashes and dotfiles cannot escape the
-directory. `StaticFiles.MaxAge(0)` while developing.
+Files are opened on each request and read into a response buffer; there is no
+per-worker body cache. Files exceeding 4 MiB are refused with 413. The default
+browser cache header is `Cache-Control: public, max-age=86400`;
+`StaticFiles.MaxAge(0)` changes that policy for development. A browser or proxy
+may retain an earlier response according to its cache policy.
 
 ```
 wwwroot/css/app.css          the whole design system (no framework, no build)
@@ -1058,14 +1048,14 @@ Streamed file uploads with a deny-by-default extension whitelist.
   the file moved into `wwwroot/media/` and recorded in the `media` table.
   Duplicate names get a timestamp prefix instead of overwriting; rejected
   uploads delete their spool file.
-- **Serving** — `StaticFiles.Mount` has a single slot (a second call
-  replaces the prefix), so media lives **inside** the static root:
-  `wwwroot/media/<file>`, publicly served as `/static/media/<file>`. The
-  `uploads/` spool directory is never mounted.
-- **Cache note** — `StaticFiles` caches asset bodies per worker after the
-  first hit, so a deleted file may still be served from worker memory until
-  the next restart. Fine for an internal library; call it out if you build
-  user-facing deletion on top.
+- **Serving** — the default layout stores media at `wwwroot/media/<file>`,
+  publicly served as `/static/media/<file>`. Multiple static mounts are supported;
+  keep the `uploads/` spool directory unmounted. The static server's 4 MiB file
+  limit applies independently of the upload limit: an accepted larger upload
+  cannot be downloaded through this static-file path.
+- **Cache note** — `StaticFiles` opens files on each request, so deletion takes
+  effect on subsequent origin requests. Browsers and proxies may still retain
+  previous responses according to `Cache-Control`; the default max-age is one day.
 - **Size cap** — `[server].uploadBodyMB` (default 64) feeds
   `app.MaxUpload()`; over-cap requests are refused with 413 before the body
   is read.

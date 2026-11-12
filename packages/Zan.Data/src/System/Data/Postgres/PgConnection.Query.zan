@@ -52,6 +52,7 @@ public partial class PgConnection : IDbConnection {
         DbResult result = new DbResult();
         List<int> colOids = new List<int>();
         this.hadError = false;
+        this.lastCommandTag = "";
         while (true) {
             byte[] pay = this.recvMessageSync();
             if (pay == null) {
@@ -73,12 +74,14 @@ public partial class PgConnection : IDbConnection {
             } else if (t == 67) {  // 'C' CommandComplete
                 if (plen > 0) {
                     string tag = PgWire.bytesToStr(pay, 0, plen - 1);
+                    this.lastCommandTag = tag;
                     this.lastAffected = PgWire.parseCommandTag(tag);
                 }
             } else if (t == 69) {  // 'E' ErrorResponse
                 this.lastError = PgWire.formatError(pay, plen);
                 this.hadError = true;
             } else if (t == 90) {  // 'Z' ReadyForQuery
+                if (plen > 0) { this.inTxn = pay[0] != 73; }
                 return result;
             }
             // 'N' 通知、'I' 空查询、'1'/'2'/'n'/'t' 扩展协议应答、
@@ -91,6 +94,7 @@ public partial class PgConnection : IDbConnection {
         DbResult result = new DbResult();
         List<int> colOids = new List<int>();
         this.hadError = false;
+        this.lastCommandTag = "";
         while (true) {
             byte[] pay = await this.recvMessageAsync();
             if (pay == null) {
@@ -112,12 +116,14 @@ public partial class PgConnection : IDbConnection {
             } else if (t == 67) {
                 if (plen > 0) {
                     string tag = PgWire.bytesToStr(pay, 0, plen - 1);
+                    this.lastCommandTag = tag;
                     this.lastAffected = PgWire.parseCommandTag(tag);
                 }
             } else if (t == 69) {
                 this.lastError = PgWire.formatError(pay, plen);
                 this.hadError = true;
             } else if (t == 90) {
+                if (plen > 0) { this.inTxn = pay[0] != 73; }
                 return result;
             }
         }
@@ -424,15 +430,47 @@ public partial class PgConnection : IDbConnection {
     // 回滚未收尾的事务（P2-29），下一个借出者绝不能落进上一个请求
     // 的未提交状态。
     public bool inTxn;
+    string lastCommandTag;
+
+    void CheckTransactionTag(string expected) {
+        if (this.lastCommandTag != expected) {
+            this.lastError = "Expected " + expected + " but server completed " + this.lastCommandTag;
+            this.fail();
+        }
+    }
+
+    void TransactionCommand(string sql) {
+        if (this.Execute(sql) < 0) { this.fail(); }
+        this.CheckTransactionTag(sql);
+    }
+
+    // Inspect the completion tag while still owning the command gate. An aborted
+    // PostgreSQL COMMIT succeeds on the wire with ROLLBACK, not COMMIT.
+    async bool TransactionCommandAsync(string sql) {
+        await this.AcquireLock();
+        try {
+            if (!this.connected) { this.lastError = "not connected"; this.fail(); }
+            this.lastError = "";
+            this.lastAffected = 0;
+            byte[] b = PgWire.strToBytes(sql, sql.Length);
+            if (await this.sendMessageAsync(81, b, sql.Length + 1) <= 0) {
+                this.die("cannot send transaction command"); this.fail();
+            }
+            await this.readResultsAsync();
+            if (this.hadError) { this.fail(); }
+            this.CheckTransactionTag(sql);
+            return true;
+        } finally { this.ReleaseLock(); }
+    }
 
     // 开始一个事务（执行 BEGIN）。
-    public void BeginTransaction() { this.Execute("BEGIN"); this.inTxn = true; }
+    public void BeginTransaction() { this.TransactionCommand("BEGIN"); }
 
     // 提交当前事务。
-    public void Commit() { this.Execute("COMMIT"); this.inTxn = false; }
+    public void Commit() { this.TransactionCommand("COMMIT"); }
 
     // 回滚当前事务。
-    public void Rollback() { this.Execute("ROLLBACK"); this.inTxn = false; }
+    public void Rollback() { this.TransactionCommand("ROLLBACK"); }
 
     // ===== 协程对应方法 =====
     // 参数化协程历来命名为 QueryParamsAsync / ExecuteParamsAsync；
@@ -463,12 +501,12 @@ public partial class PgConnection : IDbConnection {
         return r.GetString(0, 0);
     }
 
-    // 协程版事务：执行 BEGIN，恒返回 true。
-    public async bool BeginTransactionAsync() { int _n = await this.ExecuteAsync("BEGIN"); this.inTxn = true; return true; }
-    // 协程版提交：执行 COMMIT，恒返回 true。
-    public async bool CommitAsync() { int _n = await this.ExecuteAsync("COMMIT"); this.inTxn = false; return true; }
-    // 协程版回滚：执行 ROLLBACK，恒返回 true。
-    public async bool RollbackAsync() { int _n = await this.ExecuteAsync("ROLLBACK"); this.inTxn = false; return true; }
+    // 协程版事务：服务器确认 BEGIN 后返回 true。
+    public async bool BeginTransactionAsync() { return await this.TransactionCommandAsync("BEGIN"); }
+    // 协程版提交：服务器确认 COMMIT 后返回 true。
+    public async bool CommitAsync() { return await this.TransactionCommandAsync("COMMIT"); }
+    // 协程版回滚：服务器确认 ROLLBACK 后返回 true。
+    public async bool RollbackAsync() { return await this.TransactionCommandAsync("ROLLBACK"); }
 
     // 关闭数据库连接：尽力发送 Terminate('X')，然后收尾
     // TLS 与套接字。安全释放互斥门控并唤醒所有等待者。同步通道的

@@ -9,6 +9,7 @@ namespace System.Data.Orm;
 public class UpdateQuery<T> {
     public Update inner;
     public Meta meta;
+    private List<Func<T, bool>> predicates;
 
     public UpdateQuery(IDbExecutor db) {
         this.meta = Meta.For<T>();
@@ -220,105 +221,11 @@ public class UpdateQuery<T> {
         return this;
     }
 
-    /* 与 <see cref="DeleteQuery{T}.Where"/> 同一策略：bool 谓词无法还原
-     * 成 SQL，候选行物化后内存过滤，命中的主键集合下推回 UPDATE。 */
+    // 黑盒谓词留到终端读取候选行，异步终端不能在构造阶段调用同步 Query。
     public UpdateQuery<T> Where(Func<T, bool> expr) {
-        if (expr == null) { return this; }
-        List<string> pks = this.meta.PkCols();
-        bool byRowId = pks.Count == 0;
-        if (byRowId && this.inner.db.GetProvider() != DbProvider.SQLite) {
-            throw new Exception(this.meta.Entity
-                + ": lambda Where needs a primary key to target rows");
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT ");
-        if (byRowId) { sb.Append("rowid, "); }
-        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(this.meta.Cols[i].Col);
-        }
-        sb.Append(" FROM ");
-        sb.Append(this.inner.tbl);
-        DbResult r = this.inner.db.Query(sb.ToString(), new DbParams());
-        if (r == null) { this.inner.WhereNone(); return this; }
-        List<int> colIdx = SelectQuery<T>.ResolveColIndices(r, this.meta);
-        int[] pkPos = new int[pks.Count];
-        int p = 0;
-        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            if (!byRowId && this.meta.Cols[i].IsPk && p < pkPos.Length) {
-                pkPos[p] = i;
-                p = p + 1;
-            }
-        }
-        List<int> hits = new List<int>();
-        int count = r.RowCount();
-        for (int i = 0; i < count; i = i + 1) {
-            T item = SelectQuery<T>.MapRow(r, i, this.meta, colIdx);
-            if (expr(item)) { hits.Add(i); }
-        }
-        if (hits.Count == 0) { this.inner.WhereNone(); return this; }
-        if (byRowId) {
-            if (hits.Count > 2000) {
-                throw new Exception(this.meta.Entity
-                    + ": lambda Where matched " + Convert.ToString(hits.Count)
-                    + " rows; use an explicit column predicate for bulk statements");
-            }
-            int rid = r.GetColumnIndex("rowid");
-            StringBuilder rw = new StringBuilder();
-            rw.Append("rowid IN (");
-            for (int k = 0; k < hits.Count; k = k + 1) {
-                if (k > 0) { rw.Append(", "); }
-                rw.Append("?");
-            }
-            rw.Append(")");
-            this.inner.W(rw.ToString());
-            for (int k = 0; k < hits.Count; k = k + 1) {
-                this.inner.Pl(r.GetLong(hits[k], rid));
-            }
-            return this;
-        }
-        if (pks.Count == 1) {
-            int at = colIdx[pkPos[0]];
-            if (this.meta.KindOf(pks[0]) == 3) {
-                List<string> sv = new List<string>();
-                for (int k = 0; k < hits.Count; k = k + 1) {
-                    sv.Add(r.GetString(hits[k], at));
-                }
-                this.inner.WhereIn(pks[0], sv);
-            } else {
-                List<long> lv = new List<long>();
-                for (int k = 0; k < hits.Count; k = k + 1) {
-                    lv.Add(r.GetLong(hits[k], at));
-                }
-                this.inner.WhereIn(pks[0], lv);
-            }
-            return this;
-        }
-        if (hits.Count * pks.Count > 2000) {
-            throw new Exception(this.meta.Entity
-                + ": lambda Where matched " + Convert.ToString(hits.Count)
-                + " rows; use an explicit column predicate for bulk updates");
-        }
-        StringBuilder w = new StringBuilder();
-        for (int k = 0; k < hits.Count; k = k + 1) {
-            if (k > 0) { w.Append(" OR "); }
-            w.Append("(");
-            for (int j = 0; j < pks.Count; j = j + 1) {
-                if (j > 0) { w.Append(" AND "); }
-                w.Append(pks[j] + " = ?");
-            }
-            w.Append(")");
-        }
-        this.inner.W(w.ToString());
-        for (int k = 0; k < hits.Count; k = k + 1) {
-            for (int j = 0; j < pks.Count; j = j + 1) {
-                int at = colIdx[pkPos[j]];
-                if (this.meta.KindOf(pks[j]) == 3) {
-                    this.inner.P(r.GetString(hits[k], at));
-                } else {
-                    this.inner.Pl(r.GetLong(hits[k], at));
-                }
-            }
+        if (expr != null) {
+            if (this.predicates == null) { this.predicates = new List<Func<T, bool>>(); }
+            this.predicates.Add(expr);
         }
         return this;
     }
@@ -411,11 +318,28 @@ public class UpdateQuery<T> {
     }
 
     public int ExecuteAffrows() {
-        return this.inner.ExecuteAffrows();
+        Update run = this.inner.Snapshot();
+        MutationPredicate<T> filter = new MutationPredicate<T>(this.meta, run.db,
+            run.tbl, run.CandidateWhere(), run.CandidateParams(), this.predicates);
+        if (filter.HasPredicates()) {
+            filter.Build(run.db.Query(filter.Sql(), filter.CandidateParams()));
+            run.PredicateCondition(filter.Condition());
+            filter.BindUpdate(run);
+        }
+        return run.ExecuteAffrows();
     }
 
     public async int ExecuteAffrowsAsync() {
-        return await this.inner.ExecuteAffrowsAsync();
+        Update run = this.inner.Snapshot();
+        MutationPredicate<T> filter = new MutationPredicate<T>(this.meta, run.db,
+            run.tbl, run.CandidateWhere(), run.CandidateParams(), this.predicates);
+        if (filter.HasPredicates()) {
+            DbResult rows = await run.db.QueryAsync(filter.Sql(), filter.CandidateParams());
+            filter.Build(rows);
+            run.PredicateCondition(filter.Condition());
+            filter.BindUpdate(run);
+        }
+        return await run.ExecuteAffrowsAsync();
     }
 }
 
@@ -454,38 +378,14 @@ public static class DbExtensions {
     }
 
     public static InsertQuery<T> Insert<T>(this IDbConnection db, List<T> entities) {
-        InsertQuery<T> q = new InsertQuery<T>(db, null, Meta.For<T>());
-        if (entities != null) {
-            for (int i = 0; i < entities.Count; i = i + 1) {
-                T entity = entities[i];
-                DbValues v = new DbValues();
-                for (int j = 0; j < q.meta.Cols.Count; j = j + 1) {
-                    Col c = q.meta.Cols[j];
-                    if (c.IsIdent) { continue; }
-                    if (c.Kind == 3) {
-                        string sv = ((object)entity).GetFieldString(c.Field);
-                        if (sv == null) {
-                            v.SetNull(c.Col);
-                        } else {
-                            v.Set(c.Col, sv);
-                        }
-                    } else if (c.Kind == 1) {
-                        v.Set(c.Col, ((object)entity).GetFieldDouble(c.Field));
-                    } else if (c.Kind == 2) {
-                        v.Set(c.Col, ((object)entity).GetFieldBool(c.Field));
-                    } else if (c.Kind == 0 && c.I64) {
-                        v.Set(c.Col, ((object)entity).GetFieldLong(c.Field));
-                    } else {
-                        v.Set(c.Col, ((object)entity).GetFieldInt(c.Field));
-                    }
-                }
-                q.inner.AddDict(v);
-            }
-        }
-        return q;
+        return DbExtensions.BindInsertRows<T>(db, entities);
     }
 
     public static InsertQuery<T> Insert<T>(this IDbExecutor db, List<T> entities) {
+        return DbExtensions.BindInsertRows<T>(db, entities);
+    }
+
+    private static InsertQuery<T> BindInsertRows<T>(IDbExecutor db, List<T> entities) {
         InsertQuery<T> q = new InsertQuery<T>(db, null, Meta.For<T>());
         if (entities != null) {
             for (int i = 0; i < entities.Count; i = i + 1) {
@@ -594,28 +494,4 @@ public static class DbExtensions {
         }
         return true;
     }
-}
-
-// 转发到 DbExtensions 的扩展方法集合：每个方法体一律转调 DbExtensions 的同名方法。
-public static class DbOrmExtensions {
-    public static SelectQuery<T> Select<T>(this IDbConnection db) { return DbExtensions.Select<T>(db); }
-    public static SelectQuery<T> Select<T>(this IDbExecutor db) { return DbExtensions.Select<T>(db); }
-    public static SelectQuery<T> Query<T>(this IDbConnection db) { return DbExtensions.Query<T>(db); }
-    public static SelectQuery<T> Query<T>(this IDbExecutor db) { return DbExtensions.Query<T>(db); }
-    public static InsertQuery<T> Insert<T>(this IDbConnection db) { return DbExtensions.Insert<T>(db); }
-    public static InsertQuery<T> Insert<T>(this IDbExecutor db) { return DbExtensions.Insert<T>(db); }
-    public static InsertQuery<T> Insert<T>(this IDbConnection db, T entity) { return DbExtensions.Insert<T>(db, entity); }
-    public static InsertQuery<T> Insert<T>(this IDbExecutor db, T entity) { return DbExtensions.Insert<T>(db, entity); }
-    public static InsertQuery<T> Insert<T>(this IDbConnection db, List<T> entities) { return DbExtensions.Insert<T>(db, entities); }
-    public static InsertQuery<T> Insert<T>(this IDbExecutor db, List<T> entities) { return DbExtensions.Insert<T>(db, entities); }
-    public static DeleteQuery<T> Delete<T>(this IDbConnection db) { return DbExtensions.Delete<T>(db); }
-    public static DeleteQuery<T> Delete<T>(this IDbExecutor db) { return DbExtensions.Delete<T>(db); }
-    public static UpdateQuery<T> Update<T>(this IDbConnection db) { return DbExtensions.Update<T>(db); }
-    public static UpdateQuery<T> Update<T>(this IDbExecutor db) { return DbExtensions.Update<T>(db); }
-    public static void SyncStructure<T>(this IDbConnection db) { DbExtensions.SyncStructure<T>(db); }
-    public static void SyncStructure<T>(this IDbExecutor db) { DbExtensions.SyncStructure<T>(db); }
-    public static void SyncStructureAll(this IDbConnection db, Meta[] metas) { DbExtensions.SyncStructureAll(db, metas); }
-    public static void SyncStructureAll(this IDbExecutor db, Meta[] metas) { DbExtensions.SyncStructureAll(db, metas); }
-    public static async bool SyncStructureAllAsync(this IDbConnection db, Meta[] metas) { return await DbExtensions.SyncStructureAllAsync(db, metas); }
-    public static async bool SyncStructureAllAsync(this IDbExecutor db, Meta[] metas) { return await DbExtensions.SyncStructureAllAsync(db, metas); }
 }

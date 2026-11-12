@@ -1,4 +1,5 @@
 using System.Json;
+using System.IO;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Net.Tls;
@@ -129,6 +130,7 @@ public class HttpContext : IDisposable {
     }
 
     public void Dispose() {
+        this.CleanupUpload();
         this.ReleaseResponseBuf();
         if (this.headers != null) {
             this.headers.Clear();
@@ -183,7 +185,28 @@ public class HttpContext : IDisposable {
     public string ContentType() { return this.contentType; }
     public List<string> Headers() { return this.headers; }
 
+    // A completed spool is request-owned by default. Handlers that retain the
+    // original file beyond the request must explicitly transfer ownership.
+    public string TakeUpload() {
+        string path = this.uploadPath;
+        this.uploadPath = "";
+        this.uploadSize = 0;
+        return path;
+    }
+
+    public void CleanupUpload() {
+        string path = this.TakeUpload();
+        if (path.Length == 0) { return; }
+        try {
+            if (File.Exists(path)) { File.Delete(path); }
+        } catch (Exception e) {
+            // Cleanup must not hide the request's original error or response.
+            Console.WriteLine("[WebApp upload cleanup] " + e.Message);
+        }
+    }
+
     public void SetUpload(string path, long size) {
+        this.CleanupUpload();
         this.uploadPath = path;
         this.uploadSize = size;
     }
@@ -482,6 +505,37 @@ public class HttpContext : IDisposable {
         return false;
     }
 
+
+    // Ended only means a response was prepared. An exception before transport
+    // ownership must discard every success payload/header, including cookies.
+    internal bool ResetFailedResponse() {
+        if (this.wasHijacked || this.hijacked) { return false; }
+        this.ReleaseResponseBuf();
+        this.body = "";
+        this.bodyBytes = null;
+        this.bodyBytesLen = 0;
+        if (this.headers != null) {
+            for (int i = this.headers.Count - 1; i >= 0; i = i - 1) {
+                string header = this.headers[i].ToLower();
+                bool safe = header.StartsWith("access-control-")
+                    || header.StartsWith("vary:")
+                    || header.StartsWith("content-security-policy:")
+                    || header.StartsWith("content-security-policy-report-only:")
+                    || header.StartsWith("strict-transport-security:")
+                    || header.StartsWith("x-content-type-options:")
+                    || header.StartsWith("x-frame-options:")
+                    || header.StartsWith("referrer-policy:")
+                    || header.StartsWith("permissions-policy:")
+                    || header.StartsWith("cross-origin-");
+                if (!safe) { this.headers.RemoveAt(i); }
+            }
+        }
+        this.status = 500;
+        this.statusText = "Internal Server Error";
+        this.contentType = HttpLimits.MimeJson;
+        this.ended = false;
+        return true;
+    }
 
     // 设置状态码与原因短语（可链式）。
     public HttpContext Status(int code, string text) {

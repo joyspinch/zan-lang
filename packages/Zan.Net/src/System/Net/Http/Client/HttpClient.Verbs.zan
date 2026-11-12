@@ -15,81 +15,70 @@ namespace System.Net.Http.Client;
 public partial class HttpClient {
     // 发送 GET 请求并返回响应体。
     public async string GetAsync(string path) {
-        string raw = await RequestAsync("GET", path, "");
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("GET", path, "");
         return resp.body;
     }
 
     // 发送带表单数据的 POST 请求。
     public async string PostAsync(string path, string body) {
-        string raw = await RequestAsync("POST", path, body);
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("POST", path, body);
         return resp.body;
     }
 
     // 发送 PUT 请求。
     public async string PutAsync(string path, string body) {
-        string raw = await RequestAsync("PUT", path, body);
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("PUT", path, body);
         return resp.body;
     }
 
     // 发送 DELETE 请求。
     public async string DeleteAsync(string path) {
-        string raw = await RequestAsync("DELETE", path, "");
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("DELETE", path, "");
         return resp.body;
     }
 
     // 发送 PATCH 请求并返回响应体 (RFC 5789)。
     public async string PatchAsync(string path, string body) {
-        string raw = await RequestAsync("PATCH", path, body);
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("PATCH", path, body);
         return resp.body;
     }
 
     // 发送带有 application/json 格式的 POST 请求并返回响应体。
     public async string PostJsonAsync(string path, string json) {
         this.SetHeader("Content-Type", "application/json");
-        string raw = await RequestAsync("POST", path, json != null ? json : "");
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("POST", path, json != null ? json : "");
         return resp.body;
     }
 
     // 发送带有 application/json 格式的 PUT 请求并返回响应体。
     public async string PutJsonAsync(string path, string json) {
         this.SetHeader("Content-Type", "application/json");
-        string raw = await RequestAsync("PUT", path, json != null ? json : "");
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("PUT", path, json != null ? json : "");
         return resp.body;
     }
 
     // 发送带有 application/json 格式的 PATCH 请求并返回响应体。
     public async string PatchJsonAsync(string path, string json) {
         this.SetHeader("Content-Type", "application/json");
-        string raw = await RequestAsync("PATCH", path, json != null ? json : "");
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("PATCH", path, json != null ? json : "");
         return resp.body;
     }
 
     // 发送带有 application/json 格式的 DELETE 请求并返回响应体。
     public async string DeleteJsonAsync(string path, string json) {
         this.SetHeader("Content-Type", "application/json");
-        string raw = await RequestAsync("DELETE", path, json != null ? json : "");
-        HttpResponse resp = HttpResponse.Parse(raw);
+        HttpResponse resp = await RequestAsync("DELETE", path, json != null ? json : "");
         return resp.body;
     }
 
     // 发送 HEAD 请求并返回 HttpResponse 响应对象 (RFC 7231 §4.3.2，仅包含标头)。
     public async HttpResponse HeadAsync(string path) {
-        string raw = await RequestAsync("HEAD", path, "");
-        return HttpResponse.Parse(raw);
+        return await RequestAsync("HEAD", path, "");
     }
 
     // 发送 OPTIONS 请求并返回 HttpResponse 响应对象 (RFC 7231 §4.3.7)。
     public async HttpResponse OptionsAsync(string path) {
-        string raw = await RequestAsync("OPTIONS", path, "");
-        return HttpResponse.Parse(raw);
+        return await RequestAsync("OPTIONS", path, "");
     }
 
     // 快捷静态 https GET（一次性）；校验保持开启，因此
@@ -337,47 +326,22 @@ public partial class HttpClient {
                 this.callPolicy.MaxRequestBytes()) + " bytes");
             return 0;
         }
-        Socket.Initialize();
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) {
+        string requestData = BuildRequest("POST", path, body, true);
+        PooledHttpConnection channel = null;
+        try {
+            channel = await this.OpenChannel(false);
+        } catch (HttpRequestException e) {
+            sink.Finish("err: " + e.Message);
+            return 0;
+        }
+        if (channel == null) {
             sink.Finish("err: connect to " + this.host + " failed");
             return 0;
         }
-
-        TlsStream stream = null;
-        TlsContext ctx = null;
-        if (this.useTls) {
-            if (this.clientCertificateFile.Length > 0
-                && this.clientPrivateKeyFile.Length > 0) {
-                ctx = TlsContext.CreateClientWithCertificate(
-                    this.clientCertificateFile, this.clientPrivateKeyFile);
-            } else {
-                ctx = TlsContext.CreateClient();
-            }
-            if (ctx == null) {
-                conn.Close();
-                string tlsError2 = TlsStream.LastError();
-                if (tlsError2 == "") { tlsError2 = "TLS 上下文初始化失败"; }
-                sink.Finish("err: " + tlsError2);
-                return 0;
-            }
-            if (!this.verifyTls) { ctx.DisableVerify(); }
-            this.ApplyPinning(ctx);
-            stream = await this.ConnectTls(ctx, conn.Sock());
-            if (stream == null) {
-                conn.Close();
-                ctx.Free();
-                string tlsHandshakeError2 = TlsStream.LastError();
-                if (tlsHandshakeError2 == "") {
-                    tlsHandshakeError2 = "TLS 握手失败";
-                }
-                sink.Finish("err: " + tlsHandshakeError2);
-                return 0;
-            }
-        }
+        TcpClient conn = channel.conn;
+        TlsStream stream = channel.tls;
 
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string requestData = BuildRequest("POST", path, body, true);
         int sent = 0;
         if (this.useTls) {
             sent = await stream.SendAsync(requestData, requestData.Length);
@@ -386,8 +350,7 @@ public partial class HttpClient {
         }
         if (sent != requestData.Length) {
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             sink.Finish("err: request write failed");
             return 0;
         }
@@ -416,8 +379,7 @@ public partial class HttpClient {
         if (hb < 0) {
             bool timedOut = HttpDeadline.Expired(watch);
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             if (timedOut) { sink.Finish("err: timeout"); }
             else { sink.Finish("err: no response head"); }
             return 0;
@@ -599,13 +561,7 @@ public partial class HttpClient {
         }
         bool late = HttpDeadline.Expired(watch);
         HttpDeadline.Disarm(watch);
-        if (this.useTls) {
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-        } else {
-            conn.Close();
-        }
+        channel.Dispose();
 
         // 在事件边界（关闭 SSE 事件的空行）处结束的流
         // 已交付完整事件：从不发送 [DONE] 哨兵的

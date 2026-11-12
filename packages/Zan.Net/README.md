@@ -30,6 +30,18 @@ Zan.Mvc (HTTP server), Zan.Data drivers (socket transport for MySQL/Postgres/
 SqlServer/TDengine/Firebird), Zan.AppUpdate, Zan.Commercial, the IDE
 (AI/HTTP clients), and any program spelling `using System.Net.*`.
 
+## WebSocket close lifecycle
+
+WS and WSS clients share send serialization, frame/message handling and transport
+ownership. `CloseNow` stops admission and shuts down immediately, then retains the
+physical descriptor until admitted sends and receives have exited. Final disposal
+can therefore finish after `CloseNow` returns. This protects readiness waits from
+socket-handle reuse. A raw `WsReader` whose socket is owned by its caller requires
+the same lifetime discipline from that owner.
+
+Reader capacity requests beyond the frame budget plus 65,536 bytes of receive
+slack throw before copying; they are not silently clamped.
+
 ## Notes
 
 - Pure Zan; the only native interaction is via the runtime's socket syscalls —

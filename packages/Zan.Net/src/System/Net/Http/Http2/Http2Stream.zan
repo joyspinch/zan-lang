@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Text;
 using System.Threading;
@@ -16,6 +17,13 @@ public class Http2Stream {
     public int errorCode;
     public bool completed;
     public AsyncGate gate;
+    public int outboundWindow = 65535;
+    public int inboundWindow = 65535;
+    public int bodyLength;
+    public int declaredLength = -1;
+    public int maxBodyBytes = 8388608;
+    public bool headersReceived;
+    public bool suppressBody;
 
     public Http2Stream(int streamId) {
         this.streamId = streamId;
@@ -52,13 +60,17 @@ public class Http2Stream {
     }
 
     public void AppendBody(byte[] data, int offset, int length) {
-        if (data == null || length <= 0) { return; }
+        if (this.completed || data == null || offset < 0 || length < 0 || offset > data.Length || length > data.Length - offset || length > this.maxBodyBytes - this.bodyLength || (this.suppressBody && length > 0)) { throw new IOException("HTTP2 response body limit or state"); }
+        this.bodyLength = this.bodyLength + length;
+        if (this.declaredLength >= 0 && this.bodyLength > this.declaredLength) { throw new IOException("HTTP2 response content-length mismatch"); }
+        if (length == 0) { return; }
         string chunk = data.ToStr(offset, length);
         this.responseBody.Append(chunk);
     }
 
     public void Complete() {
         if (!this.completed) {
+            if (!this.suppressBody && this.declaredLength >= 0 && this.bodyLength != this.declaredLength) { this.Reset(1); return; }
             this.state = 4; // Closed
             this.completed = true;
             this.gate.Signal();

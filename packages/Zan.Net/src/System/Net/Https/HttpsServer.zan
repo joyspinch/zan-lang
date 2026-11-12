@@ -1,7 +1,6 @@
 using System;
 using System.Net.Sockets;
 using System.Net.Http;
-using System.Net.Http.Http2;
 using System.Net.Tls;
 
 namespace System.Net.Https;
@@ -44,6 +43,11 @@ public class HttpsServer : IDisposable {
         server.tls = TlsContext.CreateServer(certFile, keyFile);
         if (server.tls == null) {
             return null;
+        }
+        // The listener dispatches both versions; negotiate h2 before accepting its preface.
+        if (server.tls.alpnProtocols.Count == 0) {
+            server.tls.alpnProtocols.Add("h2");
+            server.tls.alpnProtocols.Add("http/1.1");
         }
         return server;
     }
@@ -119,232 +123,32 @@ public class HttpsServer : IDisposable {
         this.Stop();
     }
 
-    // 对一个客户端连接执行 TLS 握手，随后用与
-    // <see cref="HttpServer.HandleConnection"/> 相同的帧解析
-    // 服务其上的 HTTP/1.1 请求（支持 keep-alive 与流水线）。
     private async void HandleConnection(nint clientSock) {
-        // 握手/服务过程中任何一步抛出异常（处理器、TLS 层）都会跳过
-        // 顺序清理，泄漏 fd、TlsStream、framer 缓冲、deadline 槽位与
-        // 连接计数——计数不归还会让服务器在语义满载后拒绝一切新连接。
-        // 释放统一交给 finally，正常与异常路径共用。
         try {
-            await this.HandleConnectionInner(clientSock);
+            Socket.SetNonBlocking(clientSock);
+            TlsStream stream;
+            if (this.requestTimeoutMs > 0) {
+                stream = await TlsStream.AcceptAsync(this.tls, clientSock, this.requestTimeoutMs);
+            } else {
+                stream = await TlsStream.AcceptAsync(this.tls, clientSock);
+            }
+            if (stream == null) { return; }
+
+            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            HttpFramer framer = HttpFramerTls.Create(stream);
+            try {
+                Http1Writer writer = HttpFramerTls.CreateWriter(stream);
+                await HttpServer.ServeHttp1Session(this.requestHandler, framer, writer,
+                    this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeoutMs, watch,
+                    "<h1>Zan HTTPS Server</h1><p>Override ProcessRequest to handle routes.</p>");
+            } finally {
+                HttpDeadline.Disarm(watch);
+                framer.Dispose();
+                stream.Close();
+            }
         } finally {
+            Socket.Close(clientSock);
             this.activeConnections = this.activeConnections - 1;
         }
-    }
-
-    // HandleConnection 的服务体；计数归还见 HandleConnection 的 finally。
-    private async void HandleConnectionInner(nint clientSock) {
-        Socket.SetNonBlocking(clientSock);
-        // 握手阶段受同一个请求超时约束：沉默的对端不能借固定 30 秒
-        // 握手窗口绕过 SetTimeout。
-        TlsStream stream;
-        if (this.requestTimeoutMs > 0) {
-            stream = await TlsStream.AcceptAsync(this.tls, clientSock,
-                this.requestTimeoutMs);
-        } else {
-            stream = await TlsStream.AcceptAsync(this.tls, clientSock);
-        }
-        if (stream == null) {
-            Socket.Close(clientSock);
-            return;
-        }
-
-        // deadline/framer/stream 的释放交给下面的 try/finally；此前的
-        // 顺序清理会被任何异常（处理器抛出等）跳过。
-        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
-        bool keepAlive = true;
-        // 与明文 HTTP 用同一个拆包器（字节源换成 TLS 记录层）：跨包
-        // 头部/正文、流水线、含 NUL 的二进制正文、分块编码的定界规则
-        // 因此只有一份实现。
-        HttpFramer framer = HttpFramerTls.Create(stream);
-        int reject = 0;
-
-        try {
-            while (keepAlive) {
-                // 每个请求赋予全新截止窗口，防止上一请求消耗后的残留截止时间导致后续 keepalive 请求提前误超时
-                HttpDeadline.Touch(watch, this.requestTimeoutMs);
-                int headerEnd = await framer.ReadHead(this.maxHeaderBytes);
-                if (headerEnd == -431) { reject = 431; break; }
-                if (headerEnd <= 0) { keepAlive = false; break; }
-
-                HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
-                                                       headerEnd);
-                // 识别客户端 HTTP/2 连接序言（RFC 7540 §3.5: PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n）
-                if (request.method == "PRI" && request.path == "*" && request.version == "HTTP/2.0") {
-                    framer.Consume(headerEnd);
-                    await Http2ServerConnection.ServeTlsAsync(stream.SendAsync, this.requestHandler, framer,
-                        this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeoutMs);
-                    return;
-                }
-                // 定界失败（Content-Length 溢出/重复不一致、非数字、
-                // 未实现的 Transfer-Encoding 等）→ 拒绝，不切分正文。
-                if (request.parseStatus != 0) {
-                    reject = request.parseStatus;
-                    break;
-                }
-                int bodyLen = request.contentLength;
-                if (bodyLen < 0) { bodyLen = 0; }
-                if (headerEnd + bodyLen > this.maxRequestBytes) { reject = 413; break; }
-                HttpDeadline.Touch(watch, this.requestTimeoutMs);
-                int bodyStatus = await framer.ReadBody(request,
-                    this.maxRequestBytes - headerEnd);
-                if (bodyStatus > 0) { reject = bodyStatus; break; }
-                if (bodyStatus < 0) { keepAlive = false; break; }
-                framer.Consume(framer.RequestBytes());
-                keepAlive = request.keepAlive;
-
-                HttpDeadline.Touch(watch, this.requestTimeoutMs);
-                HttpResponse response = await ProcessRequest(request);
-                response = response.SetKeepAlive(keepAlive);
-
-                // 与明文 HTTP 相同的二进制正文处理：SendAsync 按 strlen 定长，
-                // 正文里的 NUL 会把响应截断。二进制正文用 BuildHeaders +
-                // bodyBytes 按显式字节数分块发送（Content-Length 与发送长度
-                // 同取自 BodyLength）；ToStr 按长度复制，NUL 原样加密上线。
-                // HEAD 与 1xx/204/304 响应禁止在线路上发送任何正文字节。
-                bool statusBodyless = (response.statusCode >= 100 && response.statusCode < 200)
-                    || response.statusCode == 204
-                    || response.statusCode == 304;
-                bool omitBody = (request != null && request.method == "HEAD") || statusBodyless;
-
-                if (omitBody) {
-                    StringBuilder hsb = HttpBufferPool.Rent();
-                    response.WriteHeadersTo(hsb);
-                    int _h0 = await stream.SendViewAsync(hsb.AsView());
-                    HttpBufferPool.Return(hsb);
-                } else if (response.framingChunked) {
-                    // 分块传输：头部带 Transfer-Encoding: chunked（不带
-                    // Content-Length），正文按 "<长度>\r\n<数据>\r\n" 逐块
-                    // 写出，末尾写 "0\r\n\r\n"。正文来源抛异常时头部已经
-                    // 发出，只能断开连接——不写结束块即为截断标记。
-                    // 空正文同样走这条路径（发完头部写结束块）。
-                    StringBuilder hsb = HttpBufferPool.Rent();
-                    try {
-                        response.WriteHeadersTo(hsb);
-                        int _h3 = await stream.SendViewAsync(hsb.AsView());
-                    } finally {
-                        HttpBufferPool.Return(hsb);
-                    }
-                    bool complete = true;
-                    while (true) {
-                        byte[] piece = null;
-                        if (response.chunkSource != null) {
-                            try {
-                                piece = await response.chunkSource();
-                            } catch (Exception e) {
-                                Console.WriteLine("[https] chunk source exception on "
-                                    + request.method + " " + request.path + ": "
-                                    + e.Message);
-                                complete = false;
-                                break;
-                            }
-                        }
-                        if (piece == null || piece.Length == 0) { break; }
-                        byte[] prefix = HttpChunkWriter.FramePrefix(piece.Length);
-                        int _p1 = await stream.SendBytesAsync(prefix, 0, prefix.Length);
-                        int _p2 = await stream.SendBytesAsync(piece, 0, piece.Length);
-                        byte[] suffix = HttpChunkWriter.FrameSuffix();
-                        int _p3 = await stream.SendBytesAsync(suffix, 0, suffix.Length);
-                    }
-                    if (complete) {
-                        byte[] term = HttpChunkWriter.Terminator();
-                        int _t = await stream.SendBytesAsync(term, 0, term.Length);
-                    } else {
-                        keepAlive = false;
-                    }
-                } else if (response.IsBinary()) {
-                    StringBuilder hsb = HttpBufferPool.Rent();
-                    try {
-                        response.WriteHeadersTo(hsb);
-                        int _h2 = await stream.SendViewAsync(hsb.AsView());
-                    } finally {
-                        HttpBufferPool.Return(hsb);
-                    }
-                    int blen = response.BodyLength();
-                    int off = 0;
-                    while (blen - off > 0) {
-                        int chunk = blen - off;
-                        if (chunk > 16384) { chunk = 16384; }
-                        int _b2 = await stream.SendBytesAsync(response.bodyBytes, off, chunk);
-                        off = off + chunk;
-                    }
-                } else {
-                    StringBuilder rsb = HttpBufferPool.Rent();
-                    try {
-                        response.WriteTo(rsb);
-                        int _sent = await stream.SendViewAsync(rsb.AsView());
-                    } finally {
-                        HttpBufferPool.Return(rsb);
-                    }
-                }
-                response.Dispose();
-                response = null;
-
-                if (!keepAlive) {
-                    break;
-                }
-            }
-
-            if (reject == 431) {
-                HttpResponse tooLarge = HttpResponse.WithStatus(431, "Request Header Fields Too Large", "header block exceeds limit");
-                tooLarge = tooLarge.SetKeepAlive(false);
-                StringBuilder rsb = HttpBufferPool.Rent();
-                try {
-                    tooLarge.WriteTo(rsb);
-                    int _s = await stream.SendViewAsync(rsb.AsView());
-                } finally {
-                    HttpBufferPool.Return(rsb);
-                }
-            } else if (reject == 413) {
-                HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
-                tooLarge = tooLarge.SetKeepAlive(false);
-                StringBuilder rsb = HttpBufferPool.Rent();
-                try {
-                    tooLarge.WriteTo(rsb);
-                    int _s = await stream.SendViewAsync(rsb.AsView());
-                } finally {
-                    HttpBufferPool.Return(rsb);
-                }
-            } else if (reject == 400) {
-                // 定界冲突/畸形长度：请求走私拒绝，必须关闭连接。
-                HttpResponse bad = HttpResponse.WithStatus(400, "Bad Request",
-                    "malformed request framing");
-                bad = bad.SetKeepAlive(false);
-                StringBuilder rsb = HttpBufferPool.Rent();
-                try {
-                    bad.WriteTo(rsb);
-                    int _b = await stream.SendViewAsync(rsb.AsView());
-                } finally {
-                    HttpBufferPool.Return(rsb);
-                }
-            } else if (reject == 501) {
-                HttpResponse nai = HttpResponse.WithStatus(501, "Not Implemented",
-                    "Transfer-Encoding is not supported");
-                nai = nai.SetKeepAlive(false);
-                StringBuilder rsb = HttpBufferPool.Rent();
-                try {
-                    nai.WriteTo(rsb);
-                    int _n = await stream.SendViewAsync(rsb.AsView());
-                } finally {
-                    HttpBufferPool.Return(rsb);
-                }
-            }
-        } finally {
-            HttpDeadline.Disarm(watch);
-            framer.Dispose();
-            stream.Close();
-            Socket.Close(clientSock);
-        }
-    }
-
-    // 分发到 OnRequest 注册的处理器；未注册时返回占位页。
-    private async HttpResponse ProcessRequest(HttpRequest request) {
-        HttpRequestHandler handler = this.requestHandler;
-        if (handler != null) {
-            return await handler(request);
-        }
-        return HttpResponse.Ok("<h1>Zan HTTPS Server</h1><p>Override ProcessRequest to handle routes.</p>");
     }
 }

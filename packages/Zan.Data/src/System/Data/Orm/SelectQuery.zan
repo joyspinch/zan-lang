@@ -148,6 +148,26 @@ public class SelectQuery<T> {
         this.includeFields = new List<string>();
     }
 
+    SelectQuery<T> Snapshot() {
+        SelectQuery<T> copy = new SelectQuery<T>(this.db, this.meta);
+        copy.inner = this.inner.Snapshot();
+        copy.predicate = this.predicate;
+        if (this.predicates != null) {
+            for (int i = 0; i < this.predicates.Count; i = i + 1) {
+                copy.predicates.Add(this.predicates[i]);
+            }
+        }
+        for (int i = 0; i < this.includeFields.Count; i = i + 1) {
+            copy.includeFields.Add(this.includeFields[i]);
+        }
+        copy.havingPredicate = this.havingPredicate;
+        copy.navTypeInfo = this.navTypeInfo;
+        copy.groupByStringFn = this.groupByStringFn;
+        copy.orderByLongFn = this.orderByLongFn;
+        copy.orderByDesc = this.orderByDesc;
+        return copy;
+    }
+
     public string DetectColInt(Func<T, int> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
         object dummy = ti.CreateInstance();
@@ -502,15 +522,18 @@ public class SelectQuery<T> {
 
     // 执行分页查询并返回封装总记录数与分页明细的 PageResult。
     public PageResult<T> ToPageResult(int page, int pageSize) {
-        int total = this.Count();
-        List<T> list = this.Page(page, pageSize).ToList();
+        SelectQuery<T> query = this.Snapshot();
+        int total = query.CountRows();
+        List<T> list = query.Page(page, pageSize).ReadList();
         return new PageResult<T>(list, total, page, pageSize);
     }
 
     // 异步执行分页查询并返回封装总记录数与分页明细的 PageResult。
     public async PageResult<T> ToPageResultAsync(int page, int pageSize) {
-        int total = await this.CountAsync();
-        List<T> list = await this.Page(page, pageSize).ToListAsync();
+        SelectQuery<T> query = this.Snapshot();
+        int total = await query.CountRowsAsync();
+        query.Page(page, pageSize);
+        List<T> list = await query.ReadListAsync();
         return new PageResult<T>(list, total, page, pageSize);
     }
 
@@ -545,67 +568,36 @@ public class SelectQuery<T> {
         }
     }
 
-    // 执行基于主键游标的流式分页（Keyset/Seek Pagination），规避千万级深翻页 OFFSET 扫描劣化的性能悬崖。
-    // lastCursor: 上一页最后一条记录的主键游标（首次传 0）。
-    // pageSize: 批次拉取条数。
-    // asc: true 为升序（大于 lastCursor），false 为降序（小于 lastCursor）。
-    public SeekResult<T> ToSeekResult(long lastCursor, int pageSize, bool asc = true) {
-        if (pageSize <= 0) { pageSize = 10; }
+    // 基于主键游标的分页不改写调用方的查询条件或排序。
+    void ConfigureSeek(long lastCursor, int pageSize, bool asc) {
         string pk = this.PkName();
         if (lastCursor > 0) {
-            if (asc) {
-                this.Where(pk + " > " + lastCursor.ToString());
-            } else {
-                this.Where(pk + " < " + lastCursor.ToString());
-            }
+            this.Where(pk + (asc ? " > " : " < ") + lastCursor.ToString());
         }
-        if (asc) {
-            this.OrderBy(pk + " ASC");
-        } else {
-            this.OrderBy(pk + " DESC");
-        }
-        List<T> fetch = this.Limit(pageSize + 1, 0).ToList();
-        bool hasMore = fetch.Count > pageSize;
-        List<T> items = new List<T>();
-        int limit = hasMore ? pageSize : fetch.Count;
-        for (int i = 0; i < limit; i = i + 1) {
-            items.Add(fetch[i]);
-        }
-        long nextCursor = lastCursor;
-        if (items.Count > 0) {
-            nextCursor = this.ExtractLongPk(items[items.Count - 1]);
-        }
-        return new SeekResult<T>(items, hasMore, nextCursor);
+        this.OrderBy(pk + (asc ? " ASC" : " DESC"));
+        this.Limit(pageSize < 2147483647 ? pageSize + 1 : pageSize, 0);
     }
 
-    // 异步执行基于主键游标的流式分页。
+    SeekResult<T> SeekPage(List<T> rows, long lastCursor, int pageSize) {
+        bool hasMore = rows.Count > pageSize;
+        if (hasMore) { rows.RemoveAt(rows.Count - 1); }
+        long nextCursor = rows.Count > 0 ? this.ExtractLongPk(rows[rows.Count - 1]) : lastCursor;
+        return new SeekResult<T>(rows, hasMore, nextCursor);
+    }
+
+    public SeekResult<T> ToSeekResult(long lastCursor, int pageSize, bool asc = true) {
+        if (pageSize <= 0) { pageSize = 10; }
+        SelectQuery<T> query = this.Snapshot();
+        query.ConfigureSeek(lastCursor, pageSize, asc);
+        return query.SeekPage(query.ReadList(), lastCursor, pageSize);
+    }
+
     public async SeekResult<T> ToSeekResultAsync(long lastCursor, int pageSize, bool asc = true) {
         if (pageSize <= 0) { pageSize = 10; }
-        string pk = this.PkName();
-        if (lastCursor > 0) {
-            if (asc) {
-                this.Where(pk + " > " + lastCursor.ToString());
-            } else {
-                this.Where(pk + " < " + lastCursor.ToString());
-            }
-        }
-        if (asc) {
-            this.OrderBy(pk + " ASC");
-        } else {
-            this.OrderBy(pk + " DESC");
-        }
-        List<T> fetch = await this.Limit(pageSize + 1, 0).ToListAsync();
-        bool hasMore = fetch.Count > pageSize;
-        List<T> items = new List<T>();
-        int limit = hasMore ? pageSize : fetch.Count;
-        for (int i = 0; i < limit; i = i + 1) {
-            items.Add(fetch[i]);
-        }
-        long nextCursor = lastCursor;
-        if (items.Count > 0) {
-            nextCursor = this.ExtractLongPk(items[items.Count - 1]);
-        }
-        return new SeekResult<T>(items, hasMore, nextCursor);
+        SelectQuery<T> query = this.Snapshot();
+        query.ConfigureSeek(lastCursor, pageSize, asc);
+        List<T> rows = await query.ReadListAsync();
+        return query.SeekPage(rows, lastCursor, pageSize);
     }
 
     public SelectQuery<T> Include<TNav>(Func<T, TNav> expr) {
@@ -639,24 +631,54 @@ public class SelectQuery<T> {
     }
 
     public int Count() {
-        if (this.HasPredicates()) {
-            return this.ToList().Count;
-        }
-        return this.inner.Count();
+        return this.Snapshot().CountRows();
     }
 
     public async int CountAsync() {
-        if (this.HasPredicates()) {
-            return (await this.ToListAsync()).Count;
+        SelectQuery<T> query = this.Snapshot();
+        return await query.CountRowsAsync();
+    }
+
+    bool HasClientFilter() {
+        return this.HasPredicates() || this.havingPredicate != null;
+    }
+
+    bool CountOnClient() {
+        return this.HasClientFilter() || this.groupByStringFn != null;
+    }
+
+    int CountRows() {
+        if (!this.CountOnClient()) { return this.inner.Count(); }
+        return this.CountMatching(this.Unpaged().Rows());
+    }
+
+    async int CountRowsAsync() {
+        if (!this.CountOnClient()) { return await this.inner.CountAsync(); }
+        Select select = this.Unpaged();
+        DbResult rows = await select.RowsAsync();
+        return this.CountMatching(rows);
+    }
+
+    int CountMatching(DbResult rows) {
+        List<T> items = this.FilterRows(rows, this.groupByStringFn == null, 0, -1);
+        if (this.groupByStringFn == null) { return items.Count; }
+        List<string> keys = new List<string>();
+        Dictionary<string, List<object>> groups = this.GroupRows(items, keys);
+        int count = 0;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (this.GroupMatches(groups[keys[i]])) { count = count + 1; }
         }
-        DbResult r = await this.inner.AggRAsync("COUNT(*)");
-        if (r == null || r.RowCount() == 0) { return 0; }
-        return r.GetInt(0, 0);
+        return count;
+    }
+
+    List<T> AggregateRows() {
+        SelectQuery<T> query = this.Snapshot();
+        return query.FilterRows(query.Unpaged().Rows(), true, 0, -1);
     }
 
     public int Sum(Func<T, int> expr) {
-        if (this.predicate != null) {
-            List<T> list = this.ToList();
+        if (this.HasClientFilter()) {
+            List<T> list = this.AggregateRows();
             int s = 0;
             for (int i = 0; i < list.Count; i = i + 1) {
                 s = s + expr(list[i]);
@@ -668,8 +690,8 @@ public class SelectQuery<T> {
     }
 
     public int Max(Func<T, int> expr) {
-        if (this.predicate != null) {
-            List<T> list = this.ToList();
+        if (this.HasClientFilter()) {
+            List<T> list = this.AggregateRows();
             if (list.Count == 0) { return 0; }
             int m = expr(list[0]);
             for (int i = 1; i < list.Count; i = i + 1) {
@@ -683,8 +705,8 @@ public class SelectQuery<T> {
     }
 
     public int Min(Func<T, int> expr) {
-        if (this.predicate != null) {
-            List<T> list = this.ToList();
+        if (this.HasClientFilter()) {
+            List<T> list = this.AggregateRows();
             if (list.Count == 0) { return 0; }
             int m = expr(list[0]);
             for (int i = 1; i < list.Count; i = i + 1) {
@@ -698,8 +720,8 @@ public class SelectQuery<T> {
     }
 
     public double Avg(Func<T, double> expr) {
-        if (this.predicate != null) {
-            List<T> list = this.ToList();
+        if (this.HasClientFilter()) {
+            List<T> list = this.AggregateRows();
             if (list.Count == 0) { return 0.0; }
             double sum = 0.0;
             for (int i = 0; i < list.Count; i = i + 1) {
@@ -771,221 +793,270 @@ public class SelectQuery<T> {
         return MapRow(r, row, meta, null);
     }
 
-    public List<T> ToList() {
-        int savedLim = this.inner.limN;
-        int savedOff = this.inner.offN;
-        if (this.HasPredicates()) {
-            // 客户端委托过滤安全门：若指定了 Take/Limit，设置合理的预读上限（默认 50 倍窗口，最多 10000 条），
-            // 阻断大表被无界 SELECT * 拖穿内存导致 OOM；
-            // 需全表精确分页推荐改用编译期语法树下推：Where((ExprNode x) => ...)
-            if (savedLim >= 0) {
-                int safeScan = (savedOff > 0 ? savedOff : 0) + savedLim;
-                int maxFetch = safeScan * 50;
-                if (maxFetch < 1000) { maxFetch = 1000; }
-                if (maxFetch > 10000) { maxFetch = 10000; }
-                this.inner.limN = maxFetch;
-                this.inner.offN = 0;
-            } else {
-                this.inner.limN = -1;
-                this.inner.offN = -1;
-            }
-        }
-        DbResult r = this.inner.Rows();
-        this.inner.limN = savedLim;
-        this.inner.offN = savedOff;
+    // Only execution snapshots change SQL pagination. Delegate filters see
+    // the full SQL candidate set; only filtered rows count toward a page.
+    Select Unpaged() {
+        Select select = this.inner.Snapshot();
+        select.limN = -1;
+        select.offN = -1;
+        return select;
+    }
+
+    List<T> FilterRows(DbResult rows, bool applyHaving, int skip, int take) {
         List<T> list = new List<T>();
-        if (r == null) { return list; }
-        int count = r.RowCount();
-        List<int> colIndices = ResolveColIndices(r, this.meta);
-        for (int i = 0; i < count; i = i + 1) {
-            T item = MapRow(r, i, this.meta, colIndices);
-            if (this.MatchPredicates(item)) {
-                if (this.havingPredicate == null || this.havingPredicate(item)) {
-                    if (this.includeFields.Count > 0) {
-                        this.PopulateNavigations(item);
-                    }
-                    list.Add(item);
-                }
-            }
-        }
-        if (this.HasPredicates() && (savedLim >= 0 || savedOff > 0)) {
-            List<T> paged = new List<T>();
-            int start = savedOff > 0 ? savedOff : 0;
-            int take = savedLim >= 0 ? savedLim : list.Count;
-            for (int i = start; i < list.Count && paged.Count < take; i = i + 1) {
-                paged.Add(list[i]);
-            }
-            return paged;
+        if (rows == null || take == 0) { return list; }
+        int remaining = skip > 0 ? skip : 0;
+        int count = rows.RowCount();
+        List<int> columns = ResolveColIndices(rows, this.meta);
+        for (int i = 0; i < count && (take < 0 || list.Count < take); i = i + 1) {
+            T item = MapRow(rows, i, this.meta, columns);
+            if (!this.MatchPredicates(item)) { continue; }
+            if (applyHaving && this.havingPredicate != null && !this.havingPredicate(item)) { continue; }
+            if (remaining > 0) { remaining = remaining - 1; }
+            else { list.Add(item); }
         }
         return list;
+    }
+
+    List<T> ReadList() {
+        if (this.inner.limN == 0) { return new List<T>(); }
+        bool client = this.HasClientFilter();
+        Select select = client ? this.Unpaged() : this.inner;
+        List<T> items = this.FilterRows(select.Rows(), true,
+            client ? this.inner.offN : 0, client ? this.inner.limN : -1);
+        if (this.includeFields.Count > 0) {
+            for (int i = 0; i < items.Count; i = i + 1) { this.PopulateNavigations(items[i]); }
+        }
+        return items;
+    }
+
+    async List<T> ReadListAsync() {
+        if (this.inner.limN == 0) { return new List<T>(); }
+        bool client = this.HasClientFilter();
+        Select select = client ? this.Unpaged() : this.inner;
+        DbResult rows = await select.RowsAsync();
+        List<T> items = this.FilterRows(rows, true,
+            client ? this.inner.offN : 0, client ? this.inner.limN : -1);
+        if (this.includeFields.Count > 0) {
+            for (int i = 0; i < items.Count; i = i + 1) { await this.PopulateNavigationsAsync(items[i]); }
+        }
+        return items;
+    }
+
+    public List<T> ToList() {
+        return this.Snapshot().ReadList();
+    }
+
+    TypeInfo NavigationOwnerType() {
+        return (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+    }
+
+    int NavigationField(TypeInfo owner, string name, out string foreignKey) {
+        foreignKey = name + "Id";
+        if (!owner.HasField(foreignKey)) { foreignKey = name + "id"; }
+        if (!owner.HasField(foreignKey)) { return -1; }
+        for (int i = 0; i < owner.FieldCount; i = i + 1) {
+            if (owner.GetFieldName(i) == name) { return i; }
+        }
+        return -1;
+    }
+
+    static string NavigationSql(TypeInfo owner, int field) {
+        return "SELECT * FROM " + QueryBuilder.RequireIdent(owner.GetFieldType(field)) + " WHERE id = ?";
+    }
+
+    static void SetNavigation(object item, string field, TypeInfo type, DbResult rows) {
+        if (rows == null || rows.RowCount() == 0) { return; }
+        object nav = type.CreateInstance();
+        for (int i = 0; i < type.FieldCount; i = i + 1) {
+            string name = type.GetFieldName(i);
+            int col = rows.GetColumnIndex(name);
+            if (col < 0) { continue; }
+            string kind = type.GetFieldType(i);
+            if (kind == "string") { nav.SetFieldString(name, rows.GetString(0, col)); }
+            else if (kind == "bool") { nav.SetFieldBool(name, rows.GetInt(0, col) != 0); }
+            else if (kind == "double" || kind == "float") { nav.SetFieldDouble(name, rows.GetDouble(0, col)); }
+            else if (kind == "long" || kind == "ulong") { nav.SetFieldLong(name, rows.GetLong(0, col)); }
+            else { nav.SetFieldInt(name, rows.GetInt(0, col)); }
+        }
+        item.SetFieldObject(field, nav);
     }
 
     public void PopulateNavigations(T item) {
         if (item == null || this.db == null) { return; }
         object obj = (object)item;
-        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
-        for (int k = 0; k < this.includeFields.Count; k = k + 1) {
-            string navField = this.includeFields[k];
-            string fkField = navField + "Id";
-            if (!ti.HasField(fkField)) {
-                fkField = navField + "id";
-            }
-            if (ti.HasField(fkField)) {
-                int fkid = obj.GetFieldInt(fkField);
-                for (int f = 0; f < ti.FieldCount; f = f + 1) {
-                    if (ti.GetFieldName(f) == navField) {
-                        string navType = ti.GetFieldType(f);
-                        DbParams navPs = new DbParams();
-                        navPs.AddInt(fkid);
-                        DbResult navR = this.db.Query("SELECT * FROM " + QueryBuilder.RequireIdent(navType) + " WHERE id = ?", navPs);
-                        if (navR != null && navR.RowCount() > 0) {
-                            TypeInfo navTi = ti.GetFieldTypeInfo(f);
-                            object navObj = navTi.CreateInstance();
-                            for (int nf = 0; nf < navTi.FieldCount; nf = nf + 1) {
-                                string colName = navTi.GetFieldName(nf);
-                                int col = navR.GetColumnIndex(colName);
-                                if (col >= 0) {
-                                    string cfType = navTi.GetFieldType(nf);
-                                    if (cfType == "string") {
-                                        navObj.SetFieldString(colName, navR.GetString(0, col));
-                                    } else if (cfType == "bool") {
-                                        navObj.SetFieldBool(colName, navR.GetInt(0, col) != 0);
-                                    } else if (cfType == "double" || cfType == "float") {
-                                        navObj.SetFieldDouble(colName, navR.GetDouble(0, col));
-                                    } else if (cfType == "long" || cfType == "ulong") {
-                                        navObj.SetFieldLong(colName, navR.GetLong(0, col));
-                                    } else {
-                                        navObj.SetFieldInt(colName, navR.GetInt(0, col));
-                                    }
-                                }
-                            }
-                            obj.SetFieldObject(navField, navObj);
-                        }
-                        break;
-                    }
-                }
-            }
+        TypeInfo owner = this.NavigationOwnerType();
+        for (int i = 0; i < this.includeFields.Count; i = i + 1) {
+            string name = this.includeFields[i];
+            string key = "";
+            int field = this.NavigationField(owner, name, out key);
+            if (field < 0) { continue; }
+            DbParams ps = new DbParams();
+            ps.AddInt(obj.GetFieldInt(key));
+            DbResult rows = this.db.Query(NavigationSql(owner, field), ps);
+            SetNavigation(obj, name, owner.GetFieldTypeInfo(field), rows);
         }
+    }
+
+    async bool PopulateNavigationsAsync(T item) {
+        if (item == null || this.db == null) { return true; }
+        object obj = (object)item;
+        TypeInfo owner = this.NavigationOwnerType();
+        for (int i = 0; i < this.includeFields.Count; i = i + 1) {
+            string name = this.includeFields[i];
+            string key = "";
+            int field = this.NavigationField(owner, name, out key);
+            if (field < 0) { continue; }
+            DbParams ps = new DbParams();
+            ps.AddInt(obj.GetFieldInt(key));
+            DbResult rows = await this.db.QueryAsync(NavigationSql(owner, field), ps);
+            SetNavigation(obj, name, owner.GetFieldTypeInfo(field), rows);
+        }
+        return true;
     }
 
     public async List<T> ToListAsync() {
-        return this.ToList();
+        SelectQuery<T> query = this.Snapshot();
+        return await query.ReadListAsync();
     }
 
-    public List<string> ToList(Func<T, string> selector) {
-        List<T> raw = this.ToList();
-        List<string> res = new List<string>();
-        for (int i = 0; i < raw.Count; i = i + 1) {
-            res.Add(selector(raw[i]));
-        }
-        return res;
-    }
-
-    public async List<string> ToListAsync(Func<T, string> selector) {
-        return this.ToList(selector);
-    }
-
-    public List<TReturn> ToList<TReturn>(Func<T, TReturn> selector) {
-        Func<T, bool> savedHaving = this.havingPredicate;
-        int savedLim = this.inner.limN;
-        int savedOff = this.inner.offN;
-        if (this.groupByStringFn != null) {
-            this.havingPredicate = null;
-            this.inner.limN = -1;
-            this.inner.offN = -1;
-        }
-        List<T> rawList = this.ToList();
-        this.havingPredicate = savedHaving;
-        this.inner.limN = savedLim;
-        this.inner.offN = savedOff;
-
-        List<TReturn> result = new List<TReturn>();
-        if (rawList.Count == 0) return result;
-
-        if (this.groupByStringFn != null) {
-            Dictionary<string, List<object>> groups = new Dictionary<string, List<object>>();
-            List<string> groupKeys = new List<string>();
-            for (int i = 0; i < rawList.Count; i = i + 1) {
-                T item = rawList[i];
-                string key = this.groupByStringFn(item);
-                if (!groups.ContainsKey(key)) {
-                    groups[key] = new List<object>();
-                    groupKeys.Add(key);
-                }
-                groups[key].Add((object)item);
-            }
-
-            if (this.orderByLongFn != null && groupKeys.Count > 1) {
-                for (int i = 0; i < groupKeys.Count - 1; i = i + 1) {
-                    for (int j = 0; j < groupKeys.Count - 1 - i; j = j + 1) {
-                        List<object> g1 = groups[groupKeys[j]];
-                        List<object> g2 = groups[groupKeys[j + 1]];
-                        OrmAggContext.current = g1;
-                        long v1 = this.orderByLongFn((T)g1[0]);
-                        OrmAggContext.current = g2;
-                        long v2 = this.orderByLongFn((T)g2[0]);
-                        OrmAggContext.current = null;
-                        bool swap = this.orderByDesc ? (v1 < v2) : (v1 > v2);
-                        if (swap) {
-                            string tmp = groupKeys[j];
-                            groupKeys[j] = groupKeys[j + 1];
-                            groupKeys[j + 1] = tmp;
-                        }
-                    }
-                }
-            }
-
-            for (int k = 0; k < groupKeys.Count; k = k + 1) {
-                string key = groupKeys[k];
-                List<object> group = groups[key];
-                OrmAggContext.current = group;
-                T first = (T)group[0];
-                if (savedHaving != null && !savedHaving(first)) {
-                    continue;
-                }
-                TReturn stat = selector(first);
-                result.Add(stat);
-            }
-            OrmAggContext.current = null;
-        } else {
-            OrmAggContext.current = new List<object>();
-            for (int i = 0; i < rawList.Count; i = i + 1) {
-                OrmAggContext.current.Add((object)rawList[i]);
-            }
-            T first = rawList[0];
-            TReturn stat = selector(first);
-            OrmAggContext.current = null;
-            result.Add(stat);
-            return result;
-        }
-
-        if (savedLim >= 0 || savedOff > 0) {
-            List<TReturn> paged = new List<TReturn>();
-            int start = savedOff > 0 ? savedOff : 0;
-            int take = savedLim >= 0 ? savedLim : result.Count;
-            for (int i = start; i < result.Count && paged.Count < take; i = i + 1) {
-                paged.Add(result[i]);
-            }
-            return paged;
-        }
-
+    static List<string> ProjectStrings(List<T> raw, Func<T, string> selector) {
+        List<string> result = new List<string>();
+        for (int i = 0; i < raw.Count; i = i + 1) { result.Add(selector(raw[i])); }
         return result;
     }
 
+    public List<string> ToList(Func<T, string> selector) {
+        return ProjectStrings(this.ToList(), selector);
+    }
+
+    public async List<string> ToListAsync(Func<T, string> selector) {
+        List<T> raw = await this.ToListAsync();
+        return ProjectStrings(raw, selector);
+    }
+
+    Dictionary<string, List<object>> GroupRows(List<T> rows, List<string> keys) {
+        Dictionary<string, List<object>> groups = new Dictionary<string, List<object>>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            T item = rows[i];
+            string key = this.groupByStringFn(item);
+            if (!groups.ContainsKey(key)) {
+                groups[key] = new List<object>();
+                keys.Add(key);
+            }
+            groups[key].Add((object)item);
+        }
+        return groups;
+    }
+
+    bool GroupMatches(List<object> group) {
+        if (this.havingPredicate == null) { return true; }
+        List<object> previous = OrmAggContext.current;
+        OrmAggContext.current = group;
+        try { return this.havingPredicate((T)group[0]); }
+        finally { OrmAggContext.current = previous; }
+    }
+
+    long GroupSortKey(List<object> group) {
+        List<object> previous = OrmAggContext.current;
+        OrmAggContext.current = group;
+        try { return this.orderByLongFn((T)group[0]); }
+        finally { OrmAggContext.current = previous; }
+    }
+
+    List<List<object>> PageGroups(List<T> rows) {
+        List<List<object>> page = new List<List<object>>();
+        if (rows.Count == 0 || this.inner.limN == 0) { return page; }
+        if (this.groupByStringFn == null) {
+            List<object> group = new List<object>();
+            for (int i = 0; i < rows.Count; i = i + 1) { group.Add((object)rows[i]); }
+            page.Add(group);
+            return page;
+        }
+        List<string> keys = new List<string>();
+        Dictionary<string, List<object>> groups = this.GroupRows(rows, keys);
+        if (this.orderByLongFn != null && keys.Count > 1) {
+            Dictionary<string, long> order = new Dictionary<string, long>();
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                order[keys[i]] = this.GroupSortKey(groups[keys[i]]);
+            }
+            for (int i = 0; i < keys.Count - 1; i = i + 1) {
+                for (int j = 0; j < keys.Count - 1 - i; j = j + 1) {
+                    long left = order[keys[j]];
+                    long right = order[keys[j + 1]];
+                    if (this.orderByDesc ? (left < right) : (left > right)) {
+                        string tmp = keys[j];
+                        keys[j] = keys[j + 1];
+                        keys[j + 1] = tmp;
+                    }
+                }
+            }
+        }
+        int remaining = this.inner.offN > 0 ? this.inner.offN : 0;
+        int limit = this.inner.limN;
+        for (int i = 0; i < keys.Count && (limit < 0 || page.Count < limit); i = i + 1) {
+            List<object> group = groups[keys[i]];
+            if (!this.GroupMatches(group)) { continue; }
+            if (remaining > 0) { remaining = remaining - 1; }
+            else { page.Add(group); }
+        }
+        return page;
+    }
+
+    TReturn ProjectGroup<TReturn>(List<object> group, Func<T, TReturn> selector) {
+        List<object> previous = OrmAggContext.current;
+        OrmAggContext.current = group;
+        try { return selector((T)group[0]); }
+        finally { OrmAggContext.current = previous; }
+    }
+
+    List<TReturn> ReadProjection<TReturn>(Func<T, TReturn> selector) {
+        List<TReturn> result = new List<TReturn>();
+        if (this.inner.limN == 0) { return result; }
+        List<T> rows = this.FilterRows(this.Unpaged().Rows(), this.groupByStringFn == null, 0, -1);
+        List<List<object>> page = this.PageGroups(rows);
+        for (int i = 0; i < page.Count; i = i + 1) {
+            if (this.includeFields.Count > 0) { this.PopulateNavigations((T)page[i][0]); }
+            result.Add(this.ProjectGroup<TReturn>(page[i], selector));
+        }
+        return result;
+    }
+
+    async List<TReturn> ReadProjectionAsync<TReturn>(Func<T, TReturn> selector) {
+        List<TReturn> result = new List<TReturn>();
+        if (this.inner.limN == 0) { return result; }
+        Select select = this.Unpaged();
+        DbResult data = await select.RowsAsync();
+        List<T> rows = this.FilterRows(data, this.groupByStringFn == null, 0, -1);
+        List<List<object>> page = this.PageGroups(rows);
+        for (int i = 0; i < page.Count; i = i + 1) {
+            if (this.includeFields.Count > 0) { await this.PopulateNavigationsAsync((T)page[i][0]); }
+            result.Add(this.ProjectGroup<TReturn>(page[i], selector));
+        }
+        return result;
+    }
+
+    public List<TReturn> ToList<TReturn>(Func<T, TReturn> selector) {
+        return this.Snapshot().ReadProjection<TReturn>(selector);
+    }
+
     public async List<TReturn> ToListAsync<TReturn>(Func<T, TReturn> selector) {
-        return this.ToList<TReturn>(selector);
+        SelectQuery<T> query = this.Snapshot();
+        return await query.ReadProjectionAsync<TReturn>(selector);
     }
 
     public TReturn ToOne<TReturn>(Func<T, TReturn> selector) {
-        List<TReturn> list = this.ToList<TReturn>(selector);
-        if (list.Count > 0) {
-            return list[0];
-        }
-        return null;
+        SelectQuery<T> query = this.Snapshot();
+        if (query.inner.limN != 0) { query.inner.One(); }
+        List<TReturn> list = query.ReadProjection<TReturn>(selector);
+        return list.Count > 0 ? list[0] : null;
     }
 
     public async TReturn ToOneAsync<TReturn>(Func<T, TReturn> selector) {
-        return this.ToOne<TReturn>(selector);
+        SelectQuery<T> query = this.Snapshot();
+        if (query.inner.limN != 0) { query.inner.One(); }
+        List<TReturn> list = await query.ReadProjectionAsync<TReturn>(selector);
+        return list.Count > 0 ? list[0] : null;
     }
 
     // 反向关系：取某个父行的子集合。关系从子实体的导航声明反推
@@ -1018,19 +1089,29 @@ public class SelectQuery<T> {
     }
 
     public async List<T> ChildrenAsync(int id) {
-        return this.Children(id);
+        return await this.ChildrenOfAsync("", id);
     }
 
     public async List<T> ChildrenAsync(string id) {
-        return this.Children(id);
+        return await this.ChildrenOfAsync("", id);
     }
 
     public async List<T> ChildrenOfAsync(string table, int id) {
-        return this.ChildrenOf(table, id);
+        Rel rel = Rel.Derive(this.meta, table);
+        if (rel == null) { return new List<T>(); }
+        Select q = Select.Create(this.db, this.meta);
+        rel.Apply(q, (long)id);
+        DbResult rows = await q.RowsAsync();
+        return this.MapAll(rows);
     }
 
     public async List<T> ChildrenOfAsync(string table, string id) {
-        return this.ChildrenOf(table, id);
+        Rel rel = Rel.Derive(this.meta, table);
+        if (rel == null) { return new List<T>(); }
+        Select q = Select.Create(this.db, this.meta);
+        rel.Apply(q, id);
+        DbResult rows = await q.RowsAsync();
+        return this.MapAll(rows);
     }
 
     List<T> MapAll(DbResult r) {
@@ -1045,18 +1126,16 @@ public class SelectQuery<T> {
     }
 
     public T First() {
-        if (this.predicate == null) {
-            this.inner.One();
-        }
-        List<T> list = this.ToList();
+        SelectQuery<T> query = this.Snapshot();
+        if (query.inner.limN != 0) { query.inner.One(); }
+        List<T> list = query.ReadList();
         return list.Count > 0 ? list[0] : null;
     }
 
     public async T FirstAsync() {
-        if (this.predicate == null) {
-            this.inner.One();
-        }
-        List<T> list = await this.ToListAsync();
+        SelectQuery<T> query = this.Snapshot();
+        if (query.inner.limN != 0) { query.inner.One(); }
+        List<T> list = await query.ReadListAsync();
         return list.Count > 0 ? list[0] : null;
     }
 

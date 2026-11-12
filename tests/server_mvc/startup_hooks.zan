@@ -1,0 +1,126 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+using Zan.Web.Core;
+using Zan.Web.Model;
+
+class Program {
+    static int failures;
+    static int mode;
+    static int beforeCalls;
+    static int afterCalls;
+    static IDbConnection held;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+
+    static async bool BeforeSchema(IDbConnection db) {
+        Program.beforeCalls = Program.beforeCalls + 1;
+        Program.held = db;
+        string locks = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_lock WHERE name = 'schema'");
+        Program.Check(locks == "1", "before hook runs under schema lease");
+        if (Program.mode == 0) {
+            string users = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sys_user'");
+            Program.Check(users == "0", "before hook precedes auto schema and system seeds");
+            return false;
+        }
+        // A migration can create/repair data before framework SyncStructure observes the schema.
+        int changed = await db.ExecuteAsync("CREATE TABLE IF NOT EXISTS app_startup_marker (id int PRIMARY KEY)");
+        if (Program.beforeCalls == 2) {
+            // Legacy import runs before framework seeds, including explicit occupied identities.
+            bool usersReady = await db.SyncStructureAsync<SysUser>();
+            bool rolesReady = await db.SyncStructureAsync<SysRole>();
+            bool grantsReady = await db.SyncStructureAsync<SysRoleGrant>();
+            Program.Check(usersReady && rolesReady && grantsReady, "identity fixture schema ready");
+            changed = await db.ExecuteAsync("INSERT INTO sys_user(id, username, passwordHash, passwordSalt, isSuper) VALUES(1, 'legacy-seller', 'retained-hash', '', 0)");
+            Program.Check(changed == 1, "legacy user identity imported");
+            changed = await db.ExecuteAsync("INSERT INTO sys_role(id, name, code, rank, status) VALUES(50, '商家', 'mall.seller', 2, 1)");
+            Program.Check(changed == 1, "custom role identity imported");
+            changed = await db.ExecuteAsync("INSERT INTO sys_role_grant(roleId, action, mask, createdAt) VALUES(50, 'mall.products', 7, 1)");
+            Program.Check(changed == 1, "custom grant imported");
+        }
+        return true;
+    }
+
+    static async bool AfterSchema(IDbConnection db) {
+        Program.afterCalls = Program.afterCalls + 1;
+        Program.Check(db == Program.held, "hooks share the same connection");
+        string locks = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_lock WHERE name = 'schema'");
+        string users = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_user WHERE username = 'admin'");
+        Program.Check(locks == "1" && users == "1", "after hook follows system seed and retains lease");
+        string builtinRoles = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_role WHERE code IN ('admin', 'editor') AND id > 50");
+        Program.Check(builtinRoles == "2", "builtin roles added independently after custom roles with fresh identities");
+        string bootstrap = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_user WHERE username = 'admin' AND id > 1 AND isSuper = 1");
+        string migrated = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_user WHERE id = 1 AND username = 'legacy-seller' AND passwordHash = 'retained-hash' AND isSuper = 0");
+        Program.Check(bootstrap == "1" && migrated == "1", "admin identity allocated without changing migrated user");
+        string custom = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_role WHERE id = 50 AND code = 'mall.seller' AND name = '商家' AND status = 1");
+        string grants = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_role_grant WHERE roleId = 50 AND action = 'mall.products' AND mask = 7");
+        Program.Check(custom == "1" && grants == "1", "custom role and grants survive initial and repeated seeds");
+        if (Program.afterCalls > 1) {
+            string retained = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_role WHERE code = 'admin' AND name = 'retained-admin-name' AND rank = 17 AND status = 0");
+            Program.Check(retained == "1", "missing editor repaired without rewriting existing admin role");
+        }
+        return Program.mode != 2;
+    }
+
+    static async void Main() {
+        Directory.CreateDirectoryRecursive("_scratch/server-mvc-startup");
+        string path = "_scratch/server-mvc-startup/hooks.db";
+        if (File.Exists(path)) { File.Delete(path); }
+        Cfg.Auth.iter = 1000;
+        Cfg.Auth.bootstrapPassword = "startup-hook-bootstrap-password";
+        DbPool pool = SqliteConnector.Pool(path, 1);
+        DbContext ctx = DbContext.Of(pool);
+        Boot.OnBeforeSchema(Program.BeforeSchema);
+        Boot.OnAfterSchema(Program.AfterSchema);
+        try {
+            Program.mode = 0;
+            bool ready = await Schema.Ensure(ctx);
+            Program.Check(!ready && Program.beforeCalls == 1 && Program.afterCalls == 0,
+                "before failure blocks auto schema and after hook");
+            Program.held = null;
+            IDbConnection db = await ctx.Acquire();
+            Program.Check(db != null, "failed initialization returns pool connection");
+            if (db != null) {
+                string locks = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_lock");
+                Program.Check(locks == "0", "before failure releases schema lease");
+                ctx.Release(db);
+            }
+            Program.mode = 1;
+            ready = await Schema.Ensure(ctx);
+            Program.Check(ready && Program.beforeCalls == 2 && Program.afterCalls == 1,
+                "startup succeeds after recoverable before failure");
+            db = await ctx.Acquire();
+            if (db != null) {
+                int changed = await db.ExecuteAsync("UPDATE sys_role SET name = 'retained-admin-name', rank = 17, status = 0 WHERE code = 'admin'");
+                Program.Check(changed == 1, "existing builtin customization installed");
+                changed = await db.ExecuteAsync("DELETE FROM sys_role WHERE code = 'editor'");
+                Program.Check(changed == 1, "partial builtin fixture installed");
+                ctx.Release(db);
+            }
+            Program.mode = 2;
+            ready = await Schema.Ensure(ctx);
+            Program.Check(!ready && Program.afterCalls == 2, "business seed failure reports not ready");
+            Program.held = null;
+            db = await ctx.Acquire();
+            if (db != null) {
+                string locks = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_lock");
+                Program.Check(locks == "0", "after failure releases schema lease");
+                ctx.Release(db);
+            }
+            Program.mode = 1;
+            Program.Check(await Schema.Ensure(ctx), "retry is idempotent after business failure");
+        } finally {
+            Schema.OnBeforeSchema(null);
+            Schema.OnAfterSchema(null);
+            Program.held = null;
+            pool.Close();
+            if (File.Exists(path)) { File.Delete(path); }
+        }
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("startup hook regression"); }
+    }
+}

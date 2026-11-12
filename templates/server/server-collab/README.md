@@ -771,19 +771,14 @@ List<OaDoc> docs = await db.OaDoc.Where(a => a.tenantId == tenantId)
 
 Keep reusable queries and business operations in the existing `EntityDao(IDbConnection)` classes. Call their methods through the same facade, for example `await db.FlowTask.ClaimTask(task.id, me.id)` or `await db.OaAttachUsage.TryAcquireQuota(tenantId, size, quota, now)`. The compiler initializes the DAO with the supplied connection. Built-in `Insert`, `Update` and `Delete` calls remain ORM builders and require an execution terminal, such as `await db.OaTodo.Insert(todo).ExecuteIdentityAsync()`. Synchronous import callbacks call existing `ByNameSync`, `CountByNameSync` and `InsertSync` methods on `db.Entity` so they use the import transaction connection.
 
-`System.Data.Orm.Model` maps both directions:
+For a known schema, declare a `[Table]` entity and call
+`db.SyncStructure<SysUser>()` to create its table if missing. For a
+runtime table name, inspect the existing columns with
+`DbSchema.ColumnsAsync(db, table)` and query through `DbTable.Of(db, table)`:
 
-- **Model -> table** (code first): `Model.Define("users").Column(...).CreateTable(db)`
-  (see `src/model/User.zan`).
-- **Table -> model** (database first): `Model.FromTable(db, "users")` reflects an
-  existing table's schema (SQLite `PRAGMA table_info`, MySQL/MariaDB
-  `SHOW COLUMNS`, otherwise the ANSI `information_schema` catalog) into a Model,
-  auto-detecting the provider. `Model.FromTable(db, "users").ToDefineCode()`
-  emits the `Model.Define(...)` source to scaffold a model file from a table.
-
-```
-Model users = Model.FromTable(Db.Conn(), "users");   // reflect schema
-Console.WriteLine(users.ToDefineCode());               // print model source
+```zan
+DbResult rows = await DbTable.Of(db, "sys_user").Query()
+    .WhereEq("id", userId).ToResultAsync();
 ```
 
 ## Static assets

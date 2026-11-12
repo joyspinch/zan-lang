@@ -105,7 +105,12 @@ public partial class ZanStore {
             char ch = basePath[i];
             if (ch == '/' || ch == 92) { cut = i; }  // 92 = 反斜杠
         }
-        return cut < 0 ? "." : basePath.Substring(0, cut);
+        if (cut < 0) { return "."; }
+        // 根目录必须保留分隔符；C: 是盘符当前目录，不是 C:/ 根目录。
+        if (cut == 0 || (cut == 2 && basePath[1] == ':')) {
+            return basePath.Substring(0, cut + 1);
+        }
+        return basePath.Substring(0, cut);
     }
 
     // 巡检用恒真扫描回调：只驱动逐块 CRC 校验，不收集内容。
@@ -135,6 +140,13 @@ public partial class ZanStore {
             // WAL 锁保留为兼容守卫：旧版写入者尚不认识稳定 .lock。
             if (!s.log.TryLockExclusive()) {
                 s.Fail("store is locked by another writer");
+                return s;
+            }
+            // 每次打开都确认 WAL 目录项，不能假定已有路径已被上次进程同步。
+            // Store 不创建目录；调用者负责先持久化其创建的父目录链。
+            // 屏障先于任何提交/Checkpoint/Close 的文件同步成功确认。
+            if (!PageFile.DirSync(ZanStore.DirOf(s.basePath))) {
+                s.Fail("WAL directory sync failed");
                 return s;
             }
             s.man = Manifest.Load(s.basePath);

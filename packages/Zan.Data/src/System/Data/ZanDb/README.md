@@ -146,10 +146,12 @@ db.Close();
   默认无校验，本库的校验是端到端的。
 - WAL 恢复语义：撕裂尾（尾部不满一帧或尾帧 CRC 坏）是崩溃残留，重放时截断修复；
   中段坏帧拒绝修复并拒开——静默截断会丢已提交数据。
-- 固化/归并崩溃窗口：写段 fsync → 段目录项 fsync（`DirSync`，POSIX 上 `fsync(文件)`
-  不保证新建文件的目录项落盘；NTFS 无需）→ 清单第一槽发布 → 第一槽目录项 fsync →
-  第二槽发布 → 截断日志。任一步断电最坏留下孤儿段（同号覆盖），旧槽 + 完整日志
-  仍可恢复。
+- 固化/归并软件顺序：写段 fsync → 段目录项 fsync → 清单第一槽发布 → 第一槽
+  目录项 fsync → 第二槽发布 → 截断日志。POSIX 的 `DirSync` 复用标准库类型检查、
+  EINTR 重试和关闭错误检查；每次打开库先同步 WAL 父目录，失败拒开并释放锁。
+  调用者需先持久化自己创建的父目录链。Windows 目录屏障尚不支持，`DirSync`
+  的兼容成功不代表目录项已同步；NTFS 日志不能替代这项证据。以上顺序与进程
+  中断回归不等于真实断电验收，设备缓存和文件系统恢复行为仍需另测。
 - `IntegrityCheck()`（`ZanDatabase` / `ZanStore`）：段逐块 CRC 全扫（独立句柄重开，
   不经块缓存）、索引段号指向、WAL 帧、清单双槽冗余、已加载搜索索引的快照代审计
   （头可解析、v2 声明批次数与 snap 行数一致）。只读不修复不截断，不触碰句柄错误态；
@@ -158,8 +160,12 @@ db.Close();
   `RebuildSearchIndexes()` 从文档正文重建。
 - `Backup(targetPath)` / `BackupAsync(targetPath)`（`ZanDatabase` / `ZanStore`）：
   热备份/快照导出 API（对位 SQLite backup API）。锁内一致固化（Flush memtable →
-  截取段清单快照 → 逐段物理拷贝 → 双槽写入清单与 fsync），最后由独立句柄执行
-  `IntegrityCheck()` 恢复校验；目标目录自动创建，失败清理半成品并不毒化当前句柄。
+  截取段清单快照 → 逐段拷贝并同步 → 同步目标目录链 → 双槽写入清单与 fsync），
+  伴生表文件复制后也逐一同步，独立句柄 `IntegrityCheck()` 校验并关闭后再次同步
+  相关文件和目录项。复制、同步或校验异常会关闭探针并清理生成的半成品，清理段号
+  使用实际快照边界。目标目录自动创建；目标复制或同步失败保留源库可用性，但源库
+  自身检查点或伴生表 Flush 失败仍遵循其 I/O 错误契约。覆盖已有目标不保留原备份，
+  也不提供整组文件瞬时原子切换；应用应使用独立、可信的备份路径。
 - kill -9 式脏崩溃的随机化 fuzz（`tests/conformance/zandb_crash_fuzz.zan`）：对齐
   SQLite crash-test 方法论，覆盖进程外 WAL 写帧中段崩溃、固化未换清单孤儿段、
   双槽清单写一半崩溃冗余恢复、段归并中段崩溃、以及异步真实 kill -9 强杀无损恢复。
@@ -356,15 +362,16 @@ db.Close();
   - 绝对物理寻址：
     $$\text{offset} = \text{DataOffset} + (id - 1) \times \text{rowBytes}$$
     点查寻址耗时 **0 纳秒**，单次系统调用 `PageFile.ReadAt` 直读物理扇区。
-  - **伴生预写日志与断电撕裂自愈（.zwal）**：32 字节头部（魔数 `ZWAL`、版本号 1、检查点水位 `lastCheckpointSeq`）。所有增删改走 CRC32 校验帧原子顺序追加；`Open()` 时若检测到断电撕裂尾或未写满的异常帧，引擎自动调用 `walFile.Truncate(validOffset)` 与 `Sync()`，零脏写安全回滚到上一次原子提交；未检查点有效提交自动重放入 `.ztab`/`.zblob` 并重建索引。
-  - **完整 ACID 事务保障（Begin / Commit / Rollback）**：事务开启后突变操作全部进入内存缓冲队列，`Rollback()` 直接丢弃缓冲零磁盘污染；`Commit()` 将批量操作统一打包为单帧 `OP_BATCH` 写入 WAL 并执行操作系统级 `fsync`，随后一次性刷入磁盘槽位。
+  - **伴生预写日志（.zwal）**：32 字节头部（魔数 `ZWAL`、版本号 1、检查点水位 `lastCheckpointSeq`）。增删改按 CRC32 帧顺序追加；`Open()` 截断并同步不完整尾帧，重放未检查点的有效帧并重建索引。重放写入、尾部修复或同步失败会拒绝打开并保留诊断；CRC 和软件故障回归不构成真实断电验收。
+  - **表内事务（Begin / Commit / Rollback）**：事务中的行操作先暂存；`Rollback()` 丢弃待提交操作，已追加的未引用 blob 空间可能留待回收。`Commit()` 先检查 blob 文件同步，再写入并同步单个 `OP_BATCH` WAL 帧，随后应用到表槽位。它不提供跨 KV、RecordTable 和 VectorTable 的整库原子事务。
+  - **I/O 失败契约**：WAL 追加、同步、重放和尾部修复逐项检查；显式写入与 `Flush()` 失败抛 `IOException`，首个错误保留在 `GetError()`，后续写入拒绝。检查点先完成表、blob、索引写入与同步，再重置 WAL。`Close()` 不抛 I/O 错误，保留首错并释放资源；调用者需检查 `GetError()`。失败提交可能已经写入 WAL，不能直接视作未提交，需重开核对。每次成功打开均确认文件同步及受支持的父目录屏障；调用者负责其创建的更上层目录链。
   - **伴生变长存储池（.zblob）**：32 字节头部（魔数 `ZBLB`、版本号 1、总字节数 `totalBytes`）。变长文本 `VarStr` 与大字节块 `Blob` 在主表中仅存 8 字节对齐指针 `[Offset: 4B, Len: 4B]`，数据连续追加至 `.zblob`。空值（len=0）存 `(0, 0)`，读取享受 **0 额外 I/O 优化**。
   - **二级索引磁盘持久化（.zidx）与有序范围扫描（FindRange）**：32 字节头部（魔数 `ZIDX`、版本号 1、快照总行数 `totalRows`、活跃行数 `activeRows`）。二级索引内建字典序与数值单调归一化双重排序，支持 `FindRange(col, lo, hi)` 与 `FindIdsByRange` 毫秒级二分边界探针与范围遍历；`Flush()` 与 `Close()` 触发列级索引序列化落地；`Open()` 自愈装载免全表扫描。
   - **编译期语法树下推求值器（RecordQuery）**：依托编译器 B-ID65 规范，支持 `table.Where((ExprNode x) => x.age >= 25 && x.dept == "tech").OrderByDescending("salary").Take(5)`，AST 静态下推至二级索引等值/范围探针并求交集；残余谓词在 `RecordRow` 二进制槽位上直接求值，**0% JsonValue 参与，0 运行时 SQL 文本解析，天然防 SQL 注入**。
   - **两段式延迟关联分页（Two-Phase Pagination）与纯索引 Count**：若过滤谓词纯命中二级索引且无残余条件，`Count()` 直接返回候选集数量，实现 **0 磁盘 I/O 极速计数**；默认排序下 `Skip/Take` 在 ID 序列层面先行切片，仅对切片后的最终 N 行执行物理 `Get(id)` 读盘，将深翻页物理磁盘读取量减少 99.9% 以上。
   - **自适应多表关联（Join / LeftJoin）**：提供强类型关联算子与 `RecordJoinResult` 结果对。若右表关联列为主键或二级索引，自动启用 **Index-Nested-Loop Join** 享受 2 µs 极速绝对物理点查；若无索引则自适应切换为 $O(M + N)$ 线性内存 **Hash Join** 探针，杜绝笛卡尔积暴力循环。
   - **流式标量聚合引擎（Sum / Avg / Min / Max）**：提供 `SumInt`、`SumLong`、`SumDouble`、`Avg`、`Min`、`Max` 聚合算子，直接基于候选 ID 流式累加并返回标量值，免除全量行反序列化与多余对象分配。
-  - **事务级条件批量变更（Update / Delete）**：支持 `table.Where(...).Update(updater)` 与 `table.Where(...).Delete()`，批量操作原子打包写入预写日志并在单次提交中刷盘，支持断电自愈与原子回滚。
+  - **事务级条件批量变更（Update / Delete）**：支持 `table.Where(...).Update(updater)` 与 `table.Where(...).Delete()`，批量操作打包为一个 WAL 帧，遵循上述表内事务和 I/O 失败契约。
   - **独立表级并发控制**：每张表持有独立的 `RwLock tlock` 与 CRT `ioMtx`，对一张表的批量写入绝对不阻塞其他表与向量表的读写。
   - **软删除与零 ID 漂移**：行首 `flags = 0` 墓碑标记，物理槽位永不前移，外键关联 `id` 永久自洽，支持管理级 `Vacuum()` 物理空洞紧凑双重重整（同时回收 `.ztab` 与 `.zblob` 空间）。
 - **发布档（--publish）实测压测报告（10,000 行二维员工表同机差分对拍）**：
@@ -396,7 +403,7 @@ db.Close();
    - **两段式延迟关联分页（Two-Phase Pagination）**：`repo.Where(...).Skip(2).Take(3).ToList()` 在 ID 序列层面先行切片，仅对最终切片后的目标行执行物理读盘，消除大表深翻页内存暴涨。
 4. **流式标量聚合与事务级批量变更**：
    - `SumInt`、`SumLong`、`SumDouble`、`Avg`、`Min`、`Max`：支持 Lambda 表达式（如 `(ExprNode x) => x.Salary`）或列名，直接在物理槽位上流式累加，**0 实体装箱**；
-   - `Update(updater)` / `Delete()`：支持条件批量突变，原子打包写入预写日志并在单次提交中完成，具备完整断电自愈能力。
+   - `Update(updater)` / `Delete()`：支持条件批量突变，打包为单个 WAL 帧提交；I/O 失败可能留下已提交帧，需重开后核对结果，实际断电行为仍需专项验收。
 
 ### 多引擎解耦与企业级高并发列式向量表（VectorTable）
 
@@ -428,9 +435,13 @@ db.Close();
 
 | 档位                  | 语义                                                   |
 |-----------------------|--------------------------------------------------------|
-| `ZanStore.DUR_SYNC`   | 每个提交刷新并同步 WAL，成功确认达到同步持久化边界；服务默认使用此档 |
+| `ZanStore.DUR_SYNC`   | 每个 KV 提交检查 WAL 写入与文件同步；服务默认使用此档，平台边界见下文 |
 | `ZanStore.DUR_GROUP`（嵌入式默认） | 每次提交刷新到 OS，`SetSyncEvery(n)` 次或累积 512KB 同步；断电可丢最近未同步提交 |
 | `ZanStore.DUR_NONE`   | 先缓存在进程内，攒到 1MB 再刷新；进程崩溃和断电均可能丢最近提交 |
+
+这些档位控制 KV WAL；不能据此推断所有伴生表具有相同提交语义。POSIX 打开 KV
+库时检查 WAL 父目录同步；Windows 目前只有文件同步，目录项持久化未支持。
+操作系统屏障不等于硬件断电保证，实际断电、存储缓存和文件系统恢复需单独验收。
 
 无 I/O 错误的正常关闭会同步尚未落盘的完整帧。`Commit()` 返回 bool，Collection
 写入失败抛 `IOException`，`GetError()` 保留错误。非空最外层事务令 `GetRevision()`

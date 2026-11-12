@@ -12,6 +12,12 @@ public class TransactionScope {
     public bool completed;
     public bool disposed;
 
+    // One completion attempt per scope: an uncertain failure must never be
+    // retried implicitly by Complete/Dispose, even with a custom IUnitOfWork.
+    private bool completionAttempted;
+    private bool committing;
+    private bool completionResult = true;
+
     public TransactionScope(IUnitOfWork uow) {
         this.uow = uow;
         this.completed = false;
@@ -42,43 +48,59 @@ public class TransactionScope {
         if (this.disposed) {
             throw new Exception("Cannot complete a disposed TransactionScope");
         }
-        this.completed = true;
+        if (!this.completionAttempted) { this.completed = true; }
     }
 
     // 显式提交
     public void Commit() {
-        if (this.uow != null && !this.disposed) {
+        if (this.uow != null && !this.disposed && !this.completionAttempted) {
+            this.completionAttempted = true;
+            this.committing = true;
+            this.completionResult = false;
+            this.completed = false;
             this.uow.Commit();
+            this.completionResult = true;
             this.completed = true;
         }
     }
 
-    // 异步显式提交
+    // 异步显式提交；false 或异常均为终态，释放只清理，不重试提交。
     public async bool CommitAsync() {
-        if (this.uow != null && !this.disposed) {
-            bool ok = await this.uow.CommitAsync();
-            this.completed = true;
-            return ok;
+        if (this.uow == null || this.disposed) { return false; }
+        if (!this.completionAttempted) {
+            this.completionAttempted = true;
+            this.committing = true;
+            this.completionResult = false;
+            this.completed = false;
+            this.completionResult = await this.uow.CommitAsync();
+            this.completed = this.completionResult;
         }
-        return false;
+        return this.committing && this.completionResult;
     }
 
     // 显式回滚
     public void Rollback() {
-        if (this.uow != null && !this.disposed) {
-            this.uow.Rollback();
+        if (this.uow != null && !this.disposed && !this.completionAttempted) {
+            this.completionAttempted = true;
+            this.committing = false;
+            this.completionResult = false;
             this.completed = false;
+            this.uow.Rollback();
+            this.completionResult = true;
         }
     }
 
     // 异步显式回滚
     public async bool RollbackAsync() {
-        if (this.uow != null && !this.disposed) {
-            bool ok = await this.uow.RollbackAsync();
+        if (this.uow == null || this.disposed) { return false; }
+        if (!this.completionAttempted) {
+            this.completionAttempted = true;
+            this.committing = false;
+            this.completionResult = false;
             this.completed = false;
-            return ok;
+            this.completionResult = await this.uow.RollbackAsync();
         }
-        return false;
+        return !this.committing && this.completionResult;
     }
 
     // ---- 保存点（转发给工作单元）----
@@ -128,39 +150,70 @@ public class TransactionScope {
         return await this.uow.ReleaseSavepointAsync(name);
     }
 
-    // 异步释放作用域：如果未标记 Complete 则自动执行异步回滚，保障 ACID 一致性与连接归还。
+    // IUnitOfWork owns cleanup (including rollback of an unfinished transaction).
+    // A completion failure wins over a cleanup exception; cleanup alone still throws.
+    void Cleanup() {
+        if (this.completionResult) {
+            try { this.uow.Dispose(); }
+            catch (Exception) {
+                // Cache failed disposal before propagating the cleanup-only exception.
+                this.completionResult = false;
+                throw;
+            }
+        } else {
+            try { this.uow.Dispose(); }
+            catch (Exception) { /* Don't mask the transaction's false result or original exception. */ }
+        }
+    }
+
+    // 返回首次事务结束的结果；重复释放不再提交、回滚或清理。
     public async bool DisposeAsync() {
-        if (this.disposed) { return true; }
+        if (this.disposed) { return this.completionResult; }
         this.disposed = true;
 
         if (this.uow != null) {
             try {
-                if (this.completed) {
-                    await this.uow.CommitAsync();
-                } else {
-                    await this.uow.RollbackAsync();
+                if (!this.completionAttempted) {
+                    this.completionAttempted = true;
+                    this.committing = this.completed;
+                    this.completionResult = false;
+                    this.completed = false;
+                    if (this.committing) {
+                        this.completionResult = await this.uow.CommitAsync();
+                        this.completed = this.completionResult;
+                    } else {
+                        this.completionResult = await this.uow.RollbackAsync();
+                    }
                 }
             } finally {
-                this.uow.Dispose();
+                this.Cleanup();
             }
         }
-        return true;
+        return this.completionResult;
     }
 
-    // 释放作用域：如果未标记 Complete 则自动执行回滚，保障 ACID 一致性与连接归还。
+    // 释放作用域：未显式结束时按 Complete 选择提交或回滚。
     public void Dispose() {
         if (this.disposed) { return; }
         this.disposed = true;
 
         if (this.uow != null) {
             try {
-                if (this.completed) {
-                    this.uow.Commit();
-                } else {
-                    this.uow.Rollback();
+                if (!this.completionAttempted) {
+                    this.completionAttempted = true;
+                    this.committing = this.completed;
+                    this.completionResult = false;
+                    this.completed = false;
+                    if (this.committing) {
+                        this.uow.Commit();
+                        this.completed = true;
+                    } else {
+                        this.uow.Rollback();
+                    }
+                    this.completionResult = true;
                 }
             } finally {
-                this.uow.Dispose();
+                this.Cleanup();
             }
         }
     }

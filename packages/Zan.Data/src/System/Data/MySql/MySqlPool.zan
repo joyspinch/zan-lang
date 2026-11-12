@@ -25,7 +25,6 @@ public class MySqlPool : IDisposable {
     private string user;
     private string password;
     private PoolCore<MySqlConnection> core;
-    private string lastOpenError;
 
     public MySqlPool(string host, int port, string database, string user,
             string password, int maxSize) {
@@ -35,19 +34,13 @@ public class MySqlPool : IDisposable {
         this.user = user;
         this.password = password;
         this.core = new PoolCore<MySqlConnection>(maxSize);
-        this.lastOpenError = "";
     }
 
     // 新建一条 MySQL 连接（池的建连回调）。
     private async MySqlConnection OpenOne() {
-        try {
-            return await MySqlConnection.OpenParamsAsync(this.host, this.port,
-                                                         this.database, this.user,
-                                                         this.password);
-        } catch (Exception ex) {
-            this.lastOpenError = ex.Message;
-            return null;
-        }
+        return await MySqlConnection.OpenParamsAsync(this.host, this.port,
+                                                     this.database, this.user,
+                                                     this.password);
     }
 
     // 借出一个连接：复用空闲的，未达上限则新建，
@@ -56,63 +49,20 @@ public class MySqlPool : IDisposable {
     // 只会退化成个别请求拿不到连接，绝不会把协程永久停在门上。
     // 连接池关闭后返回 null。
     public async MySqlConnection AcquireAsync() {
-        PoolWait wait = new PoolWait();
-        while (true) {
-            if (this.core.IsClosed()) {
-                return null;
-            }
-            MySqlConnection pooled = this.core.TakeIdle();
-            while (pooled != null) {
-                // 连接在停放期间可能已失效（服务器重启、空闲
-                // 超时等）：将其逐出，把槽位让给等待者。
-                if (pooled.IsConnected()) {
-                    return pooled;
-                }
-                this.core.Drop(pooled);
-                pooled = this.core.TakeIdle();
-            }
-            // 上一次建连失败后退避：后端不可达时，若每次获取都重试建连，
-            // 失败本身就成了每请求的固定开销（失败的本地 open 也要约
-            // 125us），足以让命中路由的吞吐掉一个数量级。
-            if (this.core.OpenBlocked()) {
-                return null;
-            }
-            if (this.core.TryReserve()) {
-                MySqlConnection opened = await this.OpenOne();
-                if (opened == null || !opened.IsConnected()) {
-                    if (opened != null) {
-                        opened.Close();
-                    }
-                    /* 契约：借出失败折进 null（下面随即记退避）。根因只在
-                       失败 episode 的首条记录诊断，退避期内零星重试静默。 */
-                    if (!this.core.OpenFailing()) {
-                        string why = opened != null ? opened.lastError : this.lastOpenError;
-                        Console.WriteLine("[mysqlpool] connect failed: "
-                            + (why.Length > 0 ? why
-                                : "refused, timeout, or auth rejected"));
-                    }
-                    this.lastOpenError = "";
-                    this.core.NoteOpenFailed();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                if (this.core.IsClosed()) {
-                    opened.Close();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                this.core.NoteOpenOk();
-                this.lastOpenError = "";
-                this.core.Borrow(opened);
-                return opened;
-            }
-            // 连接池已满：交给共享的有界等待（见 PoolWait），
-            // 预算耗尽以 null 快速失败。
-            if (!await this.core.WaitForRelease(wait)) {
-                return null;
-            }
-        }
-        return null;
+        PoolOpenAsync<MySqlConnection> open = this.OpenOne;
+        Predicate<MySqlConnection> connected = MySqlPool.IsUsable;
+        Action<MySqlConnection> close = MySqlPool.CloseConnection;
+        PoolOpenFailure<MySqlConnection> failed = MySqlPool.ReportOpenFailure;
+        return await this.core.AcquireAsync(open, connected, close, failed);
+    }
+
+    static bool IsUsable(MySqlConnection c) { return c.IsConnected(); }
+    static void CloseConnection(MySqlConnection c) { c.Close(); }
+
+    static void ReportOpenFailure(MySqlConnection c, Exception error) {
+        string why = error != null ? error.Message : (c != null ? c.lastError : "");
+        Console.WriteLine("[mysqlpool] connect failed: "
+            + (why.Length > 0 ? why : "refused, timeout, or auth rejected"));
     }
 
     // 将连接归还连接池。损坏的或 Close() 之后的
@@ -133,7 +83,7 @@ public class MySqlPool : IDisposable {
             Task.Spawn(this.Cleanup(c));
             return;
         }
-        this.core.Pool(c);
+        if (!this.core.Pool(c)) { c.Close(); }
     }
 
     // 清理协程体：ROLLBACK 落地后连接才回池；回滚失败连接状态不明，必须关闭丢弃。
@@ -150,7 +100,7 @@ public class MySqlPool : IDisposable {
             this.core.Drop(c);
             return true;
         }
-        this.core.Pool(c);
+        if (!this.core.Pool(c)) { c.Close(); }
         return true;
     }
 
@@ -168,11 +118,11 @@ public class MySqlPool : IDisposable {
     // 仍被借出的连接在归还时关闭。
     public void Close() {
         this.core.MarkClosed();
-        MySqlConnection c = this.core.TakeIdle();
+        MySqlConnection c = this.core.TakeClosing();
         while (c != null) {
             c.Close();
             this.core.Drop(c);
-            c = this.core.TakeIdle();
+            c = this.core.TakeClosing();
         }
         this.core.WakeAll();
     }

@@ -18,6 +18,13 @@ public partial class RedisClient {
     int port;
     bool connected;
     string lastError;
+    string protocolError;
+    // Per-line content bytes, including the RESP type byte but excluding CRLF.
+    private const int MaxProtocolLineBytes = 65536;
+    private const int MaxReceiveBufferBytes = 1073741824;
+    private const int MaxProtocolArrayDepth = 64;
+    int maxReplyPayloadBytes;
+    int maxReplyNodes;
     bool busy;
     List<AsyncGate> waiters;
 
@@ -80,6 +87,9 @@ public partial class RedisClient {
         this.port = 6379;
         this.connected = false;
         this.lastError = "";
+        this.protocolError = "";
+        this.maxReplyPayloadBytes = RedisReplyBudget.DefaultPayloadBytes;
+        this.maxReplyNodes = RedisReplyBudget.DefaultNodes;
         this.inbuf = null;
         this.incap = 0;
         this.inhead = 0;
@@ -93,6 +103,21 @@ public partial class RedisClient {
         this.Serialize = null;
         this.Deserialize = null;
         this.Notice = null;
+    }
+
+    // Per-root decoded reply limits; defaults: 64 MiB payload and 1,048,576
+    // nodes (root, arrays, scalars and nil all count). Bulk/simple/error bytes
+    // count at their wire length; integers count as eight bytes. Node overhead
+    // is bounded separately, so empty values cannot bypass the memory bound.
+    // Both limits must be positive; invalid/busy changes return false unchanged.
+    // Configure before issuing commands. A pooled facade applies its limits to
+    // each borrowed connection for that command, then restores its old limits.
+    // Direct RedisPool users get defaults, or configure an acquired client.
+    public bool SetReplyLimits(int maxPayloadBytes, int maxNodes) {
+        if (maxPayloadBytes <= 0 || maxNodes <= 0 || this.busy) { return false; }
+        this.maxReplyPayloadBytes = maxPayloadBytes;
+        this.maxReplyNodes = maxNodes;
+        return true;
     }
 
     void FireNotice(string logText, long elapsedMs, Exception ex) {
@@ -291,15 +316,35 @@ public partial class RedisClient {
         }
         this.inbuf = null;
         this.tmp = null;
+        this.inhead = 0;
+        this.intail = 0;
+        this.incap = 0;
+    }
+
+    void failProtocol(string detail) {
+        this.protocolError = "protocol error: " + detail;
+        this.lastError = this.protocolError;
+        this.Close();
+    }
+
+    RedisReply protocolFailure() {
+        RedisReply r = new RedisReply();
+        r.kind = RedisReply.ERROR;
+        r.str = this.protocolError;
+        return r;
     }
 
     string sliceBytes(int start, int len) {
         return this.inbuf.ToStr(start, len);
     }
 
-    void ensureRoom(int extra) {
-        if (this.intail + extra <= this.incap) {
-            return;
+    bool ensureRoom(int extra) {
+        if (extra < 0 || extra > RedisClient.MaxReceiveBufferBytes) {
+            this.failProtocol("receive buffer limit exceeded");
+            return false;
+        }
+        if (extra <= this.incap - this.intail) {
+            return true;
         }
         if (this.inhead > 0) {
             int span = this.intail - this.inhead;
@@ -309,16 +354,21 @@ public partial class RedisClient {
             this.inhead = 0;
             this.intail = span;
         }
-        if (this.intail + extra <= this.incap) {
-            return;
+        if (extra <= this.incap - this.intail) {
+            return true;
         }
-        int ncap = this.incap > 0 ? this.incap * 2 : 16384;
-        while (this.intail + extra > ncap) {
-            if (ncap > 1073741824 / 2) {
-                ncap = 1073741824;
-                break;
+        if (this.intail > RedisClient.MaxReceiveBufferBytes - extra) {
+            this.failProtocol("receive buffer limit exceeded");
+            return false;
+        }
+        int need = this.intail + extra;
+        int ncap = this.incap > 0 ? this.incap : 16384;
+        while (need > ncap) {
+            if (ncap > RedisClient.MaxReceiveBufferBytes / 2) {
+                ncap = RedisClient.MaxReceiveBufferBytes;
+            } else {
+                ncap = ncap * 2;
             }
-            ncap = ncap * 2;
         }
         byte[] nb = new byte[ncap + 1];
         if (this.intail > 0) {
@@ -326,26 +376,23 @@ public partial class RedisClient {
         }
         this.inbuf = nb;
         this.incap = ncap;
+        return true;
     }
 
-    async int fillMore() {
+    async int fillMore(int maxBytes) {
+        if (!this.connected) { return 0; }
+        int take = maxBytes < this.tmpcap ? maxBytes : this.tmpcap;
+        int n;
         if (this.tls != null) {
-            int n = await this.tls.RecvBytesAsync(this.tmp, 0, this.tmpcap);
-            if (n <= 0) {
-                this.Close();
-                return 0;
-            }
-            this.ensureRoom(n);
-            NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)this.tmp, n);
-            this.intail = this.intail + n;
-            return n;
+            n = await this.tls.RecvBytesAsync(this.tmp, 0, take);
+        } else {
+            n = await Socket.RecvIntoAsync(this.sock, this.tmp, take);
         }
-        int n = await Socket.RecvIntoAsync(this.sock, this.tmp, this.tmpcap);
         if (n <= 0) {
-            this.Close();
+            this.failProtocol("truncated RESP reply");
             return 0;
         }
-        this.ensureRoom(n);
+        if (!this.ensureRoom(n)) { return 0; }
         NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)this.tmp, n);
         this.intail = this.intail + n;
         return n;
@@ -353,7 +400,7 @@ public partial class RedisClient {
 
     async bool ensureAvailable(int need) {
         while ((this.intail - this.inhead) < need) {
-            int got = await this.fillMore();
+            int got = await this.fillMore(this.tmpcap);
             if (got == 0) {
                 return false;
             }
@@ -361,27 +408,58 @@ public partial class RedisClient {
         return true;
     }
 
-    async string readLine() {
-        int scan = this.inhead;
-        while (true) {
-            while (scan + 1 < this.intail) {
-                int pos = MemoryExtensions.IndexOf(this.inbuf, (byte)13, scan, this.intail - scan);
-                if (pos < 0 || pos >= this.intail - 1) {
-                    scan = (pos == this.intail - 1) ? pos : this.intail;
-                    break;
+    async string readLine(RedisReplyBudget budget) {
+        int scanned = 0;
+        while (this.connected) {
+            int available = this.intail - this.inhead;
+            int window = available;
+            if (window > RedisClient.MaxProtocolLineBytes + 2) {
+                window = RedisClient.MaxProtocolLineBytes + 2;
+            }
+            int scan = this.inhead + scanned;
+            int pos = MemoryExtensions.IndexOf(this.inbuf, (byte)13, scan, window - scanned);
+            int lf = MemoryExtensions.IndexOf(this.inbuf, (byte)10, scan, window - scanned);
+            if (lf >= 0 && (pos < 0 || lf < pos)) {
+                this.failProtocol("invalid RESP line ending");
+                return null;
+            }
+            if (pos >= 0) {
+                int lineLen = pos - this.inhead;
+                if (lineLen > RedisClient.MaxProtocolLineBytes) {
+                    this.failProtocol("RESP line exceeds 65536 byte limit");
+                    return null;
                 }
-                if (this.inbuf[pos + 1] == 10) {
-                    int lineLen = pos - this.inhead;
+                if (pos + 1 < this.intail) {
+                    if (this.inbuf[pos + 1] != 10) {
+                        this.failProtocol("invalid RESP line ending");
+                        return null;
+                    }
+                    // Charge raw text bytes before either ToStr or Substring.
+                    // Numeric/length headers stay bounded by the line guard;
+                    // their decoded payload is admitted by readReplyAtDepth.
+                    if (lineLen > 0 && (this.inbuf[this.inhead] == 43 || this.inbuf[this.inhead] == 45)) {
+                        if (!budget.AdmitPayload(lineLen - 1)) {
+                            this.failProtocol("RESP reply payload budget exceeded");
+                            return null;
+                        }
+                    }
                     string line = this.sliceBytes(this.inhead, lineLen);
                     this.inhead = pos + 2;
                     return line;
                 }
-                scan = pos + 1;
+                scanned = lineLen;
+            } else {
+                scanned = window;
+                if (available > RedisClient.MaxProtocolLineBytes) {
+                    this.failProtocol("RESP line exceeds 65536 byte limit");
+                    return null;
+                }
             }
-            int got = await this.fillMore();
-            if (got == 0) {
-                return null;
-            }
+            // Limit this read before ensureRoom can grow; later replies already
+            // prefetched after a complete CRLF do not contribute to this budget.
+            int remaining = RedisClient.MaxProtocolLineBytes + 2 - available;
+            int got = await this.fillMore(remaining);
+            if (got == 0) { return null; }
         }
         return null;
     }
@@ -391,18 +469,32 @@ public partial class RedisClient {
         if (!ok) {
             return null;
         }
+        if (this.inbuf[this.inhead + n] != 13 || this.inbuf[this.inhead + n + 1] != 10) {
+            this.failProtocol("invalid bulk string trailer");
+            return null;
+        }
         string data = this.sliceBytes(this.inhead, n);
         this.inhead = this.inhead + n + 2;
         return data;
     }
 
     async RedisReply readReply() {
-        string line = await this.readLine();
+        RedisReplyBudget budget = new RedisReplyBudget(this.maxReplyPayloadBytes, this.maxReplyNodes);
+        if (!budget.AdmitNodes(1)) {
+            this.failProtocol("RESP reply node budget exceeded");
+            return this.protocolFailure();
+        }
+        return await this.readReplyAtDepth(0, budget);
+    }
+
+    // The root or parent array reserves this node before entering the parser.
+    async RedisReply readReplyAtDepth(int arrayDepth, RedisReplyBudget budget) {
+        string line = await this.readLine(budget);
+        if (line == null) { return this.protocolFailure(); }
         RedisReply r = new RedisReply();
-        if (line == null) {
-            r.kind = RedisReply.ERROR;
-            r.str = "connection closed";
-            return r;
+        if (line.Length == 0) {
+            this.failProtocol("empty RESP line");
+            return this.protocolFailure();
         }
         int prefix = line[0];
         string rest = line.Substring(1);
@@ -418,59 +510,98 @@ public partial class RedisClient {
             r.len = (int)strlen(rest);
             return r;
         }
+        long number = 0;
+        if (prefix == 58 || prefix == 36 || prefix == 42) {
+            if (!RedisClient.tryProtocolInteger(rest, out number)) {
+                this.failProtocol("invalid RESP integer");
+                return this.protocolFailure();
+            }
+        }
         if (prefix == 58) {  // ':'
+            if (!budget.AdmitPayload(8)) {
+                this.failProtocol("RESP reply payload budget exceeded");
+                return this.protocolFailure();
+            }
             r.kind = RedisReply.INT;
-            r.integer64 = Convert.ToInt64(rest);
+            r.integer64 = number;
             r.integer = (int)r.integer64;
             return r;
         }
         if (prefix == 36) {  // '$'
-            int blen = Convert.ToInt(rest);
-            if (blen < 0) {
+            if (number == -1) {
                 r.kind = RedisReply.NIL;
                 return r;
             }
-            if (blen > 536870912) {
-                r.kind = RedisReply.ERROR;
-                r.str = "bulk string length exceeds 512MB protocol limit";
-                this.Close();
-                return r;
+            if (number < -1 || number > 536870912) {
+                this.failProtocol("bulk string length outside -1..536870912 limit");
+                return this.protocolFailure();
+            }
+            int blen = (int)number;
+            // Admit the advertised length before receive-buffer growth or ToStr.
+            if (!budget.AdmitPayload(blen)) {
+                this.failProtocol("RESP reply payload budget exceeded");
+                return this.protocolFailure();
             }
             string data = await this.readBulk(blen);
-            if (data == null) {
-                r.kind = RedisReply.ERROR;
-                r.str = "connection closed";
-                return r;
-            }
+            if (data == null) { return this.protocolFailure(); }
             r.kind = RedisReply.BULK;
             r.str = data;
             r.len = blen;
             return r;
         }
         if (prefix == 42) {  // '*'
-            int count = Convert.ToInt(rest);
-            if (count < 0) {
+            // Bound active array frames before allocating or descending.
+            if (arrayDepth >= RedisClient.MaxProtocolArrayDepth) {
+                this.failProtocol("RESP array nesting exceeds 64 level limit");
+                return this.protocolFailure();
+            }
+            if (number == -1) {
                 r.kind = RedisReply.NIL;
                 return r;
             }
-            if (count > 1048576) {
-                r.kind = RedisReply.ERROR;
-                r.str = "array element count exceeds 1M limit";
-                this.Close();
-                return r;
+            if (number < -1 || number > 1048576) {
+                this.failProtocol("array element count outside -1..1048576 limit");
+                return this.protocolFailure();
+            }
+            int count = (int)number;
+            // Reserve all direct children at the header, before allocating the
+            // list or any child. Descendants share this root's remaining nodes.
+            if (!budget.AdmitNodes(count)) {
+                this.failProtocol("RESP reply node budget exceeded");
+                return this.protocolFailure();
             }
             r.kind = RedisReply.ARRAY;
             r.items = new List<RedisReply>();
             for (int i = 0; i < count; i = i + 1) {
-                RedisReply child = await this.readReply();
+                RedisReply child = await this.readReplyAtDepth(arrayDepth + 1, budget);
+                if (!this.connected) { return child; }
                 r.items.Add(child);
             }
             return r;
         }
-        r.kind = RedisReply.ERROR;
-        r.str = "protocol error: " + line;
-        this.Close();
-        return r;
+        this.failProtocol("unknown RESP type");
+        return this.protocolFailure();
+    }
+
+    static bool tryProtocolInteger(string text, out long value) {
+        value = 0;
+        if (text.Length == 0) { return false; }
+        bool negative = text[0] == 45;
+        int i = negative || text[0] == 43 ? 1 : 0;
+        if (i == text.Length) { return false; }
+        // Accumulate negatively so Int64.MinValue also fits without overflow.
+        long limit = negative ? -9223372036854775807L - 1 : -9223372036854775807L;
+        long result = 0;
+        while (i < text.Length) {
+            int digit = text[i] - 48;
+            if (digit < 0 || digit > 9 || result < limit / 10) { return false; }
+            result = result * 10;
+            if (result < limit + digit) { return false; }
+            result = result - digit;
+            i = i + 1;
+        }
+        value = negative ? result : -result;
+        return true;
     }
 
     async int sendArgs(List<string> args) {
@@ -513,10 +644,15 @@ public partial class RedisClient {
                     r = err;
                     return err;
                 }
+                int savedPayload = c.maxReplyPayloadBytes;
+                int savedNodes = c.maxReplyNodes;
+                c.SetReplyLimits(this.maxReplyPayloadBytes, this.maxReplyNodes);
                 try {
                     r = await c.CommandAsync(args);
+                    if (r.IsError()) { this.lastError = r.str; }
                     return r;
                 } finally {
+                    c.SetReplyLimits(savedPayload, savedNodes);
                     this.pool.Release(c);
                 }
             }
@@ -540,6 +676,14 @@ public partial class RedisClient {
     }
 
     async RedisReply CommandInternalAsync(List<string> args) {
+        if (!this.connected && this.protocolError.Length > 0) { return this.protocolFailure(); }
+        if (!this.connected) {
+            RedisReply closed = new RedisReply();
+            closed.kind = RedisReply.ERROR;
+            closed.str = "connection closed";
+            this.lastError = closed.str;
+            return closed;
+        }
         int sent = await this.sendArgs(args);
         RedisReply r = new RedisReply();
         if (!this.connected || sent <= 0) {
@@ -570,10 +714,15 @@ public partial class RedisClient {
                     r = err;
                     return err;
                 }
+                int savedPayload = c.maxReplyPayloadBytes;
+                int savedNodes = c.maxReplyNodes;
+                c.SetReplyLimits(this.maxReplyPayloadBytes, this.maxReplyNodes);
                 try {
                     r = await c.CommandBytesAsync(prefixArgs, binaryArg);
+                    if (r.IsError()) { this.lastError = r.str; }
                     return r;
                 } finally {
+                    c.SetReplyLimits(savedPayload, savedNodes);
                     this.pool.Release(c);
                 }
             }
@@ -597,6 +746,7 @@ public partial class RedisClient {
     }
 
     async RedisReply CommandBytesInternalAsync(List<string> prefixArgs, byte[] binaryArg) {
+        if (!this.connected && this.protocolError.Length > 0) { return this.protocolFailure(); }
         RedisReply r = new RedisReply();
         if (!this.connected) {
             r.kind = RedisReply.ERROR;

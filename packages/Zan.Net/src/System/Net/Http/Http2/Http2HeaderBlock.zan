@@ -1,0 +1,158 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Http.Hpack;
+
+namespace System.Net.Http.Http2;
+
+// One bounded header block per connection; CONTINUATION must be contiguous.
+public class Http2HeaderBlock {
+    public int streamId;
+    public bool endStream;
+    private byte[] bytes;
+    private int count;
+    private int fragments;
+    private int limit;
+
+    public Http2HeaderBlock(int limit) { this.limit = limit; }
+
+    public byte[] Accept(Http2Frame frame, byte[] payload) {
+        if (this.streamId != 0 && (frame.type != Http2FrameType.CONTINUATION || frame.streamId != this.streamId)) {
+            throw new IOException("Interleaved HTTP2 header block");
+        }
+        if (frame.type != Http2FrameType.HEADERS && frame.type != Http2FrameType.CONTINUATION) { return null; }
+        int start = 0;
+        int size = frame.length;
+        if (frame.type == Http2FrameType.HEADERS) {
+            if (this.streamId != 0) { throw new IOException("Nested HTTP2 headers"); }
+            this.streamId = frame.streamId;
+            this.endStream = (frame.flags & Http2Flags.END_STREAM) != 0;
+            this.count = 0;
+            this.fragments = 0;
+            this.bytes = new byte[this.limit];
+            if ((frame.flags & Http2Flags.PADDED) != 0) {
+                if (size < 1) { throw new IOException("Missing HTTP2 padding length"); }
+                start = 1;
+                size = size - 1 - (payload[0] & 255);
+                if (size < 0) { throw new IOException("Invalid HTTP2 padding"); }
+            }
+            if ((frame.flags & Http2Flags.PRIORITY) != 0) {
+                if (size < 5) { throw new IOException("Truncated HTTP2 priority"); }
+                int dependency = ((payload[start] & 127) << 24) | ((payload[start + 1] & 255) << 16)
+                    | ((payload[start + 2] & 255) << 8) | (payload[start + 3] & 255);
+                if (dependency == frame.streamId) { throw new IOException("HTTP2 priority self dependency"); }
+                start = start + 5;
+                size = size - 5;
+            }
+        } else if (this.streamId == 0) { throw new IOException("Unexpected HTTP2 continuation"); }
+        this.fragments = this.fragments + 1;
+        if (this.fragments > 16 || size > this.limit - this.count) { throw new IOException("HTTP2 header block limit"); }
+        if (size > 0) { NativeMemory.Copy((nint)this.bytes + this.count, (nint)payload + start, size); }
+        this.count = this.count + size;
+        if ((frame.flags & Http2Flags.END_HEADERS) == 0) { return null; }
+        byte[] result = new byte[this.count];
+        if (this.count > 0) { NativeMemory.Copy((nint)result, (nint)this.bytes, this.count); }
+        this.bytes = null;
+        this.streamId = 0;
+        return result;
+    }
+
+    public static int DataOffset(Http2Frame frame, byte[] payload) {
+        if ((frame.flags & Http2Flags.PADDED) == 0) { return 0; }
+        if (frame.length < 1 || (payload[0] & 255) >= frame.length) { throw new IOException("Invalid HTTP2 DATA padding"); }
+        return 1;
+    }
+
+    public static int DataLength(Http2Frame frame, byte[] payload) {
+        int start = Http2HeaderBlock.DataOffset(frame, payload);
+        return frame.length - start - (start == 1 ? (payload[0] & 255) : 0);
+    }
+
+    public static bool Token(string value) {
+        if (value == null || value.Length == 0) { return false; }
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int c = value[i] & 255;
+            if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42
+                || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126)) { return false; }
+        }
+        return true;
+    }
+
+    public static int ContentLength(string value) {
+        if (value.Length == 0) { throw new IOException("Empty HTTP2 content-length"); }
+        int n = 0;
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int digit = (value[i] & 255) - 48;
+            if (digit < 0 || digit > 9 || n > (2147483647 - digit) / 10) { throw new IOException("Invalid HTTP2 content-length"); }
+            n = n * 10 + digit;
+        }
+        return n;
+    }
+
+    // Returns declared length or -1. Trailer and CONNECT semantics are explicitly unsupported.
+    public static int Validate(List<HpackHeader> headers, bool request) {
+        bool regular = false;
+        bool method = false;
+        bool path = false;
+        bool scheme = false;
+        bool authority = false;
+        bool status = false;
+        int length = -1;
+        List<string> pseudos = new List<string>();
+        string host = "";
+        string auth = "";
+        for (int i = 0; i < headers.Count; i = i + 1) {
+            HpackHeader h = headers[i];
+            if (h.name == null || h.name.Length == 0 || h.value == null || h.name != h.name.ToLower()) { throw new IOException("Invalid HTTP2 header name"); }
+            for (int j = 0; j < h.value.Length; j = j + 1) {
+                int c = h.value[j] & 255;
+                if (c == 0 || c == 10 || c == 13 || c == 127 || (c < 32 && c != 9)) { throw new IOException("Invalid HTTP2 header value"); }
+            }
+            if (h.value.Length > 0 && ((h.value[0] & 255) <= 32 || (h.value[h.value.Length - 1] & 255) <= 32)) { throw new IOException("HTTP2 header whitespace"); }
+            if (h.name.StartsWith(":")) {
+                if (regular || pseudos.Contains(h.name)) { throw new IOException("Invalid HTTP2 pseudo-header order"); }
+                pseudos.Add(h.name);
+                if (request && h.name == ":method") {
+                    if (!Http2HeaderBlock.Token(h.value) || h.value == "CONNECT") { throw new IOException("Unsupported HTTP2 method"); }
+                    method = true;
+                } else if (request && h.name == ":path") {
+                    if (!(h.value.StartsWith("/") || h.value == "*")) { throw new IOException("Invalid HTTP2 path"); }
+                    for (int j = 0; j < h.value.Length; j = j + 1) {
+                        if ((h.value[j] & 255) <= 32 || (h.value[j] & 255) == 127 || (h.value[j] & 255) == 35) { throw new IOException("Invalid HTTP2 path"); }
+                    }
+                    path = true;
+                } else if (request && h.name == ":scheme") {
+                    if (h.value != "http" && h.value != "https") { throw new IOException("Invalid HTTP2 scheme"); }
+                    scheme = true;
+                } else if (request && h.name == ":authority") {
+                    if (h.value.Length == 0 || h.value.Contains("@") || h.value.Contains("/") || h.value.Contains(" ")) { throw new IOException("Invalid HTTP2 authority"); }
+                    authority = true;
+                    auth = h.value;
+                } else if (!request && h.name == ":status") {
+                    int code = Http2HeaderBlock.ContentLength(h.value);
+                    if (h.value.Length != 3 || code < 200 || code > 599) { throw new IOException("Unsupported HTTP2 status"); }
+                    status = true;
+                } else { throw new IOException("Unknown HTTP2 pseudo-header"); }
+            } else {
+                regular = true;
+                if (!Http2HeaderBlock.Token(h.name)) { throw new IOException("Invalid HTTP2 field name"); }
+                if (h.name == "connection" || h.name == "proxy-connection" || h.name == "keep-alive" || h.name == "transfer-encoding" || h.name == "upgrade"
+                    || (h.name == "te" && (!request || h.value != "trailers"))) { throw new IOException("HTTP2 connection specific header"); }
+                if (h.name == "content-length") {
+                    if (length >= 0) { throw new IOException("Duplicate HTTP2 content-length"); }
+                    length = Http2HeaderBlock.ContentLength(h.value);
+                }
+                if (h.name == "host") {
+                    if (host != "") { throw new IOException("Duplicate HTTP2 host"); }
+                    host = h.value;
+                }
+            }
+        }
+        if ((request && (!method || !path || !scheme || !authority)) || (!request && !status) || (host != "" && auth != "" && host != auth)) {
+            throw new IOException("Missing or conflicting HTTP2 pseudo-header");
+        }
+        return length;
+    }
+}

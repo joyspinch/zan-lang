@@ -249,11 +249,18 @@ public class ZanDatabase : IDisposable {
 
     // 刀12：Backup 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
     public void BackupLocked(string targetPath) {
+        this.BackupLockedWithPersistence(targetPath, new BackupPersistence());
+    }
+
+    internal void BackupLockedWithPersistence(string targetPath, BackupPersistence persistence) {
         if (!this.IsOpen()) {
             throw new InvalidOperationException("cannot backup closed database: " + this.GetError());
         }
         string target = Path.Normalize(targetPath);
-        this.kv.Backup(target);
+        this.kv.BackupWithPersistence(target, persistence);
+        long segmentBound = this.kv.man.NextSegId();
+        ZanDatabase probe = null;
+        try {
 
         // 刀14：备份伴生的 VectorTable 物理文件
         for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
@@ -263,13 +270,13 @@ public class ZanDatabase : IDisposable {
             string dstVec = target + "." + this.vectorTables[i].name + ".zvec";
             if (File.Exists(srcVec)) {
                 if (File.Exists(dstVec)) { File.Delete(dstVec); }
-                File.Copy(srcVec, dstVec);
+                persistence.Copy(srcVec, dstVec);
             }
             string srcHnsw = vt.hnswPath;
             string dstHnsw = target + "." + this.vectorTables[i].name + ".zhnsw";
             if (File.Exists(srcHnsw)) {
                 if (File.Exists(dstHnsw)) { File.Delete(dstHnsw); }
-                File.Copy(srcHnsw, dstHnsw);
+                persistence.Copy(srcHnsw, dstHnsw);
             }
         }
 
@@ -281,37 +288,33 @@ public class ZanDatabase : IDisposable {
             string dstTab = target + "." + this.recordTables[i].name + ".ztab";
             if (File.Exists(srcTab)) {
                 if (File.Exists(dstTab)) { File.Delete(dstTab); }
-                File.Copy(srcTab, dstTab);
+                persistence.Copy(srcTab, dstTab);
             }
             string srcBlob = rt.blobPath;
             string dstBlob = target + "." + this.recordTables[i].name + ".zblob";
             if (File.Exists(srcBlob)) {
                 if (File.Exists(dstBlob)) { File.Delete(dstBlob); }
-                File.Copy(srcBlob, dstBlob);
+                persistence.Copy(srcBlob, dstBlob);
             }
             string srcIdx = rt.idxPath;
             string dstIdx = target + "." + this.recordTables[i].name + ".zidx";
             if (File.Exists(srcIdx)) {
                 if (File.Exists(dstIdx)) { File.Delete(dstIdx); }
-                File.Copy(srcIdx, dstIdx);
+                persistence.Copy(srcIdx, dstIdx);
             }
             string srcWal = rt.walPath;
             string dstWal = target + "." + this.recordTables[i].name + ".zwal";
             if (File.Exists(srcWal)) {
                 if (File.Exists(dstWal)) { File.Delete(dstWal); }
-                File.Copy(srcWal, dstWal);
+                persistence.Copy(srcWal, dstWal);
             }
         }
 
         // 对导出的数据库做全库巡检审计（包含已注册集合的索引代审计、向量表与表格校验）
-        ZanDatabase probe = ZanDatabase.Open(target, ZanStore.DUR_SYNC);
+        persistence.SyncParents(ZanStore.DirOf(target) == "" ? "." : ZanStore.DirOf(target), "backup-sidecars");
+        probe = ZanDatabase.Open(target, ZanStore.DUR_SYNC);
         if (!probe.IsOpen()) {
-            string err = probe.GetError();
-            probe.Close();
-            ZanStore.CleanTargetFiles(target, 256);
-            this.CleanTargetVectorFiles(target);
-            this.CleanTargetRecordFiles(target);
-            throw new IOException("backup database probe failed: " + err);
+            throw new IOException("backup database probe failed: " + probe.GetError());
         }
         for (int i = 0; i < this.entries.Count; i = i + 1) {
             probe.GetCollection(this.entries[i].name);
@@ -324,16 +327,52 @@ public class ZanDatabase : IDisposable {
         }
         List<string> problems = probe.IntegrityCheck();
         probe.Close();
+        string closeError = probe.GetError();
+        for (int i = 0; i < probe.recordTables.Count; i = i + 1) {
+            string tableError = probe.recordTables[i].table.GetError();
+            if (closeError == "" && tableError != "") { closeError = tableError; }
+        }
+        probe = null;
+        if (closeError != "") {
+            throw new IOException("backup database verification close failed: " + closeError);
+        }
         if (problems.Count > 0) {
-            ZanStore.CleanTargetFiles(target, 256);
-            this.CleanTargetVectorFiles(target);
-            this.CleanTargetRecordFiles(target);
             string msg = "";
             for (int i = 0; i < problems.Count; i = i + 1) {
                 if (i > 0) { msg = msg + "; "; }
                 msg = msg + problems[i];
             }
             throw new IOException("backup database integrity check failed: " + msg);
+        }
+        // Verification may create/checkpoint sidecar files; include those writes.
+        this.SyncTargetFiles(target, persistence);
+        persistence.SyncParents(ZanStore.DirOf(target), "backup-verified");
+        } catch (Exception ex) {
+            if (probe != null) { probe.Close(); probe = null; }
+            ZanStore.CleanTargetFiles(target, segmentBound);
+            this.CleanTargetVectorFiles(target);
+            this.CleanTargetRecordFiles(target);
+            throw;
+        } finally {
+            if (probe != null) { probe.Close(); }
+        }
+    }
+
+    private void SyncTargetFiles(string target, BackupPersistence persistence) {
+        persistence.SyncFile(target);
+        persistence.SyncFile(target + ".m0");
+        persistence.SyncFile(target + ".m1");
+        for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+            string prefix = target + "." + this.vectorTables[i].name;
+            if (File.Exists(prefix + ".zvec")) { persistence.SyncFile(prefix + ".zvec"); }
+            if (File.Exists(prefix + ".zhnsw")) { persistence.SyncFile(prefix + ".zhnsw"); }
+        }
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            string prefix = target + "." + this.recordTables[i].name;
+            persistence.SyncFile(prefix + ".ztab");
+            persistence.SyncFile(prefix + ".zblob");
+            if (File.Exists(prefix + ".zidx")) { persistence.SyncFile(prefix + ".zidx"); }
+            persistence.SyncFile(prefix + ".zwal");
         }
     }
 

@@ -1,10 +1,20 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Sockets;
+using System.Net.Tls;
+using System.Threading;
 
 namespace System.Net.WebSocket;
 
 public class WsReader {
+    private object receiveSync;
+    private bool stopped;
+    private bool readBusy;
+    private int activeSends;
+    private bool transportClosing;
+    private TcpClient closingConn;
+    private TlsStream closingStream;
+    private TlsContext closingContext;
     public nint sock;
     // 非空时字节源为 TLS 明文流（wss），否则直接从 sock 读取。
     public TlsStream tlsSrc;
@@ -24,6 +34,7 @@ public class WsReader {
 
     // 内部构造：64KiB 缓冲、消息上限 16 MiB；经 new / WrapTls 使用。
     public WsReader(nint sock) {
+        this.receiveSync = new object();
         this.sock = sock;
         this.tlsSrc = null;
         this.cap = 65536;
@@ -74,11 +85,14 @@ public class WsReader {
 
     // 扩展累积缓冲区，使其至少容纳 `need` 个字节。
     public void Ensure(int need) {
-        if (need <= this.cap) { return; }
-        int maxCap = this.maxLen + 65536;
-        if (need > maxCap) {
-            need = maxCap;
+        long limit = (long)this.maxLen + 65536;
+        // Clamping capacity cannot clamp the caller's following explicit-length
+        // copy. Reject before copying, also catching an overflowing len + n.
+        if (this.maxLen < 0 || limit > 1073741824 || need < 0 || (long)need > limit) {
+            throw new ArgumentException("WebSocket reader buffer limit exceeded");
         }
+        if (need <= this.cap) { return; }
+        int maxCap = (int)limit;
         int nc = this.cap * 2;
         if (nc < 65536) { nc = 65536; }
         while (nc < need) {
@@ -97,84 +111,136 @@ public class WsReader {
         this.cap = nc;
     }
 
-    // 挂起在 reactor 上直到可读，然后把收到的字节
-    // 追加进缓冲区。返回读取的字节数；0 表示对端已关闭（EOF）。
-    public async int FillMore() {
-        int got = 0;
-        this.Compact();
-        while (got == 0) {
-            if (this.tlsSrc != null) {
-                // TLS 字节源：解密后的明文落入 tmp 并按显式字节数
-                // 追加（帧负载可能含 NUL，绝不依赖 strlen）。
-                int tn = await this.tlsSrc.RecvIntoAsync(this.tmp, 65536);
-                if (tn <= 0) { return 0; }
-                this.Ensure(this.len + tn);
-                NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)this.tmp, tn);
-                this.len = this.len + tn;
-                got = tn;
-                continue;
-            }
-            await Socket.ReadReady(this.sock);
-            int n = 0;
-            if (this.len == 0) {
-                // 快路径：缓冲区为空（常见的每 recv 一帧的情况）——
-                // 直接接收进缓冲区，无需中间拷贝。
-                n = Socket.Recv(this.sock, this.buf, this.cap);
-                if (n > 0) {
-                    this.len = n;
-                    got = n;
-                } else if (n == 0 || n <= -2) {
-                    return 0;
-                }
-            } else {
-                // 缓冲区已有字节（部分帧/合并帧）：先收进
-                // 临时缓冲区再追加。
-                n = Socket.Recv(this.sock, this.tmp, 65536);
-                if (n > 0) {
-                    this.Ensure(this.len + n);
-                    NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)this.tmp, n);
-                    this.len = this.len + n;
-                    got = n;
-                } else if (n == 0 || n <= -2) {
-                    return 0;
-                }
-            }
-            // n == -1：EWOULDBLOCK/虚假唤醒——再次等待可读。
+    // Invalidation alone does not own or close the caller's transport. Owners
+    // closing a live receive must retain its descriptor until FillMore drains.
+    internal void Invalidate() {
+        lock (this.receiveSync) {
+            this.stopped = true;
+            this.sock = -1;
         }
-        return got;
     }
 
-    // 带空闲窗口的 FillMore：时限内没有任何字节到达时返回
-    // -1（连接未断，帧缓冲里已收到的半截字节原样保留，下次接着
-    // 读）；数据/对端关闭的语义与 FillMore 相同（>0 = 字节数，
-    // 0 = EOF）。timeoutMs 非正表示不限时，等价于 FillMore()。
-    // // 实现走 Socket.RecvToOv——把接收与截止时间一起交给 reactor
-    // 竞速（超时交付 -1，不 shutdown 套接字），而不是 HttpDeadline
-    // 的手法：后者靠 ShutdownBoth 挂断唤醒，用一次连接就废一次，
-    // 撑不起「每 15 秒空闲窗口到期就 Ping 一下再继续收」的长连接
-    // 心跳循环。TLS 源分支没有对等的带截止时间原语，退化为不限时
-    // （wss 心跳调用方应改用上层 Ping/Pong 探活）。
+    // Session ownership is transferred exactly once. Shutdown wakes a read even
+    // if it registers after invalidation; keeping the descriptor allocated also
+    // protects that registration gap from descriptor reuse. Native shutdown only
+    // queues reactor continuations; it does not invoke managed code inline.
+    internal void CloseTransport(TcpClient conn, TlsStream stream, TlsContext context) {
+        lock (this.receiveSync) {
+            if (this.transportClosing) { return; }
+            this.transportClosing = true;
+            this.stopped = true;
+            this.sock = -1;
+            this.closingConn = conn;
+            this.closingStream = stream;
+            this.closingContext = context;
+            if (conn != null) { Socket.ShutdownBoth(conn.GetSocket()); }
+        }
+        this.DrainTransport();
+    }
+
+    // Called while the session's connected/snapshot lock is held, before a
+    // sender can yield. This counts admitted I/O, independently of sendBusy's
+    // queue handoff state. CloseTransport never takes the session lock.
+    internal bool AcquireSend() {
+        lock (this.receiveSync) {
+            if (this.stopped) { return false; }
+            this.activeSends = this.activeSends + 1;
+            return true;
+        }
+    }
+
+    internal void ReleaseSend() {
+        lock (this.receiveSync) { this.activeSends = this.activeSends - 1; }
+        this.DrainTransport();
+    }
+
+    private void DrainTransport() {
+        TcpClient conn = null;
+        TlsStream stream = null;
+        TlsContext context = null;
+        lock (this.receiveSync) {
+            if (this.readBusy || this.activeSends > 0) { return; }
+            conn = this.closingConn;
+            stream = this.closingStream;
+            context = this.closingContext;
+            this.closingConn = null;
+            this.closingStream = null;
+            this.closingContext = null;
+        }
+        // Never run close/free or managed callbacks with the reader lock held.
+        try {
+            if (stream != null) { stream.Close(); }
+        } finally {
+            try {
+                if (conn != null) { conn.Close(); }
+            } finally {
+                if (context != null) { context.Free(); }
+            }
+        }
+    }
+
+    // One receive owns buffers and its descriptor snapshot through every await.
+    // Public fields remain available for existing server/handshake consumers;
+    // supported session close goes through CloseTransport, not raw Socket.Close.
+    public async int FillMore() { return await this.FillMore(0); }
+
+    // >0 = bytes, 0 = EOF/invalidation, -1 = idle timeout (partial frame kept).
+    // TLS retains the existing unlimited-wait behavior for a positive timeout.
     public async int FillMore(int timeoutMs) {
-        if (timeoutMs <= 0 || this.tlsSrc != null) {
-            return await this.FillMore();
+        nint handle = -1;
+        TlsStream source = null;
+        lock (this.receiveSync) {
+            if (this.stopped || this.readBusy) { return 0; }
+            handle = this.sock;
+            source = this.tlsSrc;
+            if (source == null && Socket.SetNonBlocking(handle) != 0) { return 0; }
+            this.readBusy = true;
         }
-        this.Compact();
-        int n = 0;
-        if (this.len == 0) {
-            // 快路径：缓冲区为空（常见的每 recv 一帧的情况）——
-            // 直接接收进缓冲区，无需中间拷贝。
-            n = await Socket.RecvToOv(this.sock, this.buf, this.cap, timeoutMs);
-            if (n > 0) { this.len = n; }
-            return n < 0 ? 0 - 1 : n;
+        try {
+            this.Compact();
+            while (true) {
+                lock (this.receiveSync) { if (this.stopped) { return 0; } }
+                int n = 0;
+                bool direct = this.len == 0 && source == null;
+                if (source != null) {
+                    n = await source.RecvIntoAsync(this.tmp, 65536);
+                } else if (timeoutMs > 0) {
+                    if (direct) {
+                        n = await Socket.RecvToOv(handle, this.buf, this.cap, timeoutMs);
+                    } else {
+                        n = await Socket.RecvToOv(handle, this.tmp, 65536, timeoutMs);
+                    }
+                } else {
+                    await Socket.ReadReady(handle);
+                    lock (this.receiveSync) {
+                        if (this.stopped) { return 0; }
+                        // The nonblocking syscall and stop share a lock, closing
+                        // the check/recv gap without holding a lock across await.
+                        if (direct) { n = Socket.Recv(handle, this.buf, this.cap); }
+                        else { n = Socket.Recv(handle, this.tmp, 65536); }
+                    }
+                }
+                lock (this.receiveSync) {
+                    if (this.stopped) { return 0; }
+                    if (n > 0) {
+                        if (direct) { this.len = n; }
+                        else {
+                            this.Ensure(this.len + n);
+                            NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)this.tmp, n);
+                            this.len = this.len + n;
+                        }
+                        return n;
+                    }
+                    if (n == 0 || source != null) { return 0; }
+                    if (timeoutMs > 0) { return -1; }
+                    if (n <= -2) { return 0; }
+                    // Would-block/spurious wake: check stop again before rearm.
+                }
+            }
+        } finally {
+            lock (this.receiveSync) { this.readBusy = false; }
+            this.DrainTransport();
         }
-        // 缓冲区已有字节（部分帧/合并帧）：先收进临时缓冲区再追加。
-        n = await Socket.RecvToOv(this.sock, this.tmp, 65536, timeoutMs);
-        if (n > 0) {
-            this.Ensure(this.len + n);
-            NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)this.tmp, n);
-            this.len = this.len + n;
-        }
-        return n < 0 ? 0 - 1 : n;
     }
 
     // 缓冲区头部帧的总字节长度；若完整帧尚未全部缓冲

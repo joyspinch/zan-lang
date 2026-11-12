@@ -4,8 +4,6 @@ using System.Net.Tls;
 using System.Net.Http;
 using System.Net.WebSocket;
 using System.Security.Cryptography;
-using System.Runtime.Intrinsics;
-using System.Threading;
 
 namespace System.Net.WebSocket.Secure;
 
@@ -21,26 +19,14 @@ public class WssClient : IDisposable {
     // 此前用字符串拼接攒帧：帧负载里的 NUL 会让按 strlen 计长
     // 的帧长判断与切片全部错位。
     private WsReader reader;
-    private WsAssembler asm;
-    private bool connected;
-    private bool sendBusy;
-    private List<AsyncGate> sendWaiters;
-    private int lastOpcode;
-    private int lastLen;
-    private byte[] lastBinary;
+    private WsClientSession session;
 
     // 构造未连接客户端；经 ConnectAsync 使用。
     public WssClient() {
         this.host = "";
         this.path = "/";
         this.reader = null;
-        this.asm = new WsAssembler(16777216);
-        this.connected = false;
-        this.sendBusy = false;
-        this.sendWaiters = new List<AsyncGate>();
-        this.lastOpcode = 0;
-        this.lastLen = 0;
-        this.lastBinary = null;
+        this.session = new WsClientSession();
     }
 
     // 发起 wss://host:port/path 握手：TCP 连接 → TLS 握手（带 SNI
@@ -48,19 +34,27 @@ public class WssClient : IDisposable {
     // Accept）。绝不返回 null：任何一步失败都返回 connected=false
     // 的对象（失败路径已清理连接/上下文），用 IsConnected() 判断。
     public static async WssClient ConnectAsync(string host, int port, string path) {
+        return await WssClient.ConnectContextAsync(host, port, path, null);
+    }
+
+    // An explicitly configured context is owned by this connection, including
+    // failures before TLS starts. Public connections always use system trust.
+    internal static async WssClient ConnectContextAsync(string host, int port, string path,
+            TlsContext context) {
         WssClient client = new WssClient();
+        client.context = context;
         client.host = host;
         client.path = path;
         if (!WsHandshake.SafeRequestPart(host, false)
-            || !WsHandshake.SafeRequestPart(path, false)) { return client; }
+            || !WsHandshake.SafeRequestPart(path, false)) { client.CloseNow(); return client; }
         client.conn = await TcpClient.ConnectAsync(host, port);
-        if (client.conn == null) { return client; }
-        client.context = TlsContext.CreateClient();
-        if (client.context == null) { client.conn.Close(); return client; }
+        if (client.conn == null) { client.CloseNow(); return client; }
+        if (client.context == null) { client.context = TlsContext.CreateClient(); }
+        if (client.context == null) { client.CloseNow(); return client; }
         client.stream = await TlsStream.ConnectAsync(client.context,
                                                       client.conn.Sock(), host);
         if (client.stream == null) {
-            client.conn.Close(); client.context.Free(); return client;
+            client.CloseNow(); return client;
         }
 
         byte[] keyBytes = RandomNumberGenerator.GetBytes(16);
@@ -85,7 +79,7 @@ public class WssClient : IDisposable {
         HttpDeadlineToken watch = HttpDeadline.Arm(client.conn.Sock(), 30000);
         int headerEnd = -1;
         while (headerEnd < 0) {
-            if (client.reader.Buffered() > 65536) {
+            if (!WsHandshake.HeaderWithinLimit(-1, client.reader.Buffered())) {
                 HttpDeadline.Disarm(watch);
                 client.CloseNow();
                 return client;
@@ -102,6 +96,11 @@ public class WssClient : IDisposable {
                 return client;
             }
             headerEnd = client.reader.FindHeaderEnd();
+            if (!WsHandshake.HeaderWithinLimit(headerEnd, client.reader.Buffered())) {
+                HttpDeadline.Disarm(watch);
+                client.CloseNow();
+                return client;
+            }
         }
         HttpDeadline.Disarm(watch);
         string head = client.reader.Slice(headerEnd);
@@ -113,372 +112,74 @@ public class WssClient : IDisposable {
             return client;
         }
         client.reader.Consume(headerEnd + 4);
-        client.connected = true;
+        client.session.Open(client.conn, client.stream, client.context, client.reader);
+        client.conn = null;
+        client.reader = null;
+        client.stream = null;
+        client.context = null;
         return client;
     }
 
     // 握手是否成功且连接未断。
-    public bool IsConnected() { return this.connected; }
+    public bool IsConnected() { return this.session.IsConnected(); }
 
     // 发送一条 Text 消息（fire-and-forget；发送失败会就地断开）。
     public async void SendText(string text) {
-        await this.SendFrame(WsOpcode.Text, text, text.Length);
+        await this.session.SendFrame(WsOpcode.Text, text, text.Length);
     }
 
     // 发送一条二进制消息（bytes 可含 NUL，len 为精确字节数）。
     public async void SendBinary(string bytes, int len) {
-        await this.SendFrame(WsOpcode.Binary, bytes, len);
+        await this.session.SendFrame(WsOpcode.Binary, bytes, len);
     }
 
     // 发送一条二进制消息（byte[] 原生切片，无需经过字符串中转）。
     public async void SendBinary(byte[] bytes, int offset, int len) {
-        await this.SendFrameBytes(WsOpcode.Binary, bytes, offset, len);
+        await this.session.SendFrameBytes(WsOpcode.Binary, bytes, offset, len);
     }
 
     // 发送一条完整二进制消息。
     public async void SendBinary(byte[] bytes) {
         if (bytes == null) { return; }
-        await this.SendFrameBytes(WsOpcode.Binary, bytes, 0, bytes.Length);
+        await this.session.SendFrameBytes(WsOpcode.Binary, bytes, 0, bytes.Length);
     }
 
     // 发送空 Ping 帧（对端的 Pong 由 RecvText 静默消费）。
-    public async void Ping() { await this.SendFrame(WsOpcode.Ping, "", 0); }
+    public async void Ping() { await this.session.SendFrame(WsOpcode.Ping, "", 0); }
 
     // 上一次成功接收并交付的消息操作码（WsOpcode.Text 或 WsOpcode.Binary）。
-    public int LastOpcode() { return this.lastOpcode; }
+    public int LastOpcode() { return this.session.LastOpcode(); }
 
     // 上一次成功接收并交付的消息精确字节数。
-    public int LastLength() { return this.lastLen; }
+    public int LastLength() { return this.session.LastLength(); }
 
     // 挂起直到下一个文本/二进制消息（分片消息重组到 fin 后整条
     // 交付；Ping 以 Pong 应答后继续；Close、协议错误（-2/-3）或
     // 断开返回 ""）。
     public async string RecvText() {
-        while (this.connected) {
-            int total = this.reader.FrameSize();
-            while (total < 0) {
-                if (total == -2 || total == -3) { this.CloseNow(); return ""; }
-                int n = await this.reader.FillMore();
-                if (n == 0) { this.CloseNow(); return ""; }
-                total = this.reader.FrameSize();
-            }
-            WsFrame frame = this.reader.TakeFrame(total);
-            if (!WsFrame.ValidInbound(frame, false)) {
-                // RFC 6455：客户端收到的服务端帧不得掩码，且 RSV、控制帧
-                // 和关闭负载必须满足协议约束。
-                this.CloseNow();
-                return "";
-            }
-            if (frame.opcode == WsOpcode.Close) {
-                if (frame.payload != null && frame.payloadLen >= 2) {
-                    await this.SendFrame(WsOpcode.Close, frame.payload, 2);
-                } else {
-                    await this.SendFrame(WsOpcode.Close, "", 0);
-                }
-                this.CloseNow();
-                return "";
-            }
-            if (frame.opcode == WsOpcode.Ping) {
-                await this.SendFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
-                continue;
-            }
-            if (frame.opcode == WsOpcode.Pong) { continue; }
-            // 分片消息在 fin 时整条交付——此前 continuation 帧被
-            // 静默丢弃。
-            int feed = this.asm.Feed(frame);
-            if (feed < 0) { this.CloseNow(); return ""; }
-            if (feed == 0) { continue; }
-            if (!this.asm.ValidComplete()) { this.CloseNow(); return ""; }
-            this.lastOpcode = this.asm.MessageOpcode();
-            this.lastLen = this.asm.MessageLen();
-            this.lastBinary = null;
-            return this.asm.Complete();
-        }
-        return "";
+        return await this.session.RecvText(0);
     }
 
     // 挂起直到下一个文本/二进制消息。返回未截断的原生 byte[]，
     // 彻底消除二进制消息中 NUL 字符被字符串截断的隐患；Close 或断开返回 null。
     public async byte[] RecvBinary() {
-        while (this.connected) {
-            int total = this.reader.FrameSize();
-            while (total < 0) {
-                if (total == -2 || total == -3) { this.CloseNow(); return null; }
-                int n = await this.reader.FillMore();
-                if (n == 0) { this.CloseNow(); return null; }
-                total = this.reader.FrameSize();
-            }
-            WsFrame frame = this.reader.TakeFrame(total);
-            if (!WsFrame.ValidInbound(frame, false)) {
-                this.CloseNow();
-                return null;
-            }
-            if (frame.opcode == WsOpcode.Close) {
-                if (frame.payload != null && frame.payloadLen >= 2) {
-                    await this.SendFrame(WsOpcode.Close, frame.payload, 2);
-                } else {
-                    await this.SendFrame(WsOpcode.Close, "", 0);
-                }
-                this.CloseNow();
-                return null;
-            }
-            if (frame.opcode == WsOpcode.Ping) {
-                await this.SendFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
-                continue;
-            }
-            if (frame.opcode == WsOpcode.Pong) { continue; }
-            int feed = this.asm.Feed(frame);
-            if (feed < 0) { this.CloseNow(); return null; }
-            if (feed == 0) { continue; }
-            if (!this.asm.ValidComplete()) { this.CloseNow(); return null; }
-            this.lastOpcode = this.asm.MessageOpcode();
-            this.lastLen = this.asm.MessageLen();
-            byte[] bytes = this.asm.CompleteBytes();
-            this.lastBinary = bytes;
-            return bytes;
-        }
-        return null;
+        return await this.session.RecvBinary(0);
     }
 
     // 协礼关闭：先发空关闭帧（未连接时跳过），随后无条件断开并
     // 释放 TLS 流与上下文；重复调用安全。
     public async void Close() {
-        if (this.connected) {
-            await this.SendFrame(WsOpcode.Close, "", 0);
-        }
+        await this.session.Close();
         this.CloseNow();
-    }
-
-    private void WakeSendWaiters() {
-        while (this.sendWaiters.Count > 0) {
-            AsyncGate g = this.sendWaiters[0];
-            this.sendWaiters.RemoveAt(0);
-            g.Signal();
-        }
-    }
-
-    private async bool AcquireSend() {
-        if (!this.connected || this.stream == null) { return false; }
-        if (!this.sendBusy && this.sendWaiters.Count == 0) {
-            this.sendBusy = true;
-            return true;
-        }
-        AsyncGate g = new AsyncGate();
-        this.sendWaiters.Add(g);
-        await g.Wait();
-        g.Close();
-        if (!this.connected || this.stream == null) {
-            this.ReleaseSend();
-            return false;
-        }
-        return true;
-    }
-
-    private void ReleaseSend() {
-        if (this.sendWaiters.Count > 0) {
-            AsyncGate g = this.sendWaiters[0];
-            this.sendWaiters.RemoveAt(0);
-            g.Signal();
-        } else {
-            this.sendBusy = false;
-        }
-    }
-
-    // 客户端发送入口：RFC 6455 要求客户端帧必须掩码（每帧 CSPRNG
-    // 掩码键）+ 正确的扩展长度编码。并发发送受锁保护，保证原子串行。发送失败（<= 0）就地断开。
-    private async void SendFrame(int opcode, string payload, int payloadLen) {
-        if (!this.connected || payload == null || payloadLen < 0
-            || payloadLen > 16777216
-            || opcode < 0 || opcode > WsOpcode.Pong
-            || (opcode >= 8 && payloadLen > 125)) { return; }
-        bool ok = await this.AcquireSend();
-        if (!ok) { return; }
-        try {
-            if (!this.connected || this.stream == null) { return; }
-            int ext = 0;
-            if (payloadLen > 65535) { ext = 8; }
-            else if (payloadLen > 125) { ext = 2; }
-            int headerLen = 2 + ext + 4;
-            byte[] frame = new byte[headerLen + payloadLen + 1];
-            frame[0] = (byte)(128 | opcode);
-            int pos = 2;
-            if (ext == 0) {
-                frame[1] = (byte)(128 | payloadLen);
-            } else if (ext == 2) {
-                frame[1] = (byte)(128 | 126);
-                frame[2] = (byte)((payloadLen >> 8) & 255);
-                frame[3] = (byte)(payloadLen & 255);
-                pos = 4;
-            } else {
-                frame[1] = (byte)(128 | 127);
-                frame[2] = 0; frame[3] = 0; frame[4] = 0; frame[5] = 0;
-                frame[6] = (byte)((payloadLen >> 24) & 255);
-                frame[7] = (byte)((payloadLen >> 16) & 255);
-                frame[8] = (byte)((payloadLen >> 8) & 255);
-                frame[9] = (byte)(payloadLen & 255);
-                pos = 10;
-            }
-            byte[] mask = RandomNumberGenerator.GetBytes(4);
-            if (mask == null) { mask = new byte[] { 0, 0, 0, 0 }; }
-            for (int m = 0; m < 4; m = m + 1) { frame[pos + m] = mask[m]; }
-            pos = pos + 4;
-
-            if (payloadLen > 0) {
-                NativeMemory.PutString((nint)frame, pos, payload, payloadLen);
-
-                long m0 = (long)(mask[0] & 255);
-                long m1 = (long)(mask[1] & 255);
-                long m2 = (long)(mask[2] & 255);
-                long m3 = (long)(mask[3] & 255);
-                long k32 = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
-                long k64 = k32 | (k32 << 32);
-
-                Vector256 mask256 = Vector256.Create(k64, k64, k64, k64);
-                Vector128 mask128 = Vector128.Create(k64, k64);
-
-                int iEnc = 0;
-                while (iEnc + 32 <= payloadLen) {
-                    Vector256 v = Vector256.Load(frame, pos + iEnc);
-                    v = Vector256.Xor(v, mask256);
-                    Vector256.Store(frame, pos + iEnc, v);
-                    iEnc = iEnc + 32;
-                }
-                while (iEnc + 16 <= payloadLen) {
-                    Vector128 v128 = Vector128.Load(frame, pos + iEnc);
-                    v128 = Vector128.Xor(v128, mask128);
-                    Vector128.Store(frame, pos + iEnc, v128);
-                    iEnc = iEnc + 16;
-                }
-                int limitEnc = payloadLen - 3;
-                int sm0 = (int)m0; int sm1 = (int)m1; int sm2 = (int)m2; int sm3 = (int)m3;
-                while (iEnc < limitEnc) {
-                    frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm0);
-                    frame[pos + iEnc + 1] = (byte)((frame[pos + iEnc + 1] & 255) ^ sm1);
-                    frame[pos + iEnc + 2] = (byte)((frame[pos + iEnc + 2] & 255) ^ sm2);
-                    frame[pos + iEnc + 3] = (byte)((frame[pos + iEnc + 3] & 255) ^ sm3);
-                    iEnc = iEnc + 4;
-                }
-                if (iEnc < payloadLen) {
-                    frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm0);
-                    iEnc = iEnc + 1;
-                    if (iEnc < payloadLen) {
-                        frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm1);
-                        iEnc = iEnc + 1;
-                        if (iEnc < payloadLen) {
-                            frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm2);
-                        }
-                    }
-                }
-            }
-            int sent = await this.stream.SendBytesAsync(frame, 0, headerLen + payloadLen);
-            if (sent <= 0) { this.CloseNow(); }
-        } finally {
-            this.ReleaseSend();
-        }
-    }
-
-    // 客户端原生字节数组发送入口：掩码 + 帧长 + 互斥串行发送。
-    private async void SendFrameBytes(int opcode, byte[] payload, int offset, int payloadLen) {
-        if (!this.connected || payload == null || offset < 0 || payloadLen < 0
-            || offset + payloadLen > payload.Length
-            || payloadLen > 16777216
-            || opcode < 0 || opcode > WsOpcode.Pong
-            || (opcode >= 8 && payloadLen > 125)) { return; }
-        bool ok = await this.AcquireSend();
-        if (!ok) { return; }
-        try {
-            if (!this.connected || this.stream == null) { return; }
-            int ext = 0;
-            if (payloadLen > 65535) { ext = 8; }
-            else if (payloadLen > 125) { ext = 2; }
-            int headerLen = 2 + ext + 4;
-            byte[] frame = new byte[headerLen + payloadLen + 1];
-            frame[0] = (byte)(128 | opcode);
-            int pos = 2;
-            if (ext == 0) {
-                frame[1] = (byte)(128 | payloadLen);
-            } else if (ext == 2) {
-                frame[1] = (byte)(128 | 126);
-                frame[2] = (byte)((payloadLen >> 8) & 255);
-                frame[3] = (byte)(payloadLen & 255);
-                pos = 4;
-            } else {
-                frame[1] = (byte)(128 | 127);
-                frame[2] = 0; frame[3] = 0; frame[4] = 0; frame[5] = 0;
-                frame[6] = (byte)((payloadLen >> 24) & 255);
-                frame[7] = (byte)((payloadLen >> 16) & 255);
-                frame[8] = (byte)((payloadLen >> 8) & 255);
-                frame[9] = (byte)(payloadLen & 255);
-                pos = 10;
-            }
-            byte[] mask = RandomNumberGenerator.GetBytes(4);
-            if (mask == null) { mask = new byte[] { 0, 0, 0, 0 }; }
-            for (int m = 0; m < 4; m = m + 1) { frame[pos + m] = mask[m]; }
-            pos = pos + 4;
-
-            if (payloadLen > 0) {
-                NativeMemory.Copy((nint)frame + (nint)pos, (nint)payload + (nint)offset, payloadLen);
-
-                long m0 = (long)(mask[0] & 255);
-                long m1 = (long)(mask[1] & 255);
-                long m2 = (long)(mask[2] & 255);
-                long m3 = (long)(mask[3] & 255);
-                long k32 = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
-                long k64 = k32 | (k32 << 32);
-
-                Vector256 mask256 = Vector256.Create(k64, k64, k64, k64);
-                Vector128 mask128 = Vector128.Create(k64, k64);
-
-                int iEnc = 0;
-                while (iEnc + 32 <= payloadLen) {
-                    Vector256 v = Vector256.Load(frame, pos + iEnc);
-                    v = Vector256.Xor(v, mask256);
-                    Vector256.Store(frame, pos + iEnc, v);
-                    iEnc = iEnc + 32;
-                }
-                while (iEnc + 16 <= payloadLen) {
-                    Vector128 v128 = Vector128.Load(frame, pos + iEnc);
-                    v128 = Vector128.Xor(v128, mask128);
-                    Vector128.Store(frame, pos + iEnc, v128);
-                    iEnc = iEnc + 16;
-                }
-                int limitEnc = payloadLen - 3;
-                int sm0 = (int)m0; int sm1 = (int)m1; int sm2 = (int)m2; int sm3 = (int)m3;
-                while (iEnc < limitEnc) {
-                    frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm0);
-                    frame[pos + iEnc + 1] = (byte)((frame[pos + iEnc + 1] & 255) ^ sm1);
-                    frame[pos + iEnc + 2] = (byte)((frame[pos + iEnc + 2] & 255) ^ sm2);
-                    frame[pos + iEnc + 3] = (byte)((frame[pos + iEnc + 3] & 255) ^ sm3);
-                    iEnc = iEnc + 4;
-                }
-                if (iEnc < payloadLen) {
-                    frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm0);
-                    iEnc = iEnc + 1;
-                    if (iEnc < payloadLen) {
-                        frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm1);
-                        iEnc = iEnc + 1;
-                        if (iEnc < payloadLen) {
-                            frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm2);
-                        }
-                    }
-                }
-            }
-            int sent = await this.stream.SendBytesAsync(frame, 0, headerLen + payloadLen);
-            if (sent <= 0) { this.CloseNow(); }
-        } finally {
-            this.ReleaseSend();
-        }
     }
 
     // 立即断开并释放全部句柄（TLS 流、连接、上下文、reader）。
     public void CloseNow() {
-        this.connected = false;
-        this.sendBusy = false;
+        this.session.CloseNow();
         if (this.stream != null) { this.stream.Close(); this.stream = null; }
         if (this.conn != null) { this.conn.Close(); this.conn = null; }
         if (this.context != null) { this.context.Free(); this.context = null; }
         this.reader = null;
-        this.WakeSendWaiters();
     }
 
     public void Dispose() {
@@ -486,48 +187,4 @@ public class WssClient : IDisposable {
     }
 
     // 从响应头文本里取单个头值（ASCII 大小写不敏感，跳过状态行，
-    // 去掉值前导空格）；不存在为 ""。
-    private static string Header(string headers, string name) {
-        int pos = WssClient.IndexOf(headers, "\r\n", 0);
-        if (pos < 0) { return ""; }
-        pos = pos + 2;
-        while (pos < headers.Length) {
-            int end = WssClient.IndexOf(headers, "\r\n", pos);
-            if (end < 0) { end = headers.Length; }
-            int colon = WssClient.IndexOf(headers, ":", pos);
-            if (colon > pos && colon < end) {
-                string current = headers.Substring(pos, colon - pos);
-                if (WssClient.AsciiEquals(current, name)) {
-                    int start = colon + 1;
-                    while (start < end && (headers[start] & 255) == 32) {
-                        start = start + 1;
-                    }
-                    return headers.Substring(start, end - start);
-                }
-            }
-            if (end >= headers.Length) { break; }
-            pos = end + 2;
-        }
-        return "";
-    }
-
-    // ASCII 大小写不敏感的相等比较。
-    private static bool AsciiEquals(string a, string b) {
-        if (a.Length != b.Length) { return false; }
-        for (int i = 0; i < a.Length; i = i + 1) {
-            int x = a[i] & 255; int y = b[i] & 255;
-            if (x >= 65 && x <= 90) { x = x + 32; }
-            if (y >= 65 && y <= 90) { y = y + 32; }
-            if (x != y) { return false; }
-        }
-        return true;
-    }
-
-    // 从 from 起的子串搜索；没有返回 -1。
-    private static int IndexOf(string hay, string needle, int from) {
-        if (hay == null || needle == null) { return -1; }
-        if (from < 0) { from = 0; }
-        if (from > hay.Length) { return -1; }
-        return hay.IndexOf(needle, from);
-    }
 }

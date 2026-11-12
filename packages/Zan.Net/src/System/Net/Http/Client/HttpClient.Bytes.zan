@@ -1,13 +1,6 @@
 using System;
-using System.Text;
 using System.IO;
-using System.Collections.Generic;
-using System.Net.Sockets;
 using System.Net.Http;
-using System.Net.Tls;
-using System.Net.External;
-using System.Threading;
-using System.Diagnostics;
 
 namespace System.Net.Http.Client;
 
@@ -33,14 +26,12 @@ public partial class HttpClient {
         this.ResetTotalBudget();
         this.CheckRequestLimit(bodyLen);
         this.CheckTargetPolicy();
-        if (this.callPolicy == null || this.callPolicy.MaxRedirects() <= 0) {
-            HttpResponse direct = await HttpClient.SendBytesOnceWithLenAsync(this,
-                method, path, body, bodyLen);
-            return this.ApplyContentEncoding(direct);
+        HttpResponse resp = await this.SendBytesOnce(method, path, body, null, bodyLen);
+        if (this.callPolicy != null && this.callPolicy.MaxRedirects() > 0) {
+            resp = await this.FollowBytesFromResponse(method, path, body,
+                HttpClient.SendBytesOnceAsync, resp);
         }
-        HttpResponse followed = await this.FollowBytesRedirects(method, path, body,
-            HttpClient.SendBytesOnceAsync);
-        return this.ApplyContentEncoding(followed);
+        return this.ApplyContentEncoding(resp);
     }
 
     // 发送原始字节数组（带显式字节长度，二进制安全，零中转字符串拷贝）。
@@ -48,8 +39,7 @@ public partial class HttpClient {
         this.ResetTotalBudget();
         this.CheckRequestLimit((long)bodyLen);
         this.CheckTargetPolicy();
-        HttpResponse direct = await HttpClient.SendBytesOnceWithRawBytesAsync(this,
-            method, path, body, bodyLen);
+        HttpResponse direct = await this.SendBytesOnce(method, path, null, body, bodyLen);
         return this.ApplyContentEncoding(direct);
     }
 
@@ -66,553 +56,92 @@ public partial class HttpClient {
         if (contentType != null && contentType.Length > 0 && !this.HasHeaderName("Content-Type")) {
             this.SetHeader("Content-Type", contentType);
         }
-        HttpResponse resp;
-        if (this.useTls) {
-            resp = await this.SendBytesBodyTlsAsync(method, path, "", localPath, fileLen, "", fileLen);
-        } else {
-            resp = await this.SendBytesBodyAsync(method, path, "", localPath, fileLen, "", fileLen);
-        }
-        return resp;
+        return await this.SendBytesBodyAsync(method, path, "", localPath, fileLen, "", fileLen);
     }
 
     // 一次真实上线：SendBytesAsync 的无重定向主体，同时作为
-    // FollowBytesRedirects 的驱动回调。method 随驱动签名显式传递：
+    // FollowBytesFromResponse 的驱动回调。method 随驱动签名显式传递：
     // 重定向改写（301/302/303 → GET）后驱动端据此发空 GET。
     private static async HttpResponse SendBytesOnceAsync(HttpClient client,
             string method, string path, string body) {
         int bodyLen = body != null ? body.Length : 0;
-        return await HttpClient.SendBytesOnceWithLenAsync(client, method, path, body, bodyLen);
+        return await client.SendBytesOnce(method, path, body, null, bodyLen);
     }
 
-    private static async HttpResponse SendBytesOnceWithRawBytesAsync(HttpClient client,
-            string method, string path, byte[] body, int bodyLen) {
-        if (client.useTls) {
-            HttpResponse tResp = await client.SendBytesTlsWithRawBytesAsync(method, path,
-                                                                body, bodyLen);
-            return tResp;
-        }
-        TcpClient conn = await client.ConnectTarget();
-        if (conn == null) { client.FailConnect(); }
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), client.WriteBudget(), client.TotalBudget());
-        string reqHead = client.BuildRequestHead(method, path, (long)bodyLen, true);
-        int _sent = await conn.SendBytesAsync(reqHead, reqHead.Length);
-        if (_sent != reqHead.Length) {
+    private async HttpResponse SendBytesOnce(string method, string path, string body,
+            byte[] rawBody, int bodyLen) {
+        string req = this.BuildRequestHead(method, path, bodyLen, true);
+        PooledHttpConnection channel = await this.OpenChannel(true);
+        if (channel == null) { this.FailConnect(); }
+        HttpDeadlineToken watch = null;
+        try {
+            watch = HttpDeadline.Arm(channel.conn.Sock(), this.WriteBudget(), this.TotalBudget());
+            int sent = await this.WriteStringBytes(channel, req, req.Length);
+            if (sent != req.Length) { throw new HttpRequestException("request write failed"); }
+            if (bodyLen > 0 && (rawBody != null || body != null)) {
+                int written = 0;
+                if (rawBody != null) { written = await this.WriteRawBytes(channel, rawBody, bodyLen); }
+                else { written = await this.WriteStringBytes(channel, body, bodyLen); }
+                if (written != bodyLen) {
+                    throw new HttpRequestException("request body write failed");
+                }
+            }
+            HttpResponse resp = await this.ReadFramedResponse(channel.framer, path, method, watch, true);
+            if (resp == null) { this.FailMissingResponse(watch); }
+            return resp;
+        } finally {
             HttpDeadline.Disarm(watch);
-            conn.Close();
-            throw new HttpRequestException("request write failed");
+            channel.Dispose();
         }
-        if (bodyLen > 0 && body != null) {
-            int _b = await conn.SendBytesAsync(body, bodyLen);
-            if (_b != bodyLen) {
-                HttpDeadline.Disarm(watch);
-                conn.Close();
-                throw new HttpRequestException("request body write failed");
-            }
-        }
-        HttpDeadline.Touch(watch, client.ReadBudget());
-        HttpResponse resp = await client.ReadFramedResponse(conn, path, method,
-                                                          watch, null, null);
-        return resp;
     }
 
-    private static async HttpResponse SendBytesOnceWithLenAsync(HttpClient client,
-            string method, string path, string body, int bodyLen) {
-        if (client.useTls) {
-            HttpResponse tResp = await client.SendBytesTlsWithLenAsync(method, path,
-                                                                body, bodyLen);
-            return tResp;
-        }
-        TcpClient conn = await client.ConnectTarget();
-        if (conn == null) { client.FailConnect(); }
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), client.WriteBudget(), client.TotalBudget());
-        string reqHead = client.BuildRequestHead(method, path, bodyLen, true);
-        int _sent = await conn.SendBytesAsync(reqHead, reqHead.Length);
-        if (_sent != reqHead.Length) {
-            HttpDeadline.Disarm(watch);
-            conn.Close();
-            throw new HttpRequestException("request write failed");
-        }
-        if (bodyLen > 0 && body != null) {
-            int _b = await conn.SendBytesAsync(body, bodyLen);
-            if (_b != bodyLen) {
-                HttpDeadline.Disarm(watch);
-                conn.Close();
-                throw new HttpRequestException("request body write failed");
-            }
-        }
-        HttpDeadline.Touch(watch, client.ReadBudget());
-        HttpResponse resp = await client.ReadFramedResponse(conn, path, method,
-                                                          watch, null, null);
-        return resp;
-    }
-
-    // SendBytesAsync / SendBytesTlsAsync / SendBytesBodyAsync 共用的
-    // 响应读取：从已发出请求的连接上按 HttpFramer 组装解析后的响应，
-    // 超时/对端关闭/超限走异常路径。stream/ctx 非 null 表示 TLS 通道，
-    // 清理时随连接一并关闭。
-    private async HttpResponse ReadFramedResponse(TcpClient conn, string path,
-            string method, HttpDeadlineToken watch, TlsStream stream, TlsContext ctx) {
-        // 请求已上线，后续响应等待使用 read phase，而非 write phase。
-        HttpDeadline.Touch(watch, this.ReadBudget());
-        HttpFramer fr;
-        if (stream != null) {
-            fr = HttpFramerTls.Create(stream);
-        } else {
-            fr = HttpFramer.Create(conn.Sock());
-        }
-        int he = 0;
-        string head = "";
-        while (true) {
-            he = await fr.ReadHead(65536);
-            if (he == 0) {
-                bool lateHead = HttpDeadline.Expired(watch);
-                HttpDeadline.Disarm(watch);
-                this.CloseChannel(conn, fr, stream, ctx);
-                if (lateHead) { FailTimeout(); }
-                throw new HttpRequestException(
-                    "connection closed before a response arrived");
-            }
-            if (he < 0) {
-                HttpDeadline.Disarm(watch);
-                this.CloseChannel(conn, fr, stream, ctx);
-                throw new HttpRequestException(
-                    "response header block exceeds 65536 bytes");
-            }
-            head = fr.Head(he);
-            int interim = HttpClient.HeadStatus(head);
-            if (interim >= 100 && interim < 200 && interim != 101) {
-                fr.Consume(he);
-                continue;
-            }
-            break;
-        }
-        HttpResponse resp = HttpResponse.Parse(head);
-        if (resp.statusCode < 100 || !resp.ParseFraming()) {
-            HttpDeadline.Disarm(watch);
-            this.CloseChannel(conn, fr, stream, ctx);
-            throw new HttpRequestException("response framing malformed");
-        }
-        bool noBody = resp.statusCode == 204 || resp.statusCode == 304
-            || method == "HEAD";
-        if (!noBody) {
-            if (resp.framingChunked || resp.framingHasLength) {
-                int st = await fr.ReadResponseBody(resp, he,
-                    this.ResponseLimit());
-                if (st == -1) {
-                    bool lateBody = HttpDeadline.Expired(watch);
-                    HttpDeadline.Disarm(watch);
-                    this.CloseChannel(conn, fr, stream, ctx);
-                    if (lateBody) { FailTimeout(); }
-                    throw new HttpRequestException(
-                        "connection closed in the middle of the response body");
-                }
-                if (st == 413) {
-                    HttpDeadline.Disarm(watch);
-                    this.CloseChannel(conn, fr, stream, ctx);
-                    throw new HttpRequestException(
-                        "response body exceeds " + Convert.ToString(
-                            this.ResponseLimit()) + " bytes");
-                }
-                if (st != 0) {
-                    HttpDeadline.Disarm(watch);
-                    this.CloseChannel(conn, fr, stream, ctx);
-                    throw new HttpRequestException(
-                        "malformed chunked response body");
-                }
-                int n = resp.bodyBytesLen;
-                byte[] outb = new byte[n + 1];
-                if (n > 0 && resp.body != null) {
-                    NativeMemory.PutString((nint)outb, 0, resp.body, n);
-                }
-                resp.bodyBytes = outb;
-            } else {
-                // 没有 Content-Length 也没有分块：EOF 定界，读到对端
-                // 关闭为止，按字节累积。
-                ByteBuffer acc = ByteBuffer.Alloc(8192);
-                int limit = this.ResponseLimit();
-                int pend = fr.Pending();
-                int initial = pend - he;
-                if (initial > limit) {
-                    acc.Free();
-                    HttpDeadline.Disarm(watch);
-                    this.CloseChannel(conn, fr, stream, ctx);
-                    throw new HttpRequestException(
-                        "response body exceeds " + Convert.ToString(limit)
-                        + " bytes");
-                }
-                if (initial > 0) {
-                    acc.WriteRaw(fr.Slice(he, initial), initial);
-                }
-                fr.Consume(pend);
-                while (!fr.Closed()) {
-                    int nb = await fr.Fill();
-                    if (nb > 0) {
-                        if (acc.Length() > limit - nb) {
-                            acc.Free();
-                            HttpDeadline.Disarm(watch);
-                            this.CloseChannel(conn, fr, stream, ctx);
-                            throw new HttpRequestException(
-                                "response body exceeds " + Convert.ToString(limit)
-                                + " bytes");
-                        }
-                        acc.WriteRaw(fr.Slice(0, nb), nb);
-                        fr.Consume(nb);
-                    }
-                }
-                int total = acc.Length();
-                byte[] oute = acc.ToCStringBytes();
-                resp.body = acc.ToStr();
-                acc.Free();
-                resp.bodyBytes = oute;
-                resp.bodyBytesLen = total;
-            }
-        }
-        bool late = HttpDeadline.Expired(watch);
-        HttpDeadline.Disarm(watch);
-        this.CloseChannel(conn, fr, stream, ctx);
-        if (late) {
-            FailTimeout();
-        }
-        this.AbsorbCookies(path, head);
-        return resp;
-    }
-
-    // 响应读取后的统一通道清理：先拆 framer，再关 TLS 流（如有）、
-    // 连接，最后释放 TLS 上下文——与既有各变体的清理次序一致。
-    // fr 允许为 null（请求尚未发完就放弃时还没有 framer）。
-    private void CloseChannel(TcpClient conn, HttpFramer fr, TlsStream stream,
-                      TlsContext ctx) {
-        if (fr != null) { fr.Dispose(); }
-        if (stream != null) { stream.Close(); }
-        conn.Close();
-        if (ctx != null) { ctx.Free(); }
-    }
-
-    // SendBytesAsync 的 TLS 变体：握手与一次性通道一致，只是读取
-    // 走 HttpFramerTls.Create（TlsStream.RecvIntoAsync 同样给出
-    // 精确字节数）。
-    private async HttpResponse SendBytesTlsAsync(string method, string path,
-                                         string body) {
-        int bodyLen = body != null ? body.Length : 0;
-        return await this.SendBytesTlsWithLenAsync(method, path, body, bodyLen);
-    }
-
-    private async HttpResponse SendBytesTlsWithLenAsync(string method, string path,
-                                                string body, int bodyLen) {
-        Socket.Initialize();
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) { FailConnect(); }
-        TlsContext ctx;
-        if (this.clientCertificateFile.Length > 0
-            && this.clientPrivateKeyFile.Length > 0) {
-            ctx = TlsContext.CreateClientWithCertificate(
-                this.clientCertificateFile, this.clientPrivateKeyFile);
-        } else {
-            ctx = TlsContext.CreateClient();
-        }
-        if (ctx != null && this.certPolicy != null) {
-            ctx.SetCertPolicy(this.certPolicy);
-        }
-        if (ctx == null) {
-            conn.Close();
-            string tlsError = TlsStream.LastError();
-            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
-            throw new HttpRequestException(tlsError);
-        }
-        if (!this.verifyTls) {
-            ctx.DisableVerify();
-        }
-        this.ApplyPinning(ctx);
-        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
-        if (stream == null) {
-            conn.Close();
-            ctx.Free();
-            string tlsHandshakeError = TlsStream.LastError();
-            if (tlsHandshakeError == "") {
-                tlsHandshakeError = "TLS 握手失败";
-            }
-            throw new HttpRequestException(tlsHandshakeError);
-        }
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string reqHead = this.BuildRequestHead(method, path, bodyLen, true);
-        int _sent = await stream.SendAsync(reqHead, reqHead.Length);
-        if (_sent != reqHead.Length) {
-            HttpDeadline.Disarm(watch);
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-            throw new HttpRequestException("request write failed");
-        }
-        if (bodyLen > 0 && body != null) {
-            int _b = await stream.SendAsync(body, bodyLen);
-            if (_b != bodyLen) {
-                HttpDeadline.Disarm(watch);
-                stream.Close();
-                conn.Close();
-                ctx.Free();
-                throw new HttpRequestException("request body write failed");
-            }
-        }
-        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
-                                                          watch, stream, ctx);
-        return resp;
-    }
-
-    private async HttpResponse SendBytesTlsWithRawBytesAsync(string method, string path,
-                                                    byte[] body, int bodyLen) {
-        Socket.Initialize();
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) { FailConnect(); }
-        TlsContext ctx;
-        if (this.clientCertificateFile.Length > 0
-            && this.clientPrivateKeyFile.Length > 0) {
-            ctx = TlsContext.CreateClientWithCertificate(
-                this.clientCertificateFile, this.clientPrivateKeyFile);
-        } else {
-            ctx = TlsContext.CreateClient();
-        }
-        if (ctx != null && this.certPolicy != null) {
-            ctx.SetCertPolicy(this.certPolicy);
-        }
-        if (ctx == null) {
-            conn.Close();
-            string tlsError = TlsStream.LastError();
-            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
-            throw new HttpRequestException(tlsError);
-        }
-        if (!this.verifyTls) {
-            ctx.DisableVerify();
-        }
-        this.ApplyPinning(ctx);
-        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
-        if (stream == null) {
-            conn.Close();
-            ctx.Free();
-            string tlsHandshakeError = TlsStream.LastError();
-            if (tlsHandshakeError == "") {
-                tlsHandshakeError = "TLS 握手失败";
-            }
-            throw new HttpRequestException(tlsHandshakeError);
-        }
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string reqHead = this.BuildRequestHead(method, path, (long)bodyLen, true);
-        int _sent = await stream.SendAsync(reqHead, reqHead.Length);
-        if (_sent != reqHead.Length) {
-            HttpDeadline.Disarm(watch);
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-            throw new HttpRequestException("request write failed");
-        }
-        if (bodyLen > 0 && body != null) {
-            int _b = await stream.SendBytesAsync(body, bodyLen);
-            if (_b != bodyLen) {
-                HttpDeadline.Disarm(watch);
-                stream.Close();
-                conn.Close();
-                ctx.Free();
-                throw new HttpRequestException("request body write failed");
-            }
-        }
-        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
-                                                          watch, stream, ctx);
-        return resp;
-    }
-
-    // UploadFileBytesAsync 的明文通道：头部 + 文件字节 + 尾部三段式，
-    // 每段按显式字节长度发送——strlen 定长的 SendAsync 会把内嵌 NUL
-    // 后的正文截掉；Content-Length（total）与各段发送长度取自同一处
-    // （与 HttpServer 发送二进制响应同一纪律）。单句柄流式读取，
-    // 文件按 64KB 分块读取上线，进度探针随字节推进。绑定 policy 时接入字节重定向链：
-    // 3xx 原样返回仍是默认；301/302/303 改写为 GET 后实体不重放
-    // （multipart 上传无法降级），由驱动端发空 GET。
+    // Upload in three parts over the same one-shot channel: multipart prefix,
+    // file chunks, and multipart suffix. Raw uploads use empty prefix/suffix.
     private async HttpResponse SendBytesBodyAsync(string method, string path,
-            string head, string localPath, long fileLen, string tail,
-            long total) {
+            string head, string localPath, long fileLen, string tail, long total) {
         this.CheckRequestLimit(total);
         this.CheckTargetPolicy();
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) { FailConnect(); }
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         string req = this.BuildRequestHead(method, path, total, true);
-        int _h = await conn.SendBytesAsync(req, req.Length);
-        int _m = await conn.SendBytesAsync(head, head.Length);
-        if (_h != req.Length || _m != head.Length) {
-            HttpDeadline.Disarm(watch);
-            conn.Close();
-            throw new HttpRequestException("upload write failed");
-        }
-        this.UploadTick((long)(req.Length + head.Length), total);
-        nint fp = fopen(localPath, "rb");
-        if (fp == 0) {
-            HttpDeadline.Disarm(watch);
-            conn.Close();
-            throw new FileNotFoundException("Could not open file: " + localPath);
-        }
-        long offset = 0;
-        byte[] chunk = new byte[65536];
-        while (offset < fileLen) {
-            long want = fileLen - offset;
-            if (want > 65536) { want = 65536; }
-            int got = (int)fread(chunk, 1, want, fp);
-            if (got < (int)want) {
+        PooledHttpConnection channel = await this.OpenChannel(true);
+        if (channel == null) { this.FailConnect(); }
+        HttpDeadlineToken watch = null;
+        try {
+            watch = HttpDeadline.Arm(channel.conn.Sock(), this.WriteBudget(), this.TotalBudget());
+            int sent = await this.WriteStringBytes(channel, req, req.Length);
+            if (sent != req.Length) { throw new HttpRequestException("upload write failed"); }
+            int prefix = await this.WriteStringBytes(channel, head, head.Length);
+            if (prefix != head.Length) { throw new HttpRequestException("upload write failed"); }
+            this.UploadTick((long)(req.Length + head.Length), total);
+            nint fp = fopen(localPath, "rb");
+            if (fp == 0) { throw new FileNotFoundException("Could not open file: " + localPath); }
+            try {
+                long offset = 0;
+                byte[] chunk = new byte[65536];
+                while (offset < fileLen) {
+                    long want = fileLen - offset;
+                    if (want > 65536) { want = 65536; }
+                    int got = (int)fread(chunk, 1, want, fp);
+                    if (got < (int)want) {
+                        throw new HttpRequestException("file shrank while being uploaded: " + localPath);
+                    }
+                    int written = await this.WriteRawBytes(channel, chunk, got);
+                    if (written != got) { throw new HttpRequestException("upload write failed"); }
+                    HttpDeadline.Touch(watch, this.WriteBudget());
+                    offset = offset + (long)got;
+                    this.UploadTick((long)(req.Length + head.Length) + offset, total);
+                }
+            } finally {
                 fclose(fp);
-                HttpDeadline.Disarm(watch);
-                this.CloseChannel(conn, null, null, null);
-                throw new HttpRequestException(
-                    "file shrank while being uploaded: " + localPath);
             }
-            int _c = await conn.SendBytesAsync(chunk, got);
-            if (_c != got) {
-                fclose(fp);
-                HttpDeadline.Disarm(watch);
-                conn.Close();
-                throw new HttpRequestException("upload write failed");
-            }
-            HttpDeadline.Touch(watch, this.WriteBudget());
-            offset = offset + (long)got;
-            this.UploadTick((long)(req.Length + head.Length) + offset, total);
-        }
-        fclose(fp);
-        int _t = await conn.SendBytesAsync(tail, tail.Length);
-        if (_t != tail.Length) {
+            int suffix = await this.WriteStringBytes(channel, tail, tail.Length);
+            if (suffix != tail.Length) { throw new HttpRequestException("upload write failed"); }
+            this.UploadTick(total, total);
+            HttpResponse resp = await this.ReadFramedResponse(channel.framer, path, method, watch, true);
+            if (resp == null) { this.FailMissingResponse(watch); }
+            return resp;
+        } finally {
             HttpDeadline.Disarm(watch);
-            conn.Close();
-            throw new HttpRequestException("upload write failed");
+            channel.Dispose();
         }
-        this.UploadTick(total, total);
-        HttpDeadline.Touch(watch, this.ReadBudget());
-        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
-                                                          watch, null, null);
-        return resp;
-    }
-
-    // 上传通道的重定向驱动回调：只发一次真实上线。重定向跟随中动作用
-    // method 参数表达（改写后的 GET 不带实体）；原动作 POST 的实体分块
-    // 无法通过该回调重放——multipart 边界态头尾在 307/308 才需要原样
-    // 重传，而 307/308 重放由 RedirectReplay 直接拒绝（非 GET/HEAD），
-    // 因此实体分块只存在于首发路径。
-    private static async HttpResponse UploadBytesOnceAsync(HttpClient client,
-            string method, string path, string body) {
-        if (client.useTls) {
-            HttpResponse tResp = await client.SendBytesTlsAsync(method, path,
-                                                                body);
-            return tResp;
-        }
-        TcpClient conn = await client.ConnectTarget();
-        if (conn == null) { client.FailConnect(); }
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), client.WriteBudget(), client.TotalBudget());
-        string req = client.BuildRequest(method, path, body, true);
-        int _sent = await conn.SendBytesAsync(req, req.Length);
-        if (_sent != req.Length) {
-            HttpDeadline.Disarm(watch);
-            conn.Close();
-            throw new HttpRequestException("request write failed");
-        }
-        HttpDeadline.Touch(watch, client.ReadBudget());
-        HttpResponse resp = await client.ReadFramedResponse(conn, path, method,
-                                                          watch, null, null);
-        return resp;
-    }
-
-    // UploadFileBytesAsync 的 TLS 变体：握手同 SendBytesTlsAsync，
-    // 三段式正文按显式长度发送，单句柄流式读取，读取走 HttpFramerTls.Create。
-    private async HttpResponse SendBytesBodyTlsAsync(string method, string path,
-            string head, string localPath, long fileLen, string tail,
-            long total) {
-        this.CheckRequestLimit(total);
-        this.CheckTargetPolicy();
-        Socket.Initialize();
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) { FailConnect(); }
-        TlsContext ctx;
-        if (this.clientCertificateFile.Length > 0
-            && this.clientPrivateKeyFile.Length > 0) {
-            ctx = TlsContext.CreateClientWithCertificate(
-                this.clientCertificateFile, this.clientPrivateKeyFile);
-        } else {
-            ctx = TlsContext.CreateClient();
-        }
-        if (ctx != null && this.certPolicy != null) {
-            ctx.SetCertPolicy(this.certPolicy);
-        }
-        if (ctx == null) {
-            conn.Close();
-            string tlsError = TlsStream.LastError();
-            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
-            throw new HttpRequestException(tlsError);
-        }
-        if (!this.verifyTls) {
-            ctx.DisableVerify();
-        }
-        this.ApplyPinning(ctx);
-        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
-        if (stream == null) {
-            conn.Close();
-            ctx.Free();
-            string tlsHandshakeError = TlsStream.LastError();
-            if (tlsHandshakeError == "") {
-                tlsHandshakeError = "TLS 握手失败";
-            }
-            throw new HttpRequestException(tlsHandshakeError);
-        }
-        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string req = this.BuildRequestHead(method, path, total, true);
-        int _h = await stream.SendAsync(req, req.Length);
-        int _m = await stream.SendAsync(head, head.Length);
-        if (_h != req.Length || _m != head.Length) {
-            HttpDeadline.Disarm(watch);
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-            throw new HttpRequestException("upload write failed");
-        }
-        this.UploadTick((long)(req.Length + head.Length), total);
-        nint fp = fopen(localPath, "rb");
-        if (fp == 0) {
-            HttpDeadline.Disarm(watch);
-            this.CloseChannel(conn, null, stream, ctx);
-            throw new FileNotFoundException("Could not open file: " + localPath);
-        }
-        long offset = 0;
-        byte[] chunk = new byte[65536];
-        while (offset < fileLen) {
-            long want = fileLen - offset;
-            if (want > 65536) { want = 65536; }
-            int got = (int)fread(chunk, 1, want, fp);
-            if (got < (int)want) {
-                fclose(fp);
-                HttpDeadline.Disarm(watch);
-                this.CloseChannel(conn, null, stream, ctx);
-                throw new HttpRequestException(
-                    "file shrank while being uploaded: " + localPath);
-            }
-            int _c = await stream.SendBytesAsync(chunk, got);
-            if (_c != got) {
-                fclose(fp);
-                HttpDeadline.Disarm(watch);
-                stream.Close();
-                conn.Close();
-                ctx.Free();
-                throw new HttpRequestException("upload write failed");
-            }
-            HttpDeadline.Touch(watch, this.WriteBudget());
-            offset = offset + (long)got;
-            this.UploadTick((long)(req.Length + head.Length) + offset, total);
-        }
-        fclose(fp);
-        int _t = await stream.SendAsync(tail, tail.Length);
-        if (_t != tail.Length) {
-            HttpDeadline.Disarm(watch);
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-            throw new HttpRequestException("upload write failed");
-        }
-        this.UploadTick(total, total);
-        HttpDeadline.Touch(watch, this.ReadBudget());
-        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
-                                                          watch, stream, ctx);
-        return resp;
     }
 }

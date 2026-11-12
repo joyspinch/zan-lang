@@ -14,7 +14,21 @@ namespace Zan.Web.Core;
 /* 表结构 + 种子数据，启动时由 Zan.Web.Boot 一次性应用。CodeFirst (SyncStructure) 读取数据库目录发 DDL，不做每次请求触发。种子带计数保护，重复启动不变。权限仅 seed 内置角色持有哪些 action，其余从路由表派生。业务表的种子经 OnSeed 挂点由应用侧注册——模型与 DAO 都在应用里，框架不预设任何业务。*/
 public async delegate bool SeedFn(IZanSql fsql);
 
+/* 回调与 Schema 共用持约连接，必须幂等，不能关闭/归还连接或嵌套借库。
+   false 或异常终止本轮初始化；异步委托使用具名 async bool 方法组。 */
+public async delegate bool SchemaHookFn(IDbConnection db);
+
 public class Schema {
+    static SchemaHookFn beforeSchema;
+    static SchemaHookFn afterSchema;
+
+    public static void OnBeforeSchema(SchemaHookFn fn) {
+        beforeSchema = fn;
+    }
+
+    public static void OnAfterSchema(SchemaHookFn fn) {
+        afterSchema = fn;
+    }
     /* 迁移互斥租约与等待参数。租约有效期必须远大于一次完整迁移的
        时长（秒级 schema、百万行级 backfill 也远用不到 15 分钟）；
        持约进程崩溃后租约到点自动让出，不会死锁后续启动。 */
@@ -29,10 +43,12 @@ public class Schema {
         try {
             if (!await AcquireLease(db)) { return false; }
             try {
+                if (beforeSchema != null && !await beforeSchema(db)) { return false; }
                 /* 必须接住 Apply 的结果：种子失败要如实回报未就绪；
                    也绝不能用「await 后丢弃」的裸语句形态——协程改写会
                    丢掉外层返回值（编译器挂账），捕获形态无恙。 */
                 if (!await Apply(db)) { return false; }
+                if (afterSchema != null && !await afterSchema(db)) { return false; }
                 return true;
             } finally {
                 await ReleaseLease(db);
@@ -176,13 +192,13 @@ public class Schema {
 
     /* 空库仅在明确配置强口令时创建引导账号；无配置则拒绝启动。*/
     public static async bool SeedAdmin(IZanSql fsql) {
-        int have = await fsql.Select<SysUser>().CountAsync();
+        SysUserDao dao = new SysUserDao(fsql);
+        SysUser legacy = await dao.ByUsername("admin");
         string password = Cfg.Auth.bootstrapPassword;
-        if (have > 0) {
+        /* 迁入的业务账号不能替代引导账号；只按用户名判断其是否已存在。 */
+        if (legacy != null) {
             /* 旧部署若仍使用公开的初始密码，必须更换后才能继续服务。*/
-            SysUserDao dao = new SysUserDao(fsql);
-            SysUser legacy = await dao.ByUsername("admin");
-            if (legacy != null && legacy.isSuper == 1 &&
+            if (legacy.isSuper == 1 &&
                 AuthUser.Verify("admin1234", legacy.passwordSalt, legacy.passwordHash)) {
                 if (password == null || password.Length < 12 || password == "admin1234") {
                     throw new Exception("legacy admin password must be rotated with auth.bootstrapPassword or ZAN_BOOTSTRAP_ADMIN_PASSWORD");
@@ -205,19 +221,35 @@ public class Schema {
         admin.isSuper = 1;
         admin.tokenVersion = 1;
         admin.createdAt = WebApp.NowSeconds();
+        /* id 保持未赋值，让数据库身份列在迁入的显式旧 ID 之后分配。 */
         int _id = await fsql.Insert<SysUser>(admin).ExecuteIdentityAsync();
-        return _id > 0;
+        if (_id <= 0) { return false; }
+        SysUser created = await dao.ByUsername("admin");
+        return created != null && created.id == _id && created.isSuper == 1;
     }
 
     /* 两个内置角色：admin（全部管理）和 editor（仅内容管理）。bootstrap 账号绕过角色表，防止误操作锁死。具体权限由 SyncRoleGrants 从路由表填充。*/
     private static async bool SeedRoles(IZanSql fsql) {
-        int have = await fsql.Select<SysRole>().CountAsync();
-        if (have > 0) { return true; }
-        int _admin = await AddRole(fsql, "系统管理员", "admin", 1,
-            "除超级管理员外的全部管理权限", DataScope.RoleAll);
-        int _editor = await AddRole(fsql, "内容编辑", "editor", 10,
-            "只能管理博客内容", DataScope.RoleAll);
-        return _admin > 0 && _editor > 0;
+        /* 业务迁移可以先创建自己的角色。内置角色逐 code 补缺，不更新已有
+           角色或任何授权，保留运维修改与自定义角色的权限。 */
+        SysRoleDao dao = new SysRoleDao(fsql);
+        SysRole admin = await dao.ByCode("admin");
+        if (admin == null) {
+            int id = await AddRole(fsql, "系统管理员", "admin", 1,
+                "除超级管理员外的全部管理权限", DataScope.RoleAll);
+            if (id <= 0) { return false; }
+            admin = await dao.ByCode("admin");
+            if (admin == null || admin.id != id) { return false; }
+        }
+        SysRole editor = await dao.ByCode("editor");
+        if (editor == null) {
+            int id = await AddRole(fsql, "内容编辑", "editor", 10,
+                "只能管理博客内容", DataScope.RoleAll);
+            if (id <= 0) { return false; }
+            editor = await dao.ByCode("editor");
+            if (editor == null || editor.id != id) { return false; }
+        }
+        return admin.id > 0 && editor.id > 0;
     }
 
     private static async int AddRole(IZanSql fsql, string name, string code, int rank,

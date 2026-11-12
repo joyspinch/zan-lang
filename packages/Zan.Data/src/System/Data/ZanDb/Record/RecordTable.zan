@@ -53,6 +53,25 @@ public partial class RecordTable {
     public RwLock tlock;
     public nint ioMtx;
     public string lastError;
+    // Instance-local boundary observer permits real handle failures after earlier I/O succeeds.
+    internal Action<RecordTable, string> beforePersistenceIo;
+
+    private void BeforePersistenceIo(string boundary) {
+        if (this.beforePersistenceIo != null) { this.beforePersistenceIo(this, boundary); }
+    }
+
+    private void RequireIo(bool success, string operation, PageFile handle) {
+        if (success) { return; }
+        if (this.lastError == "") {
+            this.lastError = operation + ": " + (handle == null ? "missing file" : handle.GetError());
+        }
+        throw new IOException("RecordTable " + this.name + ": " + this.lastError);
+    }
+
+    private void RequireWritable() {
+        if (this.lastError != "") { throw new IOException("RecordTable " + this.name + ": " + this.lastError); }
+        this.RequireIo(this.file != null && this.file.IsOpen(), "table file is closed", this.file);
+    }
 
     // 内存软删除墓碑集
     public Dictionary<int, bool> tombstones;
@@ -133,6 +152,11 @@ public partial class RecordTable {
 
     // 打开或创建表（schema 为 null 时从已有 .ztab 元数据自动反序列化）
     public static RecordTable Open(string basePath, string name, RecordSchema schema = null) {
+        return RecordTable.OpenWithPersistenceIo(basePath, name, schema, null);
+    }
+
+    internal static RecordTable OpenWithPersistenceIo(string basePath, string name, RecordSchema schema,
+        Action<RecordTable, string> observer) {
         if (basePath == null || basePath.Length == 0) {
             throw new ArgumentException("basePath cannot be null or empty");
         }
@@ -140,6 +164,7 @@ public partial class RecordTable {
             throw new ArgumentException("invalid tableName '" + name + "': must be 1-64 characters containing only alphanumeric, '_' or '-'");
         }
         RecordTable rt = new RecordTable();
+        rt.beforePersistenceIo = observer;
         rt.name = name;
         rt.tableName = name;
         rt.basePath = basePath;
@@ -148,6 +173,7 @@ public partial class RecordTable {
         rt.idxPath = basePath + "." + name + ".zidx";
         rt.walPath = basePath + "." + name + ".zwal";
 
+        try {
         bool exists = File.Exists(rt.tabPath);
         if (exists) {
             rt.file = PageFile.OpenExisting(rt.tabPath);
@@ -269,8 +295,11 @@ public partial class RecordTable {
             rt.activeRows = 0;
 
             // 写入 Schema 块
-            rt.file.WriteAt(schemaOffset, sb.Raw(), sbytes);
-            sb.Free();
+            try {
+                rt.RequireIo(rt.file.WriteAt(schemaOffset, sb.Raw(), sbytes) == sbytes, "write schema", rt.file);
+            } finally { sb.Free(); }
+            // Empty tables must include the declared aligned schema extent before they can reopen.
+            rt.RequireIo(rt.file.Truncate(dataOffset), "extend aligned table schema", rt.file);
 
             // 写入 64 字节头部
             rt.WriteHeaderLocked();
@@ -281,7 +310,36 @@ public partial class RecordTable {
             // 初始化伴生 .zwal 预写日志
             rt.OpenOrCreateWalFileLocked();
         }
+        // Reconfirm on reopen too: a prior failed open may have left unsynced namespace entries.
+        rt.SyncOpenFilesLocked();
         return rt;
+        } catch (IOException ex) {
+            if (rt.lastError == "") { rt.lastError = "open failed: " + ex.Message; }
+            rt.Close();
+            throw;
+        } catch (InvalidOperationException ex) {
+            if (rt.lastError == "") { rt.lastError = "WAL recovery failed: " + ex.Message; }
+            rt.Close();
+            throw;
+        } finally {
+            // Validation returns retain the diagnostic but must release constructor-owned locks too.
+            if (rt.lastError != "") { rt.Close(); }
+        }
+    }
+
+    private void SyncOpenFilesLocked() {
+        this.WriteHeaderLocked();
+        this.WriteBlobHeaderLocked();
+        this.BeforePersistenceIo("create-table-sync");
+        this.RequireIo(this.file.Sync(), "sync new table", this.file);
+        this.BeforePersistenceIo("create-blob-sync");
+        this.RequireIo(this.blobFile.Sync(), "sync new blob", this.blobFile);
+        this.BeforePersistenceIo("create-wal-sync");
+        this.RequireIo(this.walFile.Sync(), "sync new WAL", this.walFile);
+        string directory = ZanStore.DirOf(this.basePath);
+        if (directory == "") { directory = "."; }
+        this.BeforePersistenceIo("create-directory-sync");
+        this.RequireIo(PageFile.DirSync(directory), "sync new table directory", null);
     }
 
     public void OpenOrCreateBlobFileLocked() {
@@ -316,14 +374,15 @@ public partial class RecordTable {
                 bh.WriteU64(32L);
                 bh.WriteU64(0L); // reserved
                 bh.WriteU64(0L);
-                this.blobFile.WriteAt(0, bh.Raw(), BLOB_HEADER_SIZE);
-                bh.Free();
+                try {
+                    this.RequireIo(this.blobFile.WriteAt(0, bh.Raw(), BLOB_HEADER_SIZE) == BLOB_HEADER_SIZE, "write blob header", this.blobFile);
+                } finally { bh.Free(); }
             }
         }
     }
 
     public void WriteBlobHeaderLocked() {
-        if (this.blobFile == null || !this.blobFile.IsOpen()) { return; }
+        this.RequireIo(this.blobFile != null && this.blobFile.IsOpen(), "blob file is closed", this.blobFile);
         ByteBuffer bh = ByteBuffer.Alloc(BLOB_HEADER_SIZE);
         bh.WriteRaw(MAGIC_BLOB, 4);
         bh.WriteU32((long)VERSION);
@@ -332,7 +391,7 @@ public partial class RecordTable {
         bh.WriteU64(0L);
         Mutex.Lock(this.ioMtx);
         try {
-            this.blobFile.WriteAt(0, bh.Raw(), BLOB_HEADER_SIZE);
+            this.RequireIo(this.blobFile.WriteAt(0, bh.Raw(), BLOB_HEADER_SIZE) == BLOB_HEADER_SIZE, "write blob header", this.blobFile);
         } finally {
             Mutex.Unlock(this.ioMtx);
             bh.Free();
@@ -353,7 +412,7 @@ public partial class RecordTable {
         h.WriteU64(0L); // reserved
         Mutex.Lock(this.ioMtx);
         try {
-            this.file.WriteAt(0, h.Raw(), HEADER_SIZE);
+            this.RequireIo(this.file.WriteAt(0, h.Raw(), HEADER_SIZE) == HEADER_SIZE, "write table header", this.file);
         } finally {
             Mutex.Unlock(this.ioMtx);
             h.Free();
@@ -362,6 +421,7 @@ public partial class RecordTable {
 
     // 打开或创建伴生 .zwal 预写日志
     public void OpenOrCreateWalFileLocked() {
+        this.BeforePersistenceIo("open-recovery");
         bool walExists = File.Exists(this.walPath);
         if (walExists) {
             this.walFile = PageFile.OpenExisting(this.walPath);
@@ -398,11 +458,32 @@ public partial class RecordTable {
                 this.ResetWalLocked();
             }
         }
+        this.RequireIo(this.walFile != null && this.walFile.IsOpen(), "open WAL", this.walFile);
+    }
+
+    private void WriteReplayRowLocked(long offset, nint bytes, int count) {
+        Mutex.Lock(this.ioMtx);
+        try {
+            this.BeforePersistenceIo("replay-table-write");
+            this.RequireIo(this.file.WriteAt(offset, bytes, count) == count, "write replay row", this.file);
+        } finally { Mutex.Unlock(this.ioMtx); }
+    }
+
+    private void RepairWalTailLocked(long offset) {
+        Mutex.Lock(this.ioMtx);
+        try {
+            this.BeforePersistenceIo("replay-tail-truncate");
+            this.RequireIo(this.walFile.Truncate(offset), "truncate torn WAL tail", this.walFile);
+            this.BeforePersistenceIo("replay-tail-sync");
+            this.RequireIo(this.walFile.Sync(), "sync repaired WAL tail", this.walFile);
+            this.walValidSize = offset;
+        } finally { Mutex.Unlock(this.ioMtx); }
     }
 
     // 重放 WAL 日志并物理截断断电留下的撕裂尾
     public void ReplayWalLocked() {
-        if (this.walFile == null || !this.walFile.IsOpen()) { return; }
+        this.RequireWritable();
+        this.RequireIo(this.walFile != null && this.walFile.IsOpen(), "WAL file is closed", this.walFile);
         long fsize = (long)this.walFile.Size();
         if (fsize < (long)WAL_HEADER_SIZE) {
             this.walValidSize = 32L;
@@ -412,44 +493,33 @@ public partial class RecordTable {
         ByteBuffer hbuf = ByteBuffer.Alloc(8);
         bool replayedAny = false;
 
+        try {
         while (off < fsize) {
             if (fsize - off < 8L) {
                 // 尾部半写撕裂帧头，截断修复
-                Mutex.Lock(this.ioMtx);
-                this.walFile.Truncate(off);
-                this.walFile.Sync();
-                Mutex.Unlock(this.ioMtx);
-                this.walValidSize = off;
+                this.RepairWalTailLocked(off);
                 break;
             }
 
-            this.walFile.ReadAt(off, hbuf, 8);
+            this.RequireIo(this.walFile.ReadAt(off, hbuf, 8) == 8, "read WAL frame header", this.walFile);
             hbuf.SeekRead(0);
             int plen = (int)hbuf.ReadU32();
             long crc = hbuf.ReadU32();
 
             if (plen <= 0 || plen > WAL_MAX_FRAME || (long)plen > fsize - off - 8L) {
                 // 尾部半写撕裂，截断修复
-                Mutex.Lock(this.ioMtx);
-                this.walFile.Truncate(off);
-                this.walFile.Sync();
-                Mutex.Unlock(this.ioMtx);
-                this.walValidSize = off;
+                this.RepairWalTailLocked(off);
                 break;
             }
 
             ByteBuffer payload = ByteBuffer.Alloc(plen);
-            this.walFile.ReadAt(off + 8L, payload, plen);
+            try {
+            this.RequireIo(this.walFile.ReadAt(off + 8L, payload, plen) == plen, "read WAL frame payload", this.walFile);
             int computedCrc = payload.Crc32(plen);
             if (computedCrc != (int)crc) {
-                payload.Free();
                 if (off + 8L + (long)plen == fsize) {
                     // 正好在末尾损坏，撕裂尾截断修复
-                    Mutex.Lock(this.ioMtx);
-                    this.walFile.Truncate(off);
-                    this.walFile.Sync();
-                    Mutex.Unlock(this.ioMtx);
-                    this.walValidSize = off;
+                    this.RepairWalTailLocked(off);
                     break;
                 } else {
                     // 中段损坏，拒绝隐蔽故障
@@ -473,9 +543,7 @@ public partial class RecordTable {
                     rdata[j] = (byte)payload.ReadU8();
                 }
                 long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
-                Mutex.Lock(this.ioMtx);
-                this.file.WriteAt(tabOff, (nint)rdata, rbytes);
-                Mutex.Unlock(this.ioMtx);
+                this.WriteReplayRowLocked(tabOff, (nint)rdata, rbytes);
                 if (id > this.totalRows) { this.totalRows = id; }
                 this.tombstones.Remove(id);
                 RecordRow r = new RecordRow(this.schema, rdata, id, true, this);
@@ -491,9 +559,7 @@ public partial class RecordTable {
                 long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
                 byte[] zeroFlag = new byte[1];
                 zeroFlag[0] = 0;
-                Mutex.Lock(this.ioMtx);
-                this.file.WriteAt(tabOff, (nint)zeroFlag, 1);
-                Mutex.Unlock(this.ioMtx);
+                this.WriteReplayRowLocked(tabOff, (nint)zeroFlag, 1);
                 replayedAny = true;
             } else if (op == OP_BATCH) {
                 int count = (int)payload.ReadU32();
@@ -506,9 +572,7 @@ public partial class RecordTable {
                             rdata[j] = (byte)payload.ReadU8();
                         }
                         long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
-                        Mutex.Lock(this.ioMtx);
-                        this.file.WriteAt(tabOff, (nint)rdata, rbytes);
-                        Mutex.Unlock(this.ioMtx);
+                        this.WriteReplayRowLocked(tabOff, (nint)rdata, rbytes);
                         if (id > this.totalRows) { this.totalRows = id; }
                         this.tombstones.Remove(id);
                         RecordRow r = new RecordRow(this.schema, rdata, id, true, this);
@@ -522,19 +586,17 @@ public partial class RecordTable {
                         long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
                         byte[] zeroFlag = new byte[1];
                         zeroFlag[0] = 0;
-                        Mutex.Lock(this.ioMtx);
-                        this.file.WriteAt(tabOff, (nint)zeroFlag, 1);
-                        Mutex.Unlock(this.ioMtx);
+                        this.WriteReplayRowLocked(tabOff, (nint)zeroFlag, 1);
                     }
                 }
                 replayedAny = true;
             }
 
-            payload.Free();
+            } finally { payload.Free(); }
             off = off + 8L + (long)plen;
             this.walValidSize = off;
         }
-        hbuf.Free();
+        } finally { hbuf.Free(); }
 
         if (replayedAny) {
             this.activeRows = this.totalRows - this.tombstones.Count;
@@ -544,7 +606,11 @@ public partial class RecordTable {
 
     // 追加带 CRC32 校验帧的 WAL 记录并强制落盘
     public void AppendWalFrameLocked(long seq, int op, ByteBuffer payload) {
-        if (this.walFile == null || !this.walFile.IsOpen()) { return; }
+        this.RequireWritable();
+        this.RequireIo(this.walFile != null && this.walFile.IsOpen(), "WAL file is closed", this.walFile);
+        this.WriteBlobHeaderLocked();
+        this.BeforePersistenceIo("blob-commit-sync");
+        this.RequireIo(this.blobFile.Sync(), "sync blob before WAL", this.blobFile);
         int plen = payload.Length();
         int crc = payload.Crc32(plen);
         ByteBuffer frame = ByteBuffer.Alloc(8 + plen);
@@ -554,9 +620,11 @@ public partial class RecordTable {
         long off = this.walValidSize;
         Mutex.Lock(this.ioMtx);
         try {
-            this.walFile.WriteAt(off, frame.Raw(), 8 + plen);
+            this.BeforePersistenceIo("wal-append-write");
+            this.RequireIo(this.walFile.WriteAt(off, frame.Raw(), 8 + plen) == 8 + plen, "append WAL frame", this.walFile);
+            this.BeforePersistenceIo("wal-append-sync");
+            this.RequireIo(this.walFile.Sync(), "sync WAL frame", this.walFile);
             this.walValidSize = off + 8L + (long)plen;
-            this.walFile.Sync();
         } finally {
             Mutex.Unlock(this.ioMtx);
             frame.Free();
@@ -565,7 +633,8 @@ public partial class RecordTable {
 
     // 重置 WAL 预写日志（在 Checkpoint / Flush 时安全截断）
     public void ResetWalLocked() {
-        if (this.walFile == null || !this.walFile.IsOpen()) { return; }
+        this.RequireWritable();
+        this.RequireIo(this.walFile != null && this.walFile.IsOpen(), "WAL file is closed", this.walFile);
         ByteBuffer h = ByteBuffer.Alloc(WAL_HEADER_SIZE);
         h.WriteRaw(MAGIC_WAL, 4);
         h.WriteU32((long)VERSION);
@@ -574,10 +643,13 @@ public partial class RecordTable {
         h.WriteU64(0L);
         Mutex.Lock(this.ioMtx);
         try {
-            this.walFile.WriteAt(0, h.Raw(), WAL_HEADER_SIZE);
-            this.walFile.Truncate(32L);
-            this.walFile.Sync();
-            this.walValidSize = 32L;
+            this.BeforePersistenceIo("wal-reset-write");
+            this.RequireIo(this.walFile.WriteAt(0, h.Raw(), WAL_HEADER_SIZE) == WAL_HEADER_SIZE, "write WAL checkpoint", this.walFile);
+            this.BeforePersistenceIo("wal-reset-truncate");
+            this.RequireIo(this.walFile.Truncate((long)WAL_HEADER_SIZE), "truncate WAL checkpoint", this.walFile);
+            this.BeforePersistenceIo("wal-reset-sync");
+            this.RequireIo(this.walFile.Sync(), "sync WAL checkpoint", this.walFile);
+            this.walValidSize = (long)WAL_HEADER_SIZE;
         } finally {
             Mutex.Unlock(this.ioMtx);
             h.Free();
@@ -588,6 +660,7 @@ public partial class RecordTable {
     public void BeginTransaction() {
         this.tlock.EnterWrite();
         try {
+            this.RequireWritable();
             this.inTx = true;
             this.txOps = new List<RecordTxOp>();
         } finally {
@@ -599,6 +672,7 @@ public partial class RecordTable {
     public void Commit() {
         this.tlock.EnterWrite();
         try {
+            this.RequireWritable();
             if (!this.inTx || this.txOps == null || this.txOps.Count == 0) {
                 this.inTx = false;
                 return;
@@ -621,8 +695,8 @@ public partial class RecordTable {
                     b.WriteRaw(op.row.data, rbytes);
                 }
             }
-            this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b);
-            b.Free();
+            try { this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b); }
+            finally { b.Free(); }
 
             // 2. 批量物理应用至 .ztab 文件
             for (int i = 0; i < n; i = i + 1) {
@@ -641,12 +715,12 @@ public partial class RecordTable {
                     RecordTxOp op = this.txOps[i];
                     long off = this.dataOffset + (long)(op.id - 1) * (long)rbytes;
                     if (op.opType == OP_ADD || op.opType == OP_UPDATE) {
-                        this.file.WriteAt(off, (nint)op.row.data, rbytes);
+                        this.RequireIo(this.file.WriteAt(off, (nint)op.row.data, rbytes) == rbytes, "apply transaction row", this.file);
                         this.IndexRowLocked(op.row);
                     } else if (op.opType == OP_DELETE) {
                         byte[] zeroFlag = new byte[1];
                         zeroFlag[0] = 0;
-                        this.file.WriteAt(off, (nint)zeroFlag, 1);
+                        this.RequireIo(this.file.WriteAt(off, (nint)zeroFlag, 1) == 1, "write tombstone", this.file);
                     }
                 }
             } finally {
@@ -697,7 +771,7 @@ public partial class RecordTable {
         }
         long off = this.blobTotalBytes;
         int len = bytes.Length;
-        this.blobFile.WriteAt(off, (nint)bytes, len);
+        this.RequireIo(this.blobFile.WriteAt(off, (nint)bytes, len) == len, "write blob", this.blobFile);
         this.blobTotalBytes = off + (long)len;
         this.WriteBlobHeaderLocked();
         blobOffset = (int)off;
@@ -771,7 +845,7 @@ public partial class RecordTable {
     public int Add(RecordRow row) {
         this.tlock.EnterWrite();
         try {
-            if (!this.IsOpen()) { throw new InvalidOperationException("RecordTable is not open: " + this.GetError()); }
+            this.RequireWritable();
             if (row == null) { throw new ArgumentException("row cannot be null"); }
             if (this.totalRows >= 2147483647 || this.totalRows < 0) {
                 throw new InvalidOperationException("RecordTable reached maximum 32-bit row limit (2,147,483,647)");
@@ -802,13 +876,13 @@ public partial class RecordTable {
             b.WriteU8(OP_ADD);
             b.WriteU32((long)id);
             b.WriteRaw(row.data, rbytes);
-            this.AppendWalFrameLocked(this.lastTxSeq, OP_ADD, b);
-            b.Free();
+            try { this.AppendWalFrameLocked(this.lastTxSeq, OP_ADD, b); }
+            finally { b.Free(); }
 
             long off = this.dataOffset + (long)(id - 1) * (long)rbytes;
             Mutex.Lock(this.ioMtx);
             try {
-                this.file.WriteAt(off, (nint)row.data, rbytes);
+                this.RequireIo(this.file.WriteAt(off, (nint)row.data, rbytes) == rbytes, "write row", this.file);
             } finally {
                 Mutex.Unlock(this.ioMtx);
             }
@@ -828,7 +902,7 @@ public partial class RecordTable {
         this.tlock.EnterWrite();
         try {
             firstId = 0;
-            if (!this.IsOpen()) { throw new InvalidOperationException("RecordTable is not open: " + this.GetError()); }
+            this.RequireWritable();
             if (rows == null || rows.Count == 0) { return; }
 
             int n = rows.Count;
@@ -861,8 +935,8 @@ public partial class RecordTable {
                 b.WriteU32((long)r.id);
                 b.WriteRaw(r.data, rbytes);
             }
-            this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b);
-            b.Free();
+            try { this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b); }
+            finally { b.Free(); }
 
             // 3. 批量物理写主表记录槽位
             Mutex.Lock(this.ioMtx);
@@ -870,7 +944,7 @@ public partial class RecordTable {
                 for (int i = 0; i < n; i = i + 1) {
                     RecordRow r = rows[i];
                     long off = this.dataOffset + (long)(r.id - 1) * (long)rbytes;
-                    this.file.WriteAt(off, (nint)r.data, rbytes);
+                    this.RequireIo(this.file.WriteAt(off, (nint)r.data, rbytes) == rbytes, "write bulk row", this.file);
                     this.IndexRowLocked(r);
                 }
             } finally {
@@ -922,13 +996,11 @@ public partial class RecordTable {
     public bool Update(int id, RecordRow row) {
         this.tlock.EnterWrite();
         try {
-            if (!this.IsOpen() || id <= 0 || id > this.totalRows || this.tombstones.ContainsKey(id)) {
+            this.RequireWritable();
+            if (id <= 0 || id > this.totalRows || this.tombstones.ContainsKey(id)) {
                 return false;
             }
             RecordRow oldRow = this.GetLocked(id);
-            if (oldRow != null) {
-                this.UnindexRowLocked(oldRow);
-            }
             row.id = id;
             row.isActive = true;
             row.table = this;
@@ -949,16 +1021,17 @@ public partial class RecordTable {
             b.WriteU8(OP_UPDATE);
             b.WriteU32((long)id);
             b.WriteRaw(row.data, rbytes);
-            this.AppendWalFrameLocked(this.lastTxSeq, OP_UPDATE, b);
-            b.Free();
+            try { this.AppendWalFrameLocked(this.lastTxSeq, OP_UPDATE, b); }
+            finally { b.Free(); }
 
             long off = this.dataOffset + (long)(id - 1) * (long)rbytes;
             Mutex.Lock(this.ioMtx);
             try {
-                this.file.WriteAt(off, (nint)row.data, rbytes);
+                this.RequireIo(this.file.WriteAt(off, (nint)row.data, rbytes) == rbytes, "write row", this.file);
             } finally {
                 Mutex.Unlock(this.ioMtx);
             }
+            if (oldRow != null) { this.UnindexRowLocked(oldRow); }
             this.IndexRowLocked(row);
             return true;
         } finally {
@@ -970,17 +1043,15 @@ public partial class RecordTable {
     public bool Delete(int id) {
         this.tlock.EnterWrite();
         try {
-            if (!this.IsOpen() || id <= 0 || id > this.totalRows || this.tombstones.ContainsKey(id)) {
+            this.RequireWritable();
+            if (id <= 0 || id > this.totalRows || this.tombstones.ContainsKey(id)) {
                 return false;
             }
             RecordRow oldRow = this.GetLocked(id);
-            if (oldRow != null) {
-                this.UnindexRowLocked(oldRow);
-            }
-            this.tombstones[id] = true;
-            this.activeRows = this.activeRows - 1;
-
             if (this.inTx) {
+                if (oldRow != null) { this.UnindexRowLocked(oldRow); }
+                this.tombstones[id] = true;
+                this.activeRows = this.activeRows - 1;
                 RecordTxOp op = new RecordTxOp(OP_DELETE, id, null);
                 this.txOps.Add(op);
                 return true;
@@ -991,8 +1062,8 @@ public partial class RecordTable {
             b.WriteU64(this.lastTxSeq);
             b.WriteU8(OP_DELETE);
             b.WriteU32((long)id);
-            this.AppendWalFrameLocked(this.lastTxSeq, OP_DELETE, b);
-            b.Free();
+            try { this.AppendWalFrameLocked(this.lastTxSeq, OP_DELETE, b); }
+            finally { b.Free(); }
 
             long off = this.dataOffset + (long)(id - 1) * (long)this.schema.rowBytes;
             byte[] zeroFlag = new byte[1];
@@ -1000,10 +1071,13 @@ public partial class RecordTable {
 
             Mutex.Lock(this.ioMtx);
             try {
-                this.file.WriteAt(off, (nint)zeroFlag, 1);
+                this.RequireIo(this.file.WriteAt(off, (nint)zeroFlag, 1) == 1, "write tombstone", this.file);
             } finally {
                 Mutex.Unlock(this.ioMtx);
             }
+            if (oldRow != null) { this.UnindexRowLocked(oldRow); }
+            this.tombstones[id] = true;
+            this.activeRows = this.activeRows - 1;
             this.WriteHeaderLocked();
             return true;
         } finally {

@@ -3,16 +3,15 @@
 后台任务队列：持久化任务存储 + 显式处理器注册 + 重试退避 + 延迟/周期调度 +
 死信与人工重试 + 状态统计。纯 Zan，无反射，无原生依赖。
 
-对标 Hangfire / Quartz.NET 的核心子集（持久化 JobStore、触发器、重试策略、
-任务历史），但**只做后台任务这一件事**：不做 cron 表达式语言、不做日历触发、
-不做集群调度、不做内置 Web 仪表板。
+提供持久化 JobStore、处理器注册、重试策略、任务历史，以及五字段 cron 调度。
+同一存储由单个调度所有者处理；不提供集群调度或内置 Web 仪表板。
 
 ## 设计取舍
 
 ### 1. 显式注册，不做反射式派发
 
-Zan 没有运行期反射，也没有"从字符串构造对象"的能力。想让持久化下来的任务名在
-重启后还能找到处理代码，唯一的办法是**启动时显式注册**：
+任务名通过显式注册表解析，不依赖反射或按类型名构造对象。要让持久化下来的任务名在
+重启后找到处理代码，应在**启动时显式注册**：
 
 ```zan
 scheduler.Register("send-email", (argsJson) => {
@@ -134,6 +133,32 @@ scheduler.Enqueue("tick", "{}");
 scheduler.ProcessOnce();   // 同步跑一轮，返回处理条数
 ```
 
+## 持久化 cron
+
+用 `CronJobs` 管理按日历触发的任务。它复用 `JobStorage`、`JobRegistry` 和同步处理器，
+可以使用 `FileJobStorage` 保存定义、下次触发、重试及执行中状态。重新注册相同定义会保留这些状态。
+
+```zan
+JobRegistry registry = new JobRegistry();
+registry.Register("report", (args) => JobResult.Success());
+FileJobStorage storage = new FileJobStorage("data/cron.jsonl");
+CronJobs cron = new CronJobs(storage, registry, RetryPolicy.Fixed(3, 60000));
+cron.Upsert("daily-report", "0 9 * * 1-5", "report", "{}");
+cron.ProcessOnce(CancellationToken.None);
+```
+
+调用方周期性驱动 `ProcessOnce`，也可用 `TriggerNow(id)` 使任务立即到期。`TryStop()`
+在派发结束后封闭调度器；活跃派发期间返回 `false`。每轮按快照检查到期记录，串行执行同步
+处理器，取消只在回调之间生效。回调成功或重试耗尽后计算当前时刻之后的下一个 UTC 匹配，
+停机错过的分钟不会逐条补跑。固定间隔的 `EnqueueRecurring` 仍沿用原有语义。
+
+`CronExpression.Parse` 和 `CronJobs.Upsert` 默认要求日和星期同时匹配。旧 Hosting cron
+用 `ParseHosting` 和持久化兼容标志，在两域都受限时取并集。旧数据不会改变匹配规则。
+
+每次回调前先写入 `Processing`；如果结果未提交，下次派发会重放同一次尝试，且不额外消耗
+重试额度。文件存储支持重开重放；回调副作用和结果写入不在同一事务中，因此需要幂等回调。
+同一存储只允许一个 cron 调度所有者。原 `JobWorker` 不领取 cron 记录。
+
 ## 并发边界
 
 - **进程内**：多个线程安全。文件存储的所有写操作走同一把进程级互斥锁。
@@ -147,25 +172,22 @@ scheduler.ProcessOnce();   // 同步跑一轮，返回处理条数
 
 ## 验证
 
-conformance `jobs_scheduler`（38 条断言）：成功路径 / 未注册任务名在入队时拒绝 /
+conformance `jobs_scheduler`：成功路径 / 未注册任务名在入队时拒绝 /
 幂等 id 冲突 / 可重试失败走 Failed→退避→重试→超上限 Dead / 不可重试直接 Dead /
 处理器抛异常按可重试处理 / 延迟任务不到点不跑 / 周期任务自动续命 / 死信人工重排 /
 删除 / 状态统计 / 指数退避数值与上限 / 强类型注册往返 / 持久化重启后继续处理 /
-压实后状态不丢。
+压实后状态不丢。另覆盖 cron 日期语义、取消、重试、执行中重放和持久化删除。
 
 ## 已知边界
 
-- **没有 cron 表达式语言**。周期调度用固定间隔；需要 cron 时用
-  `System.Hosting.Cron` 算出下次时间再调 `Schedule`。
 - **没有集群调度 / 分布式锁 / leader 选举**。
 - **没有内置仪表板**。状态查询走 `Stats()` / `List()`，接自己的 Web 面板。
 - **参数是 JSON 文本**，没有类型信息；强类型靠注册时显式给的序列化委托。
-- **周期任务每次执行是一条独立记录**（历史完整，但记录会变多，需要定期清理
+- **固定间隔任务每次执行是一条独立记录**（历史完整，但记录会变多，需要定期清理
   终结记录或 `Compact()`）。
 - **文件存储是单写者**（见「并发边界」）。
 - 存储层没有做索引，全量扫描；任务量到万级需要换实现。
 
 ## 放置
 
-`packages/Zan.Tasks.Jobs` —— 命名空间 `Tasks.Jobs`，不依赖任何其它包
-（cron 协作是可选的，调用方自己组合）。
+`packages/Zan.Jobs` —— 命名空间 `Tasks.Jobs`。不依赖 `Zan.Hosting` 或 `Zan.Data`。

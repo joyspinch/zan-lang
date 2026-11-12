@@ -194,10 +194,7 @@ public partial class TlsEngine {
                     if (statusType == 1 && ocspRespLen > 0 && ocspRespLen <= er.Remaining()) {
                         byte[] ocspDer = er.ReadBytes(ocspRespLen);
                         this.stapledOcsp = OcspResponse.Parse(ocspDer, 0, ocspDer.Length);
-                        if (this.stapledOcsp != null && this.stapledOcsp.certStatus == OcspCertStatus.Revoked) {
-                            this.Fail("对端证书已被 OCSP 吊销 (Certificate revoked by OCSP)");
-                            return -1;
-                        }
+
                     } else {
                         er.Skip(extDataLen - 4);
                     }
@@ -225,10 +222,7 @@ public partial class TlsEngine {
         if (statusType == 1 && respLen > 0 && respLen <= r.Remaining()) {
             byte[] ocspDer = r.ReadBytes(respLen);
             this.stapledOcsp = OcspResponse.Parse(ocspDer, 0, ocspDer.Length);
-            if (this.stapledOcsp != null && this.stapledOcsp.certStatus == OcspCertStatus.Revoked) {
-                this.Fail("对端证书已被 OCSP 吊销 (Certificate revoked by OCSP)");
-                return -1;
-            }
+
         }
         this.transcript.Update(fullMsg);
         return 0;
@@ -260,6 +254,15 @@ public partial class TlsEngine {
     #endif
 
     private int VerifyCertificate() {
+        // Parse only provides untrusted diagnostic fields. Signature, CertID,
+        // responder authorization and freshness are not implemented. Optional
+        // staples give NO revocation assurance; required OCSP always fails closed,
+        // even with DisableVerify or an application certificate-policy callback.
+        if (this.requireOcspStapling) {
+            this.verifyResult = 64;
+            this.Fail("required OCSP validation is unsupported (signature, CertID and freshness are not verified)");
+            return -1;
+        }
         if (this.disableVerify) {
             if (this.pinRequired && (this.pins == null || this.pins.Count == 0)) {
                 this.verifyResult = 63; this.Fail("TLS 已要求公钥固定但未配置 pin"); return -1;
@@ -272,12 +275,6 @@ public partial class TlsEngine {
                     if (this.pins[i] == disabledPin) { disabledPinMatched = true; break; }
                 }
                 if (!disabledPinMatched) { this.verifyResult = 63; this.Fail("TLS 公钥固定校验失败"); return -1; }
-            }
-            if (this.requireOcspStapling && this.stapledOcsp == null) {
-                this.verifyResult = 64; this.Fail("要求 OCSP Stapling 但对端未提供状态扩展"); return -1;
-            }
-            if (this.stapledOcsp != null && this.stapledOcsp.certStatus == OcspCertStatus.Revoked) {
-                this.verifyResult = 65; this.Fail("对端证书已被 OCSP 吊销 (Certificate revoked by OCSP)"); return -1;
             }
             this.verifyResult = 0;
             return 0;
@@ -353,12 +350,6 @@ public partial class TlsEngine {
             }
             if (!pinMatched) { this.verifyResult = 63; this.Fail("TLS 公钥固定校验失败"); return -1; }
         }
-        if (this.requireOcspStapling && this.stapledOcsp == null) {
-            this.verifyResult = 64; this.Fail("要求 OCSP Stapling 但对端未提供状态扩展"); return -1;
-        }
-        if (this.stapledOcsp != null && this.stapledOcsp.certStatus == OcspCertStatus.Revoked) {
-            this.verifyResult = 65; this.Fail("对端证书已被 OCSP 吊销 (Certificate revoked by OCSP)"); return -1;
-        }
         this.verifyResult = 0;
         return 0;
     }
@@ -418,7 +409,16 @@ public partial class TlsEngine {
     }
 
     private int HandleFinishedTls13(byte[] fullMsg, byte[] body) {
-        if (!this.disableVerify && (this.peerCert == null || !this.handshakeSignatureVerified || this.verifyResult != 0)) {
+        // This engine negotiates no PSK: Certificate and proof of possession
+        // are mandatory even when chain/hostname verification is disabled.
+        // Otherwise omitting Certificate also skips the pin/required OCSP gate.
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls13
+            || this.state != StateTls13Handshake || !this.receivedEncryptedExtensions
+            || this.peerCert == null || !this.handshakeSignatureVerified || this.verifyResult != 0
+            || this.readCipher == null || this.writeCipher == null
+            || this.handshakeSecret == null || this.handshakeSecret.Length != 32
+            || this.serverHsTraffic == null || this.serverHsTraffic.Length != 32
+            || this.clientHsTraffic == null || this.clientHsTraffic.Length != 32) {
             this.Fail("TLS 1.3 服务端身份未认证"); return -1;
         }
         // 1. 验证 Server Finished
@@ -496,7 +496,7 @@ public partial class TlsEngine {
         int sigLen = r.ReadU16();
         if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12 || this.peerCert == null
             || this.handshakeSignatureVerified || curveType != 3 || namedCurve != 29
-            || (scheme != 0x0401 && scheme != 0x0403)
+            || (scheme != 0x0401 && scheme != 0x0403 && scheme != 0x0804)
             || sigLen <= 0 || sigLen != r.Remaining() || this.clientRandom == null || this.serverRandom == null) {
             this.Fail("ServerKeyExchange 参数或签名算法不受支持"); return -1;
         }
@@ -505,14 +505,16 @@ public partial class TlsEngine {
         NativeMemory.Copy(signed, this.clientRandom, 32);
         NativeMemory.Copy((nint)signed + 32, this.serverRandom, 32);
         NativeMemory.Copy((nint)signed + 64, body, 36);
-        // 方案与服务器证书密钥类型必须一致：0x0403 只能由 EC SPKI 验证、
-        // 0x0401 只能由 RSA 证书验证，交叉一律失败关闭。
+        // TLS 1.2 可选择 ClientHello 已宣告的 rsa_pss_rsae_sha256。
+        // OpenSSL 3 默认选择 0x0804；与 0x0401 共用 RSA SPKI，0x0403 只用 EC。
         if ((scheme == 0x0403) != this.peerCert.HasEcKey()) {
             this.Fail("ServerKeyExchange 签名方案与服务器证书密钥类型不符"); return -1;
         }
         bool sigOk = false;
         if (scheme == 0x0403) {
             sigOk = this.peerCert.VerifyEcdsaSha256(signed, signature);
+        } else if (scheme == 0x0804) {
+            sigOk = this.peerCert.VerifyPssSha256(signed, signature);
         } else {
             sigOk = this.peerCert.VerifyHandshakeSignature(signed, signature);
         }
@@ -525,7 +527,9 @@ public partial class TlsEngine {
     }
 
     private int HandleServerHelloDone(byte[] fullMsg, byte[] body) {
-        if (body.Length != 0 || (!this.disableVerify && (this.peerCert == null || !this.handshakeSignatureVerified || this.verifyResult != 0))) {
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12
+            || this.state != StateTls12Handshake || body.Length != 0
+            || this.peerCert == null || !this.handshakeSignatureVerified || this.verifyResult != 0) {
             this.Fail("TLS 1.2 服务端身份未认证"); return -1;
         }
         this.transcript.Update(fullMsg);
@@ -608,6 +612,15 @@ public partial class TlsEngine {
     }
 
     private int HandleFinishedTls12(byte[] fullMsg, byte[] body) {
+        // A Finished MAC is meaningful only after the authenticated ECDHE
+        // exchange and peer CCS. In particular a null master secret must never
+        // become an attacker-computable empty-key PRF authentication result.
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12
+            || this.state != StateTls12WaitingFinished || this.readCipher == null
+            || this.tls12MasterSecret == null || this.tls12MasterSecret.Length != 48
+            || this.peerCert == null || !this.handshakeSignatureVerified || this.verifyResult != 0) {
+            this.Fail("TLS 1.2 服务端身份未认证或 Finished 阶段非法"); return -1;
+        }
         byte[] th = this.transcript.CurrentHash();
         byte[] expectedVerifyData = Hkdf.Tls12Prf(this.tls12MasterSecret, "server finished", th, 12);
         if (body.Length != 12 || expectedVerifyData == null) {

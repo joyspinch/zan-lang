@@ -40,6 +40,12 @@ public class GZip {
     // （多个 gzip 成员拼接），并跳过 FEXTRA/FNAME/FCOMMENT/FHCRC
     // 头字段。输入格式错误时返回 null。
     public static byte[] Decompress(byte[] src) {
+        return GZip.DecompressBounded(src, 268435456);
+    }
+
+    // 多成员共享输出预算；不能给每个成员重新发放完整额度。
+    public static byte[] DecompressBounded(byte[] src, int maxOut) {
+        if (src == null || maxOut <= 0 || maxOut > 268435456) { return null; }
         int pos = 0;
         List<byte[]> parts = new List<byte[]>();
         int total = 0;
@@ -48,6 +54,7 @@ public class GZip {
                 return null;  // 魔数错误或 CM 不受支持
             }
             int flg = src[pos + 3] & 255;
+            if ((flg & 224) != 0) { return null; }
             int p = pos + 10;
             if ((flg & 4) != 0) {  // FEXTRA
                 if (p + 2 > src.Length) { return null; }
@@ -63,13 +70,20 @@ public class GZip {
                 p = p + 1;
             }
             if ((flg & 2) != 0) {  // FHCRC
+                if (p > src.Length - 2) { return null; }
+                int headerCrc = Crc32.Compute(src, pos, p - pos, 0) & 65535;
+                int expectedCrc = (src[p] & 255) | ((src[p + 1] & 255) << 8);
+                if (headerCrc != expectedCrc) { return null; }
                 p = p + 2;
             }
             if (p >= src.Length) { return null; }
+            int remaining = maxOut - total;
+            // Inflate 的 0 表示默认上限；额度耗尽时只给一个探测字节。
+            int memberBudget = remaining > 0 ? remaining : 1;
             int consumed = 0;
             byte[] member = Deflate.InflateConsumed(src, p, src.Length - p,
-                268435456, ref consumed);
-            if (member == null || consumed <= 0) { return null; }
+                memberBudget, ref consumed);
+            if (member == null || consumed <= 0 || member.Length > remaining) { return null; }
             int trailer = p + consumed;
             if (trailer + 8 > src.Length) { return null; }
             int crcWant = (int)((uint)(src[trailer] & 255) |
@@ -84,6 +98,7 @@ public class GZip {
             total = total + member.Length;
             pos = trailer + 8;
         }
+        if (parts.Count == 0 || pos != src.Length) { return null; }
         byte[] all = new byte[total];
         int at = 0;
         for (int i = 0; i < parts.Count; i = i + 1) {

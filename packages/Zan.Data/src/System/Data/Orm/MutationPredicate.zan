@@ -1,0 +1,133 @@
+using System;
+using System.Text;
+using System.Data;
+namespace System.Data.Orm;
+
+// UPDATE/DELETE 的黑盒谓词在终端执行，候选读取沿用终端的同步/异步路径。
+public class MutationPredicate<T> {
+    private Meta meta;
+    private int provider;
+    private string table;
+    private string sqlCondition;
+    private List<Func<T, bool>> predicates;
+    private DbParams candidateParams;
+    private string condition;
+    private DbParams parameters;
+
+    public DbParams CandidateParams() { return this.candidateParams; }
+    public string Condition() { return this.condition; }
+
+    public MutationPredicate(Meta meta, IDbExecutor db, string table, string sqlCondition,
+            DbParams candidateParams, List<Func<T, bool>> predicates) {
+        this.meta = meta;
+        this.provider = db.GetProvider();
+        this.table = table;
+        this.sqlCondition = sqlCondition;
+        this.candidateParams = candidateParams;
+        this.predicates = new List<Func<T, bool>>();
+        if (predicates != null) { this.predicates.AddRange(predicates); }
+        this.condition = "1 = 0";
+        this.parameters = new DbParams();
+    }
+
+    public bool HasPredicates() { return this.predicates.Count > 0; }
+
+    public string Sql() {
+        if (this.meta.PkCols().Count == 0 && this.provider != DbProvider.SQLite) {
+            throw new Exception(this.meta.Entity
+                + ": lambda Where needs a primary key to target rows");
+        }
+        StringBuilder sql = new StringBuilder();
+        sql.Append("SELECT ");
+        if (this.meta.PkCols().Count == 0) { sql.Append("rowid AS zan_mutation_rowid, "); }
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            if (i > 0) { sql.Append(", "); }
+            sql.Append(Dialect.QuoteIdentifier(this.provider, this.meta.Cols[i].Col));
+        }
+        sql.Append(" FROM ");
+        sql.Append(Dialect.QuoteIdentifier(this.provider, this.table));
+        if (this.sqlCondition.Length > 0) { sql.Append(" WHERE " + this.sqlCondition); }
+        return sql.ToString();
+    }
+
+    public void Build(DbResult rows) {
+        // 清空命中是有意义的条件，绝不能退化为无 WHERE 的整表写入。
+        this.condition = "1 = 0";
+        this.parameters = new DbParams();
+        if (rows == null) { return; }
+        List<int> indices = SelectQuery<T>.ResolveColIndices(rows, this.meta);
+        List<int> hits = new List<int>();
+        for (int i = 0; i < rows.RowCount(); i = i + 1) {
+            T item = SelectQuery<T>.MapRow(rows, i, this.meta, indices);
+            bool matches = true;
+            for (int j = 0; j < this.predicates.Count; j = j + 1) {
+                Func<T, bool> predicate = this.predicates[j];
+                if (!predicate(item)) { matches = false; break; }
+            }
+            if (matches) { hits.Add(i); }
+        }
+        if (hits.Count == 0) { return; }
+        List<string> keys = this.meta.PkCols();
+        bool rowId = keys.Count == 0;
+        int keyCount = rowId ? 1 : keys.Count;
+        if ((rowId || keyCount > 1) && hits.Count > 2000 / keyCount) {
+            throw new Exception(this.meta.Entity
+                + ": lambda Where matched too many rows; use an explicit column predicate");
+        }
+        // 单主键保留 IN 的旧绑定形状；rowid/复合键保留原有 2000 参数上限。
+        if (keyCount == 1) {
+            string key = rowId ? "rowid" : keys[0];
+            int at = rows.GetColumnIndex(rowId ? "zan_mutation_rowid" : key);
+            if (at < 0) { throw new Exception("missing mutation key column: " + key); }
+            StringBuilder single = new StringBuilder();
+            single.Append(Dialect.QuoteIdentifier(this.provider, key) + " IN (");
+            for (int i = 0; i < hits.Count; i = i + 1) {
+                if (i > 0) { single.Append(", "); }
+                single.Append("?");
+                if (!rowId && this.meta.KindOf(key) == 3) {
+                    this.parameters.Add(rows.GetString(hits[i], at));
+                } else { this.parameters.AddLong(rows.GetLong(hits[i], at)); }
+            }
+            single.Append(")");
+            this.condition = single.ToString();
+            return;
+        }
+        StringBuilder sql = new StringBuilder();
+        sql.Append("(");
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            if (i > 0) { sql.Append(" OR "); }
+            sql.Append("(");
+            for (int j = 0; j < keyCount; j = j + 1) {
+                if (j > 0) { sql.Append(" AND "); }
+                string col = rowId ? "rowid" : keys[j];
+                int at = rows.GetColumnIndex(rowId ? "zan_mutation_rowid" : col);
+                if (at < 0) { throw new Exception("missing mutation key column: " + col); }
+                sql.Append(Dialect.QuoteIdentifier(this.provider, col) + " = ?");
+                if (!rowId && this.meta.KindOf(col) == 3) {
+                    this.parameters.Add(rows.GetString(hits[i], at));
+                } else {
+                    this.parameters.AddLong(rows.GetLong(hits[i], at));
+                }
+            }
+            sql.Append(")");
+        }
+        sql.Append(")");
+        this.condition = sql.ToString();
+    }
+
+    public void BindUpdate(Update target) {
+        for (int i = 0; i < this.parameters.Count(); i = i + 1) {
+            if (this.parameters.KindAt(i) == DbParams.KindText) {
+                target.P(this.parameters.TextAt(i));
+            } else { target.Pl(this.parameters.IntAt(i)); }
+        }
+    }
+
+    public void BindDelete(Delete target) {
+        for (int i = 0; i < this.parameters.Count(); i = i + 1) {
+            if (this.parameters.KindAt(i) == DbParams.KindText) {
+                target.P(this.parameters.TextAt(i));
+            } else { target.Pl(this.parameters.IntAt(i)); }
+        }
+    }
+}

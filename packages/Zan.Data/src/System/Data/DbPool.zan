@@ -24,25 +24,16 @@ namespace System.Data;
 public class DbPool : IDisposable {
     private IDbConnector connector;
     public PoolCore<IDbConnection> core;
-    private string lastOpenError;
 
     // 由各 Connector 的 <c>Pool()</c> 工厂构造。
     public DbPool(IDbConnector connector, int maxSize) {
         this.connector = connector;
         this.core = new PoolCore<IDbConnection>(maxSize);
-        this.lastOpenError = "";
     }
 
     // 经 connector 打开一个新连接。
     private async IDbConnection OpenOne() {
-        try {
-            return await this.connector.ConnectAsync();
-        } catch (Exception ex) {
-            /* 契约：借出失败折进 null（Acquire 记退避）。异常消息存给
-               Acquire 的 episode 首条诊断用。 */
-            this.lastOpenError = ex.Message;
-            return null;
-        }
+        return await this.connector.ConnectAsync();
     }
 
     // 借出一个连接：复用空闲连接，未达上限时新建，
@@ -54,64 +45,20 @@ public class DbPool : IDisposable {
     // 全站无响应）。
     // 连接池关闭后同样返回 null。
     public async IDbConnection AcquireAsync() {
-        PoolWait wait = new PoolWait();
-        while (true) {
-            if (this.core.IsClosed()) {
-                return null;
-            }
-            IDbConnection pooled = this.core.TakeIdle();
-            while (pooled != null) {
-                // 连接停放期间可能失效（服务重启、空闲
-                // 超时）：将其逐出，把名额让给等待者。
-                if (pooled.IsConnected()) {
-                    return pooled;
-                }
-                this.core.Drop(pooled);
-                pooled = this.core.TakeIdle();
-            }
-            // 上一次建连失败后退避：后端不可达时，若每次获取都重试建连，
-            // 失败本身就成了每请求的固定开销（失败的本地 open 也要约
-            // 125us），足以让命中路由的吞吐掉一个数量级。
-            if (this.core.OpenBlocked()) {
-                return null;
-            }
-            if (this.core.TryReserve()) {
-                IDbConnection opened = await this.OpenOne();
-                if (opened == null || !opened.IsConnected()) {
-                    if (opened != null) {
-                        opened.Close();
-                    }
-                    /* 契约：借出失败折进 null（下面随即记退避）。根因只在
-                       失败 episode 的首条记录诊断，退避期内零星重试静默。 */
-                    if (!this.core.OpenFailing()) {
-                        string why = this.lastOpenError;
-                        Console.WriteLine("[dbpool] connect failed: "
-                            + (why.Length > 0 ? why
-                                : "refused, timeout, or auth rejected"));
-                        this.lastOpenError = "";
-                    }
-                    this.core.NoteOpenFailed();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                if (this.core.IsClosed()) {
-                    opened.Close();
-                    this.core.UndoReserve();
-                    return null;
-                }
-                this.core.NoteOpenOk();
-                this.lastOpenError = "";
-                this.core.Borrow(opened);
-                return opened;
-            }
-            // 连接池已满：交给共享的有界等待（先事件门，后短轮询，
-            // 见 PoolWait）；预算耗尽以 null 快速失败，把「等不到连接」
-            // 局限在单个请求。
-            if (!await this.core.WaitForRelease(wait)) {
-                return null;
-            }
-        }
-        return null;
+        PoolOpenAsync<IDbConnection> open = this.OpenOne;
+        Predicate<IDbConnection> connected = DbPool.IsUsable;
+        Action<IDbConnection> close = DbPool.CloseConnection;
+        PoolOpenFailure<IDbConnection> failed = DbPool.ReportOpenFailure;
+        return await this.core.AcquireAsync(open, connected, close, failed);
+    }
+
+    static bool IsUsable(IDbConnection c) { return c.IsConnected(); }
+    static void CloseConnection(IDbConnection c) { c.Close(); }
+
+    static void ReportOpenFailure(IDbConnection c, Exception error) {
+        string why = error != null ? error.Message : "";
+        Console.WriteLine("[dbpool] connect failed: "
+            + (why.Length > 0 ? why : "refused, timeout, or auth rejected"));
     }
 
     // 将连接归还连接池。已损坏或 Close() 之后
@@ -123,11 +70,15 @@ public class DbPool : IDisposable {
             return;
         }
         if (this.core.IsClosed() || !c.IsConnected()) {
-            c.Close();
-            this.core.Drop(c);
+            this.CloseAndDrop(c);
             return;
         }
-        this.core.Pool(c);
+        if (!this.core.Pool(c)) { c.Close(); }
+    }
+
+    private void CloseAndDrop(IDbConnection c) {
+        try { c.Close(); }
+        finally { this.core.Drop(c); }
     }
 
     // 显式丢弃连接并释放槽位。
@@ -143,18 +94,9 @@ public class DbPool : IDisposable {
     // <see cref="WarmupAsync"/> 预热连接池，并把 null 视为
     // "容量已耗尽"。归还方式与借出的连接相同。
     public IDbConnection TryAcquire() {
-        if (this.core.IsClosed()) {
-            return null;
-        }
-        IDbConnection pooled = this.core.TakeIdle();
-        while (pooled != null) {
-            if (pooled.IsConnected()) {
-                return pooled;
-            }
-            this.core.Drop(pooled);
-            pooled = this.core.TakeIdle();
-        }
-        return null;
+        Predicate<IDbConnection> connected = DbPool.IsUsable;
+        Action<IDbConnection> close = DbPool.CloseConnection;
+        return this.core.TryAcquireIdle(connected, close);
     }
 
     // 最多打开 <paramref name="count"/> 个连接（上限为
@@ -166,16 +108,36 @@ public class DbPool : IDisposable {
         if (want > this.core.MaxSize()) { want = this.core.MaxSize(); }
         List<IDbConnection> opened = new List<IDbConnection>();
         int i = 0;
-        while (i < want) {
-            IDbConnection c = await this.AcquireAsync();
-            if (c == null) { break; }
-            opened.Add(c);
-            i = i + 1;
+        try {
+            while (i < want) {
+                IDbConnection c = await this.AcquireAsync();
+                if (c == null) { break; }
+                opened.Add(c);
+                i = i + 1;
+            }
+        } catch (Exception error) {
+            this.ReleaseWarmupAfterFailure(opened, 0);
+            throw;
         }
         for (int j = 0; j < opened.Count; j = j + 1) {
-            this.Release(opened[j]);
+            try { this.Release(opened[j]); }
+            catch (Exception error) {
+                // Release already consumed this entry; never retry its cleanup.
+                this.ReleaseWarmupAfterFailure(opened, j + 1);
+                throw;
+            }
         }
         return this.core.IdleCount();
+    }
+
+    private void ReleaseWarmupAfterFailure(List<IDbConnection> opened, int start) {
+        for (int j = start; j < opened.Count; j = j + 1) {
+            try { this.Release(opened[j]); }
+            catch (Exception secondary) {
+                // Keep releasing the remaining borrows without masking the first
+                // acquisition/return exception or erasing its concrete type.
+            }
+        }
     }
 
     // 空闲（已入池、可即用）连接数。
@@ -212,13 +174,30 @@ public class DbPool : IDisposable {
     // 被借出的连接会在归还时关闭。
     public void Close() {
         this.core.MarkClosed();
-        IDbConnection c = this.core.TakeIdle();
+        try {
+            IDbConnection c = this.core.TakeClosing();
+            while (c != null) {
+                try { this.CloseAndDrop(c); }
+                catch (Exception error) {
+                    // Drain the remaining entries before rethrowing the original
+                    // error with its concrete type; later cleanup cannot mask it.
+                    this.DrainAfterFailure();
+                    throw;
+                }
+                c = this.core.TakeClosing();
+            }
+        } finally { this.core.WakeAll(); }
+    }
+
+    private void DrainAfterFailure() {
+        IDbConnection c = this.core.TakeClosing();
         while (c != null) {
-            c.Close();
-            this.core.Drop(c);
-            c = this.core.TakeIdle();
+            try { this.CloseAndDrop(c); }
+            catch (Exception secondary) {
+                // The first cleanup exception is already pending in Close.
+            }
+            c = this.core.TakeClosing();
         }
-        this.core.WakeAll();
     }
 
     public void Dispose() {

@@ -9,11 +9,7 @@ namespace Ai.Mcp;
 //
 // ## 为什么只有 HTTP
 //
-// MCP 有两种传输：HTTP 与 stdio。stdio 传输要**起一个子进程**并读写
-// 它的 stdin/stdout——仓库里目前**没有进程 API**（`System.AppPath
-// .GetCurrentProcessId` 是唯一沾边的），起不来也读不了。所以客户端
-// 先落 HTTP；stdio 留到进程 API 落地后再补。协议层不受影响：传输
-// 是可插拔的，换一个 `McpTransportFn` 就行。
+// 此实现负责 HTTP；其它传输通过 McpTransportFn 注入。
 //
 // ## 出网预算
 //
@@ -32,6 +28,7 @@ public class McpHttpTransport {
     private int connectMs;
     private int readMs;
     private int totalMs;
+    private bool localEndpoint;
 
     public McpHttpTransport(McpEndpoint ep, string token) {
         this.connectMs = 10000;
@@ -51,34 +48,36 @@ public class McpHttpTransport {
             this.http.SetHeader("Authorization", "Bearer " + token);
             this.http.SetHeader("X-Api-Key", token);
         }
-        this.ApplyPolicy(ep);
+        this.localEndpoint = ep.Local();
+        this.ApplyPolicy();
     }
 
-    // 改超时（毫秒）。连接/读/总三个都要给。
-    //
-    // 改完要重新装一次 policy——`SetCallPolicy` 会重置武装中的总截止
-    // 时间，下一次请求按新的 total 重新算。
+    // 首次请求前配置；HttpClient 使用后冻结策略，失败时保留原配置。
     public void SetTimeouts(int connectMs, int readMs, int totalMs) {
+        ExternalCallPolicy policy = this.CreatePolicy(connectMs, readMs, totalMs);
+        this.http.SetCallPolicy(policy);
         this.connectMs = connectMs;
         this.readMs = readMs;
         this.totalMs = totalMs;
-        this.ApplyPolicy(null);
     }
 
-    // 装出网预算。ep 非空时按端点决定要不要放行本机 http。
-    void ApplyPolicy(McpEndpoint ep) {
+    void ApplyPolicy() {
+        this.http.SetCallPolicy(this.CreatePolicy(this.connectMs, this.readMs, this.totalMs));
+    }
+
+    private ExternalCallPolicy CreatePolicy(int connectMs, int readMs, int totalMs) {
         ExternalCallPolicy p = ExternalCallPolicy.Default()
-            .ConnectTimeout(this.connectMs)
-            .ReadTimeout(this.readMs)
-            .TotalTimeout(this.totalMs)
+            .ConnectTimeout(connectMs)
+            .ReadTimeout(readMs)
+            .TotalTimeout(totalMs)
             .RequestLimit(4 * 1024 * 1024)
             .ResponseLimit(8 * 1024 * 1024)
             .ErrorLimit(64 * 1024)
             .Redirects(0)
             .RetryNetwork(false)
             .RetryAttempts(0);
-        if (ep != null && ep.Local()) { p.AllowLocalHttp(); }
-        this.http.SetCallPolicy(p);
+        if (this.localEndpoint) { p.AllowLocalHttp(); }
+        return p;
     }
 
     // 发一次 JSON-RPC 请求。
@@ -91,8 +90,7 @@ public class McpHttpTransport {
         return new McpTransportResult(resp.statusCode, resp.body);
     }
 
-    // 关掉连接（关不掉 keep-alive 连接，池子里的连接会一直挂到进程
-    // 退出——服务端那边也是）。
+    // 关闭客户端持有的连接池。
     public void Close() {
         this.http.Close();
     }

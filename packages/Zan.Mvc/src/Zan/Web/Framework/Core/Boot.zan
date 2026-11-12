@@ -16,7 +16,7 @@ public delegate void RouteFn(WebApp app);
 /* 项目侧业务种子委托：Schema 就绪后、服务器启动前执行一次——业务表建表、
    种子数据、旧库数据迁移等。异步方法（async bool）经 async delegate 回调，
    注册：Boot.OnSeed(Program.Seed)。回调内经 AppServices.Current().Db()
-   借还连接；返回 false 只记账不阻断启动（与 Schema 失败同语义）。 */
+   借还连接；失败记为未就绪。新应用优先使用持约的 OnAfterSchema。 */
 public async delegate bool BootSeedFn();
 
 /* 项目侧 WebApp 接线委托：Boot 装配完标准件（解析器/静态挂载/中间件）
@@ -49,6 +49,23 @@ public class Boot {
 
     public static void OnSeed(BootSeedFn fn) {
         seedFn = fn;
+    }
+
+    /* 迁移与业务种子共用 Schema 的互斥租约和连接，不能在回调里另借连接。
+       before 在自动建表和系统种子之前，after 在全部系统种子之后。 */
+    public static void OnBeforeSchema(SchemaHookFn fn) {
+        Schema.OnBeforeSchema(fn);
+    }
+
+    public static void OnAfterSchema(SchemaHookFn fn) {
+        Schema.OnAfterSchema(fn);
+    }
+
+    static bool requireDataReady = false;
+
+    /* 数据是服务前提的应用在 Run 前开启：初始化失败时拒绝监听和启动后台任务。 */
+    public static void RequireDataReady() {
+        requireDataReady = true;
     }
 
     /* WebApp 应用侧接线挂点：调用时机见 AppFn 注释。 */
@@ -113,7 +130,7 @@ public class Boot {
                     + " connectivity and the migration log");
                 Console.WriteLine("[db] schema not applied (attempt "
                     + Convert.ToString(attempt) + "/3) -- retrying in 5s");
-                await Task.Delay(5000);
+                if (attempt < 3) { await Task.Delay(5000); }
             }
         }
         if (!ready) {
@@ -124,18 +141,27 @@ public class Boot {
                 + " see error log");
         }
 
-        /* 业务种子：schema 就绪后执行一次（业务建表/种子/旧库迁移）。
-           失败只记账不阻断启动——种子多数可幂等重试，应用日志可查。 */
+        /* 兼容原有自行借库的业务种子；新挂点在 Schema 租约内执行。
+           任何种子失败均保留未就绪结果，由 required 策略决定是否启动。 */
         if (ready && seedFn != null) {
             try {
                 bool seeded = await seedFn();
                 if (!seeded) {
+                    ready = false;
                     Log.Error("[seed] business seed reported failure"
                         + " -- check app log");
                 }
             } catch (Exception seedError) {
-                Log.Error("[seed] business seed hook failed");
+                ready = false;
+                Log.Error("[seed] business seed hook failed: " + seedError.Message);
             }
+        }
+        if (!ready && requireDataReady) {
+            Log.Error("[startup] required data initialization failed -- refusing to serve");
+            AppServices.Use(null);
+            try { db.Close(); }
+            finally { cache.Close(); }
+            return 1;
         }
 
         WebApp app = new WebApp(Cfg.Server.host, Cfg.Server.port);
@@ -150,11 +176,9 @@ public class Boot {
         /* 全站安全响应头，放在一切可能短路应答的中间件之前，让 403/204
            也带着这些头出门。 */
         app.Before(SecurityHeaders);
-        /* Cookie 写入必须有同源证据；不要求无 cookie 的 API 客户端
-           伪造浏览器头。double-submit CSRF 默认关闭——框架页面/脚本
-           尚未产出 _csrf 字段与 X-CSRF-Token 头，默认打开 = 全站表单
-           403；应用页面按 Csrf 类注释配齐 token 回显后，在 main.zan
-           调 Boot.EnableCsrf() 一行开启。 */
+        /* Cookie 写入必须有同源证据；无 cookie 的 API 不需伪造浏览器头。
+           double-submit 由 EnableCsrf 显式开启；框架布局的 csrf.js 回显
+           cookie 到普通表单、htmx 与同源 fetch。自定义布局须载入同一脚本。 */
         app.Before(OriginGuard);
         if (csrfEnabled) {
             app.Before(CsrfGuard);
@@ -322,7 +346,7 @@ public class Boot {
     // bearer 与无 cookie 的 API 客户端没有可被跨站滥用的环境凭证，
     // 不拦。开启后应用页面的表单须带 _csrf 隐藏域、ajax 须回显
     // X-CSRF-Token（Csrf 类注释），否则这些请求会被 403。
-    private static void EnableCsrf() {
+    public static void EnableCsrf() {
         csrfEnabled = true;
     }
 
@@ -350,7 +374,8 @@ public class Boot {
     public static bool SecurityHeaders(HttpContext ctx) {
         ctx.SetHeader("X-Content-Type-Options", "nosniff");
         ctx.SetHeader("X-Frame-Options", "DENY");
-        ctx.SetHeader("Referrer-Policy", "no-referrer");
+        // no-referrer makes native form POSTs send Origin:null under Fetch's Origin algorithm.
+        ctx.SetHeader("Referrer-Policy", "strict-origin-when-cross-origin");
         if (Cfg.Security.csp) {
             ctx.SetHeader("Content-Security-Policy",
                 "default-src 'self'; img-src 'self' data:; base-uri 'self'");

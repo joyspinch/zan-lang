@@ -212,8 +212,7 @@ public partial class HttpClient {
             this.SetHeader("Content-Type",
                 "multipart/form-data; boundary=" + boundary);
         }
-        string raw = await this.RequestAsync("POST", path, bodyStr);
-        return HttpResponse.Parse(raw);
+        return await this.RequestAsync("POST", path, bodyStr);
     }
 
     // 字节安全的 multipart/form-data 上传：
@@ -250,19 +249,11 @@ public partial class HttpClient {
                 "multipart/form-data; boundary=" + boundary);
         }
         // 先完整发送 multipart 首跳，再仅对安全改写的 GET 跟随重定向。
-        HttpResponse resp;
-        if (this.useTls) {
-            resp = await this.SendBytesBodyTlsAsync("POST", path, head,
-                                                    localPath, fileLen,
-                                                    tail, total);
-        } else {
-            resp = await this.SendBytesBodyAsync("POST", path, head,
-                                                 localPath, fileLen,
-                                                 tail, total);
-        }
+        HttpResponse resp = await this.SendBytesBodyAsync("POST", path, head,
+            localPath, fileLen, tail, total);
         if (this.callPolicy != null && this.callPolicy.MaxRedirects() > 0) {
             return await this.FollowBytesFromResponse("POST", path, "",
-                HttpClient.UploadBytesOnceAsync, resp);
+                HttpClient.SendBytesOnceAsync, resp);
         }
         return resp;
     }
@@ -297,6 +288,7 @@ public partial class HttpClient {
     // 逐跳一致。visited/hops 由入口初始化，跨跳共享防循环。
     public async int DownloadRangeOnceAsync(string path, string localPath,
             string progressFile, List<string> visited, int hops) {
+        this.FreezeSecurity();
         this.SetDownloadError("");
         int bodyLimit = 0;
         if (this.callPolicy != null) { bodyLimit = this.callPolicy.MaxBodyBytes(); }
@@ -323,51 +315,26 @@ public partial class HttpClient {
             return 0 - 1;
         }
 
-        Socket.Initialize();
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) { return 0 - 1; }
-        TlsStream stream = null;
-        TlsContext ctx = null;
-        if (this.useTls) {
-            if (this.clientCertificateFile.Length > 0
-                && this.clientPrivateKeyFile.Length > 0) {
-                ctx = TlsContext.CreateClientWithCertificate(
-                    this.clientCertificateFile, this.clientPrivateKeyFile);
-            } else {
-                ctx = TlsContext.CreateClient();
-            }
-            if (ctx == null) {
-                string tlsError3 = TlsStream.LastError();
-                if (tlsError3 == "") { tlsError3 = "TLS 上下文初始化失败"; }
-                this.SetDownloadError(tlsError3);
-                conn.Close();
-                return 0 - 1;
-            }
-            if (!this.verifyTls) { ctx.DisableVerify(); }
-            this.ApplyPinning(ctx);
-            stream = await this.ConnectTls(ctx, conn.Sock());
-            if (stream == null) {
-                string tlsHandshakeError3 = TlsStream.LastError();
-                if (tlsHandshakeError3 == "") {
-                    tlsHandshakeError3 = "TLS 握手失败";
-                }
-                this.SetDownloadError(tlsHandshakeError3);
-                conn.Close();
-                ctx.Free();
-                return 0 - 1;
-            }
+        string req = this.BuildDownloadRequest(path, (long)have);
+        PooledHttpConnection channel = null;
+        try {
+            channel = await this.OpenChannel(false);
+        } catch (HttpRequestException e) {
+            this.SetDownloadError(e.Message);
+            return 0 - 1;
         }
+        if (channel == null) { return 0 - 1; }
+        TcpClient conn = channel.conn;
+        TlsStream stream = channel.tls;
 
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string req = this.BuildDownloadRequest(path, (long)have);
         int sent = 0;
         if (this.useTls) { sent = await stream.SendAsync(req, req.Length); }
         else { sent = await conn.SendAsync(req); }
         if (sent != req.Length) {
             this.SetDownloadError("下载请求发送失败");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
         HttpDeadline.Touch(watch, this.ReadBudget());
@@ -389,8 +356,7 @@ public partial class HttpClient {
         if (hb < 0) {
             this.SetDownloadError("响应头不完整");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
 
@@ -403,8 +369,7 @@ public partial class HttpClient {
         if (status == 416) {
             bool complete = HttpClient.RangeAlreadyComplete(headOnly, (long)have);
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             if (!complete) {
                 this.SetDownloadError("416 Content-Range does not match local file");
                 return 0 - 1;
@@ -424,16 +389,14 @@ public partial class HttpClient {
                 this.SetDownloadError("HTTP 响应状态码 "
                     + Convert.ToString(status));
                 HttpDeadline.Disarm(watch);
-                if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                else { conn.Close(); }
+                channel.Dispose();
                 return 0 - 1;
             }
             string location = HttpClient.HeadHeader(headOnly, "Location");
             if (HttpResponse.HasCrlf(location)) {
                 this.SetDownloadError("redirect Location header injection rejected");
                 HttpDeadline.Disarm(watch);
-                if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                else { conn.Close(); }
+                channel.Dispose();
                 return 0 - 1;
             }
             // 相对引用按当前请求路径解析（下载通道同样是 GET 幂等重放）。
@@ -445,16 +408,14 @@ public partial class HttpClient {
                 || visited.Contains(canonical)) {
                 this.SetDownloadError("redirect target is invalid or repeated");
                 HttpDeadline.Disarm(watch);
-                if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                else { conn.Close(); }
+                channel.Dispose();
                 return 0 - 1;
             }
             visited.Add(canonical);
             if (this.useTls && !target.IsTls()) {
                 this.SetDownloadError("insecure redirect: HTTPS to HTTP downgrade forbidden");
                 HttpDeadline.Disarm(watch);
-                if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                else { conn.Close(); }
+                channel.Dispose();
                 return 0 - 1;
             }
             // 下载是 GET（幂等），301/302/303/307/308 都原样重放；跨
@@ -464,8 +425,7 @@ public partial class HttpClient {
                 && this.port == target.Port()
                 && this.useTls == target.IsTls();
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             HttpClient next = this.RedirectNextClient(this, target,
                 sameOrigin, false);
             return await next.DownloadRangeOnceAsync(
@@ -475,8 +435,7 @@ public partial class HttpClient {
         if (status < 200 || status >= 300) {
             this.SetDownloadError("HTTP 响应状态码 " + Convert.ToString(status));
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
 
@@ -498,8 +457,7 @@ public partial class HttpClient {
                 || (total > 0 && total > bodyLimit))) {
             this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
         string mode = "wb";
@@ -507,8 +465,7 @@ public partial class HttpClient {
         nint outfp = fopen(localPath, mode);
         if (outfp == 0) {
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
 
@@ -537,8 +494,7 @@ public partial class HttpClient {
                                     fclose(outfp);
                                     this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
                                     HttpDeadline.Disarm(watch);
-                                    if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                                    else { conn.Close(); }
+                                    channel.Dispose();
                                     return 0 - 1;
                                 }
                                 fwrite(piece, 1, piece.Length, outfp);
@@ -557,8 +513,7 @@ public partial class HttpClient {
                         fclose(outfp);
                         this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
                         HttpDeadline.Disarm(watch);
-                        if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                        else { conn.Close(); }
+                        channel.Dispose();
                         return 0 - 1;
                     }
                     fwrite(pending, 1, pending.Length, outfp);
@@ -585,13 +540,7 @@ public partial class HttpClient {
         fclose(outfp);
         bool late = HttpDeadline.Expired(watch);
         HttpDeadline.Disarm(watch);
-        if (this.useTls) {
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-        } else {
-            conn.Close();
-        }
+        channel.Dispose();
 
         File.WriteAllText(progressFile,
             Convert.ToString(written) + "/" + Convert.ToString(total));
@@ -623,6 +572,7 @@ public partial class HttpClient {
     // <see cref="DownloadBinaryOnceAsync"/> 发起单次可续传请求。
     public async long DownloadBinaryToFileAsync(string path, string localPath,
             string progressFile) {
+        this.FreezeSecurity();
         this.SetDownloadError("");
         this.ResetTotalBudget();
         List<string> visited = new List<string>();
@@ -637,6 +587,7 @@ public partial class HttpClient {
     // 杜绝将大文件完整读入内存导致的 OOM。支持 3xx 重定向追踪。
     public async long DownloadBinaryOnceAsync(string path, string localPath,
             string progressFile, List<string> visited, int hops) {
+        this.FreezeSecurity();
         this.SetDownloadError("");
         long bodyLimit = 0;
         if (this.callPolicy != null) { bodyLimit = (long)this.callPolicy.MaxBodyBytes(); }
@@ -661,48 +612,23 @@ public partial class HttpClient {
             return 0 - 1;
         }
 
-        Socket.Initialize();
-        TcpClient conn = await this.ConnectTarget();
-        if (conn == null) { return 0 - 1; }
-        TlsStream stream = null;
-        TlsContext ctx = null;
-        if (this.useTls) {
-            if (this.clientCertificateFile.Length > 0
-                && this.clientPrivateKeyFile.Length > 0) {
-                ctx = TlsContext.CreateClientWithCertificate(
-                    this.clientCertificateFile, this.clientPrivateKeyFile);
-            } else {
-                ctx = TlsContext.CreateClient();
-            }
-            if (ctx == null) {
-                string tlsError4 = TlsStream.LastError();
-                if (tlsError4 == "") { tlsError4 = "TLS 上下文初始化失败"; }
-                this.SetDownloadError(tlsError4);
-                conn.Close();
-                return 0 - 1;
-            }
-            if (!this.verifyTls) { ctx.DisableVerify(); }
-            this.ApplyPinning(ctx);
-            stream = await this.ConnectTls(ctx, conn.Sock());
-            if (stream == null) {
-                string tlsHandshakeError4 = TlsStream.LastError();
-                if (tlsHandshakeError4 == "") {
-                    tlsHandshakeError4 = "TLS 握手失败";
-                }
-                this.SetDownloadError(tlsHandshakeError4);
-                conn.Close();
-                ctx.Free();
-                return 0 - 1;
-            }
+        string req = this.BuildDownloadRequest(path, have);
+        PooledHttpConnection channel = null;
+        try {
+            channel = await this.OpenChannel(false);
+        } catch (HttpRequestException e) {
+            this.SetDownloadError(e.Message);
+            return 0 - 1;
         }
+        if (channel == null) { return 0 - 1; }
+        TcpClient conn = channel.conn;
+        TlsStream stream = channel.tls;
 
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string req = this.BuildDownloadRequest(path, have);
         if (this.callPolicy != null && (long)req.Length > this.callPolicy.MaxRequestBytes()) {
             this.SetDownloadError("请求体超限");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
         int sentReq = 0;
@@ -711,8 +637,7 @@ public partial class HttpClient {
         if (sentReq != req.Length) {
             this.SetDownloadError("下载请求发送失败");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
         HttpDeadline.Touch(watch, this.ReadBudget());
@@ -752,8 +677,7 @@ public partial class HttpClient {
                 this.SetDownloadError("响应头不完整");
             }
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
         string headText = head.ToString();
@@ -761,8 +685,7 @@ public partial class HttpClient {
         if (HttpClient.HeadIsChunked(headText)) {
             this.SetDownloadError("响应使用了不支持的 chunked 传输");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
         // 下载通道不解码内容编码（与 Range 通道同一口径）：落盘的要是
@@ -773,16 +696,14 @@ public partial class HttpClient {
             this.SetDownloadError("下载响应带 " + downloadEnc
                 + " 内容编码，下载通道不解码");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
 
         if (status == 416) {
             bool complete = HttpClient.RangeAlreadyComplete(headText, have);
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             if (!complete) {
                 this.SetDownloadError("416 Content-Range does not match local file");
                 return 0 - 1;
@@ -804,16 +725,14 @@ public partial class HttpClient {
                 this.SetDownloadError("HTTP 响应状态码 "
                     + Convert.ToString(status));
                 HttpDeadline.Disarm(watch);
-                if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                else { conn.Close(); }
+                channel.Dispose();
                 return 0 - 1;
             }
             string location = HttpClient.HeadHeader(headText, "Location");
             if (HttpResponse.HasCrlf(location)) {
                 this.SetDownloadError("redirect Location header injection rejected");
                 HttpDeadline.Disarm(watch);
-                if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                else { conn.Close(); }
+                channel.Dispose();
                 return 0 - 1;
             }
             // 相对引用按当前请求路径解析（下载通道同样是 GET 幂等重放）。
@@ -825,24 +744,21 @@ public partial class HttpClient {
                 || visited.Contains(canonical)) {
                 this.SetDownloadError("redirect target is invalid or repeated");
                 HttpDeadline.Disarm(watch);
-                if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                else { conn.Close(); }
+                channel.Dispose();
                 return 0 - 1;
             }
             visited.Add(canonical);
             if (this.useTls && !target.IsTls()) {
                 this.SetDownloadError("insecure redirect: HTTPS to HTTP downgrade forbidden");
                 HttpDeadline.Disarm(watch);
-                if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                else { conn.Close(); }
+                channel.Dispose();
                 return 0 - 1;
             }
             bool sameOrigin = this.RedirectHost() == target.Host()
                 && this.port == target.Port()
                 && this.useTls == target.IsTls();
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             HttpClient next = this.RedirectNextClient(this, target,
                 sameOrigin, false);
             return await next.DownloadBinaryOnceAsync(
@@ -853,8 +769,7 @@ public partial class HttpClient {
             this.SetDownloadError("HTTP 响应状态码 "
                 + Convert.ToString(status));
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
 
@@ -878,8 +793,7 @@ public partial class HttpClient {
                 || (total > 0 && total > bodyLimit))) {
             this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
         string mode = "wb";
@@ -888,8 +802,7 @@ public partial class HttpClient {
         if (outfp == 0) {
             this.SetDownloadError("无法打开本地归档文件");
             HttpDeadline.Disarm(watch);
-            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-            else { conn.Close(); }
+            channel.Dispose();
             return 0 - 1;
         }
 
@@ -910,8 +823,7 @@ public partial class HttpClient {
                     fclose(outfp);
                     this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
                     HttpDeadline.Disarm(watch);
-                    if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-                    else { conn.Close(); }
+                    channel.Dispose();
                     return 0 - 1;
                 }
                 long w = fwrite(buf, 1, n, outfp);
@@ -944,8 +856,7 @@ public partial class HttpClient {
 
         bool late = HttpDeadline.Expired(watch);
         HttpDeadline.Disarm(watch);
-        if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
-        else { conn.Close(); }
+        channel.Dispose();
         File.WriteAllText(progressFile,
             Convert.ToString(written) + "/" + Convert.ToString(total));
         if (cancelled) { return 0 - 2; }

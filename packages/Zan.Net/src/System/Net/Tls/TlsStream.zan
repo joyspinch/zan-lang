@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Collections.Generic;
+using System.Threading;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Security.Cryptography;
@@ -26,6 +28,10 @@ public class TlsStream : IDisposable {
 
     private byte[] pendingOut;
     private int pendingLen;
+    private object ioSync;
+    private bool flushBusy;
+    private byte[] flushBuffer;
+    private List<AsyncGate> flushWaiters;
     private static string lastError = "";
 
     private static int Norm(int v) {
@@ -54,6 +60,9 @@ public class TlsStream : IDisposable {
         this.scratch = null;
         this.pendingOut = null;
         this.pendingLen = 0;
+        this.ioSync = new object();
+        this.flushBusy = false;
+        this.flushWaiters = new List<AsyncGate>();
     }
 
     private static TlsStream Setup(TlsContext ctx, nint sock, string host) {
@@ -215,30 +224,75 @@ public class TlsStream : IDisposable {
         return cert.SpkiSha256Pin();
     }
 
-    private async int FlushOutAsync() {
-        if (!this.open || this.engine == null) { return -1; }
-        while (this.engine.OutNetLength() > 0) {
-            int toSend = this.engine.OutNetLength();
-            int sent = Norm(await Socket.SendBytesAsync(
-                this.sock,
-                this.engine.OutNetBuffer(),
-                this.engine.OutNetHead(),
-                toSend
-            ));
-            if (!this.open) { return -1; }
-            if (sent <= 0) { return -1; }
-            this.engine.DropOutNet(sent);
+    private async bool AcquireFlush() {
+        AsyncGate waiter = null;
+        lock (this.ioSync) {
+            if (!this.open || this.engine == null) { return false; }
+            if (!this.flushBusy) {
+                this.flushBusy = true;
+                return true;
+            }
+            waiter = new AsyncGate();
+            this.flushWaiters.Add(waiter);
         }
-        return 0;
+        await waiter.Wait();
+        waiter.Close();
+        lock (this.ioSync) { return this.open; }
+    }
+
+    private void ReleaseFlush() {
+        lock (this.ioSync) {
+            if (this.flushWaiters.Count > 0) {
+                AsyncGate waiter = this.flushWaiters[0];
+                this.flushWaiters.RemoveAt(0);
+                waiter.Signal();
+            } else {
+                this.flushBusy = false;
+            }
+        }
+    }
+
+    private async int FlushOutAsync() {
+        bool acquired = await this.AcquireFlush();
+        if (!acquired) { return -1; }
+        try {
+            while (true) {
+                int toSend = 0;
+                byte[] output = null;
+                lock (this.ioSync) {
+                    if (!this.open || this.engine == null) { return -1; }
+                    toSend = this.engine.OutNetLength();
+                    if (toSend == 0) { return 0; }
+                    // Receive may append control output while this send yields.
+                    // The socket owns this snapshot until the awaited write returns.
+                    if (this.flushBuffer == null || this.flushBuffer.Length < toSend) {
+                        this.flushBuffer = new byte[toSend];
+                    }
+                    output = this.flushBuffer;
+                    NativeMemory.Copy((nint)output,
+                        (nint)this.engine.OutNetBuffer() + (nint)this.engine.OutNetHead(), toSend);
+                    this.engine.DropOutNet(toSend);
+                }
+                int sent = Norm(await Socket.SendBytesAsync(this.sock, output, 0, toSend));
+                if (sent != toSend) { this.Close(); return -1; }
+            }
+        } catch (Exception e) {
+            this.Close();
+            return -1;
+        } finally {
+            this.ReleaseFlush();
+        }
+        return -1;
     }
 
     private async int PumpInAsync() {
-        if (!this.open || this.engine == null) { return -1; }
         int n = await Socket.RecvBytesAsync(this.sock, this.scratch, SCRATCH);
-        if (n < 0) { return -1; }
-        if (n == 0) { return 0; }
-        this.engine.FeedNetwork(this.scratch, 0, n);
-        return n;
+        lock (this.ioSync) {
+            if (!this.open || this.engine == null || n < 0) { return -1; }
+            if (n == 0) { return 0; }
+            this.engine.FeedNetwork(this.scratch, 0, n);
+            return n;
+        }
     }
 
     public async int HandshakeAsync(int timeoutMs) {
@@ -319,20 +373,23 @@ public class TlsStream : IDisposable {
         if (want > SCRATCH) { want = SCRATCH; }
 
         while (true) {
-            int step = this.engine.Step();
-            if (step < 0) { return ""; }
+            lock (this.ioSync) {
+                if (!this.open || this.engine == null) { return ""; }
+                int step = this.engine.Step();
+                if (step < 0) { return ""; }
 
-            int avail = this.engine.AvailableAppData();
-            if (avail > 0) {
-                int toRead = avail > want ? want : avail;
-                byte[] b = new byte[toRead];
-                int read = this.engine.RecvAppData(b, 0, toRead);
-                if (read > 0) {
-                    return b.ToStr(0, read);
+                int avail = this.engine.AvailableAppData();
+                if (avail > 0) {
+                    int toRead = avail > want ? want : avail;
+                    byte[] b = new byte[toRead];
+                    int read = this.engine.RecvAppData(b, 0, toRead);
+                    if (read > 0) {
+                        return b.ToStr(0, read);
+                    }
                 }
-            }
 
-            if (this.engine.IsClosed()) { return ""; }
+                if (this.engine.IsClosed()) { return ""; }
+            }
 
             int flushed = await this.FlushOutAsync();
             if (flushed < 0) { return ""; }
@@ -348,19 +405,22 @@ public class TlsStream : IDisposable {
         if (!this.open || this.engine == null || buf == null || max < 0) { return -1; }
         if (max == 0) { return 0; }
         while (true) {
-            int step = this.engine.Step();
-            if (step < 0) { return -1; }
+            lock (this.ioSync) {
+                if (!this.open || this.engine == null) { return -1; }
+                int step = this.engine.Step();
+                if (step < 0) { return -1; }
 
-            int avail = this.engine.AvailableAppData();
-            if (avail > 0) {
-                int toRead = avail > max ? max : avail;
-                int read = this.engine.RecvAppData(buf, 0, toRead);
-                if (read > 0) {
-                    return read;
+                int avail = this.engine.AvailableAppData();
+                if (avail > 0) {
+                    int toRead = avail > max ? max : avail;
+                    int read = this.engine.RecvAppData(buf, 0, toRead);
+                    if (read > 0) {
+                        return read;
+                    }
                 }
-            }
 
-            if (this.engine.IsClosed()) { return 0; }
+                if (this.engine.IsClosed()) { return 0; }
+            }
 
             int flushed = await this.FlushOutAsync();
             if (flushed < 0) { return -1; }
@@ -378,19 +438,22 @@ public class TlsStream : IDisposable {
         if (!TlsStream.ValidReceiveRange(buf.Length, offset, max)) { return -1; }
         if (max == 0) { return 0; }
         while (true) {
-            int step = this.engine.Step();
-            if (step < 0) { return -1; }
+            lock (this.ioSync) {
+                if (!this.open || this.engine == null) { return -1; }
+                int step = this.engine.Step();
+                if (step < 0) { return -1; }
 
-            int avail = this.engine.AvailableAppData();
-            if (avail > 0) {
-                int toRead = avail > max ? max : avail;
-                int read = this.engine.RecvAppData(buf, offset, toRead);
-                if (read > 0) {
-                    return read;
+                int avail = this.engine.AvailableAppData();
+                if (avail > 0) {
+                    int toRead = avail > max ? max : avail;
+                    int read = this.engine.RecvAppData(buf, offset, toRead);
+                    if (read > 0) {
+                        return read;
+                    }
                 }
-            }
 
-            if (this.engine.IsClosed()) { return 0; }
+                if (this.engine.IsClosed()) { return 0; }
+            }
 
             int flushed = await this.FlushOutAsync();
             if (flushed < 0) { return -1; }
@@ -404,9 +467,11 @@ public class TlsStream : IDisposable {
 
     // 加密并发送 len 字节字符串数据。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
     public async int SendAsync(string data, int len) {
-        if (!this.open || this.engine == null) { return -1; }
-        int r = this.engine.SendAppData(data, 0, len);
-        if (r < 0) { return -1; }
+        lock (this.ioSync) {
+            if (!this.open || this.engine == null) { return -1; }
+            int r = this.engine.SendAppData(data, 0, len);
+            if (r < 0) { return -1; }
+        }
         int flushed = await this.FlushOutAsync();
         if (flushed < 0) { return -1; }
         return len;
@@ -424,9 +489,11 @@ public class TlsStream : IDisposable {
 
     // 加密并发送字节数组切片。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
     public async int SendBytesAsync(byte[] data, int offset, int len) {
-        if (!this.open || this.engine == null) { return -1; }
-        int r = this.engine.SendAppData(data, offset, len);
-        if (r < 0) { return -1; }
+        lock (this.ioSync) {
+            if (!this.open || this.engine == null) { return -1; }
+            int r = this.engine.SendAppData(data, offset, len);
+            if (r < 0) { return -1; }
+        }
         int flushed = await this.FlushOutAsync();
         if (flushed < 0) { return -1; }
         return len;
@@ -440,9 +507,11 @@ public class TlsStream : IDisposable {
 
     // 加密并发送裸指针内存切片。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
     public async int SendPtrAsync(nint ptr, int len) {
-        if (!this.open || this.engine == null || len <= 0 || ptr == (nint)0) { return 0; }
-        int r = this.engine.SendAppData(ptr, len);
-        if (r < 0) { return -1; }
+        lock (this.ioSync) {
+            if (!this.open || this.engine == null || len <= 0 || ptr == (nint)0) { return 0; }
+            int r = this.engine.SendAppData(ptr, len);
+            if (r < 0) { return -1; }
+        }
         int flushed = await this.FlushOutAsync();
         if (flushed < 0) { return -1; }
         return len;
@@ -467,8 +536,15 @@ public class TlsStream : IDisposable {
     public void Close() {
         HttpDeadline.Disarm(this.watch);
         this.watch = null;
-        this.open = false;
-        this.engine = null;
+        lock (this.ioSync) {
+            this.open = false;
+            this.engine = null;
+            while (this.flushWaiters.Count > 0) {
+                AsyncGate waiter = this.flushWaiters[0];
+                this.flushWaiters.RemoveAt(0);
+                waiter.Signal();
+            }
+        }
     }
 
     public void Dispose() {

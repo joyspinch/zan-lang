@@ -47,6 +47,29 @@ public class Select {
         return new Select(db, meta);
     }
 
+    // Freeze SQL inputs before the executor can suspend. A later builder mutation
+    // must not change either the generated statement or its bound values.
+    internal Select Snapshot() {
+        Select copy = new Select(this.db, this.meta);
+        copy.tbl = this.tbl;
+        copy.w = this.w;
+        copy.ob = this.ob;
+        copy.gb = this.gb;
+        copy.h = this.h;
+        copy.distinct = this.distinct;
+        copy.limN = this.limN;
+        copy.offN = this.offN;
+        copy.on = this.on;
+        copy.forUpdate = this.forUpdate;
+        for (int i = 0; i < this.navOn.Count; i = i + 1) {
+            copy.navOn[i] = this.navOn[i];
+        }
+        for (int i = 0; i < this.ps.Count(); i = i + 1) {
+            copy.ps.push(this.ps.KindAt(i), this.ps.TextAt(i), this.ps.IntAt(i), this.ps.DoubleAt(i));
+        }
+        return copy;
+    }
+
     // 实体元数据（类型化门面读取列信息用）。
     public Meta Meta() { return this.meta; }
     // 当前积累的 WHERE 参数（类型化门面直接执行时复用）。
@@ -88,7 +111,7 @@ public class Select {
     // 构建期现形，不能落成 `t.未知列` 等数据库报错。
     public void WExpr(ExprNode root) {
         if (!this.on) { return; }
-        if (root == null) { return; }
+        ExprSql.Validate(root);
         this.BindTreeCols(root);
         StringBuilder sb = new StringBuilder();
         ExprSql.Build(root, sb, this.ps);
@@ -158,34 +181,6 @@ public class Select {
     public void Pl(long v) { if (this.on) { this.ps.AddLong(v); } }
     // WHERE 浮点参数。
     public void Pd(double v) { if (this.on) { this.ps.AddDouble(v); } }
-
-    // IN 列表参数（配合 W 片段里的 "t.col IN (?)"）。
-    public void InI(List<int> vs) {
-        if (!this.on) { return; }
-        int i = 0;
-        while (i < vs.Count) { this.ps.AddInt(vs[i]); i = i + 1; }
-    }
-
-    // <see cref="InI"/> 的 long 版本。
-    public void InL(List<long> vs) {
-        if (!this.on) { return; }
-        int i = 0;
-        while (i < vs.Count) { this.ps.AddLong(vs[i]); i = i + 1; }
-    }
-
-    // <see cref="InI"/> 的 string 版本。
-    public void InS(List<string> vs) {
-        if (!this.on) { return; }
-        int i = 0;
-        while (i < vs.Count) { this.ps.Add(vs[i]); i = i + 1; }
-    }
-
-    // <see cref="InI"/> 的 double 版本。
-    public void InD(List<double> vs) {
-        if (!this.on) { return; }
-        int i = 0;
-        while (i < vs.Count) { this.ps.AddDouble(vs[i]); i = i + 1; }
-    }
 
     /* ---- 值自带条件原语：应用层拼条件的唯一入口 ----
      * 条件与其值在同一次调用里原子绑定，片段与参数没有分开传递的
@@ -426,11 +421,16 @@ public class Select {
 
     // 把 WHERE/GROUP BY/HAVING/ORDER BY 片段追加到 SELECT 文本之后。
     public string BuildTail() {
+        string s = this.BuildConditions();
+        if (this.ob.Length > 0) { s = s + " ORDER BY " + this.ob; }
+        return s;
+    }
+
+    string BuildConditions() {
         string s = "";
         if (this.w.Length > 0) { s = s + " WHERE " + this.w; }
         if (this.gb.Length > 0) { s = s + " GROUP BY " + this.gb; }
         if (this.h.Length > 0) { s = s + " HAVING " + this.h; }
-        if (this.ob.Length > 0) { s = s + " ORDER BY " + this.ob; }
         return s;
     }
 
@@ -472,22 +472,30 @@ public class Select {
         sb.Append(this.BuildLimitOffset());
     }
 
-    // 实体行的 SELECT。分页写法按方言：SQL Server/Oracle 用
-    // OFFSET ... FETCH（且必须有 ORDER BY）。
-    public string BuildSelect() {
-        string s = "SELECT ";
-        if (this.distinct) { s = s + "DISTINCT "; }
+    string BuildColumns() {
+        string s = this.distinct ? "DISTINCT " : "";
         s = s + this.meta.SelectList(this.Provider());
         for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
             if (this.navOn[i]) { s = s + this.meta.Navs[i].SelectList(this.Provider()); }
         }
-        s = s + " FROM " + Dialect.QuoteIdentifier(this.Provider(), this.tbl) + " t";
-        if (this.forUpdate && this.db != null && this.db.GetProvider() == DbProvider.SqlServer) {
+        return s;
+    }
+
+    string BuildFrom(bool lockRows) {
+        string s = " FROM " + Dialect.QuoteIdentifier(this.Provider(), this.tbl) + " t";
+        if (lockRows && this.forUpdate && this.db != null && this.db.GetProvider() == DbProvider.SqlServer) {
             s = s + " WITH (UPDLOCK, ROWLOCK)";
         }
         for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
             if (this.navOn[i]) { s = s + this.meta.Navs[i].Join(); }
         }
+        return s;
+    }
+
+    // 实体行的 SELECT。分页写法按方言：SQL Server/Oracle 用
+    // OFFSET ... FETCH（且必须有 ORDER BY）。
+    public string BuildSelect() {
+        string s = "SELECT " + this.BuildColumns() + this.BuildFrom(true);
         s = s + this.BuildTail();
         s = s + this.BuildLimitOffset();
         if (this.forUpdate && this.db != null) {
@@ -585,17 +593,11 @@ public class Select {
     // 派生表必须带别名——MySQL/PostgreSQL/SQL Server 对无别名
     // 的子查询直接报语法错；Oracle 不允许 AS 关键字。
     public string BuildCount() {
-        string s = "SELECT COUNT(*) FROM (SELECT 1 FROM " + Dialect.QuoteIdentifier(this.Provider(), this.tbl) + " t";
-        if (this.w.Length > 0) { s = s + " WHERE " + this.w; }
-        s = s + " GROUP BY " + this.gb;
-        if (this.h.Length > 0) { s = s + " HAVING " + this.h; }
-        int pv = this.db.GetProvider();
-        if (pv == DbProvider.Oracle) {
-            s = s + ") cnt";
-        } else {
-            s = s + ") AS cnt";
-        }
-        return s;
+        string from = this.BuildFrom(false) + this.BuildConditions();
+        if (this.gb.Length == 0 && !this.distinct) { return "SELECT COUNT(*)" + from; }
+        string cols = this.distinct && this.gb.Length == 0 ? this.BuildColumns() : "1";
+        string alias = this.Provider() == DbProvider.Oracle ? " cnt" : " AS cnt";
+        return "SELECT COUNT(*) FROM (SELECT " + cols + from + ")" + alias;
     }
 
     // 聚合 SELECT 的语句文本（表达式如 "COUNT(*)"、"SUM(t.n)"），
@@ -663,23 +665,14 @@ public class Select {
 
     // 匹配的行数（分组查询时数分组数）。
     public int Count() {
-        if (this.gb.Length > 0) {
-            DbResult r = this.db.Query(this.BuildCount(), this.ps);
-            if (r == null || r.RowCount() == 0) { return 0; }
-            return r.GetInt(0, 0);
-        }
-        return this.AggI("COUNT(*)");
+        DbResult r = this.db.Query(this.BuildCount(), this.ps);
+        return r == null || r.RowCount() == 0 ? 0 : r.GetInt(0, 0);
     }
 
     // 异步行数。
     public async int CountAsync() {
-        if (this.gb.Length > 0) {
-            string sql = this.BuildCount();
-            DbResult r = await this.db.QueryAsync(sql, this.ps);
-            if (r == null || r.RowCount() == 0) { return 0; }
-            return r.GetInt(0, 0);
-        }
-        return await this.AggIAsync("COUNT(*)");
+        DbResult r = await this.db.QueryAsync(this.BuildCount(), this.ps);
+        return r == null || r.RowCount() == 0 ? 0 : r.GetInt(0, 0);
     }
 
     // 是否存在匹配行。

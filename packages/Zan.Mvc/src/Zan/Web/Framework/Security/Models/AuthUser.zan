@@ -28,8 +28,17 @@ public class AuthUser {
        新写入一律走 <see cref="NewHash"/> 的 PBKDF2 自描述格式。*/
     public static string PasswordHash(string password, string salt) {
         int saltLen = salt.Length;
-        /* 缓冲：材料(<=64 hex) + ":" + salt */
-        nint buf = NativeMemory.Alloc(64 + 1 + saltLen + 1);
+        int pwLen = password.Length;
+        /* 第一轮为 salt:password:salt，后续为 64 hex:salt。
+           先用 long 算长度，拒绝 int 分配长度溢出；不限制既存凭证长度。 */
+        long firstBytes = (long)pwLen + (long)saltLen * 2 + 2;
+        long roundBytes = 64 + (long)saltLen + 1;
+        long capacity = firstBytes > roundBytes ? firstBytes : roundBytes;
+        if (capacity >= 2147483647) {
+            throw new ArgumentException("legacy password material is too large");
+        }
+        nint buf = NativeMemory.Alloc((int)capacity + 1);
+        nint tbl = 0;
         try {
             NativeMemory.PutString(buf, 0, salt, saltLen);
             NativeMemory.PutString(buf, saltLen, ":", 1);
@@ -37,7 +46,7 @@ public class AuthUser {
             int len = saltLen + 1 + password.Length;
             Span<byte> hex = new Span<byte>(buf, 65);
             /* 16 进制半字节表，Span 直读直写 */
-            nint tbl = NativeMemory.Alloc(16);
+            tbl = NativeMemory.Alloc(16);
             NativeMemory.PutString(tbl, 0, "0123456789abcdef", 16);
             Span<byte> dt = new Span<byte>(tbl, 16);
             for (int i = 0; i < 12000; i = i + 1) {
@@ -51,10 +60,10 @@ public class AuthUser {
                 }
                 len = 64;
             }
-            NativeMemory.Free(tbl);
             /* 最后一轮的 hex 摘要就在缓冲前 64 字节 */
             return NativeMemory.GetString(buf, 0, 64);
         } finally {
+            if (tbl != 0) { NativeMemory.Free(tbl); }
             NativeMemory.Free(buf);
         }
     }
@@ -141,10 +150,8 @@ public class AuthUser {
             NewHash(password), WebApp.NowSeconds());
     }
 
-    /* 账号当前 token 版本号；无法登录时返回 -1。token 版本不同即作废，token 本身不含密码材料。
-       版本号走短 TTL 缓存：每个带 cookie 的请求都要校验一次，直查数据库会让
-       每个认证请求消耗两次池借用，白白加倍池压力。代价是 bump tokenVersion
-       后旧 token 最迟再有效 VerTtlSec 秒——对管理动作足够快，且 Forget 时主动失效。*/
+    /* 保留版本缓存操作供既有调用方使用；认证必须读取数据库中的当前版本和状态。
+       进程内缓存无法同步其他 worker 的撤销，也可能被已开始的旧查询回填。*/
     public static const int VerTtlSec = 30;
 
     private static List<AuthTokenVersionEntry> verEntries = new List<AuthTokenVersionEntry>();
@@ -191,14 +198,10 @@ public class AuthUser {
         }
     }
 
+    /* 撤销后的下一次认证以持久化版本为准，不信任短 TTL 的进程缓存。 */
     public static async int TokenVersion(string uid) {
-        int now = WebApp.NowSeconds();
-        int cached = CachedVersion(uid, now);
-        if (cached >= 0) { return cached; }
         SysUser row = await ById(uid);
-        /* 负结果不缓存：禁用/删除必须尽快生效，且这类查询不在热路径上。 */
         if (row == null || row.status != Active) { return -1; }
-        StoreVersion(uid, row.tokenVersion, now);
         return row.tokenVersion;
     }
 

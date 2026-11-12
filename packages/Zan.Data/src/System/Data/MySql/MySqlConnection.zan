@@ -112,42 +112,44 @@ public partial class MySqlConnection : IDbConnection {
     // 读取一个协议数据包，返回其负载，并将长度写入
     // <c>lastLen</c>（负载是二进制，从不当作
     // NUL 结尾的字符串读取）。同时设置 <c>lastSeq</c>。连接关闭时返回 null。
-    // 支持 MySQL 协议大于 16MB (0xFFFFFF) 的多包分片流式拼装。
+    // Continuations share a 64 MiB logical-message budget; a zero-length
+    // terminator is valid even at the budget. An incomplete message cannot
+    // leave a reusable session or return its already-received prefix.
     internal async byte[] readPacket() {
         byte[] hdr = new byte[5];
-        int got = await this.recvExact(hdr, 0, 4);
-        if (got < 4) { this.lastLen = -1; return null; }
-        int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
-        this.lastSeq = hdr[3] & 255;
-        this.lastLen = len;
-        byte[] pay = new byte[len + 1];
-        if (len > 0) {
-            int g2 = await this.recvExact(pay, 0, len);
-            if (g2 < len) { this.lastLen = -1; return null; }
-        }
-        if (len == 16777215) {
-            int totalLen = len;
-            while (len == 16777215) {
-                int gotH = await this.recvExact(hdr, 0, 4);
-                if (gotH < 4) { break; }
-                len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
+        byte[] pay = new byte[1];
+        int totalLen = 0;
+        this.lastLen = -1;
+        bool complete = false;
+        try {
+            while (true) {
+                int got = await this.recvExact(hdr, 0, 4);
+                if (got < 4) { this.lastError = "truncated MySQL packet header"; return null; }
+                int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
                 this.lastSeq = hdr[3] & 255;
-                byte[] nextChunk = new byte[len + 1];
-                if (len > 0) {
-                    int g3 = await this.recvExact(nextChunk, 0, len);
-                    if (g3 < len) { break; }
+                int nextLen = MySqlPacketBounds.AppendLength(totalLen, len);
+                if (nextLen < 0) {
+                    this.lastError = "MySQL message exceeds 64 MiB receive limit";
+                    return null;
                 }
-                byte[] merged = new byte[totalLen + len + 1];
-                NativeMemory.Copy((nint)merged, (nint)pay, totalLen);
                 if (len > 0) {
-                    NativeMemory.Copy((nint)merged + (nint)totalLen, (nint)nextChunk, len);
+                    byte[] merged = new byte[nextLen + 1];
+                    if (totalLen > 0) { NativeMemory.Copy((nint)merged, (nint)pay, totalLen); }
+                    pay = merged;
+                    int body = await this.recvExact(pay, totalLen, len);
+                    if (body < len) { this.lastError = "truncated MySQL packet body"; return null; }
                 }
-                pay = merged;
-                totalLen = totalLen + len;
+                totalLen = nextLen;
+                if (len < MySqlPacketBounds.MaxChunkBytes) {
+                    this.lastLen = totalLen;
+                    complete = true;
+                    return pay;
+                }
             }
-            this.lastLen = totalLen;
+        } finally {
+            // Any failed/throwing read leaves framing uncertain; never pool it.
+            if (!complete) { this.Close(); }
         }
-        return pay;
     }
 
     // 以给定序列号写入一个协议数据包（4 字节头 + 负载）
@@ -429,18 +431,22 @@ public partial class MySqlConnection : IDbConnection {
         // --- TLS 升级（secure=true 时）：SSLRequest(序号 1) 后整条
         // 通道换 TLS，握手响应(序号 2)起全部走加密流。服务器不报
         // CLIENT_SSL 即显式失败——绝不静默降级明文。
+        // SSLRequest and HandshakeResponse41 must advertise the same capabilities.
+        // CLIENT_FOUND_ROWS keeps affected-row semantics consistent with SQLite.
+        int caps = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288;
+        bool hasDb = db.Length > 0;
+        if (hasDb) { caps = caps | 8; }
+        if (secure) { caps = caps | 2048; }
         int loginSeq = 1;
         if (secure) {
             if ((serverCaps & 2048) == 0) {
                 this.lastError = "server does not support TLS (no CLIENT_SSL)";
                 return false;
             }
-            int sslCaps = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288 | 2048;
-            if (db.Length > 0) { sslCaps = sslCaps | 8; }
             byte[] sslreq = new byte[33];
-            sslreq[0]=(byte)(sslCaps&255); sslreq[1]=(byte)((sslCaps>>8)&255);
-            sslreq[2]=(byte)((sslCaps>>16)&255); sslreq[3]=(byte)((sslCaps>>24)&255);
-            sslreq[4]=(byte)255; sslreq[5]=(byte)255; sslreq[6]=(byte)255; sslreq[7]=(byte)0;
+            sslreq[0]=(byte)(caps&255); sslreq[1]=(byte)((caps>>8)&255);
+            sslreq[2]=(byte)((caps>>16)&255); sslreq[3]=(byte)((caps>>24)&255);
+            MySqlPacketBounds.Advertise(sslreq, 4);
             sslreq[8]=(byte)45;  // utf8mb4_general_ci
             int z = 9;
             while (z < 32) { sslreq[z] = 0; z = z + 1; }
@@ -463,12 +469,6 @@ public partial class MySqlConnection : IDbConnection {
             loginSeq = 2;  // greeting 0 + SSLRequest 1
         }
         // --- 构建并发送握手响应（明文=序号 1 / TLS=序号 2） ---
-        // CLIENT_FOUND_ROWS（2）：UPDATE/DELETE 报告匹配的行数（与
-        // SQLite 一致），而非仅变更行数 —— 使受影响行数校验
-        // 在各引擎间保持一致。
-        int caps = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288;
-        bool hasDb = db.Length > 0;
-        if (hasDb) { caps = caps | 8; }  // CLIENT_CONNECT_WITH_DB
         List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
         byte[] token = authToken(plugin, pw, nonce, tokenLenOut);
         int tokenLen = tokenLenOut[0];
@@ -483,7 +483,7 @@ public partial class MySqlConnection : IDbConnection {
         byte[] resp = new byte[respLen + 1];
         int q = 0;
         resp[q] = (byte)(caps&255); resp[q+1] = (byte)((caps>>8)&255); resp[q+2] = (byte)((caps>>16)&255); resp[q+3] = (byte)((caps>>24)&255); q=q+4;
-        resp[q] = (byte)(0); resp[q+1] = (byte)(0); resp[q+2] = (byte)(0); resp[q+3] = (byte)(1); q=q+4;  // 最大数据包 16M
+        MySqlPacketBounds.Advertise(resp, q); q=q+4;
         resp[q] = (byte)(45); q=q+1;  // 字符集 utf8mb4_general_ci
         q = q + 23;  // 23 字节填充（零）
         i = 0; while (i < userLen) { resp[q+i] = (byte)(user[i] & 255); i = i + 1; } q = q + userLen;

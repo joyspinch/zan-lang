@@ -203,11 +203,17 @@ public class WebApp : IDisposable {
         this.certFile = certFile;
         this.keyFile = keyFile;
         this.tls = TlsContext.CreateServer(certFile, keyFile);
-        return this;
+        return this.UseTls(this.tls);
     }
 
     // 注入现有的服务端 TLS 上下文。
     public WebApp UseTls(TlsContext ctx) {
+        // This listener dispatches both HTTP versions; advertise them before the handshake.
+        // Preserve an explicit application protocol policy on injected contexts.
+        if (ctx != null && ctx.alpnProtocols.Count == 0) {
+            ctx.alpnProtocols.Add("h2");
+            ctx.alpnProtocols.Add("http/1.1");
+        }
         this.tls = ctx;
         return this;
     }
@@ -595,6 +601,11 @@ public class WebApp : IDisposable {
             return false;
         }
         long _back = this.activeConnections.Decrement();
+        if (this.IsHttps()) {
+            // Refuse the connection before handshake without putting plaintext on TLS.
+            Socket.Close(clientSock);
+            return true;
+        }
         TcpClient c = TcpClient.FromSocket(clientSock);
         int _s = await c.SendAsync(WebApp.SimpleResponse(503,
             "Service Unavailable", "server is at capacity"));
@@ -602,123 +613,26 @@ public class WebApp : IDisposable {
         return true;
     }
 
-    // 一条 HTTPS / TLS（含 HTTP/2 多路复用与 HTTP/1.1 over TLS）连接的处理。
+    // TLS owns the handshake and record layer; only plaintext HTTP bytes enter
+    // the shared request loop. Keep the raw socket out of the request context.
     public async void HandleTlsConnection(nint clientSock) {
         try {
-            await this.HandleTlsConnectionInner(clientSock);
-        } finally {
-            Socket.Close(clientSock);
-        }
-    }
-
-    private async void HandleTlsConnectionInner(nint clientSock) {
-        Socket.SetNoDelay(clientSock);
-        TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock, this.requestTimeoutMs);
-        if (stream == null) {
-            long _drop = this.activeConnections.Decrement();
-            return;
-        }
-        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
-        HttpFramer framer = HttpFramerTls.Create(stream);
-        string remoteIp = Socket.RemoteIp(clientSock);
-        bool keepAlive = true;
-
-        try {
-            while (keepAlive) {
-                HttpDeadline.Touch(watch, this.requestTimeoutMs);
-                int headerEnd = await framer.ReadHead(65000);
-                if (headerEnd == -431) {
-                    string s431 = WebApp.SimpleResponse(431,
-                        "Request Header Fields Too Large",
-                        "header block too large");
-                    int _s = await stream.SendAsync(s431, s431.Length);
-                    break;
-                }
-                if (headerEnd <= 0) { break; }
-
-                HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd), headerEnd);
-
-                // 识别客户端 HTTP/2 连接序言（RFC 7540 §3.5: PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n）
-                if (request.method == "PRI" && request.path == "*" && request.version == "HTTP/2.0") {
-                    framer.Consume(headerEnd);
-                    await Http2ServerConnection.ServeTlsAsync(stream.SendBytesAsync, this.HandleHttp2Request, framer,
-                        65000, this.maxBodyBytes, this.requestTimeoutMs);
-                    return;
-                }
-
-                if (request.parseStatus != 0) {
-                    string s0 = WebApp.SimpleResponse(
-                        request.parseStatus,
-                        request.parseStatus == 501 ? "Not Implemented" : "Bad Request",
-                        "malformed request framing");
-                    int _s0 = await stream.SendAsync(s0, s0.Length);
-                    break;
-                }
-                keepAlive = request.keepAlive;
-                HttpContext ctx = new HttpContext(request, remoteIp);
-                if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
-                    ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
-                }
-                ctx.SetApp(this);
-                ctx.AttachTls(stream);
-                ctx.SetFramer(framer);
-                ctx.SetDeadlineSlot(watch, this.requestTimeoutMs);
-                Route route = this.router.Match(ctx);
-
-                if (await this.LimitExceeded(ctx, route)) {
-                    string s1 = WebApp.SimpleResponse(429,
-                        "Too Many Requests", "rate limit exceeded");
-                    int _s1 = await stream.SendAsync(s1, s1.Length);
-                    break;
-                }
-
-                if (request.contentLength > this.maxBodyBytes) {
-                    string s4 = WebApp.SimpleResponse(413,
-                        "Payload Too Large", "body exceeds limit");
-                    int _s4 = await stream.SendAsync(s4, s4.Length);
-                    break;
-                }
-                int bodyStatus = await framer.ReadBody(request, this.maxBodyBytes);
-                if (bodyStatus > 0) {
-                    string s4b = WebApp.SimpleResponse(
-                        bodyStatus,
-                        bodyStatus == 413 ? "Payload Too Large" : "Bad Request",
-                        bodyStatus == 413 ? "body exceeds limit"
-                                          : "malformed request body");
-                    int _s4b = await stream.SendAsync(s4b, s4b.Length);
-                    break;
-                }
-                if (bodyStatus < 0) {
-                    string s5 = WebApp.SimpleResponse(400,
-                        "Bad Request", "incomplete body");
-                    int _s5 = await stream.SendAsync(s5, s5.Length);
-                    break;
-                }
-
-                framer.Consume(framer.RequestBytes());
-                if (request.bodyLength > 0) {
-                    if (HttpContext.StartsWith(request.contentType,
-                                               "multipart/form-data")) {
-                        HttpContext.ParseMultipartFields(request, ctx);
-                    } else {
-                        HttpContext.ParseFormBody(request, ctx);
-                    }
-                }
-
-                Worker.BumpStat();
-                await this.Dispatch(ctx, route, keepAlive);
-                if (ctx.Hijacked()) { keepAlive = false; ctx.ReleaseResponseBuf(); break; }
-                if (ctx.responseBuf != null && ctx.responseLen > 0) {
-                    int _sent = await stream.SendBytesAsync(ctx.responseBuf, 0, ctx.responseLen);
-                }
-                ctx.ReleaseResponseBuf();
-                Worker.BumpSent();
-                if (!keepAlive) { break; }
+            Socket.SetNoDelay(clientSock);
+            TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock, this.requestTimeoutMs);
+            if (stream == null) { return; }
+            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            HttpFramer framer = HttpFramerTls.Create(stream);
+            try {
+                Http1Writer writer = HttpFramerTls.CreateWriter(stream);
+                string remoteIp = Socket.RemoteIp(clientSock);
+                await this.ServeHttp1(framer, writer, remoteIp, watch, null, stream);
+            } finally {
+                HttpDeadline.Disarm(watch);
+                framer.Dispose();
+                stream.Close();
             }
         } finally {
-            HttpDeadline.Disarm(watch);
-            framer.Dispose();
-            stream.Close();
+            Socket.Close(clientSock);
             long _live = this.activeConnections.Decrement();
         }
     }
@@ -762,39 +676,34 @@ public class WebApp : IDisposable {
         return resp;
     }
 
-    // 一条 keep-alive 连接的完整生命周期：读入并定界请求头（超 64KB 回
-    // 431）→ 解析（定界失败按 parseStatus 回 400/501）→ 流式上传落盘或
-    // 缓冲内存正文（超限 413）→ 解析表单 → Dispatch → 写回应答，直到
-    // 对端断开或非 keep-alive 为止。每个请求重置一次空闲期限（防
-    // slowloris）；SSE/WS 劫持的连接由 handler 接管，循环随即结束。
-    // 清理走 finally：即便管线里有未被 catch 的异常展开到这一层，
-    // deadline 槽位、framer 缓冲、套接字与连接计数也必须归位。
     public async void HandleConnection(nint clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
         try {
-            await this.HandleConnectionInner(clientSock);
+            Socket.SetNoDelay(clientSock);
+            HttpFramer framer = HttpFramer.Create(clientSock);
+            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            try {
+                Http1Writer writer = new Http1Writer(client.SendViewAsync);
+                string remoteIp = Socket.RemoteIp(clientSock);
+                await this.ServeHttp1(framer, writer, remoteIp, watch, client, null);
+            } finally {
+                HttpDeadline.Disarm(watch);
+                framer.Dispose();
+            }
         } finally {
-            Socket.Close(clientSock);
+            client.Close();
+            long _live = this.activeConnections.Decrement();
         }
     }
 
-    // HandleConnection 的主体：watch/framer/client 三个局部资源
-    // 在这里创建，正常结束路径统一清理；套接字本身的 Close 由
-    // HandleConnection 的 finally 负责（ShutdownBoth 无法替代——
-    // 劫持连接之后的收尾也要真正释放描述符）。
-    private async void HandleConnectionInner(nint clientSock) {
-        Socket.SetNoDelay(clientSock);
-        TcpClient client = TcpClient.FromSocket(clientSock);
-        HttpFramer framer = HttpFramer.Create(clientSock);
-        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
-        // 对端地址是连接的属性，不是请求的属性：一条 keep-alive 连接上
-        // 每个请求都问一次内核（getpeername）等于白付一次系统调用。
-        string remoteIp = Socket.RemoteIp(clientSock);
+    private async void ServeHttp1(HttpFramer framer, Http1Writer writer, string remoteIp,
+                                  HttpDeadlineToken watch, TcpClient client, TlsStream stream) {
         bool keepAlive = true;
         while (keepAlive) {
             HttpDeadline.Touch(watch, this.requestTimeoutMs);
             int headerEnd = await framer.ReadHead(65000);
             if (headerEnd == -431) {
-                int _s = await client.SendAsync(WebApp.SimpleResponse(431,
+                int _s = await writer.SendTextAsync(WebApp.SimpleResponse(431,
                     "Request Header Fields Too Large",
                     "header block too large"));
                 break;
@@ -803,11 +712,19 @@ public class WebApp : IDisposable {
 
             HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
                                                    headerEnd);
+            // Hand the same pending bytes to the existing HTTP/2 session.
+            if (stream != null && request.method == "PRI" && request.path == "*"
+                && request.version == "HTTP/2.0") {
+                framer.Consume(headerEnd);
+                await Http2ServerConnection.ServeTlsAsync(stream.SendBytesAsync, this.HandleHttp2Request,
+                    framer, 65000, this.maxBodyBytes, this.requestTimeoutMs);
+                return;
+            }
             // 定界失败（Content-Length 溢出/重复不一致、非数字、
             // Transfer-Encoding 未实现等）→ 拒绝，不切分正文：
             // 剩余字节可能是走私的伪装请求。
             if (request.parseStatus != 0) {
-                int _s0 = await client.SendAsync(WebApp.SimpleResponse(
+                int _s0 = await writer.SendTextAsync(WebApp.SimpleResponse(
                     request.parseStatus,
                     request.parseStatus == 501 ? "Not Implemented" : "Bad Request",
                     "malformed request framing"));
@@ -819,7 +736,9 @@ public class WebApp : IDisposable {
                 ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
             }
             ctx.SetApp(this);
-            ctx.Attach(client);
+            // Existing file/SSE/upgrade handlers keep their transport contract.
+            if (stream != null) { ctx.AttachTls(stream); }
+            else { ctx.Attach(client); }
             ctx.SetFramer(framer);
             // 请求到达与响应处理的超时时限（毫秒）。
             ctx.SetDeadlineSlot(watch, this.requestTimeoutMs);
@@ -832,88 +751,98 @@ public class WebApp : IDisposable {
             // SimpleResponse 应答并断连，因为正文留在流上没读，keep-alive
             // 复用会把残余字节当下一个请求的头。
             if (await this.LimitExceeded(ctx, route)) {
-                int _s1 = await client.SendAsync(WebApp.SimpleResponse(429,
+                int _s1 = await writer.SendTextAsync(WebApp.SimpleResponse(429,
                     "Too Many Requests", "rate limit exceeded"));
                 break;
             }
 
-            if (route != null && route.StreamUpload() && request.contentLength > 0) {
-                if (request.contentLength > this.maxUploadBytes) {
-                    int _s2 = await client.SendAsync(WebApp.SimpleResponse(413,
-                        "Payload Too Large", "upload exceeds limit"));
-                    break;
-                }
-                string tmp = await this.StreamBodyToFile(clientSock, framer,
-                    request);
-                if (tmp.Length == 0) {
-                    int _s3 = await client.SendAsync(WebApp.SimpleResponse(400,
-                        "Bad Request", "upload failed"));
-                    break;
-                }
-                ctx.SetUpload(tmp, request.contentLength);
-                request.body = "";
-            } else {
-                if (request.contentLength > this.maxBodyBytes) {
-                    int _s4 = await client.SendAsync(WebApp.SimpleResponse(413,
-                        "Payload Too Large", "body exceeds limit"));
-                    break;
-                }
-                int bodyStatus = await framer.ReadBody(request, this.maxBodyBytes);
-                if (bodyStatus > 0) {
-                    int _s4b = await client.SendAsync(WebApp.SimpleResponse(
-                        bodyStatus,
-                        bodyStatus == 413 ? "Payload Too Large" : "Bad Request",
-                        bodyStatus == 413 ? "body exceeds limit"
-                                          : "malformed request body"));
-                    break;
-                }
-                if (bodyStatus < 0) {
-                    int _s5 = await client.SendAsync(WebApp.SimpleResponse(400,
-                        "Bad Request", "incomplete body"));
-                    break;
-                }
-                framer.Consume(framer.RequestBytes());
-                if (request.bodyLength > 0) {
-                    if (HttpContext.StartsWith(request.contentType,
-                                               "multipart/form-data")) {
-                        // 内存路径的 multipart：文本字段进 form 表
-                        // （文件部件由处理器按需取用）。
-                        HttpContext.ParseMultipartFields(request, ctx);
-                    } else {
-                        HttpContext.ParseFormBody(request, ctx);
+            // ctx owns any completed spool until the handler explicitly takes it.
+            // Cleanup also runs on response-send failures and hook exceptions.
+            try {
+                bool gatePassed = false;
+                // Only positive Content-Length uses the spool. Chunked bodies
+                // retain the normal, separately bounded in-memory path.
+                if (route != null && route.StreamUpload() && request.contentLength > 0) {
+                    // Unread bodies require closing the connection on rejection.
+                    if (!await this.DispatchGate(ctx, route, false)) {
+                        await this.Dispatch(ctx, route, false, true, true);
+                        if (!ctx.MetricsExcluded() && ctx.responseBuf != null && ctx.responseLen > 0) {
+                            int _denied = await writer.SendBytesAsync(ctx.responseBuf, 0, ctx.responseLen);
+                        }
+                        break;
+                    }
+                    gatePassed = true;
+                    if (request.contentLength > this.maxUploadBytes) {
+                        int _s2 = await writer.SendTextAsync(WebApp.SimpleResponse(413,
+                            "Payload Too Large", "upload exceeds limit"));
+                        break;
+                    }
+                    string tmp = await HttpUploadStreamer.StreamToFile(framer, request,
+                        this.uploadDir, this.uploadSeq);
+                    if (tmp.Length == 0) {
+                        int _s3 = await writer.SendTextAsync(WebApp.SimpleResponse(400,
+                            "Bad Request", "upload failed"));
+                        break;
+                    }
+                    ctx.SetUpload(tmp, request.contentLength);
+                    request.body = "";
+                } else {
+                    if (request.contentLength > this.maxBodyBytes) {
+                        int _s4 = await writer.SendTextAsync(WebApp.SimpleResponse(413,
+                            "Payload Too Large", "body exceeds limit"));
+                        break;
+                    }
+                    int bodyStatus = await framer.ReadBody(request, this.maxBodyBytes);
+                    if (bodyStatus > 0) {
+                        int _s4b = await writer.SendTextAsync(WebApp.SimpleResponse(
+                            bodyStatus,
+                            bodyStatus == 413 ? "Payload Too Large" : "Bad Request",
+                            bodyStatus == 413 ? "body exceeds limit"
+                                              : "malformed request body"));
+                        break;
+                    }
+                    if (bodyStatus < 0) {
+                        int _s5 = await writer.SendTextAsync(WebApp.SimpleResponse(400,
+                            "Bad Request", "incomplete body"));
+                        break;
+                    }
+                    framer.Consume(framer.RequestBytes());
+                    if (request.bodyLength > 0) {
+                        if (HttpContext.StartsWith(request.contentType,
+                                                   "multipart/form-data")) {
+                            // 内存路径的 multipart：文本字段进 form 表
+                            // （文件部件由处理器按需取用）。
+                            HttpContext.ParseMultipartFields(request, ctx);
+                        } else {
+                            HttpContext.ParseFormBody(request, ctx);
+                        }
                     }
                 }
-            }
 
-            Worker.BumpStat();
-            await this.Dispatch(ctx, route, keepAlive);
-            if (ctx.Hijacked()) { keepAlive = false; ctx.ReleaseResponseBuf(); break; }
-            if (ctx.responseBuf != null && ctx.responseLen > 0) {
-                int _sent = await client.SendBytesAsync(ctx.responseBuf, 0, ctx.responseLen);
+                Worker.BumpStat();
+                await this.Dispatch(ctx, route, keepAlive, gatePassed);
+                if (ctx.MetricsExcluded()) { break; }
+                if (ctx.responseBuf != null && ctx.responseLen > 0) {
+                    int sent = await writer.SendBytesAsync(ctx.responseBuf, 0, ctx.responseLen);
+                    if (sent != ctx.responseLen) { break; }
+                }
+                Worker.BumpSent();
+                if (!keepAlive) { break; }
+            } finally {
+                ctx.CleanupUpload();
+                ctx.ReleaseResponseBuf();
             }
-            ctx.ReleaseResponseBuf();
-            Worker.BumpSent();
-            if (!keepAlive) { break; }
         }
-        HttpDeadline.Disarm(watch);
-        framer.Dispose();
-        client.Close();
-        long _live = this.activeConnections.Decrement();
     }
 
-    // failure.
-    private async string StreamBodyToFile(nint sock, HttpFramer framer,
-                                  HttpRequest request) {
-        return await HttpUploadStreamer.StreamToFile(sock, framer, request,
-            this.uploadDir, this.uploadSeq);
-    }
-
-    private async void Dispatch(HttpContext ctx, Route route, bool keepAlive) {
+    private async void Dispatch(HttpContext ctx, Route route, bool keepAlive, bool gatePassed = false, bool gateRejected = false) {
         long startUs = ServerMetrics.MonoMicros();
         long _n = this.totalRequests.Increment();
         this.metrics.Entered();
         try {
-            await this.DispatchInner(ctx, route, keepAlive, startUs);
+            if (!gateRejected) {
+                await this.DispatchInner(ctx, route, keepAlive, startUs, gatePassed);
+            }
         } finally {
             this.metrics.Left();
         }
@@ -958,22 +887,39 @@ public class WebApp : IDisposable {
         return !this.Limiter().Allow(rateKey, route.RateLimit());
     }
 
-    // 认证之后的请求管线，按序：before 钩子 → 404/405 → 填路由元数据 →
-    // 登录/权限门 → [Lock] 请求锁 → handler。全局限流与路由限流已前移到
-    // 正文读取之前（HandleConnectionInner 的 LimitExceeded——被限请求不再
-    // 花服务器的带宽与解析 CPU），uid 亦由门处解析好放在 ctx.uid。
-    // ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
-    // 时仍未写应答的也兜底 500。
-    private async void DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
+    // 唯一的 before/路由/认证门。流式正文必须在此门成功后才能落盘。
+    // before 钩子也承载应用的 Origin/CSRF 策略，预检后不可再次调用。
+    private async bool DispatchGate(HttpContext ctx, Route route, bool keepAlive) {
+        try {
+            return await this.DispatchGateInner(ctx, route, keepAlive);
+        } catch (ApiError ae) {
+            if (ae.Status() >= 500) {
+                this.metrics.RecordError((long)WebApp.NowSeconds(),
+                    ctx.Method() + " " + ctx.Path(), WebApp.Redact(ae.Message));
+            }
+            if (ctx.ResetFailedResponse()) {
+                ctx.Status(ae.Status(), ApiError.Reason(ae.Status()));
+                ctx.Api(ae.Code(), ae.Message, "null");
+            }
+        } catch (Exception e) {
+            // Request boundary: gate failures obey the same fixed 500 contract
+            // as handlers; exception details stay in server diagnostics.
+            Console.WriteLine("[WebApp ERROR] " + ctx.Method() + " " + ctx.Path() + ": " + e.Message);
+            this.metrics.RecordError((long)WebApp.NowSeconds(),
+                ctx.Method() + " " + ctx.Path(), WebApp.Redact(e.Message));
+            if (ctx.ResetFailedResponse()) {
+                ctx.Status(500, "Internal Server Error");
+                ctx.Json(WebApp.ErrorJson("500", "internal server error"));
+            }
+        }
+        ctx.BuildResponseDirect(keepAlive);
+        return false;
+    }
 
-        string uid = ctx.Uid();
-        string principal = uid;
-        if (principal.Length == 0) { principal = ctx.ClientIp(); }
-        if (principal.Length == 0) { principal = "_unknown_"; }
-
+    private async bool DispatchGateInner(HttpContext ctx, Route route, bool keepAlive) {
         if (!this.hooks.RunBefore(ctx)) {
             ctx.BuildResponseDirect(keepAlive);
-            return;
+            return false;
         }
 
         if (route == null) {
@@ -985,33 +931,51 @@ public class WebApp : IDisposable {
                 ctx.Json(WebApp.ErrorJson("404", "not found"));
             }
             ctx.BuildResponseDirect(keepAlive);
-            return;
+            return false;
         }
 
         ctx.SetRoute(route.Action(), route.Pattern(), route.Idx());
 
         if (route.NeedsLogin() || route.NeedsAuth()) {
-            if (uid.Length == 0) {
+            if (ctx.Uid().Length == 0) {
                 if (this.WantsPage(ctx)) {
                     ctx.Redirect(this.loginPath + "?next="
                         + Encoding.UrlEncode(ctx.Path()));
                     ctx.BuildResponseDirect(keepAlive);
-                    return;
+                    return false;
                 }
                 ctx.Status(401, "Unauthorized");
                 ctx.Json(WebApp.ErrorJson("401", "authentication required"));
                 ctx.BuildResponseDirect(keepAlive);
-                return;
+                return false;
             }
             if (route.NeedsAuth()) {
-                if (!await this.Allow(uid, route.Action())) {
+                if (!await this.Allow(ctx.Uid(), route.Action())) {
                     ctx.Status(403, "Forbidden");
                     ctx.Json(WebApp.ErrorJson("403", "insufficient permission"));
                     ctx.BuildResponseDirect(keepAlive);
-                    return;
+                    return false;
                 }
             }
         }
+
+        return true;
+    }
+
+    // 认证之后的请求管线，按序：before 钩子 → 404/405 → 填路由元数据 →
+    // 登录/权限门 → [Lock] 请求锁 → handler。全局限流与路由限流已前移到
+    // 正文读取之前（ServeHttp1 的 LimitExceeded——被限请求不再
+    // 花服务器的带宽与解析 CPU），uid 亦由门处解析好放在 ctx.uid。
+    // ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
+    // 时仍未写应答的也兜底 500。
+    private async void DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs, bool gatePassed) {
+
+        string uid = ctx.Uid();
+        string principal = uid;
+        if (principal.Length == 0) { principal = ctx.ClientIp(); }
+        if (principal.Length == 0) { principal = "_unknown_"; }
+
+        if (!gatePassed && !await this.DispatchGate(ctx, route, keepAlive)) { return; }
 
         LockLease lockLease = null;
         if (route.LockScope().Length > 0) {
@@ -1036,7 +1000,7 @@ public class WebApp : IDisposable {
                     ctx.Method() + " " + ctx.Path(), WebApp.Redact(ae.Message));
                 errLogged = true;
             }
-            if (!ctx.Ended()) {
+            if (ctx.ResetFailedResponse()) {
                 ctx.Status(ae.Status(), ApiError.Reason(ae.Status()));
                 ctx.Api(ae.Code(), ae.Message, "null");
             }
@@ -1045,7 +1009,7 @@ public class WebApp : IDisposable {
             this.metrics.RecordError((long)WebApp.NowSeconds(),
                 ctx.Method() + " " + ctx.Path(), WebApp.Redact(e.Message));
             errLogged = true;
-            if (!ctx.Ended()) {
+            if (ctx.ResetFailedResponse()) {
                 ctx.Status(500, "Internal Server Error");
                 ctx.Json(WebApp.ErrorJson("500", "internal server error"));
             }
@@ -1078,6 +1042,10 @@ public class WebApp : IDisposable {
 
     private bool WantsPage(HttpContext ctx) {
         if (this.loginPath.Length == 0) { return false; }
+        // /api is the JSON route convention shared with ApiDocs. Missing
+        // Accept headers must not turn authentication failures into redirects.
+        string path = ctx.Path();
+        if (path == "/api" || path.StartsWith("/api/")) { return false; }
         if (ctx.Method() != "GET") { return false; }
         if (ctx.Header("HX-Request").Length > 0) { return false; }
         if (ctx.Header("X-Requested-With").Length > 0) { return false; }
