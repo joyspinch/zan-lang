@@ -1,0 +1,166 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Web;
+
+class Program {
+    static int port = 19567;
+    static int failures = 0;
+    static int beforeCalls = 0;
+    static int handlerCalls = 0;
+    static int afterCalls = 0;
+    static bool listening = true;
+    static TcpListener listener;
+    static string directory = "";
+    static string retained = "";
+
+    static void Check(bool valid, string name) {
+        Console.WriteLine((valid ? "ok " : "FAIL ") + name);
+        if (!valid) { failures = failures + 1; }
+    }
+
+    static bool Before(HttpContext ctx) {
+        beforeCalls = beforeCalls + 1;
+        if (ctx.Path() == "/gate-error") { throw new ApiError(400, "test", "gate denied"); }
+        if (ctx.Path() == "/gate-unknown") { throw new Exception("gate failure"); }
+        return Csrf.OriginGuard(ctx);
+    }
+
+    static void After(HttpContext ctx, long elapsedUs) { afterCalls = afterCalls + 1; }
+
+    static async string Authenticate(string token) { return token; }
+    static async bool Permit(string uid, string action) { return uid == "admin"; }
+
+    static async void Upload(HttpContext ctx) {
+        handlerCalls = handlerCalls + 1;
+        string path = ctx.UploadPath();
+        bool valid = path.Length > 0 && File.Exists(path)
+            && File.ReadAllText(path) == "payload" && ctx.UploadSize() == 7;
+        if (ctx.Path() == "/take") { retained = ctx.TakeUpload(); }
+        if (ctx.Path() == "/move") { File.Move(path, directory + "/moved.bin"); }
+        if (ctx.Path() == "/reject") { ctx.Status(403, "Forbidden"); }
+        ctx.Text(valid ? "body-ok" : "body-bad");
+    }
+
+    static async void Accept(WebApp app) {
+        TcpListener l = new TcpListener("127.0.0.1", port);
+        l.Start();
+        listener = l;
+        while (listening) {
+            nint sock = await l.AcceptAsync();
+            if (sock >= 0) { Task.Spawn(app.HandleConnection(sock)); }
+        }
+    }
+
+    static string Head(string path, string headers, int length) {
+        return "POST " + path + " HTTP/1.1\r\nHost: local.test\r\n"
+            + "Connection: close\r\nContent-Length: " + Convert.ToString(length)
+            + "\r\n" + headers + "\r\n";
+    }
+
+    static async string Request(string path, string headers, string body, bool sendBody) {
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", port, 3000);
+        int sent = await client.SendAsync(Head(path, headers, 7));
+        if (sendBody) { int bodySent = await client.SendAsync(body); }
+        string response = await client.RecvAsync(8192, 2000);
+        client.Close();
+        // Allow the server's request finally to finish before inspecting disk.
+        await Task.Delay(30);
+        return response;
+    }
+
+    static int Spools() { return Directory.GetFiles(directory, "upload_*.bin").Count; }
+
+    static async int Run() {
+        Socket.Initialize();
+        directory = Path.Combine(Path.GetTempPath(), "zan_web_safety_" + Guid.New());
+        Directory.CreateDirectoryRecursive(directory);
+        WebApp app = new WebApp("127.0.0.1", port);
+        app.UploadDir(directory);
+        app.Before(Before);
+        app.After(After);
+        app.AuthResolver(Authenticate);
+        app.PermissionResolver(Permit);
+        Route login = app.Post("/login", Upload).Upload().Login();
+        Route auth = app.Post("/auth", Upload).Upload().Auth();
+        Route take = app.Post("/take", Upload).Upload().Login();
+        Route moved = app.Post("/move", Upload).Upload().Login();
+        Route reject = app.Post("/reject", Upload).Upload().Login();
+        Route gateError = app.Post("/gate-error", Upload).Upload().Login();
+        Route gateUnknown = app.Post("/gate-unknown", Upload).Upload().Login();
+        Task.Spawn(Accept(app));
+        await Task.Delay(100);
+
+        // Send no body: these replies must arrive before any upload bytes,
+        // and before any spool is opened, even with an advertised body length.
+        string anonymous = await Request("/login", "", "", false);
+        Check(anonymous.Contains("401 Unauthorized") && anonymous.Contains("Connection: close"),
+            "anonymous upload rejected before body read");
+        Check(handlerCalls == 0 && Spools() == 0, "anonymous upload leaves no spool");
+        string denied = await Request("/auth", "Authorization: Bearer user\r\n", "", false);
+        Check(denied.Contains("403 Forbidden") && handlerCalls == 0 && Spools() == 0,
+            "permission denial precedes body read");
+        string crossSite = await Request("/login",
+            "Authorization: Bearer admin\r\nOrigin: https://evil.test\r\n", "", false);
+        Check(crossSite.Contains("403 Forbidden") && handlerCalls == 0 && Spools() == 0,
+            "common before origin policy precedes body read");
+
+        Check(afterCalls == 3, "rejected uploads run after hooks");
+        string gateErrorResponse = await Request("/gate-error", "", "", false);
+        Check(gateErrorResponse.Contains("400 Bad Request") && gateErrorResponse.Contains("gate denied"),
+            "gate ApiError follows request response contract");
+        string unknownResponse = await Request("/gate-unknown", "", "", false);
+        Check(unknownResponse.Contains("500 Internal Server Error") && !unknownResponse.Contains("gate failure")
+            && Spools() == 0 && afterCalls == 5, "gate exception returns fixed 500 and runs after hooks");
+
+        int before = beforeCalls;
+        string success = await Request("/auth", "Authorization: Bearer admin\r\n", "payload", true);
+        Check(success.Contains("body-ok") && handlerCalls == 1, "authorized upload reaches handler intact");
+        Check(beforeCalls == before + 1, "upload before hook executes exactly once");
+        Check(Spools() == 0, "successful request cleans unclaimed spool");
+        string rejected = await Request("/reject", "Authorization: Bearer admin\r\n", "payload", true);
+        Check(rejected.Contains("403 Forbidden") && Spools() == 0, "handler rejection cleans spool");
+        string taken = await Request("/take", "Authorization: Bearer admin\r\n", "payload", true);
+        Check(taken.Contains("body-ok") && retained.Length > 0 && File.Exists(retained),
+            "explicit ownership transfer retains spool");
+        if (retained.Length > 0 && File.Exists(retained)) { File.Delete(retained); }
+        string moveResponse = await Request("/move", "Authorization: Bearer admin\r\n", "payload", true);
+        Check(moveResponse.Contains("body-ok") && File.Exists(directory + "/moved.bin") && Spools() == 0,
+            "handler moved spool cleanup is harmless");
+
+        // EOF after the first partial write must close and delete the partial.
+        TcpClient partial = await TcpClient.ConnectAsync("127.0.0.1", port, 3000);
+        int sent = await partial.SendAsync(Head("/login", "Authorization: Bearer admin\r\n", 100) + "part");
+        await Task.Delay(30);
+        partial.Close();
+        for (int i = 0; i < 40; i = i + 1) {
+            await Task.Delay(10);
+            if (Spools() == 0) { break; }
+        }
+        Check(Spools() == 0 && handlerCalls == 4, "disconnected upload deletes partial spool");
+
+        // Request ownership is idempotent even when handlers removed the file.
+        HttpContext owned = new HttpContext(HttpRequest.Parse("POST / HTTP/1.1\r\nHost: t\r\n\r\n"), "127.0.0.1");
+        string local = directory + "/owned.bin";
+        File.WriteAllText(local, "owned");
+        owned.SetUpload(local, 5);
+        owned.CleanupUpload();
+        owned.CleanupUpload();
+        Check(!File.Exists(local) && owned.UploadPath() == "", "request cleanup is idempotent");
+        owned.Dispose();
+
+        listening = false;
+        if (listener != null) { listener.Stop(); }
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        app.Dispose();
+        List<string> files = Directory.GetFiles(directory);
+        for (int i = 0; i < files.Count; i = i + 1) { File.Delete(files[i]); }
+        Directory.Delete(directory);
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return failures;
+    }
+
+    static int Main() { return await Run(); }
+}

@@ -240,16 +240,21 @@ static int *emit_static_init_order(zan_ast_node_t *unit) {
     return order;
 }
 
-static void emit_eh_terminate_setup(zan_irgen_t *g) {
+static void emit_eh_terminate_setup(zan_irgen_t *g, bool define_body) {
     if (g->target_is_wasm) return;
+    LLVMTypeRef void_ty = LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef term_fn_ty = LLVMFunctionType(void_ty, NULL, 0, 0);
     LLVMValueRef term_fn = LLVMGetNamedFunction(g->mod, "__zan_eh_terminate");
-    if (!term_fn) {
-        LLVMTypeRef void_ty = LLVMVoidTypeInContext(g->ctx);
-        LLVMTypeRef term_fn_ty = LLVMFunctionType(void_ty, NULL, 0, 0);
+    if (!term_fn)
         term_fn = LLVMAddFunction(g->mod, "__zan_eh_terminate", term_fn_ty);
+    /* Main must finish discovering static fields before its terminal exit
+     * can share the same ARC cleanup as the normal exit. */
+    if (define_body && LLVMCountBasicBlocks(term_fn) == 0) {
         LLVMBasicBlockRef tbb = LLVMAppendBasicBlockInContext(g->ctx, term_fn, "entry");
         zan_builder_point_t pt = zan_builder_save(g);
+        g->current_fn = term_fn;
         LLVMPositionBuilderAtEnd(g->builder, tbb);
+        di_clear(g);
         emit_eh_hook_call(g, "__zan_eh_unhandled");
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -305,12 +310,39 @@ static void emit_eh_terminate_setup(zan_irgen_t *g) {
             LLVMBuildBr(g->builder, cont_bb);
         }
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+        /* The native unwind payload only transports this TLS owner. Release
+         * the Zan value once, after its diagnostic, without treating a foreign
+         * native exception as an ARC object. */
+        LLVMValueRef owned_g = get_eh_exc_owned_global(g);
+        LLVMValueRef owned = LLVMBuildLoad2(g->builder, i32t, owned_g, "term.owned");
+        zan_store_fit(g, LLVMConstInt(i32t, 0, 0), owned_g);
+        zan_store_fit(g, LLVMConstNull(i8ptr), exc_g);
+        zan_store_fit(g, LLVMConstNull(i8ptr), get_eh_exc_tid_global(g));
+        LLVMBasicBlockRef release_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.release");
+        LLVMBasicBlockRef release_obj = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.release.obj");
+        LLVMBasicBlockRef release_str = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.release.str");
+        LLVMBasicBlockRef cleanup_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.cleanup");
+        LLVMBuildCondBr(g->builder, zan_icmp(g->builder, LLVMIntNE, owned,
+            LLVMConstInt(i32t, 0, 0), "term.isowned"), release_bb, cleanup_bb);
+        LLVMPositionBuilderAtEnd(g->builder, release_bb);
+        LLVMBuildCondBr(g->builder, isStr, release_str, release_obj);
+        LLVMPositionBuilderAtEnd(g->builder, release_obj);
+        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_release_dyn),
+            g->rt_release_dyn, &exc, 1, "");
+        LLVMBuildBr(g->builder, cleanup_bb);
+        LLVMPositionBuilderAtEnd(g->builder, release_str);
+        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_str_release),
+            g->rt_str_release, &exc, 1, "");
+        LLVMBuildBr(g->builder, cleanup_bb);
+        LLVMPositionBuilderAtEnd(g->builder, cleanup_bb);
+        emit_release_static_rc_fields(g, NULL);
         LLVMValueRef exit_fn = get_libc_fn(g, "exit", LLVMFunctionType(void_ty, &i32t, 1, 0));
         LLVMValueRef code1 = LLVMConstInt(i32t, 1, 0);
         zan_call2(g->builder, LLVMFunctionType(void_ty, &i32t, 1, 0), exit_fn, &code1, 1, "");
         LLVMBuildUnreachable(g->builder);
         zan_builder_restore(g, pt);
     }
+    if (define_body) return;
 
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef st_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0);
@@ -332,7 +364,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, main_fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     di_clear(g);
-    emit_eh_terminate_setup(g);
+    emit_eh_terminate_setup(g, false);
 
     if (g->target_is_windows) {
         LLVMTypeRef uintt = LLVMInt32TypeInContext(g->ctx);
@@ -584,6 +616,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
             emit_release_static_rc_fields(g, unit);
             LLVMBuildRet(g->builder, LLVMBuildTrunc(g->builder, res,
                 LLVMInt32TypeInContext(g->ctx), "main.ret"));
+            emit_eh_terminate_setup(g, true);
             g->current_type_sym = NULL;
             g->current_fn_body = NULL;
             return;
@@ -693,6 +726,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         emit_release_static_rc_fields(g, unit);
         LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
     }
+    emit_eh_terminate_setup(g, true);
     g->current_type_sym = NULL;
     g->current_fn_body = NULL;
 }

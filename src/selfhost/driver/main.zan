@@ -57,6 +57,7 @@ public partial class Program {
     [DllImport("crt")] static extern long fclose(long f);
 
     static string stdlibRoot;
+    static string packageProject;
     static List<string> inclPaths;
     static List<string> inclSrcs;
 
@@ -94,6 +95,9 @@ public partial class Program {
     // qsort(strcmp) 同序；路径拼接统一 '/'，排序序仅在分隔符字节边界上可能
     // 与宿主不同（两侧各自确定即可，差分门比对的是程序 stdout）。
     static void AddArgToken(string token, int depth) {
+        if (token.StartsWith("-")) {
+            throw "zanc: options in response files are not supported by the self-hosted driver: '" + token + "'";
+        }
         if (token.Length > 1 && (int)token[0] == 64) {  // '@'
             ExpandArgFile(token.Substring(1), depth + 1);
             return;
@@ -231,6 +235,7 @@ public partial class Program {
     // walk up from the input file to find nearest zan.proj or packages directory,
     // prioritizing the true repository root containing packages/ (resolve_package_project_root)
     static string ResolvePkgProjectRoot(string input) {
+        if (packageProject != null && packageProject != "") { return packageProject; }
         string dir = PkgParentDir(input);
         string foundProj = "";
         for (;;) {
@@ -410,12 +415,20 @@ public partial class Program {
         string outPath = "";
         bool hasDashO = false;
         bool emitLib = false;
+        bool denyWarnings = false;
+        packageProject = "";
         string optLevel = "-O2";
         List<string> rawInputs = new List<string>();
         int i = 0;
         while (i < argc) {
             string a = Environment.ArgAt(i);
-            if (a == "-o" && i + 1 < argc) {
+            if (a == "-o" || a == "--target" || a == "--package-project") {
+                if (i + 1 >= argc || Environment.ArgAt(i + 1) == ""
+                    || Environment.ArgAt(i + 1).StartsWith("-")) {
+                    throw "zanc: option '" + a + "' requires a value";
+                }
+            }
+            if (a == "-o") {
                 outPath = Environment.ArgAt(i + 1);
                 hasDashO = true;
                 i = i + 2;
@@ -426,21 +439,23 @@ public partial class Program {
                 i = i + 1;
                 continue;
             }
-            if (a == "-g" || a == "--debug") {
-                optLevel = "-O0";
-                i = i + 1;
-                continue;
+            // Do not promise debug metadata or packaging by only changing -O.
+            if (a == "-g" || a == "--debug" || a == "--publish" || a == "-c" || a == "-S") {
+                throw "zanc: option '" + a + "' is not supported by the self-hosted driver";
             }
-            if (a == "--publish") {
-                optLevel = "-Os";
-                i = i + 1;
-                continue;
-            }
-            if (a == "--package-project" && i + 1 < argc) {
+            if (a == "--package-project") {
+                packageProject = Environment.ArgAt(i + 1);
+                if (!Directory.ExistsOnDisk(packageProject)) {
+                    throw "zanc: package project directory does not exist: '" + packageProject + "'";
+                }
                 i = i + 2;
                 continue;
             }
-            if (a == "--target" && i + 1 < argc) {
+            if (a == "--target") {
+                string target = Environment.ArgAt(i + 1);
+                if (target != "host") {
+                    throw "zanc: target '" + target + "' is not supported by the self-hosted driver; only 'host' is supported";
+                }
                 i = i + 2;
                 continue;
             }
@@ -449,13 +464,17 @@ public partial class Program {
                 i = i + 1;
                 continue;
             }
-            if (a == "--auto-stdlib" || a == "--deny-warnings" || a == "-c" || a == "-S") {
+            if (a == "--deny-warnings") {
+                denyWarnings = true;
                 i = i + 1;
                 continue;
             }
-            if (a.Length >= 2 && a.Substring(0, 2) == "--") {
+            if (a == "--auto-stdlib") {
                 i = i + 1;
                 continue;
+            }
+            if (a.StartsWith("-")) {
+                throw "zanc: unknown option '" + a + "'";
             }
             rawInputs.Add(a);
             i = i + 1;
@@ -534,8 +553,9 @@ public partial class Program {
             Checker chk = new Checker(b, d);
             chk.Check(unit);
             d.Report(src, 0);
-            if (d.HasErrors()) {
+            if (d.HasErrors() || (denyWarnings && d.HasWarnings())) {
                 d.Summary();
+                if (!d.HasErrors()) { throw "zanc: compilation failed: warnings denied by --deny-warnings"; }
                 throw "zanc: compilation failed";
             }
 
@@ -543,8 +563,9 @@ public partial class Program {
             ig.libOut = emitLib;
             string ir = ig.Gen(unit);
             d.Report(src, 0);
-            if (d.HasErrors()) {
+            if (d.HasErrors() || (denyWarnings && d.HasWarnings())) {
                 d.Summary();
+                if (!d.HasErrors()) { throw "zanc: compilation failed: warnings denied by --deny-warnings"; }
                 throw "zanc: compilation failed";
             }
             bool isExe = outPath.Length >= 4 && outPath.Substring(outPath.Length - 4, 4) == ".exe";

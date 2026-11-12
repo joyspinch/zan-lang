@@ -113,7 +113,7 @@ static int heap_push(zan_timer_entry *entry) {
         g_heap = heap;
         g_heap_cap = cap;
     }
-    if (!entry->removed) g_live++;
+    if (!entry->removed) __atomic_fetch_add(&g_live, 1, __ATOMIC_RELAXED);
     size_t index = g_heap_len++;
     g_heap[index] = entry;
     while (index > 0) {
@@ -128,7 +128,7 @@ static int heap_push(zan_timer_entry *entry) {
 static zan_timer_entry *heap_pop(void) {
     if (g_heap_len == 0) return NULL;
     zan_timer_entry *root = g_heap[0];
-    if (!root->removed) g_live--;
+    if (!root->removed) __atomic_fetch_sub(&g_live, 1, __ATOMIC_RELAXED);
     zan_timer_entry *last = g_heap[--g_heap_len];
     if (g_heap_len == 0) return root;
     g_heap[0] = last;
@@ -156,7 +156,7 @@ void zan_timer_runtime_reset(void) {
     timer_lock();
     for (size_t i = 0; i < g_heap_len; i++) free(g_heap[i]);
     g_heap_len = 0;
-    g_live = 0;
+    __atomic_store_n(&g_live, 0, __ATOMIC_RELAXED);
     g_next_id = 1;
     g_round = 0;
     g_sequence = 0;
@@ -212,7 +212,7 @@ int zan_timer_cancel_delay(void *frame) {
         if (entry->kind == ZAN_TIMER_DELAY && !entry->removed &&
             entry->frame == frame) {
             entry->removed = 1;
-            g_live--;
+            __atomic_fetch_sub(&g_live, 1, __ATOMIC_RELAXED);
             found++;
         }
     }
@@ -450,7 +450,7 @@ int zan_timer_clear(long long id) {
         zan_timer_entry *entry = g_heap[i];
         if (entry->kind == ZAN_TIMER_PUBLIC && entry->id == id && !entry->removed) {
             entry->removed = 1;
-            g_live--;
+            __atomic_fetch_sub(&g_live, 1, __ATOMIC_RELAXED);
             found = 1;
             break;
         }
@@ -471,7 +471,7 @@ long long zan_timer_clear_all(void) {
         zan_timer_entry *entry = g_heap[i];
         if (entry->kind == ZAN_TIMER_PUBLIC && !entry->removed) {
             entry->removed = 1;
-            g_live--;
+            __atomic_fetch_sub(&g_live, 1, __ATOMIC_RELAXED);
             count++;
         }
     }

@@ -519,6 +519,8 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         ctors = refl_shape_mtab(g, sym, true, &ctor_count);
     } else if (refl_is_builtin_list(t)) {
         methods = refl_emit_methods_builtin_list(g, t, &method_count);
+        ctors = refl_emit_ctor_builtin_list(g, t);
+        ctor_count = 1;
     }
 
     LLVMValueRef elem = LLVMConstNull(i8ptr);
@@ -583,15 +585,57 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
  * refl_finalize_mtabs）。登记时 sym 已知，名表把实体类名的继承链
  * 挂到该分配点上，反射 CreateInstance 造出的对象才能通过 is/下转。 */
 void refl_reserve_thunk_sites(zan_irgen_t *g) {
-    for (int i = 0; i < g->refl_mtab_count; i++) {
-        if (!g->refl_mtabs[i].ctors || g->refl_mtabs[i].site >= 0) continue;
-        zan_symbol_t *sym = g->refl_mtabs[i].sym;
-        if (!sym || !sym->type || sym->type->kind != TYPE_CLASS) continue;
-        g->refl_mtabs[i].site = reserve_arc_site(g, sym, sym->type, 0, NULL);
+    /* emit_site_meta_table snapshots leak_site_count before lazily asking for
+     * metadata. A closed List discovered there needs its own ctor site, as do
+     * nested generic arguments. Warm the entire reachable site set first.
+     * Metadata records enter the cache before visiting children, so recursive
+     * class graphs terminate; each synthetic List site is reserved only once. */
+    if (g->refl_used) {
+        int sites, metas, mtabs;
+        int ctor_cursor = 0;
+        do {
+            sites = g->leak_site_count;
+            metas = g->refl_meta_count;
+            mtabs = g->refl_mtab_count;
+            for (int i = 1; i < g->leak_site_count; i++) {
+                if (g->site_coll && g->site_coll[i]) {
+                    if (g->site_coll[i] == 1) {
+                        zan_type_t *elem = g->site_coll_elem[i];
+                        refl_meta_for(g, zan_binder_make_list_type(g->binder, elem), NULL, 0);
+                    }
+                } else {
+                    zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
+                    if (sym && sym->type) {
+                        zan_type_t *t = g->site_inst && g->site_inst[i]
+                            ? g->site_inst[i] : sym->type;
+                        refl_meta_for(g, t, NULL, 0);
+                    }
+                }
+            }
+            for (int i = 0; i < g->refl_mtab_count; i++) {
+                if (!g->refl_mtabs[i].ctors || g->refl_mtabs[i].site >= 0) continue;
+                zan_symbol_t *sym = g->refl_mtabs[i].sym;
+                if (!sym || !sym->type || sym->type->kind != TYPE_CLASS) continue;
+                g->refl_mtabs[i].site = reserve_arc_site(g, sym, sym->type, 0, NULL);
+            }
+            /* Implicit class field initializers can allocate further classes,
+             * Lists or closures. Emit ctor bodies here, while site tables can
+             * still grow, rather than during the post-freeze method fixup. */
+            int ctor_end = g->refl_mtab_count;
+            while (ctor_cursor < ctor_end) {
+                int i = ctor_cursor++;
+                if (!g->refl_mtabs[i].ctors) continue;
+                LLVMValueRef init = refl_mtab_init(g, g->refl_mtabs[i].sym,
+                    true, g->refl_mtabs[i].n, true);
+                if (init) LLVMSetInitializer(g->refl_mtabs[i].gv, init);
+            }
+        } while (sites != g->leak_site_count || metas != g->refl_meta_count ||
+                 mtabs != g->refl_mtab_count);
     }
 }
 void refl_finalize_mtabs(zan_irgen_t *g) {
     for (int i = 0; i < g->refl_mtab_count; i++) {
+        if (g->refl_mtabs[i].ctors) continue;
         LLVMValueRef init = refl_mtab_init(g, g->refl_mtabs[i].sym,
                                            g->refl_mtabs[i].ctors,
                                            g->refl_mtabs[i].n, true);

@@ -63,6 +63,7 @@ typedef struct zan_options {
     const char *pp_defines[ZAN_MAX_PP_DEFINES];
     int pp_define_count;
     const char *target_name;
+    const char *cpu_profile; /* NULL preserves historical target defaults */
     bool link_static_drivers;
     const char *driver_dir_override;
     const char *link_subsystem;

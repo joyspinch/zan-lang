@@ -191,6 +191,24 @@ partial class Irgen {
     ExprVal ApplyUserConv(Node targetTy, ExprVal v, bool explicitOk) {
         convApplied = false;
         if (v.ty == null || targetTy == null) { return v; }
+        if (DynamicReferenceType(targetTy) && IsDelegate(v.ty)) {
+            convApplied = true;
+            return EraseDelegateReference(v, targetTy);
+        }
+        if (targetTy.ival >= 1 && v.ty.ival >= 1 && ArrayTypeKey(targetTy) != ArrayTypeKey(v.ty)) {
+            string nil = NT();
+            L("  " + nil + " = icmp eq " + MapType(v.ty) + " " + v.op + ", null");
+            string matches = ArrayRuntimeTypeTest(v, targetTy);
+            string ok = NT(); L("  " + ok + " = or i1 " + nil + ", " + matches);
+            int pass = NL(); int fail = NL();
+            L("  br i1 " + ok + ", label %L" + pass + ", label %L" + fail);
+            Label(fail); EmitCastThrow("InvalidCastException: array is not an instance of the target type");
+            Label(pass); term = false;
+            convApplied = true;
+            ExprVal converted = new ExprVal(v.op, targetTy);
+            converted.ownerTemp = v.ownerTemp;
+            return converted;
+        }
         if (SameTypeTag(v.ty, targetTy)) { return v; }
         Node m = FindUserConv(v.ty, targetTy, "op_implicit");
         if (m == null && explicitOk) { m = FindUserConv(v.ty, targetTy, "op_explicit"); }
@@ -266,7 +284,7 @@ partial class Irgen {
         string s = NT();
         L("  " + s + " = call i8* @zstr_of(i8* " + buf + ")");
         L("  call void @free(i8* " + buf + ")");
-        return new ExprVal(s, MkType("string"));
+        return OwnedString(s);
     }
 
     // A single-precision float as text: passes the float flag (-9223372036854775744 = 64 | (1<<63))
@@ -282,7 +300,7 @@ partial class Irgen {
         string s = NT();
         L("  " + s + " = call i8* @zstr_of(i8* " + buf + ")");
         L("  call void @free(i8* " + buf + ")");
-        return new ExprVal(s, MkType("string"));
+        return OwnedString(s);
     }
 
     // A char as text: the C host renders it as its UTF-8 encoding
@@ -382,6 +400,7 @@ partial class Irgen {
         string lenRep = NT(); L("  " + lenRep + " = select i1 " + isz + ", i64 0, i64 " + len4);
         string lp = NT(); L("  " + lp + " = getelementptr i8, i8* " + buf + ", i64 -16");
         L("  store i64 " + lenRep + ", i64* " + lp);
+        OwnedString(buf);
         return buf;
     }
 
@@ -511,7 +530,9 @@ partial class Irgen {
         string bsz = NT(); L("  " + bsz + " = add i64 " + need64 + ", 1");
         string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
         L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* " + fp + ", " + vty + " " + vop + ")");
-        return new ExprVal(WrapManaged(buf), MkType("string"));
+        string managed = WrapManaged(buf);
+        L("  call void @free(i8* " + buf + ")");
+        return new ExprVal(managed, MkType("string"));
     }
 
     // coerce a value to i8* string form (numbers via snprintf)
@@ -531,8 +552,7 @@ partial class Irgen {
             int lSome = NL(); int lNone = NL(); int lEnd = NL();
             L("  br i1 " + hz + ", label %L" + lSome + ", label %L" + lNone);
             Label(lSome);
-            string ult = (v.ty.sval == "double" || v.ty.sval == "float")
-                ? "double" : "i64";
+            string ult = UnderLL(v.ty);
             string p2 = NT();
             L("  " + p2 + " = bitcast i8* " + v.op + " to " + ult + "*");
             string uv = NT();
@@ -573,8 +593,10 @@ partial class Irgen {
             string buf = NT();
             L("  " + buf + " = call i8* @zstr_new(i64 " + l64 + ")");
             L("  call i8* @memcpy(i8* " + buf + ", i8* " + bptr + ", i64 " + l64 + ")");
-            return buf;
+            OwnedString(buf);
+        return buf;
         }
+        if (IsDecimal(v.ty)) { return DecimalString(v); }
         // double / float -> string (the runtime's shortest round-trip form)
         if (IsDbl(v.ty)) {
             if (v.ty != null && v.ty.sval == "float") { return FltToStr(v.op).op; }
@@ -607,14 +629,39 @@ partial class Irgen {
         string buf = NT();
         L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
         L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* getelementptr inbounds ([5 x i8], [5 x i8]* " + ifmt + ", i64 0, i64 0), i64 " + v.op + ")");
-        return WrapManaged(buf);
+        string rendered = WrapManaged(buf);
+        L("  call void @free(i8* " + buf + ")");
+        return rendered;
     }
 
     // wrap a plain C string (a number formatted by snprintf, a file read, a
     // command-line argument) into the managed string layout
+    ExprVal OwnedString(string op) {
+        int i = stmtTempValues.Count - 1;
+        while (i >= 0) {
+            if (stmtTempValues[i] == op) {
+                int live = 0;
+                while (live < stmtTemps.Count) {
+                    if (stmtTemps[live] == stmtTempOwners[i]) {
+                        ExprVal existing = new ExprVal(op, MkType("string"));
+                        existing.ownerTemp = stmtTempOwners[i];
+                        return existing;
+                    }
+                    live = live + 1;
+                }
+            }
+            i = i - 1;
+        }
+        AddTemp(op, MkType("string"));
+        ExprVal result = new ExprVal(op, MkType("string"));
+        result.ownerTemp = stmtTempOwners[stmtTempOwners.Count - 1];
+        return result;
+    }
+
     string WrapManaged(string cstr) {
         string r = NT();
         L("  " + r + " = call i8* @zstr_of(i8* " + cstr + ")");
+        OwnedString(r);
         return r;
     }
 
@@ -662,8 +709,17 @@ partial class Irgen {
     // (TASKS A390).
     ExprVal ByteArrToStr(ExprVal v) {
         int esz = ByteArrElemSize(v);
-        string ap = NT();
-        L("  " + ap + " = bitcast i8* " + v.op + " to i64*");
+        string ap = v.op;
+        string bp = v.op;
+        string vt = MapType(v.ty);
+        if (vt != "i64*") {
+            ap = NT();
+            L("  " + ap + " = bitcast " + vt + " " + v.op + " to i64*");
+        }
+        if (vt != "i8*") {
+            bp = NT();
+            L("  " + bp + " = bitcast " + vt + " " + v.op + " to i8*");
+        }
         string lenp = NT();
         L("  " + lenp + " = getelementptr i64, i64* " + ap + ", i64 -1");
         string len = NT();
@@ -686,7 +742,7 @@ partial class Irgen {
         if (esz == 1) {
             // a byte array stores one byte per element
             string eb = NT();
-            L("  " + eb + " = getelementptr i8, i8* " + v.op + ", i64 " + ci);
+            L("  " + eb + " = getelementptr i8, i8* " + bp + ", i64 " + ci);
             string bv = NT();
             L("  " + bv + " = load i8, i8* " + eb);
             b = bv;
@@ -707,7 +763,7 @@ partial class Irgen {
         L("  store i64 " + ni + ", i64* " + idx);
         L("  br label %L" + lc);
         Label(lend);
-        return new ExprVal(dst, MkType("string"));
+        return OwnedString(dst);
     }
 
     // string -> byte[]: the C host's bridge primitive (irgen_expr.c
@@ -716,19 +772,9 @@ partial class Irgen {
     // element, so the buffer is a plain byte run.
     ExprVal StrToBytes(ExprVal s) {
         string len = StrLen(s.op);
-        string bytes = NT();
-        L("  " + bytes + " = add i64 " + len + ", 0");
-        string tot = NT();
-        L("  " + tot + " = add i64 " + bytes + ", 16");
-        string raw = NT();
-        L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
-        string hdr = NT();
-        L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
-        string lenp = NT();
-        L("  " + lenp + " = getelementptr i64, i64* " + hdr + ", i64 1");
-        L("  store i64 " + len + ", i64* " + lenp);
-        string arr = NT();
-        L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
+        Node at = MkType("byte");
+        at.ival = 1;
+        string arr = ArrayAllocate(at, len);
         string idx = NT();
         EA(idx, "i64");
         L("  store i64 0, i64* " + idx);
@@ -755,8 +801,7 @@ partial class Irgen {
         L("  store i64 " + ni + ", i64* " + idx);
         L("  br label %L" + lc);
         Label(lend);
-        Node at = MkType("byte");
-        at.ival = 1;
+        AddTemp(arr, at);
         return new ExprVal(arr, at);
     }
 
@@ -766,8 +811,17 @@ partial class Irgen {
     // per 8-byte slot, so the bytes are packed into a fresh buffer.
     ExprVal ByteArrWindowToStr(ExprVal a, Node e) {
         int esz = ByteArrElemSize(a);
-        string ap = NT();
-        L("  " + ap + " = bitcast i8* " + a.op + " to i64*");
+        string ap = a.op;
+        string bp = a.op;
+        string vt = MapType(a.ty);
+        if (vt != "i64*") {
+            ap = NT();
+            L("  " + ap + " = bitcast " + vt + " " + a.op + " to i64*");
+        }
+        if (vt != "i8*") {
+            bp = NT();
+            L("  " + bp + " = bitcast " + vt + " " + a.op + " to i8*");
+        }
         string lenp = NT();
         L("  " + lenp + " = getelementptr i64, i64* " + ap + ", i64 -1");
         string alen = NT();
@@ -818,7 +872,7 @@ partial class Irgen {
         string b = "";
         if (esz == 1) {
             string eb = NT();
-            L("  " + eb + " = getelementptr i8, i8* " + a.op + ", i64 " + si);
+            L("  " + eb + " = getelementptr i8, i8* " + bp + ", i64 " + si);
             string bv = NT();
             L("  " + bv + " = load i8, i8* " + eb);
             b = bv;
@@ -839,7 +893,7 @@ partial class Irgen {
         L("  store i64 " + ni + ", i64* " + idx);
         L("  br label %L" + lc);
         Label(lend);
-        return new ExprVal(dst, MkType("string"));
+        return OwnedString(dst);
     }
 
     // assigning a byte[] to a string slot packs it into a managed string.
@@ -851,6 +905,8 @@ partial class Irgen {
         if (v.op == "null") { return v; }
         if (IsStr(v.ty)) { return v; }
         if (v.ty != null && !IsByteArr(v.ty)) { return v; }
+        // The array can die at statement/scope exit; a string slot must not
+        // borrow its payload after that owner is released.
         return ByteArrToStr(v);
     }
 
@@ -916,7 +972,7 @@ partial class Irgen {
             off = no;
             i = i + 1;
         }
-        return new ExprVal(buf, MkType("string"));
+        return OwnedString(buf);
     }
 
     ExprVal StrConcat(string a, string b) {
@@ -927,7 +983,7 @@ partial class Irgen {
         L("  call i8* @memcpy(i8* " + buf + ", i8* " + a + ", i64 " + la + ")");
         string off = NT(); L("  " + off + " = getelementptr i8, i8* " + buf + ", i64 " + la);
         L("  call i8* @memcpy(i8* " + off + ", i8* " + b + ", i64 " + lb + ")");
-        return new ExprVal(buf, MkType("string"));
+        return OwnedString(buf);
     }
 
 }

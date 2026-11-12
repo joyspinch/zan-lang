@@ -1,0 +1,105 @@
+using System;
+using System.IO;
+using System.Data.ZanDb;
+
+// Ordering/error regression only; this does not simulate storage power loss.
+class ZanDbWalDirectoryTest {
+    #if !WINDOWS && !WASM32
+    [DllImport("crt", EntryPoint = "symlink")]
+    static extern int MakeLink(string target, string path);
+    [DllImport("crt", EntryPoint = "unlink")]
+    static extern int RemoveLink(string path);
+    #endif
+
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static void Main() {
+        Require(ZanStore.DirOf("database.zdb") == ".", "relative parent");
+        Require(ZanStore.DirOf("dir/database.zdb") == "dir", "nested parent");
+        Require(ZanStore.DirOf("/database.zdb") == "/", "POSIX root parent");
+        Require(ZanStore.DirOf("/") == "/", "POSIX root stable");
+        Require(ZanStore.DirOf("C:/database.zdb") == "C:/", "drive root parent");
+        Require(ZanStore.DirOf("C:/") == "C:/", "drive root stable");
+        Require(ZanStore.DirOf("C:\\database.zdb") == "C:\\", "backslash drive root parent");
+        Require(ZanStore.DirOf("C:\\") == "C:\\", "backslash drive root stable");
+        Console.WriteLine("root-safe-parents");
+
+        string root = "_scratch/conf_zandb_wal_directory";
+        string path = root + "/database.zdb";
+        Require(!Directory.Exists(root) && !File.Exists(root) && !File.IsReparsePoint(root), "fixture already exists");
+        Directory.CreateDirectory(root);
+        try {
+            #if WINDOWS
+            // Compatibility true is not evidence of a Windows namespace barrier.
+            Require(PageFile.DirSync(root), "Windows compatibility result");
+            #else
+            Require(PageFile.DirSync(root), "directory barrier");
+            Require(!PageFile.DirSync(root + "/missing"), "missing directory rejected");
+            string filePath = root + "/ordinary-file";
+            File.WriteAllText(filePath, "unchanged");
+            Require(!PageFile.DirSync(filePath), "regular file rejected as directory");
+            Require(File.ReadAllText(filePath) == "unchanged", "rejected file preserved");
+            #endif
+            Console.WriteLine("directory-platform-contract");
+
+            ZanStore store = ZanStore.Open(path, ZanStore.DUR_SYNC);
+            Require(store.IsOpen(), "new WAL open");
+            store.Put("kept", "value");
+            store.Close();
+            Require(store.GetError() == "", "healthy close");
+            store = ZanStore.Open(path, ZanStore.DUR_GROUP);
+            Require(store.IsOpen() && store.Get("kept") == "value", "existing WAL reopen");
+            store.SetSyncEvery(1);
+            store.Put("group", "synced");
+            store.Close();
+            Require(store.GetError() == "", "group close");
+            store = ZanStore.Open(path, ZanStore.DUR_NONE);
+            Require(store.IsOpen(), "NONE WAL open");
+            store.Put("none", "checkpointed");
+            store.Checkpoint();
+            store.Close();
+            Require(store.GetError() == "", "checkpoint close");
+            Console.WriteLine("new-and-existing-wal-open");
+
+            #if !WINDOWS && !WASM32
+            // A final-component directory symlink is rejected by the checked
+            // backend after WAL creation/open; verify both attempts fail closed.
+            string alias = root + "/parent-link";
+            Require(ZanDbWalDirectoryTest.MakeLink(".", alias) == 0, "create parent link");
+            try {
+                for (int attempt = 0; attempt < 2; attempt = attempt + 1) {
+                    string failedPath = alias + "/barrier-failed.zdb";
+                    store = ZanStore.Open(failedPath, ZanStore.DUR_SYNC);
+                    Require(!store.IsOpen() && store.GetError() == "WAL directory sync failed", "directory barrier fails open");
+                    Require(store.GetRevision() == 0 && store.lockHandle == 0, "failed open releases resources");
+                    Require(store.log != null && !store.log.IsOpen(), "failed open closes WAL");
+                    store.Close();
+                    string directPath = root + "/barrier-failed.zdb";
+                    Require(File.Exists(directPath) && File.GetSize64(directPath) == 0, "failed open preserves empty WAL");
+                    long handle = File.TryLock(directPath + ".lock");
+                    Require(handle != 0, "failed open releases lock");
+                    Require(File.Unlock(handle), "release test lock");
+                }
+            } finally {
+                Require(ZanDbWalDirectoryTest.RemoveLink(alias) == 0, "remove parent link");
+            }
+            #endif
+            Console.WriteLine("wal-directory-failure-platform-contract");
+
+            LogFile log = LogFile.Open(root + "/file-sync-failure.zdb");
+            Require(log.IsOpen(), "file-only log open");
+            int fd = log.file.fd;
+            log.file.fd = -1;
+            bool synced = log.Sync();
+            log.file.fd = fd;
+            Require(!synced && log.GetError() != "", "file sync error propagated");
+            log.Close(false);
+            Console.WriteLine("wal-file-sync-failure");
+        } finally {
+            Require(Directory.DeleteRecursive(root), "fixture cleanup failed");
+        }
+        Console.WriteLine("cleaned");
+    }
+}

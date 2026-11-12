@@ -30,6 +30,7 @@ typedef struct {
     LLVMValueRef fn;
     int throw_locals_base;
     int fin_idx;
+    int finally_depth; /* Finally/lock entries retained by this landing. */
     struct local_var *cleanups;
     int cleanup_count;
     int cleanup_cap;
@@ -135,6 +136,7 @@ typedef struct zan_goto_fixup {
     int          catch_base;
     int          locals_base;
     int          locals_owned;
+    struct local_var *locals_snap;
     int          resolved;
     LLVMBasicBlockRef from_bb;
     int finally_snap_n;
@@ -441,6 +443,9 @@ struct zan_irgen {
     struct {
         zan_symbol_t *cls;
         zan_symbol_t *field;
+        zan_type_t *recv_type;
+        zan_type_t *value_type;
+        int base_dispatch;
         LLVMValueRef get_fn;
         LLVMValueRef set_fn;
     } *bind_accs;
@@ -661,6 +666,7 @@ struct zan_irgen {
 
     char target_triple[128];
     /* 后端选用的 CPU/特性（--emit-ir 的产物要靠它自述，见 zan_irgen_write_ir） */
+    const char *cpu_profile; /* explicit x86-64 profile, or NULL */
     char target_cpu[64];
     char target_features[192];
     bool target_is_windows;

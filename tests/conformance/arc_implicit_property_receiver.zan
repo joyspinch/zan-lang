@@ -1,0 +1,199 @@
+using System;
+using System.Collections.Generic;
+
+// Weak witnesses make receiver leaks fail even without --check-leaks.
+// The conformance harness also checks strings, arrays, collections and closures.
+class PropertyWitness {
+    public weak PropertyLeaf Last;
+    public weak PropertyOwner Owner;
+}
+
+class PropertyLeaf {
+    public int Value;
+    public PropertyLeaf(int value) { this.Value = value; }
+    public int Read() { return this.Value; }
+    public int PostS(PropertyOwner sender) { return this.Value + sender.Marker; }
+}
+
+delegate int PropertyRead();
+
+struct PropertyPair {
+    public int Left;
+    public int Right;
+}
+
+struct PropertyBundle {
+    public List<int> Items;
+}
+
+class PropertyOwner {
+    public int Marker = 37;
+    PropertyWitness witness;
+    PropertyLeaf current;
+    public PropertyLeaf Field;
+    public PropertyLeaf Auto { get; set; }
+
+    public PropertyOwner(PropertyWitness witness) {
+        this.witness = witness;
+        this.Field = new PropertyLeaf(11);
+        this.Auto = new PropertyLeaf(13);
+    }
+
+    public PropertyLeaf Fresh {
+        get {
+            PropertyLeaf leaf = new PropertyLeaf(5);
+            this.witness.Last = leaf;
+            return leaf;
+        }
+    }
+    public PropertyLeaf Current { get { return this.current; } }
+    public object ObjectValue { get { return new PropertyLeaf(7); } }
+    public string Text { get { return "value-" + Convert.ToString(this.Marker); } }
+    public int[] ArrayValue { get { return new int[2]; } }
+    public List<int> ListValue {
+        get {
+            List<int> values = new List<int>();
+            values.Add(17);
+            return values;
+        }
+    }
+    public PropertyRead Callback { get { return this.ReadMarker; } }
+    public int Number { get { return this.Marker; } }
+    public bool Flag { get { return this.Marker == 37; } }
+    public int? Maybe { get { return this.Marker; } }
+    public PropertyPair Pair {
+        get {
+            PropertyPair pair = new PropertyPair();
+            pair.Left = 3;
+            pair.Right = 4;
+            return pair;
+        }
+    }
+    public PropertyBundle Bundle {
+        get {
+            PropertyBundle bundle = new PropertyBundle();
+            bundle.Items = new List<int>();
+            bundle.Items.Add(19);
+            return bundle;
+        }
+    }
+    public static PropertyLeaf StaticFresh { get { return new PropertyLeaf(23); } }
+
+    public int ReadMarker() { return this.Marker; }
+    public int BareReceiver() { return Fresh.PostS(this); }
+    public int ThisReceiver() { return this.Fresh.PostS(this); }
+    public int BareCurrent() { return Current.PostS(this); }
+    public int ThisCurrent() { return this.Current.PostS(this); }
+    public static int BareStatic() { return StaticFresh.Read(); }
+    public static int MemberStatic() { return PropertyOwner.StaticFresh.Read(); }
+
+    public void ResetCurrent() {
+        this.current = new PropertyLeaf(5);
+        this.witness.Last = this.current;
+    }
+    public void ClearCurrent() { this.current = null; }
+
+    public void CheckTypes() {
+        Program.Check(Program.ReadObject(ObjectValue) == 7, "bare object getter");
+        Program.Check(Program.ReadObject(this.ObjectValue) == 7, "this object getter");
+        Program.Check(Text == "value-37", "bare string getter");
+        Program.Check(this.Text == "value-37", "this string getter");
+        Program.Check(ArrayValue.Length == 2, "bare array receiver");
+        Program.Check(this.ArrayValue.Length == 2, "this array receiver");
+        Program.Check(ListValue.Contains(17), "bare list receiver");
+        Program.Check(this.ListValue.Contains(17), "this list receiver");
+        Program.Check(!ListValue.Contains(18), "bare list receiver miss");
+        Program.Check(!this.ListValue.Contains(18), "this list receiver miss");
+        Program.Check(ListValue.IndexOf(17) == 0, "bare list index receiver");
+        Program.Check(this.ListValue.IndexOf(17) == 0, "this list index receiver");
+        Program.Check(ListValue.IndexOf(18) == -1, "bare list index miss");
+        Program.Check(this.ListValue.IndexOf(18) == -1, "this list index miss");
+        Program.Check(ListValue.LastIndexOf(17) == 0, "bare list last index receiver");
+        Program.Check(this.ListValue.LastIndexOf(17) == 0, "this list last index receiver");
+        Program.Check(ListValue.LastIndexOf(18) == -1, "bare list last index miss");
+        Program.Check(this.ListValue.LastIndexOf(18) == -1, "this list last index miss");
+        List<int> borrowedList = ListValue;
+        Program.Check(borrowedList.Contains(17) && !borrowedList.Contains(18), "borrowed list contains");
+        Program.Check(borrowedList.IndexOf(17) == 0 && borrowedList.IndexOf(18) == -1, "borrowed list index");
+        Program.Check(borrowedList.LastIndexOf(17) == 0 && borrowedList.LastIndexOf(18) == -1, "borrowed list last index");
+        Program.Check(borrowedList.Count == 1 && borrowedList[0] == 17, "lookup released borrowed list");
+        Program.Check(Program.ReadCallback(Callback) == 37, "bare delegate getter");
+        Program.Check(Program.ReadCallback(this.Callback) == 37, "this delegate getter");
+        Program.Check(Number == 37 && this.Number == 37, "integer getters");
+        Program.Check(Flag && this.Flag, "boolean getters");
+        Program.Check(Program.ReadMaybe(Maybe) == 37, "bare nullable getter");
+        Program.Check(Program.ReadMaybe(this.Maybe) == 37, "this nullable getter");
+        Program.Check(Program.ReadPair(Pair) == 7, "bare struct getter");
+        Program.Check(Program.ReadPair(this.Pair) == 7, "this struct getter");
+        Program.Check(Program.ReadBundle(Bundle) == 19, "bare managed struct getter");
+        Program.Check(Program.ReadBundle(this.Bundle) == 19, "this managed struct getter");
+
+        // These are borrowed loads. Repeated receiver calls must not consume them.
+        Program.Check(Field.Read() == 11 && this.Field.Read() == 11, "field receivers");
+        Program.Check(Auto.Read() == 13 && this.Auto.Read() == 13, "auto property receivers");
+        PropertyLeaf fromField = Field;
+        PropertyLeaf fromAuto = Auto;
+        PropertyLeaf fromGetter = Fresh;
+        Program.Check(fromField.Read() == 11 && fromAuto.Read() == 13, "borrowed captures");
+        Program.Check(fromGetter.Read() == 5, "owned getter capture");
+    }
+
+    public void CheckShadow() {
+        // A local hiding the custom getter remains borrowed, including as receiver.
+        PropertyLeaf Fresh = new PropertyLeaf(29);
+        Program.Check(Fresh.Read() == 29 && Fresh.Read() == 29, "shadowed getter receiver");
+        PropertyLeaf copy = Fresh;
+        Program.Check(copy.Read() == 29 && Fresh.Read() == 29, "shadowed getter capture");
+    }
+}
+
+class Program {
+    public static void Check(bool condition, string message) {
+        if (!condition) throw new Exception(message);
+    }
+    public static int ReadObject(object value) {
+        PropertyLeaf leaf = (PropertyLeaf)value;
+        return leaf.Read();
+    }
+    public static int ReadCallback(PropertyRead read) { return read(); }
+    public static int ReadMaybe(int? value) { return value ?? 0; }
+    public static int ReadPair(PropertyPair pair) { return pair.Left + pair.Right; }
+    public static int ReadBundle(PropertyBundle bundle) { return bundle.Items[0]; }
+
+    static void Main() {
+        PropertyWitness witness = new PropertyWitness();
+        PropertyOwner owner = new PropertyOwner(witness);
+        witness.Owner = owner;
+        for (int i = 0; i < 8; i++) {
+            Program.Check(owner.BareReceiver() == 42, "bare getter receiver result");
+            Program.Check(witness.Last == null, "bare getter receiver leaked");
+            Program.Check(owner.ThisReceiver() == 42, "this getter receiver result");
+            Program.Check(witness.Last == null, "this getter receiver leaked");
+            Program.Check(owner.Fresh.PostS(owner) == 42, "member getter receiver result");
+            Program.Check(witness.Last == null, "member getter receiver leaked");
+
+            owner.ResetCurrent();
+            Program.Check(owner.BareCurrent() == 42, "bare stored getter result");
+            owner.ClearCurrent();
+            Program.Check(witness.Last == null, "bare stored getter retained");
+            owner.ResetCurrent();
+            Program.Check(owner.ThisCurrent() == 42, "this stored getter result");
+            owner.ClearCurrent();
+            Program.Check(witness.Last == null, "this stored getter retained");
+            owner.ResetCurrent();
+            Program.Check(owner.Current.PostS(owner) == 42, "member stored getter result");
+            owner.ClearCurrent();
+            Program.Check(witness.Last == null, "member stored getter retained");
+
+            owner.CheckTypes();
+            Program.Check(witness.Last == null, "owned getter local retained");
+            owner.CheckShadow();
+            Program.Check(PropertyOwner.BareStatic() == 23, "bare static getter");
+            Program.Check(PropertyOwner.MemberStatic() == 23, "member static getter");
+            Program.Check(witness.Owner != null && owner.Marker == 37, "getter released this");
+        }
+        owner = null;
+        Program.Check(witness.Owner == null, "getter retained this");
+        Console.WriteLine("ARC_IMPLICIT_PROPERTY_RECEIVER_OK");
+    }
+}

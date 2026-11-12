@@ -1,0 +1,145 @@
+using System;
+using System.Net.Tls;
+using System.Security.Cryptography;
+
+// Captured from Python ssl / OpenSSL 3.0.13's default TLS 1.2 server flight.
+// ClientHello matches production suites/groups/signature_algorithms. OpenSSL
+// selected X25519 + rsa_pss_rsae_sha256 (0x0804); openssl dgst verified the
+// captured signature with SHA-256, PSS and a 32-byte salt. No private key remains.
+// Certificate trust/expiry/hostname are tested by integration/net_interop_test.py;
+// this offline vector isolates authenticated ServerKeyExchange dispatch and bytes.
+class Tls12RsaPss {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        Console.WriteLine((ok ? "PASS " : "FAIL ") + name);
+        if (!ok) { Tls12RsaPss.failures = Tls12RsaPss.failures + 1; }
+    }
+
+    static byte[] Certificate() {
+        return Convert.FromHexString(
+            "30820309308201f1a00302010202142f814485f67b7eb367b90d47990d06136ec6db7d300d06092a864886f70d01010b"
+            + "050030143112301006035504030c096c6f63616c686f7374301e170d3236313131303136333731345a170d3236313131"
+            + "323136333731345a30143112301006035504030c096c6f63616c686f737430820122300d06092a864886f70d01010105"
+            + "000382010f003082010a0282010100be6d5e19d8ff3487d1eaf6c0ce783318ebbd831729d25802066629451d27160485"
+            + "916781f444ba553829fb58e3058ae58de33da4cf8cd592521b6c5885f6fe1f16034ef504707c6ecbe88fea156b88b41e"
+            + "a138fb0ef51fd11ad824087446564a76feddd8179a811b37057393f6c122a0ea5e37d08e982bda01ee710be482166e4f"
+            + "c9a71eafe7cd081682be6a8ae011186ccb3a713c62068bff39afbd761fc5e3ebe5b7f7c796ba1a20a1da9ccd90cb566e"
+            + "512d9792d120ccbdede3982850e538181ac22a8357a7fa598d24ee9aed2af5904619f10af8956b9c7d842f96284b62f7"
+            + "7fa0819165831a3845c6303fb9a626b2a76c1cd60c52baeb95ee11bdf953550203010001a3533051301d0603551d0e04"
+            + "1604144a119e24bed7c2c2678807605e2edb7ccf3abb67301f0603551d230418301680144a119e24bed7c2c267880760"
+            + "5e2edb7ccf3abb67300f0603551d130101ff040530030101ff300d06092a864886f70d01010b0500038201010017d5f0"
+            + "c9a6ee3a94b990fc4297974b94921f46c01c3ada18dba940f548b68ceff35590a245f5bdcf5801fd540f7f3e77dde061"
+            + "d2eb217dcbc23b746a53199f3f2796c6f3c04762a827d8bacdf969c6c9e508d0fd2deec2f5cbca0f80b6d6aa0ed4fb68"
+            + "c1e294d0de4b89b0f85a37c467be3b6da962558d321b0062ccfbfcf75636a01590f51ec2083b0794979ff62b87ce467e"
+            + "342ddf8246d39d6add48e5d74b8edd179528de047fa837ee5c219b818a00be62ea5ebc0a3bbc6a01f84414dbc49758da"
+            + "4470bf0c9eb63d4d717642d76382ce33312cfa9742db1c100ebb3d5997ac7acce31198ddd00b6abb9b24c9b15561d823"
+            + "06a3a0bd4621b772fe634eb817");
+    }
+
+    static byte[] ClientRandom() {
+        return Convert.FromHexString(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    }
+
+    static byte[] ServerRandom() {
+        return Convert.FromHexString(
+            "074495c1f71e67595b06e2399d90fe4271c0e138c526b1ea7cf96a6021381a46");
+    }
+
+    static byte[] Exchange() {
+        return Convert.FromHexString(
+            "03001d201d12318edb1c085e041ad0e2198f081336f49f8c2380a5fdbac7f98062e06f31080401003e18b9ae081556c2"
+            + "465ea7b9bdaaa3d6b0e79e979de662205178d888c8b4a354e0959a51b3be833adff8dd7a7f5ac217c051e6dc4793c148"
+            + "1e2f528049d36c5bc8e99616f134f8cc2e853c30b9581ef14aa8d0e76b495a84f735d56ac897f4e742333b617420954d"
+            + "19463686e4546575afcfb5e1e318707802c3648f5fba42f39608acd64074e2d48263d2940c3f341ef3f775056bd87d65"
+            + "8ce96d2912c8873214c38c7d27419ba22647e3237aeb2170aba1f8fd8add1eabee82d8e0cbe8fd71a7200604b9c32c9d"
+            + "ca0be4475adc4aba9d817288ff5923194fec7bc4b9c7469ada8536a93fd79da1ab488349dd8073740f9f3bd6476f314b"
+            + "f3682c84e00dedca");
+    }
+
+    static TlsEngine Client() {
+        TlsEngine engine = new TlsEngine("localhost", false, true, null, false,
+            null, null, false, "", "");
+        engine.state = TlsEngine.StateTls12Handshake;
+        engine.negotiatedVersion = TlsRecord.VersionTls12;
+        engine.negotiatedCipherSuite = 0xc02f;
+        engine.clientRandom = Tls12RsaPss.ClientRandom();
+        engine.serverRandom = Tls12RsaPss.ServerRandom();
+        byte[] certificate = Tls12RsaPss.Certificate();
+        engine.peerCert = X509Certificate.ParseForTls(certificate, certificate.Length);
+        return engine;
+    }
+
+    static int Feed(TlsEngine engine, byte[] body) {
+        TlsByteWriter message = new TlsByteWriter();
+        message.WriteU8(TlsRecord.HandshakeServerKeyExchange);
+        message.WriteU24(body.Length);
+        message.WriteBytes(body);
+        byte[] bytes = message.ToArray();
+        byte[] record = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake,
+            TlsRecord.VersionTls12, bytes, 0, bytes.Length);
+        engine.FeedNetwork(record, 0, record.Length);
+        return engine.Step();
+    }
+
+    static void Rejected(byte[] body, bool changeRandom, string error, string name) {
+        TlsEngine engine = Tls12RsaPss.Client();
+        if (changeRandom) { engine.clientRandom[0] = (byte)(engine.clientRandom[0] ^ 1); }
+        int status = Tls12RsaPss.Feed(engine, body);
+        Tls12RsaPss.Check(status < 0 && !engine.handshakeSignatureVerified
+            && engine.LastError() == error, name);
+    }
+
+    static int Main() {
+        TlsEngine valid = Tls12RsaPss.Client();
+        int status = Tls12RsaPss.Feed(valid, Tls12RsaPss.Exchange());
+        bool sameKey = valid.serverX25519Pub != null && valid.serverX25519Pub.Length == 32;
+        byte[] original = Tls12RsaPss.Exchange();
+        if (sameKey) {
+            for (int i = 0; i < 32; i = i + 1) {
+                if (valid.serverX25519Pub[i] != original[4 + i]) { sameKey = false; }
+            }
+        }
+        Tls12RsaPss.Check(status == 0 && valid.handshakeSignatureVerified
+            && valid.LastError() == "" && sameKey, "TLS12 OpenSSL RSA-PSS exchange accepted");
+
+        byte[] tampered = Tls12RsaPss.Exchange();
+        tampered[tampered.Length - 1] = (byte)(tampered[tampered.Length - 1] ^ 1);
+        Tls12RsaPss.Rejected(tampered, false, "TLS 1.2 ServerKeyExchange 签名校验失败",
+            "tampered PSS signature rejected");
+
+        byte[] changedKey = Tls12RsaPss.Exchange();
+        changedKey[4] = (byte)(changedKey[4] ^ 1);
+        Tls12RsaPss.Rejected(changedKey, false, "TLS 1.2 ServerKeyExchange 签名校验失败",
+            "tampered X25519 public key rejected");
+
+        Tls12RsaPss.Rejected(Tls12RsaPss.Exchange(), true,
+            "TLS 1.2 ServerKeyExchange 签名校验失败", "changed client random rejected");
+
+        byte[] pkcs = Tls12RsaPss.Exchange();
+        pkcs[36] = 4; pkcs[37] = 1;
+        Tls12RsaPss.Rejected(pkcs, false, "TLS 1.2 ServerKeyExchange 签名校验失败",
+            "PSS relabelled PKCS1 rejected");
+
+        byte[] ec = Tls12RsaPss.Exchange();
+        ec[36] = 4; ec[37] = 3;
+        Tls12RsaPss.Rejected(ec, false, "ServerKeyExchange 签名方案与服务器证书密钥类型不符",
+            "RSA certificate cannot verify ECDSA scheme");
+
+        byte[] unsupported = Tls12RsaPss.Exchange();
+        unsupported[37] = 5;
+        Tls12RsaPss.Rejected(unsupported, false, "ServerKeyExchange 参数或签名算法不受支持",
+            "unadvertised PSS SHA384 rejected");
+
+        byte[] malformed = Tls12RsaPss.Exchange();
+        malformed[39] = 1;
+        Tls12RsaPss.Rejected(malformed, false, "ServerKeyExchange 参数或签名算法不受支持",
+            "declared signature length mismatch rejected");
+
+        int duplicate = Tls12RsaPss.Feed(valid, Tls12RsaPss.Exchange());
+        Tls12RsaPss.Check(duplicate < 0 && valid.LastError() == "ServerKeyExchange 参数或签名算法不受支持",
+            "duplicate signed exchange rejected");
+        return Tls12RsaPss.failures == 0 ? 0 : 1;
+    }
+}

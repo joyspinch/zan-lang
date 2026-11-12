@@ -16,7 +16,25 @@ class Check {
     }
 }
 
+class WaitResults {
+    public int completed = 0;
+    public int succeeded = 0;
+}
+
 class Program {
+    static async void TimedWait(Gate g, WaitResults results, int ms) {
+        bool ok = await g.Wait(ms);
+        lock (results) {
+            results.completed = results.completed + 1;
+            if (ok) { results.succeeded = results.succeeded + 1; }
+        }
+    }
+
+    static async void Expire(long h, long ticket, int ms) {
+        await Task.Delay(ms);
+        Gate.zan_gate_ticket_signal_and_release(h, ticket);
+    }
+
     static async void Waker(Gate g, int afterMs) {
         await Task.Delay(afterMs);
         g.Signal();
@@ -50,6 +68,43 @@ class Program {
         Task.Spawn(Program.Waker(plain, 15));
         bool r4 = await plain.Wait();
         Check.True(r4, "unbounded wait still works");
+
+        Gate overlap = new Gate();
+        WaitResults results = new WaitResults();
+        Task.Spawn(Program.TimedWait(overlap, results, 20));
+        Task.Spawn(Program.TimedWait(overlap, results, 35));
+        int done = 0;
+        int okCount = 0;
+        long deadline = ServerMetrics.MonoMillis() + 2000;
+        while (done < 2 && ServerMetrics.MonoMillis() < deadline) {
+            await Task.Delay(5);
+            lock (results) {
+                done = results.completed;
+                okCount = results.succeeded;
+            }
+        }
+        Check.True(done == 2 && okCount == 2, "concurrent timeouts both return true");
+        overlap.Close();
+
+        // Two-argument Park must carry the exact arm, including completion
+        // before code generation reaches the suspend point.
+        Gate explicitTickets = new Gate();
+        long h = explicitTickets.Handle();
+        long first = Gate.zan_gate_arm(h);
+        long second = Gate.zan_gate_arm(h);
+        Gate.zan_gate_ticket_signal_and_release(h, second);
+        Task.Spawn(Program.Expire(h, first, 15));
+        await Gate.Park(h, first);
+        await Gate.Park(h, second);
+        Check.True(true, "explicit distinct tickets and early timeout resume");
+        explicitTickets.Close();
+        bool closed = await explicitTickets.Wait(10);
+        Check.True(!closed, "closed timed wait returns false");
+
+        silent.Close();
+        banked.Close();
+        woken.Close();
+        plain.Close();
     }
 
     static void Main() {

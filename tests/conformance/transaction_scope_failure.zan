@@ -1,0 +1,251 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+
+// No database: the counters expose duplicate completion even when a real UoW
+// would quietly ignore it. Dispose deliberately does not complete transactions.
+class ScopeUnitOfWork : IUnitOfWork {
+    public int commitMode;
+    public int rollbackMode;
+    public bool cleanupThrows;
+    public bool suspend;
+    public int commits;
+    public int rollbacks;
+    public int asyncCommits;
+    public int asyncRollbacks;
+    public int disposals;
+
+    public IDbConnection GetConnection() { return null; }
+    public void Commit() {
+        this.commits = this.commits + 1;
+        if (this.commitMode == 2) throw new ScopeCompletionError("commit");
+    }
+    public void Rollback() {
+        this.rollbacks = this.rollbacks + 1;
+        if (this.rollbackMode == 2) throw new ScopeCompletionError("rollback");
+    }
+    public async bool CommitAsync() {
+        this.asyncCommits = this.asyncCommits + 1;
+        if (this.suspend) await Task.Delay(1);
+        if (this.commitMode == 2) throw new ScopeCompletionError("commit");
+        return this.commitMode == 0;
+    }
+    public async bool RollbackAsync() {
+        this.asyncRollbacks = this.asyncRollbacks + 1;
+        if (this.suspend) await Task.Delay(1);
+        if (this.rollbackMode == 2) throw new ScopeCompletionError("rollback");
+        return this.rollbackMode == 0;
+    }
+    public void Dispose() {
+        this.disposals = this.disposals + 1;
+        if (this.cleanupThrows) throw new ScopeCleanupError();
+    }
+    public void CreateSavepoint(string name) { }
+    public void RollbackToSavepoint(string name) { }
+    public void ReleaseSavepoint(string name) { }
+    public async bool CreateSavepointAsync(string name) { return true; }
+    public async bool RollbackToSavepointAsync(string name) { return true; }
+    public async bool ReleaseSavepointAsync(string name) { return true; }
+    public DbResult Query(string sql) { return null; }
+    public DbResult Query(string sql, DbParams prms) { return null; }
+    public int Execute(string sql) { return 0; }
+    public int Execute(string sql, DbParams prms) { return 0; }
+    public string ExecuteScalar(string sql) { return ""; }
+    public string ExecuteScalar(string sql, DbParams prms) { return ""; }
+    public int GetProvider() { return DbProvider.Unknown; }
+    public async DbResult QueryAsync(string sql) { return null; }
+    public async DbResult QueryAsync(string sql, DbParams prms) { return null; }
+    public async int ExecuteAsync(string sql) { return 0; }
+    public async int ExecuteAsync(string sql, DbParams prms) { return 0; }
+    public async string ExecuteScalarAsync(string sql) { return ""; }
+    public async string ExecuteScalarAsync(string sql, DbParams prms) { return ""; }
+}
+
+class ScopeCompletionError : Exception {
+    public ScopeCompletionError(string operation) : base(operation) { }
+}
+
+class ScopeCleanupError : Exception {
+    public ScopeCleanupError() : base("cleanup") { }
+}
+
+class Program {
+    static int failures;
+
+    static void Check(bool condition, string name) {
+        if (!condition) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    static void Counts(ScopeUnitOfWork fake, int commits, int rollbacks, int asyncCommits, int asyncRollbacks, string name) {
+        Check(fake.commits == commits && fake.rollbacks == rollbacks &&
+            fake.asyncCommits == asyncCommits && fake.asyncRollbacks == asyncRollbacks &&
+            fake.disposals == 1, name + " completion and cleanup counts");
+    }
+
+    static async void ImplicitAsync(bool commit, int mode, bool cleanupThrows, bool suspend) {
+        ScopeUnitOfWork fake = new ScopeUnitOfWork();
+        fake.commitMode = mode;
+        fake.rollbackMode = mode;
+        fake.cleanupThrows = cleanupThrows;
+        fake.suspend = suspend;
+        TransactionScope scope = new TransactionScope(fake);
+        if (commit) scope.Complete();
+        bool result = false;
+        int caught = 0;
+        try {
+            result = await scope.DisposeAsync();
+        } catch (ScopeCompletionError e) {
+            caught = 1;
+            Check(e.Message == (commit ? "commit" : "rollback"), "async original exception payload");
+        } catch (ScopeCleanupError) {
+            caught = 2;
+        }
+        string name = commit ? "implicit async commit" : "implicit async rollback";
+        if (mode == 2) {
+            Check(caught == 1, name + " original exception wins cleanup");
+        } else if (mode == 0 && cleanupThrows) {
+            Check(caught == 2, name + " cleanup-only exception propagates");
+        } else {
+            Check(caught == 0 && result == (mode == 0), name + " result");
+        }
+        Check(scope.completed == (commit && mode == 0), name + " completed state");
+        bool lateCommit = await scope.CommitAsync();
+        bool lateRollback = await scope.RollbackAsync();
+        Check(!lateCommit && !lateRollback, name + " disposed completion rejected");
+        bool repeated = await scope.DisposeAsync();
+        Check(repeated == (mode == 0 && !cleanupThrows), name + " repeated result");
+        scope.Dispose();
+        Counts(fake, 0, 0, commit ? 1 : 0, commit ? 0 : 1, name);
+        Check(scope.disposed, name + " disposed");
+    }
+
+    static async void ExplicitAsync(bool commit, int mode, bool preComplete, bool syncDispose, bool suspend) {
+        ScopeUnitOfWork fake = new ScopeUnitOfWork();
+        fake.commitMode = mode;
+        fake.rollbackMode = mode;
+        fake.suspend = suspend;
+        TransactionScope scope = new TransactionScope(fake);
+        if (preComplete) scope.Complete();
+        bool result = false;
+        bool caught = false;
+        try {
+            if (commit) result = await scope.CommitAsync();
+            else result = await scope.RollbackAsync();
+        } catch (ScopeCompletionError e) {
+            caught = true;
+            Check(e.Message == (commit ? "commit" : "rollback"), "explicit async exception payload");
+        }
+        string name = commit ? "explicit async commit" : "explicit async rollback";
+        Check(caught == (mode == 2), name + " exception");
+        if (mode != 2) Check(result == (mode == 0), name + " result");
+        Check(scope.completed == (commit && mode == 0), name + " completed state");
+        // A prior or later Complete must not rearm a failed completion.
+        scope.Complete();
+        Check(scope.completed == (commit && mode == 0), name + " terminal Complete");
+        bool duplicate = commit ? await scope.CommitAsync() : await scope.RollbackAsync();
+        Check(duplicate == (mode == 0), name + " duplicate cached result");
+        bool opposite = commit ? await scope.RollbackAsync() : await scope.CommitAsync();
+        Check(!opposite, name + " opposite completion rejected");
+        scope.Commit();
+        scope.Rollback();
+        if (syncDispose) scope.Dispose();
+        bool disposed = await scope.DisposeAsync();
+        Check(disposed == (mode == 0), name + " disposal result");
+        bool repeated = await scope.DisposeAsync();
+        Check(repeated == (mode == 0), name + " repeated disposal result");
+        scope.Dispose();
+        Counts(fake, 0, 0, commit ? 1 : 0, commit ? 0 : 1, name);
+    }
+
+    static async void ExplicitSync(bool commit, bool throws, bool asyncDispose, bool suspend) {
+        ScopeUnitOfWork fake = new ScopeUnitOfWork();
+        fake.commitMode = throws ? 2 : 0;
+        fake.rollbackMode = throws ? 2 : 0;
+        fake.suspend = suspend;
+        TransactionScope scope = new TransactionScope(fake);
+        scope.Complete();
+        bool caught = false;
+        try {
+            if (commit) scope.Commit();
+            else scope.Rollback();
+        } catch (ScopeCompletionError e) {
+            caught = true;
+            Check(e.Message == (commit ? "commit" : "rollback"), "explicit sync exception payload");
+        }
+        string name = commit ? "explicit sync commit" : "explicit sync rollback";
+        Check(caught == throws, name + " exception");
+        Check(scope.completed == (commit && !throws), name + " completed state");
+        scope.Complete();
+        scope.Commit();
+        scope.Rollback();
+        bool duplicate = commit ? await scope.CommitAsync() : await scope.RollbackAsync();
+        Check(duplicate == !throws, name + " cached result across sync/async");
+        if (!asyncDispose) scope.Dispose();
+        bool result = await scope.DisposeAsync();
+        Check(result == !throws, name + " disposal result");
+        scope.Dispose();
+        Counts(fake, commit ? 1 : 0, commit ? 0 : 1, 0, 0, name);
+    }
+
+    static async void ImplicitSync(bool commit, bool throws, bool cleanupThrows) {
+        ScopeUnitOfWork fake = new ScopeUnitOfWork();
+        fake.commitMode = throws ? 2 : 0;
+        fake.rollbackMode = throws ? 2 : 0;
+        fake.cleanupThrows = cleanupThrows;
+        TransactionScope scope = new TransactionScope(fake);
+        if (commit) scope.Complete();
+        int caught = 0;
+        try {
+            scope.Dispose();
+        } catch (ScopeCompletionError e) {
+            caught = 1;
+            Check(e.Message == (commit ? "commit" : "rollback"), "sync original exception payload");
+        } catch (ScopeCleanupError) {
+            caught = 2;
+        }
+        string name = commit ? "implicit sync commit" : "implicit sync rollback";
+        Check(caught == (throws ? 1 : (cleanupThrows ? 2 : 0)), name + " exception precedence");
+        scope.Dispose();
+        bool result = await scope.DisposeAsync();
+        Check(result == (!throws && !cleanupThrows), name + " cached disposal result");
+        Counts(fake, commit ? 1 : 0, commit ? 0 : 1, 0, 0, name);
+    }
+
+    static async void Main() {
+        for (int suspension = 0; suspension < 2; suspension = suspension + 1) {
+            bool suspend = suspension == 1;
+            for (int operation = 0; operation < 2; operation = operation + 1) {
+                bool commit = operation == 0;
+                for (int mode = 0; mode < 3; mode = mode + 1) {
+                    await ImplicitAsync(commit, mode, false, suspend);
+                    await ImplicitAsync(commit, mode, true, suspend);
+                    await ExplicitAsync(commit, mode, false, false, suspend);
+                    await ExplicitAsync(commit, mode, true, true, suspend);
+                }
+                await ExplicitSync(commit, false, false, suspend);
+                await ExplicitSync(commit, false, true, suspend);
+                await ExplicitSync(commit, true, false, suspend);
+                await ExplicitSync(commit, true, true, suspend);
+                await ImplicitSync(commit, false, false);
+                await ImplicitSync(commit, false, true);
+                await ImplicitSync(commit, true, false);
+                await ImplicitSync(commit, true, true);
+            }
+        }
+        IUnitOfWork absent = null;
+        TransactionScope empty = new TransactionScope(absent);
+        Check(!await empty.CommitAsync(), "empty commit rejected");
+        Check(!await empty.RollbackAsync(), "empty rollback rejected");
+        Check(await empty.DisposeAsync(), "empty disposal succeeds");
+        Check(await empty.DisposeAsync(), "empty repeated disposal succeeds");
+        bool lateComplete = false;
+        try { empty.Complete(); }
+        catch (Exception) { lateComplete = true; }
+        Check(lateComplete, "Complete after disposal still throws");
+        if (Program.failures != 0) throw new Exception("TransactionScope checks failed");
+        Console.WriteLine("ok TransactionScope completion results, terminal attempts, cleanup and exceptions");
+    }
+}

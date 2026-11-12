@@ -1,0 +1,125 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.Threading;
+
+class MutationRow {
+    public int id;
+    public int bucket;
+    public int amount;
+}
+
+class MutationPair {
+    [Column(IsPrimary = true)]
+    public int leftKey;
+    [Column(IsPrimary = true)]
+    public string rightKey;
+    public int bucket;
+    public int amount;
+}
+
+class MutationAsyncOnly : IDbExecutor {
+    public SqliteConnection db;
+    public Action suspended;
+    public int queries;
+    public int writes;
+    public int GetProvider() { return DbProvider.SQLite; }
+    public DbResult Query(string sql) { throw new Exception("sync Query used"); }
+    public DbResult Query(string sql, DbParams ps) { throw new Exception("sync Query used"); }
+    public int Execute(string sql) { throw new Exception("sync Execute used"); }
+    public int Execute(string sql, DbParams ps) { throw new Exception("sync Execute used"); }
+    public string ExecuteScalar(string sql) { throw new Exception("sync scalar used"); }
+    public string ExecuteScalar(string sql, DbParams ps) { throw new Exception("sync scalar used"); }
+    public async DbResult QueryAsync(string sql) { return await this.QueryAsync(sql, new DbParams()); }
+    public async DbResult QueryAsync(string sql, DbParams ps) {
+        this.queries = this.queries + 1;
+        await Task.Delay(1);
+        Action change = this.suspended;
+        this.suspended = null;
+        DbResult result = this.db.Query(sql, ps);
+        if (change != null) { change(); }
+        return result;
+    }
+    public async int ExecuteAsync(string sql) { return await this.ExecuteAsync(sql, new DbParams()); }
+    public async int ExecuteAsync(string sql, DbParams ps) {
+        this.writes = this.writes + 1;
+        await Task.Delay(1);
+        return this.db.Execute(sql, ps);
+    }
+    public async string ExecuteScalarAsync(string sql) { throw new Exception("unexpected scalar"); }
+    public async string ExecuteScalarAsync(string sql, DbParams ps) { throw new Exception("unexpected scalar"); }
+}
+
+class Program {
+    static void Check(bool value, string name) {
+        if (!value) { throw new Exception(name); }
+        Console.WriteLine(name);
+    }
+    static int Number(SqliteConnection db, string sql) { return int.Parse(db.ExecuteScalar(sql)); }
+    static async void Main() {
+        SqliteConnection db = SqliteConnection.Open(":memory:");
+        db.Execute("CREATE TABLE MutationRow(id INTEGER PRIMARY KEY, bucket INT, amount INT)");
+        db.Execute("INSERT INTO MutationRow VALUES(1,1,10),(2,1,20),(3,2,30),(4,1,40)");
+        MutationAsyncOnly only = new MutationAsyncOnly();
+        only.db = db;
+        UpdateQuery<MutationRow> update = only.Update<MutationRow>().Set(a => a.amount, 99)
+            .Where(a => a.id > 1).Where(a => a.id < 4).WhereEq("bucket", 1);
+        Check(only.queries == 0 && only.writes == 0, "update construction has no IO");
+        only.suspended = () => { update.Set(a => a.bucket, 9); update.Where(a => a.id == 4); };
+        int changed = await update.ExecuteAffrowsAsync();
+        Check(changed == 1 && Program.Number(db, "SELECT amount FROM MutationRow WHERE id=2") == 99
+            && Program.Number(db, "SELECT bucket FROM MutationRow WHERE id=2") == 1,
+            "async update intersects predicates and snapshots setters");
+        Check(await update.ExecuteAffrowsAsync() == 0
+            && Program.Number(db, "SELECT amount FROM MutationRow WHERE id=1") == 10,
+            "reused update and zero hits stay fail closed");
+        UpdateQuery<MutationRow> repeat = only.Update<MutationRow>().Set(a => a.amount, 55).Where(a => a.id == 1);
+        Check(await repeat.ExecuteAffrowsAsync() == 1 && await repeat.ExecuteAffrowsAsync() == 1,
+            "repeated update does not accumulate key bindings");
+        int queryCount = only.queries;
+        DeleteQuery<MutationRow> delete = only.Delete<MutationRow>().Where(a => a.id > 1)
+            .Where(a => a.id < 4).WhereEq("bucket", 1);
+        Check(queryCount == only.queries, "delete construction has no IO");
+        Check(await delete.ExecuteAffrowsAsync() == 1 && await delete.ExecuteAffrowsAsync() == 0
+            && Program.Number(db, "SELECT COUNT(*) FROM MutationRow") == 3,
+            "async delete intersects predicates and rereads candidates");
+        db.Execute("CREATE TABLE MutationPair(leftKey INT,rightKey TEXT,bucket INT,amount INT,PRIMARY KEY(leftKey,rightKey))");
+        db.Execute("INSERT INTO MutationPair VALUES(1,'a',0,10),(1,'b',1,20),(2,'a',1,30)");
+        UpdateQuery<MutationPair> pair = only.Update<MutationPair>().Set(a => a.amount, 77)
+            .Where(a => a.leftKey > 0).WhereEq("bucket", 1);
+        only.suspended = () => { db.Execute("UPDATE MutationPair SET bucket=0 WHERE leftKey=1 AND rightKey='b'"); };
+        Check(await pair.ExecuteAffrowsAsync() == 1
+            && Program.Number(db, "SELECT amount FROM MutationPair WHERE leftKey=1 AND rightKey='b'") == 20,
+            "composite keys retain bound SQL guard across await");
+        Check(await only.Delete<MutationPair>().Where(a => a.leftKey > 0).WhereEq("bucket", 1)
+            .ExecuteAffrowsAsync() == 1 && Program.Number(db, "SELECT COUNT(*) FROM MutationPair") == 2,
+            "composite text and integer delete keys stay parameterized");
+        Check(db.Update<MutationRow>().Set(a => a.amount, 66).Where(a => a.id == 4).ExecuteAffrows() == 1
+            && db.Delete<MutationRow>().Where(a => a.id == 4).ExecuteAffrows() == 1,
+            "sync terminals retain predicate behavior");
+        UpdateQuery<MutationRow> guarded = only.Update<MutationRow>().Set(a => a.amount, 88)
+            .Where("bucket = ? OR id = ?").Where(a => a.id == 3);
+        guarded.inner.Pi(1);
+        guarded.inner.Pi(3);
+        UpdateQuery<MutationRow> emptyGuard = only.Update<MutationRow>().Set(a => a.amount, 111)
+            .Where("bucket = ? OR id = ?").Where(a => a.id < 0);
+        emptyGuard.inner.Pi(1);
+        emptyGuard.inner.Pi(3);
+        Check(await emptyGuard.ExecuteAffrowsAsync() == 0 && await guarded.ExecuteAffrowsAsync() == 1
+            && Program.Number(db, "SELECT amount FROM MutationRow WHERE id=1") == 55,
+            "raw SQL OR cannot bypass update predicate");
+        DeleteQuery<MutationRow> guardedDelete = only.Delete<MutationRow>()
+            .Where("bucket = ? OR id = ?").Where(a => a.id == 3);
+        guardedDelete.inner.Pi(1);
+        guardedDelete.inner.Pi(3);
+        DeleteQuery<MutationRow> emptyDelete = only.Delete<MutationRow>()
+            .Where("bucket = ? OR id = ?").Where(a => a.id < 0);
+        emptyDelete.inner.Pi(1);
+        emptyDelete.inner.Pi(3);
+        Check(await emptyDelete.ExecuteAffrowsAsync() == 0 && await guardedDelete.ExecuteAffrowsAsync() == 1
+            && Program.Number(db, "SELECT COUNT(*) FROM MutationRow WHERE id=1") == 1,
+            "raw SQL OR cannot bypass delete predicate");
+        db.Close();
+    }
+}

@@ -136,6 +136,9 @@ class Fake {
     static string PASSWORD = "masterkey";
 
     static int attaches = 0;
+    static bool failRollback = false;
+    static bool failTransaction = false;
+    static int cleanupErrors = 0;
     static int badProofs = 0;
     static int inFlight = 0;
     static int peak = 0;
@@ -365,7 +368,13 @@ class Fake {
                 await Fake.RecvInt(client);
                 FbBytes tpb = await Fake.RecvBlock(client);
                 if (tpb != null) { tpb.Release(); }
-                await Fake.Send(client, Fake.Ok(2));
+                if (Fake.failTransaction) {
+                    Fake.failTransaction = false;
+                    Fake.cleanupErrors = Fake.cleanupErrors + 1;
+                    await Fake.Send(client, Fake.Err(Cap.STATUS_NOSUCHTABLE));
+                } else {
+                    await Fake.Send(client, Fake.Ok(2));
+                }
             } else if (op == FbOp.ALLOCATE_STATEMENT) {
                 await Fake.RecvInt(client);
                 await Fake.Send(client, Fake.Ok(3));
@@ -429,6 +438,12 @@ class Fake {
                 await Fake.RecvInt(client);
                 await Fake.RecvInt(client);
                 await Fake.Send(client, Fake.Ok(0));
+            } else if (op == FbOp.ROLLBACK && Fake.failRollback) {
+                await Fake.RecvInt(client);
+                Fake.failRollback = false;
+                Fake.cleanupErrors = Fake.cleanupErrors + 1;
+                // A valid SQL status error leaves this wire session connected.
+                await Fake.Send(client, Fake.Err(Cap.STATUS_NOSUCHTABLE));
             } else if (op == FbOp.COMMIT_RETAINING || op == FbOp.COMMIT
                     || op == FbOp.ROLLBACK || op == FbOp.DETACH) {
                 await Fake.RecvInt(client);
@@ -757,9 +772,38 @@ class Program {
         pool.Release(db);
     }
 
+    static async void CleanupFailure(bool replacementBegin) {
+        FirebirdPool pool = new FirebirdPool("127.0.0.1", Fake.PORT, "test.fdb",
+                                               "sysdba", "masterkey", false, 1);
+        FirebirdConnection c = await pool.AcquireAsync();
+        Program.Check("cleanup fixture acquired", c != null && c.IsConnected());
+        if (c == null) { pool.Close(); return; }
+        Program.Check("cleanup fixture begins transaction", await c.BeginTransactionAsync());
+        int errors = Fake.cleanupErrors;
+        int attaches = Fake.attaches;
+        Fake.failRollback = !replacementBegin;
+        Fake.failTransaction = replacementBegin;
+        pool.Release(c);
+        // Both a failed rollback and a failed replacement transaction must evict.
+        for (int i = 0; i < 400 && pool.LiveCount() != 0 && pool.IdleCount() == 0; i = i + 1) {
+            await Task.Delay(5);
+        }
+        Program.CheckEqInt("cleanup server sent one nonfatal status", Fake.cleanupErrors, errors + 1);
+        Program.CheckEqInt("uncertain session is not idle", pool.IdleCount(), 0);
+        Program.CheckEqInt("uncertain session releases its slot", pool.LiveCount(), 0);
+        Program.Check("uncertain session physically closed", !c.IsConnected());
+        FirebirdConnection fresh = await pool.AcquireAsync();
+        Program.Check("acquire after failed cleanup is usable", fresh != null && fresh.IsConnected());
+        Program.CheckEqInt("acquire attaches a fresh session", Fake.attaches, attaches + 1);
+        Program.Check("failed cleanup session is not reused", fresh != c);
+        pool.Release(fresh);
+        pool.Close();
+        Program.CheckEqInt("failed cleanup regression drains live count", pool.LiveCount(), 0);
+    }
+
     static async void Live() {
         nint listener = Fake.Listen();
-        Task.Spawn(Fake.Accept(listener, 5));
+        Task.Spawn(Fake.Accept(listener, 9));
 
         FirebirdConnection db = await FirebirdConnection.OpenAsync(
             "127.0.0.1", Fake.PORT, "test.fdb", "sysdba", "masterkey", false);
@@ -879,6 +923,9 @@ class Program {
         Program.CheckEqInt("close drains the pool", pool.IdleCount(), 0);
         FirebirdConnection dead = await pool.AcquireAsync();
         Program.Check("acquire on a closed pool yields null", dead == null);
+
+        await Program.CleanupFailure(false);
+        await Program.CleanupFailure(true);
 
         FirebirdPool broken = new FirebirdPool("127.0.0.1", 1, "test.fdb",
                                                   "sysdba", "masterkey", false, 2);

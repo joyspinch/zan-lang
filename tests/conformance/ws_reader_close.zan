@@ -1,0 +1,482 @@
+using System;
+using System.IO;
+using System.Platform;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Net.WebSocket;
+using System.Threading;
+
+namespace System.Net.WebSocket;
+
+class ReaderClosePair {
+    public TcpClient conn;
+    public TcpClient peer;
+    public int result;
+    public string text;
+    public bool sent;
+    public TlsStream peerStream;
+}
+
+class Program {
+    static string CA_CERT = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDDTCCAfWgAwIBAgIUb/bsPNHjOsVxStVQV+eCJLvKtSEwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTI0WhcNMzYw\n"
+        + "ODAzMTcxMTI0WjAWMRQwEgYDVQQDDAtaYW4gVGVzdCBDQTCCASIwDQYJKoZIhvcN\n"
+        + "AQEBBQADggEPADCCAQoCggEBAK0xBdnDn6QVIaiCyPqPM3TDnomvnz3XrwUG54Kj\n"
+        + "13vQfAbuxcg/0zkrr/yxOxJRcnkh4TPzm6i98ITem6kqw7ApO7XPXBOhe/Z5OdOp\n"
+        + "ouBnQMcxgo9CqOKSqfJ9YoYdOrTxve/SiO0AHjEKaDLph8GsPynGEHftr9uRZm9H\n"
+        + "qn08QjJDxtDiyn9xil+7ZMj1eNQuvKMDRTIgO4f37+JbIFRYoaZ8Zu2aRyf05Can\n"
+        + "SyC6/g912iOgr3NS1JQuAQAe5+lAZrLgi3EAW3S4mjFJCfJpBngzC+wIuzJTFxCA\n"
+        + "wsA+PmQtPE1g8c+L24cZxfPzT0BedYH1jbu+HSz2VbUTbVUCAwEAAaNTMFEwHQYD\n"
+        + "VR0OBBYEFJ4qKfHGlmX+d/aJQBMFLs6jiEWUMB8GA1UdIwQYMBaAFJ4qKfHGlmX+\n"
+        + "d/aJQBMFLs6jiEWUMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEB\n"
+        + "AAwPQAF56rKoGJ1d5bdAP/IqpNoRwKcUL/tbNMDxaLCV29/RvXTK5pneOB2YnyHd\n"
+        + "RSUu+OBqc/KOl8f2WMmGWU+XpIHunBO9sikazAEy4TZQTob47nlI7s4x9Q3OETRm\n"
+        + "S1FGeF2lLwcjD5qXrWNLKxP5ZLz7dmlk2qii6pEym1huaQy4352UY5WheS9ofTl0\n"
+        + "JA4PFXhJqJLMFSrbz5IY00N3QPou99EWh9AFcaxksCOajtp7drG/VZEegDhhAGWa\n"
+        + "iJHZaakLuy1uXinh9EpHxOuJ43+TmW+JN7ktlPXML0PFl+DubwDtmnux6fOdRM89\n"
+        + "XyzocGB8jnk9l+9BX6qY1rU=\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static string SERVER_CERT = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDGDCCAgCgAwIBAgIUaqrty6rrTvVQ2rRAeBvfwNJolBUwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTMyWhcNMzYw\n"
+        + "ODAzMTcxMTMyWjAYMRYwFAYDVQQDDA13cm9uZy5leGFtcGxlMIIBIjANBgkqhkiG\n"
+        + "9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqvgmHOa4fI0bR4y48uabV+hkIfiIMMQgMVGE\n"
+        + "6QdVXCQjGTbjavVhr655UkoPmA/g+8Lj+KKGCq3MpGSuIxRvWgp/Syl2O77l7Amd\n"
+        + "SdlidgLvlUg5h4hlnqIWLNxpiGF6TMIoyJ4ohWMqKuuIAPoeWF933yuSWsorG4fz\n"
+        + "FqUJi5zpfrVz9QGbz4cpOJXguuk6r8BzonL8mMqSglcyoiPearaYQWOSpohriCug\n"
+        + "p8PpGKskOKD8OBaKdvTc+e05Stsbgj+MCDkKSgLPi3IXDUPHS66MLVyOX4gNk7w+\n"
+        + "evhPCJJQtkr1wPHd9zFB9I98eZMwQzmEdqvDFeoYe6FUrFGqyQIDAQABo1wwWjAY\n"
+        + "BgNVHREEETAPgg13cm9uZy5leGFtcGxlMB0GA1UdDgQWBBSGH7lrfqpCUMF/8UYv\n"
+        + "LVX/XVGLFDAfBgNVHSMEGDAWgBSeKinxxpZl/nf2iUATBS7Oo4hFlDANBgkqhkiG\n"
+        + "9w0BAQsFAAOCAQEAN5byRoBRRJguzdZFJOOrwQxy47rNrnoKdL9QXV4s5XcRF5ZC\n"
+        + "K3pueEdmQMW4CgOJ38F03e3Fd8SF/d73pNimoeOUmjrDNC83GFPYsweiL4PNCqDU\n"
+        + "PKoixouw0gdl2eHUWg7qd+aTNVg2F2rFDcHzQu0/tQNSkHVmKC5ZIT4OjWt9IOjl\n"
+        + "bMT3/Bog5jXwKPMLdfMj8Z3J4432DE797PxY7UN9I+fXgTtj4AUQeR1BAi2jh7L8\n"
+        + "fIY9E5BPmY3+jNX0TEXiDYj6uKokXbx4N82ksSBAovOXPgiUYqRbmPlpyd7l5YE1\n"
+        + "XcaVSekej9G4zp6CQVO8o32S7vcVG3/giNJPRg==\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static string SERVER_KEY = "-----BEGIN PRIVATE KEY-----\n"
+        + "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCq+CYc5rh8jRtH\n"
+        + "jLjy5ptX6GQh+IgwxCAxUYTpB1VcJCMZNuNq9WGvrnlSSg+YD+D7wuP4ooYKrcyk\n"
+        + "ZK4jFG9aCn9LKXY7vuXsCZ1J2WJ2Au+VSDmHiGWeohYs3GmIYXpMwijIniiFYyoq\n"
+        + "64gA+h5YX3ffK5Jayisbh/MWpQmLnOl+tXP1AZvPhyk4leC66TqvwHOicvyYypKC\n"
+        + "VzKiI95qtphBY5KmiGuIK6Cnw+kYqyQ4oPw4Fop29Nz57TlK2xuCP4wIOQpKAs+L\n"
+        + "chcNQ8dLrowtXI5fiA2TvD56+E8IklC2SvXA8d33MUH0j3x5kzBDOYR2q8MV6hh7\n"
+        + "oVSsUarJAgMBAAECggEAKZ3dYygbTMApXYWI6KGPOzsHkshVWG+JOZATFwkws0zd\n"
+        + "mU/l1D2WUYYaJJiACr8EwCvcw8NF9xf+yh5yz/mzsDqBaVmWnOz3OTlO5vDKOZk1\n"
+        + "2gP6cv4V5GMmnDVr3+WAeGpDtK/hA7UTiN6L3NcFZ3QXsQSBa+Wt0BYL611xgSDj\n"
+        + "IkI7sBvBX6/wQNHyvJ+Y4fykOjjfrbL3PQ0PQ/Ap9fXNXyL6pT8qj35Xy0x3FqK1\n"
+        + "ign28D4VN8mbpd9rUtT6/UNDVZksDOBHsUoweIZo85nIX7r0vtvD7uSl3RElTGId\n"
+        + "QMdavaRMQdQ7hGlB/CB6k85pZs+jrUT7DV5dI0evzQKBgQDeEC9Y9dUVBmkPKIR5\n"
+        + "zRIkhn6D8d/gbsOwy22VuvkbvrzX8NtLWfh4teUu7uLeYCo2LuryPlcUKOjUWgt2\n"
+        + "9O2CfvyqJ40AQ1IdvYa/fWQoq/ZTURG8iRfhtuk+e1dshEvmidE0VkWoao1cfEHX\n"
+        + "V8Yjefm3xAPoXMS4nf6mPZq4vQKBgQDFGQJq2/FbJlDZP0nHluDGa5roWKMotDuT\n"
+        + "BZeV6hW0MOdoYkZueaNv6YiNBDq8j27/gnKUgmYry38K1+kGg1JA+hP+i2Rfhp5k\n"
+        + "MrTzAXBU02eNYsvTNWshvPgGdUu5NtoQiOQLjDP95R4fsAPy9rbde1v/4q5MMBEQ\n"
+        + "uwCmmVr4/QKBgDgOneU3KbNFCwBomgilXA8cZJOqW3msfHoE4IULzhbS75kTlEhR\n"
+        + "Tggq4tAWPe8lF4LWFTlRw2mzahMxJ/O/oLVwmRfbJB0M4Y3gakOsw7wArQ4bSP7v\n"
+        + "HLg+FGNRf6BFRWPNJqKvpKX/P/A47eYOolYSVJevQ81EneR8/eu5YXWBAoGAdsKg\n"
+        + "C0Vlw7dtpcmVqjbGT6jM2U13WnJnJyqKcSFwXHfPJ713lN+kVC2SQu4WekGu7zRp\n"
+        + "2AROjfr7HMyGM49zQ4WsAId7Pnf9/n/zOi1WwzXywmWSTTx1xgl4JWQN8ZcUhDwH\n"
+        + "tNGRDl487XkAmCiCfSf0glXTEkMwNTWIqdnjz/0CgYBlyCdFzOlAC3i5cp3EWYe6\n"
+        + "VFFUCu2Tfikd4ZKu2uouZ+k4DHVwndYpzngS7OUbR1ex2wKI3Ejp3Hs49GNLp5cT\n"
+        + "Q6OqvBbq2uSBiQt5RRxXVmZObNJkKv+WcUy/fIb979ctVZy41wbsQ/HiErj4Np23\n"
+        + "xBYhnJesc1G+4gj4EjhgLQ==\n"
+        + "-----END PRIVATE KEY-----\n";
+
+    static void Require(bool ok, string message) {
+        if (!ok) { throw new InvalidOperationException(message); }
+    }
+
+    static async ReaderClosePair ConnectPair() {
+        // Bounded loopback-only fixture; try a small port range rather than
+        // depending on a fixed port being free on the test machine.
+        TcpListener listener = null;
+        int port = 35420;
+        while (port < 35484 && listener == null) {
+            TcpListener candidate = new TcpListener("127.0.0.1", port);
+            try {
+                candidate.Start();
+                listener = candidate;
+            } catch (SocketException e) {
+                // A port occupied by another local test is a normal retry.
+                candidate.Stop();
+                port = port + 1;
+            }
+        }
+        Program.Require(listener != null, "no loopback port available");
+        ReaderClosePair pair = new ReaderClosePair();
+        try {
+            pair.peer = await TcpClient.ConnectAsync("127.0.0.1", port, 1000);
+            Program.Require(pair.peer != null, "loopback connect");
+            nint accepted = await listener.AcceptAsync();
+            Program.Require(accepted >= 0, "loopback accept");
+            pair.conn = TcpClient.FromSocket(accepted);
+        } finally {
+            await listener.StopAsync();
+        }
+        return pair;
+    }
+
+    static bool Reading(WsReader reader) {
+        // Existing reflection reads actual production ownership, with the same
+        // lock as the writer. No replacement awaiter or production test hook.
+        object sync = reader.GetFieldObject("receiveSync");
+        lock (sync) { return reader.GetFieldBool("readBusy"); }
+    }
+
+    static async void Admitted(WsReader reader, long task) {
+        long until = Socket.NativeMonotonicUs() + 2000000;
+        while (!Program.Reading(reader) && Task.IsDone(task) == 0
+            && Socket.NativeMonotonicUs() < until) {
+            await Task.Delay(1);
+        }
+        Program.Require(Program.Reading(reader), "read was not admitted");
+    }
+
+    static async void Completed(long task) {
+        long until = Socket.NativeMonotonicUs() + 2000000;
+        while (Task.IsDone(task) == 0 && Socket.NativeMonotonicUs() < until) {
+            await Task.Delay(1);
+        }
+        Program.Require(Task.IsDone(task) != 0, "close did not wake/drain receive");
+    }
+
+    static async void Read(WsReader reader, ReaderClosePair pair, int timeoutMs) {
+        pair.result = await reader.FillMore(timeoutMs);
+    }
+
+    static async void Receive(WsClientSession session, ReaderClosePair pair, int timeoutMs) {
+        pair.text = await session.RecvText(timeoutMs);
+    }
+
+    static async void LiveSentinel(bool partial) {
+        ReaderClosePair pair = await Program.ConnectPair();
+        try {
+            WsReader reader = new WsReader(pair.conn.GetSocket());
+            if (partial) { reader.Prime("p", 1); }
+            pair.result = -99;
+            long task = Task.Spawn(Program.Read(reader, pair, 0));
+            await Program.Admitted(reader, task);
+            // Whether the reactor registration has happened or is still about
+            // to happen, the wake below must never allow the subsequent recv.
+            reader.Invalidate();
+            reader.Invalidate();
+            byte[] sentinel = new byte[] { 83, 0, 78 };
+            int sent = await pair.peer.SendBytesAsync(sentinel, 3);
+            Program.Require(sent == 3, "send sentinel");
+            await Program.Completed(task);
+            Program.Require(pair.result == 0 && !Program.Reading(reader), "invalidated read result");
+            Program.Require(reader.Buffered() == (partial ? 1 : 0), "invalidated buffer mutated");
+            Program.Require(await reader.FillMore() == 0, "invalidated reader rearmed");
+            Program.Require(await reader.FillMore(100) == 0, "invalidated timed reader rearmed");
+            byte[] actual = new byte[4];
+            int n = await Socket.RecvToOv(pair.conn.GetSocket(), actual, 3, 1000);
+            Program.Require(n == 3 && actual[0] == 83 && actual[1] == 0 && actual[2] == 78,
+                "invalidated reader consumed live socket sentinel");
+        } finally {
+            pair.conn.Close();
+            pair.peer.Close();
+        }
+    }
+
+    static async void SessionClose(int timeoutMs, bool partial) {
+        ReaderClosePair pair = await Program.ConnectPair();
+        WsReader reader = new WsReader(pair.conn.GetSocket());
+        if (partial) { reader.Prime("x", 1); }
+        WsClientSession session = new WsClientSession();
+        session.Open(pair.conn, null, null, reader);
+        try {
+            long task = Task.Spawn(Program.Receive(session, pair, timeoutMs));
+            await Program.Admitted(reader, task);
+            session.CloseNow();
+            session.CloseNow();
+            Program.Require(!session.IsConnected() && reader.sock == -1, "close admission");
+            await Program.Completed(task);
+            Program.Require(pair.text == "" && !Program.Reading(reader), "closed receive delivery");
+            Program.Require(pair.conn.GetSocket() == -1, "transport not released after drain");
+            Program.Require(reader.Buffered() == (partial ? 1 : 0), "close changed buffered prefix");
+            Program.Require(await reader.FillMore(timeoutMs) == 0, "closed reader rearmed");
+            // Fresh connection remains readable regardless of whether its OS
+            // handle happens to reuse the closed descriptor's numeric value.
+            ReaderClosePair fresh = await Program.ConnectPair();
+            try {
+                byte[] sentinel = new byte[] { 70 };
+                Program.Require(await fresh.peer.SendBytesAsync(sentinel, 1) == 1, "fresh send");
+                Program.Require(await reader.FillMore() == 0, "old reader resumed on fresh socket");
+                byte[] actual = new byte[2];
+                int n = await Socket.RecvToOv(fresh.conn.GetSocket(), actual, 1, 1000);
+                Program.Require(n == 1 && actual[0] == 70, "fresh socket bytes lost");
+            } finally {
+                fresh.conn.Close();
+                fresh.peer.Close();
+            }
+        } finally {
+            session.CloseNow();
+            pair.peer.Close();
+        }
+    }
+
+    static async void BeforeRead() {
+        ReaderClosePair pair = await Program.ConnectPair();
+        try {
+            WsReader reader = new WsReader(pair.conn.GetSocket());
+            WsClientSession session = new WsClientSession();
+            session.Open(pair.conn, null, null, reader);
+            session.CloseNow();
+            Program.Require(await reader.FillMore() == 0, "closed before readiness admission");
+            Program.Require(await reader.FillMore(100) == 0, "closed before timeout admission");
+            Program.Require(await session.RecvText(0) == "", "receive admitted after close");
+            Program.Require(pair.conn.GetSocket() == -1, "idle transport close");
+        } finally {
+            pair.conn.Close();
+            pair.peer.Close();
+        }
+    }
+
+    static async void TimeoutKeepsPrefix() {
+        ReaderClosePair pair = await Program.ConnectPair();
+        try {
+            WsReader reader = new WsReader(pair.conn.GetSocket());
+            reader.Prime("p", 1);
+            Program.Require(await reader.FillMore(20) == -1 && reader.Buffered() == 1,
+                "idle timeout discarded prefix");
+            byte[] suffix = new byte[] { 113 };
+            Program.Require(await pair.peer.SendBytesAsync(suffix, 1) == 1, "suffix send");
+            Program.Require(await reader.FillMore(1000) == 1 && reader.Slice(2) == "pq",
+                "read after idle timeout");
+        } finally {
+            pair.conn.Close();
+            pair.peer.Close();
+        }
+    }
+
+    static void LimitBuffers(ReaderClosePair pair) {
+        byte[] size = new byte[] { 0, 16, 0, 0 };
+        #if WINDOWS
+        int level = 65535;
+        int sendOption = 4097;
+        int recvOption = 4098;
+        #elif MACOS
+        int level = 65535;
+        int sendOption = 4097;
+        int recvOption = 4098;
+        #else
+        int level = 1;
+        int sendOption = 7;
+        int recvOption = 8;
+        #endif
+        Program.Require(Pal.Network.SetSocketOption(pair.conn.GetSocket(), level, sendOption, size, 4) == 0,
+            "limit sender buffer");
+        Program.Require(Pal.Network.SetSocketOption(pair.peer.GetSocket(), level, recvOption, size, 4) == 0,
+            "limit receiver buffer");
+    }
+
+    static async void SendLarge(WsClientSession session, ReaderClosePair pair) {
+        byte[] data = new byte[4194304];
+        pair.sent = await session.SendFrameBytes(WsOpcode.Binary, data, 0, data.Length);
+    }
+
+    static async void Sending(WsReader reader, long task) {
+        long until = Socket.NativeMonotonicUs() + 2000000;
+        object sync = reader.GetFieldObject("receiveSync");
+        int active = 0;
+        while (active == 0 && Task.IsDone(task) == 0 && Socket.NativeMonotonicUs() < until) {
+            lock (sync) { active = reader.GetFieldInt("activeSends"); }
+            if (active == 0) { await Task.Delay(1); }
+        }
+        Program.Require(active == 1 && Task.IsDone(task) == 0, "send did not suspend with transport lease");
+    }
+
+    static async void CloseBlockedSend(WsClientSession session, WsReader reader, ReaderClosePair pair) {
+        Program.LimitBuffers(pair);
+        pair.conn.EnsureNonBlocking();
+        byte[] fill = new byte[65536];
+        int filled = 0;
+        int wrote = 1;
+        while (wrote > 0 && filled < 8388608) {
+            wrote = Socket.Send(pair.conn.GetSocket(), fill, 65536);
+            if (wrote > 0) { filled = filled + wrote; }
+        }
+        Program.Require(wrote == -1, "sender buffer never blocked");
+        long task = Task.Spawn(Program.SendLarge(session, pair));
+        await Program.Sending(reader, task);
+        session.CloseNow();
+        // The single scheduler worker cannot resume the queued sender until
+        // this coroutine yields. Close must therefore retain this live handle.
+        Program.Require(pair.conn.GetSocket() >= 0, "send transport closed before await drained");
+        await Program.Completed(task);
+        Program.Require(!pair.sent && pair.conn.GetSocket() == -1, "send close did not drain transport: sent="
+            + pair.sent.ToString() + " handle=" + ((long)pair.conn.GetSocket()).ToString());
+        object sync = reader.GetFieldObject("receiveSync");
+        lock (sync) { Program.Require(reader.GetFieldInt("activeSends") == 0, "send lease leaked"); }
+        ReaderClosePair fresh = await Program.ConnectPair();
+        try {
+            byte[] sentinel = new byte[] { 84 };
+            Program.Require(await fresh.peer.SendBytesAsync(sentinel, 1) == 1, "send-close fresh sentinel");
+            byte[] actual = new byte[2];
+            int n = await Socket.RecvToOv(fresh.conn.GetSocket(), actual, 1, 1000);
+            Program.Require(n == 1 && actual[0] == 84, "send-close fresh bytes consumed");
+            Program.Require(!await session.SendFrame(WsOpcode.Text, "x", 1), "send admitted after close");
+        } finally {
+            fresh.conn.Close();
+            fresh.peer.Close();
+        }
+    }
+
+    static async void PlainSendClose() {
+        ReaderClosePair pair = await Program.ConnectPair();
+        WsReader reader = new WsReader(pair.conn.GetSocket());
+        WsClientSession session = new WsClientSession();
+        session.Open(pair.conn, null, null, reader);
+        try { await Program.CloseBlockedSend(session, reader, pair); }
+        finally {
+            session.CloseNow();
+            pair.peer.Close();
+        }
+    }
+
+    static async void AcceptTls(ReaderClosePair pair, TlsContext context) {
+        TlsStream stream = await TlsStream.AcceptAsync(context, pair.peer.GetSocket(), 2000);
+        Program.Require(stream != null, "server TLS handshake");
+        // Keep the peer silent until the client's session close wakes this read.
+        byte[] data = new byte[2];
+        int n = await stream.RecvBytesAsync(data, 0, 1);
+        Program.Require(n <= 0, "server expected TLS close");
+        stream.Close();
+    }
+
+    static async void AcceptTlsSilent(ReaderClosePair pair, TlsContext context) {
+        pair.peerStream = await TlsStream.AcceptAsync(context, pair.peer.GetSocket(), 2000);
+        Program.Require(pair.peerStream != null, "silent server TLS handshake");
+    }
+
+    static async void TlsSendClose(string caPath, string certPath, string keyPath) {
+        ReaderClosePair pair = await Program.ConnectPair();
+        TlsContext server = TlsContext.CreateServer(certPath, keyPath);
+        TlsContext context = TlsContext.CreateClient();
+        Program.Require(context.AddTrustedCert(caPath), "TLS send trust anchor");
+        long peerTask = Task.Spawn(Program.AcceptTlsSilent(pair, server));
+        WsClientSession session = new WsClientSession();
+        try {
+            TlsStream stream = await TlsStream.ConnectAsync(context, pair.conn.GetSocket(), "wrong.example", 2000);
+            Program.Require(stream != null, "TLS send client handshake");
+            await Program.Completed(peerTask);
+            WsReader reader = WsReader.WrapTls(stream);
+            session.Open(pair.conn, stream, context, reader);
+            await Program.CloseBlockedSend(session, reader, pair);
+            Program.Require(!stream.IsConnected(), "TLS sender still open after drain");
+        } finally {
+            session.CloseNow();
+            if (pair.peerStream != null) { pair.peerStream.Close(); }
+            pair.conn.Close();
+            pair.peer.Close();
+            server.Free();
+            context.Free();
+        }
+    }
+
+    static async void TlsClose(string caPath, string certPath, string keyPath) {
+        ReaderClosePair pair = await Program.ConnectPair();
+        TlsContext server = TlsContext.CreateServer(certPath, keyPath);
+        TlsContext context = TlsContext.CreateClient();
+        Program.Require(context.AddTrustedCert(caPath), "TLS trust anchor");
+        long peerTask = Task.Spawn(Program.AcceptTls(pair, server));
+        WsClientSession session = new WsClientSession();
+        try {
+            TlsStream stream = await TlsStream.ConnectAsync(context, pair.conn.GetSocket(), "wrong.example", 2000);
+            Program.Require(stream != null, "client TLS handshake");
+            WsReader reader = WsReader.WrapTls(stream);
+            session.Open(pair.conn, stream, context, reader);
+            // A positive idle window must still route through the shared TLS
+            // path; TCP shutdown is what wakes its nested overlapped receive.
+            long task = Task.Spawn(Program.Receive(session, pair, 10000));
+            await Program.Admitted(reader, task);
+            session.CloseNow();
+            Program.Require(!session.IsConnected(), "TLS session close");
+            await Program.Completed(task);
+            await Program.Completed(peerTask);
+            Program.Require(pair.text == "" && !stream.IsConnected(), "TLS read not drained");
+            Program.Require(pair.conn.GetSocket() == -1, "TLS transport retained after drain");
+            Program.Require(await reader.FillMore(10) == 0, "TLS reader rearmed after close");
+        } finally {
+            session.CloseNow();
+            pair.conn.Close();
+            pair.peer.Close();
+            server.Free();
+            context.Free();
+        }
+    }
+
+    static async void TlsFixture() {
+        Guid id = Guid.NewV4();
+        string dir = "_scratch/ws-reader-close-" + id.ToString();
+        Directory.CreateDirectory(dir);
+        string caPath = dir + "/ca.pem";
+        string certPath = dir + "/server.pem";
+        string keyPath = dir + "/server.key";
+        try {
+            File.WriteAllText(caPath, Program.CA_CERT);
+            File.WriteAllText(certPath, Program.SERVER_CERT);
+            File.WriteAllText(keyPath, Program.SERVER_KEY);
+            await Program.TlsClose(caPath, certPath, keyPath);
+            await Program.TlsSendClose(caPath, certPath, keyPath);
+        } finally {
+            if (File.Exists(caPath)) { File.Delete(caPath); }
+            if (File.Exists(certPath)) { File.Delete(certPath); }
+            if (File.Exists(keyPath)) { File.Delete(keyPath); }
+            Directory.Delete(dir);
+        }
+    }
+
+    static void BufferLimit() {
+        WsReader reader = new WsReader((nint)0);
+        reader.SetMaxLen(1);
+        reader.Ensure(65537);
+        byte[] bytes = new byte[65539];
+        string oversized = bytes.ToStr(0, 65538);
+        bool primeRejected = false;
+        bool appendRejected = false;
+        bool overflowRejected = false;
+        try { reader.Prime(oversized, 65538); }
+        catch (ArgumentException e) { primeRejected = true; }
+        try { reader.Append(oversized, 65538); }
+        catch (ArgumentException e) { appendRejected = true; }
+        try { reader.Ensure(-1); }
+        catch (ArgumentException e) { overflowRejected = true; }
+        Program.Require(primeRejected && appendRejected && overflowRejected && reader.Buffered() == 0,
+            "reader copied beyond clamped capacity");
+        reader.Prime("p", 1);
+        Program.Require(reader.Buffered() == 1 && reader.Slice(1) == "p", "reader limit boundary");
+    }
+
+    static async void Run() {
+        Program.BufferLimit();
+        Console.WriteLine("ws_reader_buffer_limit=ok");
+        await Program.LiveSentinel(false);
+        await Program.LiveSentinel(true);
+        Console.WriteLine("ws_reader_invalidate=ok");
+        await Program.SessionClose(0, false);
+        await Program.SessionClose(0, true);
+        await Program.SessionClose(10000, false);
+        await Program.SessionClose(10000, true);
+        await Program.BeforeRead();
+        Console.WriteLine("ws_reader_close_drain=ok");
+        await Program.TimeoutKeepsPrefix();
+        Console.WriteLine("ws_reader_timeout_prefix=ok");
+        await Program.TlsFixture();
+        Console.WriteLine("ws_reader_tls_close=ok");
+        await Program.PlainSendClose();
+        Console.WriteLine("ws_reader_send_close=ok");
+    }
+
+    static void Main() {
+        // One scheduler worker makes readBusy observable here only after the
+        // child yields at its real socket await. No sleep/reuse timing oracle.
+        AsyncRuntime.SetWorkers(1);
+        await Program.Run();
+    }
+}

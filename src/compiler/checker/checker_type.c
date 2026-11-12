@@ -188,6 +188,7 @@ static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b
     if (a->kind == TYPE_FLOAT  || b_type->kind == TYPE_FLOAT)  return b->type_float;
     if (a->kind == TYPE_ULONG  || b_type->kind == TYPE_ULONG)  return b->type_ulong;
     if (a->kind == TYPE_LONG   || b_type->kind == TYPE_LONG)   return b->type_long;
+    if (a->kind == TYPE_NINT   || b_type->kind == TYPE_NINT)   return b->type_nint;
     return b->type_int;
 }
 
@@ -532,9 +533,10 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
             if (target->sym && value->sym && target->sym == value->sym &&
                 (target->type_arg_count == 0 || value->type_arg_count == 0))
                 return true;
-            if (same_generic_container(target, value) &&
-                !checker_type_equal(target, value))
-                return true;
+            /* Generic classes are invariant. Sharing the declaration does not
+             * make different closed instantiations assignment compatible. */
+            if (same_generic_container(target, value))
+                return checker_type_equal(target, value);
             return checker_type_derives_from(value, target);
         }
         return false;

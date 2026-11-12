@@ -1,0 +1,49 @@
+using System;
+using System.IO.Compression;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        Console.WriteLine((ok ? "ok " : "FAIL ") + name);
+        if (!ok) { Program.failures = Program.failures + 1; }
+    }
+
+    static byte[] Join(byte[] a, byte[] b) {
+        byte[] result = new byte[a.Length + b.Length];
+        for (int i = 0; i < a.Length; i = i + 1) { result[i] = a[i]; }
+        for (int i = 0; i < b.Length; i = i + 1) { result[a.Length + i] = b[i]; }
+        return result;
+    }
+
+    static int Main() {
+        byte[] plain = new byte[64];
+        for (int i = 0; i < plain.Length; i = i + 1) { plain[i] = (byte)(i % 7); }
+        byte[] gz = GZip.Compress(plain, 6);
+        byte[] exact = ContentCoding.DecodeBounded("gzip", gz, 64);
+        Program.Check(exact != null && exact.Length == 64 && exact[0] == 0 && exact[63] == 0,
+            "binary gzip exact budget");
+        Program.Check(ContentCoding.DecodeBounded("gzip", gz, 63) == null, "gzip over budget");
+        byte[] members = Program.Join(gz, gz);
+        Program.Check(ContentCoding.DecodeBounded("gzip", members, 100) == null, "members share budget");
+        byte[] both = ContentCoding.DecodeBounded("gzip", members, 128);
+        Program.Check(both != null && both.Length == 128, "members exact budget");
+        byte[] garbage = new byte[1];
+        garbage[0] = 42;
+        Program.Check(ContentCoding.DecodeBounded("gzip", Program.Join(gz, garbage), 128) == null,
+            "gzip trailing garbage rejected");
+        byte[] raw = Deflate.Deflate(plain, 6);
+        byte[] rawOk = ContentCoding.DecodeBounded("deflate", raw, 64);
+        Program.Check(rawOk != null && rawOk.Length == 64, "raw deflate exact budget");
+        Program.Check(ContentCoding.DecodeBounded("deflate", raw, 63) == null, "raw deflate over budget");
+        byte[] zlib = Deflate.ZlibCompress(plain, 6);
+        byte[] zlibOk = ContentCoding.DecodeBounded("deflate", zlib, 64);
+        Program.Check(zlibOk != null && zlibOk.Length == 64, "zlib checksum accepted");
+        zlib[zlib.Length - 1] = (byte)((zlib[zlib.Length - 1] & 255) ^ 1);
+        Program.Check(ContentCoding.DecodeBounded("deflate", zlib, 64) == null, "zlib checksum rejected");
+        Program.Check(ContentCoding.DecodeBounded("gzip", gz, 0) == null, "zero budget rejected");
+        Program.Check(Deflate.Inflate(raw, 1, 2147483647, 64) == null, "input overflow rejected");
+        Console.WriteLine("failures=" + Program.failures.ToString());
+        return Program.failures;
+    }
+}

@@ -627,6 +627,17 @@ static void binder_add_ext_method(zan_binder_t *b, zan_symbol_t *m,
     b->ext_method_count++;
 }
 
+/* Signature references belong to their declaration, never the caller's scope.
+ * A null cache scope marks this already-bound type as context independent. */
+static zan_type_t *bind_signature_type(zan_binder_t *b, zan_ast_node_t *ref) {
+    zan_type_t *type = zan_binder_resolve_type(b, ref);
+    if (ref && ref->kind == AST_TYPE_REF && type != b->type_error) {
+        ref->type_ref.rt_type = type;
+        ref->type_ref.rt_scope = NULL;
+    }
+    return type;
+}
+
 static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_istr_t type_name = type_node->type_decl.name;
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
@@ -662,8 +673,9 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             break;
         }
         case AST_METHOD_DECL: {
-            register_type_param_list(b, &member->method_decl.type_params);
-            zan_type_t *ret_type = zan_binder_resolve_type(b, member->method_decl.return_type);
+            zan_scope_t *method_scope = zan_binder_push_type_params(
+                b, &member->method_decl.type_params);
+            zan_type_t *ret_type = bind_signature_type(b, member->method_decl.return_type);
             zan_symbol_t *method_sym = make_symbol(b->arena, SYM_METHOD,
                 member->method_decl.name, ret_type, member,
                 member->method_decl.modifiers);
@@ -671,12 +683,13 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             zan_type_t *first_param_type = NULL;
             for (int j = 0; j < member->method_decl.params.count; j++) {
                 zan_ast_node_t *param = member->method_decl.params.items[j];
-                zan_type_t *param_type = zan_binder_resolve_type(b, param->param.type);
+                zan_type_t *param_type = bind_signature_type(b, param->param.type);
                 if (j == 0) first_param_type = param_type;
                 zan_symbol_t *param_sym = make_symbol(b->arena, SYM_PARAM,
                     param->param.name, param_type, param, 0);
                 symbol_add_member(b->arena, method_sym, param_sym);
             }
+            b->current_scope = method_scope;
             scope_add(b->arena, b->current_scope, method_sym);
             symbol_add_member(b->arena, type_sym, method_sym);
             check_member_name_clash(b, type_sym, method_sym);
@@ -699,7 +712,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
 
             for (int j = 0; j < member->method_decl.params.count; j++) {
                 zan_ast_node_t *param = member->method_decl.params.items[j];
-                zan_type_t *param_type = zan_binder_resolve_type(b, param->param.type);
+                zan_type_t *param_type = bind_signature_type(b, param->param.type);
                 zan_symbol_t *param_sym = make_symbol(b->arena, SYM_PARAM,
                     param->param.name, param_type, param, 0);
                 symbol_add_member(b->arena, ctor_sym, param_sym);

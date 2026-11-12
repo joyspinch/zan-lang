@@ -39,7 +39,7 @@ partial class Irgen {
         string r = NT();
         L("  " + r + " = call i8* @zsb_tostring(i8* " + sb + ")");
         L("  call void @zrelease(i8* " + sb + ")");
-        return new ExprVal(r, MkType("string"));
+        return OwnedString(r);
     }
 
     // A string argument that the program may spell as a char: the C host
@@ -52,8 +52,8 @@ partial class Irgen {
         ExprVal a = GenExpr(e);
         if (a.ty != null && a.ty.sval == "char" && a.ty.ival == 0) {
             string s = CharToStr(a.op);
-            AddTemp(s, MkType("string"));
-            return new ExprVal(s, MkType("string"));
+
+            return OwnedString(s);
         }
         return a;
     }
@@ -109,7 +109,7 @@ partial class Irgen {
             string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + lenOp + ")");
             string srcp = NT(); L("  " + srcp + " = getelementptr i8, i8* " + recv.op + ", i64 " + start.op);
             L("  call i8* @memcpy(i8* " + buf + ", i8* " + srcp + ", i64 " + lenOp + ")");
-            return new ExprVal(buf, MkType("string"));
+            return OwnedString(buf);
         }
         if (name == "Equals" && e.kids.Count == 1) {
             // the C host compares the *exact* lengths and bytes
@@ -203,18 +203,18 @@ partial class Irgen {
             ExprVal to = StrArg(e.kids[1]);
             usesStrOps = true;
             string r = NT(); L("  " + r + " = call i8* @zstr_replace(i8* " + recv.op + ", i8* " + from.op + ", i8* " + to.op + ")");
-            return new ExprVal(r, MkType("string"));
+            return OwnedString(r);
         }
         if (name == "Trim" && e.kids.Count == 0) {
             usesStrOps = true;
             string r = NT(); L("  " + r + " = call i8* @zstr_trim(i8* " + recv.op + ")");
-            return new ExprVal(r, MkType("string"));
+            return OwnedString(r);
         }
         if ((name == "ToUpper" || name == "ToLower") && e.kids.Count == 0) {
             usesStrOps = true;
             string up = "1"; if (name == "ToLower") { up = "0"; }
             string r = NT(); L("  " + r + " = call i8* @zstr_case(i8* " + recv.op + ", i64 " + up + ")");
-            return new ExprVal(r, MkType("string"));
+            return OwnedString(r);
         }
         if (name == "Split" && (e.kids.Count == 1 || e.kids.Count == 2)) {
             ExprVal sep = StrArg(e.kids[0]);
@@ -235,7 +235,7 @@ partial class Irgen {
             string n = StrCLen(recv.op);
             string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + n + ")");
             L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + n + ")");
-            return new ExprVal(buf, MkType("string"));
+            return OwnedString(buf);
         }
         // An unknown string method must not degrade into "the receiver
         // itself": the program would silently get wrong answers.
@@ -284,21 +284,13 @@ partial class Irgen {
             L("  " + cnt + " = call i64 @zlist_count(i8* " + recv.op + ")");
             Node elemTy = ListElem(recv.ty);
             int esz = ArrElemSize(elemTy);
-            string bytes = NT();
-            if (esz == 1) { L("  " + bytes + " = add i64 " + cnt + ", 0"); }
-            else { L("  " + bytes + " = mul i64 " + cnt + ", 8"); }
-            string tot = NT();
-            L("  " + tot + " = add i64 " + bytes + ", 16");
-            string raw = NT();
-            L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
-            L("  call void @zan_rt_alloc_add(i64 " + tot + ")");
-            string hdr = NT();
-            L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
-            string lenp = NT();
-            L("  " + lenp + " = getelementptr i64, i64* " + hdr + ", i64 1");
-            L("  store i64 " + cnt + ", i64* " + lenp);
-            string arr = NT();
-            L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
+            Node at = MkType(elemTy.sval);
+            at.ival = elemTy.ival + 1;
+            at.op = elemTy.op;
+            at.kids = elemTy.kids;
+            at.arrRanks = "1";
+            if (elemTy.ival >= 1) { at.arrRanks = "1," + elemTy.arrRanks; }
+            string arr = ArrayAllocate(at, cnt);
             string idx = NT();
             EA(idx, "i64");
             L("  store i64 0, i64* " + idx);
@@ -313,7 +305,18 @@ partial class Irgen {
             Label(lb);
             string slot = NT();
             L("  " + slot + " = call i64 @zlist_get(i8* " + recv.op + ", i64 " + ci + ")");
-            if (esz == 1) {
+            if (IsDelegate(elemTy)) {
+                ExprVal normalized = EraseDelegateReference(FromSlot(slot, elemTy), elemTy, true, false);
+                // Transfer the normalization call's +1 directly to the array.
+                slot = ToI64(normalized.op, MapType(normalized.ty));
+            } else {
+                ArrayElementRetain(slot, elemTy);
+            }
+            if (IsDecimal(elemTy)) {
+                ExprVal value = DecimalUnboxSlot(slot);
+                string dp = DecimalArrayPlace(arr, ci);
+                L("  store " + DecimalLL() + " " + value.op + ", " + DecimalLL() + "* " + dp);
+            } else if (esz == 1) {
                 string ab = NT();
                 L("  " + ab + " = bitcast i64* " + arr + " to i8*");
                 string ap = NT();
@@ -329,11 +332,7 @@ partial class Irgen {
             L("  store i64 " + ni + ", i64* " + idx);
             L("  br label %L" + lc);
             Label(lend);
-            Node et = ListElem(recv.ty);
-            Node at = new Node(AK.TypeRef());
-            at.sval = et.sval;
-            at.ival = 1;
-            at.kids = et.kids;
+            AddTemp(arr, at);
             return new ExprVal(arr, at);
         }
         if (name == "AddRange" && e.kids.Count == 1) {
@@ -462,7 +461,14 @@ partial class Irgen {
     }
 
     // typed equality of two list elements; returns an i1
-    string EmitElemEq(ExprVal a, ExprVal b, Node elemTy) {        if (elemTy != null) {
+    string EmitElemEq(ExprVal a, ExprVal b, Node elemTy) {
+        if (IsDecimal(elemTy)) {
+            ExprVal eq = DecimalBinary(TK.EqEq(), a, b, null);
+            string pred = NT();
+            L("  " + pred + " = icmp ne i64 " + eq.op + ", 0");
+            return pred;
+        }
+        if (elemTy != null) {
             Node ca = ClassOf(elemTy);
             if (ca != null) {
                 Node m = binder.FindMethod(ca, "op_eq");
@@ -704,7 +710,7 @@ partial class Irgen {
         if (name == "ToString") {
             string t = NT();
             L("  " + t + " = call i8* @zsb_tostring(i8* " + recv.op + ")");
-            return new ExprVal(t, MkType("string"));
+            return OwnedString(t);
         }
         if (name == "Clear" && e.kids.Count == 0) {
             // the builder keeps its buffer; only the count goes back to zero

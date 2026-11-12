@@ -121,6 +121,8 @@ class FakeMySqlTls {
     int sslRequestSeq = -1;  // its sequence id (must be 1)
     bool sslRequestHasBit;   // CLIENT_SSL set in its capability flags
     int loginSeq = -1;       // sequence of the (encrypted) Handshake Response
+    bool loginHasSslBit;
+    bool loginCapabilitiesMatch;
     bool sawDowngrade;       // a plaintext Handshake Response on a no-TLS port
     int queries;             // COM_QUERY served over TLS
 
@@ -194,6 +196,14 @@ class FakeMySqlTls {
         byte[] login = await r.ReadPacket(lseq);
         if (login == null) { ts.Close(); Socket.Close(sock); return; }
         this.loginSeq = lseq[0];
+        if (lseq[1] >= 32 && sslreq != null && sseq[1] == 32) {
+            int caps = (login[0] & 255) | ((login[1] & 255) << 8);
+            this.loginHasSslBit = (caps & 2048) != 0;
+            this.loginCapabilitiesMatch = true;
+            for (int i = 0; i < 4; i = i + 1) {
+                if (login[i] != sslreq[i]) { this.loginCapabilitiesMatch = false; }
+            }
+        }
         Wire ok = new Wire();
         ok.U8(0).U8(0).U8(0).U16(2).U16(0);
         int _ok = await this.SendTls(ts, ok, lseq[0] + 1);
@@ -413,6 +423,8 @@ class Program {
         Check(secure.sslRequestSeq == 1, "SSLRequest used sequence 1");
         Check(secure.sslRequestHasBit, "SSLRequest set CLIENT_SSL");
         Check(secure.loginSeq == 2, "handshake response entered TLS at seq 2");
+        Check(secure.loginHasSslBit, "encrypted login set CLIENT_SSL");
+        Check(secure.loginCapabilitiesMatch, "login capabilities match SSLRequest");
         DbResult r = await db.QueryAsync("select 7 as n");
         Check(r.RowCount() == 1, "one row over TLS");
         Check(r.GetString(0, 0) == "7", "row value survived the tunnel");

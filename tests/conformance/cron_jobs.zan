@@ -4,6 +4,9 @@
 using System;
 using System.Hosting;
 using System.Collections.Generic;
+using System.Data.ZanDb;
+using System.IO;
+using System.Threading;
 
 class Program {
     static int bad;
@@ -78,49 +81,133 @@ class Program {
         DateTime n5d = DateTime.FromUnixMilliseconds(n5);
         Check(n5d.Day() == 13 && n5d.Month() == 11 && n5d.DayOfWeek() == 5,
             "next-friday13");
-        // PersistentJobs：真实 ZanStore 落盘。
-        string dir = "_scratch/cronconf_jobs.zdb";
-        PersistentJobs pj = new PersistentJobs(dir);
-        Check(pj.StoreOk(), "store-open");
-        pj.handler = delegate(string id, string name, string param) {
-            return param == "fail" ? false : true;
-        };
-        Check(pj.Upsert("jobA", "*/15 * * * *", "Report"), "upsert-ok");
-        Check(!pj.Upsert("jobB", "bad expr", "Bad"), "upsert-bad-rejected");
-        Check(pj.TriggerNow("jobA"), "trigger-now");
-        // 直接驱动一轮调度（绕开 StartAsync 的协程需求）。
-        await pj.ExecuteAsync(new System.Threading.CancellationToken());
-        List<JobDef> snap = pj.Snapshot();
-        Check(snap.Count == 1, "snapshot-1");
-        bool runs1 = false;
-        foreach (JobDef d in snap) {
-            if (d.id == "jobA" && d.runs == 1) { runs1 = true; }
+        string dir = "_scratch/cron_jobs_" + Guid.New();
+        Directory.CreateDirectory(dir);
+        string path = dir + "/jobs.zdb";
+        try {
+            await TestStore(path);
+        } finally {
+            ZanStore.CrashHook = null;
+            Check(Directory.DeleteRecursive(dir), "fixture-cleaned");
         }
-        Check(runs1, "ran-once");
-        // 失败 + 重试计数衰减。
-        pj.TriggerNow("jobA");
-        List<JobDef> p2 = pj.Snapshot();
-        // param 置 fail：直接写 store。
-        // TriggerNow 已推进 next，执行时 param 为空 → 成功。
-        // 改为验证 fails 路径：Upsert 新任务 + param 预写失败标记。
-        // 简化：直接验证 Remove。
-        pj.Remove("jobA");
-        Check(pj.Snapshot().Count == 0, "removed");
-        // 崩溃恢复：新实例打开同一目录，Upsert 写入的 next 仍在。
-        Check(pj.Upsert("jobC", "0 12 * * *", "Noon"), "upsert-c");
-        long nextC = 0;
-        foreach (JobDef d in pj.Snapshot()) {
-            if (d.id == "jobC") { nextC = d.nextMs; }
-        }
-        pj.Close();
-        PersistentJobs pj2 = new PersistentJobs(dir);
-        bool recovered = false;
-        foreach (JobDef d in pj2.Snapshot()) {
-            if (d.id == "jobC" && d.nextMs == nextC && d.name == "Noon") {
-                recovered = true;
-            }
-        }
-        Check(recovered, "crash-recovery");
         if (bad == 0) { Console.WriteLine("cron-jobs-done"); }
+    }
+
+    static async void TestStore(string path) {
+        CancellationToken ct = CancellationToken.None;
+        long later = DateTime.GetCurrentUnixMilliseconds() + 3600000;
+        ZanStore legacy = ZanStore.Open(path);
+        legacy.Begin();
+        legacy.Put("job:old:name", "Legacy");
+        legacy.Put("job:old:cron", "0 12 13 * 5");
+        legacy.Put("job:old:next", Convert.ToString(later));
+        legacy.Put("job:old:last", "123");
+        legacy.Put("job:old:retry", "1");
+        legacy.Put("job:old:runs", "4");
+        legacy.Put("job:old:fails", "2");
+        legacy.Put("param:old", "{\"legacy\":true}");
+        Check(legacy.Commit(), "legacy-store-written");
+        legacy.Close();
+
+        PersistentJobs jobs = new PersistentJobs(path);
+        Check(jobs.StoreOk(), "store-open");
+        JobDef old = jobs.Snapshot()[0];
+        Check(old.id == "old" && old.name == "Legacy" && old.cron == "0 12 13 * 5"
+            && old.nextMs == later && old.lastMs == 123 && old.runs == 4 && old.fails == 2
+            && old.retriesLeft == 1 && old.retryPending && !old.inFlight, "legacy-layout-read");
+        int calls = 0;
+        jobs.handler = delegate(string id, string name, string param) {
+            calls = calls + 1;
+            return id == "old" && name == "Legacy" && param == "{\"legacy\":true}";
+        };
+        await jobs.ExecuteAsync(ct);
+        Check(calls == 0, "old-param-alone-is-not-in-flight");
+        Check(jobs.TriggerNow("old"), "trigger-legacy");
+        await jobs.ExecuteAsync(ct);
+        JobDef done = jobs.Snapshot()[0];
+        Check(calls == 1 && done.runs == 5 && done.fails == 2 && done.retriesLeft == 0
+            && !done.NeedsAttention(), "legacy-callback-and-counters");
+        jobs.Close();
+
+        legacy = ZanStore.Open(path);
+        Check(legacy.Get("job:old:name") == "Legacy" && legacy.Get("job:old:cron") == "0 12 13 * 5"
+            && legacy.Get("job:old:runs") == "5" && legacy.Get("job:old:fails") == "2"
+            && !legacy.Contains("param:old") && !legacy.Contains("job:old:retry")
+            && !legacy.Contains("job:old:phase"),
+            "legacy-layout-written");
+        legacy.Close();
+
+        jobs = new PersistentJobs(path);
+        jobs.Remove("old");
+        Check(jobs.Snapshot().Count == 0, "removed");
+        Check(!jobs.Upsert("bad", "not cron", "Bad"), "upsert-bad-rejected");
+        Check(jobs.Upsert("job", "0 0 31 2 *", "Report"), "upsert-ok");
+        jobs.maxParallel = 2;
+        bool rejected = false;
+        try { await jobs.ExecuteAsync(ct); } catch (ArgumentException e) { rejected = true; }
+        Check(rejected, "nonzero-parallel-rejected");
+        jobs.maxParallel = 0;
+        jobs.maxRetries = 1;
+        jobs.retryDelayMs = 60000;
+        bool closeRejected = false;
+        bool sawInFlight = false;
+        PersistentJobs active = jobs;
+        jobs.handler = delegate(string id, string name, string param) {
+            sawInFlight = active.Snapshot()[0].inFlight;
+            try { active.Close(); } catch (InvalidOperationException e) { closeRejected = true; }
+            return false;
+        };
+        Check(jobs.TriggerNow("job"), "trigger-now");
+        await jobs.ExecuteAsync(ct);
+        JobDef waiting = jobs.Snapshot()[0];
+        Check(sawInFlight && closeRejected && jobs.StoreOk(), "close-rejected-during-callback");
+        Check(waiting.fails == 1 && waiting.retriesLeft == 1 && waiting.retryPending
+            && waiting.nextMs > DateTime.GetCurrentUnixMilliseconds() && !waiting.NeedsAttention(),
+            "false-schedules-retry");
+        jobs.handler = null;
+        jobs.Close();
+
+        jobs = new PersistentJobs(path);
+        JobDef reopened = jobs.Snapshot()[0];
+        Check(reopened.nextMs == waiting.nextMs && reopened.retryPending && reopened.retriesLeft == 1,
+            "retry-survives-reopen");
+        jobs.handler = delegate(string id, string name, string param) {
+            throw new InvalidOperationException("retry failed");
+        };
+        jobs.TriggerNow("job");
+        await jobs.ExecuteAsync(ct);
+        JobDef exhausted = jobs.Snapshot()[0];
+        Check(exhausted.fails == 2 && exhausted.retriesLeft == 0 && !exhausted.retryPending
+            && exhausted.NeedsAttention() && exhausted.lastError == "retry failed" && exhausted.nextMs == -1,
+            "retry-exhaustion-resumes-cron");
+        jobs.handler = delegate(string id, string name, string param) {
+            ZanStore.CrashHook = (string phase) => {
+                if (phase == "wal_before_commit") { throw new IOException("interrupted before outcome commit"); }
+            };
+            return true;
+        };
+        jobs.TriggerNow("job");
+        bool interrupted = false;
+        try { await jobs.ExecuteAsync(ct); } catch (IOException e) { interrupted = true; }
+        ZanStore.CrashHook = null;
+        Check(interrupted && !jobs.StoreOk(), "outcome-commit-failure-visible");
+        jobs.Close();
+
+        jobs = new PersistentJobs(path);
+        Check(jobs.Upsert("job", "0 0 31 2 *", "Report") && jobs.Snapshot()[0].inFlight,
+            "processing-marker-survives-reopen-and-registration");
+        jobs.handler = delegate(string id, string name, string param) { return true; };
+        await jobs.ExecuteAsync(ct);
+        JobDef recovered = jobs.Snapshot()[0];
+        Check(!recovered.inFlight && !recovered.NeedsAttention() && recovered.runs == 1
+            && recovered.fails == 2, "replayed-once-and-cleared-marker");
+        jobs.SetInterval(10);
+        Check(await jobs.StartAsync(ct), "host-start");
+        rejected = false;
+        try { jobs.Close(); } catch (InvalidOperationException e) { rejected = true; }
+        Check(rejected && jobs.StoreOk(), "close-rejected-before-host-stop");
+        Check(await jobs.StopAsync(ct), "host-stop-joined");
+        jobs.Close();
+        Check(!jobs.StoreOk(), "store-closed-after-stop");
     }
 }

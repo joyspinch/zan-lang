@@ -10,19 +10,34 @@ partial class Irgen {
         if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()) {
             string cn = callee.a.sval;
             string mn = callee.sval;
-            if (cn == "Task" && (mn == "Run" || mn == "Spawn") && e.kids.Count == 1) {
+            // Run/Spawn routing is decided once by the checker. Use that
+            // decision for the entire Task branch, including its reject tail;
+            // a shadowed user call must reach ordinary member dispatch.
+            bool builtinTask = cn == "Task";
+            if (mn == "Run" || mn == "Spawn") { builtinTask = builtinTask && callee.isIntrinsic; }
+            else { builtinTask = builtinTask && (e.resolvedSym == null || e.isIntrinsic); }
+            if (builtinTask && (mn == "Run" || mn == "Spawn") && e.kids.Count == 1) {
                 return EmitTaskRunCall(e, mn == "Spawn");
             }
-            if (cn == "Task" && mn == "IsDone" && e.kids.Count == 1) {
+            if (builtinTask && mn == "IsDone" && e.kids.Count == 1) {
                 return EmitTaskIsDone(e);
             }
-            if (cn == "Task" && mn == "Cancel" && e.kids.Count == 1) {
+            if (builtinTask && mn == "Cancel" && e.kids.Count == 1) {
                 return EmitTaskCancel(e);
             }
-            if (cn == "Task" && mn == "Yield" && e.kids.Count == 0) {
+            if (builtinTask && mn == "Release" && e.kids.Count == 1) {
+                ExprVal h = GenExpr(e.kids[0]);
+                string handle = h.op;
+                if (MapType(h.ty) == "i64") {
+                    handle = NT(); L("  " + handle + " = inttoptr i64 " + h.op + " to i8*");
+                }
+                EmitTaskRelease(handle);
+                return new ExprVal("0", MkType("void"));
+            }
+            if (builtinTask && mn == "Yield" && e.kids.Count == 0) {
                 return new ExprVal("0", MkType("int"));
             }
-            if (cn == "Task" && mn == "IsCancellationRequested" && e.kids.Count == 0) {
+            if (builtinTask && mn == "IsCancellationRequested" && e.kids.Count == 0) {
                 if (curAsync) {
                     string cfl = NT();
                     L("  " + cfl + " = load i64, i64* " + FrameGep("%ff", 10));
@@ -36,7 +51,7 @@ partial class Irgen {
                 }
                 return new ExprVal("0", MkType("int"));
             }
-            if (cn == "Task" && mn == "JoinNew" && e.kids.Count == 2) {
+            if (builtinTask && mn == "JoinNew" && e.kids.Count == 2) {
                 ExprVal a0 = GenExpr(e.kids[0]);
                 ExprVal a1 = GenExpr(e.kids[1]);
                 string a0_32 = NT(); L("  " + a0_32 + " = trunc i64 " + a0.op + " to i32");
@@ -45,7 +60,7 @@ partial class Irgen {
                 L("  " + r + " = call i64 @zan_join_new(i32 " + a0_32 + ", i32 " + a1_32 + ")");
                 return new ExprVal(r, MkType("long"));
             }
-            if (cn == "Task" && mn == "JoinBind" && e.kids.Count == 3) {
+            if (builtinTask && mn == "JoinBind" && e.kids.Count == 3) {
                 ExprVal a0 = GenExpr(e.kids[0]);
                 ExprVal a1 = GenExpr(e.kids[1]);
                 ExprVal a2 = GenExpr(e.kids[2]);
@@ -55,22 +70,25 @@ partial class Irgen {
                 } else {
                     fp = a1.op;
                 }
+                string token = TaskTokenBits(fp);
+                string frame = NT(); L("  " + frame + " = call i8* @zan_task_acquire(i64 " + token + ", i32 0)");
                 string a2_32 = NT(); L("  " + a2_32 + " = trunc i64 " + a2.op + " to i32");
                 string r = NT();
-                L("  " + r + " = call i32 @zan_join_bind(i64 " + a0.op + ", i8* " + fp + ", i32 " + a2_32 + ")");
+                L("  " + r + " = call i32 @zan_join_bind(i64 " + a0.op + ", i8* " + frame + ", i32 " + a2_32 + ")");
+                L("  call void @zan_task_unpin(i8* " + frame + ")");
                 string r64 = NT();
                 L("  " + r64 + " = zext i32 " + r + " to i64");
                 return new ExprVal(r64, MkType("int"));
             }
-            if (cn == "Task" && mn == "JoinCancel" && e.kids.Count == 1) {
+            if (builtinTask && mn == "JoinCancel" && e.kids.Count == 1) {
                 ExprVal a0 = GenExpr(e.kids[0]);
                 L("  call void @zan_join_cancel(i64 " + a0.op + ")");
                 return new ExprVal("0", MkType("void"));
             }
-            if (cn == "Task" && mn == "JoinWait" && e.kids.Count == 1) {
+            if (builtinTask && mn == "JoinWait" && e.kids.Count == 1) {
                 return new ExprVal("2", MkType("int"));
             }
-            if (cn == "Task" && mn == "Delay" && e.kids.Count == 1) {
+            if (builtinTask && mn == "Delay" && e.kids.Count == 1) {
                 ExprVal a = GenExpr(e.kids[0]);
                 string ms = ToI64(a.op, MapType(a.ty));
                 if (!ExternSeen("zan_co_sync_sleep")) {
@@ -80,7 +98,7 @@ partial class Irgen {
                 L("  call void @zan_co_sync_sleep(i64 " + ms + ")");
                 return new ExprVal("0", MkType("int"));
             }
-            if (cn == "Task") {
+            if (builtinTask) {
                 diags.Error("call to 'Task." + mn + "' is not supported by the self-hosted "
                     + "compiler yet", e.line, e.col);
                 return new ExprVal("0", MkType("int"));
@@ -127,7 +145,9 @@ partial class Irgen {
                 L("  store i8 0, i8* " + ep);
                 string rc = NT(); L("  " + rc + " = call i32 @fclose(i8* " + fp + ")");
                 string rcc = NT(); L("  " + rcc + " = icmp ne i32 " + rc + ", 0"); EmitAbortIf(rcc, "@.msg.rderr", 18);
-                return new ExprVal(WrapManaged(buf), MkType("string"));
+                string managed = WrapManaged(buf);
+                L("  call void @free(i8* " + buf + ")");
+                return new ExprVal(managed, MkType("string"));
             }
             if (cn == "File" && mn == "Exists") {
                 ExprVal path = GenExpr(e.kids[0]);
@@ -146,13 +166,17 @@ partial class Irgen {
             if (cn == "Environment" && mn == "ExeDir") {
                 usesDirList = true;
                 string t = NT(); L("  " + t + " = call i8* @zan_exe_dir()");
-                return new ExprVal(WrapManaged(t), MkType("string"));
+                string managed = WrapManaged(t);
+                L("  call void @free(i8* " + t + ")");
+                return new ExprVal(managed, MkType("string"));
             }
             if (cn == "Directory" && mn == "ListNames") {
                 usesDirList = true;
                 ExprVal pat = GenExpr(e.kids[0]);
                 string t = NT(); L("  " + t + " = call i8* @zan_dir_list(i8* " + pat.op + ")");
-                return new ExprVal(WrapManaged(t), MkType("string"));
+                string managed = WrapManaged(t);
+                L("  call void @free(i8* " + t + ")");
+                return new ExprVal(managed, MkType("string"));
             }
             if (cn == "File" && mn == "WriteAllText") {
                 ExprVal path = GenExpr(e.kids[0]);
@@ -262,6 +286,7 @@ partial class Irgen {
                     L("  " + bf2 + " = call i8* @malloc(i64 " + b2 + ")");
                     L("  call i8* @memcpy(i8* " + bf2 + ", i8* " + safe2 + ", i64 " + b2 + ")");
                     s = WrapManaged(bf2);
+                    L("  call void @free(i8* " + bf2 + ")");
                 }
                 else { s = ToCStr(a); }
                 return new ExprVal(s, MkType("string"));
@@ -592,7 +617,7 @@ partial class Irgen {
                 usesStrOps = true;
                 string r = NT();
                 L("  " + r + " = call i8* @zstr_join(i8* " + sep.op + ", i8* " + lst.op + ")");
-                return new ExprVal(r, MkType("string"));
+                return OwnedString(r);
             }
             if (callee.sval == "Format" && e.kids.Count >= 1 && e.kids[0].kind == AK.StringLit()) {
                 return EmitStrFormat(e);
@@ -701,7 +726,7 @@ partial class Irgen {
                 string n = StrCLen(recv.op);
                 string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + n + ")");
                 L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + n + ")");
-                return new ExprVal(buf, MkType("string"));
+                return OwnedString(buf);
             }
             // enum ToString(): the name of the member the value stands for
             // (the host compares the value against the members in

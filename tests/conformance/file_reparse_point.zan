@@ -1,0 +1,56 @@
+using System;
+using System.IO;
+using System.Platform;
+
+class Program {
+    #if !WINDOWS && !WASM32
+    [DllImport("crt", EntryPoint = "symlink")]
+    static extern int MakeLink(string target, string path);
+    [DllImport("crt", EntryPoint = "unlink")]
+    static extern int RemoveLink(string path);
+    #endif
+
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static void Main() {
+        string root = "_scratch/conf_file_reparse_point";
+        Program.Require(!Directory.Exists(root) && !File.Exists(root) && !File.IsReparsePoint(root), "fixture already exists");
+        Directory.CreateDirectory(root);
+        try {
+            string payload = root + "/payload.txt";
+            File.WriteAllText(payload, "unchanged");
+            Program.Require(!File.IsReparsePoint(root), "ordinary directory reported as link");
+            Program.Require(!File.IsReparsePoint(payload), "ordinary file reported as link");
+            Program.Require(!File.IsReparsePoint(root + "/missing"), "missing path reported as link");
+            Program.Require(!File.IsReparsePoint(null) && !File.IsReparsePoint(""), "empty path reported as link");
+            #if !WINDOWS && !WASM32
+            string fileLink = root + "/链接 file";
+            string dirLink = root + "/dir-link";
+            string dangling = root + "/dangling";
+            string cycle = root + "/cycle";
+            try {
+                Program.Require(Program.MakeLink("payload.txt", fileLink) == 0, "create file link");
+                Program.Require(Program.MakeLink(".", dirLink) == 0, "create directory link");
+                Program.Require(Program.MakeLink("absent-target", dangling) == 0, "create dangling link");
+                Program.Require(Program.MakeLink("cycle", cycle) == 0, "create cycle link");
+                Program.Require(File.IsReparsePoint(fileLink) && Pal.FileSystem.IsSymlink(fileLink), "file link missed");
+                Program.Require(File.IsReparsePoint(dirLink), "directory link missed");
+                Program.Require(File.IsReparsePoint(dangling) && !File.Exists(dangling), "dangling link missed");
+                Program.Require(File.IsReparsePoint(cycle), "cycle link followed");
+                Program.Require(File.ReadAllText(payload) == "unchanged", "link probes modified target");
+            } finally {
+                // Remove leaves before recursive cleanup, including dangling/cyclic links.
+                Program.RemoveLink(fileLink);
+                Program.RemoveLink(dirLink);
+                Program.RemoveLink(dangling);
+                Program.RemoveLink(cycle);
+            }
+            #endif
+        } finally {
+            Program.Require(Directory.DeleteRecursive(root), "fixture cleanup failed");
+        }
+        Console.WriteLine("file-link-platform-contract");
+    }
+}

@@ -11,6 +11,7 @@
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
+#include "attr_routes.h"
 #include "irgen.h"
 #include "optimizer.h"
 #include "crosscomp.h"
@@ -661,6 +662,10 @@ int main(int argc, char **argv) {
         }
     } else {
         zan_target_host(&target);
+    }
+    if (opts.cpu_profile && target.arch != ZAN_ARCH_X86_64) {
+        fprintf(stderr, "error: --cpu-profile is supported only for x86-64 targets\n");
+        return 1;
     }
     bool cross_compiling = (target_name != NULL);
     bool external_async_executor = (target.os == ZAN_OS_WINDOWS ||

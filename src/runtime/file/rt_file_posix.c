@@ -56,6 +56,47 @@ int zan_file_rename(const char *source, const char *dest) {
     return rename(source, dest);
 }
 
+static int zan_sync_fd(int fd) {
+    int rc;
+    do { rc = fsync(fd); } while (rc != 0 && errno == EINTR);
+    return rc;
+}
+
+int zan_file_flush_to_disk(const char *path) {
+#if defined(__wasm__)
+    (void)path;
+    return -2;
+#else
+    if (!path || !path[0]) return -1;
+    int fd;
+    // Nonblocking open lets fstat reject a FIFO without waiting for a writer.
+    do { fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW); }
+    while (fd < 0 && errno == EINTR);
+    if (fd < 0) return -1;
+    struct stat st;
+    int ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && zan_sync_fd(fd) == 0;
+    int close_rc = close(fd);
+    return ok && close_rc == 0 ? 0 : -1;
+#endif
+}
+
+int zan_file_flush_directory_to_disk(const char *path) {
+#if defined(__wasm__) || !defined(O_DIRECTORY)
+    (void)path;
+    return -2;
+#else
+    if (!path || !path[0]) return -1;
+    int fd;
+    do { fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW); }
+    while (fd < 0 && errno == EINTR);
+    if (fd < 0) return -1;
+    struct stat st;
+    int ok = fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && zan_sync_fd(fd) == 0;
+    int close_rc = close(fd);
+    return ok && close_rc == 0 ? 0 : -1;
+#endif
+}
+
 /* 文件元数据错误码口径规范（B-ID106 收敛）：
  * 1. zan_file_time: 成功返回 Unix 秒时间戳；路径不存在或读取失败返回 0
  * 2. zan_file_length: 成功返回文件字节数；路径不存在或读取失败返回 -1。

@@ -1,0 +1,240 @@
+using System;
+using System.Collections.Generic;
+
+enum TypedListState { Below = -7, Ready = 9 }
+
+class TypedListRow {
+    public string Name;
+    public List<TypedListRow> Children;
+}
+
+struct TypedListPair {
+    public long Left;
+    public long Right;
+}
+
+class TypedListFieldChild {
+    public List<int> Values = new List<int>();
+}
+
+class TypedListFieldOwner {
+    public List<List<int>> Items = new List<List<int>>();
+    public TypedListFieldChild Child = new TypedListFieldChild();
+}
+
+class TypedListThrowingCtor {
+    public TypedListThrowingCtor(string text) { throw new Exception(text); }
+}
+
+class TypedListCalls {
+    public string Name;
+    public TypedListCalls(string name) { Name = name; }
+    public int Length(string text) { return text.Length; }
+    public int Both(string left, string right) { return left.Length + right.Length; }
+    public void Fail(string text) { throw new Exception(text); }
+}
+
+class Program {
+    static void Require(bool value, string message) {
+        if (!value) throw new Exception(message);
+    }
+
+    static void AddScoped(object list, WeakReference<TypedListRow> observer) {
+        TypedListRow row = observer.Target;
+        Require(list.Invoke("Add", row), "reference Add");
+    }
+
+    static void References() {
+        TypeInfo ti = typeof(List<TypedListRow>);
+        Require(ti.ConstructorCount == 1, "closed List constructor metadata");
+        object list = ti.CreateInstance();
+        Require(list is List<TypedListRow>, "constructor closed identity");
+        Require(!(list is List<object>), "generic identity remains invariant");
+        Require(list.HasMethod("Add"), "Add metadata");
+        Require(ti.GetMethodParamType(3, 0) == "TypedListRow", "Add parameter metadata");
+        TypedListRow row = new TypedListRow();
+        row.Name = "row-" + 17;
+        WeakReference<TypedListRow> observer = new WeakReference<TypedListRow>(row);
+        AddScoped(list, observer);
+        row = null;
+        Require(observer.IsAlive, "Add retains borrowed reference after scope");
+        Require(list.Invoke("Add", (object)null), "null occupies an element");
+        List<TypedListRow> rows = (List<TypedListRow>)list;
+        Require(rows.Count == 2 && rows[0].Name == "row-17" && rows[1] == null,
+            "typed entity/null readback");
+        object held = list.InvokeObject("Get", 0);
+        Require(list.InvokeObject("At", 1) == null, "At null");
+        Require(list.InvokeObject("Get", -1) == null && list.InvokeObject("Get", 2) == null,
+            "Get bounds");
+        bool rejected = false;
+        try {
+            List<object> wrong = (List<object>)list;
+        } catch (InvalidCastException ex) {
+            rejected = true;
+        }
+        Require(rejected, "wrong generic cast is rejected");
+        rows = null;
+        list = null;
+        Require(observer.IsAlive && held.GetFieldString("Name") == "row-17", "Get owns returned reference");
+        held = null;
+        Require(!observer.IsAlive, "list and returned reference release entity");
+        Console.WriteLine("references PASS");
+    }
+
+    static void Nested() {
+        object nested = typeof(List<List<TypedListRow>>).CreateInstance();
+        object child = typeof(List<TypedListRow>).CreateInstance();
+        TypedListRow row = new TypedListRow();
+        row.Name = "nested";
+        Require(child.Invoke("Add", row), "nested entity");
+        Require(nested.Invoke("Add", child) && nested.Invoke("Add", (object)null), "nested Add");
+        child = null;
+        List<List<TypedListRow>> groups = (List<List<TypedListRow>>)nested;
+        Require(groups.Count == 2 && groups[0][0].Name == "nested" && groups[1] == null,
+            "nested typed readback");
+        object fetched = nested.InvokeObject("At", 0);
+        Require(fetched is List<TypedListRow>, "nested Get closed identity");
+        Console.WriteLine("nested PASS");
+    }
+
+    static void Scalars() {
+        object ints = typeof(List<int>).CreateInstance();
+        int i = 0;
+        while (i < 25) {
+            Require(ints.Invoke("Add", i - 12), "int growth Add");
+            i++;
+        }
+        List<int> values = (List<int>)ints;
+        Require(values.Count == 25 && values[0] == -12 && values[24] == 12,
+            "int growth typed readback");
+        Require(ints.InvokeInt("Get", 0) == -12 && ints.InvokeInt("At", 24) == 12, "int reflection");
+        object longs = typeof(List<long>).CreateInstance();
+        Require(longs.Invoke("Add", -5000000000L), "long Add");
+        List<long> wide = (List<long>)longs;
+        Require(wide[0] == -5000000000L && longs.InvokeLong("Get", 0) == -5000000000L, "long readback");
+        object bytes = typeof(List<byte>).CreateInstance();
+        object sbytes = typeof(List<sbyte>).CreateInstance();
+        object shorts = typeof(List<short>).CreateInstance();
+        object ushorts = typeof(List<ushort>).CreateInstance();
+        Require(bytes.Invoke("Add", (byte)250) && sbytes.Invoke("Add", (sbyte)-120) &&
+            shorts.Invoke("Add", (short)-30000) && ushorts.Invoke("Add", (ushort)60000), "narrow Add");
+        List<byte> bv = (List<byte>)bytes;
+        List<sbyte> sbv = (List<sbyte>)sbytes;
+        List<short> sv = (List<short>)shorts;
+        List<ushort> usv = (List<ushort>)ushorts;
+        Require(bv[0] == 250 && sbv[0] == -120 && sv[0] == -30000 && usv[0] == 60000,
+            "narrow typed readback");
+        Require(bytes.InvokeInt("Get", 0) == 250 && sbytes.InvokeInt("Get", 0) == -120 &&
+            shorts.InvokeInt("At", 0) == -30000 && ushorts.InvokeInt("At", 0) == 60000,
+            "narrow reflection signedness");
+        object bools = typeof(List<bool>).CreateInstance();
+        Require(bools.Invoke("Add", true) && bools.Invoke("Add", false), "bool Add");
+        List<bool> flags = (List<bool>)bools;
+        Require(flags[0] && !flags[1] && bools.InvokeInt("Get", 0) == 1 && bools.InvokeInt("At", 1) == 0,
+            "bool readback");
+        object enums = typeof(List<TypedListState>).CreateInstance();
+        Require(enums.Invoke("Add", TypedListState.Below), "enum Add");
+        Require(enums is List<TypedListState> && !(enums is List<int>), "enum closed identity");
+        List<TypedListState> states = (List<TypedListState>)enums;
+        Require(states[0] == TypedListState.Below && enums.InvokeInt("Get", 0) == -7, "enum readback");
+        Console.WriteLine("scalars PASS");
+    }
+
+    static void FloatingPoint() {
+        object floats = typeof(List<float>).CreateInstance();
+        object doubles = typeof(List<double>).CreateInstance();
+        Require(floats.Invoke("Add", (float)-1.25) && floats.Invoke("Add", (float)0.0), "float Add");
+        Require(doubles.Invoke("Add", 3.141592653589793), "double Add");
+        List<float> fv = (List<float>)floats;
+        List<double> dv = (List<double>)doubles;
+        Require(fv[0] == (float)-1.25 && fv[1] == (float)0.0 && dv[0] == 3.141592653589793,
+            "floating typed readback");
+        Require(floats.InvokeDouble("Get", 0) == -1.25 && floats.InvokeDouble("At", 1) == 0.0 &&
+            doubles.InvokeDouble("At", 0) == 3.141592653589793, "floating reflection conversion");
+        object strings = typeof(List<string>).CreateInstance();
+        Require(strings.Invoke("Add", "text-" + 23), "temporary string Add");
+        Require(strings.InvokeString("Get", 0) == "text-23", "string readback");
+        Console.WriteLine("floating PASS");
+    }
+
+    static void AggregateBoundary() {
+        object list = typeof(List<TypedListPair>).CreateInstance();
+        Require(list is List<TypedListPair>, "aggregate constructor identity");
+        Require(list.HasMethod("Add") && list.HasMethod("Get"), "aggregate metadata");
+        Require(!list.Invoke("Add", (object)null), "aggregate Add is unavailable in single-slot ABI");
+        Require(!list.Invoke("Get", 0), "aggregate Get is unavailable in single-slot ABI");
+        List<TypedListPair> pairs = (List<TypedListPair>)list;
+        Require(pairs.Count == 0, "unsupported reflection does not mutate collection");
+        Console.WriteLine("aggregate PASS");
+    }
+
+    static T NullLocal<T>() {
+        object value = null;
+        return (T)value;
+    }
+
+    static T NullArgument<T>(object value) { return (T)value; }
+
+    static void NullCasts() {
+        object value = null;
+        List<int> ints = (List<int>)value;
+        TypedListRow row = (TypedListRow)value;
+        Require(ints == null && row == null, "null reference casts");
+        Require(NullLocal<List<TypedListRow>>() == null &&
+            NullArgument<List<TypedListRow>>(value) == null, "generic null casts");
+        Require(!(value is List<int>) && !(value is TypedListRow), "null is T remains false");
+        Console.WriteLine("null casts PASS");
+    }
+
+    static string FailArgument() { throw new Exception("argument"); }
+
+    static void OwnedArguments() {
+        object target = typeof(TypedListCalls).CreateInstance("ctor-" + 31);
+        Require(target.GetFieldString("Name") == "ctor-31", "temporary ctor argument");
+        Require(target.InvokeInt("Length", "invoke-" + 27) == 9, "temporary returning Invoke argument");
+        Require(!target.Invoke("Missing", "miss-" + 19), "missing Invoke temporary cleanup");
+        bool caught = false;
+        try {
+            target.InvokeInt("Both", "first-" + 19, FailArgument());
+        } catch (Exception ex) {
+            caught = true;
+        }
+        Require(caught, "later argument evaluation unwinds earlier temporary");
+        caught = false;
+        try { target.Invoke("Fail", "literal"); }
+        catch (Exception ex) { caught = true; }
+        Require(caught, "reflective callee exception reaches caller catch");
+        caught = false;
+        try { target.Invoke("Fail", "throw-" + 19); }
+        catch (Exception ex) { caught = true; }
+        Require(caught, "throwing reflective callee unwinds fresh argument");
+        caught = false;
+        try { typeof(TypedListThrowingCtor).CreateInstance("ctor-throw-" + 19); }
+        catch (Exception ex) { caught = true; }
+        Require(caught, "reflective constructor exception reaches caller catch");
+        Console.WriteLine("owned arguments PASS");
+    }
+
+    static void FieldInitializers() {
+        object value = typeof(TypedListFieldOwner).CreateInstance();
+        TypedListFieldOwner owner = (TypedListFieldOwner)value;
+        object list = owner.Items;
+        Require(list is List<List<int>> && list.HasMethod("Add"), "late initialized List metadata");
+        Require(list.Invoke("Add", owner.Child.Values), "late initialized nested Add");
+        Require(owner.Items.Count == 1, "late initialized List count");
+        owner.Child.Values.Add(42);
+        Require(owner.Items[0][0] == 42, "late initialized typed content");
+        Console.WriteLine("field initializers PASS");
+    }
+
+    static void Main() {
+        NullCasts();
+        FieldInitializers();
+        OwnedArguments();
+        References();
+        Nested();
+        Scalars();
+        FloatingPoint();
+        AggregateBoundary();
+    }
+}

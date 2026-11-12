@@ -107,7 +107,8 @@
                 bool is_wait = mname.len == 4 && memcmp(mname.str, "Wait", 4) == 0;
                 bool is_res  = mname.len == 6 && memcmp(mname.str, "Result", 6) == 0;
                 bool is_comp = mname.len == 11 && memcmp(mname.str, "IsCompleted", 11) == 0;
-                if (is_wait || is_res || is_comp) {
+                bool is_release = mname.len == 7 && memcmp(mname.str, "Release", 7) == 0;
+                if (is_wait || is_res || is_comp || is_release) {
                     LLVMTypeRef ti64 = LLVMInt64TypeInContext(g->ctx);
                     if (is_res && ot->type_arg_count != 1) {
                         zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3012,
@@ -121,8 +122,7 @@
                     else if (LLVMGetIntTypeWidth(LLVMTypeOf(h)) < 64)
                         h = zan_iwiden(g->builder, h, ti64);
                     LLVMValueRef hp = LLVMBuildIntToPtr(g->builder, h, i8ptr, "task.fp");
-                    int mode = is_comp ? 2 : (is_res ? 1 :
-                              (ot->type_arg_count == 1 ? 3 : 0));
+                    int mode = is_comp ? 2 : (is_res ? 1 : (is_release ? 4 : 0));
                     return emit_task_member(g, hp,
                         ot->type_arg_count == 1 ? ot->type_args[0] : NULL, mode);
                 }
@@ -136,12 +136,64 @@
             zan_ast_node_t *sub_arg = expr->call.args.items[0];
             zan_type_t *sub_ty = infer_expr_type(g, sub_arg, locals);
             bool is_del = sub_ty && sub_ty->kind == TYPE_DELEGATE;
-            if (sub_arg->kind != AST_CALL && sub_arg->kind != AST_LAMBDA && !is_del) {
+            zan_symbol_t *action_owner = NULL;
+            zan_istr_t action_name = {0};
+            int action_receiver = 0, action_error = 0;
+            if (!is_del && sub_arg->kind == AST_IDENTIFIER &&
+                (!locals || !local_find(locals, sub_arg->ident.name)) &&
+                !ident_names_own_field(g, sub_arg)) {
+                action_owner = g->current_type_sym;
+                action_name = sub_arg->ident.name;
+            } else if (!is_del && sub_arg->kind == AST_MEMBER_ACCESS) {
+                zan_ast_node_t *obj = sub_arg->member.object;
+                action_owner = expr_class_sym(g, obj, locals);
+                action_name = sub_arg->member.name;
+                action_receiver = 2;
+                if (obj->kind == AST_IDENTIFIER &&
+                    (!locals || !local_find(locals, obj->ident.name)) &&
+                    !ident_names_own_field(g, obj)) {
+                    zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->ident.name);
+                    if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
+                        /* Type names have no expression value/type in irgen;
+                         * use the bound type symbol as the candidate owner. */
+                        action_owner = ts;
+                        action_receiver = 1;
+                    }
+                }
+            }
+            zan_symbol_t *action_method = zan_binder_task_action_method(g->binder,
+                action_owner, action_name, action_receiver, g->current_this != NULL, &action_error);
+            bool is_method = action_method && action_method->decl &&
+                action_method->decl->kind == AST_METHOD_DECL;
+            if (sub_arg->kind != AST_CALL && sub_arg->kind != AST_LAMBDA && !is_del && !is_method) {
             } else {
 
-            if (sub_arg->kind == AST_LAMBDA || is_del) {
+            if (sub_arg->kind == AST_LAMBDA || is_del || is_method) {
                 LLVMValueRef lv = NULL;
-                if (sub_arg->kind == AST_LAMBDA) {
+                if (is_method) {
+                    zan_ast_node_t *decl = action_method->decl;
+                    if (action_error) {
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, sub_arg->loc, 3052,
+                            "invalid Task Action method group signature or receiver");
+                        return LLVMConstInt(sp_i64, 0, 0);
+                    }
+                    LLVMValueRef receiver = NULL;
+                    if (!(decl->method_decl.modifiers & MOD_STATIC)) {
+                        if (sub_arg->kind == AST_MEMBER_ACCESS)
+                            receiver = emit_guarded_member_object(g, sub_arg, locals);
+                        else if (g->current_this)
+                            receiver = LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(g->current_this),
+                                g->current_this, "task.this");
+                    }
+                    lv = emit_method_group_closure(g, action_method, receiver, sub_arg->loc);
+                    if (!lv) {
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, sub_arg->loc, 3052,
+                            "cannot bind Task Action method group");
+                        return LLVMConstInt(sp_i64, 0, 0);
+                    }
+                    if (receiver && sub_arg->kind == AST_MEMBER_ACCESS)
+                        emit_release_owned_call_temp(g, sub_arg->member.object, receiver, locals);
+                } else if (sub_arg->kind == AST_LAMBDA) {
                     if (sub_arg->lambda.params.count != 0 ||
                         lambda_body_has_value_return(sub_arg->lambda.body)) {
                         zan_diag_emit_code(g->diag, DIAG_ERROR, sub_arg->loc, 3052,
@@ -166,7 +218,12 @@
                     }
                     lv = emit_expr(g, sub_arg, locals);
                 }
-                return emit_task_action_run(g, lv, sub_arg, locals);
+                /* The method-group closure is freshly allocated, not a borrowed
+                 * delegate expression. Transfer its initial owner explicitly. */
+                LLVMValueRef task = emit_task_action_run(g, lv,
+                    is_method ? NULL : sub_arg, locals);
+                if (is_method) emit_closure_release(g, lv);
+                return task;
             }
             LLVMValueRef sub = emit_expr(g, sub_arg, locals);
             bool keep_result = is_call_to(expr, "Task", "Run") &&
@@ -180,6 +237,14 @@
             }
         }
 
+        if (is_call_to(expr, "Task", "Release") && expr->call.args.count == 1) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef h = emit_expr(g, expr->call.args.items[0], locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(h)) == LLVMIntegerTypeKind)
+                h = LLVMBuildIntToPtr(g->builder, h, i8ptr, "release.handle");
+            else h = LLVMBuildBitCast(g->builder, h, i8ptr, "release.handle");
+            return emit_task_member(g, h, NULL, 4);
+        }
         if (is_call_to(expr, "Task", "Cancel") && expr->call.args.count == 1) {
             LLVMTypeRef ci8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef ci64 = LLVMInt64TypeInContext(g->ctx);
@@ -191,8 +256,12 @@
             } else {
                 h = LLVMBuildBitCast(g->builder, h, ci8ptr, "cancel.h");
             }
+            LLVMValueRef token = LLVMBuildPtrToInt(g->builder, h, ci64, "cancel.token");
+            LLVMValueRef pin_args[] = { token, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0) };
+            LLVMValueRef frame = emit_task_runtime_call(g, "zan_task_acquire", ci8ptr, pin_args, 2);
             LLVMValueRef cf = get_co_cancel_fn(g);
-            zan_call2(g->builder, LLVMGlobalGetValueType(cf), cf, &h, 1, "");
+            zan_call2(g->builder, LLVMGlobalGetValueType(cf), cf, &frame, 1, "");
+            emit_task_runtime_call(g, "zan_task_unpin", LLVMVoidTypeInContext(g->ctx), &frame, 1);
             return LLVMConstInt(ci64, 0, 0);
         }
 
@@ -207,9 +276,8 @@
             } else {
                 h = LLVMBuildBitCast(g->builder, h, di8ptr, "isdone.h");
             }
-            LLVMValueRef idf = get_co_isdone_fn(g);
-            return zan_call2(g->builder, LLVMGlobalGetValueType(idf),
-                             idf, &h, 1, "isdone");
+            LLVMValueRef token = LLVMBuildPtrToInt(g->builder, h, di64, "isdone.token");
+            return emit_task_runtime_call(g, "zan_task_isdone", LLVMInt32TypeInContext(g->ctx), &token, 1);
         }
 
         /* Task */
@@ -246,8 +314,13 @@
                 (LLVMTypeRef[]){ di64, di8ptr, di32 }, 3, 0);
             LLVMValueRef jb = LLVMGetNamedFunction(g->mod, "zan_join_bind");
             if (!jb) jb = LLVMAddFunction(g->mod, "zan_join_bind", jb_type);
-            return zan_call2(g->builder, jb_type, jb,
-                (LLVMValueRef[]){ a0, a1, a2 }, 3, "join.bind");
+            LLVMValueRef token = LLVMBuildPtrToInt(g->builder, a1, di64, "join.token");
+            LLVMValueRef pin_args[] = { token, LLVMConstInt(di32, 0, 0) };
+            LLVMValueRef frame = emit_task_runtime_call(g, "zan_task_acquire", di8ptr, pin_args, 2);
+            LLVMValueRef bound = zan_call2(g->builder, jb_type, jb,
+                (LLVMValueRef[]){ a0, frame, a2 }, 3, "join.bind");
+            emit_task_runtime_call(g, "zan_task_unpin", LLVMVoidTypeInContext(g->ctx), &frame, 1);
+            return bound;
         }
 
         /* Task */
@@ -498,7 +571,16 @@
                         else
                             arg = emit_widen_i64_for_print(g, arg);
                     } else {
-                        arg = emit_widen_i64_for_print(g, arg);
+                        /* Preserve sbyte signedness when nullable Value yields i8. */
+                        zan_type_t *print_ty = infer_expr_type(g, arg_ast, locals);
+                        LLVMTypeRef vt = LLVMTypeOf(arg);
+                        if (print_ty && print_ty->kind == TYPE_SBYTE &&
+                            LLVMGetTypeKind(vt) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(vt) < 64)
+                            arg = LLVMBuildSExt(g->builder, arg,
+                                LLVMInt64TypeInContext(g->ctx), "print.sbyte");
+                        else
+                            arg = emit_widen_i64_for_print(g, arg);
                     }
                     LLVMTypeRef fn_type = LLVMFunctionType(
                         LLVMVoidTypeInContext(g->ctx),
@@ -603,7 +685,16 @@
                     LLVMValueRef fmt = expr_is_ulong(g, arg_ast, locals)
                         ? zan_irgen_intern_string(g, "%llu")
                         : zan_irgen_intern_string(g, "%lld");
-                    LLVMValueRef int_arg = emit_widen_i64_for_print(g, arg);
+                    zan_type_t *print_ty = infer_expr_type(g, arg_ast, locals);
+                    LLVMTypeRef vt = LLVMTypeOf(arg);
+                    LLVMValueRef int_arg;
+                    if (print_ty && print_ty->kind == TYPE_SBYTE &&
+                        LLVMGetTypeKind(vt) == LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(vt) < 64)
+                        int_arg = LLVMBuildSExt(g->builder, arg,
+                            LLVMInt64TypeInContext(g->ctx), "print.sbyte");
+                    else
+                        int_arg = emit_widen_i64_for_print(g, arg);
                     LLVMValueRef args[] = { fmt, int_arg };
                     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
                 }

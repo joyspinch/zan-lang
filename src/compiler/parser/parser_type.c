@@ -419,8 +419,12 @@ static bool paren_is_named_cast(zan_parser_t *p) {
     if (p->current.kind == TK_QUESTION) {
         parser_advance(p);
     }
-    while (p->current.kind == TK_LBRACKET && zan_lexer_peek(p->lex).kind == TK_RBRACKET) {
+    while (p->current.kind == TK_LBRACKET) {
+        /* Match the same rank-only suffixes accepted by parse_type_ref. */
+        int rank = array_suffix_rank(p);
+        if (rank <= 0) break;
         parser_advance(p);
+        for (int c = 1; c < rank; c++) parser_advance(p);
         parser_advance(p);
     }
     if (p->current.kind == TK_RPAREN) {

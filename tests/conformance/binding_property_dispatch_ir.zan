@@ -1,0 +1,85 @@
+using System;
+
+class PropertyBindingBase {
+    public int backing = 5;
+    public int baseGets;
+    public int baseSets;
+    public int derivedGets;
+    public int derivedSets;
+    public int Inherited {
+        get { baseGets = baseGets + 1; return backing + 10; }
+        set { baseSets = baseSets + 1; backing = value - 10; }
+    }
+    public virtual int VirtualValue {
+        get { baseGets = baseGets + 1; return backing + 100; }
+        set { baseSets = baseSets + 1; backing = value - 100; }
+    }
+    public virtual int OtherValue {
+        get { baseGets = baseGets + 1; return backing + 1000; }
+        set { baseSets = baseSets + 1; backing = value - 1000; }
+    }
+}
+
+class PropertyBindingDerived : PropertyBindingBase {
+    public override int VirtualValue {
+        get { derivedGets = derivedGets + 1; return backing + 200; }
+        set { derivedSets = derivedSets + 1; backing = value - 200; }
+    }
+    public override int OtherValue {
+        get { derivedGets = derivedGets + 1; return backing + 2000; }
+        set { derivedSets = derivedSets + 1; backing = value - 2000; }
+    }
+    public void CheckVirtualFirst() {
+        // Keep both creation sites in one body: IR emission sees virtual first.
+        PropertyBindingBase view = this;
+        Binding<int> virtualBinding = view.VirtualValue;
+        Binding<int> direct = base.VirtualValue;
+        if (!direct.IsLive() || direct.Get() != 141) { throw new Exception("base getter bypasses override"); }
+        direct.Set(153);
+        if (backing != 53 || baseGets != 1 || baseSets != 1) { throw new Exception("base setter bypasses override"); }
+        if (virtualBinding.Get() != 253) { throw new Exception("virtual getter after base helper"); }
+        virtualBinding.Set(269);
+        if (backing != 69 || derivedGets != 1 || derivedSets != 1) { throw new Exception("virtual setter after base helper"); }
+    }
+    public void CheckBaseFirst() {
+        // A different property gives an independent first cache entry.
+        Binding<int> direct = base.OtherValue;
+        PropertyBindingBase view = this;
+        Binding<int> virtualBinding = view.OtherValue;
+        if (!direct.IsLive() || !virtualBinding.IsLive() || direct.Get() != 1069) { throw new Exception("base-first getter"); }
+        direct.Set(1081);
+        if (backing != 81 || baseGets != 2 || baseSets != 2) { throw new Exception("base-first setter"); }
+        if (virtualBinding.Get() != 2081) { throw new Exception("virtual getter after base-first cache"); }
+        virtualBinding.Set(2093);
+        if (backing != 93 || derivedGets != 2 || derivedSets != 2) { throw new Exception("virtual setter after base-first cache"); }
+    }
+}
+
+class PropertyBindingDispatchTest {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+    static void Main() {
+        PropertyBindingDerived derived = new PropertyBindingDerived();
+        Binding<int> inherited = derived.Inherited;
+        Check(inherited.IsLive() && inherited.Get() == 15, "inherited custom getter");
+        inherited.Set(27);
+        Check(derived.backing == 17 && derived.baseGets == 1 && derived.baseSets == 1, "inherited custom setter");
+        PropertyBindingBase view = derived;
+        int direct = view.VirtualValue;
+        Check(direct == 217 && derived.derivedGets == 1, "ordinary virtual property baseline");
+        Binding<int> property = view.VirtualValue;
+        Check(property.IsLive() && property.Get() == 217, "binding virtual getter through base view");
+        property.Set(241);
+        Check(derived.backing == 41 && derived.derivedGets == 2 && derived.derivedSets == 1, "binding virtual setter through base view");
+        Check(derived.baseGets == 1 && derived.baseSets == 1, "virtual path must not execute base accessors");
+        // Compile with -g: helper emission must isolate its debug location
+        // and restore the enclosing method's location.
+        derived.baseGets = 0; derived.baseSets = 0;
+        derived.derivedGets = 0; derived.derivedSets = 0;
+        derived.CheckVirtualFirst();
+        derived.CheckBaseFirst();
+        Check(derived.backing == 93 && derived.baseGets == 2 && derived.baseSets == 2 && derived.derivedGets == 2 && derived.derivedSets == 2, "same object both cache creation orders");
+        Console.WriteLine("BINDING_PROPERTY_DISPATCH_IR_OK");
+    }
+}

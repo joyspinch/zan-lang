@@ -50,7 +50,7 @@ void emit_string_release(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 
-static LLVMValueRef emit_closure_is_tagged(zan_irgen_t *g, LLVMValueRef v) {
+LLVMValueRef emit_closure_is_tagged(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef iv = LLVMBuildPtrToInt(g->builder, v, i64, "clo.iv");
     LLVMValueRef bit = zan_and(g->builder, iv,
@@ -205,6 +205,25 @@ LLVMValueRef emit_delegate_invoke(zan_irgen_t *g, LLVMValueRef dv,
     return phi;
 }
 
+/* Erased delegates keep their low-bit tag; only ordinary object payloads
+ * carry an ARC header at the unmodified pointer. */
+void emit_retain_obj_value(zan_irgen_t *g, LLVMValueRef v) {
+    if (g->current_fn_no_runtime || !v ||
+        LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef clo = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.cref");
+    LLVMBasicBlockRef obj = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.oref");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.ref.end");
+    LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, v), clo, obj);
+    LLVMPositionBuilderAtEnd(g->builder, clo);
+    emit_closure_retain(g, v);
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, obj);
+    emit_arc_retain(g, v);
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+}
+
 static void emit_array_retain(zan_irgen_t *g, LLVMValueRef v);
 static void emit_array_release(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
@@ -215,10 +234,12 @@ void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
         emit_closure_retain(g, v);
     } else if (type->kind == TYPE_ARRAY) {
         emit_array_retain(g, v);
+    } else if (type->kind == TYPE_INTERFACE) {
+        emit_retain_obj_value(g, v);
     } else if (is_arc_managed_type(type)) {
         emit_arc_retain(g, v);
     } else if (type->kind == TYPE_OBJECT) {
-        emit_arc_retain(g, v);
+        emit_retain_obj_value(g, v);
     }
 }
 void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
@@ -229,6 +250,8 @@ void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) 
         emit_closure_release(g, v);
     } else if (type->kind == TYPE_ARRAY) {
         emit_array_release(g, type, v);
+    } else if (type->kind == TYPE_INTERFACE) {
+        emit_release_obj_value(g, v);
     } else if (is_arc_managed_type(type)) {
         emit_arc_release_typed(g, type, v);
     } else if (type->kind == TYPE_OBJECT) {

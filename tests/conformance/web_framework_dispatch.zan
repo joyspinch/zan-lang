@@ -1,0 +1,68 @@
+using System;
+using System.Web;
+using Zan.Web;
+
+namespace Zan.Web.CompilerRegression;
+
+/* Same short name as an allowlisted package controller. */
+class HealthController : AppController {
+    [HttpGet]
+    [Route("/compiler-app-health")]
+    public async void Index() {
+        await Task.Delay(1);
+        this.Text("application-awaited");
+    }
+}
+
+class Program {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+        Console.WriteLine(label);
+    }
+
+    static HttpContext Ctx(string path) {
+        HttpRequest request = HttpRequest.Parse(
+            "GET " + path + " HTTP/1.1\r\nHost: test\r\n\r\n");
+        return new HttpContext(request, "127.0.0.1");
+    }
+
+    static Route Match(WebApp app, string path) {
+        return app.Router().Match(Program.Ctx(path));
+    }
+
+    static async string Dispatch(WebApp app, string path) {
+        HttpContext ctx = Program.Ctx(path);
+        Route route = app.Router().Match(ctx);
+        if (route == null) { throw new Exception("missing route " + path); }
+        ctx.SetRouteAction(route.Action());
+        ctx.SetRoutePattern(route.Pattern());
+        await route.Handler()(ctx);
+        return ctx.BuildResponse(true);
+    }
+
+    static async void Run() {
+        WebApp app = new WebApp("127.0.0.1", 0);
+        __AttrRoutes.Register(app);
+        Program.Check(Program.Match(app, "/health") == null,
+            "framework requires opt-in");
+        Program.Check(Program.Match(app, "/compiler-app-health").Action()
+            == typeof(HealthController).FullName + ".Index", "application key qualified");
+        /* Fully qualified calls must trigger the same compiler protocol. */
+        Zan.Web.__AttrRoutes.RegisterFramework(app);
+        __AttrRoutes.Register(app);
+        string accountKey = typeof(Zan.Web.Account.LoginController).FullName + ".Index";
+        string adminKey = typeof(Zan.Web.Admin.LoginController).FullName + ".Index";
+        Program.Check(Program.Match(app, "/login").Action()
+            == accountKey, "account key qualified");
+        Program.Check(Program.Match(app, "/admin/login").Action()
+            == adminKey && adminKey != accountKey, "admin key qualified");
+        string application = await Program.Dispatch(app, "/compiler-app-health");
+        Program.Check(application.IndexOf("application-awaited") >= 0,
+            "application async dispatch awaited");
+        string framework = await Program.Dispatch(app, "/health");
+        Program.Check(framework.IndexOf("\"status\":\"ok\"") >= 0,
+            "framework async dispatch awaited");
+    }
+
+    static void Main() { await Program.Run(); }
+}

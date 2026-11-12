@@ -296,7 +296,8 @@ void emit_site_tyname_table(zan_irgen_t *g) {
         int k = 0;
         if (g->site_coll && g->site_coll[i]) {
             int ck = g->site_coll[i];
-            names[k++] = ck == 1 ? "List" : (ck == 2 ? "StringBuilder" : "Dict");
+            names[k++] = arc_collection_type_name(g, ck,
+                g->site_coll_elem ? g->site_coll_elem[i] : NULL);
         } else if (g->site_syms[i]) {
             zan_symbol_t *cur = g->site_syms[i];
             while (cur && k < 63) {

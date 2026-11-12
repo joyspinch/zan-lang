@@ -198,9 +198,14 @@ static void zan_hash_salt_fill(uint64_t *k0, uint64_t *k1) {
 #else
     FILE *f = fopen("/dev/urandom", "rb");
     if (f) {
-        size_t got = fread(k0, 1, 16, f);
+        uint64_t keys[2];
+        size_t got = fread(keys, 1, sizeof(keys), f);
         fclose(f);
-        if (got == 16) return;
+        if (got == sizeof(keys)) {
+            *k0 = keys[0];
+            *k1 = keys[1];
+            return;
+        }
     }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

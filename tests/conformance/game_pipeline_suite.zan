@@ -7,6 +7,8 @@ using Game.Arpg;
 
 class TestHero : Entity {
     public int updateCount;
+    public InputMapper input;
+    public int pressedSteps;
 
     TestHero(int id) : base(id, "hero") {
         this.updateCount = 0;
@@ -22,7 +24,18 @@ class TestHero : Entity {
     override void OnFixedUpdate(Scene scene, double dt) {
         base.OnFixedUpdate(scene, dt);
         updateCount = updateCount + 1;
+        if (input != null && input.IsActionJustPressed("fire")) { pressedSteps++; }
         this.X = this.X + 10.0 * dt;
+    }
+}
+
+class PixelEntity : Entity {
+    int color;
+    public int renders;
+    PixelEntity(int id, int color) : base(id, "pixel") { this.color = color; }
+    public override void OnRender(Scene scene, Canvas c, double x, double y) {
+        renders++;
+        c.FillRect(0, 0, c.Width(), c.Height(), color);
     }
 }
 
@@ -32,6 +45,7 @@ class PipelineSuite {
         TestSpriteAndAnimator();
         TestInputMapper();
         TestGameViewport();
+        TestCameraFixedSteps();
 
         Console.WriteLine("PIPELINE_ALL_PASSED");
     }
@@ -128,5 +142,60 @@ class PipelineSuite {
         GameViewport viewport = GameViewport.Create(scene);
         Assert(viewport.CurrentScene != null, "Viewport should hold current scene");
         Assert(viewport.Input != null, "Viewport should provide input mapper");
+
+        App app = App.CreateOffscreen("Viewport pixels", 160, 120);
+        Scene first = Scene.Create("red", 64, 48, 128);
+        Scene second = Scene.Create("blue", 64, 48, 128);
+        PixelEntity red = new PixelEntity(first.NextId(), 0xffc02030);
+        PixelEntity blue = new PixelEntity(second.NextId(), 0xff2040c0);
+        first.AddEntity(red);
+        second.AddEntity(blue);
+        first.AdvanceFixedStep(0.02);
+        second.AdvanceFixedStep(0.02);
+        Assert(first.WorldGen() == second.WorldGen(), "Regression scenes must share generation");
+        viewport.CurrentScene = first;
+        viewport.Arrange(17, 23, 64, 48);
+        app.canvas.Clear(0xff102030);
+        viewport.OnPaint(app);
+        Assert(app.canvas.GetPixel(30, 35) == 0xffc02030, "Viewport must blit real first-scene pixels");
+        Assert(app.canvas.GetPixel(16, 35) == 0xff102030, "Viewport blit must respect its origin");
+        viewport.OnPaint(app);
+        Assert(red.renders == 1, "Unchanged scene must reuse offscreen pixels");
+        viewport.CurrentScene = second;
+        viewport.OnPaint(app);
+        Assert(app.canvas.GetPixel(30, 35) == 0xff2040c0, "Same-generation scene switch must replace cached pixels");
+        Assert(blue.renders == 1, "Replacement scene must render immediately");
+        viewport.activeScene = first;
+        viewport.OnPaint(app);
+        Assert(app.canvas.GetPixel(30, 35) == 0xffc02030, "Direct scene field replacement must also invalidate identity cache");
+        viewport.CurrentScene = second;
+        second.Clock.TimeScale = 0.0;
+        viewport.Input.BindAction("fire", 32);
+        viewport.Input.OnKeyDown(32);
+        viewport.StepLogic();
+        Assert(viewport.Input.IsActionJustPressed("fire"), "Zero-step pump must preserve pending input edge");
+        TestHero reader = TestHero.Create(second.NextId());
+        reader.input = viewport.Input;
+        second.AddEntity(reader);
+        second.Clock.accumulator = second.Clock.FixedDeltaTime * 3.1;
+        viewport.StepLogic();
+        Assert(reader.updateCount == 3 && reader.pressedSteps == 1, "Catch-up must expose pressed edge to only its first logic step");
+        Assert(!viewport.Input.IsActionJustPressed("fire"), "Executed logic step must clear consumed input edge");
+        viewport.off.Destroy();
+        app.canvas.Destroy();
+    }
+
+    static void TestCameraFixedSteps() {
+        Scene scene = Scene.Create("fixed camera", 64, 48, 128);
+        scene.clock = new GameClock(0.02);
+        scene.Clock.TimeScale = 0.0;
+        scene.Camera.Shake(8.0, 1.0);
+        for (int i = 0; i < 144; i++) { Assert(scene.Tick() == 0, "Paused clock must execute zero steps"); }
+        Assert(scene.Camera.shakeTimer == 1.0, "Display-only refreshes must not age camera shake");
+        scene.Clock.accumulator = 0.061;
+        Assert(scene.Tick() == 3, "Accumulator must execute three catch-up steps");
+        Assert(Math.Abs(scene.Camera.shakeTimer - 0.94) < 0.000001, "Camera shake must age once per fixed step");
+        scene.AdvanceFixedStep(0.02);
+        Assert(Math.Abs(scene.Camera.shakeTimer - 0.92) < 0.000001, "Direct fixed stepping must also advance camera");
     }
 }

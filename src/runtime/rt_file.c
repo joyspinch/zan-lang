@@ -1,5 +1,10 @@
 /* rt_file.c: 文件元数据、文件流与文件锁运行时（跨平台组合分发入口） */
 
+/* POSIX large-file stdio declarations are hidden by strict C11 otherwise. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS 1
 #endif

@@ -58,7 +58,8 @@ class FakeAsyncConnection : IDbConnection {
     }
 
     public bool IsConnected() { return this.connected; }
-    public void Close() { this.connected = false; }
+    public int closeCount;
+    public void Close() { this.connected = false; this.closeCount = this.closeCount + 1; }
     public void Dispose() { this.Close(); }
     public int GetProvider() { return 0; }
 }
@@ -66,31 +67,53 @@ class FakeAsyncConnection : IDbConnection {
 // 与 MySqlPool.Release/Cleanup 同构的机制载体（typed pool 样板）。
 class FakeAsyncPool {
     PoolCore<FakeAsyncConnection> core;
+    public Gate opening;
+    public Gate finishOpen;
+    public bool throwOnOpen;
+    public int openAttempts;
+    public int failureReports;
+    public string failureMessage;
+    public FakeAsyncConnection lastOpened;
 
     public FakeAsyncPool(int maxSize) {
         this.core = new PoolCore<FakeAsyncConnection>(maxSize);
     }
 
     public async FakeAsyncConnection AcquireAsync() {
-        PoolWait wait = new PoolWait();
-        while (true) {
-            if (this.core.IsClosed()) { return null; }
-            FakeAsyncConnection pooled = this.core.TakeIdle();
-            while (pooled != null) {
-                if (pooled.IsConnected()) { return pooled; }
-                this.core.Drop(pooled);
-                pooled = this.core.TakeIdle();
-            }
-            if (this.core.TryReserve()) {
-                await Task.Delay(1);
-                FakeAsyncConnection opened = new FakeAsyncConnection();
-                opened.connected = true;
-                this.core.Borrow(opened);
-                return opened;
-            }
-            if (!await this.core.WaitForRelease(wait)) { return null; }
+        PoolOpenAsync<FakeAsyncConnection> open = this.OpenOne;
+        Predicate<FakeAsyncConnection> connected = FakeAsyncPool.IsUsable;
+        Action<FakeAsyncConnection> close = FakeAsyncPool.CloseConnection;
+        PoolOpenFailure<FakeAsyncConnection> failed = this.ReportFailure;
+        return await this.core.AcquireAsync(open, connected, close, failed);
+    }
+
+    public FakeAsyncConnection TryAcquire() {
+        Predicate<FakeAsyncConnection> connected = FakeAsyncPool.IsUsable;
+        Action<FakeAsyncConnection> close = FakeAsyncPool.CloseConnection;
+        return this.core.TryAcquireIdle(connected, close);
+    }
+
+    private async FakeAsyncConnection OpenOne() {
+        this.openAttempts = this.openAttempts + 1;
+        if (this.opening != null) {
+            this.opening.Signal();
+            await this.finishOpen.Wait();
+        } else {
+            await Task.Delay(1);
         }
-        return null;
+        if (this.throwOnOpen) { throw new InvalidOperationException("fake open error"); }
+        FakeAsyncConnection c = new FakeAsyncConnection();
+        c.connected = true;
+        this.lastOpened = c;
+        return c;
+    }
+
+    static bool IsUsable(FakeAsyncConnection c) { return c.IsConnected(); }
+    static void CloseConnection(FakeAsyncConnection c) { c.Close(); }
+
+    private void ReportFailure(FakeAsyncConnection c, Exception error) {
+        this.failureReports = this.failureReports + 1;
+        this.failureMessage = error != null ? error.Message : "no error";
     }
 
     public void Release(FakeAsyncConnection c) {
@@ -104,7 +127,7 @@ class FakeAsyncPool {
             Task.Spawn(this.Cleanup(c));
             return;
         }
-        this.core.Pool(c);
+        if (!this.core.Pool(c)) { c.Close(); }
     }
 
     private async bool Cleanup(FakeAsyncConnection c) {
@@ -118,11 +141,23 @@ class FakeAsyncPool {
             this.core.Drop(c);
             return true;
         }
-        this.core.Pool(c);
+        if (!this.core.Pool(c)) { c.Close(); }
         return true;
     }
 
     public int IdleCount() { return this.core.IdleCount(); }
+    public int LiveCount() { return this.core.LiveCount(); }
+
+    public void Close() {
+        this.core.MarkClosed();
+        FakeAsyncConnection c = this.core.TakeClosing();
+        while (c != null) {
+            c.Close();
+            this.core.Drop(c);
+            c = this.core.TakeClosing();
+        }
+        this.core.WakeAll();
+    }
 }
 
 public class PoolAsyncResetCase {
@@ -133,6 +168,57 @@ public class PoolAsyncResetCase {
             bad = bad + 1;
             Console.WriteLine("FAIL " + label);
         }
+    }
+
+    static async int AcquireThenSignal(FakeAsyncPool pool, Gate done) {
+        FakeAsyncConnection c = await pool.AcquireAsync();
+        Chk("close wins in-flight open", c == null);
+        done.Signal();
+        return 0;
+    }
+
+    static async int CloseDuringOpen() {
+        FakeAsyncPool pool = new FakeAsyncPool(1);
+        pool.opening = new Gate();
+        pool.finishOpen = new Gate();
+        Gate done = new Gate();
+        Task.Spawn(PoolAsyncResetCase.AcquireThenSignal(pool, done));
+        Chk("open reached suspension", await pool.opening.Wait(1000));
+        Chk("in-flight open owns the only slot", pool.LiveCount() == 1);
+        Chk("try acquire ignores in-flight open", pool.TryAcquire() == null && pool.openAttempts == 1);
+        pool.Close();
+        pool.finishOpen.Signal();
+        Chk("closed acquire completed", await done.Wait(1000));
+        FakeAsyncConnection c = pool.lastOpened;
+        Chk("late connection closed once", c != null && c.closeCount == 1);
+        Chk("no slots after late open", pool.LiveCount() == 0 && pool.IdleCount() == 0);
+        return 0;
+    }
+
+    static async int FailedOpenAndIdle() {
+        FakeAsyncPool pool = new FakeAsyncPool(1);
+        Chk("try acquire never opens an empty pool", pool.TryAcquire() == null && pool.openAttempts == 0);
+        pool.throwOnOpen = true;
+        FakeAsyncConnection c = await pool.AcquireAsync();
+        Chk("throwing open releases its slot", c == null && pool.LiveCount() == 0);
+        Chk("first failure keeps the exception message", pool.failureReports == 1 && pool.failureMessage == "fake open error");
+        for (int i = 0; i < 64; i = i + 1) { c = await pool.AcquireAsync(); }
+        Chk("one retry per 64 calls and no duplicate diagnostic", c == null && pool.openAttempts == 2 && pool.failureReports == 1);
+        pool.throwOnOpen = false;
+        for (int i = 0; i < 64; i = i + 1) { c = await pool.AcquireAsync(); }
+        Chk("retry succeeds after recovery", c != null && pool.openAttempts == 3);
+        if (c != null) {
+            pool.Release(c);
+            c.connected = false;
+            Chk("try acquire evicts dead idle without opening", pool.TryAcquire() == null
+                && c.closeCount == 1 && pool.LiveCount() == 0 && pool.openAttempts == 3);
+        }
+        pool.throwOnOpen = true;
+        c = await pool.AcquireAsync();
+        Chk("successful retry resets the failure episode", c == null && pool.openAttempts == 4
+            && pool.failureReports == 2 && pool.LiveCount() == 0);
+        pool.Close();
+        return 0;
     }
 
     static async int Run() {
@@ -158,7 +244,10 @@ public class PoolAsyncResetCase {
         FakeAsyncConnection c3 = await pool.AcquireAsync();
         Chk("clean return direct", c3 == c2 && c3.rollbackCount == 1);
         pool.Release(c3);
+        pool.Close();
 
+        await PoolAsyncResetCase.CloseDuringOpen();
+        await PoolAsyncResetCase.FailedOpenAndIdle();
         Console.WriteLine("pool-async-reset-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
         return 0;
     }

@@ -52,6 +52,46 @@ class ZanDbBackupTest {
         return doc;
     }
 
+    static void CheckDurabilityBackup(int durability, string mode) {
+        string source = "_scratch/zandb_bk_mode_" + mode + ".zdb";
+        string target = source + ".backup";
+        Clean(source);
+        Clean(target);
+        ZanDatabase db = ZanDatabase.Open(source, durability);
+        Ok(db.IsOpen(), mode + " source opens");
+        Collection docs = db.GetCollection("docs");
+        int keptId = docs.Insert(UserDoc(1, "before-update", 20));
+        int deletedId = docs.Insert(UserDoc(2, "delete-me", 21));
+        db.Flush();
+        bool updated = docs.Update(keptId, UserDoc(1, "after-update", 22));
+        bool deleted = docs.DeleteById(deletedId);
+        int addedId = docs.Insert(UserDoc(3, "pending-insert", 23));
+        Ok(updated && deleted && addedId > 0, mode + " committed update delete and insert");
+        int pending = db.kv.log.PendingBytes();
+        Ok(db.kv.log.Size() > 0 && (durability == ZanStore.DUR_NONE ? pending > 0 : pending == 0), mode + " WAL state matches durability before export");
+        long revision = db.GetRevision();
+
+        // Backup checkpoints pending frames before exporting its immutable segments.
+        // The source WAL remains locked, so the exported WAL must be newly created.
+        db.Backup(target);
+        Ok(db.IsOpen() && db.kv.log.Size() == 0 && db.kv.log.PendingBytes() == 0, mode + " export checkpoints all committed WAL bytes");
+        Ok(db.GetRevision() == revision && File.GetSize64(target) == 0, mode + " export keeps revision and creates empty destination WAL");
+        ZanDatabase backup = ZanDatabase.Open(target, ZanStore.DUR_SYNC);
+        Ok(backup.IsOpen() && backup.GetRevision() == revision, mode + " backup reopens at exported revision");
+        Collection restored = backup.GetCollection("docs");
+        JsonValue kept = restored.FindById(keptId);
+        JsonValue added = restored.FindById(addedId);
+        Ok(kept != null && kept.Str("name", "") == "after-update" && added != null && added.Str("name", "") == "pending-insert", mode + " backup preserves updated and pending inserted data");
+        Ok(restored.FindById(deletedId) == null && backup.IntegrityCheck().Count == 0, mode + " backup preserves tombstone and passes integrity check");
+        docs.Update(keptId, UserDoc(1, "after-export", 24));
+        JsonValue isolated = restored.FindById(keptId);
+        Ok(isolated != null && isolated.Str("name", "") == "after-update" && backup.GetRevision() == revision, mode + " source writes remain isolated from exported revision");
+        backup.Close();
+        db.Close();
+        Clean(source);
+        Clean(target);
+    }
+
     static void Main() {
         string srcPath = "_scratch/zandb_bk_src.zdb";
         string dstPath = "_scratch/zandb_bk_dst.zdb";
@@ -203,6 +243,10 @@ class ZanDbBackupTest {
         Clean(srcPath);
         Clean(dstPath);
         Clean(dstPath2);
+
+        CheckDurabilityBackup(ZanStore.DUR_SYNC, "sync");
+        CheckDurabilityBackup(ZanStore.DUR_GROUP, "group");
+        CheckDurabilityBackup(ZanStore.DUR_NONE, "none");
 
         Console.WriteLine("done backup tests: " + Convert.ToString(checks));
     }

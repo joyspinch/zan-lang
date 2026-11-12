@@ -5,6 +5,22 @@ static LLVMValueRef find_fn_for_sym(zan_irgen_t *g, zan_symbol_t *msym) {
     return i >= 0 ? g->functions[i].fn : NULL;
 }
 
+/* Search only overrides of this declaration. An unrelated overload (or a
+ * nonvirtual method hiding it) must never replace a virtual slot. */
+static zan_symbol_t *vtable_slot_impl(zan_symbol_t *sym, zan_symbol_t *decl) {
+    for (zan_symbol_t *s = sym; s;
+         s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+        for (int i = 0; i < s->member_count; i++) {
+            zan_symbol_t *m = s->members[i];
+            if (m == decl) return decl;
+            if (m && m->kind == SYM_METHOD && (m->modifiers & MOD_OVERRIDE) &&
+                virtual_method_signature_equal(m, decl))
+                return m;
+        }
+    }
+    return decl;
+}
+
 static void collect_vslot_decls(zan_symbol_t *sym, zan_symbol_t **out, int *n, int cap) {
     if (sym->type && sym->type->base_type && sym->type->base_type->sym)
         collect_vslot_decls(sym->type->base_type->sym, out, n, cap);
@@ -89,8 +105,7 @@ static void fill_vtable_inst(zan_irgen_t *g, LLVMValueRef gv,
         LLVMValueRef e = LLVMConstNull(i8ptr);
         if (s < nd) {
             zan_symbol_t *decl = decls[s];
-            int arity = decl->decl ? decl->decl->method_decl.params.count : 0;
-            zan_symbol_t *impl = resolve_overload(sym, decl->name, arity, 0);
+            zan_symbol_t *impl = vtable_slot_impl(sym, decl);
             LLVMValueRef fn = vtable_slot_fn(g, impl, inst);
             if (fn) e = LLVMConstBitCast(fn, i8ptr);
         }
@@ -141,8 +156,7 @@ void emit_vtables(zan_irgen_t *g) {
             LLVMValueRef e = LLVMConstNull(i8ptr);
             if (s < nd) {
                 zan_symbol_t *decl = decls[s];
-                int arity = decl->decl ? decl->decl->method_decl.params.count : 0;
-                zan_symbol_t *impl = resolve_overload(sym, decl->name, arity, 0);
+                zan_symbol_t *impl = vtable_slot_impl(sym, decl);
                 LLVMValueRef fn = vtable_slot_fn(g, impl, NULL);
                 if (fn) e = LLVMConstBitCast(fn, i8ptr);
             }

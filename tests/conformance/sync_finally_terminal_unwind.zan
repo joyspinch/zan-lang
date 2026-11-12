@@ -1,0 +1,98 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Diagnostics;
+
+class TerminalOwner { public int value = 42; }
+
+class Program {
+    [DllImport("crt", EntryPoint = "__cxa_allocate_exception")]
+    static extern nint AllocateNative(long size);
+    [DllImport("crt", EntryPoint = "__cxa_throw")]
+    static extern void ThrowNative(nint payload, nint type, nint destroy);
+
+    static void Fail() { throw new InvalidOperationException("terminal"); }
+
+    static int calleeFinalizers = 0;
+
+    static void Callee() {
+        try {
+            TerminalOwner owner = new TerminalOwner();
+            Fail();
+        } finally { calleeFinalizers = calleeFinalizers + 1; }
+    }
+
+    static void CheckCallee() {
+        bool caught = false;
+        try { Callee(); }
+        catch (InvalidOperationException ex) { caught = ex.Message == "terminal"; }
+        if (!caught || calleeFinalizers != 1) { throw new Exception("callee propagation"); }
+    }
+
+    static void CheckCaught(bool exact) {
+        int finalizers = 0;
+        bool caught = false;
+        try {
+            try {
+                TerminalOwner owner = new TerminalOwner();
+                if (exact) {
+                    try { Fail(); }
+                    catch (InvalidOperationException ex) { caught = ex.Message == "terminal"; }
+                } else {
+                    try { Fail(); }
+                    catch (ArgumentException ex) { throw new Exception("wrong catch"); }
+                }
+            } finally { finalizers = finalizers + 1; }
+        } catch (InvalidOperationException ex) { caught = ex.Message == "terminal"; }
+        if (!caught || finalizers != 1) { throw new Exception("caught shape"); }
+    }
+
+    static void Main() {
+        if (Environment.ArgCount() > 0) {
+            string marker = Environment.ArgAt(1);
+            try {
+                for (int i = 0; i < 2; i = i + 1) {
+                    TerminalOwner owner = new TerminalOwner();
+                    if (Environment.ArgAt(0) == "typed") {
+                        try { Fail(); }
+                        catch (ArgumentException ex) { throw new Exception("wrong catch"); }
+                    } else if (Environment.ArgAt(0) == "native") {
+                        ThrowNative(AllocateNative(8), 0, 0);
+                    } else { Fail(); }
+                }
+            } finally {
+                if (File.Exists(marker)) { Environment.Exit(92); }
+                File.WriteAllText(marker, "once");
+            }
+            return;
+        }
+        CheckCaught(false);
+        CheckCaught(true);
+        CheckCallee();
+        string root = Path.GetFullPath("_scratch/conf_sync_finally_terminal_unwind");
+        if (Directory.Exists(root) || File.Exists(root) || File.IsReparsePoint(root)) {
+            throw new Exception("owned fixture already exists");
+        }
+        Directory.CreateDirectoryRecursive(root);
+        try {
+            for (int i = 0; i < 3; i = i + 1) {
+                string marker = Path.Combine(root, "terminal-unwind-" + Convert.ToString(i));
+                List<string> args = new List<string>();
+                args.Add(i == 0 ? "finally" : (i == 1 ? "typed" : "native"));
+                args.Add(marker);
+                ProcessResult child = Process.CaptureSafe(Environment.ProcessPath, args, 5000);
+                int code = child.exitCode;
+                bool once = File.Exists(marker) && File.ReadAllText(marker) == "once";
+                bool diagnosed = false;
+                bool clean = true;
+                for (int line = 0; line < child.lines.Count; line = line + 1) {
+                    string text = child.lines[line];
+                    if (text.Contains(i == 2 ? "Unhandled exception" : "terminal")) { diagnosed = true; }
+                    if (text.Contains("ARC integrity failure") || text.Contains("memory leak detected") || text.Contains("runtime error")) { clean = false; }
+                }
+                if (code != 1 || !once || !diagnosed || !clean) { throw new Exception("terminal cleanup repeated or did not propagate"); }
+            }
+        } finally { Directory.DeleteRecursive(root); }
+        Console.WriteLine("PASS sync_finally_terminal_unwind");
+    }
+}

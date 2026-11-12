@@ -104,11 +104,28 @@
                 LLVMValueRef v_slot =
                     emit_entry_alloca(g, LLVMTypeOf(val), "ret.fin.slot");
                 zan_store_fit(g, val, v_slot);
+                /* The pending +1 belongs to this return until every finally
+                 * completes. A replacement return or escaping exception must
+                 * release it just like an owned local. Inner catches, entered
+                 * after registration, must leave it alive. */
+                int pending_base = locals->count;
+                bool pending_owned = is_rc_managed_type(ret_type) ||
+                    (ret_type && ret_type->kind == TYPE_OBJECT) ||
+                    type_contains_collection_rc(g, ret_type, 0);
+                if (pending_owned) {
+                    local_add(locals, (zan_istr_t){"", 0}, v_slot, ret_type);
+                    locals->vars[locals->count - 1].struct_rc =
+                        ret_type && ret_type->kind == TYPE_STRUCT;
+                    arc_own_local(g, locals);
+                }
                 emit_pending_finallys(g, locals, 0, false);
+                locals->count = pending_base;
                 if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
                     break;
                 val = LLVMBuildLoad2(g->builder, LLVMTypeOf(val), v_slot,
                                      "ret.fin");
+                /* Successful completion transfers ownership to the caller. */
+                LLVMBuildStore(g->builder, LLVMConstNull(LLVMTypeOf(val)), v_slot);
             }
             /* 退出顺序：先释放 catch 捕获的异常对象，再释放局部变量。
              * 被捕获的异常还压在异常临时栈顶（catch 进入时压入），若先弹局部
@@ -187,12 +204,24 @@
         int then_start = locals->count;
         LLVMValueRef cond = emit_expr(g, stmt->if_stmt.cond, locals);
         cond = zan_tobool(g->builder, cond, "tobool");
+        /* Pattern bindings belong to the condition on both outgoing edges.
+         * Emitting then cleanup mutates locals, so preserve those bindings
+         * for the false edge (including an if without an else body). */
+        int condition_count = locals->count - then_start;
+        local_var_t *condition_vars = NULL;
+        if (condition_count > 0) {
+            condition_vars = (local_var_t *)zan_arena_alloc(g->arena,
+                sizeof(local_var_t) * (size_t)condition_count);
+            memcpy(condition_vars, locals->vars + then_start,
+                sizeof(local_var_t) * (size_t)condition_count);
+        }
 
         LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "then");
         LLVMBasicBlockRef else_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "else");
         LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "merge");
 
-        LLVMBuildCondBr(g->builder, cond, then_bb, stmt->if_stmt.else_body ? else_bb : merge_bb);
+        LLVMBuildCondBr(g->builder, cond, then_bb,
+            (stmt->if_stmt.else_body || condition_count > 0) ? else_bb : merge_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, then_bb);
         emit_stmt(g, stmt->if_stmt.then_body, locals);
@@ -203,7 +232,12 @@
             emit_release_owned_locals_from(g, locals, then_start);
         }
 
-        int else_start = locals->count;
+        if (condition_count > 0) {
+            memcpy(locals->vars + then_start, condition_vars,
+                sizeof(local_var_t) * (size_t)condition_count);
+            locals->count = then_start + condition_count;
+        }
+        int else_start = then_start;
         LLVMPositionBuilderAtEnd(g->builder, else_bb);
         if (stmt->if_stmt.else_body) {
             emit_stmt(g, stmt->if_stmt.else_body, locals);
@@ -247,7 +281,17 @@
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
         LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
         cond = zan_tobool(g->builder, cond, "tobool");
-        LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
+        if (locals->count > body_start) {
+            LLVMBasicBlockRef false_bb = LLVMAppendBasicBlockInContext(
+                g->ctx, g->current_fn, "while.false");
+            LLVMBuildCondBr(g->builder, cond, body_bb, false_bb);
+            LLVMPositionBuilderAtEnd(g->builder, false_bb);
+            /* Emit this edge before body cleanup truncates condition locals. */
+            emit_release_owned_locals_range(g, locals, body_start);
+            LLVMBuildBr(g->builder, end_bb);
+        } else {
+            LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
+        }
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
         emit_stmt(g, stmt->while_stmt.body, locals);
@@ -310,7 +354,16 @@
         if (stmt->for_stmt.cond) {
             LLVMValueRef cond = emit_expr(g, stmt->for_stmt.cond, locals);
             cond = zan_tobool(g->builder, cond, "tobool");
-            LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
+            if (locals->count > for_body_start) {
+                LLVMBasicBlockRef false_bb = LLVMAppendBasicBlockInContext(
+                    g->ctx, g->current_fn, "for.false");
+                LLVMBuildCondBr(g->builder, cond, body_bb, false_bb);
+                LLVMPositionBuilderAtEnd(g->builder, false_bb);
+                emit_release_owned_locals_range(g, locals, for_body_start);
+                LLVMBuildBr(g->builder, end_bb);
+            } else {
+                LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
+            }
         } else {
             LLVMBuildBr(g->builder, body_bb);
         }

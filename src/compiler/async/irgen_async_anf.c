@@ -92,26 +92,30 @@ static void anf_check_order(anf_ctx_t *c, zan_ast_node_t *before, zan_ast_node_t
     }
 }
 
-/* 将 `await E` 提升为 `var $awN = await E;` 声明并返回该临时变量引用 */
-static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
-    aw->await_expr.expr = anf_expr(c, aw->await_expr.expr);
-    anf_spill_await_receiver(c, aw);
-
+/* A frame-backed local also isolates lazy expressions without evaluating dead arms. */
+static zan_ast_node_t *anf_hoist_value(anf_ctx_t *c, zan_ast_node_t *value) {
     char buf[32];
     int len = snprintf(buf, sizeof buf, "$aw%d", (*c->counter)++);
     char *nm = (char *)zan_arena_alloc(c->g->arena, (size_t)len + 1);
     memcpy(nm, buf, (size_t)len + 1);
     zan_istr_t name = { nm, (uint32_t)len };
 
-    zan_ast_node_t *vd = zan_ast_new(c->g->arena, AST_VAR_DECL, aw->loc);
+    zan_ast_node_t *vd = zan_ast_new(c->g->arena, AST_VAR_DECL, value->loc);
     vd->var_decl.name = name;
     vd->var_decl.type = NULL;
-    vd->var_decl.initializer = aw;
+    vd->var_decl.initializer = value;
     zan_ast_list_push(c->out, vd, c->g->arena);
 
-    zan_ast_node_t *id = zan_ast_new(c->g->arena, AST_IDENTIFIER, aw->loc);
+    zan_ast_node_t *id = zan_ast_new(c->g->arena, AST_IDENTIFIER, value->loc);
     id->ident.name = name;
     return id;
+}
+
+/* 将 `await E` 提升为 `var $awN = await E;` 声明并返回该临时变量引用 */
+static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
+    aw->await_expr.expr = anf_expr(c, aw->await_expr.expr);
+    anf_spill_await_receiver(c, aw);
+    return anf_hoist_value(c, aw);
 }
 
 /* 将被 await 调用的计算所得接收者提升为独立局部变量，避免跨挂起点丢失 SSA 临时值 */
@@ -166,25 +170,93 @@ static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
     case AST_ASSIGNMENT:
         if (e->binary.op == TK_AMP_AMP || e->binary.op == TK_PIPE_PIPE) {
             e->binary.left = anf_expr(c, e->binary.left);
+            if (anf_expr_contains_await(e->binary.right)) {
+                /* Normalize the lazy arm inside its guard. Leaving raw awaits
+                 * here lets operand SSA values escape across resume entries. */
+                zan_ast_node_t *result = anf_hoist_value(c, e->binary.left);
+                zan_ast_node_t *body = zan_ast_new(c->g->arena, AST_BLOCK, e->loc);
+                zan_ast_list_init(&body->block.stmts);
+                anf_ctx_t branch = { c->g, &body->block.stmts, c->counter };
+                zan_ast_node_t *rhs = anf_expr(&branch, e->binary.right);
+                zan_ast_node_t *assign = zan_ast_new(c->g->arena, AST_ASSIGNMENT, e->loc);
+                assign->binary.op = TK_EQ;
+                assign->binary.left = result;
+                assign->binary.right = rhs;
+                zan_ast_node_t *stmt = zan_ast_new(c->g->arena, AST_EXPR_STMT, e->loc);
+                stmt->expr_stmt.expr = assign;
+                zan_ast_list_push(&body->block.stmts, stmt, c->g->arena);
+                zan_ast_node_t *guard = result;
+                if (e->binary.op == TK_PIPE_PIPE) {
+                    guard = zan_ast_new(c->g->arena, AST_UNARY, e->loc);
+                    guard->unary.op = TK_BANG;
+                    guard->unary.operand = result;
+                }
+                zan_ast_node_t *ifs = zan_ast_new(c->g->arena, AST_IF_STMT, e->loc);
+                ifs->if_stmt.cond = guard;
+                ifs->if_stmt.then_body = body;
+                ifs->if_stmt.else_body = NULL;
+                zan_ast_list_push(c->out, ifs, c->g->arena);
+                return result;
+            }
             return e;
         }
         anf_check_order(c, e->binary.left, e->binary.right);
-        e->binary.left  = anf_expr(c, e->binary.left);
+        e->binary.left = anf_expr(c, e->binary.left);
+        /* Snapshot a value before a later await can mutate its source. An
+         * assignment's left side is a storage location, not a value snapshot. */
+        if (e->kind == AST_BINARY && anf_expr_contains_await(e->binary.right))
+            e->binary.left = anf_hoist_value(c, e->binary.left);
         e->binary.right = anf_expr(c, e->binary.right);
         return e;
     case AST_UNARY:
     case AST_POSTFIX_UNARY:
         e->unary.operand = anf_expr(c, e->unary.operand);
         return e;
-    case AST_CALL:
-        for (int i = 0; i < e->call.args.count; i++) {
-            for (int j = i + 1; j < e->call.args.count; j++)
-                anf_check_order(c, e->call.args.items[i], e->call.args.items[j]);
-        }
-        e->call.callee = anf_expr(c, e->call.callee);
+    case AST_CALL: {
+        bool args_await = false;
         for (int i = 0; i < e->call.args.count; i++)
-            e->call.args.items[i] = anf_expr(c, e->call.args.items[i]);
+            args_await |= anf_expr_contains_await(e->call.args.items[i]);
+        e->call.callee = anf_expr(c, e->call.callee);
+        /* Capture an instance receiver before any argument can suspend or mutate it.
+         * Type-name receivers remain names; they are not runtime values. */
+        zan_ast_node_t *callee = e->call.callee;
+        if (args_await && callee && callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *obj = callee->member.object;
+            bool snapshot = anf_receiver_needs_spill(obj);
+            if (obj && obj->kind == AST_IDENTIFIER) {
+                zan_symbol_t *sym = zan_binder_lookup(c->g->binder, obj->ident.name);
+                snapshot = !sym || (sym->kind != SYM_CLASS &&
+                    sym->kind != SYM_STRUCT && sym->kind != SYM_NAMESPACE);
+                /* Native static types need no binder declaration. A resolved
+                 * instance call still snapshots a shadowing local receiver. */
+                if (!sym && !e->call.resolved_sym) {
+                    int count = 0;
+                    const zan_builtin_type_t *types = zan_builtin_types(&count);
+                    for (int i = 0; i < count; i++) {
+                        if (types[i].is_static &&
+                            strlen(types[i].type) == obj->ident.name.len &&
+                            memcmp(types[i].type, obj->ident.name.str,
+                                   obj->ident.name.len) == 0) {
+                            snapshot = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (snapshot) callee->member.object = anf_hoist_value(c, obj);
+        }
+        for (int i = 0; i < e->call.args.count; i++) {
+            bool later_await = false;
+            for (int j = i + 1; j < e->call.args.count; j++)
+                later_await |= anf_expr_contains_await(e->call.args.items[j]);
+            zan_ast_node_t *arg = anf_expr(c, e->call.args.items[i]);
+            if (later_await && arg->kind != AST_LAMBDA &&
+                arg->kind != AST_REF_ARG)
+                arg = anf_hoist_value(c, arg);
+            e->call.args.items[i] = arg;
+        }
         return e;
+    }
     case AST_MEMBER_ACCESS:
         e->member.object = anf_expr(c, e->member.object);
         return e;
@@ -195,6 +267,9 @@ static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
         return e;
     case AST_CONDITIONAL:
         e->conditional.cond = anf_expr(c, e->conditional.cond);
+        if (anf_expr_contains_await(e->conditional.then_expr) ||
+            anf_expr_contains_await(e->conditional.else_expr))
+            return anf_hoist_value(c, e);
         return e;
     case AST_CAST_EXPR:
         e->cast.expr = anf_expr(c, e->cast.expr);

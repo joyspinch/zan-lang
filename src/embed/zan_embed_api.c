@@ -4,6 +4,7 @@
 
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"
+#include "zan_embed_string.h"
 
 typedef struct {
     const char*          name;
@@ -28,9 +29,12 @@ static const zan_embed_ent* zan_embed_find(const char* name) {
     return 0;
 }
 
+/* Registration may supply raw bytes with no readable prefix. Only the text
+ * API wraps them; the binary API continues returning the original pointer. */
 const char* zan_embed_read(const char* name) {
     const zan_embed_ent* e = zan_embed_find(name);
-    return e ? (const char*)e->data : "";
+    if (!e || e->len < 0) return zan_embed_string_empty();
+    return zan_embed_string_view(e->data, (uint64_t)e->len);
 }
 
 int zan_embed_has(const char* name) {

@@ -1,0 +1,161 @@
+using System;
+using System.Net.Sockets;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+class Program {
+    static int failures;
+    static int port = 9757;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL: " + label);
+        }
+    }
+
+    // Read a request before sending each scripted response. After the last
+    // framed response, hold the socket open until the client closes it.
+    static async void Serve(nint listener, List<string> replies, bool eof, Gate done) {
+        nint sock = await Socket.AcceptAsync(listener);
+        if (sock >= 0) {
+            for (int i = 0; i < replies.Count; i = i + 1) {
+                string req = "";
+                while (req.IndexOf("\r\n\r\n") < 0) {
+                    string chunk = await Socket.RecvAsync(sock, 4096);
+                    if (chunk.Length == 0) { break; }
+                    req = req + chunk;
+                }
+                if (req.IndexOf("\r\n\r\n") < 0) { break; }
+                string reply = replies[i];
+                int sent = await Socket.SendStringAsync(sock, reply);
+                if (sent != reply.Length) { break; }
+            }
+            if (!eof) {
+                byte[] extra = new byte[1];
+                int n = await Socket.RecvBytesAsync(sock, extra, 1, 3000);
+                string lastReply = replies[replies.Count - 1];
+                int prefixLength = lastReply.Length < 80 ? lastReply.Length : 80;
+                Program.Check(n == 0, "client close returned " + Convert.ToString(n)
+                    + " after " + lastReply.Substring(0, prefixLength).Replace("\r\n", " "));
+            }
+            Socket.Close(sock);
+        }
+        done.Signal();
+    }
+
+    static async void CheckOneShot(HttpClient client, nint listener, string wire,
+            string method, bool binary, int status, string body, string failure) {
+        List<string> replies = new List<string>();
+        replies.Add(wire);
+        Gate done = new Gate();
+        Task.Spawn(Program.Serve(listener, replies, false, done));
+        try {
+            HttpResponse resp = null;
+            if (binary) { resp = await client.SendBytesAsync(method, "/frame", ""); }
+            else { resp = await client.SendAsync(method, "/frame", ""); }
+            Program.Check(failure == "" && resp.statusCode == status && resp.body == body,
+                "one-shot " + method + " " + Convert.ToString(status));
+        } catch (HttpRequestException e) {
+            Program.Check(failure != "" && e.Message.Contains(failure),
+                "one-shot failure: " + e.Message);
+        }
+        bool closed = await done.Wait();
+        Program.Check(closed, "one-shot released channel");
+        done.Dispose();
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        nint listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        int bound = Socket.Bind(listener, "127.0.0.1", Program.port);
+        if (bound != 0 || Socket.Listen(listener, 8) != 0) {
+            Socket.Close(listener);
+            Console.WriteLine("FAIL: listener startup");
+            return 1;
+        }
+        HttpClient one = new HttpClient("127.0.0.1", Program.port);
+        one.DisableKeepAlive();
+        one.SetTimeout(1200);
+        one.SetCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp()
+            .ResponseLimit(4).RetryAttempts(0));
+        string fixedHead = "HTTP/1.1 200 OK\r\nX-Note: independent header budget\r\n";
+        await Program.CheckOneShot(one, listener, fixedHead + "Content-Length: 4\r\n\r\nbody",
+            "GET", false, 200, "body", "");
+        await Program.CheckOneShot(one, listener, fixedHead + "Content-Length: 5\r\n\r\nbody!",
+            "GET", false, 0, "", "response body exceeds 4 bytes");
+        await Program.CheckOneShot(one, listener, fixedHead + "Content-Length: 5\r\n\r\nbody!",
+            "GET", true, 0, "", "response body exceeds 4 bytes");
+        await Program.CheckOneShot(one, listener, fixedHead + "Content-Length: 99\r\n\r\n",
+            "HEAD", false, 200, "", "");
+        await Program.CheckOneShot(one, listener, "HTTP/1.1 304 Not Modified\r\nContent-Length: 99\r\n\r\n",
+            "GET", true, 304, "", "");
+        await Program.CheckOneShot(one, listener, "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\n\r\n",
+            "GET", false, 101, "", "");
+        string padding = "a";
+        for (int i = 0; i < 16; i = i + 1) { padding = padding + padding; }
+        await Program.CheckOneShot(one, listener, "HTTP/1.1 200 OK\r\nX-Pad: " + padding
+            + "\r\nContent-Length: 0\r\n\r\n", "GET", false, 0, "", "response header block exceeds 65536 bytes");
+        one.Dispose();
+
+        List<string> replies = new List<string>();
+        replies.Add("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </asset>\r\n\r\n"
+            + "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\nX-Trailer: yes\r\n\r\n");
+        replies.Add("HTTP/1.1 204 No Content\r\n\r\n");
+        replies.Add("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx!!");
+        Gate pooledDone = new Gate();
+        Task.Spawn(Program.Serve(listener, replies, false, pooledDone));
+        HttpClient pooled = new HttpClient("127.0.0.1", Program.port);
+        pooled.SetTimeout(1200);
+        pooled.SetCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp().ResponseLimit(4));
+        HttpResponse chunked = await pooled.SendAsync("GET", "/chunked", "");
+        Program.Check(chunked.statusCode == 200 && chunked.body == "abcd" && !chunked.IsBinary(),
+            "interim heads skipped; chunked body decoded");
+        HttpResponse noBody = await pooled.SendAsync("GET", "/none", "");
+        Program.Check(noBody.statusCode == 204 && noBody.BodyLength() == 0
+            && pooled.ConnectionPool().TotalReused() == 1, "204 on reused connection");
+        string malformed = "no exception";
+        try { HttpResponse bad = await pooled.SendAsync("GET", "/bad", ""); }
+        catch (HttpRequestException e) { malformed = e.Message; }
+        int active = pooled.ConnectionPool().ActiveCount();
+        int idle = pooled.ConnectionPool().IdleCount();
+        Program.Check(malformed.Contains("malformed chunked"), "invalid chunk: " + malformed);
+        Program.Check(active == 0 && idle == 0, "malformed chunk closes lease (active="
+            + Convert.ToString(active) + ", idle=" + Convert.ToString(idle) + ")");
+        bool pooledClosed = await pooledDone.Wait();
+        Program.Check(pooledClosed, "malformed response channel closed");
+        pooledDone.Dispose();
+
+        List<string> eofReplies = new List<string>();
+        eofReplies.Add("HTTP/1.0 200 OK\r\n\r\neof!");
+        Gate eofDone = new Gate();
+        Task.Spawn(Program.Serve(listener, eofReplies, true, eofDone));
+        HttpResponse eof = await pooled.SendAsync("GET", "/eof", "");
+        Program.Check(eof.body == "eof!" && pooled.ConnectionPool().IdleCount() == 0,
+            "EOF body returned without pooling its connection");
+        bool eofClosed = await eofDone.Wait();
+        Program.Check(eofClosed, "EOF fixture exited");
+        eofDone.Dispose();
+        pooled.Dispose();
+
+        HttpClient bytes = new HttpClient("127.0.0.1", Program.port);
+        bytes.SetTimeout(1200);
+        bytes.SetCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp()
+            .ResponseLimit(4).RetryAttempts(2).RetryNetwork(true));
+        await Program.CheckOneShot(bytes, listener,
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 1\r\n\r\nx",
+            "GET", true, 503, "x", "");
+        Program.Check(bytes.ConnectionPool().TotalRented() == 0, "bytes did not rent or retry");
+        bytes.Dispose();
+        Socket.Close(listener);
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        return Program.failures;
+    }
+
+    static void Main() {
+        int failures = await Program.Run();
+    }
+}

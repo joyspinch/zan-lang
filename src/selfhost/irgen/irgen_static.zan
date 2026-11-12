@@ -181,11 +181,11 @@ partial class Irgen {
         EnsureStaticGlobal(owner, name, args, lt);
         string g = StaticGlobal(owner, name, args);
         if (IsNullableValue(fty)) {
-            L("  store i8* " + BoxFor(v, fty) + ", i8** " + g);
+            StoreNullable(g, v, fty, true);
             typeScopeCls = savedScope;
             return;
         }
-        if (ArcManaged(fty)) {
+        if (ArcManaged(fty) || (fty != null && fty.ival >= 1)) {
             string old = NT();
             L("  " + old + " = load " + lt + ", " + lt + "* " + g);
             string sv = Coerce(v, lt);
@@ -390,6 +390,9 @@ partial class Irgen {
             Node m = d.kids[j];
             if (m.kind == AK.FieldDecl() && IsStatic(m) && m.b != null) {
                 if (FoldStaticArrayInit(d, m, args)) { j = j + 1; continue; }
+                List<string> savedTemps = stmtTemps;
+                List<Node> savedTempTypes = stmtTempTypes;
+                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
                 ExprVal iv = GenExpr(m.b);
                 Node fty = m.type;
                 string savedScope = typeScopeCls;
@@ -398,7 +401,7 @@ partial class Irgen {
                 typeScopeCls = savedScope;
                 string g = StaticGlobal(d.sval, m.sval, args);
                 if (IsNullableValue(fty)) {
-                    L("  store i8* " + BoxFor(iv, fty) + ", i8** " + g);
+                    StoreNullable(g, iv, fty, false);
                 } else {
                     // a float field carries single precision: the host stores
                     // an f32
@@ -409,6 +412,8 @@ partial class Irgen {
                     L("  store " + lt + " " + sv + ", " + lt + "* " + g);
                     EmitArcRetainStore(sv, fty, iv.ty);
                 }
+                EmitTempReleases();
+                stmtTemps = savedTemps; stmtTempTypes = savedTempTypes;
             }
             else if (m.kind == AK.FieldDecl() && IsStatic(m)) {
                 // a static field without an initializer: the C host gives a
@@ -472,9 +477,10 @@ partial class Irgen {
         }
         starrn = starrn + 1;
         string g = "@.starr" + starrn;
-        H(g + " = internal global [" + (n + 2) + " x i64] [i64 0, i64 " + n + (n > 0 ? ", " + vals : "") + "]");
+        string desc = ArrayDescriptor(at);
+        H(g + " = internal global [" + (n + 3) + " x i64] [i64 add (i64 ptrtoint (i64* " + desc + " to i64), i64 1), i64 -1, i64 " + n + (n > 0 ? ", " + vals : "") + "]");
         string p = NT();
-        L("  " + p + " = getelementptr inbounds [" + (n + 2) + " x i64], [" + (n + 2) + " x i64]* " + g + ", i64 0, i64 2");
+        L("  " + p + " = getelementptr inbounds [" + (n + 3) + " x i64], [" + (n + 3) + " x i64]* " + g + ", i64 0, i64 3");
         L("  store i64* " + p + ", i64** " + StaticGlobal(d.sval, m.sval, args));
         return true;
     }

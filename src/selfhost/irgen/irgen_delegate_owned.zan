@@ -1,0 +1,175 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    int ownedDtorSeq;
+
+    // Keep the public bit0/{fn,env} ABI. Only tagged records carry an ARC
+    // header; a native callback (including null) must never be dereferenced.
+    void EmitDelegateOwnershipRuntime() {
+        int i = 0;
+        while (i < 2) {
+            string op = i == 0 ? "retain" : "release";
+            H("define void @zdelegate_" + op + "(i8* %value) {");
+            H("entry:");
+            H("  %bits = ptrtoint i8* %value to i64");
+            H("  %tag = and i64 %bits, 1");
+            H("  %tagged = icmp ne i64 %tag, 0");
+            H("  br i1 %tagged, label %record, label %done");
+            H("record:");
+            H("  %address = and i64 %bits, -2");
+            H("  %p = inttoptr i64 %address to i8*");
+            H("  call void @z" + op + "(i8* %p)");
+            H("  br label %done");
+            H("done:");
+            H("  ret void");
+            H("}");
+            // Strong backend hooks override the native runtime's host-ABI defaults.
+            H("define void @zan_backend_delegate_" + op + "(i8* %value) {");
+            H("  call void @zdelegate_" + op + "(i8* %value)");
+            H("  ret void");
+            H("}");
+            // Container ownership kind 2 denotes a delegate slot; kind 1 is
+            // an ordinary ARC payload (also used for decimal slot boxes).
+            H("define void @zslot_" + op + "(i8* %value, i64 %kind) {");
+            H("entry:");
+            H("  %isdeleg = icmp eq i64 %kind, 2");
+            H("  br i1 %isdeleg, label %delegate, label %object");
+            H("delegate:");
+            H("  call void @zdelegate_" + op + "(i8* %value)");
+            H("  ret void");
+            H("object:");
+            H("  call void @z" + op + "(i8* %value)");
+            H("  ret void");
+            H("}");
+            i = i + 1;
+        }
+        H("define void @zan_backend_delegate_invoke(i8* %value) {");
+        H("entry:");
+        H("  %empty = icmp eq i8* %value, null");
+        H("  br i1 %empty, label %done, label %check");
+        H("check:");
+        H("  %bits = ptrtoint i8* %value to i64");
+        H("  %tag = and i64 %bits, 1");
+        H("  %tagged = icmp ne i64 %tag, 0");
+        H("  br i1 %tagged, label %record, label %native");
+        H("record:");
+        H("  %address = and i64 %bits, -2");
+        H("  %slots = inttoptr i64 %address to i8**");
+        H("  %fn = load i8*, i8** %slots");
+        H("  %ep = getelementptr i8*, i8** %slots, i64 1");
+        H("  %env = load i8*, i8** %ep");
+        H("  %call = bitcast i8* %fn to void (i8*)*");
+        H("  call void %call(i8* %env)");
+        H("  br label %done");
+        H("native:");
+        H("  %raw = bitcast i8* %value to void ()*");
+        H("  call void %raw()");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+        // Action frames own slot 13; clear before release so cleanup is idempotent.
+        H("define internal void @ztask_action_release(i8* %frame) {");
+        H("  %words = bitcast i8* %frame to i64*");
+        H("  %slot = getelementptr i64, i64* %words, i64 20");
+        H("  %bits = load i64, i64* %slot");
+        H("  store i64 0, i64* %slot");
+        H("  %value = inttoptr i64 %bits to i8*");
+        H("  call void @zdelegate_release(i8* %value)");
+        H("  ret void");
+        H("}");
+        H("define void @zclosure_dtor(i8* %record) {");
+        H("  %slots = bitcast i8* %record to i8**");
+        H("  %ep = getelementptr i8*, i8** %slots, i64 1");
+        H("  %env = load i8*, i8** %ep");
+        H("  call void @zrelease(i8* %env)");
+        H("  ret void");
+        H("}");
+    }
+
+    void EmitCellRelease(string cell) {
+        L("  call void @zrelease(i8* " + cell + ")");
+    }
+
+    string OwnedAlloc(int bytes, string dtor) {
+        string p = NT();
+        string dp = "null";
+        if (dtor != "") { dp = "bitcast (void (i8*)* " + dtor + " to i8*)"; }
+        L("  " + p + " = call i8* @zalloc(i64 " + bytes + ", i8* " + dp + ", i8* null)");
+        return p;
+    }
+
+    // Emit a destructor into the deferred stream using the ordinary typed
+    // release emitter. No enclosing-function register/block state may leak.
+    string OwnedPayloadDtor(List<Node> types, List<bool> cells, bool envSlots, bool pendingObject = false) {
+        string name = "@zowned_dtor_" + ownedDtorSeq;
+        ownedDtorSeq = ownedDtorSeq + 1;
+        StringBuilder saved = body;
+        int st = tmp; int sl = lbl; string sc = curLbl; bool se = eaActive;
+        body = new StringBuilder(); tmp = 0; lbl = 0; curLbl = "entry"; eaActive = false;
+        L("define void " + name + "(i8* %payload) {");
+        L("entry:");
+        int i = 0;
+        while (i < types.Count) {
+            Node ty = types[i];
+            if (cells[i] || (envSlots && IsDecimal(ty))) {
+                string p = NT(); string v = NT();
+                L("  " + p + " = bitcast i8* %payload to i8**");
+                string slot = NT();
+                L("  " + slot + " = getelementptr i8*, i8** " + p + ", i64 " + i);
+                L("  " + v + " = load i8*, i8** " + slot);
+                L("  call void @zrelease(i8* " + v + ")");
+            } else if (pendingObject && ty.sval == "object") {
+                string p = NT(); string v = NT();
+                L("  " + p + " = bitcast i8* %payload to i8**");
+                L("  " + v + " = load i8*, i8** " + p);
+                L("  call void @zref_release(i8* " + v + ")");
+            } else if (ArcManaged(ty) || ty.ival >= 1) {
+                string lt = MapType(ty);
+                string raw = "%payload";
+                if (envSlots) {
+                    raw = NT();
+                    L("  " + raw + " = getelementptr i8, i8* %payload, i64 " + (i * 8));
+                }
+                string p = NT(); string v = NT();
+                L("  " + p + " = bitcast i8* " + raw + " to " + lt + "*");
+                L("  " + v + " = load " + lt + ", " + lt + "* " + p);
+                EmitArcRelease(v, ty);
+            }
+            i = i + 1;
+        }
+        L("  ret void"); L("}");
+        deferred.Append(body.ToString());
+        body = saved; tmp = st; lbl = sl; curLbl = sc; eaActive = se;
+        return name;
+    }
+
+    string OwnedCell(Node ty) {
+        List<Node> types = new List<Node>(); types.Add(ty);
+        List<bool> cells = new List<bool>(); cells.Add(false);
+        return OwnedAlloc(TypeSizeBytes(MapType(ty)), OwnedPayloadDtor(types, cells, false));
+    }
+
+    string OwnedEnvironment(List<Node> types, List<bool> cells) {
+        return OwnedAlloc(types.Count * 8, OwnedPayloadDtor(types, cells, true));
+    }
+
+    ExprVal OwnedClosure(string fn, string env, Node retTy, List<Node> pt) {
+        string record = OwnedAlloc(16, "@zclosure_dtor");
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + record + " to i8**");
+        string fp = NT();
+        L("  " + fp + " = bitcast " + LamFnType(retTy, pt) + " " + fn + " to i8*");
+        L("  store i8* " + fp + ", i8** " + p);
+        string ep = NT();
+        L("  " + ep + " = getelementptr i8*, i8** " + p + ", i64 1");
+        // Transfer the environment's initial +1 to the record.
+        L("  store i8* " + env + ", i8** " + ep);
+        string value = TagClosure(record);
+        Node ty = DelegTypeOf(retTy, pt);
+        AddTemp(value, ty);
+        return new ExprVal(value, ty);
+    }
+}

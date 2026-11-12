@@ -1,0 +1,183 @@
+using System;
+using System.Json;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.External;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.IO.Compression;
+
+// The Python harness supplies ephemeral loopback ports and freshly generated CAs.
+class NetClientFixture {
+    static string Setting(string name) {
+        string value = Environment.GetEnvironmentVariable(name);
+        if (value == null || value == "") { throw new ArgumentException("missing " + name); }
+        return value;
+    }
+
+    static void Require(bool ok, string detail) {
+        if (!ok) { throw new InvalidOperationException(detail); }
+    }
+
+    static byte[] Payload(int size) {
+        byte[] bytes = new byte[size];
+        for (int i = 0; i < size; i = i + 1) { bytes[i] = (byte)((i * 31 + 7) % 256); }
+        return bytes;
+    }
+
+    static void CheckBody(HttpResponse response, int size, bool decoded) {
+        NetClientFixture.Require(response != null, "null HTTP response");
+        NetClientFixture.Require(response.statusCode == 200, "unexpected HTTP status");
+        NetClientFixture.Require(response.contentDecoded == decoded, "contentDecoded mismatch");
+        NetClientFixture.Require(response.bodyBytes != null && response.bodyBytesLen == size,
+            "binary response length mismatch");
+        for (int i = 0; i < size; i = i + 1) {
+            NetClientFixture.Require((response.bodyBytes[i] & 255) == ((i * 31 + 7) % 256),
+                "binary response byte mismatch at " + Convert.ToString(i));
+        }
+    }
+
+    static async string HttpCase(string name, int port) {
+        HttpClient client = new HttpClient("127.0.0.1", port);
+        ExternalCallPolicy policy = new ExternalCallPolicy();
+        policy.AllowLocalHttp();
+        policy.ConnectTimeout(5000);
+        policy.ReadTimeout(5000);
+        policy.WriteTimeout(5000);
+        policy.TotalTimeout(15000);
+        policy.ResponseLimit(name == "gzip_exact" || name == "gzip_over" ? 4096 : 131072);
+        client.SetCallPolicy(policy);
+        if (name != "gzip_missing_decoder") {
+            client.SetBoundedContentDecoder(ContentCoding.DecodeBounded);
+        }
+        try {
+            if (name == "binary_echo") {
+                byte[] bytes = NetClientFixture.Payload(65537);
+                HttpResponse response = await client.SendBytesAsync("POST", "/echo", bytes, 65537);
+                NetClientFixture.CheckBody(response, 65537, false);
+                return "65537 request and response bytes compared, including NUL";
+            }
+            if (name == "disconnect_recovery") {
+                bool rejected = false;
+                string reason = "";
+                try {
+                    HttpResponse broken = await client.SendBytesAsync("GET", "/disconnect", "");
+                } catch (HttpRequestException e) {
+                    // Expected error-value contract: incomplete framing must be rejected.
+                    reason = e.Message;
+                    rejected = reason.Contains("middle of the response body");
+                }
+                NetClientFixture.Require(rejected, "incomplete body was not rejected: " + reason);
+                HttpResponse recovered = await client.SendBytesAsync("GET", "/binary/257", "");
+                NetClientFixture.CheckBody(recovered, 257, false);
+                return "same HttpClient recovered after rejected incomplete body: " + reason;
+            }
+            if (name == "http_stress") {
+                int loops = int.Parse(NetClientFixture.Setting("ZAN_INTEROP_LOOPS"));
+                NetClientFixture.Require(loops >= 1 && loops <= 1000, "invalid loop bound");
+                for (int i = 0; i < loops; i = i + 1) {
+                    int size = 257 + (i % 17);
+                    byte[] bytes = NetClientFixture.Payload(size);
+                    HttpResponse response = await client.SendBytesAsync("POST", "/echo", bytes, size);
+                    NetClientFixture.CheckBody(response, size, false);
+                }
+                return "completed " + Convert.ToString(loops) + " binary echo requests";
+            }
+            bool negative = name == "gzip_over" || name == "gzip_bad_crc"
+                || name == "gzip_truncated" || name == "gzip_missing_decoder";
+            if (negative) {
+                bool rejected = false;
+                string reason = "";
+                try {
+                    HttpResponse response = await client.SendBytesAsync("GET", "/" + name, "");
+                } catch (HttpRequestException e) {
+                    // Expected error-value contract: decoding failure must not return wire bytes.
+                    reason = e.Message;
+                    rejected = name == "gzip_missing_decoder"
+                        ? reason.Contains("no content decoder") : reason.Contains("failed to decode");
+                }
+                NetClientFixture.Require(rejected, "expected decode rejection: " + reason);
+                return reason;
+            }
+            int size = 65537;
+            string path = "/binary/65537";
+            bool decoded = name != "binary_get";
+            if (name == "gzip_empty") { size = 0; path = "/gzip/0"; }
+            else if (name == "gzip_one") { size = 1; path = "/gzip/1"; }
+            else if (name == "gzip_exact") { size = 4096; path = "/gzip/4096"; }
+            else if (name == "gzip_binary") { path = "/gzip/65537"; }
+            else { NetClientFixture.Require(name == "binary_get", "unknown HTTP case"); }
+            HttpResponse response = await client.SendBytesAsync("GET", path, "");
+            NetClientFixture.CheckBody(response, size, decoded);
+            return "compared " + Convert.ToString(size) + " decoded/raw bytes";
+        } finally {
+            client.Close();
+        }
+    }
+
+    static async string TlsCase(string name, int port) {
+        TlsContext context = TlsContext.CreateClient();
+        NetClientFixture.Require(context != null, "TLS context unavailable");
+        bool badCa = name.Contains("wrong_ca");
+        string caPath = NetClientFixture.Setting(badCa ? "ZAN_INTEROP_WRONG_CA" : "ZAN_INTEROP_CA");
+        NetClientFixture.Require(context.AddTrustedCert(caPath), "could not load explicit CA");
+        if (name.EndsWith("12")) { context.DisableTls13(); }
+        TcpClient connection = await TcpClient.ConnectAsync("127.0.0.1", port, 5000);
+        NetClientFixture.Require(connection != null, "TCP connection failed before TLS");
+        TlsStream stream = null;
+        try {
+            string host = name.Contains("wrong_host") ? "wrong.invalid" : "localhost";
+            stream = await TlsStream.ConnectAsync(context, connection.Sock(), host, 10000);
+            bool negative = badCa || name.Contains("wrong_host") || name.Contains("missing_intermediate");
+            if (negative) {
+                string reason = TlsStream.LastError();
+                string expected = name.Contains("wrong_host") ? "主机名不匹配" : "无受信任签名锚";
+                NetClientFixture.Require(stream == null && reason.Contains(expected),
+                    "expected certificate rejection: " + reason);
+                return reason;
+            }
+            NetClientFixture.Require(stream != null, "TLS handshake failed: " + TlsStream.LastError());
+            byte[] payload = NetClientFixture.Payload(257);
+            int sent = await stream.SendBytesAsync(payload, 257);
+            NetClientFixture.Require(sent == 257, "TLS payload write incomplete");
+            byte[] received = new byte[257];
+            int total = 0;
+            while (total < 257) {
+                int count = await stream.RecvBytesAsync(received, total, 257 - total);
+                NetClientFixture.Require(count > 0, "TLS echo ended early");
+                total = total + count;
+            }
+            for (int i = 0; i < 257; i = i + 1) {
+                NetClientFixture.Require(received[i] == payload[i], "TLS binary echo mismatch");
+            }
+            return "root -> intermediate -> localhost verified; 257 binary bytes echoed";
+        } finally {
+            if (stream != null) { stream.Close(); }
+            connection.Close();
+            context.Free();
+        }
+    }
+
+    static int Main() {
+        string name = Environment.GetEnvironmentVariable("ZAN_INTEROP_CASE");
+        JsonValue result = JsonValue.NewObject();
+        result.PutStr("case", name);
+        int code = 0;
+        try {
+            Socket.Initialize();
+            int port = int.Parse(NetClientFixture.Setting("ZAN_INTEROP_PORT"));
+            string detail = "";
+            if (name.StartsWith("tls_")) { detail = await NetClientFixture.TlsCase(name, port); }
+            else { detail = await NetClientFixture.HttpCase(name, port); }
+            result.PutStr("status", "pass");
+            result.PutStr("detail", detail);
+        } catch (Exception e) {
+            // Process boundary: report the failure and return a nonzero exit status.
+            result.PutStr("status", "fail");
+            result.PutStr("detail", e.Message);
+            code = 1;
+        }
+        Console.WriteLine("ZAN_INTEROP_RESULT " + result.ToJson());
+        return code;
+    }
+}

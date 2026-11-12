@@ -4,9 +4,296 @@ namespace Zan;
 
 partial class Irgen {
 
-    // throw expr — store the exception object, pop the innermost handler and
-    // longjmp back into its try (setjmp returns nonzero -> catch path).
+    // Only synchronous returns put stack records on this chain. A record owns
+    // exactly the retained result, and its thunk consumes a typed payload slot.
+    void EmitSyncPendingRuntime() {
+        H("%zan.pending = type { i8*, i8*, void (i8*)* }");
+        H("@zpending_top = internal thread_local global i8* null");
+        H("@zpending_marks = internal thread_local global [64 x i8*] zeroinitializer");
+        H("define internal void @zpending_unwind(i8* %mark) {");
+        H("entry:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %top = load i8*, i8** @zpending_top");
+        H("  %done = icmp eq i8* %top, %mark");
+        H("  br i1 %done, label %end, label %pop");
+        H("pop:");
+        H("  %rec = bitcast i8* %top to %zan.pending*");
+        H("  %prevp = getelementptr %zan.pending, %zan.pending* %rec, i32 0, i32 0");
+        H("  %prev = load i8*, i8** %prevp");
+        H("  store i8* %prev, i8** @zpending_top");
+        H("  %payloadp = getelementptr %zan.pending, %zan.pending* %rec, i32 0, i32 1");
+        H("  %payload = load i8*, i8** %payloadp");
+        H("  store i8* null, i8** %payloadp");
+        H("  %dtp = getelementptr %zan.pending, %zan.pending* %rec, i32 0, i32 2");
+        H("  %dt = load void (i8*)*, void (i8*)** %dtp");
+        H("  call void %dt(i8* %payload)");
+        H("  br label %loop");
+        H("end:");
+        H("  ret void");
+        H("}");
+        H("define internal void @zpending_cancel(i8* %target) {");
+        H("entry:");
+        H("  br label %find");
+        H("find:");
+        H("  %link = phi i8** [ @zpending_top, %entry ], [ %prevp, %step ]");
+        H("  %top = load i8*, i8** %link");
+        H("  %rec = bitcast i8* %top to %zan.pending*");
+        H("  %prevp = getelementptr %zan.pending, %zan.pending* %rec, i32 0, i32 0");
+        H("  %found = icmp eq i8* %top, %target");
+        H("  br i1 %found, label %remove, label %step");
+        H("step:");
+        H("  br label %find");
+        H("remove:");
+        H("  %prev = load i8*, i8** %prevp");
+        H("  store i8* %prev, i8** %link");
+        H("  %payloadp = getelementptr %zan.pending, %zan.pending* %rec, i32 0, i32 1");
+        H("  %payload = load i8*, i8** %payloadp");
+        H("  store i8* null, i8** %payloadp");
+        H("  %dtp = getelementptr %zan.pending, %zan.pending* %rec, i32 0, i32 2");
+        H("  %dt = load void (i8*)*, void (i8*)** %dtp");
+        H("  call void %dt(i8* %payload)");
+        H("  ret void");
+        H("}");
+    }
+
+    void EmitPendingHandlerMark(string depth) {
+        string p = NT(); string v = NT();
+        L("  " + p + " = getelementptr [64 x i8*], [64 x i8*]* @zpending_marks, i64 0, i64 " + depth);
+        L("  " + v + " = load i8*, i8** @zpending_top");
+        L("  store i8* " + v + ", i8** " + p);
+        string ownerMark = NT(); string ownerSlot = NT();
+        L("  " + ownerMark + " = load i8*, i8** @zexc_owners");
+        L("  " + ownerSlot + " = getelementptr [64 x i8*], [64 x i8*]* @zexc_marks, i64 0, i64 " + depth);
+        L("  store i8* " + ownerMark + ", i8** " + ownerSlot);
+
+    }
+
+    // At an active finally boundary, every handler installed inside that
+    // finally has already been popped. Ancestor handlers predate the owner.
+    // Removing this record therefore cannot invalidate a live handler mark.
+    void CancelPendingBoundary(int boundary) {
+        int i = syncFlow.records.Count - 1;
+        while (i >= 0) {
+            if (syncFlow.boundaries[i] == boundary && syncFlow.records[i] != "") {
+                string raw = NT();
+                L("  " + raw + " = bitcast %zan.pending* " + syncFlow.records[i] + " to i8*");
+                L("  call void @zpending_cancel(i8* " + raw + ")");
+                syncFlow.records[i] = "";
+            }
+            i = i - 1;
+        }
+    }
+
+    bool FlowContains(Node scope, Node target) {
+        if (scope == null || target == null) { return false; }
+        if (scope == target) { return true; }
+        if (scope.kind == AK.Lambda()) { return false; }
+        int i = 0;
+        while (i < scope.kids.Count) {
+            if (FlowContains(scope.kids[i], target)) { return true; }
+            i = i + 1;
+        }
+        return FlowContains(scope.a, target) || FlowContains(scope.b, target)
+            || FlowContains(scope.c, target) || FlowContains(scope.d, target);
+    }
+
+    bool ScopeHasLabel(Node scope, string name) {
+        if (scope == null || scope.kind == AK.Lambda()) { return false; }
+        if (scope.kind == AK.LabelStmt() && scope.sval == name) { return true; }
+        int i = 0;
+        while (i < scope.kids.Count) {
+            if (ScopeHasLabel(scope.kids[i], name)) { return true; }
+            i = i + 1;
+        }
+        return ScopeHasLabel(scope.a, name) || ScopeHasLabel(scope.b, name)
+            || ScopeHasLabel(scope.c, name) || ScopeHasLabel(scope.d, name);
+    }
+
+    Node FindFlowLabel(string name) {
+        int i = 0;
+        while (i < syncFlow.labels.Count) {
+            if (syncFlow.labels[i].sval == name) { return syncFlow.labels[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    int TargetFinBase(Node target) {
+        int i = syncFlow.scopes.Count - 1;
+        while (i >= 0) {
+            if (FlowContains(syncFlow.scopes[i], target)) { return i + 1; }
+            i = i - 1;
+        }
+        return 0;
+    }
+
+    string ArmSyncPendingReturn(ExprVal src) {
+        if (finBodies.Count == 0 || IsConstOperand(src.op) || src.ty == null) { return ""; }
+        if (!ArcManaged(src.ty) && src.ty.ival < 1 && src.ty.sval != "object") { return ""; }
+        List<Node> types = new List<Node>(); types.Add(src.ty);
+        List<bool> cells = new List<bool>(); cells.Add(false);
+        string dt = OwnedPayloadDtor(types, cells, false, true);
+        string lt = MapType(src.ty); string payload = NTS();
+        EA(payload, lt);
+        L("  store " + lt + " " + src.op + ", " + lt + "* " + payload);
+        string rec = NTS(); EA(rec, "%zan.pending");
+        string prev = NT(); L("  " + prev + " = load i8*, i8** @zpending_top");
+        string pp = NT(); L("  " + pp + " = getelementptr %zan.pending, %zan.pending* " + rec + ", i32 0, i32 0");
+        L("  store i8* " + prev + ", i8** " + pp);
+        string raw = NT(); L("  " + raw + " = bitcast " + lt + "* " + payload + " to i8*");
+        string vp = NT(); L("  " + vp + " = getelementptr %zan.pending, %zan.pending* " + rec + ", i32 0, i32 1");
+        L("  store i8* " + raw + ", i8** " + vp);
+        string dp = NT(); L("  " + dp + " = getelementptr %zan.pending, %zan.pending* " + rec + ", i32 0, i32 2");
+        L("  store void (i8*)* " + dt + ", void (i8*)** " + dp);
+        string rp = NT(); L("  " + rp + " = bitcast %zan.pending* " + rec + " to i8*");
+        L("  store i8* " + rp + ", i8** @zpending_top");
+        return rec;
+    }
+
+    void EmitSyncReturnFins(string rec) {
+        string saved = syncPendingReturn;
+        syncPendingReturn = rec;
+        EmitExitFins(0);
+        if (!term) {
+            int i = catchExcOwner.Count - 1;
+            while (i >= 0) { DropExceptionOwner(catchExcOwner[i]); i = i - 1; }
+            i = pendingExcOwner.Count - 1;
+            while (i >= 0) {
+                L("  call void @zexc_pop(%zan.exception* " + pendingExcOwner[i] + ")");
+                i = i - 1;
+            }
+        }
+        syncPendingReturn = saved;
+    }
+
+    void CommitSyncPendingReturn(string rec) {
+        if (rec == "") { return; }
+        string pp = NT(); string prev = NT();
+        L("  " + pp + " = getelementptr %zan.pending, %zan.pending* " + rec + ", i32 0, i32 0");
+        L("  " + prev + " = load i8*, i8** " + pp);
+        L("  store i8* " + prev + ", i8** @zpending_top");
+        string vp = NT(); L("  " + vp + " = getelementptr %zan.pending, %zan.pending* " + rec + ", i32 0, i32 1");
+        L("  store i8* null, i8** " + vp);
+    }
+
+    int ThrowFinallyTarget() {
+        if (catchFinDepth.Count > 0) {
+            return catchFinDepth[catchFinDepth.Count - 1];
+        }
+        return 0;
+    }
+
+    int AsyncExceptionNesting(Node n) {
+        if (n == null || n.kind == AK.Lambda()) { return 0; }
+        int depth = 0;
+        int i = 0;
+        while (i < n.kids.Count) {
+            int child = AsyncExceptionNesting(n.kids[i]);
+            if (child > depth) { depth = child; }
+            i = i + 1;
+        }
+        int a = AsyncExceptionNesting(n.a); int b = AsyncExceptionNesting(n.b);
+        int c = AsyncExceptionNesting(n.c); int d = AsyncExceptionNesting(n.d);
+        if (a > depth) { depth = a; } if (b > depth) { depth = b; }
+        if (c > depth) { depth = c; } if (d > depth) { depth = d; }
+        if (n.kind == AK.TryStmt()) { depth = depth + 1; }
+        return depth;
+    }
+
+    void RestoreExceptionDispatch() {
+        string r = NT(); string v = NT(); string t = NT();
+        L("  " + r + " = load %zan.exception, %zan.exception* @zexc_dispatch");
+        L("  " + v + " = extractvalue %zan.exception " + r + ", 0");
+        L("  " + t + " = extractvalue %zan.exception " + r + ", 1");
+        L("  store i8* " + v + ", i8** @__exc_val");
+        L("  store i8* " + t + ", i8** @__exc_tid");
+    }
+
+    string LoadExceptionOwner(string slot) {
+        string raw = NT(); string owner = NT();
+        L("  " + raw + " = load i8*, i8** " + slot);
+        L("  " + owner + " = bitcast i8* " + raw + " to %zan.exception*");
+        return owner;
+    }
+
+    void DropExceptionOwner(string slot) {
+        string owner = LoadExceptionOwner(slot);
+        L("  call void @zexc_pop(%zan.exception* " + owner + ")");
+        L("  store i8* null, i8** " + slot);
+    }
+
+    // These are identity snapshots, not payload owners. Only active snapshots
+    // join spill/reload; their stack mirrors never carry values across resume.
+    void ArmAsyncExceptionPair(string value, string tid) {
+        asyncSlotReg.Add(value); asyncSlotTy.Add(MkType("string"));
+        asyncSlotIdx.Add(asyncExceptionBase + asyncExceptionDepth * 3);
+        asyncSlotReg.Add(tid); asyncSlotTy.Add(MkType("string"));
+        asyncSlotIdx.Add(asyncExceptionBase + asyncExceptionDepth * 3 + 1);
+        asyncExceptionDepth = asyncExceptionDepth + 1;
+    }
+
+    void DisarmAsyncExceptionPair(string value, string tid) {
+        int i = asyncSlotReg.Count - 1;
+        while (i >= 0) {
+            if (asyncSlotReg[i] == value || asyncSlotReg[i] == tid) {
+                asyncSlotReg.RemoveAt(i); asyncSlotTy.RemoveAt(i); asyncSlotIdx.RemoveAt(i);
+            }
+            i = i - 1;
+        }
+        asyncExceptionDepth = asyncExceptionDepth - 1;
+    }
+
+    void EmitPropagationFins(int from) {
+        if (!curAsync || finBodies.Count <= from) { EmitExitFins(from); return; }
+        string value = NT(); string tid = NT();
+        EA(value, "i8*"); EA(tid, "i8*");
+        string v = NT(); string t = NT();
+        L("  " + v + " = load i8*, i8** @__exc_val");
+        L("  " + t + " = load i8*, i8** @__exc_tid");
+        L("  store i8* " + v + ", i8** " + value);
+        L("  store i8* " + t + ", i8** " + tid);
+        string pendingSlot = NT(); EA(pendingSlot, "i8*");
+        string pending = NT(); string pendingRaw = NT();
+        L("  " + pending + " = call %zan.exception* @zexc_push()");
+        L("  " + pendingRaw + " = bitcast %zan.exception* " + pending + " to i8*");
+        L("  store i8* " + pendingRaw + ", i8** " + pendingSlot);
+        asyncSlotReg.Add(pendingSlot); asyncSlotTy.Add(MkType("string"));
+        asyncSlotIdx.Add(asyncExceptionBase + asyncExceptionDepth * 3 + 2);
+        ArmAsyncExceptionPair(value, tid);
+        EmitExitFins(from);
+        if (!term) {
+            string restoredValue = NT(); string restoredTid = NT();
+            L("  " + restoredValue + " = load i8*, i8** " + value);
+            L("  " + restoredTid + " = load i8*, i8** " + tid);
+            L("  store i8* " + restoredValue + ", i8** @__exc_val");
+            L("  store i8* " + restoredTid + ", i8** @__exc_tid");
+        }
+        if (!term) {
+            string pendingOwner = LoadExceptionOwner(pendingSlot);
+            L("  call void @zexc_take(%zan.exception* @zexc_dispatch, %zan.exception* " + pendingOwner + ")");
+            DropExceptionOwner(pendingSlot);
+            RestoreExceptionDispatch();
+        }
+        DisarmAsyncExceptionPair(value, tid);
+        int pi = asyncSlotReg.Count - 1;
+        while (pi >= 0) {
+            if (asyncSlotReg[pi] == pendingSlot) {
+                asyncSlotReg.RemoveAt(pi); asyncSlotTy.RemoveAt(pi); asyncSlotIdx.RemoveAt(pi);
+            }
+            pi = pi - 1;
+        }
+    }
+
+    void EmitUnmatchedRaise() {
+        if (curAsync) { EmitPropagationFins(ThrowFinallyTarget()); }
+        if (!term) { EmitRaise(); }
+    }
+
+    // Synchronous throws use the same landing as a throwing callee or guard.
+    // Keep the existing coroutine lowering until its cleanup can live in the frame.
     void GenThrow(Node s) {
+        int target = ThrowFinallyTarget();
         if (s.a == null) {
             // a bare `throw;`: re-raise the exception the enclosing catch
             // clause caught. The in-flight globals may have been overwritten
@@ -19,6 +306,10 @@ partial class Irgen {
                 string rt = NT();
                 L("  " + rt + " = load i8*, i8** " + catchExcTid[catchExcTid.Count - 1]);
                 L("  store i8* " + rt + ", i8** @__exc_tid");
+                if (catchExcOwner.Count > 0) {
+                    string owner = LoadExceptionOwner(catchExcOwner[catchExcOwner.Count - 1]);
+                    L("  call void @zexc_clone(%zan.exception* @zexc_dispatch, %zan.exception* " + owner + ")");
+                }
             }
             EmitRaise();
             return;
@@ -38,6 +329,27 @@ partial class Irgen {
             L("  store i8* null, i8** @__exc_tid");
         }
         L("  store i8* " + ev + ", i8** @__exc_val");
+        string kind = "0";
+        if (tc != null) { kind = "1"; }
+        else if (v.ty != null && v.ty.sval == "string") { kind = "2"; }
+        string owned = "0";
+        if ((kind == "1" || kind == "2") && v.ownerTemp != null && v.ownerTemp != "") {
+            owned = "1";
+            int ti = stmtTemps.Count - 1;
+            while (ti >= 0) {
+                if (stmtTemps[ti] == v.ownerTemp) {
+                    if (v.ownerTemp.Length > 1 && v.ownerTemp[1] == 122) {
+                        string ownerType = MapType(stmtTempTypes[ti]);
+                        L("  store " + ownerType + " null, " + ownerType + "* " + v.ownerTemp);
+                    }
+                    stmtTemps.RemoveAt(ti); stmtTempTypes.RemoveAt(ti);
+                }
+                ti = ti - 1;
+            }
+        }
+        string publishTid = NT();
+        L("  " + publishTid + " = load i8*, i8** @__exc_tid");
+        L("  call void @zexc_publish(i8* " + ev + ", i8* " + publishTid + ", i64 " + kind + ", i64 " + owned + ")");
         EmitRaise();
     }
 
@@ -67,6 +379,14 @@ partial class Irgen {
         L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp1);
         string buf = NT();
         L("  " + buf + " = load i8*, i8** " + slot);
+        string markp = NT(); string pendingMark = NT();
+        L("  " + markp + " = getelementptr [64 x i8*], [64 x i8*]* @zpending_marks, i64 0, i64 " + sp1);
+        L("  " + pendingMark + " = load i8*, i8** " + markp);
+        L("  call void @zpending_unwind(i8* " + pendingMark + ")");
+        string ownerMarkSlot = NT(); string ownerMark = NT();
+        L("  " + ownerMarkSlot + " = getelementptr [64 x i8*], [64 x i8*]* @zexc_marks, i64 0, i64 " + sp1);
+        L("  " + ownerMark + " = load i8*, i8** " + ownerMarkSlot);
+        L("  call void @zexc_unwind(i8* " + ownerMark + ")");
         L("  call void @longjmp(i8* " + buf + ", i32 1)");
         L("  unreachable");
         term = true;
@@ -94,15 +414,40 @@ partial class Irgen {
         if (finBodies.Count <= from) { return; }
         // the liveness flags are per-path: the pops below belong to this
         // path only, so the flags are restored afterwards
+        List<string> savedRecords = new List<string>();
+        int r = 0;
+        while (r < syncFlow.records.Count) { savedRecords.Add(syncFlow.records[r]); r = r + 1; }
+        List<int> savedAsyncHandlers = new List<int>();
+        if (curAsync) {
+            int h = 0;
+            while (h < asyncTryLbl.Count) { savedAsyncHandlers.Add(asyncTryLbl[h]); h = h + 1; }
+        }
         List<int> saved = new List<int>();
+        List<string> savedMon = new List<string>();
         int i = 0;
-        while (i < finBodies.Count) { saved.Add(finLive[i]); i = i + 1; }
+        while (i < finBodies.Count) {
+            saved.Add(finLive[i]);
+            savedMon.Add(finMonSlot[i]);
+            i = i + 1;
+        }
         i = finBodies.Count - 1;
         while (i >= from) {
             // the try's EH frame goes first: a throw from the finally body
             // must reach the handler of the NEXT outer try
-            if (finLive[i] == 1) { EmitExcPop(); finLive[i] = 0; }
-            if (finBodies[i] != null && !FinIsActive(i)) {
+            if (finLive[i] == 1) {
+                EmitExcPop(); finLive[i] = 0;
+                if (curAsync) {
+                    EmitAsyncHcAdd(-1);
+                    if (asyncTryLbl.Count > 0) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
+                }
+            }
+            if (FinIsActive(i)) { CancelPendingBoundary(i); }
+            if (finMonSlot[i] != null) {
+                string obj = NT();
+                L("  " + obj + " = load i8*, i8** " + finMonSlot[i]);
+                finMonSlot[i] = null;
+                L("  call void @zan_monitor_exit(i8* " + obj + ")");
+            } else if (finBodies[i] != null && !FinIsActive(i)) {
                 finActive.Add(i);
                 List<string> oldFinLabels = finLocalLabels;
                 int oldFinScope = finLabelScope;
@@ -113,17 +458,71 @@ partial class Irgen {
                     finLabelScope = finLabelSeq;
                     finLocalLabels = myLabels;
                 }
+                // Completed inner scopes are no longer lexical parents of
+                // this clone. A nested return must not replay their finallys.
+                // Active indices must follow the same visibility: a new try
+                // may reuse an index from the hidden tail.
+                List<int> savedActive = finActive;
+                finActive = new List<int>();
+                int active = 0;
+                while (active < savedActive.Count) {
+                    if (savedActive[active] <= i) { finActive.Add(savedActive[active]); }
+                    active = active + 1;
+                }
+                List<Node> tailBodies = new List<Node>();
+                List<Node> tailScopes = new List<Node>();
+                List<int> tailLive = new List<int>();
+                List<string> tailMon = new List<string>();
+                int tail = i + 1;
+                while (tail < finBodies.Count) {
+                    tailBodies.Add(finBodies[tail]); tailScopes.Add(syncFlow.scopes[tail]);
+                    tailLive.Add(finLive[tail]); tailMon.Add(finMonSlot[tail]);
+                    tail = tail + 1;
+                }
+                while (finBodies.Count > i + 1) {
+                    int last = finBodies.Count - 1;
+                    finBodies.RemoveAt(last); syncFlow.scopes.RemoveAt(last);
+                    finLive.RemoveAt(last); finMonSlot.RemoveAt(last);
+                }
+                syncFlow.cloneBodies.Add(finBodies[i]);
+                syncFlow.cloneIds.Add(finLabelScope);
+                syncFlow.records.Add(syncPendingReturn);
+                syncFlow.boundaries.Add(i);
+                // The ambient owner belongs to this return-origin boundary.
+                // Nested cleanup transfers may clone finallys of their own,
+                // but must not register the ambient owner a second time.
+                string traversalPending = syncPendingReturn;
+                syncPendingReturn = "";
                 GenStmt(finBodies[i]);
+                syncPendingReturn = traversalPending;
+                syncFlow.records.RemoveAt(syncFlow.records.Count - 1);
+                syncFlow.boundaries.RemoveAt(syncFlow.boundaries.Count - 1);
+                syncFlow.cloneBodies.RemoveAt(syncFlow.cloneBodies.Count - 1);
+                syncFlow.cloneIds.RemoveAt(syncFlow.cloneIds.Count - 1);
+                tail = 0;
+                while (tail < tailBodies.Count) {
+                    finBodies.Add(tailBodies[tail]); syncFlow.scopes.Add(tailScopes[tail]);
+                    finLive.Add(tailLive[tail]); finMonSlot.Add(tailMon[tail]);
+                    tail = tail + 1;
+                }
                 finLocalLabels = oldFinLabels;
                 finLabelScope = oldFinScope;
+                finActive = savedActive;
                 finActive.RemoveAt(finActive.Count - 1);
                 // a finally that returns ends the whole exit path
                 if (term) { break; }
             }
             i = i - 1;
         }
+        if (curAsync) { asyncTryLbl = savedAsyncHandlers; }
+        r = 0;
+        while (r < savedRecords.Count) { syncFlow.records[r] = savedRecords[r]; r = r + 1; }
         i = 0;
-        while (i < finBodies.Count) { finLive[i] = saved[i]; i = i + 1; }
+        while (i < finBodies.Count) {
+            finLive[i] = saved[i];
+            finMonSlot[i] = savedMon[i];
+            i = i + 1;
+        }
     }
 
     bool FinIsActive(int i) {
@@ -132,11 +531,9 @@ partial class Irgen {
         return false;
     }
 
-    // try { } catch (T e) { } finally { }  — setjmp/longjmp based
-    void GenTry(Node s) {
-        // the jmp_buf lives in a global array slot (not a stack alloca): in a
-        // coroutine the resume invocation that armed the handler may have
-        // returned by the time a throw longjmps here, so its stack is dead.
+    // Both matching and cleanup-only handlers capture the pending-return
+    // watermark. Coroutine handlers also use this setup for their first arm.
+    string EmitExcPush() {
         string sp = NT();
         L("  " + sp + " = load i64, i64* @__exc_sp");
         string bufe = NT();
@@ -146,34 +543,94 @@ partial class Irgen {
         string slot = NT();
         L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
         L("  store i8* " + bufp + ", i8** " + slot);
+        EmitPendingHandlerMark(sp);
+        if (curAsync) {
+            string ownerMark = NT();
+            L("  " + ownerMark + " = load i8*, i8** @zexc_owners");
+            string bits = ToI64(ownerMark, "i8*");
+            L("  store i64 " + bits + ", i64* " + FrameGep("%ff", asyncOwnerMarkBase + asyncTryLbl.Count + 1));
+        }
         string sp1 = NT();
         L("  " + sp1 + " = add i64 " + sp + ", 1");
         L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        return bufp;
+    }
+
+    void EmitExcBranch(string buf, int body, int landing) {
+        string r = NT();
+        L("  " + r + " = call i32 @_setjmp(i8* " + buf + ", i8* null)");
+        string c = NT();
+        L("  " + c + " = icmp ne i32 " + r + ", 0");
+        L("  br i1 " + c + ", label %L" + landing + ", label %L" + body);
+    }
+
+    bool ReleaseAsyncCatchLocal(string reg) {
+        int i = 0;
+        while (i < asyncCatchBindings.Count) {
+            Node clause = asyncCatchBindings[i];
+            if (asyncLocalRegs[clause.ival] == reg) { ClearAsyncCatchBinding(clause); return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void ClearAsyncCatchBinding(Node clause) {
+        if (clause.sval == "" || clause.type == null) { return; }
+        string reg = asyncLocalRegs[clause.ival];
+        string lt = MapType(clause.type);
+        if (asyncLocalBox[clause.ival]) { lt = "i8*"; }
+        if (IsDirectAsyncLocal(reg)) { RetireLocalSlot(reg, lt); }
+        string value = NT();
+        L("  " + value + " = load " + lt + ", " + lt + "* " + reg);
+        L("  store " + lt + " null, " + lt + "* " + reg);
+        int i = 0;
+        while (i < asyncSlotReg.Count) {
+            if (asyncSlotReg[i] == reg) {
+                string slot = FrameGep("%ff", asyncSlotIdx[i]);
+                L("  store i64 0, i64* " + slot);
+            }
+            i = i + 1;
+        }
+        if (asyncLocalBox[clause.ival]) { EmitCellRelease(value); }
+        else { EmitArcRelease(value, clause.type); }
+    }
+
+    void EmitSyncCleanupFinally(int mark) {
+        string pending = NT();
+        L("  " + pending + " = call %zan.exception* @zexc_push()");
+        pendingExcOwner.Add(pending);
+        EmitExitFins(mark);
+        pendingExcOwner.RemoveAt(pendingExcOwner.Count - 1);
+        if (term) { return; }
+        L("  call void @zexc_take(%zan.exception* @zexc_dispatch, %zan.exception* " + pending + ")");
+        L("  call void @zexc_pop(%zan.exception* " + pending + ")");
+        RestoreExceptionDispatch();
+        EmitRaise();
+    }
+
+    // try { } catch (T e) { } finally { } — setjmp/longjmp based
+    void GenTry(Node s) {
+        string buf = EmitExcPush();
         if (curAsync) {
-            // arm: unwind stops at a frame with hcount > 0 (the handler
-            // resumes inside it); keep the heap frame authoritative across
-            // this try -- a throw crossing a suspension longjmps into a stale
-            // invocation whose stack allocas are garbage.
             EmitAsyncHcAdd(1);
             EmitAsyncSaveSlots();
         }
-        // setjmp
-        string r = NT();
-        L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* null)");
-        string c = NT();
-        L("  " + c + " = icmp ne i32 " + r + ", 0");
         int ltry = NL(); int lcatch = NL(); int lend = NL();
-        L("  br i1 " + c + ", label %L" + lcatch + ", label %L" + ltry);
+        EmitExcBranch(buf, ltry, lcatch);
         // the try joins the finally stack: a `return` (or a break/continue)
         // that leaves the try region must run its finally body, exactly like
         // the C host. The entry lives until the whole try is emitted, so the
         // catch clauses see it too.
         int mark = finBodies.Count;
+        syncFlow.scopes.Add(s);
         finBodies.Add(s.c);
         finLive.Add(1);
+        finMonSlot.Add(null);
         Label(ltry);
         if (curAsync) { asyncTryLbl.Add(lcatch); }
+        if (curAsync && s.b != null) { catchFinDepth.Add(mark + 1); }
         GenStmt(s.a);
+        if (curAsync && s.b != null) { catchFinDepth.RemoveAt(catchFinDepth.Count - 1); }
         if (curAsync) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
         if (!term) {
             EmitExcPop();
@@ -262,15 +719,38 @@ partial class Irgen {
                     string exv = NT();
                     L("  " + exv + " = load i8*, i8** @__exc_val");
                     string cty = MapType(cc.type);
-                    string reg = AddLocal(cc.sval, cc.type);
-                    EA(reg, cty);
+                    string reg;
+                    if (curAsync) {
+                        reg = asyncLocalRegs[cc.ival];
+                        locName.Add(cc.sval); locType.Add(cc.type); locReg.Add(reg);
+                        locBox.Add(asyncLocalBox[cc.ival]); locIter.Add(false); locCell.Add("");
+                        locRef.Add(false); locOpaque.Add(false);
+                    } else {
+                        reg = AddLocal(cc.sval, cc.type);
+                        EA(reg, cty);
+                    }
                     string cv = exv;
+                    if (cc.type.sval == "string") {
+                        cv = NT(); L("  " + cv + " = call i8* @zexc_string_binding(i8* " + exv + ")");
+                    }
                     if (cty != "i8*") {
                         string t = NT();
                         L("  " + t + " = bitcast i8* " + exv + " to " + cty);
                         cv = t;
                     }
-                    L("  store " + cty + " " + cv + ", " + cty + "* " + reg);
+                    // A named catch binding owns its reference independently of
+                    // the dispatch payload, just like an initialized local.
+                    EmitArcRetain(cv, cc.type);
+                    if (curAsync && asyncLocalBox[cc.ival]) {
+                        string cell = OwnedCell(cc.type);
+                        string payload = NT();
+                        L("  " + payload + " = bitcast i8* " + cell + " to " + cty + "*");
+                        L("  store " + cty + " " + cv + ", " + cty + "* " + payload);
+                        L("  store i8* " + cell + ", i8** " + reg);
+                    } else {
+                        L("  store " + cty + " " + cv + ", " + cty + "* " + reg);
+                    }
+                    if (curAsync) { ArmAsyncLocal(reg, cc.type, asyncLocalBox[cc.ival]); }
                 }
                 // the exception this clause caught: a bare `throw;` in the body
                 // re-raises it (the in-flight globals may have been
@@ -285,80 +765,119 @@ partial class Irgen {
                 string tdNow = NT();
                 L("  " + tdNow + " = load i8*, i8** @__exc_tid");
                 L("  store i8* " + tdNow + ", i8** " + tdSlot);
+                string ownerSlot = NT(); EA(ownerSlot, "i8*");
+                string owner = NT(); string ownerRaw = NT();
+                L("  " + owner + " = call %zan.exception* @zexc_push()");
+                L("  " + ownerRaw + " = bitcast %zan.exception* " + owner + " to i8*");
+                L("  store i8* " + ownerRaw + ", i8** " + ownerSlot);
+                int cleanup = 0;
+                if (true) {
+                    cleanup = NL();
+                    int body = NL();
+                    string cleanupBuf = EmitExcPush();
+                    finLive[mark] = 1;
+                    if (curAsync) { EmitAsyncHcAdd(1); asyncTryLbl.Add(cleanup); }
+                    EmitExcBranch(cleanupBuf, body, cleanup);
+                    Label(body);
+                }
                 catchExcVal.Add(exSlot);
                 catchExcTid.Add(tdSlot);
+                catchExcOwner.Add(ownerSlot);
+                if (curAsync) {
+                    asyncSlotReg.Add(ownerSlot); asyncSlotTy.Add(MkType("string"));
+                    asyncSlotIdx.Add(asyncExceptionBase + asyncExceptionDepth * 3 + 2);
+                    ArmAsyncExceptionPair(exSlot, tdSlot);
+                    if (cc.sval != "" && cc.type != null) { asyncCatchBindings.Add(cc); }
+                }
+                if (!curAsync && cc.sval != "" && cc.type != null) {
+                    syncFlow.catchScopes.Add(cc.a); syncFlow.catchLocals.Add(catchScope);
+                }
                 GenStmt(cc.a);
+                if (curAsync && cleanup != 0) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
+                if (curAsync) {
+                    DisarmAsyncExceptionPair(exSlot, tdSlot);
+                    int ownerIndex = asyncSlotReg.Count - 1;
+                    while (ownerIndex >= 0) {
+                        if (asyncSlotReg[ownerIndex] == ownerSlot) {
+                            asyncSlotReg.RemoveAt(ownerIndex); asyncSlotTy.RemoveAt(ownerIndex); asyncSlotIdx.RemoveAt(ownerIndex);
+                        }
+                        ownerIndex = ownerIndex - 1;
+                    }
+                }
                 catchExcVal.RemoveAt(catchExcVal.Count - 1);
                 catchExcTid.RemoveAt(catchExcTid.Count - 1);
+                catchExcOwner.RemoveAt(catchExcOwner.Count - 1);
                 if (!term) {
-                    ReleaseLocalsFrom(catchScope);
+                    DropExceptionOwner(ownerSlot);
+                    if (curAsync) { ClearAsyncCatchBinding(cc); }
+                    else { ReleaseLocalsFrom(catchScope); }
+                    if (cleanup != 0) {
+                        EmitExcPop();
+                        if (curAsync) { EmitAsyncHcAdd(-1); }
+                    }
                     L("  br label %L" + lfin);
+                }
+                if (cleanup != 0) {
+                    finLive[mark] = 0;
+                    Label(cleanup);
+                    DropExceptionOwner(ownerSlot);
+                    if (curAsync) {
+                        EmitAsyncHcAdd(-1);
+                        ClearAsyncCatchBinding(cc);
+                    } else { ReleaseLocalsFrom(catchScope); }
+                    L("  br label %L" + lrethrow);
                 }
                 term = false;
                 TrimLocals(catchScope);
+                if (!curAsync && cc.sval != "" && cc.type != null) {
+                    syncFlow.catchScopes.RemoveAt(syncFlow.catchScopes.Count - 1);
+                    syncFlow.catchLocals.RemoveAt(syncFlow.catchLocals.Count - 1);
+                }
+                if (curAsync && cc.sval != "" && cc.type != null) {
+                    asyncCatchBindings.RemoveAt(asyncCatchBindings.Count - 1);
+                }
                 first = false;
                 if (sawAll) { cc = null; } else { cc = cc.b; }
                 if (cc != null && lmiss != lrethrow) { Label(lmiss); }
             }
-            // no clause matched: re-raise to the next outer handler (this
-            // try's frame was already popped by the throw); note the finally
-            // body is bypassed on this path (mirrors the C host).
-            if (!sawAll) {
+            // A missed match or an exception escaping a selected catch reaches
+            // this landing after its handler has been popped. Siblings never
+            // see exceptions from one another's bodies.
+            if (!sawAll || s.c != null || curAsync || s.b != null) {
                 Label(lrethrow);
-                EmitRaise();
+                if (curAsync) {
+                    if (s.c != null) { EmitPropagationFins(mark); }
+                    if (!term) { EmitRaise(); }
+                } else if (s.c != null) { EmitSyncCleanupFinally(mark); }
+                else { EmitUnmatchedRaise(); }
                 term = false;
             }
         } else {
             L("  br label %L" + lfin);
         }
         Label(lfin);
-        if (s.c != null) {
-            // the finally body may run try/catch of its own; keep the
-            // in-flight exception intact across it
-            string sv2 = NT(); string st2 = NT();
-            EA(sv2, "i8*");
-            EA(st2, "i8*");
-            string ev0 = NT(); L("  " + ev0 + " = load i8*, i8** @__exc_val");
-            L("  store i8* " + ev0 + ", i8** " + sv2);
-            string td0 = NT(); L("  " + td0 + " = load i8*, i8** @__exc_tid");
-            L("  store i8* " + td0 + ", i8** " + st2);
-            finActive.Add(mark);
-            List<string> oldFinLabels = finLocalLabels;
-            int oldFinScope = finLabelScope;
-            List<string> myLabels = new List<string>();
-            CollectLabels(s.c, myLabels);
-            if (myLabels.Count > 0) {
-                finLabelSeq = finLabelSeq + 1;
-                finLabelScope = finLabelSeq;
-                finLocalLabels = myLabels;
-            }
-            GenStmt(s.c);
-            finLocalLabels = oldFinLabels;
-            finLabelScope = oldFinScope;
-            finActive.RemoveAt(finActive.Count - 1);
-            if (!term) {
-                string ev1 = NT(); L("  " + ev1 + " = load i8*, i8** " + sv2);
-                L("  store i8* " + ev1 + ", i8** @__exc_val");
-                string td1 = NT(); L("  " + td1 + " = load i8*, i8** " + st2);
-                L("  store i8* " + td1 + ", i8** @__exc_tid");
-            }
-        }
-        if (!term) {
+        if (!curAsync) {
             if (s.b == null) {
-                // finally-only try: the exception keeps unwinding (the C
-                // host runs the finally at the throw site and propagates)
-                EmitRaise();
-                term = false;
+                EmitSyncCleanupFinally(mark);
             } else {
-                L("  br label %L" + lend);
+                EmitExitFins(mark);
+                if (!term) { L("  br label %L" + lend); }
+            }
+        } else {
+            EmitPropagationFins(mark);
+            if (!term) {
+                if (s.b == null) { EmitRaise(); term = false; }
+                else { L("  br label %L" + lend); }
             }
         }
         Label(lend);
         term = false;
         // the try leaves the finally stack
         if (finBodies.Count > mark) {
+            syncFlow.scopes.RemoveAt(syncFlow.scopes.Count - 1);
             finBodies.RemoveAt(finBodies.Count - 1);
             finLive.RemoveAt(finLive.Count - 1);
+            finMonSlot.RemoveAt(finMonSlot.Count - 1);
         }
     }
 }

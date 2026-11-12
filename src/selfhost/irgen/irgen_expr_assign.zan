@@ -21,7 +21,7 @@ partial class Irgen {
         string tname = "__zca_" + locName.Count;
         string reg = AddLocal(tname, v.ty);
         string lt = MapType(v.ty);
-        L("  " + reg + " = alloca " + lt);
+        EA(reg, lt);
         string sv = Coerce(v, lt);
         L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
         if (ArcManaged(v.ty)) { EmitArcRetain(sv, v.ty); }
@@ -94,6 +94,28 @@ partial class Irgen {
             ExprVal cc = StrConcat(ToCStr(cur), ToCStr(r));
             StoreTo(e.a, cc);
             return cc;
+        }
+        if (DecimalLiftNeeded(cur.ty, r.ty)
+            && (e.op == TK.PlusEq() || e.op == TK.MinusEq() || e.op == TK.StarEq()
+                || e.op == TK.SlashEq() || e.op == TK.PercentEq())) {
+            int dop = TK.Plus();
+            if (e.op == TK.MinusEq()) { dop = TK.Minus(); }
+            if (e.op == TK.StarEq()) { dop = TK.Star(); }
+            if (e.op == TK.SlashEq()) { dop = TK.Slash(); }
+            if (e.op == TK.PercentEq()) { dop = TK.Percent(); }
+            ExprVal result = DecimalLifted(dop, cur, r, e);
+            StoreTo(e.a, result);
+            return result;
+        }
+        if (IsDecimal(cur.ty) || IsDecimal(r.ty)) {
+            int dop = TK.Plus();
+            if (e.op == TK.MinusEq()) { dop = TK.Minus(); }
+            if (e.op == TK.StarEq()) { dop = TK.Star(); }
+            if (e.op == TK.SlashEq()) { dop = TK.Slash(); }
+            if (e.op == TK.PercentEq()) { dop = TK.Percent(); }
+            ExprVal result = DecimalBinary(dop, cur, r, e);
+            StoreTo(e.a, result);
+            return result;
         }
         if (IsDbl(cur.ty) || IsDbl(r.ty)) {
             string da = AsDouble(cur);
@@ -181,7 +203,14 @@ partial class Irgen {
             if (li >= 0) {
                 Node lty = locType[li];
                 if (IsNullableValue(lty)) {
-                    L("  store i8* " + BoxFor(v, lty) + ", i8** " + locReg[li]);
+                    string place = locReg[li];
+                    if (curAsync && locBox[li]) {
+                        string cell = NT();
+                        L("  " + cell + " = load i8*, i8** " + place);
+                        place = NT();
+                        L("  " + place + " = bitcast i8* " + cell + " to i8**");
+                    }
+                    StoreNullable(place, v, lty, true);
                     return;
                 }
                 v = ApplyUserConv(lty, v, false);
@@ -197,7 +226,7 @@ partial class Irgen {
                     string p = NT();
                     L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
                     string sv = Coerce(v, lt);
-                    if (ArcManaged(lty)) {
+                    if (ArcManaged(lty) || (lty != null && lty.ival >= 1)) {
                         string old = NT();
                         L("  " + old + " = load " + lt + ", " + lt + "* " + p);
                         L("  store " + lt + " " + sv + ", " + lt + "* " + p);
@@ -208,7 +237,7 @@ partial class Irgen {
                     }
                     return;
                 }
-                if (ArcManaged(lty)) {
+                if (ArcManaged(lty) || (lty != null && lty.ival >= 1)) {
                     string old = NT();
                     L("  " + old + " = load " + lt + ", " + lt + "* " + locReg[li]);
                     string sv = Coerce(v, lt);
@@ -325,6 +354,8 @@ partial class Irgen {
                         L("  " + dv + " = load " + ity + ", " + ity + "* " + v.op);
                         sv = dv;
                     }
+                } else if (IsDecimal(el)) {
+                    sv = ToDecimal(v).op;
                 } else if (ity == "double" || ity == "float") {
                     if (v.ty == null || !IsDbl(v.ty)) {
                         string t = NT();
@@ -452,6 +483,15 @@ partial class Irgen {
             string scrb = NT();
             L("  " + scrb + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
             string p = NT();
+            if (IsDecimal(elemTy)) {
+                string dp = DecimalArrayPlace(obj.op, sflat);
+                string scratchp = NT();
+                L("  " + scratchp + " = bitcast i8* " + scrb + " to " + DecimalLL() + "*");
+                string selected = NT();
+                L("  " + selected + " = select i1 " + oobs + ", " + DecimalLL() + "* " + scratchp + ", " + DecimalLL() + "* " + dp);
+                L("  store " + DecimalLL() + " " + ToDecimal(v).op + ", " + DecimalLL() + "* " + selected);
+                return;
+            }
             if (esz == 1) {
                 // a byte array: one byte per element
                 string ab = NT();
@@ -476,8 +516,27 @@ partial class Irgen {
             }
             // a struct element is a value: the array holds its own copy
             if (IsStructTy(v.ty)) {
-                ExprVal c = CopyStructValue(v);
-                L("  store i64 " + ToI64(c.op, MapType(c.ty)) + ", i64* " + p64s);
+                ExprVal c = StructCopyTemp(v, elemTy);
+                L("  call void @zarr_store(i64* " + p + ", i64 " + ToI64(c.op, MapType(c.ty))
+                    + ", i64 " + ArrayElementKind(elemTy) + ", i64 " + ArrRankOf(elemTy) + ", i1 " + oobs + ")");
+                return;
+            }
+            if (ArrayElementKind(elemTy) != 0) {
+                string slot = ArrayElementSlot(v, elemTy);
+                if (ArrayReferenceElement(elemTy)) {
+                    string compatible = NT();
+                    L("  " + compatible + " = call i1 @zarr_store_compatible(i64* " + obj.op + ", i64 " + slot + ")");
+                    string mismatch = NT(); string report = NT(); string goodIndex = NT();
+                    L("  " + mismatch + " = xor i1 " + compatible + ", true");
+                    L("  " + goodIndex + " = xor i1 " + oobs + ", true");
+                    L("  " + report + " = and i1 " + mismatch + ", " + goodIndex);
+                    GuardFail(report, "array element type mismatch", lhs);
+                    string bad = NT(); L("  " + bad + " = or i1 " + oobs + ", " + mismatch);
+                    L("  call void @zarr_store_dynamic(i64* " + obj.op + ", i64* " + p + ", i64 " + slot + ", i1 " + bad + ")");
+                } else {
+                    L("  call void @zarr_store(i64* " + p + ", i64 " + slot
+                        + ", i64 " + ArrayElementKind(elemTy) + ", i64 " + ArrRankOf(elemTy) + ", i1 " + oobs + ")");
+                }
                 return;
             }
             // a NULLABLE element is a pointer slot: the value is boxed
@@ -489,7 +548,6 @@ partial class Irgen {
                 L("  store i64 " + bi + ", i64* " + p64s);
                 return;
             }
-            if (ArcManaged(v.ty)) { EmitArcRetain(v.op, v.ty); }
             // a float element carries single precision: the host stores an f32
             // A floating element carries its own precision: the host stores an f32
             // for `float` and converts an integer into the slot -- the array path
@@ -685,8 +743,7 @@ partial class Irgen {
         // a struct field is a value: the field gets its own copy
         if (NeedsStructCopy(fty, v)) { v = StructCopyTemp(v, fty); }
         if (IsNullableValue(fty)) {
-            string sv = BoxFor(v, fty);
-            L("  store i8* " + sv + ", i8** " + p);
+            StoreNullable(p, v, fty, true);
             return;
         }
         string ft = cls != null && cls.kind == AK.StructDecl() ? MapFieldType(fty) : MapType(fty);
@@ -703,7 +760,7 @@ partial class Irgen {
             EmitWeakStore(slotp, v64);
             return;
         }
-        if (ArcManaged(fty) && !WeakTy(fty)) {
+        if ((ArcManaged(fty) || (fty != null && fty.ival >= 1)) && !WeakTy(fty)) {
             string old = NT();
             L("  " + old + " = load " + ft + ", " + ft + "* " + p);
             string sv = Coerce(src, ft);
@@ -719,6 +776,8 @@ partial class Irgen {
 
     // convert a value to an i64 list slot (pointers via ptrtoint)
     string ToSlot(ExprVal v, Node elemTy) {
+        v = EraseDelegateReference(v, elemTy);
+        if (IsDecimal(elemTy)) { return DecimalBoxSlot(v); }
         if (IsNullableValue(elemTy)) {
             string bx = BoxFor(v, elemTy);
             if (bx == "null" || bx == "0") { return "0"; }
@@ -763,6 +822,7 @@ partial class Irgen {
     }
 
     ExprVal FromSlot(string slot, Node elemTy) {
+        if (IsDecimal(elemTy)) { return DecimalUnboxSlot(slot); }
         string lt = MapType(elemTy);
         if (lt == "i64") { return new ExprVal(slot, elemTy); }
         string t = NT();

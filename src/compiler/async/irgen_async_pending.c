@@ -238,13 +238,31 @@ static void emit_async_orphan_result_release(zan_irgen_t *g) {
                                          idx, "orphan.rval.p");
     LLVMValueRef v = LLVMBuildLoad2(g->builder, lt, p, "orphan.rval");
     LLVMBuildStore(g->builder, LLVMConstNull(lt), p);
+    /* RVAL is also scratch storage while a return is pending. Cancellation
+     * discards that pending owner and completes with RESULT=0; the stale
+     * RVAL bits must not be released again by the self-reaper path. RESULT
+     * is authoritative about whether completion transferred a value. */
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef result = LLVMBuildLoad2(g->builder, i64,
+        get_async_result_ptr(g), "orphan.result");
+    LLVMValueRef fn = g->current_fn;
+    LLVMBasicBlockRef release_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                                                               "orphan.release");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                                                            "orphan.done");
+    LLVMBuildCondBr(g->builder, zan_icmp(g->builder, LLVMIntNE, result,
+        LLVMConstInt(i64, 0, 0), "orphan.has.result"), release_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, release_bb);
     if (lk == LLVMPointerTypeKind) {
+        v = LLVMBuildIntToPtr(g->builder, result, lt, "orphan.result.value");
         if (is_rc_managed_type(rt) || rt->kind == TYPE_OBJECT) {
             emit_rc_release_for_type(g, rt, v);
         }
     } else if (type_contains_collection_rc(g, rt, 0)) {
         emit_collection_value_release(g, rt, v, 0);
     }
+    LLVMBuildBr(g->builder, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
 }
 
 /* 发射共享完成尾声：存入结果、标记完成、释放持有者、唤醒等待者并 ret void */

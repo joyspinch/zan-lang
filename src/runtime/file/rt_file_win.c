@@ -54,6 +54,29 @@ int zan_file_rename(const char *source, const char *dest) {
     return ok;
 }
 
+int zan_file_flush_to_disk(const char *path) {
+    if (!path || !path[0]) return -1;
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    if (!wide_path) return -1;
+    HANDLE h = CreateFileW(wide_path, GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    free(wide_path);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    BY_HANDLE_FILE_INFORMATION info;
+    int ok = GetFileType(h) == FILE_TYPE_DISK && GetFileInformationByHandle(h, &info) &&
+        !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        FlushFileBuffers(h);
+    int closed = CloseHandle(h);
+    return ok && closed ? 0 : -1;
+}
+
+int zan_file_flush_directory_to_disk(const char *path) {
+    (void)path;
+    return -2;
+}
+
 /* 文件元数据错误码口径规范（B-ID106 收敛）：
  * 1. zan_file_time: 成功返回 Unix 秒时间戳；路径不存在或读取失败返回 0
  * 2. zan_file_length: 成功返回文件字节数；路径不存在或读取失败返回 -1。

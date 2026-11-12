@@ -100,7 +100,9 @@ static int irgen_goto_count_owned_locals(local_scope_t *locals) {
     int owned = 0;
     for (int i = 0; i < locals->count; i++) {
         local_var_t *v = &locals->vars[i];
-        if (v->arc_owned || v->struct_rc || v->box_cell || v->obj_rc_flag)
+        /* Unnamed pending payloads have compiler-managed exit cleanup. */
+        if (v->name.len &&
+            (v->arc_owned || v->struct_rc || v->box_cell || v->obj_rc_flag))
             owned++;
     }
     return owned;
@@ -310,12 +312,16 @@ static void emit_pending_scope_exit(zan_irgen_t *g,
 void emit_finally_body(zan_irgen_t *g, local_scope_t *locals,
                               const zan_irgen_finally_entry_t *entry) {
     zan_irgen_pending_scope_t *saved = g->pending.scope;
-    zan_irgen_pending_scope_t *scope = NULL;
+    zan_irgen_pending_scope_t *scope = zan_arena_alloc(g->arena, sizeof(*scope));
     if (g->current_async_frame) {
-        scope = zan_arena_alloc(g->arena, sizeof(*scope));
         *scope = *entry->pending_scope;
-        scope->body = entry->body;
+    } else {
+        memset(scope, 0, sizeof(*scope));
+        scope->parent = saved;
     }
+    /* Host finally bodies are cloned at each exit too: their local labels
+     * need separate identities, while outward jumps retain the parent scope. */
+    scope->body = entry->body;
     g->pending.scope = scope;
     emit_stmt(g, entry->body, locals);
     g->pending.scope = saved;
@@ -464,24 +470,40 @@ static void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals, int bas
     if (base < 0) base = 0;
     int saved = g->finally_count;
     int saved_armed = g->eh_armed_count;
+    int saved_lpad_depth = g->lpad_depth;
     int saved_throw_base = g->throw_locals_base;
     int saved_throw_cbase = g->throw_catch_base;
     void *armed = finally_shared_copy(g, g->eh_armed,
         sizeof(g->eh_armed[0]) * (size_t)saved_armed);
     for (int i = saved - 1; i >= base; i--) {
-        if (g->current_async_frame) {
-            zan_irgen_finally_entry_t *entry = &g->finallys[i];
-            emit_eh_disarm_from(g, entry->outer_armed_depth);
-            g->eh_armed_count = entry->outer_armed_depth;
-            g->throw_locals_base = entry->outer_throw_locals_base;
-            g->throw_catch_base = entry->outer_throw_catch_base;
-            emit_pending_scope_exit(g, entry->pending_parent, preserve_return);
-        }
+        zan_irgen_finally_entry_t *entry = &g->finallys[i];
+        emit_eh_disarm_from(g, entry->outer_armed_depth);
+        g->eh_armed_count = entry->outer_armed_depth;
+        g->throw_locals_base = entry->outer_throw_locals_base;
+        g->throw_catch_base = entry->outer_throw_catch_base;
+        emit_pending_scope_exit(g, entry->pending_parent, preserve_return);
         if (g->finallys[i].monitor_obj) {
             emit_monitor_exit(g, g->finallys[i].monitor_obj);
             continue;
         }
         if (!g->finallys[i].body) continue;
+        /* A return has left this try before entering its finally. Invokes in
+         * the finally must target an outer handler, never this try's lpad.
+         * Nested try emission may reuse the hidden stack entries. */
+        int outer_lpad = g->lpad_depth;
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        for (int d = g->lpad_depth - 1; d >= 0; d--) {
+            if (g->lpad_stack[d].fn != fn) break;
+            if (g->lpad_stack[d].fin_idx == i) {
+                outer_lpad = d;
+                break;
+            }
+        }
+        int hidden_lp_count = saved_lpad_depth - outer_lpad;
+        zan_lpad_entry_t *hidden_lp = finally_shared_copy(g,
+            &g->lpad_stack[outer_lpad],
+            sizeof(*hidden_lp) * (size_t)hidden_lp_count);
+        g->lpad_depth = outer_lpad;
         int saved_locals = locals->count;
         int hidden_count = saved - i - 1;
         zan_irgen_finally_entry_t *hidden = finally_shared_copy(g,
@@ -498,6 +520,10 @@ static void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals, int bas
             memcpy(&g->finallys[i + 1], hidden,
                    sizeof(*hidden) * (size_t)hidden_count);
         locals->count = saved_locals;
+        if (hidden_lp_count)
+            memcpy(&g->lpad_stack[outer_lpad], hidden_lp,
+                sizeof(*hidden_lp) * (size_t)hidden_lp_count);
+        g->lpad_depth = saved_lpad_depth;
         if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) break;
     }
     g->finally_count = saved;
@@ -517,6 +543,30 @@ static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals
     }
     if (!g->finallys[fin_idx].body) return;
     emit_pending_scope_exit(g, g->finallys[fin_idx].pending_parent, false);
+    int saved_lpad_depth = g->lpad_depth;
+    int outer_lpad = saved_lpad_depth;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    for (int d = saved_lpad_depth - 1; d >= 0; d--) {
+        if (g->lpad_stack[d].fn != fn) break;
+        if (g->lpad_stack[d].fin_idx >= fin_idx &&
+            g->lpad_stack[d].fin_idx >= 0) outer_lpad = d;
+    }
+    int hidden_lp_count = saved_lpad_depth - outer_lpad;
+    zan_lpad_entry_t *hidden_lp = finally_shared_copy(g,
+        &g->lpad_stack[outer_lpad], sizeof(*hidden_lp) * (size_t)hidden_lp_count);
+    g->lpad_depth = outer_lpad;
+    int saved_armed = g->eh_armed_count;
+    int saved_throw_base = g->throw_locals_base;
+    int saved_throw_cbase = g->throw_catch_base;
+    void *armed = finally_shared_copy(g, g->eh_armed,
+        sizeof(g->eh_armed[0]) * (size_t)saved_armed);
+    if (!g->current_async_frame) {
+        zan_irgen_finally_entry_t *entry = &g->finallys[fin_idx];
+        emit_eh_disarm_from(g, entry->outer_armed_depth);
+        g->eh_armed_count = entry->outer_armed_depth;
+        g->throw_locals_base = entry->outer_throw_locals_base;
+        g->throw_catch_base = entry->outer_throw_catch_base;
+    }
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef top_g, bufs_g, exc_g;
@@ -524,6 +574,8 @@ static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals
     LLVMValueRef own_g = get_eh_exc_owned_global(g);
     LLVMValueRef tid_g = get_eh_exc_tid_global(g);
     LLVMValueRef s_exc = NULL, s_own = NULL, s_tid = NULL;
+    LLVMValueRef owner_flag = NULL;
+    int saved_locals = locals->count;
     if (g->current_async_frame) {
         LLVMValueRef owns = LLVMBuildLoad2(g->builder, i32t, own_g, "fin.owned");
         LLVMValueRef kind = LLVMBuildSelect(g->builder,
@@ -546,9 +598,30 @@ static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals
         zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, exc_g, "fin.exc.v"), s_exc);
         zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, own_g, "fin.own.v"), s_own);
         zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, tid_g, "fin.tid.v"), s_tid);
+        /* Suspend dispatch ownership in a scoped local, like a pending return.
+         * Outer landing pads and outward transfers release it; catches created
+         * inside this finally start above it and must leave it alive. */
+        LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+        owner_flag = emit_entry_alloca(g, i1, "fin.owns");
+        zan_builder_point_t pt = zan_builder_save(g);
+        LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(
+            LLVMGetBasicBlockParent(pt.bb));
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
+        if (term) LLVMPositionBuilderBefore(g->builder, term);
+        else LLVMPositionBuilderAtEnd(g->builder, entry);
+        LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), owner_flag);
+        zan_builder_restore(g, pt);
+        LLVMBuildStore(g->builder, LLVMBuildICmp(g->builder, LLVMIntNE,
+            LLVMBuildLoad2(g->builder, i32t, s_own, "fin.own.v"),
+            LLVMConstInt(i32t, 0, 0), "fin.isowned"), owner_flag);
+        local_add(locals, (zan_istr_t){"", 0}, s_exc, g->binder->type_object);
+        locals->vars[locals->count - 1].obj_rc_flag = owner_flag;
+        arc_own_local(g, locals);
+        zan_store_fit(g, LLVMConstNull(i8ptr), exc_g);
+        zan_store_fit(g, LLVMConstInt(i32t, 0, 0), own_g);
+        zan_store_fit(g, LLVMConstNull(i8ptr), tid_g);
     }
     int saved_count = g->finally_count;
-    int saved_locals = locals->count;
     int hidden_count = saved_count > fin_idx ? saved_count - fin_idx : 1;
     zan_irgen_finally_entry_t *hidden = finally_shared_copy(g,
         &g->finallys[fin_idx], sizeof(*hidden) * (size_t)hidden_count);
@@ -558,6 +631,15 @@ static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals
            sizeof(*hidden) * (size_t)hidden_count);
     locals->count = saved_locals;
     g->finally_count = saved_count;
+    if (hidden_lp_count)
+        memcpy(&g->lpad_stack[outer_lpad], hidden_lp,
+               sizeof(*hidden_lp) * (size_t)hidden_lp_count);
+    g->lpad_depth = saved_lpad_depth;
+    if (saved_armed) memcpy(g->eh_armed, armed,
+        sizeof(g->eh_armed[0]) * (size_t)saved_armed);
+    g->eh_armed_count = saved_armed;
+    g->throw_locals_base = saved_throw_base;
+    g->throw_catch_base = saved_throw_cbase;
     if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
     if (g->current_async_frame) {
         LLVMTypeRef ft = g->current_async_frame_type;
@@ -578,6 +660,9 @@ static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals
         zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, s_exc, "fin.exc.r"), exc_g);
         zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, s_own, "fin.own.r"), own_g);
         zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, s_tid, "fin.tid.r"), tid_g);
+        LLVMBuildStore(g->builder,
+            LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0), owner_flag);
+        zan_store_fit(g, LLVMConstNull(i8ptr), s_exc);
     }
 }
 void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
@@ -587,6 +672,12 @@ void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
     for (int i = g->lpad_depth - 1; i >= 0; i--) {
         zan_lpad_entry_t *top = &g->lpad_stack[i];
         if (top->fn != cur_fn) break;
+        if (!g->current_async_frame && top->lpad_bb) {
+            /* Synchronous throws enter the same lexical landing as callees.
+             * Only entries without a landing of their own (locks) run here. */
+            target_fin = top->finally_depth;
+            break;
+        }
         if (top->catch_bb) {
             target_fin = (top->fin_idx >= 0) ? top->fin_idx + 1 : 0;
             break;
@@ -602,15 +693,12 @@ static void emit_finallys_below_for_propagate(zan_irgen_t *g,
                                               local_scope_t *locals,
                                               int fin_idx) {
     if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
+    if (!g->current_async_frame) return; /* Outer landings own their finally. */
     for (int i = fin_idx - 1; i >= 0; i--) {
         if (g->finallys[i].in_try_body) break;
         emit_finally_on_exception_path(g, locals, i);
         if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
     }
-}
-
-static void emit_eh_propagate_tail(zan_irgen_t *g) {
-    emit_raise_exception(g);
 }
 
 static void emit_eh_propagate_tail_lpad(zan_irgen_t *g,
@@ -619,20 +707,25 @@ static void emit_eh_propagate_tail_lpad(zan_irgen_t *g,
                                         LLVMTypeRef lp_ret_ty,
                                         bool is_catch_rethrow) {
     if (g->current_async_frame) {
-        emit_eh_propagate_tail(g);
+        /* This try's finally has run; enclosing active tries still own
+         * their cleanup and must receive the exception in lexical order. */
+        emit_raise_exception_through_cleanups(g);
         return;
     }
     LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
     LLVMValueRef cur_fn = cur_bb ? LLVMGetBasicBlockParent(cur_bb) : NULL;
-    zan_lpad_entry_t *enclosing = NULL;
+    bool enclosing = false;
     for (int i = g->lpad_depth - 1; i >= 0; i--) {
-        if (g->lpad_stack[i].fn == cur_fn && g->lpad_stack[i].catch_bb) {
-            enclosing = &g->lpad_stack[i];
+        if (g->lpad_stack[i].fn != cur_fn) break;
+        if (g->lpad_stack[i].lpad_bb) {
+            enclosing = true;
             break;
         }
     }
     if (enclosing) {
-        LLVMBuildBr(g->builder, enclosing->catch_bb);
+        /* A branch straight to catch skipped intervening finally-only tries
+         * and their cleanup ledgers. Re-enter only the next outer landing. */
+        emit_raise_exception_through_cleanups(g);
     } else if (is_catch_rethrow) {
         emit_release_owned_locals(g, locals);
         emit_raise_exception(g);
@@ -641,6 +734,37 @@ static void emit_eh_propagate_tail_lpad(zan_irgen_t *g,
             emit_lpad_cleanups(g, &g->lpad_stack[0]);
         }
         LLVMValueRef cur_lp = LLVMBuildLoad2(g->builder, lp_ret_ty, lp_slot, "lp.prop");
+        /* A finally-only catch-all can be the selected native handler even
+         * when no Zan catch remains. Resume is only valid during cleanup
+         * unwinding; resuming a selected SEH handler targets this same frame
+         * again and reruns its ARC cleanup/finally. Restart the search for a
+         * handler outside this region while preserving the native payload. */
+        LLVMValueRef selector = LLVMBuildExtractValue(g->builder, cur_lp, 1,
+                                                       "lp.selector");
+        LLVMBasicBlockRef rethrow = LLVMAppendBasicBlockInContext(g->ctx, cur_fn,
+                                                                  "lp.rethrow");
+        LLVMBasicBlockRef resume = LLVMAppendBasicBlockInContext(g->ctx, cur_fn,
+                                                                 "lp.resume");
+        LLVMBuildCondBr(g->builder, LLVMBuildICmp(g->builder, LLVMIntNE,
+            selector, LLVMConstNull(LLVMTypeOf(selector)), "lp.handler"),
+            rethrow, resume);
+        LLVMPositionBuilderAtEnd(g->builder, rethrow);
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef native_exc = LLVMBuildExtractValue(g->builder, cur_lp, 0,
+                                                         "lp.exception");
+        LLVMTypeRef raise_ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
+                                                &i8ptr, 1, 0);
+        LLVMValueRef raise_fn = get_libc_fn(g, "_Unwind_RaiseException", raise_ty);
+        zan_call2(g->builder, raise_ty, raise_fn, &native_exc, 1, "");
+        /* Returning means propagation failed (END_OF_STACK or an unwind
+         * error). Resume_or_Rethrow aborts on SEH; use the installed terminate
+         * handler so the original Zan exception is diagnosed consistently. */
+        LLVMTypeRef void_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                                   NULL, 0, 0);
+        LLVMValueRef terminate_fn = get_libc_fn(g, "_ZSt9terminatev", void_fn_ty);
+        zan_call2(g->builder, void_fn_ty, terminate_fn, NULL, 0, "");
+        LLVMBuildUnreachable(g->builder);
+        LLVMPositionBuilderAtEnd(g->builder, resume);
         LLVMBuildResume(g->builder, cur_lp);
     }
 }

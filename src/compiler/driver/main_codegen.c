@@ -104,11 +104,13 @@
     probe_phase_mem("release ast");
     if (source) { free(source); source = NULL; }
 
+    char **shard_objs = NULL;
+    int shard_n = 0;
     const char *mf_json_path = getenv("ZAN_CODEGEN_MANIFEST_JSON");
     zan_cg_manifest_t mf;
     bool mf_built = false;
     if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
-        zan_opt_strip_unused(&irgen);
+        if (zan_opt_strip_unused(&irgen) != ZAN_OK) goto codegen_failed;
         zan_irgen_prune_extern_libs(&irgen);
         phase("manifest");
         probe_phase_mem("manifest");
@@ -124,6 +126,12 @@
                     mf_json_path);
     }
 
+    /* Discard unused stdlib bodies before checking hardware requirements.
+     * A declaration (or a dead helper) must not reject an ordinary baseline app. */
+    if (irgen.cpu_profile && strcmp(irgen.cpu_profile, "baseline") == 0) {
+        if (zan_opt_strip_unused(&irgen) != ZAN_OK ||
+            zan_opt_validate_cpu(&irgen, irgen.mod) != ZAN_OK) goto codegen_failed;
+    }
     zan_opt_level_t effective_opt = ZAN_OPT_NONE;
     if (opt_level >= 0) {
         effective_opt = (zan_opt_level_t)opt_level;
@@ -176,7 +184,7 @@
     zan_driver_prefix_snapshot_t driver_prefixes = {0};
     if (!do_emit_ir) {
         if (!mf_built) {
-            zan_opt_strip_unused(&irgen);
+            if (zan_opt_strip_unused(&irgen) != ZAN_OK) goto codegen_failed;
             zan_irgen_prune_extern_libs(&irgen);
         }
         zan_discover_drivers(resolved_stdlib_root, &driver_reg);
@@ -184,8 +192,6 @@
                                       driver_dir_override, &driver_prefixes);
     }
 
-    char **shard_objs = NULL;
-    int shard_n = 0;
     if (!do_emit_ir && want_shard && mf_built) {
         phase("shard");
         shard_n = zan_irgen_shard_run(&irgen, &mf, obj_path, &shard_objs);
@@ -208,6 +214,7 @@
 
     if (effective_opt > ZAN_OPT_NONE) {
         zan_opt_report_t opt_report = zan_optimize(&irgen, NULL, effective_opt);
+        if (!opt_report.success) goto codegen_failed;
         zan_opt_report_print(&opt_report);
         phase("optimize");
         probe_phase_mem("optimize");
@@ -217,12 +224,28 @@
         if (!irgen.target_is_wasm)
             irgen.fast_codegen = true;
         if (!do_emit_ir) {
-            zan_opt_strip_unused(&irgen);
+            if (zan_opt_strip_unused(&irgen) != ZAN_OK) goto codegen_failed;
             if (shard_n == 0)
                 zan_irgen_prune_extern_libs(&irgen);
         }
     }
 
+    goto codegen_ready;
+codegen_failed:
+    fprintf(stderr, "error: code generation stopped after optimization failure\n");
+    if (mf_built) zan_irgen_manifest_free(&mf);
+    for (int i = 0; i < shard_n; i++) {
+        remove(shard_objs[i]);
+        free(shard_objs[i]);
+    }
+    free(shard_objs);
+    zan_diag_free_buffers(irgen.diag);
+    zan_irgen_destroy(&irgen);
+    zan_arena_free(ir_arena);
+    if (arena) zan_arena_free(arena);
+    free(source);
+    return 1;
+codegen_ready:
     if (do_emit_ir) {
         if (zan_irgen_write_ir(&irgen, NULL) != ZAN_OK) {
             fprintf(stderr, "error: failed to write LLVM IR\n");
@@ -938,6 +961,7 @@
         phase("emit obj");
         probe_phase_mem("emit obj");
         if (zan_irgen_write_obj(&irgen, obj_tmp) != ZAN_OK) {
+            generated_object_vec_remove(&generated_objects, obj_tmp);
             fprintf(stderr, "error: failed to emit object file\n");
             zan_diag_free_buffers(irgen.diag);
             zan_irgen_destroy(&irgen);

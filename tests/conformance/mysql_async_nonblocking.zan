@@ -73,6 +73,8 @@ class FakeMySql {
     bool sawNonStandardOp;   // a prepared statement containing `==` or `!=`
     bool sawNullParam;       // a bound parameter marked NULL in the bitmap
     TcpListener listener;
+    List<nint> clients;
+    bool stopped;
 
     FakeMySql(int port, int delayMs) {
         this.port = port;
@@ -81,10 +83,22 @@ class FakeMySql {
         this.sawNonStandardOp = false;
         this.sawNullParam = false;
         this.listener = null;
+        this.clients = new List<nint>();
+        this.stopped = false;
     }
 
     void Stop() {
+        this.stopped = true;
         if (this.listener != null) { this.listener.Stop(); }
+        for (int i = 0; i < this.clients.Count; i = i + 1) {
+            if (this.clients[i] >= 0) { Socket.CancelPendingIo(this.clients[i]); }
+        }
+    }
+
+    async void StopAsync() {
+        this.Stop();
+        if (this.listener != null) { await this.listener.StopAsync(); }
+        while (this.clients.Count > 0) { await Task.Delay(1); }
     }
 
     async void Serve() {
@@ -93,6 +107,7 @@ class FakeMySql {
         while (true) {
             nint client = await this.listener.AcceptAsync();
             if (client < 0) { return; }
+            this.clients.Add(client);
             Task.Spawn(this.Session(client));
         }
     }
@@ -138,6 +153,7 @@ class FakeMySql {
     }
 
     async void Session(nint sock) {
+        try {
         Wire hs = new Wire();
         hs.U8(10).Cstr("8.0.0-zan-fake").U32(1);
         hs.Raw("ABCDEFGH").U8(0);                       // salt part 1 + filler
@@ -153,17 +169,17 @@ class FakeMySql {
 
         List<int> seq = new List<int>(); seq.Add(0); seq.Add(0);
         byte[] auth = await this.Recv(sock, seq);
-        if (auth == null) { Socket.Close(sock); return; }
+        if (auth == null) { return; }
         // authentication.
         int _ok = await this.Send(sock, FakeMySql.Ok(0), seq[0] + 1);
 
-        while (true) {
+        while (!this.stopped) {
             byte[] cmd = await this.Recv(sock, seq);
-            if (cmd == null) { Socket.Close(sock); return; }
+            if (cmd == null) { return; }
             int op = cmd[0] & 255;
             int clen = seq[1];
             string sql = cmd.ToStr(1, clen - 1);
-            if (op == 1) { Socket.Close(sock); return; }             // COM_QUIT
+            if (op == 1) { return; }             // COM_QUIT
             if (op == 3) {                                            // COM_QUERY
                 await this.AnswerText(sock, sql);
             } else if (op == 22) {                                    // COM_STMT_PREPARE
@@ -174,6 +190,12 @@ class FakeMySql {
             } else if (op == 25) {                                    // COM_STMT_CLOSE
             } else {
                 int _e = await this.Send(sock, FakeMySql.Ok(0), 1);
+            }
+        }
+        } finally {
+            Socket.Close(sock);
+            for (int i = 0; i < this.clients.Count; i = i + 1) {
+                if (this.clients[i] == sock) { this.clients.RemoveAt(i); break; }
             }
         }
     }
@@ -210,6 +232,19 @@ class FakeMySql {
         string head = FakeMySql.Head(sql);
         if (head != "SELECT") {
             int _o = await this.Send(sock, FakeMySql.Ok(1), 1);
+            return;
+        }
+        // ORM Func predicates materialize note rows before parameterized UPDATE.
+        if (sql.ToUpper().Contains("FROM `NOTE`") || sql.ToUpper().Contains("FROM NOTE")) {
+            int _n = await this.Send(sock, FakeMySql.Count(3), 1);
+            int _id = await this.Send(sock, FakeMySql.Column("id", 3), 2);
+            int _title = await this.Send(sock, FakeMySql.Column("title", 253), 3);
+            int _views = await this.Send(sock, FakeMySql.Column("views", 3), 4);
+            int _ce = await this.Send(sock, FakeMySql.Eof(), 5);
+            Wire note = new Wire();
+            note.Lstr("7").Lstr("alpha").Lstr("42");
+            int _nr = await this.Send(sock, note, 6);
+            int _ne = await this.Send(sock, FakeMySql.Eof(), 7);
             return;
         }
         int _c = await this.Send(sock, FakeMySql.Count(1), 1);
@@ -294,6 +329,7 @@ class Program {
         }
         Console.WriteLine("TIMEOUT at stage: " + Program.stage);
         Program.running = false;
+        Environment.Exit(1);
     }
 
     static async void Ticker() {
@@ -323,10 +359,12 @@ class Program {
 
         DbPool pool = MySqlAsyncConnector.Pool("127.0.0.1", port, "app",
             "root", "secret", 4);
-        IDbConnection db = await pool.AcquireAsync();
+        bool failed = false;
+        IDbConnection db = null;
+        try {
+        db = await pool.AcquireAsync();
         if (db == null) {
-            Console.WriteLine("FAIL: no connection");
-            return;
+            throw new Exception("no connection");
         }
         Console.WriteLine("connected: " + Program.YesNo(true));
 
@@ -381,10 +419,16 @@ class Program {
         Console.WriteLine("null string bound as SQL NULL: "
             + Program.YesNo(server.sawNullParam));
 
-        Program.running = false;
-        pool.Release(db);
-        pool.Close();
-        server.Stop();
+        } catch (Exception ex) {
+            Console.WriteLine("FAIL at " + Program.stage);
+            failed = true;
+        } finally {
+            Program.running = false;
+            if (db != null) { pool.Release(db); }
+            pool.Close();
+            await server.StopAsync();
+        }
+        if (failed) { Environment.Exit(1); }
         Console.WriteLine("OK");
     }
 

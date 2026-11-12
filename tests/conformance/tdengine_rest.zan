@@ -1,49 +1,6 @@
 using System;
 using System.Data;
-using System.Data.Orm;
 using System.Data.TDengine;
-
-
-class DescribeStub : IDbExecutor {
-    string lastSql;
-
-    DbResult Query(string sql) {
-        this.lastSql = sql;
-        DbResult r = new DbResult();
-        r.SetColumnCount(4);
-        r.AddColumnName("field");
-        r.AddColumnName("type");
-        r.AddColumnName("length");
-        r.AddColumnName("note");
-        r.AddRow(DescribeStub.Row("ts", "TIMESTAMP", "8", ""));
-        r.AddRow(DescribeStub.Row("current", "FLOAT", "4", ""));
-        r.AddRow(DescribeStub.Row("location", "BINARY", "24", "TAG"));
-        return r;
-    }
-
-    static List<string> Row(string a, string b, string c, string d) {
-        List<string> row = new List<string>();
-        row.Add(a);
-        row.Add(b);
-        row.Add(c);
-        row.Add(d);
-        return row;
-    }
-
-    DbResult Query(string sql, DbParams prms) { return Query(sql); }
-    int Execute(string sql) { return 0; }
-    int Execute(string sql, DbParams prms) { return 0; }
-    string ExecuteScalar(string sql) { return ""; }
-    string ExecuteScalar(string sql, DbParams prms) { return ""; }
-    async DbResult QueryAsync(string sql) { return this.Query(sql); }
-    async DbResult QueryAsync(string sql, DbParams prms) { return this.Query(sql, prms); }
-    async int ExecuteAsync(string sql) { return this.Execute(sql); }
-    async int ExecuteAsync(string sql, DbParams prms) { return this.Execute(sql, prms); }
-    async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
-    async string ExecuteScalarAsync(string sql, DbParams prms) { return this.ExecuteScalar(sql, prms); }
-    int GetProvider() { return DbProvider.TDengine; }
-    string LastSql() { return this.lastSql; }
-}
 
 class Program {
     static int passed = 0;
@@ -148,13 +105,17 @@ class Program {
         }
         Check("query-mismatch", queryThrew);
 
-        DescribeStub stub = new DescribeStub();
-        Model m = Model.FromTable(stub, "meters");
-        CheckEq("orm-describe-sql", stub.LastSql(), "DESCRIBE meters");
-        Check("orm-columns", m.ColumnCount() == 3);
-        CheckEq("orm-timestamp-is-key", m.GetPrimaryKey(), "ts");
-        CheckEq("orm-key-type", m.ColumnTypeAt(0), "TIMESTAMP PRIMARY KEY");
-        CheckEq("orm-binary-width", m.ColumnTypeAt(2), "BINARY(24)");
+        // TDengine returns schema details as rows in its REST DESCRIBE response.
+        DbResult schema = db.Decode("{\"code\":0,\"column_meta\":[[\"Field\",\"VARCHAR\",65],"
+            + "[\"Type\",\"VARCHAR\",16],[\"Length\",\"INT\",4],[\"Note\",\"VARCHAR\",16]],"
+            + "\"data\":[[\"ts\",\"TIMESTAMP\",8,\"\"],[\"current\",\"FLOAT\",4,\"\"],"
+            + "[\"location\",\"BINARY\",24,\"TAG\"]],\"rows\":3}");
+        Check("describe-shape", schema.RowCount() == 3 && schema.ColumnCount() == 4);
+        CheckEq("describe-leading-column", schema.GetByName(0, "Field"), "ts");
+        CheckEq("describe-leading-type", schema.GetByName(0, "Type"), "TIMESTAMP");
+        CheckEq("describe-binary-type", schema.GetByName(2, "Type"), "BINARY");
+        Check("describe-binary-tag", schema.GetInt(2, schema.GetColumnIndex("Length")) == 24
+            && schema.GetByName(2, "Note") == "TAG");
 
         Console.WriteLine("pass: " + Convert.ToString(Program.passed));
         Console.WriteLine("fail: " + Convert.ToString(Program.failed));

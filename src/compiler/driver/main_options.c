@@ -11,6 +11,7 @@ void print_usage(void) {
     fprintf(stderr, "    -O0..-O3/-Os/-Oz Set optimization level (default: O2; --publish: Os;\n");
     fprintf(stderr, "                     -g forces O0; -Oz = minimum size for edge/embedded)\n");
     fprintf(stderr, "    --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
+    fprintf(stderr, "    --cpu-profile <baseline|avx2>  x86-64 CPU requirements (default: target default)\n");
     fprintf(stderr, "    --list-targets   Show available cross-compilation targets\n");
     fprintf(stderr, "    --subsystem <s>  PE subsystem: windows (GUI; auto-detected for\n");
     fprintf(stderr, "                     GUI apps) or console (Windows only)\n");

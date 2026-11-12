@@ -491,6 +491,13 @@ static bool await_target_is_async(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (msym && msym->decl && msym->decl->kind == AST_METHOD_DECL)
                     return (msym->decl->method_decl.modifiers & MOD_ASYNC) != 0;
             }
+            /* Async extensions have their result type, not Task<T>. Reuse
+             * ordinary call emission's extension candidate selection. */
+            zan_symbol_t *ext = find_extension_method(g, obj_ty,
+                callee->member.name, expr->call.args.count, expr,
+                callee->member.object, locals);
+            if (ext && ext->decl && ext->decl->kind == AST_METHOD_DECL)
+                return (ext->decl->method_decl.modifiers & MOD_ASYNC) != 0;
         } else {
             /* 静态接收者写的是**类名**（`Socket.SendStringAsync(...)`）——
              * 类名不是值，infer 给不出类型，要按名字查符号。 */
@@ -520,6 +527,19 @@ static bool await_target_is_async(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        zan_type_t *public_task = infer_expr_type(g, expr->await_expr.expr, locals);
+        if (public_task && public_task->kind == TYPE_TASK &&
+            !await_target_is_async(g, expr->await_expr.expr, locals)) {
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef token = emit_expr(g, expr->await_expr.expr, locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(token)) == LLVMPointerTypeKind)
+                token = LLVMBuildPtrToInt(g->builder, token, i64, "await.token");
+            LLVMValueRef handle = LLVMBuildIntToPtr(g->builder, token, ptr, "await.handle");
+            return emit_task_member(g, handle,
+                public_task->type_arg_count ? public_task->type_args[0] : NULL,
+                public_task->type_arg_count ? 1 : 0);
+        }
         /* await 落在 async 方法的 lambda 体内：lambda 不是协程，没有自己的帧可挂
          * ——硬降级会把外层协程的块当自己的用（跨函数的 br，LLVM 校验直接失败：
          * "Referring to a basic block in another function"）。这里报诊断，不落那条
@@ -618,7 +638,8 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* await Gate.Park(handle): 事件驱动协程等待原语 */
         if (is_call_to(expr->await_expr.expr, "Gate", "Park") &&
-            expr->await_expr.expr->call.args.count == 1) {
+            (expr->await_expr.expr->call.args.count == 1 ||
+             expr->await_expr.expr->call.args.count == 2)) {
             LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -631,18 +652,29 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (LLVMTypeOf(handle) != di64) {
                 handle = LLVMBuildIntCast2(g->builder, handle, di64, 1, "gate64");
             }
+            bool ticketed = expr->await_expr.expr->call.args.count == 2;
+            LLVMValueRef ticket = NULL;
+            if (ticketed) {
+                ticket = emit_expr(g, expr->await_expr.expr->call.args.items[1], locals);
+                if (LLVMTypeOf(ticket) != di64)
+                    ticket = LLVMBuildIntCast2(g->builder, ticket, di64, 1, "ticket64");
+            }
             g->uses_socket_async = true;
+            LLVMTypeRef params[] = { di64, di64, di8ptr, g->co_step_ptr };
             LLVMTypeRef gate_park_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-                (LLVMTypeRef[]){ di64, di8ptr, g->co_step_ptr }, 3, 0);
-            LLVMValueRef gate_park = LLVMGetNamedFunction(g->mod, "zan_gate_park");
+                ticketed ? params : params + 1, ticketed ? 4 : 3, 0);
+            const char *park_name = ticketed ? "zan_gate_park_ticket" : "zan_gate_park";
+            LLVMValueRef gate_park = LLVMGetNamedFunction(g->mod, park_name);
             if (!gate_park) {
-                gate_park = LLVMAddFunction(g->mod, "zan_gate_park", gate_park_type);
+                gate_park = LLVMAddFunction(g->mod, park_name, gate_park_type);
             }
             int k = g->current_async_next_state++;
             LLVMValueRef self_i8 = get_async_self_i8(g);
             zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
+            LLVMValueRef args[] = { handle, ticket, self_i8, g->current_async_resume_fn };
+            if (!ticketed) args[1] = handle;
             zan_call2(g->builder, gate_park_type, gate_park,
-                (LLVMValueRef[]){ handle, self_i8, g->current_async_resume_fn }, 3, "");
+                ticketed ? args : args + 1, ticketed ? 4 : 3, "");
             LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
             LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -1057,6 +1089,8 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef sub_slot = get_async_sub_slot_ptr(g);
                 zan_store_fit(g, sub_i8, sub_slot);
                 zan_store_fit(g, sub_i8, get_async_child_ptr(g));
+                LLVMValueRef edge_args[] = { get_async_self_i8(g), sub_i8 };
+                emit_task_runtime_call(g, "zan_task_child", LLVMVoidTypeInContext(g->ctx), edge_args, 2);
                 zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0), get_async_state_ptr(g));
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
                 zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");

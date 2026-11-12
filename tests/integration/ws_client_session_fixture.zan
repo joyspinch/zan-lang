@@ -1,0 +1,111 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Net.WebSocket;
+using System.Net.WebSocket.Secure;
+using System.Threading;
+
+namespace System.Net.WebSocket.Secure;
+
+class WsClientSessionFixture {
+    static void Require(bool ok, string reason) {
+        if (!ok) { throw new InvalidOperationException(reason); }
+    }
+
+    static byte[] Payload(int len) {
+        byte[] bytes = new byte[len];
+        for (int i = 0; i < len; i = i + 1) { bytes[i] = (byte)(i % 251); }
+        return bytes;
+    }
+
+    static async void Sender(WebSocketClient ws, WssClient wss, int size, AtomicInt done) {
+        byte[] bytes = WsClientSessionFixture.Payload(size);
+        if (ws != null) { await ws.SendBinary(bytes); }
+        else { await wss.SendBinary(bytes); }
+        done.Increment();
+    }
+
+    static async void Receiver(WebSocketClient ws, WssClient wss, AtomicInt done) {
+        string message = ws != null ? await ws.RecvText() : await wss.RecvText();
+        if (message == "") { done.Add(10); }
+    }
+
+    static int Main() {
+        WebSocketClient ws = null;
+        WssClient wss = null;
+        try {
+            Socket.Initialize();
+            int port = int.Parse(Environment.GetEnvironmentVariable("ZAN_WS_PORT"));
+            string mode = Environment.GetEnvironmentVariable("ZAN_WS_MODE");
+            string test = Environment.GetEnvironmentVariable("ZAN_WS_CASE");
+            if (mode == "ws") {
+                ws = await WebSocketClient.ConnectAsync("localhost", port, "/fixture");
+                WsClientSessionFixture.Require(ws.IsConnected(), "WS upgrade failed");
+            } else {
+                TlsContext context = TlsContext.CreateClient();
+                WsClientSessionFixture.Require(context != null, "TLS context failed");
+                WsClientSessionFixture.Require(context.AddTrustedCert(Environment.GetEnvironmentVariable("ZAN_WS_CA")), "CA load failed");
+                if (mode == "wss12") { context.DisableTls13(); }
+                wss = await WssClient.ConnectContextAsync("localhost", port, "/fixture", context);
+                if (test == "wrong_ca" || test == "wrong_host") {
+                    WsClientSessionFixture.Require(!wss.IsConnected(), "certificate was accepted");
+                    Console.WriteLine("ws_client_fixture=ok");
+                    return 0;
+                }
+                WsClientSessionFixture.Require(wss.IsConnected(), "WSS upgrade failed: " + TlsStream.LastError());
+            }
+            if (test == "protocol" || test == "close") {
+                string text = ws != null ? await ws.RecvText() : await wss.RecvText();
+                WsClientSessionFixture.Require(text == "" && !(ws != null ? ws.IsConnected() : wss.IsConnected()), "expected disconnect");
+            } else if (test == "wake") {
+                AtomicInt done = new AtomicInt(0);
+                Task.Spawn(WsClientSessionFixture.Receiver(ws, wss, done));
+                for (int i = 0; i < 4; i = i + 1) {
+                    Task.Spawn(WsClientSessionFixture.Sender(ws, wss, 4194304 + i, done));
+                }
+                await Task.Delay(50);
+                WsClientSessionFixture.Require(done.Load() < 4, "fixture did not block a send");
+                if (ws != null) { ws.CloseNow(); } else { wss.CloseNow(); }
+                for (int i = 0; i < 200 && done.Load() < 14; i = i + 1) { await Task.Delay(10); }
+                WsClientSessionFixture.Require(done.Load() == 14, "close did not wake send/receive waiters");
+            } else {
+                if (test == "timeout") {
+                    string idle = await ws.RecvText(50);
+                    WsClientSessionFixture.Require(idle == "" && ws.IsConnected(), "idle timeout closed connection");
+                }
+                byte[] bytes = ws != null ? await ws.RecvBinary() : await wss.RecvBinary();
+                int len = ws != null ? ws.LastLength() : wss.LastLength();
+                int opcode = ws != null ? ws.LastOpcode() : wss.LastOpcode();
+                WsClientSessionFixture.Require(bytes != null && len == 3 && opcode == WsOpcode.Binary
+                    && bytes[0] == 97 && bytes[1] == 0 && bytes[2] == 98, "fragmented binary mismatch");
+                string next = ws != null ? await ws.RecvText() : await wss.RecvText();
+                WsClientSessionFixture.Require(next == "next", "coalesced frame lost");
+                AtomicInt done = new AtomicInt(0);
+                for (int i = 0; i < 8; i = i + 1) { Task.Spawn(WsClientSessionFixture.Sender(ws, wss, 65536 + i, done)); }
+                List<int> received = new List<int>();
+                for (int i = 0; i < 8; i = i + 1) {
+                    byte[] echo = ws != null ? await ws.RecvBinary() : await wss.RecvBinary();
+                    int count = ws != null ? ws.LastLength() : wss.LastLength();
+                    WsClientSessionFixture.Require(echo != null && count >= 65536 && count < 65544
+                        && !received.Contains(count), "queued frame length/uniqueness");
+                    received.Add(count);
+                    for (int j = 0; j < count; j = j + 1) {
+                        WsClientSessionFixture.Require(echo[j] == (byte)(j % 251), "queued frame byte mismatch");
+                    }
+                }
+                for (int i = 0; i < 100 && done.Load() < 8; i = i + 1) { await Task.Delay(10); }
+                WsClientSessionFixture.Require(done.Load() == 8, "senders unfinished");
+                if (ws != null) { await ws.Close(); } else { await wss.Close(); }
+            }
+            Console.WriteLine("ws_client_fixture=ok");
+            return 0;
+        } catch (Exception e) {
+            Console.WriteLine("ws_client_fixture=fail " + e.Message);
+            return 1;
+        } finally {
+            if (ws != null) { ws.Dispose(); }
+            if (wss != null) { wss.Dispose(); }
+        }
+    }
+}

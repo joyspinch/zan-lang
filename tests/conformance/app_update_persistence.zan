@@ -1,0 +1,247 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Collections.Generic;
+using System.Json;
+using AppUpdate;
+
+namespace AppUpdate;
+
+class RecordingPersistence : InstallPersistence {
+    public List<string> events = new List<string>();
+    public string failAt = "";
+    public bool failAfter = false;
+    public bool fired = false;
+
+    void Before(string boundary) {
+        this.events.Add(boundary);
+        if (!this.fired && this.failAt == boundary && !this.failAfter) {
+            this.fired = true;
+            throw new IOException("injected persistence failure");
+        }
+    }
+
+    void After(string boundary) {
+        if (!this.fired && this.failAt == boundary && this.failAfter) {
+            this.fired = true;
+            throw new IOException("injected post-sync failure");
+        }
+    }
+
+    internal override void SyncFile(string path, string boundary) {
+        this.Before(boundary);
+        base.SyncFile(path, boundary);
+        this.After(boundary);
+    }
+
+    internal override void SyncDirectory(string path, string boundary) {
+        this.Before(boundary);
+        base.SyncDirectory(path, boundary);
+        this.After(boundary);
+    }
+}
+
+class Program {
+    static void Require(bool ok, string name) {
+        if (!ok) { throw new Exception(name); }
+    }
+
+    static void Before(List<string> events, string earlier, string later) {
+        int first = events.LastIndexOf(earlier);
+        int second = events.IndexOf(later);
+        Require(first >= 0 && second >= 0 && first < second, earlier + " before " + later);
+    }
+
+    static UpdateManifest Manifest(List<ZipEntry> entries) {
+        UpdateManifest manifest = new UpdateManifest();
+        for (int i = 0; i < 2; i = i + 1) {
+            ZipEntry entry = new ZipEntry(i == 0 ? "nested/deep/start.sh" : "new/file.txt");
+            entry.data = System.Text.Encoding.UTF8.GetBytes(i == 0 ? "#!/bin/sh\nexit 0\n" : "new-data");
+            entries.Add(entry);
+            UpdateFileEntry file = new UpdateFileEntry();
+            file.path = entry.name;
+            file.size = entry.data.Length;
+            file.sha256 = AppUpdater.HashBytes(entry.data);
+            manifest.files.Add(file);
+        }
+        return manifest;
+    }
+
+    static void Seed(string root, UpdateManifest manifest) {
+        Directory.CreateDirectoryRecursive(root + "/nested/deep");
+        Directory.CreateDirectoryRecursive(root + "/_backup/nested/deep");
+        File.WriteAllText(root + "/" + manifest.files[0].path, "old-data");
+        File.WriteAllText(root + "/_backup/" + manifest.files[0].path, "old-backup");
+    }
+
+    static void CheckOriginals(string root, UpdateManifest manifest) {
+        Require(File.ReadAllText(root + "/" + manifest.files[0].path) == "old-data", "original restored");
+        Require(File.ReadAllText(root + "/_backup/" + manifest.files[0].path) == "old-backup", "backup restored");
+        Require(!File.Exists(root + "/" + manifest.files[1].path), "new destination removed");
+    }
+
+    static void Legacy(string root, UpdateManifest manifest, List<ZipEntry> entries, bool committed) {
+        Seed(root, manifest);
+        JsonValue plan = InstallTransaction.Prepare(root, manifest, entries, true);
+        for (int i = 0; i < manifest.files.Count; i = i + 1) { InstallTransaction.PublishOne(root, manifest, plan, i); }
+        plan.Set("format", JsonValue.NewStr("2"));
+        string payload = plan.ToJson();
+        JsonValue envelope = JsonValue.NewObject();
+        envelope.PutStr("payload", payload);
+        envelope.PutStr("sha256", InstallTransaction.Digest(payload));
+        File.WriteAllText(root + "/_appupdate/journal", envelope.ToJson());
+        if (!committed) {
+            Require(!InstallTransaction.Recover(root, manifest), "phase and plan version must match");
+            Require(File.Exists(root + "/_appupdate/0.old"), "version mismatch retains snapshots");
+        }
+        string phase = "2:" + (committed ? "committed" : "publishing") + ":" + Convert.ToString(manifest.files.Count);
+        File.WriteAllText(root + "/_appupdate/phase", phase + ":" + InstallTransaction.Digest(InstallRoot.Identity(root) + ":" + phase));
+        RecordingPersistence persistence = new RecordingPersistence();
+        Require(InstallTransaction.Recover(root, committed ? new UpdateManifest() : manifest, persistence), "legacy recovery");
+        Require(!Directory.Exists(root + "/_appupdate"), "legacy cleanup");
+        if (committed) {
+            Before(persistence.events, "committed-confirmed", "cleanup-inventory");
+            Require(AppUpdater.HashBytes(File.ReadAllBytes(root + "/" + manifest.files[0].path)) == manifest.files[0].sha256, "legacy commit preserved");
+        } else {
+            Before(persistence.events, "recovery-inventory", "replacement-file");
+            CheckOriginals(root, manifest);
+        }
+    }
+
+    static void Main() {
+        string fixture = Path.GetFullPath("_scratch/conf_app_persistence");
+        Require(!Directory.Exists(fixture) && !File.Exists(fixture) && !File.IsReparsePoint(fixture), "owned fixture absent");
+        Directory.CreateDirectoryRecursive(fixture);
+        try {
+            List<ZipEntry> entries = new List<ZipEntry>();
+            UpdateManifest manifest = Manifest(entries);
+            string root = fixture + "/fresh/root";
+            RecordingPersistence normal = new RecordingPersistence();
+            Require(InstallTransaction.Install(root, manifest, entries, true, normal), "fresh install");
+            Before(normal.events, "phase-preparing-renamed", "prepared-new");
+            Before(normal.events, "prepared-new", "phase-publishing-file");
+            Before(normal.events, "journal-renamed", "phase-publishing-file");
+            Before(normal.events, "phase-publishing-renamed", "replacement-file");
+            Before(normal.events, "replacement-source", "phase-committed-file");
+            Before(normal.events, "phase-committed-renamed", "cleanup-inventory");
+            Before(normal.events, "cleanup-inventory", "cleanup-phase");
+            Before(normal.events, "cleanup-phase", "cleanup-state");
+
+            List<string> failures = new List<string>();
+            failures.Add("phase-preparing-file");
+            failures.Add("phase-preparing-renamed");
+            failures.Add("prepared-old");
+            failures.Add("prepared-backup");
+            failures.Add("journal-file");
+            failures.Add("prepared-inventory");
+            failures.Add("phase-publishing-renamed");
+            failures.Add("replacement-file");
+            failures.Add("replacement-destination");
+            failures.Add("phase-committed-file");
+            failures.Add("phase-committed-renamed");
+            failures.Add("cleanup-inventory");
+            failures.Add("cleanup-phase");
+            failures.Add("cleanup-state");
+            for (int i = 0; i < failures.Count; i = i + 1) {
+              for (int after = 0; after < 2; after = after + 1) {
+                root = fixture + "/failure-" + Convert.ToString(i) + "-" + Convert.ToString(after);
+                Seed(root, manifest);
+                RecordingPersistence fault = new RecordingPersistence();
+                fault.failAt = failures[i];
+                fault.failAfter = after == 1;
+                bool installed = InstallTransaction.Install(root, manifest, entries, true, fault);
+                Require(fault.fired, "selected boundary reached");
+                bool cleanupFailure = failures[i].StartsWith("cleanup-");
+                Require(installed == cleanupFailure, "only committed cleanup failure returns success");
+                if (failures[i].StartsWith("phase-committed-")) {
+                    Require(File.Exists(root + "/_appupdate/journal") && File.Exists(root + "/_appupdate/0.old"), "uncertain commit retains evidence");
+                    if (failures[i] == "phase-committed-renamed") {
+                        RecordingPersistence retryFault = new RecordingPersistence();
+                        retryFault.failAt = "committed-confirmed";
+                        bool blocked = false;
+                        try { InstallTransaction.Recover(root, manifest, retryFault); }
+                        catch (IOException ex) { blocked = true; }
+                        Require(blocked && retryFault.fired, "visible commit must confirm directory sync");
+                        Require(File.Exists(root + "/_appupdate/journal") && File.Exists(root + "/_appupdate/0.old"), "confirmation failure retains evidence");
+                    }
+                }
+                Require(InstallTransaction.Recover(root, manifest), "recovery after barrier failure");
+                Require(InstallTransaction.Recover(root, manifest), "recovery repeats");
+                Require(!Directory.Exists(root + "/_appupdate"), "recovery cleans state");
+                if (cleanupFailure || failures[i] == "phase-committed-renamed") {
+                    Require(AppUpdater.HashBytes(File.ReadAllBytes(root + "/" + manifest.files[0].path)) == manifest.files[0].sha256, "committed payload retained");
+                } else { CheckOriginals(root, manifest); }
+              }
+            }
+
+            Legacy(fixture + "/legacy-publishing", manifest, entries, false);
+            Legacy(fixture + "/legacy-committed", manifest, entries, true);
+            root = fixture + "/preparing-other-plan";
+            Seed(root, manifest);
+            RecordingPersistence preparing = new RecordingPersistence();
+            preparing.failAt = "prepared-inventory";
+            bool preparationFailed = false;
+            try { InstallTransaction.Prepare(root, manifest, entries, true, preparing); }
+            catch (IOException ex) { preparationFailed = true; }
+            Require(preparationFailed && preparing.fired, "preparation failure retains preparing authority");
+            Require(InstallTransaction.Recover(root, new UpdateManifest()), "preparation cleanup independent of next plan");
+            CheckOriginals(root, manifest);
+
+            List<string> recoveryFailures = new List<string>();
+            recoveryFailures.Add("recovery-old");
+            recoveryFailures.Add("recovery-backup");
+            recoveryFailures.Add("recovery-journal");
+            recoveryFailures.Add("recovery-phase");
+            recoveryFailures.Add("recovery-inventory");
+            for (int i = 0; i < recoveryFailures.Count; i = i + 1) {
+                for (int after = 0; after < 2; after = after + 1) {
+                    root = fixture + "/recovery-" + Convert.ToString(i) + "-" + Convert.ToString(after);
+                    Seed(root, manifest);
+                    JsonValue retained = InstallTransaction.Prepare(root, manifest, entries, true);
+                    for (int k = 0; k < manifest.files.Count; k = k + 1) { InstallTransaction.PublishOne(root, manifest, retained, k); }
+                    RecordingPersistence recoveryFault = new RecordingPersistence();
+                    recoveryFault.failAt = recoveryFailures[i];
+                    recoveryFault.failAfter = after == 1;
+                    bool recoveryFailed = false;
+                    try { InstallTransaction.Recover(root, manifest, recoveryFault); }
+                    catch (IOException ex) { recoveryFailed = true; }
+                    Require(recoveryFailed && recoveryFault.fired, "recovery evidence sync failure");
+                    Require(File.Exists(root + "/_appupdate/journal") && File.Exists(root + "/_appupdate/0.old"), "recovery evidence retained");
+                    Require(AppUpdater.HashBytes(File.ReadAllBytes(root + "/" + manifest.files[0].path)) == manifest.files[0].sha256, "barriers precede rollback mutation");
+                    Require(InstallTransaction.Recover(root, manifest), "recovery evidence sync retry");
+                    CheckOriginals(root, manifest);
+                }
+            }
+
+            root = fixture + "/rollback";
+            Seed(root, manifest);
+            JsonValue plan = InstallTransaction.Prepare(root, manifest, entries, true);
+            for (int i = 0; i < manifest.files.Count; i = i + 1) { InstallTransaction.PublishOne(root, manifest, plan, i); }
+            RecordingPersistence restoreFault = new RecordingPersistence();
+            restoreFault.failAt = "restored-absence";
+            bool restoreFailed = false;
+            try { InstallTransaction.Recover(root, manifest, restoreFault); }
+            catch (IOException ex) { restoreFailed = true; }
+            Require(restoreFailed && restoreFault.fired, "rollback absence barrier failure");
+            Require(File.Exists(root + "/_appupdate/0.old"), "rollback failure retains snapshots");
+            RecordingPersistence resumed = new RecordingPersistence();
+            Require(InstallTransaction.Recover(root, manifest, resumed), "rollback barrier retry");
+            Require(resumed.events.Contains("restored-parents"), "already absent path still synchronizes parents");
+            CheckOriginals(root, manifest);
+
+            root = fixture + "/matching";
+            Seed(root, manifest);
+            plan = InstallTransaction.Prepare(root, manifest, entries, true);
+            RecordingPersistence matching = new RecordingPersistence();
+            matching.failAt = "restored-existing";
+            bool matchingFailed = false;
+            try { InstallTransaction.Recover(root, manifest, matching); }
+            catch (IOException ex) { matchingFailed = true; }
+            Require(matchingFailed && matching.fired, "matching bytes still require synchronization");
+            Require(File.Exists(root + "/_appupdate/journal"), "matching failure retains journal");
+            Require(InstallTransaction.Recover(root, manifest), "matching retry");
+            CheckOriginals(root, manifest);
+            Console.WriteLine("PASS app_update_persistence");
+        } finally { Directory.DeleteRecursive(fixture); }
+    }
+}

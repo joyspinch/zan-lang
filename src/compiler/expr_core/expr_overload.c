@@ -113,9 +113,21 @@ static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
     }
     if (a->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = a->member.object;
-    if (!obj || obj->kind != AST_IDENTIFIER) return NULL;
-    if (locals && local_find(locals, obj->ident.name)) return NULL;
-    zan_symbol_t *cs = zan_binder_lookup(g->binder, obj->ident.name);
+    if (!obj || (obj->kind != AST_IDENTIFIER && obj->kind != AST_THIS_EXPR))
+        return NULL;
+    /* Instance method groups participate in the same signature scoring as
+     * static groups. Treating a local or this receiver as an unknown value
+     * ties inherited overloads and can infer a derived void overload for a
+     * fluent call whose applicable base overload returns the receiver. */
+    zan_symbol_t *cs = NULL;
+    if (obj->kind == AST_THIS_EXPR) {
+        cs = g->current_type_sym;
+    } else {
+        local_var_t *receiver = locals ? local_find(locals, obj->ident.name) : NULL;
+        zan_type_t *receiver_type = receiver ? receiver->type : NULL;
+        cs = receiver ? (receiver_type ? receiver_type->sym : NULL)
+            : zan_binder_lookup(g->binder, obj->ident.name);
+    }
     if (!cs || (cs->kind != SYM_CLASS && cs->kind != SYM_STRUCT)) return NULL;
     if (get_field_sym(cs, a->member.name)) return NULL;
     zan_symbol_t *m = arity >= 0 ? resolve_overload(cs, a->member.name, arity, 0)
@@ -634,6 +646,9 @@ static bool ext_receiver_interface_match(zan_type_t *pt, zan_type_t *recv_ty) {
 static int ext_method_score(zan_irgen_t *g, zan_symbol_t *m,
                             zan_type_t *recv_ty, zan_ast_node_t *call,
                             zan_ast_node_t *recv_expr, local_scope_t *locals) {
+    if (call && call->kind == AST_CALL && call->call.type_args.count > 0 &&
+        m->decl->method_decl.type_params.count != call->call.type_args.count)
+        return -1;
     zan_ast_list_t *ps = &m->decl->method_decl.params;
     zan_type_t *pt = zan_binder_resolve_type(g->binder, ps->items[0]->param.type);
     int score = 0;

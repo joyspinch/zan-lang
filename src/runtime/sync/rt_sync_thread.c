@@ -5,26 +5,23 @@
 typedef void (*zan_thread_body_fn)(void);
 
 static void *zan_delegate_record(void *d);
-static void zan_delegate_retain(void *d);
-static void zan_delegate_release(void *d);
+void zan_backend_delegate_retain(void *d);
+void zan_backend_delegate_release(void *d);
+void zan_backend_delegate_invoke(void *d);
 
-static int zan_is_code_pointer(void *p) {
-    if (!p) return 0;
-#ifdef _WIN32
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(p, &mbi, sizeof(mbi))) {
-        DWORD prot = mbi.Protect;
-        if (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) {
-            return 1;
-        }
-    }
-    return 0;
+/* MSVC COFF needs an unresolved-symbol fallback rather than a weak body.
+ * GNU/MinGW and ELF use weak definitions. Selfhost supplies strong hooks. */
+#if defined(_MSC_VER)
+#pragma comment(linker, "/alternatename:zan_backend_delegate_retain=zan_default_delegate_retain")
+#pragma comment(linker, "/alternatename:zan_backend_delegate_release=zan_default_delegate_release")
+#pragma comment(linker, "/alternatename:zan_backend_delegate_invoke=zan_default_delegate_invoke")
+#define ZAN_DELEGATE_HOOK(op) void zan_default_delegate_##op
 #else
-    return 1;
+#define ZAN_DELEGATE_HOOK(op) __attribute__((weak)) void zan_backend_delegate_##op
 #endif
-}
 
-static void zan_thread_invoke(void *body) {
+ZAN_DELEGATE_HOOK(invoke)(void *body) {
+    if (!body) return;
     void *rec = zan_delegate_record(body);
     if (!rec) {
         ((zan_thread_body_fn)body)();
@@ -32,14 +29,7 @@ static void zan_thread_invoke(void *body) {
     }
     void **slots = (void **)rec;
     void (*fn)(void *) = (void (*)(void *))slots[0];
-    void *second = slots[1];
-    /* C 宿主闭包：slots[1] 为 dtor（代码段函数指针），调用传 rec 本身：fn(rec)
-     * 自举后端闭包：slots[1] 为 env（堆数据指针或 NULL），调用传 env：fn(env) */
-    if (zan_is_code_pointer(second)) {
-        if (fn) fn(rec);
-    } else {
-        if (fn) fn(second);
-    }
+    if (fn) fn(rec);
 }
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -54,18 +44,18 @@ void zan_thread_detach(void) {
 
 #ifdef _WIN32
 static DWORD WINAPI zan_thread_trampoline(LPVOID arg) {
-    zan_thread_invoke(arg);
-    zan_delegate_release(arg);
+    zan_backend_delegate_invoke(arg);
+    zan_backend_delegate_release(arg);
     zan_thread_detach();
     return 0;
 }
 
 int32_t zan_thread_start(void *body) {
     if (!body) return 0;
-    zan_delegate_retain(body);
+    zan_backend_delegate_retain(body);
     HANDLE h = CreateThread(NULL, 0, zan_thread_trampoline, body, 0, NULL);
     if (!h) {
-        zan_delegate_release(body);
+        zan_backend_delegate_release(body);
         return 0;
     }
     CloseHandle(h);
@@ -73,18 +63,18 @@ int32_t zan_thread_start(void *body) {
 }
 #else
 static void *zan_thread_trampoline(void *arg) {
-    zan_thread_invoke(arg);
-    zan_delegate_release(arg);
+    zan_backend_delegate_invoke(arg);
+    zan_backend_delegate_release(arg);
     zan_thread_detach();
     return NULL;
 }
 
 int32_t zan_thread_start(void *body) {
     if (!body) return 0;
-    zan_delegate_retain(body);
+    zan_backend_delegate_retain(body);
     pthread_t t;
     if (pthread_create(&t, NULL, zan_thread_trampoline, body) != 0) {
-        zan_delegate_release(body);
+        zan_backend_delegate_release(body);
         return 0;
     }
     pthread_detach(t);
@@ -362,12 +352,12 @@ void zan_ui_thread_assert(const char *msg) {
     }
 }
 
+void zan_dispatch_clear(void);
+
 void zan_dispatch_init(void) {
     zan_ui_thread_set();
-    zan_dispatch_lock();
-    g_dispatch_head = 0;
-    g_dispatch_tail = 0;
-    zan_dispatch_unlock();
+    /* Reinitialization releases queued owners outside the queue lock. */
+    zan_dispatch_clear();
 }
 
 static void *zan_delegate_record(void *d) {
@@ -376,30 +366,27 @@ static void *zan_delegate_record(void *d) {
     return (void *)(v & ~(uintptr_t)ZAN_CLOSURE_TAG);
 }
 
-static void zan_delegate_retain(void *d) {
+ZAN_DELEGATE_HOOK(retain)(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
-    void **slots = (void **)rec;
-    /* 仅 C 宿主带 ARC 头且 slots[1] 为 dtor 的闭包记录需要递增引用计数；
-     * 自举后端裸 malloc(16) 闭包无 ARC 头 */
-    if (!zan_is_code_pointer(slots[1])) return;
     volatile int64_t *rc = (volatile int64_t *)((char *)rec + ZAN_OBJ_RC_OFF);
 #ifdef _WIN32
+    if (InterlockedCompareExchange64((volatile LONG64 *)rc, 0, 0) == -1) return;
     InterlockedIncrement64((volatile LONG64 *)rc);
 #else
+    if (__atomic_load_n((int64_t *)rc, __ATOMIC_SEQ_CST) == -1) return;
     __atomic_add_fetch((int64_t *)rc, (int64_t)1, __ATOMIC_SEQ_CST);
 #endif
 }
 
-static void zan_delegate_release(void *d) {
+ZAN_DELEGATE_HOOK(release)(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
     void **slots = (void **)rec;
-    /* 仅 C 宿主闭包具有 dtor（代码指针），自举后端 slots[1] 为 env 数据指针不得调用 */
-    if (!zan_is_code_pointer(slots[1])) return;
     void *dtor = slots[1];
     if (dtor) ((void (*)(void *))dtor)(rec);
 }
+#undef ZAN_DELEGATE_HOOK
 
 /* A444 安全栏：object 槽里的堆值是不是字符串负载。
  * C 宿主的字符串，[-8] 高 32 位恒为 ZAN_STRING_TAG（"ZANS"）：静态字面量
@@ -440,7 +427,7 @@ int32_t zan_dispatch_post(void *fn) {
     if (next == g_dispatch_head && zan_dispatch_grow())
         next = (g_dispatch_tail + 1) % g_dispatch_cap;
     if (next != g_dispatch_head) {
-        zan_delegate_retain(fn);
+        zan_backend_delegate_retain(fn);
         g_dispatch_ring[g_dispatch_tail] = fn;
         g_dispatch_tail = next;
         ok = 1;
@@ -483,7 +470,7 @@ void zan_dispatch_clear(void) {
             g_dispatch_tail = 0;
         }
         zan_dispatch_unlock();
-        for (int i = 0; i < n; i++) zan_delegate_release(drop[i]);
+        for (int i = 0; i < n; i++) zan_backend_delegate_release(drop[i]);
         if (n < (int)(sizeof drop / sizeof *drop)) return;
     }
 }

@@ -1,0 +1,126 @@
+using System;
+
+class PropertyBindingPayload {
+    public int value;
+}
+
+class PropertyBindingModel {
+    public int backing = 11;
+    public int ordinary = 31;
+    public readonly int locked = 61;
+    public readonly string lockedText = "locked:" + 9.ToString();
+    public int gets;
+    public int sets;
+    public string text = "seed";
+    public int textGets;
+    public int textSets;
+    public PropertyBindingPayload payload = new PropertyBindingPayload();
+    public int payloadGets;
+    public int payloadSets;
+    public Binding<int> self;
+
+    public int Value {
+        get { gets = gets + 1; return backing + 100; }
+        set { sets = sets + 1; backing = value - 100; }
+    }
+    public string Text {
+        get { textGets = textGets + 1; return text + ":read"; }
+        set { textSets = textSets + 1; text = value + ":stored"; }
+    }
+    public PropertyBindingPayload Payload {
+        get { payloadGets = payloadGets + 1; return payload; }
+        set { payloadSets = payloadSets + 1; payload = value; }
+    }
+    public int ReadOnly { get { gets = gets + 1; return backing + 200; } }
+    public int InitOnly { get; init; }
+    public void BindSelf() { self = Value; }
+}
+
+class ReadonlyConstructorBindingModel {
+    public readonly int Value;
+    public Binding<int> Exported;
+    public ReadonlyConstructorBindingModel() {
+        Value = 71;
+        Exported = Value;
+    }
+}
+
+class PropertyBindingIrTest {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+    static PropertyBindingModel MakeModel() {
+        return new PropertyBindingModel();
+    }
+    static void SelfCycle() {
+        PropertyBindingModel model = new PropertyBindingModel();
+        model.BindSelf();
+        model.self.Set(145);
+        Check(model.backing == 45 && model.sets == 1, "implicit custom property binding");
+    }
+    static void Main() {
+        PropertyBindingModel model = new PropertyBindingModel { InitOnly = 17 };
+        Binding<int> property = model.Value;
+        Check(property.IsLive() && model.gets == 0, "live creation must not read property");
+        Check(property.Get() == 111 && model.gets == 1, "custom getter invoked once");
+        property.Set(123);
+        Check(model.backing == 23 && model.sets == 1, "custom setter invoked once");
+        Check(property.Get() == 123 && model.gets == 2, "custom getter reads setter result");
+        Binding<int> ordinary = model.ordinary;
+        Check(ordinary.IsLive() && ordinary.Get() == 31, "ordinary field getter");
+        ordinary.Set(44);
+        Check(model.ordinary == 44 && model.sets == 1, "ordinary field setter");
+
+        Binding<string> text = model.Text;
+        Check(model.textGets == 0 && text.IsLive(), "string binding creation");
+        for (int i = 0; i < 8; i = i + 1) {
+            string incoming = "value:" + i.ToString();
+            text.Set(incoming);
+            string result = text.Get();
+            Check(result == incoming + ":stored:read", "owned string getter result and borrowed setter value");
+            Check(incoming == "value:" + i.ToString(), "setter leaves caller string alive");
+        }
+        Check(model.textGets == 8 && model.textSets == 8, "string accessor side effects");
+
+        Binding<PropertyBindingPayload> payload = model.Payload;
+        Check(payload.IsLive() && model.payloadGets == 0, "object binding creation");
+        for (int i = 0; i < 8; i = i + 1) {
+            PropertyBindingPayload incoming = new PropertyBindingPayload();
+            incoming.value = i + 50;
+            payload.Set(incoming);
+            PropertyBindingPayload result = payload.Get();
+            Check(result == incoming && result.value == i + 50, "owned object getter and borrowed setter");
+            Check(incoming.value == i + 50, "setter leaves caller object alive");
+        }
+        Check(model.payloadGets == 8 && model.payloadSets == 8, "object accessor side effects");
+
+        ReadonlyConstructorBindingModel constructor = new ReadonlyConstructorBindingModel();
+        Check(!constructor.Exported.IsLive() && constructor.Exported.Get() == 71, "constructor cannot export readonly write access");
+        constructor.Exported.Set(72);
+        Check(constructor.Value == 71, "escaped constructor binding stays a snapshot");
+        Binding<int> locked = model.locked;
+        Check(!locked.IsLive() && locked.Get() == 61, "readonly field snapshot");
+        locked.Set(62);
+        Check(model.locked == 61 && locked.Get() == 62, "readonly field cannot export writable alias");
+        Binding<string> lockedText = model.lockedText;
+        Check(!lockedText.IsLive() && lockedText.Get() == "locked:9", "readonly string snapshot ownership");
+        lockedText.Set("changed");
+        Check(model.lockedText == "locked:9", "readonly string field cannot be written");
+
+        int before = model.gets;
+        Binding<int> readOnly = model.ReadOnly;
+        Check(!readOnly.IsLive() && model.gets == before + 1, "getter-only snapshot evaluates once");
+        readOnly.Set(999);
+        Check(readOnly.Get() == 999 && model.backing == 23 && model.gets == before + 1, "getter-only Set changes snapshot");
+        Binding<int> initOnly = model.InitOnly;
+        Check(!initOnly.IsLive() && initOnly.Get() == 17, "init-only snapshot");
+        initOnly.Set(99);
+        Check(model.InitOnly == 17 && initOnly.Get() == 99, "init-only Set changes snapshot");
+        Binding<int> rvalue = model.backing + 7;
+        Check(!rvalue.IsLive() && rvalue.Get() == 30, "ordinary rvalue snapshot");
+        Binding<string> temporary = MakeModel().Text;
+        Check(!temporary.IsLive() && temporary.Get() == "seed:read", "owned receiver custom property snapshot");
+        SelfCycle();
+        Console.WriteLine("BINDING_CUSTOM_PROPERTY_IR_OK");
+    }
+}

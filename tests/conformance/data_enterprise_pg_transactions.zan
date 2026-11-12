@@ -1,0 +1,110 @@
+using System;
+using System.Text;
+using System.Threading;
+using System.Net.Sockets;
+using System.Data;
+using System.Data.Postgres;
+
+class Program {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static byte[] Exact(nint sock, int count) {
+        byte[] result = new byte[count + 1];
+        int at = 0;
+        while (at < count) {
+            byte[] part = new byte[count - at + 1];
+            int n = Socket.Recv(sock, part, count - at);
+            Check(n > 0, "truncated frontend frame");
+            for (int i = 0; i < n; i = i + 1) { result[at + i] = part[i]; }
+            at = at + n;
+        }
+        return result;
+    }
+
+    static int Length(byte[] hdr, int offset) {
+        return ((hdr[offset] & 255) << 24) | ((hdr[offset + 1] & 255) << 16)
+            | ((hdr[offset + 2] & 255) << 8) | (hdr[offset + 3] & 255);
+    }
+
+    // Binary frames carry explicit lengths; string helpers truncate at NUL.
+    static void Send(nint sock, int type, byte[] payload, int count) {
+        byte[] frame = new byte[count + 6];
+        int size = count + 4;
+        frame[0] = (byte)type;
+        frame[1] = (byte)((size >> 24) & 255);
+        frame[2] = (byte)((size >> 16) & 255);
+        frame[3] = (byte)((size >> 8) & 255);
+        frame[4] = (byte)(size & 255);
+        for (int i = 0; i < count; i = i + 1) { frame[i + 5] = payload[i]; }
+        int at = 0;
+        while (at < count + 5) {
+            int remain = count + 5 - at;
+            byte[] rest = new byte[remain + 1];
+            for (int i = 0; i < remain; i = i + 1) { rest[i] = frame[at + i]; }
+            int n = Socket.Send(sock, rest, remain);
+            Check(n > 0, "backend send failed");
+            at = at + n;
+        }
+    }
+
+    static void Session(nint peer) {
+        byte[] hdr = Program.Exact(peer, 4);
+        byte[] startup = Program.Exact(peer, Program.Length(hdr, 0) - 4);
+        byte[] auth = new byte[5];
+        Program.Send(peer, 82, auth, 4);
+        byte[] state = new byte[2];
+        state[0] = 73;
+        Program.Send(peer, 90, state, 1);
+        for (int i = 0; i < 3; i = i + 1) {
+            byte[] qhdr = Program.Exact(peer, 5);
+            byte[] query = Program.Exact(peer, Program.Length(qhdr, 1) - 4);
+            string tag = i == 0 ? "BEGIN" : "ROLLBACK";
+            byte[] text = new byte[tag.Length + 2];
+            for (int j = 0; j < tag.Length; j = j + 1) { text[j] = (byte)tag[j]; }
+            Program.Send(peer, 67, text, tag.Length + 1);
+            state[0] = i == 0 ? (byte)84 : (byte)73;
+            Program.Send(peer, 90, state, 1);
+        }
+    }
+
+    static void Server(nint listener) {
+        try {
+            for (int i = 0; i < 2; i = i + 1) {
+                nint peer = Socket.Accept(listener);
+                Check(peer >= 0, "accept failed");
+                try { Program.Session(peer); }
+                finally { Socket.Close(peer); }
+            }
+        } finally { Socket.Close(listener); }
+    }
+
+    static async void Main() {
+        Socket.Initialize();
+        nint listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Check(Socket.Bind(listener, "127.0.0.1", 19643) == 0, "bind failed");
+        Check(Socket.Listen(listener, 1) == 0, "listen failed");
+        Thread.Start(() => { Program.Server(listener); });
+        PgConnection db = PgConnection.Open("host=127.0.0.1 port=19643 dbname=safety user=safety sslmode=disable");
+        Check(db.IsConnected(), "PG connect failed");
+        db.BeginTransaction();
+        Check(db.inTxn, "sync BEGIN state");
+        bool rejected = false;
+        try { db.Commit(); } catch (DbException) { rejected = true; }
+        Check(rejected && !db.inTxn && db.GetError().Contains("ROLLBACK"), "sync aborted COMMIT accepted");
+        db.Rollback();
+        Check(!db.inTxn, "sync rollback state");
+        db.Close();
+        db = await PgConnection.OpenAsync("host=127.0.0.1 port=19643 dbname=safety user=safety sslmode=disable");
+        Check(db.IsConnected(), "async PG connect failed");
+        Check(await db.BeginTransactionAsync() && db.inTxn, "async BEGIN state");
+        rejected = false;
+        try { await db.CommitAsync(); } catch (DbException) { rejected = true; }
+        Check(rejected && !db.inTxn && db.GetError().Contains("ROLLBACK"), "async aborted COMMIT accepted");
+        Check(await db.RollbackAsync() && !db.inTxn, "async rollback state");
+        db.Close();
+        Console.WriteLine("PostgreSQL aborted COMMIT rejected in sync and async transactions");
+    }
+}

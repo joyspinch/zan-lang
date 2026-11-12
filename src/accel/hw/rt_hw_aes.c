@@ -484,7 +484,7 @@ int64_t zan_hw_aes_cbc_encrypt(const uint8_t *in, int64_t len,
     if (len < 0 || !in || !key || !iv || !out) return -1;
     if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+    if (zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) {
         return zan_aes_cbc_encrypt_ni(in, len, key, keybits, iv, out);
     }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
@@ -501,7 +501,7 @@ int64_t zan_hw_aes_cbc_decrypt(const uint8_t *in, int64_t len,
     if (len <= 0 || !in || !key || !iv || !out) return -1;
     if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+    if (zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) {
         return zan_aes_cbc_decrypt_ni(in, len, key, keybits, iv, out);
     }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
@@ -517,7 +517,7 @@ int64_t zan_hw_aes_ecb_block(const uint8_t *key, int keybits,
     if (!key || !in16 || !out16) return -1;
     if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+    if (zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) {
         return zan_aes_ecb_block_ni(key, keybits, in16, out16);
     }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
@@ -534,7 +534,7 @@ int64_t zan_hw_aes_ctr_crypt(const uint8_t *in, int64_t len,
     if (len < 0 || !in || !key || !counter16 || !out) return -1;
     if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+    if (zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) {
         return zan_aes_ctr_ni(in, len, key, keybits, counter16, out);
     }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
@@ -859,7 +859,7 @@ static inline void zan_hw_aes_imc_ni(const void *val, void *out) {
 }
 
 void zan_hw_aes_encrypt(const void *val, const void *key, void *out) {
-    if (zan_hw_has_aesni()) {
+    if (zan_hw_x86_can(ZAN_HW_REQ_AES)) {
         zan_hw_aes_encrypt_ni(val, key, out);
     } else {
         zan_aes_encrypt_round_soft(val, key, out, 1);
@@ -867,7 +867,7 @@ void zan_hw_aes_encrypt(const void *val, const void *key, void *out) {
 }
 
 void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out) {
-    if (zan_hw_has_aesni()) {
+    if (zan_hw_x86_can(ZAN_HW_REQ_AES)) {
         zan_hw_aes_encrypt_last_ni(val, key, out);
     } else {
         zan_aes_encrypt_round_soft(val, key, out, 0);
@@ -875,7 +875,7 @@ void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out) {
 }
 
 void zan_hw_aes_decrypt(const void *val, const void *key, void *out) {
-    if (zan_hw_has_aesni()) {
+    if (zan_hw_x86_can(ZAN_HW_REQ_AES)) {
         zan_hw_aes_decrypt_ni(val, key, out);
     } else {
         zan_aes_decrypt_round_soft(val, key, out, 1);
@@ -883,7 +883,7 @@ void zan_hw_aes_decrypt(const void *val, const void *key, void *out) {
 }
 
 void zan_hw_aes_decrypt_last(const void *val, const void *key, void *out) {
-    if (zan_hw_has_aesni()) {
+    if (zan_hw_x86_can(ZAN_HW_REQ_AES)) {
         zan_hw_aes_decrypt_last_ni(val, key, out);
     } else {
         zan_aes_decrypt_round_soft(val, key, out, 0);
@@ -891,7 +891,7 @@ void zan_hw_aes_decrypt_last(const void *val, const void *key, void *out) {
 }
 
 void zan_hw_aes_keygenassist(const void *val, uint8_t rcon, void *out) {
-    if (zan_hw_has_aesni()) {
+    if (zan_hw_x86_can(ZAN_HW_REQ_AES)) {
         zan_hw_aes_keygenassist_ni(val, rcon, out);
     } else {
         zan_aes_keygenassist_soft(val, rcon, out);
@@ -899,7 +899,7 @@ void zan_hw_aes_keygenassist(const void *val, uint8_t rcon, void *out) {
 }
 
 void zan_hw_aes_imc(const void *val, void *out) {
-    if (zan_hw_has_aesni()) {
+    if (zan_hw_x86_can(ZAN_HW_REQ_AES)) {
         zan_hw_aes_imc_ni(val, out);
     } else {
         zan_aes_imc_soft(val, out);

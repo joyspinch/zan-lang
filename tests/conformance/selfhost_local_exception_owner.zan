@@ -1,0 +1,226 @@
+using System;
+
+public delegate int LocalOwnerRead();
+class LocalOwnerValue {
+    public int value;
+    public LocalOwnerValue(int n) { value = n; }
+    public int Read() { return value; }
+}
+class Program {
+    static WeakReference<LocalOwnerValue> watch;
+    static WeakReference<LocalOwnerValue> oldWatch;
+    static WeakReference<Exception> exceptionWatch;
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+        Console.WriteLine(label);
+    }
+    static void Fail() { throw new Exception("failure"); }
+    static LocalOwnerRead Capture(LocalOwnerValue value) { return () => value.Read(); }
+    static void Callee() {
+        LocalOwnerValue local = new LocalOwnerValue(1);
+        oldWatch = new WeakReference<LocalOwnerValue>(local);
+        local = new LocalOwnerValue(2);
+        watch = new WeakReference<LocalOwnerValue>(local);
+        Check(!oldWatch.IsAlive, "overwrite");
+        Fail();
+    }
+    static void SameFrame() {
+        LocalOwnerValue outer = new LocalOwnerValue(7);
+        try {
+            LocalOwnerValue local = new LocalOwnerValue(3);
+            watch = new WeakReference<LocalOwnerValue>(local);
+            Fail();
+        } catch (Exception caught) {
+            Check(!watch.IsAlive && caught.Message == "failure", "same-frame");
+        }
+        Check(outer.Read() == 7, "outer-survives");
+        try { Callee(); } catch { Check(!watch.IsAlive, "cross-frame"); }
+    }
+    static void EmptyAndLoop() {
+        int i = 0;
+        while (i < 3) {
+            try {
+                LocalOwnerValue empty;
+                LocalOwnerValue local = new LocalOwnerValue(i);
+                watch = new WeakReference<LocalOwnerValue>(local);
+                if (i == 0) { i = i + 1; continue; }
+                Fail();
+            } catch { Check(!watch.IsAlive, "loop-unwind"); }
+            i = i + 1;
+        }
+        Check(!watch.IsAlive, "loop-retired");
+    }
+    static void CellCallee() {
+        LocalOwnerValue value = new LocalOwnerValue(8);
+        watch = new WeakReference<LocalOwnerValue>(value);
+        LocalOwnerRead read = () => value.Read();
+        Check(read() == 8, "cell-readable");
+        Fail();
+    }
+    static void DelegateCallee() {
+        LocalOwnerValue value = new LocalOwnerValue(9);
+        watch = new WeakReference<LocalOwnerValue>(value);
+        LocalOwnerRead read = Capture(value);
+        value = null;
+        Check(read() == 9, "delegate-readable");
+        Fail();
+    }
+    static void ArrayCallee() {
+        LocalOwnerValue value = new LocalOwnerValue(10);
+        watch = new WeakReference<LocalOwnerValue>(value);
+        LocalOwnerValue[] items = new LocalOwnerValue[] { value };
+        value = null;
+        Check(items[0].Read() == 10, "array-readable");
+        Fail();
+    }
+    static LocalOwnerValue Returned() {
+        LocalOwnerValue value = new LocalOwnerValue(11);
+        watch = new WeakReference<LocalOwnerValue>(value);
+        try { return value; } finally { Check(watch.IsAlive, "return-protected"); }
+    }
+    static void ThrowLocal() {
+        Exception value = new Exception("local");
+        exceptionWatch = new WeakReference<Exception>(value);
+        throw value;
+    }
+    static void Parameter(LocalOwnerValue value) { Fail(); }
+    static void ParameterCaller() {
+        LocalOwnerValue value = new LocalOwnerValue(12);
+        watch = new WeakReference<LocalOwnerValue>(value);
+        Parameter(value);
+    }
+    static bool Reject(LocalOwnerValue value) { return value.Read() < 0; }
+    static LocalOwnerValue SelectPattern(LocalOwnerValue value) {
+        return value switch {
+            LocalOwnerValue rejected when Reject(rejected) => rejected,
+            LocalOwnerValue accepted => accepted
+        };
+    }
+    static void PatternScopes() {
+        {
+            LocalOwnerValue value = new LocalOwnerValue(42);
+            watch = new WeakReference<LocalOwnerValue>(value);
+            switch (value) {
+                case LocalOwnerValue rejected when Reject(rejected):
+                    Check(false, "unexpected-guard");
+                    break;
+                case LocalOwnerValue accepted:
+                    Check(accepted.Read() == 42, "pattern-guard-next");
+                    break;
+            }
+            LocalOwnerValue selected = SelectPattern(value);
+            Check(selected.Read() == 42, "pattern-result-readable");
+        }
+        Check(!watch.IsAlive, "pattern-bindings-released");
+    }
+    static LocalOwnerValue FreshArgument() {
+        LocalOwnerValue value = new LocalOwnerValue(47);
+        watch = new WeakReference<LocalOwnerValue>(value);
+        return value;
+    }
+    static async int ConsumeArgument(LocalOwnerValue value) {
+        await Task.Yield();
+        Check(watch.IsAlive, "await-argument-alive");
+        return value.Read();
+    }
+    static async void AwaitedArgument() {
+        int result = await ConsumeArgument(FreshArgument());
+        Check(result == 47 && !watch.IsAlive, "await-argument-released");
+    }
+    static async LocalOwnerValue AwaitedValue() {
+        await Task.Yield();
+        return new LocalOwnerValue(43);
+    }
+    static async void AwaitedCell() {
+        {
+            LocalOwnerValue value = await AwaitedValue();
+            watch = new WeakReference<LocalOwnerValue>(value);
+            LocalOwnerRead read = () => value.Read();
+            await Task.Yield();
+            Check(read() == 43, "await-cell-readable");
+        }
+        Check(!watch.IsAlive, "await-cell-released");
+    }
+    static void QueryOwners() {
+        {
+            LocalOwnerValue value = new LocalOwnerValue(30);
+            watch = new WeakReference<LocalOwnerValue>(value);
+            List<LocalOwnerValue> values = new List<LocalOwnerValue> { value };
+            List<int> selected = from item in values select item.Read();
+            Check(selected[0] == 30 && value.Read() == 30, "query-readable");
+        }
+        Check(!watch.IsAlive, "query-released");
+        try { Fail(); } catch { Check(!watch.IsAlive, "query-owner-retired"); }
+    }
+    static async void AsyncForeach() {
+        try {
+            LocalOwnerValue value = new LocalOwnerValue(31);
+            watch = new WeakReference<LocalOwnerValue>(value);
+            LocalOwnerValue[] items = new LocalOwnerValue[] { value };
+            value = null;
+            foreach (LocalOwnerValue item in items) {
+                await Task.Yield();
+                Check(item.Read() == 31, "async-foreach-readable");
+                Fail();
+            }
+        } catch { Check(!watch.IsAlive, "async-foreach-released"); }
+    }
+    static async void AsyncLocals() {
+        LocalOwnerValue outer = new LocalOwnerValue(20);
+        try {
+            LocalOwnerValue local = new LocalOwnerValue(21);
+            watch = new WeakReference<LocalOwnerValue>(local);
+            await Task.Yield();
+            local = new LocalOwnerValue(22);
+            watch.SetTarget(local);
+            Fail();
+        } catch (Exception caught) {
+            Check(!watch.IsAlive && caught.Message == "failure", "async-same-frame");
+        }
+        Check(outer.Read() == 20, "async-outer-survives");
+        await Task.Yield();
+        try { Callee(); } catch { Check(!watch.IsAlive, "async-sync-callee"); }
+        {
+            LocalOwnerValue captured = new LocalOwnerValue(23);
+            watch.SetTarget(captured);
+            LocalOwnerRead read = () => captured.Read();
+            try {
+                await Task.Yield();
+                Check(read() == 23, "async-cell-readable");
+                Fail();
+            } catch { Check(watch.IsAlive, "async-cell-outer-survives"); }
+        }
+        Check(!watch.IsAlive, "async-cell-released");
+    }
+    static async void AsyncEscapes() {
+        LocalOwnerValue local = new LocalOwnerValue(24);
+        watch = new WeakReference<LocalOwnerValue>(local);
+        await Task.Yield();
+        Fail();
+    }
+    static void Main() {
+        SameFrame();
+        EmptyAndLoop();
+        try { CellCallee(); } catch { Check(!watch.IsAlive, "cell-released"); }
+        try { DelegateCallee(); } catch { Check(!watch.IsAlive, "delegate-released"); }
+        try { ArrayCallee(); } catch { Check(!watch.IsAlive, "array-released"); }
+        {
+            LocalOwnerValue value = Returned();
+            Check(value.Read() == 11 && watch.IsAlive, "return-readable");
+        }
+        Check(!watch.IsAlive, "return-released");
+        try { ThrowLocal(); } catch (Exception caught) {
+            Check(caught.Message == "local" && exceptionWatch.IsAlive, "throw-local-alive");
+        }
+        Check(!exceptionWatch.IsAlive, "throw-local-released");
+        try { ParameterCaller(); } catch { Check(!watch.IsAlive, "parameters-released"); }
+        await AsyncLocals();
+        try { await AsyncEscapes(); } catch { Check(!watch.IsAlive, "async-frame-released"); }
+        QueryOwners();
+        await AsyncForeach();
+        PatternScopes();
+        try { Fail(); } catch { Check(true, "pattern-owner-retired"); }
+        await AwaitedCell();
+        await AwaitedArgument();
+    }
+}

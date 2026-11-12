@@ -330,6 +330,23 @@ int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
         return 1;
     }
     int ehk = eh_slot_kind_of(at);
+    if (ehk == ZAN_EH_SLOT_OBJ) {
+        /* Erased delegate tags must not be interpreted as EH kind bits.
+         * Each branch pushes one entry for the caller's single pop. */
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        LLVMBasicBlockRef dlg = LLVMAppendBasicBlockInContext(g->ctx, fn, "arg.edlg");
+        LLVMBasicBlockRef obj = LLVMAppendBasicBlockInContext(g->ctx, fn, "arg.eobj");
+        LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "arg.eend");
+        LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, val), dlg, obj);
+        LLVMPositionBuilderAtEnd(g->builder, dlg);
+        emit_eh_tmp_push_slot(g, val, ZAN_EH_SLOT_DLG);
+        LLVMBuildBr(g->builder, done);
+        LLVMPositionBuilderAtEnd(g->builder, obj);
+        emit_eh_tmp_push(g, val);
+        LLVMBuildBr(g->builder, done);
+        LLVMPositionBuilderAtEnd(g->builder, done);
+        return 1;
+    }
     if (ehk != ZAN_EH_SLOT_OBJ) {
         emit_eh_tmp_push_slot(g, val, ehk);
     } else {

@@ -21,8 +21,13 @@ LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMPointerType(st, 0), g->current_this, "this");
                     zan_type_t *rct = g->cur_inst ? g->cur_inst
                                                   : g->current_type_sym->type;
+                    /* Cleanup describes the receiver, not the owned getter
+                     * result: implicit this is borrowed just like this.Prop. */
+                    zan_ast_node_t receiver = {0};
+                    receiver.kind = AST_THIS_EXPR;
+                    receiver.loc = expr->loc;
                     return emit_property_getter_call(g, getter, rct, this_ptr,
-                                                     expr, locals);
+                                                     &receiver, locals);
                 }
                 LLVMTypeRef st = get_struct_llvm_type(g, g->current_type_sym);
                 if (st) {
@@ -46,7 +51,7 @@ LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_symbol_t *getter = property_getter_sym(g, fsym);
             if (getter) {
                 return emit_property_getter_call(g, getter,
-                    g->current_type_sym->type, NULL, expr, locals);
+                    g->current_type_sym->type, NULL, NULL, locals);
             }
             LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fsym, NULL);
             if (gv) {
@@ -182,6 +187,21 @@ LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
                                          LLVMValueRef left,
                                          LLVMValueRef right) {
     type = concretize(g, type);
+    if (type && type->kind == TYPE_DECIMAL) {
+        LLVMTypeRef dt = get_decimal_type(g);
+        LLVMTypeRef dp = LLVMPointerType(dt, 0);
+        LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+        LLVMValueRef lp = emit_entry_alloca(g, dt, "eq.dec.l");
+        LLVMValueRef rp = emit_entry_alloca(g, dt, "eq.dec.r");
+        LLVMBuildStore(g->builder, coerce_to_decimal(g, left), lp);
+        LLVMBuildStore(g->builder, coerce_to_decimal(g, right), rp);
+        LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ dp, dp }, 2, 0);
+        LLVMValueRef fn = get_libc_fn(g, "__zan_decimal_cmp", ft);
+        LLVMValueRef cmp = zan_call2(g->builder, ft, fn,
+            (LLVMValueRef[]){ lp, rp }, 2, "eq.dec.cmp");
+        return zan_icmp(g->builder, LLVMIntEQ, cmp,
+            LLVMConstInt(i32, 0, 0), "eq.dec");
+    }
     if (type && type->sym &&
         (type->kind == TYPE_CLASS || type->kind == TYPE_STRUCT)) {
         zan_istr_t name = {(char *)"op_eq", 5};

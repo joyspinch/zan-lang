@@ -1,0 +1,127 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+
+namespace System.Data.ZanDb;
+
+class BackupFault : BackupPersistence {
+    public string failSuffix = "";
+    public string failBoundary = "";
+    public bool fired = false;
+    public bool after = false;
+    public List<string> events = new List<string>();
+
+    internal override void SyncFile(string path) {
+        this.events.Add(path);
+        bool fail = !this.fired && this.failSuffix != "" && path.EndsWith(this.failSuffix);
+        if (fail && !this.after) {
+            this.fired = true;
+            throw new IOException("injected backup file sync failure");
+        }
+        base.SyncFile(path);
+        if (fail && this.after) {
+            this.fired = true;
+            throw new IOException("injected backup file sync failure after barrier");
+        }
+    }
+
+    internal override void SyncDirectory(string path, string boundary) {
+        this.events.Add(boundary);
+        bool fail = !this.fired && this.failBoundary == boundary;
+        if (fail && !this.after) {
+            this.fired = true;
+            throw new IOException("injected backup directory sync failure");
+        }
+        base.SyncDirectory(path, boundary);
+        if (fail && this.after) {
+            this.fired = true;
+            throw new IOException("injected backup directory sync failure after barrier");
+        }
+    }
+}
+
+class Program {
+    static void Require(bool ok, string name) {
+        if (!ok) { throw new Exception(name); }
+    }
+
+    static void Before(List<string> events, string earlier, string later) {
+        Require(events.Contains(earlier) && events.Contains(later), "backup ordering events present");
+        Require(events.LastIndexOf(earlier) < events.IndexOf(later), "backup dependency synchronized before publication");
+    }
+
+    static void Missing(string target) {
+        Require(!File.Exists(target) && !File.Exists(target + ".lock") && !File.Exists(target + ".m0") && !File.Exists(target + ".m1"), "failed backup KV removed");
+        Require(!File.Exists(target + ".s0") && !File.Exists(target + ".rows.ztab") && !File.Exists(target + ".rows.zblob") && !File.Exists(target + ".rows.zwal") && !File.Exists(target + ".rows.zidx"), "failed backup data removed");
+    }
+
+    static void Main() {
+        string root = Path.GetFullPath("_scratch/conf_zandb_backup_persistence");
+        Require(!Directory.Exists(root) && !File.Exists(root) && !File.IsReparsePoint(root), "owned fixture absent");
+        Directory.CreateDirectoryRecursive(root);
+        ZanDatabase db = null;
+        try {
+            string source = root + "/source";
+            RecordSchema schema = new RecordSchema();
+            schema.AddInt32("value");
+            RecordTable table = RecordTable.Open(source, "rows", schema);
+            RecordRow row = table.NewRow();
+            row.SetInt32("value", 42);
+            table.Add(row);
+            table.Close();
+            db = ZanDatabase.Open(source, ZanStore.DUR_SYNC);
+            db.Kv().Put("kept", "source");
+            db.GetRecordTable("rows");
+            for (int i = 0; i < 14; i = i + 1) {
+                string target = root + "/failed-" + Convert.ToString(i);
+                BackupFault fault = new BackupFault();
+                fault.after = i >= 7;
+                int boundary = i % 7;
+                if (boundary == 0) { fault.failSuffix = ".s0"; }
+                if (boundary == 1) { fault.failSuffix = ".rows.zblob"; }
+                if (boundary == 2) { fault.failBoundary = "backup-files"; }
+                if (boundary == 3) { fault.failBoundary = "backup-manifests"; }
+                if (boundary == 4) { fault.failBoundary = "backup-store-verified"; }
+                if (boundary == 5) { fault.failBoundary = "backup-sidecars"; }
+                if (boundary == 6) { fault.failBoundary = "backup-verified"; }
+                bool failed = false;
+                try { db.BackupLockedWithPersistence(target, fault); }
+                catch (IOException ex) { failed = true; }
+                Require(failed && fault.fired, "backup reports sync failure");
+                Missing(target);
+                Require(db.IsOpen() && db.Kv().Get("kept") == "source", "backup failure leaves source usable");
+            }
+            string blocked = root + "/blocked";
+            Directory.CreateDirectory(blocked + ".rows.ztab");
+            bool blockedFailed = false;
+            try { db.Backup(blocked); }
+            catch (IOException ex) { blockedFailed = true; }
+            Require(blockedFailed, "sidecar copy exception propagated");
+            Missing(blocked);
+            Require(Directory.Exists(blocked + ".rows.ztab"), "caller obstruction retained");
+            string good = Path.Normalize(root + "/nested/export");
+            BackupFault normal = new BackupFault();
+            db.BackupLockedWithPersistence(good, normal);
+            Before(normal.events, good + ".s0", "backup-files");
+            Before(normal.events, "backup-files", "backup-manifests");
+            Before(normal.events, "backup-manifests", "backup-store-verified");
+            Before(normal.events, "backup-store-verified", "backup-sidecars");
+            Before(normal.events, "backup-sidecars", "backup-verified");
+            Before(normal.events, good + ".rows.zblob", "backup-verified");
+            Before(normal.events, good + ".rows.ztab", "backup-verified");
+            Before(normal.events, good + ".rows.zwal", "backup-verified");
+            ZanDatabase copy = ZanDatabase.Open(good, ZanStore.DUR_SYNC);
+            try {
+                Require(copy.IsOpen() && copy.Kv().Get("kept") == "source", "normal backup reopened");
+                Require(copy.GetRecordTable("rows").Count() == 1, "normal backup record preserved");
+            } finally { copy.Close(); }
+            db.Close();
+            db = null;
+            Console.WriteLine("PASS zandb_backup_persistence");
+        } finally {
+            if (db != null) { db.Close(); }
+            Directory.DeleteRecursive(root);
+        }
+    }
+}

@@ -1,0 +1,367 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Data.ZanDb;
+namespace System.Data.ZanDb;
+
+class ZanDbRecordIoFailures {
+    static int checks = 0;
+
+    static void Ok(bool condition, string label) {
+        checks = checks + 1;
+        if (!condition) { throw new InvalidOperationException("FAIL " + label); }
+        Console.WriteLine("ok " + Convert.ToString(checks) + " - " + label);
+    }
+
+    static string Root() { return "_scratch/conf_zandb_record_io"; }
+
+    static void Clean(string path) {
+        string[] suffixes = new string[] { ".rows.ztab", ".rows.zblob", ".rows.zidx", ".rows.zwal" };
+        for (int i = 0; i < suffixes.Length; i = i + 1) {
+            if (File.Exists(path + suffixes[i])) { File.Delete(path + suffixes[i]); }
+        }
+    }
+
+    static RecordRow Row(RecordTable rt, int value) {
+        RecordRow row = rt.NewRow();
+        row.SetInt32("value", value);
+        return row;
+    }
+
+    static RecordTable Create(string path) {
+        Clean(path);
+        RecordSchema schema = new RecordSchema();
+        schema.AddInt32("value");
+        RecordTable rt = RecordTable.Open(path, "rows", schema);
+        rt.Add(ZanDbRecordIoFailures.Row(rt, 10));
+        rt.EnsureIndex("value");
+        rt.Flush();
+        return rt;
+    }
+
+    static bool Same(byte[] a, byte[] b) {
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) { if (a[i] != b[i]) { return false; } }
+        return true;
+    }
+
+    static void Released(RecordTable rt) {
+        Ok(!rt.IsOpen() && !rt.file.IsOpen() && !rt.blobFile.IsOpen()
+            && !rt.walFile.IsOpen() && rt.ioMtx == 0, "all handles and mutex released");
+        rt.Close();
+    }
+
+    static void ClosedWal(int operation) {
+        string path = ZanDbRecordIoFailures.Root() + "/closed-" + Convert.ToString(operation);
+        RecordTable rt = ZanDbRecordIoFailures.Create(path);
+        byte[] before = File.ReadAllBytes(rt.tabPath);
+        long valid = rt.walValidSize;
+        if (operation == 1) {
+            rt.BeginTransaction();
+            rt.Add(ZanDbRecordIoFailures.Row(rt, 20));
+        }
+        rt.walFile.Close();
+        bool threw = false;
+        try {
+            if (operation == 0) { rt.Add(ZanDbRecordIoFailures.Row(rt, 20)); }
+            else if (operation == 1) { rt.Commit(); }
+            else if (operation == 2) { rt.Update(1, ZanDbRecordIoFailures.Row(rt, 20)); }
+            else if (operation == 3) { rt.Delete(1); }
+            else {
+                List<RecordRow> rows = new List<RecordRow>();
+                rows.Add(ZanDbRecordIoFailures.Row(rt, 20));
+                rt.AddBulk(rows);
+            }
+        } catch (IOException ex) { threw = true; }
+        Ok(threw && !rt.IsOpen() && rt.GetError() != "" && rt.walValidSize == valid,
+            "closed WAL rejects operation " + Convert.ToString(operation));
+        if (operation == 2 || operation == 3) {
+            Ok(rt.indexes["value"][RecordTable.FormatIntKey(10)].Count == 1 && !rt.tombstones.ContainsKey(1),
+                "failed update or delete preserves index and tombstone");
+        }
+        rt.Close();
+        ZanDbRecordIoFailures.Released(rt);
+        Ok(ZanDbRecordIoFailures.Same(before, File.ReadAllBytes(rt.tabPath)), "failed WAL leaves table unchanged");
+        RecordTable reopened = RecordTable.Open(path, "rows");
+        RecordRow kept = reopened.Get(1);
+        Ok(reopened.IsOpen() && reopened.Count() == 1 && kept != null && kept.GetInt32("value") == 10,
+            "prior checkpoint reopens intact");
+        reopened.Close();
+        ZanDbRecordIoFailures.Clean(path);
+    }
+
+    static void Boundary(string boundary, bool closeDirectly) {
+        string path = ZanDbRecordIoFailures.Root() + "/" + boundary + (closeDirectly ? "-close" : "-flush");
+        RecordTable rt = ZanDbRecordIoFailures.Create(path);
+        rt.Add(ZanDbRecordIoFailures.Row(rt, 20));
+        long valid = rt.walValidSize;
+        byte[] before = File.ReadAllBytes(rt.walPath);
+        PageFile victim = rt.walFile;
+        if (boundary == "table-sync") { victim = rt.file; }
+        if (boundary == "blob-sync") { victim = rt.blobFile; }
+        int[] observed = new int[1];
+        rt.beforePersistenceIo = (RecordTable owner, string current) => {
+            if (current == boundary) { observed[0] = observed[0] + 1; victim.Close(); }
+        };
+        bool threw = false;
+        try {
+            if (boundary == "wal-append-write" || boundary == "wal-append-sync") {
+                rt.Add(ZanDbRecordIoFailures.Row(rt, 30));
+            } else if (closeDirectly) { rt.Close(); }
+            else { rt.Flush(); }
+        } catch (IOException ex) { threw = true; }
+        Ok(threw == !closeDirectly && observed[0] == 1 && !rt.IsOpen() && rt.GetError() != "" && rt.walValidSize == valid,
+            "failure reported at " + boundary + (closeDirectly ? " during close" : ""));
+        string error = rt.GetError();
+        rt.Close();
+        ZanDbRecordIoFailures.Released(rt);
+        Ok(rt.GetError() == error && observed[0] == 1, "cleanup preserves first error without retry");
+        if (boundary == "wal-append-sync") {
+            Ok(File.GetSize64(rt.tabPath) == rt.dataOffset + 2L * (long)rt.schema.rowBytes,
+                "failed append sync does not apply new row");
+        }
+        if (boundary == "table-sync" || boundary == "blob-sync" || boundary == "wal-append-write") {
+            Ok(ZanDbRecordIoFailures.Same(before, File.ReadAllBytes(rt.walPath)), "recovery WAL preserved byte for byte");
+        }
+        RecordTable reopened = RecordTable.Open(path, "rows");
+        RecordRow kept = reopened.Get(2);
+        Ok(reopened.IsOpen() && kept != null && kept.GetInt32("value") == 20,
+            "committed row recoverable after " + boundary);
+        reopened.Close();
+        ZanDbRecordIoFailures.Clean(path);
+    }
+
+    static void ActiveClose() {
+        string path = ZanDbRecordIoFailures.Root() + "/active-close";
+        RecordTable rt = ZanDbRecordIoFailures.Create(path);
+        rt.BeginTransaction();
+        rt.Add(ZanDbRecordIoFailures.Row(rt, 20));
+        bool threw = false;
+        try { rt.Flush(); } catch (InvalidOperationException ex) { threw = true; }
+        Ok(threw && rt.IsOpen(), "active transaction checkpoint rejected without poisoning handle");
+        rt.Close();
+        ZanDbRecordIoFailures.Released(rt);
+        RecordTable reopened = RecordTable.Open(path, "rows");
+        Ok(reopened.IsOpen() && reopened.Count() == 1, "close discards uncommitted transaction");
+        reopened.Close();
+        ZanDbRecordIoFailures.Clean(path);
+    }
+
+    static void ReplayFailure(string boundary) {
+        string path = ZanDbRecordIoFailures.Root() + "/" + boundary;
+        RecordTable rt = ZanDbRecordIoFailures.Create(path);
+        rt.Add(ZanDbRecordIoFailures.Row(rt, 20));
+        rt.lastError = "simulate abrupt shutdown without checkpoint";
+        rt.Close();
+        string walPath = path + ".rows.zwal";
+        if (boundary != "replay-table-write") {
+            PageFile wal = PageFile.OpenExisting(walPath);
+            byte[] torn = new byte[4];
+            torn[0] = 0xAA;
+            Ok(wal.WriteAt(File.GetSize64(walPath), (nint)torn, 4) == 4 && wal.Sync(), "prepare durable torn tail");
+            wal.Close();
+        }
+        byte[] before = File.ReadAllBytes(walPath);
+        RecordTable[] captured = new RecordTable[1];
+        int[] hits = new int[1];
+        bool threw = false;
+        try {
+            RecordTable.OpenWithPersistenceIo(path, "rows", null, (RecordTable owner, string current) => {
+                captured[0] = owner;
+                if (current == boundary) {
+                    hits[0] = hits[0] + 1;
+                    if (boundary == "replay-table-write") { owner.file.Close(); }
+                    else { owner.walFile.Close(); }
+                }
+            });
+        } catch (IOException ex) { threw = true; }
+        RecordTable failed = captured[0];
+        Ok(threw && hits[0] == 1 && failed != null && failed.GetError() != "", "open reports " + boundary);
+        ZanDbRecordIoFailures.Released(failed);
+        if (boundary != "replay-tail-sync") {
+            Ok(ZanDbRecordIoFailures.Same(before, File.ReadAllBytes(walPath)), "failed recovery preserves WAL");
+        }
+        RecordTable recovered = RecordTable.Open(path, "rows");
+        RecordRow row = recovered.Get(2);
+        Ok(recovered.IsOpen() && recovered.Count() == 2 && row != null && row.GetInt32("value") == 20,
+            "retry recovers committed row after " + boundary);
+        recovered.Close();
+        ZanDbRecordIoFailures.Clean(path);
+    }
+
+    static void CreationFailure(string boundary) {
+        string path = ZanDbRecordIoFailures.Root() + "/" + boundary;
+        ZanDbRecordIoFailures.Clean(path);
+        RecordSchema schema = new RecordSchema();
+        schema.AddInt32("value");
+        RecordTable[] captured = new RecordTable[1];
+        bool threw = false;
+        try {
+            RecordTable.OpenWithPersistenceIo(path, "rows", schema, (RecordTable owner, string current) => {
+                captured[0] = owner;
+                if (current == boundary) {
+                    if (boundary == "create-table-sync") { owner.file.Close(); }
+                    else if (boundary == "create-blob-sync") { owner.blobFile.Close(); }
+                    else if (boundary == "create-wal-sync") { owner.walFile.Close(); }
+                    else { throw new IOException("directory sync failure"); }
+                }
+            });
+        } catch (IOException ex) { threw = true; }
+        RecordTable failed = captured[0];
+        Ok(threw && failed != null && failed.GetError() != "", "creation barrier fails at " + boundary);
+        ZanDbRecordIoFailures.Released(failed);
+        Ok(File.Exists(path + ".rows.zwal"), "failed creation retains WAL file");
+        bool failedAgain = false;
+        try {
+            RecordTable.OpenWithPersistenceIo(path, "rows", null, (RecordTable owner, string current) => {
+                captured[0] = owner;
+                if (current == boundary) { throw new IOException("repeated open barrier failure"); }
+            });
+        } catch (IOException ex) { failedAgain = true; }
+        Ok(failedAgain && captured[0].GetError() != "", "retained files do not bypass repeated barrier failure");
+        ZanDbRecordIoFailures.Released(captured[0]);
+        int[] barriers = new int[1];
+        RecordTable retry = RecordTable.OpenWithPersistenceIo(path, "rows", null, (RecordTable owner, string current) => {
+            if (current == "create-directory-sync") { barriers[0] = barriers[0] + 1; }
+        });
+        Ok(retry.IsOpen() && barriers[0] == 1, "retry reconfirms retained file publication");
+        retry.Close();
+        RecordTable empty = RecordTable.Open(path, "rows");
+        Ok(empty.IsOpen() && empty.Count() == 0 && File.GetSize64(empty.tabPath) >= empty.dataOffset,
+            "empty aligned table closes and reopens");
+        empty.Close();
+        ZanDbRecordIoFailures.Clean(path);
+    }
+
+    static void BlobCommitFailure() {
+        string path = ZanDbRecordIoFailures.Root() + "/blob-commit-sync";
+        ZanDbRecordIoFailures.Clean(path);
+        RecordSchema schema = new RecordSchema();
+        schema.AddInt32("value");
+        schema.AddVarStr("note");
+        RecordTable rt = RecordTable.Open(path, "rows", schema);
+        byte[] walBefore = File.ReadAllBytes(rt.walPath);
+        PageFile blob = rt.blobFile;
+        int[] walWrites = new int[1];
+        rt.beforePersistenceIo = (RecordTable owner, string current) => {
+            if (current == "blob-commit-sync") { blob.Close(); }
+            if (current == "wal-append-write") { walWrites[0] = walWrites[0] + 1; }
+        };
+        RecordRow row = ZanDbRecordIoFailures.Row(rt, 10);
+        row.SetVarStr("note", "must be durable before row WAL");
+        bool threw = false;
+        try { rt.Add(row); } catch (IOException ex) { threw = true; }
+        Ok(threw && !rt.IsOpen() && walWrites[0] == 0 && rt.Count() == 0,
+            "failed blob sync prevents WAL and row publication");
+        rt.Close();
+        ZanDbRecordIoFailures.Released(rt);
+        Ok(ZanDbRecordIoFailures.Same(walBefore, File.ReadAllBytes(rt.walPath)), "blob failure preserves prior WAL");
+        ZanDbRecordIoFailures.Clean(path);
+    }
+
+    static void FailedOpenValidation() {
+        string path = ZanDbRecordIoFailures.Root() + "/invalid-open";
+        ZanDbRecordIoFailures.Clean(path);
+        RecordTable missingSchema = RecordTable.Open(path, "rows");
+        Ok(!missingSchema.IsOpen() && missingSchema.GetError() != "" && missingSchema.ioMtx == 0,
+            "missing schema releases constructor locks");
+        missingSchema.Close();
+        File.WriteAllText(path + ".rows.ztab", "short");
+        RecordTable shortHeader = RecordTable.Open(path, "rows");
+        Ok(!shortHeader.IsOpen() && !shortHeader.file.IsOpen() && shortHeader.ioMtx == 0
+            && shortHeader.GetError().Contains("truncated"), "short header releases constructor locks");
+        shortHeader.Close();
+        ZanDbRecordIoFailures.Clean(path);
+        RecordTable rt = ZanDbRecordIoFailures.Create(path);
+        rt.Add(ZanDbRecordIoFailures.Row(rt, 20));
+        rt.Add(ZanDbRecordIoFailures.Row(rt, 30));
+        rt.lastError = "simulate abrupt shutdown without checkpoint";
+        rt.Close();
+        string walPath = path + ".rows.zwal";
+        PageFile wal = PageFile.OpenExisting(walPath);
+        byte[] crc = new byte[4];
+        Ok(wal.WriteAt((long)RecordTable.WAL_HEADER_SIZE + 4L, (nint)crc, 4) == 4 && wal.Sync(),
+            "prepare corrupt non-tail frame CRC");
+        wal.Close();
+        byte[] before = File.ReadAllBytes(walPath);
+        RecordTable[] captured = new RecordTable[1];
+        bool threw = false;
+        string message = "";
+        try {
+            RecordTable.OpenWithPersistenceIo(path, "rows", null, (RecordTable owner, string current) => {
+                captured[0] = owner;
+            });
+        } catch (InvalidOperationException ex) { threw = true; message = ex.Message; }
+        Ok(threw && message.Contains("corrupt WAL frame") && captured[0].GetError().Contains(message),
+            "middle CRC preserves original corruption diagnostic");
+        ZanDbRecordIoFailures.Released(captured[0]);
+        Ok(ZanDbRecordIoFailures.Same(before, File.ReadAllBytes(walPath)), "corrupt middle WAL preserved for diagnosis");
+        ZanDbRecordIoFailures.Clean(path);
+    }
+
+    static void IndexCheckpointFailure() {
+        string path = ZanDbRecordIoFailures.Root() + "/index-checkpoint";
+        RecordTable rt = ZanDbRecordIoFailures.Create(path);
+        try {
+            rt.Add(ZanDbRecordIoFailures.Row(rt, 20));
+            byte[] before = File.ReadAllBytes(rt.walPath);
+            long valid = rt.walValidSize;
+            File.Delete(rt.idxPath);
+            Directory.CreateDirectoryRecursive(rt.idxPath);
+            bool threw = false;
+            try { rt.Flush(); } catch (IOException ex) { threw = true; }
+            Ok(threw && !rt.IsOpen() && rt.GetError() != "" && rt.walValidSize == valid,
+                "index checkpoint obstruction fails closed");
+            rt.Close();
+            ZanDbRecordIoFailures.Released(rt);
+            Ok(ZanDbRecordIoFailures.Same(before, File.ReadAllBytes(rt.walPath)),
+                "failed index checkpoint preserves recovery WAL");
+            if (!Directory.DeleteRecursive(rt.idxPath)) {
+                throw new IOException("cannot remove index checkpoint obstruction");
+            }
+            RecordTable reopened = RecordTable.Open(path, "rows");
+            try {
+                RecordRow row = reopened.Get(2);
+                Ok(reopened.IsOpen() && reopened.Count() == 2 && row != null && row.GetInt32("value") == 20,
+                    "committed row recovers after failed index checkpoint");
+            } finally { reopened.Close(); }
+        } finally { rt.Close(); }
+        ZanDbRecordIoFailures.Clean(path);
+    }
+
+    static void Main() {
+        string root = ZanDbRecordIoFailures.Root();
+        if (File.Exists(root) || Directory.Exists(root) || File.IsReparsePoint(root)) {
+            throw new IOException("refusing preexisting RecordTable I/O fixture root: " + root);
+        }
+        Directory.CreateDirectoryRecursive(root);
+        try {
+            for (int operation = 0; operation < 5; operation = operation + 1) { ZanDbRecordIoFailures.ClosedWal(operation); }
+            ZanDbRecordIoFailures.Boundary("wal-append-write", false);
+            ZanDbRecordIoFailures.Boundary("wal-append-sync", false);
+            ZanDbRecordIoFailures.Boundary("table-sync", false);
+            ZanDbRecordIoFailures.Boundary("blob-sync", false);
+            ZanDbRecordIoFailures.Boundary("wal-reset-write", false);
+            ZanDbRecordIoFailures.Boundary("wal-reset-truncate", false);
+            ZanDbRecordIoFailures.Boundary("wal-reset-sync", false);
+            ZanDbRecordIoFailures.Boundary("table-sync", true);
+            ZanDbRecordIoFailures.Boundary("blob-sync", true);
+            ZanDbRecordIoFailures.ActiveClose();
+            ZanDbRecordIoFailures.ReplayFailure("replay-table-write");
+            ZanDbRecordIoFailures.ReplayFailure("replay-tail-truncate");
+            ZanDbRecordIoFailures.ReplayFailure("replay-tail-sync");
+            ZanDbRecordIoFailures.BlobCommitFailure();
+            ZanDbRecordIoFailures.CreationFailure("create-table-sync");
+            ZanDbRecordIoFailures.CreationFailure("create-blob-sync");
+            ZanDbRecordIoFailures.CreationFailure("create-wal-sync");
+            ZanDbRecordIoFailures.CreationFailure("create-directory-sync");
+            ZanDbRecordIoFailures.FailedOpenValidation();
+            ZanDbRecordIoFailures.IndexCheckpointFailure();
+            Console.WriteLine("done RecordTable I/O failures: " + Convert.ToString(checks));
+        } finally {
+            if (!Directory.DeleteRecursive(root)) {
+                throw new IOException("cannot clean owned RecordTable I/O fixture root: " + root);
+            }
+        }
+    }
+}

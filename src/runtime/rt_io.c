@@ -115,7 +115,7 @@ static int g_io_started;
 static int g_io_broken;
 static ZAN_MAYBE_UNUSED int g_io_shards_live;
 
-static int32_t g_blocking_inflight;
+static volatile LONG g_blocking_inflight;
 static ZAN_MAYBE_UNUSED int32_t g_dns_wake_fd = -1;
 #if defined(_WIN32)
 /* 记录阻塞/DNS 完成包投递失败异常 */
@@ -343,11 +343,11 @@ static int io_flush_dead(zan_io_shard_t *sh) {
     while (sh->dead) {
         zan_io_dead_t *d = sh->dead;
         sh->dead = d->next;
-        InterlockedDecrement(&g_io_dead_count);
         if (d->out_accept) *d->out_accept = -1;
         else if (d->out_n)  *d->out_n = 0;
         io_wake(d->co, d->step);
         free(d);
+        InterlockedDecrement(&g_io_dead_count);
         woke++;
     }
     if (woke) STRACE("flush_dead sh=%d woke=%d dead=%d", (int)(sh - g_ioshard),
@@ -808,8 +808,8 @@ static int io_sweep_slots(int idx) {
             for (int k = 0; k < nr; k++) {
                 if (ready[k].out_accept)   *ready[k].out_accept = -1;
                 else if (ready[k].out_n)   *ready[k].out_n = 0;
-                InterlockedDecrement(&g_io_count);
                 io_wake(ready[k].co, ready[k].step);
+                InterlockedDecrement(&g_io_count);
                 woke++;
             }
         }

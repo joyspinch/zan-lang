@@ -7,10 +7,22 @@ namespace Zan;
 partial class Irgen {
     // ---- expressions ----
     ExprVal GenExpr(Node e) {
+        int first = stmtTempValues.Count;
+        ExprVal result = GenExprCore(e);
+        int i = stmtTempValues.Count - 1;
+        while (i >= first) {
+            if (stmtTempValues[i] == result.op) { result.ownerTemp = stmtTempOwners[i]; return result; }
+            i = i - 1;
+        }
+        return result;
+    }
+
+    ExprVal GenExprCore(Node e) {
         if (e == null) { return new ExprVal("0", MkType("int")); }
         int k = e.kind;
         if (k == AK.IntLit()) { return new ExprVal("" + e.IntLitValue(), MkType(e.IntLitTypeName())); }
         if (k == AK.FloatLit()) {
+            if (e.suffix == 2) { return DecimalLiteral(e); }
             // an f/F literal is a float: the host emits it as an LLVM float,
             // so its value is the text rounded to single precision
             if (e.suffix == 1) { return new ExprVal(F32Const(e.sval), MkType("float")); }
@@ -328,6 +340,18 @@ partial class Irgen {
                 StoreTo(e.a, uov);
                 return uov;
             }
+            if (DecimalValueType(v.ty) && IsNullableValue(v.ty)) {
+                int dop = e.op == TK.PlusPlus() ? TK.Plus() : TK.Minus();
+                ExprVal result = DecimalLifted(dop, v, new ExprVal("1", MkType("int")), e);
+                StoreTo(e.a, result);
+                return result;
+            }
+            if (IsDecimal(v.ty)) {
+                int dop = e.op == TK.PlusPlus() ? TK.Plus() : TK.Minus();
+                ExprVal result = DecimalBinary(dop, v, new ExprVal("1", MkType("int")), e);
+                StoreTo(e.a, result);
+                return result;
+            }
             // prefix ++/--: store the new value and yield it
             if (IsDbl(v.ty)) {
                 string t = NT();
@@ -387,6 +411,10 @@ partial class Irgen {
             return v;
         }
         if (e.op == TK.Minus()) {
+            if (DecimalValueType(v.ty) && IsNullableValue(v.ty)) {
+                return DecimalLifted(TK.Minus(), v, null, e);
+            }
+            if (IsDecimal(v.ty)) { return DecimalNeg(v); }
             if (UnaryOperandIsNamedComposite(v)) {
                 // the builtin path would emit `sub i64 0, <ptr>` -- invalid
                 // IR on a struct/class operand; dispatch or diagnose (A451)
@@ -444,6 +472,21 @@ partial class Irgen {
         ExprVal uovp = TryUnaryOpOverload(e, cur);
         if (uovp != null) {
             StoreTo(e.a, uovp);
+            return cur;
+        }
+        if (DecimalValueType(cur.ty) && IsNullableValue(cur.ty)) {
+            // Postfix yields the old box after replacement releases the slot.
+            EmitArcRetain(cur.op, cur.ty);
+            AddTemp(cur.op, cur.ty);
+            int dop = e.op == TK.MinusMinus() ? TK.Minus() : TK.Plus();
+            ExprVal result = DecimalLifted(dop, cur, new ExprVal("1", MkType("int")), e);
+            StoreTo(e.a, result);
+            return cur;
+        }
+        if (IsDecimal(cur.ty)) {
+            int dop = e.op == TK.MinusMinus() ? TK.Minus() : TK.Plus();
+            ExprVal result = DecimalBinary(dop, cur, new ExprVal("1", MkType("int")), e);
+            StoreTo(e.a, result);
             return cur;
         }
         if (IsDbl(cur.ty)) {
@@ -610,6 +653,7 @@ partial class Irgen {
     // lowers to a struct on the host, so the value never reaches the parser
     // there either.
     string ConvertIntOperand(Node at, ExprVal a, bool int64) {
+        if (IsDecimal(a.ty)) { return DecimalNumber(a, false); }
         if (IsNullable(a.ty)) { return "0"; }
         if (IsStr(a.ty)) {
             // A512: the C host parses with strtoll + the end-pointer
@@ -694,6 +738,7 @@ partial class Irgen {
     // Convert.ToDouble: a string is parsed as text, an integer is converted
     // and a float is kept -- the C host does the same (irgen_call.c:1679).
     string ConvertDoubleOperand(Node at, ExprVal a) {
+        if (IsDecimal(a.ty)) { return DecimalNumber(a, true); }
         if (IsNullable(a.ty)) { return "0.0"; }
         if (IsStr(a.ty)) {
             // A512: strtod with the same end-pointer predicate; strtod
@@ -735,9 +780,8 @@ partial class Irgen {
     // ulong is the one integer type whose value can set the high bit of the i64
     // slot, so it selects unsigned division/remainder/shift/compare and %llu.
     bool IsUlong(Node ty) { if (ty == null) { return false; } return ty.sval == "ulong" && ty.ival == 0; }
-    // True for a value lowered to LLVM `double` (double, float, and A487's
-    // decimal -- the payload is a double, only the type name differs).
-    bool IsDbl(Node ty) { if (ty == null) { return false; } return (ty.sval == "double" || ty.sval == "float" || ty.sval == "decimal") && ty.ival == 0; }
+    // Decimal has its own 128-bit value ABI; float still travels in double.
+    bool IsDbl(Node ty) { if (ty == null) { return false; } return (ty.sval == "double" || ty.sval == "float") && ty.ival == 0; }
     // True for a value that rides an integer slot (every integer lives in an
     // i64 here).
     bool IsIntLike(Node ty) {
@@ -773,6 +817,7 @@ partial class Irgen {
     }
     // Materialise `v` as an LLVM `double`, widening an integer operand via sitofp.
     string AsDouble(ExprVal v) {
+        if (IsDecimal(v.ty)) { return DecimalNumber(v, true); }
         if (IsDbl(v.ty)) { return v.op; }
         string t = NT();
         L("  " + t + " = sitofp i64 " + v.op + " to double");

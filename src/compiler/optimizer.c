@@ -610,8 +610,77 @@ static void zan_opt_mark_size(zan_irgen_t *g, bool min_size) {
 }
 #endif
 
-void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
-    if (level == ZAN_OPT_NONE) return;
+zan_status_t zan_opt_validate_cpu(zan_irgen_t *g, LLVMModuleRef mod) {
+    if (!g->cpu_profile) return ZAN_OK;
+    /* Also preserve explicit requirements for external consumers of --emit-ir.
+     * The TargetMachine remains authoritative for optimization and emission. */
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
+        if (LLVMIsDeclaration(fn)) continue;
+        LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)-1,
+            LLVMCreateStringAttribute(ctx, "target-cpu", 10,
+                                      g->target_cpu, (unsigned)strlen(g->target_cpu)));
+        LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)-1,
+            LLVMCreateStringAttribute(ctx, "target-features", 15,
+                                      g->target_features, (unsigned)strlen(g->target_features)));
+    }
+    if (strcmp(g->cpu_profile, "baseline") != 0) return ZAN_OK;
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+            for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst; inst = LLVMGetNextInstruction(inst)) {
+                if (!LLVMIsACallInst(inst) && !LLVMIsAInvokeInst(inst)) continue;
+                LLVMValueRef callee = LLVMGetCalledValue(inst);
+                const char *name = callee ? LLVMGetValueName(callee) : NULL;
+                if (!name || strncmp(name, "llvm.x86.", 9) != 0) continue;
+                /* SSE and SSE2 are guaranteed by x86-64. Anything newer
+                 * must have taken a portable lowering, or fail before LLVM
+                 * instruction selection (which may abort on such intrinsics). */
+                if (strncmp(name, "llvm.x86.sse.", 13) == 0 ||
+                    strncmp(name, "llvm.x86.sse2.", 14) == 0) continue;
+                fprintf(stderr, "error: --cpu-profile baseline does not support hardware intrinsic '%s' used by '%s'; use --cpu-profile avx2\n",
+                        name, LLVMGetValueName(fn));
+                return ZAN_ERROR;
+            }
+        }
+    }
+    return ZAN_OK;
+}
+
+zan_status_t zan_opt_verify_module(LLVMModuleRef mod, const char *stage) {
+    if (!mod) {
+        fprintf(stderr, "error: missing LLVM module %s\n", stage);
+        return ZAN_ERROR;
+    }
+    char *msg = NULL;
+    bool failed = LLVMVerifyModule(mod, LLVMReturnStatusAction, &msg) != 0;
+    if (failed)
+        fprintf(stderr, "error: module verification failed %s: %s\n",
+                stage, msg ? msg : "(no message)");
+    if (msg) LLVMDisposeMessage(msg);
+    return failed ? ZAN_ERROR : ZAN_OK;
+}
+
+/* All LLVM pipelines share the same fail-closed protocol. */
+static zan_status_t run_checked_passes(LLVMModuleRef mod, LLVMTargetMachineRef tm,
+                                     const char *passes) {
+    if (zan_opt_verify_module(mod, "before pass pipeline") != ZAN_OK)
+        return ZAN_ERROR;
+    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+    LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
+    LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
+    LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
+    LLVMDisposePassBuilderOptions(opts);
+    if (err) {
+        char *msg = LLVMGetErrorMessage(err);
+        fprintf(stderr, "error: LLVM pass pipeline '%s' failed: %s\n", passes, msg);
+        LLVMDisposeErrorMessage(msg);
+        return ZAN_ERROR;
+    }
+    return zan_opt_verify_module(mod, "after pass pipeline");
+}
+
+zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
+    if (level == ZAN_OPT_NONE) return ZAN_OK;
 
 #if ZAN_LLVM_MAJOR >= 23
     if (level == ZAN_OPT_SIZE) {
@@ -622,13 +691,15 @@ void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
 #endif
 
     LLVMTargetMachineRef tm = NULL;
-    zan_irgen_create_target_machine(g, &tm);
-    zan_opt_run_passes_on_module(g->mod, tm, level);
+    if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK) return ZAN_ERROR;
+    zan_status_t status = zan_opt_run_passes_on_module(g->mod, tm, level);
     if (tm) LLVMDisposeTargetMachine(tm);
+    return status;
 }
 
-void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level) {
-    if (!mod || level == ZAN_OPT_NONE) return;
+zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level) {
+    if (zan_opt_verify_module(mod, "before optimization") != ZAN_OK) return ZAN_ERROR;
+    if (level == ZAN_OPT_NONE) return ZAN_OK;
     const char *passes = NULL;
     switch (level) {
     case ZAN_OPT_BASIC: passes = "default<O1>"; break;
@@ -636,7 +707,7 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
     case ZAN_OPT_SIZE: passes = "default<Os>"; break;
     case ZAN_OPT_SIZE_MIN: passes = "default<Oz>"; break;
     case ZAN_OPT_AGGRESSIVE: passes = "default<O3>"; break;
-    default: return;
+    default: return ZAN_ERROR;
     }
 
     /* 调试旋钮：ZAN_OPT_PIPELINE 覆盖默认管线文本（如 "sroa" 逐 pass
@@ -645,7 +716,7 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
         const char *pipe_env = getenv("ZAN_OPT_PIPELINE");
         if (pipe_env && pipe_env[0]) {
             if (strcmp(pipe_env, "none") == 0) {
-                return;
+                return ZAN_OK;
             }
             passes = pipe_env;
         }
@@ -662,23 +733,16 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
         LLVMPassBuilderOptionsSetLoopUnrolling(opts, 1);
     }
 
-    char *vmsg = NULL;
-    if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &vmsg)) {
-        fprintf(stderr, "warning: module verification failed before pass "
-                        "pipeline, skipping pipeline: %s\n",
-                vmsg ? vmsg : "(no message)");
-        if (vmsg) LLVMDisposeMessage(vmsg);
-        LLVMDisposePassBuilderOptions(opts);
-        return;
-    }
-    if (vmsg) LLVMDisposeMessage(vmsg);
-
     LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
+    LLVMDisposePassBuilderOptions(opts);
     if (err) {
         char *msg = LLVMGetErrorMessage(err);
-        fprintf(stderr, "warning: LLVM pass pipeline error: %s\n", msg);
+        fprintf(stderr, "error: LLVM pass pipeline '%s' failed: %s\n", passes, msg);
         LLVMDisposeErrorMessage(msg);
+        return ZAN_ERROR;
     }
+    if (zan_opt_verify_module(mod, "after pass pipeline") != ZAN_OK)
+        return ZAN_ERROR;
     /* 调试旋钮：ZAN_DUMP_OPT_IR=<路径> 落盘优化后的模块 IR（A595 二分用） */
     {
         const char *dump = getenv("ZAN_DUMP_OPT_IR");
@@ -691,21 +755,12 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
         }
     }
 
-    LLVMDisposePassBuilderOptions(opts);
+    return ZAN_OK;
 }
 
 /* 全局死代码消除 (GlobalDCE)：纯可达性扫描剔除未引用的内部符号 */
-void zan_opt_strip_unused(zan_irgen_t *g) {
-    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-    LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
-    LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
-    LLVMErrorRef err = LLVMRunPasses(g->mod, "globaldce", NULL, opts);
-    if (err) {
-        char *msg = LLVMGetErrorMessage(err);
-        fprintf(stderr, "warning: LLVM globaldce error: %s\n", msg);
-        LLVMDisposeErrorMessage(msg);
-    }
-    LLVMDisposePassBuilderOptions(opts);
+zan_status_t zan_opt_strip_unused(zan_irgen_t *g) {
+    return run_checked_passes(g->mod, NULL, "globaldce");
 }
 
 static void insert_entry_alloca(LLVMBuilderRef b, LLVMValueRef fn) {
@@ -863,39 +918,34 @@ zan_escape_stats_t zan_opt_escape(zan_irgen_t *g) {
     return stats;
 }
 
-static void zan_opt_early_mem2reg(zan_irgen_t *g) {
-    /* 调试旋钮：ZAN_EARLY_PASSES 覆盖早期 pass 集（A595 二分用） */
+static zan_status_t zan_opt_early_mem2reg(zan_irgen_t *g) {
     const char *early = getenv("ZAN_EARLY_PASSES");
-    if (early && strcmp(early, "none") == 0) return;
-    const char *passes_txt = (early && early[0]) ? early : "sroa,early-cse";
-    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-    LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
-    LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
-    LLVMErrorRef err = LLVMRunPasses(g->mod, passes_txt, NULL, opts);
-    if (err) {
-        char *msg = LLVMGetErrorMessage(err);
-        fprintf(stderr, "warning: LLVM early sroa error: %s\n", msg);
-        LLVMDisposeErrorMessage(msg);
-    }
-    LLVMDisposePassBuilderOptions(opts);
+    if (early && strcmp(early, "none") == 0) return ZAN_OK;
+    return run_checked_passes(g->mod, NULL,
+                             (early && early[0]) ? early : "sroa,early-cse");
 }
 
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level) {
     zan_opt_report_t report;
     memset(&report, 0, sizeof(report));
+    if (zan_opt_verify_module(g->mod, "before optimizer") != ZAN_OK) return report;
+    report.success = true;
     if (level == ZAN_OPT_NONE) return report;
 
     double t0 = get_time_ms();
 
     /* 调试旋钮：ZAN_NO_OPT_<NAME>=1 跳过对应自定义 pass（A595 二分） */
-    if (!getenv("ZAN_NO_OPT_EARLY")) zan_opt_early_mem2reg(g);
+    if (!getenv("ZAN_NO_OPT_EARLY") && zan_opt_early_mem2reg(g) != ZAN_OK) {
+        report.success = false;
+        return report;
+    }
     if (!getenv("ZAN_NO_OPT_ESCAPE")) report.escape = zan_opt_escape(g);
     if (!getenv("ZAN_NO_OPT_ARC")) report.arc = zan_opt_arc(g, level);
     if (!getenv("ZAN_NO_OPT_DEVIRT")) report.devirt = zan_opt_devirtualize(g, binder);
     if (!getenv("ZAN_NO_OPT_CONSTFOLD")) report.constfold = zan_opt_const_fold(g);
     if (!getenv("ZAN_NO_OPT_DCE")) report.dce = zan_opt_dce(g);
     if (!getenv("ZAN_NO_OPT_INLINE")) report.inlining = zan_opt_inline(g, level);
-    zan_opt_configure_llvm_passes(g, level);
+    report.success = zan_opt_configure_llvm_passes(g, level) == ZAN_OK;
 
     double t1 = get_time_ms();
     report.time_ms = t1 - t0;

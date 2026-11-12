@@ -256,7 +256,21 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         }
     }
 
-    if (lexer_peek_ch(lex) == '.' && lexer_peek_ch2(lex) != '.') {
+    /* A decimal point before a member name belongs to postfix parsing.
+     * Keep trailing-dot floats, exponents and the existing f/m suffixes;
+     * checking the full suffix boundary keeps 9.Format() an integer member. */
+    char after_dot = lexer_peek_ch2(lex);
+    char after_suffix = lexer_peek_ch3(lex);
+    bool dot_member = isalpha((unsigned char)after_dot) || after_dot == '_';
+    if ((after_dot == 'e' || after_dot == 'E') &&
+        (isdigit((unsigned char)after_suffix) ||
+         after_suffix == '+' || after_suffix == '-'))
+        dot_member = false;
+    if ((after_dot == 'f' || after_dot == 'F' ||
+         after_dot == 'm' || after_dot == 'M') &&
+        !(isalnum((unsigned char)after_suffix) || after_suffix == '_'))
+        dot_member = false;
+    if (lexer_peek_ch(lex) == '.' && after_dot != '.' && !dot_member) {
         is_float = true;
         lexer_advance(lex); /* . */
         while (!lexer_at_end(lex)) {

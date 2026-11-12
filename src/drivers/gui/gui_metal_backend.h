@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-/* 检测当前 Apple 平台是否支持 Metal 硬件管线 */
+/* Reports implemented renderer capability, not merely an available device. */
 int zan_gui_internal_metal_supported(void);
 
 /* 初始化并挂接 Metal 渲染后端 */

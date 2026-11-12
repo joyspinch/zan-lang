@@ -20,7 +20,7 @@
 
             char cmd[4096];
             snprintf(cmd, sizeof(cmd),
-                     "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
+                     "ld.lld -static%s --eh-frame-hdr --gc-sections -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
                      (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
@@ -70,9 +70,29 @@
               if (zan_file_exists(memobj)) {
                   cmd_appendf(cmd, sizeof(cmd),
                            " \"%s\" --wrap=malloc --wrap=free"
-                           " --wrap=calloc --wrap=realloc", memobj);
+                           " --wrap=calloc --wrap=realloc --wrap=__malloc_allzerop", memobj);
               } }
+            for (int ei = 0; ei < extra_link_input_count; ei++) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", extra_link_inputs[ei]);
+            }
             { cmd_appendf(cmd, sizeof(cmd), " --start-group \"%s/libc.a\"", sys); }
+            for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
+            }
+            /* Zan exceptions use the target Itanium C++ ABI. Keep its
+               mutually dependent archives in the libc rescan group. */
+            {
+                static const char *const eh_libs[] = {
+                    "libc++.a", "libc++abi.a", "libunwind.a", "libcompiler_rt.a"
+                };
+                for (int li = 0; li < 4; li++) {
+                    char libpath[1300];
+                    snprintf(libpath, sizeof(libpath), "%s/%s", sys, eh_libs[li]);
+                    if (zan_file_exists(libpath)) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", libpath);
+                    }
+                }
+            }
             { char gcclib[1300];
               snprintf(gcclib, sizeof(gcclib), "%s/libgcc.a", sys);
               if (zan_file_exists(gcclib)) {

@@ -123,7 +123,12 @@ int32_t zan_io_set_nonblocking(intptr_t fd);
 
 /* 协程计数信号门原语 */
 long long zan_gate_new(void);
+/* arm: timed registration, paired with park_ticket and ticket_signal_and_release.
+ * prepare: untimed registration, paired with park_ticket. Registrations pin the
+ * gate across Close and may complete before park; tickets never use thread TLS. */
 long long zan_gate_arm(long long handle);
+long long zan_gate_prepare(long long handle);
+void zan_gate_park_ticket(long long handle, long long ticket, void *frame, zan_co_step_t step);
 void zan_gate_park(long long handle, void *frame, zan_co_step_t step);
 void zan_gate_signal(long long handle);
 void zan_gate_signal_all(long long handle);

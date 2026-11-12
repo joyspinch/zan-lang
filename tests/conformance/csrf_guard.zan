@@ -27,8 +27,8 @@ class Program {
     // token 在响应的 Set-Cookie 里；模拟后续请求时从这里取值、
     // 回填进请求侧 Cookie 头。
     static string TokenFrom(HttpContext c) {
-        for (int i = 0; i < c.headers.Count; i = i + 1) {
-            string h = c.headers[i];
+        for (int i = 0; i < c.Headers().Count; i = i + 1) {
+            string h = c.Headers()[i];
             int at = h.IndexOf("csrf_token=");
             if (at >= 0) {
                 int start = at + 11;
@@ -50,8 +50,8 @@ class Program {
         // cookie 头还没写回请求侧——从响应头里确认 Set-Cookie 形态。
         bool sawCookie = false;
         bool jsReadable = true;
-        for (int i = 0; i < g.headers.Count; i = i + 1) {
-            string h = g.headers[i];
+        for (int i = 0; i < g.Headers().Count; i = i + 1) {
+            string h = g.Headers()[i];
             if (h.Contains("csrf_token=")) {
                 sawCookie = true;
                 if (h.Contains("HttpOnly")) { jsReadable = false; }
@@ -63,8 +63,8 @@ class Program {
         // POST 无 cookie / 无 token → 403 短路。
         HttpContext p0 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n\r\n");
         Program.Ok("post without cookie blocked", Csrf.Guard(p0), false);
-        Program.Ok("blocked is 403", p0.status == 403, true);
-        Program.Ok("blocked short-circuits", p0.ended, true);
+        Program.Ok("blocked is 403", p0.GetStatus() == 403, true);
+        Program.Ok("blocked short-circuits", p0.Ended(), true);
 
         // POST 带 cookie 但无头 → 403。
         HttpContext p1 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n"
@@ -74,7 +74,8 @@ class Program {
         // POST token 不匹配 → 403；等长与否都拒绝（常时比较不短路）。
         HttpContext p2 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n"
             + "Cookie: csrf_token=" + token + "\r\n"
-            + "X-CSRF-Token: " + token.Substring(0, 30) + "ff\r\n\r\n");
+            + "X-CSRF-Token: " + token.Substring(0, 31)
+            + (token[31] == '0' ? "1" : "0") + "\r\n\r\n");
         Program.Ok("post with wrong token blocked", Csrf.Guard(p2), false);
         HttpContext p3 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n"
             + "Cookie: csrf_token=" + token + "\r\nX-CSRF-Token: short\r\n\r\n");
@@ -95,6 +96,24 @@ class Program {
             + formTok + "\r\n_csrf=" + token);
         Program.Ok("post with matching form field passes", Csrf.Guard(p5), true);
 
+        // Native form POSTs carry an Origin; valid tokens never waive origin checks.
+        string browserForm = "POST /save HTTP/1.1\r\nHost: h:14587\r\n"
+            + "Cookie: csrf_token=" + token + "\r\n"
+            + "Content-Type: application/x-www-form-urlencoded\r\n"
+            + formTok;
+        HttpContext same = Program.Ctx(browserForm
+            + "Origin: http://H:14587\r\nSec-Fetch-Site: same-origin\r\n\r\n_csrf=" + token);
+        Program.Ok("same-origin form with matching token passes", Csrf.Guard(same), true);
+        HttpContext opaque = Program.Ctx(browserForm
+            + "Origin: null\r\nSec-Fetch-Site: same-origin\r\n\r\n_csrf=" + token);
+        Program.Ok("opaque origin with matching form token blocked", Csrf.Guard(opaque), false);
+        HttpContext wrongPort = Program.Ctx(browserForm
+            + "Origin: http://h\r\nSec-Fetch-Site: same-origin\r\n\r\n_csrf=" + token);
+        Program.Ok("different origin port with matching form token blocked", Csrf.Guard(wrongPort), false);
+        HttpContext foreign = Program.Ctx(browserForm
+            + "Origin: http://h:14587\r\nSec-Fetch-Site: cross-site\r\n\r\n_csrf=" + token);
+        Program.Ok("cross-site evidence with matching form token blocked", Csrf.Guard(foreign), false);
+
         // HEAD/OPTIONS 同样放行。
         Program.Ok("head passes",
             Csrf.Guard(Program.Ctx("HEAD / HTTP/1.1\r\nHost: h\r\n\r\n")), true);
@@ -111,7 +130,7 @@ class Program {
 
         // token 唯一性抽查（两次取 token 不同）。
         string t2 = CsrfTokenForFreshGet();
-        Program.Ok("fresh tokens differ", t2 != token, true);
+        Program.Ok("fresh tokens differ", t2.Length == 32 && t2 != token, true);
 
         Console.WriteLine("failures: " + Convert.ToString(Program.failures));
     }
@@ -119,6 +138,6 @@ class Program {
     static string CsrfTokenForFreshGet() {
         HttpContext c = Program.Ctx("GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
         Csrf.Guard(c);
-        return c.Cookie("csrf_token");
+        return Program.TokenFrom(c);
     }
 }

@@ -354,6 +354,8 @@ done:
 /* ---- output ---- */
 
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path) {
+    if (zan_opt_validate_cpu(g, g->mod) != ZAN_OK ||
+        zan_opt_verify_module(g->mod, "before IR output") != ZAN_OK) return ZAN_ERROR;
     char *ir = LLVMPrintModuleToString(g->mod);
     char *owned = NULL;   /* 自述头 + IR 的拼接缓冲（malloc 释放） */
     /* 产物自述目标特性：编译器自己用 AVX2 档后端出码，但 .ll 文本里没有这层
@@ -681,9 +683,14 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
         /* Android's x86_64 ABI matches the NDK baseline: SSE4.2, POPCNT,
            CX16, but no AVX/BMI/FMA/AES guarantee. Enabling AVX globally
            vectorizes ordinary initialization before any CPU feature check. */
-        tm_features = strstr(triple, "android")
-            ? "+sse4.2,+crc32,+popcnt,+cx16"
-            : "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
+        if (g->cpu_profile && strcmp(g->cpu_profile, "baseline") == 0)
+            tm_features = "+sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-crc32,-aes,-avx,-avx2,-fma,-bmi,-bmi2,-popcnt";
+        else if (g->cpu_profile && strcmp(g->cpu_profile, "avx2") == 0)
+            tm_features = "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
+        else
+            tm_features = strstr(triple, "android")
+                ? "+sse4.2,+crc32,+popcnt,+cx16"
+                : "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
     } else if (strncmp(triple, "aarch64", 7) == 0 || strncmp(triple, "arm64", 5) == 0) {
         tm_features = "+aes";
     }
@@ -938,11 +945,17 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     LLVMTargetMachineRef tm;
     if (zan_bind_target_layout(g, &tm) != ZAN_OK) return ZAN_ERROR;
 
+    if (zan_opt_validate_cpu(g, g->mod) != ZAN_OK ||
+        zan_opt_verify_module(g->mod, "before object output") != ZAN_OK) {
+        LLVMDisposeTargetMachine(tm);
+        return ZAN_ERROR;
+    }
     char *error = NULL;
     if (LLVMTargetMachineEmitToFile(tm, g->mod, (char *)path,
                                      LLVMObjectFile, &error)) {
         zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,
                       "failed to emit object file: %s", error);
+        remove(path); /* the backend may have created a partial object */
         LLVMDisposeMessage(error);
         LLVMDisposeTargetMachine(tm);
         return ZAN_ERROR;

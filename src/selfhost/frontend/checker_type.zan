@@ -267,6 +267,7 @@ public partial class Checker {
                     return ut;
                 }
                 Node cls = ClassOf(ot);
+                if (cls == null) { cls = StaticRecv(callee.a); }
                 if (cls != null) {
                     Node m = MethodUpCall(cls, callee.sval, e);
                     if (m != null) {
@@ -359,8 +360,8 @@ public partial class Checker {
     }
 
     // The host's promote_numeric (src/compiler/checker.c:1066): the ladder
-    // is double > float > ulong > long > int. Everything else (byte, short,
-    // uint, char, nint) falls to int. A decimal arm wins over an integral
+    // is double > float > ulong > long > nint > int. Everything else (byte,
+    // short, uint, char) falls to int. A decimal arm wins over an integral
     // arm; a decimal mixed with a float or a double is an error in the
     // host, which the self-host cannot express -- it stays unknown.
     Node PromoteNumericType(Node a, Node b) {
@@ -377,6 +378,7 @@ public partial class Checker {
         if (an == "float" || bn == "float") { return MkType("float"); }
         if (an == "ulong" || bn == "ulong") { return MkType("ulong"); }
         if (an == "long" || bn == "long") { return MkType("long"); }
+        if (an == "nint" || bn == "nint") { return MkType("nint"); }
         return MkType("int");
     }
 
@@ -466,9 +468,7 @@ public partial class Checker {
     // completion path, so reading it as a result handle releases it twice.
     Node TaskCallType(Node call) {
         Node callee = call.a;
-        if (callee == null || callee.kind != AK.MemberAccess()) { return null; }
-        if (callee.a == null || callee.a.kind != AK.Ident()) { return null; }
-        if (callee.a.sval != "Task") { return null; }
+        if (callee == null || callee.kind != AK.MemberAccess() || !callee.isIntrinsic) { return null; }
         string mname = callee.sval;
         if (mname != "Run" && mname != "Spawn") { return null; }
         if (call.kids.Count != 1) { return null; }
@@ -476,6 +476,10 @@ public partial class Checker {
         if (arg == null) { return null; }
         if (mname == "Spawn") { return MkTaskType(null); }
         if (arg.kind == AK.Lambda()) { return MkTaskType(null); }
+        if (arg.resolvedSym != null && arg.resolvedSym.kind == AK.MethodDecl()
+                && (arg.kind == AK.Ident() || arg.kind == AK.MemberAccess())) {
+            return MkTaskType(null);
+        }
         Node at = InferType(arg);
         if (at == null) { return null; }        // unknown argument: stay permissive
         if (binder.IsDelegateName(at.sval)) { return MkTaskType(null); }
@@ -728,11 +732,46 @@ public partial class Checker {
             + "' in " + what + " needs an explicit cast (C# rules)", line, col);
     }
 
+    // Array types keep the final element name even for nested/rectangular
+    // ranks. Erased elements have no uniform retain/release ABI in selfhost.
+    bool IsErasedArrayElement(Node ty) {
+        if (ty == null) { return false; }
+        if (ty.sval == "object") { return true; }
+        Node decl = binder.FindType(ty.sval);
+        return decl != null && (decl.mods & MOD.Iface()) != 0;
+    }
+
+    void CheckErasedArrayOperation(Node ty, int line, int col) {
+        // All array producers now carry the same typed ownership descriptor.
+        // Element erasure no longer changes whether creation/store is safe.
+    }
+
+    void CheckErasedArrayConversion(Node target, Node valueTy, bool valueNull,
+                                    int line, int col) {
+        if (valueNull || valueTy == null) { return; }
+        if (target != null && target.ival >= 1 && IsErasedArrayElement(target)) {
+            CheckErasedArrayOperation(target, line, col);
+        } else if (valueTy != null && valueTy.ival >= 1 && IsErasedArrayElement(valueTy)) {
+            CheckErasedArrayOperation(valueTy, line, col);
+        }
+    }
+
     // `valueNull` marks a null literal: the C host types it as `object`, so
     // that is the name its diagnostics print.
     void CheckAssignable(Node target, Node valueTy, bool valueNull,
                          string what, int line, int col) {
-        if (target == null || target.ival >= 1) { return; }  // array target
+        CheckErasedArrayConversion(target, valueTy, valueNull, line, col);
+        if (target == null) { return; }
+        if (target.ival >= 1) {
+            // Host accepts identity array assignment, never array covariance.
+            // Explicit casts use CheckErasedArrayConversion, not this rule.
+            if (!valueNull && valueTy != null && valueTy.ival >= 1
+                && (!SameTypeShape(target, valueTy) || target.arrRanks != valueTy.arrRanks)) {
+                diags.Error("[E2024] cannot convert '" + TyDisplay(valueTy) + "' to '" + TyDisplay(target)
+                    + "' in " + what + ": no implicit conversion", line, col);
+            }
+            return;
+        }
         string tn = target.sval;
         if (tn == "" || tn == "var") { return; }
         if (binder.IsTypeParam(tn)) { return; }

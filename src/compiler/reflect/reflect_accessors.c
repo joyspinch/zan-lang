@@ -369,10 +369,10 @@ static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, prop);
     LLVMValueRef psv = LLVMBuildIntToPtr(g->builder, pv, i8ptr, "refl.psv");
-    LLVMValueRef psr = LLVMBuildSelect(g->builder,
-        LLVMBuildIsNull(g->builder, psv, "refl.psnull"), empty, psv, "refl.ps");
-    zan_call2(g->builder, arc_ty, g->rt_str_retain, &psr, 1, "");
-    LLVMBuildRet(g->builder, psr);
+    /* A present string property preserves null; only a missing/non-string
+     * member uses the empty-string fallback below. Retain accepts null. */
+    zan_call2(g->builder, arc_ty, g->rt_str_retain, &psv, 1, "");
+    LLVMBuildRet(g->builder, psv);
 
     LLVMPositionBuilderAtEnd(g->builder, notprop);
     LLVMBuildCondBr(g->builder,
@@ -405,10 +405,9 @@ static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
     LLVMValueRef sv = LLVMBuildLoad2(g->builder, i8ptr,
         LLVMBuildBitCast(g->builder, p, LLVMPointerType(i8ptr, 0), "refl.sp"),
         "refl.sv");
-    LLVMValueRef svr = LLVMBuildSelect(g->builder,
-        LLVMBuildIsNull(g->builder, sv, "refl.snull"), empty, sv, "refl.str");
-    zan_call2(g->builder, arc_ty, g->rt_str_retain, &svr, 1, "");
-    LLVMBuildRet(g->builder, svr);
+    /* Preserve the stored value, including null, for a present string field. */
+    zan_call2(g->builder, arc_ty, g->rt_str_retain, &sv, 1, "");
+    LLVMBuildRet(g->builder, sv);
 
     LLVMPositionBuilderAtEnd(g->builder, none);
     LLVMBuildRet(g->builder, empty);

@@ -23,7 +23,8 @@ partial class Irgen {
             Node lat = ArgTypeNode(e.a);
             if (lat == null || IsNullableValue(lat)) {
                 la = GenExpr(e.a);
-                if (IsNullableValue(la.ty)) {
+                if (IsNullableValue(la.ty) && !DecimalValueType(la.ty)
+                    && !DecimalValueType(ArgTypeNode(e.b))) {
                     int lnb = NL(); int lrhs = NL(); int ldone = NL();
                     string aisn = NT();
                     L("  " + aisn + " = icmp eq i8* " + la.op + ", null");
@@ -85,11 +86,16 @@ partial class Irgen {
             bool isAnd = (op == TK.AmpAmp());
             int lrhs = NL(); int lend = NL();
             string la = GenCond(e.a);
+            // Each operand's condition is now an i1 value. Drop its owned
+            // temporaries on the path that evaluated it, before discarding
+            // this private list; the RHS must never release skipped SSA values.
+            EmitTempReleases();
             string bpre = curLbl;
             if (isAnd) { L("  br i1 " + la + ", label %L" + lrhs + ", label %L" + lend); }
             else { L("  br i1 " + la + ", label %L" + lend + ", label %L" + lrhs); }
             Label(lrhs);
             string lb = GenCond(e.b);
+            EmitTempReleases();
             string bpost = curLbl;
             L("  br label %L" + lend);
             Label(lend);
@@ -228,6 +234,13 @@ partial class Irgen {
         // user-defined operator overloading takes precedence for class operands
         ExprVal ov = TryOpOverload(op, a, b, e.a, e.b);
         if (ov != null) { return ov; }
+        if ((op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+            || op == TK.Slash() || op == TK.Percent()) && DecimalLiftNeeded(a.ty, b.ty)) {
+            return DecimalLifted(op, a, b, e);
+        }
+        if ((IsDecimal(a.ty) || IsDecimal(b.ty)) && !(IsStr(a.ty) || IsStr(b.ty)) && !IsNullableValue(a.ty) && !IsNullableValue(b.ty)) {
+            return DecimalBinary(op, a, b, e);
+        }
         // floating-point arithmetic/comparison (string `+` concatenation wins)
         if ((IsDbl(a.ty) || IsDbl(b.ty)) && !(IsStr(a.ty) || IsStr(b.ty))) {
             string da = AsDouble(a);
@@ -354,7 +367,15 @@ partial class Irgen {
                     bPl = bv2;
                 }
                 string cmp2 = NT();
-                L("  " + cmp2 + " = icmp " + (op == TK.EqEq() ? "eq" : "ne") + " " + aUlt + " " + aPl + ", " + bPl);
+                if (aUlt == DecimalLL() || bUlt == DecimalLL()) {
+                    Node aty = a.ty; Node bty = b.ty;
+                    if (IsNullableValue(aty)) { aty = MkType(aty.sval); }
+                    if (IsNullableValue(bty)) { bty = MkType(bty.sval); }
+                    ExprVal deq = DecimalBinary(op, new ExprVal(aPl, aty), new ExprVal(bPl, bty), e);
+                    L("  " + cmp2 + " = icmp ne i64 " + deq.op + ", 0");
+                } else {
+                    L("  " + cmp2 + " = icmp " + (op == TK.EqEq() ? "eq" : "ne") + " " + aUlt + " " + aPl + ", " + bPl);
+                }
                 string cv = NT();
                 L("  " + cv + " = zext i1 " + cmp2 + " to i64");
                 L("  br label %L" + lmerge2);
@@ -543,7 +564,15 @@ partial class Irgen {
                     bPl = bv;
                 }
                 string cc = NT();
-                L("  " + cc + " = icmp " + cp + " " + aUlt + " " + aPl + ", " + bPl);
+                if (aUlt == DecimalLL() || bUlt == DecimalLL()) {
+                    Node aty = a.ty; Node bty = b.ty;
+                    if (IsNullableValue(aty)) { aty = MkType(aty.sval); }
+                    if (IsNullableValue(bty)) { bty = MkType(bty.sval); }
+                    ExprVal dcmp = DecimalBinary(op, new ExprVal(aPl, aty), new ExprVal(bPl, bty), e);
+                    L("  " + cc + " = icmp ne i64 " + dcmp.op + ", 0");
+                } else {
+                    L("  " + cc + " = icmp " + cp + " " + aUlt + " " + aPl + ", " + bPl);
+                }
                 string zcmp = NT();
                 L("  " + zcmp + " = zext i1 " + cc + " to i64");
                 string bcmp = curLbl;

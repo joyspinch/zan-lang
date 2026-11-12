@@ -187,6 +187,11 @@
                     return 1;
                 }
                 rt_timer_obj = rt_timer_buf;
+                /* Cross runtimes reference the target crash reporter too;
+                   never resolve this dependency to a host object. */
+                snprintf(rt_crash_buf, sizeof(rt_crash_buf),
+                         "%s/%s/zanrt_crash.o", link_exe_dir, tsub);
+                rt_crash_obj = zan_file_exists(rt_crash_buf) ? rt_crash_buf : NULL;
                 target_rt_sub = tsub;
                 /* The crypto archive follows the same layout: one per
                    cross target, next to the target's other runtime objects

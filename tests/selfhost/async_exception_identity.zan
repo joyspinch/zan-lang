@@ -1,0 +1,200 @@
+using System;
+using System.Collections.Generic;
+class IdentityA : Exception {
+    public int stamp;
+    public IdentityA(int n) : base("A") { stamp = n; }
+}
+class IdentityB : Exception {
+    public int stamp;
+    public IdentityB(int n) : base("B") { stamp = n; }
+}
+class Program {
+    static IdentityA original;
+    static IdentityB nested;
+    // These external owners isolate dispatch identity from the separate
+    // exception-payload ownership protocol; this is not a lifetime oracle.
+    static List<IdentityA> keepA;
+    static List<IdentityB> keepB;
+    static void Fresh() {
+        original = new IdentityA(101); nested = new IdentityB(201);
+        keepA.Add(original); keepB.Add(nested);
+    }
+    static void FailA() { throw original; }
+    static async void AwaitA() { await Task.Yield(); throw original; }
+    static async void AwaitB(bool suspend) {
+        if (suspend) { await Task.Yield(); }
+        throw nested;
+    }
+    static async void Pending(int mode) {
+        try {
+            if (mode == 0) { throw original; }
+            if (mode == 1) { FailA(); }
+            await AwaitA();
+        } finally {
+            if (mode != 0) { await Task.Yield(); }
+            try {
+                if (mode == 0) { throw nested; }
+                await AwaitB(mode == 2);
+            } catch (IdentityB b) {
+                if (mode != 0) { await Task.Yield(); }
+                Console.WriteLine(b == nested);
+                b.stamp = b.stamp + 1;
+            }
+            if (mode == 2) { await Task.Yield(); }
+        }
+    }
+    static async void RethrowA() {
+        try { await AwaitA(); }
+        catch (IdentityA a) {
+            await Task.Yield();
+            try { await AwaitB(true); }
+            catch (IdentityB b) {
+                await Task.Yield();
+                Console.WriteLine(b == nested);
+            }
+            // Reassignment of the visible binding must not change bare throw.
+            a = new IdentityA(999);
+            throw;
+        }
+    }
+    static async void Replace(bool bare) {
+        try { throw original; }
+        finally {
+            await Task.Yield();
+            try { await AwaitB(true); }
+            catch (IdentityB b) {
+                await Task.Yield();
+                if (bare) { throw; }
+                throw nested;
+            }
+        }
+    }
+    static async void CatchEscape(bool callee) {
+        try { throw original; }
+        catch (IdentityA a) {
+            await Task.Yield();
+            if (callee) { FailB(); }
+            await AwaitB(true);
+        } finally { Console.WriteLine("escape cleanup"); await Task.Yield(); }
+    }
+    static void FailB() { throw nested; }
+    static async void ForeachSnapshot(bool rethrow) {
+        try { throw original; }
+        catch (IdentityA a) {
+            int[] values = new int[2]; values[0] = 4; values[1] = 5;
+            foreach (int value in values) { Console.WriteLine(value); }
+            await Task.Yield();
+            if (rethrow) { throw; }
+        } finally {
+            int[] values = new int[1]; values[0] = 6;
+            foreach (int value in values) { Console.WriteLine(value); }
+            await Task.Yield();
+            try { await AwaitB(true); } catch (IdentityB b) { await Task.Yield(); }
+        }
+    }
+    static async void CapturedCatch() {
+        try { throw original; }
+        catch (IdentityA captured) {
+            Action read = () => { Console.WriteLine(captured == original); Console.WriteLine(captured.stamp); };
+            await Task.Yield(); read();
+        }
+    }
+    static WeakReference<IdentityA> bindingObserver;
+    static async void BindingOwner(int mode) {
+        try { throw original; }
+        catch (IdentityA binding) {
+            binding = new IdentityA(999);
+            bindingObserver = new WeakReference<IdentityA>(binding);
+            if (mode == 3) {
+                Action read = () => { Console.WriteLine(binding.stamp); };
+                await Task.Yield(); read();
+            } else { await Task.Yield(); }
+            if (mode == 0) { return; }
+            if (mode == 1) { throw; }
+            if (mode == 2) { throw nested; }
+        }
+    }
+    static async void GotoOwner(bool inside) {
+        try { throw original; }
+        catch (IdentityA binding) {
+            binding = new IdentityA(999);
+            bindingObserver = new WeakReference<IdentityA>(binding);
+            if (inside) { goto stillInside; }
+            goto done;
+        stillInside:
+            await Task.Yield();
+            Console.WriteLine(bindingObserver.IsAlive);
+        }
+    done:
+        await Task.Yield();
+    }
+    static void SyncBindingOwner(int mode) {
+        try { throw original; }
+        catch (IdentityA binding) {
+            binding = new IdentityA(999);
+            bindingObserver = new WeakReference<IdentityA>(binding);
+            if (mode == 0) { return; }
+            if (mode == 1) { throw; }
+            if (mode == 2) { throw nested; }
+            if (mode == 3) { goto doneSync; }
+        }
+    doneSync:
+        return;
+    }
+    static async int Override() {
+        try { await AwaitA(); }
+        finally { await Task.Yield(); return 73; }
+    }
+    static void CheckA() {
+        try { await RethrowA(); }
+        catch (IdentityA a) {
+            Console.WriteLine(a == original);
+            Console.WriteLine(a.stamp);
+        }
+    }
+    static void Main() {
+        keepA = new List<IdentityA>(); keepB = new List<IdentityB>();
+        Fresh();
+        int i = 0;
+        while (i < 3) {
+            Fresh();
+            try { await Pending(i); }
+            catch (IdentityA a) {
+                Console.WriteLine(a == original);
+                Console.WriteLine(a.stamp);
+            }
+            i = i + 1;
+        }
+        Console.WriteLine(nested.stamp);
+        Fresh(); CheckA();
+        Fresh(); try { await Replace(true); }
+        catch (IdentityB b) { Console.WriteLine(b == nested); Console.WriteLine(b.stamp); }
+        Fresh(); try { await Replace(false); }
+        catch (IdentityB b) { Console.WriteLine(b == nested); Console.WriteLine(b.stamp); }
+        i = 0;
+        while (i < 2) {
+            Fresh();
+            try { await CatchEscape(i == 0); }
+            catch (IdentityB b) { Console.WriteLine(b == nested); }
+            try { await ForeachSnapshot(i == 0); }
+            catch (IdentityA a) { Console.WriteLine(a == original); Console.WriteLine(a.stamp); }
+            i = i + 1;
+        }
+        Fresh(); await CapturedCatch();
+        Fresh(); Console.WriteLine(await Override());
+        i = 0;
+        while (i < 4) {
+            Fresh();
+            try { await BindingOwner(i); } catch (Exception ignored) { }
+            Console.WriteLine(bindingObserver.IsAlive);
+            i = i + 1;
+        }
+        Fresh(); await GotoOwner(false); Console.WriteLine(bindingObserver.IsAlive);
+        Fresh(); await GotoOwner(true); Console.WriteLine(bindingObserver.IsAlive);
+        i = 0;
+        while (i < 5) {
+            Fresh(); try { SyncBindingOwner(i); } catch (Exception ignored) { }
+            Console.WriteLine(bindingObserver.IsAlive); i = i + 1;
+        }
+    }
+}

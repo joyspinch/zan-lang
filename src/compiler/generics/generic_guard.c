@@ -256,7 +256,8 @@ static void emit_throw_guard_exception(zan_irgen_t *g, zan_symbol_t *sym,
     }
 
     (void)top_g;
-    emit_raise_exception(g);
+    if (g->current_async_frame) emit_raise_exception(g);
+    else emit_raise_exception_through_cleanups(g);
 }
 void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg) {

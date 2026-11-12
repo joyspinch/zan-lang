@@ -436,6 +436,10 @@
                     int n_eh_args = 0;
                     LLVMValueRef recv = emit_guarded_member_object_ex(
                         g, callee, locals, m_async != 0);
+                    /* Getter/call receivers transfer +1 ownership. Keep it armed
+                     * while evaluating arguments and invoking the implementation. */
+                    int recv_eh_pushed = emit_intrinsic_own_recv(
+                        g, callee->member.object, recv, locals);
                     LLVMValueRef *avals = (LLVMValueRef *)calloc((size_t)(uargc > 0 ? uargc : 1),
                                                                 sizeof(LLVMValueRef));
                     for (int k = 0; k < uargc; k++) {
@@ -549,6 +553,7 @@
                         }
                         for (int k = 0; k < n_eh_args; k++)
                             emit_eh_tmp_pop(g);
+                        if (recv_eh_pushed) emit_eh_tmp_pop(g);
                         for (int k = 0; k < uargc; k++)
                             emit_release_owned_call_temp(g, expr->call.args.items[k], avals[k], locals);
                         emit_release_owned_call_temp(g, callee->member.object, recv, locals);
@@ -620,6 +625,7 @@
                     }
                     for (int k = 0; k < n_eh_args; k++)
                         emit_eh_tmp_pop(g);
+                    if (recv_eh_pushed) emit_eh_tmp_pop(g);
                     for (int k = 0; k < uargc; k++)
                         emit_release_owned_call_temp(g, expr->call.args.items[k],
                                                      avals[k], locals);

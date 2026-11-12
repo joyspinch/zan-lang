@@ -1,0 +1,31 @@
+if(NOT DEFINED ZANC OR NOT DEFINED CC OR NOT DEFINED ROOT OR NOT DEFINED OUT_EXE)
+  message(FATAL_ERROR "ZANC, CC, ROOT and OUT_EXE are required")
+endif()
+get_filename_component(case_dir "${OUT_EXE}" DIRECTORY)
+file(MAKE_DIRECTORY "${case_dir}")
+set(object "${case_dir}/arc_deferred_stack_fixture.o")
+set(log_dir "${case_dir}/../test-out/exit-arc-defer")
+file(MAKE_DIRECTORY "${log_dir}")
+execute_process(COMMAND "${CC}" -std=c11 -I "${ROOT}/src/common"
+  -c "${ROOT}/tests/runtime/arc_deferred_stack.c" -o "${object}"
+  RESULT_VARIABLE native_rc OUTPUT_VARIABLE native_out ERROR_VARIABLE native_err TIMEOUT 30)
+if(NOT native_rc STREQUAL "0")
+  message(FATAL_ERROR "native fixture failed (${native_rc}): ${native_out}${native_err}")
+endif()
+execute_process(COMMAND "${ZANC}" "${ROOT}/tests/conformance/arc_deferred_stack.zan"
+  --no-stdlib -O1 --link-input "${object}" -o "${OUT_EXE}"
+  RESULT_VARIABLE compile_rc OUTPUT_VARIABLE compile_out ERROR_VARIABLE compile_err TIMEOUT 40)
+file(WRITE "${log_dir}/compile.log" "exit=${compile_rc}\n${compile_out}${compile_err}")
+if(NOT compile_rc STREQUAL "0")
+  message(FATAL_ERROR "Zan fixture failed (${compile_rc}): ${compile_out}${compile_err}")
+endif()
+execute_process(COMMAND "${OUT_EXE}" RESULT_VARIABLE run_rc
+  OUTPUT_VARIABLE actual ERROR_VARIABLE errors TIMEOUT 15)
+file(WRITE "${log_dir}/run.log" "exit=${run_rc}\n${actual}${errors}")
+file(READ "${ROOT}/tests/conformance/arc_deferred_stack.out" expected)
+string(REPLACE "\r\n" "\n" actual "${actual}")
+string(REPLACE "\r\n" "\n" expected "${expected}")
+if(NOT run_rc STREQUAL "0" OR NOT actual STREQUAL expected OR NOT errors STREQUAL "")
+  message(FATAL_ERROR "ARC deferred regression failed (${run_rc}): ${actual}${errors}")
+endif()
+message(STATUS "stack lifetime, nested heap depth bound and thread isolation passed")

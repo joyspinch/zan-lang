@@ -119,8 +119,25 @@
         ensure_function_personality(g, fn);
         LLVMTypeRef lp_ret_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
         LLVMValueRef lp_slot = emit_entry_alloca(g, lp_ret_ty, "lp.slot");
-        LLVMValueRef lp_val = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), (ncatch > 0) ? 1 : 0, "lp");
-        if (ncatch > 0) {
+        /* Native EH searches the innermost invoke's clauses, not other
+         * landing pads in the same function. A finally-only try inside a
+         * catch region must advertise that enclosing handler too, or phase
+         * one skips this entire frame before its finally can propagate. */
+        bool has_enclosing_catch = false;
+        for (int d = g->lpad_depth - 1; d >= 0; d--) {
+            if (g->lpad_stack[d].fn != fn) break;
+            if (g->lpad_stack[d].catch_bb) {
+                has_enclosing_catch = true;
+                break;
+            }
+        }
+        /* A synchronous finally may suppress the exception with return/goto,
+         * even with no enclosing catch. It must be selected during phase one. */
+        bool catches_native = ncatch > 0 || has_enclosing_catch ||
+            (!g->current_async_frame && stmt->try_stmt.finally_body);
+        LLVMValueRef lp_val = LLVMBuildLandingPad(g->builder, lp_ret_ty,
+            get_eh_personality_fn(g), catches_native ? 1 : 0, "lp");
+        if (catches_native) {
             LLVMAddClause(lp_val, LLVMConstNull(i8ptr));
         }
         LLVMSetCleanup(lp_val, 1);
@@ -173,6 +190,7 @@
             try_lpad_entry->fn = fn;
             try_lpad_entry->throw_locals_base = try_start;
             try_lpad_entry->fin_idx = fin_idx;
+            try_lpad_entry->finally_depth = g->finally_count;
             try_lpad_entry->cleanups = NULL;
             try_lpad_entry->cleanup_count = 0;
             try_lpad_entry->cleanup_cap = 0;
@@ -186,6 +204,13 @@
             g->eh_armed[armed_idx].restore_tmps = false;
         }
         emit_stmt(g, stmt->try_stmt.try_body, locals);
+        /* Catch/finally emission reuses the retired stack slot. Keep this
+         * try's cleanup ledger independent of those later lexical regions. */
+        zan_lpad_entry_t try_lpad_snapshot;
+        if (try_lpad_entry) {
+            try_lpad_snapshot = *try_lpad_entry;
+            try_lpad_entry = &try_lpad_snapshot;
+        }
         if (armed_idx >= 0) g->eh_armed_count = armed_idx;
         if (fin_idx >= 0) g->finallys[fin_idx].in_try_body = false;
         g->throw_locals_base = saved_throw_base;
@@ -362,7 +387,58 @@
                         "out of memory tracking nested catch handlers");
                 }
                 int saved_cc = g->catch_cleanup_count;
+                int catch_lpad_depth = g->lpad_depth;
+                int catch_throw_base = g->throw_locals_base;
+                int catch_throw_cbase = g->throw_catch_base;
+                LLVMBasicBlockRef cleanup_bb = NULL;
+                if (!g->current_async_frame &&
+                    g->lpad_depth < ZAN_MAX_ARMED_TRY) {
+                    cleanup_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                        "catch.cleanup");
+                    LLVMBasicBlockRef cleanup_lpad = LLVMAppendBasicBlockInContext(
+                        g->ctx, fn, "catch.cleanup.lpad");
+                    zan_builder_point_t pt = zan_builder_save(g);
+                    LLVMPositionBuilderAtEnd(g->builder, cleanup_lpad);
+                    bool catches_cleanup = has_enclosing_catch || fin_idx >= 0;
+                    LLVMValueRef lp = LLVMBuildLandingPad(g->builder, lp_ret_ty,
+                        get_eh_personality_fn(g), catches_cleanup ? 1 : 0,
+                        "catch.lp");
+                    if (catches_cleanup) LLVMAddClause(lp, LLVMConstNull(i8ptr));
+                    LLVMSetCleanup(lp, 1);
+                    LLVMBuildStore(g->builder, lp, lp_slot);
+                    LLVMBuildBr(g->builder, cleanup_bb);
+                    zan_builder_restore(g, pt);
+                    zan_lpad_entry_t *entry = &g->lpad_stack[g->lpad_depth++];
+                    memset(entry, 0, sizeof(*entry));
+                    entry->fn = fn;
+                    entry->lpad_bb = cleanup_lpad;
+                    entry->catch_bb = cleanup_bb; /* Cleanup only; no sibling match. */
+                    entry->fin_idx = fin_idx;
+                    entry->finally_depth = g->finally_count;
+                    entry->throw_locals_base = catch_start;
+                    g->throw_locals_base = catch_start;
+                    g->throw_catch_base = saved_cc;
+                }
                 emit_stmt(g, cc->catch_clause.body, locals);
+                if (cleanup_bb) {
+                    zan_lpad_entry_t cleanup = g->lpad_stack[catch_lpad_depth];
+                    g->lpad_depth = catch_lpad_depth;
+                    g->throw_locals_base = catch_throw_base;
+                    g->throw_catch_base = catch_throw_cbase;
+                    zan_builder_point_t pt = zan_builder_save(g);
+                    LLVMPositionBuilderAtEnd(g->builder, cleanup_bb);
+                    emit_release_active_catch_excs(g, saved_cc - 1);
+                    emit_eh_tmp_unwind_to(g, LLVMBuildLoad2(g->builder, i32t,
+                        tmp_mark_slot, "catch.tmp.mark"));
+                    emit_lpad_cleanups(g, &cleanup);
+                    /* The departing catch must not be visible inside finally. */
+                    g->catch_cleanup_count = saved_cc - 1;
+                    emit_finally_on_exception_path(g, locals, fin_idx);
+                    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                        emit_eh_propagate_tail_lpad(g, locals, lp_slot, lp_ret_ty, true);
+                    free(cleanup.cleanups);
+                    zan_builder_restore(g, pt);
+                }
                 g->catch_cleanup_count = saved_cc - 1;
                 locals->count = catch_start;
                 if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))

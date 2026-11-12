@@ -1,0 +1,72 @@
+using System;
+using System.IO;
+using System.Threading;
+
+class Program {
+    static AtomicInt identities = new AtomicInt(0);
+    static AtomicInt ready = new AtomicInt(0);
+    static AtomicInt phase = new AtomicInt(0);
+    static AtomicInt finished = new AtomicInt(0);
+    static AtomicInt failures = new AtomicInt(0);
+    static AtomicInt exited = new AtomicInt(0);
+    const int Workers = 16;
+    const int Rounds = 64;
+
+    static void Worker() {
+        long id = identities.Increment();
+        try {
+            for (int round = 0; round < Rounds; round = round + 1) {
+                string name = "race/" + Convert.ToString(round) + ".txt";
+                int length = round % 2 == 0 ? 65536 : 257;
+                ready.Increment();
+                while (phase.Load() <= round) { Thread.Sleep(0); }
+                if (id % 2 == 0) {
+                    byte[] lengthOut = new byte[4];
+                    nint data = File.zan_embed_bytes(name, lengthOut);
+                    int actualLength = (int)lengthOut[0] + ((int)lengthOut[1] << 8)
+                        + ((int)lengthOut[2] << 16) + ((int)lengthOut[3] << 24);
+                    bool ok = data != 0 && actualLength == length;
+                    if (ok) {
+                        for (int i = 0; i < length; i = i + 1) {
+                            if (Marshal.ReadByte(data, i) != (byte)('A' + round % 26)) { ok = false; break; }
+                        }
+                    }
+                    if (!ok) { failures.Increment(); }
+                } else {
+                    string text = File.zan_embed_read(name);
+                    List<string> kept = new List<string>();
+                    kept.Add(text);
+                    bool ok = text.Length == length;
+                    if (ok) {
+                        for (int i = 0; i < length; i = i + 1) {
+                            if (text[i] != 'A' + round % 26) { ok = false; break; }
+                        }
+                    }
+                    if (!ok || kept[0] != File.zan_embed_read(name)) { failures.Increment(); }
+                    kept.Clear();
+                }
+                finished.Increment();
+            }
+        } catch (Exception ex) { failures.Increment(); }
+        exited.Increment();
+    }
+
+    static int Main() {
+        for (int i = 0; i < Workers; i = i + 1) {
+            if (!Thread.Start(Worker)) { return 2; }
+        }
+        for (int round = 0; round < Rounds; round = round + 1) {
+            int spins = 0;
+            while (ready.Load() < (round + 1) * Workers && spins < 30000) { Thread.Sleep(1); spins = spins + 1; }
+            if (spins == 30000) { return 3; }
+            phase.Store(round + 1);
+            spins = 0;
+            while (finished.Load() < (round + 1) * Workers && spins < 30000) { Thread.Sleep(1); spins = spins + 1; }
+            if (spins == 30000) { return 4; }
+        }
+        while (exited.Load() < Workers) { Thread.Sleep(1); }
+        if (failures.Load() != 0) { Console.WriteLine("FAIL embed first read data integrity"); return 1; }
+        Console.WriteLine("PASS embed first read concurrency");
+        return 0;
+    }
+}

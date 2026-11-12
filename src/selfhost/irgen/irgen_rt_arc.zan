@@ -4,6 +4,7 @@ namespace Zan;
 
 partial class Irgen {
     void EmitArcRuntime() {
+        EmitDelegateOwnershipRuntime();
         // header layout, 24 bytes before the object pointer: [ i8* class id ]
         // [ i64 refcount ] [ i8* destructor ]. zalloc records all three;
         // zrelease at count 0 runs the destructor (which releases members /
@@ -33,7 +34,16 @@ partial class Irgen {
         H("define void @zretain(i8* %p) {");
         H("entry:");
         H("  %isnull = icmp eq i8* %p, null");
-        H("  br i1 %isnull, label %done, label %go");
+        H("  br i1 %isnull, label %done, label %kind");
+        H("kind:");
+        H("  %mp = getelementptr i8, i8* %p, i64 -8");
+        H("  %ms = bitcast i8* %mp to i64*");
+        H("  %magic = load i64, i64* %ms");
+        H("  %str = icmp eq i64 %magic, 1515082580");
+        H("  br i1 %str, label %string, label %go");
+        H("string:");
+        H("  call void @zstr_retain(i8* %p)");
+        H("  br label %done");
         H("go:");
         H("  %hdr = getelementptr i8, i8* %p, i64 -16");
         H("  %rc = bitcast i8* %hdr to i64*");
@@ -49,7 +59,16 @@ partial class Irgen {
         H("define void @zrelease(i8* %p) {");
         H("entry:");
         H("  %isnull = icmp eq i8* %p, null");
-        H("  br i1 %isnull, label %done, label %go");
+        H("  br i1 %isnull, label %done, label %kind");
+        H("kind:");
+        H("  %mp = getelementptr i8, i8* %p, i64 -8");
+        H("  %ms = bitcast i8* %mp to i64*");
+        H("  %magic = load i64, i64* %ms");
+        H("  %str = icmp eq i64 %magic, 1515082580");
+        H("  br i1 %str, label %string, label %go");
+        H("string:");
+        H("  call void @zstr_release(i8* %p)");
+        H("  br label %done");
         H("go:");
         H("  %hdr = getelementptr i8, i8* %p, i64 -16");
         H("  %rc = bitcast i8* %hdr to i64*");
@@ -93,14 +112,24 @@ partial class Irgen {
         H("define i8* @__zan_class_id(i8* %obj) {");
         H("entry:");
         H("  %isnull = icmp eq i8* %obj, null");
-        H("  br i1 %isnull, label %none, label %read");
+        H("  %bits = ptrtoint i8* %obj to i64");
+        H("  %tag = and i64 %bits, 1");
+        H("  %delegate = icmp ne i64 %tag, 0");
+        H("  %skip = or i1 %isnull, %delegate");
+        H("  br i1 %skip, label %none, label %read");
         H("none:");
         H("  ret i8* null");
         H("read:");
         H("  %cp = getelementptr i8, i8* %obj, i64 -24");
         H("  %cs = bitcast i8* %cp to i8**");
         H("  %cid = load i8*, i8** %cs");
-        H("  ret i8* %cid");
+        H("  %id = ptrtoint i8* %cid to i64");
+        H("  %kind = and i64 %id, 1");
+        H("  %tagged = icmp ne i64 %kind, 0");
+        H("  %address = icmp uge i64 %id, 9");
+        H("  %array = and i1 %tagged, %address");
+        H("  %result = select i1 %array, i8* null, i8* %cid");
+        H("  ret i8* %result");
         H("}");
         // Is the object a managed string? The string header keeps a magic word
         // right before the payload; a class instance has a destructor pointer
@@ -108,7 +137,20 @@ partial class Irgen {
         H("define i64 @__zan_is_string(i8* %obj) {");
         H("entry:");
         H("  %isnull = icmp eq i8* %obj, null");
-        H("  br i1 %isnull, label %no, label %read");
+        H("  %bits = ptrtoint i8* %obj to i64");
+        H("  %tag = and i64 %bits, 1");
+        H("  %delegate = icmp ne i64 %tag, 0");
+        H("  %skip = or i1 %isnull, %delegate");
+        H("  br i1 %skip, label %no, label %identity");
+        H("identity:");
+        H("  %ip = getelementptr i8, i8* %obj, i64 -24");
+        H("  %is = bitcast i8* %ip to i64*");
+        H("  %id = load i64, i64* %is");
+        H("  %kind = and i64 %id, 1");
+        H("  %tagged = icmp ne i64 %kind, 0");
+        H("  %address = icmp uge i64 %id, 9");
+        H("  %array = and i1 %tagged, %address");
+        H("  br i1 %array, label %no, label %read");
         H("no:");
         H("  ret i64 0");
         H("read:");
@@ -164,8 +206,11 @@ partial class Irgen {
     bool ArcManaged(Node t) {
         if (t == null) { return false; }
         if (IsErasedType(t)) { return false; }
-        if (IsNullableValue(t)) { return false; }
+        if (IsNullableValue(t)) { return true; }
         if (t.ival >= 1) { return false; }
+        if (DynamicReferenceType(t)) { return true; }
+        if (IsDelegate(t)) { return true; }
+        if (IsStr(t)) { return true; }
         string n = t.sval;
         // hardware vectors are first-class values, not ARC-managed heap objects
         if (n == "Vector128" || n == "Vector256" || n == "Span" || n == "ReadOnlySpan") { return false; }
@@ -176,6 +221,24 @@ partial class Irgen {
     }
 
     void EmitArcRetain(string val, Node ty) {
+        if (ty == null) { return; }
+        if (ty.ival >= 1) {
+            EmitArrayRetain(val, MapType(ty), ty);
+            return;
+        }
+        if (DynamicReferenceType(ty)) {
+            string p = val;
+            if (MapType(ty) != "i8*") {
+                p = NT();
+                L("  " + p + " = bitcast " + MapType(ty) + " " + val + " to i8*");
+            }
+            L("  call void @zref_retain(i8* " + p + ")");
+            return;
+        }
+        if (IsDelegate(ty)) {
+            L("  call void @zdelegate_retain(i8* " + val + ")");
+            return;
+        }
         if (!ArcManaged(ty)) { return; }
         string lt = MapType(ty);
         if (lt == "i8*") {
@@ -188,22 +251,7 @@ partial class Irgen {
     }
 
     void EmitArcRetainObject(string val) {
-        int lnotstr = NL();
-        int lskip = NL();
-        string isNull = NT();
-        L("  " + isNull + " = icmp eq i8* " + val + ", null");
-        L("  br i1 " + isNull + ", label %L" + lskip + ", label %L" + lnotstr);
-        Label(lnotstr);
-        string isStr = NT();
-        L("  " + isStr + " = call i64 @__zan_is_string(i8* " + val + ")");
-        string isZero = NT();
-        L("  " + isZero + " = icmp eq i64 " + isStr + ", 0");
-        int lret = NL();
-        L("  br i1 " + isZero + ", label %L" + lret + ", label %L" + lskip);
-        Label(lret);
-        L("  call void @zretain(i8* " + val + ")");
-        L("  br label %L" + lskip);
-        Label(lskip);
+        L("  call void @zref_retain(i8* " + val + ")");
     }
 
     // Retain a value that is stored into a slot.  An ARC-managed slot type
@@ -213,13 +261,32 @@ partial class Irgen {
     // the *value's* type.  A string has no refcount and must not be retained
     // (its header carries the length, not a count).
     void EmitArcRetainStore(string val, Node slotTy, Node valTy) {
+        if (slotTy != null && slotTy.ival >= 1) { EmitArcRetain(val, slotTy); return; }
         if (ArcManaged(slotTy)) { EmitArcRetain(val, slotTy); return; }
-        if (valTy == null || !ArcManaged(valTy)) { return; }
+        if (valTy == null || (!ArcManaged(valTy) && valTy.ival < 1)) { return; }
         if (MapType(slotTy) != "i8*") { return; }
         EmitArcRetain(val, valTy);
     }
 
     void EmitArcRelease(string val, Node ty) {
+        if (ty == null) { return; }
+        if (ty.ival >= 1) {
+            EmitArrayRelease(val, MapType(ty), ty);
+            return;
+        }
+        if (DynamicReferenceType(ty)) {
+            string p = val;
+            if (MapType(ty) != "i8*") {
+                p = NT();
+                L("  " + p + " = bitcast " + MapType(ty) + " " + val + " to i8*");
+            }
+            L("  call void @zref_release(i8* " + p + ")");
+            return;
+        }
+        if (IsDelegate(ty)) {
+            L("  call void @zdelegate_release(i8* " + val + ")");
+            return;
+        }
         if (!ArcManaged(ty)) { return; }
         string lt = MapType(ty);
         if (lt == "i8*") {
@@ -236,7 +303,19 @@ partial class Irgen {
     }
 
     void AddTemp(string op, Node ty) {
-        if (!ArcManaged(ty)) { return; }
+        int previous = stmtTempValues.Count - 1;
+        while (previous >= 0) {
+            if (stmtTempValues[previous] == op) {
+                int live = 0;
+                while (live < stmtTemps.Count) {
+                    if (stmtTemps[live] == stmtTempOwners[previous]) { return; }
+                    live = live + 1;
+                }
+            }
+            previous = previous - 1;
+        }
+        if (ty == null) { return; }
+        if (!ArcManaged(ty) && ty.ival < 1) { return; }
         // ARC 临时值的释放点固定在语句末尾，而它可能生成在某个分支里
         // （三元、if 分支、循环体）。直接拿寄存器值去释放，会在合并块
         // 里违反支配关系（LLVM: "Instruction does not dominate all uses"）。
@@ -250,10 +329,12 @@ partial class Irgen {
             entryAllocas.Append("  store " + lt + " null, " + lt + "* " + reg + "\n");
             L("  store " + lt + " " + op + ", " + lt + "* " + reg);
             stmtTemps.Add(reg);
+            stmtTempValues.Add(op); stmtTempOwners.Add(reg);
             stmtTempTypes.Add(ty);
             return;
         }
         stmtTemps.Add(op);
+        stmtTempValues.Add(op); stmtTempOwners.Add(op);
         stmtTempTypes.Add(ty);
     }
 
@@ -266,6 +347,7 @@ partial class Irgen {
                 string lt = MapType(stmtTempTypes[i]);
                 string v = NT();
                 L("  " + v + " = load " + lt + ", " + lt + "* " + op);
+                L("  store " + lt + " null, " + lt + "* " + op);
                 EmitArcRelease(v, stmtTempTypes[i]);
             } else {
                 EmitArcRelease(op, stmtTempTypes[i]);
@@ -283,7 +365,25 @@ partial class Irgen {
             if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { i = i + 1; continue; }
             // a by-ref parameter's reference belongs to the CALLER's slot
             if (i < locRef.Count && locRef[i]) { i = i + 1; continue; }
-            if (ArcManaged(locType[i])) {
+            if (curAsync && ReleaseAsyncCatchLocal(locReg[i])) { i = i + 1; continue; }
+            if (locBox[i]) {
+                string cell = locCell[i];
+                if (curAsync) {
+                    if (IsDirectAsyncLocal(locReg[i])) { RetireLocalSlot(locReg[i], "i8*"); }
+                    cell = NT();
+                    L("  " + cell + " = load i8*, i8** " + locReg[i]);
+                    L("  store i8* null, i8** " + locReg[i]);
+                } else {
+                    string ownerSlot = locReg[i] + ".local.owner";
+                    RetireLocalSlot(ownerSlot, "i8*");
+                    cell = NT();
+                    L("  " + cell + " = load i8*, i8** " + ownerSlot);
+                    L("  store i8* null, i8** " + ownerSlot);
+                }
+                EmitCellRelease(cell);
+                i = i + 1; continue;
+            }
+            if (ArcManaged(locType[i]) || (locType[i] != null && locType[i].ival >= 1)) {
                 string lt = MapType(locType[i]);
                 string t = NT();
                 if (curAsync && locBox[i]) {
@@ -297,12 +397,44 @@ partial class Irgen {
                     L("  " + t + " = load " + lt + ", " + lt + "* " + p);
                     EmitArcRelease(t, locType[i]);
                 } else {
+                    if (!curAsync || IsDirectAsyncLocal(locReg[i])) { RetireLocalSlot(locReg[i], lt); }
                     L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                    L("  store " + lt + " null, " + lt + "* " + locReg[i]);
                     EmitArcRelease(t, locType[i]);
                 }
             }
             i = i + 1;
         }
+    }
+
+    void EmitArrayRetain(string arr, string lt, Node ty) {
+        string a = arr;
+        if (lt != "i64*") {
+            string t = NT();
+            L("  " + t + " = bitcast " + lt + " " + arr + " to i64*");
+            a = t;
+        }
+        if (ArrRankOf(ty) > 1) {
+            string owner = NT();
+            L("  " + owner + " = call i64* @zarr_owner(i64* " + a + ", i64 " + ArrRankOf(ty) + ")");
+            a = owner;
+        }
+        L("  call void @zarr_retain(i64* " + a + ")");
+    }
+
+    void EmitArrayRelease(string arr, string lt, Node ty) {
+        string a = arr;
+        if (lt != "i64*") {
+            string t = NT();
+            L("  " + t + " = bitcast " + lt + " " + arr + " to i64*");
+            a = t;
+        }
+        if (ArrRankOf(ty) > 1) {
+            string owner = NT();
+            L("  " + owner + " = call i64* @zarr_owner(i64* " + a + ", i64 " + ArrRankOf(ty) + ")");
+            a = owner;
+        }
+        L("  call void @zarr_release(i64* " + a + ")");
     }
 
     void TrimLocals(int to) {
@@ -359,14 +491,43 @@ partial class Irgen {
                     EmitWeakClear(ws);
                     seq = seq + 1;
                 }
-            } else if (ArcManaged(types[i])) {
+            } else if (ArcManaged(types[i]) || (types[i] != null && types[i].ival >= 1)) {
                 int idx = fb + i;
                 string lt = MapType(types[i]);
                 string fp = "%f" + seq;
                 string fv = "%v" + seq;
                 H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
                 H("  " + fv + " = load " + lt + ", " + lt + "* " + fp);
-                if (lt == "i8*") {
+                if (types[i].ival >= 1) {
+                    if (lt == "i64*") {
+                        if (ArrRankOf(types[i]) > 1) {
+                            string owner = "%ao" + seq;
+                            H("  " + owner + " = call i64* @zarr_owner(i64* " + fv + ", i64 " + ArrRankOf(types[i]) + ")");
+                            H("  call void @zarr_release(i64* " + owner + ")");
+                        } else {
+                            H("  call void @zarr_release(i64* " + fv + ")");
+                        }
+                    } else {
+                        string fc = "%c" + seq;
+                        H("  " + fc + " = bitcast " + lt + " " + fv + " to i64*");
+                        if (ArrRankOf(types[i]) > 1) {
+                            string owner = "%ao" + seq;
+                            H("  " + owner + " = call i64* @zarr_owner(i64* " + fc + ", i64 " + ArrRankOf(types[i]) + ")");
+                            H("  call void @zarr_release(i64* " + owner + ")");
+                        } else {
+                            H("  call void @zarr_release(i64* " + fc + ")");
+                        }
+                    }
+                } else if (DynamicReferenceType(types[i])) {
+                    string dynamicValue = fv;
+                    if (lt != "i8*") {
+                        dynamicValue = "%c" + seq;
+                        H("  " + dynamicValue + " = bitcast " + lt + " " + fv + " to i8*");
+                    }
+                    H("  call void @zref_release(i8* " + dynamicValue + ")");
+                } else if (IsDelegate(types[i])) {
+                    H("  call void @zdelegate_release(i8* " + fv + ")");
+                } else if (lt == "i8*") {
                     H("  call void @zrelease(i8* " + fv + ")");
                 } else {
                     string fc = "%c" + seq;
@@ -378,6 +539,169 @@ partial class Irgen {
             i = i + 1;
         }
         typeScopeCls = savedScope;
+        H("  ret void");
+        H("}");
+    }
+
+    // Exception payload ownership is independent of the language string model.
+    // kind 1 = class ARC, kind 2 = private string copy; active is never inferred
+    // from the pointer or tid. All transfers clear the source before cleanup.
+    void EmitExceptionPayloadRuntime() {
+        H("%zan.exception = type { i8*, i8*, i64, i64 }");
+        H("@zexc_dispatch = internal thread_local global %zan.exception zeroinitializer");
+        H("@zexc_owners = internal thread_local global i8* null");
+        H("@zexc_marks = internal thread_local global [64 x i8*] zeroinitializer");
+        H("define internal void @zexc_drop(%zan.exception* %r) {");
+        H("entry:");
+        H("  %rec = load %zan.exception, %zan.exception* %r");
+        H("  store %zan.exception zeroinitializer, %zan.exception* %r");
+        H("  %p = extractvalue %zan.exception %rec, 0");
+        H("  %k = extractvalue %zan.exception %rec, 2");
+        H("  %a = extractvalue %zan.exception %rec, 3");
+        H("  %live = icmp ne i64 %a, 0");
+        H("  br i1 %live, label %kind, label %end");
+        H("kind:");
+        H("  switch i64 %k, label %end [ i64 1, label %arc i64 2, label %str i64 3, label %local ]");
+        H("local:");
+        H("  %dt = extractvalue %zan.exception %rec, 1");
+        H("  %drop = bitcast i8* %dt to void (i8*)*");
+        H("  call void %drop(i8* %p)");
+        H("  br label %end");
+        H("arc:");
+        H("  call void @zrelease(i8* %p)");
+        H("  br label %end");
+        H("str:");
+        H("  %nonnull = icmp ne i8* %p, null");
+        H("  br i1 %nonnull, label %free, label %end");
+        H("free:");
+        H("  call void @zstr_release(i8* %p)");
+        H("  br label %end");
+        H("end:");
+        H("  ret void");
+        H("}");
+        H("define internal void @zexc_take(%zan.exception* %dst, %zan.exception* %src) {");
+        H("entry:");
+        H("  %same = icmp eq %zan.exception* %dst, %src");
+        H("  br i1 %same, label %end, label %move");
+        H("move:");
+        H("  %v = load %zan.exception, %zan.exception* %src");
+        H("  store %zan.exception zeroinitializer, %zan.exception* %src");
+        H("  call void @zexc_drop(%zan.exception* %dst)");
+        H("  store %zan.exception %v, %zan.exception* %dst");
+        H("  br label %end");
+        H("end:");
+        H("  ret void");
+        H("}");
+        H("define internal void @zexc_clone(%zan.exception* %dst, %zan.exception* %src) {");
+        H("entry:");
+        H("  %v = load %zan.exception, %zan.exception* %src");
+        H("  %p = extractvalue %zan.exception %v, 0");
+        H("  %k = extractvalue %zan.exception %v, 2");
+        H("  %a = extractvalue %zan.exception %v, 3");
+        H("  %live = icmp ne i64 %a, 0");
+        H("  br i1 %live, label %kind, label %copy");
+        H("kind:");
+        H("  switch i64 %k, label %copy [ i64 1, label %arc i64 2, label %str ]");
+        H("arc:");
+        H("  call void @zretain(i8* %p)");
+        H("  br label %copy");
+        H("str:");
+        H("  %nonnull = icmp ne i8* %p, null");
+        H("  br i1 %nonnull, label %dup, label %copy");
+        H("dup:");
+        H("  %q = call i8* @zstr_dup(i8* %p)");
+        H("  %sv = insertvalue %zan.exception %v, i8* %q, 0");
+        H("  br label %copy");
+        H("copy:");
+        H("  %out = phi %zan.exception [ %v, %entry ], [ %v, %kind ], [ %v, %arc ], [ %v, %str ], [ %sv, %dup ]");
+        H("  call void @zexc_drop(%zan.exception* %dst)");
+        H("  store %zan.exception %out, %zan.exception* %dst");
+        H("  ret void");
+        H("}");
+        EmitExceptionPublishRuntime();
+        EmitExceptionOwnerRuntime();
+        EmitLocalOwnerRuntime();
+    }
+
+    void EmitExceptionPublishRuntime() {
+        H("define internal void @zexc_publish(i8* %p, i8* %tid, i64 %kind, i64 %owned) {");
+        H("entry:");
+        H("  %tmp = alloca %zan.exception");
+        H("  %v0 = insertvalue %zan.exception zeroinitializer, i8* %p, 0");
+        H("  %v1 = insertvalue %zan.exception %v0, i8* %tid, 1");
+        H("  %v2 = insertvalue %zan.exception %v1, i64 %kind, 2");
+        H("  %v3 = insertvalue %zan.exception %v2, i64 1, 3");
+        H("  store %zan.exception %v3, %zan.exception* %tmp");
+        H("  %move = icmp ne i64 %owned, 0");
+        H("  br i1 %move, label %take, label %clone");
+        H("take:");
+        H("  call void @zexc_take(%zan.exception* @zexc_dispatch, %zan.exception* %tmp)");
+        H("  br label %end");
+        H("clone:");
+        H("  call void @zexc_clone(%zan.exception* @zexc_dispatch, %zan.exception* %tmp)");
+        H("  br label %end");
+        H("end:");
+        H("  ret void");
+        H("}");
+    }
+
+    // Heap nodes survive suspension; the coroutine stores its chain in frame.
+    // Generated ARC destructors release fields only and never run user code.
+    // Unwind unlinks a node, drops its payload, and frees the node storage.
+    void EmitExceptionOwnerRuntime() {
+        H("%zan.exception.owner = type { i8*, %zan.exception }");
+        H("define internal i8* @zexc_string_binding(i8* %p) {");
+        H("entry:");
+        // The only binding call site retains its local uniformly with classes.
+        H("  ret i8* %p");
+        H("}");
+        H("define internal %zan.exception* @zexc_push() {");
+        H("entry:");
+        H("  %raw = call i8* @malloc(i64 40)");
+        H("  %n = bitcast i8* %raw to %zan.exception.owner*");
+        H("  %prevp = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 0");
+        H("  %prev = load i8*, i8** @zexc_owners");
+        H("  store i8* %prev, i8** %prevp");
+        H("  %r = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 1");
+        H("  store %zan.exception zeroinitializer, %zan.exception* %r");
+        H("  store i8* %raw, i8** @zexc_owners");
+        H("  call void @zexc_take(%zan.exception* %r, %zan.exception* @zexc_dispatch)");
+        H("  ret %zan.exception* %r");
+        H("}");
+        H("define internal void @zexc_pop(%zan.exception* %r) {");
+        H("entry:");
+        H("  %p = bitcast %zan.exception* %r to i8*");
+        H("  %raw = getelementptr i8, i8* %p, i64 -8");
+        H("  br label %find");
+        H("find:");
+        H("  %link = phi i8** [ @zexc_owners, %entry ], [ %prevp, %step ]");
+        H("  %top = load i8*, i8** %link");
+        H("  %n = bitcast i8* %top to %zan.exception.owner*");
+        H("  %prevp = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 0");
+        H("  %same = icmp eq i8* %top, %raw");
+        H("  br i1 %same, label %remove, label %step");
+        H("step:");
+        H("  br label %find");
+        H("remove:");
+        H("  %prev = load i8*, i8** %prevp");
+        H("  store i8* %prev, i8** %link");
+        H("  call void @zexc_drop(%zan.exception* %r)");
+        H("  call void @free(i8* %raw)");
+        H("  ret void");
+        H("}");
+        H("define internal void @zexc_unwind(i8* %mark) {");
+        H("entry:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %top = load i8*, i8** @zexc_owners");
+        H("  %done = icmp eq i8* %top, %mark");
+        H("  br i1 %done, label %end, label %pop");
+        H("pop:");
+        H("  %n = bitcast i8* %top to %zan.exception.owner*");
+        H("  %r = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 1");
+        H("  call void @zexc_pop(%zan.exception* %r)");
+        H("  br label %loop");
+        H("end:");
         H("  ret void");
         H("}");
     }
@@ -403,10 +727,12 @@ partial class Irgen {
         H("}");
         H("define i8* @zstr_new(i64 %len) {");
         H("entry:");
-        H("  %tot = add i64 %len, 25");
-        H("  %raw = call i8* @malloc(i64 %tot)");
-        // the class-id slot makes the string header the same size as an object
-        // header, so reading it is always in bounds
+        H("  %tot = add i64 %len, 33");
+        H("  %base = call i8* @malloc(i64 %tot)");
+        H("  %rc = bitcast i8* %base to i64*");
+        H("  store i64 1, i64* %rc");
+        H("  %raw = getelementptr i8, i8* %base, i64 8");
+        // Preserve cid/len/magic at -24/-16/-8; RC lives at -32.
         H("  %cp = getelementptr i8, i8* %raw, i64 0");
         H("  %cs = bitcast i8* %cp to i8**");
         H("  store i8* null, i8** %cs");
@@ -419,6 +745,7 @@ partial class Irgen {
         H("  store i8 0, i8* %endp");
         H("  ret i8* %p");
         H("}");
+        EmitStrOwnershipRuntime();
         H("define i64 @zstr_len(i8* %p) {");
         H("entry:");
         // a null string is a soft runtime error in the C host: it reports and
@@ -432,34 +759,28 @@ partial class Irgen {
         H("  %mp = getelementptr i8, i8* %p, i64 -8");
         H("  %m = load i64, i64* %mp");
         H("  %ok = icmp eq i64 %m, 1515082580");
-        H("  br i1 %ok, label %good, label %bad");
+        H("  br i1 %ok, label %good, label %arrhdr");
         H("good:");
         H("  %lp = getelementptr i8, i8* %p, i64 -16");
         H("  %len = load i64, i64* %lp");
         H("  ret i64 %len");
-        H("bad:");
-        H("  call void @zstr_bad()");
-        H("  ret i64 0");
+        H("arrhdr:");
+        H("  ret i64 %m");
         H("}");
         // The C-visible length: the offset of the first NUL byte, i.e. what a
         // C string operation (strlen / strstr / printf) sees.  The C host keeps
         // the exact length for Length / indexing / concatenation but truncates
         // its search and transform methods at the first NUL, so the
         // self-hosted backend has to split the two as well (A390).
-        // %p must be the base of a managed string; the magic check keeps a
-        // bogus pointer fail-closed instead of silently measuring garbage.
         H("define i64 @zstr_clen(i8* %p) {");
         H("entry:");
-        H("  %mp = getelementptr i8, i8* %p, i64 -8");
-        H("  %m = load i64, i64* %mp");
-        H("  %ok = icmp eq i64 %m, 1515082580");
-        H("  br i1 %ok, label %good, label %bad");
-        H("good:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %nullstr, label %probe");
+        H("nullstr:");
+        H("  ret i64 0");
+        H("probe:");
         H("  %n = call i64 @strlen(i8* %p)");
         H("  ret i64 %n");
-        H("bad:");
-        H("  call void @zstr_bad()");
-        H("  ret i64 0");
         H("}");
         H("define i8* @zstr_dup(i8* %p) {");
         H("entry:");
@@ -474,6 +795,59 @@ partial class Irgen {
         H("  %q = call i8* @zstr_new(i64 %n)");
         H("  call i8* @memcpy(i8* %q, i8* %c, i64 %n)");
         H("  ret i8* %q");
+        H("}");
+    }
+
+    // Strings share the managed identity prefix, but length is not an RC.
+    // Literal RC=-1 is immutable; heap RC starts at one and frees the raw base.
+    void EmitStrOwnershipRuntime() {
+        H("define void @zstr_retain(i8* %p) {");
+        H("entry:");
+        H("  %nil = icmp eq i8* %p, null");
+        H("  br i1 %nil, label %done, label %read");
+        H("read:");
+        H("  %identityp = getelementptr i8, i8* %p, i64 -24");
+        H("  %identityslot = bitcast i8* %identityp to i64*");
+        H("  %identity = load i64, i64* %identityslot");
+        H("  %ordinary = icmp eq i64 %identity, 0");
+        H("  br i1 %ordinary, label %counted, label %done");
+        H("counted:");
+        H("  %raw = getelementptr i8, i8* %p, i64 -32");
+        H("  %rc = bitcast i8* %raw to i64*");
+        H("  %count = load i64, i64* %rc");
+        H("  %imm = icmp eq i64 %count, -1");
+        H("  br i1 %imm, label %done, label %add");
+        H("add:");
+        H("  %old = atomicrmw add i64* %rc, i64 1 monotonic");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+        H("define void @zstr_release(i8* %p) {");
+        H("entry:");
+        H("  %nil = icmp eq i8* %p, null");
+        H("  br i1 %nil, label %done, label %read");
+        H("read:");
+        H("  %identityp = getelementptr i8, i8* %p, i64 -24");
+        H("  %identityslot = bitcast i8* %identityp to i64*");
+        H("  %identity = load i64, i64* %identityslot");
+        H("  %ordinary = icmp eq i64 %identity, 0");
+        H("  br i1 %ordinary, label %counted, label %done");
+        H("counted:");
+        H("  %raw = getelementptr i8, i8* %p, i64 -32");
+        H("  %rc = bitcast i8* %raw to i64*");
+        H("  %count = load i64, i64* %rc");
+        H("  %imm = icmp eq i64 %count, -1");
+        H("  br i1 %imm, label %done, label %sub");
+        H("sub:");
+        H("  %old = atomicrmw sub i64* %rc, i64 1 acq_rel");
+        H("  %last = icmp eq i64 %old, 1");
+        H("  br i1 %last, label %free, label %done");
+        H("free:");
+        H("  call void @free(i8* %raw)");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
         H("}");
     }
 
@@ -498,8 +872,16 @@ partial class Irgen {
         H("probe:");
         H("  %lp = getelementptr i64, i64* %p, i64 -1");
         H("  %len = load i64, i64* %lp");
+        H("  %isstr = icmp eq i64 %len, 1515082580");
+        H("  br i1 %isstr, label %strhdr, label %done");
+        H("strhdr:");
+        H("  %sp = getelementptr i64, i64* %p, i64 -2");
+        H("  %slen = load i64, i64* %sp");
+        H("  ret i64 %slen");
+        H("done:");
         H("  ret i64 %len");
         H("}");
+        EmitArrayOwnershipRuntime();
     }
 
     // StringBuilder: growable byte buffer { count, cap, i8* data }. Append is
@@ -685,6 +1067,7 @@ partial class Irgen {
         H("  store i64 %rov1, i64* %out");
         H("  %fin = call i8* @zstr_new(i64 %rov1)");
         H("  call i8* @memcpy(i8* %fin, i8* %buf, i64 %rov1)");
+        H("  call void @free(i8* %buf)");
         H("  ret i8* %fin");
         H("}");
     }
@@ -784,7 +1167,7 @@ partial class Irgen {
         H("define i8* @zstr_split(i8* %s, i8* %sep, i64 %opt) {");
         H("entry:");
         H("  %lsep = call i64 @zstr_clen(i8* %sep)");
-        H("  %lst = call i8* @zlist_new(i64 0)");
+        H("  %lst = call i8* @zlist_new(i64 1)");
         H("  %cur = alloca i8*");
         H("  store i8* %s, i8** %cur");
         H("  %empty = icmp eq i64 %lsep, 0");
@@ -808,6 +1191,7 @@ partial class Irgen {
         H("  call i8* @memcpy(i8* %buf, i8* %c, i64 %n)");
         H("  %bi = ptrtoint i8* %buf to i64");
         H("  call void @zlist_add(i8* %lst, i64 %bi)");
+        H("  call void @zstr_release(i8* %buf)");
         H("  br label %nseg");
         H("nseg:");
         H("  %ncur = getelementptr i8, i8* %hit, i64 %lsep");
@@ -826,6 +1210,7 @@ partial class Irgen {
         H("  call i8* @memcpy(i8* %buf2, i8* %lc, i64 %n2)");
         H("  %bi2 = ptrtoint i8* %buf2 to i64");
         H("  call void @zlist_add(i8* %lst, i64 %bi2)");
+        H("  call void @zstr_release(i8* %buf2)");
         H("  br label %fin");
         H("fin:");
         H("  ret i8* %lst");
@@ -896,6 +1281,7 @@ partial class Irgen {
         H("  %ovf = load i64, i64* %out");
         H("  %finbuf = call i8* @zstr_new(i64 %ovf)");
         H("  call i8* @memcpy(i8* %finbuf, i8* %buf, i64 %ovf)");
+        H("  call void @free(i8* %buf)");
         H("  ret i8* %finbuf");
         H("}");
         H("define i64 @zstr_isempty(i8* %s) {");

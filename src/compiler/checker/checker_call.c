@@ -21,7 +21,7 @@ static bool method_is_params_tail(zan_symbol_t *m) {
 static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
                                                zan_istr_t name, int argc,
                                                int type_arg_count) {
-    zan_symbol_t *fallback = NULL;
+    /* Inapplicable same-name members must not hide extension methods. */
     for (zan_symbol_t *s = type_sym; s;
          s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
         zan_symbol_t *variadic = NULL;
@@ -30,7 +30,7 @@ static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
             if (!m || m->kind != SYM_METHOD || m->name.len != name.len ||
                 memcmp(m->name.str, name.str, (size_t)name.len) != 0)
                 continue;
-            if (!fallback) fallback = m;
+
             if (!method_accepts_argc(m, argc)) continue;
             int mtps = (m->decl && m->decl->kind == AST_METHOD_DECL)
                 ? m->decl->method_decl.type_params.count : 0;
@@ -43,7 +43,7 @@ static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
         }
         if (variadic) return variadic;
     }
-    return fallback;
+    return NULL;
 }
 
 /* 同一个实参上的"null 绑不上值类型形参"只报一次：唯一方法路径
@@ -549,10 +549,7 @@ static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
                                       zan_type_t *value) {
     if (!target || !value) return false;
     if (target->kind == TYPE_ERROR || value->kind == TYPE_ERROR) return false;
-    if (type_refs_type_param(target) || type_refs_type_param(value) ||
-        (target->type_arg_count && value->type_arg_count &&
-         same_generic_container(target, value) &&
-         !checker_type_equal(target, value))) return false;
+    if (type_refs_type_param(target) || type_refs_type_param(value)) return false;
     if (type_is_scalar_register(value)) {
         bool ref_target = target->kind == TYPE_OBJECT ||
                           target->kind == TYPE_INTERFACE ||
@@ -607,7 +604,9 @@ static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
         return NULL;
     }
     if (!only || !only->decl || only->decl->kind != AST_METHOD_DECL) return NULL;
-    if (only->decl->method_decl.type_params.count) return NULL;
+    if (only->decl->method_decl.type_params.count ||
+        call->call.type_args.count ||
+        !method_accepts_argc(only, call->call.args.count)) return NULL;
     zan_ast_list_t *ps = &only->decl->method_decl.params;
     if (call->call.args.count > ps->count) return NULL;
     for (int i = 0; i < ps->count; i++) {

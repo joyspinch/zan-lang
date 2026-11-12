@@ -1,9 +1,47 @@
 using System;
 using System.IO;
 using AppUpdate;
+using System.IO.Compression;
+using System.Collections.Generic;
+using System.Diagnostics;
+
+namespace AppUpdate;
 
 class Program {
+    [DllImport("crt", EntryPoint = "_exit")]
+    private static extern void ExitAbruptly(int code);
+
+    #if !WINDOWS && !WASM32
+    [DllImport("crt", EntryPoint = "symlink")]
+    static extern int MakeLink(string target, string path);
+    [DllImport("crt", EntryPoint = "unlink")]
+    static extern int Unlink(string path);
+    #endif
+
+    // Public, test-only RSA fixture. Never use this key for a release.
+    static string TestModulus() { return "debcb3b7008e48defc8db6000d2126eff4aa4433d5763c155a64abef69235e231e947ce814ca501305a8766d8ff195cf9acc60cc9689ca4d65c16bef4e4e7d24062e1c2ac331532ce97449b849afbec021e15af89dd7cbf11a557fa98e349975c56cf7978fa666b78e8f2dfe7f4741b722aed320016c7fee08b622d05c3e62f2aef1f5a9a7a090321c0dfaceaf7782ca21865402ed2059050218fc067553367be4017e991b65eb23da72ae67a65f97b26639130bbf6018290db1614c2fd43995bd71d2c3711e2505775e249f8d75ae60d32907f36b837b1c5e3fab703fab109884c47446556aff3b067788b6992f430b341c9c5b74c002d4d5cc26f36bdeb73d"; }
+    static string TestPrivateExponent() { return "0a4be65c916d17bf73cf82e8408875b740d3f07db097e68ca52658bab89d443032ed1c7e125ca234283e37faa0c818a11025490744214005c66c592be6ee8d6de6cee709ef5bde735f2265f85bddab8a25b6cd76073e99cf538f3c177a3b026a15938fe42f7ae5838596a702bd5f02fc6f366e3796a142f908698fb545425eb55bae5e6015d373aa985e2cf65ff641979f544ef539af323f675d90c418ef544f36299e032e440a69ead2c7f175c7d876ac8834bc1e6c60f11fc9052b83fc72d52d83bc57029ecbb7a3cc32515e4c3b09cc2a0c818c984ebd015cfee2f2f7b5331289ea58a1dd15b8e4253e201cc49a9e09ab398981b90b33067bfa30d29600f1"; }
+    static bool Sign(UpdateManifest manifest) {
+        return ReleasePackager.SignManifest(manifest, TestModulus(), TestPrivateExponent()).Length == 512;
+    }
+    static int failed = 0;
+    static void Require(bool condition, string name) {
+        if (!condition) { Console.WriteLine("FAIL: " + name); failed = failed + 1; }
+    }
+
+    static int BootstrapCalls = 0;
+    static int RejectBootstrap(string target, string pending, string hash, bool install) {
+        BootstrapCalls = BootstrapCalls + 1;
+        return 0;
+    }
+
     static int Main() {
+        Require(UpdateBootstrap.Handle(new string[0], RejectBootstrap) == -1, "bootstrap ordinary invocation");
+        string[] malformed = new string[1]; malformed[0] = UpdateBootstrap.Argument;
+        Require(UpdateBootstrap.Handle(malformed, RejectBootstrap) >= 0, "bootstrap malformed helper invocation rejected");
+        Require(BootstrapCalls == 0, "bootstrap rejects before trusted callback");
+        string childMode = Environment.GetEnvironmentVariable("ZAN_APPUPDATE_TRANSACTION_CHILD");
+        if (childMode == "interrupt" || childMode == "lock") { return TransactionChild(childMode); }
         string srcDir = "_scratch/conf_app_src";
         string clientDir = "_scratch/conf_app_client";
         string zipPath = "_scratch/conf_app_v1.zip";
@@ -33,8 +71,20 @@ class Program {
             return 1;
         }
 
+        Require(!AppUpdater.VerifyManifestSignature(manifest, null), "unset signer rejected");
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, clientDir, false, null), "unsigned install rejected");
+        IntegrityReport invalid = TamperDetector.Check(clientDir, null, null);
+        Require(!invalid.isClean, "null manifest rejected");
+        Require(UpdateManifest.Parse("{") == null, "malformed JSON rejected");
+        AppUpdater.SetTrustedSigner(TestModulus(), "010001");
+        Require(!AppUpdater.VerifyManifestSignature(manifest, null), "missing signature rejected");
+        Require(Sign(manifest), "sign fixture");
+        Require(AppUpdater.VerifyManifestSignature(manifest, null), "valid signer accepted");
+        UpdateManifest parsed = UpdateManifest.Parse(manifest.ToJson());
+        Require(parsed != null && AppUpdater.VerifyManifestSignature(parsed, null), "signed JSON roundtrip");
+        manifest.SaveToFile(manifestPath);
         // 2. 客户端解压安装
-        bool ok = AppUpdater.ApplyPackage(zipPath, clientDir, null, false);
+        bool ok = AppUpdater.ApplyPackage(zipPath, manifest, clientDir, false, null);
         if (!ok) {
             Console.WriteLine("FAIL: apply package failed");
             return 2;
@@ -59,7 +109,7 @@ class Program {
         }
 
         // 6. 自动还原自愈
-        int healed = TamperDetector.RestoreFromZip(clientDir, rep2, zipPath, null);
+        int healed = TamperDetector.RestoreFromZip(clientDir, manifest, rep2, zipPath, null);
         if (healed != 2) {
             Console.WriteLine("FAIL: healed count mismatch");
             return 5;
@@ -78,7 +128,494 @@ class Program {
             return 7;
         }
 
+        SecurityRegressions(manifest, zipPath, manifestPath, clientDir);
+        TransactionRegressions(manifest, zipPath);
+        RecoveryRetryRegressions(manifest, zipPath);
+        #if !WINDOWS && !WASM32
+        LinkRegressions(manifest, zipPath);
+        #endif
+        if (failed != 0) { return 8; }
         Console.WriteLine("App update and tamper self-healing tests passed!");
         return 0;
     }
+    static int RunTransactionChild(string mode) {
+        List<string> args = new List<string>();
+        Environment.SetEnvironmentVariable("ZAN_APPUPDATE_TRANSACTION_CHILD", mode);
+        try { return Process.RunSafe(Environment.ProcessPath, args, 60000); }
+        finally { Environment.SetEnvironmentVariable("ZAN_APPUPDATE_TRANSACTION_CHILD", ""); }
+    }
+
+    static int TransactionChild(string mode) {
+        string root = Path.GetFullPath("_scratch/conf_app_transaction");
+        if (mode == "lock") {
+            long handle = File.TryLock(root + "/_appupdate.lock");
+            if (handle == 0) { return 0; }
+            File.Unlock(handle);
+            return 42;
+        }
+        UpdateManifest manifest = UpdateManifest.LoadFromFile("_scratch/conf_app_v1.manifest.json");
+        byte[] raw = File.ReadAllBytes("_scratch/conf_app_v1.zip");
+        List<ZipEntry> entries = Zip.Read(raw);
+        for (int i = 0; i < entries.Count; i = i + 1) { entries[i].data = Zip.Extract(raw, entries[i]); }
+        long lockHandle = File.TryLock(root + "/_appupdate.lock");
+        if (lockHandle == 0) { return 43; }
+        System.Json.JsonValue plan = InstallTransaction.Prepare(root, manifest, entries, true);
+        InstallTransaction.PublishOne(root, manifest, plan, 0);
+        InstallTransaction.PublishOne(root, manifest, plan, 1);
+        // Model process interruption: skip rollback, unlock and native atexit
+        // hooks, which would report the deliberately abandoned child objects.
+        ExitAbruptly(23);
+        return 44;
+    }
+
+    static void RecoveryRetryRegressions(UpdateManifest manifest, string zipPath) {
+        string root = Path.GetFullPath("_scratch/conf_app_recovery_retry");
+        if (Directory.Exists(root) || File.Exists(root) || File.IsReparsePoint(root)) {
+            throw new Exception("recovery retry fixture already exists");
+        }
+        Directory.CreateDirectory(root);
+        try {
+            byte[] raw = File.ReadAllBytes(zipPath);
+            List<ZipEntry> entries = Zip.Read(raw);
+            for (int i = 0; i < entries.Count; i = i + 1) { entries[i].data = Zip.Extract(raw, entries[i]); }
+            for (int i = 0; i < manifest.files.Count; i = i + 1) {
+                string rel = manifest.files[i].path;
+                Directory.CreateDirectoryRecursive(Path.GetDirectoryName(root + "/" + rel));
+                Directory.CreateDirectoryRecursive(Path.GetDirectoryName(root + "/_backup/" + rel));
+                if (i != 1) { File.WriteAllText(root + "/" + rel, "original-" + Convert.ToString(i)); }
+                File.WriteAllText(root + "/_backup/" + rel, "backup-" + Convert.ToString(i));
+            }
+            System.Json.JsonValue plan = InstallTransaction.Prepare(root, manifest, entries, true);
+            for (int i = 0; i < manifest.files.Count; i = i + 1) { InstallTransaction.PublishOne(root, manifest, plan, i); }
+
+            // Reconstruct the boundary between restoring a destination and its
+            // caller backup; the remaining files are still published.
+            int last = manifest.files.Count - 1;
+            string restored = manifest.files[last].path;
+            File.Copy(root + "/_appupdate/" + Convert.ToString(last) + ".old", root + "/" + restored);
+            Require(File.ReadAllText(root + "/_backup/" + restored) == "original-" + Convert.ToString(last), "partial rollback still has published backup");
+            Require(InstallTransaction.Recover(root, manifest), "partial rollback resumes");
+            Require(InstallTransaction.Recover(root, manifest), "completed rollback can repeat");
+            for (int i = 0; i < manifest.files.Count; i = i + 1) {
+                string rel = manifest.files[i].path;
+                if (i == 1) { Require(!File.Exists(root + "/" + rel), "resumed rollback removes new destination"); }
+                else { Require(File.ReadAllText(root + "/" + rel) == "original-" + Convert.ToString(i), "resumed rollback restores original"); }
+                Require(File.ReadAllText(root + "/_backup/" + rel) == "backup-" + Convert.ToString(i), "resumed rollback restores caller backup");
+            }
+
+            #if WINDOWS
+            plan = InstallTransaction.Prepare(root, manifest, entries, true);
+            for (int i = 0; i < manifest.files.Count; i = i + 1) { InstallTransaction.PublishOne(root, manifest, plan, i); }
+            FileInfo blockedBackup = new FileInfo(root + "/_backup/" + restored);
+            Require(blockedBackup.SetReadOnly(true), "block backup restoration");
+            bool recoveryFailed = false;
+            try { InstallTransaction.Recover(root, manifest); }
+            catch (Exception ex) { recoveryFailed = true; }
+            finally { blockedBackup.SetReadOnly(false); }
+            Require(recoveryFailed, "backup restoration IO failure propagates");
+            Require(File.ReadAllText(root + "/" + restored) == "original-" + Convert.ToString(last), "destination restored before backup failure");
+            Require(File.Exists(root + "/_appupdate/journal") && File.Exists(root + "/_appupdate/" + Convert.ToString(last) + ".backup"), "failed recovery retains journal and snapshot");
+            Require(InstallTransaction.Recover(root, manifest), "recovery retries after backup becomes writable");
+            Require(InstallTransaction.Recover(root, manifest), "retried rollback can repeat");
+            Require(File.ReadAllText(root + "/_backup/" + restored) == "backup-" + Convert.ToString(last), "retry restores failed caller backup");
+            #endif
+
+            // Both committed cleanup boundaries must ignore a different next plan.
+            UpdateManifest different = UpdateManifest.Parse(manifest.ToJson());
+            different.files.RemoveAt(different.files.Count - 1);
+            for (int boundary = 0; boundary < 2; boundary = boundary + 1) {
+                plan = InstallTransaction.Prepare(root, manifest, entries, true);
+                for (int i = 0; i < manifest.files.Count; i = i + 1) { InstallTransaction.PublishOne(root, manifest, plan, i); }
+                InstallTransaction.Phase(root, "committed", manifest.files.Count);
+                if (boundary == 0) { File.Delete(root + "/_appupdate/0.old"); }
+                else {
+                    List<string> names = Directory.GetFileNames(root + "/_appupdate");
+                    for (int i = 0; i < names.Count; i = i + 1) {
+                        if (names[i] != "phase") { File.Delete(root + "/_appupdate/" + names[i]); }
+                    }
+                }
+                Require(File.Exists(root + "/_appupdate/phase"), "partial cleanup retains committed phase");
+                Require(InstallTransaction.Recover(root, different), "partial committed cleanup resumes with different plan");
+                Require(InstallTransaction.Recover(root, different), "completed cleanup can repeat");
+                Require(!Directory.Exists(root + "/_appupdate"), "resumed cleanup removes state");
+                for (int i = 0; i < manifest.files.Count; i = i + 1) {
+                    Require(AppUpdater.HashBytes(File.ReadAllBytes(root + "/" + manifest.files[i].path)) == manifest.files[i].sha256, "partial cleanup keeps committed payload");
+                }
+            }
+        } finally { Directory.DeleteRecursive(root); }
+    }
+
+    static void TransactionRegressions(UpdateManifest manifest, string zipPath) {
+        string root = Path.GetFullPath("_scratch/conf_app_transaction");
+        if (Directory.Exists(root)) { Directory.DeleteRecursive(root); }
+        Directory.CreateDirectory(root);
+        string first = manifest.files[0].path;
+        string second = manifest.files[1].path;
+        string third = manifest.files[2].path;
+        Directory.CreateDirectoryRecursive(Path.GetDirectoryName(root + "/" + first));
+        Directory.CreateDirectoryRecursive(Path.GetDirectoryName(root + "/" + third));
+        File.WriteAllText(root + "/" + first, "original-first");
+        File.WriteAllText(root + "/" + third, "original-third");
+        Directory.CreateDirectoryRecursive(Path.GetDirectoryName(root + "/_backup/" + first));
+        File.WriteAllText(root + "/_backup/" + first, "preexisting-backup");
+        byte[] raw = File.ReadAllBytes(zipPath);
+        List<ZipEntry> entries = Zip.Read(raw);
+        for (int i = 0; i < entries.Count; i = i + 1) { entries[i].data = Zip.Extract(raw, entries[i]); }
+        long handle = File.TryLock(root + "/_appupdate.lock");
+        Require(handle != 0, "take installer lock");
+        Require(RunTransactionChild("lock") == 0, "installer lock excludes another process");
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "concurrent installer refused");
+        Require(File.ReadAllText(root + "/" + first) == "original-first", "concurrent installer leaves originals");
+        File.Unlock(handle);
+
+        // These internal phase boundaries are the same persisted states a process
+        // exit leaves behind; no public failpoint or timing-dependent crash hook.
+        System.Json.JsonValue plan = InstallTransaction.Prepare(root, manifest, entries, true);
+        InstallTransaction.PublishOne(root, manifest, plan, 0);
+        InstallTransaction.PublishOne(root, manifest, plan, 1);
+        Require(File.Exists(root + "/" + second), "new destination published before failure");
+        // A missing later staged file deterministically fails after two publishes.
+        File.Delete(root + "/_appupdate/2.new");
+        bool failedLater = false;
+        try { InstallTransaction.PublishOne(root, manifest, plan, 2); }
+        catch (Exception ex) { failedLater = true; }
+        Require(failedLater, "later file publish failure");
+        Require(InstallTransaction.Recover(root, manifest), "reverse rollback succeeds");
+        Require(File.ReadAllText(root + "/" + first) == "original-first", "earlier replacement rolled back");
+        Require(File.ReadAllText(root + "/" + third) == "original-third", "later original retained");
+        Require(!File.Exists(root + "/" + second), "new destination removed by rollback");
+        Require(File.ReadAllText(root + "/_backup/" + first) == "preexisting-backup", "caller backup restored");
+        Require(!File.Exists(root + "/_backup/" + third), "new caller backup removed");
+
+        #if WINDOWS
+        FileInfo readOnlyDestination = new FileInfo(root + "/" + third);
+        Require(readOnlyDestination.SetReadOnly(true), "set later destination readonly");
+        try {
+            Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "later destination failure triggers automatic rollback");
+            Require(File.ReadAllText(root + "/" + first) == "original-first", "automatic rollback restores earlier destination");
+            Require(!File.Exists(root + "/" + second), "automatic rollback removes new destination");
+            Require(File.ReadAllText(root + "/_backup/" + first) == "preexisting-backup", "automatic rollback restores caller backup");
+            Require(!Directory.Exists(root + "/_appupdate"), "automatic rollback cleaned state");
+        } finally { readOnlyDestination.SetReadOnly(false); }
+        #endif
+
+        Require(RunTransactionChild("interrupt") == 23, "subprocess interrupted after two publishes");
+        Require(File.Exists(root + "/_appupdate/phase") && File.Exists(root + "/" + second), "interrupted process retained publishing state");
+        string journal = File.ReadAllText(root + "/_appupdate/journal");
+        File.WriteAllText(root + "/_appupdate/journal", "{\"payload\":\"../outside\"}");
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "corrupt journal blocks installation");
+        Require(File.Exists(root + "/_appupdate/0.old"), "corrupt journal retains rollback evidence");
+        Require(File.Exists(root + "/" + second), "corrupt journal does not delete published file");
+        File.WriteAllText(root + "/_appupdate/journal", journal);
+        UpdateManifest different = UpdateManifest.Parse(manifest.ToJson());
+        different.changelog = "different authorized plan";
+        Require(Sign(different), "sign alternate recovery plan");
+        Require(!AppUpdater.ApplyPackage(zipPath, different, root, true, null), "different expected plan blocks rollback");
+        Require(File.Exists(root + "/" + second), "plan mismatch performs no rollback");
+        Require(AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "interrupted transaction recovered before retry");
+        Require(File.ReadAllText(root + "/_backup/" + first) == "original-first", "retry backed up recovered original");
+        Require(!File.Exists(root + "/_backup/" + second), "retry observes recovered absence");
+        Require(!Directory.Exists(root + "/_appupdate"), "successful transaction cleaned state");
+
+        #if WINDOWS
+        plan = InstallTransaction.Prepare(root, manifest, entries, true);
+        InstallTransaction.PublishOne(root, manifest, plan, 0);
+        handle = File.TryLock(root + "/" + third);
+        Require(handle != 0, "take destination lock");
+        bool lockedFailed = false;
+        try { InstallTransaction.PublishOne(root, manifest, plan, 2); }
+        catch (Exception ex) { lockedFailed = true; }
+        Require(lockedFailed, "locked destination publish refused");
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "locked rollback retains pending state");
+        Require(File.Exists(root + "/_appupdate/journal"), "failed rollback preserves journal");
+        File.Unlock(handle);
+        Require(AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "rollback retries after destination unlock");
+        #endif
+
+        // A committed transaction must never roll back, even when the next caller
+        // has a different, smaller signed plan and prior cleanup was interrupted.
+        plan = InstallTransaction.Prepare(root, manifest, entries, false);
+        for (int i = 0; i < manifest.files.Count; i = i + 1) { InstallTransaction.PublishOne(root, manifest, plan, i); }
+        InstallTransaction.Phase(root, "committed", manifest.files.Count);
+        different = UpdateManifest.Parse(manifest.ToJson());
+        different.files.RemoveAt(different.files.Count - 1);
+        Require(InstallTransaction.Recover(root, different), "committed cleanup independent of next plan size");
+        Require(!Directory.Exists(root + "/_appupdate"), "committed cleanup removes old inventory");
+        Require(AppUpdater.HashBytes(File.ReadAllBytes(root + "/" + first)) == manifest.files[0].sha256, "committed payload retained");
+        different = UpdateManifest.Parse(manifest.ToJson());
+        for (int i = 0; i < different.files.Count; i = i + 1) {
+            different.files[i].sha256 = different.files[i].sha256.ToUpper();
+            different.files[i].md5 = different.files[i].md5.ToUpper();
+        }
+        different.packageSha256 = different.packageSha256.ToUpper();
+        different.packageMd5 = different.packageMd5.ToUpper();
+        Require(Sign(different), "sign uppercase digest manifest");
+        Require(AppUpdater.VerifyManifestSignature(different, null), "uppercase original signature valid");
+        UpdateManifest exact = AppUpdater.Snapshot(different);
+        Require(exact != null && exact.SigningPayload() == different.SigningPayload(), "snapshot preserves signed payload byte for byte");
+        string signedJson = root + "/signed.manifest.json";
+        different.signature = different.signature.ToUpper();
+        different.SaveToFile(signedJson);
+        UpdateManifest loaded = UpdateManifest.LoadFromFile(signedJson);
+        Require(loaded != null && loaded.SigningPayload() == different.SigningPayload(), "serialized signed metadata retains hex representation");
+        Require(AppUpdater.VerifyManifestSignature(loaded, null), "uppercase persisted signature verifies");
+        plan = InstallTransaction.Prepare(root, different, entries, false);
+        InstallTransaction.PublishOne(root, different, plan, 0);
+        Require(AppUpdater.ApplyPackage(zipPath, loaded, root, false, null), "persisted uppercase signature retries pending transaction");
+        Require(TamperDetector.Check(root, loaded, null).isClean, "uppercase signed integrity check");
+        #if !WINDOWS
+        File.SetExecutable(root + "/" + first, false);
+        plan = InstallTransaction.Prepare(root, manifest, entries, false);
+        File.SetExecutable(root + "/" + first, true);
+        Require(InstallTransaction.Recover(root, manifest), "mode-only interrupted rollback");
+        Require(!File.IsExecutable(root + "/" + first), "rollback restores mode even when bytes unchanged");
+        #endif
+        plan = InstallTransaction.Prepare(root, manifest, entries, false);
+        File.WriteAllText(root + "/_appupdate/phase", "garbage");
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, false, null), "malformed phase blocks writes");
+        InstallTransaction.Phase(root, "publishing", manifest.files.Count);
+        Require(InstallTransaction.Recover(root, manifest), "restore phase after corruption fixture");
+        Directory.CreateDirectory(root + "/_appupdate");
+        Directory.CreateDirectory(root + "/_appupdate/unexpected");
+        File.WriteAllText(root + "/_appupdate/unexpected/sentinel", "retain");
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, false, null), "unexpected nested state fails closed");
+        Require(File.ReadAllText(root + "/_appupdate/unexpected/sentinel") == "retain", "cleanup never traverses unexpected subtree");
+        Require(Directory.DeleteRecursive(root), "transaction fixture cleaned");
+        RootRegressions(manifest, zipPath, entries);
+        UpdateManifest reserved = UpdateManifest.Parse(manifest.ToJson());
+        reserved.files[0].path = "_appupdate/journal";
+        Require(!AppUpdater.ValidManifest(reserved), "transaction subtree reserved");
+        reserved.files[0].path = "_appupdate.lock/child";
+        Require(!AppUpdater.ValidManifest(reserved), "installer lock subtree reserved");
+        reserved.files[0].path = "child/_appupdate.lock";
+        Require(!AppUpdater.ValidManifest(reserved), "nested installer lock reserved");
+        reserved.files[0].path = "child/_APPUPDATE/journal";
+        Require(!AppUpdater.ValidManifest(reserved), "nested transaction state reserved case insensitively");
+        reserved.files[0].path = "child/deeper/_appupdate.lock/file";
+        Require(!AppUpdater.ValidManifest(reserved), "nested lock ancestor reserved");
+        reserved.files[0].path = "child/_appupdate-other.txt";
+        Require(AppUpdater.ValidManifest(reserved), "similar nonreserved name accepted");
+    }
+
+    static void RootRegressions(UpdateManifest manifest, string zipPath, List<ZipEntry> entries) {
+        #if WINDOWS
+        string root = Path.GetFullPath("_scratch/conf_app_identity_MixedCase");
+        if (Directory.Exists(root)) { Directory.DeleteRecursive(root); }
+        Directory.CreateDirectory(root);
+        string alias = root.ToUpper();
+        Require(alias != root, "different Windows root spelling");
+        Require(InstallRoot.Identity(root) == InstallRoot.Identity(alias), "Windows alias has same filesystem identity");
+        string first = manifest.files[0].path;
+        Directory.CreateDirectoryRecursive(Path.GetDirectoryName(root + "/" + first));
+        File.WriteAllText(root + "/" + first, "identity-original");
+        System.Json.JsonValue plan = InstallTransaction.Prepare(root, manifest, entries, true);
+        InstallTransaction.PublishOne(root, manifest, plan, 0);
+        Require(AppUpdater.ApplyPackage(zipPath, manifest, alias + "/", true, null), "Windows case alias recovers publishing transaction");
+        Require(File.ReadAllText(root + "/_backup/" + first) == "identity-original", "alias recovery backed up original rather than partial payload");
+        plan = InstallTransaction.Prepare(root, manifest, entries, false);
+        InstallTransaction.Phase(root, "committed", manifest.files.Count);
+        Require(AppUpdater.ApplyPackage(zipPath, manifest, alias, false, null), "Windows case alias recovers committed cleanup");
+        Require(!Directory.Exists(root + "/_appupdate"), "alias committed state cleaned");
+        plan = InstallTransaction.Prepare(root, manifest, entries, false);
+        string legacy = "publishing:" + Convert.ToString(manifest.files.Count);
+        File.WriteAllText(root + "/_appupdate/phase", legacy + ":" + InstallTransaction.Digest(root + ":" + legacy));
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, false, null), "legacy path-bound transaction rejected");
+        Require(File.Exists(root + "/_appupdate/journal"), "legacy transaction evidence retained");
+        InstallTransaction.Phase(root, "publishing", manifest.files.Count);
+        Require(InstallTransaction.Recover(root, manifest), "identity phase restored after legacy fixture");
+        // A distinct directory must not inherit rollback authority from copied state.
+        string other = root + "-different";
+        Directory.CreateDirectory(other);
+        plan = InstallTransaction.Prepare(root, manifest, entries, false);
+        Directory.CreateDirectory(other + "/_appupdate");
+        List<string> names = Directory.GetFileNames(root + "/_appupdate");
+        for (int i = 0; i < names.Count; i = i + 1) { File.Copy(root + "/_appupdate/" + names[i], other + "/_appupdate/" + names[i]); }
+        Require(InstallRoot.Identity(root) != InstallRoot.Identity(other), "distinct Windows directories keep different identities");
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, other, false, null), "moved publishing state rejected at distinct root");
+        InstallTransaction.Phase(root, "committed", manifest.files.Count);
+        File.Copy(root + "/_appupdate/phase", other + "/_appupdate/phase");
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, other, false, null), "moved committed state rejected at distinct root");
+        Require(Directory.DeleteRecursive(root) && Directory.DeleteRecursive(other), "identity fixtures cleaned");
+        #else
+        string root = Path.GetFullPath("_scratch/conf_app_posix_tail");
+        string literal = root + "\\";
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(literal);
+        File.WriteAllText(root + "/sentinel", "other-directory");
+        Require(InstallRoot.Normalize(literal) == literal, "POSIX trailing backslash retained");
+        Require(InstallRoot.Normalize(literal + "/") == literal, "POSIX trailing slash trimmed independently");
+        Require(AppUpdater.ApplyPackage(zipPath, manifest, literal, false, null), "POSIX trailing backslash install");
+        Require(File.ReadAllText(root + "/sentinel") == "other-directory", "POSIX similarly named root unchanged");
+        Require(!File.Exists(root + "/" + manifest.files[0].path), "POSIX install did not trim literal backslash");
+        Require(TamperDetector.Check(literal, manifest, null).isClean, "POSIX literal-backslash payload verified");
+        Require(Directory.DeleteRecursive(literal) && Directory.DeleteRecursive(root), "POSIX root fixtures cleaned");
+        #endif
+    }
+
+    #if !WINDOWS && !WASM32
+    static void LinkRegressions(UpdateManifest manifest, string zipPath) {
+        string baseDir = Path.GetFullPath("_scratch/conf_app_links");
+        if (Directory.Exists(baseDir) || File.Exists(baseDir) || File.IsReparsePoint(baseDir)) {
+            throw new Exception("link fixture already exists");
+        }
+        string outside = baseDir + "/outside";
+        string root = baseDir + "/install";
+        Directory.CreateDirectoryRecursive(outside);
+        File.WriteAllText(outside + "/sentinel", "outside-unchanged");
+        List<string> links = new List<string>();
+        try {
+            links.Add("assets");
+            links.Add("app.exe");
+            links.Add("dangling.exe");
+            links.Add("_appupdate.lock");
+            links.Add("_appupdate");
+            links.Add("_backup");
+            for (int i = 0; i < links.Count; i = i + 1) {
+                Directory.CreateDirectory(root);
+                string rel = links[i];
+                string target = outside + "/sentinel";
+                if (rel == "assets" || rel == "_appupdate" || rel == "_backup") { target = outside; }
+                if (rel == "dangling.exe") { target = outside + "/missing"; rel = "app.exe"; }
+                string link = root + "/" + rel;
+                if (MakeLink(target, link) != 0) { throw new Exception("could not create updater link fixture"); }
+                try {
+                    Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "linked install path rejected: " + rel);
+                    Require(File.IsReparsePoint(link), "rejected install retained link: " + rel);
+                    Require(File.ReadAllText(outside + "/sentinel") == "outside-unchanged", "outside bytes preserved");
+                    Require(!File.Exists(outside + "/missing") && !File.Exists(outside + "/ui.png"), "outside paths not created");
+                } finally { Unlink(link); }
+                Require(Directory.DeleteRecursive(root), "link install fixture cleaned");
+            }
+
+            Directory.CreateDirectory(root);
+            byte[] raw = File.ReadAllBytes(zipPath);
+            List<ZipEntry> entries = Zip.Read(raw);
+            for (int i = 0; i < entries.Count; i = i + 1) { entries[i].data = Zip.Extract(raw, entries[i]); }
+            for (int i = 0; i < manifest.files.Count; i = i + 1) {
+                string dest = root + "/" + manifest.files[i].path;
+                Directory.CreateDirectoryRecursive(Path.GetDirectoryName(dest));
+                File.WriteAllText(dest, "before-update");
+            }
+            System.Json.JsonValue plan = InstallTransaction.Prepare(root, manifest, entries, true);
+            InstallTransaction.PublishOne(root, manifest, plan, 0);
+            string phase = root + "/_appupdate/phase";
+            string retainedPhase = File.ReadAllText(phase);
+            File.Delete(phase);
+            if (MakeLink(outside + "/sentinel", phase) != 0) { throw new Exception("could not create phase link"); }
+            try {
+                Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "linked recovery phase rejected");
+                Require(File.IsReparsePoint(phase) && File.Exists(root + "/_appupdate/journal"), "recovery evidence retained");
+                Require(File.ReadAllText(outside + "/sentinel") == "outside-unchanged", "recovery did not change outside bytes");
+            } finally { Unlink(phase); }
+            File.WriteAllText(phase, retainedPhase);
+            string snapshot = root + "/_appupdate/0.old";
+            string savedSnapshot = baseDir + "/retained-old";
+            File.Move(snapshot, savedSnapshot);
+            if (MakeLink(outside + "/sentinel", snapshot) != 0) { throw new Exception("could not create snapshot link"); }
+            try {
+                Require(!AppUpdater.ApplyPackage(zipPath, manifest, root, true, null), "linked rollback snapshot rejected");
+                Require(File.IsReparsePoint(snapshot) && File.Exists(root + "/_appupdate/journal"), "snapshot rejection retained evidence");
+                Require(File.ReadAllText(outside + "/sentinel") == "outside-unchanged", "snapshot link target unchanged");
+            } finally { Unlink(snapshot); }
+            File.Move(savedSnapshot, snapshot);
+            Require(InstallTransaction.Recover(root, manifest), "recovery succeeds after removing link");
+            for (int i = 0; i < manifest.files.Count; i = i + 1) {
+                Require(File.ReadAllText(root + "/" + manifest.files[i].path) == "before-update", "original restored after linked recovery refusal");
+            }
+        } finally {
+            // Every created link is unlinked in its inner finally before recursion.
+            Require(Directory.DeleteRecursive(baseDir), "owned link fixtures cleaned");
+        }
+    }
+    #endif
+
+    static void SecurityRegressions(UpdateManifest manifest, string zipPath, string manifestPath, string clientDir) {
+        string before = File.ReadAllText(clientDir + "/app.exe");
+        string signature = manifest.signature;
+        manifest.signature = "gg";
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, clientDir, false, null), "nonhex signature rejected");
+        manifest.signature = signature;
+        manifest.changelog = "modified";
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, clientDir, false, null), "metadata tampering rejected");
+        IntegrityReport untrusted = AppUpdater.VerifyAndSelfHeal(clientDir, manifest, zipPath, null);
+        Require(!untrusted.isClean, "untrusted selfheal rejected");
+        manifest.changelog = "Initial release";
+        Require(AppUpdater.VerifyManifestSignature(manifest, null), "fixture restored");
+        Require(!AppUpdater.VerifyZipPackage(zipPath, "", null), "empty package hash rejected");
+        Require(!AppUpdater.VerifyZipPackage(zipPath, manifest.packageMd5, null), "MD5 package hash rejected");
+        byte[] original = File.ReadAllBytes(zipPath);
+        byte[] changed = File.ReadAllBytes(zipPath);
+        changed[0] = (byte)(changed[0] ^ 1);
+        File.WriteAllBytes(zipPath, changed);
+        Require(!AppUpdater.ApplyPackage(zipPath, manifest, clientDir, false, null), "substituted package rejected");
+        File.WriteAllText(clientDir + "/app.exe", "damaged");
+        IntegrityReport damaged = TamperDetector.Check(clientDir, manifest, null);
+        Require(TamperDetector.RestoreFromZip(clientDir, manifest, damaged, zipPath, null) == 0, "substituted recovery rejected");
+        Require(File.ReadAllText(clientDir + "/app.exe") == "damaged", "failed recovery leaves disk unchanged");
+        File.WriteAllBytes(zipPath, original);
+        Require(TamperDetector.RestoreFromZip(clientDir, manifest, damaged, zipPath, null) == 1, "authenticated recovery accepted");
+        Require(File.ReadAllText(clientDir + "/app.exe") == before, "authenticated content restored");
+        string modulus = TestModulus();
+        AppUpdater.SetTrustedSigner(modulus.Substring(0, modulus.Length - 2) + "01", "010001");
+        Require(!AppUpdater.VerifyManifestSignature(manifest, null), "wrong signer rejected");
+        AppUpdater.SetTrustedSigner("zz", "010001");
+        Require(!AppUpdater.VerifyManifestSignature(manifest, null), "bad signer clears trust");
+        Require(!AppUpdater.UpdateTo("9.0.0", manifestPath, zipPath, clientDir, false, null), "no-update path still requires trust");
+        AppUpdater.SetTrustedSigner(TestModulus(), "010001");
+        Require(AppUpdater.UpdateTo("9.0.0", manifestPath, zipPath, clientDir, false, null), "authenticated no-update path");
+        Require(UpdateFileEntry.NormalizePath("/absolute") == "", "absolute path rejected");
+        Require(UpdateFileEntry.NormalizePath("../escape") == "", "traversal rejected");
+        Require(!UpdateFileEntry.SafeRelPath("a/./b"), "dot alias rejected");
+        Require(!UpdateFileEntry.SafeRelPath("a//b"), "empty segment rejected");
+        Require(!UpdateFileEntry.SafeRelPath("a/file:stream"), "ADS rejected");
+        Require(!UpdateFileEntry.SafeRelPath("NUL.txt"), "device rejected");
+        Require(!UpdateFileEntry.SafeRelPath("name. "), "trailing alias rejected");
+        UpdateManifest bad = UpdateManifest.Parse(manifest.ToJson());
+        bad.files[0].sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+        Require(Sign(bad), "sign inconsistent file metadata");
+        Require(!AppUpdater.ApplyPackage(zipPath, bad, clientDir, false, null), "file SHA mismatch rejected");
+        Require(File.ReadAllText(clientDir + "/app.exe") == before, "preflight failure leaves disk unchanged");
+        bad = UpdateManifest.Parse(manifest.ToJson());
+        bad.files[1].path = bad.files[0].path.ToUpper();
+        Require(!AppUpdater.ValidManifest(bad), "case duplicate rejected");
+        bad = UpdateManifest.Parse(manifest.ToJson());
+        bad.files[0].size = 67108865L;
+        Require(!AppUpdater.ValidManifest(bad), "entry size cap");
+        bad = UpdateManifest.Parse(manifest.ToJson());
+        bad.packageSha256 = "";
+        Require(!AppUpdater.VerifyManifestSignature(bad, null), "legacy digest rejected");
+        List<ZipEntry> entries = Zip.Read(original);
+        byte[] unsupported = File.ReadAllBytes(zipPath);
+        int offset = entries[0].localHeaderOffset;
+        unsupported[offset + 8] = 99;
+        bad = UpdateManifest.Parse(manifest.ToJson());
+        bad.packageSha256 = AppUpdater.HashBytes(unsupported);
+        Require(Sign(bad), "sign malformed archive");
+        File.WriteAllBytes(zipPath, unsupported);
+        Require(!AppUpdater.ApplyPackage(zipPath, bad, clientDir, false, null), "local header disagreement rejected");
+        File.WriteAllBytes(zipPath, original);
+        // A forged report cannot redirect recovery writes or suppress real disk checks.
+        File.WriteAllText(clientDir + "/app.exe", "damaged");
+        IntegrityReport forged = new IntegrityReport();
+        forged.AddIssue(TamperFileIssue.Create("../escape", FileIntegrityStatus.Missing, "", "", 0, 0));
+        forged.isClean = true;
+        Require(TamperDetector.RestoreFromZip(clientDir, manifest, forged, zipPath, null) == 1, "forged report ignored as authority");
+        Require(File.ReadAllText(clientDir + "/app.exe") == before, "forged report recovery rechecks disk");
+        // A publisher-signed package containing an unlisted member is still inconsistent.
+        entries = Zip.Read(original);
+        for (int i = 0; i < entries.Count; i = i + 1) { entries[i].data = Zip.Extract(original, entries[i]); }
+        ZipEntry extra = new ZipEntry("extra.exe");
+        extra.data = new byte[1] { 1 };
+        entries.Add(extra);
+        byte[] extraPackage = Zip.Create(entries, 0);
+        bad = UpdateManifest.Parse(manifest.ToJson());
+        bad.packageSize = extraPackage.Length;
+        bad.packageSha256 = AppUpdater.HashBytes(extraPackage);
+        Require(Sign(bad), "sign unlisted archive");
+        File.WriteAllBytes(zipPath, extraPackage);
+        Require(!AppUpdater.ApplyPackage(zipPath, bad, clientDir, false, null), "unlisted member rejected");
+        Require(!File.Exists(clientDir + "/extra.exe"), "unlisted member never written");
+        File.WriteAllBytes(zipPath, original);
+    }
+
 }

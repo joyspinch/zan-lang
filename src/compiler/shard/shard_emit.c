@@ -355,6 +355,7 @@ static bool sh_emit_one_file(sh_state_t *st, int shard_idx, const char *frag_pat
     char *vmsg = NULL;
     SH_TRACE("shard emit: parse ok -> verify\n");
     if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &vmsg)) {
+        st->optimizer_failed = true;
         snprintf(errbuf, errsz, "verify: %.160s", vmsg ? vmsg : "?");
         if (vmsg) LLVMDisposeMessage(vmsg);
         LLVMDisposeModule(mod);
@@ -365,9 +366,29 @@ static bool sh_emit_one_file(sh_state_t *st, int shard_idx, const char *frag_pat
     /* shard 模块必须和主模块跑同一级别的 LLVM pass pipeline，否则
      * publish 模式下 shard 里的函数完全没经过体积优化，会导致发布产物
      * 体积几乎不降。ZAN_SHARD_OPT 环境变量留作逃生口。 */
+    if (zan_opt_validate_cpu(g, mod) != ZAN_OK) {
+        st->optimizer_failed = true;
+        snprintf(errbuf, errsz, "unsupported CPU intrinsic");
+        LLVMDisposeModule(mod);
+        LLVMContextDispose(ctx);
+        return false;
+    }
     if (g->publish_mode || g->obfuscate_strings || getenv("ZAN_SHARD_OPT")) {
-        zan_opt_run_passes_on_module(mod, tm,
-            (g->publish_mode || g->obfuscate_strings) ? ZAN_OPT_SIZE : ZAN_OPT_FULL);
+        if (zan_opt_run_passes_on_module(mod, tm,
+                (g->publish_mode || g->obfuscate_strings) ? ZAN_OPT_SIZE : ZAN_OPT_FULL) != ZAN_OK) {
+            st->optimizer_failed = true;
+            snprintf(errbuf, errsz, "LLVM optimization failed");
+            LLVMDisposeModule(mod);
+            LLVMContextDispose(ctx);
+            return false;
+        }
+    }
+    if (zan_opt_verify_module(mod, "before shard object output") != ZAN_OK) {
+        st->optimizer_failed = true;
+        snprintf(errbuf, errsz, "final LLVM verification failed");
+        LLVMDisposeModule(mod);
+        LLVMContextDispose(ctx);
+        return false;
     }
     char *eerr = NULL;
     SH_TRACE("shard emit: verify ok -> codegen\n");

@@ -69,7 +69,9 @@ def run_case(case, a):
             os.remove(f)
 
     why = ""
-    rc, out, err = run_cmd([a.gen1, ll, src], a.workdir, a.emit_timeout)
+    helper = os.path.join(a.case_dir, "helpers", case + ".zan")
+    extra_args = [helper] if os.path.exists(helper) else []
+    rc, out, err = run_cmd([a.gen1, ll, src] + extra_args, a.workdir, a.emit_timeout)
     if rc == -9:
         why = "gen1 emit timed out after %ds (miscompile spin?)" % a.emit_timeout
     elif rc != 0:
@@ -105,7 +107,10 @@ def run_reject(name, text, hosttext, a):
     if os.path.exists(ll):
         os.remove(ll)
 
-    rc, out, err = run_cmd([a.gen1, ll, src] + extra_args, a.workdir)
+    rc, out, err = run_cmd([a.gen1, ll, src] + extra_args, a.workdir, a.emit_timeout)
+    if rc < 0 or rc > 125:
+        return ("reject", name, "FAIL",
+                "the self-hosted compiler timed out, crashed, or failed to launch (rc=%d)" % rc)
     if rc == 0:
         return ("reject", name, "FAIL", "the self-hosted compiler accepted a program it must reject")
     if os.path.exists(ll):
@@ -119,10 +124,16 @@ def run_reject(name, text, hosttext, a):
         hexe = os.path.join(a.outdir, "reject_%s_host.exe" % name)
         if os.path.exists(hexe):
             os.remove(hexe)
-        rc, out, err = run_cmd([a.zanc, src] + extra_args + ["--auto-stdlib", "-o", hexe], a.workdir)
+        rc, out, err = run_cmd([a.zanc, src] + extra_args + ["--auto-stdlib", "-o", hexe], a.workdir, a.emit_timeout)
+        if rc < 0 or rc > 125:
+            return ("reject", name, "FAIL",
+                    "the C host timed out, crashed, or failed to launch (rc=%d)" % rc)
         if rc == 0:
             return ("reject", name, "FAIL",
                     "the C host accepted the program the self-host must reject")
+        if os.path.exists(hexe):
+            return ("reject", name, "FAIL",
+                    "the C host wrote an executable for a program it must reject")
         if hosttext not in (out + err):
             return ("reject", name, "FAIL",
                     "the C host's diagnostic does not contain '%s' -- the two compilers do not agree on the wording" % hosttext)
@@ -155,8 +166,9 @@ def main():
     # libraries are fixed per OS, so they are derived here rather than
     # threaded through the cmake->python argument boundary
     if sys.platform == "win32":
-        a.syslibs = ["-lkernel32", "-lshell32", "-luser32", "-ladvapi32",
-                     "-lversion", "-lws2_32", "-lbcrypt", "-lpsapi"]
+        a.syslibs = ["-lkernel32", "-lshell32", "-luser32", "-lgdi32", "-ladvapi32",
+                     "-lversion", "-lws2_32", "-lbcrypt", "-lpsapi", "-lsetupapi",
+                     "-liphlpapi", "-lwinspool", "-lntdll", "-lole32"]
         sqlite_dir = os.path.join(a.workdir, "packages", "Zan.Data", "src", "System", "Data", "Sqlite", "drivers", "win-x64")
         sqlite_lib = os.path.join(sqlite_dir, "libsqlite3.dll.a")
         if os.path.exists(sqlite_lib):
@@ -164,6 +176,15 @@ def main():
             sqlite_dll = os.path.join(sqlite_dir, "libsqlite3-0.dll")
             if os.path.exists(sqlite_dll):
                 shutil.copy2(sqlite_dll, a.outdir)
+        for dlib, ddll in [("zan_audio.lib", "zan_audio.dll"),
+                           ("zan_image.lib", "zan_image.dll"),
+                           ("zan_gui.lib", "zan_gui.dll")]:
+            lp = os.path.join(a.workdir, "build", dlib)
+            if os.path.exists(lp):
+                a.syslibs.append(lp)
+            dp = os.path.join(a.workdir, "build", ddll)
+            if os.path.exists(dp):
+                shutil.copy2(dp, a.outdir)
     else:
         a.syslibs = ["-ldl", "-lpthread", "-lm"]
 

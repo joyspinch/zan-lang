@@ -78,7 +78,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
                                    void **bt, unsigned btn) {
     if (!ep || !ep->ExceptionRecord) return;
 
-    char logpath[MAX_PATH];
+    char logpath[ZAN_CRASH_PATH_CAP];
     char exe_dir[MAX_PATH];
     zan__crash_logpath(logpath, sizeof logpath, exe_dir);
 
@@ -90,11 +90,9 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
     void *arc_freed_by = NULL;
 
     zan__cf_t f = zan__crash_open_log(logpath);
-    if (!f.h) f = zan__crash_open_log("zan_crash.log");
     if (!f.h) {
-        char tpath[MAX_PATH];
-        zan__crash_temp_logpath(tpath, sizeof tpath);
-        if (tpath[0]) f = zan__crash_open_log(tpath);
+        zan__crash_temp_logpath(logpath, sizeof logpath);
+        if (logpath[0]) f = zan__crash_open_log(logpath);
     }
     if (f.h) {
         SYSTEMTIME st;
@@ -442,6 +440,7 @@ void zan__crash_install(void) {
     /* 单进程内共享的向量化异常处理程序 */
     if (InterlockedCompareExchange((LONG volatile *)&zan__crash_installed,
                                    1, 0) != 0) return;
+    zan__crash_resolve_paths();
     SetUnhandledExceptionFilter(zan__crash_filter);
     /* 向量化异常处理优先于帧异常拦截 */
     AddVectoredExceptionHandler(1, zan__crash_veh);

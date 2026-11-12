@@ -170,6 +170,7 @@ LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *loca
                 }
             }
         }
+        LLVMValueRef matched = test;
         if (expr->type_test.is_not)
             test = LLVMBuildNot(g->builder, test, "is.not");
         /* 模式匹配变量 (x is T v)：类型匹配成功时在当前作用域注册变量 v */
@@ -179,14 +180,44 @@ LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *loca
             if (!bt) bt = g->binder->type_object;
             LLVMTypeRef btll = map_type(g, bt);
             LLVMValueRef slot = emit_entry_alloca(g, btll, "pat");
+            /* A short-circuited pattern may never execute, but its condition
+             * scope still cleans the slot. Initialize it in the entry block. */
+            zan_builder_point_t pattern_point = zan_builder_save(g);
+            LLVMValueRef after_slot = LLVMGetNextInstruction(slot);
+            if (after_slot) LLVMPositionBuilderBefore(g->builder, after_slot);
+            else LLVMPositionBuilderAtEnd(g->builder, LLVMGetInstructionParent(slot));
             zan_store_fit(g, LLVMConstNull(btll), slot);
+            zan_builder_restore(g, pattern_point);
+            bool pattern_rc = is_rc_managed_type(bt) &&
+                LLVMGetTypeKind(btll) == LLVMPointerTypeKind;
+            bool source_owned = expr_yields_owned_rc_value(g,
+                expr->type_test.expr, locals) != 0;
+            LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+            LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.bind");
+            LLVMBasicBlockRef miss = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.drop");
+            LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.done");
+            LLVMBuildCondBr(g->builder, matched, hit, miss);
+            LLVMPositionBuilderAtEnd(g->builder, hit);
             LLVMValueRef castv = v;
             if (LLVMTypeOf(castv) != btll &&
                 LLVMGetTypeKind(btll) == LLVMPointerTypeKind &&
                 LLVMGetTypeKind(LLVMTypeOf(castv)) == LLVMPointerTypeKind)
                 castv = LLVMBuildBitCast(g->builder, castv, btll, "pat.cast");
+            if (pattern_rc && !source_owned)
+                emit_rc_retain_for_type(g, bt, castv);
             zan_store_fit(g, castv, slot);
+            if (!pattern_rc)
+                emit_release_owned_call_temp(g, expr->type_test.expr, v, locals);
+            LLVMBuildBr(g->builder, done);
+            LLVMPositionBuilderAtEnd(g->builder, miss);
+            zan_store_fit(g, LLVMConstNull(btll), slot);
+            emit_release_owned_call_temp(g, expr->type_test.expr, v, locals);
+            LLVMBuildBr(g->builder, done);
+            LLVMPositionBuilderAtEnd(g->builder, done);
             local_add(locals, expr->type_test.var_name, slot, bt);
+            if (pattern_rc) arc_own_local(g, locals);
+        } else {
+            emit_release_owned_call_temp(g, expr->type_test.expr, v, locals);
         }
         return test;
     }
@@ -215,6 +246,23 @@ LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *loca
         if (st->kind == TYPE_CLASS && type_is_or_derives(st, tt))
             return v;
         LLVMValueRef ok = emit_runtime_is_check_name(g, v, tt);
+        if (expr_yields_owned_rc_value(g, expr->type_test.expr, locals)) {
+            LLVMBasicBlockRef success = LLVMGetInsertBlock(g->builder);
+            LLVMValueRef fn = LLVMGetBasicBlockParent(success);
+            LLVMBasicBlockRef failed = LLVMAppendBasicBlockInContext(g->ctx, fn, "as.fail");
+            LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "as.done");
+            LLVMBuildCondBr(g->builder, ok, done, failed);
+            LLVMPositionBuilderAtEnd(g->builder, failed);
+            emit_release_owned_call_temp(g, expr->type_test.expr, v, locals);
+            LLVMBasicBlockRef released = LLVMGetInsertBlock(g->builder);
+            LLVMBuildBr(g->builder, done);
+            LLVMPositionBuilderAtEnd(g->builder, done);
+            LLVMValueRef result = LLVMBuildPhi(g->builder, LLVMTypeOf(v), "as.res");
+            LLVMValueRef values[] = {v, LLVMConstNull(LLVMTypeOf(v))};
+            LLVMBasicBlockRef blocks[] = {success, released};
+            LLVMAddIncoming(result, values, blocks, 2);
+            return result;
+        }
         return LLVMBuildSelect(g->builder, ok, v,
             LLVMConstNull(LLVMTypeOf(v)), "as.res");
     }

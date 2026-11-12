@@ -440,7 +440,11 @@
                 }
 
                 LLVMPositionBuilderAtEnd(g->builder, bb_empty);
-                LLVMValueRef empty_str = zan_irgen_intern_string(g, "");
+                /* Substring returns an ARC-compatible string on every path.
+                 * A raw C empty literal may be suffix-merged at an unaligned
+                 * address, corrupting the EH temporary stack's low-bit tags. */
+                LLVMValueRef empty_str = emit_string_literal_rc(g,
+                    (zan_istr_t){ "", 0 });
                 LLVMBuildBr(g->builder, bb_join);
 
                 LLVMPositionBuilderAtEnd(g->builder, bb_slice);

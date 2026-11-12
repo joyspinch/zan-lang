@@ -1,0 +1,143 @@
+using System;
+using System.Collections.Generic;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Net.WebSocket;
+using System.Threading;
+
+class Program {
+    static int failures = 0;
+    static int boundedCalls = 0;
+
+    static void Check(bool ok, string name) {
+        Console.WriteLine((ok ? "ok " : "FAIL ") + name);
+        if (!ok) { failures = failures + 1; }
+    }
+
+    static byte[] Bounded(string coding, byte[] data, int budget) {
+        boundedCalls = boundedCalls + 1;
+        if (coding != "test" || budget != 16 || data.Length != 4
+            || data[0] != 65 || data[1] != 0 || data[2] != 66 || data[3] != 67) {
+            return null;
+        }
+        return data;
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        if (req.path == "/encoded") {
+            byte[] bytes = new byte[4];
+            bytes[0] = 65; bytes[1] = 0; bytes[2] = 66; bytes[3] = 67;
+            return HttpResponse.Bytes(bytes, 4, "application/octet-stream")
+                .SetHeader("Content-Encoding", "test");
+        }
+        return HttpResponse.Text("ok");
+    }
+
+    static void FrozenSetters(HttpClient c) {
+        int rejected = 0;
+        try { c.UseTls(); } catch (InvalidOperationException e) { rejected = rejected + 1; }
+        try { c.DisableTlsVerify(); } catch (InvalidOperationException e) { rejected = rejected + 1; }
+        try { c.PinPublicKey("pin"); } catch (InvalidOperationException e) { rejected = rejected + 1; }
+        try { c.SetCertPolicy(null); } catch (InvalidOperationException e) { rejected = rejected + 1; }
+        try { c.SetCallPolicy(null); } catch (InvalidOperationException e) { rejected = rejected + 1; }
+        Check(rejected == 5, "security setters reject after first use");
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", 19674);
+        server.OnRequest(Program.Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(80);
+
+        HttpClient c = new HttpClient("127.0.0.1", 19674);
+        ExternalCallPolicy original = ExternalCallPolicy.Default().AllowLocalHttp().ResponseLimit(16);
+        c.SetCallPolicy(original);
+        original.ResponseLimit(1);
+        ExternalCallPolicy exported = c.CallPolicy();
+        exported.ResponseLimit(2);
+        ExternalCallPolicy snapshot = c.CallPolicy();
+        Check(snapshot != null && snapshot.MaxResponseBytes() == 16, "policy input and output are detached snapshots");
+        HttpResponse first = await c.SendAsync("GET", "/plain", "");
+        Check(first.body == "ok", "request populates idle pool");
+        FrozenSetters(c);
+        HttpResponse second = await c.SendAsync("GET", "/plain", "");
+        Check(second.body == "ok", "rejected TLS change leaves pooled request intact");
+        c.Close();
+        bool stillFrozen = false;
+        try { c.UseTls(); } catch (InvalidOperationException e) { stillFrozen = true; }
+        Check(stillFrozen, "close does not unfreeze security");
+
+        HttpClient encoded = new HttpClient("127.0.0.1", 19674);
+        encoded.SetCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp().ResponseLimit(16));
+        encoded.SetBoundedContentDecoder(Program.Bounded);
+        HttpResponse text = await encoded.SendAsync("GET", "/encoded", "");
+        HttpResponse bytes = await encoded.SendBytesAsync("GET", "/encoded", "");
+        Check(text.contentDecoded && text.body.Length == 4 && text.body[1] == 0
+            && bytes.contentDecoded && bytes.bodyBytesLen == 4 && bytes.bodyBytes[3] == 67
+            && boundedCalls == 2, "bounded decoder preserves NUL and receives response budget");
+        encoded.Dispose();
+
+        HttpClient legacy = new HttpClient("127.0.0.1", 19674);
+        bool blocked = false;
+        try { HttpResponse unused = await legacy.SendAsync("GET", "/encoded", ""); }
+        catch (HttpRequestException e) { blocked = e.Message.IndexOf("decode budget") >= 0; }
+        Check(blocked, "encoded response requires budget-enforcing decoder");
+        legacy.Dispose();
+
+        int pathFreezes = 0;
+        HttpClient binaryFirst = new HttpClient("127.0.0.1", 19674);
+        HttpResponse binaryPlain = await binaryFirst.SendBytesAsync("GET", "/plain", "");
+        try { binaryFirst.SetCertPolicy(null); }
+        catch (InvalidOperationException e) { pathFreezes = pathFreezes + 1; }
+        binaryFirst.Dispose();
+        HttpClient unpooled = new HttpClient("127.0.0.1", 19674);
+        unpooled.DisableKeepAlive();
+        HttpResponse plain = await unpooled.SendAsync("GET", "/plain", "");
+        try { unpooled.UseTls(); }
+        catch (InvalidOperationException e) { pathFreezes = pathFreezes + 1; }
+        unpooled.Dispose();
+        HttpClient range = new HttpClient("127.0.0.1", 19674);
+        range.SetCallPolicy(ExternalCallPolicy.Default());
+        List<string> visited = new List<string>();
+        int rangeRc = await range.DownloadRangeOnceAsync("/plain", "unused", "", visited, 0);
+        try { range.SetCallPolicy(null); }
+        catch (InvalidOperationException e) { pathFreezes = pathFreezes + 1; }
+        range.Dispose();
+        HttpClient download = new HttpClient("127.0.0.1", 19674);
+        download.SetCallPolicy(ExternalCallPolicy.Default());
+        long downloadRc = await download.DownloadBinaryOnceAsync("/plain", "unused", "", visited, 0);
+        try { download.DisableTlsVerify(); }
+        catch (InvalidOperationException e) { pathFreezes = pathFreezes + 1; }
+        download.Dispose();
+        Check(pathFreezes == 4 && rangeRc < 0 && downloadRc < 0,
+            "bytes unpooled and direct file paths freeze security before use");
+
+        int unsupported = 0;
+        try { c.SetClientCertificate("cert.pem", "key.pem"); }
+        catch (NotSupportedException e) { unsupported = unsupported + 1; }
+        try { TlsContext unused = TlsContext.CreateClientWithCertificate("cert.pem", "key.pem"); }
+        catch (NotSupportedException e) { unsupported = unsupported + 1; }
+        Check(unsupported == 2, "mTLS stubs explicitly reject unsupported authentication");
+
+        Check(WsHandshake.HeaderWithinLimit(65532, 131072)
+            && !WsHandshake.HeaderWithinLimit(65533, 65537)
+            && WsHandshake.HeaderWithinLimit(-1, 65535)
+            && !WsHandshake.HeaderWithinLimit(-1, 65536)
+            && !WsHandshake.HeaderWithinLimit(12, 15),
+            "WS and WSS budget includes terminator and excludes coalesced frames");
+        c.Dispose();
+        server.Stop();
+        await Task.Delay(80);
+        Console.WriteLine("failures=" + failures.ToString());
+        return failures;
+    }
+
+    static void Main() {
+        int result = await Program.Run();
+        if (result != 0) { Environment.Exit(1); }
+    }
+}

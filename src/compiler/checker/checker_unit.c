@@ -15,6 +15,8 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
             }
         }
     }
+    zan_scope_t *saved_scope = zan_binder_push_type_params(
+        c->binder, &method->method_decl.type_params);
     zan_ast_node_t *saved_method = c->current_method_decl;
     c->current_method_decl = method;
     bool saved_nrt = c->in_no_runtime;
@@ -41,6 +43,7 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     c->current_return_type = saved;
     c->in_no_runtime = saved_nrt;
     c->current_method_decl = saved_method;
+    c->binder->current_scope = saved_scope;
     c->in_ctor = saved_ctor;
 }
 
@@ -453,7 +456,8 @@ static void checker_collect_controllers(zan_checker_t *c,
          * 判定按**来源**而不是命名空间：模板/示例项目（用户自己的代码）
          * 也统一使用 Zan.Web.* 命名空间，按命名空间跳过会把项目自己的
          * 控制器一并吞掉（server-legend 全体 API 404 就是这么来的）。 */
-        if (decl->from_stdlib || decl->from_package) continue;
+        if (decl->from_stdlib || decl->from_package ||
+            zan_routes_framework_controller(unit, decl)) continue;
 
         /* 排除框架基类本身 */
         uint32_t nl = decl->type_decl.name.len;
@@ -507,13 +511,15 @@ static void checker_collect_controllers(zan_checker_t *c,
 /* __ZanActionDispatch.Dispatch：main.c 为含 __AttrRoutes.Register 的编译单元
  * 合成动作派发类；这里把它的方法组作为 Register 的第三实参传进去。 */
 static zan_ast_node_t *checker_synthesize_dispatcher_ref(zan_checker_t *c,
-                                                         zan_loc_t loc) {
+                                                         zan_loc_t loc,
+                                                         bool framework) {
     zan_ast_node_t *id = zan_ast_new(c->arena, AST_IDENTIFIER, loc);
     id->ident.name = checker_istr_lit(c->arena, "__ZanActionDispatch");
     id->ident.inst_type_ref = NULL;
     zan_ast_node_t *m = zan_ast_new(c->arena, AST_MEMBER_ACCESS, loc);
     m->member.object = id;
-    m->member.name = checker_istr_lit(c->arena, "Dispatch");
+    m->member.name = checker_istr_lit(c->arena,
+                                    framework ? "DispatchFramework" : "Dispatch");
     m->member.null_cond = 0;
     return m;
 }
@@ -558,6 +564,8 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
         }
 
         c->current_type_sym = zan_binder_lookup(c->binder, decl->type_decl.name);
+        zan_scope_t *saved_scope = zan_binder_push_type_params(
+            c->binder, &decl->type_decl.type_params);
         if (decl->kind == AST_CLASS_DECL) {
             check_virtual_shadows_base(c, decl);
             check_abstract_members(c, decl);
@@ -577,5 +585,6 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
                 check_method_body(c, member);
             }
         }
+        c->binder->current_scope = saved_scope;
     }
 }

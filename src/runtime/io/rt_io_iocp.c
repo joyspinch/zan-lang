@@ -302,9 +302,9 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 #if defined(ZAN_CO_DRIVER)
         if (skip) {
             op_free(op);
-            IO_CNT_DEC();
             InterlockedIncrement(&g_sync_inline);
             if (step) zan_co_ready(co, step);
+            IO_CNT_DEC();
         }
         return;
 #else
@@ -367,9 +367,9 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
         if (skip) {
             if (out_n) *out_n = (int64_t)got;
             op_free(op);
-            IO_CNT_DEC();
             InterlockedIncrement(&g_sync_inline);
             if (step) zan_co_ready(frame, step);
+            IO_CNT_DEC();
         }
         return;
 #else
@@ -407,12 +407,12 @@ static void rto_insert(zan_io_rto_t *e) {
     LeaveCriticalSection(&g_rto_lock);
 }
 
-static int rto_claim(void *frame) {
+/* Caller holds g_rto_lock: identity is the operation, never a reusable frame. */
+static int rto_claim(zan_io_op_t *op) {
     int found = 0;
-    EnterCriticalSection(&g_rto_lock);
     zan_io_rto_t **pp = &g_rto;
     while (*pp) {
-        if ((*pp)->frame == frame) {
+        if ((*pp)->ov == &op->ov) {
             zan_io_rto_t *e = *pp;
             *pp = e->next;
             free(e);
@@ -421,12 +421,10 @@ static int rto_claim(void *frame) {
         }
         pp = &(*pp)->next;
     }
-    LeaveCriticalSection(&g_rto_lock);
     return found;
 }
 
 static long long rto_wait_ms(long long caller_ms) {
-    if (!g_rto) return caller_ms;
     long long now = dns_now_ms();
     long long nearest = -1;
     EnterCriticalSection(&g_rto_lock);
@@ -441,8 +439,6 @@ static long long rto_wait_ms(long long caller_ms) {
 }
 
 static int rto_timeout_scan(void) {
-    if (!g_rto) return 0;
-    int woke = 0;
     long long now = dns_now_ms();
     for (;;) {
         zan_io_rto_t *e = NULL;
@@ -456,17 +452,19 @@ static int rto_timeout_scan(void) {
             }
             pp = &(*pp)->next;
         }
+        if (e) {
+            zan_io_op_t *op = CONTAINING_RECORD(e->ov, zan_io_op_t, ov);
+            op->rto = 2;
+            /* Cancellation is only a request. Keep op, frame and the borrowed
+             * receive buffer alive until its completion packet is consumed.
+             * Hold the lock through CancelIoEx so a dequeuer cannot recycle op. */
+            CancelIoEx((HANDLE)e->s, e->ov);
+            free(e);
+        }
         LeaveCriticalSection(&g_rto_lock);
         if (!e) break;
-        zan_io_op_t *win_op = CONTAINING_RECORD(e->ov, zan_io_op_t, ov);
-        win_op->rto = 2;
-        CancelIoEx((HANDLE)e->s, e->ov);
-        if (e->out_n) *e->out_n = -1;
-        io_wake(e->frame, e->step);
-        free(e);
-        woke++;
     }
-    return woke;
+    return 0; /* no coroutine has been woken yet */
 }
 
 void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
@@ -499,6 +497,8 @@ void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
     op->step = step;
     op->out_n = out_n;
     IO_CNT_INC();
+    /* Serialize publication and submission with timeout scans and dequeuers. */
+    EnterCriticalSection(&g_rto_lock);
     zan_io_rto_t *e = (zan_io_rto_t *)calloc(1, sizeof(*e));
     if (e) {
         e->s = s;
@@ -522,31 +522,38 @@ void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
     if (r == 0) {
 #if defined(ZAN_CO_DRIVER)
         if (skip) {
-            rto_claim(frame);
+            rto_claim(op);
             if (out_n) *out_n = (int64_t)got;
             op_free(op);
-            IO_CNT_DEC();
+            LeaveCriticalSection(&g_rto_lock);
             InterlockedIncrement(&g_sync_inline);
             if (step) zan_co_ready(frame, step);
+            IO_CNT_DEC();
+            return;
         }
-        return;
-#else
-        return;
 #endif
+        LeaveCriticalSection(&g_rto_lock);
+        return;
     }
     int err = WSAGetLastError();
-    if (err == WSA_IO_PENDING) return;
+    if (err == WSA_IO_PENDING) {
+        LeaveCriticalSection(&g_rto_lock);
+        return;
+    }
     if (out_n) *out_n = 0;
 #if defined(ZAN_CO_DRIVER)
     if (!PostQueuedCompletionStatus(io_shard_of(s), 0, (ULONG_PTR)s, &op->ov)) {
 #else
     if (!PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov)) {
 #endif
-        rto_claim(frame);
-        if (step) zan_co_ready(frame, step);
+        rto_claim(op);
         op_free(op);
+        LeaveCriticalSection(&g_rto_lock);
+        if (step) zan_co_ready(frame, step);
         IO_CNT_DEC();
+        return;
     }
+    LeaveCriticalSection(&g_rto_lock);
 }
 
 void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
@@ -625,9 +632,9 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
     if (ok && skip) {
         io_complete_op(op, got, 0);
         op_free(op);
-        IO_CNT_DEC();
         InterlockedIncrement(&g_sync_inline);
         if (step) zan_co_ready(frame, step);
+        IO_CNT_DEC();
         return;
     }
 #endif
@@ -636,9 +643,9 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
     closesocket(accepted);
     free(op->accept_buf);
     op_free(op);
-    IO_CNT_DEC();
     if (out_fd) *out_fd = -1;
     if (step) zan_co_ready(frame, step);
+    IO_CNT_DEC();
 }
 
 static void io_complete_op(zan_io_op_t *op, DWORD transferred,
@@ -660,8 +667,14 @@ static void io_complete_op(zan_io_op_t *op, DWORD transferred,
         free(op->accept_buf);
         return;
     }
+    /* A completion packet is the lifetime fence for borrowed receive memory.
+     * Both polling paths use this same arbitration before recycling the op. */
+    EnterCriticalSection(&g_rto_lock);
+    int timed_out = op->rto == 2;
+    if (op->rto == 1) rto_claim(op);
+    LeaveCriticalSection(&g_rto_lock);
     IOTRACE("complete op=%p kind=%d transferred=%lu status=%llu", (void*)op, op->kind, (unsigned long)transferred, (unsigned long long)status);
-    if (op->out_n) *op->out_n = (int64_t)transferred;
+    if (op->out_n) *op->out_n = timed_out ? -1 : (int64_t)transferred;
 }
 
 #if defined(ZAN_CO_DRIVER)
@@ -686,10 +699,7 @@ static BOOL io_poll_any(OVERLAPPED_ENTRY *entries, ULONG cap, ULONG *removed,
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
-    if (g_rto) {
-        int wr = rto_timeout_scan();
-        if (wr) return wr;
-    }
+    rto_timeout_scan();
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     int64_t wait = rto_wait_ms(dns_wait_ms(timeout_ms));
@@ -715,6 +725,7 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     int woke = 0;
     zan_co_task_t ready_batch[64];
     size_t ready_count = 0;
+    size_t completed_count = 0;
     for (ULONG i = 0; i < removed; i++) {
         if (!entries[i].lpOverlapped) {
             woke += dns_drain();
@@ -724,23 +735,11 @@ int32_t zan_io_poll(int64_t timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
-        if (op->rto == 2) {
-            IOTRACE("poll_op rto-dead op=%p kind=%d", (void*)op, op->kind);
-            op_free(op);
-            IO_CNT_DEC();
-            continue;
-        }
-        if (op->rto && !rto_claim(co)) {
-            IOTRACE("poll_op rto-late op=%p kind=%d", (void*)op, op->kind);
-            op_free(op);
-            IO_CNT_DEC();
-            continue;
-        }
         IOTRACE("poll_op op=%p kind=%d bytes=%lu status=%llu", (void*)op, op->kind, (unsigned long)entries[i].dwNumberOfBytesTransferred, (unsigned long long)entries[i].Internal);
         io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
                        entries[i].Internal);
         op_free(op);
-        IO_CNT_DEC();
+        completed_count++;
         if (step && co) {
             ready_batch[ready_count].frame = co;
             ready_batch[ready_count].step = step;
@@ -750,6 +749,12 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     }
     if (ready_count > 0) {
         zan_co_ready_batch(ready_batch, ready_count);
+    }
+    /* Match worker polling: transfer liveness to the ready queues before
+     * releasing pending IO. Frames may already be consumed after publication. */
+    while (completed_count > 0) {
+        completed_count--;
+        IO_CNT_DEC();
     }
     return woke;
 }

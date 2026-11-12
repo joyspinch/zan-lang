@@ -206,8 +206,8 @@ static void io_register_locked(intptr_t fd, int32_t interest, void *co, zan_co_s
         int64_t *fail_out_n = w->out_n;
         intptr_t *fail_accept = w->out_accept;
         io_unlink_waiter(s, interest == ZAN_IO_READ ? 1 : 0, w);
-        InterlockedDecrement(&g_io_count);
         io_mark_dead(sh, co, step, fail_out_n, fail_accept);
+        InterlockedDecrement(&g_io_count);
     }
 }
 
@@ -233,12 +233,12 @@ static int rto_timeout_scan(zan_io_shard_t *sh) {
         zan_io_waiter_t *w = s ? io_find_read_waiter(s, e->frame) : NULL;
         if (w) {
             io_unlink_waiter(s, 1, w);
-            InterlockedDecrement(&g_io_count);
             if (s->has_r || s->has_w) {
                 if (!io_arm(fd, s)) io_fail_slot_waiters(fd, s);
             }
             if (e->out_n) *e->out_n = -1;
             io_wake(e->frame, e->step);
+            InterlockedDecrement(&g_io_count);
             woke++;
         }
         free(e);
@@ -279,6 +279,7 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
             int woke = 0;
             zan_co_task_t ready_batch[256];
             size_t ready_count = 0;
+            int completed_count = 0;
             for (int i = 0; i < n; i++) {
                 int fd = events[i].data.fd;
                 if (fd == sh->wake_rfd) {
@@ -306,7 +307,7 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
 
                 for (int k = 0; k < nr; k++) {
                     io_deliver_waiter(fd, &ready[k]);
-                    InterlockedDecrement(&g_io_count);
+                    completed_count++;
                     if (ready[k].co && ready[k].step && ready_count < 256) {
                         ready_batch[ready_count].frame = ready[k].co;
                         ready_batch[ready_count].step = ready[k].step;
@@ -321,6 +322,8 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
             if (ready_count > 0) {
                 zan_co_ready_batch(ready_batch, ready_count);
             }
+            /* Transfer liveness before releasing dequeued IO owners. */
+            InterlockedExchangeAdd(&g_io_count, -completed_count);
             return woke;
         }
         int w2 = dns_timeout_scan();
@@ -359,8 +362,8 @@ static void io_close_notify_slots(intptr_t fdp) {
         for (int k = 0; k < nr; k++) {
             if (ready[k].out_accept)   *ready[k].out_accept = -1;
             else if (ready[k].out_n)   *ready[k].out_n = 0;
-            InterlockedDecrement(&g_io_count);
             io_wake(ready[k].co, ready[k].step);
+            InterlockedDecrement(&g_io_count);
         }
     }
 }

@@ -1,70 +1,23 @@
 /*
- * zan_gui runtime — Apple Metal GPU backend (macOS / iOS).
- *
- * 专为 Apple 生态打造的现代硬件加速渲染后端，对接 Metal API 与 CAMetalLayer，
- * 解决苹果全面弃用 OpenGL 后的硬件加速渲染与零拷贝视窗呈现。
+ * Apple renderer placeholder: primitives still use the CPU rasterizer.
+ * Device availability alone does not provide a Metal render/present pipeline.
  */
 
 #if defined(__APPLE__)
 
-#import <Foundation/Foundation.h>
-#import <Metal/Metal.h>
-#import <QuartzCore/CAMetalLayer.h>
-
 #include "gui_metal_backend.h"
 #include "gui_backend.h"
 
-typedef struct {
-    id<MTLDevice>              device;
-    id<MTLCommandQueue>        queue;
-    id<MTLRenderPipelineState> pipeline_shape;
-    int                        initialized;
-    int                        is_supported;
-} zan_metal_ctx_t;
-
-static zan_metal_ctx_t g_metal;
-
-int zan_gui_internal_metal_supported(void) {
-    if (g_metal.initialized) return g_metal.is_supported;
-    @autoreleasepool {
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        g_metal.is_supported = (dev != nil);
-    }
-    return g_metal.is_supported;
-}
+int zan_gui_internal_metal_supported(void) { return 0; }
 
 int zan_gui_internal_metal_install(void) {
-    if (g_metal.initialized) return g_metal.is_supported;
-    @autoreleasepool {
-        g_metal.device = MTLCreateSystemDefaultDevice();
-        if (!g_metal.device) {
-            g_metal.is_supported = 0;
-            g_metal.initialized = 1;
-            return 0;
-        }
-        g_metal.queue = [g_metal.device newCommandQueue];
-        if (!g_metal.queue) {
-            g_metal.is_supported = 0;
-            g_metal.initialized = 1;
-            return 0;
-        }
-        g_metal.is_supported = 1;
-        g_metal.initialized = 1;
-        return 1;
-    }
+    /* Leave backend selection to the working GL/CPU paths until implemented. */
+    return 0;
 }
 
-void zan_gui_internal_metal_drop_present(void) {
-    @autoreleasepool {
-        g_metal.queue = nil;
-        g_metal.device = nil;
-        g_metal.pipeline_shape = nil;
-        g_metal.initialized = 0;
-        g_metal.is_supported = 0;
-    }
-}
+void zan_gui_internal_metal_drop_present(void) { }
 
-/* 基础光栅化接口委托给 CPU 软光栅后备或 Metal 着色器管线 */
+/* All primitive entry points currently delegate to CPU rasterization. */
 static void metal_clear_rect(struct zan_surface_s *s, int x, int y, int w, int h, uint32_t color) {
     zan_cpu_backend.clear_rect(s, x, y, w, h, color);
 }
@@ -167,11 +120,11 @@ static void metal_blit_pixels_batch(struct zan_surface_s *s, const zan_bitmap *b
 
 static int metal_present(struct zan_surface_s *s, void *native_window) {
     (void)s; (void)native_window;
-    return 1;
+    return 0;
 }
 
 const zan_gui_backend zan_metal_backend = {
-    .name              = "metal",
+    .name              = "cpu",
     .clear_rect        = metal_clear_rect,
     .fill_rect         = metal_fill_rect,
     .fill_round        = metal_fill_round,
@@ -214,7 +167,7 @@ int zan_gui_internal_metal_install(void) { return 0; }
 void zan_gui_internal_metal_drop_present(void) { }
 
 const zan_gui_backend zan_metal_backend = {
-    .name = "metal_stub",
+    .name = "cpu",
 };
 
 #endif

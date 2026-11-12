@@ -39,8 +39,6 @@ typedef enum {
 typedef struct {
     zgl_uint tex, fbo;
     zgl_uint cov_tex, cov_fbo;
-    zgl_uint snap_tex, snap_fbo;
-    int snap_w, snap_h;
     int w, h;
     int gpu_ahead;
     int cpu_ahead;
@@ -49,6 +47,26 @@ typedef struct {
 } zgl_target;
 
 static zgl_target g_zgl_targets[64];
+
+/* Like the CPU cache, slots are global and the latest capture owns the slot. */
+typedef struct {
+    zgl_uint tex, fbo;
+    int sid, x, y, w, h;
+} zgl_snapshot;
+static zgl_snapshot g_zgl_snapshots[ZAN_SNAP_CACHE_MAX_SLOTS];
+
+static void zgl_snapshot_drop(zgl_snapshot *c) {
+    if (c->fbo) gl.DeleteFramebuffers(1, &c->fbo);
+    if (c->tex) gl.DeleteTextures(1, &c->tex);
+    memset(c, 0, sizeof(*c));
+}
+
+static void zgl_snapshots_drop_surface(int sid) {
+    for (int i = 0; i < ZAN_SNAP_CACHE_MAX_SLOTS; i++) {
+        zgl_snapshot *c = &g_zgl_snapshots[i];
+        if (c->fbo && c->sid == sid) zgl_snapshot_drop(c);
+    }
+}
 
 static struct {
     zgl_uint prog_shape, prog_text, vao, vbo;
@@ -71,6 +89,7 @@ static zgl_target *zgl_target_of(zan_surface_t *s) {
         return NULL;
     zgl_target *t = &g_zgl_targets[s->id];
     if (t->fbo && (t->w != s->width || t->h != s->height)) {
+        zgl_snapshots_drop_surface(s->id);
         gl.DeleteFramebuffers(1, &t->fbo);
         gl.DeleteTextures(1, &t->tex);
         if (t->cov_fbo) gl.DeleteFramebuffers(1, &t->cov_fbo);
@@ -553,63 +572,121 @@ static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
 }
 
 
-static void gl_snapshot(zan_surface_t *s, int x, int y, int w, int h, int slot) {
-    (void)x; (void)y; (void)w; (void)h; (void)slot;
-    if (!s || g_gl_state <= 0) return;
+/* Use 64-bit endpoints before clamping, including off-surface requests. */
+static int zgl_snap_edge(int origin, int extent, int limit) {
+    int64_t edge = (int64_t)origin + extent;
+    return edge < 0 ? 0 : edge > limit ? limit : (int)edge;
+}
+
+static zgl_target *zgl_snapshot_target(zan_surface_t *s) {
+    if (!s || g_gl_state <= 0 || !zan_gl_ctx_make_current()) return NULL;
+    zgl_flush();
     zgl_target *t = zgl_target_of(s);
+    if (t) zgl_upload(s, t);
+    return t;
+}
+
+static void gl_snapshot(zan_surface_t *s, int x, int y, int w, int h, int slot) {
+    if (!s || slot < 0 || slot >= ZAN_SNAP_CACHE_MAX_SLOTS) return;
+    int x0 = clamp_i(x, 0, s->width), y0 = clamp_i(y, 0, s->height);
+    int x1 = zgl_snap_edge(x, w, s->width), y1 = zgl_snap_edge(y, h, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    zgl_target *t = zgl_snapshot_target(s);
     if (!t) return;
-    if (g_zgl.target == s || g_zgl.count) zgl_flush();
-    if (!zan_gl_ctx_make_current()) return;
-
-    if (t->snap_w != t->w || t->snap_h != t->h || !t->snap_tex || !t->snap_fbo) {
-        if (t->snap_fbo) gl.DeleteFramebuffers(1, &t->snap_fbo);
-        if (t->snap_tex) gl.DeleteTextures(1, &t->snap_tex);
-        t->snap_tex = t->snap_fbo = 0;
-        t->snap_w = t->snap_h = 0;
-
-        gl.GenTextures(1, &t->snap_tex);
-        gl.BindTexture(ZGL_TEXTURE_2D, t->snap_tex);
+    zgl_snapshot *c = &g_zgl_snapshots[slot];
+    if (!c->fbo || c->w != rw || c->h != rh) {
+        size_t bytes = (size_t)rw * (size_t)rh * sizeof(u32);
+        if (ZAN_SNAP_CACHE_BYTES) {
+            for (int i = 0; i < ZAN_SNAP_CACHE_MAX_SLOTS; i++) {
+                const zgl_snapshot *other = &g_zgl_snapshots[i];
+                if (other != c && other->fbo)
+                    bytes += (size_t)other->w * (size_t)other->h * sizeof(u32);
+            }
+            if (bytes > (size_t)ZAN_SNAP_CACHE_BYTES) {
+                zgl_snapshot_drop(c);
+                return;
+            }
+        }
+        zgl_snapshot_drop(c);
+        gl.GenTextures(1, &c->tex);
+        gl.BindTexture(ZGL_TEXTURE_2D, c->tex);
         gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_NEAREST);
         gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_NEAREST);
         gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
         gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
-        gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, t->w, t->h, 0,
+        gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, rw, rh, 0,
                       ZGL_BGRA, ZGL_UNSIGNED_BYTE, NULL);
-        gl.GenFramebuffers(1, &t->snap_fbo);
-        gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->snap_fbo);
+        gl.GenFramebuffers(1, &c->fbo);
+        gl.BindFramebuffer(ZGL_FRAMEBUFFER, c->fbo);
         gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
-                                ZGL_TEXTURE_2D, t->snap_tex, 0);
-        if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) == ZGL_FRAMEBUFFER_COMPLETE) {
-            t->snap_w = t->w;
-            t->snap_h = t->h;
-        } else {
-            gl.DeleteFramebuffers(1, &t->snap_fbo);
-            gl.DeleteTextures(1, &t->snap_tex);
-            t->snap_tex = t->snap_fbo = 0;
-            t->snap_w = t->snap_h = 0;
+                                ZGL_TEXTURE_2D, c->tex, 0);
+        if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE) {
+            zgl_snapshot_drop(c);
             gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
             return;
         }
     }
-
+    c->sid = s->id; c->x = x0; c->y = y0; c->w = rw; c->h = rh;
+    /* Snapshot and patch ignore the drawing clip; restore applies it below. */
+    gl.Disable(ZGL_SCISSOR_TEST);
     gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
-    gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, t->snap_fbo);
-    gl.BlitFramebuffer(0, 0, t->w, t->h, 0, 0, t->w, t->h,
+    gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, c->fbo);
+    gl.BlitFramebuffer(x0, t->h - y1, x1, t->h - y0, 0, 0, rw, rh,
+                       ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+}
+
+static void gl_snapshot_patch(zan_surface_t *s, int x, int y, int w, int h, int slot) {
+    if (!s || slot < 0 || slot >= ZAN_SNAP_CACHE_MAX_SLOTS) return;
+    zgl_target *t = zgl_snapshot_target(s);
+    if (!t) return;
+    zgl_snapshot *c = &g_zgl_snapshots[slot];
+    if (!c->fbo || c->sid != s->id) return;
+    int x0 = clamp_i(x, 0, s->width), y0 = clamp_i(y, 0, s->height);
+    int x1 = zgl_snap_edge(x, w, s->width), y1 = zgl_snap_edge(y, h, s->height);
+    if (x1 <= x0 || y1 <= y0 || x0 < c->x || y0 < c->y
+        || x1 > c->x + c->w || y1 > c->y + c->h) return;
+    gl.Disable(ZGL_SCISSOR_TEST);
+    gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
+    gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, c->fbo);
+    gl.BlitFramebuffer(x0, t->h - y1, x1, t->h - y0,
+                       x0 - c->x, c->y + c->h - y1,
+                       x1 - c->x, c->y + c->h - y0,
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
 }
 
 static int gl_restore(zan_surface_t *s, int x, int y, int w, int h, int slot, int sub_rect) {
-    (void)x; (void)y; (void)w; (void)h; (void)slot; (void)sub_rect;
-    if (!s || g_gl_state <= 0) return 0;
-    zgl_target *t = zgl_target_of(s);
-    if (!t || !t->snap_fbo || !t->snap_tex) return 0;
-    if (g_zgl.target == s || g_zgl.count) zgl_flush();
-    if (!zan_gl_ctx_make_current()) return 0;
-
-    gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->snap_fbo);
+    if (!s || slot < 0 || slot >= ZAN_SNAP_CACHE_MAX_SLOTS) return 0;
+    zgl_target *t = zgl_snapshot_target(s);
+    if (!t) return 0;
+    zgl_snapshot *c = &g_zgl_snapshots[slot];
+    if (!c->fbo || c->sid != s->id) return 0;
+    int x0, y0, x1, y1;
+    if (sub_rect) {
+        int64_t right = (int64_t)x + w, bottom = (int64_t)y + h;
+        if (right <= x || bottom <= y) return 1;
+        if (x < c->x || y < c->y || right > c->x + c->w
+            || bottom > c->y + c->h) return 0;
+        x0 = x; y0 = y; x1 = (int)right; y1 = (int)bottom;
+    } else {
+        x0 = clamp_i(x, 0, s->width); y0 = clamp_i(y, 0, s->height);
+        x1 = zgl_snap_edge(x, w, s->width); y1 = zgl_snap_edge(y, h, s->height);
+        if (x1 <= x0 || y1 <= y0 || x0 != c->x || y0 != c->y
+            || x1 - x0 != c->w || y1 - y0 != c->h) return 0;
+    }
+    x0 = clamp_i(x0 > s->clip_x0 ? x0 : s->clip_x0, 0, s->width);
+    y0 = clamp_i(y0 > s->clip_y0 ? y0 : s->clip_y0, 0, s->height);
+    x1 = clamp_i(x1 < s->clip_x1 ? x1 : s->clip_x1, 0, s->width);
+    y1 = clamp_i(y1 < s->clip_y1 ? y1 : s->clip_y1, 0, s->height);
+    if (x1 <= x0 || y1 <= y0) return 1;
+    gl.Disable(ZGL_SCISSOR_TEST);
+    gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, c->fbo);
     gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, t->fbo);
-    gl.BlitFramebuffer(0, 0, t->w, t->h, 0, 0, t->w, t->h,
+    gl.BlitFramebuffer(x0 - c->x, c->y + c->h - y1,
+                       x1 - c->x, c->y + c->h - y0,
+                       x0, t->h - y1, x1, t->h - y0,
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
     t->gpu_ahead = 1;
@@ -670,8 +747,7 @@ static void gl_drop_surface(zan_surface_t *s) {
         gl.DeleteTextures(1, &t->tex);
         if (t->cov_fbo) gl.DeleteFramebuffers(1, &t->cov_fbo);
         if (t->cov_tex) gl.DeleteTextures(1, &t->cov_tex);
-        if (t->snap_fbo) gl.DeleteFramebuffers(1, &t->snap_fbo);
-        if (t->snap_tex) gl.DeleteTextures(1, &t->snap_tex);
+        zgl_snapshots_drop_surface(s->id);
     }
     if (g_zgl.target == s) g_zgl.target = NULL;
     free(t->shadow);
@@ -872,6 +948,7 @@ static const zan_gui_backend zan_gl_backend = {
     .polybatch    = gl_polybatch,
     .blur         = NULL,
     .snapshot     = gl_snapshot,
+    .snapshot_patch = gl_snapshot_patch,
     .restore      = gl_restore,
     .draw_text    = NULL,
     .glyph_run    = gl_glyph_run,

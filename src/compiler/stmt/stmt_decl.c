@@ -340,9 +340,8 @@
                                             }
                                         }
                                         if (fst && (is_rc_managed_type(fst) || fst->kind == TYPE_OBJECT)) {
-                                            emit_rc_store_field(g, fst, fptr, fval,
-                                                arg->binary.right, locals,
-                                                (fsym->modifiers & MOD_WEAK) ? 1 : 0);
+                                            emit_rc_store_member(g, fsym, fst, fptr, fval,
+                                                arg->binary.right, locals);
                                         } else if (fst && fst->kind == TYPE_STRUCT &&
                                                    type_contains_collection_rc(g, fst, 0)) {
                                             emit_struct_field_capture(g, fst, fptr, fval,

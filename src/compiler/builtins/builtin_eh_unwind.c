@@ -563,7 +563,16 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMBuildBr(g->builder, head);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_dlg);
-    emit_closure_release(g, vobj);
+    /* EH kind bits replace the closure's bit0 tag. Restore it only for
+     * non-null records; a raw callback was normalized to null at push. */
+    LLVMValueRef dlg_bits = LLVMBuildPtrToInt(g->builder, vobj, i64t, "dlg.bits");
+    LLVMValueRef dlg_tagged = LLVMBuildIntToPtr(g->builder,
+        zan_or(g->builder, dlg_bits, LLVMConstInt(i64t, 1, 0), "dlg.tag"),
+        i8ptr, "dlg.value");
+    LLVMValueRef dlg_value = LLVMBuildSelect(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, vobj, LLVMConstNull(i8ptr), "dlg.nonnull"),
+        dlg_tagged, LLVMConstNull(i8ptr), "dlg.safe");
+    emit_closure_release(g, dlg_value);
     LLVMBuildBr(g->builder, head);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_obj);
@@ -601,6 +610,16 @@ void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(slot) != i8ptr)
         slot = LLVMBuildBitCast(g->builder, slot, i8ptr, "eh.slotp");
+    if (kind == ZAN_EH_SLOT_DLG) {
+        /* Native function pointers have no closure owner. Preserve one stack
+         * entry for pop balance, but never encode their address as a record. */
+        LLVMValueRef bits = LLVMBuildPtrToInt(g->builder, slot, i64t, "dlg.push.bits");
+        LLVMValueRef is_closure = zan_icmp(g->builder, LLVMIntNE,
+            zan_and(g->builder, bits, LLVMConstInt(i64t, 1, 0), "dlg.push.tag"),
+            LLVMConstInt(i64t, 0, 0), "dlg.push.closure");
+        slot = LLVMBuildSelect(g->builder, is_closure, slot,
+            LLVMConstNull(i8ptr), "dlg.push.owner");
+    }
     uint64_t tag = 1u | ((uint64_t)kind << 1);
     LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder,
         zan_or(g->builder, LLVMBuildPtrToInt(g->builder, slot, i64t, "slot.i"),

@@ -24,6 +24,17 @@ class Program {
         return X509Certificate.ParseForTls(der, len[0]);
     }
 
+    // Feed real record framing through the public engine input API.
+    static int FeedHandshake(TlsEngine engine, byte[] message) {
+        engine.state = engine.negotiatedVersion == TlsRecord.VersionTls13
+            ? TlsEngine.StateTls13Handshake : TlsEngine.StateTls12Handshake;
+        byte[] record = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake,
+            TlsRecord.VersionTls12, message, 0, message.Length);
+        if (record == null) { return -1; }
+        engine.FeedNetwork(record, 0, record.Length);
+        return engine.Step();
+    }
+
     static void Main() {
         // 1. 验证 OCSPResponse 基础 ASN.1 DER 解码 (RFC 6960)
         byte[] goodDer = OcspResponse.BuildMockResponse(0, OcspCertStatus.Good);
@@ -94,11 +105,11 @@ class Program {
         certMsg1[2] = (byte)((bodyLen1 >> 8) & 255);
         certMsg1[3] = (byte)(bodyLen1 & 255);
 
-        int rcGood = tls13Good.ProcessHandshakePayload(certMsg1);
+        int rcGood = FeedHandshake(tls13Good, certMsg1);
         Check(rcGood == 0 && tls13Good.stapledOcsp != null && tls13Good.stapledOcsp.certStatus == OcspCertStatus.Good,
-              "TLS 1.3 stapled Good OCSP accepted");
+              "TLS 1.3 optional Good OCSP is diagnostic only");
 
-        // 3.2 TLS 1.3 证书附带 Revoked OCSP -> 立即熔断拒绝！
+        // 3.2 Unsigned optional Revoked is diagnostic, not authenticated status.
         TlsEngine tls13Rev = new TlsEngine("secure.example", false, false, null, false, null, trusted, false, "", "");
         tls13Rev.negotiatedVersion = TlsRecord.VersionTls13;
         tls13Rev.receivedEncryptedExtensions = true;
@@ -126,11 +137,11 @@ class Program {
         certMsg2[2] = (byte)((bodyLen2 >> 8) & 255);
         certMsg2[3] = (byte)(bodyLen2 & 255);
 
-        int rcRev = tls13Rev.ProcessHandshakePayload(certMsg2);
-        Check(rcRev != 0 && tls13Rev.lastError.IndexOf("OCSP") >= 0,
-              "TLS 1.3 stapled Revoked OCSP rejected with fail-closed");
+        int rcRev = FeedHandshake(tls13Rev, certMsg2);
+        Check(rcRev == 0 && tls13Rev.stapledOcsp != null,
+              "TLS 1.3 unsigned Revoked OCSP cannot decide trust");
 
-        // 4. 验证 TLS 1.2 CertificateStatus 握手报文阻断
+        // 4. TLS 1.2 optional status follows the same untrusted diagnostic rule.
         TlsEngine tls12Rev = new TlsEngine("secure.example", false, true, null, false, null, trusted, false, "", "");
         tls12Rev.negotiatedVersion = TlsRecord.VersionTls12;
         tls12Rev.peerCert = leaf;
@@ -144,9 +155,9 @@ class Program {
         csBw.WriteBytes(revokedDer);
         byte[] csMsg = csBw.ToArray();
 
-        int rcCsRev = tls12Rev.ProcessHandshakePayload(csMsg);
-        Check(rcCsRev != 0 && tls12Rev.lastError.IndexOf("OCSP") >= 0,
-              "TLS 1.2 CertificateStatus Revoked OCSP rejected");
+        int rcCsRev = FeedHandshake(tls12Rev, csMsg);
+        Check(rcCsRev == 0 && tls12Rev.stapledOcsp != null,
+              "TLS 1.2 unsigned Revoked OCSP cannot decide trust");
 
         // 5. 验证 requireOcspStapling 门禁防线：未提供状态时直接拦截
         TlsEngine tlsReq = new TlsEngine("secure.example", false, false, null, false, null, trusted, false, "", "");
@@ -170,9 +181,17 @@ class Program {
         certMsgNoExt[2] = (byte)((bodyLenNoExt >> 8) & 255);
         certMsgNoExt[3] = (byte)(bodyLenNoExt & 255);
 
-        int rcReq = tlsReq.ProcessHandshakePayload(certMsgNoExt);
+        int rcReq = FeedHandshake(tlsReq, certMsgNoExt);
         Check(rcReq != 0 && tlsReq.lastError.IndexOf("OCSP") >= 0,
               "requireOcspStapling gate blocks handshake when server provides no OCSP");
+
+        TlsEngine requiredGood = new TlsEngine("secure.example", true, false, null, false, null, trusted, false, "", "");
+        requiredGood.requireOcspStapling = true;
+        requiredGood.negotiatedVersion = TlsRecord.VersionTls13;
+        requiredGood.receivedEncryptedExtensions = true;
+        int requiredRc = FeedHandshake(requiredGood, certMsg1);
+        Check(requiredRc != 0 && requiredGood.lastError.IndexOf("unsupported") >= 0,
+              "required OCSP rejects unsigned Good even with verification disabled");
 
         if (failures > 0) {
             Console.WriteLine("FAILURES: " + Convert.ToString(failures));

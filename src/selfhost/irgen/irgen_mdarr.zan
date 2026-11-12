@@ -8,7 +8,7 @@ namespace Zan;
 // rectangular shape (`int[][,]`) put their dimensions into the array's
 // header:
 //
-//     [dim0][dim1]...[dim(r-1)][count][elements]
+//     [rc][dim0][dim1]...[dim(r-1)][count][elements]
 //
 // The count is the LAST word before the elements -- the same place a plain
 // array keeps its length -- so `arr.Length` reads it the same way, and the
@@ -31,7 +31,7 @@ partial class Irgen {
     // in front of the elements (the count is the last one).
     string MdDim(string arrOp, int rank, int d) {
         string p = NT();
-        L("  " + p + " = getelementptr i64, i64* " + arrOp + ", i64 " + (d - rank - 1));
+        L("  " + p + " = getelementptr i64, i64* " + arrOp + ", i64 " + (d - rank - 3));
         string v = NT();
         L("  " + v + " = load i64, i64* " + p);
         return v;
@@ -107,7 +107,7 @@ partial class Irgen {
         string dim = NT();
         L("  " + dim + " = select i1 " + oob + ", i64 0, i64 " + d.op);
         string off = NT();
-        L("  " + off + " = add i64 " + dim + ", " + (0 - rk - 1));
+        L("  " + off + " = add i64 " + dim + ", " + (0 - rk - 3));
         string p = NT();
         L("  " + p + " = getelementptr i64, i64* " + recv.op + ", i64 " + off);
         string v = NT();
@@ -134,47 +134,24 @@ partial class Irgen {
             dims.Add(GenExpr(e.kids[dd - 1]).op);
             dd = dd + 1;
         }
-        // the element count: the product of the dimensions
+        // Check each dimension and every product BEFORE multiplication. The
+        // helper rejects negative dimensions even when an earlier one is zero.
         string total = "1";
         dd = 0;
         while (dd < rank) {
             string mul = NT();
-            L("  " + mul + " = mul i64 " + total + ", " + dims[dd]);
+            L("  " + mul + " = call i64 @zarr_count_mul(i64 " + total + ", i64 " + dims[dd] + ")");
             total = mul;
             dd = dd + 1;
         }
-        // a wrapped product is an overflow (the C host folds it to 0 after
-        // the report)
-        string neg = NT();
-        L("  " + neg + " = icmp slt i64 " + total + ", 0");
-        GuardFail(neg, "array allocation overflow", e);
-        string safe = NT();
-        L("  " + safe + " = select i1 " + neg + ", i64 0, i64 " + total);
-        total = safe;
-        // the allocation: the header plus the elements
-        string bytes = NT();
-        if (esz == 1) { L("  " + bytes + " = add i64 " + total + ", 0"); }
-        else { L("  " + bytes + " = mul i64 " + total + ", 8"); }
-        string tot = NT();
-        L("  " + tot + " = add i64 " + bytes + ", " + (8 * (rank + 2)));
-        string raw = NT();
-        L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
-        L("  call void @zan_rt_alloc_add(i64 " + tot + ")");
-        string hdr = NT();
-        L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
-        // the dimensions at hdr+1..hdr+rank, the count at hdr+rank+1
+        string arr = ArrayAllocate(at, total);
         dd = 0;
         while (dd < rank) {
             string dp = NT();
-            L("  " + dp + " = getelementptr i64, i64* " + hdr + ", i64 " + (dd + 1));
+            L("  " + dp + " = getelementptr i64, i64* " + arr + ", i64 " + (dd - rank - 3));
             L("  store i64 " + dims[dd] + ", i64* " + dp);
             dd = dd + 1;
         }
-        string cntp = NT();
-        L("  " + cntp + " = getelementptr i64, i64* " + hdr + ", i64 " + (rank + 1));
-        L("  store i64 " + total + ", i64* " + cntp);
-        string arr = NT();
-        L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 " + (rank + 2));
         // the initializer items land in row-major order
         if (nitems > 0) {
             Node et = elemTy;
@@ -182,6 +159,12 @@ partial class Irgen {
             int jn = 0;
             while (jn < nitems) {
                 ExprVal iv = GenExpr(e.kids[ndimkids + jn]);
+                if (IsDecimal(et)) {
+                    string dp = DecimalArrayPlace(arr, "" + jn);
+                    L("  store " + DecimalLL() + " " + ToDecimal(iv).op + ", " + DecimalLL() + "* " + dp);
+                    jn = jn + 1;
+                    continue;
+                }
                 string sv = "";
                 if (IsNullableValue(et)) {
                     // a nullable element is a pointer slot: box the value
@@ -189,8 +172,10 @@ partial class Irgen {
                     string bi = NT();
                     L("  " + bi + " = ptrtoint i8* " + bx + " to i64");
                     sv = bi;
+                    ArrayElementRetain(sv, et);
                 } else {
-                    sv = StructElemSlot(iv, et);
+                    sv = ArrayElementSlot(iv, et);
+                    ArrayElementRetain(sv, et);
                 }
                 if (esz == 1) {
                     string ab = NT();
@@ -200,12 +185,13 @@ partial class Irgen {
                     ArrElemStore(ep, 1, sv);
                 } else {
                     string ep = NT();
-                    L("  " + ep + " = getelementptr i64, i64* " + hdr + ", i64 " + (jn + rank + 2));
+                    L("  " + ep + " = getelementptr i64, i64* " + arr + ", i64 " + jn);
                     L("  store i64 " + sv + ", i64* " + ep);
                 }
                 jn = jn + 1;
             }
         }
+        AddTemp(arr, at);
         return new ExprVal(arr, at);
     }
 

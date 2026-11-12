@@ -1,0 +1,60 @@
+using System;
+using System.Linq;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+
+[Table("null_binding_items")]
+class NullBindingItem {
+    public int id;
+    public string text;
+}
+
+class NullBindingProperties {
+    public string Text { get; set; }
+    public int Number { get; set; }
+}
+
+class Program {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void Main() {
+        NullBindingItem absent = new NullBindingItem();
+        absent.id = 1;
+        absent.text = null;
+        NullBindingItem empty = new NullBindingItem();
+        empty.id = 2;
+        empty.text = "";
+        object reflectedNull = absent;
+        object reflectedEmpty = empty;
+        Check(reflectedNull.GetFieldString("text") == null, "reflection changed null string");
+        Check(reflectedEmpty.GetFieldString("text") != null, "reflection changed empty string to null");
+        NullBindingProperties properties = new NullBindingProperties();
+        properties.Text = null;
+        object reflectedProperties = properties;
+        Check(reflectedProperties.GetFieldString("Text") == null, "reflection changed null property");
+        properties.Text = "";
+        Check(reflectedProperties.GetFieldString("Text") == "", "reflection changed empty property");
+        properties.Text = "present";
+        Check(reflectedProperties.GetFieldString("Text") == "present", "reflection changed property text");
+        Check(reflectedProperties.GetFieldString("Number") == "", "non-string property fallback changed");
+        Check(reflectedNull.GetFieldString("id") == "", "non-string field fallback changed");
+        Check(reflectedNull.GetFieldString("missing") == "", "missing field fallback changed");
+        DbParams parameters = new DbParams();
+        parameters.Add(reflectedNull.GetFieldString("text"));
+        parameters.Add(reflectedEmpty.GetFieldString("text"));
+        Check(parameters.IsNull(0) && !parameters.IsNull(1), "parameter null distinction lost");
+        SqliteConnection db = SqliteConnection.Open(":memory:");
+        db.Execute("CREATE TABLE null_binding_items (id INTEGER PRIMARY KEY, text TEXT)");
+        db.Insert<NullBindingItem>(absent).ExecuteAffrows();
+        db.Insert<NullBindingItem>(empty).ExecuteAffrows();
+        Check(db.ExecuteScalar("SELECT id FROM null_binding_items WHERE text IS NULL") == "1", "ORM lost SQL NULL");
+        Check(db.ExecuteScalar("SELECT id FROM null_binding_items WHERE text = ''") == "2", "ORM lost empty text");
+        Check(db.Select<NullBindingItem>().Where((ExprNode x) => x.text == null).Count() == 1, "IS NULL wrong");
+        Check(db.Select<NullBindingItem>().Where((ExprNode x) => x.text != null).Count() == 1, "IS NOT NULL wrong");
+        db.Close();
+        Console.WriteLine("reflection and ORM preserve null versus empty strings");
+    }
+}

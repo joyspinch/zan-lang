@@ -169,8 +169,8 @@ static void io_register_locked(intptr_t fd, int32_t interest, void *co, zan_co_s
         EV_SET(&kev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, NULL);
         if (kevent(sh->poll_fd, &kev, 1, NULL, 0, NULL) != 0) {
             io_unlink_waiter(s, interest == ZAN_IO_READ ? 1 : 0, w);
-            InterlockedDecrement(&g_io_count);
             io_mark_dead(sh, co, step, fail_out_n, fail_accept);
+            InterlockedDecrement(&g_io_count);
             return;
         }
     }
@@ -198,9 +198,9 @@ static int rto_timeout_scan(zan_io_shard_t *sh) {
         zan_io_waiter_t *w = s ? io_find_read_waiter(s, e->frame) : NULL;
         if (w) {
             io_unlink_waiter(s, 1, w);
-            InterlockedDecrement(&g_io_count);
             if (e->out_n) *e->out_n = -1;
             io_wake(e->frame, e->step);
+            InterlockedDecrement(&g_io_count);
             woke++;
         }
         free(e);
@@ -276,8 +276,8 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
                 }
                 for (int k = 0; k < nr; k++) {
                     io_deliver_waiter(fd, &ready[k]);
-                    InterlockedDecrement(&g_io_count);
                     io_wake(ready[k].co, ready[k].step);
+                    InterlockedDecrement(&g_io_count);
                     woke++;
                 }
             }
@@ -324,8 +324,8 @@ static void io_close_notify_slots(intptr_t fdp) {
         for (int k = 0; k < nr; k++) {
             if (ready[k].out_accept)   *ready[k].out_accept = -1;
             else if (ready[k].out_n)   *ready[k].out_n = 0;
-            InterlockedDecrement(&g_io_count);
             io_wake(ready[k].co, ready[k].step);
+            InterlockedDecrement(&g_io_count);
         }
     }
 }

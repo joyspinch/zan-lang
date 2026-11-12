@@ -323,9 +323,9 @@
                 g->arc_defer_depth = LLVMAddGlobal(g->mod, i32t,
                                                    "__zan_arc_rel_depth");
                 LLVMSetInitializer(g->arc_defer_depth, LLVMConstNull(i32t));
-                /* TLS 留待多线程释放语义定型；当前普通全局（探针单线程，
-                 * ARC 释放主线程语义下正确） */
-                if (!g->target_is_wasm && getenv("ZAN_ARC_DEFER_TLS"))
+                /* This is recursion depth, not a shared queue count. A second
+                 * thread must never decrement or inherit another thread's frame. */
+                if (!g->target_is_wasm)
                     LLVMSetThreadLocal(g->arc_defer_depth, 1);
                 LLVMTypeRef push_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                     (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
@@ -342,11 +342,20 @@
             LLVMBasicBlockRef sync_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "async2");
             LLVMBasicBlockRef drain_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "adrain");
             LLVMBasicBlockRef tail_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "atail");
+            /* Escape analysis treats release_dyn as non-escaping. A promoted
+             * object's storage belongs to its caller's frame, so even at the
+             * depth limit its destructor must finish before this call returns. */
+            LLVMValueRef raw_header = LLVMBuildLoad2(g->builder, i64, siptr, "adefer.header");
+            LLVMValueRef is_heap = zan_icmp(g->builder, LLVMIntEQ,
+                zan_and(g->builder, raw_header,
+                    LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0), "adefer.stack"),
+                LLVMConstInt(i64, 0, 0), "adefer.heap");
+            LLVMValueRef is_deep = zan_icmp(g->builder, LLVMIntUGE, dcur,
+                LLVMConstInt(i32t, ZAN_ARC_DEFER_DEPTH, 0), "adeep");
             LLVMBuildCondBr(g->builder,
-                zan_icmp(g->builder, LLVMIntUGE, dcur,
-                         LLVMConstInt(i32t, ZAN_ARC_DEFER_DEPTH, 0), "adeep"),
+                zan_and(g->builder, is_deep, is_heap, "adefer.allowed"),
                 defer_bb, sync_bb);
-            /* 超阈值：挂队列立即返回，不同步下钻 */
+            /* 超阈值的堆对象：挂队列立即返回，不同步下钻 */
             LLVMPositionBuilderAtEnd(g->builder, defer_bb);
             zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_defer_push),
                       g->rt_defer_push, (LLVMValueRef[]){ dpp, obj }, 2, "");

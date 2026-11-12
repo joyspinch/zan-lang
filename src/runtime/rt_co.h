@@ -24,6 +24,22 @@ size_t zan_co_pending(void);
 void  *__zan_co_frame_alloc(size_t size);
 void   __zan_co_frame_free(void *frame);
 
+/* Public handles are generations; internal scheduler/child values are frames. */
+void     zan_task_frame_config(void *frame, const volatile int *done, volatile int *cancel);
+void     zan_task_frame_allocator(void *frame, void (*release)(void *));
+void     zan_task_child(void *parent, void *child);
+void     zan_task_cancel(uint64_t token);
+void     zan_task_frame_cancel(void *frame);
+uint64_t zan_task_register(void *frame, const volatile int *done);
+int      zan_task_isdone(uint64_t token);
+void    *zan_task_acquire(uint64_t token, int consume);
+void     zan_task_unpin(void *frame);
+void     zan_task_discard_config(void *frame, void (*discard)(void *));
+void     zan_task_discard(void *frame);
+void     zan_task_retire(void *frame, void (*release)(void *));
+size_t   zan_task_live_count(void);
+size_t   zan_task_slot_capacity(void);
+
 typedef int (*zan_co_idle_fn)(void);
 void   zan_co_set_idle(zan_co_idle_fn fn);
 

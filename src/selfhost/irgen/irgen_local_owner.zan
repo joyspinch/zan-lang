@@ -1,0 +1,256 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    public List<string> asyncDirectLocals;
+
+    bool IsDirectAsyncLocal(string reg) {
+        if (!curAsync || asyncDirectLocals == null) { return false; }
+        int i = 0;
+        while (i < asyncDirectLocals.Count) {
+            if (asyncDirectLocals[i] == reg) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void MaterializeAsyncLocal(string reg, string lt, int index) {
+        string slot = FrameGep("%ff", index);
+        L("  " + reg + " = bitcast i64* " + slot + " to " + lt + "*");
+        asyncDirectLocals.Add(reg);
+    }
+
+    void MaterializeAsyncLoopLocal(string reg, string lt, int index) {
+        // Loops may be generated after the entry code, but every resume edge
+        // needs the alias. Derive it directly from the function argument.
+        string basep = NTS(); string slot = NTS();
+        entryAllocas.Append("  " + basep + " = bitcast i8* %fp to i64*\n");
+        entryAllocas.Append("  " + slot + " = getelementptr i64, i64* " + basep + ", i64 " + index + "\n");
+        entryAllocas.Append("  " + reg + " = bitcast i64* " + slot + " to " + lt + "*\n");
+        asyncDirectLocals.Add(reg);
+    }
+
+    void ArmAsyncLocal(string reg, Node ty, bool cell) {
+        if (!IsDirectAsyncLocal(reg)) { return; }
+        if (cell || (ty != null && (ArcManaged(ty) || ty.ival >= 1))) {
+            ArmLocalSlot(reg, ty, cell);
+        }
+    }
+
+    void ArmAsyncParameters() {
+        int i = 0;
+        while (i < locReg.Count) {
+            if (i >= locRef.Count || !locRef[i]) {
+                ArmAsyncLocal(locReg[i], locType[i], false);
+            }
+            i = i + 1;
+        }
+    }
+
+    // Local-slot owners share the exception owner chain. Handler watermarks
+    // therefore cover same-invocation scopes and synchronous callees alike.
+    // A coroutine's stack slots must never enter its suspension-persistent chain.
+    void ArmMaterializedLocal(string reg, string lt) {
+        if (curAsync) { return; }
+        int i = locReg.Count - 1;
+        while (i >= 0) {
+            if (locReg[i] == reg) {
+                if (locBox[i] || (i < locRef.Count && locRef[i])) { return; }
+                if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { return; }
+                Node ty = locType[i];
+                if (ty == null || (!ArcManaged(ty) && ty.ival < 1)) { return; }
+                // Entry initialization also makes a skipped declaration safe
+                // for a cleanup landing. Each loop entry resets before arming.
+                if (eaActive) {
+                    entryAllocas.Append("  store " + lt + " null, " + lt + "* " + reg + "\n");
+                }
+                L("  store " + lt + " null, " + lt + "* " + reg);
+                ArmLocalSlot(reg, ty, false);
+                return;
+            }
+            i = i - 1;
+        }
+    }
+
+    void ArmLocalCell(int li) {
+        if (curAsync) { return; }
+        string ownerSlot = locReg[li] + ".local.owner";
+        EA(ownerSlot, "i8*");
+        if (eaActive) { entryAllocas.Append("  store i8* null, i8** " + ownerSlot + "\n"); }
+        L("  store i8* " + locCell[li] + ", i8** " + ownerSlot);
+        ArmLocalSlot(ownerSlot, locType[li], true);
+    }
+
+    void ArmLocalSlot(string slot, Node ty, bool cell) {
+        string lt = MapType(ty);
+        if (cell) { lt = "i8*"; }
+        string raw = NT();
+        L("  " + raw + " = bitcast " + lt + "* " + slot + " to i8*");
+        string dt = LocalSlotDtor(ty, cell);
+        L("  call void @zlocal_arm(i8* " + raw + ", void (i8*)* " + dt + ")");
+    }
+
+    bool GotoVisibleLocal(int i) {
+        return locName[i].Length < 6 || locName[i].Substring(0, 6) != "__qdot";
+    }
+
+    int GotoVisibleLocals() {
+        int count = 0; int i = 0;
+        while (i < locName.Count) {
+            if (GotoVisibleLocal(i)) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    int GotoOwnedLocals() {
+        int count = 0; int i = 0;
+        while (i < locName.Count) {
+            if (GotoVisibleLocal(i) && (i >= locRef.Count || !locRef[i]) && locName[i] != "") {
+                if (locBox[i] || ArcManaged(locType[i]) || (locType[i] != null && locType[i].ival >= 1)) {
+                    count = count + 1;
+                }
+            }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    void RecordForwardGoto(Node jump) {
+        string name = "" + LabelId(jump.sval);
+        if (Contains(syncFlow.definedGotoLabels, name)) { return; }
+        syncFlow.pendingGotoNodes.Add(jump);
+        syncFlow.pendingGotoLocals.Add(GotoVisibleLocals());
+        syncFlow.pendingGotoOwned.Add(GotoOwnedLocals());
+    }
+
+    void DefineGotoLabel(Node label) {
+        string name = "" + LabelId(label.sval);
+        int i = 0;
+        while (i < syncFlow.pendingGotoNodes.Count) {
+            Node jump = syncFlow.pendingGotoNodes[i];
+            if (jump != null && "" + LabelId(jump.sval) == name) {
+                if (syncFlow.pendingGotoLocals[i] < GotoVisibleLocals()
+                    || syncFlow.pendingGotoOwned[i] != GotoOwnedLocals()) {
+                    diags.Error("goto '" + jump.sval + "' leaves (or enters) a scope with owning locals; the abandoned references would leak -- restructure with break/return", jump.line, jump.col);
+                }
+                syncFlow.pendingGotoNodes[i] = null;
+            }
+            i = i + 1;
+        }
+        syncFlow.definedGotoLabels.Add(name);
+        syncFlow.definedGotoLocalCounts.Add(locName.Count);
+    }
+
+    int GotoLocalBase(string label) {
+        string name = "" + LabelId(label);
+        int i = syncFlow.definedGotoLabels.Count - 1;
+        while (i >= 0) {
+            if (syncFlow.definedGotoLabels[i] == name) {
+                return syncFlow.definedGotoLocalCounts[i];
+            }
+            i = i - 1;
+        }
+        return locName.Count;
+    }
+
+    void TransferAwaitTemp(ExprVal value) {
+        int i = stmtTemps.Count - 1;
+        while (i >= 0) {
+            string op = stmtTemps[i];
+            if (op == value.op || (value.ownerTemp != null && op == value.ownerTemp)) {
+                if (op.Length > 1 && op[1] == 122) {
+                    string lt = MapType(stmtTempTypes[i]);
+                    L("  store " + lt + " null, " + lt + "* " + op);
+                }
+                stmtTemps.RemoveAt(i); stmtTempTypes.RemoveAt(i);
+                return;
+            }
+            i = i - 1;
+        }
+    }
+
+    void RetireLocalSlot(string slot, string lt) {
+        string raw = NT();
+        L("  " + raw + " = bitcast " + lt + "* " + slot + " to i8*");
+        L("  call void @zlocal_retire(i8* " + raw + ")");
+    }
+
+    string LocalSlotDtor(Node ty, bool cell) {
+        string name = "@zlocal_dtor_" + ownedDtorSeq;
+        ownedDtorSeq = ownedDtorSeq + 1;
+        StringBuilder saved = body;
+        int st = tmp; int sl = lbl; string sc = curLbl; bool se = eaActive;
+        body = new StringBuilder(); tmp = 0; lbl = 0; curLbl = "entry"; eaActive = false;
+        string lt = MapType(ty);
+        if (cell) { lt = "i8*"; }
+        L("define internal void " + name + "(i8* %slot) {");
+        L("entry:");
+        L("  %p = bitcast i8* %slot to " + lt + "*");
+        L("  %value = load " + lt + ", " + lt + "* %p");
+        // Clear before release: a surrounding cleanup landing may visit the
+        // lexical slot again, and it must see an already-consumed owner.
+        L("  store " + lt + " null, " + lt + "* %p");
+        if (cell) { EmitCellRelease("%value"); }
+        else { EmitArcRelease("%value", ty); }
+        L("  ret void"); L("}");
+        deferred.Append(body.ToString());
+        body = saved; tmp = st; lbl = sl; curLbl = sc; eaActive = se;
+        return name;
+    }
+
+    void EmitLocalOwnerRuntime() {
+        // kind=3 is internal cleanup metadata, never an exception payload.
+        // The layout is the existing heap owner node: prev + exception record.
+        H("define internal void @zlocal_arm(i8* %slot, void (i8*)* %drop) {");
+        H("entry:");
+        H("  %raw = call i8* @malloc(i64 40)");
+        H("  %n = bitcast i8* %raw to %zan.exception.owner*");
+        H("  %prevp = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 0");
+        H("  %prev = load i8*, i8** @zexc_owners");
+        H("  store i8* %prev, i8** %prevp");
+        H("  %r = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 1");
+        H("  %dt = bitcast void (i8*)* %drop to i8*");
+        H("  %v0 = insertvalue %zan.exception zeroinitializer, i8* %slot, 0");
+        H("  %v1 = insertvalue %zan.exception %v0, i8* %dt, 1");
+        H("  %v2 = insertvalue %zan.exception %v1, i64 3, 2");
+        H("  %v3 = insertvalue %zan.exception %v2, i64 1, 3");
+        H("  store %zan.exception %v3, %zan.exception* %r");
+        H("  store i8* %raw, i8** @zexc_owners");
+        H("  ret void");
+        H("}");
+        // Normal exits unlink without dropping: their ordinary typed release
+        // immediately consumes the slot. Search also handles out-of-order
+        // lexical cleanup and catch bindings that have no local record.
+        H("define internal void @zlocal_retire(i8* %slot) {");
+        H("entry:");
+        H("  br label %find");
+        H("find:");
+        H("  %link = phi i8** [ @zexc_owners, %entry ], [ %prevp, %step ]");
+        H("  %top = load i8*, i8** %link");
+        H("  %nil = icmp eq i8* %top, null");
+        H("  br i1 %nil, label %end, label %inspect");
+        H("inspect:");
+        H("  %n = bitcast i8* %top to %zan.exception.owner*");
+        H("  %prevp = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 0");
+        H("  %r = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 1");
+        H("  %v = load %zan.exception, %zan.exception* %r");
+        H("  %p = extractvalue %zan.exception %v, 0");
+        H("  %k = extractvalue %zan.exception %v, 2");
+        H("  %same = icmp eq i8* %p, %slot");
+        H("  %local = icmp eq i64 %k, 3");
+        H("  %found = and i1 %same, %local");
+        H("  br i1 %found, label %remove, label %step");
+        H("step:");
+        H("  br label %find");
+        H("remove:");
+        H("  %prev = load i8*, i8** %prevp");
+        H("  store i8* %prev, i8** %link");
+        H("  call void @free(i8* %top)");
+        H("  br label %end");
+        H("end:");
+        H("  ret void");
+        H("}");
+    }
+}

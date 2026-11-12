@@ -3,6 +3,7 @@ using System.Data;
 using System.Data.Orm;
 using System.Data.Sqlite;
 using System.IO;
+using System.Text;
 
 [Table("app_articles")]
 class Article {
@@ -21,7 +22,128 @@ class Article {
     public int viewCount { get; set; }
 }
 
+[Table("app_manifests")]
+class ManifestDocument {
+    [Column(IsIdentity = true)]
+    public int id;
+
+    [Column(StringLength = 8192, DbType = "text")]
+    public string manifest;
+
+    public string label;
+
+    [Column(StringLength = 4096)]
+    public string providedNamespaces;
+
+    [Column(StringLength = 0)]
+    public string defaultSized;
+
+    [Column(DbType = "text", StringLength = 1024)]
+    public string certificate;
+}
+
+[Table("order")]
+class ReservedDdlRow {
+    [Column("group", IsPrimary = true)]
+    public int groupId;
+
+    [Column("sql", IsPrimary = true, StringLength = 400)]
+    public string statement;
+}
+
 class Program {
+    static void Require(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static void ReservedIdentifiers(SqliteConnection db) {
+        Meta meta = Meta.For<ReservedDdlRow>();
+        Require(Sync.CreateDdl(DbProvider.MySQL, meta, meta.Table)
+            == "CREATE TABLE `order` (`group` INT, `sql` VARCHAR(400), PRIMARY KEY (`group`, `sql`))",
+            "MySQL reserved table, columns and composite primary key");
+        Require(Sync.CreateDdl(DbProvider.MariaDB, meta, meta.Table)
+            == "CREATE TABLE `order` (`group` INT, `sql` VARCHAR(400), PRIMARY KEY (`group`, `sql`))",
+            "MariaDB reserved identifiers");
+        Require(Sync.CreateDdl(DbProvider.PostgreSQL, meta, meta.Table)
+            == "CREATE TABLE \"order\" (\"group\" INTEGER, \"sql\" VARCHAR(400), PRIMARY KEY (\"group\", \"sql\"))",
+            "PostgreSQL reserved identifiers");
+        Require(Sync.AddColDdl(DbProvider.SqlServer, meta.Cols[1], meta.Table)
+            == "ALTER TABLE [order] ADD COLUMN [sql] NVARCHAR(400)", "SQL Server quoted add column");
+        Require(Sync.AddColDdl(DbProvider.MySQL, meta.Cols[1], "odd`table")
+            == "ALTER TABLE `odd``table` ADD COLUMN `sql` VARCHAR(400)", "MySQL identifier escaping");
+        db.SyncStructure<ReservedDdlRow>();
+        db.SyncStructure<ReservedDdlRow>();
+        ReservedDdlRow row = new ReservedDdlRow();
+        row.groupId = 1;
+        row.statement = "fixture";
+        Require(db.Insert<ReservedDdlRow>(row).ExecuteAffrows() == 1, "reserved table insert");
+        ReservedDdlRow read = db.Select<ReservedDdlRow>().First();
+        Require(read != null && read.groupId == 1 && read.statement == "fixture", "reserved table round trip");
+    }
+
+    static void LargeText(SqliteConnection db) {
+        Meta meta = Meta.For<ManifestDocument>();
+        Require(meta.Cols.Count == 6, "manifest metadata columns");
+        Meta article = Meta.For<Article>();
+        Require(article.Cols[1].Col == "article_title" && article.Cols[1].StrLen == 100,
+            "Column name and positive StringLength must survive reflection");
+        Require(Sync.CreateDdl(DbProvider.MySQL, article, "app_articles")
+            .Contains("`article_title` VARCHAR(100)"), "attribute bounded MySQL DDL");
+        Col manifest = meta.Cols[1];
+        Require(manifest.StrLen == -1 && manifest.TyCode() == 3,
+            "Column DbType=text must survive reflection and metadata");
+        Require(meta.Cols[2].StrLen == 255, "default string length unchanged");
+        Require(meta.Cols[3].StrLen == 4096, "large bounded attribute length");
+        Require(meta.Cols[4].StrLen == 255, "nonpositive attribute length defaults");
+        Require(meta.Cols[5].StrLen == -1, "text takes priority regardless of argument order");
+        Require(Sync.AddColDdl(DbProvider.MySQL, meta.Cols[3], "app_manifests")
+            == "ALTER TABLE `app_manifests` ADD COLUMN `providedNamespaces` VARCHAR(4096)",
+            "declared 4096 must reach MySQL add column");
+        Require(Sync.AddColDdl(DbProvider.PostgreSQL, meta.Cols[3], "app_manifests")
+            == "ALTER TABLE \"app_manifests\" ADD COLUMN \"providedNamespaces\" VARCHAR(4096)",
+            "declared 4096 must reach PostgreSQL add column");
+        Require(Sync.CreateDdl(DbProvider.MySQL, meta, "app_manifests")
+            .Contains("`manifest` LONGTEXT"), "MySQL create large text");
+        Require(Sync.AddColDdl(DbProvider.MariaDB, manifest, "app_manifests")
+            == "ALTER TABLE `app_manifests` ADD COLUMN `manifest` LONGTEXT", "MariaDB add large text");
+        Require(Sync.AddColDdl(DbProvider.PostgreSQL, manifest, "app_manifests")
+            == "ALTER TABLE \"app_manifests\" ADD COLUMN \"manifest\" TEXT", "PostgreSQL add large text");
+        Require(Sync.AddColDdl(DbProvider.SQLite, manifest, "app_manifests")
+            == "ALTER TABLE \"app_manifests\" ADD COLUMN \"manifest\" TEXT", "SQLite add large text");
+        Require(Dialect.Ty(DbProvider.SqlServer, 3, false, false, -1)
+            == "NVARCHAR(MAX)", "SQL Server large text");
+        Require(Dialect.Ty(DbProvider.MySQL, 3, false, false, 100)
+            == "VARCHAR(100)", "bounded MySQL string unchanged");
+        Require(Dialect.Ty(DbProvider.PostgreSQL, 3, false, false, 100)
+            == "VARCHAR(100)", "bounded PostgreSQL string unchanged");
+        Require(Dialect.Ty(DbProvider.SqlServer, 3, false, false, 100)
+            == "NVARCHAR(100)", "bounded SQL Server string unchanged");
+        Require(Dialect.Ty(DbProvider.MySQL, 3, false, false, 0)
+            == "VARCHAR(255)", "zero length default unchanged");
+        Require(Dialect.Ty(DbProvider.MySQL, 3, false, false, -2)
+            == "VARCHAR(255)", "other negative lengths default unchanged");
+        Require(Dialect.Ty(DbProvider.MySQL, 0, false, false, -1)
+            == "INT", "text sentinel only applies to strings");
+
+        db.SyncStructure<ManifestDocument>();
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < 4096; i = i + 1) { text.Append("清单-entry;"); }
+        string payload = text.ToString();
+        Require(payload.Length > 8192, "large manifest fixture");
+        ManifestDocument row = new ManifestDocument();
+        row.manifest = payload;
+        row.label = "release";
+        row.providedNamespaces = "[\"Acme.Tools\"]";
+        row.defaultSized = "default";
+        row.certificate = "signed";
+        Require(db.Insert<ManifestDocument>(row).ExecuteAffrows() == 1,
+            "large manifest inserted");
+        ManifestDocument read = db.Select<ManifestDocument>().First();
+        if (read == null) { throw new Exception("large manifest selected"); }
+        Require(read.manifest == payload && read.label == "release",
+            "large manifest round trip must preserve every byte");
+    }
+
     static void Main() {
         string dbPath = "_scratch/orm_entity_attributes.db";
         if (File.Exists(dbPath)) {
@@ -29,6 +151,8 @@ class Program {
         }
 
         SqliteConnection db = SqliteConnection.Open(dbPath);
+        Program.ReservedIdentifiers(db);
+        Program.LargeText(db);
 
         // 验证 CodeFirst 建表，检查生成的列与表名
         db.SyncStructure<Article>();

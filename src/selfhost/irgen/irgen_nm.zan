@@ -109,6 +109,41 @@ partial class Irgen {
         H("}");
     }
 
+    void EmitCopy2DHelper() {
+        if (copy2dEmitted) { return; }
+        copy2dEmitted = true;
+        H("define internal void @__zan_nm_copy2d(i8* %dst, i64 %dstStride, i8* %src, i64 %srcStride, i64 %rowBytes, i64 %height) {");
+        H("entry:");
+        H("  %c1 = icmp sgt i64 %rowBytes, 0");
+        H("  %c2 = icmp sgt i64 %height, 0");
+        H("  %can = and i1 %c1, %c2");
+        H("  br i1 %can, label %check_fast, label %done");
+        H("check_fast:");
+        H("  %eq_d = icmp eq i64 %dstStride, %rowBytes");
+        H("  %eq_s = icmp eq i64 %srcStride, %rowBytes");
+        H("  %is_fast = and i1 %eq_d, %eq_s");
+        H("  br i1 %is_fast, label %fast, label %loop");
+        H("fast:");
+        H("  %total = mul i64 %rowBytes, %height");
+        H("  call i8* @memmove(i8* %dst, i8* %src, i64 %total)");
+        H("  br label %done");
+        H("loop:");
+        H("  %row = phi i64 [ 0, %check_fast ], [ %next_row, %body ]");
+        H("  %in_rng = icmp slt i64 %row, %height");
+        H("  br i1 %in_rng, label %body, label %done");
+        H("body:");
+        H("  %d_off = mul i64 %row, %dstStride");
+        H("  %s_off = mul i64 %row, %srcStride");
+        H("  %r_dst = getelementptr i8, i8* %dst, i64 %d_off");
+        H("  %r_src = getelementptr i8, i8* %src, i64 %s_off");
+        H("  call i8* @memmove(i8* %r_dst, i8* %r_src, i64 %rowBytes)");
+        H("  %next_row = add i64 %row, 1");
+        H("  br label %loop");
+        H("done:");
+        H("  ret void");
+        H("}");
+    }
+
     // The NativeMemory digest intrinsic (the C host's emit_nm_digest): the
     // hardware kernel writes the raw digest into a scratch buffer; the value
     // is a string of those raw bytes, or null when the kernel is unavailable.
@@ -143,7 +178,7 @@ partial class Irgen {
         Label(lDone);
         string r = NT();
         L("  " + r + " = phi i8* [ " + s + ", %L" + lHas + " ], [ null, %L" + lNone + " ]");
-        return new ExprVal(r, MkType("string"));
+        return OwnedString(r);
     }
 
     // ---- NativeMemory runtime helpers ----
@@ -238,6 +273,19 @@ partial class Irgen {
             L("  call i8* @memmove(i8* " + dp + ", i8* " + spp + ", i64 " + n.op + ")");
             return new ExprVal("0", MkType("void"));
         }
+        if (m == "Copy2D" && argc == 6) {
+            EmitCopy2DHelper();
+            ExprVal dst = GenExpr(e.kids[0]);
+            ExprVal dstStride = GenExpr(e.kids[1]);
+            ExprVal src = GenExpr(e.kids[2]);
+            ExprVal srcStride = GenExpr(e.kids[3]);
+            ExprVal rowBytes = GenExpr(e.kids[4]);
+            ExprVal height = GenExpr(e.kids[5]);
+            string dp = NmAddr(dst, "0");
+            string sp = NmAddr(src, "0");
+            L("  call void @__zan_nm_copy2d(i8* " + dp + ", i64 " + dstStride.op + ", i8* " + sp + ", i64 " + srcStride.op + ", i64 " + rowBytes.op + ", i64 " + height.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
         if (m == "Fill" && argc == 3) {
             ExprVal p = GenExpr(e.kids[0]);
             ExprVal v = GenExpr(e.kids[1]);
@@ -268,7 +316,7 @@ partial class Irgen {
             L("  " + s + " = call i8* @zstr_new(i64 " + len.op + ")");
             string src = NmAddr(p, off.op);
             L("  call i8* @memcpy(i8* " + s + ", i8* " + src + ", i64 " + len.op + ")");
-            return new ExprVal(s, MkType("string"));
+            return OwnedString(s);
         }
         if (m == "PutString" && argc == 4) {
             ExprVal p = GenExpr(e.kids[0]);
@@ -415,7 +463,7 @@ partial class Irgen {
             string m = NT();
             L("  " + m + " = call i8* @zstr_new(i64 " + w + ")");
             L("  call i8* @memcpy(i8* " + m + ", i8* " + s + ", i64 " + w + ")");
-            return new ExprVal(m, MkType("string"));
+            return OwnedString(m);
         }
         if (m == "Base64Decode" && argc == 3) {
             // Base64Decode(dst, src, size) -> written bytes

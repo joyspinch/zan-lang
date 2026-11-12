@@ -9,6 +9,8 @@ typedef struct zan_blocking_job {
     struct zan_blocking_job *queue_next;
     int64_t  deadline_ms;
     int      timed_out;
+    /* Protected by dns_lock: timeout delivery owns the job through io_wake. */
+    int      timeout_delivering;
     int      started;
     int64_t  result;        
 /* 已解析的 IPv4 网络序地址 */
@@ -65,12 +67,12 @@ static void blocking_spawn(zan_blocking_job_t *job);
 
 static void blocking_finish_worker(zan_blocking_job_t *job) {
     zan_blocking_job_t *next = NULL;
-    int discard = 0;
+    int discard = 0, notify = 0;
     dns_lock();
     if (job->timed_out) {
         job->started = 0;
         if (g_blocking_active > 0) g_blocking_active--;
-        discard = 1;
+        discard = !job->timeout_delivering;
     } else {
         zan_blocking_job_t **pp = &g_blocking_pending;
         while (*pp && *pp != job) pp = &(*pp)->next;
@@ -80,6 +82,7 @@ static void blocking_finish_worker(zan_blocking_job_t *job) {
             *pp = job->next;
             job->next = g_blocking_done;
             g_blocking_done = job;
+            notify = 1;
             job->started = 0;
             if (g_blocking_active > 0) g_blocking_active--;
         }
@@ -94,7 +97,7 @@ static void blocking_finish_worker(zan_blocking_job_t *job) {
     }
     dns_unlock();
     if (discard) free(job);
-    if (!discard) dns_wake_notify();
+    if (notify) dns_wake_notify();
     if (next) blocking_spawn(next);
 }
 
@@ -115,7 +118,7 @@ static void *blocking_worker(void *arg) {
 }
 
 static void blocking_start_failed(zan_blocking_job_t *job) {
-    int deliver = 0;
+    int deliver = 0, discard = 0;
     dns_lock();
     zan_blocking_job_t **pp = &g_blocking_pending;
     while (*pp && *pp != job) pp = &(*pp)->next;
@@ -130,9 +133,10 @@ static void blocking_start_failed(zan_blocking_job_t *job) {
         job->next = g_blocking_done;
         g_blocking_done = job;
     }
+    discard = !deliver && !job->timeout_delivering;
     dns_unlock();
     if (deliver) dns_wake_notify();
-    else free(job);
+    if (discard) free(job);
     blocking_start_next();
 }
 
@@ -178,7 +182,7 @@ static void blocking_submit(zan_blocking_job_t *job) {
     } else {
         job->next = g_blocking_pending;
         g_blocking_pending = job;
-        g_blocking_inflight++;
+        InterlockedIncrement((volatile LONG *)&g_blocking_inflight);
         if (g_blocking_active < ZAN_BLOCKING_MAX_ACTIVE) {
             job->started = 1;
             g_blocking_active++;
@@ -246,7 +250,7 @@ static int dns_timeout_scan(void) {
         }
         *pp = j->next;
         j->timed_out = 1;
-        g_blocking_inflight--;
+        j->timeout_delivering = 1;
         if (!j->started) {
             zan_blocking_job_t **qp = &g_blocking_queued;
             while (*qp && *qp != j) qp = &(*qp)->queue_next;
@@ -269,7 +273,13 @@ static int dns_timeout_scan(void) {
         if (j->out) *j->out = 0;
         if (j->out64) *j->out64 = 0;
         io_wake(j->frame, j->step);
-        if (!j->started) free(j);
+        dns_lock();
+        j->timeout_delivering = 0;
+        int discard = !j->started;
+        dns_unlock();
+        /* Either this delivery or the still-running worker owns destruction. */
+        if (discard) free(j);
+        InterlockedDecrement((volatile LONG *)&g_blocking_inflight);
         woke++;
     }
     return woke;
@@ -310,13 +320,11 @@ static ZAN_MAYBE_UNUSED void dns_wake_read(void) {
 
 /* 派发所有已完成的域名解析结果至等待协程 */
 static int dns_drain(void) {
-    int cnt = 0, woke = 0;
+    int woke = 0;
     zan_blocking_job_t *j;
     dns_lock();
     j = g_blocking_done;
     g_blocking_done = NULL;
-    for (zan_blocking_job_t *x = j; x; x = x->next) cnt++;
-    g_blocking_inflight -= cnt;
     dns_unlock();
     while (j) {
         zan_blocking_job_t *n = j->next;
@@ -329,6 +337,8 @@ static int dns_drain(void) {
         }
         io_wake(j->frame, j->step);
         free(j);
+        /* Keep the blocking owner until the ready continuation owns liveness. */
+        InterlockedDecrement((volatile LONG *)&g_blocking_inflight);
         woke++;
         j = n;
     }

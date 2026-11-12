@@ -80,20 +80,18 @@ void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub, LLVMValueRef tmp
 LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp,
                                      zan_type_t *rt, int mode) {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    if (mode == 2) {
-        LLVMValueRef idf = get_co_isdone_fn(g);
-        return zan_call2(g->builder, LLVMGlobalGetValueType(idf), idf,
-                         &hp, 1, "task.done");
-    }
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef token = LLVMBuildPtrToInt(g->builder, hp, i64t, "task.token");
+    if (mode == 2)
+        return emit_task_runtime_call(g, "zan_task_isdone", i32, &token, 1);
     LLVMValueRef fn = g->current_fn;
     LLVMBasicBlockRef test_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "tk.test");
     LLVMBasicBlockRef pump_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "tk.pump");
     LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "tk.done");
     LLVMBuildBr(g->builder, test_bb);
     LLVMPositionBuilderAtEnd(g->builder, test_bb);
-    LLVMValueRef idf = get_co_isdone_fn(g);
-    LLVMValueRef dn = zan_call2(g->builder, LLVMGlobalGetValueType(idf), idf,
-                                &hp, 1, "tk.dn");
+    LLVMValueRef dn = emit_task_runtime_call(g, "zan_task_isdone", i32, &token, 1);
     LLVMValueRef dn1 = zan_icmp(g->builder, LLVMIntNE, dn,
                                 LLVMConstInt(LLVMTypeOf(dn), 0, 0), "tk.dn1");
     LLVMBuildCondBr(g->builder, dn1, done_bb, pump_bb);
@@ -101,19 +99,48 @@ LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp,
     zan_call2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
     LLVMBuildBr(g->builder, test_bb);
     LLVMPositionBuilderAtEnd(g->builder, done_bb);
-    if (mode == 1) {
-        /* Task<T> */
+    if (mode == 1 || mode == 4) {
+        LLVMValueRef args[] = { token, LLVMConstInt(i32, 1, 0) };
+        LLVMValueRef frame = emit_task_runtime_call(g, "zan_task_acquire", i8ptr, args, 2);
+        LLVMValueRef missing = zan_icmp(g->builder, LLVMIntEQ, frame,
+            LLVMConstNull(i8ptr), "task.consumed");
+        LLVMBasicBlockRef release_done = NULL;
+        if (mode == 4) {
+            LLVMBasicBlockRef release_body = LLVMAppendBasicBlockInContext(g->ctx, fn, "task.release");
+            release_done = LLVMAppendBasicBlockInContext(g->ctx, fn, "task.release.done");
+            LLVMBuildCondBr(g->builder, missing, release_done, release_body);
+            LLVMPositionBuilderAtEnd(g->builder, release_body);
+        } else {
+            LLVMBasicBlockRef invalid = LLVMAppendBasicBlockInContext(g->ctx, fn, "task.invalid");
+            LLVMBasicBlockRef valid = LLVMAppendBasicBlockInContext(g->ctx, fn, "task.valid");
+            LLVMBuildCondBr(g->builder, missing, invalid, valid);
+            LLVMPositionBuilderAtEnd(g->builder, invalid);
+            emit_task_runtime_call(g, "abort", LLVMVoidTypeInContext(g->ctx), NULL, 0);
+            LLVMBuildUnreachable(g->builder);
+            LLVMPositionBuilderAtEnd(g->builder, valid);
+        }
+        if (mode == 4) {
+            emit_task_runtime_call(g, "zan_task_discard", LLVMVoidTypeInContext(g->ctx), &frame, 1);
+            emit_task_runtime_call(g, "zan_task_unpin", LLVMVoidTypeInContext(g->ctx), &frame, 1);
+            LLVMBuildBr(g->builder, release_done);
+            LLVMPositionBuilderAtEnd(g->builder, release_done);
+            return LLVMConstInt(i32, 0, 0);
+        }
+        /* Consumption owns the frame until its one reap. Release the query pin
+         * before exception transfer, whose existing helper may unwind immediately. */
+        emit_task_runtime_call(g, "zan_task_unpin", LLVMVoidTypeInContext(g->ctx), &frame, 1);
+        if (mode == 1) emit_async_check_sub_exc(g, frame, NULL);
         LLVMValueRef rp = LLVMBuildStructGEP2(g->builder, g->co_header_type,
-            hp, ASYNC_FRAME_RESULT, "tk.resp");
+            frame, ASYNC_FRAME_RESULT, "tk.resp");
         LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64t, rp, "tk.raw");
-        LLVMValueRef val = coerce_from_frame_result(g, raw, rt);
+        LLVMValueRef val = rt ? coerce_from_frame_result(g, raw, rt) : NULL;
+        if (mode == 4 && rt) emit_rc_release_for_type(g, rt, val);
+        LLVMBuildStore(g->builder, LLVMConstInt(i64t, 0, 0), rp);
         LLVMValueRef reap = get_co_reap_fn(g);
-        zan_call2(g->builder, LLVMGlobalGetValueType(reap), reap, &hp, 1, "");
-        return val;
-    }
-    if (mode == 3) {
-        LLVMValueRef reap = get_co_reap_fn(g);
-        zan_call2(g->builder, LLVMGlobalGetValueType(reap), reap, &hp, 1, "");
+        zan_call2(g->builder, LLVMGlobalGetValueType(reap), reap, &frame, 1, "");
+        if (mode == 1) return val;
+        LLVMBuildBr(g->builder, release_done);
+        LLVMPositionBuilderAtEnd(g->builder, release_done);
     }
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
@@ -640,6 +667,12 @@ bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
             return is_string_expr(g, e->binary.left, locals) ||
                    is_string_expr(g, e->binary.right, locals);
         return false;
+    case AST_AWAIT_EXPR: {
+        /* Lazy async arms retain await nodes instead of ANF locals. String
+         * operators must recognize their result type to consume owned results. */
+        zan_type_t *rt = infer_expr_type(g, e, locals);
+        return rt && rt->kind == TYPE_STRING;
+    }
     case AST_CALL: {
         zan_ast_node_t *callee = e->call.callee;
         if (callee && callee->kind == AST_MEMBER_ACCESS) {

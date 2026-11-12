@@ -70,13 +70,20 @@ typedef struct {
     zan_dce_stats_t dce;
     zan_inline_stats_t inlining;
     double time_ms;
+    bool success; /* false: stop before publishing IR or machine code */
 } zan_opt_report_t;
 
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level);
 void zan_opt_report_print(const zan_opt_report_t *report);
-void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
-void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level);
+zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
+zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level);
 
-void zan_opt_strip_unused(zan_irgen_t *g);
+zan_status_t zan_opt_strip_unused(zan_irgen_t *g);
+
+/* Reject unsupported hardware calls, never mere intrinsic declarations. */
+zan_status_t zan_opt_validate_cpu(zan_irgen_t *g, LLVMModuleRef mod);
+
+/* Shared gate for optimizer stages and artifact writers. */
+zan_status_t zan_opt_verify_module(LLVMModuleRef mod, const char *stage);
 
 #endif /* ZAN_OPTIMIZER_H */

@@ -292,14 +292,22 @@
         char exe_dir[1024];
         GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
         { char *s = strrchr(exe_dir, '\\'); if (s) *s = '\0'; }
-        char ld_path[1200], syslib[1200];
-        snprintf(ld_path, sizeof(ld_path), "%s\\ld.exe", exe_dir);
+        char lld_path[1200], syslib[1200];
+        snprintf(lld_path, sizeof(lld_path), "%s\\ld.lld.exe", exe_dir);
         snprintf(syslib, sizeof(syslib), "%s\\mingw\\lib", exe_dir);
+        DWORD lld_attrs = zan_utf8_get_file_attributes(lld_path);
         int have_bundle =
-            zan_utf8_get_file_attributes(ld_path) != INVALID_FILE_ATTRIBUTES &&
-            zan_utf8_get_file_attributes(syslib)  != INVALID_FILE_ATTRIBUTES;
+            zan_utf8_get_file_attributes(syslib) != INVALID_FILE_ATTRIBUTES;
 
-        if (have_bundle) {
+        /* GNU ld 2.36 corrupts COFF TLS SECREL offsets under ASLR. Both
+         * native EXE paths must use bundled LLD, including the clang fallback. */
+        if (lld_attrs == INVALID_FILE_ATTRIBUTES ||
+            (lld_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            fprintf(stderr,
+                "zanc: error: bundled ld.lld.exe is required for Windows native "
+                "TLS linking; restore the bundled LLVM linker\n");
+            link_ret = 1;
+        } else if (have_bundle) {
             char crt2[1300], crtbeg[1300], crtend[1300], lflag[1300];
             snprintf(crt2,   sizeof(crt2),   "%s\\crt2.o", syslib);
             snprintf(crtbeg, sizeof(crtbeg), "%s\\crtbegin.o", syslib);
@@ -308,7 +316,7 @@
 
             const char *argv[ZAN_LINK_MAX_ARGV];
             int a = 0;
-            argv[a++] = ld_path;
+            argv[a++] = lld_path;
             argv[a++] = "-m";      argv[a++] = "i386pep";
             argv[a++] = "-Bdynamic";
             argv[a++] = "--stack"; argv[a++] = "268435456";
@@ -398,24 +406,19 @@
             argv[a++] = "--end-group";
             argv[a++] = crtend;
             argv[a] = NULL;
-            char lld_path[1200];
-            snprintf(lld_path, sizeof(lld_path), "%s\\ld.lld.exe", exe_dir);
-            const char *linker = rt_mem_obj ? ld_path
-                                 : (zan_utf8_get_file_attributes(lld_path) != INVALID_FILE_ATTRIBUTES
-                                    ? lld_path : ld_path);
-            argv[0] = linker;
+            argv[0] = lld_path;
             if (getenv("ZAN_LINK_ECHO")) {
                 fprintf(stderr, "[link]");
                 for (int i = 1; i < a; i++) fprintf(stderr, " %s", argv[i]);
                 fprintf(stderr, "\n");
             }
-            link_ret = (int)zan_utf8_spawnv(_P_WAIT, linker, argv);
+            link_ret = (int)zan_utf8_spawnv(_P_WAIT, lld_path, argv);
         } else {
             char link_cmd[4096];
             snprintf(link_cmd, sizeof(link_cmd),
-                     "clang --target=x86_64-w64-windows-gnu \"%s\" -o \"%s\" "
-                     "-Wl,--stack,268435456%s",
-                     generated_objects.paths[0], obj_path,
+                     "clang --target=x86_64-w64-windows-gnu --ld-path=\"%s\" "
+                     "\"%s\" -o \"%s\" -Wl,--stack,268435456%s",
+                     lld_path, generated_objects.paths[0], obj_path,
                      publish_mode ? " -O2 -s" : "");
             for (int oi = 1; oi < generated_objects.count; oi++) {
                 cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"",
@@ -547,7 +550,8 @@
 #else
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -Wl,--wrap=malloc -Wl,--wrap=free"
-                     " -Wl,--wrap=calloc -Wl,--wrap=realloc", rt_mem_obj);
+                     " -Wl,--wrap=calloc -Wl,--wrap=realloc"
+                     " -Wl,--wrap=__malloc_allzerop", rt_mem_obj);
 #endif
         }
         for (int di = 0; di < zan_lib_ndirs; di++) {

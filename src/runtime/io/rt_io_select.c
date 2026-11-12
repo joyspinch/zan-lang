@@ -116,9 +116,9 @@ static int rto_timeout_scan(zan_io_shard_t *sh) {
             zan_io_entry_t *x = *pp;
             *pp = x->next;
             free(x);
-            InterlockedDecrement(&g_io_count);
             if (e->out_n) *e->out_n = -1;
             io_wake(e->frame, e->step);
+            InterlockedDecrement(&g_io_count);
             woke++;
         }
         free(e);
@@ -194,9 +194,9 @@ static int32_t io_poll_shard_locked(int shard, int64_t timeout_ms) {
             *pp = cur->next;
             io_deliver_recv(cur);
             free(cur);
-            InterlockedDecrement(&g_io_count);
             rto_drop(sh, co);
             io_wake(co, step);
+            InterlockedDecrement(&g_io_count);
             woke++;
         } else {
             pp = &cur->next;

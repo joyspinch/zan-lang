@@ -27,11 +27,68 @@
 #include <windows.h>
 #endif
 
-/* The real allocator, behind the linker wrap. */
+/* PE import thunks can themselves be rewritten by LLD --wrap. Resolve the
+ * native CRT entry points directly so internal allocator metadata never
+ * re-enters __wrap_malloc through a rewritten __real_malloc import thunk. */
+#if defined(_WIN32)
+static INIT_ONCE g_native_alloc_once = INIT_ONCE_STATIC_INIT;
+static void *(__cdecl *g_native_malloc)(size_t);
+static void (__cdecl *g_native_free)(void *);
+static void *(__cdecl *g_native_calloc)(size_t, size_t);
+static void *(__cdecl *g_native_realloc)(void *, size_t);
+static BOOL CALLBACK zan_mem_init_native_alloc(PINIT_ONCE once, PVOID arg,
+                                               PVOID *context) {
+    (void)once; (void)arg; (void)context;
+    HMODULE crt = GetModuleHandleA("msvcrt.dll");
+    if (!crt) return FALSE;
+    g_native_malloc = (void *(__cdecl *)(size_t))GetProcAddress(crt, "malloc");
+    g_native_free = (void (__cdecl *)(void *))GetProcAddress(crt, "free");
+    g_native_calloc = (void *(__cdecl *)(size_t, size_t))GetProcAddress(crt, "calloc");
+    g_native_realloc = (void *(__cdecl *)(void *, size_t))GetProcAddress(crt, "realloc");
+    return g_native_malloc && g_native_free && g_native_calloc && g_native_realloc;
+}
+static void zan_mem_require_native_alloc(void) {
+    if (!InitOnceExecuteOnce(&g_native_alloc_once, zan_mem_init_native_alloc,
+                             NULL, NULL))
+        ExitProcess(127);
+}
+static void *zan_mem_crt_malloc(size_t n) {
+    zan_mem_require_native_alloc();
+    return g_native_malloc(n);
+}
+static void zan_mem_crt_free(void *p) {
+    zan_mem_require_native_alloc();
+    g_native_free(p);
+}
+static void *zan_mem_crt_calloc(size_t n, size_t m) {
+    zan_mem_require_native_alloc();
+    return g_native_calloc(n, m);
+}
+static void *zan_mem_crt_realloc(void *p, size_t n) {
+    zan_mem_require_native_alloc();
+    return g_native_realloc(p, n);
+}
+#define __real_malloc zan_mem_crt_malloc
+#define __real_free zan_mem_crt_free
+#define __real_calloc zan_mem_crt_calloc
+#define __real_realloc zan_mem_crt_realloc
+#else
+/* ELF's real allocator symbols are supplied by the linker wrap. */
 void *__real_malloc(size_t n);
 void  __real_free(void *p);
 void *__real_calloc(size_t n, size_t m);
 void *__real_realloc(void *p, size_t n);
+#endif
+
+/* Internal metadata is released with __real_free. Static musl's calloc can
+ * call wrapped malloc, so __real_calloc does not guarantee native provenance. */
+static void *zan_mem_native_calloc(size_t n, size_t size) {
+    if (size && n > SIZE_MAX / size) return NULL;
+    size_t bytes = n * size;
+    void *p = __real_malloc(bytes ? bytes : 1);
+    if (p) memset(p, 0, bytes);
+    return p;
+}
 
 #define ZAN_MEM_MAX_SMALL   2048u
 #define ZAN_MEM_SLAB        (1u << 20)      /* 1 MiB */
@@ -428,7 +485,8 @@ static void *zan_mem_small(size_t n) {
         uintptr_t start = ((uintptr_t)c->bump + 4095) & ~(uintptr_t)4095;
         uintptr_t end = (uintptr_t)c->bump_end & ~(uintptr_t)4095;
         if (end > start) {
-            VirtualAlloc((void *)start, end - start, MEM_COMMIT, PAGE_READWRITE);
+            if (!VirtualAlloc((void *)start, end - start, MEM_COMMIT,
+                              PAGE_READWRITE)) return NULL;
         }
         c->bump_decommitted = 0;
     }
@@ -568,6 +626,18 @@ void __wrap_free(void *p) {
         zan_mem_drain_remote(self);
     }
 }
+
+#if defined(__linux__)
+/* Static --wrap=malloc bypasses musl's dynamic replacement detection. Its
+ * calloc must not inspect mallocng metadata on a Zan-owned small block.
+ * Returning false requests normal zeroing; native blocks retain the libc
+ * fast path. The weak reference keeps this object usable with other libcs. */
+extern int __real___malloc_allzerop(void *p) __attribute__((weak));
+int __wrap___malloc_allzerop(void *p) {
+    if (zan_mem_owns(p)) return 0;
+    return __real___malloc_allzerop ? __real___malloc_allzerop(p) : 0;
+}
+#endif
 
 void *__wrap_calloc(size_t n, size_t m) {
     size_t total = n * m;
@@ -754,7 +824,7 @@ static void zan_live_ensure_init(void) {
         for (int i = 0; i < ZAN_LIVE_STRIPES; i++) {
             zan_live_lock_init(&g_live_stripes[i]);
             g_live_stripes[i].bucket_count = 64;
-            g_live_stripes[i].buckets = (zan_live_entry_t **)__real_calloc(64, sizeof(zan_live_entry_t *));
+            g_live_stripes[i].buckets = (zan_live_entry_t **)zan_mem_native_calloc(64, sizeof(zan_live_entry_t *));
             g_live_stripes[i].count = 0;
             g_live_stripes[i].free_list = NULL;
         }
@@ -776,13 +846,13 @@ void zan_rt_live_register(void *obj, size_t size) {
     zan_live_lock(s);
     if (!s->buckets) {
         s->bucket_count = 64;
-        s->buckets = (zan_live_entry_t **)__real_calloc(64, sizeof(zan_live_entry_t *));
+        s->buckets = (zan_live_entry_t **)zan_mem_native_calloc(64, sizeof(zan_live_entry_t *));
     }
 
     /* Grow buckets if load factor > 2 */
     if (s->count > s->bucket_count * 2 && s->bucket_count < (1u << 24)) {
         size_t new_cap = s->bucket_count * 2;
-        zan_live_entry_t **new_buckets = (zan_live_entry_t **)__real_calloc(new_cap, sizeof(zan_live_entry_t *));
+        zan_live_entry_t **new_buckets = (zan_live_entry_t **)zan_mem_native_calloc(new_cap, sizeof(zan_live_entry_t *));
         if (new_buckets) {
             for (size_t b = 0; b < s->bucket_count; b++) {
                 zan_live_entry_t *curr = s->buckets[b];
@@ -962,7 +1032,7 @@ static inline void zan_obj_map_init(zan_obj_map_t *map, size_t min_cap) {
     while (cap < min_cap * 2) cap *= 2;
     map->capacity = cap;
     map->mask = cap - 1;
-    map->entries = (zan_map_entry_t *)__real_calloc(cap, sizeof(zan_map_entry_t));
+    map->entries = (zan_map_entry_t *)zan_mem_native_calloc(cap, sizeof(zan_map_entry_t));
 }
 
 static inline void zan_obj_map_free(zan_obj_map_t *map) {
@@ -1237,3 +1307,12 @@ int64_t zan_gc_write_heap_snapshot(const char *path) {
     if (stats) __real_free(stats);
     return (int64_t)total_count;
 }
+
+/* Keep native bridge aliases local to this implementation when included by
+ * allocator unit tests that supply their own linker-ABI shims afterwards. */
+#if defined(_WIN32)
+#undef __real_malloc
+#undef __real_free
+#undef __real_calloc
+#undef __real_realloc
+#endif

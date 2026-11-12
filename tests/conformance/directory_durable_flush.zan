@@ -1,0 +1,73 @@
+using System;
+using System.IO;
+
+// Checks POSIX directory barriers and explicit Windows non-support.
+// This API regression does not simulate a machine crash or storage power loss.
+class Program {
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static void Main() {
+        string root = "_scratch/conf_directory_durable_flush";
+        string child = root + "/持久 目录";
+        string filePath = child + "/payload.txt";
+        string missingPath = root + "/missing directory";
+        Program.Require(!Directory.Exists(root) && !File.Exists(root), "fixture path already exists");
+        try {
+            Directory.CreateDirectory(child);
+            File.WriteAllText(filePath, "directory barrier sentinel");
+            #if WINDOWS || WASM32
+            bool unsupported = false;
+            try { Directory.FlushToDisk(child); }
+            catch (PlatformNotSupportedException) { unsupported = true; }
+            Program.Require(unsupported, "directory flush did not report unsupported");
+            #else
+            Directory.FlushToDisk(child);
+            Directory.FlushToDisk(child);
+            Directory.FlushToDisk(root);
+            #endif
+            Program.Require(Directory.Exists(child), "directory flush removed directory");
+            Program.Require(File.ReadAllText(filePath) == "directory barrier sentinel", "directory flush changed contents");
+            Console.WriteLine("platform-contract-and-contents");
+
+            bool missingFailed = false;
+            try { Directory.FlushToDisk(missingPath); }
+            #if WINDOWS || WASM32
+            catch (PlatformNotSupportedException) { missingFailed = true; }
+            #else
+            catch (IOException) { missingFailed = true; }
+            #endif
+            Program.Require(missingFailed, "missing directory did not report expected failure");
+            Program.Require(!Directory.Exists(missingPath) && !File.Exists(missingPath), "flush created missing directory");
+            Console.WriteLine("missing-rejected-without-create");
+
+            bool fileFailed = false;
+            try { Directory.FlushToDisk(filePath); }
+            #if WINDOWS || WASM32
+            catch (PlatformNotSupportedException) { fileFailed = true; }
+            #else
+            catch (IOException) { fileFailed = true; }
+            #endif
+            Program.Require(fileFailed, "file did not report expected directory-flush failure");
+            Program.Require(File.ReadAllText(filePath) == "directory barrier sentinel", "file-type failure changed bytes");
+            Console.WriteLine("file-rejected-without-change");
+
+            File.Delete(filePath);
+            Program.Require(!File.Exists(filePath), "could not remove sentinel");
+            #if !WINDOWS && !WASM32
+            Directory.FlushToDisk(child);
+            #endif
+            Directory.Delete(child);
+            Program.Require(!Directory.Exists(child), "flush retained directory handle");
+            #if !WINDOWS && !WASM32
+            Directory.FlushToDisk(root);
+            #endif
+            Console.WriteLine("handles-released");
+        } finally {
+            Program.Require(Directory.DeleteRecursive(root), "could not clean owned fixture");
+            Program.Require(!Directory.Exists(root) && !File.Exists(root), "fixture survived cleanup");
+        }
+        Console.WriteLine("cleaned");
+    }
+}

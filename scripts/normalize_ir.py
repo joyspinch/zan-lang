@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Normalize gen1 (self-hosted compiler) LLVM IR text for golden comparison.
 
-The repo-gate IR goldens (tests/selfhost/ir_golden/<case>.lln) pin the IR a
-case compiles to. Raw .ll text is too volatile to diff: every gen1 refactor
-renames mnemonic SSA temps (%tot -> %total), labels and internal globals
-without changing semantics, and a raw diff would flag all of it as noise.
+The golden gate uses --fnhash raw function fingerprints, not normalize().
+Each fingerprint includes the original function signature and body text;
+SSA names, labels, comments and whitespace inside that text remain sensitive.
+Module-level globals, declarations, types and attributes are not fingerprinted.
 
-The normalizer erases exactly that noise and nothing else:
+The separate normalized-text modes attempt to reduce naming noise:
 
   - every local SSA name becomes %vN, numbered by first *definition* inside
     its function (parameters first, in signature order) -- a pure rename
@@ -26,15 +26,15 @@ Usage:
   python scripts/normalize_ir.py --check <in.ll> <golden.lln>   (exit 1 = diff)
   python scripts/normalize_ir.py --fnhash <in.ll> <out.hashes>
 
---fnhash emits one "<sha16> <function name>" line per defined function
-(sorted by name) -- the golden-IR gate format. Full normalized IR for the
-230 differential cases is ~700 MB (every case pulls the whole stdlib
-closure), which no repo should commit; per-function content hashes pin the
-same information in ~20 KB per case, and a mismatch names the exact
-functions whose emission changed.
+--fnhash emits one "<sha16> <function name>" line per defined function,
+sorted by the complete output line. sha16 is the first 16 hex digits of
+SHA-256 over raw function lines joined with LF, without a trailing LF.
+This compact, unversioned golden format does not establish semantic equivalence.
 """
+import os
 import re
 import sys
+import tempfile
 
 NAME = r'([A-Za-z_.$][\w.$]*)'
 
@@ -59,6 +59,8 @@ def _collect_function(lines, start):
         s = lines[i].strip()
         if s == "}":
             return i, vmap, lmap
+        if s.startswith("define "):
+            raise ValueError("nested function definition at line %d" % (i + 1))
         m = re.match(r'^' + NAME + r':\s*$', s)
         if m:
             if m.group(1) not in lmap:
@@ -68,7 +70,7 @@ def _collect_function(lines, start):
             if m and m.group(1) not in vmap:
                 vmap[m.group(1)] = len(vmap)
         i += 1
-    return i, vmap, lmap  # unterminated function: defensive
+    raise ValueError("unterminated function at line %d" % (start + 1))
 
 
 def _rewrite_body(line, vmap, lmap, tmap):
@@ -164,6 +166,22 @@ def normalize(text):
     return "\n".join(result) + "\n"
 
 
+def _write_atomic(path, text):
+    """Publish only a complete output; preserve any previous file on failure."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", delete=False,
+                dir=os.path.dirname(os.path.abspath(path)),
+                prefix=".normalize-ir-", suffix=".tmp") as f:
+            temporary = f.name
+            f.write(text)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def main():
     args = sys.argv[1:]
     mode = "emit"
@@ -176,7 +194,7 @@ def main():
     if len(args) != 2:
         print(__doc__)
         return 2
-    with open(args[0], "r", encoding="utf-8", errors="replace") as f:
+    with open(args[0], "r", encoding="utf-8") as f:
         text = f.read()
     if mode == "fnhash":
         import hashlib
@@ -184,15 +202,26 @@ def main():
         fstarts = [i for i, l in enumerate(lines)
                    if l.strip().startswith("define ")]
         rows = []
+        names = set()
         for fi in fstarts:
+            # Match the emitter's one-line, unquoted function-header subset.
+            header = re.fullmatch(
+                r'define\s+[^@\n]+@([A-Za-z_.$][\w.$]*|[0-9]+)\(.*\).*\{\s*',
+                lines[fi].strip())
+            if header is None:
+                raise ValueError("unsupported function header at line %d" % (fi + 1))
+            name = header.group(1)
+            if name in names:
+                raise ValueError("duplicate function: %s" % name)
+            names.add(name)
             end, _v, _l = _collect_function(lines, fi)
             body = chr(10).join(lines[fi:end + 1])
-            name = lines[fi].split("@", 1)[1].split("(", 1)[0]
             h = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
             rows.append("%s %s" % (h, name))
+        if not rows:
+            raise ValueError("no function definitions found")
         rows.sort()
-        with open(args[1], "w", encoding="utf-8", newline=chr(10)) as f:
-            f.write(chr(10).join(rows) + chr(10))
+        _write_atomic(args[1], chr(10).join(rows) + chr(10))
         return 0
     norm = normalize(text)
     if mode == "check":

@@ -108,15 +108,17 @@ void zan_hw_pixel_blend_over(uint8_t *dst, const uint8_t *src, int64_t count) {
 void zan_hw_pixel_swap_rb(uint8_t *dst, const uint8_t *src, int64_t count) {
     if (count <= 0 || !dst || !src) return;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    pixel_swap_rb_ssse3(dst, src, count);
-#else
+    if (zan_hw_x86_can(ZAN_HW_REQ_PIXEL)) {
+        pixel_swap_rb_ssse3(dst, src, count);
+        return;
+    }
+#endif
     for (int64_t i = 0; i < count; i++) {
         uint32_t p;
         memcpy(&p, src + i * 4, 4);
         uint32_t swapped = (p & 0xFF00FF00u) | ((p & 0x00FF0000u) >> 16) | ((p & 0x000000FFu) << 16);
         memcpy(dst + i * 4, &swapped, 4);
     }
-#endif
 }
 
 void zan_hw_pixel_fill_rect(uint8_t *dst, int64_t stride, int64_t x, int64_t y,

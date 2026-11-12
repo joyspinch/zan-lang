@@ -1,0 +1,199 @@
+using System;
+using System.Data.MySql;
+using System.Interop;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace System.Data.MySql;
+
+// Bounded loopback fixture: one shared 0xFFFFFF body, sequential sessions.
+// No database service, credentials, external traffic or reduced production policy.
+class PacketSender {
+    nint socket;
+    byte[] fullBody;
+    int mode;
+    AtomicInt done;
+
+    PacketSender(nint socket, byte[] fullBody, int mode) {
+        this.socket = socket;
+        this.fullBody = fullBody;
+        this.mode = mode;
+        this.done = new AtomicInt(0);
+    }
+
+    void Send(byte[] bytes, int count) {
+        int sent = 0;
+        byte[] part = new byte[32769];
+        while (sent < count) {
+            int n = count - sent;
+            if (n > 32768) { n = 32768; }
+            NativeMemory.Copy((nint)part, (nint)bytes + (nint)sent, n);
+            int wrote = Socket.Send(this.socket, part, n);
+            if (wrote <= 0) { throw new InvalidOperationException("fixture send failed"); }
+            sent = sent + wrote;
+        }
+    }
+
+    void Header(int length, int seq, int count) {
+        byte[] header = new byte[4];
+        header[0] = (byte)(length & 255);
+        header[1] = (byte)((length >> 8) & 255);
+        header[2] = (byte)((length >> 16) & 255);
+        header[3] = (byte)seq;
+        this.Send(header, count);
+    }
+
+    void Run() {
+        try {
+            if (this.mode == 0) {
+                this.Header(3, 9, 4);
+                byte[] small = new byte[3];
+                small[0] = 65; small[1] = 0; small[2] = 90;
+                this.Send(small, 3);
+            } else if (this.mode == 1) {
+                this.Header(0, 9, 4);
+            } else if (this.mode == 5) {
+                this.Header(3, 9, 2);
+            } else if (this.mode == 6) {
+                this.Header(3, 9, 4);
+                this.Send(this.fullBody, 1);
+            } else {
+                this.Header(16777215, 9, 4);
+                this.Send(this.fullBody, 16777215);
+                if (this.mode == 2) {
+                    this.Header(0, 10, 4);
+                } else if (this.mode == 3) {
+                    this.Header(0, 10, 2);
+                } else {
+                    this.Header(3, 10, 4);
+                    this.Send(this.fullBody, this.mode == 7 ? 3 : 1);
+                }
+            }
+            // A graceful send-side EOF preserves all queued fixture bytes.
+            Socket.Close(this.socket);
+            this.done.Store(1);
+        } catch (Exception e) {
+            // Surface fixture errors after releasing the receiving reader.
+            Socket.Close(this.socket);
+            this.done.Store(-1);
+        }
+    }
+}
+
+class Program {
+    static void Check(bool good, string name) {
+        if (!good) { throw new InvalidOperationException(name); }
+    }
+
+    static void Admission() {
+        int cap = 67108864;
+        int chunk = 16777215;
+        Program.Check(MySqlPacketBounds.MaxMessageBytes == cap, "64 MiB policy");
+        Program.Check(MySqlPacketBounds.AppendLength(0, 0) == 0, "empty");
+        Program.Check(MySqlPacketBounds.AppendLength(0, chunk) == chunk, "full chunk");
+        int total = 0;
+        for (int i = 0; i < 4; i = i + 1) {
+            total = MySqlPacketBounds.AppendLength(total, chunk);
+        }
+        Program.Check(total == cap - 4, "four full continuations");
+        Program.Check(MySqlPacketBounds.AppendLength(total, 4) == cap, "exact cap");
+        Program.Check(MySqlPacketBounds.AppendLength(total, 5) == -1, "cap plus one header");
+        Program.Check(MySqlPacketBounds.AppendLength(cap, 0) == cap, "zero terminator at cap");
+        Program.Check(MySqlPacketBounds.AppendLength(cap, 1) == -1, "no body admitted at cap");
+        Program.Check(MySqlPacketBounds.AppendLength(2147483647, 1) == -1, "signed sum overflow");
+        Program.Check(MySqlPacketBounds.AppendLength(1, 2147483647) == -1, "invalid chunk overflow");
+        Program.Check(MySqlPacketBounds.AppendLength(-1, 1) == -1, "negative total");
+        Program.Check(MySqlPacketBounds.AppendLength(1, -1) == -1, "negative chunk");
+        Program.Check(MySqlPacketBounds.AppendLength(cap + 1, 0) == -1, "invalid prior total");
+        Program.Check(MySqlPacketBounds.AppendLength(0, chunk + 1) == -1, "invalid wire length");
+        byte[] handshake = new byte[8];
+        MySqlPacketBounds.Advertise(handshake, 4);
+        Program.Check(handshake[4] == 0 && handshake[5] == 0
+            && handshake[6] == 0 && handshake[7] == 4, "advertised receive budget");
+        Console.WriteLine("aggregate admission: ok");
+    }
+
+    static nint Listener(out int selectedPort) {
+        selectedPort = 0;
+        // A private small port range avoids hard dependency on a single port.
+        for (int port = 25470; port < 25530; port = port + 1) {
+            nint listener = Socket.CreateTcp();
+            if (Socket.Bind(listener, "127.0.0.1", port) == 0
+                && Socket.Listen(listener, 1) == 0) {
+                selectedPort = port;
+                return listener;
+            }
+            Socket.Close(listener);
+        }
+        throw new InvalidOperationException("no loopback fixture port");
+    }
+
+    static void Result(byte[] packet, int length, int seq, bool connected, int mode) {
+        if (mode >= 3 && mode <= 6) {
+            Program.Check(packet == null && length == -1 && !connected, "truncated session discarded");
+            return;
+        }
+        Program.Check(packet != null && connected, "valid session preserved");
+        if (packet == null) { return; }
+        if (mode == 0) {
+            Program.Check(length == 3 && packet.Length == 4 && seq == 9
+                && packet[0] == 65 && packet[1] == 0 && packet[2] == 90, "normal binary packet");
+        } else if (mode == 1) {
+            Program.Check(length == 0 && packet.Length == 1 && seq == 9, "empty packet");
+        } else {
+            int tail = mode == 7 ? 3 : 0;
+            Program.Check(length == 16777215 + tail && packet.Length == 16777216 + tail && seq == 10
+                && packet[0] == 65 && packet[8388607] == 66 && packet[16777214] == 90
+                && packet[length] == 0, "full chunk and terminator");
+            if (tail > 0) {
+                Program.Check(packet[16777215] == 65 && packet[16777216] == 0
+                    && packet[16777217] == 0, "continuation copied at logical offset");
+            }
+        }
+    }
+
+    static async void RunMode(byte[] body, int mode, bool asynchronous) {
+        int port = 0;
+        nint listener = Program.Listener(out port);
+        nint receiver = Socket.CreateTcp();
+        Program.Check(Socket.Connect(receiver, "127.0.0.1", port) == 0, "fixture connect");
+        nint senderSocket = Socket.Accept(listener);
+        Socket.Close(listener);
+        PacketSender sender = new PacketSender(senderSocket, body, mode);
+        Thread.Start(() => { sender.Run(); });
+        if (asynchronous) {
+            Socket.SetNonBlocking(receiver);
+            MySqlConnection db = new MySqlConnection();
+            db.sock = receiver;
+            db.connected = true;
+            byte[] packet = await db.readPacket();
+            Program.Result(packet, db.lastLen, db.lastSeq, db.IsConnected(), mode);
+            if (mode >= 3 && mode <= 6) { Program.Check(db.sock == (nint)(-1), "async socket closed"); }
+            db.Close();
+        } else {
+            MySqlSyncConnection db = new MySqlSyncConnection();
+            db.sock = receiver;
+            db.connected = true;
+            byte[] packet = db.readPacket();
+            Program.Result(packet, db.lastLen, db.lastSeq, db.IsConnected(), mode);
+            if (mode >= 3 && mode <= 6) { Program.Check(db.sock == (nint)(-1), "sync socket closed"); }
+            db.Close();
+        }
+        while (sender.done.Load() == 0) { await Task.Delay(1); }
+        Program.Check(sender.done.Load() == 1, "fixture completed");
+    }
+
+    static async void Main() {
+        Program.Admission();
+        byte[] body = new byte[16777215];
+        body[0] = 65; body[8388607] = 66; body[16777214] = 90;
+        for (int mode = 0; mode < 8; mode = mode + 1) {
+            await Program.RunMode(body, mode, false);
+        }
+        Console.WriteLine("sync packet bounds: ok");
+        for (int mode = 0; mode < 8; mode = mode + 1) {
+            await Program.RunMode(body, mode, true);
+        }
+        Console.WriteLine("async packet bounds: ok");
+    }
+}

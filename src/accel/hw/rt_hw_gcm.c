@@ -208,7 +208,7 @@ static int zan_ghash_kat(void) {
 int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16) {
     if (!h16 || !x16 || !y16) return -1;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (zan_hw_gate(&g_gate_ghash, zan_hw_has_pclmul(), zan_ghash_kat)) {
+    if (zan_hw_gate(&g_gate_ghash, zan_hw_x86_can(ZAN_HW_REQ_GHASH), zan_ghash_kat)) {
         return zan_ghash_block_clmul(h16, x16, y16);
     }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
@@ -224,7 +224,7 @@ int64_t zan_hw_ghash_update(const uint8_t *h16, const uint8_t *data, int64_t len
     if (len <= 0) return 0;
     if (!data) return -1;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (zan_hw_gate(&g_gate_ghash, zan_hw_has_pclmul(), zan_ghash_kat)) {
+    if (zan_hw_gate(&g_gate_ghash, zan_hw_x86_can(ZAN_HW_REQ_GHASH), zan_ghash_kat)) {
         return zan_ghash_update_clmul(h16, data, len, y16);
     }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
@@ -524,7 +524,7 @@ int64_t zan_hw_aes_gcm_encrypt_ctx(const uint8_t *ctxBuf,
 
     uint8_t ej0[16];
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+    if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) {
         zan_aes_ecb_block_rk(ctx->rkb, ctx->nr, j0, ej0);
     } else {
         if (zan_hw_aes_ecb_block(ctx->rkb[0], ctx->keybits, j0, ej0) != 0) return -1;
@@ -544,10 +544,10 @@ int64_t zan_hw_aes_gcm_encrypt_ctx(const uint8_t *ctxBuf,
 
     if (inLen > 0) {
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-        if ((g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) &&
-            (g_gate_ghash == 1 || zan_hw_gate(&g_gate_ghash, zan_hw_has_pclmul(), zan_ghash_kat))) {
+        if ((g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) &&
+            (g_gate_ghash == 1 || zan_hw_gate(&g_gate_ghash, zan_hw_x86_can(ZAN_HW_REQ_GHASH), zan_ghash_kat))) {
             zan_aes_gcm_encrypt_ni_fused(ctx->rkb, ctx->nr, ctx->h_powers, in, inLen, ctr, out, y16);
-        } else if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+        } else if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) {
             zan_aes_ctr_ni_4way(ctx->rkb, ctx->nr, in, inLen, ctr, out);
             if (zan_hw_ghash_update(ctx->h16, out, inLen, y16) != 0) return -1;
         } else {
@@ -594,7 +594,7 @@ int64_t zan_hw_aes_gcm_decrypt_ctx(const uint8_t *ctxBuf,
 
     uint8_t ej0[16];
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+    if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) {
         zan_aes_ecb_block_rk(ctx->rkb, ctx->nr, j0, ej0);
     } else {
         if (zan_hw_aes_ecb_block(ctx->rkb[0], ctx->keybits, j0, ej0) != 0) return -1;
@@ -615,8 +615,8 @@ int64_t zan_hw_aes_gcm_decrypt_ctx(const uint8_t *ctxBuf,
     int did_fused = 0;
     if (inLen > 0) {
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-        if ((g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) &&
-            (g_gate_ghash == 1 || zan_hw_gate(&g_gate_ghash, zan_hw_has_pclmul(), zan_ghash_kat))) {
+        if ((g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) &&
+            (g_gate_ghash == 1 || zan_hw_gate(&g_gate_ghash, zan_hw_x86_can(ZAN_HW_REQ_GHASH), zan_ghash_kat))) {
             zan_aes_gcm_decrypt_ni_fused(ctx->rkb, ctx->nr, ctx->h_powers, in, inLen, ctr, out, y16);
             did_fused = 1;
         } else {
@@ -647,7 +647,7 @@ int64_t zan_hw_aes_gcm_decrypt_ctx(const uint8_t *ctxBuf,
 
     if (!did_fused && inLen > 0) {
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-        if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+        if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_x86_can(ZAN_HW_REQ_AES), zan_aes_kat)) {
             zan_aes_ctr_ni_4way(ctx->rkb, ctx->nr, in, inLen, ctr, out);
         } else {
             if (zan_hw_aes_ctr_crypt(in, inLen, ctx->rkb[0], ctx->keybits, ctr, out) != inLen) return -1;

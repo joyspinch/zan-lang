@@ -1,0 +1,58 @@
+using System;
+using System.Net.WebSocket;
+using System.Net.WebSocket.Secure;
+
+namespace System.Net.WebSocket;
+
+class Program {
+    static void Require(bool ok) {
+        if (!ok) { throw new InvalidOperationException("client session regression"); }
+    }
+
+    static void Append(WsReader reader, WsFrame frame) {
+        byte[] wire = frame.Encode();
+        wire[0] = (byte)((frame.fin ? 128 : 0) | frame.opcode);
+        int len = WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen;
+        reader.Append(wire.ToStr(0, len), len);
+    }
+
+    static async void Run() {
+        WebSocketClient ws = new WebSocketClient();
+        WssClient wss = new WssClient();
+        Program.Require(!ws.IsConnected() && !wss.IsConnected());
+        await ws.Close();
+        await wss.Close();
+        ws.Dispose();
+        wss.Dispose();
+        Program.Require(ws.LastOpcode() == 0 && wss.LastLength() == 0);
+        WsReader reader = new WsReader((nint)0);
+        WsFrame first = WsFrame.RawFrame(WsOpcode.Binary, "a", 1);
+        first.fin = false;
+        Program.Append(reader, first);
+        Program.Append(reader, WsFrame.PongFrame());
+        byte[] tail = new byte[] { 0, 98 };
+        Program.Append(reader, WsFrame.RawBytes(WsOpcode.Continuation, tail, 0, 2));
+        Program.Append(reader, WsFrame.TextFrame("next"));
+        Program.Append(reader, WsFrame.BinaryFrame("", 0));
+        WsClientSession session = new WsClientSession();
+        session.Open(null, null, null, reader);
+        byte[] received = await session.RecvBinary(0);
+        Program.Require(received != null && session.LastOpcode() == WsOpcode.Binary
+            && session.LastLength() == 3 && received[0] == 97 && received[1] == 0 && received[2] == 98);
+        string text = await session.RecvText(0);
+        Program.Require(text == "next" && session.LastOpcode() == WsOpcode.Text && session.LastLength() == 4);
+        received = await session.RecvBinary(0);
+        Program.Require(received != null && session.LastLength() == 0);
+        bool sent = await session.SendFrameBytes(WsOpcode.Binary, tail, 2147483647, 2);
+        Program.Require(!sent && session.IsConnected());
+        sent = await session.SendFrame(3, "x", 1);
+        Program.Require(!sent && session.IsConnected());
+        Program.Append(reader, WsFrame.RawFrame(WsOpcode.Continuation, "bad", 3));
+        text = await session.RecvText(0);
+        Program.Require(text == "" && !session.IsConnected() && session.LastLength() == 0);
+        session.CloseNow();
+        Console.WriteLine("ws_client_session=ok");
+    }
+
+    static void Main() { await Program.Run(); }
+}

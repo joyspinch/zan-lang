@@ -662,7 +662,7 @@ int64_t zan_hw_sm4_cbc_encrypt(const uint8_t *in, int64_t len,
 
     int use_hw = 0;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    use_hw = zan_hw_gate(&g_gate_sm4, zan_hw_has_aesni(), zan_sm4_kat_x86);
+    use_hw = zan_hw_gate(&g_gate_sm4, zan_hw_x86_can(ZAN_HW_REQ_SM4), zan_sm4_kat_x86);
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
     use_hw = zan_hw_gate(&g_gate_sm4, zan_hw_arm_sm4(), zan_sm4_kat_arm);
 #endif
@@ -735,9 +735,9 @@ int64_t zan_hw_sm4_cbc_decrypt(const uint8_t *in, int64_t len,
 
     int use_hw = 0;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    use_hw = zan_hw_gate(&g_gate_sm4, zan_hw_has_aesni(), zan_sm4_kat_x86);
+    use_hw = zan_hw_gate(&g_gate_sm4, zan_hw_x86_can(ZAN_HW_REQ_SM4), zan_sm4_kat_x86);
     if (use_hw) {
-        int use_vaes = zan_hw_has_vaes();
+        int use_vaes = zan_hw_x86_can(ZAN_HW_REQ_SM4_VAES);
         if (use_vaes) {
             while (blocks - b >= 16) {
                 uint8_t dec16[256];

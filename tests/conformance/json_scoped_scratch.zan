@@ -28,6 +28,36 @@ class Program {
             Console.WriteLine("caught scoped error: " + e.Message);
         }
 
+        // Parsing a signed manifest in a scoped channel-response callback must
+        // not overwrite the outer tape before its remaining fields are read.
+        string nested = JsonDoc.ParseScoped<string>(json, (outer) => {
+            JsonDoc inner = JsonDoc.Parse("{\"different\":17}");
+            if (inner.PathInt("different", 0) != 17) { throw new JsonException("inner parse"); }
+            JsonValue dom = JsonValue.Parse("{\"dom\":true}");
+            if (!dom.Bool("dom", false)) { throw new JsonException("inner DOM"); }
+            JsonDoc.ParseScoped("{\"nested\":23}", (innerScope) => {
+                if (innerScope.PathInt("nested", 0) != 23) { throw new JsonException("nested scope"); }
+                JsonDoc deepest = JsonDoc.Parse("{\"deep\":31}");
+                if (deepest.PathInt("deep", 0) != 31 || innerScope.PathInt("nested", 0) != 23) { throw new JsonException("nested tape overwritten"); }
+            });
+            return outer.PathStr("data.user", "lost");
+        });
+        Console.WriteLine("nested generic preserved: " + (nested == "alice"));
+        JsonDoc.ParseScoped(json, (outer) => {
+            string value = JsonDoc.ParseScoped<string>("{\"value\":\"inner\"}", (inner) => inner.PathStr("value", ""));
+            try {
+                JsonDoc.ParseScoped("{\"throw\":true}", (inner) => { throw new JsonException("callback"); });
+            } catch (JsonException) { }
+            try { JsonDoc.Parse("{\"broken\":"); } catch (JsonException) { }
+            JsonDoc after = JsonDoc.Parse("{\"after\":41}");
+            Console.WriteLine("nested action preserved: " + (value == "inner" && outer.PathInt("code", 0) == 200 && after.PathInt("after", 0) == 41));
+        });
+        try {
+            JsonDoc.ParseScoped<int>(json, (outer) => { throw new JsonException("generic callback"); return 0; });
+        } catch (JsonException) { }
+        JsonDoc.ParseScoped(json, (after) => {
+            Console.WriteLine("scope recovers after exceptions: " + (after.PathStr("data.user", "") == "alice"));
+        });
         Console.WriteLine("done");
     }
 }

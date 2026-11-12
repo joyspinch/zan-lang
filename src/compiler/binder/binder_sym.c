@@ -26,6 +26,7 @@ static uint32_t istr_hash(zan_istr_t name) {
 static zan_scope_t *scope_new(zan_arena_t *arena, zan_scope_t *parent) {
     zan_scope_t *s = (zan_scope_t *)zan_arena_alloc(arena, sizeof(zan_scope_t));
     s->parent = parent;
+    s->declaration_type_params = false;
     s->symbols = NULL;
     s->sym_count = 0;
     s->sym_cap = 0;
@@ -779,7 +780,7 @@ static bool type_is_value_kind(zan_type_t *t) {
     case TYPE_BOOL: case TYPE_BYTE: case TYPE_SBYTE:
     case TYPE_SHORT: case TYPE_USHORT: case TYPE_INT: case TYPE_UINT:
     case TYPE_LONG: case TYPE_ULONG: case TYPE_NINT:
-    case TYPE_FLOAT: case TYPE_DOUBLE:
+    case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_DECIMAL:
     case TYPE_CHAR: case TYPE_ENUM: case TYPE_STRUCT:
         return true;
     default:
@@ -852,7 +853,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     }
 
     if (b->binding_done && type_ref->type_ref.rt_type &&
-        type_ref->type_ref.rt_scope == (void *)b->current_scope)
+        (!type_ref->type_ref.rt_scope ||
+         type_ref->type_ref.rt_scope == (void *)b->current_scope))
         return (zan_type_t *)type_ref->type_ref.rt_type;
 
     zan_istr_t name = type_ref->type_ref.name;
@@ -1102,7 +1104,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     }
     if (b->binding_done && resolved && resolved != b->type_error) {
         type_ref->type_ref.rt_type = resolved;
-        type_ref->type_ref.rt_scope = (void *)b->current_scope;
+        type_ref->type_ref.rt_scope = b->current_scope->declaration_type_params
+            ? NULL : (void *)b->current_scope;
     }
     return resolved;
 }
@@ -1117,12 +1120,10 @@ zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name) {
  * 按 名字 memcmp + kind、irgen 的 di_subst_param 按名字）从不比对对象
  * 指针，所以"谁的对象被留下"不可观测——文件解析顺序不改变行为
  * （tests/conformance/type_param_same_name 钉形）。
- * 这份根作用域注册是 checking 阶段的承重墙：checker 全程不设置
- * current_scope，resolve_type 的 rt_scope 缓存守卫让方法体内新出现的
- * 类型引用（局部变量、new、调用实参）全部落回根作用域解析——没有它，
- * 泛型方法体一律 E1005。不要做"按层隔离"重构：那需要给 checker 全程
- * 作用域感知，而同名类型参数在按名字统一架构下语义本就相同，隔离
- * 不产生任何行为差异。 */
+ * 根作用域注册仍是没有声明上下文的解析路径的 fallback，不可删除。
+ * checker 检查类和方法时用 zan_binder_push_type_params 叠加声明作用域：
+ * 同名普通 class T 不能替代泛型声明中的 T；仅按名字比较并不能把
+ * TYPE_CLASS 与 TYPE_TYPE_PARAM 视为相等。作用域退出后恢复根 fallback。 */
 static void register_type_param_list(zan_binder_t *b, zan_ast_list_t *tps) {
     for (int j = 0; j < tps->count; j++) {
         zan_ast_node_t *tp = tps->items[j];
@@ -1134,6 +1135,25 @@ static void register_type_param_list(zan_binder_t *b, zan_ast_list_t *tps) {
                                            tp->ident.name, tp_type, tp, 0);
         scope_add(b->arena, b->current_scope, tp_sym);
     }
+}
+
+/* Keep the root fallback, but declarations must shadow unrelated classes with
+ * the same name (class T must not replace the T in a generic constructor). */
+zan_scope_t *zan_binder_push_type_params(zan_binder_t *b, zan_ast_list_t *tps) {
+    zan_scope_t *saved = b->current_scope;
+    if (tps->count == 0) return saved;
+    b->current_scope = scope_new(b->arena, saved);
+    b->current_scope->declaration_type_params = true;
+    for (int i = 0; i < tps->count; i++) {
+        zan_ast_node_t *tp = tps->items[i];
+        if (tp->kind != AST_IDENTIFIER) continue;
+        zan_type_t *type = make_type(b->arena, TYPE_TYPE_PARAM,
+                                     tp->ident.name.str, tp->ident.name.len);
+        zan_symbol_t *sym = make_symbol(b->arena, SYM_TYPE_PARAM,
+                                        tp->ident.name, type, tp, 0);
+        scope_add(b->arena, b->current_scope, sym);
+    }
+    return saved;
 }
 
 static void register_type_params(zan_binder_t *b, zan_ast_list_t *decls) {

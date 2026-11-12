@@ -335,6 +335,7 @@ static const zan_builtin_member_t members_task[] = {
     { "WhenAll",'M', "async int WhenAll(List<long> handles)" },
     { "WhenAny",'M', "async int WhenAny(List<long> handles)" },
     { "IsDone", 'M', "int IsDone(long handle)" },
+    { "Release", 'M', "void Release(long handle)" },
     { "Cancel", 'M', "void Cancel(long handle)" },
     { "IsCancellationRequested", 'M', "int IsCancellationRequested()" },
     { "JoinNew",   'M', "long JoinNew(int npairs, int any)" },

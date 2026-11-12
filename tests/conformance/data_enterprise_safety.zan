@@ -1,0 +1,205 @@
+using System;
+using System.Text;
+using System.Linq;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.Data.Postgres;
+
+class SafetyConnection : IDbConnection {
+    public bool connected = true;
+    public bool rollbackThrows;
+    public bool rollbackOk = true;
+    public bool commitOk = true;
+    public bool executeOk = true;
+    public bool closeThrows;
+    public bool beginThrows;
+    public DbResult Query(string sql) { return new DbResult(); }
+    public DbResult Query(string sql, DbParams p) { return new DbResult(); }
+    public int Execute(string sql) { return this.executeOk ? 0 : -1; }
+    public int Execute(string sql, DbParams p) { return 0; }
+    public string ExecuteScalar(string sql) { return ""; }
+    public string ExecuteScalar(string sql, DbParams p) { return ""; }
+    public async DbResult QueryAsync(string sql) { return new DbResult(); }
+    public async DbResult QueryAsync(string sql, DbParams p) { return new DbResult(); }
+    public async int ExecuteAsync(string sql) { return this.executeOk ? 0 : -1; }
+    public async int ExecuteAsync(string sql, DbParams p) { return 0; }
+    public async string ExecuteScalarAsync(string sql) { return ""; }
+    public async string ExecuteScalarAsync(string sql, DbParams p) { return ""; }
+    public void BeginTransaction() {
+        if (this.beginThrows) { throw new DbException("begin failed", 123, DbProvider.SQLite); }
+    }
+    public void Commit() { }
+    public void Rollback() {
+        if (this.rollbackThrows) { throw new Exception("rollback failed"); }
+    }
+    public async bool BeginTransactionAsync() { return true; }
+    public async bool CommitAsync() { return this.commitOk; }
+    public async bool RollbackAsync() {
+        if (this.rollbackThrows) { throw new Exception("rollback failed"); }
+        return this.rollbackOk;
+    }
+    public int GetProvider() { return DbProvider.SQLite; }
+    public bool IsConnected() { return this.connected; }
+    public void Close() {
+        this.connected = false;
+        if (this.closeThrows) { throw new Exception("close failed"); }
+    }
+    public void Dispose() { this.Close(); }
+}
+
+class SafetyConnector : IDbConnector {
+    public async IDbConnection ConnectAsync() { return new SafetyConnection(); }
+    public int GetProvider() { return DbProvider.SQLite; }
+}
+
+class Program {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static bool Reject(ExprNode root) {
+        StringBuilder sb = new StringBuilder();
+        DbParams ps = new DbParams();
+        ps.AddInt(99);
+        bool rejected = false;
+        try { ExprSql.Build(root, sb, ps); }
+        catch (NotSupportedException) { rejected = true; }
+        Check(sb.ToString() == "" && ps.Count() == 1, "rejected expression mutated output");
+        return rejected;
+    }
+
+    static void Expressions() {
+        Check(Reject(ExprNode.Call("Unknown", ExprNode.Member("id"), ExprNode.Const(1))), "unknown method");
+        ExprNode unknown = new ExprNode();
+        unknown.Kind = 999;
+        Check(Reject(unknown), "unknown node");
+        Check(Reject(null), "null root");
+        Check(Reject(ExprNode.Binary("OR 1=1 --", ExprNode.Const(1), ExprNode.Const(2))), "operator injection");
+        Check(Reject(ExprNode.Binary("&&", ExprNode.Const(true), unknown)), "partial binding");
+        Check(Reject(ExprNode.Call("Contains", ExprNode.Member("name"), ExprNode.Member("other"))), "nonconstant LIKE");
+        SqliteConnection db = SqliteConnection.Open(":memory:");
+        db.Execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)");
+        db.Execute("INSERT INTO items VALUES (1, 'one'), (2, 'two')");
+        Meta meta = Meta.Of("SafetyItem", "items");
+        meta.Col("id", "Id", DbParams.KindInt, true, true, false, true, 0);
+        meta.Col("name", "Name", DbParams.KindText, false, false, false, true, 100);
+        meta.Seal();
+        Update update = Update.Create(db, meta);
+        update.SetS("name", "changed");
+        bool rejected = false;
+        try { update.WExpr(unknown); } catch (NotSupportedException) { rejected = true; }
+        Check(rejected && update.ExecuteAffrows() == 0, "update failed open");
+        Delete del = Delete.Create(db, meta);
+        rejected = false;
+        try { del.WExpr(unknown); } catch (NotSupportedException) { rejected = true; }
+        Check(rejected && del.ExecuteAffrows() == 0, "delete failed open");
+        Check(db.ExecuteScalar("SELECT COUNT(*) FROM items WHERE name IN ('one','two')") == "2", "rows changed");
+        db.Close();
+        Console.WriteLine("expressions fail closed");
+    }
+
+    static async void Transactions() {
+        SafetyConnection c = new SafetyConnection();
+        UnitOfWork u = UnitOfWork.Create(c, false);
+        u.CreateSavepoint("a"); u.CreateSavepoint("b"); u.CreateSavepoint("c");
+        u.RollbackToSavepoint("b");
+        Check(u.savepoints.Count == 2, "rollback descendants");
+        u.CreateSavepoint("c");
+        u.ReleaseSavepoint("b");
+        Check(u.savepoints.Count == 1 && u.savepoints[0] == "a", "release descendants");
+        await u.CreateSavepointAsync("b"); await u.CreateSavepointAsync("c");
+        await u.RollbackToSavepointAsync("b");
+        Check(u.savepoints.Count == 2, "async rollback descendants");
+        await u.CreateSavepointAsync("c"); await u.ReleaseSavepointAsync("b");
+        Check(u.savepoints.Count == 1, "async release descendants");
+        c.commitOk = false;
+        Check(!await u.CommitAsync() && !u.committed, "failed commit recorded success");
+        u.Dispose();
+
+        SafetyConnection savepointFailure = new SafetyConnection();
+        UnitOfWork sp = UnitOfWork.Create(savepointFailure, false);
+        sp.CreateSavepoint("a"); sp.CreateSavepoint("b");
+        savepointFailure.executeOk = false;
+        bool failedCommand = false;
+        try { sp.RollbackToSavepoint("a"); } catch (DbException) { failedCommand = true; }
+        Check(failedCommand && sp.savepoints.Count == 2, "failed savepoint rollback changed ledger");
+        failedCommand = false;
+        try { await sp.ReleaseSavepointAsync("a"); } catch (DbException) { failedCommand = true; }
+        Check(failedCommand && sp.savepoints.Count == 2, "failed release changed ledger");
+        sp.Dispose();
+        SafetyConnection rollbackFailure = new SafetyConnection();
+        UnitOfWork direct = UnitOfWork.Create(rollbackFailure, false);
+        rollbackFailure.rollbackThrows = true;
+        rollbackFailure.closeThrows = true;
+        bool rollbackRejected = false;
+        try { direct.Rollback(); }
+        catch (Exception ex) { rollbackRejected = ex.Message == "rollback failed"; }
+        Check(rollbackRejected && direct.GetConnection() == null, "rollback failure masked");
+        direct.Dispose();
+
+        SafetyConnection beginFailure = new SafetyConnection();
+        beginFailure.beginThrows = true;
+        beginFailure.closeThrows = true;
+        bool beginRejected = false;
+        try { UnitOfWork failedBegin = UnitOfWork.Create(beginFailure, false); }
+        catch (DbException ex) { beginRejected = ex.Message == "begin failed"; }
+        Check(beginRejected && !beginFailure.connected, "sync BEGIN failure masked or connection retained");
+
+        DbPool pool = new DbPool(new SafetyConnector(), 1);
+        SafetyConnection pooledBeginFailure = new SafetyConnection();
+        Check(pool.core.TryReserve() && pool.core.Borrow(pooledBeginFailure), "reserve BEGIN connection");
+        pooledBeginFailure.beginThrows = true;
+        pooledBeginFailure.closeThrows = true;
+        beginRejected = false;
+        try { UnitOfWork failedBegin = UnitOfWork.Create(pooledBeginFailure, pool, false); }
+        catch (DbException ex) { beginRejected = ex.Message == "begin failed"; }
+        Check(beginRejected && !pooledBeginFailure.connected, "pooled BEGIN failure masked or connection retained");
+        Check(pool.LiveCount() == 0 && pool.IdleCount() == 0, "failed BEGIN retained pool slot");
+        SafetyConnection failed = new SafetyConnection();
+        Check(pool.core.TryReserve() && pool.core.Borrow(failed), "reserve rollback connection");
+        UnitOfWork bad = UnitOfWork.Create(failed, pool, false);
+        failed.rollbackThrows = true;
+        bad.Dispose();
+        Check(!failed.connected && pool.LiveCount() == 0 && pool.IdleCount() == 0, "failed rollback pooled");
+        SafetyConnection asyncFailed = new SafetyConnection();
+        UnitOfWork asyncBad = UnitOfWork.Create(asyncFailed, false);
+        asyncFailed.rollbackOk = false;
+        Check(!await asyncBad.RollbackAsync() && !asyncFailed.connected, "false rollback retained session");
+        asyncBad.Dispose(); pool.Close();
+        PgConnection pg = new PgConnection();
+        bool threw = false;
+        try { pg.BeginTransaction(); } catch (DbException) { threw = true; }
+        Check(threw && !pg.inTxn, "disconnected PG begin succeeded");
+        Console.WriteLine("transaction failures and savepoints safe");
+    }
+
+    static void PoolOrdering() {
+        PoolCore<SafetyConnection> core = new PoolCore<SafetyConnection>(1);
+        SafetyConnection c = new SafetyConnection();
+        Check(core.TryReserve() && core.Borrow(c), "pool reserve");
+        core.MarkClosed();
+        Check(!core.Pool(c) && core.LiveCount() == 0 && core.IdleCount() == 0, "late return accepted");
+        Check(!core.TryReserve(), "closed reserve accepted");
+        PoolCore<SafetyConnection> opening = new PoolCore<SafetyConnection>(1);
+        Check(opening.TryReserve(), "opening reserve");
+        opening.MarkClosed();
+        Check(!opening.Borrow(c) && opening.LiveCount() == 0, "late open accepted");
+        PoolCore<SafetyConnection> idle = new PoolCore<SafetyConnection>(1);
+        Check(idle.TryReserve() && idle.Borrow(c) && idle.Pool(c), "idle setup");
+        Check(idle.Pool(c) && idle.LiveCount() == 1, "duplicate return changed count");
+        idle.MarkClosed();
+        Check(idle.TakeIdle() == null, "closed idle borrowed");
+        SafetyConnection closing = idle.TakeClosing();
+        Check(closing == c, "close lost idle session");
+        idle.Drop(closing);
+        Check(idle.LiveCount() == 0, "drain count");
+        Console.WriteLine("pool close ordering safe");
+    }
+
+    static async void Main() {
+        Program.Expressions();
+        await Program.Transactions();
+        Program.PoolOrdering();
+    }
+}

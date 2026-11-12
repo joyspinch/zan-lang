@@ -1,0 +1,97 @@
+using System;
+using System.IO;
+
+// Checks the file barrier contract; successful reads do not prove power-loss durability.
+class Program {
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static void FlushExisting(string path) {
+        #if WASM32
+        bool unsupported = false;
+        try { File.FlushToDisk(path); }
+        catch (PlatformNotSupportedException) { unsupported = true; }
+        Program.Require(unsupported, "WebAssembly file flush did not report unsupported");
+        #else
+        File.FlushToDisk(path);
+        #endif
+    }
+
+    static void Main() {
+        string root = "_scratch/conf_file_durable_flush";
+        string payloadPath = root + "/持久 文件.bin";
+        string emptyPath = root + "/empty file.bin";
+        string missingPath = root + "/missing.bin";
+        string movedPath = root + "/renamed.bin";
+        // Refuse to delete an existing fixture that this invocation did not create.
+        Program.Require(!Directory.Exists(root) && !File.Exists(root), "fixture path already exists");
+        try {
+            Directory.CreateDirectory(root);
+            byte[] payload = new byte[8193];
+            for (int i = 0; i < payload.Length; i = i + 1) {
+                payload[i] = (byte)(i % 256);
+            }
+            File.WriteAllBytes(payloadPath, payload);
+            Program.FlushExisting(payloadPath);
+            Program.FlushExisting(payloadPath);
+            byte[] actual = File.ReadAllBytes(payloadPath);
+            Program.Require(actual.Length == payload.Length, "flush changed payload length");
+            for (int i = 0; i < payload.Length; i = i + 1) {
+                Program.Require(actual[i] == payload[i], "flush changed payload bytes");
+            }
+            Console.WriteLine("binary-unicode-preserved");
+
+            File.WriteAllBytes(emptyPath, new byte[0]);
+            Program.FlushExisting(emptyPath);
+            Program.Require(File.Exists(emptyPath) && File.GetSize64(emptyPath) == 0, "empty file changed");
+            Console.WriteLine("empty-preserved");
+
+            bool missingFailed = false;
+            try { File.FlushToDisk(missingPath); }
+            #if WASM32
+            catch (PlatformNotSupportedException) { missingFailed = true; }
+            #else
+            catch (IOException) { missingFailed = true; }
+            #endif
+            Program.Require(missingFailed, "missing file did not report expected failure");
+            Program.Require(!File.Exists(missingPath) && !Directory.Exists(missingPath), "flush created missing path");
+            Console.WriteLine("missing-rejected-without-create");
+
+            bool directoryFailed = false;
+            try { File.FlushToDisk(root); }
+            #if WASM32
+            catch (PlatformNotSupportedException) { directoryFailed = true; }
+            #else
+            catch (IOException) { directoryFailed = true; }
+            #endif
+            Program.Require(directoryFailed && Directory.Exists(root), "directory was not rejected as a file");
+            Console.WriteLine("directory-rejected");
+
+            #if WINDOWS
+            long handle = File.TryLock(payloadPath);
+            Program.Require(handle != 0, "could not take exclusive file lock");
+            try {
+                bool lockedFailed = false;
+                try { File.FlushToDisk(payloadPath); }
+                catch (IOException) { lockedFailed = true; }
+                Program.Require(lockedFailed, "flush ignored exclusive sharing denial");
+            } finally {
+                Program.Require(File.Unlock(handle), "could not release exclusive file lock");
+            }
+            Program.FlushExisting(payloadPath);
+            #endif
+
+            // A completed barrier must not leave a handle blocking rename or deletion.
+            File.Move(payloadPath, movedPath);
+            Program.Require(!File.Exists(payloadPath) && File.Exists(movedPath), "flush retained file handle");
+            File.Delete(movedPath);
+            Program.Require(!File.Exists(movedPath), "flushed file could not be deleted");
+            Console.WriteLine("handles-released");
+        } finally {
+            Program.Require(Directory.DeleteRecursive(root), "could not clean owned fixture");
+            Program.Require(!Directory.Exists(root) && !File.Exists(root), "fixture survived cleanup");
+        }
+        Console.WriteLine("cleaned");
+    }
+}

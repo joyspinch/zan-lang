@@ -178,6 +178,14 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             driver_dir_override = argv[++i];
         } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
             target_name = argv[++i];
+        } else if (strcmp(argv[i], "--cpu-profile") == 0) {
+            if (i + 1 >= argc ||
+                (strcmp(argv[i + 1], "baseline") != 0 && strcmp(argv[i + 1], "avx2") != 0)) {
+                fprintf(stderr, "error: --cpu-profile requires baseline or avx2\n");
+                opts->exit_code = 1;
+                return ZAN_OPTIONS_ERROR;
+            }
+            opts->cpu_profile = argv[++i];
         } else if (strcmp(argv[i], "--list-targets") == 0) {
             const zan_target_info_t *ts;
             int nt = zan_target_list(&ts);

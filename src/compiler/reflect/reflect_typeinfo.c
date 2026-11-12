@@ -76,9 +76,16 @@ static LLVMValueRef refl_arg_str(zan_irgen_t *g, zan_ast_node_t *arg,
     return LLVMBuildBitCast(g->builder, v, i8ptr, "refl.nm");
 }
 
+typedef struct {
+    LLVMValueRef values[ZAN_REFL_ARG_SLOTS];
+    int pushed;
+} refl_arg_temps_t;
+
 static LLVMValueRef refl_pack_args(zan_irgen_t *g, zan_ast_node_t **args,
                                    int argc, int from,
-                                   local_scope_t *locals) {
+                                   local_scope_t *locals,
+                                   refl_arg_temps_t *temps) {
+    memset(temps, 0, sizeof(*temps));
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef slots = LLVMBuildArrayAlloca(g->builder, i64,
         LLVMConstInt(i64, ZAN_REFL_ARG_SLOTS, 0), "refl.args");
@@ -87,12 +94,28 @@ static LLVMValueRef refl_pack_args(zan_irgen_t *g, zan_ast_node_t **args,
         LLVMValueRef p = LLVMBuildGEP2(g->builder, i64, slots, &off, 1,
                                        "refl.as");
         int ai = from + i;
-        LLVMValueRef v = (args && ai < argc)
-            ? refl_to_slot(g, emit_expr(g, args[ai], locals))
-            : LLVMConstInt(i64, 0, 0);
+        LLVMValueRef v = LLVMConstInt(i64, 0, 0);
+        if (args && ai < argc) {
+            LLVMValueRef value = emit_expr(g, args[ai], locals);
+            temps->values[i] = value;
+            /* Reuse normal calls' exception protocol: keep each fresh argument
+             * alive across evaluation of later arguments and the thunk call. */
+            temps->pushed += emit_call_arg_eh_push(g, args[ai], value, locals);
+            v = refl_to_slot(g, value);
+        }
         LLVMBuildStore(g->builder, v, p);
     }
     return slots;
+}
+
+static void refl_release_args(zan_irgen_t *g, zan_ast_node_t **args,
+                              int argc, int from, local_scope_t *locals,
+                              refl_arg_temps_t *temps) {
+    for (int i = 0; i < temps->pushed; i++) emit_eh_tmp_pop(g);
+    for (int i = ZAN_REFL_ARG_SLOTS - 1; i >= 0; i--) {
+        if (args && from + i < argc && temps->values[i])
+            emit_release_owned_call_temp(g, args[from + i], temps->values[i], locals);
+    }
 }
 
 /* `ti */
@@ -170,18 +193,20 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         return true;
     }
     case ZAN_REFL_M_CNEW: {      /* CreateInstance(...) */
-        LLVMValueRef slots = refl_pack_args(g, args, argc, 0, locals);
+        refl_arg_temps_t temps;
+        LLVMValueRef slots = refl_pack_args(g, args, argc, 0, locals, &temps);
         LLVMValueRef idx = zan_call2(g->builder,
             LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
             refl_cfind_fn(g), (LLVMValueRef[]){ ti,
                 LLVMConstInt(i64, (unsigned long long)argc, 0) }, 2, "refl.ci");
         LLVMValueRef kout = LLVMBuildAlloca(g->builder, i64, "refl.nk");
-        LLVMValueRef v = zan_call2(g->builder,
+        LLVMValueRef v = zan_call_or_invoke(g, g->builder,
             LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr,
                                                    i64ptr, i64ptr }, 6, 0),
             refl_invoke_fn(g), (LLVMValueRef[]){ ti,
                 LLVMConstInt(i64, ZAN_REFL_TBL_CTOR, 0), idx,
                 LLVMConstNull(i8ptr), slots, kout }, 6, "refl.new");
+        refl_release_args(g, args, argc, 0, locals, &temps);
         *out = LLVMBuildIntToPtr(g->builder,
             LLVMBuildSelect(g->builder,
                 LLVMBuildICmp(g->builder, LLVMIntEQ,
@@ -450,14 +475,16 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
         code == ZAN_REFL_M_ILONG || code == ZAN_REFL_M_IDOUBLE ||
         code == ZAN_REFL_M_ISTRING || code == ZAN_REFL_M_IOBJECT) {
         LLVMValueRef idx = refl_mfind(g, ti, nm, 0);
-        LLVMValueRef slots = refl_pack_args(g, args, argc, 1, locals);
+        refl_arg_temps_t temps;
+        LLVMValueRef slots = refl_pack_args(g, args, argc, 1, locals, &temps);
         LLVMValueRef kout = LLVMBuildAlloca(g->builder, i64, "refl.ik");
-        LLVMValueRef v = zan_call2(g->builder,
+        LLVMValueRef v = zan_call_or_invoke(g, g->builder,
             LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr,
                                                    i64ptr, i64ptr }, 6, 0),
             refl_invoke_fn(g), (LLVMValueRef[]){ ti,
                 LLVMConstInt(i64, ZAN_REFL_TBL_METHOD, 0), idx, obj, slots,
                 kout }, 6, "refl.iv");
+        refl_release_args(g, args, argc, 1, locals, &temps);
         LLVMValueRef kv = LLVMBuildLoad2(g->builder, i64, kout, "refl.ikv");
         LLVMValueRef called = LLVMBuildICmp(g->builder, LLVMIntNE, kv,
             LLVMConstInt(i64, 0, 0), "refl.icalled");
@@ -609,8 +636,8 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
         if (g->site_coll && g->site_coll[i]) {
             LLVMValueRef fn = get_collection_release_decl(g, i);
             if (fn) dtor = LLVMConstBitCast(fn, i8ptr);
-            const char *cn = g->site_coll[i] == 1 ? "List"
-                           : g->site_coll[i] == 2 ? "StringBuilder" : "Dict";
+            const char *cn = arc_collection_type_name(g, g->site_coll[i],
+                g->site_coll_elem ? g->site_coll_elem[i] : NULL);
             LLVMValueRef nptr[2] = {
                 zan_irgen_intern_string(g, cn),
                 LLVMConstNull(i8ptr) };

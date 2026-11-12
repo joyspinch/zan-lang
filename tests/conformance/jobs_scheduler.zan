@@ -203,7 +203,90 @@ class JobsConformance {
         FileJobStorage fs3 = new FileJobStorage(path);
         Check("compaction keeps the state", fs3.Snapshot().Count == 1);
 
+        JobsConformance.TestCron();
         Console.WriteLine("ok=" + ok + " bad=" + bad);
+    }
+
+    static void TestCron() {
+        string expression = "0 0 13 * 5";
+        CronExpression jobsDays = CronExpression.Parse(expression);
+        CronExpression hostingDays = CronExpression.ParseHosting(expression);
+        DateTime friday = DateTime.FromParts(2026, 11, 6, 0, 0, 0);
+        DateTime friday13 = DateTime.FromParts(2026, 11, 13, 0, 0, 0);
+        Check("jobs and hosting keep distinct day rules", !jobsDays.IsMatching(friday)
+            && jobsDays.IsMatching(friday13) && hostingDays.IsMatching(friday));
+        string dir = "_scratch/jobs_cron_" + Guid.New();
+        Directory.CreateDirectoryRecursive(dir);
+        try {
+            JobsConformance.TestCronStorage(dir + "/store.jsonl", expression);
+        } finally {
+            Check("cron file fixture cleaned", Directory.DeleteRecursive(dir));
+        }
+    }
+
+    static void TestCronStorage(string path, string expression) {
+        InterruptedJobStorage store = new InterruptedJobStorage(path);
+        JobRegistry registry = new JobRegistry();
+        RetryPolicy policy = RetryPolicy.Fixed(2, 60000);
+        CronJobs cron = new CronJobs(store, registry, policy);
+        CancellationToken ct = CancellationToken.None;
+        int calls = 0;
+        registry.Register("cron", (args) => {
+            calls = calls + 1;
+            if (args != "{}") { return JobResult.Fail("wrong args"); }
+            if (calls == 1) { return JobResult.Retry("temporary"); }
+            if (calls == 2) { store.interrupt = true; }
+            return JobResult.Success();
+        });
+        Check("cron schedule stored", cron.Upsert("cron-id", expression, "cron", "{}"));
+        JobRecord planned = cron.Snapshot()[0];
+        DateTime plannedTime = DateTime.FromUnixMilliseconds(planned.runAt);
+        CronExpression expected = CronExpression.Parse(expression);
+        Check("cron uses calendar time without an interval", planned.interval == 0
+            && planned.runAt > DateTime.GetCurrentUnixMilliseconds() && expected.IsMatching(plannedTime));
+        cron.TriggerNow("cron-id");
+        JobWorker ordinaryWorker = new JobWorker(store, registry, policy);
+        Check("ordinary worker leaves cron records alone", ordinaryWorker.ProcessOnce() == 0 && calls == 0);
+        CancellationTokenSource cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        Check("cancelled tick leaves due cron work pending", cron.ProcessOnce(cancelled.Token) == 0 && calls == 0);
+        Check("cron handler runs through registry", cron.ProcessOnce(ct) == 1 && calls == 1);
+        JobRecord failed = cron.Snapshot()[0];
+        Check("cron retry is scheduled durably", failed.state == JobState.Failed
+            && failed.cronRetriesLeft == 1 && failed.cronFails == 1 && failed.error == "temporary"
+            && failed.runAt > DateTime.GetCurrentUnixMilliseconds());
+        cron.TriggerNow("cron-id");
+        bool threw = false;
+        try { cron.ProcessOnce(ct); } catch (IOException e) { threw = true; }
+        Check("completion write failure leaves processing", threw && calls == 2
+            && cron.Snapshot()[0].state == JobState.Processing);
+        Check("cron dispatcher can stop after a failed tick", cron.TryStop());
+
+        CronJobs reopened = new CronJobs(new FileJobStorage(path), registry, policy);
+        JobRecord pending = reopened.Snapshot()[0];
+        Check("file replay preserves cron and in-flight attempt", pending.state == JobState.Processing
+            && pending.attempts == 2 && pending.cronRetriesLeft == 0
+            && pending.cron == expression && !pending.cronHostingDays);
+        Check("reopened cron replays once", reopened.ProcessOnce(ct) == 1 && calls == 3);
+        JobRecord next = reopened.Snapshot()[0];
+        Check("completed replay resumes calendar schedule", next.state == JobState.Scheduled
+            && next.cronRuns == 1 && next.cronFails == 1 && next.error == ""
+            && next.runAt > DateTime.GetCurrentUnixMilliseconds());
+        Check("remove leaves no active cron schedule", reopened.Remove("cron-id")
+            && reopened.Snapshot().Count == 0 && reopened.TryStop());
+        CronJobs removed = new CronJobs(new FileJobStorage(path), registry, policy);
+        Check("removed cron schedule stays removed after replay", removed.Snapshot().Count == 0);
+    }
+}
+
+class InterruptedJobStorage : FileJobStorage {
+    public bool interrupt;
+
+    public InterruptedJobStorage(string path) : base(path) { }
+
+    public override void Append(JobRecord record) {
+        if (this.interrupt) { throw new IOException("interrupted before completion write"); }
+        base.Append(record);
     }
 }
 

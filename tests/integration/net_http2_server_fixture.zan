@@ -1,0 +1,56 @@
+using System;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Net.Http.Hpack;
+using System.Threading;
+
+// HTTP/2 framing, HPACK and flow control belong to the production HttpServer.
+class NetHttp2ServerFixture {
+    static bool stopping = false;
+
+    static byte[] Payload(int size) {
+        byte[] bytes = new byte[size];
+        for (int i = 0; i < size; i = i + 1) { bytes[i] = (byte)((i * 31 + 7) % 256); }
+        return bytes;
+    }
+
+    static async HttpResponse Handle(HttpRequest request) {
+        if (request.path == "/ready") { return HttpResponse.Text("ready"); }
+        if (request.path == "/shutdown") {
+            NetHttp2ServerFixture.stopping = true;
+            return HttpResponse.Text("stopping");
+        }
+        if (request.path == "/binary") {
+            return HttpResponse.Bytes(NetHttp2ServerFixture.Payload(257), 257, "application/octet-stream");
+        }
+        if (request.path == "/large") {
+            return HttpResponse.Bytes(NetHttp2ServerFixture.Payload(100000), 100000, "application/octet-stream");
+        }
+        if (request.path == "/echo") {
+            byte[] bytes = new byte[request.bodyLength];
+            for (int i = 0; i < request.bodyLength; i = i + 1) {
+                bytes[i] = (byte)request.body[i];
+            }
+            return HttpResponse.Bytes(bytes, request.bodyLength, "application/octet-stream");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static int Main() {
+        Socket.Initialize();
+        int port = int.Parse(Environment.GetEnvironmentVariable("ZAN_INTEROP_PORT"));
+        HttpServer server = new HttpServer("127.0.0.1", port);
+        server.OnRequest(NetHttp2ServerFixture.Handle);
+        Task.Spawn(server.Start());
+        // Bounded lifetime also covers a harness crash or a missing shutdown request.
+        for (int tick = 0; tick < 2400 && !NetHttp2ServerFixture.stopping; tick = tick + 1) {
+            await Task.Delay(50);
+        }
+        await Task.Delay(100);
+        server.Stop();
+        await Task.Delay(250);
+        HpackStaticTable.Teardown();
+        HpackHuffman.Teardown();
+        return NetHttp2ServerFixture.stopping ? 0 : 1;
+    }
+}

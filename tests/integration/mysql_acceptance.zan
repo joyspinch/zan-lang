@@ -1,0 +1,501 @@
+using System;
+using System.Data;
+using System.Data.MySql;
+using System.Data.Orm;
+using System.Json;
+using System.IO;
+using System.Threading;
+
+[Table(Name = "acceptance_values")]
+class MySqlAcceptanceValue {
+    [Column(IsPrimary = true)]
+    int id;
+    string body;
+    string empty_value;
+}
+
+class MySqlAcceptance {
+    static string Required(string key) {
+        string value = Environment.GetEnvironmentVariable(key);
+        if (value.Length == 0) { throw new Exception("Missing environment: " + key); }
+        return value;
+    }
+
+    static void Check(bool ok, string detail) {
+        if (!ok) { throw new Exception(detail); }
+    }
+
+    static async MySqlConnection Open() {
+        MySqlConnection c = await MySqlConnection.OpenParamsAsync(
+            MySqlAcceptance.Required("ZAN_MYSQL_HOST"),
+            int.Parse(MySqlAcceptance.Required("ZAN_MYSQL_PORT")),
+            MySqlAcceptance.Required("ZAN_MYSQL_DATABASE"),
+            MySqlAcceptance.Required("ZAN_MYSQL_USER"),
+            MySqlAcceptance.Required("ZAN_MYSQL_PASSWORD"));
+        MySqlAcceptance.Check(c != null, "Open returned null");
+        if (!c.IsConnected()) {
+            string detail = c.GetError();
+            c.Close();
+            throw new Exception("Open failed: " + detail);
+        }
+        return c;
+    }
+
+    static MySqlPool Pool(int size) {
+        return new MySqlPool(MySqlAcceptance.Required("ZAN_MYSQL_HOST"),
+            int.Parse(MySqlAcceptance.Required("ZAN_MYSQL_PORT")),
+            MySqlAcceptance.Required("ZAN_MYSQL_DATABASE"),
+            MySqlAcceptance.Required("ZAN_MYSQL_USER"),
+            MySqlAcceptance.Required("ZAN_MYSQL_PASSWORD"), size);
+    }
+
+    static async bool Parameters(MySqlConnection c) {
+        await c.ExecuteAsync("CREATE TABLE IF NOT EXISTS acceptance_values (id INT PRIMARY KEY, body TEXT NULL, empty_value TEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        string payload = "x'); DROP TABLE acceptance_values; -- \\ \"\n中文 café 😀";
+        DbParams write = new DbParams();
+        write.AddInt(1).Add(payload).Add("");
+        MySqlAcceptance.Check(await c.ExecuteAsync("INSERT INTO acceptance_values VALUES (?, ?, ?)", write) == 1, "parameter insert affected rows");
+        DbParams nullable = new DbParams();
+        nullable.AddInt(2).AddNull().Add("");
+        MySqlAcceptance.Check(await c.ExecuteAsync("INSERT INTO acceptance_values VALUES (?, ?, ?)", nullable) == 1, "NULL insert affected rows");
+        DbResult text = await c.QueryAsync("SELECT body, empty_value FROM acceptance_values ORDER BY id");
+        MySqlAcceptance.Check(text.RowCount() == 2, "text row count");
+        MySqlAcceptance.Check(text.GetString(0, 0) == payload && !text.IsNull(0, 0), "text protocol injection and Unicode round trip");
+        MySqlAcceptance.Check(text.IsNull(1, 0), "text protocol SQL NULL");
+        MySqlAcceptance.Check(!text.IsNull(1, 1) && text.GetString(1, 1) == "", "text protocol empty differs from NULL");
+        DbParams filter = new DbParams();
+        filter.AddInt(0);
+        DbResult binary = await c.QueryAsync("SELECT body, empty_value FROM acceptance_values WHERE id > ? ORDER BY id", filter);
+        MySqlAcceptance.Check(binary.RowCount() == 2, "binary row count");
+        MySqlAcceptance.Check(binary.GetString(0, 0) == payload && !binary.IsNull(0, 0), "binary protocol Unicode and injection round trip");
+        MySqlAcceptance.Check(binary.IsNull(1, 0), "binary protocol SQL NULL");
+        MySqlAcceptance.Check(!binary.IsNull(1, 1) && binary.GetString(1, 1) == "", "binary protocol empty differs from NULL");
+        DbParams match = new DbParams();
+        match.Add(payload);
+        MySqlAcceptance.Check(await c.ExecuteScalarAsync("SELECT COUNT(*) FROM acceptance_values WHERE body = ?", match) == "1", "injection payload remains one literal value");
+        SelectQuery<MySqlAcceptanceValue> typed = new SelectQuery<MySqlAcceptanceValue>(c);
+        typed.WhereEq("body", payload).OrderBy("id");
+        PageResult<MySqlAcceptanceValue> page = await typed.ToPageResultAsync(1, 1);
+        MySqlAcceptance.Check(page.total == 1 && page.items.Count == 1, "async typed ORM page");
+        MySqlAcceptanceValue row = page.items[0];
+        MySqlAcceptance.Check(row.id == 1 && row.body == payload && row.empty_value == "", "async typed ORM mapping and binding");
+        SelectQuery<MySqlAcceptanceValue> nullableRow = new SelectQuery<MySqlAcceptanceValue>(c);
+        nullableRow.WhereEq("id", 2);
+        MySqlAcceptanceValue missing = await nullableRow.FirstAsync();
+        MySqlAcceptance.Check(missing != null && missing.body == null && missing.empty_value == "", "async typed ORM NULL versus empty");
+        await MySqlAcceptance.MutationPredicates(c, payload);
+        MySqlConnection observer = await MySqlAcceptance.Open();
+        try {
+            DbResult persisted = await observer.QueryAsync("SELECT id, body, empty_value FROM acceptance_values ORDER BY id");
+            MySqlAcceptance.Check(persisted.RowCount() == 2
+                && persisted.GetInt(0, 0) == 1 && persisted.GetString(0, 1) == payload
+                && !persisted.IsNull(0, 2) && persisted.GetString(0, 2) == ""
+                && persisted.GetInt(1, 0) == 2 && persisted.IsNull(1, 1)
+                && !persisted.IsNull(1, 2) && persisted.GetString(1, 2) == "", "async Func mutation rollback leaves the original committed rows");
+        } finally { observer.Close(); }
+        return true;
+    }
+
+    static bool MutationReady(MySqlAcceptanceValue row) { return row.body == "ready"; }
+    static bool MutationAllowed(MySqlAcceptanceValue row) { return row.id != 903; }
+    static bool MutationNotWaiting(MySqlAcceptanceValue row) { return row.body != "waiting"; }
+
+    static async void MutationPredicates(MySqlConnection c, string payload) {
+        UnitOfWork uow = await UnitOfWork.CreateAsync(c, false);
+        try {
+            // Each rejected row fails a different filter; the original fixtures remain committed.
+            DbParams rows = new DbParams().AddInt(901).Add("ready").Add(payload)
+                .AddInt(902).Add("waiting").Add(payload).AddInt(903).Add("ready").Add(payload)
+                .AddInt(904).Add("ready").Add("outside");
+            int seeded = await uow.ExecuteAsync("INSERT INTO acceptance_values VALUES (?,?,?), (?,?,?), (?,?,?), (?,?,?)", rows);
+            MySqlAcceptance.Check(seeded == 4, "async Func mutation setup");
+
+            Func<MySqlAcceptanceValue, bool> ready = MySqlAcceptance.MutationReady;
+            Func<MySqlAcceptanceValue, bool> allowed = MySqlAcceptance.MutationAllowed;
+            string updated = payload + " updated";
+            UpdateQuery<MySqlAcceptanceValue> update = uow.Update<MySqlAcceptanceValue>();
+            update.Set("body", updated).WhereEq("empty_value", payload).Where(ready).Where(allowed);
+            MySqlAcceptance.Check(await update.ExecuteAffrowsAsync() == 1, "async Func UPDATE intersects bound SQL and both predicates");
+            string body = await uow.ExecuteScalarAsync("SELECT body FROM acceptance_values WHERE id=?", new DbParams().AddInt(901));
+            MySqlAcceptance.Check(body == updated, "async Func UPDATE bound SET value");
+
+            // Change the matching key so a stale key binding would write the old row again.
+            DbParams swap = new DbParams().AddInt(901).Add("waiting").Add("ready").AddInt(901).AddInt(902);
+            await uow.ExecuteAsync("UPDATE acceptance_values SET body=CASE WHEN id=? THEN ? ELSE ? END WHERE id IN (?,?)", swap);
+            MySqlAcceptance.Check(await update.ExecuteAffrowsAsync() == 1, "reused async Func UPDATE reads a fresh key snapshot");
+            MySqlAcceptance.Check(await update.ExecuteAffrowsAsync() == 0, "async Func UPDATE with no hits changes nothing");
+            body = await uow.ExecuteScalarAsync("SELECT body FROM acceptance_values WHERE id=?", new DbParams().AddInt(902));
+            MySqlAcceptance.Check(body == updated, "reused async Func UPDATE targets the new key");
+
+            Func<MySqlAcceptanceValue, bool> notWaiting = MySqlAcceptance.MutationNotWaiting;
+            DeleteQuery<MySqlAcceptanceValue> remove = uow.Delete<MySqlAcceptanceValue>();
+            remove.WhereEq("empty_value", payload).Where(notWaiting).Where(allowed);
+            MySqlAcceptance.Check(await remove.ExecuteAffrowsAsync() == 1, "async Func DELETE intersects bound SQL and both predicates");
+            MySqlAcceptance.Check(await remove.ExecuteAffrowsAsync() == 0, "reused async Func DELETE has no hits");
+            DbResult remaining = await uow.QueryAsync("SELECT id, body FROM acceptance_values WHERE id >= ? ORDER BY id", new DbParams().AddInt(901));
+            MySqlAcceptance.Check(remaining.RowCount() == 3
+                && remaining.GetInt(0, 0) == 901 && remaining.GetString(0, 1) == "waiting"
+                && remaining.GetInt(1, 0) == 903 && remaining.GetString(1, 1) == "ready"
+                && remaining.GetInt(2, 0) == 904 && remaining.GetString(2, 1) == "ready", "async Func mutations preserve rejected rows");
+            MySqlAcceptance.Check(await uow.RollbackAsync(), "async Func mutation rollback");
+        } finally {
+            if (!uow.rolledBack && c.IsConnected()) { await uow.RollbackAsync(); }
+            uow.Dispose();
+        }
+    }
+
+    static async int Counter(MySqlConnection c, string sql) {
+        DbResult rows = await c.QueryAsync(sql);
+        MySqlAcceptance.Check(rows.RowCount() == 1, "server statement counter missing");
+        return rows.GetInt(0, 1);
+    }
+
+    static async bool PreparedCache(MySqlConnection c) {
+        int prepareBefore = await MySqlAcceptance.Counter(c, "SHOW SESSION STATUS LIKE 'Com_stmt_prepare'");
+        int executeBefore = await MySqlAcceptance.Counter(c, "SHOW SESSION STATUS LIKE 'Com_stmt_execute'");
+        for (int i = 0; i < 8; i = i + 1) {
+            DbParams values = new DbParams();
+            values.AddInt(i).Add("预处理").AddNull().Add("");
+            DbResult row = await c.QueryParamsAsync("SELECT ? AS n, ? AS txt, ? AS nullable_value, ? AS empty_value", values);
+            MySqlAcceptance.Check(row.RowCount() == 1 && row.GetInt(0, 0) == i, "prepared binding changed between executions");
+            MySqlAcceptance.Check(row.GetString(0, 1) == "预处理", "prepared text binding");
+            MySqlAcceptance.Check(row.IsNull(0, 2) && !row.IsNull(0, 3) && row.GetString(0, 3) == "", "prepared null bitmap");
+        }
+        int prepareAfter = await MySqlAcceptance.Counter(c, "SHOW SESSION STATUS LIKE 'Com_stmt_prepare'");
+        int executeAfter = await MySqlAcceptance.Counter(c, "SHOW SESSION STATUS LIKE 'Com_stmt_execute'");
+        MySqlAcceptance.Check(prepareAfter - prepareBefore == 1, "same SQL must prepare once on the server");
+        MySqlAcceptance.Check(executeAfter - executeBefore == 8, "eight actual COM_STMT_EXECUTE commands");
+        return true;
+    }
+
+    static async bool Transaction(MySqlConnection c, string name) {
+        await c.ExecuteAsync("CREATE TABLE IF NOT EXISTS acceptance_tx (id INT PRIMARY KEY) ENGINE=InnoDB");
+        await c.ExecuteAsync("DELETE FROM acceptance_tx");
+        UnitOfWork uow = await UnitOfWork.CreateAsync(c, false);
+        try {
+            await uow.ExecuteAsync("INSERT INTO acceptance_tx VALUES (10)");
+            if (name == "savepoint") {
+                MySqlAcceptance.Check(await uow.CreateSavepointAsync("segment"), "create savepoint");
+                await uow.ExecuteAsync("INSERT INTO acceptance_tx VALUES (20)");
+                MySqlAcceptance.Check(await uow.RollbackToSavepointAsync("segment"), "rollback to savepoint");
+                await uow.ExecuteAsync("INSERT INTO acceptance_tx VALUES (30)");
+                MySqlAcceptance.Check(await uow.ReleaseSavepointAsync("segment"), "release savepoint");
+            }
+            if (name == "rollback") {
+                MySqlAcceptance.Check(await uow.RollbackAsync(), "UoW rollback");
+            } else {
+                MySqlAcceptance.Check(await uow.CommitAsync(), "UoW commit");
+            }
+        } finally {
+            // Async driver requires explicit async completion before synchronous Dispose.
+            if (!uow.committed && !uow.rolledBack && c.IsConnected()) {
+                await uow.RollbackAsync();
+            }
+            uow.Dispose();
+        }
+        // A separate physical connection proves visibility outside the transaction.
+        MySqlConnection observer = await MySqlAcceptance.Open();
+        try {
+            DbResult rows = await observer.QueryAsync("SELECT id FROM acceptance_tx ORDER BY id");
+            int expected = name == "rollback" ? 0 : (name == "savepoint" ? 2 : 1);
+            MySqlAcceptance.Check(rows.RowCount() == expected, "committed row count from independent observer");
+            if (expected > 0) { MySqlAcceptance.Check(rows.GetInt(0, 0) == 10, "first transaction row"); }
+            if (expected == 2) { MySqlAcceptance.Check(rows.GetInt(1, 0) == 30, "savepoint discarded only row 20"); }
+        } finally { observer.Close(); }
+        return true;
+    }
+
+    static async bool StatementRecovery(MySqlConnection c) {
+        bool rejected = false;
+        try { await c.ExecuteAsync("THIS IS DELIBERATELY INVALID SQL"); }
+        catch (DbException ex) {
+            // Expected server error is a tested contract, not a fallback result.
+            rejected = ex.Code == 1064;
+        }
+        MySqlAcceptance.Check(rejected, "text syntax error exposes MariaDB error 1064");
+        MySqlAcceptance.Check(await c.ExecuteScalarAsync("SELECT 41 + 1") == "42", "text command after server error");
+        DbParams values = new DbParams();
+        values.AddInt(1);
+        rejected = false;
+        try { await c.QueryParamsAsync("SELECT ? FROM acceptance_missing_table", values); }
+        catch (DbException) { rejected = true; /* Expected server prepare rejection. */ }
+        MySqlAcceptance.Check(rejected, "prepare error is surfaced");
+        MySqlAcceptance.Check(await c.ExecuteScalarAsync("SELECT ? + 41", values) == "42", "prepared command after prepare rejection");
+        await c.ExecuteAsync("CREATE TEMPORARY TABLE acceptance_unique (id INT PRIMARY KEY) ENGINE=InnoDB");
+        await c.ExecuteAsync("INSERT INTO acceptance_unique VALUES (?)", values);
+        rejected = false;
+        try { await c.ExecuteAsync("INSERT INTO acceptance_unique VALUES (?)", values); }
+        catch (DbException ex) { rejected = ex.Code == 1062; /* Expected duplicate-key execution error. */ }
+        MySqlAcceptance.Check(rejected, "prepared execution reports duplicate key 1062");
+        values = new DbParams();
+        values.AddInt(2);
+        MySqlAcceptance.Check(await c.ExecuteAsync("INSERT INTO acceptance_unique VALUES (?)", values) == 1, "errored prepared SQL can prepare and execute again");
+        MySqlAcceptance.Check(await c.ExecuteScalarAsync("SELECT COUNT(*) FROM acceptance_unique") == "2", "statement error did not lose connection state");
+        return true;
+    }
+
+    static async bool PoolCycle() {
+        MySqlPool pool = MySqlAcceptance.Pool(2);
+        MySqlConnection first = null;
+        MySqlConnection second = null;
+        try {
+            first = await pool.AcquireAsync();
+            second = await pool.AcquireAsync();
+            MySqlAcceptance.Check(first != null && second != null, "pool acquires configured capacity");
+            MySqlAcceptance.Check(pool.LiveCount() == 2 && pool.IdleCount() == 0, "pool capacity accounting");
+            pool.Release(first); first = null;
+            pool.Release(second); second = null;
+            for (int i = 0; i < 24; i = i + 1) {
+                first = await pool.AcquireAsync();
+                MySqlAcceptance.Check(first != null, "pool cycle acquire");
+                DbParams values = new DbParams();
+                values.AddInt(i);
+                DbResult rows = await first.QueryAsync("SELECT ? AS iteration", values);
+                MySqlAcceptance.Check(rows.GetInt(0, 0) == i, "pool query result");
+                pool.Release(first); first = null;
+                MySqlAcceptance.Check(pool.LiveCount() == 2 && pool.IdleCount() == 2, "pool bounded reuse accounting");
+            }
+        } finally {
+            if (first != null) { pool.Release(first); }
+            if (second != null) { pool.Release(second); }
+            pool.Close();
+        }
+        MySqlAcceptance.Check(pool.LiveCount() == 0 && pool.IdleCount() == 0, "pool close drains idle physical connections");
+        MySqlConnection closed = await pool.AcquireAsync();
+        MySqlAcceptance.Check(closed == null, "closed pool rejects acquisition");
+        return true;
+    }
+
+    static async bool PoolFault(MySqlConnection controller) {
+        MySqlPool pool = MySqlAcceptance.Pool(1);
+        MySqlConnection lease = null;
+        try {
+            lease = await pool.AcquireAsync();
+            MySqlAcceptance.Check(lease != null, "fault case acquire");
+            DbResult identity = await lease.QueryAsync("SELECT CONNECTION_ID()");
+            int victim = identity.GetInt(0, 0);
+            MySqlAcceptance.Check(victim > 0, "owned lease connection id");
+            // KILL's target is the integer returned by this owned lease, never external input.
+            await controller.ExecuteAsync("KILL CONNECTION " + Convert.ToString(victim));
+            bool failed = false;
+            try { await lease.QueryAsync("SELECT 1"); }
+            catch (DbException) { failed = true; /* Expected owned server connection termination. */ }
+            MySqlAcceptance.Check(failed && !lease.IsConnected(), "transport failure invalidates lease");
+            pool.Release(lease); lease = null;
+            MySqlAcceptance.Check(pool.LiveCount() == 0, "broken lease returns capacity");
+            lease = await pool.AcquireAsync();
+            MySqlAcceptance.Check(lease != null, "pool replaces killed connection");
+            MySqlAcceptance.Check(await lease.ExecuteScalarAsync("SELECT 42") == "42", "query on replacement physical connection");
+        } finally {
+            if (lease != null) { pool.Release(lease); }
+            pool.Close();
+        }
+        return true;
+    }
+
+    static async bool PoolTransaction(MySqlConnection observer) {
+        await observer.ExecuteAsync("CREATE TABLE IF NOT EXISTS acceptance_pool_tx (id INT PRIMARY KEY) ENGINE=InnoDB");
+        MySqlPool pool = MySqlAcceptance.Pool(1);
+        MySqlConnection lease = null;
+        try {
+            lease = await pool.AcquireAsync();
+            MySqlAcceptance.Check(lease != null, "pool transaction acquire");
+            MySqlAcceptance.Check(await lease.BeginTransactionAsync(), "pool begin");
+            await lease.ExecuteAsync("INSERT INTO acceptance_pool_tx VALUES (1)");
+            pool.Release(lease); lease = null;
+            lease = await pool.AcquireAsync();
+            MySqlAcceptance.Check(lease != null, "pool acquire after asynchronous rollback cleanup");
+            MySqlAcceptance.Check(!lease.inTxn, "returned lease has no open transaction");
+            MySqlAcceptance.Check(await lease.ExecuteScalarAsync("SELECT COUNT(*) FROM acceptance_pool_tx") == "0", "borrower sees rollback");
+            MySqlAcceptance.Check(await observer.ExecuteScalarAsync("SELECT COUNT(*) FROM acceptance_pool_tx") == "0", "independent observer sees no leaked write");
+        } finally {
+            if (lease != null) { pool.Release(lease); }
+            pool.Close();
+        }
+        return true;
+    }
+
+    static string StressPayload(int worker, int iteration) {
+        return "压力 café 😀 '); -- worker=" + Convert.ToString(worker)
+            + ";iteration=" + Convert.ToString(iteration);
+    }
+
+    static async bool Stress(JsonValue report) {
+        int worker = int.Parse(MySqlAcceptance.Required("ZAN_MYSQL_STRESS_WORKER"));
+        int loops = int.Parse(MySqlAcceptance.Required("ZAN_MYSQL_STRESS_LOOPS"));
+        MySqlAcceptance.Check(worker >= 0 && loops > 0, "invalid stress configuration");
+        MySqlPool pool = MySqlAcceptance.Pool(1);
+        MySqlConnection lease = null;
+        int commits = 0;
+        int rollbacks = 0;
+        try {
+            for (int i = 0; i < loops; i = i + 1) {
+                lease = await pool.AcquireAsync();
+                MySqlAcceptance.Check(lease != null, "stress acquire");
+                UnitOfWork uow = await UnitOfWork.CreateAsync(lease, false);
+                try {
+                    DbParams values = new DbParams();
+                    values.AddInt(worker).AddInt(i).AddInt(worker * 100000 + i)
+                        .Add(MySqlAcceptance.StressPayload(worker, i));
+                    MySqlAcceptance.Check(await uow.ExecuteAsync(
+                        "INSERT INTO acceptance_stress (worker, iteration, amount, payload) VALUES (?, ?, ?, ?)", values) == 1,
+                        "stress parameterized insert");
+                    DbParams key = new DbParams();
+                    key.AddInt(worker).AddInt(i);
+                    DbResult own = await uow.QueryAsync(
+                        "SELECT amount, payload FROM acceptance_stress WHERE worker = ? AND iteration = ?", key);
+                    MySqlAcceptance.Check(own.RowCount() == 1 && own.GetInt(0, 0) == worker * 100000 + i,
+                        "transaction reads its own amount");
+                    MySqlAcceptance.Check(own.GetString(0, 1) == MySqlAcceptance.StressPayload(worker, i),
+                        "transaction reads its own Unicode payload");
+                    if (i % 2 == 0) {
+                        MySqlAcceptance.Check(await uow.CommitAsync(), "stress commit");
+                        commits = commits + 1;
+                    } else {
+                        MySqlAcceptance.Check(await uow.RollbackAsync(), "stress rollback");
+                        rollbacks = rollbacks + 1;
+                    }
+                } finally {
+                    // Complete async rollback before synchronous UoW disposal.
+                    if (!uow.committed && !uow.rolledBack && lease.IsConnected()) {
+                        await uow.RollbackAsync();
+                    }
+                    uow.Dispose();
+                }
+                pool.Release(lease); lease = null;
+                MySqlAcceptance.Check(pool.LiveCount() == 1 && pool.IdleCount() == 1,
+                    "stress process-local pool stays bounded");
+            }
+        } finally {
+            if (lease != null) { lease.Close(); pool.Release(lease); }
+            pool.Close();
+        }
+        report.PutInt("worker", worker);
+        report.PutInt("loops", loops);
+        report.PutInt("commits", commits);
+        report.PutInt("rollbacks", rollbacks);
+        report.PutStr("concurrency_scope", "independent_process_and_pool");
+        return true;
+    }
+
+    static async bool Checkpoint(string name) {
+        string root = MySqlAcceptance.Required("ZAN_MYSQL_CHECKPOINT");
+        int timeout = int.Parse(MySqlAcceptance.Required("ZAN_MYSQL_CHECKPOINT_MS"));
+        File.WriteAllText(root + "/" + name + ".ready", "ready");
+        long deadline = Environment.TickCount64 + timeout;
+        while (!File.Exists(root + "/" + name + ".go")) {
+            MySqlAcceptance.Check(Environment.TickCount64 < deadline, "checkpoint deadline: " + name);
+            await Thread.SleepAsync(20);
+        }
+        return true;
+    }
+
+    static async bool RestartSamePool(JsonValue report) {
+        // This exact pool instance and process remain alive across both checkpoints.
+        MySqlPool pool = MySqlAcceptance.Pool(1);
+        MySqlConnection lease = null;
+        try {
+            lease = await pool.AcquireAsync();
+            MySqlAcceptance.Check(lease != null, "pre-restart pool acquire");
+            MySqlAcceptance.Check(await lease.ExecuteScalarAsync("SELECT 42") == "42", "pre-restart query");
+            await MySqlAcceptance.Checkpoint("connected");
+            long failedAt = Environment.TickCount64;
+            bool rejected = false;
+            try { await lease.QueryAsync("SELECT 1"); }
+            catch (DbException) { rejected = true; /* Expected disconnect after owned server stop. */ }
+            MySqlAcceptance.Check(rejected && !lease.IsConnected(), "stopped server invalidates existing lease");
+            pool.Release(lease); lease = null;
+            MySqlAcceptance.Check(pool.LiveCount() == 0, "dead lease returns pool capacity");
+            lease = await pool.AcquireAsync();
+            MySqlAcceptance.Check(lease == null, "same pool returns null while server is stopped");
+            long outageMs = Environment.TickCount64 - failedAt;
+            MySqlAcceptance.Check(outageMs < int.Parse(MySqlAcceptance.Required("ZAN_MYSQL_CHECKPOINT_MS")),
+                "outage failure must be bounded");
+            report.PutInt("outage_failure_ms", outageMs);
+            await MySqlAcceptance.Checkpoint("unavailable");
+            long deadline = Environment.TickCount64 + int.Parse(MySqlAcceptance.Required("ZAN_MYSQL_CHECKPOINT_MS"));
+            int attempts = 0;
+            while (lease == null && Environment.TickCount64 < deadline) {
+                lease = await pool.AcquireAsync();
+                attempts = attempts + 1;
+                if (lease == null) { await Thread.SleepAsync(20); }
+            }
+            MySqlAcceptance.Check(lease != null, "same pool acquires a new physical connection after restart");
+            string identity = await lease.ExecuteScalarAsync("SELECT CURRENT_USER()");
+            MySqlAcceptance.Check(identity == MySqlAcceptance.Required("ZAN_MYSQL_USER") + "@127.0.0.1",
+                "replacement connection reauthenticates");
+            DbParams key = new DbParams();
+            key.AddInt(1);
+            DbResult marker = await lease.QueryAsync("SELECT payload FROM acceptance_restart WHERE id = ?", key);
+            MySqlAcceptance.Check(marker.RowCount() == 1 && marker.GetString(0, 0) == "重启 café 😀",
+                "committed marker survives restart");
+            MySqlAcceptance.Check(await lease.ExecuteScalarAsync("SELECT ? + 41", key) == "42",
+                "same pool supports parameterized query after restart");
+            // Counts completed AcquireAsync calls, including pool backoff returning null;
+            // this is neither a configured cap nor a count of physical TCP attempts.
+            report.PutInt("recovery_acquire_attempts", attempts);
+            pool.Release(lease); lease = null;
+            MySqlAcceptance.Check(pool.LiveCount() == 1 && pool.IdleCount() == 1, "recovered pool accounting");
+        } finally {
+            if (lease != null) { lease.Close(); pool.Release(lease); }
+            pool.Close();
+        }
+        MySqlAcceptance.Check(pool.LiveCount() == 0, "restart pool cleanup");
+        report.PutInt("process_id", Environment.ProcessId);
+        report.PutStr("recovery_scope", "same_process_same_pool_new_physical_connection");
+        return true;
+    }
+
+    static async bool Run(string name) {
+        if (name == "auth_reject") {
+            MySqlConnection bad = await MySqlConnection.OpenParamsAsync(
+                MySqlAcceptance.Required("ZAN_MYSQL_HOST"),
+                int.Parse(MySqlAcceptance.Required("ZAN_MYSQL_PORT")),
+                MySqlAcceptance.Required("ZAN_MYSQL_DATABASE"),
+                MySqlAcceptance.Required("ZAN_MYSQL_USER"),
+                MySqlAcceptance.Required("ZAN_MYSQL_PASSWORD") + "wrong");
+            MySqlAcceptance.Check(bad != null, "auth rejection returns diagnostic connection");
+            try {
+                MySqlAcceptance.Check(!bad.IsConnected() && bad.GetError().Length > 0, "wrong native credential rejected with diagnostic");
+            } finally { bad.Close(); }
+        }
+        MySqlConnection c = await MySqlAcceptance.Open();
+        try {
+            if (name == "native_auth" || name == "auth_reject") {
+                MySqlAcceptance.Check(await c.ExecuteScalarAsync("SELECT 42") == "42", "native login query");
+                string user = await c.ExecuteScalarAsync("SELECT CURRENT_USER()");
+                MySqlAcceptance.Check(user == MySqlAcceptance.Required("ZAN_MYSQL_USER") + "@127.0.0.1", "native account identity");
+                return true;
+            }
+            if (name == "parameters") { return await MySqlAcceptance.Parameters(c); }
+            if (name == "prepared_cache") { return await MySqlAcceptance.PreparedCache(c); }
+            if (name == "commit" || name == "rollback" || name == "savepoint") {
+                return await MySqlAcceptance.Transaction(c, name);
+            }
+            if (name == "statement_recovery") { return await MySqlAcceptance.StatementRecovery(c); }
+            if (name == "pool_cycle") { return await MySqlAcceptance.PoolCycle(); }
+            if (name == "pool_fault_recovery") { return await MySqlAcceptance.PoolFault(c); }
+            if (name == "pool_transaction_cleanup") { return await MySqlAcceptance.PoolTransaction(c); }
+            throw new Exception("Unknown acceptance case: " + name);
+        } finally { c.Close(); }
+    }
+
+    static async void Main() {
+        string name = Environment.GetEnvironmentVariable("ZAN_MYSQL_CASE");
+        JsonValue report = JsonValue.NewObject();
+        report.PutStr("case", name);
+        bool passed = false;
+        try {
+            if (name == "stress") { passed = await MySqlAcceptance.Stress(report); }
+            else if (name == "restart_same_pool") { passed = await MySqlAcceptance.RestartSamePool(report); }
+            else { passed = await MySqlAcceptance.Run(name); }
+            report.PutStr("status", passed ? "pass" : "fail");
+        } catch (Exception ex) {
+            // Fixture process boundary: preserve the failed assertion as a JSON item.
+            report.PutStr("status", "fail");
+            report.PutStr("reason", ex.Message);
+        }
+        Console.WriteLine(report.ToJson());
+        if (!passed) { Environment.Exit(1); }
+    }
+}

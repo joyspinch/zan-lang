@@ -133,6 +133,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (left->kind == TYPE_NULLABLE || right->kind == TYPE_NULLABLE) {
                 zan_type_t *lb = checker_nullable_base(left);
                 zan_type_t *rb = checker_nullable_base(right);
+                if ((lb->kind == TYPE_DECIMAL || rb->kind == TYPE_DECIMAL) &&
+                    type_is_numeric(lb) && type_is_numeric(rb)) {
+                    if (lb->kind == TYPE_FLOAT || lb->kind == TYPE_DOUBLE ||
+                        rb->kind == TYPE_FLOAT || rb->kind == TYPE_DOUBLE) {
+                        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2041,
+                            "cannot apply operator to nullable decimal and floating-point operands -- convert explicitly");
+                        return c->binder->type_error;
+                    }
+                    return zan_binder_make_nullable_type(c->binder, c->binder->type_decimal);
+                }
                 if (type_is_numeric(lb) && type_is_numeric(rb))
                     return left->kind == TYPE_NULLABLE ? left : right;
             }
@@ -323,7 +333,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *operand = zan_checker_check_expr(c, expr->unary.operand);
         switch (expr->unary.op) {
         case TK_MINUS:
-            if (type_is_numeric(operand) || operand->kind == TYPE_CHAR)
+            if (type_is_numeric(operand) || operand->kind == TYPE_CHAR ||
+                (operand->kind == TYPE_NULLABLE && operand->element_type &&
+                 operand->element_type->kind == TYPE_DECIMAL))
                 return operand;
             /* 一元运算符重载：类/结构体上的 static op_sub（1 个形参）。
                重载存不存在由 irgen 判定，这里按二元路径的同一口径把类型
@@ -333,7 +345,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             check_unary_operand_type(c, expr, operand, '-');
             return c->binder->type_error;
         case TK_PLUS:
-            if (type_is_numeric(operand) || operand->kind == TYPE_CHAR)
+            if (type_is_numeric(operand) || operand->kind == TYPE_CHAR ||
+                (operand->kind == TYPE_NULLABLE && operand->element_type &&
+                 operand->element_type->kind == TYPE_DECIMAL))
                 return operand;
             if (operand->kind == TYPE_CLASS || operand->kind == TYPE_STRUCT)
                 return operand;
@@ -357,7 +371,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             return c->binder->type_error;
         case TK_PLUS_PLUS: case TK_MINUS_MINUS:
             check_readonly_incdec(c, expr);
-            if (type_is_numeric(operand)) return operand;
+            if (type_is_numeric(operand) ||
+                (operand->kind == TYPE_NULLABLE && operand->element_type &&
+                 operand->element_type->kind == TYPE_DECIMAL)) return operand;
             return c->binder->type_error;
         default:
             return c->binder->type_error;
@@ -379,7 +395,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             return operand;
         }
         check_readonly_incdec(c, expr);
-        if (type_is_numeric(operand)) return operand;
+        if (type_is_numeric(operand) ||
+            (operand->kind == TYPE_NULLABLE && operand->element_type &&
+             operand->element_type->kind == TYPE_DECIMAL)) return operand;
         return c->binder->type_error;
     }
 
@@ -442,18 +460,22 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * 第 3 实参是 main.c 合成的动作派发器（约定路由的 handler 统一是
          * __AttrRoutes.Dispatch，真正的方法调用按 actionKey 在这里展开成
          * 强类型调用——反射 Invoke 拿不到异步协程句柄，await 不了）。 */
-        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
-            (expr->call.args.count == 1 || expr->call.args.count == 2) &&
-            checker_is_attr_routes(expr->call.callee->member.object) &&
-            expr->call.callee->member.name.len == 8 &&
-            memcmp(expr->call.callee->member.name.str, "Register", 8) == 0) {
+        int route_registration = zan_routes_registration(expr);
+        if (route_registration == 1 &&
+            (expr->call.args.count == 1 || expr->call.args.count == 2)) {
             if (expr->call.args.count == 1) {
                 zan_ast_list_push(&expr->call.args,
                                   checker_synthesize_controllers_array(c, expr->loc),
                                   c->arena);
             }
             zan_ast_list_push(&expr->call.args,
-                              checker_synthesize_dispatcher_ref(c, expr->loc),
+                              checker_synthesize_dispatcher_ref(c, expr->loc, false),
+                              c->arena);
+        } else if (route_registration == 2 && expr->call.args.count == 1) {
+            /* Framework opt-in keeps its own dispatcher; Register(app) must
+             * neither discover these controllers nor overwrite this delegate. */
+            zan_ast_list_push(&expr->call.args,
+                              checker_synthesize_dispatcher_ref(c, expr->loc, true),
                               c->arena);
         }
         zan_type_t *callee_type;
@@ -645,18 +667,61 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 for (int i = 0; i < n; i++) {
                     targs[i] = zan_binder_resolve_type(c->binder, expr->call.type_args.items[i]);
                 }
+                /* Close receiver parameters except names shadowed by the
+                 * method's own parameters, then substitute method arguments. */
+                if (recv && recv->type_args && recv->type_arg_count > 0 &&
+                    recv->sym && recv->sym->decl &&
+                    (recv->sym->decl->kind == AST_CLASS_DECL ||
+                     recv->sym->decl->kind == AST_STRUCT_DECL)) {
+                    zan_ast_list_t *class_tps =
+                        &recv->sym->decl->type_decl.type_params;
+                    if (class_tps->count == recv->type_arg_count) {
+                        zan_type_t **class_args = zan_arena_alloc(c->arena,
+                            sizeof(*class_args) * (size_t)class_tps->count);
+                        for (int i = 0; i < class_tps->count; i++) {
+                            class_args[i] = recv->type_args[i];
+                            zan_istr_t name = class_tps->items[i]->ident.name;
+                            for (int j = 0; j < tps->count; j++) {
+                                zan_istr_t method_name = tps->items[j]->ident.name;
+                                if (name.len == method_name.len &&
+                                    memcmp(name.str, method_name.str, name.len) == 0) {
+                                    class_args[i] = NULL;
+                                    break;
+                                }
+                            }
+                        }
+                        ret = zan_binder_subst_named(c->binder, ret, class_tps,
+                                                     class_args);
+                    }
+                }
                 ret = zan_binder_subst_named(c->binder, ret, tps, targs);
                 no_runtime_warn_arc_return(c, expr, ret);
                 return ret;
             }
         }
 
-        if (typed_overload_changed && called_sym && called_sym->decl &&
-            called_sym->decl->kind == AST_METHOD_DECL) {
+        /* Generic receivers have no call_arg_signature. Type their selected
+         * method even when it is the initial overload, and close its return
+         * type using the type arguments of its declaring class or struct. */
+        zan_ast_list_t *recv_tps = NULL;
+        if (callee_is_method && recv && recv->type_arg_count > 0 &&
+            called_sym && called_sym->parent == recv->sym && recv->sym->decl &&
+            (recv->sym->decl->kind == AST_CLASS_DECL ||
+             recv->sym->decl->kind == AST_STRUCT_DECL)) {
+            zan_ast_list_t *tps = &recv->sym->decl->type_decl.type_params;
+            if (tps->count == recv->type_arg_count)
+                recv_tps = tps;
+        }
+        if (called_sym && called_sym->decl && called_sym->decl->kind == AST_METHOD_DECL &&
+            (typed_overload_changed ||
+             (recv_tps && called_sym->decl->method_decl.type_params.count == 0))) {
             zan_ast_node_t *m = called_sym->decl;
             zan_type_t *ret = m->method_decl.return_type
                 ? zan_binder_resolve_type(c->binder, m->method_decl.return_type)
                 : c->binder->type_void;
+            if (recv_tps)
+                ret = zan_binder_subst_named(c->binder, ret, recv_tps,
+                                             recv->type_args);
             no_runtime_warn_arc_return(c, expr, ret);
             return ret;
         }
@@ -829,7 +894,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
         c->in_assignable_ctx = prev_assign;
         check_readonly_assignment(c, expr);
-        zan_type_t *target = checker_assignment_target_type(c, expr->binary.left);
+        zan_type_t *target = checker_assignment_target_type(c, expr->binary.left, left);
         if (!target && expr->binary.left->kind == AST_INDEX) {
             target = checker_index_set_target(c, expr->binary.left, right);
             if (!target) {

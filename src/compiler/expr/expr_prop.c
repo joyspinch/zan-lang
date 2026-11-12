@@ -17,7 +17,10 @@ zan_symbol_t *property_getter_sym(zan_irgen_t *g, zan_symbol_t *prop) {
     return NULL;
 }
 
-/* 在已求值的接收者上发射属性 getter 方法调用 */
+/* 在已求值的接收者上发射属性 getter 方法调用。
+ * obj_ast describes recv for ownership cleanup, never the property result.
+ * Implicit instance access supplies a borrowed AST_THIS_EXPR; static access
+ * has no receiver and may supply NULL. */
 LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
                                               zan_symbol_t *getter,
                                               zan_type_t *recv_type,
@@ -51,7 +54,9 @@ LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
             const char *cn = "pget";
             /* base.Prop 属性读取：绑定至基类属性 getter 实现 */
             LLVMValueRef result = emit_dispatch_call(g,
-                (is_static || !recv_type) ? NULL : recv_type->sym, getter,
+                (is_static || !recv_type ||
+                 (obj_ast && obj_ast->kind == AST_BASE_EXPR))
+                    ? NULL : recv_type->sym, getter,
                 mfn, mft, args, (int)argc, cn);
             result = coerce_generic_result(g, result, getter, recv_type);
             /* 接收者强引用临时变量生命周期延长契约 */
@@ -124,8 +129,9 @@ void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter,
             if (!is_static) args[argc++] = rval;
             args[argc++] = v;
             /* 裸属性名赋值 Prop = v 降解处理 */
-            emit_dispatch_call(g, (is_static || !recv_type) ? NULL : recv_type->sym,
-                setter, mfn, mft, args, (int)argc, "");
+            emit_dispatch_call(g, (is_static || !recv_type ||
+                (obj_ast && obj_ast->kind == AST_BASE_EXPR))
+                    ? NULL : recv_type->sym, setter, mfn, mft, args, (int)argc, "");
             emit_release_owned_call_temp(g, obj_ast, recv, locals);
             emit_release_owned_call_temp(g, rhs_ast, value, locals);
             return;

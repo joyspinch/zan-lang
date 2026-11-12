@@ -1058,11 +1058,11 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                         if (fsty && (is_rc_managed_type(fsty) || fsty->kind == TYPE_OBJECT) &&
                                             !(fsym->modifiers & MOD_WEAK)) {
                                             /* 绑定值发射结果处理 */
-                                            emit_rc_store_field(g, fsty, fptr, fval,
+                                            emit_rc_store_member(g, fsym, fsty, fptr, fval,
                                                 fval_owned
                                                     ? owned_rhs_marker(g, arg->binary.right->loc)
                                                     : arg->binary.right,
-                                                locals, 0);
+                                                locals);
                                         } else if (fsty && fsty->kind == TYPE_STRUCT &&
                                                    type_contains_collection_rc(g, fsty, 0)) {
                                             emit_struct_field_capture(g, fsty, fptr, fval,

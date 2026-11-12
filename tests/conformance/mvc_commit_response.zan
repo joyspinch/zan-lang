@@ -1,0 +1,168 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Threading;
+using System.Web;
+using Zan.Web;
+using Zan.Web.Core;
+using Zan.Web.Security;
+
+class CommitConnection : IDbConnection {
+    SqliteConnection db;
+    int mode;
+    bool rollbackFails;
+    int rollbacks;
+    bool closed;
+    CommitConnection(int mode, bool rollbackFails) {
+        this.db = SqliteConnection.Open(":memory:");
+        this.db.Execute("CREATE TABLE writes (value INTEGER)");
+        this.mode = mode;
+        this.rollbackFails = rollbackFails;
+    }
+    DbResult Query(string sql) { return this.db.Query(sql); }
+    DbResult Query(string sql, DbParams p) { return this.db.Query(sql, p); }
+    int Execute(string sql) { return this.db.Execute(sql); }
+    int Execute(string sql, DbParams p) { return this.db.Execute(sql, p); }
+    string ExecuteScalar(string sql) { return this.db.ExecuteScalar(sql); }
+    string ExecuteScalar(string sql, DbParams p) { return this.db.ExecuteScalar(sql, p); }
+    async DbResult QueryAsync(string sql) { return await this.db.QueryAsync(sql); }
+    async DbResult QueryAsync(string sql, DbParams p) { return await this.db.QueryAsync(sql, p); }
+    async int ExecuteAsync(string sql) { return await this.db.ExecuteAsync(sql); }
+    async int ExecuteAsync(string sql, DbParams p) { return await this.db.ExecuteAsync(sql, p); }
+    async string ExecuteScalarAsync(string sql) { return await this.db.ExecuteScalarAsync(sql); }
+    async string ExecuteScalarAsync(string sql, DbParams p) { return await this.db.ExecuteScalarAsync(sql, p); }
+    int GetProvider() { return DbProvider.SQLite; }
+    bool IsConnected() { return !this.closed; }
+    void Close() { this.closed = true; }
+    void Dispose() { this.Close(); }
+    void BeginTransaction() { this.db.BeginTransaction(); }
+    void Commit() { this.db.Commit(); }
+    void Rollback() { this.db.Rollback(); }
+    async bool BeginTransactionAsync() { return await this.db.BeginTransactionAsync(); }
+    async bool CommitAsync() {
+        await Task.Delay(1);
+        if (this.mode == 1) { return false; }
+        if (this.mode == 2) { throw new ApiError(409, "commit-rejected", "controlled commit rejection"); }
+        return await this.db.CommitAsync();
+    }
+    async bool RollbackAsync() {
+        this.rollbacks = this.rollbacks + 1;
+        bool ok = await this.db.RollbackAsync();
+        if (this.rollbackFails) { throw new Exception("controlled rollback rejection"); }
+        return ok;
+    }
+}
+
+class CommitConnector : IDbConnector {
+    CommitConnection connection;
+    CommitConnector(CommitConnection connection) { this.connection = connection; }
+    int GetProvider() { return DbProvider.SQLite; }
+    async IDbConnection ConnectAsync() { return this.connection; }
+}
+
+[Route("/api/commit")]
+[Custom(Authorization = CustomAuthorization.None)]
+class CommitController : AppController {
+    static bool cleanupFails;
+    [HttpGet]
+    [Tx]
+    async void Save(string kind) {
+        await this.Held().ExecuteAsync("INSERT INTO writes VALUES (1)");
+        HttpContext c = this.Ctx();
+        c.SetHeader("Access-Control-Allow-Origin", "https://fixture.invalid");
+        c.SetHeader("X-Content-Type-Options", "nosniff");
+        c.SetHeader("Content-Length", "12345");
+        c.SetHeader("Content-Disposition", "attachment; filename=success.txt");
+        c.SetHeader("X-Success", "prepared");
+        c.SetCookie("prepared-session", "fixture", 60);
+        if (kind == "redirect") { c.Redirect("/uncommitted-success"); }
+        else if (kind == "html") { c.Html("<h1>uncommitted-success</h1>"); }
+        else { c.Json("{\"success\":\"uncommitted-success\"}"); }
+    }
+    override void OnDone() {
+        if (CommitController.cleanupFails) { throw new Exception("controlled cleanup rejection"); }
+    }
+}
+
+class Program {
+    static int failures;
+    static AtomicInt served = new AtomicInt(0);
+    static void Check(bool ok, string label) {
+        Console.WriteLine((ok ? "ok " : "FAIL ") + label);
+        if (!ok) { failures = failures + 1; }
+    }
+    static async void Serve(WebApp app, TcpListener listener) {
+        nint socket = await listener.AcceptAsync();
+        if (socket >= 0) { await app.HandleConnection(socket); }
+        long done = served.Increment();
+    }
+    static async string Request(WebApp app, TcpListener listener, string kind) {
+        long before = served.Load();
+        Task.Spawn(Serve(app, listener));
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", 19591, 3000);
+        int sent = await client.SendAsync("GET /api/commit/save?kind=" + kind
+            + " HTTP/1.1\r\nHost: local.test\r\nConnection: close\r\n\r\n");
+        string response = "";
+        for (int i = 0; i < 32; i = i + 1) {
+            string chunk = await client.RecvAsync(8192, 3000);
+            if (chunk.Length == 0) { break; }
+            response = response + chunk;
+        }
+        client.Close();
+        for (int i = 0; i < 100 && served.Load() == before; i = i + 1) { await Task.Delay(10); }
+        return response;
+    }
+    static async void Case(WebApp app, TcpListener listener, string kind, int mode, bool rollbackFails) {
+        CommitConnection connection = new CommitConnection(mode, rollbackFails);
+        DbPool pool = new DbPool(new CommitConnector(connection), 1);
+        AppServices.Use(new AppServices(new DbContext(pool), null));
+        CommitController.cleanupFails = rollbackFails;
+        string label = kind + " mode=" + Convert.ToString(mode) + (rollbackFails ? " rollback-fails" : "");
+        string response = await Request(app, listener, kind);
+        if (mode == 0) {
+            string status = kind == "redirect" ? "302" : "200";
+            Check(response.StartsWith("HTTP/1.1 " + status + " "), label + " success status");
+            Check(response.Contains("uncommitted-success") && response.Contains("prepared-session="), label + " success payload");
+        } else {
+            string status = mode == 2 ? "409" : "500";
+            Check(response.StartsWith("HTTP/1.1 " + status + " "), label + " failure status");
+            Check(!response.Contains("uncommitted-success") && !response.Contains("Location:")
+                && !response.Contains("prepared-session=") && !response.Contains("X-Success:")
+                && !response.Contains("12345") && !response.Contains("Content-Disposition:"), label + " success discarded");
+            Check(response.Contains("application/json") && response.Contains("nosniff")
+                && response.Contains("https://fixture.invalid"), label + " error security headers");
+            Check(connection.rollbacks == 1 && connection.db.ExecuteScalar("SELECT COUNT(*) FROM writes") == "0", label + " database rollback");
+            if (rollbackFails) {
+                Check(response.Contains("commit-rejected") && response.Contains("controlled commit rejection")
+                    && !response.Contains("controlled rollback rejection") && !response.Contains("controlled cleanup rejection")
+                    && connection.closed && pool.LiveCount() == 0, label + " primary error and discard");
+            }
+        }
+        if (mode == 0) { Check(connection.db.ExecuteScalar("SELECT COUNT(*) FROM writes") == "1", label + " database committed"); }
+        AppServices.Use(null);
+        ZanSql.SetProvider(null);
+        ZanSql.SetDefault(null);
+        pool.Close();
+        connection.db.Close();
+    }
+    static async int Main() {
+        Socket.Initialize();
+        WebApp app = new WebApp("127.0.0.1", 19591);
+        __AttrRoutes.Register(app);
+        TcpListener listener = new TcpListener("127.0.0.1", 19591);
+        listener.Start();
+        for (int mode = 0; mode < 3; mode = mode + 1) {
+            await Case(app, listener, "json", mode, false);
+            await Case(app, listener, "redirect", mode, false);
+            await Case(app, listener, "html", mode, false);
+        }
+        await Case(app, listener, "json", 2, true);
+        await listener.StopAsync();
+        app.Dispose();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return failures;
+    }
+}

@@ -7,9 +7,34 @@ partial class Irgen {
     ExprVal GenCast(Node e) {
         ExprVal v = GenExpr(e.b);
         Node tgt = e.type;
+        if (tgt != null && tgt.ival >= 1 && v.ty != null && IsPtrLL(MapType(v.ty))) {
+            string isNull = NT();
+            L("  " + isNull + " = icmp eq " + MapType(v.ty) + " " + v.op + ", null");
+            // Host array casts accept an already array-typed value of the
+            // identical shape. An erased object does not supply a castable
+            // array type in the current language implementation.
+            string matches = "false";
+            if (v.ty.ival >= 1) { matches = ArrayRuntimeTypeTest(v, tgt); }
+            string ok = matches;
+            if (v.ty.ival >= 1 && ArrayTypeKey(v.ty) == ArrayTypeKey(tgt)) {
+                ok = NT(); L("  " + ok + " = or i1 " + isNull + ", " + matches);
+            }
+            int pass = NL(); int fail = NL();
+            L("  br i1 " + ok + ", label %L" + pass + ", label %L" + fail);
+            Label(fail); EmitCastThrow("InvalidCastException: array is not an instance of the target type");
+            Label(pass); term = false;
+            ExprVal result = new ExprVal(Coerce(v, MapType(tgt)), tgt);
+            result.ownerTemp = v.ownerTemp;
+            return result;
+        }
         // a user-defined conversion operator wins over the built-in cast
         ExprVal uc = ApplyUserConv(tgt, v, true);
         if (convApplied) { return uc; }
+        if (IsDecimal(tgt)) { return ToDecimal(v); }
+        if (IsDecimal(v.ty)) {
+            ExprVal converted = new ExprVal(DecimalNumber(v, IsDbl(tgt)), IsDbl(tgt) ? MkType("double") : MkType("long"));
+            return NarrowToDeclared(converted, tgt);
+        }
         bool toD = IsDbl(tgt);
         bool fromD = IsDbl(v.ty);
         // int -> double
@@ -126,7 +151,9 @@ partial class Irgen {
                     L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
                     cv = b;
                 }
-                return new ExprVal(cv, tgt);
+                ExprVal converted = new ExprVal(cv, tgt);
+                converted.ownerTemp = v.ownerTemp;
+                return converted;
             }
         }
         // remaining numeric casts are all i64 in this model; just retag
@@ -290,7 +317,7 @@ partial class Irgen {
     // The merged conditional type: C#'s ?: takes the common promoted type of
     // the two arms -- the host's irgen_promote_pair ladder (TASKS.md A514):
     // decimal over every integer, double over float, float over every
-    // integer, ulong over long, long over int.  A decimal mixed with a
+    // integer, ulong over long, long over nint, nint over int. A decimal mixed with a
     // float/double has no common type and unknown or non-numeric mixes keep
     // the then arm -- the host's "return lt" fallback.
     Node MergeArmTypes(Node a, Node b) {
@@ -303,6 +330,7 @@ partial class Irgen {
         if (an == "float" || bn == "float") { return MkType("float"); }
         if (an == "ulong" || bn == "ulong") { return MkType("ulong"); }
         if (an == "long" || bn == "long") { return MkType("long"); }
+        if (an == "nint" || bn == "nint") { return MkType("nint"); }
         return a;
     }
 
@@ -320,12 +348,8 @@ partial class Irgen {
         } else {
             L("  " + ci + " = icmp ne i64 " + c.op + ", 0");
         }
-        // The merged type is decided before the then arm is coerced.  It is
-        // adopted only when both carriers are plain numeric slots (i64 or
-        // double -- floats ride doubles here), because a decimal travels as a
-        // %Decimal* in this backend and coercing an integer into that phi
-        // would mint a garbage pointer; such mixes keep the then arm, which
-        // is what this backend did before the merge existed.
+        // Resolve promotion before either branch emits its value: decimal
+        // arms carry the same 128-bit aggregate as ordinary decimal locals.
         Node mty = MergeArmTypes(ArmStaticTy(e.b), ArmStaticTy(e.c));
         int lt = NL(); int lf = NL(); int lend = NL();
         L("  br i1 " + ci + ", label %L" + lt + ", label %L" + lf);
@@ -336,7 +360,7 @@ partial class Irgen {
         Node rty = tv.ty;
         if (mty != null && tv.ty != null && mty.sval != tv.ty.sval) {
             string ml = MapType(mty); string tl = MapType(tv.ty);
-            if ((ml == "i64" || ml == "double") && (tl == "i64" || tl == "double")) {
+            if ((ml == "i64" || ml == "double" || ml == DecimalLL()) && (tl == "i64" || tl == "double" || tl == DecimalLL())) {
                 rty = mty;
             }
         }
@@ -535,7 +559,7 @@ partial class Irgen {
         string reg = AddLocal(cse.sval, pty);
         EA(reg, plt);
         if (IsNullableValue(pty)) {
-            L("  store i8* " + BoxFor(subj, pty) + ", i8** " + reg);
+            StoreNullable(reg, subj, pty, false);
             return;
         }
         string sv = Coerce(subj, plt);
@@ -547,6 +571,8 @@ partial class Irgen {
         stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
         ExprVal subj = GenExpr(s.a);
         int lend = NL();
+        Node savedBreakScope = syncFlow.breakScope;
+        syncFlow.breakScope = s;
         int sBrk = brkTarget; int sLoop = loopScopeBase;
         brkTarget = lend; loopScopeBase = locName.Count;
         int nc = s.kids.Count;
@@ -588,6 +614,7 @@ partial class Irgen {
             Node cse = s.kids[i];
             if (i == defIdx) { i = i + 1; continue; }
             int scopeStart = locName.Count;
+            syncFlow.localScopes.Add(cse.b); syncFlow.localScopeStarts.Add(scopeStart);
             string c = NT();
             if (cse.ival == 1) {
                 // pattern section: `case T x [when g]:` or `case null:`
@@ -621,7 +648,11 @@ partial class Irgen {
                 ExprVal gv = GenExpr(cse.c);
                 string gi = NT();
                 L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
-                L("  br i1 " + gi + ", label %L" + bodyL[i] + ", label %L" + nextL[i]);
+                int rejected = NL();
+                L("  br i1 " + gi + ", label %L" + bodyL[i] + ", label %L" + rejected);
+                Label(rejected);
+                ReleaseLocalsFrom(scopeStart);
+                L("  br label %L" + nextL[i]);
             } else {
                 L("  br i1 " + c + ", label %L" + matchL[i] + ", label %L" + nextL[i]);
                 Label(matchL[i]);
@@ -630,6 +661,9 @@ partial class Irgen {
             }
             Label(bodyL[i]);
             if (!SwitchCaseHasBody(cse)) {
+                // This section's binding does not escape into the next one.
+                ReleaseLocalsFrom(scopeStart);
+                TrimLocals(scopeStart);
                 // empty section: fall through into the next section with a body
                 if (fallTo[i] >= 0) { L("  br label %L" + entryL[fallTo[i]]); }
                 else if (defIdx >= 0 && SwitchCaseHasBody(s.kids[defIdx])) { L("  br label %L" + bodyL[defIdx]); }
@@ -640,6 +674,8 @@ partial class Irgen {
                 term = false;
                 TrimLocals(scopeStart);
             }
+            syncFlow.localScopes.RemoveAt(syncFlow.localScopes.Count - 1);
+            syncFlow.localScopeStarts.RemoveAt(syncFlow.localScopeStarts.Count - 1);
             Label(nextL[i]);
             i = i + 1;
         }
@@ -655,6 +691,7 @@ partial class Irgen {
             L("  br label %L" + lend);
         }
         Label(lend);
+        syncFlow.breakScope = savedBreakScope;
         brkTarget = sBrk; loopScopeBase = sLoop;
     }
 
@@ -701,7 +738,11 @@ partial class Irgen {
                     ExprVal gv = GenExpr(arm.c);
                     string gi = NT();
                     L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
-                    L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
+                    int rejected = NL();
+                    L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + rejected);
+                    Label(rejected);
+                    ReleaseLocalsFrom(armScope);
+                    L("  br label %L" + nextL);
                 } else {
                     L("  br label %L" + bodyL);
                 }
@@ -750,7 +791,9 @@ partial class Irgen {
             ExprVal rv = GenExpr(arm.b);
             resLL = MapType(rv.ty);
             resTy = rv.ty;
-            vals.Add(Coerce(rv, resLL));
+            string result = Coerce(rv, resLL);
+            EmitArcRetain(result, resTy);
+            vals.Add(result);
             labs.Add(curLbl);
             ReleaseLocalsFrom(armScope);
             TrimLocals(armScope);
@@ -762,7 +805,7 @@ partial class Irgen {
         string fbLbl = curLbl;
         Label(nend);
         string t = NT();
-        string zero = "0"; if (resLL == "i8*") { zero = "null"; }
+        string zero = ZeroConst(resLL);
         string phi = t + " = phi " + resLL;
         int j = 0;
         while (j < vals.Count) {
@@ -773,7 +816,9 @@ partial class Irgen {
         if (vals.Count > 0) { phi = phi + ", [ " + zero + ", %" + fbLbl + " ]"; }
         else { phi = phi + " [ " + zero + ", %" + fbLbl + " ]"; }
         L("  " + phi);
+        EmitTempReleases();
         stmtTemps = svT; stmtTempTypes = svTT;
+        AddTemp(t, resTy);
         return new ExprVal(t, resTy);
     }
 

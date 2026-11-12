@@ -1030,14 +1030,15 @@ EXPORT i32 zan_gui_set_render_backend(i32 mode) {
 #else
         if (zan_gui_internal_gl_install()) be = &zan_gl_backend;
 #endif
-    } else {
-        zan_gui_internal_set_backend(NULL);
     }
+    zan_gui_internal_set_backend(be);
     for (int i = 0; i < g_surface_count; i++) {
         zan_surface_t *s = g_surfaces[i];
         if (!s || s->be == be) continue;
         if (s->be && s->be->flush) s->be->flush(s);
         if (s->be && s->be->read_pixels) s->be->read_pixels(s);
+        if (s->be && s->be->drop_surface) s->be->drop_surface(s);
+        zan_cache_drop_surface(s->id);
         s->be = be;
     }
     if (!be) {

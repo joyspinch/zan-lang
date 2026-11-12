@@ -60,7 +60,7 @@ partial class Irgen {
     // ---- the coroutine's exception plumbing ----
     //
     // The exception-handler stack (@__exc_sp / @__exc_stack / @__exc_bufs)
-    // is global, but a handler may only be longjmp-ed into while the
+    // is thread-local. A handler may only be longjmp-ed into while the
     // invocation that armed it is still on the stack: a coroutine that
     // suspends kills its invocation, and a longjmp into that dead frame
     // is what made `try { await X(); } catch` die with 0xC0000028.
@@ -84,11 +84,17 @@ partial class Irgen {
         string sp0 = NT(); L("  " + sp0 + " = load i64, i64* @__exc_sp");
         L("  store i64 " + sp0 + ", i64* " + ed);
         asyncEhDepth = ed;
+        string parentOwner = NT();
+        L("  " + parentOwner + " = load i8*, i8** @zexc_owners");
+        string parentBits = ToI64(parentOwner, "i8*");
+        L("  store i64 " + parentBits + ", i64* " + FrameGep("%ff", 19));
+        L("  store i8* null, i8** @zexc_owners");
         string sp = NT(); L("  " + sp + " = load i64, i64* @__exc_sp");
         string bufe = NT(); L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
         string bufp = NT(); L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
         string slot = NT(); L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
         L("  store i8* " + bufp + ", i8** " + slot);
+        EmitPendingHandlerMark(sp);
         string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
         L("  store i64 " + sp1 + ", i64* @__exc_sp");
         string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* null)");
@@ -98,6 +104,10 @@ partial class Irgen {
         asyncTrampLbl = ltr;
         L("co.pre:");
         term = false; curLbl = "co.pre";
+        string savedOwners = NT();
+        L("  " + savedOwners + " = load i64, i64* " + FrameGep("%ff", 18));
+        string ownerPtr = FromI64(savedOwners, "i8*");
+        L("  store i8* " + ownerPtr + ", i8** @zexc_owners");
     }
     // The invocation suspends: drop every handler it armed (the trampoline
     // included) so the next coroutine starts from a clean stack. The
@@ -107,6 +117,12 @@ partial class Irgen {
         if (asyncEhDepth == "") { return; }
         string edv = NT(); L("  " + edv + " = load i64, i64* " + asyncEhDepth);
         L("  store i64 " + edv + ", i64* @__exc_sp");
+        string owners = NT(); L("  " + owners + " = load i8*, i8** @zexc_owners");
+        string ownerBits = ToI64(owners, "i8*");
+        L("  store i64 " + ownerBits + ", i64* " + FrameGep("%ff", 18));
+        string parentBits = NT(); L("  " + parentBits + " = load i64, i64* " + FrameGep("%ff", 19));
+        string parent = FromI64(parentBits, "i8*");
+        L("  store i8* " + parent + ", i8** @zexc_owners");
     }
     // Arm the handlers of the try blocks that enclose this point again.
     // The setjmp that armed them ran in an invocation that has returned
@@ -127,6 +143,16 @@ partial class Irgen {
             string bufp = NT(); L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
             string slot = NT(); L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
             L("  store i8* " + bufp + ", i8** " + slot);
+            string pendingMark = NT(); string pendingMarkSlot = NT();
+            L("  " + pendingMark + " = load i8*, i8** @zpending_top");
+            L("  " + pendingMarkSlot + " = getelementptr [64 x i8*], [64 x i8*]* @zpending_marks, i64 0, i64 " + sp);
+            L("  store i8* " + pendingMark + ", i8** " + pendingMarkSlot);
+            string savedMarkBits = NT();
+            L("  " + savedMarkBits + " = load i64, i64* " + FrameGep("%ff", asyncOwnerMarkBase + i + 1));
+            string savedMark = FromI64(savedMarkBits, "i8*");
+            string markSlot = NT();
+            L("  " + markSlot + " = getelementptr [64 x i8*], [64 x i8*]* @zexc_marks, i64 0, i64 " + sp);
+            L("  store i8* " + savedMark + ", i8** " + markSlot);
             string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
             L("  store i64 " + sp1 + ", i64* @__exc_sp");
             string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* null)");
@@ -163,9 +189,15 @@ partial class Irgen {
     void EmitAsyncSaveSlots() {
         int i = 0;
         while (i < asyncSlotReg.Count) {
+            if (IsDirectAsyncLocal(asyncSlotReg[i])) { i = i + 1; continue; }
             string lt = MapType(asyncSlotTy[i]);
             string v = NT();
             L("  " + v + " = load " + lt + ", " + lt + "* " + asyncSlotReg[i]);
+            if (IsDecimal(asyncSlotTy[i])) {
+                DecimalFrameStore("%ff", asyncSlotIdx[i], v);
+                i = i + 1;
+                continue;
+            }
             string vi = ToI64(v, lt);
             string p = FrameGep("%ff", asyncSlotIdx[i]);
             L("  store i64 " + vi + ", i64* " + p);
@@ -184,11 +216,14 @@ partial class Irgen {
     void EmitAsyncReloadSlots() {
         int i = 0;
         while (i < asyncSlotReg.Count) {
+            if (IsDirectAsyncLocal(asyncSlotReg[i])) { i = i + 1; continue; }
             string lt = MapType(asyncSlotTy[i]);
             string p = FrameGep("%ff", asyncSlotIdx[i]);
             string vi = NT();
             L("  " + vi + " = load i64, i64* " + p);
-            string v = FromI64(vi, lt);
+            string v;
+            if (IsDecimal(asyncSlotTy[i])) { v = DecimalFrameLoad("%ff", asyncSlotIdx[i]).op; }
+            else { v = FromI64(vi, lt); }
             L("  store " + lt + " " + v + ", " + lt + "* " + asyncSlotReg[i]);
             i = i + 1;
         }
@@ -665,9 +700,15 @@ partial class Irgen {
         if (cn == "Gate" && mn == "Park") {
             // event-driven wait: the frame is re-readied by zan_gate_signal
             string gh = ArgI64(callExpr.kids[0]);
+            string gt = "";
+            if (callExpr.kids.Count == 2) { gt = ArgI64(callExpr.kids[1]); }
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
-            L("  call void @zan_gate_park(i64 " + gh + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            if (callExpr.kids.Count == 2) {
+                L("  call void @zan_gate_park_ticket(i64 " + gh + ", i64 " + gt + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            } else {
+                L("  call void @zan_gate_park(i64 " + gh + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            }
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");

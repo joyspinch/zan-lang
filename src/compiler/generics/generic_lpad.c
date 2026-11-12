@@ -58,13 +58,21 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         }
         return expr_yields_owned_rc_value(g, e->cast.expr, locals);
     }
+    /* A successful reference `as` transfers its operand's owned reference;
+     * the emitter releases that reference itself on a failed type check. */
+    if (e->kind == AST_AS_EXPR)
+        return expr_yields_owned_rc_value(g, e->type_test.expr, locals);
     if (e->kind == AST_POSTFIX_UNARY && e->unary.op == TK_BANG)
         return expr_yields_owned_rc_value(g, e->unary.operand, locals);
     if (e->kind == AST_TUPLE_EXPR) return 1;
-    if (e->kind == AST_IDENTIFIER && g->current_type_sym && g->current_this &&
+    if (e->kind == AST_IDENTIFIER && g->current_type_sym &&
         !(locals && local_find(locals, e->ident.name))) {
         zan_symbol_t *bfs = get_field_sym(g->current_type_sym, e->ident.name);
-        if (bfs && bfs->kind == SYM_FIELD &&
+        /* Bare custom properties emit getter calls just like this.Prop or
+         * Type.Prop. Their results are owned; auto-properties/fields remain
+         * borrowed, and a local with the same name takes precedence. */
+        if (property_getter_sym(g, bfs)) return 1;
+        if (g->current_this && bfs && bfs->kind == SYM_FIELD &&
             !(bfs->modifiers & MOD_STATIC) && (bfs->modifiers & MOD_WEAK))
             return 1;
     }
@@ -75,6 +83,19 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
             if (get_method_sym(ot->sym, op_istr)) return 1;
         }
         if (expr_index_of_owned_temp(g, e, locals)) return 1;
+    }
+    if (e->kind == AST_MEMBER_ACCESS && e->member.object &&
+        e->member.object->kind == AST_IDENTIFIER &&
+        !(locals && local_find(locals, e->member.object->ident.name))) {
+        /* Match emit_expr_member_access: a type-qualified static load does not
+         * evaluate an inherited field/property with the same receiver name.
+         * Static fields are borrowed; custom getter results remain owned. */
+        zan_symbol_t *cs = zan_binder_lookup(g->binder, e->member.object->ident.name);
+        if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+            zan_symbol_t *fs = get_field_sym(cs, e->member.name);
+            if (fs && (fs->modifiers & MOD_STATIC))
+                return property_getter_sym(g, fs) != NULL;
+        }
     }
     if (e->kind == AST_MEMBER_ACCESS && expr_member_of_owned_temp(g, e, locals))
         return 1;
@@ -275,6 +296,7 @@ static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
 int call_arg_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                   zan_type_t *at, local_scope_t *locals) {
     if (!arg) return 0;
+    if (irgen_expr_was_boxed(g, arg)) return 1;
     if (expr_is_local_ident(arg, locals)) return 0;
     if (irgen_is_tree_lambda(g, arg)) return 1;
     if (expr_yields_delegate_value(g, arg, locals)) return 1;
@@ -354,6 +376,15 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g,
     int argc = call->call.args.count;
     LLVMValueRef *call_args = (LLVMValueRef *)calloc(
         (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+    /* The callee is borrowed from its local/field slot. Argument evaluation
+     * or the callback may overwrite that last owner, so keep the selected
+     * delegate alive until the invocation and argument cleanup finish. */
+    emit_closure_retain(g, fn_ptr);
+    int eh_pushed = 0;
+    if (!g->current_fn_no_runtime) {
+        emit_eh_tmp_push_slot(g, fn_ptr, ZAN_EH_SLOT_DLG);
+        eh_pushed = 1;
+    }
     for (int k = 0; k < argc; k++) {
         call_args[k] = emit_expr(
             g, call->call.args.items[k], locals);
@@ -372,6 +403,8 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g,
         emit_release_owned_call_temp(
             g, call->call.args.items[k], call_args[k], locals);
     }
+    if (eh_pushed) emit_eh_tmp_pop(g);
+    emit_closure_release(g, fn_ptr);
     free(call_args);
     free(param_types);
     return result;
@@ -652,6 +685,8 @@ void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *locals, int 
         } else if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
+            /* An enclosing landing pad may still visit this slot after a jump. */
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), locals->vars[i].alloca);
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
         }
     }
@@ -739,13 +774,20 @@ void emit_release_obj_value(zan_irgen_t *g, LLVMValueRef cur) {
     if (LLVMTypeOf(cur) != i8ptr)
         cur = LLVMBuildBitCast(g->builder, cur, i8ptr, "obj.rbc");
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef tag = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.tag");
+    LLVMBasicBlockRef clo = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.crel");
     LLVMBasicBlockRef probe = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.probe");
     LLVMBasicBlockRef sbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.srel");
     LLVMBasicBlockRef obb = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.orel");
     LLVMBasicBlockRef cbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.rdone");
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, cur, LLVMConstNull(i8ptr), "obj.rnull"),
-        cbb, probe);
+        cbb, tag);
+    LLVMPositionBuilderAtEnd(g->builder, tag);
+    LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, cur), clo, probe);
+    LLVMPositionBuilderAtEnd(g->builder, clo);
+    emit_closure_release(g, cur);
+    LLVMBuildBr(g->builder, cbb);
     LLVMPositionBuilderAtEnd(g->builder, probe);
     LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
     LLVMValueRef hp = LLVMBuildGEP2(g->builder, i8t, cur, &neg8, 1, "obj.hp");
@@ -772,20 +814,22 @@ void emit_release_obj_local(zan_irgen_t *g, local_var_t *v) {
     LLVMBuildCondBr(g->builder, owns, rel, cont);
     LLVMPositionBuilderAtEnd(g->builder, rel);
     LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, v->alloca, "obj.cur");
-    emit_release_obj_value(g, cur);
+    /* Disarm before destruction: enclosing cleanup may visit the same slot. */
     LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), v->obj_rc_flag);
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), v->alloca);
+    emit_release_obj_value(g, cur);
     LLVMBuildBr(g->builder, cont);
     LLVMPositionBuilderAtEnd(g->builder, cont);
 }
 
 static int obj_slot_owns_value(zan_type_t *t) {
-    return t && is_arc_managed_type(t);
+    return t && (is_arc_managed_type(t) || t->kind == TYPE_OBJECT);
 }
 
 static int obj_slot_owns_owned_rhs(zan_irgen_t *g, zan_ast_node_t *rhs,
                                    LLVMValueRef val, local_scope_t *locals) {
     if (!rhs || !val || !locals) return 0;
+    if (irgen_expr_was_boxed(g, rhs)) return 1;
     if (LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return 0;
     zan_type_t *rt = infer_expr_type(g, rhs, locals);
     if (!rt || (rt->kind != TYPE_OBJECT && rt->kind != TYPE_STRING)) return 0;
@@ -796,17 +840,19 @@ void emit_obj_local_store(zan_irgen_t *g, local_var_t *v, LLVMValueRef val,
                                  local_scope_t *locals) {
     LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    val = emit_implicit_box(g, v->type, val, rhs, locals);
     int owns = obj_slot_owns_value(vtype) ||
                obj_slot_owns_owned_rhs(g, rhs, val, locals);
     if (owns || v->obj_rc_flag) obj_rc_flag_slot(g, v);
-    emit_release_obj_local(g, v);
     if (owns) {
         if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind &&
             LLVMTypeOf(val) != i8ptr)
             val = LLVMBuildBitCast(g->builder, val, i8ptr, "obj.bc");
         if (!expr_yields_owned_rc_value(g, rhs, locals))
-            emit_arc_retain(g, val);
+            emit_retain_obj_value(g, val);
     }
+    /* Retain first: the source may alias the destination being replaced. */
+    emit_release_obj_local(g, v);
     zan_store_fit(g, val, v->alloca);
     if (v->obj_rc_flag)
         LLVMBuildStore(g->builder, LLVMConstInt(i1, owns ? 1 : 0, 0),
@@ -884,4 +930,32 @@ void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
         g->current_type_sym->type->kind == TYPE_STRUCT && !is_weak) {
         emit_eh_tmp_push_slot(g, v, eh_slot_kind_of(type));
     }
+}
+
+int field_is_binding_target(zan_symbol_t *field) {
+    return field && field->kind == SYM_FIELD && field->parent &&
+        type_is_binding(field->parent->type) &&
+        field->name.len == 6 && memcmp(field->name.str, "target", 6) == 0;
+}
+/* Binding.target is a borrowed slot in both synthesized and explicit bindings.
+ * Its destructor deliberately skips target; retaining here would leak the owner.
+ * Unlike tracked weak class fields this object slot does not auto-null on death. */
+void emit_rc_store_member(zan_irgen_t *g, zan_symbol_t *field,
+                          zan_type_t *type, LLVMValueRef field_ptr,
+                          LLVMValueRef value, zan_ast_node_t *rhs,
+                          local_scope_t *locals) {
+    if (field_is_binding_target(field)) {
+        if (expr_yields_owned_rc_value(g, rhs, locals)) {
+            zan_diag_emit_code(g->diag, DIAG_ERROR,
+                rhs ? rhs->loc : field->decl->loc, 3105,
+                "Binding.target is non-owning and cannot reference an owned "
+                "temporary; keep the target in an owning local or field");
+            return;
+        }
+        /* Neither acquire the new borrow nor release the previous borrow. */
+        zan_store_fit(g, value, field_ptr);
+        return;
+    }
+    emit_rc_store_field(g, type, field_ptr, value, rhs, locals,
+        field && (field->modifiers & MOD_WEAK) ? 1 : 0);
 }

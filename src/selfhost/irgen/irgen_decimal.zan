@@ -1,0 +1,276 @@
+using System;
+namespace Zan;
+
+partial class Irgen {
+    // Match zan_decimal_t: flags, high coefficient word, low coefficient words.
+    string DecimalLL() { return "{ i32, i32, i64 }"; }
+    bool IsDecimal(Node ty) {
+        return ty != null && ty.sval == "decimal" && ty.ival == 0 && !IsNullable(ty);
+    }
+
+    string DecimalNativeReturn(string sym, string fallback) {
+        if (sym == "__zan_decimal_parse") { return "i1"; }
+        if (sym == "__zan_decimal_cmp" || sym == "__zan_decimal_to_string") { return "i32"; }
+        return fallback;
+    }
+
+    void DeclareDecimalExtern(string sym, Node m) {
+        string args = "";
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                if (args != "") { args = args + ", "; }
+                args = args + MapType(p.type);
+                if (p.ival == 1) { args = args + "*"; }
+            }
+            i = i + 1;
+        }
+        DecimalDeclare(sym, DecimalNativeReturn(sym, MapType(m.type)), args);
+    }
+
+    void DecimalDeclare(string name, string ret, string args) {
+        if (ExternSeen(name)) { return; }
+        externDecls.Add(name);
+        H("declare " + ret + " @" + name + "(" + args + ")");
+    }
+
+    string DecimalPlace(string value) {
+        string p = NT();
+        EA(p, DecimalLL());
+        L("  store " + DecimalLL() + " " + value + ", " + DecimalLL() + "* " + p);
+        return p;
+    }
+
+    ExprVal DecimalLoad(string p) {
+        string v = NT();
+        L("  " + v + " = load " + DecimalLL() + ", " + DecimalLL() + "* " + p);
+        return new ExprVal(v, MkType("decimal"));
+    }
+
+    ExprVal DecimalLiteral(Node e) {
+        // Parse the source text without a binary floating point intermediate,
+        // exactly as the host's literal evaluator uses zan_decimal_parse.
+        string p = DecimalPlace("zeroinitializer");
+        string text = RawCString(e.sval);
+        DecimalDeclare("__zan_decimal_parse", "i1", "i8*, i64, " + DecimalLL() + "*");
+        string ok = NT();
+        L("  " + ok + " = call i1 @__zan_decimal_parse(i8* " + text
+            + ", i64 " + e.sval.Length + ", " + DecimalLL() + "* " + p + ")");
+        return DecimalLoad(p);
+    }
+
+    ExprVal ToDecimal(ExprVal v) {
+        if (IsDecimal(v.ty)) { return v; }
+        string p = DecimalPlace("zeroinitializer");
+        string fn = "__zan_decimal_from_int64";
+        string argTy = "i64";
+        if (IsDbl(v.ty)) { fn = "__zan_decimal_from_double"; argTy = "double"; }
+        else if (IsUlong(v.ty)) { fn = "__zan_decimal_from_uint64"; }
+        DecimalDeclare(fn, "void", argTy + ", " + DecimalLL() + "*");
+        L("  call void @" + fn + "(" + argTy + " " + v.op + ", " + DecimalLL() + "* " + p + ")");
+        return DecimalLoad(p);
+    }
+
+    string DecimalNumber(ExprVal v, bool floating) {
+        string p = DecimalPlace(v.op);
+        string fn = floating ? "__zan_decimal_to_double" : "__zan_decimal_to_int64";
+        string rt = floating ? "double" : "i64";
+        DecimalDeclare(fn, rt, DecimalLL() + "*");
+        string r = NT();
+        L("  " + r + " = call " + rt + " @" + fn + "(" + DecimalLL() + "* " + p + ")");
+        return r;
+    }
+
+    ExprVal DecimalBinary(int op, ExprVal a, ExprVal b, Node at) {
+        a = ToDecimal(a); b = ToDecimal(b);
+        string ap = DecimalPlace(a.op); string bp = DecimalPlace(b.op);
+        string ptr = DecimalLL() + "*";
+        string cmp = CmpOp(op);
+        if (cmp != "") {
+            DecimalDeclare("__zan_decimal_cmp", "i32", ptr + ", " + ptr);
+            string c = NT();
+            L("  " + c + " = call i32 @__zan_decimal_cmp(" + ptr + " " + ap + ", " + ptr + " " + bp + ")");
+            string pred = NT();
+            L("  " + pred + " = icmp " + cmp + " i32 " + c + ", 0");
+            string r = NT();
+            L("  " + r + " = zext i1 " + pred + " to i64");
+            return new ExprVal(r, MkType("bool"));
+        }
+        if (op == TK.Slash() || op == TK.Percent()) {
+            ExprVal z = new ExprVal("zeroinitializer", MkType("decimal"));
+            ExprVal eq = DecimalBinary(TK.EqEq(), b, z, at);
+            string pred = NT();
+            L("  " + pred + " = icmp ne i64 " + eq.op + ", 0");
+            EmitRuntimeCheckIf(at, pred, "division by zero");
+        }
+        string suffix = "add";
+        if (op == TK.Minus()) { suffix = "sub"; }
+        if (op == TK.Star()) { suffix = "mul"; }
+        if (op == TK.Slash()) { suffix = "div"; }
+        if (op == TK.Percent()) { suffix = "rem"; }
+        string fn = "__zan_decimal_" + suffix;
+        DecimalDeclare(fn, "void", ptr + ", " + ptr + ", " + ptr);
+        string outp = DecimalPlace("zeroinitializer");
+        L("  call void @" + fn + "(" + ptr + " " + ap + ", " + ptr + " " + bp + ", " + ptr + " " + outp + ")");
+        return DecimalLoad(outp);
+    }
+
+    bool DecimalValueType(Node ty) {
+        return ty != null && ty.sval == "decimal" && ty.ival == 0;
+    }
+
+    bool DecimalLiftNeeded(Node a, Node b) {
+        return (DecimalValueType(a) || DecimalValueType(b))
+            && (IsNullableValue(a) || IsNullableValue(b))
+            && !(IsStr(a) || IsStr(b));
+    }
+
+    // Only call after the has-value branch; nullable handles are not numbers.
+    ExprVal DecimalLiftPayload(ExprVal v) {
+        if (v.op == "null") { return new ExprVal("zeroinitializer", MkType("decimal")); }
+        if (!IsNullableValue(v.ty)) { return v; }
+        string lt = UnderLL(v.ty);
+        string p = NT(); string value = NT();
+        L("  " + p + " = bitcast i8* " + v.op + " to " + lt + "*");
+        L("  " + value + " = load " + lt + ", " + lt + "* " + p);
+        return new ExprVal(value, MkType(v.ty.sval));
+    }
+
+    // Operands have already been evaluated left-to-right exactly once.
+    // A null b denotes unary negation; arithmetic null propagation is eager
+    // in operand evaluation, but payload loads and division guards are lazy.
+    ExprVal DecimalLifted(int op, ExprVal a, ExprVal b, Node at) {
+        string hasA = "1"; string hasB = "1";
+        if (a.op == "null") { hasA = "0"; }
+        else if (IsNullableValue(a.ty)) {
+            hasA = NT();
+            L("  " + hasA + " = icmp ne i8* " + a.op + ", null");
+        }
+        if (b != null && b.op == "null") { hasB = "0"; }
+        else if (b != null && IsNullableValue(b.ty)) {
+            hasB = NT();
+            L("  " + hasB + " = icmp ne i8* " + b.op + ", null");
+        }
+        string both = NT();
+        L("  " + both + " = and i1 " + hasA + ", " + hasB);
+        string before = curLbl;
+        int valueBlock = NL(); int merge = NL();
+        L("  br i1 " + both + ", label %L" + valueBlock + ", label %L" + merge);
+        Label(valueBlock);
+        ExprVal av = DecimalLiftPayload(a);
+        ExprVal result;
+        if (b == null) { result = DecimalNeg(ToDecimal(av)); }
+        else { result = DecimalBinary(op, av, DecimalLiftPayload(b), at); }
+        Node ty = MkType("decimal"); ty.op = 1;
+        string boxed = BoxVal(result, ty);
+        string after = curLbl;
+        L("  br label %L" + merge);
+        Label(merge);
+        string value = NT();
+        L("  " + value + " = phi i8* [ null, %" + before + " ], [ " + boxed + ", %" + after + " ]");
+        AddTemp(value, ty);
+        return new ExprVal(value, ty);
+    }
+
+    ExprVal DecimalNeg(ExprVal v) {
+        string p = DecimalPlace(v.op); string r = DecimalPlace("zeroinitializer");
+        string ptr = DecimalLL() + "*";
+        DecimalDeclare("__zan_decimal_neg", "void", ptr + ", " + ptr);
+        L("  call void @__zan_decimal_neg(" + ptr + " " + p + ", " + ptr + " " + r + ")");
+        return DecimalLoad(r);
+    }
+
+    int DecimalSlotOffset(List<Node> types, int count) {
+        int offset = 0; int i = 0;
+        while (i < count) {
+            offset = offset + (IsDecimal(types[i]) ? 2 : 1);
+            i = i + 1;
+        }
+        return offset;
+    }
+
+    void DecimalFrameStore(string frame, int index, string value) {
+        string p = FrameGep(frame, index);
+        string dp = NT();
+        L("  " + dp + " = bitcast i64* " + p + " to " + DecimalLL() + "*");
+        L("  store " + DecimalLL() + " " + value + ", " + DecimalLL() + "* " + dp);
+    }
+
+    ExprVal DecimalFrameLoad(string frame, int index) {
+        string p = FrameGep(frame, index);
+        string dp = NT();
+        L("  " + dp + " = bitcast i64* " + p + " to " + DecimalLL() + "*");
+        return DecimalLoad(dp);
+    }
+
+    // The result low word uses the common scheduler slot 6; the high word
+    // has a dedicated extension slot 13, outside the scheduler's header.
+    void DecimalResultStore(string frame, ExprVal value) {
+        string p = DecimalPlace(ToDecimal(value).op);
+        string words = NT();
+        L("  " + words + " = bitcast " + DecimalLL() + "* " + p + " to i64*");
+        string lo = NT(); L("  " + lo + " = load i64, i64* " + words);
+        string hp = FrameGep(words, 1);
+        string hi = NT(); L("  " + hi + " = load i64, i64* " + hp);
+        L("  store i64 " + lo + ", i64* " + FrameGep(frame, 6));
+        L("  store i64 " + hi + ", i64* " + FrameGep(frame, 13));
+    }
+
+    ExprVal DecimalResultLoad(string frame) {
+        string p = DecimalPlace("zeroinitializer");
+        string words = NT();
+        L("  " + words + " = bitcast " + DecimalLL() + "* " + p + " to i64*");
+        string lo = NT(); L("  " + lo + " = load i64, i64* " + FrameGep(frame, 6));
+        string hi = NT(); L("  " + hi + " = load i64, i64* " + FrameGep(frame, 13));
+        L("  store i64 " + lo + ", i64* " + words);
+        L("  store i64 " + hi + ", i64* " + FrameGep(words, 1));
+        return DecimalLoad(p);
+    }
+
+    string DecimalArrayPlace(string arr, string index) {
+        string basep = NT();
+        L("  " + basep + " = bitcast i64* " + arr + " to " + DecimalLL() + "*");
+        string p = NT();
+        L("  " + p + " = getelementptr " + DecimalLL() + ", " + DecimalLL() + "* " + basep + ", i64 " + index);
+        return p;
+    }
+
+    // An erased container owns an immutable ARC box. Reading copies the
+    // aggregate; callers never receive an alias to the stored decimal.
+    string DecimalBoxSlot(ExprVal v) {
+        v = ToDecimal(v);
+        string raw = NT();
+        L("  " + raw + " = call i8* @zalloc(i64 16, i8* null, i8* null)");
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + raw + " to " + DecimalLL() + "*");
+        L("  store " + DecimalLL() + " " + v.op + ", " + DecimalLL() + "* " + p);
+        AddTemp(raw, MkType("List"));
+        string slot = NT();
+        L("  " + slot + " = ptrtoint i8* " + raw + " to i64");
+        return slot;
+    }
+
+    ExprVal DecimalUnboxSlot(string slot) {
+        string zero = DecimalPlace("zeroinitializer");
+        string p = NT();
+        L("  " + p + " = inttoptr i64 " + slot + " to " + DecimalLL() + "*");
+        string empty = NT();
+        L("  " + empty + " = icmp eq i64 " + slot + ", 0");
+        string safe = NT();
+        L("  " + safe + " = select i1 " + empty + ", " + DecimalLL() + "* " + zero + ", " + DecimalLL() + "* " + p);
+        return DecimalLoad(safe);
+    }
+
+    string DecimalString(ExprVal v) {
+        string p = DecimalPlace(v.op);
+        string buf = NT();
+        EA(buf, "[64 x i8]");
+        string bytes = NT();
+        L("  " + bytes + " = getelementptr [64 x i8], [64 x i8]* " + buf + ", i64 0, i64 0");
+        DecimalDeclare("__zan_decimal_to_string", "i32", DecimalLL() + "*, i8*, i64");
+        string n = NT();
+        L("  " + n + " = call i32 @__zan_decimal_to_string(" + DecimalLL() + "* " + p + ", i8* " + bytes + ", i64 64)");
+        return WrapManaged(bytes);
+    }
+}

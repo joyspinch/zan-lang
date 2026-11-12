@@ -7,6 +7,9 @@
  * 链接面：凡链 zanrt_io.o 或 zan_gui 的目标必须同链 zanrt_crash.o
  * （rt_io.c 调 install；gui_runtime.c 调 guard_call/recovered_count/install）。
  * POSIX 编译面按文档需 _GNU_SOURCE（musl 的 sigaltstack/SS_DISABLE）。 */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 #include "rt_crash.h"
 
 #if defined(_WIN32)

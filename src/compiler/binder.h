@@ -5,6 +5,7 @@
 
 #include "zan.h"
 #include "ast.h"
+#include <string.h>
 
 typedef enum {
     SYM_NAMESPACE,
@@ -93,6 +94,7 @@ struct zan_symbol {
 typedef struct zan_scope zan_scope_t;
 struct zan_scope {
     zan_scope_t *parent;
+    bool declaration_type_params;
     zan_symbol_t **symbols;
     int sym_count;
     int sym_cap;
@@ -165,6 +167,56 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag);
 void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit);
 
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref);
+/* Overlay declared type parameters; restore the returned scope after use. */
+zan_scope_t *zan_binder_push_type_params(zan_binder_t *b, zan_ast_list_t *tps);
+
+/* Shared Task Action selection. receiver: 0 implicit, 1 type, 2 value.
+ * A parameterless derived candidate hides the base candidate regardless of
+ * return type. Other arities allow base lookup. error: 1 signature,
+ * 2 receiver/staticness, 3 ambiguity. A nonmethod member shadows the group. */
+static inline zan_symbol_t *zan_binder_task_action_method(
+        zan_binder_t *b, zan_symbol_t *owner, zan_istr_t name,
+        int receiver, bool has_this, int *error) {
+    *error = 0;
+    zan_symbol_t *fallback = NULL;
+    for (; owner; owner = owner->type && owner->type->base_type
+            ? owner->type->base_type->sym : NULL) {
+        zan_symbol_t *first = NULL, *selected = NULL;
+        bool compatible_receiver = false, has_zero_arity = false;
+        for (int k = 0; k < owner->member_count; k++) {
+            zan_symbol_t *m = owner->members[k];
+            if (!m || m->name.len != name.len ||
+                memcmp(m->name.str, name.str, (size_t)name.len) != 0 ||
+                m->kind == SYM_CONSTRUCTOR) continue;
+            if (m->kind != SYM_METHOD) return NULL;
+            if (!first) first = m;
+            if (!m->decl || m->decl->kind != AST_METHOD_DECL) continue;
+            zan_ast_node_t *d = m->decl;
+            if (d->method_decl.params.count == 0) has_zero_arity = true;
+            bool is_static = (d->method_decl.modifiers & MOD_STATIC) != 0;
+            if ((receiver == 1 && !is_static) ||
+                (receiver == 2 && is_static) ||
+                (receiver == 0 && !has_this && !is_static)) continue;
+            compatible_receiver = true;
+            zan_type_t *ret = zan_binder_resolve_type(b, d->method_decl.return_type);
+            if (d->method_decl.params.count || d->method_decl.type_params.count ||
+                !ret || ret->kind != TYPE_VOID ||
+                (d->method_decl.modifiers & MOD_ASYNC)) continue;
+            if (selected) { *error = 3; return selected; }
+            selected = m;
+        }
+        if (first) {
+            if (selected) return selected;
+            if (!fallback) fallback = first;
+            if (has_zero_arity) {
+                *error = compatible_receiver ? 1 : 2;
+                return first;
+            }
+        }
+    }
+    if (fallback) *error = 1;
+    return fallback;
+}
 
 zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem);

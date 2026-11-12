@@ -1,0 +1,406 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Redis;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+namespace System.Data.Redis;
+
+class Program {
+    static int failures;
+    static int port = 19873;
+    const int LineLimit = 65536;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL: " + label);
+        }
+    }
+
+    static string TextLine(string prefix, int length) {
+        byte[] data = new byte[length];
+        for (int i = 0; i < length; i = i + 1) { data[i] = (byte)120; }
+        data[0] = (byte)prefix[0];
+        return data.ToStr(0, length);
+    }
+
+    // A pause separates the fragment writes, including CR and LF at the cap.
+    // EOF cases close explicitly; the other cases observe the client close.
+    static async void Serve(nint listener, string wire, int split, bool eof, Gate done) {
+        nint peer = await Socket.AcceptAsync(listener);
+        if (peer >= 0) {
+            Socket.SetNonBlocking(peer);
+            byte[] request = new byte[512];
+            int got = await Socket.RecvBytesAsync(peer, request, 512, 3000);
+            Program.Check(got > 0, "fixture received command");
+            byte[] bytes = Encoding.UTF8.GetBytes(wire);
+            if (split > 0) {
+                int sent = await Socket.SendBytesAsync(peer, bytes, 0, split);
+                Program.Check(sent == split, "fixture first fragment");
+                await Thread.SleepAsync(15);
+                if (split < bytes.Length) {
+                    int rest = await Socket.SendBytesAsync(peer, bytes, split, bytes.Length - split);
+                    Program.Check(rest == bytes.Length - split, "fixture second fragment");
+                }
+            } else {
+                int sent = await Socket.SendBytesAsync(peer, bytes, 0, bytes.Length);
+                Program.Check(sent == bytes.Length, "fixture response");
+            }
+            if (!eof) {
+                // Drain legitimate follow-up commands until EOF. A timeout
+                // means the failed parser left its transport reusable/open.
+                int n = await Socket.RecvBytesAsync(peer, request, 512, 3000);
+                while (n > 0) { n = await Socket.RecvBytesAsync(peer, request, 512, 3000); }
+                Program.Check(n == 0, "fixture observed connection close");
+            }
+            Socket.Close(peer);
+        } else { Program.Check(false, "fixture accept"); }
+        done.Signal();
+    }
+
+    static async void Reject(nint listener, string name, string wire, int split,
+            bool eof, string reason) {
+        Gate done = new Gate();
+        Task.Spawn(Program.Serve(listener, wire, split, eof, done));
+        RedisClient client = await RedisClient.ConnectAsync("127.0.0.1", Program.port, 1500);
+        Program.Check(client != null, name + " connect");
+        if (client != null) {
+            RedisReply reply = await client.CommandAsync1("PING");
+            Program.Check(reply.IsError() && reply.str.StartsWith("protocol error: ")
+                && reply.str.Contains(reason), name + " protocol error");
+            Program.Check(!client.IsConnected(), name + " terminal close");
+            Program.Check(client.GetLastError() == reply.str, name + " last error");
+            RedisReply next = await client.CommandAsync1("PING");
+            Program.Check(next.IsError() && next.str == reply.str, name + " following reply discarded");
+            List<string> args = new List<string>();
+            args.Add("ECHO");
+            byte[] data = new byte[1];
+            RedisReply binary = await client.CommandBytesAsync(args, data);
+            Program.Check(binary.IsError() && binary.str == reply.str, name + " binary cannot reuse");
+            client.Close();
+        }
+        bool finished = await done.Wait(4000);
+        Program.Check(finished, name + " fixture finished");
+        done.Dispose();
+    }
+
+    static async void Accept(nint listener, string name, string wire, int split,
+            int expectedLength, bool serverError) {
+        Gate done = new Gate();
+        Task.Spawn(Program.Serve(listener, wire, split, false, done));
+        RedisClient client = await RedisClient.ConnectAsync("127.0.0.1", Program.port, 1500);
+        Program.Check(client != null, name + " connect");
+        if (client != null) {
+            RedisReply reply = await client.CommandAsync1("PING");
+            Program.Check(reply.IsError() == serverError && reply.str.Length == expectedLength,
+                name + " first reply");
+            Program.Check(client.IsConnected(), name + " remains connected");
+            RedisReply next = await client.CommandAsync1("PING");
+            Program.Check(!next.IsError() && next.str == "NEXT", name + " buffered next reply");
+            Program.Check(client.IsConnected(), name + " second remains connected");
+            client.Close();
+        }
+        bool finished = await done.Wait(4000);
+        Program.Check(finished, name + " fixture finished");
+        done.Dispose();
+    }
+
+    static async void AcceptPrefetched(nint listener) {
+        Gate done = new Gate();
+        string wire = "$32768\r\n" + Program.TextLine("x", 32768) + "\r\n"
+            + Program.TextLine("+", Program.LineLimit - 4) + "\r\n+NEXT\r\n";
+        Task.Spawn(Program.Serve(listener, wire, 0, false, done));
+        RedisClient client = await RedisClient.ConnectAsync("127.0.0.1", Program.port, 1500);
+        Program.Check(client != null, "prefetched connect");
+        if (client != null) {
+            RedisReply bulk = await client.CommandAsync1("PING");
+            Program.Check(!bulk.IsError() && bulk.len == 32768, "prefetched bulk");
+            RedisReply line = await client.CommandAsync1("PING");
+            Program.Check(!line.IsError() && line.str.Length == Program.LineLimit - 5,
+                "prefetched line with compaction and suffix");
+            RedisReply next = await client.CommandAsync1("PING");
+            Program.Check(!next.IsError() && next.str == "NEXT", "prefetched suffix preserved");
+            client.Close();
+        }
+        bool finished = await done.Wait(4000);
+        Program.Check(finished, "prefetched fixture finished");
+        done.Dispose();
+    }
+
+    static async void AcceptNumbers(nint listener) {
+        Gate done = new Gate();
+        string wire = "*6\r\n:9223372036854775807\r\n:-9223372036854775808\r\n:+1\r\n"
+            + "$-1\r\n*-1\r\n-ERR child\r\n+NEXT\r\n";
+        Task.Spawn(Program.Serve(listener, wire, 0, false, done));
+        RedisClient client = await RedisClient.ConnectAsync("127.0.0.1", Program.port, 1500);
+        Program.Check(client != null, "numbers connect");
+        if (client != null) {
+            RedisReply reply = await client.CommandAsync1("PING");
+            Program.Check(reply.Count() == 6, "valid numeric array");
+            if (reply.Count() == 6) {
+                Program.Check(reply.At(0).integer64 == 9223372036854775807L, "int64 maximum");
+                Program.Check(reply.At(1).integer64 == -9223372036854775807L - 1, "int64 minimum");
+                Program.Check(reply.At(2).integer64 == 1, "integer plus sign");
+                Program.Check(reply.At(3).IsNil() && reply.At(4).IsNil(), "valid null lengths");
+                Program.Check(reply.At(5).IsError(), "valid child Redis error");
+            }
+            Program.Check(client.IsConnected(), "child Redis error remains connected");
+            RedisReply next = await client.CommandAsync1("PING");
+            Program.Check(!next.IsError() && next.str == "NEXT", "numbers next reply");
+            client.Close();
+        }
+        bool finished = await done.Wait(4000);
+        Program.Check(finished, "numbers fixture finished");
+        done.Dispose();
+    }
+
+    static string Nested(int depth, string leaf) {
+        StringBuilder wire = new StringBuilder();
+        for (int i = 0; i < depth; i = i + 1) { wire.Append("*1\r\n"); }
+        wire.Append(leaf);
+        wire.Append("+NEXT\r\n");
+        return wire.ToString();
+    }
+
+    static async void AcceptNested(nint listener) {
+        Gate done = new Gate();
+        Task.Spawn(Program.Serve(listener, Program.Nested(64, "-ERR nested\r\n"), 0, false, done));
+        RedisClient client = await RedisClient.ConnectAsync("127.0.0.1", Program.port, 1500);
+        Program.Check(client != null, "nested connect");
+        if (client != null) {
+            RedisReply reply = await client.CommandAsync1("PING");
+            int depth = 0;
+            while (depth < 64 && reply.Count() == 1) {
+                reply = reply.At(0);
+                depth = depth + 1;
+            }
+            Program.Check(depth == 64 && reply.IsError() && reply.str == "ERR nested",
+                "64 arrays preserve nested Redis error");
+            Program.Check(client.IsConnected(), "64 arrays nonterminal");
+            RedisReply next = await client.CommandAsync1("PING");
+            Program.Check(!next.IsError() && next.str == "NEXT", "64 arrays following reply");
+            client.Close();
+        }
+        bool finished = await done.Wait(4000);
+        Program.Check(finished, "nested fixture finished");
+        done.Dispose();
+    }
+
+    static void BudgetBoundaries() {
+        RedisReplyBudget defaults = new RedisReplyBudget(
+            RedisReplyBudget.DefaultPayloadBytes, RedisReplyBudget.DefaultNodes);
+        Program.Check(defaults.AdmitPayload(67108864), "default payload exact boundary");
+        Program.Check(!defaults.AdmitPayload(1), "default payload boundary plus one");
+        Program.Check(defaults.AdmitNodes(1048576), "default nodes exact boundary");
+        Program.Check(!defaults.AdmitNodes(1), "default nodes boundary plus one");
+        RedisReplyBudget budget = new RedisReplyBudget(12, 5);
+        Program.Check(!budget.AdmitPayload(-1) && !budget.AdmitPayload(2147483647),
+            "payload negative and oversized admission");
+        Program.Check(budget.AdmitPayload(8) && budget.AdmitPayload(4)
+            && budget.AdmitPayload(0) && !budget.AdmitPayload(1), "payload cumulative boundary");
+        Program.Check(!budget.AdmitNodes(-1) && !budget.AdmitNodes(2147483647),
+            "nodes negative and oversized admission");
+        Program.Check(budget.AdmitNodes(1) && budget.AdmitNodes(4)
+            && budget.AdmitNodes(0) && !budget.AdmitNodes(1), "nodes cumulative boundary");
+    }
+
+    // Small production limits exercise the real parser without huge fixtures.
+    // Accepted replies are followed by another root at the same limits.
+    static async void BudgetReply(nint listener, string name, string wire,
+            int payload, int nodes, bool binary, string reason, int expectedCount) {
+        Gate done = new Gate();
+        Task.Spawn(Program.Serve(listener, wire, 0, false, done));
+        RedisClient client = await RedisClient.ConnectAsync("127.0.0.1", Program.port, 1500);
+        Program.Check(client != null, name + " connect");
+        if (client != null) {
+            Program.Check(client.SetReplyLimits(payload, nodes), name + " configure");
+            Program.Check(!client.SetReplyLimits(0, nodes) && !client.SetReplyLimits(payload, -1),
+                name + " invalid configuration unchanged");
+            List<string> args = new List<string>();
+            args.Add("PING");
+            byte[] data = new byte[0];
+            RedisReply reply = binary ? await client.CommandBytesAsync(args, data)
+                : await client.CommandAsync(args);
+            if (reason.Length > 0) {
+                Program.Check(reply.IsError() && reply.str.Contains(reason), name + " budget failure");
+                Program.Check(!client.IsConnected() && client.GetLastError() == reply.str,
+                    name + " terminal retained error");
+                RedisReply again = await client.CommandBytesAsync(args, data);
+                RedisReply textAgain = await client.CommandAsync(args);
+                Program.Check(again.IsError() && again.str == reply.str && textAgain.str == reply.str,
+                    name + " both routes retain failure");
+            } else {
+                Program.Check(!reply.IsError() && reply.Count() == expectedCount,
+                    name + " exact boundary accepted");
+                RedisReply next = await client.CommandAsync(args);
+                Program.Check(!next.IsError() && next.str == "NEXT" && client.IsConnected(),
+                    name + " next root has fresh budget");
+            }
+            client.Close();
+        }
+        Program.Check(await done.Wait(4000), name + " fixture finished");
+        done.Dispose();
+    }
+
+    static async bool PoolRequest(nint peer, int expectedBytes) {
+        byte[] request = new byte[64];
+        int read = 0;
+        while (read < expectedBytes) {
+            int got = await Socket.RecvBytesAsync(peer, request, expectedBytes - read, 3000);
+            if (got <= 0) { return false; }
+            read = read + got;
+        }
+        return true;
+    }
+
+    static async void ServePool(nint listener, bool binaryFailure, Gate done) {
+        nint peer = await Socket.AcceptAsync(listener);
+        if (peer >= 0) {
+            Socket.SetNonBlocking(peer);
+            byte[] request = new byte[512];
+            Program.Check(await Program.PoolRequest(peer, 14), "pool initial ping");
+            Program.Check(await Socket.SendAsync(peer, "+PONG\r\n", 7) == 7, "pool ping response");
+            // Facade string and binary calls fit at four bytes. The direct
+            // pool call is five bytes and proves facade limits were restored.
+            for (int i = 0; i < 3; i = i + 1) {
+                Program.Check(await Program.PoolRequest(peer, i == 1 ? 20 : 14), "pool command");
+                string wire = i == 2 ? "+12345\r\n" : "+NEXT\r\n";
+                Program.Check(await Socket.SendAsync(peer, wire, wire.Length) == wire.Length,
+                    "pool command response");
+            }
+            Program.Check(await Program.PoolRequest(peer, binaryFailure ? 20 : 14), "pool excess command");
+            Program.Check(await Socket.SendAsync(peer, "$5\r\n", 4) == 4, "pool excess header");
+            Program.Check(await Socket.RecvBytesAsync(peer, request, 512, 3000) == 0, "pool excess close");
+            Socket.Close(peer);
+        } else { Program.Check(false, "pool fixture accept"); }
+        done.Signal();
+    }
+
+    static async void PoolBudget(nint listener, bool binaryFailure) {
+        Gate done = new Gate();
+        Task.Spawn(Program.ServePool(listener, binaryFailure, done));
+        RedisPool pool = new RedisPool("127.0.0.1", Program.port, 1, 1500);
+        RedisClient facade = new RedisClient(pool);
+        Program.Check(facade.SetReplyLimits(4, 1), "pool facade configure");
+        List<string> args = new List<string>();
+        args.Add("PING");
+        byte[] data = new byte[0];
+        RedisReply text = await facade.CommandAsync(args);
+        RedisReply binary = await facade.CommandBytesAsync(args, data);
+        Program.Check(text.str == "NEXT" && binary.str == "NEXT", "pool both routes accept boundary");
+        RedisReply direct = await pool.CommandAsync(args);
+        Program.Check(direct.str == "12345", "pool borrowed configuration restored");
+        RedisReply failed = binaryFailure ? await facade.CommandBytesAsync(args, data)
+            : await facade.CommandAsync(args);
+        Program.Check(failed.IsError() && failed.str.Contains("payload budget"), "pool facade limit propagated");
+        Program.Check(facade.GetLastError() == failed.str && pool.LiveCount() == 0,
+            "pool error retained and failed transport dropped");
+        facade.Close();
+        Program.Check(await done.Wait(4000), "pool fixture finished");
+        done.Dispose();
+    }
+
+    static async int Run() {
+        Program.BudgetBoundaries();
+        Socket.Initialize();
+        nint listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        int bound = -1;
+        for (int i = 0; i < 40; i = i + 1) {
+            bound = Socket.Bind(listener, "127.0.0.1", Program.port);
+            if (bound == 0) { break; }
+            Program.port = Program.port + 1;
+        }
+        if (bound != 0 || Socket.Listen(listener, 8) != 0) {
+            Socket.Close(listener);
+            Console.WriteLine("FAIL: listener startup");
+            return 1;
+        }
+        Socket.SetNonBlocking(listener);
+        await Program.Reject(listener, "first trailer", "$1\r\naX\n+NEXT\r\n", 0, false, "bulk string trailer");
+        await Program.Reject(listener, "second trailer", "$1\r\na\rX+NEXT\r\n", 0, false, "bulk string trailer");
+        await Program.Reject(listener, "empty bulk trailer", "$0\r\nXX+NEXT\r\n", 0, false, "bulk string trailer");
+        await Program.Reject(listener, "truncated bulk", "$1\r\na\r", 0, true, "truncated RESP reply");
+        await Program.Reject(listener, "truncated line", "+partial", 0, true, "truncated RESP reply");
+        await Program.Reject(listener, "empty EOF", "", 0, true, "truncated RESP reply");
+        await Program.Reject(listener, "empty line", "\r\n+NEXT\r\n", 0, false, "empty RESP line");
+        await Program.Reject(listener, "bare LF", "+x\n+NEXT\r\n", 0, false, "line ending");
+        await Program.Reject(listener, "invalid CR", "+x\rX+NEXT\r\n", 0, false, "line ending");
+        await Program.Reject(listener, "unknown type", "?x\r\n+NEXT\r\n", 0, false, "unknown RESP type");
+        await Program.Reject(listener, "array child", "*2\r\n$1\r\naX\n+NEXT\r\n", 0, false, "bulk string trailer");
+        await Program.Reject(listener, "array truncated", "*2\r\n+OK\r\n", 0, true, "truncated RESP reply");
+
+        List<string> badNumbers = new List<string>();
+        badNumbers.Add("$wat");
+        badNumbers.Add("$-2");
+        badNumbers.Add("$536870913");
+        badNumbers.Add("$4294967296");
+        badNumbers.Add("*oops");
+        badNumbers.Add("*-2");
+        badNumbers.Add("*1048577");
+        badNumbers.Add(":9223372036854775808");
+        badNumbers.Add(":-9223372036854775809");
+        badNumbers.Add(":1x");
+        for (int i = 0; i < badNumbers.Count; i = i + 1) {
+            await Program.Reject(listener, "numeric " + i.ToString(), badNumbers[i] + "\r\n+NEXT\r\n",
+                0, false, "protocol error:");
+        }
+
+        string exact = Program.TextLine("+", Program.LineLimit);
+        // Two complete legal lines exceed one line's budget in aggregate.
+        await Program.Accept(listener, "exact boundary with suffix", exact + "\r\n+NEXT\r\n", 0,
+            Program.LineLimit - 1, false);
+        await Program.Accept(listener, "CR at boundary split", exact + "\r\n+NEXT\r\n", Program.LineLimit + 1,
+            Program.LineLimit - 1, false);
+        await Program.Reject(listener, "beyond boundary", exact + "x\r\n+NEXT\r\n", 0, false, "65536 byte limit");
+        await Program.Reject(listener, "split unterminated limit", exact + "x", Program.LineLimit / 2,
+            false, "65536 byte limit");
+        await Program.Reject(listener, "exact unterminated EOF", exact, Program.LineLimit / 2,
+            true, "truncated RESP reply");
+        await Program.Reject(listener, "length header line limit", Program.TextLine("$", Program.LineLimit + 1),
+            Program.LineLimit / 2, false, "65536 byte limit");
+        await Program.Accept(listener, "server error reusable", "-ERR ordinary\r\n+NEXT\r\n", 0, 12, true);
+        await Program.Accept(listener, "valid bulk", "$1\r\na\r\n+NEXT\r\n", 0, 1, false);
+        await Program.Accept(listener, "valid empty bulk", "$0\r\n\r\n+NEXT\r\n", 0, 0, false);
+        await Program.AcceptPrefetched(listener);
+        await Program.AcceptNumbers(listener);
+        await Program.AcceptNested(listener);
+        await Program.Reject(listener, "65 arrays", Program.Nested(65, "+OK\r\n"),
+            0, false, "64 level limit");
+        string aggregate = "*3\r\n$4\r\nabcd\r\n*2\r\n+ef\r\n-gh\r\n:1\r\n+NEXT\r\n";
+        await Program.BudgetReply(listener, "aggregate exact text", aggregate, 16, 6, false, "", 3);
+        await Program.BudgetReply(listener, "aggregate exact binary", aggregate, 16, 6, true, "", 3);
+        await Program.BudgetReply(listener, "aggregate payload", aggregate, 15, 6, false, "payload budget", 0);
+        await Program.BudgetReply(listener, "aggregate nodes", aggregate, 16, 5, true, "node budget", 0);
+        // No body/children are sent: rejection must happen at the header.
+        await Program.BudgetReply(listener, "bulk header admission", "*2\r\n$4\r\nabcd\r\n$5\r\n",
+            8, 3, true, "payload budget", 0);
+        await Program.BudgetReply(listener, "array header admission", "*4\r\n",
+            8, 4, false, "node budget", 0);
+        await Program.BudgetReply(listener, "integer payload", ":1\r\n", 7, 1, false, "payload budget", 0);
+        await Program.BudgetReply(listener, "UTF8 text bytes", "*2\r\n+é\r\n-é\r\n",
+            3, 3, false, "payload budget", 0);
+        await Program.BudgetReply(listener, "embedded NUL payload", "*2\r\n$3\r\na\0b\r\n$3\r\nc\0d\r\n",
+            5, 3, true, "payload budget", 0);
+        string emptyTree = "*2\r\n*2\r\n$-1\r\n*0\r\n*2\r\n$0\r\n\r\n*-1\r\n+NEXT\r\n";
+        await Program.BudgetReply(listener, "empty and nil nodes exact", emptyTree, 4, 7, false, "", 2);
+        await Program.BudgetReply(listener, "empty and nil nodes exceed", emptyTree, 4, 6, false,
+            "node budget", 0);
+        await Program.Reject(listener, "default bulk budget header", "$67108865\r\n", 0, false,
+            "payload budget");
+        await Program.Reject(listener, "default node budget header", "*1048576\r\n", 0, false,
+            "node budget");
+        await Program.PoolBudget(listener, false);
+        await Program.PoolBudget(listener, true);
+        Socket.Close(listener);
+        Console.WriteLine("redis protocol bounds failures=" + Program.failures.ToString());
+        return Program.failures == 0 ? 0 : 1;
+    }
+
+    static void Main() {
+        int code = await Program.Run();
+        if (code != 0) { Environment.Exit(code); }
+    }
+}

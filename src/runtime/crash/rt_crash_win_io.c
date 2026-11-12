@@ -126,10 +126,19 @@ static int zan__crash_snprintf(char *buf, size_t cap, const char *fmt, ...) {
     return (int)strlen(buf);
 }
 
+/* Log paths are UTF-8; Win32 wide IO also accepts the cached extended-length path. */
+#define ZAN_CRASH_PATH_CAP 4096
+static int zan__crash_wpath(const char *path, wchar_t *out, size_t cap) {
+    return path && *path && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                               path, -1, out, (int)cap) > 0;
+}
+
 /* 追加模式打开崩溃日志；失败返回 h==NULL 的句柄，便于沿用 !f 判空 */
 static zan__cf_t zan__cf_open_append(const char *path) {
-    zan__cf_t f;
-    f.h = CreateFileA(path, FILE_APPEND_DATA,
+    zan__cf_t f = { 0 };
+    wchar_t wide[ZAN_CRASH_PATH_CAP];
+    if (!zan__crash_wpath(path, wide, ZAN_CRASH_PATH_CAP)) return f;
+    f.h = CreateFileW(wide, FILE_APPEND_DATA,
                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
                       FILE_ATTRIBUTE_NORMAL, NULL);
     if (f.h == INVALID_HANDLE_VALUE) f.h = NULL;

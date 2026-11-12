@@ -1,0 +1,208 @@
+using System;
+
+class IsBase { public int Value = 42; }
+class IsNode : IsBase { }
+class IsOther : IsBase { }
+class IsWatch { public weak IsBase Node; }
+class IsSource {
+    public IsWatch Watch;
+    public IsBase Current { get { return IsOwnedOperandTest.Make(Watch, true); } }
+    public IsBase this[int index] {
+        get { return IsOwnedOperandTest.Make(Watch, index == 0); }
+    }
+}
+
+class IsOwnedOperandTest {
+    static void Check(bool ok, string label) {
+        if (!ok) throw new Exception(label);
+    }
+    public static IsBase Make(IsWatch watch, bool match) {
+        IsBase value = match ? new IsNode() : new IsOther();
+        watch.Node = value;
+        return value;
+    }
+    static bool Fail() { throw new Exception("pattern condition"); }
+    static void Plain(IsWatch watch) {
+        Check(Make(watch, true) is IsNode, "owned call matches");
+        Check(watch.Node == null, "owned call released");
+        Check(!(Make(watch, false) is IsNode), "owned mismatch");
+        Check(watch.Node == null, "owned mismatch released");
+        Check(Make(watch, true) is not null, "owned is not null");
+        Check(watch.Node == null, "owned null test released");
+        IsSource source = new IsSource();
+        source.Watch = watch;
+        Check(source.Current is IsNode, "owned getter matches");
+        Check(watch.Node == null, "owned getter released");
+        Check(source[0] is IsNode, "owned indexer matches");
+        Check(watch.Node == null, "owned indexer released");
+        Check(!(source[1] is IsNode), "owned indexer mismatch");
+        Check(watch.Node == null, "owned indexer mismatch released");
+    }
+    static void Patterns(IsWatch watch) {
+        if (Make(watch, true) is IsNode match) {
+            Check(match.Value == 42 && watch.Node != null, "owned pattern alive");
+        }
+        Check(watch.Node == null, "owned pattern scope released");
+        if (Make(watch, false) is IsNode missing) {
+            throw new Exception("unexpected pattern match");
+        }
+        Check(watch.Node == null, "failed pattern without else released");
+        if (Make(watch, false) is IsNode absent) {
+            throw new Exception("unexpected else match");
+        } else {
+            Check(watch.Node == null, "failed pattern before else released");
+        }
+        if (Make(watch, true) is IsNode gated && gated.Value == 0) {
+            throw new Exception("unexpected gated match");
+        }
+        Check(watch.Node == null, "matched pattern false condition released");
+        if (false && Make(watch, true) is IsNode skipped) {
+            throw new Exception("short circuit executed");
+        }
+        Check(watch.Node == null, "short circuit pattern safe");
+        IsBase value = Make(watch, true);
+        Check(value is IsNode, "borrowed plain match");
+        Check(value.Value == 42, "borrowed plain stays alive");
+        if (value is IsNode borrowed) {
+            value = null;
+            Check(borrowed.Value == 42 && watch.Node != null,
+                "borrowed pattern retains reference");
+        }
+        Check(watch.Node == null, "borrowed pattern releases reference");
+    }
+    static void Exceptional(IsWatch watch) {
+        bool caught = false;
+        try {
+            if (Make(watch, true) is IsNode node && Fail()) {
+                Console.WriteLine(node.Value);
+            }
+        } catch (Exception) {
+            caught = true;
+        }
+        Check(caught && watch.Node == null, "condition EH releases pattern");
+        caught = false;
+        try {
+            if (Make(watch, true) is IsNode body) {
+                Check(body.Value == 42, "EH pattern alive");
+                throw new Exception("pattern body");
+            }
+        } catch (Exception) {
+            caught = true;
+        }
+        Check(caught && watch.Node == null, "body EH releases pattern");
+    }
+    static bool ReturnTest(IsWatch watch) {
+        return Make(watch, true) is IsNode;
+    }
+    static IsBase ReturnPattern(IsWatch watch) {
+        if (Make(watch, true) is IsNode node) return node;
+        throw new Exception("return pattern missing");
+    }
+    static void Loops(IsWatch watch) {
+        while (Make(watch, true) is IsNode never && false) {
+            throw new Exception("unexpected while body");
+        }
+        Check(watch.Node == null, "while false releases matched pattern");
+        for (int i = 0; Make(watch, true) is IsNode absent && false; i++) {
+            throw new Exception("unexpected for body");
+        }
+        Check(watch.Node == null, "for false releases matched pattern");
+        while (false && Make(watch, true) is IsNode skipped) {
+            throw new Exception("unexpected skipped while");
+        }
+        for (int i = 0; false && Make(watch, true) is IsNode skippedFor; i++) {
+            throw new Exception("unexpected skipped for");
+        }
+        while (Make(watch, false) is IsNode missing) {
+            throw new Exception("unexpected while match");
+        }
+        Check(watch.Node == null, "while mismatch releases operand");
+        int count = 0;
+        while (Make(watch, true) is IsNode node && count < 2) {
+            Check(node.Value == 42, "while pattern alive");
+            count++;
+        }
+        Check(count == 2 && watch.Node == null, "while backedge and false cleanup");
+        count = 0;
+        for (int i = 0; Make(watch, true) is IsNode item && i < 2; i++) {
+            Check(item.Value == 42, "for pattern alive");
+            count++;
+        }
+        Check(count == 2 && watch.Node == null, "for backedge and false cleanup");
+    }
+    static void JumpExceptional(IsWatch watch) {
+        bool caught = false;
+        try {
+            while (true) {
+                if (Make(watch, true) is IsNode node) {
+                    Check(node.Value == 42, "while break pattern alive");
+                    break;
+                }
+            }
+            Check(watch.Node == null, "while break releases pattern");
+            Fail();
+        } catch (Exception) { caught = true; }
+        Check(caught && watch.Node == null, "while break then EH safe");
+        caught = false;
+        try {
+            int count = 0;
+            while (count < 2) {
+                count++;
+                if (count == 1) {
+                    if (Make(watch, true) is IsNode node) continue;
+                }
+                Check(watch.Node == null, "while continue releases pattern");
+                Fail();
+            }
+        } catch (Exception) { caught = true; }
+        Check(caught && watch.Node == null, "while continue then EH safe");
+        caught = false;
+        try {
+            for (int i = 0; Make(watch, true) is IsNode node; i++) {
+                Check(node.Value == 42, "for break condition alive");
+                break;
+            }
+            Check(watch.Node == null, "for break releases condition");
+            Fail();
+        } catch (Exception) { caught = true; }
+        Check(caught && watch.Node == null, "for break then EH safe");
+        caught = false;
+        try {
+            for (int i = 0; i < 2; i++) {
+                if (i == 0) {
+                    if (Make(watch, true) is IsNode node) continue;
+                }
+                Check(watch.Node == null, "for continue releases pattern");
+                Fail();
+            }
+        } catch (Exception) { caught = true; }
+        Check(caught && watch.Node == null, "for continue then EH safe");
+        caught = false;
+        try {
+            while (Make(watch, true) is IsNode node && false) { }
+            Check(watch.Node == null, "while false before EH released");
+            Fail();
+        } catch (Exception) { caught = true; }
+        Check(caught && watch.Node == null, "while false then EH safe");
+    }
+    static void Returns(IsWatch watch) {
+        Check(ReturnTest(watch), "owned is return bool");
+        Check(watch.Node == null, "returned bool drops operand");
+        IsBase value = ReturnPattern(watch);
+        Check(value.Value == 42 && watch.Node != null, "returned pattern transfers");
+        value = null;
+        Check(watch.Node == null, "returned pattern last owner releases");
+    }
+    static void Main() {
+        IsWatch watch = new IsWatch();
+        for (int i = 0; i < 8; i++) {
+            Plain(watch);
+            Patterns(watch);
+            Exceptional(watch);
+            Loops(watch);
+            JumpExceptional(watch);
+            Returns(watch);
+        }
+        Console.WriteLine("ARC_IS_OWNED_OPERAND_OK");
+    }
+}

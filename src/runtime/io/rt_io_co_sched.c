@@ -26,6 +26,8 @@ void zan_co_sched_init(void) {
     }
     if (!g_wk) {
         g_wk = (zan_co_worker_t *)calloc(ZAN_CO_MAXW, sizeof(zan_co_worker_t));
+        for (int i = 0; i < ZAN_CO_MAXW; i++)
+            InitializeCriticalSection(&g_wk[i].queue_lock);
     }
     g_co_workers = co_worker_count();
     g_rq_head = g_rq_tail = NULL;
@@ -35,8 +37,8 @@ void zan_co_sched_init(void) {
     g_co_parked = 0;
     g_co_searching = 0;
     g_co_wake = 0;
-    g_co_stop = 0;
-    g_co_pool_live = 0;
+    InterlockedExchange(&g_co_stop, 0);
+    InterlockedExchange(&g_co_pool_live, 0);
     g_co_pool_gen = 0;
     g_io_shards_live = 0;
     g_timer_owner = 0;
@@ -56,7 +58,7 @@ void zan_co_sched_init(void) {
     for (int i = 0; i < ZAN_CO_MAXW; i++) {
         zan_co_worker_t *w = &g_wk[i];
         w->head = w->tail = 0;
-        w->lifo_full = 0;
+        __atomic_store_n(&w->lifo_full, 0, __ATOMIC_RELEASE);
         w->lifo_budget = ZAN_LIFO_BUDGET;
         w->index = i;
         w->searching = 0;
@@ -74,7 +76,7 @@ void zan_co_sched_init(void) {
 
 static int co_search_begin(zan_co_worker_t *w) {
     if (w->searching) return 1;
-    LONG s = g_co_searching;
+    LONG s = co_load(&g_co_searching);
     if (2 * s >= g_co_workers) return 0;
     InterlockedIncrement(&g_co_searching);
     w->searching = 1;
@@ -103,7 +105,7 @@ static int co_steal(zan_co_worker_t *w, zan_co_task *out) {
 }
 
 static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
-    if (++w->tick % ZAN_GLOBAL_TICK == 0 && g_inj_len > 0) {
+    if (++w->tick % ZAN_GLOBAL_TICK == 0 && co_load(&g_inj_len) > 0) {
         zan_co_task batch[ZAN_INJ_BATCH];
         int n = inj_pop_batch(batch, ZAN_INJ_BATCH);
         if (n > 0) {
@@ -114,16 +116,16 @@ static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
             return 1;
         }
     }
-    if (w->lifo_full) {
+    if (__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE)) {
         if (w->lifo_budget > 0) {
             *out = w->lifo;
-            w->lifo_full = 0;
+            __atomic_store_n(&w->lifo_full, 0, __ATOMIC_RELEASE);
             w->lifo_budget--;
             w->st.lifo_hit++;
             return 1;
         }
         lq_push(w, w->lifo);
-        w->lifo_full = 0;
+        __atomic_store_n(&w->lifo_full, 0, __ATOMIC_RELEASE);
         w->st.lifo_demote++;
     }
     w->lifo_budget = ZAN_LIFO_BUDGET;
@@ -135,10 +137,10 @@ static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
 }
 
 static int co_has_runnable(void) {
-    if (g_inj_len > 0) return 1;
+    if (co_load(&g_inj_len) > 0) return 1;
     for (int i = 0; i < g_co_workers; i++) {
         zan_co_worker_t *w = &g_wk[i];
-        if (w->lifo_full) return 1;
+        if (__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE)) return 1;
         if (__atomic_load_n(&w->tail, __ATOMIC_ACQUIRE) !=
             __atomic_load_n(&w->head, __ATOMIC_ACQUIRE)) return 1;
     }
@@ -152,7 +154,7 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
     long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
     for (;;) {
         if (s & CO_DEAD) {
-            free(t->frame);
+            zan_task_retire(t->frame, free);
             co_cnt_add(w, +1, -1);
             return;
         }
@@ -189,7 +191,7 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
     co_trace("done", t->frame);
     for (;;) {
         s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
-        if (s & CO_DEAD) { free(t->frame); break; }
+        if (s & CO_DEAD) { zan_task_retire(t->frame, free); break; }
         if (s & CO_NOTIFIED) {
             zan_co_step_t step = __atomic_load_n(&h->pending, __ATOMIC_RELAXED);
             int selfq = (s & CO_SELFQ) != 0;
@@ -221,14 +223,14 @@ static long long co_pump_timers_now(void) {
     if (InterlockedCompareExchange(&g_timer_owner, 1, 0) != 0) {
         long long live = zan_timer_next_timeout();
         if (live > 0) return live;
-        long long cached = g_timer_next_ms;
+        long long cached = __atomic_load_n(&g_timer_next_ms, __ATOMIC_ACQUIRE);
         return (cached <= 0) ? 1 : cached;
     }
     InterlockedIncrement(&g_co_running);
     zan_timer_dispatch_due();
     long long next = zan_timer_next_timeout();
-    g_timer_next_ms = next;
-    g_timer_pumped_us = zan_co_precise_us();
+    __atomic_store_n(&g_timer_next_ms, next, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_timer_pumped_us, zan_co_precise_us(), __ATOMIC_RELEASE);
     InterlockedDecrement(&g_co_running);
     InterlockedExchange(&g_timer_owner, 0);
     return next;
@@ -236,9 +238,9 @@ static long long co_pump_timers_now(void) {
 
 static long long co_pump_timers(void) {
     long long now = zan_co_precise_us();
-    if (now - g_timer_pumped_us >= 1000)
+    if (now - __atomic_load_n(&g_timer_pumped_us, __ATOMIC_ACQUIRE) >= 1000)
         return co_pump_timers_now();
-    long long cached = g_timer_next_ms;
+    long long cached = __atomic_load_n(&g_timer_next_ms, __ATOMIC_ACQUIRE);
     return (cached == 0) ? 1 : cached;
 }
 
@@ -265,10 +267,11 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     }
     zan_co_task_t ready_batch[64];
     size_t ready_count = 0;
+    size_t completed_count = 0;
     for (ULONG i = 0; i < removed; i++) {
         if (entries[i].lpOverlapped == NULL) {
             if (entries[i].lpCompletionKey == ZAN_WAKE_KEY) {
-                if (g_co_wake > 0) InterlockedDecrement(&g_co_wake);
+                if (co_load(&g_co_wake) > 0) InterlockedDecrement(&g_co_wake);
             } else {
                 dns_drain();
             }
@@ -278,23 +281,11 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
-        if (op->rto == 2) {
-            IOTRACE("poll_op rto-dead op=%p kind=%d", (void*)op, op->kind);
-            op_free(op);
-            IO_CNT_DEC();
-            continue;
-        }
-        if (op->rto && !rto_claim(co)) {
-            IOTRACE("poll_op rto-late op=%p kind=%d", (void*)op, op->kind);
-            op_free(op);
-            IO_CNT_DEC();
-            continue;
-        }
         IOTRACE("poll_op op=%p kind=%d bytes=%lu status=%llu", (void*)op, op->kind, (unsigned long)entries[i].dwNumberOfBytesTransferred, (unsigned long long)entries[i].Internal);
         io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
                        entries[i].Internal);
         op_free(op);
-        IO_CNT_DEC();
+        completed_count++;
         if (step && co) {
             ready_batch[ready_count].frame = co;
             ready_batch[ready_count].step = step;
@@ -304,12 +295,19 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     if (ready_count > 0) {
         zan_co_ready_batch(ready_batch, ready_count);
     }
+    /* Pending IO owns scheduler liveness until ready publication. A different
+     * worker can otherwise stop the pool in the dequeue-to-enqueue gap. Only
+     * the captured count is used here: consumers may already rearm/free frames. */
+    while (completed_count > 0) {
+        completed_count--;
+        IO_CNT_DEC();
+    }
 #else
     (void)w;
     STRACE("w%d waitio enter to=%lld haspend=%d", w->index, (long long)to, zan_io_has_pending());
     int polled = zan_io_pump_timeout(to == INFINITE ? -1 : (int64_t)to);
     BOOL ok = (polled >= 0);
-    if (g_co_wake > 0) InterlockedDecrement(&g_co_wake);
+    if (co_load(&g_co_wake) > 0) InterlockedDecrement(&g_co_wake);
     InterlockedExchange(&w->parked, 0);
     InterlockedDecrement(&g_co_parked);
     STRACE("w%d waitio ret=%d ok=%d", w->index, polled, (int)ok);
@@ -325,14 +323,14 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
 }
 
 static int co_all_idle(void) {
-    if (co_cnt_outstanding() != 0 || g_co_running != 0 ||
-        g_io_count != 0 || g_blocking_inflight != 0 || zan_timer_pending() != 0)
+    if (co_cnt_outstanding() != 0 || co_load(&g_co_running) != 0 ||
+        zan_io_has_pending() || zan_timer_pending() != 0)
         return 0;
     int idle;
     EnterCriticalSection(&g_co_lock);
     idle = !(zan_timer_pending() != 0 || co_cnt_outstanding() != 0 ||
-             g_co_running != 0 || g_io_count != 0 ||
-             g_blocking_inflight != 0 || co_has_runnable());
+             co_load(&g_co_running) != 0 || zan_io_has_pending() ||
+             co_has_runnable());
     LeaveCriticalSection(&g_co_lock);
     return idle;
 }
@@ -431,7 +429,7 @@ static void co_worker(int worker) {
     if (g_co_tls != TLS_OUT_OF_INDEXES) TlsSetValue(g_co_tls, w);
     LONG idle_seen = -1;
     for (;;) {
-        if (g_co_stop) { co_pool_retire(w); return; }
+        if (co_load(&g_co_stop)) { co_pool_retire(w); return; }
         /* 队列繁忙时持续推进到期定时器 */
         if (zan_timer_pending() > 0) co_pump_timers();
         zan_co_task t;
@@ -452,7 +450,7 @@ static void co_worker(int worker) {
         if (co_all_idle()) {
             LONG seq = co_cnt_activity();
             if (idle_seen == seq) {
-                g_co_stop = 1;
+                InterlockedExchange(&g_co_stop, 1);
                 for (int i = 0; i < g_co_workers; i++)
                     co_wake_shard(co_worker_shard(i));
                 co_pool_retire(w);
@@ -536,15 +534,25 @@ static void co_stats_dump(void) {
     fflush(stderr);
 }
 
+/* Same optional compiler-provided EH teardown as rt_sync_thread.c. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) void __zan_eh_release(void) { }
+#else
+void __zan_eh_release(void) { }
+#endif
+
 static DWORD WINAPI co_worker_thunk(LPVOID p) {
     co_worker((int)(uintptr_t)p);
+    /* Only owned native threads detach. Foreground worker 0 runs on the
+     * caller's thread and must preserve its enclosing EH state. */
+    __zan_eh_release();
     return 0;
 }
 
 /* 启动后台工作线程池（进程单例） */
 static void co_pool_start_background(void) {
     zan_io_init();
-    g_co_stop = 0;
+    InterlockedExchange(&g_co_stop, 0);
     g_co_workers = co_worker_count();
     int w = g_co_workers;
     if (!g_io_shards_live) { io_shards_start(w); g_io_shards_live = 1; }
@@ -568,7 +576,7 @@ static void co_pool_start_background(void) {
     }
     g_co_pool_out = made;
     if (made == 0) {
-        g_co_pool_live = 0;
+        InterlockedExchange(&g_co_pool_live, 0);
     }
 }
 
@@ -578,24 +586,24 @@ static void co_pool_retire(zan_co_worker_t *w) {
     co_trace("retire", w);
     if (InterlockedDecrement(&g_co_pool_out) != 0) { return; }
     EnterCriticalSection(&g_inj_lock);
-    if (g_inj_len > 0) {
+    if (co_load(&g_inj_len) > 0) {
         LeaveCriticalSection(&g_inj_lock);
         co_pool_start_background();
         return;
     }
-    g_co_pool_live = 0;
+    InterlockedExchange(&g_co_pool_live, 0);
     LeaveCriticalSection(&g_inj_lock);
 }
 
 static void co_pool_ensure(void) {
-    if (g_co_pool_live || g_co_pool_fg) return;
+    if (co_load(&g_co_pool_live) || co_load(&g_co_pool_fg)) return;
     if (InterlockedCompareExchange(&g_co_pool_live, 1, 0) == 0) {
         co_pool_start_background();
     }
 }
 
 void zan_co_sched_run(void) {
-    if (g_co_pool_live || InterlockedCompareExchange(&g_co_pool_fg, 1, 0) != 0) {
+    if (co_load(&g_co_pool_live) || InterlockedCompareExchange(&g_co_pool_fg, 1, 0) != 0) {
         for (;;) {
             LONG activity = co_cnt_activity();
             int busy = zan_io_has_pending() || zan_timer_pending() > 0 ||
@@ -616,7 +624,7 @@ void zan_co_sched_run(void) {
     zan_io_init();
     g_co_workers = co_worker_count();
     int w = g_co_workers;
-    g_co_stop = 0;
+    InterlockedExchange(&g_co_stop, 0);
     io_shards_start(w);
 
 #if defined(_WIN32)
@@ -648,18 +656,18 @@ void zan_co_sched_run(void) {
     }
     InterlockedExchange(&g_co_pool_fg, 0);
     if (!co_all_idle() || g_inj_len > 0) {
-        g_co_pool_live = 0;
+        InterlockedExchange(&g_co_pool_live, 0);
         co_pool_ensure();
         return;
     }
     co_stats_dump();
     zan_io_shutdown();
-    g_co_pool_live = 0;
+    InterlockedExchange(&g_co_pool_live, 0);
     if (g_inj_len > 0 || !co_all_idle()) co_pool_ensure();
 }
 
 void zan_co_sched_run_until(const volatile int *done) {
-    if ((g_co_pool_live || g_co_pool_fg) && done != NULL) {
+    if ((co_load(&g_co_pool_live) || co_load(&g_co_pool_fg)) && done != NULL) {
         /* 从 worker 线程进来：这个调用点在等一个**子协程**跑完（根驱动
          * await：非 async 方法里 await 一个 async 调用，编译器分配子帧后
          * 让当前线程把它驱动到完成）。
@@ -714,7 +722,7 @@ size_t zan_co_pending(void) {
         long long h = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
         long long t = __atomic_load_n(&w->tail, __ATOMIC_ACQUIRE);
         if (t > h) n += (size_t)(t - h);
-        if (w->lifo_full) n++;
+        if (__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE)) n++;
     }
     return n;
 }
@@ -753,7 +761,7 @@ void *__zan_co_frame_alloc(size_t size) {
     return calloc(1, size ? size : 1);
 }
 
-void __zan_co_frame_free(void *frame) { free(frame); }
+void __zan_co_frame_free(void *frame) { if (frame) zan_task_retire(frame, free); }
 
 size_t zan_co_pending(void) {
     size_t n = 0;

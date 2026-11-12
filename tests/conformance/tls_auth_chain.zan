@@ -33,6 +33,94 @@ class Program {
         e.peerChain.Add(peer);
         return e;
     }
+    static int FeedHandshake(TlsEngine engine, int kind, byte[] body) {
+        if (engine.negotiatedVersion == 0) { engine.negotiatedVersion = TlsRecord.VersionTls12; }
+        engine.state = engine.negotiatedVersion == TlsRecord.VersionTls13
+            ? TlsEngine.StateTls13Handshake : TlsEngine.StateTls12Handshake;
+        engine.receivedEncryptedExtensions = true;
+        TlsByteWriter message = new TlsByteWriter();
+        message.WriteU8(kind); message.WriteU24(body.Length); message.WriteBytes(body);
+        byte[] bytes = message.ToArray();
+        byte[] record = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake,
+            TlsRecord.VersionTls12, bytes, 0, bytes.Length);
+        if (record == null) { return -2; }
+        engine.FeedNetwork(record, 0, record.Length);
+        return engine.Step();
+    }
+    static int VerifyPeer(TlsEngine engine) {
+        X509Certificate cert = engine.peerCert;
+        if (cert == null) { return -2; }
+        engine.peerCert = null;
+        engine.peerChain.Clear();
+        bool tls13 = engine.negotiatedVersion == TlsRecord.VersionTls13;
+        TlsByteWriter body = new TlsByteWriter();
+        if (tls13) { body.WriteU8(0); }
+        body.WriteU24(3 + cert.RawDerLen() + (tls13 ? 2 : 0));
+        body.WriteU24(cert.RawDerLen()); body.WriteBytes(cert.RawDer(), 0, cert.RawDerLen());
+        if (tls13) { body.WriteU16(0); }
+        return FeedHandshake(engine, TlsRecord.HandshakeCertificate, body.ToArray());
+    }
+    // Valid Finished MAC and traffic keys isolate the authentication guard from
+    // cryptographic/framing failures; no network peer or private key is needed.
+    static int Finish13(TlsEngine engine) {
+        engine.negotiatedVersion = TlsRecord.VersionTls13;
+        engine.state = TlsEngine.StateTls13Handshake;
+        engine.receivedEncryptedExtensions = true;
+        engine.serverHsTraffic = new byte[32];
+        engine.clientHsTraffic = new byte[32];
+        engine.handshakeSecret = new byte[32];
+        engine.writeCipher = new TlsCipherState(TlsRecord.VersionTls13, new byte[16], new byte[12]);
+        byte[] finishedKey = Hkdf.ExpandLabel(engine.serverHsTraffic, "finished", null, 32);
+        byte[] hash = engine.transcript.CurrentHash();
+        byte[] body = Hmac.Sha256(finishedKey, finishedKey.Length, hash, hash.Length);
+        byte[] message = new byte[36];
+        message[0] = (byte)TlsRecord.HandshakeFinished;
+        message[3] = 32;
+        NativeMemory.Copy((nint)message + 4, body, 32);
+        TlsCipherState writer = new TlsCipherState(TlsRecord.VersionTls13, new byte[16], new byte[12]);
+        engine.readCipher = new TlsCipherState(TlsRecord.VersionTls13, new byte[16], new byte[12]);
+        byte[] record = writer.Encrypt(TlsRecord.ContentTypeHandshake, message, 0, message.Length);
+        if (record == null) { return -2; }
+        engine.FeedNetwork(record, 0, record.Length);
+        return engine.Step();
+    }
+    static void FinishedDenied(TlsEngine engine, string name) {
+        int result = Finish13(engine);
+        Check(result < 0 && engine.state == TlsEngine.StateFailed && !engine.peerAuthenticated
+            && engine.outNet.Length() == 0, name);
+    }
+    static int FeedFinished12(TlsEngine engine, bool encrypted) {
+        byte[] hash = engine.transcript.CurrentHash();
+        byte[] body = Hkdf.Tls12Prf(engine.tls12MasterSecret, "server finished", hash, 12);
+        byte[] message = new byte[16];
+        message[0] = (byte)TlsRecord.HandshakeFinished;
+        message[3] = 12;
+        NativeMemory.Copy((nint)message + 4, body, 12);
+        byte[] record = null;
+        if (encrypted) {
+            TlsCipherState writer = new TlsCipherState(TlsRecord.VersionTls12,
+                engine.tls12ServerWriteKey, engine.tls12ServerWriteIv);
+            record = writer.Encrypt(TlsRecord.ContentTypeHandshake, message, 0, message.Length);
+        } else {
+            record = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake,
+                TlsRecord.VersionTls12, message, 0, message.Length);
+        }
+        if (record == null) { return -2; }
+        engine.FeedNetwork(record, 0, record.Length);
+        return engine.Step();
+    }
+    static TlsEngine Ready12(X509Certificate peer, List<X509Certificate> roots) {
+        TlsEngine engine = Client(peer, roots, "secure.example");
+        engine.disableVerify = true;
+        engine.negotiatedVersion = TlsRecord.VersionTls12;
+        engine.state = TlsEngine.StateTls12WaitingFinished;
+        engine.tls12MasterSecret = new byte[48];
+        engine.tls12ServerWriteKey = new byte[16];
+        engine.tls12ServerWriteIv = new byte[4];
+        engine.readCipher = new TlsCipherState(TlsRecord.VersionTls12,
+            engine.tls12ServerWriteKey, engine.tls12ServerWriteIv);
+        return engine;
+    }
     static void Main() {
         X509Certificate root = Decode(ROOT);
         X509Certificate leaf = Decode(LEAF);
@@ -59,13 +147,61 @@ class Program {
         tls12.negotiatedVersion = TlsRecord.VersionTls12;
         tls12.clientRandom = new byte[32]; tls12.serverRandom = new byte[32];
         for (int i = 0; i < 32; i = i + 1) { tls12.clientRandom[i] = 1; tls12.serverRandom[i] = 2; }
-        Check(tls12.HandleServerKeyExchange(new byte[0], skeBody) == 0 && tls12.handshakeSignatureVerified,
+        Check(FeedHandshake(tls12, TlsRecord.HandshakeServerKeyExchange, skeBody) == 0 && tls12.handshakeSignatureVerified,
             "TLS 1.2 handshake authentic signature accepted");
         skeBody[40] = (byte)((skeBody[40] & 255) ^ 1);
         TlsEngine bad12 = Client(leaf, trusted, "secure.example");
         bad12.negotiatedVersion = TlsRecord.VersionTls12;
         bad12.clientRandom = tls12.clientRandom; bad12.serverRandom = tls12.serverRandom;
-        Check(bad12.HandleServerKeyExchange(new byte[0], skeBody) < 0, "TLS 1.2 handshake forged signature refused");
+        Check(FeedHandshake(bad12, TlsRecord.HandshakeServerKeyExchange, skeBody) < 0, "TLS 1.2 handshake forged signature refused");
+        TlsEngine premature12 = new TlsEngine("secure.example", false, true, null, false,
+            null, trusted, false, "", "");
+        premature12.StartHandshake();
+        premature12.DrainNetwork();
+        Check(FeedFinished12(premature12, false) < 0 && premature12.state == TlsEngine.StateFailed
+            && !premature12.peerAuthenticated,
+            "TLS 1.2 plaintext empty-secret Finished before ServerHello rejected");
+        // Reuse the authenticated SKE fixture, with deterministic traffic keys.
+        tls12.disableVerify = true;
+        tls12.state = TlsEngine.StateTls12WaitingFinished;
+        tls12.tls12MasterSecret = new byte[48];
+        tls12.tls12ServerWriteKey = new byte[16];
+        tls12.tls12ServerWriteIv = new byte[4];
+        tls12.readCipher = new TlsCipherState(TlsRecord.VersionTls12,
+            tls12.tls12ServerWriteKey, tls12.tls12ServerWriteIv);
+        Check(FeedFinished12(tls12, true) == 1 && tls12.state == TlsEngine.StateConnected
+            && !tls12.peerAuthenticated,
+            "TLS 1.2 disabled trust verification accepts signed exchange and encrypted Finished");
+        TlsEngine noCcs12 = Client(leaf, trusted, "secure.example");
+        noCcs12.disableVerify = true;
+        noCcs12.negotiatedVersion = TlsRecord.VersionTls12;
+        noCcs12.state = TlsEngine.StateTls12WaitingFinished;
+        noCcs12.handshakeSignatureVerified = true;
+        noCcs12.tls12MasterSecret = new byte[48];
+        Check(FeedFinished12(noCcs12, false) < 0 && !noCcs12.peerAuthenticated,
+            "TLS 1.2 plaintext Finished without ChangeCipherSpec rejected");
+        TlsEngine missingCert12 = Ready12(leaf, trusted);
+        missingCert12.peerCert = null;
+        missingCert12.handshakeSignatureVerified = true;
+        missingCert12.pinRequired = true;
+        Check(FeedFinished12(missingCert12, true) < 0 && !missingCert12.peerAuthenticated,
+            "TLS 1.2 omitted certificate cannot bypass required pin");
+        TlsEngine missingSignature12 = Ready12(leaf, trusted);
+        Check(FeedFinished12(missingSignature12, true) < 0 && !missingSignature12.peerAuthenticated,
+            "TLS 1.2 disabled trust verification rejects missing signed key exchange");
+        TlsEngine failedPolicy12 = Ready12(leaf, trusted);
+        failedPolicy12.handshakeSignatureVerified = true;
+        failedPolicy12.verifyResult = 64;
+        failedPolicy12.requireOcspStapling = true;
+        Check(FeedFinished12(failedPolicy12, true) < 0 && !failedPolicy12.peerAuthenticated,
+            "TLS 1.2 disabled trust verification cannot ignore failed OCSP policy");
+        TlsEngine noIdentityDone12 = Ready12(leaf, trusted);
+        noIdentityDone12.readCipher = null;
+        noIdentityDone12.peerCert = null;
+        noIdentityDone12.handshakeSignatureVerified = true;
+        Check(FeedHandshake(noIdentityDone12, TlsRecord.HandshakeServerHelloDone, new byte[0]) < 0
+            && noIdentityDone12.lastError.IndexOf("身份未认证") >= 0,
+            "TLS 1.2 ServerHelloDone always requires certificate and signature");
         byte[] signed = new byte[130];
         for (int i = 0; i < 64; i = i + 1) { signed[i] = 32; }
         string context = "TLS 1.3, server CertificateVerify";
@@ -83,18 +219,54 @@ class Program {
         NativeMemory.Copy((nint)cvBody + 4, cvSig, cvSig.Length);
         TlsEngine tls13 = Client(leaf, trusted, "secure.example");
         tls13.negotiatedVersion = TlsRecord.VersionTls13;
-        Check(tls13.HandleCertificateVerify(new byte[0], cvBody) == 0 && tls13.handshakeSignatureVerified,
+        Check(FeedHandshake(tls13, TlsRecord.HandshakeCertificateVerify, cvBody) == 0 && tls13.handshakeSignatureVerified,
             "TLS 1.3 handshake authentic signature accepted");
+        // DisableVerify waives chain/hostname policy, never proof of possession.
+        TlsEngine disabled13 = Client(leaf, trusted, "else.example");
+        disabled13.disableVerify = true;
+        disabled13.negotiatedVersion = TlsRecord.VersionTls13;
+        int disabledPolicy = VerifyPeer(disabled13);
+        // The independent CV fixture signs an empty transcript.
+        disabled13.transcript = new TlsTranscript();
+        Check(disabledPolicy == 0
+            && FeedHandshake(disabled13, TlsRecord.HandshakeCertificateVerify, cvBody) == 0
+            && Finish13(disabled13) == 1 && disabled13.state == TlsEngine.StateConnected
+            && !disabled13.peerAuthenticated,
+            "TLS 1.3 disabled trust verification accepts signed certificate and Finished");
+        TlsEngine noCertificate = new TlsEngine("secure.example", true, false, null, false,
+            null, null, false, "", "");
+        FinishedDenied(noCertificate, "TLS 1.3 disabled trust verification rejects missing certificate");
+        TlsEngine noVerify = Client(leaf, trusted, "secure.example");
+        noVerify.disableVerify = true;
+        FinishedDenied(noVerify, "TLS 1.3 disabled trust verification rejects missing CertificateVerify");
+        TlsEngine noCertPin = new TlsEngine("secure.example", true, false, null, true,
+            null, null, false, "", "");
+        FinishedDenied(noCertPin, "TLS 1.3 omitted certificate cannot bypass required pin");
+        List<string> omittedPins = new List<string>(); omittedPins.Add("sha256/invalid");
+        TlsEngine noCertConfiguredPin = new TlsEngine("secure.example", true, false, omittedPins, false,
+            null, null, false, "", "");
+        FinishedDenied(noCertConfiguredPin, "TLS 1.3 omitted certificate cannot bypass configured pin");
+        TlsEngine noCertOcsp = new TlsEngine("secure.example", true, false, null, false,
+            (long reason, string certText) => true, null, false, "", "");
+        noCertOcsp.requireOcspStapling = true;
+        FinishedDenied(noCertOcsp, "TLS 1.3 omitted certificate cannot bypass required OCSP with accepting callback");
+        TlsEngine failedPolicy = Client(leaf, trusted, "secure.example");
+        failedPolicy.disableVerify = true;
+        failedPolicy.negotiatedVersion = TlsRecord.VersionTls13;
+        Check(FeedHandshake(failedPolicy, TlsRecord.HandshakeCertificateVerify, cvBody) == 0,
+            "TLS 1.3 failed-policy fixture has valid CertificateVerify");
+        failedPolicy.verifyResult = 63;
+        FinishedDenied(failedPolicy, "TLS 1.3 disabled trust verification cannot ignore failed certificate policy");
         cvBody[4] = (byte)((cvBody[4] & 255) ^ 1);
         TlsEngine bad13 = Client(leaf, trusted, "secure.example");
         bad13.negotiatedVersion = TlsRecord.VersionTls13;
-        Check(bad13.HandleCertificateVerify(new byte[0], cvBody) < 0, "TLS 1.3 handshake forged signature refused");
+        Check(FeedHandshake(bad13, TlsRecord.HandshakeCertificateVerify, cvBody) < 0, "TLS 1.3 handshake forged signature refused");
         Check(leaf.VerifyHost("secure.example") && leaf.VerifyHost("www.secure.example"), "SAN DNS and single-label wildcard");
         Check(!leaf.VerifyHost("else.example") && !leaf.VerifyHost("deep.www.secure.example")
             && !leaf.VerifyHost("127.0.0.1"), "SAN mismatch and IP reject");
-        Check(Client(leaf, trusted, "secure.example").VerifyCertificate() == 0, "trusted chain accepted");
-        Check(Client(leaf, null, "secure.example").VerifyCertificate() < 0, "no implicit trust roots");
-        Check(Client(leaf, trusted, "else.example").VerifyCertificate() < 0, "wrong host refused");
+        Check(VerifyPeer(Client(leaf, trusted, "secure.example")) == 0, "trusted chain accepted");
+        Check(VerifyPeer(Client(leaf, null, "secure.example")) < 0, "no implicit trust roots");
+        Check(VerifyPeer(Client(leaf, trusted, "else.example")) < 0, "wrong host refused");
         X509Certificate clientOnlyRoot = Decode(CLIENT_AUTH_ROOT);
         X509Certificate clientOnlyLeaf = Decode(CLIENT_AUTH_LEAF);
         Check(clientOnlyRoot != null && clientOnlyLeaf != null && clientOnlyRoot.ValidNow()
@@ -104,29 +276,29 @@ class Program {
         if (clientOnlyRoot != null && clientOnlyLeaf != null) {
             List<X509Certificate> restricted = new List<X509Certificate>(); restricted.Add(clientOnlyRoot);
             Check(!clientOnlyRoot.CanSignCertificates()
-                && Client(clientOnlyLeaf, restricted, "secure.example").VerifyCertificate() < 0,
+                && VerifyPeer(Client(clientOnlyLeaf, restricted, "secure.example")) < 0,
                 "clientAuth-only CA cannot authenticate TLS server");
         }
         TlsEngine policy = new TlsEngine("else.example", false, true, null, false,
             (long reason, string certText) => reason == 62 && certText.Length > 0, trusted, false, "", "");
         policy.peerCert = leaf; policy.peerChain.Add(leaf);
         policy.peerCertText = "issuer=" + leaf.Issuer() + " subject=" + leaf.Subject();
-        Check(policy.VerifyCertificate() == 0, "explicit policy accepts hostname mismatch");
+        Check(VerifyPeer(policy) == 0, "explicit policy accepts hostname mismatch");
         TlsEngine combinedFailure = new TlsEngine("else.example", false, true, null, false,
             (long reason, string certText) => reason == 62, null, false, "", "");
         combinedFailure.peerCert = leaf; combinedFailure.peerChain.Add(leaf);
-        Check(combinedFailure.VerifyCertificate() < 0 && combinedFailure.verifyResult == 19,
+        Check(VerifyPeer(combinedFailure) < 0 && combinedFailure.verifyResult == 19,
             "hostname policy cannot also waive untrusted chain");
         TlsEngine pinDisabled = new TlsEngine("else.example", true, true, null, true,
             null, null, false, "", "");
         pinDisabled.peerCert = leaf;
-        Check(pinDisabled.VerifyCertificate() < 0 && pinDisabled.verifyResult == 63,
+        Check(VerifyPeer(pinDisabled) < 0 && pinDisabled.verifyResult == 63,
             "disabled chain verification still enforces required pin");
         List<string> wrongPins = new List<string>(); wrongPins.Add("sha256/invalid");
         TlsEngine wrongPinDisabled = new TlsEngine("else.example", true, true, wrongPins, false,
             null, null, false, "", "");
         wrongPinDisabled.peerCert = leaf;
-        Check(wrongPinDisabled.VerifyCertificate() < 0 && wrongPinDisabled.verifyResult == 63,
+        Check(VerifyPeer(wrongPinDisabled) < 0 && wrongPinDisabled.verifyResult == 63,
             "disabled chain verification still rejects mismatched pin");
         Check(!leaf.VerifyHost("xn--test.secure.example") && !leaf.VerifyHost("XN--test.secure.example"),
             "wildcard refuses IDNA labels regardless of case");
@@ -135,7 +307,7 @@ class Program {
         forged[n[0] - 3] = (byte)((forged[n[0] - 3] & 255) ^ 1);
         X509Certificate fake = X509Certificate.ParseForTls(forged, n[0]);
         Check(fake != null && !fake.VerifySignedBy(root), "forged issuer signature rejected");
-        if (fake != null) { Check(Client(fake, trusted, "secure.example").VerifyCertificate() < 0, "forged chain refused"); }
+        if (fake != null) { Check(VerifyPeer(Client(fake, trusted, "secure.example")) < 0, "forged chain refused"); }
         Console.WriteLine("failures=" + Convert.ToString(failures));
     }
 }

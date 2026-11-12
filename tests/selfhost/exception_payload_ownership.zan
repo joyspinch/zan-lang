@@ -1,0 +1,504 @@
+using System;
+
+class Program {
+    // Observers never acquire Target; no static strong exception anchors.
+    static WeakReference<Exception> originalWatch;
+    static WeakReference<Exception> replacementWatch;
+    static string escapedText;
+
+    static void Reset() {
+        originalWatch = new WeakReference<Exception>(null);
+        replacementWatch = new WeakReference<Exception>(null);
+    }
+    static Exception Fresh() {
+        Exception value = new Exception("original");
+        originalWatch.SetTarget(value);
+        return value;
+    }
+    static Exception Replacement() {
+        Exception value = new Exception("replacement");
+        replacementWatch.SetTarget(value);
+        return value;
+    }
+    static void SyncFail() { throw Fresh(); }
+    static async void FailImmediate() { throw Fresh(); }
+    static async void FailAfterYield() {
+        await Task.Yield();
+        throw Fresh();
+    }
+
+    static async int TaskResultFailImmediate() { throw Fresh(); }
+    static async int TaskResultFailAfterYield() {
+        await Task.Yield();
+        throw Fresh();
+    }
+    static async int TaskResultSuccess() {
+        await Task.Yield();
+        return 75;
+    }
+    static void TaskResultOwnership() {
+        Reset();
+        {
+            Task<int> task = Task.Run(TaskResultFailImmediate());
+            try {
+                int unexpected = task.Result;
+                Console.WriteLine("task-result-immediate:unexpected=" + unexpected);
+            } catch (Exception caught) {
+                Console.WriteLine("task-result-immediate:message=" + caught.Message);
+                Console.WriteLine("task-result-immediate:inside=" + originalWatch.IsAlive);
+            }
+            Console.WriteLine("task-result-immediate:after-catch=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine("task-result-immediate:after-scope=" + originalWatch.IsAlive);
+        Reset();
+        {
+            Task<int> task = Task.Run(TaskResultFailAfterYield());
+            try {
+                int unexpected = task.Result;
+                Console.WriteLine("task-result-yield:unexpected=" + unexpected);
+            } catch (Exception caught) {
+                Console.WriteLine("task-result-yield:message=" + caught.Message);
+                Console.WriteLine("task-result-yield:inside=" + originalWatch.IsAlive);
+            }
+            Console.WriteLine("task-result-yield:after-catch=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine("task-result-yield:after-scope=" + originalWatch.IsAlive);
+        // Result consumes each handle once, including the successful control.
+        Task<int> success = Task.Run(TaskResultSuccess());
+        int value = success.Result;
+        Console.WriteLine("task-result-success:value=" + value);
+    }
+    static async int CompletionValue(bool yielded) {
+        if (yielded) { await Task.Yield(); }
+        return 76;
+    }
+    static void SyncCompletionThenThrow(bool yielded, bool result, string phase) {
+        Reset();
+        // Install the caller's handler before the successful child runs.
+        try {
+            int value;
+            if (result) {
+                Task<int> task = Task.Run(CompletionValue(yielded));
+                value = task.Result;
+            } else {
+                value = await CompletionValue(yielded);
+            }
+            Console.WriteLine(phase + ":value=" + value);
+            throw Fresh();
+        } catch (Exception caught) {
+            Console.WriteLine(phase + ":message=" + caught.Message);
+            Console.WriteLine(phase + ":inside=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine(phase + ":after=" + originalWatch.IsAlive);
+    }
+    static async void AsyncCompletionThenThrow(bool yielded, bool result, string phase) {
+        Reset();
+        try {
+            int value;
+            if (result) {
+                Task<int> task = Task.Run(CompletionValue(yielded));
+                value = task.Result;
+            } else {
+                value = await CompletionValue(yielded);
+            }
+            Console.WriteLine(phase + ":value=" + value);
+            throw Fresh();
+        } catch (Exception caught) {
+            Console.WriteLine(phase + ":message=" + caught.Message);
+            Console.WriteLine(phase + ":inside=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine(phase + ":after=" + originalWatch.IsAlive);
+    }
+    static void FreshTyped() {
+        Reset();
+        try { throw Fresh(); }
+        catch (Exception) {
+            Console.WriteLine("sync-typed:inside=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine("sync-typed:after=" + originalWatch.IsAlive);
+    }
+    static void FreshAll() {
+        Reset();
+        try { throw Fresh(); }
+        catch {
+            Console.WriteLine("sync-all:inside=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine("sync-all:after=" + originalWatch.IsAlive);
+    }
+    static void FinallyReplacement() {
+        Reset();
+        try {
+            try { throw Fresh(); }
+            finally {
+                Console.WriteLine("finally-replace:pending=" + originalWatch.IsAlive);
+                throw Replacement();
+            }
+        } catch (Exception caught) {
+            Console.WriteLine("finally-replace:message=" + caught.Message);
+            Console.WriteLine("finally-replace:inside=" + replacementWatch.IsAlive);
+        }
+        Console.WriteLine("finally-replace:original-after=" + originalWatch.IsAlive);
+        Console.WriteLine("finally-replace:replacement-after=" + replacementWatch.IsAlive);
+    }
+    static void FinallyRestore() {
+        Reset();
+        try {
+            try { throw Fresh(); }
+            finally {
+                Console.WriteLine("finally-restore:pending=" + originalWatch.IsAlive);
+                try { throw Replacement(); }
+                catch (Exception) {
+                    Console.WriteLine("finally-restore:nested=" + replacementWatch.IsAlive);
+                }
+                Console.WriteLine("finally-restore:continued=" + originalWatch.IsAlive);
+            }
+        } catch (Exception caught) {
+            Console.WriteLine("finally-restore:message=" + caught.Message);
+            Console.WriteLine("finally-restore:inside=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine("finally-restore:original-after=" + originalWatch.IsAlive);
+        Console.WriteLine("finally-restore:replacement-after=" + replacementWatch.IsAlive);
+    }
+    static async void AsyncFinallyRestore() {
+        try {
+            try { await FailAfterYield(); }
+            finally {
+                await Task.Yield();
+                Console.WriteLine("async-restore:pending=" + originalWatch.IsAlive);
+                try { throw Replacement(); }
+                catch (Exception) {
+                    await Task.Yield();
+                    Console.WriteLine("async-restore:nested=" + replacementWatch.IsAlive);
+                }
+                await Task.Yield();
+                Console.WriteLine("async-restore:continued=" + originalWatch.IsAlive);
+            }
+        } catch (Exception caught) {
+            await Task.Yield();
+            Console.WriteLine("async-restore:message=" + caught.Message);
+            Console.WriteLine("async-restore:inside=" + originalWatch.IsAlive);
+        }
+    }
+    static async void AsyncFinallyReplacement() {
+        try {
+            try { await FailAfterYield(); }
+            finally {
+                await Task.Yield();
+                Console.WriteLine("async-replace:pending=" + originalWatch.IsAlive);
+                throw Replacement();
+            }
+        } catch (Exception caught) {
+            await Task.Yield();
+            Console.WriteLine("async-replace:message=" + caught.Message);
+            Console.WriteLine("async-replace:inside=" + replacementWatch.IsAlive);
+        }
+    }
+    static void NamedBorrowed() {
+        Reset();
+        {
+            Exception local = new Exception("borrowed");
+            originalWatch.SetTarget(local);
+            try { throw local; }
+            catch (Exception caught) {
+                Console.WriteLine("borrowed:same=" + (caught == local));
+            }
+            Console.WriteLine("borrowed:after-catch=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine("borrowed:after-scope=" + originalWatch.IsAlive);
+    }
+    static async void AsyncNamedBorrowed() {
+        Reset();
+        {
+            Exception local = new Exception("borrowed");
+            originalWatch.SetTarget(local);
+            await Task.Yield();
+            try { throw local; }
+            catch (Exception caught) {
+                Console.WriteLine("async-borrowed:same=" + (caught == local));
+                Console.WriteLine("async-borrowed:inside=" + originalWatch.IsAlive);
+                await Task.Yield();
+                Console.WriteLine("async-borrowed:resumed=" + originalWatch.IsAlive);
+            }
+            // The enclosing local owns the payload after the handler retires.
+            Console.WriteLine("async-borrowed:after-catch=" + originalWatch.IsAlive);
+            await Task.Yield();
+            Console.WriteLine("async-borrowed:after-catch-resumed=" + originalWatch.IsAlive);
+            Console.WriteLine("async-borrowed:message=" + local.Message);
+        }
+        Console.WriteLine("async-borrowed:after-scope=" + originalWatch.IsAlive);
+    }
+    static void NestedBare() {
+        Reset();
+        try {
+            try { throw Fresh(); }
+            catch (Exception binding) {
+                try { throw; }
+                catch (Exception inner) {
+                    Console.WriteLine("bare:inner-same=" + (inner == binding));
+                    Console.WriteLine("bare:inner-alive=" + originalWatch.IsAlive);
+                }
+                Console.WriteLine("bare:continued=" + originalWatch.IsAlive);
+                binding = Replacement();
+                // The immutable original snapshot survives both the inner
+                // handler's completion and reassignment of the named binding.
+                throw;
+            }
+        } catch (Exception outer) {
+            Console.WriteLine("bare:outer-message=" + outer.Message);
+            Console.WriteLine("bare:outer-alive=" + originalWatch.IsAlive);
+        }
+        Console.WriteLine("bare:original-after=" + originalWatch.IsAlive);
+        Console.WriteLine("bare:binding-after=" + replacementWatch.IsAlive);
+    }
+    static Exception ReturnBinding() {
+        try { throw Fresh(); }
+        catch (Exception binding) {
+            Console.WriteLine("binding-return:inside=" + originalWatch.IsAlive);
+            return binding;
+        }
+    }
+    static void BindingReturn() {
+        Reset();
+        {
+            Exception escaped = ReturnBinding();
+            Console.WriteLine("binding-return:escaped=" + originalWatch.IsAlive);
+            // This read has a live, explicit owner: escaped.
+            Console.WriteLine("binding-return:message=" + escaped.Message);
+        }
+        Console.WriteLine("binding-return:after=" + originalWatch.IsAlive);
+    }
+    static async Exception AsyncReturnBinding() {
+        try { await FailAfterYield(); }
+        catch (Exception binding) {
+            Console.WriteLine("async-binding-return:inside=" + originalWatch.IsAlive);
+            await Task.Yield();
+            Console.WriteLine("async-binding-return:resumed=" + originalWatch.IsAlive);
+            return binding;
+        }
+    }
+    static async void AsyncBindingReturn() {
+        Reset();
+        {
+            Exception escaped = await AsyncReturnBinding();
+            Console.WriteLine("async-binding-return:escaped=" + originalWatch.IsAlive);
+            await Task.Yield();
+            Console.WriteLine("async-binding-return:escaped-resumed=" + originalWatch.IsAlive);
+            // Only this local owns the returned payload; observers stay weak.
+            Console.WriteLine("async-binding-return:message=" + escaped.Message);
+        }
+        Console.WriteLine("async-binding-return:after=" + originalWatch.IsAlive);
+    }
+    static void ThrowBinding() {
+        try { throw Fresh(); }
+        catch (Exception binding) {
+            binding = Replacement();
+            throw binding;
+        }
+    }
+    static void BindingThrow() {
+        Reset();
+        try { ThrowBinding(); }
+        catch (Exception escaped) {
+            Console.WriteLine("binding-throw:message=" + escaped.Message);
+            Console.WriteLine("binding-throw:inside=" + replacementWatch.IsAlive);
+        }
+        Console.WriteLine("binding-throw:original-after=" + originalWatch.IsAlive);
+        Console.WriteLine("binding-throw:replacement-after=" + replacementWatch.IsAlive);
+    }
+    static int FinallyReturn() {
+        try { throw Fresh(); }
+        finally {
+            Console.WriteLine("finally-return:pending=" + originalWatch.IsAlive);
+            return 73;
+        }
+    }
+    static async int AsyncFinallyReturn() {
+        try { await FailAfterYield(); }
+        finally {
+            Console.WriteLine("async-return:pending=" + originalWatch.IsAlive);
+            await Task.Yield();
+            Console.WriteLine("async-return:resumed=" + originalWatch.IsAlive);
+            return 74;
+        }
+    }
+
+    static async void AsyncTyped(int mode, string phase) {
+        try {
+            if (mode == 0) {
+                await Task.Yield();
+                throw Fresh();
+            }
+            if (mode == 1) {
+                await Task.Yield();
+                SyncFail();
+            }
+            if (mode == 2) { await FailImmediate(); }
+            if (mode == 3) { await FailAfterYield(); }
+        } catch (Exception) {
+            Console.WriteLine(phase + ":inside=" + originalWatch.IsAlive);
+            await Task.Yield();
+            Console.WriteLine(phase + ":resumed=" + originalWatch.IsAlive);
+        }
+    }
+    static async void AsyncAll() {
+        try { await FailAfterYield(); }
+        catch {
+            Console.WriteLine("async-all:inside=" + originalWatch.IsAlive);
+            await Task.Yield();
+            Console.WriteLine("async-all:resumed=" + originalWatch.IsAlive);
+        }
+    }
+    static async void AsyncBare() {
+        try {
+            try { await FailAfterYield(); }
+            catch (Exception binding) {
+                await Task.Yield();
+                try { throw; }
+                catch (Exception inner) {
+                    await Task.Yield();
+                    Console.WriteLine("async-bare:inner-same=" + (inner == binding));
+                    Console.WriteLine("async-bare:inner-alive=" + originalWatch.IsAlive);
+                }
+                Console.WriteLine("async-bare:continued=" + originalWatch.IsAlive);
+                binding = Replacement();
+                await Task.Yield();
+                throw;
+            }
+        } catch (Exception outer) {
+            Console.WriteLine("async-bare:outer-message=" + outer.Message);
+            Console.WriteLine("async-bare:outer-alive=" + originalWatch.IsAlive);
+        }
+    }
+
+    static string FreshText() {
+        // Dynamic NUL-containing payload. String checks below establish
+        // content preservation and usability after catch/await/escape only;
+        // they do not measure string ARC ownership or allocation reclamation.
+        string tail = "B";
+        return "A\0" + tail;
+    }
+    static void CheckText(string phase, string text) {
+        Console.WriteLine(phase + ":length=" + text.Length);
+        Console.WriteLine(phase + ":nul=" + (text[1] == '\0'));
+        Console.WriteLine(phase + ":tail=" + (text[2] == 'B'));
+    }
+    static string ReturnTextBinding() {
+        try { throw FreshText(); }
+        catch (string binding) {
+            try { throw; }
+            catch (string inner) { CheckText("string-inner", inner); }
+            escapedText = binding;
+            return binding;
+        }
+    }
+    static string ReturnReassignedText() {
+        try { throw "discarded"; }
+        catch (string binding) {
+            binding = FreshText();
+            escapedText = binding;
+            return binding;
+        }
+    }
+    static async void FailTextAfterYield() {
+        await Task.Yield();
+        throw FreshText();
+    }
+    static async string AsyncTextBinding() {
+        try { await FailTextAfterYield(); }
+        catch (string binding) {
+            await Task.Yield();
+            CheckText("async-string:resumed", binding);
+            try { throw; }
+            catch (string inner) {
+                await Task.Yield();
+                CheckText("async-string:inner", inner);
+            }
+            await Task.Yield();
+            CheckText("async-string:continued", binding);
+            escapedText = binding;
+            return binding;
+        }
+    }
+    static void StringBindings() {
+        {
+            string returned = ReturnTextBinding();
+            CheckText("string-return", returned);
+        }
+        // Check the original caught string through the field after the
+        // returned local leaves scope; no string lifetime oracle is claimed.
+        CheckText("string-field", escapedText);
+        escapedText = null;
+        {
+            string reassigned = ReturnReassignedText();
+            CheckText("string-reassigned-return", reassigned);
+        }
+        CheckText("string-reassigned-field", escapedText);
+        escapedText = null;
+        // Null-throw semantics are deliberately not guessed by this fixture.
+    }
+
+    static void Main() {
+        FreshTyped();
+        FreshAll();
+        FinallyReplacement();
+        FinallyRestore();
+        Reset();
+        await AsyncFinallyRestore();
+        Console.WriteLine("async-restore:original-after=" + originalWatch.IsAlive);
+        Console.WriteLine("async-restore:replacement-after=" + replacementWatch.IsAlive);
+        Reset();
+        await AsyncFinallyReplacement();
+        Console.WriteLine("async-replace:original-after=" + originalWatch.IsAlive);
+        Console.WriteLine("async-replace:replacement-after=" + replacementWatch.IsAlive);
+        NamedBorrowed();
+        await AsyncNamedBorrowed();
+        Console.WriteLine("async-borrowed:after-await=" + originalWatch.IsAlive);
+        NestedBare();
+        BindingReturn();
+        await AsyncBindingReturn();
+        Console.WriteLine("async-binding-return:after-await=" + originalWatch.IsAlive);
+        BindingThrow();
+        Reset();
+        Console.WriteLine("finally-return:value=" + FinallyReturn());
+        Console.WriteLine("finally-return:after=" + originalWatch.IsAlive);
+        Reset();
+        await AsyncTyped(0, "async-fresh");
+        Console.WriteLine("async-fresh:after-await=" + originalWatch.IsAlive);
+        Reset();
+        await AsyncTyped(1, "sync-to-async");
+        Console.WriteLine("sync-to-async:after-await=" + originalWatch.IsAlive);
+        Reset();
+        await AsyncTyped(2, "await-immediate");
+        Console.WriteLine("await-immediate:after-await=" + originalWatch.IsAlive);
+        Reset();
+        await AsyncTyped(3, "await-failed");
+        Console.WriteLine("await-failed:after-await=" + originalWatch.IsAlive);
+        Reset();
+        await AsyncAll();
+        Console.WriteLine("async-all:after-await=" + originalWatch.IsAlive);
+        Reset();
+        await AsyncBare();
+        Console.WriteLine("async-bare:original-after=" + originalWatch.IsAlive);
+        Console.WriteLine("async-bare:binding-after=" + replacementWatch.IsAlive);
+        Reset();
+        Console.WriteLine("async-return:value=" + await AsyncFinallyReturn());
+        Console.WriteLine("async-return:after-await=" + originalWatch.IsAlive);
+        TaskResultOwnership();
+        SyncCompletionThenThrow(false, false, "complete-sync-await-immediate");
+        SyncCompletionThenThrow(true, false, "complete-sync-await-yield");
+        SyncCompletionThenThrow(false, true, "complete-sync-result-immediate");
+        SyncCompletionThenThrow(true, true, "complete-sync-result-yield");
+        await AsyncCompletionThenThrow(false, false, "complete-async-await-immediate");
+        await AsyncCompletionThenThrow(true, false, "complete-async-await-yield");
+        await AsyncCompletionThenThrow(false, true, "complete-async-result-immediate");
+        await AsyncCompletionThenThrow(true, true, "complete-async-result-yield");
+        StringBindings();
+        {
+            string returned = await AsyncTextBinding();
+            CheckText("async-string:return", returned);
+        }
+        CheckText("async-string:field", escapedText);
+        escapedText = null;
+        Console.WriteLine("payload:done");
+    }
+}

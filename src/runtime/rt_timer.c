@@ -1,5 +1,11 @@
 #if !defined(_WIN32) && !defined(__APPLE__)
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
+/* timegm is a GNU/BSD extension used for UTC/local offset conversion. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #endif
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -91,4 +97,5 @@ static void timer_yield(void) { sched_yield(); }
 #include "timer/rt_timer_diag.c"
 #include "timer/rt_timer_core.c"
 #include "timer/rt_timer_co.c"
+#include "timer/rt_timer_task.c"
 #include "timer/rt_timer_misc.c"

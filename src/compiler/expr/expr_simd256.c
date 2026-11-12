@@ -424,8 +424,8 @@ bool emit_sse42_call(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     /* 仅在支持的 x86 目标平台生成硬件指令，其他平台使用可移植算法模拟 */
-    bool hw_crc = strstr(g->target_triple, "x86") != NULL ||
-                  strstr(g->target_triple, "amd64") != NULL;
+    bool hw_crc = emit_target_is_x86(g) &&
+                  (!g->cpu_profile || strcmp(g->cpu_profile, "baseline") != 0);
 
     if (method.len == 5 && memcmp(method.str, "Crc32", 5) == 0 && argc == 2) {
         zan_ast_node_t *arg0 = expr->call.args.items[0];

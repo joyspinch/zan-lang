@@ -6,9 +6,10 @@
  * 协程句柄被丢弃，`await` 不到（而控制器动作绝大多数 `async`，且异常要
  * 沿 await 链回到 WebApp 的错误处理）。
  *
- * 所以派发在编译期展开成强类型调用：本函数扫描编译单元里的用户控制器
- * （跳过 stdlib / packages 来源，口径同 checker_collect_controllers），
- * 合成一个 __ZanActionDispatch 类——每个动作一条 `if (actionKey == "...")`
+ * 所以派发在编译期展开成强类型调用：Register 发现用户控制器，显式调用
+ * RegisterFramework 才启用其 typeof 白名单里的框架控制器（来源可为包或
+ * 显式源码输入）。合成 __ZanActionDispatch 的 Dispatch/DispatchFramework，
+ * 每个动作一条 `if (actionKey == "...")`
  * 分支，分支内 new 控制器 → Bind(ctx) → 参数绑定 → 前置钩子 → await 动作
  * → 后置钩子。checker 在 __AttrRoutes.Register 调用点把它作为第三实参传给
  * 框架（Register(app, controllers, dispatcher)）。
@@ -207,9 +208,9 @@ static bool zd_class_is_controller(zan_ast_node_t *unit, zan_ast_node_t *decl,
 
 /* 生成一条动作分支；返回 false 表示签名不可绑定（跳过该动作）。 */
 static bool zd_emit_action(zd_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
-                           const char *full, const char *short_name,
+                           const char *full, const char *view_owner,
                            bool class_tx, bool class_ro) {
-    if (!b->buf || !m || !full || !short_name) return false;
+    if (!b->buf || !m || !full || !view_owner) return false;
     if (m->kind != AST_METHOD_DECL) return false;
     if (!m->method_decl.name.str || m->method_decl.name.len == 0) return false;
     if (m->method_decl.type_params.count > 0) return false;   /* 泛型动作 */
@@ -268,7 +269,7 @@ static bool zd_emit_action(zd_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
     char mname[192];
     snprintf(mname, sizeof(mname), "%.*s", (int)m->method_decl.name.len,
              m->method_decl.name.str);
-    zd_putf(b, "        if (actionKey == \"%s.%s\") {\n", short_name, mname);
+    zd_putf(b, "        if (actionKey == \"%s.%s\") {\n", full, mname);
 
     /* 参数绑定：实例动作借控制器上的 Need* / In*（带 ApiError 中止语义），
        静态动作没有实例，直接读 ctx 并在缺失时抛同样的 ApiError。
@@ -374,6 +375,7 @@ static bool zd_emit_action(zd_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
     } else {
         zd_putf(b, "            %s __c = new %s();\n", full, full);
         zd_putf(b, "            __c.Bind(ctx);\n");
+        zd_putf(b, "            __c.SetView(\"%s.%s\");\n", view_owner, mname);
         if (ro) zd_putf(b, "            __c.UseReadOnly();\n");
         if (tx) zd_putf(b, "            bool __tx = false;\n");
         zd_putf(b, "            try {\n");
@@ -404,23 +406,15 @@ static bool zd_emit_action(zd_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
 }
 
 typedef struct {
-    int found;
+    bool app;
+    bool framework;
 } zd_probe_t;
 
 static zan_walk_action_t zd_probe_register(zan_ast_node_t *n, void *ud) {
     zd_probe_t *p = (zd_probe_t *)ud;
-    if (n && n->kind == AST_CALL && n->call.callee &&
-        n->call.callee->kind == AST_MEMBER_ACCESS &&
-        n->call.callee->member.name.len == 8 && n->call.callee->member.name.str &&
-        memcmp(n->call.callee->member.name.str, "Register", 8) == 0) {
-        zan_ast_node_t *obj = n->call.callee->member.object;
-        if (obj && obj->kind == AST_IDENTIFIER && obj->ident.name.len == 12 &&
-            obj->ident.name.str &&
-            memcmp(obj->ident.name.str, "__AttrRoutes", 12) == 0) {
-            p->found = 1;
-            return ZAN_WALK_ABORT;
-        }
-    }
+    int registration = zan_routes_registration(n);
+    if (registration == 1) p->app = true;
+    if (registration == 2) p->framework = true;
     return ZAN_WALK_CONTINUE;
 }
 
@@ -428,71 +422,99 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
                                       zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     zd_probe_t probe = {0};
-    for (int i = 0; i < unit->comp_unit.decls.count && !probe.found; i++)
-        zan_ast_walk(unit->comp_unit.decls.items[i], zd_probe_register, NULL,
-                     &probe);
-    if (!probe.found) return;
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *d = unit->comp_unit.decls.items[i];
+        if (d && !d->from_stdlib && !d->from_package)
+            zan_ast_walk(d, zd_probe_register, NULL, &probe);
+    }
+    if (!probe.app && !probe.framework) return;
 
     zd_buf_t b;
     memset(&b, 0, sizeof(b));
     zd_putf(&b, "/* 由编译器合成的动作派发器（勿手改）：约定路由的 handler 统一是\n");
     zd_putf(&b, "   __AttrRoutes.Dispatch，实际控制器方法调用在这里按 actionKey 展开。 */\n");
     zd_putf(&b, "class __ZanActionDispatch {\n");
-    zd_putf(&b, "    public static async bool Dispatch(System.Web.HttpContext ctx, string actionKey) {\n");
-
-    int emitted = 0;
     int skipped = 0;
-    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
-        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
-        if (!decl || decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str)
-            continue;
-        if (decl->from_stdlib || decl->from_package) continue;
-        if (decl->type_decl.modifiers & MOD_ABSTRACT) continue;
-        if (decl->type_decl.type_params.count > 0) continue;
-        if (!zd_class_is_controller(unit, decl, 0)) continue;
+    for (int framework = 0; framework <= 1; framework++) {
+        /* Both entry points exist even if one set is empty. Only an explicit
+         * RegisterFramework call enables generation of framework action bodies. */
+        zd_putf(&b, "    public static async bool %s(System.Web.HttpContext ctx, string actionKey) {\n",
+                framework ? "DispatchFramework" : "Dispatch");
+        int emitted = 0;
+        for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+            zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+            if (!decl || decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str)
+                continue;
+            if (decl->from_stdlib) continue;
+            bool framework_controller = zan_routes_framework_controller(unit, decl);
+            if (framework) {
+                if (!probe.framework || !framework_controller) continue;
+            } else {
+                if (!probe.app || decl->from_package || framework_controller) continue;
+            }
+            if (decl->type_decl.modifiers & MOD_ABSTRACT) continue;
+            if (decl->type_decl.type_params.count > 0) continue;
+            if (!zd_class_is_controller(unit, decl, 0)) continue;
 
-        char full[512];
-        zan_istr_t ns = zan_ast_ns_name(decl);
-        if (ns.len > 0 && ns.str)
-            snprintf(full, sizeof(full), "%.*s.%.*s", (int)ns.len, ns.str,
-                     (int)decl->type_decl.name.len, decl->type_decl.name.str);
-        else
-            snprintf(full, sizeof(full), "%.*s", (int)decl->type_decl.name.len,
-                     decl->type_decl.name.str);
+            char full[512];
+            zan_istr_t ns = zan_ast_ns_name(decl);
+            /* Both the next nsresolve pass and reflection's render_type_full use
+             * the rewritten identity. App and framework keys must both match
+             * TypeInfo.FullName, including namespace-qualified collision names. */
+            if (ns.len > 0 && ns.str)
+                snprintf(full, sizeof(full), "%.*s.%.*s", (int)ns.len, ns.str,
+                         (int)decl->type_decl.name.len, decl->type_decl.name.str);
+            else
+                snprintf(full, sizeof(full), "%.*s", (int)decl->type_decl.name.len,
+                         decl->type_decl.name.str);
 
-        /* 动作键短名口径同框架：剥最后一段命名空间，'_' 视作嵌套分隔符 */
-        char short_name[256];
-        snprintf(short_name, sizeof(short_name), "%.*s",
-                 (int)decl->type_decl.name.len, decl->type_decl.name.str);
-        {
-            char *u = strrchr(short_name, '_');
-            if (u && u[1]) memmove(short_name, u + 1, strlen(u + 1) + 1);
-        }
+            /* View.LoadRec keys use source namespace segments and file stems,
+             * not reflection's collision identity. MVC views omit only the
+             * conventional Zan.Web prefix and retain the Controller suffix. */
+            zan_istr_t view_ns = ns;
+            zan_istr_t simple = zan_routes_simple_name(decl);
+            if (view_ns.len == 7 && memcmp(view_ns.str, "Zan.Web", 7) == 0)
+                view_ns.len = 0;
+            else if (view_ns.len > 8 && memcmp(view_ns.str, "Zan.Web.", 8) == 0) {
+                view_ns.str += 8;
+                view_ns.len -= 8;
+            }
+            char view_owner[512];
+            if (view_ns.len > 0)
+                snprintf(view_owner, sizeof(view_owner), "%.*s.%.*s",
+                         (int)view_ns.len, view_ns.str, (int)simple.len, simple.str);
+            else
+                snprintf(view_owner, sizeof(view_owner), "%.*s",
+                         (int)simple.len, simple.str);
 
-        bool class_tx = zd_has_attr(decl, "Tx");
-        bool class_ro = zd_has_attr(decl, "ReadOnly");
-        for (int j = 0; j < decl->type_decl.members.count; j++) {
-            zan_ast_node_t *m = decl->type_decl.members.items[j];
-            if (!m || m->kind != AST_METHOD_DECL) continue;
-            if (m->method_decl.modifiers & MOD_PRIVATE) continue;
-            if (m->method_decl.modifiers & MOD_ABSTRACT) continue;
-            if (zd_emit_action(&b, unit, m, full, short_name, class_tx, class_ro))
-                emitted++;
-            else {
-                bool idx = false;
-                if (zd_is_action_method(m, &idx)) skipped++;
+            bool class_tx = zd_has_attr(decl, "Tx");
+            bool class_ro = zd_has_attr(decl, "ReadOnly");
+            for (int j = 0; j < decl->type_decl.members.count; j++) {
+                zan_ast_node_t *m = decl->type_decl.members.items[j];
+                if (!m || m->kind != AST_METHOD_DECL) continue;
+                if (m->method_decl.modifiers & MOD_PRIVATE) continue;
+                if (m->method_decl.modifiers & MOD_ABSTRACT) continue;
+                if (zd_emit_action(&b, unit, m, full, view_owner, class_tx, class_ro))
+                    emitted++;
+                else {
+                    bool idx = false;
+                    if (zd_is_action_method(m, &idx)) skipped++;
+                }
             }
         }
-    }
 
-    if (emitted == 0) zd_putf(&b, "        await Task.Delay(0);\n");
-    zd_putf(&b, "        return false;\n");
-    zd_putf(&b, "    }\n}\n");
+        if (emitted == 0) zd_putf(&b, "        await Task.Delay(0);\n");
+        zd_putf(&b, "        return false;\n");
+        zd_putf(&b, "    }\n");
+        zan_compile_trace("%s action dispatch: %d emitted",
+                          framework ? "framework" : "app", emitted);
+    }
+    zd_putf(&b, "}\n");
 
     if (!b.buf) return;
     if (skipped > 0)
-        zan_compile_trace("action dispatch: %d emitted, %d skipped "
-                          "(unsupported signature)", emitted, skipped);
+        zan_compile_trace("action dispatch: %d skipped "
+                          "(unsupported signature)", skipped);
 
     size_t slen = b.len;
     char *src = zan_arena_strdup(arena, b.buf, slen);

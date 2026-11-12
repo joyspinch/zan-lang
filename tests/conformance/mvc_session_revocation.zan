@@ -1,0 +1,143 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.Net.Sockets;
+using System.Threading;
+using System.Web;
+using Zan.Web;
+using Zan.Web.Core;
+using Zan.Web.Dao;
+using Zan.Web.Model;
+using Zan.Web.Security;
+
+class Program {
+    static int failures = 0;
+    static AtomicInt served = new AtomicInt(0);
+
+    static void Check(bool valid, string name) {
+        Console.WriteLine((valid ? "ok " : "FAIL ") + name);
+        if (!valid) { failures = failures + 1; }
+    }
+
+    static async void Protected(HttpContext ctx) { ctx.Text("authenticated"); }
+
+    static async void ServeOne(WebApp app, TcpListener listener) {
+        nint socket = await listener.AcceptAsync();
+        if (socket >= 0) { await app.HandleConnection(socket); }
+        long completed = served.Increment();
+    }
+
+    static async bool Status(WebApp app, TcpListener listener, string path,
+            string headers, string expected) {
+        long completed = served.Load();
+        Task.Spawn(ServeOne(app, listener));
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", 19589, 3000);
+        int sent = await client.SendAsync("GET " + path + " HTTP/1.1\r\nHost: local.test\r\n"
+            + "Connection: close\r\n" + headers + "\r\n");
+        string response = "";
+        for (int i = 0; i < 16; i = i + 1) {
+            string chunk = await client.RecvAsync(8192, 2000);
+            if (chunk.Length == 0) { break; }
+            response = response + chunk;
+            if (response.Contains("\r\n")) { break; }
+        }
+        client.Close();
+        for (int i = 0; i < 100 && served.Load() == completed; i = i + 1) {
+            await Task.Delay(10);
+        }
+        return served.Load() == completed + 1
+            && response.StartsWith("HTTP/1.1 " + expected + " ");
+    }
+
+    static async int Main() {
+        Socket.Initialize();
+        SqliteConnection db = SqliteConnection.Open(":memory:");
+        IZanSql orm = ZanSql.FromConnection(db);
+        AppServices.Use(new AppServices(null, null, orm));
+        await db.SyncStructureAsync<SysUser>();
+        Cfg.Auth.secret = "session-revocation-public-fixture-key";
+        Cfg.Auth.iter = 1000;
+        SysUser user = new SysUser();
+        user.username = "session-revocation-fixture";
+        user.status = AuthUser.Active;
+        user.tokenVersion = 1;
+        user.passwordHash = AuthUser.NewHash("original-fixture-password");
+        int id = await db.Insert<SysUser>(user).ExecuteIdentityAsync();
+        string uid = Convert.ToString(id);
+        SysUserDao dao = new SysUserDao(orm);
+        string token = await AuthUser.Login(user.username, "original-fixture-password");
+        Check(token.Length > 0 && await AuthToken.Resolve(token) == uid,
+            "issued session resolves before reset");
+        AuthUser.StoreVersion(uid, 1, WebApp.NowSeconds());
+        Check(AuthUser.CachedVersion(uid, WebApp.NowSeconds()) == 1,
+            "session fixture warms version cache");
+        Check(await dao.ResetPassword(id, "", AuthUser.NewHash("replacement-fixture-password"),
+            WebApp.NowSeconds()) == 1, "password reset changes one account");
+        SysUser changed = await dao.ById(id);
+        Check(changed != null && changed.tokenVersion == 2,
+            "password reset atomically increments stored version");
+        AuthUser.Forget(uid);
+        Check(await AuthToken.Resolve(token) == "",
+            "password reset with invalidation rejects issued session");
+        WebApp app = new WebApp("127.0.0.1", 19589);
+        app.LoginPath("/account/login");
+        app.AuthResolver(AuthToken.Resolve);
+        app.Get("/api/auth/me", Protected).Login();
+        app.Get("/api", Protected).Login();
+        app.Get("/account", Protected).Login();
+        app.Get("/apiculture", Protected).Login();
+        TcpListener listener = new TcpListener("127.0.0.1", 19589);
+        listener.Start();
+        Check(await Status(app, listener, "/api/auth/me", "Cookie: zsession=" + token + "\r\n", "401"),
+            "revoked cookie API request returns 401 without accept header");
+        Check(await Status(app, listener, "/api/auth/me", "Authorization: Bearer " + token + "\r\n", "401"),
+            "revoked bearer API request returns 401");
+        Check(await Status(app, listener, "/api/auth/me", "Accept: text/html\r\n", "401"),
+            "anonymous API request cannot negotiate login redirect");
+        Check(await Status(app, listener, "/api", "", "401"),
+            "API root returns 401");
+        Check(await Status(app, listener, "/account", "Cookie: zsession=" + token + "\r\n", "302"),
+            "revoked page session redirects to login");
+        Check(await Status(app, listener, "/apiculture", "", "302"),
+            "API convention respects path segment boundary");
+        Check(await Status(app, listener, "/account", "Accept: application/json\r\n", "401"),
+            "page JSON request returns 401");
+        Check(await AuthUser.Login(user.username, "original-fixture-password") == "",
+            "previous password cannot log in");
+        string fresh = await AuthUser.Login(user.username, "replacement-fixture-password");
+        Check(fresh.Length > 0 && await AuthToken.Resolve(fresh) == uid,
+            "replacement password establishes valid session");
+        Check(await Status(app, listener, "/api/auth/me", "Cookie: zsession=" + fresh + "\r\n", "200"),
+            "replacement session reaches protected API");
+        Check(await dao.BumpTokenVersion(id) == 1, "forced logout changes one account");
+        AuthUser.Forget(uid);
+        // A different worker or an already-started read can still carry this
+        // process-local entry after another request completes the mutation.
+        AuthUser.StoreVersion(uid, 2, WebApp.NowSeconds());
+        Check(await AuthToken.Resolve(fresh) == "",
+            "stale process cache cannot restore revoked session");
+        string latest = await AuthUser.Login(user.username, "replacement-fixture-password");
+        Check(latest.Length > 0 && await AuthToken.Resolve(latest) == uid,
+            "login after forced logout uses current version");
+        AuthUser.StoreVersion(uid, 3, WebApp.NowSeconds());
+        Check(await dao.UpdateProfile(id, user.username, "", "", "", 0, 0,
+            WebApp.NowSeconds()) == 1, "disable changes one account");
+        Check(await AuthToken.Resolve(latest) == "",
+            "disabled account rejected despite warmed version cache");
+        Check(await AuthUser.Login(user.username, "replacement-fixture-password") == "",
+            "disabled account cannot log in");
+        Check(await Status(app, listener, "/api/auth/me", "Cookie: zsession=" + latest + "\r\n", "401"),
+            "disabled session API request returns 401");
+        await listener.StopAsync();
+        app.Dispose();
+        AuthUser.ForgetAllLocal();
+        LoginThrottle.Clear(user.username);
+        AppServices.Use(null);
+        ZanSql.SetProvider(null);
+        ZanSql.SetDefault(null);
+        db.Close();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return failures;
+    }
+}

@@ -187,6 +187,7 @@ partial class Irgen {
                 diags.Error("[E3049] ref/out argument must be a variable, a field, or an element", place.line, place.col);
                 return "null";
             }
+            if (IsDecimal(et)) { return DecimalArrayPlace(obj.op, idx.op); }
             if (IsByteArr(obj.ty)) {
                 string ab = NT();
                 L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
@@ -280,8 +281,10 @@ partial class Irgen {
     int ArrElemSize(Node elemTy) {
         if (elemTy == null) { return 8; }
         if (elemTy.ival >= 1) { return 8; }
+        if (IsNullableValue(elemTy)) { return 8; }
         string n = elemTy.sval;
         if (n == "byte" || n == "sbyte") { return 1; }
+        if (IsDecimal(elemTy)) { return 16; }
         return 8;
     }
 
@@ -427,6 +430,7 @@ partial class Irgen {
     string CallArg(ExprVal av, Node pty, bool rawStr) {
         // a user-defined implicit conversion applies to the argument
         av = ApplyUserConv(pty, av, false);
+        if (IsNullableValue(pty)) { return BoxFor(av, pty); }
         // a struct parameter is a value: the callee gets its own copy
         if (NeedsStructCopy(pty, av)) { av = StructCopyTemp(av, pty); }
         if (IsErasedType(pty)) { return ToSlot(av, av.ty); }
@@ -612,8 +616,10 @@ partial class Irgen {
         string rt = "i64";
         if (m != null) { rt = MapTypeDecl(m.type, declCls); }
         if (spec) { rt = MapTypeDecl(SubstTP(m.type, stns, strs), declCls); }
+        string nativeRt = rt;
+        if (sym.StartsWith("__zan_decimal_")) { nativeRt = DecimalNativeReturn(sym, rt); }
         bool isAsyncCall = (m != null && IsAsync(m));
-        if (isAsyncCall) { rt = "i8*"; }
+        if (isAsyncCall) { rt = "i8*"; nativeRt = rt; }
         string args = "";
         List<Node> aargs = OrderArgs(m, e);
         bool freeArgIsStr = false;
@@ -723,7 +729,13 @@ partial class Irgen {
                 L("  " + rawP + " = call i8* @" + sym + "(" + args + ")");
                 L("  " + t + " = ptrtoint i8* " + rawP + " to i64");
             } else {
-                L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+                L("  " + t + " = call " + nativeRt + " @" + sym + "(" + args + ")");
+                if (nativeRt != rt) {
+                    string wide = NT();
+                    string ext = nativeRt == "i1" ? "zext" : "sext";
+                    L("  " + wide + " = " + ext + " " + nativeRt + " " + t + " to " + rt);
+                    t = wide;
+                }
             }
         }
         if (m != null && HasMod(m, MOD.Extern()) && IsStr(m.type)) {
@@ -732,20 +744,11 @@ partial class Irgen {
             t = WrapManaged(t);
         }
         if (m != null && HasMod(m, MOD.Extern()) && IsDelegate(m.type)) {
-            // extern C returns a bare fn pointer: rewrap as a {fn, env} closure
-            string clo = NT();
-            L("  " + clo + " = call i8* @malloc(i64 16)");
-            string clop = NT();
-            L("  " + clop + " = bitcast i8* " + clo + " to i8**");
-            L("  store i8* " + t + ", i8** " + clop);
-            string clop1 = NT();
-            L("  " + clop1 + " = getelementptr i8*, i8** " + clop + ", i64 1");
-            L("  store i8* null, i8** " + clop1);
-            string isn = NT();
-            L("  " + isn + " = icmp eq i8* " + t + ", null");
-            string res = NT();
-            L("  " + res + " = select i1 " + isn + ", i8* null, i8* " + TagClosure(clo));
-            return new ExprVal(res, m.type);
+            // Preserve the delegate value returned by C, including null.
+            // A bare fn has no env parameter; a tagged closure (e.g. from
+            // zan_dispatch_take) already carries its record and ARC owner.
+            AddTemp(t, m.type);
+            return new ExprVal(t, m.type);
         }
         // an async call hands back the coroutine FRAME; the awaited value's
         // type is the method's RETURN type -- substituted when the call
@@ -775,6 +778,11 @@ partial class Irgen {
         int i = 0;
         while (i < ms.Count) {
             Node m = ms[i];
+            Node targs = ExplicitTypeArgs(e);
+            if (targs != null && TParams(m).Count != targs.kids.Count) {
+                i = i + 1;
+                continue;
+            }
             int np = 0;
             int k = 0;
             while (k < m.kids.Count) { if (m.kids[k].kind == AK.Param()) { np = np + 1; } k = k + 1; }

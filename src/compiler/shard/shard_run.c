@@ -544,8 +544,13 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 if (objs[s]) { remove(objs[s]); free(objs[s]); }
             }
         free(objs);
-        fprintf(stderr, "shard: %s — falling back to single module\n",
-                st.reason);
+        if (st.optimizer_failed) {
+            fprintf(stderr, "error: shard: %s\n", st.reason);
+            rc = -1;
+        } else {
+            fprintf(stderr, "shard: %s — falling back to single module\n",
+                    st.reason);
+        }
         goto cleanup_planning;
     }
 

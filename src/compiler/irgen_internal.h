@@ -240,6 +240,7 @@ struct zan_struct_type_entry *get_struct_entry(zan_irgen_t *g, zan_symbol_t *typ
 LLVMValueRef get_eh_personality_fn(zan_irgen_t *g);
 void ensure_function_personality(zan_irgen_t *g, LLVMValueRef fn);
 void emit_raise_exception(zan_irgen_t *g);
+void emit_raise_exception_through_cleanups(zan_irgen_t *g);
 LLVMValueRef zan_call_or_invoke(zan_irgen_t *g, LLVMBuilderRef b, LLVMTypeRef ty,
                                 LLVMValueRef fn, LLVMValueRef *args, unsigned n,
                                 const char *nm);
@@ -298,6 +299,7 @@ LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type);
 bool member_name_is(zan_symbol_t *m, zan_istr_t name);
 int method_accepts_arity(zan_symbol_t *m, int argc);
 int method_declared_param_count(zan_symbol_t *m);
+bool virtual_method_signature_equal(zan_symbol_t *a, zan_symbol_t *b);
 bool method_introduces_virtual_slot(zan_symbol_t *type_sym, zan_symbol_t *m);
 int method_is_params_variadic(zan_symbol_t *m);
 zan_symbol_t * method_sym_for_decl(zan_symbol_t *type_sym, zan_ast_node_t *decl);
@@ -312,6 +314,8 @@ void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym);
 void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals);
 int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym, zan_type_t *inst, int coll_kind, zan_type_t *coll_elem);
 int reserve_closure_site(zan_irgen_t *g);
+const char *arc_runtime_type_name(zan_irgen_t *g, zan_type_t *type);
+const char *arc_collection_type_name(zan_irgen_t *g, int kind, zan_type_t *element);
 zan_symbol_t * resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name, int argc, int type_arg_count);
 zan_symbol_t * resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, int argc, int type_arg_count);
 zan_type_t * resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref);
@@ -352,6 +356,11 @@ LLVMValueRef emit_boundary_coerce(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef ta
 void emit_closure_record_release(zan_irgen_t *g, LLVMValueRef rec);
 void emit_closure_release(zan_irgen_t *g, LLVMValueRef v);
 void emit_closure_retain(zan_irgen_t *g, LLVMValueRef v);
+LLVMValueRef emit_closure_is_tagged(zan_irgen_t *g, LLVMValueRef v);
+void emit_retain_obj_value(zan_irgen_t *g, LLVMValueRef v);
+LLVMValueRef emit_delegate_erasure(zan_irgen_t *g, zan_type_t *type,
+                                   LLVMValueRef value, zan_loc_t loc,
+                                   bool transfer_owned);
 LLVMValueRef emit_closure_untag(zan_irgen_t *g, LLVMValueRef v);
 void emit_collection_release_raw_slot(zan_irgen_t *g, zan_type_t *elem_type, LLVMValueRef raw, LLVMTypeRef slot_ty);
 void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type, LLVMTypeRef slot_ty, LLVMValueRef slot_ptr, LLVMValueRef value, zan_ast_node_t *rhs, local_scope_t *locals, int overwrite_old);
@@ -718,6 +727,8 @@ void emit_oob_store_finish(zan_irgen_t *g, LLVMBasicBlockRef do_bb, LLVMBasicBlo
 void emit_oob_store_split(zan_irgen_t *g, LLVMValueRef oob, LLVMBasicBlockRef *do_bb, LLVMBasicBlockRef *end_bb);
 void emit_rc_capture_local(zan_irgen_t *g, zan_type_t *type, LLVMValueRef slot_alloca, LLVMValueRef v, zan_ast_node_t *rhs, local_scope_t *locals);
 void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type, LLVMValueRef field_ptr, LLVMValueRef v, zan_ast_node_t *rhs, local_scope_t *locals, int is_weak);
+int field_is_binding_target(zan_symbol_t *field);
+void emit_rc_store_member(zan_irgen_t *g, zan_symbol_t *field, zan_type_t *type, LLVMValueRef field_ptr, LLVMValueRef value, zan_ast_node_t *rhs, local_scope_t *locals);
 void emit_release_active_catch_excs(zan_irgen_t *g, int base);
 void emit_release_obj_local(zan_irgen_t *g, local_var_t *v);
 void emit_release_obj_value(zan_irgen_t *g, LLVMValueRef cur);
@@ -756,6 +767,10 @@ int expr_is_local_ident(zan_ast_node_t *e, local_scope_t *locals);
 int expr_yields_delegate_value(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 LLVMValueRef get_co_reap_fn(zan_irgen_t *g);
+LLVMValueRef emit_task_runtime_call(zan_irgen_t *g, const char *name,
+    LLVMTypeRef result, LLVMValueRef *args, unsigned count);
+LLVMValueRef emit_task_token(zan_irgen_t *g, LLVMValueRef frame);
+void emit_task_discard_config(zan_irgen_t *g, LLVMValueRef frame, zan_type_t *rt);
 LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc);
 zan_type_t * ident_inst_type(zan_irgen_t *g, zan_ast_node_t *e);
 int irgen_expr_was_boxed(zan_irgen_t *g, zan_ast_node_t *e);

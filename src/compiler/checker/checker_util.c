@@ -27,6 +27,11 @@ static bool checker_is_task_call(zan_ast_node_t *expr, const char *method) {
  * 收口后这种写法在编译期就被拒绝，而"跑一个 Action 再等它"仍然合法
  * （Task t = Task.Run(action); t.Wait(); —— 无结果任务，Wait 不 reap）。
  */
+static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name);
+static zan_type_t *checker_find_local(zan_checker_t *c, zan_istr_t name);
+static bool access_member_allowed(zan_checker_t *c, zan_symbol_t *m);
+static void report_inaccessible(zan_checker_t *c, zan_symbol_t *m, zan_loc_t loc);
+
 static zan_type_t *task_run_result_type(zan_checker_t *c, zan_ast_node_t *expr,
                                         zan_type_t **arg_types) {
     if (!expr || expr->call.args.count != 1 || !arg_types) return NULL;
@@ -35,8 +40,41 @@ static zan_type_t *task_run_result_type(zan_checker_t *c, zan_ast_node_t *expr,
     if (!arg) return NULL;
     /* 无结果任务句柄 */
     zan_type_t *base = zan_binder_make_task_type(c->binder, NULL);
-    if (checker_is_task_call(expr, "Spawn")) return base;
     if (arg->kind == AST_LAMBDA) return base;
+    zan_symbol_t *owner = NULL;
+    zan_istr_t name = {0};
+    int receiver = 0;
+    if (arg->kind == AST_IDENTIFIER && !checker_find_local(c, arg->ident.name) &&
+        !checker_find_field(c->current_type_sym, arg->ident.name)) {
+        owner = c->current_type_sym;
+        name = arg->ident.name;
+    } else if (arg->kind == AST_MEMBER_ACCESS) {
+        zan_ast_node_t *obj = arg->member.object;
+        zan_type_t *ot = zan_checker_check_expr(c, obj);
+        owner = ot ? ot->sym : NULL;
+        name = arg->member.name;
+        receiver = 2;
+        if (obj->kind == AST_IDENTIFIER && !checker_find_local(c, obj->ident.name) &&
+            !checker_find_field(c->current_type_sym, obj->ident.name)) {
+            zan_symbol_t *ts = zan_binder_lookup(c->binder, obj->ident.name);
+            if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) receiver = 1;
+        }
+    }
+    bool has_this = c->current_method_decl &&
+        !(c->current_method_decl->method_decl.modifiers & MOD_STATIC);
+    int action_error = 0;
+    zan_symbol_t *method = zan_binder_task_action_method(c->binder, owner, name,
+        receiver, has_this, &action_error);
+    if (method) {
+        if (!access_member_allowed(c, method)) report_inaccessible(c, method, arg->loc);
+        if (action_error)
+            zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 3052,
+                action_error == 2 ? "Task method group requires a matching receiver (instance methods need this)" :
+                action_error == 3 ? "ambiguous Task Action method group" :
+                "Task.Run delegate must be a parameterless synchronous nongeneric void method");
+        return base;
+    }
+    if (checker_is_task_call(expr, "Spawn")) return base;
     zan_type_t *at = arg_types[0];
     if (!at) return NULL; /* 实参类型未知：维持旧的宽松行为 */
     if (at->kind == TYPE_DELEGATE) return base;
@@ -128,19 +166,8 @@ static zan_ast_node_t *checker_synthesize_table_array(zan_checker_t *c,
 static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
                                                             zan_loc_t loc);
 static zan_ast_node_t *checker_synthesize_dispatcher_ref(zan_checker_t *c,
-                                                         zan_loc_t loc);
-static bool checker_is_attr_routes(zan_ast_node_t *obj) {
-    if (!obj) return false;
-    if (obj->kind == AST_IDENTIFIER) {
-        return obj->ident.name.len == 12 &&
-               memcmp(obj->ident.name.str, "__AttrRoutes", 12) == 0;
-    }
-    if (obj->kind == AST_MEMBER_ACCESS) {
-        return obj->member.name.len == 12 &&
-               memcmp(obj->member.name.str, "__AttrRoutes", 12) == 0;
-    }
-    return false;
-}
+                                                         zan_loc_t loc,
+                                                         bool framework);
 static bool checker_is_builtin_class_name(zan_istr_t n);
 static bool checker_is_target_builtin_class(zan_ast_node_t *obj) {
     if (!obj) return false;
@@ -559,7 +586,8 @@ static void check_readonly_incdec(zan_checker_t *c, zan_ast_node_t *expr) {
 static bool checker_type_assignable(zan_type_t *target, zan_type_t *value);
 
 static zan_type_t *checker_assignment_target_type(zan_checker_t *c,
-                                                   zan_ast_node_t *lhs) {
+                                                   zan_ast_node_t *lhs,
+                                                   zan_type_t *resolved_lhs) {
     if (!lhs) return NULL;
     if (lhs->kind == AST_IDENTIFIER) {
         zan_type_t *local = checker_find_local(c, lhs->ident.name);
@@ -572,7 +600,11 @@ static zan_type_t *checker_assignment_target_type(zan_checker_t *c,
         zan_symbol_t *sym = obj && obj->sym
             ? checker_field_visible(c, obj->sym, lhs->loc, lhs->member.name)
             : NULL;
-        return sym ? sym->type : NULL;
+        /* Member access already specializes the field type through the
+         * receiver (including delegate argument/return types). Returning the
+         * declaration type here discards that substitution before assignment
+         * compatibility is checked. Keep field lookup/shadowing unchanged. */
+        return sym ? resolved_lhs : NULL;
     }
     if (lhs->kind == AST_INDEX) {
         zan_type_t *obj = zan_checker_check_expr(c, lhs->index.object);

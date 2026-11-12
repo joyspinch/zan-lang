@@ -1,0 +1,146 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Http.Hpack;
+using System.Net.Http.Http2;
+
+class Http2SecurityBounds {
+    static void Check(bool value, string name) {
+        if (!value) { throw new IOException("FAIL " + name); }
+    }
+    static bool Reject(string hex, int limit) {
+        HpackContext context = new HpackContext(4096);
+        context.maxHeaderBytes = limit;
+        byte[] data = Convert.FromHexString(hex);
+        try { context.DecodeHeaderBlock(data, 0, hex.Length / 2); }
+        catch (Exception ex) { return true; }
+        return false;
+    }
+    static List<HpackHeader> Request() {
+        List<HpackHeader> headers = new List<HpackHeader>();
+        headers.Add(new HpackHeader(":method", "GET"));
+        headers.Add(new HpackHeader(":scheme", "https"));
+        headers.Add(new HpackHeader(":path", "/"));
+        headers.Add(new HpackHeader(":authority", "example.org"));
+        return headers;
+    }
+    static bool BadHeaders(List<HpackHeader> headers) {
+        try { Http2HeaderBlock.Validate(headers, true); }
+        catch (Exception ex) { return true; }
+        return false;
+    }
+    static Http2Frame Frame(int type, int flags, int length, int id) {
+        Http2Frame frame = new Http2Frame();
+        frame.type = type;
+        frame.flags = flags;
+        frame.length = length;
+        frame.streamId = id;
+        return frame;
+    }
+    static int Main() {
+        Check(Http2SecurityBounds.Reject("ff", 65536), "truncated integer");
+        Check(Http2SecurityBounds.Reject("ffffffffffff7f", 65536), "integer overflow");
+        Check(Http2SecurityBounds.Reject("80", 65536), "index zero");
+        Check(Http2SecurityBounds.Reject("be", 65536), "missing dynamic index");
+        Check(Http2SecurityBounds.Reject("400378", 65536), "truncated string");
+        Check(Http2SecurityBounds.Reject("3fe21f", 65536), "table update beyond advertised 4096");
+        Check(Http2SecurityBounds.Reject("8220", 65536), "table update after field");
+        Check(Http2SecurityBounds.Reject("828282", 100), "indexed header list expansion");
+        Check(Http2SecurityBounds.Reject("40017881ff", 65536), "invalid Huffman padding");
+        HpackContext zero = new HpackContext(0);
+        Check(zero.maxTableSize == 0, "zero table constructor");
+        byte[] valid = Convert.FromHexString("2082");
+        HpackContext shrink = new HpackContext(4096);
+        List<HpackHeader> decoded = shrink.DecodeHeaderBlock(valid, 0, 2);
+        Check(decoded.Count == 1 && shrink.maxTableSize == 0, "valid table shrink");
+        byte[] slice = Convert.FromHexString("0001780176");
+        HpackContext sliced = new HpackContext();
+        bool rejected = false;
+        try { sliced.DecodeHeaderBlock(slice, 0, 4); }
+        catch (Exception ex) { rejected = true; }
+        Check(rejected, "block boundary does not consume suffix");
+        byte[] badHuff = Convert.FromHexString("ff");
+        Check(HpackHuffman.Decode(badHuff, 0, 1) == null, "overlong Huffman padding");
+        badHuff = Convert.FromHexString("18");
+        Check(HpackHuffman.Decode(badHuff, 0, 1) == null, "zero Huffman padding");
+        Console.WriteLine("HPACK bounded malformed vectors rejected");
+
+        List<HpackHeader> headers = Http2SecurityBounds.Request();
+        Check(Http2HeaderBlock.Validate(headers, true) == -1, "valid request headers");
+        headers.Add(new HpackHeader("content-length", "1x"));
+        Check(Http2SecurityBounds.BadHeaders(headers), "invalid decimal");
+        headers = Http2SecurityBounds.Request();
+        headers.Add(new HpackHeader("content-length", "1"));
+        headers.Add(new HpackHeader("content-length", "1"));
+        Check(Http2SecurityBounds.BadHeaders(headers), "duplicate length");
+        headers = Http2SecurityBounds.Request();
+        headers.Add(new HpackHeader("x-name", "ok\r\nInjected: yes"));
+        Check(Http2SecurityBounds.BadHeaders(headers), "CRLF value");
+        headers = Http2SecurityBounds.Request();
+        headers.Add(new HpackHeader("connection", "close"));
+        Check(Http2SecurityBounds.BadHeaders(headers), "connection header");
+        headers = Http2SecurityBounds.Request();
+        headers.Add(new HpackHeader(":path", "/again"));
+        Check(Http2SecurityBounds.BadHeaders(headers), "duplicate pseudo");
+        headers = Http2SecurityBounds.Request();
+        headers.Add(new HpackHeader("X-Upper", "value"));
+        Check(Http2SecurityBounds.BadHeaders(headers), "uppercase field");
+        headers = Http2SecurityBounds.Request();
+        headers.Add(new HpackHeader("x", "y"));
+        headers.Add(new HpackHeader(":extra", "z"));
+        Check(Http2SecurityBounds.BadHeaders(headers), "pseudo after regular");
+        Console.WriteLine("HTTP2 header semantics reject ambiguous requests");
+
+        Http2HeaderBlock assembly = new Http2HeaderBlock(8);
+        byte[] first = Convert.FromHexString("0100000000028200");
+        byte[] block = assembly.Accept(Http2SecurityBounds.Frame(Http2FrameType.HEADERS, Http2Flags.PADDED | Http2Flags.PRIORITY | Http2Flags.END_STREAM, 8, 1), first);
+        Check(block == null, "fragment incomplete");
+        byte[] second = Convert.FromHexString("87");
+        block = assembly.Accept(Http2SecurityBounds.Frame(Http2FrameType.CONTINUATION, Http2Flags.END_HEADERS, 1, 1), second);
+        Check(block != null && block.Length == 2 && block[0] == 130 && block[1] == 135 && assembly.endStream, "padding priority continuation assembly");
+        rejected = false;
+        try { assembly.Accept(Http2SecurityBounds.Frame(Http2FrameType.CONTINUATION, Http2Flags.END_HEADERS, 1, 1), second); }
+        catch (Exception ex) { rejected = true; }
+        Check(rejected, "unsolicited continuation");
+        assembly = new Http2HeaderBlock(8);
+        assembly.Accept(Http2SecurityBounds.Frame(Http2FrameType.HEADERS, 0, 1, 3), second);
+        rejected = false;
+        try { assembly.Accept(Http2SecurityBounds.Frame(Http2FrameType.PING, 0, 8, 0), first); }
+        catch (Exception ex) { rejected = true; }
+        Check(rejected, "interleaved control frame");
+        assembly = new Http2HeaderBlock(1);
+        rejected = false;
+        try { assembly.Accept(Http2SecurityBounds.Frame(Http2FrameType.HEADERS, Http2Flags.END_HEADERS, 2, 1), first); }
+        catch (Exception ex) { rejected = true; }
+        Check(rejected, "header encoded byte limit");
+        byte[] padded = Convert.FromHexString("02610000");
+        Http2Frame data = Http2SecurityBounds.Frame(Http2FrameType.DATA, Http2Flags.PADDED, 4, 1);
+        Check(Http2HeaderBlock.DataOffset(data, padded) == 1 && Http2HeaderBlock.DataLength(data, padded) == 1, "DATA padding excluded from body");
+        Console.WriteLine("HTTP2 bounded continuation padding and priority verified");
+
+        Http2Stream stream = new Http2Stream(1);
+        stream.maxBodyBytes = 2;
+        byte[] body = Convert.FromHexString("616263");
+        rejected = false;
+        try { stream.AppendBody(body, 0, 3); }
+        catch (Exception ex) { rejected = true; }
+        Check(rejected && stream.bodyLength == 0, "body limit before append");
+        stream.declaredLength = 2;
+        stream.AppendBody(body, 0, 1);
+        stream.Complete();
+        Check(stream.errorCode != 0, "short content-length reset");
+        stream.gate.Close();
+        byte[] hdr = Http2Frame.EncodeHeader(0, Http2FrameType.SETTINGS, 0, 0);
+        Check(Http2Frame.DecodeHeader(hdr, 2147483647) == null, "frame offset overflow");
+        rejected = false;
+        try { Http2Frame.EncodeHeader(16777216, 0, 0, 1); }
+        catch (Exception ex) { rejected = true; }
+        Check(rejected, "frame length truncation rejected");
+        Console.WriteLine("HTTP2 stream and frame bounds verified");
+        HpackStaticTable.Teardown();
+        HpackHuffman.Teardown();
+        Console.WriteLine("HTTP2 security bounds PASS");
+        return 0;
+    }
+}

@@ -81,8 +81,6 @@ LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_co_cancel");
     if (fn) return fn;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef hdr = g->co_header_type;
     fn = LLVMAddFunction(g->mod, "__zan_co_cancel",
         LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0));
     LLVMSetLinkage(fn, LLVMInternalLinkage);
@@ -90,34 +88,10 @@ LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     zan_builder_point_t saved_pt = zan_builder_save(g);
     g->current_fn = fn;
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
-    LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.head");
-    LLVMBasicBlockRef mark_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.mark");
-    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.ret");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     di_clear(g);
     LLVMValueRef arg = LLVMGetParam(fn, 0);
-    LLVMValueRef cur = LLVMBuildAlloca(g->builder, i8ptr, "cc.cur");
-    LLVMBuildStore(g->builder, arg, cur);
-    LLVMValueRef live = emit_co_live_has(g, arg);
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntNE, live, LLVMConstInt(i32, 0, 0), "cc.islive"),
-        head_bb, ret_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, head_bb);
-    LLVMValueRef f = LLVMBuildLoad2(g->builder, i8ptr, cur, "cc.f");
-    LLVMValueRef nn = zan_icmp(g->builder, LLVMIntNE, f, LLVMConstNull(i8ptr), "cc.nn");
-    LLVMBuildCondBr(g->builder, nn, mark_bb, ret_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, mark_bb);
-    LLVMBuildStore(g->builder, LLVMConstInt(i32, 1, 0),
-        LLVMBuildStructGEP2(g->builder, hdr, f, ASYNC_FRAME_CANCEL, "cc.flag"));
-    LLVMValueRef child = LLVMBuildLoad2(g->builder, i8ptr,
-        LLVMBuildStructGEP2(g->builder, hdr, f, ASYNC_FRAME_CHILD, "cc.child.p"),
-        "cc.child");
-    LLVMBuildStore(g->builder, child, cur);
-    LLVMBuildBr(g->builder, head_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, ret_bb);
+    emit_task_runtime_call(g, "zan_task_frame_cancel", LLVMVoidTypeInContext(g->ctx), &arg, 1);
     LLVMBuildRetVoid(g->builder);
 
     zan_builder_restore(g, saved_pt);
@@ -217,6 +191,9 @@ void emit_async_eh_prologue(zan_irgen_t *g) {
         g->lpad_stack[g->lpad_depth].catch_bb = exc_bb;
         g->lpad_stack[g->lpad_depth].fn = fn;
         g->lpad_stack[g->lpad_depth].throw_locals_base = 0;
+        /* The coroutine root is never a departing lexical try/finally. */
+        g->lpad_stack[g->lpad_depth].fin_idx = -1;
+        g->lpad_stack[g->lpad_depth].finally_depth = 0;
         g->lpad_depth++;
     }
 
@@ -428,7 +405,9 @@ void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), ep);
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0), op);
     zan_emit_frame_free(g, sub);
-    emit_raise_exception(g);
+    /* Await has not run any lexical finally bodies yet. Enter the
+     * innermost landing pad, including finally-only regions. */
+    emit_raise_exception_through_cleanups(g);
 
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }

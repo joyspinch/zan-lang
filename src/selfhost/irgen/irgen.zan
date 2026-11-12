@@ -18,6 +18,8 @@ public class ExprVal {
     // such a frame to the scheduler when the call is a fire-and-forget
     // statement.
     public bool asyncCall;
+    // Statement-temp registry slot owning this exact produced value, or empty.
+    public string ownerTemp;
     public ExprVal(string o, Node t) { op = o; ty = t; }
 }
 
@@ -111,14 +113,22 @@ partial class Irgen {
     // the C host does, and skipping them leaves a lock held (a
     // `try { return x; } finally { Unlock(); }` would deadlock the next
     // Lock forever).
+    public string syncPendingReturn;
+    public SyncFlowContext syncFlow;
     public List<Node> finBodies;
     public List<int> finLive;
     public List<int> finActive;
+    public List<string> finMonSlot;
+    public List<int> catchFinDepth;
+    public List<string> labelFinNames;
+    public List<int> labelFinDepths;
     // the exception value/tid each enclosing catch clause caught: a bare
     // `throw;` re-raises the innermost one (a nested try inside the clause
     // body overwrites the in-flight globals)
     public List<string> catchExcVal;
     public List<string> catchExcTid;
+    public List<string> catchExcOwner;
+    public List<string> pendingExcOwner;
     // the type binding of the last class-level specialization (the indexer
     // and property paths use it to map the clone's own types)
     public List<string> csNames;
@@ -161,6 +171,8 @@ partial class Irgen {
     public bool eaActive;
     public int lamCount;
     public List<string> stmtTemps;
+    public List<string> stmtTempValues;
+    public List<string> stmtTempOwners;
     public List<Node> stmtTempTypes;
     public int loopScopeBase;
     public List<string> externDecls; // extern C symbols already `declare`d
@@ -176,6 +188,10 @@ partial class Irgen {
     public List<string> asyncSlotReg;
     public List<Node> asyncSlotTy;
     public List<int> asyncSlotIdx;
+    public int asyncExceptionBase;
+    public int asyncOwnerMarkBase;
+    public int asyncExceptionDepth;
+    public List<Node> asyncCatchBindings;
     public List<string> asyncLocalRegs;
     public List<bool> asyncLocalBox;
     public List<Node> asyncLocalTypes;
@@ -212,6 +228,7 @@ partial class Irgen {
     public int finLabelSeq;
     public bool crcEmitted; // NativeMemory.Crc32 helper+table emitted once
     public bool crc32cEmitted; // NativeMemory.Crc32C helpers+table emitted once
+    public bool copy2dEmitted; // NativeMemory.Copy2D helper emitted once
     public List<string> tidNames; // classes whose @__tid_X global was emitted
     public List<string> reflMetaNames;
     public List<string> reflMetaGvs;
@@ -270,13 +287,21 @@ partial class Irgen {
         finBodies = new List<Node>();
         finLive = new List<int>();
         finActive = new List<int>();
+        finMonSlot = new List<string>();
+        catchFinDepth = new List<int>();
+        labelFinNames = new List<string>();
+        labelFinDepths = new List<int>();
         catchExcVal = new List<string>();
         catchExcTid = new List<string>();
+        catchExcOwner = new List<string>();
+        pendingExcOwner = new List<string>();
         csNames = new List<string>();
         csReps = new List<Node>();
         brkFinBase = 0;
         contFinBase = 0;
         stmtTemps = new List<string>();
+        stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>();
         stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
         externDecls = new List<string>();
@@ -317,6 +342,26 @@ partial class Irgen {
         return false;
     }
 
+    string GetDllImportLib(Node m) {
+        if (m == null || m.attrBlob == null || m.attrBlob == "") { return ""; }
+        string blob = m.attrBlob;
+        int idx = blob.IndexOf("DllImport=");
+        if (idx < 0) { return ""; }
+        int start = idx + 10;
+        int end = blob.IndexOf(";", start);
+        if (end < 0) { return blob.Substring(start); }
+        return blob.Substring(start, end - start);
+    }
+
+    bool IsResolvableLib(string lib) {
+        if (lib == "" || lib == "crt" || lib == "msvcrt" || lib == "c" || lib == "m" || lib == "pthread" || lib == "dl") { return true; }
+        if (lib == "kernel32" || lib == "user32" || lib == "gdi32" || lib == "advapi32" || lib == "shell32") { return true; }
+        if (lib == "ole32" || lib == "ws2_32" || lib == "bcrypt" || lib == "psapi" || lib == "setupapi") { return true; }
+        if (lib == "iphlpapi" || lib == "winspool" || lib == "ntdll" || lib == "sqlite3") { return true; }
+        if (lib == "zan_audio" || lib == "zan_image" || lib == "zan_gui" || lib == "zan_game" || lib == "zanrt_mem") { return true; }
+        return false;
+    }
+
     // Emit `declare <ret> @<sym>(<params>)` for a [DllImport] extern method,
     // deduplicated against builtins and prior declarations. Calls route to the
     // raw symbol via MethodSym.
@@ -326,9 +371,45 @@ partial class Irgen {
         // (matches the C host's symbol routing); inline-lowered methods are
         // filtered out by the caller before we get here
         if (cls.sval == "NativeMemory") { sym = "zan_hw_" + sym; }
+        if (sym.StartsWith("__zan_decimal_")) { DeclareDecimalExtern(sym, m); return; }
         if (ExternSeen(sym)) { return; }
         externDecls.Add(sym);
         string rt = ((m.mods & MOD.Variadic()) != 0) ? MapFieldType(m.type) : MapType(m.type);
+        string lib = GetDllImportLib(m);
+        if (lib != "" && !IsResolvableLib(lib)) {
+            // Unresolved extern library (TASKS / static_publish_tls_stub):
+            // emit safe stub implementation returning default zero/null
+            string paramList = "";
+            int first = 1;
+            int pi = 0;
+            int i = 0;
+            while (i < m.kids.Count) {
+                Node p = m.kids[i];
+                if (p.kind == AK.Param()) {
+                    if (first == 0) { paramList = paramList + ", "; }
+                    string pt = ((m.mods & MOD.Variadic()) != 0) ? MapFieldType(p.type) : MapType(p.type);
+                    paramList = paramList + pt + " %p" + pi;
+                    first = 0;
+                    pi = pi + 1;
+                }
+                i = i + 1;
+            }
+            if (rt == "void") {
+                H("define void @" + sym + "(" + paramList + ") {");
+                H("entry:");
+                H("  ret void");
+                H("}");
+                return;
+            }
+            string retVal = "0";
+            if (rt == "double" || rt == "float") { retVal = "0.0"; }
+            else if (rt == "i8*" || (rt.Length > 0 && rt.Substring(rt.Length - 1, 1) == "*")) { retVal = "null"; }
+            H("define " + rt + " @" + sym + "(" + paramList + ") {");
+            H("entry:");
+            H("  ret " + rt + " " + retVal);
+            H("}");
+            return;
+        }
         string sig = "declare " + rt + " @" + sym + "(";
         int first = 1;
         int i = 0;
@@ -361,6 +442,7 @@ partial class Irgen {
     void EA(string reg, string lt) {
         if (eaActive) { entryAllocas.Append("  " + reg + " = alloca " + lt + "\n"); }
         else { L("  " + reg + " = alloca " + lt); }
+        ArmMaterializedLocal(reg, lt);
     }
     void H(string s) { head.Append(s); head.Append("\n"); }
     void Label(int n) { body.Append("L" + n + ":\n"); term = false; curLbl = "L" + n; }
@@ -471,6 +553,7 @@ partial class Irgen {
     bool IsNullable(Node t) { return t != null && t.op == 1; }
 
     bool IsPrimValue(Node t) {
+        if (t != null && t.sval == "decimal") { return true; }
         if (t == null) { return false; }
         string n = t.sval;
         if (n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "double" || n == "float" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte" || n == "nint") {
@@ -480,9 +563,10 @@ partial class Irgen {
         return d != null && d.kind == AK.EnumDecl();
     }
 
-    bool IsNullableValue(Node t) { return IsNullable(t) && IsPrimValue(t); }
+    bool IsNullableValue(Node t) { return t != null && t.ival == 0 && IsNullable(t) && IsPrimValue(t); }
 
     string UnderLL(Node t) {
+        if (t.sval == "decimal") { return DecimalLL(); }
         if (t.sval == "double" || t.sval == "float") { return "double"; }
         return "i64";
     }
@@ -491,7 +575,7 @@ partial class Irgen {
     string BoxVal(ExprVal v, Node ty) {
         string ult = UnderLL(ty);
         string raw = NT();
-        L("  " + raw + " = call i8* @malloc(i64 8)");
+        L("  " + raw + " = call i8* @zalloc(i64 " + TypeSizeBytes(ult) + ", i8* null, i8* null)");
         string p = NT();
         L("  " + p + " = bitcast i8* " + raw + " to " + ult + "*");
         L("  store " + ult + " " + Coerce(v, ult) + ", " + ult + "* " + p);
@@ -502,7 +586,23 @@ partial class Irgen {
     string BoxFor(ExprVal v, Node ty) {
         if (v.op == "null") { return "null"; }
         if (IsNullableValue(v.ty)) { return v.op; }
-        return BoxVal(v, ty);
+        string boxed = BoxVal(v, ty);
+        AddTemp(boxed, ty);
+        return boxed;
+    }
+
+    // A slot owns a reference independently of the expression temporary.
+    // Retain before releasing the old value, including self-assignment.
+    void StoreNullable(string place, ExprVal value, Node ty, bool replace) {
+        string boxed = BoxFor(value, ty);
+        EmitArcRetain(boxed, ty);
+        string old = "";
+        if (replace) {
+            old = NT();
+            L("  " + old + " = load i8*, i8** " + place);
+        }
+        L("  store i8* " + boxed + ", i8** " + place);
+        if (replace) { EmitArcRelease(old, ty); }
     }
 
 
@@ -546,13 +646,17 @@ partial class Irgen {
         H("declare void @exit(i32)");
         H("declare i64 @atoi(i8*)");
         SeedExternBuiltins();
-        H("@__exc_sp = global i64 0");
-        H("@__exc_stack = global [64 x i8*] zeroinitializer");
-        H("@__exc_val = global i8* null");
-        H("@__exc_tid = global i8* null");
+        EmitSyncPendingRuntime();
+        EmitExceptionPayloadRuntime();
+        // A native worker may enter a lock while another thread has armed
+        // handlers. The dispatch, watermarks and jmp_bufs belong to the thread.
+        H("@__exc_sp = thread_local global i64 0");
+        H("@__exc_stack = thread_local global [64 x i8*] zeroinitializer");
+        H("@__exc_val = thread_local global i8* null");
+        H("@__exc_tid = thread_local global i8* null");
         // align 32: MSVC's _setjmp stores XMM state with movaps, which faults
         // on a default-8-aligned global buffer
-        H("@__exc_bufs = global [64 x [32 x i64]] zeroinitializer, align 32");
+        H("@__exc_bufs = thread_local global [64 x [32 x i64]] zeroinitializer, align 32");
         H("@__zan_argc = global i32 0");
         H("@__zan_argv = global i8** null");
         H("@.mode_rb = private unnamed_addr constant [3 x i8] c\"rb\\00\"");
@@ -764,7 +868,7 @@ partial class Irgen {
                         lowered = true;
                     } else if (MatchBuiltinClass(cls.sval, "NativeMemory")) {
                         string nm = ExternName(m);
-                        if (nm == "Alloc" || nm == "Free" || nm == "Copy" || nm == "Fill"
+                        if (nm == "Alloc" || nm == "Free" || nm == "Copy" || nm == "Copy2D" || nm == "Fill"
                             || nm == "Compare" || nm == "GetString" || nm == "PutString"
                             || nm == "Crc32" || nm == "Crc32C" || nm == "Crc32CUpdate"
                             || nm == "Crc32Update"
@@ -853,6 +957,10 @@ partial class Irgen {
 
     void StartFn() {
         tmp = 0; lbl = 0; term = false;
+        syncPendingReturn = "";
+        syncFlow = new SyncFlowContext();
+        catchExcOwner = new List<string>();
+        pendingExcOwner = new List<string>();
         curLbl = "entry";
         locName = new List<string>();
         locType = new List<Node>();
@@ -865,6 +973,8 @@ partial class Irgen {
         capNames = new List<string>();
         locSeq = 0;
         stmtTemps = new List<string>();
+        stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>();
         stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
         gotoNames = new List<string>();
@@ -872,10 +982,56 @@ partial class Irgen {
         finLocalLabels = new List<string>();
         finLabelScope = 0;
         finLabelSeq = 0;
+        catchFinDepth = new List<int>();
+        labelFinNames = new List<string>();
+        labelFinDepths = new List<int>();
+        finMonSlot = new List<string>();
+    }
+
+    void PreScanLabelDepths(Node s, int depth) {
+        if (s == null) { return; }
+        if (s.kind == AK.Lambda()) { return; }
+        if (s.kind == AK.LabelStmt()) {
+            syncFlow.labels.Add(s);
+            labelFinNames.Add(s.sval);
+            labelFinDepths.Add(depth);
+        }
+        if (s.kind == AK.TryStmt()) {
+            int bodyDepth = depth;
+            if (s.c != null) { bodyDepth = depth + 1; }
+            PreScanLabelDepths(s.a, bodyDepth);
+            PreScanLabelDepths(s.b, bodyDepth);
+            PreScanLabelDepths(s.c, bodyDepth);
+            return;
+        }
+        if (s.kind == AK.LockStmt()) {
+            PreScanLabelDepths(s.b, depth + 1);
+            return;
+        }
+        int i = 0;
+        while (i < s.kids.Count) {
+            PreScanLabelDepths(s.kids[i], depth);
+            i = i + 1;
+        }
+        PreScanLabelDepths(s.a, depth);
+        PreScanLabelDepths(s.b, depth);
+        PreScanLabelDepths(s.c, depth);
+        PreScanLabelDepths(s.d, depth);
+    }
+
+    int GetLabelFinDepth(string name) {
+        int i = 0;
+        while (i < labelFinNames.Count) {
+            if (labelFinNames[i] == name) {
+                return labelFinDepths[i];
+            }
+            i = i + 1;
+        }
+        return 0;
     }
 
     void CollectLabels(Node s, List<string> list) {
-        if (s == null) { return; }
+        if (s == null || s.kind == AK.Lambda()) { return; }
         if (s.kind == AK.LabelStmt()) {
             if (IndexOfStr(list, s.sval) < 0) { list.Add(s.sval); }
         }
@@ -890,8 +1046,13 @@ partial class Irgen {
     // Resolve a goto label name to a stable per-function label id, allocating
     // one on first use so forward references (goto before label) work.
     int LabelId(string name) {
-        if (IndexOfStr(finLocalLabels, name) >= 0) {
-            name = name + "$f" + finLabelScope;
+        int scope = syncFlow.cloneBodies.Count - 1;
+        while (scope >= 0) {
+            if (ScopeHasLabel(syncFlow.cloneBodies[scope], name)) {
+                name = name + "$f" + syncFlow.cloneIds[scope];
+                break;
+            }
+            scope = scope - 1;
         }
         int i = 0;
         while (i < gotoNames.Count) {
@@ -908,4 +1069,25 @@ partial class Irgen {
         int b = m.mods / 2048;
         return b - (b / 2) * 2 == 1;
     }
+}
+
+// Emission state belongs to one native function, including hoisted lambdas.
+public class SyncFlowContext {
+    public Node breakScope;
+    public Node continueScope;
+    public List<string> definedGotoLabels = new List<string>();
+    public List<int> definedGotoLocalCounts = new List<int>();
+    public List<Node> pendingGotoNodes = new List<Node>();
+    public List<int> pendingGotoLocals = new List<int>();
+    public List<int> pendingGotoOwned = new List<int>();
+    public List<Node> localScopes = new List<Node>();
+    public List<int> localScopeStarts = new List<int>();
+    public List<Node> catchScopes = new List<Node>();
+    public List<int> catchLocals = new List<int>();
+    public List<Node> scopes = new List<Node>();
+    public List<Node> labels = new List<Node>();
+    public List<string> records = new List<string>();
+    public List<int> boundaries = new List<int>();
+    public List<Node> cloneBodies = new List<Node>();
+    public List<int> cloneIds = new List<int>();
 }

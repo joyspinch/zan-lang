@@ -543,6 +543,81 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
     return LLVMBuildIntToPtr(g->builder, tagged, i8ptr, "clo.v");
 }
 
+/* Erasure produces one owned tagged delegate. Native code addresses have no
+ * ARC header; their typed thunk keeps the raw address in the target slot. */
+LLVMValueRef emit_delegate_erasure(zan_irgen_t *g, zan_type_t *type,
+                                   LLVMValueRef value, zan_loc_t loc,
+                                   bool transfer_owned) {
+    if (g->cur_inst) {
+        zan_type_t *subst = subst_type_param_deep(g, type, g->cur_inst);
+        if (subst) type = subst;
+    }
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (LLVMTypeOf(value) != i8ptr)
+        value = LLVMBuildBitCast(g->builder, value, i8ptr, "erased.ptr");
+    unsigned np = (unsigned)type->delegate_param_count;
+    LLVMTypeRef *tp = calloc((size_t)np + 1, sizeof(*tp));
+    tp[0] = i8ptr;
+    for (unsigned i = 0; i < np; ++i)
+        tp[i + 1] = map_type(g, type->delegate_param_types[i]);
+    LLVMTypeRef ret = type->delegate_is_async ? i8ptr :
+        (type->delegate_ret_type ? map_type(g, type->delegate_ret_type) :
+         LLVMVoidTypeInContext(g->ctx));
+    LLVMTypeRef native_ty = LLVMFunctionType(ret, tp + 1, np, 0);
+    LLVMTypeRef thunk_ty = LLVMFunctionType(ret, tp, np + 1, 0);
+    free(tp);
+    char name[160], thunk_name[192];
+    unsigned id = 0;
+    do {
+        snprintf(name, sizeof(name), "native_erased_%u", id++);
+        snprintf(thunk_name, sizeof(thunk_name), "__zan_%s", name);
+    } while (LLVMGetNamedFunction(g->mod, thunk_name));
+    LLVMValueRef thunk = LLVMAddFunction(g->mod, thunk_name, thunk_ty);
+    LLVMSetLinkage(thunk, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMPositionBuilderAtEnd(g->builder,
+        LLVMAppendBasicBlockInContext(g->ctx, thunk, "entry"));
+    LLVMTypeRef rec_ty = closure_header_type(g);
+    LLVMValueRef fnp = LLVMBuildStructGEP2(g->builder, rec_ty,
+        LLVMGetParam(thunk, 0), 2, "native.slot");
+    LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, fnp, "native.fn");
+    LLVMValueRef *args = calloc((size_t)np + 1, sizeof(*args));
+    for (unsigned i = 0; i < np; ++i) args[i] = LLVMGetParam(thunk, i + 1);
+    LLVMValueRef result = zan_call2(g->builder, native_ty, raw, args, np,
+        LLVMGetTypeKind(ret) == LLVMVoidTypeKind ? "" : "native.result");
+    free(args);
+    if (LLVMGetTypeKind(ret) == LLVMVoidTypeKind) LLVMBuildRetVoid(g->builder);
+    else LLVMBuildRet(g->builder, result);
+    LLVMPositionBuilderAtEnd(g->builder, saved);
+
+    LLVMValueRef fn = LLVMGetBasicBlockParent(saved);
+    LLVMBasicBlockRef keep = LLVMAppendBasicBlockInContext(g->ctx, fn, "erased.keep");
+    LLVMBasicBlockRef wrap = LLVMAppendBasicBlockInContext(g->ctx, fn, "erased.native");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "erased.done");
+    LLVMValueRef nil = zan_icmp(g->builder, LLVMIntEQ, value,
+        LLVMConstNull(i8ptr), "erased.nil");
+    LLVMValueRef safe = LLVMBuildOr(g->builder, nil,
+        emit_closure_is_tagged(g, value), "erased.safe");
+    LLVMBuildCondBr(g->builder, safe, keep, wrap);
+    LLVMPositionBuilderAtEnd(g->builder, keep);
+    if (!transfer_owned) emit_closure_retain(g, value);
+    LLVMBuildBr(g->builder, done);
+    LLVMBasicBlockRef keep_end = LLVMGetInsertBlock(g->builder);
+    LLVMPositionBuilderAtEnd(g->builder, wrap);
+    /* The target is a code pointer, so its destructor must not release it. */
+    build_closure_dtor(g, name, rec_ty, NULL, 0, 0, false);
+    LLVMValueRef record = emit_closure_record(g, loc, name, rec_ty, thunk,
+        value, NULL, 0, 0, NULL, false);
+    LLVMBuildBr(g->builder, done);
+    LLVMBasicBlockRef wrap_end = LLVMGetInsertBlock(g->builder);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, i8ptr, "erased.delegate");
+    LLVMValueRef values[2] = { value, record };
+    LLVMBasicBlockRef blocks[2] = { keep_end, wrap_end };
+    LLVMAddIncoming(phi, values, blocks, 2);
+    return phi;
+}
+
 /* 装箱共享局部变量 (Boxed Locals) 支持 */
 #define ZAN_BOX_VALUE_FIELD ZAN_CLOSURE_HDR_FIELDS
 
@@ -1020,7 +1095,8 @@ LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
     } else {
         for (unsigned i = 1; i < tn; i++) cargs[ca++] = LLVMGetParam(thunk, i);
     }
-    LLVMValueRef r = zan_call2(g->builder, target_ty, target, cargs, ca,
+    LLVMValueRef r = emit_dispatch_call(g, is_static ? NULL : msym->parent,
+        msym, target, target_ty, cargs, (int)ca,
         LLVMGetTypeKind(ret) == LLVMVoidTypeKind ? "" : "mg.r");
     if (LLVMGetTypeKind(ret) == LLVMVoidTypeKind) LLVMBuildRetVoid(g->builder);
     else LLVMBuildRet(g->builder, r);

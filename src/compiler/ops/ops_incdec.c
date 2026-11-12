@@ -1,3 +1,22 @@
+/* Reuse binary decimal ABI/lifting on an already-evaluated place value. */
+static bool incdec_is_decimal(zan_irgen_t *g, LLVMTypeRef ty) {
+    return ty == get_decimal_type(g) ||
+        (llvm_is_nullable(ty) && nullable_payload_type(ty) == get_decimal_type(g));
+}
+static LLVMValueRef emit_decimal_incdec_value(zan_irgen_t *g,
+        zan_ast_node_t *expr, LLVMValueRef old, local_scope_t *locals) {
+    zan_ast_node_t *binary = zan_ast_new(g->arena, AST_BINARY, expr->loc);
+    binary->binary.op = expr->unary.op == TK_PLUS_PLUS ? TK_PLUS : TK_MINUS;
+    /* Only the supplied LLVM values are evaluated; these source nodes retain
+     * location/type context and never reload the receiver or index. */
+    binary->binary.left = expr->unary.operand;
+    binary->binary.right = expr->unary.operand;
+    LLVMValueRef one = LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 1, 0);
+    return llvm_is_nullable(LLVMTypeOf(old))
+        ? emit_nullable_binary(g, binary, old, one, locals)
+        : emit_decimal_binary(g, binary, old, one, locals);
+}
+
 /* 前缀/后缀自增自减 (++ / --) 共享降解发射：操作数原地更新 */
 LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                      local_scope_t *locals, int is_prefix) {
@@ -166,7 +185,8 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         if (pt) pt = subst_type_param_deep(g, pt, prop_recv_type);
         LLVMTypeRef pty = pt ? map_type(g, pt) : i64;
         LLVMTypeKind pk = LLVMGetTypeKind(pty);
-        if (pk != LLVMIntegerTypeKind && pk != LLVMFloatTypeKind &&
+        bool decimal_value = incdec_is_decimal(g, pty);
+        if (!decimal_value && pk != LLVMIntegerTypeKind && pk != LLVMFloatTypeKind &&
             pk != LLVMDoubleTypeKind) {
             zan_diag_emit_code(g->diag, DIAG_ERROR, operand->loc, 3010,
                 "++/-- requires a numeric operand");
@@ -175,7 +195,9 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef old_val = emit_property_getter_call(g, prop_getter,
             prop_recv_type, prop_recv, operand, locals);
         LLVMValueRef new_val;
-        if (pk == LLVMFloatTypeKind || pk == LLVMDoubleTypeKind) {
+        if (decimal_value) {
+            new_val = emit_decimal_incdec_value(g, expr, old_val, locals);
+        } else if (pk == LLVMFloatTypeKind || pk == LLVMDoubleTypeKind) {
             LLVMValueRef one = LLVMConstReal(pty, 1.0);
             new_val = (expr->unary.op == TK_PLUS_PLUS)
                 ? LLVMBuildFAdd(g->builder, old_val, one, "inc")
@@ -207,7 +229,8 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         return LLVMConstInt(i64, 0, 0);
     }
     LLVMTypeKind k = LLVMGetTypeKind(slot_ty);
-    if (k != LLVMIntegerTypeKind && k != LLVMFloatTypeKind &&
+    bool decimal_value = incdec_is_decimal(g, slot_ty);
+    if (!decimal_value && k != LLVMIntegerTypeKind && k != LLVMFloatTypeKind &&
         k != LLVMDoubleTypeKind) {
         /* A525 一件：非数值槽位先试用户 operator ++/--（parser 命名
          * op_inc/op_dec；emit_unary_op_overload 自带 struct 槽位解引用）。
@@ -233,7 +256,9 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     LLVMValueRef old_val = LLVMBuildLoad2(g->builder, slot_ty, slot_ptr, "inc.old");
     LLVMValueRef new_val;
-    if (k == LLVMFloatTypeKind || k == LLVMDoubleTypeKind) {
+    if (decimal_value) {
+        new_val = emit_decimal_incdec_value(g, expr, old_val, locals);
+    } else if (k == LLVMFloatTypeKind || k == LLVMDoubleTypeKind) {
         LLVMValueRef one = LLVMConstReal(slot_ty, 1.0);
         new_val = (expr->unary.op == TK_PLUS_PLUS)
             ? LLVMBuildFAdd(g->builder, old_val, one, "inc")

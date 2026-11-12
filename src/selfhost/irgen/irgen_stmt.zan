@@ -9,6 +9,7 @@ partial class Irgen {
         // A label is a branch target, so it must be emitted even when the
         // current block is already terminated (e.g. code after a goto).
         if (s.kind == AK.LabelStmt()) {
+            DefineGotoLabel(s);
             int lid = LabelId(s.sval);
             if (!term) { L("  br label %L" + lid); }
             Label(lid);
@@ -20,10 +21,13 @@ partial class Irgen {
         if (curAsync && k == AK.ReturnStmt()) { GenAsyncReturn(s); return; }
         if (k == AK.Block()) {
             int scopeStart = locName.Count;
+            syncFlow.localScopes.Add(s); syncFlow.localScopeStarts.Add(scopeStart);
             int i = 0;
             while (i < s.kids.Count) { GenStmt(s.kids[i]); i = i + 1; }
             if (!term) { ReleaseLocalsFrom(scopeStart); }
             TrimLocals(scopeStart);
+            syncFlow.localScopes.RemoveAt(syncFlow.localScopes.Count - 1);
+            syncFlow.localScopeStarts.RemoveAt(syncFlow.localScopeStarts.Count - 1);
         } else if (k == AK.VarDecl()) {
             stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
             GenVarDecl(s);
@@ -48,16 +52,20 @@ partial class Irgen {
                     EmitTempReleases();
                     // the finallys of the try statements this return leaves
                     // run BEFORE the locals are released: they may use them
-                    EmitExitFins(0);
+                    EmitSyncReturnFins("");
                     if (term) { return; }
                     ReleaseLocalsFrom(0);
                     L("  ret void");
                 } else if (IsNullableValue(curRetTy)) {
                     string rv = BoxFor(v, curRetTy);
+                    ExprVal result = new ExprVal(rv, curRetTy);
+                    EmitArcRetain(rv, curRetTy);
+                    string pending = ArmSyncPendingReturn(result);
                     EmitTempReleases();
-                    EmitExitFins(0);
+                    EmitSyncReturnFins(pending);
                     if (term) { return; }
                     ReleaseLocalsFrom(0);
+                    CommitSyncPendingReturn(pending);
                     L("  ret i8* " + rv);
                 } else {
                     ExprVal src = ApplyUserConv(curRetTy, v, false);
@@ -72,20 +80,22 @@ partial class Irgen {
                     // `icmp eq i8*` (invalid IR). A literal (null or an
                     // integer constant) owns nothing, so no retain either.
                     if (!IsConstOperand(src.op)) {
-                        if (ArcManaged(src.ty)) {
+                        if (ArcManaged(src.ty) || (src.ty != null && src.ty.ival >= 1)) {
                             EmitArcRetain(src.op, src.ty);
                         } else if (curRet == "i8*" || (src.ty != null && src.ty.sval == "object")) {
                             EmitArcRetainObject(src.op);
                         }
                     }
+                    string pending = ArmSyncPendingReturn(src);
                     EmitTempReleases();
-                    EmitExitFins(0);
+                    EmitSyncReturnFins(pending);
                     if (term) { return; }
                     ReleaseLocalsFrom(0);
+                    CommitSyncPendingReturn(pending);
                     L("  ret " + curRet + " " + rv);
                 }
             } else {
-                EmitExitFins(0);
+                EmitSyncReturnFins("");
                 if (term) { return; }
                 ReleaseLocalsFrom(0);
                 // A bare `return;` in a non-void function returns the ZERO of
@@ -115,25 +125,125 @@ partial class Irgen {
         } else if (k == AK.BreakStmt()) {
             if (brkTarget > 0) {
                 // the finallys opened inside the loop run before the break
-                EmitExitFins(brkFinBase);
+                EmitExitFins(TargetFinBase(syncFlow.breakScope));
                 if (term) { return; }
                 ReleaseLocalsFrom(loopScopeBase);
                 L("  br label %L" + brkTarget); term = true;
             }
         } else if (k == AK.ContinueStmt()) {
             if (contTarget > 0) {
-                EmitExitFins(contFinBase);
+                EmitExitFins(TargetFinBase(syncFlow.continueScope));
                 if (term) { return; }
                 ReleaseLocalsFrom(loopScopeBase);
                 L("  br label %L" + contTarget); term = true;
             }
+        } else if (k == AK.LockStmt()) {
+            GenLock(s);
         } else if (k == AK.GotoStmt()) {
+            RecordForwardGoto(s);
+            int targetFin = TargetFinBase(FindFlowLabel(s.sval));
+            if (targetFin < finBodies.Count) {
+                EmitExitFins(targetFin);
+                if (term) { return; }
+            }
+            if (curAsync) {
+                Node target = FindFlowLabel(s.sval);
+                int binding = asyncCatchBindings.Count - 1;
+                while (binding >= 0) {
+                    Node clause = asyncCatchBindings[binding];
+                    if (!FlowContains(clause.a, target)) { ClearAsyncCatchBinding(clause); }
+                    binding = binding - 1;
+                }
+            }
+            {
+                Node target = FindFlowLabel(s.sval);
+                int releaseFrom = GotoLocalBase(s.sval);
+                if (releaseFrom > locName.Count) { releaseFrom = locName.Count; }
+                int scope = 0;
+                while (scope < syncFlow.localScopes.Count) {
+                    if (!FlowContains(syncFlow.localScopes[scope], target)
+                        && syncFlow.localScopeStarts[scope] < releaseFrom) {
+                        releaseFrom = syncFlow.localScopeStarts[scope];
+                    }
+                    scope = scope + 1;
+                }
+                int binding = 0;
+                while (binding < syncFlow.catchScopes.Count) {
+                    if (!FlowContains(syncFlow.catchScopes[binding], target)
+                        && syncFlow.catchLocals[binding] < releaseFrom) {
+                        releaseFrom = syncFlow.catchLocals[binding];
+                    }
+                    binding = binding + 1;
+                }
+                ReleaseLocalsFrom(releaseFrom);
+            }
             int gid = LabelId(s.sval);
             L("  br label %L" + gid);
             term = true;
         } else {
             GenExpr(s);
         }
+    }
+
+    void GenLock(Node s) {
+        if (s.a == null) { return; }
+        ExprVal v = GenExpr(s.a);
+        string vt = MapType(v.ty);
+        string obj = v.op;
+        if (vt != "i8*") {
+            string t = NT();
+            if (IsPtrLL(vt)) {
+                L("  " + t + " = bitcast " + vt + " " + obj + " to i8*");
+            } else {
+                L("  " + t + " = inttoptr " + vt + " " + obj + " to i8*");
+            }
+            obj = t;
+        }
+        string slot = NT();
+        if (curAsync) { L("  " + slot + " = alloca i8*"); }
+        else { EA(slot, "i8*"); }
+        L("  store i8* " + obj + ", i8** " + slot);
+        if (!ExternSeen("zan_monitor_enter")) {
+            externDecls.Add("zan_monitor_enter");
+            H("declare void @zan_monitor_enter(i8*)");
+        }
+        if (!ExternSeen("zan_monitor_exit")) {
+            externDecls.Add("zan_monitor_exit");
+            H("declare void @zan_monitor_exit(i8*)");
+        }
+        L("  call void @zan_monitor_enter(i8* " + obj + ")");
+        int mark = finBodies.Count;
+        int cleanup = 0;
+        if (!curAsync) {
+            cleanup = NL();
+            int body = NL();
+            EmitExcBranch(EmitExcPush(), body, cleanup);
+            Label(body);
+        }
+        syncFlow.scopes.Add(s);
+        finBodies.Add(null);
+        finLive.Add(cleanup == 0 ? 0 : 1);
+        finMonSlot.Add(slot);
+        if (s.b != null) { GenStmt(s.b); }
+        if (!term) { EmitExitFins(mark); }
+        if (cleanup != 0) {
+            bool bodyTerm = term;
+            int next = 0;
+            if (!bodyTerm) {
+                next = NL();
+                L("  br label %L" + next);
+            }
+            finLive[mark] = 0;
+            Label(cleanup);
+            EmitExitFins(mark);
+            EmitRaise();
+            if (!bodyTerm) { Label(next); }
+            term = bodyTerm;
+        }
+        syncFlow.scopes.RemoveAt(syncFlow.scopes.Count - 1);
+        finBodies.RemoveAt(finBodies.Count - 1);
+        finLive.RemoveAt(finLive.Count - 1);
+        finMonSlot.RemoveAt(finMonSlot.Count - 1);
     }
 
     bool IsClassPtr(string s) {
@@ -154,6 +264,26 @@ partial class Irgen {
     // when null literal, retype to the target LLVM type; bitcast class pointers
     // (e.g. a derived instance stored into a base-typed slot)
     string Coerce(ExprVal v, string llty) {
+        if (IsNullableValue(v.ty) && !IsPtrLL(llty)) {
+            string empty = NT();
+            L("  " + empty + " = icmp eq i8* " + v.op + ", null");
+            string from = curLbl;
+            int payload = NL(); int done = NL();
+            L("  br i1 " + empty + ", label %L" + done + ", label %L" + payload);
+            Label(payload);
+            string value = Coerce(DecimalLiftPayload(v), llty);
+            string loaded = curLbl;
+            L("  br label %L" + done);
+            Label(done);
+            string result = NT();
+            L("  " + result + " = phi " + llty + " [ " + ZeroConst(llty) + ", %" + from
+                + " ], [ " + value + ", %" + loaded + " ]");
+            return result;
+        }
+        if (llty == DecimalLL()) { return ToDecimal(v).op; }
+        if (IsDecimal(v.ty) && (llty == "double" || llty == "i64")) {
+            return DecimalNumber(v, llty == "double");
+        }
         if (v.op == "null") { return ZeroConst(llty); }
         if (v.op == "0" && IsPtrLL(llty)) { return "null"; }
         // the double->i64 bitcast boundary: a double value reaching an i64
@@ -253,20 +383,22 @@ partial class Irgen {
                 Node pty0 = asyncLocalTypes[slot]; string preg0 = asyncLocalRegs[slot];
                 bool isBx = asyncLocalBox[slot]; string plt0 = MapType(pty0);
                 if (s.b != null) {
+                    if (s.b.kind == AK.Lambda() && IsDelegate(pty0)) {
+                        AnnotateLambda(s.b, pty0);
+                    }
                     ExprVal iv0 = GenExpr(s.b);
                     if (isBx) {
-                        string c = NT();
-                        L("  " + c + " = call i8* @malloc(i64 " + TypeSizeBytes(plt0) + ")");
+                        string c = OwnedCell(pty0);
                         string p = NT();
                         L("  " + p + " = bitcast i8* " + c + " to " + plt0 + "*");
-                        string sv0 = Coerce(iv0, plt0);
+                        string sv0 = IsNullableValue(pty0) ? BoxFor(iv0, pty0) : Coerce(iv0, plt0);
                         L("  store " + plt0 + " " + sv0 + ", " + plt0 + "* " + p);
                         L("  store i8* " + c + ", i8** " + preg0);
                         EmitArcRetain(sv0, pty0);
                     } else if (IsNullableValue(pty0)) {
-                        L("  store i8* " + BoxFor(iv0, pty0) + ", i8** " + preg0);
+                        StoreNullable(preg0, iv0, pty0, false);
                     } else {
-                        string sv0 = Coerce(iv0, plt0);
+                        string sv0 = IsNullableValue(pty0) ? BoxFor(iv0, pty0) : Coerce(iv0, plt0);
                         L("  store " + plt0 + " " + sv0 + ", " + plt0 + "* " + preg0);
                         EmitArcRetain(sv0, pty0);
                     }
@@ -274,8 +406,7 @@ partial class Irgen {
                     Node sd0 = binder.FindType(pty0.sval);
                     if (sd0 != null && sd0.kind == AK.StructDecl() && pty0.ival == 0 && !IsNullable(pty0)) {
                         if (isBx) {
-                            string c = NT();
-                            L("  " + c + " = call i8* @malloc(i64 " + TypeSizeBytes(plt0) + ")");
+                            string c = OwnedCell(pty0);
                             string p = NT();
                             L("  " + p + " = bitcast i8* " + c + " to " + plt0 + "*");
                             string obj0 = AllocZeroStruct(pty0, sd0);
@@ -285,6 +416,9 @@ partial class Irgen {
                             string obj0 = AllocZeroStruct(pty0, sd0);
                             L("  store " + plt0 + " " + obj0 + ", " + plt0 + "* " + preg0);
                         }
+                    } else if (isBx) {
+                        string c = OwnedCell(pty0);
+                        L("  store i8* " + c + ", i8** " + preg0);
                     } else if (ArcManaged(pty0)) {
                         L("  store " + plt0 + " null, " + plt0 + "* " + preg0);
                     }
@@ -297,6 +431,7 @@ partial class Irgen {
                 locCell.Add("");
                 locRef.Add(false);
                 locOpaque.Add(false);
+                ArmAsyncLocal(preg0, pty0, isBx);
                 return;
             }
         }
@@ -333,7 +468,7 @@ partial class Irgen {
         }
         if (hasInit) {
             if (IsNullableValue(ty)) {
-                L("  store i8* " + BoxFor(init, ty) + ", i8** " + reg);
+                StoreNullable(reg, init, ty, false);
             } else {
                 ExprVal src = ApplyUserConv(ty, init, false);
                 if (!convApplied) { src = StrSlotConv(ty, init); }
@@ -345,13 +480,16 @@ partial class Irgen {
                 EmitArcRetainStore(sv, ty, src.ty);
             }
         } else {
+            if (IsDecimal(ty)) {
+                L("  store " + lt + " zeroinitializer, " + lt + "* " + reg);
+            }
             Node sd = binder.FindType(ty.sval);
             if (sd != null && sd.kind == AK.StructDecl() && ty.ival == 0 && !IsNullable(ty)) {
                 // value struct default-initialised: allocate zeroed storage so
                 // field accesses operate on real memory (calloc zeroes fields).
                 string obj = AllocZeroStruct(ty, sd);
                 L("  store " + lt + " " + obj + ", " + lt + "* " + reg);
-            } else if (ArcManaged(ty)) {
+            } else if (ArcManaged(ty) || (ty != null && ty.ival >= 1)) {
                 L("  store " + lt + " null, " + lt + "* " + reg);
             }
         }
@@ -397,6 +535,8 @@ partial class Irgen {
 
     void GenWhile(Node s) {
         int lc = NL(); int lb = NL(); int lend = NL();
+        Node savedBreakScope = syncFlow.breakScope; Node savedContinueScope = syncFlow.continueScope;
+        syncFlow.breakScope = s; syncFlow.continueScope = s;
         int sb = brkTarget; int sc = contTarget;
         int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
@@ -411,6 +551,7 @@ partial class Irgen {
         GenStmt(s.b);
         if (!term) { L("  br label %L" + lc); }
         Label(lend);
+        syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
         brkTarget = sb; contTarget = sc;
         brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
@@ -418,6 +559,8 @@ partial class Irgen {
 
     void GenDoWhile(Node s) {
         int lb = NL(); int lc = NL(); int lend = NL();
+        Node savedBreakScope = syncFlow.breakScope; Node savedContinueScope = syncFlow.continueScope;
+        syncFlow.breakScope = s; syncFlow.continueScope = s;
         int sb = brkTarget; int sc = contTarget;
         int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
@@ -448,6 +591,7 @@ partial class Irgen {
             L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
         }
         Label(lend);
+        syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
         brkTarget = sb; contTarget = sc;
         brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
@@ -455,12 +599,15 @@ partial class Irgen {
 
     void GenFor(Node s) {
         int forScope = locName.Count;
+        syncFlow.localScopes.Add(s); syncFlow.localScopeStarts.Add(forScope);
         if (s.a != null) { GenStmt(s.a); }
         // A519: a for-statement's header variable is ONE variable shared by
         // the whole loop (C# semantics): every closure made in the body
         // captures that single variable and sees the final value. Only the
         // foreach element variable is snapshotted per iteration (C#5+).
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        Node savedBreakScope = syncFlow.breakScope; Node savedContinueScope = syncFlow.continueScope;
+        syncFlow.breakScope = s; syncFlow.continueScope = s;
         int sb = brkTarget; int sc = contTarget;
         int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
@@ -490,6 +637,9 @@ partial class Irgen {
         Label(lend);
         ReleaseLocalsFrom(forScope);
         TrimLocals(forScope);
+        syncFlow.localScopes.RemoveAt(syncFlow.localScopes.Count - 1);
+        syncFlow.localScopeStarts.RemoveAt(syncFlow.localScopeStarts.Count - 1);
+        syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
         brkTarget = sb; contTarget = sc;
         brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
@@ -547,7 +697,8 @@ partial class Irgen {
         Node resElem = QueryElem(e.b, e.sval, srcElem);
         Node resListTy = MkType("List");
         resListTy.a = resElem; resListTy.Add(resElem);
-        string ow = "0"; if (ArcManaged(resElem)) { ow = "1"; }
+        string ow = "0"; if (ArcManaged(resElem) || IsDecimal(resElem)) { ow = "1"; }
+        if (IsDelegate(resElem)) { ow = "2"; }
         string list = NT();
         L("  " + list + " = call i8* @zlist_new(i64 " + ow + ")");
         if (!IsListType(coll.ty)) { AddTemp(list, resListTy); return new ExprVal(list, resListTy); }
@@ -560,7 +711,7 @@ partial class Irgen {
         } else {
             EA(ereg, selt);
         }
-        if (ArcManaged(srcElem)) { L("  store " + selt + " null, " + selt + "* " + ereg); }
+        if (ArcManaged(srcElem) || srcElem.ival >= 1) { L("  store " + selt + " null, " + selt + "* " + ereg); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         L("  br label %L" + lc);
         Label(lc);
@@ -575,7 +726,15 @@ partial class Irgen {
         string slot = NT();
         L("  " + slot + " = call i64 @zlist_get(i8* " + coll.op + ", i64 " + iv + ")");
         ExprVal ev = FromSlot(slot, srcElem);
-        L("  store " + selt + " " + ev.op + ", " + selt + "* " + ereg);
+        if (ArcManaged(srcElem) || srcElem.ival >= 1) {
+            string old = NT();
+            L("  " + old + " = load " + selt + ", " + selt + "* " + ereg);
+            EmitArcRetain(ev.op, srcElem);
+            L("  store " + selt + " " + ev.op + ", " + selt + "* " + ereg);
+            EmitArcRelease(old, srcElem);
+        } else {
+            L("  store " + selt + " " + ev.op + ", " + selt + "* " + ereg);
+        }
         int wi = 0;
         while (wi < e.kids.Count) {
             string wc = GenCond(e.kids[wi]);
@@ -596,6 +755,7 @@ partial class Irgen {
         L("  store i64 " + inc + ", i64* " + idx);
         L("  br label %L" + lc);
         Label(lend);
+        ReleaseLocalsFrom(qScope);
         TrimLocals(qScope);
         AddTemp(list, resListTy);
         return new ExprVal(list, resListTy);
@@ -631,6 +791,7 @@ partial class Irgen {
             diags.Error("foreach over '" + cn + "' is not supported by the self-hosted compiler yet (List<T>, T[] and string are)", s.line, s.col);
             return;
         }
+        syncFlow.localScopes.Add(s); syncFlow.localScopeStarts.Add(feScope);
         Node elemTy = s.type;
         if (elemTy == null) {
             if (feList) { elemTy = ListElem(coll.ty); }
@@ -653,7 +814,7 @@ partial class Irgen {
         string creg = "";
         if (curAsync) {
             creg = NT();
-            EA(creg, cty);
+            MaterializeAsyncLoopLocal(creg, cty, s.ival);
             L("  store " + cty + " " + coll.op + ", " + cty + "* " + creg);
             asyncSlotReg.Add(creg); asyncSlotTy.Add(coll.ty); asyncSlotIdx.Add(s.ival);
         }
@@ -670,11 +831,9 @@ partial class Irgen {
         // in the body keeps its own element
         locIter[locName.Count - 1] = true;
         if (curAsync) {
-            // An async foreach element variable is not boxed: boxing it would
-            // need the cell-pointer spill slot the method's own locals use,
-            // and the per-iteration snapshot it would need is not modelled in
-            // the async frame either. A closure over it captures by value.
-            EA(ereg, elt);
+            // The foreach scan reserved a stable frame slot for the element.
+            // A closure over it still captures the per-iteration value.
+            MaterializeAsyncLoopLocal(ereg, elt, s.ival + 2);
         } else if (ShouldBox(s.sval)) {
             ereg = BoxLocal(locName.Count - 1);
         } else {
@@ -684,7 +843,8 @@ partial class Irgen {
             // the element variable crosses the suspension as well
             asyncSlotReg.Add(ereg); asyncSlotTy.Add(elemTy); asyncSlotIdx.Add(s.ival + 2);
         }
-        if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
+        if (ArcManaged(elemTy) || elemTy.ival >= 1) { L("  store " + elt + " null, " + elt + "* " + ereg); }
+        if (curAsync) { ArmAsyncLocal(ereg, elemTy, false); }
         // A521: snapshot the collection's element count once at loop entry.
         // The walk compares the live count each round; a mutation inside the
         // body reports and terminates the enumeration (the C host's fail-fast
@@ -703,12 +863,14 @@ partial class Irgen {
             L("  " + cnt0 + " = call i64 @zstr_len(i8* " + coll.op + ")");
         }
         if (curAsync) {
-            L("  store i64 " + cnt0 + ", i64* " + FrameGep("%ff", s.ival + 3));
+            L("  store i64 " + cnt0 + ", i64* " + FrameGep("%ff", s.ival + 4));
         } else {
             EA(feSnap, "i64");
             L("  store i64 " + cnt0 + ", i64* " + feSnap);
         }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        Node savedBreakScope = syncFlow.breakScope; Node savedContinueScope = syncFlow.continueScope;
+        syncFlow.breakScope = s; syncFlow.continueScope = s;
         int sb = brkTarget; int sc = contTarget;
         int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
@@ -748,7 +910,7 @@ partial class Irgen {
         // the body can be re-entered from a resume block.
         string sn = NT();
         if (curAsync) {
-            L("  " + sn + " = load i64, i64* " + FrameGep("%ff", s.ival + 3));
+            L("  " + sn + " = load i64, i64* " + FrameGep("%ff", s.ival + 4));
         } else {
             L("  " + sn + " = load i64, i64* " + feSnap);
         }
@@ -776,10 +938,14 @@ partial class Irgen {
             L("  " + slot + " = call i64 @zlist_get(i8* " + cv + ", i64 " + iv + ")");
             ev = FromSlot(slot, elemTy);
         } else if (feArr) {
+            if (IsDecimal(elemTy)) {
+                ev = DecimalLoad(DecimalArrayPlace(cv, iv));
+            } else {
             int esz = ArrElemSize(elemTy);
             string ep = ArrElemAddr(cv, iv, esz);
             string raw = ArrElemLoad(ep, esz);
             ev = FromSlot(raw, elemTy);
+            }
         } else {
             string cp = NT();
             L("  " + cp + " = getelementptr i8, i8* " + cv + ", i64 " + iv);
@@ -789,7 +955,7 @@ partial class Irgen {
             L("  " + z + " = zext i8 " + ch + " to i64");
             ev = new ExprVal(z, elemTy);
         }
-        if (ArcManaged(elemTy)) {
+        if (ArcManaged(elemTy) || elemTy.ival >= 1) {
             string old = NT();
             L("  " + old + " = load " + elt + ", " + elt + "* " + ereg);
             L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
@@ -818,6 +984,9 @@ partial class Irgen {
         Label(lend);
         ReleaseLocalsFrom(feScope);
         TrimLocals(feScope);
+        syncFlow.localScopes.RemoveAt(syncFlow.localScopes.Count - 1);
+        syncFlow.localScopeStarts.RemoveAt(syncFlow.localScopeStarts.Count - 1);
+        syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
         brkTarget = sb; contTarget = sc;
         brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
@@ -861,6 +1030,7 @@ partial class Irgen {
         }
         if (elemTy == null) { return false; }
         int feScope = locName.Count;
+        syncFlow.localScopes.Add(s); syncFlow.localScopeStarts.Add(feScope);
         Node call0 = new Node(AK.Call()); call0.kids = new List<Node>();
         ExprVal en = EmitInstanceCall(coll, cls.sval, "GetEnumerator", call0);
         // the dispatch concretizes the declared return (`Enumerator<T>` ->
@@ -869,15 +1039,17 @@ partial class Irgen {
         if (en.ty != null && en.ty.kids.Count > 0) { enumTy = en.ty; }
         string enTy = MapType(enumTy);
         string enReg = AddLocal("__zenum", enumTy);
-        EA(enReg, enTy);
+        if (curAsync) { MaterializeAsyncLoopLocal(enReg, enTy, s.ival); }
+        else { EA(enReg, enTy); }
         L("  store " + enTy + " " + en.op + ", " + enTy + "* " + enReg);
+        if (curAsync) { ArmAsyncLocal(enReg, enumTy, false); }
         string elt = MapType(elemTy);
         string ereg = AddLocal(s.sval, elemTy);
         // the element variable is a per-iteration capture: every closure made
         // in the body keeps its own element
         locIter[locName.Count - 1] = true;
         if (curAsync) {
-            EA(ereg, elt);
+            MaterializeAsyncLoopLocal(ereg, elt, s.ival + 2);
             asyncSlotReg.Add(enReg); asyncSlotTy.Add(enumTy); asyncSlotIdx.Add(s.ival);
             asyncSlotReg.Add(ereg); asyncSlotTy.Add(elemTy); asyncSlotIdx.Add(s.ival + 2);
         } else if (ShouldBox(s.sval)) {
@@ -885,8 +1057,11 @@ partial class Irgen {
         } else {
             EA(ereg, elt);
         }
-        if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
+        if (ArcManaged(elemTy) || elemTy.ival >= 1) { L("  store " + elt + " null, " + elt + "* " + ereg); }
+        if (curAsync) { ArmAsyncLocal(ereg, elemTy, false); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        Node savedBreakScope = syncFlow.breakScope; Node savedContinueScope = syncFlow.continueScope;
+        syncFlow.breakScope = s; syncFlow.continueScope = s;
         int sb = brkTarget; int sc = contTarget;
         int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
@@ -920,7 +1095,7 @@ partial class Irgen {
             Node call2 = new Node(AK.Call()); call2.kids = new List<Node>();
             ev = EmitInstanceCall(curEn, ecls.sval, "Current", call2);
         }
-        if (ArcManaged(elemTy)) {
+        if (ArcManaged(elemTy) || elemTy.ival >= 1) {
             string old = NT();
             L("  " + old + " = load " + elt + ", " + elt + "* " + ereg);
             L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
@@ -936,6 +1111,9 @@ partial class Irgen {
         Label(lend);
         ReleaseLocalsFrom(feScope);
         TrimLocals(feScope);
+        syncFlow.localScopes.RemoveAt(syncFlow.localScopes.Count - 1);
+        syncFlow.localScopeStarts.RemoveAt(syncFlow.localScopeStarts.Count - 1);
+        syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
         brkTarget = sb; contTarget = sc;
         brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;

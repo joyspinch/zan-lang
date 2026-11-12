@@ -486,7 +486,7 @@ int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
     size_t full_blocks = (size_t)len / 64;
     int use_ni = 0;
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    use_ni = zan_hw_gate(&g_gate_sha256, zan_hw_has_shani(), zan_sha256_kat_x86);
+    use_ni = zan_hw_gate(&g_gate_sha256, zan_hw_x86_can(ZAN_HW_REQ_SHA), zan_sha256_kat_x86);
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
     use_ni = zan_hw_gate(&g_gate_sha256, zan_hw_arm_sha2(), zan_sha256_kat_arm);
 #endif
@@ -731,7 +731,7 @@ int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]) {
     if (len < 0) len = 0;
     int use_ni = 0;
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    use_ni = zan_hw_gate(&g_gate_sha1, zan_hw_has_shani(), zan_sha1_kat);
+    use_ni = zan_hw_gate(&g_gate_sha1, zan_hw_x86_can(ZAN_HW_REQ_SHA), zan_sha1_kat);
 #elif ZAN_SHA1_ARM_KERNEL
     use_ni = zan_hw_gate(&g_gate_sha1, zan_hw_arm_sha1(), zan_sha1_kat);
 #endif

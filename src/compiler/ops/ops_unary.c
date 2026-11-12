@@ -78,6 +78,19 @@ static LLVMValueRef emit_unary_op_overload(zan_irgen_t *g, zan_ast_node_t *expr,
     emit_release_owned_call_temp(g, expr->unary.operand, arg, locals);
     return res;
 }
+static LLVMValueRef emit_decimal_neg_value(zan_irgen_t *g, LLVMValueRef operand) {
+    LLVMTypeRef t = get_decimal_type(g);
+    LLVMValueRef slot = emit_entry_alloca(g, t, "dec.uneg_in");
+    LLVMValueRef res_slot = emit_entry_alloca(g, t, "dec.uneg_res");
+    LLVMBuildStore(g->builder, operand, slot);
+    LLVMTypeRef ptr_ty = LLVMPointerType(t, 0);
+    LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+        (LLVMTypeRef[]){ ptr_ty, ptr_ty }, 2, 0);
+    LLVMValueRef fn = get_libc_fn(g, "__zan_decimal_neg", fn_ty);
+    zan_call2(g->builder, fn_ty, fn, (LLVMValueRef[]){ slot, res_slot }, 2, "");
+    return LLVMBuildLoad2(g->builder, t, res_slot, "dec.uneg_val");
+}
+
 LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
     if (expr->unary.op == TK_PLUS_PLUS || expr->unary.op == TK_MINUS_MINUS)
@@ -90,16 +103,28 @@ LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
         switch (expr->unary.op) {
         case TK_MINUS: {
             LLVMTypeRef t = LLVMTypeOf(operand);
+            if (llvm_is_nullable(t) && nullable_payload_type(t) == get_decimal_type(g)) {
+                LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+                LLVMBasicBlockRef value_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.neg.value");
+                LLVMBasicBlockRef null_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.neg.null");
+                LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.neg.end");
+                LLVMBuildCondBr(g->builder, nullable_has_value(g, operand), value_bb, null_bb);
+                LLVMPositionBuilderAtEnd(g->builder, value_bb);
+                LLVMValueRef payload = emit_decimal_neg_value(g, nullable_get_payload(g, operand));
+                LLVMValueRef present = nullable_some(g, t, payload);
+                LLVMBasicBlockRef value_end = LLVMGetInsertBlock(g->builder);
+                LLVMBuildBr(g->builder, merge_bb);
+                LLVMPositionBuilderAtEnd(g->builder, null_bb);
+                LLVMBuildBr(g->builder, merge_bb);
+                LLVMPositionBuilderAtEnd(g->builder, merge_bb);
+                LLVMValueRef result = LLVMBuildPhi(g->builder, t, "nv.neg.result");
+                LLVMValueRef values[] = { present, nullable_none(t) };
+                LLVMBasicBlockRef blocks[] = { value_end, null_bb };
+                LLVMAddIncoming(result, values, blocks, 2);
+                return result;
+            }
             if (t == get_decimal_type(g)) {
-                LLVMValueRef slot = emit_entry_alloca(g, t, "dec.uneg_in");
-                LLVMValueRef res_slot = emit_entry_alloca(g, t, "dec.uneg_res");
-                LLVMBuildStore(g->builder, operand, slot);
-                LLVMTypeRef ptr_ty = LLVMPointerType(t, 0);
-                LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-                    (LLVMTypeRef[]){ ptr_ty, ptr_ty }, 2, 0);
-                LLVMValueRef fn = get_libc_fn(g, "__zan_decimal_neg", fn_ty);
-                zan_call2(g->builder, fn_ty, fn, (LLVMValueRef[]){ slot, res_slot }, 2, "");
-                return LLVMBuildLoad2(g->builder, t, res_slot, "dec.uneg_val");
+                return emit_decimal_neg_value(g, operand);
             }
             if (LLVMGetTypeKind(t) == LLVMDoubleTypeKind ||
                 LLVMGetTypeKind(t) == LLVMFloatTypeKind) {

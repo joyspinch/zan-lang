@@ -140,11 +140,11 @@ bool emit_target_is_x86(const zan_irgen_t *g)
            (g->target_triple[0] == 'i' && strstr(g->target_triple, "86") != NULL);
 }
 
-/* Match the Android baseline selected by zan_bind_target_layout. Architecture
-   alone does not permit AVX2; generic vector IR can split into SSE operations. */
+/* Use the actual TargetMachine feature selection, including explicit profiles.
+   Generic vector IR can split into SSE operations when AVX2 is unavailable. */
 static bool emit_target_has_avx2(const zan_irgen_t *g)
 {
-    return emit_target_is_x86(g) && strstr(g->target_triple, "android") == NULL;
+    return emit_target_is_x86(g) && strstr(g->target_features, "+avx2") != NULL;
 }
 
 /* 跨平台 pmovmskb 实现：提取每个字节符号位组装为整型掩码。
@@ -539,7 +539,8 @@ bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (method.len == 7 && memcmp(method.str, "Shuffle", 7) == 0) {
             LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef m16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            if (emit_target_is_x86(g)) {
+            if (emit_target_is_x86(g) &&
+                (!g->cpu_profile || strcmp(g->cpu_profile, "baseline") != 0)) {
                 LLVMTypeRef fty = LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0);
                 LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.ssse3.pshuf.b.128");
                 if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.ssse3.pshuf.b.128", fty);

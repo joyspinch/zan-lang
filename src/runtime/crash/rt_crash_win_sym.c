@@ -1,4 +1,10 @@
 /* rt_crash_win_sym.c -- Windows 符号化器（addr2line / llvm-symbolizer）与 PE 栈分析 */
+#include <wchar.h>
+
+/* Older MinGW headers omit this Vista+ UTF-8 validation flag. */
+#ifndef WC_ERR_INVALID_CHARS
+#define WC_ERR_INVALID_CHARS 0x00000080
+#endif
 
 static void zan__crash_modline(zan__cf_t f, void *addr, const char *tag) {
     HMODULE m = NULL;
@@ -235,33 +241,101 @@ static void zan__crash_symbolize_one(const char *logpath, const char *exe,
     zan__crash_symbolize(logpath, exe, exe_dir, exe_base, addr, NULL, 0, 1);
 }
 
-/* 崩溃日志路径：<exe_dir>/zan_crash.log 或当前目录回退 */
-static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
-    exe_dir[0] = '\0';
-    DWORD n = GetModuleFileNameA(NULL, logpath, (DWORD)cap);
-    if (n == 0 || n >= cap) {
-        zan__crash_snprintf(logpath, cap, "zan_crash.log");
-        return;
-    }
-    char *slash = strrchr(logpath, '\\');
-    if (!slash) {
-        zan__crash_snprintf(logpath, cap, "zan_crash.log");
-        return;
-    }
-    size_t dl = (size_t)(slash + 1 - logpath);
-    memcpy(exe_dir, logpath, dl);
-    exe_dir[dl] = '\0';
-    slash[1] = '\0';
-    strncat(logpath, "zan_crash.log", cap - strlen(logpath) - 1);
+/* Resolve and create paths before installing handlers: no getenv, allocation or
+ * recursive directory creation on the faulting thread. Never fall back to the
+ * executable or working directory (SDKs and installed applications are payloads). */
+static char zan__crash_cached_log[ZAN_CRASH_PATH_CAP];
+static char zan__crash_cached_temp[ZAN_CRASH_PATH_CAP];
+
+static int zan__crash_env_path(const wchar_t *name, wchar_t *out) {
+    DWORD n = GetEnvironmentVariableW(name, out, ZAN_CRASH_PATH_CAP);
+    if (!n || n >= ZAN_CRASH_PATH_CAP) { out[0] = 0; return 0; }
+    return 1;
 }
 
-/* exe 目录与当前目录都不可写时（Program Files、只读部署盘）的最后一档：
- * 用户临时目录。真崩溃的记录宁可落进 %TEMP% 也不要静默丢（审计 P1-2）。 */
+static int zan__crash_absolute(const wchar_t *path) {
+    return (path[0] == L'\\' && path[1] == L'\\') ||
+           (path[0] && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/'));
+}
+
+static int zan__crash_path_suffix(wchar_t *out, const wchar_t *suffix) {
+    size_t a = wcslen(out), b = wcslen(suffix);
+    if (a + b >= ZAN_CRASH_PATH_CAP) return 0;
+    memcpy(out + a, suffix, (b + 1) * sizeof(wchar_t));
+    return 1;
+}
+
+static int zan__crash_prepare_log(const wchar_t *dir, char *out) {
+    wchar_t full[ZAN_CRASH_PATH_CAP], wide[ZAN_CRASH_PATH_CAP];
+    out[0] = 0;
+    DWORD n = GetFullPathNameW(dir, ZAN_CRASH_PATH_CAP, full, NULL);
+    if (!n || n >= ZAN_CRASH_PATH_CAP) return 0;
+    for (DWORD i = 0; i < n; ++i) if (full[i] == L'/') full[i] = L'\\';
+    if (wcsncmp(full, L"\\\\?\\", 4) == 0) {
+        memcpy(wide, full, (n + 1) * sizeof(wchar_t));
+    } else {
+        const wchar_t *prefix = full[0] == L'\\' && full[1] == L'\\'
+                                    ? L"\\\\?\\UNC\\" : L"\\\\?\\";
+        const wchar_t *tail = full + (wcslen(prefix) == 8 ? 2 : 0);
+        wide[0] = 0;
+        if (!zan__crash_path_suffix(wide, prefix) ||
+            !zan__crash_path_suffix(wide, tail)) return 0;
+    }
+    /* Skip the drive root, or the server/share root for UNC paths. */
+    size_t start = 7;
+    if (wcsncmp(wide, L"\\\\?\\UNC\\", 8) == 0) {
+        start = 8;
+        for (int part = 0; part < 2; ++part) {
+            while (wide[start] && wide[start] != L'\\') ++start;
+            if (wide[start]) ++start;
+        }
+    }
+    for (size_t i = start; wide[i]; ++i) {
+        if (wide[i] != L'\\') continue;
+        wide[i] = 0;
+        BOOL made = CreateDirectoryW(wide, NULL);
+        DWORD err = GetLastError();
+        wide[i] = L'\\';
+        if (!made && err != ERROR_ALREADY_EXISTS) return 0;
+    }
+    if (!CreateDirectoryW(wide, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return 0;
+    DWORD attr = GetFileAttributesW(wide);
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+    if (!zan__crash_path_suffix(wide, L"\\zan_crash.log")) return 0;
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, out,
+                              ZAN_CRASH_PATH_CAP, NULL, NULL)) { out[0] = 0; return 0; }
+    return 1;
+}
+
+static void zan__crash_resolve_paths(void) {
+    wchar_t dir[ZAN_CRASH_PATH_CAP];
+    zan__crash_cached_log[0] = zan__crash_cached_temp[0] = 0;
+    DWORD n = GetTempPathW(ZAN_CRASH_PATH_CAP, dir);
+    if (n && n < ZAN_CRASH_PATH_CAP && zan__crash_path_suffix(dir, L"Zan\\logs"))
+        zan__crash_prepare_log(dir, zan__crash_cached_temp);
+    if (zan__crash_env_path(L"ZAN_LOG_DIR", dir)) {
+        zan__crash_prepare_log(dir, zan__crash_cached_log);
+    } else if (zan__crash_env_path(L"LOCALAPPDATA", dir) && zan__crash_absolute(dir)) {
+        if (zan__crash_path_suffix(dir, L"\\Zan\\logs"))
+            zan__crash_prepare_log(dir, zan__crash_cached_log);
+    } else if (zan__crash_env_path(L"USERPROFILE", dir) && zan__crash_absolute(dir)) {
+        if (zan__crash_path_suffix(dir, L"\\AppData\\Local\\Zan\\logs"))
+            zan__crash_prepare_log(dir, zan__crash_cached_log);
+    }
+}
+
+static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
+    zan__crash_snprintf(logpath, cap, "%s", zan__crash_cached_log);
+    exe_dir[0] = 0;
+    DWORD n = GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) { exe_dir[0] = 0; return; }
+    char *slash = strrchr(exe_dir, '\\');
+    if (slash) slash[1] = 0;
+    else exe_dir[0] = 0;
+}
+
 static void zan__crash_temp_logpath(char *logpath, size_t cap) {
-    char tmp[MAX_PATH];
-    DWORD n = GetTempPathA((DWORD)sizeof tmp, tmp);
-    if (n == 0 || n >= sizeof tmp) { logpath[0] = '\0'; return; }
-    zan__crash_snprintf(logpath, cap, "%szan_crash.log", tmp);
+    zan__crash_snprintf(logpath, cap, "%s", zan__crash_cached_temp);
 }
 
 /* 崩溃兜底日志的大小上限。
@@ -277,25 +351,27 @@ static zan__cf_t zan__crash_open_log(const char *logpath) {
     LARGE_INTEGER sz;
     if (GetFileSizeEx(f.h, &sz) && sz.QuadPart >= ZAN_CRASH_LOG_MAX_BYTES) {
         zan__cf_close(f);
-        char old[MAX_PATH];
+        char old[ZAN_CRASH_PATH_CAP];
+        wchar_t wide[ZAN_CRASH_PATH_CAP], wide_old[ZAN_CRASH_PATH_CAP];
+        if (strlen(logpath) + 3 > sizeof old) return (zan__cf_t){ 0 };
         zan__crash_snprintf(old, sizeof old, "%s.1", logpath);
-        DeleteFileA(old);
-        MoveFileA(logpath, old);
+        if (!zan__crash_wpath(logpath, wide, ZAN_CRASH_PATH_CAP) ||
+            !zan__crash_wpath(old, wide_old, ZAN_CRASH_PATH_CAP)) return (zan__cf_t){ 0 };
+        DeleteFileW(wide_old);
+        MoveFileW(wide, wide_old);
         f = zan__cf_open_append(logpath);
     }
     return f;
 }
 
 static void zan__crash_note(const char *what, const char *detail) {
-    char logpath[MAX_PATH];
+    char logpath[ZAN_CRASH_PATH_CAP];
     char exe_dir[MAX_PATH];
     zan__crash_logpath(logpath, sizeof logpath, exe_dir);
     zan__cf_t f = zan__crash_open_log(logpath);
-    if (!f.h) f = zan__crash_open_log("zan_crash.log");
     if (!f.h) {
-        char tpath[MAX_PATH];
-        zan__crash_temp_logpath(tpath, sizeof tpath);
-        if (tpath[0]) f = zan__crash_open_log(tpath);
+        zan__crash_temp_logpath(logpath, sizeof logpath);
+        if (logpath[0]) f = zan__crash_open_log(logpath);
     }
     if (!f.h) return;
     SYSTEMTIME st;

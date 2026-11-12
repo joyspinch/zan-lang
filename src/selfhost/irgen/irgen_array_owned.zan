@@ -1,0 +1,559 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    int arrayDescriptorSeq;
+
+    bool DynamicReferenceType(Node ty) {
+        if (ty == null || ty.ival >= 1 || IsNullableValue(ty)) { return false; }
+        if (ty.sval == "object") { return true; }
+        Node decl = binder.FindType(ty.sval);
+        return decl != null && (decl.mods & MOD.Iface()) != 0;
+    }
+
+    int erasedDelegateSeq;
+
+    // Type erasure must never turn a native code address into an ARC payload.
+    // A typed thunk preserves its signature and owns a record/environment pair.
+    ExprVal EraseDelegateReference(ExprVal value, Node target, bool arrayElement = false, bool registerTemp = true) {
+        if ((!DynamicReferenceType(target) && !arrayElement) || value == null || !IsDelegate(value.ty)) { return value; }
+        Node dty = InstDelegateType(value.ty);
+        Node retTy = DelegRet(dty);
+        if (IsAsyncDelegate(dty)) { retTy = MkType("object"); }
+        List<Node> pt = DelegParams(dty);
+        string name = "@zerased_delegate_" + erasedDelegateSeq;
+        erasedDelegateSeq = erasedDelegateSeq + 1;
+        string rt = MapType(retTy);
+        string signatureParams = ""; string types = ""; string args = "";
+        int i = 0;
+        while (i < pt.Count) {
+            string lt = MapType(pt[i]);
+            signatureParams = signatureParams + ", " + lt + " %a" + i;
+            types = types + (i == 0 ? "" : ", ") + lt;
+            args = args + (i == 0 ? "" : ", ") + lt + " %a" + i;
+            i = i + 1;
+        }
+        H("define internal " + rt + " " + name + "_call(i8* %env" + signatureParams + ") {");
+        H("  %slot = bitcast i8* %env to i8**");
+        H("  %raw = load i8*, i8** %slot");
+        H("  %fn = bitcast i8* %raw to " + rt + " (" + types + ")*");
+        if (rt == "void") {
+            H("  call void %fn(" + args + ")");
+            H("  ret void");
+        } else {
+            H("  %r = call " + rt + " %fn(" + args + ")");
+            H("  ret " + rt + " %r");
+        }
+        H("}");
+        H("define internal i8* " + name + "(i8* %value) {");
+        H("entry:");
+        H("  %bits = ptrtoint i8* %value to i64");
+        H("  %low = and i64 %bits, 1");
+        H("  %tagged = icmp ne i64 %low, 0");
+        H("  %nil = icmp eq i8* %value, null");
+        H("  %safe = or i1 %tagged, %nil");
+        H("  br i1 %safe, label %keep, label %wrap");
+        H("keep:");
+        H("  call void @zdelegate_retain(i8* %value)");
+        H("  ret i8* %value");
+        H("wrap:");
+        H("  %env = call i8* @zalloc(i64 8, i8* null, i8* null)");
+        H("  %ep = bitcast i8* %env to i8**");
+        H("  store i8* %value, i8** %ep");
+        H("  %record = call i8* @zalloc(i64 16, i8* bitcast (void (i8*)* @zclosure_dtor to i8*), i8* null)");
+        H("  %fp = bitcast i8* %record to i8**");
+        H("  store i8* bitcast (" + LamFnType(retTy, pt) + " " + name + "_call to i8*), i8** %fp");
+        H("  %es = getelementptr i8*, i8** %fp, i64 1");
+        H("  store i8* %env, i8** %es");
+        H("  %rb = ptrtoint i8* %record to i64");
+        H("  %tb = or i64 %rb, 1");
+        H("  %result = inttoptr i64 %tb to i8*");
+        H("  ret i8* %result");
+        H("}");
+        string result = NT();
+        L("  " + result + " = call i8* " + name + "(i8* " + value.op + ")");
+        if (registerTemp) { AddTemp(result, value.ty); }
+        ExprVal erased = new ExprVal(result, target);
+        return erased;
+    }
+
+    // Descriptor: { outer rank, element stride, ownership kind, element rank }.
+    // kind 0 = value/borrowed, 1 = ARC payload, 2 = delegate, 3 = array.
+    // Nullable boxes remain borrowed until their separate ownership migration.
+    int ArrayElementKind(Node ty) {
+        if (ty == null) { return 0; }
+        if (ty.ival >= 1) { return 3; }
+        if (IsNullableValue(ty)) { return 1; }
+        if (IsDelegate(ty)) { return 2; }
+        if (DynamicReferenceType(ty)) { return 4; }
+        if (ArcManaged(ty)) { return 1; }
+        return 0;
+    }
+
+    // Full element shape is compared byte-for-byte, including nested ranks.
+    string ArrayTypeKey(Node ty) {
+        if (ty == null) { return "void"; }
+        string key = ty.sval + (ty.op == 1 ? "?" : "");
+        int i = 0;
+        while (i < ty.kids.Count) { key = key + "<" + ArrayTypeKey(ty.kids[i]) + ">"; i = i + 1; }
+        i = 0;
+        while (i < ty.ival) { key = key + "[" + Node.ArrRankAt(ty.arrRanks, i) + "]"; i = i + 1; }
+        return key;
+    }
+
+    string ArrayTypeKeyGlobal(Node ty, string name) {
+        List<int> bytes = DecodeStr(ArrayTypeKey(ty));
+        string encoded = ""; int i = 0;
+        while (i < bytes.Count) { encoded = encoded + "\\" + Hex2(bytes[i]); i = i + 1; }
+        int count = bytes.Count + 1;
+        H(name + " = private constant [" + count + " x i8] c\"" + encoded + "\\00\"");
+        return "getelementptr ([" + count + " x i8], [" + count + " x i8]* " + name + ", i64 0, i64 0)";
+    }
+
+    bool ArrayReferenceElement(Node ty) {
+        if (ty == null || IsNullableValue(ty) || IsStructTy(ty)) { return false; }
+        return ty.ival >= 1 || DynamicReferenceType(ty) || IsDelegate(ty) || ArcManaged(ty) || ty.sval == "string";
+    }
+
+    string ArrayElementCid(Node elem) {
+        if (elem == null || elem.ival >= 1 || IsNullableValue(elem) || IsDelegate(elem)) { return "null"; }
+        Node decl = binder.FindType(elem.sval);
+        if (decl != null && (decl.kind == AK.ClassDecl() || decl.kind == AK.StructDecl())) {
+            return "bitcast (i8** @__tid_" + elem.sval + " to i8*)";
+        }
+        if (IsContainerType(elem.sval)) { return "bitcast (i8** @__tid_" + ContainerTidName(elem.sval) + " to i8*)"; }
+        return "null";
+    }
+
+    // Emit a predicate while preserving the caller's instruction/label state.
+    string ArrayStorePredicate(Node elem, string name) {
+        StringBuilder saved = body;
+        int st = tmp; int sl = lbl; string sc = curLbl; bool se = eaActive;
+        body = new StringBuilder(); tmp = 0; lbl = 0; curLbl = "entry"; eaActive = false;
+        L("define internal i1 " + name + "(i8* %value) {");
+        L("entry:");
+        string nil = NT(); L("  " + nil + " = icmp eq i8* %value, null");
+        int work = NL(); int yes = NL(); int no = NL();
+        L("  br i1 " + nil + ", label %L" + yes + ", label %L" + work);
+        Label(work);
+        string ok = "false";
+        if (elem != null && elem.ival < 1 && elem.sval == "object") { ok = "true"; }
+        else if (elem != null && elem.ival >= 1) { ok = ArrayRuntimeTypeTest(new ExprVal("%value", MkType("object")), elem); }
+        else if (elem != null && elem.sval == "string") { ok = EmitStringIdTest(new ExprVal("%value", MkType("object"))); }
+        else if (IsDelegate(elem)) {
+            string bits = NT(); string low = NT(); ok = NT();
+            L("  " + bits + " = ptrtoint i8* %value to i64");
+            L("  " + low + " = and i64 " + bits + ", 1");
+            L("  " + ok + " = icmp ne i64 " + low + ", 0");
+        } else if (ArrayReferenceElement(elem) || IsStructTy(elem)) {
+            ok = EmitClassIdTest(new ExprVal("%value", MkType("object")), elem.sval);
+        }
+        L("  br i1 " + ok + ", label %L" + yes + ", label %L" + no);
+        Label(yes); L("  ret i1 true");
+        Label(no); L("  ret i1 false"); L("}");
+        string text = body.ToString();
+        body = saved; tmp = st; lbl = sl; curLbl = sc; eaActive = se;
+        deferred.Append(text);
+        return name;
+    }
+
+    // A descriptor's element cid is tested against the same closed-world set
+    // as class casts; no read is made through a candidate element pointer.
+    string ArrayCovariantCid(string cid, Node target) {
+        string acc = "false";
+        if (target == null || target.ival >= 1 || !ArrayReferenceElement(target)) { return acc; }
+        int i = 0;
+        while (i < tidNames.Count) {
+            string cn = tidNames[i];
+            if (IsSubclassName(cn, target.sval)) {
+                string cmp = NT(); string combined = NT();
+                L("  " + cmp + " = icmp eq i8* " + cid + ", bitcast (i8** @__tid_" + cn + " to i8*)");
+                L("  " + combined + " = or i1 " + acc + ", " + cmp);
+                acc = combined;
+            }
+            i = i + 1;
+        }
+        return acc;
+    }
+
+    string ArrayRuntimeTypeTest(ExprVal value, Node target) {
+        string p = Coerce(value, "i8*");
+        string desc = NT();
+        L("  " + desc + " = call i64* @zref_array_descriptor(i8* " + p + ")");
+        string has = NT(); L("  " + has + " = icmp ne i64* " + desc + ", null");
+        int read = NL(); int fail = NL(); int join = NL();
+        L("  br i1 " + has + ", label %L" + read + ", label %L" + fail);
+        Label(read);
+        Node elem = ArrElemOf(target);
+        string token = ArrayTypeKeyGlobal(elem, "@zarr_cast_key_" + arrayDescriptorSeq);
+        arrayDescriptorSeq = arrayDescriptorSeq + 1;
+        string exact = NT();
+        L("  " + exact + " = call i1 @zarr_shape_exact(i64* " + desc + ", i64 " + ArrRankOf(target) + ", i8* " + token + ")");
+        string accepted = exact;
+        string pred = curLbl;
+        L("  br label %L" + join);
+        Label(fail); L("  br label %L" + join);
+        Label(join);
+        string result = NT();
+        L("  " + result + " = phi i1 [ " + accepted + ", %" + pred + " ], [ false, %L" + fail + " ]");
+        return result;
+    }
+
+    string ArrayDescriptor(Node ty) {
+        Node elem = ArrElemOf(ty);
+        int innerRank = 1;
+        if (elem != null && elem.ival >= 1) { innerRank = ArrRankOf(elem); }
+        string name = "@zarr_desc_" + arrayDescriptorSeq;
+        arrayDescriptorSeq = arrayDescriptorSeq + 1;
+        string key = ArrayTypeKeyGlobal(elem, name + "_key");
+        string predicate = ArrayStorePredicate(elem, name + "_accept");
+        H(name + " = internal constant [8 x i64] [i64 " + ArrRankOf(ty)
+            + ", i64 " + ArrElemSize(elem) + ", i64 " + ArrayElementKind(elem)
+            + ", i64 " + innerRank
+            + ", i64 ptrtoint (i1 (i8*)* " + predicate + " to i64)"
+            + ", i64 ptrtoint (i8* " + key + " to i64)"
+            + ", i64 ptrtoint (i8* " + ArrayElementCid(elem) + " to i64)"
+            + ", i64 " + (ArrayReferenceElement(elem) ? "1" : "0") + "], align 8");
+        return "getelementptr ([8 x i64], [8 x i64]* " + name + ", i64 0, i64 0)";
+    }
+
+    // Creation owns +1; its caller registers exactly one statement temporary.
+    string ArrayAllocate(Node ty, string count) {
+        string desc = ArrayDescriptor(ty);
+        string arr = NT();
+        L("  " + arr + " = call i64* @zarr_alloc(i64 " + count + ", i64* " + desc + ")");
+        return arr;
+    }
+
+    void ArrayElementRetain(string slot, Node ty) {
+        int kind = ArrayElementKind(ty);
+        if (kind == 0) { return; }
+        L("  call void @zarr_element_retain(i64 " + slot + ", i64 " + kind
+            + ", i64 " + ArrRankOf(ty) + ")");
+    }
+
+    // Copying a struct produces an owned instance; keep that creation reference
+    // in the ordinary temporary list while the array acquires its own reference.
+    string ArrayElementSlot(ExprVal value, Node ty) {
+        value = EraseDelegateReference(value, ty, IsDelegate(ty));
+        if (IsStructTy(ty)) { value = StructCopyTemp(value, ty); }
+        return ToSlot(value, ty);
+    }
+
+    void EmitArrayOwnershipRuntime() {
+        H("define i64* @zref_array_descriptor(i8* %p) {");
+        H("entry:");
+        H("  %nil = icmp eq i8* %p, null");
+        H("  %bits = ptrtoint i8* %p to i64");
+        H("  %low = and i64 %bits, 1");
+        H("  %delegate = icmp ne i64 %low, 0");
+        H("  %skip = or i1 %nil, %delegate");
+        H("  br i1 %skip, label %none, label %read");
+        H("read:");
+        H("  %h = getelementptr i8, i8* %p, i64 -24");
+        H("  %hp = bitcast i8* %h to i64*");
+        H("  %id = load i64, i64* %hp");
+        H("  %tag = and i64 %id, 1");
+        H("  %tagged = icmp ne i64 %tag, 0");
+        H("  %address = icmp uge i64 %id, 9");
+        H("  %array = and i1 %tagged, %address");
+        H("  br i1 %array, label %found, label %none");
+        H("found:");
+        H("  %clean = and i64 %id, -2");
+        H("  %desc = inttoptr i64 %clean to i64*");
+        H("  ret i64* %desc");
+        H("none:");
+        H("  ret i64* null");
+        H("}");
+        H("define i1 @zarr_shape_exact(i64* %desc, i64 %targetrank, i8* %targetkey) {");
+        H("entry:");
+        H("  %rank = load i64, i64* %desc");
+        H("  %same = icmp eq i64 %rank, %targetrank");
+        H("  %kp = getelementptr i64, i64* %desc, i64 5");
+        H("  %ki = load i64, i64* %kp");
+        H("  %key = inttoptr i64 %ki to i8*");
+        H("  %cmp = call i32 @strcmp(i8* %key, i8* %targetkey)");
+        H("  %match = icmp eq i32 %cmp, 0");
+        H("  %result = and i1 %same, %match");
+        H("  ret i1 %result");
+        H("}");
+        H("define i1 @zarr_store_compatible(i64* %data, i64 %value) {");
+        H("entry:");
+        H("  %p = bitcast i64* %data to i8*");
+        H("  %desc = call i64* @zref_array_descriptor(i8* %p)");
+        H("  %nil = icmp eq i64* %desc, null");
+        H("  br i1 %nil, label %no, label %read");
+        H("read:");
+        H("  %ap = getelementptr i64, i64* %desc, i64 4");
+        H("  %ai = load i64, i64* %ap");
+        H("  %accept = inttoptr i64 %ai to i1 (i8*)*");
+        H("  %element = inttoptr i64 %value to i8*");
+        H("  %ok = call i1 %accept(i8* %element)");
+        H("  ret i1 %ok");
+        H("no:");
+        H("  ret i1 false");
+        H("}");
+        H("define void @zarr_store_dynamic(i64* %data, i64* %slot, i64 %value, i1 %bad) {");
+        H("entry:");
+        H("  br i1 %bad, label %done, label %work");
+        H("work:");
+        H("  %p = bitcast i64* %data to i8*");
+        H("  %desc = call i64* @zref_array_descriptor(i8* %p)");
+        H("  %kp = getelementptr i64, i64* %desc, i64 2");
+        H("  %kind = load i64, i64* %kp");
+        H("  %rp = getelementptr i64, i64* %desc, i64 3");
+        H("  %rank = load i64, i64* %rp");
+        H("  call void @zarr_store(i64* %slot, i64 %value, i64 %kind, i64 %rank, i1 false)");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+        // Every array uses [dimensions...][descriptor|1][rc][count][data].
+        // The public data pointer is also the ARC owner, for every rank.
+        // The tagged, aligned descriptor at data[-3] distinguishes arrays from
+        // class/string identities without probing arbitrary candidate pointers.
+        // rc=-1 is immortal; the descriptor rank determines the free base.
+        // Same fatal protocol as EmitAbortIf: report, exit(1), unreachable.
+        H("@zarr_alloc_error = private constant [25 x i8] c\"array allocation failed\\0A\\00\"");
+        H("define void @zarr_alloc_fail() {");
+        H("entry:");
+        H("  %msg = getelementptr [25 x i8], [25 x i8]* @zarr_alloc_error, i64 0, i64 0");
+        H("  call i32 (i8*, ...) @printf(i8* %msg)");
+        H("  call void @exit(i32 1)");
+        H("  unreachable");
+        H("}");
+        H("define i64 @zarr_count_mul(i64 %left, i64 %right) {");
+        H("entry:");
+        H("  %ln = icmp slt i64 %left, 0");
+        H("  %rn = icmp slt i64 %right, 0");
+        H("  %negative = or i1 %ln, %rn");
+        H("  br i1 %negative, label %fail, label %nonnegative");
+        H("nonnegative:");
+        H("  %zero = icmp eq i64 %right, 0");
+        H("  br i1 %zero, label %empty, label %check");
+        H("empty:");
+        H("  ret i64 0");
+        H("check:");
+        H("  %limit = udiv i64 9223372036854775807, %right");
+        H("  %overflow = icmp ugt i64 %left, %limit");
+        H("  br i1 %overflow, label %fail, label %multiply");
+        H("multiply:");
+        H("  %count = mul i64 %left, %right");
+        H("  ret i64 %count");
+        H("fail:");
+        H("  call void @zarr_alloc_fail()");
+        H("  unreachable");
+        H("}");
+        H("define i64* @zarr_alloc(i64 %count, i64* %desc) {");
+        H("entry:");
+        H("  %rank = load i64, i64* %desc");
+        H("  %sp = getelementptr i64, i64* %desc, i64 1");
+        H("  %stride = load i64, i64* %sp");
+        H("  %negative = icmp slt i64 %count, 0");
+        H("  %badstride = icmp sle i64 %stride, 0");
+        H("  %badrank = icmp slt i64 %rank, 1");
+        H("  %hugrank = icmp ugt i64 %rank, 1152921504606846972");
+        H("  %bad0 = or i1 %negative, %badstride");
+        H("  %bad1 = or i1 %badrank, %hugrank");
+        H("  %bad = or i1 %bad0, %bad1");
+        H("  br i1 %bad, label %fail, label %headercheck");
+        H("headercheck:");
+        H("  %rect = icmp sgt i64 %rank, 1");
+        H("  %rh = add i64 %rank, 3");
+        H("  %words = select i1 %rect, i64 %rh, i64 3");
+        H("  %header = mul i64 %words, 8");
+        H("  %available = sub i64 9223372036854775807, %header");
+        H("  %limit = udiv i64 %available, %stride");
+        H("  %overflow = icmp ugt i64 %count, %limit");
+        H("  br i1 %overflow, label %fail, label %allocate");
+        H("allocate:");
+        H("  %bytes = mul i64 %count, %stride");
+        H("  %total = add i64 %header, %bytes");
+        H("  %raw = call i8* @calloc(i64 1, i64 %total)");
+        H("  %oom = icmp eq i8* %raw, null");
+        H("  br i1 %oom, label %fail, label %initialize");
+        H("fail:");
+        H("  call void @zarr_alloc_fail()");
+        H("  unreachable");
+        H("initialize:");
+        H("  call void @zan_rt_alloc_add(i64 %total)");
+        H("  %base = bitcast i8* %raw to i64*");
+        H("  %data = getelementptr i64, i64* %base, i64 %words");
+        H("  %dp = getelementptr i64, i64* %data, i64 -3");
+        H("  %di = ptrtoint i64* %desc to i64");
+        H("  %tagged = or i64 %di, 1");
+        H("  store i64 %tagged, i64* %dp");
+        H("  %rcp = getelementptr i64, i64* %data, i64 -2");
+        H("  store i64 1, i64* %rcp");
+        H("  %cp = getelementptr i64, i64* %data, i64 -1");
+        H("  store i64 %count, i64* %cp");
+        H("  ret i64* %data");
+        H("}");
+        int dynamicOp = 0;
+        while (dynamicOp < 2) {
+            string op = dynamicOp == 0 ? "retain" : "release";
+            H("define void @zref_" + op + "(i8* %p) {");
+            H("entry:");
+            H("  %nil = icmp eq i8* %p, null");
+            H("  br i1 %nil, label %done, label %tag");
+            H("tag:");
+            H("  %bits = ptrtoint i8* %p to i64");
+            H("  %low = and i64 %bits, 1");
+            H("  %delegate = icmp ne i64 %low, 0");
+            H("  br i1 %delegate, label %closure, label %identity");
+            H("closure:");
+            H("  call void @zdelegate_" + op + "(i8* %p)");
+            H("  br label %done");
+            H("identity:");
+            H("  %header = getelementptr i8, i8* %p, i64 -24");
+            H("  %slot = bitcast i8* %header to i64*");
+            H("  %id = load i64, i64* %slot");
+            H("  %kind = and i64 %id, 1");
+            H("  %tagged = icmp ne i64 %kind, 0");
+            H("  %address = icmp uge i64 %id, 9");
+            H("  %array = and i1 %tagged, %address");
+            H("  br i1 %array, label %arr, label %object");
+            H("arr:");
+            H("  %a = bitcast i8* %p to i64*");
+            H("  call void @zarr_" + op + "(i64* %a)");
+            H("  br label %done");
+            H("object:");
+            H("  call void @z" + op + "(i8* %p)");
+            H("  br label %done");
+            H("done:");
+            H("  ret void");
+            H("}");
+            dynamicOp = dynamicOp + 1;
+        }
+        H("define i64* @zarr_owner(i64* %p, i64 %rank) {");
+        H("entry:");
+        H("  ret i64* %p");
+        H("}");
+        H("define void @zarr_element_retain(i64 %value, i64 %kind, i64 %rank) {");
+        H("entry:");
+        H("  %p = inttoptr i64 %value to i8*");
+        H("  switch i64 %kind, label %ret [ i64 1, label %obj i64 2, label %delegate i64 3, label %array i64 4, label %dynamic ]");
+        H("obj:");
+        H("  call void @zretain(i8* %p)");
+        H("  br label %ret");
+        H("delegate:");
+        H("  call void @zdelegate_retain(i8* %p)");
+        H("  br label %ret");
+        H("array:");
+        H("  %a = inttoptr i64 %value to i64*");
+        H("  %q = call i64* @zarr_owner(i64* %a, i64 %rank)");
+        H("  call void @zarr_retain(i64* %q)");
+        H("  br label %ret");
+        H("dynamic:");
+        H("  call void @zref_retain(i8* %p)");
+        H("  br label %ret");
+        H("ret:");
+        H("  ret void");
+        H("}");
+        H("define void @zarr_element_release(i64 %value, i64 %kind, i64 %rank) {");
+        H("entry:");
+        H("  %p = inttoptr i64 %value to i8*");
+        H("  switch i64 %kind, label %ret [ i64 1, label %obj i64 2, label %delegate i64 3, label %array i64 4, label %dynamic ]");
+        H("obj:");
+        H("  call void @zrelease(i8* %p)");
+        H("  br label %ret");
+        H("delegate:");
+        H("  call void @zdelegate_release(i8* %p)");
+        H("  br label %ret");
+        H("array:");
+        H("  %a = inttoptr i64 %value to i64*");
+        H("  %q = call i64* @zarr_owner(i64* %a, i64 %rank)");
+        H("  call void @zarr_release(i64* %q)");
+        H("  br label %ret");
+        H("dynamic:");
+        H("  call void @zref_release(i8* %p)");
+        H("  br label %ret");
+        H("ret:");
+        H("  ret void");
+        H("}");
+        H("define void @zarr_store(i64* %slot, i64 %value, i64 %kind, i64 %rank, i1 %bad) {");
+        H("entry:");
+        H("  br i1 %bad, label %ret, label %work");
+        H("work:");
+        H("  call void @zarr_element_retain(i64 %value, i64 %kind, i64 %rank)");
+        H("  %old = load i64, i64* %slot");
+        H("  store i64 %value, i64* %slot");
+        H("  call void @zarr_element_release(i64 %old, i64 %kind, i64 %rank)");
+        H("  br label %ret");
+        H("ret:");
+        H("  ret void");
+        H("}");
+        H("define void @zarr_retain(i64* %p) {");
+        H("entry:");
+        H("  %nil = icmp eq i64* %p, null");
+        H("  br i1 %nil, label %ret, label %probe");
+        H("probe:");
+        H("  %rcp = getelementptr i64, i64* %p, i64 -2");
+        H("  %rc = load atomic i64, i64* %rcp monotonic, align 8");
+        H("  %immortal = icmp eq i64 %rc, -1");
+        H("  br i1 %immortal, label %ret, label %work");
+        H("work:");
+        H("  %old = atomicrmw add i64* %rcp, i64 1 monotonic");
+        H("  br label %ret");
+        H("ret:");
+        H("  ret void");
+        H("}");
+        H("define void @zarr_release(i64* %p) {");
+        H("entry:");
+        H("  %nil = icmp eq i64* %p, null");
+        H("  br i1 %nil, label %ret, label %probe");
+        H("probe:");
+        H("  %rcp = getelementptr i64, i64* %p, i64 -2");
+        H("  %rc = load atomic i64, i64* %rcp monotonic, align 8");
+        H("  %immortal = icmp eq i64 %rc, -1");
+        H("  br i1 %immortal, label %ret, label %work");
+        H("work:");
+        H("  %old = atomicrmw sub i64* %rcp, i64 1 acq_rel");
+        H("  %last = icmp eq i64 %old, 1");
+        H("  br i1 %last, label %destroy, label %ret");
+        H("destroy:");
+        H("  %dp = getelementptr i64, i64* %p, i64 -3");
+        H("  %tagged = load i64, i64* %dp");
+        H("  %di = and i64 %tagged, -2");
+        H("  %desc = inttoptr i64 %di to i64*");
+        H("  %rank = load i64, i64* %desc");
+        H("  %sp = getelementptr i64, i64* %desc, i64 1");
+        H("  %stride = load i64, i64* %sp");
+        H("  %kp = getelementptr i64, i64* %desc, i64 2");
+        H("  %kind = load i64, i64* %kp");
+        H("  %irp = getelementptr i64, i64* %desc, i64 3");
+        H("  %inner = load i64, i64* %irp");
+        H("  %rect = icmp sgt i64 %rank, 1");
+        H("  %dims = select i1 %rect, i64 %rank, i64 0");
+        H("  %header = add i64 %dims, 3");
+        H("  %back = sub i64 0, %header");
+        H("  %base = getelementptr i64, i64* %p, i64 %back");
+        H("  %data = getelementptr i64, i64* %p, i64 0");
+        H("  %cp = getelementptr i64, i64* %data, i64 -1");
+        H("  %count = load i64, i64* %cp");
+        H("  %owns = icmp ne i64 %kind, 0");
+        H("  %bytes = bitcast i64* %data to i8*");
+        H("  br i1 %owns, label %loop, label %free");
+        H("loop:");
+        H("  %i = phi i64 [ 0, %destroy ], [ %next, %element ]");
+        H("  %done = icmp uge i64 %i, %count");
+        H("  br i1 %done, label %free, label %element");
+        H("element:");
+        H("  %offset = mul i64 %i, %stride");
+        H("  %ep = getelementptr i8, i8* %bytes, i64 %offset");
+        H("  %slot = bitcast i8* %ep to i64*");
+        H("  %value = load i64, i64* %slot");
+        H("  store i64 0, i64* %slot");
+        H("  call void @zarr_element_release(i64 %value, i64 %kind, i64 %inner)");
+        H("  %next = add i64 %i, 1");
+        H("  br label %loop");
+        H("free:");
+        H("  %raw = bitcast i64* %base to i8*");
+        H("  call void @free(i8* %raw)");
+        H("  br label %ret");
+        H("ret:");
+        H("  ret void");
+        H("}");
+    }
+}

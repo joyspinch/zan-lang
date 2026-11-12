@@ -51,6 +51,7 @@ typedef struct {
     char pad_head[56];
     volatile long long tail;
     char pad_tail[56];
+    CRITICAL_SECTION   queue_lock;
     zan_co_task        buf[ZAN_LQ_CAP];
     zan_co_task        lifo;
     int                lifo_full;
@@ -93,6 +94,10 @@ static zan_co_node     *g_inj_head, *g_inj_tail, *g_inj_free;
 static volatile LONG    g_inj_len;
 static volatile LONG    g_inj_push_ext;
 
+static LONG co_load(volatile LONG *p) {
+    return InterlockedCompareExchange(p, 0, 0);
+}
+
 static long long co_now_ms(void) { return (long long)GetTickCount64(); }
 
 static volatile LONG      g_timer_owner;
@@ -130,16 +135,16 @@ static int co_worker_shard(int worker) {
 static zan_co_worker_t *co_self(void);
 
 static void co_notify(void) {
-    if (g_co_searching > 0) return;
-    if (g_co_parked <= 0) return;
-    if (InterlockedIncrement(&g_co_wake) > g_co_parked) {
+    if (co_load(&g_co_searching) > 0) return;
+    if (co_load(&g_co_parked) <= 0) return;
+    if (InterlockedIncrement(&g_co_wake) > co_load(&g_co_parked)) {
         InterlockedDecrement(&g_co_wake);
         return;
     }
     zan_co_worker_t *self = co_self();
     if (self) self->st.wake_post++;
     for (int i = 0; i < g_co_workers; i++) {
-        if (g_wk[i].parked) { co_wake_shard(co_worker_shard(i)); return; }
+        if (co_load(&g_wk[i].parked)) { co_wake_shard(co_worker_shard(i)); return; }
     }
     co_wake_shard(0);
 }
@@ -217,7 +222,7 @@ static void inj_push_batch(const zan_co_task *tasks, size_t count) {
 }
 
 static int inj_pop(zan_co_task *out) {
-    if (g_inj_len <= 0) return 0;
+    if (co_load(&g_inj_len) <= 0) return 0;
     EnterCriticalSection(&g_inj_lock);
     zan_co_node *n = g_inj_head;
     if (n) {
@@ -234,7 +239,7 @@ static int inj_pop(zan_co_task *out) {
 /* 单次加锁批量抽取注入的任务队列 */
 #define ZAN_INJ_BATCH 64
 static int inj_pop_batch(zan_co_task *out, int max) {
-    if (g_inj_len <= 0) return 0;
+    if (co_load(&g_inj_len) <= 0) return 0;
     EnterCriticalSection(&g_inj_lock);
     int n = 0;
     while (n < max && g_inj_head) {
@@ -253,86 +258,83 @@ static int inj_pop_batch(zan_co_task *out, int max) {
 
 static void lq_push(zan_co_worker_t *w, zan_co_task t);
 
+/* A speculative thief can retain an old head while another consumer advances
+ * it and the producer reuses the ring slot. Protect the complete task pair and
+ * head movement together; index atomics alone do not protect slot lifetime.
+ * No queue lock is held while publishing to another queue or the injector. */
 static void lq_spill(zan_co_worker_t *w) {
     zan_co_task tmp[ZAN_LQ_CAP / 2];
-    for (;;) {
-        long long h = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
-        long long t = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
-        long long n = (t - h) / 2;
-        if (n <= 0) return;
-        if (n > (long long)(ZAN_LQ_CAP / 2)) n = (long long)(ZAN_LQ_CAP / 2);
-        for (long long i = 0; i < n; i++)
-            tmp[i] = w->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
-        if (!__atomic_compare_exchange_n(&w->head, &h, h + n, 0,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            continue;
-        for (long long i = 0; i < n; i++) inj_push(tmp[i]);
-        w->st.spill++;
-        w->st.inj_push += (unsigned long long)n;
-        return;
-    }
+    EnterCriticalSection(&w->queue_lock);
+    long long h = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
+    long long t = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+    long long n = (t - h) / 2;
+    if (n > (long long)(ZAN_LQ_CAP / 2)) n = (long long)(ZAN_LQ_CAP / 2);
+    for (long long i = 0; i < n; i++)
+        tmp[i] = w->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
+    if (n > 0) __atomic_store_n(&w->head, h + n, __ATOMIC_RELEASE);
+    LeaveCriticalSection(&w->queue_lock);
+    if (n <= 0) return;
+    for (long long i = 0; i < n; i++) inj_push(tmp[i]);
+    w->st.spill++;
+    w->st.inj_push += (unsigned long long)n;
 }
 
-static void lq_push(zan_co_worker_t *w, zan_co_task t) {
+static void lq_push(zan_co_worker_t *w, zan_co_task task) {
+    EnterCriticalSection(&w->queue_lock);
     long long tail = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
-    long long head = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
+    long long head = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
     if (tail - head >= (long long)ZAN_LQ_CAP) {
+        LeaveCriticalSection(&w->queue_lock);
         lq_spill(w);
-        head = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
+        EnterCriticalSection(&w->queue_lock);
+        tail = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+        head = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
         if (tail - head >= (long long)ZAN_LQ_CAP) {
-            inj_push(t);
+            LeaveCriticalSection(&w->queue_lock);
+            inj_push(task);
             w->st.inj_push++;
             return;
         }
     }
-    w->buf[(unsigned long long)tail & ZAN_LQ_MASK] = t;
+    w->buf[(unsigned long long)tail & ZAN_LQ_MASK] = task;
     __atomic_store_n(&w->tail, tail + 1, __ATOMIC_RELEASE);
+    LeaveCriticalSection(&w->queue_lock);
     w->st.lq_push++;
 }
 
 static int lq_pop(zan_co_worker_t *w, zan_co_task *out) {
-    for (;;) {
-        long long h = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
-        long long t = __atomic_load_n(&w->tail, __ATOMIC_ACQUIRE);
-        if (h >= t) return 0;
-        zan_co_task task = w->buf[(unsigned long long)h & ZAN_LQ_MASK];
-        if (__atomic_compare_exchange_n(&w->head, &h, h + 1, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            *out = task;
-            return 1;
-        }
+    EnterCriticalSection(&w->queue_lock);
+    long long h = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
+    long long t = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+    if (h >= t) {
+        LeaveCriticalSection(&w->queue_lock);
+        return 0;
     }
+    *out = w->buf[(unsigned long long)h & ZAN_LQ_MASK];
+    __atomic_store_n(&w->head, h + 1, __ATOMIC_RELEASE);
+    LeaveCriticalSection(&w->queue_lock);
+    return 1;
 }
 
 static int lq_steal(zan_co_worker_t *v, zan_co_worker_t *w, zan_co_task *out) {
     zan_co_task tmp[ZAN_LQ_CAP / 2];
-    int attempts = 0;
-    for (;;) {
-        long long h = __atomic_load_n(&v->head, __ATOMIC_ACQUIRE);
-        long long t = __atomic_load_n(&v->tail, __ATOMIC_ACQUIRE);
-        long long n = t - h;
-        if (n <= 0) return 0;
-        n = n - n / 2;                                   /* half, rounded up */
-        if (n > (long long)(ZAN_LQ_CAP / 2)) n = (long long)(ZAN_LQ_CAP / 2);
-        for (long long i = 0; i < n; i++)
-            tmp[i] = v->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
-        if (!__atomic_compare_exchange_n(&v->head, &h, h + n, 0,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            attempts++;
-            if (attempts > 16) {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-                __builtin_ia32_pause();   /* no <emmintrin.h> on musl/wasi */
-#endif
-            }
-            if (attempts > 64) {
-                return 0;
-            }
-            continue;
-        }
-        *out = tmp[0];
-        for (long long i = 1; i < n; i++) lq_push(w, tmp[i]);
-        return 1;
+    EnterCriticalSection(&v->queue_lock);
+    long long h = __atomic_load_n(&v->head, __ATOMIC_RELAXED);
+    long long t = __atomic_load_n(&v->tail, __ATOMIC_RELAXED);
+    long long n = t - h;
+    if (n <= 0) {
+        LeaveCriticalSection(&v->queue_lock);
+        return 0;
     }
+    n = n - n / 2; /* half, rounded up */
+    if (n > (long long)(ZAN_LQ_CAP / 2)) n = (long long)(ZAN_LQ_CAP / 2);
+    for (long long i = 0; i < n; i++)
+        tmp[i] = v->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
+    __atomic_store_n(&v->head, h + n, __ATOMIC_RELEASE);
+    LeaveCriticalSection(&v->queue_lock);
+    *out = tmp[0];
+    for (long long i = 1; i < n; i++) lq_push(w, tmp[i]);
+    return 1;
 }
 
 
@@ -381,22 +383,23 @@ static void co_trace_dump(long long live) {
 }
 
 static LONG co_cnt_activity(void) {
-    long long s = g_co_cnt_ext.act;
-    for (int i = 0; i < g_co_workers; i++) s += g_wk[i].cnt_act;
+    long long s = co_load(&g_co_cnt_ext.act);
+    for (int i = 0; i < g_co_workers; i++) s += co_load(&g_wk[i].cnt_act);
     return (LONG)s;
 }
 static LONG co_cnt_outstanding(void) {
-    long long s = g_co_cnt_ext.out;
-    for (int i = 0; i < g_co_workers; i++) s += g_wk[i].cnt_out;
+    long long s = co_load(&g_co_cnt_ext.out);
+    for (int i = 0; i < g_co_workers; i++) s += co_load(&g_wk[i].cnt_out);
     return (LONG)s;
 }
 static void co_cnt_add(zan_co_worker_t *w, int act, int out) {
     volatile LONG *pa = w ? &w->cnt_act : &g_co_cnt_ext.act;
     volatile LONG *po = w ? &w->cnt_out : &g_co_cnt_ext.out;
-    if (act > 0)      InterlockedIncrement(pa);
-    else if (act < 0) InterlockedDecrement(pa);
-    if (out > 0)      InterlockedIncrement(po);
-    else if (out < 0) InterlockedDecrement(po);
+    /* Batch submission passes full deltas. Counting only their sign lets a
+     * batch of N drain N times after recording one owner, producing negative
+     * outstanding work and invalid scheduler quiescence decisions. */
+    if (act) InterlockedExchangeAdd(pa, (LONG)act);
+    if (out) InterlockedExchangeAdd(po, (LONG)out);
 }
 
 static void co_submit(void *frame, zan_co_step_t step) {
@@ -411,9 +414,9 @@ static void co_submit(void *frame, zan_co_step_t step) {
         co_notify();
         return;
     }
-    if (!w->lifo_full) {
+    if (!__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE)) {
         w->lifo = t;
-        w->lifo_full = 1;
+        __atomic_store_n(&w->lifo_full, 1, __ATOMIC_RELEASE);
         w->st.lifo_put++;
         return;
     }
@@ -434,9 +437,9 @@ static void co_submit_batch(const zan_co_task *tasks, size_t count) {
     }
     co_cnt_add(w, (int)count, (int)count);
     size_t i = 0;
-    if (!w->lifo_full && i < count) {
+    if (!__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE) && i < count) {
         w->lifo = tasks[i];
-        w->lifo_full = 1;
+        __atomic_store_n(&w->lifo_full, 1, __ATOMIC_RELEASE);
         w->st.lifo_put++;
         i++;
     }
@@ -502,20 +505,8 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     zan_co_ready_batch(&t, 1);
 }
 
-/* ---- 帧检疫区与线程本地复用热池（Thread-Local Coroutine Frame Pool）----
- * 帧的释放方（读 .Result 后的 zan_emit_frame_free）与完成方可能对同一
- * 帧各走一次 __zan_co_frame_free。幂等守卫读帧首 CO_DEAD 位，但通用
- * 分配器在 free 后会把块首 8 字节写成 freelist 指针（rt_mem.c），守卫
- * 读到垃圾 → 二次释放直接 abort（double free of block）。检疫区把释放
- * 的帧延迟归还：守卫位在被覆盖之前，第二次释放稳定读到 DEAD 并返回。
- *
- * 经过检疫窗口（32 帧周期）平滑脱离危险期的合法帧，不再直接回落通用 free()，
- * 而是按规格分流收纳至线程本地协程帧热池 (t_co_frame_pool) 中；下次启动
- * async 协程时，直接自 TLS 弹出复用，纯寄存器基址直取，实现零堆分配 (Zero-Alloc Async)。 */
-#define ZAN_TLS_FRAME_QUAR_CAP 64
-static _Thread_local void  *t_frame_quar[ZAN_TLS_FRAME_QUAR_CAP];
-static _Thread_local size_t t_frame_quar_head = 0;
-static _Thread_local size_t t_frame_quar_len = 0;
+/* Bounded thread-local allocation cache. Safety comes from scheduler ownership
+ * and registry pins, never from delaying address reuse. */
 
 #define ZAN_CO_FRAME_MAGIC 0x5a434f46U /* "ZCOF" */
 #define ZAN_CO_FRAME_CLASSES 4
@@ -546,8 +537,11 @@ static inline uint32_t co_frame_size_class(size_t sz) {
     return 99;
 }
 
+static void co_frame_recycle(void *frame);
+
 void *__zan_co_frame_alloc(size_t size) {
     size_t req = size ? size : 1;
+    if (req > SIZE_MAX - sizeof(zan_co_frame_prefix_t)) return NULL;
     uint32_t c = co_frame_size_class(req);
     size_t alloc_sz = (c < ZAN_CO_FRAME_CLASSES) ? g_co_frame_class_sz[c] : req;
     size_t total_sz = sizeof(zan_co_frame_prefix_t) + alloc_sz;
@@ -563,46 +557,24 @@ void *__zan_co_frame_alloc(size_t size) {
     pfx->magic = ZAN_CO_FRAME_MAGIC;
     pfx->class_idx = c;
     pfx->actual_sz = req;
-    return (void *)(pfx + 1);
+    void *frame = (void *)(pfx + 1);
+    zan_task_frame_allocator(frame, co_frame_recycle);
+    return frame;
 }
 
-static void co_frame_quarantine_add(void *frame) {
-    if (t_frame_quar_len == ZAN_TLS_FRAME_QUAR_CAP) {
-        size_t half = ZAN_TLS_FRAME_QUAR_CAP / 2;
-        for (size_t i = 0; i < half; i++) {
-            void *old_frame = t_frame_quar[(t_frame_quar_head + i) % ZAN_TLS_FRAME_QUAR_CAP];
-            if (!old_frame) continue;
-            zan_co_frame_prefix_t *pfx = (zan_co_frame_prefix_t *)old_frame - 1;
-            if (pfx->magic == ZAN_CO_FRAME_MAGIC && pfx->class_idx < ZAN_CO_FRAME_CLASSES) {
-                uint32_t c = pfx->class_idx;
-                if (t_co_frame_pool[c].count < ZAN_CO_FRAME_POOL_CAP) {
-                    t_co_frame_pool[c].frames[t_co_frame_pool[c].count++] = (void *)pfx;
-                    continue;
-                }
-                free(pfx);
-            } else if (pfx->magic == ZAN_CO_FRAME_MAGIC) {
-                free(pfx);
-            } else {
-                free(old_frame);
-            }
-        }
-        t_frame_quar_head = (t_frame_quar_head + half) % ZAN_TLS_FRAME_QUAR_CAP;
-        t_frame_quar_len -= half;
+static void co_frame_recycle(void *frame) {
+    zan_co_frame_prefix_t *pfx = (zan_co_frame_prefix_t *)frame - 1;
+    /* Only allocator-registered payloads reach this callback. */
+    if (pfx->magic != ZAN_CO_FRAME_MAGIC) abort();
+    uint32_t c = pfx->class_idx;
+    if (c < ZAN_CO_FRAME_CLASSES && t_co_frame_pool[c].count < ZAN_CO_FRAME_POOL_CAP) {
+        t_co_frame_pool[c].frames[t_co_frame_pool[c].count++] = pfx;
+    } else {
+        free(pfx);
     }
-    size_t tail = (t_frame_quar_head + t_frame_quar_len) % ZAN_TLS_FRAME_QUAR_CAP;
-    t_frame_quar[tail] = frame;
-    t_frame_quar_len++;
 }
 
 static void co_frame_pool_flush_tls(void) {
-    for (size_t i = 0; i < t_frame_quar_len; i++) {
-        void *f = t_frame_quar[(t_frame_quar_head + i) % ZAN_TLS_FRAME_QUAR_CAP];
-        if (!f) continue;
-        zan_co_frame_prefix_t *pfx = (zan_co_frame_prefix_t *)f - 1;
-        if (pfx->magic == ZAN_CO_FRAME_MAGIC) free(pfx);
-        else free(f);
-    }
-    t_frame_quar_len = t_frame_quar_head = 0;
     for (int c = 0; c < ZAN_CO_FRAME_CLASSES; c++) {
         for (size_t i = 0; i < t_co_frame_pool[c].count; i++) {
             free(t_co_frame_pool[c].frames[i]);
@@ -627,7 +599,7 @@ void __zan_co_frame_free(void *frame) {
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             break;
     }
-    co_frame_quarantine_add(frame);
+    zan_task_retire(frame, free);
 }
 
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {

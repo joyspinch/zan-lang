@@ -482,6 +482,8 @@ struct zan_ast_node {
             int array_rank;
             zan_ast_node_t *array_element;
             void *rt_type;
+            /* With rt_type set: NULL pins the declaration's lexical binding
+             * (including generic bodies); otherwise valid only in this scope. */
             void *rt_scope;
         } type_ref;
 

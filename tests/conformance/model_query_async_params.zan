@@ -4,6 +4,21 @@ using System.Data.Orm;
 using System.Data.Sqlite;
 using System.IO;
 
+[Table(Name = "articles")]
+class AsyncArticle {
+    [Column(IsIdentity = true)]
+    public int id;
+    public string title;
+    public int views;
+
+    public AsyncArticle() { }
+
+    public AsyncArticle(string title, int views) {
+        this.title = title;
+        this.views = views;
+    }
+}
+
 class Program {
     static int pass = 0;
     static int fail = 0;
@@ -21,89 +36,80 @@ class Program {
         string dbPath = "model_async_test.tmp.db";
         File.Delete(dbPath);
 
-        SqliteConnection db = SqliteConnection.Open(dbPath);
+        IDbConnection db = SqliteConnection.Open(dbPath);
         Check("db open", db != null);
+        IDbExecutor exec = db;
+        string tableExists = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?";
+        DbParams tableName = new DbParams().Add("articles");
+        Check("table not exists sync", exec.ExecuteScalar(tableExists, tableName) == "0");
+        Check("table not exists async", !await DbSchema.TableExistsAsync(db, "articles"));
 
-        Model model = Model.Define("articles")
-            .Column("id", "INTEGER", true)
-            .Column("title", "TEXT")
-            .Column("views", "INTEGER");
+        int created = await exec.ExecuteAsync("CREATE TABLE articles ("
+            + "id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, views INTEGER)");
+        Check("create table async", created >= 0);
+        Check("table exists sync", exec.ExecuteScalar(tableExists, tableName) == "1");
+        Check("table exists async", await DbSchema.TableExistsAsync(db, "articles"));
 
-        // 1. TableExists & TableExistsAsync before creation
-        Check("table not exists sync", !model.TableExists(db));
-        Check("table not exists async", !await model.TableExistsAsync(db));
-
-        // 2. CreateTableAsync
-        await model.CreateTableAsync(db);
-        Check("table exists sync", model.TableExists(db));
-        Check("table exists async", await model.TableExistsAsync(db));
-
-        // 3. Insert & InsertAsync
-        ModelRow r1 = new ModelRow().Set("title", "Hello Zan").Set("views", "10");
-        int aff1 = model.Insert(db, r1);
+        string hostile = "Param Injection Test'--";
+        int aff1 = db.Insert<AsyncArticle>(new AsyncArticle("Hello Zan", 10)).ExecuteAffrows();
         Check("insert sync", aff1 == 1);
-
-        ModelRow r2 = new ModelRow().Set("title", "Async ORM").Set("views", "25");
-        int aff2 = await model.InsertAsync(db, r2);
+        int aff2 = await exec.Insert<AsyncArticle>(new AsyncArticle("Async ORM", 25)).ExecuteAffrowsAsync();
         Check("insert async", aff2 == 1);
-
-        ModelRow r3 = new ModelRow().Set("title", "Param Injection Test'--").Set("views", "99");
-        int aff3 = await model.InsertAsync(db, r3);
+        int aff3 = await db.Insert<AsyncArticle>(new AsyncArticle(hostile, 99)).ExecuteAffrowsAsync();
         Check("insert async special chars", aff3 == 1);
 
-        // 4. Count & CountAsync
-        Check("count sync", model.Count(db) == 3);
-        Check("count async", await model.CountAsync(db) == 3);
+        Check("count sync", db.Select<AsyncArticle>().Count() == 3);
+        Check("count async", await exec.Select<AsyncArticle>().CountAsync() == 3);
 
-        // 5. FindById & FindByIdAsync (parameterized)
-        ModelRow f1 = model.FindById(db, 1);
-        Check("find by id sync", f1.Get("title") == "Hello Zan");
+        AsyncArticle f1 = db.Select<AsyncArticle>().WherePk(1).First();
+        Check("find by id sync", f1 != null && f1.title == "Hello Zan");
+        AsyncArticle f2 = await exec.Select<AsyncArticle>().WherePk(2).FirstAsync();
+        Check("find by id async", f2 != null && f2.title == "Async ORM");
+        AsyncArticle f3 = await db.Select<AsyncArticle>().WherePk(3).FirstAsync();
+        Check("find by id special", f3 != null && f3.title == hostile);
+        AsyncArticle missing = await db.Select<AsyncArticle>().WherePk(9999).FirstAsync();
+        Check("find by id missing", missing == null);
 
-        ModelRow f2 = await model.FindByIdAsync(db, 2);
-        Check("find by id async", f2.Get("title") == "Async ORM");
-
-        ModelRow f3 = await model.FindByIdAsync(db, 3);
-        Check("find by id special", f3.Get("title") == "Param Injection Test'--");
-
-        ModelRow fNone = await model.FindByIdAsync(db, 9999);
-        Check("find by id missing", fNone.GetKeys().Count == 0);
-
-        // 6. ModelQuery Select, ExecuteAsync, FirstAsync, CountAsync, AnyAsync
-        ModelQuery q = model.Select(db).WhereEq("title", "Async ORM");
+        SelectQuery<AsyncArticle> q = exec.Select<AsyncArticle>().WhereEq("title", "Async ORM");
         Check("query any async", await q.AnyAsync());
         Check("query count async", await q.CountAsync() == 1);
-
-        List<ModelRow> rows = await q.ExecuteAsync();
+        List<AsyncArticle> rows = await q.ToListAsync();
         Check("query execute async count", rows.Count == 1);
-        Check("query execute async val", rows[0].Get("views") == "25");
+        Check("query execute async val", rows.Count == 1 && rows[0].views == 25);
 
-        ModelRow first = await model.Select(db).Where("views > 20").OrderBy("views").FirstAsync();
-        Check("query first async", first.Get("title") == "Async ORM");
+        AsyncArticle first = await db.Select<AsyncArticle>()
+            .Where((AsyncArticle a) => a.views > 20).OrderBy("views").FirstAsync();
+        Check("query first async", first != null && first.title == "Async ORM");
 
-        // 7. ModelUpdate ExecuteAsync
-        int upAff = await model.UpdateQuery(db).SetInt("views", 100).WhereEq("title", "Async ORM").ExecuteAsync();
-        Check("update async", upAff == 1);
-        ModelRow upRow = await model.FindByIdAsync(db, 2);
-        Check("updated value", upRow.Get("views") == "100");
+        int updated = await exec.Update<AsyncArticle>().Set("views", 100)
+            .WhereEq("title", "Async ORM").ExecuteAffrowsAsync();
+        Check("update async", updated == 1);
+        AsyncArticle upRow = await db.Select<AsyncArticle>().WherePk(2).FirstAsync();
+        Check("updated value", upRow != null && upRow.views == 100);
 
-        // 8. DeleteById & DeleteByIdAsync (parameterized)
-        model.DeleteById(db, 1);
-        Check("delete by id sync", model.Count(db) == 2);
-
-        int delAff = await model.DeleteByIdAsync(db, 2);
-        Check("delete by id async", delAff == 1 && await model.CountAsync(db) == 1);
-
-        // 9. ModelDelete ExecuteAsync
-        int delAff2 = await model.DeleteQuery(db).WhereEq("title", "Param Injection Test'--").ExecuteAsync();
-        Check("model delete async", delAff2 == 1);
-        Check("final count 0", await model.CountAsync(db) == 0);
-
-        // 10. AllAsync & DropTableAsync
-        List<ModelRow> allEmpty = await model.AllAsync(db);
+        int deleted = db.Delete<AsyncArticle>().WherePk(1).ExecuteAffrows();
+        Check("delete by id sync", deleted == 1 && db.Select<AsyncArticle>().Count() == 2);
+        int delAff = await exec.Delete<AsyncArticle>().WherePk(2).ExecuteAffrowsAsync();
+        Check("delete by id async", delAff == 1 && await db.Select<AsyncArticle>().CountAsync() == 1);
+        int delAff2 = await db.Delete<AsyncArticle>().WhereEq("title", hostile).ExecuteAffrowsAsync();
+        Check("delete by bound value async", delAff2 == 1);
+        Check("final count 0", await db.Select<AsyncArticle>().CountAsync() == 0);
+        List<AsyncArticle> allEmpty = await db.Select<AsyncArticle>().ToListAsync();
         Check("all async empty", allEmpty.Count == 0);
 
-        int dropRes = await model.DropTableAsync(db);
-        Check("table dropped", !await model.TableExistsAsync(db));
+        List<AsyncArticle> connectionBatch = new List<AsyncArticle>();
+        connectionBatch.Add(new AsyncArticle(null, 11));
+        Check("bulk insert via connection", db.Insert<AsyncArticle>(connectionBatch).ExecuteAffrows() == 1);
+        List<AsyncArticle> executorBatch = new List<AsyncArticle>();
+        executorBatch.Add(new AsyncArticle(hostile, 22));
+        Check("bulk insert via executor", await exec.Insert<AsyncArticle>(executorBatch).ExecuteAffrowsAsync() == 1);
+        DbResult bulk = await DbTable.Of(db, "articles").Query().OrderBy("views").ToResultAsync();
+        int views = bulk.GetColumnIndex("views");
+        Check("bulk values roundtrip", bulk.RowCount() == 2 && bulk.IsNullByName(0, "title")
+            && bulk.GetInt(0, views) == 11 && bulk.GetByName(1, "title") == hostile && bulk.GetInt(1, views) == 22);
+
+        await exec.ExecuteAsync("DROP TABLE articles");
+        Check("table dropped", !await DbSchema.TableExistsAsync(db, "articles"));
 
         db.Close();
         File.Delete(dbPath);

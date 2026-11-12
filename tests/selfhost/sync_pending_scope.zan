@@ -1,0 +1,240 @@
+using System;
+
+class ScopeWatch {
+    public weak ScopeItem first;
+    public weak ScopeItem second;
+}
+class ScopeItem {
+    public int id;
+    public ScopeItem(int n) {
+        id = n;
+        if (n == 1) { PendingScope.watch.first = this; }
+        else { PendingScope.watch.second = this; }
+    }
+}
+class PendingScope {
+    public static ScopeWatch watch;
+    static void Fail() { throw new Exception("inner"); }
+    static ScopeItem Make(int n) { return new ScopeItem(n); }
+    static ScopeItem NestedCaught() {
+        try { return Make(1); }
+        finally {
+            try {
+                try { return Make(2); }
+                finally { Fail(); }
+            } catch (Exception e) {
+                Console.WriteLine("caught=" + e.Message);
+                Console.WriteLine("caught-a-live=" + (PendingScope.watch.first != null));
+                Console.WriteLine("caught-b-dead=" + (PendingScope.watch.second == null));
+            }
+        }
+    }
+    static ScopeItem CrossOuter() {
+        try {
+            try { return Make(1); }
+            finally {
+                try { return Make(2); }
+                finally { Console.WriteLine("b-finally-a-live=" + (PendingScope.watch.first != null)); }
+            }
+        } finally {
+            Console.WriteLine("outer-a-dead=" + (PendingScope.watch.first == null));
+            Console.WriteLine("outer-b-live=" + (PendingScope.watch.second != null));
+        }
+    }
+    static ScopeItem BreakOut() {
+        while (true) {
+            try { return Make(1); }
+            finally { break; }
+        }
+        Console.WriteLine("break-a-dead=" + (PendingScope.watch.first == null));
+        return Make(2);
+    }
+    static ScopeItem ContinueOut() {
+        int n = 0;
+        while (n < 3) {
+            Console.WriteLine("reuse-before-dead=" + (PendingScope.watch.first == null));
+            n = n + 1;
+            try { return Make(1); }
+            finally { continue; }
+        }
+        Console.WriteLine("continue-a-dead=" + (PendingScope.watch.first == null));
+        return Make(2);
+    }
+    static ScopeItem GotoOut() {
+        try { return Make(1); }
+        finally { goto done; }
+        done:
+        Console.WriteLine("goto-a-dead=" + (PendingScope.watch.first == null));
+        return Make(2);
+    }
+    static ScopeItem Internal() {
+        try { return Make(1); }
+        finally {
+            int i = 0;
+            while (i < 2) {
+                i = i + 1;
+                if (i == 1) { continue; }
+                break;
+            }
+            switch (i) {
+                case 2: Console.WriteLine("switch-internal"); break;
+                default: Console.WriteLine("wrong-switch"); break;
+            }
+            goto kept;
+            kept:
+            try { Fail(); }
+            catch (Exception e) { Console.WriteLine("internal-a-live=" + (PendingScope.watch.first != null)); }
+        }
+    }
+    static ScopeItem NestedGoto() {
+        try { return Make(1); }
+        finally {
+            try { return Make(2); }
+            finally { goto kept; }
+            kept:
+            Console.WriteLine("nested-goto-a-live=" + (PendingScope.watch.first != null));
+            Console.WriteLine("nested-goto-b-dead=" + (PendingScope.watch.second == null));
+        }
+    }
+    static ScopeItem SwitchOut() {
+        switch (1) {
+            case 1:
+                try { return Make(1); }
+                finally { break; }
+            default: break;
+        }
+        Console.WriteLine("switch-out-a-dead=" + (PendingScope.watch.first == null));
+        return Make(2);
+    }
+    static ScopeItem AbortsOutside() {
+        try { return Make(1); }
+        finally {
+            try { return Make(2); }
+            finally { Fail(); }
+        }
+    }
+    static ScopeItem ReusedFor() {
+        for (int i = 0; i < 3; i = i + 1) {
+            Console.WriteLine("for-reuse-dead=" + (PendingScope.watch.first == null));
+            try { return Make(1); }
+            finally { continue; }
+        }
+        try { Fail(); }
+        catch (Exception e) { Console.WriteLine("after-reuse-dead=" + (PendingScope.watch.first == null)); }
+        return Make(2);
+    }
+    static ScopeItem ReusedDo() {
+        int i = 0;
+        do {
+            i = i + 1;
+            try { return Make(1); }
+            finally { continue; }
+        } while (i < 3);
+        Console.WriteLine("do-reuse-dead=" + (PendingScope.watch.first == null));
+        return Make(2);
+    }
+    static ScopeItem ReusedForeach() {
+        int[] numbers = new int[] { 1, 2, 3 };
+        foreach (int n in numbers) {
+            Console.WriteLine("foreach-reuse-dead=" + (PendingScope.watch.first == null));
+            try { return Make(1); }
+            finally { continue; }
+        }
+        Console.WriteLine("foreach-final-dead=" + (PendingScope.watch.first == null));
+        return Make(2);
+    }
+    static ScopeItem AmbientCleanup() {
+        try { return Make(1); }
+        finally {
+            try {
+                while (true) {
+                    try { break; }
+                    finally { goto kept; }
+                }
+                kept:
+                Fail();
+            } catch (Exception e) {
+                Console.WriteLine("ambient-a-live=" + (PendingScope.watch.first != null));
+            }
+        }
+    }
+    static ScopeItem CompletedInner() {
+        try {
+            try { return Make(1); }
+            finally { Console.WriteLine("completed-once"); }
+        } finally { return Make(2); }
+    }
+    static ScopeItem HiddenActive() {
+        try {
+            try { return Make(1); }
+            finally { return Make(2); }
+        } finally {
+            try { return Make(2); }
+            finally { Console.WriteLine("hidden-active-finally"); }
+        }
+    }
+    static ScopeItem ScalarReplacement() {
+        try { return Make(1); }
+        finally { return null; }
+    }
+    static ScopeItem LambdaLabels() {
+        try { return Make(1); }
+        finally {
+            Action f = () => {
+                goto same;
+                same:
+                Console.WriteLine("lambda-label");
+            };
+            f();
+            goto same;
+            same:
+            Console.WriteLine("lambda-parent-a-live=" + (PendingScope.watch.first != null));
+        }
+    }
+    static void Check(string name, ScopeItem item, int expected) {
+        Console.WriteLine(name + "-value=" + (item.id == expected));
+        Console.WriteLine(name + "-live=" + (expected == 1 ? PendingScope.watch.first != null : PendingScope.watch.second != null));
+    }
+    static void Main() {
+        PendingScope.watch = new ScopeWatch();
+        ScopeItem item = NestedCaught(); Check("caught", item, 1); item = null;
+        Console.WriteLine("caught-dead=" + (PendingScope.watch.first == null));
+        item = CrossOuter(); Check("outer", item, 2); item = null;
+        Console.WriteLine("outer-dead=" + (PendingScope.watch.second == null));
+        item = BreakOut(); Check("break", item, 2); item = null;
+        Console.WriteLine("break-dead=" + (PendingScope.watch.second == null));
+        item = ContinueOut(); Check("continue", item, 2); item = null;
+        Console.WriteLine("continue-dead=" + (PendingScope.watch.second == null));
+        item = GotoOut(); Check("goto", item, 2); item = null;
+        Console.WriteLine("goto-dead=" + (PendingScope.watch.second == null));
+        item = Internal(); Check("internal", item, 1); item = null;
+        Console.WriteLine("internal-dead=" + (PendingScope.watch.first == null));
+        item = NestedGoto(); Check("nested-goto", item, 1); item = null;
+        Console.WriteLine("nested-goto-dead=" + (PendingScope.watch.first == null));
+        item = SwitchOut(); Check("switch", item, 2); item = null;
+        Console.WriteLine("switch-dead=" + (PendingScope.watch.second == null));
+        try { item = AbortsOutside(); }
+        catch (Exception e) {
+            Console.WriteLine("outside-a-dead=" + (PendingScope.watch.first == null));
+            Console.WriteLine("outside-b-dead=" + (PendingScope.watch.second == null));
+        }
+        item = ReusedFor(); Check("for", item, 2); item = null;
+        Console.WriteLine("for-dead=" + (PendingScope.watch.second == null));
+        item = ReusedDo(); Check("do", item, 2); item = null;
+        Console.WriteLine("do-dead=" + (PendingScope.watch.second == null));
+        item = ReusedForeach(); Check("foreach", item, 2); item = null;
+        Console.WriteLine("foreach-dead=" + (PendingScope.watch.second == null));
+        item = AmbientCleanup(); Check("ambient", item, 1); item = null;
+        Console.WriteLine("ambient-dead=" + (PendingScope.watch.first == null));
+        item = CompletedInner(); Check("completed", item, 2); item = null;
+        Console.WriteLine("completed-dead=" + (PendingScope.watch.first == null && PendingScope.watch.second == null));
+        item = HiddenActive(); Check("hidden", item, 2); item = null;
+        Console.WriteLine("hidden-dead=" + (PendingScope.watch.first == null && PendingScope.watch.second == null));
+        item = ScalarReplacement();
+        Console.WriteLine("scalar-null=" + (item == null));
+        Console.WriteLine("scalar-a-dead=" + (PendingScope.watch.first == null));
+        item = LambdaLabels(); Check("lambda", item, 1); item = null;
+        Console.WriteLine("lambda-dead=" + (PendingScope.watch.first == null));
+        PendingScope.watch = null;
+    }
+}

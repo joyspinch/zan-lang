@@ -62,7 +62,9 @@ static struct {
     void (*scaled)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
                    int32_t, int32_t, int32_t, int32_t);
     void (*snapshot)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
+    void (*patch)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
     int32_t (*restore)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
+    int32_t (*restore_sub)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
     int32_t (*begin)(int32_t, zan_gpu_frame *);
     void (*end)(int32_t);
 } gui;
@@ -118,7 +120,9 @@ static void load_apis(module core, module game_module, module image_module) {
     LOAD(core, gui.batch, "zan_gui_blit_pixels_batch");
     LOAD(core, gui.scaled, "zan_gui_blit_surface_scaled");
     LOAD(core, gui.snapshot, "zan_gui_snapshot_rect");
+    LOAD(core, gui.patch, "zan_gui_snapshot_patch_rect");
     LOAD(core, gui.restore, "zan_gui_restore_rect");
+    LOAD(core, gui.restore_sub, "zan_gui_restore_sub_rect");
     LOAD(core, gui.begin, "zan_gui_gpu_begin");
     LOAD(core, gui.end, "zan_gui_gpu_end");
     LOAD(image_module, image.get, "zan_image_get");
@@ -224,6 +228,135 @@ static void test_order(int dst, int handle, int tolerance) {
     expect("final 2D", b, 7, 3, MAGENTA, tolerance);
 }
 
+static void test_snapshots(int gpu) {
+    phase = gpu ? "GPU snapshots" : "CPU snapshots";
+    int a = gui.create(12, 10), b = gui.create(12, 10);
+    CHECK(a >= 0 && b >= 0);
+    gui.clear(a, (int32_t)RED);
+    gui.fill(a, 2, 4, 6, 3, (int32_t)BLUE);
+    gui.clip(a, 0, 0, 1, 1);
+    gui.snapshot(a, 2, 1, 6, 6, 0); /* capture ignores clip */
+    gui.unclip(a);
+    gui.clear(a, (int32_t)GREEN);
+    gui.snapshot(a, 2, 1, 6, 6, 384);
+    gui.clear(a, (int32_t)BLACK);
+    CHECK(!gui.restore(a, 2, 1, 5, 6, 0));
+    CHECK(!gui.restore_sub(a, 1, 1, 6, 6, 0));
+    CHECK(!gui.restore(a, 2, 1, 6, 6, -1));
+    CHECK(!gui.restore(a, 2, 1, 6, 6, 512));
+    CHECK(!gui.restore(a, 2, 1, 6, 6, 383));
+    CHECK(gui.restore(a, 2, 1, 6, 6, 0));
+    const zan_bitmap *view = gui.bitmap(a);
+    expect("slot 0 top", view, 3, 2, RED, 0);
+    expect("slot 0 bottom", view, 3, 5, BLUE, 0);
+    expect("region outside", view, 1, 2, BLACK, 0);
+    CHECK(gui.restore(a, 2, 1, 6, 6, 384));
+    expect("slot 384 independent", gui.bitmap(a), 3, 2, GREEN, 0);
+
+    gui.clear(a, (int32_t)BLACK);
+    gui.clip(a, 3, 2, 2, 4);
+    CHECK(gui.restore(a, 2, 1, 6, 6, 0));
+    gui.unclip(a);
+    view = gui.bitmap(a);
+    expect("restore clip top", view, 3, 2, RED, 0);
+    expect("restore clip bottom", view, 3, 5, BLUE, 0);
+    expect("restore clip left", view, 2, 2, BLACK, 0);
+    expect("restore clip right", view, 5, 2, BLACK, 0);
+    expect("restore clip above", view, 3, 1, BLACK, 0);
+    gui.clear(a, (int32_t)BLACK);
+    gui.clip(a, 4, 3, 2, 3);
+    CHECK(gui.restore_sub(a, 3, 2, 4, 4, 0));
+    gui.unclip(a);
+    view = gui.bitmap(a);
+    expect("sub restore top", view, 4, 3, RED, 0);
+    expect("sub restore bottom", view, 4, 5, BLUE, 0);
+    expect("sub restore outside clip", view, 3, 3, BLACK, 0);
+    CHECK(gui.restore_sub(a, 3, 2, 0, 1, 0));
+    gui.clip(a, 0, 0, 1, 1);
+    CHECK(gui.restore(a, 2, 1, 6, 6, 0)); /* valid, fully clipped */
+    gui.unclip(a);
+    expect("empty clip writes nothing", gui.bitmap(a), 3, 2, BLACK, 0);
+
+    /* Patch sees pending GPU work without an intervening readback. */
+    gui.fill(a, 2, 1, 6, 6, (int32_t)YELLOW);
+    gui.fill(a, 4, 3, 2, 2, (int32_t)MAGENTA);
+    gui.clip(a, 0, 0, 1, 1);
+    gui.patch(a, 4, 3, 2, 2, 0);
+    gui.patch(a, 1, 1, 3, 2, 0); /* reject partial overlap */
+    gui.unclip(a);
+    gui.clear(a, (int32_t)BLACK);
+    CHECK(gui.restore(a, 2, 1, 6, 6, 0));
+    view = gui.bitmap(a);
+    expect("patch fresh pixels", view, 4, 3, MAGENTA, 0);
+    expect("patch preserved top", view, 2, 1, RED, 0);
+    expect("patch preserved bottom", view, 3, 5, BLUE, 0);
+    expect("patch bounds", view, 6, 3, RED, 0);
+    CHECK(gui.restore(a, 2, 1, 6, 6, 384));
+    expect("patch leaves other slot", gui.bitmap(a), 4, 3, GREEN, 0);
+
+    gui.clear(b, (int32_t)WHITE);
+    gui.patch(b, 2, 1, 6, 6, 0);
+    CHECK(!gui.restore(b, 2, 1, 6, 6, 0));
+    CHECK(gui.restore(a, 2, 1, 6, 6, 0));
+    expect("cross-surface patch ignored", gui.bitmap(a), 4, 3, MAGENTA, 0);
+    gui.snapshot(b, 2, 1, 6, 6, 0); /* global slot changes owner */
+    CHECK(!gui.restore(a, 2, 1, 6, 6, 0));
+    gui.clear(b, (int32_t)BLACK);
+    CHECK(gui.restore(b, 2, 1, 6, 6, 0));
+    expect("global slot new owner", gui.bitmap(b), 3, 2, WHITE, 0);
+    CHECK(gui.restore(a, 2, 1, 6, 6, 384));
+    CHECK(gui.destroy(a) == 0);
+    CHECK(gui.restore(b, 2, 1, 6, 6, 0));
+
+    /* Public surfaces change dimensions by destruction/recreation. */
+    int resized = gui.create(9, 8);
+    CHECK(resized == a);
+    CHECK(!gui.restore(resized, 2, 1, 6, 6, 384));
+    gui.clear(resized, (int32_t)BLUE);
+    gui.snapshot(resized, -2, -1, 6, 5, 384);
+    gui.clear(resized, (int32_t)BLACK);
+    CHECK(gui.restore(resized, 0, 0, 4, 4, 384));
+    view = gui.bitmap(resized);
+    expect("resized clipped capture", view, 3, 3, BLUE, 0);
+    expect("resized capture outside", view, 4, 3, BLACK, 0);
+    gui.fill(resized, 5, 1, 2, 5, (int32_t)GREEN);
+    gui.snapshot(resized, 5, 1, 2, 5, 384); /* reallocate the same slot */
+    gui.snapshot(resized, 0, 0, 0, 0, 384); /* empty capture preserves it */
+    gui.clear(resized, (int32_t)BLACK);
+    CHECK(!gui.restore(resized, 0, 0, 4, 4, 384));
+    CHECK(gui.restore(resized, 5, 1, 2, 5, 384));
+    expect("slot resized again", gui.bitmap(resized), 6, 5, GREEN, 0);
+    CHECK(gui.destroy(resized) == 0 && gui.destroy(b) == 0);
+}
+
+static void test_backend_snapshots(void) {
+    phase = "snapshot backend transitions";
+    int s = gui.create(8, 6);
+    CHECK(s >= 0);
+    gui.clear(s, (int32_t)RED);
+    gui.snapshot(s, 0, 0, 8, 6, 0);
+    CHECK(gui.backend(0) == 0 && strcmp(gui.backend_name(), "cpu") == 0);
+    CHECK(!gui.restore(s, 0, 0, 8, 6, 0));
+    expect("GL to CPU preserves pixels", gui.bitmap(s), 1, 1, RED, 0);
+    gui.clear(s, (int32_t)BLUE);
+    gui.snapshot(s, 0, 0, 8, 6, 0);
+    CHECK(gui.backend(1) == 1 && strcmp(gui.backend_name(), "gl") == 0);
+    CHECK(!gui.restore(s, 0, 0, 8, 6, 0));
+    expect("CPU to GL preserves pixels", gui.bitmap(s), 1, 1, BLUE, 0);
+    int fresh = gui.create(3, 3);
+    zan_gpu_frame frame;
+    CHECK(fresh >= 0 && gui.begin(fresh, &frame));
+    gui.end(fresh);
+    CHECK(gui.destroy(fresh) == 0);
+    gui.snapshot(s, 0, 0, 8, 6, 384);
+    CHECK(gui.backend(0) == 0);
+    CHECK(!gui.restore(s, 0, 0, 8, 6, 0)); /* old CPU slot stays invalid */
+    CHECK(!gui.restore(s, 0, 0, 8, 6, 384));
+    CHECK(gui.backend(1) == 1);
+    CHECK(!gui.restore(s, 0, 0, 8, 6, 384)); /* old GL slot stays invalid */
+    CHECK(gui.destroy(s) == 0);
+}
+
 static void test_transient(int dst) {
     uint32_t pixels[8] = { RED, RED, MAGENTA, MAGENTA, RED, RED, MAGENTA, MAGENTA };
     zan_bitmap bitmap = { pixels, 2, 2, 4, 0 };
@@ -320,10 +453,13 @@ int main(int argc, char **argv) {
     test_images();
     CHECK(gui.backend(0) == 0 && strcmp(gui.backend_name(), "cpu") == 0);
     test_sprites(0);
+    test_snapshots(0);
     puts("render modules: image + CPU passed");
     if (gui.backend(1)) {
         CHECK(strcmp(gui.backend_name(), "gl") == 0);
         test_sprites(1);
+        test_snapshots(1);
+        test_backend_snapshots();
         puts("render modules: GPU passed");
     } else {
         puts("render modules: GPU unavailable; image + CPU checks passed");

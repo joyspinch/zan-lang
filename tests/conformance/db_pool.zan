@@ -207,6 +207,23 @@ class Program {
         pool.Close();
     }
 
+    static async void IdleOnly() {
+        FakeConnector f = FakeConnector.Create();
+        DbPool pool = new DbPool(f, 1);
+        Check.True(pool.TryAcquire() == null && f.Opened() == 0, "try acquire never opens a connection");
+        IDbConnection c = await pool.AcquireAsync();
+        Check.True(pool.TryAcquire() == null && pool.WaitingCount() == 0, "try acquire never waits");
+        pool.Release(c);
+        IDbConnection reused = pool.TryAcquire();
+        Check.True(reused == c, "try acquire takes the idle connection");
+        pool.Release(reused);
+        c.Execute("KILL");
+        Check.True(pool.TryAcquire() == null && pool.LiveCount() == 0 && f.Opened() == 1,
+            "try acquire drops dead idle without opening a replacement");
+        pool.Close();
+        Check.True(pool.TryAcquire() == null, "try acquire on closed pool returns null");
+    }
+
     static async void FailedOpen() {
         DbPool pool = new DbPool(FakeConnector.Failing(), 1);
         IDbConnection a = await pool.AcquireAsync();
@@ -272,6 +289,7 @@ class Program {
         await Program.Basics();
         await Program.CapAndWait();
         await Program.Eviction();
+        await Program.IdleOnly();
         await Program.FailedOpen();
         await Program.FailedOpenBackoff();
         await Program.CloseWakesWaiters();

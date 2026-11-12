@@ -146,6 +146,12 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (st && find_user_conversion(g, st, tt, "op_explicit"))
                 return emit_user_conversion(g, st, tt, "op_explicit", val,
                                             expr->cast.expr, locals);
+            if (tt && (tt->kind == TYPE_OBJECT || tt->kind == TYPE_INTERFACE) &&
+                st && st->kind == TYPE_DELEGATE) {
+                val = emit_implicit_box(g, tt, val, expr->cast.expr, locals);
+                irgen_note_boxed_expr(g, expr);
+                return val;
+            }
             /* `(object)` 对值形状的分流（A454）：无托管字段的 struct 走真
              * 装箱（分配带头部堆对象、写载荷、site 注册三件事都在
              * emit_box_struct）；其余值形状仍报错兜住泛型特化（类型参数
@@ -228,18 +234,24 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (!static_ok) {
                     LLVMValueRef cfn = LLVMGetBasicBlockParent(
                         LLVMGetInsertBlock(g->builder));
-                    LLVMValueRef ok = emit_runtime_is_check_name(g, val, tt);
-                    LLVMBasicBlockRef cast_ok = LLVMGetInsertBlock(g->builder);
+                    LLVMBasicBlockRef cast_check = LLVMAppendBasicBlockInContext(
+                        g->ctx, cfn, "cast.check");
                     LLVMBasicBlockRef cast_bad = LLVMAppendBasicBlockInContext(
                         g->ctx, cfn, "cast.bad");
                     LLVMBasicBlockRef cast_m = LLVMAppendBasicBlockInContext(
                         g->ctx, cfn, "cast.m");
+                    /* null converts to any reference type. Keep `is T` false
+                     * for null, and check the closed identity only for non-null. */
+                    LLVMBuildCondBr(g->builder,
+                        LLVMBuildIsNull(g->builder, val, "cast.null"), cast_m, cast_check);
+                    LLVMPositionBuilderAtEnd(g->builder, cast_check);
+                    LLVMValueRef ok = emit_runtime_is_check_name(g, val, tt);
                     LLVMBuildCondBr(g->builder, ok, cast_m, cast_bad);
                     /* B-ID163③：失败一律抛 InvalidCastException（C# 同语义：
                      * try 内可 catch，try 外未捕获终止进程）。旧实现 try 外
                      * 走 A509 软失败——stderr 一次后拿 null 继续跑，正是
-                     * "强转失败静默给默认值"缺陷本体。cast_m 现在只有
-                     * cast_ok 单前驱，直接返回 val，不再需要 phi。 */
+                     * "强转失败静默给默认值"缺陷本体。null 或类型匹配均
+                     * 保留同一个 val，合流无需 phi。 */
                     LLVMPositionBuilderAtEnd(g->builder, cast_bad);
                     emit_cast_throw(g, expr->loc,
                         "InvalidCastException: object is not an instance of the target type");
@@ -368,20 +380,7 @@ LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
 /* 运行时 x is T 类型检查辅助封装 */
 LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
                                                zan_type_t *tt) {
-    char tbuf[320];
-    const char *ns = NULL;
-    int nlen = 0;
-    if (tt && tt->name.str) {
-        ns = tt->name.str;
-        nlen = (int)tt->name.len;
-    } else if (tt && tt->sym && tt->sym->name.str) {
-        ns = tt->sym->name.str;
-        nlen = (int)tt->sym->name.len;
-    }
-    if (nlen > 319) nlen = 319;
-    if (nlen > 0) memcpy(tbuf, ns, (size_t)nlen);
-    tbuf[nlen] = 0;
-    return emit_runtime_is_check(g, x, tbuf);
+    return emit_runtime_is_check(g, x, arc_runtime_type_name(g, tt));
 }
 LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
                                           const char *tname) {

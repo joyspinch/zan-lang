@@ -43,15 +43,16 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
         }
     }
 
-    while (!parser_check(p, TK_EOF) && !parser_check(p, TK_RBRACE)) {
-        if (!parse_top_level_decl(p, unit))
-            parser_advance(p); /* skip to recover */
+    while (!parser_check(p, TK_EOF)) {
         if (parser_check(p, TK_RBRACE)) {
             /* 顶层游离右大括号容错：报告语法错误并跳过以继续解析后续声明 */
             zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 55,
                           "unexpected '}' at top level");
             parser_advance(p);
+            continue;
         }
+        if (!parse_top_level_decl(p, unit))
+            parser_advance(p); /* skip to recover */
     }
 
     /* A381 lazy iterators：IEnumerable<T>+yield 的方法合成迭代器类 */

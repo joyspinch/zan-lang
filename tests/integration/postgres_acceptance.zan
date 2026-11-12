@@ -1,0 +1,560 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Postgres;
+using System.IO;
+using System.Json;
+using System.Threading;
+
+[Table(Name = "acceptance_records")]
+class PgAcceptanceRecord {
+    [Column(IsPrimary = true)]
+    int id;
+    string payload;
+    string nullable_value;
+    string empty_value;
+}
+
+// Run only through postgres_acceptance.py: it owns the SCRAM server and schema.
+public class PostgresAcceptance {
+    static void Require(bool ok, string reason) {
+        if (!ok) { throw new InvalidOperationException(reason); }
+    }
+
+    static string Payload() {
+        return "O'Brien'); DROP TABLE acceptance_records; -- ? $1 \\ 中文\nline";
+    }
+
+    static void Report(string name, bool ok, string detail) {
+        JsonValue item = JsonValue.NewObject();
+        item.PutStr("case", name);
+        item.PutBool("ok", ok);
+        item.PutStr("detail", detail);
+        Console.WriteLine(item.ToJson());
+    }
+
+    static async PgConnection OpenConnection(string conninfo, bool useAsync) {
+        PgConnection db = null;
+        if (useAsync) { db = await PgConnection.OpenAsync(conninfo); }
+        else { db = PgConnection.Open(conninfo); }
+        if (db == null) { throw new InvalidOperationException("Open returned null"); }
+        if (!db.IsConnected()) {
+            string reason = db.GetError();
+            db.Close();
+            throw new InvalidOperationException("SCRAM TCP connection failed: " + reason);
+        }
+        return db;
+    }
+
+    static async void Parameters(string conninfo, bool useAsync) {
+        PgConnection db = await PostgresAcceptance.OpenConnection(conninfo, useAsync);
+        try {
+            int id = useAsync ? 101 : 100;
+            DbParams values = new DbParams().AddInt(id).Add(PostgresAcceptance.Payload()).AddNull().Add("");
+            string insert = "INSERT INTO acceptance_records(id,payload,nullable_value,empty_value) VALUES (?,?,?,?)";
+            int affected = 0;
+            if (useAsync) { affected = await db.ExecuteParamsAsync(insert, values); }
+            else { affected = db.Execute(insert, values); }
+            PostgresAcceptance.Require(affected == 1, "parameterized INSERT failed");
+            DbResult rows = null;
+            string query = "SELECT payload,nullable_value,empty_value FROM acceptance_records WHERE id=? AND payload=?";
+            DbParams lookup = new DbParams().AddInt(id).Add(PostgresAcceptance.Payload());
+            if (useAsync) { rows = await db.QueryParamsAsync(query, lookup); }
+            else { rows = db.Query(query, lookup); }
+            PostgresAcceptance.Require(rows != null, "query returned null");
+            PostgresAcceptance.Require(rows.RowCount() == 1, "parameterized lookup did not return exactly one row");
+            PostgresAcceptance.Require(rows.GetString(0, 0) == PostgresAcceptance.Payload(), "quoted/injection-style/Unicode value changed");
+            PostgresAcceptance.Require(rows.IsNull(0, 1), "SQL NULL was not preserved");
+            PostgresAcceptance.Require(!rows.IsNull(0, 2) && rows.GetString(0, 2) == "", "empty text was confused with NULL");
+            if (useAsync) {
+                SelectQuery<PgAcceptanceRecord> typed = new SelectQuery<PgAcceptanceRecord>(db);
+                typed.WhereEq("id", id).WhereEq("payload", PostgresAcceptance.Payload()).OrderBy("id");
+                PageResult<PgAcceptanceRecord> page = await typed.ToPageResultAsync(1, 1);
+                PostgresAcceptance.Require(page.total == 1 && page.items.Count == 1, "async typed ORM page");
+                PgAcceptanceRecord row = page.items[0];
+                PostgresAcceptance.Require(row.id == id && row.payload == PostgresAcceptance.Payload()
+                    && row.nullable_value == null && row.empty_value == "", "async typed ORM mapping and binding");
+                await PostgresAcceptance.MutationPredicates(db);
+            }
+        } finally { db.Close(); }
+    }
+
+    static bool MutationReady(PgAcceptanceRecord row) { return row.payload == "ready"; }
+    static bool MutationAllowed(PgAcceptanceRecord row) { return row.id != 903; }
+    static bool MutationNotWaiting(PgAcceptanceRecord row) { return row.payload != "waiting"; }
+
+    static async void MutationPredicates(PgConnection db) {
+        UnitOfWork uow = await UnitOfWork.CreateAsync(db, false);
+        try {
+            // Each rejected row fails a different filter; the original fixtures remain committed.
+            string payload = PostgresAcceptance.Payload();
+            DbParams rows = new DbParams().AddInt(901).Add("ready").Add(payload)
+                .AddInt(902).Add("waiting").Add(payload).AddInt(903).Add("ready").Add(payload)
+                .AddInt(904).Add("ready").Add("outside");
+            int seeded = await uow.ExecuteAsync("INSERT INTO acceptance_records(id,payload,empty_value) VALUES (?,?,?), (?,?,?), (?,?,?), (?,?,?)", rows);
+            PostgresAcceptance.Require(seeded == 4, "async Func mutation setup");
+
+            Func<PgAcceptanceRecord, bool> ready = PostgresAcceptance.MutationReady;
+            Func<PgAcceptanceRecord, bool> allowed = PostgresAcceptance.MutationAllowed;
+            string updated = payload + " updated";
+            UpdateQuery<PgAcceptanceRecord> update = uow.Update<PgAcceptanceRecord>();
+            update.Set("payload", updated).WhereEq("empty_value", payload).Where(ready).Where(allowed);
+            PostgresAcceptance.Require(await update.ExecuteAffrowsAsync() == 1, "async Func UPDATE intersects bound SQL and both predicates");
+            string body = await uow.ExecuteScalarAsync("SELECT payload FROM acceptance_records WHERE id=?", new DbParams().AddInt(901));
+            PostgresAcceptance.Require(body == updated, "async Func UPDATE bound SET value");
+
+            // Change the matching key so a stale key binding would write the old row again.
+            DbParams swap = new DbParams().AddInt(901).Add("waiting").Add("ready").AddInt(901).AddInt(902);
+            await uow.ExecuteAsync("UPDATE acceptance_records SET payload=CASE WHEN id=? THEN ? ELSE ? END WHERE id IN (?,?)", swap);
+            PostgresAcceptance.Require(await update.ExecuteAffrowsAsync() == 1, "reused async Func UPDATE reads a fresh key snapshot");
+            PostgresAcceptance.Require(await update.ExecuteAffrowsAsync() == 0, "async Func UPDATE with no hits changes nothing");
+            body = await uow.ExecuteScalarAsync("SELECT payload FROM acceptance_records WHERE id=?", new DbParams().AddInt(902));
+            PostgresAcceptance.Require(body == updated, "reused async Func UPDATE targets the new key");
+
+            Func<PgAcceptanceRecord, bool> notWaiting = PostgresAcceptance.MutationNotWaiting;
+            DeleteQuery<PgAcceptanceRecord> remove = uow.Delete<PgAcceptanceRecord>();
+            remove.WhereEq("empty_value", payload).Where(notWaiting).Where(allowed);
+            PostgresAcceptance.Require(await remove.ExecuteAffrowsAsync() == 1, "async Func DELETE intersects bound SQL and both predicates");
+            PostgresAcceptance.Require(await remove.ExecuteAffrowsAsync() == 0, "reused async Func DELETE has no hits");
+            DbResult remaining = await uow.QueryAsync("SELECT id, payload FROM acceptance_records WHERE id >= ? ORDER BY id", new DbParams().AddInt(901));
+            PostgresAcceptance.Require(remaining.RowCount() == 3
+                && remaining.GetInt(0, 0) == 901 && remaining.GetString(0, 1) == "waiting"
+                && remaining.GetInt(1, 0) == 903 && remaining.GetString(1, 1) == "ready"
+                && remaining.GetInt(2, 0) == 904 && remaining.GetString(2, 1) == "ready", "async Func mutations preserve rejected rows");
+            PostgresAcceptance.Require(await uow.RollbackAsync(), "async Func mutation rollback");
+        } finally {
+            if (!uow.rolledBack && db.IsConnected()) { await uow.RollbackAsync(); }
+            uow.Dispose();
+        }
+    }
+
+    static async void CommitCase(string conninfo, bool useAsync) {
+        PgConnection db = await PostgresAcceptance.OpenConnection(conninfo, useAsync);
+        UnitOfWork uow = null;
+        try {
+            int id = useAsync ? 202 : 201;
+            if (useAsync) { uow = await UnitOfWork.CreateAsync(db, false); }
+            else { uow = UnitOfWork.Create(db, false); }
+            DbParams values = new DbParams().AddInt(id).Add("committed");
+            int affected = 0;
+            if (useAsync) { affected = await uow.ExecuteAsync("INSERT INTO acceptance_records(id,payload) VALUES (?,?)", values); }
+            else { affected = uow.Execute("INSERT INTO acceptance_records(id,payload) VALUES (?,?)", values); }
+            PostgresAcceptance.Require(affected == 1, "UoW insert failed");
+            if (useAsync) { PostgresAcceptance.Require(await uow.CommitAsync(), "CommitAsync returned false"); }
+            else { uow.Commit(); }
+            PostgresAcceptance.Require(uow.committed && !uow.rolledBack && !db.inTxn, "UoW commit flags disagree with server readiness");
+            PgConnection observer = await PostgresAcceptance.OpenConnection(conninfo, true);
+            try {
+                string count = await observer.ExecuteScalarAsync("SELECT count(*) FROM acceptance_records WHERE id=?", new DbParams().AddInt(id));
+                PostgresAcceptance.Require(count == "1", "committed row is invisible to a separate connection");
+            } finally { observer.Close(); }
+        } finally {
+            if (uow != null) { uow.Dispose(); }
+            db.Close();
+        }
+    }
+
+    static async void RollbackCase(string conninfo, bool useAsync) {
+        PgConnection db = await PostgresAcceptance.OpenConnection(conninfo, useAsync);
+        UnitOfWork uow = null;
+        try {
+            int id = useAsync ? 204 : 203;
+            if (useAsync) { uow = await UnitOfWork.CreateAsync(db, false); }
+            else { uow = UnitOfWork.Create(db, false); }
+            DbParams values = new DbParams().AddInt(id).Add("rolled back");
+            int affected = 0;
+            if (useAsync) { affected = await uow.ExecuteAsync("INSERT INTO acceptance_records(id,payload) VALUES (?,?)", values); }
+            else { affected = uow.Execute("INSERT INTO acceptance_records(id,payload) VALUES (?,?)", values); }
+            PostgresAcceptance.Require(affected == 1, "rollback insert failed");
+            if (useAsync) { PostgresAcceptance.Require(await uow.RollbackAsync(), "RollbackAsync returned false"); }
+            else { uow.Rollback(); }
+            PostgresAcceptance.Require(uow.rolledBack && !uow.committed && !db.inTxn, "rollback flags disagree");
+            uow.Dispose();
+            uow = null;
+            if (useAsync) { uow = await UnitOfWork.CreateAsync(db, false); }
+            else { uow = UnitOfWork.Create(db, false); }
+            DbParams disposable = new DbParams().AddInt(id + 2).Add("disposed without commit");
+            if (useAsync) { affected = await uow.ExecuteAsync("INSERT INTO acceptance_records(id,payload) VALUES (?,?)", disposable); }
+            else { affected = uow.Execute("INSERT INTO acceptance_records(id,payload) VALUES (?,?)", disposable); }
+            PostgresAcceptance.Require(affected == 1, "dispose rollback insert failed");
+            uow.Dispose();
+            PostgresAcceptance.Require(uow.rolledBack && !uow.committed && !db.inTxn, "Dispose did not roll back");
+            uow = null;
+            string count = await db.ExecuteScalarAsync("SELECT count(*) FROM acceptance_records WHERE id IN (?,?)", new DbParams().AddInt(id).AddInt(id + 2));
+            PostgresAcceptance.Require(count == "0", "rollback/dispose left a row");
+        } finally {
+            if (uow != null) { uow.Dispose(); }
+            db.Close();
+        }
+    }
+
+    static async void AbortTransaction(PgConnection db, bool useAsync) {
+        bool rejected = false;
+        if (useAsync) {
+            try { await db.ExecuteAsync("SELECT 1 / 0"); }
+            catch (DbException) {
+                // Expected server-error contract: async commands throw DbException.
+                rejected = true;
+            }
+        } else { rejected = db.Execute("SELECT 1 / 0") < 0; }
+        PostgresAcceptance.Require(rejected && db.GetError().Contains("division by zero"), "division-by-zero server error was not reported");
+        PostgresAcceptance.Require(db.inTxn, "server error did not retain the aborted transaction state");
+    }
+
+    static async void SavepointCase(string conninfo, bool useAsync) {
+        PgConnection db = await PostgresAcceptance.OpenConnection(conninfo, useAsync);
+        UnitOfWork uow = null;
+        try {
+            int id = useAsync ? 311 : 301;
+            if (useAsync) { uow = await UnitOfWork.CreateAsync(db, false); }
+            else { uow = UnitOfWork.Create(db, false); }
+            string insert = "INSERT INTO acceptance_records(id,payload) VALUES (?,?)";
+            int affected = 0;
+            DbParams before = new DbParams().AddInt(id).Add("before savepoint");
+            if (useAsync) { affected = await uow.ExecuteAsync(insert, before); }
+            else { affected = uow.Execute(insert, before); }
+            PostgresAcceptance.Require(affected == 1, "savepoint outer insert failed");
+            if (useAsync) { await uow.CreateSavepointAsync("outer_point"); }
+            else { uow.CreateSavepoint("outer_point"); }
+            DbParams discard = new DbParams().AddInt(id + 1).Add("discard at savepoint");
+            if (useAsync) { affected = await uow.ExecuteAsync(insert, discard); }
+            else { affected = uow.Execute(insert, discard); }
+            PostgresAcceptance.Require(affected == 1, "savepoint inner insert failed");
+            if (useAsync) { await uow.CreateSavepointAsync("child_point"); }
+            else { uow.CreateSavepoint("child_point"); }
+            await PostgresAcceptance.AbortTransaction(db, useAsync);
+            if (useAsync) { await uow.RollbackToSavepointAsync("outer_point"); }
+            else { uow.RollbackToSavepoint("outer_point"); }
+            PostgresAcceptance.Require(uow.savepoints.Count == 1, "rollback retained a descendant savepoint");
+            if (useAsync) { await uow.ReleaseSavepointAsync("outer_point"); }
+            else { uow.ReleaseSavepoint("outer_point"); }
+            PostgresAcceptance.Require(uow.savepoints.Count == 0, "release retained the savepoint");
+            DbParams after = new DbParams().AddInt(id + 2).Add("after savepoint");
+            if (useAsync) { affected = await uow.ExecuteAsync(insert, after); }
+            else { affected = uow.Execute(insert, after); }
+            PostgresAcceptance.Require(affected == 1, "savepoint rollback did not restore usable transaction");
+            if (useAsync) { PostgresAcceptance.Require(await uow.CommitAsync(), "savepoint commit failed"); }
+            else { uow.Commit(); }
+            string count = await db.ExecuteScalarAsync("SELECT count(*) FROM acceptance_records WHERE id=?", new DbParams().AddInt(id + 1));
+            PostgresAcceptance.Require(count == "0" && uow.committed, "savepoint-discarded row survived");
+        } finally {
+            if (uow != null) { uow.Dispose(); }
+            db.Close();
+        }
+    }
+
+    static async void AbortedCommit(string conninfo, bool useAsync) {
+        PgConnection db = await PostgresAcceptance.OpenConnection(conninfo, useAsync);
+        UnitOfWork uow = null;
+        try {
+            int id = useAsync ? 402 : 401;
+            if (useAsync) { uow = await UnitOfWork.CreateAsync(db, false); }
+            else { uow = UnitOfWork.Create(db, false); }
+            DbParams values = new DbParams().AddInt(id).Add("must never commit");
+            int affected = 0;
+            if (useAsync) { affected = await uow.ExecuteAsync("INSERT INTO acceptance_records(id,payload) VALUES (?,?)", values); }
+            else { affected = uow.Execute("INSERT INTO acceptance_records(id,payload) VALUES (?,?)", values); }
+            PostgresAcceptance.Require(affected == 1, "aborted transaction insert failed");
+            await PostgresAcceptance.AbortTransaction(db, useAsync);
+            bool refused = false;
+            try {
+                if (useAsync) { refused = !await uow.CommitAsync(); }
+                else { uow.Commit(); }
+            } catch (Exception) {
+                // Expected error-value contract: COMMIT completed as ROLLBACK.
+                refused = true;
+            }
+            PostgresAcceptance.Require(refused && !uow.committed, "aborted COMMIT falsely reported success");
+            PostgresAcceptance.Require(db.GetError().Contains("ROLLBACK"), "failure did not identify the server ROLLBACK completion tag");
+            PostgresAcceptance.Require(!db.inTxn, "server ended transaction but connection retained inTxn");
+            string count = await db.ExecuteScalarAsync("SELECT count(*) FROM acceptance_records WHERE id=?", new DbParams().AddInt(id));
+            PostgresAcceptance.Require(count == "0", "aborted transaction persisted a row");
+        } finally {
+            if (uow != null) { uow.Dispose(); }
+            db.Close();
+        }
+    }
+
+    static async void PoolRecovery(string conninfo) {
+        PgPool pool = new PgPool(conninfo, 1);
+        PgConnection borrowed = null;
+        PgConnection control = null;
+        try {
+            borrowed = await pool.AcquireAsync();
+            PostgresAcceptance.Require(borrowed != null, "initial pool acquisition failed");
+            string original = await borrowed.ExecuteScalarAsync("SELECT pg_backend_pid()");
+            int pid = int.Parse(original);
+            pool.Release(borrowed);
+            borrowed = null;
+            control = await PostgresAcceptance.OpenConnection(conninfo, true);
+            string terminated = await control.ExecuteScalarAsync("SELECT pg_terminate_backend(?)", new DbParams().AddInt(pid));
+            PostgresAcceptance.Require(terminated == "t", "server did not terminate the idle pooled backend");
+            bool recovered = false;
+            // A stale idle socket can fail its first command; release must evict it.
+            for (int attempt = 0; attempt < 4; attempt = attempt + 1) {
+                borrowed = await pool.AcquireAsync();
+                PostgresAcceptance.Require(borrowed != null, "pool lost its slot after backend disconnect");
+                string current = "";
+                try { current = await borrowed.ExecuteScalarAsync("SELECT pg_backend_pid()"); }
+                catch (DbException) {
+                    // Expected disconnect contract: the failed socket must be marked unusable.
+                    PostgresAcceptance.Require(!borrowed.IsConnected(), "terminated backend remained reusable after command failure");
+                }
+                if (current.Length > 0 && current != original) { recovered = true; }
+                pool.Release(borrowed);
+                borrowed = null;
+                if (recovered) { break; }
+            }
+            PostgresAcceptance.Require(recovered, "pool did not recover within four acquisitions");
+            PostgresAcceptance.Require(pool.LiveCount() == 1 && pool.IdleCount() == 1 && pool.WaitingCount() == 0, "pool accounting leaked a slot after recovery");
+        } finally {
+            if (borrowed != null) { pool.Release(borrowed); }
+            if (control != null) { control.Close(); }
+            pool.Close();
+        }
+        PostgresAcceptance.Require(pool.LiveCount() == 0 && pool.IdleCount() == 0, "closed pool retained live connections");
+    }
+
+    static async void PoolBoundedReuse(string conninfo) {
+        PgPool pool = new PgPool(conninfo, 1);
+        PgConnection borrowed = null;
+        try {
+            for (int cycle = 0; cycle < 16; cycle = cycle + 1) {
+                borrowed = await pool.AcquireAsync();
+                PostgresAcceptance.Require(borrowed != null, "bounded acquire failed");
+                string value = await borrowed.ExecuteScalarAsync("SELECT 42");
+                PostgresAcceptance.Require(value == "42", "reused connection failed query");
+                if (cycle % 3 == 0) { borrowed.Close(); }
+                pool.Release(borrowed);
+                borrowed = null;
+                PostgresAcceptance.Require(pool.LiveCount() <= 1 && pool.WaitingCount() == 0, "bounded loop leaked a reservation/waiter");
+            }
+        } finally {
+            if (borrowed != null) { pool.Release(borrowed); }
+            pool.Close();
+        }
+        PostgresAcceptance.Require(pool.LiveCount() == 0, "bounded loop pool did not drain");
+        PgConnection closed = await pool.AcquireAsync();
+        PostgresAcceptance.Require(closed == null, "closed pool still lent a connection");
+    }
+
+    static async void PoolAuthFailure(string badConninfo) {
+        PgPool pool = new PgPool(badConninfo, 1);
+        try {
+            for (int attempt = 0; attempt < 3; attempt = attempt + 1) {
+                PgConnection db = await pool.AcquireAsync();
+                if (db != null) { pool.Release(db); }
+                PostgresAcceptance.Require(db == null, "incorrect SCRAM password was accepted");
+                PostgresAcceptance.Require(pool.LiveCount() == 0 && pool.WaitingCount() == 0, "failed authentication leaked a reservation");
+            }
+        } finally { pool.Close(); }
+    }
+
+    static async void RunCase(string name, string conninfo) {
+        if (name == "parameters_sync") { await PostgresAcceptance.Parameters(conninfo, false); }
+        else if (name == "parameters_async") { await PostgresAcceptance.Parameters(conninfo, true); }
+        else if (name == "uow_commit_sync") { await PostgresAcceptance.CommitCase(conninfo, false); }
+        else if (name == "uow_commit_async") { await PostgresAcceptance.CommitCase(conninfo, true); }
+        else if (name == "uow_rollback_sync") { await PostgresAcceptance.RollbackCase(conninfo, false); }
+        else if (name == "uow_rollback_async") { await PostgresAcceptance.RollbackCase(conninfo, true); }
+        else if (name == "uow_savepoint_sync") { await PostgresAcceptance.SavepointCase(conninfo, false); }
+        else if (name == "uow_savepoint_async") { await PostgresAcceptance.SavepointCase(conninfo, true); }
+        else if (name == "aborted_commit_sync") { await PostgresAcceptance.AbortedCommit(conninfo, false); }
+        else if (name == "aborted_commit_async") { await PostgresAcceptance.AbortedCommit(conninfo, true); }
+        else if (name == "pool_server_disconnect_recovery") { await PostgresAcceptance.PoolRecovery(conninfo); }
+        else if (name == "pool_bounded_reuse") { await PostgresAcceptance.PoolBoundedReuse(conninfo); }
+        else if (name == "pool_auth_failure_bounded") {
+            await PostgresAcceptance.PoolAuthFailure(Environment.GetEnvironmentVariable("ZAN_PG_ACCEPTANCE_BAD_CONNINFO"));
+        } else { throw new InvalidOperationException("unknown case"); }
+    }
+
+    static async void StressWorker(string conninfo) {
+        int worker = int.Parse(Environment.GetEnvironmentVariable("ZAN_PG_ACCEPTANCE_WORKER"));
+        int loops = int.Parse(Environment.GetEnvironmentVariable("ZAN_PG_ACCEPTANCE_LOOPS"));
+        PostgresAcceptance.Require(worker >= 0 && loops > 0 && loops <= 10000, "invalid stress worker bounds");
+        PgPool pool = new PgPool(conninfo, 1);
+        PgConnection borrowed = null;
+        UnitOfWork uow = null;
+        int inserted = 0;
+        int committed = 0;
+        int rolledBack = 0;
+        int completed = 0;
+        try {
+            string checkpoint = Environment.GetEnvironmentVariable("ZAN_PG_ACCEPTANCE_CHECKPOINT");
+            PostgresAcceptance.Require(checkpoint.Length > 0, "stress start barrier missing");
+            File.WriteAllText(checkpoint + "/ready_" + worker.ToString(), "ready");
+            await PostgresAcceptance.WaitCheckpoint(checkpoint, "go");
+            for (int iteration = 0; iteration < loops; iteration = iteration + 1) {
+                borrowed = await pool.AcquireAsync();
+                PostgresAcceptance.Require(borrowed != null, "stress pool acquisition failed");
+                uow = await UnitOfWork.CreateAsync(borrowed, false);
+                DbParams values = new DbParams().AddInt(worker).AddInt(iteration)
+                    .Add(PostgresAcceptance.Payload()).AddNull().Add("");
+                int affected = await uow.ExecuteAsync(
+                    "INSERT INTO acceptance_stress(worker_id,iteration,payload,nullable_value,empty_value) VALUES (?,?,?,?,?)", values);
+                PostgresAcceptance.Require(affected == 1, "stress parameterized insert failed");
+                inserted = inserted + 1;
+                if (iteration % 3 == 0) {
+                    PostgresAcceptance.Require(await uow.RollbackAsync(), "stress rollback failed");
+                    PostgresAcceptance.Require(uow.rolledBack && !uow.committed, "stress rollback flags disagree");
+                    rolledBack = rolledBack + 1;
+                } else {
+                    PostgresAcceptance.Require(await uow.CommitAsync(), "stress commit failed");
+                    PostgresAcceptance.Require(uow.committed && !uow.rolledBack, "stress commit flags disagree");
+                    committed = committed + 1;
+                }
+                uow.Dispose();
+                uow = null;
+                string count = await borrowed.ExecuteScalarAsync(
+                    "SELECT count(*) FROM acceptance_stress WHERE worker_id=?", new DbParams().AddInt(worker));
+                PostgresAcceptance.Require(int.Parse(count) == committed, "worker count differs from confirmed commits");
+                pool.Release(borrowed);
+                borrowed = null;
+                PostgresAcceptance.Require(pool.LiveCount() == 1 && pool.IdleCount() == 1 && pool.WaitingCount() == 0,
+                    "stress worker leaked a connection/waiter");
+                completed = completed + 1;
+            }
+        } finally {
+            if (uow != null) { uow.Dispose(); }
+            if (borrowed != null) { pool.Release(borrowed); }
+            pool.Close();
+        }
+        PostgresAcceptance.Require(pool.LiveCount() == 0 && pool.IdleCount() == 0, "stress worker pool did not drain");
+        JsonValue result = JsonValue.NewObject();
+        result.PutStr("case", "stress_worker");
+        result.PutBool("ok", true);
+        result.PutStr("detail", "independent process, connection and pool; no shared-pool thread-safety claim");
+        result.PutInt("worker", worker);
+        result.PutInt("loops", loops);
+        result.PutInt("completed", completed);
+        result.PutInt("inserted", inserted);
+        result.PutInt("committed", committed);
+        result.PutInt("rolled_back", rolledBack);
+        Console.WriteLine(result.ToJson());
+    }
+
+    static async void WaitCheckpoint(string directory, string name) {
+        long deadline = Environment.TickCount64 + 45000;
+        while (!File.Exists(directory + "/" + name)) {
+            PostgresAcceptance.Require(Environment.TickCount64 < deadline, "checkpoint deadline expired: " + name);
+            await Task.Delay(25);
+        }
+    }
+
+    static async void RestartPool(string conninfo) {
+        string directory = Environment.GetEnvironmentVariable("ZAN_PG_ACCEPTANCE_CHECKPOINT");
+        PostgresAcceptance.Require(directory.Length > 0, "restart checkpoint directory missing");
+        PgPool pool = new PgPool(conninfo, 1);
+        PgConnection borrowed = null;
+        string original = "";
+        string replacement = "";
+        long interruptedMs = 0;
+        int attempts = 0;
+        try {
+            borrowed = await pool.AcquireAsync();
+            PostgresAcceptance.Require(borrowed != null, "restart initial pool acquire failed");
+            original = await borrowed.ExecuteScalarAsync("SELECT pg_backend_pid()");
+            PostgresAcceptance.Require(original.Length > 0, "restart initial backend pid missing");
+            // Runner confirms this backend is executing pg_sleep before stopping our server.
+            File.WriteAllText(directory + "/ready", original);
+            await PostgresAcceptance.WaitCheckpoint(directory, "begin_query");
+            bool interrupted = false;
+            long started = Environment.TickCount64;
+            try { await borrowed.ExecuteAsync("SELECT pg_sleep(30)"); }
+            catch (DbException) {
+                // Expected shutdown contract: the in-flight query must fail, never report success.
+                interrupted = true;
+            }
+            interruptedMs = Environment.TickCount64 - started;
+            PostgresAcceptance.Require(interrupted && interruptedMs < 20000, "in-flight query did not fail within 20 seconds");
+            // A FATAL frame may precede EOF; probe once more to observe the closed socket.
+            if (borrowed.IsConnected()) {
+                try { await borrowed.ExecuteScalarAsync("SELECT 1"); }
+                catch (DbException) { /* Expected EOF after server shutdown. */ }
+            }
+            PostgresAcceptance.Require(!borrowed.IsConnected(), "shutdown backend remained reusable");
+            pool.Release(borrowed);
+            borrowed = null;
+            PostgresAcceptance.Require(pool.LiveCount() == 0, "shutdown socket did not release the pool slot");
+            File.WriteAllText(directory + "/interrupted", interruptedMs.ToString());
+            await PostgresAcceptance.WaitCheckpoint(directory, "restarted");
+            // Keep this exact pool instance alive across shutdown/start and refill its slot.
+            for (int attempt = 0; attempt < 4; attempt = attempt + 1) {
+                attempts = attempts + 1;
+                borrowed = await pool.AcquireAsync();
+                if (borrowed != null) { break; }
+                await Task.Delay(100);
+            }
+            PostgresAcceptance.Require(borrowed != null, "same pool failed to reconnect after server restart");
+            replacement = await borrowed.ExecuteScalarAsync("SELECT pg_backend_pid()");
+            PostgresAcceptance.Require(replacement.Length > 0 && replacement != original, "same pool did not obtain a new backend");
+            int affected = await borrowed.ExecuteParamsAsync(
+                "INSERT INTO acceptance_restart(id,payload) VALUES (?,?)", new DbParams().AddInt(1).Add(PostgresAcceptance.Payload()));
+            PostgresAcceptance.Require(affected == 1, "same pool failed parameterized write after restart");
+            pool.Release(borrowed);
+            borrowed = null;
+            PostgresAcceptance.Require(pool.LiveCount() == 1 && pool.IdleCount() == 1 && pool.WaitingCount() == 0,
+                "same pool accounting disagrees after restart");
+        } finally {
+            if (borrowed != null) { pool.Release(borrowed); }
+            pool.Close();
+        }
+        PostgresAcceptance.Require(pool.LiveCount() == 0, "restart pool did not drain");
+        JsonValue result = JsonValue.NewObject();
+        result.PutStr("case", "restart_same_pool");
+        result.PutBool("ok", true);
+        result.PutStr("detail", "one process and one pool survived private PostgreSQL stop/start; interrupted query failed and same pool reconnected");
+        result.PutStr("original_backend", original);
+        result.PutStr("replacement_backend", replacement);
+        result.PutInt("interrupted_ms", interruptedMs);
+        result.PutInt("reconnect_attempts", attempts);
+        Console.WriteLine(result.ToJson());
+    }
+
+    static async int Main() {
+        string conninfo = Environment.GetEnvironmentVariable("ZAN_PG_ACCEPTANCE_CONNINFO");
+        if (conninfo.Length == 0) {
+            PostgresAcceptance.Report("configuration", false, "Run postgres_acceptance.py; private connection environment is missing");
+            return 1;
+        }
+        string mode = Environment.GetEnvironmentVariable("ZAN_PG_ACCEPTANCE_MODE");
+        if (mode == "stress" || mode == "restart") {
+            try {
+                if (mode == "stress") { await PostgresAcceptance.StressWorker(conninfo); }
+                else { await PostgresAcceptance.RestartPool(conninfo); }
+                return 0;
+            } catch (Exception ex) {
+                // Child-process boundary: runner reports nonzero and preserves this case failure.
+                PostgresAcceptance.Report(mode == "stress" ? "stress_worker" : "restart_same_pool", false, ex.Message);
+                return 1;
+            }
+        }
+        List<string> cases = new List<string>();
+        cases.Add("parameters_sync");
+        cases.Add("parameters_async");
+        cases.Add("uow_commit_sync");
+        cases.Add("uow_commit_async");
+        cases.Add("uow_rollback_sync");
+        cases.Add("uow_rollback_async");
+        cases.Add("uow_savepoint_sync");
+        cases.Add("uow_savepoint_async");
+        cases.Add("aborted_commit_sync");
+        cases.Add("aborted_commit_async");
+        cases.Add("pool_server_disconnect_recovery");
+        cases.Add("pool_bounded_reuse");
+        cases.Add("pool_auth_failure_bounded");
+        int failures = 0;
+        for (int i = 0; i < cases.Count; i = i + 1) {
+            try {
+                await PostgresAcceptance.RunCase(cases[i], conninfo);
+                PostgresAcceptance.Report(cases[i], true, "verified against PostgreSQL over loopback TCP");
+            } catch (Exception ex) {
+                // Process boundary: report each failed contract and continue the remaining cases.
+                failures = failures + 1;
+                PostgresAcceptance.Report(cases[i], false, ex.Message);
+            }
+        }
+        return failures == 0 ? 0 : 1;
+    }
+}

@@ -121,8 +121,7 @@ binding_lowered:
                 } else {
                 LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs, NULL);
                 if (fs->type && (is_rc_managed_type(fs->type) || fs->type->kind == TYPE_OBJECT)) {
-                    emit_rc_store_field(g, fs->type, gv, right, expr->binary.right, locals,
-                                        (fs->modifiers & MOD_WEAK) ? 1 : 0);
+                    emit_rc_store_member(g, fs, fs->type, gv, right, expr->binary.right, locals);
                 } else if (fs->type && fs->type->kind == TYPE_STRUCT &&
                            type_contains_collection_rc(g, fs->type, 0)) {
                     emit_struct_field_capture(g, fs->type, gv, right,
@@ -146,8 +145,15 @@ binding_lowered:
                     if (setter && st) {
                         LLVMValueRef this_ptr = LLVMBuildLoad2(g->builder,
                             LLVMPointerType(st, 0), g->current_this, "this");
-                        emit_property_setter_call(g, setter, g->cur_inst,
-                            this_ptr, right, expr->binary.left,
+                        /* Cleanup must describe borrowed this, not the owned
+                         * result of reading the property being assigned. */
+                        zan_ast_node_t receiver = {0};
+                        receiver.kind = AST_THIS_EXPR;
+                        receiver.loc = expr->binary.left->loc;
+                        zan_type_t *rct = g->cur_inst ? g->cur_inst
+                                                      : g->current_type_sym->type;
+                        emit_property_setter_call(g, setter, rct,
+                            this_ptr, right, &receiver,
                             expr->binary.right, locals);
                     } else if (st) {
                         LLVMValueRef this_ptr = LLVMBuildLoad2(g->builder,
@@ -175,8 +181,7 @@ binding_lowered:
                             }
                         }
                         if (fst && (is_rc_managed_type(fst) || fst->kind == TYPE_OBJECT)) {
-                            emit_rc_store_field(g, fst, fptr, right, expr->binary.right, locals,
-                                                (fsym->modifiers & MOD_WEAK) ? 1 : 0);
+                            emit_rc_store_member(g, fsym, fst, fptr, right, expr->binary.right, locals);
                         } else if (fst && fst->kind == TYPE_STRUCT &&
                                    type_contains_collection_rc(g, fst, 0)) {
                             /* 结构体字段按值整体赋值 */
@@ -848,9 +853,8 @@ binding_lowered:
                         static_access_inst(g, obj_expr));
                     if (gv) {
                         if (fs->type && (is_rc_managed_type(fs->type) || fs->type->kind == TYPE_OBJECT)) {
-                            emit_rc_store_field(g, fs->type, gv, right,
-                                                expr->binary.right, locals,
-                                                (fs->modifiers & MOD_WEAK) ? 1 : 0);
+                            emit_rc_store_member(g, fs, fs->type, gv, right,
+                                                expr->binary.right, locals);
                         } else if (fs->type && fs->type->kind == TYPE_STRUCT &&
                                    type_contains_collection_rc(g, fs->type, 0)) {
                             emit_struct_field_capture(g, fs->type, gv, right,
@@ -888,8 +892,7 @@ binding_lowered:
                             zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
                             zan_type_t *aft = afsym ? field_store_type(g, afsym, local->type) : NULL;
                             if (aft && (is_rc_managed_type(aft) || aft->kind == TYPE_OBJECT)) {
-                                emit_rc_store_field(g, aft, fptr, right, expr->binary.right, locals,
-                                                    (afsym->modifiers & MOD_WEAK) ? 1 : 0);
+                                emit_rc_store_member(g, afsym, aft, fptr, right, expr->binary.right, locals);
                             } else if (aft && aft->kind == TYPE_STRUCT &&
                                        type_contains_collection_rc(g, aft, 0)) {
                                 emit_struct_field_capture(g, aft, fptr, right,
@@ -932,9 +935,8 @@ binding_lowered:
                                     zan_type_t *gft = gfsym ? field_store_type(g,
                                         gfsym, et) : NULL;
                                     if (gft && (is_rc_managed_type(gft) || gft->kind == TYPE_OBJECT)) {
-                                        emit_rc_store_field(g, gft, fptr, right,
-                                            expr->binary.right, locals,
-                                            (gfsym->modifiers & MOD_WEAK) ? 1 : 0);
+                                        emit_rc_store_member(g, gfsym, gft, fptr, right,
+                                            expr->binary.right, locals);
                                     } else if (gft && gft->kind == TYPE_STRUCT &&
                                                type_contains_collection_rc(g, gft, 0)) {
                                         emit_struct_field_capture(g, gft, fptr, right,
@@ -952,9 +954,9 @@ binding_lowered:
                             zan_type_t *rct = infer_expr_type(g, obj_expr, locals);
                             LLVMValueRef rval = emit_guarded_member_object(
                                 g, expr->binary.left, locals);
+                            /* The setter helper consumes the owned receiver temporary. */
                             emit_property_setter_call(g, setter, rct, rval,
                                 right, obj_expr, expr->binary.right, locals);
-                            emit_release_owned_call_temp(g, obj_expr, rval, locals);
                             stored = true;
                         } else {
                             LLVMTypeRef st = get_struct_llvm_type(g, cls);
@@ -970,8 +972,7 @@ binding_lowered:
                                           infer_expr_type(g, obj_expr, locals))
                                     : NULL;
                                 if (gft && (is_rc_managed_type(gft) || gft->kind == TYPE_OBJECT)) {
-                                    emit_rc_store_field(g, gft, fptr, right, expr->binary.right, locals,
-                                                        (gfsym->modifiers & MOD_WEAK) ? 1 : 0);
+                                    emit_rc_store_member(g, gfsym, gft, fptr, right, expr->binary.right, locals);
                                 } else if (gft && gft->kind == TYPE_STRUCT &&
                                            type_contains_collection_rc(g, gft, 0)) {
                                     emit_struct_field_capture(g, gft, fptr, right,

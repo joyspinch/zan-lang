@@ -223,6 +223,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             g->lpad_stack[g->lpad_depth].catch_bb = NULL;
             g->lpad_stack[g->lpad_depth].throw_locals_base = 0;
             g->lpad_stack[g->lpad_depth].fin_idx = -1;
+            g->lpad_stack[g->lpad_depth].finally_depth = 0;
             g->lpad_stack[g->lpad_depth].cleanups = NULL;
             g->lpad_stack[g->lpad_depth].cleanup_count = 0;
             g->lpad_stack[g->lpad_depth].cleanup_cap = 0;
@@ -991,6 +992,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
         g->lpad_stack[g->lpad_depth].catch_bb = NULL;
         g->lpad_stack[g->lpad_depth].throw_locals_base = 0;
         g->lpad_stack[g->lpad_depth].fin_idx = -1;
+        g->lpad_stack[g->lpad_depth].finally_depth = 0;
         g->lpad_stack[g->lpad_depth].cleanups = NULL;
         g->lpad_stack[g->lpad_depth].cleanup_count = 0;
         g->lpad_stack[g->lpad_depth].cleanup_cap = 0;

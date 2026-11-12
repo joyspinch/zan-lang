@@ -1,0 +1,79 @@
+using System;
+using System.IO;
+
+class Program {
+    static void Require(bool condition, string message) {
+        if (!condition) { throw new IOException(message); }
+    }
+
+    static void Main() {
+        string root = "_scratch/conf_io_write_failure";
+        Directory.CreateDirectoryRecursive(root);
+        string path = root + "/payload.bin";
+        string copy = root + "/copy.bin";
+        try {
+            File.WriteAllText(path, "first\n中文");
+            Require(File.ReadAllText(path) == "first\n中文", "text write");
+            File.AppendAllText(path, "\nlast");
+            Require(File.ReadAllText(path) == "first\n中文\nlast", "text append");
+            File.WriteAllText(path, "");
+            Require(File.GetSize64(path) == 0, "empty text truncates");
+            File.AppendAllText(path, "");
+            Require(File.GetSize64(path) == 0, "empty append");
+            byte[] bytes = new byte[3];
+            bytes[0] = 65;
+            bytes[1] = 0;
+            bytes[2] = 255;
+            File.WriteAllBytes(path, bytes);
+            byte[] read = File.ReadAllBytes(path);
+            Require(read.Length == 3 && read[0] == 65 && read[1] == 0 && read[2] == 255, "binary write");
+            File.Copy(path, copy);
+            read = File.ReadAllBytes(copy);
+            Require(read.Length == 3 && read[0] == 65 && read[1] == 0 && read[2] == 255, "binary copy");
+            File.WriteAllBytes(path, new byte[0]);
+            Require(File.GetSize64(path) == 0, "empty binary truncates");
+            File.Copy(path, copy);
+            Require(File.GetSize64(copy) == 0, "empty copy truncates");
+            File.WriteAllBytes(path, bytes);
+
+            #if LINUX
+            // A phase-sized fwrite fits stdio's buffer; /dev/full rejects the
+            // final flush in fclose. Large writes also cover direct write failure.
+            Require(File.Exists("/dev/full"), "Linux /dev/full fixture missing");
+            for (int i = 0; i < 8; i = i + 1) {
+                bool textFailed = false;
+                try { File.WriteAllText("/dev/full", "publishing:3"); }
+                catch (IOException) { textFailed = true; }
+                Require(textFailed, "buffered text close failure must throw");
+                bool appendFailed = false;
+                try { File.AppendAllText("/dev/full", "committed:3"); }
+                catch (IOException) { appendFailed = true; }
+                Require(appendFailed, "buffered append close failure must throw");
+                bool bytesFailed = false;
+                try { File.WriteAllBytes("/dev/full", bytes); }
+                catch (IOException) { bytesFailed = true; }
+                Require(bytesFailed, "buffered binary close failure must throw");
+                bool copyFailed = false;
+                try { File.Copy(path, "/dev/full"); }
+                catch (IOException) { copyFailed = true; }
+                Require(copyFailed, "buffered copy close failure must throw");
+            }
+            bool largeFailed = false;
+            try { File.WriteAllBytes("/dev/full", new byte[1048576]); }
+            catch (IOException) { largeFailed = true; }
+            Require(largeFailed, "direct binary write failure must throw");
+            // Offset zero is unmapped in this process: reading self memory there
+            // fails with EIO instead of an ordinary EOF.
+            bool readFailed = false;
+            try { File.Copy("/proc/self/mem", copy); }
+            catch (IOException) { readFailed = true; }
+            Require(readFailed, "copy read failure must throw");
+            #endif
+            Console.WriteLine("io_write_failure: PASS");
+        } finally {
+            if (File.Exists(path)) { File.Delete(path); }
+            if (File.Exists(copy)) { File.Delete(copy); }
+            Directory.Delete(root);
+        }
+    }
+}

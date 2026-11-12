@@ -1,0 +1,131 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.Threading;
+
+class SnapParent {
+    int id;
+    string name;
+}
+
+class SnapChild {
+    int id;
+    int parentId;
+    int amount;
+    SnapParent parent;
+}
+
+class SnapTotal {
+    long amount;
+    int count;
+}
+
+// SQLite supplies real SQL semantics, but only the async executor is usable.
+class AsyncOnly : IDbExecutor {
+    public SqliteConnection db;
+    public Action whileSuspended;
+    public int navigationQueries;
+
+    public int GetProvider() { return DbProvider.SQLite; }
+    public DbResult Query(string sql) { throw new Exception("sync Query used"); }
+    public DbResult Query(string sql, DbParams ps) { throw new Exception("sync Query used"); }
+    public int Execute(string sql) { throw new Exception("unexpected Execute"); }
+    public int Execute(string sql, DbParams ps) { throw new Exception("unexpected Execute"); }
+    public string ExecuteScalar(string sql) { throw new Exception("unexpected ExecuteScalar"); }
+    public string ExecuteScalar(string sql, DbParams ps) { throw new Exception("unexpected ExecuteScalar"); }
+    public async int ExecuteAsync(string sql) { throw new Exception("unexpected ExecuteAsync"); }
+    public async int ExecuteAsync(string sql, DbParams ps) { throw new Exception("unexpected ExecuteAsync"); }
+    public async string ExecuteScalarAsync(string sql) { throw new Exception("unexpected ExecuteScalarAsync"); }
+    public async string ExecuteScalarAsync(string sql, DbParams ps) { throw new Exception("unexpected ExecuteScalarAsync"); }
+
+    public async DbResult QueryAsync(string sql) {
+        return await this.QueryAsync(sql, new DbParams());
+    }
+
+    public async DbResult QueryAsync(string sql, DbParams ps) {
+        await Task.Delay(1);
+        Action mutate = this.whileSuspended;
+        this.whileSuspended = null;
+        if (mutate != null) { mutate(); }
+        if (sql.StartsWith("SELECT * FROM SnapParent")) {
+            this.navigationQueries = this.navigationQueries + 1;
+        }
+        return this.db.Query(sql, ps);
+    }
+}
+
+class Program {
+    static void Check(bool condition, string name) {
+        if (!condition) { throw new Exception(name); }
+        Console.WriteLine(name);
+    }
+
+    static bool Rare(SnapChild row) { return row.id > 10000; }
+    static bool Never(SnapChild row) { return false; }
+    static int Amount(SnapChild row) { return row.amount; }
+    static double AmountDouble(SnapChild row) { return (double)row.amount; }
+    static string ParentName(SnapChild row) { return row.parent.name; }
+    static SnapTotal Total(SnapChild row) {
+        return new SnapTotal { amount = row.Sum(x => x.amount), count = row.Count() };
+    }
+
+    static async void Main() {
+        SqliteConnection db = SqliteConnection.Open(":memory:");
+        db.Execute("CREATE TABLE SnapParent(id INTEGER PRIMARY KEY, name TEXT)");
+        db.Execute("CREATE TABLE SnapChild(id INTEGER PRIMARY KEY, parentId INTEGER, amount INTEGER)");
+        db.Execute("INSERT INTO SnapParent VALUES (1, 'north'), (2, 'south')");
+        db.Execute("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 10003) INSERT INTO SnapChild SELECT n, 1 + (n % 2), n - 10000 FROM seq");
+
+        Func<SnapChild, bool> rare = Program.Rare;
+        Func<SnapChild, int> amount = Program.Amount;
+        Func<SnapChild, double> amountDouble = Program.AmountDouble;
+        SelectQuery<SnapChild> query = new SelectQuery<SnapChild>(db);
+        query.Where(rare).OrderBy("id").Skip(1).Take(1);
+        List<SnapChild> list = query.ToList();
+        Check(list.Count == 1 && list[0].id == 10002, "complete-filter-before-page");
+        Check(query.Count() == 3 && query.Sum(amount) == 6 && query.Min(amount) == 1
+            && query.Max(amount) == 3 && query.Avg(amountDouble) == 2.0, "unpaged-count-and-aggregates");
+        PageResult<SnapChild> page = query.ToPageResult(3, 1);
+        SnapChild first = query.First();
+        Check(page.total == 3 && page.items[0].id == 10003 && first != null && first.id == 10002
+            && query.ToList()[0].id == 10002, "terminals-preserve-query-page");
+
+        AsyncOnly executor = new AsyncOnly();
+        executor.db = db;
+        SelectQuery<SnapChild> asyncQuery = new SelectQuery<SnapChild>(executor);
+        asyncQuery.Where(rare).WhereEq("parentId", 2).OrderBy("id").Take(1).Include(p => p.parent);
+        executor.whileSuspended = () => {
+            Func<SnapChild, bool> never = Program.Never;
+            asyncQuery.Where(never).WhereEq("parentId", 1).Take(0);
+        };
+        List<SnapChild> awaited = await asyncQuery.ToListAsync();
+        Check(awaited.Count == 1 && awaited[0].id == 10001 && awaited[0].parent.name == "south"
+            && executor.navigationQueries == 1, "async-query-snapshot-and-final-page-include");
+        List<SnapChild> changed = await asyncQuery.ToListAsync();
+        Check(changed.Count == 0, "later-execution-sees-mutation");
+
+        SelectQuery<SnapChild> projection = new SelectQuery<SnapChild>(executor);
+        projection.Where(rare).OrderBy("id").Skip(1).Take(1).Include(p => p.parent);
+        Func<SnapChild, string> name = Program.ParentName;
+        List<string> names = await projection.ToListAsync(name);
+        int total = await projection.CountAsync();
+        PageResult<SnapChild> next = await projection.ToPageResultAsync(3, 1);
+        Check(names.Count == 1 && names[0] == "north" && total == 3
+            && next.total == 3 && next.items[0].id == 10003 && next.items[0].parent.name == "south"
+            && executor.navigationQueries == 3, "async-string-projection-and-page-total");
+
+        SelectQuery<SnapChild> groups = new SelectQuery<SnapChild>(executor);
+        groups.Where(rare).OrderBy("id").GroupBy(p => new { p.parentId }).Take(1);
+        Func<SnapChild, SnapTotal> aggregate = Program.Total;
+        List<SnapTotal> grouped = await groups.ToListAsync<SnapTotal>(aggregate);
+        int groupCount = await groups.CountAsync();
+        SnapTotal top = await groups.ToOneAsync<SnapTotal>(aggregate);
+        Check(grouped.Count == 1 && grouped[0].amount == 4 && grouped[0].count == 2
+            && groupCount == 2 && top.amount == 4, "async-group-projection-and-total");
+
+        List<SnapChild> children = await projection.ChildrenAsync(1);
+        Check(children.Count == 5001, "async-children-dispatch");
+        db.Close();
+    }
+}

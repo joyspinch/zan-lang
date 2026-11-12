@@ -372,6 +372,12 @@ static LLVMValueRef mask_shift_count(zan_irgen_t *g, zan_ast_node_t *lhs,
 static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
                                           LLVMValueRef left, LLVMValueRef right,
                                           local_scope_t *locals) {
+        /* Lifted nullable payloads enter here directly, bypassing the outer
+         * expression dispatch. Decimal always uses its pointer-based ABI. */
+        if (LLVMTypeOf(left) == get_decimal_type(g) ||
+            LLVMTypeOf(right) == get_decimal_type(g))
+            return emit_decimal_binary(g, expr, left, right, locals);
+
         /* 比较类的 int/指针 混比必须当场诊断：checker 在开放泛型 lambda
          * 上下文里判不出成员类型（特化后才知道，E2045 被静默跳过），裸
          * icmp i32 vs ptr 会被 LLVM verify 整模块击毙（E3090 报在 0:0，
@@ -856,6 +862,39 @@ static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
     }
 
     LLVMValueRef both = LLVMBuildAnd(g->builder, lhas, rhas, "nv.both");
+
+    if (LLVMTypeOf(lval) == get_decimal_type(g) ||
+        LLVMTypeOf(rval) == get_decimal_type(g)) {
+        /* A null operand suppresses payload evaluation, including decimal
+         * overflow/zero-divisor checks. A select after an eager call cannot. */
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        LLVMBasicBlockRef value_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.dec.value");
+        LLVMBasicBlockRef null_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.dec.null");
+        LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "nv.dec.end");
+        LLVMBuildCondBr(g->builder, both, value_bb, null_bb);
+        LLVMPositionBuilderAtEnd(g->builder, value_bb);
+        LLVMValueRef payload = emit_binary_op_values(g, expr, lval, rval, locals);
+        bool cmp = op == TK_EQ_EQ || op == TK_BANG_EQ ||
+                   op == TK_LESS || op == TK_LESS_EQ ||
+                   op == TK_GREATER || op == TK_GREATER_EQ;
+        LLVMTypeRef result_ty = cmp ? i1 : nullable_type_of(g, LLVMTypeOf(payload));
+        LLVMValueRef present = cmp ? payload : nullable_some(g, result_ty, payload);
+        LLVMBasicBlockRef present_end = LLVMGetInsertBlock(g->builder);
+        LLVMBuildBr(g->builder, merge_bb);
+        LLVMPositionBuilderAtEnd(g->builder, null_bb);
+        LLVMValueRef absent = cmp ? LLVMConstInt(i1, 0, 0) : nullable_none(result_ty);
+        if (op == TK_EQ_EQ || op == TK_BANG_EQ) {
+            LLVMValueRef either = LLVMBuildOr(g->builder, lhas, rhas, "nv.dec.either");
+            absent = op == TK_EQ_EQ ? LLVMBuildNot(g->builder, either, "nv.dec.neither") : either;
+        }
+        LLVMBuildBr(g->builder, merge_bb);
+        LLVMPositionBuilderAtEnd(g->builder, merge_bb);
+        LLVMValueRef result = LLVMBuildPhi(g->builder, result_ty, "nv.dec.result");
+        LLVMValueRef values[] = { present, absent };
+        LLVMBasicBlockRef blocks[] = { present_end, null_bb };
+        LLVMAddIncoming(result, values, blocks, 2);
+        return result;
+    }
 
     if (op == TK_EQ_EQ || op == TK_BANG_EQ) {
         /* 可空类型相等性判断：均为 null 或内部值均相等 */

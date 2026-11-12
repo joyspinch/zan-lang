@@ -105,7 +105,12 @@
                         (int)stmt->ident.name.len, stmt->ident.name.str);
                 } else if (f->fin_depth > lab_fin || f->catch_base > lab_catch ||
                            f->eh_armed_base > lab_eh ||
-                           f->pending.scope != g->pending.scope) {
+                           f->pending.scope != g->pending.scope ||
+                           f->locals_base > locals->count) {
+                    local_scope_t source_locals = *locals;
+                    source_locals.vars = f->locals_snap;
+                    source_locals.count = f->locals_base;
+                    source_locals.cap = f->locals_base;
                     zan_irgen_pending_context_t saved_pending = g->pending;
                     LLVMBasicBlockRef saved_break = g->break_target;
                     LLVMBasicBlockRef saved_continue = g->continue_target;
@@ -149,7 +154,7 @@
                                sizeof(g->finallys[0]) *
                                    (size_t)(f->fin_depth - lab_fin));
                         g->finally_count = f->fin_depth;
-                        emit_pending_finallys(g, locals, lab_fin, false);
+                        emit_pending_finallys(g, &source_locals, lab_fin, false);
                         g->finally_count = lab_fin;
                     } else if (f->fin_depth > lab_fin) {
                         zan_diag_emit_code(g->diag, DIAG_ERROR, f->loc, 3084,
@@ -171,6 +176,11 @@
                             emit_release_active_catch_excs(g, lab_catch);
                             g->catch_cleanup_count = lab_catch;
                         }
+                    }
+                    if (!LLVMGetBasicBlockTerminator(
+                            LLVMGetInsertBlock(g->builder))) {
+                        emit_release_owned_locals_range(g, &source_locals,
+                                                        locals->count);
                     }
                     if (!LLVMGetBasicBlockTerminator(
                             LLVMGetInsertBlock(g->builder)) &&
@@ -266,6 +276,8 @@
                 f->catch_base = g->catch_cleanup_count;
                 f->locals_base = locals->count;
                 f->locals_owned = irgen_goto_count_owned_locals(locals);
+                f->locals_snap = finally_shared_copy(g, locals->vars,
+                    sizeof(*locals->vars) * (size_t)locals->count);
                 f->from_bb = LLVMGetInsertBlock(g->builder);
                 f->finally_snap_n = g->finally_count;
                 if (f->finally_snap_n > 0) {
@@ -382,7 +394,7 @@ throw_unwind:
                 for (int i = g->lpad_depth - 1; i >= 0; i--) {
                     zan_lpad_entry_t *top = &g->lpad_stack[i];
                     if (top->fn != cur_fn) break;
-                    if (top->catch_bb) {
+                    if (top->catch_bb || (!g->current_async_frame && top->lpad_bb)) {
                         rel_base = top->throw_locals_base;
                         break;
                     }
@@ -391,7 +403,8 @@ throw_unwind:
                 emit_clear_owned_locals_range(g, locals, rel_base);
             }
             emit_release_active_catch_excs(g, g->throw_catch_base);
-            emit_raise_exception(g);
+            if (g->current_async_frame) emit_raise_exception(g);
+            else emit_raise_exception_through_cleanups(g);
             break;
         }
         break;

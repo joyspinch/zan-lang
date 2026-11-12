@@ -113,6 +113,7 @@ typedef struct {
     sh_map_t          ext_globs;
     sh_map_t          ext_fns;
     bool              failed;
+    bool              optimizer_failed; /* cannot recover by emitting the coordinator */
     char              reason[256];
 } sh_state_t;
 

@@ -89,6 +89,39 @@ static bool desc_gv_reserve(zan_irgen_t *g, int want) {
     g->desc_gv_cap = newcap;
     return true;
 }
+/* Type checks and both ARC metadata formats must use the same closed
+ * collection identity. Dict's site element is already its full K,V type;
+ * List's site element is T. Keep other runtime class names unchanged. */
+const char *arc_runtime_type_name(zan_irgen_t *g, zan_type_t *type) {
+    if (type && type->type_arg_count > 0 &&
+        (type_named(type, "List", 4) || type_named(type, "Dict", 4))) {
+        for (int cap = 256; cap <= 1048576; cap *= 2) {
+            char *buf = (char *)malloc((size_t)cap);
+            if (!buf) break;
+            int len = render_type_full(type, buf, cap);
+            if (len < cap - 2) {
+                const char *name = zan_arena_strdup(g->arena, buf, (size_t)len);
+                free(buf);
+                return name;
+            }
+            free(buf);
+        }
+        fprintf(stderr, "zanc: cannot render collection runtime type identity\n");
+        exit(1);
+    }
+    zan_istr_t name = type ? type->name : (zan_istr_t){NULL, 0};
+    if (!name.str && type && type->sym) name = type->sym->name;
+    return name.str ? zan_arena_strdup(g->arena, name.str, name.len) : "";
+}
+
+const char *arc_collection_type_name(zan_irgen_t *g, int kind,
+                                     zan_type_t *element) {
+    if (kind == 2) return "StringBuilder";
+    zan_type_t *type = kind == 1
+        ? zan_binder_make_list_type(g->binder, element) : element;
+    return arc_runtime_type_name(g, type);
+}
+
 int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
                             zan_type_t *inst, int coll_kind,
                             zan_type_t *coll_elem) {
@@ -234,7 +267,7 @@ void ensure_function_personality(zan_irgen_t *g, LLVMValueRef fn) {
     }
 }
 
-void emit_raise_exception(zan_irgen_t *g) {
+static void emit_raise_exception_impl(zan_irgen_t *g, bool include_cleanups) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     if (!g->fn_cxa_allocate_exception) {
@@ -268,7 +301,7 @@ void emit_raise_exception(zan_irgen_t *g) {
         for (int i = g->lpad_depth - 1; i >= 0; i--) {
             zan_lpad_entry_t *top = &g->lpad_stack[i];
             if (top->fn != cur_fn) break;
-            if (top->lpad_bb && top->catch_bb) {
+            if (top->lpad_bb && (include_cleanups || top->catch_bb)) {
                 LLVMBasicBlockRef unreach_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "throw.unreach");
                 LLVMBuildInvoke2(g->builder, throw_ty, g->fn_cxa_throw,
                     (LLVMValueRef[]){ exc_mem, LLVMConstNull(i8ptr), LLVMConstNull(i8ptr) }, 3,
@@ -283,6 +316,14 @@ void emit_raise_exception(zan_irgen_t *g) {
     zan_call2(g->builder, throw_ty, g->fn_cxa_throw,
         (LLVMValueRef[]){ exc_mem, LLVMConstNull(i8ptr), LLVMConstNull(i8ptr) }, 3, "");
     LLVMBuildUnreachable(g->builder);
+}
+
+void emit_raise_exception(zan_irgen_t *g) {
+    emit_raise_exception_impl(g, false);
+}
+
+void emit_raise_exception_through_cleanups(zan_irgen_t *g) {
+    emit_raise_exception_impl(g, true);
 }
 
 LLVMValueRef zan_call_or_invoke(zan_irgen_t *g, LLVMBuilderRef b, LLVMTypeRef ty,

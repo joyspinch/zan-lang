@@ -96,15 +96,45 @@ class Check {
     }
 }
 
+class BorrowResult {
+    string value = "";
+    bool completed;
+
+    public void Complete(string value) {
+        lock (this) {
+            this.value = value;
+            this.completed = true;
+        }
+    }
+
+    // Observe completion independently of the timed Gate used by the pool.
+    public async bool WaitUntilComplete(int timeoutMs) {
+        long deadline = ServerMetrics.MonoMillis() + timeoutMs;
+        while (!this.IsComplete() && ServerMetrics.MonoMillis() < deadline) {
+            await Task.Delay(1);
+        }
+        return this.IsComplete();
+    }
+
+    public bool IsComplete() {
+        lock (this) { return this.completed; }
+    }
+
+    public string GetValue() {
+        lock (this) { return this.value; }
+    }
+}
+
 class Program {
-    static async void Borrow(DbPool pool, List<string> log) {
+    static async void RecordBorrow(DbPool pool, BorrowResult result) {
         IDbConnection c = await pool.AcquireAsync();
         if (c == null) {
-            log.Add("null");
-            return;
+            result.Complete("null");
+        } else {
+            string value = c.ExecuteScalar("SELECT 1");
+            pool.Release(c);
+            result.Complete(value);
         }
-        log.Add(c.ExecuteScalar("SELECT 1"));
-        pool.Release(c);
     }
 
     static async void Recovery() {
@@ -113,16 +143,21 @@ class Program {
         IDbConnection held = await pool.AcquireAsync();
         Check.Eq(f.Opened(), 1, "one connection opened");
 
-        List<string> log = new List<string>();
-        Task.Spawn(Program.Borrow(pool, log));
-        await Task.Delay(20);
-        Check.Eq(log.Count, 0, "waiter parked while saturated");
+        BorrowResult result = new BorrowResult();
+        Task.Spawn(Program.RecordBorrow(pool, result));
+        long admissionDeadline = ServerMetrics.MonoMillis() + 500;
+        while (pool.WaitingCount() == 0 && !result.IsComplete()
+               && ServerMetrics.MonoMillis() < admissionDeadline) {
+            await Task.Delay(1);
+        }
+        Check.True(!result.IsComplete(), "waiter parked while saturated");
         Check.Eq(pool.WaitingCount(), 1, "one waiter on the gate");
 
         pool.Release(held);
-        await Task.Delay(20);
-        Check.Eq(log.Count, 1, "release woke the waiter");
+        await result.WaitUntilComplete(500);
+        Check.True(result.IsComplete() && result.GetValue() == "1", "release woke the waiter");
         Check.Eq(pool.WaitingCount(), 0, "gate drained cleanly");
+        pool.Close();
     }
 
     static async void ExhaustionFastFails() {
@@ -139,11 +174,13 @@ class Program {
         DbPool pool = new DbPool(f, 1);
         IDbConnection held = await pool.AcquireAsync();
 
-        List<string> log = new List<string>();
-        Task.Spawn(Program.Borrow(pool, log));
-        Task.Spawn(Program.Borrow(pool, log));
+        BorrowResult first = new BorrowResult();
+        BorrowResult second = new BorrowResult();
         long t0 = ServerMetrics.MonoMillis();
-        await Task.Delay(500);
+        Task.Spawn(Program.RecordBorrow(pool, first));
+        Task.Spawn(Program.RecordBorrow(pool, second));
+        await first.WaitUntilComplete(500);
+        await second.WaitUntilComplete(500);
         long dt = ServerMetrics.MonoMillis() - t0;
 
         PoolWait.MaxGateWaits = saveWaits;
@@ -151,9 +188,9 @@ class Program {
         PoolWait.PollStepMs = saveStep;
         PoolWait.PollBudgetMs = saveBudget;
 
-        Check.Eq(log.Count, 2, "both borrowers gave up in bounded time");
-        Check.EqStr(log[0], "null", "first borrower fast-failed");
-        Check.EqStr(log[1], "null", "second borrower fast-failed");
+        Check.True(first.IsComplete() && second.IsComplete(), "both borrowers gave up in bounded time");
+        Check.EqStr(first.GetValue(), "null", "first borrower fast-failed");
+        Check.EqStr(second.GetValue(), "null", "second borrower fast-failed");
         Check.Eq(pool.WaitingCount(), 0, "no waiter left behind on the gate");
         Check.True(dt < 30000, "exhaustion resolved quickly");
 
@@ -161,6 +198,7 @@ class Program {
         IDbConnection again = await pool.AcquireAsync();
         Check.True(again != null, "healthy acquire after policy restored");
         if (again != null) { pool.Release(again); }
+        pool.Close();
     }
 
     static async void RunAll() {

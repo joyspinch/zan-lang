@@ -540,6 +540,91 @@ int method_declared_param_count(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
     return m->decl->method_decl.params.count;
 }
+/* A type view keeps substitutions on base edges without allocating types.
+ * chain[0] is the derived owner; chain[k]'s arguments are expressed in
+ * chain[k-1]'s scope (Derived<U> : Base<List<U>>). */
+static zan_type_t *virtual_signature_subst(zan_type_t *t, zan_type_t **chain,
+                                          int *scope) {
+    while (t && t->kind == TYPE_TYPE_PARAM && *scope > 0) {
+        zan_type_t *owner = chain[*scope];
+        if (!owner || !owner->sym || !owner->sym->decl) break;
+        zan_ast_list_t *tps = &owner->sym->decl->type_decl.type_params;
+        int i = 0;
+        for (; i < tps->count; i++) {
+            zan_istr_t name = tps->items[i]->ident.name;
+            if (name.len == t->name.len &&
+                memcmp(name.str, t->name.str, (size_t)name.len) == 0)
+                break;
+        }
+        if (i >= tps->count || i >= owner->type_arg_count ||
+            !owner->type_args[i]) break;
+        t = owner->type_args[i];
+        (*scope)--;
+    }
+    return t;
+}
+static bool virtual_signature_type_equal(zan_type_t *a, int ascope,
+                                         zan_type_t *b, int bscope,
+                                         zan_type_t **chain, int depth) {
+    if (depth > 64) return false;
+    a = virtual_signature_subst(a, chain, &ascope);
+    b = virtual_signature_subst(b, chain, &bscope);
+    if (a == b && ascope == bscope) return true;
+    if (!a || !b || a->kind != b->kind) return false;
+    if (a->sym && b->sym && a->sym != b->sym) return false;
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
+        if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank) return false;
+        return virtual_signature_type_equal(a->element_type, ascope,
+                    b->element_type, bscope, chain, depth + 1);
+    }
+    if (!(a->sym && a->sym == b->sym) &&
+        (a->name.len != b->name.len ||
+         (a->name.len && memcmp(a->name.str, b->name.str,
+                               (size_t)a->name.len) != 0)))
+        return false;
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++)
+        if (!virtual_signature_type_equal(a->type_args[i], ascope,
+                b->type_args[i], bscope, chain, depth + 1)) return false;
+    return true;
+}
+
+/* Slot identity follows the declared parameter signature, not call arity:
+ * overloads may have the same number of arguments and different ABIs. */
+bool virtual_method_signature_equal(zan_symbol_t *a, zan_symbol_t *b) {
+    if (a == b) return a != NULL;
+    if (!a || !b || !member_name_is(a, b->name) ||
+        method_declared_param_count(a) < 0 ||
+        method_declared_param_count(a) != method_declared_param_count(b) ||
+        method_type_param_count(a) != method_type_param_count(b) ||
+        a->member_count != b->member_count)
+        return false;
+    zan_type_t *chain[64];
+    int ascope = 0, bscope = 0;
+    chain[0] = b->parent ? b->parent->type : NULL;
+    for (int i = 0; chain[i] && i < 63; i++) {
+        if (chain[i]->sym == a->parent) { ascope = i; break; }
+        chain[i + 1] = chain[i]->base_type;
+    }
+    if (ascope == 0 && a->parent != b->parent) {
+        chain[0] = a->parent ? a->parent->type : NULL;
+        for (int i = 0; chain[i] && i < 63; i++) {
+            if (chain[i]->sym == b->parent) { bscope = i; break; }
+            chain[i + 1] = chain[i]->base_type;
+        }
+    }
+    for (int i = 0; i < a->member_count; i++) {
+        zan_symbol_t *ap = a->members[i], *bp = b->members[i];
+        if (!ap || !bp || ap->kind != SYM_PARAM || bp->kind != SYM_PARAM ||
+            !virtual_signature_type_equal(ap->type, ascope, bp->type, bscope,
+                                          chain, 0))
+            return false;
+        if (!ap->decl || !bp->decl ||
+            ap->decl->param.by_ref != bp->decl->param.by_ref)
+            return false;
+    }
+    return true;
+}
 int get_virtual_method_index(zan_symbol_t *type_sym,
                                     zan_symbol_t *method_sym);
 bool method_introduces_virtual_slot(zan_symbol_t *type_sym, zan_symbol_t *m) {
@@ -580,13 +665,11 @@ int get_virtual_method_index(zan_symbol_t *type_sym,
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         base_count = count_virtual_methods(type_sym->type->base_type->sym);
     }
-    int want = method_declared_param_count(method_sym);
     int idx = base_count;
     for (int i = 0; i < type_sym->member_count; i++) {
         zan_symbol_t *m = type_sym->members[i];
         if (method_introduces_virtual_slot(type_sym, m)) {
-            if (member_name_is(m, method_sym->name) &&
-                method_declared_param_count(m) == want) {
+            if (virtual_method_signature_equal(m, method_sym)) {
                 return idx;
             }
             idx++;
@@ -802,7 +885,7 @@ static unsigned llvm_scalar_size(LLVMTypeRef t) {
     }
 }
 unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem) {
-    if (!elem || elem->kind != TYPE_STRUCT) return 1;
+    if (!elem || (elem->kind != TYPE_STRUCT && elem->kind != TYPE_DECIMAL)) return 1;
     LLVMTypeRef st = map_type(g, elem);
     if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return 1;
     unsigned sz = llvm_scalar_size(st);

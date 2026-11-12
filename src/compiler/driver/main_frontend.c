@@ -143,6 +143,16 @@
             break;
         }
     }
+    if (missing_namespace_count > 0) {
+        fprintf(stderr, "error: %d unresolved imported namespace(s); "
+                        "see ZANPKG_MISSING diagnostics above\n",
+                missing_namespace_count);
+        package_sources_destroy();
+        zan_diag_free_buffers(diag);
+        zan_arena_free(arena);
+        free(source);
+        return 3;
+    }
     phase("parse");
     probe_phase_mem("parse");
     if (g_time_phases) zan_arena_dump_stats();
@@ -162,7 +172,7 @@
         zan_parser_specialize_generic_bases(ast, arena, diag);
         phase("specialize_bases");
 
-        if (gen_meta_path) {
+        if (gen_meta_path && !zan_diag_has_errors(diag)) {
             char *meta = zan_genmeta_export_files(ast, diag);
             if (!meta) {
                 fprintf(stderr, "error: cannot export metadata\n");
@@ -274,6 +284,15 @@
     }
 
     package_sources_destroy();
+    if (missing_namespace_count > 0) {
+        fprintf(stderr, "error: %d unresolved imported namespace(s); "
+                        "see ZANPKG_MISSING diagnostics above\n",
+                missing_namespace_count);
+        zan_diag_free_buffers(diag);
+        zan_arena_free(arena);
+        free(source);
+        return 3;
+    }
 
     if (emit_symbols_path) {
         int srv = zan_symbols_emit(ast, emit_symbols_path);
@@ -423,6 +442,7 @@
         free(source);
         return 1;
     }
+    irgen.cpu_profile = opts.cpu_profile;
     irgen.emit_debug = debug_info;
     irgen.strict_runtime = strict_runtime;
     irgen.publish_mode = publish_mode;

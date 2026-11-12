@@ -1,0 +1,61 @@
+using System;
+using System.Web;
+using Zan.Web;
+
+namespace RouteRegression;
+
+class Program {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+        Console.WriteLine(label);
+    }
+
+    static HttpContext Ctx(string path) {
+        HttpRequest request = HttpRequest.Parse(
+            "GET " + path + " HTTP/1.1\r\nHost: test\r\n\r\n");
+        return new HttpContext(request, "127.0.0.1");
+    }
+
+    static async string Dispatch(WebApp app, string path, string key) {
+        HttpContext ctx = Program.Ctx(path);
+        ctx.SetApp(app);
+        Route route = app.Router().Match(ctx);
+        if (route == null) { throw new Exception("missing route " + path); }
+        Program.Check(route.Action() == key, "registered identity " + path);
+        ctx.SetRouteAction(route.Action());
+        ctx.SetRoutePattern(route.Pattern());
+        await route.Handler()(ctx);
+        return ctx.BuildResponse(true);
+    }
+
+    static async void Run(string views) {
+        WebApp app = new WebApp("127.0.0.1", 0);
+        app.Views(views);
+        __AttrRoutes.Register(app);
+        string siteKey = typeof(Zan.Web.Index.Index).FullName + ".Index";
+        string apiKey = typeof(RouteRegression.Api_Index.Index).FullName + ".Index";
+        Program.Check(siteKey != apiKey, "same short name has distinct identities");
+        string home = await Program.Dispatch(app, "/", siteKey);
+        Program.Check(home.IndexOf("<main>site-home-awaited</main>") >= 0
+            && home.IndexOf("api-metrics-awaited") < 0, "root dispatches site action");
+        string metrics = await Program.Dispatch(app, "/identity-metrics", apiKey);
+        Program.Check(metrics.IndexOf("<article>api-metrics-awaited</article>") >= 0
+            && metrics.IndexOf("site-home-awaited") < 0, "metrics dispatches api action");
+        string beforeKey = typeof(Zan.Web.Identity.BeforeController).FullName + ".Index";
+        string before = await Program.Dispatch(app, "/identity-before", beforeKey);
+        Program.Check(before.IndexOf("<aside>before-view-awaited</aside>") >= 0,
+            "view bound before hook and Controller suffix retained");
+        string sitePing = await Program.Dispatch(app, "/index/index/ping",
+            typeof(Zan.Web.Index.Index).FullName + ".Ping");
+        Program.Check(sitePing.Contains("site convention"),
+            "collision convention maps source namespace once");
+        string apiPing = await Program.Dispatch(app, "/routeregression/api/index/index/ping",
+            typeof(RouteRegression.Api_Index.Index).FullName + ".Ping");
+        Program.Check(apiPing.Contains("api convention"),
+            "underscore namespace retains convention segments");
+        Program.Check(app.Router().Match(Program.Ctx("/index/zan/web/index/index/ping")) == null,
+            "collision does not expose duplicated namespace route");
+    }
+
+    static void Main(string[] args) { await Program.Run(args[0]); }
+}

@@ -55,11 +55,15 @@ static zan_type_t *assign_lhs_type(zan_irgen_t *g, zan_ast_node_t *lhs,
 
 /* 为类字段合成或查询缓存的 getter/setter 访问器函数 */
 static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
-        zan_symbol_t *fs, LLVMValueRef *out_get, LLVMValueRef *out_set) {
+        zan_symbol_t *fs, zan_type_t *recv_type, zan_type_t *value_type, int base_dispatch,
+        LLVMValueRef *out_get, LLVMValueRef *out_set) {
     *out_get = NULL;
     *out_set = NULL;
     for (int i = 0; i < g->bind_acc_count; i++) {
-        if (g->bind_accs[i].cls == cls && g->bind_accs[i].field == fs) {
+        if (g->bind_accs[i].cls == cls && g->bind_accs[i].field == fs &&
+            types_equal(g->bind_accs[i].recv_type, recv_type) &&
+            types_equal(g->bind_accs[i].value_type, value_type) &&
+            g->bind_accs[i].base_dispatch == base_dispatch) {
             *out_get = g->bind_accs[i].get_fn;
             *out_set = g->bind_accs[i].set_fn;
             return;
@@ -67,16 +71,32 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
     }
     LLVMTypeRef st = get_struct_llvm_type(g, cls);
     int fi = get_field_index(cls, fs->name);
-    if (!st || fi < 0 || !fs->type) return;
+    if (!st || fi < 0 || !value_type) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef vt = map_type(g, fs->type);
+    LLVMTypeRef vt = map_type(g, value_type);
+    zan_symbol_t *getter = property_getter_sym(g, fs);
+    zan_symbol_t *setter = property_setter_sym(g, fs);
+    local_scope_t accessor_locals;
+    memset(&accessor_locals, 0, sizeof(accessor_locals));
+    /* Accessor parameters borrow the target and setter value. The ordinary
+     * property helpers own dispatch and result ownership, including generics. */
+    zan_ast_node_t *borrowed_this = (getter || setter)
+        ? zan_ast_new(g->arena, base_dispatch ? AST_BASE_EXPR : AST_THIS_EXPR,
+                      fs->decl->loc) : NULL;
 
-    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef saved_fn = g->current_fn;
+    zan_builder_point_t saved_point = zan_builder_save(g);
+    di_clear(g);
+    zan_type_t *saved_inst = g->cur_inst;
+    zan_type_t *saved_recv_type = g->cur_recv_type;
+    zan_symbol_t *saved_type = g->current_type_sym;
+    g->cur_inst = recv_type;
+    g->cur_recv_type = recv_type;
+    g->current_type_sym = cls;
 
     char name[512];
-    snprintf(name, sizeof(name), "__zbind_get_%.*s_%.*s",
-             (int)cls->name.len, cls->name.str, (int)fs->name.len, fs->name.str);
+    snprintf(name, sizeof(name), "__zbind_get_%.*s_%.*s_%d",
+             (int)cls->name.len, cls->name.str, (int)fs->name.len, fs->name.str,
+             g->bind_acc_count);
     LLVMTypeRef get_ty = LLVMFunctionType(vt, &i8ptr, 1, 0);
     LLVMValueRef get_fn = LLVMAddFunction(g->mod, name, get_ty);
     LLVMSetLinkage(get_fn, LLVMInternalLinkage);
@@ -86,20 +106,26 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
         g->current_fn = get_fn;
         LLVMValueRef obj = LLVMBuildBitCast(g->builder, LLVMGetParam(get_fn, 0),
             LLVMPointerType(st, 0), "obj");
-        LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj, fi, "fld");
         LLVMValueRef val;
-        if (fs->modifiers & MOD_WEAK) {
-            val = emit_weak_field_load(g, fptr, vt);
+        if (getter) {
+            val = emit_property_getter_call(g, getter, recv_type, obj,
+                                            borrowed_this, &accessor_locals);
         } else {
-            val = LLVMBuildLoad2(g->builder, vt, fptr, "val");
-            if (is_rc_managed_type(fs->type))
-                emit_rc_retain_for_type(g, fs->type, val);
+            LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj, fi, "fld");
+            if (fs->modifiers & MOD_WEAK) {
+                val = emit_weak_field_load(g, fptr, vt);
+            } else {
+                val = LLVMBuildLoad2(g->builder, vt, fptr, "val");
+                if (is_rc_managed_type(value_type))
+                    emit_rc_retain_for_type(g, value_type, val);
+            }
         }
         LLVMBuildRet(g->builder, val);
     }
 
-    snprintf(name, sizeof(name), "__zbind_set_%.*s_%.*s",
-             (int)cls->name.len, cls->name.str, (int)fs->name.len, fs->name.str);
+    snprintf(name, sizeof(name), "__zbind_set_%.*s_%.*s_%d",
+             (int)cls->name.len, cls->name.str, (int)fs->name.len, fs->name.str,
+             g->bind_acc_count);
     LLVMTypeRef set_params[2] = { i8ptr, vt };
     LLVMTypeRef set_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), set_params, 2, 0);
     LLVMValueRef set_fn = LLVMAddFunction(g->mod, name, set_ty);
@@ -111,19 +137,28 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
         LLVMValueRef obj = LLVMBuildBitCast(g->builder, LLVMGetParam(set_fn, 0),
             LLVMPointerType(st, 0), "obj");
         LLVMValueRef v = LLVMGetParam(set_fn, 1);
-        LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj, fi, "fld");
-        /* 弱引用字段写入防护：维护弱引用注册表槽位 */
-        emit_rc_store_field(g, fs->type, fptr, v, NULL, NULL,
-                            (fs->modifiers & MOD_WEAK) ? 1 : 0);
+        if (setter) {
+            emit_property_setter_call(g, setter, recv_type, obj, v,
+                                     borrowed_this, NULL, &accessor_locals);
+        } else {
+            LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj, fi, "fld");
+            /* 弱引用字段写入防护：维护弱引用注册表槽位 */
+            emit_rc_store_member(g, fs, value_type, fptr, v, NULL, NULL);
+        }
         LLVMBuildRetVoid(g->builder);
     }
 
-    g->current_fn = saved_fn;
-    if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    g->cur_inst = saved_inst;
+    g->cur_recv_type = saved_recv_type;
+    g->current_type_sym = saved_type;
+    zan_builder_restore(g, saved_point);
 
     if (ZAN_TAB_ENSURE(g->bind_accs, g->bind_acc_count, g->bind_acc_cap, 128)) {
         g->bind_accs[g->bind_acc_count].cls = cls;
         g->bind_accs[g->bind_acc_count].field = fs;
+        g->bind_accs[g->bind_acc_count].recv_type = recv_type;
+        g->bind_accs[g->bind_acc_count].value_type = value_type;
+        g->bind_accs[g->bind_acc_count].base_dispatch = base_dispatch;
         g->bind_accs[g->bind_acc_count].get_fn = get_fn;
         g->bind_accs[g->bind_acc_count].set_fn = set_fn;
         g->bind_acc_count++;
@@ -175,13 +210,33 @@ LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
 
     zan_symbol_t *cls = NULL;
     zan_symbol_t *ffs = NULL;
+    zan_type_t *recv_type = NULL;
+    zan_type_t *value_type = NULL;
     if (rhs && rhs->kind == AST_MEMBER_ACCESS && !rhs->member.null_cond) {
         cls = expr_class_sym(g, rhs->member.object, locals);
         if (cls) {
             ffs = get_field_sym(cls, rhs->member.name);
             if (ffs && field_member_is_static(ffs)) ffs = NULL;
-            if (ffs && !ffs->type) ffs = NULL;
-            if (ffs && T && ffs->type->kind != T->kind) ffs = NULL;
+            /* A non-owning object slot cannot expose a writable accessor that
+             * accepts owned temporaries through Binding<object>.Set. */
+            if (field_is_binding_target(ffs)) ffs = NULL;
+            /* Getter-only and init-only properties are value snapshots. */
+            if (ffs && ffs->kind == SYM_PROPERTY && ffs->decl &&
+                (!ffs->decl->field_decl.has_getter ||
+                 !ffs->decl->field_decl.has_setter)) ffs = NULL;
+            /* A Binding can escape even when created in a constructor, so a
+             * readonly field must never export a writable accessor. */
+            if (ffs && ffs->kind == SYM_FIELD && ffs->decl &&
+                (ffs->decl->field_decl.modifiers & MOD_READONLY)) ffs = NULL;
+            recv_type = concretize(g,
+                infer_expr_type(g, rhs->member.object, locals));
+            /* Generic this can carry the declaration's zero-argument type. */
+            if (recv_type && g->cur_inst && recv_type->sym == g->cur_inst->sym &&
+                is_user_generic_sym(recv_type->sym) &&
+                recv_type->type_arg_count == 0) recv_type = g->cur_inst;
+            if (ffs) value_type = field_store_type(g, ffs, recv_type);
+            if (ffs && !value_type) ffs = NULL;
+            if (ffs && T && value_type->kind != concretize(g, T)->kind) ffs = NULL;
             /* 绑定目标使用非持有弱引用，防止双向绑定循环引用导致内存泄漏 */
             if (ffs) {
                 zan_type_t *ot = infer_expr_type(g, rhs->member.object, locals);
@@ -193,7 +248,9 @@ LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
     }
     LLVMValueRef get_fn = NULL, set_fn = NULL;
     if (ffs) {
-        get_binding_accessors(g, cls, ffs, &get_fn, &set_fn);
+        get_binding_accessors(g, cls, ffs, recv_type, value_type,
+                              rhs->member.object->kind == AST_BASE_EXPR,
+                              &get_fn, &set_fn);
         if (!get_fn || !set_fn) ffs = NULL;
     }
 
@@ -422,9 +479,8 @@ void emit_decl_field_initializers(zan_irgen_t *g,
         LLVMTypeRef slot_type = map_type(g, fsym->type);
         value = emit_boundary_coerce(g, value, slot_type);
         if (field_type && (is_rc_managed_type(field_type) || field_type->kind == TYPE_OBJECT)) {
-            emit_rc_store_field(g, field_type, field_ptr, value,
-                                field->field_decl.initializer, locals,
-                                (fsym->modifiers & MOD_WEAK) ? 1 : 0);
+            emit_rc_store_member(g, fsym, field_type, field_ptr, value,
+                                field->field_decl.initializer, locals);
         } else {
             zan_store_fit(g, value, field_ptr);
         }
@@ -690,6 +746,13 @@ LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
      * 泄漏第一个，还会把箱首字 vtable 当字段 0 装进载荷。 */
     if (irgen_expr_was_boxed(g, rhs)) return val;
     zan_type_t *st = infer_expr_type(g, rhs, locals);
+    if (st && st->kind == TYPE_DELEGATE) {
+        bool transfer_owned = expr_yields_owned_rc_value(g, rhs, locals) ||
+                              expr_yields_delegate_value(g, rhs, locals);
+        val = emit_delegate_erasure(g, st, val, rhs->loc, transfer_owned);
+        irgen_note_boxed_expr(g, rhs);
+        return val;
+    }
     bool boxable = st && st->kind == TYPE_STRUCT &&
         irgen_boxed_eligible_struct(g, st);
     /* 指针形值一般是引用形状（类/串/数组/集合），无需装箱；唯一例外是

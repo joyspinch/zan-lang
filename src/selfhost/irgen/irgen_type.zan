@@ -15,8 +15,8 @@ partial class Irgen {
         if (IsErasedType(t)) { return "i64"; }
         if (n == "void") { return "void"; }
         if (n == "string") { return "i8*"; }
-        // A487: decimal 保留类型名（checker 按名分流），发射仍是 double。
-        if (n == "double" || n == "float" || n == "decimal") { return "double"; }
+        if (n == "decimal") { return DecimalLL(); }
+        if (n == "double" || n == "float") { return "double"; }
         if (n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte" || n == "nint") { return "i64"; }
         if (n == "object" || n == "var") { return "i8*"; }
         if (n == "List" || n == "Dictionary" || n == "Dict") { return "i8*"; }
@@ -47,7 +47,8 @@ partial class Irgen {
         if (IsErasedType(t)) { return "i64"; }
         if (n == "void") { return "void"; }
         if (n == "string") { return "i8*"; }
-        if (n == "double" || n == "decimal") { return "double"; }
+        if (n == "decimal") { return DecimalLL(); }
+        if (n == "double") { return "double"; }
         if (n == "float") { return "float"; }
         if (n == "bool") { return "i8"; }
         if (n == "byte" || n == "sbyte") { return "i8"; }
@@ -112,6 +113,7 @@ partial class Irgen {
         if (n == "byte" || n == "sbyte" || n == "bool" || n == "char") { return "i8"; }
         if (n == "short" || n == "ushort") { return "i16"; }
         if (n == "int" || n == "uint") { return "i32"; }
+        if (n == "decimal") { return DecimalLL(); }
         if (n == "double") { return "double"; }
         if (n == "float") { return "float"; }
         if (el != null && IsStructTy(el)) { return "%" + n; }
@@ -195,9 +197,9 @@ partial class Irgen {
     void EmitTid(Node d) {
         Node bt = BaseClassOf(d);
         if (bt != null) {
-            H("@__tid_" + d.sval + " = global i8* bitcast (i8** @__tid_" + bt.sval + " to i8*)");
+            H("@__tid_" + d.sval + " = global i8* bitcast (i8** @__tid_" + bt.sval + " to i8*), align 8");
         } else {
-            H("@__tid_" + d.sval + " = global i8* null");
+            H("@__tid_" + d.sval + " = global i8* null, align 8");
         }
         tidNames.Add(d.sval);
     }
@@ -238,13 +240,13 @@ partial class Irgen {
         while (i < cs.Count) {
             string cn = cs[i];
             if (binder.FindType(cn) == null) {
-                H("@__tid_" + cn + " = global i8* null");
+                H("@__tid_" + cn + " = global i8* null, align 8");
                 tidNames.Add(cn);
             }
             i = i + 1;
         }
         if (!Contains(tidNames, "Exception") && binder.FindType("Exception") == null) {
-            H("@__tid_Exception = global i8* null");
+            H("@__tid_Exception = global i8* null, align 8");
             tidNames.Add("Exception");
         }
         List<string> bExcs = new List<string>();
@@ -258,7 +260,7 @@ partial class Irgen {
         while (bei < bExcs.Count) {
             string ben = bExcs[bei];
             if (!Contains(tidNames, ben) && binder.FindType(ben) == null) {
-                H("@__tid_" + ben + " = global i8* bitcast (i8** @__tid_Exception to i8*)");
+                H("@__tid_" + ben + " = global i8* bitcast (i8** @__tid_Exception to i8*), align 8");
                 tidNames.Add(ben);
             }
             bei = bei + 1;
@@ -431,6 +433,7 @@ partial class Irgen {
 
     // byte size of a lowered type: a capture cell holds exactly one value
     int TypeSizeBytes(string lt) {
+        if (lt == DecimalLL()) { return 16; }
         if (lt == "i1" || lt == "i8") { return 1; }
         if (lt == "i16") { return 2; }
         if (lt == "i32" || lt == "float") { return 4; }
@@ -447,13 +450,13 @@ partial class Irgen {
     string BoxLocal(int li) {
         Node ty = locType[li];
         string lt = MapType(ty);
-        string cell = NT();
-        L("  " + cell + " = call i8* @malloc(i64 " + TypeSizeBytes(lt) + ")");
+        string cell = OwnedCell(ty);
         string p = NT();
         L("  " + p + " = bitcast i8* " + cell + " to " + lt + "*");
         locReg[li] = p;
         locBox[li] = true;
         locCell[li] = cell;
+        ArmLocalCell(li);
         return p;
     }
 
@@ -493,13 +496,13 @@ partial class Irgen {
         // managed string header in front of the payload: [i64 cid][i64 len]
         // [i64 magic] -- the same 24-byte shape as an object header, so the
         // runtime type test can read the class-id slot of any heap value
-        string hdr = HexI64LE(0) + HexI64LE(bytes.Count) + "\\54\\53\\4E\\5A\\00\\00\\00\\00";
+        string hdr = "\\FF\\FF\\FF\\FF\\FF\\FF\\FF\\FF" + HexI64LE(0) + HexI64LE(bytes.Count) + "\\54\\53\\4E\\5A\\00\\00\\00\\00";
         strn = strn + 1;
         string g = "@.s" + strn;
-        int tlen = 24 + blen;
-        H(g + " = private unnamed_addr constant [" + tlen + " x i8] c\"" + hdr + bodytxt + "\"");
+        int tlen = 32 + blen;
+        H(g + " = private unnamed_addr constant [" + tlen + " x i8] c\"" + hdr + bodytxt + "\", align 8");
         string t = NT();
-        L("  " + t + " = getelementptr inbounds [" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 24");
+        L("  " + t + " = getelementptr inbounds [" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 32");
         return new ExprVal(t, MkType("string"));
     }
 

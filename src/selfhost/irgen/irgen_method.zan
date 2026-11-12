@@ -12,6 +12,7 @@ partial class Irgen {
         curMethodNode = m;
         if (IsAsync(m)) { GenAsyncMethod(cls, m); curMethodNode = prevMethod; return; }
         StartFn();
+        PreScanLabelDepths(m.d, 0);
         // a closure in this method may capture the method's locals: the names
         // it mentions have to live in a cell
         CollectCapturedNames(m.d, capNames);
@@ -67,7 +68,7 @@ partial class Irgen {
                 // to live in a cell
                 preg = BoxLocal(locName.Count - 1);
             } else {
-                L("  " + preg + " = alloca " + lt);
+                EA(preg, lt);
             }
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
             EmitArcRetain("%p" + j, pt[j]);
@@ -135,7 +136,7 @@ partial class Irgen {
             if (ShouldBox(pn[j])) {
                 preg = BoxLocal(locName.Count - 1);
             } else {
-                L("  " + preg + " = alloca " + lt);
+                EA(preg, lt);
             }
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
             EmitArcRetain("%p" + j, pt[j]);
@@ -344,6 +345,7 @@ partial class Irgen {
         string rsp = NT(); L("  " + rsp + " = load i64, i64* @__exc_sp");
         string rslot = NT(); L("  " + rslot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + rsp);
         L("  store i8* " + rbp + ", i8** " + rslot);
+        EmitPendingHandlerMark(rsp);
         string rsp1 = NT(); L("  " + rsp1 + " = add i64 " + rsp + ", 1");
         L("  store i64 " + rsp1 + ", i64* @__exc_sp");
         string rr = NT(); L("  " + rr + " = call i32 @_setjmp(i8* " + rbp + ", i8* null)");
@@ -365,19 +367,21 @@ partial class Irgen {
             string rf = NT(); L("  " + rf + " = inttoptr i64 " + rs + " to void(i8*)*");
             L("  call void @zan_co_ready(i8* " + fr + ", void(i8*)* " + rf + ")");
             L("  call void @zan_co_sched_run()");
+            string mainHeader = NT(); L("  " + mainHeader + " = bitcast i8* " + fr + " to i64*");
+            EmitAwaitCheckExc(mainHeader);
             string mrt = MapType(mainMeth.type);
             if (mrt == "void") {
                 // The awaiter owns the frame: release it once the coroutine
                 // is done. An exception unwinds the frame through its own
                 // cleanup (which frees it), so this path is completion only.
-                L("  call void @__zan_co_frame_free(i8* " + fr + ")");
+                L("  call void @zexc_frame_free(i8* " + fr + ")");
                 L("  ret i32 0");
             } else {
                 // read the result before the frame is released
                 string fh = NT(); L("  " + fh + " = bitcast i8* " + fr + " to i64*");
                 string rp = FrameGep(fh, 6);
                 string ri = NT(); L("  " + ri + " = load i64, i64* " + rp);
-                L("  call void @__zan_co_frame_free(i8* " + fr + ")");
+                L("  call void @zexc_frame_free(i8* " + fr + ")");
                 string r32 = NT(); L("  " + r32 + " = trunc i64 " + ri + " to i32");
                 L("  ret i32 " + r32);
             }
@@ -389,8 +393,24 @@ partial class Irgen {
         string mp = NT(); L("  " + mp + " = getelementptr inbounds [25 x i8], [25 x i8]* @.msg.unhandled, i64 0, i64 0");
         string xv = NT(); L("  " + xv + " = load i8*, i8** @__exc_val");
         string xn = NT(); L("  " + xn + " = icmp eq i8* " + xv + ", null");
-        string xm = NT(); L("  " + xm + " = select i1 " + xn + ", i8* getelementptr inbounds ([13 x i8], [13 x i8]* @.msg.exnil, i64 0, i64 0), i8* " + xv);
+        int lmsg_null = NL();
+        int lmsg_ok = NL();
+        int lmsg_done = NL();
+        L("  br i1 " + xn + ", label %L" + lmsg_null + ", label %L" + lmsg_ok);
+        Label(lmsg_ok);
+        string xvp = NT(); L("  " + xvp + " = bitcast i8* " + xv + " to i8**");
+        string mslot = NT(); L("  " + mslot + " = getelementptr i8*, i8** " + xvp + ", i64 1");
+        string mval = NT(); L("  " + mval + " = load i8*, i8** " + mslot);
+        string mn = NT(); L("  " + mn + " = icmp eq i8* " + mval + ", null");
+        string mx = NT(); L("  " + mx + " = select i1 " + mn + ", i8* getelementptr inbounds ([13 x i8], [13 x i8]* @.msg.exnil, i64 0, i64 0), i8* " + mval);
+        L("  br label %L" + lmsg_done);
+        Label(lmsg_null);
+        string mnil = NT(); L("  " + mnil + " = getelementptr inbounds [13 x i8], [13 x i8]* @.msg.exnil, i64 0, i64 0");
+        L("  br label %L" + lmsg_done);
+        Label(lmsg_done);
+        string xm = NT(); L("  " + xm + " = phi i8* [ " + mx + ", %L" + lmsg_ok + " ], [ " + mnil + ", %L" + lmsg_null + " ]");
         L("  call i32 (i8*, ...) @printf(i8* " + mp + ", i8* " + xm + ")");
+        L("  call void @zexc_drop(%zan.exception* @zexc_dispatch)");
         L("  ret i32 1");
         L("}");
         obody.Append(entryAllocas.ToString());

@@ -1,0 +1,237 @@
+using System;
+using System.Data;
+using System.Threading;
+
+// Close releases the physical resource before reporting its cleanup error.
+class CleanupConnection : IDbConnection {
+    public int id;
+    public bool alive = true;
+    public bool invalid = false;
+    public bool throws = false;
+    public bool probeThrows = false;
+    public int closes = 0;
+    public CleanupConnection(int id) { this.id = id; }
+    public DbResult Query(string sql) { return new DbResult(); }
+    public DbResult Query(string sql, DbParams p) { return this.Query(sql); }
+    public int Execute(string sql) { return 0; }
+    public int Execute(string sql, DbParams p) { return 0; }
+    public string ExecuteScalar(string sql) { return this.id.ToString(); }
+    public string ExecuteScalar(string sql, DbParams p) { return this.ExecuteScalar(sql); }
+    public async DbResult QueryAsync(string sql) { return this.Query(sql); }
+    public async DbResult QueryAsync(string sql, DbParams p) { return this.Query(sql); }
+    public async int ExecuteAsync(string sql) { return 0; }
+    public async int ExecuteAsync(string sql, DbParams p) { return 0; }
+    public async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
+    public async string ExecuteScalarAsync(string sql, DbParams p) { return this.ExecuteScalar(sql); }
+    public void BeginTransaction() { }
+    public void Commit() { }
+    public void Rollback() { }
+    public async bool BeginTransactionAsync() { return true; }
+    public async bool CommitAsync() { return true; }
+    public async bool RollbackAsync() { return true; }
+    public bool IsConnected() {
+        if (this.probeThrows) { throw new IOException("probe-" + this.id.ToString()); }
+        return this.alive && !this.invalid;
+    }
+    public void Close() {
+        this.closes = this.closes + 1;
+        this.alive = false;
+        if (this.throws) { throw new InvalidOperationException("close-" + this.id.ToString()); }
+    }
+    public void Dispose() { this.Close(); }
+    public int GetProvider() { return DbProvider.SQLite; }
+}
+
+class CleanupConnector : IDbConnector {
+    public int opened = 0;
+    public int sabotageAt = 0;
+    public int probeFailAt = 0;
+    public int nullAt = 0;
+    public List<CleanupConnection> connections = new List<CleanupConnection>();
+    public async IDbConnection ConnectAsync() {
+        this.opened = this.opened + 1;
+        if (this.opened == this.sabotageAt) {
+            // Previously borrowed resources fail on return; later healthy ones must survive.
+            for (int i = 0; i < 2 && i < this.connections.Count; i = i + 1) {
+                this.connections[i].invalid = true;
+                this.connections[i].throws = true;
+            }
+        }
+        if (this.opened == this.nullAt) { return null; }
+        CleanupConnection c = new CleanupConnection(this.opened);
+        c.probeThrows = this.opened == this.probeFailAt;
+        this.connections.Add(c);
+        return c;
+    }
+    public int GetProvider() { return DbProvider.SQLite; }
+}
+
+class CleanupWaiter {
+    public bool done = false;
+    public bool gotNull = false;
+    public int id = 0;
+    public async void Run(DbPool pool) {
+        IDbConnection c = await pool.AcquireAsync();
+        this.gotNull = c == null;
+        if (c != null) {
+            this.id = int.Parse(c.ExecuteScalar("id"));
+            pool.Release(c);
+        }
+        this.done = true;
+    }
+}
+
+class Program {
+    static int passed = 0;
+    static int failed = 0;
+    static void Check(string label, bool ok) {
+        if (ok) { Program.passed = Program.passed + 1; }
+        else { Program.failed = Program.failed + 1; Console.WriteLine("FAIL " + label); }
+    }
+    static async void WaitRegistered(DbPool pool, int want) {
+        for (int i = 0; i < 200 && pool.WaitingCount() < want; i = i + 1) {
+            await Task.Delay(2);
+        }
+        Program.Check("waiter registered", pool.WaitingCount() == want);
+    }
+    static async void WaitDone(CleanupWaiter waiter) {
+        for (int i = 0; i < 200 && !waiter.done; i = i + 1) { await Task.Delay(2); }
+        Program.Check("waiter completed within bound", waiter.done);
+    }
+    static async void InvalidReturn() {
+        CleanupConnector connector = new CleanupConnector();
+        DbPool pool = new DbPool(connector, 1);
+        CleanupConnection c = (CleanupConnection)(await pool.AcquireAsync());
+        CleanupWaiter waiter = new CleanupWaiter();
+        Task.Spawn(waiter.Run(pool));
+        await Program.WaitRegistered(pool, 1);
+        c.invalid = true;
+        c.throws = true;
+        string error = "";
+        try { pool.Release(c); } catch (Exception ex) { error = ex.Message; }
+        Program.Check("invalid return propagates close error", error == "close-1");
+        Program.Check("invalid return physically closed", !c.alive && c.closes == 1);
+        Program.Check("invalid return freed slot", pool.LiveCount() == 0);
+        await Program.WaitDone(waiter);
+        Program.Check("waiter opened replacement", waiter.id == 2 && connector.opened == 2);
+        Program.Check("replacement counts", pool.LiveCount() == 1 && pool.IdleCount() == 1);
+        Program.Check("waiter count cleared", pool.WaitingCount() == 0);
+        pool.Close();
+        Program.Check("replacement drained", pool.LiveCount() == 0 && pool.IdleCount() == 0);
+    }
+    static async void Shutdown() {
+        CleanupConnector connector = new CleanupConnector();
+        DbPool pool = new DbPool(connector, 2);
+        CleanupConnection a = (CleanupConnection)(await pool.AcquireAsync());
+        CleanupConnection b = (CleanupConnection)(await pool.AcquireAsync());
+        a.throws = true;
+        b.throws = true;
+        pool.Release(a);
+        pool.Release(b);
+        string error = "";
+        bool typed = false;
+        try { pool.Close(); }
+        catch (InvalidOperationException ex) { error = ex.Message; typed = true; }
+        catch (Exception ex) { error = ex.Message; }
+        Program.Check("shutdown preserves first close error and type", typed && error == "close-2");
+        Program.Check("shutdown closes both physical resources", !a.alive && !b.alive);
+        Program.Check("shutdown attempts every idle entry once", a.closes == 1 && b.closes == 1);
+        Program.Check("shutdown drains counts", pool.IdleCount() == 0 && pool.LiveCount() == 0);
+        Program.Check("shutdown marked closed", pool.IsClosed());
+        IDbConnection after = await pool.AcquireAsync();
+        Program.Check("closed acquire returns null", after == null);
+        pool.Close();
+        Program.Check("repeated close does not repeat cleanup", a.closes == 1 && b.closes == 1);
+    }
+    static async void ShutdownWaiters() {
+        CleanupConnector connector = new CleanupConnector();
+        DbPool pool = new DbPool(connector, 1);
+        CleanupConnection c = (CleanupConnection)(await pool.AcquireAsync());
+        CleanupWaiter a = new CleanupWaiter();
+        CleanupWaiter b = new CleanupWaiter();
+        Task.Spawn(a.Run(pool));
+        Task.Spawn(b.Run(pool));
+        await Program.WaitRegistered(pool, 2);
+        pool.Close();
+        await Program.WaitDone(a);
+        await Program.WaitDone(b);
+        Program.Check("shutdown waiters return null", a.gotNull && b.gotNull);
+        Program.Check("shutdown waiter count cleared", pool.WaitingCount() == 0);
+        Program.Check("borrowed slot retained until return", pool.LiveCount() == 1);
+        c.throws = true;
+        string error = "";
+        try { pool.Release(c); } catch (Exception ex) { error = ex.Message; }
+        Program.Check("late return propagates close error", error == "close-1");
+        Program.Check("late return releases slot", pool.LiveCount() == 0 && !c.alive);
+    }
+    static async void WarmupReleaseFailure() {
+        CleanupConnector connector = new CleanupConnector();
+        connector.sabotageAt = 4;
+        DbPool pool = new DbPool(connector, 4);
+        string error = "";
+        bool typed = false;
+        try { await pool.WarmupAsync(4); }
+        catch (InvalidOperationException ex) { error = ex.Message; typed = true; }
+        catch (Exception ex) { error = ex.Message; }
+        Program.Check("warmup return keeps first error and type", typed && error == "close-1");
+        Program.Check("warmup return attempts both failed closes once",
+            connector.connections[0].closes == 1 && connector.connections[1].closes == 1);
+        Program.Check("warmup return releases healthy tail", pool.LiveCount() == 2 && pool.IdleCount() == 2);
+        IDbConnection a = pool.TryAcquire();
+        IDbConnection b = pool.TryAcquire();
+        Program.Check("warmup tail can be borrowed", a != null && b != null && a != b);
+        pool.Release(a);
+        pool.Release(b);
+        pool.Close();
+        Program.Check("warmup return close drains all ownership", pool.LiveCount() == 0 && pool.IdleCount() == 0);
+        Program.Check("warmup return closes every resource once",
+            connector.connections[2].closes == 1 && connector.connections[3].closes == 1);
+    }
+    static async void WarmupAcquireFailure() {
+        CleanupConnector connector = new CleanupConnector();
+        connector.sabotageAt = 4;
+        connector.probeFailAt = 4;
+        DbPool pool = new DbPool(connector, 4);
+        string error = "";
+        bool typed = false;
+        try { await pool.WarmupAsync(4); }
+        catch (IOException ex) { error = ex.Message; typed = true; }
+        catch (Exception ex) { error = ex.Message; }
+        Program.Check("warmup acquire keeps original error and type", typed && error == "probe-4");
+        Program.Check("warmup acquire cleans earlier failures once",
+            connector.connections[0].closes == 1 && connector.connections[1].closes == 1);
+        Program.Check("warmup acquire core cleans rejected open once", connector.connections[3].closes == 1);
+        Program.Check("warmup acquire releases healthy earlier borrow", pool.LiveCount() == 1 && pool.IdleCount() == 1);
+        IDbConnection c = pool.TryAcquire();
+        Program.Check("warmup acquire surviving connection is usable", c != null);
+        pool.Release(c);
+        pool.Close();
+        Program.Check("warmup acquire close drains ownership once",
+            pool.LiveCount() == 0 && pool.IdleCount() == 0 && connector.connections[2].closes == 1);
+    }
+    static async void WarmupPartial() {
+        CleanupConnector connector = new CleanupConnector();
+        connector.nullAt = 3;
+        DbPool pool = new DbPool(connector, 4);
+        int idle = await pool.WarmupAsync(4);
+        Program.Check("warmup null returns partial idle count", idle == 2 && pool.LiveCount() == 2);
+        Program.Check("warmup null releases earlier borrows", pool.IdleCount() == 2);
+        pool.Close();
+        Program.Check("warmup partial close drains once", pool.LiveCount() == 0
+            && connector.connections[0].closes == 1 && connector.connections[1].closes == 1);
+    }
+    static void Main() {
+        // A missed wake must not be hidden by the normal short gate watchdog.
+        PoolWait.GateWaitMs = 2000;
+        PoolWait.MaxGateWaits = 1;
+        PoolWait.PollBudgetMs = 0;
+        await Program.InvalidReturn();
+        await Program.Shutdown();
+        await Program.ShutdownWaiters();
+        await Program.WarmupReleaseFailure();
+        await Program.WarmupAcquireFailure();
+        await Program.WarmupPartial();
+        Console.WriteLine("pass: " + Program.passed.ToString());
+        Console.WriteLine("fail: " + Program.failed.ToString());
+    }
+}

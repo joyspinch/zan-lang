@@ -35,7 +35,7 @@ class Program {
     static async void WsAuth(HttpContext ctx) {
         string auth = ctx.Header("Authorization");
         if (auth != "Bearer tok123") {
-            ctx.Status(401, "denied");
+            ctx.Status(401, "denied").Text("denied");
             return;
         }
         WsSession ws = await WebWs.Upgrade(ctx);
@@ -61,7 +61,7 @@ class Program {
     static async void WsTick(HttpContext ctx) {
         string auth = ctx.Header("Authorization");
         if (auth != "Bearer tok123") {
-            ctx.Status(401, "denied");
+            ctx.Status(401, "denied").Text("denied");
             return;
         }
         WsSession ws = await WebWs.Upgrade(ctx);
@@ -98,6 +98,27 @@ class Program {
         }
     }
 
+    static async bool UnauthorizedUpgradeIs401() {
+        TcpClient conn = await TcpClient.ConnectAsync("127.0.0.1", PORT, 2000);
+        if (conn == null) { return false; }
+        try {
+            string request = "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                + "Sec-WebSocket-Version: 13\r\n\r\n";
+            int sent = await conn.SendAsync(request);
+            if (sent != request.Length) { return false; }
+            string status = "";
+            while (status.Length < 13) {
+                string part = await conn.RecvAsync(128, 2000);
+                if (part == "") { return false; }
+                status = status + part;
+            }
+            return status.StartsWith("HTTP/1.1 401 ");
+        } finally {
+            conn.Close();
+        }
+    }
+
     static async int Run() {
         Socket.Initialize();
         WebApp app = new WebApp("127.0.0.1", PORT);
@@ -110,7 +131,8 @@ class Program {
         // 1a. 无授权头：401 门当在升级前 → 握手失败。
         WebSocketClient bad = await WebSocketClient.ConnectAsync(
             "127.0.0.1", PORT, "/ws");
-        Check(bad != null && !bad.IsConnected(), "no-header handshake rejected");
+        bool unauthorized = await Program.UnauthorizedUpgradeIs401();
+        Check(bad != null && !bad.IsConnected() && unauthorized, "no-header handshake rejected");
 
         // 1b. Bearer 头随握手上线 → 101 + 正常回显。
         List<string> okHeaders = new List<string>();

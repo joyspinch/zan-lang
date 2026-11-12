@@ -267,6 +267,7 @@
                 if (ltype && type_named(ltype, "List", 4)) {
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
+                    int recv_own = emit_intrinsic_own_recv(g, lobj, raw_ptr, locals);
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
                     LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
@@ -296,6 +297,7 @@
                     LLVMBuildBr(g->builder, c_bb);
                     LLVMPositionBuilderAtEnd(g->builder, d_bb);
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), count_ptr);
+                    emit_intrinsic_drop_recv(g, lobj, raw_ptr, locals, recv_own);
                     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
                 }
             }
@@ -380,6 +382,7 @@
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
+                    int recv_own = emit_intrinsic_own_recv(g, lobj, raw_ptr, locals);
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
                     LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
@@ -423,6 +426,7 @@
                     LLVMPositionBuilderAtEnd(g->builder, done_bb);
                     emit_release_owned_call_temp(g, expr->call.args.items[0],
                                                  search, locals);
+                    emit_intrinsic_drop_recv(g, lobj, raw_ptr, locals, recv_own);
                     return LLVMBuildLoad2(g->builder, i64, res, "iofres");
                 }
             }
@@ -438,6 +442,7 @@
                 if (ltype && type_named(ltype, "List", 4)) {
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
+                    int recv_own = emit_intrinsic_own_recv(g, lobj, raw_ptr, locals);
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
                     LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
@@ -482,6 +487,7 @@
                     LLVMPositionBuilderAtEnd(g->builder, done_bb);
                     emit_release_owned_call_temp(g, expr->call.args.items[0],
                                                  search, locals);
+                    emit_intrinsic_drop_recv(g, lobj, raw_ptr, locals, recv_own);
                     return LLVMBuildLoad2(g->builder, i64, res, "liofres");
                 }
             }
@@ -498,6 +504,7 @@
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
+                    int recv_own = emit_intrinsic_own_recv(g, lobj, raw_ptr, locals);
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
                     LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
@@ -541,6 +548,7 @@
                     LLVMPositionBuilderAtEnd(g->builder, done_bb);
                     emit_release_owned_call_temp(g, expr->call.args.items[0],
                                                  search, locals);
+                    emit_intrinsic_drop_recv(g, lobj, raw_ptr, locals, recv_own);
                     return LLVMBuildLoad2(g->builder, LLVMInt32TypeInContext(g->ctx), res, "ctres");
                 }
             }

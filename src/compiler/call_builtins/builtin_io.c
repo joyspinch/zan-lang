@@ -11,7 +11,8 @@
                      rt_ty->kind == TYPE_LONG || rt_ty->kind == TYPE_SBYTE ||
                      rt_ty->kind == TYPE_USHORT || rt_ty->kind == TYPE_UINT ||
                      rt_ty->kind == TYPE_ULONG || rt_ty->kind == TYPE_FLOAT ||
-                     rt_ty->kind == TYPE_DOUBLE || rt_ty->kind == TYPE_CHAR ||
+                     rt_ty->kind == TYPE_DOUBLE || rt_ty->kind == TYPE_DECIMAL ||
+                     rt_ty->kind == TYPE_CHAR ||
                      rt_ty->kind == TYPE_STRING || rt_ty->kind == TYPE_ENUM);
                 if (handled_kind) {
                     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -19,6 +20,8 @@
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMValueRef v = emit_expr(g, sc->member.object, locals);
                     LLVMTypeKind vk = LLVMGetTypeKind(LLVMTypeOf(v));
+                    if (rt_ty->kind == TYPE_DECIMAL)
+                        return emit_to_cstr(g, v);
                     if (rt_ty->kind == TYPE_BOOL && vk == LLVMIntegerTypeKind) {
                         /* 语义类型是 bool 就渲染成 "true"/"false"：泛型方法
                            返回值被提升成 i64 时也要认（按宽度判会渲染成 "1"） */

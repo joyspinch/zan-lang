@@ -1,0 +1,76 @@
+using System;
+
+class BorrowedBindingModel {
+    public string Value = "seed";
+    public int Calls;
+    public Binding<string> Self;
+    public void BindSelf() { Self = Value; }
+}
+class BorrowedBindingWitness { public weak BorrowedBindingModel Seen; }
+class OrdinaryTargetHolder { public object target; }
+class BorrowedBindingTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static string Get(object target) { return ((BorrowedBindingModel)target).Value; }
+    static void Set(object target, string value) {
+        BorrowedBindingModel model = (BorrowedBindingModel)target;
+        model.Value = value;
+        model.Calls = model.Calls + 1;
+    }
+    static void InstallAndDrop(Binding<string> binding, BorrowedBindingWitness witness) {
+        BorrowedBindingModel model = new BorrowedBindingModel();
+        witness.Seen = model;
+        binding.target = model;
+        binding.Set("alive");
+        Check(binding.Get() == "alive", "borrow usable while owner lives");
+    }
+    static void DropAutomaticSelf() {
+        BorrowedBindingModel model = new BorrowedBindingModel();
+        model.BindSelf();
+        model.Self.Set("self");
+        Check(model.Value == "self", "automatic self binding must not retain owner");
+    }
+    static void Main() {
+        BorrowedBindingModel first = new BorrowedBindingModel();
+        BorrowedBindingModel second = new BorrowedBindingModel();
+        Binding<string> binding = new Binding<string>();
+        binding.getter = BorrowedBindingTest.Get;
+        binding.setter = BorrowedBindingTest.Set;
+        binding.live = true;
+        binding.target = first;
+        binding.Set("first");
+        Check(binding.Get() == "first", "first target");
+        binding.target = second;
+        binding.Set("second");
+        binding.Set("again");
+        Check(binding.Get() == "again" && second.Calls == 2 && first.Value == "first", "overwrite and repeated calls");
+        binding.target = binding.target;
+        Check(binding.Get() == "again", "borrow self assignment");
+        Binding<object> snapshot = binding.target;
+        Check(!snapshot.IsLive() && snapshot.Get() == second, "borrowed target is a constant snapshot");
+        snapshot.Set(new BorrowedBindingModel());
+        Check(binding.target == second, "snapshot setter cannot forge temporary borrowed target");
+        binding.target = null;
+        binding.target = first;
+        Check(binding.Get() == "first", "clear then replace");
+        Binding<string> initialized = new Binding<string> { target = second };
+        Check(initialized.target == second, "object initializer target");
+        initialized.target = null;
+        Binding<string> automatic = first.Value;
+        automatic.target = second;
+        automatic.Set("automatic");
+        Check(second.Value == "automatic" && first.Value == "first", "overwrite synthesized borrowed target");
+        automatic.target = null;
+        BorrowedBindingWitness witness = new BorrowedBindingWitness();
+        InstallAndDrop(binding, witness);
+        Check(witness.Seen == null, "explicit target must not retain owner");
+        // Non-owning object target is not tracked weak: do not Get/Set after the
+        // owner dies. Clearing the stale borrow must not release its old value.
+        binding.target = null;
+        OrdinaryTargetHolder ordinary = new OrdinaryTargetHolder();
+        ordinary.target = first;
+        Check(ordinary.target == first, "unrelated object target remains ordinary strong storage");
+        ordinary.target = null;
+        DropAutomaticSelf();
+        Console.WriteLine("BINDING_TARGET_BORROWED_OK");
+    }
+}

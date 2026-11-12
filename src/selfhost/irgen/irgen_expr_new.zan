@@ -92,7 +92,7 @@ partial class Irgen {
                 }
                 return new ExprVal(v0, el);
             }
-            if (ity == "i64") { return new ExprVal(v0, el); }
+            if (ity == "i64" || IsDecimal(el)) { return new ExprVal(v0, el); }
             string w = NT();
             string ext = "sext";
             if (SpanZext(el)) { ext = "zext"; }
@@ -177,6 +177,9 @@ partial class Irgen {
             L("  " + safe + " = select i1 " + oob + ", i64 0, i64 " + flat);
             abase = bsel;
             flat = safe;
+        }
+        if (IsDecimal(elemTy2)) {
+            return DecimalLoad(DecimalArrayPlace(abase, flat));
         }
         if (esz2 == 1) {
             // a byte array: one byte per element
@@ -288,30 +291,19 @@ partial class Irgen {
                 // is the number of initializer expressions
                 nsz = new ExprVal("" + nitems, MkType("int"));
             }
-            string bytes = NT();
-            if (esz == 1) { L("  " + bytes + " = add i64 " + nsz.op + ", 0"); }
-            else { L("  " + bytes + " = mul i64 " + nsz.op + ", 8"); }
-            string tot = NT();
-            // the array header is [class id][length] -- the same 24-byte
-            // shape as an object header, so the runtime type test can read
-            // the class-id slot of any heap value
-            L("  " + tot + " = add i64 " + bytes + ", 16");
-            string raw = NT();
-            L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
-            L("  call void @zan_rt_alloc_add(i64 " + tot + ")");
-            string hdr = NT();
-            L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
-            string lenp = NT();
-            L("  " + lenp + " = getelementptr i64, i64* " + hdr + ", i64 1");
-            L("  store i64 " + nsz.op + ", i64* " + lenp);
-            string arr = NT();
-            L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
+            string arr = ArrayAllocate(at, nsz.op);
             if (init) {
                 Node et = elemTy;
                 if (et == null) { et = MkType(ty.sval); }
                 int jn = 0;
                 while (jn < e.kids.Count) {
                     ExprVal iv = GenExpr(e.kids[jn]);
+                    if (IsDecimal(et)) {
+                        string dp = DecimalArrayPlace(arr, "" + jn);
+                        L("  store " + DecimalLL() + " " + ToDecimal(iv).op + ", " + DecimalLL() + "* " + dp);
+                        jn = jn + 1;
+                        continue;
+                    }
                     string sv = "";
                     if (IsNullableValue(et)) {
                         // a nullable element is a pointer slot: box the value
@@ -319,8 +311,10 @@ partial class Irgen {
                         string bi = NT();
                         L("  " + bi + " = ptrtoint i8* " + bx + " to i64");
                         sv = bi;
+                        ArrayElementRetain(sv, et);
                     } else {
-                        sv = StructElemSlot(iv, et);
+                        sv = ArrayElementSlot(iv, et);
+                        ArrayElementRetain(sv, et);
                     }
                     if (esz == 1) {
                         string ab = NT();
@@ -334,7 +328,7 @@ partial class Irgen {
                         string ep = arr;
                         if (jn > 0) {
                             ep = NT();
-                            L("  " + ep + " = getelementptr i64, i64* " + hdr + ", i64 " + (jn + 2));
+                            L("  " + ep + " = getelementptr i64, i64* " + arr + ", i64 " + jn);
                         }
                         L("  store i64 " + sv + ", i64* " + ep);
                     }
@@ -350,11 +344,13 @@ partial class Irgen {
                     L("  call void @" + et3.sval + "_initarr(i64* " + arr + ", i64 " + nsz.op + ")");
                 }
             }
+            AddTemp(arr, at2);
             return new ExprVal(arr, at2);
         }
         if (IsListType(ty)) {
             string t = NT();
-            string ow = "0"; if (ArcManaged(ListElem(ty))) { ow = "1"; }
+            string ow = "0"; if (ArcManaged(ListElem(ty)) || IsDecimal(ListElem(ty))) { ow = "1"; }
+            if (IsDelegate(ListElem(ty))) { ow = "2"; }
             L("  " + t + " = call i8* @zlist_new(i64 " + ow + ")");
             if (e.ival == 2) {
                 // collection initializer: append each item
@@ -395,7 +391,8 @@ partial class Irgen {
         }
         if (IsDictType(ty)) {
             string t = NT();
-            string ow = "0"; if (ArcManaged(DictVal(ty))) { ow = "1"; }
+            string ow = "0"; if (ArcManaged(DictVal(ty)) || IsDecimal(DictVal(ty))) { ow = "1"; }
+            if (IsDelegate(DictVal(ty))) { ow = "2"; }
             L("  " + t + " = call i8* @zdict_new(i64 " + ow + ")");
             if (e.ival == 2) {
                 // collection initializer: each item is a key/value pair.
@@ -705,6 +702,7 @@ partial class Irgen {
         L("  store i8* null, i8** " + f2);
         L("  store i8* bitcast (i8** @__tid_" + tidName + " to i8*), i8** @__exc_tid");
         L("  store i8* " + raw + ", i8** @__exc_val");
+        L("  call void @zexc_publish(i8* " + raw + ", i8* bitcast (i8** @__tid_" + tidName + " to i8*), i64 1, i64 1)");
         EmitRaise();
     }
 

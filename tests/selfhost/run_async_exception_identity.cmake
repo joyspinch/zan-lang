@@ -1,0 +1,77 @@
+# Run under the shared build gate. This oracle checks language semantics,
+# including cases where the C bootstrap's exception lowering is not the oracle.
+if(NOT GEN1 OR NOT CLANG OR NOT OUTDIR OR NOT LLVM_AS)
+  message(FATAL_ERROR "GEN1, CLANG, LLVM_AS and OUTDIR are required")
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/exception_ownership_provenance.cmake")
+ownership_pin_stdlib()
+file(MAKE_DIRECTORY "${OUTDIR}")
+file(REMOVE "${OUTDIR}/async_exception_identity.ll"
+  "${OUTDIR}/identity.bc" "${OUTDIR}/async_exception_identity.exe"
+  "${OUTDIR}/async_exception_identity${CMAKE_EXECUTABLE_SUFFIX}")
+if(NOT IDENTITY_CASE)
+  set(IDENTITY_CASE async_exception_identity)
+endif()
+set(_src "${CMAKE_CURRENT_LIST_DIR}/${IDENTITY_CASE}.zan")
+set(_gold "${CMAKE_CURRENT_LIST_DIR}/${IDENTITY_CASE}.out")
+set(_inputs "${GEN1}" "${CLANG}" "${LLVM_AS}" ${RT_OBJS} "${_src}" "${_gold}" "${CMAKE_CURRENT_LIST_FILE}")
+if(IDENTITY_CASE STREQUAL "async_exception_identity")
+  list(APPEND _inputs "${CMAKE_CURRENT_LIST_DIR}/async_exception_natural.zan"
+    "${CMAKE_CURRENT_LIST_DIR}/async_exception_natural.out")
+endif()
+foreach(_lib IN LISTS SYSLIBS)
+  if(EXISTS "${_lib}" AND NOT IS_DIRECTORY "${_lib}")
+    list(APPEND _inputs "${_lib}")
+  endif()
+endforeach()
+ownership_capture(before _before)
+set(_ll "${OUTDIR}/async_exception_identity.ll")
+set(_exe "${OUTDIR}/async_exception_identity${CMAKE_EXECUTABLE_SUFFIX}")
+if(WIN32)
+  set(_exe "${OUTDIR}/async_exception_identity.exe")
+endif()
+execute_process(COMMAND "${GEN1}" "${_ll}" "${_src}"
+  WORKING_DIRECTORY "${OWNERSHIP_WORKDIR}"
+  RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 120)
+file(WRITE "${OUTDIR}/emit.log" "exit=${_rc}\n${_out}${_err}")
+if(NOT _rc STREQUAL "0")
+  message(FATAL_ERROR "Identity emit failed: ${_rc}\n${_out}${_err}")
+endif()
+execute_process(COMMAND "${LLVM_AS}" "${_ll}" -o "${OUTDIR}/identity.bc"
+  RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 120)
+file(WRITE "${OUTDIR}/verify.log" "exit=${_rc}\n${_out}${_err}")
+if(NOT _rc STREQUAL "0")
+  message(FATAL_ERROR "Identity LLVM verifier failed: ${_rc}\n${_out}${_err}")
+endif()
+execute_process(COMMAND "${CLANG}" "${_ll}" ${RT_OBJS} ${SYSLIBS} -o "${_exe}"
+  RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 120)
+file(WRITE "${OUTDIR}/link.log" "exit=${_rc}\n${_out}${_err}")
+if(NOT _rc STREQUAL "0")
+  message(FATAL_ERROR "Identity link failed: ${_rc}\n${_out}${_err}")
+endif()
+execute_process(COMMAND "${_exe}" RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 15)
+file(WRITE "${OUTDIR}/stdout" "${_out}")
+file(WRITE "${OUTDIR}/stderr" "${_err}")
+file(READ "${_gold}" _want)
+string(REPLACE "\r\n" "\n" _want "${_want}")
+string(REPLACE "\r\n" "\n" _actual "${_out}")
+if(NOT _rc STREQUAL "0" OR NOT _actual STREQUAL _want OR NOT _err STREQUAL "")
+  message(FATAL_ERROR "Identity trace mismatch: ${_rc}\n${_out}${_err}")
+endif()
+if(IDENTITY_CASE STREQUAL "async_exception_identity")
+  execute_process(COMMAND "${CMAKE_COMMAND}"
+    "-DGEN1=${GEN1}" "-DCLANG=${CLANG}" "-DLLVM_AS=${LLVM_AS}"
+    "-DSTDLIB_ROOT=${STDLIB_ROOT}"
+    "-DOUTDIR=${OUTDIR}/natural" "-DRT_OBJS=${RT_OBJS}" "-DSYSLIBS=${SYSLIBS}"
+    -DIDENTITY_CASE=async_exception_natural -P "${CMAKE_CURRENT_LIST_FILE}"
+    RESULT_VARIABLE _natural_rc OUTPUT_VARIABLE _natural_out ERROR_VARIABLE _natural_err)
+  if(NOT _natural_rc STREQUAL "0")
+    message(FATAL_ERROR "Natural lifetime regression failed\n${_natural_out}${_natural_err}")
+  endif()
+  message(STATUS "${_natural_out}")
+endif()
+ownership_capture(after _after)
+if(NOT _before STREQUAL _after)
+  message(FATAL_ERROR "Identity validation input drift")
+endif()
+message(STATUS "${IDENTITY_CASE}: exact trace and LLVM verification match")

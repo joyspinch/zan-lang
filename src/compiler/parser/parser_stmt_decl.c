@@ -270,7 +270,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             while (q < n && ZAN_GA_WS(s[q])) q++;
             while (q < n && s[q] == '[') {
                 size_t r = q + 1;
-                while (r < n && ZAN_GA_WS(s[r])) r++;
+                while (r < n && (ZAN_GA_WS(s[r]) || s[r] == ',')) r++;
                 if (r >= n || s[r] != ']') return false;
                 q = r + 1;
                 while (q < n && ZAN_GA_WS(s[q])) q++;
@@ -311,7 +311,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             }
             if (q < n && s[q] == '[') {
                 size_t r = q + 1;
-                while (r < n && ZAN_WS(s[r])) r++;
+                while (r < n && (ZAN_WS(s[r]) || s[r] == ',')) r++;
                 if (r < n && s[r] == ']') return true;
                 return false;
             }
@@ -399,7 +399,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             if (q < n && s[q] == '[') {
                 q++;
                 while (q < n && (s[q] == ' ' || s[q] == '\t' ||
-                                 s[q] == '\r' || s[q] == '\n')) q++;
+                                 s[q] == '\r' || s[q] == '\n' || s[q] == ',')) q++;
                 if (q < n && s[q] == ']') return true;
             }
         }

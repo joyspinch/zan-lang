@@ -1,0 +1,141 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Net.Http.Hpack;
+using System.Net.Http.Http2;
+using System.Threading;
+
+class Http2ServerSecurity {
+    public ByteBuffer input;
+    public ByteBuffer output;
+    public int calls;
+    public int position;
+    public int readCalls;
+    public int waitReads;
+    public Http2ServerSecurity() {
+        this.input = ByteBuffer.Alloc(1024);
+        this.output = ByteBuffer.Alloc(1024);
+    }
+    public async int Recv(string buffer, int capacity) {
+        this.readCalls = this.readCalls + 1;
+        if (this.position >= this.input.Length()) {
+            return 0;
+        }
+        int size = this.input.Length() - this.position;
+        if (size > capacity) { size = capacity; }
+        if (size <= 0) { return 0; }
+        NativeMemory.Copy((nint)buffer, this.input.data + this.position, size);
+        this.position = this.position + size;
+        return size;
+    }
+    public async int Send(byte[] data, int length) {
+        // Exercise partial writes: return at most three bytes each time.
+        int count = length > 3 ? 3 : length;
+        this.output.WriteBytes(data, 0, count);
+        return count;
+    }
+    public async HttpResponse Handle(HttpRequest request) {
+        this.calls = this.calls + 1;
+        return HttpResponse.Ok("ok");
+    }
+    public void Add(byte[] data, int length) { this.input.WriteBytes(data, 0, length); }
+    public void Start(bool zeroWindow) {
+        this.input.WriteRaw("SM\r\n\r\n", 6);
+        byte[] hdr = Http2Frame.EncodeHeader(zeroWindow ? 6 : 0, Http2FrameType.SETTINGS, 0, 0);
+        this.Add(hdr, 9);
+        if (zeroWindow) {
+            byte[] setting = new byte[6];
+            setting[1] = 4;
+            this.Add(setting, 6);
+        }
+    }
+    public void Headers(int streamId, int flags, string length) {
+        List<HpackHeader> headers = new List<HpackHeader>();
+        headers.Add(new HpackHeader(":method", "POST"));
+        headers.Add(new HpackHeader(":scheme", "http"));
+        headers.Add(new HpackHeader(":path", "/"));
+        headers.Add(new HpackHeader(":authority", "example.org"));
+        if (length != "") { headers.Add(new HpackHeader("content-length", length)); }
+        HpackContext context = new HpackContext(0);
+        byte[] block = context.EncodeHeaders(headers, false);
+        byte[] hdr = Http2Frame.EncodeHeader(block.Length, Http2FrameType.HEADERS, flags | Http2Flags.END_HEADERS, streamId);
+        this.Add(hdr, 9);
+        this.Add(block, block.Length);
+    }
+    public async int Run(int headers, int body) {
+        HttpFramer framer = new HttpFramer();
+        framer.buf = TcpClient.RentRecvBuffer(1024);
+        framer.bufCap = 1024;
+        framer.pend = ByteBuffer.Alloc(1024);
+        framer.recv = this.Recv;
+        Http2ServerConnection connection = new Http2ServerConnection(framer, this.Handle, this.Send);
+        connection.maxHeaderBytes = headers;
+        connection.maxRequestBytes = body;
+        int result = await connection.RunAsync();
+        framer.Dispose();
+        await Task.Delay(5);
+        return result;
+    }
+    public int Count(int type) {
+        int p = 0;
+        int count = 0;
+
+        byte[] wire = this.output.ToCStringBytes();
+        while (p < this.output.Length()) {
+            Http2Frame frame = Http2Frame.DecodeHeader(wire, p);
+            if (frame == null || frame.length > this.output.Length() - p - 9) { throw new IOException("Corrupt partial-write output"); }
+            if (frame.type == type) { count = count + 1; }
+
+            p = p + 9 + frame.length;
+        }
+        return count;
+    }
+    public void Dispose() { this.input.Free(); this.output.Free(); }
+    static void Check(bool result, string name) { if (!result) { throw new IOException("FAIL " + name); } }
+    static async int RunAll() {
+        Http2ServerSecurity peer = new Http2ServerSecurity();
+        peer.Start(false);
+        byte[] oversized = Http2Frame.EncodeHeader(16777215, Http2FrameType.DATA, 0, 1);
+        peer.Add(oversized, 9);
+        await peer.Run(4096, 1024);
+        Check(peer.calls == 0 && peer.Count(Http2FrameType.GOAWAY) == 1 && peer.readCalls == 3, "oversize rejected before payload read");
+        peer.Dispose();
+        Console.WriteLine("HTTP2 server rejects oversized frames before payload receive");
+
+        peer = new Http2ServerSecurity();
+        peer.Start(false);
+        peer.Headers(1, Http2Flags.END_STREAM, "1");
+        await peer.Run(4096, 1024);
+        Check(peer.calls == 0 && peer.Count(Http2FrameType.GOAWAY) == 1, "short declared body rejected");
+        peer.Dispose();
+        peer = new Http2ServerSecurity();
+        peer.Start(false);
+        peer.Headers(1, 0, "2048");
+        await peer.Run(4096, 1024);
+        Check(peer.calls == 0 && peer.Count(Http2FrameType.GOAWAY) == 1, "configured request budget enforced");
+        peer.Dispose();
+        Console.WriteLine("HTTP2 server enforces content-length and configured budgets");
+
+        peer = new Http2ServerSecurity();
+        peer.Start(false);
+        peer.Headers(1, 0, "");
+        peer.Headers(1, 0, "");
+        await peer.Run(4096, 1024);
+        Check(peer.calls == 0 && peer.Count(Http2FrameType.GOAWAY) == 1, "duplicate stream rejected");
+        peer.Dispose();
+        peer = new Http2ServerSecurity();
+        peer.Start(false);
+        for (int i = 0; i < 17; i = i + 1) { peer.Headers(1 + i * 2, 0, ""); }
+        await peer.Run(4096, 1024);
+        Check(peer.calls == 0 && peer.Count(Http2FrameType.GOAWAY) == 1, "active stream limit enforced");
+        peer.Dispose();
+        Console.WriteLine("HTTP2 server rejects reused ids and bounded stream overflow");
+        HpackStaticTable.Teardown();
+        HpackHuffman.Teardown();
+        Console.WriteLine("HTTP2 server security PASS");
+        return 0;
+    }
+    static int Main() { return await Http2ServerSecurity.RunAll(); }
+}

@@ -100,6 +100,14 @@ public partial class Checker {
             if (k == AK.Binary() && n.op == TK.QQ()) { InferType(n); }
             if (k == AK.Assignment()) {
                 CheckClosureCycleWarning(n.a, n.b, n.line, n.col);
+                if (n.a != null && n.a.kind == AK.Index()) {
+                    Node arrayTy = InferType(n.a.a);
+                    if (arrayTy != null && arrayTy.ival >= 1) {
+                        CheckErasedArrayOperation(arrayTy, n.line, n.col);
+                    }
+                }
+                CheckErasedArrayConversion(InferType(n.a), InferType(n.b),
+                    n.b != null && n.b.kind == AK.NullLit(), n.line, n.col);
                 CheckTaskNoResult(InferType(n.a), InferType(n.b), "assignment", n.line, n.col);
             }
             return;
@@ -147,6 +155,7 @@ public partial class Checker {
                 }
             }
             CheckType(n.type);
+            if (n.ival == 1) { CheckErasedArrayOperation(n.type, n.line, n.col); }
             CheckExpr(n.b);
             Node ctor = null;
             bool isDel = false;
@@ -194,12 +203,16 @@ public partial class Checker {
             Node prevCastTarget = curTargetType;
             curTargetType = n.type;
             CheckExpr(n.b);
+            CheckErasedArrayConversion(n.type, InferType(n.b),
+                n.b != null && n.b.kind == AK.NullLit(), n.line, n.col);
             curTargetType = prevCastTarget;
             return;
         }
         if (k == AK.AsExpr()) {
             CheckType(n.type);
             CheckExpr(n.a);
+            CheckErasedArrayConversion(n.type, InferType(n.a),
+                n.a != null && n.a.kind == AK.NullLit(), n.line, n.col);
             return;
         }
         if (k == AK.IsExpr()) {
@@ -402,8 +415,103 @@ public partial class Checker {
         return false;
     }
 
+    bool IsTaskActionCall(Node call) {
+        Node c = call.a;
+        if (c == null || c.kind != AK.MemberAccess() || call.kids.Count != 1) { return false; }
+        return c.a != null && c.a.kind == AK.Ident() && c.a.sval == "Task"
+            && !ScopeHas("Task") && FieldUp(curClass, "Task") == null
+            && MethodUp(curClass, "get_Task") == null
+            && (c.sval == "Run" || c.sval == "Spawn");
+    }
+
+    // Resolve the Action overload explicitly: builtin Task has no declaration
+    // from which the ordinary argument walker can obtain a target type.
+    bool CheckTaskActionMethod(Node arg) {
+        if (arg == null) { return false; }
+        Node owner = null;
+        string name = arg.sval;
+        int receiver = 0; // implicit / type / value
+        if (arg.kind == AK.Ident()) {
+            if (ScopeHas(name)) { return false; }
+            owner = curClass;
+        } else if (arg.kind == AK.MemberAccess()) {
+            owner = StaticRecv(arg.a);
+            receiver = 1;
+            if (owner == null) {
+                owner = ClassOf(InferType(arg.a));
+                receiver = 2;
+            }
+            if (owner == null) { return false; }
+        } else { return false; }
+        Node c = owner;
+        Node selected = null;
+        Node selectedOwner = null;
+        bool found = false;
+        bool badReceiver = false;
+        bool ambiguous = false;
+        int depth = 0;
+        while (c != null && depth < 512) {
+            if (binder.FindField(c, name) != null || binder.FindMethod(c, "get_" + name) != null) { return false; }
+            bool zeroArity = false;
+            bool compatible = false;
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.sval == name && m.kind == AK.MethodDecl()) {
+                    found = true;
+                    int argc = 0;
+                    int tpc = 0;
+                    int j = 0;
+                    while (j < m.kids.Count) {
+                        if (m.kids[j].kind == AK.Param()) { argc = argc + 1; }
+                        if (m.kids[j].kind == AK.TypeParam()) { tpc = tpc + 1; }
+                        j = j + 1;
+                    }
+                    if (argc == 0) { zeroArity = true; }
+                    bool stat = HasMod(m, MOD.Static());
+                    bool recvOk = (receiver == 1 && stat) || (receiver == 2 && !stat)
+                        || (receiver == 0 && (stat || (!curStatic && curMethodNode != null)));
+                    if (recvOk) {
+                        compatible = true;
+                        if (argc == 0 && tpc == 0 && !HasMod(m, MOD.Async())
+                                && m.type != null && m.type.sval == "void" && m.type.ival == 0) {
+                            if (selected != null) { ambiguous = true; }
+                            selected = m;
+                            selectedOwner = c;
+                        }
+                    }
+                } else if (m.sval == name && m.kind == AK.FieldDecl()) { return false; }
+                i = i + 1;
+            }
+            if (selected != null) { break; }
+            if (zeroArity) { badReceiver = !compatible; break; }
+            c = binder.FindType(c.sval2);
+            depth = depth + 1;
+        }
+        if (!found) { return false; }
+        if (arg.kind == AK.MemberAccess()) { CheckObj(arg.a); }
+        if (ambiguous) {
+            diags.Error("Task.Run delegate must resolve to an unambiguous Action method group", arg.line, arg.col);
+        } else if (selected == null) {
+            if (badReceiver) {
+                diags.Error("Task.Run delegate must use a valid receiver: type requires static, value requires instance, implicit instance requires this", arg.line, arg.col);
+            } else {
+                diags.Error("Task.Run delegate must be a parameterless synchronous void method without type parameters", arg.line, arg.col);
+            }
+        } else {
+            arg.resolvedSym = selected;
+            arg.type = MkType("Action");
+            CheckSelectedInternalAccess(selectedOwner, selected, arg);
+        }
+        return true;
+    }
+
     void CheckCall(Node n) {
         Node callee = n.a;
+        // This callee marker is the builtin Task routing decision consumed by
+        // irgen. Reset it on every check; the call's own intrinsic flag has
+        // its ordinary resolved-method meaning.
+        if (callee != null) { callee.isIntrinsic = IsTaskActionCall(n); }
         bool hasNamed = false;
         Node callTargetMethod = null;
         Node callTargetCls = null;
@@ -440,7 +548,16 @@ public partial class Checker {
                 diags.Error("[E3104] cannot convert a lambda to async delegate '" + curTargetType.sval
                     + "': a lambda is not a coroutine; assign an async method group instead", n.kids[i].line, n.kids[i].col);
             }
-            CheckExpr(n.kids[i]);
+            bool taskMethod = false;
+            if (i == 0 && callee != null && callee.isIntrinsic) {
+                taskMethod = CheckTaskActionMethod(n.kids[i]);
+                if (taskMethod || n.kids[i].kind == AK.Lambda()) { curTargetType = MkType("Action"); }
+            }
+            if (!taskMethod) { CheckExpr(n.kids[i]); }
+            if (callTargetMethod != null) {
+                CheckErasedArrayConversion(curTargetType, InferType(n.kids[i]),
+                    n.kids[i] != null && n.kids[i].kind == AK.NullLit(), n.kids[i].line, n.kids[i].col);
+            }
             curTargetType = prevArgTarget;
             i = i + 1;
         }

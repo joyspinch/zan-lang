@@ -10,6 +10,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <errno.h>
 
 #if (defined(__GLIBC__) || defined(__APPLE__)) && !defined(ZAN_NO_EXECINFO)
 #include <execinfo.h>
@@ -162,6 +163,21 @@ static char *zan__crash_put2(char *p, unsigned v) {
     return p + 2;
 }
 
+/* Startup only: create the base before any signal can need it. */
+static int zan__crash_prepare_dir(char *dir) {
+    if (!*dir) return 0;
+    for (size_t i = 1; dir[i]; ++i) {
+        if (dir[i] != '/') continue;
+        dir[i] = 0;
+        int made = mkdir(dir, 0700), err = errno;
+        dir[i] = '/';
+        if (made && err != EEXIST) return 0;
+    }
+    if (mkdir(dir, 0700) && errno != EEXIST) return 0;
+    struct stat st;
+    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode) && access(dir, W_OK) == 0;
+}
+
 static void zan__crash_resolve_paths(void) {
     ssize_t n = -1;
 #if defined(__linux__)
@@ -185,19 +201,32 @@ static void zan__crash_resolve_paths(void) {
     }
 
     const char *env = getenv("ZAN_LOG_DIR");
-    if (env && *env && strlen(env) < sizeof(zan__crash_logdir)) {
-        memcpy(zan__crash_logdir, env, strlen(env) + 1);
-        return;
+    const char *home = getenv("HOME");
+    int len = 0;
+    zan__crash_logdir[0] = 0;
+    if (env && *env) {
+        len = snprintf(zan__crash_logdir, sizeof zan__crash_logdir, "%s", env);
+    } else {
+#if defined(__APPLE__)
+        if (home && home[0] == '/')
+            len = snprintf(zan__crash_logdir, sizeof zan__crash_logdir,
+                           "%s/Library/Caches/Zan/logs", home);
+#else
+        const char *cache = getenv("XDG_CACHE_HOME");
+        if (cache && cache[0] == '/')
+            len = snprintf(zan__crash_logdir, sizeof zan__crash_logdir, "%s/zan/logs", cache);
+        else if (home && home[0] == '/')
+            len = snprintf(zan__crash_logdir, sizeof zan__crash_logdir, "%s/.cache/zan/logs", home);
+#endif
     }
-    /* <exe_dir>/logs */
-    memcpy(zan__crash_logdir, "logs", 5);
-    if (n <= 0) return;
-    char *slash = strrchr(zan__crash_exe, '/');
-    if (!slash) return;
-    size_t dl = (size_t)(slash + 1 - zan__crash_exe);
-    if (dl + 5 >= sizeof(zan__crash_logdir)) return;
-    memcpy(zan__crash_logdir, zan__crash_exe, dl);
-    memcpy(zan__crash_logdir + dl, "logs", 5);
+    if (len > 0 && (size_t)len < sizeof zan__crash_logdir &&
+        zan__crash_prepare_dir(zan__crash_logdir)) return;
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || tmp[0] != '/') tmp = "/tmp";
+    len = snprintf(zan__crash_logdir, sizeof zan__crash_logdir,
+                   "%s/zan-%lu/logs", tmp, (unsigned long)getuid());
+    if (len <= 0 || (size_t)len >= sizeof zan__crash_logdir ||
+        !zan__crash_prepare_dir(zan__crash_logdir)) zan__crash_logdir[0] = 0;
 }
 
 /* <logdir>/{yyyy}{MM}/{dd} */
@@ -223,7 +252,7 @@ static int zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
         p = zan__crash_put2(p, da);
         *p = '\0';
     }
-    if (!month[0] || !day[0]) return 0;
+    if (!month[0] || !day[0] || !zan__crash_logdir[0]) return 0;
     char dir[4096];
     if ((size_t)snprintf(dir, sizeof dir, "%s/%s", zan__crash_logdir, month)
             >= sizeof dir) return 0;

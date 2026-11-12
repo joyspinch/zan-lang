@@ -50,7 +50,7 @@ zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
 }
 
 /* 两支数值提升（infer 侧）：与 checker 的 promote_numeric 同口径——
- * double > float > ulong > long > int，decimal 只与整数合。曾按 then 臂
+ * double > float > ulong > long > nint > int，decimal 只与整数合。曾按 then 臂
  * 返回类型，(t?1:2.0)/2 被推成 int 除法得 0（C# 0.5，TASKS.md A514）。 */
 static zan_type_t *irgen_promote_pair(zan_irgen_t *g, zan_type_t *a,
                                       zan_type_t *b) {
@@ -64,6 +64,7 @@ static zan_type_t *irgen_promote_pair(zan_irgen_t *g, zan_type_t *a,
     if (a->kind == TYPE_FLOAT  || b->kind == TYPE_FLOAT)  return g->binder->type_float;
     if (a->kind == TYPE_ULONG  || b->kind == TYPE_ULONG)  return g->binder->type_ulong;
     if (a->kind == TYPE_LONG   || b->kind == TYPE_LONG)   return g->binder->type_long;
+    if (a->kind == TYPE_NINT   || b->kind == TYPE_NINT)   return g->binder->type_nint;
     if (a->kind == TYPE_UINT   || b->kind == TYPE_UINT)   return g->binder->type_uint;
     int fa = type_family(a);
     int fb = type_family(b);
@@ -450,21 +451,18 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     if (!declared) return g->binder->type_int;
                 }
             }
-            /* string 实例方法启发式——char/Char 的静态类（char.ToUpper 等，
-             * A525）成员名与之相撞（ToUpper/ToLower），先跳过让它落到
-             * 下面的静态内建分支按 Char 表解析。 */
-            int recv_is_char_cls = callee->member.object->kind == AST_IDENTIFIER &&
-                callee->member.object->ident.name.len == 4 &&
-                (memcmp(callee->member.object->ident.name.str, "char", 4) == 0 ||
-                 memcmp(callee->member.object->ident.name.str, "Char", 4) == 0);
-            if (!recv_is_char_cls &&
-                ((mm.len == 9 && memcmp(mm.str, "Substring", 9) == 0) ||
-                (mm.len == 8 && memcmp(mm.str, "ToString", 8) == 0) ||
+            /* A string member name alone is not a return-type contract:
+             * user methods such as async bool Roles.Replace must reach their
+             * declarations before async frame ownership is classified. */
+            if ((mm.len == 9 && memcmp(mm.str, "Substring", 9) == 0) ||
                 (mm.len == 4 && memcmp(mm.str, "Trim", 4) == 0) ||
                 (mm.len == 7 && memcmp(mm.str, "Replace", 7) == 0) ||
                 (mm.len == 7 && memcmp(mm.str, "ToUpper", 7) == 0) ||
-                (mm.len == 7 && memcmp(mm.str, "ToLower", 7) == 0)))
-                return g->binder->type_string;
+                (mm.len == 7 && memcmp(mm.str, "ToLower", 7) == 0)) {
+                zan_type_t *srt = infer_expr_type(g, callee->member.object, locals);
+                if (srt && srt->kind == TYPE_STRING)
+                    return g->binder->type_string;
+            }
             if (mm.len == 5 && memcmp(mm.str, "Split", 5) == 0) {
                 zan_type_t *ot = infer_expr_type(g, callee->member.object, locals);
                 if (ot && ot->kind == TYPE_STRING)
@@ -595,6 +593,12 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                                                      e->call.args.count,
                                                      e, obj, locals);
             if (xm) return method_ret_type_at(g, xm, e, obj, locals);
+            /* Object/scalar ToString remains available without a declaration;
+             * declared static/instance methods above always determine their
+             * own return type, including non-string user ToString overloads. */
+            if (rt && callee->member.name.len == 8 &&
+                memcmp(callee->member.name.str, "ToString", 8) == 0)
+                return g->binder->type_string;
         }
         return NULL;
     }
@@ -668,6 +672,14 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         case TK_GREATER_GREATER_GREATER: {
             zan_type_t *lt = infer_expr_type(g, e->binary.left, locals);
             zan_type_t *rt = infer_expr_type(g, e->binary.right, locals);
+            if (lt && rt && (lt->kind == TYPE_NULLABLE || rt->kind == TYPE_NULLABLE)) {
+                zan_type_t *lb = lt->kind == TYPE_NULLABLE ? lt->element_type : lt;
+                zan_type_t *rb = rt->kind == TYPE_NULLABLE ? rt->element_type : rt;
+                if (lb && rb && (lb->kind == TYPE_DECIMAL || rb->kind == TYPE_DECIMAL)) {
+                    zan_type_t *promoted = irgen_promote_pair(g, lb, rb);
+                    if (promoted) return zan_binder_make_nullable_type(g->binder, promoted);
+                }
+            }
             if (lt && lt->kind == TYPE_NULLABLE) return lt;
             if (rt && rt->kind == TYPE_NULLABLE) return rt;
             if ((lt && lt->kind == TYPE_ULONG) || (rt && rt->kind == TYPE_ULONG))

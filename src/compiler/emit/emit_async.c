@@ -57,6 +57,14 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
             anf_normalize_block(g, member->method_decl.body, &anf_counter);
         }
 
+        /* Frame slot types and ARC ownership must use the same generic
+         * bindings as the resume body that writes those slots. */
+        zan_ast_list_t *scan_saved_mtps = g->cur_mtps;
+        zan_type_t **scan_saved_mbind = g->cur_mbind;
+        zan_type_t *scan_saved_inst = g->cur_inst;
+        g->cur_mtps = w->mtps;
+        g->cur_mbind = w->mbind;
+        g->cur_inst = w->cur_inst;
         async_scan_t scan = { .g = g, .scope =
                               local_scope_new(g->arena) };
         scan.body = member->method_decl.body;
@@ -72,6 +80,9 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         g->current_type_sym = type_sym;
         async_scan_stmt(&scan, member->method_decl.body);
         g->current_type_sym = scan_saved_type;
+        g->cur_mtps = scan_saved_mtps;
+        g->cur_mbind = scan_saved_mbind;
+        g->cur_inst = scan_saved_inst;
         w->await_count = scan.await_count;
         w->alocals = scan.locals;
         w->alocal_count = scan.local_count;
@@ -263,6 +274,19 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_CLEANUP, "cl"));
         LLVMBuildStore(g->builder, resume_fn,
             LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_SELF_STEP, "selfstep"));
+        LLVMValueRef config_args[] = { raw,
+            LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_DONE, "registry.done"),
+            LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_CANCEL, "registry.cancel") };
+        emit_task_runtime_call(g, "zan_task_frame_config", LLVMVoidTypeInContext(g->ctx), config_args, 3);
+        /* Discard the effective result type, matching current_async_ret_type. */
+        zan_type_t *ret_type = concretize(g,
+            member->method_decl.return_type
+                ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
+                : g->binder->type_void);
+        if (ret_type && ret_type->type_arg_count > 0 && is_task_like_type(ret_type)) {
+            ret_type = concretize(g, ret_type->type_args[0]);
+        }
+        emit_task_discard_config(g, raw, ret_type);
         for (int k = 0; k < total_params; k++) {
             LLVMValueRef pv = LLVMGetParam(ramp_fn, (unsigned)k);
             LLVMValueRef slot = LLVMBuildStructGEP2(g->builder, frame_type, rframe,
@@ -527,6 +551,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMBuildStore(g->builder,
             LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)),
             get_async_child_ptr(g));
+        LLVMValueRef clear_edge_args[] = { get_async_self_i8(g), LLVMConstNull(i8ptr) };
+        emit_task_runtime_call(g, "zan_task_child", LLVMVoidTypeInContext(g->ctx), clear_edge_args, 2);
 
         LLVMValueRef cancel_ptr = get_async_cancel_ptr(g);
         LLVMValueRef cancel_val = LLVMBuildLoad2(g->builder, i32, cancel_ptr, "fr.cancelled");
