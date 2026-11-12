@@ -47,6 +47,18 @@ Build and run it: `run_command("build/app")`. Print state at the boundary you
 suspect (`Console.WriteLine`) — cheap and decisive. Note that `Console.Error`
 does not exist; error text also goes through `Console.WriteLine`.
 
+### 字符串、原始字节与可空元数据
+
+- **检 NUL 要在解码前检查原始字节**：Zan 的 `Contains("\0")` 经 C 字符串搜索时，
+  needle 在 NUL 处终止，等同搜索空串，会匹配正常文本；不能用它判断输入是否含零字节。
+  对文件、归档或协议载荷，按实际数据长度检查 `byte[]`，再解码，防止 NUL 后缀被隐藏。
+- **C 字符串与字节缓冲区分别验证边界**：按实际调用的实现和契约确认终止符、显式长度、
+  编码及切片范围；字符串视图能承载字节，不代表后续搜索、拼接或发送仍保留全部字节。
+  涉及两种表示互转时验证 NUL 前后内容与消费长度，不能把某个 API 的结论泛化到所有 API。
+- **业务可空元数据先判空再取成员**：数据库或外部输入中的可选字符串先检查 `!= null`，
+  再读 `.Length` 或调用字符串方法；仅在业务契约允许时把缺席映射为空串或默认值。
+  历史行与 ORM 可空列可能保留 null，构造时赋过默认值也不能证明读回后非空。
+
 ### Crashes with no symbolized stack (the `0xC0000005` ritual)
 
 A native crash (Windows: `build/zan_crash.log` with register dump; `rcx` =

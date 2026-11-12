@@ -92,7 +92,7 @@ stdlib/
 │   ├── Stopwatch.zan                # monotonic clock + elapsed timing (QPC / clock_gettime)
 │   ├── TimeSpan.zan                 # Time span
 │   ├── GC.zan                       # Allocation tracking + memory metrics (A464)
-│   ├── Binding.zan                  # late binding / dynamic dispatch helpers
+│   ├── Binding.zan                  # typed property read/write bindings (Binding<T>)
 │   ├── TaskJoin.zan                 # async task join helpers
 │   ├── ZanVersion.zan               # version constants
 │   │
@@ -301,7 +301,24 @@ static void Delete(string path);
 static void Copy(string source, string dest);
 static void Move(string source, string dest);
 static long GetSize(string path);
+static void FlushToDisk(string path);
 ```
+
+`File.FlushToDisk` synchronizes an existing regular file through `fsync` on POSIX
+or `FlushFileBuffers` on Windows (which requires write access). Flush or close
+all writers first. Missing paths,
+wrong file types and synchronization errors throw `IOException`; unsupported
+backends throw `PlatformNotSupportedException`. It does not synchronize the
+parent directory or promise stronger physical-media behavior than the OS call.
+`Directory.FlushToDisk` synchronizes an existing POSIX directory with `fsync`;
+Windows reports `PlatformNotSupportedException`. Filesystem refusal remains an
+error. These two barriers alone do not make a multi-file update power-loss safe.
+
+`File.IsReparsePoint(path)` detects Windows reparse points and POSIX symbolic
+links, including dangling links. It queries the final path component; callers
+protecting a complete path must also check every ancestor and control concurrent
+directory modification. Missing or unqueryable paths return `false`, so this
+boolean query is not authorization to open or modify a path.
 
 There is no `Stream Open(path, FileMode)` — there is no `FileMode` enum; use
 `FileStream` (`System.IO`) for stream-style access. The `*Async` variants are
@@ -313,8 +330,11 @@ empty/default values:
 
 - `ReadAllText` / `ReadAllLines` / `ReadAllBytes` / `GetSize` / `Copy` (source)
   throw `FileNotFoundException` when the file cannot be opened.
-- `WriteAllText` / `WriteAllLines` / `AppendAllText` / `Copy` (destination)
-  throw `IOException` when the file cannot be opened for writing.
+- `WriteAllText` / `WriteAllBytes` / `WriteAllLines` / `AppendAllText` / `Copy`
+  (destination) throw `IOException` when opening, writing or final buffered close
+  fails. `Copy` also rejects source read errors instead of treating them as EOF.
+  An earlier write/read error takes precedence over a later close failure. Successful
+  close confirms delivery to the OS, not power-loss durability or a disk flush.
 - `Exists` remains a non-throwing boolean probe.
 - `FileNotFoundException` derives from `IOException`, which derives from
   `Exception`, so `catch (IOException e)` and `catch (Exception e)` both work.
@@ -327,7 +347,8 @@ the process with `cannot read file` / `cannot write file` on failure.
 ### 3.5 System.Net.Http
 
 ```csharp
-namespace System.Net.Http;
+// HttpClient: using System.Net.Http.Client;
+// HttpResponse: using System.Net.Http;
 
 class HttpClient {                       // packages/Zan.Net/src/System/Net/Http/Client/HttpClient.zan
     HttpClient(string host, int port);   // host:port base; no base-URL form
@@ -335,7 +356,7 @@ class HttpClient {                       // packages/Zan.Net/src/System/Net/Http
     // configuration (fluent, return this)
     HttpClient UseTls();                 // HTTPS client
     HttpClient DisableTlsVerify();       // self-signed / dev certificates
-    HttpClient SetClientCertificate(string certFile, string keyFile);
+    HttpClient SetClientCertificate(string certFile, string keyFile); // always throws NotSupportedException; mTLS unavailable
     HttpClient SetHeader(string name, string value);   // default request header
     HttpClient SetTimeout(int milliseconds);
     HttpClient PinPublicKey(string spkiSha256Base64);

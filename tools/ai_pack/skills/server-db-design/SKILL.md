@@ -96,3 +96,9 @@ description: 服务端 DB 专属数据层细则——索引选择、两段式分
 - `await` 挂在 `async void` 方法上是火后不理：包装异步库调用的 facade
   方法签名必须 `async bool`/`async int`（调方才真正等得到完成）；
   `async void` 只留给事件/停机钩子出口。
+
+## 十、RR 事务中的幂等重放
+
+修改同键购买或保存点失败恢复时，读
+[RR 保存点与幂等重放](references/repeatable-read-replay.md)：既有 RR 快照不会因
+保存点回滚而可靠刷新；正常查重/恢复都用 current read，并断言每个并发 caller 成功。

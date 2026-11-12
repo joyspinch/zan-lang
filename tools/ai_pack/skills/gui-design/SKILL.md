@@ -18,7 +18,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   状态完整,还原或新写收尾都过一遍)
 - CSS 方言/引擎解析规则全集(选择器/伪元素/单位/已知坑):
   `references/css-dialect.md`(改皮肤或写 CSS 前先查)
-- HTML 窗口开发定式(.html 设计稿五件声明原语、三条建树通道、
+- HTML 窗口开发定式(.html 设计稿五件声明原语、窗口与页面装配、
   所见所得设计器、Nav 出口、游戏帧内边界):
   `references/html-window.md`(写 .html 设计稿窗口前先读)
 - 复杂窗口的迭代过程纪律(先问框架要、加高标题栏三处同步、动效帧调度、
@@ -35,7 +35,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   依据:用户指出两套风格混搭会降低游戏品质。实施与整屏截图验收见
   `game-dev` 的“图形游戏的 Gui 组件必须匹配游戏美术风格”；无需为换外观
   重写控件，布局与交互复用标准 Gui，风格配置集中进游戏皮肤与语义类。
-  游戏内面板间距都走 4 的倍数档位。同屏混排(自绘 HUD + Gui 面板)时,
+  游戏内面板间距都走 4 的倍数档位。同屏混排(世界画布 + Gui HUD/面板)时,
   缩放路径的边界按下文“缩放纪律”划分，字号必须同源。
 - 两范式开发心智模型/控件目录:`docs/agent-kb/gui-development.md`
 - 样式解析规则:`docs/STDLIB_COMPONENT_STANDARDS.md`《附录:取色与取字的统一封装》(Tailwind 原子类引擎已移除,皮肤走语义类 + token)
@@ -152,9 +152,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   **同宽撑条**,容器挂 `display: flex`,要"各宽几像素"的子控件挂
   `flex-grow: 1` —— 剩余宽度平摊到控件本身,余数由引擎给最后一个可增长项
   (两排右缘因此落在同一列);撑条 flex-grow 0 不动,所以**间隙逐条不变**。
-  **坑**:`Panel.Row` 默认走**停靠布局**(`With` = 左停靠),不做剩余
-  空间分配,只按子控件的 `StyleWidth` 摆位 —— 容器没写 `display: flex`
-  时子控件的 `flex-grow` 一点作用都没有(实测踩空一次)。
+  容器使用 Flex 布局时，子项的剩余空间分配按最终 `flex-grow` 计算。
 - 容器边缘:相邻区块共享同一条左边界,面板左 padding 必须同值。
 
 ## 层级与颜色
@@ -213,97 +211,86 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
 未知属性写上去不报错也不生效,收尾自查要过一遍。
 ## HTML 窗口开发定式(硬规则)
 
-**界面一律用 html+css 绘制,不用即时模式自绘**(全仓约定)。
-自绘只在两种情况下例外:① 画布类内容(图表、关系图连线、波形——没有
-对应的声明式控件);② 声明式表达不了的绘制语义。其余一律设计稿 + code-behind。
-判据:**如果一块界面能写成 .html,就写 .html**——自绘的代价是命中测试、
-滚动、焦点、撤销栈都要自己重做一遍,高一个数量级。
+GUI 创作采用两条标准通道：HTML + CSS，或保留模式声明式对象树。
+图表、仪表、代码高亮及游戏 HUD/菜单/SceneDesigner 也封装成标准控件；
+像素绘制收在控件 `OnPaint` 内，使用处只配置属性、样式与绑定。
+Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执行。
 
-窗口用 .html 设计稿声明:布局/内容/样式进
-设计稿,交互与数据在 code-behind。五件声明原语:`data-on-*` 事件、
-`data-arg` 带参、`data-bind` 绑模型、`data-if` 显隐、
-`<template data-for>` 列表行。硬边界(每条都真踩过):
+### 窗口入口与文档装载
 
-- **`data-bind` / `data-if` / `data-for` 只在挂了模型的宿主里生效**:
-  运行时 HTML 树要 `SetRoot(tree, model)` 才有模型;**停靠面板是
-  `Gui.Control`,不挂模型,这三个属性在那里静默失效**。面板要动态更新就走
-  命令式:`Bind()` 换数据源、`SetProp()` 改属性、`Refresh()` 标脏。
-  判据:**"声明式"说的是"界面长什么样",不保证"数据怎么进"**——先把两者分开,
-  再决定哪一半用声明式、哪一半用命令式。
+- **嵌入宿主与内部控件同名**：DesignedControl 外层宿主 id 可以与内部文档 id 相同；内部访问器应从 children 按文档 id 搜索，排除宿主自身和文本回退，缺失仍显式失败。否则 CtxRing 的宿主 Ring 会先于内部 Progress Ring 命中，触发 InvalidCastException；不得改业务 id 绕过。回归应真实设置 host.name 与内部 id 相同，证明旧查找失败、新查找通过。
 
-- **普通 HTML 通道里 `<label>` 是元素不是控件，静态文字排不出来**：`Style.UaCss()`
-  的 UA 表只给「纯布局/排版 tag」声明 display，`label` 因为与真控件 `Label` 撞名被
-  **故意排除**（注释写明「避免改变现有控件的 display 归类」）。于是
-  `<label>文字</label>` 建成 `Gui.Element`，它的块流文字排不出来（元素高度 0、
-  字不画）——设计器路径把 label 映射成 `Label` 控件，两条路径语义不一致。
-  普通 HTML 要文字就用 `<div>`（UA 表给 block）或 `<span>`（行内）。
-  坑出处：某个即时通讯模板的登录窗标题与三个入口全是 `<label>`，实机一个字都不画。
+- **约定式窗口**：`class MainForm : Form` 配同名 `MainForm.html`，
+  调用 `new MainForm().Show()`。`Show` 找文档、解析、读取窗口键、
+  初始化 App、挂树与模型泵，再调用 `OnLoad` 并进入循环。
+  零参 `Form` 构造不初始化 App；不要直接在新建子类上调用 `Run()`。
+- **已有宿主中的页面**：`Gui.Html.Load(app, html, handlers, baseDir)`
+  返回控件树，并合入文档作用域样式、接链接导航；`Parse` 内自动
+  `Install`，调用者不用手工安装声明层。此入口不负责挂进父控件，
+  也不自动为页面注册模型宿主。使用 `host.Add(ui)`，按父布局为根
+  声明 `flex-grow: 1`；需要绑定时再挂 ModelBinder。
+- **编译只输入 `.zan`**：`.html` 是运行期文档，zanc 拒绝将其当源码。
+  发布用 `--embed` 带文档；文档 `<style>` 随装载进入应用样式，
+  不再使用生成类、静态 Css/Build 或 JSON 建树入口。
+- **窗口键**：同名文档的 `data-win-title/win-w/win-h/win-chrome/
+  win-center` 由 `Form.Show` 装配消费。显式 `Html.Load` 只是页面装载，
+  不替宿主新建或配置窗口。
 
-- **文档根元素用 `flex-grow: 1`，别用 `height: 100%`**：百分比高度在未定高的
-  上下文里退化成 auto，窗口会被内容撑小（请求 900×640 变成 349×208，控件挤在
-  一角）。`flex-grow` 让根吃满宿主高度，窗口尺寸回到请求值。
+### 内容、事件与模型
 
-- **文档元素的类不要整串覆盖**：文档元素带编译期作用域类（`zs-<基名>`），
-  `Class = "新类"` 会把它一起抹掉（该元素的文档样式全丢）；要换状态类用
-  `SetClassIn("族名", "新类")`（只换这一族，作用域类保留）。
+- **Children 集合必须维护真实父链（2026-11-12 实证）**：自然嵌套 `new Row() { Children = { new Column() { Children = { input } } } }` 通过 getter 返回的集合逐项 `Add`，不会调用属性 setter；返回裸 `List<Control>` 会绕过 adoption，导致 parent/App 链断裂和输入捕获无法退休。`Control.Children` 现为 getter-only、缓存的 `ControlChildren` 门面，提供 Count、只读索引、Add/Remove/Clear 与 foreach；不再使用 `ChildrenCollection` 或向 Children 赋 List，Row/Column 的 `Children(List<Control>)` fluent 方法保留。业务结构修改走门面或 Control 的树方法，不直接改 backing `children`。
+- **移除、重挂先退休旧宿主输入**：共享 `Control.Remove` 在仍有旧父链时调用 `ReleaseInputSubtree`，再重查索引和父归属后摘除；Clear 用快照逐项 Remove，跨父/跨 App adoption 同样经过旧父 Remove。取消回调若已把节点挂到第三父或请求目标父，外层 Add/With/InsertAt 尊重新归属，不能重复追加或强抢。门面弱引用 owner，owner 释放后 Count=0、Add/Remove/Clear 无害，枚举快照仅持有子项；不得让门面或 enumerator 保活 owner。回归 `tests/gui/control_children_lifecycle_test.zan` 已以真实 offscreen 输入、嵌套初始化器、焦点/捕获退休、取消重入重挂及 weak 生命周期通过 strict/golden/leak/guard。
 
-- **设计稿必须是编译输入的第一个文件**——zanc 从第一份设计文档合成
-  Main 与控件字段,放后面 = 字段全缺。
-- **写真 HTML 语义,不是全 div + data-* 的"类 HTML"**:凡 HTML 有原生
-  等价物的组件一律写原生标签。全集:`<button>文字`、`<label>文字`、
-  `<textarea>初始值`、`<img src/alt>`、`<input>` 按 type 七型
-  (checkbox→Checkbox+checked、radio→Radio、range→Slider、
-  color→ColorPicker、number→InputNumber、date→DatePicker、file→Upload,
-  其余→Input+placeholder)、`<select><option>`(option 文本→options,
-  selected→value 下标,无 selected 默认第 0 项=浏览器语义)、
-  `<hr>`→Divider(void 无正文,文案走 `data-text`)、`<progress
-  value max>`→Progress(折算 percent)、`<p>正文`→Typography。
-  **没有原生等价物的组件写成 `zan-<kebab>` 自定义元素**(`zan-avatar`、
-  `zan-data-grid`、`zan-tabs`——HTML5 合法标签名,tokenizer 收连字符,
-  读端 TagKind 逐段大写反解回 Pascal kind)。彻底废除 `data-kind` 属性旁路与
-  `DesignerHtml.ToJsonDoc` 旧 JSON 管线，纯正典标签模式为全仓唯一通道。
-  原生属性与 `data-x-*` 通道等价可混用(图片内容就该放 src);
-  复合属性(props/columns)才用 `data-x-<键>='<JSON>'`。
-- **裸 `<div>` 的 kind 兜底就是 Panel**:布局壳(页面/卡片/格子)直接用 `<div>`，
-  不写任何属性旁路。有原生等价物的控件一律用正典标签（`<button>`、`<switch>`、
-  `<select>`、`<input>` 等），自定义或高级组件用 `<zan-*>` 或连字符标签。
-- **`<a href>` 自带导航语义,别再手接 data-on-click 当链接用**（起,此前 `<a>` 只是行内 Element、href 静默忽略):http/https 链接建树时
-  自动接缺省导航——缺省进内嵌 WebView(宿主 `app.UseWebview(box)` 注册过
-  就地图,没注册懒开 App 级链接窗口复用),`target="_blank"` 弹系统浏览器;
-  WebView 运行时不可用自动回落系统浏览器。边界:href 只认 http/https
-  (相对路径无 base、`#` 锚无滚动目标、`javascript:`/`mailto:` 涉脚本与
-  shell 关联程序,一律不路由);元素写了 `data-on-click` 即宿主接管、不再
-  叠加导航;运行时通道(LoadHtmlWith)与生成通道都生效,挂主窗口的生成树
-  需宿主补一遍 `Html.AutoLinkTree(root, app)`。视觉:UA 给
-  `a { color: var(--primary) }`(引擎没有下划线绘制原语,retained 模式
-  也还没有 cursor 消费点——色差即示能)。
-- **`title` 属性原生就是悬停提示**（起,此前静默忽略):
-  Element 上的 title 文本在指针停稳 500ms 后浮出皮肤样式的 Tooltip 气泡
-  (贴元素底边、260px 自动换行),指针挪走即消失。前提:元素要有命中区
-  (链接/带 data-on-click 的元素天然有,纯展示容器没有指针也就无提示)。
-  真控件(button/input/...)的 title 仍忽略;运行时装载对 Element
-  发 elTitle。
-- **导入侧两个静默坑**(都真踩过):①读端属性循环里,专用分支必须排在
-  通用分支之前——checkbox/radio 的 value 是文案(→label)、progress 的
-  value/max 要截流(→percent),排进通用 value/min/max 分支之后就成了
-  死代码,值静默丢失;②原生标签折进模型的键形态必须与消费端对齐——
-  select 折出的 options 形态必须与消费端对齐(字符串/JSON 数组二选一,
-  两头同形),折错形态 SelectBox 空白。折新键前先查
-  DesignerHtml.FieldJson 与控件 SetProp 期望的形态。
-- **code-behind 职责分界**:结构全部进设计稿;只有声明通道喂不活的组件
-  (泛型 `ListView<T>`、需运行时模型、立即模式助手、设计器文档节点)在
-  HTML 里落 Panel 占位壳,由 code-behind 构造真控件 `Add` 进壳。两个
-  易错形态:Wizard 的 `Render`/`Show` 是 App 级全窗绘制,不可 Dock 进
-  卡片,内嵌场景用它的 `RenderList` 等子件;`FormField` 是设计器文档
-  节点、自身无运行时绘制,运行时形态是 `FormBuilder.Build(设计 JSON)`
-  实例化的真控件树。
-- **"喂不活"的判别法**(裁定一个类能不能进画廊/目录时先看这三条):
-  ①类头注释写"每帧由调用方…"、API 只有 `Begin/End/Bind` 没有
-  `Dock/Add`(ScrollView、StyledText、ChatArea)——每帧驱动的宿主件,
-  不是 retained 控件;②构造私有 + 无 `Kind`(Layer/Prompt/
-  Ellipsis 这类静态助手);③App 级全窗(Dialog/Wizard 全窗形态)。
-  反例教训:ScrollView 名字像容器,真身是 `ScrollColumn` 背后的
-  每帧滚动助手,差点当容器补卡——读类头注释+方法面,别望文生义。
+- 文档声明结构、样式与事件名，code-behind 管状态和事件响应。
+  优先用正典语义标签与 `zan-*` 控件标签；具体映射以
+  `Html.Build.zan`、控件注册与属性协议为准，不凭浏览器经验猜。
+- 五件声明原语：`data-on-*` 事件、`data-arg` 字面参数、`data-bind`
+  模型路径、`data-if` 路径真值、`<template data-for>` 列表。
+  `@click` 等语法糖见 `references/html-window.md`。
+- `Form.Show` 默认把窗口实例作为模型；已有宿主里的页面需
+  `ModelBinder.SetRoot(ui, model)`、`Wire()`、
+  `ModelHosts.Register(app, binder)`，撤页时 Unregister。
+  同一个事件选 handlers 或 binder 一处接线，避免重复订阅。
+- 值、显隐、列表内容优先改模型并 `RequestRedraw()`；结构变化走
+  控件树操作或重新 `Html.Load` 后替换旧树。重新装载不会替你替换
+  父节点中的旧树，也不会自动注销旧 binder。
+- 文档元素携装载期作用域类；状态切换用 `SetClassIn`，不要整串覆盖
+  `Class`。代码后挂的控件没有文档作用域类，共享外观放全局皮肤层。
+
+### 布局与样式
+
+- 根与中间内容区用 Flex/Grid/Flow；顶栏、内容、底栏按文档序排列，
+  固定栏 `flex-shrink: 0`，内容 `flex-grow: 1; min-height: 0`。
+  百分比高度须有确定包含块；不能用历史 dock 数字解决高度塌陷。
+- `Control.dock` 仅为兼容属性：setter 只在值为 5 时调用 `Grow()`，
+  其余值无操作；新代码不使用 DockTop/Bottom/Left/Right/Manual。
+  需要独立浮层时使用 CSS absolute 或 `Float(x, y)`，它经 `Place`
+  写 absolute 样式；普通表单排布继续留在自动流中。
+- 样式使用语义类与 token；HTML 不执行脚本。`line-height: 72` 表示
+  字号倍数，72 逻辑像素应写 `72px`。不要把 CSS 注释结束符写进注释文案。
+- `base.css` 由编译器内嵌兜底；项目只发布自家皮肤，不用旧磁盘基线
+  盖住新内嵌基线。文档样式自动作用域化，全局皮肤通过 `UseAppCss`
+  或皮肤接口配置。
+
+### 控件与浏览器集成经验
+
+- **WebView2 完成回调的参数归引擎所有,不得释放**: 手写 COM 桥里完成
+  handler 收到的结果串(`ExecuteScript` 的 JSON、`AddScript...` 的
+  脚本 id)和 `GetCookies` 的列表指针,Invoke 返回后引擎自己回收——
+  按"方法出参用 CoTaskMemFree"的惯例去释放,轻则堆损坏(0xC0000374,
+  Eval 加一次 Com.Free 即崩),重则过释放 CookieList 后后续 COM 调用
+  在 STA 里永久挂死。只有同步方法调用拿到的出参(get_Source 等)才走
+  `Com.GetString/Com.Free`;completion 参数一律只读。
+
+- **WebView2 是"加载器+系统运行时"两层,缺运行时可自动装**: 随应用只发
+  166KB WebView2Loader.dll(组件 drivers/ 目录),引擎本体 Win10/11 自带;
+  没装的机器调 `WebViewBootstrap.EnsureRuntime` 下载官方 bootstrapper
+  (~1.8MB)静默安装(弹一次 UAC),装后要新建 WebView 实例才重试创建
+  (created 标志一次性);Win7/8.1 的 bootstrapper 已不派发兼容版(109 为
+  最后),会改为打开官方下载页——要 Win7 免安装就发布带 CEF 的
+  zan_cef109 驱动。探测用 `WebView2.RuntimeVersion`;用户装没装运行时
+  与代码无关,程序只认探测结果,别写死"一定有"。
+
 - **滚轮认领以"真溢出"为前提,不溢出不拦截**(滚动条乱跳的框架级
   根因 修):指针在内就 `CaptureWheel` 但内容放得下的
   容器,会把 offset 钳回 0 空转、白白吃掉本属于外层的一格滚轮;
@@ -315,49 +302,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   **有意拦截**滚轮的认领不受此限。回归锁定:
   `conformance_gui_wheel_route` 场景 4(放得下的 flat 容器穿透,
   外层逐格线性)。
-- `data-if` 只认路径真值,不支持比较表达式;多按钮控制中间区走
-  `Nav.Embed`(路由出口:惰性实例化、切走保留、可配临态),别用
-  N 个布尔 data-if 硬拼。
-- **运行中改界面先问"改值还是改结构"**(选路细则见
-  `references/html-window.md` 动态绑定节):值/显隐/列表内容一律
-  **改 JsonValue 模型 + RequestRedraw**——挂模型宿主
-  (`SetRoot(tree, model)`)每帧双向同步,帧前推送、帧后回写;结构
-  变化(增删控件)才走命令式树操作或 `LoadHtmlWith` 整树重装
-  (无 diff)。两个硬边界:主窗口 `LoadHtmlWith` 装的树没有模型,
-  data-bind/data-if/data-for 全惰性;改模型与 `SetProp` 同一控件
-  是两个写入源打架,回写会把模型改动顶回去。
-- **重尾控件(CEF/WebView)是"注册才可用",不注册 = 发布不携带**:
-  ControlFactory 主 switch 不含 `WebViewBox`/`CefBrowserBox`——单一
-  switch 的每个 `new Xxx` 分支都会把该家族静态拉进编译图(globaldce
-  删不掉 internal 存活),几行代码的演示程序也会让 zanc 判定"图里有
-  CefBackend 符号",发布自动带上 zan_cef/zan_cef109/WebView2Loader
-  (bundle 的 `DLL if 符号前缀` 条件按符号存在性判定)。要用它们,宿主
-  在 Main/启动最前调一次 `CefControlBootstrap.Install` 或
-  `WebViewBootstrap.Install`(IDE 已接,gui_cef_browser 示例是范本);
-  不调用的程序整个家族被 DCE 删光,发布目录不再出现浏览器 DLL。给
-  其他重尾控件扩同类时,走 `HeavyControls.Register(kind, fn)` 同一
-  注册表,别往主 switch 加分支。
-- **WebView2 完成回调的参数归引擎所有,不得释放**: 手写 COM 桥里完成
-  handler 收到的结果串(`ExecuteScript` 的 JSON、`AddScript...` 的
-  脚本 id)和 `GetCookies` 的列表指针,Invoke 返回后引擎自己回收——
-  按"方法出参用 CoTaskMemFree"的惯例去释放,轻则堆损坏(0xC0000374,
-  Eval 加一次 Com.Free 即崩),重则过释放 CookieList 后后续 COM 调用
-  在 STA 里永久挂死。只有同步方法调用拿到的出参(get_Source 等)才走
-  `Com.GetString/Com.Free`;completion 参数一律只读。
-- **WebView2 是"加载器+系统运行时"两层,缺运行时可自动装**: 随应用只发
-  166KB WebView2Loader.dll(组件 drivers/ 目录),引擎本体 Win10/11 自带;
-  没装的机器调 `WebViewBootstrap.EnsureRuntime` 下载官方 bootstrapper
-  (~1.8MB)静默安装(弹一次 UAC),装后要新建 WebView 实例才重试创建
-  (created 标志一次性);Win7/8.1 的 bootstrapper 已不派发兼容版(109 为
-  最后),会改为打开官方下载页——要 Win7 免安装就发布带 CEF 的
-  zan_cef109 驱动。探测用 `WebView2.RuntimeVersion`;用户装没装运行时
-  与代码无关,程序只认探测结果,别写死"一定有"。
-- **zanc 编 .html 设计稿会先喷 `<unknown>` 噪音诊断,不是编译失败**:
-  编译前置的命名空间预扫描对原始 HTML 文本跑一遍 Zan lexer,HTML 的中文
-  与超长 data-uri 会报成 "unexpected character" 和 "string literal
-  exceeds 4095 characters",文件名显示 `<unknown>`。这些是良性噪音;
-  判定成败看最后的 Compiled/linking 行与产物 SELFTEST——曾把 54 个噪音
-  错误误判为编译失败,白查半小时才定位到预扫描。
+
 - **组件画廊/演示墙用瀑布流,大组件跨两列**(组件全量画廊定式):固定
   N 列行打包的行高=行内最高卡,DataGrid/Transfer 这类宽组件挤在单列
   370 逻辑宽里施展不开;改每列独立记账、卡片落"最矮位置"(并列取最
@@ -366,41 +311,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   (key=(-卡高,-span),同高跨列卡先落)收平页底——手工把高单卡排前面
   只是打补丁,同高时单卡抢先落位照样把跨列卡的窗口顶高
   (导航页 892>854 翻车后改排序键才收平)。
-- 布局按浏览器**等价子集**写(flow/inline/flex/grid/float/overflow);
-  "写上去不生效"先查支持度审计与差异清单,再查优先级。
-- **HTML+CSS 开发边界与响应式铁律(AI必读)**:
-  1. **禁止在 HTML 中手写 `data-fx/data-fy/data-fw/data-fh` 绝对坐标尺寸**:
-     除设计器生成的离线静态卡片外，新建 HTML 界面必须全采用 Flex/Grid/Block 流式布局与 CSS 变量（`gap`, `padding`, `flex: 1`），严禁使用绝对坐标防呆混淆。
-  2. **Zan HTML 解析器为轻量 Control AST 转换器，非完整浏览器引擎**:
-     支持语义标签映射（`button`, `input`, `textarea`, `select`, `progress`）与 78+ 款扩展控件（`<zan-card>`, `<zan-badge>`, `<zan-tabs>`）；不支持复杂的父子 `position: relative/absolute` 深度嵌套计算或深层伪元素。
-  3. **复杂/泛型组件采用“容器占位 + Code-behind 挂载”定式**:
-     对于 `VirtualList`, `TreeView`, `Dropdown<T>`, `CodeEditor` 等需泛型或模型的重型组件，HTML 中仅放置占位容器 `<div id="PlaceHolder" style="flex:1"></div>`，在 code-behind 中通过 `Find("PlaceHolder")` 实例化后 `Add()` 填入，禁止在 HTML 标签硬试探复杂参数。
-    4. **GenHtml 通道树根必须 `DockFill`**:
-       普通 `.html`（不带 `data-zan-design`）由 GenHtml 生成，body 根节点默认无 Dock，在 code-behind 中必须补齐 `root.DockFill`，否则界面缩在左上角。
-    5. **从设计截图还原精美客户端的“四步拆解定式”(网易云/QQ音乐实战验证)**:
-       - **第一步·视觉材质提取**: 从设计图取色提取主题主色与渐变层（暗紫/深灰阶梯，如 `linear-gradient(135deg, #26212b, #121015)`）；提炼特征几何（黑胶唱片大圆角 `border-radius: 180px`、同心圆同轴径向渐变 `radial-gradient`）；提炼吸底/吸顶磨砂半透明度（`rgba(18, 15, 21, 0.95)`）。
-       - **第二步·骨架分段与弹性伸缩(防白板与颠倒)**:
-         视口排布必须首选标准 Flex Column 垂直流：`body { display: flex; flex-direction: column; width: 100%; height: 100%; overflow: hidden; }`。
-         按自然视口自上而下顺次书写：顶栏 `<div class="topbar">`（固定高 `flex-shrink: 0`） -> 主舞台 `<div class="stage-row">`（`flex-grow: 1; min-height: 0` 弹性撑满中间） -> 底栏 `<div class="bottom-bar">`（固定高 `flex-shrink: 0` 吸附在最底）。禁止在 block 流中混用 `dock="bottom"` 与 `dock="fill"` 导致顺序颠倒或高度塌陷。
-       - **第三步·CSS 原生动效交付**: 旋转/呼吸高光直接在 CSS 声明内置关键帧动画（如 `animation: spin 24s linear infinite`），由底层 GPU 帧循环 60/120Hz 驱动无损旋转，严禁在 Zan 业务代码里手写角度插值时钟。
-       - **第四步·原生 Code-behind 极简绑定(核心防白板铁律)**:
-         HTML 内完全不写 `<script>`；在 `App.zan` 中仅写 30~50 行强类型业务逻辑。
-         **防白板第一铁律**：必须在建树前显式调用 `form.GetApp().UseAppCss(AppHtml.Css)` 注入样式表，否则 CSS 全部未生效、窗口必成纯白板！
-         **防露白第二铁律**：沉浸式暗色应用必须使用 `Form.CreateDark` 创建深色宿主，并配合 `form.GetApp().SetChromeVisible(false)` 隐藏默认标题栏，让 HTML 顶栏完全接管视口，底栏贴底，杜绝浅色窗体外框露白边。
-         通过 `HtmlHandlers.Add("OnTogglePlay", OnTogglePlay)` 编译期安全绑定原生事件。
-       - **验收铁律**: 一律经 `zan_gui_snapshot` 或无头 `ZAN_UI_SCRIPT` 回收 `tree.json` 验真，确保各主要容器高度不塌陷、子项不叠放、无无效坐标警告。
-- **基线 `base.css` 由编译器内嵌兜底,磁盘上不要再放一份**:编译器对 GUI 程序
-  自动把 stdlib 的 Gui 皮肤目录整份烤进 exe(含 base.css),运行时
-  `Skin.BaseCss()` 是**磁盘优先、内嵌兜底**——exe 旁再放一份 base.css 会
-  **盖住**内嵌基线,"内嵌兜底到底生效没有"永远测不出来。
-- **暂存形态分两种,别混**:单文件形态(只暂存自家 `skins/<名>/skin.css`)
-  不顶替基线,编译器照旧自动内嵌 stdlib 基线,**不要**拷 base.css;目录形态
-  (暂存整个 `skins/` 目录)只有该目录自带 base.css 时编译器才跳过 stdlib
-  基线内嵌,此时要换基线就得给**完整**基线——基线层整层丢失会让 flex 全
-  退化成叠矩形(wuwei 百艺页签全叠的根因:只带自家 skin.css 的目录暂存吞掉
-  了 stdlib 基线内嵌,编译器已把跳过条件收紧成"暂存目录自带 base.css")。
-- 游戏帧循环:菜单/面板可嵌(脏区门控,实测均值 3ms);每帧热路径 HUD
-  仍走代码直绘,不进 DOM。
+
 - **HTML 里"当前选中项"高亮必须 class 驱动,行内 style 只留几何**:
   HTML 的 `style="..."` 不是浏览器那套"内联样式优先"——构建器会把它合成
   一条专属类规则 `.zgen-N { ... }` 并给控件挂上 `zgen-N` 这个类,所以它和
@@ -416,8 +327,10 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   3. 改 `Class` 不必手动 invalidate——样式缓存键含 Class 串
     (`Control.ResolveStyleCached`),Class 一变缓存自动失效重算。
 
-完整声明面/切页三路/验证定式:`references/html-window.md`(写 .html
-窗口前先读)。
+完整声明面、页面绑定、设计器与验证方法见
+`references/html-window.md`。本规则描述开发约定；具体实现状态及迁移缺口
+以 `docs/GUI_ARCHITECTURE.md` 的现状与目标分栏为准。
+
 ## 克制
 
 - **把大胆花在一处**:一个画面一个签名元素,其余安静;删掉不服务内容的
@@ -429,6 +342,80 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   等一个画面至多一处;hover 微反馈可以普遍,入场动画不要。
 
 ## 组件封装的反哺
+
+- **双击与修饰键读取本次 routed Click 快照**：消费者在 `Click` 中读取 `e.isDoubleClick` 与 `e.modifiers`，不在 PointerUp 读取帧级 DoubleClickNow，不另建控件私有计时器。共享层在业务回调前确认有效主键 Click，并用事件序号防旧兼容路径重复记账；取消、拖动和次键不推进历史。原因：回调可注入另一输入，读取窗口当前状态会把内层修饰键或点击事实误用于外层；严格回归应覆盖同目标混合路由、重绘不重放、修饰键组合及回调嵌套输入。
+- **Escape 弹层钩子之后重验登记会话**：覆写 `OnPopupEscape(App)` 可处理取消而保持面板；共享宿主在钩子后检查 popup、owner App 与登记 revision，再决定默认关闭。不能沿用旧弹层快照清理回调新开的会话；普通失焦关闭不调用 Escape 钩子。原因：导出取消与关闭面板是不同动作，回调又可能重开或跨宿主；验证须覆盖 handled、默认关闭、重开和失焦路径。
+
+- **复合行交互尊重嵌入编辑器与子控件捕获**：行拖拽在 Down 冒泡时不得覆盖子控件已有捕获；文本编辑操作按 originalSource 到本行内容根的真实祖先链及 text/IME 能力判定，不能按具体 Input 类型列白名单，也不能把所有可聚焦控件都排除。原因：Button 已收到 Click，之前 Input 聚焦却已误选行，单查按钮计数会误判捕获修复无效。验证须从未选择状态依次执行编辑器聚焦/输入、子按钮点击及普通行选择/拖拽，并分段断言；List 原生命周期与旧 Tree 筛选已通过严格金样及正常退出检查。
+
+- **焦点能力属于当前输入树，不依赖绘制登记**：控件显式声明键盘及文本能力；Down 只检查命中祖先的当前 App、输入归属、显隐与禁用状态，Tab 临时投影当前树顺序，IME 查询当前弱焦点端点。聚合输入成员不要求 parent 链走到适配器；兼容绘制登记须使用弱端点。先提交新焦点再通知旧端点，回调重入后不写回旧状态。验证须在首次 Paint 前发送真实 Down/Up、字符和 Tab，并覆盖重排、弹层、聚合根与 weak 释放；共享焦点及真实 Tree 行编辑器均已通过严格 golden/leak/guard/runtime。
+
+- **拖动在路由事件期提交，绘制只读状态**：主键按下认领 `CapturePointer(control, true)`，Move 与主键 Up 使用事件坐标；Up 先提交最终位置，再结束并发通知，次键释放不能结束主拖动。Cancel 只清状态；Change 回调可能关闭、禁用或替换输入根，回调后须重验捕获和有效状态再发 DragEnd。原因：绘制期轮询漏掉重绘前输入及最后一次抬起坐标；Slider/SplitPanel 与调色板严格回归已覆盖这些边界。
+- **普通按压与拖动捕获分别认领触摸手势**：一参 CapturePointer 保留按压语义，触摸越过防抖阈值取消按压并清旧 pressed；拖动显式用二参 true 后继续接收 Move/Up，两种情况都禁止合成 Click。原因：普通 Button 也会捕获，不能以“有捕获”判定拖动；只清捕获又会留下 FocusManager 的旧 pressed。
+- **内联 CSS padding 走样式盒，不转成 Pad()**：ApplyInline 不能把 padding 简写取首数写成显式 Pad，否则四边/单位失真，替换或清空样式仍残留 padSet 优先级。实际布局读取解析后的四边值；手工 Pad/Padding 仍保留显式优先级。判定器：`css_dpi_test` 在100%–300% DPI比较首行坐标/宽度与替换样式后的几何；ScrollColumn 回归同时覆盖四边与显式 Pad。
+- **借用输入根按结构组合**：HUD/Layer 等适配器共用 InputRootAdapter，以既有 content/slot 链保留被包装的根、弱持宿主与业务 owner，绑定判环只查结构链，不能用受模态限制的 ContainsInputControl；高优先级 Layer 始终在 HUD 外层，重复 Bind 保位，Detach 跨不同适配器拼接且只释放自有输入。原因：各自维护链会产生 HUD→Layer→HUD 强环，后加入 HUD 还可能绕过模态。判定器：`input_root_composition_test` 真实 RenderIn/Open/Render、两种绑定顺序、跨 App、摘除保留其他层焦点/捕获及弱寿命，39 项 strict 通过。
+- **离屏滚轮重放保留原事件身份**：旧 CaptureWheel 两帧认领只恢复事件载荷，不能再次派发 routed Wheel，也不能先增后退事件序号；否则通知重复，且下一真实输入会撞上去重缓存。已路由消费的滚轮须跨 BeginFrame 保持已消费，不能被旧绘制路径重领。判定器：`scroll_routed_input_test` 的真实 EndOffscreenFrame→重放→下一指针/滚轮，以及 `scrollcolumn_input_lifecycle_test` 的混合消费。
+- **旧行数 API 只投影共享像素 offset**：RichText 用真实行高前缀定位、bottomAnchor=0 精确贴底；CodeBlock 的 UseScroll 保留行数与信号版本，内部投影不能吃掉半行像素余量。OnScrollChanged 在真实提交后统一通知、同值不通知；最终 Up 先退休旧捕获再通知，回调换根/新捕获不被旧动作覆盖。固定 header/copy 是真实子树，正文 ScrollViewport 排除固定区域，Paint 不处理输入。`richtext_codeblock_input_test` 已通过 strict 精确 golden/leak/guard，覆盖输入返回前投影、链接、复制一次、最终 Up、触控取消、DPI、重入与 weak；原 `richtext_test` 旧 golden 同轮严格通过。
+- **布局诊断不暴露可变缓存**：只读属性返回 List 仍可 Clear/Add；RichText.LineAt(index) 返回独立行、段与链接快照，越界/未布局为 null，修改快照不能污染实际布局。资源占位前须收口文本段宽，资源 advance 也计入行宽；探针实际复现宽度为零后才修根因，未复现的行高疑点不顺带改。
+- **真实离屏输入先用标准 App 工厂**：ProcessOffscreenInput 对原生 window 按设计无动作，必须 App.CreateOffscreen；验证 App 弱释放时 Main 先建独立 frame，再在子方法创建业务 App，避开首实例由 frameApp 静态持有的既有契约，正常 Destroy canvas。不能把 fixture 错误当业务输入或 ARC 缺陷，也不能清零 witness 伪造释放。判定器：同一 richtext/codeblock 配对回归。
+- **CSS 滚动接在公共路由，不能依赖子类调用 base**：滚动条 chrome 在内容指针钩子前处理，滚轮在控件未消费后处理，真移动才阻止向外冒泡；绘制只画滚动条。默认命中、拖动与绘制共用边框内的 padding box。固定列等复合控件通过 ScrollWheelViewport 扩展滚轮范围、ScrollBarViewport(bool) 分轴限定 chrome、ScrollWheelModifiers 局部映射修饰键；同一 owner 保持 offset/extent/捕获/commit，原事件不改写以保留边界冒泡语义。修饰位使用 Gui.Backend.Modifiers API，不能手写猜值：实际 Ctrl=1、Shift=2，夹具曾反置而错误断言横滚。原因：只接默认虚方法会让覆盖钩子的控件丢失 overflow 输入，固定区域共用单一几何又会把竖条画到中间带；scroll_geometry_input_test 已通过100%/150%/200% DPI、最终 Up/Cancel、原 modifiers/delta 冒泡及重复 Paint 的 strict golden/leak/guard/runtime。
+
+- **模型事件接线不能强持有 binder 或控件**：控件及排队 Action 只持弱端点 token，执行时查当前 handler；重复 Wire 合并同控件/事件，Detach 与更换 root/model 使旧 token 失效并重置首同步及快照。不能仅清 binder 字段而遗留保活闭包，也不能让旧队列调用新模型。判定器：`model_binding_equivalence_test` 完整 HTML/代码实际事件、替换、重复接线、迟到队列及 weak 释放已通过严格 golden/leak/guard。
+- **选项索引、键与标签是不同属性投影**：SelectBox 的 value/selected/data 读写索引，selectedValue/val 读写选项键，text/label/selectedText 表示标签；数字文本键“0”不可被当作索引0。绑定默认投影由 PropSpec 元数据与模型真实类型选择，显式 bindProp 优先，不在 Binder 中列具体控件类型。`model_binding_equivalence_test` 已严格验证 JSON、字符串/数值/bool 字典、POCO、零值及分数写回。
+- **表单校验空值按控件语义局部投影**：SelectBox 未选中的索引投影是“-1”，FormRow 的 Check/Peek 应用 HasValue() 将未选中投影为空校验值，同时保留 FormGroup.Value 的索引契约；不能让通用 FormRule.Required 把普通文本“-1”当空。判定器：`formgroup_test` 覆盖未选中、Clear 后的 Check/Peek、选中后的索引与标签，以及普通文本“-1”仍有效，已通过 strict golden/leak/guard。
+- **虚拟行在布局期维护真实子树，保留可见交集实例**：VirtualList 的行用 Add/Remove 继承宿主，滚动只替换离开/进入视口的行；移除前 ReleaseInputSubtree，SetRows/Refresh 即时退休旧编辑器。HitTest 与焦点查找须兑现重绘前的新滚动位置，不能在 OnPaint 才重建。显式行高是逻辑 px，参与 extent 与实际行高时同样 Scale。判定器：`scroll_widgets_input_lifecycle_test` 验证连续输入、重叠行焦点、跨宿主、1000 行有界实例、150%/200% DPI 及 weak 释放，strict golden/leak/guard 通过。
+- **固定表头复合控件覆写共享 ScrollViewport**：BandGrid 从 border 内侧视口扣除表头，滚轮命中、滚动条拖动与绘制均使用同一正文矩形；不造第二套滚动包装器，不伪造 border 偏移。选区在 routed PointerDown/Move/Up 更新，主键 Up 提交最终坐标、次键 Up 保持主捕获，Cancel 仅终止。判定器：同一严格回归覆盖表头不滚、正文滚轮、滚动条最终 Up、选区通知一次与取消。
+- **复合控件的编辑部件必须进入真实输入子树**：独立保存并 RenderTree 不会自动接入命中与焦点路由；优先让编辑部件成为聚合面板的 children，共享布局、绘制和输入几何。确实不能加入 children（如 TreeView 的行索引契约）时，须覆盖输入归属、焦点查找和命中，并同步继承 App；替换/移除先释放旧子树状态。TreeView filter 与 ColorPicker 通道已用重绘前真实输入、替换、跨宿主及 weak 生命周期回归验证，不能用绘制成功代替输入验收。
+- **弹层内容采用与完整测量职责（2026-11-12 caller 实证）**：内部内容交给 `Add/With` 采用前不能手写 `parent`，否则 parent 链与父集合不一致，Card/Flex 实际拥有内容时会跳过或错误移除；真实父链必须由采用机制一次建立。弹层宿主统一负责 `MeasureTree(app)`，完整测量包装容器及 Calendar/编辑面板等后代后再读自然尺寸并 Arrange；仅调用根 `OnMeasure` 不会遍历后代，不能让各 factory 复制补测量。共享 host 已改用完整测量，`contextmenu_routed_lifecycle_test` 与扩展 `overlay_host_routing_test` 已通过 strict golden/leak/guard；Calendar/包装容器的真实 factory 与 caller 验收由对应迁移另行收口，不能用共享回归代替 caller 证据。
+- **点定位菜单复用同一 OverlayHost（2026-11-12 strict 实证）**：ContextMenu 实例通过 `ShowAt(app,x,y)` 使用普通 retained Button 子树，宿主统一 clamp 点定位、外 Down/Esc/kind9 关闭与关闭通知；ownerless static Render 仍是旧兼容入口，不能声称自动接 retained。关闭先注销活动登记并退休旧输入，再通知旧 popup/anchor；cancel 或 popup 通知若重新激活同 identity 的 popup/anchor，须跳过迟到的旧关闭通知，回调打开的新弹层不能被外层覆盖。每控件在 lazy ControlExtra 中仅存整型登记 epoch，popup 与 anchor 同 identity 时只递增一次；通知前核对旧 epoch，不能仅比较旧 host 的 activePopup，因为新会话可在另一 App。ShowAt 仅对旧 host 仍实际登记自身时 Hide，返回后核对 opened/代次，cancel 中旧登记已注销的新 ShowAt 可接管；三 App 实证曾复现双 host，已根修并通过完整 strict。同 anchor 换内容只通知旧 popup，不关闭 anchor。选择先 `Hide(this)`，检查 opening generation 未被重入改写后才记录一次性 action 结果，再调用业务通知；业务回调后再次检查代次，不能把旧通知送进新会话。queued item action 使用 weak owner 与 opening generation，迟到旧动作或旧 `Hide(popup)` 不能关闭新菜单。普通关闭保留配置的 item 回调与 `ActionSelected`，与控件配置生命周期一致；显式 `ClearCallbacks()` 结束业务订阅，关闭只退休会话状态。Add 延迟建树接既有测量生命周期，绘制不重建或重放输入。保留自然 `Children[0] is IconView` 表达式，owned 临时值问题由编译器根修。`contextmenu_routed_lifecycle_test` 与扩展 `overlay_host_routing_test` 均已 fresh 通过精确 golden、normal leak、ARC guard、strict runtime；后者用真实 Down 捕获→cancel 覆盖同 anchor 重开同 popup/替换 popup，最终关闭只通知一次。
+- **Retained 长按复用原手势状态机与唤醒（2026-11-12 strict 实证）**：仅显式 LongPress 订阅或覆写 capability 认领，普通 HitTest/泛路由不认领；保留实际 Down leaf source，在原500ms/12px算法中只触发一次，越界或退出归属即取消，不能添加控件私有计时器。聚合根用 ContainsInputControl 验证成员，再检查真实祖先，不要求 parent 链走到适配器。Up 的 intrinsic hook 与同节点 MouseUp 订阅之间也须核手势票据；旧 hover 在 Leave 前注销，回调新建 Down/capture/hover 后旧尾部不得改写。完整 `retained_longpress_input_test` 和 slop Cancel→新手势探针均通过 fresh strict golden/leak/guard/runtime；原生窗口空闲唤醒与实际子窗口 deadline 唤醒仍须独立实窗验收。
+- **锚定弹层随输入归属退休，重入守卫按资源分别判断（2026-11-12 strict 实证）**：换根或摘除子树时，即使 anchor 没有 focus/capture，也须按共享输入归属关闭旧锚定登记；聚合根仍包含 anchor 时保留，点坐标弹层按调用方生命周期管理。先清旧按压/悬停再发送 Cancel/Leave，focus 只由 FocusManager 与焦点端点身份保护，overlay 只由登记 revision 保护，根安装只由后续换根 generation 取代。回调只新建 capture 不能阻止旧 focus/anchor 退休；关闭回调新建的 capture/focus/popup 不能被旧清理覆盖。`overlay_anchor_retirement_test` 与原生产 SelectBox 探针已通过 fresh strict golden/leak/guard/runtime；SelectBox fixture 须安装真实 App/输入根，并按当前入口在实际 Down/Up 后配对绘制，先确认打开成功，再断言无焦点/捕获的根替换立即关闭。
+- **Ribbon 业务订阅与三类按钮接线都借用 owner（2026-11-12 实证）**：Designer 外层 `CommandClicked` 使用 weak owner action，Ribbon 内部 tab、group item、flat command 三类 Button action 同样弱持 Ribbon，保留原有通知与动作码；只修外层仍会留下 Ribbon→Button→委托→Ribbon 环。`BuildTree()` 先递增 generation，再用 `RemoveAll()` 退休旧子树的 capture、focus、parent/App；取消回调可能重入，返回后核对 generation，queued action 执行前也核对所属 generation，不能只 `children.Clear()` 或靠清业务订阅释放。
+- **可见生命周期与 frame fixture 分开验收**：隐藏/零尺寸路径早退的 green 不能代表可见 Ribbon 已释放；回归须实际渲染并重建可见 Ribbon，覆盖 tab/group item/flat command、真实 Down 建立 capture、focus 退休、旧队列失效与退出 weak 释放。离屏绘制配对 Begin/EndOffscreenFrame；App 弱寿命 fixture 先建立独立 frame 宿主，遵守首实例由 frameApp 静态持有的契约，不清 witness 伪造释放。可见 probe 已从 owner/host/三类 Ribbon 全存活修到全释放并通过 strict；正式 `conformance_gui_designer_contextmenu_routed` 已在父批次 PASS（150.23 秒），证据见 `build/test-out/gui-current-failed-jobs4.log`。
+- **排队动作夹具遵守真实事件 turn（2026-11-12 Ribbon strict 实证）**：ProcessOffscreenInput 在 EndLoopTurn 自动 DrainPosts，真实 Up 返回后再重建不能撤销已经执行的动作。验证旧 queued action 时用真实 Down 建立捕获，随后 Post 变更，立即真实 Up；同轮 FIFO 先执行变更再执行旧动作，断言变更确实执行及旧业务计数未增加，不用私有 pump 或延迟断言制造绿色。tabbed Ribbon 的夹具高度用 HeightTabbed，无 tab 用 HeightGroups，否则窄宽 overflow 前提可能因三行压缩失效。保留旧失败与原 golden；组件严格通过不代表 Designer/Gallery 调用方或实窗验收完成。
+- **关闭或替换弹层先释放旧输入子树**：共享弹层宿主须清理旧弹层的 focus、capture、press、hover；只清活动弹层字段会遗留文本焦点或拖动捕获。聚合面板反向借用 owner 用 weak，避免 Picker→Card→Panel→Picker 环；ColorPicker 关闭/替换与孤立 Panel 回归已在 golden/leak/guard 下验证。
+
+- **宿主与父控件的借用反向引用用 weak**：App 持有输入根，Control 不得再强持有
+  App；Input/TextArea 的宿主缓存同样是借用。`control_host_lifecycle` 离屏探针
+  已验证按钮树与编辑树无需手动卸载根即可释放窗口和树。复合控件指示器的 owner
+  也不得强持有父控件：Checkbox 的两棵引用环曾精确保留 548 项对象，改 weak 后
+  原 HTML/代码属性等价探针在相同 golden、leak/guard 下通过。真实拥有窗口的
+  Form.app、ChildWindow.host 保持强引用，退出时解除根和回调，不能一律弱化。
+- **复合控件的子控件事件用 weak owner action 避免 ARC 环**：父控件持有子控件，
+  子控件的事件又持有绑定父控件实例的方法时，会形成父→子→委托→父的强引用环。
+  用独立 action 对象接线，action 以 `weak` 字段引用 owner，回调先检查 owner
+  是否仍存在，再转发操作；只把父子反向字段改 weak 不能解除委托造成的环。
+  生命周期回归须销毁复合控件后检查实际释放，并同时启用 `--check-leaks`
+  与 `--arc-guard`；InputNumber lifecycle 的 11 项严格 golden 比较已通过该
+  组合检查，step_bounds 的 10 项亦通过同组合检查。
+- **图标按钮必须使用真实 `IconView` 子控件**：它提供测量与绘制内容；单独赋值旧
+  `Icon` 字段不会创建内容，按钮会变成空内容的零宽 Button。
+- **离屏交互测试须运行标准事件队列**：`Button.Click` 通过 Dispatcher 排队，
+  `ProcessOffscreenInput` 后须在下一帧前取出并执行 `Dispatcher.Take()` 返回的动作，
+  再测量/绘制；只重绘会让标准按钮收到捕获却不执行业务回调。关闭后的动作测试
+  应排入实际订阅的 `button.Click`，保留旧根与按钮，确认 weak owner 已释放后再消费。
+- **固定页脚的纵向 Flex 主体设 `flex-basis:0;min-height:0`**：主体增长占剩余高度，
+  详情区使用 `overflow-y:auto`；只写 `flex-grow:1` 会按内容基准把页脚推到窗口外。
+  回归使用窗口内真实点击和祖先几何诊断，不能用直接触发事件替代越界按钮检查。
+
+- **属性检查器保留一棵树，编辑只走一个提交出口**：属性行及其输入控件按实例
+  创建并接线一次，绘制、选择切换与模型回填只更新值和可见性，保留根、行、
+  父子关系与订阅；不能逐帧重建/重挂输入树。Change/Click 统一进入模型提交，
+  回填期间抑制提交，写模型前比较旧值，一次有效编辑只记一次 undo，无变化、
+  拒绝的值与重绘不记空 undo。资源选择等程序调用 `SetText` 不触发 Change，
+  必须显式调用对应 commit（SceneDesigner 为 `CommitInspectorText`），不要再
+  额外模拟一次 Change。RGB 编辑保留独立 alpha，不能用取色器回填覆盖透明度。
+  2026-11-11 `scene_designer_inspector` 严格 golden probe 已覆盖真实离屏输入、
+  单次/无变化提交、Undo、anchor、RGB/alpha、资源字段、滚动与根/行身份稳定；
+  `scene_designer_color` 颜色 probe 亦通过，不外推为 IDE 实机或正式 CTest 通过。
+- **嵌入区域的布局、绘制与输入共用同一几何**：检查器/HUD 使用
+  `HudLayer.RenderIn(app, x, y, width, height)`，在 App 坐标的宿主区域内对
+  同一树 Measure/Arrange/RenderTree，并绑定 Visual Tree 输入聚合根；
+  RenderTree 本身不接输入，不另算一套命中坐标、不重新收养控件。关闭 dock
+  或离页显式隐藏该层；`SetVisible(false)` 摘除输入入口，只释放该层子树的
+  focus 与 pointer capture，不能清掉其他层的输入状态。2026-11-11 检查器
+  probe 已验证滚动、hidden 释放焦点和重新显示根稳定；capture 释放是已核对
+  的实现契约，该 probe 未直接断言，不将其写为已完成的交互验证。
 
 - **铁律:控件自己负责绘制,使用处只配置**(实例化→配属性→喂数据→摆位置)。
   禁止在使用处用 Canvas 原语重画已有控件——组件修好后示例还在按旧画法显示,
@@ -469,10 +456,12 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   自己的条带——FireCommon 只给 `On.Any` 的控件注册命中区,宿主只用
   `TabChanged.Add` 类型化接线(On 为空)时,按页签=按空白,命中解析不到
   任何控件(既不是控件也不是遮罩),释放就没有归属,页签永远切不动。
-- **PropSpec 的 str/num/flag 必须绑字段本身,不能绑 getter 返回值**
-  (ListItem 教训):`text.str = this.Label` 绑到的是一份值快照,设计
-  通道的 SetProp 写进死快照,界面永不出现;绑 `Text` 字段才拿到编译器
-  合成的实时访问器对。
+- **PropSpec 的 str/num/flag 必须绑定可写源**：实例可写字段和同时具有
+  get/set 的属性生成实时 Binding，自定义属性保留访问器副作用与分派；
+  getter-only、init-only 属性、readonly 字段和方法返回值生成快照，Set
+  只修改快照。ListItem 的只读 Label 不可作为写回源，应绑定 Text；
+  不能把这一限制扩展成禁止所有自定义属性。实时 target 不持有 owner，
+  owner 必须活过 Get/Set；用真实读写与退出 leak/ARC 验证，不能只看 IsLive。
 - **控件框高要对齐内部条带的自然高,否则皮肤底线变"两条下划线"**
   (组件画廊顶栏教训):Tabs 的选中指示线画在页签条内容底,控件的
   border-bottom 画在控件整框底;页签条内容自然高=theme.heightMedium(34),
@@ -499,9 +488,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   2. 盒模型一等公民快捷设置：Margin（外边距）、Padding（内边距）与容器 Gap（子间距）必须作为 FormField 核心建模字段，并在 Inspector 检查器提供数字步进器（0~200px 范围），同时闭环 FieldToJson / FieldFromJson 序列化、IsModeledKey 白名单以及快照 Copy/Equal 比对，避免开发者在自由/流式排版中被迫手写额外内联 CSS；
   3. 自由与流式拖拽位移隔离：仅当鼠标移动超出物理阈值（`dx >= 4 || dy >= 4`）时才触发 `DesignMakeFloat`，避免原地单击或抖动将流式/停靠组件意外变为绝对定位；外壳/顶栏组件（如 ToolStrip）优先使用 `dock: top` 或主 Flex 列首项，避免绝对定位脱离文档流被后续流式容器覆盖；
   4. Z-Order 渲染层级与列表下标契约（置顶置底倒置教训）：GUI Retained 模式与 HTML 遵循自然文档序绘制（`0 -> Count - 1`，下标 0 最先绘制处于最底层，下标末尾最后绘制处于最顶层，`HitTest` 命中测试从末尾向前逆序检测）。因此置顶（Bring to Front）必须移至末尾下标 `Count - 1`，置底（Send to Back）移至头部下标 `0`；上移一层（Bring Forward）为正向位移 `+1`，下移一层（Send Backward）为负向位移 `-1`，切勿倒置导致“越置顶越在底层被遮挡”；
-  5. Dock 停靠模式一等公民与流式 Fill 撑满：顶栏（ToolStrip/MenuBar）和底栏（StatusBar）首选 `dockSide`（Top=1, Bottom=2, Fill=5），并在 Inspector 中暴露可视化停靠选项；停靠组件协同设置 `position = 0` 保持在文档流中，避免脱离文档流导致后续流式容器覆盖顶栏；全流式容器下主组件自动撑满高度使用 `flexGrow = 1`（Fill / Grow）；
   6. 组件大纲树（Component Tree / Outline）大纲导航与双向联动选择：左侧面板提供 `[ 组件库 | 大纲树 ]` 双 Tab 切换，递归遍历显示完整窗口的嵌套结构、图标、类型与定位模式（Dock/Float）；树节点单击直接同步选中目标组件，彻底解决画布深层嵌套、零尺寸或被遮挡组件无法点中的痛点；
-  7. 容器 Flex 弹性排版一等公民建模（方向/主轴/交叉轴/换行）：Panel/Card/FlowPanel 等容器的子项流向与对齐方式必须作为 FormField 核心建模字段（flexDir: Column/Row、justify: Start/Center/End/SpaceBetween、alignItems: Start/Center/End/Stretch、flexWrap），并在 Inspector 检查器提供直观的可视化配置与 FormBuilder 同构映射，彻底免除在设计器中被迫手写额外内联 flex CSS 类的繁琐；
   8. 多选画布上下文菜单与就地排版对齐：多选（freeExtra.Count > 0）时，右键上下文菜单直接呼出「左/顶/右/底对齐、水平/垂直居中、水平/垂直均分、等宽/等高」，无需移至顶部 Ribbon 翻找；
   9. 大纲树就地右键菜单与 Alt+方向键尺寸缩放：左侧大纲树支持右键就地呼出操作菜单；自由排版模式下支持 Alt+方向键（结合网格吸附与 Shift 步长）快捷调整控件宽高；
   10. 多选批量属性同步（Batch Property Sync）：多选状态下在 Inspector 检查器修改通用尺寸（w/h）、盒模型（margin/padding/gap）、排版定位（dock/flexGrow/position/anchor）或容器弹性属性时，自动批量同步给 freeExtra 中所有未锁定控件，并统一纳入单一撤销快照，杜绝逐个重复配置；
@@ -562,7 +549,6 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
 - **Flex 主轴/交叉轴对称性与行高最小容纳约束（Line Height Minimum Bounding Constraint）**：
   1. Flex 测量主轴与交叉轴判定：横向流（`row == true`）主轴为宽（width），交叉轴为高（height）；纵向流（`!row`）主轴为高（height），交叉轴为宽（width）。断行主轴累计判定（`m > lineRem`）必须与排布阶段取值同源一致，严禁颠倒导致子项意外提前断行；
   2. 行高基线保证与防截断：容器声明的 `line-height`（`declaredLineH`）为单行最小基线，不能强行压制比其更高的子元素（如 Button、Input）；行高计算应满足 `maxCross = Math.Max(maxCross, declaredLineH)`，杜绝子控件被压扁截断；
-  3. 盒模型双轨注入：FormBuilder 解析 `padding/pad` 属性时，必须同时注入 CSS `style` 与内核逻辑单位 `ctl.logPad`，并在 `padding == 0` 时显式注入 `padding: 0px`，确保画布预览与运行时完全一致。
 
 ## 毛刺防治(斜线/曲线/圆角的抗锯齿)
 
@@ -804,7 +790,10 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   指示状态，`ContentHeight` 与逐行绘制均需联动跳过折叠项，并在标题栏使用 `Ui.ClickedIn`
   阻断点击穿透，保证滚动条量程与视野紧凑清晰。
 - **HTML+CSS+Zan 设计稿零胶水规范与纯矢量图标体系（从截图还原精美客户端铁律）**:
-  - **设计稿运行期零建树通道**:HTML 设计稿不是编译输入(zanc 拒绝 .html)。窗口属性(`data-win-title`、`data-win-w`、`data-win-h`、`data-win-chrome="false"` 沉浸式无边框、`data-win-center="true"`)是文档键,由入口代码读键后调 `Form.Create`/`SetChromeVisible` 等落地;内容经 `FormBuilder.BuildWith`/`LoadHtmlWith` 投影,`<style>` 随装载并进应用样式,`@click` 事件由 handlers/binder 接线。业务代码只写状态与事件响应,不碰建树;发布用 `--embed` 把设计稿烘进 exe(压缩加密、内存解出、不落盘)。
+- **HTML + CSS + Zan 的装配边界**：窗口子类使用同名文档与 `Show()`；
+  页面使用 `Gui.Html.Load(app, html, handlers, baseDir)` 返回树，再由宿主挂载。
+  HTML 只在运行期解析；发布用 `--embed` 携带设计稿，业务代码管理状态与事件。
+  文档文本、图标与容器的映射以当前解析器和控件属性协议为准。
   - **无边框窗口右上角系统控制按钮保护区（SetCaptionZone）**:声明 `data-win-chrome="false"` 沉浸式无边框窗口时，若标题栏高度生效，Win32 的 `WM_NCHITTEST` 会将整个窗口顶栏判定为 `HTCAPTION (2)` 导致拖拽吞掉右上角按钮点击；必须在 `OnLoad` 中调用 `form.GetApp().SetCaptionZone(width)`（如 `form.GetApp().Scale(160)`）为右上角功能区（菜单/最小化/最大化/关闭）保留非拖拽客户区。
   - **Tabler SVG 纯矢量图标铁律(杜绝伪 Unicode 字符)**:按钮与图标控件一律声明标准 SVG 矢量名(如 `icon="player-play"`、`icon="player-skip-back"`、`icon="player-skip-forward"`、`icon="heart"`、`icon="volume"`、`icon="reload"`、`icon="playlist"`、`icon="chevron-down"` 等),走内置 997+ Tabler SVG 矢量图标集经 nanosvg 矢量光栅化与 GPU 贴图缓存。严禁使用 `▶`、`⏮`、`❤` 等 Unicode 假字符冒充图标。
   - **Nanosvg 矢量图元约束与动态透明 SVG 规范**:
@@ -817,10 +806,6 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   判定是否由下拉框升格为单行分段按钮时，文字宽度测量 `tw` 必须预留至少 `app.Scale(16)`
   的安全 padding（左右各 8px），否则在高 DPI 或多字宽下极易贴边或溢出截断；放不下时应
   平滑自动回退为下拉单选框。
-- **Dock 停靠与内外边距/间隙全链路闭环**:
-  属性设置不仅要在设计器 Inspector 中呈现，必须由 `Control` 核心基类度量
-  （`ApplyDeclaredUnits` / `StyleMarL/T/R/B`）和 `FormBuilder` 动态构建树承接，
-  确保设计期、预览期与运行期完全同构，消除“改了属性在画布与预览毫无反应”的断层。
 - **设计器画布双击与代码跳转防误触机制**:
   画布组件双击默认优先进入原地行内文案编辑（`StartInlineRename`，按钮/标签等全量包含），
   严禁将普通双击硬编码为跳转代码；只有在显式按下 `Ctrl+双击` 或属性面板点击“定位代码”
@@ -946,7 +931,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
 1. **样式路径(自动缩放,禁止再乘)**:CSS 声明、控件属性、`FontOr/Width`
    等 StyleBox 取值——写 token/档位值即可,框架已缩放,手再乘一遍就是
    "150% 显示下按钮大 1.5 倍"的双重缩放。
-2. **自绘路径(手动缩放,禁止忘记)**:`Canvas.DrawText` 字号、HUD/自绘的
+2. **控件内部绘制/游戏世界路径(手动缩放,禁止忘记)**:`Canvas.DrawText` 字号、内部绘制的
    坐标与边距——必须过 `app.Scale`;且**封装成项目内单一 helper**(如
    `Ui.Dp`),禁止在使用处散落内联 `* dpiScale / 100`。
 
@@ -1017,49 +1002,23 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
    **同一条布局代码改到第二遍就停**:不是数值没调对,是结构选错了,
    回到规则 1-3 换容器。
 
-7. **`Grow` 只在停靠路径有效;进了 Flex 容器撑满要写 CSS `flex-grow`**。
-   `Control.Grow` 只做两件事:`grow = true; dock = 5`;而 `ArrangeFlex`
-   分配剩余空间读的是 `StyleGrow`,它返回的是 **CSS `flex-grow`**,与代码的
-   `grow` 字段无关。两条后果(都是背包页实测踩出来的):
-   - 停靠路径把 `dock == 5` 的子项**排到最后、共享同一块剩余矩形**,不按顺序
-     各吃一段——`Row` 里"左固定 + 撑满 + 右固定"三兄弟,撑满的那个会跑到最右
-     并与其他 Grow 兄弟重叠。要"左固定…右贴边"就得用 `DockRight`(从右往左
-     吃边,注意声明顺序会反过来),或者把容器改成 flex。
-   - 容器要 `display: flex`(挂皮肤类),撑满的子项要 `flex-grow: 1`(挂皮肤类);
-     代码里写 `Grow` 在 flex 容器里等于没写。实证:背包下段 tab 行"左三 tab +
-     撑满条 + 右六 tab"用 `Grow` 撑条,六个右 tab 一直贴左边不动;取代表
-     "格 + 中部撑满 + 数量 + 升级钮"的中部被排到最后,渲染顺序变成
-     「格 / 数量 / 升级钮 / 名称」。
-   - 皮肤里一条 `flex-direction` 会盖掉代码的容器方向:`.bag-top, .bag-lower
-     { flex-direction: row }` 把 `Panel.Column` 的下段压成横排(tab 行被拉满高、
-     内容挤到右边)。Row/Column 混用时**一条规则只写一个方向**。
+7. **布局以 CSS 的最终计算值为准**。`Panel.Row/Column` 为流式容器；
+   不再依据 dock 数字或旧停靠分支推导排布。Flex 的剩余空间分配读
+   `StyleGrow()`，声明 `flex-grow: 1` 最明确。`Grow()` 当前设置控件
+   `grow` 字段，具体容器如何消费须核对实现，不能声称它仍写 dock=5。
+   Row/Column 混用时，避免同一条 CSS 把两者的方向覆盖为一个方向。
 
-8. **停靠容器的 `Gap` 连第一个子项也算一份——首尾对齐别用撑条**。
-   `Arrange` 的停靠分支在**每个**子项之后都扣一次 `StyleGap`，包括第一个；
-   于是「首撑条 + 缝」= 内缩 + gap，整行/整列右移/下移一个 gap 的量。
-   实证(商店页):卡片行 `Gap(21)` + 首撑条 `Prefer(22,…)` → 卡阵整体右移 21
-   设备；货币行 `Gap(9)` + 首撑条 → 右移 9。**左右(上下)内缩一律走容器
-   `Padding(top, right, bottom, left)`，只有子项之间的缝用 `Gap`**；确实
-   要在两端留白又不想动 padding 时，把首尾撑条的宽度减去一个 gap。
-   注意 `Padding` 会被皮肤里声明的 `padding` 顶掉——那个类就别在 CSS 里
-   写 padding。
+8. **边缘留白归 padding，子项间距归 gap**。不要用首尾撑条模拟边缘
+   内缩，也不要套用旧停靠引擎逐项扣 gap 的推导；按最终布局树核对。
 
-9. **贴底元素用 `DockBottom`(dock=2)，不要指望 `Grow` 撑条把它推下去**。
-   停靠分支是「先按声明顺序摆 dock 1..4，再摆 dock 5」，而 `Grow` 把子项
-   变成 dock=5。所以「内容 + 撑条(Grow) + 页脚」里，撑条排在页脚**之后**，
-   页脚被摆在内容正下方、页面底部留一大块空。要贴底必须
-   `footer.DockBottom; body.Add(footer);`——**先 Add 的 dock=2 先占底**，
-   所以「页脚之下那条底缝」要在页脚之前 Add。实证(商店页):页脚原本落在
-   卡阵下 15 设备处，改 DockBottom 后才回到页底。
+9. **贴底用有确定高度的 Flex 列**。按“内容 → 页脚”文档序挂载，
+   内容声明 `flex-grow: 1; min-height: 0`，页脚声明 `flex-shrink: 0`。
+   `dock=2` 不会产生底部停靠效果。
 
-10. **流式容器里要手摆一个子项，必须 `Add` + `DockManual` + `Place`，
-    不能用 `With` 再指望 `Place` 生效**。`With` 在 `Panel.Row/Column`
-    里会按容器方向重设 `dock`（Row→3 左停靠、Column→1 上停靠），子项于是被
-    摆到流的位置上，`Place` 的坐标被忽略——实证（称谓页）「领取」钮本来要
-    在格子里居中，用 `With` 后贴在格子左边还拉满高；改成
-    `b.DockManual; b.Place(dx, dy); box.Add(b);` 才落回量出来的位置。
-    注意 `DockManual` 是 `dock = 0`，容器只在 `dock==0` 分支读 `mx/my`，
-    所以这条也意味着**这个子项退出了自动流**，尺寸要自己给（`Prefer`）。
+10. **有意退出流才用 absolute**。`b.Float(dx, dy)` 当前转调 `Place`，
+    写 `position: absolute; left/top`；不需要也不存在 DockManual 开关。
+    子项挂到哪个包含块、如何定尺寸，按 CSS absolute 与父盒模型核对。
+
 11. **`Label` 原生支持 `text-align`（left/center/right）**。
     `Label.OnPaint` 会读取样式的 `s.align` 与 `padding`/`border`，在单行或
     折行（wrap）模式下直接完成居中与靠右偏移绘制。因此无需为了给文本居中
@@ -1087,18 +1046,13 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 
 
 自定义控件的子类契约:写 `Control` 子类(自绘控件/画布图元)必须有显式
-构造器调用 `InitControl(名字, 停靠)`;隐式默认构造器不会跑基类字段初始化,
+构造器调用 `InitControl(名字, 兼容整数参数)`;隐式默认构造器不会跑基类字段初始化,
 `children` 为 null、`visible` 为 false,首次 `With`/`Arrange` 即段错误。
 
 排版容器三条实测：
-- **`Panel.Row` / `Column` 默认是停靠布局，不是 flex**：`align-items`、
-  `justify-content`、CSS `flex-grow` 只在该元素的 CSS 类显式写了
-  `display: flex; flex-direction: row|column` 时才被采纳；而代码里的 `Grow`
-  **只在停靠路径有效**（第 7 条），进了 flex 容器要撑满必须给子项挂
-  `flex-grow: 1` 的类。坑：六枚等分页签叠成一枚（容器没声明 flex）；交易市场
-  表格盒右缘短 70 设备、页脚撑条不推分页（容器是 flex 却只写了 `Grow`）；
-  左面板被 `align-items` 默认 stretch 拉满整页高（给 flex +
-  `align-items: flex-start` 才对上原图 167..876）。
+- **`Panel.Row/Column` 当前直接走 Flex 排布**：工厂设置 `flexFlow = 1`，
+  `StyleDisplay()` 返回 Flex；Add/With 按顺序排布，方向来自容器 layout。
+  子项增长按 `StyleGrow()` 的 CSS 计算值声明，不套用已删除的停靠引擎。
 - **flex 容器内容超出主轴就按比例收缩所有子项**（flex-shrink 默认 1）：定高的
   外框列里放「顶带 + 自适应中排 + 页脚」，中排按内容测量比可用高还大时，顶带
   从 38 被挤成 36、1 设备底线挤成 0。撑满项写 `flex-grow: 1; flex-basis: 0`
@@ -1224,6 +1178,20 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 
 ## 验证
 
+- **延迟生命周期测试须用 `Post` 排队**：`TriggerEvent` 同步执行，验证 owner 释放后的回调应使用 `header.On.Click.Post()`；collapse 修正该测试后实际 17 项断言及正式单 case 重跑通过（50.41 秒），golden 与产品代码未为失败修改。
+- **关闭窗口先断开持有回调，清理按 owner 身份限定**：窗口关闭须清掉持有回调以破除 owner 自环；根树与 UiDriver 清理按 owner 身份匹配，不能误清其他窗口。
+
+- **真实离屏输入按当前 Window.EventSeq 去重与消费**：事件序号取当前窗口的
+  `app.window.EventSeq()`，App 暂存、控件去重及输入消费标记必须使用同一窗口局部
+  序号；不能读取平台 global 序号，否则离屏注入或其他窗口的事件会让各阶段
+  对不上，造成重复处理或吞掉后续输入。验证须走实际离屏窗口事件入口：同一
+  事件跨多次渲染只生效一次，新序号的后续字符、按键仍正常生效；多窗口的
+  事件不能相互消费。仅直接调用 Change/Click 回调不能覆盖此契约。
+
+- **游戏 HUD 的绘制与输入必须接同一棵树**：宿主须通过 `app.SetRootControl(hud)` 绑定 Visual Tree 输入根，`RenderTree` 自身不接输入。按下命中 Button 的子 Label、由祖先 Button 捕获时，Click 要求按下目标与实际释放命中都属于捕获祖先的子树；捕获仅保证 Up 投递，不能把拖到外部释放判成点击。`OnClick` 行为钩子执行后由 `TriggerEvent` 统一通知一次，钩子里不再重复通知订阅者。已由 `guihost_loop_test` 独立探针验证通过（`GUIHOST_LOOP_OK`），覆盖原四次点击及 disabled、拖外释放、默认/Float 单次通知回归。
+
+- 依赖 Console 输出或 stdout golden 的 GUI 回归编译时显式加 `--subsystem console`；自动选择 Windows 子系统可能正常退出却没有 stdout，本轮样式探针已证。
+
 - **运行期守卫的错误只进 stderr，进程照样退出 0**：除零这类软错误由运行期
   守卫打印到 stderr（并追加崩溃日志），**退出码仍是 0**——用例"绿"了，错误
   却已经发生（设计器宿主模式窄区除零就是这么溜过去的：IDE 里只留下一行
@@ -1261,28 +1229,16 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
   (bash→powershell)按 GBK 显示乱码是**终端显示问题**:
   `乱码.encode('gbk').decode('utf-8')` 还原后与服务端存储 byte 级比对,
   别当成输入 bug 修。
-- **HTML 运行期文档通道(GenHtml)的树根必须代码补 DockFill**:
-  `Build` 返回的 body 元素 dock=Manual,窗口只填 dock=Fill 的根——
-  漏一句整棵树缩在左上角;类名=文件基名帕斯卡化+Html(App.html→
-  AppHtml),成员只有静态 Css 字段(无括号)+Build 方法,不发射 Main。
-  搬 CSS 进 `<style>` 时逐条补单位:`line-height: 72` 是 72 倍行高
-  (无单位=倍数),30px 字号配它=3240px 行盒整树顶飞,要 72px 必须
-  写 `72px`(详见 references/html-window.md)。
-- **设计稿根（body）是 CSS 块流容器，body 直接子级的 `data-dock` 不生效**：
-  CSS `display:block` 在引擎里映射成块流排版（`StyleDisplay()==3`），子项的
-  dock 被忽略——`dock=5` 的填充层只拿到内容自然高，`dock=2` 的底栏就贴在那个
-  小盒子的底，看着像"跑到屏幕中间去了"（coreforge 底部建造栏悬在屏幕中部）。
-  根要当 HUD 容器用时，改成 flex 列 + 让填充层吃剩余空间：
-  `root.SetProp("style","display:flex;flex-direction:column")` 与填充层
-  `SetProp("style","flex-grow:1")`——**flex 排布只认 CSS 的 `flex-grow`，
-  `Control.Grow()` 那个字段是停靠排版用的，对 flex 无效**。
-  注意层级差异：设计稿里的 `<div>`（`Gui.Widget.Panel`，style=3 → 类型选择器
-  `stack`）走**停靠排版**，它的子级 dock 生效；只有 body 这一层是块流。
-  量坐标别靠截图猜：UiDriver `dump tree`（`ZAN_UI_SCRIPT` 指向脚本**文件**
-  路径、`ZAN_UI_OUT` 指输出目录）直接给出每个控件的 x/y/w/h。
+- **运行期文档使用真实装载入口**：约定式窗口调用 `Show()`；已有
+  App 的页面调用 `Gui.Html.Load(app, html, handlers, baseDir)`，再挂到
+  父树。没有生成的 AppHtml.Css/Build；CSS 单位与根高度按本文布局规则核对。
+- **HUD 根按 CSS 排版**：满屏 HUD 用 Flex 列，中间层声明
+  `flex-grow: 1; min-height: 0`，顶部/底部条 `flex-shrink: 0`；
+  不使用 `data-dock` 或数字 dock 作为运行时停靠指令。
+  用 UiDriver 布局树核对实际矩形，不能从旧停靠推导当前行为。
 - **窗口与内容面板贴边纪律与圆角状态契约（Window Margin & Corner Invariant）**：
   ① 桌面窗口根节点（`body` 与 `.designroot`）默认必须 0 外边距与 0 内边距、100% 贴边撑满客户区；留白应由具体业务卡片/内联布局显式决定，根节点绝不强行内缩，禁止机械带出浏览器的 `body { margin: 8px }` 导致主界面悬空漏边；
-  ② 通用容器/面板（`panel`）默认必须直角透明无内边距（`border-radius: 0; padding: 0; box-shadow: none`），填满窗口（`Dock.Fill`）时天然贴合无缝咬合；只有明确声明为展示卡片的独立部件（`card` / `panel.card`）才带圆角与投影，禁止普通面板默认带圆角导致贴边时四角切开漏底；
+  ② 通用容器/面板（`panel`）默认必须直角透明无内边距（`border-radius: 0; padding: 0; box-shadow: none`），填满窗口（Flex 增长项）时天然贴合无缝咬合；只有明确声明为展示卡片的独立部件（`card` / `panel.card`）才带圆角与投影，禁止普通面板默认带圆角导致贴边时四角切开漏底；
   ③ 窗口圆角与最大化状态严格联动：最大化（`SIZE_MAXIMIZED`）时铺满全屏，DWM 与异形遮罩必须自动取消圆角（直角平铺），防止屏幕四角漏出桌面背景；从最大化还原（`SIZE_RESTORED`）时必须完整恢复原本的圆角与阴影规格，严禁单向破坏不可逆。
 - **自由画布动态像素标尺系统（Dynamic Pixel Rulers）与视口投影**：
   设计器画布支持视口平移（ox/oy）与光标中心缩放（psMilli）时，屏幕物理像素与文档设计逻辑像素（fx/fy/fw/fh）
@@ -1352,10 +1308,6 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
   工业级防误触必须同时满足两层严密防护：
   1. **屏幕位移容差校验**：两次点击在屏幕空间中的位移必须限制在极小容差内（如 `abs(dx) <= Scale(5) && abs(dy) <= Scale(5)`），只要产生拖拽位移或跨区域点击即刻重置，严禁触发代码跳转；
   2. **业务控件白名单与容器/静态项绝对排除**：容器类组件（Panel, Card, Tabs, Collapse 等）与静态纯展示组件（Label, Title, Divider, Tag, Badge 等）在排版时属于高频承载与对齐参照物，绝对禁止双击跳代码；只有明确具备交互业务事件的组件（Button, Input, Checkbox, Switch, Tree, DataGrid 等）或自定义组件引用（`compRef`，双击打开子设计稿）才允许双击导航。
-- **显式停靠组件（Docking Components）的防误转浮动防护**：
-  在自由画布上拖拽移动组件时，必须严格保护 `f.dockSide > 0` 的显式停靠组件（如 ToolStrip Dock.Top 或 StatusBar Dock.Bottom）。
-  严禁在移动起始（`DesignBeginMove`）或解除约束（`DesignMakeFloat`）中粗暴将组件的 `dockSide` 抹为 0 并改为 `position = 1`（绝对浮动定位）；
-  否则停靠组件一旦被降级为绝对浮动，将脱离正常文档流占位，导致后续从顶部 (0,0) 开始排列的流式容器直接遮挡浮动工具条，引发严重的视觉与交互倒退。
 - **全流式排版高度自动撑满（Fill Remaining Height）一键快捷动作**：
   在全流式（Flex/Flow）布局下，组件撑满剩余高度的规范语义是 `position = 0`、`flexGrow = 1` 且 `fh = 0`（由弹性主轴自动分配撑满余量空间）。
   若仅提供抽象的 `flexGrow` 整数输入，用户极难联想到高度填满需要将固定像素高度置 0。
@@ -1429,7 +1381,6 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 - **流式组件拖拽保护与容器内精准插槽调序（Flow Drag Preservation & In-Container Slot Reordering）**：
   在自由画布或混合排版模式下，过去 `DesignBeginMove` 曾无差别对所有拖拽组件调用 `DesignMakeFloat`，导致在流式容器或流式表单里的组件一拖动就被破坏性降级为浮动绝对定位（`position = 1`），不仅破坏 Flex 流式自适应特性还会引发图层遮挡；同时，在同容器内拖拽松手时因 `pc == cont` 判定直接 `continue` 跳过，无法通过拖拽进行子项排序。
   规范做法：
-  1. 拖拽开始时严格判定 `if (f.dockSide == 0 && f.position == 1)`，仅绝对浮动组件才重算并解除坐标约束，流式组件（`position == 0`）严禁被篡改为浮动；
   2. 拖拽悬停于容器上方时，始终激活 `FlowDropTarget` 探测流向与子节点包围盒，实时渲染插入线；
   3. 松手 `FreeReparentSel` 中识别同容器内部拖拽（`pc == cont`），结合 `dropIndex` 实现 `kids` 精确插槽调序，无论在容器内还是跨容器均完美保持流式属性。
 - **属性检查器多选批量外边距与内边距档位矩阵（Batch Margin & Padding Matrix in Inspector）**：
@@ -1440,7 +1391,6 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 - **外壳控件智能默认Dock停靠与检查器停靠矩阵（Smart Docking on Creation & Quick Dock Matrix）**：
   在自由或混合排版中，外壳控件（ToolStrip, StatusBar）如果被默认赋予绝对浮动坐标（Float），后续添加的流式容器（Panel, Form, GroupBox）会从 (0, 0) 开始排版并将工具条覆盖遮挡。
   规范做法：
-  1. 新增 ToolStrip 时默认赋予 `dockSide = 1`（Dock.Top 顶部停靠，`position = 0`），新增 StatusBar 时默认赋予 `dockSide = 2`（Dock.Bottom 底部停靠，`position = 0`），使其自动参与外壳停靠排版；
   2. 属性检查器单选排版卡片常驻提供 `Dock: [None 0] [Top 1] [Bot 2] [Left 3] [Right 4] [Fill 5]` 胶囊切换按钮矩阵，一秒在常用停靠与铺满余量间切换，并自动同步坐标与重算布局。
 	- **大纲树同级调序方向与视图闭环联动（Outline Sibling Reordering & Immediate Refresh）**：
 	  在组件大纲树（Outline TreeView）等纵向层级树视图中，列表物理索引为从上至下（第 0 项在最顶部，第 Count-1 项在最底部）。
@@ -1451,7 +1401,6 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 	- **设计器持久化与尺寸微调之布局模式保护（Layout Mode Preservation in DesignDeclareRect & Resize）**：
 	  过去 `DesignDeclareRect` 曾错误硬编码 `position = "1"` 与 `dock = "0"`，导致任何通过检查器修改属性或微调尺寸的流式/停靠组件，一被持久化或刷新就强制降级为绝对浮动（`position = 1`）；同时 `DesignMakeFloat` 在调整尺寸手柄时也无差别将流式组件降级为浮动。
 	  规范做法：
-	  1. `DesignDeclareRect` 必须动态持久化当前真实的 `Convert.ToString(f.position)` 与 `Convert.ToString(f.dockSide)`，严禁硬编码常量；
 	  2. `DesignMakeFloat` 在检测到组件为流式（`f.position == 0`）时，拖动手柄调整尺寸仅更新 `fw/fh` 推荐像素，保留 `position == 0` 流式属性，绝不强行降级为绝对浮动；
 		  3. 画布右键上下文菜单（`CanvasMenuLabels` & `HandleCanvasMenu`）同步完备集成 `Dock`（Top/Bottom/Left/Right/Fill/None）与 `Flow: Fill Height`（撑满剩余高度 `flexGrow=1, fh=0`）/ `Flow: Auto Height` 一键命令，消除全流布局填满高度的心智门槛。
 	- **设计器右键上下文菜单（ContextMenu）精简规范与事件防穿透门控**：
@@ -1461,12 +1410,6 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 	  3. 裸指针事件防穿透门控：设计器画布、绘图区等直接读取底层裸事件（`app.EventKind()`、`mouseX`、`mouseY`）的组件，当存在浮层弹窗、ContextMenu 或帮助浮层时，必须建立联合锁定门控（`locked = BigEditorOpen || canvasMenuOpen || quickInsertOpen || keymapHelpOpen`），并在鼠标抬起（`EventKind == 3`）、双击跳转、标尺拖拽等关键路径全量施加 `!locked` 门控，彻底封死在菜单项上点击时穿透到底层画布篡改组件或误跳代码的历史顽疾。
 		- **属性检查器窄面板下密集按钮网格排布（Inspector Grid Adaptability in Narrow Panels）**：
 		  在属性检查器（宽 200~300px）中，当操作选项多于 4 项时（如 Dock 的 6 种停靠方式：None/Top/Bottom/Left/Right/Fill），严禁在单行硬塞 6 个按钮导致文字严重截断挤压与视觉畸变；规范做法是拆分为标准 3+3 两行等宽网格排布，垂直与水平间距遵循 4px 阶梯，行高宽裕舒适，彻底根治窄面板下按钮变形的顽疾。
-		- **内外边距与间隙（Margin, Padding & Gap）在设计器与运行时全链路生效闭环**：
-		  在设计器中配置 `margin`（外边距）、`padding`（内边距）和 `gap`（子间距）后，若出现“设置了但在设计器预览或运行期没有变化”的症状，根因在于 FormBuilder 动态重建控件树期未将文档声明绑定到底层控件的度量通道。
-		  规范做法：
-		  1. `Control` 基类必须内建显式的 `marL/marT/marR/marB` 与 `marSet` 标志，提供 `Margin(int m)` / `Margin(t, r, b, l)` 链式方法，并在 `StyleMarL/T/R/B()` 决策中优先返回显式外边距（与 `Pad()/Padding()` 优先机制完全对齐）；
-		  2. 声明度量体系建立 `logMar`、`logPad`、`logGap` 通道，在 `ApplyDeclaredUnits` 中统一由 `app.Scale(...)` 换算为设备像素；
-		  3. `FormBuilder.SetupLayout` 构建期必须将文档节点的 `padding`、`gap`、`margin` 显式映射到控件的 `logPad`、`logGap`、`logMar`，彻底打通“检查器设置 -> 文档持久化 -> FormBuilder 映射 -> 布局度量计算”的全链路。
 		- **无边框窗口边框拖拽手势与客户区光标切换纪律（Border Resize Cursor vs Client Cursor Synchronization）**：
 		  无边框自定义窗口通过 `WM_NCHITTEST` 将边缘映射为系统缩放手柄（HTLEFT/HTRIGHT/HTTOP/HTBOTTOM 等）时，系统底层会在鼠标经过边缘时由 `DefWindowProcW` 派发 `WM_SETCURSOR` 自动设置调整大小光标（双向拖拽手势）。
 		  若光标进入窗口客户区（`HTCLIENT`）后仍残留拖动手势，典型根因有二：

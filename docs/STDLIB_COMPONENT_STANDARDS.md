@@ -66,7 +66,7 @@
 > Widget 中混用（56 个 Widget 中 18 个双通道并存，Switch 同挂四条通道）。
 > 本节为收敛契约，2026-09 起新代码必须遵守，存量逐步收敛。
 
-1. **外部数据绑定的唯一协议是 `Binding<T>`**（`stdlib/System/Binding.zan`）：
+1. **控件的强类型属性绑定使用 `Binding<T>`**（`stdlib/System/Binding.zan`）；模型路径绑定由 ModelBinder 经同一公开属性协议分派，两者均适用于 HTML 与代码树：
    - 组件作者把可绑定属性声明为 `Binding<T>` 字段：主值命名 `data`，辅值 `dataXxx`；
    - 使用方 `control.data = model.field;`（实时）或 `= 常量`（常量绑定），不感知机制；
    - 禁止为同一控件再发明第二条同语义通道（历史双通道已收敛：
@@ -97,19 +97,20 @@
    （通道字段、方向、真相归属），照 `SelectBox.zan` 头注释样式。
 6. **文档承诺必须与实现一致**：宣称"响应式/变更通知"的成员必须有真实订阅者，
    否则删除（反例：`Signal.Changed` 曾零订阅空转）。
-7. **字符串 `bind` 通道的边界**：`Control.bindPath`/`bindProp` 是**设计时声明
-   元数据**（设计器 Inspector、Serialize 行格式、DesignerHtml 编解码读写），运行时
-   由 `ChildWindow` 消费——每帧把 JsonValue 状态实体按路径同步进控件/回写。
+7. **模型路径声明共用同一绑定器**：`Control.bindPath`/`bindProp` 是树上的声明
+   元数据，HTML 属性、设计器或代码均可配置；运行时由 ModelBinder 消费，适用于
+   Form 页面、ChildWindow 和手搭树。默认值投影由 PropSpec 元数据与模型真实类型
+   选择，显式 bindProp 优先；读写经公共 GetProp/SetProp，不维护具体控件类型表。
+   事件 token 弱持 binder/control，重复接线合并，Detach/root/model 替换使旧队列失效。
 8. **`Props()` 指针必须优先指向活的外部通道**：属性 spec 同时存在 Binding 与
    内部 Signal 背书时，`data != null` 分支必须指向 Binding（`spec.num = data`），
    仅在无外部绑定时才落到内部缓冲（`spec.snum = model`）。否则 `SetProp` 写进
    内部缓冲后会被下一帧 SyncBinding 用旧模型值覆盖（P5 修复的真实缺陷类）。
    `PropSpec` 的 `s*` 字段仅用于控件自身内部状态接线（如 ChoiceGroup 组子
    Radio），不构成对外 API。
-   它服务"对话框 ↔ 状态实体"场景，与代码内实时绑定 `Binding<T>`（第 1 条）
-   分工不同、互不替代；新控件不得再开第三种绑定写法。绑定机制的派生缓存
-   不进 Control 基类——它属于消费方（如"模型侧确认值"快照归 ChildWindow
-   的旁表所有，`Control.bindSnapshot` 已拆除）。
+   模型路径绑定与强类型字段绑定不按创作模式分隔；新控件只需发布属性和值投影，
+   无需新增绑定器或控件专属分派。模型快照和事件 token 等派生状态归 ModelBinder，
+   不进 Control 基类；更换 root/model 时重置快照及首同步状态。
 
 ## 7. DataTable 单元格内嵌（Gui 组件契约）
 

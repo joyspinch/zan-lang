@@ -14,9 +14,8 @@
 
 ### 批次 0 · 在飞（持有会话未提交；其他会话勿碰同文件）
 
-- [~] 在飞观察（2026-11-06 补）：ChildWindow 声明式装配——z-mount 挂载（`DocWire.MountSlots`）、`:prop` 绑定启动期对账、`diag_cw_bad_mount` 注册；涉及 Zan.Gui 9 个文件（UiDriver/ChildWindow/Control/ControlExtra/DocWire/ModelBinder/Html/Progress/win-x64 libzan_gui.a）与 CMakeLists.txt（childwindow_budget_test.zan 2026-11-08 仍有改动，在飞持续）。持有会话未注册调度器。GUI 分层重构（B-ID171+）已绕开这些文件。
-- [~] 在飞观察（2026-11-09 补）：游戏域拆包——`Zan.Game` 收缩为引擎核心（Core/Graphics/Kit/Scene/Physics 等），`Zan.Game.Arpg`/`Zan.Game.Idle` 等类目整包迁出为独立包（工作区未提交 D/?? 状态）；gui-design/game-dev skill 也有同日未提交改动（Dock 方言清理方向）。持有会话未注册调度器；B-ID177 的游戏域迁移待拆包收口后执行。
-- [~] 在飞观察（2026-11-09 补）：ide_zan 面（Docs/Marketplace/Wizard 组件、AiAssistant/AiSettings 对话框、LspRange.zan 等，2026-11-08/09 mtime）另一会话在飞未提交；B-ID167 ③④ 涉及同面文件，待其收口。
+- 2026-11-12 整体收口：批次 0 旧在飞面（ChildWindow 装配、游戏域拆包、ide_zan Wizard/Marketplace、编译器 EH/async、GUI 分层、Data ORM、AppUpdate 安装事务、zan-site、toolchain linux-musl）已按域分 11 个提交入库（5c0565083…bb51a1767），本段旧三条观察随之移出。
+- [~] 在飞观察（2026-11-12 补）：输入仲裁退役（B-ID177 P6 方向）——`App.InputRetirement*`/`InputRetirementObserver`/`InputRetirementToken`、Layer 族、`App.VisualTree`、`docs/GUI_ARCHITECTURE.md`、tests/gui `input_scope_retirement_test` 与 `models/InputScope*` 当晚仍有会话在飞未提交，其他会话勿碰同文件。
 
 ### 批次 1 · 根修项（闭它解锁下游，优先领）
 

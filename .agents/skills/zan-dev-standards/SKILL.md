@@ -116,18 +116,20 @@ description: Zan 开发规范总纲——开发工作流闭环、代码规范（
      不算违规。
   ② **内联 style（`SetProp("style", ...)`）分两半**：视觉键（背景/颜色/
      圆角）在**解析时重放**进样式盒，控件上不留第二份副本——替换原文后
-     旧值不留残影；布局键（width/height/pad/gap）**必须即时落控件**——
-     样式盒里的 width 只影响画出来的那张面，撑不开控件的槽位，漏了这一段
-     就是"写了等于没写"（坑出处：内联通道改成"解析时重放"时把布局键
-     一起丢了，`style="width:88px"` 失效，回归用例 `gui_field_style` 变红）。
-  ③ **控件的 kind 名单副本要对得上**：运行期重建注册表
-     （`ControlBootstrap.Names` + 各族 bootstrap；应用组件走自发现
-     约定——类自声明 `static void Install()` 注册进 HeavyControls，
-     注册表由脚本扫描文档引用生成，不维护手工清单）、控件自己声明的
-     `Kind()`。少一处就出症状：按 kind 重建拿到 null，控件在运行期
-     整体消失（坑出处：`Row`/`Spacer`/`FormGroup`/`FormItem`/`Modal`/
-     `Drawer` 注册表漏登记；编译期限定名单已随 GenForm 删除退出历史，
-     2026-10-31）。
+     旧值不留残影；布局键必须参与实际 Measure/Arrange，不能只改绘制外观。
+     width/height/gap 的既有兼容投影按消费方维护；**padding 读取解析后的
+     StyleBox 四边值，不转成显式 Pad()**，手工 Pad/Padding 保持显式优先级。
+     原因：漏接布局曾使 `style="width:88px"` 无效；将 padding 简写首数
+     写入 Pad 又会丢失四边和单位，并在替换样式后残留 padSet。回归同时检查
+     实际槽位、替换样式和 DPI，不以样式字段正确代替布局正确。
+  ③ **控件 kind 与构造注册保持同一事实源**：`ControlBootstrap.Install()`
+     对 70 个核心 kind 各写一条 `ControlFactory.Register(kind, constructor)`，
+     不再维护独立 Names/Make 名单；可选包仍由各自显式 Install 注册，
+     应用组件继续自声明 Install 走 HeavyControls 自发现。注册键必须与
+     实例 `Kind()` 一致（含 RadioButton 形态），HTML 别名保持原映射。
+     新增或调整 kind 时验证自然构造、工厂、HTML、Html.Clone 及弱引用
+     释放等价；复合控件通过 CloneContentTo 复制业务内容并重建生成部件。
+     编译期 GenForm 限定名单已删除，不恢复重复清单。
 - **窗口程序开发铁律：UI 线程专职渲染与事件派发，业务/IO/计算绝对异步解耦非阻塞**：
   ① **职责唯一性约束**：UI 线程（主事件消息泵）核心使命是保持 60/120Hz 丝滑响应，只负责系统输入事件分发与界面排版绘制（Layout -> Paint -> Present），单次事件或帧处理耗时红线严禁超过 2ms；
   ② **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络通信（HTTP/WebSocket）、磁盘文件大读写、数据库 SQL 执行、大 JSON/XML 解析、图像解码、重 CPU 计算或同步 `Sleep`；

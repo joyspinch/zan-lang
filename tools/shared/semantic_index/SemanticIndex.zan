@@ -1,0 +1,713 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+
+namespace Zan.Tools.SemanticIndex;
+
+// Projects the version 1 `zanc --gen-meta` document into .zanmap artifacts.
+// Carries forward the former GenIndex format without compiler code generators.
+public class SemanticIndex {
+    private JsonValue unit;
+    private List<string> files;
+    private Dictionary<string, JsonValue> classesByName;
+    private string basePath;
+
+    public SemanticIndex(JsonValue unit, string basePath) {
+        this.unit = unit;
+        this.basePath = basePath;
+        this.files = new List<string>();
+        this.classesByName = new Dictionary<string, JsonValue>();
+        JsonValue fileTable = unit.Get("files");
+        if (fileTable != null && fileTable.IsArray()) {
+            for (int i = 0; i < fileTable.Count(); i = i + 1) {
+                JsonValue file = fileTable.At(i);
+                this.files.Add(file != null ? file.AsString("") : "");
+            }
+        }
+        JsonValue classes = unit.Get("classes");
+        if (classes == null || !classes.IsArray()) { return; }
+        for (int i = 0; i < classes.Count(); i = i + 1) {
+            JsonValue cls = classes.At(i);
+            if (cls == null) { continue; }
+            string name = cls.Str("name", "");
+            if (name != "" && !this.classesByName.ContainsKey(name)) {
+                this.classesByName.Add(name, cls);
+            }
+        }
+    }
+
+    private string FileOf(int id) {
+        if (id < 0 || id >= this.files.Count) { return ""; }
+        return this.Relative(this.files[id]);
+    }
+
+    private string Relative(string path) {
+        if (this.basePath == null || this.basePath.Length == 0) { return path; }
+        string p = path.Replace("\\", "/");
+        string b = this.basePath.Replace("\\", "/");
+        while (b.Length > 0 && b.EndsWith("/")) { b = b.Substring(0, b.Length - 1); }
+        if (b.Length == 0 || !p.StartsWith(b + "/")) { return path; }
+        return p.Substring(b.Length + 1, p.Length - b.Length - 1);
+    }
+
+    private static JsonValue NamedArg(JsonValue attr, string key) {
+        if (attr == null) { return null; }
+        JsonValue args = attr.Get("args");
+        if (args == null || !args.IsArray()) { return null; }
+        for (int i = 0; i < args.Count(); i = i + 1) {
+            JsonValue a = args.At(i);
+            if (a == null || a.Str("k", "") != "assign") { continue; }
+            JsonValue l = a.Get("l");
+            if (l == null || l.Str("n", "") != key) { continue; }
+            return a.Get("r");
+        }
+        return null;
+    }
+
+    private static string ExprText(JsonValue e) {
+        if (e == null) { return ""; }
+        string k = e.Str("k", "");
+        if (k == "lit") {
+            JsonValue v = e.Get("v");
+            if (v == null) { return ""; }
+            return v.AsString("");
+        }
+        if (k == "id") { return e.Str("n", ""); }
+        if (k == "mem") {
+            string o = SemanticIndex.ExprText(e.Get("o"));
+            string n = e.Str("n", "");
+            if (o.Length == 0) { return n; }
+            return o + "." + n;
+        }
+        if (k == "bin") {
+            string op = e.Str("op", "");
+            return SemanticIndex.ExprText(e.Get("l")) + op + SemanticIndex.ExprText(e.Get("r"));
+        }
+        if (k == "cast") { return SemanticIndex.ExprText(e.Get("e")); }
+        return "";
+    }
+
+    private static string CustomText(JsonValue cls, JsonValue m, string key) {
+        JsonValue v = SemanticIndex.NamedArg(SemanticIndex.AttrOf(m, "Custom"), key);
+        if (v == null) { v = SemanticIndex.NamedArg(SemanticIndex.AttrOf(cls, "Custom"), key); }
+        return SemanticIndex.ExprText(v);
+    }
+
+    private static string AuthOf(JsonValue cls, JsonValue m) {
+        string t = SemanticIndex.CustomText(cls, m, "Authorization");
+        int dot = t.LastIndexOf(".");
+        if (dot >= 0) { return t.Substring(dot + 1); }
+        return t;
+    }
+
+    private JsonValue RoutesDoc() {
+        JsonValue outArr = JsonValue.NewArray();
+        JsonValue classes = this.unit.Get("classes");
+        if (classes == null || !classes.IsArray()) { return outArr; }
+        for (int ci = 0; ci < classes.Count(); ci = ci + 1) {
+            JsonValue cls = classes.At(ci);
+            if (cls == null || cls.Str("kind", "") != "class") { continue; }
+            if (!SemanticIndex.IsController(cls)) { continue; }
+            string ctrltok = SemanticIndex.ControllerToken(cls);
+            string cmod = SemanticIndex.ControllerModule(cls);
+            string cdisp = SemanticIndex.ControllerDisplay(cls);
+            string cact = SemanticIndex.ControllerActionName(cdisp, cmod);
+            string clsTpl = SemanticIndex.AttrStringArg(cls, "Route");
+            string clsDesc = SemanticIndex.AttrStringArg(cls, "Description");
+            bool apiController = SemanticIndex.AttrNamed(cls, "ApiController");
+
+            JsonValue methods = cls.Get("methods");
+            if (methods == null || !methods.IsArray()) { continue; }
+            for (int mi = 0; mi < methods.Count(); mi = mi + 1) {
+                JsonValue m = methods.At(mi);
+                if (m == null || m.Bool("ctor", false)) { continue; }
+                if (SemanticIndex.AttrNamed(m, "NonAction")) { continue; }
+                bool tagged = SemanticIndex.AttrNamed(m, "Route") ||
+                              SemanticIndex.AttrHttpVerb(
+                                  SemanticIndex.FirstVerbAttr(m)).Length > 0;
+                if (!tagged && !apiController) { continue; }
+                if (m.Bool("private", false) || m.Bool("protected", false)) {
+                    continue;
+                }
+                JsonValue ps = m.Get("params");
+                int np = ps != null ? ps.Count() : 0;
+                bool ctxParam = np == 1 &&
+                                ps.At(0).Str("type", "") == "HttpContext";
+                bool bindable = np > 0 && !ctxParam &&
+                                !m.Bool("static", false) &&
+                                this.BindableParams(ps);
+                if (np != 0 && !ctxParam && !bindable) { continue; }
+
+                string mname = m.Str("name", "");
+                string verb = SemanticIndex.MethodVerb(m);
+                if (verb.Length == 0) { verb = "GET"; }
+                string path = SemanticIndex.BuildPath(clsTpl,
+                    SemanticIndex.AttrStringArg(m, "Route"), ctrltok,
+                    mname.ToLower());
+                string mDesc = SemanticIndex.AttrStringArg(m, "Description");
+                string title = mDesc.Length > 0 ? mDesc : clsDesc;
+
+                JsonValue r = JsonValue.NewObject();
+                r.Put("method", JsonValue.NewStr(verb));
+                r.Put("path", JsonValue.NewStr(path));
+                r.Put("action", JsonValue.NewStr(cact + "." + mname));
+                r.Put("controller", JsonValue.NewStr(cls.Str("name", "")));
+                r.Put("module", JsonValue.NewStr(cmod));
+                r.Put("title", JsonValue.NewStr(title));
+                r.Put("auth", JsonValue.NewStr(SemanticIndex.AuthOf(cls, m)));
+                r.Put("perm", JsonValue.NewStr(
+                    SemanticIndex.CustomText(cls, m, "Perm")));
+                r.Put("menu", JsonValue.NewStr(
+                    SemanticIndex.CustomText(cls, m, "IsMenu")));
+                r.Put("icon", JsonValue.NewStr(
+                    SemanticIndex.CustomText(cls, m, "Icon")));
+                r.Put("async", JsonValue.NewBool(m.Bool("async", false)));
+                JsonValue pl = JsonValue.NewArray();
+                if (ps != null && !ctxParam) {
+                    for (int pi = 0; pi < np; pi = pi + 1) {
+                        JsonValue p = JsonValue.NewObject();
+                        p.Put("name", JsonValue.NewStr(
+                            ps.At(pi).Str("name", "")));
+                        p.Put("type", JsonValue.NewStr(
+                            ps.At(pi).Str("type", "")));
+                        pl.Append(p);
+                    }
+                }
+                r.Put("params", pl);
+                r.Put("file", JsonValue.NewStr(
+                    this.FileOf(m.Int("file", 0))));
+                r.Put("line", JsonValue.NewNum(
+                    Convert.ToString(m.Int("line", 0))));
+                outArr.Append(r);
+            }
+        }
+        return outArr;
+    }
+
+    private JsonValue EntitiesDoc() {
+        JsonValue outArr = JsonValue.NewArray();
+        JsonValue classes = this.unit.Get("classes");
+        if (classes == null || !classes.IsArray()) { return outArr; }
+        for (int ci = 0; ci < classes.Count(); ci = ci + 1) {
+            JsonValue cls = classes.At(ci);
+            if (cls == null || cls.Str("kind", "") != "class") { continue; }
+            string name = cls.Str("name", "");
+            if (name.Length == 0 || SemanticIndex.AttrOf(cls, "Table") == null) { continue; }
+            List<IndexedField> fs = this.FieldsOf(name, 0);
+
+            JsonValue e = JsonValue.NewObject();
+            e.Put("name", JsonValue.NewStr(name));
+            e.Put("ns", JsonValue.NewStr(cls.Str("ns", "")));
+            e.Put("table", JsonValue.NewStr(this.TableOf(name)));
+            e.Put("file", JsonValue.NewStr(this.FileOf(cls.Int("file", 0))));
+            e.Put("line", JsonValue.NewNum(Convert.ToString(cls.Int("line", 0))));
+            e.Put("pk", JsonValue.NewStr(this.PkOf(name)));
+
+            JsonValue fac = JsonValue.NewObject();
+            fac.Put("cols", JsonValue.NewStr(name + "Cols"));
+            fac.Put("query", JsonValue.NewStr("__DbQ_" + name));
+            fac.Put("insert", JsonValue.NewStr("__DbI_" + name));
+            fac.Put("update", JsonValue.NewStr("__DbU_" + name));
+            fac.Put("delete", JsonValue.NewStr("__DbD_" + name));
+            fac.Put("sync", JsonValue.NewStr("__DbCF_" + name));
+            fac.Put("map", JsonValue.NewStr("__DbM_" + name));
+            fac.Put("bind", JsonValue.NewStr("__DbB_" + name));
+            e.Put("facades", fac);
+
+            JsonValue cols = JsonValue.NewArray();
+            JsonValue navs = JsonValue.NewArray();
+            for (int i = 0; i < fs.Count; i = i + 1) {
+                IndexedField f = fs[i];
+                if (f.Kind == 5) {
+                    JsonValue nv = JsonValue.NewObject();
+                    nv.Put("field", JsonValue.NewStr(f.Name));
+                    nv.Put("type", JsonValue.NewStr(f.TypeName));
+                    nv.Put("table", JsonValue.NewStr(this.TableOf(f.TypeName)));
+                    navs.Append(nv);
+                    continue;
+                }
+                JsonValue c = JsonValue.NewObject();
+                c.Put("field", JsonValue.NewStr(f.Name));
+                c.Put("column", JsonValue.NewStr(f.Col));
+                c.Put("type", JsonValue.NewStr(f.TypeName));
+                c.Put("pk", JsonValue.NewBool(f.IsPk));
+                c.Put("identity", JsonValue.NewBool(f.IsIdent));
+                c.Put("notNull", JsonValue.NewBool(f.NotNull));
+                if (f.StrLen > 0) {
+                    c.Put("strLen", JsonValue.NewNum(
+                        Convert.ToString(f.StrLen)));
+                }
+                cols.Append(c);
+            }
+            e.Put("columns", cols);
+            e.Put("navs", navs);
+
+            JsonValue idx = JsonValue.NewArray();
+            List<JsonValue> ias = SemanticIndex.IndexAttrs(cls);
+            for (int i = 0; i < ias.Count; i = i + 1) {
+                JsonValue ia = ias[i];
+                JsonValue io = JsonValue.NewObject();
+                io.Put("name", JsonValue.NewStr(SemanticIndex.AttrStr(ia, "Name")));
+                io.Put("fields", JsonValue.NewStr(SemanticIndex.AttrStr(ia, "Fields")));
+                io.Put("unique", JsonValue.NewBool(
+                    SemanticIndex.AttrBool(ia, "IsUnique", false)));
+                idx.Append(io);
+            }
+            e.Put("indexes", idx);
+            outArr.Append(e);
+        }
+        return outArr;
+    }
+
+    private JsonValue ManifestDoc(int routes, int entities) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("version", JsonValue.NewNum("1"));
+        // Keep the version 1 producer label for existing index readers.
+        o.Put("generatedBy", JsonValue.NewStr("System.Compiler.GenIndex"));
+        o.Put("sourceFiles", JsonValue.NewNum(
+            Convert.ToString(this.files.Count)));
+        o.Put("routes", JsonValue.NewNum(Convert.ToString(routes)));
+        o.Put("entities", JsonValue.NewNum(Convert.ToString(entities)));
+        JsonValue art = JsonValue.NewArray();
+        art.Append(JsonValue.NewStr("routes.json"));
+        art.Append(JsonValue.NewStr("entities.json"));
+        o.Put("artefacts", art);
+        JsonValue fl = JsonValue.NewArray();
+        for (int i = 0; i < this.files.Count; i = i + 1) {
+            fl.Append(JsonValue.NewStr(this.FileOf(i)));
+        }
+        o.Put("files", fl);
+        return o;
+    }
+
+    public int WriteTo(string dir) {
+        JsonValue routes = this.RoutesDoc();
+        JsonValue entities = this.EntitiesDoc();
+        Directory.CreateDirectoryRecursive(dir);
+        File.WriteAllText(dir + "/routes.json", routes.PrettyToJson());
+        File.WriteAllText(dir + "/entities.json", entities.PrettyToJson());
+        File.WriteAllText(dir + "/index.json",
+            this.ManifestDoc(routes.Count(), entities.Count()).PrettyToJson());
+        return routes.Count();
+    }
+
+    private static string AttrHttpVerb(string n) {
+        if (n == "HttpGet") { return "GET"; }
+        if (n == "HttpPost") { return "POST"; }
+        if (n == "HttpPut") { return "PUT"; }
+        if (n == "HttpDelete") { return "DELETE"; }
+        if (n == "HttpPatch") { return "PATCH"; }
+        if (n == "HttpHead") { return "HEAD"; }
+        if (n == "HttpOptions") { return "OPTIONS"; }
+        return "";
+    }
+
+    private static bool DerivesFrom(JsonValue cls, string basename) {
+        JsonValue bases = cls.Get("bases");
+        if (bases == null || !bases.IsArray()) { return false; }
+        for (int i = 0; i < bases.Count(); i = i + 1) {
+            string b = bases.At(i).AsString("");
+            if (b == basename || b.StartsWith(basename + "<")) { return true; }
+        }
+        return false;
+    }
+
+    private static bool IsController(JsonValue cls) {
+        if (cls.Bool("abstract", false)) { return false; }
+        if (cls.Bool("generic", false)) { return false; }
+        string nm = cls.Str("name", "");
+        if (nm == "Controller" || nm == "ApiController" ||
+            nm == "CrudController" || nm == "CurdController") {
+            return false;
+        }
+        if (SemanticIndex.DerivesFrom(cls, "Controller")) { return true; }
+        if (SemanticIndex.DerivesFrom(cls, "ApiController")) { return true; }
+        if (SemanticIndex.DerivesFrom(cls, "CrudController")) { return true; }
+        if (SemanticIndex.DerivesFrom(cls, "CurdController")) { return true; }
+        if (SemanticIndex.AttrNamed(cls, "Route")) { return true; }
+        if (SemanticIndex.AttrNamed(cls, "RouteR")) { return true; }
+        if (SemanticIndex.AttrNamed(cls, "ApiController")) { return true; }
+        if (nm.EndsWith("Controller")) {
+            string ns = cls.Str("ns", "");
+            if (ns.StartsWith("Gui.") || ns.StartsWith("Game.") || ns == "Gui" || ns == "Game") {
+                return false;
+            }
+            JsonValue bases = cls.Get("bases");
+            if (bases != null && bases.IsArray() && bases.Count() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static string ControllerDisplay(JsonValue cls) {
+        string orig = cls.Str("orig", "");
+        if (orig.Length > 0) { return orig; }
+        return cls.Str("name", "");
+    }
+
+    private static string ControllerModule(JsonValue cls) {
+        string ns = cls.Str("ns", "");
+        int dot = ns.IndexOf(".");
+        if (dot >= 0) { return ns.Substring(dot + 1); }
+        return "";
+    }
+
+    private static string ControllerActionName(string disp, string mod) {
+        if (mod.Length > 0) { return mod + "." + disp; }
+        return disp;
+    }
+
+    private static string ControllerToken(JsonValue cls) {
+        string nm = SemanticIndex.ControllerDisplay(cls);
+        if (nm.EndsWith("Controller")) {
+            nm = nm.Substring(0, nm.Length - 10);
+        }
+        return nm.ToLower();
+    }
+
+    private static string BuildPath(string clsTpl, string mTpl, string ctrlTok,
+                            string actionTok) {
+        string tpl;
+        if (mTpl.StartsWith("/")) {
+            tpl = mTpl;
+        } else if (mTpl.Length > 0) {
+            if (clsTpl.Length > 0) { tpl = clsTpl + "/" + mTpl; }
+            else { tpl = mTpl; }
+        } else {
+            if (actionTok == "index") {
+                if (clsTpl.EndsWith("/[action]")) {
+                    tpl = clsTpl.Substring(0, clsTpl.Length - 9);
+                } else if (clsTpl.IndexOf("[action]") >= 0) {
+                    tpl = clsTpl;
+                } else {
+                    tpl = clsTpl.Length > 0 ? clsTpl : "/";
+                }
+            } else if (clsTpl.IndexOf("[action]") >= 0) {
+                tpl = clsTpl;
+            } else {
+                tpl = clsTpl.Length > 0 ? clsTpl + "/[action]" : "/[action]";
+            }
+        }
+        if (tpl.IndexOf("[action]") < 0 && !mTpl.StartsWith("/") && actionTok != "index") {
+            if (tpl.EndsWith("/")) { tpl = tpl + "[action]"; }
+            else { tpl = tpl + "/[action]"; }
+        }
+        /* token 替换 + 斜杠归一化 */
+        StringBuilder sub = new StringBuilder();
+        int i = 0;
+        int n = tpl.Length;
+        int start = 0;
+        while (i < n) {
+            if (n - i >= 12 && tpl.Substring(i, 12) == "[controller]") {
+                if (i > start) { sub.Append(tpl.Substring(start, i - start)); }
+                sub.Append(ctrlTok);
+                i = i + 12;
+                start = i;
+            } else if (n - i >= 8 && tpl.Substring(i, 8) == "[action]") {
+                if (i > start) { sub.Append(tpl.Substring(start, i - start)); }
+                sub.Append(actionTok);
+                i = i + 8;
+                start = i;
+            } else {
+                i = i + 1;
+            }
+        }
+        if (n > start) { sub.Append(tpl.Substring(start, n - start)); }
+        /* 前导 '/'、折叠重复 '/'、去尾 '/' */
+        StringBuilder out0 = new StringBuilder();
+        out0.Append("/");
+        bool prevSlash = true;
+        string s = sub.ToString();
+        int slen = s.Length;
+        for (int j = 0; j < slen; j = j + 1) {
+            int c = s[j] & 255;
+            if (c == 47) {
+                if (prevSlash) { continue; }
+                out0.Append("/");
+                prevSlash = true;
+            } else {
+                int segStart = j;
+                while (j < slen && (s[j] & 255) != 47) { j = j + 1; }
+                out0.Append(s.Substring(segStart, j - segStart));
+                prevSlash = false;
+                j = j - 1;
+            }
+        }
+        string r = out0.ToString();
+        while (r.Length > 1 && r.EndsWith("/")) {
+            r = r.Substring(0, r.Length - 1);
+        }
+        return r;
+    }
+
+    private static string FirstVerbAttr(JsonValue m) {
+        JsonValue attrs = m.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return ""; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue attr = attrs.At(i);
+            if (attr == null) { continue; }
+            string n = SemanticIndex.AttributeName(attr);
+            if (SemanticIndex.AttrHttpVerb(n).Length > 0) { return n; }
+        }
+        return "";
+    }
+
+    private static string MethodVerb(JsonValue m) {
+        return SemanticIndex.AttrHttpVerb(SemanticIndex.FirstVerbAttr(m));
+    }
+
+    private bool BindableParams(JsonValue ps) {
+        for (int i = 0; i < ps.Count(); i = i + 1) {
+            string t = ps.At(i).Str("type", "");
+            if (!SemanticIndex.BindableType(t) && this.FormClassOf(t) == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool BindableType(string t) {
+        return t == "string" || t == "int" || t == "long" ||
+               t == "double" || t == "bool";
+    }
+
+    private JsonValue FormClassOf(string t) {
+        JsonValue cls = this.ClassGet(t);
+        if (cls == null) { return null; }
+        if (cls.Str("kind", "") != "class") { return null; }
+        JsonValue methods = cls.Get("methods");
+        bool hasCtor = false;
+        if (methods != null && methods.IsArray()) {
+            for (int i = 0; i < methods.Count(); i = i + 1) {
+                JsonValue m = methods.At(i);
+                if (!m.Bool("ctor", false)) { continue; }
+                hasCtor = true;
+                JsonValue cps = m.Get("params");
+                if (cps != null && cps.Count() == 0) { return cls; }
+            }
+        }
+        if (!hasCtor) { return cls; }
+        return null;
+    }
+
+    private static JsonValue AttrOf(JsonValue cls, string name) {
+        if (cls == null) { return null; }
+        JsonValue attrs = cls.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return null; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a == null) { continue; }
+            if (SemanticIndex.AttributeName(a) == name) { return a; }
+        }
+        return null;
+    }
+
+    private static JsonValue AttrPositional(JsonValue attr) {
+        if (attr == null) { return null; }
+        JsonValue args = attr.Get("args");
+        if (args == null || !args.IsArray()) { return null; }
+        for (int i = 0; i < args.Count(); i = i + 1) {
+            JsonValue a = args.At(i);
+            if (a == null) { continue; }
+            if (a.Str("k", "") == "assign") { return null; }
+            return a;
+        }
+        return null;
+    }
+
+    private static string AttrStr(JsonValue attr, string key) {
+        JsonValue v = SemanticIndex.NamedArg(attr, key);
+        if (v == null) { return ""; }
+        if (v.Str("k", "") != "lit") { return ""; }
+        if (v.Str("t", "") != "str") { return ""; }
+        return v.Str("v", "");
+    }
+
+    private static bool AttrBool(JsonValue attr, string key, bool dflt) {
+        JsonValue v = SemanticIndex.NamedArg(attr, key);
+        if (v == null) { return dflt; }
+        if (v.Str("k", "") != "lit") { return dflt; }
+        if (v.Str("t", "") != "bool") { return dflt; }
+        return v.Bool("v", dflt);
+    }
+
+    private static int AttrInt(JsonValue attr, string key, int dflt) {
+        JsonValue v = SemanticIndex.NamedArg(attr, key);
+        if (v == null) { return dflt; }
+        if (v.Str("k", "") != "lit") { return dflt; }
+        if (v.Str("t", "") != "int") { return dflt; }
+        return v.Int("v", dflt);
+    }
+
+    private static bool IsIntName(string n) {
+        return n == "int" || n == "long" || n == "short" || n == "byte" ||
+               n == "sbyte" || n == "uint" || n == "ushort" || n == "ulong" ||
+               n == "char" || n == "nint";
+    }
+
+    private static bool IsFloatName(string n) {
+        return n == "double" || n == "float" || n == "decimal";
+    }
+
+    private int ClassifyKind(string type) {
+        if (SemanticIndex.IsIntName(type)) { return 0; }
+        if (SemanticIndex.IsFloatName(type)) { return 1; }
+        if (type == "bool") { return 2; }
+        if (type == "string") { return 3; }
+        if (type.Contains("[") || type.Contains("<") || type.Contains("?")) {
+            return 6;
+        }
+        if (this.EnumGet(type)) { return 4; }
+        if (this.ClassGet(type) != null) { return 5; }
+        return 6;
+    }
+
+    private List<IndexedField> FieldsOf(string cls, int depth) {
+        List<IndexedField> outl = new List<IndexedField>();
+        this.FieldsInto(cls, depth, outl);
+        /* 复合主键里没有自增列:单列整数主键才按 identity 推断,
+         * 多列主键各自都是普通列(除非实体显式写了 IsIdentity) */
+        int pks = 0;
+        for (int i = 0; i < outl.Count; i = i + 1) {
+            if (outl[i].IsPk) { pks = pks + 1; }
+        }
+        if (pks > 1) {
+            for (int i = 0; i < outl.Count; i = i + 1) {
+                if (!outl[i].IdentSet) { outl[i].IsIdent = false; }
+            }
+        }
+        return outl;
+    }
+
+    private void CollectMember(JsonValue m, List<IndexedField> outl) {
+        if (m == null) { return; }
+        if (m.Bool("static", false)) { return; }
+        if (SemanticIndex.AttrOf(m, "NotMapped") != null) { return; }
+        JsonValue ca = SemanticIndex.AttrOf(m, "Column");
+        if (SemanticIndex.AttrBool(ca, "Ignore", false)) { return; }
+
+        string name = m.Str("name", "");
+        if (SemanticIndex.FieldFind(outl, name) != null) { return; }
+
+        IndexedField df = new IndexedField();
+        df.Name = name;
+        df.TypeName = m.Str("type", "");
+        df.Kind = this.ClassifyKind(df.TypeName);
+        string cn = SemanticIndex.AttrStr(ca, "Name");
+        if (cn.Length == 0) {
+            JsonValue pos = SemanticIndex.AttrPositional(ca);
+            if (pos != null && pos.Str("k", "") == "lit"
+                    && pos.Str("t", "") == "str") {
+                cn = pos.Str("v", "");
+            }
+        }
+        df.Col = cn.Length > 0 ? cn : df.Name;
+        df.IsPk = SemanticIndex.AttrBool(ca, "IsPrimary", df.Name == "id");
+        df.IdentSet = SemanticIndex.NamedArg(ca, "IsIdentity") != null;
+        df.IsIdent = SemanticIndex.AttrBool(ca, "IsIdentity",
+                                    df.IsPk && df.Kind == 0);
+        df.NotNull = !SemanticIndex.AttrBool(ca, "IsNullable", !df.IsPk);
+        df.StrLen = SemanticIndex.AttrInt(ca, "StringLength", 0);
+        if (df.Kind != 6) { outl.Add(df); }
+    }
+
+    private void FieldsInto(string cls, int depth, List<IndexedField> outl) {
+        if (depth > 8) { return; }
+        JsonValue decl = this.ClassGet(cls);
+        if (decl == null) { return; }
+        JsonValue bases = decl.Get("bases");
+        if (bases != null && bases.IsArray()) {
+            for (int b = 0; b < bases.Count(); b = b + 1) {
+                string bn = bases.At(b).AsString("");
+                if (bn.Length > 0) { this.FieldsInto(bn, depth + 1, outl); }
+            }
+        }
+        JsonValue fields = decl.Get("fields");
+        if (fields != null && fields.IsArray()) {
+            for (int i = 0; i < fields.Count(); i = i + 1) {
+                this.CollectMember(fields.At(i), outl);
+            }
+        }
+        JsonValue props = decl.Get("props");
+        if (props != null && props.IsArray()) {
+            for (int i = 0; i < props.Count(); i = i + 1) {
+                this.CollectMember(props.At(i), outl);
+            }
+        }
+    }
+
+    private static IndexedField FieldFind(List<IndexedField> fs, string name) {
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (fs[i].Name == name) { return fs[i]; }
+        }
+        return null;
+    }
+
+    private string TableOf(string cls) {
+        JsonValue decl = this.ClassGet(cls);
+        JsonValue attr = SemanticIndex.AttrOf(decl, "Table");
+        string n = SemanticIndex.AttrStr(attr, "Name");
+        if (n.Length == 0) {
+            JsonValue pos = SemanticIndex.AttrPositional(attr);
+            if (pos != null && pos.Str("k", "") == "lit"
+                    && pos.Str("t", "") == "str") {
+                n = pos.Str("v", "");
+            }
+        }
+        return n.Length > 0 ? n : cls;
+    }
+
+    private static List<JsonValue> IndexAttrs(JsonValue cls) {
+        List<JsonValue> outl = new List<JsonValue>();
+        JsonValue attrs = cls.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return outl; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a == null) { continue; }
+            if (SemanticIndex.AttributeName(a) == "Index") { outl.Add(a); }
+        }
+        return outl;
+    }
+
+    private string PkOf(string cls) {
+        List<IndexedField> fs = this.FieldsOf(cls, 0);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (fs[i].IsIdent) { return fs[i].Name; }
+        }
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (fs[i].Name == "id") { return fs[i].Name; }
+        }
+        return "";
+    }
+
+    private JsonValue ClassGet(string name) {
+        JsonValue v = null;
+        if (this.classesByName.TryGetValue(name, out v)) { return v; }
+        return null;
+    }
+
+    private bool EnumGet(string name) {
+        JsonValue v = this.ClassGet(name);
+        return v != null && v.Str("kind", "") == "enum";
+    }
+
+    private static bool AttrNamed(JsonValue owner, string name) {
+        return SemanticIndex.AttrOf(owner, name) != null;
+    }
+
+    private static string AttrStringArg(JsonValue owner, string name) {
+        JsonValue value = SemanticIndex.AttrPositional(SemanticIndex.AttrOf(owner, name));
+        if (value == null || value.Str("k", "") != "lit" || value.Str("t", "") != "str") { return ""; }
+        return value.Str("v", "");
+    }
+
+    private static string AttributeName(JsonValue attr) {
+        string name = attr.Str("name", "");
+        int dot = name.LastIndexOf(".");
+        if (dot >= 0) { name = name.Substring(dot + 1); }
+        if (name.EndsWith("Attribute")) { name = name.Substring(0, name.Length - 9); }
+        return name;
+    }
+}

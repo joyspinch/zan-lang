@@ -108,6 +108,19 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      才判死。
      回归用例：`tests/conformance/overload_lambda_target.zan`（跨文件 partial，
      干扰重载在调用点声明）。
+   - 边界（**实例方法组与继承链调用**）：IR 的 `arg_method_group` 必须与
+     checker 的 `expr_method_group` 同时接受 identifier 与 `AST_THIS_EXPR`：
+     `state.Click` 从局部静态类型取 class/struct，`this.Click` 从当前类型取，
+     再按目标委托签名评分。把它当未知普通值会令继承候选同分，派生
+     `OnClick(EventValue)->void` 抢走基类 `OnClick(Action)->Parent`，自然链
+     `new Child().OnClick(state.Click).Height(36)` 在末端报 E3068；仅修局部
+     receiver 仍会漏掉真实 `return new Button("Action").OnClick(this.Click).Height(36)`。
+     保留遮蔽：局部存在但类型未知时不得回退 binder 同名类型；成员命中字段时
+     仍是普通值（含 `this.Click` 委托字段），不得误识别成方法组。返回类型推断
+     与实际调用必须使用同一重载选择，不能靠拆链、强转或委托临时变量掩盖缺陷。
+     回归用例：`tests/conformance/inherited_overload_chain.zan`，覆盖局部/this自然链、
+     直接return、partial父类自身双重载与子override、接收者身份、standalone、
+     派生值重载、静态方法组、局部/this委托字段。最小复现绿后还须实际验证原消费者。
    - 手法（确认编译器实际选了哪个重载）：在**每个**候选重载里各放一句
      `throw new Exception("PICKED-<签名>")`，跑一次看抛的是哪一句——比读评分
      逻辑快得多。最小复现要按真实调用形状写：**Zan 不接受顶层函数**（顶层只
@@ -249,19 +262,20 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：这类错位**必现编译错误**（字符串落进 int 形参），所以"改完必编译"
      就能全量兜住；但脚本层的回读校验能把发现点从"编译失败逐个排查"提前到
      "脚本当场报错"，批量改写一律两条都上。
-16. **类型参数按名字统一是有意架构，不要"按层隔离"重构**：
-   - 动作：遇到"同名 `T` 先到先得"（`register_type_param_list` 在根作用域只留
-     第一个同名对象）时，不要顺手把它改成"方法级注册进方法作用域"的分层隔离——
-     全部消费方（`binder_type_params_equiv` 比 arity、`checker_unify_method_tp` /
-     `checker_type_equal` / irgen `di_subst_param` 按名字 memcmp）从不比对对象
-     指针，同名即同义，谁的对象被留下不可观测。
-   - 理由：checker **全程不设置 `current_scope`**（零处赋值），`resolve_type` 的
-     `rt_scope` 缓存守卫令 checking 阶段方法体内新出现的类型引用全部落回
-     **根作用域**解析——根作用域那份注册是承重墙，拆掉或分层会让泛型方法体
-     一律 E1005（A453 两轮探针 + 静态审计的结论；钉形
-     `tests/conformance/type_param_same_name`）。
-   - 边界：真正的同名冲突在内建类型层（`class Dict<K,V>` 被 builder 的内建
-     Dict 顶掉），那是 A551 的事，与类型参数注册无关。
+16. **类型参数保留根 fallback，声明作用域必须遮蔽同名普通类型**：
+   - 动作：保留 `register_type_param_list` 的根作用域 fallback 与按名字的类型
+     参数等价判定；binder 绑定方法签名、checker 检查类/方法时用
+     `zan_binder_push_type_params` 叠加显式声明的类型参数，结束恢复原作用域。
+     方法类型参数遮蔽同名类参数，不能先按接收者实参替换掉方法自己的 `T`。
+   - 理由（2026-11-12 实证）：`ffi_nint_handle` 的普通 `class T` 曾让 checker
+     将只读集合构造器的 `List<T>` 形参重解成 `List<普通类T>`，字段却仍是
+     `List<类型参数T>`，报同名类型不可转换。两者 kind 不同，不能靠放宽泛型
+     不变性或按名字忽略 kind 来放行。
+   - 边界：签名复用 binder 的声明绑定；显式类型参数作用域中解析的方法体类型
+     也保留词法绑定（`rt_type` 非空且 `rt_scope == NULL`），交给 IR 现有的
+     方法/类实例替换；普通缓存仍按作用域校验。根 fallback 不删除，闭合泛型
+     不变性不放宽。判定器：`case_ffi_nint_handle`、`case_type_param_same_name`
+     （含普通 T/U 碰撞、构造器/局部/返回值、方法参数遮蔽）及泛型不变性负例。
 ---
 
 ## 二、LLVM 代码生成与指令下沉（IRGen）

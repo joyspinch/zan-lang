@@ -240,7 +240,7 @@ kernel32、shell32、user32、advapi32、version）。
 ## 16. 自举的 string 是「带长度头的托管串」——不是裸 C 字符串
 
 - 动作：自举 IR 后端的 `string` 值指向一个托管块的 payload，块前面是
-  `[i64 len][i64 magic]`，payload 仍以 NUL 结尾（与 C 运行时的 ABI 不变），
+  `[i64 rc][i64 cid=0][i64 len][i64 magic]`，payload 仍以 NUL 结尾（与 C 运行时的 ABI 不变），
   长度取**精确字节数**而不是 `strlen`。新造字符串只有三条路：`zstr_new(len)`、
   `zstr_of(裸C串)`、字面量（常量区直接排好头）。数组 → string 的隐式转换
   必须在**每个 string 位置**做（声明 / 赋值 / 字段 / 实参 / return）。
@@ -2887,7 +2887,7 @@ kernel32、shell32、user32、advapi32、version）。
 ## 147. 字符串头与对象 ARC 头不通用：动态调用返回值不能对字符串字面量 `@zretain`
 
 - 坑（2026-11-10 实测）：在泛型容器（如 `List<T>`）的动态反射调用（`InvokeString`/`InvokeObject`）中，对返回指针如果统一调用 `@zretain`，当被反射方法返回的是字符串常量时，由于字符串在只读 `.rdata` 常量区，其对象头布局为 `[-24]=0, [-16]=len, [-8]=magic (TSNZ/1515082580)`，而不是 ARC 类对象的 `[-24]=cid, [-16]=rc, [-8]=dtor`。调用 `@zretain` 会在 `lock incq -0x10(%rcx)` 处尝试原子递增只读段中的字符串长度字段，直接触发 Windows 0xC0000005 写入访问冲突崩溃。
-- 口径：字符串（不管是字面量还是动态分配的托管串）不走类对象的 `@zretain` 引用计数机制，动态反射调用返回字符串/类对象时，应将原始 `inttoptr` 后的指针直接存入结果槽位，绝不能误加 `@zretain`。
+- 当前口径（2026-11-11）：普通 string 已有独立 `[-32]=rc`，`zretain/zrelease` 必须先区分 class/string 再委派 `zstr_retain/release`，不能直接读写字符串的 `[-16]` 长度槽。字面量 rc=-1；TypeInfo 特殊静态头 cid=kind1..8，必须在读 rc 前排除。动态反射返回值的拥有/借用按实际调用契约处理，不能以跳过全部 string retain 掩盖泄漏。完整布局与受测分配闭账见 [selfhost-string.md](selfhost-string.md)。
 - 判据：`tests/selfhost/diff_cases.txt` 收录 `reflect_builtin_list` 钉住。
 
 ## 148. 重载候选评分必须考虑接口实现与基类继承（子类型实参精准匹配）

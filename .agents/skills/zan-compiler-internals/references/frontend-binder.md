@@ -240,3 +240,22 @@
   探针只覆盖你想得到的形态，矩阵才暴露真正的分界线——而且前瞻改动波及
   **全仓每个以标识符开头的语句**，回归面远大于看上去。
 
+
+## 12. Named array 前瞻与 Task 精确绑定（2026-11-11 实证）
+
+- 数组局部声明与 cast 的 rank 扫描必须一致：host `looks_like_var_decl` 的简单名、限定名、泛型后缀分支均需接受 rank 中的逗号；selfhost `IsNamedCast` 识别命名类型后的连续 `[]` / `[,]`，再交给 `ParseType`。只接受空/逗号 rank 内容，保留 `(a[i])` 下标与 `(x) + y` 分组；不能把自然 fixture 改成别的写法绕过 parser。回归：`selfhost_named_array_cast` 覆盖 class[] / class[,] cast 后读写及两种表达式边界。
+- Task.Run/Spawn 的 Action 方法组由 checker 单次选择：零参、无方法类型参数、同步 void；类型接收者要求 static，值接收者要求 instance，隐式 instance 要有 this。零参派生候选即使返回类型错误也隐藏基类，其他 arity 可继续查基类；保留 local/field/property 遮蔽和歧义诊断。成功将实际 MethodDecl 写入 `arg.resolvedSym`，irgen 消费它，不按名字重新筛选；`Make().Work` 需要成员调用类型推断的 `StaticRecv` 回退，类型名没有表达式值类型。
+- 内建 Task 路由也只有一个判定来源：CheckCall 每次重置 `callee.isIntrinsic = IsTaskActionCall(call)`，排除同名 local/field/getter；此标记属于 callee，不可混用 call 自身的 resolved-method intrinsic 标记。TaskCallType、Run/Spawn 发射入口及最后 unsupported 兜底都必须尊重该结果。只挡早期内建入口仍会在名称兜底误拒用户 `Task.Run/Spawn`；shadow 用例必须观察用户方法先打印的同步副作用，不能只观察回调执行。
+- 访问权限必须检查选中的 MethodDecl：`CheckSelectedInternalAccess(selectedOwner, selected, at)`；按 name 再 FindMethod 会读到首重载的权限，既可能漏拒 internal 零参方法，也可能误拒 public 零参方法。正式跨模块测试每文件一个 namespace，通过已有多源 ZANC_ARGS 输入 helper；conformance helper 放 `helpers/` 避免根 glob 独立注册。回归：`task_action_selected_public`、`task_action_selected_internal` 与 `task_action_shadow`。
+- 验证边界：本轮主会话报告新增 3 组 host/gen1 对拍 PASS，6 项 host CTest 全 PASS（7.27 秒）。这不表示所有限定名/generic cast 或访问权限模型均已覆盖；nullable 的本轮验证未开启 ARC 检查。
+
+### 泛型接收者的重载返回类型
+
+- `checker_expr_core.c` 通过实参类型选中实例重载后，用接收者的具体类型实参替换该类直接声明的方法返回类型，包括嵌套的 `List<T>`；不要把初选候选或原始声明的开放类型带回调用方。方法自己的显式类型实参绑定也要保留。继承方法的类型实参应按声明类型的继承关系求解，不能按派生类型参数的位置猜测。
+- 判定器：`case_generic_overload_return` 检查 `int` 和 `string` 重载分别返回正确的 `List<具体类型>` 结果；`case_orm_reverse_relation` 检查原始消费者。最小复现无需安装包。
+
+### 同名实例成员不能用不适用候选遮蔽扩展
+
+- checker 的初选、typed fallback 与唯一实参签名都必须先检查调用实参数和显式泛型元数；不能保留已被过滤的同名成员作成功结果。唯一 raw `Query(string)` 曾把合法 `Query<Entity>()` 扩展的返回类型判成 `DbResult`，而 raw 重载组因唯一签名为空反而掩盖缺陷。
+- irgen 的共享扩展评分同样拒绝显式泛型元数不符的候选；异步性判定与正常调用都复用这份选择，避免声明顺序决定 async 标记。
+- 判定器：`case_extension_member_collision`（唯一/重载 raw 成员）、`case_async_generic_extension`（相反 async 标记与错误泛型元数）、`case_orm_executor_extensions`（真实 IDbExecutor）。

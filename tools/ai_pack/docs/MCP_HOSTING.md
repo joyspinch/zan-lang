@@ -4,20 +4,21 @@ The MCP server can host a workspace over stdio or HTTP. Knowledge files are
 server-side artifacts: clients do not need local copies of `symbols.json`,
 `gallery.json`, or `form.json`.
 
-Generate the source-driven gallery and form schema with the Zan tool:
+From the repository root, build the server or generate the source-driven gallery.
+Both tools compile the shared Gallery sources. The MCP server also uses the
+semantic index emitter shared with `zanindex`:
 
-```text
-zanc tools/genknowledge/GenKnowledge.zan --stdlib-path stdlib -o build/genknowledge
-build/genknowledge --root . --stdlib stdlib --out knowledge \
-  --seed tools/mcp_server/gallery.json \
-  --doc tools/mcp_server/form.doc.json \
-  --controls tools/mcp_server/form.controls.txt --write-controls
+```sh
+build/zanc --stdlib-path stdlib tools/mcp_server/*.zan tools/shared/gallery/*.zan tools/shared/semantic_index/*.zan -o build/zan-mcp
+build/zanc --stdlib-path stdlib tools/zanindex/ZanIndex.zan tools/shared/semantic_index/*.zan -o build/zanindex
+build/zanc --stdlib-path stdlib tools/genknowledge/GenKnowledge.zan tools/shared/gallery/*.zan -o build/genknowledge
+build/genknowledge --root . --stdlib stdlib --out knowledge --seed tools/mcp_server/gallery.json
 ```
 
 After the server starts, `zan_start_here` reports whether the knowledge
 artifacts are present and fresh. A mutable server with the source inputs
-advertises `zan_refresh_knowledge`, which regenerates `gallery.json` and
-`gallery.json` in process. It does not build RepoMap or replace `symbols.json`;
+advertises `zan_refresh_knowledge`, which regenerates `gallery.json` in process.
+It does not build RepoMap or replace `symbols.json`;
 generate that index separately when it is missing.
 
 For a shared HTTP deployment, bind to a non-loopback address only with bearer

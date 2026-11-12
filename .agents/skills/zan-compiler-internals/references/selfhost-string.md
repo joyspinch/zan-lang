@@ -7,15 +7,14 @@
 自举的 `string` 值是一个 `i8*`，指向托管块的 **payload**：
 
 ```
-  [ i64 cid ][ i64 len ][ i64 magic ][ bytes... ][ NUL ]
-  ^ payload-24  ^ payload-16  ^ payload-8   ^ payload(=值)
+  [ i64 rc ][ i64 cid ][ i64 len ][ i64 magic ][ bytes... ][ NUL ]
+  ^ payload-32  ^ payload-24  ^ payload-16  ^ payload-8  ^ payload(=值)
 ```
 
 - `len` 是**精确字节数**（不是 `strlen`）：嵌入的 NUL 不再截断长度。
 - `magic` = `1515082580`（0x5A4E5354）：`zstr_len` 读到它才认这是托管串。
-- `cid` 是**类标识槽**（当前恒为 0）：与对象头同宽（24 字节），运行期类型
-  判定读任何堆值的类标识槽都不会越界，见
-  [selfhost-classid.md](selfhost-classid.md)。
+- 普通字符串的 `cid` 为 0，`rc` 位于 payload-32；堆串从 1 开始原子 retain/release，归零释放 raw=payload-32。旧三个槽偏移不变。类型判定遵守 [selfhost-classid.md](selfhost-classid.md)。
+- 字面量 `rc=-1` 永生，八个字节显式写 `\\FF`，不能让只支持非负数的 HexI64LE 输出 -1。TypeInfo 特殊静态串的 cid 为保留 kind 1..8，payload-32 仍是反射元数据；`zstr_retain/release` 必须先检查 cid==0，再读 rc，不能改写只读 metadata。
 - payload 仍然 **NUL 结尾** → 传给 C 运行时（`printf("%s")` 等）依然合法，
   与 C 宿主的运行时 ABI 不变。
 - 运行时辅助（自举后端生成）：
@@ -29,8 +28,8 @@
 1. `zstr_new(len)` —— 自己知道长度；
 2. `zstr_of(cstr)` —— 包装一个外部返回的裸 C 串（extern 的 string 返回值、
    `snprintf` 出来的数字字符串）；
-3. **字面量** —— 常量区直接按 `[cid][len][magic][bytes][NUL]` 排好，值取
-   `getelementptr ..., 0, 24`（跳过 24 字节头）。
+3. **字面量** —— 常量区直接按 `[rc=-1][cid][len][magic][bytes][NUL]` 排好并 align 8，值取
+   `getelementptr ..., 0, 32`（跳过 32 字节头）。
 
 `zstr_len` 读到不认识的 magic 就 `abort()`——这是**故意的**：漏掉一个来源
 会立刻炸，而不是静默返回一个错长度。调试时先想"哪个 string 不是托管的"。
@@ -115,4 +114,6 @@ h.IndexOf("CD")=-1  h.LastIndexOf("C")=-1  h.EndsWith("CD")=0
 
 - `byte[]` / `char[]` → `string` 是复制而非共享 view（C 宿主是共享），
   见 `TASKS.md` A390。
-- 自举的 string 不参与 ARC（`malloc` 之后不释放），与改造前一致。
+- string 现参与 ARC；fresh producer 通过 OwnedString/AddTemp 登记，赋值先 retain 新值再替换并释放旧值。AddTemp 只去重当前 live 的同 operand，不可把跨 statement 的历史登记当 live。
+- 循环条件分支的 temp 槽释放必须先清 null，避免下轮死臂再次消费旧指针。异步返回先独立 retain/store result，再消费 statement temps；只验证值正确不能证明临时量闭账。
+- 2026-11-11 durable string 11 组在 gen1 `ebe2ded3d5aa19596d3f47785bc030f3ef2a0fab8f6378a79ca2ad13ce333f4e` 实测 134 allocation/134 free，各组 live blocks/bytes 与 bad free 均 0；包含 alias、return、容器、转换/NUL、异常、object 动态所有权及跨 Yield。观测只覆盖生成模块分配，不含 runtime 内部，也不证明所有 API 或并发分配。nullable await 临时实参的独立修补需单独验收。

@@ -56,11 +56,20 @@ description: Zan 游戏开发规范——Gui 美术风格一致性、帧循环�
 - 等下一帧时使用可被输入和后台任务唤醒的原生等待，不叠加帧尾 Sleep；隐藏/
   最小化窗口跳过光栅化。慢速运动仍按连续时间求值，不能因速度慢而隔几十毫秒
   才更新相位；加载圆点 90ms 整步在提高帧率后仍会重复同一画面。
-- 排空输入时，保留树在渲染期消费的按下、释放、按键和字符事件必须先完成该帧
-  再取下一条。为什么：GuiHost 排空到释放之后的 mouse-move 曾丢掉 HUD 点击，
-  单纯挂住最后 kind 也会覆盖连续点击。每轮泵输入前清除上轮 HoldEventKind，
-  无输入的显示回调/空唤醒不能回退为旧 release；回归包含同批两次点击、尾随
-  移动和释放后的空唤醒，并精确断言按下、释放和点击次数。
+- 标准控件与 GameViewport 在 App 输入泵中即时路由，世界输入不能在 Render
+  后重查旧 hitTester/ClickClaimed 再桥接。GuiHost.SetContentRoot 显式挂真实内容树，
+  AttachViewport 只认领逻辑步进；HUD/Layer 复用既有 adapter 链的末端 fallback。
+  KeyDown 尊重当前 GUI 消费，未消费的全局动作保持兼容；KeyUp、失焦与 Stop
+  幂等释放，InputMapper 的按下/释放边沿只在实际逻辑步后清理，零步与重绘保留。
+  HoldEventKind 和离散事件先呈现的节奏仅保留旧绘制期消费者兼容，不是标准输入主路径。
+  `guihost_loop_test` 已通过真实离屏输入与原循环的 strict golden/leak/guard。
+- 焦点语义释放与业务 Blur 分开：FocusManager 保存取得时的 weak Control，
+  setter 先提交新 id/身份再调用旧 OnInputFocusLost，回调后不写回；Tab、ClearFocus、
+  kind9 同源，隐藏后卸载仍按保存身份清理。根/fallback 变化只释放离开新输入树的
+  状态，回调可替换第三棵树；generation/原链接检查防外层覆盖重入结果。
+  `scene_router_input_test` 已验证根替换保留与释放、Cancel/失焦重入、真实 HTML
+  输入、OnEnter/OnExit/Stop 重入、无树场景与关闭 weak 寿命，并通过 strict golden/leak/guard。
+  这些定向回归不代表游戏实窗、模板全量或 IDE 验收完成。
 - 逐段计时用**环境变量开关的 prof 走廊**（如 `XXX_PROF=1`）：启动后定时
   自动触发一次玩家操作（自动发射/自动点击），从那一帧起连打 N 帧分段
   账单到 stdout。复现"首次操作卡"这类问题全靠它，人手点永远复现不齐。
@@ -140,102 +149,70 @@ description: Zan 游戏开发规范——Gui 美术风格一致性、帧循环�
 - HUD 不显示/不置顶/画布错位，先查三条：合成循环是否根本没跑（空闲
   死锁）、是否绕过了置顶链、锚点算的是窗口还是画布坐标。
 
-## HUD 用 HTML/CSS 声明（游戏与 Gui 同引擎）
+## 世界画布与标准 HUD 的边界
 
-- 游戏 HUD/菜单/面板不需要独立 UI 宿主或第二表面：HTML 声明的 UI 就是
-  同一棵 Gui 控件树。帧体 = 世界直接画上画布（HUD 树之前）→
-  hud.MeasureTree/Arrange/RenderTree（RenderFrame 的组合调用是公开
-  契约）→ PresentFrame。参考预算 1280x800、240 实体 + HTML HUD：
-  clean/dirty avg 3ms、max 23ms（60fps 预算 16.6ms，余量 5 倍）；
-  空闲时事件驱动门控天然零渲染。
-- **自写循环显式声明出帧需求**：Show 后先 RequestRedraw；每次 Present 后
-  为仍在运行的动画请求下一帧。ProcessEvent 等显示截止时间时保留原生输入/
-  后台唤醒，PollOneEvent 仅用于无阻塞排空。为什么：首拍漏请求曾阻塞等输入；
-  每轮强制轮询配帧尾 Sleep 又绕开显示同步，不能作为通用帧率控制。
-- **像素断言在 Present 之前做**：present 后画布内容不保留（与合成
-  契约同源）；GetPixel 是回读同步、每样本只读一个像素，条带哈希级
-  采样会把探针拖慢一个量级。
-- 台账（已闭）：运行期 HTML 流式子元素的 % 宽未生效（内联/样式表
-  alike 回落 auto=100% 母宽）——P8 已修（StyleDeclaresWidth 认 Pm、
-  包含块未定的测量路径回落 fb），血条宽度可直接 `width:X%` 驱动。
+游戏 UI 采用 HTML + CSS 或保留模式声明式对象树。HUD、血条、伤害数字、
+小地图 UI、菜单、背包、提示、结算与 SceneDesigner 都属于标准控件面；
+像素绘制封在控件 `OnPaint` 内，应用只配置属性、样式、绑定与数据。
+RTS/动作游戏也遵守这条规则，高刷新率不是外部直绘 HUD 的例外。
 
-### 世界画布 + 声明式 HUD 叠加定式（工厂塔防模板 全链路验证）
+世界、实体、地形、世界内粒子等仍走 Zan.Game 的世界/视口渲染，
+不把世界渲染当成 Gui 控件范式。两者在同一帧合成，避免多个宿主重复
+清屏或 Present；帧顺序按实际 GuiHost/视口契约核对，不照抄旧手工布局循环。
 
-RTS/工厂类也能吃声明式 HUD：每帧变的游戏坐标内容（小地图/边缘预警/
-粒子）留在画布直绘，chrome（顶栏/面板/建造栏/结算幕）全部进
-App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的：
+- **长生命周期控件**：初始化时建 HUD 树并接事件，对局中更新状态与绑定。
+  不逐帧重建控件，不另建 zone 表与手写按钮命中体系。
+- **检查器的持久属性树与单一提交**：SceneDesigner 等属性面板按实例保留
+  根、属性行与输入控件，渲染/选择切换只同步值和显隐，不重建或重挂子树。
+  Change/Click 走一个模型提交出口，回填时抑制提交，比较旧值后才写入并
+  记录一次 undo；无变化、拒绝值和绘制不添空 undo。资源选择调用 `SetText`
+  后须显式 commit（如 `CommitInspectorText`），因为 SetText 不触发 Change；
+  RGB 提交保留独立 alpha。2026-11-11 `scene_designer_inspector` 严格 golden
+  probe 覆盖真实离屏输入、undo、anchor、RGB/alpha、资源、滚动和根/行稳定，
+  `scene_designer_color` 亦通过；这些结果不代表 IDE 或正式 CTest 已通过。
+- **区域 HUD 同几何接入输入，隐藏时释放输入状态**：嵌入 dock 或子区域用
+  `HudLayer.RenderIn(app, x, y, width, height)`，参数为 App 坐标；同一树在
+  该区域 Measure/Arrange/RenderTree，并绑定 Visual Tree 输入聚合根。
+  不另算命中坐标、不重新收养节点，单独 RenderTree 不会接入输入。
+  关闭 dock/离页调用 `SetInspectorVisible(false)` 或该层 `SetVisible(false)`，
+  摘除输入入口并只释放本层子树的 focus/pointer capture。检查器 probe 已
+  直接验证 hidden 释放焦点与再显示根稳定；capture 释放按实现契约记录，
+  此 probe 未直接断言，不外推为 capture 或 IDE 实机交互验证通过。
+- **聚合输入根须覆盖焦点与成员查询**：HudInputRoot 不收养 HUD 节点，必须通过 `Control.ContainsInputControl` / `FindInputFocus` 覆盖它聚合的子树。重排根仅取消已经离开新输入树的捕获；隐藏、Remove、Clear 调用 `App.ReleaseInputSubtree`，只释放本层状态。2026-11-12 GuiHost 原用例新增多层字符输入、重排/移出区域后捕获与隐藏隔离断言，以相同 golden/leak/guard 通过；测试循环持有 Button 时，Stop 必须解除反向强捕获的测试回调，否则测试自身成环。此结果不等于全部 HUD/IDE 已迁移。
+- **性能优化留在组件层**：静态缓存、变值更新、真实动画损伤、限速
+  重绘与素材合批。帧预算包括世界、HUD 与最终提交，不能凭历史均值
+  宣称当前组合有固定余量。
+- **文档入口**：约定式窗口 `new MainForm().Show()` 配同名 HTML；
+  已有宿主页面 `Gui.Html.Load(app, html, handlers, baseDir)` 返回树，
+  再挂进父控件，并按需注册 ModelBinder。Parse 内自动 Install。
+  zanc 只编译 `.zan`，HTML 运行期读取，发布用 `--embed`。
+- **CSS 组合**：HUD 根与窗口表面需要让世界透出时配置透明；根尺寸
+  按 Flex/Grid 与视口确定，不能靠数字 dock 或已删除的 JSON 建树接口。
+- **输入分工**：HUD 使用控件路由、焦点与指针捕获；世界输入应尊重
+  UI 消费结果，防止同一次操作同时触发 UI 和世界。
+- **像素检查在 Present 前**：Present 后不再假定画布保留；采样回读
+  自身有成本，不放进生产帧热路径。
 
-- **每帧组合不要调 RenderFrame**：它内部先 RenderBackground（主题
-  底色+壁纸），会把世界整个盖掉。手动走三步
-  `MeasureTree → Arrange(ShapeOffX, ContentTop+ShapeOffY, clientW, clientH-ContentTop) → RenderTree`，
-  世界画在其前。
-- **游戏皮肤的 `window { background }` 必须透明**：RenderTree 先画
-  Form 自身的 window 样式表面——写 opaque 底色就是全屏遮罩，表现为
-  "HUD 在、世界全黑"。根 Panel（Panel.Root，style=3）天然透明，别画蛇添足。
-- **自由几何推荐使用绝对定位 CSS**：
-  悬浮面板推荐声明 `style="position: absolute; left: ...; top: ...;"` 或包进一个
-  全屏弹性宿主容器中，避免流式堆叠导致面板全宽压顶。
-  悬浮面板包进一个满宽宿主再定位。
-- **裸 `<stack>` 标签不是 Stack 控件**：TagKind 兜底成自由 Panel，
-  子级全叠原点。纵列用 `<zan-flex class="column">`。
-- **事件键是 `"Click"` 不是 `"click"`**：生成器发
-  `SetHandler(key.Substring(2))`，模型键 onClick 截出 Click。
-  自测合成点击走 `form.Call(control.GetHandler("Click"))`，与真实
-  点击同一条 form.Call 分发路径。
-- **设计文档必须显式列进 zanc 命令行**（App.html 与 main.zan 同目录
-  也不会被自动捡起；漏了就是生成字段全体缺失，报
-  "partial class has no member rXxx" 满屏）。
-- **皮肤从 cwd 解析**（`./skins` walk，其次 $ZAN_GUI_SKINS，再次
-  exe 内嵌）：开发期从模板目录运行；发布 `--publish --embed
-  skins=skins`。皮肤没加载时回落内置暗色主题——"界面突然变灰"先查 cwd。
-- **code-behind 每帧回写习惯**：文案 `.Text =`（Binding<string> 存常
-  量）、进度 `SetPercent`、禁用 `Disabled =`（` :disabled` 样式）、
-  显隐 `visible`（子树整体退出测量/布局/命中）、互斥选中态
-  `SetClassIn("cf-a cf-b", ...)`。事件接线一次性 `form.On(name,  => …)`。
-  状态按钮文案要**常驻**（如"蓝图 B"）：宽度随状态变化的 `.Text` 会让
-  flex 工具栏整行回流、按钮左右跳动；状态用 `SetClassIn` 高亮 + 世界
-  叠加层/状态栏表达（实测：三态文案按钮把整条工具栏反复重排）。
-- **双通道输入的分工**：自有循环里 PollOneEvent→ProcessEvent 已把
-  真实点击路由进控件树；世界输入通道（game.Input）按容器
-  bx/by/bw/bh + visible 做 HudConsumes 遮蔽，HUD 上的桌面事件不进世界。
-
-## 立即模式直绘 HUD（RTS/工厂类的全图形化热 HUD）
-
-- 全图形化 HUD（画面上零原生控件）的定式：渲染帧清空 zone 表 → 各
-  面板边画边注册命中区（id/x/y/w/h）；输入按 ZoneAt 命中分发，悬停
-  高亮直接用上一帧 zone 表（HUD 帧率下无感知）。`Button` 画完
-  **返回右缘 x+w**；向左链式排布必须显式两步 `Button(...); bx = bx
-  - gap - w;`——写成 `bx = Button(...) - gap - w` 丢了 w，按钮会叠在
-  一起（工厂塔防模板实测间距只剩 9px）。
-- 游戏的式样由游戏美术确定：立即模式 HUD 与 Gui 控件共享视觉规格。
-  Gui 菜单/面板通过 `UseSkin("游戏名")` + `skins/<名>/skin.css` 使用
-  游戏专属皮肤，标题栏不设通用皮肤选择按钮（用户裁决）。验收按前文
-  “图形游戏的 Gui 组件必须匹配游戏美术风格”，声明式叠加路径见
-  “世界画布 + 声明式 HUD 叠加定式”。
+以上是当前开发约定，不表示仓库旧 HUD、SceneDesigner 或各模板已全部
+迁移或通过实机验证。实现现状与迁移门见 `docs/GUI_ARCHITECTURE.md`。
 
 ## 游戏界面设计方案：菜单/面板走 .html 设计稿 + Nav 出口
 
 放置/面板驱动类（legend、wuwei 这类"页签导航 + 全屏面板堆"，界面
-代码占大头）按声明层方案组织，不要手写建树；RTS/动作类不适用（见
-热路径边界）。
+代码占大头）按页面组织；RTS/动作类的 UI 同样使用标准控件，
+世界渲染按前节边界执行。
 
 - **每个页面一张 .html 设计稿**：布局/列表/样式进设计稿，数据绑定走
   `data-bind`/`data-for`（服务端 JSON 或本地模型都接 JsonValue），
   交互在 code-behind。五件声明原语与硬边界见 gui-design skill 的
-  "HTML 窗口开发定式"（设计稿必须是编译输入第一个文件等）。
+  "HTML 窗口开发定式"（运行期文档装载与模型绑定；发布用 `--embed`）。
 - **页与页切换 = `Gui/Nav.zan` 的 `Nav.Embed`**（Tabs-as-outlet）：
   路由表对应按钮排（legend 的按钮本来就从 navigation.csv 读——
   `data-for` 一条渲染），中间区 = 出口；惰性实例化、默认切走保留
   （keepAlive）、可按路由配临态。别用 N 个布尔 data-if 硬拼页切换
   （data-if 只认路径真值，没有比较表达式）。
-- **热路径边界**：每帧变的 HUD（血条/伤害数字/选中框/小地图）继续
-  代码直绘 + 门控渲染（上一节）——那是性能边界不是能力缺口；
-  RTS/动作类整体属这类，HTML 化收益低。放置类主城的计数条量少，
-  直绘或 HTML 都行。
-- 已知坑出处：wuwei 百艺页签全叠的根因是**只带自家 skin.css 的目录暂存吞掉
-  了 stdlib 基线内嵌**（编译器已把跳过条件收紧成"暂存目录自带 base.css"），
-  不是"该把 base.css 一起带"；运行时建树用 `App.LoadHtml`，编译期通道用
-  GenHtml，两者同语义。
+- **高频 HUD 仍用标准控件**：血条、伤害数字、小地图 UI 通过属性与
+  数据更新，绘制封在组件内部；低频菜单与页面也采用同一范式。
 
 ## GPU 档 3D（DrawMesh3D）平台事实与 NVIDIA 死锁定式
 
@@ -258,39 +235,17 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
   第一帧。新加平台
   分支 API 时把所有 `#if` 臂抄全，缺臂不报错。
 
-## 面板/弹层摆位：Dock 与手动 Place 的边界
+## 面板布局与缩放边界
 
-- Panel 默认停靠是 fill——**只调 Place 不切到手动停靠，面板会被 fill
-  分支撑满画布**，框位能漂移几十像素。手动摆位三件套一起上：
-  切手动停靠 + 定尺寸（Prefer）+ 内部用列布局三段式（标题/数据/提示）
-  居中排版。
-- 游戏内面板的间距同样走 4 的倍数档位（gui-design 的阶梯在这里照样适用，
-  只是画布绝对坐标替代了文档流）。缩放路径的划分见"自绘度量的缩放边界"。
-- 验收是**像素复核**：按预期公式算出面板框的坐标与颜色，从截图中量测
-  断言（边框色在第几像素、标题带中心 x=面板几何中心），不靠"看着行"。
-
-## 自绘度量的缩放边界(D16:字号忽大忽小的根因)
-
-游戏画布上有两套绘制,缩放路径完全不同——每个尺寸值必须明确归属其一,
-**全项目不得出现第三种写法**(这是"有的特大有的特小"的唯一根因):
-
-1. **Gui 控件路径(自动缩放,禁止再乘)**:Panel/Label/按钮等控件,尺寸
-   写 token/档位值(`app.theme.gap*`、字号阶梯、`.small/.medium` 档位类)。
-   框架已按 DPI×密度缩放,代码里再乘 `app.Scale` 就是双重放大。
-2. **Canvas 自绘路径(手动缩放,禁止忘记)**:HUD 的 `Canvas.DrawText`
-   字号、手算的坐标/边距,不经过任何自动缩放——**必须过项目内单一缩放
-   helper**(如 `Hud.Dp(v)`,内部一行 `app.Scale(v)`),禁止在使用处散落
-   内联 `* dpiScale / 100`(漏一处=150% 屏上特小,乘两处=特大)。
-
-**混排判定**:一个画面里同时有自绘 HUD 和 Gui 面板时,两边的字号/间距
-必须同源——自绘文字取主题字号阶梯(`Style.FontFallback(app, "medium")`
-等已缩放值)或 helper 缩放后的档位值,不许裸写;Gui 面板不许手乘缩放。
-虚拟设计分辨率的项目(整幅画面按固定设计稿放大)必须二选一:全走 Gui
-逻辑像素(推荐,DPI 免费),或全走"虚拟坐标×单一缩放因子";一半控件
-一半自绘各用各的缩放是最忌讳的形态。
-
-审计:grep `DrawText(`、内联 `dpiScale`/`Scale(` 乘法、裸字号数字——
-每处命中都是错乱候选;HUD 截图里量一遍字号,与 theme 阶梯对照。
+- HUD 与菜单优先 Flex/Grid/Flow；贴底采用有确定高度的 Flex 列，
+  内容增长、页脚固定并按文档序排列。不要用 DockBottom 或数字 dock。
+- 真正悬浮的控件使用 CSS absolute 或 `Float(x, y)`（当前转调 Place
+  写 absolute 样式），按包含块定位；不再有“切手动停靠”步骤。
+- 标准控件的 token、字号、间距由样式路径缩放一次，不再手乘 DPI。
+  世界画布使用游戏视口坐标变换；控件内部绘制消费已解析的样式度量，
+  不把世界坐标缩放 helper 用到 HUD 的 CSS 度量上。
+- 验收在目标窗口/DPI 下同时核对实际控件矩形、文字、命中和世界视口；
+  不能仅用世界截图推断 GUI 布局或缩放正确。
 
 ## 游戏舞台的统一 DPI 契约（GuiHost，脱 SDL 定式）
 
@@ -332,15 +287,10 @@ Post 调用核对编码，别信二手注释。
 
 ## 游戏窗口保留树收不到点击：排空清掉事件状态（已修）+ UiDriver 点击验证配方
 
-- **坑（勿回退修复）**：GuiHost.Run 排空事件循环的最后一次"队列已空"轮询
-  会经 `Win32Shell.ClearEvent` 清掉原生"正在处理的事件"状态，之后整个
-  渲染帧 `app.EventKind==0`——保留树控件在渲染期才读它，`Ui.Clicked`
-  的 kind==3 永不成立，**游戏窗口里 HUD 挂件/HTML 场景按钮全部点不动**
-  （HudLayer 同样中招；正常 GUI 循环每次迭代只泵一个事件紧跟渲染，踩不到）。
-  症状：UiDriver 点击坐标全对、results.log 全部执行、场景纹丝不动、每帧
-  EventKind 打印恒 0。修法：`App.HoldEventKind(kind)` + GuiHost 每帧排空后
-  挂载本帧最后分发的事件 kind（无事件帧挂 0，不泄漏）——普通 GUI 应用
-  从不武装该路径，行为零变化。
+- **旧绘制消费机制的历史坑**：GuiHost 排空时的空轮询曾清掉原生事件槽，
+  旧 Ui.Clicked 渲染期消费者因此读不到 release。HoldEventKind 只为这类兼容
+  消费者保留帧内事件（无输入帧必须清零）；标准保留控件、HTML 和 GameViewport
+  已在事件泵共享路由，不能再靠持住 kind 或绘制后桥接来接线。
 - **UiDriver 在游戏窗口的点击验证配方**：普通 Button 命中区走
   `RegisterRect`（无语义标签），`clickid @按钮文字` 解析不到（@label 只认
   RegisterRectL 自报标签的控件，如 Wizard 行）；数字 id 跨构建漂移（同一
@@ -701,11 +651,11 @@ Post 调用核对编码，别信二手注释。
     `ForgeSave`）就是这样坏的——抽出成包、把无头测试修好后，240 条断言
     才第一次真正跑起来。
 
-## 2D 物理动力学定式（`Zan.Game.Physics2D`）
+## 2D 物理动力学定式（`Game.Physics2D`）
 
 几何检测（射线、AABB、分离轴粗筛）留在 `Game.Arcade2D.Collision2D`；
-**动力学层**（积分器、约束/关节、旋转体、穿透修正）在 `Zan.Game.Physics2D`
-包（命名空间 `Game.Physics2D`）。下面是踩出来的数值纪律——**每一条都对应过
+**动力学层**（积分器、约束/关节、旋转体、穿透修正）属于 `Zan.Game`
+包的 `Game.Physics2D` 命名空间。下面是踩出来的数值纪律——**每一条都对应过
 一次"看起来对但就是不对"的现象**：
 
 - **SAT 分离量必须取顶点投影的最小值再跨面取最大**：沿某面法线把对方顶点投影，

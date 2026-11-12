@@ -31,6 +31,23 @@ instead of asking again.
   或 `grep -a`。另外 `irgen_call.c` 里的 `AddRange` / `Reserve` 等 List 内建
   降级都在 `irgen_call.c`，不在 `irgen.c`。
 
+* **事务持久化需按依赖顺序同步，重命名可见不等于屏障成功**：写并关闭临时文件
+  → 文件同步 → 重命名 → 父目录同步；跨目录重命名同步源/目标目录。恢复快照、
+  journal 及目录项先于发布授权，所有替换屏障先于提交；提交重命名后屏障失败应
+  返回不确定失败并保留材料，恢复先重新确认提交再清理。清理快照/journal 后同步
+  目录，再删除并同步 phase，最后删除状态目录并同步父目录。恢复中内容已匹配
+  仍需恢复模式并同步；新建目录链和删除缺席路径的重试也要覆盖目录项同步。
+  故障注入用每事务内部对象，分别在操作前/后失败；检查事件存在再断言全部前序
+  事件早于后序事件。Windows 缺目录屏障、旧事务未同步历史和真实断电验收须明确
+  单列，不能用缓存读回、进程退出或软件注入代替。判定器：`app_update_persistence`。
+* **WAL 的依赖先同步，检查点成功后才退休日志**：逐项检查完整写入、截断和同步
+  结果；blob 偏移进入 WAL 前，先同步 blob 数据与头。数据或索引检查点失败时
+  保留 WAL，锁存首个错误并拒绝后续写入，Close 释放资源且保留诊断。重开已有
+  路径仍须确认文件及父目录屏障，不能把文件存在视作过去同步成功。Windows
+  字节锁会阻止第二个句柄读取，即使文件为空；备份应在持锁检查点确认 WAL 与
+  缓冲均为空后创建目标空 WAL，不能为复制而释放源锁。判定器：
+  `zandb_recordtable_io_failures`、`zandb_wal_directory`、`zandb_backup`。
+
 ## 2. Look up every API you are about to call
 
 ```
@@ -175,8 +192,28 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   servers should use an explicit anchor, not disabled verification: PG
   connection string `sslrootcert=`, `MySqlConnection.OpenSecureParamsAsync`
   sixth arg `sslCa` (PEM path; unreadable file fails explicitly).
-  `HttpClient` has only a verify on/off switch and no CA hook yet — against
-  self-signed servers its only option is disabling verification.
+  `HttpClient` has no public custom-CA hook. For private-CA interoperability
+  tests use `TlsContext.CreateClient().AddTrustedCert(caPath)` + `TlsStream`,
+  keeping chain and hostname verification enabled.
+* **TLS 宣告的签名方案必须在对应版本的握手验签分派中实现**：核对
+  ClientHello 的 `signature_algorithms` 与 TLS 1.2 `ServerKeyExchange`、
+  TLS 1.3 `CertificateVerify` 的实际分派；不能因 TLS 1.3 支持某方案就认为
+  TLS 1.2 也支持。Python ssl/OpenSSL 3 的默认 TLS 1.2 服务端会从已宣告
+  列表选择 `rsa_pss_rsae_sha256 (0x0804)`；曾因 SKE 只接受 `0x0401/0x0403`
+  而在验签前拒绝。修生产分派并复用 `VerifyPssSha256`，保持 RSA/EC 证书
+  密钥类型匹配；不要删宣告、限制服务端套件、关闭 verify 或跳过来让测试变绿。
+  **独立证据先行**：用 Python `ssl.MemoryBIO` 与生产形状的 ClientHello 捕获
+  默认服务端 flight，读取 SKE 的 group/scheme，再以
+  `openssl dgst -sha256 -verify pub.pem -sigopt rsa_padding_mode:pss
+  -sigopt rsa_mgf1_md:sha256 -sigopt rsa_pss_saltlen:32 -signature sig.bin signed.bin`
+  独立验签；`signed.bin` 是 `client_random || server_random || ServerECDHParams`。
+  `0x0804` 要求 SHA-256、MGF1-SHA256、32 字节盐；不可接受任意盐长。
+  把公开证书/随机数/SKE 固化为离线 conformance，含篡签、改随机数/公钥、
+  方案重标记、密钥类型错配、长度与重复消息负例；不保留私钥。
+  生产互操作再用默认 Python SSL 服务端、每次生成的 CA 与显式信任测试完整链、
+  错 CA、错主机名、缺中间证书，检查负例仍失败，缺依赖显式 skip。
+  判定器：`tests/conformance/tls12_rsa_pss_exchange.zan` 与
+  `tests/integration/net_interop_test.py`（独立 Python/OpenSSL 实跑通过）。
 * **包级 static 持有 rc 集合 = 进程退出时的泄漏**（实证，2026-10-20）：编译器
   退出期只释放**主编译单元**的静态字段，`packages/*/src/**` 里的
   `static List<T>` / `static Dictionary<K,V>` 不参与回收——集合本身与它持有的
@@ -231,6 +268,12 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **闭包捕获 `this` 会成引用环**（实证，2026-10-21）：把委托（闭包）存进自己
   的字段、闭包又捕获 `this` → 环 → ARC 回收不掉（`--check-leaks` 报出）。
   委托要捕获就捕获**独立的辅助对象**（如订阅表），别捕获宿主。
+  控件内部子按钮事件同理：owner 持有子按钮、Click 闭包再强捕获 owner 也成环。
+  用专用 action 对象保存 `weak` owner，闭包只捕获 action，触发时判 owner 存活；
+  辅助对象不能再用强字段指回 owner。Tabs 曾因此留住 1006 个对象，修法见
+  `packages/Zan.Gui/src/Gui/Widget/Models/TabsAction.zan` 的 `weak Tabs owner`。
+  验收同时真实触发 select/close/add 三条 Click 并断言行为，再做泄漏检查；
+  `case_tabs_set_label` 已通过，不能只验证创建/销毁或编译通过。
 * **`object.ToString()` 调不通**（实证，2026-10-21）：在 `object` 静态类型的
   接收者上调 `ToString()` 报 "this call could not be resolved to any callable"。
   用 `is` + 强转（`if (v is string) { string t = (string)v; }`）。装箱进
@@ -369,6 +412,32 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   （报 "expected ']', got '..'"）。要切片就新建数组循环拷贝。
   `byte[].ToStr(0, len)` 给出字节的字符串视图（可含 NUL），反向用
   `Encoding.UTF8.GetBytes(text)`。
+* **二进制协议假对端必须用 `byte[]` 组帧并以显式长度 `Socket.Send` 发送**
+  （PG fixture 挂起实证，2026-11-10）：字符串拼接与 `SendString` 走 NUL
+  终止语义，帧内 `0` 会截断内容；PG 长度字段/载荷因此不完整，对端一直等
+  剩余字节。即使 `byte[].ToStr(0, len)` 可含 NUL，也不能再拼串或用
+  `SendString` 发送；帧头与载荷直接写入字节数组，保留完整长度。
+* **MariaDB 真互操作先完整收包，再校验握手版本**（11 项生产验收实证，
+  2026-11-11）：TCP 的一次 `recv(n)` 不保证拿到 n 字节；用带截止时间的
+  `recv_exact` 先收完整 4 字节包头，再按 3 字节小端长度收完整 payload，
+  校验包长界限、初始 sequence=0、protocol=10、版本 NUL 与后续字段边界。
+  MariaDB 的 wire greeting 可在 `SELECT VERSION()` 前多出兼容前缀 `5.5.5-`
+  （实测 `5.5.5-10.11.14-MariaDB-…`）；版本比较只接受精确相等，或确认
+  是 MariaDB 后允许这个已知前缀，保留 wire/SQL 两个版本作证，不能任意
+  截断版本或取消协议校验。分片接收用 mock 每次仅返回 1 字节检验，另测
+  非法 sequence 拒绝，无需为脚手架检查反复启动数据库。
+* **WSL 数据库验收只管理自己创建的隔离实例，finally 必须留清理证据**
+  （MariaDB 11 项与 cleanup 全通过实证，2026-11-11）：只读确认现有工具；
+  排他创建 `/tmp/zan-mysql-UUID`，创建成功才记为 owned，权限 0700。初始化
+  与进程启动传 `--no-defaults`，datadir/socket/pid/log 全指向 owned 目录；
+  先 socket-only 配置临时凭据，再开放随机 loopback 端口。worker 直接持有
+  mariadbd 子进程，宿主 finally 发 stop/关闭 stdin，worker finally 等待
+  子进程退出（有界 terminate→kill），再删自己的目录；不按进程名杀服务，
+  不改现有数据库或停整个 distro。WSL 启动与 Windows loopback 转发探测带
+  分阶段日志和有界超时，每轮报告进独立 `build/test-out/` 子目录。环境
+  preflight 单独标 scope，不能当包验收通过；缺工具 explicit skip 且非零，
+  清理未确认也判失败。参考 `tests/integration/mysql_acceptance.py`，fixture
+  为同名 `.zan`；编译验收仍由持共享构建锁的会话执行。
 * **stdlib 的异常类型比想象中少**（实证，2026-10-22）：只有 `ArgumentException`、
   `InvalidOperationException`、`IOException`（`FileNotFoundException` 继承它）、
   `JsonException`、`NotSupportedException`、`TimeoutException` 等。

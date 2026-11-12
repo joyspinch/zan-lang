@@ -113,16 +113,20 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
      不算违规。
   ② **内联 style（`SetProp("style", ...)`）分两半**：视觉键（背景/颜色/
      圆角）在**解析时重放**进样式盒，控件上不留第二份副本——替换原文后
-     旧值不留残影；布局键（width/height/pad/gap）**必须即时落控件**——
-     样式盒里的 width 只影响画出来的那张面，撑不开控件的槽位，漏了这一段
-     就是"写了等于没写"（坑出处：内联通道改成"解析时重放"时把布局键
-     一起丢了，`style="width:88px"` 失效，回归用例 `gui_field_style` 变红）。
-  ③ **控件的 kind 名单三处副本要对得上**：运行期重建注册表
-     （`ControlBootstrap.Names` + 各族 bootstrap）、编译期限定名单
-     （`GenForm.IsStdWidgetKind` / `IsHmiKind`）、控件自己声明的 `Kind()`。
-     少一处就出两种症状：按 kind 重建拿到 null，或生成代码发裸名、用户
-     项目的同名全局类压过 stdlib（坑出处：`Row`/`Spacer`/`FormGroup`/
-     `FormItem`/`Modal`/`Drawer` 在注册表里却不在编译期名单）。
+     旧值不留残影；布局键必须参与实际 Measure/Arrange，不能只改绘制外观。
+     width/height/gap 的既有兼容投影按消费方维护；**padding 读取解析后的
+     StyleBox 四边值，不转成显式 Pad()**，手工 Pad/Padding 保持显式优先级。
+     原因：漏接布局曾使 `style="width:88px"` 无效；将 padding 简写首数
+     写入 Pad 又会丢失四边和单位，并在替换样式后残留 padSet。回归同时检查
+     实际槽位、替换样式和 DPI，不以样式字段正确代替布局正确。
+  ③ **控件 kind 与构造注册保持同一事实源**：`ControlBootstrap.Install()`
+     对 70 个核心 kind 各写一条 `ControlFactory.Register(kind, constructor)`，
+     不再维护独立 Names/Make 名单；可选包仍由各自显式 Install 注册，
+     应用组件继续自声明 Install 走 HeavyControls 自发现。注册键必须与
+     实例 `Kind()` 一致（含 RadioButton 形态），HTML 别名保持原映射。
+     新增或调整 kind 时验证自然构造、工厂、HTML、Html.Clone 及弱引用
+     释放等价；复合控件通过 CloneContentTo 复制业务内容并重建生成部件。
+     编译期 GenForm 限定名单已删除，不恢复重复清单。
 - **窗口程序开发铁律：UI 线程专职渲染与事件派发，业务/IO/计算绝对异步解耦非阻塞**：
   ① **职责唯一性约束**：UI 线程（主事件消息泵）核心使命是保持 60/120Hz 丝滑响应，只负责系统输入事件分发与界面排版绘制（Layout -> Paint -> Present），单次事件或帧处理耗时红线严禁超过 2ms；
   ② **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络通信（HTTP/WebSocket）、磁盘文件大读写、数据库 SQL 执行、大 JSON/XML 解析、图像解码、重 CPU 计算或同步 `Sleep`；
@@ -764,13 +768,8 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 6. 本次引入或发现的旧写法，挂账了吗？（见第七节）
 7. 删了该删的吗？（临时探针、废弃产物、被推翻的规则）
 
-- **并行会话共享工作树时，编译验证用"冻结床"隔离在途噪声**（定式）：
-  别的会话正把某个包/stdlib 文件改到语法破损的中间态时，直接用工作树工具链编译
-  会看到与己无关的解析错误假象。隔离法：`git archive HEAD packages stdlib |
-  tar -x` 解到独立临时目录，再拷入当前 zanc 与其运行时 obj 兄弟文件——包/stdlib
-  发现跟 zanc **二进制位置**走，床内 zanc 只见 HEAD 冻结包，与工作树在途编辑完全
-  解耦；tar 报 linux 驱动符号链接失败在 Windows 无碍。**zanc 必须连带
-  捆绑件**：`ld.exe`、`ld.lld.exe`、`mingw/`（dllcrt2.o 等）拷到 zanc 同目录
-  ——zanc 只找自己旁边的 ld.exe，缺了就静默回退 PATH 上的 ld（GNU-ABI 链接满屏
-  undefined reference，档案里符号明明都在）。适合"要在别人施工时量出
-  自己改动的真实基线"的场景（撞名定性、A/B 对照），日常验证仍走工作树。
+- **共享源码验证先协调稳定窗口，不复制包与工具链**：公共包处于语法破损的
+  中间态时，向 owner 报精确文件和诊断，等其合拢后再编译；编译期间暂停该组
+  共享文件编辑。探针仍用当前工程的工具链与公共包，并遵守工程的共享构建闸。
+  原因：复制包/stdlib/编译器会制造漂移与重复构建，半改树又会让多个无关回归
+  反复假红。一次失败保留证据并协调，不重复排队赌时间窗口。

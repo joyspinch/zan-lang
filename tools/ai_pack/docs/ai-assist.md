@@ -34,8 +34,8 @@ It writes to `<root>/.zanmap/` (git-ignored — regenerate any time):
 |-----------------|-----------------------------------------------------------------|
 | `repo.map.txt`  | Human/AI-readable outline: every file with its classes + method signatures and line numbers. Feed this as AI context. |
 | `symbols.json`  | Flat index `[{name,kind,file,line,sig}]` — jump straight to a definition. |
-| `gallery.json` | Generated example catalog; build `tools/genknowledge/GenKnowledge.zan` or call the server's `zan_refresh_knowledge` after changing templates or examples. |
-| `routes.approx.json` | HTTP route table extracted from controller attributes by text scanning (only when `src/Controller` exists): `[{method,path,action,title,auth}]`, where `auth` is the `CustomAuthorization` value in force (`None`/`Auth`/`Login`/`Grant`/`ApiAuth`, method attribute overriding the class one). A fallback: `routes.json` with the same shape plus `module`/`perm`/`params` is written by `System.Compiler.GenIndex` from real unit metadata (`zanindex`, or the server's `zan_refresh_index`), and RepoMap never overwrites it. |
+| `gallery.json` | Generated example catalog; [build and run GenKnowledge](MCP_HOSTING.md) or call the server's `zan_refresh_knowledge` after changing templates or examples. |
+| `routes.approx.json` | HTTP route table extracted from controller attributes by text scanning (only when `src/Controller` exists): `[{method,path,action,title,auth}]`, where `auth` is the `CustomAuthorization` value in force (`None`/`Auth`/`Login`/`Grant`/`ApiAuth`, method attribute overriding the class one). This is a fallback for `routes.json`, which includes `module`/`perm`/`params` and is written from `zanc --gen-meta` by `zanindex` or the server's `zan_refresh_index`. RepoMap never overwrites it. |
 
 `repo.map.txt` excerpt:
 
@@ -78,7 +78,7 @@ pull structure without a filesystem walk:
 |------------------|------------------------------|
 | `repo://map`     | `.zanmap/repo.map.txt`       |
 | `repo://symbols` | `.zanmap/symbols.json`       |
-| `repo://routes`  | `.zanmap/routes.json` (GenIndex) or `.zanmap/routes.approx.json` |
+| `repo://routes`  | `.zanmap/routes.json` (semantic index) or `.zanmap/routes.approx.json` |
 | `repo://entities` | `.zanmap/entities.json`     |
 | `repo://index`   | `.zanmap/index.json`         |
 
@@ -88,10 +88,9 @@ A typical AI edit loop:
 2. `repo://symbols` (or `search`) → locate the definition to change.
 3. read the file → apply an `apply_patch`/write → run build via `run_command`.
 
-Regenerate the indices (`repomap.exe`) after structural edits so the resources
-stay current; the routes index is also produced by the server templates' route
-generator, `stdlib/System/Compiler/GenRoute.zan` (the server templates emit the
-route table as `src/framework/Routes.gen.zan`).
+Run `repomap.exe` after structural edits to refresh the outline and symbols.
+To refresh routes and entities, call `zan_refresh_index` or run `zanindex` on
+fresh `zanc --gen-meta` output.
 
 ---
 

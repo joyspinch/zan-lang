@@ -6,21 +6,24 @@ zanc 对 .html 显式拒绝；唯一通道是运行期装载（2026-10-31，B-ID
 
 ## 唯一建树通道：运行期装载
 
-- **装载**：`Html.Install()` 后 `app.LoadHtmlWith(html, handlers,
-  baseDir)`（html 文本可来自文件/网络/字符串，窗口装配走 `Form.Show` /
-  `Html.Parse` 纯正典标签单跳通道）。装载器自己把 html 根
-  `Dock(Fill)` 挂进宿主——GenHtml 时代"必须补一句 root.DockFill"的
-  树根坑已成历史；旧 JSON 建树管线（FormBuilder.BuildWith 等）已彻底拆除。
+- **约定式窗口**：`class MainForm : Form` 与同名 `MainForm.html` 配对，
+  `new MainForm().Show()` 执行文档装配、App 初始化、模型与事件接线、
+  `OnLoad` 和循环。零参 `Form` 构造不初始化 App，不应直接 `Run()`。
+- **已有宿主中的页面**：`Gui.Html.Load(app, html, handlers, baseDir)`
+  返回树，文档作用域 CSS 自动并进 App，导航自动接线；`Html.Parse`
+  内自动 `Install()`，调用者不用手工安装声明层。装载不会自动挂父树
+  或注册模型；由宿主 `Add(ui)`，按父布局声明根的增长，再挂所需 binder。
+
 - **发布保护**：设计稿用 `--embed <file>=<别名>` 随 exe 烘入（压缩 +
   加密，运行期 `File.ReadAllText` 内嵌优先、内存解出，**不落盘**、
   不解压临时文件）。
 - **窗口属性**：`data-win-title/win-w/win-h/win-chrome/win-center` 等
-  是文档键，由入口代码读键后调 `Form.Create`/`SetChromeVisible` 等
-  落地（一份手写入口，业务代码不碰建树）。
-- **组件零清单扩展**：文档里正典标签（`<button>`、`<switch>`、`<zan-*>` 等）引用的组件，其类
-  自声明 `static void Install()`（内部 `HeavyControls.Register`）即被
-  构建期扫描自动收进注册表；设计类视图的半件与注册表由
-  生成脚本扫描 .html 自动产出——新增组件不加任何清单。
+  文档键由 `Form.Show` 装配读取和应用；显式 `Html.Load` 页面入口不创建窗口，
+  不消费宿主窗口键。
+- **组件显式注册**：标准组件由 `ControlBootstrap.Install()` 幂等安装，
+  在同一处维护70项 kind→构造器注册，包含 `RadioButton`；HTML 与代码工厂
+  查询同一运行期注册表。扩展组件在自己的显式安装入口调用 `HeavyControls.Register`
+  或 `ControlFactory.Register`，宿主负责安装；不依赖扫描 `.html` 生成第二份注册名单。
 - **运行时装载 + `ModelBinder` = 主窗口内的数据驱动页面**：文档负责
   结构与样式，code-behind 负责数据与事件，`data-bind`/`data-if`/
   `data-for` 照常生效（不必把页面做成独立子窗口）。
@@ -101,7 +104,7 @@ zanc 对 .html 显式拒绝；唯一通道是运行期装载（2026-10-31，B-ID
 |---|---|---|
 | `data-on-click="名字"` | 事件 → 处理器注册表 | 设计稿只落名字；逻辑在 code-behind |
 | `data-arg="字面量"` | 带参事件（列表行共用处理器区分来源） | 只支持字面量，不求值表达式 |
-| `data-bind="路径"` | 绑 JsonValue 模型字段（模型宿主每帧双向同步，见下节选路） | Element 缺省绑 text；真控件缺省 value；**只在挂模型宿主生效**（主窗口内的页面用 `ModelBinder` + `ModelHosts` 挂，见下节） |
+| `data-bind="路径"` | 绑定模型字段，由 ModelBinder 双向同步；HTML 和代码树共用 | Element 默认 text，其他控件按 PropSpec 元数据与模型真实类型选择默认投影，显式 bindProp 优先；须实际挂 ModelBinder/ModelHosts，不能仅绘制树 |
 | `data-if="路径"` | 显隐插拔 | **只认路径真值**（null/假/"false" 为隐），不支持 `a==b` 比较表达式 |
 | `<template data-for="路径">` | 数组行克隆 | 嵌套模板不支持；行内 bind/bindIf 以本项为第一作用域、回落根模型 |
 
@@ -147,11 +150,10 @@ zanc 对 .html 显式拒绝；唯一通道是运行期装载（2026-10-31，B-ID
   帧后回写可能把模型改动顶回去。
 - **结构（增删控件/换组件类型）→ 命令式**：retained 树 API
   （`Find` + `Add`/`InsertAt`/`Remove`/`SetProp`）或整页
-  `LoadHtmlWith` 重装。已知代价：重载是**整树无 diff**（手工 Add
-  的控件不在新文档里）；命令式行内 style 只吃视觉键、布局键走
-  类规则；没有"改第 N 行"助手——列表局部高频更新留在模型通道
-  （data-for 长度变了整组重建）。
-- **模型宿主与窗口无关**：任何一棵控件树（`LoadHtmlWith` 装出的
+  `Gui.Html.Load` 重装。已知代价：重载是**整树无 diff**（手工 Add
+  的控件不在新文档里）；宿主须替换旧树并注销旧 binder。列表高频
+  更新留在模型通道，带 data-key 的行可走增量更新。
+- **模型宿主与窗口无关**：任何一棵控件树（`Gui.Html.Load` 装出的
   运行期文档树、手搭树）挂上 ModelBinder 即生效。此前只有 ChildWindow 带这层驱动——主窗口里的页面写了
   绑定也不生效，于是「一个 .html 文档 + 一个 .zan code-behind」这种
   页面写法在主窗口内拿不到判断与双向绑定。
@@ -171,30 +173,31 @@ zanc 对 .html 显式拒绝；唯一通道是运行期装载（2026-10-31，B-ID
 
 ```zan
 // 1) 装载文档（样式随装载并进 appCss，作用域类自动混入）
-Html.Install();                       // 运行时装载必须先装声明层
-Control ui = app.LoadHtmlWith(html, null, "");  // html 来自文件/内嵌资源
+Control ui = Gui.Html.Load(app, html, null, ""); // html 来自文件/内嵌资源
+ui.SetProp("style", "flex-grow: 1; min-height: 0;"); // host 使用 Flex 布局
+host.Add(ui);                           // host 是已有的页面宿主
 // 2) 挂模型宿主：事件按名字接线 + 绑定声明从此生效
 ModelBinder b = new ModelBinder();
 b.Handle("save", () => { ... });          // 无参
 b.HandleArg("pick", (string s) => { });   // 带参（data-arg）
 b.HandleSender("open-row", (Control c) => {
-    JsonValue row = b.ScopeOf(c);         // 行内控件 → 行模型项
+    object row = b.ScopeOf(c);            // 行内控件 → 行模型项（按实际模型类型使用）
 });
 b.SetRoot(ui, model);
 b.Wire();
 ModelHosts.Register(app, b);            // 主窗口的每帧泵驱动它
 ```
 
-- **装载器不带处理器表**（`LoadHtmlWith(html, null, dir)`）：事件统一
+- **装载器不带处理器表**（`Gui.Html.Load(app, html, null, dir)`）：事件统一
   由 binder 的 `Wire()` 接线。装载时若也传 handlers，同一个控件会有两
   条订阅，一次点击触发两遍。
 - **注册顺序：先 `Handle` 后 `SetRoot`**：早期 `SetRoot` 会重建处理器注册
   表，把之前注册的处理器全冲掉——页面照常渲染、按钮照常画出来，**点击却
   毫无反应且不报任何错**（坏的是看不见的部分，最难查）。现在 `SetRoot`
   只挂根与模型，注册表仅在为 null 时才建。
-- **`Html.Install()` 必做**：只走 `app.LoadHtml` 的宿主不会自动装声明层，
-  装载后端没注册时 `LoadHtmlWith` **静默返回 null**（页面一片空白，
-  只有一行日志能看出）。
+- **声明层自动安装**：`Gui.Html.Load` 经 `Html.Parse` 自动调用
+  幂等的 `Install()`；页面入口不再调用 App 上的 HTML 装载方法。
+  装载后仍须挂树；使用模型时还须注册 ModelBinder。
 - **行点击要拿"是哪一行"**：用 sender 槽（`HandleSender`）+ binder 的
   `ScopeOf(control)`（取行模型项）；`data-arg` 只支持字面量，行内用不了。
   **行根也登记作用域**（2026-10-23 修）：`@click` 挂在 `<template data-for>`
@@ -211,10 +214,9 @@ ModelHosts.Register(app, b);            // 主窗口的每帧泵驱动它
 - **改模型后要出一帧**：帧泵每帧同步模型→界面，但窗口静止时不会自己
   出帧——改完模型记得 `app.RequestRedraw()`。
 
-代码内实时绑定是另一层：`Binding<T>`（stdlib 规范 §6.1），
-强类型字段直绑；字符串 bindPath 是"对话框 ↔ 状态实体"通道，
-两者互不替代（Control.zan bindPath 头注释、STDLIB_COMPONENT_
-STANDARDS.md §6.7）。
+代码树也可配置 bindPath/bindProp 并挂同一 ModelBinder；模型路径不限于对话框或
+JsonValue。`Binding<T>` 提供强类型字段直绑，两者都通过控件公开属性承载值，
+不构成不同 UI 创作模式（STDLIB_COMPONENT_STANDARDS.md §6）。
 
 ## 文档与原生控件混排：五个画不对的坑（都真踩过）
 
@@ -350,27 +352,13 @@ Cookie，"对照组"就不成立了。
 - 验收：设计器预览与生成运行时的**同一棵树**逐节点矩形一致
   （`conformance_gui_designer_wysiwyg`）；相邻两行的底 ≤ 下一行的顶。
 
-## 浮动件的定位基准：让开父容器最上面那条停靠带（框架层硬规则）
+## 浮动件的定位基准（框架层规则）
 
-浮动（绝对定位）件的 `fy=0` 指的是**内容区上沿**，不是"父容器盒子顶"。
-父容器顶上有停靠带（标题栏 / 工具条 / 面包屑）时，浮动件必须落在那条
-带子**下面**——否则 `fy=0` 的浮动件正好压在标题栏上（用户报的"标题栏
-浮动组件忽略标题栏高度"）。
-
-- **只让开最上面那一条**：浮动件本来就浮在内容之上，后面的内容条不挡它；
-  让开全部停靠带会把浮动件推到内容底部（作者 `fy=0` 的意图全丢）。
-- **谁算"停靠带"**：父容器里 `dock=Top` 的可见子项，**取最靠上的那条**；
-  浮动件自己不算（它正是在从流里摘出来的那一条）；布局内部的流式容器
-  （`FbFlow`）不算——那是布局结构，不是作者摆的标题栏。
-- **设计器与运行时必须同一口径**：设计器的摆放基准
-  （`Designer.DesignSlotOriginY`）与运行时的排布基准
-  （`Control.ArrangePositioned`）都取"内容区上沿 + 首条停靠带高度"，
-  否则预览与生成程序会错位（WYSIWYG 破）。
-- **转换瞬间不许跳**：把一个流式件转成浮动件时，它自己那条停靠带要排除
-  在外（设计器侧按"正在编辑的字段"排除，运行时侧按"浮动件"排除），
-  否则基准在转换那一帧变一次，控件会突然跳一格。
-- 验收：`conformance_gui_designer_float_band`——浮动件落在标题栏下沿、
-  没有停靠带的容器里仍贴内容区上沿、设计器预览与生成运行时矩形一致。
+CSS absolute 与 `Control.Float(x, y)`/`Place(x, y)` 用同一定位语义，
+坐标依据父包含块与 `ArrangePositioned` 的实际实现。普通顶栏、内容区、
+页脚按 Flex 文档序排布；不要依据已退役的 Dock.Top 推算自动避让。
+设计器把流式件转为 absolute 时，应保持当前视觉位置并写 CSS 定位，
+预览与运行时必须共用同一棵控件树和包含块换算。此处未重跑像素验证。
 
 ## 颜色属性接真取色器：色块即触发条，写回走 CSS 颜色文本（框架层硬规则）
 
@@ -378,10 +366,9 @@ Cookie，"对照组"就不成立了。
   属性用取色器本体当触发条（皮肤透明底 + 当前色），点开就是 SV 面板 +
   色相/透明度条 + RGBA/HEX/HSL/HSB 输入行。自绘色块配"点击循环预设色"
   是死路：用户挑不了颜色，只能在几个预设之间跳。
-- **即时模式控件的弹层锚点要自己落**：弹层按 `bx/by/bh` 定位，而这三个
-  字段只有 `Arrange`（保留式布局）才会设。即时模式渲染（`RenderIn`）必
-  须自己写这三个字段，否则弹层跑到窗口原点——设计器属性行就踩过这个坑：
-  取色器弹层开在左上角，而不是色块下方。
+- **弹层锚点读取实际布局**：控件树 Arrange 后的 `bx/by/bw/bh`
+  是弹层定位依据；不在应用侧仿造 RenderIn 路径或另建命中与锚点体系。
+
 - **颜色属性（`PropSpec` kind 4）的文档值有两种形态**：十进制打包色
   （`Read()` 的输出，0xAARRGGBB 回绕成负 int）与 CSS 颜色文本
   （`#rrggbb` / `#aarrggbb` / `rgba(...)` / 命名色）。两种都要认——只按
@@ -445,14 +432,10 @@ Cookie，"对照组"就不成立了。
 
 ## HTML 窗口设计器的所见所得
 
-- **共用完整建树与布局，拾取读取实际框**：预览树按原始
-  `fields/kids` DFS 装配（prepared 槽），FormBuilder 统一装配；混排顺序只影响
-  展示，不改变槽序。完整结构遍历 `Control.children`，文本次序结合
-  `Element.elOrder`；`FlowEntries` 是流布局视图，会排除 absolute/hidden，
-  用它分配槽或断言整树曾把仍存在的定位控件误判为丢失。选框、拖动、
-  缩放、换父均读取实际 `bx/by/bw/bh` 和父内容框/SlotHost；Flow 转 Float
-  时先保存世界坐标，显式 fw/fh 表示最终 border-box，避免旧 CSS 尺寸
-  让选框变大而控件不变。
+- **预览共用完整运行时树与布局**：选框、拖动、缩放、换父读取实际
+  `bx/by/bw/bh` 与父包含块。完整结构遍历 children；布局流视图会排除
+  absolute/hidden，不能把不在流视图里的控件判定为丢失。
+
 - **目标 App 与编辑视图分离**：离屏 App 自持文档 CSS、基线缓存、主题、
   DPI 和事件；视图 zoom 只缩放最终图像。借用编辑器的样式上下文曾使
   继承/后代选择器度量不同，把 zoom 当 DPI 又会二次缩放。目标 DPI 是会话
@@ -476,11 +459,6 @@ Cookie，"对照组"就不成立了。
   和混排文字；直接复用旧索引会指向另一个孩子。同级重排还须保持文本槽
   并重写子节点槽的显示顺序：只重映射身份曾让 MoveSel/SelToEdge 改了
   kids 顺序，混排画面却仍按旧序，验收要检查实际 elOrder 的控件引用。
-- **FormBuilder 装配契约（Element 混排）**：HTML 容器节点导出的
-  JSON 结构常为 `kind: "Panel"` 且带有 `htmlTag`。父级是 Element
-  （满足 `IsElement`：带有 `htmlTag` 或 `kind == "Element"`）时必须走
-  `AddKid`/`AddChild` 保 `elOrder`，绕过它子节点会被推迟到全部内联
-  文本流条目之后，混排流序与设计器预览出现偏差。
 - **最终窗形与运行窗口共用遮罩**：逐 region 计算并集，圆角 SDF 保留
   `min(max(qx,qy),0)` 内部项；旧步进曾跳过后续区域，缺内部项使 radius=0
   整块半覆盖。区分 straight/premult，预乘缓冲须满足 RGB≤A：
@@ -509,7 +487,7 @@ Cookie，"对照组"就不成立了。
 - **真窗冒烟要带主窗骨架，裸页截图会"缺导航栏"**：页面文档只含
   页内骨架，图标导航栏在主窗文档里——把单页文档直接装进裸 Form
   截图，看到的永远是"少了左侧导航"（不是回归）。要看真实形态就
-  复刻主窗装配（LoadHtmlWith 主窗文档 + 各页宿主挂页），跳过登录泵。
+  复刻主窗装配（Gui.Html.Load 主窗文档 + 各页宿主挂页），跳过登录泵。
 - **截屏三坑（当天连踩五次才抓到图）**：① 带中文注释的 `.ps1`
   以无 BOM UTF-8 落盘，PowerShell 5.1 按 ANSI 误解析，多字节序列
   会吞掉下一行语句——参数/环境变量"神秘变空"多半是这个，自动化
@@ -534,10 +512,11 @@ Cookie，"对照组"就不成立了。
 
 ## 游戏接入边界
 
-菜单/面板/商店这类低频交互面可嵌进游戏帧循环（同一引擎，脏区门控，
-实测 clean/dirty 均值 3ms、峰值 23ms、预算 16.6ms，空闲 120 拍仅
-3 帧重绘）；**每帧热路径 HUD（血条/伤害数字/小地图）仍走代码直绘
-+ 门控渲染，不进 DOM**——那是性能边界，不是能力缺口。
+游戏 HUD、血条、伤害数字、小地图 UI、菜单与 SceneDesigner 使用标准
+控件树（HTML/CSS 或声明式对象树）；像素绘制封在控件 `OnPaint` 内。
+高频刷新通过长生命周期控件、变值更新、脏区和缓存优化，不建立应用侧
+直绘 HUD 或自制命中区体系。游戏世界渲染保留 Zan.Game 的专用渲染路径。
+此处是开发规则；旧调用方是否完成迁移须分别核对，不能由文档规范推断。
 
 ## 声明式事件体系与丰富组件事件契约
 
@@ -631,7 +610,7 @@ Cookie，"对照组"就不成立了。
 
 12. **HTML5 声明式输入控件多态映射与模型类型感知自动强转规范**：
    - **`<input type="...">` 多态组件实例化**：在 HTML 声明中写 `<input type="checkbox|radio|number|range|color|date|password" />` 时，装载器（`DesignerHtml.InputTypeKind`）自动映射实例化为对应的专属高阶组件（`checkbox` -> `Checkbox`、`radio` -> `Radio`、`number` -> `InputNumber`、`range` -> `Slider`、`color` -> `ColorPicker`、`date` -> `DatePicker`、`password` -> `Input` 带密码掩码属性），与自定义组件标签（`<slider>`、`<colorpicker>` 等）完全等价且支持标准 HTML 语义。
-   - **组件类型感知模型强转回写（Coercion On Writeback）**：双向绑定 `data-bind` 回写时，若目标 JSON 模型节点尚未初始化（`cur == null`），`WriteBoundValue` 自动根据当前绑定的控件类型进行精准的类型归一化：`Checkbox` / `Switch` 强制以 `JsonValue.NewBool` 写入；`Slider` / `InputNumber` / `Progress` / `Rate` 及声明了 `.number` 的控件强制以 `JsonValue.NewNum` 写入；避免空模型初次绑定输入时被统一回写为字符串而破坏数据契约。
+   - **属性元数据驱动模型回写**：双向绑定按显式 `bindProp`、实际模型类型与 `BindingSpec` 选择属性，经公共 `GetProp` 读取；`WriteBoundValue` 根据 `PropSpec.ValueKind`、`bindNumber` 及既有模型值类型确定 bool/数值/字符串回写，不维护具体控件类型名单，也不限于空 JSON 节点。新组件声明默认绑定属性和值类型即可复用该协议；显式绑定属性优先。
    - **快照即时同步防抖**：控件完成 `WriteBoundValue` 模型就地回写后，立即调用 `RecordSnapshot(c, s)` 同步控件快照，防止同一帧在后续流程中再次触发无效重复写入。
 
 14. **设计器复合与容器组件项事件与细粒度配置闭环规范（ToolStrip 项事件/Tab 与选项关闭尺寸/大编辑器定位）**：
@@ -653,24 +632,16 @@ Cookie，"对照组"就不成立了。
    - **JSON 模型数组动态绑定（`:options` / `v-bind:options`）**：在 `ModelBinder.ResolveOperandStr` 中，当绑定表达式求值结果为 JSON 数组（`v.IsArray`）时，自动序列化为标准 JSON 字符串（`v.ToJson`），使高阶选择组件（`SelectBox`、`ChoiceGroup`、`RadioGroup`、`Tabs` 等）能够无缝响应由模型数组驱动的动态选项变更。
    - **选项反序列化多格式兼容与元数据映射**：组件的 `SetOptionsText` / `SetItemsText` 原生兼容经典竖线分隔字符串（`"A|B|C"`）与结构化 JSON 数组（`"[{\"label\":\"北京\",\"value\":\"bj\"}, ...]"`）。解析 JSON 数组时，标签键优先读取 `label` / `title` / `name` / `text`，值键读取 `value` / `id`，并支持 `disabled` 与 `closable` 元数据映射。
    - **帧渲染缓存幂等防抖（`optionsRaw` / `itemsSpec`）**：在组件内部维护 `optionsRaw` 原始字符串缓存；当每帧数据同步写入的选项文本与当前缓存一致时立即跳过重新解析与重建子项，彻底避免动画帧循环中重复反序列化造成的性能损耗以及弹窗滚动条、焦点和选中态被意外重置的问题。
-   - **双向绑定语义值与下标自适应（Two-Way Binding Type Adaptability）**：
-     - 当从 `SelectBox` 读取值回写模型时（`ChildWindow.BoundValue`），先检查目标模型字段当前是否为数值类型；若为数值，则回写整型下标字符串（`Convert.ToString(sb.Selected)`）；若为字符串或未初始化，则回写语义值（`sb.SelectedValue`，回退至 `sb.Text`）。
-     - 当从模型向 `SelectBox` 写入属性时（`SetProp("value", val)`），优先在选项列表中匹配 `opts[i].val == val || opts[i].label == val`；若未命中则回退为数值下标解析，实现语义值与下标的双向平滑转换。
-   - **`<option value="...">` 语义合成**：声明式 HTML 里带显式 `value` 属性的 `<option value="bj">北京</option>`，装载器统一探测子级非空自定义 `value`，自动合成 `[{"label": "北京", "value": "bj"}, ...]` JSON 数组并 `SetProp("options", ...)`，原生 `<select>` 语义完整保真。
+   - **索引、选项键与标签分开投影**：ModelBinder 按 PropSpec 默认投影与模型真实类型选择属性，显式 bindProp 优先，HTML 与代码树共用分派。SelectBox 的 `value/selected/data` 只读写索引，`selectedValue/val` 只读写选项键，`text/label/selectedText` 读写标签；键为空时按现有 SelectedValue 契约使用标签。数字文本键“0”不能被当作索引0。索引 null/空串/-1 清空，非法或越界索引保持原选择。完整 `model_binding_equivalence_test` 已严格验证 JSON、字典与 POCO 的文本键、数值、bool、零值和显式投影。
+   - **`<option value="...">` 选项合成**：带显式 `value` 的 `<option value="bj">北京</option>` 由装载器合成 `[{"label": "北京", "value": "bj"}, ...]` 并设置 options；这声明选项的键，不改变控件 value 属性的索引协议。支持范围以实际属性与回归为准。
 
-17. **流式排版、停靠体系与边距内外消费全链路契约（Fill Height / Flex / Margin / Padding）**：
-   - **FormBuilder 布局流与容器 Display 属性声明**：
-     - 当控件在 JSON 中声明 `flexDir` 时，解析器在生成样式时必须注入 `;display:flex`（若仅声明 `flex-direction` 会导致容器退化为 `display:block` 并进入传统停靠/流式分支）。
-   - **自动撑满高度（Fill Height）与停靠语义映射**：
-     - 在非 Flex 停靠容器中，撑满剩余高度的语义对应 `c.dock = Dock.Fill()`（`5`）；在 Flex 弹性容器中，撑满对应 `flex-grow: 1` 且 `fh = 0`。
-     - `FormBuilder.SetupLayout` 在流式模式（`position == 0`）下，必须优先识别显式 `dock` 属性；当 `flexGrow > 0 && fh == 0` 时自动赋给 `ctl.dock = Dock.Fill()`，避免将流式控件重置为 `Dock.Top()` 导致高度取 0 塌陷。
-     - `FormBuilder.AttachNode` 当 `ctl.dock > 0` 时直接挂载到宿主容器，不被 `FbFlow` 匿名网格拦截。
-   - **Control.Arrange 停靠与浮动分支的边距消费**：
-     - 控件排布引擎 `Control.Arrange` 在处理各停靠分支（Top/Bottom/Left/Right/Fill）及未停靠流式分支时，必须完整消费 `StyleMarL/T/R/B` 边距扣减、自身位置平移与下一项步进累加（`stepH = hh + mt + mb`），确保边距直观生效。
-     - 在 `ArrangePositioned` 的 `c.designFloat` 浮动分支中，改用 `StylePadL/T/R/B` 避免边框重复累加，并加上子控件自身的 `c.StyleMarL()` 与 `c.StyleMarT()`。
-   - **设计器属性检查器实时脏标记与数据模型同步**：
-     - `PropertyGrid.OnChange` 必须显式触发 `Designer.MarkDocDirty()`，使得属性检查器中编辑任何数值均即时触发文档树重建并更新画布预览。
-     - `DesignDeclareRect` 同步持久化 `flexGrow`、`margin`、`padding`、`gap` 至 `f.designSource`，确保设计器与序列化快照双向保真。
+17. **流式布局与盒模型契约**：
+   - 容器同时声明 `display: flex` 与所需方向；只写方向不构成 Flex 容器。
+   - 需要贴底时父容器定高，内容 `flex-grow: 1; min-height: 0`，底栏
+     `flex-shrink: 0`；子项遵循文档序。历史数字 dock 不构成停靠机制。
+   - margin/padding/gap 通过样式声明进入同一计算路径，设计器预览
+     与运行期共用解析和布局，不能再指导调用已删除的 JSON 建树实现。
+   - 属性修改需同步持久化并标脏；验收比较当前布局树的实际矩形。
 
 18. **设计器属性检查器 Visual Studio 规范重构与垂直间距律（VS 分类、高频前置与呼吸节奏）**：
    - **Visual Studio 属性网格分区分级契约**：
@@ -725,7 +696,8 @@ Cookie，"对照组"就不成立了。
      6) **Flex-wrap 换行网格与滚动延伸（Scroll Extent）全貌闭环**：当卡片采用百分比宽度（如 `width: 31%` 或 `flex: 0 0 31%`）并声明 `flex-wrap: wrap` 时，排布测量引擎必须根据宿主换行宽度解析子项百分比尺寸（`StyleWidthIn(wrapMain)`）并累计多行交叉轴跨度（`crossSum + crossGap * (lines - 1)`）。滚动容器（如 `.tools-scroll`）依靠此真实高度计算完整的 `scrollExtent` 并唤出原生纵向滚动条，彻底根除因高度虚低导致下方卡片被窗口硬生生裁切成半截且无法滚动的恶性排版缺陷。
 
 22. **声明式窗口与单管线装载规范（B-ID149：`class X : Form`、`<include>` 组合与零胶水建树）**：
-   - **`class X : Form` 窗口即对象**：业务类直接继承 `Form`，框架通过 `Form.FindDoc(cls)` 自动定位同名 `X.html`（发布态权威内嵌 VFS 优先，开发态源码 src 树回退），`Html.Parse` 一跳建树，消除一切 `DesignDoc.Load`/`FormBuilder.BuildWith` 门面胶水代码。
+   - **窗口即对象**：`class X : Form` 与同名 `X.html` 配对，通过
+     `new X().Show()` 完成装配，不绕过装配直接调用 Run。
    - **事件反射按名自动接线与绑定对账**：树上所有事件（`@click="OnSave"`）按名自动匹配实例方法，缺失即 fail-fast 退出；`data-bind` 路径由 `CheckBindsDoc` 启动期静态对账，杜绝静默失败。
    - **模板脚手架约束**：新建项目模板中的入口类必须声明为 `partial class {{NAME}} : Form`，严禁遗漏 `{{NAME}}` 占位符或 `: Form` 继承，否则编译器入口合成（`new <基名>().Show()`）将因类型未定义中断。
    - **`<include src="...">` 组合化**：支持在 HTML 中通过 `<include src="fragment.html" />` 组合引入组件化片段，装载期展开（深度 8 封顶防环），片段内事件与数据绑定对宿主窗口类同构生效。

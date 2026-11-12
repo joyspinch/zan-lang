@@ -42,6 +42,9 @@ class SkinBuilder {
     static Label status;
     static Panel colA;
     static Panel colB;
+    static Control inputRoot;
+    static Control viewportA;
+    static Control viewportB;
 
     // ---- 产物视图 ----
     static TextArea cssBox;
@@ -55,6 +58,7 @@ class SkinBuilder {
     static string draftName = "skinbuilder-draft";
     static string lastApplied = "";
 
+    #if !GUI_CALLER_INPUT_TEST
     static void Main() {
         // 亮色基底起步（ECharts 示例站观感）；标题栏皮肤选择器开着，
         // 可随时切到内置皮肤对比。
@@ -123,7 +127,45 @@ class SkinBuilder {
         }
         // 收尾清掉 draft：预览热重载是它唯一的用途，留着只会在
         // 磁盘上多一个不可选的皮肤目录。
+        SkinBuilder.ReleaseControls();
         Directory.DeleteRecursive(SkinBuilder.SkinsRoot() + "/" + draftName);
+    }
+    #endif
+
+    static void ReleaseControls() {
+        if (app != null && inputRoot != null) {
+            SkinBuilder.CloseClippedPickers(inputRoot, inputRoot, true);
+            app.ReleaseInputSubtree(inputRoot);
+            if (app.rootControl == inputRoot) { app.SetRootControl(null); }
+        }
+        inputRoot = null;
+        viewportA = null;
+        viewportB = null;
+        colA = null;
+        colB = null;
+        cssBox = null;
+        nameInput = null;
+        baseGroup = null;
+        pal = null;
+        pGrid = null;
+        pAxisLine = null;
+        pAxisText = null;
+        pAxisTitle = null;
+        pLabel = null;
+        pLegend = null;
+        pMark = null;
+        pAccent = null;
+        pTipBg = null;
+        pTipText = null;
+        pTipBorder = null;
+        resetBtn = null;
+        copyBtn = null;
+        status = null;
+        mixOpt = null;
+        pieOpt = null;
+        shownCss = "";
+        lastApplied = "";
+        app = null;
     }
 
     // ---- 配置面板 ----------------------------------------------------------
@@ -153,6 +195,9 @@ class SkinBuilder {
     }
 
     static void BuildControls() {
+        App host = app;
+        SkinBuilder.ReleaseControls();
+        app = host;
         nameInput = new Input("my-chart-skin");
         nameInput.SetText("my-chart-skin");
 
@@ -225,6 +270,19 @@ class SkinBuilder {
         cb.With(Row("提示框字", pTipText));
         cb.With(Row("提示框边", pTipBorder));
         SkinBuilder.colB = cb;
+
+        // Borrow no trees: each persistent column has exactly one viewport parent.
+        inputRoot = new Control();
+        viewportA = new Control();
+        viewportB = new Control();
+        viewportA.SetProp("style", "overflow: hidden");
+        viewportB.SetProp("style", "overflow: hidden");
+        viewportA.Add(colA);
+        viewportB.Add(colB);
+        inputRoot.Add(viewportA);
+        inputRoot.Add(viewportB);
+        inputRoot.Add(cssBox);
+        app.SetRootControl(inputRoot);
     }
 
     static void BuildPreviews() {
@@ -394,13 +452,78 @@ class SkinBuilder {
 
     // ---- 帧渲染 ------------------------------------------------------------
 
-    static void LayoutCol(Panel root, int x, int y, int w, int availH) {
-        root.HintWrapWidth(w);
-        root.MeasureTree(app);
-        int hh = root.prefH;
-        if (hh < 1) { hh = availH; }
-        root.Arrange(x, y, w, hh);
-        root.RenderTree(app);
+    static void CloseClippedPickers(Control node, Control viewport, bool closing) {
+        if (node is ColorPicker) {
+            ColorPicker picker = (ColorPicker)node;
+            if (picker.IsOpen() && (closing || !SkinBuilder.Overlaps(viewport, picker))) {
+                picker.SetOpen(false);
+            }
+        }
+        for (int i = 0; i < node.Children.Count; i = i + 1) {
+            SkinBuilder.CloseClippedPickers(node.Children[i], viewport, closing);
+        }
+    }
+
+    static void ReleaseClippedInput(Control viewport) {
+        SkinBuilder.CloseClippedPickers(viewport, viewport, false);
+        Control focused = viewport.FindInputFocus(app);
+        if (focused != null && !SkinBuilder.Overlaps(viewport, focused)) {
+            app.ReleaseInputSubtree(focused);
+        }
+        Control captured = app.GetCapturedPointer();
+        if (captured != null && viewport.ContainsInputControl(captured)
+            && !SkinBuilder.Overlaps(viewport, captured)) {
+            app.ReleaseInputSubtree(captured);
+        }
+    }
+
+    static bool Overlaps(Control viewport, Control child) {
+        return viewport.bw > 0 && viewport.bh > 0 && child.bw > 0 && child.bh > 0
+            && child.bx < viewport.bx + viewport.bw && child.bx + child.bw > viewport.bx
+            && child.by < viewport.by + viewport.bh && child.by + child.bh > viewport.by;
+    }
+
+    static void LayoutCol(Control viewport, Panel column, int x, int y, int w, int height) {
+        bool show = w > 0 && height > 0;
+        if (!show) {
+            SkinBuilder.CloseClippedPickers(viewport, viewport, true);
+            app.ReleaseInputSubtree(viewport);
+        }
+        viewport.Visible = show;
+        viewport.Arrange(x, y, show ? w : 0, show ? height : 0);
+        if (!show) { return; }
+        column.HintWrapWidth(w);
+        column.MeasureTree(app);
+        int hh = column.prefH;
+        if (hh < 1) { hh = height; }
+        column.Arrange(x, y, w, hh);
+        SkinBuilder.ReleaseClippedInput(viewport);
+    }
+
+    // The retained root only owns the controls; all rectangles come from this layout.
+    static void LayoutInputs(App a, int width, int height) {
+        int pad = a.Scale(14);
+        int gap = a.Scale(14);
+        int py = a.titlebarH + pad;
+        int stripH = a.Scale(120);
+        int mainH = height - py - pad - stripH - gap;
+        int colW = a.Scale(292);
+        inputRoot.MeasureTree(a);
+        inputRoot.Arrange(0, a.titlebarH, width, height - a.titlebarH);
+        int aw = width - pad * 2;
+        if (aw > colW) { aw = colW; }
+        int bw = width - (pad + colW + gap) - pad;
+        if (bw > colW) { bw = colW; }
+        SkinBuilder.LayoutCol(viewportA, colA, pad, py, aw, mainH);
+        SkinBuilder.LayoutCol(viewportB, colB, pad + colW + gap, py, bw, mainH);
+        int cssY = py + mainH + gap;
+        if (cssY < py) { cssY = py; }
+        int cssH = height - pad - cssY;
+        if (cssH > stripH) { cssH = stripH; }
+        bool showCss = width > pad * 2 && cssH > 0;
+        if (!showCss) { a.ReleaseInputSubtree(cssBox); }
+        cssBox.Visible = showCss;
+        cssBox.Arrange(pad, cssY, showCss ? width - pad * 2 : 0, showCss ? cssH : 0);
     }
 
     static void Render(App a) {
@@ -424,8 +547,7 @@ class SkinBuilder {
         int stripH = a.Scale(120);
         int mainH = availH - stripH - gap;
 
-        LayoutCol(colA, px, py, colW, mainH);
-        LayoutCol(colB, px + colW + gap, py, colW, mainH);
+        SkinBuilder.LayoutInputs(a, w, h);
 
         // 右侧：真实 Chart 组件预览（颜色全部来自已应用的皮肤 token）。
         int cx = px + (colW + gap) * 2;
@@ -444,6 +566,6 @@ class SkinBuilder {
             cssBox.SetText(css);
             SkinBuilder.shownCss = css;
         }
-        cssBox.Render(a, px, py + mainH + gap, w - px * 2, stripH);
+        inputRoot.RenderTree(a);
     }
 }
