@@ -48,7 +48,7 @@ public class Input : Control {
     // 上一帧渲染时的宿主 App：手动操作（Focus/Blur/Clear/
     // ScrollToEnd）需要在事件回调里改焦点并请求重绘，而回调
     // 没有 app 形参——渲染沿顺手记一笔即可。
-    public App liveApp;
+    public weak App liveApp;
     // 密码掩码：设置后文本以 `*` 渲染，直到被明文显示。
     public bool password;
     // 掩码字段当前是否显示明文（通过眼睛图标切换）。
@@ -113,8 +113,7 @@ public class Input : Control {
     // 文本输入，按回车才开始编辑——避免误触 Tab 聚焦就吞掉输入。
     public bool PassiveActivated;
     public bool passiveActive;
-    // 最近一次发过命名键事件的 OS 事件序号：键槽未认领时跨帧留存，
-    // 靠序号把 KeyDown/KeyUp/KeyPress 各限制为每物理事件一次。
+    // KeyPress 兼容通知按宿主窗口的本地文本事件序号去重。
     public long lastKeyNamedSeq;
 
     // 输入过滤（Naive UI allow-input）：返回清洗后的候选文本，
@@ -182,6 +181,8 @@ public class Input : Control {
     // 宿主调整占位文字（SelectBox 的筛选框在 Filterable(true) 之后
     // 才由 FilterHint 定文案，晚于构造）。
     public void SetHint(string v) { hint = v; }
+
+    public override int InputFocusCapabilities() { return 3; }
 
     public override int WidgetId() { return wid; }
 
@@ -413,23 +414,21 @@ public class Input : Control {
         return true;
     }
 
-    // 键盘输入处理（聚焦时由 Render 调用）：编辑键、Ctrl 快捷键、
-    // 方向键/Home/End 导航与鼠标选择/拖选。
-    private void HandleInput(App app) {
+    // 路由输入复用原有编辑规则；返回 true 表示该事件已归本控件。
+    private bool HandleKeyEvent(App app, int kind, int code, int mods) {
         ClampCursor();
-        int kind = app.EventKind();
         string txt = editSig.Get();
         // 被动激活：聚焦后先用回车"解锁"，解锁前不消费任何编辑键
         // （Naive UI passively-activated：Tab 聚焦不该吞掉输入）。
         if (PassiveActivated && !passiveActive) {
-            if (kind == 6 && app.window.EventKeyCode() == 13) {
+            if (kind == 6 && code == 13) {
                 passiveActive = true;
                 app.RequestRedraw();
+                return true;
             }
-            return;
+            return false;
         }
         if (kind == 6) {
-            int code = app.window.EventKeyCode();
             if (code == 8) {
                 if (HasSel()) {
                     DeleteSel();
@@ -444,44 +443,31 @@ public class Input : Control {
                 }
                 // 退格已归本输入框：事件槽留到下次轮询期间窗口可能再
                 // 渲染几帧，不消费就会连删两个字符。
-                app.ClaimKey();
+                return true;
             } else if (code == 13) {
                 Submit.RaiseS(this);
                 app.RequestRedraw();
-                app.ClaimKey();
+                return true;
             } else if (code == 9) {
                 // 忽略 Tab（由框架焦点遍历处理）——不消费，Tab 留给框架。
             } else {
                 string ch = Text.CharStr(code);
-                if (ch.Length > 0 && Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
+                if (ch.Length > 0 && app.window.EventSeq() != this.lastKeyNamedSeq) {
                     // 字符键出口：落文本之前通知（DOM keypress 语义）；
-                    // 同一序号去重（与 KeyDown/KeyUp 共用一档）。
-                    this.lastKeyNamedSeq = Window.EventSeqGlobal();
+                    // 仅 KeyPress 兼容通知在控件内按本地序号去重。
+                    this.lastKeyNamedSeq = app.window.EventSeq();
                     this.FireKeyNamed("KeyPress");
+                    if (this.IsDisabled() || Loading || !this.IsFocused(app)) { return true; }
                     // IME 组合：直接插入（上限/过滤同样生效）。
                     if (this.Insert(ch)) { app.RequestRedraw(); }
                     // 这个字符已归本输入框：事件槽留到下次轮询期间窗口
                     // 可能再渲染几帧，不消费就会被重复插入（输一个 "4"
                     // 得 "44"）。
-                    app.ClaimKey();
+                    return true;
                 }
             }
-        } else if (kind == 5) {
-            // 键释放出口：命名 KeyUp（仅通知，不消费事件槽）。
-            if (Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
-                this.lastKeyNamedSeq = Window.EventSeqGlobal();
-                this.FireKeyNamed("KeyUp");
-            }
         } else if (kind == 4) {
-            int kc = app.window.EventKeyCode();
-            int mods = app.window.EventMods();
-            // 键按下出口：编辑快捷键之前通知，命名处理器看到包括
-            // Ctrl 组合在内的每一次按键。事件槽未认领时跨帧留存，
-            // 按事件序号去重，一个物理按键只通知一次。
-            if (Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
-                this.lastKeyNamedSeq = Window.EventSeqGlobal();
-                this.FireKeyNamed("KeyDown");
-            }
+            int kc = code;
             bool shift = Modifiers.HasShift(mods);
             bool ctrl = Modifiers.HasCtrl(mods);
             if (ctrl && kc == 65) {
@@ -489,12 +475,12 @@ public class Input : Control {
                 selAnchor = 0;
                 cursorPos = txt.Length;
                 app.RequestRedraw();
-                app.ClaimKey();
+                return true;
             } else if (ctrl && kc == 67) {
                 // Ctrl+C：复制选区（无选区时复制全文）。
                 if (HasSel()) { Clipboard.SetText(SelText()); }
                 else { Clipboard.SetText(txt); }
-                app.ClaimKey();
+                return true;
             } else if (ctrl && kc == 88) {
                 // Ctrl+X：剪切。
                 if (HasSel()) {
@@ -503,14 +489,14 @@ public class Input : Control {
                     Edited();
                     app.RequestRedraw();
                 }
-                app.ClaimKey();
+                return true;
             } else if (ctrl && kc == 86) {
                 // Ctrl+V：粘贴（整段走同一过滤+上限闸门）。
                 string clip = Clipboard.GetText();
                 if (clip.Length > 0) {
                     if (this.Insert(clip)) { app.RequestRedraw(); }
                 }
-                app.ClaimKey();
+                return true;
             } else if (kc == 37 || kc == 39 || kc == 36 || kc == 35) {
                 // 方向键/Home/End：Shift 从光标处扩展选区；
                 // 普通移动则收起选区（方向键收起到选区边缘，
@@ -524,8 +510,7 @@ public class Input : Control {
                     if (kc == 36) { cursorPos = 0; }
                     if (kc == 35) { cursorPos = txt.Length; }
                     app.RequestRedraw();
-                    app.ClaimKey();
-                    return;
+                    return true;
                 }
                 if (!shift) { selAnchor = -1; }
                 if (kc == 37) { if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); } }
@@ -533,7 +518,7 @@ public class Input : Control {
                 else if (kc == 36) { cursorPos = 0; }
                 else if (kc == 35) { cursorPos = txt.Length; }
                 app.RequestRedraw();
-                app.ClaimKey();
+                return true;
             } else if (kc == 46) {
                 if (HasSel()) {
                     DeleteSel();
@@ -544,10 +529,30 @@ public class Input : Control {
                         app.RequestRedraw();
                     }
                 }
-                app.ClaimKey();
+                return true;
             }
         }
+        return false;
     }
+
+    private void HandleRoutedKey(RoutedEventArgs e, int kind) {
+        if (e.handled || this.IsDisabled() || Loading) { return; }
+        App app = this.FindApp();
+        if (app == null) { app = liveApp; }
+        if (app == null || !this.IsFocused(app)) { return; }
+        if (liveApp != app) { lastKeyNamedSeq = 0; }
+        liveApp = app;
+        this.SyncBinding();
+        if (Autoselect && !autoselected) {
+            this.SelectAll();
+            autoselected = true;
+        }
+        if (this.HandleKeyEvent(app, kind, e.keyCode, e.modifiers)) { e.Handle(); }
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) { this.HandleRoutedKey(e, 4); }
+    public override void OnKeyUp(RoutedEventArgs e) { this.HandleRoutedKey(e, 5); }
+    public override void OnTextInput(RoutedEventArgs e) { this.HandleRoutedKey(e, 6); }
 
     // 内部绘制实现：输入框核心绘制与 IME 编辑管线。
     private int PaintInput(App app, int x, int y, int w, int h) {
@@ -555,10 +560,11 @@ public class Input : Control {
         Canvas c = app.canvas;
         Theme t = app.theme;
         // 事件回调没有 app 形参，渲染沿记一笔宿主供手动操作使用。
+        if (liveApp != app) { lastKeyNamedSeq = 0; }
         liveApp = app;
 
         bool off = this.IsDisabled();
-        app.focus.RegisterFocusable(id);
+        app.focus.RegisterFocusable(id, this);
         app.focus.RegisterTextEditable(id);
         bool focused = app.focus.IsFocused(id) && !off;
 
@@ -579,7 +585,6 @@ public class Input : Control {
                 SelectAll();
                 autoselected = true;
             }
-            HandleInput(app);
         }
         if (!focused) {
             autoselected = false;
@@ -858,7 +863,7 @@ public class Input : Control {
         // 恢复 Class，避免设计器/序列化器读到污染的字段。
         Class = origClass;
 
-        // 键盘族不在此轮询（键槽跨帧留存会重复投递），走 HandleInput
+        // 键盘族由 OnKeyDown/OnKeyUp/OnTextInput 路由处理。
         // 的命名出口；其余通用事件照常按帧快照轮询。
         On.FireNonKey(app, id, this);
         return id;
@@ -1002,5 +1007,17 @@ public class Input : Control {
     // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bw, bh) 完成绘制与编辑交互。
     public override void OnPaint(App app) {
         this.PaintInput(app, bx, by, bw, bh);
+    }
+
+    public int Render(App app, int x, int y, int w) {
+        return this.Render(app, x, y, w, app != null ? app.Scale(28) : 28);
+    }
+
+    public int Render(App app, int x, int y, int w, int h) {
+        this.bx = x;
+        this.by = y;
+        this.bw = w;
+        this.bh = h;
+        return this.PaintInput(app, x, y, w, h);
     }
 }

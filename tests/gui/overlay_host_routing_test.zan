@@ -1,0 +1,278 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class CancelReopenPopup : Control {
+    public weak App Host;
+    public weak Control Anchor;
+    public weak Control Reopen;
+    public int dismissed;
+
+    public CancelReopenPopup() : base("cancel-reopen-popup") {
+        prefW = 120;
+        prefH = 100;
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        Control next = Reopen;
+        Reopen = null;
+        if (next != null) { Host.overlayHost.Show(Host, Anchor, next); }
+    }
+
+    public override void OnPopupDismissed() { dismissed = dismissed + 1; }
+}
+
+class Program : Control {
+    int dismissed;
+    int clicks;
+    bool outside = true;
+
+    public Program() : base("anchor") {
+    }
+
+    public override void OnPopupDismissed() {
+        dismissed = dismissed + 1;
+    }
+
+    public override bool DismissOnOutsideClick() {
+        return outside;
+    }
+
+    void OnClick() {
+        clicks = clicks + 1;
+    }
+
+    static void Check(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    static Control Popup() {
+        Control popup = new Control("popup");
+        popup.prefW = 120;
+        popup.prefH = 100;
+        popup.Arrange(40, 80, 120, 100);
+        return popup;
+    }
+
+    static void Lifecycle() {
+        App app = App.CreateOffscreen("Overlay lifecycle", 320, 240);
+        OverlayHost host = app.overlayHost;
+        Program first = new Program();
+        Program second = new Program();
+        first.Arrange(20, 20, 120, 32);
+        second.Arrange(180, 20, 120, 32);
+        Control oldPopup = Popup();
+        Control replacement = Popup();
+        app.focus.SetFocused(first.WidgetId());
+        host.Show(app, first, oldPopup);
+        Check(host.HasActive() && host.IsAnchorActive(first), "Show must activate popup");
+        host.Show(app, first, replacement);
+        Check(first.dismissed == 0, "Replacing content must preserve anchor open state");
+        Check(host.HitTest(replacement.bx + 1, replacement.by + 1, 0) == replacement,
+            "Same-anchor replacement must remove old popup");
+        host.Hide(oldPopup);
+        Check(host.HasActive(), "Hiding stale popup must not close replacement");
+        host.Dismiss();
+        Check(!host.HasActive() && host.HitTest(41, 81, 0) == null,
+            "Dismiss must leave no popup registration");
+        Check(first.dismissed == 1, "Dismiss must notify once");
+        Check(app.focus.IsFocused(first.WidgetId()), "Dismiss must preserve existing focus");
+        host.Dismiss();
+        Check(first.dismissed == 1, "Repeated Dismiss must not notify again");
+        host.Show(app, first, oldPopup);
+        host.Show(app, second, replacement);
+        Check(first.dismissed == 2 && host.IsAnchorActive(second),
+            "Changing anchors must close previous owner");
+        host.Hide(replacement);
+        Check(!host.HasActive() && second.dismissed == 1, "Hide must unregister and notify");
+
+        host.Show(app, first, oldPopup);
+        oldPopup.Visible = false;
+        Check(!host.HasActive() && host.HitTest(41, 81, 1) == null,
+            "Hidden popup must not capture mouse or touch");
+        host.RenderAll(app);
+        Check(!app.blocksInputBelow && !app.hitTester.BlockerAt(41, 81),
+            "Hidden popup must not register legacy blockers");
+        Check(first.dismissed == 3, "Hidden popup must be dismissed during update");
+        oldPopup.Visible = true;
+        host.Show(app, first, oldPopup);
+        oldPopup.Arrange(40, 80, 0, 100);
+        Check(!host.HasActive(), "Zero-width popup must be inactive");
+        host.RenderAll(app);
+        Check(!app.blocksInputBelow && !app.hitTester.BlockerAt(41, 81),
+            "Zero-width popup must not register blockers or be resurrected by layout");
+        Check(first.dismissed == 4, "Zero-size popup must be dismissed");
+
+        host.Show(app, first, oldPopup);
+        first.Visible = false;
+        Check(!host.HasActive(), "Hidden anchor must deactivate popup");
+        host.Update(app);
+        Check(first.dismissed == 5, "Hidden anchor must be notified on cleanup");
+        first.Visible = true;
+        host.Show(app, null, replacement);
+        host.RenderAll(app);
+        Check(app.blocksInputBelow && app.hitTester.BlockerAt(replacement.bx + 1, replacement.by + 1),
+            "Visible popup must register actual legacy blocker geometry");
+        host.Dismiss();
+        app.canvas.Destroy();
+    }
+
+    static void ClosingInput() {
+        App app = App.CreateOffscreen("Overlay closing input", 320, 240);
+        OverlayHost host = app.overlayHost;
+        Program anchor = new Program();
+        anchor.Arrange(20, 20, 120, 32);
+        Control popup = Popup();
+        host.Show(app, anchor, popup);
+        Check(!host.HandleInput(app, 2, popup.bx + 1, popup.by + 1, 0) && host.HasActive(),
+            "Inside down must continue to popup routing");
+        Check(host.HandleInput(app, 2, 310, 230, 0) && !host.HasActive(),
+            "Outside down must close and consume input");
+        Check(anchor.dismissed == 1, "Outside down must notify once");
+        host.Show(app, anchor, popup);
+        Check(host.HandleInput(app, 2, 21, 21, 0) && !host.HasActive(),
+            "Clicking anchor while open must close without replaying into root");
+        host.Show(app, anchor, popup);
+        Check(host.HandleInput(app, 4, 0, 0, 27) && !host.HasActive(), "Escape must close and consume");
+        host.Show(app, anchor, popup);
+        Check(host.HandleInput(app, 9, 0, 0, 0) && !host.HasActive(), "Blur must close and consume");
+        anchor.outside = false;
+        host.Show(app, anchor, popup);
+        Check(host.HandleInput(app, 2, 310, 230, 0) && host.HasActive(),
+            "Non-dismissible outside down must block underlying controls");
+        Check(host.HandleInput(app, 4, 0, 0, 27) && !host.HasActive(),
+            "Outside-click policy must not disable Escape");
+        Check(!host.HandleInput(app, 2, 310, 230, 0), "Inactive host must release input");
+        app.canvas.Destroy();
+    }
+
+    static void ShowOrphan(App app) {
+        Program anchor = new Program();
+        anchor.Arrange(20, 20, 120, 32);
+        app.overlayHost.Show(app, anchor, Popup());
+    }
+
+    static void OwnerLifetime() {
+        App app = App.CreateOffscreen("Overlay owner lifetime", 320, 240);
+        ShowOrphan(app);
+        Check(!app.overlayHost.HasActive(), "Host must not retain departed anchor");
+        app.overlayHost.Update(app);
+        Check(app.overlayHost.HitTest(41, 81, 0) == null, "Departed owner must leave no hit target");
+        app.canvas.Destroy();
+    }
+
+    static void RoutedClick() {
+        App app = App.CreateOffscreen("Overlay routed click", 320, 240);
+        Program popupCount = new Program();
+        Program rootCount = new Program();
+        Button root = new Button("underlying");
+        root.Click.Add(rootCount.OnClick);
+        app.SetRootControl(root);
+        root.MeasureTree(app);
+        root.Arrange(0, 0, 320, 240);
+        root.RenderTree(app);
+        Control popup = Popup();
+        Button button = new Button("popup button");
+        button.Click.Add(popupCount.OnClick);
+        popup.Add(button);
+        popup.MeasureTree(app);
+        popup.Arrange(40, 80, 180, 100);
+        popup.RenderTree(app);
+        app.overlayHost.Show(app, null, popup);
+        Control label = button.children[0];
+        int x = label.bx + label.bw / 2;
+        int y = label.by + label.bh / 2;
+        Check(app.overlayHost.HitTest(x, y, 0) == label, "Overlay hit must descend standard Control tree");
+        app.DispatchVisualTree(2, x, y, 0, 0);
+        Check(app.GetCapturedPointer() == button, "Popup label down must bubble into Button capture");
+        app.DispatchVisualTree(3, x, y, 0, 0);
+        app.DrainPosts();
+        Check(popupCount.clicks == 1 && rootCount.clicks == 0,
+            "Popup Button must receive one routed click without root penetration");
+        app.DispatchVisualTree(2, 310, 230, 0, 0);
+        app.DispatchVisualTree(3, 310, 230, 0, 0);
+        app.DrainPosts();
+        Check(!app.overlayHost.HasActive() && rootCount.clicks == 0,
+            "Dismissal down/up pair must not click underlying Button");
+        app.DispatchVisualTree(2, 310, 230, 0, 0);
+        app.DispatchVisualTree(3, 310, 230, 0, 0);
+        app.DrainPosts();
+        Check(rootCount.clicks == 1, "Root must receive later input after popup dismissal");
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+
+    static void AnchoredCancelReopen() {
+        App app = App.CreateOffscreen("Anchored cancel reopen", 320, 240);
+        Program anchor = new Program();
+        anchor.Arrange(20, 20, 120, 32);
+        CancelReopenPopup popup = new CancelReopenPopup();
+        popup.Host = app;
+        popup.Anchor = anchor;
+        Button button = new Button("capture");
+        popup.Add(button);
+        popup.UseApp(app);
+        app.overlayHost.Show(app, anchor, popup);
+        int x = button.bx + button.bw / 2;
+        int y = button.by + button.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == button, "Anchored popup Down must establish real capture");
+        popup.Reopen = popup;
+        app.overlayHost.Dismiss();
+        Check(app.GetCapturedPointer() == null && app.overlayHost.ActiveRoot() == popup
+            && app.overlayHost.IsAnchorActive(anchor) && anchor.dismissed == 0 && popup.dismissed == 0,
+            "Cancel reopening same anchored popup must preserve new popup and anchor session");
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == button, "Reopened anchored popup must accept later capture");
+        Control replacement = Popup();
+        popup.Reopen = replacement;
+        app.overlayHost.Dismiss();
+        Check(app.GetCapturedPointer() == null && app.overlayHost.ActiveRoot() == replacement
+            && app.overlayHost.IsAnchorActive(anchor) && anchor.dismissed == 0 && popup.dismissed == 1,
+            "Cancel replacing popup on same anchor must notify only retired popup");
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        app.overlayHost.Dismiss();
+        Check(!app.overlayHost.HasActive() && anchor.dismissed == 1,
+            "Independent final dismissal must notify anchor exactly once");
+        app.canvas.Destroy();
+    }
+
+    static void AnchoredCrossAppReopen(bool samePopup) {
+        App a = App.CreateOffscreen("anchored a", 320, 240);
+        App b = App.CreateOffscreen("anchored b", 320, 240);
+        Program anchor = new Program();
+        anchor.Arrange(20, 20, 120, 32);
+        CancelReopenPopup popup = new CancelReopenPopup();
+        popup.Host = b;
+        popup.Anchor = anchor;
+        Button button = new Button("cross capture");
+        popup.Add(button);
+        popup.UseApp(a);
+        a.overlayHost.Show(a, anchor, popup);
+        a.ProcessOffscreenInput(2, button.bx + 5, button.by + 5, 0, 0, 0, 0);
+        Check(a.GetCapturedPointer() == button, "Cross App anchored Down establishes capture");
+        Control next = samePopup ? popup : Popup();
+        popup.Reopen = next;
+        a.overlayHost.Dismiss();
+        Check(a.GetCapturedPointer() == null && !a.overlayHost.HasActive()
+            && b.overlayHost.ActiveRoot() == next && b.overlayHost.IsAnchorActive(anchor)
+            && anchor.dismissed == 0 && popup.dismissed == (samePopup ? 0 : 1),
+            "Old host must not notify popup or anchor registered again in another App");
+        b.overlayHost.Dismiss();
+        Check(anchor.dismissed == 1 && !b.overlayHost.HasActive(), "Transferred anchor closes independently once");
+        a.canvas.Destroy(); b.canvas.Destroy();
+    }
+
+    static void Main() {
+        AnchoredCrossAppReopen(true);
+        AnchoredCrossAppReopen(false);
+        AnchoredCancelReopen();
+        Lifecycle();
+        ClosingInput();
+        OwnerLifetime();
+        RoutedClick();
+        Console.WriteLine("overlay_host_routing_test OK");
+    }
+}

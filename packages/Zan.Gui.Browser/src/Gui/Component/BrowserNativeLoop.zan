@@ -1,0 +1,137 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component.CefBrowser;
+
+namespace Gui.Component;
+
+// One service per App; native handles may outlive the weak managed endpoints.
+public class BrowserNativeLoop : AppLoopParticipant, AppLoopService, AppLoopStopped {
+    public weak App host;
+    weak AppLoopRegistration registration;
+    List<BrowserNativeEntry> entries;
+    List<int> closing;
+    int deadline;
+    bool stopped;
+    bool ticking;
+    int lastWorkTurn;
+    weak App lastWorkRoot;
+    int wakeGeneration;
+    public int workCount;
+
+    public BrowserNativeLoop() {
+        entries = new List<BrowserNativeEntry>();
+        closing = new List<int>();
+        deadline = -1;
+    }
+
+    public string ServiceKey() { return "Gui.Component.BrowserNativeLoop"; }
+    public int PendingCloseCount() { return closing.Count; }
+    public int EntryCount() { return entries.Count; }
+
+    public static BrowserNativeLoop For(App app) {
+        AppLoopParticipant existing = app.FindLoopService("Gui.Component.BrowserNativeLoop");
+        if (existing is BrowserNativeLoop) { return (BrowserNativeLoop)existing; }
+        BrowserNativeLoop loop = new BrowserNativeLoop();
+        loop.host = app;
+        loop.registration = app.RegisterLoopParticipant(app, loop);
+        return loop;
+    }
+
+    public void Add(BrowserNativeEntry entry) {
+        if (stopped) { return; }
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            if (entries[i] == entry) { Wake(); return; }
+        }
+        entries.Add(entry);
+        Wake();
+    }
+
+    public void Wake() {
+        App app = host;
+        if (stopped || app == null) { return; }
+        wakeGeneration = wakeGeneration + 1;
+        deadline = Window.GetTickMs();
+        AppLoopRegistration ticket = registration;
+        if (ticket != null) { ticket.Reschedule(); }
+    }
+
+    public void CloseCef(int handle) {
+        if (handle == 0) { return; }
+        NativeLayer.Forget(handle);
+        CefBackend.SetVisible(handle, false);
+        CefBackend.Close(handle);
+        if (!stopped && !closing.Contains(handle)) { closing.Add(handle); }
+        Wake();
+    }
+
+    public int NextDeadline() { return deadline; }
+
+    void WorkOnce(App app) {
+        int turn = app.LoopTurnIdentity();
+        App root = ChildWindows.LoopRoot(app);
+        if (turn != 0 && lastWorkRoot == root && lastWorkTurn == turn) { return; }
+        lastWorkRoot = root;
+        lastWorkTurn = turn;
+        CefHost.Work();
+        workCount = workCount + 1;
+    }
+
+    public void Tick(App app, int now) {
+        if (stopped || ticking || host != app) { return; }
+        ticking = true;
+        bool cefActive = closing.Count > 0;
+        bool busy = false;
+        int count = entries.Count;
+        int wake = wakeGeneration;
+        try {
+            // Create/bounds before Work; poll events only after the engine turn.
+            for (int i = 0; i < count && !stopped; i = i + 1) {
+                BrowserNativeEntry entry = entries[i];
+                if (!entry.Prepare(app)) { continue; }
+                if (entry.HasCef()) { cefActive = true; }
+            }
+            if ((cefActive || closing.Count > 0) && !stopped) { WorkOnce(app); }
+            for (int i = 0; i < count && !stopped; i = i + 1) {
+                BrowserNativeEntry entry = entries[i];
+                if (entry.Poll(app)) { busy = true; }
+            }
+            for (int i = closing.Count - 1; i >= 0; i = i - 1) {
+                if (!CefBackend.Alive(closing[i])) { closing.RemoveAt(i); }
+            }
+        } finally {
+            ticking = false;
+            for (int i = entries.Count - 1; i >= 0; i = i - 1) {
+                if (entries[i].retired) { entries.RemoveAt(i); }
+            }
+            if (!stopped) {
+                // Live hidden pages still progress; no entries/tails means no wake.
+                if (entries.Count > 0 || closing.Count > 0) {
+                    if (wake == wakeGeneration) { deadline = now + (busy ? 8 : 30); }
+                }
+                else {
+                    deadline = -1;
+                    AppLoopRegistration ticket = registration;
+                    if (ticket != null) { ticket.Invalidate(); }
+                }
+            }
+        }
+    }
+
+    public void Stopped(App app) {
+        if (stopped) { return; }
+        stopped = true;
+        deadline = -1;
+        Exception first = null;
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            try { entries[i].Retire(app); }
+            catch (Exception error) { if (first == null) { first = error; } }
+        }
+        entries.Clear();
+        // CEF Close is async and process-wide. Other live App services may keep
+        // pumping; the application's existing CefHost.Shutdown owns final drain.
+        try { WorkOnce(app); }
+        finally { closing.Clear(); host = null; lastWorkRoot = null; }
+        if (first != null) { throw first; }
+    }
+}

@@ -100,6 +100,19 @@ public partial class Tabs : Control {
 
     public int Count() { return tabs.Count; }
 
+    public string LabelAt(int idx) {
+        if (idx >= 0 && idx < tabs.Count) { return tabs[idx].label; }
+        return "";
+    }
+
+    public void SetLabel(int idx, string label) {
+        if (idx < 0 || idx >= tabs.Count) { return; }
+        string text = label != null ? label : "";
+        if (tabs[idx].label == text) { return; }
+        tabs[idx].label = text;
+        this.BuildTree();
+    }
+
     public void Clear() {
         tabs.Clear();
         pages.Clear();
@@ -137,16 +150,86 @@ public partial class Tabs : Control {
         return this;
     }
 
-    public void CloseTab(int idx) {
-        if (idx < 0 || idx >= tabs.Count) { return; }
+    public bool Closable(int idx) {
+        return idx >= 0 && idx < tabs.Count && (tabs[idx].closable || closableAll);
+    }
+
+    public int ClosableCount(int keep) {
+        int count = 0;
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (i != keep && this.Closable(i)) { count = count + 1; }
+        }
+        return count;
+    }
+
+    private void ReindexClosed(int idx) {
+        if (active > idx) { active = active - 1; }
+        if (active >= tabs.Count) { active = tabs.Count - 1; }
+        if (active < 0 && tabs.Count > 0) { active = 0; }
+    }
+
+    private void EmitClosed(int idx) {
         closedIndex = idx;
         closedQueue.Add(idx);
         TabClosed.RaiseS(this);
+    }
+
+    public void CloseTab(int idx) {
+        if (!this.Closable(idx)) { return; }
+        int before = active;
         if (!hostModel) {
             tabs.RemoveAt(idx);
             if (idx < pages.Count) { this.DropPage(idx); }
-            if (active >= tabs.Count) { active = tabs.Count - 1; }
+            this.ReindexClosed(idx);
             this.BuildTree();
+            if (data != null) { data.Set(active); }
+            if (active != before || idx == before) {
+                changedIndex = active;
+                TabChanged.RaiseS(this);
+            }
+        }
+        this.EmitClosed(idx);
+    }
+
+    public void CloseAll() { this.CloseBulk(0 - 1); }
+
+    public void CloseOthers(int keep) {
+        if (keep < 0 || keep >= tabs.Count) { return; }
+        this.CloseBulk(keep);
+    }
+
+    private void CloseBulk(int keep) {
+        // Snapshot descending indices before notifying a host that may mutate
+        // its own parallel model while handling each close event.
+        List<int> doomed = new List<int>();
+        for (int i = tabs.Count - 1; i >= 0; i = i - 1) {
+            if (i != keep && this.Closable(i)) { doomed.Add(i); }
+        }
+        if (doomed.Count == 0) { return; }
+        int before = active;
+        TabItem beforeItem = null;
+        if (before >= 0 && before < tabs.Count) { beforeItem = tabs[before]; }
+        int removedBeforeKeep = 0;
+        for (int k = 0; k < doomed.Count; k = k + 1) {
+            int idx = doomed[k];
+            if (keep >= 0 && idx < keep) { removedBeforeKeep = removedBeforeKeep + 1; }
+            if (!hostModel) {
+                tabs.RemoveAt(idx);
+                if (idx < pages.Count) { this.DropPage(idx); }
+                this.ReindexClosed(idx);
+            }
+            this.EmitClosed(idx);
+        }
+        if (hostModel) { return; }
+        if (keep >= 0) { active = keep - removedBeforeKeep; }
+        this.BuildTree();
+        if (data != null) { data.Set(active); }
+        TabItem afterItem = null;
+        if (active >= 0 && active < tabs.Count) { afterItem = tabs[active]; }
+        // A removed active tab can be replaced at the same numeric index.
+        if (active != before || afterItem != beforeItem) {
+            changedIndex = active;
+            TabChanged.RaiseS(this);
         }
     }
 
@@ -162,14 +245,14 @@ public partial class Tabs : Control {
     }
 
     public int TakeClosed() {
-        if (closedQueue.Count > 0) {
-            int last = closedQueue[closedQueue.Count - 1];
-            closedQueue.RemoveAt(closedQueue.Count - 1);
-            return last;
+        if (closedQueue.Count == 0) {
+            closedIndex = 0 - 1;
+            return 0 - 1;
         }
-        int c = closedIndex;
-        closedIndex = 0 - 1;
-        return c;
+        int idx = closedQueue[0];
+        closedQueue.RemoveAt(0);
+        closedIndex = closedQueue.Count > 0 ? closedQueue[0] : (0 - 1);
+        return idx;
     }
 
     public int TakeAdded() {
@@ -220,7 +303,7 @@ public partial class Tabs : Control {
     }
 
     public void BuildTree() {
-        this.children.Clear();
+        this.RemoveAll();
 
         // 1. 导航条容器
         navStrip = new Control();
@@ -247,15 +330,13 @@ public partial class Tabs : Control {
             if (item.closable || closableAll) {
                 Button closeBtn = new Button("×");
                 closeBtn.ClassName = "tab-item-close ghost tiny";
-                closeBtn.Click.Add(() => {
-                    this.CloseTab(tidx);
-                });
+                TabsAction closeAction = new TabsAction(this, tidx, true);
+                closeBtn.Click.Add(() => { closeAction.Invoke(); });
                 tabBtn.Add(closeBtn);
             }
 
-            tabBtn.Click.Add(() => {
-                this.Select(tidx);
-            });
+            TabsAction selectAction = new TabsAction(this, tidx, false);
+            tabBtn.Click.Add(() => { selectAction.Invoke(); });
 
             navStrip.Add(tabBtn);
         }
@@ -263,9 +344,8 @@ public partial class Tabs : Control {
         if (showAdd) {
             Button addBtn = new Button("+");
             addBtn.ClassName = "tab-add-btn ghost small";
-            addBtn.Click.Add(() => {
-                this.TriggerAdd();
-            });
+            TabsAction addAction = new TabsAction(this, 0 - 1, false);
+            addBtn.Click.Add(() => { addAction.Invoke(); });
             navStrip.Add(addBtn);
         }
 
@@ -295,6 +375,22 @@ public partial class Tabs : Control {
                 this.Select(cur);
             }
         }
+    }
+
+    public override void CloneContentTo(Control target, CloneTreeFn clone) {
+        Tabs copy = (Tabs)target;
+        copy.tabs.Clear();
+        copy.pages.Clear();
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            TabItem item = new TabItem(tabs[i].label, tabs[i].closable);
+            if (tabs[i].headerSlot != null) { item.Header(clone(tabs[i].headerSlot)); }
+            copy.tabs.Add(item);
+        }
+        for (int i = 0; i < pages.Count; i = i + 1) {
+            pages[i].CloneContentTo(copy.Page(i), clone);
+        }
+        if (extraSlot != null) { copy.extraSlot = clone(extraSlot); }
+        copy.BuildTree();
     }
 
     public override string Kind() { return "Tabs"; }

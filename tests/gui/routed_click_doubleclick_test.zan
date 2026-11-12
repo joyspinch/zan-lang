@@ -1,0 +1,118 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+// UNCOMPILED formal regression draft, intended for tests/gui after parent applies
+// the shared patch. Every pointer transition uses production offscreen dispatch.
+class RoutedClickProbe : Control {
+    public RoutedClickProbe() { this.InitControl("routedClickProbe", 0); }
+    public int clicks;
+    public int doubles;
+    public bool lastDouble;
+    public int lastModifiers;
+    public int reenterModifiers;
+    public bool consume;
+    public bool reenter;
+    public weak RoutedClickProbe other;
+    public override void OnPaint(App app) {
+        app.hitTester.RegisterRect(this.WidgetId(), bx, by, bw, bh, 3);
+    }
+    public override void OnClick(RoutedEventArgs e) {
+        clicks = clicks + 1; lastDouble = e.isDoubleClick; lastModifiers = e.modifiers;
+        if (e.isDoubleClick) { doubles = doubles + 1; }
+        if (reenter) {
+            reenter = false;
+            App app = this.FindApp();
+            RoutedClickProbe next = other;
+            // Reenter with an actual newer completed input on another target.
+            int outerModifiers = e.modifiers;
+            RoutedClickDoubleClickTest.PairMods(app, next.bx + 10, next.by + 10, reenterModifiers);
+            RoutedClickDoubleClickTest.Check(e.isDoubleClick == lastDouble && e.modifiers == outerModifiers,
+                "outer Click keeps double-click and modifiers after newer input");
+        }
+        if (consume) { e.Handle(); }
+    }
+}
+class RoutedClickDoubleClickTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Input(App app, int kind, int x, int y, int button, int flag) {
+        app.ProcessOffscreenInput(kind, x, y, button, 0, 0, flag);
+        while (true) { Action a = Dispatcher.Take(); if (a == null) { break; } a(); }
+    }
+    static void Pair(App app, int x, int y, int button, int flag) {
+        Input(app, 2, x, y, button, flag); Input(app, 3, x, y, button, flag);
+    }
+    static void PairMods(App app, int x, int y, int modifiers) {
+        app.ProcessOffscreenInput(2, x, y, 0, 0, modifiers, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, modifiers, 0);
+        while (true) { Action a = Dispatcher.Take(); if (a == null) { break; } a(); }
+    }
+    static void Paint(App app, Control root) {
+        app.BeginOffscreenFrame(); root.RenderTree(app); root.RenderTree(app); app.EndOffscreenFrame();
+    }
+    static void Body() {
+        App app = App.CreateOffscreen("routed clicks", 320, 180);
+        RoutedClickProbe root = new RoutedClickProbe();
+        RoutedClickProbe left = new RoutedClickProbe();
+        RoutedClickProbe right = new RoutedClickProbe();
+        root.Add(left); root.Add(right); root.UseApp(app); root.MeasureTree(app);
+        root.Arrange(0, 0, 320, 180); left.Arrange(10, 10, 120, 100); right.Arrange(170, 10, 120, 100);
+        app.SetRootControl(root); Paint(app, root);
+
+        // Unhandled Click bubbles then reaches immediate fallback. Registering
+        // the same WidgetId makes duplicate accounting observable on click #1.
+        Pair(app, 30, 30, 0, 0);
+        Check(left.clicks == 1 && !left.lastDouble && !app.DoubleClickNow(),
+            "first unhandled routed click is committed once across fallback");
+        Check(root.clicks == 1 && !root.lastDouble, "parent receives same committed snapshot");
+        int start = Window.GetTickMs();
+        Pair(app, 210, 30, 0, 0);
+        Check(!right.lastDouble, "different target breaks double click");
+        Pair(app, 210, 30, 0, 0);
+        Check(Window.GetTickMs() - start <= 400, "fixture completed pair inside public time window");
+        Check(right.lastDouble && root.lastDouble, "second target click snapshots double before notifications");
+        int count = right.clicks; int parentCount = root.clicks;
+        Paint(app, root); Paint(app, root);
+        Check(right.clicks == count && root.clicks == parentCount, "paint never replays Click");
+
+        int lastId = app.lastClickId; int lastMs = app.lastClickMs;
+        Pair(app, 30, 30, 1, 0);
+        Check(app.lastClickId == lastId && app.lastClickMs == lastMs && left.clicks == 1,
+            "secondary click never advances primary history");
+        Input(app, 2, 30, 30, 0, 0); Input(app, 9, 30, 30, 0, 0); Input(app, 3, 30, 30, 0, 0);
+        Check(left.clicks == 1 && app.lastClickId == lastId && app.lastClickMs == lastMs,
+            "cancelled press never advances click history");
+        Input(app, 2, 30, 30, 0, 1); Input(app, 1, 60, 30, 0, 1); Input(app, 3, 60, 30, 0, 1);
+        Check(left.clicks == 1 && app.lastClickId == lastId && app.lastClickMs == lastMs,
+            "touch slop never advances click history");
+
+        // A consumed route also commits exactly once before its callback.
+        app.currentPointerType = 0; left.consume = true;
+        Pair(app, 30, 30, 0, 0);
+        Check(!left.lastDouble && !app.DoubleClickNow(), "handled route commits first target click once");
+        start = Window.GetTickMs(); Pair(app, 30, 30, 0, 0);
+        Check(Window.GetTickMs() - start <= 400 && left.lastDouble, "handled route produces real double click");
+
+        left.consume = false;
+        for (int modifiers = 1; modifiers <= 7; modifiers = modifiers + 1) {
+            PairMods(app, 30, 30, modifiers);
+            Check(left.lastModifiers == modifiers && root.lastModifiers == modifiers,
+                "Click preserves each Ctrl/Shift/Alt bit and combination from Up");
+        }
+        left.reenter = true; left.other = right; left.reenterModifiers = Modifiers.Alt();
+        parentCount = root.clicks; count = right.clicks;
+        PairMods(app, 30, 30, Modifiers.Ctrl() + Modifiers.Shift());
+        Check(right.clicks == count + 1 && root.clicks == parentCount + 1,
+            "new inner Click bubbles; superseded outer Click stops before parent");
+        Check(app.lastClickId == right.WidgetId() && !app.DoubleClickNow(),
+            "outer fallback cannot overwrite newer input click history");
+        Check(left.lastModifiers == Modifiers.Ctrl() + Modifiers.Shift()
+            && right.lastModifiers == Modifiers.Alt() && root.lastModifiers == Modifiers.Alt(),
+            "inner modifiers cannot pollute outer snapshot or revive old parent delivery");
+        app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("frame", 64, 64);
+        Body(); frame.canvas.Destroy(); Console.WriteLine("routed-click-doubleclick:ok");
+    }
+}

@@ -90,7 +90,10 @@ public class ChildWindows {
     // 把窗口加入主循环驱动队列（OpenHost 自动调用）。
     static void Register(ChildWindow w) {
         if (!ChildWindows.All().Contains(w)) {
-            ChildWindows.All().Add(w);
+            List<ChildWindow> next = new List<ChildWindow>();
+            foreach (ChildWindow current in ChildWindows.All()) { next.Add(current); }
+            next.Add(w);
+            ChildWindows.wins = next;
         }
     }
 
@@ -175,6 +178,48 @@ public class ChildWindows {
         return false;
     }
 
+    // Register and Prune replace the registry rather than mutate active views.
+    // Local references therefore remain stable across lifecycle callbacks.
+    static App LoopRoot(App app) {
+        foreach (ChildWindow child in ChildWindows.All()) {
+            if (!child.IsOpen() || child.host != app || child.parentApp == null) { continue; }
+            return ChildWindows.LoopRoot(child.parentApp);
+        }
+        return app;
+    }
+
+    // Loop service is independent of paint budget and BeginFrame wake clearing.
+    static int LoopDeadline(App parent, int deadline) {
+        foreach (ChildWindow child in ChildWindows.All()) {
+            if (!child.IsOpen() || child.parentApp != parent) { continue; }
+            int due = child.host.MinLoopDeadline();
+            due = ChildWindows.LoopDeadline(child.host, due);
+            if (due >= 0 && (deadline < 0 || due < deadline)) { deadline = due; }
+        }
+        return deadline;
+    }
+
+    static void WakeLoopParent(App childApp) {
+        foreach (ChildWindow child in ChildWindows.All()) {
+            if (!child.IsOpen() || child.host != childApp) { continue; }
+            App parent = child.parentApp;
+            if (parent != null) { parent.WakeLoopParticipants(); }
+            return;
+        }
+    }
+
+    static void ServiceLoopParticipants(App parent, int turn, int now) {
+        List<ChildWindow> snapshot = ChildWindows.All();
+        foreach (ChildWindow child in snapshot) {
+            if (!child.IsOpen() || child.parentApp != parent) { continue; }
+            child.host.SyncSurface();
+            child.host.DrainPosts();
+            if (!child.IsOpen() || !child.host.isRunning) { continue; }
+            child.host.TickLoopParticipantsForTurn(turn, now);
+            if (child.IsOpen()) { ChildWindows.ServiceLoopParticipants(child.host, turn, now); }
+        }
+    }
+
     static int Deadline(int deadline) {
         foreach (ChildWindow w in ChildWindows.All()) {
             int a = w.AnimNextMs();
@@ -220,6 +265,7 @@ public class ChildWindows {
     static bool TickDue(int now) {
         bool due = false;
         foreach (ChildWindow w in ChildWindows.All()) {
+            w.TickInputGestures();
             int a = w.AnimNextMs();
             int f = w.FxNextMs();
             if (a >= 0 && now >= a) { due = true; w.RequestRedraw(); }

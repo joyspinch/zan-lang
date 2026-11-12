@@ -1,0 +1,210 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class ListLifecycleEditor : Input {
+    public int Cancels;
+    public bool AttachedAtCancel;
+    public weak Control Destination;
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        Cancels = Cancels + 1;
+        AttachedAtCancel = this.parent != null && this.FindApp() != null;
+        base.OnPointerCancel(e);
+        Control target = Destination;
+        Destination = null;
+        if (target != null) { target.Add(this); }
+    }
+}
+
+class ListLifecycleState {
+    public int Clicks;
+    public int Selected;
+    public int Dragged;
+    public void Click() { Clicks = Clicks + 1; }
+    public void Select() { Selected = Selected + 1; }
+    public void Drag(int index) { Dragged = index; }
+    public bool Gate(string text) { return text != "disabled"; }
+    public string Text(string text) { return text; }
+    public Control Build(string text) {
+        if (text == "none") { return null; }
+        if (text == "button") { return new Button("Action").OnClick(this.Click).Height(36); }
+        ListLifecycleEditor editor = new ListLifecycleEditor();
+        editor.Height(text == "tall" ? 50 : 30);
+        return editor;
+    }
+}
+
+class ListHostSwapTemplate {
+    public weak ListView<string> List;
+    public weak App Destination;
+    public int Calls;
+    public Control Build(string text) {
+        Calls = Calls + 1;
+        ListView<string> list = List;
+        App host = Destination;
+        Destination = null;
+        if (list != null && host != null) { list.UseApp(host); }
+        return new ListLifecycleEditor();
+    }
+}
+
+class ListLifecycleWitness {
+    public weak App Host;
+    public weak ListView<string> List;
+    public weak Control Row;
+}
+
+class ListRetainedLifecycleTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Event(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void Layout(App app, Control root) {
+        root.UseApp(app); root.MeasureTree(app); root.Arrange(10, 10, 260, 160); app.SetRootControl(root);
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static void Arm(App app, ListLifecycleEditor editor) {
+        Event(app, 2, editor.bx + 8, editor.by + 8, 0, 0);
+        Event(app, 3, editor.bx + 8, editor.by + 8, 0, 0);
+        Check(editor.IsFocused(app), "actual pointer focuses template input before Paint");
+        app.CapturePointer(editor, true);
+    }
+    static void TemplateHostBoundary() {
+        App first = App.CreateOffscreen("List template old host", 340, 240);
+        App other = App.CreateOffscreen("List template new host", 340, 240);
+        ListHostSwapTemplate swap = new ListHostSwapTemplate();
+        ListView<string> list = new ListView<string>(swap.Build);
+        swap.List = list; swap.Destination = other;
+        List<string> data = new List<string>(); data.Add("one"); data.Add("two");
+        list.Bind(data); list.UseApp(first);
+        list.BuildRows(first);
+        Check(swap.Calls == 1 && list.FindApp() == other && list.RowControl(0) == null && list.rowsStale,
+            "template host transfer stops old App build before row adoption or measure");
+        list.BuildRows(other);
+        Check(list.RowControl(0) != null && list.RowControl(0).FindApp() == other && swap.Calls == 3,
+            "next list build uses current host for all measured rows");
+        first.canvas.Destroy(); other.canvas.Destroy();
+    }
+    static void Exercise(ListLifecycleWitness witness) {
+        App app = App.CreateOffscreen("List retained lifecycle", 340, 240);
+        ListLifecycleState state = new ListLifecycleState();
+        ListView<string> list = new ListView<string>(state.Build);
+        list.Column("Name", state.Text).Column("Detail", state.Text);
+        list.WithSelectable(state.Gate).OnSelect(state.Select).OnDragOut(state.Drag);
+        List<string> data = new List<string>();
+        data.Add("none"); data.Add("tall"); data.Add("button"); data.Add("disabled");
+        for (int i = 0; i < 12; i = i + 1) { data.Add("tail"); }
+        list.Bind(data);
+        witness.Host = app; witness.List = list;
+        SignalInt original = list.scroll;
+        Layout(app, list);
+        Check(list.RowCount() == data.Count && list.RowControl(0) == null, "null template keeps original data mapping");
+        ListLifecycleEditor editor = (ListLifecycleEditor)list.RowControl(1);
+        Control button = list.RowControl(2);
+        witness.Row = editor;
+        Check(editor.parent != null && editor.FindApp() == app && editor.bh == 50,
+            "variable row measured and adopted before Paint");
+        Check(list.ContentHeightForTest(app) == 50 + 36 + 13 * 30, "null template omission and variable content extent preserved");
+        Check(list.RowControl(3).Disabled.Get() && !editor.Disabled.Get(), "sparse mapping applies selectable gate to original item");
+        editor.Disabled.Set(true);
+        list.SelectIndex(1);
+        Check(!list.Selectable(1) && list.SelectedIndex() == -1,
+            "authored row Disabled is resolved through sparse business mapping, not structural children index");
+        Event(app, 2, editor.bx + 8, editor.by + 8, 0, 0);
+        Event(app, 3, editor.bx + 8, editor.by + 8, 0, 0);
+        Drain(app);
+        Check(list.SelectedIndex() == -1 && state.Selected == 0,
+            "actual disabled template row click cannot select via structural body index");
+        editor.Disabled.Set(false);
+        Check(list.Selectable(1), "mapped enabled row restores selectability independently of filter/body structure");
+        Rect view = list.ScrollViewport();
+        Check(view.y > list.by && view.height < list.bh, "fixed header excluded from body viewport");
+        Arm(app, editor);
+        Event(app, 6, 0, 0, 0, 65);
+        Check(editor.GetText() == "A", "real template editor receives text before Paint");
+        app.ReleasePointerCapture();
+        Event(app, 2, button.bx + 8, button.by + 8, 0, 0);
+        Event(app, 3, button.bx + 8, button.by + 8, 0, 0);
+        Drain(app);
+        Check(state.Clicks == 1 && list.SelectedIndex() == -1, "child Button handles actual input without row selection");
+        editor.Focus(app);
+        list.SetScrollTop(5);
+        Check(editor.IsFocused(app) && list.RowControl(1) == editor, "overlap editor retains identity and focus");
+        Check(list.scroll == original && original.Get() == list.ScrollTop(), "Signal identity mirrors body commit");
+        int version = original.Version();
+        list.SetScrollTop(list.ScrollTop());
+        Check(original.Version() == version, "same offset cannot feed back into legacy Signal");
+        list.SetScrollTop(0);
+        RoutedEventArgs boundary = new RoutedEventArgs("Wheel", editor, view.x + 8, view.y + 8);
+        boundary.delta = 120;
+        editor.RouteEvent(boundary);
+        Check(!boundary.handled && list.ScrollTop() == 0, "body boundary wheel chains to ancestors");
+        Event(app, 13, view.x + 8, list.by + 3, 0, -120);
+        Check(list.ScrollTop() == 0, "header wheel leaves body offset unchanged");
+        Event(app, 13, view.x + 8, view.y + 8, 0, -120);
+        int offset = list.ScrollTop();
+        Check(offset > 0, "shared body wheel before Paint");
+        app.BeginOffscreenFrame(); list.RenderTree(app); list.RenderTree(app); app.EndOffscreenFrame();
+        Check(list.ScrollTop() == offset && list.RowControl(1) == editor && state.Clicks == 1,
+            "Paint is idempotent for scrolling, rows and child actions");
+        list.SetScrollTop(0);
+        Control body = editor.parent;
+        ScrollState metrics = new ScrollState();
+        Rect track = metrics.Track(app, view.x, view.y, view.width, view.height, false);
+        int tx = track.x + track.width / 2;
+        int ty = view.y + metrics.ThumbLength(app, view.height, list.ContentHeightForTest(app)) / 2;
+        Event(app, 2, tx, ty, 0, 0);
+        Check(app.GetCapturedPointer() == body, "only body owns shared scrollbar capture");
+        Event(app, 3, tx, ty + 30, 0, 0);
+        Check(app.GetCapturedPointer() == null && list.ScrollTop() > 0, "shared drag commits final up coordinate");
+        list.SetScrollTop(0);
+        Arm(app, editor);
+        list.SetScrollTop(100000);
+        Check(app.GetCapturedPointer() == null && !editor.IsFocused(app) && editor.Cancels == 1,
+            "offscreen retirement clears input while preserving row ownership");
+        list.SetScrollTop(0);
+        Arm(app, editor);
+        Control destination = new Column(); destination.UseApp(app); editor.Destination = destination;
+        list.Refresh();
+        Check(editor.parent == destination && editor.AttachedAtCancel && list.RowControl(1) == null,
+            "Refresh immediate cancellation preserves reentrant moved editor");
+        destination.RemoveAll();
+        Layout(app, list);
+        Control replacement = list.RowControl(1);
+        App other = App.CreateOffscreen("List other host", 340, 240);
+        app.SetRootControl(null); other.SetRootControl(list); list.UseApp(other);
+        Check(replacement.FindApp() == other, "cross App host inheritance immediate before any operation or Paint");
+        replacement.Focus(other); Event(other, 6, 0, 0, 0, 66);
+        Check(((Input)replacement).GetText() == "B", "cross App editor input before repaint");
+        other.CapturePointer(replacement, true);
+        list.WithRow(null);
+        Check(replacement.parent == null && other.GetCapturedPointer() == null, "template change immediately retires old rows");
+        list.Bind(new List<string>());
+        Check(list.RowCount() == 0, "Bind clears business mapping immediately");
+        List<string> plain = new List<string>(); plain.Add("first"); plain.Add("second");
+        list.Bind(plain);
+        Layout(other, list);
+        Check(list.RowControl(0) == null && list.RowControl(1) == null,
+            "column mode has no row control but retains business row hit height");
+        Rect plainView = list.ScrollViewport();
+        Event(other, 2, plainView.x + 8, plainView.y + 8, 0, 0);
+        Event(other, 3, plainView.x + 8, plainView.y + 8, 0, 0);
+        Drain(other);
+        Check(list.SelectedIndex() == 0 && state.Selected == 1, "plain row selection routes before Paint");
+        Event(other, 2, plainView.x + 8, plainView.y + list.RowHeight(other) + 8, 0, 0);
+        Event(other, 3, list.bx + list.bw + 20, list.by + list.bh + 20, 0, 0);
+        Check(state.Dragged == 1 && other.GetCapturedPointer() == null, "row drag-out preserves original index before Paint");
+        other.SetRootControl(null); other.canvas.Destroy(); app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("Frame", 2, 2);
+        ListLifecycleWitness witness = new ListLifecycleWitness(); Exercise(witness);
+        TemplateHostBoundary();
+        Check(witness.Host == null && witness.List == null && witness.Row == null, "weak list tree lifetime");
+        frame.canvas.Destroy();
+        Console.WriteLine("LISTVIEW_RETAINED_INPUT_LIFECYCLE_OK");
+    }
+}

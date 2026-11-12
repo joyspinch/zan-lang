@@ -1,0 +1,159 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class TransferScrollWatch {
+    public weak Control Transfer;
+    public weak Control Left;
+    public weak Control Search;
+    public weak Control Button;
+}
+class TransferScrollInputTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Input(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void Paint(App app, Control root) {
+        app.BeginOffscreenFrame(); root.RenderTree(app); root.RenderTree(app); app.EndOffscreenFrame();
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static List<string> Rows(string prefix, int count) {
+        List<string> rows = new List<string>();
+        for (int i = 0; i < count; i++) { rows.Add(prefix + i); }
+        return rows;
+    }
+    static TransferRegion<string> Region(Transfer<string> transfer, bool source) {
+        for (int i = 0; i < transfer.Children.Count; i++) {
+            if (transfer.Children[i] is TransferRegion<string> region && region.isSource == source) { return region; }
+        }
+        throw new Exception("missing stable transfer region");
+    }
+    static void Exercise(App app, TransferScrollWatch watch) {
+        Transfer<string> transfer = new Transfer<string>();
+        transfer.Bind(Rows("left", 1000), Rows("right", 300)).WithSearch();
+        transfer.UseApp(app); app.SetRootControl(transfer);
+        for (int dpi = 150; dpi <= 200; dpi = dpi + 50) {
+            app.SetOffscreenViewport(1400, 1000, dpi);
+            transfer.MeasureTree(app); transfer.Arrange(10, 10, app.Scale(620), app.Scale(280));
+            Check(transfer.left.rowHPx == app.Scale(36), "row geometry scales before paint at 150 and 200 percent");
+        }
+        app.SetOffscreenViewport(900, 500, 100);
+        transfer.MeasureTree(app); transfer.Arrange(10, 10, 620, 280);
+        TransferRegion<string> left = Region(transfer, true);
+        TransferRegion<string> right = Region(transfer, false);
+        watch.Transfer = transfer; watch.Left = left;
+        watch.Search = transfer.left.search; watch.Button = transfer.MoveRightButton();
+        Check(left.parent == transfer && right.parent == transfer && left != right,
+            "two stable regions are real children before first paint");
+        Check(transfer.opBox.parent == transfer && transfer.MoveRightButton().Parent() == transfer.opBox
+            && transfer.left.search.Parent() == transfer && transfer.right.search.Parent() == transfer,
+            "operation box and search inputs are mounted in actual tree");
+        Check(left.FindApp() == app && transfer.left.search.FindApp() == app
+            && transfer.MoveRightButton().FindApp() == app, "all internal controls inherit host before paint");
+        int lx = left.bx + 20; int ly = left.by + 20;
+        int rx = right.bx + 20; int ry = right.by + 20;
+        Input(app, 13, lx, ly, 0, -120);
+        Check(left.ScrollTop() > 0 && transfer.left.scroll.Get() == left.ScrollTop()
+            && right.ScrollTop() == 0, "first left wheel commits once and projects SignalInt before paint");
+        int before = left.ScrollTop();
+        Paint(app, transfer);
+        Check(left.ScrollTop() == before && transfer.left.scroll.Get() == before,
+            "double paint cannot replay wheel or change offset");
+        Input(app, 13, rx, ry, 0, -120);
+        Check(right.ScrollTop() > 0 && left.ScrollTop() == before, "right wheel stays independent");
+        transfer.left.scroll.Set(37); transfer.Arrange(10, 10, 620, 280);
+        Check(left.ScrollTop() == 37 && transfer.left.scroll.Get() == 37, "external SignalInt write imports exact pixel at layout");
+        left.SetScrollTop(38);
+        Check(transfer.left.scroll.Get() == 38, "shared programmatic pixel commit projects compatibility signal");
+        left.SetScrollTop(0);
+        ScrollState metrics = new ScrollState(); Rect view = left.ScrollViewport();
+        Rect track = metrics.Track(app, view.x, view.y, view.width, view.height, false);
+        int x = track.x + track.width / 2;
+        int y = view.y + metrics.ThumbLength(app, view.height, left.ScrollExtent()) / 2;
+        Input(app, 2, x, y, 0, 0);
+        Check(app.GetCapturedPointer() == left && transfer.left.paintStart < 0,
+            "left chrome captures without starting row selection");
+        Input(app, 3, x, y + 50, 0, 0);
+        Check(app.GetCapturedPointer() == null && left.ScrollTop() > 0 && transfer.CheckedSource() == 0,
+            "final Up scrolls without selecting or moving any row");
+        left.SetScrollTop(0);
+        Input(app, 2, lx, ly, 0, 0);
+        Check(app.GetCapturedPointer() == left && transfer.CheckedSource() == 0, "row selection defers and captures");
+        Input(app, 3, lx, ly + transfer.left.rowHPx * 2, 0, 0);
+        Drain(app);
+        Check(app.GetCapturedPointer() == null && transfer.CheckedSource() == 3,
+            "final Up commits row band without Move or paint");
+        Input(app, 2, lx, ly, 0, 0);
+        app.ReleaseInputSubtree(transfer);
+        Check(app.GetCapturedPointer() == null && transfer.left.paintStart < 0,
+            "subtree cancellation retires row gesture immediately");
+        transfer.SetQuery(true, "not-present"); transfer.Arrange(10, 10, 620, 280);
+        Check(left.ScrollTop() == 0 && transfer.left.scroll.Get() == 0 && right.ScrollTop() > 0,
+            "left filter clamps only left projection");
+        transfer.SetQuery(true, ""); transfer.Arrange(10, 10, 620, 280);
+        Input(app, 2, x, y, 0, 0);
+        transfer.source.Clear(); transfer.Refresh(); transfer.Arrange(10, 10, 620, 280);
+        Check(app.GetCapturedPointer() == null && left.ScrollTop() == 0, "data shrink cancels thumb and clamps");
+        transfer.left.search.Focus(app);
+        Check(transfer.left.search.IsFocused(app), "mounted search receives input focus");
+        app.SetRootControl(null);
+        Check(!transfer.left.search.IsFocused(app) && app.GetCapturedPointer() == null,
+            "detach retires mounted search focus and all captures");
+    }
+    static void SelectionButtonsAndRebind(App app) {
+        Transfer<string> transfer = new Transfer<string>();
+        List<string> sourceA = Rows("A", 8); List<string> targetA = Rows("targetA", 0);
+        transfer.Bind(sourceA, targetA); transfer.UseApp(app); app.SetRootControl(transfer);
+        transfer.MeasureTree(app); transfer.Arrange(10, 10, 620, 280);
+        TransferRegion<string> left = Region(transfer, true);
+        Button move = transfer.MoveRightButton();
+        Check(move.IsDisabled(), "empty selection starts with disabled operation");
+        int x = left.bx + 20; int y = left.by + transfer.left.rowHPx / 2;
+        Input(app, 2, x, y, 0, 0); Input(app, 3, x, y, 0, 0);
+        Check(transfer.CheckedSource() == 1 && !move.IsDisabled(),
+            "row Up enables operation synchronously without paint or Arrange");
+        int mx = move.bx + move.bw / 2; int my = move.by + move.bh / 2;
+        Input(app, 2, mx, my, 0, 0); Input(app, 3, mx, my, 0, 0); Drain(app);
+        Check(sourceA.Count == 7 && targetA.Count == 1 && move.IsDisabled(),
+            "physical operation works immediately after selection and disables after moving");
+        transfer.SetChecked(sourceA[0], true);
+        Check(!move.IsDisabled(), "programmatic selection updates operation eligibility");
+        transfer.ClearChecked(true);
+        Check(move.IsDisabled(), "programmatic clear updates operation eligibility");
+        for (int side = 0; side < 2; side++) {
+            transfer.Bind(Rows("oldLeft", 8), Rows("oldRight", 8));
+            transfer.Arrange(10, 10, 620, 280);
+            TransferRegion<string> region = Region(transfer, side == 0);
+            int rx = region.bx + 20; int ry = region.by + transfer.left.rowHPx / 2;
+            Input(app, 2, rx, ry, 0, 0);
+            Check(region.pane.paintStart >= 0 && app.GetCapturedPointer() == region,
+                "old binding starts captured row selection");
+            List<string> sourceB = Rows("B", 8); List<string> targetB = Rows("targetB", 8);
+            transfer.Bind(sourceB, targetB);
+            Check(app.GetCapturedPointer() == null && transfer.left.paintStart < 0
+                && transfer.right.paintStart < 0 && !region.IsPressed(),
+                "Bind synchronously retires old selection capture and press on either pane");
+            Input(app, 3, rx, ry, 0, 0); Drain(app);
+            Check(transfer.CheckedSource() == 0 && transfer.CheckedTarget() == 0
+                && sourceB.Count == 8 && targetB.Count == 8,
+                "old binding final Up cannot commit selection or moves to new lists");
+        }
+        app.SetRootControl(null); Drain(app);
+    }
+    static void Main() {
+        Dispatcher.Init();
+        App frame = App.CreateOffscreen("independent Transfer frame", 2, 2);
+        App app = App.CreateOffscreen("Transfer shared scroll", 900, 500);
+        TransferScrollWatch watch = new TransferScrollWatch();
+        Exercise(app, watch);
+        Drain(app);
+        Check(watch.Transfer == null && watch.Left == null && watch.Search == null && watch.Button == null,
+            "weak region owner and operation/search events release full tree");
+        SelectionButtonsAndRebind(app);
+        app.canvas.Destroy(); frame.canvas.Destroy();
+        Console.WriteLine("transfer_scroll_input_lifecycle: ok");
+    }
+}

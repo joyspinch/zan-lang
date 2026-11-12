@@ -1,0 +1,155 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.WebView;
+using Gui.Component.CefBrowser;
+using Gui.Component.FirefoxBrowser;
+
+namespace Gui.Component;
+
+public class BrowserNativeEntry {
+    public weak BrowserNativeLoop loop;
+    public weak Control box;
+    public weak Gui.Component.WebView.WebView web;
+    public weak Gui.Component.CefBrowser.CefBrowser cef;
+    public weak Gui.Component.FirefoxBrowser.FirefoxBrowser firefox;
+    public int engine;
+    public bool retired;
+    bool shown;
+    bool boxOwned;
+    int x;
+    int y;
+    int width;
+    int height;
+    int revision;
+    int nativeHandle;
+    int nativeViewId;
+    bool hiddenRequested;
+    nint geckoHandle;
+
+    public void SetBounds(int px, int py, int pw, int ph) {
+        bool changed = x != px || y != py || width != pw || height != ph || hiddenRequested;
+        x = px; y = py; width = pw; height = ph;
+        shown = pw > 0 && ph > 0;
+        hiddenRequested = false;
+        BrowserNativeLoop service = loop;
+        if (changed && service != null) { service.Wake(); }
+    }
+
+    public void AttachBox(Control owner) { box = owner; boxOwned = true; }
+
+    bool Current(App app) {
+        if (retired || app == null || !app.isRunning) { return false; }
+        Control owner = box;
+        if (!boxOwned) { shown = !hiddenRequested && width > 0 && height > 0; return true; }
+        if (owner == null || owner.app != app) { return false; }
+        // Modal input masks do not remove a hosted native endpoint. Structural
+        // membership still rejects a removed/replaced root with an App binding.
+        if (app.rootControl == null || !app.rootControl.ContainsHostedControl(owner)) { return false; }
+        x = owner.bx; y = owner.by; width = owner.bw; height = owner.bh;
+        shown = !hiddenRequested && width > 0 && height > 0;
+        Control node = owner;
+        while (node != null) {
+            if (!node.StyleVisible() || node.bw <= 0 || node.bh <= 0) { shown = false; }
+            node = node.parent;
+        }
+        // Input exclusion changes native surface eligibility, never ownership.
+        if (!app.rootControl.ContainsInputControl(owner)) { shown = false; }
+        // Minimized Layer bodies remain hosted and keep their engine alive.
+        // Their native surface stays hidden until the Layer is restored.
+        if (app.layerContext is AppLayerContext) {
+            AppLayerContext context = (AppLayerContext)app.layerContext;
+            for (int i = 0; i < context.zorder.Count; i = i + 1) {
+                LayerState state = context.zorder[i];
+                if (!state.open || state.modal || state.state != 2) { continue; }
+                if ((state.view != null && state.view.ContainsHostedControl(owner))
+                    || (state.wrap != null && state.wrap.ContainsHostedControl(owner))) { shown = false; }
+            }
+        }
+        return true;
+    }
+
+    public bool IsCurrent(App app) { return Current(app); }
+
+    public bool Prepare(App app) {
+        if (!Current(app) || (web == null && cef == null && firefox == null)) { Retire(app); return false; }
+        if (!shown) { Hide(); return true; }
+        Control owner = box;
+        if (owner is WebViewBox) { ((WebViewBox)owner).ConsumeStartUrl(); }
+        if (owner is CefBrowserBox) { ((CefBrowserBox)owner).ConsumeStartUrl(); }
+        if (owner is FirefoxBrowserBox) { ((FirefoxBrowserBox)owner).ConsumeStartUrl(); }
+        Gui.Component.WebView.WebView w = web;
+        Gui.Component.CefBrowser.CefBrowser c = cef;
+        Gui.Component.FirefoxBrowser.FirefoxBrowser f = firefox;
+        if (w != null) { w.PrepareNative(app, x, y, width, height); nativeHandle = w.handle; }
+        if (c != null) { c.PrepareNative(app, x, y, width, height); nativeHandle = c.handle; }
+        if (f != null) { f.PrepareNative(app, x, y, width, height); geckoHandle = f.handle; nativeViewId = f.viewId; }
+        return !retired;
+    }
+
+    public bool HasCef() { return cef != null && (nativeHandle != 0 || shown); }
+
+    public bool Poll(App app) {
+        if (!Current(app)) { Retire(app); return false; }
+        Gui.Component.WebView.WebView w = web;
+        Gui.Component.CefBrowser.CefBrowser c = cef;
+        Gui.Component.FirefoxBrowser.FirefoxBrowser f = firefox;
+        if (w != null) { w.PollNative(app); }
+        if (c != null) { c.PollNative(app); }
+        if (f != null) { f.PollNative(app); }
+        return (w != null && w.IsLoading()) || (c != null && c.IsLoading());
+    }
+
+    public void RequestHide() { hiddenRequested = true; }
+
+    public void Hide() {
+        bool requested = hiddenRequested;
+        Gui.Component.WebView.WebView w = web;
+        Gui.Component.CefBrowser.CefBrowser c = cef;
+        Gui.Component.FirefoxBrowser.FirefoxBrowser f = firefox;
+        if (w != null) { w.Hide(); }
+        if (c != null) { c.SetFocus(false); c.Hide(); }
+        if (f != null) { f.Hide(); }
+        hiddenRequested = requested;
+    }
+
+    // Endpoint destruction detaches the handle before dropping this weak entry.
+    // A collected endpoint has no Dispose callback, so retain only its last handle.
+    public void Retire(App app) {
+        if (retired) { return; }
+        retired = true;
+        revision = revision + 1;
+        Gui.Component.WebView.WebView w = web;
+        Gui.Component.CefBrowser.CefBrowser c = cef;
+        Gui.Component.FirefoxBrowser.FirefoxBrowser f = firefox;
+        if (w != null) { w.ReleaseNative(); }
+        else if (engine == 1 && nativeHandle != 0) {
+            NativeLayer.Forget(nativeHandle);
+            WebViewBackend.Destroy(nativeHandle);
+        }
+        if (c != null) { c.ReleaseNative(); }
+        else if (engine == 2 && nativeHandle != 0) {
+            BrowserNativeLoop service = loop;
+            if (service != null) { service.CloseCef(nativeHandle); }
+        }
+        if (f != null) { f.ReleaseNative(); }
+        else if (geckoHandle != 0 && FirefoxCore.PfnDestroy != 0) {
+            if (nativeViewId > 0) { NativeLayer.Forget(nativeViewId); }
+            GeckoActionFn destroy = (GeckoActionFn)FirefoxCore.PfnDestroy;
+            destroy(geckoHandle);
+        }
+        nativeHandle = 0; geckoHandle = 0;
+        web = null; cef = null; firefox = null; box = null;
+    }
+
+    public void CaptureHandle() {
+        Gui.Component.WebView.WebView w = web;
+        Gui.Component.CefBrowser.CefBrowser c = cef;
+        Gui.Component.FirefoxBrowser.FirefoxBrowser f = firefox;
+        if (w != null) { nativeHandle = w.handle; }
+        if (c != null) { nativeHandle = c.handle; }
+        if (f != null) { geckoHandle = f.handle; nativeViewId = f.viewId; }
+    }
+
+    public void ForgetHandle() { nativeHandle = 0; geckoHandle = 0; nativeViewId = 0; }
+}

@@ -1,6 +1,7 @@
 using System.Json;
 using System;
 using Gui;
+using Gui.Component;
 
 namespace Gui.Component.CefBrowser;
 
@@ -25,6 +26,46 @@ public delegate void CefPopupFn(string url);
 // CefBootstrap.RunHelper()、之后 await CefBootstrap.StartAsync()。没启动成功时
 // IsSupported() 为 false，Render 画一个画布内占位符（说明原因），而不是崩掉。
 public class CefBrowser : IDisposable {
+    public BrowserNativeEntry nativeEntry;
+    string nativeTarget = "";
+    string nativeHtml = "";
+    string nativeBase = "";
+    int nativeRevision;
+    bool nativeDestroyed;
+
+    public BrowserNativeEntry AttachNative(App app, Control box) {
+        if (nativeDestroyed || app == null || !app.isRunning) { return null; }
+        if (nativeEntry != null && !nativeEntry.retired && nativeEntry.loop != null
+            && nativeEntry.loop.host == app) {
+            if (box != null) { nativeEntry.AttachBox(box); }
+            return nativeEntry;
+        }
+        if (nativeEntry != null && !nativeEntry.retired) { nativeEntry.Retire(app); }
+        BrowserNativeLoop service = BrowserNativeLoop.For(app);
+        BrowserNativeEntry entry = new BrowserNativeEntry();
+        entry.engine = 2;
+        entry.cef = this;
+        entry.loop = service;
+        if (box != null) { entry.AttachBox(box); }
+        nativeEntry = entry;
+        service.Add(entry);
+        return entry;
+    }
+
+    public void ReleaseNative() {
+        nativeRevision = nativeRevision + 1;
+        int previous = handle;
+        handle = 0; created = false;
+        guiHadFocus = false;
+        if (pendingUrl == "") { pendingUrl = nativeTarget != "" ? nativeTarget : url.Get(); }
+        if (previous != 0) {
+            BrowserNativeLoop service = nativeEntry != null ? nativeEntry.loop : null;
+            if (service != null) { service.CloseCef(previous); }
+            else { NativeLayer.Forget(previous); CefBackend.SetVisible(previous, false); CefBackend.Close(previous); }
+        }
+        if (nativeEntry != null) { nativeEntry.ForgetHandle(); }
+    }
+
     #if WINDOWS
     // 原生浏览器是宿主窗口的子 HWND，被点中时 Win32 键盘焦点就落在它上面，
     // 此后所有按键都进 Chromium——宿主窗口再也收不到 WM_CHAR，界面上的
@@ -117,6 +158,12 @@ public class CefBrowser : IDisposable {
     }
 
     public void EnsureCreated(App app, int x, int y, int w, int h) {
+        if (nativeDestroyed) { return; }
+        if (app == null) { app = App.FrameApp(); }
+        BrowserNativeEntry creationEntry = this.AttachNative(app, null);
+        if (creationEntry == null) { return; }
+        creationEntry.SetBounds(x, y, w, h);
+        try {
         if (created) { return; }
         if (app == null) { app = App.FrameApp(); }
         if (app == null) { supported = false; return; }
@@ -138,10 +185,13 @@ public class CefBrowser : IDisposable {
         if (popupPolicy != 0) {
             CefBackend.SetPopupPolicy(handle, popupPolicy);
         }
+            } finally { creationEntry.CaptureHandle(); }
     }
 
     // 导航到 URL。无协议的裸主机名视为 https://。
     public void Navigate(string target) {
+        nativeTarget = CefBrowser.Normalize(target);
+        nativeHtml = "";
         string u = CefBrowser.Normalize(target);
         if (handle == 0) {
             pendingUrl = u;
@@ -373,6 +423,7 @@ public class CefBrowser : IDisposable {
 
     // 隐藏原生窗口（对不在屏幕上的标签/面板调用）。
     public void Hide() {
+        if (nativeEntry != null) { nativeEntry.RequestHide(); }
         if (handle != 0) { CefBackend.SetVisible(handle, false); }
     }
 
@@ -384,16 +435,11 @@ public class CefBrowser : IDisposable {
     // 把循环推到它消失为止（有上限，别让病态页面把 UI 线程卡死；没推完
     // 的收尾由后续帧或 CefHost.Shutdown 兜底）。
     public void Destroy() {
-        if (handle != 0) {
-            NativeLayer.Forget(handle);
-            CefBackend.Close(handle);
-            for (int i = 0; i < 64; i = i + 1) {
-                if (!CefBackend.Alive(handle)) { break; }
-                CefHost.Work();
-            }
-        }
-        handle = 0;
-        created = false;
+        nativeDestroyed = true;
+        BrowserNativeEntry previous = nativeEntry;
+        if (previous != null && !previous.retired) { previous.Retire(null); }
+        else { this.ReleaseNative(); }
+        nativeEntry = null;
     }
 
     public void Dispose() {
@@ -409,37 +455,50 @@ public class CefBrowser : IDisposable {
         return this.Render(App.FrameApp(), x, y, w, h);
     }
 
+    // Compatibility facade: immediate callers still drive one complete turn.
     public int Render(App app, int x, int y, int w, int h) {
         if (app == null) { app = App.FrameApp(); }
-        if (app == null) { return 0; }
+        BrowserNativeEntry entry = this.AttachNative(app, null);
+        if (entry != null) { entry.SetBounds(x, y, w, h); }
+        this.Paint(app, x, y, w, h);
+        return handle;
+    }
+
+    // Retained path: creation/bounds/focus/events; invoked by the public host loop.
+    public int Update(App app, int x, int y, int w, int h) {
+        this.PrepareNative(app, x, y, w, h);
+        this.PollNative(app);
+        return handle;
+    }
+
+    public void PrepareNative(App app, int x, int y, int w, int h) {
+        if (app == null) { app = App.FrameApp(); }
+        if (app == null) { return; }
         EnsureCreated(app, x, y, w, h);
         if (handle == 0) {
-            CefBrowser.PaintPlaceholder(app, x, y, w, h);
-            return 0;
+            return;
         }
-        // Chromium 的 UI 线程就是宿主线程（single-process message loop），
-        // 所以每帧必须推它一轮，否则页面不动。
-        CefHost.Work();
         CefBackend.SetBounds(handle, x, y, w, h);
-        // 可见性不在这里定：原生窗口是 OS 兄弟层，永远画在画布之上，直接
-        // 显示就会把右键菜单、下拉、模态对话框一起盖住。改为向 App 登记
-        // 本帧占位，由 PresentFrame 在所有自绘 UI 之后算出未被遮挡的
-        // 区域再下发（完全被盖住时隐藏）。
-        NativeLayer.Register(app, handle, x, y, w, h, CefBackend.ApplyClip);
         SyncFocus(app);
 
-        if (cdpRouter != null) { cdpRouter.Pump(); }
+    }
+
+    public void PollNative(App app) {
+        if (nativeDestroyed || handle == 0) { return; }
+        int generation = nativeRevision;
+        int expected = handle;
+        if (cdpRouter != null) { cdpRouter.Pump(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; } }
         if (popupPolicy == 2 && popupSink != null) {
             string popup = CefBackend.TakePopupUrl(handle);
-            if (popup != "") { popupSink(popup); }
+            if (popup != "") { popupSink(popup); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; } }
         }
 
         bool dirty = false;
         bool busy = CefBackend.IsLoading(handle);
         if (busy != lastSeenLoading) {
             lastSeenLoading = busy;
-            if (busy) { NavStart.Raise(); }
-            LoadingChanged.Raise();
+            if (busy) { NavStart.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; } }
+            LoadingChanged.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
             dirty = true;
         }
 
@@ -448,27 +507,31 @@ public class CefBrowser : IDisposable {
             lastNavSeq = seq;
             url.Set(CefBackend.GetUrl(handle));
             title.Set(CefBackend.GetTitle(handle));
-            NavComplete.Raise();
+            NavComplete.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
             dirty = true;
         }
         string docTitle = CefBackend.GetTitle(handle);
         if (docTitle != lastSeenTitle) {
             lastSeenTitle = docTitle;
             title.Set(docTitle);
-            TitleChanged.Raise();
+            TitleChanged.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
             dirty = true;
         }
         // 浏览器画面变化不会经过 Zan 的重绘逻辑，但原生窗口是自己刷新的，
         // 这里只在有语义变化时请求重绘（省电）。
         if (dirty) { app.RequestRedraw(); }
-        // Chromium 的消息循环只在本方法里被推，而事件循环空闲时会阻塞在
-        // WaitEvent 上——没有这一句，鼠标一停页面就冻住（加载中的页面停在
-        // 半张，标题/导航事件也要等下一次输入才到）。所以只要浏览器还活着
-        // 就预约下一帧：加载中密一点，空闲时降到约 30 Hz，并把重绘范围声明
-        // 成浏览器这块矩形（原生窗口自己刷新，画布这块几乎没有开销）。
-        int next = 30;
-        if (busy) { next = 8; }
-        app.RequestAnimationFrameIn(next, x, y, w, h);
+
+        }
+
+    // Paint may register this frame's native clip or draw the fallback only.
+    public int Paint(App app, int x, int y, int w, int h) {
+        if (nativeEntry != null && !nativeEntry.shown) { return handle; }
+        if (app == null || w <= 0 || h <= 0) { return 0; }
+        if (handle == 0) {
+            CefBrowser.PaintPlaceholder(app, x, y, w, h);
+            return 0;
+        }
+        NativeLayer.Register(app, handle, x, y, w, h, CefBackend.ApplyClip);
         return handle;
     }
 

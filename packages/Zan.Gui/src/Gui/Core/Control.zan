@@ -14,7 +14,7 @@ namespace Gui;
 // 标准 Flow 块级流与行内行盒流，见 `Arrange`）。绘制由
 // 渲染管道递归——子类重写 `OnPaint`，框架通过 `Paint` 递归裁剪
 // 并装配图元，内容不会溢出（复用原生裁剪栈）。
-public partial class Control {
+public partial class Control : AppLoopOwner {
     string name;
     // 容器流式标记（兼容 Flex 方向判定：0 无，1 列，2 行）
     int layout;
@@ -58,6 +58,24 @@ public partial class Control {
         return this.extra;
     }
 
+    // 兼容历史调用方：停靠模式与逻辑宽高映射到现代 flex grow 与 prefW/prefH
+    public int dock {
+        get { return grow ? 5 : 0; }
+        set { if (value == 5) { this.Grow(); } }
+    }
+    public int logW {
+        get { return prefW; }
+        set { prefW = value; prefSet = true; }
+    }
+    public int logH {
+        get { return prefH; }
+        set { prefH = value; prefSet = true; }
+    }
+    public int logGap {
+        get { return gap; }
+        set { gap = value; }
+    }
+
     public bool layoutFlow {
         get { return this.extra != null ? this.extra.layoutFlow : false; }
         set { this.EnsureExtra().layoutFlow = value; }
@@ -94,20 +112,20 @@ public partial class Control {
     int scrollExtentX;
     ScrollState scroll;
     weak Control parent;
-    App app;
+    weak App app;
+    // 显式上下文覆盖与树继承分开：重挂子树只更新继承值。
+    bool explicitApp;
     public App App {
         get { return this.ResolveApp(null); }
-        set { this.app = value; }
+        set { this.UseApp(value); }
     }
     public List<Control> children;
-    public List<Control> Children {
-        get { return children; }
-        set {
-            if (value != null) {
-                for (int i = 0; i < value.Count; i = i + 1) {
-                    this.Add(value[i]);
-                }
-            }
+    // Collection initializers and direct edits share adoption and input retirement.
+    public ControlChildren Children {
+        get {
+            ControlExtra state = this.EnsureExtra();
+            if (state.childrenView == null) { state.childrenView = new ControlChildren(this); }
+            return state.childrenView;
         }
     }
     private static List<EventBinding> emptyEvents = new List<EventBinding>();
@@ -462,25 +480,20 @@ public partial class Control {
         this.InitControl(n);
     }
 
-    // 追加一个子节点，返回该子节点本身，调用方可内联持有引用，
-    // 如 `Button b = panel.Add(save)`。注意：Add 不做停靠归一化——
-    // 子项保持手摆（dock=0），在流式容器（列/行）里会全部叠在原点。
-    // 要自动沿流式轴停靠请用 With()（或集合初始化器，它走的也是 With）。
+    // 追加一个子节点并返回该子节点，如 `Button b = panel.Add(save)`。
+    // Add 与 With（含 Children 集合初始化器）走相同的虚拟业务挂载入口，
+    // 布局由 CSS 与父容器决定；二者只在返回 child / container 上有区别。
     public virtual Control Add(Control c) {
         if (!this.Adoptable(c)) { return c; }
-        this.Adopt(c);
+        if (!this.Adopt(c)) { return c; }
         children.Add(c);
         return c;
     }
 
-    // 流式子节点追加：添加 `c` 并返回 THIS 容器（而非子节点），
-    // 因此多个子节点可链式追加——`panel.With(a).With(b).With(c)`。若
-    // 此节点有流式布局（列/行），子节点会自动沿
-    // 流式轴停靠，除非它选择了 Grow()。
+    // 添加 `c` 并返回 THIS 容器，支持 `panel.With(a).With(b)` 链式追加。
+    // 调用虚拟 Add 保持普通子节点与组件业务插槽的挂载协议一致。
     Control With(Control c) {
-        if (!this.Adoptable(c)) { return this; }
-        this.Adopt(c);
-        children.Add(c);
+        this.Add(c);
         return this;
     }
 
@@ -521,11 +534,15 @@ public partial class Control {
 
     // 收养一个子节点：先从原父节点摘下（含本节点，重复 Add 不会让
     // 同一个控件在 children 里出现两次），再指向本节点。
-    void Adopt(Control c) {
+    bool Adopt(Control c) {
         if (c.parent != null) { c.parent.Remove(c); }
+        // A cancellation handler may have moved the child elsewhere.
+        if (c.parent != null || !this.Adoptable(c)) { return false; }
         c.parent = this;
+        c.InheritApp(this.FindApp());
         c.SpreadHostForm(this.HostForm());
         this.SpreadScopeTo(c);
+        return true;
     }
 
     // 提取作用域类（HTML scoping 约定的 `zs-*` 类标记）：
@@ -614,15 +631,35 @@ public partial class Control {
     }
 
     public Control UseApp(App host) {
-        this.app = host;
+        this.explicitApp = host != null;
+        App inherited = host;
+        if (inherited == null && this.parent != null) {
+            inherited = this.parent.FindApp();
+        }
+        this.SetHostApp(inherited);
         return this;
     }
 
-    // 挂到窗口树上时由框架下发：设计出来的控件用它记住自己的事件
-    // 宿主，因此宿主代码不需要手动接线。
+    void SetHostApp(App host) {
+        if (this.app != host) {
+            this.app = host;
+            this.computedStyle = null;
+        }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            children[i].InheritApp(host);
+        }
+    }
+
+    void InheritApp(App host) {
+        if (this.explicitApp) { return; }
+        if (this.parent != null) { host = this.parent.FindApp(); }
+        this.SetHostApp(host);
+    }
+
+    // 挂到窗口树上时同步自动继承的上下文；显式覆盖由 UseApp 管理。
     public virtual void OnHostForm(Form f) {
         if (f != null && this.app == null) {
-            this.app = f.GetApp();
+            this.InheritApp(f.GetApp());
         }
     }
 
@@ -670,23 +707,30 @@ public partial class Control {
     void Remove(Control c) {
         int idx = IndexOf(c);
         if (idx >= 0) {
+            App host = this.FindApp();
+            if (host != null) { host.ReleaseInputSubtree(c); }
+            // Cancellation may itself mutate the tree.
+            idx = IndexOf(c);
+            if (idx < 0 || c.parent != this) { return; }
             children.RemoveAt(idx);
             c.parent = null;
+            c.InheritApp(null);
         }
     }
 
     // 移除所有子节点：数据驱动的容器在按数据重填前调用。
     void RemoveAll() {
-        for (int i = 0; i < children.Count; i = i + 1) {
-            children[i].parent = null;
+        List<Control> previous = new List<Control>();
+        previous.AddRange(children);
+        for (int i = 0; i < previous.Count; i = i + 1) {
+            this.Remove(previous[i]);
         }
-        children = new List<Control>();
     }
 
     // 在某个位置插入子节点，索引被钳制在范围内。会重新父化 `c`。
     void InsertAt(int idx, Control c) {
         if (!this.Adoptable(c)) { return; }
-        this.Adopt(c);
+        if (!this.Adopt(c)) { return; }
         int at = idx;
         if (at < 0) { at = 0; }
         if (at > children.Count) { at = children.Count; }
@@ -716,6 +760,7 @@ public partial class Control {
     public virtual Control HitTest(int x, int y, int pointerType) {
         if (!this.StyleVisible()) { return null; }
         if (!this.ContainsPoint(x, y, pointerType)) { return null; }
+        if (this.ScrollBarHit(x, y) != 0) { return this; }
         bool anyZ = false;
         for (int i = 0; i < children.Count; i = i + 1) {
             if (children[i].StyleZIndex() != 0) { anyZ = true; break; }
@@ -786,14 +831,6 @@ public partial class Control {
         return parent;
     }
 
-    // 子节点集合门面（getter-only 属性）：对象初始化器
-    // `new Panel.Row() { Children = { a, b, c } }` 对它逐个 Add，
-    // 每次 Add 都走 `With` 的完整收养语义；这是唯一预期的用法，
-    // 返回的包装对象是一次性的，不值得在初始化器之外持有。
-    public ControlChildren ChildrenCollection {
-        get { return new ControlChildren(this); }
-    }
-
     // 作者声明控件高度（设计文档的 fh，逻辑像素）。走这条通道的
     // 高度优先于样式表的 height：文档是设计器的唯一真相，样式表
     // 的默认高度（`input { height: 32px }`）不该把作者定下的行高
@@ -825,6 +862,10 @@ public partial class Control {
     }
     public virtual void OnPaintOverlay(App app) {
     }
+
+    // Return true when this popup handled Escape without the host's default dismissal.
+    // Called only for the current host session; blur keeps its normal retirement.
+    public virtual bool OnPopupEscape(App app) { return false; }
 
     // 浮层（下拉列表、日历卡片、颜色面板等）被外部点击或 Esc 关闭时的回调通知。
     public virtual void OnPopupDismissed() {

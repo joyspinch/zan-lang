@@ -1,0 +1,80 @@
+using System;
+using Gui;
+
+class PopupEscapeWitness : Control {
+    public weak App Host;
+    public weak App Destination;
+    public weak Control Next;
+    public int Mode;
+    public int Escapes;
+    public int Dismissals;
+    public PopupEscapeWitness() : base("escape-witness") { prefW = 140; prefH = 90; }
+    public override bool OnPopupEscape(App app) {
+        Escapes = Escapes + 1;
+        App host = Host;
+        if (Mode == 1) { return true; }
+        if (Mode == 2) { host.overlayHost.ShowAt(host, Next, 30, 30); }
+        if (Mode == 3) { host.overlayHost.Dismiss(); host.overlayHost.ShowAt(host, this, 30, 30); }
+        if (Mode == 4) {
+            host.overlayHost.Dismiss();
+            App target = Destination; this.UseApp(target);
+            target.overlayHost.ShowAt(target, this, 30, 30);
+        }
+        return false;
+    }
+    public override void OnPopupDismissed() { Dismissals = Dismissals + 1; }
+}
+class PopupEscapeInputTest {
+    static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+    static void Input(App app, int kind, int key) {
+        app.BeginOffscreenFrame();
+        app.ProcessOffscreenInput(kind, 0, 0, 0, key, 0, 0);
+        app.EndOffscreenFrame();
+    }
+    static PopupEscapeWitness Open(App app, int mode) {
+        PopupEscapeWitness popup = new PopupEscapeWitness(); popup.Host = app; popup.Mode = mode;
+        popup.UseApp(app); app.overlayHost.ShowAt(app, popup, 20, 20); return popup;
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("independent escape frame", 2, 2);
+        App app = App.CreateOffscreen("popup Escape contract", 320, 240);
+        App other = App.CreateOffscreen("popup Escape destination", 320, 240);
+        try {
+            Control plain = new Control("default-popup"); plain.prefW = 140; plain.prefH = 90; plain.UseApp(app);
+            app.overlayHost.ShowAt(app, plain, 20, 20);
+            Input(app, 4, 27);
+            Check(app.overlayHost.ActiveRoot() == null, "default false keeps legacy Escape dismissal");
+            PopupEscapeWitness handled = Open(app, 1);
+            Input(app, 4, 27);
+            Check(handled.Escapes == 1 && handled.Dismissals == 0
+                && app.overlayHost.ActiveRoot() == handled, "handled Escape retains current popup");
+            Input(app, 9, 0);
+            Check(handled.Escapes == 1 && handled.Dismissals == 1
+                && app.overlayHost.ActiveRoot() == null, "blur bypasses Escape hook and retires normally");
+            PopupEscapeWitness normal = Open(app, 0);
+            Input(app, 4, 27);
+            Check(normal.Escapes == 1 && normal.Dismissals == 1, "false hook dismisses current popup once");
+            PopupEscapeWitness replacement = new PopupEscapeWitness(); replacement.UseApp(app);
+            PopupEscapeWitness old = Open(app, 2); old.Next = replacement;
+            Input(app, 4, 27);
+            Check(app.overlayHost.ActiveRoot() == replacement && replacement.Dismissals == 0,
+                "old false return cannot dismiss replacement");
+            app.overlayHost.Dismiss();
+            PopupEscapeWitness reopened = Open(app, 3);
+            Input(app, 4, 27);
+            Check(reopened.Dismissals == 1 && app.overlayHost.ActiveRoot() == reopened,
+                "same popup reopen revision survives old false return");
+            app.overlayHost.Dismiss();
+            PopupEscapeWitness moved = Open(app, 4); moved.Destination = other;
+            Input(app, 4, 27);
+            Check(app.overlayHost.ActiveRoot() == null && other.overlayHost.ActiveRoot() == moved
+                && moved.Dismissals == 1, "cross App callback session survives");
+            other.overlayHost.Dismiss();
+            Console.WriteLine("OVERLAY_ESCAPE_INPUT_OK");
+        } finally {
+            app.overlayHost.Dismiss(); other.overlayHost.Dismiss();
+            app.SetRootControl(null); other.SetRootControl(null);
+            app.canvas.Destroy(); other.canvas.Destroy(); frame.canvas.Destroy();
+        }
+    }
+}

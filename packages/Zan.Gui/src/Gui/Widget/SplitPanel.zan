@@ -22,8 +22,8 @@ public class SplitPanel : Control {
     private int minSecond;
     private Panel firstPane;
     private Panel secondPane;
-    private int wid;
-    // 分隔条上一次的命中矩形，供 OnPaint 之后的拖拽处理使用。
+    private bool dragging;
+    // Arrange 产生的分隔条矩形，绘制与输入共用。
     public int handleX;
     public int handleY;
     public int handleW;
@@ -43,7 +43,7 @@ public class SplitPanel : Control {
         firstSize = new SignalInt(size);
         minFirst = 60;
         minSecond = 60;
-        wid = this.CommonId();
+        dragging = false;
         handleX = 0;
         handleY = 0;
         handleW = 0;
@@ -99,6 +99,12 @@ public class SplitPanel : Control {
     // ---- 设计器 / 序列化模型 --------------------------------------
 
     // 控件类型标识（序列化/设计器用）。
+    public override void CloneContentTo(Control target, CloneTreeFn clone) {
+        SplitPanel split = (SplitPanel)target;
+        firstPane.CloneContentTo(split.First(), clone);
+        secondPane.CloneContentTo(split.Second(), clone);
+    }
+
     public override string Kind() { return "SplitPanel"; }
 
     // 覆写：返回设计器属性清单（orient/size/minFirst/minSecond）。
@@ -220,28 +226,78 @@ public class SplitPanel : Control {
         return want;
     }
 
-    // 覆写：画分隔条并登记命中区；按住拖动时把鼠标位置经 Clamp
-    // 写回首格尺寸。
-    public override void OnPaint(App app) {
-        Canvas c = app.canvas;
-        int id = wid;
-        bool hot = app.focus.IsHovered(id) || app.focus.IsPressed(id);
-        int hs = Style.SNormal();
-        if (hot) { hs = Style.SHover(); }
-        c.FillRect(handleX, handleY, handleW, handleH,
-                   this.ResolveStyleAs(app, "splitter", "", hs).bg);
-        app.hitTester.RegisterRect(id, handleX, handleY,
-                                            handleW, handleH, 4);
-        if (app.focus.IsPressed(id)) {
-            int nv = app.mouseX - bx;
-            if (orient == 1) { nv = app.mouseY - by; }
-            int total = bw;
-            if (orient == 1) { total = bh; }
-            nv = this.Clamp(nv, total, SplitPanel.BarSize());
-            if (nv != firstSize.Get()) {
-                firstSize.Set(nv);
-                app.RequestRedraw();
-            }
+    // The handle's expanded hit area must win before either pane's children.
+    private bool HitsHandle(int x, int y, int pointerType) {
+        int margin = pointerType == 1 ? 20 : 4;
+        if (handleW <= 0 || handleH <= 0) { return false; }
+        if (orient == 1) {
+            return x >= handleX && x < handleX + handleW && y >= handleY - margin && y < handleY + handleH + margin;
         }
+        return x >= handleX - margin && x < handleX + handleW + margin && y >= handleY && y < handleY + handleH;
+    }
+
+    public override Control HitTest(int x, int y, int pointerType) {
+        if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
+        if (this.HitsHandle(x, y, pointerType)) { return this; }
+        return base.HitTest(x, y, pointerType);
+    }
+
+    private void DragTo(App app, RoutedEventArgs e) {
+        int value = orient == 1 ? e.y - by : e.x - bx;
+        int total = orient == 1 ? bh : bw;
+        value = this.Clamp(value, total, SplitPanel.BarSize());
+        if (value == firstSize.Get()) { return; }
+        firstSize.Set(value);
+        this.Arrange(bx, by, bw, bh);
+        app.RequestRedraw();
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || this.IsDisabled() || app == null || app.window.EventButton() != 0) { return; }
+        if (e.originalSource != this || !this.HitsHandle(e.x, e.y, e.pointerType)) { return; }
+        dragging = true;
+        base.OnPointerDown(e);
+        app.CapturePointer(this, true);
+        this.DragTo(app, e);
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || !dragging || app == null || app.GetCapturedPointer() != this) { return; }
+        if (this.IsDisabled()) { this.OnPointerCancel(e); return; }
+        this.DragTo(app, e);
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || !dragging || app == null || app.window.EventButton() != 0) { return; }
+        if (!this.IsDisabled() && app.GetCapturedPointer() == this) { this.DragTo(app, e); }
+        base.OnPointerUp(e);
+        dragging = false;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        dragging = false;
+        App app = this.FindApp();
+        if (app != null) {
+            if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+            app.RequestRedraw();
+        }
+    }
+
+    public override void OnPaint(App app) {
+        int state = Style.SNormal();
+        if (this.IsDisabled()) { state = Style.SDisabled(); }
+        else if (dragging || this.HitsHandle(app.mouseX, app.mouseY, app.GetPointerDeviceType())) { state = Style.SHover(); }
+        app.canvas.FillRect(handleX, handleY, handleW, handleH,
+            this.ResolveStyleAs(app, "splitter", "", state).bg);
     }
 }

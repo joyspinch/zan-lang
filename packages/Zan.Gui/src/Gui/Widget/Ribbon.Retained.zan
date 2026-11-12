@@ -1,0 +1,334 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+// Shares the legacy Fit/Layout result; input is supplied by real Button descendants.
+public partial class Ribbon {
+    Control retainedTabs;
+    Control retainedBand;
+    Button retainedMore;
+    List<Button> retainedItems = new List<Button>();
+    List<Label> retainedLabels = new List<Label>();
+    List<Control> retainedGroups = new List<Control>();
+    List<Control> retainedBoxes = new List<Control>();
+    List<Label> retainedTitles = new List<Label>();
+    RibbonLayout retainedLayout;
+    List<RibbonSlot> retainedOverflow = new List<RibbonSlot>();
+    RibbonOverflow retainedPopup;
+    weak App retainedApp;
+    int arrangedTab = -1;
+    int layoutRevision;
+    int arrangeEpoch;
+    int overflowEpoch;
+    int layoutX; int layoutY; int layoutW; int layoutH;
+    int layoutGeneration;
+    List<Control> retainedDividers = new List<Control>();
+    List<int> retainedDividerItems = new List<int>();
+    public int Rows;
+    public UiEvent TabChanged = new UiEvent();
+
+    public RibbonLayout CurrentLayout() { return retainedLayout; }
+    public List<RibbonSlot> OverflowSlots() { return retainedOverflow; }
+    public Button OverflowButton() { return retainedMore; }
+
+    public bool RetireInput() {
+        layoutRevision = layoutRevision + 1;
+        int session = layoutRevision;
+        retainedLayout = null;
+        this.CloseRetainedOverflow();
+        if (layoutRevision != session) { return false; }
+        App app = this.FindApp();
+        if (app != null) { app.ReleaseInputSubtree(this); }
+        return layoutRevision == session;
+    }
+
+    void BeginRetainedTree() {
+        retainedTabs = null; retainedBand = null; retainedMore = null;
+        retainedItems = new List<Button>(); retainedLabels = new List<Label>();
+        retainedGroups = new List<Control>(); retainedBoxes = new List<Control>();
+        retainedTitles = new List<Label>(); retainedLayout = null;
+        retainedOverflow = new List<RibbonSlot>();
+        retainedDividers = new List<Control>(); retainedDividerItems = new List<int>();
+        layoutGeneration = 0;
+        layoutRevision = layoutRevision + 1;
+    }
+
+    RibbonAction RetainedAction(int value, bool tab, Control source) {
+        RibbonAction action = new RibbonAction();
+        action.Owner = this; action.Generation = treeGeneration;
+        action.Value = value; action.Tab = tab; action.Source = source; action.Revision = layoutRevision;
+        return action;
+    }
+
+    // Snapshot the flat model only for the existing grouped geometry engine.
+    List<RibbonGroup> RetainedModel() {
+        if (groups.Count > 0) { return groups; }
+        List<RibbonGroup> result = new List<RibbonGroup>();
+        RibbonGroup group = new RibbonGroup("");
+        for (int i = 0; i < cmds.Count; i = i + 1) {
+            RibbonCmd command = cmds[i];
+            RibbonItem item = command.compact
+                ? RibbonItem.Tile(command.icon, command.label)
+                : RibbonItem.Large(command.icon, command.label);
+            item.act = command.act; item.enabled = command.enabled;
+            item.toggle = command.compact; item.on = command.on; item.tip = command.tip;
+            group.Add(item);
+            if (command.sep) { result.Add(group); group = new RibbonGroup(""); }
+        }
+        if (group.items.Count > 0) { result.Add(group); }
+        return result;
+    }
+
+    public override void OnMeasure(App app) {
+        if (retainedBand == null) { this.BuildTree(); }
+        int rows = Rows > 0 ? Rows : (tabs.Count > 0 ? 3 : 2);
+        int height = tabs.Count > 0 ? Ribbon.HeightTabbed(app)
+            : (groups.Count > 0 ? Ribbon.HeightGroups(app) : Ribbon.Height(app));
+        int bandH = height - (tabs.Count > 0 ? Ribbon.TabStripHeight(app) : 0);
+        prefH = height;
+        prefW = Ribbon.BandWidth(app, this.RetainedModel(), bandH, rows);
+        if (retainedTabs != null) { retainedTabs.MeasureTree(app); }
+        if (retainedBand != null) { retainedBand.MeasureTree(app); }
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        App app = this.FindApp();
+        if (app == null) { base.Arrange(x, y, width, height); return; }
+        // Host changes invalidate queued actions, including App A -> B -> A.
+        if (retainedApp != app) {
+            retainedApp = app;
+            this.BuildTree();
+        }
+        int session = treeGeneration;
+        int revision = arrangeEpoch + 1; arrangeEpoch = revision;
+        this.bx = x; this.by = y; this.bw = (int)Math.Max(0, width); this.bh = (int)Math.Max(0, height);
+        int tab = activeTab != null ? activeTab.Get() : 0;
+        if (arrangedTab != tab) {
+            this.CloseRetainedOverflow();
+            if (treeGeneration != session || arrangeEpoch != revision) { return; }
+            arrangedTab = tab;
+        }
+        int stripH = tabs.Count > 0 ? (int)Math.Min(this.bh, Ribbon.TabStripHeight(app)) : 0;
+        if (retainedTabs != null) {
+            retainedTabs.Arrange(x, y, this.bw, stripH);
+            int tx = x + app.theme.paddingSmall;
+            for (int i = 0; i < retainedTabs.Children.Count; i = i + 1) {
+                Control button = retainedTabs.Children[i];
+                button.ClassName = "ribbon-tab " + (tab == i ? "active" : "");
+                button.MeasureTree(app);
+                int tw = button.prefW;
+                button.Arrange(tx, y, (int)Math.Max(0, Math.Min(tw, x + this.bw - tx)), stripH);
+                tx = tx + tw;
+            }
+        }
+        if (retainedBand == null) { return; }
+        int bandY = y + stripH;
+        int bandH = this.bh - stripH;
+        // The band remains a real parent, while slots supply child geometry.
+        retainedBand.bx = x; retainedBand.by = bandY; retainedBand.bw = this.bw; retainedBand.bh = bandH;
+        List<RibbonGroup> model = this.RetainedModel();
+        int rows = Rows > 0 ? Rows : (tabs.Count > 0 ? 3 : 2);
+        RibbonFit fit = Ribbon.Fit(app, model, bandH, rows, this.bw);
+        RibbonLayout layout = Ribbon.Layout(app, model, bandH, rows, fit);
+        int limit = this.bw;
+        if (layout.width > limit) {
+            limit = (int)Math.Max(0, this.bw - Ribbon.OverflowButtonW(app));
+            fit = Ribbon.Fit(app, model, bandH, rows, limit);
+            layout = Ribbon.Layout(app, model, bandH, rows, fit);
+        }
+        List<RibbonSlot> overflow = new List<RibbonSlot>();
+        for (int i = 0; i < layout.slots.Count; i = i + 1) {
+            RibbonSlot slot = layout.slots[i];
+            slot.overflow = slot.x + slot.w > limit || slot.h <= app.Scale(Space.XS);
+            if (slot.overflow) { overflow.Add(slot); }
+        }
+        // A changed geometry/menu must retire capture/focus before hiding buttons.
+        bool changed = !this.SameRetainedLayout(layout, overflow) || layoutX != x || layoutY != y
+            || layoutW != this.bw || layoutH != this.bh;
+        if (changed) {
+            layoutRevision = layoutRevision + 1;
+            this.CloseRetainedOverflow();
+            if (treeGeneration != session || arrangeEpoch != revision) { return; }
+        }
+        layoutX = x; layoutY = y; layoutW = this.bw; layoutH = this.bh;
+        retainedLayout = layout; retainedOverflow = overflow;
+        if (!this.ArrangeRetainedSlots(app, model, session, revision)) { return; }
+        bool more = overflow.Count > 0 && this.bw > 0 && bandH > 0;
+        if (!this.SetRetainedShown(app, retainedMore, more, session, revision)) { return; }
+        if (more) {
+            int mw = (int)Math.Min(this.bw, Ribbon.OverflowButtonW(app));
+            int mh = (int)Math.Min(bandH, app.Scale(24));
+            retainedMore.MeasureTree(app);
+            retainedMore.Arrange(x + this.bw - mw, bandY + (bandH - mh) / 2, mw, mh);
+        }
+        if (changed) { this.WireRetainedRevision(); }
+        layoutGeneration = session;
+    }
+
+    void WireRetainedRevision() {
+        if (retainedTabs != null) {
+            for (int i = 0; i < retainedTabs.Children.Count; i = i + 1) {
+                Button button = (Button)retainedTabs.Children[i];
+                button.Click.Clear(); button.Click.Add(this.RetainedAction(i, true, button).Run);
+            }
+        }
+        for (int i = 0; i < retainedItems.Count; i = i + 1) {
+            Button button = retainedItems[i];
+            RibbonItem item = groups.Count > 0 ? Ribbon.ItemAt(groups, i) : null;
+            int value = item != null ? item.act : cmds[i].act;
+            button.Click.Clear(); button.Click.Add(this.RetainedAction(value, false, button).Run);
+        }
+        retainedMore.Click.Clear();
+        RibbonAction more = this.RetainedAction(0, false, retainedMore); more.Overflow = true;
+        retainedMore.Click.Add(more.Run);
+    }
+
+    bool SameRetainedLayout(RibbonLayout layout, List<RibbonSlot> overflow) {
+        if (retainedLayout == null || retainedLayout.slots.Count != layout.slots.Count
+                || retainedOverflow.Count != overflow.Count) { return false; }
+        for (int i = 0; i < layout.slots.Count; i = i + 1) {
+            RibbonSlot a = retainedLayout.slots[i]; RibbonSlot b = layout.slots[i];
+            if (a.flat != b.flat || a.kind != b.kind || a.x != b.x || a.y != b.y
+                || a.w != b.w || a.h != b.h || a.overflow != b.overflow) { return false; }
+        }
+        return true;
+    }
+
+    bool SetRetainedShown(App app, Control node, bool shown, int session, int revision) {
+        if (node == null) { return true; }
+        if (node.Visible && !shown) {
+            app.ReleaseInputSubtree(node);
+            if (treeGeneration != session || arrangeEpoch != revision) { return false; }
+        }
+        node.Visible = shown;
+        if (!shown) { node.Arrange(0, 0, 0, 0); }
+        return true;
+    }
+
+    bool ArrangeRetainedSlots(App app, List<RibbonGroup> model, int session, int revision) {
+        for (int i = 0; i < retainedItems.Count; i = i + 1) {
+            RibbonSlot found = null;
+            for (int j = 0; j < retainedLayout.slots.Count; j = j + 1) {
+                RibbonSlot slot = retainedLayout.slots[j];
+                if (slot.flat == i && !slot.overflow) { found = slot; break; }
+            }
+            Button button = retainedItems[i];
+            if (!this.SetRetainedShown(app, button, found != null, session, revision)) { return false; }
+            if (found == null) { continue; }
+            RibbonItem item = found.cmd;
+            button.Disabled = !item.enabled;
+            if (button.IsDisabled()) {
+                app.ReleaseInputSubtree(button);
+                if (treeGeneration != session || arrangeEpoch != revision) { return false; }
+            }
+            button.ClassName = "ribbon-cmd align-center justify-center "
+                + (found.kind == 1 ? "row small" : "col") + (item.on ? " on" : "");
+            if (i < retainedLabels.Count && retainedLabels[i] != null) { retainedLabels[i].Visible = found.kind != 2; }
+            button.MeasureTree(app);
+            int gap = app.Scale(Space.XS);
+            button.Arrange(this.bx + found.x, retainedBand.by + app.theme.paddingSmall + found.y + gap / 2,
+                (int)Math.Max(0, found.w - gap), (int)Math.Max(0, found.h - gap));
+        }
+        // Keep the original group/items/title hierarchy consumed by the Designer caller.
+        for (int i = 0; i < retainedGroups.Count; i = i + 1) {
+            int start = 0; int end = 0; bool shown = false;
+            for (int j = 0; j < retainedLayout.slots.Count; j = j + 1) {
+                RibbonSlot slot = retainedLayout.slots[j];
+                if (slot.group != i || slot.overflow) { continue; }
+                if (!shown) { start = slot.x; }
+                shown = true; end = slot.x + slot.w;
+            }
+            Control group = retainedGroups[i]; Control box = retainedBoxes[i];
+            if (!this.SetRetainedShown(app, group, shown, session, revision)) { return false; }
+            if (!shown) { continue; }
+            group.bx = this.bx + start; group.by = retainedBand.by;
+            group.bw = end - start + app.theme.paddingSmall; group.bh = retainedBand.bh;
+            box.bx = group.bx; box.by = group.by; box.bw = group.bw;
+            box.bh = (int)Math.Max(0, group.bh - app.Scale(16));
+            Label title = retainedTitles[i];
+            if (title != null) { title.Arrange(group.bx, group.by + group.bh - app.Scale(16) - app.theme.paddingTiny, end - start, app.Scale(16)); }
+        }
+        for (int i = 0; i < retainedDividers.Count; i = i + 1) {
+            Button preceding = retainedItems[retainedDividerItems[i]];
+            Control divider = retainedDividers[i];
+            if (!this.SetRetainedShown(app, divider, preceding.Visible, session, revision)) { return false; }
+            if (preceding.Visible) {
+                divider.Arrange(preceding.bx + preceding.bw + app.theme.paddingSmall,
+                    retainedBand.by + app.theme.paddingSmall, 1,
+                    (int)Math.Max(0, retainedBand.bh - app.theme.paddingSmall * 2));
+            }
+        }
+        return treeGeneration == session && arrangeEpoch == revision;
+    }
+
+    bool RetainedAncestorsActive(Control source) {
+        Control cursor = source;
+        while (cursor != null) {
+            if (!cursor.StyleVisible() || cursor.IsDisabled() || cursor.bw <= 0 || cursor.bh <= 0) { return false; }
+            cursor = cursor.parent;
+        }
+        return true;
+    }
+
+    bool AcceptRetainedAction(int session, Control source) {
+        App app = this.FindApp();
+        return treeGeneration == session && app != null && app == retainedApp
+            && this.StyleVisible() && !this.IsDisabled() && this.bw > 0 && this.bh > 0
+            && source != null && source.StyleVisible() && !source.IsDisabled() && source.bw > 0 && source.bh > 0
+            && this.RetainedAncestorsActive(source)
+            && app.rootControl != null && app.rootControl.ContainsInputControl(source);
+    }
+
+    void SelectRetainedTab(int value, int session, Control source) {
+        if (!this.AcceptRetainedAction(session, source) || value < 0 || value >= tabs.Count) { return; }
+        if (activeTab.Get() == value) { return; }
+        activeTab.Set(value);
+        this.BuildTree();
+        if (treeGeneration != session + 1 || activeTab.Get() != value) { return; }
+        App app = this.FindApp();
+        if (app != null) { app.RequestRedraw(); }
+        TabChanged.RaiseS(this);
+    }
+
+    void InvokeRetained(int value, int session, Control source) {
+        if (!this.AcceptRetainedAction(session, source)) { return; }
+        lastAct = value;
+        CommandClicked.Raise();
+    }
+
+    void CloseRetainedOverflow() {
+        overflowEpoch = overflowEpoch + 1;
+        RibbonOverflow old = retainedPopup;
+        retainedPopup = null;
+        App app = old != null ? old.FindApp() : null;
+        if (app != null && app.overlayHost != null) { app.overlayHost.Hide(old); }
+        if (retainedMore != null && retainedPopup == null) { retainedMore.Tip = Ribbon.T("More commands", "更多命令"); }
+    }
+
+    void OpenRetainedOverflow(int session, Control source) {
+        if (!this.AcceptRetainedAction(session, source) || retainedOverflow.Count == 0) { return; }
+        App app = this.FindApp();
+        int opening = overflowEpoch + 1;
+        this.CloseRetainedOverflow();
+        if (overflowEpoch != opening || !this.AcceptRetainedAction(session, source)) { return; }
+        RibbonOverflow popup = new RibbonOverflow(this, session, layoutRevision);
+        for (int i = 0; i < retainedOverflow.Count; i = i + 1) {
+            RibbonSlot slot = retainedOverflow[i]; RibbonItem item = slot.cmd;
+            Button button = new Button();
+            button.ClassName = "contextmenu-item row align-center ghost small";
+            button.SetProp("style", "flex-shrink:0");
+            button.Disabled = !item.enabled;
+            if (item.icon != "") { button.Add(new IconView(item.icon)); }
+            button.Add(new Label(item.label));
+            RibbonOverflowAction action = new RibbonOverflowAction();
+            action.Popup = popup; action.Value = item.act; action.Source = button;
+            button.Click.Add(action.Run);
+            popup.Add(button);
+        }
+        retainedPopup = popup;
+        retainedMore.Tip = "";
+        app.overlayHost.Show(app, retainedMore, popup);
+        if (retainedPopup == popup && app.overlayHost.ActiveRoot() != popup) { popup.OnPopupDismissed(); }
+    }
+}

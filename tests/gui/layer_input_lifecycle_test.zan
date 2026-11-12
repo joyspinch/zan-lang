@@ -1,0 +1,247 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class LayerClickCounter {
+    public int Count;
+    public void Invoke() { Count = Count + 1; }
+}
+
+class LayerWitness {
+    public weak LayerState Layer;
+    public weak Control Body;
+    public weak App App;
+}
+
+class LayerTestInputWrapper : InputRootAdapter {
+    public LayerTestInputWrapper() : base("test_input_wrapper") { }
+    public override Control HitTest(int x, int y, int pointerType) { return content.HitTest(x, y, pointerType); }
+    public override bool ContainsInputControl(Control control) { return control == this || content.ContainsInputControl(control); }
+    public override Control FindInputFocus(App app) { return content.FindInputFocus(app); }
+}
+
+class LayerInputLifecycleTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void Drain() {
+        Action action = Dispatcher.Take();
+        while (action != null) { action(); action = Dispatcher.Take(); }
+    }
+
+    static void Click(App app, Control control) {
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Drain();
+    }
+
+    static void Draw(App app, LayerState state) {
+        state.openMs = 0;
+        app.BeginOffscreenFrame();
+        Layer.Render(app, state);
+        app.EndOffscreenFrame();
+    }
+
+    static void Exercise(App app, LayerWitness witness) {
+        Input background = new Input("");
+        app.SetRootControl(background);
+        app.BeginOffscreenFrame();
+        background.RenderInside(app, new Rect(0, 0, 180, 32));
+        app.EndOffscreenFrame();
+        background.Focus(app);
+        app.CapturePointer(background);
+        LayerState page = new LayerState("Page", 40, 50, 440, 300);
+        page.Open(app);
+        Check(app.GetCapturedPointer() == background, "floating wrapper preserves background capture");
+        app.ReleasePointerCapture();
+        Input body = new Input("");
+        page.SetBody(body);
+        Draw(app, page);
+        Control inputRoot = app.rootControl;
+        Check(inputRoot.ContainsInputControl(background) && inputRoot.ContainsInputControl(body), "page and background share input tree");
+        LayerTestInputWrapper wrapper = new LayerTestInputWrapper();
+        wrapper.Bind(app);
+        app.CapturePointer(background);
+        Draw(app, page);
+        Check(app.rootControl == inputRoot && ((InputRootAdapter)inputRoot).ContainsAdapter(wrapper)
+            && app.GetCapturedPointer() == background, "heterogeneous input adapter preserves layer priority without cycle");
+        app.ReleasePointerCapture();
+        Click(app, body);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Check(body.GetText() == "A", "floating body receives routed text");
+        Click(app, page.okBtn);
+        Check(page.action == 1, "window footer receives routed click");
+        LayerState front = new LayerState("Front", 40, 50, 440, 300);
+        Input frontBody = new Input("");
+        front.SetBody(frontBody);
+        front.Open(app);
+        Draw(app, front);
+        Check(inputRoot.HitTest(body.bx + body.bw / 2, body.by + body.bh / 2, 0) == frontBody, "floating hit order follows open order");
+        front.Close(app);
+        body.Focus(app);
+        app.CapturePointer(body);
+        page.state = 2;
+        Check(app.GetCapturedPointer() == null && !body.IsFocused(app), "minimize releases input immediately");
+        Check(!inputRoot.ContainsInputControl(body), "minimized body leaves input tree");
+        background.Arrange(body.bx, body.by, 180, 32);
+        Check(inputRoot.HitTest(body.bx + 10, body.by + 10, 0) == background, "minimized old body rectangle admits background pointer");
+        page.state = 0;
+        Draw(app, page);
+        ScrollColumn wrap = new ScrollColumn();
+        wrap.With(body);
+        page.wrap = wrap;
+        body.Focus(app);
+        app.CapturePointer(body);
+        Draw(app, page);
+        Check(app.GetCapturedPointer() == body && body.IsFocused(app), "scroll wrapper installation preserves descendant state");
+        body.Focus(app);
+        app.CapturePointer(body);
+        Input replacement = new Input("");
+        page.view = replacement;
+        Check(page.wrap == null && body.parent == null, "body replacement removes stale wrapper");
+        Check(app.GetCapturedPointer() == null && !body.IsFocused(app), "replacement releases old state");
+        Draw(app, page);
+        Click(app, replacement);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 66, 0, 0);
+        Check(replacement.GetText() == "B" && body.GetText() == "A", "replacement receives next input");
+        Input newBackground = new Input("");
+        app.SetRootControl(newBackground);
+        app.CapturePointer(newBackground);
+        Draw(app, page);
+        Check(app.rootControl == inputRoot && inputRoot.ContainsInputControl(newBackground), "host root replacement recomposes");
+        Check(app.GetCapturedPointer() == newBackground && !inputRoot.ContainsInputControl(background), "replacement capture survives wrapper bind");
+        app.ReleasePointerCapture();
+        ExerciseDialogs(app, witness, page, replacement, inputRoot);
+    }
+
+    static void ExerciseDialogs(App app, LayerWitness witness, LayerState page,
+            Input replacement, Control inputRoot) {
+        LayerClickCounter backgroundClicks = new LayerClickCounter();
+        Button backgroundButton = new Button("Background");
+        backgroundButton.Click.Add(backgroundClicks.Invoke);
+        app.SetRootControl(backgroundButton);
+        app.BeginOffscreenFrame();
+        backgroundButton.RenderInside(app, new Rect(0, 0, 180, 32));
+        app.EndOffscreenFrame();
+        Draw(app, page);
+        LayerState prompt = LayerState.PromptWith("Prompt", "", 0, "", 3);
+        witness.Layer = prompt;
+        witness.Body = prompt.promptInput;
+        app.focus.SetFocused(backgroundButton.WidgetId());
+        app.CapturePointer(backgroundButton);
+        prompt.Open(app);
+        Check(app.GetCapturedPointer() == null && !backgroundButton.IsFocused(app), "modal open isolates background state");
+        Draw(app, prompt);
+        LayerTestInputWrapper modalFallback = new LayerTestInputWrapper();
+        modalFallback.Bind(app);
+        Draw(app, prompt);
+        Check(app.rootControl == inputRoot && ((InputRootAdapter)inputRoot).ContainsAdapter(modalFallback),
+            "modal structural chain survives heterogeneous adapter bind");
+        prompt.promptInput.Focus(app);
+        app.CapturePointer(prompt.promptInput);
+        modalFallback.Bind(app);
+        Draw(app, prompt);
+        Check(app.GetCapturedPointer() == prompt.promptInput && prompt.promptInput.IsFocused(app),
+            "modal rebind preserves active input state");
+        modalFallback.Detach();
+        Check(app.rootControl == inputRoot && app.GetCapturedPointer() == prompt.promptInput,
+            "fallback adapter detach preserves modal capture");
+        app.ReleasePointerCapture();
+        Check(!inputRoot.ContainsInputControl(replacement), "modal excludes lower layer capture");
+        Check(inputRoot.HitTest(1, 1, 0) != backgroundButton, "modal mask blocks background pointer");
+        Click(app, backgroundButton);
+        Check(backgroundClicks.Count == 0, "modal mask prevents routed background button click");
+        Click(app, prompt.promptInput);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 88, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 89, 0, 0);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 37, 0, 0);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 46, 0, 0);
+        Check(prompt.PromptText() == "X", "prompt receives text and key before repaint");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 13, 0, 0);
+        Drain();
+        Check(prompt.action == 1, "routed prompt Enter submits through weak action");
+        prompt.action = 0;
+        Control footer = prompt.dialogFooter;
+        Draw(app, prompt);
+        Check(prompt.dialogFooter == footer && prompt.okBtn.parent == footer, "dialog footer identity is stable");
+        Click(app, prompt.cancelBtn);
+        Check(prompt.action == 2, "dialog footer routes cancel");
+        prompt.promptInput.Focus(app);
+        app.CapturePointer(prompt.promptInput);
+        prompt.open = false;
+        Check(app.GetCapturedPointer() == null && !prompt.promptInput.IsFocused(app), "direct close releases immediately");
+        Check(!inputRoot.ContainsInputControl(prompt.promptInput), "closed prompt leaves input tree");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 90, 0, 0);
+        Check(prompt.PromptText() == "X", "direct-close prompt rejects later text");
+        LayerState multiline = LayerState.PromptWith("Multiline", "", 2, "", 4);
+        multiline.Open(app);
+        Draw(app, multiline);
+        Check(multiline.promptArea.bw > 0 && multiline.promptArea.bh > 32, "multiline prompt is rendered");
+        Click(app, multiline.promptArea);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 77, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 13, 0, 0);
+        Check(multiline.PromptText() == "M\n" && multiline.action == 0, "multiline Enter inserts newline");
+        app.CapturePointer(multiline.promptArea);
+        Layer.CloseLast(app, 2);
+        Check(app.GetCapturedPointer() == null, "close-last releases capture");
+        page.Open(app);
+        Draw(app, page);
+        replacement.Focus(app);
+        app.CapturePointer(replacement);
+        Layer.CloseAll(app, 0);
+        Check(app.GetCapturedPointer() == null && !replacement.IsFocused(app), "close-all releases page state");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 90, 0, 0);
+        Check(replacement.GetText() == "B", "closed body rejects later text");
+        LayerState chrome = new LayerState("Chrome", 0, app.titlebarH, 180, 140);
+        chrome.footer = false;
+        chrome.Open(app);
+        Draw(app, chrome);
+        int captionX = chrome.x + 8;
+        int captionY = chrome.y + Layer.BarH(app) / 2;
+        app.ProcessOffscreenInput(2, captionX, captionY, 0, 0, 0, 0);
+        Draw(app, chrome);
+        app.ProcessOffscreenInput(1, captionX + 12, captionY + 8, 0, 0, 0, 0);
+        Draw(app, chrome);
+        app.ProcessOffscreenInput(3, captionX + 12, captionY + 8, 0, 0, 0, 0);
+        Draw(app, chrome);
+        Check(chrome.x == 12 && chrome.y == app.titlebarH + 8 && !chrome.dragging,
+            "blank window caption preserves legacy drag without background click");
+        int closeX = chrome.x + chrome.w - Layer.BtnW(app) / 2;
+        int closeY = chrome.y + Layer.BarH(app) / 2;
+        app.ProcessOffscreenInput(2, closeX, closeY, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, closeX, closeY, 0, 0, 0, 0);
+        Draw(app, chrome);
+        Drain();
+        Check(!chrome.open && backgroundClicks.Count == 0, "window chrome closes without background click");
+        page.Open(app);
+        Draw(app, page);
+        replacement.Focus(app);
+        app.CapturePointer(replacement);
+        ((InputRootAdapter)inputRoot).Detach();
+        Check(app.rootControl == backgroundButton && app.GetCapturedPointer() == null
+            && !replacement.IsFocused(app), "layer detach releases owned state and restores fallback");
+        Draw(app, page);
+        Check(app.rootControl == inputRoot && inputRoot.ContainsInputControl(replacement),
+            "detached layer adapter rebind restores input membership");
+        page.Close(app);
+    }
+
+    static void OwnSession(LayerWitness witness) {
+        App app = App.CreateOffscreen("Layer lifetime", 640, 480);
+        witness.App = app;
+        Exercise(app, witness);
+        app.canvas.Destroy();
+    }
+
+    static void Main() {
+        App frame = App.CreateOffscreen("Frame context", 2, 2);
+        LayerWitness witness = new LayerWitness();
+        OwnSession(witness);
+        Check(witness.App == null && witness.Layer == null && witness.Body == null, "layer context and roots release without cycles");
+        frame.canvas.Destroy();
+        Console.WriteLine("LAYER_INPUT_LIFECYCLE_OK");
+    }
+}

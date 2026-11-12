@@ -1,115 +1,237 @@
 using System;
-using System.Collections.Generic;
 using Gui;
 
 namespace Gui;
 
-// OverlayHost.zan - 统一浮层与弹窗宿主（消灭各组件手搓弹层与事件阻断）
-// 所有下拉列表、日期卡片、取色板、右键菜单统一作为保留组件挂载于此。
-// 具备以下核心保证：
-// 1. 天然置于视觉最顶层（无需逐控件硬调 z-order）；
-// 2. 外部点击自动关闭（DismissOnOutsideClick）；
-// 3. 浮层内事件正常捕获，消除 BlockHitsRect 与 ClaimClick；
-// 4. 彻底实例绑定于 App 实例，杜绝全局静态多窗口竞态与 ARC 强引用内存泄漏。
+// 同一 App 的单个活动弹层；绘制、命中与遮挡共用同一份登记。
 public class OverlayHost {
-    private List<Control> overlays;
     private Control activePopup;
-    private Control activeAnchor;
+    private weak Control activeAnchor;
+    private weak App ownerApp;
+    private bool anchored;
+    private bool positioned;
+    private int pointX;
+    private int pointY;
+    private int revision;
 
     public OverlayHost() {
-        this.overlays = new List<Control>();
+    }
+
+    private bool VisibleTree(Control control) {
+        if (control == null || control.bw <= 0 || control.bh <= 0) { return false; }
+        Control node = control;
+        while (node != null) {
+            if (!node.StyleVisible()) { return false; }
+            node = node.parent;
+        }
+        return true;
     }
 
     public bool HasActive() {
-        return activePopup != null || (overlays != null && overlays.Count > 0);
+        return ownerApp != null && this.VisibleTree(activePopup)
+            && (!anchored || this.VisibleTree(activeAnchor));
     }
 
     public bool IsAnchorActive(Control anchor) {
-        return activeAnchor == anchor;
+        return this.HasActive() && activeAnchor == anchor;
+    }
+
+    public Control ActiveRoot() {
+        return this.HasActive() ? activePopup : null;
+    }
+
+    public Control HitTest(int x, int y, int pointerType) {
+        if (!this.HasActive()) { return null; }
+        return activePopup.HitTest(x, y, pointerType);
+    }
+
+    private void ArrangePopup(App app) {
+        if (activePopup == null) { return; }
+        if (positioned) {
+            int margin = app.Scale(Space.XS);
+            int availableW = app.canvas.Width() - margin * 2;
+            int availableH = app.canvas.Height() - margin * 2;
+            if (availableW < 1) { availableW = 1; }
+            if (availableH < 1) { availableH = 1; }
+            int width = activePopup.prefW;
+            int height = activePopup.prefH;
+            if (width > availableW) { width = availableW; }
+            if (height > availableH) { height = availableH; }
+            if (width < 1) { width = 1; }
+            if (height < 1) { height = 1; }
+            int x = pointX;
+            int y = pointY;
+            if (x + width > app.canvas.Width() - margin) { x = app.canvas.Width() - margin - width; }
+            if (y + height > app.canvas.Height() - margin) { y = app.canvas.Height() - margin - height; }
+            if (x < margin) { x = margin; }
+            if (y < margin) { y = margin; }
+            activePopup.Arrange(x, y, width, height);
+            return;
+        }
+        if (activeAnchor == null) { return; }
+        activePopup.MeasureTree(app);
+        int popW = activePopup.prefW > 0 ? activePopup.prefW : activeAnchor.bw;
+        int popH = activePopup.prefH > 0 ? activePopup.prefH : app.Scale(200);
+        int popX = OverlayPopup.FitX(app, activeAnchor.bx, popW);
+        int popY = OverlayPopup.FitY(app, activeAnchor.by + activeAnchor.bh + app.Scale(4), activeAnchor.bh, popH);
+        activePopup.Arrange(popX, popY, popW, popH);
     }
 
     public void Show(App app, Control anchor, Control popup) {
+        this.ShowCore(app, anchor, popup, false, 0, 0);
+    }
+
+    public void ShowAt(App app, Control popup, int x, int y) {
+        this.ShowCore(app, null, popup, true, x, y);
+    }
+
+    private void ShowCore(App app, Control anchor, Control popup, bool atPoint, int x, int y) {
         if (app == null || popup == null) { return; }
-        if (overlays == null) { overlays = new List<Control>(); }
-        if (activeAnchor != null && activeAnchor != anchor) {
-            activeAnchor.OnPopupDismissed();
-            if (activePopup != null && overlays.Contains(activePopup)) {
-                overlays.Remove(activePopup);
-            }
+        if (activePopup != null && (activePopup != popup || activeAnchor != anchor || ownerApp != app)) {
+            bool sameAnchor = activeAnchor == anchor && ownerApp == app;
+            int before = revision;
+            this.CloseActive(!sameAnchor);
+            // A close/cancel callback that opened a new popup owns the host now.
+            if (revision != before + 1) { return; }
         }
+        revision = revision + 1;
+        popup.EnsureExtra().popupEpoch = popup.EnsureExtra().popupEpoch + 1;
+        if (anchor != null && anchor != popup) {
+            anchor.EnsureExtra().popupEpoch = anchor.EnsureExtra().popupEpoch + 1;
+        }
+        ownerApp = app;
         activePopup = popup;
         activeAnchor = anchor;
-        if (!overlays.Contains(popup)) {
-            overlays.Add(popup);
-        }
-        if (anchor != null) {
-            int popW = popup.prefW > 0 ? popup.prefW : anchor.bw;
-            int popH = popup.prefH > 0 ? popup.prefH : app.Scale(200);
-            int popX = OverlayPopup.FitX(app, anchor.bx, popW);
-            int popY = OverlayPopup.FitY(app, anchor.by + anchor.bh + app.Scale(4), anchor.bh, popH);
-            popup.Arrange(popX, popY, popW, popH);
+        anchored = anchor != null;
+        positioned = atPoint;
+        pointX = x;
+        pointY = y;
+        this.ArrangePopup(app);
+        app.RequestRedraw();
+    }
+
+    public void Hide(Control popup) {
+        if (popup != null && popup == activePopup) { this.Dismiss(); }
+    }
+
+    // Root replacement preserves anchored overlays reachable through input adapters.
+    // Point popups have no anchor and keep their explicit caller-owned lifetime.
+    internal void RetireAnchorOutside(Control nextRoot, int expectedRevision) {
+        if (revision != expectedRevision) { return; }
+        Control anchor = activeAnchor;
+        if (activePopup == null || !anchored || anchor == null) { return; }
+        if (nextRoot == null || !nextRoot.ContainsInputControl(anchor)) {
+            this.CloseActive(true);
         }
     }
 
-    public void Dismiss() {
+    internal int RetirementRevision() { return revision; }
+
+    // Only the registration snapshotted before input retirement may be closed.
+    internal void RetireAnchorIn(Control retiredRoot, int expectedRevision) {
+        if (revision != expectedRevision) { return; }
         Control anchor = activeAnchor;
+        if (activePopup == null || !anchored || anchor == null || retiredRoot == null) { return; }
+        if (retiredRoot.ContainsInputControl(anchor)) { this.CloseActive(true); }
+    }
+
+    public void Dismiss() { this.CloseActive(true); }
+
+    private void CloseActive(bool notifyAnchor) {
+        Control anchor = activeAnchor;
+        App app = ownerApp;
         Control popup = activePopup;
+        bool hadPopup = popup != null;
+        int popupEpoch = hadPopup && popup.extra != null ? popup.extra.popupEpoch : 0;
+        int anchorEpoch = anchor != null && anchor.extra != null ? anchor.extra.popupEpoch : 0;
         activePopup = null;
         activeAnchor = null;
-        if (popup != null && overlays != null) {
-            overlays.Remove(popup);
+        ownerApp = null;
+        anchored = false;
+        positioned = false;
+        revision = revision + 1;
+        // 先注销再通知：关闭回调允许重入；只释放旧弹层内的输入状态。
+        if (hadPopup && app != null) {
+            app.ReleaseInputSubtree(popup);
+            app.RequestRedraw();
         }
-        if (anchor != null) {
+        if (hadPopup && activePopup != popup && popup.extra.popupEpoch == popupEpoch) {
+            popup.OnPopupDismissed();
+        }
+        // Cancellation or popup notification may have reopened the same anchor.
+        if (hadPopup && notifyAnchor && anchor != null && anchor != popup && activeAnchor != anchor
+                && anchor.extra.popupEpoch == anchorEpoch) {
             anchor.OnPopupDismissed();
         }
     }
 
+    // true 表示本次关闭或遮罩已消费输入，调用方不得继续派发给底层树。
+    public bool HandleInput(App app, int kind, int x, int y, int key) {
+        if (app == null || ownerApp != app || activePopup == null) { return false; }
+        if (!this.HasActive()) {
+            this.Dismiss();
+            return false;
+        }
+        if (kind == 9) {
+            this.Dismiss();
+            return true;
+        }
+        if (kind == 4 && key == 27) {
+            int ticket = revision;
+            Control popup = activePopup;
+            App popupApp = popup.App;
+            App sessionApp = ownerApp;
+            bool handled = popup.OnPopupEscape(app);
+            // A callback may close/reopen, replace the popup, or move it to another App.
+            // The old Escape is consumed but cannot dismiss the callback's new session.
+            if (revision != ticket || activePopup != popup || ownerApp != sessionApp
+                    || sessionApp != app || popup.App != popupApp || app.overlayHost != this) {
+                return true;
+            }
+            if (!handled) { this.Dismiss(); }
+            return true;
+        }
+        if (kind == 2 && this.HitTest(x, y, app.GetPointerDeviceType()) == null) {
+            Control anchor = activeAnchor;
+            if (anchor == null || anchor.DismissOnOutsideClick()) { this.Dismiss(); }
+            return true;
+        }
+        return false;
+    }
+
     public void Update(App app) {
-        if (activePopup == null || app == null) { return; }
-        if (activeAnchor != null && !activeAnchor.DismissOnOutsideClick()) {
+        if (app == null || ownerApp != app || activePopup == null) { return; }
+        int kind = app.EventKind();
+        int key = app.window != null ? app.window.EventKeyCode() : 0;
+        if (this.HandleInput(app, kind, app.mouseX, app.mouseY, key)) {
+            if (kind == 4) { app.ClaimKey(); }
+            if (kind == 2) { app.ClaimClick(); }
             return;
         }
-        int mx = app.mouseX;
-        int my = app.mouseY;
-        bool inPopup = mx >= activePopup.bx && mx < activePopup.bx + activePopup.bw
-                    && my >= activePopup.by && my < activePopup.by + activePopup.bh;
-        bool inAnchor = false;
-        if (activeAnchor != null) {
-            inAnchor = mx >= activeAnchor.bx && mx < activeAnchor.bx + activeAnchor.bw
-                    && my >= activeAnchor.by && my < activeAnchor.by + activeAnchor.bh;
-        }
-        if (!inPopup && !inAnchor) {
-            if (app.ClickAvailable()) {
-                this.Dismiss();
-            }
+        // 即时表面的既有释放点击也走相同关闭状态；不另存一套事件仲裁。
+        if (!this.HasActive() || !app.ClickAvailable()) { return; }
+        Control anchor = activeAnchor;
+        if (anchor != null && !anchor.DismissOnOutsideClick()) { return; }
+        bool inAnchor = anchor != null && anchor.ContainsPoint(app.mouseX, app.mouseY, app.GetPointerDeviceType());
+        if (!inAnchor && this.HitTest(app.mouseX, app.mouseY, app.GetPointerDeviceType()) == null) {
+            this.Dismiss();
+            app.ClaimClick();
         }
     }
 
     public void RenderAll(App app) {
-        if (overlays == null || overlays.Count == 0) { return; }
-        if (activePopup != null && activeAnchor != null) {
-            activePopup.OnMeasure(app);
-            int popW = activePopup.prefW > 0 ? activePopup.prefW : activeAnchor.bw;
-            int popH = activePopup.prefH > 0 ? activePopup.prefH : app.Scale(200);
-            int popX = OverlayPopup.FitX(app, activeAnchor.bx, popW);
-            int popY = OverlayPopup.FitY(app, activeAnchor.by + activeAnchor.bh + app.Scale(4), activeAnchor.bh, popH);
-            activePopup.Arrange(popX, popY, popW, popH);
-            app.BlockHitsBelow();
-            app.BlockHitsRect(activePopup.bx, activePopup.by, activePopup.bw, activePopup.bh);
-        } else if (activePopup != null) {
-            app.BlockHitsBelow();
-            app.BlockHitsRect(activePopup.bx, activePopup.by, activePopup.bw, activePopup.bh);
-        }
-        this.Update(app);
-        for (int i = 0; i < overlays.Count; i = i + 1) {
-            Control pop = overlays[i];
-            if (pop != null && pop.StyleVisible()) {
-                pop.RenderTree(app);
-            }
-        }
+        if (app == null || ownerApp != app || activePopup == null) { return; }
+        // Point popups are already laid out; paint must not replay opening input.
+        if (!positioned) { this.Update(app); }
+        else if (!this.HasActive()) { this.Dismiss(); }
+        if (!this.HasActive()) { return; }
+        if (!positioned) { this.ArrangePopup(app); }
+        if (!this.HasActive()) { this.Dismiss(); return; }
+        Control popup = activePopup;
+        app.BlockHitsBelow();
+        app.BlockHitsRect(popup.bx, popup.by, popup.bw, popup.bh);
+        popup.RenderTree(app);
     }
-
-    // ---- 静态转发门面：保证各控件已有调用代码平滑运行，底层完全委托至对应 App 实例 ----
 
     public static void ShowPopup(App app, Control anchor, Control popup) {
         if (app == null) { app = App.FrameApp(); }

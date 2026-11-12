@@ -1,0 +1,359 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Designer;
+
+// Scratch test candidate. Intentionally not registered, copied to tests, or compiled.
+class PropertyGridModel {
+    public string text = "seed";
+    public int number = 2;
+    public bool flag;
+    public int choice;
+    public string choiceText = "a";
+    public int color;
+    public List<PropSpec> Specs() {
+        List<PropSpec> specs = new List<PropSpec>();
+        specs.Add(PropSpec.Section("General"));
+        PropSpec text = PropSpec.Text("text","Text").Default("default"); text.str = this.text; specs.Add(text);
+        PropSpec number = PropSpec.Int("number","Number").Step(1,0,3).Default("0"); number.num = this.number; specs.Add(number);
+        PropSpec flag = PropSpec.Bool("flag","Flag"); flag.flag = this.flag; specs.Add(flag);
+        List<string> choices = new List<string>(); choices.Add("a"); choices.Add("b"); choices.Add("c");
+        PropSpec pick = PropSpec.Enum("choice","Choice",choices); pick.num = this.choice; specs.Add(pick);
+        PropSpec pickText = PropSpec.Enum("choiceText","Choice text",choices); pickText.str = this.choiceText; specs.Add(pickText);
+        PropSpec first = PropSpec.Text("first","First").Half(); first.str = this.text; specs.Add(first);
+        PropSpec second = PropSpec.Int("second","Second").Half(); second.num = this.number; specs.Add(second);
+        PropSpec color=PropSpec.Color("color","Color"); color.num=this.color; specs.Add(color);
+        specs.Add(PropSpec.Section("More"));
+        for (int i=0;i<12;i=i+1) {
+            PropSpec extra=PropSpec.Text("extra"+Convert.ToString(i),"Extra"+Convert.ToString(i)); extra.str=this.text; specs.Add(extra);
+        }
+        return specs;
+    }
+}
+class PropertyGridWitness {
+    public weak App app;
+    public weak PropertyGrid grid;
+    public weak Control row;
+    public weak Input editor;
+}
+// Captured inside the real picker popup. Hide releases this subtree and
+// synchronously routes Cancel; no direct callback/event invocation in the test.
+class PropertyGridMoveOnCancel : Control {
+    public weak PropertyGrid grid;
+    public weak App oldApp;
+    public weak App nextApp;
+    public weak SelectBox pick;
+    public PropertyGridModel model;
+    public int cancels;
+    public PropertyGridMoveOnCancel() : base("grid-move-on-cancel") { }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        cancels=cancels+1;
+        App previous=oldApp;App next=nextApp;PropertyGrid target=grid;SelectBox editor=pick;
+        if(previous==null||next==null||target==null||editor==null){throw new Exception("callback owners missing");}
+        previous.SetRootControl(null);
+        target.UseApp(next);next.SetRootControl(target);
+        // Same key/schema preserves row identity and bindingEpoch. Rebind and
+        // narrow layout now belong to the new App, not the paused wide layout.
+        target.Bind("callback",model.Specs());target.SetScrollTop(0);target.Arrange(30,30,160,320);
+        editor.Arrange(71,73,79,23);
+    }
+}
+class PropertyGridBeforeRebind {
+    public weak PropertyGrid grid;
+    public PropertyGridModel nextModel;
+    public int changes;
+    public void Before(string key){PropertyGrid target=grid;if(target!=null){target.Bind("before",nextModel.Specs());}}
+    public void Changed(){changes=changes+1;}
+}
+class PropertyGridSetterRebind {
+    public weak PropertyGrid grid;
+    public PropertyGridModel nextModel;
+    public string value="old-a";
+    public int reads;
+    public int writes;
+    public int changes;
+    public static string Get(object owner){PropertyGridSetterRebind state=(PropertyGridSetterRebind)owner;state.reads=state.reads+1;return state.value;}
+    public static void Set(object owner,string value){
+        PropertyGridSetterRebind state=(PropertyGridSetterRebind)owner;
+        state.value=value;state.writes=state.writes+1;
+        PropertyGrid target=state.grid;
+        if(target!=null){
+            List<PropSpec> specs=new List<PropSpec>();
+            PropSpec prop=PropSpec.Int("number","Replacement number").Default("0");
+            prop.num=state.nextModel.number;specs.Add(prop);target.Bind("setter",specs);
+        }
+    }
+    public void Changed(){changes=changes+1;}
+}
+class PropertyGridInputTest {
+    PropertyGridModel model;
+    public int before;
+    public int changes;
+    public string beforeValue;
+    public string afterValue;
+    public App redirectApp;
+    public Control redirectRoot;
+    public void Before(string key) {
+        before=before+1; beforeValue=model.text;
+        if(redirectApp!=null){redirectApp.SetRootControl(redirectRoot);}
+    }
+    public void Changed() { changes=changes+1; afterValue=model.text; }
+    static void Check(bool ok,string label) { if(!ok){throw new Exception(label);} }
+    static void InputEvent(App app,int kind,int x,int y,int button,int key,int mods,int pointer) {
+        app.SetPointerDeviceType(pointer); app.ProcessOffscreenInput(kind,x,y,button,key,mods,pointer);
+    }
+    static void Click(App app,Control control) {
+        int x=control.bx+control.bw/2; int y=control.by+control.bh/2;
+        InputEvent(app,2,x,y,0,0,0,0); InputEvent(app,3,x,y,0,0,0,0);
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while(true){Action action=Dispatcher.Take();if(action==null){return;} action();}
+    }
+    static void Layout(App app,PropertyGrid grid,int width,int height) {
+        grid.UseApp(app);grid.MeasureTree(app);grid.Arrange(10,10,width,height);app.SetRootControl(grid);
+    }
+    static void Paint(App app,PropertyGrid grid) {
+        app.BeginOffscreenFrame();grid.RenderTree(app);grid.RenderTree(app);app.EndOffscreenFrame();
+    }
+    static Control Row(PropertyGrid grid,int index) {
+        string name="property-row-"+Convert.ToString(index);
+        for(int i=0;i<grid.Children.Count;i=i+1){if(grid.Children[i].name==name){return grid.Children[i];}}
+        throw new Exception("row missing");
+    }
+    static Button RowButton(PropertyGrid grid,int index,string text,string icon) {
+        Control row=Row(grid,index);
+        for(int i=0;i<row.Children.Count;i=i+1){
+            if(row.Children[i] is Button){
+                Button button=(Button)row.Children[i];
+                if((text!=""&&button.Text.Get()==text)||(icon!=""&&button.Icon==icon)){return button;}
+            }
+        }
+        throw new Exception("row button missing");
+    }
+    static Input TextEditor(PropertyGrid grid,int row) {
+        Control root=Row(grid,row);
+        for(int i=0;i<root.Children.Count;i=i+1){if(root.Children[i] is Input){return (Input)root.Children[i];}}
+        throw new Exception("text editor missing");
+    }
+    static SelectBox Picker(PropertyGrid grid,int row) {
+        Control root=Row(grid,row);
+        for(int i=0;i<root.Children.Count;i=i+1){if(root.Children[i] is SelectBox){return (SelectBox)root.Children[i];}}
+        throw new Exception("picker missing");
+    }
+    static Switch Flag(PropertyGrid grid,int row) {
+        Control root=Row(grid,row);
+        for(int i=0;i<root.Children.Count;i=i+1){if(root.Children[i] is Switch){return (Switch)root.Children[i];}}
+        throw new Exception("switch missing");
+    }
+    static Button PopupOption(Control root,string text) {
+        if(root is Button && ((Button)root).Text.Get()==text){return (Button)root;}
+        for(int i=0;i<root.Children.Count;i=i+1){
+            Button found=PopupOption(root.Children[i],text);if(found!=null){return found;}
+        }
+        return null;
+    }
+    static void Choose(App app,SelectBox pick,string label) {
+        Click(app,pick);
+        Check(app.overlayHost.IsAnchorActive(pick),"actual picker click opens own popup");
+        Control popup=app.overlayHost.ActiveRoot();
+        Button option=PopupOption(popup,label);
+        Check(option!=null,"option is a real Button");Click(app,option);
+    }
+    static void DesignerUndo(App app) {
+        Designer designer=new Designer();designer.layoutMode=0;
+        designer.fields.Clear();
+        FormField field=FormField.New(0,1);field.label="before-session";
+        designer.fields.Add(field);designer.sel=field;
+        List<PropSpec> all=designer.AllFieldSpecs(field);
+        List<PropSpec> one=new List<PropSpec>();
+        for(int i=0;i<all.Count;i=i+1){if(all[i].key=="label"){one.Add(all[i]);}}
+        Check(one.Count==1,"designer label spec found");
+        PropertyGrid grid=designer.propGrid;grid.Bind(field.fname,one);Layout(app,grid,520,96);Paint(app,grid);
+        int initialUndo=designer.undoStack.Count;
+        Input editor=TextEditor(grid,0);editor.Focus(app);
+        InputEvent(app,6,0,0,0,65,0,0);InputEvent(app,6,0,0,0,66,0,0);Drain(app);
+        Check(field.label=="before-sessionAB"&&designer.undoStack.Count==initialUndo+1,"same-field typing enters actual Designer undo gate once");
+        Click(app,RowButton(grid,0,"","refresh"));Drain(app);
+        Check(field.label==FormField.DefaultLabel(0)&&designer.undoStack.Count==initialUndo+1,"reset shares existing field undo session");
+        designer.Undo();
+        Check(designer.fields.Count==1&&designer.fields[0].label=="before-session","actual Undo restores snapshot-owned replacement field");
+        app.SetRootControl(null);Drain(app);
+    }
+    static void PickerCancelMovesHost(bool scrollRetirement) {
+        App oldApp=App.CreateOffscreen("picker old",800,600);
+        App nextApp=App.CreateOffscreen("picker next",800,600);
+        PropertyGridModel model=new PropertyGridModel();PropertyGrid grid=new PropertyGrid();
+        grid.Bind("callback",model.Specs());Layout(oldApp,grid,160,320);Paint(oldApp,grid);
+        SelectBox pick=Picker(grid,4);Control row=pick.parent;
+        Click(oldApp,pick);Check(oldApp.overlayHost.IsAnchorActive(pick),"callback test opens actual picker");
+        Control popup=oldApp.overlayHost.ActiveRoot();
+        PropertyGridMoveOnCancel cancel=new PropertyGridMoveOnCancel();
+        cancel.grid=grid;cancel.oldApp=oldApp;cancel.nextApp=nextApp;cancel.pick=pick;cancel.model=model;
+        popup.Add(cancel);oldApp.CapturePointer(cancel,true);
+        // Growing width chooses segments: AdoptPart closes the picker, whose
+        // real captured popup child moves this same row during Cancel.
+        if(scrollRetirement){grid.SetScrollTop(500);}else{grid.Arrange(10,10,520,320);}
+        Check(cancel.cancels==1&&grid.App==nextApp&&nextApp.rootControl==grid,"real picker Cancel moves grid host once");
+        Check(Row(grid,4)==row&&pick.parent==row&&row.App==nextApp&&pick.App==nextApp,
+            "paused old AdoptPart does not remove or rehost the new host picker");
+        Check(pick.bx==71&&pick.by==73&&pick.bw==79&&pick.bh==23,
+            "paused old layout stops before overwriting callback geometry");
+        Check(!oldApp.overlayHost.HasActive()&&oldApp.GetCapturedPointer()==null&&model.choice==0,
+            "old picker input is released without model submission");
+        nextApp.SetRootControl(null);Drain(oldApp);Drain(nextApp);
+        oldApp.canvas.Destroy();nextApp.canvas.Destroy();
+    }
+    static void CommitReentry() {
+        App app=App.CreateOffscreen("commit callbacks",800,600);
+        PropertyGridModel first=new PropertyGridModel();PropertyGridModel second=new PropertyGridModel();second.text="model-b";
+        PropertyGrid grid=new PropertyGrid();grid.Bind("before",first.Specs());Layout(app,grid,520,320);Paint(app,grid);
+        Control row=Row(grid,1);Input editor=TextEditor(grid,1);
+        PropertyGridBeforeRebind before=new PropertyGridBeforeRebind();before.grid=grid;before.nextModel=second;
+        grid.OnBeforeChange(before.Before);grid.OnChange(before.Changed);
+        grid.Change.PostS(grid); // Already-public queued delivery must survive.
+        editor.Focus(app);InputEvent(app,6,0,0,0,90,0,0);
+        Check(first.text=="seed"&&second.text=="model-b"&&Row(grid,1)==row&&TextEditor(grid,1)==editor
+            &&editor.GetText()=="model-b","BeforeChange same-schema model swap aborts old model write");
+        Drain(app);Check(before.changes==1,"already-posted Change survives model swap without stale extra post");
+        app.SetRootControl(null);
+        PropertyGrid setterGrid=new PropertyGrid();PropertyGridSetterRebind setter=new PropertyGridSetterRebind();
+        setter.grid=setterGrid;setter.nextModel=second;second.number=7;
+        Binding<string> binding=new Binding<string>();binding.target=setter;binding.getter=PropertyGridSetterRebind.Get;
+        binding.setter=PropertyGridSetterRebind.Set;binding.live=true;
+        PropSpec old=PropSpec.Text("old","Old setter").Default("reset-a");old.str=binding;
+        List<PropSpec> oldSpecs=new List<PropSpec>();oldSpecs.Add(old);setterGrid.Bind("setter",oldSpecs);
+        Layout(app,setterGrid,520,96);Paint(app,setterGrid);setterGrid.OnChange(setter.Changed);
+        Control oldRow=Row(setterGrid,0);int reads=setter.reads;
+        setterGrid.Change.PostS(setterGrid);
+        setterGrid.ResetToDefault(0);
+        Check(setter.writes==1&&setter.value=="reset-a"&&setter.reads==reads,
+            "Reset setter replacement stops before stale getter readback");
+        Check(Row(setterGrid,0)!=oldRow&&oldRow.parent==null&&second.number==7&&TextEditor(setterGrid,0).GetText()=="7"
+            &&setterGrid.ChangedKey()=="","Reset old tail never loads or marks replacement schema");
+        Drain(app);Check(setter.changes==1,"setter replacement preserves only already-posted Change");
+        List<PropSpec> reload=new List<PropSpec>();
+        PropSpec current=PropSpec.Int("number","Replacement number").Default("0");current.num=second.number;reload.Add(current);
+        setterGrid.Bind("setter",reload);
+        Check(TextEditor(setterGrid,0).GetText()=="7","replacement shadow survives subsequent same-schema reload");
+        app.SetRootControl(null);Drain(app);app.canvas.Destroy();
+    }
+    static void Exercise(PropertyGridWitness witness) {
+        App app=App.CreateOffscreen("property grid",800,600);witness.app=app;
+        PropertyGridModel model=new PropertyGridModel();
+        PropertyGridInputTest state=new PropertyGridInputTest();state.model=model;
+        PropertyGrid grid=new PropertyGrid();witness.grid=grid;
+        grid.OnBeforeChange(state.Before);grid.OnChange(state.Changed);grid.Bind("same",model.Specs());
+        Layout(app,grid,520,320);Paint(app,grid);
+        Input editor=TextEditor(grid,1);witness.editor=editor;witness.row=editor.parent;
+        Check(editor.parent.parent==grid&&editor.FindApp()==app,"editor enters actual row subtree");
+        editor.Focus(app);InputEvent(app,6,0,0,0,65,0,0);
+        Check(model.text=="seedA"&&state.before==1&&state.beforeValue=="seed"&&state.changes==0,"before-write sees old model and input commits before paint");
+        Drain(app);Check(state.changes==1&&state.afterValue=="seedA","queued Change sees new value");
+        Paint(app,grid);Paint(app,grid);Drain(app);
+        Check(state.before==1&&state.changes==1,"repaint never writes or posts");
+        int caret=editor.cursorPos;
+        grid.Bind("same",model.Specs());
+        Check(TextEditor(grid,1)==editor&&editor.IsFocused(app)&&editor.cursorPos==caret,"same object schema retains editor focus and cursor identity");
+        model.text="external";grid.Bind("same",model.Specs());
+        Check(editor.GetText()=="external"&&state.before==1,"programmatic refeed never commits");
+        Input integer=TextEditor(grid,2);integer.Focus(app);integer.SelectAll();
+        InputEvent(app,6,0,0,0,45,0,0);
+        Check(model.number==2&&integer.GetText()=="-","invalid integer text remains local");
+        grid.Bind("same",model.Specs());
+        Check(integer.GetText()=="-"&&integer.IsFocused(app),"unchanged model refeed preserves incomplete integer edit");
+        Control oldRow=editor.parent;
+        Button oldReset=null;
+        for(int i=0;i<oldRow.Children.Count;i=i+1){
+            Control child=oldRow.Children[i];
+            if(child is Button&&((Button)child).Icon=="refresh"){oldReset=(Button)child;}
+        }
+        Check(oldReset!=null,"reset child exists");
+        oldReset.Click.PostS(oldReset);
+        List<PropSpec> changed=model.Specs();changed[1].kind=1;changed[1].num=model.number;changed[1].str=null;
+        grid.Bind("same",changed);Drain(app);
+        Check(oldRow.parent==null&&model.text=="external","same-count schema change retires row and invalidates old action");
+        grid.Bind("same",model.Specs());Layout(app,grid,520,320);Paint(app,grid);
+        editor=TextEditor(grid,1);editor.Focus(app);app.CapturePointer(editor,true);
+        grid.ToggleSection("General");
+        Check(!editor.IsFocused(app)&&app.GetCapturedPointer()==null&&editor.parent.parent==null,"collapse retires editor input immediately");
+        Click(app,RowButton(grid,0,"General",""));Layout(app,grid,520,320);Paint(app,grid);
+        Check(TextEditor(grid,1).parent.parent==grid,"group Button expands real editor subtree");
+        editor=TextEditor(grid,1);editor.Focus(app);app.CapturePointer(editor,true);
+        grid.SetScrollTop(500);
+        Check(app.GetCapturedPointer()==null&&!editor.IsFocused(app)&&editor.parent.parent==null,"fully offscreen rows retire before paint");
+        int offset=grid.ScrollTop();Paint(app,grid);Check(grid.ScrollTop()==offset,"paint does not replay scroll");
+        grid.SetScrollTop(0);Layout(app,grid,520,320);
+        Control section=Row(grid,0);int sectionY=section.by;
+        grid.SetScrollTop(5);Check(section.by==sectionY-5&&Row(grid,0)==section,"intersecting section keeps identity and scrolls with body");
+        Rect view=grid.ScrollViewport();int priorOffset=grid.ScrollTop();
+        InputEvent(app,13,view.x+10,view.y+view.height-10,0,-120,0,0);
+        Check(grid.ScrollTop()>priorOffset,"shared routed wheel changes grid offset before paint");
+        int wheelOffset=grid.ScrollTop();Paint(app,grid);Check(grid.ScrollTop()==wheelOffset,"paint never replays wheel");
+        grid.SetScrollTop(0);Layout(app,grid,520,320);Paint(app,grid);
+        int writes=state.before;int posts=state.changes;
+        Click(app,Flag(grid,3));
+        Check(model.flag&&state.before==writes+1&&state.changes==posts,"real switch commits before paint and posts Change");Drain(app);
+        Click(app,RowButton(grid,4,"c",""));Check(model.choice==2&&grid.ChangedKey()=="choice","numeric segmented enum writes index and preserves data row");Drain(app);
+        Click(app,RowButton(grid,5,"b",""));Check(model.choiceText=="b","string segmented enum writes option text");Drain(app);
+        Click(app,RowButton(grid,2,"+",""));Check(model.number==3,"real step writes clamped value");Drain(app);
+        writes=state.before;posts=state.changes;Click(app,RowButton(grid,2,"+",""));
+        Check(model.number==3&&state.before==writes+1,"boundary step keeps existing BeforeChange notification");Drain(app);
+        Check(state.changes==posts+1,"boundary step keeps existing queued Change notification");
+        Click(app,RowButton(grid,1,"","refresh"));Check(model.text=="default"&&grid.ChangedKey()=="text","standard reset button writes default before paint");Drain(app);
+        Check(!grid.RowNeedsReset(1),"reset removes its entry when default matches");
+        writes=state.before;posts=state.changes;grid.ResetToDefault(1);
+        Check(state.before==writes+1,"public same-value reset retains BeforeChange semantics");Drain(app);
+        Check(state.changes==posts+1,"public same-value reset retains queued Change semantics");
+        Check(Row(grid,6).by==Row(grid,7).by&&Row(grid,6).bx<Row(grid,7).bx,"half rows share visual row and keep separate data indices");
+        Input color=TextEditor(grid,8);color.SetText("#123456");writes=state.before;color.Change.RaiseS(color);
+        Check(model.color==PropSpec.ColorInt("#123456")&&color.GetText()==Convert.ToString(model.color)&&state.before==writes+1,"color submit normalizes readback once");Drain(app);
+        Paint(app,grid);Drain(app);Check(state.before==writes+1,"color normalization never resubmits on paint");
+        // Resize swaps only the representation; both modes keep the row's SelectBox value.
+        Layout(app,grid,160,320);Paint(app,grid);
+        SelectBox pick=Picker(grid,4);Choose(app,pick,"b");
+        Check(model.choice==1,"actual narrow picker option writes numeric index");Drain(app);
+        Choose(app,Picker(grid,5),"c");Check(model.choiceText=="c","actual narrow picker writes text option");Drain(app);
+        Click(app,pick);Check(app.overlayHost.IsAnchorActive(pick),"own picker active before collapse");
+        grid.ToggleSection("General");Check(!pick.IsOpen()&&!app.overlayHost.HasActive(),"collapse closes own picker before retiring anchor");
+        grid.ToggleSection("General");Layout(app,grid,160,320);Paint(app,grid);
+        pick=Picker(grid,4);Click(app,pick);grid.SetScrollTop(500);
+        Check(!pick.IsOpen()&&!app.overlayHost.HasActive(),"offscreen retirement closes own picker");
+        grid.SetScrollTop(0);Layout(app,grid,160,320);Paint(app,grid);
+        pick=Picker(grid,4);Click(app,pick);Control prior=pick.parent;
+        grid.Bind("other-object",model.Specs());
+        Check(prior.parent==null&&!pick.IsOpen()&&!app.overlayHost.HasActive(),"different binding identity retires rows and closes own picker");
+        // Another anchor in the same root must survive this grid's retirement.
+        app.SetRootControl(null);Control host=new Control("picker-host");
+        List<string> options=new List<string>();options.Add("x");options.Add("y");
+        SelectBox other=SelectBox.FromOptions(options,"");host.Add(grid);host.Add(other);host.UseApp(app);
+        host.MeasureTree(app);host.Arrange(0,0,700,580);grid.Arrange(10,10,160,320);other.MeasureTree(app);other.Arrange(400,10,160,24);
+        app.SetRootControl(host);app.BeginOffscreenFrame();host.RenderTree(app);app.EndOffscreenFrame();
+        Click(app,other);Check(app.overlayHost.IsAnchorActive(other),"other picker active");
+        grid.ToggleSection("General");Check(app.overlayHost.IsAnchorActive(other)&&other.IsOpen(),"retiring this grid never dismisses another picker");
+        app.overlayHost.Hide(app.overlayHost.ActiveRoot());grid.ToggleSection("General");
+        app.SetRootControl(null);host.Remove(grid);Layout(app,grid,520,320);Paint(app,grid);
+        for(int dpi=150;dpi<=200;dpi=dpi+50){
+            app.SetOffscreenViewport(1200,900,dpi);grid.SetScrollTop(0);Layout(app,grid,app.Scale(520),app.Scale(320));Paint(app,grid);
+            Check(grid.RowHeight(app)==app.Scale(32)&&Row(grid,6).by==Row(grid,7).by,"DPI row metrics and half-row mapping");
+            bool old=model.flag;Click(app,Flag(grid,3));Check(model.flag!=old,"DPI real child hit");Drain(app);
+        }
+        app.SetOffscreenViewport(800,600,100);Layout(app,grid,520,320);Paint(app,grid);
+        // User BeforeChange may replace the root without touching schema epochs.
+        state.redirectApp=app;state.redirectRoot=new Control("replacement");
+        int number=model.number;Click(app,RowButton(grid,2,"-",""));
+        Check(model.number==number&&app.rootControl==state.redirectRoot,"root replacement during BeforeChange aborts stale write");
+        state.redirectApp=null;state.redirectRoot=null;Drain(app);
+        DesignerUndo(app);
+        app.SetRootControl(null);Drain(app);app.canvas.Destroy();
+    }
+    static void Main(){
+        App frame=App.CreateOffscreen("frame",2,2);PropertyGridWitness witness=new PropertyGridWitness();Exercise(witness);
+        Check(witness.app==null&&witness.grid==null&&witness.row==null&&witness.editor==null,"retired grid/actions release without manual unwire");
+        PickerCancelMovesHost(false);PickerCancelMovesHost(true);
+        CommitReentry();
+        frame.canvas.Destroy();Console.WriteLine("PROPERTYGRID_INPUT_LIFECYCLE_OK");
+    }
+}

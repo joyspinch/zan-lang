@@ -1,0 +1,122 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class PopupFactoryWitness {
+    public weak Control Anchor;
+    public weak Control Popup;
+    public weak Control Content;
+}
+
+class PopupFactoryMountTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    // Follow the owned child tree, rather than accepting a parent pointer alone.
+    static bool Reaches(Control root, Control target) {
+        if (root == target) { return true; }
+        for (int i = 0; i < root.Children.Count; i = i + 1) {
+            Control child = root.Children[i];
+            Check(child.parent == root, "factory child has matching parent");
+            if (Reaches(child, target)) { return true; }
+        }
+        return false;
+    }
+
+    static void Exercise(App app, PopupFactoryWitness witness, int kind) {
+        Control anchor;
+        Card popup;
+        Control content;
+        if (kind == 0) {
+            ColorPicker picker = new ColorPicker();
+            picker.Mode = "hex";
+            picker.UseApp(app);
+            anchor = picker;
+            popup = picker.EnsurePopupCard(app);
+            content = picker.palettePanel;
+        } else if (kind == 1) {
+            DatePicker picker = new DatePicker();
+            picker.UseApp(app);
+            anchor = picker;
+            popup = picker.EnsurePopupCard(app);
+            content = picker.calendarWidget;
+        } else if (kind == 2) {
+            SelectBox select = new SelectBox("tree").Tree();
+            List<TreeNode> nodes = new List<TreeNode>();
+            nodes.Add(TreeNode.Dir("root", 0, true));
+            nodes.Add(TreeNode.File("leaf", 1));
+            select.TreeNodes(nodes);
+            select.UseApp(app);
+            anchor = select;
+            popup = select.EnsureTreeCard(app);
+            content = select.treeBox;
+        } else {
+            SelectBox select = new SelectBox("cascade").Cascade();
+            int root = select.AddBranch("root");
+            select.AddChild(root, "leaf");
+            select.UseApp(app);
+            anchor = select;
+            popup = select.EnsureCascadeCard(app);
+            content = select.cascadePanel;
+        }
+        witness.Anchor = anchor;
+        witness.Popup = popup;
+        witness.Content = content;
+        app.SetRootControl(anchor);
+        anchor.Arrange(20, 20, 220, 32);
+        Check(popup.parent == anchor, "popup retains trigger host chain");
+        Check(Reaches(popup, content), "factory owns content in actual child tree");
+        Check(content.App == app && popup.ContainsInputControl(content), "content inherits app and input membership");
+        app.overlayHost.Show(app, anchor, popup);
+        app.BeginOffscreenFrame();
+        app.overlayHost.RenderAll(app);
+        app.EndOffscreenFrame();
+        Check(content.bw > 0 && content.bh > 0, "factory content receives popup layout kind=" + kind
+            + " rect=" + content.bx + "," + content.by + "," + content.bw + "," + content.bh);
+        Check(app.overlayHost.ActiveRoot() == popup, "factory popup remains active after paint");
+        content.Focus(app);
+        app.CapturePointer(content);
+        Check(content.IsFocused(app) && app.GetCapturedPointer() == content, "content holds input before close");
+        app.overlayHost.Dismiss();
+        Check(!content.IsFocused(app) && app.GetCapturedPointer() == null, "popup close releases mounted content input");
+        app.SetRootControl(null);
+    }
+
+    static CascadePanel RetainPanel(App app, PopupFactoryWitness witness) {
+        SelectBox owner = new SelectBox("retained cascade").Cascade();
+        int root = owner.AddBranch("root");
+        owner.AddChild(root, "leaf");
+        owner.UseApp(app);
+        owner.EnsureCascadeCard(app);
+        witness.Anchor = owner;
+        witness.Content = owner.cascadePanel;
+        return owner.cascadePanel;
+    }
+
+    static void ExerciseExpiredOwner(App app, PopupFactoryWitness witness) {
+        CascadePanel panel = RetainPanel(app, witness);
+        Check(witness.Anchor == null && panel.box == null, "retained panel cannot keep its owner alive");
+        panel.OnMeasure(app);
+        panel.Arrange(20, 20, 200, 120);
+        app.BeginOffscreenFrame();
+        panel.OnPaint(app);
+        app.EndOffscreenFrame();
+        Check(panel.box == null, "expired owner callbacks leave detached panel inert");
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Popup factory mounts", 900, 700);
+        PopupFactoryWitness witness = new PopupFactoryWitness();
+        for (int kind = 0; kind < 4; kind = kind + 1) {
+            Exercise(app, witness, kind);
+            Check(witness.Anchor == null && witness.Popup == null && witness.Content == null,
+                "factory tree releases before process exit kind=" + kind);
+        }
+        ExerciseExpiredOwner(app, witness);
+        Check(witness.Content == null, "retained detached panel releases after callbacks");
+        app.canvas.Destroy();
+        Console.WriteLine("popup factories color / date / tree / cascade: mounted, laid out, closed, released");
+        Console.WriteLine("popup_factory_mount: ok");
+    }
+}

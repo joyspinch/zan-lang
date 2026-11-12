@@ -1,0 +1,145 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+class FocusBorrowedRoot : InputRootAdapter {
+    public FocusBorrowedRoot() : base("focus_borrowed_root") { }
+    public override bool ContainsInputControl(Control control) {
+        return control == this || (content != null && content.ContainsInputControl(control));
+    }
+    public override Control FindInputFocus(App app) {
+        return content != null ? content.FindInputFocus(app) : null;
+    }
+    public override Control HitTest(int x, int y, int pointerType) {
+        return content != null ? content.HitTest(x, y, pointerType) : null;
+    }
+}
+
+class FocusReentrantInput : Input {
+    public weak App Host;
+    public weak Control Winner;
+    public bool Armed;
+    public FocusReentrantInput() : base("first") { }
+    public override void OnInputFocusLost() {
+        base.OnInputFocusLost();
+        App app = Host; Control winner = Winner;
+        if (!Armed || app == null || winner == null) { return; }
+        Armed = false;
+        app.focus.SetFocused(winner.WidgetId(), winner);
+    }
+}
+
+class FocusWeakWitness {
+    public weak Control target;
+}
+
+class RetainedFocusLifecycleTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static void Click(App app, Control control) {
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Drain(app);
+    }
+    static void Tab(App app) { app.ProcessOffscreenInput(4, 0, 0, 0, 9, 0, 0); }
+    static void Expect(App app, Control control, bool text, string label) {
+        Check(app.focus.IsFocused(control.WidgetId()) && app.focus.focusedControl == control, label);
+        Check(app.focus.imeSessionId == (text ? control.WidgetId() : 0 - 1), label + " IME");
+    }
+    static void RegisterTemporary(App app, FocusWeakWitness witness) {
+        Input input = new Input("temporary"); input.UseApp(app);
+        app.focus.RegisterFocusable(input.WidgetId(), input);
+        witness.target = input;
+    }
+    static int Main() {
+        App app = App.CreateOffscreen("retained focus before paint", 480, 320);
+        Control root = new Control("focus_page"); root.UseApp(app);
+        FocusReentrantInput first = new FocusReentrantInput();
+        Button button = new Button("Next");
+        TextArea last = new TextArea("Last");
+        root.Add(first); root.Add(button); root.Add(last);
+        app.SetRootControl(root); root.MeasureTree(app); root.Arrange(0, 0, 480, 320);
+        first.Arrange(10, 10, 200, 32); button.Arrange(10, 55, 200, 32); last.Arrange(10, 100, 200, 72);
+        // First behavior assertion is real input after Measure/Arrange. No Paint,
+        // manual focus assignment or registration is allowed to prepare it.
+        Check(app.focus.IndexOf(first.WidgetId()) < 0, "paint table starts empty");
+        Click(app, first); Expect(app, first, true, "prepaint pointer Input focus");
+        first.SetText("ab");
+        // Backend delivers Backspace through TextInput, as it does characters.
+        app.ProcessOffscreenInput(6, 0, 0, 0, 8, 0, 0);
+        Check(first.GetText() == "a", "prepaint routed editing");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 99, 0, 0);
+        Check(first.GetText() == "ac", "prepaint routed character insertion");
+        Tab(app); Expect(app, button, false, "prepaint Tab Button");
+        Tab(app); Expect(app, last, true, "prepaint Tab TextArea");
+        Tab(app); Expect(app, first, true, "prepaint Tab wraps");
+        app.focus.ResetIds(); app.focus.UpdateImeSession();
+        Expect(app, first, true, "ResetIds preserves retained text capability");
+        // Reorder within this App without another measure, paint or registry pass.
+        root.children.RemoveAt(2); root.children.Insert(0, last);
+        app.focus.ClearFocus(); Tab(app); Expect(app, last, true, "Tab follows current order");
+        last.visible = false; app.focus.ClearFocus(); Tab(app);
+        Expect(app, first, true, "hidden endpoint excluded");
+        first.Disabled.Set(true); app.focus.ClearFocus(); Tab(app);
+        Expect(app, button, false, "disabled endpoint excluded");
+        first.Disabled.Set(false); last.visible = true;
+        root.Disabled.Set(true); app.focus.ClearFocus(); Tab(app);
+        Check(app.focus.focusedId < 0, "disabled ancestor excludes subtree");
+        root.Disabled.Set(false);
+        // Borrowed aggregation has no parent chain to its actual content.
+        FocusBorrowedRoot adapter = new FocusBorrowedRoot(); adapter.Bind(app);
+        Check(root.parent == null && app.rootControl == adapter, "borrowed root fixture");
+        Click(app, first); Expect(app, first, true, "aggregate prepaint pointer");
+        Tab(app); Expect(app, button, false, "aggregate current-tree Tab");
+        // The old focus notification may select a third endpoint. The outer
+        // pointer transition must not restore Button or close the winner's IME.
+        Click(app, first); first.Host = app; first.Winner = last; first.Armed = true;
+        Click(app, button); Expect(app, last, true, "focus lost reentry winner");
+        // A separately hosted child remains physically inside the parent tree.
+        App child = App.CreateOffscreen("child focus", 160, 80);
+        Input foreign = new Input("foreign"); foreign.UseApp(child); root.Add(foreign);
+        child.SetRootControl(foreign); foreign.MeasureTree(child); foreign.Arrange(240, 10, 160, 32);
+        app.focus.ClearFocus(); app.focus.FocusStep(0 - 1);
+        Expect(app, button, false, "parent excludes childApp endpoint");
+        // Popup owns the Tab scope before its first Paint.
+        Control popup = new Control("focus_popup"); popup.prefW = 220; popup.prefH = 70;
+        Input popupInput = new Input("popup"); popup.Add(popupInput);
+        popup.UseApp(app); popup.MeasureTree(app);
+        app.overlayHost.ShowAt(app, popup, 220, 140);
+        popupInput.Arrange(230, 150, 180, 32);
+        Click(app, popupInput); Expect(app, popupInput, true, "overlay pointer before paint");
+        app.focus.FocusStep(1); Expect(app, popupInput, true, "overlay Tab scope");
+        app.overlayHost.Hide(popup);
+        // Paint compatibility metadata cannot resurrect invalid endpoints.
+        app.BeginOffscreenFrame(); root.RenderTree(app); app.EndOffscreenFrame();
+        first.visible = false; last.Disabled.Set(true);
+        app.focus.ClearFocus(); app.focus.FocusStep(1);
+        Expect(app, button, false, "paint ids do not resurrect hidden or disabled endpoints");
+        FocusWeakWitness witness = new FocusWeakWitness(); RegisterTemporary(app, witness);
+        Check(witness.target == null, "paint endpoint metadata is weak");
+        // Replacing a root retires its endpoint and the old paint metadata.
+        Control replacement = new Control("replacement"); replacement.UseApp(app);
+        Input replacementInput = new Input("replacement input"); replacement.Add(replacementInput);
+        app.focus.SetFocused(button.WidgetId(), button);
+        app.SetRootControl(replacement);
+        Check(app.focus.focusedId < 0 && app.focus.imeSessionId < 0, "root replacement retires old focus");
+        replacement.MeasureTree(app); replacement.Arrange(0, 0, 480, 320);
+        app.focus.FocusStep(1); Expect(app, replacementInput, true, "old paint table cannot enter replaced root");
+        // The old pure-id registration remains available with no retained root.
+        adapter.Detach(); app.SetRootControl(null); app.focus.ResetIds();
+        app.focus.RegisterFocusable(71); app.focus.RegisterFocusable(72);
+        app.focus.RegisterTextEditable(72); app.focus.ClearFocus();
+        app.focus.FocusStep(1); Check(app.focus.IsFocused(71), "legacy first id");
+        app.focus.FocusStep(1); Check(app.focus.IsFocused(72) && app.focus.imeSessionId == 72, "legacy text id");
+        app.focus.ClearFocus(); app.focus.ResetIds();
+        child.SetRootControl(null); Drain(child); child.canvas.Destroy();
+        root.RemoveAll(); popup.RemoveAll(); Drain(app); app.canvas.Destroy();
+        Console.WriteLine("RETAINED_FOCUS_LIFECYCLE_OK");
+        return 0;
+    }
+}

@@ -74,6 +74,63 @@ public partial class Control {
         return this;
     }
 
+    // Retained capability: bit 0 = keyboard focus, bit 1 = text/IME.
+    // Capability declares behavior; eligibility follows the live input root.
+    public virtual int InputFocusCapabilities() { return 0; }
+
+    public bool InputFocusEligible(App app, Control root) {
+        if (app == null || root == null || this.FindApp() != app
+            || !root.StyleVisible() || root.IsDisabled()
+            || !root.ContainsInputControl(this)) { return false; }
+        Control node = this;
+        while (node != null) {
+            if (!node.StyleVisible() || node.IsDisabled()) { return false; }
+            node = node.parent;
+        }
+        return true;
+    }
+
+    // Called for Tab only, never for pointer Down. Borrowed roots override this
+    // alongside ContainsInputControl/FindInputFocus without adopting children.
+    public virtual void CollectInputFocus(App app, List<Control> controls) {
+        if (app == null || !this.StyleVisible() || this.IsDisabled()) { return; }
+        if (this.FindApp() == app && (this.InputFocusCapabilities() & 1) != 0) {
+            controls.Add(this);
+        }
+        if (children != null) {
+            for (int i = 0; i < children.Count; i = i + 1) {
+                children[i].CollectInputFocus(app, controls);
+            }
+        }
+    }
+
+    // 聚合输入根可覆盖这两个查询；布局/所有权仍由原来的控件树管理。
+    // Structural hosting ignores visibility, disabled state and modal input masks.
+    public virtual bool ContainsHostedControl(Control control) {
+        if (control == null) { return false; }
+        Control node = control;
+        while (node != null && node != this) { node = node.parent; }
+        return node == this;
+    }
+
+    public virtual bool ContainsInputControl(Control control) {
+        Control node = control;
+        while (node != null && node != this) { node = node.parent; }
+        return node == this;
+    }
+
+    public virtual Control FindInputFocus(App app) {
+        if (app == null || !this.StyleVisible() || this.IsDisabled()) { return null; }
+        if (this.IsFocused(app)) { return this; }
+        if (this.children != null) {
+            for (int i = 0; i < this.children.Count; i = i + 1) {
+                Control found = this.children[i].FindInputFocus(app);
+                if (found != null) { return found; }
+            }
+        }
+        return null;
+    }
+
     // 构建从根节点到本节点的 Visual Tree 路径（用于 Preview/Tunneling 阶段）
     public List<Control> BuildVisualTreePath() {
         List<Control> path = new List<Control>();
@@ -89,7 +146,7 @@ public partial class Control {
     public static void DispatchTunnel(List<Control> path, RoutedEventArgs e) {
         if (path == null) { return; }
         for (int i = 0; i < path.Count; i = i + 1) {
-            if (e.handled) { return; }
+            if (e.handled || !e.GestureRouteCurrent()) { return; }
             Control node = path[i];
             e.source = node;
             node.OnPreviewRoutedEvent(e);
@@ -103,9 +160,12 @@ public partial class Control {
     public static void DispatchBubble(Control target, RoutedEventArgs e) {
         Control curr = target;
         while (curr != null) {
-            if (e.handled) { return; }
+            if (e.handled || !e.GestureRouteCurrent()) { return; }
             e.source = curr;
-            curr.OnRoutedEvent(e);
+            curr.ScrollRoutedEvent(e);
+            if (!e.handled && e.GestureRouteCurrent()) { curr.OnRoutedEvent(e); }
+            if (!e.handled && e.eventName == "Wheel") { curr.ScrollWheel(e); }
+            if (!e.GestureRouteCurrent()) { return; }
             curr = curr.parent;
         }
     }
@@ -222,13 +282,13 @@ public partial class Control {
     }
 
     public virtual void OnPointerMove(RoutedEventArgs e) { }
-    public virtual void OnClick(RoutedEventArgs e) {
-        if (this.extra != null && this.extra.Click != null) {
-            this.extra.Click.RaiseS(this);
-        }
-    }
+    // 行为钩子；订阅通知由 OnRoutedEvent 的 TriggerEvent 统一发一次。
+    public virtual void OnClick(RoutedEventArgs e) {}
     public virtual void OnKeyDown(RoutedEventArgs e) { }
     public virtual void OnKeyUp(RoutedEventArgs e) { }
+    // Immediate semantic cleanup; business Focus/Blur events retain their frame protocol.
+    public virtual void OnInputFocusLost() { }
+    public virtual void OnTextInput(RoutedEventArgs e) { }
     public virtual void OnWheel(RoutedEventArgs e) { }
 
     // 隧穿事件虚方法，容器可在下沉阶段提前截获或处理（如遮罩、全局手势）
@@ -240,22 +300,30 @@ public partial class Control {
 
     // 冒泡事件虚方法，节点消费事件后可调用 e.Handle() 阻止继续向上冒泡
     public virtual void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.handled || !e.GestureRouteCurrent()) { return; }
         if (this.routedHandler != null) {
             this.routedHandler(this, e);
         }
-        if (e.source != this) {
-            this.OnChildEvent(e.source, e.eventName);
+        if (e.handled || !e.GestureRouteCurrent()) { return; }
+        if (e.originalSource != null && e.originalSource != this) {
+            this.OnChildEvent(e.originalSource, e.eventName);
         }
+        if (e.handled || !e.GestureRouteCurrent()) { return; }
 
         string ev = e.eventName;
         if (ev == "PointerEnter" || ev == "MouseEnter") { this.OnPointerEnter(e); this.TriggerEvent("Enter"); }
         else if (ev == "PointerLeave" || ev == "MouseLeave") { this.OnPointerLeave(e); this.TriggerEvent("Leave"); }
         else if (ev == "PointerDown" || ev == "MouseDown") { this.OnPointerDown(e); this.TriggerEvent("MouseDown"); }
-        else if (ev == "PointerUp" || ev == "MouseUp") { this.OnPointerUp(e); this.TriggerEvent("MouseUp"); }
+        else if (ev == "PointerUp" || ev == "MouseUp") {
+            this.OnPointerUp(e);
+            if (!e.GestureRouteCurrent()) { return; }
+            this.TriggerEvent("MouseUp");
+        }
         else if (ev == "PointerMove" || ev == "MouseMove") { this.OnPointerMove(e); this.TriggerEvent("Move"); }
         else if (ev == "Click") { this.OnClick(e); this.TriggerEvent("Click"); }
         else if (ev == "KeyDown") { this.OnKeyDown(e); this.TriggerEvent("KeyDown"); }
         else if (ev == "KeyUp") { this.OnKeyUp(e); this.TriggerEvent("KeyUp"); }
+        else if (ev == "TextInput") { this.OnTextInput(e); this.TriggerEvent("TextInput"); }
         else if (ev == "Wheel") { this.OnWheel(e); this.TriggerEvent("Wheel"); }
         else if (ev == "PointerCancel" || ev == "MouseCancel") { this.OnPointerCancel(e); this.TriggerEvent("Cancel"); }
         else if (e.eventName != "") {

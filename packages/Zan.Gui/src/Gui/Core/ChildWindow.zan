@@ -9,7 +9,7 @@ namespace Gui;
 
 public class ChildWindow {
     App host;
-    App parentApp;
+    weak App parentApp;
     Control root;
     ModelBinder binder;
     object model;
@@ -66,6 +66,7 @@ public class ChildWindow {
         root = tree;
         model = m;
         this.Binder().SetRoot(tree, m);
+        if (host != null) { host.SetRootControl(tree); }
         UiDriver.SetRoot(tree);
     }
 
@@ -198,6 +199,7 @@ public class ChildWindow {
         open = true;
         idBase = this.IdBase();
         host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        host.SetRootControl(root);
         host.SetChildMode(true);
         if (parent != null) {
             string parentSkin = parent.SkinName();
@@ -242,6 +244,7 @@ public class ChildWindow {
         open = true;
         idBase = this.IdBase();
         host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        host.SetRootControl(root);
         host.SetChildMode(true);
         host.ApplySkinName(this.StandaloneSkin());
         host.SetChromeButtons(this.ShowTheme(), this.ShowPin(), this.ShowMinimize(),
@@ -336,6 +339,7 @@ public class ChildWindow {
         int now = Window.GetTickMs();
         if (host.animNextMs >= 0 && now >= host.animNextMs) { return true; }
         if (host.fxNextMs >= 0 && now >= host.fxNextMs) { return true; }
+        if (host.wakeFrameNextMs >= 0 && now >= host.wakeFrameNextMs) { return true; }
         return false;
     }
 
@@ -375,17 +379,28 @@ public class ChildWindow {
     void Teardown() {
         if (destroyed) { return; }
         destroyed = true;
+        renderCb = null;
         if (binder != null) {
             binder.Detach();
+        }
+        // UiDriver 是进程级关联：只撤销仍属于本窗口的引用。
+        if (root != null && UiDriver.root == root) { UiDriver.SetRoot(null); }
+        if (host != null) {
+            host.StopLoop();
+            host.SetRootControl(null);
+            if (UiDriver.app == host) {
+                UiDriver.active = false;
+                UiDriver.app = null;
+            }
         }
         root = null;
         model = null;
         if (host != null) {
-            host.window.Destroy();
+            if (host.window != null) { host.window.Destroy(); }
             // 光栅 surface 与 OS 窗口是两份资源：销毁窗口只释放
             // X11/Win32 侧，surface 槽位（及其模糊/快照缓存）要
             // 显式归还，否则每开关一个副窗口就漏一块帧缓冲。
-            host.canvas.Destroy();
+            if (host.canvas != null) { host.canvas.Destroy(); }
         }
     }
 
@@ -448,7 +463,17 @@ public class ChildWindow {
     // 宿主的下一次动画截止时刻（毫秒时钟；窗口关闭返回 -1）。
     int AnimNextMs() {
         if (!open) { return 0 - 1; }
-        return host.animNextMs;
+        int due = host.animNextMs;
+        int participantDue = host.MinLoopDeadline();
+        if (participantDue >= 0 && (due < 0 || participantDue < due)) { due = participantDue; }
+        if (host.wakeFrameNextMs >= 0 && (due < 0 || host.wakeFrameNextMs < due)) {
+            due = host.wakeFrameNextMs;
+        }
+        return due;
+    }
+
+    void TickInputGestures() {
+        if (open) { host.TickRoutedLongPress(); }
     }
 
     // 宿主的下一次特效截止时刻（毫秒时钟；窗口关闭返回 -1）。

@@ -8,8 +8,7 @@ using Game.Scene;
 // 点开是 SV/色相面板，选中即写回文本框与元素染色。
 //
 // 三件事，缺一就是"看着能点、其实不生效"：
-// 1. 取色器锚点落在色块上——即时模式没有 Arrange，锚点必须由
-//    RenderIn 自己落，否则弹层跑到窗口原点。
+// 1. 取色器锚点来自持久颜色行的 Arrange，弹层不能跑到窗口原点。
 // 2. 取色器 → 元素：用户在弹层里挑了色，元素染色要跟着变。
 // 3. 文本 → 取色器：手改 hex，色块要跟着走（文本是权威）。
 //
@@ -40,7 +39,7 @@ class SceneDesignerColorTest {
     }
 
     static void Main() {
-        App app = new App("scolor", 900, 640);
+        App app = App.CreateOffscreen("scolor", 900, 640);
         SceneDesigner d = new SceneDesigner();
         SceneElement el = new SceneElement("button", "btnTest");
         el.Tint(24, 144, 255, 128);
@@ -51,9 +50,9 @@ class SceneDesignerColorTest {
         int iw = 280;
 
         // 帧 1：画一行。取色器以选中元素的颜色为初值。
-        app.BeginFrame();
+        app.BeginOffscreenFrame();
         d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
-        app.RunOverlays();
+        app.EndOffscreenFrame();
         Check("color picker is created", d.colorPick != null);
         if (d.colorPick == null) {
             Console.WriteLine("SCENE_DESIGNER_COLOR_TEST_FAIL");
@@ -64,17 +63,21 @@ class SceneDesignerColorTest {
         // 锚点必须落在色块上（弹层据此定位）。缩放系数在首帧后才稳
         // 定，几何期望值必须在帧后算。
         int lw = app.Scale(52);
-        int sw = app.Scale(28);
-        int gap = app.Scale(4);
-        int inpW = iw - lw - sw - gap;
-        EqInt("picker anchor x", d.colorPick.bx, ix + lw + inpW + gap);
+        int sw = app.theme.heightSmall;
+        int gap = app.theme.gapSmall;
+        int inpW = d.colorIn.bw;
+        EqInt("picker width", d.colorPick.bw, sw);
+        Check("retained input has positive width", inpW > 0);
+        EqInt("input follows fixed label", d.colorIn.bx, ix + lw + gap);
+        EqInt("picker anchor x", d.colorPick.bx, d.colorIn.bx + inpW + gap);
+        Check("picker stays inside row", d.colorPick.bx + d.colorPick.bw <= ix + iw);
         EqInt("picker anchor y", d.colorPick.by, iy);
 
         // 帧 2：用户在弹层里挑了绿色 → 文本框与元素染色都要跟上。
         d.colorPick.SetColor(ColorPicker.Opaque(0, 255, 0));
-        app.BeginFrame();
+        app.BeginOffscreenFrame();
         d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
-        app.RunOverlays();
+        app.EndOffscreenFrame();
         EqStr("text after pick", d.colorIn.GetText(), "#00FF00");
         EqInt("element R after pick", el.R(), 0);
         EqInt("element G after pick", el.G(), 255);
@@ -83,9 +86,9 @@ class SceneDesignerColorTest {
 
         // 帧 3：手改文本 → 取色器跟着走。
         d.colorIn.SetText("#ff8800");
-        app.BeginFrame();
+        app.BeginOffscreenFrame();
         d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
-        app.RunOverlays();
+        app.EndOffscreenFrame();
         EqInt("picker follows text",
               ColorPicker.RgbOf(d.colorPick.Value()),
               ColorPicker.RgbOf(ColorPicker.Opaque(255, 136, 0)));
@@ -93,11 +96,22 @@ class SceneDesignerColorTest {
         EqInt("element G after typing", el.G(), 136);
         EqInt("element B after typing", el.B(), 0);
 
-        // 帧 4：弹层展开时 SV 面板必须落在色块下方（不是窗口原点）。
-        d.colorPick.open = true;
-        app.BeginFrame();
+        // 真正路由到同一行的标准取色器；不挪动 colorIn 的父节点。
+        Control colorParent = d.colorIn.parent;
+        app.SetRootControl(d.inspector.colorRow);
+        int clickX = d.colorPick.bx + d.colorPick.bw / 2;
+        int clickY = d.colorPick.by + d.colorPick.bh / 2;
+        app.ProcessOffscreenInput(2, clickX, clickY, 0, 0, 0, 0);
+        app.BeginOffscreenFrame();
         d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
-        app.RunOverlays();
+        app.EndOffscreenFrame();
+        app.ProcessOffscreenInput(3, clickX, clickY, 0, 0, 0, 0);
+        app.BeginOffscreenFrame();
+        d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
+        app.EndOffscreenFrame();
+        Check("routed swatch opens popup", d.colorPick.open);
+        Check("color input never reparented", d.colorIn.parent == colorParent);
+        // 展开的 SV 面板必须落在色块下方（不是窗口原点）。
         int svId = d.colorPick.wid + ColorPicker.SvPanelOff();
         int foundY = 0 - 1;
         for (int y = 0; y < 400; y = y + 1) {
@@ -106,8 +120,8 @@ class SceneDesignerColorTest {
                 break;
             }
         }
-        Check("sv panel below swatch", foundY > iy + app.Scale(28));
-        Check("sv panel near swatch", foundY < iy + app.Scale(28) + app.Scale(80));
+        Check("sv panel below swatch", foundY > iy + app.theme.heightSmall);
+        Check("sv panel near swatch", foundY < iy + app.theme.heightSmall + app.Scale(80));
         Check("sv panel not at origin", foundY != 0 - 1);
 
         app.canvas.Destroy();

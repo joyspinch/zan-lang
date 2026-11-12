@@ -13,7 +13,7 @@ public delegate void RichTextLinkActivated(string action);
 // 滚动模型仿 StyledText：bottomAnchor=true（默认，聊天用）时
 // scroll 是「距底端的行数」，0 = 贴住最新一行；false（文档用）时
 // scroll 是「距顶端的行数」。绘制后写出 maxScroll 供调用方回读；
-// 给了 scrollBar 信号就在右侧画一条可拖动的纵向滚动条。滚轮
+// scrollBar 保留旧的滚动条宽度开关；交互由共享像素滚动处理。滚轮
 // 内置。资源段（#p/#a/#item）当前只占位推进排版，不绘制内容。
 public class RichText : Control {
     // 标记文本；每帧赋同一串不会重复解析（字符串相等即跳过）。
@@ -41,11 +41,19 @@ public class RichText : Control {
     // 行高（排版时算出，绘制与滚动共用）。
     public int rowH;
     // 滚动条要的「像素、从顶算」转换信号（构造时建一次）。
-    private SignalInt barPx;
     // 链接点击处理列表（#@动作@…@ 被点下并抬起时逐个调用）。
     private List<RichTextLinkActivated> linkHandlers;
     // 按下时命中的链接动作（抬起时还在同一链接上才算点击）。
     private string pressedAction;
+    private RichTextLink hoveredLink;
+    private List<int> lineTops;
+    private int contentHeight;
+    private int projectedScroll;
+    private bool projectedBottom;
+    private bool scrollReady;
+    private int maximumPixel;
+    private int maximumLine;
+
 
     // 空控件；Markup 赋值后自会解析排版。
     public RichText() {
@@ -65,7 +73,6 @@ public class RichText : Control {
         fontPxOverride = 0;
         defaultColor = 0;
         rowH = 0;
-        barPx = new SignalInt(0);
         linkHandlers = new List<RichTextLinkActivated>();
         pressedAction = null;
     }
@@ -86,7 +93,6 @@ public class RichText : Control {
         fontPxOverride = 0;
         defaultColor = 0;
         rowH = 0;
-        barPx = new SignalInt(0);
         linkHandlers = new List<RichTextLinkActivated>();
         pressedAction = null;
     }
@@ -137,6 +143,31 @@ public class RichText : Control {
         base.SetProp(key, val);
     }
 
+    // A detached diagnostic snapshot; callers cannot mutate the layout cache.
+    public RichTextLine LineAt(int index) {
+        if (lines == null || index < 0 || index >= lines.Count) { return null; }
+        RichTextLine source = lines[index];
+        RichTextLine result = new RichTextLine(source.alignment);
+        result.width = source.width;
+        result.height = source.height;
+        for (int i = 0; i < source.segments.Count; i = i + 1) {
+            RichTextSegment segment = source.segments[i];
+            RichTextLink link = null;
+            if (segment.link != null) {
+                link = new RichTextLink(segment.link.Raw());
+                link.style = segment.link.Style();
+                link.normalColor = segment.link.NormalColor();
+                link.hoverColor = segment.link.HoverColor();
+                link.pressedColor = segment.link.PressedColor();
+            }
+            RichTextSegment copy = new RichTextSegment(segment.text, segment.color, segment.background, link);
+            copy.x = segment.x;
+            copy.width = segment.width;
+            result.segments.Add(copy);
+        }
+        return result;
+    }
+
     // 当前排版行数（未排版为 -1）。诊断与测试用。
     public int LineCount() {
         if (this.lines == null) { return 0 - 1; }
@@ -149,7 +180,7 @@ public class RichText : Control {
         if (this.fontPxOverride > 0) { return this.fontPxOverride; }
         app = this.ResolveApp(app);
         if (app == null) { return 14; }
-        return this.ResolveStyleAs(app, "label", "small", Style.SNormal())
+        return this.ResolvePartAs(app, "label", "", "", "small", Style.SNormal())
             .FontOr(Style.FontFallback(app, "small"));
     }
 
@@ -294,6 +325,7 @@ public class RichText : Control {
                     index = next;
                 }
             } else {
+                if (seg != null) { seg.width = lineW - segStartLineW; }
                 // 资源/占位段：当前只推进排版（宽兜底字号），不绘制。
                 int w = run.Width();
                 int h = run.Height();
@@ -311,13 +343,14 @@ public class RichText : Control {
                 seg = null;
             }
             if (lineHeight > line.height) { line.height = lineHeight; }
+            if (lineW > line.width) { line.width = lineW; }
         }
         if (seg != null) { seg.width = lineW - segStartLineW; }
         this.lines.Add(line);
         for (int k = 0; k < this.lines.Count; k = k + 1) {
             RichTextLine ln = this.lines[k];
             if (ln.height < baseH) { ln.height = baseH; }
-            ln.width = 0;
+            // Keep resource advance already recorded while laying out runs.
             for (int j = 0; j < ln.segments.Count; j = j + 1) {
                 RichTextSegment s = ln.segments[j];
                 if (s.x + s.width > ln.width) { ln.width = s.x + s.width; }
@@ -340,149 +373,194 @@ public class RichText : Control {
         }
     }
 
-    // 覆写：解析 → 排版 → 处理滚轮与链接点击 → 逐段绘制背景与
-    // 文字 → 写出 maxScroll → 可选滚动条。
-    public override void OnPaint(App app) {
-        Canvas c = app.canvas;
-        int pad = app.Scale(4);
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
+        return box;
+    }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        App app = this.App;
+        int pad = app != null ? app.Scale(4) : 4;
+        int w = view.width - pad * 2;
+        int h = view.height - pad * 2;
+        return new Rect(view.x + pad, view.y + pad, w > 0 ? w : 0, h > 0 ? h : 0);
+    }
+
+    private int LineAtPixel(int pixel) {
+        if (lineTops == null || lineTops.Count == 0) { return 0; }
+        int index = 0;
+        while (index + 1 < lineTops.Count && lineTops[index + 1] <= pixel) { index = index + 1; }
+        return index;
+    }
+
+    private void ProjectScroll() {
+        if (!scrollReady || lineTops == null) { return; }
+        int line = this.LineAtPixel(this.ScrollTop());
+        int value = bottomAnchor ? maximumLine - line : line;
+        if (value < 0) { value = 0; }
+        if (value > maxScroll) { value = maxScroll; }
+        // The exact bottom is the legacy zero even when it cuts through a line.
+        if (bottomAnchor && this.ScrollTop() >= maximumPixel) { value = 0; }
+        scroll = value;
+        projectedScroll = value;
+        projectedBottom = bottomAnchor;
+    }
+
+    public override void OnScrollChanged() {
+        this.ProjectScroll();
+        hoveredLink = null;
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        App app = this.App;
+        if (app == null) { return; }
+        bool external = !scrollReady || scroll != projectedScroll || bottomAnchor != projectedBottom;
+        int requested = scroll;
+        int distanceFromBottom = maximumPixel - this.ScrollTop();
+        Rect view = this.ScrollViewport();
         int fp = this.ResolveFontPx(app);
-        int inset = 0;
-        if (this.scrollBar != null) { inset = this.BarW(app); }
-        int availW = bw - pad * 2 - inset;
+        int inset = scrollBar != null ? this.BarW(app) : 0;
+        int availW = view.width - inset;
         if (availW < fp) { availW = fp; }
         this.EnsureLayout(app, availW, fp);
-        int count = this.lines.Count;
-        int textDy = (this.rowH - Canvas.FontHeight(fp)) / 2;
+        lineTops = new List<int>();
+        contentHeight = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            lineTops.Add(contentHeight);
+            contentHeight = contentHeight + lines[i].height;
+        }
+        scrollExtent = contentHeight;
+        scrollExtentX = view.width;
+        maximumPixel = contentHeight - view.height;
+        if (maximumPixel < 0) { maximumPixel = 0; }
+        maximumLine = this.LineAtPixel(maximumPixel);
+        if (lineTops.Count > 0 && lineTops[maximumLine] < maximumPixel) { maximumLine = maximumLine + 1; }
+        if (maximumLine >= lines.Count) { maximumLine = lines.Count - 1; }
+        maxScroll = maximumLine;
+        int next = this.ScrollTop();
+        if (external) {
+            if (requested < 0) { requested = 0; }
+            if (requested > maxScroll) { requested = maxScroll; }
+            int index = bottomAnchor ? maximumLine - requested : requested;
+            next = lineTops.Count > 0 ? lineTops[index] : 0;
+            if (bottomAnchor && requested == 0) { next = maximumPixel; }
+        } else if (bottomAnchor) { next = maximumPixel - distanceFromBottom; }
+        if (next > maximumPixel) { next = maximumPixel; }
+        if (next < 0) { next = 0; }
+        scrollReady = true;
+        this.ProjectScroll();
+        this.SetScrollTop(next);
+        // Also projects external changes whose pixel position did not change.
+        this.ProjectScroll();
+    }
+
+    private RichTextSegment SegmentAt(int x, int y) {
+        Rect view = this.ScrollViewport();
+        if (lines == null || !view.Contains(x, y) || this.ScrollBarHit(x, y) != 0) { return null; }
+        int pixel = y - view.y + this.ScrollTop();
+        int index = this.LineAtPixel(pixel);
+        if (index >= lines.Count || pixel < lineTops[index] || pixel >= lineTops[index] + lines[index].height) { return null; }
+        RichTextLine line = lines[index];
+        int offX = line.alignment == 1 ? (laidW - line.width) / 2 : (line.alignment == 2 ? laidW - line.width : 0);
+        if (offX < 0) { offX = 0; }
+        for (int i = 0; i < line.segments.Count; i = i + 1) {
+            RichTextSegment segment = line.segments[i];
+            int left = view.x + offX + segment.x;
+            if (x >= left && x < left + segment.width) { return segment; }
+        }
+        return null;
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (this.IsDisabled() || !this.StyleVisible()) { return; }
+        RichTextSegment segment = this.SegmentAt(e.x, e.y);
+        RichTextLink next = segment != null ? segment.link : null;
+        if (hoveredLink != next) { hoveredLink = next; if (this.App != null) { this.App.RequestRedraw(); } }
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        hoveredLink = null;
+        if (this.App != null) { this.App.RequestRedraw(); }
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.originalSource != this || app == null || app.window.EventButton() != 0
+            || this.IsDisabled() || !this.StyleVisible()) { return; }
+        RichTextSegment segment = this.SegmentAt(e.x, e.y);
+        if (segment == null || segment.link == null) { return; }
+        pressedAction = segment.link.Raw();
+        isPressed = true;
+        app.CapturePointer(this);
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || app.window.EventButton() != 0 || pressedAction == null) { return; }
+        string action = pressedAction;
+        RichTextSegment segment = this.SegmentAt(e.x, e.y);
+        bool activate = !this.IsDisabled() && this.StyleVisible() && segment != null
+            && segment.link != null && segment.link.Raw() == action;
+        pressedAction = null;
+        isPressed = false;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        e.Handle();
+        if (activate) {
+            for (int i = 0; i < linkHandlers.Count; i = i + 1) { linkHandlers[i](action); }
+        }
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        pressedAction = null;
+        hoveredLink = null;
+    }
+
+    public override void OnInputFocusLost() {
+        pressedAction = null;
+        hoveredLink = null;
+        isPressed = false;
+        App app = this.App;
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+    }
+
+    // Geometry and interaction state are prepared before painting.
+    public override void OnPaint(App app) {
+        if (lines == null || lineTops == null) { return; }
+        Canvas c = app.canvas;
+        Rect view = this.ScrollViewport();
+        int fp = this.ResolveFontPx(app);
+        int textDy = (rowH - Canvas.FontHeight(fp)) / 2;
         if (textDy < 0) { textDy = 0; }
-        int viewH = bh - pad * 2;
-        int maxRows = viewH / this.rowH;
-        if (maxRows < 1) { maxRows = 1; }
-        int maxSc = count - maxRows;
-        if (maxSc < 0) { maxSc = 0; }
-        int sc = this.scroll;
-        if (sc > maxSc) { sc = maxSc; }
-        if (sc < 0) { sc = 0; }
-        this.scroll = sc;
-        this.maxScroll = maxSc;
-        int start = 0;
-        if (this.bottomAnchor) {
-            start = count - maxRows - sc;
-        } else {
-            start = sc;
-        }
-        if (start < 0) { start = 0; }
-        if (start > count) { start = count; }
-
-        // 指针交互：滚轮滚动；链接悬停换色，按下+抬起在同一链接上
-        // 触发点击。命中区域先注册，拖拽期间移动事件才持续送达。
-        int hid = app.focus.AllocId();
-        app.hitTester.RegisterRect(hid, bx, by, bw, bh, 1);
-        int kind = app.EventKind();
-        // 认领以真溢出为前提（maxSc > 0）：内容放得下时不认领，滚轮
-        // 穿透给外层容器/页面——认领了也只是把 sc 钳回 0 白吃一格。
-        if (maxSc > 0 && app.CaptureWheel(bx, by, bw, bh) && kind == 13) {
-            int wd = app.window.EventKeyCode();
-            int step = wd / 120;
-            if (step == 0) {
-                if (wd > 0) { step = 1; }
-                else if (wd < 0) { step = 0 - 1; }
-            }
-            if (this.bottomAnchor) { sc = sc - step; }
-            else { sc = sc + step; }
-            if (sc > maxSc) { sc = maxSc; }
-            if (sc < 0) { sc = 0; }
-            this.scroll = sc;
-            app.RequestRedraw();
-        }
-        bool over = app.mouseX >= bx && app.mouseX < bx + bw
-            && app.mouseY >= by && app.mouseY < by + bh;
-        RichTextSegment hover = null;
-        RichTextSegment hit = null;
-        if (over && !app.PointerCaptured()) {
-            hit = this.SegmentHit(pad, start, maxRows,
-                app.mouseX, app.mouseY);
-            if (hit != null && hit.link != null) { hover = hit; }
-        }
-        if (kind == 2 && over && hit != null && hit.link != null) {
-            this.pressedAction = hit.link.Raw();
-        }
-        if (kind == 3 && this.pressedAction != null) {
-            RichTextSegment up = null;
-            if (over) {
-                up = this.SegmentHit(pad, start, maxRows,
-                    app.mouseX, app.mouseY);
-            }
-            if (up != null && up.link != null
-                && up.link.Raw() == this.pressedAction) {
-                for (int i = 0; i < this.linkHandlers.Count; i = i + 1) {
-                    this.linkHandlers[i](this.pressedAction);
-                }
-            }
-            this.pressedAction = null;
-        }
-
-        int barX = bx + bw - pad - inset;
-        c.PushClip(bx, by, bw, bh);
-        int y = by + pad;
-        for (int row = 0; row < maxRows; row = row + 1) {
-            int idx = start + row;
-            if (idx >= count) { break; }
-            RichTextLine line = this.lines[idx];
-            int offX = 0;
-            if (line.alignment == 1) {
-                offX = (availW - line.width) / 2;
-            } else if (line.alignment == 2) {
-                offX = availW - line.width;
-            }
+        c.PushClip(view.x, view.y, view.width, view.height);
+        for (int index = this.LineAtPixel(this.ScrollTop()); index < lines.Count; index = index + 1) {
+            RichTextLine line = lines[index];
+            int y = view.y + lineTops[index] - this.ScrollTop();
+            if (y >= view.y + view.height) { break; }
+            int offX = line.alignment == 1 ? (laidW - line.width) / 2 : (line.alignment == 2 ? laidW - line.width : 0);
             if (offX < 0) { offX = 0; }
-            int lineY = y;
             for (int j = 0; j < line.segments.Count; j = j + 1) {
-                RichTextSegment s = line.segments[j];
-                int sx = bx + pad + offX + s.x;
-                if (s.background != 0) {
-                    c.FillRect(sx, lineY, s.width, line.height,
-                        s.background);
+                RichTextSegment segment = line.segments[j];
+                int sx = view.x + offX + segment.x;
+                if (segment.background != 0) { c.FillRect(sx, y, segment.width, line.height, segment.background); }
+                int color = segment.color;
+                if (segment.link != null) {
+                    int normal = segment.link.NormalColor();
+                    int hover = segment.link.HoverColor();
+                    if (((normal >> 24) & 255) == 0) { normal = 0; }
+                    if (((hover >> 24) & 255) == 0) { hover = 0; }
+                    if (hoveredLink == segment.link && hover != 0) { color = hover; }
+                    else if (normal != 0) { color = normal; }
                 }
-                int col = s.color;
-                if (s.link != null) {
-                    // 链接色 alpha 字节为 0 视为未提供（DrawText 把 0
-                    // 当不透明，直接比较会把 Arpg 的透明标记色画出来）。
-                    int nc = s.link.NormalColor();
-                    if (((nc >> 24) & 255) == 0) { nc = 0; }
-                    int hc = s.link.HoverColor();
-                    if (((hc >> 24) & 255) == 0) { hc = 0; }
-                    if (hover != null && hover.link == s.link && hc != 0) {
-                        col = hc;
-                    } else if (nc != 0) {
-                        col = nc;
-                    }
-                }
-                c.DrawText(sx, lineY + textDy, s.text, col, fp);
+                c.DrawText(sx, y + textDy, segment.text, color, fp);
             }
-            y = y + line.height;
         }
         c.PopClip();
-
-        // 纵向滚动条：行数滚动换算成从顶算的像素，拖动结果写回。
-        if (this.scrollBar != null && maxSc > 0) {
-            int trackH = bh - pad * 2;
-            int contentPx = count * this.rowH;
-            int top = 0;
-            if (this.bottomAnchor) { top = (maxSc - sc) * this.rowH; }
-            else { top = sc * this.rowH; }
-            this.barPx.Set(top);
-            Scrollbar.RenderVerticalScrollIn(app, barX, by + pad,
-                trackH, maxRows * this.rowH, contentPx, this.barPx,
-                bx, by, bw, bh);
-            int want = this.barPx.Get() / this.rowH;
-            if (this.bottomAnchor) { want = maxSc - want; }
-            if (want < 0) { want = 0; }
-            if (want > maxSc) { want = maxSc; }
-            if (want != sc) {
-                this.scroll = want;
-                app.RequestRedraw();
-            }
-        }
     }
 
     // 滚动条占用的宽度（与 StyledText 一致，收窄换行宽用）。
@@ -492,32 +570,4 @@ public class RichText : Control {
         return app != null ? app.Scale(12) : 12;
     }
 
-    // (mx,my) 落在的可见段；不在任何段上返回 null。
-    private RichTextSegment SegmentHit(int pad, int start, int maxRows,
-            int mx, int my) {
-        int y = by + pad;
-        for (int row = 0; row < maxRows; row = row + 1) {
-            int idx = start + row;
-            if (idx >= this.lines.Count) { break; }
-            RichTextLine line = this.lines[idx];
-            int nextY = y + line.height;
-            if (my >= y && my < nextY) {
-                int offX = 0;
-                if (line.alignment == 1) {
-                    offX = (this.laidW - line.width) / 2;
-                } else if (line.alignment == 2) {
-                    offX = this.laidW - line.width;
-                }
-                if (offX < 0) { offX = 0; }
-                for (int j = 0; j < line.segments.Count; j = j + 1) {
-                    RichTextSegment s = line.segments[j];
-                    int sx = bx + pad + offX + s.x;
-                    if (mx >= sx && mx < sx + s.width) { return s; }
-                }
-                return null;
-            }
-            y = nextY;
-        }
-        return null;
-    }
 }

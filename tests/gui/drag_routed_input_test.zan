@@ -1,0 +1,284 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+class DragRoutedInputTest {
+    int changes;
+    int ends;
+    int clicks;
+    public int low;
+    public int high;
+    public weak App cancelApp;
+
+    public void Changed() {
+        changes = changes + 1;
+        if (cancelApp != null) { cancelApp.SetRootControl(null); }
+    }
+    public void Ended() { ends = ends + 1; }
+    public void Clicked() { clicks = clicks + 1; }
+
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("Drag routed input: " + label); }
+        Console.WriteLine(label);
+    }
+
+    static void Mount(App app, Control control, int width, int height) {
+        app.SetRootControl(control);
+        control.UseApp(app);
+        control.MeasureTree(app);
+        control.Arrange(20, 20, width, height);
+    }
+
+    static void Paint(App app, Control control) {
+        app.BeginOffscreenFrame();
+        control.RenderTree(app);
+        control.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+
+    static void Pointer(App app, int kind, int x, int y) {
+        app.ProcessOffscreenInput(kind, x, y, 0, 0, 0, 0);
+    }
+
+    static void Key(App app, int code) {
+        app.ProcessOffscreenInput(4, 0, 0, 0, code, 0, 0);
+    }
+
+    static void SliderCases(App app) {
+        DragRoutedInputTest count = new DragRoutedInputTest();
+        Slider slider = new Slider(0, 100);
+        slider.Change.Add(count.Changed);
+        slider.DragEnd.Add(count.Ended);
+        count.low = 20;
+        slider.data = count.low;
+        Mount(app, slider, 200, 32);
+        Pointer(app, 2, 120, 36);
+        Check("slider down changes binding before first paint", slider.Value() == 50 && count.low == 50 && count.changes == 1);
+        Check("slider captures and focuses routed owner", app.GetCapturedPointer() == slider && slider.IsFocused(app) && slider.dragThumb == 1);
+        app.ProcessOffscreenInput(3, 180, 36, 1, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 180, 36, 2, 0, 0, 0);
+        Check("secondary release cannot end slider drag", app.GetCapturedPointer() == slider && slider.dragThumb == 1 && count.ends == 0 && count.changes == 1);
+        Pointer(app, 1, 420, 200);
+        Check("slider capture drags beyond box", slider.Value() == 100 && count.changes == 2);
+        Pointer(app, 1, 420, 200);
+        Check("slider unchanged move does not notify", count.changes == 2);
+        Paint(app, slider);
+        Check("slider repaint cannot replay edit", slider.Value() == 100 && count.changes == 2 && slider.trackNode != null && slider.thumbNode.bw > 0 && slider.fillNode.bw > 0);
+        Pointer(app, 3, 420, 200);
+        Pointer(app, 3, 420, 200);
+        Check("slider outside release ends exactly once", app.GetCapturedPointer() == null && slider.dragThumb == 0 && count.ends == 1 && count.changes == 2);
+        slider.step = 10;
+        Key(app, 37);
+        Check("slider routed arrow changes binding", slider.Value() == 90 && count.low == 90 && count.changes == 3);
+        Key(app, 35);
+        Key(app, 35);
+        Check("slider end at boundary notifies once", slider.Value() == 100 && count.changes == 4 && count.ends == 1);
+        Key(app, 36);
+        Check("slider home reaches minimum", slider.Value() == 0 && count.changes == 5);
+        slider.keyboard = false;
+        Key(app, 39);
+        Check("slider keyboard switch disables stepping", slider.Value() == 0 && count.changes == 5);
+        slider.keyboard = true;
+        app.window.SetLocalEvent(4, 0, 0, 0, 35, 0, 0);
+        RoutedEventArgs routed = new RoutedEventArgs("KeyDown", slider);
+        routed.keyCode = 39;
+        slider.RouteEvent(routed);
+        Check("slider uses routed key instead of window key", routed.handled && slider.Value() == 10 && count.changes == 6);
+        app.ProcessOffscreenInput(2, 180, 36, 1, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 180, 36, 1, 0, 0, 0);
+        app.ProcessOffscreenInput(2, 180, 36, 2, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 180, 36, 2, 0, 0, 0);
+        Check("slider rejects secondary pointer buttons", slider.Value() == 10 && count.changes == 6 && count.ends == 1 && app.GetCapturedPointer() == null);
+        slider.Disabled = true;
+        Pointer(app, 2, 180, 36);
+        Key(app, 35);
+        Pointer(app, 3, 180, 36);
+        Check("disabled slider does not edit or complete", slider.Value() == 10 && count.changes == 6 && count.ends == 1 && app.GetCapturedPointer() == null);
+        slider.Disabled = false;
+        Pointer(app, 2, 120, 36);
+        int changes = count.changes;
+        Pointer(app, 9, 0, 0);
+        Pointer(app, 1, 200, 36);
+        Pointer(app, 3, 200, 36);
+        Check("slider blur cancels without notifications", slider.Value() == 50 && count.changes == changes && count.ends == 1 && slider.dragThumb == 0 && app.GetCapturedPointer() == null);
+        Pointer(app, 2, 120, 36);
+        app.SetRootControl(new Control());
+        Pointer(app, 1, 200, 36);
+        Pointer(app, 3, 200, 36);
+        Check("slider root replacement cancels drag", slider.Value() == 50 && count.changes == changes && count.ends == 1 && slider.dragThumb == 0 && app.GetCapturedPointer() == null);
+        Mount(app, slider, 200, 32);
+        Pointer(app, 2, 120, 36);
+        slider.Disabled = true;
+        Pointer(app, 1, 200, 36);
+        Pointer(app, 3, 200, 36);
+        Check("disabling active slider cancels silently", slider.Value() == 50 && count.changes == changes && count.ends == 1 && slider.dragThumb == 0 && app.GetCapturedPointer() == null);
+        slider.Disabled = false;
+        app.SetPointerDeviceType(1);
+        Pointer(app, 2, 120, 36);
+        Pointer(app, 1, 200, 36);
+        Check("slider touch drag survives slop threshold", slider.Value() == 90 && slider.dragThumb == 1 && app.GetCapturedPointer() == slider);
+        Pointer(app, 3, 200, 36);
+        Check("slider touch release completes once", count.ends == 2 && app.GetCapturedPointer() == null);
+        app.SetPointerDeviceType(0);
+        changes = count.changes;
+        Pointer(app, 2, 200, 36);
+        Pointer(app, 3, 60, 36);
+        Check("slider release applies final position without move", slider.Value() == 20 && count.low == 20 && count.changes == changes + 1 && count.ends == 3 && app.GetCapturedPointer() == null);
+        Pointer(app, 2, 60, 36);
+        count.cancelApp = app;
+        Pointer(app, 3, 120, 36);
+        Check("slider final change cancellation suppresses drag end", slider.Value() == 50 && count.changes == changes + 2 && count.ends == 3 && app.GetCapturedPointer() == null && slider.dragThumb == 0);
+        count.cancelApp = null;
+        app.SetRootControl(null);
+    }
+
+    static void RangeCases(App app) {
+        DragRoutedInputTest count = new DragRoutedInputTest();
+        Slider slider = new Slider(0, 100);
+        slider.range = true;
+        slider.Change.Add(count.Changed);
+        slider.DragEnd.Add(count.Ended);
+        slider.data = count.low;
+        slider.dataHigh = count.high;
+        count.low = 20;
+        count.high = 80;
+        Mount(app, slider, 200, 32);
+        Pointer(app, 2, 180, 36);
+        Pointer(app, 1, 0, 36);
+        Pointer(app, 1, 0, 36);
+        Check("range high cannot cross low and notifies once", slider.Low() == 20 && slider.High() == 20 && count.low == 20 && count.high == 20 && count.changes == 1 && slider.dragThumb == 2);
+        Pointer(app, 3, 0, 36);
+        Key(app, 36);
+        Check("range constrained home is not a change", slider.High() == 20 && count.changes == 1 && count.ends == 1);
+        Key(app, 35);
+        Check("range keyboard remembers high thumb", slider.High() == 100 && count.high == 100 && count.changes == 2);
+        count.low = 40;
+        count.high = 70;
+        Pointer(app, 2, 100, 36);
+        Pointer(app, 1, 300, 36);
+        Check("range pulls binding before low drag and clamps", slider.Low() == 70 && slider.High() == 70 && count.low == 70 && count.changes == 3 && slider.dragThumb == 1);
+        Pointer(app, 3, 300, 36);
+        Key(app, 35);
+        Check("range constrained end is not a change", count.changes == 3 && count.ends == 2);
+        slider.AddMark(0, "zero");
+        slider.AddMark(30, "thirty");
+        slider.AddMark(100, "full");
+        slider.stepMark = true;
+        slider.SetRange(0, 100);
+        Key(app, 39);
+        Check("range keyboard steps between marks", slider.Low() == 30 && count.low == 30 && count.changes == 4);
+        Paint(app, slider);
+        Check("range retains both visible thumb nodes", slider.hiThumbNode != null && slider.hiThumbNode.bw > 0 && slider.thumbNode.bw > 0 && count.changes == 4);
+        int trackY = slider.trackNode.by + slider.trackNode.bh / 2;
+        int fillPixel = app.canvas.GetPixel(slider.fillNode.bx + slider.fillNode.bw / 2, trackY);
+        int trackPixel = app.canvas.GetPixel(slider.trackNode.bx + 10, trackY);
+        int thumbPixel = app.canvas.GetPixel(slider.thumbNode.bx + slider.thumbNode.bw / 2, slider.thumbNode.by + slider.thumbNode.bh / 2);
+        Check("slider retained fill and thumb render distinct pixels", fillPixel != trackPixel && thumbPixel != fillPixel);
+        Check("slider remains registered for keyboard focus", app.focus.IndexOf(slider.WidgetId()) >= 0);
+        Slider vertical = new Slider(0, 100);
+        vertical.vertical = true;
+        vertical.reverse = true;
+        vertical.step = 10;
+        Mount(app, vertical, 32, 200);
+        Pointer(app, 2, 36, 70);
+        Check("vertical reverse slider quantizes routed position", vertical.Value() == 30);
+        Pointer(app, 1, 36, 400);
+        Pointer(app, 3, 36, 400);
+        Check("vertical slider capture clamps maximum", vertical.Value() == 100 && app.GetCapturedPointer() == null);
+        vertical.reverse = false;
+        Pointer(app, 2, 36, 70);
+        Pointer(app, 3, 36, 70);
+        Check("vertical normal slider grows upward", vertical.Value() == 80);
+        app.SetRootControl(null);
+    }
+
+    static void SplitCases(App app) {
+        DragRoutedInputTest count = new DragRoutedInputTest();
+        SplitPanel split = new SplitPanel(SplitPanel.Vertical(), 100);
+        split.MinSizes(60, 70);
+        Button button = new Button("child");
+        button.Click.Add(count.Clicked);
+        split.First().Add(button);
+        Mount(app, split, 300, 160);
+        Check("split handle hit wins adjacent pane", split.HitTest(split.handleX - 2, 60, 0) == split && split.HitTest(split.handleX + split.handleW + 2, 60, 0) == split);
+        Pointer(app, 2, split.handleX, 60);
+        Check("split captures before first paint", app.GetCapturedPointer() == split);
+        app.ProcessOffscreenInput(3, 180, 60, 1, 0, 0, 0);
+        Check("secondary release cannot end split drag", app.GetCapturedPointer() == split);
+        Pointer(app, 1, 800, 400);
+        Check("split drag clamps second minimum before paint", split.Size() == 225 && split.handleX == 245 && split.First().bw == 225 && split.Second().bw == 70);
+        Paint(app, split);
+        Check("split paint cannot change model", split.Size() == 225);
+        Pointer(app, 1, 0, 400);
+        Check("split drag clamps first minimum outside box", split.Size() == 60 && split.First().bw == 60);
+        Pointer(app, 3, 0, 400);
+        Check("split outside release drops capture", app.GetCapturedPointer() == null);
+        Paint(app, split);
+        int cx = button.bx + button.bw / 2;
+        int cy = button.by + button.bh / 2;
+        Pointer(app, 2, cx, cy);
+        Check("split pane child owns its interaction", app.GetCapturedPointer() == button && split.Size() == 60);
+        Pointer(app, 3, cx, cy);
+        Action pending = Dispatcher.Take();
+        while (pending != null) { pending(); pending = Dispatcher.Take(); }
+        Check("split child click does not drag", count.clicks == 1 && split.Size() == 60);
+        Pointer(app, 2, 50, 140);
+        Pointer(app, 1, 400, 140);
+        Pointer(app, 3, 400, 140);
+        Check("split pane background does not drag", split.Size() == 60 && app.GetCapturedPointer() == null);
+        split.Disabled = true;
+        Pointer(app, 2, split.handleX, 60);
+        Pointer(app, 1, 200, 60);
+        Pointer(app, 3, 200, 60);
+        Check("disabled split does not capture or resize", split.Size() == 60 && app.GetCapturedPointer() == null);
+        split.Disabled = false;
+        app.ProcessOffscreenInput(2, split.handleX, 60, 1, 0, 0, 0);
+        app.ProcessOffscreenInput(1, 200, 60, 1, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 200, 60, 1, 0, 0, 0);
+        Check("split secondary pointer does not resize", split.Size() == 60 && app.GetCapturedPointer() == null);
+        Pointer(app, 2, split.handleX, 60);
+        Pointer(app, 9, 0, 0);
+        Pointer(app, 1, 200, 60);
+        Pointer(app, 3, 200, 60);
+        Check("split blur cancels resize", split.Size() == 60 && app.GetCapturedPointer() == null);
+        Pointer(app, 2, split.handleX, 60);
+        app.SetRootControl(new Control());
+        Pointer(app, 1, 200, 60);
+        Pointer(app, 3, 200, 60);
+        Check("split root replacement cancels resize", split.Size() == 60 && app.GetCapturedPointer() == null);
+        split.Orient(SplitPanel.Horizontal());
+        split.SetSize(80);
+        Mount(app, split, 300, 200);
+        Pointer(app, 2, 100, split.handleY);
+        Pointer(app, 1, 100, 600);
+        Check("horizontal split respects second minimum", split.Size() == 125 && split.First().bh == 125 && split.Second().bh == 70 && split.handleY == 145);
+        Pointer(app, 3, 100, 600);
+        app.SetPointerDeviceType(1);
+        Pointer(app, 2, 100, split.handleY);
+        Pointer(app, 1, 100, 0);
+        Check("split touch drag survives slop and clamps", split.Size() == 60 && app.GetCapturedPointer() == split);
+        split.Disabled = true;
+        Pointer(app, 1, 100, 180);
+        Pointer(app, 3, 100, 180);
+        Check("disabling active split cancels resize", split.Size() == 60 && app.GetCapturedPointer() == null);
+        app.SetPointerDeviceType(0);
+        split.Disabled = false;
+        Pointer(app, 2, 100, split.handleY);
+        Pointer(app, 3, 100, 120);
+        Check("split release applies final position without move", split.Size() == 100 && split.handleY == 120 && split.First().bh == 100 && app.GetCapturedPointer() == null);
+        split.SetSize(500);
+        Mount(app, split, 40, 40);
+        Paint(app, split);
+        Check("undersized split arrange leaves model unchanged", split.Size() == 500 && split.First().bh >= 0 && split.Second().bh >= 0);
+        app.SetRootControl(null);
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Drag routed input", 360, 260);
+        SliderCases(app);
+        RangeCases(app);
+        SplitCases(app);
+        app.canvas.Destroy();
+    }
+}

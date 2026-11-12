@@ -39,8 +39,6 @@ public class BandGrid : Control {
     private int barMax;
     private int accent;
     private int heatDeep;
-    private App lastApp;
-    private ScrollView scroll;
     private Rect viewportArea;
     public UiEvent Changed;
     public UiEvent Context;
@@ -71,8 +69,6 @@ public class BandGrid : Control {
         // accent 默认为 0（未指定）；有 App 时由 OnPaint 先经
         // bandgrid::accent / 主题主色解析覆盖；无 App 独立测试时兜底。
         accent = 0;
-        lastApp = null;
-        scroll = new ScrollView();
         viewportArea = new Rect(0, 0, 0, 0);
         Changed = new UiEvent();
         Context = new UiEvent();
@@ -86,8 +82,12 @@ public class BandGrid : Control {
 
     // 行列数；单元格为空文本、无数值（-1）。
     public BandGrid Bind(int r, int c) {
-        rows = r;
-        cols = c;
+        App app = this.App;
+        if (app != null) { app.ReleaseInputSubtree(this); }
+        anchorR = 0 - 1; anchorC = 0 - 1;
+        hoverR = 0 - 1; hoverC = 0 - 1;
+        rows = r > 0 ? r : 0;
+        cols = c > 0 ? c : 0;
         cells = new List<BandGridCell>();
         for (int i = 0; i < r * c; i = i + 1) {
             cells.Add(new BandGridCell("", 0 - 1, 0));
@@ -237,7 +237,8 @@ public class BandGrid : Control {
 
     // 值或选区在窗体侧变更后调用：请求下一帧重画。
     public void Poke() {
-        if (lastApp != null) { lastApp.RequestRedraw(); }
+        App app = this.App;
+        if (app != null) { app.RequestRedraw(); }
     }
 
     // ---- 布局与绘制 ----------------------------------------------
@@ -323,23 +324,148 @@ public class BandGrid : Control {
         base.SetProp(name, val);
     }
 
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
+        return box;
+    }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        int header = this.BandH(this.App);
+        if (header > view.height) { header = view.height; }
+        return new Rect(view.x, view.y + header, view.width, view.height - header);
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        App app = this.App;
+        Rect view = this.ScrollViewport();
+        int ch = app != null ? app.Scale(cellH) : cellH;
+        if (ch < 1) { ch = 1; }
+        scrollExtent = rows * ch;
+        scrollExtentX = view.width;
+        int maximum = scrollExtent - view.height;
+        if (maximum < 0) { maximum = 0; }
+        if (scrollY > maximum) { scrollY = maximum; }
+        if (scrollY < 0) { scrollY = 0; }
+        viewportArea.Set(view.x, view.y, view.width, view.height);
+    }
+
+    private int ColumnWidth(App app) {
+        int cw = app.Scale(cellW);
+        int labW = this.LabelW(app);
+        if (cellW <= 0 && cols > 0 && viewportArea.width > labW) {
+            cw = (viewportArea.width - labW) / cols;
+            if (cw < app.Scale(8)) { cw = app.Scale(8); }
+        }
+        return cw;
+    }
+
+    private bool LocateCell(int x, int y) {
+        App app = this.App;
+        hoverR = 0 - 1; hoverC = 0 - 1;
+        if (app == null || rows <= 0 || cols <= 0 || !viewportArea.Contains(x, y)) { return false; }
+        if (this.ScrollBarHit(x, y) != 0) { return false; }
+        int cw = this.ColumnWidth(app);
+        int ch = app.Scale(cellH);
+        int left = viewportArea.x + this.LabelW(app);
+        if (cw <= 0 || ch <= 0 || x < left) { return false; }
+        int r = (y - viewportArea.y + scrollY) / ch;
+        int c = (x - left) / cw;
+        if (r < 0 || r >= rows || c < 0 || c >= cols) { return false; }
+        hoverR = r; hoverC = c;
+        return true;
+    }
+
+    private void ExtendSelection(int x, int y) {
+        if (anchorR < 0 || !this.LocateCell(x, y)) { return; }
+        int loR = anchorR < hoverR ? anchorR : hoverR;
+        int hiR = anchorR > hoverR ? anchorR : hoverR;
+        int loC = anchorC < hoverC ? anchorC : hoverC;
+        int hiC = anchorC > hoverC ? anchorC : hoverC;
+        for (int r = loR; r <= hiR; r = r + 1) {
+            for (int c = loC; c <= hiC; c = c + 1) {
+                cells[r * cols + c].mark = dragSet ? 1 : 0;
+            }
+        }
+        this.Damage();
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || this.IsDisabled() || !this.LocateCell(e.x, e.y)) { return; }
+        if (app.window.EventButton() == 1) {
+            ctxR = hoverR; ctxC = hoverC;
+            Context.PostS(this);
+            this.Damage();
+            e.Handle();
+            return;
+        }
+        if (app.window.EventButton() != 0) { return; }
+        anchorR = hoverR; anchorC = hoverC;
+        dragSet = cells[anchorR * cols + anchorC].mark == 0;
+        cells[anchorR * cols + anchorC].mark = dragSet ? 1 : 0;
+        app.CapturePointer(this, true);
+        this.Damage();
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (this.IsDisabled()) { this.OnPointerCancel(e); return; }
+        App app = this.App;
+        if (app == null) { return; }
+        if (anchorR >= 0 && app.GetCapturedPointer() == this) {
+            this.ExtendSelection(e.x, e.y);
+            e.Handle();
+        } else {
+            this.LocateCell(e.x, e.y);
+            this.Damage();
+        }
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        hoverR = 0 - 1; hoverC = 0 - 1;
+        this.Damage();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || app.window.EventButton() != 0 || anchorR < 0
+            || app.GetCapturedPointer() != this) { return; }
+        if (this.IsDisabled()) { this.OnPointerCancel(e); return; }
+        this.ExtendSelection(e.x, e.y);
+        if (this.LocateCell(e.x, e.y) && app.DoubleClickNow()) {
+            actR = hoverR; actC = hoverC;
+            CellActivate.PostS(this);
+        }
+        anchorR = 0 - 1; anchorC = 0 - 1;
+        app.ReleasePointerCapture();
+        Changed.PostS(this);
+        this.Damage();
+        e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        anchorR = 0 - 1; anchorC = 0 - 1;
+        App app = this.App;
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        this.Damage();
+    }
+
     public override void OnPaint(App app) {
-        lastApp = app;
         if (rows <= 0 || cols <= 0 || cells.Count < rows * cols) {
             return;
         }
         Canvas c = app.canvas;
         int labW = this.LabelW(app);
-        int cw = app.Scale(cellW);
-        // 弹性网格列宽：cellW <= 0 时自适应可用空间均分
-        if (cellW <= 0 && cols > 0 && bw > labW) {
-            cw = (bw - labW) / cols;
-            if (cw < app.Scale(8)) { cw = app.Scale(8); }
-        }
+        int cw = this.ColumnWidth(app);
         int ch = app.Scale(cellH);
+        if (ch < 1) { ch = 1; }
         int fs = app.Scale(11);
         int bandH = this.BandH(app);
-        int ox = bx + labW;
+        Rect frame = base.ScrollViewport();
+        int ox = frame.x + labW;
 
         StyleBox head = Style.Part(app, "bandgrid", "head", "panel",
                                    "", "", Style.SNormal());
@@ -352,45 +478,40 @@ public class BandGrid : Control {
         if (fg == 0) { fg = app.theme.textPrimary; }
         if (headBg == 0) { headBg = bodyBg != 0 ? bodyBg : app.theme.bgTertiary; }
         if (bodyBg == 0) { bodyBg = app.theme.bgPrimary; }
-        if (accent == 0) {
+        int themedAccent = accent;
+        if (themedAccent == 0) {
             int themed = Style.Part(app, "bandgrid", "accent", "panel",
                                     "", "", Style.SNormal()).BgOr(0);
-            accent = themed != 0 ? themed : app.theme.primary;
+            themedAccent = themed != 0 ? themed : app.theme.primary;
         }
         int heatLo = 0;
         if (heatDeep != 0 && colorOf == null) {
             heatLo = App.LerpColor(bodyBg, heatDeep, 160);
         }
 
-        c.FillRect(bx, by, bw, bh, bodyBg);
+        c.FillRect(frame.x, frame.y, frame.width, frame.height, bodyBg);
 
         // 顶部分组表头（固定在顶部，不随内容纵向滚动）
         if (bandH > 0) {
-            c.FillRect(bx, by, labW, bandH, headBg);
+            c.FillRect(frame.x, frame.y, labW, bandH, headBg);
             for (int i = 0; i < bandLabels.Count; i = i + 1) {
                 int x0 = ox + i * bandSpan * cw;
                 int spanW = bandSpan * cw;
-                c.FillRect(x0, by, spanW, bandH, headBg);
-                c.DrawTextCentered(x0, by, spanW, bandH,
+                c.FillRect(x0, frame.y, spanW, bandH, headBg);
+                c.DrawTextCentered(x0, frame.y, spanW, bandH,
                                    bandLabels[i], fg, fs);
             }
-            c.DrawLine(bx, by + bandH - 1, bx + bw, by + bandH - 1, app.theme.divider, 1);
+            c.DrawLine(frame.x, frame.y + bandH - 1, frame.x + frame.width, frame.y + bandH - 1, app.theme.divider, 1);
         }
 
         // 视口与行虚拟化（VirtualList 视口复用范式）
-        int viewX = bx;
-        int viewY = by + bandH;
-        int viewW = bw;
-        int viewH = bh - bandH;
+        int viewX = viewportArea.x;
+        int viewY = viewportArea.y;
+        int viewW = viewportArea.width;
+        int viewH = viewportArea.height;
         if (viewH <= 0) { return; }
 
-        int totalH = rows * ch;
-        viewportArea.x = viewX;
-        viewportArea.y = viewY;
-        viewportArea.width = viewW;
-        viewportArea.height = viewH;
-
-        int scrollY = scroll.Begin(app, viewportArea, totalH);
+        c.PushClip(viewX, viewY, viewW, viewH);
 
         int r0 = scrollY / ch;
         if (r0 < 0) { r0 = 0; }
@@ -398,23 +519,18 @@ public class BandGrid : Control {
         if (r1 > rows) { r1 = rows; }
 
         bool showText = cw >= app.Scale(22);
-        hoverR = 0 - 1;
-        hoverC = 0 - 1;
-
         for (int r = r0; r < r1; r = r + 1) {
             int y0 = viewY + r * ch - scrollY;
             // 行首标签
-            c.FillRect(bx, y0, labW, ch, headBg);
+            c.FillRect(viewX, y0, labW, ch, headBg);
             if (r < rowLabels.Count) {
-                c.DrawTextCentered(bx, y0, labW, ch, rowLabels[r], fg, fs);
+                c.DrawTextCentered(viewX, y0, labW, ch, rowLabels[r], fg, fs);
             }
 
             // 行内单元格
             for (int k = 0; k < cols; k = k + 1) {
                 int idx = r * cols + k;
                 int x0 = ox + k * cw;
-                int id = app.focus.AllocId();
-                app.hitTester.RegisterRect(id, x0, y0, cw, ch, 0);
 
                 int colBg = bodyBg;
                 if (colorOf != null) {
@@ -435,80 +551,23 @@ public class BandGrid : Control {
                     if (barW > cw - 1) { barW = cw - 1; }
                     if (barW < 2) { barW = 2; }
                     c.FillRect(x0, y0 + ch - 1 - app.Scale(3), barW,
-                               app.Scale(3), accent);
+                               app.Scale(3), themedAccent);
                 }
                 if (showText && cells[idx].text != "") {
                     c.DrawTextCentered(x0, y0, cw - 1, ch - 1,
                                        cells[idx].text, fg, fs);
                 }
 
-                if (app.focus.IsHovered(id)) {
-                    hoverR = r;
-                    hoverC = k;
-                }
                 if (cells[idx].mark != 0) {
-                    c.DrawRect(x0, y0, cw - 1, ch - 1, accent, 2);
+                    c.DrawRect(x0, y0, cw - 1, ch - 1, themedAccent, 2);
                 } else if (hoverR == r && hoverC == k) {
                     c.DrawRect(x0, y0, cw - 1, ch - 1, fg, 1);
                 }
 
-                if (app.PressTarget() == id && anchorR < 0) {
-                    anchorR = r;
-                    anchorC = k;
-                    dragSet = cells[idx].mark == 0;
-                    cells[idx].mark = dragSet ? 1 : 0;
-                    this.Damage(app);
-                }
-                if (app.ClickTarget() == id && app.ClickAvailable()) {
-                    if (anchorR < 0) {
-                        cells[idx].mark = cells[idx].mark == 0 ? 1 : 0;
-                    }
-                    if (app.DoubleClickNow()) {
-                        actR = r;
-                        actC = k;
-                        CellActivate.PostS(this);
-                    }
-                    anchorR = 0 - 1;
-                    anchorC = 0 - 1;
-                    Changed.PostS(this);
-                    app.ClaimClick();
-                    this.Damage(app);
-                }
-                if (app.RightPressTarget() == id && app.EventKind() == 2) {
-                    ctxR = r;
-                    ctxC = k;
-                    Context.PostS(this);
-                    this.Damage(app);
-                }
+
             }
         }
 
-        scroll.End(app, viewportArea);
-
-        if (anchorR >= 0) {
-            if (app.PointerPressed() && hoverR >= 0) {
-                int r0Sel = anchorR < hoverR ? anchorR : hoverR;
-                int r1Sel = anchorR > hoverR ? anchorR : hoverR;
-                int c0Sel = anchorC < hoverC ? anchorC : hoverC;
-                int c1Sel = anchorC > hoverC ? anchorC : hoverC;
-                bool dirty = false;
-                for (int rr = r0Sel; rr <= r1Sel; rr = rr + 1) {
-                    for (int cc = c0Sel; cc <= c1Sel; cc = cc + 1) {
-                        int idx = rr * cols + cc;
-                        int want = dragSet ? 1 : 0;
-                        if (cells[idx].mark != want) {
-                            cells[idx].mark = want;
-                            dirty = true;
-                        }
-                    }
-                }
-                if (dirty) { this.Damage(app); }
-            } else if (!app.PointerPressed()) {
-                anchorR = 0 - 1;
-                anchorC = 0 - 1;
-                Changed.PostS(this);
-                this.Damage(app);
-            }
-        }
+        c.PopClip();
     }
 }

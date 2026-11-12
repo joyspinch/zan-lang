@@ -7,13 +7,193 @@ namespace Gui;
 public partial class App {
     // 当前视口绑定的 Visual Tree 根节点
     public Control rootControl;
+    int inputRootGeneration;
+    int inputRootChangeTicket;
 
     // 指针（鼠标/触摸）当前捕获的独占控件（如滑块拖拽、分栏拖拽、选区拖动）
     Control capturedPointerControl;
+    bool capturedDragGesture;
+    long routedWheelConsumedSequence;
+    bool routedWheelConsumedSequenceValid;
     // 指针悬停目标缓存（用于合成 PointerEnter / PointerLeave 边界穿越事件）
     Control lastHoveredControl;
     // 鼠标按下目标缓存（用于手势判定：按下和抬起在同一个控件上时才合成 Click）
     Control pointerDownTarget;
+    long pressSnapshotSequence;
+    bool pressSnapshotSequenceValid;
+    int pointerGestureTicket;
+    weak Control retainedLongPressOwner;
+    weak Control retainedLongPressRoot;
+    int retainedLongPressTicket;
+    int retainedLongPressRootGeneration;
+    int retainedLongPressPointerType;
+    bool retainedLongPressReserved;
+    int routedWindowGestureTicket;
+
+    bool RetainedLongPressOwnsGesture() {
+        // Remains reserved through slop/cancel/Up, until the next physical Down.
+        // A canceled retained gesture must not fall back to legacy polling.
+        return retainedLongPressReserved;
+    }
+
+    void RetireRetainedLongPress() {
+        pointerGestureTicket = pointerGestureTicket + 1;
+        retainedLongPressOwner = null;
+        retainedLongPressRoot = null;
+        retainedLongPressTicket = 0;
+    }
+
+    void ArmRetainedLongPress(Control target, Control inputRoot, int pointerType) {
+        if (pointerType != 1 || target == null || inputRoot == null) { return; }
+        Control node = target;
+        while (node != null) {
+            if (!inputRoot.ContainsInputControl(node)) { return; }
+            if (node.AcceptsRetainedLongPress()) {
+                retainedLongPressOwner = node;
+                retainedLongPressRoot = inputRoot;
+                retainedLongPressTicket = pointerGestureTicket;
+                retainedLongPressRootGeneration = inputRootGeneration;
+                retainedLongPressPointerType = pointerType;
+                retainedLongPressReserved = true;
+                this.RequestWakeFrameIn(80);
+                return;
+            }
+            if (node == inputRoot) { return; }
+            node = node.parent;
+        }
+    }
+
+    bool LongPressRouteCurrent(RoutedEventArgs e) {
+        if (e.gestureApp != this || e.gestureTicket != pointerGestureTicket
+                || !this.RetainedLongPressOwnsGesture() || !pointerDown
+                || retainedLongPressTicket != pointerGestureTicket
+                || touchSlopExceeded || overlayPressBlocked
+                || inputRootGeneration != retainedLongPressRootGeneration
+                || e.originalSource != pointerDownTarget) { return false; }
+        Control popup = overlayHost != null ? overlayHost.ActiveRoot() : null;
+        Control root = popup != null ? popup : rootControl;
+        Control owner = retainedLongPressOwner;
+        if (root == null || root != retainedLongPressRoot || owner == null
+                || !owner.AcceptsRetainedLongPress()
+                || !root.ContainsInputControl(pointerDownTarget)
+                || !root.ContainsInputControl(owner)
+                || !owner.ContainsInputControl(pointerDownTarget)) { return false; }
+        Control node = pointerDownTarget;
+        while (node != null) {
+            if (node.App != this || !node.StyleVisible() || node.IsDisabled()) { return false; }
+            if (node == root) { return true; }
+            node = node.parent;
+        }
+        // Borrowed HUD/Layer/fallback trees need not parent to the input adapter.
+        // Membership above is authoritative; still validate the actual ancestors.
+        return true;
+    }
+
+    bool PointerRouteCurrent(RoutedEventArgs e) {
+        return e.gestureApp == this && e.gestureTicket == pointerGestureTicket;
+    }
+
+    void TickRoutedLongPress() {
+        if (!this.RetainedLongPressOwnsGesture() || retainedLongPressOwner == null
+                || retainedLongPressTicket != pointerGestureTicket) { return; }
+        Control target = pointerDownTarget;
+        if (target == null) { return; }
+        RoutedEventArgs e = new RoutedEventArgs("LongPress", target,
+            pressStartX, pressStartY, retainedLongPressPointerType);
+        e.gestureApp = this;
+        e.gestureTicket = pointerGestureTicket;
+        if (!this.LongPressRouteCurrent(e)) { this.RetireRetainedLongPress(); return; }
+        if (!this.ClaimLongPress()) { return; }
+        // Claim is committed before callbacks. Never retire their new capture/root/press.
+        Control.RouteEvent(target, e);
+    }
+    long routedWindowSequence;
+    bool routedWindowSequenceValid;
+    bool routedWindowHandled;
+    bool routedFocusAssigned;
+    bool overlayPressBlocked;
+
+    bool BelongsToInputTree(Control control, Control root) {
+        return root != null && root.ContainsInputControl(control);
+    }
+
+    void CancelRoutedPointer() {
+        Control target = capturedPointerControl != null ? capturedPointerControl : pointerDownTarget;
+        capturedPointerControl = null;
+        capturedDragGesture = false;
+        pointerDownTarget = null;
+        lastHoveredControl = null;
+        // Retire the old press before notification; cancel may establish a new press/capture.
+        clickHistorySuppressed = true;
+        pointerDown = false;
+        this.RetireRetainedLongPress();
+        if (focus != null) { focus.ClearPress(); focus.ClearHover(); }
+        if (target != null) {
+            RoutedEventArgs cancel = new RoutedEventArgs("PointerCancel", target, mouseX, mouseY, currentPointerType);
+            Control.RouteEvent(target, cancel);
+        }
+    }
+
+    bool ConsumeRoutedInput(int kind) {
+        if (!routedWindowHandled) { return false; }
+        if (kind == 1 || kind == 2 || kind == 3 || kind == 13) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+        }
+        if (kind == 3 && routedWindowGestureTicket == pointerGestureTicket) {
+            pointerDown = false;
+            focus.ClearPress();
+            clickTargetId = -1;
+            this.ClaimClick();
+        }
+        if (kind == 4 || kind == 5 || kind == 6) { this.ClaimKey(); }
+        if (kind == 13) {
+            wheelConsumed = true;
+            routedWheelConsumedSequence = window.EventSeq();
+            routedWheelConsumedSequenceValid = true;
+        }
+        lastInputMs = Window.GetTickMs();
+        needsRedraw = true;
+        return true;
+    }
+
+    // Both native event pumps enter here; one event is routed once per App.
+    void DispatchWindowInput(int kind) {
+        if (kind != 1 && kind != 2 && kind != 3 && kind != 4
+                && kind != 5 && kind != 6 && kind != 9 && kind != 13) {
+            routedWindowHandled = false;
+            routedFocusAssigned = false;
+            this.TickRoutedLongPress();
+            return;
+        }
+        long sequence = window.EventSeq();
+        if (routedWindowSequenceValid && routedWindowSequence == sequence) { return; }
+        routedWindowSequence = sequence;
+        routedWindowSequenceValid = true;
+        routedFocusAssigned = false;
+        // Snapshot before callbacks and before a consumed retained event can early-return.
+        if (kind == 1 || kind == 2 || kind == 3 || kind == 13) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+        }
+        if (kind == 2 && window.EventButton() != 1) {
+            pointerDown = true;
+            int hit = hitTester.AnchorAt(0, mouseX, mouseY, false);
+            this.NotePressStart(hit, mouseX, mouseY);
+        }
+        int pointerType = window.EventFlag() == 1 ? 1 : this.currentPointerType;
+        int key = window.EventKeyCode();
+        int dispatchTicket = pointerGestureTicket;
+        routedWindowHandled = this.DispatchVisualTree(kind, window.EventX(),
+            window.EventY(), key, kind == 13 ? key : 0, pointerType);
+        routedWindowGestureTicket = dispatchTicket;
+        if (dispatchTicket != pointerGestureTicket) { routedWindowHandled = true; }
+        if (routedWindowHandled) { needsRedraw = true; }
+    }
+
+    Control FindFocusedControl(Control root) {
+        return root != null ? root.FindInputFocus(this) : null;
+    }
 
     // 当前输入设备的指针类型（0: Mouse 默认桌面鼠标, 1: Touch 触屏, 2: Pen 触控笔）
     public int currentPointerType;
@@ -33,12 +213,19 @@ public partial class App {
     // 捕获指针输入：后续所有的 PointerMove / PointerUp 将直接定向投递给该控件，
     // 即使鼠标已移出控件边界或窗口边界。
     public void CapturePointer(Control ctl) {
+        this.CapturePointer(ctl, false);
+    }
+
+    // 拖动捕获越过触控防抖阈值后继续接收移动；普通按钮捕获仍取消按压。
+    public void CapturePointer(Control ctl, bool dragGesture) {
         this.capturedPointerControl = ctl;
+        this.capturedDragGesture = ctl != null && dragGesture;
     }
 
     // 释放指针捕获
     public void ReleasePointerCapture() {
         this.capturedPointerControl = null;
+        this.capturedDragGesture = false;
     }
 
     // 获取当前捕获指针的控件（未捕获时为 null）
@@ -46,9 +233,83 @@ public partial class App {
         return this.capturedPointerControl;
     }
 
-    // 设置当前视口/窗口的 Visual Tree 根控件
+    // Retire each old resource independently; a new capture does not spare an old overlay.
+    public void ReleaseInputSubtree(Control root) {
+        if (root == null) { return; }
+        OverlayHost host = overlayHost;
+        int overlayTicket = host != null ? host.RetirementRevision() : 0;
+        FocusManager oldFocus = focus;
+        Control focused = oldFocus != null ? oldFocus.focusedControl : null;
+        int focusedId = oldFocus != null ? oldFocus.focusedId : -1;
+        if (root.ContainsInputControl(capturedPointerControl) || root.ContainsInputControl(pointerDownTarget)) {
+            this.CancelRoutedPointer();
+        } else if (root.ContainsInputControl(lastHoveredControl)) {
+            Control hovered = lastHoveredControl;
+            lastHoveredControl = null;
+            if (focus != null) { focus.ClearHover(); }
+            RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", hovered, mouseX, mouseY, currentPointerType);
+            Control.RouteEvent(hovered, leave);
+        }
+        // Only replacement of the focus endpoint protects it; capture changes are independent.
+        if (focus == oldFocus && oldFocus != null
+                && oldFocus.focusedControl == focused && oldFocus.focusedId == focusedId
+                && (oldFocus.FocusBelongsTo(root) || root.FindInputFocus(this) != null)) {
+            oldFocus.ClearFocus();
+        }
+        // Revision binds retirement to the old registration, including same-identity reopen.
+        // Close is last: no stale input cleanup follows its callbacks.
+        if (overlayHost == host && host != null) { host.RetireAnchorIn(root, overlayTicket); }
+    }
+
+    // An adapter lifecycle callback may reclaim the unchanged root chain.
+    // Only fence an installation in progress; ordinary per-frame Bind must not
+    // invalidate the generation used by retained long-press input.
+    void FenceInputRootChange(Control expectedRoot) {
+        if (rootControl != expectedRoot || inputRootChangeTicket == 0
+                || inputRootChangeTicket != inputRootGeneration) { return; }
+        inputRootGeneration = inputRootGeneration + 1;
+        inputRootChangeTicket = 0;
+    }
+
     public void SetRootControl(Control root) {
-        this.rootControl = root;
+        if (rootControl == root) { return; }
+        inputRootGeneration = inputRootGeneration + 1;
+        int ticket = inputRootGeneration;
+        inputRootChangeTicket = ticket;
+        try {
+            Control previous = rootControl;
+            OverlayHost host = overlayHost;
+            int overlayTicket = host != null ? host.RetirementRevision() : 0;
+            FocusManager oldFocus = focus;
+            Control focused = oldFocus != null ? oldFocus.focusedControl : null;
+            int focusedId = oldFocus != null ? oldFocus.focusedId : -1;
+            bool captureLost = capturedPointerControl != null && !this.BelongsToInputTree(capturedPointerControl, root);
+            bool pressLost = pointerDownTarget != null && !this.BelongsToInputTree(pointerDownTarget, root);
+            bool hoverLost = lastHoveredControl != null && !this.BelongsToInputTree(lastHoveredControl, root);
+            if (captureLost || pressLost) { this.CancelRoutedPointer(); }
+            else if (hoverLost) {
+                Control hovered = lastHoveredControl;
+                lastHoveredControl = null;
+                if (focus != null) { focus.ClearHover(); }
+                RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", hovered, mouseX, mouseY, currentPointerType);
+                Control.RouteEvent(hovered, leave);
+            }
+            if (inputRootGeneration != ticket) { return; }
+            if (focus == oldFocus && oldFocus != null
+                    && oldFocus.focusedControl == focused && oldFocus.focusedId == focusedId && previous != null) {
+                bool hadFocus = oldFocus.FocusBelongsTo(previous) || previous.FindInputFocus(this) != null;
+                bool keepsFocus = oldFocus.FocusBelongsTo(root) || (root != null && root.FindInputFocus(this) != null);
+                if (hadFocus && !keepsFocus) { oldFocus.ClearFocus(); }
+            }
+            if (inputRootGeneration != ticket) { return; }
+            if (overlayHost == host && host != null) { host.RetireAnchorOutside(root, overlayTicket); }
+            // Another root installation or adapter lifecycle fence supersedes this ticket.
+            if (inputRootGeneration != ticket) { return; }
+            this.rootControl = root;
+        } finally {
+            // A callback may have started a newer installation; retire only our ticket.
+            if (inputRootChangeTicket == ticket) { inputRootChangeTicket = 0; }
+        }
     }
 
     // 将底层 OS 输入事件尝试分发给 Visual Tree 路由管线（默认采用当前指针类型）。
@@ -63,15 +324,38 @@ public partial class App {
     // - 笔模式 (2): 高精度触控笔与压感
     public bool DispatchVisualTree(int eventKind, int x, int y, int keyCode, int delta, int pointerType) {
         this.currentPointerType = pointerType;
-        if (this.rootControl == null && this.capturedPointerControl == null) {
-            return false;
+        if (eventKind == 2) { overlayPressBlocked = false; }
+        if (eventKind == 9) {
+            this.CancelRoutedPointer();
+            if (focus != null) { focus.ClearFocus(); }
+            overlayPressBlocked = false;
+        }
+        if (overlayHost != null && overlayHost.HandleInput(this, eventKind, x, y, keyCode)) {
+            this.CancelRoutedPointer();
+            if (eventKind == 2) { overlayPressBlocked = true; }
+            return true;
+        }
+        if (eventKind == 3 && overlayPressBlocked) {
+            overlayPressBlocked = false;
+            this.CancelRoutedPointer();
+            return true;
+        }
+        Control popup = overlayHost != null ? overlayHost.ActiveRoot() : null;
+        Control inputRoot = popup != null ? popup : rootControl;
+        if (capturedPointerControl != null && !this.BelongsToInputTree(capturedPointerControl, inputRoot)) {
+            this.CancelRoutedPointer();
+        }
+        if (inputRoot == null && capturedPointerControl == null) { return false; }
+
+        bool keyboard = eventKind == 4 || eventKind == 5 || eventKind == 6;
+        Control captureOwner = keyboard ? null : capturedPointerControl;
+        Control target = keyboard ? this.FindFocusedControl(inputRoot) : captureOwner;
+        if (!keyboard && target == null && inputRoot != null) {
+            target = inputRoot.HitTest(x, y, pointerType);
         }
 
-        Control target = this.capturedPointerControl;
-        if (target == null && this.rootControl != null) {
-            target = this.rootControl.HitTest(x, y, pointerType);
-        }
-
+        // Fix the ticket before any pointer-cancel callback can reenter.
+        int dispatchTicket = pointerGestureTicket;
         // 处理鼠标移动与触控滑动带来的状态流转
         if (eventKind == 1) { // PointerMove
             if (pointerType == 1) {
@@ -81,9 +365,21 @@ public partial class App {
                     int dy = y - this.touchDownY;
                     if (dx * dx + dy * dy >= TOUCH_SLOP_PX * TOUCH_SLOP_PX) {
                         this.touchSlopExceeded = true;
-                        // 确认突破防抖死区：手势意图由「点击」升级为「滑动/滚动」，向被按压控件发送取消通知
-                        RoutedEventArgs cancelEvt = new RoutedEventArgs("PointerCancel", this.pointerDownTarget, x, y, pointerType);
-                        Control.RouteEvent(this.pointerDownTarget, cancelEvt);
+                        clickHistorySuppressed = true;
+                        this.RetireRetainedLongPress();
+                        // This transition belongs to this Move, not to a new Down.
+                        dispatchTicket = pointerGestureTicket;
+                        // 拖动控件已认领手势；普通按压越过阈值时取消，二者都不再合成 Click。
+                        if (capturedPointerControl == null || !capturedDragGesture) {
+                            Control pressed = capturedPointerControl != null ? capturedPointerControl : pointerDownTarget;
+                            this.ReleasePointerCapture();
+                            pointerDownTarget = null;
+                            if (focus != null) { focus.ClearPress(); }
+                            RoutedEventArgs cancelEvt = new RoutedEventArgs("PointerCancel", pressed, x, y, pointerType);
+                            Control.RouteEvent(pressed, cancelEvt);
+                            // A cancel callback may begin a different physical gesture.
+                            if (dispatchTicket != pointerGestureTicket) { return true; }
+                        }
                     }
                 }
             } else {
@@ -103,7 +399,8 @@ public partial class App {
         }
 
         if (target == null) {
-            return false;
+            if (eventKind == 3) { this.pointerDownTarget = null; }
+            return popup != null;
         }
 
         string evtName = "";
@@ -112,6 +409,7 @@ public partial class App {
         else if (eventKind == 3) { evtName = "PointerUp"; }
         else if (eventKind == 4) { evtName = "KeyDown"; }
         else if (eventKind == 5) { evtName = "KeyUp"; }
+        else if (eventKind == 6) { evtName = "TextInput"; }
         else if (eventKind == 13) { evtName = "Wheel"; }
 
         if (evtName == "") {
@@ -120,7 +418,12 @@ public partial class App {
 
         RoutedEventArgs e = new RoutedEventArgs(evtName, target, x, y, pointerType);
         e.keyCode = keyCode;
+        e.modifiers = window.EventMods();
         e.delta = delta;
+        if (eventKind == 3) {
+            e.gestureApp = this;
+            e.gestureTicket = dispatchTicket;
+        }
 
         if (eventKind == 2) { // PointerDown
             this.pointerDownTarget = target;
@@ -130,40 +433,78 @@ public partial class App {
                 this.touchSlopExceeded = false;
                 this.lastHoveredControl = target;
             }
-        }
-
-        // 执行完整的隧穿与冒泡路由
-        Control.RouteEvent(target, e);
-
-        // 如果是按下，将焦点同步转移给命中目标（双轨兼顾）
-        if (eventKind == 2 && target != null) {
-            if (this.focus != null) {
-                this.focus.SetFocused(target.WidgetId());
+            if (window.EventButton() != 1) {
+                this.ArmRetainedLongPress(target, inputRoot, pointerType);
             }
         }
 
+        // 焦点取最近的可聚焦祖先，并在路由前设置，处理程序可主动转移焦点。
+        if (eventKind == 2 && window.EventButton() != 1) {
+            Control node = target;
+            while (node != null) {
+                int id = node.WidgetId();
+                if (node.InputFocusEligible(this, inputRoot)
+                    && (((node.InputFocusCapabilities() & 1) != 0) || focus.IndexOf(id) >= 0)) {
+                    focus.SetFocused(id, node);
+                    routedFocusAssigned = true;
+                    break;
+                }
+                node = node.parent;
+            }
+        }
+        if (dispatchTicket != pointerGestureTicket) { return true; }
+        Control.RouteEvent(target, e);
+        if (dispatchTicket != pointerGestureTicket) { return true; }
+
         // 如果是点击释放且在同一个目标上释放，合成标准 Click 路由事件
-        if (eventKind == 3 && target != null && !e.handled) {
+        if (eventKind == 3 && target != null && !e.handled && window.EventButton() != 1) {
             // 防抖与滑动保护：若在触屏上移动距离超出了防抖阈值（如列表滚动手势），严禁合成 Click
-            bool allowClick = true;
+            bool allowClick = !this.LongPressFired();
             if (pointerType == 1 && this.touchSlopExceeded) {
                 allowClick = false;
             }
 
-            if (allowClick && this.pointerDownTarget == target) {
-                RoutedEventArgs clickEvt = new RoutedEventArgs("Click", target, x, y, pointerType);
-                Control.RouteEvent(target, clickEvt);
+            Control clickTarget = null;
+            if (captureOwner != null) {
+                // 捕获可能由命中叶子的祖先（Button 内 Label）在冒泡时取得。
+                // 捕获只保证 Up 投递；Click 还要求按下/实际释放都属于该子树。
+                Control down = this.pointerDownTarget;
+                while (down != null && down != captureOwner) { down = down.parent; }
+                Control up = inputRoot != null ? inputRoot.HitTest(x, y, pointerType) : null;
+                while (up != null && up != captureOwner) { up = up.parent; }
+                if (down == captureOwner && up == captureOwner) { clickTarget = captureOwner; }
+            } else if (this.pointerDownTarget == target) {
+                clickTarget = target;
+            }
+            if (!allowClick || clickTarget == null) { clickHistorySuppressed = true; }
+            if (allowClick && clickTarget != null) {
+                bool primaryDoubleClick = false;
+                if (window.EventButton() == 0) {
+                    this.NoteClickTarget(clickTarget.WidgetId());
+                    primaryDoubleClick = this.DoubleClickNow();
+                }
+                RoutedEventArgs clickEvt = new RoutedEventArgs("Click", clickTarget, x, y, pointerType);
+                clickEvt.modifiers = e.modifiers;
+                clickEvt.isDoubleClick = primaryDoubleClick;
+                clickEvt.gestureApp = this;
+                clickEvt.gestureTicket = dispatchTicket;
+                Control.RouteEvent(clickTarget, clickEvt);
                 if (clickEvt.handled) {
                     e.Handle();
                 }
             }
+        }
+        if (dispatchTicket != pointerGestureTicket) { return true; }
+        if (eventKind == 3) {
             this.pointerDownTarget = null;
 
             // 触屏关键治理：手指离屏后立即清除悬停态，彻底根除桌面 Hover 粘滞残留（Sticky Hover）
             if (pointerType == 1 && this.lastHoveredControl != null) {
-                RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", this.lastHoveredControl, x, y, pointerType);
-                Control.RouteEvent(this.lastHoveredControl, leave);
+                Control hovered = this.lastHoveredControl;
                 this.lastHoveredControl = null;
+                RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", hovered, x, y, pointerType);
+                Control.RouteEvent(hovered, leave);
+                if (dispatchTicket != pointerGestureTicket) { return true; }
             }
         }
 

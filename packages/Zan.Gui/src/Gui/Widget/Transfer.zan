@@ -26,6 +26,9 @@ public class Transfer<T> : Control {
     // 左 / 右栏各自的瞬时状态（勾选、滚动、过滤）。
     public TransferPane left;
     public TransferPane right;
+    private TransferRegion<T> leftRegion;
+    private TransferRegion<T> rightRegion;
+    private bool arrangingTransfer;
     // 行文本委托（未设时取 `item.ToString()`）。
     public CellOf<T> label;
     // 行首图标委托（null = 不画图标）。
@@ -78,6 +81,11 @@ public class Transfer<T> : Control {
         target = new List<T>();
         left = new TransferPane();
         right = new TransferPane();
+        leftRegion = new TransferRegion<T>(this, left, true);
+        rightRegion = new TransferRegion<T>(this, right, false);
+        this.Add(leftRegion);
+        this.Add(rightRegion);
+        arrangingTransfer = false;
         label = null;
         iconOf = null;
         searchable = false;
@@ -99,6 +107,11 @@ public class Transfer<T> : Control {
         opBox.ClassName = "column align-center justify-center gap-small";
         opBox.Add(rightBtn);
         opBox.Add(leftBtn);
+        this.Add(opBox);
+        TransferRegionAction<T> rightAction = new TransferRegionAction<T>(leftRegion);
+        TransferRegionAction<T> leftAction = new TransferRegionAction<T>(rightRegion);
+        rightBtn.Click.AddS(rightAction.Operation);
+        leftBtn.Click.AddS(leftAction.Operation);
         wiresOwnEvents = true;
         Change = new UiEvent();
         SelectChanged = new UiEvent();
@@ -129,6 +142,11 @@ public class Transfer<T> : Control {
     // 绑定两侧列表。不拷贝：每帧都从中读行，所以宿主改动列表
     // （增删条目）后下一帧即生效；勾选标记按行序自动伸缩。
     public Transfer<T> Bind(List<T> src, List<T> tgt) {
+        // A row band belongs to the lists on which its Down occurred.
+        leftRegion.CancelSelection();
+        rightRegion.CancelSelection();
+        pendRow = 0 - 1; pendPane = 0 - 1;
+        pendOn = false; wasPaint = false; lastDrag = false;
         if (src != null) { source = src; }
         if (tgt != null) { target = tgt; }
         this.Invalidate();
@@ -142,6 +160,7 @@ public class Transfer<T> : Control {
     public void Invalidate() {
         left.orderFor = 0 - 1;
         right.orderFor = 0 - 1;
+        this.SyncOperationButtons();
     }
 
     // 行文本委托（未设时取 `item.ToString()`）。
@@ -260,7 +279,7 @@ public class Transfer<T> : Control {
         if (i < 0 || i >= p.flags.Count) { return; }
         if (p.flags[i] == on) { return; }
         p.flags[i] = on;
-        SelectChanged.PostS(this);
+        this.SyncOperationButtons(); SelectChanged.PostS(this);
     }
 
     // 左栏当前被勾选的实体（按行序）。
@@ -336,7 +355,7 @@ public class Transfer<T> : Control {
                 }
             }
         }
-        if (dirty) { SelectChanged.PostS(this); }
+        if (dirty) { this.SyncOperationButtons(); SelectChanged.PostS(this); }
     }
 
     // 程序化全选/取消勾选某侧（只作用于当前过滤结果的可见行，
@@ -355,7 +374,7 @@ public class Transfer<T> : Control {
                 dirty = true;
             }
         }
-        if (dirty) { SelectChanged.PostS(this); }
+        if (dirty) { this.SyncOperationButtons(); SelectChanged.PostS(this); }
     }
 
     // 勾选/取消勾选某侧当前过滤结果的全部可见行（表头全选框的
@@ -499,7 +518,7 @@ public class Transfer<T> : Control {
         List<T> data = isSource ? source : target;
         this.SyncFlags(p, data.Count);
         int changed = PaintRange(p, a, b, val);
-        if (changed > 0) { SelectChanged.PostS(this); }
+        if (changed > 0) { this.SyncOperationButtons(); SelectChanged.PostS(this); }
         return changed;
     }
 
@@ -524,9 +543,15 @@ public class Transfer<T> : Control {
     public void Render(App app, int x, int y, int w, int h) {
         app = this.ResolveApp(app);
         if (app == null) { return; }
-        this.SyncFlags(left, source.Count);
-        this.SyncFlags(right, target.Count);
+        this.UseApp(app);
+        this.MeasureTree(app);
+        this.Arrange(x, y, w, h);
+        this.RenderTree(app);
+    }
 
+    private void PaintTransfer(App app, int x, int y, int w, int h) {
+        app = this.ResolveApp(app);
+        if (app == null) { return; }
         Canvas c = app.canvas;
         Theme t = app.theme;
         StyleBox root = this.ResolveStyleAs(app, "transfer", Class,
@@ -547,44 +572,11 @@ public class Transfer<T> : Control {
         int panelW = (iw - opW - opGap * 2) / 2;
         if (panelW < app.Scale(100)) { panelW = app.Scale(100); }
 
-        // 中缝两枚按钮：按下/抬起/禁用外观、皮肤全部由 Button 自持。
-        // 对应侧没有勾选就禁用。
-        int opX = ix + panelW + opGap;
-        bool moved = false;
-        rightBtn.Disabled = this.CheckedCount(left, source.Count) == 0
-                            || this.IsDisabled();
-        rightBtn.Arrange(opX, iy + ih / 2 - opH - opGap / 2, opW, opH);
-        rightBtn.RenderTree(app);
-        if (rightBtn.WasClicked()) { this.MoveRight(); moved = true; }
-        if (!oneWay) {
-            leftBtn.Disabled = this.CheckedCount(right, target.Count) == 0
-                               || this.IsDisabled();
-            leftBtn.Arrange(opX, iy + ih / 2 + opGap / 2, opW, opH);
-            leftBtn.RenderTree(app);
-            if (leftBtn.WasClicked()) { this.MoveLeft(); moved = true; }
-        }
-
         bool dirty = this.RenderPane(app, left, source, ix, iy, panelW, ih,
                                      true);
         dirty = this.RenderPane(app, right, target,
                                 ix + panelW + opW + opGap * 2, iy,
                                 panelW, ih, false) || dirty;
-        // 按下/拖拽的勾选在抬起帧入账：拖过把整段扫带置为目标态，
-        // 普通点击就是单次翻勾（连按同一行两次=双击回到原状态）。
-        if (app.EventKind() == 3) {
-            dirty = this.FlushPaint(left) || dirty;
-            dirty = this.FlushPaint(right) || dirty;
-        }
-        if (!app.pointerDown
-            && (left.paintStart >= 0 || right.paintStart >= 0)) {
-            // 失焦：就地作废锚点，预览回落到真实勾选。
-            left.paintStart = 0 - 1;
-            left.paintEnd = 0 - 1;
-            right.paintStart = 0 - 1;
-            right.paintEnd = 0 - 1;
-            dirty = true;
-        }
-        dirty = moved || dirty;
         if (dirty) {
             app.NoteDamage(x, y, w, h);
             app.window.Wake();
@@ -640,22 +632,7 @@ public class Transfer<T> : Control {
         } else {
             Checkbox.PaintBox(app, hx, hby, hbox, 0);
         }
-        int cid = app.focus.AllocId();
-        app.canvas.DrawText(hx + hbox + app.Scale(6), hy, selectAllText,
-                            fg, fs);
-        int lw = Canvas.MeasureText(selectAllText, fs);
-        app.hitTester.RegisterRect(cid, hx, iy,
-                                   hbox + app.Scale(6) + lw, headH, 2);
-        if (Ui.Clicked(app, cid) && !this.IsDisabled()
-            && (isSource || !oneWay)) {
-            bool on = selN < allN;
-            for (int k = 0; k < order.Count; k = k + 1) {
-                int i = order[k];
-                if (i < p.flags.Count) { p.flags[i] = on; }
-            }
-            SelectChanged.PostS(this);
-            return true;
-        }
+        app.canvas.DrawText(hx + hbox + app.Scale(6), hy, selectAllText, fg, fs);
         return false;
     }
 
@@ -671,7 +648,7 @@ public class Transfer<T> : Control {
             return false;
         }
         int changed = PaintRange(p, a, b, val);
-        if (changed > 0) { SelectChanged.PostS(this); }
+        if (changed > 0) { this.SyncOperationButtons(); SelectChanged.PostS(this); }
         return changed > 0;
     }
 
@@ -709,14 +686,6 @@ public class Transfer<T> : Control {
         int count = data.Count;
         int checkedN = this.CheckedCount(p, count);
 
-        if (searchable && p.search != null) {
-            string live = p.search.GetText();
-            if (live != p.query) {
-                p.query = live;
-                p.scroll.Set(0);
-                dirty = true;
-            }
-        }
         List<int> order = this.Order(p, data);
 
         c.FillRect(ix, iy, iw, headH, header.BgOr(0));
@@ -735,18 +704,12 @@ public class Transfer<T> : Control {
                  totalText + " " + Convert.ToString(count) + " 项", fs)
              + pad;
         if (!isSource) {
-            int cid = app.focus.AllocId();
             bool canClear = !oneWay && checkedN > 0 && !this.IsDisabled();
             StyleBox link = Style.Part(app, "transfer", "link", "", Class, "",
                 canClear ? Style.SNormal() : Style.SDisabled());
             c.DrawText(hx, hy, clearText,
                        link.FgOr(root.accent), fs);
             int lw = Canvas.MeasureText(clearText, fs);
-            app.hitTester.RegisterRect(cid, hx, iy, lw, headH, 2);
-            if (Ui.Clicked(app, cid) && canClear) {
-                this.ClearPane(right, target, true);
-                dirty = true;
-            }
             c.DrawText(hx + lw + pad, hy,
                        selectedText + " " + Convert.ToString(checkedN) + " 项",
                        meta.FgOr(root.fg), fs);
@@ -754,44 +717,18 @@ public class Transfer<T> : Control {
         iy = iy + headH;
         ih = ih - headH;
 
-        // ---- 搜索框 ----
-        if (searchable) {
-            if (p.search == null) {
-                string hint = isSource ? leftHint : rightHint;
-                p.search = new Input(hint);
-                p.search.iconLead = "search";
-                p.search.Class = "small";
-                dirty = true;
-            }
-            p.search.Arrange(ix + pad, iy + app.Scale(6),
-                            iw - pad * 2, searchH);
-            p.search.RenderTree(app);
-            iy = iy + searchH + app.Scale(10);
-            ih = ih - searchH - app.Scale(10);
-        }
-
-        // ---- 行区 ----
+        // Search controls and row viewport were arranged before input/paint.
         int n = order.Count;
         int contentH = n * rowH;
-        Scrollbar.HandleWheel(app, ix, iy, iw, ih, contentH, p.scroll);
-        int maxOff = contentH - ih;
-        if (maxOff < 0) { maxOff = 0; }
-        if (p.scroll.Get() > maxOff) { p.scroll.Set(maxOff); }
-        if (p.scroll.Get() < 0) { p.scroll.Set(0); }
+        iy = p.bodyY;
+        ih = p.bodyH;
         int off = p.scroll.Get();
         bool overflow = contentH > ih;
-        int barW = app.Scale(10);
-        int bodyW = iw;
-        if (overflow) { bodyW = iw - barW; }
+        int bodyW = p.bodyW;
         int first = off / rowH;
         if (first < 0) { first = 0; }
         int last = (off + ih) / rowH;
         if (last >= n) { last = n - 1; }
-        p.bodyX = ix;
-        p.bodyY = iy;
-        p.bodyW = bodyW;
-        p.bodyH = ih;
-        p.rowHPx = rowH;
         c.PushClip(ix, iy, bodyW, ih);
         int rfs = row.FontOr(Style.FontFallback(app, "medium"));
         int rbox = app.Scale(16);
@@ -800,22 +737,9 @@ public class Transfer<T> : Control {
         while (k <= last) {
             int i = order[k];
             int ry = iy + k * rowH - off;
-            int id = app.focus.AllocId();
-            app.hitTester.RegisterRect(id, ix, ry, bodyW, rowH, 2);
-            bool over = app.focus.IsHovered(id);
-            bool selectable = !this.IsDisabled() && (!oneWay || isSource);
-            if (selectable && Ui.PressedDown(app, id)) {
-                p.paintStart = i;
-                p.paintEnd = i;
-                p.paintVal = !(i < p.flags.Count && p.flags[i]);
-                painting = true;
-                dirty = true;
-            } else if (painting && app.pointerDown && over && i != p.paintStart) {
-                if (p.paintEnd != i) {
-                    p.paintEnd = i;
-                    dirty = true;
-                }
-            }
+            bool over = app.mouseX >= ix && app.mouseX < ix + bodyW
+                && app.mouseY >= ry && app.mouseY < ry + rowH
+                && app.mouseY >= iy && app.mouseY < iy + ih;
             bool checkedK = i < p.flags.Count && p.flags[i];
             if (this.InPaintBand(p, i)) { checkedK = p.paintVal; }
             if (over) {
@@ -848,10 +772,6 @@ public class Transfer<T> : Control {
             k = k + 1;
         }
         c.PopClip();
-        if (overflow) {
-            Scrollbar.RenderVerticalScrollIn(app, ix + iw - barW, iy, ih,
-                ih, contentH, p.scroll, ix, iy, iw, ih);
-        }
 
         // ---- 空态 ----
         if (n == 0 && emptyText != "") {
@@ -862,6 +782,159 @@ public class Transfer<T> : Control {
                                Style.FontFallback(app, "small"));
         }
         return dirty;
+    }
+
+    private void SyncOperationButtons() {
+        if (rightBtn != null) { rightBtn.Disabled = this.CheckedCount(left, source.Count) == 0 || this.IsDisabled(); }
+        if (leftBtn != null) { leftBtn.Disabled = this.CheckedCount(right, target.Count) == 0 || this.IsDisabled(); }
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        if (arrangingTransfer) { return; }
+        arrangingTransfer = true;
+        bx = px; by = py; bw = pw > 0 ? pw : 0; bh = ph > 0 ? ph : 0;
+        App app = this.App;
+        if (app == null) { arrangingTransfer = false; return; }
+        this.SyncFlags(left, source.Count);
+        this.SyncFlags(right, target.Count);
+        this.ComputeMetrics(app);
+        StyleBox style = this.ResolveStyleAs(app, "transfer", Class, Style.SNormal());
+        int pad = style.PadLOr(app.Scale(12));
+        int x = bx + pad;
+        int y = by + pad;
+        int w = bw - pad * 2;
+        int h = bh - pad * 2;
+        int paneW = (w - opW - opGap * 2) / 2;
+        if (paneW < app.Scale(100)) { paneW = app.Scale(100); }
+        int opX = x + paneW + opGap;
+        rightBtn.Disabled = this.CheckedCount(left, source.Count) == 0 || this.IsDisabled();
+        leftBtn.Disabled = this.CheckedCount(right, target.Count) == 0 || this.IsDisabled();
+        leftBtn.visible = !oneWay;
+        opBox.Arrange(opX, y, opW, h);
+        rightBtn.Arrange(opX, y + h / 2 - opH - opGap / 2, opW, opH);
+        if (!oneWay) { leftBtn.Arrange(opX, y + h / 2 + opGap / 2, opW, opH); }
+        this.ArrangePane(app, leftRegion, source, x, y, paneW, h);
+        this.ArrangePane(app, rightRegion, target, x + paneW + opW + opGap * 2, y, paneW, h);
+        arrangingTransfer = false;
+    }
+
+    private void ArrangePane(App app, TransferRegion<T> region, List<T> data,
+                             int x, int y, int w, int h) {
+        TransferPane p = region.pane;
+        int ix = x + 1;
+        int iy = y + 1 + headH;
+        int iw = w - 2;
+        int ih = h - 2 - headH;
+        if (searchable && p.search == null) {
+            p.search = new Input(region.isSource ? leftHint : rightHint);
+            p.search.iconLead = "search";
+            p.search.Class = "small";
+            this.Add(p.search);
+            TransferRegionAction<T> action = new TransferRegionAction<T>(region);
+            p.search.Change.AddS(action.SearchChanged);
+            p.search.MeasureTree(app);
+        }
+        if (p.search != null) {
+            p.search.visible = searchable;
+            if (searchable) {
+                string live = p.search.GetText();
+                if (live != p.query) { p.query = live; p.scroll.Set(0); }
+                int pad = app.theme.paddingMedium;
+                p.search.Arrange(ix + pad, iy + app.Scale(6), iw - pad * 2, searchH);
+                iy = iy + searchH + app.Scale(10);
+                ih = ih - searchH - app.Scale(10);
+            }
+        }
+        StyleBox row = Style.Part(app, "transfer", "row", "", Class, "", Style.SNormal());
+        int rowH = row.HeightOr(app.Scale(36));
+        if (rowH < 1) { rowH = 1; }
+        List<int> order = this.Order(p, data);
+        region.Disabled = this.IsDisabled();
+        region.LayoutRows(ix, iy, iw, ih, order.Count * rowH);
+        p.bodyX = ix; p.bodyY = iy;
+        p.bodyW = iw - (order.Count * rowH > ih ? app.Scale(8) : 0);
+        p.bodyH = ih > 0 ? ih : 0;
+        p.rowHPx = rowH;
+    }
+
+    public void SyncRegion(TransferRegion<T> region) {
+        // Row paint, RowCenter and input all read the just-committed projection.
+        App app = this.App;
+        if (app != null) { app.NoteScrollDamage(region.bx, region.by, region.bw, region.bh); }
+    }
+
+    private int RegionRow(TransferRegion<T> region, int x, int y) {
+        TransferPane p = region.pane;
+        if (p.rowHPx < 1 || x < p.bodyX || x >= p.bodyX + p.bodyW
+            || y < p.bodyY || y >= p.bodyY + p.bodyH) { return 0 - 1; }
+        List<int> order = this.Order(p, region.isSource ? source : target);
+        int row = (y - p.bodyY + p.scroll.Get()) / p.rowHPx;
+        return row >= 0 && row < order.Count ? order[row] : 0 - 1;
+    }
+    public bool BeginRegionSelection(TransferRegion<T> region, int x, int y) {
+        if (this.IsDisabled() || (oneWay && !region.isSource)) { return false; }
+        int row = this.RegionRow(region, x, y);
+        if (row < 0) { return false; }
+        TransferPane p = region.pane;
+        p.paintStart = row; p.paintEnd = row;
+        p.paintVal = !(row < p.flags.Count && p.flags[row]);
+        this.SyncRegion(region);
+        return true;
+    }
+    public void MoveRegionSelection(TransferRegion<T> region, int x, int y) {
+        int row = this.RegionRow(region, x, y);
+        if (row >= 0) { region.pane.paintEnd = row; this.SyncRegion(region); }
+    }
+    public void EndRegionSelection(TransferRegion<T> region) {
+        this.FlushPaint(region.pane);
+        this.SyncOperationButtons();
+        this.SyncRegion(region);
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        if (e.handled || e.originalSource != this || this.IsDisabled()) { return; }
+        App app = this.App;
+        if (app == null) { return; }
+        StyleBox root = this.ResolveStyleAs(app, "transfer", Class, Style.SNormal());
+        int hy = by + root.PadLOr(app.Scale(12)) + 1;
+        if (e.y < hy || e.y >= hy + headH) { return; }
+        TransferRegion<T> region = e.x < rightRegion.bx ? leftRegion : rightRegion;
+        if (!region.isSource && oneWay) { return; }
+        TransferPane p = region.pane;
+        List<T> data = region.isSource ? source : target;
+        StyleBox header = Style.Part(app, "transfer", "header", "", Class, "", Style.SNormal());
+        int fs = header.FontOr(Style.FontFallback(app, "small"));
+        int pad = app.theme.paddingMedium;
+        int hx = region.bx + pad;
+        int selectW = app.Scale(16) + app.Scale(6) + Canvas.MeasureText(selectAllText, fs);
+        if (e.x >= hx && e.x < hx + selectW) {
+            List<int> order = this.Order(p, data);
+            int selected = 0;
+            for (int k = 0; k < order.Count; k++) { if (p.flags[order[k]]) { selected++; } }
+            bool value = selected < order.Count;
+            for (int k = 0; k < order.Count; k++) { p.flags[order[k]] = value; }
+            SelectChanged.PostS(this);
+            e.Handle();
+        } else if (!region.isSource) {
+            hx = hx + selectW + pad + Canvas.MeasureText(totalText + " " + Convert.ToString(data.Count) + " 项", fs) + pad;
+            if (e.x >= hx && e.x < hx + Canvas.MeasureText(clearText, fs)) {
+                this.ClearPane(p, data, true);
+                e.Handle();
+            }
+        }
+        if (e.handled) { this.Arrange(bx, by, bw, bh); app.NoteDamage(bx, by, bw, bh); }
+    }
+
+    public void SearchRegionChanged(TransferRegion<T> region) {
+        TransferPane p = region.pane;
+        if (p.search == null) { return; }
+        string live = p.search.GetText();
+        if (live != p.query) {
+            p.query = live;
+            p.scroll.Set(0);
+            this.Arrange(bx, by, bw, bh);
+            this.SyncRegion(region);
+        }
     }
 
     // 覆写：量出布局度量后给默认尺寸。
@@ -879,7 +952,7 @@ public class Transfer<T> : Control {
     // 覆写：在自身矩形内绘制双栏穿梭框并处理交互（见 Render）。
     public override void OnPaint(App app) {
         app = this.ResolveApp(app);
-        this.Render(app, bx, by, bw, bh);
+        this.PaintTransfer(app, bx, by, bw, bh);
     }
 
     // 覆写：公共事件之外提供 "Change"/"SelectChanged"。

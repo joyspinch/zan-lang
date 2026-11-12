@@ -1,0 +1,189 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+class ChildrenInput : Input {
+    public int Cancels;
+    public bool CancelAttached;
+    public weak App CancelHost;
+    public weak Control CancelDestination;
+    public ChildrenInput() : base() { }
+    public bool Retired() { return !this.isPressed && !this.isHovered; }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        Cancels = Cancels + 1;
+        CancelAttached = this.parent != null;
+        CancelHost = this.FindApp();
+        base.OnPointerCancel(e);
+        Control destination = CancelDestination;
+        CancelDestination = null;
+        if (destination != null) { destination.Children.Add(this); }
+    }
+}
+
+class ChildrenWitness {
+    public weak Control Owner;
+    public weak Control Child;
+    public ControlChildren View;
+    public IEnumerator<Control> Iterator;
+}
+
+class ControlChildrenLifecycleTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Event(App app, int kind, int x, int y, int key) {
+        app.ProcessOffscreenInput(kind, x, y, 0, key, 0, 0);
+    }
+    static void Layout(App app, Control root) {
+        root.UseApp(app);
+        root.MeasureTree(app);
+        root.Arrange(10, 10, 260, 180);
+        app.SetRootControl(root);
+    }
+    static void Arm(App app, ChildrenInput input) {
+        Event(app, 2, input.bx + 5, input.by + 5, 0);
+        input.Focus(app);
+        app.CapturePointer(input, true);
+        Check(input.IsFocused(app) && app.GetCapturedPointer() == input, "arm focus and capture");
+    }
+    static void Trees() {
+        App app = App.CreateOffscreen("children first", 320, 240);
+        App other = App.CreateOffscreen("children second", 320, 240);
+        ChildrenInput input = new ChildrenInput();
+        Control root = new Row() { Children = { new Column() { Children = { input } } } };
+        Control nested = root.Children[0];
+        Check(nested.parent == root && input.parent == nested, "natural nested initializer adopts each level");
+        Check(root.Children == root.Children, "facade is cached");
+        Layout(app, root);
+        Check(input.FindApp() == app && nested.FindApp() == app, "initializer descendants inherit App before paint");
+        Check(root.HitTest(input.bx + 5, input.by + 5) == input, "nested initializer participates in real hit testing");
+        Arm(app, input);
+        Event(app, 6, 0, 0, 65);
+        Check(input.GetText() == "A", "nested editor receives routed text before paint");
+        Check(nested.Children.Remove(input), "facade removes existing child");
+        Check(input.Cancels == 1 && input.CancelAttached && input.CancelHost == app, "cancel routes before detachment");
+        Check(input.parent == null && input.FindApp() == null && !input.IsFocused(app)
+            && app.GetCapturedPointer() == null && input.Retired(), "remove retires subtree input and host");
+        Check(!nested.Children.Remove(input) && !nested.Children.Remove(null), "remove absent and null is harmless");
+        nested.Children.Add(null);
+        Check(nested.Children.Count == 0, "Add null is harmless");
+        nested.Children.Add(input);
+        ChildrenInput sibling = new ChildrenInput();
+        nested.Children.Add(sibling);
+        int seen = 0;
+        foreach (Control child in nested.Children) {
+            Check(child == nested.Children[seen], "enumeration preserves child order");
+            seen = seen + 1;
+        }
+        Check(seen == 2, "foreach visits all children");
+        Layout(app, root);
+        Arm(app, input);
+        nested.Children.Clear();
+        Check(nested.Children.Count == 0 && input.parent == null && sibling.parent == null
+            && input.FindApp() == null && sibling.FindApp() == null, "Clear detaches all children");
+        Check(input.Cancels == 2 && app.GetCapturedPointer() == null && !input.IsFocused(app), "Clear retires focus capture and press");
+        nested.Children.Add(input);
+        Control destination = new Column();
+        root.Children.Add(destination);
+        Layout(app, root);
+        Arm(app, input);
+        destination.Children.Add(input);
+        Check(nested.Children.Count == 0 && destination.Children.Count == 1 && input.parent == destination
+            && input.FindApp() == app && input.Cancels == 3, "same App reparent retires input through old parent");
+        Check(app.GetCapturedPointer() == null && !input.IsFocused(app), "same App transfer cannot carry active input");
+        Control otherRoot = new Column();
+        Layout(other, otherRoot);
+        Layout(app, root);
+        Arm(app, input);
+        otherRoot.Children.Add(destination);
+        Check(root.Children.Count == 1 && destination.parent == otherRoot && input.FindApp() == other
+            && input.Cancels == 4 && input.CancelHost == app, "cross App subtree transfer retires old host before inheritance");
+        Check(app.GetCapturedPointer() == null && !input.IsFocused(app) && other.GetCapturedPointer() == null,
+            "cross App transfer cannot migrate capture or focus");
+        Layout(other, otherRoot);
+        input.Focus(other);
+        Event(other, 6, 0, 0, 66);
+        Check(input.GetText() == "AB", "transferred nested editor receives new host input before paint");
+        List<Control> fluentItems = new List<Control>();
+        fluentItems.Add(new Control());
+        Row fluentRow = new Row();
+        fluentRow.Children(fluentItems);
+        Column fluentColumn = new Column();
+        fluentColumn.Children(fluentItems);
+        Check(fluentColumn.ChildCount() == 1 && fluentRow.ChildCount() == 0
+            && fluentItems[0].parent == fluentColumn, "Row Column fluent methods retain adoption semantics");
+        otherRoot.Children.Clear();
+        Control third = new Column();
+        root.Children.Add(third);
+        root.Children.Add(destination);
+        destination.Children.Add(input);
+        Layout(app, root);
+        Arm(app, input);
+        int cancels = input.Cancels;
+        input.CancelDestination = otherRoot;
+        third.Children.Add(input);
+        Check(input.parent == otherRoot && input.FindApp() == other && otherRoot.Children.Count == 1
+            && third.Children.Count == 0 && destination.Children.Count == 0 && input.Cancels == cancels + 1,
+            "cancel reparent to third owner wins without double ownership or cancellation");
+        Layout(other, otherRoot);
+        Arm(other, input);
+        cancels = input.Cancels;
+        input.CancelDestination = third;
+        third.Children.Add(input);
+        Check(input.parent == third && third.Children.Count == 1 && otherRoot.Children.Count == 0
+            && input.FindApp() == app && input.Cancels == cancels + 1,
+            "cancel reparent to requested target is idempotent");
+        Layout(app, root);
+        Arm(app, input);
+        cancels = input.Cancels;
+        input.CancelDestination = otherRoot;
+        third.Children.Remove(input);
+        Check(input.parent == otherRoot && otherRoot.Children.Count == 1 && third.Children.Count == 0
+            && input.FindApp() == other && input.Cancels == cancels + 1,
+            "outer Remove preserves ownership installed by cancellation callback");
+        Layout(other, otherRoot);
+        Arm(other, input);
+        cancels = input.Cancels;
+        input.CancelDestination = third;
+        destination.InsertAt(0, input);
+        Check(input.parent == third && third.Children.Count == 1 && destination.Children.Count == 0
+            && otherRoot.Children.Count == 0 && input.FindApp() == app && input.Cancels == cancels + 1,
+            "InsertAt respects cancellation callback ownership");
+        third.Children.Add(input);
+        Check(third.Children.Count == 1, "same parent Add never duplicates a child");
+        otherRoot.Children.Clear();
+        app.SetRootControl(null);
+        other.SetRootControl(null);
+        app.DrainPosts();
+        other.DrainPosts();
+        while (true) { Action pending = Dispatcher.Take(); if (pending == null) { break; } pending(); }
+        app.canvas.Destroy();
+        other.canvas.Destroy();
+    }
+    static void Borrow(ChildrenWitness witness) {
+        Control owner = new Control() { Children = { new Control() } };
+        witness.Owner = owner;
+        witness.Child = owner.Children[0];
+        witness.View = owner.Children;
+        witness.Iterator = witness.View.GetEnumerator();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("frame", 2, 2);
+        Trees();
+        ChildrenWitness witness = new ChildrenWitness();
+        Borrow(witness);
+        Check(witness.Owner == null && witness.View.Count == 0, "cached facade and iterator do not retain owner");
+        Control orphan = new Control();
+        witness.View.Add(orphan);
+        witness.View.Add(null);
+        witness.View.Clear();
+        Check(witness.View.Count == 0 && orphan.parent == null && !witness.View.Remove(orphan), "dead owner facade mutations are harmless");
+        int empty = 0;
+        foreach (Control child in witness.View) { empty = empty + 1; }
+        Check(empty == 0, "dead owner enumeration is empty");
+        Check(witness.Iterator.MoveNext() && witness.Iterator.Current() == witness.Child, "snapshot retains children independently of owner");
+        witness.Iterator = null;
+        Check(witness.Child == null, "snapshot releases children after enumeration lifetime");
+        frame.canvas.Destroy();
+        Console.WriteLine("CONTROL_CHILDREN_LIFECYCLE_OK");
+    }
+}

@@ -41,7 +41,7 @@ public class Slider : Control {
     public Control hiThumbNode;
     // 值变化时触发（C# 风格：`s.Change += h;`）。
     public UiEvent Change;
-    // 拖拽/定位手势结束时触发（在滑块上松开指针）。
+    // 拖拽/定位手势正常松开时触发（捕获允许在控件外完成；取消不触发）。
     public UiEvent DragEnd;
     // 拖动步长（Naive UI step prop）。0 = 任意（默认）。
     public int step;
@@ -390,6 +390,10 @@ public class Slider : Control {
     }
 
     // 控件类型标识（序列化/设计器用）。
+    public override void CloneContentTo(Control target, CloneTreeFn clone) {
+        // Constructor and property replay recreate the generated parts.
+    }
+
     public override string Kind() { return "Slider"; }
 
     // 覆写：返回设计器属性清单（量程 / 值与高值 / 步长 / range、vertical、
@@ -488,84 +492,112 @@ public class Slider : Control {
         prefW = vertical ? 32 : 160;
     }
 
-    // 覆写：保留模式交互——基于自身盒模型与 CommonId 处理手势与键盘步进。
-    public override void OnPaint(App app) {
-        int id = this.CommonId();
-        SyncBinding();
-        app.focus.RegisterFocusable(id);
-        app.hitTester.RegisterRect(id, bx, by, bw, bh, 0);
-        bool disabled = this.IsDisabled();
-        bool changed = false;
-        int pnt = vertical ? app.mouseY : app.mouseX;
+    // Decorative children share the slider's input owner and focus.
+    public override Control HitTest(int x, int y, int pointerType) {
+        if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
+        return this;
+    }
+
+    private void EditValue(App app, int thumb, int value) {
+        bool high = range && thumb == 2;
+        if (value < minVal) { value = minVal; }
+        if (value > maxVal) { value = maxVal; }
+        if (high && value < model.Get()) { value = model.Get(); }
+        if (!high && range && value > hiModel.Get()) { value = hiModel.Get(); }
+        int current = high ? hiModel.Get() : model.Get();
+        lastEdited = high ? 2 : 1;
+        if (value == current) { return; }
+        if (high) { hiModel.Set(value); } else { model.Set(value); }
+        if (data != null) { data.Set(model.Get()); }
+        if (range && dataHigh != null) { dataHigh.Set(hiModel.Get()); }
+        Change.RaiseS(this);
+        app.RequestRedraw();
+    }
+
+    private void EditPointer(App app, RoutedEventArgs e) {
         int pos = vertical ? by : bx;
         int len = vertical ? bh : bw;
         if (len < 1) { len = 1; }
-        if (!disabled && Ui.PressedDown(app, id)) {
-            dragThumb = 1;
-            if (range) {
-                int dlo = pnt - this.PxAt(this.FracOf(model.Get()), pos, len);
-                if (dlo < 0) { dlo = 0 - dlo; }
-                int dhi = pnt - this.PxAt(this.FracOf(hiModel.Get()), pos, len);
-                if (dhi < 0) { dhi = 0 - dhi; }
-                if (dhi < dlo) { dragThumb = 2; }
-            }
+        this.EditValue(app, dragThumb, this.ValAt(vertical ? e.y : e.x, pos, len));
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || this.IsDisabled() || app == null || app.window.EventButton() != 0) { return; }
+        this.SyncBinding();
+        dragThumb = 1;
+        int pos = vertical ? by : bx;
+        int len = vertical ? bh : bw;
+        int point = vertical ? e.y : e.x;
+        if (range) {
+            int lowDistance = point - this.PxAt(this.FracOf(model.Get()), pos, len);
+            int highDistance = point - this.PxAt(this.FracOf(hiModel.Get()), pos, len);
+            if (lowDistance < 0) { lowDistance = 0 - lowDistance; }
+            if (highDistance < 0) { highDistance = 0 - highDistance; }
+            if (highDistance < lowDistance) { dragThumb = 2; }
         }
-        if (!disabled && dragThumb > 0 && app.pointerDown) {
-            int nv = this.ValAt(pnt, pos, len);
-            if (dragThumb == 2) {
-                if (nv < model.Get()) { nv = model.Get(); }
-                if (nv != hiModel.Get()) {
-                    hiModel.Set(nv);
-                    changed = true;
-                    app.RequestRedraw();
-                }
-                lastEdited = 2;
-            } else {
-                if (range && nv > hiModel.Get()) { nv = hiModel.Get(); }
-                if (nv != model.Get()) {
-                    model.Set(nv);
-                    changed = true;
-                    app.RequestRedraw();
-                }
-                lastEdited = 1;
-            }
-        }
-        if (Ui.MouseUpOn(app, id) || !app.pointerDown) {
-            dragThumb = 0;
-        }
-        // 键盘方向键微调
-        if (!disabled && keyboard && Ui.Focused(app, id) && app.EventKind() == 4) {
-            int kc = app.window.EventKeyCode();
-            bool hi = range && lastEdited == 2;
-            int cur = hi ? hiModel.Get() : model.Get();
-            int v = cur;
-            if (kc == 37 || kc == 40) { v = this.StepDownVal(cur); }
-            if (kc == 39 || kc == 38) { v = this.StepUpVal(cur); }
-            if (kc == 36) { v = minVal; }
-            if (kc == 35) { v = maxVal; }
-            if (v < minVal) { v = minVal; }
-            if (v > maxVal) { v = maxVal; }
-            if (v != cur) {
-                if (hi) {
-                    if (v < model.Get()) { v = model.Get(); }
-                    hiModel.Set(v);
-                } else {
-                    if (range && v > hiModel.Get()) { v = hiModel.Get(); }
-                    model.Set(v);
-                }
-                changed = true;
-                app.RequestRedraw();
-            }
-        }
-        if (changed) {
-            if (data != null) { data.Set(model.Get()); }
-            if (range && dataHigh != null) { dataHigh.Set(hiModel.Get()); }
-            Change.RaiseS(this);
+        base.OnPointerDown(e);
+        app.focus.SetFocused(this.WidgetId());
+        app.CapturePointer(this, true);
+        this.EditPointer(app, e);
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || dragThumb == 0 || app == null || app.GetCapturedPointer() != this) { return; }
+        if (this.IsDisabled()) { this.OnPointerCancel(e); return; }
+        this.SyncBinding();
+        this.EditPointer(app, e);
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || dragThumb == 0 || app == null || app.window.EventButton() != 0) { return; }
+        bool complete = !this.IsDisabled() && app.GetCapturedPointer() == this;
+        if (complete) {
             this.SyncBinding();
+            this.EditPointer(app, e);
+            complete = dragThumb > 0 && !this.IsDisabled() && app.GetCapturedPointer() == this;
         }
-        DragEnd.RaiseIfS(Ui.MouseUpOn(app, id), this);
-        if (this.On.Any()) {
-            On.Fire(app, id, this);
+        base.OnPointerUp(e);
+        dragThumb = 0;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        if (complete) { DragEnd.RaiseS(this); }
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        dragThumb = 0;
+        App app = this.FindApp();
+        if (app != null) {
+            if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+            app.RequestRedraw();
         }
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || this.IsDisabled() || !keyboard || app == null || !this.IsFocused(app)) { return; }
+        int key = e.keyCode;
+        if (key != 37 && key != 40 && key != 39 && key != 38 && key != 36 && key != 35) { return; }
+        this.SyncBinding();
+        int thumb = range && lastEdited == 2 ? 2 : 1;
+        int value = thumb == 2 ? hiModel.Get() : model.Get();
+        if (key == 37 || key == 40) { value = this.StepDownVal(value); }
+        if (key == 39 || key == 38) { value = this.StepUpVal(value); }
+        if (key == 36) { value = minVal; }
+        if (key == 35) { value = maxVal; }
+        this.EditValue(app, thumb, value);
+        e.Handle();
+    }
+
+    // Retained children paint the track, fill and thumbs; input precedes paint.
+    public override void OnPaint(App app) {
+        if (!this.IsDisabled()) { app.focus.RegisterFocusable(this.WidgetId()); }
     }
 }

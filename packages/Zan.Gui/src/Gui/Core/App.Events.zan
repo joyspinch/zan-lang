@@ -20,6 +20,18 @@ public partial class App {
     }
 
     bool ProcessEvent() {
+        App previousLoopRoot = this.loopTurnRoot;
+        int loopTurn = this.BeginLoopTurn();
+        App currentLoopRoot = this.loopTurnRoot;
+        try {
+            return this.ProcessEventCore();
+        } finally {
+            try { this.EndLoopTurnForRoot(loopTurn, currentLoopRoot); }
+            finally { this.loopTurnRoot = previousLoopRoot; }
+        }
+    }
+
+    bool ProcessEventCore() {
         // 推进活动的自动化脚本（注入合成事件，
         // 由同一循环随后轮询并分发）。未启用驱动时为空操作。
         UiDriver.Tick();
@@ -30,6 +42,8 @@ public partial class App {
         int result;
         int loopT0 = 0;
         int loopPath = 2;
+        int participantDeadline = this.MinLoopDeadline();
+        participantDeadline = ChildWindows.LoopDeadline(this, participantDeadline);
         if (App.PerfOn()) { loopT0 = Window.GetTickMs(); }
         if (needsRedraw || pollPending) {
             bool explicitPoll = pollPending;
@@ -40,6 +54,11 @@ public partial class App {
             if (result == 1 && needsRedraw && !explicitPoll) {
                 int wait = window.RequestDisplayFrame()
                     ? 100 : frameCadence.WaitMilliseconds(Stopwatch.GetMicroseconds());
+                if (participantDeadline >= 0) {
+                    int participantWait = participantDeadline - Window.GetTickMs();
+                    if (participantWait < 0) { participantWait = 0; }
+                    if (participantWait < wait) { wait = participantWait; }
+                }
                 if (wait > 0) { result = window.WaitEventTimeout(wait); }
             } else if (result == 1 && !needsRedraw && !explicitPoll) {
                 // 只有"要求轮询"没有"挂起重绘"（自动化驱动在等时间
@@ -49,6 +68,7 @@ public partial class App {
                 int now = Window.GetTickMs();
                 int slice = 8;
                 int dl = animNextMs;
+                if (participantDeadline >= 0 && (dl < 0 || participantDeadline < dl)) { dl = participantDeadline; }
                 if (dl < 0 || (wakeNextMs >= 0 && wakeNextMs < dl)) { dl = wakeNextMs; }
                 if (dl < 0 || (wakeFrameNextMs >= 0 && wakeFrameNextMs < dl)) { dl = wakeFrameNextMs; }
                 if (dl < 0 || (fxNextMs >= 0 && fxNextMs < dl)) { dl = fxNextMs; }
@@ -60,11 +80,12 @@ public partial class App {
                 result = window.WaitEventTimeout(slice);
             }
         } else if (animNextMs >= 0 || wakeNextMs >= 0
-                   || wakeFrameNextMs >= 0 || fxNextMs >= 0) {
+                   || wakeFrameNextMs >= 0 || fxNextMs >= 0 || participantDeadline >= 0) {
             loopPath = 1;
             // 先取出输入/生命周期事件，到期帧在 Surface 和输入处理后兑现。
             int now = Window.GetTickMs();
             int deadline = animNextMs;
+            if (participantDeadline >= 0 && (deadline < 0 || participantDeadline < deadline)) { deadline = participantDeadline; }
             if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) {
                 deadline = wakeNextMs;
             }
@@ -166,21 +187,8 @@ public partial class App {
         this.SyncSurface();
         this.PerfMark("sh.surface");
 
-        bool vtHandled = false;
-        if (kind == 1 || kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 13) {
-            int ex = window.EventX();
-            int ey = window.EventY();
-            int ek = window.EventKeyCode();
-            int ed = (kind == 13) ? window.EventKeyCode() : 0;
-            int pType = this.currentPointerType;
-            if (window.EventFlag() == 1) {
-                pType = 1; // Touch 触控标记驱动
-            }
-            vtHandled = this.DispatchVisualTree(kind, ex, ey, ek, ed, pType);
-            if (vtHandled) {
-                needsRedraw = true;
-            }
-        }
+        this.DispatchWindowInput(kind);
+        if (this.ConsumeRoutedInput(kind)) { return true; }
 
         // 失焦（kind 9）需要渲染一帧：打开中的浮层（右键菜单、
         // 下拉）在渲染阶段才能看到失焦并自行关闭。失焦也意味着
@@ -266,7 +274,7 @@ public partial class App {
                 hitTester.ClearAnchor(0);
             } else {
                 focus.SetPressed(hitId);
-                focus.SetFocused(hitId);
+                if (!routedFocusAssigned) { focus.SetFocused(hitId); }
                 hitTester.ClearAnchor(2);
                 hitTester.ClearAnchor(3);
                 rightPressTargetId = -1;
@@ -448,6 +456,19 @@ public partial class App {
     // hwnd，再通过 ApplyEvent 把事件提供给每个 App。
     // 若本窗口收到关闭事件则返回 false。
     bool ApplyEvent(nint evHwnd) {
+        if (evHwnd != window.GetHandle()) { return true; }
+        App previousLoopRoot = this.loopTurnRoot;
+        int loopTurn = this.BeginLoopTurn();
+        App currentLoopRoot = this.loopTurnRoot;
+        try {
+            return this.ApplyEventCore(evHwnd);
+        } finally {
+            try { this.EndLoopTurnForRoot(loopTurn, currentLoopRoot); }
+            finally { this.loopTurnRoot = previousLoopRoot; }
+        }
+    }
+
+    bool ApplyEventCore(nint evHwnd) {
         bool mine = evHwnd == window.GetHandle();
         int kind = this.NormalizedKind();
         // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
@@ -511,6 +532,9 @@ public partial class App {
                 needsRedraw = true;
             }
         }
+
+        this.DispatchWindowInput(kind);
+        if (this.ConsumeRoutedInput(kind)) { return true; }
 
         // 失焦（kind 9）需要渲染一帧，让打开中的浮层自行关闭
         // （与 ProcessEvent 相同的约定）。
@@ -577,7 +601,7 @@ public partial class App {
                 hitTester.ClearAnchor(0);
             } else {
                 focus.SetPressed(hitId);
-                focus.SetFocused(hitId);
+                if (!routedFocusAssigned) { focus.SetFocused(hitId); }
                 // 主键按下作废上一次右键解析出的目标：否则被右键
                 // 点过的控件会一直认为自己是次要目标，之后在别处的
                 // 每一次点击它都会跟着响应（树行被莫名展开/折叠）。

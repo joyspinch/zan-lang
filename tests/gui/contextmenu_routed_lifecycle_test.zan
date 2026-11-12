@@ -1,0 +1,291 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class MenuState {
+    public int Calls;
+    public int Notices;
+    public int Underlying;
+    public weak App Host;
+    public weak ContextMenu Third;
+    public void Selected() {
+        Calls = Calls + 1;
+        ContextMenu next = Third;
+        if (next != null) { next.ShowAt(Host, 80, 40); }
+    }
+    public void Notified() { Notices = Notices + 1; }
+    public void RootClicked() { Underlying = Underlying + 1; }
+}
+class MenuWitness {
+    public weak App Host;
+    public weak ContextMenu Menu;
+    public weak MenuState State;
+    public Control Button;
+}
+class ReentrantMenu : ContextMenu {
+    public weak ContextMenu Next;
+    public weak App Host;
+    public bool ReopenOnCancel;
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        if (ReopenOnCancel) {
+            ReopenOnCancel = false;
+            this.ShowAt(Host, 40, 40);
+        }
+    }
+    public override void OnPopupDismissed() {
+        base.OnPopupDismissed();
+        ContextMenu next = Next;
+        Next = null;
+        if (next != null) { next.ShowAt(Host, 30, 30); }
+    }
+}
+class ContextMenuRoutedLifecycleTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Event(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static void Click(App app, Control control) {
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        Event(app, 2, x, y, 0, 0);
+        Event(app, 3, x, y, 0, 0);
+        Drain(app);
+    }
+    static void Paint(App app) {
+        app.BeginOffscreenFrame();
+        app.overlayHost.RenderAll(app);
+        app.overlayHost.RenderAll(app);
+        app.EndOffscreenFrame();
+    }
+    static ContextMenu Simple(MenuState state) {
+        ContextMenu menu = new ContextMenu();
+        menu.AddItem("Select\tCtrl+S", state.Selected);
+        menu.ActionSelected.Add(state.Notified);
+        return menu;
+    }
+    static void Exercise() {
+        App app = App.CreateOffscreen("menu first", 420, 340);
+        App other = App.CreateOffscreen("menu second", 420, 340);
+        MenuState state = new MenuState();
+        Button root = new Button("underlying");
+        root.Click.Add(state.RootClicked);
+        root.UseApp(app);
+        root.MeasureTree(app);
+        root.Arrange(0, 0, 420, 340);
+        app.SetRootControl(root);
+        ContextMenu menu = Simple(state);
+        menu.AddItem(MenuItem.Disabled("Disabled", "lock", 9));
+        menu.AddSeparator();
+        menu.AddItem(MenuItem.Header("Group"));
+        menu.AddItem(MenuItem.DangerShortcut("Delete", "trash", "Del", 42));
+        Check(menu.Children.Count == 0, "Add does not rebuild the tree for every item");
+        menu.UseApp(app);
+        menu.MeasureTree(app);
+        Control first = menu.Children[0];
+        menu.MeasureTree(app);
+        Check(menu.Children[0] == first && first.parent == menu && first.FindApp() == app,
+            "existing retained measurement builds once and adopts the tree");
+        Button danger = (Button)menu.Children[4];
+        Check(danger.Children.Count == 3 && danger.Children[0] is IconView
+            && ((Label)danger.Children[2]).Text.Get() == "Del" && Style.Has(danger.Class, "error"),
+            "rich item retains icon shortcut and danger presentation");
+        Event(app, 2, 15, 15, 1, 0);
+        menu.ShowAt(app, 400, 330);
+        Check(menu.bx >= 0 && menu.by >= 0 && menu.bx + menu.bw <= 420 && menu.by + menu.bh <= 340,
+            "point popup clamps right and bottom edges");
+        Event(app, 3, first.bx + 4, first.by + 4, 1, 0);
+        Drain(app);
+        Check(state.Calls == 0 && menu.IsOpen(), "opening right release cannot select an item");
+        Click(app, menu.Children[1]);
+        Click(app, menu.Children[2]);
+        Click(app, menu.Children[3]);
+        Check(menu.IsOpen() && state.Calls == 0 && menu.TakeAction() == -1,
+            "disabled separator and header cannot select");
+        Paint(app);
+        Check(menu.Children[0] == first && state.Calls == 0 && menu.IsOpen(), "paint does not rebuild or replay opening input");
+        Click(app, first);
+        Check(!menu.IsOpen() && state.Calls == 1 && state.Notices == 1
+            && menu.SelectedAction() == 0 && menu.TakeAction() == 0 && menu.TakeAction() == -1,
+            "actual routed click closes and publishes one result and notification");
+        Paint(app);
+        Check(state.Calls == 1 && state.Notices == 1, "paint cannot replay selection");
+        ContextMenu reusable = Simple(state);
+        int reusableCalls = state.Calls;
+        int reusableNotices = state.Notices;
+        reusable.ShowAt(app, 20, 20);
+        Click(app, reusable.Children[0]);
+        reusable.ShowAt(app, 20, 20);
+        Click(app, reusable.Children[0]);
+        Check(state.Calls == reusableCalls + 2 && state.Notices == reusableNotices + 2,
+            "persistent configured menu keeps callbacks across two openings");
+        ReentrantMenu reopening = new ReentrantMenu();
+        reopening.AddItem("Reopen", state.Selected);
+        reopening.ActionSelected.Add(state.Notified);
+        reopening.Host = app;
+        reopening.Next = reopening;
+        reopening.ShowAt(app, 20, 20);
+        int beforeReopen = state.Calls;
+        int beforeReopenNotice = state.Notices;
+        Click(app, reopening.Children[0]);
+        Check(app.overlayHost.ActiveRoot() == reopening && reopening.IsOpen()
+            && reopening.TakeAction() == -1 && reopening.SelectedAction() == -1
+            && state.Calls == beforeReopen && state.Notices == beforeReopenNotice,
+            "same instance reopened by close notification keeps fresh session result and callbacks");
+        Click(app, reopening.Children[0]);
+        Check(!reopening.IsOpen() && state.Calls == beforeReopen + 1
+            && state.Notices == beforeReopenNotice + 1 && reopening.TakeAction() == 0,
+            "reopened instance selects normally on later independent input");
+        ContextMenu callbackReopen = Simple(state);
+        state.Host = app;
+        state.Third = callbackReopen;
+        callbackReopen.ShowAt(app, 20, 20);
+        int callbackReopenNotices = state.Notices;
+        Click(app, callbackReopen.Children[0]);
+        Check(callbackReopen.IsOpen() && callbackReopen.TakeAction() == -1
+            && state.Notices == callbackReopenNotices,
+            "business callback reopening same instance suppresses obsolete notification");
+        state.Third = null;
+        app.overlayHost.Hide(callbackReopen);
+        ContextMenu outside = Simple(state);
+        outside.ShowAt(app, 40, 40);
+        Event(app, 2, 410, 330, 0, 0);
+        Event(app, 3, 410, 330, 0, 0);
+        Drain(app);
+        Check(!outside.IsOpen() && state.Underlying == 0, "outside Down and Up cannot penetrate root");
+        Click(app, root);
+        Check(state.Underlying == 1, "later independent input reaches root");
+        ContextMenu escape = Simple(state);
+        escape.ShowAt(app, -100, -100);
+        Check(escape.bx >= 0 && escape.by >= 0, "point popup clamps negative coordinates");
+        Event(app, 4, 0, 0, 0, 27);
+        Check(!escape.IsOpen() && !app.overlayHost.HasActive(), "Escape dismisses retained popup");
+        ContextMenu blur = Simple(state);
+        blur.ShowAt(app, 20, 20);
+        Event(app, 9, 0, 0, 0, 0);
+        Check(!blur.IsOpen() && !app.overlayHost.HasActive(), "kind9 dismisses retained popup");
+        ContextMenu third = new ContextMenu(); third.AddItem(MenuItem.Item("Third", "", 30));
+        ContextMenu callback = Simple(state);
+        state.Host = app; state.Third = third;
+        callback.ShowAt(app, 20, 20);
+        Click(app, callback.Children[0]);
+        Check(app.overlayHost.ActiveRoot() == third && !callback.IsOpen(), "selection callback may open a third menu");
+        app.overlayHost.Hide(callback);
+        Check(app.overlayHost.ActiveRoot() == third, "late old Hide cannot close new menu");
+        ContextMenu stale = Simple(state);
+        stale.ShowAt(app, 20, 20);
+        Control staleButton = stale.Children[0];
+        int calls = state.Calls;
+        staleButton.TriggerEvent("Click");
+        third.ShowAt(app, 80, 40);
+        Drain(app);
+        Check(state.Calls == calls && app.overlayHost.ActiveRoot() == third,
+            "queued old selection cannot call business code or close replacement");
+        stale.ShowAt(app, 20, 20);
+        staleButton.TriggerEvent("Click");
+        stale.ShowAt(app, 30, 30);
+        Drain(app);
+        Check(stale.IsOpen() && state.Calls == calls, "old opening token cannot select reopened same menu");
+        ContextMenu independent = new ContextMenu(); independent.AddItem(MenuItem.Item("Other", "", 77));
+        independent.ShowAt(other, 20, 20);
+        Check(app.overlayHost.ActiveRoot() == stale && other.overlayHost.ActiveRoot() == independent,
+            "two Apps own independent active menus");
+        Click(other, independent.Children[0]);
+        Check(independent.TakeAction() == 77 && app.overlayHost.ActiveRoot() == stale, "other App selection leaves first menu intact");
+        ReentrantMenu old = new ReentrantMenu(); old.AddItem(MenuItem.Item("Old", "", 1));
+        old.Host = app; old.Next = third;
+        old.ShowAt(app, 20, 20);
+        ContextMenu attempted = new ContextMenu(); attempted.AddItem(MenuItem.Item("Attempted", "", 2));
+        attempted.ShowAt(app, 50, 50);
+        Check(app.overlayHost.ActiveRoot() == third && !attempted.IsOpen(),
+            "replacement close callback owns newly opened menu without outer overwrite");
+        state.Third = null;
+        ReentrantMenu cancelReopen = new ReentrantMenu();
+        cancelReopen.AddItem(MenuItem.Item("Cancel reopen", "", 55));
+        cancelReopen.Host = app;
+        cancelReopen.ShowAt(app, 20, 20);
+        Control cancelButton = cancelReopen.Children[0];
+        Event(app, 2, cancelButton.bx + 5, cancelButton.by + 5, 0, 0);
+        Check(app.GetCapturedPointer() == cancelButton, "actual item Down captures before cancel-reopen");
+        cancelReopen.ReopenOnCancel = true;
+        app.overlayHost.Dismiss();
+        Check(cancelReopen.IsOpen() && app.overlayHost.ActiveRoot() == cancelReopen
+            && app.GetCapturedPointer() == null && cancelReopen.TakeAction() == -1,
+            "input retirement cancel may reopen same popup without stale close notification");
+        Click(app, cancelReopen.Children[0]);
+        Check(cancelReopen.TakeAction() == 55, "cancel-reopened popup receives later real selection");
+        app.overlayHost.Dismiss(); other.overlayHost.Dismiss();
+        app.SetRootControl(null);
+        Drain(app); Drain(other);
+        app.canvas.Destroy(); other.canvas.Destroy();
+    }
+    static void Borrow(MenuWitness witness) {
+        App app = App.CreateOffscreen("menu lifetime", 320, 240);
+        MenuState state = new MenuState();
+        ContextMenu menu = Simple(state);
+        witness.Host = app; witness.Menu = menu; witness.State = state;
+        menu.ShowAt(app, 10, 10);
+        witness.Button = menu.Children[0];
+        witness.Button.TriggerEvent("Click");
+        app.overlayHost.Dismiss();
+        Check(menu.ActionSelected.CountAll() == 1, "close preserves configured reusable notification");
+        app.canvas.Destroy();
+    }
+    static ContextMenu Configured(MenuWitness witness) {
+        MenuState state = new MenuState();
+        witness.State = state;
+        return Simple(state);
+    }
+    static void CrossAppReentry(bool migrate) {
+        App a = App.CreateOffscreen("cross a", 320, 240);
+        App b = App.CreateOffscreen("cross b", 320, 240);
+        App c = App.CreateOffscreen("cross c", 320, 240);
+        ReentrantMenu menu = new ReentrantMenu();
+        menu.AddItem(MenuItem.Item("cross pick", "", 77));
+        menu.ShowAt(a, 20, 20);
+        Control button = menu.Children[0];
+        Event(a, 2, button.bx + 5, button.by + 5, 0, 0);
+        Check(a.GetCapturedPointer() == button, "cross App probe starts with real capture");
+        App expected = migrate ? c : b;
+        menu.Host = expected;
+        menu.ReopenOnCancel = true;
+        if (migrate) { menu.ShowAt(b, 30, 30); }
+        else { a.overlayHost.Dismiss(); }
+        Check(menu.IsOpen() && menu.FindApp() == expected && expected.overlayHost.ActiveRoot() == menu
+            && a.overlayHost.ActiveRoot() == null && a.GetCapturedPointer() == null
+            && (migrate ? b.overlayHost.ActiveRoot() == null : c.overlayHost.ActiveRoot() == null),
+            "cancel cross App opening owns exactly one host and survives old dismissal/migration");
+        Event(a, 3, button.bx + 5, button.by + 5, 0, 0);
+        Check(menu.TakeAction() == -1, "old host release cannot select transferred menu");
+        Click(expected, menu.Children[0]);
+        Check(menu.TakeAction() == 77 && !menu.IsOpen() && !expected.overlayHost.HasActive(),
+            "cross App transferred menu handles fresh routed selection once");
+        a.overlayHost.Dismiss(); b.overlayHost.Dismiss(); c.overlayHost.Dismiss();
+        Drain(a); Drain(b); Drain(c);
+        a.canvas.Destroy(); b.canvas.Destroy(); c.canvas.Destroy();
+    }
+
+    static void Main() {
+        CrossAppReentry(false);
+        CrossAppReentry(true);
+        App frame = App.CreateOffscreen("frame", 2, 2);
+        Exercise();
+        MenuWitness witness = new MenuWitness();
+        Borrow(witness);
+        Check(witness.Host == null && witness.Menu == null && witness.State == null,
+            "orphan queued item borrows menu and closed menu releases callback owner");
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+        witness.Button = null;
+        ContextMenu retained = Configured(witness);
+        Check(witness.State != null, "configured callbacks share explicit menu lifetime");
+        retained.ClearCallbacks();
+        Check(witness.State == null && retained.ActionSelected.CountAll() == 0,
+            "ClearCallbacks retires business subscriptions while retaining menu");
+        frame.canvas.Destroy();
+        Console.WriteLine("CONTEXTMENU_ROUTED_LIFECYCLE_OK");
+    }
+}

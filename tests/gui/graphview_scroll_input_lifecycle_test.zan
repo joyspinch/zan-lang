@@ -1,0 +1,165 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+class GraphScrollWatch { public weak GraphView Graph; public weak Control Card; }
+class GraphRetirementCard : Control {
+    public weak Control Destination;
+    public weak GraphView Graph;
+    public bool Armed;
+    public GraphRetirementCard() : base("graph-retirement-card") { prefW = 100; prefH = 60; }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        if (!Armed) { return; }
+        Armed = false;
+        Control destination = Destination;
+        GraphView graph = Graph;
+        if (destination != null) { destination.Add(this); }
+        else if (graph != null) {
+            List<GraphNode> replacement = new List<GraphNode>();
+            replacement.Add(GraphNode.Of("replacement", "Replacement"));
+            graph.Bind(replacement); graph.Refresh();
+        }
+        this.visible = true;
+        this.Arrange(311, 127, 91, 43);
+    }
+}
+class GraphRetirementTemplate {
+    public Control Make(GraphNode node) { return new GraphRetirementCard(); }
+}
+class GraphScrollInputTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Input(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void Paint(App app, Control root) {
+        app.BeginOffscreenFrame(); root.RenderTree(app); root.RenderTree(app); app.EndOffscreenFrame();
+    }
+    static List<GraphNode> Nodes(int count) {
+        List<GraphNode> nodes = new List<GraphNode>();
+        for (int i = 0; i < count; i++) {
+            GraphNode node = GraphNode.Of("n" + i, "Node " + i);
+            if (i > 0) { node.After("n" + (i - 1)); }
+            nodes.Add(node);
+        }
+        return nodes;
+    }
+    static void Exercise(App app, GraphScrollWatch watch) {
+        GraphView graph = new GraphView();
+        watch.Graph = graph;
+        graph.Bind(Nodes(30)); graph.UseApp(app);
+        app.SetRootControl(graph);
+        graph.MeasureTree(app); graph.Arrange(10, 10, 240, 140);
+        Check(graph.Children.Count == 30 && graph.NodeAt(0).lh > 0, "cards and node rectangles exist before paint");
+        Control card = graph.Children[0]; watch.Card = card;
+        Check(card.parent == graph && card.FindApp() == app, "card belongs to real graph tree");
+        int beforeY = graph.NodeAt(0).ly;
+        int before = graph.ScrollTop();
+        Input(app, 13, 15, 80, 0, -120);
+        Check(graph.ScrollTop() > before && graph.NodeAt(0).ly < beforeY, "first wheel commits offset and node rectangles before paint: offset=" + graph.ScrollTop() + " before=" + before + " extent=" + graph.ScrollExtent() + " viewport=" + graph.ScrollViewport().height + " node=" + graph.NodeAt(0).ly + " beforeY=" + beforeY + " mode=" + graph.StyleOverflowY());
+        before = graph.ScrollTop(); beforeY = graph.NodeAt(0).ly;
+        Paint(app, graph);
+        Check(graph.ScrollTop() == before && graph.NodeAt(0).ly == beforeY, "double paint replays no input or layout");
+        graph.SetScrollTop(0);
+        ScrollState metrics = new ScrollState();
+        Rect view = graph.ScrollViewport();
+        Rect track = metrics.Track(app, view.x, view.y, view.width, view.height, false);
+        int x = track.x + track.width / 2;
+        int y = view.y + metrics.ThumbLength(app, view.height, graph.ScrollExtent()) / 2;
+        Check(graph.HitTest(x, y) == graph, "shared chrome wins hit testing over cards");
+        Input(app, 2, x, y, 0, 0);
+        Check(app.GetCapturedPointer() == graph && !graph.IsPanning(), "chrome capture never starts pan");
+        Input(app, 3, x, y + 50, 0, 0);
+        Check(graph.ScrollTop() > 0 && app.GetCapturedPointer() == null && !graph.IsPanning(), "final Up moves thumb and retires capture");
+        graph.SetScrollTop(0);
+        Input(app, 2, 12, 25, 0, 0);
+        Check(graph.IsPanning() && app.GetCapturedPointer() == graph, "background primary Down starts captured pan");
+        Input(app, 3, 40, 55, 0, 0);
+        Check(!graph.IsPanning() && app.GetCapturedPointer() == null && graph.panX == 28 && graph.panY == 30,
+            "pan uses final Up even without intervening Move");
+        graph.panX = 0; graph.panY = 0; graph.Arrange(10, 10, 240, 140);
+        Input(app, 2, 12, 25, 0, 0);
+        graph.Disabled = true;
+        Input(app, 1, 32, 45, 0, 0);
+        Check(!graph.IsPanning() && app.GetCapturedPointer() == null && graph.panX == 0 && graph.panY == 0,
+            "disabled next real Move cancels without committing Pan");
+        graph.Disabled = false;
+        Input(app, 2, 12, 25, 0, 0);
+        graph.visible = false;
+        Input(app, 1, 32, 45, 0, 0);
+        Check(!graph.IsPanning() && app.GetCapturedPointer() == null && graph.panX == 0 && graph.panY == 0,
+            "hidden next real Move cancels without committing Pan");
+        graph.visible = true;
+        Input(app, 2, 12, 25, 0, 0);
+        app.ReleaseInputSubtree(graph);
+        Check(!graph.IsPanning() && app.GetCapturedPointer() == null, "explicit subtree Cancel retires Pan");
+        graph.Arrange(10, 10, 240, 140);
+        Input(app, 2, x, y, 0, 0);
+        graph.Bind(Nodes(1)); graph.Refresh(); graph.MeasureTree(app); graph.Arrange(10, 10, 240, 140);
+        Check(graph.ScrollTop() == 0 && app.GetCapturedPointer() == null, "range shrink cancels chrome and clamps offset");
+        graph.Bind(Nodes(30)); graph.MeasureTree(app); graph.Arrange(10, 10, 240, 140);
+        graph.SetScrollTop(0);
+        Control nested = new Control();
+        nested.SetProp("style", "overflow:auto;display:block");
+        app.SetRootControl(null); nested.Add(graph);
+        Control filler = new Control(); filler.SetProp("style", "height:500px;width:100px"); nested.Add(filler);
+        nested.UseApp(app); nested.MeasureTree(app); nested.Arrange(0, 0, 260, 200);
+        graph.Arrange(10, 10, 240, 140); app.SetRootControl(nested);
+        graph.SetScrollTop(graph.ScrollExtent() - graph.ScrollViewport().height);
+        before = graph.ScrollTop();
+        Input(app, 13, 15, 80, 0, -120);
+        Check(graph.ScrollTop() == before && nested.ScrollTop() > 0, "graph bottom wheel bubbles to parent");
+        app.SetRootControl(null);
+    }
+    static void RetirementCallback(App app, bool migrate) {
+        App other = App.CreateOffscreen("Graph card destination", 640, 480);
+        Control destination = new Control("destination");
+        destination.UseApp(other); destination.Arrange(0, 0, 640, 480); other.SetRootControl(destination);
+        GraphRetirementTemplate template = new GraphRetirementTemplate();
+        GraphView graph = new GraphView(template.Make);
+        graph.Bind(Nodes(30)); graph.UseApp(app); app.SetRootControl(graph);
+        graph.MeasureTree(app); graph.Arrange(10, 10, 240, 140);
+        GraphRetirementCard card = (GraphRetirementCard)graph.Children[0];
+        card.Graph = graph;
+        if (migrate) { card.Destination = destination; }
+        card.Armed = true;
+        int cx = card.bx + 8; int cy = card.by + 8;
+        Input(app, 2, cx, cy, 0, 0);
+        app.CapturePointer(card, true);
+        // The first card becomes offscreen; its real cancel mutates ownership or Bind version.
+        graph.SetScrollTop(graph.ScrollExtent() - graph.ScrollViewport().height);
+        Check(!card.Armed && card.visible && card.bx == 311 && card.by == 127
+            && card.bw == 91 && card.bh == 43,
+            "old Arrange stops before overwriting cancellation callback card layout/visibility");
+        if (migrate) {
+            Check(card.parent == destination && card.FindApp() == other && destination.IndexOf(card) >= 0,
+                "card moved to another App stays owned and arranged by its destination");
+        } else { Check(graph.NodeAt(0).id == "replacement", "cancel callback Bind replaces graph data"); }
+        Check(app.GetCapturedPointer() == null, "old capture retired before callback mutation");
+        app.SetRootControl(null); other.SetRootControl(null); other.canvas.Destroy();
+    }
+    static void NonPanUp(App app) {
+        GraphView graph = new GraphView(); graph.Bind(Nodes(1)); graph.UseApp(app);
+        app.SetRootControl(graph); graph.MeasureTree(app); graph.Arrange(10, 10, 240, 140);
+        Control card = graph.Children[0];
+        int x = card.bx + 8; int y = card.by + 8;
+        Input(app, 2, x, y, 0, 0);
+        Check(!graph.IsPanning() && graph.IsPressed(), "card Down bubbles base press without graph Pan");
+        Input(app, 3, x, y, 0, 0);
+        Check(!graph.IsPressed() && !graph.IsPanning(), "non-pan Up always clears graph base press");
+        app.SetRootControl(null);
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("independent Graph frame", 2, 2);
+        App app = App.CreateOffscreen("Graph shared scroll", 640, 480);
+        GraphScrollWatch watch = new GraphScrollWatch();
+        Exercise(app, watch);
+        Check(watch.Graph == null && watch.Card == null, "graph card event ownership releases before exit");
+        NonPanUp(app);
+        RetirementCallback(app, true);
+        RetirementCallback(app, false);
+        app.canvas.Destroy(); frame.canvas.Destroy();
+        Console.WriteLine("graphview_scroll_input_lifecycle: ok");
+    }
+}

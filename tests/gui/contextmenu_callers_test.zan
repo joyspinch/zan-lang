@@ -1,0 +1,97 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+class DockMenuWitness {
+    public weak DockHost Owner;
+    public weak ContextMenu Menu;
+}
+
+class ContextMenuCallersTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Click(App app, Control control) {
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        Check(control.bw > 0 && control.bh > 0, "menu row has painted geometry");
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        app.DrainPosts();
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { break; }
+            action();
+        }
+    }
+    static void Paint(App app) {
+        app.BeginOffscreenFrame();
+        app.overlayHost.RenderAll(app);
+        app.EndOffscreenFrame();
+    }
+    static void Exercise(App app, DockMenuWitness witness) {
+        DockHost dock = new DockHost();
+        dock.RegisterFixed("main", "Main");
+        dock.Register("a", "Alpha", DockSide.Left(), true, false);
+        dock.Register("b", "Beta", DockSide.Left(), true, false);
+        dock.Close("a");
+        dock.Close("b");
+        dock.OpenMenu(app, 890, 690);
+        ContextMenu menu = (ContextMenu)app.overlayHost.ActiveRoot();
+        Check(menu != null && menu.IsOpen() && menu.items.Count == 2, "real DockHost opens retained menu");
+        Paint(app);
+        Check(menu.bx >= 0 && menu.by >= 0 && menu.bx + menu.bw <= app.canvas.Width()
+            && menu.by + menu.bh <= app.canvas.Height(), "actual dock menu clamps to viewport");
+        dock.Show("a");
+        Control beta = menu.Children[1];
+        Click(app, beta);
+        Check(!dock.IsHidden("b") && !menu.IsOpen(), "selection restores snapshot panel before repaint");
+        dock.Close("a");
+        dock.OpenMenu(app, 30, 30);
+        Check(app.overlayHost.ActiveRoot() == menu, "dock reuses retained menu");
+        Paint(app);
+        Control oldRow = menu.Children[0];
+        app.ProcessOffscreenInput(4, 0, 0, 0, 27, 0, 0);
+        Check(!menu.IsOpen() && dock.IsHidden("a"), "Escape closes without restoring panel");
+        dock.OpenMenu(app, 30, 30);
+        Paint(app);
+        oldRow.Click.RaiseS(oldRow);
+        Check(menu.IsOpen() && dock.IsHidden("a"), "stale prior session row cannot restore a panel");
+        app.ProcessOffscreenInput(2, 800, 600, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 800, 600, 0, 0, 0, 0);
+        Check(!menu.IsOpen() && dock.IsHidden("a"), "outside click closes without business action");
+        dock.OpenMenu(app, 30, 30);
+        Paint(app);
+        Control closing = menu.Children[0];
+        closing.Focus(app);
+        app.CapturePointer(closing);
+        int qx = closing.bx + closing.bw / 2;
+        int qy = closing.by + closing.bh / 2;
+        app.ProcessOffscreenInput(2, qx, qy, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, qx, qy, 0, 0, 0, 0);
+        dock.ReleaseControls();
+        app.DrainPosts();
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { break; }
+            action();
+        }
+        Check(dock.IsHidden("a"), "queued action cannot outlive released dock menu session");
+        Check(!menu.IsOpen() && app.GetCapturedPointer() == null && !closing.IsFocused(app),
+            "dock release closes menu input lifetime");
+        dock.OpenMenu(app, 30, 30);
+        Paint(app);
+        witness.Owner = dock;
+        witness.Menu = menu;
+    }
+    static void Main() {
+        App app = App.CreateOffscreen("Menu callers", 900, 700);
+        DockMenuWitness witness = new DockMenuWitness();
+        Exercise(app, witness);
+        Check(witness.Owner == null, "active retained menu cannot retain dock owner");
+        app.overlayHost.Dismiss();
+        Check(witness.Menu == null, "dismissed dock menu releases before process exit");
+        app.canvas.Destroy();
+        Console.WriteLine("dock menu snapshot / routed selection / stale session / close / weak owner: ok");
+        Console.WriteLine("contextmenu_callers: ok");
+    }
+}

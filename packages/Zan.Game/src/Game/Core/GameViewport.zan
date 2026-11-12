@@ -15,6 +15,7 @@ public delegate void HudRenderFn(Canvas canvas, int width, int height);
 public class GameViewport : Control {
     public Scene activeScene;
     public InputMapper input;
+    Action afterLogicStep;
     public HudRenderFn onRenderHudCallback;
     public bool autoDriveClock;
     // 经 GuiHost.AttachViewport 挂载后为 true：逻辑由宿主帧循环的
@@ -29,12 +30,14 @@ public class GameViewport : Control {
     // 帧照常重渲染，插值平滑不受影响。表面与宿主画布同为 32bpp。
     public Canvas off;
     public int offWorldGen;
+    Scene offScene;
     public bool offValid;
 
     public GameViewport(Scene scene, int dockMode) {
         this.InitControl("game_viewport", dockMode > 0 ? dockMode : 5);  // 默认 dock=5 铺满剩余空间
         this.activeScene = scene;
         this.input = InputMapper.Create();
+        this.afterLogicStep = this.input.FlushFrameEvents;
         this.onRenderHudCallback = null;
         // 渲染与逻辑严格解耦架构：
         // 默认 autoDriveClock 为 false，渲染帧仅负责提交世界与 HUD 画面；
@@ -50,7 +53,14 @@ public class GameViewport : Control {
         return new GameViewport(scene, 5);
     }
 
-    public Scene CurrentScene { get { return activeScene; } set { activeScene = value; } }
+    public Scene CurrentScene {
+        get { return activeScene; }
+        set {
+            if (activeScene == value) { return; }
+            activeScene = value;
+            offValid = false;
+        }
+    }
     public InputMapper Input { get { return input; } }
     public bool AutoDriveClock { get { return autoDriveClock; } set { autoDriveClock = value; } }
 
@@ -69,11 +79,71 @@ public class GameViewport : Control {
     // 渲染帧率）。经 GuiHost.AttachViewport 挂载的视口由宿主自动调用。
     public void StepLogic() {
         if (activeScene != null) {
-            activeScene.Tick();
+            // 回调持久缓存，不在帧内分配；零步保留、首个实际逻辑步后清边沿。
+            activeScene.Tick(this.afterLogicStep);
         }
-        if (input != null) {
-            input.FlushFrameEvents();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (this.IsDisabled() || !this.StyleVisible()) { this.OnInputFocusLost(); return; }
+        this.input.OnMouseMove(e.x - this.bx, e.y - this.by);
+        e.Handle();
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        if (this.IsDisabled() || !this.StyleVisible()) { return; }
+        App app = this.App;
+        if (app == null) { return; }
+        int button = app.window.EventButton();
+        if (button != 0 && button != 1) { return; }
+        this.Focus(app);
+        Control popup = app.overlayHost != null ? app.overlayHost.ActiveRoot() : null;
+        Control inputRoot = popup != null ? popup : app.rootControl;
+        if (this.App != app || !this.IsFocused(app) || this.IsDisabled() || !this.StyleVisible()
+            || inputRoot == null || !inputRoot.ContainsInputControl(this)) { return; }
+        this.input.OnMouseMove(e.x - this.bx, e.y - this.by);
+        this.input.OnMouseButton(button, true);
+        app.CapturePointer(this, true);
+        this.isPressed = true;
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null) { return; }
+        this.input.OnMouseMove(e.x - this.bx, e.y - this.by);
+        this.input.OnMouseButton(app.window.EventButton(), false);
+        if (!this.input.IsLeftDown && !this.input.IsRightDown) {
+            if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+            this.isPressed = false;
         }
+        e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        this.input.CancelPointer();
+        App app = this.App;
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        e.Handle();
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        if (this.IsDisabled() || !this.StyleVisible()) { return; }
+        this.input.OnKeyDown(e.keyCode);
+        e.Handle();
+    }
+
+    public override void OnKeyUp(RoutedEventArgs e) {
+        this.input.OnKeyUp(e.keyCode);
+        e.Handle();
+    }
+
+    public override void OnInputFocusLost() {
+        this.input.ReleaseAll();
+        this.isPressed = false;
+        App app = this.App;
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
     }
 
     public override void OnMeasure(App app) {
@@ -84,6 +154,7 @@ public class GameViewport : Control {
 
     public override void OnPaint(App app) {
         base.OnPaint(app);
+        if (!this.IsDisabled()) { app.focus.RegisterFocusable(this.WidgetId()); }
         if (activeScene == null) { return; }
 
         Canvas c = app.canvas;
@@ -97,7 +168,7 @@ public class GameViewport : Control {
         // 2. 推进游戏时钟步进与实体物理（兼容单管线简易模式；
         // 挂宿主或外部定时驱动则走 StepLogic，渲染帧不推进逻辑）
         if (autoDriveClock && !hostDriven) {
-            activeScene.Tick();
+            this.StepLogic();
         }
 
         // 3. 世界渲染进持久离屏表面，再整块贴到宿主画布。
@@ -109,10 +180,12 @@ public class GameViewport : Control {
                 || this.off.Height() != this.bh) {
                 this.RecreateOff(this.bw, this.bh);
             }
-            if (!this.offValid || activeScene.WorldGen() != this.offWorldGen) {
+            if (!this.offValid || activeScene != this.offScene
+                || activeScene.WorldGen() != this.offWorldGen) {
                 this.off.Clear(-16777216);
                 activeScene.Render(this.off);
                 this.offWorldGen = activeScene.WorldGen();
+                this.offScene = activeScene;
                 this.offValid = true;
             }
             c.BlitSurface(this.off, this.bx, this.by, 0, 0, this.bw, this.bh);
@@ -124,11 +197,6 @@ public class GameViewport : Control {
             onRenderHudCallback(c, this.bw, this.bh);
         }
 
-        // 5. 刷新单帧输入击发事件（单管线简易模式；挂宿主后由 StepLogic 刷新，
-        // 避免一帧多次 OnPaint 把还没读到的输入边沿提前清掉）
-        if (autoDriveClock && !hostDriven) {
-            input.FlushFrameEvents();
-        }
     }
 
     // 重建离屏表面（首帧或视口尺寸变化）。先建新再销旧，

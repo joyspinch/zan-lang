@@ -9,6 +9,9 @@ public partial class App {
     FocusManager focus;
     HitTester hitTester;
     bool isRunning;
+    // Native queue delegates own the work; the App only indexes pending work.
+    weak AppPostWork postHead;
+    weak AppPostWork postTail;
     bool needsRedraw;
     // 「别阻塞等事件，这一圈就回来」——与 needsRedraw 不同，它不
     // 声称有像素变了。自动化驱动、外部泵这类需要循环持续转的
@@ -273,6 +276,8 @@ public partial class App {
     List<OverlayPopup> overlays;
     public OverlayHost overlayHost;
     public object layerContext;
+    // 由 Ribbon 惰性创建，随 App 交由 ARC 回收；Core 不依赖 Widget 状态类型。
+    public object ribbonContext;
 
     // 本帧登记的原生浮层（WebView 等 OS 兄弟层）与遮挡区。原生视图
     // 永远画在软件画布之上，所以它们不自己决定可见性，而是登记
@@ -513,6 +518,7 @@ public partial class App {
     }
 
     public App(string title, int width, int height, bool physicalStage, bool offscreen) {
+        if (!offscreen) { Dispatcher.EnsureInitialized(); }
         this.physicalStage = physicalStage;
         if (offscreen) {
             this.window = Window.Offscreen(width, height);
@@ -526,6 +532,7 @@ public partial class App {
         this.InitSkinning();
         this.InitAnimation();
         this.focus = new FocusManager();
+        this.focus.BindApp(this);
         this.hitTester = new HitTester();
         this.hitTester.BindFocus(this.focus);
         this.isRunning = true;
@@ -590,6 +597,7 @@ public partial class App {
         this.overlays = new List<OverlayPopup>();
         this.overlayHost = new OverlayHost();
         this.layerContext = null;
+        this.ribbonContext = null;
         this.nativeLayers = new List<NativeLayerReq>();
         this.nativeOccluders = new List<int>();
         this.hitOnlyBlockers = new List<int>();
@@ -738,9 +746,6 @@ public partial class App {
         this.bgSnapGen = 0;
         this.metricsScale = 1000;
         this.canvas = new Canvas(width, height);
-        // 预先（在 UI 线程上）重置 UI 线程分派队列，使
-        // 任何后台工作线程一产生，App.Post 就安全可用。
-        if (!offscreen) { Dispatcher.Init(); }
         // 每个窗口默认在标题栏获得内置皮肤选择器
         // （浅色窗口 -> 预选"Light"）。id 块
         // 现在分配，早于任何应用的 WidgetId.Mark，使选项 id 保持

@@ -1,0 +1,244 @@
+using System;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+class TreeLifecycleEditor : Input {
+    public int Cancels;
+    public bool AttachedAtCancel;
+    public weak Control Destination;
+    public weak Control HostOwner;
+    public weak App NextHost;
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        Cancels = Cancels + 1;
+        AttachedAtCancel = this.parent != null && this.FindApp() != null;
+        base.OnPointerCancel(e);
+        Control target = Destination;
+        Destination = null;
+        if (target != null) { target.Add(this); }
+        Control owner = HostOwner;
+        App host = NextHost;
+        HostOwner = null; NextHost = null;
+        if (owner != null && host != null) { owner.UseApp(host); }
+    }
+}
+
+class TreeHostSwapTemplate {
+    public weak TreeView Tree;
+    public weak App Destination;
+    public int Calls;
+    public Control Build(TreeNode node) {
+        Calls = Calls + 1;
+        TreeView tree = Tree;
+        App host = Destination;
+        Destination = null;
+        if (tree != null && host != null) { tree.UseApp(host); }
+        return new TreeLifecycleEditor();
+    }
+}
+
+class TreeRefreshWorker {
+    public weak TreeView Tree;
+    public AtomicInt Done = new AtomicInt(0);
+    public void Run() {
+        TreeView tree = Tree;
+        if (tree != null) { tree.Refresh(); }
+        Done.Store(1);
+    }
+}
+
+class TreeLifecycleWitness {
+    public weak TreeView Tree;
+    public weak App Host;
+    public weak Control Editor;
+    public weak Input Filter;
+}
+
+class TreeRetainedLifecycleTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Event(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void Layout(App app, Control root) {
+        root.UseApp(app);
+        root.MeasureTree(app);
+        root.Arrange(10, 10, 260, 150);
+        app.SetRootControl(root);
+    }
+    static bool Contains(Control root, Control needle) {
+        if (root == needle) { return true; }
+        for (int i = 0; i < root.Children.Count; i = i + 1) {
+            if (Contains(root.Children[i], needle)) { return true; }
+        }
+        return false;
+    }
+    static Control Build(TreeNode node) {
+        if (node.label == "plain") { return null; }
+        TreeLifecycleEditor input = new TreeLifecycleEditor();
+        input.Height(node.depth > 0 ? 45 : 30);
+        return input;
+    }
+    static void PaintTwice(App app, Control tree) {
+        app.BeginOffscreenFrame();
+        tree.RenderTree(app);
+        tree.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+    static void Arm(App app, TreeLifecycleEditor input) {
+        int x = input.bx + 8;
+        int y = input.by + 8;
+        Event(app, 2, x, y, 0, 0);
+        Event(app, 3, x, y, 0, 0);
+        Check(input.IsFocused(app), "actual pointer focuses editor before Paint");
+        app.CapturePointer(input, true);
+    }
+    static void HostAndWorkerBoundaries() {
+        App first = App.CreateOffscreen("Tree template old host", 340, 240);
+        App other = App.CreateOffscreen("Tree template new host", 340, 240);
+        TreeHostSwapTemplate swap = new TreeHostSwapTemplate();
+        TreeView tree = new TreeView(swap.Build);
+        swap.Tree = tree; swap.Destination = other;
+        List<TreeNode> nodes = new List<TreeNode>();
+        nodes.Add(TreeNode.File("one", 0)); nodes.Add(TreeNode.File("two", 0));
+        tree.Bind(nodes); tree.UseApp(first);
+        tree.BuildRows(first);
+        Check(swap.Calls == 1 && tree.FindApp() == other && tree.RowControl(0) == null && tree.rowsStale,
+            "template host change stops old App build before mounting or measuring returned row");
+        tree.BuildRows(other);
+        Control row = tree.RowControl(0);
+        Check(row != null && row.FindApp() == other && swap.Calls == 3,
+            "next build measures all rows against current host");
+        Layout(other, tree);
+        TreeLifecycleEditor input = (TreeLifecycleEditor)row;
+        Arm(other, input);
+        Dispatcher.SetUiThread();
+        TreeRefreshWorker worker = new TreeRefreshWorker(); worker.Tree = tree;
+        Check(Thread.Start(worker.Run), "Tree Refresh worker starts");
+        int start = Window.GetTickMs();
+        while (worker.Done.Load() == 0 && Window.GetTickMs() - start < 5000) { Thread.Sleep(0); }
+        Check(worker.Done.Load() == 1 && tree.RowControl(0) == row && row.parent != null
+            && other.GetCapturedPointer() == row, "worker Refresh does not mutate real input tree before UI dispatch");
+        Action action = Dispatcher.Take();
+        Check(action != null, "worker Refresh posts UI action");
+        action();
+        Check(tree.RowControl(0) == null && row.parent == null && other.GetCapturedPointer() == null,
+            "UI-dispatched Tree Refresh retires input and mapping");
+        for (int i = 0; i < 12; i = i + 1) { nodes.Add(TreeNode.File("tail", 0)); }
+        tree.Refresh(); Layout(other, tree);
+        TreeLifecycleEditor retiring = (TreeLifecycleEditor)tree.RowControl(0);
+        Control later = tree.RowControl(1);
+        int oldY = later.by;
+        Arm(other, retiring);
+        retiring.HostOwner = tree; retiring.NextHost = first;
+        tree.SetScrollTop(100000);
+        Check(tree.FindApp() == first && later.FindApp() == first && later.by == oldY,
+            "retirement callback host change aborts old App layout before later rows");
+        other.SetRootControl(null); first.canvas.Destroy(); other.canvas.Destroy();
+    }
+    static void Exercise(TreeLifecycleWitness witness) {
+        App app = App.CreateOffscreen("Tree retained lifecycle", 340, 240);
+        TreeView tree = new TreeView(Build);
+        Input filter = new Input("Search");
+        tree.WithFilter(filter);
+        List<TreeNode> nodes = new List<TreeNode>();
+        nodes.Add(TreeNode.Dir("directory", 0, true));
+        nodes.Add(TreeNode.File("plain", 1));
+        nodes.Add(TreeNode.File("editor", 1));
+        for (int i = 0; i < 12; i = i + 1) { nodes.Add(TreeNode.File("tail", 0)); }
+        tree.Bind(nodes);
+        witness.Tree = tree; witness.Host = app; witness.Filter = filter;
+        SignalInt originalScroll = tree.scroll;
+        Layout(app, tree);
+        Check(Contains(tree, filter) && filter.parent == tree, "filter is a real structural child");
+        Check(tree.RowCount() == nodes.Count && tree.RowControl(1) == null,
+            "filter and null template never shift original data index");
+        TreeLifecycleEditor editor = (TreeLifecycleEditor)tree.RowControl(2);
+        witness.Editor = editor;
+        Check(editor != null && editor.parent != null && editor.FindApp() == app,
+            "sparse row editor enters real input tree");
+        Check(tree.ContentHeight(app) == 13 * 30 + 45 + tree.RowHeight(app),
+            "variable and fallback row extents use the original data mapping");
+        Rect view = tree.ScrollViewport();
+        Check(view.y >= filter.by + filter.bh, "fixed filter excluded from body viewport");
+        Arm(app, editor);
+        Event(app, 6, 0, 0, 0, 65);
+        Check(editor.GetText() == "A", "editor handles text before first Paint");
+        app.ReleasePointerCapture();
+        tree.SetScrollTop(5);
+        Check(tree.RowControl(2) == editor && editor.IsFocused(app), "overlap row identity and focus survive scroll");
+        Check(tree.scroll == originalScroll && tree.scroll.Get() == tree.ScrollTop(), "legacy Signal object and committed projection preserved");
+        tree.SetScrollTop(0);
+        RoutedEventArgs boundary = new RoutedEventArgs("Wheel", editor, view.x + 5, view.y + 5);
+        boundary.delta = 120;
+        editor.RouteEvent(boundary);
+        Check(!boundary.handled && tree.ScrollTop() == 0, "body edge wheel remains available to ancestors");
+        Event(app, 13, filter.bx + 5, filter.by + 5, 0, -120);
+        Check(tree.ScrollTop() == 0, "fixed filter wheel never scrolls body");
+        Event(app, 13, view.x + 5, view.y + 5, 0, -120);
+        int off = tree.ScrollTop();
+        Check(off > 0, "body wheel commits before Paint");
+        PaintTwice(app, tree);
+        Check(tree.ScrollTop() == off && tree.RowControl(2) == editor, "repeated Paint cannot replay wheel or rebuild rows");
+        tree.SetScrollTop(0);
+        Arm(app, editor);
+        tree.CollapseAll();
+        Check(app.GetCapturedPointer() == null && !editor.IsFocused(app) && editor.Cancels == 1,
+            "collapse retires descendant input synchronously");
+        tree.ExpandAll();
+        Check(tree.RowControl(2) == editor, "expand does not rebuild unchanged row");
+        tree.SetScrollTop(0);
+        Arm(app, editor);
+        tree.SetScrollTop(100000);
+        Check(app.GetCapturedPointer() == null && !editor.IsFocused(app), "offscreen retirement clears capture and focus");
+        tree.SetScrollTop(0);
+        Arm(app, editor);
+        Control destination = new Column(); destination.UseApp(app);
+        editor.Destination = destination;
+        tree.Refresh();
+        Check(editor.parent == destination && editor.AttachedAtCancel && Contains(destination, editor),
+            "Refresh cancellation reentry preserves moved row");
+        Check(tree.RowControl(2) == null && app.GetCapturedPointer() == null, "Refresh invalidates old mapping immediately");
+        destination.RemoveAll();
+        Layout(app, tree);
+        Control replacement = tree.RowControl(2);
+        App other = App.CreateOffscreen("Tree other host", 340, 240);
+        app.SetRootControl(null);
+        other.SetRootControl(tree);
+        tree.UseApp(other);
+        Check(filter.FindApp() == other && replacement.FindApp() == other,
+            "real filter and editor host inheritance is immediate before any input or Paint");
+        replacement.Focus(other);
+        Event(other, 6, 0, 0, 0, 66);
+        Check(((Input)replacement).GetText() == "B", "cross App editor receives text before Paint");
+        other.CapturePointer(replacement, true);
+        tree.NodeSlot(null);
+        Check(replacement.parent == null && other.GetCapturedPointer() == null, "template replacement immediately retires real children");
+        tree.WithFilter(null);
+        Check(filter.parent == null && filter.FindApp() == null, "filter removal uses ordinary lifecycle");
+        List<TreeNode> sparse = new List<TreeNode>();
+        sparse.Add(TreeNode.File("plain first", 0));
+        Input extra = new Input("extra");
+        sparse.Add(TreeNode.File("extra second", 0).Extra(extra));
+        sparse.Add(TreeNode.File("plain third", 0));
+        tree.Bind(sparse);
+        Layout(other, tree);
+        Check(tree.RowControl(0) == null && tree.RowControl(1) != null && tree.RowControl(2) == null
+            && Contains(tree.RowControl(1), extra), "sparse TreeNode.extra preserves original data index");
+        extra.Focus(other); other.CapturePointer(extra, true);
+        tree.Bind(new List<TreeNode>());
+        Check(!extra.IsFocused(other) && other.GetCapturedPointer() == null && tree.RowCount() == 0,
+            "Bind retires sparse extra input immediately");
+        other.SetRootControl(null); other.canvas.Destroy(); app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("Frame", 2, 2);
+        TreeLifecycleWitness witness = new TreeLifecycleWitness();
+        Exercise(witness);
+        HostAndWorkerBoundaries();
+        Check(witness.Tree == null && witness.Host == null && witness.Editor == null && witness.Filter == null,
+            "weak owners and real child trees release");
+        frame.canvas.Destroy();
+        Console.WriteLine("TREEVIEW_RETAINED_INPUT_LIFECYCLE_OK");
+    }
+}

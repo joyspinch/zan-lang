@@ -1,0 +1,119 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Component.CefBrowser;
+using Gui.Component.WebView;
+
+// This offline fixture never starts CEF. Native engine acceptance is separate.
+class BrowserNativeLifecycleTest {
+    public weak App app;
+    public weak Control root;
+    public weak CefBrowserBox box;
+    public weak CefBrowser view;
+    public weak BrowserNativeLoop service;
+    public weak BrowserNativeEntry entry;
+    public weak CefBrowser cdpView;
+    public weak CefCdp weakRouter;
+    public CefCdp keptRouter;
+
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+    static void Turn(App app) { app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0); }
+    static void Paint(App app, CefBrowserBox box) {
+        app.BeginOffscreenFrame(); box.OnPaint(app); app.EndOffscreenFrame();
+    }
+    static void Run(BrowserNativeLifecycleTest witness) {
+        Check(!CefHost.IsRunning(), "offline fixture requires unstarted CEF");
+        App app = App.CreateOffscreen("Native lifecycle offline", 640, 480);
+        Control root = new Control("browser-owner");
+        root.UseApp(app);
+        root.bx = 0; root.by = 0; root.bw = 640; root.bh = 480;
+        CefBrowserBox first = new CefBrowserBox();
+        CefBrowserBox second = new CefBrowserBox();
+        first.SetStartUrl("https://first.example");
+        second.SetStartUrl("https://second.example");
+        root.Add(first); root.Add(second); app.SetRootControl(root);
+        first.Arrange(0, 0, 300, 200); second.Arrange(310, 0, 300, 200);
+        BrowserNativeLoop service = BrowserNativeLoop.For(app);
+        Check(first.view.nativeEntry.loop == service && second.view.nativeEntry.loop == service,
+            "Arrange registers both weak views with one App service");
+        Check(!first.navigated && !second.navigated, "Arrange does not consume first navigation");
+        Turn(app);
+        Check(first.navigated && second.navigated && first.view.pendingUrl == "https://first.example"
+            && second.view.pendingUrl == "https://second.example", "loop consumes start URL once without native runtime");
+        Check(service.workCount == 1 && service.EntryCount() == 2, "two views share one Work per App turn");
+        int work = service.workCount;
+        Paint(app, first); Paint(app, first); Paint(app, second);
+        Check(service.workCount == work && first.view.handle == 0 && !first.view.created,
+            "repeated Paint neither pumps nor creates CEF");
+        first.Navigate("https://explicit.example");
+        Paint(app, first); Turn(app); Paint(app, first);
+        Check(first.view.pendingUrl == "https://explicit.example", "paint and later loop cannot replay start URL");
+        Console.WriteLine("native offline registration / shared Work / start URL / paint purity: ok");
+        root.Visible = false;
+        Turn(app);
+        Check(service.EntryCount() == 2 && service.NextDeadline() >= 0,
+            "hidden ancestor retains bounded service scheduling without a native handle");
+        root.Visible = true;
+        root.Remove(first);
+        Turn(app);
+        Check(first.view.nativeEntry.retired && service.EntryCount() == 1,
+            "removed Box retires on current turn tail");
+        Check(service.NextDeadline() >= Window.GetTickMs() - 30, "remaining service keeps bounded idle deadline");
+        second.Destroy(); Turn(app);
+        Check(service.EntryCount() == 0 && service.NextDeadline() == -1
+            && app.FindLoopService("Gui.Component.BrowserNativeLoop") == null,
+            "last endpoint removes idle wake and service registration");
+        Console.WriteLine("native hidden ancestor / remove / last endpoint / idle deadline: ok");
+        CefBrowserBox retiring = new CefBrowserBox(); root.Add(retiring); retiring.Arrange(0, 0, 300, 200);
+        BrowserNativeLoop closing = BrowserNativeLoop.For(app);
+        BrowserNativeEntry entry = retiring.view.nativeEntry;
+        witness.app = app; witness.root = root; witness.box = retiring; witness.view = retiring.view;
+        witness.service = closing; witness.entry = entry;
+        app.StopLoop();
+        Check(entry.retired && closing.EntryCount() == 0 && closing.PendingCloseCount() == 0,
+            "App stop closes owned endpoints before tickets retire");
+        app.SetRootControl(null); app.canvas.Destroy();
+        Console.WriteLine("native App stop / endpoint retirement: ok");
+    }
+    static void MakeRetainedRouter(BrowserNativeLifecycleTest witness) {
+        CefBrowser browser = new CefBrowser();
+        CefCdp router = browser.Cdp();
+        witness.cdpView = browser; witness.weakRouter = router; witness.keptRouter = router;
+    }
+    static void ForwardCases(BrowserNativeLifecycleTest witness) {
+        MakeRetainedRouter(witness);
+        Check(witness.cdpView == null && witness.keptRouter.web == null,
+            "retaining CDP router cannot retain its browser owner");
+        CefCdp router = witness.keptRouter;
+        Check(router.Send("Runtime.enable", "{}", null) == 0
+            && router.Enable("Runtime") == 0 && router.Disable("Runtime") == 0,
+            "ownerless router returns unavailable message id without native call");
+        router.Pump(); witness.keptRouter = null;
+        Console.WriteLine("native CDP weak owner / retained router / ownerless safe calls: ok");
+        CefBrowser cef = new CefBrowser(); cef.Navigate("example.org/rehome");
+        // Model the completed first creation consuming pendingUrl; nativeTarget
+        // must preserve normalized navigation when ReleaseNative prepares rehome.
+        cef.pendingUrl = ""; cef.guiHadFocus = true; cef.ReleaseNative();
+        Check(cef.pendingUrl == CefBrowser.Normalize("example.org/rehome") && !cef.guiHadFocus,
+            "rehome preserves normalized URL and forces focus edge resync");
+        WebView web = new WebView(); web.Navigate("example.org/rehome");
+        web.pendingUrl = ""; web.ReleaseNative();
+        Check(web.pendingUrl == WebView.Normalize("example.org/rehome"),
+            "system WebView rehome preserves normalized URL");
+        Console.WriteLine("native rehome URL normalization / focus resync: ok");
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("Independent frame", 16, 16);
+        BrowserNativeLifecycleTest witness = new BrowserNativeLifecycleTest();
+        Run(witness);
+        Check(witness.app == null && witness.root == null && witness.box == null && witness.view == null
+            && witness.service == null && witness.entry == null, "no service view Box or App ARC cycle");
+        ForwardCases(witness);
+        Check(witness.weakRouter == null, "ownerless retained router releases naturally");
+        frame.canvas.Destroy();
+        Console.WriteLine("native weak service / entry / Box / view / App: ok");
+        Console.WriteLine("browser_native_lifecycle: ok");
+    }
+}

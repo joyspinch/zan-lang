@@ -20,6 +20,15 @@ public class CodeBlock : Control {
     SignalInt scroll;
     bool copied;
     int wid;
+    Button copyButton;
+    CodeBlockCopyAction copyAction;
+    int projectedLine;
+    int projectedVersion;
+    int linePixel;
+    int textFont;
+    int gutterPixel;
+    int copiedFrame;
+
     // 选中状态。代码只读但可选中（拖动、Ctrl+A、
     // Ctrl+C），同一时刻只有一个代码块能持有选中，因此状态
     // 共享，并标记所属代码块的焦点 id——这也使它
@@ -45,6 +54,11 @@ public class CodeBlock : Control {
         wid = WidgetId.Next();
         wiresOwnEvents = true;
         Copy = new UiEvent();
+        copyButton = new Button { Text = "Copy", Icon = "copy", Class = "small" };
+        copyAction = new CodeBlockCopyAction(this);
+        copyButton.Click.Add(copyAction.Invoke);
+        this.Add(copyButton);
+        copiedFrame = 0 - 1;
     }
 
     // 空代码块（设计器用）。
@@ -55,19 +69,23 @@ public class CodeBlock : Control {
     // 通过宿主持有的信号滚动，因此偏移量在
     // 面板重建后依然保留。
     public void UseScroll(SignalInt s) {
+        if (s == null) { return; }
         scroll = s;
+        projectedLine = 0 - 1;
     }
 
     // 刚绘制的这一帧内复制操作被点击时返回 true，供
     // 倾向于轮询而非订阅 `Copy` 的宿主使用。
-    bool Copied() { return copied; }
+    bool Copied() { return copied && this.App != null && copiedFrame == this.App.frameCount; }
 
     // 显示的行；赋值会替换行、重置滚动并清除
     // 任何选中状态。
     public void SetLines(List<string> src) {
         lines = src;
         scroll.Set(0);
+        projectedLine = 0;
         CodeBlock.ClearSelection();
+        this.SetScrollTop(0);
     }
 
     // 清除共享选中状态，无论此前属于谁。
@@ -120,23 +138,6 @@ public class CodeBlock : Control {
         CodeBlock.selCol = lines[lines.Count - 1].Length;
         CodeBlock.selActive = true;
     }
-
-    // 把指针位置映射为代码区内的（行, 列）光标位置。
-    void CaretFromMouse(App app, int codeX, int topY, int lineH, int off,
-                        int font, bool moveAnchor) {
-        int l = off + (app.mouseY - topY) / lineH;
-        if (l < 0) { l = 0; }
-        if (l >= lines.Count) { l = lines.Count - 1; }
-        if (l < 0) { return; }
-        int col = CodeEditor.ColFromX(lines[l], app.mouseX - codeX, font);
-        if (moveAnchor) {
-            CodeBlock.selAnchorLine = l;
-            CodeBlock.selAnchorCol = col;
-        }
-        CodeBlock.selLine = l;
-        CodeBlock.selCol = col;
-    }
-
 
     // 行高：`codeblock::line` 字号加呼吸空间。
     public static int LineHeight(App app) {
@@ -195,177 +196,206 @@ public class CodeBlock : Control {
         prefW = widest + app.Scale(34);
     }
 
-    // 覆写：画表面、标题栏（标题 + 复制按钮）、行号与代码文本，
-    // 并处理滚轮滚动、文本选择与复制交互。
+    public override int WidgetId() { return wid; }
+
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
+        return box;
+    }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        App app = this.App;
+        int header = app != null ? CodeBlock.HeaderHeight(app) : 32;
+        int top = app != null ? app.Scale(8) : 8;
+        int bottom = app != null ? app.Scale(6) : 6;
+        int h = view.height - header - top - bottom;
+        return new Rect(view.x, view.y + header + top, view.width, h > 0 ? h : 0);
+    }
+
+    public override void OnScrollChanged() {
+        if (linePixel <= 0 || scroll == null) { return; }
+        projectedLine = this.ScrollTop() / linePixel;
+        if (scroll.Get() != projectedLine) { scroll.Set(projectedLine); }
+        projectedVersion = scroll.Version();
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        App app = this.App;
+        if (app == null) { return; }
+        bool external = scroll != null && (scroll.Get() != projectedLine || scroll.Version() != projectedVersion);
+        int requested = scroll != null ? scroll.Get() : 0;
+        linePixel = CodeBlock.LineHeight(app);
+        StyleBox ls = this.ResolvePartAs(app, "codeblock", "line", "", Class, Style.SNormal());
+        textFont = ls.FontOr(Style.FontFallback(app, "small"));
+        gutterPixel = CodeBlock.GutterWidth(app, lines.Count);
+        copyButton.Text = CopyLabel.Get();
+        copyButton.MeasureTree(app);
+        int cpW = copyButton.prefW > 0 ? copyButton.prefW : app.Scale(72);
+        int cpH = app.theme.heightSmall;
+        copyButton.Arrange(bx + bw - cpW - app.Scale(8), by + (CodeBlock.HeaderHeight(app) - cpH) / 2, cpW, cpH);
+        Rect view = this.ScrollViewport();
+        scrollExtent = lines.Count * linePixel;
+        scrollExtentX = view.width;
+        int maximum = scrollExtent - view.height;
+        if (maximum < 0) { maximum = 0; }
+        int next = external ? requested * linePixel : this.ScrollTop();
+        if (next > maximum) { next = maximum; }
+        if (next < 0) { next = 0; }
+        projectedLine = next / linePixel;
+        if (scroll != null) {
+            if (scroll.Get() != projectedLine) { scroll.Set(projectedLine); }
+            projectedVersion = scroll.Version();
+        }
+        this.SetScrollTop(next);
+    }
+
+    private bool OverCode(int x, int y) {
+        Rect view = this.ScrollViewport();
+        return view.Contains(x, y) && x >= view.x + gutterPixel && this.ScrollBarHit(x, y) == 0;
+    }
+
+    private void PlaceCaret(int x, int y, bool anchor) {
+        if (lines.Count == 0 || linePixel <= 0) { return; }
+        Rect view = this.ScrollViewport();
+        int pixel = y - view.y + this.ScrollTop();
+        int index = pixel < 0 ? 0 : pixel / linePixel;
+        if (index >= lines.Count) { index = lines.Count - 1; }
+        int column = CodeEditor.ColFromX(lines[index], x - view.x - gutterPixel - this.App.Scale(10), textFont);
+        if (anchor) { CodeBlock.selAnchorLine = index; CodeBlock.selAnchorCol = column; }
+        CodeBlock.selLine = index;
+        CodeBlock.selCol = column;
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.originalSource != this || app == null || app.window.EventButton() != 0
+            || this.IsDisabled() || !this.StyleVisible() || !this.OverCode(e.x, e.y)) { return; }
+        this.Focus(app);
+        Control popup = app.overlayHost != null ? app.overlayHost.ActiveRoot() : null;
+        Control root = popup != null ? popup : app.rootControl;
+        if (this.App != app || !this.IsFocused(app) || this.IsDisabled() || !this.StyleVisible()
+            || root == null || !root.ContainsInputControl(this)) { return; }
+        bool keep = Modifiers.HasShift(e.modifiers) && CodeBlock.selOwner == wid;
+        CodeBlock.selOwner = wid;
+        this.PlaceCaret(e.x, e.y, !keep);
+        CodeBlock.selActive = keep;
+        CodeBlock.selDragging = true;
+        isPressed = true;
+        app.CapturePointer(this, true);
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || !CodeBlock.selDragging || CodeBlock.selOwner != wid
+            || app.GetCapturedPointer() != this) { return; }
+        if (this.IsDisabled() || !this.StyleVisible()) { this.OnInputFocusLost(); return; }
+        this.PlaceCaret(e.x, e.y, false);
+        CodeBlock.selActive = CodeBlock.selLine != CodeBlock.selAnchorLine || CodeBlock.selCol != CodeBlock.selAnchorCol;
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || app.window.EventButton() != 0 || CodeBlock.selOwner != wid
+            || !CodeBlock.selDragging) { return; }
+        if (!this.IsDisabled() && this.StyleVisible()) {
+            this.PlaceCaret(e.x, e.y, false);
+            CodeBlock.selActive = CodeBlock.selLine != CodeBlock.selAnchorLine || CodeBlock.selCol != CodeBlock.selAnchorCol;
+        }
+        CodeBlock.selDragging = false;
+        isPressed = false;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        this.OnInputFocusLost();
+    }
+
+    public override void OnInputFocusLost() {
+        if (CodeBlock.selOwner == wid) { CodeBlock.selDragging = false; }
+        isPressed = false;
+        App app = this.App;
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+    }
+
+    public override void OnTextInput(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || !this.IsFocused(app) || this.IsDisabled() || !this.StyleVisible()) { return; }
+        if (e.keyCode == 1) { this.SelectAll(wid); }
+        else if (e.keyCode == 3) {
+            string selected = this.SelectedText(wid);
+            Clipboard.SetText(selected != "" ? selected : this.AllText());
+        } else { return; }
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public void ActivateCopy() {
+        App app = this.App;
+        if (app == null || this.IsDisabled() || !this.StyleVisible()) { return; }
+        copied = true;
+        copiedFrame = app.frameCount;
+        app.RequestRedraw();
+        Copy.RaiseS(this);
+    }
+
+    // Painting reads retained geometry, offsets, and selection only.
     override void OnPaint(App app) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         EditorPalette pal = EditorPalette.For(t);
-        StyleBox s = this.ResolveStyleAs(app, "codeblock", Class,
-                                         Style.SNormal());
-
+        StyleBox s = computedStyle;
         int hdrH = CodeBlock.HeaderHeight(app);
-        int lineH = CodeBlock.LineHeight(app);
-        c.FillRoundRect(bx, by, bw, bh, s.RadiusOr(t.borderRadiusMedium),
-                        s.BgOr(CodeBlock.SurfaceColor(app, pal)));
-        c.DrawRect(bx, by, bw, bh, s.BorderOr(0),
-                   s.BorderWOr(1));
+        c.FillRoundRect(bx, by, bw, bh, s.RadiusOr(t.borderRadiusMedium), s.BgOr(CodeBlock.SurfaceColor(app, pal)));
+        c.DrawRect(bx, by, bw, bh, s.BorderOr(0), s.BorderWOr(1));
         c.FillRect(bx, by + hdrH, bw, 1, pal.panelBg);
-        StyleBox cs = this.ResolvePartAs(app, "codeblock", "caption", "", Class,
-                                         Style.SNormal());
-        int capFont = cs.FontOr(Style.FontFallback(app, "medium"));
-        c.DrawText(bx + app.Scale(12),
-                   Canvas.CenterTextY(by, hdrH, capFont), Caption.Get(),
-                   cs.FgOr(0), capFont);
-
-        // 复制操作是标准小按钮，用自身高度和
-        // 自然宽度（图标 + 标签 + 内边距，翻译后的标签
-        // 不会被省略），在标题栏内居中。
-        Button cp = new Button { Text = CopyLabel.Get(), Icon = "copy",
-                                 Class = "small" };
-        int cpH = t.heightSmall;
-        cp.MeasureTree(app);
-        int cpW = cp.prefW > 0 ? cp.prefW : app.Scale(72);
-        cp.Arrange(bx + bw - cpW - app.Scale(8),
-                   by + (hdrH - cpH) / 2, cpW, cpH);
-        cp.RenderTree(app);
-        int cpId = cp.WidgetId();
-
-        int textY = by + hdrH + app.Scale(8);
-        int bottom = by + bh - app.Scale(6);
-        int visRows = (bottom - textY) / lineH;
-        if (visRows < 1) { visRows = 1; }
-        int maxScroll = lines.Count - visRows;
-        if (maxScroll < 0) { maxScroll = 0; }
-        // 认领以真溢出为前提（maxScroll > 0）：放得下不认领，滚轮
-        // 穿透给外层容器/页面。
-        if (maxScroll > 0 && app.CaptureWheel(bx, by, bw, bh)) {
-            int delta = app.window.EventKeyCode();
-            int step = delta / 120;
-            if (step == 0) {
-                if (delta > 0) { step = 1; }
-                else if (delta < 0) { step = 0 - 1; }
-            }
-            scroll.Set(scroll.Get() - step * 3);
-            app.RequestRedraw();
-        }
-        int off = scroll.Get();
-        if (off > maxScroll) { off = maxScroll; }
-        if (off < 0) { off = 0; }
-        scroll.Set(off);
-
-        StyleBox ls = this.ResolvePartAs(app, "codeblock", "line", "", Class,
-                                         Style.SNormal());
-        int lineFont = ls.FontOr(Style.FontFallback(app, "small"));
+        StyleBox captionStyle = this.ResolvePartAs(app, "codeblock", "caption", "", Class, Style.SNormal());
+        int captionFont = captionStyle.FontOr(Style.FontFallback(app, "medium"));
+        c.DrawText(bx + app.Scale(12), Canvas.CenterTextY(by, hdrH, captionFont), Caption.Get(), captionStyle.FgOr(0), captionFont);
+        app.focus.RegisterFocusable(wid);
+        Rect view = this.ScrollViewport();
+        StyleBox ls = this.ResolvePartAs(app, "codeblock", "line", "", Class, Style.SNormal());
         int lineColor = ls.FgOr(pal.plain);
-        int gutW = CodeBlock.GutterWidth(app, lines.Count);
-        // 行号槽：右对齐行号背后的一列淡色背景，用细线
-        // 与代码区隔开——保留编辑器在
-        // 只读块中的阅读节奏。
-        c.FillRect(bx + 1, by + hdrH + 1, gutW, bh - hdrH - 2,
-                   34 * 16777216 + (pal.panelBg % 16777216));
-        c.FillRect(bx + gutW, by + hdrH + 1, 1, bh - hdrH - 2,
-                   60 * 16777216 + (pal.border % 16777216));
-        int codeX = bx + gutW + app.Scale(10);
-        // ---- 可选中只读文本：拖动选中，Ctrl+A，Ctrl+C ----
-        int fid = app.focus.AllocId();
-        bool focused = app.focus.IsFocused(fid);
-        bool overCode = app.mouseX >= bx + gutW && app.mouseX < bx + bw
-            && app.mouseY >= textY && app.mouseY < bottom;
-        // PointerCaptured：盖在代码块上的浮层（菜单/浮窗/查找栏）
-        // 拥有指针时，代码块不得起文本选区——按下被浮层收走，
-        // 却在下面拖出一道选区，就是「点浮层上面就穿透」。
-        if (app.EventKind() == 2 && app.window.EventButton() == 0 && overCode
-            && !app.PointerCaptured()) {
-            app.focus.SetFocused(fid);
-            focused = true;
-            bool shift = Modifiers.HasShift(app.window.EventMods());
-            bool keep = shift && CodeBlock.selOwner == fid;
-            CodeBlock.selOwner = fid;
-            this.CaretFromMouse(app, codeX, textY, lineH, off, lineFont, !keep);
-            CodeBlock.selActive = keep;
-            CodeBlock.selDragging = true;
-            app.RequestRedraw();
-        }
-        if (app.EventKind() == 1 && CodeBlock.selDragging
-            && CodeBlock.selOwner == fid) {
-            this.CaretFromMouse(app, codeX, textY, lineH, off, lineFont, false);
-            CodeBlock.selActive = CodeBlock.selLine != CodeBlock.selAnchorLine
-                || CodeBlock.selCol != CodeBlock.selAnchorCol;
-            app.RequestRedraw();
-        }
-        if (app.EventKind() == 3 && app.window.EventButton() == 0) {
-            CodeBlock.selDragging = false;
-        }
-        if (focused && app.EventKind() == 6) {
-            int key = app.window.EventKeyCode();
-            if (key == 1) {  // Ctrl+A
-                this.SelectAll(fid);
-                app.RequestRedraw();
-            } else if (key == 3) {  // Ctrl+C
-                string sel = this.SelectedText(fid);
-                if (sel == "") { sel = this.AllText(); }
-                Clipboard.SetText(sel);
-                app.RequestRedraw();
-            }
-        }
-        bool showSel = CodeBlock.selActive && CodeBlock.selOwner == fid;
-
-        c.PushClip(bx, by + hdrH, bw, bh - hdrH);
-        // 块注释跨行，因此词法分析器状态从
-        // 第一行延续——而不是第一行*可见*的行。
+        c.FillRect(bx + 1, by + hdrH + 1, gutterPixel, bh - hdrH - 2, 34 * 16777216 + (pal.panelBg % 16777216));
+        c.FillRect(bx + gutterPixel, by + hdrH + 1, 1, bh - hdrH - 2, 60 * 16777216 + (pal.border % 16777216));
+        if (linePixel <= 0) { return; }
+        int off = this.ScrollTop() / linePixel;
+        int y = view.y + off * linePixel - this.ScrollTop();
+        int codeX = view.x + gutterPixel + app.Scale(10);
+        bool showSelection = CodeBlock.selActive && CodeBlock.selOwner == wid;
+        c.PushClip(view.x, view.y, view.width, view.height);
         bool inBlock = false;
         for (int pre = 0; pre < off && pre < lines.Count; pre = pre + 1) {
-            List<CodeSpan> preSpans = new List<CodeSpan>();
-            inBlock = CodeEditor.HighlightSpans(lines[pre], pal.keyword,
-                pal.type, pal.str, pal.comment, pal.number, lineColor,
-                inBlock, preSpans);
+            List<CodeSpan> spans = new List<CodeSpan>();
+            inBlock = CodeEditor.HighlightSpans(lines[pre], pal.keyword, pal.type, pal.str, pal.comment, pal.number, lineColor, inBlock, spans);
         }
-        int i = off;
-        while (i < lines.Count && textY + lineH <= bottom) {
-            string no = Convert.ToString(i + 1);
-            int noW = Canvas.MeasureText(no, lineFont);
-            c.DrawText(bx + gutW - app.Scale(8) - noW, textY, no,
-                       pal.lineNo, lineFont);
-            if (showSel) {
-                CodeEditor.DrawSelHighlight(c, app, CodeBlock.selAnchorLine,
-                    CodeBlock.selAnchorCol, CodeBlock.selLine, CodeBlock.selCol,
-                    i, lines[i], codeX, textY, lineH, lineFont,
-                    new Rect(bx, by, bw, bh));
+        for (int i = off; i < lines.Count && y < view.y + view.height; i = i + 1) {
+            string number = Convert.ToString(i + 1);
+            c.DrawText(bx + gutterPixel - app.Scale(8) - Canvas.MeasureText(number, textFont), y, number, pal.lineNo, textFont);
+            if (showSelection) {
+                CodeEditor.DrawSelHighlight(c, app, CodeBlock.selAnchorLine, CodeBlock.selAnchorCol, CodeBlock.selLine, CodeBlock.selCol,
+                    i, lines[i], codeX, y, linePixel, textFont, view);
             }
             List<CodeSpan> spans = new List<CodeSpan>();
-            inBlock = CodeEditor.HighlightSpans(lines[i], pal.keyword,
-                pal.type, pal.str, pal.comment, pal.number, lineColor,
-                inBlock, spans);
+            inBlock = CodeEditor.HighlightSpans(lines[i], pal.keyword, pal.type, pal.str, pal.comment, pal.number, lineColor, inBlock, spans);
             int tx = codeX;
-            for (int g = 0; g < spans.Count; g = g + 1) {
-                CodeSpan span = spans[g];
-                c.DrawText(tx, textY, span.text, span.color, lineFont);
-                tx = tx + Canvas.MeasureText(span.text, lineFont);
+            for (int j = 0; j < spans.Count; j = j + 1) {
+                CodeSpan span = spans[j];
+                c.DrawText(tx, y, span.text, span.color, textFont);
+                tx = tx + Canvas.MeasureText(span.text, textFont);
             }
-            textY = textY + lineH;
-            i = i + 1;
+            y = y + linePixel;
         }
         c.PopClip();
-
-        if (maxScroll > 0) {
-            int viewH = bh - hdrH - app.Scale(8);
-            SignalInt px = new SignalInt(off * lineH);
-            Scrollbar.RenderVerticalScrollIn(app, bx + bw - app.Scale(10),
-                by + hdrH + app.Scale(4), viewH, viewH,
-                lines.Count * lineH, px, bx, by + hdrH, bw, bh - hdrH);
-            int moved = px.Get() / lineH;
-            if (moved != off) {
-                scroll.Set(moved);
-                app.RequestRedraw();
-            }
-        }
-        copied = Ui.Clicked(app, cpId);
-        if (copied) {
-            Copy.RaiseS(this);
-            app.RequestRedraw();
-        }
-        On.Fire(app, wid, this);
     }
 
     // ---- 设计器 / 序列化模型 ----

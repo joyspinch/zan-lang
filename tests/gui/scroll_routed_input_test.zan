@@ -1,0 +1,305 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class ScrollOverrideControl : Control {
+    public int routes;
+    public bool claimWheel;
+    public override void OnWheel(RoutedEventArgs e) {
+        if (claimWheel) { e.Handle(); }
+    }
+    public override void OnPointerDown(RoutedEventArgs e) { }
+    public override void OnPointerMove(RoutedEventArgs e) { }
+    public override void OnPointerUp(RoutedEventArgs e) { }
+    public override void OnPointerCancel(RoutedEventArgs e) { }
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        routes = routes + 1;
+        if (e.eventName == "Wheel") { this.OnWheel(e); }
+    }
+}
+
+class ScrollRoutedInputTest {
+    int wheels;
+    int downs;
+    int ups;
+    public void Wheel() { wheels = wheels + 1; }
+    public void Down() { downs = downs + 1; }
+    public void Up() { ups = ups + 1; }
+
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("Scroll routed input: " + label); }
+    }
+
+    static Control Box(string style) {
+        Control box = new Control();
+        box.SetProp("style", style);
+        return box;
+    }
+
+    static void Layout(App app, Control root, int w, int h) {
+        root.UseApp(app);
+        root.MeasureTree(app);
+        root.Arrange(20, 20, w, h);
+        app.SetRootControl(root);
+    }
+
+    static void Paint(App app, Control root) {
+        app.BeginOffscreenFrame();
+        root.RenderTree(app);
+        root.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+
+    static void Input(App app, int kind, int x, int y, int key, int mods, int pointer) {
+        app.SetPointerDeviceType(pointer);
+        app.ProcessOffscreenInput(kind, x, y, 0, key, mods, pointer);
+    }
+
+    static void WheelChain(App app) {
+        Control outer = Box("overflow:auto;display:block");
+        Control inner = Box("overflow:auto;display:block;width:120px;height:100px");
+        Control content = Box("width:300px;height:400px");
+        inner.Add(content);
+        outer.Add(inner);
+        outer.Add(Box("height:500px;width:100px"));
+        Layout(app, outer, 200, 160);
+        Check("nested extents", inner.scrollExtent > 100 && outer.scrollExtent > 160);
+        ScrollRoutedInputTest count = new ScrollRoutedInputTest();
+        inner.BindEvent("Wheel", count.Wheel);
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Check("inner wheel before paint", inner.ScrollTop() == app.scrollSpeed && outer.ScrollTop() == 0);
+        Check("Wheel subscription once", count.wheels == 1);
+        int before = inner.ScrollTop();
+        Paint(app, outer);
+        Check("paint cannot replay wheel", inner.ScrollTop() == before && count.wheels == 1);
+        inner.SetScrollTop(inner.scrollExtent - inner.bh);
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Check("bottom edge bubbles", outer.ScrollTop() == app.scrollSpeed);
+        inner.SetScrollTop(0);
+        outer.SetScrollTop(app.scrollSpeed);
+        Input(app, 13, 50, 50, 120, 0, 0);
+        Check("top edge bubbles", inner.ScrollTop() == 0 && outer.ScrollTop() == 0);
+        Input(app, 13, 50, 50, -120, Modifiers.Shift(), 0);
+        Check("shift scrolls horizontal", inner.ScrollLeft() == app.scrollSpeed && inner.ScrollTop() == 0);
+        inner.SetScrollLeft(inner.scrollExtentX - inner.bw);
+        Input(app, 13, 50, 50, -120, Modifiers.Shift(), 0);
+        Check("horizontal edge bubbles", outer.ScrollTop() == app.scrollSpeed);
+        content.SetProp("style", "width:100px;height:30px");
+        inner.SetScrollLeft(0);
+        inner.SetScrollTop(0);
+        outer.SetScrollTop(0);
+        Layout(app, outer, 200, 160);
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Check("nonoverflow passes through", inner.ScrollTop() == 0 && outer.ScrollTop() == app.scrollSpeed);
+        content.SetProp("style", "width:100px;height:400px");
+        outer.SetScrollTop(0);
+        Layout(app, outer, 200, 160);
+        Input(app, 13, 50, 50, -120, Modifiers.Shift(), 0);
+        Check("shift without horizontal overflow falls back vertical", inner.ScrollLeft() == 0 && inner.ScrollTop() == app.scrollSpeed);
+        inner.Disabled = true;
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Check("disabled inner bubbles", outer.ScrollTop() == app.scrollSpeed);
+        app.SetRootControl(null);
+    }
+
+    static void Drag(App app) {
+        Control host = Box("overflow:auto;display:block;border:2px solid black");
+        Control content = Box("width:500px;height:600px");
+        host.Add(content);
+        Layout(app, host, 200, 160);
+        Rect view = host.ScrollViewport();
+        ScrollState state = new ScrollState();
+        Rect vertical = state.Track(app, view.x, view.y, view.width, view.height, false);
+        Rect horizontal = state.Track(app, view.x, view.y, view.width, view.height, true);
+        int x = vertical.x + vertical.width / 2;
+        int y = view.y + state.ThumbLength(app, view.height, host.scrollExtent) / 2;
+        Check("bar wins over content", host.HitTest(x, y) == host);
+        Check("border excluded", host.ScrollBarHit(host.bx + host.bw - 1, y) == 0);
+        ScrollRoutedInputTest count = new ScrollRoutedInputTest();
+        host.BindEvent("MouseDown", count.Down);
+        host.BindEvent("MouseUp", count.Up);
+        Input(app, 2, x, y, 0, 0, 0);
+        Check("thumb captures before paint", app.GetCapturedPointer() == host && host.ScrollTop() == 0 && count.downs == 1);
+        app.ProcessOffscreenInput(3, x, y, 1, 0, 0, 0);
+        Check("secondary release preserves primary drag", app.GetCapturedPointer() == host && host.scroll.Active());
+        RoutedEventArgs handledUp = new RoutedEventArgs("PointerUp", host, x, y);
+        handledUp.Handle();
+        host.RouteEvent(handledUp);
+        Check("handled release leaves drag untouched", app.GetCapturedPointer() == host && host.scroll.Active());
+        app.CapturePointer(content, true);
+        RoutedEventArgs otherUp = new RoutedEventArgs("PointerUp", content, x, y);
+        host.RouteEvent(otherUp);
+        Check("observer release preserves other capture", app.GetCapturedPointer() == content && host.scroll.Active());
+        app.CapturePointer(host, true);
+        Input(app, 1, -40, y + 30, 0, 0, 0);
+        int moved = host.ScrollTop();
+        Check("thumb moves outside before paint", moved > 0);
+        Paint(app, host);
+        Check("paint stable during capture", host.ScrollTop() == moved && app.GetCapturedPointer() == host);
+        Input(app, 3, -40, y + 30, 0, 0, 0);
+        Check("outside release clears capture", app.GetCapturedPointer() == null && !host.scroll.Active());
+        Check("secondary observer and primary releases notify once each", count.ups == 3);
+        host.SetScrollTop(0);
+        Input(app, 2, x, view.y + view.height - 12, 0, 0, 0);
+        Check("track jumps and captures", host.ScrollTop() > 0 && app.GetCapturedPointer() == host);
+        Input(app, 3, x, view.y + view.height - 12, 0, 0, 0);
+        host.SetScrollLeft(0);
+        int hx = view.x + state.ThumbLength(app, view.width, host.scrollExtentX) / 2;
+        int hy = horizontal.y + horizontal.height / 2;
+        Input(app, 2, hx, hy, 0, 0, 1);
+        Input(app, 1, hx + 40, 300, 0, 0, 1);
+        Check("touch drag survives slop outside", host.ScrollLeft() > 0 && app.GetCapturedPointer() == host);
+        int touchOffset = host.ScrollLeft();
+        Input(app, 9, hx + 40, 300, 0, 0, 1);
+        Check("cancel clears drag", app.GetCapturedPointer() == null && !host.scroll.Active());
+        Input(app, 1, hx + 80, 300, 0, 0, 1);
+        Check("cancelled motion stable", host.ScrollLeft() == touchOffset);
+        host.SetScrollTop(0);
+        Input(app, 2, x, y, 0, 0, 0);
+        Input(app, 1, x, y + 20, 0, 0, 0);
+        moved = host.ScrollTop();
+        content.SetProp("style", "width:500px;height:1000px");
+        Layout(app, host, 200, 160);
+        Input(app, 1, x, y + 21, 0, 0, 0);
+        Check("content resize reanchors", host.ScrollTop() == moved);
+        Input(app, 1, x, y + 21, 0, 0, 0);
+        Check("stationary pointer stays anchored", host.ScrollTop() == moved);
+        Input(app, 1, x, y + 31, 0, 0, 0);
+        Check("drag continues after resize", host.ScrollTop() > moved);
+        Input(app, 3, x, y + 31, 0, 0, 0);
+        host.SetScrollTop(0);
+        Input(app, 2, x, y, 0, 0, 0);
+        host.SetProp("style", "overflow-x:auto;overflow-y:hidden;display:block;border:2px solid black");
+        Layout(app, host, 200, 160);
+        Input(app, 1, x, y + 10, 0, 0, 0);
+        Check("hidden active axis cancels while other remains auto", !host.scroll.Active()
+            && app.GetCapturedPointer() == null && host.ScrollTop() == 0);
+        host.SetProp("style", "overflow:auto;display:block;border:2px solid black");
+        Layout(app, host, 200, 160);
+        Input(app, 2, x, y, 0, 0, 0);
+        content.SetProp("style", "width:500px;height:20px");
+        Layout(app, host, 200, 160);
+        Input(app, 1, x, y + 10, 0, 0, 0);
+        Check("lost overflow cancels drag", !host.scroll.Active() && app.GetCapturedPointer() == null);
+        content.SetProp("style", "width:500px;height:1000px");
+        Layout(app, host, 200, 160);
+        host.SetScrollTop(9999);
+        Paint(app, host);
+        Check("pure paint does not clamp supplied offset", host.ScrollTop() == 9999);
+        Layout(app, host, 200, 160);
+        Check("Arrange still clamps", host.ScrollTop() < 9999);
+        app.SetRootControl(null);
+    }
+
+    static void Equivalence(App app) {
+        HtmlDoc doc = Html.Parse("<div style='overflow:auto;display:block'><div style='width:400px;height:500px'></div></div>", "", null);
+        Control html = doc.root.children[0];
+        Control code = Box("overflow:auto;display:block");
+        code.Add(Box("width:400px;height:500px"));
+        Layout(app, code, 180, 140);
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Input(app, 13, 50, 50, -120, Modifiers.Shift(), 0);
+        app.UseAppCss(doc.css);
+        Layout(app, html, 180, 140);
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Input(app, 13, 50, 50, -120, Modifiers.Shift(), 0);
+        Check("HTML and code extents and wheel agree", html.scrollExtent == code.scrollExtent
+            && html.scrollExtentX == code.scrollExtentX && html.ScrollTop() == code.ScrollTop()
+            && html.ScrollLeft() == code.ScrollLeft());
+        Control empty = Box("overflow:scroll");
+        Layout(app, empty, 180, 140);
+        empty.scrollExtent = 0;
+        empty.scrollExtentX = 0;
+        Paint(app, empty);
+        Check("empty scroll extent safe", empty.ScrollTop() == 0 && empty.ScrollLeft() == 0);
+        app.SetRootControl(null);
+    }
+
+    static void Overrides(App app) {
+        ScrollOverrideControl host = new ScrollOverrideControl();
+        host.SetProp("style", "overflow:auto;display:block");
+        host.Add(Box("width:400px;height:500px"));
+        Layout(app, host, 180, 140);
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Check("override without base still CSS scrolls", host.ScrollTop() == app.scrollSpeed);
+        host.claimWheel = true;
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Check("custom handled wheel retains priority", host.ScrollTop() == app.scrollSpeed);
+        host.claimWheel = false;
+        host.SetScrollTop(0);
+        Rect view = host.ScrollViewport();
+        ScrollState state = new ScrollState();
+        Rect track = state.Track(app, view.x, view.y, view.width, view.height, false);
+        int x = track.x + track.width / 2;
+        int y = view.y + state.ThumbLength(app, view.height, host.scrollExtent) / 2;
+        ScrollRoutedInputTest count = new ScrollRoutedInputTest();
+        host.BindEvent("MouseDown", count.Down);
+        host.BindEvent("MouseUp", count.Up);
+        int before = host.routes;
+        Input(app, 2, x, y, 0, 0, 0);
+        Check("chrome bypasses overridden content hook", app.GetCapturedPointer() == host
+            && host.routes == before && count.downs == 1);
+        Input(app, 1, -40, y + 30, 0, 0, 0);
+        Check("override drag moves before paint", host.ScrollTop() > 0);
+        Input(app, 3, -40, y + 30, 0, 0, 0);
+        Check("override release once", app.GetCapturedPointer() == null && count.ups == 1);
+        app.SetRootControl(null);
+    }
+
+    static void OffscreenReplay(App app) {
+        Control host = Box("display:block");
+        Layout(app, host, 180, 140);
+        ScrollRoutedInputTest count = new ScrollRoutedInputTest();
+        host.BindEvent("Wheel", count.Wheel);
+        host.BindEvent("MouseDown", count.Down);
+        host.BindEvent("MouseUp", count.Up);
+        Input(app, 13, 50, 50, -120, 0, 0);
+        long original = app.window.EventSeq();
+        Check("original unhandled wheel notifies once", count.wheels == 1);
+        app.BeginOffscreenFrame();
+        Check("first legacy wheel awaits ownership", !app.CaptureWheel(20, 20, 180, 140));
+        app.EndOffscreenFrame();
+        Check("frame queues actual wheel replay", app.offscreenWheelPending && app.EventKind() == 0);
+        Check("actual wheel replay restored", app.ReplayOffscreenWheel());
+        long replay = app.window.EventSeq();
+        int replayWheels = count.wheels;
+        app.BeginOffscreenFrame();
+        Check("replayed legacy wheel gets ownership", app.CaptureWheel(20, 20, 180, 140));
+        app.EndOffscreenFrame();
+        Check("consumed replay is bounded", !app.ReplayOffscreenWheel());
+        Input(app, 2, 50, 50, 0, 0, 0);
+        Check("real pointer after replay routes before paint", count.downs == 1);
+        Check("real pointer advances past replay", app.window.EventSeq() > replay);
+        Input(app, 3, 50, 50, 0, 0, 0);
+        Check("real release after replay routes once", count.ups == 1);
+        Check("replay preserves original event identity", replay == original);
+        Check("replay does not notify Wheel again", replayWheels == 1 && count.wheels == 1);
+
+        // No claimant on the replay frame must still end the replay chain.
+        app.BeginOffscreenFrame();
+        app.EndOffscreenFrame();
+        Input(app, 13, 50, 50, -120, 0, 0);
+        app.BeginOffscreenFrame();
+        Check("new legacy wheel awaits new ownership", !app.CaptureWheel(20, 20, 180, 140));
+        app.EndOffscreenFrame();
+        Check("unconsumed wheel replay restored", app.ReplayOffscreenWheel());
+        app.BeginOffscreenFrame();
+        app.EndOffscreenFrame();
+        Check("unclaimed replay is bounded", !app.ReplayOffscreenWheel());
+        Input(app, 13, 50, 50, -120, 0, 0);
+        Check("real wheel after replay notifies once", count.wheels == 3);
+        app.SetRootControl(null);
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Scroll routed input", 320, 240);
+        WheelChain(app);
+        Drag(app);
+        Equivalence(app);
+        Overrides(app);
+        OffscreenReplay(app);
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+        Console.WriteLine("SCROLL_ROUTED_INPUT_TEST_OK");
+    }
+}

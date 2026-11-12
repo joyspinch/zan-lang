@@ -10,7 +10,7 @@ using Gui.Widget;
 // alpha、百分数、小数 alpha）全部接受，垃圾文本保留原值不崩。
 // 3. 模式与格式化：modes 只剩一种时锁定取值格式；showAlpha 关闭
 // 时 alpha 恒 1 且文本退回 rgb(...)/#RRGGBB。
-// 4. 弹层帧推演：BeginFrame/RunOverlays 手工推帧，验证弹层登记的
+// 4. 弹层帧推演：真实 retained root + 离屏帧及 routed input，验证弹层
 // 阻挡区、外部点击关闭、以及弹层打开时输入行视图对齐 Mode。
 // （rowY 曾对 alpha 条空间双扣，输入行压住透明度条——用命中
 // 区扫描锁住：透明度条 id 必须在色相条与输入行之间可见。）
@@ -20,17 +20,16 @@ class Program {
     static ColorPicker live;
 
     static void CpPumpFrame() {
-        cpApp.RequestRedraw();
-        cpApp.PumpGuarded();
-        cpApp.FrameGuarded(CpBody);
+        cpApp.BeginOffscreenFrame();
+        CpBody();
+        // EndOffscreenFrame 统一执行 RunOverlays 并保留整帧命中快照。
+        cpApp.EndOffscreenFrame();
     }
 
-    // 弹层帧推演的帧体：真实帧循环（PresentFrame 的
-    // KeepFullSnapshot 快照）里渲染触发条 + 弹层。
+    // 保留 RenderInside 兼容入口：内部 MeasureTree/Arrange/RenderTree，
+    // 输入归属则由 SetRootControl 安装，不依赖绘制隐式建立 root。
     static void CpBody() {
-        cpApp.BeginFrame();
         live.RenderInside(cpApp, new Rect(40, 40, 220, 34));
-        cpApp.RunOverlays();
     }
 
     static void True(string what, bool got) {
@@ -204,65 +203,86 @@ class Program {
         p.SetShowAlpha(true);
 
         // ---- 弹层帧推演 ---------------------------------------------
-        // AnchorAt 读取的是 PresentFrame 里 KeepFullSnapshot 留下的
-        // 整帧命中区快照，所以帧必须走 App 的真实帧循环（
-        // SetFrameBody + FrameGuarded），手动 BeginFrame/RunOverlays
-        // 拼不出快照。
-        cpApp = new App("cp-regression", 480, 560);
+        // 无窗口 App：先安装真实输入 root、测量安排触发条，再正式打开。
+        // RenderInside 保留兼容覆盖；EndOffscreenFrame 负责弹层及快照。
+        // 首实例保留为 frameApp 上下文，不让静态上下文持有被测 App。
+        App frame = App.CreateOffscreen("cp-frame-context", 2, 2);
+        cpApp = App.CreateOffscreen("cp-regression", 480, 560);
         live = new ColorPicker(0xFF000000);
         live.Mode = "hex";
-        live.open = true;
-        cpApp.SetFrameBody(CpBody);
-        cpApp.Show();
+        live.UseApp(cpApp);
+        cpApp.SetRootControl(live);
+        CpPumpFrame();
+        live.SetOpen(true);
         for (int i = 0; i < 3; i = i + 1) {
             CpPumpFrame();
         }
         True("popup blocker", cpApp.hitTester.BlockerAt(200, 200));
         int trigId = live.wid;
-        // 纵向扫触发条中心 x：色相条之下应先命中透明度条、再是输入行。
-        // （rowY 双扣回归曾让输入行整行压住透明度条，输入行的四个
-        // Input 命中区把 alpha 条 id 全部遮没。）
+        // retained 面板共用一个命中控件，不再登记 HueOff/AlphaOff 子 id。
+        // 保留原 x=158 的纵扫：在真实色条几何内必须命中 palette，
+        // 输入行必须命中实际 HEX Input，且不能遮掉 alpha 条。
+        ColorPalettePanel panel = live.palettePanel;
+        int hueY = panel.by + cpApp.Scale(10) + cpApp.Scale(148) + cpApp.Scale(8);
+        int barH = cpApp.Scale(12);
+        int alphaY = hueY + barH + cpApp.Scale(8);
         int sawAlpha = 0 - 1;
         int sawHue = 0 - 1;
         int sawInput = 0 - 1;
-        int aId = live.wid + ColorPicker.AlphaOff();
         for (int y = 40; y < 560; y = y + 1) {
-            int id = cpApp.hitTester.AnchorAt(0, 158, y, false);
-            if (id == live.wid + ColorPicker.HueOff() && sawHue < 0) {
+            Control hit = cpApp.overlayHost.HitTest(158, y, 0);
+            if (hit == panel && y >= hueY && y < hueY + barH && sawHue < 0) {
                 sawHue = y;
             }
-            if (id == aId && sawAlpha < 0) { sawAlpha = y; }
-            if (id > aId + 4 && sawInput < 0 && sawAlpha > 0) {
-                sawInput = y;
+            if (hit == panel && y >= alphaY && y < alphaY + barH && sawAlpha < 0) {
+                sawAlpha = y;
             }
+            if (hit == live.inHex && sawInput < 0) { sawInput = y; }
         }
         True("hue bar hit", sawHue > 0);
         True("alpha bar hit", sawAlpha > 0);
-        True("input row below alpha", sawInput > sawAlpha);
-        True("alpha below hue", sawAlpha > sawHue);
+        True("input row below alpha", sawInput > sawAlpha && live.inHex.by >= alphaY + barH);
+        True("alpha below hue", sawAlpha > sawHue && alphaY >= hueY + barH);
         // 输入行视图：Mode=hex 且允许 → 打开第一帧对齐 HEX。
         EqStr("view aligned hex", live.inputView == 1 ? "hex" : "other", "hex");
         True("popup stays open", live.open);
-        True("pointer captured by popup", cpApp.PointerCaptured());
-        True("trigger not hovered", !cpApp.focus.IsHovered(trigId));
+        // 真实 Down 验证几何对应实际拖动部件，打开弹层本身不捕获指针。
+        cpApp.ProcessOffscreenInput(2, 158, hueY + barH / 2, 0, 0, 0, 0);
+        True("hue down routes to palette", cpApp.GetCapturedPointer() == panel && live.dragPart == 2);
+        cpApp.ProcessOffscreenInput(3, 158, hueY + barH / 2, 0, 0, 0, 0);
+        cpApp.ProcessOffscreenInput(2, 158, alphaY + barH / 2, 0, 0, 0, 0);
+        True("pointer captured by popup", cpApp.PointerCaptured()
+            && cpApp.GetCapturedPointer() == panel && live.dragPart == 3 && live.open);
+        True("trigger not hovered", !cpApp.focus.IsHovered(trigId) && !live.IsHovered(cpApp));
+        cpApp.ProcessOffscreenInput(3, 158, alphaY + barH / 2, 0, 0, 0, 0);
+        True("popup up releases capture", cpApp.GetCapturedPointer() == null && live.dragPart == 0);
 
         // ---- 外部按下关闭 -------------------------------------------
-        // Naive UI 语义：在弹层外*按下*即关闭（不等释放）。直改状态
-        // 模拟一次弹层外的按压帧：dragPart 复位、输入行失焦、
-        // 覆盖阶段弹层不再注册。
-        cpApp.focus.SetPressed(0 - 1);
-        live.open = false;
+        // 弹层外真实 Down 立即关闭，不等 Up，不直接写 open/pressed。
+        cpApp.ProcessOffscreenInput(2, 450, 540, 0, 0, 0, 0);
+        True("outside down closes before up", !live.open && !cpApp.overlayHost.HasActive());
+        cpApp.ProcessOffscreenInput(3, 450, 540, 0, 0, 0, 0);
         for (int i = 0; i < 3; i = i + 1) {
             CpPumpFrame();
         }
         True("closed stays closed", live.open == false);
+        True("closed removes popup blocker", !cpApp.hitTester.BlockerAt(200, 200));
 
         // ---- 重开 ----------------------------------------------------
-        live.open = true;
+        cpApp.ProcessOffscreenInput(2, 158, 57, 0, 0, 0, 0);
+        cpApp.ProcessOffscreenInput(3, 158, 57, 0, 0, 0, 0);
+        // Up 同步合成 routed Click，OnClick 直接 SetOpen；不靠重绘泵队列。
+        True("trigger reopens before repaint", live.open && cpApp.overlayHost.IsAnchorActive(live));
         for (int i = 0; i < 3; i = i + 1) {
             CpPumpFrame();
         }
-        True("trigger reopens", live.open);
+        True("trigger reopens", live.open && cpApp.overlayHost.IsAnchorActive(live));
+        live.SetOpen(false);
+        cpApp.SetRootControl(null);
+        cpApp.canvas.Destroy();
+        frame.canvas.Destroy();
+        live = null;
+        cpApp = null;
 
         // ---- Change 事件：拖 SV 落定触发一次 ------------------------
         // 直接戳字段 + 置 hsvTouched 模拟一次色盘拖动（真实拖动路径

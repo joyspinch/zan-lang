@@ -1,0 +1,119 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class RoutedKeyProbe : Control {
+    public int downs;
+    public int ups;
+    public int texts;
+    public int lastKey;
+    public RoutedKeyProbe() { this.InitControl("routed-key-probe", 0); }
+    public override void OnKeyDown(RoutedEventArgs e) { downs = downs + 1; lastKey = e.keyCode; e.Handle(); }
+    public override void OnKeyUp(RoutedEventArgs e) { ups = ups + 1; e.Handle(); }
+    public override void OnTextInput(RoutedEventArgs e) { texts = texts + 1; lastKey = e.keyCode; e.Handle(); }
+}
+
+class RoutedParentProbe : Control {
+    public Control childSource;
+    public int childEvents;
+    public RoutedParentProbe() { this.InitControl("routed-parent-probe", 0); }
+    public override void OnChildEvent(Control child, string evt) {
+        childSource = child;
+        childEvents = childEvents + 1;
+    }
+}
+
+class RoutingChild : ChildWindow {
+    public void Attach(App app, Control tree) {
+        host = app;
+        this.SetRoot(tree, null);
+    }
+}
+
+class WindowInputRoutingTest {
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("window input routing: " + label); }
+    }
+    static void Drain() {
+        Action action = Dispatcher.Take();
+        while (action != null) { action(); action = Dispatcher.Take(); }
+    }
+    static void Paint(App app, Control root) {
+        Drain();
+        app.BeginOffscreenFrame();
+        root.RenderInside(app, new Rect(0, 0, 360, 240));
+        app.EndOffscreenFrame();
+    }
+    static void Apply(App app, int kind, int x, int y, int key) {
+        app.window.SetLocalEvent(kind, x, y, 0, key, 0, 0);
+        Check("window event accepted", app.ApplyEvent(app.window.GetHandle()));
+    }
+    static void CheckRouteConsumption() {
+        RoutedKeyProbe key = new RoutedKeyProbe();
+        key.OnRouted((Control sender, RoutedEventArgs e) => { e.Handle(); });
+        Control.RouteEvent(key, new RoutedEventArgs("KeyDown", key));
+        Check("handled callback suppresses intrinsic key behavior", key.downs == 0);
+        key.OnRouted(null);
+        RoutedParentProbe parent = new RoutedParentProbe();
+        Control leaf = new Control();
+        parent.Add(leaf);
+        Control.RouteEvent(leaf, new RoutedEventArgs("CustomEvent", leaf));
+        Check("parent sees original child source", parent.childEvents == 1 && parent.childSource == leaf);
+        parent.OnPreviewRouted((Control sender, RoutedEventArgs e) => { e.Handle(); });
+        Control.RouteEvent(leaf, new RoutedEventArgs("CustomEvent", leaf));
+        Check("handled preview suppresses bubble", parent.childEvents == 1);
+    }
+    static void Main() {
+        Dispatcher.Init();
+        CheckRouteConsumption();
+        App app = App.CreateOffscreen("window input routing", 360, 240);
+        Panel root = Panel.Column();
+        Button button = new Button("Click");
+        SignalInt clicks = new SignalInt(0);
+        button.Click.Add(() => { clicks.Set(clicks.Get() + 1); });
+        root.Add(button);
+        RoutedKeyProbe key = new RoutedKeyProbe();
+        key.Prefer(100, 30);
+        root.Add(key);
+        RoutingChild child = new RoutingChild();
+        child.Attach(app, root);
+        Check("child registers input root", app.rootControl == root);
+        Paint(app, root);
+        int x = button.bx + button.bw / 2;
+        int y = button.by + button.bh / 2;
+        Apply(app, 2, x, y, 0);
+        Check("multi-window down captures button", app.GetCapturedPointer() == button);
+        Apply(app, 3, x, y, 0);
+        Drain();
+        Check("multi-window click delivered once", clicks.Get() == 1);
+        app.ApplyEvent(app.window.GetHandle());
+        Drain();
+        Check("same window event not replayed", clicks.Get() == 1);
+        app.focus.SetFocused(key.WidgetId());
+        Apply(app, 4, 0, 0, 65);
+        Check("key targets focused control", key.downs == 1 && key.lastKey == 65);
+        Apply(app, 5, 0, 0, 65);
+        Check("key release targets focused control", key.ups == 1);
+        Apply(app, 6, 0, 0, 66);
+        Check("character targets focused control", key.texts == 1 && key.lastKey == 66);
+        app.ApplyEvent(app.window.GetHandle());
+        Check("same character not replayed", key.texts == 1);
+        Check("handled character unavailable to paint input", app.EventKind() == 0);
+        Apply(app, 2, x, y, 0);
+        Check("button label focuses button ancestor", button.IsFocused(app));
+        Apply(app, 9, 0, 0, 0);
+        Check("blur cancels capture and press", app.GetCapturedPointer() == null && !button.IsPressed(app));
+        Apply(app, 3, x, y, 0);
+        Drain();
+        Check("blur prevents pending click", clicks.Get() == 1);
+        Apply(app, 2, x, y, 0);
+        Panel replacement = Panel.Column();
+        child.SetRoot(replacement, null);
+        Check("changing child root changes input root", app.rootControl == replacement);
+        Check("changing child root cancels old capture", app.GetCapturedPointer() == null);
+        app.SetRootControl(null);
+        app.ReleasePointerCapture();
+        app.canvas.Destroy();
+        Console.WriteLine("WINDOW_INPUT_ROUTING_OK");
+    }
+}

@@ -1,0 +1,123 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Component.CefBrowser;
+using Game.Foundation.Gui;
+
+// Offline lifecycle coverage. No CEF runtime is started by this fixture.
+class BrowserHostedLifecycleTest {
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+    static void Turn(App app) { app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0); }
+    static void DrawLayer(App app, LayerState layer) {
+        layer.openMs = 0;
+        app.BeginOffscreenFrame(); Layer.Render(app, layer); app.EndOffscreenFrame();
+    }
+    static Control Root(App app) {
+        Control root = new Control("hosted-browser-root");
+        root.UseApp(app); root.bx = 0; root.by = 0; root.bw = 640; root.bh = 480;
+        app.SetRootControl(root);
+        return root;
+    }
+    static CefBrowserBox Box(Control root) {
+        CefBrowserBox box = new CefBrowserBox();
+        root.Add(box); box.Arrange(0, 0, 240, 160);
+        return box;
+    }
+    static void ModalAndHidden(App app) {
+        Control root = Root(app);
+        CefBrowserBox box = Box(root);
+        BrowserNativeEntry entry = box.view.nativeEntry;
+        BrowserNativeLoop service = BrowserNativeLoop.For(app);
+        Turn(app);
+        root.Visible = false;
+        int work = service.workCount;
+        Turn(app);
+        Check(!entry.retired && !entry.shown && service.EntryCount() == 1 && service.NextDeadline() >= 0,
+            "hidden ancestor keeps service scheduled and native surface hidden");
+        root.Visible = true;
+        LayerState modal = LayerState.PromptWith("Modal", "", 0, "", 3);
+        modal.Open(app); DrawLayer(app, modal);
+        Control adapter = app.rootControl;
+        Check(!adapter.ContainsInputControl(box) && adapter.ContainsHostedControl(box),
+            "real modal excludes input but preserves structural host");
+        work = service.workCount; Turn(app);
+        Check(!entry.retired && !entry.shown && service.NextDeadline() >= 0,
+            "modal hides native input surface while keeping endpoint scheduled");
+        modal.Close(app); Turn(app);
+        Check(adapter.ContainsHostedControl(box) && !entry.retired && entry.shown && box.view.nativeEntry == entry,
+            "closed modal restores original hosted native entry");
+        ((InputRootAdapter)adapter).Detach();
+        Check(app.rootControl == root, "adapter detach restores ordinary content");
+        root.Remove(box); Turn(app);
+        Check(entry.retired && service.EntryCount() == 0,
+            "removed Box retires despite explicit root App binding");
+        Console.WriteLine("hosted hidden ancestor / real modal / adapter detach / removal: ok");
+    }
+    static void OpenLayerAndHud(App app) {
+        Control page = Root(app);
+        LayerState layer = new LayerState("Browser layer", 260, 0, 300, 220);
+        CefBrowserBox layerBox = new CefBrowserBox(); layer.SetBody(layerBox);
+        layer.Open(app); DrawLayer(app, layer);
+        BrowserNativeEntry layerEntry = layerBox.view.nativeEntry;
+        Check(layerEntry != null && app.rootControl.ContainsHostedControl(layerBox),
+            "open layer body belongs to structural host");
+        layer.state = 2; Turn(app);
+        Check(app.rootControl.ContainsHostedControl(layerBox) && !layerEntry.retired && !layerEntry.shown,
+            "minimized layer clears input snapshots but retains hidden hosted endpoint");
+        layer.state = 0; DrawLayer(app, layer); Turn(app);
+        Check(!layerEntry.retired, "restored layer reuses original native entry");
+        LayerState modal = LayerState.PromptWith("Upper modal", "", 0, "", 3);
+        modal.Open(app); DrawLayer(app, modal); Turn(app);
+        Check(!app.rootControl.ContainsInputControl(layerBox)
+            && app.rootControl.ContainsHostedControl(layerBox) && !layerEntry.retired && !layerEntry.shown,
+            "modal preserves lower open layer native endpoint");
+        layer.Close(app); Turn(app);
+        Check(layerEntry.retired && !app.rootControl.ContainsHostedControl(layerBox),
+            "closed layer no longer owns native endpoint");
+        modal.Close(app); ((InputRootAdapter)app.rootControl).Detach();
+        HudLayer hud = new HudLayer();
+        CefBrowserBox hudBox = new CefBrowserBox(); hud.Add(hudBox);
+        app.BeginOffscreenFrame(); hud.RenderIn(app, 0, 0, 240, 160); app.EndOffscreenFrame();
+        BrowserNativeEntry hudEntry = hudBox.view.nativeEntry;
+        Check(hudEntry != null && app.rootControl.ContainsHostedControl(hudBox),
+            "borrowed HUD root exposes structural members");
+        hudBox.Visible = false; Turn(app);
+        Check(!hudEntry.retired && app.rootControl.ContainsHostedControl(hudBox),
+            "hidden HUD member retains structural ownership");
+        hud.Remove(hudBox); Turn(app);
+        Check(hudEntry.retired && !app.rootControl.ContainsHostedControl(hudBox),
+            "HUD removal retires native member");
+        hud.SetVisible(false); app.SetRootControl(page);
+        Console.WriteLine("hosted open layer / modal lower layer / close / HUD removal: ok");
+    }
+    static void Rehome(App first) {
+        Control oldRoot = Root(first);
+        CefBrowserBox box = Box(oldRoot); Turn(first);
+        BrowserNativeEntry oldEntry = box.view.nativeEntry;
+        App second = App.CreateOffscreen("Rehome browser", 640, 480);
+        Control nextRoot = Root(second);
+        oldRoot.Remove(box); nextRoot.Add(box); box.Arrange(0, 0, 240, 160);
+        BrowserNativeEntry moved = box.view.nativeEntry;
+        Check(oldEntry.retired && moved != oldEntry && moved.loop.host == second,
+            "rehome retires original registration and registers new App");
+        Turn(first); Turn(second);
+        Check(!moved.retired && second.rootControl.ContainsHostedControl(box),
+            "new host continues endpoint lifecycle");
+        Control replacement = new Control("replacement"); replacement.UseApp(second);
+        second.SetRootControl(replacement); Turn(second);
+        Check(moved.retired, "root switch retires endpoint with stale explicit App binding");
+        second.StopLoop(); second.canvas.Destroy();
+        Console.WriteLine("hosted cross-App rehome / old retirement / root replacement: ok");
+    }
+    static void Main() {
+        Check(!CefHost.IsRunning(), "offline fixture requires unstarted CEF");
+        App frame = App.CreateOffscreen("Independent frame", 16, 16);
+        App app = App.CreateOffscreen("Hosted lifecycle", 640, 480);
+        ModalAndHidden(app); OpenLayerAndHud(app); Rehome(app);
+        app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy(); frame.canvas.Destroy();
+        Console.WriteLine("browser_hosted_lifecycle: ok");
+    }
+}

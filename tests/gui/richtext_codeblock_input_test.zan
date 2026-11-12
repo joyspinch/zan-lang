@@ -1,0 +1,192 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+using Gui.Component.CodeEditor;
+
+class RichCodeWitness {
+    public weak App app;
+    public weak RichText rich;
+    public weak CodeBlock code;
+    public weak Control copy;
+}
+class ScrollNotifyProbe : Control {
+    public int changes;
+    public bool redirect;
+    public Control replacement;
+    public override void OnScrollChanged() {
+        changes = changes + 1;
+        if (redirect) {
+            redirect = false;
+            this.App.SetRootControl(replacement);
+            this.App.CapturePointer(replacement, true);
+            this.SetScrollTop(7);
+        }
+    }
+}
+class RichCodeInputTest {
+    int links;
+    int copies;
+    public void Link(string action) { if (action == "go") { links = links + 1; } }
+    public void Copy() { copies = copies + 1; }
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void InputEvent(App app, int kind, int x, int y, int button, int key, int mods, int pointer) {
+        app.SetPointerDeviceType(pointer);
+        app.ProcessOffscreenInput(kind, x, y, button, key, mods, pointer);
+    }
+    static void Paint(App app, Control control) {
+        app.BeginOffscreenFrame(); control.RenderTree(app); control.RenderTree(app); app.EndOffscreenFrame();
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static void Layout(App app, Control control, int w, int h) {
+        control.UseApp(app); control.MeasureTree(app); control.Arrange(10, 10, w, h); app.SetRootControl(control);
+    }
+    static RichTextLine Row(RichText rich, int index) {
+        RichTextLine row = rich.LineAt(index);
+        if (row == null) { throw new Exception("missing layout row"); }
+        return row;
+    }
+    static string Many() {
+        string text = "";
+        for (int i = 0; i < 30; i = i + 1) { text = text + "row" + Convert.ToString(i) + "\n"; }
+        return text;
+    }
+    static void Rich(App app, RichCodeInputTest state, RichCodeWitness witness) {
+        RichText rich = new RichText(Many()); witness.rich = rich;
+        rich.scrollBar = new SignalInt(0);
+        Layout(app, rich, 240, 100);
+        Rect view = rich.ScrollViewport();
+        Check(rich.ScrollTop() == rich.ScrollExtent() - view.height && rich.scroll == 0, "bottom zero is exact pixel bottom before paint");
+        int before = rich.ScrollTop();
+        InputEvent(app, 13, view.x + 20, view.y + 20, 0, 120, 0, 0);
+        Check(rich.ScrollTop() < before && rich.scroll > 0, "rich wheel before="+Convert.ToString(before)+" after="+Convert.ToString(rich.ScrollTop())+" row="+Convert.ToString(rich.scroll)+" mode="+Convert.ToString(rich.StyleOverflowY())+" hit="+(rich.HitTest(view.x+20,view.y+20)!=null ? "yes" : "no"));
+        before = rich.ScrollTop(); int projected = rich.scroll;
+        Paint(app, rich); Check(rich.ScrollTop() == before && rich.scroll == projected, "rich paint cannot replay wheel");
+        rich.scroll = 0; rich.Arrange(10,10,240,100);
+        rich.SetMarkup(Many() + "last\n"); rich.Arrange(10,10,240,100);
+        Check(rich.scroll == 0 && rich.ScrollTop() == rich.ScrollExtent() - rich.ScrollViewport().height, "append follows bottom anchor");
+        rich.bottomAnchor = false; rich.scroll = 2; rich.Arrange(10,10,240,100);
+        Check(rich.ScrollTop() == Row(rich,0).height + Row(rich,1).height, "legacy top rows use real line tops");
+        rich.SetScrollTop(5); rich.Arrange(10,10,240,100);
+        Check(rich.ScrollTop() == 5, "pixel remainder survives legacy projection");
+        rich.SetMarkup("#z(20,70)\na\nb"); rich.scroll = 0; rich.Arrange(10,10,240,90);
+        Check(rich.ScrollExtent() == Row(rich,0).height + Row(rich,1).height + Row(rich,2).height, "variable heights define exact extent");
+        rich.SetMarkup("ab#z(20,70)\nc"); rich.Arrange(10,10,240,90);
+        RichTextLine snapshot = Row(rich,0);
+        Check(snapshot.width >= Canvas.MeasureText("ab",rich.ResolveFontPx(app))+20 && snapshot.segments[0].width > 0, "resource advance and preceding text width retained");
+        snapshot.segments.Clear(); snapshot.height = 1;
+        Check(Row(rich,0).segments.Count > 0 && Row(rich,0).height == 70, "diagnostic snapshot cannot mutate layout");
+        rich.SetMarkup("#md#@go|2,0xFFFFFFFF,0xFFFFFF00@click@"); rich.scroll = 0;
+        rich.OnLinkActivated(state.Link); Layout(app,rich,240,90);
+        view = rich.ScrollViewport();
+        RichTextLine line = Row(rich,0);
+        int x = view.x + (view.width - line.width) / 2 + 2;
+        int y = view.y + 2;
+        InputEvent(app,2,x,y,0,0,0,0); InputEvent(app,3,x,y,0,0,0,0);
+        Check(state.links == 1 && app.GetCapturedPointer() == null, "real centered link up dispatches once before paint");
+        Paint(app,rich); Check(state.links == 1, "link paint is read only");
+        InputEvent(app,2,x,y,1,0,0,0); InputEvent(app,3,x,y,1,0,0,0);
+        Check(state.links == 1, "secondary button cannot activate link");
+        InputEvent(app,2,x,y,0,0,0,1); InputEvent(app,1,x+20,y+20,0,0,0,1); InputEvent(app,3,x,y,0,0,0,1);
+        Check(state.links == 1 && app.GetCapturedPointer() == null, "link touch slop cancels click");
+        InputEvent(app,2,x,y,0,0,0,0); InputEvent(app,9,x,y,0,0,0,0); InputEvent(app,3,x,y,0,0,0,0);
+        Check(state.links == 1, "blur without up clears link press");
+        rich.SetMarkup(Many()); Layout(app,rich,240,100); rich.SetScrollTop(0);
+        view = rich.ScrollViewport(); ScrollState chrome = new ScrollState();
+        Rect track = chrome.Track(app,view.x,view.y,view.width,view.height,false);
+        int thumbY = chrome.ThumbStart(app,view.y,view.height,rich.ScrollExtent(),0);
+        InputEvent(app,2,track.x,thumbY+1,0,0,0,0);
+        Check(app.GetCapturedPointer() == rich, "rich shared thumb captures");
+        InputEvent(app,3,track.x,view.y+view.height+40,0,0,0,0);
+        Check(rich.ScrollTop() > 0 && app.GetCapturedPointer() == null, "rich final up applies final thumb coordinate");
+        for (int dpi = 150; dpi <= 200; dpi = dpi + 50) {
+            app.SetOffscreenViewport(640,480,dpi); Layout(app,rich,400,200);
+            Check(rich.ScrollViewport().x == rich.bx + app.Scale(4) + rich.computedStyle.BorderLeftPx(), "rich viewport padding scales");
+        }
+        app.SetOffscreenViewport(640,480,100);
+        app.SetRootControl(null);
+    }
+    static List<string> Source() {
+        List<string> rows = new List<string>();
+        rows.Add("alpha"); rows.Add("beta");
+        for (int i = 0; i < 28; i = i + 1) { rows.Add("line" + Convert.ToString(i)); }
+        return rows;
+    }
+    static void Code(App app, RichCodeInputTest state, RichCodeWitness witness) {
+        CodeBlock code = new CodeBlock("Zan",Source()); witness.code = code;
+        SignalInt signal = new SignalInt(2); code.UseScroll(signal); code.Copy.Add(state.Copy);
+        Layout(app,code,300,180); Paint(app,code);
+        Check(code.ScrollTop() == 2 * CodeBlock.LineHeight(app), "external signal retains line units");
+        code.SetScrollTop(5); code.Arrange(10,10,300,180);
+        Check(code.ScrollTop() == 5 && signal.Get() == 0, "code pixel remainder survives layout");
+        Rect view = code.ScrollViewport();
+        int before = code.ScrollTop();
+        InputEvent(app,13,view.x+80,view.y+10,0,-120,0,0);
+        Check(code.ScrollTop() > before && signal.Get() == code.ScrollTop()/CodeBlock.LineHeight(app), "wheel projects external signal before paint");
+        before = code.ScrollTop(); int childY = code.Children[0].by;
+        signal.Set(0); code.Arrange(10,10,300,180);
+        Check(code.ScrollTop() == 0,"same projected signal value explicitly resets pixel remainder");
+        code.SetScrollTop(before);
+        Paint(app,code); Check(code.ScrollTop() == before && code.Children[0].by == childY, "code paint cannot replay wheel or shift header");
+        InputEvent(app,13,view.x+80,code.by+5,0,-120,0,0);
+        Check(code.ScrollTop() == before, "header wheel never scrolls body");
+        code.SetScrollTop(0); Paint(app,code);
+        int x = view.x+CodeBlock.GutterWidth(app,30)+app.Scale(10);
+        InputEvent(app,2,x,view.y+2,0,0,0,0);
+        Check(app.GetCapturedPointer() == code, "code selection captures real tree");
+        InputEvent(app,3,x+200,view.y+CodeBlock.LineHeight(app)+2,0,0,0,0);
+        Check(code.SelectedText(code.WidgetId()) == "alpha\nbeta" && app.GetCapturedPointer() == null, "selection final up updates caret before release");
+        InputEvent(app,2,x,view.y+2,0,0,0,1); InputEvent(app,1,x+50,view.y+40,0,0,0,1);
+        Check(app.GetCapturedPointer() == code && CodeBlock.selDragging, "touch selection owns drag after slop");
+        InputEvent(app,9,x,view.y+40,0,0,0,1);
+        Check(!CodeBlock.selDragging && app.GetCapturedPointer() == null, "blur stops selection without up");
+        code.Focus(app); InputEvent(app,6,0,0,0,1,0,0);
+        Check(code.SelectedText(code.WidgetId()) == code.AllText(), "routed ctrl-a character selects all");
+        InputEvent(app,6,0,0,0,3,0,0);
+        Check(Clipboard.GetText() == code.AllText(), "routed ctrl-c copies selected text");
+        Control copy = code.Children[0]; witness.copy = copy;
+        Check(copy.parent == code && copy.FindApp() == app, "copy is persistent real child");
+        InputEvent(app,2,copy.bx+copy.bw/2,copy.by+copy.bh/2,0,0,0,0);
+        InputEvent(app,3,copy.bx+copy.bw/2,copy.by+copy.bh/2,0,0,0,0); Drain(app);
+        Check(state.copies == 1 && !CodeBlock.selDragging, "real copy child fires once without starting selection");
+        Paint(app,code); Drain(app); Check(state.copies == 1, "copy never replays on paint");
+        CodeBlock other = new CodeBlock("Other",Source()); other.SelectAll(other.WidgetId());
+        Check(code.SelectedText(code.WidgetId()) == "" && other.SelectedText(other.WidgetId()) != "", "static selection owner remains exclusive");
+        code.SetLines(Source()); Check(other.SelectedText(other.WidgetId()) == "", "SetLines preserves global clear contract");
+        for (int dpi = 150; dpi <= 200; dpi = dpi + 50) {
+            app.SetOffscreenViewport(640,480,dpi); Layout(app,code,500,300);
+            Rect scaled = code.ScrollViewport();
+            Check(scaled.y >= code.by + CodeBlock.HeaderHeight(app) + app.Scale(8)
+                && code.Children[0].by < scaled.y, "code header and viewport scale together");
+        }
+        app.SetOffscreenViewport(640,480,100);
+        app.SetRootControl(null);
+    }
+    static void Notify(App app) {
+        ScrollNotifyProbe probe = new ScrollNotifyProbe(); Layout(app,probe,200,100);
+        probe.SetScrollTop(10); probe.SetScrollTop(10); Check(probe.changes == 1,"same program offset never notifies");
+        probe.SetProp("style","overflow:auto"); probe.MeasureTree(app);
+        probe.scrollExtent = 500; probe.scrollExtentX = 200;
+        Control replacement = new Control("replacement"); replacement.UseApp(app); replacement.Arrange(0,0,200,100);
+        probe.replacement = replacement; probe.redirect = true;
+        Rect view = probe.ScrollViewport(); ScrollState chrome = new ScrollState(); Rect track = chrome.Track(app,view.x,view.y,view.width,view.height,false);
+        InputEvent(app,2,track.x,view.y+view.height-5,0,0,0,0);
+        Check(app.rootControl == replacement && app.GetCapturedPointer() == replacement && probe.ScrollTop() == 7,"scroll callback third root capture and offset win");
+        app.ReleasePointerCapture(); app.SetRootControl(null);
+    }
+    static void Exercise(RichCodeWitness witness) {
+        App app = App.CreateOffscreen("rich code input",640,480); witness.app = app;
+        RichCodeInputTest state = new RichCodeInputTest();
+        Rich(app,state,witness); Code(app,state,witness); Notify(app); Drain(app);
+        app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("frame",2,2);
+        RichCodeWitness witness = new RichCodeWitness(); Exercise(witness);
+        Check(witness.app == null && witness.rich == null && witness.code == null && witness.copy == null,"weak app="+Convert.ToString(witness.app==null)+" rich="+Convert.ToString(witness.rich==null)+" code="+Convert.ToString(witness.code==null)+" copy="+Convert.ToString(witness.copy==null));
+        CodeBlock.ClearSelection(); frame.canvas.Destroy(); Console.WriteLine("RICHTEXT_CODEBLOCK_INPUT_OK");
+    }
+}

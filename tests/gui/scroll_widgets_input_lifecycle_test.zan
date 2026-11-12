@@ -1,0 +1,180 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+class ScrollWidgetsWitness {
+    public weak App Host;
+    public weak VirtualList List;
+    public weak BandGrid Grid;
+    public weak Control Row;
+}
+
+class ScrollWidgetsInputTest {
+    int changes;
+    int contexts;
+    public void Changed() { changes = changes + 1; }
+    public void Context() { contexts = contexts + 1; }
+    public Control Build(int index) { return new Input("row" + Convert.ToString(index)); }
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void InputEvent(App app, int kind, int x, int y, int button, int key, int pointer) {
+        app.SetPointerDeviceType(pointer);
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, pointer);
+    }
+    static void Paint(App app, Control root) {
+        app.BeginOffscreenFrame();
+        root.RenderTree(app);
+        root.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { return; }
+            action();
+        }
+    }
+    static void Layout(App app, Control root, int w, int h) {
+        root.UseApp(app);
+        root.MeasureTree(app);
+        root.Arrange(10, 10, w, h);
+        app.SetRootControl(root);
+    }
+    static void Lists(App app, ScrollWidgetsWitness witness) {
+        ScrollWidgetsInputTest state = new ScrollWidgetsInputTest();
+        VirtualList list = new VirtualList();
+        witness.List = list;
+        list.SetRowHeight(30);
+        list.SetRows(1000, state.Build);
+        for (int dpi = 150; dpi <= 200; dpi = dpi + 50) {
+            app.SetOffscreenViewport(320, 240, dpi);
+            Layout(app, list, 200, 120);
+            Check(list.ResolveRowH(app) == app.Scale(30)
+                && list.ScrollExtent() == 1000 * app.Scale(30)
+                && list.Children[0].bh == app.Scale(30), "logical row height scales at 150 and 200 percent");
+        }
+        app.SetOffscreenViewport(320, 240, 100);
+        Layout(app, list, 200, 120);
+        Check(list.Children.Count <= 6 && list.Children.Count > 0, "virtualization stays bounded before paint");
+        Control first = list.Children[0];
+        Control overlap = list.Children[1];
+        witness.Row = first;
+        Check(first.parent == list && first.FindApp() == app, "rows enter real host tree");
+        first.Focus(app);
+        app.CapturePointer(first, true);
+        list.SetRows(500, state.Build);
+        Check(app.GetCapturedPointer() == null && !first.IsFocused(app) && first.parent == null, "SetRows retires input immediately");
+        list.Arrange(10, 10, 200, 120);
+        overlap = list.Children[1];
+        overlap.Focus(app);
+        list.SetScrollTop(30);
+        list.HitTest(40, 40, 0);
+        Check(list.Children[0] == overlap && overlap.IsFocused(app), "overlap row identity and focus survive scrolling");
+        InputEvent(app, 6, 0, 0, 0, 65, 0);
+        Check(((Input)overlap).GetText() == "A", "overlap editor receives queued text");
+        list.SetScrollTop(0);
+        list.Arrange(10, 10, 200, 120);
+        RoutedEventArgs boundary = new RoutedEventArgs("Wheel", list, 40, 50);
+        boundary.delta = 120;
+        list.RouteEvent(boundary);
+        Check(!boundary.handled && list.ScrollTop() == 0, "list boundary wheel remains available to ancestors");
+        int before = list.ScrollTop();
+        InputEvent(app, 13, 40, 50, 0, -120, 0);
+        Check(list.ScrollTop() > before, "list wheel routes before repaint");
+        before = list.ScrollTop();
+        Paint(app, list);
+        Check(list.ScrollTop() == before, "list paint cannot replay wheel or rebuild rows");
+        list.HitTest(40, 40, 0);
+        Control current = list.Children[0];
+        current.Focus(app);
+        app.CapturePointer(current, true);
+        list.Refresh();
+        Check(app.GetCapturedPointer() == null && !current.IsFocused(app) && current.parent == null, "Refresh retires old editor immediately");
+        list.Arrange(10, 10, 200, 120);
+        Control replacement = list.Children[0];
+        App other = App.CreateOffscreen("other virtual host", 320, 240);
+        app.SetRootControl(null);
+        other.SetRootControl(list);
+        list.UseApp(other);
+        replacement.Focus(other);
+        InputEvent(other, 6, 0, 0, 0, 66, 0);
+        Check(replacement.FindApp() == other && ((Input)replacement).GetText() == "B", "cross-host row inherits before paint");
+        other.CapturePointer(replacement, true);
+        list.SetItems(new List<string>());
+        Check(other.GetCapturedPointer() == null && replacement.parent == null && !replacement.IsFocused(other), "string mode removes template input tree");
+        app.ReleasePointerCapture();
+        other.SetRootControl(null);
+        other.canvas.Destroy();
+    }
+    static void Grids(App app, ScrollWidgetsWitness witness) {
+        ScrollWidgetsInputTest state = new ScrollWidgetsInputTest();
+        BandGrid grid = new BandGrid();
+        witness.Grid = grid;
+        grid.Bind(100, 4).CellSize(30, 20);
+        List<string> bands = new List<string>(); bands.Add("Header");
+        grid.BandLabels(bands, 4);
+        grid.OnChanged(state.Changed);
+        grid.OnContext(state.Context);
+        grid.SetProp("style", "border:2px solid black");
+        Layout(app, grid, 200, 150);
+        Rect view = grid.ScrollViewport();
+        Check(view.y == grid.by + 2 + grid.BandH(app), "fixed header excluded from shared input viewport");
+        int x = view.x + grid.LabelW(app) + 5;
+        int y = view.y + 5;
+        InputEvent(app, 2, x, y, 0, 0, 0);
+        Check(grid.SelectedCount() == 1 && app.GetCapturedPointer() == grid, "grid down selects and captures before paint");
+        InputEvent(app, 3, x, y, 1, 0, 0);
+        Check(app.GetCapturedPointer() == grid, "secondary release preserves grid primary selection");
+        InputEvent(app, 1, x + 35, y + 25, 0, 0, 0);
+        Check(grid.SelectedCount() == 4, "grid drag rectangle before paint");
+        InputEvent(app, 3, x + 65, y + 45, 0, 0, 0);
+        Drain(app);
+        Check(grid.SelectedCount() == 9 && app.GetCapturedPointer() == null && state.changes == 1, "grid final up coordinate and one Changed");
+        int selected = grid.SelectedCount();
+        Paint(app, grid);
+        Check(grid.SelectedCount() == selected && state.changes == 1, "grid painting is read only");
+        InputEvent(app, 2, x, y, 1, 0, 0);
+        Drain(app);
+        Check(state.contexts == 1 && grid.ContextRow() == 0 && grid.ContextCol() == 0, "grid routed context event");
+        InputEvent(app, 13, x, grid.by + 3, 0, -120, 0);
+        Check(grid.ScrollTop() == 0, "fixed header does not consume body wheel");
+        InputEvent(app, 13, x, y, 0, -120, 0);
+        Check(grid.ScrollTop() == app.scrollSpeed, "grid body uses shared wheel");
+        grid.SetScrollTop(0);
+        ScrollState metrics = new ScrollState();
+        Rect track = metrics.Track(app, view.x, view.y, view.width, view.height, false);
+        int tx = track.x + track.width / 2;
+        int ty = view.y + metrics.ThumbLength(app, view.height, grid.ScrollExtent()) / 2;
+        InputEvent(app, 2, tx, ty, 0, 0, 0);
+        Check(app.GetCapturedPointer() == grid, "shared grid scrollbar captures");
+        InputEvent(app, 3, tx, ty + 30, 0, 0, 0);
+        Check(grid.ScrollTop() > 0 && app.GetCapturedPointer() == null, "shared grid scrollbar uses final up coordinates");
+        grid.SetScrollTop(0);
+        InputEvent(app, 2, x, y, 0, 0, 1);
+        InputEvent(app, 9, x, y, 0, 0, 1);
+        Check(app.GetCapturedPointer() == null, "touch cancel clears grid selection capture");
+        selected = grid.SelectedCount();
+        InputEvent(app, 1, x + 60, y + 40, 0, 0, 1);
+        Check(grid.SelectedCount() == selected, "cancelled selection cannot resume");
+        InputEvent(app, 2, x, y, 0, 0, 0);
+        app.SetRootControl(null);
+        Check(app.GetCapturedPointer() == null, "root removal releases grid capture");
+    }
+    static void Exercise(ScrollWidgetsWitness witness) {
+        App app = App.CreateOffscreen("Scroll widgets", 320, 240);
+        witness.Host = app;
+        Lists(app, witness);
+        Grids(app, witness);
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("frame", 2, 2);
+        ScrollWidgetsWitness witness = new ScrollWidgetsWitness();
+        Exercise(witness);
+        Check(witness.Host == null && witness.List == null && witness.Grid == null && witness.Row == null, "weak lifetimes release all owned trees");
+        frame.canvas.Destroy();
+        Console.WriteLine("SCROLL_WIDGETS_INPUT_LIFECYCLE_OK");
+    }
+}

@@ -1,0 +1,176 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+namespace Gui;
+
+public partial class App : AppLoopOwner {
+    List<AppLoopRegistration> loopParticipants;
+    bool tickingLoopParticipants;
+    int loopGeneration;
+    int lastLoopTurn;
+    weak App lastLoopRoot;
+    int loopTurnSequence;
+    int loopTurnDepth;
+    long loopThreadId;
+    weak App loopTurnRoot;
+
+    void CheckLoopThread() {
+        long current = Thread.CurrentId();
+        if (loopThreadId == 0) { loopThreadId = current; }
+        if (loopThreadId != current) { throw new InvalidOperationException("App loop must run on its UI thread"); }
+    }
+
+    // Related child windows borrow their root's turn; independent Apps never
+    // share a process-global depth or deduplicate each other's event turns.
+    int BeginLoopTurn() {
+        this.CheckLoopThread();
+        App root = ChildWindows.LoopRoot(this);
+        root.CheckLoopThread();
+        if (root.loopTurnDepth == 0) {
+            root.loopTurnSequence = root.loopTurnSequence + 1;
+            if (root.loopTurnSequence == 0) { root.loopTurnSequence = 1; }
+        }
+        root.loopTurnDepth = root.loopTurnDepth + 1;
+        this.loopTurnRoot = root;
+        return root.loopTurnSequence;
+    }
+
+    void EndLoopTurn(int turn) {
+        this.EndLoopTurnForRoot(turn, this.loopTurnRoot);
+    }
+
+    void EndLoopTurnForRoot(int turn, App root) {
+        if (root == null) { return; }
+        // Child ApplyEvent is nested in root ProcessEvent. Its own input and
+        // posts finish before the root services all child participants once.
+        if (root.loopTurnDepth > 1) { root.loopTurnDepth = root.loopTurnDepth - 1; return; }
+        try {
+            if (root.isRunning) {
+                root.DrainPosts();
+                int now = Window.GetTickMs();
+                root.TickLoopParticipantsForTurn(turn, now);
+                if (root.isRunning) { ChildWindows.ServiceLoopParticipants(root, turn, now); }
+            }
+        } finally {
+            root.loopTurnDepth = 0;
+        }
+    }
+
+    void TickLoopParticipantsForTurn(int turn, int now) {
+        this.CheckLoopThread();
+        App root = ChildWindows.LoopRoot(this);
+        if ((lastLoopRoot == root && lastLoopTurn == turn) || !this.isRunning) { return; }
+        lastLoopRoot = root;
+        lastLoopTurn = turn;
+        this.TickLoopParticipants(now);
+    }
+
+    void WakeLoopParticipants() {
+        this.Wake();
+        ChildWindows.WakeLoopParent(this);
+    }
+
+    public AppLoopRegistration RegisterLoopParticipant(AppLoopOwner owner, AppLoopParticipant participant) {
+        this.CheckLoopThread();
+        if (owner == null || participant == null) { throw new ArgumentException("loop owner and participant required"); }
+        if (!this.isRunning) { throw new InvalidOperationException("App loop has stopped"); }
+        AppLoopRegistration ticket = new AppLoopRegistration();
+        ticket.host = this;
+        ticket.owner = owner;
+        ticket.participant = participant;
+        ticket.active = true;
+        ticket.generation = 1;
+        if (loopParticipants == null) { loopParticipants = new List<AppLoopRegistration>(); }
+        loopParticipants.Add(ticket);
+        this.WakeLoopParticipants();
+        return ticket;
+    }
+
+    bool LiveLoopRegistration(AppLoopRegistration ticket) {
+        if (!ticket.active || ticket.host != this || ticket.owner == null || ticket.participant == null) {
+            if (ticket.active) { ticket.Retire(); }
+            return false;
+        }
+        return true;
+    }
+
+    int MinLoopDeadline() {
+        int deadline = -1;
+        if (loopParticipants == null) { return deadline; }
+        // NextDeadline is pure; it must not register/invalidate/call user code.
+        for (int i = 0; i < loopParticipants.Count; i = i + 1) {
+            AppLoopRegistration ticket = loopParticipants[i];
+            if (!LiveLoopRegistration(ticket)) { continue; }
+            int due = ticket.participant.NextDeadline();
+            if (due >= 0 && (deadline < 0 || due < deadline)) { deadline = due; }
+        }
+        return deadline;
+    }
+
+    void TickLoopParticipants(int now) {
+        if (tickingLoopParticipants || loopParticipants == null) { return; }
+        tickingLoopParticipants = true;
+        int generation = loopGeneration;
+        // Count snapshot excludes registrations made by callbacks this turn.
+        int count = loopParticipants.Count;
+        try {
+            for (int i = 0; i < count; i = i + 1) {
+                if (generation != loopGeneration) { break; }
+                AppLoopRegistration ticket = loopParticipants[i];
+                if (!LiveLoopRegistration(ticket)) { continue; }
+                AppLoopParticipant participant = ticket.participant;
+                participant.Tick(this, now);
+            }
+        } finally {
+            tickingLoopParticipants = false;
+            if (generation == loopGeneration) { PruneLoopParticipants(); }
+        }
+    }
+
+    void PruneLoopParticipants() {
+        if (loopParticipants == null) { return; }
+        for (int i = loopParticipants.Count - 1; i >= 0; i = i - 1) {
+            if (!LiveLoopRegistration(loopParticipants[i])) { loopParticipants.RemoveAt(i); }
+        }
+    }
+
+    // Services are owned by the existing registration, not a second App table.
+    public AppLoopParticipant FindLoopService(string key) {
+        if (loopParticipants == null) { return null; }
+        for (int i = 0; i < loopParticipants.Count; i = i + 1) {
+            AppLoopRegistration ticket = loopParticipants[i];
+            if (!LiveLoopRegistration(ticket)) { continue; }
+            AppLoopParticipant participant = ticket.participant;
+            if (participant is AppLoopService) {
+                AppLoopService service = (AppLoopService)participant;
+                if (service.ServiceKey() == key) { return participant; }
+            }
+        }
+        return null;
+    }
+
+    public int LoopTurnIdentity() {
+        App root = ChildWindows.LoopRoot(this);
+        return root.loopTurnDepth > 0 ? root.loopTurnSequence : 0;
+    }
+
+    void ClearLoopParticipants() {
+        loopGeneration = loopGeneration + 1;
+        List<AppLoopRegistration> previous = loopParticipants;
+        loopParticipants = null;
+        if (previous == null) { return; }
+        Exception first = null;
+        for (int i = 0; i < previous.Count; i = i + 1) {
+            AppLoopRegistration ticket = previous[i];
+            try {
+                AppLoopParticipant participant = ticket.participant;
+                if (ticket.active && participant is AppLoopStopped) {
+                    AppLoopStopped stopped = (AppLoopStopped)participant;
+                    stopped.Stopped(this);
+                }
+            } catch (Exception error) { if (first == null) { first = error; } }
+            finally { ticket.Retire(); }
+        }
+        if (first != null) { throw first; }
+    }
+}

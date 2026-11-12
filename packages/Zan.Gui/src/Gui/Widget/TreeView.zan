@@ -84,6 +84,31 @@ public class TreeView : Control {
     public int dropAt;
     public bool dropDone;
     public Rect rowBuf;
+    // Data indices stay stable even when a template returns null.
+    private TreeRowsPanel rowsBody;
+    private bool layingRows;
+    private bool projectingScroll;
+    private int filterRevision;
+    private List<Control> dataRows;
+    private int rowsRevision;
+    private bool buildingRows;
+
+    private Control DataRow(int index) {
+        if (dataRows == null || index < 0 || index >= dataRows.Count) { return null; }
+        Control row = dataRows[index];
+        if (row == null || rowsBody == null || row.parent != rowsBody || rowsBody.IndexOf(row) < 0) { return null; }
+        return row;
+    }
+
+    private void RetireRows() {
+        rowsRevision = rowsRevision + 1;
+        rowsStale = true;
+        builtFor = -1;
+        dataRows = null;
+        // RemoveAll snapshots; Remove cancels input while the old parent path is valid.
+        if (rowsBody != null) { rowsBody.RemoveAll(); }
+    }
+
     private Checkbox treeCheck;
 
     private Checkbox TreeCheck() {
@@ -96,6 +121,8 @@ public class TreeView : Control {
     // 公共初始化（各构造共用）。
     private void InitTree() {
         this.InitControl("tree", 5);
+        rowsBody = new TreeRowsPanel(this);
+        base.Add(rowsBody);
         this.rowBuf = new Rect(0, 0, 0, 0);
         data = new List<TreeNode>();
         sel = new SignalInt(0 - 1);
@@ -138,6 +165,300 @@ public class TreeView : Control {
     }
 
     // 控件类型标识（序列化/设计器用）。
+    private bool layoutBodyActive;
+    // Generated body is rebuilt from business declarations, never copied as authored content.
+    public override void CloneContentTo(Control target, CloneTreeFn clone) {
+        TreeView copy = (TreeView)target;
+        copy.Bind(data);
+        copy.NodeSlot(tpl);
+        if (filter != null) { copy.WithFilter((Input)clone(filter)); }
+    }
+
+    // Root owns fixed chrome; rowsBody alone consumes shared scrolling input.
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        box.overflowX = 0;
+        box.overflowY = 0;
+        box.overflow = 1;
+        return box;
+    }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        int fixedH = this.FilterHeight(this.App);
+        if (fixedH > view.height) { fixedH = view.height; }
+        if (fixedH < 0) { fixedH = 0; }
+        return new Rect(view.x, view.y + fixedH, view.width, view.height - fixedH);
+    }
+
+    // Original data index, independent of structural filter/body children.
+    public Control RowControl(int index) { return this.DataRow(index); }
+    public int RowCount() { return data.Count; }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        if (layingRows || rowsBody == null) { return; }
+        layingRows = true;
+        try {
+            App app = this.FindApp();
+            Control ownerParent = parent;
+            this.BuildRows(app);
+            if (this.FindApp() != app || parent != ownerParent || rowsStale) { return; }
+
+        if (filter != null) {
+            Rect frame = base.ScrollViewport();
+            int pad = app != null ? app.Scale(6) : 6;
+            int glyph = app != null ? app.Scale(12) : 12;
+            int inset = app != null ? app.Scale(2) : 2;
+            filter.Arrange(frame.x + pad * 2 + glyph, frame.y + inset,
+                frame.width - pad * 3 - glyph, this.FilterHeight(app) - inset * 2);
+        }
+            int requested = scroll.Get();
+            Rect view = this.ScrollViewport();
+            int ticket = rowsRevision;
+            rowsBody.Arrange(view.x, view.y, view.width, view.height);
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+            if (requested != rowsBody.ScrollTop()) { rowsBody.SetScrollTop(requested); }
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+            this.LayoutBody();
+        } finally { layingRows = false; }
+    }
+
+    // Compatibility SetScrollTop/ScrollTop project the body's committed value.
+    public override void OnScrollChanged() {
+        if (projectingScroll || rowsBody == null) { return; }
+        App app = this.FindApp();
+        Control ownerParent = parent;
+        int ticket = rowsRevision;
+        int requested = scrollY;
+        if (scroll.Get() != requested) { scroll.Set(requested); }
+        if (rowsBody.ScrollTop() != requested) { rowsBody.SetScrollTop(requested); }
+        if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+        this.BodyScrolled();
+    }
+
+    public void BodyScrolled() {
+        if (rowsBody == null || projectingScroll) { return; }
+        projectingScroll = true;
+        try {
+            int value = rowsBody.ScrollTop();
+            if (scroll.Get() != value) { scroll.Set(value); }
+            if (scrollY != value || scrollX != 0) { this.CommitScrollOffset(0, value); }
+        } finally { projectingScroll = false; }
+        if (!layingRows) { this.LayoutBody(); }
+    }
+
+    public void LayoutBody() {
+        if (rowsBody == null || layoutBodyActive) { return; }
+        layoutBodyActive = true;
+        try {
+        App app = this.FindApp();
+        Control ownerParent = parent;
+        int ticket = rowsRevision;
+        Rect view = rowsBody.ScrollViewport();
+        rowsBody.scrollExtent = this.ContentHeight(app);
+        rowsBody.scrollExtentX = view.width;
+        // Read-only compatibility projection; root overflow modes are zero.
+        scrollExtent = rowsBody.scrollExtent;
+        scrollExtentX = rowsBody.scrollExtentX;
+        int max = rowsBody.scrollExtent - view.height;
+        if (max < 0) { max = 0; }
+        int off = rowsBody.ScrollTop();
+        if (off > max) { off = max; }
+        if (off < 0) { off = 0; }
+        if (off != rowsBody.ScrollTop()) { rowsBody.CommitScrollOffset(0, off); }
+        if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+        int width = view.width;
+        if (rowsBody.scrollExtent > view.height) { width = width - (app != null ? app.Scale(12) : 12); }
+        if (width < 0) { width = 0; }
+        int y = view.y - off;
+        for (int i = 0; i < data.Count; i = i + 1) {
+            Control row = this.DataRow(i);
+            bool shown = this.Shown(i);
+            int rh = row != null ? this.RowExtent(app, row) : this.RowHeight(app);
+            bool onscreen = shown && y + rh > view.y && y < view.y + view.height;
+            if (row != null) {
+                if (!onscreen && app != null) { app.ReleaseInputSubtree(row); }
+                if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+                // Reentrant cancellation can move a row; never take it back.
+                if (row.parent == rowsBody) {
+                    row.Arrange(view.x, shown ? y : view.y - rh - 1, width, rh);
+                    if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+                }
+            }
+            if (shown) { y = y + rh; }
+        }
+        this.BodyScrolled();
+        } finally { layoutBodyActive = false; }
+    }
+
+    private int DataIndexAt(int x, int y) {
+        if (rowsBody == null) { return -1; }
+        Rect view = rowsBody.ScrollViewport();
+        if (!view.Contains(x, y)) { return -1; }
+        int top = view.y - rowsBody.ScrollTop();
+        for (int i = 0; i < data.Count; i = i + 1) {
+            if (!(this.Shown(i))) { continue; }
+            Control row = this.DataRow(i);
+            int height = row != null ? this.RowExtent(this.App, row) : this.RowHeight(this.App);
+            if (y >= top && y < top + height) { return i; }
+            top = top + height;
+        }
+        return -1;
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        if (e.handled || this.IsDisabled()) { return; }
+        int index = this.DataIndexAt(e.x, e.y);
+        if (index < 0) { return; }
+        App app = this.App;
+        if (app.window.EventButton() == 1) {
+            if (!(multi && this.IsMarked(index))) {
+                if (multi) { marks = new List<int>(); }
+                sel.Set(index);
+            }
+            ctxRow = index; ctxX = e.x; ctxY = e.y;
+            Context.PostS(this);
+            e.Handle();
+            return;
+        }
+        if (app.window.EventButton() != 0) { return; }
+        dropDone = false;
+        ctxRow = index; ctxX = e.x; ctxY = e.y;
+        Press.PostS(this);
+        if (reorder) {
+            pressed = true; dragRow = index; dragging = false; dropAt = -1;
+            app.CapturePointer(this, true);
+        }
+    }
+
+    private void UpdateRoutedDrop(RoutedEventArgs e) {
+        if (!reorder || !pressed || dragRow < 0) { return; }
+        Rect view = rowsBody.ScrollViewport();
+        dragging = true;
+        dropAt = data.Count;
+        int top = view.y - rowsBody.ScrollTop();
+        for (int i = 0; i < data.Count; i = i + 1) {
+            if (!this.Shown(i)) { continue; }
+            Control row = this.DataRow(i);
+            int height = row != null ? this.RowExtent(this.App, row) : this.RowHeight(this.App);
+            if (e.y < top + height / 2) { dropAt = i; break; }
+            top = top + height;
+        }
+        this.NoteSelfDamage(this.App);
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        base.OnPointerMove(e);
+        if (!e.handled) { this.UpdateRoutedDrop(e); }
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        App app = this.App;
+        if (e.handled || app.window.EventButton() != 0 || !pressed) { return; }
+        if (dragging) { this.UpdateRoutedDrop(e); }
+        bool moved = dragging && dropAt >= 0 && dropAt != dragRow && dropAt != dragRow + 1;
+        pressed = false; dragging = false;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        if (moved) { dropDone = true; Move.PostS(this); }
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        pressed = false; dragging = false; dropAt = -1;
+        App app = this.App;
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        base.OnClick(e);
+        if (e.handled || this.IsDisabled() || dropDone) { return; }
+        int index = this.DataIndexAt(e.x, e.y);
+        if (index < 0) { return; }
+        App app = this.App;
+        if (checks && e.x >= rowsBody.bx + app.theme.paddingSmall
+            && e.x < rowsBody.bx + app.theme.paddingSmall + app.Scale(16)) {
+            TreeView.ToggleCheck(data, index);
+            ctxRow = index;
+            Check.PostS(this);
+            this.NoteSelfDamage(app);
+            e.Handle();
+            return;
+        }
+            TreeNode n = data[index];
+            int mods = app.window.EventMods();
+            if (multi && Modifiers.HasCtrl(mods)) {
+                // 将行切入/切出多选。不触发 Select
+                // （切换不是选中），目录保留
+                // 展开状态，使选择可以包含已折叠的文件夹。
+                bool was = false;
+                for (int mi = 0; mi < marks.Count; mi = mi + 1) {
+                    if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
+                }
+                if (sel.Get() == index) { sel.Set(0 - 1); was = true; }
+                if (!was) {
+                    if (sel.Get() < 0) { sel.Set(index); }
+                    else { marks.Add(index); }
+                }
+                ctxRow = index;
+                this.NoteSelfDamage(app);
+                return;
+            }
+            if (multi && Modifiers.HasShift(mods) && sel.Get() >= 0) {
+                // 将选择从焦点行扩展到本行，
+                // 只标记可见行，使折叠目录的子节点
+                // 永远不会被悄悄选中。
+                int a = sel.Get();
+                int b = index;
+                if (b < a) { int tmp = a; a = b; b = tmp; }
+                int r = a;
+                while (r <= b) {
+                    if (!this.IsMarked(r) && this.Shown(r)) { marks.Add(r); }
+                    r = r + 1;
+                }
+                ctxRow = index;
+                this.NoteSelfDamage(app);
+                return;
+            }
+            bool moved = sel.Get() != index;
+            if (multi) { marks = new List<int>(); }
+            sel.Set(index);
+            ctxRow = index;
+            if (n.isDir) {
+                n.expanded = !n.expanded;
+                this.LayoutBody();
+                if (n.expanded) { Expand.PostS(this); } else { Collapse.PostS(this); }
+            }
+            if (moved) { Select.PostS(this); }
+            if (app.DoubleClickNow()) { Activate.PostS(this); }
+            this.NoteSelfDamage(app);
+        e.Handle();
+    }
+
+    // Uses the existing gesture name; stationary delivery must come from App's
+    // shared gesture state machine, never another paint poll or component timer.
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (!e.handled && e.eventName == "LongPress" && !this.IsDisabled()) {
+            int index = this.DataIndexAt(e.x, e.y);
+            if (index >= 0) {
+                if (!(multi && this.IsMarked(index))) {
+                    if (multi) { marks = new List<int>(); }
+                    sel.Set(index);
+                }
+                ctxRow = index; ctxX = e.x; ctxY = e.y;
+                pressed = false; dragging = false; dragRow = -1; dropAt = -1;
+                App app = this.App;
+                if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+                Context.PostS(this);
+                this.NoteSelfDamage(app);
+                e.Handle();
+            }
+        }
+        if (!e.handled) { base.OnRoutedEvent(e); }
+    }
+
     public override string Kind() { return "TreeView"; }
 
     // 覆写：返回设计器属性清单（checks/empty/sel/value）。
@@ -191,7 +512,7 @@ public class TreeView : Control {
     public TreeView Bind(List<TreeNode> nodes) {
         if (nodes == null) { data = new List<TreeNode>(); }
         else { data = nodes; }
-        rowsStale = true;
+        this.RetireRows();
         if (sel.Get() >= data.Count) { sel.Set(0 - 1); }
         int mi = marks.Count - 1;
         while (mi >= 0) {
@@ -202,7 +523,14 @@ public class TreeView : Control {
     }
 
     // 标记绑定的节点为已变化，使自定义行在下一帧重建。
-    public void Refresh() { rowsStale = true; }
+    public void Refresh() {
+        if (!Dispatcher.CheckUiThread()) {
+            TreeRefreshAction action = new TreeRefreshAction(this);
+            Dispatcher.Post(action.Run);
+            return;
+        }
+        this.RetireRows();
+    }
 
     // 共享调用方的选择信号，供在节点列表重建时
     // 持久化选择的宿主使用。
@@ -214,11 +542,27 @@ public class TreeView : Control {
     // 在树顶部绘制内联过滤行，本身不进行过滤：
     // 宿主在输入变化时重新绑定过滤后的列表。
     public TreeView WithFilter(Input f) {
-        filter = f;
+        if (filter == f) { return this; }
+        filterRevision = filterRevision + 1;
+        int ticket = filterRevision;
+        Input previous = filter;
+        filter = null;
+        if (previous != null) { this.Remove(previous); }
+        if (ticket != filterRevision) { return this; }
+        if (f != null) {
+            base.Add(f);
+            if (ticket != filterRevision) { return this; }
+            if (f.parent == this) { filter = f; }
+        }
         return this;
     }
 
-    // 在每个节点前绘制三态复选框。
+    public override Control HitTest(int x, int y, int pointerType) {
+        if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
+        this.Arrange(bx, by, bw, bh);
+        return base.HitTest(x, y, pointerType);
+    }
+
     public TreeView WithChecks() {
         checks = true;
         return this;
@@ -351,7 +695,7 @@ public class TreeView : Control {
         for (int k = 0; k < data.Count; k = k + 1) {
             if (data[k].isDir) { data[k].expanded = true; }
         }
-        rowsStale = true;
+        this.LayoutBody();
     }
 
     // 折叠所有目录。
@@ -359,7 +703,7 @@ public class TreeView : Control {
         for (int k = 0; k < data.Count; k = k + 1) {
             if (data[k].isDir) { data[k].expanded = false; }
         }
-        rowsStale = true;
+        this.LayoutBody();
     }
 
     // 勾选/取消全部节点（含目录）。
@@ -398,7 +742,7 @@ public class TreeView : Control {
     // 声明式设置自定义节点行插槽
     public TreeView NodeSlot(NodeOf template) {
         tpl = template;
-        rowsStale = true;
+        this.RetireRows();
         return this;
     }
 
@@ -461,8 +805,9 @@ public class TreeView : Control {
                 else { hideDepth = 0 - 1; }
             }
             if (shown) {
-                if (this.Templated() && k < children.Count) {
-                    h = h + this.RowExtent(app, children[k]);
+                Control row = this.DataRow(k);
+                if (row != null) {
+                    h = h + this.RowExtent(app, row);
                 } else {
                     h = h + rowH;
                 }
@@ -486,30 +831,48 @@ public class TreeView : Control {
     // 已经走过了它们。
     public void BuildRows() { this.BuildRows(this.App); }
     public void BuildRows(App app) {
-        app = this.ResolveApp(app);
-        if (!rowsStale && builtFor == data.Count) { return; }
-        children = new List<Control>();
-        for (int i = 0; i < data.Count; i = i + 1) {
-            Control row = null;
-            if (tpl != null) {
-                row = tpl(data[i]);
-            } else if (data[i].extra != null) {
-                Row r = new Row().AlignCenter().Gap(6);
-                r.Child(new Label(data[i].label));
-                r.Child(new Spacer());
-                r.Child(data[i].extra);
-                row = r;
+        App host = this.FindApp();
+        Control ownerParent = parent;
+        app = host != null ? host : this.ResolveApp(app);
+        if (buildingRows || (!rowsStale && builtFor == data.Count)) { return; }
+        buildingRows = true;
+        try {
+            this.RetireRows();
+            if (this.FindApp() != host || parent != ownerParent) { return; }
+            int ticket = rowsRevision;
+            List<TreeNode> source = data;
+            NodeOf template = tpl;
+            List<Control> mapped = new List<Control>();
+            dataRows = mapped;
+            for (int i = 0; i < source.Count; i = i + 1) {
+                Control row = null;
+                if (template != null) { row = template(source[i]); }
+                else if (source[i].extra != null) {
+                    Row r = new Row().AlignCenter().Gap(6);
+                    r.Child(new Label(source[i].label));
+                    r.Child(new Spacer());
+                    r.Child(source[i].extra);
+                    row = r;
+                }
+                if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) { return; }
+                // A repeated template object cannot represent two independent rows.
+                if (row != null && rowsBody.IndexOf(row) < 0 && rowsBody.Adoptable(row)) {
+                    rowsBody.Add(row);
+                    if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) {
+                        if (ticket != rowsRevision && this.FindApp() == host && parent == ownerParent
+                            && row.parent == rowsBody) { rowsBody.Remove(row); }
+                        return;
+                    }
+                }
+                else { row = null; }
+                if (row != null && row.parent != rowsBody) { row = null; }
+                mapped.Add(row);
+                if (row != null) { row.MeasureTree(app); }
+                if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) { return; }
             }
-            if (row != null) {
-                row.parent = this;
-                children.Add(row);
-            }
-        }
-        rowsStale = false;
-        builtFor = data.Count;
-        for (int k = 0; k < children.Count; k = k + 1) {
-            children[k].MeasureTree(app);
-        }
+            rowsStale = false;
+            builtFor = source.Count;
+        } finally { buildingRows = false; }
     }
 
     // 过滤行，绘制在树自身的背景上，使其看起来是树的一部分。
@@ -519,7 +882,7 @@ public class TreeView : Control {
     }
     public Rect PaintFilter(App app) {
         int barH = this.FilterHeight(app);
-        Rect rows = new Rect(bx, by + barH, bw, bh - barH);
+        Rect rows = this.ScrollViewport();
         if (barH == 0) { return rows; }
         app = this.ResolveApp(app);
         if (app == null || app.canvas == null) { return rows; }
@@ -533,8 +896,7 @@ public class TreeView : Control {
         int inX = bx + pad * 2 + glyph;
         int inW = bw - (inX - bx) - pad;
         int inH = barH - app.Scale(4);
-        filter.Arrange(inX, by + app.Scale(2), inW, inH);
-        filter.RenderTree(app);
+        // filter is a real child; Arrange and RenderTree belong to retained traversal.
         return rows;
     }
 
@@ -684,15 +1046,6 @@ public class TreeView : Control {
         cb.MeasureTree(app);
         cb.Arrange(cx, cy, box, box);
         cb.RenderTree(app);
-        if (app.ClickAvailable() && app.window.EventButton() == 0
-            && app.mouseX >= cx && app.mouseX < cx + box
-            && app.mouseY >= rowY && app.mouseY < rowY + rowH) {
-            TreeView.ToggleCheck(data, row);
-            ctxRow = row;
-            Check.PostS(this);
-            this.NoteSelfDamage(app);
-            return true;
-        }
         return false;
     }
 
@@ -743,16 +1096,7 @@ public class TreeView : Control {
         return this.ScrollOffset(this.App, rows, contentH);
     }
     public int ScrollOffset(App app, Rect rows, int contentH) {
-        app = this.ResolveApp(app);
-        if (app != null) {
-            Scrollbar.HandleWheel(app, rows.x, rows.y, rows.width, rows.height,
-                contentH, scroll);
-        }
-        int maxOff = contentH - rows.height;
-        if (maxOff < 0) { maxOff = 0; }
-        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
-        if (scroll.Get() < 0) { scroll.Set(0); }
-        return scroll.Get();
+        return rowsBody != null ? rowsBody.ScrollTop() : 0;
     }
 
     // 拖动排序的每帧状态机：移动时更新插入位置，松手时把
@@ -807,10 +1151,10 @@ public class TreeView : Control {
                                         Style.SNormal());
         int rowH = this.RowHeight(app);
         if (rows.height <= 0 || rowH <= 0) { return; }
-        this.UpdateDrag(app, rows);
+        // Reorder state is updated by routed pointer input.
         bool dragNow = reorder && dragging;
         int dropY = 0 - 1;
-        if (dragNow) { dropAt = data.Count; }
+        // dropAt is committed by routed move/up input.
         int contentH = this.ContentHeight(app);
         int off = this.ScrollOffset(app, rows, contentH);
         bool overflow = contentH > rows.height;
@@ -836,8 +1180,8 @@ public class TreeView : Control {
             if (shown) {
                 int rh = rowH;
                 Control child = null;
-                if (this.Templated() && k < children.Count) {
-                    child = children[k];
+                child = this.DataRow(k);
+                if (child != null) {
                     rh = this.RowExtent(app, child);
                 }
                 bool onscreen = y + rh > rows.y && y < rows.y + rows.height;
@@ -847,21 +1191,14 @@ public class TreeView : Control {
                     this.rowBuf.Set(rows.x, y, rowW, rh);
                 }
                 Rect rb = this.rowBuf;
-                if (dragNow && dropY < 0 && app.mouseY < y + rh / 2) {
-                    dropAt = k;
-                    dropY = y;
-                }
-                if (child != null) {
-                    child.Arrange(rb.x, rb.y, rb.width, rb.height);
-                    child.visible = onscreen;
-                }
+                if (dragNow && dropY < 0 && dropAt == k) { dropY = y; }
                 if (onscreen) {
                     bool active = k == selRow || (multi && this.IsMarked(k));
                     int id = 0 - 1;
                     // 先绘制行背景，使其绝不会盖住行前的复选框
                     // （旧顺序会把选择高亮铺满
                     // 整行并遮住复选框）。
-                    if (!checkClick) { id = this.RowInteract(app, k, rb); }
+                    id = this.CommonId() + k;
                     if (active) {
                         c.FillRect(rb.x, rb.y, rowW, rh, rowSelected.BgOr(0));
                         c.FillRect(rb.x, rb.y, app.Scale(3), rh, indicator.BgOr(0));
@@ -880,8 +1217,6 @@ public class TreeView : Control {
                 }
                 y = y + rh;
                 if (n.isDir && !n.expanded) { hideDepth = n.depth; }
-            } else if (this.Templated() && k < children.Count) {
-                children[k].visible = false;
             }
         }
         if (dragNow) {
@@ -892,14 +1227,8 @@ public class TreeView : Control {
         // 本帧已经吃掉了拖放那一次松手；拖动源的行号留到下一次
         // 按下才重置，因为 Move 处理器在本帧之后才跑，还要读
         // MoveFrom()。
-        dropDone = false;
+        // dropDone resets on the next routed primary press.
 
-        if (overflow) {
-            Scrollbar.RenderVerticalScrollIn(app,
-                rows.x + rows.width - barW, rows.y, rows.height,
-                rows.height, contentH, scroll,
-                rows.x, rows.y, rows.width, rows.height);
-        }
     }
 
     // ---- 保留式钩子 -----------------------------------------------------
@@ -913,13 +1242,12 @@ public class TreeView : Control {
     // 覆写：按需重建模板行，画过滤框与空态提示，再画可见行
     // （含拖放指示线）。
     public override void OnPaint(App app) {
-        if (this.Templated()) { this.BuildRows(app); }
         Rect rows = this.PaintFilter(app);
         if (data.Count == 0) {
             this.PaintEmpty(app, rows);
             return;
         }
-        this.PaintRows(app, rows);
+        // Body paints rows, then the retained traversal paints real row controls.
     }
 
     // 空树时绘制 Empty 提示文本。
@@ -1050,5 +1378,38 @@ public class TreeView : Control {
         int end = TreeView.SubtreeEnd(nodes, idx);
         int j = idx + 1;
         while (j < end) { nodes[j].checked = target; j = j + 1; }
+    }
+}
+
+class TreeRefreshAction {
+    private weak TreeView owner;
+    public TreeRefreshAction(TreeView value) { owner = value; }
+    public void Run() {
+        TreeView target = owner;
+        if (target != null) { target.Refresh(); }
+    }
+}
+
+// Structural region only: the inherited Control scroll engine owns all input and bars.
+class TreeRowsPanel : Panel {
+    private weak TreeView owner;
+    public TreeRowsPanel(TreeView value) { owner = value; }
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        box.overflow = 1;
+        box.overflowX = 0;
+        box.overflowY = 2;
+        return box;
+    }
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        if (owner != null) { owner.LayoutBody(); }
+    }
+    public override void OnScrollChanged() {
+        if (owner != null) { owner.BodyScrolled(); }
+    }
+    public override void OnPaint(App app) {
+        if (owner == null) { return; }
+        owner.PaintRows(app, this.ScrollViewport());
     }
 }

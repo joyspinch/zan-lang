@@ -1,0 +1,163 @@
+using System;
+using Gui;
+
+namespace Gui;
+
+// Retained CSS scrolling: input mutates offsets, paint only reads them.
+// Offsets live on Control; Arrange owns extent calculation and clamping.
+public class ScrollState {
+    int dragAxis;
+    int dragMouse0;
+    int dragOffset0;
+    int dragMax0;
+    int dragTravel0;
+    int barW;
+
+    ScrollState() { barW = 4; }
+
+    bool WantsBar(int extent, int client, int mode) {
+        return mode == 3 || (mode == 2 && extent > client);
+    }
+
+    int Clamp(int offset, int extent, int client) {
+        int maximum = extent - client;
+        if (maximum < 0) { maximum = 0; }
+        if (offset > maximum) { return maximum; }
+        if (offset < 0) { return 0; }
+        return offset;
+    }
+
+    // Explicit event data is authoritative; no window polling or wheel claim.
+    bool WheelDelta(App app, int delta, int modifiers, int w, int h,
+                    Control host, int oxMode, int oyMode) {
+        bool xCan = oxMode >= 2 && host.scrollExtentX > w && w > 0;
+        bool yCan = oyMode >= 2 && host.scrollExtent > h && h > 0;
+        int step = delta * app.scrollSpeed / 120;
+        if (Modifiers.HasShift(modifiers) && xCan) {
+            int nextX = this.Clamp(host.scrollX - step, host.scrollExtentX, w);
+            if (nextX == host.scrollX) { return false; }
+            host.scrollX = nextX;
+            return true;
+        }
+        if (!yCan) { return false; }
+        int nextY = this.Clamp(host.scrollY - step, host.scrollExtent, h);
+        if (nextY == host.scrollY) { return false; }
+        host.scrollY = nextY;
+        return true;
+    }
+
+    // Compatibility entry for explicit callers. Retained paint never calls it.
+    bool WheelXY(App app, int x, int y, int w, int h, Control host,
+                 int oxMode, int oyMode) {
+        if (!Ui.Over(app, x, y, w, h)) { return false; }
+        return this.WheelDelta(app, app.window.EventKeyCode(),
+            app.window.EventMods(), w, h, host, oxMode, oyMode);
+    }
+
+    Rect Track(App app, int x, int y, int w, int h, bool horizontal) {
+        int cross = horizontal ? h : w;
+        int width = app.Scale(barW);
+        if (width > cross) { width = cross; }
+        if (width < 1) { width = 1; }
+        int inset = app.Scale(2);
+        if (horizontal) {
+            int top = y + h - width - inset;
+            if (top < y) { top = y; }
+            return new Rect(x, top, w, width);
+        }
+        int left = x + w - width - inset;
+        if (left < x) { left = x; }
+        return new Rect(left, y, width, h);
+    }
+
+    int ThumbLength(App app, int client, int extent) {
+        if (client <= 0) { return 0; }
+        if (extent <= client) { return client; }
+        int minimum = app.Scale(24);
+        if (minimum > client) { minimum = client; }
+        int length = (int)((long)client * client / extent);
+        if (length < minimum) { length = minimum; }
+        if (length > client) { length = client; }
+        return length;
+    }
+
+    int ThumbStart(App app, int start, int client, int extent, int offset) {
+        int travel = client - this.ThumbLength(app, client, extent);
+        int maximum = extent - client;
+        if (maximum <= 0) { return start; }
+        return start + (int)((long)this.Clamp(offset, extent, client) * travel / maximum);
+    }
+
+    bool Active() { return dragAxis != 0; }
+    bool Horizontal() { return dragAxis == 2; }
+    void Cancel() { dragAxis = 0; }
+
+    int BeginDrag(App app, bool horizontal, int pointer, int start,
+                  int client, int extent, int offset) {
+        int length = this.ThumbLength(app, client, extent);
+        int thumb = this.ThumbStart(app, start, client, extent, offset);
+        int travel = client - length;
+        int off = this.Clamp(offset, extent, client);
+        if ((pointer < thumb || pointer >= thumb + length) && travel > 0) {
+            off = this.Clamp((int)((long)(pointer - start - length / 2)
+                * (extent - client) / travel), extent, client);
+        }
+        dragAxis = horizontal ? 2 : 1;
+        dragMouse0 = pointer;
+        dragOffset0 = off;
+        dragMax0 = extent - client;
+        dragTravel0 = travel;
+        return off;
+    }
+
+    int MoveDrag(App app, int pointer, int client, int extent, int offset) {
+        int maximum = extent - client;
+        int travel = client - this.ThumbLength(app, client, extent);
+        int off = this.Clamp(offset, extent, client);
+        // Content/viewport changes reanchor at the current pointer and offset.
+        if (maximum != dragMax0 || travel != dragTravel0) {
+            dragMouse0 = pointer;
+            dragOffset0 = off;
+            dragMax0 = maximum;
+            dragTravel0 = travel;
+            return off;
+        }
+        if (travel <= 0 || maximum <= 0) { return off; }
+        return this.Clamp(dragOffset0 + (int)((long)(pointer - dragMouse0)
+            * maximum / travel), extent, client);
+    }
+
+    int PaintBar(App app, int x, int y, int w, int h, int offset,
+                 int extent, int mode, bool horizontal) {
+        int client = horizontal ? w : h;
+        if (w <= 0 || h <= 0 || !this.WantsBar(extent, client, mode)) { return offset; }
+        Rect track = this.Track(app, x, y, w, h, horizontal);
+        int length = this.ThumbLength(app, client, extent);
+        int start = this.ThumbStart(app, horizontal ? x : y, client, extent, offset);
+        Rect thumb = horizontal ? new Rect(start, track.y, length, track.height)
+            : new Rect(track.x, start, track.width, length);
+        bool overThumb = Ui.Over(app, thumb.x, thumb.y, thumb.width, thumb.height);
+        bool overBar = Ui.Over(app, track.x, track.y, track.width, track.height);
+        bool dragging = dragAxis == (horizontal ? 2 : 1);
+        StyleBox trackStyle = Control.BareBox(app, "scrollbar", Style.SNormal());
+        int state = dragging || overThumb ? Style.SHover() : Style.SNormal();
+        StyleBox thumbStyle = Style.Part(app, "scrollbar", "thumb", "", "", "", state);
+        int radius = (horizontal ? track.height : track.width) / 2;
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        if (trackStyle.bg != 0 && (dragging || overBar)) {
+            c.FillRoundRect(track.x, track.y, track.width, track.height, radius, trackStyle.bg);
+        }
+        c.FillRoundRect(thumb.x, thumb.y, thumb.width, thumb.height, radius, thumbStyle.bg);
+        c.PopClip();
+        return offset;
+    }
+
+    // Preserve the public signatures; return the supplied offset unchanged.
+    int Bar(App app, int x, int y, int w, int h, int offset, int extent, int mode) {
+        return this.PaintBar(app, x, y, w, h, offset, extent, mode, false);
+    }
+    int BarX(App app, int x, int y, int w, int h, int offset, int extent, int mode) {
+        return this.PaintBar(app, x, y, w, h, offset, extent, mode, true);
+    }
+}

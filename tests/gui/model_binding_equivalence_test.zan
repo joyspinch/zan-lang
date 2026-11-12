@@ -1,0 +1,467 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+class BindingEquivalenceModel {
+    public string text;
+    public double number;
+    public int count;
+    public bool flag;
+    public string key;
+
+    public void Plain() { count = count + 1; }
+    public void Replacement() { count = count + 10; }
+    public void Argument(string value) { text = value; }
+    public void Sender(Control sender) { key = sender.GetHandler("Click"); }
+    public void Item(Control sender, object value) { flag = value == this && sender.item == value; }
+}
+
+class BindingEquivalenceLifetime {
+    public weak Control control;
+    public weak ModelBinder binder;
+    public weak BindingEquivalenceModel model;
+}
+
+class ModelBindingEquivalenceTest {
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("model binding equivalence: " + label); }
+    }
+
+    static Control One(string html) {
+        HtmlDoc doc = Html.Parse(html, "", null);
+        return doc.root.children[0];
+    }
+
+    static ModelBinder Bind(Control c, object model) {
+        ModelBinder binder = new ModelBinder();
+        binder.SetRoot(c, model);
+        binder.Wire();
+        return binder;
+    }
+
+    static void Idle(ModelBinder binder, Control c) {
+        for (int i = 0; i < 3; i = i + 1) {
+            binder.SyncChangedNode(c);
+            binder.MarkDirty();
+            binder.SyncFromModel();
+        }
+    }
+
+    static void Paint(App app, Control c) {
+        app.BeginOffscreenFrame();
+        c.RenderInside(app, new Rect(20, 20, 240, 100));
+        app.EndOffscreenFrame();
+    }
+
+    static void Drain() {
+        Action action = Dispatcher.Take();
+        while (action != null) { action(); action = Dispatcher.Take(); }
+    }
+
+    static void QueueClick(App app, Control c, int x, int y) {
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static void Click(App app, Control c, int x, int y) {
+        QueueClick(app, c, x, y);
+        // App.Post work is enqueued globally but retains its exact owning App.
+        app.DrainPosts();
+    }
+
+    static void ScalarPair(bool html) {
+        string mode = html ? "html" : "code";
+        BindingEquivalenceModel model = new BindingEquivalenceModel();
+        model.text = "seed";
+        model.number = 0;
+        model.flag = false;
+        Control input = html ? One("<input data-bind='text'>") : new Input();
+        input.bindPath = "text";
+        ModelBinder binder = Bind(input, model);
+        Check(mode + " string load", input.GetProp("value") == "seed");
+        Idle(binder, input);
+        Check(mode + " string idle", model.text == "seed");
+        App app = App.CreateOffscreen("binding edit", 320, 180);
+        app.SetRootControl(input);
+        input.UseApp(app);
+        Paint(app, input);
+        app.focus.SetFocused(input.WidgetId());
+        ((Input)input).Autoselect = true;
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        binder.SyncChangedNode(input);
+        Check(mode + " routed string write", model.text == "A");
+        binder.Detach();
+
+        Control number = html ? One("<input type='number' data-bind='number'>") : new InputNumber();
+        number.bindPath = "number";
+        binder = Bind(number, model);
+        Check(mode + " zero load", number.GetProp("value") == "0");
+        Idle(binder, number);
+        number.SetProp("max", "1000");
+        number.SetProp("precision", "1");
+        number.SetProp("value", "23.5");
+        binder.SyncChangedNode(number);
+        Check(mode + " fractional number write UI=" + number.GetProp("value")
+            + " model=" + Convert.ToString(model.number), model.number == 23.5);
+        binder.Detach();
+
+        Control flag = html ? One("<input type='checkbox' data-bind='flag'>") : new Checkbox();
+        flag.bindPath = "flag";
+        binder = Bind(flag, model);
+        Check(mode + " false load", flag.GetProp("value") == "false");
+        Idle(binder, flag);
+        app.SetRootControl(flag);
+        flag.UseApp(app);
+        Paint(app, flag);
+        Click(app, flag, flag.bx + 8, flag.by + 8);
+        binder.SyncChangedNode(flag);
+        Check(mode + " routed bool write", model.flag);
+        binder.Detach();
+
+        // Explicit text metadata must win over the Checkbox's default bool property.
+        flag = html ? One("<input type='checkbox' z-text='text'>") : new Checkbox();
+        flag.bindPath = "text";
+        if (!html) { flag.bindProp = "label"; }
+        model.text = "caption";
+        binder = Bind(flag, model);
+        Check(mode + " explicit label load", flag.GetProp("label") == "caption");
+        flag.SetProp("label", "changed");
+        binder.SyncChangedNode(flag);
+        Check(mode + " explicit label write", model.text == "changed" && model.flag);
+        binder.Detach();
+
+        Control radio = html ? One("<radio option='2' data-bind='count'></radio>") : new Radio(2, "two");
+        radio.bindPath = "count";
+        model.count = 0;
+        binder = Bind(radio, model);
+        Check(mode + " radio zero load", radio.GetProp("value") == "0");
+        radio.SetProp("value", "2");
+        binder.SyncChangedNode(radio);
+        Check(mode + " radio integer write", model.count == 2);
+        binder.Detach();
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+
+    static string Options() {
+        JsonValue options = JsonValue.NewArray();
+        JsonValue alpha = JsonValue.NewObject();
+        alpha.PutStr("label", "Alpha");
+        alpha.PutStr("value", "alpha");
+        options.Append(alpha);
+        JsonValue beta = JsonValue.NewObject();
+        beta.PutStr("label", "Beta");
+        beta.PutStr("value", "beta");
+        options.Append(beta);
+        JsonValue zero = JsonValue.NewObject();
+        zero.PutStr("label", "Zero");
+        zero.PutStr("value", "0");
+        options.Append(zero);
+        return options.ToJson();
+    }
+
+    static void SelectPair(bool html, int kind) {
+        string mode = (html ? "html" : "code") + " source " + Convert.ToString(kind);
+        Control control = html ? One("<select data-bind='key'></select>") : new SelectBox();
+        control.bindPath = "key";
+        control.SetProp("options", Options());
+        JsonValue json = JsonValue.NewObject();
+        json.PutStr("key", "beta");
+        Dictionary<string, string> dict = new Dictionary<string, string>();
+        dict["key"] = "beta";
+        BindingEquivalenceModel poco = new BindingEquivalenceModel();
+        poco.key = "beta";
+        object model = kind == 0 ? (object)json : (kind == 1 ? (object)dict : (object)poco);
+        ModelBinder binder = Bind(control, model);
+        Check(mode + " selected option key", control.GetProp("selectedValue") == "beta");
+        Idle(binder, control);
+        Check(mode + " idle key preserved", kind == 0 ? json.Str("key", "") == "beta"
+            : (kind == 1 ? dict["key"] == "beta" : poco.key == "beta"));
+        // Numeric-looking strings remain option keys, including a key unequal to its index.
+        if (kind == 0) { json.PathSet("key", "0"); }
+        if (kind == 1) { dict["key"] = "0"; }
+        if (kind == 2) { poco.key = "0"; }
+        binder.MarkDirty();
+        binder.SyncFromModel();
+        Idle(binder, control);
+        Check(mode + " numeric text key", control.GetProp("selectedValue") == "0"
+            && (kind == 0 ? json.Str("key", "") == "0" : (kind == 1 ? dict["key"] == "0" : poco.key == "0")));
+
+        App app = App.CreateOffscreen("select binding edit", 320, 180);
+        SelectBox select = (SelectBox)control;
+        Card popup = select.EnsurePopupCard(app);
+        app.SetRootControl(popup);
+        popup.UseApp(app);
+        Paint(app, popup);
+        Control option = popup.Find("0");
+        Check(mode + " popup option exists", option != null);
+        Click(app, option, option.bx + option.bw / 2, option.by + option.bh / 2);
+        Check(mode + " routed option edit", select.SelectedValue() == "alpha");
+        binder.SyncChangedNode(control);
+        Check(mode + " routed key write", kind == 0 ? json.Str("key", "") == "alpha"
+            : (kind == 1 ? dict["key"] == "alpha" : poco.key == "alpha"));
+        Idle(binder, control);
+        binder.Detach();
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+
+    static void SelectProjections(bool html) {
+        Control select = html ? One("<select></select>") : new SelectBox();
+        select.SetProp("options", Options());
+        List<string> indices = new List<string>{ "value", "selected", "data" };
+        for (int i = 0; i < indices.Count; i = i + 1) {
+            string prop = indices[i];
+            select.SetProp("selectedValue", "0");
+            Check("numeric key selects third option", select.GetProp("value") == "2");
+            select.SetProp(prop, "0");
+            Check("index alias selects first option " + prop, select.GetProp(prop) == "0"
+                && select.GetExtra(prop) == "0" && select.GetProp("selectedValue") == "alpha");
+            select.SetProp(prop, "alpha");
+            select.SetProp(prop, "99");
+            select.SetProp(prop, "-2");
+            Check("invalid index leaves selection " + prop, select.GetProp("value") == "0");
+            select.SetProp(prop, "");
+            Check("empty index clears " + prop, select.GetProp("value") == "-1");
+            select.SetProp(prop, "1");
+            select.SetProp(prop, "-1");
+            Check("negative sentinel clears " + prop, select.GetProp("value") == "-1");
+        }
+        List<string> keys = new List<string>{ "selectedValue", "val" };
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string prop = keys[i];
+            select.SetProp(prop, "0");
+            Check("key alias selects numeric key " + prop, select.GetProp("value") == "2");
+            select.SetProp(prop, "1");
+            select.SetProp(prop, "Beta");
+            Check("key projection never falls back to index or label " + prop, select.GetProp("value") == "2");
+            select.SetProp(prop, "");
+            Check("empty key clears " + prop, select.GetProp("value") == "-1");
+        }
+        List<string> labels = new List<string>{ "text", "label", "selectedText" };
+        for (int i = 0; i < labels.Count; i = i + 1) {
+            select.SetProp(labels[i], "Beta");
+            Check("label projection " + labels[i], select.GetProp(labels[i]) == "Beta"
+                && select.GetProp("selectedValue") == "beta");
+        }
+    }
+
+    static void NumericSelect(bool html) {
+        Control select = html ? One("<select data-bind='key'></select>") : new SelectBox();
+        select.bindPath = "key";
+        select.SetProp("options", Options());
+        JsonValue model = JsonValue.NewObject();
+        model.PutInt("key", 1);
+        ModelBinder binder = Bind(select, model);
+        Check("numeric select index load", select.GetProp("value") == "1");
+        Idle(binder, select);
+        Check("numeric select idle", model.Int("key", -1) == 1);
+        select.SetProp("value", "0");
+        binder.SyncChangedNode(select);
+        Check("numeric select index write", model.Int("key", -1) == 0);
+        binder.Detach();
+    }
+
+    static void TypedDictionaries(bool html) {
+        Dictionary<string, double> numbers = new Dictionary<string, double>();
+        numbers["number"] = 0;
+        Control number = html ? One("<input type='number' data-bind='number'>") : new InputNumber();
+        number.bindPath = "number";
+        ModelBinder binder = Bind(number, numbers);
+        Check("double dictionary zero load", number.GetProp("value") == "0");
+        Idle(binder, number);
+        number.SetProp("value", "17");
+        binder.SyncChangedNode(number);
+        Check("double dictionary write", numbers["number"] == 17);
+        binder.Detach();
+        Dictionary<string, bool> flags = new Dictionary<string, bool>();
+        flags["flag"] = false;
+        Control flag = html ? One("<input type='checkbox' data-bind='flag'>") : new Checkbox();
+        flag.bindPath = "flag";
+        binder = Bind(flag, flags);
+        Check("bool dictionary false load", flag.GetProp("value") == "false");
+        Idle(binder, flag);
+        flag.SetProp("value", "true");
+        binder.SyncChangedNode(flag);
+        Check("bool dictionary write", flags["flag"]);
+        binder.Detach();
+
+        JsonValue json = JsonValue.NewObject();
+        json.PutBool("text", false);
+        flag.bindPath = "text";
+        flag.bindProp = "text";
+        binder = Bind(flag, json);
+        flag.SetProp("label", "caption");
+        binder.SyncChangedNode(flag);
+        JsonValue caption = json.PathGet("text");
+        Check("explicit text alias changes JSON to string", caption != null && caption.IsString()
+            && caption.AsString("") == "caption");
+        binder.Detach();
+    }
+
+    static Button HandlerButton(bool html) {
+        Control c = html ? One("<button onClick='run'>Run</button>") : new Button("Run");
+        if (!html) { c.SetHandler("Click", "run"); }
+        return (Button)c;
+    }
+
+    static void HandlerPair(bool html) {
+        string mode = html ? "html" : "code";
+        BindingEquivalenceModel model = new BindingEquivalenceModel();
+        Button button = HandlerButton(html);
+        ModelBinder binder = new ModelBinder();
+        binder.SetRoot(button, model);
+        binder.Handle("run", model.Plain);
+        binder.Wire();
+        binder.Wire();
+        App app = App.CreateOffscreen("binding handlers", 320, 180);
+        app.SetRootControl(button);
+        button.UseApp(app);
+        binder.SetApp(app);
+        Paint(app, button);
+        QueueClick(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(mode + " click queued", model.count == 0);
+        app.DrainPosts();
+        Check(mode + " wire idempotence", model.count == 1);
+        binder.Handle("run", model.Replacement);
+        Click(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(mode + " current handler lookup", model.count == 11);
+
+        button.SetHandler("Click", "argument");
+        button.handlerArg = "snapshot";
+        binder.HandleArg("argument", model.Argument);
+        binder.Wire();
+        button.handlerArg = "later";
+        Click(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(mode + " handler name and argument snapshot", model.text == "snapshot" && model.count == 11);
+        binder.HandleArg("argument", (string value) => { model.text = value + "!"; });
+        Click(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(mode + " argument replacement", model.text == "snapshot!");
+
+        button.SetHandler("Click", "sender");
+        binder.HandleSender("sender", model.Sender);
+        binder.Wire();
+        Click(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(mode + " sender channel", model.key == "sender");
+        button.SetHandler("Click", "item");
+        button.item = model;
+        binder.HandleItem("item", model.Item);
+        binder.Wire();
+        Click(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(mode + " item channel", model.flag);
+        button.item = null;
+
+        button.SetHandler("Click", "run");
+        binder.Wire();
+        QueueClick(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        binder.Detach();
+        app.DrainPosts();
+        Check(mode + " detached queued action inert", model.count == 11);
+        binder.SetRoot(button, model);
+        binder.Handle("run", model.Plain);
+        binder.Wire();
+        Click(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(mode + " reattach only new token", model.count == 12);
+
+        BindingEquivalenceModel next = new BindingEquivalenceModel();
+        QueueClick(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        binder.SetRoot(button, next);
+        binder.Handle("run", next.Plain);
+        binder.Wire();
+        app.DrainPosts();
+        Check(mode + " model replacement invalidates queued action", model.count == 12 && next.count == 0);
+        Click(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(mode + " replacement model receives fresh click", next.count == 1);
+        QueueClick(app, button, button.bx + button.bw / 2, button.by + button.bh / 2);
+        Button replacement = HandlerButton(html);
+        binder.SetRoot(replacement, next);
+        binder.Wire();
+        app.DrainPosts();
+        button.TriggerEvent("Click");
+        app.DrainPosts();
+        Check(mode + " root replacement invalidates old control", next.count == 1);
+        app.SetRootControl(replacement);
+        replacement.UseApp(app);
+        Paint(app, replacement);
+        Click(app, replacement, replacement.bx + replacement.bw / 2, replacement.by + replacement.bh / 2);
+        Check(mode + " replacement root handler", next.count == 2);
+        binder.Detach();
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+
+    static void RetainedHandler(BindingEquivalenceLifetime watch, Button button, bool detach) {
+        BindingEquivalenceModel model = new BindingEquivalenceModel();
+        ModelBinder binder = new ModelBinder();
+        binder.SetRoot(button, model);
+        binder.Handle("run", model.Plain);
+        binder.Wire();
+        watch.control = button;
+        watch.binder = binder;
+        watch.model = model;
+        button.TriggerEvent("Click");
+        if (detach) { binder.Detach(); }
+    }
+
+    static void HandlerLifetimes(bool html, bool detach) {
+        BindingEquivalenceLifetime watch = new BindingEquivalenceLifetime();
+        Button button = HandlerButton(html);
+        RetainedHandler(watch, button, detach);
+        Check("retained control releases binder and captured model", watch.control != null
+            && watch.binder == null && watch.model == null);
+        Drain();
+        button.TriggerEvent("Click");
+        Drain();
+        button = null;
+        Check("retained handler control cleanup", watch.control == null);
+    }
+
+    static void ReplacementSync(bool html) {
+        Control input = html ? One("<input data-bind='text'>") : new Input();
+        input.bindPath = "text";
+        BindingEquivalenceModel first = new BindingEquivalenceModel();
+        first.text = "first";
+        BindingEquivalenceModel second = new BindingEquivalenceModel();
+        second.text = "second";
+        ModelBinder binder = Bind(input, first);
+        binder.SetRoot(input, second);
+        binder.Wire();
+        Check("replacement model first sync", input.GetProp("value") == "second");
+        input.SetProp("value", "edited");
+        binder.SyncChangedNode(input);
+        Check("replacement snapshot write", first.text == "first" && second.text == "edited");
+        binder.Detach();
+    }
+
+    static void Lifetimes(BindingEquivalenceLifetime watch) {
+        BindingEquivalenceModel model = new BindingEquivalenceModel();
+        model.text = "life";
+        Control input = One("<input data-bind='text'>");
+        ModelBinder binder = Bind(input, model);
+        watch.model = model;
+        watch.control = input;
+        watch.binder = binder;
+        binder.Detach();
+    }
+
+    static void Main() {
+        Dispatcher.Init();
+        for (int mode = 0; mode < 2; mode = mode + 1) {
+            ScalarPair(mode == 0);
+            for (int kind = 0; kind < 3; kind = kind + 1) { SelectPair(mode == 0, kind); }
+            SelectProjections(mode == 0);
+            NumericSelect(mode == 0);
+            TypedDictionaries(mode == 0);
+            HandlerPair(mode == 0);
+            HandlerLifetimes(mode == 0, false);
+            HandlerLifetimes(mode == 0, true);
+            ReplacementSync(mode == 0);
+        }
+        BindingEquivalenceLifetime watch = new BindingEquivalenceLifetime();
+        Lifetimes(watch);
+        Check("weak cleanup", watch.model == null && watch.control == null && watch.binder == null);
+        Console.WriteLine("MODEL_BINDING_EQUIVALENCE_TEST_OK");
+    }
+}

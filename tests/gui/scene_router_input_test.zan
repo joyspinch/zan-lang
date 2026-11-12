@@ -1,0 +1,247 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Game.Foundation.Gui;
+using Game.Core;
+
+class RouterFocusLossProbe : Control {
+    public weak GuiHost host;
+    public weak GameViewport viewport;
+    public int losses;
+    public RouterFocusLossProbe() : base("router-focus-probe") { }
+    public override void OnInputFocusLost() {
+        losses = losses + 1;
+        GameViewport vp = viewport;
+        if (vp != null) { vp.Disabled = true; }
+        GuiHost owner = host;
+        if (owner != null) { owner.SetContentRoot(new Control("replacement")); }
+    }
+}
+
+class RootReplacementProbe : Control {
+    public Control replacement;
+    public bool replaceOnCancel;
+    public bool replaceOnFocus;
+    public RootReplacementProbe() : base("root-replacement-probe") { }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        if (replaceOnCancel) { this.App.SetRootControl(replacement); }
+    }
+    public override void OnInputFocusLost() {
+        if (replaceOnFocus) { this.App.SetRootControl(replacement); }
+    }
+}
+
+class RouterInputWitness {
+    public weak SceneRouter router;
+    public weak GuiHost host;
+    public weak App app;
+    public weak Control root;
+    public weak Control editor;
+    public RouterInputScene retained;
+}
+
+class RouterInputScene : HtmlScene {
+    public bool html;
+    public bool stopOnExit;
+    public bool stopOnEnter;
+    public string goOnEnter;
+    public int enters;
+    public int exits;
+    public int saves;
+    public string savedArg;
+    public int doubles;
+    public int changes;
+    public weak Control enteredRoot;
+
+    public RouterInputScene(bool html) { this.html = html; this.goOnEnter = ""; }
+    public override string HtmlFile() { return html ? "tests/gui/html_runtime.html" : ""; }
+    public bool TryGo(string name) {
+        SceneRouter owner = this.router;
+        return owner != null && owner.Go(name);
+    }
+    public void SaveArg(string value) { saves = saves + 1; savedArg = value; }
+    public void DoubleSave() { doubles = doubles + 1; }
+    public void NameChanged() { changes = changes + 1; }
+    public override void OnWire(HtmlHandlers handlers) {
+        handlers.AddArg("save", this.SaveArg);
+        handlers.Add("onDblSave", this.DoubleSave);
+        handlers.Add("onNameChange", this.NameChanged);
+    }
+    public override void OnEnter(Control root) {
+        enters = enters + 1;
+        enteredRoot = root;
+        if (root != null) {
+            App app = this.router.Host().App();
+            SceneRouterInputTest.Require(app.rootControl.ContainsInputControl(root), "input root precedes OnEnter");
+            Control editor = root.Find("userName");
+            editor.RenderInside(app, new Rect(20, 40, 120, 32));
+            editor.Focus(app);
+            app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+            SceneRouterInputTest.Require(((Input)editor).GetText() == "A", "OnEnter routes real text before router Render");
+        }
+        if (goOnEnter != "") {
+            this.router.Go(goOnEnter);
+            this.router.ApplyPending();
+        }
+        if (stopOnEnter) { this.router.Stop(this.router.Host()); }
+    }
+    public override void OnExit() {
+        exits = exits + 1;
+        if (stopOnExit) { this.router.Stop(this.router.Host()); }
+    }
+}
+
+class SceneRouterInputTest {
+    public static void Require(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void Exercise(RouterInputWitness witness) {
+        GuiHost host = new GuiHost("Scene router input", 320, 240, 16);
+        host.app = App.CreateOffscreen("Scene router input", 320, 240);
+        SceneRouter router = new SceneRouter(host);
+        RouterInputScene html = new RouterInputScene(true);
+        RouterInputScene empty = new RouterInputScene(false);
+        RouterInputScene stop = new RouterInputScene(false);
+        RouterInputScene enterStop = new RouterInputScene(true);
+        router.Register("html", html);
+        router.Register("empty", empty);
+        router.Register("stop", stop);
+        router.Register("enter-stop", enterStop);
+        router.Go("html");
+        router.ApplyPending();
+        router.Render(host, host.app.canvas, 0);
+        Control oldRoot = router.hudRoot;
+        Control editor = oldRoot.Find("userName");
+        Control button = oldRoot.Find("ok");
+        int clickX = button.bx + button.bw / 2;
+        int clickY = button.by + button.bh / 2;
+        Require(button.bw > 0 && button.bh > 0, "scene button has actual layout");
+        host.app.ProcessOffscreenInput(2, clickX, clickY, 0, 0, 0, 0);
+        host.app.ProcessOffscreenInput(3, clickX, clickY, 0, 0, 0, 0);
+        host.app.DrainPosts();
+        Control hit = host.app.rootControl.HitTest(clickX, clickY, 0);
+        Require(html.saves == 1 && html.savedArg == "apple" && html.doubles == 0 && html.changes == 0,
+            "HTML scene button dispatch saves=" + html.saves + " doubles=" + html.doubles + " changes=" + html.changes
+            + " hit=" + (hit == null ? "null" : hit.Kind()) + " button=" + button.bx + "," + button.by + "," + button.bw + "," + button.bh
+            + " root=" + oldRoot.bx + "," + oldRoot.by + "," + oldRoot.bw + "," + oldRoot.bh);
+        editor.Focus(host.app);
+        host.app.CapturePointer(editor, true);
+        router.Go("empty");
+        router.ApplyPending();
+        Require(router.current == empty && router.hudRoot == null && !editor.IsFocused(host.app)
+            && host.app.GetCapturedPointer() == null && !host.app.rootControl.ContainsInputControl(oldRoot),
+            "HTML to empty scene releases old focus capture and root");
+        witness.root = oldRoot;
+        witness.editor = editor;
+        oldRoot = null;
+        editor = null;
+        button = null;
+        Require(witness.root == null && witness.editor == null, "retired scene controls release without manual unwire");
+        empty.goOnEnter = "html";
+        router.Go("empty");
+        router.ApplyPending();
+        Require(router.current == empty && router.pendingName == "html", "OnEnter Go remains pending under reentry");
+        router.ApplyPending();
+        Require(router.current == html && html.enters == 2, "next ApplyPending enters queued scene once");
+        html.stopOnExit = true;
+        router.Go("empty");
+        router.ApplyPending();
+        Require(router.current == null && router.hudRoot == null && host.contentRoot == null && html.exits == 2,
+            "OnExit Stop cancels stale outer transition");
+        stop.stopOnExit = true;
+        router.Go("stop");
+        router.ApplyPending();
+        router.Stop(host);
+        router.Stop(host);
+        Require(stop.exits == 1 && router.current == null && host.contentRoot == null,
+            "Stop reentry exits current scene once");
+        enterStop.stopOnEnter = true;
+        router.Go("enter-stop");
+        router.ApplyPending();
+        Require(enterStop.exits == 1 && router.current == null && router.hudRoot == null && host.contentRoot == null,
+            "OnEnter Stop leaves no stale content root");
+        witness.retained = html;
+        witness.router = router;
+        witness.host = host;
+        witness.app = host.app;
+        host.app.canvas.Destroy();
+    }
+
+    static void TestDownFocusReentry() {
+        GuiHost host = new GuiHost("Down focus reentry", 240, 180, 16);
+        host.app = App.CreateOffscreen("Down focus reentry", 240, 180);
+        Control root = new Control("root");
+        RouterFocusLossProbe previous = new RouterFocusLossProbe();
+        GameViewport viewport = GameViewport.Create(null);
+        root.Add(previous);
+        root.Add(viewport);
+        host.SetContentRoot(root);
+        root.Arrange(0, 0, 240, 180);
+        previous.RenderInside(host.app, new Rect(0, 0, 20, 20));
+        viewport.RenderInside(host.app, new Rect(30, 50, 80, 60));
+        previous.host = host;
+        previous.viewport = viewport;
+        previous.Focus(host.app);
+        host.app.ProcessOffscreenInput(2, 45, 70, 0, 0, 0, 0);
+        Require(previous.losses == 1 && !viewport.Input.IsLeftDown
+            && host.app.GetCapturedPointer() == null, "focus-loss root replacement cannot recapture stale viewport");
+        host.SetContentRoot(null);
+        host.app.canvas.Destroy();
+    }
+
+    static void TestDirectRootReplacement() {
+        App app = App.CreateOffscreen("Direct roots", 240, 180);
+        GameViewport viewport = GameViewport.Create(null);
+        app.SetRootControl(viewport);
+        viewport.RenderInside(app, new Rect(30, 50, 80, 60));
+        viewport.Focus(app);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 65, 0, 0);
+        app.CapturePointer(viewport, true);
+        HudLayer hud = new HudLayer();
+        hud.RenderIn(app, 0, 0, 20, 20);
+        Require(viewport.IsFocused(app) && viewport.Input.keyState[65] && app.GetCapturedPointer() == viewport,
+            "new aggregate preserves existing viewport focus and capture");
+        app.SetRootControl(app.rootControl);
+        Require(viewport.Input.keyState[65] && app.GetCapturedPointer() == viewport, "same root is no-op");
+        app.SetRootControl(new Control("new-content"));
+        Require(!viewport.Input.keyState[65] && viewport.Input.keyJustReleased[65]
+            && app.GetCapturedPointer() == null && !viewport.IsFocused(app), "direct root replacement releases old held viewport");
+        RootReplacementProbe cancel = new RootReplacementProbe();
+        cancel.RenderInside(app, new Rect(0, 0, 40, 40));
+        app.SetRootControl(cancel);
+        Control third = new Control("cancel-third");
+        cancel.replacement = third;
+        cancel.replaceOnCancel = true;
+        app.CapturePointer(cancel, true);
+        app.SetRootControl(new Control("superseded-cancel"));
+        Require(app.rootControl == third, "Cancel callback third root wins");
+        RootReplacementProbe focused = new RootReplacementProbe();
+        focused.RenderInside(app, new Rect(0, 0, 40, 40));
+        app.SetRootControl(focused);
+        focused.Focus(app);
+        Control finalRoot = new Control("focus-third");
+        focused.replacement = finalRoot;
+        focused.replaceOnFocus = true;
+        app.SetRootControl(new Control("superseded-focus"));
+        Require(app.rootControl == finalRoot, "focus loss callback third root wins");
+        cancel.replacement = null;
+        focused.replacement = null;
+        hud.SetVisible(false);
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+
+    static void Main() {
+        TestDownFocusReentry();
+        TestDirectRootReplacement();
+        RouterInputWitness witness = new RouterInputWitness();
+        Exercise(witness);
+        Require(witness.router == null && witness.host == null && witness.app == null,
+            "closed router scene host and app release weakly");
+        Require(witness.retained.router == null && !witness.retained.TryGo("html"),
+            "externally retained scene handles absent router safely");
+        Console.WriteLine("SCENE_ROUTER_INPUT_OK");
+    }
+}

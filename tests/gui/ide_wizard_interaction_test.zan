@@ -1,0 +1,307 @@
+using System;
+using System.Globalization;
+using Gui;
+using Gui.Widget;
+
+// Compile this entry with the IDE Wizard partials, its three model files and
+// WizardHost. Packages come from the main repository via --package-project.
+class IdeWizardCloseOwner {
+    WizardHost host;
+    SignalInt calls;
+
+    public IdeWizardCloseOwner(WizardHost window, SignalInt count) {
+        host = window;
+        calls = count;
+    }
+
+    public void Close() {
+        calls.Set(calls.Get() + 1);
+        // Closing is allowed to reenter. The host must clear its callback first.
+        host.OnCloseRequested();
+    }
+}
+
+class IdeWizardCloseWatch {
+    public weak IdeWizardCloseOwner owner;
+}
+
+class IdeWizardWatch {
+    public weak Wizard owner;
+}
+
+class IdeWizardInteractionTest {
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("IDE wizard interaction: " + label); }
+    }
+
+    static int Paint(App app, Wizard wizard) {
+        Action posted = Dispatcher.Take();
+        while (posted != null) {
+            posted();
+            posted = Dispatcher.Take();
+        }
+        app.BeginOffscreenFrame();
+        int action = wizard.Show(app);
+        app.EndOffscreenFrame();
+        return action;
+    }
+
+    static Control Find(App app, string text) {
+        Control root = app.rootControl;
+        if (root == null) { throw new Exception("IDE wizard has no interaction root"); }
+        Control found = root.Find(text);
+        if (found == null) { throw new Exception("IDE wizard control missing: " + text); }
+        return found;
+    }
+
+    static string Geometry(Control control) {
+        string detail = "";
+        while (control != null) {
+            detail = detail + " [" + control.Kind() + " text=" + control.GetProp("text")
+                + " x=" + Convert.ToString(control.bx) + " y=" + Convert.ToString(control.by)
+                + " w=" + Convert.ToString(control.bw) + " h=" + Convert.ToString(control.bh) + "]";
+            control = control.Parent();
+        }
+        return detail;
+    }
+
+    static int Click(App app, Wizard wizard, Control control) {
+        if (control.bw <= 0 || control.bh <= 0) {
+            throw new Exception("IDE wizard interaction: click target has visible geometry" + Geometry(control));
+        }
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        // A flat hit table alone can produce Ui.Clicked. Capture proves the
+        // real VisualTree path reached the retained Button through its label.
+        if (control is Button) {
+            Check("pointer down reaches retained button " + control.GetProp("name") + Geometry(control), app.GetCapturedPointer() == control);
+        }
+        Paint(app, wizard);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        int action = Paint(app, wizard);
+        Check("pointer up releases capture", app.GetCapturedPointer() == null);
+        return action;
+    }
+
+    static bool Visible(Control control) {
+        while (control != null) {
+            if (!control.StyleVisible()) { return false; }
+            control = control.Parent();
+        }
+        return true;
+    }
+
+    static void AttachClose(WizardHost host, IdeWizardCloseWatch watch, SignalInt calls) {
+        IdeWizardCloseOwner owner = new IdeWizardCloseOwner(host, calls);
+        watch.owner = owner;
+        host.OnClose(() => { owner.Close(); });
+    }
+
+    static void TestCloseCallback() {
+        WizardHost host = new WizardHost("Close callback", 320, 200);
+        IdeWizardCloseWatch watch = new IdeWizardCloseWatch();
+        SignalInt calls = new SignalInt(0);
+        AttachClose(host, watch, calls);
+        Check("registered close callback retains owner", watch.owner != null);
+        host.OnCloseRequested();
+        Check("close callback fires once despite reentry", calls.Get() == 1);
+        Check("close callback releases captured owner", watch.owner == null);
+        host.OnCloseRequested();
+        Check("second close does not call callback", calls.Get() == 1);
+    }
+
+    static void TestCategorized(App app) {
+        List<string> categories = new List<string>();
+        categories.Add("Window App");
+        categories.Add("Console");
+        categories.Add("Empty");
+        List<WizardTemplate> templates = new List<WizardTemplate>();
+        templates.Add(new WizardTemplate("Window App", "Form project", "", "Form description")
+            .Shape(true, 800, 600, false).Look("", "form").Caps("forms").Plats("windows"));
+        templates.Add(new WizardTemplate("Window App", "Chart project", "", "Chart description")
+            .Shape(true, 1024, 768, false).Look("", "chart").Plats("windows,linux"));
+        templates.Add(new WizardTemplate("Console", "Console project", "", "Console description")
+            .Look("", "console").Plats("linux"));
+        List<WizardTarget> targets = new List<WizardTarget>();
+        targets.Add(new WizardTarget("Windows", 1, "windows-x64"));
+        targets.Add(new WizardTarget("Linux", 0, "linux-x64"));
+        List<string> groups = new List<string>();
+        groups.Add("Desktop");
+        SignalInt category = new SignalInt(0);
+        SignalInt selected = new SignalInt(0);
+        SignalInt size = new SignalInt(-1);
+        SignalInt device = new SignalInt(0);
+        SignalInt rotation = new SignalInt(0);
+        Input name = new Input();
+        Input location = new Input();
+        Input width = new Input();
+        Input height = new Input();
+        name.SetText("Project");
+        location.SetText("D:/Projects");
+        width.SetText("800");
+        height.SetText("600");
+        Wizard.notice = "";
+        Wizard wizard = Wizard.Categorized("New Project", categories, category,
+            templates, selected, name, location, targets, groups, size, width, height,
+            device, rotation);
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        Check("categorized initial paint has no action", Paint(app, wizard) == 0);
+        Control root = app.rootControl;
+        Control first = Find(app, "wizard-template-0");
+        Control second = Find(app, "wizard-template-1");
+        Control preview = Find(app, "wizard-preview");
+        Check("categorized name belongs to tree", name.Parent() != null);
+        Check("categorized preview is visible", Visible(preview));
+        Click(app, wizard, name);
+        Check("categorized name receives focus", name.IsFocused(app));
+        Paint(app, wizard);
+        Check("categorized repaint retains focus and root",
+            name.IsFocused(app) && app.rootControl == root);
+        Check("categorized repaint retains template controls",
+            Find(app, "wizard-template-0") == first && Find(app, "wizard-template-1") == second);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 88, 0, 0);
+        Paint(app, wizard);
+        Paint(app, wizard);
+        Check("categorized input handles event once", name.GetText() == "ProjectX");
+
+        Click(app, wizard, Find(app, "wizard-target-1"));
+        Check("unsupported target rejected", targets[1].selected == 0 && Wizard.notice != "");
+        Check("platform refusal notice visible", Visible(Find(app, "wizard-notice")));
+        Wizard.notice = "";
+        Click(app, wizard, second);
+        Check("template uses global index", selected.Get() == 1);
+        Click(app, wizard, Find(app, "wizard-target-1"));
+        Check("supported target toggles on", targets[1].selected == 1);
+        Click(app, wizard, Find(app, "wizard-device-1"));
+        Check("phone profile sets portrait dimensions",
+            device.Get() == 1 && width.GetText() == "390" && height.GetText() == "844");
+        Click(app, wizard, Find(app, "wizard-orientation-1"));
+        Check("phone orientation updates dimensions",
+            rotation.Get() == 1 && width.GetText() == "844" && height.GetText() == "390");
+        Click(app, wizard, Find(app, "wizard-device-0"));
+        Click(app, wizard, Find(app, "wizard-size-preset-0"));
+        Check("desktop preset updates dimensions",
+            size.Get() == 0 && width.GetText() == "320" && height.GetText() == "240");
+
+        Click(app, wizard, Find(app, "wizard-category-1"));
+        Check("category selects first global template", category.Get() == 1 && selected.Get() == 2);
+        Check("non-sizeable template hides sizes", !Visible(Find(app, "wizard-size-width")));
+        Click(app, wizard, Find(app, "wizard-target-0"));
+        Check("unsupported selected target can be removed", targets[0].selected == 0);
+        Click(app, wizard, Find(app, "wizard-category-2"));
+        Check("empty category clears template selection", category.Get() == 2 && selected.Get() == -1);
+        Check("empty category disables create", Find(app, "wizard-create").IsDisabled());
+        Click(app, wizard, Find(app, "wizard-category-0"));
+        Check("returning category selects global first", selected.Get() == 0);
+        Check("category changes reuse template control", Find(app, "wizard-template-0") == first);
+        Check("category changes keep input text",
+            name.GetText() == "ProjectX" && location.GetText() == "D:/Projects");
+        Check("browse returns action three", Click(app, wizard, Find(app, "wizard-browse")) == 3);
+        Check("browse action is consumed once", Paint(app, wizard) == 0);
+        Check("categorized create returns one", Click(app, wizard, Find(app, "wizard-create")) == 1);
+        Check("categorized cancel returns two", Click(app, wizard, Find(app, "wizard-cancel")) == 2);
+        Check("categorized close returns two", Click(app, wizard, Find(app, "wizard-close")) == 2);
+        Check("categorized preview retains root", Find(app, "wizard-preview") == preview);
+        app.SetRootControl(null);
+        app.ReleasePointerCapture();
+        IdeWizardWatch watch = new IdeWizardWatch();
+        watch.owner = wizard;
+        Button oldButton = (Button)FindDetached(root, "wizard-create");
+        oldButton.Click.Post();
+        wizard = null;
+        Check("detached categorized buttons do not retain wizard", watch.owner == null);
+        Action posted = Dispatcher.Take();
+        while (posted != null) {
+            posted();
+            posted = Dispatcher.Take();
+        }
+        Check("expired categorized action remains harmless", watch.owner == null);
+        Wizard.notice = "";
+    }
+
+    static Control FindDetached(Control root, string name) {
+        Control control = root.Find(name);
+        if (control == null) { throw new Exception("Missing detached wizard control: " + name); }
+        return control;
+    }
+
+    static void Main() {
+        Dispatcher.Init();
+        App app = App.CreateOffscreen("IDE wizard interaction", 960, 720);
+        List<WizardItem> items = new List<WizardItem>();
+        items.Add(new WizardItem("File A", "", "First file kind"));
+        items.Add(new WizardItem("File B", "", "Second file kind"));
+        SignalInt selected = new SignalInt(0);
+        SignalInt size = new SignalInt(-1);
+        Input name = new Input();
+        Input width = new Input();
+        Input height = new Input();
+        Wizard wizard = new Wizard("New File", items, selected, name, name, false,
+            size, width, height);
+        Check("initial paint has no action", Paint(app, wizard) == 0);
+        Control root = app.rootControl;
+        Check("single list installs retained root", root != null);
+        Check("name belongs to interaction tree", name.Parent() != null);
+        Check("idle paint has no action", Paint(app, wizard) == 0);
+        Check("retained root survives repaint", app.rootControl == root);
+
+        Control second = Find(app, "File B");
+        Check("item click has no terminal action", Click(app, wizard, second) == 0);
+        Check("item click updates selection", selected.Get() == 1);
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        Paint(app, wizard);
+        Control description = Find(app, "Second file kind");
+        Check("description updates after selection", description.Visible);
+
+        Click(app, wizard, name);
+        Check("pointer establishes name focus", name.IsFocused(app));
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Paint(app, wizard);
+        Check("focused name accepts character", name.GetText() == "A");
+        Paint(app, wizard);
+        Check("idle repaint does not insert twice", name.GetText() == "A");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 66, 0, 0);
+        Paint(app, wizard);
+        Check("later character reaches same input", name.GetText() == "AB");
+
+        Control qvga = Find(app, "QVGA");
+        Check("preset click has no terminal action", Click(app, wizard, qvga) == 0);
+        Check("preset updates selection and dimensions",
+            size.Get() == 0 && width.GetText() == "320" && height.GetText() == "240");
+        Click(app, wizard, width);
+        Check("custom dimension receives focus", width.IsFocused(app));
+        Control footer = root.children[root.children.Count - 1];
+        Control cancel = footer.children[0];
+        Control create = footer.children[1];
+        Check("create returns action one", Click(app, wizard, create) == 1);
+        Check("cancel returns action two", Click(app, wizard, cancel) == 2);
+        Control header = root.children[0];
+        Control close = header.children[header.children.Count - 1];
+        Check("title close returns action two", Click(app, wizard, close) == 2);
+
+        // The host changes the cached wizard when the file kind hides sizes.
+        // A replacement must own a fresh root, even though its name input stays.
+        app.SetRootControl(null);
+        app.ReleasePointerCapture();
+        Wizard plain = new Wizard("New File", items, selected, name, name, false);
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        Paint(app, plain);
+        Check("replacement takes root ownership", app.rootControl != null && app.rootControl != root);
+        Control plainRoot = app.rootControl;
+        Control plainPreset = plainRoot.Find("QVGA");
+        Check("replacement hides unused sizes", plainPreset != null && !Visible(plainPreset));
+        Click(app, plain, name);
+        Check("reused input remains interactive", name.IsFocused(app));
+        app.ProcessOffscreenInput(6, 0, 0, 0, 67, 0, 0);
+        Paint(app, plain);
+        Check("reused input keeps text and accepts typing", name.GetText() == "ABC");
+
+        app.SetRootControl(null);
+        app.ReleasePointerCapture();
+        TestCategorized(app);
+        app.canvas.Destroy();
+        TestCloseCallback();
+        Console.WriteLine("IDE_WIZARD_INTERACTION_TEST_OK");
+    }
+}

@@ -1,0 +1,127 @@
+using Gui;
+using System.Collections.Generic;
+
+namespace Gui.Widget;
+
+// Borrows layer trees: their existing layout, parents and event routes stay intact.
+class LayerInputRoot : InputRootAdapter {
+    weak AppLayerContext context;
+
+    public LayerInputRoot(AppLayerContext context) : base("layer_input") {
+        this.context = context;
+    }
+
+    LayerState Modal() {
+        if (context == null) { return null; }
+        for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+            LayerState s = context.zorder[i];
+            if (s.open && s.modal) { return s; }
+        }
+        return null;
+    }
+
+    public override bool ContainsHostedControl(Control control) {
+        if (control == null) { return false; }
+        if (base.ContainsHostedControl(control)) { return true; }
+        if (context != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState state = context.zorder[i];
+                if (!state.open) { continue; }
+                if (state.view != null && state.view.ContainsHostedControl(control)) { return true; }
+                if (state.wrap != null && state.wrap.ContainsHostedControl(control)) { return true; }
+                if (state.promptInput != null && state.promptInput.ContainsHostedControl(control)) { return true; }
+                if (state.dialogFooter != null && state.dialogFooter.ContainsHostedControl(control)) { return true; }
+                if (state.windowFooter != null && state.windowFooter.ContainsHostedControl(control)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    public override bool ContainsInputControl(Control control) {
+        if (control == null) { return false; }
+        if (control == this) { return true; }
+        LayerState modal = this.Modal();
+        if (context != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState s = context.zorder[i];
+                if (s.ContainsLayerInput(control)) { return true; }
+                if (s == modal) { return false; }
+            }
+        }
+        return content != null && content.ContainsInputControl(control);
+    }
+
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        LayerState modal = this.Modal();
+        if (context != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState s = context.zorder[i];
+                s.CollectLayerFocus(app, controls);
+                if (s == modal) { return; }
+            }
+        }
+        base.CollectInputFocus(app, controls);
+    }
+
+    public override Control FindInputFocus(App app) {
+        LayerState modal = this.Modal();
+        if (modal != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState s = context.zorder[i];
+                Control focused = s.FindLayerFocus(app);
+                if (focused != null) { return focused; }
+                if (s == modal) { return this; }
+            }
+        }
+        if (context != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                Control focused = context.zorder[i].FindLayerFocus(app);
+                if (focused != null) { return focused; }
+            }
+        }
+        return content != null ? content.FindInputFocus(app) : null;
+    }
+
+    public override Control HitTest(int x, int y, int pointerType) {
+        if (context != null) {
+            LayerState modal = this.Modal();
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState s = context.zorder[i];
+                if (s.open && !s.modal && s.state == 2 && inputApp != null
+                    && Layer.Contains(inputApp, s, x, y)) { return this; }
+                if (s.open && (s.modal || s.state != 2) && Layer.Inside(x, y, s.inputX, s.inputY, s.inputW, s.inputH)) {
+                    Control hit = s.HitLayerInput(x, y, pointerType);
+                    return hit != null ? hit : this;
+                }
+                if (s == modal) { return this; }
+            }
+        }
+        return content != null ? content.HitTest(x, y, pointerType) : null;
+    }
+
+    // Blank surface input still reaches legacy caption/resize/shade handling.
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName == "KeyDown" && inputApp != null && Layer.Key(inputApp, e.keyCode)) {
+            e.Handle();
+        }
+    }
+
+    public override int InputPriority() { return 1; }
+
+    protected override void OnReleaseInput(App app) {
+        if (context == null) { return; }
+        for (int i = 0; i < context.zorder.Count; i = i + 1) {
+            context.zorder[i].ReleaseLayerInput();
+        }
+    }
+
+    void Activate(LayerState s) {
+        if (s.modal && inputApp != null) {
+            if (content != null) { inputApp.ReleaseInputSubtree(content); }
+            for (int i = 0; i < context.zorder.Count; i = i + 1) {
+                LayerState other = context.zorder[i];
+                if (other != s) { other.CancelLayerInput(); }
+            }
+        }
+    }
+}

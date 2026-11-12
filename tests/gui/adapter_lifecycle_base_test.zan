@@ -1,0 +1,136 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+class AdapterLifecycleBaseTest {
+    static void Check(bool value, string label) { if (!value) { throw new Exception(label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static AdapterLifecycleHooks Hooks(AdapterLifecycleProbe probe, App target, Control root, Control button) {
+        AdapterLifecycleHooks hooks = new AdapterLifecycleHooks();
+        hooks.Probe = probe; hooks.Target = target; hooks.Root = root; hooks.Button = button;
+        return hooks;
+    }
+    static void Down(App app, Control root, Control button) {
+        root.MeasureTree(app); root.Arrange(10, 10, 280, 120);
+        app.ProcessOffscreenInput(2, button.bx + button.bw / 2, button.by + button.bh / 2, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == button, "probe receives actual Down");
+    }
+    static void Up(App app, Control button) {
+        app.ProcessOffscreenInput(3, button.bx + button.bw / 2, button.by + button.bh / 2, 0, 0, 0, 0);
+        Drain(app);
+    }
+    static void RootTail() {
+        App app = App.CreateOffscreen("old SetRootControl tail", 320, 200);
+        Control fallback = new Control(); app.SetRootControl(fallback);
+        Control root = new Control(); Button button = new Button("root tail"); root.Add(button);
+        AdapterLifecycleProbe probe = new AdapterLifecycleProbe(root); probe.RetireBorrowed = false;
+        probe.Bind(app); Down(app, root, button);
+        AdapterLifecycleHooks hooks = Hooks(probe, app, root, button); button.OnRouted(hooks.RoutedCancel);
+        probe.Detach();
+        Check(hooks.Cancels == 1, "root-tail cancellation count=" + hooks.Cancels);
+        Check(app.rootControl == probe, "same-App callback Bind fences the older SetRootControl commit");
+        Check(probe.BoundApp() == app, "root-tail callback binding retains App");
+        Check(probe.Fallback() == fallback && app.GetCapturedPointer() == button
+            && app.focus.IsFocused(button.WidgetId()), "root-tail callback capture focus and fallback survive");
+        Up(app, button); probe.Detach();
+        Check(app.rootControl == fallback, "later explicit base detach restores exact fallback");
+        app.canvas.Destroy();
+    }
+    static void PendingInstall() {
+        App oldApp = App.CreateOffscreen("pending old root install", 320, 200);
+        App nextApp = App.CreateOffscreen("callback new install", 320, 200);
+        Button oldRoot = new Button("old ordinary root"); oldApp.SetRootControl(oldRoot);
+        oldRoot.UseApp(oldApp); Down(oldApp, oldRoot, oldRoot);
+        Control fallback = new Control(); nextApp.SetRootControl(fallback);
+        Control root = new Control(); Button button = new Button("new session"); root.Add(button);
+        AdapterLifecycleProbe probe = new AdapterLifecycleProbe(root);
+        // A modal-style adapter masks fallback input during its pending installation.
+        probe.FallbackInput = false;
+        AdapterLifecycleHooks hooks = Hooks(probe, nextApp, root, button); oldRoot.OnRouted(hooks.RoutedCancel);
+        probe.Bind(oldApp);
+        Check(hooks.Cancels == 1 && oldApp.rootControl == oldRoot && nextApp.rootControl == probe,
+            "callback cross-App Bind fences an installation before its first owning slot exists");
+        Check(probe.BoundApp() == nextApp && probe.Fallback() == fallback && root.FindApp() == nextApp
+            && nextApp.GetCapturedPointer() == button && nextApp.focus.IsFocused(button.WidgetId()),
+            "outer base Bind cannot erase callback binding after SetRootControl returns");
+        Up(nextApp, button); probe.Detach();
+        Check(nextApp.rootControl == fallback, "pending-install callback has independent later detach");
+        oldApp.canvas.Destroy(); nextApp.canvas.Destroy();
+    }
+    static void CrossBind() {
+        App oldApp = App.CreateOffscreen("outer Bind source", 320, 200);
+        App requested = App.CreateOffscreen("outer Bind requested target", 320, 200);
+        App callback = App.CreateOffscreen("callback chosen target", 320, 200);
+        Control oldFallback = new Control(); oldApp.SetRootControl(oldFallback);
+        Control requestedFallback = new Control(); requested.SetRootControl(requestedFallback);
+        Control callbackFallback = new Control(); callback.SetRootControl(callbackFallback);
+        Control root = new Control(); Button button = new Button("cross Bind"); root.Add(button);
+        AdapterLifecycleProbe probe = new AdapterLifecycleProbe(root); probe.Bind(oldApp); Down(oldApp, root, button);
+        AdapterLifecycleHooks hooks = Hooks(probe, callback, root, button); button.OnRouted(hooks.RoutedCancel);
+        probe.Bind(requested);
+        Check(hooks.Cancels == 1 && oldApp.rootControl == oldFallback && requested.rootControl == requestedFallback
+            && callback.rootControl == probe, "base Bind revalidates after callback-bearing cross-App Detach");
+        Check(probe.BoundApp() == callback && probe.Fallback() == callbackFallback
+            && root.FindApp() == callback && callback.GetCapturedPointer() == button,
+            "synchronous callback chooses the surviving App session");
+        Up(callback, button); probe.Detach();
+        Check(callback.rootControl == callbackFallback, "callback-selected target restores exact fallback");
+        oldApp.canvas.Destroy(); requested.canvas.Destroy(); callback.canvas.Destroy();
+    }
+    static void OwnerRenewal() {
+        App app = App.CreateOffscreen("renew exact inner owner slot", 320, 200);
+        Control fallback = new Control(); app.SetRootControl(fallback);
+        Control root = new Control(); Button button = new Button("owner renewal"); root.Add(button);
+        AdapterLifecycleProbe probe = new AdapterLifecycleProbe(root); probe.Bind(app);
+        AdapterLifecycleProbe owner = new AdapterLifecycleProbe(null); owner.Priority = 100; owner.Bind(app);
+        Down(app, root, button);
+        AdapterLifecycleHooks hooks = Hooks(probe, app, root, button);
+        hooks.Owner = owner; hooks.RenewOwner = true; button.OnRouted(hooks.RoutedCancel);
+        // Isolate owner-slot renewal from same-endpoint focus retirement semantics.
+        app.focus.ClearFocus();
+        probe.Detach();
+        Check(hooks.Cancels == 1 && app.rootControl == owner && owner.Fallback() == probe
+            && probe.BoundApp() == app && probe.Fallback() == fallback,
+            "same owner and slot identity with newer owner epoch survives stale inner detach");
+        Check(app.GetCapturedPointer() == button && app.focus.IsFocused(button.WidgetId()),
+            "renewed inner-slot session preserves callback actual Down and focus");
+        Up(app, button); probe.Detach();
+        Check(owner.Fallback() == fallback, "later inner detach splices only its own fallback");
+        owner.Detach(); Check(app.rootControl == fallback, "later owner detach restores ordinary fallback");
+        app.canvas.Destroy();
+    }
+    static void ThrowingCancel() {
+        App app = App.CreateOffscreen("throwing root retirement", 320, 200);
+        Control fallback = new Control(); app.SetRootControl(fallback);
+        Control root = new Control(); Button button = new Button("throw Cancel"); root.Add(button);
+        AdapterLifecycleProbe probe = new AdapterLifecycleProbe(root); probe.Bind(app); Down(app, root, button);
+        AdapterLifecycleHooks hooks = new AdapterLifecycleHooks(); button.OnRouted(hooks.RoutedThrowCancel);
+        int before = app.AdapterLifecycleRootGeneration();
+        bool propagated = false;
+        try { app.SetRootControl(fallback); }
+        catch (Exception ex) {
+            Check(ex.Message == "adapter cancellation sentinel", "original cancellation exception propagates");
+            propagated = true;
+        }
+        Check(propagated && hooks.Cancels == 1 && app.rootControl == probe,
+            "throwing cancellation aborts the root commit and escapes SetRootControl");
+        int after = app.AdapterLifecycleRootGeneration();
+        Check(after == before + 1, "failed root installation advances only its own generation");
+        probe.Bind(app); probe.Bind(app);
+        Check(app.AdapterLifecycleRootGeneration() == after && app.rootControl == probe
+            && probe.BoundApp() == app && probe.Fallback() == fallback,
+            "ordinary Bind after throwing cancellation cannot fence a stale pending ticket");
+        probe.Detach(); Check(app.rootControl == fallback, "explicit detach recovers after throwing callback");
+        app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("independent frame", 8, 8);
+        RootTail(); PendingInstall(); CrossBind(); OwnerRenewal(); ThrowingCancel();
+        frame.canvas.Destroy();
+        Console.WriteLine("ADAPTER_LIFECYCLE_BASE_OK");
+    }
+}

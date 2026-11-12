@@ -1,0 +1,251 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Game.Foundation.Gui;
+
+class CompositionWitness {
+    public weak App App;
+    public weak HudLayer Hud;
+    public weak InputRootAdapter HudRoot;
+    public weak InputRootAdapter LayerRoot;
+    public weak LayerState Layer;
+    public weak Control Page;
+    public weak Control Editor;
+}
+
+class InputRootCompositionTest {
+    static void Check(bool ok, string label) {
+        Console.WriteLine(label);
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void DrawHud(App app, HudLayer hud) {
+        app.BeginOffscreenFrame();
+        hud.RenderIn(app, 0, 60, 180, 32);
+        app.EndOffscreenFrame();
+    }
+
+    static void DrawLayer(App app, LayerState layer) {
+        layer.openMs = 0;
+        app.BeginOffscreenFrame();
+        Layer.Render(app, layer);
+        app.EndOffscreenFrame();
+    }
+
+    static Input Page(App app) {
+        Input page = new Input("");
+        app.SetRootControl(page);
+        app.BeginOffscreenFrame();
+        page.RenderInside(app, new Rect(0, 0, 180, 32));
+        app.EndOffscreenFrame();
+        return page;
+    }
+
+    static void Exercise(App app, CompositionWitness witness) {
+        Input page = Page(app);
+        HudLayer hud = new HudLayer();
+        Input editor = new Input("");
+        hud.Add(editor);
+        DrawHud(app, hud);
+        InputRootAdapter hudRoot = (InputRootAdapter)app.rootControl;
+        LayerState layer = new LayerState("Floating", 250, 120, 300, 240);
+        Input layerEditor = new Input("");
+        layer.SetBody(layerEditor);
+        layer.Open(app);
+        DrawLayer(app, layer);
+        InputRootAdapter layerRoot = (InputRootAdapter)app.rootControl;
+        Check(layerRoot != hudRoot && layerRoot.ContainsAdapter(hudRoot), "real Layer structurally wraps real HUD");
+        for (int i = 0; i < 3; i = i + 1) {
+            DrawHud(app, hud);
+            DrawLayer(app, layer);
+        }
+        Check(app.rootControl == layerRoot && layerRoot.ContainsAdapter(hudRoot), "repeated real HUD render preserves Layer position");
+        Check(layerRoot.HitTest(10, 10, 0) == page && layerRoot.HitTest(10, 70, 0) == editor,
+            "heterogeneous fallback hits page and HUD without recursion");
+        editor.Focus(app);
+        Check(layerRoot.FindInputFocus(app) == editor, "heterogeneous focus lookup reaches HUD");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Check(editor.GetText() == "A", "real HUD editor receives routed text through Layer");
+        app.CapturePointer(editor);
+        DrawHud(app, hud);
+        Check(app.GetCapturedPointer() == editor, "HUD rebind preserves active capture");
+        hud.SetVisible(false);
+        Check(app.rootControl == layerRoot && !layerRoot.ContainsAdapter(hudRoot), "HUD detach splices through actual Layer");
+        Check(app.GetCapturedPointer() == null && !editor.IsFocused(app), "HUD detach releases own focus and capture");
+        Check(layerRoot.HitTest(10, 10, 0) == page && layerRoot.ContainsInputControl(layerEditor),
+            "HUD detach preserves page fallback and Layer body");
+        hud.SetVisible(true);
+        // A host root replacement starts a fresh composition in paint order.
+        app.SetRootControl(page);
+        DrawHud(app, hud);
+        DrawLayer(app, layer);
+        page.Focus(app);
+        app.CapturePointer(page);
+        hud.SetVisible(false);
+        Check(app.GetCapturedPointer() == page && page.IsFocused(app), "HUD detach preserves fallback input state");
+        app.ReleasePointerCapture();
+        hud.SetVisible(true);
+        app.SetRootControl(page);
+        DrawHud(app, hud);
+        DrawLayer(app, layer);
+        editor.Focus(app);
+        app.CapturePointer(editor);
+        LayerState modal = LayerState.PromptWith("Modal", "", 0, "", 3);
+        modal.Open(app);
+        DrawLayer(app, modal);
+        Check(app.GetCapturedPointer() == null && !editor.IsFocused(app), "real modal activation releases HUD state");
+        Check(!layerRoot.ContainsInputControl(hudRoot) && layerRoot.ContainsAdapter(hudRoot),
+            "structural membership survives modal input exclusion");
+        DrawHud(app, hud);
+        DrawLayer(app, modal);
+        Check(app.rootControl == layerRoot && layerRoot.ContainsAdapter(hudRoot), "HUD rebind beneath modal preserves composition");
+        Check(layerRoot.HitTest(10, 70, 0) != editor, "modal continues blocking HUD hit after rebind");
+        modal.promptInput.Focus(app);
+        app.CapturePointer(modal.promptInput);
+        hud.SetVisible(false);
+        Check(app.rootControl == layerRoot && !layerRoot.ContainsAdapter(hudRoot), "HUD detach beneath modal uses structural chain");
+        Check(app.GetCapturedPointer() == modal.promptInput && modal.promptInput.IsFocused(app),
+            "HUD detach preserves modal focus and capture");
+        modal.Close(app);
+        Check(layerRoot.HitTest(10, 10, 0) == page, "modal close exposes spliced page fallback");
+        layerRoot.Detach();
+        Check(app.rootControl == page, "Layer base detach restores page");
+        // Leave a real composed chain alive: weak checks must prove natural release.
+        hud.SetVisible(true);
+        DrawHud(app, hud);
+        DrawLayer(app, layer);
+        DrawHud(app, hud);
+        witness.App = app;
+        witness.Hud = hud;
+        witness.HudRoot = hudRoot;
+        witness.LayerRoot = layerRoot;
+        witness.Layer = layer;
+        witness.Page = page;
+        witness.Editor = editor;
+    }
+
+    static void LayerFirst(bool modal) {
+        App app = App.CreateOffscreen("Layer first composition", 640, 480);
+        Input page = Page(app);
+        LayerState layer = modal ? LayerState.PromptWith("Modal first", "", 0, "", 3)
+            : new LayerState("Floating first", 250, 120, 300, 240);
+        layer.Open(app);
+        DrawLayer(app, layer);
+        InputRootAdapter layerRoot = (InputRootAdapter)app.rootControl;
+        HudLayer hud = new HudLayer();
+        Input editor = new Input("");
+        hud.Add(editor);
+        for (int i = 0; i < 3; i = i + 1) {
+            DrawHud(app, hud);
+            DrawLayer(app, layer);
+        }
+        Check(app.rootControl == layerRoot, modal ? "new HUD binds below existing modal Layer"
+            : "new HUD binds below existing nonmodal Layer");
+        if (modal) {
+            Check(layerRoot.HitTest(10, 70, 0) != editor && !layerRoot.ContainsInputControl(editor),
+                "Layer-first modal blocks newly bound HUD input");
+            layer.promptInput.Focus(app);
+            app.CapturePointer(layer.promptInput);
+            hud.SetVisible(false);
+            Check(app.rootControl == layerRoot && app.GetCapturedPointer() == layer.promptInput
+                && layer.promptInput.IsFocused(app), "new HUD detach preserves existing modal input");
+            layer.Close(app);
+            Check(layerRoot.HitTest(10, 10, 0) == page, "Layer-first modal detach restores original page fallback");
+        } else {
+            Check(layerRoot.HitTest(10, 70, 0) == editor && layerRoot.HitTest(10, 10, 0) == page,
+                "Layer-first nonmodal forwards to new HUD and page");
+            hud.SetVisible(false);
+            Check(app.rootControl == layerRoot && layerRoot.HitTest(10, 10, 0) == page,
+                "new HUD detach splices below existing nonmodal Layer");
+            layer.Close(app);
+        }
+        layerRoot.Detach();
+        Check(app.rootControl == page, modal ? "Layer-first modal adapter detach restores page"
+            : "Layer-first nonmodal adapter detach restores page");
+        app.canvas.Destroy();
+    }
+
+    static void CrossApp() {
+        App first = App.CreateOffscreen("first composition", 640, 480);
+        App second = App.CreateOffscreen("second composition", 640, 480);
+        Input firstPage = Page(first);
+        Input secondPage = Page(second);
+        HudLayer hud = new HudLayer();
+        Input editor = new Input("");
+        hud.Add(editor);
+        DrawHud(first, hud);
+        InputRootAdapter hudRoot = (InputRootAdapter)first.rootControl;
+        LayerState layer = new LayerState("Move HUD", 250, 120, 300, 240);
+        layer.Open(first);
+        DrawLayer(first, layer);
+        InputRootAdapter layerRoot = (InputRootAdapter)first.rootControl;
+        firstPage.Focus(first);
+        first.CapturePointer(firstPage);
+        DrawHud(second, hud);
+        Check(first.rootControl == layerRoot && !layerRoot.ContainsAdapter(hudRoot), "cross App bind splices HUD from old Layer");
+        Check(first.GetCapturedPointer() == firstPage && firstPage.IsFocused(first), "cross App bind preserves old fallback state");
+        Check(second.rootControl == hudRoot && hudRoot.ContainsInputControl(secondPage), "cross App bind adopts new fallback");
+        editor.Focus(second);
+        second.CapturePointer(editor);
+        DrawHud(first, hud);
+        Check(second.rootControl == secondPage && second.GetCapturedPointer() == null && !editor.IsFocused(second),
+            "cross App move releases only HUD state in departing App");
+        Check(first.rootControl == layerRoot && layerRoot.ContainsAdapter(hudRoot)
+            && layerRoot.HitTest(10, 10, 0) == firstPage, "cross App return reinserts HUD below old Layer");
+        DrawHud(second, hud);
+        hud.SetVisible(false);
+        Check(second.rootControl == secondPage, "cross App HUD detach restores new page");
+        layer.Close(first);
+        first.canvas.Destroy();
+        second.canvas.Destroy();
+    }
+
+    static InputRootAdapter RetainedHudRoot(CompositionWitness witness) {
+        App app = App.CreateOffscreen("retained HUD adapter", 640, 480);
+        Input page = Page(app);
+        HudLayer hud = new HudLayer();
+        Input editor = new Input("");
+        hud.Add(editor);
+        DrawHud(app, hud);
+        InputRootAdapter root = (InputRootAdapter)app.rootControl;
+        witness.App = app;
+        witness.Hud = hud;
+        witness.Page = page;
+        witness.Editor = editor;
+        app.canvas.Destroy();
+        return root;
+    }
+
+    static void WeakAdapterOwners() {
+        CompositionWitness witness = new CompositionWitness();
+        InputRootAdapter root = RetainedHudRoot(witness);
+        Check(witness.App == null && witness.Hud == null && witness.Editor == null,
+            "retained HUD adapter does not retain App or HUD owner");
+        Check(witness.Page != null && root.HitTest(10, 10, 0) == witness.Page,
+            "retained HUD adapter keeps fallback alive after weak owners expire");
+        root.Detach();
+        Check(witness.Page == null, "adapter detach after App expiry releases fallback");
+    }
+
+    static void OwnSession(CompositionWitness witness) {
+        App app = App.CreateOffscreen("real input composition", 640, 480);
+        Exercise(app, witness);
+        app.canvas.Destroy();
+    }
+
+    static void Main() {
+        App frame = App.CreateOffscreen("Frame context", 2, 2);
+        CompositionWitness witness = new CompositionWitness();
+        OwnSession(witness);
+        Check(witness.App == null && witness.Hud == null && witness.HudRoot == null && witness.LayerRoot == null,
+            "real HUD Layer adapters release without strong cycles");
+        Check(witness.Layer == null && witness.Page == null && witness.Editor == null,
+            "real composed borrowed trees release naturally");
+        LayerFirst(false);
+        LayerFirst(true);
+        CrossApp();
+        WeakAdapterOwners();
+        frame.canvas.Destroy();
+        Console.WriteLine("INPUT_ROOT_COMPOSITION_OK");
+    }
+}

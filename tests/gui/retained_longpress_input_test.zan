@@ -1,0 +1,428 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+// Scratch-only candidate regression. Uses real down/move/up entry points;
+// no direct LongPress injection and no wall-clock sleeps.
+// Subscriptions own this endpoint; it only weakly references the sender.
+class LongPressProbeActions {
+    public weak LongPressInputProbe Probe;
+    public LongPressProbeActions(LongPressInputProbe probe) { Probe = probe; }
+    public void LongPressed() { LongPressInputProbe probe = Probe; if (probe != null) { probe.Notified(); } }
+    public void Clicked() { LongPressInputProbe probe = Probe; if (probe != null) { probe.ClickedNotice(); } }
+    public void MouseUp() { LongPressInputProbe probe = Probe; if (probe != null) { probe.MouseUpNotice(); } }
+}
+class LongPressBorrowedRoot : InputRootAdapter {
+    public Control Borrowed;
+    public LongPressBorrowedRoot() : base("longpress_borrowed_input") { }
+    public override bool ContainsInputControl(Control control) {
+        return control != null && (control == this
+            || (Borrowed != null && Borrowed.ContainsInputControl(control))
+            || (content != null && content.ContainsInputControl(control)));
+    }
+    public override Control HitTest(int x, int y, int pointerType) {
+        Control hit = Borrowed != null ? Borrowed.HitTest(x, y, pointerType) : null;
+        return hit != null ? hit : (content != null ? content.HitTest(x, y, pointerType) : null);
+    }
+}
+class LongPressInputProbe : Control {
+    public int Notices;
+    public int Clicks;
+    public int Routes;
+    public weak Control Original;
+    public bool ConsumeDown;
+    public bool DragCapture;
+    public weak App Host;
+    public weak Control Replacement;
+    public weak Control NextCapture;
+    public bool ReplaceOnRoute;
+    public bool ReplaceOnNotice;
+    public bool ReplaceOnCancel;
+    public bool CaptureOnMove;
+    public int Moves;
+    public int Cancels;
+    public bool ReplaceOnUp;
+    public bool ReplaceOnLeave;
+    public bool ReleaseOnMouseUp;
+    public int MouseUps;
+    public int Leaves;
+
+    public LongPressInputProbe() {
+        this.InitControl("longpress-input-probe", 0);
+        LongPressProbeActions actions = new LongPressProbeActions(this);
+        this.OnLongPress(actions.LongPressed);
+        this.OnClick(actions.Clicked);
+        this.OnMouseUp(actions.MouseUp);
+    }
+    public void Notified() {
+        Notices = Notices + 1;
+        if (ReplaceOnNotice) {
+            ReplaceOnNotice = false;
+            this.ReplaceAndPress();
+        }
+    }
+    public void ClickedNotice() { Clicks = Clicks + 1; }
+    void ReplaceAndPress() {
+        App app = Host;
+        Control root = Replacement;
+        Control capture = NextCapture;
+        if (app == null || root == null || capture == null) { return; }
+        app.SetRootControl(root);
+        app.ProcessOffscreenInput(2, capture.bx + 4, capture.by + 4, 0, 0, 0, 1);
+        app.CapturePointer(capture, true);
+    }
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        if (DragCapture && this.App != null) { this.App.CapturePointer(this, true); }
+        if (ConsumeDown) { e.Handle(); }
+    }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        Cancels = Cancels + 1;
+        if (ReplaceOnCancel) {
+            ReplaceOnCancel = false;
+            this.ReplaceAndPress();
+        }
+    }
+    public void MouseUpNotice() {
+        MouseUps = MouseUps + 1;
+        if (ReleaseOnMouseUp && this.App != null) { this.App.ReleasePointerCapture(); }
+    }
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        if (ReplaceOnUp) { ReplaceOnUp = false; this.ReplaceAndPress(); }
+    }
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        Leaves = Leaves + 1;
+        if (ReplaceOnLeave) { ReplaceOnLeave = false; this.ReplaceAndPress(); }
+    }
+    public override void OnPointerMove(RoutedEventArgs e) {
+        Moves = Moves + 1;
+        if (CaptureOnMove && this.App != null) { this.App.CapturePointer(this, true); }
+    }
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName == "LongPress") {
+            Routes = Routes + 1;
+            Original = e.originalSource;
+            if (ReplaceOnRoute) {
+                ReplaceOnRoute = false;
+                this.ReplaceAndPress();
+            }
+        }
+        base.OnRoutedEvent(e);
+    }
+}
+
+class RetainedLongPressInputTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("retained longpress: " + label); }
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { break; }
+            action();
+        }
+    }
+    static void Install(App app, Control root) {
+        root.UseApp(app);
+        root.Arrange(0, 0, 240, 160);
+        app.SetRootControl(root);
+    }
+    static void Input(App app, int kind, int x, int y) {
+        app.ProcessOffscreenInput(kind, x, y, 0, 0, 0, 1);
+    }
+    static void Tick(App app, int ms) {
+        Window.FreezeTick(ms);
+        // Real idle input/pump entry; does not call the claim helper directly.
+        Input(app, 0, app.mouseX, app.mouseY);
+        Drain(app);
+    }
+    static void Reset(App app) { Input(app, 9, 0, 0); app.SetRootControl(null); }
+
+    static void BorrowedAdapterLongPress(App app) {
+        LongPressInputProbe fallback = new LongPressInputProbe();
+        fallback.ConsumeDown = true;
+        Install(app, fallback);
+        LongPressInputProbe borrowed = new LongPressInputProbe();
+        borrowed.ConsumeDown = true;
+        borrowed.UseApp(app); borrowed.Arrange(120, 0, 100, 100);
+        LongPressBorrowedRoot adapter = new LongPressBorrowedRoot();
+        adapter.Borrowed = borrowed;
+        adapter.Bind(app);
+        Check(app.rootControl == adapter && fallback.parent == null && borrowed.parent == null
+            && adapter.ContainsInputControl(fallback) && adapter.ContainsInputControl(borrowed),
+            "real bound adapter owns borrowed and fallback trees without reparenting");
+        Window.FreezeTick(11000);
+        Input(app, 2, 20, 20);
+        Tick(app, 11499);
+        Check(fallback.Notices == 0, "adapter fallback 499ms");
+        Tick(app, 11500);
+        Check(fallback.Notices == 1 && fallback.Original == fallback,
+            "adapter fallback routes stationary LongPress without parent link to adapter");
+        Input(app, 3, 20, 20);
+        Window.FreezeTick(12000);
+        Input(app, 2, 140, 20);
+        Tick(app, 12500);
+        Check(borrowed.Notices == 1 && borrowed.Original == borrowed && fallback.Notices == 1,
+            "borrowed HUD Layer style tree routes once without adapter in parent chain");
+        Input(app, 3, 140, 20);
+        // Membership loss, with unchanged adapter identity, must still reject the old source.
+        Window.FreezeTick(13000);
+        Input(app, 2, 140, 20);
+        adapter.Borrowed = null;
+        Tick(app, 13500);
+        Check(borrowed.Notices == 1, "removed borrowed member cannot receive LongPress");
+        Input(app, 9, 0, 0);
+        adapter.Detach();
+        Reset(app);
+    }
+
+    static void UpStartsNewGesture(App app) {
+        LongPressInputProbe old = new LongPressInputProbe();
+        LongPressInputProbe next = new LongPressInputProbe();
+        next.UseApp(app); next.Arrange(0, 0, 240, 160);
+        old.Host = app; old.Replacement = next; old.NextCapture = next;
+        old.ReplaceOnUp = true;
+        old.ReleaseOnMouseUp = true;
+        Install(app, old);
+        Window.FreezeTick(14000);
+        Input(app, 2, 20, 20);
+        Input(app, 3, 20, 20);
+        Check(old.MouseUps == 0 && app.rootControl == next && app.GetCapturedPointer() == next,
+            "OnPointerUp new Down must suppress old same-node MouseUp subscriber release");
+        Tick(app, 14499);
+        Check(next.Notices == 0, "Up callback new gesture 499ms");
+        Tick(app, 14500);
+        Check(next.Notices == 1 && app.GetCapturedPointer() == next,
+            "Up callback new gesture retains timer and capture");
+        Reset(app);
+    }
+
+    static void LeaveStartsNewHover(App app) {
+        LongPressInputProbe old = new LongPressInputProbe();
+        LongPressInputProbe next = new LongPressInputProbe();
+        next.UseApp(app); next.Arrange(0, 0, 240, 160);
+        old.Host = app; old.Replacement = next; old.NextCapture = next;
+        old.ReplaceOnLeave = true;
+        old.ConsumeDown = true;
+        Install(app, old);
+        Window.FreezeTick(15000);
+        Input(app, 2, 20, 20);
+        Input(app, 3, 20, 20);
+        Check(old.Leaves == 1 && app.rootControl == next && app.GetCapturedPointer() == next,
+            "touch Up Leave callback establishes next Down and capture");
+        // A second physical Up observes the private hover through its real Leave route.
+        Input(app, 3, 20, 20);
+        Check(next.Leaves == 1,
+            "old Up tail must not erase callback new hover before its own Up Leave");
+        Reset(app);
+    }
+
+    static void ThresholdAndUp(App app) {
+        LongPressInputProbe probe = new LongPressInputProbe();
+        probe.ConsumeDown = true;
+        Install(app, probe);
+        Window.FreezeTick(1000);
+        Input(app, 2, 20, 20);
+        Tick(app, 1499);
+        Check(probe.Notices == 0, "499ms no notification after consumed Down");
+        Tick(app, 1500);
+        Check(probe.Notices == 1 && probe.Routes == 1 && probe.Original == probe,
+            "500ms routes real Down source exactly once");
+        Tick(app, 1800);
+        app.BeginOffscreenFrame();
+        probe.FireCommon(app);
+        app.EndOffscreenFrame();
+        Drain(app);
+        Check(probe.Notices == 1, "idle and legacy Paint do not duplicate");
+        Input(app, 3, 20, 20);
+        Drain(app);
+        Check(probe.Clicks == 0, "longpress Up does not synthesize Click");
+        Reset(app);
+    }
+
+    static void SlopAndCancel(App app) {
+        LongPressInputProbe probe = new LongPressInputProbe();
+        Install(app, probe);
+        Window.FreezeTick(2000);
+        Input(app, 2, 20, 20);
+        Input(app, 1, 28, 20);
+        Input(app, 1, 20, 20);
+        Tick(app, 2600);
+        Check(probe.Notices == 0, "8px slop stays canceled after moving back");
+        Reset(app);
+        probe.DragCapture = true;
+        Install(app, probe);
+        Window.FreezeTick(3000);
+        Input(app, 2, 20, 20);
+        Input(app, 1, 28, 20);
+        Tick(app, 3600);
+        Check(probe.Notices == 0 && app.GetCapturedPointer() == probe,
+            "drag keeps capture but loses longpress eligibility");
+        Reset(app);
+        Install(app, probe);
+        Window.FreezeTick(4000);
+        Input(app, 2, 20, 20);
+        Input(app, 9, 20, 20);
+        Tick(app, 4600);
+        Check(probe.Notices == 0, "blur cancels pending longpress");
+        Reset(app);
+    }
+
+    static void SlopCancelNewGesture(App app) {
+        LongPressInputProbe old = new LongPressInputProbe();
+        LongPressInputProbe next = new LongPressInputProbe();
+        next.UseApp(app);
+        next.Arrange(0, 0, 240, 160);
+        old.Host = app;
+        old.Replacement = next;
+        old.NextCapture = next;
+        old.ReplaceOnCancel = true;
+        old.CaptureOnMove = true;
+        Install(app, old);
+        Window.FreezeTick(4700);
+        Input(app, 2, 20, 20);
+        // Real touch Move crosses the existing 8px slop. Its PointerCancel
+        // callback installs another root, injects Down, and captures next.
+        Input(app, 1, 28, 20);
+        Check(old.Cancels == 1 && old.Moves == 0 && app.rootControl == next
+            && app.GetCapturedPointer() == next,
+            "slop Cancel new Down/capture cannot receive stale old Move");
+        Tick(app, 5199);
+        Check(next.Notices == 0, "cancel callback new Down has its own threshold");
+        Tick(app, 5200);
+        Check(old.Notices == 0 && next.Notices == 1 && app.GetCapturedPointer() == next,
+            "new gesture remains eligible and keeps its capture after old Move returns");
+        Reset(app);
+
+        // Own Retire increments a ticket too; without callback reentry this is
+        // still the same drag Move and must be delivered to its drag capture.
+        LongPressInputProbe drag = new LongPressInputProbe();
+        drag.DragCapture = true;
+        Install(app, drag);
+        Window.FreezeTick(5300);
+        Input(app, 2, 20, 20);
+        Input(app, 1, 28, 20);
+        Check(drag.Moves == 1 && app.GetCapturedPointer() == drag,
+            "slop's own retirement is not mistaken for callback new Down");
+        Tick(app, 5900);
+        Check(drag.Notices == 0, "continued drag still cannot longpress");
+        Reset(app);
+    }
+
+    static void ReentrantRoot(App app) {
+        LongPressInputProbe old = new LongPressInputProbe();
+        LongPressInputProbe next = new LongPressInputProbe();
+        next.UseApp(app);
+        next.Arrange(0, 0, 240, 160);
+        old.Host = app;
+        old.Replacement = next;
+        old.NextCapture = next;
+        old.ReplaceOnRoute = true;
+        Install(app, old);
+        Window.FreezeTick(5000);
+        Input(app, 2, 20, 20);
+        Tick(app, 5500);
+        Check(old.Routes == 1 && old.Notices == 0 && app.rootControl == next
+            && app.GetCapturedPointer() == next,
+            "route callback replacing root suppresses old notice and preserves new capture");
+        Tick(app, 6000);
+        Check(next.Notices == 1, "callback new Down owns an independent timer");
+        Reset(app);
+        old.ReplaceOnNotice = true;
+        Install(app, old);
+        Window.FreezeTick(6500);
+        Input(app, 2, 20, 20);
+        Tick(app, 7000);
+        Check(old.Notices == 1 && app.rootControl == next && app.GetCapturedPointer() == next,
+            "named callback root/new Down not overwritten by old tick tail");
+        Reset(app);
+    }
+
+    static void LeafAndApply(App app) {
+        LongPressInputProbe parent = new LongPressInputProbe();
+        parent.DragCapture = true;
+        parent.ConsumeDown = true;
+        Label leaf = new Label("real Down leaf");
+        parent.Add(leaf);
+        Install(app, parent);
+        leaf.Arrange(10, 10, 120, 40);
+        Window.FreezeTick(7500);
+        app.SetPointerDeviceType(1);
+        app.window.SetLocalEvent(2, 20, 20, 0, 0, 0, 1);
+        Check(app.ApplyEvent(app.window.GetHandle()), "ApplyEvent Down accepted");
+        Check(app.GetCapturedPointer() == parent, "ancestor owns capture");
+        Tick(app, 8000);
+        Check(parent.Notices == 1 && parent.Original == leaf,
+            "ApplyEvent keeps actual leaf source despite ancestor capture");
+        Reset(app);
+    }
+
+    static void RemovedRootAndOtherApp(App app) {
+        LongPressInputProbe removed = new LongPressInputProbe();
+        Install(app, removed);
+        Window.FreezeTick(9000);
+        Input(app, 2, 20, 20);
+        app.SetRootControl(null);
+        Tick(app, 9500);
+        Check(removed.Notices == 0, "root removed before deadline cancels");
+        App other = App.CreateOffscreen("other longpress", 240, 160);
+        LongPressInputProbe a = new LongPressInputProbe();
+        LongPressInputProbe b = new LongPressInputProbe();
+        Install(app, a);
+        Install(other, b);
+        Window.FreezeTick(10000);
+        Input(app, 2, 20, 20);
+        Window.FreezeTick(10200);
+        Input(other, 2, 20, 20);
+        Tick(app, 10500);
+        Tick(other, 10500);
+        Check(a.Notices == 1 && b.Notices == 0, "Apps have independent Down times");
+        Tick(other, 10700);
+        Check(b.Notices == 1, "second App claims its own gesture");
+        Reset(other);
+        other.canvas.Destroy();
+        Reset(app);
+    }
+
+    static void LegacySentinel(App app) {
+        Control legacy = new Control("legacy-only-surface");
+        Install(app, legacy);
+        Window.FreezeTick(8000);
+        Input(app, 2, 20, 20);
+        app.NotePressSentinel(0 - 2);
+        Tick(app, 8500);
+        Check(app.PollLongPress(0 - 2), "no capability leaves legacy sentinel claim available");
+        Check(!app.PollLongPress(0 - 2), "legacy sentinel remains one shot");
+        Reset(app);
+    }
+
+    static void Main() {
+        Dispatcher.Init();
+        App frame = App.CreateOffscreen("independent longpress frame owner", 2, 2);
+        App app = App.CreateOffscreen("retained longpress candidate", 240, 160);
+        try {
+            ThresholdAndUp(app);
+            SlopAndCancel(app);
+            SlopCancelNewGesture(app);
+            ReentrantRoot(app);
+            LeafAndApply(app);
+            LegacySentinel(app);
+            RemovedRootAndOtherApp(app);
+            BorrowedAdapterLongPress(app);
+            UpStartsNewGesture(app);
+            LeaveStartsNewHover(app);
+            Console.WriteLine("RETAINED_LONGPRESS_INPUT_OK");
+        } finally {
+            app.SetRootControl(null);
+            app.ReleasePointerCapture();
+            Window.UnfreezeTick();
+            app.canvas.Destroy();
+            frame.canvas.Destroy();
+        }
+    }
+}

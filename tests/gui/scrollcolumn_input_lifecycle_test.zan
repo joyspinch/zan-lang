@@ -1,0 +1,272 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class LegacyScrollSurface : Control {
+    public ScrollView View;
+    public SignalInt Offset;
+    public bool UseBar;
+    public LegacyScrollSurface(bool bar) {
+        this.InitControl("legacy-scroll-surface", 0);
+        View = new ScrollView();
+        Offset = new SignalInt(0);
+        UseBar = bar;
+    }
+    public override void OnPaint(App app) {
+        if (UseBar) {
+            Scrollbar.HandleWheel(app, bx, by, bw, bh, 1000, Offset);
+            Scrollbar.RenderVerticalScrollIn(app, bx + bw - app.Scale(10), by,
+                bh, bh, 1000, Offset, bx, by, bw, bh);
+        } else {
+            Rect area = new Rect(bx, by, bw, bh);
+            View.Begin(app, area, 1000);
+            View.End(app, area);
+        }
+    }
+    public int Position() { return UseBar ? Offset.Get() : View.Offset(); }
+}
+
+class ScrollColumnWitness {
+    public weak ScrollColumn Column;
+    public weak Control Row;
+}
+
+class ScrollColumnInputLifecycleTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("ScrollColumn: " + label); }
+    }
+    static void Paint(App app, Control root) {
+        app.BeginOffscreenFrame();
+        root.RenderTree(app);
+        root.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+    static ScrollColumn Column(App app, string style) {
+        ScrollColumn column = new ScrollColumn();
+        column.UseApp(app);
+        if (style != "") { column.SetProp("style", style); }
+        for (int i = 0; i < 8; i = i + 1) {
+            Control row = new Control();
+            row.Prefer(100, 40);
+            column.Add(row);
+        }
+        column.MeasureTree(app);
+        column.Arrange(20, 20, 200, 100);
+        app.SetRootControl(column);
+        return column;
+    }
+    static void Input(App app, int kind, int x, int y, int key, int device) {
+        app.SetPointerDeviceType(device);
+        app.ProcessOffscreenInput(kind, x, y, 0, key, 0, 0);
+    }
+    static void Exercise(App app, ScrollColumnWitness witness) {
+        ScrollColumn column = Column(app, "padding:4px 6px;border:2px solid #222;gap:8px");
+        witness.Column = column;
+        witness.Row = column.Children[0];
+        Check(column.Kind() == "ScrollColumn" && column.scrollExtent == 384 && column.scrollExtentX == 196,
+            "natural rows and gaps include culled rows; border defines viewport");
+        Check(column.Children[0].bx == 28 && column.Children[0].by == 26 && column.Children[0].bw == 172,
+            "padding and reserved scrollbar preserve child geometry: "
+                + Convert.ToString(column.Children[0].bx) + ","
+                + Convert.ToString(column.Children[0].by) + ","
+                + Convert.ToString(column.Children[0].bw));
+        Input(app, 13, 50, 50, -120, 0);
+        int offset = column.ScrollTop();
+        Check(offset == app.scrollSpeed, "wheel mutates shared offset before paint");
+        Paint(app, column);
+        Check(column.ScrollTop() == offset, "repeated paint never replays wheel");
+        column.Arrange(20, 20, 200, 100);
+        Check(column.Children[0].by == 26 - offset && column.scrollExtent == 384,
+            "Arrange positions rows from shared offset without losing extent");
+        column.SetScrollTop(150);
+        column.Arrange(20, 20, 200, 100);
+        Check(!column.Children[0].visible && column.Children[3].visible && column.scrollExtent == 384,
+            "scroll culls rows without shrinking extent");
+        column.SetScrollTop(0);
+        column.Arrange(20, 20, 200, 100);
+        ScrollState geometry = new ScrollState();
+        Rect viewport = new Rect(22, 22, 196, 96);
+        Rect track = geometry.Track(app, viewport.x, viewport.y, viewport.width, viewport.height, false);
+        int x = track.x + track.width / 2;
+        int y = track.y + geometry.ThumbLength(app, viewport.height, column.scrollExtent) / 2;
+        for (int device = 0; device < 3; device = device + 1) {
+            column.SetScrollTop(0);
+            column.Arrange(20, 20, 200, 100);
+            Input(app, 2, x, y, 0, device);
+            Check(app.GetCapturedPointer() == column, "thumb captures before paint");
+            app.ProcessOffscreenInput(3, x, y + 80, 1, 0, 0, 0);
+            Check(app.GetCapturedPointer() == column && column.ScrollTop() == 0,
+                "secondary release preserves primary capture");
+            Input(app, 1, x + 200, y + 200, 0, device);
+            Check(column.ScrollTop() > 0 && app.GetCapturedPointer() == column,
+                "drag outside bounds survives touch slop");
+            offset = column.ScrollTop();
+            Paint(app, column);
+            Check(column.ScrollTop() == offset, "paint cannot advance captured drag");
+            Input(app, 3, x + 200, y + 200, 0, device);
+            Check(app.GetCapturedPointer() == null, "primary up releases drag");
+        }
+        column.SetScrollTop(0);
+        column.Arrange(20, 20, 200, 100);
+        Input(app, 2, x, y, 0, 0);
+        Input(app, 9, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == null, "focus loss cancels drag");
+        Input(app, 2, x, y, 0, 0);
+        column.Disabled = true;
+        offset = column.ScrollTop();
+        Input(app, 1, x, y + 80, 0, 0);
+        Check(app.GetCapturedPointer() == null && column.ScrollTop() == offset, "disable cancels without mutation");
+        Input(app, 13, 50, 50, -120, 0);
+        Check(column.ScrollTop() == offset, "disabled wheel inert");
+        column.Disabled = false;
+        column.SetScrollTop(0);
+        Input(app, 2, x, y, 0, 0);
+        column.Children.Clear();
+        column.Arrange(20, 20, 200, 100);
+        Input(app, 1, x, y + 80, 0, 0);
+        Check(column.ScrollTop() == 0 && column.scrollExtent == 96 && app.GetCapturedPointer() == null,
+            "empty content resets extent and cancels capture");
+        app.SetRootControl(null);
+    }
+    static void InlinePadding(App app) {
+        ScrollColumn column = Column(app, "padding:2px 8px 6px 10px;border:2px solid #222");
+        Check(column.Children[0].bx == 32 && column.Children[0].by == 24
+            && column.Children[0].bw == 166 && column.scrollExtent == 328,
+            "four-side inline padding reaches actual layout");
+        column.SetProp("style", "border:2px solid #222");
+        column.MeasureTree(app);
+        column.Arrange(20, 20, 200, 100);
+        ScrollColumn baseline = Column(app, "border:2px solid #222");
+        Check(column.Children[0].bx == baseline.Children[0].bx
+            && column.Children[0].by == baseline.Children[0].by
+            && column.Children[0].bw == baseline.Children[0].bw,
+            "replacing inline padding restores stylesheet geometry");
+        column.Pad(5);
+        column.SetProp("style", "padding:2px 8px 6px 10px;border:2px solid #222");
+        column.MeasureTree(app);
+        column.Arrange(20, 20, 200, 100);
+        Check(column.Children[0].bx == 27 && column.Children[0].by == 27
+            && column.Children[0].bw == 174,
+            "explicit Pad keeps its documented layout priority");
+        app.SetRootControl(null);
+    }
+    static void OverflowModes(App app) {
+        ScrollColumn hidden = Column(app, "overflow:hidden");
+        Input(app, 13, 50, 50, -120, 0);
+        Check(hidden.ScrollTop() == 0, "explicit hidden suppresses wheel");
+        hidden.SetScrollTop(60);
+        hidden.Arrange(20, 20, 200, 100);
+        Check(hidden.ScrollTop() == 60 && hidden.Children[0].by == -40,
+            "hidden retains programmatic scrolling");
+        ScrollColumn visible = Column(app, "overflow:visible");
+        Input(app, 13, 50, 50, -120, 0);
+        Check(visible.ScrollTop() == 0, "explicit visible suppresses default scroll behavior");
+        ScrollColumn axis = Column(app, "overflow-x:hidden");
+        Check(axis.StyleOverflowX() == 1 && axis.StyleOverflowY() == 2,
+            "explicit single-axis stylesheet semantics preserved");
+        ScrollColumn hiddenAxis = Column(app, "overflow-y:hidden");
+        Input(app, 13, 50, 50, -120, 0);
+        Check(hiddenAxis.StyleOverflowY() == 1 && hiddenAxis.ScrollTop() == 0,
+            "inline overflow-y hidden overrides default");
+        ScrollColumn visibleAxis = Column(app, "overflow-y:visible");
+        Input(app, 13, 50, 50, -120, 0);
+        Check(visibleAxis.StyleOverflowY() == 0 && visibleAxis.ScrollTop() == 0,
+            "inline overflow-y visible overrides default");
+        app.UseAppCss("scrollcolumn { overflow-y:hidden; }");
+        ScrollColumn sheetHidden = Column(app, "");
+        Input(app, 13, 50, 50, -120, 0);
+        Check(sheetHidden.StyleOverflowY() == 1 && sheetHidden.ScrollTop() == 0,
+            "stylesheet overflow-y hidden overrides default");
+        app.UseAppCss("scrollcolumn { overflow-y:visible; }");
+        ScrollColumn sheetVisible = Column(app, "");
+        Input(app, 13, 50, 50, -120, 0);
+        Check(sheetVisible.StyleOverflowY() == 0 && sheetVisible.ScrollTop() == 0,
+            "stylesheet overflow-y visible overrides default");
+        app.SetRootControl(null);
+        app.UseAppCss("");
+    }
+    static void HiddenEditor(App app, ScrollColumnWitness witness) {
+        ScrollColumn column = new ScrollColumn();
+        column.UseApp(app);
+        Input editor = new Input("");
+        editor.Prefer(100, 40);
+        column.Add(editor);
+        for (int i = 0; i < 7; i = i + 1) {
+            Control row = new Control();
+            row.Prefer(100, 40);
+            column.Add(row);
+        }
+        witness.Column = column;
+        witness.Row = editor;
+        column.MeasureTree(app);
+        column.Arrange(20, 20, 200, 100);
+        app.SetRootControl(column);
+        Paint(app, column);
+        editor.Focus(app);
+        app.CapturePointer(editor);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Check(editor.IsFocused(app) && app.GetCapturedPointer() == editor && editor.GetText() == "A",
+            "visible editor receives text with focus and capture");
+        column.SetScrollTop(150);
+        column.Arrange(20, 20, 200, 100);
+        Check(!editor.visible && !editor.IsFocused(app) && app.GetCapturedPointer() == null,
+            "culling editor releases focus and capture before paint");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 66, 0, 0);
+        Paint(app, column);
+        Check(editor.GetText() == "A", "culled editor cannot consume text or replay it during paint");
+        column.SetScrollTop(0);
+        column.Arrange(20, 20, 200, 100);
+        Check(editor.visible && !editor.IsFocused(app), "returning row does not restore hidden focus");
+        app.SetRootControl(null);
+    }
+    static void MixedWheel(App app, bool bar) {
+        Control outer = new Control();
+        outer.UseApp(app);
+        outer.SetProp("style", "overflow:auto;display:block");
+        LegacyScrollSurface legacy = new LegacyScrollSurface(bar);
+        legacy.SetProp("style", "height:100px;width:120px");
+        Control spacer = new Control();
+        spacer.SetProp("style", "height:500px;width:100px");
+        outer.Add(legacy);
+        outer.Add(spacer);
+        outer.MeasureTree(app);
+        outer.Arrange(20, 20, 200, 160);
+        app.SetRootControl(outer);
+        Input(app, 1, 50, 50, 0, 0);
+        Paint(app, outer);
+        Input(app, 13, 50, 50, -120, 0);
+        Check(outer.ScrollTop() == app.scrollSpeed && legacy.Position() == 0,
+            "routed ancestor alone consumes mixed wheel before paint");
+        Paint(app, outer);
+        Paint(app, outer);
+        Check(outer.ScrollTop() == app.scrollSpeed && legacy.Position() == 0,
+            "legacy paint cannot replay routed wheel event sequence");
+        outer.SetProp("style", "overflow:visible;display:block");
+        outer.SetScrollTop(0);
+        outer.MeasureTree(app);
+        outer.Arrange(20, 20, 200, 160);
+        Input(app, 1, 50, 50, 0, 0);
+        Paint(app, outer);
+        Input(app, 13, 50, 50, -120, 0);
+        Paint(app, outer);
+        Check(legacy.Position() == app.scrollSpeed && outer.ScrollTop() == 0,
+            "next genuine legacy-only wheel still scrolls");
+        app.SetRootControl(null);
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("Frame context", 2, 2);
+        App app = App.CreateOffscreen("ScrollColumn input", 400, 400);
+        ScrollColumnWitness witness = new ScrollColumnWitness();
+        Exercise(app, witness);
+        Check(witness.Column == null && witness.Row == null, "column and culled rows release without cycles");
+        InlinePadding(app);
+        OverflowModes(app);
+        HiddenEditor(app, witness);
+        Check(witness.Column == null && witness.Row == null, "culled editor and owner release without cycles");
+        MixedWheel(app, false);
+        MixedWheel(app, true);
+        app.canvas.Destroy();
+        frame.canvas.Destroy();
+        Console.WriteLine("SCROLLCOLUMN_INPUT_LIFECYCLE_OK");
+    }
+}

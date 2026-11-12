@@ -391,45 +391,56 @@ public partial class Form : Control {
     // 标准保留模式循环：处理事件、泵子窗口、布局、渲染树、绘制
     // 装饰、呈现。子窗口（ChildWindow）与共享文件选择器由
     // ChildWindows 注册表在此自动泵送，宿主无需手写任何泵逻辑。
+    // 输入根和尺寸重绘回调只在本次循环作用域内持有窗口。
+    protected void RunScoped(Action loop) {
+        App prior = App.frameApp;
+        Control priorRoot = UiDriver.root;
+        Control priorInputRoot = app.rootControl;
+        FrameBody priorBody = app.frameBody;
+        try {
+            app.SetFrameBody(() => {
+                this.RenderFrame(app);
+                app.RenderChrome(title);
+            });
+            app.SetRootControl(this);
+            UiDriver.SetRoot(this);
+            loop();
+        } finally {
+            app.SetRootControl(priorInputRoot);
+            app.SetFrameBody(priorBody);
+            UiDriver.SetRoot(priorRoot);
+            App.frameApp = prior;
+        }
+    }
+
     void Run() {
         this.WireDocEvents();
         app.Show();
-        App prior = App.frameApp;
-        // 拖动窗口边框时 OS 进入模态尺寸调整循环，下面这个循环拿不到
-        // 控制权：把同一份帧体登记给框架，窗口过程收到 WM_SIZE 就地
-        // 画一帧，界面随拖动实时跟随，而不是松手后才刷新。
-        app.SetFrameBody(() => {
-            this.RenderFrame(app);
-            app.RenderChrome(title);
+        this.RunScoped(() => {
+            while (app.isRunning) {
+                if (!app.ProcessEvent()) {
+                    break;
+                }
+                if (frameHook != null) { frameHook(); }
+                app.PerfMark("sh.framehook");
+                ChildWindows.PumpAll();
+                app.PerfMark("sh.childpump");
+                ChildWindows.FoldDeadlines(app);
+                app.PerfMark("sh.deadlines");
+                this.PumpTasks();
+                app.PerfMark("sh.tasks");
+                app.PerfMark("sh.framegate");
+                if (!app.needsRedraw) {
+                    continue;
+                }
+                app.BeginFrame();
+                RenderFrame(app);
+                app.RenderChrome(title);
+                app.PresentFrame();
+                ChildWindows.FoldDeadlines(app);
+                this.FoldTaskDeadlines();
+            }
         });
-        app.SetRootControl(this);
-        UiDriver.SetRoot(this);
-        while (app.isRunning) {
-            if (!app.ProcessEvent()) {
-                break;
-            }
-            if (frameHook != null) { frameHook(); }
-            app.PerfMark("sh.framehook");
-            ChildWindows.PumpAll();
-            app.PerfMark("sh.childpump");
-            ChildWindows.FoldDeadlines(app);
-            app.PerfMark("sh.deadlines");
-            this.PumpTasks();
-            app.PerfMark("sh.tasks");
-            app.PerfMark("sh.framegate");
-            if (!app.needsRedraw) {
-                continue;
-            }
-            app.BeginFrame();
-            RenderFrame(app);
-            app.RenderChrome(title);
-            app.PresentFrame();
-            ChildWindows.FoldDeadlines(app);
-            this.FoldTaskDeadlines();
-        }
-        // 嵌套窗口（对话框等）跑完自己的循环后，把就地重绘的归属
-        // 交还给之前那个窗口，别让它指着一个已关闭的窗口。
-        App.frameApp = prior;
         if (exitHook != null) { exitHook(); }
     }
 

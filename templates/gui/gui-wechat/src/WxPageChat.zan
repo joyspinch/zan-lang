@@ -24,42 +24,37 @@ public class WxPageChat : Control {
     // 里的 #QuoteBar 元素，显隐走 visible，文字走 SetProp。
     Control quoteBar;
     Control quoteText;
-    // 气泡右键菜单的锚点与载荷（跨帧持有，覆盖阶段画）。
-    bool ctxOpen;
-    int ctxMsg;
-    string ctxText;
-    int ctxX;
-    int ctxY;
+    // 一个保留式菜单；稳定 action 0=复制、1=引用，业务载荷每次打开快照。
+    ContextMenu bubbleMenu;
+    weak App menuApp;
+    int bubbleMenuEpoch;
 
-    // 覆盖阶段：画右键菜单。菜单开启时拥有整窗（ContextMenu.Render
-    // 内部 BlockHitsMenu），返回 -2（点外部/再右键）即收起。
-    override void OnPaintOverlay(App app) {
-        if (!ctxOpen) { return; }
-        app.BeginIdScope(730000);
-        List<string> items = new List<string>();
-        items.Add("复制");
-        items.Add("引用");
-        int pick = ContextMenu.Render(app, ctxX, ctxY, items);
-        if (pick == 0 - 2) {
-            ctxOpen = false;
-            app.RequestRedraw();
-            return;
-        }
-        if (pick == 0) {
-            string clip = ctxText != null ? ctxText : "";
-            if (clip.Length > 0) { Clipboard.SetText(clip); }
-            ctxOpen = false;
-            app.RequestRedraw();
-            return;
-        }
-        if (pick == 1) {
-            ctxOpen = false;
-            WxIm.SetQuoteDraft(ctxMsg, ctxText);
-            app.RequestRedraw();
+    void CloseBubbleMenu() {
+        bubbleMenuEpoch = bubbleMenuEpoch + 1;
+        App host = menuApp;
+        menuApp = null;
+        if (bubbleMenu != null) {
+            if (host != null) { host.overlayHost.Hide(bubbleMenu); }
+            bubbleMenu.ClearCallbacks();
         }
     }
+
+    void ApplyBubbleMenu(int epoch, WxSession session, ChatMessage message,
+            int index, string text, int action) {
+        if (epoch != bubbleMenuEpoch || session == null || message == null
+                || session != this.CurrentSession() || index < 0
+                || index >= session.msgs.Count || session.msgs[index] != message) { return; }
+        this.CloseBubbleMenu();
+        if (action == 0) {
+            string clip = text != null ? text : "";
+            if (clip.Length > 0) { Clipboard.SetText(clip); }
+        } else if (action == 1) {
+            WxIm.SetQuoteDraft(index, text);
+        }
+        if (app != null) { app.RequestRedraw(); }
+    }
     // 宿主 App（拖出行手势要按主窗口矩形判断「拖到窗外」）。
-    App app;
+    weak App app;
     // 「...」对应的右侧抽屉与输入区上方的弹出面板。
     Flex drawer;
     WxDrawerBody drawerBody;
@@ -87,16 +82,14 @@ public class WxPageChat : Control {
 
         // ---- HTML 骨架（WeChatChat.html）：左栏搜索 + 会话列表宿主，
         // 右栏标题行 / 聊天 / 弹出面板 / 输入区。
+        WxPageChatActions actions = new WxPageChatActions();
+        actions.owner = this;
         HtmlHandlers hs = new HtmlHandlers();
-        hs.Add("chat-history", () => { WxHistoryWindow.Open(this.app, data[current]); });
-        hs.Add("toggle-drawer", () => { this.ToggleDrawer(); });
+        hs.Add("chat-history", actions.History);
+        hs.Add("toggle-drawer", actions.ToggleDrawer);
         hs.Add("dismiss-quote", () => { WxIm.DismissQuoteDraft(); });
-        hs.Add("send-msg", () => { this.Send(); });
-        hs.Add("start-group", () => {
-            WxCreateGroupWindow.Open(this.app, (convId, title) => {
-                this.OpenConv(convId, title);
-            });
-        });
+        hs.Add("send-msg", actions.Send);
+        hs.Add("start-group", actions.StartGroup);
         Control ui = Html.Load(App.FrameApp(), Form.ReadDoc("src/WxPageChat.html"), hs, "");
 if (ui == null) { ui = new Panel(); }
         ui.Grow();
@@ -112,7 +105,7 @@ if (ui == null) { ui = new Panel(); }
         list = new ListView<WxSession>(WxSessionRow.Of);
         list.Class = "wxlist grow";
         list.Bind(data);
-        list.OnSelect(() => { this.Select(list.SelectedIndex()); });
+        list.OnSelect(actions.Select);
         listHost.Add(list);
 
         // ---- 右侧标题行：文字是文档元素，按钮图标/显隐/事件均在 HTML 中声明
@@ -146,10 +139,10 @@ if (ui == null) { ui = new Panel(); }
         popup.AddClass("wxpopup");
         popup.AlignStart();
         popup.visible = false;
-        emoPanel = WxEmojiPanel.Of((t) => { this.Type(t); });
+        emoPanel = WxEmojiPanel.Of(actions.Type);
         emoPanel.Root().visible = false;
         popup.Add(emoPanel.Root());
-        avaPanel = WxAvaPanel.Of((t) => { this.Type(t); });
+        avaPanel = WxAvaPanel.Of(actions.Type);
         avaPanel.Root().visible = false;
         popup.Add(avaPanel.Root());
         popupHost.Add(popup);
@@ -158,15 +151,8 @@ if (ui == null) { ui = new Panel(); }
         // 抽屉与名片是覆盖层，仍挂在页面根本身，压在骨架文档之上；骨架是纯 flex 流。
         drawer = Wx.Col("wxdrawer");
         drawer.visible = false;
-        drawerBody = WxDrawerBody.Of(
-            () => { WxHistoryWindow.Open(this.app, data[current]); },
-            () => { this.ClearCurrent(); },
-            (nm, ini, tint) => { this.ShowProfile(nm, ini, tint); },
-            () => {
-                WxCreateGroupWindow.Open(this.app, (convId, title) => {
-                    this.OpenConv(convId, title);
-                });
-            });
+        drawerBody = WxDrawerBody.Of(actions.History, actions.Clear,
+            actions.ShowProfile, actions.StartGroup);
         Control drawerRoot = drawerBody.Root();
         drawerRoot.AddClass("grow");
         drawerRoot.Grow();
@@ -191,11 +177,11 @@ if (ui == null) { ui = new Panel(); }
         chat.WithStyle(ChatStyle.Bubble());
         chat.WithBubbleWidth(620);
         // 点气泡里的头像 = 弹发言人名片（原版同款交互）。
-        chat.OnAvatarClick((idx) => { this.OpenMsgProfile(idx); });
+        chat.OnAvatarClick(actions.OpenMsgProfile);
         // 右键气泡 = 复制 / 引用；「引用」把草稿交给桥，随下一条发送。
-        chat.OnBubbleMenu((idx, sel) => { this.OpenBubbleMenu(idx, sel); });
+        chat.OnBubbleMenu(actions.OpenBubbleMenu);
         // 点任务卡片 = 拉详情弹右缘详情卡（card 消息才有单击语义）。
-        chat.OnBubbleActivate((idx, sel) => { this.OpenTaskCard(idx); });
+        chat.OnBubbleActivate(actions.OpenTaskCard);
         chatHost.Add(chat);
 
         this.Select(0);
@@ -225,15 +211,26 @@ if (ui == null) { ui = new Panel(); }
         return data[current];
     }
 
-    // 气泡右键菜单：复制（选中部分或整条）+ 引用。菜单是即时模式
-    // 的（ContextMenu.Render），挂在覆盖阶段末尾、按右键坐标锚定，
-    // 与 IDE 外壳同一套画法；ctxOpen 跨帧持有开关状态。
+    // 气泡选择/正文仍由真实 ChatView 提供；菜单只持有这次打开的身份快照。
     void OpenBubbleMenu(int msgIndex, string selText) {
-        ctxMsg = msgIndex;
-        ctxText = selText;
-        ctxX = app.mouseX;
-        ctxY = app.mouseY;
-        ctxOpen = true;
+        this.CloseBubbleMenu();
+        WxSession session = this.CurrentSession();
+        if (app == null || session == null || msgIndex < 0 || msgIndex >= session.msgs.Count) { return; }
+        if (bubbleMenu == null) {
+            bubbleMenu = new ContextMenu();
+            bubbleMenu.AddItem(MenuItem.Item("复制", "", 0));
+            bubbleMenu.AddItem(MenuItem.Item("引用", "", 1));
+        }
+        WxBubbleMenuSelection selection = new WxBubbleMenuSelection();
+        selection.owner = this;
+        selection.epoch = bubbleMenuEpoch;
+        selection.session = session;
+        selection.message = session.msgs[msgIndex];
+        selection.index = msgIndex;
+        selection.text = selText;
+        bubbleMenu.ActionSelected.AddS(selection.Run);
+        menuApp = app;
+        bubbleMenu.ShowAt(app, app.mouseX, app.mouseY);
         app.RequestRedraw();
     }
 
@@ -444,6 +441,7 @@ if (ui == null) { ui = new Panel(); }
     // 清空当前会话：共享的记录列表清掉，聊天区与列表摘要跟上
     // （抽屉底部那行红字）。
     void ClearCurrent() {
+        this.CloseBubbleMenu();
         WxSession s = data[current];
         s.msgs.Clear();
         s.snippet = "";
@@ -471,12 +469,14 @@ if (ui == null) { ui = new Panel(); }
         bar.Add("", "caret-down");
         bar.Add("", "microphone");
         bar.Add("", "target");
+        WxPageChatActions actions = new WxPageChatActions();
+        actions.owner = this;
         Wx.Item(bar, 0).Tip = "表情";
-        Wx.Item(bar, 0).OnClick(() => { this.ShowPopup(emoPanel.Root()); });
+        Wx.Item(bar, 0).OnClick(actions.ShowEmoji);
         Wx.Item(bar, 1).Tip = "常用头像";
-        Wx.Item(bar, 1).OnClick(() => { this.ShowPopup(avaPanel.Root()); });
+        Wx.Item(bar, 1).OnClick(actions.ShowAvatar);
         Wx.Item(bar, 2).Tip = "文件";
-        Wx.Item(bar, 2).OnClick(() => { this.PickAttach(); });
+        Wx.Item(bar, 2).OnClick(actions.PickAttach);
         Wx.Item(bar, 3).Tip = "截图";
         Wx.Item(bar, 4).Tip = "截图范围";
         Wx.Item(bar, 5).Tip = "麦克风";
@@ -492,6 +492,7 @@ if (ui == null) { ui = new Panel(); }
     // 抽屉与弹出面板一并收起，图标条按群聊/私聊翻群目标图标。
     void Select(int i) {
         if (i < 0 || i >= data.Count) { return; }
+        this.CloseBubbleMenu();
         current = i;
         WxSession s = data[i];
         headName.SetProp("text", s.name);
@@ -592,7 +593,9 @@ if (ui == null) { ui = new Panel(); }
         this.ClosePopups();
         if (pick == null) {
             pick = new FilePicker();
-            pick.Accepted.Add(this.OnPicked);
+            WxPageChatActions actions = new WxPageChatActions();
+            actions.owner = this;
+            pick.Accepted.Add(actions.OnPicked);
         }
         // 每次打开都重新登记（幂等）：弹窗关闭后注册表移出该实例，
         // 复用同一实例的第二次打开不登记就不再被泵。
@@ -653,6 +656,7 @@ if (ui == null) { ui = new Panel(); }
     // 接桥（登录成功）：示例会话整批退场——登录是硬门，进了主窗口
     // 就只认服务端数据；残留的示例会话会把首屏聊天区画成别人的记录。
     void BeginServerMode() {
+        this.CloseBubbleMenu();
         data.Clear();
         current = 0 - 1;
         shownCount = 0 - 1;
@@ -669,8 +673,11 @@ if (ui == null) { ui = new Panel(); }
 
     // 绑定宿主 App，并接上「会话行拖出列表成独立窗口」手势。
     void UseDetach(App a) {
+        this.CloseBubbleMenu();
         this.app = a;
-        list.OnDragOut((i) => { this.Detach(i); });
+        WxPageChatActions actions = new WxPageChatActions();
+        actions.owner = this;
+        list.OnDragOut(actions.Detach);
     }
 
     // 行被拖出列表之后：只有拖到主窗口之外才开独立窗口。原版行为

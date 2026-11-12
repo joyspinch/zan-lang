@@ -23,7 +23,8 @@ public class GraphView : Control {
     // 调用方的节点，每帧读取；卡片需要重建时调用 Refresh()。
     private List<GraphNode> data;
     private SignalInt sel;
-    private SignalInt scroll;
+    private bool arrangingGraph;
+    private int graphVersion;
     private GraphCardOf tpl;
     // 每个节点一个卡片槽位（包含卡片控件与可选锁标记）。
     private List<GraphCardSlot> slots;
@@ -62,7 +63,7 @@ public class GraphView : Control {
         this.InitControl("graph", 5);
         data = new List<GraphNode>();
         sel = new SignalInt(0 - 1);
-        scroll = new SignalInt(0);
+        arrangingGraph = false;
         tpl = null;
         slots = new List<GraphCardSlot>();
         cardsStale = true;
@@ -81,19 +82,61 @@ public class GraphView : Control {
         Blocked = new UiEvent();
         Context = new UiEvent();
 
-        this.OnMouseDown(() => {
-            dragging = true;
-            App fapp = App.FrameApp();
-            if (fapp != null) {
-                dragStartX = fapp.mouseX;
-                dragStartY = fapp.mouseY;
-                panStartX = panX;
-                panStartY = panY;
-            }
-        });
-        this.OnMouseUp(() => {
-            dragging = false;
-        });
+        // Pan is a routed content gesture; shared scroll chrome runs first.
+    }
+
+    public void BeginPan() {
+        if (this.IsDisabled() || !this.StyleVisible()
+            || (scroll != null && scroll.Active())) { return; }
+        App frame = this.App;
+        if (frame == null) { return; }
+        dragging = true;
+        dragStartX = frame.mouseX;
+        dragStartY = frame.mouseY;
+        panStartX = panX;
+        panStartY = panY;
+        frame.CapturePointer(this, true);
+    }
+
+    public void EndPan() {
+        dragging = false;
+        App app = this.App;
+        if (app != null && app.GetCapturedPointer() == this
+            && (scroll == null || !scroll.Active())) { app.ReleasePointerCapture(); }
+    }
+    public bool IsPanning() { return dragging; }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        App app = this.App;
+        if (e.handled || e.originalSource != this || app == null
+            || app.window.EventButton() != 0) { return; }
+        this.BeginPan();
+        if (dragging) { e.Handle(); }
+    }
+
+    private void MovePan(RoutedEventArgs e) {
+        App app = this.App;
+        if (!dragging || app == null || app.GetCapturedPointer() != this) { return; }
+        if (this.IsDisabled() || !this.StyleVisible()) { this.OnPointerCancel(e); return; }
+        panX = panStartX + e.x - dragStartX;
+        panY = panStartY + e.y - dragStartY;
+        this.Arrange(bx, by, bw, bh);
+        this.NoteSelfDamage(app);
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) { this.MovePan(e); }
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        App app = this.App;
+        if (app == null || app.window.EventButton() != 0 || !dragging) { return; }
+        this.MovePan(e); // The final Up coordinate is authoritative.
+        this.EndPan();
+    }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        if (dragging) { this.EndPan(); e.Handle(); }
+        base.OnPointerCancel(e);
     }
 
     // 默认构造：节点卡片用内置标准控件拼装。
@@ -178,6 +221,7 @@ public class GraphView : Control {
 
     // 绑定调用方的节点列表；不复制任何内容。
     public GraphView Bind(List<GraphNode> nodes) {
+        graphVersion = graphVersion + 1;
         if (nodes == null) { data = new List<GraphNode>(); }
         else { data = nodes; }
         cardsStale = true;
@@ -186,7 +230,7 @@ public class GraphView : Control {
     }
 
     // 节点内容变了：下一帧重建卡片。
-    public void Refresh() { cardsStale = true; }
+    public void Refresh() { graphVersion = graphVersion + 1; cardsStale = true; }
 
     // 共享调用方的选择信号，供在列表重建后保持选择的宿主使用。
     public GraphView BindSel(SignalInt s) {
@@ -331,15 +375,10 @@ public class GraphView : Control {
             if (card == null) { continue; }
 
             // 挂接 Visual Tree 标准事件驱动
-            card.Click.Add(() => {
-                this.OnNodeClick(nodeIndex, app);
-            });
-            card.OnDoubleClick(() => {
-                this.OnNodeDoubleClick(nodeIndex, app);
-            });
-            card.OnRightClick(() => {
-                this.OnNodeRightClick(nodeIndex, app);
-            });
+            GraphCardAction action = new GraphCardAction(this, nodeIndex);
+            card.Click.AddS(action.Click);
+            card.BindEventS("DoubleClick", action.DoubleClick);
+            card.BindEventS("RightClick", action.RightClick);
 
             this.Add(card);
             slots.Add(new GraphCardSlot(card, mark));
@@ -349,6 +388,14 @@ public class GraphView : Control {
         for (int k = 0; k < slots.Count; k = k + 1) {
             slots[k].card.MeasureTree(app);
         }
+    }
+
+    public void DispatchCardEvent(int row, string eventName) {
+        if (!this.Has(row)) { return; }
+        App app = this.App;
+        if (eventName == "Click") { this.OnNodeClick(row, app); }
+        else if (eventName == "DoubleClick") { this.OnNodeDoubleClick(row, app); }
+        else if (eventName == "RightClick") { this.OnNodeRightClick(row, app); }
     }
 
     private void OnNodeClick(int index, App app) {
@@ -452,7 +499,7 @@ public class GraphView : Control {
     private int Gap(App app) {
         app = this.ResolveApp(app);
         if (app == null) { return 16; }
-        StyleBox s = this.ResolveStyleAs(app, "graph", Class, Style.SNormal());
+        StyleBox s = this.ResolveStyle(app, Style.SNormal());
         return s.GapOr(app.theme.gapLarge);
     }
 
@@ -535,57 +582,68 @@ public class GraphView : Control {
         prefH = this.Layout(app, 0, 0, areaW) + gap * 2;
     }
 
-    // 覆写：画表面、空态提示，流式摆放节点卡片与连线并在溢出时
-    // 支持拖拽画布 Pan 与平滑贝塞尔连线。
-    public override void OnPaint(App app) {
-        this.BuildCards(app);
-        Canvas c = app.canvas;
-        StyleBox s = this.ResolveStyleAs(app, "graph", Class, Style.SNormal());
-        s.Paint(app, bx, by, bw, bh);
-        if (data.Count == 0) {
-            this.PaintEmpty(app);
-            return;
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == 0 - 1) {
+            box.overflowY = panX == 0 && panY == 0 ? 2 : 1;
+            box.overflow = 1;
         }
-
-        // 画布级交互：按住背景拖拽 Pan 画布平移
-        if (dragging) {
-            panX = panStartX + (app.mouseX - dragStartX);
-            panY = panStartY + (app.mouseY - dragStartY);
-            this.NoteSelfDamage(app);
-        }
-
-        int gap = this.Gap(app);
-        int barW = app.Scale(6);
-        int areaW = bw - gap * 2;
-        if (areaW < app.Scale(40)) { areaW = app.Scale(40); }
-        int contentH = this.Layout(app, bx + gap + panX, by + gap + panY, areaW);
-        bool overflow = contentH + gap * 2 > bh;
-        if (overflow && panX == 0 && panY == 0) {
-            areaW = areaW - barW;
-            contentH = this.Layout(app, bx + gap, by + gap, areaW);
-            int off = this.ScrollOffset(app, contentH + gap * 2);
-            if (off != 0) { this.Layout(app, bx + gap, by + gap - off, areaW); }
-        }
-
-        c.PushClip(bx, by, bw, bh);
-        this.PaintEdges(app);
-        this.PaintNodes(app);
-        c.PopClip();
-
-        if (overflow && panX == 0 && panY == 0) {
-            Scrollbar.RenderVerticalScrollIn(app, bx + bw - barW, by, bh, bh,
-                contentH + gap * 2, scroll, bx, by, bw, bh);
-        }
+        return box;
     }
 
-    // 处理滚轮并把滚动位置钳在内容范围内，返回当前偏移。
-    private int ScrollOffset(App app, int contentH) {
-        Scrollbar.HandleWheel(app, bx, by, bw, bh, contentH, scroll);
-        int maxOff = contentH - bh;
-        if (maxOff < 0) { maxOff = 0; }
-        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
-        if (scroll.Get() < 0) { scroll.Set(0); }
-        return scroll.Get();
+    public override void OnScrollChanged() {
+        if (!arrangingGraph) { this.Arrange(bx, by, bw, bh); }
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        if (arrangingGraph) { return; }
+        arrangingGraph = true;
+        bx = px; by = py;
+        bw = pw > 0 ? pw : 0;
+        bh = ph > 0 ? ph : 0;
+        App app = this.App;
+        if (app == null) { arrangingGraph = false; return; }
+        this.BuildCards(app);
+        int gap = this.Gap(app);
+        Rect view = this.ScrollViewport();
+        int areaW = view.width - gap * 2;
+        if (areaW < app.Scale(40)) { areaW = app.Scale(40); }
+        int contentH = this.Layout(app, view.x + gap, view.y + gap, areaW);
+        bool scrolling = panX == 0 && panY == 0;
+        if (scrolling && contentH + gap * 2 > view.height) {
+            // Shared ScrollState: 4px thumb plus 2px inset, with content margin.
+            areaW = areaW - app.Scale(8);
+            if (areaW < 1) { areaW = 1; }
+            contentH = this.Layout(app, view.x + gap, view.y + gap, areaW);
+        }
+        scrollExtentX = view.width;
+        scrollExtent = scrolling && contentH + gap * 2 > view.height
+            ? contentH + gap * 2 : view.height;
+        int maximum = scrollExtent - view.height;
+        int nextY = scrollY;
+        if (nextY < 0) { nextY = 0; }
+        if (nextY > maximum) { nextY = maximum; }
+        this.CommitScrollOffset(0, nextY);
+        this.Layout(app, view.x + gap + panX, view.y + gap + panY - scrollY, areaW);
+        if (!this.ArrangeNodes(app)) { arrangingGraph = false; return; }
+        // Shrinking out of scroll mode retires an active shared chrome gesture.
+        if (scroll != null && scroll.Active() && maximum <= 0) {
+            RoutedEventArgs cancel = new RoutedEventArgs("PointerCancel", this, px, py);
+            this.ScrollPointerCancel(cancel);
+        }
+        arrangingGraph = false;
+    }
+
+    public override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        StyleBox s = this.ResolveStyle(app, Style.SNormal());
+        s.Paint(app, bx, by, bw, bh);
+        if (data.Count == 0) { this.PaintEmpty(app); return; }
+        Rect view = this.ScrollViewport();
+        c.PushClip(view.x, view.y, view.width, view.height);
+        this.PaintEdges(app);
+        c.PopClip();
+        // Cards and shared chrome are rendered by Control.RenderTree afterwards.
     }
 
     // 依赖连线：前置卡片底边中点 -> 本节点顶边中点。
@@ -658,7 +716,10 @@ public class GraphView : Control {
 
     // 节点：把卡片摆到算出来的矩形上，并按选中/悬停/锁住换类 ——
     // 选中态、悬停态和锁住态的长相在皮肤里，由卡片自主渲染与处理点击。
-    private void PaintNodes(App app) {
+    private bool ArrangeNodes(App app) {
+        int version = graphVersion;
+        List<GraphNode> arrangedData = data;
+        List<GraphCardSlot> arrangedSlots = slots;
         int selRow = sel.Get();
         int viewportBottom = by + bh;
         for (int i = 0; i < data.Count; i = i + 1) {
@@ -671,8 +732,17 @@ public class GraphView : Control {
                 mark = slots[i].lockMark;
             }
             if (card == null) { continue; }
+            if (this.App != app || graphVersion != version || data != arrangedData
+                || slots != arrangedSlots || i >= slots.Count || slots[i].card != card
+                || card.parent != this || card.App != app || this.IndexOf(card) < 0) { return false; }
+            if (!onscreen && card.visible) {
+                app.ReleaseInputSubtree(card);
+                // Cancellation may rebind the graph or move this card to another App.
+                if (this.App != app || graphVersion != version || data != arrangedData
+                    || slots != arrangedSlots || i >= slots.Count || slots[i].card != card
+                    || card.parent != this || card.App != app || this.IndexOf(card) < 0) { return false; }
+            }
             card.visible = onscreen;
-            if (!onscreen) { continue; }
 
             bool locked = this.LockedAt(i);
             bool isHovered = card.IsHovered();
@@ -685,6 +755,7 @@ public class GraphView : Control {
             card.MeasureTree(app);
             card.Arrange(n.lx, n.ly, n.lw, n.lh);
         }
+        return true;
     }
 
     // 节点卡片的状态类（预定义常量静态分支，消除每帧临时字符串拼接）。
@@ -700,6 +771,7 @@ public class GraphView : Control {
 
     // 选中与滚动只改画布自己那块像素，损伤限定在控件矩形内。
     private void NoteSelfDamage(App app) {
+        if (!arrangingGraph) { this.Arrange(bx, by, bw, bh); }
         app.NoteDamage(bx, by, bw, bh);
         app.window.Wake();
     }

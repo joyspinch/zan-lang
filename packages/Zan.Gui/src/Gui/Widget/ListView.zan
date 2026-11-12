@@ -82,8 +82,35 @@ public class ListView<T> : Control {
     public UiEvent Context;
 
     // 公共初始化（各构造共用）。
+    // Data indices stay stable even when a template returns null.
+    private ListRowsPanel<T> rowsBody;
+    private bool layingRows;
+    private bool projectingScroll;
+    private int filterRevision;
+    private List<Control> dataRows;
+    private int rowsRevision;
+    private bool buildingRows;
+
+    private Control DataRow(int index) {
+        if (dataRows == null || index < 0 || index >= dataRows.Count) { return null; }
+        Control row = dataRows[index];
+        if (row == null || rowsBody == null || row.parent != rowsBody || rowsBody.IndexOf(row) < 0) { return null; }
+        return row;
+    }
+
+    private void RetireRows() {
+        rowsRevision = rowsRevision + 1;
+        rowsStale = true;
+        builtFor = -1;
+        dataRows = null;
+        // RemoveAll snapshots; Remove cancels input while the old parent path is valid.
+        if (rowsBody != null) { rowsBody.RemoveAll(); }
+    }
+
     private void InitList() {
         this.InitControl("list", 5);
+        rowsBody = new ListRowsPanel<T>(this);
+        base.Add(rowsBody);
         data = null;
         cols = new List<ListColumn<T>>();
         rowOf = null;
@@ -134,7 +161,7 @@ public class ListView<T> : Control {
     public ListView<T> WithColumns(List<ListColumn<T>> columns) {
         cols = new List<ListColumn<T>>();
         if (columns != null) { cols = columns; }
-        rowsStale = true;
+        this.RetireRows();
         return this;
     }
 
@@ -142,7 +169,7 @@ public class ListView<T> : Control {
     // 默认构造函数，行模板在代码里补上）。
     public ListView<T> WithRow(RowOf<T> row) {
         rowOf = row;
-        rowsStale = true;
+        this.RetireRows();
         return this;
     }
 
@@ -150,7 +177,7 @@ public class ListView<T> : Control {
     public ListView<T> Column(string title, CellOf<T> cell) {
         if (cols == null) { cols = new List<ListColumn<T>>(); }
         cols.Add(new ListColumn<T>(title, cell));
-        rowsStale = true;
+        this.RetireRows();
         return this;
     }
 
@@ -158,7 +185,7 @@ public class ListView<T> : Control {
     public ListView<T> Column(string title, int weight, CellOf<T> cell) {
         if (cols == null) { cols = new List<ListColumn<T>>(); }
         cols.Add(new ListColumn<T>(title, weight, cell));
-        rowsStale = true;
+        this.RetireRows();
         return this;
     }
 
@@ -166,7 +193,7 @@ public class ListView<T> : Control {
     public ListView<T> SlotColumn(string title, CellSlotOf<T> slot) {
         if (cols == null) { cols = new List<ListColumn<T>>(); }
         cols.Add(ListColumn<T>.Slot(title, slot));
-        rowsStale = true;
+        this.RetireRows();
         return this;
     }
 
@@ -174,14 +201,258 @@ public class ListView<T> : Control {
     public ListView<T> SlotColumn(string title, int weight, CellSlotOf<T> slot) {
         if (cols == null) { cols = new List<ListColumn<T>>(); }
         cols.Add(ListColumn<T>.SlotWithWeight(title, weight, slot));
-        rowsStale = true;
+        this.RetireRows();
         return this;
     }
 
     // 控件类型标识（序列化/设计器用）。
+    private bool layoutBodyActive;
+    // Generated body is rebuilt from business declarations, never copied as authored content.
+    public override void CloneContentTo(Control target, CloneTreeFn clone) {
+        ListView<T> copy = (ListView<T>)target;
+        copy.Bind(data);
+        copy.WithColumns(cols);
+        copy.WithRow(rowOf);
+    }
+
+    // Root owns fixed chrome; rowsBody alone consumes shared scrolling input.
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        box.overflowX = 0;
+        box.overflowY = 0;
+        box.overflow = 1;
+        return box;
+    }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        int fixedH = this.HeaderHeight(this.App);
+        if (fixedH > view.height) { fixedH = view.height; }
+        if (fixedH < 0) { fixedH = 0; }
+        return new Rect(view.x, view.y + fixedH, view.width, view.height - fixedH);
+    }
+
+    // Original data index, independent of structural filter/body children.
+    public Control RowControl(int index) { return this.DataRow(index); }
+    public int RowCount() { return this.Count(); }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        if (layingRows || rowsBody == null) { return; }
+        layingRows = true;
+        try {
+            App app = this.FindApp();
+            Control ownerParent = parent;
+            this.BuildRows(app);
+            if (this.FindApp() != app || parent != ownerParent || rowsStale) { return; }
+            int requested = scroll.Get();
+            Rect view = this.ScrollViewport();
+            int ticket = rowsRevision;
+            rowsBody.Arrange(view.x, view.y, view.width, view.height);
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+            if (requested != rowsBody.ScrollTop()) { rowsBody.SetScrollTop(requested); }
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+            this.LayoutBody();
+        } finally { layingRows = false; }
+    }
+
+    // Compatibility SetScrollTop/ScrollTop project the body's committed value.
+    public override void OnScrollChanged() {
+        if (projectingScroll || rowsBody == null) { return; }
+        App app = this.FindApp();
+        Control ownerParent = parent;
+        int ticket = rowsRevision;
+        int requested = scrollY;
+        if (scroll.Get() != requested) { scroll.Set(requested); }
+        if (rowsBody.ScrollTop() != requested) { rowsBody.SetScrollTop(requested); }
+        if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+        this.BodyScrolled();
+    }
+
+    public void BodyScrolled() {
+        if (rowsBody == null || projectingScroll) { return; }
+        projectingScroll = true;
+        try {
+            int value = rowsBody.ScrollTop();
+            if (scroll.Get() != value) { scroll.Set(value); }
+            if (scrollY != value || scrollX != 0) { this.CommitScrollOffset(0, value); }
+        } finally { projectingScroll = false; }
+        if (!layingRows) { this.LayoutBody(); }
+    }
+
+    public void LayoutBody() {
+        if (rowsBody == null || layoutBodyActive) { return; }
+        layoutBodyActive = true;
+        try {
+        App app = this.FindApp();
+        Control ownerParent = parent;
+        int ticket = rowsRevision;
+        Rect view = rowsBody.ScrollViewport();
+        rowsBody.scrollExtent = this.ContentHeight(app);
+        rowsBody.scrollExtentX = view.width;
+        // Read-only compatibility projection; root overflow modes are zero.
+        scrollExtent = rowsBody.scrollExtent;
+        scrollExtentX = rowsBody.scrollExtentX;
+        int max = rowsBody.scrollExtent - view.height;
+        if (max < 0) { max = 0; }
+        int off = rowsBody.ScrollTop();
+        if (off > max) { off = max; }
+        if (off < 0) { off = 0; }
+        if (off != rowsBody.ScrollTop()) { rowsBody.CommitScrollOffset(0, off); }
+        if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+        int width = view.width;
+        if (rowsBody.scrollExtent > view.height) { width = width - (app != null ? app.Scale(12) : 12); }
+        if (width < 0) { width = 0; }
+        int y = view.y - off;
+        for (int i = 0; i < this.Count(); i = i + 1) {
+            Control row = this.DataRow(i);
+            bool shown = true;
+            int rh = row != null ? this.RowExtent(app, row) : 0;
+            bool onscreen = shown && y + rh > view.y && y < view.y + view.height;
+            if (row != null) {
+                if (!onscreen && app != null) { app.ReleaseInputSubtree(row); }
+                if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+                // Reentrant cancellation can move a row; never take it back.
+                if (row.parent == rowsBody) {
+                    row.Arrange(view.x, shown ? y : view.y - rh - 1, width, rh);
+                    if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+                }
+            }
+            if (shown) { y = y + rh; }
+        }
+        this.BodyScrolled();
+        } finally { layoutBodyActive = false; }
+    }
+
+    private int DataIndexAt(int x, int y) {
+        if (rowsBody == null) { return -1; }
+        Rect view = rowsBody.ScrollViewport();
+        if (!view.Contains(x, y)) { return -1; }
+        int top = view.y - rowsBody.ScrollTop();
+        for (int i = 0; i < this.Count(); i = i + 1) {
+            if (!(true)) { continue; }
+            Control row = this.DataRow(i);
+            int height = row != null ? this.RowExtent(this.App, row) : (this.Templated() ? 0 : this.RowHeight(this.App));
+            if (y >= top && y < top + height) { return i; }
+            top = top + height;
+        }
+        return -1;
+    }
+
+    private bool RowEditorOwnsPrimary(Control source) {
+        bool editing = false;
+        Control node = source;
+        while (node != null && node != rowsBody && node != this) {
+            if ((node.InputFocusCapabilities() & 2) != 0) { editing = true; }
+            node = node.parent;
+        }
+        return node == rowsBody && editing;
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        if (e.handled || this.IsDisabled()) { return; }
+        if (this.App.window.EventButton() == 0 && this.RowEditorOwnsPrimary(e.originalSource)) { return; }
+        int index = this.DataIndexAt(e.x, e.y);
+        if (index < 0 || !this.Selectable(index)) { return; }
+        App app = this.App;
+        if (app.window.EventButton() == 1) {
+            sel = index; Context.PostS(this); this.NoteSelfDamage(app); e.Handle();
+        } else if (app.window.EventButton() == 0 && dragOut.Count > 0
+                && (app.GetCapturedPointer() == null || app.GetCapturedPointer() == this)) {
+            dragOutFrom = index;
+            app.CapturePointer(this, true);
+        }
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        App app = this.App;
+        if (e.handled || app.window.EventButton() != 0 || dragOutFrom < 0) { return; }
+        int from = dragOutFrom;
+        dragOutFrom = -1;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        if (!this.ContainsPoint(e.x, e.y, e.pointerType) && this.Has(from)) {
+            for (int i = 0; i < dragOut.Count; i = i + 1) { dragOut[i](from); }
+        }
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        dragOutFrom = -1;
+        App app = this.App;
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        base.OnClick(e);
+        if (e.handled || this.IsDisabled() || this.RowEditorOwnsPrimary(e.originalSource)) { return; }
+        int index = this.DataIndexAt(e.x, e.y);
+        if (index < 0 || !this.Selectable(index)) { return; }
+        App app = this.App;
+            int mods = app.window.EventMods();
+            if (multi && Modifiers.HasCtrl(mods)) {
+                // 把该行加入/移出多选集合。
+                bool was = false;
+                for (int mi = 0; mi < marks.Count; mi = mi + 1) {
+                    if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
+                }
+                if (sel == index) { sel = -1; was = true; }
+                if (!was) { marks.Add(index); if (sel < 0) { sel = index; } }
+                Select.PostS(this);
+            } else if (multi && Modifiers.HasShift(mods) && sel >= 0) {
+                // 把选中项从聚焦行扩展到本行；范围内的禁用行跳过。
+                int a = sel;
+                int b = index;
+                if (b < a) { int tmp = a; a = b; b = tmp; }
+                int r = a;
+                while (r <= b) {
+                    if (this.Selectable(r) && !this.IsMarked(r)) { marks.Add(r); }
+                    r = r + 1;
+                }
+                Select.PostS(this);
+            } else {
+                // 激活 = 同一行的第二次点击，或者一次真正的双击。
+                // 后者也要算，因为两次点击之间行可能被重新绑定（宿主
+                // 每次刷新数据都会重建行），那时 sel 已经不等于 index，
+                // 只看「又点了同一行」会把双击吞掉。
+                bool again = (sel == index) || app.DoubleClickNow();
+                if (multi) { marks = new List<int>(); }
+                sel = index;
+                if (again) { Activate.PostS(this); }
+                else { Select.PostS(this); }
+            }
+            this.NoteSelfDamage(app);
+        e.Handle();
+    }
+
+    // Uses the existing gesture name; stationary delivery must come from App's
+    // shared gesture state machine, never another paint poll or component timer.
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (!e.handled && e.eventName == "LongPress" && !this.IsDisabled()) {
+            int index = this.DataIndexAt(e.x, e.y);
+            if (index >= 0 && this.Selectable(index)) {
+                sel = index;
+                dragOutFrom = -1;
+                App app = this.App;
+                if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+                Context.PostS(this);
+                this.NoteSelfDamage(app);
+                e.Handle();
+            }
+        }
+        if (!e.handled) { base.OnRoutedEvent(e); }
+    }
+
     public override string Kind() { return "ListView"; }
 
     // 覆写：CSS 类型选择器名（"list"）。
+    public override Control HitTest(int x, int y, int pointerType) {
+        if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
+        this.Arrange(bx, by, bw, bh);
+        return base.HitTest(x, y, pointerType);
+    }
+
     public override string StyleType() { return "list"; }
 
     // ---- 数据 ----
@@ -191,7 +462,7 @@ public class ListView<T> : Control {
     public ListView<T> Bind(List<T> src) {
         if (data == src) { return this; }
         data = src;
-        rowsStale = true;
+        this.RetireRows();
         if (sel >= this.Count()) { sel = -1; }
         int mi = marks.Count - 1;
         while (mi >= 0) {
@@ -203,7 +474,14 @@ public class ListView<T> : Control {
 
     // 标记绑定数据已变更，自定义行将在下一帧
     // 重建。任意线程调用都安全。
-    public void Refresh() { rowsStale = true; }
+    public void Refresh() {
+        if (!Dispatcher.CheckUiThread()) {
+            ListRefreshAction<T> action = new ListRefreshAction<T>(this);
+            Dispatcher.Post(action.Run);
+            return;
+        }
+        this.RetireRows();
+    }
 
     // 当前绑定数据的行数。
     public int Count() {
@@ -356,41 +634,51 @@ public class ListView<T> : Control {
     // 它们。
     public void BuildRows() { this.BuildRows(this.App); }
     public void BuildRows(App app) {
-        app = this.ResolveApp(app);
-        if (!rowsStale && builtFor == this.Count()) { return; }
-        // 采用作用域 Hash 栈隔离行控件 ID，跨重建稳定且绝不与外部全局撞号。
-        children = new List<Control>();
-        int n = this.Count();
-        for (int i = 0; i < n; i = i + 1) {
-            WidgetId.Push(i);
-            Control row = null;
-            if (rowOf != null) {
-                row = rowOf(data[i]);
-            } else if (this.HasSlotColumns()) {
-                row = this.BuildCompositeRow(data[i]);
-            }
-            if (row != null) {
-                row.parent = this;
-                children.Add(row);
-            }
-            WidgetId.Pop();
-        }
-        rowsStale = false;
-        builtFor = n;
-        // 门判定的禁用行传播到行控件：模板行自己画文本，不传播的
-        // 话禁用行行为上点不动、外观上却和可选项一模一样（列模式
-        // 有 ::cell:disabled 弱色，模板模式靠行控件自己的 disabled
-        // 状态；只置真不复位——控件自身的 Disabled 是模板的语义）。
-        if (onlySelectable != null) {
-            for (int i = 0; i < children.Count; i = i + 1) {
-                if (children[i] != null && !onlySelectable(data[i])) {
-                    children[i].Disabled.Set(true);
+        App host = this.FindApp();
+        Control ownerParent = parent;
+        app = host != null ? host : this.ResolveApp(app);
+        if (buildingRows || (!rowsStale && builtFor == this.Count())) { return; }
+        buildingRows = true;
+        try {
+            this.RetireRows();
+            if (this.FindApp() != host || parent != ownerParent) { return; }
+            int ticket = rowsRevision;
+            List<T> source = data;
+            RowOf<T> template = rowOf;
+            int n = this.Count();
+            List<Control> mapped = new List<Control>();
+            dataRows = mapped;
+            for (int i = 0; i < n; i = i + 1) {
+                Control row = null;
+                WidgetId.Push(i);
+                try {
+                    if (template != null) { row = template(source[i]); }
+                    else if (this.HasSlotColumns()) { row = this.BuildCompositeRow(source[i]); }
+                } finally { WidgetId.Pop(); }
+                if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) { return; }
+                if (row != null && rowsBody.IndexOf(row) < 0 && rowsBody.Adoptable(row)) {
+                    rowsBody.Add(row);
+                    if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) {
+                        if (ticket != rowsRevision && this.FindApp() == host && parent == ownerParent
+                            && row.parent == rowsBody) { rowsBody.Remove(row); }
+                        return;
+                    }
                 }
+                else { row = null; }
+                if (row != null && row.parent != rowsBody) { row = null; }
+                mapped.Add(row);
+                if (row != null) {
+                    if (onlySelectable != null && !onlySelectable(source[i])) {
+                        row.Disabled.Set(true);
+                    }
+                    if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) { return; }
+                    row.MeasureTree(app);
+                }
+                if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) { return; }
             }
-        }
-        for (int k = 0; k < children.Count; k = k + 1) {
-            children[k].MeasureTree(app);
-        }
+            rowsStale = false;
+            builtFor = n;
+        } finally { buildingRows = false; }
     }
 
     // 行的总高度；当样式表未声明高度时，列布局用它
@@ -400,8 +688,9 @@ public class ListView<T> : Control {
         app = this.ResolveApp(app);
         if (this.Templated()) {
             int h = 0;
-            for (int i = 0; i < children.Count; i = i + 1) {
-                h = h + this.RowExtent(app, children[i]);
+            for (int i = 0; i < this.Count(); i = i + 1) {
+                Control row = this.DataRow(i);
+                if (row != null) { h = h + this.RowExtent(app, row); }
             }
             return h;
         }
@@ -546,8 +835,8 @@ public class ListView<T> : Control {
     public bool Selectable(int row) {
         if (!this.Has(row)) { return false; }
         if (onlySelectable != null && !onlySelectable(data[row])) { return false; }
-        if (this.Templated() && row < children.Count && children[row] != null
-            && children[row].IsDisabled()) { return false; }
+        Control control = this.DataRow(row);
+        if (control != null && control.IsDisabled()) { return false; }
         return true;
     }
 
@@ -656,23 +945,19 @@ public class ListView<T> : Control {
         int secondaryFont = secondary.FontOr(cellFont);
         int cellOffFont = cellOff.FontOr(cellFont);
         int rowH = this.RowHeight(app);
-        int viewY = by + headH;
-        int viewH = bh - headH;
+        Rect bodyView = rowsBody.ScrollViewport();
+        int viewY = bodyView.y;
+        int viewH = bodyView.height;
         if (viewH <= 0 || rowH <= 0) { return; }
         int n = this.Count();
         int contentH = n * rowH;
-        Scrollbar.HandleWheel(app, bx, viewY, bw, viewH, contentH, scroll);
-        int maxOff = contentH - viewH;
-        if (maxOff < 0) { maxOff = 0; }
-        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
-        if (scroll.Get() < 0) { scroll.Set(0); }
-        int off = scroll.Get();
+        int off = rowsBody.ScrollTop();
         bool overflow = contentH > viewH;
         // 行区给滚动条让位：条带画在视口右缘，行高亮/文本若仍占满
         // 整个盒子宽度，就会被轨道压在下面（选中色一直延伸进条带）。
-        int barW = app.Scale(10);
-        int rowW = bw;
-        if (overflow) { rowW = bw - barW; }
+        int barW = app.Scale(12);
+        int rowW = bodyView.width;
+        if (overflow) { rowW = bodyView.width - barW; }
         if (rowW < 0) { rowW = 0; }
         int pad = t.paddingMedium;
         List<int> ws = this.ColumnWidths(rowW - pad * 2);
@@ -685,21 +970,21 @@ public class ListView<T> : Control {
         int first = off / rowH;
         int last = (off + viewH) / rowH;
         if (last >= n) { last = n - 1; }
-        c.PushClip(bx, viewY, rowW, viewH);
+        c.PushClip(bodyView.x, viewY, rowW, viewH);
         int i = first;
         while (i <= last) {
             int ry = viewY + i * rowH - off;
-            int id = this.RowInteract(app, i, bx, ry, rowW, rowH);
+            int id = this.CommonId() + i;
             if (i == sel || (multi && this.IsMarked(i))) {
-                c.FillRect(bx, ry, hotW, rowH, rowSelected.BgOr(rowNormal.BgOr(0)));
+                c.FillRect(bodyView.x, ry, hotW, rowH, rowSelected.BgOr(rowNormal.BgOr(0)));
             }
             else if (this.Selectable(i) && app.focus.IsHovered(id)) {
-                c.FillRect(bx, ry, hotW, rowH, rowHover.BgOr(0));
+                c.FillRect(bodyView.x, ry, hotW, rowH, rowHover.BgOr(0));
             }
-            if (i > first || off > 0) { c.FillRect(bx, ry, rowW, 1, divider.BgOr(0)); }
+            if (i > first || off > 0) { c.FillRect(bodyView.x, ry, rowW, 1, divider.BgOr(0)); }
             int rowFont = cellFont;
             int ty = Canvas.CenterTextY(ry, rowH, rowFont);
-            int cx = bx + pad;
+            int cx = bodyView.x + pad;
             for (int k = 0; k < ws.Count; k = k + 1) {
                 int cw = ws[k];
                 StyleBox cs = k > 0 ? secondary : cell;
@@ -719,10 +1004,6 @@ public class ListView<T> : Control {
             i = i + 1;
         }
         c.PopClip();
-        if (overflow) {
-            Scrollbar.RenderVerticalScrollIn(app, bx + bw - barW, viewY, viewH,
-                viewH, contentH, scroll, bx, viewY, bw, viewH);
-        }
     }
 
     // 在此盒子内按滚动偏移量布局模板行；
@@ -734,23 +1015,19 @@ public class ListView<T> : Control {
     public void ArrangeRows(App app, int headH) {
         app = this.ResolveApp(app);
         if (app == null) { return; }
-        int viewY = by + headH;
-        int viewH = bh - headH;
+        Rect bodyView = rowsBody.ScrollViewport();
+        int viewY = bodyView.y;
+        int viewH = bodyView.height;
         if (viewH <= 0) { return; }
         int contentH = this.ContentHeight(app);
-        Scrollbar.HandleWheel(app, bx, viewY, bw, viewH, contentH, scroll);
-        int maxOff = contentH - viewH;
-        if (maxOff < 0) { maxOff = 0; }
-        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
-        if (scroll.Get() < 0) { scroll.Set(0); }
-        int off = scroll.Get();
+        int off = rowsBody.ScrollTop();
         // 行区给滚动条让位（与 PaintColumnRows 同一规则）：模板行
         // 的排布宽度与命中矩形都收窄到滚动条带左侧，行的选中/悬停
         // 高亮就不会延伸进轨道。
         bool overflow = contentH > viewH;
-        int barW = app.Scale(10);
-        int rowW = bw;
-        if (overflow) { rowW = bw - barW; }
+        int barW = app.Scale(12);
+        int rowW = bodyView.width;
+        if (overflow) { rowW = bodyView.width - barW; }
         if (rowW < 0) { rowW = 0; }
         Theme t = app.theme;
         StyleBox rowNormal = this.BareBox(app, "listrow", Style.SNormal());
@@ -762,26 +1039,22 @@ public class ListView<T> : Control {
         if (overflow) { hotW = rowW - app.Scale(4); }
         if (hotW < 0) { hotW = 0; }
         int y = viewY - off;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control row = children[i];
+        for (int i = 0; i < this.Count(); i = i + 1) {
+            Control row = this.DataRow(i);
+            if (row == null) { continue; }
             int rh = this.RowExtent(app, row);
-            row.Arrange(bx, y, rowW, rh);
-            row.visible = (y + rh > viewY && y < viewY + viewH);
-            if (row.visible) {
-                int id = this.RowInteract(app, i, bx, y, rowW, rh);
+            bool onscreen = y + rh > viewY && y < viewY + viewH;
+            if (onscreen) {
+                int id = this.CommonId() + i;
                 if (i == sel || (multi && this.IsMarked(i))) {
-                    app.canvas.FillRect(bx, y, hotW, rh,
+                    app.canvas.FillRect(bodyView.x, y, hotW, rh,
                         rowSelected.BgOr(rowNormal.BgOr(0)));
                 }
                 else if (this.Selectable(i) && app.focus.IsHovered(id)) {
-                    app.canvas.FillRect(bx, y, hotW, rh, rowHover.BgOr(0));
+                    app.canvas.FillRect(bodyView.x, y, hotW, rh, rowHover.BgOr(0));
                 }
             }
             y = y + rh;
-        }
-        if (overflow) {
-            Scrollbar.RenderVerticalScrollIn(app, bx + bw - barW, viewY, viewH,
-                viewH, contentH, scroll, bx, viewY, bw, viewH);
         }
     }
 
@@ -806,21 +1079,14 @@ public class ListView<T> : Control {
                 s.RadiusOr(app.theme.borderRadiusMedium),
                 s.bg, s.BorderOr(app.theme.borderSecondary), s.BorderWOr(1));
         }
-        hover = -1;
-        hover = -1;
-        this.DragOutTick(app);
+
         int headH = this.HeaderHeight(app);
         this.PaintHeader(app, headH);
         if (this.Count() == 0) {
             this.PaintEmpty(app);
             return;
         }
-        if (this.Templated()) {
-            this.BuildRows(app);
-            this.ArrangeRows(app, headH);
-            return;
-        }
-        this.PaintColumnRows(app, headH);
+        // Body owns row drawing and shared scrollbar traversal.
     }
 
     // 覆写：公共事件之外提供 "Select"/"Activate"/"Context"。
@@ -852,4 +1118,38 @@ public class ListView<T> : Control {
         On.AddByNameS(evt, a);
     }
 
+}
+
+class ListRefreshAction<T> {
+    private weak ListView<T> owner;
+    public ListRefreshAction(ListView<T> value) { owner = value; }
+    public void Run() {
+        ListView<T> target = owner;
+        if (target != null) { target.Refresh(); }
+    }
+}
+
+// Structural region only: the inherited Control scroll engine owns all input and bars.
+class ListRowsPanel<T> : Panel {
+    private weak ListView<T> owner;
+    public ListRowsPanel(ListView<T> value) { owner = value; }
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        box.overflow = 1;
+        box.overflowX = 0;
+        box.overflowY = 2;
+        return box;
+    }
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        if (owner != null) { owner.LayoutBody(); }
+    }
+    public override void OnScrollChanged() {
+        if (owner != null) { owner.BodyScrolled(); }
+    }
+    public override void OnPaint(App app) {
+        if (owner == null) { return; }
+        if (owner.Templated()) { owner.ArrangeRows(app, owner.HeaderHeight(app)); }
+        else { owner.PaintColumnRows(app, owner.HeaderHeight(app)); }
+    }
 }

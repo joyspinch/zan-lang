@@ -1,0 +1,191 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class AppPostLifetimeWatch {
+    public weak App app;
+    public weak SignalInt capture;
+}
+
+class AppPostLifecycleTest {
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("app post lifecycle: " + label); }
+    }
+
+    static void Drain() {
+        Action action = Dispatcher.Take();
+        while (action != null) {
+            action();
+            action = Dispatcher.Take();
+        }
+    }
+
+    static void QueueCapture(App app, AppPostLifetimeWatch watch) {
+        SignalInt capture = new SignalInt(0);
+        watch.capture = capture;
+        app.Post(() => { capture.Set(1); });
+    }
+
+    static void QueueOwnerCapture(App app, AppPostLifetimeWatch watch) {
+        // Even a user callback capturing its App cannot form App->work->App.
+        watch.app = app;
+        app.Post(() => { app.RequestRedraw(); });
+    }
+
+    static void QueueUnownedApp(AppPostLifetimeWatch watch) {
+        App app = App.CreateOffscreen("unowned pending app", 8, 8);
+        watch.app = app;
+        app.Post(() => { throw new Exception("released App callback ran"); });
+        app.canvas.Destroy();
+    }
+
+    static void QueueCancelledSender(App app, AppPostLifetimeWatch watch) {
+        Button sender = new Button("cancel sender");
+        sender.UseApp(app);
+        SignalInt capture = new SignalInt(0);
+        watch.capture = capture;
+        UiEvent ev = new UiEvent();
+        ev.AddS((Control c) => { capture.Set(1); });
+        ev.PostS(sender);
+    }
+
+    static void Main() {
+        Dispatcher.Init();
+        // The legacy frame context retains the first App, so keep it separate
+        // from the instances whose weak lifetime is asserted below.
+        App frame = App.CreateOffscreen("frame context", 8, 8);
+        App first = App.CreateOffscreen("first", 8, 8);
+        App second = App.CreateOffscreen("second", 8, 8);
+        SignalInt calls = new SignalInt(0);
+        first.Post(() => { calls.Set(calls.Get() + 1); });
+        Dispatcher.EnsureInitialized();
+        App constructed = App.CreateOffscreen("constructed with pending work", 8, 8);
+        Drain();
+        Check("initialization preserves pending callbacks", calls.Get() == 1);
+        Check("completed node unlinked", first.postHead == null && first.postTail == null);
+
+        AppPostLifetimeWatch cancelled = new AppPostLifetimeWatch();
+        QueueCapture(first, cancelled);
+        Check("native queue retains callback capture", cancelled.capture != null);
+        first.Post(() => { calls.Set(calls.Get() + 100); });
+        second.Post(() => { calls.Set(calls.Get() + 10); });
+        UiEvent globalEvent = new UiEvent();
+        globalEvent.Add(() => { calls.Set(calls.Get() + 1000); });
+        globalEvent.Post();
+        first.StopLoop();
+        first.StopLoop();
+        Check("stop releases captures before drain", cancelled.capture == null);
+        Check("stopped list empty", first.postHead == null && first.postTail == null);
+        Action rejected = () => { calls.Set(0); };
+        Check("stopped App rejects posts", !first.TryPost(rejected));
+        Check("null handler rejected", !second.TryPost(null));
+        Drain();
+        Check("sibling and global callbacks survive stop", calls.Get() == 1011);
+        Check("sibling completed list empty", second.postHead == null && second.postTail == null);
+
+        App selected = App.CreateOffscreen("selected callback", 8, 8);
+        selected.Post(() => { calls.Set(0); });
+        Action taken = Dispatcher.Take();
+        Check("work selected from queue", taken != null);
+        selected.StopLoop();
+        if (taken != null) { taken(); }
+        taken = null;
+        Check("taken but unclaimed callback cancelled", calls.Get() == 1011);
+
+        App reentrant = App.CreateOffscreen("reentrant", 8, 8);
+        reentrant.Post(() => {
+            calls.Set(calls.Get() + 1);
+            reentrant.Post(() => { calls.Set(0); });
+            reentrant.StopLoop();
+        });
+        Drain();
+        Check("callback may post and stop outside lock", calls.Get() == 1012);
+
+        App senderHost = App.CreateOffscreen("sender host", 8, 8);
+        Button sender = new Button("sender");
+        sender.UseApp(senderHost);
+        UiEvent owned = new UiEvent();
+        owned.Add(() => { calls.Set(calls.Get() + 100); });
+        owned.AddS((Control c) => {
+            Check("sender preserved", c == sender);
+            calls.Set(calls.Get() + 10000);
+        });
+        owned.PostS(sender);
+        AppPostLifetimeWatch senderCapture = new AppPostLifetimeWatch();
+        QueueCancelledSender(senderHost, senderCapture);
+        UiEvent noSender = new UiEvent();
+        noSender.Add(() => { calls.Set(calls.Get() + 1000); });
+        noSender.Post();
+        senderHost.StopLoop();
+        Check("sender cancellation releases capture", senderCapture.capture == null);
+        Drain();
+        Check("sender host owns both channels and global remains", calls.Get() == 2012);
+        sender.UseApp(second);
+        owned.PostS(sender);
+        Drain();
+        Check("live sender channels execute", calls.Get() == 12112);
+
+        Button detached = new Button("detached");
+        UiEvent detachedEvent = new UiEvent();
+        detachedEvent.AddS((Control c) => {
+            Check("detached sender preserved", c == detached);
+            calls.Set(calls.Get() + 1);
+        });
+        detachedEvent.PostS(detached);
+        frame.StopLoop();
+        Drain();
+        Check("detached sender stays global without FrameApp inference", calls.Get() == 12113);
+
+        AppPostLifetimeWatch ownerCapture = new AppPostLifetimeWatch();
+        QueueOwnerCapture(constructed, ownerCapture);
+        constructed.StopLoop();
+        constructed.canvas.Destroy();
+        constructed = null;
+        Check("stop releases callback capturing App", ownerCapture.app == null);
+        AppPostLifetimeWatch unowned = new AppPostLifetimeWatch();
+        QueueUnownedApp(unowned);
+        Check("pending work does not retain App", unowned.app == null);
+        Drain();
+
+        // Native Clear can discard wrappers independently; weak indexes clear
+        // themselves and leave no App-owned list or callback capture behind.
+        AppPostLifetimeWatch cleared = new AppPostLifetimeWatch();
+        QueueCapture(second, cleared);
+        Dispatcher.Clear();
+        Check("global reset releases captures", cleared.capture == null);
+        Check("discarded weak indexes clear", second.postHead == null && second.postTail == null);
+        second.Post(() => { calls.Set(calls.Get() + 1); });
+        Drain();
+        Check("post after global reset works", calls.Get() == 12114);
+        AppPostLifetimeWatch completed = new AppPostLifetimeWatch();
+        QueueCapture(second, completed);
+        Drain();
+        Check("completed callback releases capture", completed.capture == null);
+
+        SignalInt order = new SignalInt(0);
+        second.Post(() => { order.Set(order.Get() * 10 + 1); });
+        second.Post(() => { order.Set(order.Get() * 10 + 2); });
+        second.Post(() => { order.Set(order.Get() * 10 + 3); });
+        Action head = Dispatcher.Take();
+        Action middle = Dispatcher.Take();
+        Action tail = Dispatcher.Take();
+        Check("three wrappers selected", head != null && middle != null && tail != null);
+        if (middle != null) { middle(); }
+        if (tail != null) { tail(); }
+        if (head != null) { head(); }
+        head = null;
+        middle = null;
+        tail = null;
+        Check("middle and tail unlink preserve head", order.Get() == 231);
+        Check("out-of-order completion empties indexes", second.postHead == null && second.postTail == null);
+
+        first.canvas.Destroy();
+        second.StopLoop();
+        second.canvas.Destroy();
+        selected.canvas.Destroy();
+        reentrant.canvas.Destroy();
+        senderHost.canvas.Destroy();
+        frame.canvas.Destroy();
+        Console.WriteLine("APP_POST_LIFECYCLE_OK");
+    }
+}

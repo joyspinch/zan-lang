@@ -656,22 +656,97 @@ public partial class App {
     // 委托被丢弃而非入队：已没有 UI 线程可运行它，
     // 且让它在*下一个*窗口运行也是错误的。
     public void Post(Action handler) {
-        if (!isRunning) { return; }
-        Dispatcher.Post(handler);
-        if (window != null) { window.Wake(); }
+        this.TryPost(handler);
     }
 
     public void Post(Action handler, string tag) {
         this.Post(handler);
     }
 
-    // 结束事件循环，并丢弃所有仍通过
-    // <see cref="Post"/> 排队的委托。在每次窗口关闭路径上调用：
-    // 为已关闭窗口投递的后台工作不得在下一个
-    // 窗口上运行，其帧循环复用了同一个全局分派队列。
+    // False means the App has stopped, the handler is null, or the native
+    // queue rejected it. The native closure captures only work, never this.
+    public bool TryPost(Action handler) {
+        bool accepted = false;
+        lock (this) {
+            if (isRunning && handler != null) {
+                AppPostWork work = new AppPostWork();
+                work.owner = this;
+                work.handler = handler;
+                work.prev = postTail;
+                AppPostWork tail = postTail;
+                if (tail != null) { tail.next = work; }
+                else { postHead = work; }
+                postTail = work;
+                accepted = Dispatcher.Post(() => { work.Run(); });
+                if (!accepted) {
+                    this.UnlinkPost(work);
+                    // The parameter retains the handler until after unlocking.
+                    work.handler = null;
+                }
+            }
+        }
+        if (accepted) { this.Wake(); }
+        return accepted;
+    }
+
+    // Caller holds lock(this). All links are weak; removing the native queue's
+    // closure may destroy a work node without keeping this App alive.
+    void UnlinkPost(AppPostWork work) {
+        AppPostWork before = work.prev;
+        AppPostWork after = work.next;
+        if (before != null) { before.next = after; }
+        else { postHead = after; }
+        if (after != null) { after.prev = before; }
+        else { postTail = before; }
+        work.prev = null;
+        work.next = null;
+        work.owner = null;
+    }
+
+    void RunPost(AppPostWork work) {
+        Action handler = null;
+        bool run = false;
+        lock (this) {
+            if (work.owner == this) {
+                this.UnlinkPost(work);
+                handler = work.handler;
+                work.handler = null;
+                run = isRunning;
+            }
+        }
+        // Claiming a live handler commits it to execution; StopLoop cancels
+        // pending work. User code can reenter Post/StopLoop without the App lock.
+        if (run && handler != null) {
+            this.NoteRedrawWhy("handler");
+            needsRedraw = true;
+            handler();
+        }
+    }
+
+    // Stop accepting first, then release only this App's pending handlers.
+    // Native tombstones stay queued until taken; sibling/global work survives.
     public void StopLoop() {
-        isRunning = false;
-        Dispatcher.Clear();
+        lock (this) { isRunning = false; }
+        Exception loopError = null;
+        try { this.ClearLoopParticipants(); }
+        catch (Exception error) { loopError = error; }
+        bool done = false;
+        while (!done) {
+            Action handler = null;
+            lock (this) {
+                AppPostWork work = postHead;
+                if (work == null) { done = true; }
+                else {
+                    this.UnlinkPost(work);
+                    handler = work.handler;
+                    work.handler = null;
+                }
+            }
+            // Releasing a capture can release arbitrary objects: never under
+            // the App lock, just as executing the callback must be outside it.
+            handler = null;
+        }
+        if (loopError != null) { throw loopError; }
     }
 
     Action closeRequest;
@@ -821,7 +896,14 @@ public partial class App {
         wheelCapOrder = wheelClaimSeq;
         bool ev = this.EventKind() == 13;
         if (ev) { wheelClaimSeen = true; }
-        bool owns = ev && wheelOwnerOrder == wheelClaimSeq;
+        // BeginFrame resets paint claims; a routed event stays consumed for its whole sequence.
+        bool routedConsumed = ev && routedWheelConsumedSequenceValid
+            && routedWheelConsumedSequence == window.EventSeq();
+        if (routedConsumed) {
+            wheelConsumed = true;
+            wheelReplayArmed = false;
+        }
+        bool owns = ev && !routedConsumed && wheelOwnerOrder == wheelClaimSeq;
         if (owns) {
             wheelConsumed = true;
             wheelReplayArmed = false;
@@ -988,6 +1070,7 @@ public partial class App {
     // “阻塞等下一拍”那一路才产生，于是驱动一开，悬停缓动、提示浮出、
     // toast 收拢这些纯动画帧一帧也不来，界面就停在最后那帧上。
     void PumpDueFrame() {
+        this.TickRoutedLongPress();
         int now = Window.GetTickMs();
         int deadline = animNextMs;
         if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) {

@@ -8,11 +8,201 @@ namespace Gui.Widget;
 // 作为 Card 或 OverlayHost 弹层的标准子控件存在，基于自身盒模型 (bx, by, bw, bh) 布局与渲染。
 // 负责 SV 饱和度/明度双层渐变、色相条六段渐变、棋盘格透明度条及 RGBA/HEX/HSL/HSB 多格式输入行。
 public class ColorPalettePanel : Control {
-    public ColorPicker picker;
+    public weak ColorPicker picker;
 
     public ColorPalettePanel(ColorPicker cp) {
         this.InitControl("color-palette-panel", 0);
         this.picker = cp;
+        if (cp == null) { return; }
+        this.Add(cp.inR);
+        this.Add(cp.inG);
+        this.Add(cp.inB);
+        this.Add(cp.inA);
+        this.Add(cp.inHex);
+        this.Add(cp.inHsl);
+        this.Add(cp.inHsb);
+        this.SyncInputView();
+    }
+
+    void SyncInputView() {
+        ColorPicker cp = this.picker;
+        if (cp != null) {
+            string modeName = cp.ModeName();
+            if (cp.modes != null && cp.modes.Count == 1) {
+                cp.inputView = ColorPicker.ViewOf(modeName);
+            }
+            if (!cp.viewAligned) {
+                cp.viewAligned = true;
+                int want = ColorPicker.ViewOf(modeName);
+                if (ColorPicker.Allowed(want, cp.modes)) { cp.inputView = want; }
+            }
+        }
+        App app = this.FindApp();
+        for (int i = 0; i < children.Count; i = i + 1) {
+            bool shown = cp != null && (cp.inputView == 0 ? i < 4 : i == cp.inputView + 3);
+            Control input = children[i];
+            if (!shown && input.visible && app != null) { app.ReleaseInputSubtree(input); }
+            input.SetShown(shown);
+        }
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        this.SyncInputView();
+        base.Arrange(x, y, w, h);
+        App app = this.FindApp();
+        ColorPicker cp = this.picker;
+        if (app == null || cp == null) { return; }
+        int pad = app.Scale(10);
+        int labW = app.Scale(34);
+        int gap = app.Scale(6);
+        int rowsH = app.Scale(26);
+        cp.ArrangeInputsFromOverlay(app, x + pad + labW + gap, y + h - pad - rowsH,
+            w - pad * 2 - labW - gap, rowsH);
+    }
+
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        this.SyncInputView();
+        base.CollectInputFocus(app, controls);
+    }
+
+    public override Control FindInputFocus(App app) {
+        this.SyncInputView();
+        return base.FindInputFocus(app);
+    }
+
+    public override Control HitTest(int x, int y, int pointerType) {
+        this.SyncInputView();
+        return base.HitTest(x, y, pointerType);
+    }
+
+    private int PanelWidth(App app) {
+        return bw > 0 ? bw : app.Scale(236);
+    }
+
+    private int PartX(App app) { return bx + app.Scale(10); }
+    private int PartWidth(App app) { return this.PanelWidth(app) - app.Scale(10) * 2; }
+
+    private int PartY(App app, int part) {
+        int y = by + app.Scale(10);
+        if (part > 1) { y = y + app.Scale(148) + app.Scale(8); }
+        if (part > 2) { y = y + app.Scale(12) + app.Scale(8); }
+        return y;
+    }
+
+    private int PartHeight(App app, int part) {
+        return app.Scale(part == 1 ? 148 : 12);
+    }
+
+    private void EndDrag(App app) {
+        ColorPicker cp = this.picker;
+        if (cp != null) { cp.dragPart = 0; }
+        this.isPressed = false;
+        if (app != null && app.GetCapturedPointer() == this) {
+            app.ReleasePointerCapture();
+        }
+    }
+
+    private void UpdateDrag(App app, int x, int y) {
+        ColorPicker cp = this.picker;
+        if (cp == null || this.IsDisabled() || cp.IsDisabled() ||
+            (cp.dragPart == 3 && !cp.showAlpha)) {
+            this.EndDrag(app);
+            return;
+        }
+        int w = this.PartWidth(app);
+        int h = this.PartHeight(app, cp.dragPart);
+        if (w <= 0 || h <= 0) { this.EndDrag(app); return; }
+        int dx = x - this.PartX(app);
+        int dy = y - this.PartY(app, cp.dragPart);
+        // Clamp before multiplying so captured coordinates beyond the popup remain bounded.
+        if (dx < 0) { dx = 0; } if (dx > w) { dx = w; }
+        if (dy < 0) { dy = 0; } if (dy > h) { dy = h; }
+        bool changed = false;
+        if (cp.dragPart == 1) {
+            int ns = dx * 1000 / w;
+            int nv = 1000 - dy * 1000 / h;
+            if (ns != cp.sat || nv != cp.val) {
+                cp.sat = ns;
+                cp.val = nv;
+                cp.hsvTouched = true;
+                changed = true;
+            }
+        } else if (cp.dragPart == 2) {
+            int nh = dx * 360 / w;
+            if (nh > 359) { nh = 359; }
+            if (nh != cp.hue) {
+                cp.hue = nh;
+                cp.hsvTouched = true;
+                changed = true;
+            }
+        } else if (cp.dragPart == 3) {
+            int na = dx * 255 / w;
+            if (na != cp.alpha) { cp.alpha = na; changed = true; }
+        }
+        if (changed) {
+            cp.Commit();
+            app.RequestRedraw();
+        }
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        ColorPicker cp = this.picker;
+        App app = this.FindApp();
+        if (e.originalSource != this || cp == null || app == null ||
+            this.IsDisabled() || cp.IsDisabled() || app.window.EventButton() == 1) { return; }
+        int x = this.PartX(app);
+        int w = this.PartWidth(app);
+        if (w <= 0 || e.x < x || e.x >= x + w) { return; }
+        for (int part = 1; part <= (cp.showAlpha ? 3 : 2); part = part + 1) {
+            int y = this.PartY(app, part);
+            int h = this.PartHeight(app, part);
+            if (h > 0 && e.y >= y && e.y < y + h) {
+                cp.dragPart = part;
+                base.OnPointerDown(e);
+                app.CapturePointer(this, true);
+                e.Handle();
+                this.UpdateDrag(app, e.x, e.y);
+                return;
+            }
+        }
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (app == null || app.GetCapturedPointer() != this) { return; }
+        e.Handle();
+        this.UpdateDrag(app, e.x, e.y);
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (app == null || app.GetCapturedPointer() != this) { return; }
+        e.Handle();
+        if (app.window.EventButton() == 1) { return; }
+        this.UpdateDrag(app, e.x, e.y);
+        this.EndDrag(app);
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        this.EndDrag(this.FindApp());
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        ColorPicker cp = this.picker;
+        App app = this.FindApp();
+        if (cp == null || app == null) { return; }
+        if (e.originalSource == this && !this.IsDisabled() && !cp.IsDisabled()) {
+            int pad = app.Scale(10);
+            int rowY = by + bh - pad - app.Scale(26);
+            if (e.x >= bx + pad && e.x < bx + pad + app.Scale(34) &&
+                e.y >= rowY && e.y < rowY + app.Scale(26)) {
+                cp.inputView = ColorPicker.NextAllowedView(cp.inputView + 1, cp.modes);
+                this.Arrange(bx, by, bw, bh);
+                app.RequestRedraw();
+            }
+        }
+        e.Handle();
     }
 
     public override void OnMeasure(App app) {
@@ -34,10 +224,10 @@ public class ColorPalettePanel : Control {
         ColorPicker cp = this.picker;
         Canvas c = app.canvas;
         int scale = app.Scale(1);
-        int panelW = bw > 0 ? bw : app.Scale(236);
+        int panelW = this.PanelWidth(app);
         int pad = app.Scale(10);
-        int svH = app.Scale(148);
-        int barH = app.Scale(12);
+        int svH = this.PartHeight(app, 1);
+        int barH = this.PartHeight(app, 2);
         int gap = app.Scale(8);
         int rowsH = app.Scale(26);
         int popX = bx;
@@ -48,10 +238,9 @@ public class ColorPalettePanel : Control {
                                           "select", cp.Class, Style.SNormal());
         pop.Paint(app, popX, popY, panelW, popH);
 
-        int svX = popX + pad;
-        int svY = popY + pad;
-        int svW = panelW - pad * 2;
-        bool clicked = app.ClickAvailable();
+        int svX = this.PartX(app);
+        int svY = this.PartY(app, 1);
+        int svW = this.PartWidth(app);
 
         // ---- SV 面板：两层渐变合成（白→纯色横排、透明→黑纵排）----
         int pure = ColorPicker.HsvToRgb(cp.hue, 1000, 1000);
@@ -65,11 +254,9 @@ public class ColorPalettePanel : Control {
         int dotR = app.Scale(5);
         c.DrawCircle(dotX, dotY, dotR + scale, 0xFFFFFFFF, scale + 1);
         c.DrawCircle(dotX, dotY, dotR, 0xFF000000, scale);
-        app.hitTester.RegisterRect(cp.wid + ColorPicker.SvPanelOff(),
-                                   svX, svY, svW, svH, 3);
 
         // ---- 色相条：红橙黄绿青蓝紫 六段渐变拼成 --------------------
-        int barY = svY + svH + gap;
+        int barY = this.PartY(app, 2);
         int segN = 6;
         int segW = svW / segN;
         for (int i = 0; i < segN; i = i + 1) {
@@ -82,12 +269,10 @@ public class ColorPalettePanel : Control {
         int hueX = popX + pad + cp.hue * svW / 360;
         c.DrawCircle(hueX, barY + barH / 2, barH / 2 + scale - 1,
                      0xFFFFFFFF, scale + 1);
-        app.hitTester.RegisterRect(cp.wid + ColorPicker.HueOff(),
-                                   popX + pad, barY, svW, barH, 3);
 
         // ---- 透明度条：棋盘格打底 + 白↔纯色水平渐变 -----------------
         if (cp.showAlpha) {
-            int aY = barY + barH + gap;
+            int aY = this.PartY(app, 3);
             int chk = app.Scale(5);
             StyleBox checker = cp.ResolvePartAs(
                 app, "colorpicker", "checker", "", cp.Class, Style.SNormal());
@@ -112,67 +297,10 @@ public class ColorPalettePanel : Control {
             int aX = popX + pad + cp.alpha * svW / 255;
             c.DrawCircle(aX, aY + barH / 2, barH / 2 + scale - 1,
                          0xFFFFFFFF, scale + 1);
-            app.hitTester.RegisterRect(cp.wid + ColorPicker.AlphaOff(),
-                                       popX + pad, aY, svW, barH, 3);
-        }
-
-        // ---- 指针：拖 SV / 色相 / 透明度 ----------------------------
-        bool changed = false;
-        if (!cp.IsDisabled()) {
-            if (app.focus.IsPressed(cp.wid + ColorPicker.SvPanelOff())) {
-                cp.dragPart = 1;
-            } else if (app.focus.IsPressed(cp.wid + ColorPicker.HueOff())) {
-                cp.dragPart = 2;
-            } else if (cp.showAlpha
-                       && app.focus.IsPressed(cp.wid + ColorPicker.AlphaOff())) {
-                cp.dragPart = 3;
-            } else if (cp.dragPart != 0 && app.EventKind() == 3) {
-                cp.dragPart = 0;
-            }
-            if (cp.dragPart == 1) {
-                int ns = (app.mouseX - svX) * 1000 / svW;
-                int nv = 1000 - (app.mouseY - svY) * 1000 / svH;
-                if (ns < 0) { ns = 0; } if (ns > 1000) { ns = 1000; }
-                if (nv < 0) { nv = 0; } if (nv > 1000) { nv = 1000; }
-                if (ns != cp.sat || nv != cp.val) {
-                    cp.sat = ns; cp.val = nv;
-                    cp.hsvTouched = true;
-                    changed = true;
-                }
-            } else if (cp.dragPart == 2) {
-                int nh = (app.mouseX - (popX + pad)) * 360 / svW;
-                if (nh < 0) { nh = 0; } if (nh > 359) { nh = 359; }
-                if (nh != cp.hue) {
-                    cp.hue = nh;
-                    cp.hsvTouched = true;
-                    changed = true;
-                }
-            } else if (cp.dragPart == 3) {
-                int na = (app.mouseX - (popX + pad)) * 255 / svW;
-                if (na < 0) { na = 0; } if (na > 255) { na = 255; }
-                if (na != cp.alpha) {
-                    cp.alpha = na;
-                    changed = true;
-                }
-            }
-        } else {
-            cp.dragPart = 0;
         }
 
         // ---- 输入行：RGBA / HEX / HSL / HSB，标签点击循环切换 -------
         int rowY = popY + popH - pad - rowsH;
-        string modeName = cp.ModeName();
-        if (cp.modes != null && cp.modes.Count == 1) {
-            cp.inputView = ColorPicker.ViewOf(modeName);
-        }
-        if (!cp.viewAligned) {
-            cp.viewAligned = true;
-            int want = ColorPicker.ViewOf(modeName);
-            if (cp.modes == null || cp.modes.Count == 0
-                || ColorPicker.Allowed(want, cp.modes)) {
-                cp.inputView = want;
-            }
-        }
         StyleBox lab = cp.ResolvePartAs(app, "colorpicker", "label",
                                           "", cp.Class, Style.SNormal());
         int labFs = lab.FontOr(Style.FontFallback(app, "small"));
@@ -180,19 +308,8 @@ public class ColorPalettePanel : Control {
         c.DrawText(popX + pad,
                    Canvas.CenterTextY(rowY, rowsH, labFs),
                    ColorPicker.ViewLabel(cp.inputView), lab.FgOr(pop.fg), labFs);
-        if (app.ClickAvailable()
-            && Ui.Over(app, popX + pad, rowY, labW, rowsH)) {
-            cp.inputView = ColorPicker.NextAllowedView(cp.inputView + 1, cp.modes);
-            app.ClaimClick();
-            app.RequestRedraw();
-        }
-        cp.PaintInputsFromOverlay(app, popX + pad + labW + scale * 6, rowY,
-                                  panelW - pad * 2 - labW - scale * 6, rowsH, clicked);
+        cp.SyncInputsFromOverlay(app);
 
-        if (changed) {
-            cp.Commit();
-            app.RequestRedraw();
-        }
     }
 
     public override string Kind() { return "ColorPalettePanel"; }

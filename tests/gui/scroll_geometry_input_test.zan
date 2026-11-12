@@ -1,0 +1,152 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+// Only fixture geometry and observations live here. Input, thumbs and commits use Gui.
+class GeometryScrollHost : Control {
+    public int commits;
+    public override StyleBox ResolveStyle(App app,int status) {
+        StyleBox box=base.ResolveStyle(app,status);
+        box.overflowX=2;box.overflowY=2;box.overflow=1;return box;
+    }
+    public override void Arrange(int x,int y,int w,int h) {
+        bx=x;by=y;bw=w;bh=h;App app=this.App;if(app==null){return;}
+        this.ResolveStyle(app,Style.SNormal());Rect view=this.ScrollViewport();
+        scrollExtentX=view.width+app.Scale(600);scrollExtent=view.height+app.Scale(1000);
+    }
+    public override void OnScrollChanged(){commits=commits+1;}
+    public bool Pressed(){return isPressed;}
+}
+class GeometryAxisHost : GeometryScrollHost {
+    public override Rect ScrollViewport() {
+        int fixedWidth=this.App.Scale(80);
+        return new Rect(bx+fixedWidth,by,bw-fixedWidth*2,bh);
+    }
+    public override Rect ScrollBarViewport(bool horizontal) {
+        return horizontal?this.ScrollViewport():new Rect(bx,by,bw,bh);
+    }
+    public override Rect ScrollWheelViewport(){return new Rect(bx,by,bw,bh);}
+    public override int ScrollWheelModifiers(int modifiers){return Modifiers.HasCtrl(modifiers)||Modifiers.HasAlt(modifiers)?Modifiers.Shift():0;}
+}
+class GeometryWheelParent : Control {
+    public int wheels;
+    public int modifiers;
+    public int delta;
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if(e.eventName=="Wheel"){
+            wheels=wheels+1;modifiers=e.modifiers;delta=e.delta;e.Handle();return;
+        }
+        base.OnRoutedEvent(e);
+    }
+}
+class ScrollGeometryInputTest {
+    static void Check(bool ok,string message){if(!ok){throw new Exception(message);}}
+    static void Input(App app,int kind,int x,int y,int delta,int mods){app.ProcessOffscreenInput(kind,x,y,0,delta,mods,0);}
+    static bool Same(Rect a,Rect b){return a.x==b.x&&a.y==b.y&&a.width==b.width&&a.height==b.height;}
+    static void Paint(App app,Control root){app.BeginOffscreenFrame();root.RenderTree(app);root.RenderTree(app);app.EndOffscreenFrame();}
+    static void Thumb(App app,GeometryScrollHost host,bool horizontal) {
+        host.SetScrollLeft(0);host.SetScrollTop(0);
+        Rect view=host.ScrollBarViewport(horizontal);ScrollState geometry=new ScrollState();
+        Rect track=geometry.Track(app,view.x,view.y,view.width,view.height,horizontal);
+        int position=geometry.ThumbStart(app,horizontal?view.x:view.y,
+            horizontal?view.width:view.height,horizontal?host.ScrollExtentX():host.ScrollExtent(),0)+app.Scale(2);
+        int x=horizontal?position:track.x+track.width/2;
+        int y=horizontal?track.y+track.height/2:position;
+        Check(host.HitTest(x,y,0)==host,"actual chrome hit returns its single owner");
+        Input(app,2,x,y,0,0);
+        Check(app.GetCapturedPointer()==host&&host.Pressed(),"real thumb Down captures shared owner");
+        int count=host.commits;int distance=app.Scale(25);
+        // Deliberately no Move: final Up is the only source of this offset change.
+        Input(app,3,x+(horizontal?distance:0),y+(horizontal?0:distance),0,0);
+        Check((horizontal?host.ScrollLeft():host.ScrollTop())>0,"final Up commits thumb coordinate before paint");
+        Check(host.commits==count+1&&app.GetCapturedPointer()==null&&!host.Pressed(),"one final commit retires capture and pressed");
+        // A second drag exercises Move on the same axis rectangle, then Cancel has no tail commit.
+        int offset=horizontal?host.ScrollLeft():host.ScrollTop();
+        position=geometry.ThumbStart(app,horizontal?view.x:view.y,
+            horizontal?view.width:view.height,horizontal?host.ScrollExtentX():host.ScrollExtent(),offset)+app.Scale(2);
+        x=horizontal?position:track.x+track.width/2;y=horizontal?track.y+track.height/2:position;
+        Input(app,2,x,y,0,0);Check(app.GetCapturedPointer()==host,"second real Down captures thumb");
+        count=host.commits;Input(app,1,x+(horizontal?distance:0),y+(horizontal?0:distance),0,0);
+        Check(host.commits==count+1&&(horizontal?host.ScrollLeft():host.ScrollTop())>offset,
+            "real Move uses the same active axis viewport");
+        offset=horizontal?host.ScrollLeft():host.ScrollTop();
+        count=host.commits;app.ReleaseInputSubtree(host);
+        Check(app.GetCapturedPointer()==null&&!host.Pressed()&&host.commits==count
+            &&(horizontal?host.ScrollLeft():host.ScrollTop())==offset,"Cancel retires chrome without a commit");
+        Input(app,3,x+distance,y+distance,0,0);
+        Check(host.commits==count,"old Up after cancellation cannot replay drag");
+    }
+    static void DefaultBehavior(App app,GeometryWheelParent parent) {
+        GeometryScrollHost host=new GeometryScrollHost();parent.Add(host);host.UseApp(app);
+        host.MeasureTree(app);host.Arrange(app.Scale(20),app.Scale(20),app.Scale(500),app.Scale(300));
+        Rect view=host.ScrollViewport();
+        Check(Same(host.ScrollWheelViewport(),view)&&Same(host.ScrollBarViewport(true),view)
+            &&Same(host.ScrollBarViewport(false),view),"default hooks retain original viewport for both axes and wheel");
+        Check(host.ScrollWheelModifiers(7)==7,"default modifier hook is identity");
+        int x=view.x+app.Scale(30);int y=view.y+app.Scale(30);
+        int count=host.commits;Input(app,13,x,y,-120,0);
+        Check(host.ScrollTop()>0&&host.ScrollLeft()==0&&host.commits==count+1,"default plain wheel remains vertical with one commit");
+        Input(app,13,x,y,-120,Modifiers.Shift());Check(host.ScrollLeft()>0,"default Shift remains horizontal");
+        int previous=host.ScrollLeft();int top=host.ScrollTop();Input(app,13,x,y,-120,Modifiers.Ctrl());
+        Check(host.ScrollLeft()==previous&&host.ScrollTop()>top,"default Ctrl retains existing vertical behavior");
+        host.SetScrollLeft(host.ScrollExtentX()-view.width);
+        int wheels=parent.wheels;Input(app,13,x,y,-120,Modifiers.Shift());
+        Check(parent.wheels==wheels+1&&parent.modifiers==Modifiers.Shift()&&parent.delta==-120,"default horizontal boundary bubbles original event");
+        Thumb(app,host,true);Thumb(app,host,false);
+        count=host.commits;previous=host.ScrollLeft();top=host.ScrollTop();Paint(app,parent);
+        Check(host.commits==count&&host.ScrollLeft()==previous&&host.ScrollTop()==top,"default repeated paint does not dispatch or commit");
+        parent.Remove(host);
+    }
+    static void AxisBehavior(App app,GeometryWheelParent parent) {
+        GeometryAxisHost host=new GeometryAxisHost();parent.Add(host);host.UseApp(app);
+        host.MeasureTree(app);host.Arrange(app.Scale(20),app.Scale(20),app.Scale(500),app.Scale(300));
+        Rect middle=host.ScrollViewport();Rect vertical=host.ScrollBarViewport(false);
+        ScrollState geometry=new ScrollState();
+        Rect horizontalTrack=geometry.Track(app,middle.x,middle.y,middle.width,middle.height,true);
+        Rect verticalTrack=geometry.Track(app,vertical.x,vertical.y,vertical.width,vertical.height,false);
+        Check(horizontalTrack.x==middle.x&&horizontalTrack.width==middle.width,"horizontal track is confined to middle viewport");
+        int fixedRight=middle.x+middle.width;
+        Check(verticalTrack.x>=fixedRight&&verticalTrack.x+verticalTrack.width<=host.bx+host.bw,"vertical track occupies whole-body right gutter");
+        // Real descendants in the fixed band must remain reachable away from the gutter.
+        Control fixedCell=new Control("fixed-right-cell");host.Add(fixedCell);
+        fixedCell.Arrange(fixedRight,host.by,app.Scale(65),host.bh-app.Scale(12));
+        Check(host.HitTest(fixedRight+app.Scale(20),host.by+app.Scale(40),0)==fixedCell,"right fixed content is not covered by a misplaced vertical bar");
+        int left=host.bx+app.Scale(15);int right=host.bx+host.bw-app.Scale(25);int y=host.by+app.Scale(40);
+        int count=host.commits;Input(app,13,left,y,-120,0);
+        Check(host.ScrollTop()>0&&host.commits==count+1,"wheel viewport accepts left fixed region outside content viewport");
+        int previous=host.ScrollLeft();Input(app,13,left,y,-120,Modifiers.Ctrl());
+        Check(host.ScrollLeft()>previous,"mapped Ctrl over fixed region uses shared horizontal wheel");
+        previous=host.ScrollLeft();Input(app,13,right,y,-120,Modifiers.Alt());
+        Check(host.ScrollLeft()>previous,"mapped Alt bubbles from right fixed descendant to same owner");
+        previous=host.ScrollLeft();int top=host.ScrollTop();Input(app,13,left,y,-120,Modifiers.Shift());
+        Check(host.ScrollLeft()==previous&&host.ScrollTop()>top,"modifier override can retain Shift for consumer semantics");
+        host.SetScrollLeft(host.ScrollExtentX()-middle.width);
+        int wheels=parent.wheels;count=host.commits;Input(app,13,right,y,-120,Modifiers.Ctrl());
+        Check(parent.wheels==wheels+1&&parent.modifiers==Modifiers.Ctrl()&&parent.delta==-120&&host.commits==count,
+            "mapped boundary bubbles untouched original Ctrl without a commit");
+        host.SetScrollTop(host.ScrollExtent()-middle.height);
+        wheels=parent.wheels;Input(app,13,left,y,-120,0);
+        Check(parent.wheels==wheels+1&&parent.modifiers==0,"vertical boundary remains available to ancestor");
+        // A former middle-right bar coordinate is now ordinary content, never chrome.
+        int oldX=middle.x+middle.width-app.Scale(3);int oldY=middle.y+app.Scale(10);
+        Input(app,2,oldX,oldY,0,0);Check(app.GetCapturedPointer()!=host,"old middle-right position no longer starts vertical drag");
+        Input(app,3,oldX,oldY,0,0);
+        Thumb(app,host,true);Thumb(app,host,false);
+        count=host.commits;previous=host.ScrollLeft();top=host.ScrollTop();Paint(app,parent);
+        Check(host.commits==count&&host.ScrollLeft()==previous&&host.ScrollTop()==top,"axis repeated paint never replays input");
+        parent.Remove(host);
+    }
+    static void Exercise() {
+        App app=App.CreateOffscreen("shared scroll geometry",1600,1100);
+        GeometryWheelParent parent=new GeometryWheelParent();parent.UseApp(app);app.SetRootControl(parent);
+        for(int dpi=100;dpi<=200;dpi=dpi+50){
+            app.SetOffscreenViewport(1600,1100,dpi);parent.Arrange(0,0,1600,1100);
+            DefaultBehavior(app,parent);AxisBehavior(app,parent);
+        }
+        app.SetRootControl(null);app.DrainPosts();app.canvas.Destroy();
+    }
+    static void Main(){
+        Dispatcher.Init();App frame=App.CreateOffscreen("frame",2,2);Exercise();frame.canvas.Destroy();
+        Console.WriteLine("SCROLL_GEOMETRY_INPUT_OK");
+    }
+}

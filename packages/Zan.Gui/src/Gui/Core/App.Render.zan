@@ -228,7 +228,6 @@ public partial class App {
     int offscreenWheelKey;
     int offscreenWheelMods;
     int offscreenWheelFlag;
-    long offscreenWheelSeq;
 
 
 
@@ -279,6 +278,7 @@ public partial class App {
         animNextMs = -1;
         wakeNextMs = -1;
         wakeFrameNextMs = -1;
+        this.TickRoutedLongPress();
         animRectValid = false;
         animRectAll = false;
         // inputNeedsFrame 此处不清：TakeDueFrame 与本函数下方的条带
@@ -604,13 +604,13 @@ public partial class App {
     // 标记当前键盘事件已被本窗口的控件消费。
     void ClaimKey() {
         this.keyClaimed = true;
-        this.keyClaimSeq = Window.EventSeqGlobal();
+        this.keyClaimSeq = this.window.EventSeq();
     }
 
     // 当前键盘事件是否已被消费（同一件事件序号才算）。
     bool KeyConsumed() {
         return this.keyClaimed &&
-            this.keyClaimSeq == Window.EventSeqGlobal();
+            this.keyClaimSeq == this.window.EventSeq();
     }
 
     // 正在处理的 OS 事件类型；当事件属于
@@ -727,7 +727,14 @@ public partial class App {
 
     // 记录 `id` 上的完成点击，并在 400 ms 内
     // 同一 id 重复时标记双击。由鼠标释放路径调用。
+    long clickSnapshotSequence;
+    bool clickSnapshotSequenceValid;
+    bool clickHistorySuppressed;
     void NoteClickTarget(int id) {
+        if (id < 0 || window.EventButton() != 0 || clickHistorySuppressed || this.LongPressFired()) { return; }
+        long sequence = window.EventSeq();
+        if (clickSnapshotSequenceValid && clickSnapshotSequence == sequence) { return; }
+        clickSnapshotSequence = sequence; clickSnapshotSequenceValid = true;
         int t = Window.GetTickMs();
         if (id >= 0 && id == lastClickId && (t - lastClickMs) <= 400) {
             doubleClickNow = true;
@@ -741,6 +748,16 @@ public partial class App {
     // 快照按下目标/位置/时间，使手势（滑动、长按）
     // 可从按下起推导。由鼠标按下路径调用。
     void NotePressStart(int id, int x, int y) {
+        long sequence = window.EventSeq();
+        if (pressSnapshotSequenceValid && pressSnapshotSequence == sequence) { return; }
+        pressSnapshotSequenceValid = true;
+        pressSnapshotSequence = sequence;
+        clickHistorySuppressed = false;
+        pointerGestureTicket = pointerGestureTicket + 1;
+        retainedLongPressOwner = null;
+        retainedLongPressRoot = null;
+        retainedLongPressTicket = 0;
+        retainedLongPressReserved = false;
         pressStartId = id;
         pressStartX = x;
         pressStartY = y;
@@ -756,8 +773,8 @@ public partial class App {
     // 使随后的 PollLongPress(-2) 之类哨兵查询认领这次按压。
     // 不动焦点/按下状态，只改手势快照。
     void NotePressSentinel(int id) {
+        if (longPressFired || this.RetainedLongPressOwnsGesture()) { return; }
         pressStartId = id;
-        longPressFired = false;
     }
 
     // 根据按下到释放的位移推导滑动方向：0 无，
@@ -806,11 +823,18 @@ public partial class App {
     // 无法与 focus.pressedId 比对（那里记录的是命中的真实
     // 控件 id，如表格行矩形），改查主键是否仍按住。
     bool PollLongPress(int id) {
+        if (this.RetainedLongPressOwnsGesture()) { return false; }
         if (longPressFired) { return false; }
         if (id < 0) {
             if (!pointerDown) { return false; }
         } else if (focus.pressedId != id) { return false; }
         if (pressStartId != id) { return false; }
+        return this.ClaimLongPress();
+    }
+
+    // The only timing/slop/one-shot implementation, shared with retained routing.
+    bool ClaimLongPress() {
+        if (longPressFired) { return false; }
         int mdx = mouseX - pressStartX; if (mdx < 0) { mdx = -mdx; }
         int mdy = mouseY - pressStartY; if (mdy < 0) { mdy = -mdy; }
         if (mdx > 12 || mdy > 12) { longPressFired = true; return false; }

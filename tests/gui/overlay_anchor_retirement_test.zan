@@ -1,0 +1,328 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// Scratch candidate only: not compiled, registered, or accepted as a passing test.
+// The PropertyGrid owner's separate picker probe remains the caller acceptance.
+class RetirementAdapter : InputRootAdapter {
+    public RetirementAdapter() : base("retirement_adapter") { }
+    public override bool ContainsInputControl(Control control) {
+        return control != null && (base.ContainsInputControl(control)
+            || (content != null && content.ContainsInputControl(control)));
+    }
+    public override Control FindInputFocus(App app) {
+        return content != null ? content.FindInputFocus(app) : null;
+    }
+    public override Control HitTest(int x, int y, int pointerType) {
+        return content != null ? content.HitTest(x, y, pointerType) : null;
+    }
+}
+
+class RetirementAnchor : Control {
+    public int Dismissed;
+    public bool Reopen;
+    public weak App Origin;
+    public weak App Destination;
+    public weak Control WinningRoot;
+    public weak Control Popup;
+    public RetirementAnchor() : base("retirement_anchor") { }
+    public override void OnPopupDismissed() {
+        Dismissed = Dismissed + 1;
+        if (!Reopen) { return; }
+        Reopen = false;
+        App origin = Origin;
+        App destination = Destination;
+        Control nextRoot = WinningRoot;
+        Control popup = Popup;
+        if (origin != null) { origin.SetRootControl(nextRoot); }
+        if (destination != null && popup != null) { destination.overlayHost.Show(destination, this, popup); }
+    }
+}
+
+class RetirementPopup : Control {
+    public int Dismissed;
+    public bool Reopen;
+    public weak App Origin;
+    public weak App Destination;
+    public weak Control WinningRoot;
+    public weak Control Anchor;
+    public bool CaptureOnClose;
+    public bool ReplaceRootOnClose = true;
+    public RetirementPopup() : base("retirement_popup") { prefW = 100; prefH = 60; }
+    public override void OnPopupDismissed() {
+        Dismissed = Dismissed + 1;
+        if (!Reopen) { return; }
+        Reopen = false;
+        App origin = Origin;
+        App destination = Destination;
+        Control nextRoot = WinningRoot;
+        Control anchor = Anchor;
+        if (ReplaceRootOnClose && origin != null) { origin.SetRootControl(nextRoot); }
+        if (destination != null && anchor != null) {
+            destination.overlayHost.Show(destination, anchor, this);
+            if (CaptureOnClose) {
+                destination.CapturePointer(anchor, true);
+                destination.focus.SetPressed(anchor.WidgetId());
+                destination.focus.SetHovered(anchor.WidgetId());
+                destination.focus.SetFocused(anchor.WidgetId(), anchor);
+            }
+        }
+    }
+}
+
+class RetirementInput : Control {
+    public string Callback;
+    public bool Armed;
+    public int Notifications;
+    public int Clicks;
+    public weak App Host;
+    public weak Control Popup;
+    public bool Reopen;
+    public bool CaptureAgain = true;
+    public bool CaptureOnly;
+    public weak Control NextInput;
+    public RetirementInput() : base("retirement_input") { }
+    void Establish() {
+        App app = Host; Control popup = Popup;
+        if (app == null) { return; }
+        if (Reopen && popup != null) { app.overlayHost.Show(app, this, popup); }
+        Control target = NextInput != null ? NextInput : this;
+        if (CaptureAgain) { app.CapturePointer(target, true); }
+        if (CaptureOnly) { return; }
+        app.focus.SetPressed(target.WidgetId());
+        app.focus.SetHovered(target.WidgetId());
+        app.focus.SetFocused(target.WidgetId(), target);
+    }
+    void Notify(string kind) {
+        if (!Armed || Callback != kind) { return; }
+        Armed = false; Notifications = Notifications + 1; this.Establish();
+    }
+    public override void OnInputFocusLost() { this.Notify("FocusLost"); }
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        App app = Host;
+        if (e.eventName == "PointerDown" && app != null) {
+            app.CapturePointer(this, true); app.focus.SetPressed(this.WidgetId());
+        }
+        if (e.eventName == "Click") { Clicks = Clicks + 1; }
+        this.Notify(e.eventName);
+    }
+}
+
+class OverlayAnchorRetirementTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static Control Page(App app) {
+        Control page = new Control("retirement_page");
+        page.UseApp(app); app.SetRootControl(page);
+        page.MeasureTree(app); page.Arrange(0, 0, 640, 480);
+        return page;
+    }
+    static SelectBox Picker(App app, Control page) {
+        SelectBox picker = new SelectBox("Choose", false);
+        picker.AddOption("one"); picker.AddOption("two"); page.Add(picker);
+        picker.MeasureTree(app); picker.Arrange(20, 20, 180, 32);
+        app.BeginOffscreenFrame(); page.RenderTree(app); app.EndOffscreenFrame();
+        // Layout may visit a generic parent: restore the explicit fixture geometry.
+        picker.Arrange(20, 20, 180, 32);
+        return picker;
+    }
+    static void OpenWithoutFocus(App app, Control page, SelectBox picker) {
+        int x = picker.bx + picker.bw / 2; int y = picker.by + picker.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        app.BeginOffscreenFrame(); page.RenderTree(app); app.EndOffscreenFrame(); Drain(app);
+        Check(picker.IsOpen() && app.overlayHost.IsAnchorActive(picker), "real picker click registers overlay");
+        app.focus.ClearFocus();
+        Check(picker.IsOpen() && app.overlayHost.IsAnchorActive(picker), "clearing focus leaves picker open");
+        Check(page.FindInputFocus(app) == null && app.GetCapturedPointer() == null,
+            "picker-only state has no focus or capture");
+    }
+    static void PickerRootReplacement() {
+        App app = App.CreateOffscreen("picker root retirement", 640, 480);
+        Control page = Page(app); SelectBox picker = Picker(app, page);
+        OpenWithoutFocus(app, page, picker);
+        Control nextRoot = new Control("replacement"); app.SetRootControl(nextRoot);
+        // Assert synchronously: no redraw or subsequent input may provide cleanup.
+        Check(!picker.IsOpen() && !app.overlayHost.HasActive(), "root replacement immediately closes picker without focus/capture");
+        Check(app.rootControl == nextRoot, "requested root installed");
+        app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void AggregateAndContentReplacement() {
+        App app = App.CreateOffscreen("adapter anchor retirement", 640, 480);
+        Control page = Page(app); SelectBox picker = Picker(app, page);
+        OpenWithoutFocus(app, page, picker);
+        RetirementAdapter first = new RetirementAdapter(); first.Bind(app);
+        RetirementAdapter second = new RetirementAdapter(); second.Bind(app);
+        Check(app.rootControl == second && second.ContainsAdapter(first), "two borrowed adapters compose");
+        Check(second.parent == null && page.parent == null && second.ContainsInputControl(picker), "input membership reaches anchor without a parent chain");
+        Check(picker.IsOpen() && app.overlayHost.IsAnchorActive(picker), "aggregate root replacement preserves reachable anchor");
+        first.Detach();
+        Check(app.rootControl == second && picker.IsOpen(), "adapter splice preserves fallback anchor");
+        Control nextRoot = new Control("new content");
+        Check(second.SetContentRoot(nextRoot), "content replacement accepted");
+        Check(!picker.IsOpen() && !app.overlayHost.HasActive(), "SetContentRoot retires old anchor through ReleaseInputSubtree");
+        second.Detach(); Check(app.rootControl == nextRoot, "detach restores new content");
+        app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void SubtreeRemoval() {
+        App app = App.CreateOffscreen("subtree anchor retirement", 640, 480);
+        Control page = Page(app); SelectBox picker = Picker(app, page);
+        Control unrelated = new Control("other subtree"); page.Add(unrelated);
+        OpenWithoutFocus(app, page, picker);
+        app.ReleaseInputSubtree(unrelated);
+        Check(picker.IsOpen(), "retiring unrelated subtree preserves picker");
+        page.Remove(picker);
+        Check(!picker.IsOpen() && !app.overlayHost.HasActive(), "actual Remove retires anchor before parent/app detach");
+        app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void PointPopupPreserved() {
+        App app = App.CreateOffscreen("point popup lifetime", 640, 480);
+        Control page = Page(app); RetirementPopup popup = new RetirementPopup();
+        app.overlayHost.ShowAt(app, popup, 20, 20);
+        app.ReleaseInputSubtree(page); app.SetRootControl(new Control("next point root"));
+        Check(app.overlayHost.ActiveRoot() == popup && popup.Dismissed == 0,
+            "anchorless point popup is not tied to an input root");
+        app.overlayHost.Hide(popup); Check(popup.Dismissed == 1, "explicit point close notifies once");
+        app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void Reentry(bool fromAnchor, bool crossApp, bool retireSubtree) {
+        App app = App.CreateOffscreen("retiring origin", 640, 480);
+        App other = App.CreateOffscreen("reopening destination", 640, 480);
+        Control page = Page(app); Control winner = new Control("callback root wins");
+        RetirementAnchor anchor = new RetirementAnchor(); RetirementPopup popup = new RetirementPopup();
+        page.Add(anchor); anchor.MeasureTree(app); anchor.Arrange(20, 20, 100, 30);
+        App destination = crossApp ? other : app;
+        // Same-App callback installs a root that still reaches the reopened anchor.
+        // Cross-App callback moves the old page before reopening the same identities.
+        if (crossApp) { other.SetRootControl(page); }
+        else { winner.Add(page); }
+        if (fromAnchor) {
+            anchor.Reopen = true; anchor.Origin = app; anchor.Destination = destination;
+            anchor.WinningRoot = winner; anchor.Popup = popup;
+        } else {
+            popup.Reopen = true; popup.Origin = app; popup.Destination = destination;
+            popup.WinningRoot = winner; popup.Anchor = anchor;
+        }
+        app.overlayHost.Show(app, anchor, popup);
+        if (retireSubtree) { app.ReleaseInputSubtree(page); }
+        else { app.SetRootControl(new Control("stale outer root")); }
+        Check(app.rootControl == winner, "close callback newer root wins over stale SetRootControl");
+        Check(destination.overlayHost.ActiveRoot() == popup && destination.overlayHost.IsAnchorActive(anchor),
+            "close callback reopened popup survives outer retirement");
+        Check(popup.Dismissed == 1, "old popup notified once without recursive sweep");
+        Check(anchor.Dismissed == (fromAnchor ? 1 : 0), "cross-App epoch suppresses stale old anchor notification");
+        if (crossApp) { Check(!app.overlayHost.HasActive(), "origin host stays unregistered after migration"); }
+        destination.overlayHost.Hide(popup);
+        Check(popup.Dismissed == 2 && anchor.Dismissed == (fromAnchor ? 2 : 1), "new session closes exactly once");
+        app.SetRootControl(null); other.SetRootControl(null); Drain(app); Drain(other);
+        app.canvas.Destroy(); other.canvas.Destroy();
+    }
+    static void CloseCallbackCapture(bool replaceRoot, bool capture) {
+        App app = App.CreateOffscreen("close callback fresh capture", 640, 480);
+        Control page = Page(app); Control winner = new Control("aggregate winner"); winner.Add(page);
+        RetirementAnchor anchor = new RetirementAnchor(); RetirementPopup popup = new RetirementPopup();
+        page.Add(anchor); anchor.MeasureTree(app); anchor.Arrange(20, 20, 100, 30);
+        popup.Origin = app; popup.Destination = app; popup.WinningRoot = winner; popup.Anchor = anchor;
+        popup.Reopen = true; popup.CaptureOnClose = capture; popup.ReplaceRootOnClose = replaceRoot;
+        app.overlayHost.Show(app, anchor, popup);
+        Check(app.GetCapturedPointer() == null, "review counterexample starts without capture");
+        app.ReleaseInputSubtree(page);
+        Check(app.rootControl == (replaceRoot ? winner : page), "close callback preserves chosen root including unchanged root");
+        Check(app.overlayHost.ActiveRoot() == popup && app.GetCapturedPointer() == (capture ? anchor : null),
+            "old retirement cannot cancel close callback fresh capture or reopened-only session");
+        if (capture) {
+            Check(app.focus.IsPressed(anchor.WidgetId()) && app.focus.IsHovered(anchor.WidgetId())
+                && app.focus.IsFocused(anchor.WidgetId()), "close callback fresh press hover focus survive");
+        }
+        Check(popup.Dismissed == 1 && anchor.Dismissed == 0, "reopened old identity avoids stale anchor notification");
+        app.ReleasePointerCapture(); app.focus.ClearFocus(); app.focus.ClearPress();
+        app.overlayHost.Dismiss(); app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void InputCallbackReentry(string kind, bool reopen, bool capture) {
+        App app = App.CreateOffscreen("retirement input callback", 640, 480);
+        Control page = Page(app); RetirementInput input = new RetirementInput(); RetirementPopup popup = new RetirementPopup();
+        input.Host = app; input.Popup = popup; input.Reopen = reopen; input.CaptureAgain = capture; page.Add(input);
+        input.MeasureTree(app); input.Arrange(20, 20, 100, 30);
+        if (kind == "PointerCancel") {
+            app.ProcessOffscreenInput(2, 30, 30, 0, 0, 0, 0);
+            Check(app.GetCapturedPointer() == input, "real Down establishes old captured press");
+        } else if (kind == "PointerLeave") {
+            app.ProcessOffscreenInput(1, 30, 30, 0, 0, 0, 0);
+        } else { app.focus.SetFocused(input.WidgetId(), input); }
+        input.Callback = kind; input.Armed = true;
+        app.ReleaseInputSubtree(page);
+        Check(input.Notifications == 1 && app.rootControl == page, "input callback runs once without root change");
+        Check(app.GetCapturedPointer() == (capture ? input : null) && app.focus.IsPressed(input.WidgetId())
+            && app.focus.IsHovered(input.WidgetId()) && app.focus.IsFocused(input.WidgetId()),
+            "cancel leave focus-lost callback new capture press hover focus survive");
+        if (reopen) { Check(app.overlayHost.ActiveRoot() == popup, "callback new overlay survives delayed retirement"); }
+        Check(input.Clicks == 0, "retirement callbacks do not synthesize Click");
+        app.ReleasePointerCapture(); app.focus.ClearFocus(); app.focus.ClearPress();
+        app.overlayHost.Dismiss(); app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void CaptureOnlyClearsOldFocus(bool replaceRoot) {
+        App app = App.CreateOffscreen("capture independent of old focus", 640, 480);
+        Control page = Page(app); Control nextRoot = new Control("capture next root");
+        RetirementInput old = new RetirementInput(); old.Host = app; page.Add(old);
+        old.MeasureTree(app); old.Arrange(20, 20, 100, 30);
+        Control next = new Control("capture next"); nextRoot.Add(next);
+        next.MeasureTree(app); next.Arrange(200, 20, 100, 30);
+        app.ProcessOffscreenInput(2, 30, 30, 0, 0, 0, 0);
+        app.focus.SetFocused(old.WidgetId(), old);
+        Check(app.GetCapturedPointer() == old && app.focus.IsFocused(old.WidgetId()),
+            "capture-only fixture starts with old capture and old focus");
+        RetirementPopup popup = new RetirementPopup(); app.overlayHost.Show(app, old, popup);
+        old.NextInput = next; old.CaptureOnly = true; old.Callback = "PointerCancel"; old.Armed = true;
+        if (replaceRoot) { app.SetRootControl(nextRoot); }
+        else { app.ReleaseInputSubtree(page); }
+        Check(old.Notifications == 1 && app.GetCapturedPointer() == next,
+            "cancel only replaces capture without replacing focus");
+        Check(!app.focus.IsFocused(old.WidgetId()) && app.focus.focusedControl == null,
+            "new capture cannot protect unchanged retired focus");
+        Check(app.rootControl == (replaceRoot ? nextRoot : page)
+            && !app.overlayHost.HasActive() && popup.Dismissed == 1,
+            "capture-only callback preserves root operation and retires old overlay");
+        app.ReleasePointerCapture(); app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void RedirectInputKeepsRetirement(bool replaceRoot) {
+        App app = App.CreateOffscreen("independent resource retirement", 640, 480);
+        Control page = Page(app); Control nextRoot = new Control("next root");
+        RetirementInput old = new RetirementInput(); old.Host = app; page.Add(old);
+        old.MeasureTree(app); old.Arrange(20, 20, 100, 30);
+        Control next = new Control("next input"); nextRoot.Add(next);
+        next.MeasureTree(app); next.Arrange(200, 20, 100, 30);
+        app.ProcessOffscreenInput(2, 30, 30, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == old, "review redirect establishes real old capture");
+        RetirementPopup popup = new RetirementPopup(); app.overlayHost.Show(app, old, popup);
+        old.NextInput = next; old.Callback = "PointerCancel"; old.Armed = true;
+        if (replaceRoot) { app.SetRootControl(nextRoot); }
+        else { app.ReleaseInputSubtree(page); }
+        Check(app.rootControl == (replaceRoot ? nextRoot : page), "new capture cannot veto requested root install");
+        Check(app.GetCapturedPointer() == next && app.focus.IsFocused(next.WidgetId())
+            && app.focus.IsPressed(next.WidgetId()), "redirected new capture focus press survive old retirement");
+        Check(!app.overlayHost.HasActive() && popup.Dismissed == 1,
+            "redirected input cannot spare unchanged old anchor overlay");
+        app.ReleasePointerCapture(); app.focus.ClearFocus(); app.focus.ClearPress();
+        app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("independent frame owner", 2, 2);
+        PickerRootReplacement(); AggregateAndContentReplacement(); SubtreeRemoval(); PointPopupPreserved();
+        CloseCallbackCapture(false, false); CloseCallbackCapture(false, true); CloseCallbackCapture(true, true);
+        RedirectInputKeepsRetirement(false); RedirectInputKeepsRetirement(true);
+        CaptureOnlyClearsOldFocus(false); CaptureOnlyClearsOldFocus(true);
+        InputCallbackReentry("PointerCancel", false, true); InputCallbackReentry("PointerCancel", true, true);
+        InputCallbackReentry("PointerLeave", false, true); InputCallbackReentry("PointerLeave", true, true);
+        InputCallbackReentry("FocusLost", false, true); InputCallbackReentry("FocusLost", true, true);
+        InputCallbackReentry("PointerCancel", false, false); InputCallbackReentry("PointerLeave", false, false);
+        InputCallbackReentry("FocusLost", false, false);
+        Reentry(false, false, false); Reentry(true, false, false);
+        Reentry(false, true, false); Reentry(true, true, false);
+        Reentry(false, false, true); Reentry(true, false, true);
+        Reentry(false, true, true); Reentry(true, true, true);
+        frame.canvas.Destroy(); Console.WriteLine("OVERLAY_ANCHOR_RETIREMENT_OK");
+    }
+}

@@ -4,8 +4,7 @@ using Gui;
 namespace Gui.Widget;
 
 // Office 风格功能区（Ribbon）：纯声明式对象树与 CSS 盒模型，继承自 Control。
-// 彻底物理删除所有 Canvas 手动微绘、AllocId 与即时模式 Render 入口。
-public class Ribbon : Control {
+public partial class Ribbon : Control {
     public List<string> tabs;
     public SignalInt activeTab;
     public List<RibbonGroup> groups;
@@ -13,8 +12,9 @@ public class Ribbon : Control {
     public UiEvent CommandClicked;
     // 最近一次被点的条目下标：宿主在构建 groups/cmds 时把全局动作
     // 序号写进 RibbonItem.act / RibbonCmd.act，点击经 CommandClicked
-    // 抛出后从这里读回（控件树每帧重建，闭包与序号同帧有效）。
+    // 抛出后从这里读回；重建代次使旧排队动作失效。
     public int lastAct;
+    int treeGeneration;
 
     public override int StyleDisplay() { return 1; } // Flex
     public override int StyleFlexDir() { return 1; } // Column
@@ -46,7 +46,13 @@ public class Ribbon : Control {
     }
 
     public void BuildTree() {
-        this.children.Clear();
+        treeGeneration = treeGeneration + 1;
+        int session = treeGeneration;
+        this.CloseRetainedOverflow();
+        if (treeGeneration != session) { return; }
+        this.RemoveAll();
+        if (treeGeneration != session) { return; }
+        this.BeginRetainedTree();
 
         // 1. 顶部标签条
         if (tabs.Count > 0) {
@@ -56,12 +62,12 @@ public class Ribbon : Control {
                 int tidx = ti;
                 Button tb = new Button(tabs[ti]);
                 tb.ClassName = "ribbon-tab " + (activeTab.Get() == ti ? "active" : "");
-                tb.Click.Add(() => {
-                    activeTab.Set(tidx);
-                    this.BuildTree();
-                });
+                RibbonAction action = new RibbonAction();
+                action.Owner = this; action.Generation = session; action.Value = tidx; action.Tab = true; action.Source = tb;
+                tb.Click.Add(action.Run);
                 tabStrip.Add(tb);
             }
+            retainedTabs = tabStrip;
             this.Add(tabStrip);
         }
 
@@ -90,46 +96,62 @@ public class Ribbon : Control {
                     if (it.tip != "") { ibtn.Tip = it.tip; }
                     else if (it.label != "") { ibtn.Tip = it.label; }
                     if (it.icon != "") { ibtn.Add(new IconView(it.icon, compact ? 14 : 20)); }
-                    if (it.label != "" && !it.tile) { ibtn.Add(new Label(it.label)); }
-                    ibtn.Click.Add(() => {
-                        this.lastAct = actIdx;
-                        this.CommandClicked.Raise();
-                    });
+                    Label caption = null;
+                    if (it.label != "" && !it.tile) { caption = new Label(it.label); ibtn.Add(caption); }
+                    if (it.menu) { ibtn.Add(new IconView("chevron-down", 8)); }
+                    retainedItems.Add(ibtn); retainedLabels.Add(caption);
+                    RibbonAction action = new RibbonAction();
+                    action.Owner = this; action.Generation = session; action.Value = actIdx; action.Source = ibtn;
+                    ibtn.Click.Add(action.Run);
                     itemsBox.Add(ibtn);
                 }
                 gnode.Add(itemsBox);
 
+                Label groupTitle = null;
                 if (grp.title != "") {
                     Label glbl = new Label(grp.title);
                     glbl.ClassName = "ribbon-group-title align-center justify-center";
                     gnode.Add(glbl);
+                    groupTitle = glbl;
                 }
+                retainedGroups.Add(gnode); retainedBoxes.Add(itemsBox); retainedTitles.Add(groupTitle);
                 band.Add(gnode);
             }
         } else if (cmds.Count > 0) {
             for (int ci = 0; ci < cmds.Count; ci = ci + 1) {
                 RibbonCmd cmd = cmds[ci];
                 int actIdx = cmd.act;
-                Button cbtn = new Button(cmd.compact ? "" : cmd.label);
+                Button cbtn = new Button();
                 cbtn.ClassName = "ribbon-cmd col align-center justify-center "
                     + (cmd.compact ? "compact" : "")
                     + (cmd.on ? " on" : "");
                 if (!cmd.enabled) { cbtn.Disabled = true; }
                 if (cmd.tip != "") { cbtn.Tip = cmd.tip; }
                 if (cmd.icon != "") { cbtn.Add(new IconView(cmd.icon, cmd.compact ? 14 : 20)); }
-                if (!cmd.compact && cmd.label != "") { cbtn.Add(new Label(cmd.label)); }
-                cbtn.Click.Add(() => {
-                    this.lastAct = actIdx;
-                    this.CommandClicked.Raise();
-                });
+                Label caption = null;
+                if (!cmd.compact && cmd.label != "") { caption = new Label(cmd.label); cbtn.Add(caption); }
+                retainedItems.Add(cbtn); retainedLabels.Add(caption);
+                RibbonAction action = new RibbonAction();
+                action.Owner = this; action.Generation = session; action.Value = actIdx; action.Source = cbtn;
+                cbtn.Click.Add(action.Run);
                 band.Add(cbtn);
                 if (cmd.sep) {
                     Control sep = new Control();
                     sep.ClassName = "ribbon-divider";
+                    retainedDividers.Add(sep); retainedDividerItems.Add(ci);
                     band.Add(sep);
                 }
             }
         }
+        retainedMore = new Button();
+        retainedMore.ClassName = "ribbon-cmd ghost small";
+        retainedMore.Tip = Ribbon.T("More commands", "更多命令");
+        retainedMore.Add(new IconView("chevrons-right", 16));
+        RibbonAction moreAction = this.RetainedAction(0, false, retainedMore);
+        moreAction.Overflow = true;
+        retainedMore.Click.Add(moreAction.Run);
+        band.Add(retainedMore);
+        retainedBand = band;
         this.Add(band);
     }
 

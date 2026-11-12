@@ -1,0 +1,169 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+class SceneDesignerInspectorTest {
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("Inspector: " + label); }
+    }
+
+    static void Paint(App app, SceneDesigner d, int w, int h) {
+        app.SetOffscreenViewport(w + 40, h + 40, 100);
+        app.BeginOffscreenFrame();
+        d.RenderInspector(app, app.canvas, app.theme, 20, 20, w, h);
+        app.EndOffscreenFrame();
+    }
+
+    static void Click(App app, SceneDesigner d, Control control, int w, int h) {
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        Paint(app, d, w, h);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Paint(app, d, w, h);
+        app.DrainPosts();
+        app.ProcessOffscreenInput(0, x, y, 0, 0, 0, 0);
+    }
+
+    static void Type(App app, SceneDesigner d, Input input, int code, int w, int h) {
+        Click(app, d, input, w, h);
+        Check("pointer focuses text editor", input.IsFocused(app));
+        Check("text editor has positive geometry", input.bw > 0 && input.bh > 0);
+        input.SelectAll();
+        app.ProcessOffscreenInput(6, 0, 0, 0, code, 0, 0);
+        // Verify storage through the window: App.EventKind filters keys that
+        // have already been claimed by a consumer of this event sequence.
+        Check("offscreen character event stored", app.window.EventKind() == 6 && app.window.EventKeyCode() == code);
+        long eventSeq = app.window.EventSeq();
+        Paint(app, d, w, h);
+        string expected = code == 81 ? "Q" : "N";
+        if (input.GetText() != expected) {
+            Console.WriteLine("Keyboard context: text='" + input.GetText() + "', expected='" + expected
+                + "', focused=" + input.IsFocused(app).ToString()
+                + ", bounds=" + input.bx.ToString() + "," + input.by.ToString()
+                + "," + input.bw.ToString() + "," + input.bh.ToString()
+                + ", localSeq=" + eventSeq.ToString()
+                + ", lastKeySeq=" + input.lastKeyNamedSeq.ToString());
+        }
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+    }
+
+    static void RoutedEditing(App app, SceneDesigner d) {
+        Paint(app, d, 340, 2100);
+        Control root = d.InspectorRoot();
+        Control nameParent = d.nameIn.parent;
+        InputNumber width = d.inspector.FindNumber("designW");
+        Check("design width exists", width != null);
+        int undo = d.undoStack.Count;
+        int before = d.doc.DesignWidth();
+        Click(app, d, width.plusBtn, 340, 2100);
+        Check("routed plus updates document", d.doc.DesignWidth() == before + 20);
+        Check("routed plus records one undo", d.undoStack.Count == undo + 1);
+        d.CommitInspectorNumber("designW", d.doc.DesignWidth());
+        Check("no-op number creates no undo", d.undoStack.Count == undo + 1);
+        Type(app, d, d.titleIn, 81, 340, 2100);
+        Check("routed keyboard updates title", d.doc.WinTitle() == "Q");
+        Check("input focus included", d.InspectorInputFocused(app));
+        int focused = d.titleIn.WidgetId();
+        Paint(app, d, 340, 2100);
+        Check("root identity stable", d.InspectorRoot() == root);
+        Check("existing input parent stable", d.nameIn.parent == nameParent);
+        Check("focused identity survives paint", app.focus.IsFocused(focused));
+        d.RunInspectorAction("mode", d.doc.Mode());
+        int count = d.undoStack.Count;
+        Paint(app, d, 340, 2100);
+        Check("paint does not record undo", d.undoStack.Count == count);
+    }
+
+    static void ElementEditing(App app, SceneDesigner d, SceneElement e) {
+        Type(app, d, d.nameIn, 78, 340, 2100);
+        Check("routed name edit", e.Name() == "N");
+        SceneElement other = new SceneElement("label", "taken");
+        d.doc.Add(other);
+        int count = d.undoStack.Count;
+        d.nameIn.SetText("taken");
+        d.CommitInspectorText("name");
+        Check("duplicate rejected", e.Name() == "N" && d.nameIn.GetText() == "N");
+        Check("rejected name no undo", d.undoStack.Count == count);
+        d.layerIn.SetText("inventory");
+        d.CommitInspectorText("layer");
+        Check("named layer auto switches", e.Layer() == "inventory" && d.editLayer == "inventory");
+        d.RunInspectorAction("anchor", 8);
+        int left = d.DesignLeft(e);
+        int top = d.DesignTop(e);
+        d.CommitInspectorNumber("w", e.W() + 7);
+        d.CommitInspectorNumber("h", e.H() + 11);
+        Check("anchored resize keeps top left", d.DesignLeft(e) == left && d.DesignTop(e) == top);
+        d.RunInspectorAction("anchor", 4);
+        Check("anchor change keeps top left", d.DesignLeft(e) == left && d.DesignTop(e) == top);
+        d.colorIn.SetText("#11223344");
+        d.CommitInspectorText("color");
+        Check("color text updates RGB only", e.R() == 17 && e.G() == 34 && e.B() == 51 && e.A() == 128);
+        d.colorPick.SetColor(ColorPicker.Opaque(255, 0, 0));
+        d.CommitInspectorColor();
+        Check("picker preserves alpha", e.R() == 255 && e.G() == 0 && e.A() == 128);
+        d.CommitInspectorNumber("alpha", 143);
+        Check("alpha separate", e.A() == 143 && e.R() == 255);
+        d.imgIn.SetText("image-id");
+        d.CommitInspectorText("image");
+        d.bgIn.SetText("background-id");
+        d.CommitInspectorText("background");
+        Check("resource endpoints", e.ImageId() == "image-id" && d.doc.Background() == "background-id");
+        d.RunInspectorAction("code", 0);
+        Check("handler navigation", d.openCodeBehindRequested && e.OnAction("Click") == "OnNClick");
+    }
+
+    static void ScrollAndLifecycle(App app, SceneDesigner d, SceneElement e) {
+        Paint(app, d, 240, 240);
+        InputNumber designWidth = d.inspector.FindNumber("designW");
+        Check("design width exists in narrow row", designWidth != null);
+        Check("narrow number stays in row", designWidth.bw > 0
+            && designWidth.bx + designWidth.bw <= 260);
+        // CaptureWheel grants the next input frame to the last hovered
+        // scrollable viewport. Move into the narrowed inspector before wheeling.
+        app.ProcessOffscreenInput(1, 100, 150, 0, 0, 0, 0);
+        Paint(app, d, 240, 240);
+        Check("retained content overflows viewport", d.inspector.content.bh > d.inspector.root.bh);
+        int before = d.inspector.content.by;
+        Control stableRoot = d.InspectorRoot();
+        app.ProcessOffscreenInput(13, 100, 150, 0, -120, 0, 0);
+        Paint(app, d, 240, 240);
+        app.ProcessOffscreenInput(0, 100, 150, 0, 0, 0, 0);
+        Paint(app, d, 240, 240);
+        Check("scroll moves retained content", d.inspector.content.by < before);
+        Control row = d.inspector.colorRow;
+        d.Select(null);
+        Paint(app, d, 240, 240);
+        Check("empty selection shown", d.inspector.empty.visible && !d.inspector.element.visible);
+        d.Select(e);
+        Paint(app, d, 340, 2100);
+        Check("selection retains color row", row == d.inspector.colorRow);
+        Click(app, d, d.titleIn, 340, 2100);
+        d.SetInspectorVisible(false);
+        Check("hidden input root releases focus", !d.InspectorInputFocused(app));
+        d.SetInspectorVisible(true);
+        Paint(app, d, 340, 2100);
+        Check("show retains root", d.InspectorRoot() == stableRoot);
+        int width = d.doc.DesignWidth();
+        d.CommitInspectorNumber("designW", width + 20);
+        d.Undo();
+        Paint(app, d, 340, 2100);
+        Check("undo restores scene and clears selection", d.doc.DesignWidth() == width && d.sel == null);
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Inspector", 400, 2140);
+        SceneDesigner d = new SceneDesigner();
+        SceneElement e = new SceneElement("button", "one");
+        e.Tint(24, 144, 255, 128);
+        d.doc.Add(e);
+        d.Select(e);
+        RoutedEditing(app, d);
+        ElementEditing(app, d, e);
+        ScrollAndLifecycle(app, d, e);
+        d.SetInspectorVisible(false);
+        app.canvas.Destroy();
+        Console.WriteLine("SCENE_DESIGNER_INSPECTOR_TEST_OK");
+    }
+}

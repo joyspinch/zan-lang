@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
 
@@ -23,8 +24,22 @@ public class LayerState {
     public int sy;
     public int sw;
     public int sh;
-    public int state;
-    public bool open;
+    int windowState;
+    public int state {
+        get { return windowState; }
+        set {
+            if (!modal && windowState != value && value == 2) { this.ReleaseLayerInput(); }
+            windowState = value;
+        }
+    }
+    bool inputOpen;
+    public bool open {
+        get { return inputOpen; }
+        set {
+            if (inputOpen && !value) { this.ReleaseLayerInput(); }
+            inputOpen = value;
+        }
+    }
     public bool dragging;
     public int grabDx;
     public int grabDy;
@@ -64,7 +79,94 @@ public class LayerState {
     // page 层的嵌入式正文控件树（layui page 层放任意 HTML 的等价物）：
     // 宿主构造一棵保留的组件树（表单/面板等）挂进来，每帧渲染在
     // 正文区。构造必须包在 Layer.BeginBody()/EndBody() 里领保留段 id。
-    public Control view;
+    Control bodyView;
+    public Control view {
+        get { return bodyView; }
+        set {
+            if (bodyView == value) { return; }
+            this.ReleaseLayerInput();
+            if (wrap != null && bodyView != null) { wrap.Remove(bodyView); }
+            wrap = null;
+            bodyView = value;
+        }
+    }
+    weak App inputApp;
+    Control inputBody;
+    Control inputPrompt;
+    Control inputFooter;
+    int inputX;
+    int inputY;
+    int inputW;
+    int inputH;
+
+    void CancelLayerInput() {
+        if (inputApp == null) { return; }
+        if (inputBody != null) { inputApp.ReleaseInputSubtree(inputBody); }
+        if (inputPrompt != null) { inputApp.ReleaseInputSubtree(inputPrompt); }
+        if (inputFooter != null) { inputApp.ReleaseInputSubtree(inputFooter); }
+    }
+
+    void ReleaseLayerInput() {
+        this.CancelLayerInput();
+        inputBody = null;
+        inputPrompt = null;
+        inputFooter = null;
+    }
+
+    void SetLayerInput(App app, Control bodyRoot, Control prompt, Control footerRoot,
+            int x, int y, int w, int h) {
+        if (inputApp != null && inputApp != app) {
+            this.ReleaseLayerInput();
+            Layer.Context(inputApp).zorder.Remove(this);
+        }
+        if (!open || (!modal && state == 2)) { this.ReleaseLayerInput(); }
+        else {
+            if (inputApp != null) {
+                if (inputBody != null && inputBody != bodyRoot
+                    && (bodyRoot == null || !bodyRoot.ContainsInputControl(inputBody))) {
+                    inputApp.ReleaseInputSubtree(inputBody);
+                }
+                if (inputPrompt != null && inputPrompt != prompt) { inputApp.ReleaseInputSubtree(inputPrompt); }
+                if (inputFooter != null && inputFooter != footerRoot) { inputApp.ReleaseInputSubtree(inputFooter); }
+            }
+            inputBody = bodyRoot;
+            inputPrompt = prompt;
+            inputFooter = footerRoot;
+        }
+        inputApp = app;
+        inputX = x; inputY = y; inputW = w; inputH = h;
+        Layer.BindInput(app, this);
+    }
+
+    bool ContainsLayerInput(Control control) {
+        if (!open || (!modal && state == 2) || control == null) { return false; }
+        return (inputBody != null && inputBody.ContainsInputControl(control))
+            || (inputPrompt != null && inputPrompt.ContainsInputControl(control))
+            || (inputFooter != null && inputFooter.ContainsInputControl(control));
+    }
+
+    void CollectLayerFocus(App app, List<Control> controls) {
+        if (!open || (!modal && state == 2)) { return; }
+        if (inputPrompt != null) { inputPrompt.CollectInputFocus(app, controls); }
+        if (inputBody != null) { inputBody.CollectInputFocus(app, controls); }
+        if (inputFooter != null) { inputFooter.CollectInputFocus(app, controls); }
+    }
+
+    Control FindLayerFocus(App app) {
+        if (!open || (!modal && state == 2)) { return null; }
+        Control found = inputPrompt != null ? inputPrompt.FindInputFocus(app) : null;
+        if (found == null && inputBody != null) { found = inputBody.FindInputFocus(app); }
+        if (found == null && inputFooter != null) { found = inputFooter.FindInputFocus(app); }
+        return found;
+    }
+
+    Control HitLayerInput(int x, int y, int pointerType) {
+        if (!open || (!modal && state == 2)) { return null; }
+        Control hit = inputFooter != null ? inputFooter.HitTest(x, y, pointerType) : null;
+        if (hit == null && inputBody != null) { hit = inputBody.HitTest(x, y, pointerType); }
+        if (hit == null && inputPrompt != null) { hit = inputPrompt.HitTest(x, y, pointerType); }
+        return hit;
+    }
     // 点遮罩关闭（模态对话框）：按下与抬起都落在遮罩、且不在对话框
     // 矩形内时报告 action 2，由调用方关闭。
     public bool shadeClose;
@@ -153,6 +255,12 @@ public class LayerState {
         this.okBtn = new Button { Class = "primary" };
         this.cancelBtn = new Button { };
         this.altBtn = new Button { };
+        LayerAction okAction = new LayerAction(this, 1);
+        LayerAction cancelAction = new LayerAction(this, 2);
+        LayerAction altAction = new LayerAction(this, 4);
+        this.okBtn.Click.Add(okAction.Invoke);
+        this.cancelBtn.Click.Add(cancelAction.Invoke);
+        this.altBtn.Click.Add(altAction.Invoke);
         this.dialogFooter = new Flex();
         this.dialogFooter.ClassName = "row justify-end align-center gap-medium";
         this.windowFooter = new Flex();
@@ -240,9 +348,12 @@ public class LayerState {
         s.promptMaxLen = maxLen;
         if (formType == 2) {
             s.promptArea = new TextArea(hint);
+            if (maxLen > 0) { s.promptArea.MaxLen = maxLen; }
             if (value != "") { s.promptArea.SetText(value); }
         } else {
             s.promptInput = new Input(hint);
+            LayerAction submitAction = new LayerAction(s, 1);
+            s.promptInput.Submit.Add(submitAction.Invoke);
             if (value != "") { s.promptInput.SetText(value); }
             if (formType == 1) { s.promptInput.password = true; }
             if (maxLen > 0) { s.promptInput.MaxLen = maxLen; }
@@ -308,11 +419,13 @@ public class LayerState {
         if (maxH > 0 && availBody > maxH) { availBody = maxH; }
         bool scrolling = contentH > availBody
             && view.Kind() != "ScrollColumn";
-        if (scrolling) {
+        if (scrolling && wrap == null) {
             ScrollColumn sc = new ScrollColumn();
             sc.With(view);
             wrap = sc;
-        } else {
+        } else if (!scrolling && wrap != null) {
+            this.ReleaseLayerInput();
+            wrap.Remove(view);
             wrap = null;
         }
         int w = contentW + padX;

@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Gui.Component;
 using Gui.Widget;
 
 namespace Gui.Component.FirefoxBrowser;
@@ -9,6 +10,43 @@ namespace Gui.Component.FirefoxBrowser;
 /// 承载 C-ABI 视口句柄、生命周期、智能体代理与渲染裁剪
 /// </summary>
 public class FirefoxBrowser {
+    public BrowserNativeEntry nativeEntry;
+    string nativeTarget = "";
+    string nativeHtml = "";
+    string nativeBase = "";
+    int nativeRevision;
+    bool nativeDestroyed;
+
+    public BrowserNativeEntry AttachNative(App app, Control box) {
+        if (nativeDestroyed || app == null || !app.isRunning) { return null; }
+        if (nativeEntry != null && !nativeEntry.retired && nativeEntry.loop != null
+            && nativeEntry.loop.host == app) {
+            if (box != null) { nativeEntry.AttachBox(box); }
+            return nativeEntry;
+        }
+        if (nativeEntry != null && !nativeEntry.retired) { nativeEntry.Retire(app); }
+        BrowserNativeLoop service = BrowserNativeLoop.For(app);
+        BrowserNativeEntry entry = new BrowserNativeEntry();
+        entry.engine = 3;
+        entry.firefox = this;
+        entry.loop = service;
+        if (box != null) { entry.AttachBox(box); }
+        nativeEntry = entry;
+        service.Add(entry);
+        return entry;
+    }
+
+    public void ReleaseNative() {
+        nativeRevision = nativeRevision + 1;
+        if (handle != 0) {
+            this.Hide();
+            if (viewId > 0) { NativeLayer.Forget(viewId); }
+            if (FirefoxCore.PfnDestroy != 0) { GeckoActionFn destroy = (GeckoActionFn)FirefoxCore.PfnDestroy; destroy(handle); }
+        }
+        handle = 0; viewId = 0; created = false; agent = null;
+        if (nativeEntry != null) { nativeEntry.ForgetHandle(); }
+    }
+
     public nint handle;
     public int contextId;
     public FingerprintProfile fingerprint;
@@ -68,6 +106,8 @@ public class FirefoxBrowser {
     }
 
     public void Navigate(string target) {
+        nativeTarget = target;
+        nativeHtml = "";
         this.pendingUrl = target;
         if (this.handle != 0 && FirefoxCore.PfnNavigate != 0) {
             GeckoNavigateFn fn = (GeckoNavigateFn)FirefoxCore.PfnNavigate;
@@ -97,6 +137,7 @@ public class FirefoxBrowser {
     }
 
     public void Hide() {
+        if (nativeEntry != null) { nativeEntry.RequestHide(); }
         if (this.viewId > 0) {
             FirefoxCore.ApplyClip(this.viewId, "");
         }
@@ -110,19 +151,11 @@ public class FirefoxBrowser {
     }
 
     public void Destroy() {
-        if (this.viewId > 0) {
-            NativeLayer.Forget(this.viewId);
-            FirefoxCore.ApplyClip(this.viewId, "");
-        }
-        if (this.handle != 0) {
-            this.Hide();
-            if (FirefoxCore.PfnDestroy != 0) {
-                GeckoActionFn fn = (GeckoActionFn)FirefoxCore.PfnDestroy;
-                fn(this.handle);
-            }
-            this.handle = 0;
-            this.agent = null;
-        }
+        nativeDestroyed = true;
+        BrowserNativeEntry previous = nativeEntry;
+        if (previous != null && !previous.retired) { previous.Retire(null); }
+        else { this.ReleaseNative(); }
+        nativeEntry = null;
     }
 
     public string CurrentUrl() {
@@ -158,6 +191,18 @@ public class FirefoxBrowser {
     }
 
     public void Render(App app, int x, int y, int w, int h) {
+        if (app == null) { app = App.FrameApp(); }
+        BrowserNativeEntry entry = this.AttachNative(app, null);
+        if (entry != null) { entry.SetBounds(x, y, w, h); }
+        this.Paint(app, x, y, w, h);
+    }
+
+    public void Update(App app, int x, int y, int w, int h) {
+        this.PrepareNative(app, x, y, w, h);
+        this.PollNative(app);
+    }
+
+    public void PrepareNative(App app, int x, int y, int w, int h) {
         if (!this.created) {
             this.EnsureCreated(app, x, y, w, h);
         }
@@ -180,9 +225,7 @@ public class FirefoxBrowser {
             }
         }
 
-        if (this.viewId > 0) {
-            NativeLayer.Register(app, this.viewId, x, y, w, h, FirefoxCore.ApplyClip);
-        } else {
+        if (this.viewId <= 0) {
             if (!this.lastVisible) {
                 this.lastVisible = true;
                 if (FirefoxCore.PfnSetVisible != 0) {
@@ -192,20 +235,39 @@ public class FirefoxBrowser {
             }
         }
 
+    }
+
+    public void PollNative(App app) {
+        if (nativeDestroyed || handle == 0) { return; }
+        int generation = nativeRevision;
+        nint expected = handle;
         string curT = this.CurrentTitle();
         if (curT != "" && curT != this.lastTitle) {
             this.lastTitle = curT;
-            this.TitleChanged.Raise();
+            this.TitleChanged.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
         }
 
         string curU = this.CurrentUrl();
         if (curU != "" && curU != this.lastUrl) {
             this.lastUrl = curU;
-            this.NavComplete.Raise();
+            this.NavComplete.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
+        }
+        }
+
+    public void Paint(App app, int x, int y, int w, int h) {
+        if (nativeEntry != null && !nativeEntry.shown) { return; }
+        if (app != null && this.handle != 0 && this.viewId > 0 && w > 0 && h > 0) {
+            NativeLayer.Register(app, this.viewId, x, y, w, h, FirefoxCore.ApplyClip);
         }
     }
 
     void EnsureCreated(App app, int x, int y, int w, int h) {
+        if (nativeDestroyed) { return; }
+        if (app == null) { app = App.FrameApp(); }
+        BrowserNativeEntry creationEntry = this.AttachNative(app, null);
+        if (creationEntry == null) { return; }
+        creationEntry.SetBounds(x, y, w, h);
+        try {
         if (this.created) return;
         this.created = true;
 
@@ -249,5 +311,6 @@ public class FirefoxBrowser {
                 this.viewId = vidFn(this.handle);
             }
         }
+            } finally { creationEntry.CaptureHandle(); }
     }
 }

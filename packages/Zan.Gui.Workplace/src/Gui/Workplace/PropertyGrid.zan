@@ -16,8 +16,8 @@ public class PropertyGrid : Control {
     private List<PropertyGridRow> rows;
     // 当前绑定对象的标识，变化时重建编辑器。
     private string key;
-    // 纵向滚动偏移（像素）。
-    private SignalInt scroll;
+    private int bindingEpoch;
+    private bool preparingRows;
     // 自定义标签列宽（逻辑像素，0 = 自动根据内容自适应）。
     public int LabelWidth;
     // 没有属性时显示的文本（"" 不画）。
@@ -30,8 +30,6 @@ public class PropertyGrid : Control {
     private int hitRow;
     // 已折叠的分组标题集合（支持一键折叠收起不常用大类）。
     private List<string> collapsedSections;
-    // 分组点击命中的部件ID池。
-    private List<int> sectionClickIds;
 
     // 构造空属性表：未绑定任何行，空态文本为 ""（不画）。
     public PropertyGrid() {
@@ -39,11 +37,9 @@ public class PropertyGrid : Control {
         data = new List<PropSpec>();
         rows = new List<PropertyGridRow>();
         key = "";
-        scroll = new SignalInt(0);
         Empty = "";
         hitRow = 0 - 1;
         collapsedSections = new List<string>();
-        sectionClickIds = new List<int>();
         wiresOwnEvents = true;
         Change = new UiEvent();
     }
@@ -62,10 +58,19 @@ public class PropertyGrid : Control {
         for (int i = 0; i < collapsedSections.Count; i = i + 1) {
             if (collapsedSections[i] == sec) {
                 collapsedSections.RemoveAt(i);
+                this.RefreshRows();
                 return;
             }
         }
         collapsedSections.Add(sec);
+        this.RefreshRows();
+    }
+
+    private void RefreshRows() {
+        App app = this.App;
+        if (app == null) { return; }
+        this.Arrange(bx,by,bw,bh);
+        app.RequestRedraw();
     }
 
     // 控件类型标识（"PropertyGrid"）。
@@ -111,8 +116,10 @@ public class PropertyGrid : Control {
     // 绑定一组属性。`k` 标识当前对象（如 "Field:btn0"）：它变化时
     // 才重建编辑器，否则沿用现有的，输入焦点和光标不会每帧丢失。
     public void Bind(string k, List<PropSpec> specs) {
-        if (k == key && specs.Count == data.Count) {
+        if (k == key && this.SameSchema(specs)) {
             data = specs;
+            this.ReloadExternal();
+            this.PrepareRows();
             return;
         }
         key = k;
@@ -122,39 +129,54 @@ public class PropertyGrid : Control {
 
     // 强制丢弃现有编辑器并按当前 specs 重建（切对象后 Bind 会自动调）。
     public void Rebuild() {
+        bindingEpoch = bindingEpoch + 1;
+        int ticket = bindingEpoch;
+        App expectedApp = this.App;
+        Control expectedRoot = expectedApp != null ? expectedApp.rootControl : null;
+        List<PropSpec> expectedData = data;
+        List<PropertyGridRow> previous = rows;
         rows = new List<PropertyGridRow>();
-        for (int i = 0; i < data.Count; i = i + 1) {
-            PropSpec p = data[i];
-            string cur = p.Read();
-            PropertyGridRow r = new PropertyGridRow();
-            r.shadow = cur;
-            if (p.kind == 5) {
-                // 分组标题：没有编辑器。
-            } else if (p.kind == 2) {
-                // 动态宿主不走 Binding<T>（无编译期字段可指），
-                // 统一经控件的属性协议驱动（§6.1）。
-                Switch sw = new Switch();
-                sw.Size = "small";
-                sw.SetOn(PropSpec.IsOn(cur));
-                r.flag = sw;
-            } else if (p.kind == 3) {
-                SelectBox sb = SelectBox.FromOptions(p.options, "");
-                sb.SetIndex(this.IndexOfValue(p, cur));
-                r.pick = sb;
-                for (int si = 0; si < p.options.Count; si = si + 1) {
-                    r.pickSegIds.Add(WidgetId.Next());
-                }
-            } else {
-                Input inp = new Input("");
-                inp.SetText(cur);
-                r.text = inp;
-            }
-            r.minusId = WidgetId.Next();
-            r.plusId = WidgetId.Next();
-            r.resetId = WidgetId.Next();
-            rows.Add(r);
-        }
         hitRow = 0 - 1;
+        for (int i = 0; i < previous.Count; i = i + 1) {
+            // Reentrant binding owns a different row list. Finish retiring this
+            // snapshot so its remaining old roots never survive beside new rows.
+            this.RetireRow(previous[i]);
+        }
+        if (!this.LayoutCurrent(expectedApp,expectedRoot,ticket,expectedData)) { return; }
+        for (int i = 0; i < data.Count; i = i + 1) {
+            PropSpec prop = data[i];
+            PropertyGridRow row = new PropertyGridRow();
+            row.index = i;
+            row.schema = this.SchemaOf(prop);
+            string value = prop.Read();
+            if (!this.LayoutCurrent(expectedApp,expectedRoot,ticket,expectedData)) { return; }
+            row.shadow = value;
+            row.root = new Control("property-row-" + Convert.ToString(i));
+            row.root.Tip = prop.tip;
+            row.label = new Label(prop.label);
+            row.reset = new Button { Icon = "refresh", Class = "tiny" };
+            row.minus = new Button("-").Small();
+            row.plus = new Button("+").Small();
+            row.group = new Button(prop.label).Small();
+            if (prop.kind == 5) { row.root.Add(row.group); }
+            else {
+                row.root.Add(row.label);
+                if (prop.kind == 2) {
+                    row.flag = new Switch(); row.flag.Size = "small";
+                    row.flag.SetOn(PropSpec.IsOn(row.shadow)); row.root.Add(row.flag);
+                } else if (prop.kind == 3) {
+                    row.pick = SelectBox.FromOptions(prop.options, "");
+                    row.pick.SetIndex(this.IndexOfValue(prop,row.shadow));
+                    for (int option = 0; option < prop.options.Count; option = option + 1) {
+                        row.segments.Add(new Button(prop.options[option]).Small());
+                    }
+                } else {
+                    row.text = new Input(""); row.text.SetText(row.shadow); row.root.Add(row.text);
+                }
+            }
+            rows.Add(row);
+        }
+        this.RefreshRows();
     }
 
     // 枚举值（可能存的是序号，也可能是选项文本）对应的选项下标。
@@ -211,61 +233,34 @@ public class PropertyGrid : Control {
         r.text.SetText(val);
     }
 
-    // 一行的双向同步：外部改动优先灌回编辑器，否则把编辑器的新值
-    // 写进模型并广播 Change。整数行在输入合法前不写。
-    // 提交时请求重绘：Change 经 Dispatcher 延迟到 UI 队列，若不保证
-    // 下一帧，即时模式下循环会空转，处理器不排空、预览慢半拍。
-    private void Sync(App app, int i) {
-        PropSpec p = data[i];
-        if (p.kind == 5 || !p.IsBound()) { return; }
-        PropertyGridRow r = rows[i];
-        string cur = p.Read();
-        if (cur != r.shadow) {
-            this.Load(i, cur);
-            r.shadow = cur;
-            return;
-        }
-        string ui = this.Editor(i);
-        if (ui == cur) { return; }
-        if (p.kind == 1 && !PropertyGrid.IsNumber(ui)) { return; }
-        if (this.BeforeChange != null) {
-            this.BeforeChange(p.key);
-        }
-        p.Write(ui);
-        r.shadow = p.Read();
-        // 颜色属性（kind 4）的模型是打包色，文档形态是十进制；用户
-        // 写的是 CSS 文本（"#rrggbb"）。不回灌编辑器的话，文本与
-        // 模型形态永远不等，每帧都会重写一次并广播改动。
-        if (p.kind == 4) { this.Load(i, r.shadow); }
-        hitRow = i;
-        Change.PostS(this);
-        app.RequestRedraw();
-    }
-
     // 整数属性的 -/+ 步进：按 spec 配置的步长增减、钳制到范围，
     // 直接写回模型与编辑器，并立即请求重绘，预览同帧跟新。
     private void Step(App app, int i, int delta) {
-        PropSpec p = data[i];
+        List<PropSpec> specs=data;
+        PropSpec p=specs[i];
         if (!p.IsBound()) { return; }
-        PropertyGridRow r = rows[i];
-        int cur = 0;
-        string readVal = p.Read();
-        if (PropertyGrid.IsNumber(readVal)) { cur = Convert.ToInt32(readVal); }
-        int nv = p.Clamp(cur + delta);
-        string s = Convert.ToString(nv);
-        if (this.BeforeChange != null) {
-            this.BeforeChange(p.key);
-        }
-        p.Write(s);
-        r.text.SetText(s);
-        r.shadow = p.Read();
-        hitRow = i;
-        Change.PostS(this);
-        app.RequestRedraw();
+        PropertyGridRow row=rows[i];
+        int binding=bindingEpoch;int epoch=row.epoch;
+        Control root=app!=null?app.rootControl:null;
+        string readVal=p.Read();
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
+        int cur=PropertyGrid.IsNumber(readVal)?Convert.ToInt32(readVal):0;
+        string value=Convert.ToString(p.Clamp(cur+delta));
+        if (BeforeChange!=null) { BeforeChange(p.key); }
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
+        p.Write(value);
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
+        string normalized=p.Read();
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
+        row.text.SetText(value);
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
+        row.shadow=normalized;
+        hitRow=i;Change.PostS(this);
+        if (app!=null) { app.RequestRedraw();this.PrepareRows(); }
     }
 
     // 该行是否需要"恢复默认值"入口（当前值与声明的默认值不同）。
-    private bool RowNeedsReset(int i) {
+    public bool RowNeedsReset(int i) {
         if (i < 0 || i >= data.Count) { return false; }
         PropSpec p = data[i];
         if (!p.hasDef) { return false; }
@@ -275,47 +270,25 @@ public class PropertyGrid : Control {
     // 把第 i 行复位到默认值（VS 的"恢复默认值"）：写回模型、
     // 同步编辑器、广播改动（经 BeforeChange 走撤销栈钩子）。
     public void ResetToDefault(int i) {
-        if (i < 0 || i >= data.Count) { return; }
-        PropSpec p = data[i];
-        if (!p.hasDef || !p.IsBound()) { return; }
-        if (this.BeforeChange != null) {
-            this.BeforeChange(p.key);
-        }
+        if (i<0||i>=data.Count||i>=rows.Count) { return; }
+        List<PropSpec> specs=data;
+        PropSpec p=specs[i];
+        if (!p.hasDef||!p.IsBound()) { return; }
+        PropertyGridRow row=rows[i];
+        int binding=bindingEpoch;int epoch=row.epoch;
+        App app=this.App;
+        Control root=app!=null?app.rootControl:null;
+        if (BeforeChange!=null) { BeforeChange(p.key); }
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
         p.Write(p.defVal);
-        if (i < rows.Count) {
-            this.Load(i, p.defVal);
-            rows[i].shadow = p.Read();
-        }
-        hitRow = i;
-        Change.PostS(this);
-    }
-
-    // 绘制期复位：写回模型并立即请求重绘（按钮随值复位而消失）。
-    private void Reset(App app, int i) {
-        this.ResetToDefault(i);
-        app.RequestRedraw();
-    }
-
-    // 画一个步进小按钮（方形，中间一个字符字形），注册命中区，
-    // 返回本帧是否被点击。
-    private bool StepBtn(App app, int id, int x, int y, int sz, string glyph,
-                 StyleBox normalStyle, StyleBox hoverStyle) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        app.hitTester.RegisterRect(id, x, y, sz, sz, 0);
-        int hv = Ui.HoverLevelMsIn(app, id, 0, x, y, sz, sz);
-        int state = Style.SNormal();
-        if (hv != 0) { state = Style.SHover(); }
-        StyleBox step = normalStyle;
-        if (state == Style.SHover()) { step = hoverStyle; }
-        c.FillRoundRect(x, y, sz, sz, t.borderRadiusSmall, step.BgOr(0));
-        c.DrawRoundRect(x, y, sz, sz, t.borderRadiusSmall,
-                        step.BorderOr(0), 1);
-        int fs = Style.FontFallback(app, "small");
-        int gw = Canvas.MeasureText(glyph, fs);
-        c.DrawText(x + (sz - gw) / 2, Canvas.CenterTextY(y, sz, fs),
-            glyph, step.FgOr(0), fs);
-        return Ui.Clicked(app, id);
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
+        string normalized=p.Read();
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
+        this.Load(i,p.defVal);
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
+        row.shadow=normalized;
+        hitRow=i;Change.PostS(this);
+        if (app!=null) { app.RequestRedraw();this.PrepareRows(); }
     }
 
     // 单行高度（逻辑像素，绘制时按 DPI 缩放）。
@@ -351,300 +324,354 @@ public class PropertyGrid : Control {
         return totalH;
     }
 
-    // 绘制单个属性项的标签与编辑器（支持全宽行或等分列单元格内排版）
-    private void RenderPropField(App app, Canvas c, Theme t, int i, int cx, int cy, int cw, int ch,
-                         int flabelW, int fs, StyleBox valueStyle, StyleBox accentStyle,
-                         StyleBox rowHoverStyle, StyleBox stepStyle, StyleBox stepHoverStyle) {
-        if (i < 0 || i >= data.Count || i >= rows.Count) { return; }
-        PropSpec p = data[i];
-        PropertyGridRow r = rows[i];
-        int ex = cx + flabelW;
-        int ew = cw - flabelW;
-        int eh = app.Scale(24);
-        int ey = cy + (ch - eh) / 2;
+    public override void OnMeasure(App app) { prefH = this.ContentHeight(app); }
 
-        // "恢复默认值"（VS 口径）：当前值与默认值不同的行才给复位入口，
-        // 画在属性名右侧——VS 的属性下拉箭头也在那个位置。
-        bool showReset = this.RowNeedsReset(i);
-        int resetSz = app.Scale(14);
-        int labelTextW = flabelW - t.gapSmall;
-        if (showReset) { labelTextW = labelTextW - resetSz - app.Scale(4); }
-        c.DrawText(cx, Canvas.CenterTextY(cy, ch, fs),
-            Ellipsis.Fit(p.label, labelTextW, fs),
-            valueStyle.FgOr(0), fs);
-        if (showReset) {
-            int rx = cx + flabelW - resetSz - app.Scale(2);
-            int ry = cy + (ch - resetSz) / 2;
-            app.hitTester.RegisterRect(r.resetId, rx, ry, resetSz, resetSz, 0);
-            if (Ui.Over(app, rx, ry, resetSz, resetSz)) {
-                c.FillRoundRect(rx - app.Scale(2), ry - app.Scale(2),
-                    resetSz + app.Scale(4), resetSz + app.Scale(4),
-                    app.Scale(3), rowHoverStyle.BgOr(0));
-            }
-            c.DrawGlyph("refresh", rx, ry, resetSz, valueStyle.FgOr(0));
-            if (Ui.Clicked(app, r.resetId)) { this.Reset(app, i); }
+    // Scratch implementation fragment: not applied or compiled.
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
+        return box;
+    }
+
+    private string SchemaOf(PropSpec p) {
+        string result = Convert.ToString(p.key.Length) + ":" + p.key
+            + "|" + Convert.ToString(p.alias.Length) + ":" + p.alias
+            + "|" + Convert.ToString(p.defaultBinding)
+            + "|" + Convert.ToString(p.label.Length) + ":" + p.label
+            + "|" + Convert.ToString(p.tip.Length) + ":" + p.tip
+            + "|" + Convert.ToString(p.defVal.Length) + ":" + p.defVal
+            + "|" + Convert.ToString(p.kind) + "|" + Convert.ToString(p.halfRow) + "|" + Convert.ToString(p.ValueKind())
+            + "|" + Convert.ToString(p.step) + "|" + Convert.ToString(p.lo) + "|" + Convert.ToString(p.hi)
+            + "|" + Convert.ToString(p.hasRange) + "|" + Convert.ToString(p.hasDef)
+            + "|" + Convert.ToString(p.syncName) + "|" + Convert.ToString(p.IsBound());
+        for (int i = 0; i < p.options.Count; i = i + 1) {
+            // Length prefix keeps literal separators in option labels unambiguous.
+            result = result + "|" + Convert.ToString(p.options[i].Length) + ":" + p.options[i];
         }
-        if (p.kind == 2) {
-            int swH = app.Scale(18);
-            int swY = cy + (ch - swH) / 2;
-            r.flag.MeasureTree(app);
-            r.flag.Arrange(ex, swY, r.flag.prefW > 0 ? r.flag.prefW : app.Scale(36), swH);
-            r.flag.RenderTree(app);
-        } else if (p.kind == 3) {
-            int optCount = p.options.Count;
-            bool useSegmented = optCount >= 2 && optCount <= 4 && !p.halfRow;
-            if (useSegmented) {
-                int segW = ew / optCount;
-                for (int si = 0; si < optCount; si = si + 1) {
-                    int tw = Canvas.MeasureText(p.options[si], fs);
-                    if (tw + app.Scale(16) > segW) {
-                        useSegmented = false;
-                        break;
-                    }
-                }
-                if (segW < app.Scale(24)) { useSegmented = false; }
-            }
+        return result;
+    }
 
-            if (useSegmented) {
-                int curIdx = r.pick.Value();
-                int segW = ew / optCount;
-                int br = app.Scale(4);
-                c.FillRoundRect(ex, ey, ew, eh, br, valueStyle.BgOr(0));
-                c.DrawRoundRect(ex, ey, ew, eh, br, valueStyle.BorderOr(0), 1);
-
-                for (int si = 0; si < optCount; si = si + 1) {
-                    int sx = ex + si * segW;
-                    int sw = (si == optCount - 1) ? (ex + ew - sx) : segW;
-                    bool isSel = (si == curIdx);
-                    bool segHover = Ui.Over(app, sx, ey, sw, eh);
-                    int segId = (si < r.pickSegIds.Count)
-                        ? r.pickSegIds[si] : WidgetId.Next();
-                    app.hitTester.RegisterRect(segId, sx, ey, sw, eh, 0);
-
-                    if (Ui.Clicked(app, segId)) {
-                        if (!isSel) {
-                            r.pick.SetIndex(si);
-                            if (this.BeforeChange != null) {
-                                this.BeforeChange(p.key);
-                            }
-                            p.Write(this.PickValue(p, si));
-                            r.shadow = p.Read();
-                            hitRow = i;
-                            Change.PostS(this);
-                            app.RequestRedraw();
-                        }
-                    }
-
-                    if (isSel) {
-                        int accBg = accentStyle.BgOr(t.primary);
-                        int accFg = accentStyle.FgOr(t.textInverse);
-                        c.FillRoundRect(sx + app.Scale(1), ey + app.Scale(1),
-                            sw - app.Scale(2), eh - app.Scale(2), app.Scale(3), accBg);
-                        int tw = Canvas.MeasureText(p.options[si], fs);
-                        c.DrawText(sx + (sw - tw) / 2, Canvas.CenterTextY(ey, eh, fs),
-                            p.options[si], accFg, fs);
-                    } else {
-                        if (segHover) {
-                            c.FillRoundRect(sx + app.Scale(1), ey + app.Scale(1),
-                                sw - app.Scale(2), eh - app.Scale(2), app.Scale(3), rowHoverStyle.BgOr(0));
-                        }
-                        int tw = Canvas.MeasureText(p.options[si], fs);
-                        c.DrawText(sx + (sw - tw) / 2, Canvas.CenterTextY(ey, eh, fs),
-                            p.options[si], valueStyle.FgOr(0), fs);
-                        if (si > 0 && !isSel && (si - 1 != curIdx)) {
-                            c.DrawLine(sx, ey + app.Scale(3), sx, ey + eh - app.Scale(3), valueStyle.BorderOr(0), 1);
-                        }
-                    }
-                }
-            } else {
-                r.pick.Arrange(ex, ey, ew, eh);
-                r.pick.RenderTree(app);
-            }
-        } else if (p.kind == 1) {
-            int gap = app.Scale(4);
-            int minStepW = (eh + gap) * 2 + app.Scale(32);
-            if (ew >= minStepW) {
-                int inW = ew - (eh + gap) * 2;
-                if (this.StepBtn(app, r.minusId, ex, ey, eh, "-",
-                        stepStyle, stepHoverStyle)) {
-                    this.Step(app, i, 0 - p.step);
-                }
-                r.text.Arrange(ex + eh + gap, ey, inW, eh);
-                r.text.RenderTree(app);
-                if (this.StepBtn(app, r.plusId, ex + ew - eh,
-                        ey, eh, "+", stepStyle, stepHoverStyle)) {
-                    this.Step(app, i, p.step);
-                }
-            } else {
-                r.text.Arrange(ex, ey, ew, eh);
-                r.text.RenderTree(app);
-            }
-        } else {
-            r.text.Arrange(ex, ey, ew, eh);
-            r.text.RenderTree(app);
+    private bool SameSchema(List<PropSpec> specs) {
+        if (specs == null || rows.Count != specs.Count) { return false; }
+        for (int i = 0; i < specs.Count; i = i + 1) {
+            if (rows[i].schema != this.SchemaOf(specs[i])) { return false; }
         }
-        this.Sync(app, i);
-        if (p.tip != "" && Ui.Over(app, cx, cy, cw, ch)) {
-            Tooltip.RequestBox(app, cx, cy, cw, ch, p.tip,
-                Tooltip.Left(), app.Scale(240));
+        return true;
+    }
+
+    private bool CurrentRow(PropertyGridRow row, int binding, int epoch) {
+        return row != null && bindingEpoch == binding && row.epoch == epoch
+            && row.index >= 0 && row.index < rows.Count && rows[row.index] == row;
+    }
+
+    // Layout snapshots include host/root/spec-list identity: same-schema Bind
+    // and cross-App adoption need not advance bindingEpoch.
+    private bool LayoutCurrent(App app, Control root, int binding, List<PropSpec> specs) {
+        return this.App == app && (app == null || app.rootControl == root)
+            && bindingEpoch == binding && data == specs;
+    }
+
+    private bool LayoutRow(App app, Control root, int binding, List<PropSpec> specs, PropertyGridRow row, int epoch) {
+        return this.LayoutCurrent(app,root,binding,specs) && this.CurrentRow(row,binding,epoch)
+            && row.root.parent == this && row.root.App == app;
+    }
+
+    // Public Reset may run off-tree, but every callback must preserve the
+    // exact model, host/root and row from the start of this operation.
+    private bool CanCommitRow(PropertyGridRow row, int binding, int epoch, App expectedApp, Control expectedRoot, List<PropSpec> specs, PropSpec prop) {
+        if (!this.LayoutCurrent(expectedApp,expectedRoot,binding,specs)
+            || !this.CurrentRow(row,binding,epoch) || row.index >= specs.Count || specs[row.index] != prop) { return false; }
+        if (expectedRoot == null || !expectedRoot.ContainsInputControl(this)) { return true; }
+        return row.root.parent == this && row.root.App == expectedApp
+            && this.StyleVisible() && !this.IsDisabled();
+    }
+
+    private void CloseRowPicker(PropertyGridRow row) {
+        App app = this.App;
+        if (row.pick == null || app == null || app.overlayHost == null) { return; }
+        if (app.overlayHost.IsAnchorActive(row.pick)) {
+            Control popup = app.overlayHost.ActiveRoot();
+            if (popup != null) { app.overlayHost.Hide(popup); }
         }
     }
 
-    // 布局测量：首选高度 = 全部行高之和。
-    public override void OnMeasure(App app) {
-        app = this.ResolveApp(app);
-        prefH = this.ContentHeight(app);
+    private void RetireRow(PropertyGridRow row) {
+        if (row == null || row.root == null || row.root.parent != this) { return; }
+        App app=this.App;
+        Control root=app!=null?app.rootControl:null;
+        List<PropSpec> specs=data;
+        int binding=bindingEpoch;
+        Control rowRoot=row.root;
+        int epoch=row.epoch;
+        this.CloseRowPicker(row);
+        // Scroll retirement may synchronously move/rebind this same row during
+        // popup Cancel. Only the original session may remove its root.
+        if (!this.LayoutCurrent(app,root,binding,specs) || row.epoch!=epoch
+            || row.root!=rowRoot || rowRoot.App!=app || rowRoot.parent!=this) { return; }
+        row.epoch=row.epoch+1;
+        this.Remove(rowRoot);
     }
 
-    // 绘制：处理滚轮并钳制滚动偏移，逐行画标签与编辑器
-    // （整数行带 -/+ 步进按钮），每行做一次双向同步；
-    // 悬停行有说明时请求气泡提示，内容溢出时画纵向滚动条。
-    public override void OnPaint(App app) {
-        app = this.ResolveApp(app);
+    private void WireRow(PropertyGridRow row) {
+        row.epoch = row.epoch + 1;
+        if (row.text != null) {
+            row.text.Change.Clear();
+            row.text.Change.Add(new PropertyGridAction(this,row,bindingEpoch,row.epoch,0,0).Invoke);
+        }
+        if (row.flag != null) {
+            row.flag.Change.Clear();
+            row.flag.Change.Add(new PropertyGridAction(this,row,bindingEpoch,row.epoch,0,0).Invoke);
+        }
+        if (row.pick != null) {
+            row.pick.Change.Clear();
+            row.pick.Change.Add(new PropertyGridAction(this,row,bindingEpoch,row.epoch,0,0).Invoke);
+        }
+        row.reset.Click.Clear();
+        row.reset.Click.Add(new PropertyGridAction(this,row,bindingEpoch,row.epoch,1,0).Invoke);
+        row.minus.Click.Clear();
+        row.minus.Click.Add(new PropertyGridAction(this,row,bindingEpoch,row.epoch,2,-1).Invoke);
+        row.plus.Click.Clear();
+        row.plus.Click.Add(new PropertyGridAction(this,row,bindingEpoch,row.epoch,2,1).Invoke);
+        row.group.Click.Clear();
+        row.group.Click.Add(new PropertyGridAction(this,row,bindingEpoch,row.epoch,3,0).Invoke);
+        for (int i = 0; i < row.segments.Count; i = i + 1) {
+            row.segments[i].Click.Clear();
+            row.segments[i].Click.Add(new PropertyGridAction(this,row,bindingEpoch,row.epoch,4,i).Invoke);
+        }
+    }
+
+    public void ApplyRowAction(PropertyGridRow row, int binding, int epoch, int action, int argument) {
+        if (!this.CurrentRow(row,binding,epoch) || row.root.parent != this || this.IsDisabled() || !this.StyleVisible()) { return; }
+        App app = this.App;
         if (app == null) { return; }
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int fs = Style.FontFallback(app, "small");
-        StyleBox emptyStyle = Style.Part(app, "propertygrid", "empty", "",
-                                         "", "", Style.SNormal());
-        StyleBox sectionStyle = Style.Part(app, "propertygrid", "section", "",
-                                           "", "", Style.SNormal());
-        StyleBox sectionHoverStyle = Style.Part(app, "propertygrid", "section", "",
-                                                "", "", Style.SHover());
-        StyleBox rowHoverStyle = Style.Part(app, "propertygrid", "row", "",
-                                            "", "", Style.SHover());
-        StyleBox accentStyle = Style.Part(app, "propertygrid", "accent", "",
-                                          "", "", Style.SNormal());
-        StyleBox labelStyle = Style.Part(app, "propertygrid", "label", "",
-                                         "", "", Style.SNormal());
-        StyleBox valueStyle = Style.Part(app, "propertygrid", "value", "",
-                                         "", "", Style.SNormal());
-        StyleBox stepStyle = Style.Part(app, "propertygrid", "step", "",
-                                        "", "", Style.SNormal());
-        StyleBox stepHoverStyle = Style.Part(app, "propertygrid", "step", "",
-                                             "", "", Style.SHover());
-        if (data.Count == 0) {
-            if (Empty != "") {
-                c.DrawText(bx, by + t.paddingSmall, Ellipsis.Fit(Empty, bw, fs),
-                    emptyStyle.FgOr(0), fs);
-            }
-            return;
+        Control root = app.rootControl;
+        if (root == null || !root.ContainsInputControl(this)) { return; }
+        int index = row.index;
+        PropSpec prop = data[index];
+        if (action == 3) { this.ToggleSection(prop.label); return; }
+        if (!prop.IsBound()) { return; }
+        if (action == 1) { this.ResetToDefault(index); return; }
+        if (action == 2) { this.Step(app,index,argument * prop.step); return; }
+        if (action == 4) {
+            if (argument == row.pick.Value()) { return; }
+            row.pick.SetIndex(argument);
         }
-        int rowH = this.RowHeight(app);
-        int contentH = this.ContentHeight(app);
-        Scrollbar.HandleWheel(app, bx, by, bw, bh, contentH, scroll);
-        int maxOff = contentH - bh;
-        if (maxOff < 0) { maxOff = 0; }
-        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
-        if (scroll.Get() < 0) { scroll.Set(0); }
-        bool overflow = contentH > bh;
-        int barW = app.Scale(6);
-        int rowW = bw;
-        if (overflow) { rowW = bw - barW; }
-        int labelW = 0;
-        if (LabelWidth > 0) {
-            labelW = app.Scale(LabelWidth);
+        this.SubmitRow(app,index,binding,epoch);
+    }
+
+    private void ReloadExternal() {
+        App app=this.App;
+        Control root=app!=null?app.rootControl:null;
+        int ticket=bindingEpoch;
+        List<PropSpec> specs=data;
+        for (int i=0;i<specs.Count&&i<rows.Count;i=i+1) {
+            PropSpec prop=specs[i];
+            PropertyGridRow row=rows[i];
+            int epoch=row.epoch;
+            if (prop.kind==5||!prop.IsBound()) { continue; }
+            string current=prop.Read();
+            if (!this.LayoutCurrent(app,root,ticket,specs)||!this.CurrentRow(row,ticket,epoch)) { return; }
+            if (current!=row.shadow) {
+                this.Load(i,current);
+                if (!this.LayoutCurrent(app,root,ticket,specs)||!this.CurrentRow(row,ticket,epoch)) { return; }
+                row.shadow=current;
+            }
+        }
+    }
+
+    private void SubmitRow(App app, int index, int binding, int epoch) {
+        List<PropSpec> specs=data;
+        PropSpec prop=specs[index];
+        PropertyGridRow row=rows[index];
+        Control root=app.rootControl;
+        string current=prop.Read();
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,prop)) { return; }
+        // External update wins without a new user notification.
+        if (current!=row.shadow) {
+            this.Load(index,current);
+            if (!this.CanCommitRow(row,binding,epoch,app,root,specs,prop)) { return; }
+            row.shadow=current;return;
+        }
+        string value=this.Editor(index);
+        if (value==current || (prop.kind==1&&!PropertyGrid.IsNumber(value))) { return; }
+        if (BeforeChange!=null) { BeforeChange(prop.key); }
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,prop)) { return; }
+        prop.Write(value);
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,prop)) { return; }
+        string normalized=prop.Read();
+        if (!this.CanCommitRow(row,binding,epoch,app,root,specs,prop)) { return; }
+        if (prop.kind==4) {
+            this.Load(index,normalized);
+            if (!this.CanCommitRow(row,binding,epoch,app,root,specs,prop)) { return; }
+        }
+        row.shadow=normalized;
+        hitRow=index;
+        Change.PostS(this);
+        app.RequestRedraw();this.PrepareRows();
+    }
+
+    public override void OnScrollChanged() { this.PrepareRows(); }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx=x; by=y; bw=w>0?w:0; bh=h>0?h:0;
+        App app=this.App;
+        Control root=app!=null?app.rootControl:null;
+        int ticket=bindingEpoch;
+        List<PropSpec> specs=data;
+        this.ReloadExternal();
+        if (!this.LayoutCurrent(app,root,ticket,specs)) { return; }
+        Rect view = this.ScrollViewport();
+        scrollExtent = this.ContentHeight(this.App);
+        scrollExtentX = view.width;
+        int maximum = scrollExtent-view.height;
+        if (maximum<0) { maximum=0; }
+        int next=this.ScrollTop();
+        if (next>maximum) { next=maximum; }
+        if (next<0) { next=0; }
+        this.SetScrollTop(next);
+        if (!this.LayoutCurrent(app,root,ticket,specs)) { return; }
+        this.PrepareRows();
+    }
+
+    private void AdoptPart(PropertyGridRow row, Control part, bool wanted, App app, Control root, int ticket, List<PropSpec> specs, int epoch) {
+        if (part == null) { return; }
+        if (wanted && part.parent != row.root) { row.root.Add(part); }
+        else if (!wanted && part.parent == row.root) {
+            if (part == row.pick) { this.CloseRowPicker(row); }
+            if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+            if (part.parent == row.root) { row.root.Remove(part); }
+        }
+    }
+
+    private void ArrangeField(PropertyGridRow row, int x, int y, int w, int h, int labelW, App app, Control root, int ticket, List<PropSpec> specs, int epoch) {
+        PropSpec prop=data[row.index];
+        int editorH=app.Scale(24);
+        int editorY=y+(h-editorH)/2;
+        int editorX=x+labelW;
+        int editorW=w-labelW;
+        bool reset=this.RowNeedsReset(row.index); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+        int resetW=app.Scale(18);
+        row.label.Text=prop.label;
+        row.label.Tip=prop.tip;
+        row.label.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+        row.label.Arrange(x,y,labelW-(reset?resetW:0)-app.Scale(4),h); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+        this.AdoptPart(row,row.reset,reset,app,root,ticket,specs,epoch); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+        if (reset) { row.reset.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; } row.reset.Arrange(x+labelW-resetW-app.Scale(2),editorY,resetW,editorH); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; } }
+        if (prop.kind==2) {
+            row.flag.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+            row.flag.Arrange(editorX,y+(h-app.Scale(18))/2,row.flag.prefW>0?row.flag.prefW:app.Scale(36),app.Scale(18)); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+        } else if (prop.kind==3) {
+            int count=prop.options.Count;
+            bool segmented=count>=2&&count<=4&&!prop.halfRow;
+            int partW=count>0?editorW/count:0;
+            int font=Style.FontFallback(app,"small");
+            for (int i=0;i<count&&segmented;i=i+1) {
+                if (Canvas.MeasureText(prop.options[i],font)+app.Scale(16)>partW || partW<app.Scale(24)) { segmented=false; }
+            }
+            this.AdoptPart(row,row.pick,!segmented,app,root,ticket,specs,epoch); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+            for (int i=0;i<row.segments.Count;i=i+1) {
+                Button button=row.segments[i];
+                this.AdoptPart(row,button,segmented,app,root,ticket,specs,epoch); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                if (segmented) {
+                    button.Checked=i==row.pick.Value();
+                    button.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                    button.Arrange(editorX+i*partW,editorY,i==count-1?editorW-i*partW:partW,editorH); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                }
+            }
+            if (!segmented) { row.pick.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; } row.pick.Arrange(editorX,editorY,editorW,editorH); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; } }
         } else {
-            int maxNeed = 0;
-            for (int li = 0; li < data.Count; li = li + 1) {
-                if (data[li].kind != 5 && data[li].label != "") {
-                    int lw = Canvas.MeasureText(data[li].label, fs);
-                    if (lw > maxNeed) { maxNeed = lw; }
-                }
+            int gap=app.Scale(4);
+            bool step=prop.kind==1&&editorW>=(editorH+gap)*2+app.Scale(32);
+            this.AdoptPart(row,row.minus,step,app,root,ticket,specs,epoch); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; } this.AdoptPart(row,row.plus,step,app,root,ticket,specs,epoch); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+            int textX=editorX; int textW=editorW;
+            if (step) {
+                row.minus.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; } row.plus.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                row.minus.Arrange(editorX,editorY,editorH,editorH); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                row.plus.Arrange(editorX+editorW-editorH,editorY,editorH,editorH); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                textX=textX+editorH+gap; textW=textW-(editorH+gap)*2;
             }
-            maxNeed = maxNeed + t.gapSmall * 2;
-            int minW = app.Scale(110);
-            int maxW = rowW * 52 / 100;
-            labelW = maxNeed;
-            if (labelW < minW) { labelW = minW; }
-            if (labelW > maxW) { labelW = maxW; }
+            row.text.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; } row.text.Arrange(textX,editorY,textW>0?textW:0,editorH); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
         }
-        if (rowW - labelW < app.Scale(60)) { labelW = rowW - app.Scale(60); }
-        if (labelW < app.Scale(40)) { labelW = app.Scale(40); }
-        int y = by - scroll.Get();
+    }
 
-        c.PushClip(bx, by, bw, bh);
-        string curSec = "";
-        bool curCollapsed = false;
-        for (int i = 0; i < data.Count; i = i + 1) {
-            PropSpec p = data[i];
-            if (p.kind == 5) {
-                curSec = p.label;
-                curCollapsed = this.IsSectionCollapsed(curSec);
-            } else {
-                if (curCollapsed) {
-                    continue;
+    private void PrepareRows() {
+        App app=this.App;
+        if (app==null||preparingRows) { return; }
+        preparingRows=true;
+        int ticket=bindingEpoch;
+        Control root=app.rootControl;
+        List<PropSpec> specs=data;
+        try {
+            Rect view=this.ScrollViewport();
+            int rowH=this.RowHeight(app);
+            int rowW=view.width-(scrollExtent>view.height?app.Scale(6):0);
+            int font=Style.FontFallback(app,"small");
+            int labelW=LabelWidth>0?app.Scale(LabelWidth):app.Scale(110);
+            if (LabelWidth<=0) {
+                for (int i=0;i<data.Count;i=i+1) {
+                    int need=Canvas.MeasureText(data[i].label,font)+app.theme.gapSmall*2;
+                    if (need>labelW) { labelW=need; }
                 }
+                if (labelW>rowW*52/100) { labelW=rowW*52/100; }
             }
-
-            bool onscreen = y + rowH > by && y < by + bh;
-            if (onscreen) {
-                bool rowHover = Ui.Over(app, bx, y, rowW, rowH)
-                    && app.mouseY >= by && app.mouseY < by + bh;
-                if (rowHover && p.kind != 5) {
-                    c.FillRoundRect(bx, y, rowW, rowH, app.Scale(4), rowHoverStyle.BgOr(0));
+            if (rowW-labelW<app.Scale(60)) { labelW=rowW-app.Scale(60); }
+            if (labelW<app.Scale(40)) { labelW=app.Scale(40); }
+            int y=view.y-this.ScrollTop();
+            bool collapsed=false;
+            for (int i=0;i<data.Count&&i<rows.Count;i=i+1) {
+                PropSpec prop=data[i];
+                if (prop.kind==5) { collapsed=this.IsSectionCollapsed(prop.label); }
+                bool visible=(prop.kind==5||!collapsed)&&y+rowH>view.y&&y<view.y+view.height&&this.StyleVisible();
+                bool pair=prop.kind!=5&&prop.halfRow&&i+1<data.Count&&data[i+1].halfRow&&data[i+1].kind!=5;
+                int cells=pair?2:1;
+                for (int column=0;column<cells;column=column+1) {
+                    PropertyGridRow row=rows[i+column];
+                    if (!visible) { this.RetireRow(row); }
+                    else {
+                        bool attach=row.root.parent!=this;
+                        if (attach) { this.WireRow(row); }
+                        int epoch=row.epoch;
+                        if (attach) { this.Add(row.root); }
+                        if (!this.LayoutCurrent(app,root,ticket,specs)) { return; }
+                        if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                        int gap=pair?app.Scale(6):0;
+                        int cellW=pair?(rowW-gap)/2:rowW;
+                        int cellX=view.x+column*(cellW+gap);
+                        row.root.Arrange(cellX,y,cellW,rowH);
+                        if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                        if (prop.kind==5) {
+                            row.group.Text=prop.label;
+                            row.group.Icon=collapsed?"chevron-right":"chevron-down";
+                            row.group.MeasureTree(app);
+                            if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                            row.group.Arrange(cellX,y+(rowH-app.Scale(24))/2,cellW,app.Scale(24));
+                        } else {
+                            int cellLabel=labelW;
+                            if (pair) {
+                                cellLabel=Canvas.MeasureText(data[i+column].label,font)+app.Scale(6);
+                                if (cellLabel>cellW*45/100) { cellLabel=cellW*45/100; }
+                                if (cellLabel<app.Scale(20)) { cellLabel=app.Scale(20); }
+                            }
+                            this.ArrangeField(row,cellX,y,cellW,rowH,cellLabel,app,root,ticket,specs,epoch);
+                        }
+                        if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
+                    }
+                    if (!this.LayoutCurrent(app,root,ticket,specs)) { return; }
                 }
-                if (p.kind == 5) {
-                    int secBarH = app.Scale(24);
-                    int secY = y + (rowH - secBarH) / 2;
-                    bool secHover = Ui.Over(app, bx, secY, rowW, secBarH)
-                        && app.mouseY >= by && app.mouseY < by + bh;
-                    if (secHover) {
-                        c.FillRoundRect(bx, secY, rowW, secBarH, app.Scale(3), sectionHoverStyle.BgOr(0));
-                    } else {
-                        c.FillRoundRect(bx, secY, rowW, secBarH, app.Scale(3), sectionStyle.BgOr(0));
-                    }
-                    c.DrawRoundRect(bx, secY, rowW, secBarH, app.Scale(3), sectionStyle.BorderOr(0), 1);
-                    if (Ui.ClickedIn(app, bx, secY, rowW, secBarH)) {
-                        this.ToggleSection(curSec);
-                        app.RequestRedraw();
-                    }
-                    int indW = app.Scale(3);
-                    int indH = app.Scale(12);
-                    int indY = secY + (secBarH - indH) / 2;
-                    c.FillRoundRect(bx + app.Scale(6), indY, indW, indH, app.Scale(1), accentStyle.BgOr(sectionStyle.FgOr(0)));
-                    int arrowSz = app.Scale(12);
-                    int arrowX = bx + app.Scale(13);
-                    int arrowY = secY + (secBarH - arrowSz) / 2;
-                    c.DrawGlyphIn(curCollapsed ? "chevron-right" : "chevron-down",
-                        arrowX, arrowY, arrowSz, arrowSz, arrowSz, sectionStyle.FgOr(0));
-                    c.DrawText(bx + app.Scale(28), Canvas.CenterTextY(secY, secBarH, fs),
-                        Ellipsis.Fit(p.label, rowW - app.Scale(38), fs), sectionStyle.FgOr(0), fs);
-                } else {
-                    bool isPair = p.halfRow && (i + 1 < data.Count) && data[i + 1].halfRow && data[i + 1].kind != 5;
-                    if (isPair) {
-                        int pGap = app.Scale(6);
-                        int colW = (rowW - pGap) / 2;
-                        PropSpec p2 = data[i + 1];
-
-                        int lW1 = Canvas.MeasureText(p.label, fs) + app.Scale(6);
-                        if (lW1 > colW * 45 / 100) { lW1 = colW * 45 / 100; }
-                        if (lW1 < app.Scale(20)) { lW1 = app.Scale(20); }
-
-                        int lW2 = Canvas.MeasureText(p2.label, fs) + app.Scale(6);
-                        if (lW2 > colW * 45 / 100) { lW2 = colW * 45 / 100; }
-                        if (lW2 < app.Scale(20)) { lW2 = app.Scale(20); }
-
-                        this.RenderPropField(app, c, t, i, bx, y, colW, rowH, lW1, fs,
-                            valueStyle, accentStyle, rowHoverStyle, stepStyle, stepHoverStyle);
-
-                        this.RenderPropField(app, c, t, i + 1, bx + colW + pGap, y, colW, rowH, lW2, fs,
-                            valueStyle, accentStyle, rowHoverStyle, stepStyle, stepHoverStyle);
-
-                        i = i + 1;
-                    } else {
-                        this.RenderPropField(app, c, t, i, bx, y, rowW, rowH, labelW, fs,
-                            valueStyle, accentStyle, rowHoverStyle, stepStyle, stepHoverStyle);
-                    }
-                }
+                if (prop.kind==5||!collapsed) { y=y+rowH; }
+                if (pair) { i=i+1; }
             }
-            y = y + rowH;
+        } finally {
+            preparingRows=false;
+            if (this.App==app&&app.rootControl==root&&(bindingEpoch!=ticket||data!=specs)) { this.RefreshRows(); }
         }
-        c.PopClip();
+    }
 
-        if (overflow) {
-            Scrollbar.RenderVerticalScrollIn(app, bx + bw - barW, by, bh, bh,
-                contentH, scroll, bx, by, bw, bh);
+    public override void OnPaint(App app) {
+        if (data.Count==0 && Empty!="") {
+            StyleBox empty=this.ResolvePartAs(app,"propertygrid","empty","","",Style.SNormal());
+            int font=Style.FontFallback(app,"small");
+            app.canvas.DrawText(bx,by+app.theme.paddingSmall,Ellipsis.Fit(Empty,bw,font),empty.FgOr(0),font);
         }
     }
 

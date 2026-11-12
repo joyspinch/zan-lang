@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Json;
 using Gui;
-using Gui.Widget;
 
 namespace Gui;
 
@@ -24,6 +23,7 @@ public partial class ModelBinder {
     Control root;
     object model;
     HandlerRegistry handlers;
+    List<ModelBindingAction> wiredActions;
     // 宿主 App（可空）：AutoLink 扫描与 .lazy 绑定的获焦判定都要它。
     App app;
     // 绑定快照旁表：SyncFromNode 记录"模型侧确认的控件值"，
@@ -61,9 +61,17 @@ public partial class ModelBinder {
 
     // 挂树与模型。支持 POCO 强类型实体、JsonDoc 以及 JsonValue。
     public void SetRoot(Control tree, object m) {
+        if (this.root != tree || this.model != m) {
+            HandlerRegistry registry = this.handlers;
+            App host = this.app;
+            this.Detach();
+            this.handlers = registry;
+            this.app = host;
+        }
         this.root = tree;
         this.model = m;
         this.dirty = true;
+        this.syncedOnce = false;
         if (this.handlers == null) { this.handlers = new HandlerRegistry(); }
     }
 
@@ -73,6 +81,15 @@ public partial class ModelBinder {
 
     // 破环解绑：清空内部控件引用与展开节点，杜绝 ARC 闭包循环引用泄漏。
     public void Detach() {
+        if (this.wiredActions != null) {
+            for (int i = 0; i < this.wiredActions.Count; i = i + 1) {
+                this.wiredActions[i].active = false;
+            }
+            this.wiredActions.Clear();
+            this.wiredActions = null;
+        }
+        this.syncedOnce = false;
+        this.dirty = true;
         if (this.expandedRows != null) {
             for (int i = this.expandedRows.Count - 1; i >= 0; i = i - 1) {
                 Control row = this.expandedRows[i].rowRoot;
@@ -134,6 +151,13 @@ public partial class ModelBinder {
         this.handlers.SetSender(name, a);
     }
 
+    // Explicit registrations take precedence over reflected document handlers.
+    public bool HasHandler(string name) {
+        return this.handlers != null && (this.handlers.Get(name) != null
+            || this.handlers.GetArg(name) != null || this.handlers.GetSender(name) != null
+            || this.handlers.GetItem(name) != null);
+    }
+
     // 接线：解析事件声明 + 登记模板原型 + 首帧同步。
     public void Wire() {
         if (this.root == null) { return; }
@@ -147,52 +171,50 @@ public partial class ModelBinder {
         for (int i = 0; i < c.events.Count; i = i + 1) {
             string evt = c.events[i].key;
             string hname = c.events[i].val;
-            if (hname == "" || this.handlers == null) { continue; }
-            ControlItemEvent ia = this.handlers.GetItem(hname);
-            if (ia != null) {
-                Control sc = c;
-                c.BindEvent(evt, () => {
-                    ia(sc, sc.item);
-                    this.MarkDirty();
-                    if (this.app != null) { this.app.RequestRedraw(); this.app.Wake(); }
-                });
+            if (this.wiredActions == null) { this.wiredActions = new List<ModelBindingAction>(); }
+            ModelBindingAction found = null;
+            for (int k = 0; k < this.wiredActions.Count; k = k + 1) {
+                ModelBindingAction candidate = this.wiredActions[k];
+                if (candidate.control == c && candidate.evt == evt) { found = candidate; break; }
+            }
+            if (found != null) {
+                found.hname = hname;
+                found.arg = c.handlerArg;
                 continue;
             }
-            ControlEvent sa = this.handlers.GetSender(hname);
-            if (sa != null) {
-                Control sc = c;
-                c.BindEvent(evt, () => {
-                    sa(sc);
-                    this.MarkDirty();
-                    if (this.app != null) { this.app.RequestRedraw(); this.app.Wake(); }
-                });
-                continue;
-            }
-            if (c.handlerArg != "") {
-                Action<string> aa = this.handlers.GetArg(hname);
-                if (aa != null) {
-                    string arg = c.handlerArg;
-                    c.BindEvent(evt, () => {
-                        aa(arg);
-                        this.MarkDirty();
-                        if (this.app != null) { this.app.RequestRedraw(); this.app.Wake(); }
-                    });
-                    continue;
-                }
-            }
-            Action a = this.handlers.Get(hname);
-            if (a != null) {
-                c.BindEvent(evt, () => {
-                    a();
-                    this.MarkDirty();
-                    if (this.app != null) { this.app.RequestRedraw(); this.app.Wake(); }
-                });
-            }
+            if (hname == "") { continue; }
+            ModelBindingAction action = new ModelBindingAction();
+            action.binder = this;
+            action.control = c;
+            action.evt = evt;
+            action.hname = hname;
+            action.arg = c.handlerArg;
+            action.active = true;
+            this.wiredActions.Add(action);
+            c.BindEvent(evt, () => { action.Run(); });
         }
         App.AutoLinkTree(c, this.app);
         for (int j = 0; j < c.children.Count; j = j + 1) {
             this.WireNode(c.children[j]);
         }
+    }
+
+    // Resolve registrations at dispatch time; subscriptions retain only a weak token.
+    void InvokeBindingAction(ModelBindingAction token) {
+        Control c = token.control;
+        if (!token.active || c == null || this.handlers == null || token.hname == "") { return; }
+        ControlItemEvent itemAction = this.handlers.GetItem(token.hname);
+        ControlEvent senderAction = this.handlers.GetSender(token.hname);
+        Action<string> argAction = this.handlers.GetArg(token.hname);
+        Action plainAction = this.handlers.Get(token.hname);
+        if (itemAction != null) { itemAction(c, c.item); }
+        else if (senderAction != null) { senderAction(c); }
+        else if (token.arg != "" && argAction != null) { argAction(token.arg); }
+        else if (plainAction != null) { plainAction(); }
+        else { return; }
+        if (!token.active) { return; }
+        this.MarkDirty();
+        if (this.app != null) { this.app.RequestRedraw(); this.app.Wake(); }
     }
 
     // 把绑定的状态实体值推入每个声明了 `bind` 路径的控件（state -> UI）。
@@ -253,12 +275,7 @@ public partial class ModelBinder {
             string s = "";
             bool hasVal = this.TryResolveString(c, c.bindPath, out s);
             if (hasVal) {
-                string prop = c.bindProp;
-                if (prop == "") {
-                    prop = "value";
-                    // 展示型控件没有 value 语义：文本落 text。
-                    if (c is Element || c is Typography || c is Label) { prop = "text"; }
-                }
+                string prop = this.BoundProperty(c);
                 string cur = this.BoundValue(c);
                 if (!this.HasSnapshot(c) || cur == this.SnapshotOf(c)) {
                     if (c.GetProp(prop) != s) { c.SetProp(prop, s); }
@@ -427,10 +444,32 @@ public partial class ModelBinder {
             return false;
         }
 
+        if (scope is Dictionary<string, double>) {
+            Dictionary<string, double> dict = (Dictionary<string, double>)scope;
+            if (!dict.ContainsKey(actualPath)) { return false; }
+            result = Convert.ToString(dict[actualPath]);
+            return true;
+        }
+        if (scope is Dictionary<string, bool>) {
+            Dictionary<string, bool> dict = (Dictionary<string, bool>)scope;
+            if (!dict.ContainsKey(actualPath)) { return false; }
+            result = PropSpec.Flag(dict[actualPath]);
+            return true;
+        }
+
         // POCO 强类型实体反射（支持点号级联导航如 user.addr.city）
         string leaf = "";
         object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
         if (target != null && target.HasField(leaf)) {
+            int valueKind = ModelBinder.FieldValueKind(target, leaf);
+            if (valueKind == 1) {
+                result = Convert.ToString(target.GetFieldDouble(leaf));
+                return true;
+            }
+            if (valueKind == 2) {
+                result = PropSpec.Flag(target.GetFieldBool(leaf));
+                return true;
+            }
             result = target.GetFieldString(leaf);
             if (result == "") {
                 // 集合字段（:options="names" 绑 List<string>、JsonValue 数组）
@@ -535,15 +574,13 @@ public partial class ModelBinder {
             Dictionary<string, string> sdict = (Dictionary<string, string>)scope;
             if (sdict.ContainsKey(actualPath)) {
                 string sv = sdict[actualPath];
-                result = sv != "" ? sv.ToDouble() : 0.0;
-                return true;
+                return double.TryParse(sv, out result);
             }
             if (scope != this.model && this.model != null && this.model is Dictionary<string, string>) {
                 Dictionary<string, string> msdict = (Dictionary<string, string>)this.model;
                 if (msdict.ContainsKey(path)) {
                     string msv = msdict[path];
-                    result = msv != "" ? msv.ToDouble() : 0.0;
-                    return true;
+                    return double.TryParse(msv, out result);
                 }
             }
             return false;
@@ -552,16 +589,22 @@ public partial class ModelBinder {
         string leaf = "";
         object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
         if (target != null && target.HasField(leaf)) {
-            result = target.GetFieldDouble(leaf);
-            return true;
+            if (ModelBinder.FieldValueKind(target, leaf) == 1) {
+                result = target.GetFieldDouble(leaf);
+                return true;
+            }
+            return double.TryParse(target.GetFieldString(leaf), out result);
         }
 
         if (scope != this.model && this.model != null) {
             string mleaf = "";
             object mtarget = ModelBinder.ResolveFieldScope(this.model, path, out mleaf);
             if (mtarget != null && mtarget.HasField(mleaf)) {
-                result = mtarget.GetFieldDouble(mleaf);
-                return true;
+                if (ModelBinder.FieldValueKind(mtarget, mleaf) == 1) {
+                    result = mtarget.GetFieldDouble(mleaf);
+                    return true;
+                }
+                return double.TryParse(mtarget.GetFieldString(mleaf), out result);
             }
         }
         return false;
@@ -696,23 +739,69 @@ public partial class ModelBinder {
         return false;
     }
 
-    // 控件绑定属性的当前值：显式 bindProp 优先，否则取 value、再取 text。
-    string BoundValue(Control c) {
-        if (c.bindProp != "") { return c.GetProp(c.bindProp); }
-        string k = c.Kind();
-        if (k == "SelectBox") {
-            double numVal = 0.0;
-            if (this.TryResolveDouble(c, c.bindPath, out numVal)) {
-                return c.GetProp("value");
-            }
-            string sv = c.GetProp("selectedValue");
-            if (sv != "") { return sv; }
-            string txt = c.GetProp("text");
-            if (txt != "") { return txt; }
+    // 转换成功不代表模型字段是数字（例如字符串选项键 "0"）。
+    static int FieldValueKind(object target, string leaf) {
+        TypeInfo type = target.GetType();
+        for (int i = 0; i < type.FieldCount; i = i + 1) {
+            if (type.GetFieldName(i) != leaf) { continue; }
+            string name = type.GetFieldType(i);
+            if (name == "bool") { return 2; }
+            if (name == "int" || name == "long" || name == "double"
+                || name == "float" || name == "byte" || name == "short"
+                || name == "uint" || name == "ulong" || name == "ushort") { return 1; }
+            return 0;
         }
-        string s = c.GetProp("value");
-        if (s == "") { s = c.GetProp("text"); }
-        return s;
+        return 0;
+    }
+
+    int ModelValueKind(Control c) {
+        object scope = this.ScopeItemOf(c);
+        if (scope == null) { return 0; }
+        string path = ModelBinder.StripAlias(c.bindPath, this.ScopeAliasOf(c));
+        if (scope is JsonValue) {
+            JsonValue v = ((JsonValue)scope).PathGet(path);
+            if (v == null && scope != this.model && this.model is JsonValue) {
+                v = ((JsonValue)this.model).PathGet(c.bindPath);
+            }
+            if (v != null && v.IsNumber()) { return 1; }
+            if (v != null && v.IsBool()) { return 2; }
+            return 0;
+        }
+        if (scope is JsonDocCursor) {
+            JsonDocCursor cur = (JsonDocCursor)scope;
+            int slot = cur.doc.Path(cur.slot, path);
+            return slot >= 0 && cur.doc.KindAt(slot) == 2 ? 1 : 0;
+        }
+        if (scope is JsonDoc) {
+            JsonDoc doc = (JsonDoc)scope;
+            int slot = doc.Path(doc.root, path);
+            return slot >= 0 && doc.KindAt(slot) == 2 ? 1 : 0;
+        }
+        if (scope is Dictionary<string, double>) { return 1; }
+        if (scope is Dictionary<string, bool>) { return 2; }
+        if (scope is Dictionary<string, string>) { return 0; }
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(scope, path, out leaf);
+        if (target != null && target.HasField(leaf)) {
+            return ModelBinder.FieldValueKind(target, leaf);
+        }
+        if (scope != this.model && this.model != null) {
+            target = ModelBinder.ResolveFieldScope(this.model, c.bindPath, out leaf);
+            if (target != null && target.HasField(leaf)) {
+                return ModelBinder.FieldValueKind(target, leaf);
+            }
+        }
+        return 0;
+    }
+
+    string BoundProperty(Control c) {
+        if (c.bindProp != "") { return c.bindProp; }
+        PropSpec p = c.BindingSpec("", this.ModelValueKind(c) == 1);
+        return p != null ? p.key : "value";
+    }
+
+    string BoundValue(Control c) {
+        return c.GetProp(this.BoundProperty(c));
     }
 
     // 把字符串值写回模型节点：支持 JsonValue 与 POCO 实体强类型双向写回。
@@ -720,9 +809,10 @@ public partial class ModelBinder {
         if (c.bindTrim) {
             s = s.Trim();
         }
-        string k = c.Kind();
-        bool isBoolCtrl = (k == "Checkbox" || k == "Switch");
-        bool isNumCtrl = (k == "Slider" || k == "InputNumber" || k == "Progress" || k == "Rate" || c.bindNumber);
+        PropSpec spec = c.BindingSpec(c.bindProp, this.ModelValueKind(c) == 1);
+        int valueKind = spec != null ? spec.ValueKind() : this.ModelValueKind(c);
+        bool isBoolCtrl = valueKind == 2;
+        bool isNumCtrl = valueKind == 1 || c.bindNumber;
 
         object scope = this.ScopeItemOf(c);
         string alias = this.ScopeAliasOf(c);
@@ -732,11 +822,11 @@ public partial class ModelBinder {
             if (scope is JsonValue) {
                 JsonValue jscope = (JsonValue)scope;
                 JsonValue cur = jscope.PathGet(actualPath);
-                if (isNumCtrl || (cur != null && cur.IsNumber())) {
+                if (isNumCtrl || (c.bindProp == "" && cur != null && cur.IsNumber())) {
                     string ns = s.Trim();
                     if (ns == "") { ns = "0"; }
                     jscope.PathSetValue(actualPath, JsonValue.NewNum(ns));
-                } else if (isBoolCtrl || (cur != null && cur.IsBool())) {
+                } else if (isBoolCtrl || (c.bindProp == "" && cur != null && cur.IsBool())) {
                     jscope.PathSetValue(actualPath, JsonValue.NewBool(s == "true"));
                 } else {
                     jscope.PathSet(actualPath, s);
@@ -760,7 +850,6 @@ public partial class ModelBinder {
                     if (isNumCtrl) {
                         double numVal = s != "" ? s.ToDouble() : 0.0;
                         target.SetFieldDouble(leaf, numVal);
-                        target.SetFieldInt(leaf, (int)numVal);
                     } else if (isBoolCtrl) {
                         target.SetFieldBool(leaf, s == "true");
                     } else {
@@ -777,11 +866,11 @@ public partial class ModelBinder {
             if (this.model is JsonValue) {
                 JsonValue jm = (JsonValue)this.model;
                 JsonValue cur0 = jm.PathGet(c.bindPath);
-                if (isNumCtrl || (cur0 != null && cur0.IsNumber())) {
+                if (isNumCtrl || (c.bindProp == "" && cur0 != null && cur0.IsNumber())) {
                     string ns0 = s.Trim();
                     if (ns0 == "") { ns0 = "0"; }
                     jm.PathSetValue(c.bindPath, JsonValue.NewNum(ns0));
-                } else if (isBoolCtrl || (cur0 != null && cur0.IsBool())) {
+                } else if (isBoolCtrl || (c.bindProp == "" && cur0 != null && cur0.IsBool())) {
                     jm.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
                 } else {
                     jm.PathSet(c.bindPath, s);
@@ -802,7 +891,6 @@ public partial class ModelBinder {
                     if (isNumCtrl) {
                         double numVal = s != "" ? s.ToDouble() : 0.0;
                         mtarget.SetFieldDouble(mleaf, numVal);
-                        mtarget.SetFieldInt(mleaf, (int)numVal);
                     } else if (isBoolCtrl) {
                         mtarget.SetFieldBool(mleaf, s == "true");
                     } else {

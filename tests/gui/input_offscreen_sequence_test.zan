@@ -1,0 +1,80 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// Event ownership follows the offscreen Window's local sequence. Repainting
+// the same stored event must not insert or notify again.
+class InputOffscreenSequenceTest {
+    int presses;
+    int downs;
+    int ups;
+
+    public void Press() { presses = presses + 1; }
+    public void Down() { downs = downs + 1; }
+    public void Up() { ups = ups + 1; }
+
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("Offscreen input sequence: " + label); }
+    }
+
+    static void PaintTwice(App app, Input input) {
+        app.BeginOffscreenFrame();
+        input.RenderInside(app, new Rect(20, 20, 240, 28));
+        input.RenderInside(app, new Rect(20, 20, 240, 28));
+        app.EndOffscreenFrame();
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Input sequence", 320, 120);
+        Input input = new Input();
+        InputOffscreenSequenceTest counts = new InputOffscreenSequenceTest();
+        input.BindEvent("KeyPress", counts.Press);
+        input.BindEvent("KeyDown", counts.Down);
+        input.BindEvent("KeyUp", counts.Up);
+        app.SetRootControl(input);
+        PaintTwice(app, input);
+        app.ProcessOffscreenInput(2, 100, 30, 0, 0, 0, 0);
+        PaintTwice(app, input);
+        app.ProcessOffscreenInput(3, 100, 30, 0, 0, 0, 0);
+        PaintTwice(app, input);
+        Check("pointer establishes input focus", input.IsFocused(app));
+
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        long first = app.window.EventSeq();
+        Check("first character routes before paint", input.GetText() == "A" && counts.presses == 1);
+        PaintTwice(app, input);
+        Check("first character inserts once", input.GetText() == "A" && counts.presses == 1);
+        Check("character uses local sequence", input.lastKeyNamedSeq == first);
+        PaintTwice(app, input);
+        Check("idle repaint does not insert", input.GetText() == "A" && counts.presses == 1);
+
+        app.ProcessOffscreenInput(6, 0, 0, 0, 66, 0, 0);
+        long second = app.window.EventSeq();
+        Check("new character advances sequence", second > first);
+        PaintTwice(app, input);
+        Check("later character inserts once", input.GetText() == "AB" && counts.presses == 2);
+        Check("later character uses its sequence", input.lastKeyNamedSeq == second);
+
+        // A printable KeyDown only notifies; WM_CHAR performs insertion.
+        app.ProcessOffscreenInput(4, 0, 0, 0, 67, 0, 0);
+        long down = app.window.EventSeq();
+        Check("keydown routes before paint", counts.downs == 1);
+        PaintTwice(app, input);
+        Check("keydown notified once", counts.downs == 1 && input.GetText() == "AB");
+        Check("keydown preserves last text sequence", input.lastKeyNamedSeq == second);
+        app.ProcessOffscreenInput(5, 0, 0, 0, 67, 0, 0);
+        long up = app.window.EventSeq();
+        Check("keyup routes before paint", counts.ups == 1);
+        PaintTwice(app, input);
+        Check("keyup advances sequence", up > down);
+        Check("keyup notified once", counts.ups == 1 && input.GetText() == "AB");
+        Check("keyup preserves last text sequence", input.lastKeyNamedSeq == second);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 67, 0, 0);
+        PaintTwice(app, input);
+        Check("character after key pair inserts", input.GetText() == "ABC" && counts.presses == 3);
+
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+        Console.WriteLine("INPUT_OFFSCREEN_SEQUENCE_TEST_OK");
+    }
+}

@@ -11,6 +11,7 @@ public class Collapse : Control {
     public Binding<int> data { get { return Active; } set { Active = value; } }
     public UiEvent Change;
     public bool Accordion;
+    private bool updatingItems;
 
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return 1; } // flex-direction: column
@@ -27,26 +28,39 @@ public class Collapse : Control {
     public Collapse(SignalInt m) { InitCollapse(m); }
 
     public void AddItem(CollapseItem item) {
-        if (item == null) { return; }
-        int idx = this.children.Count;
-        item.Toggle.Add(() => {
+        if (item == null || this.children.Contains(item)) { return; }
+        if (open != null && open.Get() == this.children.Count) {
+            item.SetExpanded(true);
+        }
+        CollapseAction action = new CollapseAction(this, item);
+        item.Toggle.Add(action.Toggle);
+        base.Add(item);
+    }
+
+    // 子项事件经弱引用 action 转发，手风琴收起的联动只发一次 Change。
+    public void OnItemToggled(CollapseItem item) {
+        if (updatingItems || item == null) { return; }
+        int idx = 0 - 1;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            if (this.children[i] == item) { idx = i; }
+        }
+        if (idx < 0) { return; }
+        updatingItems = true;
+        try {
             if (item.IsExpanded && Accordion) {
-                // 手风琴模式：收起其他项
                 for (int i = 0; i < this.children.Count; i = i + 1) {
                     if (this.children[i] is CollapseItem && i != idx) {
                         ((CollapseItem)this.children[i]).SetExpanded(false);
                     }
                 }
             }
-            if (open != null) {
-                open.Set(item.IsExpanded ? idx : (0 - 1));
-            }
-            if (Active != null) {
-                Active.Set(item.IsExpanded ? idx : (0 - 1));
-            }
-            if (Change != null) { Change.RaiseS(this); }
-        });
-        this.Add(item);
+            int value = item.IsExpanded ? idx : (0 - 1);
+            if (open != null) { open.Set(value); }
+            if (Active != null) { Active.Set(value); }
+        } finally {
+            updatingItems = false;
+        }
+        if (Change != null) { Change.RaiseS(this); }
     }
 
     public CollapseItem AddPanel(string title, string content) {
@@ -73,18 +87,27 @@ public class Collapse : Control {
         return base.Add(child);
     }
 
+    // 模型/属性回填共用静默路径，不把子项 Toggle 反写成用户 Change。
+    private void ApplyActiveIndex(int idx) {
+        bool wasUpdating = updatingItems;
+        updatingItems = true;
+        try {
+            open.Set(idx);
+            for (int i = 0; i < this.children.Count; i = i + 1) {
+                if (this.children[i] is CollapseItem) {
+                    ((CollapseItem)this.children[i]).SetExpanded(i == idx);
+                }
+            }
+        } finally {
+            updatingItems = wasUpdating;
+        }
+    }
+
     public override void SyncBinding() {
         base.SyncBinding();
         if (Active == null) { return; }
         int cur = Active.Get();
-        if (cur != open.Get()) {
-            open.Set(cur);
-            for (int i = 0; i < this.children.Count; i = i + 1) {
-                if (this.children[i] is CollapseItem) {
-                    ((CollapseItem)this.children[i]).SetExpanded(i == cur);
-                }
-            }
-        }
+        if (cur != open.Get()) { this.ApplyActiveIndex(cur); }
     }
 
     public override string Kind() { return "Collapse"; }
@@ -129,12 +152,7 @@ public class Collapse : Control {
         if (key == "active" || key == "data" || key == "value") {
             int idx = Convert.ToInt32(val);
             if (Active != null) { Active.Set(idx); }
-            open.Set(idx);
-            for (int i = 0; i < this.children.Count; i = i + 1) {
-                if (this.children[i] is CollapseItem) {
-                    ((CollapseItem)this.children[i]).SetExpanded(i == idx);
-                }
-            }
+            this.ApplyActiveIndex(idx);
             return;
         }
         base.SetProp(key, val);

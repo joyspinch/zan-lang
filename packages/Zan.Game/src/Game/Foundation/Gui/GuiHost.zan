@@ -31,6 +31,15 @@ public class GuiHost {
     public int lastTick;
     // 挂载的游戏视口：每帧在固定步长逻辑阶段统一步进
     public List<GameViewport> viewports;
+    Control contentRoot;
+
+    // Declare visual ownership explicitly; attaching logic never guesses paint order.
+    public void SetContentRoot(Control root) {
+        if (root is InputRootAdapter) { return; }
+        if (this.app != null && !this.hud.SetContentRoot(this.app, root)) { return; }
+        this.contentRoot = root;
+        if (root != null && this.app != null) { root.InheritApp(this.app); }
+    }
 
     // fixedStepMilliseconds <= 0 时取 16ms（约 60Hz）。
     public GuiHost(string title, int logicalWidth, int logicalHeight,
@@ -60,7 +69,7 @@ public class GuiHost {
     // Update 之前）统一调用 StepLogic()，渲染帧（OnPaint）不再推进
     // 逻辑与输入刷新——逻辑帧率与渲染帧率、重绘次数彻底解耦。
     public void AttachViewport(GameViewport vp) {
-        if (vp == null) { return; }
+        if (vp == null || this.viewports.Contains(vp)) { return; }
         this.viewports.Add(vp);
         vp.MarkHostDriven();
     }
@@ -83,37 +92,40 @@ public class GuiHost {
         this.running = true;
         this.lastTick = Window.GetTickMs();
         loop.Start(this);
+        if (this.contentRoot != null) { this.SetContentRoot(this.contentRoot); }
+        this.hud.BindInputRoot(this.app);
         while (this.running) {
+            this.input.BeginFrame();
             // 帧回调/空唤醒没有输入，不能回退成上一帧挂载的释放事件。
             this.app.HoldEventKind(0);
             // 无输入时等显示帧，有输入时立即派发；排空阶段始终非阻塞。
             if (!this.app.ProcessEvent()) { this.running = false; break; }
             int drained = 0;
             int lastEvKind = 0;
+
             if (this.app.lastPollResult == 0) {
-                lastEvKind = this.app.EventKind();
+                lastEvKind = this.app.EventIsMine() ? this.app.window.EventKind() : 0;
+
                 this.DispatchKeyEvent(loop);
                 drained = 1;
             }
-            // 保留树在 Render 才消费按下/释放/键盘/字符事件。
-            // 每个离散输入必须先呈现，再取下一个，否则同批输入会互相覆盖。
+            // Standard controls already route each event in the App input pump.
+            // Retain one discrete event per frame for legacy paint-time consumers.
             while (drained < 32 && (lastEvKind < 2 || lastEvKind > 6)) {
                 int ev = this.app.PollOneEvent();
                 if (ev < 0) { this.running = false; break; }
                 if (ev == 0) { break; }
                 // 原生事件状态此刻仍有效，记下本帧最后分发的事件 kind。
-                lastEvKind = this.app.EventKind();
+                lastEvKind = this.app.EventIsMine() ? this.app.window.EventKind() : 0;
+
                 this.DispatchKeyEvent(loop);
                 drained = drained + 1;
             }
             if (!this.running) { break; }
-            // 排空循环的最后一次"队列已空"轮询会经 ClearEvent 清掉
-            // 原生"正在处理的事件"状态，而保留树控件（HudLayer 挂件、
-            // HTML 场景按钮）在渲染期才读 EventKind()——不挂住的话
-            // Ui.Clicked 的 kind==3 永远不成立，标准控件在游戏窗口里
-            // 收不到任何点击。把本帧最后的事件 kind 挂给 App 供渲染期
-            // 回退读取；下一帧循环用新值覆盖（无事件帧挂 0）。
+            // Compatibility only: paint-time Ui consumers still read the held kind.
+            // Routed controls and GameViewport never replay input from rendering.
             this.app.HoldEventKind(lastEvKind);
+
 
             // 窗口最小化/不可见（全平台）：完全跳过光栅化与上屏，仅保持逻辑步进并深睡。
             if (!this.app.window.IsVisible()) {
@@ -161,11 +173,13 @@ public class GuiHost {
             // 标准 Gui 标题栏画在游戏内容之上（内容区从
             // ContentTop() 之下开始）；全屏收起标题栏后自然消失。
             this.app.RenderChrome(this.title);
+
             this.app.PresentFrame();
             // 连续渲染：游戏每帧都要画，下一圈继续出帧。
             this.app.RequestRedraw();
 
         }
+        this.ReleaseInput();
         loop.Stop(this);
         this.app.StopLoop();
         this.running = false;
@@ -174,16 +188,34 @@ public class GuiHost {
 
     // 输入事件转发：键盘喂语义输入映射，键盘与鼠标都回调 loop.Event。
     public void DispatchKeyEvent(IGuiHostLoop loop) {
-        int kind = this.app.EventKind();
+        if (!this.app.EventIsMine()) { return; }
+        int kind = this.app.window.EventKind();
+        if (kind == 9) { this.ReleaseInput(); }
         if (kind == 4 || kind == 5) {
             int keycode = this.app.window.EventKeyCode();
-            if (kind == 4) { this.input.ProcessKey(keycode, true); }
-            else { this.input.ProcessKey(keycode, false); }
+            if (kind == 4) {
+                if (!this.app.KeyConsumed() && !this.app.HasOverlays()) {
+                    this.input.ProcessKey(keycode, true);
+                }
+            } else {
+                this.input.ProcessKey(keycode, false);
+                for (int i = 0; i < this.viewports.Count; i = i + 1) {
+                    this.viewports[i].Input.OnKeyUp(keycode);
+                }
+            }
             loop.Event(this, kind, keycode);
             return;
         }
         if (kind == 1 || kind == 2 || kind == 3) {
             loop.Event(this, kind, this.app.window.EventButton());
+        }
+    }
+
+    // Fallback release is deliberately idempotent, including controls no longer focused.
+    public void ReleaseInput() {
+        this.input.ReleaseAll();
+        for (int i = 0; i < this.viewports.Count; i = i + 1) {
+            this.viewports[i].OnInputFocusLost();
         }
     }
 

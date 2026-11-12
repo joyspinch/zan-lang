@@ -1,0 +1,196 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+class TextRoutedInputTest {
+    int presses;
+    int downs;
+    int ups;
+    int bubbles;
+    int changes;
+    public string bound;
+
+    public void Press() { presses = presses + 1; }
+    public void Down() { downs = downs + 1; }
+    public void Up() { ups = ups + 1; }
+    public void Bubble() { bubbles = bubbles + 1; }
+    public void Change() { changes = changes + 1; }
+
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("Text routed input: " + label); }
+    }
+
+    static void Paint(App app, Control widget) {
+        app.BeginOffscreenFrame();
+        widget.RenderInside(app, new Rect(20, 20, 260, 100));
+        widget.RenderInside(app, new Rect(20, 20, 260, 100));
+        app.EndOffscreenFrame();
+    }
+
+    static void Mount(App app, Control root, Control widget) {
+        app.SetRootControl(root);
+        widget.UseApp(app);
+        Paint(app, widget);
+        app.focus.SetFocused(widget.WidgetId());
+    }
+
+    static RoutedEventArgs Key(Control target, string name, int code, int mods) {
+        RoutedEventArgs e = new RoutedEventArgs(name, target);
+        e.keyCode = code;
+        e.modifiers = mods;
+        return e;
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Text routed input", 320, 160);
+        TextRoutedInputTest counts = new TextRoutedInputTest();
+        Control root = new Control();
+        root.BindEvent("KeyDown", counts.Bubble);
+        root.BindEvent("TextInput", counts.Bubble);
+        Input input = new Input();
+        input.BindEvent("KeyPress", counts.Press);
+        input.BindEvent("KeyDown", counts.Down);
+        input.BindEvent("KeyUp", counts.Up);
+        root.Add(input);
+        Mount(app, root, input);
+        counts.bound = "seed";
+        input.data = counts.bound;
+        input.Autoselect = true;
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Check("input edits before paint and replaces autoselection", input.GetText() == "A" && counts.bound == "A");
+        Check("claimed text stops bubbling", counts.bubbles == 0 && counts.presses == 1);
+        Paint(app, input);
+        Check("paint cannot replay text", input.GetText() == "A" && counts.presses == 1);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 66, 0, 0);
+        app.ProcessOffscreenInput(5, 0, 0, 0, 66, 0, 0);
+        Check("named key pair notifies once", counts.downs == 1 && counts.ups == 1);
+        Check("unclaimed printable key bubbles", counts.bubbles == 1 && input.GetText() == "A");
+
+        input.SetText("AB");
+        input.selAnchor = -1;
+        RoutedEventArgs left = Key(input, "KeyDown", 37, Modifiers.Shift());
+        input.RouteEvent(left);
+        Check("routed code and modifiers override stored window key", left.handled && input.cursorPos == 1 && input.selAnchor == 2);
+        Check("claimed navigation does not bubble", counts.bubbles == 1 && counts.downs == 2);
+        RoutedEventArgs ignored = Key(input, "TextInput", 90, 0);
+        ignored.Handle();
+        input.OnTextInput(ignored);
+        Check("handled input is untouched", input.GetText() == "AB");
+        input.Disabled = true;
+        RoutedEventArgs disabled = Key(input, "KeyDown", 36, 0);
+        input.OnKeyDown(disabled);
+        Check("disabled input does not claim or move", !disabled.handled && input.cursorPos == 1);
+        input.Disabled = false;
+        input.Loading = true;
+        input.OnKeyDown(disabled);
+        Check("loading input does not edit", !disabled.handled && input.cursorPos == 1);
+        input.Loading = false;
+        app.focus.ClearFocus();
+        input.OnKeyDown(disabled);
+        Check("unfocused input does not claim", !disabled.handled && input.cursorPos == 1);
+        app.focus.SetFocused(input.WidgetId());
+        input.PassiveActivated = true;
+        input.passiveActive = false;
+        app.ProcessOffscreenInput(6, 0, 0, 0, 88, 0, 0);
+        Check("passive input ignores text", input.GetText() == "AB");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 13, 0, 0);
+        Check("enter activates passive input without editing", input.passiveActive && input.GetText() == "AB");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 0x4E2D, 0, 0);
+        Check("IME committed codepoint replaces selection", input.GetText() == "A中" && counts.bound == "A中");
+
+        TextArea area = new TextArea();
+        area.BindEvent("KeyPress", counts.Press);
+        Mount(app, area, area);
+        counts.bound = "seed";
+        area.data = counts.bound;
+        area.cursorPos = 4;
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Check("textarea pulls binding before editing", area.GetText() == "seedA" && counts.bound == "seedA");
+        long areaSeq = app.window.EventSeq();
+        Check("textarea KeyPress uses local sequence", area.lastKeyNamedSeq == areaSeq);
+        Paint(app, area);
+        Paint(app, area);
+        Check("textarea paint cannot replay", area.GetText() == "seedA");
+        area.SkipKeysOnce();
+        Paint(app, area);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 88, 0, 0);
+        Check("skipKeys survives paint and skips one event", area.GetText() == "seedA" && !area.skipKeys);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 13, 0, 0);
+        Check("textarea resumes after skip", area.GetText() == "seedA\n");
+        area.ReadOnly(true);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 90, 0, 0);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 46, 0, 0);
+        Check("readonly textarea rejects edits", area.GetText() == "seedA\n");
+        RoutedEventArgs select = Key(area, "KeyDown", 65, Modifiers.Ctrl());
+        area.RouteEvent(select);
+        Check("readonly textarea retains select all", select.handled && area.selAnchor == 0 && area.cursorPos == area.GetText().Length);
+        area.ReadOnly(false);
+        area.MaxLen = 2;
+        area.Filter = Input.OnlyDigits;
+        area.SetText("");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 49, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 50, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 51, 0, 0);
+        Check("textarea filter and max length remain active", area.GetText() == "12");
+
+        InputOtp otp = new InputOtp(4);
+        otp.Change.Add(counts.Change);
+        Mount(app, otp, otp);
+        otp.SetCode("1234");
+        otp.MoveEnd();
+        app.ProcessOffscreenInput(4, 0, 0, 0, 8, 0, 0);
+        Check("OTP keydown does not double delete", otp.GetCode() == "1234" && counts.changes == 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 8, 0, 0);
+        Check("OTP backspace pair deletes once", otp.GetCode() == "123" && counts.changes == 1);
+        Paint(app, otp);
+        Paint(app, otp);
+        Check("OTP paint cannot replay backspace", otp.GetCode() == "123" && counts.changes == 1);
+        otp.ReadOnly = true;
+        app.ProcessOffscreenInput(6, 0, 0, 0, 8, 0, 0);
+        Check("readonly OTP preserves code", otp.GetCode() == "123" && counts.changes == 1);
+        otp.ReadOnly = false;
+        counts.bound = "98";
+        otp.data = counts.bound;
+        otp.MoveHome();
+        app.ProcessOffscreenInput(6, 0, 0, 0, 55, 0, 0);
+        Check("OTP pulls and pushes binding during route", otp.GetCode() == "78" && counts.bound == "78");
+
+        // All three still cache app from paint; moving their input tree must
+        // use the new host before the first paint in that window.
+        App other = App.CreateOffscreen("Moved text input", 320, 160);
+        input.PassiveActivated = false;
+        input.Autoselect = false;
+        input.SetText("");
+        input.selAnchor = -1;
+        other.SetRootControl(root);
+        root.UseApp(other);
+        input.UseApp(null);
+        other.focus.SetFocused(input.WidgetId());
+        app.focus.ClearFocus();
+        other.ProcessOffscreenInput(6, 0, 0, 0, 75, 0, 0);
+        Check("input moves host without paint", input.GetText() == "K");
+        area.Filter = null;
+        area.MaxLen = 0;
+        area.SetText("");
+        other.SetRootControl(area);
+        area.UseApp(other);
+        other.focus.SetFocused(area.WidgetId());
+        other.ProcessOffscreenInput(6, 0, 0, 0, 76, 0, 0);
+        Check("textarea moves host without paint", area.GetText() == "L");
+        otp.data = null;
+        otp.SetCode("");
+        other.SetRootControl(otp);
+        otp.UseApp(other);
+        other.focus.SetFocused(otp.WidgetId());
+        other.ProcessOffscreenInput(6, 0, 0, 0, 53, 0, 0);
+        Check("OTP moves host without paint", otp.GetCode() == "5");
+        other.SetRootControl(null);
+        other.canvas.Destroy();
+
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+        Console.WriteLine("TEXT_ROUTED_INPUT_TEST_OK");
+    }
+}

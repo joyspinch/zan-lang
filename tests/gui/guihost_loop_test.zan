@@ -3,6 +3,22 @@ using Gui;
 using Gui.Backend;
 using Gui.Widget;
 using Game.Foundation.Gui;
+using Game.Core;
+
+class GuiHostFocusProbe : Control {
+    public int losses;
+    public weak Control redirect;
+    public weak GuiHost replaceHost;
+    public Control replacement;
+    public GuiHostFocusProbe() : base("focus-probe") { }
+    public override void OnInputFocusLost() {
+        losses = losses + 1;
+        Control target = redirect;
+        if (target != null) { target.Focus(this.App); }
+        GuiHost host = replaceHost;
+        if (host != null) { host.SetContentRoot(replacement); }
+    }
+}
 
 class GuiHostLoopTest : IGuiHostLoop {
     Button button;
@@ -16,6 +32,9 @@ class GuiHostLoopTest : IGuiHostLoop {
     int keyPresses;
     int keyReleases;
     int updates;
+    int actionPressFrames;
+    int actionReleaseFrames;
+    GameViewport viewport;
     bool started;
     bool stopped;
     long startUs;
@@ -28,7 +47,38 @@ class GuiHostLoopTest : IGuiHostLoop {
         Console.WriteLine("PASS " + label);
     }
 
-    void OnClick() { clicks++; }
+    void OnClick() {
+        clicks++;
+        if (ProcessHost.Env("ZAN_GUIHOST_DIAG") == "1") {
+            Console.WriteLine("GUIHOST_CALLBACK clicks=" + clicks);
+        }
+    }
+
+    static string Node(Control c) {
+        return c == null ? "null" : c.Kind() + ":" + c.WidgetId();
+    }
+
+    void TraceRoute(Control sender, RoutedEventArgs e) {
+        if (ProcessHost.Env("ZAN_GUIHOST_DIAG") != "1") { return; }
+        Console.WriteLine("GUIHOST_ROUTE event=" + e.eventName + " sender=" + Node(sender)
+            + " original=" + Node(e.originalSource) + " handled=" + e.handled
+            + " x=" + e.x + " y=" + e.y);
+    }
+
+    void TraceEvent(GuiHost host, int kind) {
+        if (ProcessHost.Env("ZAN_GUIHOST_DIAG") != "1" || kind < 1 || kind > 5) { return; }
+        App app = host.App();
+        int x = app.window.EventX();
+        int y = app.window.EventY();
+        Control hit = app.rootControl != null ? app.rootControl.HitTest(x, y, app.currentPointerType) : null;
+        Console.WriteLine("GUIHOST_EVENT kind=" + kind + " seq=" + app.window.EventSeq()
+            + " x=" + x + " y=" + y + " root=" + Node(app.rootControl)
+            + " tree_hit=" + Node(hit) + " flat_hit=" + app.hitTester.HitTest(x, y)
+            + " down_target=" + Node(app.pointerDownTarget)
+            + " captured=" + Node(app.GetCapturedPointer())
+            + " button=" + Node(button) + " button_clicked=" + button.clicked
+            + " rect=" + button.bx + "," + button.by + "," + button.bw + "," + button.bh);
+    }
 
     void Diagnose(GuiHost host, string label) {
         App app = host.App();
@@ -55,14 +105,23 @@ class GuiHostLoopTest : IGuiHostLoop {
         }
         #endif
         app.EnableSkins(0);
+        host.Input().BindKey("test-action", 65);
+        viewport = GameViewport.Create(Scene.Create("HUD input shielding", 360, 240, 128));
+        host.AttachViewport(viewport);
+        host.AttachViewport(viewport);
+        if (host.viewports.Count != 1) { throw new Exception("Viewport attached twice"); }
+        host.SetContentRoot(viewport);
         button = new Button("HUD action");
         button.Click.Add(() => this.OnClick());
+        button.OnPreviewRouted(this.TraceRoute);
+        button.OnRouted(this.TraceRoute);
         button.MeasureTree(app);
         button.Arrange(40, app.ContentTop() + 30, 160, 48);
         host.Hud().Add(button);
     }
 
     void Event(GuiHost host, int kind, int keycode) {
+        this.TraceEvent(host, kind);
         if (kind == 2) { presses++; }
         if (kind == 3) { releases++; }
         if (kind == 4 && keycode == 65) { keyPresses++; }
@@ -78,6 +137,11 @@ class GuiHostLoopTest : IGuiHostLoop {
     void Update(GuiHost host, int deltaMilliseconds) {
         updates++;
         elapsedMilliseconds += deltaMilliseconds;
+        if (host.Input().Pressed("test-action")) { actionPressFrames++; }
+        if (host.Input().Released("test-action")) { actionReleaseFrames++; }
+        if (viewport.Input.IsLeftDown || viewport.Input.IsRightDown) {
+            throw new Exception("HUD-owned pointer input leaked into viewport");
+        }
         // 隐藏窗口只推进 Update，不能把有界退出条件放在 Render 内。
         if (Stopwatch.GetMicroseconds() - startUs > 5000000) {
             this.Diagnose(host, "five-second guard");
@@ -92,6 +156,12 @@ class GuiHostLoopTest : IGuiHostLoop {
     void Render(GuiHost host, Canvas canvas, double alpha) {
         frames++;
         canvas.Clear(0xff14291f);
+        viewport.Arrange(0, host.App().ContentTop(), canvas.Width(), canvas.Height() - host.App().ContentTop());
+        viewport.RenderTree(host.App());
+        if (frames > 1 && (button.by != host.App().ContentTop()
+            || button.bh != host.App().ClientHeight() - host.App().ContentTop())) {
+            throw new Exception("HUD must be arranged in the content area below chrome");
+        }
         int x = button.bx + button.bw / 2;
         int y = button.by + button.bh / 2;
         // Split press/release across frames, then drain both in one frame.
@@ -136,9 +206,313 @@ class GuiHostLoopTest : IGuiHostLoop {
         GuiHostLoopTest.Check(keyPresses == 1 && keyReleases == 1,
             "queued key press/release reach game loop");
         GuiHostLoopTest.Check(clicks == 4, "HUD clicks survive drain and repaint without replay");
+        GuiHostLoopTest.Check(actionPressFrames == 1 && actionReleaseFrames == 1,
+            "semantic input edges last exactly one Update");
+        button.Click.Clear();
+        button.OnPreviewRouted(null);
+        button.OnRouted(null);
+    }
+
+    static void Send(GuiHost host, int kind, int x, int y, int button, int key, int flag) {
+        host.app.ProcessOffscreenInput(kind, x, y, button, key, 0, flag);
+        host.DispatchKeyEvent(new GuiHostLoopTest());
+    }
+
+    static void Require(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void TestViewportRouting() {
+        GuiHost host = new GuiHost("Viewport routing", 240, 180, 100);
+        host.app = App.CreateOffscreen("Viewport routing", 240, 180);
+        App app = host.app;
+        GameViewport vp = GameViewport.Create(Scene.Create("input", 80, 60, 128));
+        host.AttachViewport(vp);
+        host.SetContentRoot(vp);
+        vp.MeasureTree(app);
+        vp.Arrange(30, 50, 80, 60);
+        vp.RenderTree(app);
+        host.Input().BindKey("global", 65);
+        host.Input().BindKey("text-consumed", 37);
+        Send(host, 1, 45, 70, 0, 99, 0);
+        Require(vp.Input.MouseX == 15 && vp.Input.MouseY == 20, "routed viewport coordinates are local");
+        Send(host, 2, 45, 70, 0, 99, 0);
+        Require(vp.Input.IsLeftDown && !vp.Input.IsRightDown && app.GetCapturedPointer() == vp,
+            "real left button ignores unrelated keycode and captures");
+        Send(host, 2, 45, 70, 1, 99, 0);
+        Send(host, 3, 200, 160, 0, 99, 0);
+        Require(!vp.Input.IsLeftDown && vp.Input.IsRightDown && app.GetCapturedPointer() == vp,
+            "one button up preserves other button capture");
+        Send(host, 1, 210, 170, 0, 0, 0);
+        Require(vp.Input.MouseX == 180 && vp.Input.MouseY == 120, "captured movement crosses viewport boundary");
+        Send(host, 3, 210, 170, 1, 0, 0);
+        Require(!vp.Input.IsRightDown && app.GetCapturedPointer() == null, "last button up releases capture");
+        Send(host, 2, 45, 70, 0, 0, 1);
+        Send(host, 1, 150, 140, 0, 0, 1);
+        Require(vp.Input.IsLeftDown && vp.Input.IsDragging && app.GetCapturedPointer() == vp,
+            "touch drag survives slop and viewport boundary");
+        Send(host, 9, 0, 0, 0, 0, 0);
+        Require(!vp.Input.IsLeftDown && !vp.Input.IsDragging && app.GetCapturedPointer() == null,
+            "window blur cancels drag without up");
+        app.SetPointerDeviceType(0);
+        Input editor = new Input("");
+        host.Hud().Add(editor);
+        host.Hud().RenderIn(app, 30, 50, 80, 32);
+        Send(host, 2, 45, 60, 0, 0, 0);
+        Send(host, 3, 45, 60, 0, 0, 0);
+        Require(!vp.Input.IsLeftDown && editor.IsFocused(app), "HUD shields viewport before world input");
+        Send(host, 4, 0, 0, 0, 65, 0);
+        Require(host.Input().Down("global") && !vp.Input.keyState[65], "unconsumed A retains global action compatibility");
+        Send(host, 5, 0, 0, 0, 65, 0);
+        Send(host, 4, 0, 0, 0, 37, 0);
+        Require(!host.Input().Down("text-consumed") && !vp.Input.keyState[37], "consumed text Left shields global and viewport keydown");
+        Send(host, 5, 0, 0, 0, 37, 0);
+        vp.Focus(app);
+        Send(host, 4, 0, 0, 0, 65, 0);
+        Require(vp.Input.keyState[65] && vp.Input.keyJustPressed[65], "focused viewport accepts key immediately");
+        editor.Focus(app);
+        Require(!vp.Input.keyState[65] && vp.Input.keyJustReleased[65], "focus transfer releases key before another event");
+        vp.RenderTree(app);
+        vp.RenderTree(app);
+        Require(vp.Input.keyJustPressed[65] && vp.Input.keyJustReleased[65], "zero logic and repaint retain both key edges");
+        Send(host, 5, 0, 0, 0, 65, 0);
+        Require(vp.Input.keyJustReleased[65], "late keyup remains idempotent");
+        vp.Input.FlushFrameEvents();
+        Require(!vp.Input.keyJustPressed[65] && !vp.Input.keyJustReleased[65], "logic consumption clears edges");
+        vp.Focus(app);
+        Send(host, 4, 0, 0, 0, 66, 0);
+        vp.visible = false;
+        app.focus.ClearFocus();
+        Require(!vp.Input.keyState[66] && vp.Input.keyJustReleased[66], "hidden focus owner still receives semantic loss");
+        vp.visible = true;
+        GuiHostFocusProbe probe = new GuiHostFocusProbe();
+        probe.RenderInside(app, new Rect(120, 50, 60, 30));
+        app.overlayHost.Show(app, null, probe);
+        probe.Focus(app);
+        probe.visible = false;
+        vp.Focus(app);
+        Require(probe.losses == 1, "hidden popup focus identity is retained");
+        app.overlayHost.Dismiss();
+        probe.visible = true;
+        host.Hud().Add(probe);
+        host.Hud().RenderIn(app, 120, 50, 60, 30);
+        probe.Focus(app);
+        probe.redirect = editor;
+        vp.Focus(app);
+        Require(editor.IsFocused(app) && probe.losses == 2, "focus-loss reentry retains third focus owner");
+        probe.redirect = null;
+        vp.Focus(app);
+        app.focus.tabOrder.Clear();
+        app.focus.RegisterFocusable(vp.WidgetId());
+        app.focus.RegisterFocusable(editor.WidgetId());
+        Send(host, 4, 0, 0, 0, 67, 0);
+        app.focus.FocusStep(1);
+        Require(editor.IsFocused(app) && !vp.Input.keyState[67], "Tab uses immediate focus setter");
+        host.Input().ProcessKey(65, true);
+        host.ReleaseInput();
+        host.ReleaseInput();
+        Require(!host.Input().Down("global") && host.Input().Pressed("global") && host.Input().Released("global"),
+            "stop releases global actions without erasing edges");
+        vp.Disabled = true;
+        vp.Focus(app);
+        Send(host, 4, 0, 0, 0, 68, 0);
+        Send(host, 2, 45, 100, 0, 0, 0);
+        Require(!vp.Input.keyState[68] && !vp.Input.IsLeftDown, "disabled viewport rejects keys and pointer down");
+        vp.Disabled = false;
+        vp.CurrentScene = null;
+        app.focus.tabOrder.Clear();
+        vp.RenderTree(app);
+        Require(app.focus.IndexOf(vp.WidgetId()) >= 0, "empty-scene viewport remains focusable");
+        host.Hud().Clear();
+        host.SetContentRoot(null);
+        vp.off.Destroy();
+        app.canvas.Destroy();
+    }
+
+    static void TestHostContentReplacement() {
+        GuiHost host = new GuiHost("Content chain", 640, 480, 100);
+        host.app = App.CreateOffscreen("Content chain", 640, 480);
+        App app = host.app;
+        GuiHostFocusProbe previous = new GuiHostFocusProbe();
+        GuiHostFocusProbe witness = new GuiHostFocusProbe();
+        witness.redirect = previous;
+        previous.RenderInside(app, new Rect(0, 0, 180, 32));
+        host.SetContentRoot(previous);
+        Input editor = new Input("");
+        host.Hud().Add(editor);
+        host.Hud().RenderIn(app, 0, 60, 180, 32);
+        InputRootAdapter hudRoot = (InputRootAdapter)app.rootControl;
+        LayerState layer = new LayerState("Floating", 250, 120, 300, 240);
+        layer.SetBody(new Control("layer-body"));
+        layer.Open(app);
+        layer.openMs = 0;
+        Layer.Render(app, layer);
+        InputRootAdapter layerRoot = (InputRootAdapter)app.rootControl;
+        Require(layerRoot != hudRoot && layerRoot.ContainsAdapter(hudRoot), "Layer wraps existing host HUD");
+        editor.Focus(app);
+        app.CapturePointer(editor);
+        Control next = new Control("next");
+        next.RenderInside(app, new Rect(0, 0, 180, 32));
+        host.SetContentRoot(next);
+        previous.Focus(app);
+        previous.visible = false;
+        host.SetContentRoot(previous);
+        previous.Focus(app);
+        host.SetContentRoot(next);
+        Require(previous.losses == 1, "hidden fallback replacement notifies focus loss exactly once");
+        editor.Focus(app);
+        app.CapturePointer(editor);
+        previous = null;
+        Require(witness.redirect == null, "replaced fallback releases old content ownership");
+        Require(app.rootControl == layerRoot && layerRoot.ContainsAdapter(hudRoot)
+            && app.GetCapturedPointer() == editor && editor.IsFocused(app), "content replacement preserves Layer HUD focus and capture");
+        host.SetContentRoot(next);
+        Require(app.GetCapturedPointer() == editor && editor.IsFocused(app), "same content replacement is input-idempotent");
+        host.SetContentRoot(layerRoot);
+        Require(app.rootControl == layerRoot && !hudRoot.SetContentRoot(hudRoot)
+            && !hudRoot.SetContentRoot(layerRoot), "content setter rejects adapter cycles");
+        next.Focus(app);
+        app.CapturePointer(next, true);
+        host.SetContentRoot(new Control("third"));
+        Require(!next.IsFocused(app) && app.GetCapturedPointer() == null,
+            "replacing fallback releases only departed world input");
+        GuiHostFocusProbe reentrant = new GuiHostFocusProbe();
+        reentrant.RenderInside(app, new Rect(0, 0, 180, 32));
+        host.SetContentRoot(reentrant);
+        reentrant.replaceHost = host;
+        Control finalRoot = new Control("reentrant-final");
+        reentrant.replacement = finalRoot;
+        reentrant.Focus(app);
+        host.SetContentRoot(new Control("superseded"));
+        Require(reentrant.losses == 1 && host.contentRoot == finalRoot, "fallback loss callback retains its newer content");
+        reentrant.replaceHost = null;
+        reentrant.replacement = null;
+        layer.Close();
+        host.Hud().Clear();
+        host.SetContentRoot(null);
+        app.canvas.Destroy();
+    }
+
+    static void TestHudInputRoot() {
+        App app = App.CreateOffscreen("HUD input tree", 240, 180);
+        Control content = new Control("content");
+        content.Arrange(0, 0, 240, 180);
+        app.SetRootControl(content);
+        HudLayer hud = new HudLayer();
+        Button lower = new Button("lower");
+        Button upper = new Button("upper");
+        hud.Add(lower);
+        hud.Add(upper);
+        hud.Render(app, app.canvas);
+        lower.Arrange(20, 50, 80, 40);
+        upper.Arrange(20, 50, 80, 40);
+        // 测根自身区域，绕开文字子节点，断言输入层次与绘制顺序相同。
+        if (app.rootControl != hud.inputRoot || hud.inputRoot.HitTest(21, 51, 0) != upper) {
+            throw new Exception("HUD input root must choose last painted control");
+        }
+        if (hud.inputRoot.HitTest(200, 140, 0) != content || content.parent != null) {
+            throw new Exception("Transparent HUD must preserve content hit and parent");
+        }
+        hud.Remove(upper);
+        if (hud.inputRoot.HitTest(21, 51, 0) != lower) { throw new Exception("Removed HUD must stop receiving input"); }
+        app.CapturePointer(lower);
+        app.focus.SetFocused(lower.WidgetId());
+        hud.SetVisible(false);
+        if (app.rootControl != content || app.GetCapturedPointer() != null
+            || app.focus.IsFocused(lower.WidgetId())) {
+            throw new Exception("Hidden HUD must detach input, focus and capture");
+        }
+        if (app.rootControl.HitTest(21, 51, 0) != content) { throw new Exception("Hidden HUD must stop receiving input"); }
+        Require(hud.inputRoot.HitTest(21, 51, 0) == null && !hud.inputRoot.ContainsInputControl(content), "detached HUD adapter no longer owns fallback");
+        hud.SetVisible(true);
+        hud.RenderIn(app, 30, 60, 100, 70);
+        if (lower.bx != 30 || lower.by != 60 || lower.bw != 100 || lower.bh != 70
+            || app.rootControl != hud.inputRoot) {
+            throw new Exception("HUD region must share rendered geometry and input binding");
+        }
+        HudLayer second = new HudLayer();
+        Input field = new Input("HUD text");
+        second.Add(field);
+        second.RenderIn(app, 140, 60, 90, 40);
+        field.Focus(app);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        if (field.GetText() != "A") { throw new Exception("HUD aggregate must route focused text"); }
+        app.CapturePointer(lower);
+        hud.RenderIn(app, 30, 60, 100, 70);
+        second.RenderIn(app, 140, 60, 90, 40);
+        if (app.GetCapturedPointer() != lower) { throw new Exception("HUD reordering must preserve capture"); }
+        app.DispatchVisualTree(1, 220, 160, 0, 0);
+        if (app.GetCapturedPointer() != lower) { throw new Exception("HUD capture must belong to aggregate input tree"); }
+        second.SetVisible(false);
+        if (app.GetCapturedPointer() != lower || field.IsFocused(app)) {
+            throw new Exception("Hiding one HUD must release only its own input");
+        }
+        hud.Clear();
+        if (app.GetCapturedPointer() != null) { throw new Exception("Cleared HUD must release capture immediately"); }
+        if (hud.inputRoot.HitTest(21, 51, 0) != content) { throw new Exception("Cleared HUD must restore content input"); }
+        hud.Render(app, app.canvas);
+        if (app.rootControl != hud.inputRoot || content.parent != null) {
+            throw new Exception("HUD root binding must be stable without reparenting");
+        }
+        app.canvas.Destroy();
+    }
+
+    static void TestCapturedButtonClicks() {
+        App app = App.CreateOffscreen("Captured button click", 240, 180);
+        GuiHostLoopTest counter = new GuiHostLoopTest();
+        Button button = new Button("label click");
+        button.Click.Add(counter.OnClick);
+        app.SetRootControl(button);
+        button.MeasureTree(app);
+        button.Arrange(20, 40, 160, 48);
+        button.RenderTree(app);
+        Control label = button.children[0];
+        int x = label.bx + label.bw / 2;
+        int y = label.by + label.bh / 2;
+        if (button.HitTest(x, y, 0) != label) { throw new Exception("Click regression must start on label"); }
+        app.DispatchVisualTree(2, x, y, 0, 0);
+        if (app.pointerDownTarget != label || app.GetCapturedPointer() != button) {
+            throw new Exception("Label down must bubble to button capture");
+        }
+        app.DispatchVisualTree(3, x, y, 0, 0);
+        app.DrainPosts();
+        if (counter.clicks != 1) { throw new Exception("Real button label click must notify exactly once"); }
+        button.Disabled = true;
+        app.DispatchVisualTree(2, x, y, 0, 0);
+        app.DispatchVisualTree(3, x, y, 0, 0);
+        app.DrainPosts();
+        if (counter.clicks != 1) { throw new Exception("Disabled button must not click"); }
+        button.Disabled = false;
+        app.DispatchVisualTree(2, x, y, 0, 0);
+        app.DispatchVisualTree(1, 230, 170, 0, 0);
+        app.DispatchVisualTree(3, 230, 170, 0, 0);
+        app.DrainPosts();
+        if (counter.clicks != 1) { throw new Exception("Captured release outside button must not click"); }
+        FloatButton floating = new FloatButton();
+        floating.Click.Add(counter.OnClick);
+        Control.RouteEvent(floating, new RoutedEventArgs("Click", floating));
+        app.DrainPosts();
+        if (counter.clicks != 2) { throw new Exception("FloatButton routed click must notify exactly once"); }
+        Control plain = new Control("plain");
+        plain.Click.Add(counter.OnClick);
+        Control.RouteEvent(plain, new RoutedEventArgs("Click", plain));
+        if (counter.clicks != 3) { throw new Exception("Default control routed click must notify exactly once"); }
+        plain.Arrange(20, 40, 80, 40);
+        app.SetRootControl(plain);
+        app.DispatchVisualTree(2, 30, 50, 0, 0);
+        app.DispatchVisualTree(3, 230, 170, 0, 0);
+        if (app.pointerDownTarget != null) { throw new Exception("Untargeted release must clear down target"); }
+        app.DispatchVisualTree(3, 30, 50, 0, 0);
+        if (counter.clicks != 3) { throw new Exception("Later release must not replay abandoned click"); }
+        app.canvas.Destroy();
     }
 
     static void Main() {
+        Console.WriteLine("GUIHOST_RUN_BEGIN");
+        TestCapturedButtonClicks();
+        TestViewportRouting();
+        TestHostContentReplacement();
+        TestHudInputRoot();
         GuiHostLoopTest loop = new GuiHostLoopTest();
         GuiHost host = new GuiHost("GuiHost HUD input regression", 360, 240, 100);
         GuiHostLoopTest.Check(host.Run(loop), "host returns normally");

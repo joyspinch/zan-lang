@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Gui.Component;
 
 namespace Gui.Component.WebView;
 
@@ -27,6 +28,50 @@ namespace Gui.Component.WebView;
 // （GetCookies/SetCookie/ClearCookies/ClearBrowsingData）以及
 // DevTools（OpenDevTools）。
 public class WebView : IDisposable {
+    public BrowserNativeEntry nativeEntry;
+    List<string> nativeHandlers = new List<string>();
+    List<PendingScriptItem> nativeScripts = new List<PendingScriptItem>();
+    List<string> nativeStyles = new List<string>();
+    string nativeTarget = "";
+    string nativeHtml = "";
+    string nativeBase = "";
+    int nativeRevision;
+    bool nativeDestroyed;
+
+    public BrowserNativeEntry AttachNative(App app, Control box) {
+        if (nativeDestroyed || app == null || !app.isRunning) { return null; }
+        if (nativeEntry != null && !nativeEntry.retired && nativeEntry.loop != null
+            && nativeEntry.loop.host == app) {
+            if (box != null) { nativeEntry.AttachBox(box); }
+            return nativeEntry;
+        }
+        if (nativeEntry != null && !nativeEntry.retired) { nativeEntry.Retire(app); }
+        BrowserNativeLoop service = BrowserNativeLoop.For(app);
+        BrowserNativeEntry entry = new BrowserNativeEntry();
+        entry.engine = 1;
+        entry.web = this;
+        entry.loop = service;
+        if (box != null) { entry.AttachBox(box); }
+        nativeEntry = entry;
+        service.Add(entry);
+        return entry;
+    }
+
+    public void ReleaseNative() {
+        nativeRevision = nativeRevision + 1;
+        if (handle != 0) { NativeLayer.Forget(handle); WebViewBackend.Destroy(handle); }
+        handle = 0; created = false; supported = true;
+        pendingUrl = nativeTarget != "" ? nativeTarget : url.Get();
+        pendingHtml = nativeHtml; pendingBase = nativeBase;
+        pendingHandlers = new List<string>();
+        foreach (string name in nativeHandlers) { pendingHandlers.Add(name); }
+        pendingScripts = new List<PendingScriptItem>();
+        foreach (PendingScriptItem item in nativeScripts) { pendingScripts.Add(item); }
+        pendingStyles = new List<string>();
+        foreach (string style in nativeStyles) { pendingStyles.Add(style); }
+        if (nativeEntry != null) { nativeEntry.ForgetHandle(); }
+    }
+
     public int handle;  // 原生 webview 句柄（0 = 尚未创建/不支持）
     public string profileId;  // 隔离配置文件："" = 共享默认存储，否则按账户隔离
     public bool created;  // 已尝试原生创建
@@ -123,6 +168,11 @@ public class WebView : IDisposable {
     }
 
     public void EnsureCreated(App app) {
+        if (nativeDestroyed) { return; }
+        if (app == null) { app = App.FrameApp(); }
+        BrowserNativeEntry creationEntry = this.AttachNative(app, null);
+        if (creationEntry == null) { return; }
+        try {
         if (created) { return; }
         if (app == null) { app = App.FrameApp(); }
         if (app == null) { supported = false; return; }
@@ -176,6 +226,7 @@ public class WebView : IDisposable {
         if (this.ResourceResponse != null) {
             WebViewBackend.SetResourceResponseHandler(handle, this.ResourceResponse);
         }
+            } finally { creationEntry.CaptureHandle(); }
     }
 
     // 当前平台有可用的原生 Web 视图时为 true；false 时
@@ -202,6 +253,8 @@ public class WebView : IDisposable {
     // 创建前调用会把地址挂起，创建时自动消费（后调的 LoadHtml 会
     // 覆盖挂起的 Navigate，反之亦然）。
     public void Navigate(string target) {
+        nativeTarget = WebView.Normalize(target);
+        nativeHtml = "";
         string u = WebView.Normalize(target);
         if (!created || !supported) {
             pendingUrl = u;
@@ -214,6 +267,7 @@ public class WebView : IDisposable {
     // 加载内存中的 HTML 字符串（baseUrl 解析相对链接；可为
     // ""）。原生视图创建前调用同样挂起，创建时消费。
     public void LoadHtml(string html, string baseUrl) {
+        nativeHtml = html; nativeBase = baseUrl; nativeTarget = "";
         if (!created || !supported) {
             pendingHtml = html;
             pendingBase = baseUrl;
@@ -294,6 +348,7 @@ public class WebView : IDisposable {
     // CDP 队列同一套用法）。可在原生视图创建前调用。
     public void AddMessageHandler(string handlerName) {
         if (handlerName == "") { return; }
+        if (!nativeHandlers.Contains(handlerName)) { nativeHandlers.Add(handlerName); }
         if (!created || !supported || handle == 0) {
             pendingHandlers.Add(handlerName);
             return;
@@ -303,6 +358,12 @@ public class WebView : IDisposable {
 
     // 撤掉 AddMessageHandler 注册的消息通道（不支持的后端为空操作）。
     public void RemoveMessageHandler(string handlerName) {
+        for (int i = nativeHandlers.Count - 1; i >= 0; i = i - 1) {
+            if (nativeHandlers[i] == handlerName) { nativeHandlers.RemoveAt(i); }
+        }
+        for (int i = pendingHandlers.Count - 1; i >= 0; i = i - 1) {
+            if (pendingHandlers[i] == handlerName) { pendingHandlers.RemoveAt(i); }
+        }
         if (supported && handle != 0) {
             WebViewBackend.RemoveHandler(handle, handlerName);
         }
@@ -332,6 +393,7 @@ public class WebView : IDisposable {
     // document/window），false 则在页面自己的脚本之前跑（适合装桥）。
     public void InjectScript(string js, bool atDocumentEnd) {
         if (js == "") { return; }
+        nativeScripts.Add(new PendingScriptItem(js, atDocumentEnd));
         if (!created || !supported || handle == 0) {
             pendingScripts.Add(new PendingScriptItem(js, atDocumentEnd));
             return;
@@ -342,6 +404,7 @@ public class WebView : IDisposable {
     // 每次导航都注入的 CSS。
     public void InjectStyle(string css) {
         if (css == "") { return; }
+        nativeStyles.Add(css);
         if (!created || !supported || handle == 0) {
             pendingStyles.Add(css);
             return;
@@ -351,6 +414,8 @@ public class WebView : IDisposable {
 
     // 撤掉此前注入的所有脚本/样式（下一次导航起生效）。
     public void ClearInjected() {
+        nativeScripts = new List<PendingScriptItem>();
+        nativeStyles = new List<string>();
         pendingScripts = new List<PendingScriptItem>();
         pendingStyles = new List<string>();
         if (supported && handle != 0) { WebViewBackend.RemoveScripts(handle); }
@@ -459,6 +524,7 @@ public class WebView : IDisposable {
 
     // 隐藏原生视图（对不在屏幕上的标签/面板调用）。
     public void Hide() {
+        if (nativeEntry != null) { nativeEntry.RequestHide(); }
         if (created && supported && handle != 0) {
             WebViewBackend.SetVisible(handle, false);
         }
@@ -467,12 +533,11 @@ public class WebView : IDisposable {
     // 销毁原生视图并释放其资源。销毁后再调用其他方法均为
     // 空操作；如需重用应新建实例。
     public void Destroy() {
-        if (created && supported && handle != 0) {
-            NativeLayer.Forget(handle);
-            WebViewBackend.Destroy(handle);
-        }
-        handle = 0;
-        created = false;
+        nativeDestroyed = true;
+        BrowserNativeEntry previous = nativeEntry;
+        if (previous != null && !previous.retired) { previous.Retire(null); }
+        else { this.ReleaseNative(); }
+        nativeEntry = null;
     }
 
     public void Dispose() {
@@ -496,20 +561,32 @@ public class WebView : IDisposable {
 
     public int Render(App app, int x, int y, int w, int h) {
         if (app == null) { app = App.FrameApp(); }
-        if (app == null) { return 0; }
+        BrowserNativeEntry entry = this.AttachNative(app, null);
+        if (entry != null) { entry.SetBounds(x, y, w, h); }
+        this.Paint(app, x, y, w, h);
+        return handle;
+    }
+
+    public int Update(App app, int x, int y, int w, int h) {
+        this.PrepareNative(app, x, y, w, h);
+        this.PollNative(app);
+        return handle;
+    }
+
+    public void PrepareNative(App app, int x, int y, int w, int h) {
+        if (app == null) { app = App.FrameApp(); }
+        if (app == null) { return; }
         EnsureCreated(app);
         if (!supported) {
-            WebView.PaintPlaceholder(app, x, y, w, h);
-            return handle;
+            return;
         }
         WebViewBackend.SetFrame(handle, x, y, w, h);
-        // 可见性不在这里定：原生视图是 OS 兄弟层，永远画在画布之上，
-        // 直接 SetVisible(true) 就会把标签条之外的右键菜单、下拉、
-        // 模态对话框一起盖住。改为向 App 登记本帧占位，由
-        // PresentFrame 在所有自绘 UI 之后算出未被遮挡的区域再下发
-        // （完全被盖住时隐藏）。
-        NativeLayer.Register(app, handle, x, y, w, h, WebViewBackend.ApplyClip);
+    }
 
+    public void PollNative(App app) {
+        if (nativeDestroyed || handle == 0) { return; }
+        int generation = nativeRevision;
+        int expected = handle;
         // 上一帧被接管的新窗口请求（window.open / target=_blank）就地
         // 落地为本视图导航——与 macOS 后端"同视图加载"策略一致。
         string pendingNav = WebViewBackend.DrainWindowNav(handle);
@@ -519,13 +596,13 @@ public class WebView : IDisposable {
         string request = WebViewBackend.LastRequest(handle);
         if (request != lastSeenRequest) {
             lastSeenRequest = request;
-            if (request != "") { NavStart.Raise(); }
+            if (request != "") { NavStart.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; } }
             dirty = true;
         }
         bool busy = WebViewBackend.IsLoading(handle);
         if (busy != lastSeenLoading) {
             lastSeenLoading = busy;
-            LoadingChanged.Raise();
+            LoadingChanged.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
             dirty = true;
         }
 
@@ -534,16 +611,27 @@ public class WebView : IDisposable {
             lastNavSeq = seq;
             url.Set(WebViewBackend.GetUrl(handle));
             title.Set(WebViewBackend.GetTitle(handle));
-            NavComplete.Raise();
+            NavComplete.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
             dirty = true;
         }
         string docTitle = title.Get();
         if (docTitle != lastSeenTitle) {
             lastSeenTitle = docTitle;
-            TitleChanged.Raise();
+            TitleChanged.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
             dirty = true;
         }
         if (dirty) { app.RequestRedraw(); }
+
+        }
+
+    public int Paint(App app, int x, int y, int w, int h) {
+        if (nativeEntry != null && !nativeEntry.shown) { return handle; }
+        if (app == null || w <= 0 || h <= 0) { return 0; }
+        if (!supported || handle == 0) {
+            WebView.PaintPlaceholder(app, x, y, w, h);
+            return handle;
+        }
+        NativeLayer.Register(app, handle, x, y, w, h, WebViewBackend.ApplyClip);
         return handle;
     }
 

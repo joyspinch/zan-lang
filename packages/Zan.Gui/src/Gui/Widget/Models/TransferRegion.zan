@@ -1,0 +1,123 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+public class TransferRegionAction<T> {
+    public weak TransferRegion<T> region;
+    public TransferRegionAction(TransferRegion<T> value) { region = value; }
+    public void SearchChanged(Control sender) {
+        TransferRegion<T> value = region;
+        if (value != null) { value.SearchChanged(sender); }
+    }
+    public void Operation(Control sender) {
+        TransferRegion<T> value = region;
+        if (value != null) { value.Operation(sender); }
+    }
+}
+
+// The real retained row viewport; all scrolling is inherited from Control.
+// No offset, wheel decoder, drag math, or scrollbar renderer is duplicated here.
+public class TransferRegion<T> : Control {
+    public weak Transfer<T> owner;
+    public TransferPane pane;
+    public bool isSource;
+    private bool arrangingRegion;
+
+    public TransferRegion(Transfer<T> transfer, TransferPane state, bool sourceSide) {
+        this.InitControl("transfer-region", 0);
+        owner = transfer;
+        pane = state;
+        isSource = sourceSide;
+        arrangingRegion = false;
+    }
+
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
+        return box;
+    }
+
+    public void LayoutRows(int x, int y, int w, int h, int contentH) {
+        arrangingRegion = true;
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        scrollExtentX = bw;
+        scrollExtent = contentH > bh ? contentH : bh;
+        // External writes to the public SignalInt are imported only at layout.
+        int offset = pane.scroll.Get();
+        int maximum = scrollExtent - bh;
+        if (offset < 0) { offset = 0; }
+        if (offset > maximum) { offset = maximum; }
+        this.CommitScrollOffset(0, offset);
+        pane.scroll.Set(scrollY);
+        if (scroll != null && scroll.Active() && maximum <= 0) {
+            RoutedEventArgs cancel = new RoutedEventArgs("PointerCancel", this, x, y);
+            this.ScrollPointerCancel(cancel);
+        }
+        arrangingRegion = false;
+    }
+
+    public void SearchChanged(Control sender) {
+        Transfer<T> transfer = owner;
+        if (transfer != null) { transfer.SearchRegionChanged(this); }
+    }
+    public void Operation(Control sender) {
+        Transfer<T> transfer = owner;
+        if (transfer == null || transfer.IsDisabled()) { return; }
+        if (isSource) { transfer.MoveRight(); }
+        else if (!transfer.oneWay) { transfer.MoveLeft(); }
+        transfer.Arrange(transfer.bx, transfer.by, transfer.bw, transfer.bh);
+    }
+
+    public override void OnScrollChanged() {
+        pane.scroll.Set(scrollY); // Compatibility projection, never a second accumulator.
+        Transfer<T> transfer = owner;
+        if (!arrangingRegion && transfer != null) { transfer.SyncRegion(this); }
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        Transfer<T> transfer = owner;
+        App app = this.App;
+        if (transfer == null || app == null || e.originalSource != this
+            || app.window.EventButton() != 0 || transfer.IsDisabled()) { return; }
+        if (transfer.BeginRegionSelection(this, e.x, e.y)) {
+            app.CapturePointer(this, true);
+            e.Handle();
+        }
+    }
+    public override void OnPointerMove(RoutedEventArgs e) {
+        Transfer<T> transfer = owner;
+        App app = this.App;
+        if (transfer != null && app != null && app.GetCapturedPointer() == this
+            && pane.paintStart >= 0) {
+            transfer.MoveRegionSelection(this, e.x, e.y);
+            e.Handle();
+        }
+    }
+    public override void OnPointerUp(RoutedEventArgs e) {
+        Transfer<T> transfer = owner;
+        App app = this.App;
+        if (transfer == null || app == null || app.window.EventButton() != 0
+            || app.GetCapturedPointer() != this || pane.paintStart < 0) { return; }
+        transfer.MoveRegionSelection(this, e.x, e.y);
+        // Retire capture before SelectChanged observers can reenter/remove the tree.
+        app.ReleasePointerCapture();
+        base.OnPointerUp(e);
+        e.Handle();
+        transfer.EndRegionSelection(this);
+    }
+    public void CancelSelection() {
+        if (pane.paintStart < 0) { return; }
+        pane.paintStart = 0 - 1;
+        pane.paintEnd = 0 - 1;
+        App app = this.App;
+        RoutedEventArgs cancel = new RoutedEventArgs("PointerCancel", this, bx, by);
+        base.OnPointerCancel(cancel);
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleaseInputSubtree(this); }
+    }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        if (pane.paintStart >= 0) { this.CancelSelection(); e.Handle(); }
+        base.OnPointerCancel(e);
+    }
+}

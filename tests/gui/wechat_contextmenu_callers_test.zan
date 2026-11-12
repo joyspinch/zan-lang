@@ -1,0 +1,302 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Component;
+using Gui.Widget;
+
+// Build with tests/run_wechat_contextmenu_callers.cmake and real template sources.
+// Run from templates/gui/gui-wechat so Form.ReadDoc uses original HTML documents.
+class WechatContextMenuCallersTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { break; }
+            action();
+        }
+    }
+
+    static void Paint(App app, WxPageChat page) {
+        Check(app.rootControl != null && app.rootControl.ContainsInputControl(page),
+            "real shell contains chat page before layout");
+        app.BeginOffscreenFrame();
+        app.rootControl.RenderInside(app, new Rect(0, 0, 1180, 760));
+        app.EndOffscreenFrame();
+    }
+
+    static void DownUp(App app, Control row) {
+        Check(row != null && row.bw > 0 && row.bh > 0, "real menu row has geometry");
+        int x = row.bx + row.bw / 2;
+        int y = row.by + row.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static ContextMenu Open(App app, WxPageChat page, string text) {
+        app.mouseX = 500;
+        app.mouseY = 180;
+        page.OpenBubbleMenu(0, text);
+        Paint(app, page);
+        ContextMenu menu = app.overlayHost.ActiveRoot() as ContextMenu;
+        Check(menu != null && menu == page.bubbleMenu && menu.IsOpen(), "real page owns retained menu");
+        Check(menu.items.Count == 2 && menu.items[0].action == 0 && menu.items[1].action == 1,
+            "stable copy zero quote one");
+        return menu;
+    }
+
+    static ChatMessage Message(string id, string text) {
+        ChatMessage message = ChatMessage.Create("assistant", text);
+        message.msgId = id;
+        return message;
+    }
+
+    static void SetNavigationHosts(Control root, WxPageChat page) {
+        // Same original App.html hosts and real Pick body; unrelated pages stay null.
+        WechatMenuCandidateShell.chatPage = page;
+        WechatMenuCandidateShell.ChatHost = root.Find("ChatHost");
+        WechatMenuCandidateShell.ContactsHost = root.Find("ContactsHost");
+        WechatMenuCandidateShell.FavsHost = root.Find("FavsHost");
+        WechatMenuCandidateShell.WorkHost = root.Find("WorkHost");
+        WechatMenuCandidateShell.BitableHost = root.Find("BitableHost");
+        WechatMenuCandidateShell.AgentHost = root.Find("AgentHost");
+        WechatMenuCandidateShell.FlowAgentHost = root.Find("FlowAgentHost");
+        WechatMenuCandidateShell.NotifyHost = root.Find("NotifyHost");
+        WechatMenuCandidateShell.DocsHost = root.Find("DocsHost");
+        WechatMenuCandidateShell.AdminHost = root.Find("AdminHost");
+        Check(WechatMenuCandidateShell.ChatHost != null && WechatMenuCandidateShell.ContactsHost != null
+            && WechatMenuCandidateShell.FavsHost != null && WechatMenuCandidateShell.WorkHost != null
+            && WechatMenuCandidateShell.BitableHost != null && WechatMenuCandidateShell.AgentHost != null
+            && WechatMenuCandidateShell.FlowAgentHost != null && WechatMenuCandidateShell.NotifyHost != null
+            && WechatMenuCandidateShell.DocsHost != null && WechatMenuCandidateShell.AdminHost != null,
+            "original App.html provides every production navigation host");
+        WechatMenuCandidateShell.ChatHost.Add(page);
+        WechatMenuCandidateShell.Pick(0);
+    }
+
+    static void ClearNavigationHosts() {
+        WechatMenuCandidateShell.chatPage = null;
+        WechatMenuCandidateShell.ChatHost = null;
+        WechatMenuCandidateShell.ContactsHost = null;
+        WechatMenuCandidateShell.FavsHost = null;
+        WechatMenuCandidateShell.WorkHost = null;
+        WechatMenuCandidateShell.BitableHost = null;
+        WechatMenuCandidateShell.AgentHost = null;
+        WechatMenuCandidateShell.FlowAgentHost = null;
+        WechatMenuCandidateShell.NotifyHost = null;
+        WechatMenuCandidateShell.DocsHost = null;
+        WechatMenuCandidateShell.AdminHost = null;
+    }
+
+    static void DumpLayoutNode(App app, Control root, string label, Control node) {
+        if (node == null) {
+            Console.WriteLine("WX_LAYOUT " + label + " null");
+            return;
+        }
+        string parent = node.parent != null ? node.parent.Kind() + ":" + node.parent.name : "null";
+        Console.WriteLine("WX_LAYOUT " + label + " kind=" + node.Kind() + " name=" + node.name
+            + " class=" + node.ClassName + " rect=" + node.bx + "," + node.by + "," + node.bw + "," + node.bh
+            + " pref=" + node.prefW + "," + node.prefH + " visible=" + node.visible
+            + " styleVisible=" + node.StyleVisible() + " app=" + (node.FindApp() == app)
+            + " member=" + (root != null && root.ContainsInputControl(node))
+            + " display=" + node.StyleDisplay() + " direction=" + node.StyleFlexDir()
+            + " grow=" + node.StyleGrow() + " children=" + node.Children.Count + " parent=" + parent);
+    }
+
+    static void DumpChatLayout(App app, WxPageChat page) {
+        Control root = app.rootControl;
+        DumpLayoutNode(app, root, "root", root);
+        DumpLayoutNode(app, root, "shell-host", WechatMenuCandidateShell.ChatHost);
+        DumpLayoutNode(app, root, "page", page);
+        DumpLayoutNode(app, root, "content", page.Children.Count > 0 ? page.Children[0] : null);
+        DumpLayoutNode(app, root, "chat-main", page.Find("ChatMain"));
+        DumpLayoutNode(app, root, "chat", page.chat);
+        // Walk the actual parent chain too: duplicate ChatHost IDs in the two
+        // original documents must not conceal an intervening zero-size layer.
+        Control node = page.chat;
+        for (int i = 0; node != null && i < 16; i = i + 1) {
+            DumpLayoutNode(app, root, "chat-ancestor-" + i, node);
+            node = node.parent;
+        }
+        Console.WriteLine("WX_LAYOUT viewport=" + app.canvas.Width() + "," + app.canvas.Height()
+            + " pageHost=" + (page.parent == WechatMenuCandidateShell.ChatHost)
+            + " contentAdopted=" + (page.Children.Count > 0 && page.Children[0].parent == page));
+    }
+
+    static void BubbleCaller(App app, WxPageChat page) {
+        ChatView chat = page.chat;
+        if (chat == null || chat.bw <= 0 || chat.bh <= 0) { DumpChatLayout(app, page); }
+        Check(chat != null && chat.bw > 0 && chat.bh > 0, "real page lays out ChatView");
+        int hitX = -1;
+        int hitY = -1;
+        for (int y = chat.by; y < chat.by + chat.bh && hitX < 0; y = y + 4) {
+            for (int x = chat.bx; x < chat.bx + chat.bw && hitX < 0; x = x + 4) {
+                ChatHit hit = chat.HitBubble(app, x, y, false);
+                if (hit.msg == 0) { hitX = x; hitY = y; }
+            }
+        }
+        Check(hitX >= 0, "real first bubble has hittable geometry");
+        app.ProcessOffscreenInput(2, hitX, hitY, 1, 0, 0, 0);
+        Paint(app, page);
+        app.ProcessOffscreenInput(3, hitX, hitY, 1, 0, 0, 0);
+        Paint(app, page);
+        Drain(app);
+        Check(page.bubbleMenu != null && page.bubbleMenu.IsOpen(), "real ChatView right release opens caller menu");
+        DownUp(app, page.bubbleMenu.Children[0]);
+        Drain(app);
+        Check(Clipboard.GetText() == "first message", "real bubble callback copies actual body");
+    }
+
+    static void Exercise(App app, WechatLifecycleWitness witness) {
+        app.BeginOffscreenFrame();
+        // App.Root installs WxSkin before either runtime HTML document is loaded.
+        Html.Install();
+        app.UseAppCss(WxSkin.Css());
+        string shellHtml = Form.ReadDoc("src/App.html");
+        Check(shellHtml != null && shellHtml.Length > 0, "original shell document is available");
+        Control root = Html.Load(app, shellHtml, null, "");
+        Check(root != null, "original shell document builds a retained root");
+        root.Grow();
+        WxPageChat page = new WxPageChat();
+        page.UseDetach(app);
+        page.UseApp(app);
+        SetNavigationHosts(root, page);
+        app.SetRootControl(root);
+        app.EndOffscreenFrame();
+        // Real bridge Use clears demo sessions. Empty peer/conv means Open makes
+        // no request; the real WxNet remains in the compilation, without a stub.
+        WxIm.Use(page.Model(), page);
+        WxSession first = WxSession.Peer("First", "F", "primary", "", "now", 0);
+        WxSession second = WxSession.Peer("Second", "S", "info", "", "now", 0);
+        ChatMessage original = Message("m-first", "first message");
+        first.msgs.Add(original);
+        second.msgs.Add(Message("m-second", "second message"));
+        page.Model().Add(first);
+        page.Model().Add(second);
+        page.Select(0);
+        Paint(app, page);
+        Drain(app);
+        BubbleCaller(app, page);
+
+        ContextMenu menu = Open(app, page, "selected copy");
+        // IDs remain semantic even if localized labels change.
+        menu.items[0].label = "Copy renamed";
+        menu.items[1].label = "Quote renamed";
+        DownUp(app, menu.Children[0]);
+        Drain(app);
+        Check(menu.SelectedAction() == 0 && Clipboard.GetText() == "selected copy",
+            "action zero calls real clipboard with selected text");
+        Check(!menu.IsOpen(), "copy closes retained menu");
+
+        menu = Open(app, page, "selected quote");
+        DownUp(app, menu.Children[1]);
+        Drain(app);
+        Check(menu.SelectedAction() == 1 && WxIm.quoteIdPending == "m-first"
+            && WxIm.quoteTextPending == "selected quote" && WxIm.quoteWhoPending == "First"
+            && page.quoteBar.visible, "action one calls real SetQuoteDraft and quote UI");
+        WxIm.DismissQuoteDraft();
+        menu = Open(app, page, "");
+        DownUp(app, menu.Children[1]);
+        Drain(app);
+        Check(WxIm.quoteTextPending == "first message", "empty selected quote uses actual message body");
+        WxIm.DismissQuoteDraft();
+
+        Clipboard.SetText("session sentinel");
+        menu = Open(app, page, "stale session");
+        Control oldCopy = menu.Children[0];
+        DownUp(app, oldCopy);
+        page.Select(1);
+        Drain(app);
+        Check(!menu.IsOpen() && Clipboard.GetText() == "session sentinel"
+            && WxIm.quoteIdPending == "", "queued action cannot cross real session switch");
+        page.Select(0);
+
+        menu = Open(app, page, "stale replaced message");
+        DownUp(app, menu.Children[1]);
+        first.msgs[0] = Message("m-replaced", "replacement");
+        Drain(app);
+        Check(WxIm.quoteIdPending == "", "same index replacement cannot quote different message");
+        first.msgs[0] = original;
+        page.RebindChat();
+
+        menu = Open(app, page, "stale cleared message");
+        DownUp(app, menu.Children[1]);
+        page.ClearCurrent();
+        Drain(app);
+        Check(!menu.IsOpen() && first.msgs.Count == 0 && WxIm.quoteIdPending == "",
+            "real clear closes menu and invalidates queued payload");
+        first.msgs.Add(original);
+        page.Select(0);
+
+        menu = Open(app, page, "escape");
+        Control oldRow = menu.Children[0];
+        oldRow.Click.PostS(oldRow);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 27, 0, 0);
+        Check(!menu.IsOpen(), "Escape dismisses real page menu");
+        menu = Open(app, page, "current");
+        Clipboard.SetText("stale row sentinel");
+        Drain(app);
+        Check(menu.IsOpen() && Clipboard.GetText() == "stale row sentinel", "prior menu generation cannot act");
+        app.ProcessOffscreenInput(2, 1100, 700, 0, 0, 0, 0);
+        Check(!menu.IsOpen(), "outside Down closes before Up");
+        app.ProcessOffscreenInput(3, 1100, 700, 0, 0, 0, 0);
+        Drain(app);
+
+        menu = Open(app, page, "leave chat");
+        Control closing = menu.Children[0];
+        closing.Focus(app);
+        app.CapturePointer(closing);
+        WechatMenuCandidateShell.Pick(1);
+        Drain(app);
+        Check(!menu.IsOpen() && app.GetCapturedPointer() == null && !closing.IsFocused(app),
+            "real App.Pick leaving chat releases menu focus and capture");
+        Check(!WechatMenuCandidateShell.ChatHost.visible && WechatMenuCandidateShell.ContactsHost.visible,
+            "real Pick switches visibility of original shell hosts");
+        WechatMenuCandidateShell.Pick(0);
+
+        menu = Open(app, page, "server mode");
+        page.BeginServerMode();
+        Drain(app);
+        Check(!menu.IsOpen() && page.CurrentSession() == null, "server mode closes menu before clearing model");
+        page.CloseBubbleMenu();
+        witness.Page = page;
+        witness.Menu = page.bubbleMenu;
+        witness.Chat = page.chat;
+        witness.Toolbar = page.bar;
+        witness.Drawer = page.drawerBody;
+        witness.Emoji = page.emoPanel;
+        witness.Profile = page.prof;
+        witness.Task = page.taskSheet;
+        app.SetRootControl(null);
+        ClearNavigationHosts();
+        WxIm.DismissQuoteDraft();
+        WxIm.page = null;
+        WxIm.sessions = null;
+        Console.WriteLine("wechat menu copy0 / quote1 / real clipboard / real quote draft: ok");
+        Console.WriteLine("wechat menu identity / queued session / clear / outside / Escape / leave chat: ok");
+    }
+
+    static void Main() {
+        App frame = App.CreateOffscreen("Wechat frame context", 2, 2);
+        App app = App.CreateOffscreen("Wechat retained menu", 1180, 760);
+        string clipboardBefore = Clipboard.GetText();
+        WechatLifecycleWitness witness = new WechatLifecycleWitness();
+        Exercise(app, witness);
+        Drain(app);
+        Check(witness.Page == null, "real page releases after normal root/static cleanup");
+        Check(witness.Menu == null, "retained caller menu releases with page");
+        Check(witness.Chat == null, "chat releases after normal root cleanup");
+        Check(witness.Toolbar == null, "toolbar releases without clearing business callbacks");
+        Check(witness.Drawer == null && witness.Emoji == null, "drawer and emoji callback owners release");
+        Check(witness.Profile == null && witness.Task == null, "profile and task callback owners release");
+        Check(!app.overlayHost.HasActive() && app.GetCapturedPointer() == null,
+            "caller cleanup leaves no active popup input");
+        Clipboard.SetText(clipboardBefore);
+        app.canvas.Destroy();
+        frame.canvas.Destroy();
+        Console.WriteLine("wechat_contextmenu_callers: ok");
+    }
+}

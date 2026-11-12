@@ -1,0 +1,191 @@
+using System;
+using Gui;
+
+namespace Gui;
+
+public partial class Control {
+    // One commit point; observers see committed offsets and may reenter or retire this tree.
+    public virtual void OnScrollChanged() { }
+
+    void NotifyScrollChanged(int previousX, int previousY) {
+        if (previousX != scrollX || previousY != scrollY) { this.OnScrollChanged(); }
+    }
+
+    void CommitScrollOffset(int x, int y) {
+        int previousX = scrollX;
+        int previousY = scrollY;
+        scrollX = x;
+        scrollY = y;
+        this.NotifyScrollChanged(previousX, previousY);
+    }
+
+    // Input and paint share this viewport; composite controls may exclude fixed chrome.
+    public virtual Rect ScrollViewport() {
+        int left = computedStyle != null ? computedStyle.BorderLeftPx() : 0;
+        int top = computedStyle != null ? computedStyle.BorderTopPx() : 0;
+        int right = computedStyle != null ? computedStyle.BorderRightPx() : 0;
+        int bottom = computedStyle != null ? computedStyle.BorderBottomPx() : 0;
+        return new Rect(bx + left, by + top, bw - left - right, bh - top - bottom);
+    }
+
+    // Wheel may cover fixed content while chrome remains confined to its viewport.
+    public virtual Rect ScrollWheelViewport() { return this.ScrollViewport(); }
+    public virtual int ScrollWheelModifiers(int modifiers) { return modifiers; }
+
+    // Different fixed bands may expose independent chrome rectangles on one owner.
+    public virtual Rect ScrollBarViewport(bool horizontal) { return this.ScrollViewport(); }
+
+    // Horizontal is painted last and wins in the shared corner.
+    int ScrollBarHit(int x, int y) {
+        App app = this.App;
+        if (app == null || !this.IsScrollContainer() || this.IsDisabled()) { return 0; }
+        Rect horizontalView = this.ScrollBarViewport(true);
+        Rect verticalView = this.ScrollBarViewport(false);
+        if (scroll == null) { scroll = new ScrollState(); }
+        if (horizontalView.width > 0 && horizontalView.height > 0 && horizontalView.Contains(x,y)
+                && scroll.WantsBar(scrollExtentX, horizontalView.width, this.StyleOverflowX())) {
+            Rect horizontal = scroll.Track(app, horizontalView.x, horizontalView.y, horizontalView.width, horizontalView.height, true);
+            if (horizontal.Contains(x, y)) { return 2; }
+        }
+        if (verticalView.width > 0 && verticalView.height > 0 && verticalView.Contains(x,y)
+                && scroll.WantsBar(scrollExtent, verticalView.height, this.StyleOverflowY())) {
+            Rect vertical = scroll.Track(app, verticalView.x, verticalView.y, verticalView.width, verticalView.height, false);
+            if (vertical.Contains(x, y)) { return 1; }
+        }
+        return 0;
+    }
+
+    void ScrollDamage(App app) { app.NoteScrollDamage(bx, by, bw, bh); }
+
+    // Chrome belongs to every Control, including subclasses replacing hooks.
+    // Preview runs first; consumed chrome never invokes content drag behavior.
+    void ScrollRoutedEvent(RoutedEventArgs e) {
+        if (e.handled) { return; }
+        string ev = e.eventName;
+        string notification = "";
+        if (ev == "PointerDown" || ev == "MouseDown") {
+            this.ScrollPointerDown(e);
+            if (e.handled) { notification = "MouseDown"; }
+        } else if (ev == "PointerMove" || ev == "MouseMove") {
+            this.ScrollPointerMove(e);
+            if (e.handled) { notification = "Move"; }
+        } else if (ev == "PointerUp" || ev == "MouseUp") {
+            this.ScrollPointerUp(e);
+            if (e.handled) { notification = "MouseUp"; }
+        } else if (ev == "PointerCancel" || ev == "MouseCancel") {
+            this.ScrollPointerCancel(e);
+            if (e.handled) { notification = "Cancel"; }
+        }
+        if (notification != "") { this.TriggerEvent(notification); }
+    }
+
+    void ScrollWheel(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.handled || app == null || !this.StyleVisible() || this.IsDisabled()
+            || !this.IsScrollContainer()) { return; }
+        Rect view = this.ScrollViewport();
+        if (!this.ScrollWheelViewport().Contains(e.x, e.y)) { return; }
+        if (scroll == null) { scroll = new ScrollState(); }
+        int previousX = scrollX;
+        int previousY = scrollY;
+        if (scroll.WheelDelta(app, e.delta, this.ScrollWheelModifiers(e.modifiers), view.width, view.height,
+                             this, this.StyleOverflowX(), this.StyleOverflowY())) {
+            this.ScrollDamage(app);
+            e.Handle();
+            this.NotifyScrollChanged(previousX, previousY);
+        }
+    }
+
+    void ScrollPointerDown(RoutedEventArgs e) {
+        if (e.handled || e.originalSource != this) { return; }
+        App app = this.App;
+        if (app == null || app.window.EventButton() != 0) { return; }
+        int axis = this.ScrollBarHit(e.x, e.y);
+        if (axis == 0) { return; }
+        Rect view = this.ScrollBarViewport(axis == 2);
+        int nextX = scrollX;
+        int nextY = scrollY;
+        if (axis == 2) {
+            nextX = scroll.BeginDrag(app, true, e.x, view.x, view.width, scrollExtentX, scrollX);
+        } else {
+            nextY = scroll.BeginDrag(app, false, e.y, view.y, view.height, scrollExtent, scrollY);
+        }
+        app.CapturePointer(this, true);
+        isPressed = true;
+        this.ScrollDamage(app);
+        e.Handle();
+        this.CommitScrollOffset(nextX, nextY);
+    }
+
+    void ScrollPointerMove(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.handled || app == null || scroll == null || !scroll.Active()
+            || app.GetCapturedPointer() != this) { return; }
+        if (this.IsDisabled() || !this.StyleVisible() || !this.IsScrollContainer()) {
+            this.ScrollPointerCancel(e);
+            return;
+        }
+        Rect view = this.ScrollBarViewport(scroll.Horizontal());
+        int mode = scroll.Horizontal() ? this.StyleOverflowX() : this.StyleOverflowY();
+        int client = scroll.Horizontal() ? view.width : view.height;
+        int extent = scroll.Horizontal() ? scrollExtentX : scrollExtent;
+        if (mode < 2 || client <= 0 || extent <= client
+            || scroll.ThumbLength(app, client, extent) >= client) {
+            this.ScrollPointerCancel(e);
+            return;
+        }
+        int nextX = scrollX;
+        int nextY = scrollY;
+        if (scroll.Horizontal()) {
+            nextX = scroll.MoveDrag(app, e.x, view.width, scrollExtentX, scrollX);
+        } else {
+            nextY = scroll.MoveDrag(app, e.y, view.height, scrollExtent, scrollY);
+        }
+        this.ScrollDamage(app);
+        e.Handle();
+        this.CommitScrollOffset(nextX, nextY);
+    }
+
+    void ScrollPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.handled || app == null || app.window.EventButton() != 0
+            || app.GetCapturedPointer() != this || scroll == null || !scroll.Active()) { return; }
+        Rect view = this.ScrollBarViewport(scroll.Horizontal());
+        int nextX = scrollX;
+        int nextY = scrollY;
+        if (!this.IsDisabled() && this.StyleVisible() && this.IsScrollContainer()) {
+            if (scroll.Horizontal() && this.StyleOverflowX() >= 2) {
+                nextX = scroll.MoveDrag(app, e.x, view.width, scrollExtentX, scrollX);
+            } else if (!scroll.Horizontal() && this.StyleOverflowY() >= 2) {
+                nextY = scroll.MoveDrag(app, e.y, view.height, scrollExtent, scrollY);
+            }
+        }
+        // Retire the old gesture before a callback can start a new one.
+        this.ScrollPointerCancel(e);
+        this.CommitScrollOffset(nextX, nextY);
+    }
+
+    void ScrollPointerCancel(RoutedEventArgs e) {
+        if (scroll == null || !scroll.Active()) { return; }
+        scroll.Cancel();
+        isPressed = false;
+        isHovered = false;
+        App app = this.App;
+        if (app != null) {
+            if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+            this.ScrollDamage(app);
+        }
+        e.Handle();
+    }
+
+    void PaintScrollBars(App app) {
+        if (!this.IsScrollContainer()) { return; }
+        if (scroll == null) { scroll = new ScrollState(); }
+        Rect verticalView = this.ScrollBarViewport(false);
+        Rect horizontalView = this.ScrollBarViewport(true);
+        scroll.Bar(app, verticalView.x, verticalView.y, verticalView.width, verticalView.height,
+                   scrollY, scrollExtent, this.StyleOverflowY());
+        scroll.BarX(app, horizontalView.x, horizontalView.y, horizontalView.width, horizontalView.height,
+                    scrollX, scrollExtentX, this.StyleOverflowX());
+    }
+}

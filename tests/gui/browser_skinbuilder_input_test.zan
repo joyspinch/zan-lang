@@ -1,0 +1,199 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// Compile with -DGUI_CALLER_INPUT_TEST and the original Browser/Tab/SkinBuilder sources.
+class BrowserSkinBuilderInputTest {
+    public weak Input browserAddress;
+    public weak Control skinRoot;
+    public weak TextArea skinCss;
+    public weak ColorPicker skinPicker;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void Click(App app, Control control) {
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        Check(control.bw > 0 && control.bh > 0, "click has visible geometry: " + control.Kind()
+            + " name=" + control.name + " rect=" + control.bx + "," + control.by + "," + control.bw + "," + control.bh);
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static void PaintBrowser(App app, int width) {
+        app.BeginOffscreenFrame();
+        Browser.RenderToolbar(app, 0, 20, width, 48);
+        app.EndOffscreenFrame();
+    }
+
+    static void BrowserInput(App app, BrowserSkinBuilderInputTest witness) {
+        Browser.BuildControls(app);
+        PaintBrowser(app, 1000);
+        Click(app, Browser.address);
+        Check(Browser.address.IsFocused(app), "browser address receives routed focus");
+        Browser.address.SetText("");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 0x4E2D, 0, 0);
+        Check(Browser.address.GetText() == "中", "browser address receives IME commit before paint");
+        PaintBrowser(app, 1000);
+        PaintBrowser(app, 1000);
+        Check(Browser.address.GetText() == "中", "browser paint cannot replay text");
+        app.CapturePointer(Browser.address);
+        PaintBrowser(app, 80);
+        Check(!Browser.address.IsFocused(app) && app.GetCapturedPointer() == null,
+            "browser collapsed address releases focus and capture");
+        PaintBrowser(app, 1000);
+        Click(app, Browser.address);
+        Input replaced = Browser.address;
+        app.CapturePointer(replaced);
+        Browser.BuildControls(app);
+        Check(!replaced.IsFocused(app) && app.GetCapturedPointer() == null,
+            "browser rebuild releases replaced input");
+        PaintBrowser(app, 1000);
+        Click(app, Browser.address);
+        app.CapturePointer(Browser.address);
+        Input closing = Browser.address;
+        witness.browserAddress = closing;
+        Browser.ReleaseControls();
+        Check(!closing.IsFocused(app) && app.GetCapturedPointer() == null && app.rootControl == null
+            && Browser.address == null && Browser.app == null, "browser close releases input root");
+        Console.WriteLine("browser address routed / IME / repaint / resize / replace / close: ok");
+    }
+
+    static void PaintSkin(App app, int width, int height) {
+        app.BeginOffscreenFrame();
+        SkinBuilder.LayoutInputs(app, width, height);
+        Check(SkinBuilder.viewportA.ContainsInputControl(SkinBuilder.nameInput),
+            "layout preserves original name input membership");
+        SkinBuilder.inputRoot.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+
+    static void PickerInput(App app, ColorPicker picker) {
+        Click(app, picker);
+        Check(picker.IsOpen(), "real column picker opens through routed click");
+        app.BeginOffscreenFrame();
+        app.overlayHost.RenderAll(app);
+        app.EndOffscreenFrame();
+        Check(picker.ModeName() == "hex" && picker.inputView == 1 && picker.inHex.visible,
+            "actual caller popup selects visible HEX channel");
+        Check(picker.palettePanel.bw > 0 && picker.palettePanel.bh > 0
+            && picker.inHex.bw > 0 && picker.inHex.bh > 0,
+            "actual caller popup lays out mounted palette and HEX input");
+        Click(app, picker.inHex);
+        picker.inHex.SetText("");
+        string value = "#123456";
+        for (int i = 0; i < value.Length; i = i + 1) {
+            app.ProcessOffscreenInput(6, 0, 0, 0, value[i], 0, 0);
+        }
+        Check(picker.inHex.GetText() == value, "column popup channel receives text before paint");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 13, 0, 0);
+        Check(ColorPicker.RgbOf(picker.Value()) == 0x123456, "column popup commits routed Enter");
+        picker.SetOpen(false);
+    }
+
+    static void CheckNameTree(string stage) {
+        Control row = SkinBuilder.nameInput.parent;
+        Check(row == SkinBuilder.colA.Children[0] && row != null && row.parent == SkinBuilder.colA
+            && SkinBuilder.colA.parent == SkinBuilder.viewportA
+            && SkinBuilder.viewportA.parent == SkinBuilder.inputRoot
+            && SkinBuilder.viewportA.ContainsInputControl(SkinBuilder.nameInput),
+            stage + " preserves name input parent chain and membership");
+    }
+
+    static void SkinInput(App app, BrowserSkinBuilderInputTest witness) {
+        SkinBuilder.app = app;
+        SkinBuilder.BuildControls();
+        CheckNameTree("built");
+        PaintSkin(app, 1500, 920);
+        CheckNameTree("painted");
+        Check(SkinBuilder.colA.parent == SkinBuilder.viewportA && SkinBuilder.colB.parent == SkinBuilder.viewportB
+            && SkinBuilder.cssBox.parent == SkinBuilder.inputRoot, "skin inputs have one retained parent");
+        Click(app, SkinBuilder.nameInput);
+        SkinBuilder.nameInput.SetText("");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 0x4E2D, 0, 0);
+        Check(SkinBuilder.nameInput.GetText() == "中", "skin name receives IME before repaint");
+        PaintSkin(app, 1500, 920);
+        Check(SkinBuilder.nameInput.GetText() == "中", "skin paint does not replay name input");
+        PickerInput(app, SkinBuilder.pGrid);
+        PaintSkin(app, 1500, 920);
+        Check(SkinBuilder.BuildCss(false).Contains("#123456"), "real column B text edits generated CSS");
+        PickerInput(app, SkinBuilder.pal[0]);
+        PaintSkin(app, 1500, 920);
+        Check(SkinBuilder.BuildCss(false).Contains("--chart-1: #123456"), "real column A text edits generated CSS");
+        SkinBuilder.cssBox.SetText("");
+        Click(app, SkinBuilder.cssBox);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Check(SkinBuilder.cssBox.GetText() == "A", "CSS textarea edits before repaint");
+        PaintSkin(app, 1500, 920);
+        Check(SkinBuilder.cssBox.GetText() == "A", "CSS textarea paint cannot replay text");
+        app.ProcessOffscreenInput(4, 0, 0, 0, 65, Modifiers.Ctrl(), 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 0x6587, 0, 0);
+        Check(SkinBuilder.cssBox.GetText() == "文", "CSS textarea selection is routed");
+        Click(app, SkinBuilder.nameInput);
+        app.CapturePointer(SkinBuilder.nameInput);
+        CheckNameTree("before-hidden");
+        PaintSkin(app, 1500, 150);
+        CheckNameTree("after-hidden");
+        Check(!SkinBuilder.nameInput.IsFocused(app) && app.GetCapturedPointer() == null,
+            "hidden columns release focus and capture: focused=" + SkinBuilder.nameInput.IsFocused(app)
+            + " captured=" + (app.GetCapturedPointer() != null)
+            + " captureName=" + (app.GetCapturedPointer() == SkinBuilder.nameInput)
+            + " member=" + SkinBuilder.viewportA.ContainsInputControl(app.GetCapturedPointer())
+            + " visible=" + SkinBuilder.viewportA.Visible
+            + " viewport=" + SkinBuilder.viewportA.bx + "," + SkinBuilder.viewportA.by + ","
+            + SkinBuilder.viewportA.bw + "," + SkinBuilder.viewportA.bh
+            + " name=" + SkinBuilder.nameInput.bx + "," + SkinBuilder.nameInput.by + ","
+            + SkinBuilder.nameInput.bw + "," + SkinBuilder.nameInput.bh
+            + " pad=" + app.Scale(14) + " strip=" + app.Scale(120) + " title=" + app.titlebarH);
+        PaintSkin(app, 1500, 920);
+        SkinBuilder.pTipBorder.SetOpen(true);
+        app.BeginOffscreenFrame();
+        app.overlayHost.RenderAll(app);
+        app.EndOffscreenFrame();
+        SkinBuilder.pTipBorder.inHex.Focus(app);
+        app.CapturePointer(SkinBuilder.pTipBorder.inHex);
+        PaintSkin(app, 1500, 250);
+        Check(!SkinBuilder.pTipBorder.IsOpen() && !SkinBuilder.pTipBorder.inHex.IsFocused(app)
+            && app.GetCapturedPointer() == null, "clipped picker closes popup and releases channel input");
+        PaintSkin(app, 1500, 920);
+        SkinBuilder.pTipBorder.Focus(app);
+        app.CapturePointer(SkinBuilder.pTipBorder);
+        PaintSkin(app, 1500, 250);
+        Check(!SkinBuilder.pTipBorder.IsFocused(app) && app.GetCapturedPointer() == null,
+            "clipped column descendant releases focus and capture");
+        Check(SkinBuilder.viewportB.HitTest(SkinBuilder.pTipBorder.bx, SkinBuilder.pTipBorder.by, 0) == null,
+            "clipped descendant cannot receive pointer hit");
+        PaintSkin(app, 1500, 920);
+        Click(app, SkinBuilder.cssBox);
+        TextArea replaced = SkinBuilder.cssBox;
+        app.CapturePointer(replaced);
+        SkinBuilder.BuildControls();
+        Check(!replaced.IsFocused(app) && app.GetCapturedPointer() == null,
+            "skin rebuild releases old tree");
+        PaintSkin(app, 1500, 920);
+        Click(app, SkinBuilder.cssBox);
+        app.CapturePointer(SkinBuilder.cssBox);
+        TextArea closing = SkinBuilder.cssBox;
+        witness.skinRoot = SkinBuilder.inputRoot;
+        witness.skinCss = closing;
+        witness.skinPicker = SkinBuilder.pGrid;
+        SkinBuilder.ReleaseControls();
+        Check(!closing.IsFocused(app) && app.GetCapturedPointer() == null && app.rootControl == null
+            && SkinBuilder.app == null && SkinBuilder.cssBox == null, "skin close releases all inputs");
+        Console.WriteLine("skin name / both color columns / CSS selection / repaint / clip / replace / close: ok");
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Real caller inputs", 1500, 920);
+        BrowserSkinBuilderInputTest witness = new BrowserSkinBuilderInputTest();
+        BrowserInput(app, witness);
+        Check(witness.browserAddress == null, "browser input releases before process exit");
+        SkinInput(app, witness);
+        Check(witness.skinRoot == null && witness.skinCss == null && witness.skinPicker == null,
+            "skin input tree releases before process exit");
+        app.canvas.Destroy();
+        Console.WriteLine("browser_skinbuilder_input: ok");
+    }
+}

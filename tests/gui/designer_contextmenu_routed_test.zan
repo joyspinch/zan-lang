@@ -1,0 +1,178 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+class RibbonCounter { public int Count; public void Run() { Count = Count + 1; } }
+class RibbonWeak { public weak Ribbon Tab; public weak Ribbon Item; public weak Ribbon Cmd; }
+class DesignerMenuWitness {
+    public weak Designer Owner;
+    public ContextMenu Menu;
+}
+class DesignerContextMenuRoutedTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static void Input(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void Click(App app, Control control) {
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        Input(app, 2, x, y, 0, 0);
+        Check(app.GetCapturedPointer() == control, "real caller item down captures");
+        Input(app, 3, x, y, 0, 0);
+        Drain(app);
+    }
+    static Control Item(ContextMenu menu, int action) {
+        for (int i = 0; i < menu.items.Count; i = i + 1) {
+            if (menu.items[i].kind == 0 && menu.items[i].action == action) { return menu.Children[i]; }
+        }
+        throw new Exception("missing action " + Convert.ToString(action));
+    }
+    static void Paint(App app) {
+        app.BeginOffscreenFrame(); app.overlayHost.RenderAll(app); app.overlayHost.RenderAll(app); app.EndOffscreenFrame();
+    }
+    static Designer Create() {
+        Designer d = new Designer();
+        d.LoadHtmlText("<html><body data-zan-design id=\"Menu\" data-win-w=\"640\" data-win-h=\"480\" data-layout-mode=\"1\">"
+            + "<button id=\"A\" data-position=\"1\" data-fx=\"10\" data-fy=\"20\" data-fw=\"80\" data-fh=\"30\">A</button>"
+            + "<button id=\"B\" data-position=\"1\" data-fx=\"110\" data-fy=\"70\" data-fw=\"80\" data-fh=\"30\">B</button>"
+            + "<button id=\"C\" data-position=\"1\" data-fx=\"210\" data-fy=\"120\" data-fw=\"80\" data-fh=\"30\">C</button></body></html>");
+        return d;
+    }
+    static void FourMenus() {
+        App app = App.CreateOffscreen("designer menus", 1100, 1000);
+        Designer d = Create();
+        d.RunRibbon(app, "zoommenu");
+        ContextMenu zoom = d.zoomMenuCtl;
+        Check(zoom.IsOpen() && app.overlayHost.ActiveRoot() == zoom, "zoom command opens registered menu");
+        Click(app, Item(zoom, 500));
+        Check(d.winZoom == 500 && !d.zoomMenuOpen && !app.overlayHost.HasActive(), "zoom uses routed stable preset");
+        Paint(app); Check(d.winZoom == 500, "paint cannot replay selected zoom");
+        d.RunRibbon(app, "dpimenu");
+        Click(app, Item(d.dpiMenuCtl, 150));
+        Check(d.targetDpi == 150 && !d.dpiMenuOpen, "DPI command selects registered preset once");
+        d.sel = d.fields[0];
+        List<string> labels = new List<string>(); labels.Add("arbitrary translated command");
+        List<string> actions = new List<string>(); actions.Add("lock");
+        d.ribbonMenuLabels = labels;
+        d.OpenRibbonOverflow(actions);
+        ContextMenu ribbon = d.ribbonMenuCtl;
+        Check(ribbon != null && ribbon.IsOpen(), "ribbon overflow actual entry opens host menu");
+        Click(app, Item(ribbon, 0));
+        Check(d.fields[0].locked && !d.ribbonMenuOpen && d.undoStack.Count == 1,
+            "ribbon action uses command snapshot and preserves undo");
+        d.Undo(); Check(!d.fields[0].locked, "ribbon lock undo restores document");
+
+        d.sel = d.fields[0]; d.freeExtra.Add(d.fields[1]);
+        Input(app, 2, 20, 20, 1, 0);
+        d.OpenCanvasMenu(app, 20, 20);
+        ContextMenu canvas = d.canvasMenuCtl;
+        Control lockItem = Item(canvas, 25);
+        for (int i = 0; i < canvas.items.Count; i = i + 1) {
+            if (canvas.items[i].action == 25) { canvas.items[i].label = "label no longer identifies action"; }
+        }
+        d.sel = d.fields[2]; d.ClearExtraSel();
+        Input(app, 3, lockItem.bx + 4, lockItem.by + 4, 1, 0);
+        Drain(app);
+        Check(!d.fields[0].locked && !d.fields[1].locked && !d.fields[2].locked,
+            "right opening release never selects caller menu");
+        int before = d.undoStack.Count;
+        Click(app, lockItem);
+        Check(d.fields[0].locked && d.fields[1].locked && !d.fields[2].locked
+            && d.sel == d.fields[0] && d.freeExtra.Count == 1 && d.freeExtra[0] == d.fields[1]
+            && d.undoStack.Count == before + 1, "canvas fixed multi target snapshot and stable action preserve undo");
+        Paint(app); Check(d.undoStack.Count == before + 1, "caller paint cannot replay lock");
+        d.Undo(); Check(!d.fields[0].locked && !d.fields[1].locked, "canvas multi lock undo restores targets");
+        d.sel = d.fields[2]; d.ClearExtraSel();
+        d.OpenCanvasMenu(app, 20, 20);
+        Click(app, Item(d.canvasMenuCtl, 21));
+        Check(d.fields[0].fname == "C", "canvas stable z action brings opening target to front");
+        d.Undo(); Check(d.fields[0].fname == "A", "z action undo preserves ordering");
+        d.CloseDesignerMenus(); d.DisposeDesignPreview(); Drain(app); app.canvas.Destroy();
+    }
+    static void Closing() {
+        App app = App.CreateOffscreen("designer close", 1100, 1000);
+        Designer d = Create();
+        d.OpenZoomMenu(app, 20, 20);
+        Input(app, 2, 1090, 990, 0, 0); Input(app, 3, 1090, 990, 0, 0);
+        Check(!d.zoomMenuOpen && !app.overlayHost.HasActive(), "outside pair closes real caller state");
+        d.OpenDpiMenu(app, 20, 20); Input(app, 4, 0, 0, 0, 27);
+        Check(!d.dpiMenuOpen && !app.overlayHost.HasActive(), "Esc closes caller registration");
+        d.OpenCanvasMenu(app, 20, 20); Input(app, 9, 0, 0, 0, 0);
+        Check(!d.canvasMenuOpen && !app.overlayHost.HasActive(), "blur closes caller registration");
+        d.OpenZoomMenu(app, 20, 20); ContextMenu old = d.zoomMenuCtl;
+        d.OpenDpiMenu(app, 30, 30); app.overlayHost.Hide(old);
+        Check(d.dpiMenuCtl.IsOpen() && app.overlayHost.ActiveRoot() == d.dpiMenuCtl, "stale caller Hide preserves replacement");
+        d.ResetInteractionState(); Check(!app.overlayHost.HasActive() && !d.dpiMenuOpen, "hidden/reset retires old popup");
+        d.OpenCanvasMenu(app, 20, 20); old = d.canvasMenuCtl;
+        d.LoadHtmlText("<html><body data-zan-design id=\"New\"></body></html>");
+        Check(!old.IsOpen() && !app.overlayHost.HasActive(), "document install actually Hides old popup");
+        d.OpenZoomMenu(app, 20, 20);
+        d.RenderPinned(app, 0, 0, 0, 0);
+        Check(!app.overlayHost.HasActive(), "zero-size hidden caller Hides popup");
+        d.OpenZoomMenu(app, 20, 20);
+        d.NewEditorWindow(app, 300, 200, "modal");
+        Check(!app.overlayHost.HasActive(), "Dialog path Hides old popup");
+        d.DisposeDesignPreview(); Drain(app); app.canvas.Destroy();
+    }
+    static void Borrow(DesignerMenuWitness witness, App app) {
+        Designer d = Create(); witness.Owner = d;
+        d.OpenZoomMenu(app, 20, 20); witness.Menu = d.zoomMenuCtl;
+        d.ResetInteractionState(); d.DisposeDesignPreview();
+    }
+    static void VisibleRibbonBorrow(DesignerMenuWitness witness, App app) {
+        Designer d = Create(); witness.Owner = d;
+        app.BeginOffscreenFrame();
+        d.RenderRibbon(app, app.canvas, app.theme, 0, 0, 1000);
+        d.RenderRibbon(app, app.canvas, app.theme, 0, 0, 1000);
+        app.EndOffscreenFrame();
+        d.DisposeDesignPreview();
+    }
+    static void RibbonTrees(RibbonWeak witness, App app) {
+        RibbonCounter count = new RibbonCounter();
+        Ribbon tabs = new Ribbon(); tabs.AddTab("one"); tabs.AddTab("two"); witness.Tab = tabs;
+        app.SetRootControl(tabs); tabs.MeasureTree(app); tabs.Arrange(0, 0, 1000, 200);
+        Control tab = tabs.Children[0].Children[1];
+        Click(app, tab); Check(tabs.activeTab.Get() == 1 && tab.FindApp() == null, "tab action rebuilds and detaches old tab");
+        Ribbon ribbon = new Ribbon(); RibbonGroup group = new RibbonGroup("group");
+        group.Add(RibbonItem.Small("", "command")); ribbon.AddGroup(group); witness.Item = ribbon;
+        ribbon.CommandClicked.Add(count.Run);
+        app.SetRootControl(ribbon); ribbon.MeasureTree(app); ribbon.Arrange(0, 0, 1000, 200);
+        Control button = ribbon.Children[0].Children[0].Children[0].Children[0];
+        Click(app, button); Check(count.Count == 1, "group item action notifies once");
+        Input(app, 2, button.bx + 4, button.by + 4, 0, 0);
+        Check(app.GetCapturedPointer() == button, "rebuild test establishes real capture");
+        app.focus.SetFocused(button.WidgetId(), button);
+        ribbon.BuildTree();
+        Check(app.GetCapturedPointer() == null && button.FindApp() == null
+            && !app.focus.IsFocused(button.WidgetId()), "BuildTree retires old capture focus and host");
+        Input(app, 3, button.bx + 4, button.by + 4, 0, 0); Drain(app);
+        button.TriggerEvent("Click"); Drain(app);
+        Check(count.Count == 1, "retired queued item cannot replay into rebuilt Ribbon");
+        Ribbon commands = new Ribbon(); RibbonCmd command = new RibbonCmd("", "flat"); command.act = 19;
+        commands.AddCommand(command); witness.Cmd = commands; commands.CommandClicked.Add(count.Run);
+        app.SetRootControl(commands); commands.MeasureTree(app); commands.Arrange(0, 0, 1000, 200);
+        Click(app, commands.Children[0].Children[0]);
+        Check(count.Count == 2 && commands.lastAct == 19, "flat command retains action code and notification");
+        app.SetRootControl(null);
+    }
+    static void Main() {
+        FourMenus(); Closing();
+        App ribbonApp = App.CreateOffscreen("visible ribbon formal", 1100, 500);
+        DesignerMenuWitness visible = new DesignerMenuWitness(); VisibleRibbonBorrow(visible, ribbonApp);
+        Check(visible.Owner == null, "visible Designer Ribbon rebuild does not retain business owner");
+        RibbonWeak witness = new RibbonWeak(); RibbonTrees(witness, ribbonApp);
+        Check(witness.Tab == null && witness.Item == null && witness.Cmd == null, "tab item and flat command trees release without clearing subscriptions");
+        Drain(ribbonApp); ribbonApp.canvas.Destroy();
+        App app = App.CreateOffscreen("weak designer", 1100, 1000);
+        DesignerMenuWitness witness = new DesignerMenuWitness(); Borrow(witness, app);
+        Check(witness.Owner == null && witness.Menu.ActionSelected.CountAll() == 1,
+            "retained menu configuration borrows owner without clearing normal callbacks");
+        witness.Menu = null; Drain(app); app.canvas.Destroy();
+        Console.WriteLine("DESIGNER_CONTEXTMENU_ROUTED_OK");
+    }
+}

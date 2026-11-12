@@ -1,0 +1,227 @@
+using System;
+using Gui;
+
+class LoopOwner : AppLoopOwner { public int marker; }
+
+class LoopProbe : AppLoopParticipant {
+    public weak LoopOwner owner;
+    public AppLoopRegistration ticket;
+    public AppLoopRegistration cancelOther;
+    public AppLoopParticipant addNext;
+    public weak AppLoopOwner addOwner;
+    public int calls;
+    public int due = -1;
+    public int fired;
+    public bool stop;
+    public int posted;
+    public int observedPosts;
+    public void Posted() { posted = posted + 1; }
+
+    public int NextDeadline() { return due; }
+    public void Tick(App app, int now) {
+        calls = calls + 1;
+        observedPosts = posted;
+        if (cancelOther != null) { cancelOther.Invalidate(); cancelOther = null; }
+        if (addNext != null) {
+            AppLoopParticipant next = addNext;
+            addNext = null;
+            app.RegisterLoopParticipant(addOwner, next);
+        }
+        if (due >= 0 && now >= due) { due = -1; fired = fired + 1; app.RequestRedraw(); }
+        if (stop) { app.StopLoop(); }
+    }
+}
+
+class LoopReparentAction : Control {
+    public weak ChildWindow child;
+    public weak App targetApp;
+    public bool entered;
+    public override void OnPointerDown(RoutedEventArgs e) {
+        if (entered) { return; }
+        entered = true;
+        ChildWindow window = child;
+        App host = targetApp;
+        if (window == null || host == null) { return; }
+        window.parentApp = null;
+        host.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+class AppLoopParticipantTest {
+    public weak App weakApp;
+    public weak LoopOwner weakOwner;
+    public weak LoopProbe weakProbe;
+    public AppLoopRegistration detachedTicket;
+
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static void Turn(App app) { app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0); }
+
+    static void Basic(App app) {
+        LoopOwner owner = new LoopOwner();
+        LoopProbe probe = new LoopProbe();
+        probe.owner = owner;
+        AppLoopRegistration ticket = app.RegisterLoopParticipant(owner, probe);
+        Turn(app);
+        Turn(app);
+        Check(probe.calls == 2 && app.MinLoopDeadline() == -1, "deadline -1 still ticks real turns");
+        app.BeginOffscreenFrame(); app.EndOffscreenFrame();
+        app.BeginOffscreenFrame(); app.EndOffscreenFrame();
+        Check(probe.calls == 2, "paint frames do not tick participants");
+        probe.due = Window.GetTickMs() + 400;
+        ticket.Reschedule();
+        int due = probe.due;
+        Check(app.MinLoopDeadline() == due, "absolute deadline is earliest wake");
+        app.BeginOffscreenFrame(); app.EndOffscreenFrame();
+        Check(app.MinLoopDeadline() == due, "deadline survives BeginFrame wake reset");
+        probe.due = Window.GetTickMs() - 1;
+        ticket.Reschedule();
+        Turn(app);
+        Check(probe.fired == 1 && app.MinLoopDeadline() == -1, "due callback retires deadline once");
+        Turn(app);
+        Check(probe.fired == 1, "natural later turn does not replay due action");
+        ticket.Invalidate(); ticket.Invalidate();
+        Turn(app);
+        Check(!ticket.active && ticket.participant == null && probe.calls == 4, "Invalidate is idempotent and stops ticks");
+        Console.WriteLine("loop turns / paint / absolute deadline / rearm / invalidate: ok");
+    }
+
+    static void Reentrant(App app) {
+        LoopOwner owner = new LoopOwner();
+        LoopProbe first = new LoopProbe();
+        LoopProbe skipped = new LoopProbe();
+        LoopProbe later = new LoopProbe();
+        AppLoopRegistration a = app.RegisterLoopParticipant(owner, first);
+        AppLoopRegistration b = app.RegisterLoopParticipant(owner, skipped);
+        first.cancelOther = b;
+        first.addOwner = owner;
+        first.addNext = later;
+        Turn(app);
+        Check(first.calls == 1 && skipped.calls == 0 && later.calls == 0,
+            "snapshot skips canceled entry and defers new registration");
+        Turn(app);
+        Check(first.calls == 2 && later.calls == 1, "new registration runs on next real turn");
+        a.Invalidate();
+        app.ClearLoopParticipants();
+        App independent = App.CreateOffscreen("Independent loop root", 100, 100);
+        LoopProbe independentProbe = new LoopProbe();
+        AppLoopRegistration separate = independent.RegisterLoopParticipant(owner, independentProbe);
+        int enclosing = app.BeginLoopTurn();
+        Turn(independent);
+        app.EndLoopTurn(enclosing);
+        Check(independentProbe.calls == 1, "independent Apps cannot share enclosing turn depth");
+        separate.Invalidate(); independent.StopLoop(); independent.canvas.Destroy();
+        Console.WriteLine("loop reentrant invalidate / deferred registration: ok");
+    }
+
+    static void RegisterWeakOwner(App app, AppLoopParticipantTest witness) {
+        LoopOwner owner = new LoopOwner();
+        LoopProbe probe = new LoopProbe();
+        probe.owner = owner;
+        probe.due = Window.GetTickMs() + 500;
+        witness.weakOwner = owner;
+        witness.weakProbe = probe;
+        witness.detachedTicket = app.RegisterLoopParticipant(owner, probe);
+    }
+
+    static void WeakOwner(App app, AppLoopParticipantTest witness) {
+        RegisterWeakOwner(app, witness);
+        Check(witness.weakOwner == null, "registration does not own business owner");
+        Check(app.MinLoopDeadline() == -1 && witness.detachedTicket.participant == null,
+            "expired owner retires pending wake and strong participant");
+        Check(witness.weakProbe == null, "expired owner releases participant before exit");
+        Turn(app);
+        Console.WriteLine("loop weak owner / pending deadline / participant release: ok");
+    }
+
+    static void StopCases() {
+        App app = App.CreateOffscreen("Stop loop", 200, 100);
+        LoopOwner owner = new LoopOwner();
+        LoopProbe first = new LoopProbe(); first.stop = true;
+        LoopProbe second = new LoopProbe();
+        AppLoopRegistration a = app.RegisterLoopParticipant(owner, first);
+        AppLoopRegistration b = app.RegisterLoopParticipant(owner, second);
+        Turn(app);
+        Check(!app.isRunning && first.calls == 1 && second.calls == 0 && !a.active && !b.active,
+            "StopLoop during Tick retires all and aborts old snapshot");
+        app.canvas.Destroy();
+        Console.WriteLine("loop stop during callback / retired snapshot: ok");
+    }
+
+    static void ChildCases(App parent) {
+        App childApp = App.CreateOffscreen("Child loop", 200, 100);
+        ChildWindow child = new ChildWindow();
+        child.host = childApp; child.parentApp = parent; child.open = true;
+        ChildWindows.Register(child);
+        LoopOwner owner = new LoopOwner();
+        LoopProbe probe = new LoopProbe(); probe.due = Window.GetTickMs() + 400;
+        AppLoopRegistration ticket = childApp.RegisterLoopParticipant(owner, probe);
+        Check(ChildWindows.LoopDeadline(parent, -1) == probe.due, "child deadline joins parent wait");
+        int turn = parent.BeginLoopTurn();
+        childApp.TickLoopParticipantsForTurn(turn, Window.GetTickMs());
+        parent.EndLoopTurn(turn);
+        Check(probe.calls == 1, "routed child and parent tail share single turn");
+        // An idle child has no ApplyEvent, but parent turn must service it.
+        childApp.Post(probe.Posted);
+        Turn(parent);
+        Check(probe.calls == 2 && probe.posted == 1 && probe.observedPosts == 1,
+            "idle child drains actual App.Post before Tick independent of paint budget");
+        childApp.StopLoop(); child.open = false;
+        ChildWindows.Prune();
+        Check(!ticket.active && ChildWindows.LoopDeadline(parent, -1) == -1,
+            "child close retires deadline");
+        childApp.canvas.Destroy();
+        Console.WriteLine("loop child deadline / one turn / idle service / close: ok");
+    }
+
+    static void NestedRoot(App parent) {
+        App childApp = App.CreateOffscreen("Nested child loop", 200, 100);
+        ChildWindow child = new ChildWindow();
+        child.host = childApp; child.parentApp = parent; child.open = true;
+        ChildWindows.Register(child);
+        LoopReparentAction action = new LoopReparentAction();
+        action.child = child; action.targetApp = childApp;
+        childApp.SetRootControl(action);
+        action.Arrange(0, 0, 200, 100);
+        LoopOwner owner = new LoopOwner();
+        LoopProbe parentProbe = new LoopProbe();
+        AppLoopRegistration ticket = parent.RegisterLoopParticipant(owner, parentProbe);
+        // Routed Down runs before the outer input wrapper's finally. The old
+        // implementation reads the inner child's overwritten root and leaves
+        // parent.loopTurnDepth=1, so the next real parent turn never ticks.
+        childApp.ProcessOffscreenInput(2, 20, 20, 0, 0, 0, 0);
+        Check(action.entered && parent.loopTurnDepth == 0 && childApp.loopTurnDepth == 0,
+            "nested same-App routed Down restores original root after child reparent");
+        int before = parentProbe.calls;
+        Turn(parent);
+        Check(parent.loopTurnDepth == 0 && parentProbe.calls == before + 1,
+            "next real parent turn actually ticks after nested root replacement");
+        ticket.Invalidate();
+        childApp.SetRootControl(null);
+        childApp.StopLoop(); child.open = false; ChildWindows.Prune(); childApp.canvas.Destroy();
+        Console.WriteLine("loop nested child reparent / root context restore: ok");
+    }
+
+    static void HostRelease(AppLoopParticipantTest witness) {
+        App app = App.CreateOffscreen("Weak loop host", 200, 100);
+        LoopProbe probe = new LoopProbe();
+        witness.weakApp = app; witness.weakProbe = probe;
+        witness.detachedTicket = app.RegisterLoopParticipant(app, probe);
+        app.StopLoop(); app.canvas.Destroy();
+    }
+
+    static void Main() {
+        App frame = App.CreateOffscreen("Independent frame", 16, 16);
+        App app = App.CreateOffscreen("Loop participants", 640, 480);
+        AppLoopParticipantTest witness = new AppLoopParticipantTest();
+        Basic(app); Reentrant(app); WeakOwner(app, witness); ChildCases(app); NestedRoot(app); StopCases();
+        HostRelease(witness);
+        Check(witness.weakApp == null && witness.weakProbe == null
+            && witness.detachedTicket.host == null, "kept retired ticket does not own App or participant");
+        app.StopLoop(); app.canvas.Destroy(); frame.canvas.Destroy();
+        Console.WriteLine("loop weak host / retired ticket: ok");
+        Console.WriteLine("app_loop_participant: ok");
+    }
+}

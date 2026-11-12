@@ -5,10 +5,11 @@
 Zan.Gui 遵循两大标准创作范式：
 
 1. **范式一：HTML + CSS**：`Gui.Markup/Html` 将标记解析为现代盒模型，外观完全由 CSS 级联与 Theme token 决定，排版纯走 CSS（Flex/Grid/Flow）引擎；数据通过 `data-bind` 双向同步。
-2. **范式二：保留模式声明式对象树**：代码侧使用 `Children = [ ... ]`、`ClassName = "..."` 声明建树，排版纯走 Flex/Grid/Flow；动态宿主（设计器、PropertyGrid）走 `GetProp/SetProp` 属性协议；数据通过控件的 `Binding<T> data` 字段双向绑定。
+2. **范式二：保留模式声明式对象树**：代码侧使用 `Children = { ... }`、`ClassName = "..."` 或 Add/With 建树，排版纯走 Flex/Grid/Flow；动态宿主（设计器、PropertyGrid）走 `GetProp/SetProp` 属性协议。两种模式共用 PropSpec 属性元数据与 ModelBinder 投影；代码侧也可直接使用控件的 `Binding<T>` 字段。集合入口须维持 parent 和宿主继承，其共享修复验收状态见架构文档。
 
 **核心铁律**：
-- **禁止外部自绘**：全仓所有 UI 元素（包括图表曲线、仪表指针、代码高亮、游戏 HUD 等）一律封装为标准范式二控件。像素绘制严格封存在控件内部 `OnPaint` 中，对外仅暴露声明式属性配置与数据绑定。
+- **禁止外部自绘**：全仓所有 UI 元素（包括图表曲线、仪表指针、代码高亮、游戏 HUD/菜单/SceneDesigner 等）一律封装为标准范式二控件。像素绘制严格封存在控件内部 `OnPaint` 中，对外仅暴露声明式属性配置与数据绑定。
+- **游戏世界边界**：Zan.Game 世界/实体/地形渲染走引擎契约；HUD 等 UI 的像素绘制封在标准控件内部。
 - **长生命周期控件树**：`Control` 具备完整的树状对象图（`parent` 弱引用、`children` 列表、`MeasureTree`、`Arrange` 绝对坐标边界 `bx, by, bw, bh`、`RenderTree` 裁切栈）。
 - **统一路由事件分发**：全面走 **Visual Tree 路由分发**（`Tunneling` 隧穿向下 + `Bubbling` 冒泡向上，`RoutedEventArgs` 携带 `originalSource`、`source` 与 `handled` 消费标记，支持指针捕获 `App.CapturePointer`）。
 - **控件纯实例化**：控件为纯实例对象，按对象引用识别，状态仅保存在控件实例字段与树可达宿主中。无全局 ID 依赖，无全局静态可变状态，天然支持同屏多实例、多弹层与多窗口完全隔离。
@@ -16,27 +17,39 @@ Zan.Gui 遵循两大标准创作范式：
 典型应用程序循环（`Gui/App.zan` / `Form.zan`）：
 
 ```zan
-Form form = new MainForm();
-form.Run(); // 自动挂载 rootControl 到 App 并开启事件驱动渲染循环
+MainForm form = new MainForm(); // class MainForm : Form，配 MainForm.html
+form.Show(); // 查文档、初始化 App、挂树/模型与事件、调用 OnLoad，然后进入循环
 ```
+
+`Form()` 零参构造不初始化 App，不能跳过 `Show()` 装配而直接 `Run()`。
+已有 App 的页面装载用 `Gui.Html.Load(app, html, handlers, baseDir)`，返回
+树后由宿主 Add 并按需挂 ModelBinder；Parse 内自动 Install，装载不自动挂树。
+`.html` 是运行期文档，不是 zanc 编译输入，发布用 `--embed` 携带。
+
+本节的两范式、实例隔离与事件路由是开发约定；它们不表示所有遗留控件、
+包与应用已完成迁移。当前实现/目标与验证门分别见 `docs/GUI_ARCHITECTURE.md`。
 
 由此推出几条必须遵守的标准架构约定：
 
 1. **事件与输入处理走 Visual Tree 路由分发**：
    - 控件重写 `OnRoutedEvent(RoutedEventArgs e)` 或 `OnPreviewRoutedEvent(RoutedEventArgs e)` 处理事件；
    - 消费事件时显式调用 `e.Handle()`，冒泡派发自动终止；
-   - 拖拽手势（分割条、滑块、窗口移动）在按下时调用 `app.CapturePointer(this)`，释放时调用 `app.ReleasePointerCapture()`，后续位移与抬键直接定向派发。
+   - 拖拽手势（分割条、滑块、窗口移动）在按下时调用 `app.CapturePointer(this, true)`，普通按压用一参形式；触摸越过阈值时普通按压取消，显式拖动继续。主键 Up 先提交事件最终坐标再释放捕获，次键 Up 不结束主拖动；Cancel 只清理。
+   - `OnLongPress` 由共享手势状态机认领，实际 Down source 在静止500ms后投递一次，越过12px或失去输入归属时取消；组件固有长按通过 `AcceptsRetainedLongPress()` 声明，不在绘制或组件私有计时器内轮询。
+   - 换根和摘除子树会按锚点输入归属关闭旧锚定弹层，无焦点或捕获也必须退休。旧状态先于通知注销，回调中的新 capture、focus、弹层各按自身身份和代次保护，不能用输入改变作为跳过全部旧资源清理的条件。
 
 2. **控件纯实例化与状态隔离**：
    - 控件是纯实例对象，状态只存在于控件实例字段与树可达宿主上；
    - 控件按对象引用与 Visual Tree 路径识别，禁止跨实例全局静态可变状态；
    - 天然支持多实例、同屏多弹层与多窗口完全隔离。
 
-3. **数据绑定只有两条正道**：HTML 窗口用 `data-bind`（ModelBinder 自动双向同步，
-   `<template data-for>` 展开列表行）；代码侧用控件的 `Binding<T> data` 字段
-   （如 `sel.data = form.color;`，`docs/STDLIB_COMPONENT_STANDARDS.md` §6）。设计器、
-   PropertyGrid 这类动态宿主走 `GetProp/SetProp` 属性协议。`Signal*` 只作控件内部
-   状态缓冲，Zan.Gui 以外不得新建（机检拦截）。
+3. **数据绑定共用公开属性协议**：HTML 的 `data-bind` 与代码树的绑定元数据
+   都由 ModelBinder 自动双向同步，默认投影取自 PropSpec，显式 bindProp 优先；
+   `<template data-for>` 展开列表行。代码也可直接配置控件的 `Binding<T>` 字段
+   （`docs/STDLIB_COMPONENT_STANDARDS.md` §6）。设计器、PropertyGrid 等动态宿主
+   走 GetProp/SetProp。`Signal*` 只作控件内部状态缓冲，Zan.Gui 以外不得新建。
+   模型事件接线须弱持端点，Detach 或更换 root/model 时使旧队列 token 失效；
+   不能让控件闭包强持 binder 或让迟到事件作用于新模型。
 4. **UI 线程专职渲染与交互，一切耗时业务/IO/计算完全异步解耦非阻塞（开发基本铁律）**：
    - **职责边界**：UI 线程（主线程事件循环）有且仅有两项职责：分发操作系统输入事件（按键/鼠标/焦点/窗口尺寸）与推进界面排版绘制（Layout/Paint/Present）。任何单次超过 1~2ms 的操作严禁在 UI 线程执行。
    - **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络请求（HTTP/WebSocket）、磁盘文件大读写、数据库存取、大 JSON 解析、图像编解码、压缩解压、重 CPU 矩阵/分词计算或同步 `Sleep`。同步阻塞是造成界面掉帧、卡顿、甚至触发系统“未响应”白屏的万恶之源。
@@ -112,6 +125,8 @@ Canvas.EvictImage("mem:logo");                              // 丢弃（路径�
 
 **`ImageWidth<=0` 就是"图不存在/读不了"**，用它做"有截图就画截图，没有就画占位"的判断。
 
+上述 Canvas 原语供标准控件内部实现或游戏世界渲染使用；应用 UI 优先配置以下图片等标准组件。
+
 ### 图片组件 Gui.Widget.Image（传地址即渲染）
 
 `new Image(src, alt, fit)` 直接吃四类地址，按前缀自动识别：本地文件路径
@@ -133,7 +148,7 @@ Canvas.EvictImage("mem:logo");                              // 丢弃（路径�
 控件。
 
 **宿主必须自己有高度**：水印是覆盖层，自身测量 0×0、不参与排版——宿主
-容器若靠内容撑高（`Gallery.LayoutAuto`、流式面板），`Grow()`/`DockFill()`
+容器若靠内容撑高（`Gallery.LayoutAuto`、流式面板），`Grow()`
 的水印会分到 0 高、什么都不画。给宿主 `Prefer(0, 高度)`（stack 面板不吃
 CSS height，`Prefer` 才设置 `prefSet`）。另外 `Panel.Column` 的样式类型是
 `stack` 不是 `panel`，给演示容器写皮肤要写 `stack.xxx`。
@@ -240,7 +255,7 @@ smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size
 | --- | --- |
 | 基础控件（58 个） | `packages/Zan.Gui/src/Gui/Widget/`：Button Input SelectBox Image Table Tabs TreeView ListView VirtualList Slider Switch Steps Timeline Pagination Progress Rate Tag Card Panel Collapse Popover Tooltip Dropdown Menu ContextMenu Breadcrumb PageHeader Result Empty Skeleton Spin Statistic … |
 | 外壳容器 | `Widget/ToolStrip.zan` `StatusBar.zan` `SplitPanel.zan` `Split.zan` `Ribbon.zan`；自定义标题栏见 `Core/App.Chrome.zan` |
-| 向导/对话框 | `Widget/Wizard.zan`（新建项目/新建文件都用它）、`Widget/Prompt.zan`、`Widget/Layer.zan`（通知/浮层） |
+| 向导/对话框 | 通用步骤向导见 `Widget/Wizard.zan`；IDE 新建项目/文件使用 `src/ide_zan/src/dialogs/ProjectWizard*.zan`；`Widget/Prompt.zan`、`Widget/Layer.zan` 提供提示与通知/浮层 |
 | 基础复合件 | `packages/Zan.Gui/src/Gui/Component/`：`FilePicker` `GraphView` `BandGrid` 等 |
 | 图表控件包 | `packages/Zan.Gui.Charts/`（`Gui.Charts`：折线、柱状、饼图、仪表、散点、热力等范式二图表组件） |
 | 高性能表格包 | `packages/Zan.Gui.DataTable/`（`Gui.DataTable`：千万级虚拟化报表组件） |
@@ -252,13 +267,13 @@ smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size
 新增控件的落地清单：`Widget/<Name>.zan` → 在 gallery 里加演示 → 需要能被设计器摆放的话
 补 `PropSpec`/`ControlFactory` 注册 → `standard` + gallery 构建 + 截图。
 
-## 自定义组件按 kind 解析：HeavyControls 运行期注册，不要生成注册表文件
+## 自定义组件按 kind 解析：当前运行期注册入口
 
-宿主自有组件要在声明式页面（`.html`，运行期经 `ControlFactory` 按 kind 字符串建树）
-和设计器面板里可用，做法是**启动时显式注册**进 `HeavyControls`
-（`HeavyControls.Register(kind, 工厂委托)`，幂等的 `XxxBootstrap.Install()`，
-IDE 见 `src/ide_zan/src/components/IdeBootstrap.zan`，画廊在 `gui_gallery.zan`
-的 Main 里注册 StatusPill）。
+宿主自有组件在声明式页面与设计器面板中按 kind 建树，当前注册入口是
+`ControlFactory.Register(kind, 工厂委托)`。IDE 自有组件示例见
+`src/ide_zan/src/components/DocsSectionTabs.zan` 的 `Install()`；画廊示例见
+`examples/gui_gallery/Gallery.zan` 中 StatusPill 的工厂与注册。
+这是当前实现说明；注册机制的后续收敛目标见 `docs/GUI_ARCHITECTURE.md` P1。
 
 不要回到"构建期扫描源码生成注册表文件"的老路（已删的 `scan_components.ps1`
 + `ProjectComponents.*.zan`）：
@@ -302,16 +317,16 @@ IDE 见 `src/ide_zan/src/components/IdeBootstrap.zan`，画廊在 `gui_gallery.z
 ## 设计器窗体（`.html` 设计稿）的数据流
 
 ```text
-.html 设计稿 (JSON 文档模型)  --IDE/编译器 GenForm--> <Name>.g.zan --+
-                                                               |--> 与手写 App.zan 一起编译
-手写逻辑 <Name>.zan / App.zan --------------------------------+
+.html 设计稿 --运行期 Html.Parse--> 控件树、样式与绑定元数据
+窗口子类 .zan --zanc 编译--> 程序；Form.Show 按同名文档约定装配窗口
 ```
 
-- 文档模型在 `src/ide_zan/src/editor/ZanIDE.CodeNav.zan`：`FormDoc { name, winW, winH, winTitle,
-  winCenter, layoutMode, winZoom, fields }`、`FormFieldDoc { type, label, name,
-  required, wrap, span, fx, fy, fw, fh }`（`fx/fy/fw/fh` 是自由布局的绝对坐标）。
-- 生成器在 `stdlib/System/Compiler/GenForm.zan`（编译期）与 IDE 侧的生成代码路径。
-- 因此：**改窗口尺寸/控件位置就是改设计文档再写回 `.html` 设计稿**，不要去改生成的 `.g.zan`。
+- 设计器的 HTML 读写入口在
+  `packages/Zan.Gui.Designer/src/Gui/Designer/Designer.Html.zan`：
+  `LoadHtmlText` 解析文档，`SaveHtml` 将设计模型写回 HTML。
+- 运行时装配见 `packages/Zan.Gui/src/Gui/Core/Form.Show.zan`，显式页面装载见
+  `packages/Zan.Gui/src/Gui/Markup/Html.zan`；设计稿不是 zanc 源码输入。
+- 改窗口尺寸、控件位置应写回 `.html` 设计稿；当前通道不生成窗体 `.g.zan`。
 
 ## 验证 GUI 改动
 

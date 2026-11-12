@@ -1,0 +1,190 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class RibbonRetainedComponentTest {
+    static void Check(bool value, string label) { if (!value) { throw new Exception(label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static void Input(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void QueueClick(App app, Control control) {
+        Check(control != null && control.bw > 0 && control.bh > 0, "actual control is laid out");
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        Input(app, 2, x, y, 0, 0);
+        Check(app.GetCapturedPointer() == control, "real Down captures actual control");
+        Input(app, 3, x, y, 0, 0);
+    }
+    // Up owns the automatic EndLoopTurn drain. Queue mutation before Up's action,
+    // with no intervening event turn, so stale-action guards are really exercised.
+    static void QueueMutation(App app, Control control, Action mutation) {
+        Check(control != null && control.bw > 0 && control.bh > 0, "mutation target is laid out");
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        Input(app, 2, x, y, 0, 0);
+        Check(app.GetCapturedPointer() == control, "mutation fixture actual Down captures target");
+        app.Post(mutation);
+        Input(app, 3, x, y, 0, 0);
+    }
+    static void Click(App app, Control control) { QueueClick(app, control); Drain(app); }
+    static Control GroupButton(Ribbon ribbon, int group, int index) {
+        int band = ribbon.tabs.Count > 0 ? 1 : 0;
+        return ribbon.Children[band].Children[group].Children[0].Children[index];
+    }
+    static Ribbon Model() {
+        Ribbon ribbon = new Ribbon();
+        RibbonGroup left = new RibbonGroup("left");
+        RibbonItem a = RibbonItem.Large("folder", "Primary"); a.act = 71; left.Add(a);
+        RibbonItem b = RibbonItem.Small("copy", "Secondary label"); b.act = 72; left.Add(b);
+        ribbon.AddGroup(left);
+        RibbonGroup right = new RibbonGroup("right");
+        for (int i = 0; i < 12; i = i + 1) {
+            RibbonItem item = RibbonItem.Tile("grid", "command " + Convert.ToString(i));
+            item.act = 100 + i; right.Add(item);
+        }
+        right.Add(RibbonItem.Small("info", "Optional").SetOptional());
+        ribbon.AddGroup(right); return ribbon;
+    }
+    static void Layout(App app, Ribbon ribbon, int width) {
+        app.SetRootControl(ribbon); ribbon.MeasureTree(app);
+        int height = ribbon.tabs.Count > 0 ? Ribbon.HeightTabbed(app) : Ribbon.HeightGroups(app);
+        ribbon.Arrange(10, 10, width, height);
+    }
+    static void Component() {
+        App a = App.CreateOffscreen("Ribbon A", 1200, 500);
+        App b = App.CreateOffscreen("Ribbon B", 1200, 500);
+        Ribbon ribbon = Model(); RibbonComponentHooks hooks = new RibbonComponentHooks(); hooks.Ribbon = ribbon;
+        ribbon.CommandClicked.Add(hooks.Command); Layout(a, ribbon, 1000);
+        Control button = GroupButton(ribbon, 0, 0);
+        Click(a, button); Check(hooks.Count == 1 && hooks.Seen == 71, "group action retains explicit act");
+        QueueMutation(a, button, () => { ribbon.BuildTree(); hooks.Mutations = hooks.Mutations + 1; });
+        Check(hooks.Mutations == 1, "queued rebuild ran before stale command"); Drain(a);
+        Check(hooks.Count == 1 && button.FindApp() == null, "rebuild invalidates real queued command and host");
+        Layout(a, ribbon, 1000); button = GroupButton(ribbon, 0, 0);
+        Input(a, 2, button.bx + 8, button.by + 8, 0, 0); a.focus.SetFocused(button.WidgetId(), button);
+        int cancels = hooks.Cancels; hooks.Reenter = true; button.OnRouted(hooks.RoutedCancel); ribbon.BuildTree();
+        Check(hooks.Cancels == cancels + 1 && !hooks.Reenter
+            && a.GetCapturedPointer() == null && button.FindApp() == null
+            && !a.focus.IsFocused(button.WidgetId()), "Cancel reentry preserves new generation and retires old input");
+        Layout(a, ribbon, 1000); button = GroupButton(ribbon, 0, 0);
+        QueueMutation(a, button, () => {
+            Layout(a, ribbon, 180); Check(ribbon.OverflowSlots().Count > 0, "queued narrow layout has overflow");
+            Layout(a, ribbon, 1000); hooks.Mutations = hooks.Mutations + 1;
+        });
+        Check(hooks.Mutations == 2 && ribbon.bw == 1000, "queued narrow-wide layout completed"); Drain(a);
+        Check(hooks.Count == 1, "narrow-wide geometry invalidates old queued action");
+        QueueMutation(a, GroupButton(ribbon, 0, 0), () => {
+            a.SetRootControl(null); Layout(b, ribbon, 1000);
+            Check(ribbon.FindApp() == b, "queued cross-App layout reaches B");
+            b.SetRootControl(null); Layout(a, ribbon, 1000); hooks.Mutations = hooks.Mutations + 1;
+        });
+        Check(hooks.Mutations == 3 && ribbon.FindApp() == a && a.rootControl == ribbon,
+            "queued A B A completes before stale command"); Drain(a);
+        Check(hooks.Count == 1, "A B A adoption invalidates queued old App action");
+        Layout(a, ribbon, 180);
+        Check(!ribbon.groups[0].items[1].tile && !ribbon.groups[1].items[12].tile,
+            "Fit never mutates shared command model");
+        RibbonLayout layout = ribbon.CurrentLayout();
+        for (int i = 0; i < layout.slots.Count; i = i + 1) {
+            RibbonSlot slot = layout.slots[i];
+            if (slot.overflow) { continue; }
+            Control item = GroupButton(ribbon, slot.group, slot.item);
+            Check(item.bx >= ribbon.bx && item.bx + item.bw <= ribbon.OverflowButton().bx,
+                "each real visible item stays fully inside reserved content area");
+        }
+        a.SetOffscreenViewport(1200, 500, 150); Layout(a, ribbon, a.Scale(1000));
+        Check(ribbon.CurrentLayout().slots[0].w == a.Scale(64), "150 percent actual slots use shared DPI geometry");
+        a.SetOffscreenViewport(1200, 500, 200); Layout(a, ribbon, a.Scale(1000));
+        Check(ribbon.CurrentLayout().slots[0].w == a.Scale(64), "200 percent actual slots use shared DPI geometry");
+        a.SetOffscreenViewport(1200, 500, 100);
+        Ribbon commands = new Ribbon(); RibbonCmd command = new RibbonCmd("save", "Save"); command.act = 99;
+        commands.AddCommand(command); commands.CommandClicked.Add(hooks.Command); hooks.Ribbon = commands;
+        Layout(a, commands, 1000); Click(a, commands.Children[0].Children[0]);
+        Check(hooks.Count == 2 && hooks.Seen == 99, "flat command retains act and original tree path");
+        a.SetRootControl(null); b.SetRootControl(null); Drain(a); Drain(b); a.canvas.Destroy(); b.canvas.Destroy();
+        Console.WriteLine("RIBBON_RETAINED_INPUT_OK");
+    }
+    static void BorrowedHostContract() {
+        App app = App.CreateOffscreen("borrowed host contract", 320, 200);
+        Control root = new Control(); Button button = new Button("Focus"); root.Add(button);
+        ControlInputHost host = new ControlInputHost(root);
+        host.Bind(app);
+        Check(root.FindApp() == app && button.FindApp() == app,
+            "first Bind inherits App through the real borrowed subtree before measurement");
+        List<Control> focus = new List<Control>(); host.CollectInputFocus(app, focus);
+        Check(focus.Count == 1 && focus[0] == button, "first Bind exposes actual focus capability without caller UseApp");
+        root.MeasureTree(app); root.Arrange(10, 10, 280, 120);
+        Input(app, 2, button.bx + button.bw / 2, button.by + button.bh / 2, 0, 0);
+        Check(app.GetCapturedPointer() == button, "borrowed host routes actual Down");
+        app.focus.SetFocused(button.WidgetId(), button); host.Hide();
+        Check(root.Visible && app.GetCapturedPointer() == null && !app.focus.IsFocused(button.WidgetId()),
+            "host Hide retires input while preserving business Visible");
+        host.Bind(app); focus.Clear(); host.CollectInputFocus(app, focus);
+        Check(root.Visible && focus.Count == 1 && focus[0] == button,
+            "Hide then Bind restores input without caller visibility repair");
+        Click(app, button); host.Hide(); root.Visible = false; host.Bind(app);
+        focus.Clear(); host.CollectInputFocus(app, focus);
+        Check(!root.Visible && focus.Count == 0, "Bind preserves business-hidden root");
+        host.Hide(); Drain(app); app.canvas.Destroy();
+    }
+    static void Paint(App app, Ribbon ribbon) {
+        app.BeginOffscreenFrame(); ribbon.RenderTree(app);
+        app.overlayHost.RenderAll(app); app.EndOffscreenFrame();
+    }
+    static void OverflowAndTabs() {
+        App app = App.CreateOffscreen("Ribbon component overflow", 1200, 500);
+        Ribbon ribbon = Model(); ribbon.tabs.Add("Home"); ribbon.tabs.Add("View");
+        RibbonComponentHooks hooks = new RibbonComponentHooks(); hooks.Ribbon = ribbon;
+        ribbon.CommandClicked.Add(hooks.Command); Layout(app, ribbon, 1000);
+        Control band = ribbon.Children[1]; Control first = GroupButton(ribbon, 0, 0);
+        Paint(app, ribbon); Paint(app, ribbon);
+        Check(band == ribbon.Children[1] && first == GroupButton(ribbon, 0, 0), "repaint preserves component tree identity");
+        Click(app, ribbon.Children[0].Children[1]);
+        Check(ribbon.activeTab.Get() == 1 && ribbon.Children[1] != band, "real tab selects and rebuilds before Paint");
+        Layout(app, ribbon, 180); Check(ribbon.OverflowSlots().Count > 0, "narrow component exposes overflow");
+        int expected = ribbon.OverflowSlots()[0].cmd.act;
+        Click(app, ribbon.OverflowButton()); Control popup = app.overlayHost.ActiveRoot();
+        Check(popup != null, "overflow opens through shared OverlayHost");
+        Paint(app, ribbon); Paint(app, ribbon);
+        Check(app.overlayHost.ActiveRoot() == popup, "repaint preserves popup session");
+        Click(app, popup.Children[0]);
+        Check(hooks.Count == 1 && hooks.Seen == expected && !app.overlayHost.HasActive(), "overflow reports original act once");
+        Paint(app, ribbon); Check(hooks.Count == 1, "Paint does not replay command");
+        Click(app, ribbon.OverflowButton()); Input(app, 4, 0, 0, 0, 27);
+        Check(!app.overlayHost.HasActive(), "Escape closes component popup");
+        Click(app, ribbon.OverflowButton()); Input(app, 2, 1100, 450, 0, 0); Input(app, 3, 1100, 450, 0, 0);
+        Check(!app.overlayHost.HasActive(), "outside Down closes component popup");
+        Click(app, ribbon.OverflowButton()); Input(app, 9, 0, 0, 0, 0);
+        Check(!app.overlayHost.HasActive(), "blur closes component popup");
+        Click(app, ribbon.OverflowButton()); popup = app.overlayHost.ActiveRoot();
+        QueueMutation(app, popup.Children[0], () => {
+            Check(ribbon.RetireInput(), "explicit retirement completes"); hooks.Mutations = hooks.Mutations + 1;
+        });
+        Check(hooks.Mutations == 1, "queued retirement ran before stale popup action"); Drain(app);
+        Check(!app.overlayHost.HasActive() && hooks.Count == 1, "retirement rejects queued popup action");
+        app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+        Console.WriteLine("RIBBON_COMPONENT_OVERFLOW_TABS_OK");
+    }
+    static void Borrow(RibbonComponentWitness witness) {
+        App app = App.CreateOffscreen("Ribbon component weak", 1200, 500); witness.App = app;
+        Ribbon ribbon = Model(); ribbon.tabs.Add("Home"); ribbon.tabs.Add("View"); witness.Ribbon = ribbon;
+        ControlInputHost host = new ControlInputHost(ribbon); witness.Host = host; host.Bind(app);
+        ribbon.MeasureTree(app); ribbon.Arrange(10, 10, 180, Ribbon.HeightTabbed(app));
+        Paint(app, ribbon); witness.Button = ribbon.OverflowButton();
+        Click(app, ribbon.OverflowButton()); witness.Popup = app.overlayHost.ActiveRoot();
+        Check(witness.Popup != null, "weak fixture actually opens visible overflow");
+        Paint(app, ribbon); ribbon.BuildTree();
+        ribbon.MeasureTree(app); ribbon.Arrange(10, 10, 180, Ribbon.HeightTabbed(app)); Paint(app, ribbon);
+        host.Hide(); Drain(app); app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("independent frame", 8, 8);
+        Lang.Set(""); BorrowedHostContract(); Component(); OverflowAndTabs();
+        RibbonComponentWitness witness = new RibbonComponentWitness(); Borrow(witness);
+        Check(witness.App == null && witness.Host == null && witness.Ribbon == null
+            && witness.Button == null && witness.Popup == null, "visible component and host weak endpoints release");
+        frame.canvas.Destroy(); Console.WriteLine("RIBBON_COMPONENT_VISIBLE_WEAK_OK");
+    }
+}

@@ -27,7 +27,7 @@ public class InputOtp : Control {
     // 字符格数。
     private int length;
     // 上一帧渲染的宿主：Focus/Blur 要在没有 app 形参的回调里用。
-    private App liveApp;
+    private weak App liveApp;
     public List<Control> cellNodes;
     public List<Label> cellLabels;
 
@@ -167,6 +167,8 @@ public class InputOtp : Control {
     }
 
     // 设计器默认构造：6 格。
+    public override int InputFocusCapabilities() { return 3; }
+
     public InputOtp() { this.InitOtp(6); }
 
     public InputOtp(int n) { this.InitOtp(n); }
@@ -397,47 +399,66 @@ public class InputOtp : Control {
         return this.TypeChar(clip);
     }
 
-    // 聚焦时的按键消费（与 Input 同构的事件口径：kind 6 字符、
-    // kind 4 按键）。
-    private void HandleKeys(App app) {
-        int kind = app.EventKind();
+    // Backspace 与 Input/TextArea 一样只在 TextInput 编辑：同一物理键
+    // 的 KeyDown + TextInput 事件对只删除一格。
+    private bool HandleKeyEvent(App app, int kind, int code, int mods) {
         if (kind == 6) {
-            int code = app.window.EventKeyCode();
+            if (ReadOnly) { return false; }
             if (code == 8) {
                 if (this.Backspace()) { app.RequestRedraw(); }
+                return true;
             } else if (code == 9) {
                 // Tab 交给框架焦点遍历。
-            } else if (!ReadOnly) {
+            } else {
                 string ch = Text.CharStr(code);
-                if (ch.Length > 0 && this.TypeChar(ch)) { app.RequestRedraw(); }
+                if (ch.Length > 0) {
+                    if (this.TypeChar(ch)) { app.RequestRedraw(); }
+                    return true;
+                }
             }
         } else if (kind == 4) {
-            int kc = app.window.EventKeyCode();
-            int mods = app.window.EventMods();
+            int kc = code;
             if (Modifiers.HasCtrl(mods)) {
                 if (kc == 86) {
+                    if (ReadOnly) { return false; }
                     // Ctrl+V：粘贴整段。
                     string clip = Clipboard.GetText();
                     if (clip.Length > 0 && this.Paste(clip)) { app.RequestRedraw(); }
+                    return true;
                 } else if (kc == 65) {
                     // Ctrl+A 对验证码无选区语义：全选 = 跳首格。
                     this.MoveHome();
                     app.RequestRedraw();
+                    return true;
                 }
-                return;
+                return false;
             }
-            if (kc == 37) { this.MoveLeft(); app.RequestRedraw(); }
-            else if (kc == 39) { this.MoveRight(); app.RequestRedraw(); }
-            else if (kc == 8) {
-                if (this.Backspace()) { app.RequestRedraw(); }
-            }
+            if (kc == 37) { this.MoveLeft(); app.RequestRedraw(); return true; }
+            else if (kc == 39) { this.MoveRight(); app.RequestRedraw(); return true; }
             else if (kc == 46) {
+                if (ReadOnly) { return false; }
                 if (this.DeleteForward()) { app.RequestRedraw(); }
+                return true;
             }
-            else if (kc == 36) { this.MoveHome(); app.RequestRedraw(); }
-            else if (kc == 35) { this.MoveEnd(); app.RequestRedraw(); }
+            else if (kc == 36) { this.MoveHome(); app.RequestRedraw(); return true; }
+            else if (kc == 35) { this.MoveEnd(); app.RequestRedraw(); return true; }
         }
+        return false;
     }
+
+    private void HandleRoutedKey(RoutedEventArgs e, int kind) {
+        if (e.handled || this.IsDisabled()) { return; }
+        App app = this.FindApp();
+        if (app == null) { app = liveApp; }
+        if (app == null || !this.IsFocused(app)) { return; }
+        liveApp = app;
+        this.SyncBinding();
+        if (this.HandleKeyEvent(app, kind, e.keyCode, e.modifiers)) { e.Handle(); }
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) { this.HandleRoutedKey(e, 4); }
+    public override void OnKeyUp(RoutedEventArgs e) { this.HandleRoutedKey(e, 5); }
+    public override void OnTextInput(RoutedEventArgs e) { this.HandleRoutedKey(e, 6); }
 
     // 第 i 格的显示文本；掩码模式返回掩码字符（默认 "•"）。
     public string CellDisplay(int i) {
@@ -478,6 +499,10 @@ public class InputOtp : Control {
     // --- 设计器 / 序列化模型 ---
 
     // 控件类型标识（序列化/设计器用）。
+    public override void CloneContentTo(Control target, CloneTreeFn clone) {
+        // Constructor and property replay recreate the generated parts.
+    }
+
     public override string Kind() { return "InputOtp"; }
     // 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
     public override Binding<string> SizeOf() { return Size; }
@@ -587,11 +612,8 @@ public class InputOtp : Control {
     public override void OnPaint(App app) {
         int id = this.CommonId();
         liveApp = app;
-        bool off = this.IsDisabled();
-        app.focus.RegisterFocusable(id);
+        app.focus.RegisterFocusable(id, this);
         app.focus.RegisterTextEditable(id);
-        bool focused = app.focus.IsFocused(id) && !off;
-        if (focused) { this.HandleKeys(app); }
         SyncBinding();
         string a11y = this.EffectiveA11yRole("textbox") + ":" + this.EffectiveA11yLabel("OTP");
         app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);

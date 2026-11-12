@@ -25,6 +25,9 @@ public class SceneRouter : IGuiHostLoop {
     public Control hudRoot;
     public string baseDir;
     public bool installTried;
+    bool applying;
+    bool stopping;
+    int generation;
 
     // 创建路由器并持有宿主（约 60fps 固定步长）。
     public static SceneRouter Create(string title, int w, int h) {
@@ -138,32 +141,58 @@ public class SceneRouter : IGuiHostLoop {
     }
 
     public void Stop(GuiHost host) {
-        if (this.current != null) {
-            this.current.OnExit();
-            this.current = null;
-        }
+        if (this.stopping) { return; }
+        this.stopping = true;
+        this.generation = this.generation + 1;
+        HtmlScene previous = this.current;
+        this.current = null;
+        this.currentName = "";
+        this.pendingName = "";
         this.hudRoot = null;
-        this.OnStop(host);
+        try {
+            host.SetContentRoot(null);
+            if (previous != null) { previous.OnExit(); }
+            this.OnStop(host);
+        } finally {
+            this.stopping = false;
+        }
     }
 
     // 应用挂起的切换：OnExit(旧) → 装载 HTML → OnEnter(新)。每帧
     // 至多一次：OnEnter 里再 Go 留到下一帧，A/B 互相 Go 不会死循环。
     public void ApplyPending() {
-        if (this.pendingName.Length == 0) { return; }
+        if (this.applying || this.stopping || this.pendingName.Length == 0) { return; }
         string name = this.pendingName;
         this.pendingName = "";
         HtmlScene next = null;
         if (!this.scenes.TryGetValue(name, out next)) { return; }
-        if (this.current != null) { this.current.OnExit(); }
-        this.current = next;
-        this.currentName = name;
+        this.applying = true;
+        this.generation = this.generation + 1;
+        int ticket = this.generation;
+        HtmlScene previous = this.current;
+        this.current = null;
+        this.currentName = "";
         this.hudRoot = null;
-        string file = next.HtmlFile();
-        if (file != null && file.Length > 0) {
-            this.hudRoot = this.LoadSceneHtml(file, next);
+        try {
+            this.host.SetContentRoot(null);
+            if (this.generation != ticket) { return; }
+            if (previous != null) { previous.OnExit(); }
+            if (this.generation != ticket) { return; }
+            Control root = null;
+            string file = next.HtmlFile();
+            if (file != null && file.Length > 0) { root = this.LoadSceneHtml(file, next); }
+            if (this.generation != ticket) { return; }
+            this.current = next;
+            this.currentName = name;
+            this.hudRoot = root;
+            this.host.SetContentRoot(root);
+            if (this.generation != ticket || this.current != next) { return; }
+            next.OnEnter(root);
+            // OnEnter may stop or queue another scene. Never overwrite its tree afterward.
+            Console.WriteLine("SCENE -> " + name);
+        } finally {
+            this.applying = false;
         }
-        next.OnEnter(this.hudRoot);
-        Console.WriteLine("SCENE -> " + name);
     }
 
     // 装载一个场景的 HTML：Assets.Find 定位（开发期磁盘布局），
