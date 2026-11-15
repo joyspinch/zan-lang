@@ -12,8 +12,6 @@ Creates a widget of the given size.
 
 **Returns:** The new widget.
 
-#### `Widget w = new Widget();`
-
 #### `int Size() { return this.size; }`
 
 The current size.
@@ -41,6 +39,26 @@ What a widget can be asked to do.
 ### Methods
 
 #### `void Draw();`
+
+Renders the drawable.
+
+---
+
+## class Rule
+
+规则定义（多行 summary 块）。
+
+### Methods
+
+#### `Rule Create()`
+
+Creates an empty rule.
+
+#### `bool HasName() { return this.names.Count > 0; }`
+
+True when the rule has a name.
+
+#### `Rule Join( int seed, bool strict )`
 
 ---
 
