@@ -76,10 +76,10 @@ kernel32、shell32、user32、advapi32、version）。
   支配违规、phi 前驱不匹配；clang 对 `.ll` 输入会自动加
   `-disable-llvm-verifier`，非法 IR 会被静默送进后端然后以 0xC0000005 崩在
   ISel——看到这个崩溃，先用 `llvm-as` 验证，别怀疑后端。
-  ⚠ 本机 CMake 找到的是 VS 自带 LLVM，**没有** `llvm-as`/`opt`（只有 clang、
-  llvm-nm、llvm-objdump…），`clang -Xclang -verify` 与 `-flto` 都**不会**报出
-  支配违规——要验证自举产出的 IR，得另写一个走 LLVM C API 的小工具
-  （`LLVMParseIRInContext` + `LLVMVerifyModule`）。
+  CMake 选中的 VS LLVM 目录可能没有 `llvm-as`/`opt`，不能据此断言本机无验证器：
+  先查已安装的 mozbuild LLVM（本机已验证 `C:/Users/QQ/.mozbuild/clang/bin/llvm-as.exe`）。
+  `clang -Xclang -verify` 与 `-flto` 不能替代 IR 验证；确无验证器时才用 LLVM C API
+  （`LLVMParseIRInContext` + `LLVMVerifyModule`）构造探针，并明确记录未执行的检查。
 - 链接器的 LNK2019/LNK1120 走 **stdout**，不是 stderr；只看 stderr 会误判成
   "没有具体错误"。
 
@@ -240,7 +240,7 @@ kernel32、shell32、user32、advapi32、version）。
 ## 16. 自举的 string 是「带长度头的托管串」——不是裸 C 字符串
 
 - 动作：自举 IR 后端的 `string` 值指向一个托管块的 payload，块前面是
-  `[i64 len][i64 magic]`，payload 仍以 NUL 结尾（与 C 运行时的 ABI 不变），
+  `[i64 rc][i64 cid=0][i64 len][i64 magic]`，payload 仍以 NUL 结尾（与 C 运行时的 ABI 不变），
   长度取**精确字节数**而不是 `strlen`。新造字符串只有三条路：`zstr_new(len)`、
   `zstr_of(裸C串)`、字面量（常量区直接排好头）。数组 → string 的隐式转换
   必须在**每个 string 位置**做（声明 / 赋值 / 字段 / 实参 / return）。
@@ -670,10 +670,23 @@ kernel32、shell32、user32、advapi32、version）。
   不释放（每个 action 帧泄漏 72 字节；不是 ARC 对象，泄漏检查看不见）。
   要根治就得在自举侧也做一份活跃帧登记表。
 - 坑二：**自举没有工作线程池**。宿主的 `Task.Run` 把任务丢给工作线程，主
-  线程只等；自举的调度器是**单线程协作式**的，任务只在主线程泵调度器时
-  前进。于是 `while (Task.IsDone(h) == 0) {}` 这种忙等在自举侧永远推不动：
-  `IsDone` 读到"还没完"就必须**给调度器一次机会**（泵一次再读），否则是死
-  循环。这是自举与宿主唯一的语义偏差，遇到"宿主能跑、自举卡住"先查这条。
+  线程只等；自举的调度器是**单线程协作式**的，任务只在泵调度器时前进。
+  于是 `while (Task.IsDone(h) == 0) {}` 这种忙等在自举侧推不动——除非查询
+  顺手泵一次。`Task.IsDone` 因此有**两条按执行上下文分流的规则**
+  （2026-11-15 定，B-ID213；`irgen_task.zan` 的 `EmitTaskIsDone`）：
+  ① **协程执行栈上**（`@__zan_co_depth > 0`）：纯查询，与宿主一致。泵这里
+     会重入调度器——WhenAny 竞速时慢任务被查询提前跑完，先完成者与取消时机
+     全被改写（`async_when_all` 的 slowRanYet 由 0 变 1）。
+  ② **同步上下文**（depth == 0）：泵一次再读。调用方没有别的办法让出，泵是
+     这一侧唯一的推进手段；不泵则忙等挂死（`task_run_action_handle` 超时）。
+  - 深度计数只在**调度器执行 step 的那一处**维护（save/load/restore 包住
+    `call void %stfn`），不要散到每个 `$resume` 里去加减——resume 有多个
+    出口（异常 unwind、await 返回），漏一个就把标志永久卡在 >0，规则②随之失效。
+  - 这是自举相对宿主**唯一保留**的语义偏差，且是收窄过的：无条件泵 → 仅同步
+    上下文泵。判据：`tests/conformance/task_isdone_pure_query.zan`（协程内查询
+    必须纯净：旧实现 `q=1 ranAfter=1`，宿主与新实现 `q=0 ranAfter=0`）+
+    `diff_cases.txt` 的 `async_when_all`（协程内）与 `task_run_action_handle`
+    （同步忙等）两条分别钉住 ① 和 ②。
 - 坑三：**属性形态与调用形态是两条路**。`t.Wait()` 是调用，`t.Result` /
   `t.IsCompleted` 是**不带括号的成员访问**——只挂调用路径会漏掉一半，症状是
   "member 'Result' of type 'Task' is not supported"。挂的时候两处都要挂
@@ -2887,7 +2900,7 @@ kernel32、shell32、user32、advapi32、version）。
 ## 147. 字符串头与对象 ARC 头不通用：动态调用返回值不能对字符串字面量 `@zretain`
 
 - 坑（2026-11-10 实测）：在泛型容器（如 `List<T>`）的动态反射调用（`InvokeString`/`InvokeObject`）中，对返回指针如果统一调用 `@zretain`，当被反射方法返回的是字符串常量时，由于字符串在只读 `.rdata` 常量区，其对象头布局为 `[-24]=0, [-16]=len, [-8]=magic (TSNZ/1515082580)`，而不是 ARC 类对象的 `[-24]=cid, [-16]=rc, [-8]=dtor`。调用 `@zretain` 会在 `lock incq -0x10(%rcx)` 处尝试原子递增只读段中的字符串长度字段，直接触发 Windows 0xC0000005 写入访问冲突崩溃。
-- 口径：字符串（不管是字面量还是动态分配的托管串）不走类对象的 `@zretain` 引用计数机制，动态反射调用返回字符串/类对象时，应将原始 `inttoptr` 后的指针直接存入结果槽位，绝不能误加 `@zretain`。
+- 当前口径（2026-11-11）：普通 string 已有独立 `[-32]=rc`，`zretain/zrelease` 必须先区分 class/string 再委派 `zstr_retain/release`，不能直接读写字符串的 `[-16]` 长度槽。字面量 rc=-1；TypeInfo 特殊静态头 cid=kind1..8，必须在读 rc 前排除。动态反射返回值的拥有/借用按实际调用契约处理，不能以跳过全部 string retain 掩盖泄漏。完整布局与受测分配闭账见 [selfhost-string.md](selfhost-string.md)。
 - 判据：`tests/selfhost/diff_cases.txt` 收录 `reflect_builtin_list` 钉住。
 
 ## 148. 重载候选评分必须考虑接口实现与基类继承（子类型实参精准匹配）
@@ -2897,3 +2910,48 @@ kernel32、shell32、user32、advapi32、version）。
 - 修法：在 `irgen_resolve.zan` 中实现 `TypeImplementsOrDerives`，递归沿着 `interfaces` 与基类链查找目标类型。在 `ScoreCand` 中，接口实现或派生匹配给予适中奖励（+2 分），确保当实参类型满足接口契约时，能够压倒不相关的接口或基类，精准选中正确的接口重载。
 - 判据：`tests/selfhost/diff_cases.txt` 收录 `data_connectors_hardening`, `data_orm_hardening`, `orm_transaction_scope` 三案钉住。
 
+## 149. 自举审计按调用契约与当前证据归因
+
+入口 wrapper 必须按实际 `Main` 声明区分 void/int 返回值和有无 `string[]` 形参，生成相同签名的调用并传递参数；不能给带参声明发无参 call。字面量 Format 的占位索引在十进制累加和 `idx + 1` 前都须验证范围；`2147483648` 会越过 int32，溢出后的负索引不能只靠上界比较拦截。根因已确定也须把“正在修复”与“已完成回归”分开记录。
+
+自举 GC 的缺失导出先核对对象头、分配器、活对象注册表和链接闭包；`zan_gc_detect_cycles` / `zan_gc_write_heap_snapshot` 缺失不能靠盲链宿主 `rt_mem` 补齐，自举 ARC registry 与它不兼容。链接成功只证明符号齐全，不证明检测或快照能读取当前对象布局。
+
+`Task.IsDone` 在**协程执行栈上**必须纯查询，在**同步上下文**才泵调度器（自举没有工作线程池，同步侧不泵则忙等挂死）。该缺陷已于 2026-11-15 修复：无条件泵改为按 `@__zan_co_depth` 分流，深度只在调度器执行 step 的那一处维护；回归由 conformance `task_isdone_pure_query`（协程内 `q=0 ranAfter=0`，旧实现 `q=1 ranAfter=1`）与 diff_cases 的 `async_when_all` / `task_run_action_handle` 两条分别钉住两个分支。修复后仍要独立的崩溃栈与 ABI 证据，才能把 `async_when_all` 的访问冲突归因到过度 pump 或运行时强弱符号混搭——目前没有，不得写成已证根因。
+
+审计旧 corpus 先以当前宿主和 gen1 对同一输入、参数及运行时闭包重新取证，区分编译、链接、运行、输出与超时；历史行数和分类计数是语料快照，不能直接当当前缺陷数。宿主对照通过只排除该输入的宿主故障，gen1 根因及修复仍须独立验证。
+
+## 150. 普通方法组共享目标签名契约与闭合泛型虚表桥接（B-ID207）
+
+- 契约只保留一套：checker 与 IR 共用 `Binder.ResolveMethodGroup(receiver, name, form, target)`，返回 `MethodGroupBinding(method, ownerType, score)`；复用既有 delegate 参数/返回类型与类型替换能力。AST 独立 `methodGroupTarget` 只存期望 delegate 类型，不把某个泛型实例的候选方法写入共享声明。外层调用/构造的候选探测不得修改目标信息，胜出后才提交；克隆时同步替换该目标类型。
+- 候选规则必须一致：参数个数、async 状态一致，方法自有类型参数与方法/目标 delegate 的 ref/out 均拒绝。参数按“delegate 实参 → 方法形参”、返回按“方法结果 → delegate 返回”检查；只允许精确匹配与支持的引用转换，不引入数值拓宽或装箱。基础分 +4，精确参数 +4、引用兼容 +1；同深度最高分歧义拒绝，等分更远基类不替换近层候选。
+- 接收者与遮蔽先于方法候选：bare/this/value/type 共用静态性规则，静态上下文的 bare 名不能捕获实例方法。局部/参数即使类型未知也遮蔽同名方法；字段、属性和 getter 继续作为普通 delegate 值。嵌套字段接收者经 owner 替换后保留闭合泛型类型，不能退回声明中的裸类型参数。
+- 目标传播覆盖字段初始化、对象初始化、条件表达式两臂、调用及构造参数；条件本身不继承 delegate 目标。字段初始化检查必须隔离并恢复当前方法、static 状态、返回类型、作用域和 lambda 深度，避免上一个方法的局部状态污染绑定。
+- 实例方法组只求值接收者一次，复用 `OwnedEnvironment` / `OwnedClosure` 及既有临时值释放路径；闭合 owner 走现有具体 ABI/泛型符号路由。静态方法组保持原生函数指针，delegate 字段/局部保持普通借用值；不能为实现方法组另造一套 ARC 或泛型规则。
+- 虚表槽身份按祖先实参替换后的签名匹配，槽 ABI 仍保留引入声明的形式。`Base<T>.Echo(T)` 与 `Child.Echo(double)` 不能因原始参数标签不同而裂成两个槽；`CollectVSlotNodes`、`VSlotIndexM`、`EmitVtable` 共用 `VSlotMatches`，实际实现与继承槽的 value ABI 不同时由 `EmitVSlotAdapter` 桥接擦除参数/返回值。方法组 thunk 仍从对象虚表取实现，不能直调具体符号代替动态 override。
+- adapter 边界：未找到实现先做 null 守卫；同 ABI 的 ref/out 参数按指针原样透传，不能送入值参数 `CallArg` 转换；需要改变 ref/out 存储 ABI 时明确诊断并 fail-closed。async 返回保留 coroutine frame 的 `i8*` ABI。**这些 ref/out 与 async 分支本轮仅完成静态守卫，未分别通过运行用例验证，不能记为已验证支持。**
+- 数组形状是签名的一部分：类型参数替换为数组时组合内外层 rank，类型显示保留完整维度。除精确匹配和转 object 等明确规则外，不能把数组当元素类沿基类链判断引用兼容。不同命名 delegate 可按结构比较；同名递归 delegate 先按普通类型形状处理，结构展开需有身份短路及深度上限，避免无限递归。
+- 本轮证据（2026-11-15，主代理执行）：gen1 build rc=0、`CHANGED_INPUTS=0`；三个 positive（含 contexts）均 emit/llvm-as/link/run rc=0 且 golden 一致，三个 negative 分别准确拒绝 3/4/2 条。contexts 覆盖闭合泛型 virtual direct call 与 method-group call 命中真实 override，并包含同名递归 delegate。此结果不等于 host 全门通过；随后 host 侧递归 delegate 栈溢出已由 `irgen_type_map.c` 将委托值映射改为 opaque pointer 修复，contexts 双端复验通过（证据见 build/test-out/selfhost-method-group/RESULTS.md）。
+- 未修边界必须保留：`generic_virtual_dispatch` 的历史 wrongstdout、类型判定/泛型多实例表 known gap 未在本轮解决；泛型接口继承转换也未扩展。不得删除失败断言、绕写自然语法，或以本轮 contexts 通过宣称泛型虚分派已全面覆盖；新增 adapter 模式仍需独立取证。
+
+## 151. W2072 返回逃逸警告对齐与 Func/Action 内建合成遮蔽（B-ID208）
+
+- W2072 谓词是**窄开关**（宿主 `checker_util.c` 的 `has_closure_capturing_this`）：剥 cast → 方法组绑 this → lambda 体 → 赋值右值 → 条件两臂 → 调用实参 → new 实参与初始化项，到此为止。`this.field[0]` 这类读取既有委托值的形状不构成新捕获，宿主不警告；自举旧谓词的 a/b/c/d/kids 泛递归会把读形状也扫成警告，已对齐（`checker_expr.zan` 的 `HasClosureCapturingThis`）。W2009 回挂环与 W2072 返回逃逸两个入口都只在类里触发（struct 不发；interface 以 ClassDecl+MOD.Iface 编码，同样排除）。
+- 裸 `Action` 由内建按使用点 arity 合成，stdlib 只声明 `Action<T>`（arity 1）。`DelegateParams`/`DelegateRet` 对 Func/Action 名字必须跳过 `FindDelegate` 声明路径，否则裸 `Action` 会借到未替换的 `T`，0 参方法组被误判 E2098 "signature is not compatible"（`checker_type.zan` 的 arity 注释记录同一宿主契约：内建名先于任何作用域声明解析）。
+- 自举驱动诊断默认模式会重复打印：checker 与 irgen 阶段各 `Report(src, 0)` 把 checker 的警告打两遍；第二遍必须从 checker 阶段结束的条目数起打（`driver/main.zan` 的 `reported` 标记）。自举诊断走 stdout、宿主走 stderr，跨端比对必须合并双流，单流 grep 会把"零警告"误读成奇偶。
+- `--deny-warnings` 行为差异：宿主把警告升级为 E 前缀并按错误计数；自举保留 warning 行、以 "warnings denied by --deny-warnings" 拒绝编译——拒绝语义一致，严重级显示不同。
+- 证据（2026-11-15）：11/11 定向 ctest，含新增 `selfhost_method_group_this_return`（gen1 `--deny-warnings` 孪生，锚定 `[W2072] returned closure captures`）与复验的六案差分门；三案双端奇偶探针：return fixture 2/2 条、clean fixture 0/0、边角形态 3/3（调用实参/cast/条件臂触发，索引读取/局部遮蔽/struct 静默）。interface 方法组返回无专门运行用例，仅静态路径覆盖。
+
+## 152. 自举 GC 探测/快照运行时的发射模式与 IR 文本调试法（B-ID211）
+
+- gen1 缺 `zan_gc_detect_cycles` / `zan_gc_write_heap_snapshot` 导出（宿主每模块发 weak no-op stub 压过，自举链无 rt_mem）→ 发射**自包含探测运行时**镜像宿主 rt_mem 算法，不盲链宿主对象（自举 ARC registry 与宿主不兼容）。接线三板斧：`irgen.zan` SeedExtern 后对 AST 预扫描 `GC.DetectCycles/WriteHeapSnapshot` 调用定开关（不触 GC 的程序零发射、零行为变化，prog1 IR `zan_gc` 零命中可证）；`externDecls.Add` 预加两符号抑制 DllImport declare（finalize 发射的 define 是唯一定义）；`@zalloc/@zrelease/@zstr_new/@zstr_release` 四处 `if (gcProbeUsed)` 条件钩子。per-class 字段 walk 函数复用 dtor 发射的 CollectFields/FieldBase/ArcManaged 惯用法，cid 表 `%zan.gc.ty {i8* cid, i8* walkfn, i8* name}`。
+- 两个 IR 裁判级 bug 模式（clang `-disable-llvm-verifier` 下表现为随机崩溃/控制流损坏，`opt -passes=verify` 是唯一正道）：①多前驱块的 **phi 前驱表不全**——给循环尾块加 phi 后，后加的中间块（名字解析链）汇入同一尾块时必须同步补进 phi 前驱列表，否则 SSA 支配违规；②**struct 布局存读不一致**——写侧 `{count@+0, name@+1, bytes@+2}`、读侧把 +0 当 name 拿去 `inttoptr` 后 `fprintf %s` 打小整数地址即 AV。哨兵定位法：LLVM IR 是文本，手插 `%sf = call i8* @__acrt_iob_func(i32 2)` + `fprintf(%sf, "X\0A")` 哨兵（stderr 无缓冲、崩溃不丢；哨兵不能插在 terminator 之后），复刻 gen1 LinkExe 的 clang 命令编译即得崩点字母。MSVC 目标 CRT 无 stderr 数据导出，一律走 `__acrt_iob_func(2)`。
+- 孤儿明细行的**预算语义**：宿主列前 min(oc,20) 个孤儿（按槽序、活/死槽不耗预算），孤儿槽散布在活对象之后——若拿 min(oc,20) 当槽位上界则一行都打不出（早期 3 行 stderr vs 宿主 9 行即此）。快照零计数行必须跳过：name==0 的行 `%-40s` 是 UB。
+- 先读被测程序再怀疑编译器：探针"m1 无限重复/类分配即段错误"追了半天 IR，根因是**调试程序自己把标记块误贴进递归构造函数**（每次 new Node 打一行 m1 = 无限递归栈溢出），与探测运行时无关。二分定位之前先 `awk '/define .*被疑函数/,/^}/' 生成IR` 读一遍程序侧调用点。
+- 金标对探全绿（2026-11-15）：gc_cycle_detector 双端 compileExit=0 runExit=0 stdout EXACT（12 行）、stderr 孤儿报告同形（1/2/3 环、摘要+明细、rc/internal_rc/size 字段一致；size 48 vs 40 源自 gen1 对象头多 cid 槽、site=0 是 v1 契约边界）；t3 最小快照案（对象数/头/行格式/自删）绿；毕业 diff_cases.txt + 单案 BLESS `tests/selfhost/ir_golden/gc_cycle_detector.hashes`（cmake -P 带 SKIP_GEN1_BUILD=1 + 单案清单可只 bless 一案，不动其他 244 份金标）；corpus_gaps.txt illegal-ir 14→13 出账。定向 ctest `case_gc_cycle_detector` + `selfhost_gen1` 绿。v1 边界（与宿主对齐或降级显示，非遗漏）：数组负载不追踪、探测程序分配付 O(live) 线性 dict 扫描、表外 cid 退 `"?"` 行。
+
+## 153. 运行时内部函数绕过公开守卫的裸调缺陷与台账批量复核法（B-ID212）
+
+- 自举 `async_when_all` 的 0xC0000005 根因在 **C 运行时**而非 gen1：`zan_join_bind`（rt_timer_co.c）裸调内部 `live_has_nolock`，而公开入口 `zan_co_live_has` 带 `!g_colive_cap return 0` 守卫。cap==0 时 `mask = cap-1 = SIZE_MAX`、`g_colive_slots==NULL`，`slots[hash & SIZE_MAX]` 用全宽哈希解引用空表 → AV。gen1 程序从不走 `zan_co_live_add`（那是宿主 io_co_sched 调度器启动流程的一部分），宿主程序 cap>0 故不崩——**"宿主过、自举崩"的案子根因可能在两端共享的运行时里，且只在其中一端的调用剖面触发**。修法一行：`if (g_colive_cap != 0 && live_has_nolock(frame))`；新增/复用内部函数时必须审计全部调用点的前置条件（本文件同类调用 :140/:281 都有调用方守卫，:389 是唯一漏网）。
+- 取证路径照抄 §152 的 IR 哨兵法：runtime call 后各插一个 stderr 字母（register=A join_new=B acquire=C bind=D unpin=M resume=J/K），B、C 打了而 D、M 没打 ⇒ 崩在 `zan_join_bind` 内部未返回，再读 C 源锁行。修一类根因后**批量复核同台账类**：对 crash 类全部 async 案跑同一探针（gen1 编译 → 运行 → 归一化 diff 金标），13 案过绿批量毕业（diff_cases.txt 追加 + run_selfhost_ir_golden.cmake 带 SKIP_GEN1_BUILD=1 与多案清单一次 BLESS 13 份哈希）、转类案如实改台账（reject/wrong-stdout 各附原因与日期），不顺手硬修语义差。
+- 归一化口径：`run_diff_parallel.py` 的 normalize 剥 `\r\n`→`\n`，且**金标自身行尾 CRLF/LF 混合**（宿主产出时带入）——本地探针判 DIFF 先 `tr -d '\r'` 复核再下结论。`run_case.cmake` 的 up-to-date stamp 只含 SRC/ZANC/STDLIB_STAMP，**不含 runtime obj**——改 C 运行时后验证宿主侧必须先删 `build/cases/*.exe` 强制重链，否则 case 复用旧二进制测不到修复。
+- 本轮证据（2026-11-15）：gen1 侧 async_when_all 金标 EXACT（runExit=0）；13 案批量复核过绿毕业；宿主定向 `case_(async_when_all|async_mt_sched|async_delay_max|task_isdone_pure_query|gc_trim_memory)` 5/5 绿（新 obj 重链）；`selfhost_gen1` 绿。转类余量：`async_catch_ownership_route`（gen1 拒 Task.Spawn 静态方法组）、`async_preempt_hotloop`（brokeEarly 取消时机晚一轮——协作单 worker 泵与宿主多 worker 抢占的语义差，留 wrong-stdout 段）。zanc.exe 重链因他会话占用运行中 exe 而 pending，修复不改编译器代码，不阻塞。

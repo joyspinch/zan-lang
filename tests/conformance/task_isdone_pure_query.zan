@@ -1,0 +1,54 @@
+// Task.IsDone 在**协程执行栈上**必须保持纯查询：只查任务表，不驱动调度器。
+//
+// 回归用例（B-ID213）。自举编译器曾在未完成分支里无条件插一次
+// zan_co_sched_run()，想防 `while (Task.IsDone(h) == 0) {}` 紧循环饥饿；
+// 后果是查询有了副作用——一次查询把整个调度器推一轮，别的协程被提前跑完
+// （WhenAny 竞速时慢任务被 IsDone 推进，先完成者与取消时机全被改写，
+// async_when_all 的 slowRanYet 由 0 变 1）。
+//
+// 规则分两种执行上下文（见 src/selfhost/irgen/irgen_task.zan 的
+// EmitTaskIsDone 注释）：
+//   ① 协程执行栈上（@__zan_co_depth > 0）——纯查询，与宿主一致；
+//   ② 同步上下文——自举是单线程协作式运行时，任务只在泵调度器时前进，
+//      这里必须泵，否则忙等永远推不动。该分支由 diff_cases 的
+//      task_run_action_handle 覆盖（它含 while (Task.IsDone(h) == 0) {}，
+//      若 ② 失效该用例会挂死超时）。
+//
+// 本用例钉 ①：在协程内部 spawn 一个只 await Task.Yield() 就能跑完的
+// 工作项，立刻查询——若查询会泵，工作项就被推完，q 与 ranAfter 都变 1。
+//   纯查询（宿主/修复后）→ q=0 ranAfter=0；
+//   无条件泵（旧实现）  → q=1 ranAfter=1。
+// 随后正常 await 收尾，ran 归 1，证明工作项本身没问题。
+using System;
+
+class TaskIsDoneProbe {
+    public static int ran;
+    public static int q;
+    public static int ranAfter;
+
+    public static async int Worker() {
+        await Task.Yield();
+        TaskIsDoneProbe.ran = TaskIsDoneProbe.ran + 1;
+        return 7;
+    }
+
+    public static async int Run() {
+        long handle = Task.Spawn(TaskIsDoneProbe.Worker());
+        // 我们此刻在协程里：这次查询不得推进调度器。
+        TaskIsDoneProbe.q = Task.IsDone(handle);
+        TaskIsDoneProbe.ranAfter = TaskIsDoneProbe.ran;
+        List<long> handles = new List<long>();
+        handles.Add(handle);
+        int joined = await Task.WhenAll(handles);
+        return joined;
+    }
+
+    public static void Main() {
+        Task t = Task.Run(TaskIsDoneProbe.Run());
+        t.Wait();
+        Console.WriteLine("q=" + Convert.ToString(TaskIsDoneProbe.q));
+        Console.WriteLine("ranAfter=" + Convert.ToString(TaskIsDoneProbe.ranAfter));
+        Console.WriteLine("ran=" + Convert.ToString(TaskIsDoneProbe.ran));
+        Console.WriteLine("task-isdone-pure: 1");
+    }
+}
