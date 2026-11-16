@@ -1,0 +1,65 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Postgres;
+
+// Pg conninfo 值转义契约：BuildConninfo 曾把五个值全部裸拼——密码含
+// 空格、单引号、反斜杠时 conninfo 解析错位（后续键整个落进值里，
+// 认证失败且难以排查）。锚定转义与 PgWire.parseConninfo 的引号解析
+// 严格互逆：构造 → 解析回读，值必须无损；普通值不加引号。
+class Program {
+    static List<string> outs = new List<string>();
+
+    static void Seed() {
+        Program.outs.Clear();
+        for (int i = 0; i < 8; i = i + 1) { Program.outs.Add(""); }
+    }
+
+    // 构造后解析回读，断言 user/password 无损。
+    static void RoundTrip(string label, string user, string password) {
+        string ci = PgConnector.BuildConninfo("db.host.example", 5433,
+            "appdb", user, password);
+        Program.Seed();
+        int rc = PgWire.parseConninfo(ci, Program.outs);
+        if (rc == 0 && Program.outs[3] == user && Program.outs[4] == password
+            && Program.outs[0] == "db.host.example" && Program.outs[2] == "appdb") {
+            Console.WriteLine("ok " + label);
+        } else {
+            Console.WriteLine("FAIL " + label + " rc=" + Convert.ToString(rc)
+                + " user=[" + Program.outs[3] + "] pass=[" + Program.outs[4] + "]");
+        }
+    }
+
+    static int Main() {
+        // 1) 普通值不加引号（可读性不受影响）。
+        string plain = PgConnector.BuildConninfo("127.0.0.1", 5432, "appdb",
+            "app", "secret");
+        Program.Seed();
+        PgWire.parseConninfo(plain, Program.outs);
+        Console.WriteLine((Program.outs[3] == "app" && Program.outs[4] == "secret"
+            && plain.IndexOf("'") < 0) ? "ok plain values unquoted" : "FAIL plain values");
+
+        // 2) 含空格的密码（裸拼时后续键落进值里）。
+        RoundTrip("password with space", "app", "p@ss word");
+
+        // 3) 含单引号。
+        RoundTrip("password with quote", "app", "it's");
+
+        // 4) 含反斜杠。
+        RoundTrip("password with backslash", "app", "back\\slash");
+
+        // 5) 组合最恶劣形态 + 空值 + 用户名特殊字符。
+        RoundTrip("password worst mix", "app", "a b'c\\d'e f");
+        RoundTrip("empty password", "app", "");
+        RoundTrip("user with space", "svc account", "normal");
+
+        // 6) EscapeConninfoValue 单元行为。
+        Console.WriteLine((PgConnector.EscapeConninfoValue(null) == "") ? "ok null escaped" : "FAIL null");
+        Console.WriteLine((PgConnector.EscapeConninfoValue("") == "''") ? "ok empty quoted" : "FAIL empty");
+        Console.WriteLine((PgConnector.EscapeConninfoValue("plain") == "plain") ? "ok plain passthrough" : "FAIL passthrough");
+        Console.WriteLine((PgConnector.EscapeConninfoValue("a'b") == "'a\\'b'") ? "ok quote escaped" : "FAIL quote");
+        Console.WriteLine((PgConnector.EscapeConninfoValue("a\\b") == "'a\\\\b'") ? "ok backslash escaped" : "FAIL backslash");
+        Console.WriteLine("done");
+        return 0;
+    }
+}
