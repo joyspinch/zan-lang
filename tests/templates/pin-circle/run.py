@@ -13,15 +13,21 @@ import time
 ROOT = Path(__file__).resolve().parents[3]
 TESTS = Path(__file__).resolve().parent
 TEMPLATE = ROOT / "templates/game/pin-circle"
-WORK = ROOT / "_scratch/pin-circle-tests"
-SOURCES = [TEMPLATE / "src" / name for name in ("main.zan", "World.zan", "View.zan")]
+WORK = ROOT / "build/test-out/pin-circle-tests"
+CASES = ROOT / "build/cases"
+SOURCES = sorted((TEMPLATE / "src").rglob("*.zan"))
+SCENE_SOURCES = [source for source in SOURCES if source.name != "main.zan"]
+MODEL_SOURCES = [TEMPLATE / "src/PinWorld.zan", *sorted((TEMPLATE / "src/Entities").glob("*.zan"))]
 
 
-def compile_program(compiler, name, sources, publish=False):
-    exe = WORK / (name + ".exe")
-    command = [str(compiler), *map(str, sources), "--auto-stdlib", "-o", str(exe)]
-    if len(sources) > 2:
-        command += ["--embed", "assets=" + str(TEMPLATE / "assets")]
+def compile_program(compiler, name, sources, publish=False, assets=False):
+    exe = CASES / ("pin_circle_" + name + ".exe")
+    command = [str(compiler), *map(str, sources), "--auto-stdlib",
+               "--package-project", str(ROOT), "-o", str(exe)]
+    if name == "scene-test":
+        command += ["-DPIN_SCENE_TEST"]
+    if assets:
+        command += ["--embed", str(TEMPLATE / "assets") + "=assets"]
     if publish:
         command += ["--publish", "--subsystem", "windows"]
     result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
@@ -126,21 +132,28 @@ def window_test(exe, script, name, resize=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, default=ROOT / "build/zanc.exe")
+    parser.add_argument("--model-only", action="store_true",
+                        help="Compile and run only the platform-independent world regression")
     args = parser.parse_args()
-    if sys.platform != "win32":
-        parser.error("Window regression requires Windows; world_test.zan is platform-independent")
-    ctypes.WinDLL("user32").SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    if not args.model_only:
+        if sys.platform != "win32":
+            parser.error("Window regression requires Windows; use --model-only for world_test.zan")
+        ctypes.WinDLL("user32").SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     WORK.mkdir(parents=True, exist_ok=True)
-    world = compile_program(args.compiler, "world-test", [TESTS / "world_test.zan", SOURCES[1]])
+    CASES.mkdir(parents=True, exist_ok=True)
+    world = compile_program(args.compiler, "world-test", [TESTS / "world_test.zan", *MODEL_SOURCES])
     result = subprocess.run([str(world)], cwd=WORK, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, timeout=60)
     log = result.stdout.decode("utf-8", errors="replace")
     (WORK / "world-test.log").write_text(log, encoding="utf-8")
     assert result.returncode == 0 and "PASS pin-circle:" in log and "FAIL:" not in log, log
     print(log.strip())
-    game = compile_program(args.compiler, "game", SOURCES, publish=True)
+    if args.model_only:
+        return
+    game = compile_program(args.compiler, "game", SOURCES, publish=True, assets=True)
     scene = compile_program(args.compiler, "scene-test",
-                            [TESTS / "scene_test.zan", TESTS / "world_test.zan", *SOURCES])
+                            [TESTS / "scene_test.zan", TESTS / "world_test.zan", *SCENE_SOURCES],
+                            assets=True)
     window_test(game, TESTS / "gameplay.ui", "gameplay")
     window_test(scene, TESTS / "cleared.ui", "cleared")
     window_test(game, TESTS / "gameplay.ui", "resized", resize=True)
