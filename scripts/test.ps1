@@ -136,6 +136,26 @@ $codeFile = Join-Path $env:TEMP "zan_ctest_code_$PID.txt"
 $logFile  = Join-Path $env:TEMP "zan_ctest_log_$PID.txt"
 Remove-Item -LiteralPath $codeFile -Force -ErrorAction SilentlyContinue
 & $gate -Name 'build' -Script {
+    # ---- stdlib stamp 失效链自愈 ------------------------------------------
+    # run_case.cmake 用 build\stdlib.stamp 判断"库没变就复用旧 exe"，但 stamp 只在
+    # cmake --build（stdlib_stamp 目标）时 touch——直接跑定向 ctest 不经过构建，
+    # 工作区里已改的 stdlib/packages 源码不会反映到 stamp，于是旧 exe 被当作
+    # "最新"直接回放：ctest 绿了，测的却是上一份库（实测 2026-11-16：124 个库
+    # 源文件 mtime 新于 stamp）。这里在持锁后、跑用例前把stamp 补到最新库源
+    # mtime，让 up-to-date 检查正确失效。成本：只有真正改过库的会话多付一次
+    # 重编，且只影响本轮命中的 ≤80 条。
+    $stamp = Join-Path $buildDir 'stdlib.stamp'
+    if (Test-Path $stamp) {
+        $stampTime = (Get-Item -LiteralPath $stamp).LastWriteTimeUtc
+        $newestLib = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '..\stdlib'), (Join-Path $PSScriptRoot '..\packages') -Recurse -File |
+            Where-Object { $_.Extension -eq '.zan' } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+        if ($newestLib -and $newestLib.LastWriteTimeUtc -gt $stampTime) {
+            Set-ItemProperty -LiteralPath $stamp -Name LastWriteTimeUtc -Value $newestLib.LastWriteTimeUtc
+            Write-Host "[test] stdlib.stamp 已落后库源（最新：$($newestLib.Name)），已刷新——旧 exe 将按需重编"
+        }
+    }
     # 顺手回收上一轮留下的副本（过期任务租约 + 没人引用的仓库外 worktree）。
     # 在闸里跑，与编译互斥。
     if (Test-Path $schedPath) { & $schedPath reap -Apply | Out-Null }
