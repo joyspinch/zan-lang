@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
+using System.Threading;
 using Gui;
 using Gui.Widget;
 using Gui.Component;
+using Gui.Component.CodeEditor;
 
 // 路径由测试指定；实际解析、启动与协议逻辑使用真实 LspSession。
 class ZanIDE {
@@ -39,9 +42,168 @@ class IdleProbe {
     int timeouts;
 }
 
+class LspShutdownOwner {
+    public LspSession session;
+    public int calls;
+}
+
+class LspShutdownWatch {
+    public weak LspSession session;
+    public weak App app;
+    public weak LspShutdownOwner owner;
+    public weak LspDispatcherCounter dispatcherCapture;
+}
+
+// UI 分发调用计数器：普通字段即可（Zan.Gui 外不建 Signal*——分层
+// 棘轮 B-ID171 口径，计数语义不受影响）。
+class LspDispatcherCounter {
+    public int calls;
+}
+
 class Program {
     static void Assert(bool condition, string message) {
         if (!condition) { throw new InvalidOperationException("FAIL: " + message); }
+    }
+
+    static LspSession ShutdownFixture(LspShutdownWatch watch) {
+        // Only worker completion is controlled; shutdown uses the real session path.
+        LspSession session = new LspSession();
+        session.background = true;
+        session.alive = true;
+        session.pending = new Dict<int, LspPendingRequest>();
+        session.cache = new List<LspPendingRequest>();
+        session.commands = new BlockingQueue<LspCommand>(null, 0);
+        session.shutdownSource = new CancellationTokenSource();
+        session.commandSource = new CancellationTokenSource();
+        session.serviceStopped = new TaskCompletionSource<int>();
+        watch.session = session;
+        LspShutdownOwner owner = new LspShutdownOwner();
+        owner.session = session;
+        watch.owner = owner;
+        session.onDiagnostics = (string path, List<Diagnostic> diagnostics) => {
+            owner.calls = owner.calls + 1;
+        };
+        LspDispatcherCounter capture = new LspDispatcherCounter();
+        watch.dispatcherCapture = capture;
+        session.uiDispatcher = (Action action) => { capture.calls = capture.calls + 1; };
+        return session;
+    }
+
+    static async void ObserveShutdown(LspSession session, TaskCompletionSource<int> entered) {
+        entered.TrySetResult(0);
+        await session.ShutdownAsync();
+    }
+
+    static async void AwaitShutdownEntry(TaskCompletionSource<int> entered) {
+        int ignored = await entered.Task;
+    }
+
+    static void DrainShutdownFixture(LspSession session) {
+        Task drain = Task.Run(session.ShutdownAsync());
+        drain.Wait();
+    }
+
+    static void CloseShutdownFixture(LspSession session) {
+        session.commands.Dispose();
+        session.shutdownSource.Dispose();
+        session.commandSource.Dispose();
+        session.serviceStopped.Close();
+    }
+
+    static void CheckShutdownOwnership(LspShutdownWatch watch) {
+        LspSession session = Program.ShutdownFixture(watch);
+        session.Shutdown();
+        TaskCompletionSource<int> entered = new TaskCompletionSource<int>();
+        Task drain = Task.Run(Program.ObserveShutdown(session, entered));
+        Task ready = Task.Run(Program.AwaitShutdownEntry(entered));
+        ready.Wait();
+        // Entry acknowledges task startup, not arrival at ShutdownAsync's await.
+        Assert(!drain.IsCompleted, "shutdown drain waits for worker completion");
+        Assert(watch.owner != null && watch.dispatcherCapture != null,
+            "shutdown request retains callbacks until worker completion");
+        session.serviceStopped.TrySetResult(0);
+        drain.Wait();
+        Assert(watch.owner == null && watch.dispatcherCapture == null,
+            "joined shutdown releases diagnostics owner and UI dispatcher capture");
+        Assert(watch.session != null, "callback release does not require releasing session");
+        session.Shutdown();
+        Program.DrainShutdownFixture(session);
+        entered.Close();
+        Program.CloseShutdownFixture(session);
+    }
+
+    static void CheckLiveSessionOwnership(LspShutdownWatch watch) {
+        LspSession session = Program.ShutdownFixture(watch);
+        session.serviceStopped.TrySetResult(0);
+        Program.DrainShutdownFixture(session);
+        Assert(watch.owner != null && watch.dispatcherCapture != null,
+            "completion without shutdown preserves live callbacks");
+        session.onDiagnostics("live.zan", null);
+        session.uiDispatcher(null);
+        Assert(watch.owner.calls == 1 && watch.dispatcherCapture.calls == 1 && session.Alive(),
+            "live diagnostics and dispatcher remain callable");
+        session.Shutdown();
+        Program.DrainShutdownFixture(session);
+        Assert(watch.owner == null && watch.dispatcherCapture == null,
+            "later shutdown releases completed live session callbacks");
+        Program.CloseShutdownFixture(session);
+    }
+
+    static void AwaitSessionRelease(LspShutdownWatch watch, string message) {
+        // Task DONE precedes async frame-local/this release; do not retain a weak target here.
+        long deadline = System.Diagnostics.Stopwatch.GetMilliseconds() + 2000;
+        while (watch.session != null && System.Diagnostics.Stopwatch.GetMilliseconds() < deadline) {
+            Thread.Sleep(1);
+        }
+        Assert(watch.session == null, message);
+    }
+
+    static void DrainShutdownPosts() {
+        Action action = Dispatcher.Take();
+        while (action != null) {
+            action();
+            action = Dispatcher.Take();
+        }
+    }
+
+    static void CheckAppShutdownOwnership(LspShutdownWatch watch) {
+        App app = App.CreateOffscreen("LSP shutdown owner", 8, 8);
+        watch.app = app;
+        LspSession session = LspSession.StartAsync(app, "D:/workspace");
+        watch.session = session;
+        session.Shutdown();
+        Program.DrainShutdownFixture(session);
+        app.StopLoop();
+        app.canvas.Destroy();
+        Program.DrainShutdownPosts();
+    }
+
+    static void AppShutdownOwnership() {
+        Dispatcher.Init();
+        // The legacy first-App context must not retain the subject of the weak probe.
+        App frame = App.CreateOffscreen("LSP outer frame", 8, 8);
+        LspShutdownWatch watch = new LspShutdownWatch();
+        Program.CheckAppShutdownOwnership(watch);
+        long deadline = System.Diagnostics.Stopwatch.GetMilliseconds() + 2000;
+        while ((watch.app != null || watch.session != null)
+            && System.Diagnostics.Stopwatch.GetMilliseconds() < deadline) {
+            Program.DrainShutdownPosts();
+            Thread.Sleep(1);
+        }
+        Assert(watch.session == null, "actual App overload releases joined session");
+        Assert(watch.app == null, "actual App overload releases dispatcher-captured App");
+        Program.DrainShutdownPosts();
+        frame.StopLoop();
+        frame.canvas.Destroy();
+    }
+
+    static void ShutdownOwnership() {
+        LspShutdownWatch stopped = new LspShutdownWatch();
+        Program.CheckShutdownOwnership(stopped);
+        Program.AwaitSessionRelease(stopped, "joined session cycle releases after helper returns");
+        LspShutdownWatch live = new LspShutdownWatch();
+        Program.CheckLiveSessionOwnership(live);
+        Program.AwaitSessionRelease(live, "live session releases after shutdown");
     }
 
     static void AwaitCompletion(LspSession session, CodeEditor editor, string label) {
@@ -286,7 +448,40 @@ Assert(definition != null && definition.line == 0 && definition.column == source
         Assert(renamed.valid && renamed.text == source.Replace("value", "renamed"), "real rename applies server ranges");
     }
 
+    static void OwnedServerProcess(string childExe, string mode) {
+        #if WINDOWS
+        List<string> arguments = new List<string>();
+        arguments.Add(mode);
+        arguments.Add("--port");
+        arguments.Add("0");
+        System.Diagnostics.ProcessSpawn child = System.Diagnostics.ProcessSpawn.Spawn(childExe, arguments);
+        Assert(child != null, "owned child started");
+        LspSession session = new LspSession();
+        session.sock = -1;
+        session.serverProcess = child;
+        session.Shutdown();
+        Assert(session.serverProcess == null, "shutdown retires owned child handle");
+        Assert(child.WaitExitCode(1) == -1, "shutdown disposes owned process handle after exit");
+        session.Shutdown();
+        Console.WriteLine("PASS LspSession owned server process " + mode);
+        #endif
+    }
+
     static void Main(string[] args) {
+        if (args[0] == "owned-server-process") {
+            Program.OwnedServerProcess(args[1], args[2]);
+            return;
+        }
+        if (args[0] == "shutdown-app-ownership") {
+            Program.AppShutdownOwnership();
+            Console.WriteLine("PASS LspSession App shutdown ownership");
+            return;
+        }
+        if (args[0] == "shutdown-ownership") {
+            Program.ShutdownOwnership();
+            Console.WriteLine("PASS LspSession shutdown ownership");
+            return;
+        }
         if (args[0] == "resolve") { Program.ResolveExecutable(args); return; }
         if (args[0] == "start") {
             ZanIDE.toolchainDir = args[2]; ZanIDE.baseDir = args[3];
@@ -299,6 +494,7 @@ Assert(definition != null && definition.line == 0 && definition.column == source
         int port = Convert.ToInt32(args[0]);
         if (args.Length > 1 && args[1] == "idle") { Program.Idle(port); return; }
         if (args.Length > 2) { Program.RealServer(port, args[2]); return; }
+        Program.ShutdownOwnership();
         LspSession session = LspSession.Open(port, "D:/workspace");
         Assert(session != null, "initialize");
         CodeEditor editor = new CodeEditor();
