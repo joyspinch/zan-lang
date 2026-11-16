@@ -166,7 +166,7 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
     (`GIT_INDEX_FILE` + `read-tree HEAD`)只提交自己的路径。
     提交完再 `git show --stat <sha>` 核一遍带进去的文件。
   - 坑出处(2026-10-21):提交"体检脚本修正"时把并行会话暂存的
-    `packages/Zan.Jobs/`、`docs/ECOSYSTEM_ROADMAP.md` 等一并带进
+    `packages/Zan.Jobs/` 等一并带进
     b0961ed37。已核实历史连续、无删除项、内容完整(没顶掉别人的提交),
     并已用 `session send` 通知相关会话"照常提交即可"。
   - 配套的坑:**提交前不复核 index,就等于替别人提交**——尤其在
@@ -191,6 +191,11 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
     改用 `git commit -- <只自己的路径>`（pathspec 提交绕开 index 里他人
     暂存）；**绝不 `git restore --staged <他人路径>`**——那会抹掉别人的
     暂存，是反向事故。
+  - amend 同戒（2026-11-16）：`--amend` 不带 pathspec 同样吞整个
+    index——裸 `git commit --amend -F msg` 把他人 staged 的 301 个
+    文件卷进了提交。修法：刚提交且未推送时 `git reset --soft HEAD~1`
+    （全部内容原样回 index，工作树不动）再 pathspec 重提；铁律
+    **amend 必须带与原提交相同的 pathspec**，与普通提交同一纪律。
 - **判"这条红灯是不是我造成的"：先比 exe 与源文件的时间戳**。共享工作树里
   别的会话改了编译器源码并**重新链接了 `build/zanc.exe`**，你随后跑测试看到
   的行为就**包含他们未提交的改动**——红灯可能是他们的，不是你的。
