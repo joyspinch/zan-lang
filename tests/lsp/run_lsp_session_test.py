@@ -324,6 +324,39 @@ def reap_launcher(pid, identity):
         raise AssertionError(f"owned launcher did not exit: {pid}")
 
 
+def owned_process_shutdown_probe(client, launcher):
+    if os.name != "nt":
+        return  # ProcessSpawn currently exposes Windows process handles only.
+    with tempfile.TemporaryDirectory(prefix="lsp_owned_", dir=client.resolve().parent / "test-out") as temporary:
+        for mode in ("owned-exit", "owned-hang"):
+            marker = Path(temporary) / mode
+            environment = os.environ.copy()
+            environment["ZAN_LSP_PROCESS_TEST_PID_FILE"] = str(marker)
+            process = subprocess.Popen([str(client.resolve()), "owned-server-process", str(launcher), mode],
+                                       env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, errors="replace")
+            identity = None
+            try:
+                deadline = time.monotonic() + 10
+                while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert marker.is_file(), "owned child did not publish its PID"
+                pid = int(marker.read_text())
+                identity = launcher_identity(pid)
+                Path(str(marker) + ".release").touch()
+                stdout, stderr = process.communicate(timeout=10)
+                assert process.returncode == 0 and "PASS LspSession owned server process" in stdout, stdout + stderr
+                kernel, handle = identity
+                assert kernel.WaitForSingleObject(handle, 0) == 0, "Shutdown returned before owned OS process exited"
+                print(stdout.strip())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+                if identity is not None:
+                    reap_launcher(pid, identity)
+
+
 LSP_STARTUP_TIMEOUT = 90
 LSP_CLIENT_TIMEOUT = 120
 
@@ -503,6 +536,7 @@ def main():
                                        "--auto-stdlib", "-o", str(launcher)], cwd=root,
                                       capture_output=True, text=True, errors="replace", timeout=90)
             assert compiled.returncode == 0 and launcher.exists(), compiled.stdout + compiled.stderr
+            owned_process_shutdown_probe(args.client, launcher)
             for mode in ("normal", "timeout", "exit"):
                 natural_discovery_probe(args.client, args.server, launcher, mode)
         project_probe(args.server)
