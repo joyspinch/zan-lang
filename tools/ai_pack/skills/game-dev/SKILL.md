@@ -63,6 +63,19 @@ description: Zan 游戏开发规范——Gui 美术风格一致性、帧循环�
   幂等释放，InputMapper 的按下/释放边沿只在实际逻辑步后清理，零步与重绘保留。
   HoldEventKind 和离散事件先呈现的节奏仅保留旧绘制期消费者兼容，不是标准输入主路径。
   `guihost_loop_test` 已通过真实离屏输入与原循环的 strict golden/leak/guard。
+- **首次登记早于输入准备快照**：HUD/区域 scope 在装配时创建并 Bind，PrepareView
+  只更新当前区域几何；BeforeInput 首次注册会改变 participant generation，旧准备必须
+  放弃尾部。SceneDesigner 用 `InitializeInput(app)` 提前登记，再用 SetBounds 更新区域，
+  不能等 Render 时首次安装，也不能放宽 generation 守卫来吞掉首输入失败。
+- **绑定登记由共享宿主阶段推进**：`UiViewScope.Bind(model)` 创建、注册并
+  Wire binder，游戏页面不另建逐帧模型泵。无 AppHostLayout 时，App 共享准备
+  在区域布局前 `SyncModelHosts()`，已准备的 null-host 帧在
+  RenderFrameOverlays 末 `WriteBackModelHosts()`，原生与 offscreen 同源；
+  Form/ChildWindow 保持既有模型阶段。自定义手动帧必须在 BeginFrame 和业务
+  更新后、绘制前检查 `PrepareStandardHostFrame()`，每个业务绘制回调后及
+  呈现前检查 `ContinuePreparedFrame()`，任一 false 就放弃旧帧尾部和呈现；
+  null-host 也校验 hostLayoutRevision。该模型阶段已通过严格 probe，不能据此
+  宣称正在修改的 HUD、Designer、DataTable 或其他游戏消费方已验收。
 - 焦点语义释放与业务 Blur 分开：FocusManager 保存取得时的 weak Control，
   setter 先提交新 id/身份再调用旧 OnInputFocusLost，回调后不写回；Tab、ClearFocus、
   kind9 同源，隐藏后卸载仍按保存身份清理。根/fallback 变化只释放离开新输入树的
@@ -170,18 +183,39 @@ RTS/动作游戏也遵守这条规则，高刷新率不是外部直绘 HUD 的�
   RGB 提交保留独立 alpha。2026-11-11 `scene_designer_inspector` 严格 golden
   probe 覆盖真实离屏输入、undo、anchor、RGB/alpha、资源、滚动和根/行稳定，
   `scene_designer_color` 亦通过；这些结果不代表 IDE 或正式 CTest 已通过。
-- **区域 HUD 同几何接入输入，隐藏时释放输入状态**：嵌入 dock 或子区域用
-  `HudLayer.RenderIn(app, x, y, width, height)`，参数为 App 坐标；同一树在
-  该区域 Measure/Arrange/RenderTree，并绑定 Visual Tree 输入聚合根。
-  不另算命中坐标、不重新收养节点，单独 RenderTree 不会接入输入。
-  关闭 dock/离页调用 `SetInspectorVisible(false)` 或该层 `SetVisible(false)`，
-  摘除输入入口并只释放本层子树的 focus/pointer capture。检查器 probe 已
-  直接验证 hidden 释放焦点与再显示根稳定；capture 释放按实现契约记录，
-  此 probe 未直接断言，不外推为 capture 或 IDE 实机交互验证通过。
+- **区域 HUD 先绑定与准备，再绘制**：输入前用 `HudLayer.SetBounds(x,y,width,height)`
+  （App 坐标）与 `Bind(app)`，共享 prepare 对同一树 Measure/Arrange；
+  `RenderIn(app,x,y,width,height)` 绘制该区域，不承担首次输入前的登记时序。
+  SceneDesigner 当前用 `InitializeInput(app)`、`SetBounds(app,x,y,w,h)` 与
+  `SetHostPanelBounds(app,tools,properties)` 更新自身区域；SceneDesigner、Cards、Inspector
+  与 ScrollColumn 新旧布局/输入生命周期均有对应 frozen strict 收据，SceneView 与 casual HUD
+  仅按各自 direct probe 计。不要外推为完整 IDE、Gallery/tools 或实窗验收。
+  不另算命中坐标、不重新收养节点，单独 RenderTree 不接输入。关闭 dock/离页用
+  `SetInspectorVisible(false)` 或该层 `SetVisible(false)`，只退休本层输入。
+- **验收状态入口（2026-11-14）**：具体收据、版本与未验项按本节列出的
+  单项结论与待验项为准。
+  ControlInputHost reentry、DynamicTags options 已有各自正式单项通过，不外推为完整产品验收。
+  Tag 当前缺陷及后续测试、素材工具新布局、AI 修订仍待验；Gallery 当前官方构建仍在运行，
+  完整 IDE 性能/帧预算仍待验。capture、首输入与重入按对应版本收据确认，历史局部通过不替代当前实窗证据。
 - **聚合输入根须覆盖焦点与成员查询**：HudInputRoot 不收养 HUD 节点，必须通过 `Control.ContainsInputControl` / `FindInputFocus` 覆盖它聚合的子树。重排根仅取消已经离开新输入树的捕获；隐藏、Remove、Clear 调用 `App.ReleaseInputSubtree`，只释放本层状态。2026-11-12 GuiHost 原用例新增多层字符输入、重排/移出区域后捕获与隐藏隔离断言，以相同 golden/leak/guard 通过；测试循环持有 Button 时，Stop 必须解除反向强捕获的测试回调，否则测试自身成环。此结果不等于全部 HUD/IDE 已迁移。
 - **性能优化留在组件层**：静态缓存、变值更新、真实动画损伤、限速
   重绘与素材合批。帧预算包括世界、HUD 与最终提交，不能凭历史均值
-  宣称当前组合有固定余量。
+  宣称当前组合有固定余量。样式 offscreen before `gui-style-benchmark-20261114T104202Z`
+  与 after `gui-style-benchmark-20261114T105803Z` 均为 201 nodes × 120 frames、两模式 style_resolve=0。
+  总分配均 57758400→53899200 bytes（−6.68%）；measure 27916800→26947200、
+  arrange 4819200→1929600（−60%）、render 25022400 不变。普通/关系 pipeline
+  270588/272022→256466/253595 μs，单轮观察下降约5.2%/6.8%，不代表普遍加速、
+  零分配或游戏整帧达标，也不冒充历史旧版全面基线。style 功能和 flow regression
+  分别通过，core 三文件输入冻结；broad manifest 有 Designer 并发变化、功能收据
+  frozenPass false，不能合称整批冻结通过；该轮性能证据不代表消费方当前验收状态，后续结果统一查上述架构文档入口。
+  经验：按 measure/arrange/render 归因分配，核心冻结与广域无漂移分别核对。
+- **JsonValue 模型更新用 Set**：如 `model.Set("hp", JsonValue.NewInt(hp))`，再标脏。
+  Put 与 PutStr/PutInt/PutDouble/PutBool 等助手只追加，重复键读取首值，不能更新
+  已存在的 HUD/页面字段；更新用 Set(key, JsonValue)，不虚构 SetInt/SetStr。
+- **游戏发布与原生证据分开**：五个 game 的实际 Main publish 编译均通过；FPS 最新实际发布
+  `gui-consumer-fps-3d-20261114T134002Z` 为 pass、无 fallback、12 objects、changedInputs:[]。
+  具体收据及编译器身份见上述架构文档。native 的 `observed-native-routing-only` 只证明
+  对应启动、路由和关闭，不构成画面、玩法或完整产品验收。
 - **文档入口**：约定式窗口 `new MainForm().Show()` 配同名 HTML；
   已有宿主页面 `Gui.Html.Load(app, html, handlers, baseDir)` 返回树，
   再挂进父控件，并按需注册 ModelBinder。Parse 内自动 Install。
@@ -191,10 +225,12 @@ RTS/动作游戏也遵守这条规则，高刷新率不是外部直绘 HUD 的�
 - **输入分工**：HUD 使用控件路由、焦点与指针捕获；世界输入应尊重
   UI 消费结果，防止同一次操作同时触发 UI 和世界。
 - **像素检查在 Present 前**：Present 后不再假定画布保留；采样回读
-  自身有成本，不放进生产帧热路径。
+  自身有成本，不放进生产帧热路径。FillRect 的夹具标记须有不透明 ARGB alpha，
+  如 `unchecked((int)0xFFEA00D4)`；省略 FF 是透明色，会伪装成没画或 clip 错误。
+  先确认标记可见，再检查裁剪/合成，不能据透明夹具误修生产代码。
 
 以上是当前开发约定，不表示仓库旧 HUD、SceneDesigner 或各模板已全部
-迁移或通过实机验证。实现现状与迁移门见 `docs/GUI_ARCHITECTURE.md`。
+迁移或通过实机验证。实现现状与迁移门见本节前述验收边界。
 
 ## 游戏界面设计方案：菜单/面板走 .html 设计稿 + Nav 出口
 

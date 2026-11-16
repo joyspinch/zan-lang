@@ -61,7 +61,17 @@ zanc 对 .html 显式拒绝；唯一通道是运行期装载（2026-10-31，B-ID
   ListView 报全内容高（几千 px）时，溢出收缩按比例分摊，240px 的
   封面带会被压扁成 95px（朋友圈封面实测）。装饰角/页脚文案这类
   "静态 AddText 元素"没有内在宽度申报，不吃 `flex-grow: 1` 就被
-  量成几十 px 折行。
+  量成几十 px 折行。**先核对父级布局上下文，再给子项 grow**：普通 `Panel`
+  走 flow，子项的 `flex-grow` 不会分配父级剩余高度；即使 Panel 已有非零高度，
+  内层列仍可能仅按内容高排列。沿受限高度的祖先链建立 flex 上下文，例如外层
+  `display:flex; flex-direction:column`，内层列与文本区用 `flex-grow:1;
+  flex-basis:0; min-height:0`；不要用固定大高度掩盖断链。素材工具已确证输出
+  Panel 为 `300×936`、内层列仅 `300×24`、JSON 为 `300×0`，局部补父级纵向
+  flex 后 direct `162141Z` frozen pass。回归在真实输入准备后、首次 Paint 前
+  分别断言文本区宽高（保留可读高度阈值）、文字非空且等于当前模型；真实 native
+  canvas 另存画面审查字形、裁剪与标签切换后的内容。离屏几何/文本 oracle 通过
+  不等于画面已验收，canvas 证据也不证明锁屏外桌面或 OS 输入；后续实测状态见
+  本技能 references/ 内的素材工具证据边界。
 - **`<style>` 注释里别写 `*/` 序列**（如 `.wxfilt*/.wxfavrow*` 这种
   通配写法）：StripComments 按第一个 `*/` 截断注释，注释后半段
   变成裸 CSS 文本、随后的规则被吞进选择器——整段样式静默失效。
@@ -133,30 +143,48 @@ zanc 对 .html 显式拒绝；唯一通道是运行期装载（2026-10-31，B-ID
 快照变了就回写，**没有来源过滤**——程序化 `SetProp` 同样落模型）。
 宿主有两种挂法：
 
-- **子窗口**：`ChildWindow.SetRoot(tree, model)` + `Wire()`，子窗口
-  自己的渲染循环每帧驱动（`ChildWindow` 内部持有一个 ModelBinder）。
+- **子窗口**：`ChildWindow.SetRoot(tree, model)` + `Wire()`，窗口持有的
+  ModelBinder 登记到该窗口的 App；ChildWindow 与 Form 都驱动各自 App
+  的模型宿主同步。
 - **主窗口里的页面**：`new ModelBinder()` → `SetRoot(tree, model)` →
-  `Wire()` → `ModelHosts.Register(app, binder)`；主窗口的 `Form` 帧
-  循环在测量前 `ModelHosts.SyncAll()`、渲染后
-  `ModelHosts.WriteBackAll()`。页面不必自己写帧钩子；换页时
-  `ModelHosts.Unregister(binder)`。
+  `Wire()` → `ModelHosts.Register(app, binder)`；Form 已驱动该 App 的
+  模型→UI 同步与 UI→模型回写，页面不必自己写帧钩子。换页时调用
+  `ModelHosts.Unregister(binder)`。兼容批量入口必须显式传 App：
+  `ModelHosts.SyncAll(app)` / `ModelHosts.WriteBackAll(app)`，无参版本已删除。
+  页面也可用 `UiViewScope(app, owner, tree)` 的 `Mount(parent)`、
+  `Bind(model)`、`Handle(name)` / `Action(name, sender)` 组合装配，换页时
+  `Retire()`。Bind 只创建、注册 binder 并 Wire，模型阶段由标准宿主共享
+  prepare 驱动；独立区域在 owner.PrepareView 中 `view.Layout(...)`。
+  scope/输入宿主须在输入准备快照之前创建并 Bind；BeforeInput 内首次登记会改变
+  generation，使旧准备失效，不能继续旧尾部或等到 Paint 才安装。
+- **自定义宿主与手动帧**：无 AppHostLayout 时，App 共享准备先执行
+  `SyncModelHosts()` 再推进区域布局，已准备的 null-host 帧在
+  `RenderFrameOverlays` 末执行 `WriteBackModelHosts()`；原生 PresentFrame 与
+  offscreen 共用此边界，Form/ChildWindow 保持既有模型阶段。手动帧必须在
+  BeginFrame 和业务更新后、绘制前检查 `PrepareStandardHostFrame()`，并在
+  每个业务绘制回调后及呈现前检查 `ContinuePreparedFrame()`；任一 false 就
+  终止旧帧尾部与呈现，null-host 同样校验 hostLayoutRevision。页面不重复泵模型。
+  该自定义宿主模型阶段已通过严格 probe；HUD、Designer、DataTable 等消费方
+  仍须独立验收。完整契约见本技能 references/ 内的共享机制正文。
 
 由此三条选路规则：
 
-- **值/显隐/列表内容 → 改模型**：`model.Set("title", ...)` /
-  `Set("showBag", ...)` / `Set("items", ...)`，末尾
-  `RequestRedraw` 出一帧即生效（模型改了但窗口静止，屏幕不会
-  自己动）。别既改模型又 `SetProp` 同一控件——两个写入源打架，
-  帧后回写可能把模型改动顶回去。
+- **值/显隐/列表内容 → 改模型**：JsonValue 使用
+  `model.Set("title", JsonValue.NewStr(title))` /
+  `model.Set("showBag", JsonValue.NewBool(showBag))` / `model.Set("items", items)`；
+  items 是 JsonValue 数组。更新必须用 Set(key, JsonValue)：Put 与
+  PutStr/PutInt/PutDouble/PutBool 等助手只追加，重复键 Get 取首值，用它们更新会继续
+  读旧值。末尾 `app.RequestRedraw()` 出帧，不虚构 SetStr/SetInt 等公开方法。
+  别既改模型又 SetProp 同一控件，帧后回写可能把模型改动顶回去。
 - **结构（增删控件/换组件类型）→ 命令式**：retained 树 API
   （`Find` + `Add`/`InsertAt`/`Remove`/`SetProp`）或整页
   `Gui.Html.Load` 重装。已知代价：重载是**整树无 diff**（手工 Add
   的控件不在新文档里）；宿主须替换旧树并注销旧 binder。列表高频
   更新留在模型通道，带 data-key 的行可走增量更新。
-- **模型宿主与窗口无关**：任何一棵控件树（`Gui.Html.Load` 装出的
-  运行期文档树、手搭树）挂上 ModelBinder 即生效。此前只有 ChildWindow 带这层驱动——主窗口里的页面写了
-  绑定也不生效，于是「一个 .html 文档 + 一个 .zan code-behind」这种
-  页面写法在主窗口内拿不到判断与双向绑定。
+- **模型宿主可用于任意控件树，但登记需要宿主泵**：`Gui.Html.Load` 装出的
+  文档树与代码树共用 ModelBinder；注册到明确 App 后，由该 App 的标准共享
+  prepare 执行同步/回写。仅创建 binder、Bind 或 RenderTree 不会自行运行模型阶段，
+  自定义手动帧须遵守上述 prepare/Continue 契约。
 
 **每帧同步与用户输入的分工（坑）**：模型→UI 同步**不覆盖"用户改过、
 还没回写"的控件**——控件现值与上次模型确认值（快照）不同就说明用户
@@ -216,7 +244,7 @@ ModelHosts.Register(app, b);            // 主窗口的每帧泵驱动它
 
 代码树也可配置 bindPath/bindProp 并挂同一 ModelBinder；模型路径不限于对话框或
 JsonValue。`Binding<T>` 提供强类型字段直绑，两者都通过控件公开属性承载值，
-不构成不同 UI 创作模式（STDLIB_COMPONENT_STANDARDS.md §6）。
+不构成不同 UI 创作模式。
 
 ## 文档与原生控件混排：五个画不对的坑（都真踩过）
 
@@ -296,7 +324,7 @@ Cookie，"对照组"就不成立了。
 引擎支持 flow / inline 行盒 / flex / grid / float / overflow 滚动，
 经 Chrome getBoundingClientRect 逐盒对比（oracle）校准，多数场景
 0px 偏差。CSS 方言之外的东西写上去不报错也不生效——动手前查支持度
-审计脚本与 HTML_UI.md 的与浏览器差异清单；"改了没反应"先怀疑
+审计脚本与 `references/css-dialect.md` 的与浏览器差异清单；"改了没反应"先怀疑
 没进方言，再怀疑优先级。
 
 ## CSS 两层与基线坑
@@ -464,6 +492,10 @@ CSS absolute 与 `Control.Float(x, y)`/`Place(x, y)` 用同一定位语义，
   整块半覆盖。区分 straight/premult，预乘缓冲须满足 RGB≤A：
   `0x80FF0000 / cov128 → 0x40FF0000 → 0x40400000`；只乘 coverage 曾造成
   亮边。快照只读借用 surface，复制到自有缓冲后裁切，避免污染原帧。
+  Layered 输出先 `a' = floor(a * coverage / 255)`，再逐通道
+  `rgb' = floor(rgb * a' / 255)`，保留两次截断，不合并成一次乘除。
+  shape snapshot 保持 straight RGB，仅按 coverage 更新 alpha；预乘只发生在
+  Layered 输出边界，不得将预乘像素写回借用 surface。
 - **预览状态不反写作者文档**：进出预览从文档恢复运行树，避免已切换的
   Tabs 状态泄漏回编辑页。中键、抓手、Ctrl-wheel 归编辑器，并取消目标
   press/anchors；否则平移会拖 splitter、缩放会滚内容或留下误点击。
@@ -517,6 +549,9 @@ CSS absolute 与 `Control.Float(x, y)`/`Place(x, y)` 用同一定位语义，
 高频刷新通过长生命周期控件、变值更新、脏区和缓存优化，不建立应用侧
 直绘 HUD 或自制命中区体系。游戏世界渲染保留 Zan.Game 的专用渲染路径。
 此处是开发规则；旧调用方是否完成迁移须分别核对，不能由文档规范推断。
+
+- **GuiHost 退出走宿主生命周期**：游戏回调调用 `host.RequestStop()`；不要只写 `host.App().isRunning = false`，因为 `GuiHost.Run` 由 `host.running` 控制循环，只改 App 标志不能结束宿主。原生验证须确认真实窗口收到退出输入后正常结束，并在超时 sentinel 前退出。
+  Match3 限定证据：`build/test-out/gui-native-pair-20261113T084058.019920Z/match3-escape/run.json` 记录可见 HWND、exit0、空 stderr、无 driver/runtime diagnostics，棋盘选择边框改变30个白像素；driver log 在 Esc 后结束，未到 `ESC_NOT_HANDLED`。同批 `match3-discovery/initial.png` 已目检 HUD 正确。Survivor/FPS 虽迁移同一修法，尚无各自原生证据；GUI form 回调当前失败，不属于这项语义验收。
 
 ## 声明式事件体系与丰富组件事件契约
 
@@ -709,5 +744,131 @@ CSS absolute 与 `Control.Float(x, y)`/`Place(x, y)` 用同一定位语义，
    - **反射方法表含继承方法**：HasMethod/Invoke 能命中基类方法（名字级遮蔽、最近声明胜出，基类静态方法除外），html 处理器可声明在基类窗上。
    - **`OnCloseRequested` 里可以再调 `Close()`**：Close 先置 open=false 再回调，重入早退，不会互递归。
    - **`(Label)r.Find(id)` 只对 `<label>` 成立**：`<span>` 不产出 Label；`<label><input/></label>` 里的 input 取不到，复选框文字写 `<input type="checkbox" value="文字">`。子类窗没有同名 html 时覆写 `DesignName()` 指向基类设计稿。
-   - **html 裸布尔属性通道（`readonly`，与 `disabled` 同语义）**：html 里裸写 `readonly` 出现即生效，解析期直落 `SetProp("readonly","true")`。键名走 PropSpec **精确匹配（区分大小写）**：TextArea 的键是小写 `readonly`（与 input/rate 先例对齐）——历史键名 `readOnly` 双重失配（键名不命中 + 裸属性无值按 off 判 false）会**静默失效**。契约钉在 GUI 一致性用例（TextCw：初始推送/一帧同步/readonly 命中三断言）。
+   - **html 裸布尔属性通道（`readonly`，与 `disabled` 同语义）**：html 里裸写 `readonly` 出现即生效，解析期直落 `SetProp("readonly","true")`。键名走 PropSpec **精确匹配（区分大小写）**：TextArea 的键是小写 `readonly`（与 input/rate 先例对齐）——历史键名 `readOnly` 双重失配（键名不命中 + 裸属性无值按 off 判 false）会**静默失效**。契约钉在 GUI 一致性用例（cwdocscan；TextCw：初始推送/一帧同步/readonly 命中三断言）。
 
+23. **Retained 属性、内容与克隆的五条边界（2026-11-13 属性 case 验证）**：
+   - **options 的全局 closable 不固化为逐项状态**：Tabs 从 options 建项时逐项 `closable` 为 false，有效关闭状态由逐项 flag 与 `closableAll` 组合；全局 true→false 必须能移除仅由全局开关产生的关闭按钮。显式逐项状态独立保留；此规则不改写 `Add(string)` 默认取全局值的既有语义。
+   - **Add/AddPane 使用独立装配游标**：options 预声明标签，`pendingPaneIndex` 决定后续 AddPane 消费哪项，不能用 `pages.Count` 推断；提前创建命名页不应消费标签。直接 Add 结束预声明消费阶段，之后 AddPane 追加；保留 early activeTab。检查 Add→AddPane、options→提前取页→AddPane、options→Add→AddPane 三种顺序。
+   - **clone 区分 own node 与业务内容，并配齐工厂注册**：普通 `Html.Clone` 先回放 Props，再调用 `CloneContentTo`；setter 可能已生成 caption/icon/panel，内容 hook 须去掉回放脚手架，恰好一次恢复业务 children/slot，并让回调归目标树。每个经通用 clone 的具体 Kind 都须注册工厂（如 CollapseItem），避免返回 null 后静默丢子树。空树、独立子控件、自定义 slot 和克隆后再次修改都要覆盖；Tabs 重建导航/内容壳，不重复复制生成节点。
+   - **语义样式用独立 canonical key**：Tabs 用 `tabStyle` 供 Props/GetProp/clone，兼容 `style=card/segment` 时只拦截声明支持的枚举值；inline CSS 继续走基类。验证 CSS getter、实际 padding/background 以及随后改语义样式时 CSS 仍保留，不能把 style 设为吞掉任意 CSS 的普遍 alias。
+   - **比较已应用投影，正常更新复用 Binding**：公开字段或 Binding 可绕过 setter，early return 要比较已应用状态/实际节点；同值字段不代表投影已更新。已有文本 Binding 用 `.Set(...)`，仅 null 时补建；同色但旧 gradient 尾色未清仍须失效缓存。只撤销控件负责的颜色投影，保留业务节点自定义色；生成节点被移除/换 parent 后放弃旧身份，未变化时保留节点。Binding 身份/订阅持续性没有独立计数断言，不据此声称零分配。
+
+   验证定位：`tests/conformance/retained_property_contract.zan` 的 `case_retained_property_contract`，在
+   `build/test-out/gui-refactor-old-targeted-20261113-064300-431057/result.json` 与
+   `build/test-out/gui-refactor-old-targeted-20261113-065950-731288/result.json` 中均正式及同 exe strict 通过，
+   精确 stdout、空 runtime stderr、无泄漏、exe 不变，批次输入及编译器无漂移。
+   只覆盖各收据版本的属性用例；不据此认定后续 HTML wrapper/data-child-tab 装配、Designer 或整个 Gui 已验收，
+   也不推导总体精简、普遍提速或零分配。
+
+24. **预览客户区、取消重入与回调保活（2026-11-13 Designer fixture 验证）**：
+   - **客户区根约束检查实际几何**：预览文档承担完整客户区及命中裁剪范围时，用 `position: absolute; left: 0; top: 0; right: 0; bottom: 0;`，不要仅凭百分比宽高认定已铺满；断言实际 bw/bh 等于父 viewport 扣除 inset 的尺寸。此约束针对预览根，不要求普通页面都绝对定位，也不让布局负责安装输入根。
+   - **取消旧手势须在回调前完成，不留旧清理尾部**：`App.CancelRoutedPointer` 保存旧 target 后，先退休 capture/down/hover、click history、long-press 和 press 状态，再通知 PointerCancel。回调可能建立新 press/capture，回调后再清旧状态会抹掉合法重入。用取消回调建立替代按压的回归验证，同时检查物理 release、专用 Click 一次及 drain 不重复。
+   - **Hover 回调后复核输入身份**：Leave 前先注销旧 hover；Leave/Enter 回调后，复核
+     App 仍运行、事件序列、输入根代次、手势票据、活动输入根及当前 hover 身份，
+     再继续 Enter/Move。目标须仍属于输入树，其实际祖先须属于当前 App、可见且启用；
+     adapter 以输入成员归属为准，不要求 parent 链抵达输入根。嵌套回调建立的新 hover
+     不得被旧尾部覆盖；旧目标失效时不得继续派发旧 Move。
+   - **观察引用与子控件回调避免保活环**：仅观察 sender 身份的 fixture 字段用 weak，避免 control→闭包→observer→control；Designer 自持 Palette TreeView 的回调捕获 `WeakReference<Designer>`，触发时取 Target、判空后临时调用，避免 owner→child→callback→owner 环。weak 不负责保活，也不表示整条 GUI 引用图都应弱化。
+
+   定位：`packages/Zan.Gui.Designer/src/Gui/Designer/Designer.Preview.zan`、`Designer.Palette.zan`，
+   `packages/Zan.Gui/src/Gui/Core/App.VisualTree.zan`；回归为
+   `tests/gui/designer_interaction_test.zan` 的 root viewport、SlotsAndReparent、click/drain 与 PreviewCancelReentry。
+   直接运行收据 `build/test-out/gui-designer-direct-20261113-080718/result.json` compile0/run0、strictPass true；
+   正式 `conformance_gui_designer_interaction` 收据
+   `build/test-out/gui-refactor-old-targeted-20261113-080832-559569/result.json` 于08:10:27关闭，success true，
+   正式及同 exe strict 通过，精确 stdout、空 runtime stderr、无泄漏、exe 不变，输入及编译器无漂移。
+   此结论只覆盖相应 fixture 版本，不替代产品构建门、原生窗口实机或整个 Gui 验收，也不推导零分配或普遍提速。
+
+## CSS 合并隔离与 HTML 文本首测量
+
+- **声明块必须递归 Clone**：`Css.MergeInto` 展开分组选择器时，每个选择器须得到独立声明块；`StyleSheet.MergeSheet` 合入时同样递归 Clone，隔离源表与目标表。浅拷贝会别名共享 `__zan_lengths` / `__zan_prescaled` 等内部状态，公开 CSS 字符串虽正确，有效几何、字号与颜色仍会被串改。验证须检查分组规则及源表隔离后的实际样式与布局，不能只比较字符串。
+- **设计稿文本走语义 SetProp**：HTML 装载写文本须调用控件 `SetProp`，不能直接 `PropSpec.Write`；语义 setter 在 `MeasureTree` 前创建 retained generated caption，才能让首次自然尺寸稳定。直接写属性值可能读回正确却缺少 caption，不能靠先 Paint 一次补齐。验证应在未绘制时断言 caption 与首测量，并检查重复测量尺寸不漂移。
+
+证据按用例限定：`conformance_gui_match3_retained_hud` 在
+`build/test-out/gui-refactor-old-targeted-20261113-163236-258876/result.json` 中正式及同 exe strict 通过；
+该批次整体失败，不能写成整批通过。`case_retained_property_contract` 的通过收据为
+`build/test-out/gui-refactor-old-targeted-20261113-163906-501763/result.json`，同样正式及同 exe strict 通过。
+两用例均精确 stdout、空 runtime stderr、exe 不变，所在批次输入及编译器无漂移。
+这些 strict 证据只覆盖对应 fixture；Match3 的原生证据及边界见“游戏接入边界”，不外推为 GUI form 或整个 Gui 验收。
+
+## 焦点业务通知与结构退休（2026-11-13 定向验证）
+
+- **Focus/Blur 跟随已提交的焦点转换，与绘制无关**：`FocusManager.SetFocused` 先提交 id、endpoint 与 IME，再执行旧控件 `OnInputFocusLost` 清理及业务 `Blur`，最后按 revision 检查派发当前 `Focus`。清理 hook 重入也必须兑现旧转换欠下的 Blur；回调即使绕行后回到同一 endpoint，旧尾部仍须由 revision 截断，防重复 Focus。通知沿 `TriggerEvent` → `WidgetEvents.FireByName` 仅 Peek 已有惰性槽，不为未订阅事件建槽；首次绘制前可通知，重复绘制不补发。
+- **退休在结构提交后定向核对旧子树**：`Control.Remove/RemoveChildren` 完成摘除、`App.SetRootControl` 安装新根后，再 `ReconcileFocus`；只处理属于此次旧移除子树且未重新托管的当前焦点，不全局清扫所有暂未挂树 endpoint。保留回调显式选择待挂载新目标的既有兼容语义；新 capture 也不能豁免未变的旧焦点或旧 overlay。
+- **批量移除的临时 fence 覆盖整批旧子树**：全部结构移除提交后，在同步清焦回调期间阻止向这些尚未重新托管的节点设焦，防 Blur 内 A→B→A 恢复已脱树焦点；嵌套退休合并 fence，finally 恢复外层。合法重新托管的目标可保留，不把 fence 变成永久禁用。
+
+限定证据：`build/test-out/gui-refactor-old-targeted-20261113-200834-041767/result.json` 中
+`conformance_gui_retained_focus_lifecycle`、`conformance_gui_overlay_anchor_retirement`、
+`conformance_gui_control_host_lifecycle` 三个既有用例均 officialPass/strictPass，正式通过后同 exe strict 复跑通过，
+精确 stdout、空 runtime stderr、exe 不变；`changedInputs: []`、`compilerUnchanged: true`，
+编译器 SHA-256 为 `f51abfc8103be942c459c3761095d97bd15814d83b59046ddeb6b4d21d48590c`。
+结论只覆盖该收据的三个 fixture 版本，尚不构成原生窗口实机或完整 Gui 验收，也不推导普遍提速或零分配。
+
+## 关闭回调的 ARC 所有权（2026-11-13 定向验证）
+
+- **在真正停循环时退休关闭回调**：`App.StopLoop()` 清空 `closeRequest` 与 `closeGuard`，打断 owner → App → 回调 → owner 环；不要在首次关闭请求时提前清空，否决关闭与异步清理期间仍需保留关闭语义，pending 请求只通知一次，排空完成后才停循环。
+- **执行中的委托由局部强引用保活**：调用前分别取 `Func<bool> guard = closeGuard`、`Action handler = closeRequest`，再调用局部；guard/handler 内重入 `StopLoop()` 会清掉字段，局部必须保护当前执行及其捕获对象，直到调用返回。
+- **LSP 在服务线程汇合后释放宿主回调**：`Shutdown()` 先标记 stopping、取消并解绑编辑器；`ShutdownAsync()` 等 `serviceStopped.Task` 完成后，仅在 `stopping` 时清空 `onDiagnostics` 与 `uiDispatcher`，打断退休 session → 诊断回调 → IDE 环。单纯观察完成不应清掉未 stopping 会话的回调。
+
+源码已确认上述 owner 环；弱引用探针验证停循环释放、否决保留、pending 一次通知、委托重入保活及 LSP 汇合后的释放边界。
+strict 探针收据：`build/test-out/gui-close-probe-20261113T130446.414248Z/close-probe-report.json`（两探针通过）。
+正式 App 用例 `conformance_gui_app_post_lifecycle` 及同 exe strict 通过：`build/test-out/gui-refactor-old-targeted-20261113-210647-706765/result.json`；
+正式 `lsp_session_editor` 通过（119.05 秒）：`build/test-out/gui-close-lsp-formal-20261113T1307.log`。
+旧 native IDE 正常关闭报告仍为 52,268 个对象；新 exe 的原生关闭验证尚待完成。这些源码与 fixture 证据不证明该总量已消除，不得写成 native 泄漏已修复。
+
+## 关闭排空的 Task 契约（2026-11-13 定向验证）
+
+- `Task` 是有类型的任务值，不与整数比较，不用 `return 0` 表示空任务或已完成任务。
+- 本次已观察到 async property 结果直接转交后 `Wait` 未形成有效启动/回收链，TCS owner 残留；不可将 `Wait` 当成显式启动，未将其定为转换缺陷，也不外推所有 async property 的行为。
+- 非阻塞 drain 可同步登记 completion，再返回 `Task.Run(this.WaitForDrain(completion))`；具名 async 方法在 completion 非空时 `await completion.Task`，由 `Task.Run` 显式注册并调度。
+- async 入口只建帧；active async resume 内的 `await` 挂起当前帧，普通函数上下文的 `await` 才走同步 pump。
+- drain 回归勿在 `Task.Run(Action)` worker 内嵌套 `Task.Run(WaitGate(...)) + Wait()`，以免同步泵制造 drain 依赖环；取得 drain 后由测试独立推进 Complete。
+- DONE 可早于帧尾声释放；弱 owner 检查用有截止时间的 eventual 断言，轮询时避免强引用保活目标，不要求即时清空或无限等待。
+- 导航 strict probe：`build/test-out/navigation-work-20261113T141215.704486Z/report.json`，编译/运行 exit 0、精确 marker、runtime stderr 空、changed_inputs=[]；编译警告 W2072 不属于 runtime stderr。
+- fresh native：`build/test-out/gui-ide-native-20261113T141513.882231Z/result.json`，result=capture-complete、exit 0、stdout/stderr 均 0 bytes、diagnostics=[]，raw_close=true 且 visible；结论限于本次捕获的正常关闭路径。
+
+## 双范式布局：本次分配宽度与内在测量边界
+
+- **分配宽度是本次测量状态**：`MeasureTree(App app, int width)` 接受已分配的 border-box 宽度，以独立状态保存并在 `finally` 恢复，不写回作者的 `HintWrapWidth`。`RenderInside`、带宽度的 `RenderAt`、`UiViewScope.Layout` 在测量前传实际宽度；换行 Label 用当前内容宽计算高度。子项 auto 宽度先扣水平 margin，显式 content-box 尺寸先按 min/max 钳制再加 padding/border，避免窄宽切换残留旧高度或盒模型少算。
+- **分配与重测共用布局事实**：Grid 显式传递当前 `App` 宿主，列宽确定后按 slot 重测子树再求行高，不依赖脱树 HTML 节点原先保存的 `app` 字段。nowrap Flex 行的约束测量与排列共用 `FlexLineSizes`；wrap Flex 行按当前内容宽重新分行、累计高度。HTML 与声明式对象树必须比较实际几何和滚动范围，不能只比样式字段。
+- **直接测量保留显式样式边界**：完整子树约束重测仅在 scoped `MeasureTree` 内启用；`measuringTree` 保存旧状态、置位后执行，并在 `finally` 恢复。直接调用 `MeasureGridContent(app)` 保留调用者显式提供的 `computedStyle`，不触发重新解析样式的子树测量。
+- **内在遍历不重复启动约束遍历**：确定列轨的 Grid 延后内在子树测量，直接按列槽测量；内在测量 flag 阻止内在遍历再次触发约束递归，消除该路径的指数式重复。嵌套且依赖内在尺寸的树仍可能二次增长，不能推导全树线性、零分配或普遍提速；源码精简仍未完成。
+- **状态栏用公共单行布局承诺几何**：`statusbar` 基线使用 Flex row、交叉轴居中、overflow hidden，直属 Label 声明 `min-width:0;flex-shrink:1`。一个弹性 spacer 分隔左右组，右项用标量 order 从右向左扩展；公开索引保持添加顺序并排除 spacer，Clear/重建只保留一个 spacer。检查实际矩形在栏内、同排居中且互不重叠，覆盖左右混合插入、窄宽往返、动态文本及多 DPI；裁剪不能替代正确布局。
+- **显式最小尺寸替代自动内在下限**：Flex 收缩在没有主轴 min 声明时才使用 `MinContentMain`；显式 `min-width/min-height`（含 0、正值、百分比）经既有 clamp 路径替代该自动下限。最终尺寸仍按可让空间分配，回归断言最小值、相邻关系和总尺寸，不要求每项恰好等于正最小值。
+- **回归用真实文本与状态往返**：覆盖 100/150/200 DPI、窄→宽→窄、真实长文本、缩短/再增长、RemoveAll/恢复及滚动范围；覆盖 `minmax(0,1fr)` Grid、nowrap Flex、根声明宽与实际宽冲突、margin/content-box 与 wrap Flex。七层嵌套的叶子测量次数 `<= depth + 2` 只约束对应夹具，不证明任意树复杂度。
+
+直接 strict 探针定位：`scroll_routed_input` 的 `build/test-out/gui-layout-20261113T160722.781351Z/report.json`，
+以及 `view_scope` 的 `build/test-out/gui-layout-20261113T160634.712937Z/report.json`，两者 compile/run exit 0、success true。
+直接探针只证明相应夹具；正式收口及源码版本边界见本文件「双范式布局：本次分配宽度与内在测量边界」小节，各用例通过不构成整个 Gui 验收。
+
+## 复合控件的布局与真实输入（2026-11-14）
+
+- **嵌套按钮保留最近子控件的捕获**：按钮冒泡处理 Down 时只在当前没有捕获者时捕获自身；Up 只释放自身持有的捕获。Tabs 关闭图标的 Down 必须捕获关闭 Button，Up 合成一次关闭；直接调用 Click 事件绕过这条路径，不能验证捕获正确。
+- **CSS 对应实际生成节点**：Tabs 标题与关闭目标是 `button.tab-item`、`button.tab-item-close`，伪元素规则不能代替真实子控件样式。分别验证 line/card/segment、横竖方向、选中边框与图标中心；关系选择器的独立 ResolveStyle 查询须提供当前节点上下文，或读取当前布局的 computedStyle。
+- **长标题约束整条祖先链**：标题可收缩、关闭按钮不收缩，并同时约束导航列与 header 的最大宽度；只给 header 加百分比上限仍可能随过宽导航列一起溢出。自动显示选中项按 ScrollViewport 的可见内容矩形计算，包含边框和滚动条的外框不能作为可见边界。
+- **异步动作带树版本**：用数字索引捕获 Tabs 选择/关闭/添加动作时，同时捕获构建 generation；重建后旧动作失效。弱 owner 只避免生命周期保活，不能证明索引仍指向原项。用真实 Down → Post(重建) → Up 验证，不假设 Up 返回后动作仍在队列里。
+- **首次测量前建立内容**：ToolStrip 创建按钮时就用 `Button(caption)` 和 icon 属性建立真实子节点，不能等 Paint 中 SyncBinding 再补标题。工具栏明确使用 Flex row，共用弹性 spacer 和 order 区分左右项，公开索引排除 spacer；分隔符禁用且不产生点击回调。
+- **宿主先接收组件输入结果**：把业务 activeTab 回写 Tabs 之前先消费组件 TakeChanged，避免覆盖上一输入轮次的选择；延迟创建的组件须先确认实例已存在，首次帧没有待消费事件。同时复核原生 IDE 的标题切换、关闭、上下文和添加路径。组件矩形断言、事件数量和实窗截图各有边界，单项通过不代表完整 Gui 验收。
+- **长工具项保留相邻操作命中宽度**：仅测短标题会漏掉短按钮被长标题挤到 10px 的问题。按钮以主题 height-large 为最小宽度，图标不收缩，标题收缩；代码与 HTML 都要在窄宽、多个 DPI 下于首次 Paint 前断言矩形，并用真实输入点击每一项。该规则不代表已有通用溢出菜单。
+- **菜单状态落到实际子节点**：保留树 Menu 的 .menu-item、标题、组和 separator 需要真实 CSS，旧 menu::item 不能替代。禁用组按钮也要 Disabled；非空 selectedKey 优先于旧数字索引。重建用 RemoveAll 退休捕获/父链，弱 owner 加 generation 退休旧动作；验证多层组和重建期间的 Down/Up。
+- **组件尺寸进入测量契约**：Avatar 等公开 Size/Diameter 的组件须在 OnMeasure 给出对应两轴默认尺寸，不能让字形宽度代替直径；显式单轴尺寸仍由布局引擎保留。回归同时测短/长标签、公开尺寸与实际 Flex 行排列，flex-shrink:0 只能禁止收缩，不能补出缺失的首选尺寸。Flex 居中须同时声明 align-items/justify-content；长标签另设 min-width:0、最大宽度与收缩边界，断言实际内容中心及包含关系，不能只检查外框为圆。
+- **菜单 Escape 用按键事件并消费一次**：legacy ContextMenu.Render 与 retained 弹层都应按 App.KeyPressed(27) 的窗口/消费约束处理退出，返回已有 dismiss 结果并 ClaimKey；不能在各业务窗口重复补 guard。UiDriver 的 char 27 是字符事件，应发送 keydown 27 0 与 keyup 27 0，回归同时覆盖字符、释放、其他键、消费后不重复。
+- **绘制与输入挂载分别验证**：RenderInside/RenderAt/RenderTree 负责测量、排列、绘制，命中转储有区域仍可能脱离当前输入树。混合宿主复用 ControlInputHost 借用控件树、UiViewScope 在输入前布局；重建先退休旧 scope/host，Bind 保留其他 adapter，禁止每帧 SetRootControl 覆盖整个输入链。实窗确认标题切换、非当前关闭、最后标签关闭后的有效页面；UiDriver click/ev 使用物理客户区坐标，不二次乘除 DPI。
+- **退出清理覆盖仍打开的子窗口**：向导 renderCb 可能捕获自身，closeCb 也可能通过业务 owner/dlg 成环；主窗口退出先用局部强引用 Close 当前子窗口，走既有回调与 Teardown 清链。分别验证正常关闭子窗和主窗带子窗退出；非视觉 HWND 取消只证明生命周期，不证明子窗排版。单 App UiDriver 的主 canvas 截图不能冒充独立 HWND 截图。
+- **实窗验收读取捕获的帧异常**：stdout/stderr 为空且进程正常退出仍可能每帧 catch 异常。运行前后记录可执行文件旁 zan_ui_errors.log 的新增部分；存在新错误就失败，并结合实际编辑区、探针和截图复核，不能只看脚本走到末尾。
+- **生成操作节点与作者内容分开克隆**：Tag 关闭按钮在构造时创建，属性 setter 在首次测量前同步可见性；CloneContentTo 只跳过该实例，保留作者按钮、图标及专属文字的样式/顺序，并恢复目标的文字节点身份。SetText 不按首节点类型认领用户 Label。重加已有节点时，先完成 Adopt 再定位生成按钮，避免移除旧位置或取消回调使索引失效。所有可克隆的子节点 Kind 都须有公共工厂注册，不能让 null 克隆悄悄丢内容。
+- **排队关闭核对条目身份**：DynamicTags 关闭动作弱引用创建它的 Tag，执行时同时核对当前下标和子节点身份；列表重建后旧动作失效，重复文字不能用文本匹配代替身份。保留 UiEvent 已排队回调的通用语义，不为单组件取消请求改全局队列。回归须覆盖排队后删除前项、SetItems 替换及重复标签。
+- **失焦通知逐段确认宿主所有权**：焦点切换先提交当前身份，再调用旧端点清理与 Blur；每个回调前分别确认旧端点仍归原 App，回调后按 revision 检查是否重入。语义失焦回调本身也可能转移控件，首次检查不能覆盖后续业务通知。真实 Down 建立捕获，在 PointerCancel 中绑定替代宿主并重新取得焦点，断言旧 Hide 不清掉新状态，再用 Up 验证正常释放；仅检查最终 root 无法发现新捕获被旧清理误伤。
+
+### DynamicTags / Tag 与 HTML 标识边界（2026-11-14 冻结正式三项）
+
+- **重建 proof 进入退休过程**：DynamicTags 每次 RebuildChildren 先递增 generation，以保存该代次的 action.Current 作为 `RemoveChildren(children, proof.Current)` 的继续条件；取消回调可嵌套 SetItems，返回后及逐项 Add 后都核对 proof，旧调用不得继续摘除或追加新一代子树。只在 RemoveChildren 返回后检查不足以保护退休过程。
+- **旧构造器也保存身份**：保留 `DynamicTagsAction(tags, index)` 两参入口，创建时快照当前 generation 与该索引的 Tag；Close 同时核对代次、有效索引及当前子节点身份。当前动作正常关闭，重建后的旧动作失效，不能因缺少 source 而让旧 API 永久无效。
+- **编辑由真实 Input 完成**：StartEdit 在挂载后 Focus 实际 editor，挂载前开始的编辑在 OnMeasure 补焦点；Enter 接 Input.Submit，Escape 接 routed OnKeyDown 并 Handle。重建移除旧 Submit 订阅后接新代次动作，不在 Paint 轮询输入。回归在零 Paint 下验证焦点、输入、提交/取消，再重复绘制确认不重放；不据此新增失焦提交语义。
+- **树拥有文字，缓存只借用**：Tag 的 owned Label 缓存用 weak；新 Label 先由局部强引用持有，再 Add 交给子树。移出后即使 Tag 仍存活、未再 SetText，Label 也应释放；单测同时保活 owner、只弱持移出的 Label，避免测试自身延长寿命。
+- **HTML id 早晚都直写元数据**：Html.Build 初次分配 id 与属性回放后恢复 id 都直接写 `Control.name`，不能走 `SetProp("name", id)`。IconView.Name 是字形，id 不得覆盖默认空字形或注册工厂的默认字形；验证 id-only、克隆与工厂默认字形，不能仅靠末尾恢复 id 掩盖首次 setter 的副作用。
+
+证据：`build/test-out/gui-followup-cases-20261114T170531.457974Z/report.json` 的
+`tag_close`、`control_factory_equivalence`、`html_props_equivalence` 三条 exact conformance 均 Passed，
+pass=true，compiler 前后均 `d08d28837b05b41d85279faff258646972d7f11308108c879fbd042d54d9d5ef`，
+changedInputs/changedRegistration=[]；结论限于这三条，不外推完整 GUI 或原生窗口验收。

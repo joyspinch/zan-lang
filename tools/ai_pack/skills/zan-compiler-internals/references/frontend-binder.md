@@ -24,6 +24,18 @@
 - **属性访问静态与实例区分**：
   访问属性时，若属性声明为 static，禁止通过实例接收者直接读写；反之实例属性必须绑定至有效实例对象，防止语义层绕过导致 IRGen 阶段解引用空接收者指针。
 
+- **泛型构造器的方法组目标必须贯穿闭合（2026-11-15 实测）**：
+  `new Picker<Item>(Rows.Of)` 的 `CellOf<T>` / `RowOf<T>` 形参必须按 constructed owner
+  闭合后再做 checker 候选判断、胜出 target 标注、IR 构造器评分及 typed 发码；
+  checker 复用 `zan_binder_subst_named`，IR 查找显式传 owner（`find_ctor_inst`），
+  发码复用 `subst_delegate_sig`。只补 checker 会从 E2037/E2038 前进到 IR E3024，
+  只补发码则根本选不到构造器。命名/重排参数的判断与 target 标注共用映射，保留
+  params 既有展开规则，不能将源方法组标成开放委托，也不能放宽不兼容签名。
+  判定器：`generic_delegate_ctor_methodgroup`（RowOf/CellOf、重载、named/reordered），
+  `cs_b04_named_args`、`params_optional_combination`、`diag_method_group_selected_signature`
+  与 `diag_method_group_selected_receiver`；另用错误 T 的 ctor 探针确认 E2037 仍拒绝。
+  直接委托赋值绿不代表泛型 ctor 绿，最小探针通过后仍须重建实际 IDE 消费者。
+
 ## 4. 闭包捕获与控制流分析
 
 - **捕获变量而不是捕获值快照**：
@@ -238,3 +250,28 @@
 - checker 的初选、typed fallback 与唯一实参签名都必须先检查调用实参数和显式泛型元数；不能保留已被过滤的同名成员作成功结果。唯一 raw `Query(string)` 曾把合法 `Query<Entity>()` 扩展的返回类型判成 `DbResult`，而 raw 重载组因唯一签名为空反而掩盖缺陷。
 - irgen 的共享扩展评分同样拒绝显式泛型元数不符的候选；异步性判定与正常调用都复用这份选择，避免声明顺序决定 async 标记。
 - 判定器：`case_extension_member_collision`（唯一/重载 raw 成员）、`case_async_generic_extension`（相反 async 标记与错误泛型元数）、`case_orm_executor_extensions`（真实 IDbExecutor）。
+
+### 显式限定类型接收者必须保留类型身份
+
+- `nsresolve` 精确命中限定类型后，即使把 `Ns.Type` 折叠为标识符，也必须保留
+  “这是类型接收者”的标记；binder 按最终类型名只查根类型，checker 与 IR 共用。
+  否则同名字段/局部/参数会把 `Ns.Layer.Render` 重新绑成值接收者，checker 报
+  E2084；只放过检查器仍会被 IR 局部快速路径或自身字段判断再次误派。
+- 仅精确限定类型命中设置标记；裸 `Layer` 与 `this.Layer` 保留值遮蔽，错误
+  namespace 不得退化猜简单名。判定器 `qualified_type_receiver_shadow` 同时给
+  干扰值类型声明同名方法，以运行输出锁住实际静态派发；最小跨 namespace
+  探针保留 weak 同名字段，覆盖真实阻塞形状。
+- 身份协议必须覆盖静态字段读写、`++/--`、方法组评分和发码，不能只修直接调用；
+  IR 的局部值与类型查询统一分类。泛型基类 AST 克隆也不得把已证明的限定类型
+  按同名类型参数替换。正式判定器用互异的静态/局部值、`Func<int>`/`Func<string>`
+  重载和基类克隆输出锁住这些入口；独立红例曾无诊断地产生错误值，或在方法组发码报 E3009。
+- `get_field_index` 的布局槽也包含 `SYM_PROPERTY`，不能把命中槽等同于裸类型被字段遮蔽。
+  当 binder 已选中类型时，同名继承属性仍须允许自然静态路径（如 `App.frameApp`）；
+  局部变量/真实字段遮蔽及显式 `this.App` 属性访问另按各自身份处理。判定器包含此交叉形状。
+
+### 方法组转换共享目标驱动的候选选择
+
+- 闭合泛型类上的普通方法组必须经 `route_generic_method` 取得具体函数与签名，再构造实例 thunk 或静态委托；直接使用泛型定义的擦除 ABI 会造成直接调用正确、委托调用错值。不同类型实例必须分别验证，防止 thunk 缓存串用。
+- 裸字段接收者与 `this.field` 必须解析为同一实例类型，同时保留同名局部遮蔽。目标委托声明中的 `ref/out` 模式也属于签名；当前不支持该转换时应报 E2098，不能丢掉参数模式按值接受。
+
+方法组匹配不能只返回“存在兼容重载”再按名字取首方法；checker、IR 发码和 ARC 的实例接收者/临时 owner 分类统一走 binder 的 `zan_binder_method_group`，按目标委托签名及类型/值接收者形状选择实际候选，保留字段/属性遮蔽。AST 经 `zan_binder_method_group_target` / `zan_binder_set_method_group_target` 只保存目标委托类型，IR 按当前泛型环境替换后重选，不能缓存某次实例化的候选。外层重载评分仅探测，胜出后才提交实参目标；否则未选候选会污染后续发码和清理。回归用 `method_group_selected_overload`、`method_group_selected_static` 观察实际调用与接收者生命周期，配套 `method_group_selected_receiver`、`method_group_selected_signature` 锁住 E2098；宿主通过不代表自举按名 `FindMethodUp` 的转换路径也已对齐。

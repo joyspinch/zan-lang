@@ -259,6 +259,137 @@
   无 `-g` 时两个分配点可能共用 site 编号，不能仅凭 site/行号归因；须用
   allocation/release trace 或 `-g` 确认实际来源。本次 trace 确认 Bundle 正常，
   旧 line 75 归因来自共用 site，泄漏实际为临时集合 receiver 漏释放。
+- `List.AddRange(Snapshot())` 的 source 是调用方 owned 临时量，内建展开不能绕过
+  通用调用的释放协议：source 求值后复用现有 EH 临时槽，在 null/空源/复制完成
+  的共同 done 点撤槽并 `emit_release_owned_call_temp`；借用局部 source 不释放。
+  `case_list_addrange_source_lifetime` 覆盖 int/reference-token 临时源、空/null、
+  借用源、self AddRange 与 source 抛异常；旧 compiler 漏集合及元素共5对象，
+  修复后 -g/leak/ARC/strict/HARD direct 与单case正式零漏通过。
+
+- **发布构建不能按 DTO 外形裁掉动态反射元数据**（2026-11-14 探针对照）：
+  `object.GetField*` 与 JSON 的嵌套对象读取依赖分配描述符里的具体类型 meta；
+  `typeof(T)` 有字段列表不代表实例能动态读值。启用 `refl_used` 时，普通无注解、
+  无接口、无虚方法的 DTO 也必须保留 site meta 和相应发射可达性；不能只保留多态类。
+  `publish_reflect_object_metadata.zan` 在旧 publish 构建读取 Id 即失败，调试构建正常；
+  修复后两种构建均精确输出、空 stderr，覆盖嵌套 int/string/bool 与对象身份。
+  探针收据 `build/test-out/gui-publish-reflect-20261113T201915Z/report.json`；
+  正式定向四用例 `case_publish_reflect_object_metadata`、`case_reflect_typeinfo`、
+  `case_reflect_members`、`case_reflect_object_getter_ownership` 均 exit 0；冻结收据
+  `build/test-out/gui-publish-reflect-formal-20261113T203716Z/result.json`，
+  compiler SHA-256 `b781046c6e21abf2be53207c4c2e2b2b56a6be27656bbb7c65f4c0aa3d0c75e7`，
+  `success=true`、`changedInputs=[]`。原生 IDE 验收仍需另记，不能由这些用例外推。
+- **反射元数据与构造调用能力分开记账**：字段/JSON 动态读取所需的 `refl_used`
+  不能因裁剪构造器删除；构造调用需求从实际发射的活 `CreateInstance` 记录，死方法
+  不开启需求，未知 TypeInfo 流保守保留。构造器 body root、类/List thunk 和合成站点
+  共用谓词。隐式初始化器与泛型特化也能产生需求，须在死桩与站点表冻结前，将
+  body、需求、metadata、方法表及站点统一求固定点，并用 ready 状态保证幂等。
+  发布 IR 门禁检查无构造 thunk/死构造专用 marker；元数据查询可合法常量折叠，
+  不要求物理表存在，另用运行期数量/参数 golden 验证。能力级保留不等于逐类型裁剪。
+- **nothrow 闭包必须把未知间接调用记为可抛**：无法解析调用目标时，仅跳过边会把
+  反射、委托和虚调用 wrapper 误证为 nothrow，错误塌缩 `invoke` 后异常越过局部
+  catch。回归覆盖间接反射方法、构造器和委托 relay 的捕获及 leak/ARC 清理；
+  原生助手名称白名单也不能替代对其间接调用体的分析。
+- **发布模式字段反射必须保持默认公开与 private 字段的既有语义**（2026-11-14）：
+  `reflect_fields.c` 不能按原始 `MOD_PUBLIC` 位删除字段记录；Zan 省略修饰符默认
+  public，而且既有 `reflect_members` 也要求显式 private 字段可由反射读取。
+  保留静态成员/遮蔽排除，删除发布专用可见性过滤；不能给业务 DTO 补 public
+  掩盖编译器差异。IDE 编辑器探针实际执行却输出 `{}`，是 FieldCount 为零，
+  不是 UiDriver 未注册；保留分配 site meta 也不能代替保留字段记录。
+  `publish_reflect_object_metadata` 已覆盖两类公开字段、private 字段与嵌套 JSON；
+  调试/发布对照 `gui-reflect-visibility-20261113T214511Z` 均精确输出、空 stderr。
+  正式四项收据 `gui-publish-reflect-formal-20261113T214533Z` 全通过、changedInputs=[]，
+  compiler SHA-256 `b4b07c7899d799c52929974064974c52a43f1c046acc44e61f86b12e970814b1`。
+  此处不证明发布模式的方法反射调用可达性完整；额外整例发布对照仍有差异。
+- **诊断字符串缓存的键必须拥有覆盖缓存寿命的存储**（2026-11-14 红绿与正式验证）：
+  `generics/generic_str.c` 的 `emit_string_literal_rc` 缓存不能直接保留调用方的
+  `zan_istr_t` 的借用指针 `text.str`；guard 消息可来自重复使用的栈缓冲，内容改写后，
+  缓存查找会把新消息误命中为旧 LLVM 字符串常量。入缓存时用
+  `zan_arena_strdup(g->arena, text.str, (size_t)text.len)` 复制键字节并保留长度，
+  让键随编译 arena 存活；不能靠改变量名、关 null guard 或调整栈布局绕过。
+  最小探针中 `menuResult` 与 `editorTabs` 的 live 调用均返回 17；旧 debug/publish
+  的两条 null 诊断都误报 `menuResult`，runExit 1、`FAILURES 1`，红证据
+  `build/test-out/gui-guard-literal-20261113T203712Z/report.json`。修复后两模式分别
+  正确报告 `menuResult` / `editorTabs`，runExit 0、`FAILURES 0`、空 stderr，绿证据
+  `build/test-out/gui-guard-literal-20261113T204012Z/report.json`。
+  正式 `case_null_receiver_literal_identity` exit 0；冻结收据
+  `build/test-out/gui-publish-reflect-formal-20261113T204138Z/result.json`，
+  compiler SHA-256 `56a16f3380c1eb4ee7f18daa29f58588fadae77c7866026baea4ee1cb9afc931`，
+  `success=true`、`changedInputs=[]`。此结论只覆盖最小诊断身份回归及该正式用例，
+  不代表原生 IDE 整体验收通过。
+- **反射 getter 转移已有 +1，字段读取才补 retain**（2026-11-13 正式验证）：
+  `GetFieldObject` / `GetFieldString` 的 getter thunk 已转移 getter 返回的 owned
+  引用，反射属性分支不得再 retain；直接字段加载是 borrowed，仍须 retain 后返回。
+  多 retain 会让调用方消费后仍剩一份引用。保留 object/string 与 null 的原语义；
+  `tests/conformance/reflect_object_getter_ownership.zan` 覆盖字段、自定义 getter、
+  self、已有/新建/null 字符串及 object 投影，结合 weak 观察验证 owner/payload 释放。
+- **委托实参求值后立即登记 EH owner**（2026-11-13 正式验证）：
+  `emit_delegate_call` 每求值一个拥有型临时实参就调用 `emit_call_arg_eh_push`，
+  保护它免于后续实参求值或 callback 抛异常时泄漏；正常返回先撤实参 EH 槽，再用
+  `emit_release_owned_call_temp` 释放，维持 callee 槽与实参槽的 LIFO 顺序。
+  `tests/conformance/delegate_argument_exception_owner.zan` 覆盖属性返回的
+  CancellationToken 临时量及捕获闭包的正常/抛异常路径；借用值不得当作新 owner 释放。
+  上述两项正式验收收据：`build/test-out/gui-refactor-old-targeted-20261113-043955-487017/result.json`
+  （`success: true`、`changedInputs: []`），编译器 SHA256：
+  `62e483dc1acc4d2fadc5bb972178c6b15066b7b4745237a2503e87f82a2667be`。
+  该证据仅覆盖这两项，不替代 UiWorkScope 或整个 Gui 批次验收。
+
+- **async native local catch 也须展开委托临时 owner**（2026-11-13 单项正式验证）：
+  `src/compiler/stmt/stmt_try.c` 的本地 catch 必须调用共享 EH 临时槽展开，不能因
+  已接住 callback 异常就跳过 owned 实参清理。async 的临时栈 mark 在每次 resume
+  调用入口从当前线程 TLS 深度初始化；本次首次进入词法 try 时再覆盖为该处 mark。
+  await 可能换线程恢复，不能把旧线程深度持久存入协程帧后继续使用。
+  独立探针 before：`build/test-out/gui-refactor-async-probe-20261113-044829/run.stdout`
+  显示抛异常路径 token retained；fixed：
+  `build/test-out/gui-refactor-async-probe-20261113-045236/run.stdout` 显示对应 token released。
+  `tests/conformance/async_delegate_argument_owner.zan` 覆盖未挂起与真实 await 恢复后的
+  捕获回调正常返回、静态回调抛出、捕获回调抛出共六路径，并在强局部退栈后观察
+  token/payload 释放。编译器 `8f7293ca` 下 `case_async_delegate_argument_owner`
+  已正式通过，同 exe strict 精确 golden、空 stderr、无泄漏通过；单项日志见
+  `build/test-out/gui-refactor-old-targeted-20261113-045325-830758/case_async_delegate_argument_owner.ctest.stdout`
+  及同目录 `case_async_delegate_argument_owner.strict.stdout` / `.strict.stderr`。
+  最终 `build/test-out/gui-refactor-old-targeted-20261113-045325-830758/result.json`
+  已收口为 success true、changedInputs 空，三项正式及同 exe strict 均通过；
+  编译器 SHA256 保持 `8f7293ca21a6df25713f85dbb34687c8ff77b5bee898db8f2efa98087d520c13`。
+  该收据仅覆盖 async delegate owner、UiWorkScope latest/重叠 Drain 与 App 模型宿主作用域，
+  不代表整个 Gui 或性能验收完成。
+
+- **调用结果接收者的方法组也须参与签名评分**（2026-11-13 单项正式验证）：
+  `MakeAction().Run` / `box.Echo(MakeAction()).Run` 的接收者是 `AST_CALL`；
+  checker 与 IR 的方法组识别须按调用结果的静态类型（含泛型实参替换）评分，
+  不能当未知普通值给零分而误选派生 `OnClick(RoutedEventArgs)`，丢失基类 Action 订阅。
+  不以拆临时变量绕行；保留字段/属性遮蔽，接收者只求值一次，委托保活临时接收者，
+  清空委托后释放。`tests/conformance/call_receiver_method_group.zan` 覆盖直接调用、
+  泛型包装与显式 BindEvent 对照，并断言事件重载仍有效及 weak 生命周期。
+  修前 `8f7293ca` 探针 `build/test-out/gui-refactor-method-probe-20261112T214508.890925Z/`
+  记录 compile0/run1/IR0，原 IR 第2603/2819行误调 `@CallReceiverButton_OnClick`。
+  修后编译器 `9e19805aef733ee812824157d59340ba0a387cb436e026e17ed07486d4bab7bd`
+  的 `case_call_receiver_method_group` 正式及同 exe strict 通过，精确 golden、空 stderr；
+  证据为 `build/test-out/gui-refactor-old-targeted-20261113-054856-068349/result.json`
+  的该 case 条目（officialPass/strictPass true、exeUnchanged true）。整组14项仍在运行，
+  不以该单项通过代替批次或整个 Gui 验收。
+
+- **List.RemoveAt 的 owned 接收者须配对 own/drop，状态在索引求值后读取**（2026-11-13 正式验证）：
+  `src/compiler/call/call_collections.c` 的内建展开先且仅一次求值 receiver，立即用
+  `emit_intrinsic_own_recv` 登记 owned 临时接收者的 EH owner，再求值 index；完成删除后
+  用 `emit_intrinsic_drop_recv` 撤槽并释放。属性 getter/调用结果返回的 +1 不能漏释放，
+  借用 field/local 不能误释放；index 抛出与负数/Count 越界也须由共享 EH 协议清理。
+  index 可以扩容或清空同一 List，故 count/data 必须在 index 返回后从已求值 receiver
+  读取，再做边界检查与移动；提前缓存旧 buffer/count 会使用失效缓冲区或过期边界。
+  保留自然 `owner.Undo.RemoveAt(index)` 写法，不能改业务为临时变量绕过编译器缺陷。
+  旧编译器 `9e19805a` 红探针
+  `build/test-out/gui-refactor-removeat-probe-20261112T221147.945574Z/result.json`
+  记录 compile0/run1/IR0，输入及编译器/exe 未漂移；`run.stdout` 在
+  `property history lists released` 断言异常后报告4个仍可达对象。该旧执行止于属性
+  生命周期失败，未走完后续扩展的索引副作用路径，不能把它描述为所有路径的红证据。
+  新 `tests/conformance/list_removeat_owned_receiver.zan` 覆盖属性/借用/临时调用结果、
+  receiver/index 各求值一次、立即释放被删元素、保留剩余元素、undo/redo 转移、index
+  抛出、负数/Count 越界，以及 index 扩容/清空后的当前状态与捕获后可继续使用。
+  编译器 `de010ab40cc4cd59de6cad827e870d76dc8aeac1fcca2db32c9aed4841b44fbb`
+  下 `case_list_removeat_owned_receiver` 与实际 `conformance_gui_datatable_multirange`
+  均正式及同 exe strict 通过，精确 golden、空 runtime stderr、无泄漏、exe 身份不变；
+  最终收据 `build/test-out/gui-refactor-old-targeted-20261113-061253-399479/result.json`
+  于06:14:44关闭，success true、2/2、changedInputs 空、compilerUnchanged true。
+  此验收只覆盖上述两项；属性补丁与 Designer 仍待独立验收，不代表整个 Gui 通过。
 
 ## 12. Nullable decimal：类型表示、提升运算与 pointer ABI 同源（2026-11-11 实证）
 
@@ -336,20 +467,20 @@
 - Selfhost 返回值先 retain 并写 frame slot6，再执行可挂起 finally；finally 逃逸异常、下一次 resume 取消或 frame cleanup 必须 load → clear → 按声明类型 release。helper 显式传 retTy，独立 cleanup 生成前保存类型；正常 completion 将 owner 转给 awaiter，不能在每次 throw 时撤销，finally 内部 catch 后仍可能继续返回。替换 return 先 retain 新值再释放旧值，允许两者别名。
 - 宿主 typed RVAL 还兼作 pending return 缓存。pending discard 已释放 owner 后，RVAL 可能残留旧指针；orphan 清理必须以最终 RESULT 是否交付值为准，先清 RVAL，指针结果从 RESULT 解码，聚合只在实际交付时按类型释放。不得用旧 RVAL 再 release，也不得关 arcguard 掩盖错误。
 - 实证：selfhost_async_pending_result_owner 的旧 gen1 异常及取消两处 WeakReference 错误为 true；修后四路径（正常跨 Yield、finally 内部 catch、异常终结、取消）均匹配 golden。修后 gen1 c7614f9ab367a98983898b7b5e05ecd0a3d8ad07fbafec11145c49e9af7f0454，另 3 项 focused 通过。宿主普通 probe 虽绿，正式 CTest arcguard 首次报 stale release；修 RVAL/RESULT 后原 fixture 与 async_spawn_result_release 的 arcguard+check-leaks probe 和两条正式 CTest 均通过（4.79 秒）。
-- 边界：独立 cleanup callback 与 finally 第二次 return 只有生成/链接覆盖；最新改动未重跑 fixedpoint 或完整 production driver。前一 checkpoint 的 fixedpoint+24行为+10拒绝通过不可冒充本次新源码结果。证据 _scratch/async-pending-owner、docs/PRODUCTION_ACCEPTANCE.md。
+- 边界：独立 cleanup callback 与 finally 第二次 return 只有生成/链接覆盖；最新改动未重跑 fixedpoint 或完整 production driver。前一 checkpoint 的 fixedpoint+24行为+10拒绝通过不可冒充本次新源码结果。证据 _scratch/async-pending-owner。
 
 ## 18. 同步 pending return：handler 水位与 finally 外层 EH（2026-11-11 实证）
 
 - 返回先求值及retain，再运行finally；预留给调用方的owner必须登记。selfhost仅同步return建立entry栈record，记录typed payload及destructor；handler武装时保存pending链水位，longjmp前摘链清槽并按类型展开。正常return摘链不release；finally内部catch不得撤销原返回，替代return须先保活新值再撤销旧值。跨函数Fail不能靠EmitExitFins之后的term判断补救。
 - 全部handler（含async trampoline）保存同步链水位；不能让协程pending record跨挂起留在栈上。lambda、task action和函数入口需保存/清空/恢复编译期pending状态。复用OwnedPayloadDtor类型化释放，object字符串边界不能统一当class。此协议只登记返回owner，不代表一般同步局部变量异常展开已完成。
 - 宿主同步pending槽必须登记现有owned local清理，正常交付清槽；执行离开的finally先切外层landingpad/EH上下文，并保存恢复嵌套栈条目。finally-only landingpad若同函数有外catch，原生phase1需可见catch clause，否则直接跳帧，不能靠cleanup阶段再补catch。
-- 实证：旧selfhost五处class释放失败及delegate/typed-array异常撤销失败；host还有重复finally和丢catch。根修后两新fixture（23行/8行）及6邻近selfhost共8项emit/link/run全MATCH；host两新+exception_finally_paths+exception_finally_managed_owner正式CTest全PASS，4.90秒。邻近SameFrame没有原host基线，不声称本改动引入。证据_scratch/pending-return及docs/PRODUCTION_ACCEPTANCE.md。
+- 实证：旧selfhost五处class释放失败及delegate/typed-array异常撤销失败；host还有重复finally和丢catch。根修后两新fixture（23行/8行）及6邻近selfhost共8项emit/link/run全MATCH；host两新+exception_finally_paths+exception_finally_managed_owner正式CTest全PASS，4.90秒。邻近SameFrame没有原host基线，不声称本改动引入。证据_scratch/pending-return。
 - 最新同步修复尚未重跑fixedpoint/27项生产driver；此前checkpoint固定点28,476,832字节一致、25行为+10拒绝全绿不能外推本次新源码。
 
 ## 19. 同步 finally 内嵌套异常不能覆盖正在传播的异常
 
 - 原异常的对象和类型必须一起保存。同步 throw、裸重抛、catch 类型不匹配后的传播在运行内联 finally 后，只有控制流正常返回才发布原异常；finally 逃逸的新异常继续传播。不要把同步 SSA 保存方式用于可能挂起的 async 路径。
-- 实证：selfhost_sync_finally_payload 旧 gen1 三次进入错误的外层 handler，新 gen1 与两个 pending-return 回归均匹配预期。另有独立探针证明普通同步局部在同帧和跨帧异常时仍漏释放；异常派发修复不等于 ARC 保活或局部 owner 展开。证据见 docs/PRODUCTION_ACCEPTANCE.md 与 _scratch/sync-owner-eh-review。
+- 实证：selfhost_sync_finally_payload 旧 gen1 三次进入错误的外层 handler，新 gen1 与两个 pending-return 回归均匹配预期。另有独立探针证明普通同步局部在同帧和跨帧异常时仍漏释放；异常派发修复不等于 ARC 保活或局部 owner 展开。证据见 _scratch/sync-owner-eh-review。
 
 
 ## 20. 失败的 await 必须沿最内层异常清理入口展开
@@ -409,7 +540,7 @@
 
 named binding 与原异常快照分开：初始化取得自身引用；正常、异常、return 和向外 goto 全部归还。async 先清 local/frame 再 typed/cell release，避免后续 spill 复活旧 owner；捕获变量遵守统一 cell 布局。goto 按目标 catch 范围判断，内部跳转保留，嵌套跳回外 catch 只释放离开的内层。同步 binding 同样不能借用初始化却在退出时释放。
 
-实证：原 async probe 退出0却覆盖原异常，修后 nested/original/nested/original。中间版正确传播后暴露同步 named catch 消耗 static 异常引用，连续 replacement 发生堆损坏；binding 独立 retain 并补全出口后自然矩阵通过。identity 45行覆盖实例标记、挂起、bare、替换、cell及weak出口；自然fixture重复同一A/B且无额外keepalive。锚点identity通过不等于payload生命周期通过；中间版CTest不能冒充最终实现证据。完整异常payload协议和普通local unwind仍开放，详细身份/固定点见docs/PRODUCTION_ACCEPTANCE.md。
+实证：原 async probe 退出0却覆盖原异常，修后 nested/original/nested/original。中间版正确传播后暴露同步 named catch 消耗 static 异常引用，连续 replacement 发生堆损坏；binding 独立 retain 并补全出口后自然矩阵通过。identity 45行覆盖实例标记、挂起、bare、替换、cell及weak出口；自然fixture重复同一A/B且无额外keepalive。锚点identity通过不等于payload生命周期通过；中间版CTest不能冒充最终实现证据。完整异常payload协议和普通local unwind仍开放，详细身份/固定点见本次提交说明与 TASKS.md 的 B-ID 台账。
 
 ## 26. 自举异常记录转移与消费式 Task.Result（2026-11-11 实证）
 
@@ -420,6 +551,14 @@ failed await 与消费式 Task<T>.Result 共用 EmitAwaitCheckExc：先检查 fr
 实证：旧 Result 对立即失败与 Yield 后失败均返回0、跳过 catch 且 weak 仍活；修后 Wait 不消费异常、catch 内存活、catch 后死亡，成功值保持正确。exception_payload_ownership 的130行与其余三份异常 fixture 由同一 fresh gen1 验证，正式 selfhost_exception_ownership 单条通过。弱引用观察不得加强引用锚点；字符串内容/NUL/逃逸通过不代表完整分配平衡。runner 应删旧产物/通过标记，检查 LLVM、精确输出、退出码和 stderr，并对构建至子测试结束的已记录输入作前后身份比较；自动 stdlib 依赖未入清单时不得声称完整依赖闭包。固定点证明和旧版三项门结果不得冒充后续改动的固定点证据。
 
 成功协程的终态完成也必须恢复本次 resume 入口保存的异常深度：EmitAsyncComplete 在 owner 清理与恢复后，将 asyncEhDepth 写回 __exc_sp 再 ret；挂起路径退栈不覆盖正常完成路径。否则调用方预先安装的 catch 被已返回 resume 的 trampoline 盖住，成功 await/Result 后直接 throw 会访问冲突或堆损坏。必须把 caller try 装在成功任务之前再 throw；成功之后才装新 try 会掩盖缺陷。立即/Yield×同步/异步调用×await/Result 八形旧六红两绿（async await rearm 掩盖），修后八形全绿。此例说明静态疑点需要精确控制 handler 安装顺序的实证，旧绿探针的排列不等于反证。
+
+## 27. 自举普通局部的异常清理是 typed slot 协议（2026-11-11 实证）
+
+局部拥有值在 materialize 后登记到统一异常 owner 链，kind3 保存 typed slot 地址和析构函数，不能保存旧 value 快照。entry 先置 null；normal exit 先 retire、清槽再 release；unwind 先摘链清槽再析构。cell 的独立 ownerSlot 也必须 entry null，不能依赖不属于 locReg 的 EA 自动初始化。异步登记必须指向稳定 frame 槽，不能指向本次 resume 的 alloca；save/reload 不得恢复已清掉的拥有值。captured await 声明要先创建 cell，再将结果写 payload，frame 槽保存 cell 指针。
+
+所有拥有范围都要闭合，不能只检查 Block/catch：query range 每次覆盖 retain 新值并 release 旧值，结尾 retire；pattern guard false 释放绑定；switch expression 引用结果先独立保活，phi 默认值用 ZeroConst 而非仅识别 i8*。loop header、foreach 元素和 switch section 绑定均是独立拥有范围。内部跳转需按目标范围退出清理；源语言是否允许该 goto 另由宿主约束决定，不能把修好清理机制当成扩大语言许可。宿主前向 owning goto 的 E3083 必须在自举保持一致。
+
+实证：third gen1 `ebe2ded3d5aa19596d3f47785bc030f3ef2a0fab8f6378a79ca2ad13ce333f4e` 的 46 行扩展诊断在 LLVM、exact stdout、stderr 和记录源身份检查下通过；随后 host oracle 证明其中 owning goto 应拒绝，已拆分为正例与 reject 回归，不能把原 46 行称作语言差分通过。string async 返回临时槽先 clear 再 release 后，durable 分配从 18/17 变为 18/18，11组总计134/134；临时实参在 await 挂起前的独立清理仍需下一版验证。
 
 ### await 拥有型字符串必须同时通过字符串分类（2026-11-12 实证）
 
@@ -443,3 +582,40 @@ failed await 与消费式 Task<T>.Result 共用 EmitAwaitCheckExc：先检查 fr
 
 - checker、IR 类型推断与 selfhost 的数值/条件表达式提升必须一致：`long` 之后、窄整数之前保留 `nint`，并覆盖两种操作数顺序。漏判会把 `int * nint` 推成 int，使正确的 int32 回绕截掉指针高位；指针解码或 Process 捕获中的复制故障应先追值与原生指令，不能交换业务操作数绕行。
 - 用高 32 位非零的加减乘、比较、嵌套表达式、混合条件表达式和 long 对照回归；`nint_mixed_arithmetic` 与完整 `sync_finally_terminal_unwind` 在 Windows/Linux x64 严格直接探针均 exit0、golden 匹配、stderr 空。保持 long 优先级、目标原生位宽和 int32 回绕规则；此证据不等于 32 位目标或 selfhost bootstrap 已验证。
+
+### 条件委托实参的目标类型与临时 owner（2026-11-13）
+
+- 普通 lambda 没有自然类型，lambda/null 三元式可判为 owned 却推断为 NULL；不能以缺少推断类型跳过清理。
+- 从已解析形参取得 expected delegate type，交给 typed conditional；两臂递归走 emit_arg_typed，保持自然 ternary lambda。
+- 显式 delegate cast 包裹 lambda/conditional 时向内传自身目标类型，其余 cast 保留既有转换语义。
+- fresh/borrowed 混合臂只在 borrowed 路径补 retain，使 PHI 两路均携带一份 owned 引用；retain 后重取前驱基本块。
+- 纯 borrowed/borrowed 或 borrowed/null 不补 retain、不登记 owner、不额外 release；字段/属性遮蔽方法组的规则保持。
+- 仅为缺少自然类型的 owned 委托发射建立 scope 内记录，以 AST、实际 LLVM value、LLVM function 联合匹配。
+- 记录不写永久 AST、不借 infer cache；normal release 与 EH 登记共享有效类型查询和 call_arg_is_owned_temp，委托 EH 用 DLG 槽。
+- delegate invoke 的实参也走 emit_arg_typed；callee throw 与 later-argument throw 必须在求值后立即登记同一 owner。
+- 编译器 1ce04ee... 构建通过；三模式 fixed 全过：build/test-out/conditional-owner-20261113T133228.258195Z。
+- 正式四项 official+strict 均通过：conditional_delegate_argument_owner、delegate_argument_exception_owner、async_delegate_argument_owner、delegate_callee_exception_owner。
+- 正式收据：build/test-out/gui-refactor-old-targeted-20261113-213312-101310/result.json；native IDE/App 完整关闭复验尚待，不外推为整机零泄漏。
+
+### 分片全局定义复用模块文本，避免逐值 LLVM 打印（2026-11-13 实证）
+
+- 分片组装慢先用 `ZAN_SHARD_TRACE=1` 区分 bodies/globals/declares/types，不能把全局打印耗时归到闭包递归。大模块上逐全局调用 `LLVMPrintValueToString` 的重复打印器初始化代价可远大于实际输出。
+- 在链接属性调整后的模块文本单次索引中，另建全局记录切片表，按需读取完整记录，复用现有函数切片机制；支持跨块长行和 LLVM `\XX` 转义名，缺失/读取失败显式报错，保留 comdat/alias 拒绝和部分索引清理。不要改成跨分片跳过依赖收集。
+- 同为 14 分片：`build/test-out/gui-shard-timing-20261113T221956Z` 首片 bodies=4s、globals=67s；`gui-shard-timing-20261113T222443Z` 全部 14 片的组装阶段均在 4s 时间戳内完成。该对照只证明记录的分片组装阶段提速。
+- 正式 `conformance_shard_deep_refl` 收据 `build/test-out/gui-shard-formal-20261113T222542Z/result.json`：pass=true、changedInputs=[]，compiler SHA-256 `b60f8582d6e7a2de62067a4879c1b248447223a53ad0b7d75302b7b6750f8357`。不据此宣称完整 IDE 构建提速、运行时性能或新 IDE 原生验收通过。
+
+### 函数异常清理按活跃拥有者分组，不能累积所有局部（2026-11-15 实证）
+
+- 巨型分片先流式区分函数体、globals、指令数与 PHI incoming。Gallery 首片221MB中单函数体占94%，共享函数 landing pad 有9980前驱；局部清理账本与前驱的乘积导致大量空 PHI。不能靠禁用 SROA、降优化、改分片阈值或拆业务代码掩盖根因，也不能由片段大小断言具体后端 pass 超时。
+- 同步普通/泛型函数按当前有序清理集合复用 pad，键包含槽身份和完整所有权元数据；临时参数栈先 unwind，再逆序清局部，最后 resume。try/catch/finally 与 async 不套用同步函数分组。
+- 活跃局部必须来自实际发码上下文，并连同函数身份保存/恢复。forward goto 在 label 补发 finally 时使用 source_locals 副本，固定函数入口表会漏清；lambda 切换也不能借用旧 current_locals。反例必须由 callee 真抛出，显式 throw 的主动清理会掩盖问题。
+- async 词法 alias 通过 frame_owner 清真实帧 owner，清槽后再 release；try 异常边和正常离域分别验证。boxed cell 退场后，循环重入须建立新 cell，并从当前 owner 重取 payload/cell；逃逸闭包保留旧 cell，不能只清 payload。统一 finalize 下沉须处理两根 uses、PHI 前驱、函数身份、初始化发布顺序与剩余 use 诊断。
+- switch 表达式推断结果时须临时带入 pattern 变量类型并恢复 locals，含 NULL scope；否则类型缺失回退 int 会截断指针。表达式标为 owned 时，隐藏结果槽也须登记所有权，arm 借值 retain、拥有值转交，正常 load 后清槽，异常走既有 ledger，不能只修类型而留下双释放。
+- `eh-active-cleanup-20261115/tests-final.log` 精确十项全部通过（4.66s），含 `exception_active_cleanup_variants` 与 `selfhost_local_exception_owner`；47项 raw 输入前后稳定，compiler `172d034a…`。最新版最大探针 Work PHI incoming 从12417降至194，普通/泛型三对象严格逆序释放。覆盖 goto、初始化抛出、循环、借用参数、闭包逃逸及再次挂起；这些证据不代替完整 Gallery/IDE 发布、实窗或帧预算验收。
+
+### 方法组目标传播与递归委托值表示（2026-11-15 定向验证）
+
+- 字段 initializer、对象 initializer 与 conditional 两臂都须贯穿声明的委托目标：checker 按目标校验并标注，类型推断读取标注，IR 复用 `emit_arg_typed`；泛型字段先用 `field_store_type` 闭合。只为 lambda 传目标会让方法组退回首个同名重载；候选选择继续共用 `zan_binder_method_group`，不在消费者重复决议。
+- `map_type(TYPE_DELEGATE)` 只映射 opaque value pointer；调用点与 thunk 独立构造 `LLVMFunctionType`。为值指针递归展开签名会让 `delegate void R(R next)` 在编译期栈溢出（无诊断，Windows exit `-1073741571`），不能误判成程序运行失败。
+- `type_mentions_tp` 用当前路径 visited 跳过同指针环，继续检查其他分支；64 层预算耗尽保守返回 true。此项是静态防护，不是递归类型相等、替换或任意深度泛型图已正确的证明；本轮未单独隔离验证 visited 分支及预算边界。
+- 主代理收据：新 host build exit0；仅定向 `method_group_target_contexts`，host/gen1 各阶段全 PASS，含递归委托赋值、`recursive(null)` 及精确 golden。该结果不外推为全量 conformance、bootstrap 固定点或全部递归泛型已验证。

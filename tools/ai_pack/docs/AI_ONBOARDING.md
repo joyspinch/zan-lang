@@ -167,7 +167,8 @@ directly by the editor:
   variables, `evaluate`. It drives gdb — the bundled
   `toolchain\debugger\bin\gdb.exe` if present, else `ZAN_GDB`, else a system gdb.
 
-Details and a VS Code snippet for each: [`docs/TOOLING.md`](../../../docs/TOOLING.md).
+Details and a VS Code snippet for each: `docs/ZANC_CLI.md` (debugger flags and
+`zan-dap` invocation) plus `scripts/` for the exact tool wrappers.
 
 ## 6. Without MCP
 

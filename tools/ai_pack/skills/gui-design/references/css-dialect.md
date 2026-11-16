@@ -65,7 +65,7 @@
   顺序。`overflow: visible` 放行子节点溢出(缺省引擎裁剪,显式声明才变
   行为)。type 选择器大小写不敏感(`Button` 与 `button` 都命中,引擎按
   `Kind` 的小写匹配);class/id 仍区分大小写。
-- **Web 等价布局已落地前三批（WEB_GUI_ROADMAP P0-P2)**:
+- **Web 等价布局已落地前三批（P0-P2)**:
   `display: block` 是**真块流**——写成 CSS 的树走 web 语义,没写 display 的
   老代码走 legacy 零回归。**margin 是塌陷的(CSS 2.1)**:相邻兄弟取大合并,
   首子的 margin-top 塌出无内衬的父框把它整体顶开;空块(height:0/无内容/
@@ -83,7 +83,7 @@
   Chrome 时用带 padding 的接收者或 oracle 驱动的 escT 公式)。与 Chrome 的
   逐盒一致性由 `scripts/web_oracle.py` 裁决:用例 JSON(tests/weboracle/*.json)
   + Zan 侧驱动(*_driver.zan)输出同名 `sel x,y wxh` 行 `--compare` 对比;
-  其余偏差记录在 `docs/archive/WEB_GUI_ROADMAP.md` 台账(已全量落地,历史留档)。
+  其余偏差记录在本文件的台账备注里(已全量落地,历史留档)。
 - **行内混排(行盒,P2)**:`AddText("...")`/`AddKid(span)` 文档序交错 =
   真混排(16px 文本里混 28px span、inline-block 徽标都按浏览器行盒模型
   摆);span 不写 line-height/font-size 会**继承父级行高字号**(浏览器同款)。
@@ -134,7 +134,7 @@
   Element(UA 样式表给 web 缺省 display/字号/margin,AI 不用写
   `display: block`)、button/textarea/input/img→真控件、select 落
   Element 占位。`<style>`/`<link>`/style 三路样式并进 appCss。规范:
-  `docs/HTML_UI.md`。坑:① href/title/disabled 等属性静默忽略,行为
+  `references/html-window.md`。坑:① href/title/disabled 等属性静默忽略,行为
   在宿主语言;② 引擎级台账(行内 x 步进 ±3px、行高取整逐行 ±1px、
   块级 strut 字号不继承)对 HTML 层同样适用,fixture 里显式
   line-height/font-size 规避。

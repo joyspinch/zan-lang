@@ -43,11 +43,11 @@
 
 HTML 声明层（`App.LoadHtmlWith`/GenHtml 编译期展开/`data-on-*` 协议/
 tag→控件映射/空白语义/设计器 .html P7a、P7b 字段内联 style）的能力
-全集与差异台账在**仓库文档** `docs/HTML_UI.md`（随代码更新），
-布局语义在 `docs/archive/WEB_GUI_ROADMAP.md`（已全量落地，归档留档）；skill 侧只在 gui-design 的
-`references/css-dialect.md` 留"HTML 声明窗口"一节摘要与指针。
-理由：docs 跟代码同仓库同提交，是能力面的权威；skill 只放"写界面时
-要遵守的规范"。能力清单在 docs、行为规范在 skill，两边不重复维护。
+全集与差异台账在本技能侧维护（2026-11-16 文档清理后，能力面权威只在 skill 侧）：
+布局语义落点在 gui-design 的 `references/css-dialect.md`「HTML 声明窗口」一节。
+理由：能力面必须与它描述的实现同仓库同提交，而 docs/ 现在只放语法与开发规范；
+skill 只放"写界面时
+要遵守的规范"。能力清单与行为规范都在 skill 侧，一边维护、不在 docs 重复。
 
 ## 已执行的历史处置
 

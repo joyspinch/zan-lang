@@ -282,3 +282,9 @@
 异常、callee/ctor 异常与仅反射创建的嵌套字段初始化；本轮已以
 `--check-leaks --arc-guard -g` 实跑无泄漏，并用 IR 核对惰性元数据生成后的
 用户分配点仍保留实际文件、行列与匹配的 `!dbg`。不外推为其他平台已验证。
+
+## 13. 进程捕获的 deadline 与启动确认
+
+带超时的进程捕获必须让读管道和等待子进程都能返回检查单调时钟：Windows 用 `PeekNamedPipe` 确认可读量后限定 `ReadFile` 长度，POSIX 用非阻塞 read、有限 `poll` 和 `waitpid(WNOHANG)`；持续输出也不能形成无界 drain。超时后只排空该边界已有字节的快照，不能等后代持有的写端 EOF。保留六参旧 ABI，POSIX 超时入口另增七参符号，并重建所有受影响目标的 sync bundle；不能在 Windows 调不存在的 POSIX 入口。deadline 约束等待与排空流程，OS 终止/回收没有任意硬实时保证，特权子进程可能令 kill 返回 EPERM。
+
+POSIX `StartProgram` 用 CLOEXEC 错误管道确认最终 exec，重定向或 exec 失败必须回报启动失败；成功 exec 后程序自行退出 127 仍属启动成功。用 `process_capture_timeout` 和 `rt_proc_contract_test.c` 分别核对 API 与原生边界，覆盖无输出、持续输出、超时快照、后代持管、启动失败及正常退出回收；双平台分别留证，已有断言通过不替代新增边界的验证。

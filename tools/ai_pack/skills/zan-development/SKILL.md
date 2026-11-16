@@ -220,7 +220,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   整条对象图都留到进程结束，`--check-leaks` 逐条报出。stdlib 的
   `Activity.Current` 同理，靠 `Stop()` 显式清空。所以：**常驻可变状态放实例**
   （使用者持有，生命周期跟着走），别放包级 static；确需进程级单例就提供
-  显式清空入口。证据与影响面见 `docs/ECOSYSTEM_ROADMAP.md` §7。
+  显式清空入口。
 * **值结构体没有运算符**（实证，2026-10-20）：`System.Numerics.Vector3` 只有
   `Add`/`Subtract`/`Multiply`/`Dot`/`Cross` 等静态方法，**没有 `+ - *` 运算符**
   ——写数学库必须逐分量展开（`new Vector3(a.X*b, a.Y*b, a.Z*b)`），
@@ -279,6 +279,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   用 `is` + 强转（`if (v is string) { string t = (string)v; }`）。装箱进
   `List<object>` 的**值类型**在 `is` 下不认（探针里装箱 int 不匹配 `is int`），
   别把值类型存进 `object` 再取回来。
+* **`Math.Min/Max` 按实参类型定型**：`int,int` 返回 `int`；`uint` 与有符号整数统一到 `long`，`ulong` 与有符号整数无可用重载、须显式转换，其余含 `long` 的整数对返回 `long`；有浮点实参时返回 `double`。不要因旧成员索引只列 double 就给全整数调用加收窄强转。类型检查与发码必须共用同一规则，长整数要用超过 `2^53` 的值验证，unsigned 高位还须验证无符号比较。
 * **计算属性可写**：`public bool IsValid { get { return ...; } }`（只有 getter
   形态）；`List<T>.Count`、`Dictionary<K,V>` 的 `Count`/`Keys`/`Values` 也是属性。
 * **`string` 内建成员很全**：`Length`（字节数）、`Substring`、`IndexOf`、
@@ -481,6 +482,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `items[i].Equals(value)` 报 "could not be resolved to any callable"。要按值
   去重就用 `HashSet<T>`（相等规则：值类型按值、字符串按内容、其他引用类型
   按身份）。
+* **实例方法组强持有接收者**：`callback = this.Handle` 与裸 `Handle` 都创建接收者闭包；对象持有委托、委托又持有对象就成强环，需清空或解除订阅。直接回挂当前对象触发 E2009，宿主返回当前实例方法组触发 E2072（自举尚缺此返回警告）；局部别名与任意对象图不在静态警告的完整覆盖范围内，不能把“无警告”当作“无环”。静态方法组、已有委托字段与同名局部遮蔽不得误报。回归：`method_group_this_cycle` / `method_group_this_return` / `method_group_this_clean`。
 * **闭包捕获 `this` 逃逸方法作用域会触发 ARC 警告**（实证，2026-10-23）：
   `return this.Of<string>(n, i => this.random.String())` 报 "returned closure
   captures 'this' and escapes method scope"。定式：先把要用的字段拷进局部
@@ -751,7 +753,7 @@ path's truthiness (null/false/0/"" are false). Both are **consumed only by
 a model-hosting ChildWindow** (`SetRoot(tree, model)` + `Wire`); without
 a model they are inert (prototype stays hidden, conditions stay visible).
 Nested templates are not supported v1.
-Full spec: `docs/HTML_UI.md` in the SDK.
+Full spec: the gui-design skill's `references/html-window.md` and `references/css-dialect.md`.
 
 ## 6c. Designer documents are .html (Gui P7a)
 
@@ -895,7 +897,7 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
 * 给 `Binding<T>` 属性赋值（`Label.Text = ...` 同族）时，右值**别用裸字段左值**（`someObj.field`）：会合成活绑定逐帧读源对象，源是本次调用里新建的临时就活不过返回，绑定的 target 悬空，下一帧 MeasureText 读坏串崩（gui-wechat 名片页点击路径 30-50% 概率崩实测）。**先快照进局部变量再赋**——局部 → 常量绑定；右值本就被持有（`data[i]`、`cur = c`）则安全。
 * `out` 实参的目标是**实例字段**时（`Fill(out v)`），编译干净但字段没被写穿，后续读它 = 空指针崩。定式：先给字段赋值，再把字段当普通实参传。
 * `TryGetValue(key, out v)` **未命中时不写 out 参数**——调用后 `v` 还是调用前的旧值（未初始化则是 null），拿它当"没找到"的信号必错。定式：调用前先赋哨兵值（`string v = "";`），命中与否用返回布尔判断，别用 out 值判空。
-* 闭包（delegate/lambda）捕获方法的 **`out` 参数不回传**——捕获的是副本，delegate 里的累加/赋值调用方看不见，编译不报错（ZanDb `MinField` 首版在 `ScanRows` 回调里直接写 out 累计值，调用方永远拿到初值 0）。定式：delegate 里只操作局部变量，扫描结束后一次写回 out 参数。
+* **lambda 不得捕获方法或构造器的 `ref/out` 形参**（E3043），同步与 async 都适用；不是可依赖的“捕获副本、不回传”语义。回调里累计到普通局部变量，回调完成后再写回 `out` 形参。普通局部在调用点用作 `out` 实参不改变其捕获资格，闭包内外仍共享同一单元。回归：`closure_ref_capture` / `closure_out_capture`、`async_closure_ref_capture` / `async_closure_out_capture`、`closure_constructor_ref_capture`。
 * `Dictionary.Keys` 返回的是**内部 List 本体**，不是副本——对它原地排序/增删会把键与值的配对打乱（排序后 `keys[i]` 对应的值还是旧槽位的）。需要排序先拷贝到新 List 再排。
 * `.html` 的设计名（或文件基名）**别叫 `App`**：与 stdlib `Gui.App` 同名时 nsresolve 会把 Chart 全家的 `App` 形参引用改坏（100 个 `undefined type 'App'`，100% 复现，TASKS A311）。模板 raw 编译要把 `{{NAME}}` 占位符换成真实项目名（IDE 建项目时自动替换+重命名）。要和并行会话彻底隔离：`git archive HEAD stdlib` 解到快照目录 + 复制 `zanc.exe` 和 `build/zanrt_*.obj` 进去（stdlib 按 exe 相对定位），再把 `LOCALAPPDATA` 指到私有目录隔离生成器缓存。
 * **析构器 `~X()` 不支持——声明即编译错误**（实证，2026-10-23）：它曾是死语法（binder/irgen 全程放行但从不发射、从不调用），1e4e7f7d7 起编译器当场拒绝并指路（ARC 释放链没有析构钩子）。确定性清理用显式 `Dispose`/`Close` 配 `using`；迁存量时直接删声明是零运行时差异（它们从未执行过），兜底逻辑保留在显式方法里。坑出处：编译器侧落地禁令时没迁调用点，仓内 29 处 `~X()` 把 IDE 重编挡了一整轮——用户等修复等到以为「修复被回退」，实机报回归先对时间线（进程 StartTime + exe mtime vs 修复提交时间）。

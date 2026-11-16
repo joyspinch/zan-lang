@@ -109,18 +109,29 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      回归用例：`tests/conformance/overload_lambda_target.zan`（跨文件 partial，
      干扰重载在调用点声明）。
    - 边界（**实例方法组与继承链调用**）：IR 的 `arg_method_group` 必须与
-     checker 的 `expr_method_group` 同时接受 identifier 与 `AST_THIS_EXPR`：
-     `state.Click` 从局部静态类型取 class/struct，`this.Click` 从当前类型取，
-     再按目标委托签名评分。把它当未知普通值会令继承候选同分，派生
+     checker 的 `expr_method_group` 同时接受 identifier、`AST_THIS_EXPR` 与嵌套
+     `AST_MEMBER_ACCESS` 接收者：`state.Click` 从局部静态类型取 class/struct，
+     `this.Click` 从当前类型取，`this.actions.Replay` / `holder.actions.Replay`
+     从接收者表达式的静态类型取；沿用字段类型实参替换，再按目标委托签名评分。把它当未知普通值会令继承候选同分，派生
      `OnClick(EventValue)->void` 抢走基类 `OnClick(Action)->Parent`，自然链
      `new Child().OnClick(state.Click).Height(36)` 在末端报 E3068；仅修局部
      receiver 仍会漏掉真实 `return new Button("Action").OnClick(this.Click).Height(36)`。
-     保留遮蔽：局部存在但类型未知时不得回退 binder 同名类型；成员命中字段时
-     仍是普通值（含 `this.Click` 委托字段），不得误识别成方法组。返回类型推断
+     嵌套字段接收者漏识别时，IR 将方法组当未知值给 0 分；候选虽已遍历完整
+     基类链，仍因派生先遍历、平分保首而错选事件重载。红例：natural 订阅 0 /
+     eventCalls 1，显式 BindEvent 与基类 receiver 均为 1 / 0；根修同步两侧
+     方法组识别，保持候选收集与排名，不靠基类优先或未知值加分掩盖。
+     保留遮蔽：局部存在但类型未知时不得回退 binder 同名类型；末端成员命中真实
+     字段/属性时仍是普通值（含嵌套委托字段遮蔽继承同名方法），不得误识别成方法组。
+     所有权谓词 `expr_yields_delegate_value` 同样须先查字段/属性遮蔽，再查方法：
+     借用委托字段不能判成 fresh 方法组闭包，否则调用后清理多 release，业务断言
+     全过仍在退出时报 already-freed；真正方法组仍为 fresh owned，正常清理与异常
+     实参登记共用该判定，必须保留严格 ARC 遮蔽对照。返回类型推断
      与实际调用必须使用同一重载选择，不能靠拆链、强转或委托临时变量掩盖缺陷。
      回归用例：`tests/conformance/inherited_overload_chain.zan`，覆盖局部/this自然链、
      直接return、partial父类自身双重载与子override、接收者身份、standalone、
-     派生值重载、静态方法组、局部/this委托字段。最小复现绿后还须实际验证原消费者。
+     派生值重载、静态方法组、局部/this委托字段；
+     `inherited_onclick_field_method_group.zan` 覆盖嵌套字段方法组、闭合泛型字段
+     接收者、直接 return 与委托字段遮蔽。最小复现绿后还须实际验证原消费者。
    - 手法（确认编译器实际选了哪个重载）：在**每个**候选重载里各放一句
      `throw new Exception("PICKED-<签名>")`，跑一次看抛的是哪一句——比读评分
      逻辑快得多。最小复现要按真实调用形状写：**Zan 不接受顶层函数**（顶层只
@@ -1073,5 +1084,15 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
       static（p33）都正确，唯入口路径漏环境。C# 原版即禁止泛型类入口。
     - 判定器：`class Repo<E>{ static void Main(){ db.SyncStructure<E>(); } }`
       须报 E3102；实例方法/static 经实例化链两形照常。
-    - 连带纪律：新增诊断码先查 docs/DIAGNOSTIC_CODES.md 占用（本次初版误用
+    - 连带纪律：新增诊断码先查已占用编号（本次初版误用
       已占用的 3092，靠补文档行时纠出改号 3102）。
+62. **反射字符串内容池的判重必须比 initializer 完整相等，不能只比 hash 或名字**：
+   - 动作：反射元数据字符串入私有内容池时按内容 hash 定名、碰撞序号兜底；同名全局只在
+     记录类型与常量属性一致且 initializer 完整相等（长度/头/含 terminator 的负载逐项相同，
+     LLVM 常量唯一化即按完整 initializer 判等）时复用，否则递增碰撞序号换名重建。
+     池项用 `LLVMGlobalUnnamedAddr`（与普通字面量同语义）+ 私有链接，内容地址用
+     `LLVMConstGEP2` 直接构造常量 GEP，不引入 builder 指令。
+   - 理由：只比 hash、名字或 C 串，hash 碰撞时会把不同内容别到同一地址，反射回读串错；
+     initializer 完整相等是唯一与内容绑定的判据。
+   - 边界：已证范围仅限本池命中路径；跨片去重是否完整、反射内容是否泄漏源码字面
+     均未验证，不得声称完成；完整 IDE 重发布前不作为整产品验收依据。

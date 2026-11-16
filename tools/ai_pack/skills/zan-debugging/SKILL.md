@@ -41,7 +41,8 @@ Common ones:
 
 Build and run it: `run_command("build/app")`. Print state at the boundary you
 suspect (`Console.WriteLine`) — cheap and decisive. Note that `Console.Error`
-does not exist; error text also goes through `Console.WriteLine`.
+does not exist; use `Console.ErrorWriteLine(string)` for stderr. `Console.WriteLine`
+writes to stdout, so it must not replace stderr in protocols or golden-output tests.
 
 ### 字符串、原始字节与可空元数据
 

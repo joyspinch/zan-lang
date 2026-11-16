@@ -37,8 +37,8 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   重写控件，布局与交互复用标准 Gui，风格配置集中进游戏皮肤与语义类。
   游戏内面板间距都走 4 的倍数档位。同屏混排(世界画布 + Gui HUD/面板)时,
   缩放路径的边界按下文“缩放纪律”划分，字号必须同源。
-- 两范式开发心智模型/控件目录:`docs/agent-kb/gui-development.md`
-- 样式解析规则:`docs/STDLIB_COMPONENT_STANDARDS.md`《附录:取色与取字的统一封装》(Tailwind 原子类引擎已移除,皮肤走语义类 + token)
+- 两范式开发心智模型/控件目录:本技能「两范式」各节 + `references/html-window.md`
+- 样式解析规则:语义类 + token(取色与取字的统一封装;Tailwind 原子类引擎已移除)
 
 ## 三条尺寸阶梯(硬规则)
 
@@ -257,6 +257,57 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
 - 文档元素携装载期作用域类；状态切换用 `SetClassIn`，不要整串覆盖
   `Class`。代码后挂的控件没有文档作用域类，共享外观放全局皮肤层。
 
+### 嵌入视图的输入、生命周期与模型泵
+
+<!-- experience:stdlib-preparation-2026-11-16 -->
+- **同一 List 的树内容变化仍须准备失效**：复用既有 scope/输入宿主，先核对 Prepare 的更新契约；
+  当前 `IdeTreePanelHost` 每次 Prepare 无条件筛选、Bind、Layout，Paint 只消费。
+  原因：节点 expanded 可原地变化，仅按 List 引用缓存会漏掉收起/展开后的可见 extent 与滚动范围。
+  回归先用真实首次 wheel/filter 进入准备，再在同一列表改 expanded；Paint 消费检查须执行真实绘制，
+  同时核对筛选调用数、行控件身份、Measure/Arrange 计数及输入 proof，覆盖隐藏/重挂/关闭退休。
+  判定器：`conformance_gui_ide_stdlib_preparation`（2026-11-16 PASS 69.26s）；同批4/5，
+  `initial_shape_fill` 因 Gui internal 访问限制编译失败。此结果限于该契约，未验收新 profile 性能预算或 native close。
+<!-- /experience:stdlib-preparation-2026-11-16 -->
+
+- **借用树须在输入前同时挂载与约束视口**：装配时登记 scope/host，PrepareView 过滤、绑定并 Layout，Paint 只消费；隐藏 Hide、关闭 Retire，重显先准备。Form 换启动根后用真实 App 输入入口推进 BeforeInput，目标快照前可恢复已有 adapters；BeforePaint 改根会拒绝当前 proof，不能靠加重试预算掩盖。自定义设计宿主不能假定 ProjectBody 复制 body 的 class；检查当前投影契约，用 AddClass 保留既有类并兑现标准 Flex/min-height。原因：Explorer/Tools 缺宿主布局类使220高区域撑成986，body视口等于extent，滚轮命中却不消费；局部补类后视口194、extent960，真实 wheel handled=true、内部offset/兼容signal均40。回归须同时断言分配区域、真实wheel/filter、隐藏退休/重挂与Paint proof，不能只看signal。判定器：`conformance_gui_ide_editor_tabs_preparation`（2026-11-16 strict精确通过，保留Tabs/Scene覆盖）。
+
+- **首次登记早于输入准备快照**：scope/输入宿主在装配时创建并 Bind，区域几何
+  留给 PrepareView。prepare 保存 participant/generation 快照；在 BeforeInput 内
+  首次登记会使旧准备失效，必须放弃旧尾部，不能放宽守卫或等 Paint 才登记。
+  SceneDesigner 当前 `InitializeInput(App)` 正为提前登记入口，后续
+  `SetBounds(App,x,y,w,h)` 更新区域；源码接入不等于该 caller 已最终验收。
+- **Paint 不复活已退休的借用输入域**：装配或输入前准备阶段负责登记、绑定与显隐；
+  准备阶段已经隐藏或退休的域，Paint 不得以“确保初始化”为由重新 Bind/Initialize。
+  否则绘制会改变输入根代际，使已保存的准备证明失效；重新显示也先走活动视图准备。
+- **JsonValue 模型更新使用 Set**：`model.Set("title", JsonValue.NewStr(text))`
+  替换已有键，不存在时追加；随后 RequestRedraw/MarkDirty。
+  Put 与 PutStr/PutInt/PutDouble/PutBool 等助手只追加，重复键 Get 取首值，
+  因而用它们“更新”会继续读旧值。不要虚构 SetStr/SetInt 等入口。
+
+- 独立绘制的现有树借用输入时，持有 `new ControlInputHost(root)`，调用
+  `Bind(app)` 接入共享输入适配链；它不收养 root、不选择布局区域、不负责绘制。
+  root 与适配器都由页面持有，离页或隐藏调用 `Hide()`，退休本子树输入并摘链。
+  普通子树仍直接 Add/Mount，不能用借用宿主代替真实 parent 链。
+- 页面持有 `new UiViewScope(app, owner, root)`，owner 实现 `UiViewOwner`。
+  `Mount(parent)` 可挂到普通父树；独立区域在 `PrepareView(UiViewScope view, App app)`
+  中调用 `view.Layout(x, y, width, height)`，使输入命中前与绘制前使用同一
+  Measure/Arrange 几何。只在 Paint 中 Arrange 无法保证连续输入命中新位置。
+  scope 不自动安装输入根；其 owner/root/App 为借用，调用方须保持存活。
+- `view.Bind(model)` 创建、注册并 Wire ModelBinder，不自动执行首同步或循环。
+  宿主泵必须在布局前推进 `SyncModelHosts()`，在呈现前推进
+  `WriteBackModelHosts()`；这些阶段由标准共享准备推进，不在每个页面重复泵。
+  自定义宿主检查 `PrepareStandardHostFrame()` 的返回值，并用
+  `ContinuePreparedFrame()` 检查回调后的登记/revision proof，失效即中止旧帧。
+  无 AppHostLayout 时，App 共享准备在区域布局前同步模型，并在 overlay 尾部
+  回写；原生呈现与 offscreen 共用此边界。该模型阶段已通过严格 probe，
+  不代表 HUD、Designer、DataTable 消费方已验收。自定义手动帧须在 BeginFrame
+  和业务更新后、绘制前显式 prepare，并在回调后及呈现前检查 Continue；
+  null-host 分支也核对 hostLayoutRevision，页面不重复执行模型阶段。
+- 事件可经 `view.Action(name, sender)` 的 Run/Send/Pointer 与
+  `view.Handle(name)` 转交 owner；修改模型用 `view.MarkDirty()`。
+  离页调用 `view.Retire()` 使旧动作失效、Detach 自有 binder 并移除 Mount 的树，
+  同时对独立 `ControlInputHost` 调用 Hide；Retire 不代替借用输入宿主的摘链。
+
 ### 布局与样式
 
 - 根与中间内容区用 Flex/Grid/Flow；顶栏、内容、底栏按文档序排列，
@@ -273,6 +324,49 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   或皮肤接口配置。
 
 ### 控件与浏览器集成经验
+
+- **验收结论绑定具体版本与消费方**：用编译器、源码及成品身份关联构建、业务断言与截图，
+  分别记录发布、交互、视觉及性能结果；不把不同冻结批次合称完整产品验收。
+  共享机制或旧组件通过不替代当前调用方与实窗证据。项目当前状态统一查
+  `TASKS.md` 的 B-ID171～179（GUI 分层重构台账），技能不复制运行状态。
+- **FilePicker 先准备后绘制**：内联显式用
+  `BeginInline(app, mode, initial, extension, defaultName, title)`，在输入前装配；
+  跨 App 用 BindInline，隐藏 HideInline，结束 Close。持久宿主在共享 prepare 中建树、
+  挂载与布局，RenderOverlay 只绘制；dirty 重建及 Cancel 重入保护新会话。
+- **retained 绘制只读输入状态**：Input.OnPaint 不登记焦点/命中、不派发输入或通知；
+  旧 Render 的兼容登记只属于该入口。DataTableControl 的可见单元控件/明细是真实
+  children，`ChildControlsRenderedByOwner()` 避免通用树再次绘制；paint clip 与 hit clip
+  同源，Bind/Cancel/嵌套绘制以 generation 废弃旧尾部。标准 comp/detail/provider 的
+  可见子树由 Arrange 经 UiViewScope/HUD prepare 建立，Paint 复用；custom
+  `PaintCell`/`Paint` 的 bool 完全接管语义保留，默认 fallback 仅在真实 Paint
+  确认 false 后才采用或退休；header/filter/footer 的即时输入尚未全部迁移，
+  purity 也不等于零分配。
+- **ScrollColumn/Cards 的 viewport cull 不改作者可见性**：新旧 ScrollColumn 与 Cards
+  收据验证 viewport cull 不覆写作者设置的 `visible`；绘制、命中与焦点统一使用
+  `ChildInViewport` eligibility，且该 eligibility 不参与 measure，避免上一轮视口结果改变内容
+  extent。保留 snapshot 与 generation/reentry 守卫，断言按当前真实 clip 更新，不用应用侧扩大
+  viewport 绕过生产裁剪或测量缺陷。
+- **浏览器按逻辑 root turn 推进**：Work 已由共享循环驱动，各 App 共用 root 所有的
+  CefWorkLoop；非零 turn 去重，turn 0 的关闭工作不擦掉旧认领。离线 WorkBackend
+  覆盖调度与 weak root，不证明真实 CEF/WebView/Gecko pump、键鼠或 IME。
+- **子语义度量不得覆盖本体样式缓存（TreeView RowHeight）**：先查清 `ResolveStyleAs`
+  会 Full/Clone 并记入本体 computedStyle；它不是只读子样式查询。RowHeight 仅当现有
+  `tree/normal` 通过 `ComputedStyleCurrentAs` 的完整校验时复用，否则临时 Full+Inline，
+  不写回本体，不用缺失 theme/DPI/metrics/Class/id/context 的行样式缓存取代它。
+  当前默认 TreeView.StyleType 是 tree，仍须覆盖重复 Measure、hover 与派生 selector；
+  live-only 用例先 Measure 建立缓存，再改变 sibling，验证不陈旧且本体缓存未被覆盖。
+  回归 `conformance_gui_treeview_rowheight_style` 已正式 PASS；离屏像素保持与该用例通过
+  不外推正式 IDE 帧预算，单项 PASS 与整批结果分别记录（具体证据见提交说明与该用例的 conformance 记录）。
+- **样式缓存按依赖判断**：无节点依赖不构造祖先路径，祖先路径依赖纳入 id/状态/位置；
+  属性/兄弟/结构/后代等 live-only 依赖保守绕过 Control/App 缓存，media 环境进入键。
+  offscreen before `gui-style-benchmark-20261114T104202Z` 与 after `gui-style-benchmark-20261114T105803Z`
+  均为 201 nodes × 120 frames、两模式 style_resolve=0。总分配均 57758400→53899200 bytes（−6.68%）；
+  measure 27916800→26947200、arrange 4819200→1929600（−60%）、render 25022400 不变。
+  普通/关系 pipeline 270588/272022→256466/253595 μs，单轮观察下降约5.2%/6.8%，
+  不代表普遍加速、零分配或实窗达标，也不冒充历史旧版全面基线。
+  style 功能和 flow regression 分别通过；core 三文件输入冻结，但 broad manifest 记录
+  Designer 并发变化、功能收据 frozenPass false，不能合称整批冻结通过；该轮性能证据不代表消费方当前验收状态，后续结果统一查上述架构文档入口。
+  分配按 measure/arrange/render 归因，核心冻结与广域无漂移分别核对，不能互相替代。
 
 - **WebView2 完成回调的参数归引擎所有,不得释放**: 手写 COM 桥里完成
   handler 收到的结果串(`ExecuteScript` 的 JSON、`AddScript...` 的
@@ -329,7 +423,7 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
 
 完整声明面、页面绑定、设计器与验证方法见
 `references/html-window.md`。本规则描述开发约定；具体实现状态及迁移缺口
-以 `docs/GUI_ARCHITECTURE.md` 的现状与目标分栏为准。
+以源码声明与 `TASKS.md` 的迁移台账为准。
 
 ## 克制
 
@@ -371,7 +465,7 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
 - **Retained 长按复用原手势状态机与唤醒（2026-11-12 strict 实证）**：仅显式 LongPress 订阅或覆写 capability 认领，普通 HitTest/泛路由不认领；保留实际 Down leaf source，在原500ms/12px算法中只触发一次，越界或退出归属即取消，不能添加控件私有计时器。聚合根用 ContainsInputControl 验证成员，再检查真实祖先，不要求 parent 链走到适配器。Up 的 intrinsic hook 与同节点 MouseUp 订阅之间也须核手势票据；旧 hover 在 Leave 前注销，回调新建 Down/capture/hover 后旧尾部不得改写。完整 `retained_longpress_input_test` 和 slop Cancel→新手势探针均通过 fresh strict golden/leak/guard/runtime；原生窗口空闲唤醒与实际子窗口 deadline 唤醒仍须独立实窗验收。
 - **锚定弹层随输入归属退休，重入守卫按资源分别判断（2026-11-12 strict 实证）**：换根或摘除子树时，即使 anchor 没有 focus/capture，也须按共享输入归属关闭旧锚定登记；聚合根仍包含 anchor 时保留，点坐标弹层按调用方生命周期管理。先清旧按压/悬停再发送 Cancel/Leave，focus 只由 FocusManager 与焦点端点身份保护，overlay 只由登记 revision 保护，根安装只由后续换根 generation 取代。回调只新建 capture 不能阻止旧 focus/anchor 退休；关闭回调新建的 capture/focus/popup 不能被旧清理覆盖。`overlay_anchor_retirement_test` 与原生产 SelectBox 探针已通过 fresh strict golden/leak/guard/runtime；SelectBox fixture 须安装真实 App/输入根，并按当前入口在实际 Down/Up 后配对绘制，先确认打开成功，再断言无焦点/捕获的根替换立即关闭。
 - **Ribbon 业务订阅与三类按钮接线都借用 owner（2026-11-12 实证）**：Designer 外层 `CommandClicked` 使用 weak owner action，Ribbon 内部 tab、group item、flat command 三类 Button action 同样弱持 Ribbon，保留原有通知与动作码；只修外层仍会留下 Ribbon→Button→委托→Ribbon 环。`BuildTree()` 先递增 generation，再用 `RemoveAll()` 退休旧子树的 capture、focus、parent/App；取消回调可能重入，返回后核对 generation，queued action 执行前也核对所属 generation，不能只 `children.Clear()` 或靠清业务订阅释放。
-- **可见生命周期与 frame fixture 分开验收**：隐藏/零尺寸路径早退的 green 不能代表可见 Ribbon 已释放；回归须实际渲染并重建可见 Ribbon，覆盖 tab/group item/flat command、真实 Down 建立 capture、focus 退休、旧队列失效与退出 weak 释放。离屏绘制配对 Begin/EndOffscreenFrame；App 弱寿命 fixture 先建立独立 frame 宿主，遵守首实例由 frameApp 静态持有的契约，不清 witness 伪造释放。可见 probe 已从 owner/host/三类 Ribbon 全存活修到全释放并通过 strict；正式 `conformance_gui_designer_contextmenu_routed` 已在父批次 PASS（150.23 秒），证据见 `build/test-out/gui-current-failed-jobs4.log`。
+- **可见生命周期与 frame fixture 分开验收**：隐藏/零尺寸路径早退的 green 不能代表可见 Ribbon 已释放；回归须实际渲染并重建可见 Ribbon，覆盖 tab/group item/flat command、真实 Down 建立 capture、focus 退休、旧队列失效与退出 weak 释放。离屏绘制每次 Begin 必须配对 EndOffscreenFrame 或 CancelOffscreenFrame，并在 finally 中用 CancelOffscreenFrame 收口早退或异常；App 弱寿命 fixture 先建立独立 frame 宿主，遵守首实例由 frameApp 静态持有的契约，不清 witness 伪造释放。可见 probe 已从 owner/host/三类 Ribbon 全存活修到全释放并通过 strict；正式 `conformance_gui_designer_contextmenu_routed` 已在父批次 PASS（150.23 秒），证据见 `build/test-out/gui-current-failed-jobs4.log`。
 - **排队动作夹具遵守真实事件 turn（2026-11-12 Ribbon strict 实证）**：ProcessOffscreenInput 在 EndLoopTurn 自动 DrainPosts，真实 Up 返回后再重建不能撤销已经执行的动作。验证旧 queued action 时用真实 Down 建立捕获，随后 Post 变更，立即真实 Up；同轮 FIFO 先执行变更再执行旧动作，断言变更确实执行及旧业务计数未增加，不用私有 pump 或延迟断言制造绿色。tabbed Ribbon 的夹具高度用 HeightTabbed，无 tab 用 HeightGroups，否则窄宽 overflow 前提可能因三行压缩失效。保留旧失败与原 golden；组件严格通过不代表 Designer/Gallery 调用方或实窗验收完成。
 - **关闭或替换弹层先释放旧输入子树**：共享弹层宿主须清理旧弹层的 focus、capture、press、hover；只清活动弹层字段会遗留文本焦点或拖动捕获。聚合面板反向借用 owner 用 weak，避免 Picker→Card→Panel→Picker 环；ColorPicker 关闭/替换与孤立 Panel 回归已在 golden/leak/guard 下验证。
 
@@ -390,10 +484,18 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   组合检查，step_bounds 的 10 项亦通过同组合检查。
 - **图标按钮必须使用真实 `IconView` 子控件**：它提供测量与绘制内容；单独赋值旧
   `Icon` 字段不会创建内容，按钮会变成空内容的零宽 Button。
-- **离屏交互测试须运行标准事件队列**：`Button.Click` 通过 Dispatcher 排队，
-  `ProcessOffscreenInput` 后须在下一帧前取出并执行 `Dispatcher.Take()` 返回的动作，
-  再测量/绘制；只重绘会让标准按钮收到捕获却不执行业务回调。关闭后的动作测试
-  应排入实际订阅的 `button.Click`，保留旧根与按钮，确认 weak owner 已释放后再消费。
+- **离屏交互断言以真实事件 turn 为边界**：`ProcessOffscreenInput` 返回前由
+  `EndLoopTurn` 排空 App posts。写前通知应同步断言旧模型与旧通知计数，返回后
+  断言新模型与一次 Change；用 FrameSeq 不变证明没有依赖 Paint。验证迟到动作时
+  使用真实 Down、Post 变更、真实 Up 的 FIFO 顺序。只有显式向 Dispatcher 排队的
+  独立动作才手动 Take；不能假设真实输入返回后业务队列尚未执行。
+- **复合内容替换使用业务替换入口**：Card 的 Add/With 追加业务内容，RemoveAll
+  只拆当前 children；重建弹层内容使用 Content 替换。原因是旧业务面板可在后续
+  结构重建中再次出现，点击命中旧会话。验证连续打开、选择及 Change 回调重开，
+  保留会话守卫，不能通过放宽旧动作有效期掩盖残留内容。
+- **路由消费按事件序号跨绘制帧保留**：兼容点击查询须检查当前 EventSeq 的
+  routed handled，BeginFrame 不能让已消费的 Up 再次命中旧绘制锚点。验证同一 Up
+  重复绘制不提交、下一次真实 Down/Up 正常提交；不以业务计数限流替代共享判断。
 - **固定页脚的纵向 Flex 主体设 `flex-basis:0;min-height:0`**：主体增长占剩余高度，
   详情区使用 `overflow-y:auto`；只写 `flex-grow:1` 会按内容基准把页脚推到窗口外。
   回归使用窗口内真实点击和祖先几何诊断，不能用直接触发事件替代越界按钮检查。
@@ -408,28 +510,29 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   2026-11-11 `scene_designer_inspector` 严格 golden probe 已覆盖真实离屏输入、
   单次/无变化提交、Undo、anchor、RGB/alpha、资源字段、滚动与根/行身份稳定；
   `scene_designer_color` 颜色 probe 亦通过，不外推为 IDE 实机或正式 CTest 通过。
-- **嵌入区域的布局、绘制与输入共用同一几何**：检查器/HUD 使用
-  `HudLayer.RenderIn(app, x, y, width, height)`，在 App 坐标的宿主区域内对
-  同一树 Measure/Arrange/RenderTree，并绑定 Visual Tree 输入聚合根；
-  RenderTree 本身不接输入，不另算一套命中坐标、不重新收养控件。关闭 dock
-  或离页显式隐藏该层；`SetVisible(false)` 摘除输入入口，只释放该层子树的
-  focus 与 pointer capture，不能清掉其他层的输入状态。2026-11-11 检查器
-  probe 已验证滚动、hidden 释放焦点和重新显示根稳定；capture 释放是已核对
-  的实现契约，该 probe 未直接断言，不将其写为已完成的交互验证。
+- **嵌入区域的布局、绘制与输入共用同一几何**：HUD 在输入前调用
+  `SetBounds(x,y,width,height)`（App 坐标）与 `Bind(app)`，共享 prepare 对同一树
+  Measure/Arrange；绘制用 `RenderIn(app,x,y,width,height)`，不把首次绑定推迟到 Paint。
+  当前 SceneDesigner 用 `InitializeInput(app)` 提前登记，再以 `SetBounds(app,...)`、
+  `SetHostPanelBounds(app,tools,properties)` 更新区域；Designer Inspector 的入口为
+  `PrepareInspectorInput(App,Rect)`，不沿用旧 RenderInspector 代替准备。
+  RenderTree 本身不接输入，不另算命中坐标、不重新收养控件。关闭 dock/离页显式
+  隐藏，HudLayer.SetVisible(false) 只退休本层输入。2026-11-11 检查器 probe 的滚动、
+  hidden 焦点与根稳定属于历史局部结果；后续各消费方的 capture 释放、连续输入和重入
+  按架构文档中的对应版本收据确认，不能外推为完整 IDE、Gallery/tools 或实窗完成。
 
 - **铁律:控件自己负责绘制,使用处只配置**(实例化→配属性→喂数据→摆位置)。
   禁止在使用处用 Canvas 原语重画已有控件——组件修好后示例还在按旧画法显示,
   就会"组件是对的,demo 是错的"。
-- **组件的命名空间必须与它所在的目录一致**(BandGrid 教训):`Gui/Component/`
-  下的控件一律 `namespace Gui.Component`——类名与目录不一致就是没归位的信号。
-  组件一律在 Gui.Component 下,用户项目里出现同名全局类时不会压过包里的真身
-  (限定名按命名空间解析,不按最后一段猜)。分层重构的终态是"目录即命名空间"
-  (`docs/GUI_ARCHITECTURE.md` P7):Gui 根命名空间只留 Point/Rect/Color 等基元,
-  Core/Styling/Rendering 等各归 `Gui.<目录>`;在那之前它们仍在 Gui 根下。
-  迁名的连带面通常很小:解析器会沿命名空间链向上找
-  (`Gui.Component.DataTable` → `Gui.Component` → `Gui`),同族包里直接写
-  `BandGrid` 不用补 using;只有命名空间与目标无关的地方(如独立命名空间
-  `DataTableTest`)才要补 `using Gui.Component;`。
+- **组件归属与命名空间以源码声明为准**：`Gui/Component/` 的基础复合控件
+  声明在 `Gui.Component`，例如 BandGrid；独立包继续使用自己的实际声明，
+  不因“组件”二字统一迁入此空间。限定名按命名空间解析，不能只猜类名末段。
+  “目录即命名空间”是迁移目标：Gui 根最终
+  只留 Point/Rect/Color 等基元，Core/Styling/Rendering 等分别归层；当前这些层
+  仍有 `namespace Gui`，不能提前按目标补 using。解析会沿当前命名空间链向上找
+  （`Gui.Component.DataTable` → `Gui.Component` → `Gui`）；无关命名空间的调用方
+  使用 `using Gui.Component;` 或限定名。全层迁名涉及所有 partial 声明与调用点，
+  必须按 P7 原子迁移，不能由单个控件的较小影响面推断全层改名成本。
 - **宿主面板有专属入口时,不要在通用开关列表里再列一遍**(停靠面板教训):
   同一个面板既出现在功能区的「工作面」大按钮里、又出现在 dock 自动生成的
   「面板」开关列表里,用户会犯迷糊该点哪个。DockHost 给了 `SetNoSwitch`:
@@ -454,22 +557,22 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   裸写的 `Gui.Widget.Ribbon`(功能区控件)整体劫持到新类上,调用点报
   "no member",离肇因提交很远——Zan 的名字解析按 using 就近绑定,同名类不警告。
   新增类落名前 `grep -rn "class <Name>" packages/Zan.Gui/src/Gui/`;撞名要么改名、要么调用点限定名。
-- **纯几何消费点击的控件必须自己注册命中区**(Tabs 页签条教训):不走
-  On 通用事件包、按几何自己判点击的区域,要 `app.hitTester.RegisterRect`
-  自己的条带——FireCommon 只给 `On.Any` 的控件注册命中区,宿主只用
-  `TabChanged.Add` 类型化接线(On 为空)时,按页签=按空白,命中解析不到
-  任何控件(既不是控件也不是遮罩),释放就没有归属,页签永远切不动。
+- **Tabs 交互依托真实子树与路由**：页签、关闭与新增按钮是 `navStrip` 的
+  retained Button 子控件，内容页挂在 `contentBox`；通过标准 Click 接线，
+  宿主订阅 `TabChanged/TabClosed/TabAdded`。命中由当前树的 HitTest 与路由处理，
+  不依赖 `On.Any`、FireCommon 绘制登记或手写 `hitTester.RegisterRect`。
+  调整布局与滚动时保持按钮及内容的真实父链，不能另造几何点击路径。
 - **PropSpec 的 str/num/flag 必须绑定可写源**：实例可写字段和同时具有
   get/set 的属性生成实时 Binding，自定义属性保留访问器副作用与分派；
   getter-only、init-only 属性、readonly 字段和方法返回值生成快照，Set
   只修改快照。ListItem 的只读 Label 不可作为写回源，应绑定 Text；
   不能把这一限制扩展成禁止所有自定义属性。实时 target 不持有 owner，
   owner 必须活过 Get/Set；用真实读写与退出 leak/ARC 验证，不能只看 IsLive。
-- **控件框高要对齐内部条带的自然高,否则皮肤底线变"两条下划线"**
-  (组件画廊顶栏教训):Tabs 的选中指示线画在页签条内容底,控件的
-  border-bottom 画在控件整框底;页签条内容自然高=theme.heightMedium(34),
-  控件 fh 设 44 时两线错开 12px 看着像双下划线。修法是控件 fh 对齐
-  heightMedium,不是去改皮肤线位。
+- **Tabs 导航条与指示线共用 CSS 盒模型**：横向条高由
+  `.tabs-nav-horizontal` 的 `var(--height-medium)` 及 small/large 档决定，
+  选中线属于 `.tab-item.active`，底部分隔属于 `.tabs-nav.line`；
+  内容页占 Tabs 剩余空间。仅顶栏导航按所选档位定高，不把含内容页的 Tabs
+  整体锁成条高，也不使用旧 theme.heightMedium 数值手算指示线位置。
 - **设计器选框读取实际布局，默认尺寸只用于创建**
   (Pagination/仪表选区错位及 HTML 设计与运行不一致教训):
   调色板点击与拖拽添加采用一致的控件自然尺寸，避免统一 200x32 造成
@@ -487,7 +590,7 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
      落点命中自身或子树时安全回退至原父容器，拖拽坐标换算处强制 `fx >= 0, fy >= 0` 杜绝负坐标移出画布。
 - **设计器画布双击时序与盒模型一等公民属性规范**
   (点击设计窗口误跳代码/拖拽浮动层级混乱/盒模型只能手写 CSS 教训):
-  1. 双击进代码时序解耦：严禁在 MouseDown (`ek == 2`) 中消费底层 `DoubleClickNow`，否则在单击选中或拖拽起步时极易误判为双击，打断画布操作并意外跳转代码生成桩事件；必须在 MouseUp (`ek == 3`) 且判定无任何物理拖拽/缩放位移（`!dragging && !freeDragHasMoved && !designResizeMoved`）时，通过组件指针与 400ms 阈值状态机精准触发跳转；
+  1. 双击消费共享 Click 快照：在 routed `Click` 的 `OnClick(RoutedEventArgs e)` 或路由处理器中读取 `e.isDoubleClick`，修饰键使用 `Modifiers.HasCtrl(e.modifiers)`；拖拽、缩放及取消不得触发文案编辑或代码导航。不在 MouseDown/MouseUp 轮询 `DoubleClickNow`，也不维护组件指针、时钟和位移组成的私有双击状态机；具体编辑/导航策略见下文“设计器画布双击与代码跳转防误触机制”；
   2. 盒模型一等公民快捷设置：Margin（外边距）、Padding（内边距）与容器 Gap（子间距）必须作为 FormField 核心建模字段，并在 Inspector 检查器提供数字步进器（0~200px 范围），同时闭环 FieldToJson / FieldFromJson 序列化、IsModeledKey 白名单以及快照 Copy/Equal 比对，避免开发者在自由/流式排版中被迫手写额外内联 CSS；
   3. 自由与流式拖拽位移隔离：仅当鼠标移动超出物理阈值（`dx >= 4 || dy >= 4`）时才触发 `DesignMakeFloat`，避免原地单击或抖动将流式/停靠组件意外变为绝对定位；外壳/顶栏组件（如 ToolStrip）优先使用 `dock: top` 或主 Flex 列首项，避免绝对定位脱离文档流被后续流式容器覆盖；
   4. Z-Order 渲染层级与列表下标契约（置顶置底倒置教训）：GUI Retained 模式与 HTML 遵循自然文档序绘制（`0 -> Count - 1`，下标 0 最先绘制处于最底层，下标末尾最后绘制处于最顶层，`HitTest` 命中测试从末尾向前逆序检测）。因此置顶（Bring to Front）必须移至末尾下标 `Count - 1`，置底（Send to Back）移至头部下标 `0`；上移一层（Bring Forward）为正向位移 `+1`，下移一层（Send Backward）为负向位移 `-1`，切勿倒置导致“越置顶越在底层被遮挡”；
@@ -581,6 +684,10 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   Radius/Corners,一次画对;覆盖裁剪的原语自己拥有边缘,叠补必留边。
 - **AA 渐变带固定 1 物理像素**:抗锯齿过渡带宽度是原语内部固定的,别随
   线宽/DPI 自行加宽;要更柔的效果用半透明描边,不动 AA。
+- **像素夹具先验证不透明标记**：Canvas.FillRect 接收 `0xAARRGGBB`；例如
+  `unchecked((int)0xFFEA00D4)` 才是不透明色，省略 FF 会得到 alpha=0 的透明标记。
+  DataTable clip 探针曾因此假报“没画/越界”；先确认基准标记可见，再断言 clip，
+  在 Present 前采样，不能把透明夹具问题当成生产渲染失败。
 - **半透明量程 0–255**:`Chart.WithAlpha` 直写 alpha 字节,传 256 会整型
   溢出成全透明——画了但看不见,极难排查。
 - **验证仪式**:离屏 `new Canvas(w, h)` + `GetPixel` 统计"纯色直贴纯背景"
@@ -797,14 +904,17 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   DrainPosts 执行后自动置 needsRedraw,不用自己搭互斥队列;UI 侧用
     pending 槽画「加载中…」占位(范例 ImageHttp.zan)。--nomouse/
     回放/审查这类"单帧截图必须终态"的路径保持同步装载。
-- **PropertyGrid 嵌入控件高度严禁脱节，必须显式传递行槽位高度**:
-  属性表中嵌入 SelectBox/LineEdit 等复合控件时，必须传递显式槽位高度 `eh`
-  （如 `r.pick.RenderIn(app, ex, ey, ew, eh)`），严禁使用缺省高度的无参 `Render`
-  导致控件回退到默认大尺寸（32px/36px）撑破 24px 行槽位覆盖下一行或被裁剪截断。
-- **长属性检查器必须具备分组折叠能力（Collapsible Sections）**:
-  属性项动辄几十项时必须分组并支持折叠展开，大类标题（`kind == 5`）展示 `▶` / `▼`
-  指示状态，`ContentHeight` 与逐行绘制均需联动跳过折叠项，并在标题栏使用 `Ui.ClickedIn`
-  阻断点击穿透，保证滚动条量程与视野紧凑清晰。
+- **PropertyGrid 编辑器是共享行几何下的真实子控件**：Input、SelectBox、Switch
+  与操作 Button 由行容器 Add/Remove，继承同一 App、裁剪与输入归属。布局期先
+  `MeasureTree(app)`，再将编辑槽位的完整矩形交给 `Arrange(ex, ey, ew, eh)`；
+  绘制沿现有树执行，不在 Paint 临时挂树。SelectBox 历史兼容签名为
+  `void Render(App,int,int,int)`，转发共享 RenderAt，不负责安装输入所有权。
+  编辑槽高须受行内可用高度约束，不能让默认自然高度撑破紧凑行或覆盖下一行。
+- **长属性检查器的分组折叠走 retained children 与 routed Click**：
+  `PropSpec.Section`（`kind == 5`）对应真实分组 Button，经标准 Click 调用
+  `ToggleSection`；折叠状态同时更新可见行、`ContentHeight` 与滚动量程。
+  移出可见集合的编辑器经树操作退休输入；需要拦截冒泡时在路由处理器调用
+  `e.Handle()`，不用 `Ui.ClickedIn` 几何轮询，图标继续使用标准 IconView。
 - **分段单选按钮（Segmented Buttons）文字安全内边距阈值**:
   判定是否由下拉框升格为单行分段按钮时，文字宽度测量 `tw` 必须预留至少 `app.Scale(16)`
   的安全 padding（左右各 8px），否则在高 DPI 或多字宽下极易贴边或溢出截断；放不下时应
@@ -903,6 +1013,15 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   为什么：零测量高度的精灵叠层在姿态命令哈希变化时报告高度 0 的损伤，
   把局部动画交替升级成整窗帧。修复实际 bx/by/bw/bh，并用真实 partial 比例
   及整帧像素对照验证；不能关闭 paint hash 来掩盖损伤错误。
+- **嵌套绘制 hash 按 owner 分段，恢复放 finally**：用值 token 保存父累加器与 armed 状态，成功后才提交本段 fingerprint；non-tree 子绘制显式建立稳定 owner scope，祖先自身变化仍须检测。
+  原因：单个保存槽会让嵌套子段覆盖父 prefix，子命令也可能被错误归到全窗祖先。空/负尺寸 damage 在调度与并集前忽略；当前覆盖只查冻结 present clip，pending 并集不是已画证明。
+  判定器 `conformance_gui_paint_hash_scope` 已正式通过三层嵌套、异常恢复、真实祖先变化、零高祖先、多 pending 与 full/partial 逐像素比较；没有修前红证据，不据 profile 总数逐帧归因 owner，也不由此宣称 IDE 性能通过。
+- **有界滚动损伤须覆盖全部变化**：仅在损伤边界覆盖全部变化时使用 bounded damage；它已安排重绘，不预先无范围 RequestRedraw，保留 unknown/full 优先级。
+  提示含阴影溢出时须保障旧完整区域在下一自然帧清除；body 后才扩大损伤不能证明当前帧已修，仍须整幅像素对照验证。
+- **首次出现在 partial 帧的悬浮提示不能只靠 RequireFullFrame 保完整**：该调用只武装下一自然帧，
+  不调度重绘、也不改当前帧已捕获的裁剪；能否本帧绘制须按捕获的 present 矩形判覆盖
+  （`FrameDamageContains`）。未覆盖整个提示（含阴影）时整层延期不绘，并 RequestRedraw 一次
+  等 full 后继帧；确认完整包含时才保持 partial，不得为保险扩成全帧，也不得轮询 busy 重绘。
 
 - 页面动画与背景特效同一显示拍先合成再提交一次，局部页帧仍推进条带外
   特效，并合并旧/新特效损伤。为什么：FxPresent 先提交、PresentFrame 再提交
@@ -910,6 +1029,40 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   整帧像素参考验证，否则下一特效拍会恢复旧页面。任何仍标记有效的干净
   快照都须补齐重画条带；复制面积阈值只能触发快照失效，不能跳过补丁仍
   宣称有效。
+
+### 静态玻璃组合缓存的来源与计账（2026-11-15 实证）
+
+- 最终 blur/fill/sheen 合成缓存须同时核对有效样式、surface 身份和真实 straight ARGB 来源；
+  原 blur 的抽样 hash 不能证明来源等价。为什么：单个未抽样背景像素变化也必须使组合失效，
+  dirty exact miss 还须避免旧 blur 的抽样命中。只在完整 clip 覆盖真实输出 bounds 时捕获；
+  partial/GPU/外扩或动态效果不支持时保守回退，不把旧前景收进来源或漏掉阴影。
+- 缓存复用现有有界 slot/销毁生命周期，并报告来源+结果缓冲成本、容量上限及 first-cold
+  捕获成本；命中 copy 计实际 restore 面积，输入/结果 copy 计 snapshot。为什么：缓存可
+  降低混合却增加复制，不能用漏计工作量或像素回归通过代替真实 IDE 帧预算验收。
+  判定器：`static_glass_cache_test` 的冷暖全像素/计数、背景单像素变化、clip、多 surface
+  与销毁复用；2026-11-15 正式单项通过131.07s，性能结论仍须独立正式测量。
+- **旧 blur-hit 的访问优化（2026-11-16 实证）**：验证 surface/几何/radius/圆角等缓存键后，
+  dirty=false 可跳过来源 checksum；命中时仅逐行复制 panel 与 clip 交集内已含 coverage 的
+  straight ARGB，不扫描整 panel 逐像素再裁剪。为什么：31×1 clip 曾触发32768次访问，
+  保护页 red 证实读取 clip 外缓存；green 保持全部目标像素与 guard 不变。保留 dirty=true、
+  miss/deferred 和组合缓存完整 clip 门，**blurhit 仍按原完整面板面积计账**，不降低统计口径
+  冒充收益。扩展 static_glass_cache_test 正式通过95.22s；cold 与 IDE 预算须独立验收。
+
+<!-- experience:initial-shape-fill-2026-11-16 -->
+- **透明首层只能省掉真实混合，不能只改账**：完整帧、无 shape shadow、单实体非椭圆背景可走
+  internal 初层入口；多区域、shadow、partial miss 保留旧 painter。仍检查真实目标 alpha：
+  da=0且有效sa>0可直接赋 straight源RGB，sa=0完全不写（含隐藏RGB）；AA先按原coverage求
+  floor(sa*cov/255)，再决定赋值或原source-over。共用原round扫描/coverage，不复制近似算法。
+  直接赋值计fill（结果可半透明），真实混合计blend，round调用/extent保留；新入口AA corner
+  也记真实像素，旧corner未计fill/blend，不能声称分类严格等额搬账。mixed rectangle不伪造
+  单面积top；区间去重top不是首帧分项。融合blur/fill/sheen仅省遍历时，逐层floor与混合仍须计入。
+  判定器：initial_shape_fill_test全source/destination alpha、隐藏RGB、AA/clip、真实计数及
+  multi/shadow/partial/ellipse回退、多DPI。前轮E2004编译红保留；测试按既有模式放namespace Gui
+  访问internal，禁止扩大生产public API。2026-11-16正式PASS110.30s，同轮4/4，日志
+  targeted-20261116-011717.log（SHA256 cb45ad7ae3fc3a7fde49d364092673b51731c2f7954190089a4d96b527c00088）。
+  PowerShell GUI exe探针需console或可靠等待/输出；正式run_case.cmake同步execute_process捕获stdout，
+  不需强制console。组件exact通过不等于fresh IDE首帧/整体固定预算通过，禁止以warm替cold。
+<!-- /experience:initial-shape-fill-2026-11-16 -->
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 
@@ -1153,7 +1306,7 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
   存量代码的做法是 `app.ClaimClick()`（认领）+ 组件级提前返回。**新代码不得再新增
   ClaimClick / BlockHitsRect / BlockHits* 这类仲裁调用**（`scripts/gui_layer_rules.py`
   棘轮拦截）：新浮层复用 `OverlayPopup.Host`、`Layer` 等共享件；统一浮层 OverlayHost 与
-  路由事件落地后（`docs/GUI_ARCHITECTURE.md` P4/P6）整体迁过去。本节以下几条描述的是
+  路由事件落地后整体迁过去。本节以下几条描述的是
   现行仲裁机制，供维护存量代码。
 
 - **遮罩只挡自身矩形 = 点外面也穿透**：下拉/菜单类的浮层若只
@@ -1199,6 +1352,9 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 
 - **延迟生命周期测试须用 `Post` 排队**：`TriggerEvent` 同步执行，验证 owner 释放后的回调应使用 `header.On.Click.Post()`；collapse 修正该测试后实际 17 项断言及正式单 case 重跑通过（50.41 秒），golden 与产品代码未为失败修改。
 - **关闭窗口先断开持有回调，清理按 owner 身份限定**：窗口关闭须清掉持有回调以破除 owner 自环；根树与 UiDriver 清理按 owner 身份匹配，不能误清其他窗口。
+- **同进程重开窗口按创建寿命隔离退出状态**：退休旧主窗身份，将终止状态绑定该次创建，防止旧退出通知误停新窗口。
+  阻塞等待被空唤醒时须在本次返回兑现自身 terminal，保留真实其他窗口事件和外部 WM_QUIT，不能把二者当陈旧唤醒吞掉。
+  用真实销毁后重开、等待中关闭、空唤醒及并存窗口事件回归验证；共享消息队列通过不替代具体宿主验收。
 
 - **真实离屏输入按当前 Window.EventSeq 去重与消费**：事件序号取当前窗口的
   `app.window.EventSeq()`，App 暂存、控件去重及输入消费标记必须使用同一窗口局部
@@ -1322,11 +1478,10 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
   拥有庞大组件库与大纲树的设计器左侧面板，必须在顶层 Tab 下方常驻即时搜索输入框（`filterInput`），联动树视图的 `WithFilter` 机制，支持输入拼音/英文/汉字关键字（如 "button", "table", "tab", "按钮"）毫秒级过滤匹配项，避免用户在几十个折叠分组中反复翻找。
 - **大纲树节点激活重命名与状态栏实时几何指示（Outline Activation & Status Live Geometry）**：
   设计器中组件大纲树（`TreeView`）应挂载 `OnActivate` 回调：当用户在已选节点上再次点击或回车激活时，即时就地触发 F2 原地重命名（`StartInlineRename`），免除用户在树节点与右键菜单之间往返切换。同时，底部状态栏应动态显示当前选中组件（或根窗口）的实时逻辑位置与宽高（如 `'btnSave' [120, 80  100×32]`），并在多选时标注附加项数，为像素微调和对齐校验提供毫秒级直接反馈。
-- **设计器双击防误跳代码机制（Double-Click Navigation Tolerance & Component Whitelist）**：
-  在可视化设计器画布中，用户频繁进行组件点选、拖拽微调或多选框选，若仅凭“400ms 内两次点击同一组件”就触发跳转后台代码，极易因快速双击选中、手抖轻微位移或无意识连击而频频误跳到代码编辑框，打断排版心流。
-  工业级防误触必须同时满足两层严密防护：
-  1. **屏幕位移容差校验**：两次点击在屏幕空间中的位移必须限制在极小容差内（如 `abs(dx) <= Scale(5) && abs(dy) <= Scale(5)`），只要产生拖拽位移或跨区域点击即刻重置，严禁触发代码跳转；
-  2. **业务控件白名单与容器/静态项绝对排除**：容器类组件（Panel, Card, Tabs, Collapse 等）与静态纯展示组件（Label, Title, Divider, Tag, Badge 等）在排版时属于高频承载与对齐参照物，绝对禁止双击跳代码；只有明确具备交互业务事件的组件（Button, Input, Checkbox, Switch, Tree, DataGrid 等）或自定义组件引用（`compRef`，双击打开子设计稿）才允许双击导航。
+- **设计器双击防误跳代码机制**：共享输入层负责有效主键 Click、双击时间与
+  位移容差、拖拽/取消排除；画布只消费本次 `e.isDoubleClick` 与 `e.modifiers`，
+  不再维护另一套计时、坐标或组件点击历史。文案编辑、组件打开与显式代码导航
+  按“设计器画布双击与代码跳转防误触机制”选择，容器与静态展示项不自动跳代码。
 - **全流式排版高度自动撑满（Fill Remaining Height）一键快捷动作**：
   在全流式（Flex/Flow）布局下，组件撑满剩余高度的规范语义是 `position = 0`、`flexGrow = 1` 且 `fh = 0`（由弹性主轴自动分配撑满余量空间）。
   若仅提供抽象的 `flexGrow` 整数输入，用户极难联想到高度填满需要将固定像素高度置 0。
@@ -1396,7 +1551,7 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
   在可视化画布中，用户快速双击或连击组件时，过去曾无差别触发跳转后台代码（`RequestOpenCodeBehindHandler`），导致焦点丢失，且无法直观修改按钮/标签文案。
   规范做法：
   1. 双击时优先通过 `HasDisplayText(sel)` 判定是否为带有界面展示文本特性的组件（如 Button, Label, Checkbox, Radio, Title 等），若有则就地激活 F2 原地编辑浮层（`StartInlineRename`），自动聚焦输入框并全选文案；
-  2. 仅在明确按住 `Ctrl` 键或双击无展示文本的业务控件时才允许导航至代码后置事件，彻底消除排版心流被强制打断的痛点。
+  2. 代码后置事件导航须由本次 Click 快照的 `Modifiers.HasCtrl(e.modifiers)` 或属性面板“定位代码”显式触发；不能因控件没有展示文本就自动跳转。`compRef` 的组件设计稿打开走独立组件入口。
 - **流式组件拖拽保护与容器内精准插槽调序（Flow Drag Preservation & In-Container Slot Reordering）**：
   在自由画布或混合排版模式下，过去 `DesignBeginMove` 曾无差别对所有拖拽组件调用 `DesignMakeFloat`，导致在流式容器或流式表单里的组件一拖动就被破坏性降级为浮动绝对定位（`position = 1`），不仅破坏 Flex 流式自适应特性还会引发图层遮挡；同时，在同容器内拖拽松手时因 `pc == cont` 判定直接 `continue` 跳过，无法通过拖拽进行子项排序。
   规范做法：
@@ -1441,10 +1596,10 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
-- 完整心智模型、皮肤与样式解析:`docs/agent-kb/gui-development.md`、
-  `docs/STDLIB_COMPONENT_STANDARDS.md`《附录:取色与取字的统一封装》。
+- 完整心智模型、皮肤与样式解析:本技能各节、
+  `references/html-window.md` 的取色与取字统一封装。
 - 守门测试:`policy_no_widget_drawing`(examples 自绘)、三条颜色/字号预算
-  棘轮;新组件必带 conformance 测试(`docs/STDLIB_COMPONENT_STANDARDS.md`)。
+  棘轮;新组件必带 conformance 测试。
 - 构建回归:`scripts\build_gallery.ps1` + `scripts\build_ide.ps1` 必须过;
   视觉检查用 gallery 深链(组件名+皮肤直达,如 `./gui_gallery Slider
   dark zh`),完整构建/启动流程见仓库文档;
