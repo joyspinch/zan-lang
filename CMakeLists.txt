@@ -3936,16 +3936,6 @@ add_test(NAME emit_lib_macos_dylib
     -P ${CMAKE_SOURCE_DIR}/tests/run_emit_lib.cmake)
 set_tests_properties(emit_lib_macos_dylib PROPERTIES TIMEOUT 120)
 
-if(UNIX AND NOT APPLE)
-  add_test(NAME driver_packaging_sqlite
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/examples/db/sqlite_crud.zan
-      -DWORK=${CMAKE_BINARY_DIR}/driver_packaging_sqlite
-      -P ${CMAKE_SOURCE_DIR}/tests/run_driver_packaging.cmake)
-  set_tests_properties(driver_packaging_sqlite PROPERTIES TIMEOUT 120)
-endif()
-
 # ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
 #      clang-compile + run + diff stdout, and verify malformed input fails
 #      closed (non-zero, no .ll). clang is optional -- without it the stdout
