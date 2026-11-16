@@ -1,0 +1,119 @@
+using System;
+
+class MethodGroupCleanBase {
+    public void Handle() { }
+}
+
+class MethodGroupCleanField : MethodGroupCleanBase {
+    public Action Handle;
+    public Action Callback;
+
+    public void Setup(Action source) {
+        Handle = source;
+        Callback = Handle;
+        this.Callback = this.Handle;
+    }
+
+    public Action Explicit() { return this.Handle; }
+    public Action Implicit() { return Handle; }
+}
+
+class MethodGroupCleanStatic {
+    public Action Callback;
+    public static int Calls;
+
+    public static void Handle() { Calls = Calls + 1; }
+    public void Setup() {
+        Callback = Handle;
+        this.Callback = MethodGroupCleanStatic.Handle;
+    }
+    public Action Read() { return Handle; }
+}
+
+class MethodGroupCleanReceiver {
+    public int Calls;
+    public void Handle() { Calls = Calls + 1; }
+}
+
+class MethodGroupCleanInitializer {
+    public int Handle;
+}
+
+class MethodGroupCleanLocal {
+    public Action Callback;
+    public MethodGroupCleanInitializer Initialized;
+    public void Handle() { }
+
+    public void SetupInitializer() {
+        // Handle is the new object's field, not this.Handle's method group.
+        Initialized = new MethodGroupCleanInitializer { Handle = 1 };
+    }
+
+    public void Setup(MethodGroupCleanReceiver receiver) {
+        Action Handle = receiver.Handle;
+        Callback = Handle;
+        this.Callback = receiver.Handle;
+    }
+    public Action Parameter(Action Handle) { return Handle; }
+    public Action Local(MethodGroupCleanReceiver receiver) {
+        Action Handle = receiver.Handle;
+        return Handle;
+    }
+    public Action DirectCall() { return Make(); }
+    Action Make() { return MethodGroupCleanStatic.Handle; }
+}
+
+class MethodGroupThisCleanTest {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static void Main() {
+        MethodGroupCleanStatic statics = new MethodGroupCleanStatic();
+        statics.Setup();
+        statics.Callback();
+        Action staticRead = statics.Read();
+        staticRead();
+        Check(MethodGroupCleanStatic.Calls == 2, "static method groups");
+
+        MethodGroupCleanReceiver receiver = new MethodGroupCleanReceiver();
+        WeakReference<MethodGroupCleanReceiver> observer =
+            new WeakReference<MethodGroupCleanReceiver>(receiver);
+        Action source = receiver.Handle;
+        MethodGroupCleanField field = new MethodGroupCleanField();
+        field.Setup(source);
+        field.Callback();
+        Action explicitRead = field.Explicit();
+        explicitRead();
+        Action implicitRead = field.Implicit();
+        implicitRead();
+
+        MethodGroupCleanLocal locals = new MethodGroupCleanLocal();
+        locals.SetupInitializer();
+        Check(locals.Initialized.Handle == 1, "initializer member is not a method group");
+        locals.Setup(receiver);
+        locals.Callback();
+        Action parameterRead = locals.Parameter(source);
+        parameterRead();
+        Action localRead = locals.Local(receiver);
+        localRead();
+        Action fromCall = locals.DirectCall();
+        fromCall();
+        Check(MethodGroupCleanStatic.Calls == 3, "direct calls are not method groups");
+        Check(receiver.Calls == 6, "delegate fields and local shadows");
+
+        receiver = null;
+        source = null;
+        explicitRead = null;
+        implicitRead = null;
+        parameterRead = null;
+        localRead = null;
+        field.Callback = null;
+        field.Handle = null;
+        Check(observer.IsAlive, "method group strongly retains receiver");
+        locals.Callback();
+        locals.Callback = null;
+        Check(!observer.IsAlive, "clearing final delegate releases receiver");
+        Console.WriteLine("method group diagnostics and strong retain verified");
+    }
+}

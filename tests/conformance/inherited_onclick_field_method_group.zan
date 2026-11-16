@@ -1,0 +1,136 @@
+using System;
+
+class FieldClickEventArgs { }
+
+class FieldClickActions {
+    public int Calls;
+    public void Replay() { Calls = Calls + 1; }
+}
+
+class FieldClickBase {
+    public int Subscriptions;
+    public int EventCalls;
+    public Action Subscribed;
+
+    public FieldClickBase OnClick(Action action) {
+        BindEvent(action);
+        return this;
+    }
+    public virtual void BindEvent(Action action) {
+        Subscriptions = Subscriptions + 1;
+        Subscribed = action;
+    }
+    public virtual void OnClick(FieldClickEventArgs e) {
+        EventCalls = EventCalls + 1;
+    }
+    public void Fire() { Subscribed(); }
+}
+
+class FieldClickDerived : FieldClickBase {
+    public override void BindEvent(Action action) {
+        Subscriptions = Subscriptions + 1;
+        Subscribed = action;
+    }
+    public override void OnClick(FieldClickEventArgs e) {
+        // Do not dereference e: the regression passes a method pointer here.
+        EventCalls = EventCalls + 1;
+    }
+}
+
+class FieldClickConsumer {
+    public FieldClickActions actions;
+    public FieldClickDerived natural;
+    public FieldClickDerived explicitBinding;
+    public FieldClickDerived baseTyped;
+
+    public FieldClickConsumer() {
+        this.actions = new FieldClickActions();
+        this.natural = new FieldClickDerived();
+        this.natural.OnClick(this.actions.Replay);
+        this.explicitBinding = new FieldClickDerived();
+        this.explicitBinding.BindEvent(this.actions.Replay);
+        this.baseTyped = new FieldClickDerived();
+        FieldClickBase receiver = this.baseTyped;
+        receiver.OnClick(this.actions.Replay);
+    }
+    public FieldClickBase Build() {
+        return new FieldClickDerived().OnClick(this.actions.Replay);
+    }
+}
+
+class FieldClickBox<T> {
+    public T Value;
+    public FieldClickBox(T value) { Value = value; }
+}
+
+class FieldClickShadowBase {
+    public int WrongCalls;
+    public void Replay(FieldClickEventArgs e) { WrongCalls = WrongCalls + 1; }
+}
+
+class FieldClickDelegateActions : FieldClickShadowBase {
+    public Action Replay;
+}
+
+class FieldClickDelegateConsumer {
+    public FieldClickDelegateActions actions;
+    public FieldClickBase Build() {
+        return new FieldClickDerived().OnClick(this.actions.Replay);
+    }
+}
+
+class InheritedOnClickFieldMethodGroupTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+    static void CheckSubscription(FieldClickBase receiver, string label) {
+        Check(receiver.Subscriptions == 1 && receiver.EventCalls == 0, label);
+    }
+    static void Main() {
+        FieldClickConsumer holder = new FieldClickConsumer();
+        CheckSubscription(holder.natural, "this.actions method group");
+        CheckSubscription(holder.explicitBinding, "explicit binding control");
+        CheckSubscription(holder.baseTyped, "base receiver control");
+        holder.natural.Fire();
+        holder.explicitBinding.Fire();
+        holder.baseTyped.Fire();
+        Check(holder.actions.Calls == 3, "registered callbacks execute once");
+        Console.WriteLine("THIS_FIELD_AND_CONTROLS_OK");
+
+        FieldClickDerived local = new FieldClickDerived();
+        local.OnClick(holder.actions.Replay);
+        CheckSubscription(local, "holder.actions method group");
+        local.Fire();
+        FieldClickBase built = holder.Build();
+        CheckSubscription(built, "direct return infers inherited Action overload");
+        built.Fire();
+        Check(holder.actions.Calls == 5, "nested callbacks preserve receiver identity");
+        local.OnClick(new FieldClickEventArgs());
+        Check(local.EventCalls == 1 && local.Subscriptions == 1,
+            "derived event overload remains callable");
+        Console.WriteLine("NESTED_FIELD_AND_EVENT_OK");
+
+        FieldClickBox<FieldClickActions> generic =
+            new FieldClickBox<FieldClickActions>(holder.actions);
+        FieldClickDerived genericTarget = new FieldClickDerived();
+        genericTarget.OnClick(generic.Value.Replay);
+        CheckSubscription(genericTarget, "closed generic field receiver");
+        genericTarget.Fire();
+        Check(holder.actions.Calls == 6, "generic field callback identity");
+        Console.WriteLine("GENERIC_FIELD_RECEIVER_OK");
+
+        FieldClickDelegateConsumer shadow = new FieldClickDelegateConsumer();
+        shadow.actions = new FieldClickDelegateActions();
+        shadow.actions.Replay = holder.actions.Replay;
+        FieldClickDerived shadowTarget = new FieldClickDerived();
+        shadowTarget.OnClick(shadow.actions.Replay);
+        CheckSubscription(shadowTarget, "nested delegate field shadows base method");
+        shadowTarget.Fire();
+        FieldClickBase shadowBuilt = shadow.Build();
+        CheckSubscription(shadowBuilt, "this nested delegate field shadows base method");
+        shadowBuilt.Fire();
+        Check(holder.actions.Calls == 8 && shadow.actions.WrongCalls == 0,
+            "delegate field stays a value and invokes the assigned receiver");
+        Console.WriteLine("DELEGATE_FIELD_SHADOW_OK");
+    }
+}

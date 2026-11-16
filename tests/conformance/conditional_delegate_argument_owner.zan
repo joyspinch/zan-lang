@@ -1,0 +1,177 @@
+using System;
+
+class ConditionalArgumentOwner {
+    public int calls;
+    public void Post(Action action) {
+        calls = calls + 1;
+        if (action != null) { action(); }
+    }
+    public int Read(int value) { calls = calls + 1; return value + 7; }
+}
+
+class ConditionalArgumentWatch {
+    public weak ConditionalArgumentOwner first;
+    public weak ConditionalArgumentOwner second;
+}
+
+class ConditionalDelegateArgumentOwnerTest {
+    static int entered;
+
+    static void Require(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static void Consume(Action<Action> handler) {
+        if (handler != null) { handler(null); }
+    }
+
+    static int ConsumeTyped(Func<int, int> handler) { return handler(5); }
+
+    static void FreshNull(ConditionalArgumentWatch watch, bool selected, bool reverse) {
+        ConditionalArgumentOwner owner = new ConditionalArgumentOwner();
+        watch.first = owner;
+        if (reverse) {
+            Consume(selected ? null : (Action action) => { owner.Post(action); });
+        } else {
+            Consume(selected ? (Action action) => { owner.Post(action); } : null);
+        }
+        Require(owner.calls == (selected != reverse ? 1 : 0), "fresh/null selected branch");
+    }
+
+    static void FreshBorrowed(ConditionalArgumentWatch watch, bool selected, bool reverse) {
+        ConditionalArgumentOwner fresh = new ConditionalArgumentOwner();
+        ConditionalArgumentOwner borrowed = new ConditionalArgumentOwner();
+        watch.first = fresh;
+        watch.second = borrowed;
+        Action<Action> existing = (Action action) => { borrowed.Post(action); };
+        if (reverse) {
+            Consume(selected ? existing : (Action action) => { fresh.Post(action); });
+        } else {
+            Consume(selected ? (Action action) => { fresh.Post(action); } : existing);
+        }
+        bool choseFresh = selected != reverse;
+        Require(fresh.calls == (choseFresh ? 1 : 0), "fresh/borrowed fresh branch");
+        existing(null);
+        Require(borrowed.calls == (choseFresh ? 1 : 2), "borrowed delegate remains callable");
+    }
+
+    static void FreshFresh(ConditionalArgumentWatch watch, bool selected) {
+        ConditionalArgumentOwner first = new ConditionalArgumentOwner();
+        ConditionalArgumentOwner second = new ConditionalArgumentOwner();
+        watch.first = first;
+        watch.second = second;
+        Consume(selected ? (Action action) => { first.Post(action); }
+                         : (Action action) => { second.Post(action); });
+        Require(first.calls == (selected ? 1 : 0) && second.calls == (selected ? 0 : 1),
+            "fresh/fresh selected branch");
+    }
+
+    static void BorrowedNull(ConditionalArgumentWatch watch, bool selected) {
+        ConditionalArgumentOwner owner = new ConditionalArgumentOwner();
+        watch.first = owner;
+        Action<Action> existing = (Action action) => { owner.Post(action); };
+        Consume(selected ? existing : null);
+        Consume(selected ? null : existing);
+        existing(null);
+        Require(owner.calls == 2, "borrowed/null both directions preserve existing delegate");
+    }
+
+    static void Nested(ConditionalArgumentWatch watch, bool outer, bool inner) {
+        ConditionalArgumentOwner owner = new ConditionalArgumentOwner();
+        watch.first = owner;
+        Consume(outer ? (inner ? (Action action) => { owner.Post(action); } : null)
+                      : (Action action) => { owner.Post(action); });
+        Require(owner.calls == (!outer || inner ? 1 : 0), "nested conditional branch");
+    }
+
+    static void Cast(ConditionalArgumentWatch watch, bool selected) {
+        ConditionalArgumentOwner owner = new ConditionalArgumentOwner();
+        watch.first = owner;
+        Consume((Action<Action>)(selected ? (Action action) => { owner.Post(action); } : null));
+        Require(owner.calls == (selected ? 1 : 0), "explicit delegate cast");
+    }
+
+    static void Typed(ConditionalArgumentWatch watch, bool selected) {
+        ConditionalArgumentOwner owner = new ConditionalArgumentOwner();
+        watch.first = owner;
+        Func<int, int> existing = (int value) => { return owner.Read(value) + 1; };
+        int result = ConsumeTyped(selected ? (int value) => { return owner.Read(value); } : existing);
+        Require(result == (selected ? 12 : 13), "typed lambda argument and return");
+        Require(existing(1) == 9 && owner.calls == 2, "typed borrowed signature remains valid");
+    }
+
+    static void DelegateCall(ConditionalArgumentWatch watch, bool selected) {
+        ConditionalArgumentOwner owner = new ConditionalArgumentOwner();
+        watch.first = owner;
+        Action<Action<Action>> sink = Consume;
+        sink(selected ? (Action action) => { owner.Post(action); } : null);
+        Require(owner.calls == (selected ? 1 : 0), "delegate callee accepts conditional argument");
+    }
+
+    static void ThrowingConsume(Action<Action> handler) {
+        Consume(handler);
+        throw new Exception("callee");
+    }
+
+    static int ThrowArgument() { throw new Exception("argument"); }
+
+    static void ConsumeLater(Action<Action> handler, int ignored) {
+        entered = entered + 1;
+        Consume(handler);
+    }
+
+    static void Exceptional(ConditionalArgumentWatch watch, bool laterArgument, bool delegateCall) {
+        ConditionalArgumentOwner owner = new ConditionalArgumentOwner();
+        watch.first = owner;
+        bool selected = true;
+        bool caught = false;
+        int before = entered;
+        try {
+            if (laterArgument) {
+                if (delegateCall) {
+                    Action<Action<Action>, int> sink = ConsumeLater;
+                    sink(selected ? (Action action) => { owner.Post(action); } : null, ThrowArgument());
+                } else {
+                    ConsumeLater(selected ? (Action action) => { owner.Post(action); } : null, ThrowArgument());
+                }
+            } else {
+                if (delegateCall) {
+                    Action<Action<Action>> sink = ThrowingConsume;
+                    sink(selected ? (Action action) => { owner.Post(action); } : null);
+                } else {
+                    ThrowingConsume(selected ? (Action action) => { owner.Post(action); } : null);
+                }
+            }
+        } catch (Exception error) {
+            caught = error.Message == (laterArgument ? "argument" : "callee");
+        }
+        Require(caught, "expected exception propagates");
+        Require(entered == before, "later argument throws before callee entry");
+        Require(owner.calls == (laterArgument ? 0 : 1), "exception evaluation order");
+    }
+
+    static void Released(ConditionalArgumentWatch watch) {
+        Require(watch.first == null && watch.second == null, "conditional argument retained owner after helper return");
+    }
+
+    static void Main() {
+        ConditionalArgumentWatch watch = new ConditionalArgumentWatch();
+        for (int i = 0; i < 2; i = i + 1) {
+            bool selected = i == 0;
+            FreshNull(watch, selected, false); Released(watch);
+            FreshNull(watch, selected, true); Released(watch);
+            FreshBorrowed(watch, selected, false); Released(watch);
+            FreshBorrowed(watch, selected, true); Released(watch);
+            FreshFresh(watch, selected); Released(watch);
+            BorrowedNull(watch, selected); Released(watch);
+            Nested(watch, true, selected); Released(watch);
+            Cast(watch, selected); Released(watch);
+            Typed(watch, selected); Released(watch);
+            DelegateCall(watch, selected); Released(watch);
+            Exceptional(watch, false, selected); Released(watch);
+            Exceptional(watch, true, selected); Released(watch);
+        }
+        Nested(watch, false, false); Released(watch);
+        Console.WriteLine("CONDITIONAL_DELEGATE_ARGUMENT_OWNER_OK");
+    }
+}

@@ -1,0 +1,141 @@
+using System;
+
+class BindingArgumentModel {
+    public string Text = "seed";
+    public int Count = 3;
+    public bool Enabled;
+    public int Writes;
+    public int Number {
+        get { return Count; }
+        set { Count = value; Writes = Writes + 1; }
+    }
+}
+
+class BindingArgumentWatch {
+    public weak Binding<string> Seen;
+}
+
+class BindingArgumentHolder {
+    public Binding<string> Text;
+    public Binding<int> Number;
+    public Binding<bool> Enabled;
+
+    public BindingArgumentHolder(Binding<string> text, Binding<int> number, Binding<bool> enabled) {
+        Init(text, number, enabled);
+    }
+
+    public void Init(Binding<string> text, Binding<int> number, Binding<bool> enabled) {
+        Text = text;
+        Number = number;
+        Enabled = enabled;
+    }
+}
+
+class BindingArgumentChoice {
+    public int Selected;
+    public BindingArgumentChoice(Binding<int> value) { Selected = 1; }
+    public BindingArgumentChoice(int value) { Selected = 2; }
+}
+
+class BindingCallArguments {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static Binding<int> Identity(Binding<int> value) { return value; }
+    static void SetGeneric<T>(Binding<T> binding, T value) { binding.Set(value); }
+    static int Choose(Binding<int> value) { return 1; }
+    static int Choose(int value) { return 2; }
+    static bool IsNull(Binding<string> value) { return value == null; }
+    static string Read(Binding<string> value) { return value.Get(); }
+
+    static BindingArgumentModel Temporary() {
+        BindingArgumentModel model = new BindingArgumentModel();
+        model.Text = "temporary";
+        return model;
+    }
+
+    static void Consume(Binding<string> value, BindingArgumentWatch watch, bool fail) {
+        watch.Seen = value;
+        Check(value.Get() == "owned", "temporary argument value");
+        if (fail) { throw new Exception("callee"); }
+    }
+
+    static int ThrowArgument() { throw new Exception("argument"); }
+    static void ConsumeLater(Binding<string> value, int ignored) {
+        throw new Exception("must not enter callee");
+    }
+
+    static void CheckOwnership(bool delegateCall, bool fail) {
+        BindingArgumentWatch watch = new BindingArgumentWatch();
+        bool caught = false;
+        try {
+            if (delegateCall) {
+                Action<Binding<string>, BindingArgumentWatch, bool> sink = Consume;
+                sink("owned", watch, fail);
+            } else {
+                Consume("owned", watch, fail);
+            }
+        } catch (Exception error) {
+            caught = error.Message == "callee";
+        }
+        Check(caught == fail && watch.Seen == null, "temporary argument lifetime");
+        caught = false;
+        try {
+            if (delegateCall) {
+                Action<Binding<string>, int> sink = ConsumeLater;
+                sink("owned", ThrowArgument());
+            } else {
+                ConsumeLater("owned", ThrowArgument());
+            }
+        } catch (Exception error) {
+            caught = error.Message == "argument";
+        }
+        Check(caught, "later argument exception");
+    }
+
+    static void Main() {
+        BindingArgumentHolder holder = new BindingArgumentHolder("literal", 4, true);
+        Check(holder.Text.Get() == "literal" && holder.Number.Get() == 4 && holder.Enabled.Get(),
+            "literal constructor arguments");
+        holder.Init("method", 5, false);
+        Check(holder.Text.Get() == "method" && holder.Number.Get() == 5 && !holder.Enabled.Get(),
+            "member method arguments");
+        BindingArgumentHolder named = new BindingArgumentHolder(enabled: true, number: 7, text: "named");
+        Check(named.Text.Get() == "named" && named.Number.Get() == 7 && named.Enabled.Get(),
+            "named constructor arguments");
+
+        BindingArgumentModel model = new BindingArgumentModel();
+        holder.Init(model.Text, model.Number, model.Enabled);
+        Check(holder.Text.IsLive() && holder.Number.IsLive() && holder.Enabled.IsLive(), "live arguments");
+        holder.Text.Set("changed");
+        holder.Number.Set(9);
+        holder.Enabled.Set(true);
+        Check(model.Text == "changed" && model.Count == 9 && model.Writes == 1 && model.Enabled,
+            "field and property setters");
+        model.Count = 11;
+        Check(holder.Number.Get() == 11, "property getter remains live");
+        Binding<int> existing = model.Number;
+        Check(Identity(existing) == existing, "existing binding identity");
+        SetGeneric<int>(model.Number, 13);
+        Check(model.Count == 13 && model.Writes == 2, "generic argument conversion");
+
+        int local = 21;
+        Binding<int> snapshot = Identity(local);
+        local = 22;
+        snapshot.Set(23);
+        Check(!snapshot.IsLive() && snapshot.Get() == 23 && local == 22, "local snapshot argument");
+        Check(Read(Temporary().Text) == "temporary", "temporary receiver snapshot");
+        Check(IsNull(null), "null remains a null binding");
+        Check(Choose(1) == 2 && Choose(existing) == 1, "method exact overload priority");
+        BindingArgumentChoice exact = new BindingArgumentChoice(1);
+        BindingArgumentChoice bound = new BindingArgumentChoice(existing);
+        Check(exact.Selected == 2 && bound.Selected == 1, "constructor exact overload priority");
+
+        CheckOwnership(false, false);
+        CheckOwnership(false, true);
+        CheckOwnership(true, false);
+        CheckOwnership(true, true);
+        Console.WriteLine("BINDING_CALL_ARGUMENTS_OK");
+    }
+}

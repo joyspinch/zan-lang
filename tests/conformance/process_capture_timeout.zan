@@ -1,0 +1,149 @@
+using System;
+using System.Diagnostics;
+using System.Threading;
+
+class Program {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetStdHandle")]
+    static extern nint GetStdHandle(int which);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int CloseHandle(nint handle);
+    [DllImport("kernel32", EntryPoint = "CreateProcessW")]
+    static extern int CreateProcess(nint application, nint commandLine, nint processAttrs,
+        nint threadAttrs, int inherit, int flags, nint environment, nint directory,
+        byte[] startup, byte[] processInfo);
+
+    static void PutHandle(byte[] bytes, int offset, nint handle) {
+        for (int i = 0; i < 8; i = i + 1) {
+            bytes[offset + i] = (byte)(handle % 256);
+            handle = handle / 256;
+        }
+    }
+
+    static nint HandleAt(byte[] bytes, int offset) {
+        nint handle = 0;
+        nint multiplier = 1;
+        for (int i = 0; i < 8; i = i + 1) {
+            handle = handle + (bytes[offset + i] & 255) * multiplier;
+            multiplier = multiplier * 256;
+        }
+        return handle;
+    }
+    #else
+    [DllImport("crt", EntryPoint = "close")]
+    static extern int CloseFd(int fd);
+    [DllImport("crt", EntryPoint = "fork")]
+    static extern int Fork();
+    #endif
+
+    static bool StartWriterDescendant() {
+        #if WINDOWS
+        // Use CreateProcess directly: detached APIs deliberately replace stdio.
+        byte[] startup = new byte[104];
+        byte[] processInfo = new byte[24];
+        startup[0] = 104;
+        startup[61] = 1; // STARTF_USESTDHANDLES = 0x100
+        Program.PutHandle(startup, 80, Program.GetStdHandle(0 - 10));
+        Program.PutHandle(startup, 88, Program.GetStdHandle(0 - 11));
+        Program.PutHandle(startup, 96, Program.GetStdHandle(0 - 12));
+        List<string> args = new List<string>();
+        args.Add("--writer-descendant");
+        nint command = Wide.Of(Process.BuildCommandLine(Environment.ProcessPath, args));
+        int ok = 0;
+        try {
+            ok = Program.CreateProcess(0, command, 0, 0, 1, 134217728, 0, 0,
+                startup, processInfo);
+        } finally {
+            Wide.Free(command);
+        }
+        if (ok == 0) { return false; }
+        Program.CloseHandle(Program.HandleAt(processInfo, 0));
+        Program.CloseHandle(Program.HandleAt(processInfo, 8));
+        return true;
+        #else
+        int pid = Program.Fork();
+        if (pid < 0) { return false; }
+        if (pid == 0) {
+            Thread.Sleep(3000);
+            Environment.Exit(0);
+        }
+        return true;
+        #endif
+    }
+
+    static void Child(string mode) {
+        if (mode == "--held-writer") {
+            bool started = Program.StartWriterDescendant();
+            if (started) { Console.WriteLine("writer-started"); }
+            Environment.Exit(started ? 0 : 91);
+        }
+        if (mode == "--eof") {
+            #if WINDOWS
+            Program.CloseHandle(Program.GetStdHandle(0 - 11));
+            Program.CloseHandle(Program.GetStdHandle(0 - 12));
+            #else
+            Program.CloseFd(1);
+            Program.CloseFd(2);
+            #endif
+        }
+        if (mode == "--partial") { Console.WriteLine("before-timeout"); }
+        if (mode == "--normal") {
+            for (int i = 0; i < 1024; i = i + 1) {
+                Console.WriteLine("0123456789abcdefghijklmnopqrstuvwxyz");
+            }
+            Environment.Exit(37);
+        }
+        if (mode == "--short") {
+            Thread.Sleep(80);
+            Console.WriteLine("done");
+            Environment.Exit(127);
+        }
+        if (mode == "--flood") {
+            // Finite even on the old implementation; the outer harness is a second watchdog.
+            long until = Stopwatch.GetMilliseconds() + 3000;
+            while (Stopwatch.GetMilliseconds() < until) {
+                Console.WriteLine("0123456789abcdefghijklmnopqrstuvwxyz");
+            }
+        } else {
+            Thread.Sleep(3000);
+        }
+        Environment.Exit(0);
+    }
+
+    static ProcessResult Capture(string mode, int timeoutMs) {
+        List<string> args = new List<string>();
+        args.Add(mode);
+        return Process.CaptureSafe(Environment.ProcessPath, args, timeoutMs);
+    }
+
+    static void Timeout(string mode) {
+        long start = Stopwatch.GetMilliseconds();
+        ProcessResult result = Program.Capture(mode, 150);
+        long elapsed = Stopwatch.GetMilliseconds() - start;
+        Console.WriteLine(mode + "=" + (result.exitCode == 0 - 1 && elapsed < 1500));
+        if (mode == "--held-writer") {
+            Console.WriteLine("descendant=" + result.Text().Contains("writer-started"));
+        }
+        if (mode == "--partial") {
+            Console.WriteLine("partial=" + result.Text().Contains("before-timeout"));
+        }
+    }
+
+    static void Main() {
+        if (Environment.ArgCount() > 0) {
+            Program.Child(Environment.ArgAt(0));
+            return;
+        }
+        Program.Timeout("--silent");
+        Program.Timeout("--partial");
+        Program.Timeout("--flood");
+        Program.Timeout("--eof");
+        Program.Timeout("--held-writer");
+        ProcessResult normal = Program.Capture("--normal", 5000);
+        Console.WriteLine("drain=" + (normal.exitCode == 37 && normal.lines.Count == 1024));
+        ProcessResult zero = Program.Capture("--short", 0);
+        Console.WriteLine("zero-infinite=" + (zero.exitCode == 127 && zero.Text().Contains("done")));
+        ProcessResult negative = Program.Capture("--short", 0 - 1);
+        Console.WriteLine("negative-infinite=" + (negative.exitCode == 127 && negative.Text().Contains("done")));
+    }
+}

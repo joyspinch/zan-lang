@@ -1,0 +1,212 @@
+using System;
+
+public delegate int VariantRead();
+
+class VariantNode {
+    public int Value;
+    public VariantNode(int value) { Value = value; }
+}
+
+class Program {
+    static WeakReference<VariantNode> first;
+    static WeakReference<VariantNode> second;
+    static WeakReference<VariantNode> outerWatch;
+    static WeakReference<VariantNode> retired;
+
+    static void Check(bool value, string label) {
+        if (!value) throw new Exception(label);
+    }
+    static void Fail() { throw new Exception("variant-failure"); }
+    static VariantNode FailedInitializer() { Fail(); return null; }
+
+    static void Branch(bool left, bool initialize) {
+        VariantNode outer = new VariantNode(10);
+        outerWatch = new WeakReference<VariantNode>(outer);
+        if (left) {
+            VariantNode a = new VariantNode(11);
+            first = new WeakReference<VariantNode>(a);
+            if (initialize) {
+                VariantNode b = new VariantNode(12);
+                second = new WeakReference<VariantNode>(b);
+                Fail();
+            }
+            VariantNode pending = FailedInitializer();
+        } else {
+            VariantNode a = new VariantNode(21);
+            first = new WeakReference<VariantNode>(a);
+            VariantNode b = new VariantNode(22);
+            second = new WeakReference<VariantNode>(b);
+            Fail();
+        }
+    }
+
+    static void Generic<T>(T borrowed, bool left) {
+        VariantNode outer = new VariantNode(30);
+        outerWatch = new WeakReference<VariantNode>(outer);
+        if (left) {
+            VariantNode a = new VariantNode(31);
+            first = new WeakReference<VariantNode>(a);
+            VariantNode b = new VariantNode(32);
+            second = new WeakReference<VariantNode>(b);
+            Fail();
+        } else {
+            VariantNode a = new VariantNode(33);
+            first = new WeakReference<VariantNode>(a);
+            VariantNode pending = FailedInitializer();
+        }
+    }
+
+    static void Loop() {
+        VariantNode outer = new VariantNode(40);
+        outerWatch = new WeakReference<VariantNode>(outer);
+        for (int i = 0; i < 3; i++) {
+            if (i > 0) Check(!retired.IsAlive, "previous iteration released");
+            VariantNode a = new VariantNode(41 + i);
+            retired = new WeakReference<VariantNode>(a);
+            if (i < 2) continue;
+            first = new WeakReference<VariantNode>(a);
+            VariantNode b = new VariantNode(50);
+            second = new WeakReference<VariantNode>(b);
+            Fail();
+        }
+    }
+
+    static void SameFrame() {
+        VariantNode outer = new VariantNode(60);
+        outerWatch = new WeakReference<VariantNode>(outer);
+        try { Branch(false, true); }
+        catch (Exception e) {
+            Check(e.Message == "variant-failure", "same-frame routing");
+            Check(!first.IsAlive && !second.IsAlive, "callee locals released");
+            Check(outer.Value == 60, "caller outer remains alive");
+        }
+        Check(outer.Value == 60, "caller outer survives catch");
+    }
+
+    // With ZAN_ARC_TRACE enabled, the first three allocations between these
+    // markers must be destroyed in reverse order, in both ordinary and
+    // specialized generic frames. The normal golden output stays stable.
+    static void Lifo() {
+        VariantNode a = new VariantNode(71);
+        VariantNode b = new VariantNode(72);
+        VariantNode c = new VariantNode(73);
+        Check(a.Value + b.Value + c.Value == 216, "lifo nodes live");
+        Fail();
+    }
+    static void GenericLifo<T>(T borrowed) {
+        VariantNode a = new VariantNode(81);
+        VariantNode b = new VariantNode(82);
+        VariantNode c = new VariantNode(83);
+        Check(a.Value + b.Value + c.Value == 246, "generic lifo nodes live");
+        Fail();
+    }
+
+    static void ForwardGoto() {
+        try { goto done; }
+        finally {
+            VariantNode value = new VariantNode(91);
+            first = new WeakReference<VariantNode>(value);
+            Fail();
+        }
+        done: Check(false, "forward goto did not throw");
+    }
+    static void GenericForwardGoto<T>(T borrowed) {
+        try { goto done; }
+        finally {
+            VariantNode value = new VariantNode(92);
+            first = new WeakReference<VariantNode>(value);
+            Fail();
+        }
+        done: Check(false, "generic forward goto did not throw");
+    }
+    static VariantRead escaped;
+    static async void AsyncOwners(VariantNode parameter) {
+        VariantNode outer = new VariantNode(100);
+        for (int i = 0; i < 2; i++) {
+            try {
+                VariantNode value = new VariantNode(101 + i);
+                first = new WeakReference<VariantNode>(value);
+                VariantRead read = () => value.Value;
+                await Task.Yield();
+                Check(read() == 101 + i, "captured loop cell readable");
+                if (i == 0) {
+                    VariantNode pending = FailedInitializer();
+                }
+                Fail();
+            } catch {
+                Check(!first.IsAlive, "async try owners released");
+                Check(outer.Value == 100 && parameter.Value == 90, "outer owners preserved");
+            }
+            await Task.Yield();
+            Check(!first.IsAlive, "released owner stays null after resume");
+        }
+        for (int i = 0; i < 2; i++) {
+            {
+                VariantNode value = new VariantNode(105 + i);
+                first = new WeakReference<VariantNode>(value);
+                VariantRead read = () => value.Value;
+                await Task.Yield();
+                Check(read() == 105 + i, "normal captured loop readable");
+            }
+            Check(!first.IsAlive, "normal captured loop released");
+            await Task.Yield();
+            Check(!first.IsAlive, "normal captured loop stays released");
+        }
+        {
+            VariantNode value = new VariantNode(110);
+            first = new WeakReference<VariantNode>(value);
+            escaped = () => value.Value;
+        }
+        await Task.Yield();
+        Check(first.IsAlive && escaped() == 110, "escaped cell survives lexical release");
+        escaped = null;
+        Check(!first.IsAlive, "escaped cell released with delegate");
+        try {
+            try {
+                VariantNode value = new VariantNode(111);
+                first = new WeakReference<VariantNode>(value);
+                await Task.Yield();
+                Fail();
+            } catch {
+                Check(!first.IsAlive, "inner catch released owner");
+                throw new Exception("rethrow");
+            }
+        } catch (Exception caught) {
+            Check(caught.Message == "rethrow", "outer catch route");
+            Check(outer.Value == 100 && parameter.Value == 90, "outer catch owner lifetime");
+        }
+    }
+
+    static void Main() {
+        for (int i = 0; i < 3; i++) {
+            try { Branch(i != 2, i != 1); }
+            catch (Exception e) { Check(e.Message == "variant-failure", "branch route"); }
+            Check(!first.IsAlive && !outerWatch.IsAlive, "branch cleanup");
+            if (i != 1) Check(!second.IsAlive, "branch second cleanup");
+        }
+        VariantNode caller = new VariantNode(90);
+        WeakReference<VariantNode> callerWatch = new WeakReference<VariantNode>(caller);
+        for (int i = 0; i < 2; i++) {
+            try { Generic<VariantNode>(caller, i == 0); }
+            catch (Exception e) { Check(e.Message == "variant-failure", "generic route"); }
+            Check(!first.IsAlive && !outerWatch.IsAlive, "generic cleanup");
+            Check(callerWatch.IsAlive && caller.Value == 90, "borrowed parameter survives");
+        }
+        try { Loop(); }
+        catch (Exception e) { Check(e.Message == "variant-failure", "loop route"); }
+        Check(!first.IsAlive && !second.IsAlive && !outerWatch.IsAlive && !retired.IsAlive,
+        "loop slots released once");
+        SameFrame();
+        try { ForwardGoto(); } catch { Check(!first.IsAlive, "forward goto finally owner"); }
+        try { GenericForwardGoto<int>(1); }
+        catch { Check(!first.IsAlive, "generic forward goto finally owner"); }
+        await AsyncOwners(caller);
+        Console.WriteLine("LIFO_BEGIN");
+        try { Lifo(); } catch { }
+        Console.WriteLine("LIFO_END");
+        Console.WriteLine("GENERIC_LIFO_BEGIN");
+        try { GenericLifo<int>(1); } catch { }
+        Console.WriteLine("GENERIC_LIFO_END");
+        Console.WriteLine("PASS active cleanup variants");
+    }
+}

@@ -1,0 +1,44 @@
+using System;
+using System.Runtime.Intrinsics;
+
+// B-ID199：Vector128/256.Load/Store 契约 = 对齐无关（.NET 语义；C 宿主
+// expr_simd256.c 四处 LLVMSetAlignment 1）。本用例以 +3/+5/+7 三个非对齐
+// 内点驱动 load/store 与 NativeMemory SIMD 路径，钉住两代编译器同契约。
+// gen1 缺 align 1 时此处表现为 movaps #GP（0xC0000005）崩溃。
+class Program {
+    static void Main() {
+        string s = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        string t = "ABCDEFGHIjKLMNOPQRSTUVWXYZ0123456789"; // [9] 小写 => 16B 窗内不同
+        nint p = (nint)s;
+
+        // 非对齐 16B 窗：同址相等
+        Console.WriteLine("eqSame=" + NativeMemory.SequenceEqual(p + 7, p + 7, 16));
+        // 非对齐 16B 窗：异串不等
+        Console.WriteLine("eqDiff=" + NativeMemory.SequenceEqual(p + 7, (nint)t + 7, 16));
+
+        // 非对齐 IndexOf（+3 起 20 字节内找 'H'：绝对下标 7 => 视图内 4）
+        Console.WriteLine("idxH=" + NativeMemory.IndexOf(p + 3, 20, (byte)'H'));
+
+        // 非对齐 load -> 非对齐 store -> 读回比对（128 位）
+        Vector128 v = Vector128.Load(p + 3);
+        byte[] buf = new byte[32];
+        Vector128.Store((nint)buf + 3, v);
+        Console.WriteLine("storeEq128=" + NativeMemory.SequenceEqual((nint)buf + 3, p + 3, 16));
+
+        // 跨缓存行的非对齐 256 位路径
+        Vector256 w = Vector256.Load(p + 5);
+        byte[] buf2 = new byte[64];
+        Vector256.Store((nint)buf2 + 5, w);
+        Console.WriteLine("storeEq256=" + NativeMemory.SequenceEqual((nint)buf2 + 5, p + 5, 32));
+
+        // store 后读回的字节逐个断言（避免只验 bool 的浅覆盖）
+        int diff = 0;
+        int i = 3;
+        while (i < 19) {
+            if (buf[i] != (byte)s[i]) { diff = diff + 1; }
+            i = i + 1;
+        }
+        Console.WriteLine("storeDiff=" + diff);
+        Console.WriteLine("SIMD UNALIGNED OK");
+    }
+}

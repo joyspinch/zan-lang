@@ -1,0 +1,120 @@
+using System;
+using System.Threading;
+
+class AsyncDelegateOwnerPayload {
+    public bool throwing;
+}
+
+class AsyncDelegateOwnerWitness {
+    public WeakReference<CancellationToken> token;
+    public WeakReference<AsyncDelegateOwnerPayload> payload;
+}
+
+class AsyncDelegateOwnerJob<TSnapshot, TResult> {
+    Func<TSnapshot, CancellationToken, TResult> compute;
+    TSnapshot snapshot;
+    CancellationTokenSource source;
+    public bool caught;
+
+    public AsyncDelegateOwnerJob(TSnapshot snapshot, CancellationTokenSource source,
+            Func<TSnapshot, CancellationToken, TResult> compute) {
+        this.snapshot = snapshot;
+        this.source = source;
+        this.compute = compute;
+    }
+
+    public async void Run(List<long> pending) {
+        try {
+            if (pending != null) { await Task.WhenAll(pending); }
+            TResult result = this.compute(this.snapshot, this.source.Token);
+        } catch (Exception failure) {
+            this.caught = true;
+        } finally {
+            this.compute = null;
+            this.snapshot = null;
+        }
+    }
+
+    public void Close() {
+        this.source.Dispose();
+        this.source = null;
+    }
+}
+
+class AsyncDelegateArgumentOwner {
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static string Fail(string snapshot, CancellationToken token) {
+        throw new Exception("static callback");
+    }
+
+    static AsyncDelegateOwnerJob<string, string> Capture(CancellationTokenSource source,
+            AsyncDelegateOwnerWitness witness, bool throwing) {
+        AsyncDelegateOwnerPayload payload = new AsyncDelegateOwnerPayload();
+        payload.throwing = throwing;
+        witness.payload = new WeakReference<AsyncDelegateOwnerPayload>(payload);
+        Func<string, CancellationToken, string> callback = (string snapshot, CancellationToken token) => {
+            if (payload.throwing) { throw new Exception("captured callback"); }
+            return snapshot;
+        };
+        // The capture scope returns without replacing payload's captured cell.
+        return new AsyncDelegateOwnerJob<string, string>("captured", source, callback);
+    }
+
+    static async void WaitForRelease(Gate release) {
+        await release.Wait();
+    }
+
+    static async void Observe(AsyncDelegateOwnerJob<string, string> job, List<long> pending, Semaphore completed) {
+        await job.Run(pending);
+        completed.Release();
+    }
+
+    static AsyncDelegateOwnerWitness RunCase(bool captured, bool throwing, bool suspend) {
+        CancellationTokenSource source = new CancellationTokenSource();
+        AsyncDelegateOwnerWitness witness = new AsyncDelegateOwnerWitness();
+        witness.token = new WeakReference<CancellationToken>(source.Token);
+        AsyncDelegateOwnerJob<string, string> job = null;
+        if (captured) { job = Capture(source, witness, throwing); }
+        else { job = new AsyncDelegateOwnerJob<string, string>("static", source, Fail); }
+        if (suspend) {
+            Gate release = new Gate();
+            List<long> pending = new List<long>();
+            pending.Add(Task.Run(WaitForRelease(release)));
+            Semaphore completed = new Semaphore(0, 1);
+            // Direct call reaches the incomplete join before returning here.
+            Observe(job, pending, completed);
+            Require(!completed.WaitOne(0), "callback ran before suspended join was released");
+            release.Signal();
+            Require(completed.WaitOne(5000), "cross-resume callback completion timeout");
+            completed.Dispose(); release.Dispose();
+        } else {
+            Task worker = Task.Run(job.Run(null));
+            worker.Wait();
+        }
+        Require(job.caught == throwing, "async catch outcome");
+        job.Close();
+        // All strong locals leave before the caller checks weak payload/token.
+        return witness;
+    }
+
+    static void Check(bool captured, bool throwing, bool suspend) {
+        AsyncDelegateOwnerWitness witness = RunCase(captured, throwing, suspend);
+        Require(!witness.token.IsAlive, "async delegate retained owned token argument");
+        if (captured) {
+            Require(!witness.payload.IsAlive, "async delegate retained callback payload");
+        }
+    }
+
+    static void Main() {
+        Check(true, false, false);
+        Check(false, true, false);
+        Check(true, true, false);
+        Check(true, false, true);
+        Check(false, true, true);
+        Check(true, true, true);
+        Console.WriteLine("async delegate argument ownership ok");
+    }
+}

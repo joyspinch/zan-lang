@@ -1,0 +1,192 @@
+using System;
+using System.Collections.Generic;
+
+// Property and temporary receivers must release on normal and exceptional removal.
+class RemoveAtPayload { public int Value; }
+class RemoveAtWatch {
+    public weak RemoveAtPayload Removed;
+    public weak RemoveAtPayload Remaining;
+    public weak RemoveAtHistory History;
+    public int Calls;
+    public int IndexCalls;
+}
+class RemoveAtHistory {
+    public List<RemoveAtPayload> Undo = new List<RemoveAtPayload>();
+    public List<RemoveAtPayload> Redo = new List<RemoveAtPayload>();
+}
+class RemoveAtOwner {
+    public RemoveAtHistory State = new RemoveAtHistory();
+    public int Gets;
+    public List<RemoveAtPayload> Undo {
+        get { Gets = Gets + 1; return State.Undo; }
+    }
+    public List<RemoveAtPayload> Redo {
+        get { Gets = Gets + 1; return State.Redo; }
+    }
+}
+class RemoveAtReceiverTest {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+    static void Seed(RemoveAtHistory history, RemoveAtWatch watch) {
+        RemoveAtPayload removed = new RemoveAtPayload();
+        RemoveAtPayload remaining = new RemoveAtPayload();
+        removed.Value = 11;
+        remaining.Value = 29;
+        watch.Removed = removed;
+        watch.Remaining = remaining;
+        watch.History = history;
+        history.Undo.Add(removed);
+        history.Undo.Add(remaining);
+    }
+    static void PropertyHistory(RemoveAtWatch watch) {
+        RemoveAtOwner owner = new RemoveAtOwner();
+        Seed(owner.State, watch);
+        owner.Undo.RemoveAt(0);
+        Check(owner.Gets == 1, "RemoveAt evaluates property receiver once");
+        Check(watch.Removed == null, "removed element released immediately");
+        Check(owner.State.Undo.Count == 1 && owner.State.Undo[0].Value == 29,
+            "remaining history element preserved");
+        // Transfer the remaining payload through both forwarding properties.
+        owner.Redo.Add(owner.Undo[0]);
+        owner.Undo.RemoveAt(0);
+        owner.Undo.Add(owner.Redo[0]);
+        owner.Redo.RemoveAt(0);
+        Check(owner.State.Undo.Count == 1 && owner.State.Redo.Count == 0,
+            "undo redo transfer remains reversible");
+        Check(watch.Remaining != null, "history retains remaining payload");
+    }
+    static void BorrowedHistory(RemoveAtWatch watch) {
+        RemoveAtHistory history = new RemoveAtHistory();
+        Seed(history, watch);
+        history.Undo.RemoveAt(0);
+        Check(watch.Removed == null, "borrowed field removal releases element");
+        List<RemoveAtPayload> local = history.Undo;
+        local.Add(new RemoveAtPayload());
+        local.RemoveAt(1);
+        Check(local.Count == 1 && local[0].Value == 29,
+            "borrowed local receiver remains alive");
+    }
+    static List<RemoveAtPayload> FreshReceiver(RemoveAtWatch watch) {
+        watch.Calls = watch.Calls + 1;
+        RemoveAtHistory history = new RemoveAtHistory();
+        Seed(history, watch);
+        return history.Undo;
+    }
+    static int ZeroIndex(RemoveAtWatch watch) {
+        watch.IndexCalls = watch.IndexCalls + 1;
+        Check(watch.Calls == 1 && watch.History == null
+            && watch.Removed != null && watch.Remaining != null,
+            "call result owns list before index evaluation");
+        return 0;
+    }
+    static int ThrowIndex(RemoveAtWatch watch) {
+        watch.IndexCalls = watch.IndexCalls + 1;
+        throw new Exception("index failure");
+    }
+    static void CallResultHistory() {
+        RemoveAtWatch watch = new RemoveAtWatch();
+        FreshReceiver(watch).RemoveAt(ZeroIndex(watch));
+        Check(watch.Calls == 1 && watch.IndexCalls == 1,
+            "call-result receiver and index each evaluated once");
+        Check(watch.History == null && watch.Removed == null && watch.Remaining == null,
+            "normal call-result removal releases list and remaining element");
+    }
+    static void FreshFailure(int mode) {
+        RemoveAtWatch watch = new RemoveAtWatch();
+        bool caught = false;
+        if (mode == 0) {
+            try { FreshReceiver(watch).RemoveAt(ThrowIndex(watch)); }
+            catch (Exception failure) { caught = true; }
+        } else if (mode == 1) {
+            try { FreshReceiver(watch).RemoveAt(0 - 1); }
+            catch (IndexOutOfRangeException failure) { caught = true; }
+        } else {
+            // FreshReceiver always returns a two-element list: 2 is Count.
+            try { FreshReceiver(watch).RemoveAt(2); }
+            catch (IndexOutOfRangeException failure) { caught = true; }
+        }
+        Check(caught && watch.Calls == 1 && watch.IndexCalls == (mode == 0 ? 1 : 0),
+            "fresh receiver exception caught after one evaluation");
+        Check(watch.History == null && watch.Removed == null && watch.Remaining == null,
+            "EH releases sole list owner and both payloads before catch returns");
+    }
+    static void PropertyFailures(RemoveAtWatch watch) {
+        RemoveAtOwner owner = new RemoveAtOwner();
+        Seed(owner.State, watch);
+        bool caught = false;
+        try { owner.Undo.RemoveAt(ThrowIndex(watch)); }
+        catch (Exception failure) { caught = true; }
+        Check(caught && owner.Gets == 1 && watch.IndexCalls == 1,
+            "throwing index evaluates getter once");
+        caught = false;
+        try { owner.Undo.RemoveAt(0 - 1); }
+        catch (IndexOutOfRangeException failure) { caught = true; }
+        Check(caught && owner.Gets == 2, "negative bounds evaluates getter once");
+        caught = false;
+        try { owner.Undo.RemoveAt(owner.State.Undo.Count); }
+        catch (IndexOutOfRangeException failure) { caught = true; }
+        Check(caught && owner.Gets == 3, "Count bounds evaluates getter once");
+        Check(owner.State.Undo.Count == 2 && owner.State.Undo[0].Value == 11
+            && owner.State.Undo[1].Value == 29
+            && watch.Removed != null && watch.Remaining != null,
+            "failed removals preserve borrowed owner list and payloads");
+    }
+    static int ExpandingIndex(RemoveAtOwner owner, RemoveAtWatch watch) {
+        watch.IndexCalls = watch.IndexCalls + 1;
+        Check(owner.Gets == 1, "getter runs before expanding index");
+        // Grow far beyond the fresh list's initial capacity, forcing reallocation.
+        for (int i = 0; i < 256; i = i + 1) {
+            owner.State.Undo.Add(new RemoveAtPayload());
+        }
+        return 0;
+    }
+    static int ClearingIndex(RemoveAtOwner owner, RemoveAtWatch watch) {
+        watch.IndexCalls = watch.IndexCalls + 1;
+        Check(owner.Gets == 2, "getter runs before clearing index");
+        owner.State.Undo.Clear();
+        return 0;
+    }
+    static void MutatingIndex(RemoveAtWatch watch) {
+        RemoveAtOwner owner = new RemoveAtOwner();
+        Seed(owner.State, watch);
+        owner.Undo.RemoveAt(ExpandingIndex(owner, watch));
+        Check(owner.Gets == 1 && watch.IndexCalls == 1
+            && owner.State.Undo.Count == 257 && owner.State.Undo[0].Value == 29
+            && owner.State.Undo[256].Value == 0 && watch.Removed == null
+            && watch.Remaining != null,
+            "RemoveAt uses buffer and count after index expands receiver");
+        bool caught = false;
+        try { owner.Undo.RemoveAt(ClearingIndex(owner, watch)); }
+        catch (IndexOutOfRangeException failure) { caught = true; }
+        Check(caught && owner.Gets == 2 && watch.IndexCalls == 2
+            && owner.State.Undo.Count == 0
+            && watch.Removed == null && watch.Remaining == null,
+            "RemoveAt checks current empty count after index clears receiver");
+        owner.State.Undo.Add(new RemoveAtPayload());
+        Check(owner.State.Undo.Count == 1, "receiver remains usable after caught clear-index failure");
+    }
+    static void Main() {
+        RemoveAtWatch property = new RemoveAtWatch();
+        PropertyHistory(property);
+        Check(property.History == null, "property history owner released");
+        Check(property.Remaining == null, "property history lists released");
+        RemoveAtWatch borrowed = new RemoveAtWatch();
+        BorrowedHistory(borrowed);
+        Check(borrowed.History == null && borrowed.Remaining == null,
+            "borrowed history released after scope");
+        CallResultHistory();
+        FreshFailure(0);
+        FreshFailure(1);
+        FreshFailure(2);
+        RemoveAtWatch failed = new RemoveAtWatch();
+        PropertyFailures(failed);
+        Check(failed.History == null && failed.Removed == null && failed.Remaining == null,
+            "getter exceptions release temporary receiver references");
+        RemoveAtWatch mutated = new RemoveAtWatch();
+        MutatingIndex(mutated);
+        Check(mutated.History == null && mutated.Removed == null && mutated.Remaining == null,
+            "mutating index releases temporary receivers after normal and caught paths");
+        Console.WriteLine("LIST_REMOVEAT_OWNED_RECEIVER_OK");
+    }
+}
