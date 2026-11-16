@@ -383,7 +383,24 @@ public delegate TResult Func<T, TResult>(T arg);
 `_scratch/csaudit/objectmodel/p06_for_capture.zan` 的 plain:9）。`for` 头
 声明的循环变量**每次迭代新建**（各迭代闭包各拿各的）；`foreach` 迭代变量
 同样每迭代新建，与 C# 5+ 一致。runtime 若要把委托留存到下一次调用之后，必须
-retain（见 `docs/ABI.md` §3.6）。
+retain。实例方法组同样强持有接收者；将
+`this.Method`（或裸实例方法名）存回自身直接或间接持有的委托字段会形成强环，
+应在生命周期结束时解除订阅或清空委托。W2009 会警告直接回挂，返回当前实例的
+方法组或捕获 `this` 的闭包会触发 W2072；宿主与自举同形同数，
+`--deny-warnings` 下两者都拒绝编译。这些警告不替代对任意对象图的生命周期管理。
+宿主与自举的方法组转换均按目标委托的签名与接收者形态选择候选，各自的检查与
+发码共用决议：类型接收者选择 static 方法，显式对象接收者选择实例方法；无兼容
+候选或存在歧义时拒绝转换（E2098）。同名 static/instance 混合重载与 `this.Method`
+遵守同一规则。目标类型传播到委托字段与对象初始化器、三元表达式的两臂；外层
+重载探测不提交方法组绑定，胜出后才传播目标。
+闭合泛型类上的普通方法组按具体类型实例发码，虚方法保留动态分派；方法自身带
+类型参数的转换仍不支持。目标委托含 `ref` / `out` 参数的方法组转换当前拒绝
+（E2098），不会按值参数接受。
+
+lambda 不得捕获方法或构造器的 `ref` / `out` 形参（E3043），同步与异步路径
+遵守同一限制。普通局部变量即使在调用处被用作 `out` 实参，仍按上述共享单元
+规则捕获；需要在回调中累计结果时，先累计到普通局部，再在回调完成后写回
+`out` 形参。
 
 ### 4.8 Access Control
 
@@ -544,7 +561,8 @@ try {
 throw new ArgumentException("invalid value");
 ```
 
-`Console.Error` 不存在——错误输出用 `Console.WriteLine`。
+`Console.Error` 不存在；向标准错误流输出一行文本用
+`Console.ErrorWriteLine(string)`，普通标准输出用 `Console.WriteLine`。
 
 ---
 
@@ -664,7 +682,7 @@ delegate int CompareFunc(nint a, nint b);
 
 ### 7.5 Marshal（值类型 ↔ 原生内存）
 
-`System.Marshal`（`stdlib/System/Marshal.zan`）+ 语言原语 `sizeof(T)`：
+`System.Marshal`（`stdlib/System/Interop/Marshal.zan`）+ 语言原语 `sizeof(T)`：
 值类型与离堆原生内存的互操作面。指针是普通 `nint`，不进 ARC，缓冲区的
 分配/释放配对由调用方负责（`NativeMemory.Alloc` / `Free`）。
 

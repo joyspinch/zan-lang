@@ -332,28 +332,30 @@ checkout` / `git restore` / `git reset --hard` 抹掉报错、拿旧版本文件
    `Render(App …)`、新增 App 输入仲裁调用（ClaimClick、BlockHitsRect…）、设计器文档以外的 html 新增
    `data-dock/fx/fy/fw/fh/span`、Zan.Gui 以外新建 `Signal*`。修掉违规后对改动文件运行
    `python scripts/gui_layer_rules.py --update <文件…>` 锁定收紧（`git mv` 时新旧路径都传）；基线总数上升会被拦截，确属必要时设置
-   `ZAN_GUI_BASELINE_RAISE=1` 并在提交说明写明理由。全树核对：`--report`。依据见 `docs/GUI_ARCHITECTURE.md`。
+   `ZAN_GUI_BASELINE_RAISE=1` 并在提交说明写明理由。全树核对：`--report`。规则与迁移边界见 `TASKS.md` 的 B-ID171～179。
    暂存了 Zan.Gui 源码时要扫一遍 Gui 家族声明建类型表，这类提交的机检约 1 秒。
 
 ---
 
-## 附录：docs 文档维护规则（原 DOCS_MAINTENANCE.md，2026-09-26 并入）
+## 附录：docs 文档维护规则（原 DOCS_MAINTENANCE.md，2026-09-26 并入；2026-11-16 按极简口径重写）
 
-本节定义 `docs/` 下所有文档的维护约定。目标是让每份文档的**可信度一眼可判**，
-并防止"文档与实现漂移"再次发生（历史问题见 `TASKS.md` 的 C 组）。
+`docs/` **只放语法与开发规范**，共七份：`README.md`（索引）、`SPEC.md` / `SPEC.zh-CN.md`
+（语言规范）、`WORKSPACE_CONVENTIONS.md`（本文件）、`BUILD_TOOLCHAIN.md`、`ZANC_CLI.md`、
+`STDLIB.md`。目标是让上下文不被历史材料污染——**不新增第八份**，需要写的东西先问
+"它属于这七份里的哪一份"。2026-11-16 清理掉了 64 份计划/台账/验收/审计/归档文档，
+它们是"文档与实现漂移"的主要来源（历史问题见 `TASKS.md` 的 C 组）。
 
-### 1. 分层：当前实现 / 目标设计 / 历史记录
+### 1. 分层：当前实现 / 目标设计
 
-每份文档（或文档内每个小节）必须能被归入以下三层之一，并在显要位置标明：
+每份文档（或文档内每个小节）必须能被归入以下两层之一，并在显要位置标明：
 
 - **当前实现（current implementation）**——描述代码此刻的真实行为。**以实现和 C# 为准**，
   不以旧文档为准（见 §3）。写明核实来源（源文件路径 / 测试 / 探针）与核实日期。
 - **目标设计（target design）**——描述尚未落地的意图。**必须写明它依赖哪个能力项**
   （`TASKS.md` 里的 A 编号），并注明"该能力落地前本节不为真"。
-- **历史记录（history / archive）**——已过时、仅作参考。移入 `docs/archive/`，
-  顶部加归档说明（日期 + 指向当前来源）。**不要用"本文已过时"横幅代替归档或重写。**
 
-一份文档可以同时含前两层，但要分节标清，例如 `docs/ABI.md` 的 §1.1「Document status」。
+一份文档可以同时含两层，但要分节标清。**不设"历史记录"层**：过时的内容就地删掉或
+按实现重写，不再建设归档目录——归档目录只会成为下一轮上下文污染。
 
 ### 2. 目标设计随能力落地同步更新
 
@@ -368,30 +370,24 @@ checkout` / `git restore` / `git reset --hard` 抹掉报错、拿旧版本文件
 - 反向检查：文档里记录的、偏离 C# 习惯的设计，优先提出按 C# 靠拢（在 `TASKS.md` 立项），
   而不是把偏差固化进文档。
 
-### 4. bug 文档状态字段（C6）
+### 4. bug 与计划记在哪
 
-`docs/archive/bugs/*.md` 每份在标题下第一行给出统一状态字段：
-
-```
-**Status:** Fixed (YYYY-MM-DD) — <task ref>；see Resolution / TASKS.md <编号>.
-```
-
-或 `**Status:** Open — <blocker>`。读者不必读全文即可判断该 bug 是否仍然有效。
+进度、缺陷归因、验收边界**不进 `docs/`**：未完成的进 `TASKS.md` 的 B 编号，
+已修完的进提交说明与对应回归用例（`tests/`）。文档里只保留"怎么用/怎么写"这类
+长期有效的规范，不保留"某轮验了什么"这类时点记录。
 
 ### 5. 位置与索引
 
-- `docs/README.md` 是全部文档的索引（分区分层 + 一句话说明）。
-- 语言/编译器/标准库等**现行**文档放 `docs/` 根目录。时点报告、被推翻的设计、
-  已全部落地的计划不是现行文档——移入 `docs/archive/`，顶部加归档说明
-  （日期 + 指向现行来源）。
-- 项目专属文档：`docs/projects/<project>/`。
-- 历史/过时文档：`docs/archive/`，冻结不再随实现更新。
+- `docs/README.md` 是这七份文档的索引（一句话说明 + 何时读它）。
+- 语言/编译器/标准库等**现行**规范放 `docs/` 根目录，不建子目录。
 
-### 6. 移动/归档必须同步引用
+### 6. 移动/删除必须同步引用
 
 根目录文档被源码注释、脚本、skills 按路径锚定（`publish_ide.ps1` 有固定发布
 清单，skills 有三份副本：`.agents/skills/` → `tools/ai_pack/skills/` →
-`C:\Users\<user>\.agents\skills\`）。移动或归档文档时，同一次提交里：
+`C:\Users\<user>\.agents\skills\`）。移动或删除文档时，同一次提交里：
 
-1. 全仓库 grep 旧路径，逐处改指新位置（含 skills 三副本）；
-2. 更新 `docs/README.md` 索引。
+1. 全仓库 grep 旧路径，逐处改指新位置或删掉死链（含 skills 三副本）；
+2. 更新 `docs/README.md` 索引；
+3. `python scripts/check_doc_refs.py --all` 必须清零（它把所有 `docs/*.md`
+   与 `.zan`/`.c`/`.h` 注释里的仓库路径当死链查）。

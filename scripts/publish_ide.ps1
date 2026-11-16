@@ -1,4 +1,4 @@
-﻿# publish_ide.ps1 -- Assemble a self-contained, redistributable Zan IDE into
+# publish_ide.ps1 -- Assemble a self-contained, redistributable Zan IDE into
 # the per-platform release directory  dist\win-x64  (other platforms get their
 # own dist\<platform> when their builds exist, e.g. dist\linux-x64).
 #
@@ -129,7 +129,6 @@ Add-SdkCopy (Join-Path $aiPack 'docs\AI_README.md') 'AI_README.md'
 foreach ($name in @('AI_ONBOARDING.md', 'ai-assist.md', 'MCP_HOSTING.md', 'AI_DEV_INFRASTRUCTURE.md')) {
     Add-SdkCopy (Join-Path (Join-Path $aiPack 'docs') $name) "docs/$name"
 }
-Add-SdkCopy (Join-Path $root 'docs\TOOLING.md') 'docs/TOOLING.md'
 $toolPlan = Get-Content -LiteralPath $toolInputs -Raw | ConvertFrom-Json
 $plan = @{ repo = $root; toolchain = @($toolPlan | ForEach-Object { $_ }); copies = @($copies.ToArray()) }
 ConvertTo-Json -InputObject $plan -Depth 8 | Set-Content -LiteralPath $planFile -Encoding UTF8
@@ -316,7 +315,7 @@ Zan IDE 自包含发布包
                  知识库、技能、文档路径一览，没接 MCP 也能读。
   AI_README.md   怎么让 AI 用这个 SDK（中文）：接入方式、MCP 工具目录、技能、
                  知识库、常见问题。接 AI 工具前先读它。
-  docs\          AI_ONBOARDING.md（AI 接入完整指南）、TOOLING.md、ai-assist.md、
+  docs\          AI_ONBOARDING.md（AI 接入完整指南）、ai-assist.md、
                  MCP_HOSTING.md、AI_DEV_INFRASTRUCTURE.md。
 
 AI 编程工具（Claude Code / Cursor / Copilot / Windsurf）

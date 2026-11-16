@@ -40,7 +40,7 @@ Game.Arcade2D  -+ (2D碰撞/实体池/补间/几何流形)
 
 IDE 原 17 条旧 API 错误已清除，Scaffold 两处问题已修；2026-11-12 完整 IDE 编译链接实际通过，exit 0，输出 `IDE_BUILD_OK build\ZanIDE.exe`（`IDE_NO_PUBLISH=1`；日志 `call_89c0e4b0d90b4693b5b9147e8c2947be-stdout.log`）。不含发布或实机交互验证，已知 LSP/Form 闭包警告仍保留。上述 12 个正式目标与完整 IDE 编译链接通过不代表全架构迁移完成。上轮 9 条正式 ctest 与 `game/match3`、`gui/gui-empty`、`gui/gui-html-responsive`、`gui/gui-hud-anchor`、`gui/gui-scene-router` 五个模板编译通过的记录保留，独立于本轮验证。
 
-元素调色板、图层/资源/上下文菜单、画布及 IDE 更广范围的迁移仍属遗留路径，尚未完成。架构进度及两轮验证边界见 [GUI_ARCHITECTURE.md](../../docs/GUI_ARCHITECTURE.md)。
+元素调色板、图层/资源/上下文菜单、画布及 IDE 更广范围的迁移仍属遗留路径，尚未完成。架构进度与迁移边界见 `TASKS.md` 的 B-ID171～179。
 
 ## 各子模块文档入口
 

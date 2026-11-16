@@ -1,14 +1,10 @@
 # zanc 命令全解 —— 编译 · 发布 · 测试权威参考
 
-<p align="left">
-  <b>简体中文</b> | <a href="ZANC_CLI.en.md">English</a>
-</p>
-
 一份把 zanc 的命令面说全的文档：全部参数、全部交叉目标、全部环境变量、
 各场景的标准配方（可直接复制）、以及反复踩过的坑。会话里"命令搞不清"
 时先查这里；本文与 `zanc --help` / `--list-targets` 同步维护，改了参数
 解析（`src/compiler/main_options_parse.c`）或帮助文本
-（`src/compiler/main_options.c`）必须同提交更新本文。
+（`src/compiler/main_options_parse.c`）必须同提交更新本文。
 
 --------------------------------------------------------------------------------
 
@@ -88,7 +84,7 @@ build/zanc src/main.zan --auto-stdlib --target ios-arm64 --emit-ipa app.ipa \
 ### 1.4 库与工具通道
 
 ```bash
-build/zanc src/lib.zan --auto-stdlib --emit-lib -o foo.dll   # 共享库（.so/.dylib 同理）
+build/zanc src/lib.zan --auto-stdlib --emit-lib -o foo.dll   # 共享库（.so/.dylib 同理；src/lib.zan 指你自己的源码）
 build/zanc --emit-symbols index.json src/...                 # 类型/成员索引（IDE 补全）后退出
 build/zanc --gen-meta meta.json src/...                      # 编译单元元数据 JSON 后退出
 ```
@@ -242,7 +238,9 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--package-install <dir>` | — | 本地包安装；必须配 `--package-name`（内部/未稳定） |
 | `--package-name <name>` | — | 安装包名（内部/未稳定） |
 | `--package-scope <project\|global>` | `project` | 安装作用域（内部/未稳定） |
-| `--package-project <dir>` | `.` | 包发现/项目级安装的工程根（内部/未稳定） |
+| `--package-project <dir>` | `.` | 包发现/项目级安装的工程根（内部/未稳定）；不改变默认业务资源的归属 |
+
+默认 `assets/` 归第一个用户输入所属工程：从入口目录向上找到最近的 `zan.proj`，遇到 SDK 的 `packages/` 边界即停止；没有工程清单时只取入口同目录的 `assets/`。自动引入的包源码目录和包搜索根不作为业务资源候选，因此包内 `Game/Assets/*.zan` 或 SDK 根目录的图片不会自动混入应用。需要其他目录时显式使用 `--embed <目录>=assets`；显式 `assets` 别名优先，包清单声明的资源和 Gui 皮肤仍按各自契约内嵌。
 
 ## 3. 交叉编译目标（--list-targets）
 
@@ -285,7 +283,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `ZAN_CO_QUANTUM_MS` | 协程协作式抢占的时间片（毫秒，默认 2，0=关闭）：编译器在 async 函数的每个循环回边埋 `zan_co_poll`，超片的计算密集帧自动重排到队尾，不再饿死定时器/IO 回调/兄弟协程；片长记账走微秒级单调钟（Windows QPC，POSIX CLOCK_MONOTONIC），2ms 就是真 2ms |
 | `ZAN_CO_STACK` | Task.Spawn/Run 有栈 fiber 的栈大小（默认 128KB，范围 64KB~16MB） |
 | `ZAN_GUI_ICONS` | 覆盖图标包目录（发现序：env → exe 旁 icons/ → 内嵌 → stdlib） |
-| `ZAN_CEF_*` | CEF 浏览器驱动运行时定位（examples/gui_cef_browser/README.md 全表：RUNTIME/CACHE/MIRROR/LOG/SWITCHES/HELPER* 等一族） |
+| `ZAN_CEF_*` | CEF 浏览器驱动运行时定位（RUNTIME/CACHE/MIRROR/LOG/SWITCHES/HELPER* 等一族） |
 
 ## 5. 测试命令（本仓库纪律的命令面）
 
@@ -321,7 +319,7 @@ stamp，并发构建会让无关用例成批假红）。
 模板不是"直接编模板树"，而是脚手架后编译：
 1. 复制模板树到 build/templates_build/<tpl>/，文本文件内容替换 `{{NAME}}`
    → `TplProbe`；
-2. gui 模板把 `src/App.zan`/`src/App.html` 改名为 `src/TplProbe.zan/.html`；
+2. gui 模板把 `src/App.zan`/`src/App.html` 改名为同名的 `TplProbe.zan` / `TplProbe.html`；
 3. 编译命令 = **设计稿 html 在第一个参数** + 全部 src/**/*.zan（排序）+
    `--stdlib-path stdlib` + `--subsystem windows` + `--driver-dir <新编 zan_gui 目录>`。
 
@@ -365,6 +363,6 @@ stamp，并发构建会让无关用例成批假红）。
 
 改参数解析（`src/compiler/main_options_parse.c`）或加新参数 → 同提交更新
 本文 §2/§3/§4 与 `zanc --help` 文案（help 在
-`src/compiler/main_options.c` 的 `print_usage()`）。分组顺序固定为
+`src/compiler/main_options_parse.c` 的 `print_usage()`）。分组顺序固定为
 常用 / 发布 / 调试 / 打包 / 内部（未稳定），两侧条目必须一一对应。本文与
 help 冲突时以代码解析与 `zanc --help` 为准并修本文。

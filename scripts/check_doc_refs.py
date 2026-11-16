@@ -24,7 +24,6 @@ EXCLUDE_DIRS = {
     "_scratch",
     "node_modules",
     ".zan-packages",
-    os.path.join("docs", "archive"),
     os.path.join("src", "runtime", "libwebp"),
     os.path.join("src", "runtime", "nanosvg"),
 }
@@ -32,7 +31,7 @@ EXCLUDE_DIRS = {
 # Generic placeholders / protocols / upstream sources often cited in comments
 IGNORED_TOKENS = {
     "tools/call", "tools/list", "src/alt", "src/buf", "src/dstAngle",
-    "stdlib/X/Y", "src/main.zan", "src/App.zan", "src/App.html", "src/MainWindow.html",
+    "stdlib/X/Y", "src/main.zan", "src/lib.zan", "src/App.zan", "src/App.html", "src/MainWindow.html",
     "src/Order.zan", "src/Slots.zan", "src/TableUi.zan", "src/controller", "src/model",
     "src/Controller", "src/Model", "src/Dao", "src/Feature", "src/Framework",
 }
@@ -146,15 +145,13 @@ def main():
                     if f.endswith('.zan'):
                         target_files.append(os.path.join(root, f))
         
-        # Add core root docs
-        core_docs = [
-            os.path.join(REPO_ROOT, "docs", "STDLIB.md"),
-            os.path.join(REPO_ROOT, "docs", "WORKSPACE_CONVENTIONS.md"),
-            os.path.join(REPO_ROOT, "docs", "agent-kb", "project-map.md"),
-        ]
-        for cd in core_docs:
-            if os.path.isfile(cd):
-                target_files.append(cd)
+        # Add every surviving doc under docs/ (top level only; docs/archive
+        # is excluded above when it still exists)
+        docs_dir = os.path.join(REPO_ROOT, "docs")
+        if os.path.isdir(docs_dir):
+            for name in sorted(os.listdir(docs_dir)):
+                if name.endswith('.md'):
+                    target_files.append(os.path.join(docs_dir, name))
 
     violations = []
     for fp in target_files:

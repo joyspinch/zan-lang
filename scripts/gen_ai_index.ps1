@@ -113,7 +113,7 @@ if (Test-Path $skillsDir) {
 
 # ---- docs -------------------------------------------------------------------
 $docLines = @()
-foreach ($d in @('AI_ONBOARDING.md', 'TOOLING.md', 'ai-assist.md', 'MCP_HOSTING.md', 'AI_DEV_INFRASTRUCTURE.md')) {
+foreach ($d in @('AI_ONBOARDING.md', 'ai-assist.md', 'MCP_HOSTING.md', 'AI_DEV_INFRASTRUCTURE.md')) {
     if (Test-Staged "docs/$d") { $docLines += "docs/$d" }
 }
 if ($docLines.Count -gt 0) {

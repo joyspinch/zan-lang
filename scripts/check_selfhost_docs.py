@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """Self-host documentation closure check (B-ID189).
 
-Three drift classes this guards against:
+Two drift classes this guards against:
 
   1. a source listed in scripts/selfhost_sources.txt that no longer exists
      (the canonical list rotting);
   2. a .zan file under src/selfhost/ that is NOT in the canonical list --
      the exact way the fixed point rotted unnoticed once (a source added to
      the tree but missing from the closure silently dropped out of gen1,
-     gen2 and the fixed-point assertion);
-  3. docs/agent-kb/bootstrap.md's architecture table naming files that do
-     not exist (the table once listed jsongen/dbgen/attrgen.zan, none of
-     which are in the tree).
+     gen2 and the fixed-point assertion).
 
-Run it after touching src/selfhost/, scripts/selfhost_sources.txt or
-docs/agent-kb/bootstrap.md. Exit 0 = clean, 1 = findings above.
+Run it after touching src/selfhost/ or scripts/selfhost_sources.txt.
+Exit 0 = clean, 1 = findings above.
 """
 import os
 import re
@@ -23,7 +20,6 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_LIST = os.path.join(ROOT, "scripts", "selfhost_sources.txt")
 SELFHOST_DIR = os.path.join(ROOT, "src", "selfhost")
-BOOTSTRAP_MD = os.path.join(ROOT, "docs", "agent-kb", "bootstrap.md")
 
 findings = []
 
@@ -54,24 +50,7 @@ for path in sorted(on_disk - listed):
         "on disk but not in scripts/selfhost_sources.txt: src/%s.zan "
         "(it silently drops out of gen1/gen2 and the fixed point)" % path)
 
-# ---- 3: bootstrap.md architecture table ----------------------------------
-with open(BOOTSTRAP_MD, "r", encoding="utf-8") as f:
-    md = f.read()
-for m in re.finditer(r'^\|\s*`([a-zA-Z0-9_/]+\.zan)`\s*\|', md, re.M):
-    name = m.group(1)
-    bare = os.path.basename(name)
-    found = False
-    for root_dir, _, files in os.walk(SELFHOST_DIR):
-        if bare in files:
-            found = True
-            break
-    if found:
-        continue
-    if os.path.isfile(os.path.join(ROOT, "src", name)):
-        continue
-    if os.path.isfile(os.path.join(ROOT, "src", "compiler", name)):
-        continue
-    findings.append("bootstrap.md table names a nonexistent file: %s" % name)
+# ---- 3: removed with the docs cleanup (bootstrap.md no longer exists) -----
 
 if findings:
     for x in findings:

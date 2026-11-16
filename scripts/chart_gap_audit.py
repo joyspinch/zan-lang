@@ -160,7 +160,7 @@ def main():
             for line in lost:
                 print('   ' + line)
         print('\nEither implement the key, or add it to the baseline with '
-              '--write-baseline and say why in docs/CHART_CODE_GAP_LEDGER.md.')
+              '--write-baseline and say why in the commit message.')
         return 1
 
     print('option files scanned      : %d' % n_files)

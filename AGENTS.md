@@ -56,6 +56,4 @@ git hooks（`core.hooksPath`，`cmake -B build` 自动配置）每次 commit/mer
 - 单程序：`build/zanc <file.zan> --auto-stdlib -o out.exe`（发布加 `--publish`）。
   全部旗标/交叉目标/测试配方见 [`docs/ZANC_CLI.md`](docs/ZANC_CLI.md)，
   改参数解析时同一提交更新它。
-- CEF 浏览器驱动默认关（configure 从 CDN 拉几百 MB）：`-DZAN_BUILD_CEF=ON`
-  （Win7/8.1 另加 `-DZAN_BUILD_CEF_LEGACY=ON`）；`ZAN_CEF_*` 环境变量见
-  `examples/gui_cef_browser/README.md`。
+

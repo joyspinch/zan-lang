@@ -4,8 +4,9 @@ The Zan GUI toolkit, extracted from the standard library. HTML + CSS and
 code-built retained controls share one Control tree, property and binding
 protocol, layout, and routed input. ModelBinder consumes model-path metadata
 from either authoring mode; code can also use typed `Binding<T>` fields.
-The target layering, current migration gaps, and verified results are in
-`docs/GUI_ARCHITECTURE.md` at the repository root.
+The layering rules are enforced by `scripts/gui_layer_rules.py` (shrink-only
+baseline in `scripts/gui_layers_baseline.json`); current migration gaps are
+tracked as B-ID171..179 in `TASKS.md`.
 
 Programs compile as-is once the package is visible to zanc (project
 `packages/`, `.zan-packages/`, or a toolchain-relative `packages/` store).

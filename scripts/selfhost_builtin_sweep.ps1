@@ -10,7 +10,7 @@
 #   anything else -> the probe itself is wrong (not a self-host gap)
 #
 # The probes are only compiled, never run: the argument values only have to
-# type-check. The result is the capability matrix in docs/selfhost-builtins.md.
+# type-check. The result is the capability matrix printed by -Out.
 #
 # Usage:
 #   scripts\selfhost_builtin_sweep.ps1 [-Gen1 <gen1.exe>] [-Out <report.txt>]

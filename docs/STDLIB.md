@@ -177,6 +177,7 @@ no `System/Console.zan` file. Its members are:
 static void WriteLine(object value);
 static void Write(object value);
 static void PrintLine(object value);    // alias of WriteLine (same lowering)
+static void ErrorWriteLine(string value); // writes a line to stderr
 
 // Input
 static string ReadLine();
@@ -192,7 +193,14 @@ static string Title;                    // get/set property (console window titl
 ```
 
 `ConsoleColor` comes from `stdlib/System/ConsoleColor.zan`. There is no
-`Error`, `SetCursorPosition` or `SetColor` member.
+`Error`, `SetCursorPosition` or `SetColor` member. Use
+`Console.ErrorWriteLine(string)` for stderr; `WriteLine` writes to stdout.
+
+The built-in `Dictionary<K,V>` (`Dict<K,V>`) exposes `Count`, `Keys` and
+`Values` as properties: write `map.Keys`, without parentheses. The standard
+library's `HashSet<T>` exposes `Keys()` as a method; it returns a snapshot in
+insertion order. These are distinct APIs, so do not substitute one spelling
+for the other.
 
 ### 3.2 System.Math
 
@@ -200,7 +208,17 @@ static string Title;                    // get/set property (console window titl
 
 ```csharp
 static double Abs(double value);
+static uint Max(uint a, uint b);
+static ulong Max(ulong a, ulong b);
+static nint Max(nint a, nint b);
+static int Max(int a, int b);
+static long Max(long a, long b);
 static double Max(double a, double b);
+static uint Min(uint a, uint b);
+static ulong Min(ulong a, ulong b);
+static nint Min(nint a, nint b);
+static int Min(int a, int b);
+static long Min(long a, long b);
 static double Min(double a, double b);
 static double Pow(double x, double y);
 static double Sqrt(double value);
@@ -216,6 +234,17 @@ static double Asin(double value);
 static double Acos(double value);
 ```
 
+`Min`/`Max` preserve integer results: `int` with `int` returns `int`, and
+`long` with `int` or `long` returns `long`, without a floating-point round trip.
+Small integer operands promote to `int`; unsigned-only operands involving
+`uint` or `ulong` return that unsigned type and compare without interpreting
+the high bit as a sign. Mixing `uint` with a signed integer returns `long`;
+mixing `ulong` with a signed integer requires an explicit conversion.
+`nint` with smaller signed integers returns `nint`. If either operand is
+`float` or `double`, both operands and the result use `double`; converting
+that result to an integer requires an explicit cast. Type inference and
+code generation use the same selection rules.
+
 There are no `PI`/`E` constants, no logarithms (`Log`/`Log2`/`Log10`), no
 `Clamp`, and no generic `Min`/`Max`. The trigonometry family is available, but
 `Math.PI` is **not** — use `System.Numerics.MathUtil.Pi` instead.
@@ -224,7 +253,7 @@ There are no `PI`/`E` constants, no logarithms (`Log`/`Log2`/`Log10`), no
 
 `System.Numerics` lives in `stdlib/System/Numerics/`. The geometry types are
 `float` (so they convert to/from the matrix types without precision loss);
-scalar and sampling helpers are `double` (the built-in `Math` is `double` too,
+scalar and sampling helpers are `double` (the built-in `Math` floating-point helpers use `double` too,
 and game-side math in this repository is `double`-dominant).
 
 | File | Type | What it gives you |
@@ -574,8 +603,7 @@ class Enumerable {
 }
 ```
 
-Differences from C# (by design or pending compiler work — see
-`docs/archive/bugs/generics-uniform-repr.md`):
+Differences from C# (by design or pending compiler work):
 
 - **Eager, not lazy**: every operator runs immediately and returns a `List`;
   there is no `IEnumerable<T>` pipeline.
@@ -596,7 +624,7 @@ Differences from C# (by design or pending compiler work — see
 
 `Task` is a compiler-builtin type (`src/compiler/builtin_api.c`, `members_task`),
 not a library class. A task handle is a `long`; an `async` method is lowered to
-a coroutine state machine (see `docs/ASYNC_CPS_DESIGN.md`).
+a coroutine state machine (CPS lowering in `src/compiler/irgen/`).
 
 | Form | Meaning |
 |------|---------|
@@ -675,7 +703,7 @@ The async I/O stack is implemented end to end and verified on Linux, macOS and
 Windows: one readiness/completion reactor (`src/runtime/rt_io.c`) with `epoll`
 (Linux), `kqueue` (macOS/BSD), `IOCP` (Windows) and `select` (fallback)
 backends; `Socket.*Async` / `AsyncSocket` / `TcpClient` / `TcpListener` /
-`UdpClient` suspend on it. Lowering details: `docs/ASYNC_CPS_DESIGN.md`.
+`UdpClient` suspend on it.
 
 ### 3.8 System.Configuration — 配置 provider 体系
 
@@ -740,6 +768,33 @@ typo in a config file into a zero.
 
 **Missing files.** A file provider throws `FileNotFoundException` when the
 file is missing unless it was added with `optional: true`.
+
+### 3.9 System.Diagnostics.Process
+
+`Process.CaptureSafe(exe, args)` starts the executable directly, combines stdout
+and stderr, and returns a `ProcessResult` with `exitCode` and `lines`. Arguments
+are passed as individual values without invoking a shell. The overload
+`CaptureSafe(exe, args, timeoutMs)` uses one monotonic deadline for launch,
+output reads, and waiting for exit. `timeoutMs <= 0`, including the default
+`-1`, means an infinite wait.
+
+On timeout, `exitCode` is `-1`. Captured output and bytes buffered at timeout
+are retained; the direct child is terminated and reaped. A descendant holding
+an inherited output pipe cannot extend a positive timeout. This API does not
+promise to terminate descendants. Termination and reaping after the deadline
+remain subject to OS permissions and scheduling; this is not a hard real-time
+guarantee, particularly for a privileged child that changes its user identity.
+A launch or capture failure also returns `exitCode = -1`.
+
+`Process.StartProgram(exe, logPath)` returns `0` when the OS accepts the launch
+and `-1` when startup fails. On POSIX, this includes failures in redirection,
+forking, session setup, and `exec`; a successfully launched executable that
+later exits with code `127` is still a successful launch. A nonempty `logPath`
+redirects stdout and stderr to that file. The return value describes startup,
+not the program's eventual exit status.
+
+`Process.Spawn` currently provides live stdin/stdout pipes on Windows; the
+POSIX implementation returns `null`.
 
 ## 4. Module Resolution Rules
 

@@ -3,14 +3,15 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # ---- ZanIDE structure guard ------------------------------------------------
-# Enforces docs/projects/zanide/STRUCTURE.md so the project keeps its shape as
-# it grows: one .html design doc per visual unit with a same-named code-behind,
-# a fixed directory layering, no UI dependency inside services/models, and a
-# file-size ceiling with a shrink-only baseline for the files still being split
-# up.
+# Keeps the ZanIDE project in the documented shape as it grows: one .html design
+# doc per visual unit with a same-named code-behind, a fixed directory layering,
+# no UI dependency inside services/models, and a file-size ceiling with a
+# shrink-only baseline for the files still being split up. The layering rules
+# are stated in the header of src/ide_zan (see AGENTS.md directory map); the
+# ceiling baseline lives next to this script.
 
 $src        = Join-Path $root "src\ide_zan\src"
-$baselineFn = Join-Path $root "docs\projects\zanide\oversize.baseline.txt"
+$baselineFn = Join-Path $PSScriptRoot "zanide_oversize.baseline.txt"
 $maxLines   = 800
 $allowedDirs = @("shell", "panels", "editor", "dialogs", "pages", "services",
                  "models", "components", "views")
@@ -28,7 +29,7 @@ foreach ($f in Get-ChildItem $src -Recurse -Include *.html) {
 foreach ($d in Get-ChildItem $src -Directory) {
     if ($allowedDirs -notcontains $d.Name) {
         $errors += "undocumented folder: src\ide_zan\src\" + $d.Name +
-                   " (see docs\projects\zanide\STRUCTURE.md)"
+                   " (undocumented folder under src\ide_zan\src)"
     }
 }
 
@@ -109,7 +110,7 @@ Write-Output ("[oversize] " + $stillOver.Count + " baselined file(s) still to sp
 if ($gone.Count -gt 0) {
     Write-Output ("[oversize] " + $gone.Count +
         " baseline entr(y|ies) now under the limit - drop them from " +
-        "docs\projects\zanide\oversize.baseline.txt")
+        "scripts\zanide_oversize.baseline.txt")
 }
 if ($errors.Count -gt 0) {
     Write-Output ("STRUCTURE_FAILED " + $errors.Count)

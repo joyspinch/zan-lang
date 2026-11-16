@@ -46,6 +46,4 @@ Zan 现已完全对齐 C# ZanSql 的现代 ORM 架构与最佳实践，彻底淘
 ## 二、示范代码
 
 完整强类型实战范式请参考：
-- `examples/db/orm_model.zan`：ZanSql 链式查询、更新、增删与事务范例。
-- `examples/db/postgres_crud.zan`：PostgreSQL 引擎上的强类型 ZanSql 实践。
 - `tests/conformance/orm_zansql.zan`：全功能覆盖与回归测试。
