@@ -1,0 +1,113 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Tasks.Jobs;
+
+// 任务领取原子化 + 压实前重建契约：
+//   1) JobStorage.Claim：可执行校验与置 Processing 在存储锁内一次完成——
+//      领取成功返回记录（attempts+1、worker 归属、startAt=now），二次
+//      领取、未到期、未知 id 一律 null；
+//   2) 多 worker 防重：worker 领取执行后，第二个 worker 对同一条任务
+//      拿 null、不再执行；
+//   3) FileJobStorage.Claim 跨实例防重：领取前从文件重建 index，另一
+//      实例看到的是 Processing 态而不是陈旧的 Enqueued；
+//   4) FileJobStorage.Compact 折叠前重建 index：同路径另一实例追加的
+//      任务不再被压实抹掉（此前按陈旧内存 index 折叠，直接丢数据）。
+class Program {
+    static int Main() {
+        string dir = "_scratch/jobs_claim";
+        Directory.CreateDirectoryRecursive(dir);
+        long now = 1000000;
+
+        // 1) InMemory Claim 契约
+        InMemoryJobStorage mem = new InMemoryJobStorage();
+        JobRecord j1 = new JobRecord();
+        j1.id = "j1";
+        j1.name = "task.a";
+        j1.state = JobState.Enqueued;
+        mem.Append(j1);
+
+        JobRecord c1 = mem.Claim("j1", now, "w1");
+        if (c1 != null && c1.state == JobState.Processing
+            && c1.attempts == 1 && c1.worker == "w1" && c1.startAt == now) {
+            Console.WriteLine("mem_claim_first=ok");
+        } else {
+            Console.WriteLine("mem_claim_first=fail");
+        }
+        Console.WriteLine("mem_claim_again=" + (mem.Claim("j1", now, "w2") == null ? "ok" : "fail"));
+
+        JobRecord j2 = new JobRecord();
+        j2.id = "j2";
+        j2.name = "task.a";
+        j2.state = JobState.Scheduled;
+        j2.runAt = now + 500;
+        mem.Append(j2);
+        Console.WriteLine("mem_claim_early=" + (mem.Claim("j2", now, "w1") == null ? "ok" : "fail"));
+        Console.WriteLine("mem_claim_ontime=" + (mem.Claim("j2", now + 500, "w1") != null ? "ok" : "fail"));
+        Console.WriteLine("mem_claim_missing=" + (mem.Claim("nope", now, "w1") == null ? "ok" : "fail"));
+
+        // 2) 多 worker 防重
+        JobRegistry reg = new JobRegistry();
+        reg.Register("task.a", (args) => JobResult.Success());
+        InMemoryJobStorage shared = new InMemoryJobStorage();
+        JobWorker wa = new JobWorker(shared, reg, null);
+        wa.SetWorkerId("wA");
+        JobWorker wb = new JobWorker(shared, reg, null);
+        wb.SetWorkerId("wB");
+        JobRecord j3 = new JobRecord();
+        j3.id = "j3";
+        j3.name = "task.a";
+        shared.Append(j3);
+        JobRecord ra = wa.ProcessJob(shared.Find("j3"));
+        JobRecord rb = wb.ProcessJob(shared.Find("j3"));
+        JobRecord fin = shared.Find("j3");
+        if (ra != null && rb == null && fin != null
+            && fin.state == JobState.Succeeded && fin.attempts == 1) {
+            Console.WriteLine("worker_once=ok");
+        } else {
+            Console.WriteLine("worker_once=fail");
+        }
+
+        // 3) FileJobStorage.Claim 跨实例防重
+        string fpath = dir + "/claim.jsonl";
+        if (File.Exists(fpath)) { File.Delete(fpath); }
+        if (File.Exists(fpath + ".lock")) { File.Delete(fpath + ".lock"); }
+        FileJobStorage fa = new FileJobStorage(fpath);
+        JobRecord fj = new JobRecord();
+        fj.id = "fj";
+        fj.name = "task.a";
+        fa.Append(fj);
+        FileJobStorage fb = new FileJobStorage(fpath);
+        JobRecord fc = fa.Claim("fj", now, "wA");
+        JobRecord fd = fb.Claim("fj", now, "wB");
+        if (fc != null && fc.state == JobState.Processing && fc.worker == "wA" && fd == null) {
+            Console.WriteLine("file_claim_once=ok");
+        } else {
+            Console.WriteLine("file_claim_once=fail");
+        }
+
+        // 4) Compact 折叠前重建：另一实例追加的任务不被抹掉。
+        //    用第三个实例从文件重读锚定文件真实内容（内存 index 不作数）。
+        string cpath = dir + "/compact_keep.jsonl";
+        if (File.Exists(cpath)) { File.Delete(cpath); }
+        if (File.Exists(cpath + ".lock")) { File.Delete(cpath + ".lock"); }
+        if (File.Exists(cpath + ".tmp")) { File.Delete(cpath + ".tmp"); }
+        FileJobStorage sa = new FileJobStorage(cpath);
+        JobRecord k1 = new JobRecord();
+        k1.id = "k1";
+        k1.name = "task.a";
+        sa.Append(k1);
+        FileJobStorage sb = new FileJobStorage(cpath);
+        JobRecord k2 = new JobRecord();
+        k2.id = "k2";
+        k2.name = "task.a";
+        sa.Append(k2);
+        sb.Compact();
+        FileJobStorage sc = new FileJobStorage(cpath);
+        Console.WriteLine("compact_keep=" + (sc.Find("k2") != null ? "ok" : "fail"));
+        Console.WriteLine("compact_state=" + (sc.Find("k1") != null ? "ok" : "fail"));
+
+        Console.WriteLine("done");
+        return 0;
+    }
+}

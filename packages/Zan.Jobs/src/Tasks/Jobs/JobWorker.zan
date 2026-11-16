@@ -100,32 +100,21 @@ public class JobWorker {
 
     // 这条任务现在该不该被执行。
     static bool IsRunnable(JobRecord r, long now) {
-        if (r == null || r.cron != "") { return false; }
-        if (r.state != JobState.Enqueued && r.state != JobState.Failed
-            && r.state != JobState.Scheduled) {
-            return false;
-        }
-        if (r.runAt > now) { return false; }
-        return true;
+        if (r == null) { return false; }
+        return r.IsRunnableAt(now);
     }
 
     // 执行一个任务，返回写回存储后的终态记录。
     public JobRecord ProcessJob(JobRecord source) {
         if (source == null) { return null; }
-        // 乐观锁二次校验：确保当前存储中的最新状态仍为可执行状态，
-        // 杜绝多 worker 线程并发拉取快照时对同个任务产生重复执行。
-        JobRecord current = this.storage.Find(source.id);
         long now = DateTime.GetCurrentUnixMilliseconds();
-        if (current == null || !JobWorker.IsRunnable(current, now)) {
+        // 原子领取：可执行校验与置 Processing 在存储同一把锁内一次完成。
+        // 旧的 Find→校验→Append 三步跨锁，两个 worker 可同时通过校验
+        // 重复执行同一任务；Claim 收口后先到者领取，后到者拿 null。
+        JobRecord rec = this.storage.Claim(source.id, now, this.workerId);
+        if (rec == null) {
             return null;
         }
-        JobRecord rec = current.Copy();
-        rec.state = JobState.Processing;
-        rec.startAt = now;
-        rec.attempts = current.attempts + 1;
-        rec.worker = this.workerId;
-        rec.error = "";
-        this.storage.Append(rec);
 
         JobHandler handler = this.registry.Find(rec.name);
         if (handler == null) {
@@ -220,18 +209,12 @@ public class JobWorker {
     // 异步执行一个任务，返回写回存储后的终态记录。
     public async JobRecord ProcessJobAsync(JobRecord source) {
         if (source == null) { return null; }
-        JobRecord current = this.storage.Find(source.id);
         long now = DateTime.GetCurrentUnixMilliseconds();
-        if (current == null || !JobWorker.IsRunnable(current, now)) {
+        // 原子领取，同 ProcessJob：校验与置 Processing 在存储锁内一次完成。
+        JobRecord rec = this.storage.Claim(source.id, now, this.workerId);
+        if (rec == null) {
             return null;
         }
-        JobRecord rec = current.Copy();
-        rec.state = JobState.Processing;
-        rec.startAt = now;
-        rec.attempts = current.attempts + 1;
-        rec.worker = this.workerId;
-        rec.error = "";
-        this.storage.Append(rec);
 
         JobHandler handler = this.registry.Find(rec.name);
         if (handler == null) {

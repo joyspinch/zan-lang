@@ -38,6 +38,25 @@ public class JobStorage {
         return null;
     }
 
+    // 原子领取：若 id 对应任务当前可执行（JobRecord.IsRunnableAt），在存储
+    // 的同一把锁内置为 Processing（attempts+1、startAt=now、worker 归属、
+    // error 清空）并落库，返回领取后的记录；否则不动存储、返回 null。
+    // 默认实现由 Find + Append 拼成，两步跨锁，防不了多 worker 并发重复
+    // 领取；自带并发控制的内置实现（InMemory/File）覆写了本方法，校验与
+    // 置态在锁内一次完成。自定义实现若在意多 worker 并发，也应覆写。
+    public virtual JobRecord Claim(string id, long now, string workerId) {
+        JobRecord current = this.Find(id);
+        if (current == null || !current.IsRunnableAt(now)) { return null; }
+        JobRecord rec = current.Copy();
+        rec.state = JobState.Processing;
+        rec.startAt = now;
+        rec.attempts = current.attempts + 1;
+        rec.worker = workerId;
+        rec.error = "";
+        this.Append(rec);
+        return rec;
+    }
+
     // 过滤查询：name 为空表示不限名字；state < 0 表示不限状态；
     // limit <= 0 表示不限条数。
     public virtual List<JobRecord> Filter(string name, int state, int limit) {

@@ -57,4 +57,27 @@ public class InMemoryJobStorage : JobStorage {
             this.syncLock.ReleaseMutex();
         }
     }
+
+    // 原子领取：可执行校验与置 Processing 在实例锁内一次完成，多 worker
+    // 并发拉取不会重复执行同一任务。锁内直写 index——Append 会二次
+    // WaitOne 同一把不可重入锁，自死锁。
+    public override JobRecord Claim(string id, long now, string workerId) {
+        if (id == null) { return null; }
+        this.syncLock.WaitOne();
+        try {
+            JobRecord current = null;
+            if (!this.index.TryGetValue(id, out current)) { return null; }
+            if (!current.IsRunnableAt(now)) { return null; }
+            JobRecord rec = current.Copy();
+            rec.state = JobState.Processing;
+            rec.startAt = now;
+            rec.attempts = current.attempts + 1;
+            rec.worker = workerId;
+            rec.error = "";
+            this.index[rec.id] = rec;
+            return rec;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
+    }
 }

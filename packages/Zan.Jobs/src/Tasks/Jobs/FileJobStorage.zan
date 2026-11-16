@@ -47,20 +47,25 @@ public class FileJobStorage : JobStorage {
     public void Reload() {
         writeLock.WaitOne();
         try {
-            Dictionary<string, JobRecord> fresh = new Dictionary<string, JobRecord>();
-            if (File.Exists(this.path)) {
-                List<string> lines = File.ReadAllLines(this.path);
-                for (int i = 0; i < lines.Count; i++) {
-                    JobRecord r = JobRecord.FromJson(lines[i]);
-                    if (r == null) { continue; }
-                    if (r.id == null || r.id.Length == 0) { continue; }
-                    fresh[r.id] = r;
-                }
-            }
-            this.index = fresh;
+            this.ReloadInternal();
         } finally {
             writeLock.ReleaseMutex();
         }
+    }
+
+    // 须持 writeLock 调用：从文件重建内存 index。
+    void ReloadInternal() {
+        Dictionary<string, JobRecord> fresh = new Dictionary<string, JobRecord>();
+        if (File.Exists(this.path)) {
+            List<string> lines = File.ReadAllLines(this.path);
+            for (int i = 0; i < lines.Count; i++) {
+                JobRecord r = JobRecord.FromJson(lines[i]);
+                if (r == null) { continue; }
+                if (r.id == null || r.id.Length == 0) { continue; }
+                fresh[r.id] = r;
+            }
+        }
+        this.index = fresh;
     }
 
     public override void Append(JobRecord record) {
@@ -69,17 +74,49 @@ public class FileJobStorage : JobStorage {
         }
         writeLock.WaitOne();
         try {
-            long handle = File.TryLock(this.lockPath);
-            if (handle == 0) {
-                throw new JobException(JobError.StorageFailure, record.id,
-                    "storage is locked by another process: " + this.path);
-            }
-            try {
-                File.AppendAllText(this.path, record.ToJson() + "\n");
-            } finally {
-                File.Unlock(handle);
-            }
-            this.index[record.id] = record;
+            this.AppendInternal(record);
+        } finally {
+            writeLock.ReleaseMutex();
+        }
+    }
+
+    // 须持 writeLock 调用：跨进程文件锁内追加一行并更新内存 index。
+    void AppendInternal(JobRecord record) {
+        long handle = File.TryLock(this.lockPath);
+        if (handle == 0) {
+            throw new JobException(JobError.StorageFailure, record.id,
+                "storage is locked by another process: " + this.path);
+        }
+        try {
+            File.AppendAllText(this.path, record.ToJson() + "\n");
+        } finally {
+            File.Unlock(handle);
+        }
+        this.index[record.id] = record;
+    }
+
+    // 原子领取：可执行校验与置 Processing 在同一把进程内写锁内一次完成，
+    // 多 worker（含同进程多存储实例）并发拉取不会重复执行同一任务。
+    // 领取前从文件重建 index——内存 index 可能落后（同进程其它实例或
+    // 另一进程已追加/领取），用陈旧状态校验会重复领取或盖掉别人的变更；
+    // 领取是低频操作（一条任务一次），重建的 O(行数) 读可接受。
+    // 锁内直调 AppendInternal——Append 会二次 WaitOne 进程锁，自死锁。
+    public override JobRecord Claim(string id, long now, string workerId) {
+        if (id == null) { return null; }
+        writeLock.WaitOne();
+        try {
+            this.ReloadInternal();
+            JobRecord current = null;
+            if (!this.index.TryGetValue(id, out current)) { return null; }
+            if (!current.IsRunnableAt(now)) { return null; }
+            JobRecord rec = current.Copy();
+            rec.state = JobState.Processing;
+            rec.startAt = now;
+            rec.attempts = current.attempts + 1;
+            rec.worker = workerId;
+            rec.error = "";
+            this.AppendInternal(rec);
+            return rec;
         } finally {
             writeLock.ReleaseMutex();
         }
@@ -120,6 +157,8 @@ public class FileJobStorage : JobStorage {
 
     // 压实：把历史折叠成"每个 id 一行"，只保留当前状态。
     // 写临时文件再原子替换，避免中途崩溃把存储写坏。
+    // 折叠前从文件重建 index：内存 index 可能落后（同进程其它实例或另
+    // 一进程已追加新任务），直接折叠内存态会把新任务从文件里抹掉。
     public override void Compact() {
         writeLock.WaitOne();
         try {
@@ -129,6 +168,7 @@ public class FileJobStorage : JobStorage {
                     "storage is locked by another process: " + this.path);
             }
             try {
+                this.ReloadInternal();
                 StringBuilder sb = new StringBuilder();
                 List<JobRecord> all = this.SnapshotInternal();
                 for (int i = 0; i < all.Count; i++) {
