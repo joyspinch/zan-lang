@@ -6,6 +6,7 @@ using Messaging.Kafka;
 
 class Program {
     static const int PORT = 29092;
+    static const int DEAD_PORT = 29093;
     static int failures = 0;
 
     static void Check(bool cond, string name) {
@@ -180,7 +181,8 @@ class Program {
                     resp.WriteInt64(0L); // log_start_offset
                     resp.WriteInt32(0); // throttle_time_ms
                 } else if (apiKey == KafkaConstants.API_FETCH) {
-                    // Fetch API v4 Request 解析
+                    // Fetch API v5 Request 解析（分区带 log_start_offset，
+                    // 客户端此前标 v4 但按 v5 写——真实 broker 会错位解析）
                     int replicaId = r.ReadInt32();
                     int maxWait = r.ReadInt32();
                     int minBytes = r.ReadInt32();
@@ -191,8 +193,10 @@ class Program {
                     int partCount = r.ReadArrayHeader();
                     int partId = r.ReadInt32();
                     long fetchOff = r.ReadInt64();
+                    long logStartOff = r.ReadInt64();
+                    int partMaxBytes = r.ReadInt32();
 
-                    // Fetch API v4 Response
+                    // Fetch API v5 Response
                     resp.WriteInt32(0); // throttle_time_ms
                     resp.WriteArrayHeader(1); // topics count
                     resp.WriteString(top);
@@ -247,6 +251,19 @@ class Program {
                 Task.Spawn(Program.HandleMockClient(sock));
             }
         }
+    }
+
+    // 死连接 mock：accept 后稍候立即断开——锚定请求失败分支走 Shutdown
+    // （不销毁 ioLock），finally 释锁安全，连接标记断开，后续调用安全。
+    static async void RunDeadBroker() {
+        TcpListener l = new TcpListener("127.0.0.1", Program.DEAD_PORT);
+        l.Start();
+        nint sock = await l.AcceptAsync();
+        if (sock >= 0) {
+            await Task.Delay(50);
+            Socket.Close(sock);
+        }
+        l.Stop();
     }
 
     static async int Run() {
@@ -305,6 +322,21 @@ class Program {
         // 8. 验证 ListOffsets API (查询最新位点)
         long latestOffset = await consumer.GetOffsetAsync("orders.events", 0, -1L);
         Check(latestOffset == 43L, "latest offset queried 43");
+
+        // 8.5 死连接收尾：服务端 accept 后断开，请求失败分支走 Shutdown
+        // （旧实现此处分支调 Close 销毁持锁中的 ioLock，finally 释锁打在
+        // 已销毁句柄上直接崩）。
+        Task.Spawn(Program.RunDeadBroker());
+        await Task.Delay(100);
+        KafkaConnection dead = await KafkaConnection.ConnectAsync("127.0.0.1", Program.DEAD_PORT);
+        Check(dead != null, "dead broker connection established");
+        KafkaConsumer deadConsumer = new KafkaConsumer(dead);
+        List<KafkaRecord> deadPoll = await deadConsumer.PollAsync("orders.events", 0, 500);
+        Check(deadPoll != null && deadPoll.Count == 0, "poll on dead conn returns empty");
+        Check(!dead.IsConnected(), "dead conn marked disconnected");
+        List<KafkaRecord> deadPoll2 = await deadConsumer.PollAsync("orders.events", 0, 500);
+        Check(deadPoll2 != null && deadPoll2.Count == 0, "poll again on dead conn safe");
+        deadConsumer.Dispose();
 
         // 9. 资源释放与清理
         producer.Dispose();

@@ -76,7 +76,7 @@ public class KafkaConnection {
             byte[] rawPkt = pkt.ToBytes();
             int sent = await Socket.SendAsync(this.sock, rawPkt, rawPkt.Length);
             if (sent < rawPkt.Length) {
-                this.Close();
+                this.Shutdown();
                 return null;
             }
 
@@ -84,13 +84,13 @@ public class KafkaConnection {
             byte[] lenBuf = new byte[4];
             int rLen = await this.ReadExactAsync(lenBuf, 4);
             if (rLen < 4) {
-                this.Close();
+                this.Shutdown();
                 return null;
             }
             int respLen = ((int)lenBuf[0] << 24) | (((int)lenBuf[1] & 255) << 16) |
                           (((int)lenBuf[2] & 255) << 8) | ((int)lenBuf[3] & 255);
             if (respLen <= 0 || respLen > 67108864) { // 防御性上限 64MB
-                this.Close();
+                this.Shutdown();
                 return null;
             }
 
@@ -98,7 +98,7 @@ public class KafkaConnection {
             byte[] respBuf = new byte[respLen];
             int rBody = await this.ReadExactAsync(respBuf, respLen);
             if (rBody < respLen) {
-                this.Close();
+                this.Shutdown();
                 return null;
             }
 
@@ -127,12 +127,20 @@ public class KafkaConnection {
         return received;
     }
 
-    public void Close() {
+    // 断开套接字，但不动 ioLock。请求进行中的失败分支在持锁状态下走到
+    // 这里——此前直接调 Close 会把 ioLock 销毁并置 null，随后 finally 的
+    // ReleaseMutex 打在空引用/已销毁句柄上。锁的生命周期跟实例走，
+    // 只有 Close/Dispose 销毁。
+    void Shutdown() {
         this.connected = false;
         if (this.sock >= 0) {
             Socket.Close(this.sock);
             this.sock = -1;
         }
+    }
+
+    public void Close() {
+        this.Shutdown();
         if (this.ioLock != null) {
             this.ioLock.Close();
             this.ioLock = null;

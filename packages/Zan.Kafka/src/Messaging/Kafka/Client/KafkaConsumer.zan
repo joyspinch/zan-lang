@@ -79,14 +79,16 @@ public class KafkaConsumer {
         return await this.PollAsync(topic, partition, 500);
     }
 
-    // 从指定主题与分区拉取一批消息 (Fetch API v4)
+    // 从指定主题与分区拉取一批消息 (Fetch API v5)
     public async List<KafkaRecord> PollAsync(string topic, int partition, int timeoutMs) {
         List<KafkaRecord> result = new List<KafkaRecord>();
         if (!this.IsConnected()) { return result; }
 
         int waitMs = timeoutMs > 0 ? timeoutMs : this.maxWaitMs;
 
-        // 1. 构造 FetchRequest v4 请求体
+        // 1. 构造 FetchRequest v5 请求体。分区带 log_start_offset 是 v5
+        //    才加入的字段——此前版本号写成 4，broker 按 v4 布局解析时
+        //    8 字节错位，整个请求读歪。
         KafkaWriter w = new KafkaWriter(128);
         w.WriteInt32(-1); // replica_id: -1
         w.WriteInt32(waitMs);
@@ -106,10 +108,11 @@ public class KafkaConsumer {
         w.WriteInt32(this.maxBytes);
 
         // 2. 发送请求
-        KafkaReader r = await this.conn.SendRequestAsync(KafkaConstants.API_FETCH, 4, w.ToBytes());
+        KafkaReader r = await this.conn.SendRequestAsync(KafkaConstants.API_FETCH, 5, w.ToBytes());
         if (r == null) { return result; }
 
-        // 3. 解析 FetchResponse v4
+        // 3. 解析 FetchResponse v5（分区头含 last_stable_offset 与
+        //    log_start_offset，随后是 aborted_transactions 数组）
         int throttleTimeMs = r.ReadInt32();
         int topicCount = r.ReadArrayHeader();
         if (topicCount <= 0) { return result; }
