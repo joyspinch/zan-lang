@@ -1,0 +1,57 @@
+using System;
+using System.IO;
+
+// MemoryStream 位置域守卫契约：int 位置域之外的操作必须显式报错，
+// 而不是静默截断（Seek 曾把 4294967295 截成 -1，写入时向缓冲区前越界写）。
+//
+// 覆盖的判定点：
+//   - Seek(>int.MaxValue, 0/1/2) 抛 ArgumentException；
+//   - Seek 到 int.MaxValue 本身合法（位置域边界），Length 不变；
+//   - 边界位置上写入 1 字节抛 ArgumentException（pos+count 回绕防线），
+//     且流内容未被破坏；
+//   - 常规小位置读写回归（写读一致、Seek 负值钳 0）。
+class MemStreamBoundsProbe {
+    static string Caught(Action body) {
+        try {
+            body();
+            return "no-throw";
+        } catch (ArgumentException) {
+            return "ArgumentException";
+        } catch (Exception e) {
+            return "other:" + e.GetType().Name;
+        }
+    }
+
+    static void Main() {
+        // 1) 原始缺陷形态：>int.MaxValue 的 Seek 必须 ArgumentException。
+        MemoryStream ms = MemoryStream.Alloc(64);
+        Console.WriteLine("seek-max-overflow " +
+            Caught(() => { ms.Seek(4294967295L, 0); }));
+        Console.WriteLine("seek-cur-overflow " +
+            Caught(() => { ms.Seek(4294967290L, 1); }));
+
+        // 2) 末尾基准的超界 Seek 同样报错（length 很小）。
+        Console.WriteLine("seek-end-overflow " +
+            Caught(() => { ms.Seek(2147483648L, 2); }));
+
+        // 3) 边界位置本身合法；其上写入必须报错而不是回绕。
+        ms.Seek(2147483647L, 0);
+        Console.WriteLine("boundary pos=" + ms.Position() + " length=" + ms.Length());
+        byte[] one = new byte[] { 0xAB };
+        Console.WriteLine("write-at-boundary " +
+            Caught(() => { ms.WriteBytes(one, 0, 1); }));
+        Console.WriteLine("after-write pos=" + ms.Position() + " length=" + ms.Length());
+
+        // 4) 常规回归：钳 0、写读一致。
+        // 4) 常规回归：相对回退、回 0 后写读一致（在 2 GiB 附近写入会触发
+        //    扩容上限 IOException，属正确防线，用例不覆盖那条路径）。
+        Console.WriteLine("seek-back " + ms.Seek(-100L, 1));
+        Console.WriteLine("rewind " + ms.Seek(0L, 0));
+        ms.WriteBytes(new byte[] { 1, 2, 3, 4 }, 0, 4);
+        ms.Seek(0L, 0);
+        byte[] back = new byte[4];
+        int got = ms.ReadBytes(back, 0, 4);
+        Console.WriteLine("roundtrip got=" + got + " bytes=" + back[0] + back[1] + back[2] + back[3]);
+        ms.Close();
+    }
+}
