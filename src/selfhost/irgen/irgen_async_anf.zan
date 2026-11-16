@@ -90,10 +90,9 @@ partial class Irgen {
         L("  store i64 " + parentBits + ", i64* " + FrameGep("%ff", 19));
         L("  store i8* null, i8** @zexc_owners");
         string sp = NT(); L("  " + sp + " = load i64, i64* @__exc_sp");
-        string bufe = NT(); L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
-        string bufp = NT(); L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
-        string slot = NT(); L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
-        L("  store i8* " + bufp + ", i8** " + slot);
+        string need = NT(); L("  " + need + " = add i64 " + sp + ", 1");
+        L("  call void @__exc_grow(i64 " + need + ")");
+        string bufp = EmitFrameBuf(sp);
         EmitPendingHandlerMark(sp);
         string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
         L("  store i64 " + sp1 + ", i64* @__exc_sp");
@@ -139,19 +138,16 @@ partial class Irgen {
         while (i < asyncTryLbl.Count) {
             int lbl = asyncTryLbl[i];
             string sp = NT(); L("  " + sp + " = load i64, i64* @__exc_sp");
-            string bufe = NT(); L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
-            string bufp = NT(); L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
-            string slot = NT(); L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
-            L("  store i8* " + bufp + ", i8** " + slot);
-            string pendingMark = NT(); string pendingMarkSlot = NT();
+            string need = NT(); L("  " + need + " = add i64 " + sp + ", 1");
+            L("  call void @__exc_grow(i64 " + need + ")");
+            string bufp = EmitFrameBuf(sp);
+            string pendingMark = NT(); string pendingMarkSlot = EmitMarkSlot("@zpending_marks", sp);
             L("  " + pendingMark + " = load i8*, i8** @zpending_top");
-            L("  " + pendingMarkSlot + " = getelementptr [64 x i8*], [64 x i8*]* @zpending_marks, i64 0, i64 " + sp);
             L("  store i8* " + pendingMark + ", i8** " + pendingMarkSlot);
             string savedMarkBits = NT();
             L("  " + savedMarkBits + " = load i64, i64* " + FrameGep("%ff", asyncOwnerMarkBase + i + 1));
             string savedMark = FromI64(savedMarkBits, "i8*");
-            string markSlot = NT();
-            L("  " + markSlot + " = getelementptr [64 x i8*], [64 x i8*]* @zexc_marks, i64 0, i64 " + sp);
+            string markSlot = EmitMarkSlot("@zexc_marks", sp);
             L("  store i8* " + savedMark + ", i8** " + markSlot);
             string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
             L("  store i64 " + sp1 + ", i64* @__exc_sp");
@@ -759,6 +755,13 @@ partial class Irgen {
             EmitAsyncRearm();
             string rs = FrameGep("%ff", 6);
             string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
+            // consume-and-clear: the reactor's completion is an unmanaged
+            // byte count parked in the frame's RESULT slot (6) -- leaving it
+            // there made the return path's release-old (slot 6 doubles as the
+            // async result slot) free() the raw count as a pointer
+            // (B-ID199 r7: zrelease(4) in Socket_RecvAsync___nint_int$resume,
+            // tcp suite AV).
+            L("  store i64 0, i64* " + rs);
             return new ExprVal(rv, MkType("int"));
         }
         if (mn == "RecvToOv") {
@@ -793,6 +796,7 @@ partial class Irgen {
             EmitAsyncRearm();
             string rs = FrameGep("%ff", 6);
             string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
+            L("  store i64 0, i64* " + rs); // consume-and-clear (see RecvOv)
             return new ExprVal(rv, MkType("int"));
         }
         // AcceptOv
@@ -810,6 +814,7 @@ partial class Irgen {
             EmitAsyncRearm();
             string rs2 = FrameGep("%ff", 6);
             string rv2 = NT(); L("  " + rv2 + " = load i64, i64* " + rs2);
+            L("  store i64 0, i64* " + rs2); // consume-and-clear (see RecvOv)
             return new ExprVal(rv2, MkType("int"));
         }
         // ResolveSockAddr(name, port, buf, cap): the runtime resolves the host
@@ -860,6 +865,7 @@ partial class Irgen {
             string rs32 = NT(); L("  " + rs32 + " = bitcast i64* " + rs + " to i32*");
             string rv = NT(); L("  " + rv + " = load i32, i32* " + rs32);
             string rv64 = NT(); L("  " + rv64 + " = zext i32 " + rv + " to i64");
+            L("  store i64 0, i64* " + rs); // consume-and-clear (see RecvOv)
             return new ExprVal(rv64, MkType("int"));
         }
         // ResolveAsync(hostname): the runtime resolves the host name to an
@@ -892,6 +898,7 @@ partial class Irgen {
             string rs32 = NT(); L("  " + rs32 + " = bitcast i64* " + rs + " to i32*");
             string rv = NT(); L("  " + rv + " = load i32, i32* " + rs32);
             string rv64 = NT(); L("  " + rv64 + " = zext i32 " + rv + " to i64");
+            L("  store i64 0, i64* " + rs); // consume-and-clear (see RecvOv)
             return new ExprVal(rv64, MkType("int"));
         }
         // an unknown intrinsic must not answer with a constant: the program

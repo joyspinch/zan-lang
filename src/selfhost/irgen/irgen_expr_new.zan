@@ -275,8 +275,20 @@ partial class Irgen {
             // array of nullable ints, not a nullable array of ints
             // the rank list rides along too: it is what tells the codegen
             // that the array is rectangular (and how many dimensions it has)
-            Node at = MkType(ty.sval); at.ival = Node.ArrRankCount(rkl); at.op = ty.op;
-            at.kids = ty.kids;
+            // B-ID216：开放类级类型参数先按当前实例化替后，再进数组描述符。
+            // `new T[2]` 在 HolderS<string> 的克隆体里必须按 string 建描述符：
+            // 描述符的接受谓词按元素类型生成，开放 T 不命中任何谓词分支、
+            // accept 恒 false——任何引用型元素存储都被 zarr_store_compatible
+            // 拒掉（"array element type mismatch" 鸣叫 + 槽保持 null 读回）。
+            // 存/读两端（LoadField 的 SubstRecvTy）早已替后，只有 alloc 端漏。
+            Node ety = ty;
+            if (curInstCls != "" && curInstCls == curClass
+                    && curInstArgs != null && curInstArgs.Count > 0) {
+                Node icls = binder.FindType(curInstCls);
+                if (icls != null) { ety = SubstTP(ty, TParams(icls), curInstArgs); }
+            }
+            Node at = MkType(ety.sval); at.ival = Node.ArrRankCount(rkl); at.op = ety.op;
+            at.kids = ety.kids;
             at.arrRanks = rkl;
             Node elemTy = ArrElemOf(at);
             int esz = ArrElemSize(elemTy);
@@ -452,9 +464,14 @@ partial class Irgen {
         if (IsPolyClass(cls)) {
             List<string> vslots = new List<string>();
             CollectVSlots(cls, vslots);
+            // B-ID218: an instantiation whose virtual bodies mention the type
+            // parameters dispatches through its own vtable -- the shared one
+            // points at the erased bodies (`o is T` folds to constant false)
+            string vtSym = SpecVtableSym(cls, ty);
+            if (vtSym == "") { vtSym = cn + "_vtable"; }
             string vtp0 = NT();
             L("  " + vtp0 + " = getelementptr %" + cn + ", %" + cn + "* " + obj + ", i32 0, i32 0");
-            L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + cn + "_vtable to i8*), i8** " + vtp0);
+            L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + vtSym + " to i8*), i8** " + vtp0);
         }
         // The constructor: with an object initializer (ival == 2) the kids are
         // `Field = value` pairs, not ctor args, so only a parameterless ctor
@@ -469,7 +486,10 @@ partial class Irgen {
                 L("  call void @" + CtorSym(cn, pctor) + "(%" + cn + "* " + obj + ")");
             }
             else if (HasChainFieldInits(cls)) {
-                L("  call void @" + FieldInitsSym(cls) + "(%" + cn + "* " + obj + ")");
+                // B-ID216: a generic instantiation runs the specialized
+                // helper -- the shared one erases `new T[n]` and the array
+                // descriptor ends up rejecting every reference-element store
+                L("  call void @" + SpecFieldInitsSym(cls.sval, ty) + "(%" + cn + "* " + obj + ")");
             }
         }
         else {
@@ -587,7 +607,9 @@ partial class Irgen {
                     }
                     L("  call void @" + CtorSym(bctorCls.sval, bctor) + "(%" + bctorCls.sval + "* " + bthis + ")");
                 } else if (HasChainFieldInits(cls)) {
-                    L("  call void @" + FieldInitsSym(cls) + "(%" + cn + "* " + obj + ")");
+                    // B-ID216: specialized helper for a generic instantiation
+                    // (see the object-initializer branch above)
+                    L("  call void @" + SpecFieldInitsSym(cls.sval, ty) + "(%" + cn + "* " + obj + ")");
                 }
             }
         }

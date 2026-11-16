@@ -720,6 +720,17 @@ partial class Irgen {
             bp = NT();
             L("  " + bp + " = bitcast " + vt + " " + v.op + " to i8*");
         }
+        // A null array converts to an empty managed string -- the same
+        // null->"" convention as the string path above. The length peek
+        // loads arr[-1] (the header slot before the data), which on a
+        // null pointer reads address -8 and faults (B-ID199 r7:
+        // security_cryptography_suite binds `string decStr = decrypted;`
+        // where the decrypt failure path yields null).
+        string isNull = NT();
+        L("  " + isNull + " = icmp eq " + vt + " " + v.op + ", null");
+        int lnul = NL(); int ln = NL(); int ljoin = NL();
+        L("  br i1 " + isNull + ", label %L" + lnul + ", label %L" + ln);
+        Label(ln);
         string lenp = NT();
         L("  " + lenp + " = getelementptr i64, i64* " + ap + ", i64 -1");
         string len = NT();
@@ -763,7 +774,15 @@ partial class Irgen {
         L("  store i64 " + ni + ", i64* " + idx);
         L("  br label %L" + lc);
         Label(lend);
-        return OwnedString(dst);
+        L("  br label %L" + ljoin);
+        Label(lnul);
+        string es = NT();
+        L("  " + es + " = call i8* @zstr_new(i64 0)");
+        L("  br label %L" + ljoin);
+        Label(ljoin);
+        string res = NT();
+        L("  " + res + " = phi i8* [ " + es + ", %L" + lnul + " ], [ " + dst + ", %L" + lend + " ]");
+        return OwnedString(res);
     }
 
     // string -> byte[]: the C host's bridge primitive (irgen_expr.c
@@ -822,10 +841,24 @@ partial class Irgen {
             bp = NT();
             L("  " + bp + " = bitcast " + vt + " " + a.op + " to i8*");
         }
+        // Same null guard as ByteArrToStr: the header peek would read
+        // address -8 on a null array. A null array yields alen 0, so the
+        // window clamps below empty the string instead of faulting.
+        string isNull = NT();
+        L("  " + isNull + " = icmp eq " + vt + " " + a.op + ", null");
+        int lnul = NL(); int ln = NL(); int ljoin = NL();
+        L("  br i1 " + isNull + ", label %L" + lnul + ", label %L" + ln);
+        Label(ln);
         string lenp = NT();
         L("  " + lenp + " = getelementptr i64, i64* " + ap + ", i64 -1");
+        string al = NT();
+        L("  " + al + " = load i64, i64* " + lenp);
+        L("  br label %L" + ljoin);
+        Label(lnul);
+        L("  br label %L" + ljoin);
+        Label(ljoin);
         string alen = NT();
-        L("  " + alen + " = load i64, i64* " + lenp);
+        L("  " + alen + " = phi i64 [ " + al + ", %L" + ln + " ], [ 0, %L" + lnul + " ]");
         string off = "0";
         string len = alen;
         if (e.kids.Count == 2) {

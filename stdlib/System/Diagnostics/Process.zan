@@ -113,7 +113,7 @@ public class Process {
     private static extern int WinGetTickCount();
     [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
     private static extern int WinGetCurrentProcessId();
-    // CaptureSafe 的管道捕获三原语（声明缺失会让整包无法编译）。
+    // CaptureSafe 只读取 PeekNamedPipe 已确认就绪的字节，避免 ReadFile 吃掉超时。
     [DllImport("kernel32", EntryPoint = "CreatePipe")]
     private static extern int WinCreatePipe(byte[] hRead, byte[] hWrite, byte[] sa, int nSize);
     [DllImport("kernel32", EntryPoint = "SetHandleInformation")]
@@ -121,6 +121,11 @@ public class Process {
     [DllImport("kernel32", EntryPoint = "ReadFile")]
     private static extern int WinReadFile(nint handle, byte[] buf, int nBytes, byte[] numRead,
                                   nint overlapped);
+    [DllImport("kernel32", EntryPoint = "PeekNamedPipe")]
+    private static extern int WinPeekNamedPipe(nint handle, nint buf, int bufSize,
+                                               nint numRead, byte[] totalAvail, nint left);
+    [DllImport("kernel32", EntryPoint = "GetLastError")]
+    private static extern int WinGetLastError();
     [DllImport("crt", EntryPoint = "zan_proc_run_safe")]
     private static extern int PlatProcRunSafe(string exe, nint argsPtr, int argc);
     [DllImport("crt", EntryPoint = "zan_proc_start_detached_safe")]
@@ -146,6 +151,11 @@ public class Process {
     private static extern nint WinCreateFile(nint path, int access, int share, byte[] sa,
                                      int disposition, int flags, nint template);
     #else
+    #if !WASM32
+    [DllImport("crt", EntryPoint = "zan_proc_capture_safe_timeout")]
+    private static extern int PlatProcCaptureSafeTimeout(string exe, nint argsPtr, int argc,
+                            byte[] outBufPtr, byte[] outLen, byte[] exitCode, int timeoutMs);
+    #endif
     [DllImport("crt", EntryPoint = "zan_proc_run_safe")]
     private static extern int PlatProcRunSafe(string exe, nint argsPtr, int argc);
     [DllImport("crt", EntryPoint = "zan_proc_start_detached_safe")]
@@ -450,7 +460,8 @@ public class Process {
 
     // 直接启动一个程序，不经过 shell，可选把
     // stdout/stderr 追加重定向到 `logPath`（为 "" 时丢弃输出）。
-    // 启动成功返回 0，失败返回 -1。
+    // 启动成功返回 0，失败返回 -1。POSIX 等最终 exec 成功后才返回，
+    // 日志重定向失败也返回 -1；目标退出码（包括 127）不影响启动结果。
     // // 与 <see cref="RunDetached"/> 的区别：不产生 cmd.exe /bin/sh 中间进程。
     // 长期运行的子进程（如 worker）必须用它：`cmd.exe /c app.exe` 会让
     // 每个 worker 多挂一个 cmd.exe 加一个 conhost.exe，在任务管理器里堆成
@@ -685,11 +696,14 @@ public class Process {
         return Process.CaptureSafe(exe, args, 0 - 1);
     }
 
-    // 支持超时限制的 CaptureSafe（timeoutMs <= 0 表示无限等待；超时主动终止子进程防止宿主挂死）。
+    // timeoutMs <= 0（默认 -1）无限等待；正值限制启动、读输出及等待退出的总时间。
+    // 超时返回 exitCode=-1，终止并回收直接子进程，保留已读取和当时已缓冲的输出。
+    // 不等待仍持有输出管道的后代进程；本方法不承诺终止整个进程树。
     public static ProcessResult CaptureSafe(string exe, List<string> args, int timeoutMs) {
         ProcessResult r = new ProcessResult();
         r.lines = new List<string>();
         #if WINDOWS
+        long deadline = timeoutMs > 0 ? Stopwatch.GetMilliseconds() + timeoutMs : 0;
         byte[] sa = new byte[24];
         WinPutInt(sa, 0, 24);
         WinPutInt(sa, 16, 1); // bInheritHandle = TRUE
@@ -702,7 +716,12 @@ public class Process {
         nint hReadPipe = WinHandleAt(hRead, 0);
         nint hWritePipe = WinHandleAt(hWrite, 0);
         int HANDLE_FLAG_INHERIT = 1;
-        WinSetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+        if (WinSetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0) == 0) {
+            WinCloseHandle(hReadPipe);
+            WinCloseHandle(hWritePipe);
+            r.exitCode = 0 - 1;
+            return r;
+        }
 
         byte[] si = new byte[128];
         si[0] = 104;
@@ -731,32 +750,79 @@ public class Process {
             StringBuilder sb = new StringBuilder();
             byte[] readBuf = new byte[4096];
             byte[] numRead = new byte[8];
-            try {
-                for (;;) {
-                    int readOk = WinReadFile(hReadPipe, readBuf, 4096, numRead, 0);
-                    int bytesRead = numRead[0] + numRead[1] * 256 + numRead[2] * 65536 + numRead[3] * 16777216;
-                    if (readOk == 0 || bytesRead <= 0) { break; }
-                    sb.Append(readBuf.ToStr(0, bytesRead));
+            byte[] available = new byte[4];
+            bool pipeOpen = true;
+            bool failed = false;
+            for (;;) {
+                if (deadline > 0 && Stopwatch.GetMilliseconds() >= deadline) {
+                    failed = true;
+                    break;
                 }
-            } finally {
-                WinCloseHandle(hReadPipe);
+                int waitRes = WinWaitForSingleObject(hProc, 0);
+                if (waitRes != 0 && waitRes != 258) { failed = true; break; }
+                int ready = 0;
+                if (pipeOpen) {
+                    if (WinPeekNamedPipe(hReadPipe, 0, 0, 0, available, 0) == 0) {
+                        if (WinGetLastError() == 109) { pipeOpen = false; } // ERROR_BROKEN_PIPE
+                        else { failed = true; break; }
+                    } else {
+                        ready = available[0] + available[1] * 256 + available[2] * 65536 + available[3] * 16777216;
+                    }
+                }
+                if (ready > 0) {
+                    int count = ready < 4096 ? ready : 4096;
+                    int readOk = WinReadFile(hReadPipe, readBuf, count, numRead, 0);
+                    int got = numRead[0] + numRead[1] * 256 + numRead[2] * 65536 + numRead[3] * 16777216;
+                    if (readOk == 0 || got <= 0) { failed = true; break; }
+                    sb.Append(readBuf.ToStr(0, got));
+                    // Check the clock after every chunk, including continuous output.
+                    continue;
+                }
+                if (waitRes == 0 && !pipeOpen) { break; }
+                int pauseMs = 10;
+                if (deadline > 0) {
+                    long left = deadline - Stopwatch.GetMilliseconds();
+                    if (left <= 0) { continue; }
+                    if (left < pauseMs) { pauseMs = (int)left; }
+                }
+                if (waitRes == 258) { WinWaitForSingleObject(hProc, pauseMs); }
+                else { Thread.Sleep(pauseMs); } // A descendant still owns the writer.
             }
-
-            int waitMs = timeoutMs > 0 ? timeoutMs : (0 - 1);
-            int waitRes = WinWaitForSingleObject(hProc, waitMs);
-            if (waitRes == 258) { // WAIT_TIMEOUT
-                WinTerminateProcess(hProc, 1);
-                WinWaitForSingleObject(hProc, 5000);
-                r.exitCode = 0 - 1;
-                r.lines = SplitLines(sb.ToString());
-                return r;
+            r.exitCode = 0 - 1;
+            if (failed) {
+                if (WinWaitForSingleObject(hProc, 0) == 258) {
+                    if (WinTerminateProcess(hProc, 1) != 0) {
+                        WinWaitForSingleObject(hProc, 0 - 1);
+                    }
+                }
+                // Drain a snapshot only; a descendant must not extend this deadline.
+                if (pipeOpen && WinPeekNamedPipe(hReadPipe, 0, 0, 0, available, 0) != 0) {
+                    int pending = available[0] + available[1] * 256 + available[2] * 65536 + available[3] * 16777216;
+                    while (pending > 0) {
+                        int count = pending < 4096 ? pending : 4096;
+                        int readOk = WinReadFile(hReadPipe, readBuf, count, numRead, 0);
+                        int got = numRead[0] + numRead[1] * 256 + numRead[2] * 65536 + numRead[3] * 16777216;
+                        if (readOk == 0 || got <= 0) { break; }
+                        sb.Append(readBuf.ToStr(0, got));
+                        pending = pending - got;
+                    }
+                }
+            } else {
+                byte[] cb = new byte[8];
+                if (WinGetExitCodeProcess(hProc, cb) != 0) {
+                    r.exitCode = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
+                }
             }
-            byte[] cb = new byte[8];
-            WinGetExitCodeProcess(hProc, cb);
-            r.exitCode = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
             r.lines = SplitLines(sb.ToString());
             return r;
         } finally {
+            // Also cover exceptions while building the captured text.
+            if (WinWaitForSingleObject(hProc, 0) == 258) {
+                if (WinTerminateProcess(hProc, 1) != 0) {
+                    WinWaitForSingleObject(hProc, 0 - 1);
+                }
+            }
+            WinCloseHandle(hReadPipe);
             WinCloseHandle(hProc);
             WinCloseHandle(hThread);
         }
@@ -779,7 +845,11 @@ public class Process {
                     av[i] = abuf;
                 }
             }
+            #if WASM32
             ret = PlatProcCaptureSafe(exe, argv, argc, outBuf, outLen, exitCode);
+            #else
+            ret = PlatProcCaptureSafeTimeout(exe, argv, argc, outBuf, outLen, exitCode, timeoutMs);
+            #endif
         } finally {
             if (argv != 0) {
                 Span<nint> av = new Span<nint>(argv, argc);

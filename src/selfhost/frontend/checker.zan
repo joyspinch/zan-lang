@@ -38,6 +38,9 @@ public partial class Checker {
                                 // is only valid inside a catch block)
     List<string> scopeName;     // value names currently in scope
     List<Node> scopeType;       // parallel declared/inferred types (may be null)
+    List<Node> scopeByRef;      // ref/out parameter declaration, null for other bindings
+    List<int> scopeLambdaDepth; // lambda nesting where each binding was declared
+    int lambdaDepth;
     List<Node> accReported;     // accessor nodes whose E2095 already fired
                                 // (InferType re-runs on one node many times)
     public int inCallArgs;
@@ -46,6 +49,8 @@ public partial class Checker {
         binder = b; diags = d; curClass = null; curMethodNode = null; curRet = null; curTargetType = null;
         curStatic = false; loopDepth = 0; catchDepth = 0;
         scopeName = new List<string>(); scopeType = new List<Node>();
+        scopeByRef = new List<Node>(); scopeLambdaDepth = new List<int>();
+        lambdaDepth = 0;
         accReported = null;
         inCallArgs = 0;
     }
@@ -162,8 +167,26 @@ public partial class Checker {
     string TyDisplay(Node t) {
         if (t == null) { return "?"; }
         if (IsTaskTy(t)) { return TaskTyName(t); }
-        if (t.op == 1) { return t.sval + "?"; }
-        return t.sval;
+        string name = t.sval;
+        if (t.kids.Count > 0) {
+            name = name + "<";
+            int i = 0;
+            while (i < t.kids.Count) {
+                if (i > 0) { name = name + ","; }
+                name = name + TyDisplay(t.kids[i]); i = i + 1;
+            }
+            name = name + ">";
+        }
+        if (t.op == 1) { name = name + "?"; }
+        int level = 0;
+        while (level < t.ival) {
+            int rank = Node.ArrRankAt(t.arrRanks, level);
+            name = name + "[";
+            int comma = 1;
+            while (comma < rank) { name = name + ","; comma = comma + 1; }
+            name = name + "]"; level = level + 1;
+        }
+        return name;
     }
 
     // ---- lexical scope ----
@@ -171,12 +194,38 @@ public partial class Checker {
     void ScopeTrim(int to) {
         List<string> nn = new List<string>();
         List<Node> nt = new List<Node>();
+        List<Node> nr = new List<Node>();
+        List<int> nd = new List<int>();
         int i = 0;
-        while (i < to) { nn.Add(scopeName[i]); nt.Add(scopeType[i]); i = i + 1; }
+        while (i < to) {
+            nn.Add(scopeName[i]); nt.Add(scopeType[i]);
+            nr.Add(scopeByRef[i]); nd.Add(scopeLambdaDepth[i]);
+            i = i + 1;
+        }
         scopeName = nn; scopeType = nt;
+        scopeByRef = nr; scopeLambdaDepth = nd;
     }
     void ScopeAdd(string name, Node ty) {
-        if (name != "") { scopeName.Add(name); scopeType.Add(ty); }
+        if (name != "") {
+            scopeName.Add(name); scopeType.Add(ty);
+            scopeByRef.Add(null); scopeLambdaDepth.Add(lambdaDepth);
+        }
+    }
+    void ScopeParam(Node p) {
+        ScopeAdd(p.sval, p.type);
+        if (p.sval != "" && p.ival == 1) {
+            scopeByRef[scopeByRef.Count - 1] = p;
+        }
+    }
+    void CheckByRefCapture(string name) {
+        if (lambdaDepth == 0) { return; }
+        int i = ScopeIdx(name);
+        if (i < 0 || scopeLambdaDepth[i] >= lambdaDepth) { return; }
+        Node p = scopeByRef[i];
+        if (p == null) { return; }
+        diags.Error("[E3043] cannot capture a ref or out parameter in a lambda", p.line, p.col);
+        // One diagnostic per binding; ordinary cells and shadowing stay unchanged.
+        scopeByRef[i] = null;
     }
     int ScopeIdx(string name) {
         int i = scopeName.Count - 1;
@@ -327,43 +376,10 @@ public partial class Checker {
         return null;
     }
 
-    Node CopyTypeNode(Node t) {
-        if (t == null) { return null; }
-        Node n = new Node(t.kind);
-        n.sval = t.sval; n.op = t.op; n.ival = t.ival; n.sval2 = t.sval2;
-        n.line = t.line; n.col = t.col; n.mods = t.mods;
-        int i = 0;
-        while (i < t.kids.Count) { n.Add(CopyTypeNode(t.kids[i])); i = i + 1; }
-        return n;
-    }
+    Node CopyTypeNode(Node t) { return binder.CopyType(t); }
 
     Node SubstType(Node t, List<string> names, List<Node> reps) {
-        if (t == null) { return null; }
-        if (t.ival >= 1) {
-            Node el = new Node(AK.TypeRef());
-            el.sval = t.sval;
-            Node se = SubstType(el, names, reps);
-            if (se == null) { return t; }
-            Node r = CopyTypeNode(se);
-            r.ival = t.ival;
-            return r;
-        }
-        if (t.kids.Count == 0) {
-            int i = 0;
-            while (i < names.Count) {
-                if (names[i] == t.sval) { return CopyTypeNode(reps[i]); }
-                i = i + 1;
-            }
-            return t;
-        }
-        Node n = CopyTypeNode(t);
-        n.kids = new List<Node>();
-        int ki = 0;
-        while (ki < t.kids.Count) {
-            n.kids.Add(SubstType(t.kids[ki], names, reps));
-            ki = ki + 1;
-        }
-        return n;
+        return binder.SubstType(t, names, reps);
     }
 
     Node SubstTypeParams(Node t, Node cls, Node ot) {
@@ -652,7 +668,7 @@ public partial class Checker {
         List<Node> fit = new List<Node>();
         int i = 0;
         while (i < cands.Count) {
-            if (AcceptsArgcOf(cands[i], argc)) { fit.Add(cands[i]); }
+            if (AcceptsArgcOf(cands[i], argc) && MethodGroupArgsFit(cands[i], call, CallReceiverType(call))) { fit.Add(cands[i]); }
             i = i + 1;
         }
         if (fit.Count > 0) {
@@ -742,6 +758,10 @@ public partial class Checker {
                 } else if (pty != null && (pty.sval == "string" || PrimCat(pty.sval) != 0)) {
                     score = score - 10;
                 }
+            } else if (IsMethodGroup(arg)) {
+                Node pt = CallParamType(cand, call, a, CallReceiverType(call));
+                if (pt == null || ProbeMethodGroup(arg, pt).method == null) { return -1000000; }
+                score = score + 4;
             } else {
                 Node aty = InferType(arg);
                 if (pty != null && aty != null && pty.sval != "" && aty.sval != "") {
@@ -897,7 +917,25 @@ public partial class Checker {
         int i = 0;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
-            if (m.kind == AK.FieldDecl()) { CheckType(m.type); }
+            if (m.kind == AK.FieldDecl()) {
+                CheckType(m.type);
+                if (m.b != null && m.type != null && binder.IsDelegateName(m.type.sval)) {
+                    Node savedTarget = curTargetType; bool savedStatic = curStatic;
+                    Node savedMethod = curMethodNode; Node savedRet = curRet;
+                    List<string> savedNames = scopeName; List<Node> savedTypes = scopeType;
+                    List<Node> savedRefs = scopeByRef; List<int> savedDepths = scopeLambdaDepth;
+                    int savedLambdaDepth = lambdaDepth;
+                    scopeName = new List<string>(); scopeType = new List<Node>();
+                    scopeByRef = new List<Node>(); scopeLambdaDepth = new List<int>();
+                    curMethodNode = null; curRet = null; lambdaDepth = 0;
+                    curTargetType = m.type; curStatic = HasMod(m, MOD.Static());
+                    CheckExpr(m.b);
+                    curTargetType = savedTarget; curStatic = savedStatic;
+                    curMethodNode = savedMethod; curRet = savedRet; lambdaDepth = savedLambdaDepth;
+                    scopeName = savedNames; scopeType = savedTypes;
+                    scopeByRef = savedRefs; scopeLambdaDepth = savedDepths;
+                }
+            }
             else if (m.kind == AK.MethodDecl()) { CheckMethod(m, false); }
             else if (m.kind == AK.CtorDecl()) { CheckMethod(m, true); }
             i = i + 1;
@@ -909,6 +947,8 @@ public partial class Checker {
         curMethodNode = m;
         if (m.type != null) { CheckSignatureType(m.type); }
         scopeName = new List<string>(); scopeType = new List<Node>();
+        scopeByRef = new List<Node>(); scopeLambdaDepth = new List<int>();
+        lambdaDepth = 0;
         loopDepth = 0;
         catchDepth = 0;
         // An async method with a Task-shaped return type returns its RESULT,
@@ -929,9 +969,30 @@ public partial class Checker {
                 if (ScopeHas(p.sval)) {
                     diags.Error("duplicate parameter '" + p.sval + "'", p.line, p.col);
                 }
-                ScopeAdd(p.sval, p.type);
+                ScopeParam(p);
             }
             i = i + 1;
+        }
+        if (ctor) {
+            Node init = m.c != null ? m.c : m.b;
+            if (init != null) {
+                Node targetClass = m.c != null ? curClass : binder.FindType(curClass.sval2);
+                Node target = binder.FindCtorArity(targetClass, init.kids.Count);
+                if (target == null) { target = binder.FindCtor(targetClass); }
+                int savedInCall = inCallArgs;
+                inCallArgs = inCallArgs + 1;
+                int ai = 0;
+                // Only arguments: base/this is a constructor initializer,
+                // not an ordinary method callee. The body is checked below.
+                while (ai < init.kids.Count) {
+                    Node savedTarget = curTargetType;
+                    curTargetType = target != null ? NthParamType(target, ai) : null;
+                    CheckExpr(init.kids[ai]);
+                    curTargetType = savedTarget;
+                    ai = ai + 1;
+                }
+                inCallArgs = savedInCall;
+            }
         }
         CheckStmt(m.d);
         CheckAwaits(m);
@@ -1089,6 +1150,18 @@ public partial class Checker {
                 CheckAssignable(curRet, rv, n.a.kind == AK.NullLit(),
                     "return statement", n.line, n.col);
             }
+            // Host W2072 (checker_stmt.c): a returned closure or instance
+            // method group carries `this` out of the method; under ARC the
+            // caller can hold the receiver alive far past its intended
+            // lifetime. Independent of curRet -- the host has no
+            // return-value-in-void diagnostic, so the warning still applies.
+            if (n.a != null && InClassContext()) {
+                if (HasClosureCapturingThis(n.a)) {
+                    diags.Warning("[W2072] returned closure captures 'this' and escapes method scope; "
+                        + "ensure the caller does not retain it indefinitely to prevent ARC memory leaks",
+                        n.line, n.col);
+                }
+            }
             return;
         }
         if (k == AK.ThrowStmt()) {
@@ -1219,7 +1292,7 @@ public partial class Checker {
     // undefined identifier: it may name a stdlib type or namespace.
     void CheckObj(Node n) {
         if (n == null) { return; }
-        if (n.kind == AK.Ident()) { return; }
+        if (n.kind == AK.Ident()) { CheckByRefCapture(n.sval); return; }
         CheckExpr(n);
     }
 

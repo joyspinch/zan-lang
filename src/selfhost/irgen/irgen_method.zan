@@ -259,12 +259,18 @@ partial class Irgen {
     // for the implicit parameterless constructor: the allocation site calls
     // it when no constructor matches, and a derived constructor calls the
     // base class' helper when the base constructor was not called.
-    void GenFieldInitsFn(Node cls) {
+    void GenFieldInitsFn(Node cls) { GenFieldInitsFnAs(cls, FieldInitsSym(cls)); }
+
+    // `sym` overrides the shared symbol: the specialized helper of a generic
+    // class (B-ID216) emits under its instantiation-mangled name with the
+    // instantiation bound by the drain loop, so the descriptors its
+    // initializers build are the concrete ones.
+    void GenFieldInitsFnAs(Node cls, string sym) {
         StartFn();
         curClass = cls.sval;
         curRet = "void";
         curHasThis = true;
-        L("define void @" + FieldInitsSym(cls) + "(%" + cls.sval + "* %this) {");
+        L("define void @" + sym + "(%" + cls.sval + "* %this) {");
         L("entry:");
         StringBuilder obody = body; StringBuilder oea = entryAllocas; bool oact = eaActive;
         body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
@@ -297,22 +303,82 @@ partial class Irgen {
     void GenMainWrapper(Node unit) {
         string owner = "";
         Node mainMeth = null;
+        Node mainOwner = null;
         int i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
                 Node mm = binder.FindMethod(d, "Main");
-                if (mm != null) { owner = d.sval; mainMeth = mm; }
+                if (mm != null) { owner = d.sval; mainMeth = mm; mainOwner = d; }
             }
             i = i + 1;
         }
-        if (owner == "") { return; }
+        if (mainMeth == null || mainOwner == null) { return; }
+        // Validate source types, not just MapType: long/bool also map to i64,
+        // but are not legal entry results. Async Task<T> carries T in slot 6.
+        bool asyncMain = IsAsync(mainMeth);
+        Node resultTy = mainMeth.type;
+        bool valid = IsStatic(mainMeth) && mainMeth.d != null && resultTy != null;
+        if (asyncMain && resultTy != null && resultTy.sval == "Task") {
+            if (resultTy.ival != 0 || resultTy.op != 0 || resultTy.kids.Count > 1) { valid = false; }
+            resultTy = AsyncElemTyOf(resultTy);
+        }
+        if (resultTy == null) { valid = false; }
+        else if (resultTy.ival != 0 || resultTy.op != 0 || resultTy.kids.Count != 0
+            || (resultTy.sval != "void" && resultTy.sval != "int")) { valid = false; }
+        Node argsTy = null;
+        int paramCount = 0;
+        i = 0;
+        while (i < mainMeth.kids.Count) {
+            Node p = mainMeth.kids[i];
+            if (p.kind == AK.TypeParam()) { valid = false; }
+            if (p.kind == AK.Param()) {
+                paramCount = paramCount + 1;
+                argsTy = p.type;
+                if (p.ival != 0 || argsTy == null) { valid = false; }
+                else if (argsTy.sval != "string" || argsTy.ival != 1
+                    || ArrRankOf(argsTy) != 1 || argsTy.kids.Count != 0) { valid = false; }
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < mainOwner.kids.Count) {
+            if (mainOwner.kids[i].kind == AK.TypeParam()) { valid = false; }
+            i = i + 1;
+        }
+        if (paramCount > 1) { valid = false; }
+        if (!valid) {
+            diags.Error("entry point 'Main' must be a non-generic static method returning void or int (or async Task/Task<int>), with no parameters or one string[] parameter passed by value", mainMeth.line, mainMeth.col);
+            return;
+        }
+        string mainSym = MethodSym(owner, mainMeth);
         L("define i32 @main(i32 %argc, i8** %argv) {");
         L("entry:");
         StringBuilder obody = body; StringBuilder oea = entryAllocas; bool oact = eaActive;
         body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
-        L("  store i32 %argc, i32* @__zan_argc");
-        L("  store i8** %argv, i8*** @__zan_argv");
+        // This synthetic wrapper has no StartFn/locals-table lifetime. Give
+        // its one owner an explicit entry slot, independent of method locals.
+        string argsOwner = "";
+        if (argsTy != null) {
+            argsOwner = NT();
+            L("  " + argsOwner + " = alloca i64*");
+            L("  store i64* null, i64** " + argsOwner);
+        }
+        string mainArgc = "%argc";
+        string mainArgv = "%argv";
+        if (hostWin) {
+            string argcSlot = NT(); string argvSlot = NT();
+            L("  " + argcSlot + " = alloca i32");
+            L("  " + argvSlot + " = alloca i8**");
+            L("  store i32 %argc, i32* " + argcSlot);
+            L("  store i8** %argv, i8*** " + argvSlot);
+            L("  call i32 @zan_utf8_argv(i32* " + argcSlot + ", i8*** " + argvSlot + ")");
+            mainArgc = NT(); mainArgv = NT();
+            L("  " + mainArgc + " = load i32, i32* " + argcSlot);
+            L("  " + mainArgv + " = load i8**, i8*** " + argvSlot);
+        }
+        L("  store i32 " + mainArgc + ", i32* @__zan_argc");
+        L("  store i8** " + mainArgv + ", i8*** @__zan_argv");
         // Programs emit UTF-8 bytes; switch the Windows console to code page
         // 65001 so CJK/accented output renders instead of mojibake. Redirected
         // output (pipe/file) keeps its raw UTF-8 bytes.
@@ -340,11 +406,16 @@ partial class Irgen {
         L("  call void @zan_co_sched_init()");
         // Install a root exception handler so an uncaught throw prints a
         // message and exits 1 instead of longjmp-ing through an empty stack.
-        string rbuf = NT(); L("  " + rbuf + " = alloca [32 x i64], align 32");
-        string rbp = NT(); L("  " + rbp + " = bitcast [32 x i64]* " + rbuf + " to i8*");
+        // B-ID199 round4: this used to setjmp into a local alloca recorded
+        // in @__exc_stack -- the one writer that broke the "stack entry ==
+        // &bufs[depth]" invariant and blocked retiring @__exc_stack when
+        // the frame store went heap-backed. It now arms the shared heap
+        // frame like every other push, so the frame address stays
+        // derivable from the depth alone.
         string rsp = NT(); L("  " + rsp + " = load i64, i64* @__exc_sp");
-        string rslot = NT(); L("  " + rslot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + rsp);
-        L("  store i8* " + rbp + ", i8** " + rslot);
+        string rneed = NT(); L("  " + rneed + " = add i64 " + rsp + ", 1");
+        L("  call void @__exc_grow(i64 " + rneed + ")");
+        string rbp = EmitFrameBuf(rsp);
         EmitPendingHandlerMark(rsp);
         string rsp1 = NT(); L("  " + rsp1 + " = add i64 " + rsp + ", 1");
         L("  store i64 " + rsp1 + ", i64* @__exc_sp");
@@ -353,42 +424,72 @@ partial class Irgen {
         int lbody = NL(); int lcatch = NL();
         L("  br i1 " + rc + ", label %L" + lcatch + ", label %L" + lbody);
         Label(lbody);
+        // Arm AFTER the root handler's watermark: an uncaught throw unwinds
+        // this owner through zexc_owners, including a partially filled array.
+        if (argsTy != null) { ArmLocalSlot(argsOwner, argsTy, false); }
         EmitStaticInits(unit);
-        if (mainMeth != null && IsAsync(mainMeth) && IsStatic(mainMeth)) {
-            // An async Main is a coroutine: its ramp only allocates the frame
-            // and returns it -- the body runs from $resume. Calling the ramp
-            // like an ordinary function would allocate a frame and never run
-            // the body (the program would print nothing). The entry readies
-            // the frame on the cooperative scheduler and runs it to completion
-            // (mirrors the C host's emit_main_method).
-            string mainSym = MethodSym(owner, mainMeth);
-            string fr = NT(); L("  " + fr + " = call i8* @" + mainSym + "()");
+        string mainArgs = "";
+        if (argsTy != null) {
+            string argc64 = NT(); string rawCount = NT(); string hasArgs = NT(); string count = NT();
+            L("  " + argc64 + " = sext i32 " + mainArgc + " to i64");
+            L("  " + rawCount + " = sub i64 " + argc64 + ", 1");
+            L("  " + hasArgs + " = icmp sgt i64 " + rawCount + ", 0");
+            L("  " + count + " = select i1 " + hasArgs + ", i64 " + rawCount + ", i64 0");
+            string args = ArrayAllocate(argsTy, count);
+            L("  store i64* " + args + ", i64** " + argsOwner);
+            string pred = curLbl;
+            int loop = NL(); int fill = NL(); int done = NL();
+            string index = NT(); string next = NT();
+            L("  br label %L" + loop);
+            Label(loop);
+            L("  " + index + " = phi i64 [ 0, %" + pred + " ], [ " + next + ", %L" + fill + " ]");
+            string more = NT(); L("  " + more + " = icmp slt i64 " + index + ", " + count);
+            L("  br i1 " + more + ", label %L" + fill + ", label %L" + done);
+            Label(fill);
+            string argIndex = NT(); L("  " + argIndex + " = add i64 " + index + ", 1");
+            string argSlot = NT(); L("  " + argSlot + " = getelementptr i8*, i8** " + mainArgv + ", i64 " + argIndex);
+            string rawArg = NT(); L("  " + rawArg + " = load i8*, i8** " + argSlot);
+            string managed = NT(); L("  " + managed + " = call i8* @zstr_of(i8* " + rawArg + ")");
+            // zstr_of creates +1; transfer it to this zeroed element slot.
+            string bits = NT(); L("  " + bits + " = ptrtoint i8* " + managed + " to i64");
+            string elemSlot = NT(); L("  " + elemSlot + " = getelementptr i64, i64* " + args + ", i64 " + index);
+            L("  store i64 " + bits + ", i64* " + elemSlot);
+            L("  " + next + " = add i64 " + index + ", 1");
+            L("  br label %L" + loop);
+            Label(done);
+            mainArgs = "i64* " + args;
+        }
+        string exitCode = "0";
+        if (asyncMain) {
+            // The ramp retains its parameters. Keep the wrapper's own array
+            // reference through the pump as well, including exceptional exit.
+            string fr = NT(); L("  " + fr + " = call i8* @" + mainSym + "(" + mainArgs + ")");
             string rs = NT(); L("  " + rs + " = ptrtoint void(i8*)* @" + mainSym + "$resume to i64");
             string rf = NT(); L("  " + rf + " = inttoptr i64 " + rs + " to void(i8*)*");
             L("  call void @zan_co_ready(i8* " + fr + ", void(i8*)* " + rf + ")");
             L("  call void @zan_co_sched_run()");
             string mainHeader = NT(); L("  " + mainHeader + " = bitcast i8* " + fr + " to i64*");
             EmitAwaitCheckExc(mainHeader);
-            string mrt = MapType(mainMeth.type);
-            if (mrt == "void") {
-                // The awaiter owns the frame: release it once the coroutine
-                // is done. An exception unwinds the frame through its own
-                // cleanup (which frees it), so this path is completion only.
-                L("  call void @zexc_frame_free(i8* " + fr + ")");
-                L("  ret i32 0");
-            } else {
-                // read the result before the frame is released
-                string fh = NT(); L("  " + fh + " = bitcast i8* " + fr + " to i64*");
-                string rp = FrameGep(fh, 6);
+            if (resultTy.sval == "int") {
+                // Read the result before releasing the completed frame.
+                string rp = FrameGep(mainHeader, 6);
                 string ri = NT(); L("  " + ri + " = load i64, i64* " + rp);
-                L("  call void @zexc_frame_free(i8* " + fr + ")");
-                string r32 = NT(); L("  " + r32 + " = trunc i64 " + ri + " to i32");
-                L("  ret i32 " + r32);
+                exitCode = NT(); L("  " + exitCode + " = trunc i64 " + ri + " to i32");
             }
+            L("  call void @zexc_frame_free(i8* " + fr + ")");
+        } else if (resultTy.sval == "int") {
+            string result = NT(); L("  " + result + " = call i64 @" + mainSym + "(" + mainArgs + ")");
+            exitCode = NT(); L("  " + exitCode + " = trunc i64 " + result + " to i32");
         } else {
-            L("  call void @" + owner + "_Main()");
-            L("  ret i32 0");
+            L("  call void @" + mainSym + "(" + mainArgs + ")");
         }
+        if (argsTy != null) {
+            RetireLocalSlot(argsOwner, "i64*");
+            string args = NT(); L("  " + args + " = load i64*, i64** " + argsOwner);
+            L("  store i64* null, i64** " + argsOwner);
+            EmitArcRelease(args, argsTy);
+        }
+        L("  ret i32 " + exitCode);
         Label(lcatch);
         string mp = NT(); L("  " + mp + " = getelementptr inbounds [25 x i8], [25 x i8]* @.msg.unhandled, i64 0, i64 0");
         string xv = NT(); L("  " + xv + " = load i8*, i8** @__exc_val");

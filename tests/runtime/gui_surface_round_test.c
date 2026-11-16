@@ -11,6 +11,8 @@ extern void zan_gui_clear(int32_t, int32_t);
 extern void *zan_gui_get_pixels(int32_t);
 extern void zan_gui_push_clip(int32_t, int32_t, int32_t, int32_t, int32_t);
 extern void zan_gui_pop_clip(int32_t);
+extern int32_t zan_gui_stat_read(int32_t, int32_t);
+extern int32_t zan_gui_set_render_backend(int32_t);
 extern void zan_gui_fill_rounded_rect(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
 extern void zan_gui_surface_rounded_rect(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
 extern void zan_gui_surface_rounded_rect_mask(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
@@ -88,7 +90,69 @@ static void bitmap_boundaries(void) {
     CHECK(zan_gui_destroy_surface(next) == 0);
 }
 
+static void bitmap_stat_clip(void) {
+    const uint32_t background = 0xff102030u;
+    const uint32_t foreground = 0xff40c080u;
+    const struct {
+        const char *name;
+        int x, y, kpx;
+    } cases[] = {
+        {"visible",       8,  8, 2},
+        {"partial",      39,  8, 1},
+        {"one-axis-out", 96,  8, 0},
+        {"two-axes-out", 96, 96, 0}
+    };
+    uint32_t src[50 * 40];
+    for (int i = 0; i < 50 * 40; i++) src[i] = foreground;
+    zan_bitmap img = {0};
+    img.pixels = src; img.width = 50; img.height = 40; img.stride = 50;
+    CHECK(zan_gui_set_render_backend(0) == 0);
+    int32_t id = zan_gui_create_surface(128, 128);
+    CHECK(id >= 0);
+    const uint32_t *dst = zan_gui_get_pixels(id);
+    CHECK(dst != NULL);
+    const int32_t calls0 = zan_gui_stat_read(7, 0);
+    const int32_t kpx0 = zan_gui_stat_read(7, 2);
+    int32_t calls = calls0, kpx = kpx0;
+    int failed = 0;
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        zan_gui_clear(id, (int32_t)background);
+        zan_gui_push_clip(id, 0, 0, 64, 64);
+        zan_gui_blit_pixels(id, &img, cases[i].x, cases[i].y,
+            50, 40, 0, 0, 50, 40);
+        zan_gui_pop_clip(id);
+        calls++;
+        /* Valid intersections are exact kpx, independent of baseline residue. */
+        kpx += cases[i].kpx;
+        int32_t got_calls = zan_gui_stat_read(7, 0);
+        int32_t got_kpx = zan_gui_stat_read(7, 2);
+        int32_t peek_again = zan_gui_stat_read(7, 2);
+        int32_t calls_again = zan_gui_stat_read(7, 0);
+        int bad_pixels = 0;
+        for (int y = 0; y < 128; y++) for (int x = 0; x < 128; x++) {
+            int covered = x < 64 && y < 64
+                && x >= cases[i].x && x < cases[i].x + 50
+                && y >= cases[i].y && y < cases[i].y + 40;
+            uint32_t want = covered ? foreground : background;
+            if (dst[y * 128 + x] != want) bad_pixels++;
+        }
+        if (got_calls != calls || calls_again != calls || got_kpx != kpx
+            || peek_again != kpx || bad_pixels != 0) {
+            fprintf(stderr, "img clip %s: calls=%d/%d want=%d "
+                "peek=%d/%d want=%d bad_pixels=%d\n", cases[i].name,
+                got_calls, calls_again, calls, got_kpx, peek_again, kpx,
+                bad_pixels);
+            failed = 1;
+        }
+    }
+    CHECK(zan_gui_stat_read(7, 0) == calls0 + 4);
+    if (zan_gui_stat_read(7, 2) != kpx0 + 3) failed = 1;
+    CHECK(zan_gui_destroy_surface(id) == 0);
+    CHECK(!failed);
+}
+
 int main(void) {
+    bitmap_stat_clip();
     bitmap_boundaries();
     int32_t id = zan_gui_create_surface(32, 32);
     CHECK(id >= 0);

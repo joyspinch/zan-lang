@@ -150,6 +150,29 @@ partial class Irgen {
     public List<Node> specCtorCls;
     public List<Node> specCtorThis;
     public List<string> specCtorSyms;
+    // B-ID216: class-level monomorphization of the FIELD-INITIALIZER helper.
+    // A generic class with an implicit parameterless constructor runs its
+    // `new T[n]` initializers through the shared helper, which allocates the
+    // array with the ERASED element type: the descriptor's accept predicate
+    // is generated for the open parameter and rejects every reference-element
+    // store ("array element type mismatch"), and ARC never retains. Like the
+    // constructor, the helper is specialized per instantiation; these are the
+    // pending specialized helpers.
+    public List<Node> specFinits;
+    public List<Node> specFinitCls;
+    public List<Node> specFinitThis;
+    public List<string> specFinitSyms;
+    // B-ID218: per-instantiation VTABLES of the generic classes. A generic
+    // class's virtual methods share ONE declaration-form vtable whose slots
+    // point at the erased bodies -- an override body reading its type
+    // parameter (`o is T`) folds to a constant, and every instantiation
+    // answers it the same way. An instantiation whose virtual bodies mention
+    // the type parameters gets its own table (slots pointing at the
+    // specialized clones, mirroring the ctor/finit specialization); these
+    // are the pending per-instantiation tables.
+    public List<Node> specVtCls;
+    public List<Node> specVtArgs;
+    public List<string> specVtSyms;
     // the symbol of the constructor being emitted ("" = the shared one)
     public string curCtorSym;
     // the instantiations of generic classes the program uses: the class name
@@ -262,6 +285,10 @@ partial class Irgen {
         locSeq = 0;
         qdotSeq = 0;
         curAsync = false; usesAsync = false; usesDirList = false; usesStrOps = false;
+        gcProbeUsed = false;
+        gcTyCids = new List<string>();
+        gcTyNames = new List<string>();
+        gcTyWalks = new List<string>();
         mgTargets = new List<string>();
         curLbl = "entry";
         brkTarget = 0; contTarget = 0;
@@ -277,6 +304,13 @@ partial class Irgen {
         specCtorCls = new List<Node>();
         specCtorThis = new List<Node>();
         specCtorSyms = new List<string>();
+        specFinits = new List<Node>();
+        specFinitCls = new List<Node>();
+        specFinitThis = new List<Node>();
+        specFinitSyms = new List<string>();
+        specVtCls = new List<Node>();
+        specVtArgs = new List<Node>();
+        specVtSyms = new List<string>();
         curCtorSym = "";
         instClasses = new List<string>();
         instConts = new List<Node>();
@@ -331,6 +365,7 @@ partial class Irgen {
         externDecls.Add("fseek"); externDecls.Add("ftell"); externDecls.Add("fread");
         externDecls.Add("fwrite"); externDecls.Add("fclose"); externDecls.Add("_setjmp");
         externDecls.Add("longjmp"); externDecls.Add("exit"); externDecls.Add("atoi");
+        if (hostWin) { externDecls.Add("zan_utf8_argv"); }
     }
 
     bool ExternSeen(string name) {
@@ -640,23 +675,45 @@ partial class Irgen {
         if (hostWin) {
             H("declare i32 @SetConsoleOutputCP(i32)");
             H("declare i32 @SetConsoleCP(i32)");
+            H("declare i32 @zan_utf8_argv(i32*, i8***)");
         }
         H("declare void @longjmp(i8*, i32)");
         H("declare i8* @llvm.frameaddress.p0(i32)");
         H("declare void @exit(i32)");
         H("declare i64 @atoi(i8*)");
         SeedExternBuiltins();
+        // B-ID211: decide once, before any emission, whether the GC probe
+        // runtime (and the allocation-tracking hooks in zalloc/zrelease and
+        // the zstr pair) are needed. Pre-adding the two symbols keeps the
+        // stdlib's DllImport declares out of the module -- the finalize-time
+        // EmitGcProbeRuntime defines them instead.
+        gcProbeUsed = AstUsesGcProbe(unit);
+        if (gcProbeUsed) {
+            externDecls.Add("zan_gc_detect_cycles");
+            externDecls.Add("zan_gc_write_heap_snapshot");
+        }
         EmitSyncPendingRuntime();
         EmitExceptionPayloadRuntime();
         // A native worker may enter a lock while another thread has armed
         // handlers. The dispatch, watermarks and jmp_bufs belong to the thread.
         H("@__exc_sp = thread_local global i64 0");
-        H("@__exc_stack = thread_local global [64 x i8*] zeroinitializer");
+        // B-ID199 round4: the handler frame store used to be three fixed
+        // [64]-slot globals with no bounds check -- nesting >=65 frames
+        // (deep_try_finally_nesting) wrote out of bounds and corrupted
+        // adjacent globals (64/65 ran "fine", 100 died at teardown, 300
+        // mid-run; the C host dropped its static nesting cap via landingpad
+        // EH in B-ID74). The frames now live in heap arrays that
+        // @__exc_grow doubles on demand. @__exc_stack is retired: every
+        // writer stored &bufs[depth] (the main root handler's alloca was
+        // unified into the same shape), and the single reader (the unwind
+        // landing) re-derives the frame from the depth, so the address is
+        // always computable from @__exc_sp and nothing caches stale
+        // pointers across a growth. Frames are never freed back -- the
+        // arrays stay at the peak depth, like any growable stack.
+        H("@__exc_cap = thread_local global i64 0");
+        H("@__exc_bufs = thread_local global i8* null");
         H("@__exc_val = thread_local global i8* null");
         H("@__exc_tid = thread_local global i8* null");
-        // align 32: MSVC's _setjmp stores XMM state with movaps, which faults
-        // on a default-8-aligned global buffer
-        H("@__exc_bufs = thread_local global [64 x [32 x i64]] zeroinitializer, align 32");
         H("@__zan_argc = global i32 0");
         H("@__zan_argv = global i8** null");
         H("@.mode_rb = private unnamed_addr constant [3 x i8] c\"rb\\00\"");
@@ -721,7 +778,7 @@ partial class Irgen {
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())
-                && d.sval != "Vector128" && d.sval != "Vector256") { EmitClassDtor(d); }
+                && d.sval != "Vector128" && d.sval != "Vector256") { EmitClassDtor(d); GcProbeNoteClass(d); }
             i = i + 1;
         }
         // per-struct default-instance constructor and array fill: a struct
@@ -749,7 +806,10 @@ partial class Irgen {
         // queue further specializations, so drain until the list stops growing)
         int sp = 0;
         int cp = 0;
-        while (sp < specMs.Count || cp < specCtors.Count) {
+        int fp = 0;
+        int vp = 0;
+        while (sp < specMs.Count || cp < specCtors.Count || fp < specFinitSyms.Count
+            || vp < specVtSyms.Count) {
         while (sp < specMs.Count) {
             // the clone's receiver carries the concrete type arguments of the
             // class it specializes (`Pool<string>`), so a field read inside it
@@ -790,6 +850,33 @@ partial class Irgen {
             curInstArgs = pargs; curInstCls = pcls;
             cp = cp + 1;
         }
+        // the specialized field-initializer helpers of the generic classes
+        // (B-ID216): emitted with the instantiation bound, so `new T[n]` in a
+        // field initializer builds the array descriptor for the real element
+        // type. The shared helper erases it: the accept predicate generated
+        // for the open parameter rejects every reference-element store.
+        while (fp < specFinitSyms.Count) {
+            Node pthis = curThisTy;
+            List<Node> pargs = curInstArgs; string pcls = curInstCls;
+            curThisTy = specFinitThis[fp];
+            curInstArgs = new List<Node>(); curInstCls = "";
+            if (curThisTy != null && curThisTy.kids.Count > 0) {
+                curInstArgs = curThisTy.kids;
+                curInstCls = specFinitCls[fp].sval;
+            }
+            GenFieldInitsFnAs(specFinits[fp], specFinitSyms[fp]);
+            curThisTy = pthis;
+            curInstArgs = pargs; curInstCls = pcls;
+            fp = fp + 1;
+        }
+        // B-ID218: the per-instantiation vtables queued by SpecVtableSym. A
+        // slot whose implementing body mentions the class's type parameters
+        // queues its specialized clone here, so the sp loop above picks it
+        // up in the same pass -- the table can safely reference it.
+        while (vp < specVtSyms.Count) {
+            EmitVtableAs(specVtCls[vp], specVtArgs[vp], specVtSyms[vp]);
+            vp = vp + 1;
+        }
         }
         // The coroutine runtime is emitted unconditionally, not only when the
         // program awaits something: the C runtime object the program links
@@ -802,6 +889,10 @@ partial class Irgen {
         EmitAsyncRuntime();
         if (usesDirList) { EmitDirRuntime(); }
         if (usesStrOps) { EmitStrOpsRuntime(); }
+        // B-ID211: the GC probe runtime (registry + detect + snapshot) lands
+        // after the bodies, so the pre-scan flag is final and every class
+        // the program declares has already contributed its table entry.
+        EmitGcProbeRuntime();
         head.Append(body.ToString());
         head.Append(deferred.ToString());
         // G8 round 2: whole-module dead-code pruning -- the stdlib

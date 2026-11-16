@@ -4,8 +4,77 @@ namespace Zan;
 
 partial class Irgen {
     // ---- vtable emission for polymorphic classes ----
-    // Slots are matched by name AND parameter tags so overloaded virtual
-    // methods each get their own slot bound to the right definition symbol.
+    // Compare signatures after ancestor substitution, but keep each inherited
+    // slot ABI; an erased base slot may need a concrete override adapter.
+    Node VSlotOwnerType(Node receiver, Node method) {
+        string owner = DeclOwnerOf(receiver, method);
+        Node ty = MkType(owner);
+        List<Node> args = TypeArgsForAncestor(receiver, owner, new List<Node>());
+        if (args != null) { ty.kids = args; }
+        return ty;
+    }
+
+    bool VSlotMatches(Node receiver, Node slot, Node candidate) {
+        if (slot.sval != candidate.sval || MethodParamCount(slot) != MethodParamCount(candidate)) { return false; }
+        Node slotOwner = VSlotOwnerType(receiver, slot);
+        Node implOwner = VSlotOwnerType(receiver, candidate);
+        int i = 0;
+        while (i < MethodParamCount(slot)) {
+            if (IsRefParam(slot, i) != IsRefParam(candidate, i)) { return false; }
+            Node a = binder.SubstOwner(ParamTypeNode(slot, i), slotOwner);
+            Node b = binder.SubstOwner(ParamTypeNode(candidate, i), implOwner);
+            if (!binder.SameType(a, b)) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    string EmitVSlotAdapter(Node receiver, Node slot, Node impl, string owner, int index) {
+        string slotOwner = DeclOwnerOf(receiver, slot);
+        string symbol = receiver.sval + "_vslot_" + index;
+        string rt = IsAsync(slot) ? "i8*" : MapTypeDecl(slot.type, slotOwner);
+        StringBuilder saved = body; int savedTmp = tmp; bool savedEntry = eaActive;
+        body = new StringBuilder(); tmp = 0; eaActive = false;
+        string sig = "define " + rt + " @" + symbol + "(%" + slotOwner + "* %receiver";
+        int i = 0;
+        while (i < MethodParamCount(slot)) {
+            string pt = MapTypeDecl(ParamTypeNode(slot, i), slotOwner);
+            if (IsRefParam(slot, i)) { pt = pt + "*"; }
+            sig = sig + ", " + pt + " %p" + i;
+            i = i + 1;
+        }
+        L(sig + ") {"); L("entry:");
+        string self = "%receiver";
+        if (slotOwner != owner) {
+            self = NT(); L("  " + self + " = bitcast %" + slotOwner + "* %receiver to %" + owner + "*");
+        }
+        string args = "%" + owner + "* " + self;
+        i = 0;
+        while (i < MethodParamCount(slot)) {
+            Node st = ParamTypeNode(slot, i); Node it = ParamTypeNode(impl, i);
+            if (IsRefParam(slot, i)) {
+                args = args + ", " + MapTypeDecl(it, owner) + "* %p" + i;
+            } else {
+                ExprVal value = new ExprVal("%p" + i, st);
+                if (IsErasedTypeDecl(st, slotOwner)) { value = FromSlot(value.op, it); }
+                args = args + ", " + MapTypeDecl(it, owner) + " " + CallArg(value, it, false);
+            }
+            i = i + 1;
+        }
+        string implRt = IsAsync(impl) ? "i8*" : MapTypeDecl(impl.type, owner);
+        if (implRt == "void") { L("  call void @" + MethodSym(owner, impl) + "(" + args + ")"); L("  ret void"); }
+        else {
+            string value = NT(); L("  " + value + " = call " + implRt + " @" + MethodSym(owner, impl) + "(" + args + ")");
+            ExprVal result = new ExprVal(value, impl.type);
+            string op = value;
+            if (!IsAsync(slot)) { op = IsErasedTypeDecl(slot.type, slotOwner) ? ToSlot(result, impl.type) : Coerce(result, rt); }
+            L("  ret " + rt + " " + op);
+        }
+        L("}"); deferred.Append(body.ToString());
+        body = saved; tmp = savedTmp; eaActive = savedEntry;
+        return "i8* bitcast (" + MethodFnTypeThis(slot, slotOwner) + " @" + symbol + " to i8*)";
+    }
+
     void EmitVtable(Node cls) {
         List<Node> ms = new List<Node>();
         CollectVSlotNodes(cls, ms);
@@ -13,18 +82,103 @@ partial class Irgen {
         int i = 0;
         while (i < ms.Count) {
             Node sm = ms[i];
-            string tags = ParamTags(sm);
             string impl = "";
-            Node im = null;
-            Node c = cls;
-            while (c != null) {
-                Node f = FindMethodSig(c, sm.sval, tags);
-                if (f != null && !IsAbstract(f)) { impl = c.sval; im = f; c = null; }
-                else { c = BaseClassOf(c); }
-            }
+            Node im = FindVSlotImpl(cls, sm);
+            if (im != null) { impl = DeclOwnerOf(cls, im); }
             if (im == null) { impl = ResolveImpl(cls, sm.sval); im = FindMethodUp(cls, sm.sval); }
             if (i > 0) { s = s + ", "; }
-            s = s + "i8* bitcast (" + MethodFnTypeThis(im, impl) + " @" + MethodSym(impl, im) + " to i8*)";
+            if (im == null) { s = s + "i8* null"; i = i + 1; continue; }
+            string slotOwner = DeclOwnerOf(cls, sm);
+            bool adapt = !IsAsync(sm) && MapTypeDecl(sm.type, slotOwner) != MapTypeDecl(im.type, impl);
+            bool unsupportedRef = false;
+            int pi = 0;
+            while (pi < MethodParamCount(sm)) {
+                if (MapTypeDecl(ParamTypeNode(sm, pi), slotOwner) != MapTypeDecl(ParamTypeNode(im, pi), impl)) {
+                    adapt = true;
+                    if (IsRefParam(sm, pi)) { unsupportedRef = true; }
+                }
+                pi = pi + 1;
+            }
+            if (unsupportedRef) {
+                diags.Error("generic virtual override requires unsupported ref/out ABI adaptation", sm.line, sm.col);
+                s = s + "i8* null";
+            } else if (adapt) { s = s + EmitVSlotAdapter(cls, sm, im, impl, i); }
+            else { s = s + "i8* bitcast (" + MethodFnTypeThis(im, impl) + " @" + MethodSym(impl, im) + " to i8*)"; }
+            i = i + 1;
+        }
+        s = s + "]";
+        H(s);
+    }
+
+    // the implementing method of slot `sm` for cls: the nearest declaration
+    // in cls's chain that matches the slot and is not abstract (the walk
+    // EmitVtable does, extracted so the per-instantiation tables share it)
+    Node FindVSlotImpl(Node cls, Node sm) {
+        Node c = cls;
+        while (c != null) {
+            Node f = null; int mi = 0;
+            while (mi < c.kids.Count) {
+                Node candidate = c.kids[mi];
+                if (candidate.kind == AK.MethodDecl() && VSlotMatches(cls, sm, candidate) && !IsAbstract(candidate)) {
+                    f = candidate; break;
+                }
+                mi = mi + 1;
+            }
+            if (f != null) { return f; }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    // B-ID218: the per-instantiation vtable of a generic class. Same slot
+    // walk as EmitVtable; a slot whose implementing body mentions the class's
+    // type parameters points at the specialized clone (SpecQueueTy dedups it
+    // with the call-path clones) instead of the erased body. A slot needing
+    // ABI adaptation keeps the declaration-form slot: its adapter targets the
+    // shared body, exactly as today.
+    void EmitVtableAs(Node cls, Node instTy, string sym) {
+        List<Node> ms = new List<Node>();
+        CollectVSlotNodes(cls, ms);
+        string s = "@" + sym + " = global [" + ms.Count + " x i8*] [";
+        int i = 0;
+        while (i < ms.Count) {
+            Node sm = ms[i];
+            Node im = FindVSlotImpl(cls, sm);
+            string impl = im != null ? DeclOwnerOf(cls, im) : "";
+            if (im == null) { impl = ResolveImpl(cls, sm.sval); im = FindMethodUp(cls, sm.sval); }
+            if (i > 0) { s = s + ", "; }
+            if (im == null) { s = s + "i8* null"; i = i + 1; continue; }
+            string slotOwner = DeclOwnerOf(cls, sm);
+            bool adapt = !IsAsync(sm) && MapTypeDecl(sm.type, slotOwner) != MapTypeDecl(im.type, impl);
+            bool unsupportedRef = false;
+            int pi = 0;
+            while (pi < MethodParamCount(sm)) {
+                if (MapTypeDecl(ParamTypeNode(sm, pi), slotOwner) != MapTypeDecl(ParamTypeNode(im, pi), impl)) {
+                    adapt = true;
+                    if (IsRefParam(sm, pi)) { unsupportedRef = true; }
+                }
+                pi = pi + 1;
+            }
+            string csym = "";
+            if (!adapt && impl != "") {
+                Node oc = binder.FindType(impl);
+                List<string> iptps = oc != null ? TParams(oc) : new List<string>();
+                if (iptps.Count > 0) {
+                    List<Node> bargs = TypeArgsForAncestor(cls, impl, instTy.kids);
+                    if (bargs != null && bargs.Count == iptps.Count && MentionsTPDeep(im)) {
+                        List<string> tns = new List<string>();
+                        List<Node> trs = new List<Node>();
+                        int bi = 0;
+                        while (bi < iptps.Count) { tns.Add(iptps[bi]); trs.Add(bargs[bi]); bi = bi + 1; }
+                        string tag = SpecTagC(im, bargs, new List<string>(), tns, trs, "I");
+                        if (tag != "") { csym = SpecQueueTy(impl, im, tns, trs, tag, InstType(impl, bargs)); }
+                    }
+                }
+            }
+            if (csym != "") { s = s + "i8* bitcast (" + MethodFnTypeThis(im, impl) + " @" + csym + " to i8*)"; }
+            else if (unsupportedRef) { s = s + "i8* null"; }
+            else if (adapt) { s = s + "i8* bitcast (" + MethodFnTypeThis(sm, slotOwner) + " @" + cls.sval + "_vslot_" + i + " to i8*)"; }
+            else { s = s + "i8* bitcast (" + MethodFnTypeThis(im, impl) + " @" + MethodSym(impl, im) + " to i8*)"; }
             i = i + 1;
         }
         s = s + "]";
@@ -287,6 +441,25 @@ partial class Irgen {
         return false;
     }
 
+    // does an AST node mention a type parameter anywhere -- a TypeRef with
+    // its name, a bound type field, or deeper in the expression tree. The
+    // per-instantiation vtable uses it to pick the slots whose implementing
+    // body has to be cloned: an `o is T` test folds to a constant in the
+    // erased shared body, and so does every other T-typed step.
+    bool MentionsTPDeep(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == AK.TypeRef() && MentionsTypeParam(n)) { return true; }
+        if (n.type != null && MentionsTypeParam(n.type)) { return true; }
+        if (n.methodGroupTarget != null && MentionsTypeParam(n.methodGroupTarget)) { return true; }
+        if (n.a != null && MentionsTPDeep(n.a)) { return true; }
+        if (n.b != null && MentionsTPDeep(n.b)) { return true; }
+        if (n.c != null && MentionsTPDeep(n.c)) { return true; }
+        if (n.d != null && MentionsTPDeep(n.d)) { return true; }
+        int i = 0;
+        while (i < n.kids.Count) { if (MentionsTPDeep(n.kids[i])) { return true; } i = i + 1; }
+        return false;
+    }
+
     // static type of an expression-bodied lambda's result, with its typed
     // parameters visible (only same-name parameter references are resolved).
     Node LambdaRetType(Node lam) {
@@ -310,6 +483,55 @@ partial class Irgen {
             i = i + 1;
         }
         return ArgTypeNode(b);
+    }
+
+    // LambdaRetType with the lambda's untyped parameters bound from the
+    // CANDIDATE's delegate parameter type: `q.OrderBy(a => a.name)` has a
+    // typeless `a`, so only the candidate (Func<T,string> vs Func<T,int>)
+    // knows a's type -- inferring without it ties both overloads at +8 and
+    // the first-declared one wins, which then feeds AnnotateLambda the wrong
+    // return type (B-ID199 r9, generic_delegate_overload). The candidate's
+    // Func args name the CLASS's type parameter (Func<T,int>), so they are
+    // substituted with the call site's receiver type (Query<Entity>) before
+    // use; DelegateParams already implements that extraction.
+    Node LambdaRetTypeForCand(Node lam, Node pt, Node recvTy) {
+        if (lam == null || lam.a == null) { return null; }
+        bool needs = false;
+        int i = 0;
+        while (i < lam.kids.Count) {
+            Node p = lam.kids[i];
+            // a checker annotation can leave the CLASS's type parameter (T) on
+            // an untyped lambda parameter -- that is not a concrete type, the
+            // candidate still has to provide the binding
+            if (p.kind == AK.Param() && (p.type == null || p.type.sval == "var"
+                || binder.IsTypeParam(p.type.sval))) { needs = true; }
+            i = i + 1;
+        }
+        if (!needs || pt == null) { return LambdaRetType(lam); }
+        if (!(pt.sval.StartsWith("Func") || pt.sval.StartsWith("Action")
+            || pt.sval.StartsWith("Predicate") || IsDelegate(pt))) { return LambdaRetType(lam); }
+        List<Node> dpts = binder.DelegateParams(binder.SubstOwner(pt, recvTy));
+        Node b = lam.a;
+        if (b.kind == AK.MemberAccess() && b.a != null && b.a.kind == AK.Ident()) {
+            i = 0;
+            while (i < lam.kids.Count) {
+                Node p = lam.kids[i];
+                if (p.kind == AK.Param() && p.sval == b.a.sval && i < dpts.Count) {
+                    Node at = dpts[i];
+                    if (at != null) {
+                        Node tc = binder.FindType(at.sval);
+                        if (tc != null) {
+                            Node fty = FieldType(tc, b.sval);
+                            if (fty != null) { return SubstRecvTy(fty, at); }
+                            Node gm = FindMethodUp(tc, "get_" + b.sval);
+                            if (gm != null) { return SubstRecvTy(gm.type, at); }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return LambdaRetType(lam);
     }
 
     // The LLVM symbol for a method. Non-overloaded names stay `Owner_Name`
@@ -414,6 +636,87 @@ partial class Irgen {
             specCtorCls.Add(cls);
             specCtorThis.Add(instTy);
             specCtorSyms.Add(sym);
+        }
+        return sym;
+    }
+
+    // B-ID216: the specialized FIELD-INITIALIZER helper of a generic class --
+    // the helper that stands in for the implicit parameterless constructor.
+    // The shared helper allocates `new T[n]` with the erased element type, so
+    // the array descriptor (accept predicate, ARC kind, shape key) is built
+    // for the OPEN parameter: every reference-element store into such an
+    // array is rejected at runtime and nothing retains. The queued clone
+    // carries the concrete field types, exactly like SpecCtorSym.
+    string SpecFieldInitsSym(string owner, Node instTy) {
+        Node cls = binder.FindType(owner);
+        if (cls == null) { return "__zan_finits_" + owner; }
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || instTy == null) { return "__zan_finits_" + owner; }
+        if (instTy.kids.Count != tps.Count) { return "__zan_finits_" + owner; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("__zan_finits_" + owner);
+        sb.Append("__SPI");
+        int i = 0;
+        while (i < instTy.kids.Count) {
+            if (instTy.kids[i] == null || MentionsTypeParam(instTy.kids[i])) { return "__zan_finits_" + owner; }
+            sb.Append("_");
+            sb.Append(TypeTag(instTy.kids[i]));
+            i = i + 1;
+        }
+        string sym = sb.ToString();
+        if (IndexOfStr(specFinitSyms, sym) < 0) {
+            specFinitSyms.Add(sym);
+            specFinits.Add(CloneSubst(cls, tps, instTy.kids));
+            specFinitCls.Add(cls);
+            specFinitThis.Add(instTy);
+        }
+        return sym;
+    }
+
+    // does the class have a virtual slot whose implementing body mentions a
+    // type parameter -- the precondition for a per-instantiation table
+    // (B-ID218). An impl whose declaring class is not generic cannot have a
+    // T-mentioning body bound to THIS class's parameters.
+    bool VTableNeedsSpec(Node cls) {
+        List<Node> ms = new List<Node>();
+        CollectVSlotNodes(cls, ms);
+        int i = 0;
+        while (i < ms.Count) {
+            Node im = FindVSlotImpl(cls, ms[i]);
+            if (im != null) {
+                Node oc = binder.FindType(DeclOwnerOf(cls, im));
+                if (oc != null && TParams(oc).Count > 0 && MentionsTPDeep(im)) { return true; }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // B-ID218: the per-instantiation vtable symbol of a generic class, ""
+    // when the instantiation shares the declaration-form table (no type
+    // parameters, an incomplete binding, or no virtual body mentions them).
+    // Queues the table for the drain loop in Gen, mirroring
+    // SpecFieldInitsSym.
+    string SpecVtableSym(Node cls, Node instTy) {
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || instTy == null || instTy.kids.Count != tps.Count) { return ""; }
+        if (!VTableNeedsSpec(cls)) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(cls.sval);
+        sb.Append("__SPI");
+        int i = 0;
+        while (i < instTy.kids.Count) {
+            if (instTy.kids[i] == null || MentionsTypeParam(instTy.kids[i])) { return ""; }
+            sb.Append("_");
+            sb.Append(TypeTag(instTy.kids[i]));
+            i = i + 1;
+        }
+        sb.Append("_vtable");
+        string sym = sb.ToString();
+        if (IndexOfStr(specVtSyms, sym) < 0) {
+            specVtSyms.Add(sym);
+            specVtCls.Add(cls);
+            specVtArgs.Add(instTy);
         }
         return sym;
     }
@@ -527,6 +830,13 @@ partial class Irgen {
         return null;
     }
 
+    // Native Math.Min/Max share one semantic overload contract with GenMathCall.
+    Node MathMinMaxType(Node a, Node b) {
+        string result = NumericBuiltinContract.MinMaxResult(a, b);
+        if (result == "") { return null; }
+        return MkType(result);
+    }
+
     // The result type of a call: the callee's return type with the type
     // arguments applied.
     Node CallResultType(Node e) {
@@ -549,7 +859,10 @@ partial class Irgen {
                     }
                     return MkType("double");
                 }
-                if (mn == "Max" || mn == "Min" || mn == "Clamp") {
+                if ((mn == "Max" || mn == "Min") && e.kids.Count == 2) {
+                    return MathMinMaxType(ArgTypeNode(e.kids[0]), ArgTypeNode(e.kids[1]));
+                }
+                if (mn == "Clamp") {
                     int k = 0;
                     bool anyDbl = false;
                     while (k < e.kids.Count) {
@@ -640,7 +953,7 @@ partial class Irgen {
         if (k == AK.Ident()) {
             int li = LocalIdx(e.sval);
             if (li >= 0) { return locType[li]; }
-            return FieldType(binder.FindType(curClass), e.sval);
+            return binder.MemberType(CurThisTy(), e.sval);
         }
         if (k == AK.MemberAccess()) {
             if (e.a != null && e.a.kind == AK.Ident()) {
@@ -685,8 +998,8 @@ partial class Irgen {
             }
             Node cls = ClassOf(ot);
             if (cls != null) {
-                Node fty = FieldType(cls, e.sval);
-                if (fty != null) { return SubstRecvTy(fty, ot); }
+                Node fty = binder.MemberType(ot, e.sval);
+                if (fty != null) { return fty; }
                 return null;
             }
             return null;
@@ -784,50 +1097,71 @@ partial class Irgen {
         return n;
     }
 
-    // The method a METHOD-GROUP argument names: `Cls.Method` where Cls is a
-    // class (not a local) and Method is one of its methods. The C host's
-    // arg_method_group (src/compiler/irgen_expr_core.c:820); `arity` picks
-    // the overload (the delegate's parameter count), -1 for the first one.
-    Node ArgMethodGroup(Node arg, int arity) {
-        if (arg == null || arg.kind != AK.MemberAccess()) { return null; }
-        if (arg.a == null || arg.a.kind != AK.Ident()) { return null; }
-        if (LocalIdx(arg.a.sval) >= 0) { return null; }
-        Node cls = binder.FindType(arg.a.sval);
-        if (cls == null) { return null; }
-        if (cls.kind != AK.ClassDecl() && cls.kind != AK.StructDecl()) { return null; }
-        if (FieldIndex(cls, arg.sval) >= 0) { return null; }
-        if (arity >= 0) {
-            Node c = cls;
-            while (c != null) {
-                int i = 0;
-                while (i < c.kids.Count) {
-                    Node mm = c.kids[i];
-                    if (mm.kind == AK.MethodDecl() && mm.sval == arg.sval
-                        && MethodParamCount(mm) == arity) { return mm; }
-                    i = i + 1;
-                }
-                c = BaseClassOf(c);
+    Node MethodGroupReceiver(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.Ident()) {
+            if (LocalIdx(e.sval) >= 0) { return null; }
+            return CurThisTy();
+        }
+        if (e.kind != AK.MemberAccess() || e.a == null) { return null; }
+        if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && !ShadowsTypeName(e.a.sval)) {
+            Node cls = binder.FindType(e.a.sval);
+            if (cls != null) {
+                Node ty = MkType(cls.sval);
+                List<Node> args = InstArgsOf(e);
+                if (args != null) { ty.kids = args; }
+                return ty;
             }
         }
-        return FindMethodUp(cls, arg.sval);
+        return ArgTypeNode(e.a);
     }
 
-    // Method group fits delegate-typed parameter when arity matches.
-    int MethodGroupScore(Node m, Node pt) {
-        if (m == null) { return -1; }
-        if (pt == null || !IsDelegate(pt)) { return -1; }
-        if (DelegParams(pt).Count != MethodParamCount(m)) { return -1; }
-        int score = 2;
-        Node rt = m.type;
-        Node dr = DelegRet(pt);
-        if (rt != null && dr != null && !MentionsTypeParam(rt) && !MentionsTypeParam(dr)) {
-            if (TypeTag(rt) == TypeTag(dr)) { score = score + 2; }
-            else {
-                int rf = TypeFamily(rt); int df = TypeFamily(dr);
-                if (rf != df && rf != 0 && df != 0) { return -1; }
-            }
+    int MethodGroupForm(Node e) {
+        if (e.kind == AK.Ident()) { return curHasThis ? 0 : 1; }
+        if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+            && !ShadowsTypeName(e.a.sval) && binder.FindType(e.a.sval) != null) { return 1; }
+        return 2;
+    }
+
+    bool IsMethodGroup(Node e) {
+        Node recv = MethodGroupReceiver(e);
+        return recv != null && binder.HasMethodGroup(recv, e.sval);
+    }
+
+    MethodGroupBinding ResolveMethodGroup(Node e, Node target) {
+        return binder.ResolveMethodGroup(MethodGroupReceiver(e), e.sval, MethodGroupForm(e), InstDelegateType(target));
+    }
+
+    Node MethodGroupCallParam(Node m, Node call, int index) {
+        Node pt = ParamTypeNode(m, index);
+        Node recv = null;
+        if (call.kind == AK.NewExpr()) { recv = call.type; }
+        else if (call.a != null && call.a.kind == AK.MemberAccess()) {
+            recv = MethodGroupReceiver(call.a);
+        } else { recv = CurThisTy(); }
+        Node owner = recv; int depth = 0;
+        while (owner != null && depth < 64) {
+            Node cls = binder.FindType(owner.sval);
+            if (cls == null) { break; }
+            int i = 0; bool found = false;
+            while (i < cls.kids.Count) { if (cls.kids[i] == m) { found = true; break; } i = i + 1; }
+            if (found) { return binder.SubstOwner(pt, owner); }
+            owner = binder.BaseType(owner); depth = depth + 1;
         }
-        return score;
+        return pt;
+    }
+
+    bool MethodGroupArgsFit(Node m, Node call) {
+        int i = 0;
+        while (i < call.kids.Count) {
+            Node arg = call.kids[i];
+            if (IsMethodGroup(arg)) {
+                Node pt = MethodGroupCallParam(m, call, i);
+                if (pt == null || !IsDelegate(pt) || ResolveMethodGroup(arg, pt).method == null) { return false; }
+            }
+            i = i + 1;
+        }
+        return true;
     }
 
     // The explicit type arguments of a call (`M<int>(x)`), if any.
@@ -877,7 +1211,7 @@ partial class Irgen {
     // static/instance context, +4 for each exact argument-type match, -1 for a
     // known mismatch (an implicit conversion may still apply, so it is not
     // disqualifying). Unknown argument types are neutral.
-    int ScoreCand(Node m, Node e, int argc, bool wantStatic) {
+    int ScoreCand(Node m, Node e, int argc, bool wantStatic, Node recvTy) {
         int score = 0;
         if (IsStatic(m) == wantStatic) { score = score + 1; }
         // explicit type arguments pick generic overload
@@ -908,7 +1242,7 @@ partial class Irgen {
                     score = score + 8;
                     if (pt != null && (pt.sval == "Func" || pt.sval.StartsWith("Func")) && pt.kids.Count > 0) {
                         Node retType = pt.kids[pt.kids.Count - 1];
-                        Node lrt = LambdaRetType(arg);
+                        Node lrt = LambdaRetTypeForCand(arg, pt, recvTy);
                         if (lrt != null) {
                             if (TypeTag(lrt) == TypeTag(retType)) { score = score + 4; }
                             else { score = score - 1; }
@@ -917,7 +1251,7 @@ partial class Irgen {
                         Node dd = null;
                         if (pt != null) { dd = binder.FindDelegate(pt.sval); }
                         if (dd != null && !MentionsTypeParam(dd.type)) {
-                            Node lrt = LambdaRetType(arg);
+                            Node lrt = LambdaRetTypeForCand(arg, pt, recvTy);
                             if (lrt != null) {
                                 if (TypeTag(lrt) == TypeTag(dd.type)) { score = score + 4; }
                                 else { score = score - 1; }
@@ -932,15 +1266,10 @@ partial class Irgen {
                 a = a + 1;
                 continue;
             }
-            // a method group (`Cls.Method` used as a value) fits a
-            // delegate-typed parameter: the C host's method_group_score
-            Node paty = pt;
-            int parity = -1;
-            if (paty != null && IsDelegate(paty)) { parity = DelegParams(paty).Count; }
-            Node mg = ArgMethodGroup(arg, parity);
-            if (mg != null) {
-                int ms = MethodGroupScore(mg, paty);
-                if (ms > 0) { score = score + ms; }
+            if (IsMethodGroup(arg)) {
+                Node target = MethodGroupCallParam(m, e, a);
+                if (target == null || ResolveMethodGroup(arg, target).method == null) { return -1000000; }
+                score = score + 4;
                 a = a + 1;
                 continue;
             }
@@ -989,7 +1318,7 @@ partial class Irgen {
         }
         Node cls = binder.FindType(clsName);
         if (cls == null) { return false; }
-        Node m = ResolveMethod(cls, methName, e, true);
+        Node m = ResolveMethod(cls, methName, e, true, null);
         if (m == null) { return false; }
         return HasMod(m, MOD.Extern());
     }
@@ -1026,7 +1355,7 @@ partial class Irgen {
     // overloads we keep those whose arity admits the call, then pick the best
     // argument-type match for the caller's static/instance context; an empty
     // candidate set or a tie is a diagnostic.
-    Node ResolveMethod(Node cls, string name, Node e, bool wantStatic) {
+    Node ResolveMethod(Node cls, string name, Node e, bool wantStatic, Node recvTy) {
         if (cls == null) { return null; }
         // The candidates are the class's own overloads PLUS the inherited ones:
         // C# resolves a call over the whole hierarchy, and a derived member
@@ -1041,7 +1370,7 @@ partial class Irgen {
         List<Node> fit = new List<Node>();
         int i = 0;
         while (i < cands.Count) {
-            if (AcceptsArity(cands[i], argc)) { fit.Add(cands[i]); }
+            if (AcceptsArity(cands[i], argc) && MethodGroupArgsFit(cands[i], e)) { fit.Add(cands[i]); }
             i = i + 1;
         }
         if (fit.Count == 0) {
@@ -1055,7 +1384,7 @@ partial class Irgen {
         int mx = -2000000000;
         List<int> sc = new List<int>();
         i = 0;
-        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, wantStatic); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
+        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, wantStatic, recvTy); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
         int cntMax = 0;
         Node best = fit[0];
         i = 0;
@@ -1068,10 +1397,10 @@ partial class Irgen {
     }
 
     // Like ResolveMethod but walks base classes, matching FindMethodUp.
-    Node ResolveMethodUp(Node cls, string name, Node e, bool wantStatic) {
+    Node ResolveMethodUp(Node cls, string name, Node e, bool wantStatic, Node recvTy) {
         Node c = cls;
         while (c != null) {
-            Node m = ResolveMethod(c, name, e, wantStatic);
+            Node m = ResolveMethod(c, name, e, wantStatic, recvTy);
             if (m != null) { return m; }
             if (c.interfaces != null) {
                 int ii = 0;
@@ -1081,7 +1410,7 @@ partial class Irgen {
                     string baseIf = ilt > 0 ? iname.Substring(0, ilt) : iname;
                     Node iface = binder.FindType(baseIf);
                     if (iface != null) {
-                        Node im = ResolveMethodUp(iface, name, e, wantStatic);
+                        Node im = ResolveMethodUp(iface, name, e, wantStatic, recvTy);
                         if (im != null) { return im; }
                     }
                     ii = ii + 1;
@@ -1180,10 +1509,10 @@ partial class Irgen {
                         if (DelegParams(pt).Count != LambdaArity(arg)) { return false; }
                     }
                     else {
-                        int parity = -1;
-                        if (pt != null && IsDelegate(pt)) { parity = DelegParams(pt).Count; }
-                        Node mg = ArgMethodGroup(arg, parity);
-                        if (mg != null && MethodGroupScore(mg, pt) < 0) { return false; }
+                        if (IsMethodGroup(arg)) {
+                            Node target = MethodGroupCallParam(ctor, e, j);
+                            if (target == null || ResolveMethodGroup(arg, target).method == null) { return false; }
+                        }
                     }
                 }
                 j = j + 1;
@@ -1219,7 +1548,7 @@ partial class Irgen {
         int mx = -2000000000;
         List<int> sc = new List<int>();
         i = 0;
-        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, false); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
+        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, false, null); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
         i = 0;
         while (i < fit.Count) { if (sc[i] == mx) { return fit[i]; } i = i + 1; }
         return fit[0];
@@ -1265,7 +1594,7 @@ partial class Irgen {
                     int j = 0;
                     bool found = false;
                     while (j < ms.Count) {
-                        if (ms[j].sval == m.sval && ParamTags(ms[j]) == tags) { found = true; break; }
+                        if (VSlotMatches(cls, ms[j], m)) { found = true; break; }
                         j = j + 1;
                     }
                     if (!found) { ms.Add(m); }
@@ -1290,7 +1619,7 @@ partial class Irgen {
         string tags = ParamTags(m);
         int i = 0;
         while (i < ms.Count) {
-            if (ms[i].sval == m.sval && ParamTags(ms[i]) == tags) { return i; }
+            if (VSlotMatches(cls, ms[i], m)) { return i; }
             i = i + 1;
         }
         int hit = 0 - 1;

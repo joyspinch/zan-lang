@@ -138,6 +138,13 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
 int32_t zan_proc_start_program_safe(const char *exe, const char *log_path);
 int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
                               char **out_buf, int32_t *out_len, int32_t *exit_code);
+#if !defined(_WIN32) && !defined(__wasm32__)
+/* <=0: infinite; timeout: return 0, partial output and exit_code -1.
+ * Kills/reaps the direct child; descendants cannot prolong output draining. */
+int32_t zan_proc_capture_safe_timeout(const char *exe, const char **args, int32_t argc,
+                                      char **out_buf, int32_t *out_len,
+                                      int32_t *exit_code, int32_t timeout_ms);
+#endif
 void zan_proc_free_buf(char *buf);
 
 long long zan_file_time(const char *path, int which);

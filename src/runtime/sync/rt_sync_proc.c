@@ -126,6 +126,8 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
 }
 
 #ifndef _WIN32
+#include <sys/ioctl.h>
+
 #if !defined(__linux__)
 static pthread_mutex_t g_proc_pipe_guard = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t g_proc_pipe_once = PTHREAD_ONCE_INIT;
@@ -172,10 +174,66 @@ failed:
 #endif
     return -1;
 }
+
+/* The CLOEXEC writer reports failure until the final exec succeeds. Reuse this
+ * handshake for both detached APIs: reaping the intermediate fork alone cannot
+ * distinguish successful exec from a missing executable/interpreter. */
+static int32_t zan_proc_launch_detached(const char *exe, char *const argv[],
+                                         const char *log_path) {
+    int launch_pipe[2];
+    if (zan_proc_launch_pipe(launch_pipe) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(launch_pipe[0]);
+        close(launch_pipe[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        close(launch_pipe[0]);
+        if (setsid() < 0) goto launch_failed;
+        pid_t gc = fork();
+        if (gc < 0) goto launch_failed;
+        if (gc == 0) {
+            int input = open("/dev/null", O_RDONLY);
+            if (input < 0) goto launch_failed;
+            int ok = dup2(input, STDIN_FILENO);
+            if (input > STDERR_FILENO) close(input);
+            if (ok < 0) goto launch_failed;
+            int output = log_path && log_path[0]
+                ? open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644)
+                : open("/dev/null", O_WRONLY);
+            if (output < 0) goto launch_failed;
+            int out_ok = dup2(output, STDOUT_FILENO);
+            int err_ok = dup2(output, STDERR_FILENO);
+            if (output > STDERR_FILENO) close(output);
+            if (out_ok < 0 || err_ok < 0) goto launch_failed;
+            execvp(exe, argv);
+            goto launch_failed;
+        }
+        close(launch_pipe[1]);
+        _exit(0);
+launch_failed: {
+            char failed = 1;
+            while (write(launch_pipe[1], &failed, 1) < 0 && errno == EINTR) {}
+            _exit(127);
+        }
+    }
+    close(launch_pipe[1]);
+    char failed;
+    ssize_t launch_result;
+    do { launch_result = read(launch_pipe[0], &failed, 1); }
+    while (launch_result < 0 && errno == EINTR);
+    close(launch_pipe[0]);
+    int st;
+    while (waitpid(pid, &st, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return launch_result == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
 #endif
 
 int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t argc) {
-    if (!exe) return -1;
+    if (!exe || argc < 0 || (argc > 0 && !args)) return -1;
 #ifdef _WIN32
     char *cmdline = zan_win_quote_cmdline(exe, args, argc);
     if (!cmdline) return -1;
@@ -210,52 +268,9 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
     }
     argv[argc + 1] = NULL;
 
-    int launch_pipe[2];
-    if (zan_proc_launch_pipe(launch_pipe) < 0) { free(argv); return -1; }
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(launch_pipe[0]);
-        close(launch_pipe[1]);
-        free(argv);
-        return -1;
-    }
-    if (pid == 0) {
-        close(launch_pipe[0]);
-        /* 双重 fork 隔离守护子进程 */
-        if (setsid() < 0) goto launch_failed;
-        pid_t gc = fork();
-        if (gc < 0) goto launch_failed;
-        if (gc == 0) {
-            int devnull = open("/dev/null", O_RDWR);
-            if (devnull >= 0) {
-                dup2(devnull, STDIN_FILENO);
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                if (devnull > STDERR_FILENO) close(devnull);
-            }
-            execvp(exe, argv);
-            goto launch_failed;
-        }
-        close(launch_pipe[1]);
-        _exit(0);
-launch_failed: {
-            char failed = 1;
-            while (write(launch_pipe[1], &failed, 1) < 0 && errno == EINTR) {}
-            _exit(127);
-        }
-    }
+    int32_t result = zan_proc_launch_detached(exe, argv, NULL);
     free(argv);
-    close(launch_pipe[1]);
-    char failed;
-    ssize_t launch_result;
-    do { launch_result = read(launch_pipe[0], &failed, 1); }
-    while (launch_result < 0 && errno == EINTR);
-    close(launch_pipe[0]);
-    int st;
-    while (waitpid(pid, &st, 0) < 0) {
-        if (errno != EINTR) return -1;
-    }
-    return launch_result == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+    return result;
 #endif
 }
 
@@ -322,49 +337,152 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
     CloseHandle(pi.hThread);
     return 0;
 #else
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        if (setsid() < 0) _exit(127);
-        pid_t gc = fork();
-        if (gc < 0) _exit(127);
-        if (gc == 0) {
-            int devnull = open("/dev/null", O_RDONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDIN_FILENO);
-                if (devnull > STDIN_FILENO) close(devnull);
-            }
-            if (log_path && log_path[0]) {
-                int outfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-                if (outfd >= 0) {
-                    dup2(outfd, STDOUT_FILENO);
-                    dup2(outfd, STDERR_FILENO);
-                    if (outfd > STDERR_FILENO) close(outfd);
-                }
-            } else {
-                int outnull = open("/dev/null", O_WRONLY);
-                if (outnull >= 0) {
-                    dup2(outnull, STDOUT_FILENO);
-                    dup2(outnull, STDERR_FILENO);
-                    if (outnull > STDERR_FILENO) close(outnull);
-                }
-            }
-            char *argv[2];
-            argv[0] = (char *)exe;
-            argv[1] = NULL;
-            execvp(exe, argv);
-            _exit(127);
-        }
-        _exit(0);
-    }
-    /* 回收中间引导进程防止僵尸进程 */
-    int st;
-    while (waitpid(pid, &st, 0) < 0) {
-        if (errno != EINTR) return -1;
-    }
-    return 0;
+    char *argv[] = {(char *)exe, NULL};
+    return zan_proc_launch_detached(exe, argv, log_path);
 #endif
 }
+
+#ifndef _WIN32
+static int zan_proc_capture_append(char **buf, size_t *cap, size_t *len,
+                                    const char *bytes, size_t count) {
+    /* out_len is int32_t; never truncate it or overflow the grow calculation. */
+    if (count > (size_t)2147483647 - *len) return -1;
+    size_t need = *len + count + 1;
+    if (need > *cap) {
+        size_t grown = *cap;
+        while (grown < need) grown *= 2;
+        char *next = (char *)realloc(*buf, grown);
+        if (!next) return -1;
+        *buf = next;
+        *cap = grown;
+    }
+    memcpy(*buf + *len, bytes, count);
+    *len += count;
+    return 0;
+}
+
+/* Preserve the original six-argument ABI. Only this new POSIX entry receives a
+ * deadline; timeout_ms <= 0 means infinite, just like the public Zan API.
+ * A timeout is a captured result (return 0, exit_code -1), retaining partial
+ * output. Other errors return -1 and transfer no buffer to the caller. */
+int32_t zan_proc_capture_safe_timeout(const char *exe, const char **args, int32_t argc,
+                                      char **out_buf, int32_t *out_len,
+                                      int32_t *exit_code, int32_t timeout_ms) {
+    if (!out_buf || !out_len || !exit_code) return -1;
+    *out_buf = NULL;
+    *out_len = 0;
+    *exit_code = -1;
+    if (!exe || argc < 0 || (argc > 0 && !args)) return -1;
+    int64_t deadline = timeout_ms > 0
+        ? zan_monotonic_us() + (int64_t)timeout_ms * 1000 : 0;
+    int pipefd[2];
+    if (zan_proc_launch_pipe(pipefd) < 0) return -1;
+    int flags = fcntl(pipefd[0], F_GETFL);
+    if (flags < 0 || fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(pipefd[0]); close(pipefd[1]); return -1;
+    }
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)malloc(cap);
+    char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
+    if (!buf || !argv) {
+        free(buf); free(argv);
+        close(pipefd[0]); close(pipefd[1]); return -1;
+    }
+    argv[0] = (char *)exe;
+    for (int32_t i = 0; i < argc; i++) argv[i + 1] = (char *)args[i];
+    argv[argc + 1] = NULL;
+    pid_t pid = fork();
+    if (pid < 0) {
+        free(buf); free(argv);
+        close(pipefd[0]); close(pipefd[1]); return -1;
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
+            dup2(pipefd[1], STDERR_FILENO) < 0) _exit(127);
+        close(pipefd[1]);
+        execvp(exe, argv);
+        _exit(127);
+    }
+    free(argv);
+    close(pipefd[1]);
+    int reaped = 0, eof = 0, failed = 0, timed_out = 0, status = 0;
+    char bytes[4096];
+    for (;;) {
+        if (deadline && zan_monotonic_us() >= deadline) { timed_out = 1; break; }
+        if (!reaped) {
+            pid_t waited = waitpid(pid, &status, WNOHANG);
+            if (waited == pid) reaped = 1;
+            else if (waited < 0) {
+                if (errno == EINTR) continue; /* Recheck the deadline too. */
+                if (errno == ECHILD) reaped = 1; /* No longer own this PID. */
+                failed = 1;
+                break;
+            }
+        }
+        if (!eof) {
+            ssize_t got = read(pipefd[0], bytes, sizeof(bytes));
+            if (got > 0) {
+                if (zan_proc_capture_append(&buf, &cap, &len, bytes, (size_t)got) < 0) {
+                    failed = 1; break;
+                }
+                /* One chunk per iteration: an always-ready writer must not
+                 * hide the clock behind an unbounded drain loop. */
+                continue;
+            }
+            if (got == 0) eof = 1;
+            else if (errno == EINTR) continue;
+            else if (errno != EAGAIN && errno != EWOULDBLOCK) { failed = 1; break; }
+        }
+        if (reaped && eof) break;
+        int wait_ms = 10;
+        if (deadline) {
+            int64_t left = deadline - zan_monotonic_us();
+            if (left <= 0) continue;
+            if (left < 10000) wait_ms = (int)((left + 999) / 1000);
+        }
+        /* EOF does not mean the child exited. Conversely, child exit does not
+         * mean EOF when descendants inherited stdout. Both obey the deadline. */
+        struct pollfd ready = {eof ? -1 : pipefd[0], POLLIN, 0};
+        int polled = poll(&ready, 1, wait_ms);
+        if ((polled < 0 && errno != EINTR) || (ready.revents & POLLNVAL)) {
+            failed = 1; break;
+        }
+    }
+    if ((timed_out || failed) && !reaped) {
+        kill(pid, SIGKILL);
+        pid_t waited;
+        do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        if (waited != pid) failed = 1;
+    }
+    if (timed_out && !failed && !eof) {
+        /* Drain only the bytes already buffered after termination/reap. A
+         * descendant may keep writing; waiting for its EOF would defeat timeout. */
+        int pending = 0;
+        if (ioctl(pipefd[0], FIONREAD, &pending) == 0) {
+            while (pending > 0) {
+                size_t count = pending < (int)sizeof(bytes) ? (size_t)pending : sizeof(bytes);
+                ssize_t got = read(pipefd[0], bytes, count);
+                if (got <= 0) break;
+                if (zan_proc_capture_append(&buf, &cap, &len, bytes, (size_t)got) < 0) {
+                    failed = 1; break;
+                }
+                pending -= (int)got;
+            }
+        }
+    }
+    close(pipefd[0]);
+    if (failed) { free(buf); return -1; }
+    buf[len] = '\0';
+    *out_buf = buf;
+    *out_len = (int32_t)len;
+    if (!timed_out) {
+        if (WIFEXITED(status)) *exit_code = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) *exit_code = 128 + WTERMSIG(status);
+    }
+    return 0;
+}
+#endif
 
 int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
                               char **out_buf, int32_t *out_len, int32_t *exit_code) {
@@ -455,78 +573,7 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
     *exit_code = (int32_t)code;
     return 0;
 #else
-    int pipefd[2];
-    if (pipe(pipefd) < 0) return -1;
-    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
-    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
-
-    char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
-    if (!argv) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -1;
-    }
-    argv[0] = (char *)exe;
-    for (int32_t i = 0; i < argc; i++) {
-        argv[i + 1] = (char *)args[i];
-    }
-    argv[argc + 1] = NULL;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        free(argv);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        /* Child */
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-        execvp(exe, argv);
-        _exit(127);
-    }
-    free(argv);
-
-    close(pipefd[1]);
-    size_t cap = 4096;
-    size_t len = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) {
-        close(pipefd[0]);
-        return -1;
-    }
-
-    ssize_t r;
-    while ((r = read(pipefd[0], buf + len, cap - len - 1)) > 0 ||
-           (r < 0 && errno == EINTR)) {
-        if (r > 0) {
-            len += (size_t)r;
-            if (len + 1024 >= cap) {
-                cap *= 2;
-                char *nb = (char *)realloc(buf, cap);
-                if (!nb) break;
-                buf = nb;
-            }
-        }
-    }
-    close(pipefd[0]);
-    buf[len] = '\0';
-
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) break;
-    }
-    int code = -1;
-    if (WIFEXITED(status)) code = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
-
-    *out_buf = buf;
-    *out_len = (int32_t)len;
-    *exit_code = code;
-    return 0;
+    return zan_proc_capture_safe_timeout(exe, args, argc, out_buf, out_len, exit_code, -1);
 #endif
 }
 

@@ -386,7 +386,11 @@ int zan_join_bind(long long entry, void *frame, int idx) {
     if (!j || !frame) return 0;
     int bound = 0;
     live_lock();
-    if (live_has_nolock(frame)) {
+    /* An empty live table means no coroutine was ever tracked: the frame
+     * cannot be live, so skip instead of indexing g_colive_slots with a
+     * full-width hash (cap==0 makes mask==SIZE_MAX and the slot load faults,
+     * B-ID212). */
+    if (g_colive_cap != 0 && live_has_nolock(frame)) {
         int32_t done = __atomic_load_n(
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);

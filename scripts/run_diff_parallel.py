@@ -13,7 +13,10 @@
 # final summary line is byte-identical to the sequential loop's.
 
 import argparse
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,10 +58,74 @@ def read_golden(path):
         return f.read().decode(errors="replace")
 
 
+def stage(a, name, command, timeout):
+    rc, out, err = run_cmd(command, a.workdir, timeout)
+    if a.log_dir:
+        for suffix, text in [("exit", str(rc) + "\n"), ("stdout", out),
+                             ("stderr", err), ("command.json", json.dumps(command))]:
+            with open(os.path.join(a.log_dir, name + "." + suffix), "w", encoding="utf-8") as f:
+                f.write(text)
+    return rc, out, err
 
+
+def emit_error(out, err):
+    text = re.sub(r"\x1b\[[0-9;]*m", "", out + "\n" + err)
+    return re.search(r"\berror:|[1-9][0-9]* error\(s\)", text) is not None
+
+
+def check_output(exe, golden, name, a):
+    rc, out, err = stage(a, name + ".run", [exe], a.run_timeout)
+    if rc != 0:
+        return "program exit %d (expected 0): %s%s" % (rc, out, err)
+    expected = normalize(read_golden(golden))
+    if normalize(out) != expected or err:
+        return "golden stdout or empty stderr mismatch\n--- expected ---\n%s\n--- actual ---\n%s\n--- stderr ---\n%s" % (expected, out, err)
+    return ""
+
+
+def run_focused_case(case, a):
+    src = os.path.join(a.case_dir, case + ".zan")
+    golden = os.path.join(a.case_dir, case + ".out")
+    ll = os.path.join(a.outdir, case + ".ll")
+    host_exe = os.path.join(a.outdir, case + ".host.exe")
+    gen_exe = os.path.join(a.outdir, case + ".gen1.exe")
+    bc = os.path.join(a.outdir, case + ".bc")
+    for path in (ll, host_exe, gen_exe, bc):
+        if os.path.exists(path):
+            os.remove(path)
+    helper = os.path.join(a.case_dir, "helpers", case + ".zan")
+    extras = [helper] if os.path.exists(helper) else []
+    failures = []
+    rc, out, err = stage(a, case + ".host.compile",
+                         [a.zanc, src] + extras + ["--auto-stdlib", "--package-project", a.workdir, "-o", host_exe], a.emit_timeout)
+    if rc != 0 or emit_error(out, err) or not os.path.isfile(host_exe):
+        failures.append("host compile failed (rc=%d): %s%s" % (rc, out, err))
+    else:
+        why = check_output(host_exe, golden, case + ".host", a)
+        if why:
+            failures.append("host " + why)
+    rc, out, err = stage(a, case + ".gen1.emit", [a.gen1, ll, src] + extras, a.emit_timeout)
+    if rc != 0 or emit_error(out, err) or not os.path.isfile(ll):
+        failures.append("gen1 emit failed (rc=%d): %s%s" % (rc, out, err))
+        return case, "\n".join(failures)
+    if a.llvm_as:
+        rc, out, err = stage(a, case + ".gen1.llvm-as", [a.llvm_as, ll, "-o", bc], a.link_timeout)
+        if rc != 0 or not os.path.isfile(bc):
+            failures.append("llvm-as rejected IR (rc=%d): %s%s" % (rc, out, err))
+            return case, "\n".join(failures)
+    rc, out, err = stage(a, case + ".gen1.link", [a.clang, ll] + a.rtobjs + a.syslibs + ["-o", gen_exe], a.link_timeout)
+    if rc != 0 or not os.path.isfile(gen_exe):
+        failures.append("gen1 link failed (rc=%d): %s%s" % (rc, out, err))
+    else:
+        why = check_output(gen_exe, golden, case + ".gen1", a)
+        if why:
+            failures.append("gen1 " + why)
+    return case, "\n".join(failures)
 
 
 def run_case(case, a):
+    if a.focus:
+        return run_focused_case(case, a)
     src = os.path.join(a.case_dir, case + ".zan")
     if not os.path.exists(src):
         return ("fatal", "case source not found: %s" % src)
@@ -97,7 +164,38 @@ def run_case(case, a):
     return (case, why)
 
 
+def run_focused_reject(name, text, hosttext, count, a):
+    src = os.path.join(a.reject_dir, name + ".zan")
+    helper = os.path.join(a.reject_dir, name + "_helper.zan")
+    extras = [helper] if os.path.isfile(helper) else []
+    failures = []
+    for compiler in ("host", "gen1"):
+        output = os.path.join(a.outdir, "reject_%s.%s" % (name, "host.exe" if compiler == "host" else "ll"))
+        if os.path.exists(output):
+            os.remove(output)
+        command = ([a.zanc, src] + extras + ["--auto-stdlib", "--package-project", a.workdir, "-o", output]
+                   if compiler == "host" else [a.gen1, output, src] + extras)
+        rc, out, err = stage(a, name + "." + compiler + ".reject", command, a.emit_timeout)
+        diagnostic = re.sub(r"\x1b\[[0-9;]*m", "", out + "\n" + err)
+        expected = hosttext if compiler == "host" else text
+        if rc < 1 or rc > 125:
+            failures.append("%s must reject normally, got exit %d" % (compiler, rc))
+        if os.path.exists(output):
+            failures.append("%s wrote output for rejected input" % compiler)
+        if expected not in diagnostic:
+            failures.append("%s diagnostic does not contain '%s'" % (compiler, expected))
+        actual_count = len(re.findall(r"^.*:\d+:\d+:\s*error:", diagnostic, re.MULTILINE))
+        if actual_count != count:
+            failures.append("%s emitted %d diagnostic(s), expected %d" % (compiler, actual_count, count))
+    if failures:
+        return "reject", name, "FAIL", "\n".join(failures)
+    log("-- REJECT %s: host/gen1 refused with matching diagnostic and count %d" % (name, count))
+    return "reject", name, "OK", ""
+
+
 def run_reject(name, text, hosttext, a):
+    if a.focus:
+        return run_focused_reject(name, text, hosttext, a.reject_counts[name], a)
     src = os.path.join(a.reject_dir, name + ".zan")
     if not os.path.exists(src):
         return ("fatal", "reject case source not found: %s" % src)
@@ -147,7 +245,12 @@ def main():
     ap.add_argument("--gen1", required=True)
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--case-dir", required=True)
-    ap.add_argument("--cases", required=True)
+    ap.add_argument("--cases", default="")
+    ap.add_argument("--focus", default="", help="manifest: case, or !reject|||self diagnostic|||host diagnostic|||count")
+    ap.add_argument("--only", nargs="+", default=[], help="exact names from the focus manifest")
+    ap.add_argument("--log-dir", default="")
+    ap.add_argument("--llvm-as", default="")
+    ap.add_argument("--stdlib-stamp", default="")
     ap.add_argument("--clang", default="")
     ap.add_argument("--rtobjs", nargs="*", default=[])
     ap.add_argument("--gaps", default="")
@@ -160,7 +263,18 @@ def main():
     ap.add_argument("--run-timeout", type=int, default=5)
     a = ap.parse_args()
 
+    if not a.focus and not a.cases:
+        ap.error("--cases is required unless --focus is supplied")
+    if a.only and not a.focus:
+        ap.error("--only requires --focus")
+    if a.focus and (not a.clang or not a.rtobjs or not a.log_dir):
+        ap.error("--focus requires --clang, --rtobjs and --log-dir (existing tools only)")
     os.makedirs(a.outdir, exist_ok=True)
+    if a.log_dir:
+        os.makedirs(a.log_dir, exist_ok=True)
+        passed_file = os.path.join(a.log_dir, "passed.txt")
+        if os.path.exists(passed_file):
+            os.remove(passed_file)
     jobs = a.jobs if a.jobs > 0 else (os.cpu_count() or 8)
     # the same link set the cmake gate resolves by platform: the system
     # libraries are fixed per OS, so they are derived here rather than
@@ -174,7 +288,7 @@ def main():
         if os.path.exists(sqlite_lib):
             a.syslibs.append(sqlite_lib)
             sqlite_dll = os.path.join(sqlite_dir, "libsqlite3-0.dll")
-            if os.path.exists(sqlite_dll):
+            if not a.focus and os.path.exists(sqlite_dll):
                 shutil.copy2(sqlite_dll, a.outdir)
         for dlib, ddll in [("zan_audio.lib", "zan_audio.dll"),
                            ("zan_image.lib", "zan_image.dll"),
@@ -183,10 +297,17 @@ def main():
             if os.path.exists(lp):
                 a.syslibs.append(lp)
             dp = os.path.join(a.workdir, "build", ddll)
-            if os.path.exists(dp):
+            if not a.focus and os.path.exists(dp):
                 shutil.copy2(dp, a.outdir)
+        if a.focus:
+            os.environ["PATH"] = os.pathsep.join([os.path.join(a.workdir, "build"), sqlite_dir, os.environ.get("PATH", "")])
     else:
         a.syslibs = ["-ldl", "-lpthread", "-lm"]
+    if a.focus:
+        os.environ["ZAN_STDLIB_PATH"] = os.path.join(a.workdir, "stdlib")
+        a.llvm_as = a.llvm_as or shutil.which("llvm-as") or ""
+        if not a.llvm_as:
+            log("-- llvm-as not available: assembly verification skipped (clang still verifies IR)")
 
     # ---- case list / gaps / rejects: same comment+blank filtering ----------
     def parse_lines(path, split_gaps=False):
@@ -203,7 +324,7 @@ def main():
                 out.append(s)
         return out
 
-    cases = parse_lines(a.cases)
+    cases = parse_lines(a.cases) if a.cases else []
     gaps = set(parse_lines(a.gaps, split_gaps=True)) if a.gaps else set()
 
     rejects = []  # (name, self_substring, host_substring)
@@ -214,6 +335,60 @@ def main():
             self_sub = parts[1] if len(parts) > 1 else ""
             host_sub = parts[2] if len(parts) > 2 else ""
             rejects.append((name, self_sub, host_sub))
+    if a.focus:
+        cases, rejects, gaps, a.reject_counts = [], [], set(), {}
+        names = set()
+        for line in parse_lines(a.focus):
+            parts = line.split("|||")
+            reject = parts[0].startswith("!")
+            name = parts[0][1:] if reject else parts[0]
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name in names:
+                ap.error("invalid or duplicate focus case: " + name)
+            names.add(name)
+            if reject:
+                if len(parts) != 4 or not parts[1] or not parts[2] or not parts[3].isdigit() or int(parts[3]) < 1:
+                    ap.error("focus reject requires !name|||self diagnostic|||host diagnostic|||positive count")
+                a.reject_counts[name] = int(parts[3])
+                rejects.append((name, parts[1], parts[2]))
+            elif len(parts) == 1:
+                cases.append(name)
+            else:
+                ap.error("focus positive must be a case name: " + name)
+        if a.only:
+            if set(a.only) - names:
+                ap.error("unknown focus case(s): " + ", ".join(sorted(set(a.only) - names)))
+            cases = [name for name in cases if name in a.only]
+            rejects = [r for r in rejects if r[0] in a.only]
+        if not cases and not rejects:
+            ap.error("focus manifest selects no cases")
+        inputs = [a.zanc, a.gen1, a.clang, a.focus, os.path.abspath(__file__),
+                  os.path.join(a.workdir, "tests", "run_selfhost_diff.cmake")] + a.rtobjs
+        inputs += [p for p in a.syslibs if os.path.isfile(p)]
+        inputs += [p for p in [a.llvm_as, a.stdlib_stamp] if p]
+        for case in cases:
+            inputs += [os.path.join(a.case_dir, case + ext) for ext in (".zan", ".out")]
+            helper = os.path.join(a.case_dir, "helpers", case + ".zan")
+            if os.path.isfile(helper):
+                inputs.append(helper)
+        for name, _, _ in rejects:
+            inputs.append(os.path.join(a.reject_dir, name + ".zan"))
+            helper = os.path.join(a.reject_dir, name + "_helper.zan")
+            if os.path.isfile(helper):
+                inputs.append(helper)
+        def fingerprint():
+            records = []
+            for path in dict.fromkeys(inputs):
+                with open(path, "rb") as f:
+                    digest = hashlib.sha256(f.read()).hexdigest()
+                records.append({"path": path, "sha256": digest, "mtime_ns": os.stat(path).st_mtime_ns})
+            return records
+        try:
+            before = fingerprint()
+        except OSError as e:
+            ap.error("missing focus input: " + str(e))
+        with open(os.path.join(a.log_dir, "inputs.json"), "w", encoding="utf-8") as f:
+            json.dump(before, f, indent=2)
+        log("-- focused selfhost differential: %d positive, %d negative; existing compilers only" % (len(cases), len(rejects)))
 
     failures = 0
     gap_hits = 0
@@ -250,6 +425,22 @@ def main():
                 else:
                     rejected += 1
 
+    if a.focus:
+        try:
+            after = fingerprint()
+        except OSError:
+            after = []
+        with open(os.path.join(a.log_dir, "inputs.after.json"), "w", encoding="utf-8") as f:
+            json.dump(after, f, indent=2)
+        if before != after:
+            failures += 1
+            log("-- FAIL inputs changed during validation; see inputs.json/inputs.after.json")
+        with open(os.path.join(a.log_dir, "result.json"), "w", encoding="utf-8") as f:
+            json.dump({"passed": passed, "rejected": rejected, "failures": failures,
+                       "inputs_stable": before == after, "llvm_as": a.llvm_as}, f, indent=2)
+        if failures == 0:
+            with open(os.path.join(a.log_dir, "passed.txt"), "w", encoding="utf-8") as f:
+                f.write("%d host/gen1 golden+exit pairs, %d diagnostic rejects; inputs stable.\n" % (passed, rejected))
     log("-- selfhost differential: %d passed, %d known gaps, %d rejected, %d failures"
         % (passed, gap_hits, rejected, failures))
     if failures > 0:

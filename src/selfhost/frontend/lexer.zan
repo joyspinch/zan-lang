@@ -17,6 +17,15 @@ public class Lexer {
     public int line;
     public int col;
 
+    // Invalid escape diagnostics collected while lexing CHARACTER literals
+    // (the host reports them straight from lexer_escape_char_cp, B-ID219).
+    // The driver's Diags does not exist yet when the lexer runs, so the
+    // messages ride out in parallel lists and the driver reports them right
+    // after constructing Diags -- same host wording (E0014-E0017), same loc.
+    public List<string> escMsgs;
+    public List<int> escMsgLine;
+    public List<int> escMsgCol;
+
     // Preprocessor state (mirrors src/compiler/lexer.c): a define table and a
     // nested #if/#else conditional stack. Only the target-platform macros the
     // stdlib tests are predefined.
@@ -36,6 +45,9 @@ public class Lexer {
 
     public Lexer(string s) {
         src = s; pos = 0; n = s.Length; line = 1; col = 1;
+        escMsgs = new List<string>();
+        escMsgLine = new List<int>();
+        escMsgCol = new List<int>();
         ppName = new List<string>();
         ppActive = new List<int>();
         ppParent = new List<int>();
@@ -913,6 +925,12 @@ public class Lexer {
                     Adv();
                     cnt = cnt + 1;
                 }
+                if (cnt == 0) {
+                    EscErr("[E0014] '\\x' escape requires at least one hex digit", startLine, startCol);
+                } else if (hv >= 55296 && hv <= 57343) {
+                    EscErr("[E0016] '\\x' escape value 0x" + StrEsc.HexUpper(hv)
+                        + " is a surrogate code point", startLine, startCol);
+                }
                 v = hv;
             } else if (Peek() == 117) {
                 // \uHHHH: exactly four hex digits
@@ -924,9 +942,24 @@ public class Lexer {
                     Adv();
                     cnt2 = cnt2 + 1;
                 }
+                if (cnt2 != 4) {
+                    EscErr("[E0015] '\\u' escape requires 4 hex digits", startLine, startCol);
+                } else if (hv2 >= 55296 && hv2 <= 57343) {
+                    EscErr("[E0016] '\\u' escape value 0x" + StrEsc.HexUpper(hv2)
+                        + " is a surrogate code point", startLine, startCol);
+                }
                 v = hv2;
             } else {
-                v = EscapeChar(Peek());
+                int ec = Peek();
+                v = EscapeChar(ec);
+                // the host's lexer_escape_char_cp rejects any escape outside
+                // n r t 0 \ " ' with E0017 (B-ID219); n r t 0 return their
+                // control char so the identity fallback is exactly the
+                // illegal set plus the three legal identity escapes
+                if (ec != 110 && ec != 114 && ec != 116 && ec != 48
+                    && ec != 92 && ec != 34 && ec != 39) {
+                    EscErr("[E0017] invalid escape sequence '\\" + ((char)ec) + "'", startLine, startCol);
+                }
                 Adv();
             }
         }
@@ -969,6 +1002,12 @@ public class Lexer {
         }
         if (Peek() == 39) { Adv(); } // closing '
         return new Token(TK.CharLit(), "", v, startLine, startCol);
+    }
+
+    void EscErr(string msg, int l, int c) {
+        escMsgs.Add(msg);
+        escMsgLine.Add(l);
+        escMsgCol.Add(c);
     }
 
     int HexDigitVal(int c) {

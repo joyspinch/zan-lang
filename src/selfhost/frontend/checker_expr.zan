@@ -3,10 +3,60 @@ using System.Collections.Generic;
 namespace Zan;
 
 public partial class Checker {
+    Node MethodGroupReceiver(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.Ident()) {
+            if (ScopeHas(e.sval)) { return null; }
+            return curClass != null ? MkType(curClass.sval) : null;
+        }
+        if (e.kind != AK.MemberAccess() || e.a == null) { return null; }
+        Node cls = StaticRecv(e.a);
+        if (cls != null) {
+            Node ty = MkType(cls.sval);
+            if (e.d != null && e.d.sval == "__typeargs") { ty.kids = e.d.kids; }
+            return ty;
+        }
+        return InferType(e.a);
+    }
+
+    int MethodGroupForm(Node e) {
+        if (e.kind == AK.Ident()) { return curStatic ? 1 : 0; }
+        return StaticRecv(e.a) != null ? 1 : 2;
+    }
+
+    bool IsMethodGroup(Node e) {
+        Node recv = MethodGroupReceiver(e);
+        return recv != null && binder.HasMethodGroup(recv, e.sval);
+    }
+
+    MethodGroupBinding ProbeMethodGroup(Node e, Node target) {
+        return binder.ResolveMethodGroup(MethodGroupReceiver(e), e.sval, MethodGroupForm(e), target);
+    }
+
+    bool CheckMethodGroup(Node e) {
+        if (!IsMethodGroup(e)) { return false; }
+        if (curTargetType == null || !binder.IsDelegateName(curTargetType.sval)) { return false; }
+        MethodGroupBinding selected = ProbeMethodGroup(e, curTargetType);
+        e.methodGroupTarget = binder.CopyType(curTargetType);
+        if (e.kind == AK.MemberAccess()) {
+            Node saved = curTargetType; curTargetType = null;
+            CheckObj(e.a); curTargetType = saved;
+        }
+        if (selected.method == null) {
+            diags.Error("[E2098] method '" + e.sval + "' cannot be converted to delegate type '"
+                + TyDisplay(curTargetType) + "': signature is not compatible", e.line, e.col);
+        } else {
+            CheckSelectedInternalAccess(binder.FindType(selected.ownerType.sval), selected.method, e);
+        }
+        return true;
+    }
+
     void CheckExpr(Node n) {
         if (n == null) { return; }
         int k = n.kind;
+        if ((k == AK.Ident() || k == AK.MemberAccess()) && CheckMethodGroup(n)) { return; }
         if (k == AK.Ident()) {
+            CheckByRefCapture(n.sval);
             if (!KnownValue(n.sval)) {
                 diags.Error("undefined identifier '" + n.sval + "'", n.line, n.col);
             } else if (curStatic && !ScopeHas(n.sval)) {
@@ -27,6 +77,7 @@ public partial class Checker {
             // `ref x` place form: check the referenced expression
             if (n.a != null) { CheckExpr(n.a); return; }
             // `out T name` declares a new local visible after the call
+            if (n.type == null) { CheckByRefCapture(n.sval); }
             if (n.type != null) { ScopeAdd(n.sval, n.type); }
             else if (!KnownValue(n.sval)) {
                 diags.Error("undefined identifier '" + n.sval + "'", n.line, n.col);
@@ -165,7 +216,7 @@ public partial class Checker {
                 } else {
                     Node cls = ClassOf(n.type);
                     if (cls != null) {
-                        ctor = binder.FindCtorArity(cls, n.kids.Count);
+                        ctor = MethodGroupCtor(cls, n);
                         if (ctor == null) { ctor = binder.FindCtor(cls); }
                     }
                 }
@@ -178,13 +229,16 @@ public partial class Checker {
                 // object initializer `Field = v`: the lhs names a field of the
                 // new type, not a local, so only the value is checked here.
                 if (n.ival == 2 && it.kind == AK.Assignment()) {
+                    Node saved = curTargetType;
+                    curTargetType = it.a != null ? binder.MemberType(n.type, it.a.sval) : null;
                     CheckExpr(it.b);
+                    curTargetType = saved;
                 } else {
                     Node prevArgTarget = curTargetType;
                     if (isDel) {
                         curTargetType = n.type;
                     } else if (ctor != null) {
-                        curTargetType = NthParamType(ctor, i);
+                        curTargetType = CallParamType(ctor, n, i, n.type);
                     }
                     if (curTargetType != null && binder.DelegateIsAsync(curTargetType.sval) && it != null && it.kind == AK.Lambda()) {
                         diags.Error("[E3104] cannot convert a lambda to async delegate '" + curTargetType.sval
@@ -221,7 +275,11 @@ public partial class Checker {
             ScopeAdd(n.sval, n.type);
             return;
         }
-        if (k == AK.Conditional()) { CheckExpr(n.a); CheckExpr(n.b); CheckExpr(n.c); return; }
+        if (k == AK.Conditional()) {
+            Node target = curTargetType; curTargetType = null;
+            CheckExpr(n.a); curTargetType = target;
+            CheckExpr(n.b); CheckExpr(n.c); return;
+        }
         if (k == AK.WithExpr()) {
             CheckExpr(n.a);
             int i = 0;
@@ -251,6 +309,7 @@ public partial class Checker {
                 return;
             }
             int mark = ScopeMark();
+            lambdaDepth = lambdaDepth + 1;
             Node retTy = null;
             List<Node> expectedParamTypes = new List<Node>();
             if (curTargetType != null) {
@@ -291,7 +350,7 @@ public partial class Checker {
                         p.type = expectedParamTypes[pidx];
                     }
                     pidx = pidx + 1;
-                    ScopeAdd(p.sval, p.type);
+                    ScopeParam(p);
                 }
                 i = i + 1;
             }
@@ -309,6 +368,7 @@ public partial class Checker {
                 n.type = retTy;
             }
             ScopeTrim(mark);
+            lambdaDepth = lambdaDepth - 1;
             return;
         }
         if (k == AK.SwitchExpr()) {
@@ -506,6 +566,77 @@ public partial class Checker {
         return true;
     }
 
+    Node CallReceiverType(Node call) {
+        if (call == null || call.a == null) { return null; }
+        if (call.a.kind == AK.Ident()) { return curClass != null ? MkType(curClass.sval) : null; }
+        if (call.a.kind == AK.MemberAccess()) {
+            Node ty = InferType(call.a.a);
+            if (ty != null) { return ty; }
+            Node cls = StaticRecv(call.a.a);
+            if (cls != null) {
+                ty = MkType(cls.sval);
+                if (call.a.d != null && call.a.d.sval == "__typeargs") { ty.kids = call.a.d.kids; }
+                return ty;
+            }
+        }
+        return call.type;
+    }
+
+    Node CallParamType(Node cand, Node call, int index, Node receiver) {
+        if (cand == null) { return null; }
+        int position = index;
+        if (call.kids[index].argName != "") {
+            position = 0; int i = 0;
+            while (i < cand.kids.Count) {
+                Node p = cand.kids[i];
+                if (p.kind == AK.Param()) {
+                    if (p.sval == call.kids[index].argName) { break; }
+                    position = position + 1;
+                }
+                i = i + 1;
+            }
+        }
+        Node pt = NthParamType(cand, position);
+        Node owner = receiver; int depth = 0;
+        while (owner != null && depth < 64) {
+            Node cls = binder.FindType(owner.sval);
+            if (cls == null) { break; }
+            int i = 0; bool found = false;
+            while (i < cls.kids.Count) { if (cls.kids[i] == cand) { found = true; break; } i = i + 1; }
+            if (found) { pt = binder.SubstOwner(pt, owner); break; }
+            owner = binder.BaseType(owner); depth = depth + 1;
+        }
+        return SubstMethodTypeParams(pt, cand, call);
+    }
+
+    bool MethodGroupArgsFit(Node cand, Node call, Node receiver) {
+        if (call == null) { return true; }
+        int i = 0;
+        while (i < call.kids.Count) {
+            Node arg = call.kids[i];
+            if (IsMethodGroup(arg)) {
+                Node pt = CallParamType(cand, call, i, receiver);
+                if (pt == null || !binder.IsDelegateName(pt.sval) || ProbeMethodGroup(arg, pt).method == null) { return false; }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    Node MethodGroupCtor(Node cls, Node call) {
+        Node pick = null; int best = -2000000000; int i = 0;
+        while (cls != null && i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.CtorDecl() && !HasMod(m, MOD.Static()) && AcceptsArgcOf(m, call.kids.Count)
+                && MethodGroupArgsFit(m, call, call.type)) {
+                int score = CallScore(m, call);
+                if (score > best) { pick = m; best = score; }
+            }
+            i = i + 1;
+        }
+        return pick;
+    }
+
     void CheckCall(Node n) {
         Node callee = n.a;
         // This callee marker is the builtin Task routing decision consumed by
@@ -518,7 +649,8 @@ public partial class Checker {
         Node callTargetOt = null;
         if (callee != null) {
             if (callee.kind == AK.Ident()) {
-                callTargetMethod = MethodUp(curClass, callee.sval);
+                CheckByRefCapture(callee.sval);
+                callTargetMethod = MethodUpCall(curClass, callee.sval, n);
                 callTargetCls = curClass;
             } else if (callee.kind == AK.MemberAccess()) {
                 Node ot = InferType(callee.a);
@@ -540,9 +672,9 @@ public partial class Checker {
             if (n.kids[i].argName != "") { hasNamed = true; }
             Node prevArgTarget = curTargetType;
             if (callTargetMethod != null) {
-                Node rawPt = NthParamType(callTargetMethod, i);
-                curTargetType = SubstTypeParams(rawPt, callTargetCls, callTargetOt);
-                curTargetType = SubstMethodTypeParams(curTargetType, callTargetMethod, n);
+                curTargetType = CallParamType(callTargetMethod, n, i, CallReceiverType(n));
+            } else {
+                curTargetType = null;
             }
             if (curTargetType != null && binder.DelegateIsAsync(curTargetType.sval) && n.kids[i] != null && n.kids[i].kind == AK.Lambda()) {
                 diags.Error("[E3104] cannot convert a lambda to async delegate '" + curTargetType.sval
@@ -565,7 +697,7 @@ public partial class Checker {
         int argc = n.kids.Count;
         if (callee != null && callee.kind == AK.Ident()) {
             // bare call: resolve against the enclosing type's methods
-            Node cands = MethodUp(curClass, callee.sval);
+            Node cands = callTargetMethod;
             if (cands != null) {
                 n.resolvedSym = cands;
                 n.isIntrinsic = (cands.mods & MOD.Intrinsic()) != 0 ||
@@ -609,7 +741,7 @@ public partial class Checker {
             Node targetCls = cls != null ? cls : sc;
             Node mm = null;
             if (targetCls != null) {
-                mm = MethodUp(targetCls, callee.sval);
+                mm = callTargetMethod;
             }
             if (cls != null) {
                 if (ot != null && ot.op == 1 && callee.sval == "GetValueOrDefault") {
@@ -793,19 +925,82 @@ public partial class Checker {
         return false;
     }
 
+    // Method groups retain their instance receiver just like lambdas.
+    // Delegate fields/getters and local/parameter shadows are existing values.
+    bool MethodGroupCapturesThis(Node e) {
+        if (e == null || curClass == null) { return false; }
+        string name = "";
+        if (e.kind == AK.Ident()) {
+            name = e.sval;
+            if (ScopeHas(name)) { return false; }
+        } else if (e.kind == AK.MemberAccess() && e.a != null
+                   && e.a.kind == AK.ThisExpr()) {
+            name = e.sval;
+        } else { return false; }
+        if (FieldUp(curClass, name) != null
+            || MethodUp(curClass, "get_" + name) != null) { return false; }
+        if (e.methodGroupTarget != null) {
+            MethodGroupBinding selected = ProbeMethodGroup(e, e.methodGroupTarget);
+            return selected.method != null && !HasMod(selected.method, MOD.Static());
+        }
+        Node m = MethodUp(curClass, name);
+        return m != null && !HasMod(m, MOD.Static());
+    }
+
+    // Host SYM_CLASS gate (checker_util.c:849 / checker_stmt.c:72): both
+    // this-capture warnings fire only inside a class -- structs are value
+    // copies and interfaces cannot be instantiated, so neither mints an
+    // escaping receiver closure.
+    bool InClassContext() {
+        return curClass != null && curClass.kind == AK.ClassDecl()
+            && (curClass.mods & MOD.Iface()) == 0;
+    }
+
+    // Host has_closure_capturing_this (checker_util.c:815): a NARROW walk.
+    // Only the shapes below can MINT a receiver closure; reading an existing
+    // delegate value through an index or member chain stays silent (e.g.
+    // `this.field[0]` mentions this but creates no new capture). The previous
+    // generic a/b/c/d/kids recursion also swept those read shapes and warned
+    // where the host does not.
     bool HasClosureCapturingThis(Node e) {
         if (e == null) { return false; }
+        while (e != null && e.kind == AK.CastExpr()) { e = e.b; }
+        if (e == null) { return false; }
+        if (MethodGroupCapturesThis(e)) { return true; }
         if (e.kind == AK.Lambda()) {
-            if (ExprCapturesThis(e.a) || ExprCapturesThis(e.d)) { return true; }
+            return ExprCapturesThis(e.a) || ExprCapturesThis(e.d);
         }
-        if (HasClosureCapturingThis(e.a)) { return true; }
-        if (HasClosureCapturingThis(e.b)) { return true; }
-        if (HasClosureCapturingThis(e.c)) { return true; }
-        if (HasClosureCapturingThis(e.d)) { return true; }
-        int i = 0;
-        while (i < e.kids.Count) {
-            if (HasClosureCapturingThis(e.kids[i])) { return true; }
-            i = i + 1;
+        // An initializer's assignment lhs names the new object's member;
+        // only its value can introduce a receiver closure (host same rule).
+        if (e.kind == AK.Assignment()) {
+            return HasClosureCapturingThis(e.b);
+        }
+        if (e.kind == AK.Conditional()) {
+            return HasClosureCapturingThis(e.b) || HasClosureCapturingThis(e.c);
+        }
+        // A direct call does not convert its callee into a delegate; only
+        // the arguments can carry an escaping method group (host same rule).
+        if (e.kind == AK.Call()) {
+            int ai = 0;
+            while (ai < e.kids.Count) {
+                if (HasClosureCapturingThis(e.kids[ai])) { return true; }
+                ai = ai + 1;
+            }
+            return false;
+        }
+        if (e.kind == AK.NewExpr()) {
+            // .b is the first constructor argument; kids hold the remaining
+            // arguments and, for `new T { Member = value }`, assignment items
+            // whose lhs names the new object's member (host args+arg_inits).
+            if (HasClosureCapturingThis(e.b)) { return true; }
+            int ai = 0;
+            while (ai < e.kids.Count) {
+                Node it = e.kids[ai];
+                if (it.kind == AK.Assignment()) { it = it.b; }
+                if (HasClosureCapturingThis(it)) { return true; }
+                ai = ai + 1;
+            }
+            return false;
         }
         return false;
     }
@@ -836,7 +1031,7 @@ public partial class Checker {
     }
 
     void CheckClosureCycleWarning(Node lhs, Node rhs, int line, int col) {
-        if (curClass == null || lhs == null || rhs == null) { return; }
+        if (lhs == null || rhs == null || !InClassContext()) { return; }
         if (TargetsThis(lhs) && HasClosureCapturingThis(rhs)) {
             diags.Warning("closure captures 'this' while assigned to a member of 'this'; this creates a potential strong reference cycle under ARC", line, col);
         }

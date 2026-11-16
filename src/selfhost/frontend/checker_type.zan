@@ -2,6 +2,40 @@ using System;
 using System.Collections.Generic;
 namespace Zan;
 
+// Shared by checker and IR: Min/Max's native overload result, or no match.
+public static class NumericBuiltinContract {
+    public static bool MinMaxNumeric(Node ty) {
+        if (ty == null || ty.op == 1 || ty.ival != 0) { return false; }
+        string n = ty.sval;
+        return n == "byte" || n == "sbyte" || n == "short" || n == "ushort"
+            || n == "char" || n == "int" || n == "uint" || n == "long"
+            || n == "nint" || n == "ulong" || n == "float" || n == "double";
+    }
+
+    static bool MinMaxSigned(string n) {
+        return n == "sbyte" || n == "short" || n == "int"
+            || n == "long" || n == "nint";
+    }
+
+    public static string MinMaxResult(Node a, Node b) {
+        if (!NumericBuiltinContract.MinMaxNumeric(a) || !NumericBuiltinContract.MinMaxNumeric(b)) { return ""; }
+        string an = a.sval;
+        string bn = b.sval;
+        if (an == "double" || an == "float" || bn == "double" || bn == "float") { return "double"; }
+        if (an == "ulong" || bn == "ulong") {
+            if (NumericBuiltinContract.MinMaxSigned(an) || NumericBuiltinContract.MinMaxSigned(bn)) { return ""; }
+            return "ulong";
+        }
+        if (an == "long" || bn == "long") { return "long"; }
+        if (an == "uint" || bn == "uint") {
+            if (NumericBuiltinContract.MinMaxSigned(an) || NumericBuiltinContract.MinMaxSigned(bn)) { return "long"; }
+            return "uint";
+        }
+        if (an == "nint" || bn == "nint") { return "nint"; }
+        return "int";
+    }
+}
+
 public partial class Checker {
     // ---- expression typer (null == unknown) ----
     Node InferType(Node e) {
@@ -167,9 +201,9 @@ public partial class Checker {
             Node cls = ClassOf(ot);
             if (cls != null) {
                 Node f = FieldUp(cls, e.sval);
-                if (f != null) { return LiftNullCondType(e, f.type); }
+                if (f != null) { return LiftNullCondType(e, binder.MemberType(ot, e.sval)); }
                 Node g = MethodUp(cls, "get_" + e.sval);
-                if (g != null) { return LiftNullCondType(e, g.type); }
+                if (g != null) { return LiftNullCondType(e, binder.MemberType(ot, e.sval)); }
             }
             // recv.<Entity> table accessor: the lookup missed, so the member
             // node may degrade in place into the synthesized new expression
@@ -239,6 +273,13 @@ public partial class Checker {
                 if (callee.a != null && callee.a.kind == AK.Ident()) {
                     string cname = callee.a.sval;
                     string mname = callee.sval;
+                    if (cname == "Math" && binder.FindType("Math") == null &&
+                        ScopeIdx("Math") < 0 && e.kids.Count == 2 &&
+                        (mname == "Min" || mname == "Max")) {
+                        string result = NumericBuiltinContract.MinMaxResult(
+                            InferType(e.kids[0]), InferType(e.kids[1]));
+                        if (result != "") { return MkType(result); }
+                    }
                     if (cname == "String" || cname == "string") {
                         if (mname == "Format" || mname == "Join" || mname == "Concat") { return MkType("string"); }
                         if (mname == "IsNullOrEmpty" || mname == "IsNullOrWhiteSpace") { return MkType("bool"); }

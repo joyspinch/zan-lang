@@ -223,30 +223,7 @@ partial class Irgen {
         return d;
     }
 
-    List<Node> DelegParams(Node dty) {
-        List<Node> r = new List<Node>();
-        // named delegate: signature comes from its declaration, with the
-        // delegate's own type parameters bound to the use-site type arguments
-        if (dty.sval != "Func" && dty.sval != "Action") {
-            Node d = binder.FindDelegate(dty.sval);
-            if (d != null) {
-                List<string> dtn = TParams(d);
-                List<Node> dta = DelegTArgs(d, dty, dtn);
-                int j = 0;
-                while (j < d.kids.Count) {
-                    if (d.kids[j].kind == AK.Param()) { r.Add(SubstTP(d.kids[j].type, dtn, dta)); }
-                    j = j + 1;
-                }
-                return r;
-            }
-        }
-        int n = dty.kids.Count;
-        int lim = n;
-        if (dty.sval == "Func" && n > 0) { lim = n - 1; }
-        int i = 0;
-        while (i < lim) { r.Add(dty.kids[i]); i = i + 1; }
-        return r;
-    }
+    List<Node> DelegParams(Node dty) { return binder.DelegateParams(dty); }
 
     // positional type arguments for a named delegate use (missing args stay
     // as the declared type-parameter names so unbound uses keep erased slots)
@@ -261,17 +238,7 @@ partial class Irgen {
         return dta;
     }
 
-    Node DelegRet(Node dty) {
-        if (dty.sval != "Func" && dty.sval != "Action") {
-            Node d = binder.FindDelegate(dty.sval);
-            if (d != null && d.type != null) {
-                List<string> dtn = TParams(d);
-                return SubstTP(d.type, dtn, DelegTArgs(d, dty, dtn));
-            }
-        }
-        if (dty.sval == "Func" && dty.kids.Count > 0) { return dty.kids[dty.kids.Count - 1]; }
-        return MkType("void");
-    }
+    Node DelegRet(Node dty) { return binder.DelegateRet(dty); }
 
     // A lambda lowers to a hoisted top-level function @__lambda_N(i8* env, ...)
     // plus a heap closure { i8* fn, i8* env } capturing free locals by value.
@@ -282,18 +249,39 @@ partial class Irgen {
     // NATIVE callback: the C side calls the pointer with the C signature.
     // A closure would shift the arguments (the self-host's closure ABI puts
     // the env first), so the callback would see the wrong parameters.
-    ExprVal EmitMethodGroup(string clsName, Node cls, Node m) {
+    ExprVal EmitSelectedMethodGroup(Node e, Node targetType) {
+        MethodGroupBinding selected = ResolveMethodGroup(e, targetType);
+        Node m = selected.method;
+        Node owner = selected.ownerType;
+        if (m == null || owner == null) {
+            diags.Error("[E3047] method group cannot be converted to delegate type '" + targetType.sval
+                + "': signature is not compatible or the conversion is ambiguous", e.line, e.col);
+            return new ExprVal("null", targetType);
+        }
+        Node cls = binder.FindType(owner.sval);
+        if (HasMod(m, MOD.Static())) { return EmitMethodGroup(owner.sval, cls, m, owner); }
+        ExprVal recv;
+        if (e.kind == AK.Ident()) { recv = new ExprVal("%this", CurThisTy()); }
+        else { recv = GenExpr(e.a); }
+        return EmitInstanceMethodGroup(recv, cls, m, owner);
+    }
+
+    ExprVal EmitMethodGroup(string clsName, Node cls, Node m, Node ownerType = null) {
         string owner = DeclOwnerOf(cls, m);
         if (owner == "") { owner = clsName; }
         string target = MethodSym(owner, m);
+        if (ownerType != null) {
+            string spec = ClassSpecSym(owner, m, ownerType);
+            if (spec != "") { target = spec; }
+        }
         List<Node> pt = new List<Node>();
         int i = 0;
         while (i < m.kids.Count) {
             Node p = m.kids[i];
-            if (p.kind == AK.Param()) { pt.Add(p.type); }
+            if (p.kind == AK.Param()) { pt.Add(ownerType != null ? binder.SubstOwner(p.type, ownerType) : p.type); }
             i = i + 1;
         }
-        Node retTy = m.type; if (retTy == null) { retTy = MkType("void"); }
+        Node retTy = ownerType != null ? binder.SubstOwner(m.type, ownerType) : m.type; if (retTy == null) { retTy = MkType("void"); }
         string rt = MapType(retTy);
         string fnty = rt + " (";
         int a = 0;
@@ -316,19 +304,23 @@ partial class Irgen {
     // The self-host's closure ABI is the lambda one: a { fn, env } record and
     // a thunk with the signature (i8* env, params...). The env of an
     // instance method group holds exactly one slot -- the receiver.
-    ExprVal EmitInstanceMethodGroup(ExprVal recv, Node cls, Node m) {
+    ExprVal EmitInstanceMethodGroup(ExprVal recv, Node cls, Node m, Node ownerType = null) {
         string owner = DeclOwnerOf(cls, m);
         if (owner == "") { owner = MethodOwner(cls, m.sval); }
         if (owner == "") { owner = cls.sval; }
         string target = MethodSym(owner, m);
+        if (ownerType != null) {
+            string spec = ClassSpecSym(owner, m, ownerType);
+            if (spec != "") { target = spec; }
+        }
         List<Node> pt = new List<Node>();
         int i = 0;
         while (i < m.kids.Count) {
             Node p = m.kids[i];
-            if (p.kind == AK.Param()) { pt.Add(p.type); }
+            if (p.kind == AK.Param()) { pt.Add(ownerType != null ? binder.SubstOwner(p.type, ownerType) : p.type); }
             i = i + 1;
         }
-        Node retTy = m.type; if (retTy == null) { retTy = MkType("void"); }
+        Node retTy = ownerType != null ? binder.SubstOwner(m.type, ownerType) : m.type; if (retTy == null) { retTy = MkType("void"); }
         string rt = MapType(retTy);
         string fname = "@__mg_" + target;
         // the receiver's type: the class that declares the method
@@ -337,41 +329,7 @@ partial class Irgen {
         // from the closure's env)
         if (IndexOfStr(mgTargets, target) < 0) {
             mgTargets.Add(target);
-            string sig = "define " + rt + " " + fname + "(i8* %env";
-            int a = 0;
-            while (a < pt.Count) { sig = sig + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
-            sig = sig + ") {";
-            deferred.Append(sig); deferred.Append("\n");
-            deferred.Append("entry:\n");
-            deferred.Append("  %envi = bitcast i8* %env to i64*\n");
-            deferred.Append("  %rcvi = load i64, i64* %envi\n");
-            deferred.Append("  %rcv = inttoptr i64 %rcvi to " + rcvTy + "\n");
-            string args = rcvTy + " %rcv";
-            a = 0;
-            while (a < pt.Count) { args = args + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
-            // The environment owns the bound receiver. A virtual method group
-            // resolves its slot when invoked, using the receiver's actual table.
-            string callTarget = "@" + target;
-            Node ownerCls = binder.FindType(owner);
-            int vslot = -1;
-            if (ownerCls != null && IsPolyClass(ownerCls)) { vslot = VSlotIndexM(ownerCls, m); }
-            if (vslot >= 0) {
-                deferred.Append("  %vptr = bitcast " + rcvTy + " %rcv to i8**\n");
-                deferred.Append("  %vtable = load i8*, i8** %vptr\n");
-                deferred.Append("  %vslots = bitcast i8* %vtable to i8**\n");
-                deferred.Append("  %vslot = getelementptr i8*, i8** %vslots, i64 " + vslot + "\n");
-                deferred.Append("  %vraw = load i8*, i8** %vslot\n");
-                deferred.Append("  %vfn = bitcast i8* %vraw to " + MethodFnTypeThis(m, owner) + "\n");
-                callTarget = "%vfn";
-            }
-            if (rt == "void") {
-                deferred.Append("  call void " + callTarget + "(" + args + ")\n");
-                deferred.Append("  ret void\n");
-            } else {
-                deferred.Append("  %r = call " + rt + " " + callTarget + "(" + args + ")\n");
-                deferred.Append("  ret " + rt + " %r\n");
-            }
-            deferred.Append("}\n");
+            EmitMethodGroupThunk(owner, m, target, fname, pt, retTy);
         }
         // the env: one slot holding the receiver
         List<Node> captureTypes = new List<Node>(); captureTypes.Add(recv.ty);
@@ -386,6 +344,54 @@ partial class Irgen {
             EmitArcRetain(recv.op, recv.ty);
         }
         return OwnedClosure(fname, env, retTy, pt);
+    }
+
+    // Reuse ordinary argument/slot coercion for the vtable's declared ABI.
+    // The thunk exposes the concrete delegate signature, but dispatch remains
+    // virtual even when a generic class needs a specialized direct body.
+    void EmitMethodGroupThunk(string owner, Node m, string target, string fname, List<Node> pt, Node retTy) {
+        StringBuilder saved = body; int savedTmp = tmp; bool savedEntry = eaActive;
+        body = new StringBuilder(); tmp = 0; eaActive = false;
+        string rt = MapType(retTy);
+        string sig = "define " + rt + " " + fname + "(i8* %env";
+        int i = 0;
+        while (i < pt.Count) { sig = sig + ", " + MapType(pt[i]) + " %p" + i; i = i + 1; }
+        L(sig + ") {"); L("entry:");
+        string recvTy = MapType(MkType(owner));
+        L("  %envi = bitcast i8* %env to i64*");
+        L("  %rcvi = load i64, i64* %envi");
+        L("  %rcv = inttoptr i64 %rcvi to " + recvTy);
+        string fn = "@" + target;
+        Node cls = binder.FindType(owner);
+        int slot = cls != null && IsPolyClass(cls) ? VSlotIndexM(cls, m) : -1;
+        string callRt = rt;
+        if (slot >= 0) {
+            L("  %vptr = bitcast " + recvTy + " %rcv to i8**");
+            L("  %vtable = load i8*, i8** %vptr");
+            L("  %vslots = bitcast i8* %vtable to i8**");
+            L("  %vslot = getelementptr i8*, i8** %vslots, i64 " + slot);
+            L("  %vraw = load i8*, i8** %vslot");
+            L("  %vfn = bitcast i8* %vraw to " + MethodFnTypeThis(m, owner));
+            fn = "%vfn"; callRt = MapTypeDecl(m.type, owner);
+        }
+        string args = recvTy + " %rcv";
+        i = 0;
+        while (i < pt.Count) {
+            Node formal = slot >= 0 ? ParamTypeNode(m, i) : pt[i];
+            ExprVal av = new ExprVal("%p" + i, pt[i]);
+            string op = slot >= 0 ? CallArg(av, formal, false) : av.op;
+            args = args + ", " + (slot >= 0 ? MapTypeDecl(formal, owner) : MapType(formal)) + " " + op;
+            i = i + 1;
+        }
+        if (callRt == "void") { L("  call void " + fn + "(" + args + ")"); L("  ret void"); }
+        else {
+            string value = NT(); L("  " + value + " = call " + callRt + " " + fn + "(" + args + ")");
+            ExprVal result = new ExprVal(value, retTy);
+            if (slot >= 0 && IsErasedTypeDecl(m.type, owner)) { result = FromSlot(value, retTy); }
+            L("  ret " + rt + " " + Coerce(result, rt));
+        }
+        L("}"); deferred.Append(body.ToString());
+        body = saved; tmp = savedTmp; eaActive = savedEntry;
     }
 
     public bool IsTreeLambda(Node n) {
@@ -848,8 +854,14 @@ partial class Irgen {
                     EmitArcRetain(rv.op, rv.ty);
                     rvs = ToSlot(rv, rv.ty);
                 } else {
+                    // the retain reads the PRE-coercion value: Coerce packs a
+                    // pointer into an erased i64 slot via ptrtoint, and
+                    // retaining the packed integer as i8* is invalid IR
+                    // (B-ID199 r9, generic_delegate_overload:
+                    // `zretain(i8* %t36)` where %t36 = ptrtoint). Same shape
+                    // as the erased-slot branch above.
+                    EmitArcRetain(rv.op, rv.ty);
                     rvs = Coerce(rv, curRet);
-                    EmitArcRetain(rvs, rv.ty);
                 }
                 EmitTempReleases();
                 ReleaseLocalsFrom(0);
@@ -1355,17 +1367,29 @@ partial class Irgen {
             // (irgen_call.c math_arg_is_numeric on each side) -- a pointer
             // next to an integer used to slip through and then be sitofp'd
             // into invalid IR.
-            string badA = MathNumBadType(a.ty);
-            string badB = MathNumBadType(b.ty);
-            if (badA != "" || badB != "") {
-                diags.Error("Math." + name + " requires numeric arguments",
-                    e.line, e.col);
+            Node resultTy = MathMinMaxType(a.ty, b.ty);
+            if (resultTy == null) {
+                string message = "Math." + name + " requires numeric arguments";
+                if (NumericBuiltinContract.MinMaxNumeric(a.ty) && NumericBuiltinContract.MinMaxNumeric(b.ty)) {
+                    message = "Math." + name + " has no matching numeric overload; convert arguments explicitly";
+                }
+                diags.Error(message, e.line, e.col);
                 return new ExprVal("0", MkType("int"));
             }
-            bool dbl = IsDbl(a.ty) || IsDbl(b.ty);
+            bool dbl = IsDbl(resultTy);
             if (dbl) {
-                string av = ToDbl(a, name, e);
-                string bv = ToDbl(b, name, e);
+                string av = "";
+                string bv = "";
+                if (a.ty.sval == "byte" || a.ty.sval == "ushort" ||
+                    a.ty.sval == "char" || a.ty.sval == "uint" || a.ty.sval == "ulong") {
+                    av = NT();
+                    L("  " + av + " = uitofp i64 " + a.op + " to double");
+                } else { av = ToDbl(a, name, e); }
+                if (b.ty.sval == "byte" || b.ty.sval == "ushort" ||
+                    b.ty.sval == "char" || b.ty.sval == "uint" || b.ty.sval == "ulong") {
+                    bv = NT();
+                    L("  " + bv + " = uitofp i64 " + b.op + " to double");
+                } else { bv = ToDbl(b, name, e); }
                 string an = NT();
                 L("  " + an + " = fcmp uno double " + av + ", " + av);
                 string bn = NT();
@@ -1382,11 +1406,17 @@ partial class Irgen {
                 return new ExprVal(r, MkType("double"));
             }
             string c = NT();
-            if (name == "Max") { L("  " + c + " = icmp sgt i64 " + a.op + ", " + b.op); }
-            else { L("  " + c + " = icmp slt i64 " + a.op + ", " + b.op); }
+            bool uns = resultTy.sval == "uint" || resultTy.sval == "ulong";
+            string pred = "slt";
+            if (name == "Max") { pred = "sgt"; }
+            if (uns) {
+                pred = "ult";
+                if (name == "Max") { pred = "ugt"; }
+            }
+            L("  " + c + " = icmp " + pred + " i64 " + a.op + ", " + b.op);
             string r = NT();
             L("  " + r + " = select i1 " + c + ", i64 " + a.op + ", i64 " + b.op);
-            return new ExprVal(r, MkType("int"));
+            return new ExprVal(r, resultTy);
         }
         return null;
     }

@@ -37,11 +37,74 @@
 # decimal_round stays: gen1 decimal is a double alias (payload is a double),
 # exact-decimal arithmetic is a separate work item.
 #
+# 2026-11-15 B-ID212 graduated 13 crash-class async cases: zan_join_bind indexed
+# the coroutine-live table without a cap guard -- cap==0 makes mask==SIZE_MAX and
+# the slot load faults on the NULL table, so any program that joins handles without
+# ever tracking a coroutine died 0xC0000005 (guard added in rt_timer_co.c):
+#   async_await_in_catch async_await_shared_tail async_delay_max async_finally_frame_capacity async_finally_shared_contexts async_frame_storage async_mt_pool async_mt_sched async_runtime_workers async_structured_concurrency async_sync_fast_path async_try_exit_depth async_when_all
+# Re-classified the same round: async_catch_ownership_route -> reject (Task.Spawn
+# static method group unsupported), async_preempt_hotloop -> wrong-stdout
+# (cooperative single-worker pump wakes the cancel poll one round late).
+# 2026-11-15 B-ID199 crash-class sweep round 1 (all 104 re-verified with the
+# current gen1 + the B-ID212 runtime): graduated 19 (3x stability-checked,
+# golden EXACT). Root fix of the round: gen1 Vector128/256.Load/Store emitted
+# aligned vector memory ops (no align attr -> LLVM assumes ABI alignment ->
+# movaps), but the contract is alignment-agnostic (host LLVMSetAlignment 1);
+# unaligned interior pointers faulted 0xC0000005 inside
+# NativeMemory.SequenceEqual/IndexOf. Fixed in irgen_simd.zan (4 sites,
+# align 1) and pinned by the new conformance case simd_unaligned_load:
+  accept_after_close decimal_arithmetic decimal_divide_wide delegate_dispatch exception_rethrow exception_threads firebird_wire memory_extensions_slice_indexof nested_delegate_decl pool_async_reset record_with_expr regress_format_join_bounds rwlock_concurrency security_x509_extensions sse_sink_take_co string_view_test task_completion_source task_spawn_indirect threading_mutex_srwlock
+# Re-classified the same round: 61 -> reject (packages Task.Spawn/Task.Run
+# unsupported, one shared root), 7 -> wrong-stdout (see entries), 1 ->
+# illegal-ir (orm_pool typed-pointer mismatch), 16 stay in crash (12 AV + 4
+# heap-corruption 0xC0000374; zandb_p3 alternates with a soft-exit face).
+# 2026-11-15 B-ID199 crash sweep round 2 (intrinsic-shadowing class): gen1
+# dispatched Environment/File/Directory builtins by bare name with no shadow
+# guard (the C host guards all 24 builtin sites with !zan_type_defines) and
+# Environment.ArgAt read @__zan_argv[i+1] unchecked. A user class named
+# Environment had its methods hijacked to the real argv intrinsics
+# (builtin_shadowing printed 'argat BAR' + segfaulted bare); bare runs of
+# argv cases segfaulted on ArgAt OOB where the host returns ''. Fixed in
+# irgen_expr_call.zan: 7 sites gated with the Task-branch criterion
+# (resolvedSym==null || isIntrinsic) + ArgAt bounds check with empty-string
+# fallback; pinned by the new conformance case argat_oob_returns_empty
+# (dual-compiler, bare-run). Graduated: builtin_shadowing (3x3 golden EXACT,
+# +diff_cases +ir_golden hash). environment_unicode_args -> wrong-stdout
+# (with RUN_ARGS = golden EXACT 3x3; bare = host-identical). Also swept the
+# 111 builtin-using cases: 45 now pass officially (File/Directory stdlib-body
+# routing candidates for later graduation rounds; NOT graduated here --
+# single-pass is not graduation). Bisect with a scratch HEAD-tree gen1 proved
+# the zandb/config_providers reds pre-date this round (both generations heap-
+# corrupt; zandb_group is a pre-existing in-flight-packages cluster).
+# 2026-11-15 B-ID199 crash sweep round 3 (EH face): two roots fixed. (1) A
+# null receiver's instance-field READ was a raw GEP+load in gen1 (hardware
+# segfault, no diagnostic) -- irgen_expr_member.zan now guards ClassDecl
+# receivers with the A507 dual-track idiom (irgen_expr_call.zan): inside a
+# try it raises NullReferenceException, outside one it takes the soft
+# channel; the read lands on the soft scratch page. Field STORE is
+# intentionally unguarded: the C host segfaults there too (probe-verified),
+# matching that is the contract. (2) A bare string throw (exc tid = null)
+# matched the FIRST catch clause unconditionally in gen1's clause walk and
+# the raw string got bound into a typed variable -- member reads
+# dereferenced string bytes (sA/sB probes segfaulted; host goldens
+# string_throw_dispatch A/B demand the miss). irgen_stmt_eh.zan: null tid
+# now flows through the base-chain walk and misses every typed clause.
+# Graduated: runtime_error_catch, string_throw_dispatch (+diff_cases +nails
+# null_receiver_field_catch / string_throw_typed_miss), and round4 graduated
+# deep_try_finally_nesting -- @__exc_stack retired entirely: every push site
+# calls @__exc_grow (need = depth+1, newcap = max(cap*2, 64, need), malloc +
+# hand-aligned, marks arrays doubled) and derives the frame address from
+# @__exc_sp, so the alloca-address constraint that blocked realloc+fixup is
+# gone (main's root handler was the only rule breaker and now uses the same
+# push form). Probes 64/65/100/200/300 all finish with per-level finally
+# output correct.
 # illegal-ir (14):
+# gc_cycle_detector graduated to tests/selfhost/diff_cases.txt on 2026-11-15
+# via B-ID211 (gen1 emits a self-contained cycle-probe/heap-snapshot runtime
+# mirroring the host rt_mem semantics; dual-compile golden EXACT).
 
 desktop_appupdate_hardening -- clang rejected the emitted IR (rc=1120): desktop_appupdate_hardening-3d791e.o : error LNK2019: 无法解析的外部符号 SetupDiGetClassDevsW，函数 Device_ParseMultiString 中引用了该符号
 desktop_update_hardening -- clang rejected the emitted IR (rc=1120): desktop_update_hardening-4b148e.o : error LNK2019: 无法解析的外部符号 zan_hw_Copy2D，函数 ImageBuffer_Dispose 中引用了该符号
-gc_cycle_detector -- clang rejected the emitted IR (rc=1120): gc_cycle_detector-a2628c.o : error LNK2019: 无法解析的外部符号 zan_gc_detect_cycles，函数 GC_DetectCycles 中引用了该符号
 gui_atlas_cold_sweep -- clang rejected the emitted IR (rc=1120): gui_atlas_cold_sweep-224684.o : error LNK2019: 无法解析的外部符号 zan_gui_create_surface，函数 Prog_Main 中引用了该符号
 gui_sprite_p0 -- clang rejected the emitted IR (rc=1120): gui_sprite_p0-459f32.o : error LNK2019: 无法解析的外部符号 zan_gui_create_surface，函数 Prog_Main 中引用了该符号
 image_buffer -- clang rejected the emitted IR (rc=1120): image_buffer-995260.o : error LNK2019: 无法解析的外部符号 zan_hw_Copy2D，函数 ImageBuffer_Dispose 中引用了该符号
@@ -55,36 +118,89 @@ win_printing_smoke -- clang rejected the emitted IR (rc=1120): win_printing_smok
 win_tray_screen_smoke -- clang rejected the emitted IR (rc=1120): win_tray_screen_smoke-3c754f.o : error LNK2019: 无法解析的外部符号 GetDeviceCaps，函数 Stream_FlushAsync$cleanup 中引用了该符号
 
 
-# reject (0):
+orm_pool -- clang rejected the emitted IR (rc=1): '%t6' defined with type 'i64' but expected 'ptr' in call void @zretain(i8* %t6) (190046)
+# reject (62):
+async_catch_ownership_route -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (static method group form; moved from the crash class 2026-11-15 via B-ID212)
+ai_memory -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ai_rag -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ai_remote -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ai_rerank -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ai_stream -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ai_stream_tools -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ai_tools -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+anthropic_client -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http2_server_multiplex_test -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_bytes_redirect -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_chunk_len_overflow -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_client_binary -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_client_cookies -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_client_keepalive -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_client_redirect -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_client_retry -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_client_timeout -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_connection_pool -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_content_encoding -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_forwarder_framing -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_forwarder_keepalive -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_forwarder_stream -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_forwarder_tunnel -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_framing -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_server_chunked -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_server_stress -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_smuggling -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+http_upload_bytes -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+https_binary_body -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+mcp_client -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+mysql_async_nonblocking -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+mysql_tls -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+net_loopback_integration -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+net_security_redirect_and_flood -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+net_throughput_benchmark -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+oss_multipart_upload -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+oss_storage -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+proxy_binary_body -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+rabbitmq_amqp_protocol -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+redis_tls -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+sdk_jd_api -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+sdk_jd_client -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+security_forwarder_status -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+security_forwarder_wire -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+security_http_client -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+security_http_upload_resume -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+security_ws_worker -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+sqlserver_tls -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+tls_hostname -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+web_framing -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+web_https_http2 -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+web_route_async_teardown -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+web_route_duplicate_key -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+web_ws_upgrade -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+webdav_conformance -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+websocket_concurrency_resilience -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+websocket_server_rfc6455_test -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ws_client_auth -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ws_loopback -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+ws_protocol_gate -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
+zandb_service -- gen1 rejects: call to 'Task.Spawn' is not supported by the self-hosted compiler yet (packages Zan.Net/Zan.Data package async; moved from the crash class 2026-11-15 via B-ID199)
 
-# wrong-stdout (48):
-aes_gcm -- stdout differs from the C host's golden output
-async_cancel -- stdout differs from the C host's golden output
+# wrong-stdout (45): (round1 said 54 = 47 held + 7 moved-in; those 7 sat duplicated at the file topand after the crash section -- insertion-offset bug in the round1 surgery, layout corrected 2026-11-15 round2; +environment_unicode_args the same round; -type_param_same_name 2026-11-15 B-ID216 round6: graduated to diff_cases -- the C host's generic-value-array stride mismatch got its root fix, golden flipped 41->83, gen1 aligned via spec-finit); +generic_virtual_dispatch 2026-11-16 B-ID199 round7 (pre-existing, not a round7 regression -- v1/v2 bisect on the round6-end gen1 fails identically; B-ID218); 2026-11-16 B-ID199 round9: -8 graduated (aes_gcm, async_cancel, decimal_round, gate_signal_all, gate_wait_timeout, ipv6, method_group_overload_sender, udp_client_lifecycle -- cured by the round1-8 cumulative fixes, 3x3 + anchored ctest green), -2 gen1-cured but held (channel_csp_concurrency: ctest leg blocked by a HOST checker regression E2024 on Channel<int>.CreateUnbounded -- in-flight src/compiler work; async_finally_shared_paths: ctest harness flake exit-3, differential 3x3 green); 2026-11-16 round9 illegal-IR hunt: -1 graduated (generic_delegate_overload -- two-layer root fix, see diff_cases.txt), 56-case regression batch 15 passed / 41 red with newly-red = 0; kafka_wire_protocol + weight_formats went 1/1 golden-exact in the same batch but hold (single green does not graduate, no lambdas in either case); 2026-11-16 B-ID199 round11: -1 graduated (generic_virtual_dispatch -- B-ID218 per-instantiation vtables, see diff_cases.txt)
+async_preempt_hotloop -- stdout differs from the C host's golden output (brokeEarly=0 vs 1: the cooperative single-worker pump wakes the cancel poll one round late; no longer crashes after the B-ID212 join-bind guard)
 async_finally_paths -- stdout differs from the C host's golden output
-async_finally_shared_paths -- stdout differs from the C host's golden output
 async_finally_scope_transfers -- stdout differs from the C host's golden output
 async_nested_yield -- stdout differs from the C host's golden output
 async_sync_delay_timer -- stdout differs from the C host's golden output
 audio_dsp -- stdout differs from the C host's golden output
 barcode_qr -- stdout differs from the C host's golden output
-channel_csp_concurrency -- stdout differs from the C host's golden output
 checked_overflow_coverage -- stdout differs from the C host's golden output
 connection_lock_handover -- stdout differs from the C host's golden output
 cs_b10_interp_format -- stdout differs from the C host's golden output
-decimal_round -- stdout differs from the C host's golden output
 explicit_layout -- stdout differs from the C host's golden output
 extension_methods -- stdout differs from the C host's golden output
 foreach_mutation_guard -- stdout differs from the C host's golden output
-gate_signal_all -- stdout differs from the C host's golden output
-gate_wait_timeout -- stdout differs from the C host's golden output
-generic_delegate_overload -- stdout differs from the C host's golden output
-generic_virtual_dispatch -- stdout differs from the C host's golden output
-ipv6 -- stdout differs from the C host's golden output
 jwt_rs256 -- stdout differs from the C host's golden output
 lambda_struct_return -- stdout differs from the C host's golden output
 list_array_ctor -- stdout differs from the C host's golden output
 marshal_full -- stdout differs from the C host's golden output
-method_group_overload_sender -- stdout differs from the C host's golden output
 null_overload_resolution -- stdout differs from the C host's golden output
 orm_group_aggregate -- stdout differs from the C host's golden output
 readonly_collections -- stdout differs from the C host's golden output
@@ -92,7 +208,6 @@ reflect_object_payload -- stdout differs from the C host's golden output
 respack_roundtrip -- stdout differs from the C host's golden output
 task_cancellation_scheduler -- stdout differs from the C host's golden output
 test_mocks -- stdout semi_differs from the C host's golden output
-udp_client_lifecycle -- stdout differs from the C host's golden output
 web_api_docs -- stdout differs from the C host's golden output
 web_controller_origin -- stdout differs from the C host's golden output
 web_list_protocol -- stdout differs from the C host's golden output
@@ -104,127 +219,76 @@ xlsx_write -- stdout differs from the C host's golden output
 zandb_crash_fuzz -- stdout differs from the C host's golden output
 zandb_rescore -- stdout differs from the C host's golden output
 zandb_veckbulk -- stdout differs from the C host's golden output
+dns_rfc1035_udp_test -- stdout differs from the C host's golden output (13 lines vs 11: two response-summary lines missing after the truncation path)
+kafka_wire_protocol -- stdout differs from the C host's golden output (unstable in both generations: 2/3 golden-exact runs pre-fix; post-fix fails with soft 'Dict key not found in indexer read' after 'ok record header span-id'; 2026-11-16 round9: 1/1 golden-exact in the 56-case regression batch -- held, needs a 3x re-run to graduate, the case has no lambdas so the round9 lambda fixes are not the cause)
+main_args -- stdout differs from the C host's golden output (bare-run golden needs RUN_ARGS 'alpha beta gamma': gen1 bare prints 0/0/end exactly like the C host bare, so the diff gate is unsatisfiable for both; the real gen1 gap is Main(string[] args) entry wiring -- gen1 does not build the args array from __zan_argc/__zan_argv at the entry, host does since D19)
+queue_struct_clear_default -- stdout differs from the C host's golden output (soft runtime error exit: InvalidCastException 'array is not an instance of' on the first assertion; no longer crashes after the B-ID199 align fix)
+span_intrinsic -- stdout differs from the C host's golden output (span Get(0) 20 vs 999: intrinsic span indexer reads the wrong slot)
+tryget_pinyin -- stdout differs from the C host's golden output (tryget-pinyin-ok 0 vs 1: pinyin table lookups all miss)
+weight_formats -- stdout differs from the C host's golden output (GGUF second-string metadata FAIL: soft 'Dict key not found' at 293:27; no longer crashes after the B-ID199 align fix; 2026-11-16 round9: 1/1 golden-exact in the 56-case regression batch -- held, needs a 3x re-run to graduate, the case has no lambdas so the round9 lambda fixes are not the cause)
+environment_unicode_args -- stdout differs from the C host's golden output (bare-run golden needs RUN_ARGS '中文 参数'; with args gen1 = golden EXACT 3x3 -- the crash face is gone: gen1 Environment.ArgAt had no bounds check and segfaulted on the bare run, now returns the empty string exactly like the host, contract pinned by the new conformance case argat_oob_returns_empty)
+type_param_same_name -- graduated 2026-11-15 B-ID216 round6: moved to tests/selfhost/diff_cases.txt (see there for the full three-piece root fix)
 
-# crash (119):
-accept_after_close -- the program exited with 3221225477: 
-ai_memory -- the program exited with 3221225477: 
-ai_rag -- the program exited with 3221225477: 
-ai_remote -- the program exited with 3221225477: 
-ai_rerank -- the program exited with 3221225477: 
-ai_stream -- the program exited with 3221225477: 
-ai_stream_tools -- the program exited with 3221225477: 
-ai_tools -- the program exited with 3221225477: 
-anthropic_client -- the program exited with 3221225477: 
-async_await_in_catch -- the program exited with 3221225477: 
-async_await_shared_tail -- the program exited with 3221225477: 
-async_catch_ownership_route -- the program exited with 3221225477: 
-async_delay_max -- the program exited with 3221225477: 
-async_finally_frame_capacity -- the program exited with 3221225477: 
-async_finally_shared_contexts -- the program exited with 3221225477: 
-async_frame_storage -- the program exited with 3221225477: 
-async_mt_pool -- the program exited with 3221225477: 
-async_mt_sched -- the program exited with 3221225477: 
-async_preempt_hotloop -- the program exited with 3221225477: 
-async_runtime_workers -- the program exited with 3221225477: 
-async_structured_concurrency -- the program exited with 3221225477: 
-async_sync_fast_path -- the program exited with 3221225477: 
-async_try_exit_depth -- the program exited with 3221225477: 
-async_when_all -- the program exited with 3221225477: 
-builtin_shadowing -- the program exited with 3221225477: 
-decimal_arithmetic -- the program exited with 3221225477: 
-decimal_divide_wide -- the program exited with 3221225477: 
-deep_try_finally_nesting -- the program exited with 3221225477: 
-delegate_dispatch -- the program exited with 3221225477: 
-dns_rfc1035_udp_test -- the program exited with 3221225477: 
-environment_unicode_args -- the program exited with 3221225477: 
-exception_rethrow -- the program exited with 3221225477: 
-exception_threads -- the program exited with 3221225477: 
-firebird_wire -- the program exited with 3221225477: 
-http2_server_multiplex_test -- the program exited with 3221225477: 
-http_bytes_redirect -- the program exited with 3221225477: 
-http_chunk_len_overflow -- the program exited with 3221225477: 
-http_client_binary -- the program exited with 3221225477: 
-http_client_cookies -- the program exited with 3221225477: 
-http_client_keepalive -- the program exited with 3221225477: 
-http_client_redirect -- the program exited with 3221225477: 
-http_client_retry -- the program exited with 3221225477: 
-http_client_timeout -- the program exited with 3221225477: 
-http_connection_pool -- the program exited with 3221225477: 
-http_content_encoding -- the program exited with 3221225477: 
-http_forwarder_framing -- the program exited with 3221225477: 
-http_forwarder_keepalive -- the program exited with 3221225477: 
-http_forwarder_stream -- the program exited with 3221225477: 
-http_forwarder_tunnel -- the program exited with 3221225477: 
-http_framing -- the program exited with 3221225477: 
-http_server_chunked -- the program exited with 3221225477: 
-http_server_stress -- the program exited with 3221225477: 
-http_smuggling -- the program exited with 3221225477: 
-http_upload_bytes -- the program exited with 3221225477: 
-https_binary_body -- the program exited with 3221225477: 
-iterator_lazy_semantics -- the program exited with 3221225477: 
-kafka_wire_protocol -- the program exited with 3221225477: 
-main_args -- the program exited with 3221225477: <unknown>:14:35: runtime error: array index out of bounds
-mcp_client -- the program exited with 3221225477: 
-memory_extensions_slice_indexof -- the program exited with 3221225477: 
-mysql_async_nonblocking -- the program exited with 3221225477: 
-mysql_tls -- the program exited with 3221225477: 
-nested_delegate_decl -- the program exited with 3221225477: 
-net_loopback_integration -- the program exited with 3221225477: 
-net_security_redirect_and_flood -- the program exited with 3221225477: 
-net_throughput_benchmark -- the program exited with 3221225477: 
-orm_pool -- the program exited with 3221226356: 
-oss_multipart_upload -- the program exited with 3221225477: 
-oss_storage -- the program exited with 3221225477: 
-pathfinding_grid -- the program exited with 3221225477: 
-pool_async_reset -- the program exited with 3221225477: 
-proxy_binary_body -- the program exited with 3221225477: 
-queue_struct_clear_default -- the program exited with 3221225477: 
-rabbitmq_amqp_protocol -- the program exited with 3221225477: 
-record_with_expr -- the program exited with 3221225477: 
-redis_tls -- the program exited with 3221225477: 
-regress_format_join_bounds -- the program exited with 3221225477: 
-runtime_error_catch -- the program exited with 3221225477: 
-rwlock_concurrency -- the program exited with 3221225477: 
-sdk_jd_api -- the program exited with 3221225477: 
-sdk_jd_client -- the program exited with 3221225477: 
-security_cryptography_suite -- the program exited with 3221225477: 
-security_forwarder_status -- the program exited with 3221225477: 
-security_forwarder_wire -- the program exited with 3221225477: 
-security_http_client -- the program exited with 3221225477: 
-security_http_upload_resume -- the program exited with 3221225477: 
-security_ws_worker -- the program exited with 3221225477: 
-security_x509_extensions -- the program exited with 3221225477: 
-span_intrinsic -- the program exited with 3221225477: 
-sqlserver_tls -- the program exited with 3221225477: 
-sse_sink_take_co -- the program exited with 3221225477: 
-string_throw_dispatch -- the program exited with 3221225477: 
-string_view_test -- the program exited with 3221225477: 
-task_completion_source -- the program exited with 3221225477: 
-task_spawn_indirect -- the program exited with 3221225477: 
-tcp_client_listener_lifecycle -- the program exited with 3221225477: 
-tdengine_pool -- the program exited with 3221225477: 
-test_runner -- the program exited with 3221225477: 
-threading_mutex_srwlock -- the program exited with 3221225477: 
-tls_hostname -- the program exited with 3221225477: 
-tryget_pinyin -- the program exited with 3221225477: 
-type_param_same_name -- the program exited with 3221225477: 
-web_framing -- the program exited with 3221225477: 
-web_https_http2 -- the program exited with 3221225477: 
-web_route_async_teardown -- the program exited with 3221225477: 
-web_route_duplicate_key -- the program exited with 3221225477: 
-web_ws_upgrade -- the program exited with 3221225477: 
-webdav_conformance -- the program exited with 3221225477: 
-websocket_concurrency_resilience -- the program exited with 3221225477: 
-websocket_server_rfc6455_test -- the program exited with 3221225477: 
-weight_formats -- the program exited with 3221225477: 
-ws_client_auth -- the program exited with 3221225477: 
-ws_loopback -- the program exited with 3221225477: 
-ws_protocol_gate -- the program exited with 3221225477: 
-zandb_backup -- the program exited with 3221225477: 
-zandb_integrity -- the program exited with 3221225477: 
-zandb_p3 -- the program exited with 3221225477: 
-zandb_quantize -- the program exited with 3221225477: 
-zandb_service -- the program exited with 3221225477: 
+# crash (5):
+# 2026-11-15 B-ID199 round5: test_runner graduated to
+# tests/selfhost/diff_cases.txt (cured by the round1-4 cumulative fixes;
+# recheck on the round5 gen1: official driver PASS + 3x3 EXACT).
+# type_param_same_name reclassified to wrong-stdout: the round5 root fix
+# (method-level type-parameter shadowing on generic-class receivers,
+# irgen_expr_dispatch.zan + irgen_expr_args.zan) stopped the AV and 10/11
+# output lines match the host; the remaining line is the C HOST's own
+# generic-value-array stride mismatch (ledger item B-ID216), not a gen1
+# defect.
+# type_param_same_name graduated 2026-11-15 B-ID216 round6 (full account in
+# tests/selfhost/diff_cases.txt): host store stride root-fixed
+# (ops_assign.c field-array branch concretizes fsym->type), golden flipped
+# 41->83 (host + gen1 both print 83, corpus ripple sweep found no other
+# open-T[] element-store case), gen1 aligned via per-instantiation
+# field-initializer helper clones (specFinits: the shared __zan_finits_*
+# built the array descriptor from the OPEN type param, whose accept
+# predicate rejects every reference-element store and whose ARC kind=0
+# never retains -- strings stored read back null).
+# 2026-11-15 B-ID199 round4: deep_try_finally_nesting graduated to
+# tests/selfhost/diff_cases.txt -- the static [64] EH frame stack is retired.
+# @__exc_grow (need = depth+1; newcap = max(cap*2, 64, need)) reallocs
+# @__exc_bufs (malloc + hand-alignment to 32, raw pointer kept in
+# @__exc_bufs_raw for free; jmp_buf bytes survive the memcpy) and doubles the
+# marks arrays; every push site derives the frame address from @__exc_sp, so
+# nothing but depth survives a grow and >=65 nested try frames no longer
+# write out of bounds. Probes 64/65/100/200/300 all pass (per-level finally
+# output correct); official driver PASS, 3x3 EXACT, case_deep_try_finally_nesting
+# green.
+# 2026-11-16 B-ID199 round7: security_cryptography_suite,
+# pathfinding_grid and tcp_client_listener_lifecycle graduated to
+# tests/selfhost/diff_cases.txt (roots: ByteArrToStr null-guard + CallArg
+# raw byte[]->string arg sharing; struct virtual-dispatch exclusion;
+# socket-intrinsic completion-slot consume-and-clear -- full accounts in
+# TASKS.md B-ID199 round7; official driver 3x3 stable, anchored ctest 3/3).
+# iterator_lazy_semantics re-signed below: the type-confused AV is gone
+# (EmitInterfaceCall single-candidate devirtualization is soundness-guarded
+# now), the remaining red is the eager-List iterator degradation (B-ID217).
+iterator_lazy_semantics -- the program exited with 3221226505 (0xC0000409 controlled abort; was AV 3221225477 -- the round7 devirt soundness guard routes the built-in-container IEnumerable receiver to the honest fail-fast fallback instead of the type-confused direct call; the eager List materialization still cannot produce the lazy output, B-ID217)
+# 2026-11-16 B-ID199 round8: tdengine_pool cured by the cumulative
+# round1-7 fixes (test_runner precedent) -- official driver 3x3 stable +
+# anchored ctest case_tdengine_pool Passed; graduated to
+# tests/selfhost/diff_cases.txt.
+# 2026-11-16 B-ID199 round8 re-signature + attribution: the whole zandb
+# family (incl. the GRADUATED zandb_docs/zandb_kernel in
+# tests/selfhost/diff_cases.txt) now dies in the first Collection.Insert
+# with 0xC0000374 heap corruption (zandb_quantize: exit 1 after "ok 1 -
+# open"). Layered probe bisects it to ZanDatabase.Open -> GetCollection ->
+# first Insert (no escaping involved -- a plain {"name","age"} doc
+# corrupts). Attribution is closed against selfhost changes: a HEAD
+# worktree gen1 (no B-ID199 r1-7 changes) built with TODAY's zanc crashes
+# identically on all six zandb cases, while the graduated batch was green
+# with the pre-rebuild zanc -- the root is the in-flight src/compiler
+# rebuild (other session, zanc re-linked 2026-11-15 23:47), same drift
+# face B-ID186 documented for bzip2/decimal. Not a B-ID199 account; do
+# not fix or work around in-flight. Re-derive after the zanc work closes.
+zandb_backup -- the program exited with 3221226356 (0xC0000374 heap corruption in first Collection.Insert; zanc in-flight rebuild, see round8 note above)
+zandb_integrity -- the program exited with 3221226356 (same face as zandb_backup)
+zandb_p3 -- the program exited with 3221226356 (same face as zandb_backup; probe trace open->GetCollection->Insert)
+zandb_quantize -- the program exited with 1 after "ok 1 - open" (same Insert face, soft-fail variant)
 
 # timeout (33):
 db_pool_lifecycle -- the program timed out after 5s (spin or hang)
@@ -261,7 +325,7 @@ zandb_vecbin -- the program timed out after 5s (spin or hang)
 zandb_vectable -- the program timed out after 5s (spin or hang)
 zandb_vector -- the program timed out after 5s (spin or hang)
 
-# other (19):
+# other (21): (header said 19 -- ai_pipeline / exception_try_exit_depth were appended without updating the count; corrected 2026-11-15 round3)
 arc_temp_receiver_methodgroup -- the program exited with 3221226356: 
 async_concurrent_echo -- the program exited with 3221226356: 
 async_handler_slots -- the program exited with 3221226505: 

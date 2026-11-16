@@ -28,6 +28,7 @@ partial class Irgen {
         c.op = n.op; c.ival = n.ival; c.sval = n.sval; c.sval2 = n.sval2;
         c.mods = n.mods; c.line = n.line; c.col = n.col;
         c.type = CopyType(SubstTP(n.type, tns, trs));
+        c.methodGroupTarget = CopyType(SubstTP(n.methodGroupTarget, tns, trs));
         c.a = CloneSubst(n.a, tns, trs);
         c.b = CloneSubst(n.b, tns, trs);
         c.c = CloneSubst(n.c, tns, trs);
@@ -264,14 +265,24 @@ partial class Irgen {
     // base_recv -> emit_dispatch_call with a NULL class).
     ExprVal EmitInstanceCallAs(ExprVal recv, string clsName, string name, Node e, bool direct) {
         Node cls = binder.FindType(clsName);
-        Node m = ResolveMethodUp(cls, name, e, false);
+        // the receiver's instantiated type (Query<Entity>) is what binds the
+        // declaration's type parameters while overload scoring looks at the
+        // declaration-form candidate signatures (Func<T,int>)
+        Node m = ResolveMethodUp(cls, name, e, false, recv.ty);
         if (m == null && (name == "ToString" || name == "Equals" || name == "GetHashCode")) {
             return EmitObjectFamilyCall(recv, name, e);
         }
         if (!direct && m != null && IsPolyClass(cls) && HasMod(cls, MOD.Iface())) {
             return EmitInterfaceCall(recv, cls, name, m, e);
         }
-        if (!direct && m != null && IsPolyClass(cls) && VSlotIndexM(cls, m) >= 0) {
+        // A struct never takes the vtable path: it is a VALUE with no vptr
+        // slot in its layout (FieldBase keeps slot 0 for classes only), so
+        // its runtime type is statically known and the override below the
+        // receiver's own type IS the only possible implementation. Routing
+        // `GridPoint.ToString()` through EmitVirtualCall loaded the packed
+        // {x,y} payload as the vtable pointer and jumped through it
+        // (B-ID199 r7, pathfinding_grid: call [0x400000003]).
+        if (!direct && m != null && cls.kind != AK.StructDecl() && IsPolyClass(cls) && VSlotIndexM(cls, m) >= 0) {
             return EmitVirtualCall(recv, cls, name, m, e);
         }
         string owner = MethodOwner(cls, name);
@@ -321,8 +332,26 @@ partial class Irgen {
                 }
             }
             if (mtps.Count > 0) {
-                if (!BindTypeArgs(m, e, mtps, stns, strs)) {
-                    BindFromArgs(m, e, 0, mtps, stns, strs);
+                // A method type parameter with the same name as a class one
+                // SHADOWS it (TypeParamConstraint semantics): bind the
+                // method's own parameters in fresh lists first, then merge
+                // over the class bindings. Binding straight into
+                // (stns,strs) let IndexOfStr find the class's replacement
+                // and silently drop the call's explicit type argument --
+                // `box.Same<int>(7)` on a `Box<string>` monomorphized the
+                // body for T=string and passed the int as a reference
+                // (inttoptr -> zretain(0x7) -> AV).
+                List<string> mtns = new List<string>();
+                List<Node> mtrs = new List<Node>();
+                if (!BindTypeArgs(m, e, mtps, mtns, mtrs)) {
+                    BindFromArgs(m, e, 0, mtps, mtns, mtrs);
+                }
+                int mi = 0;
+                while (mi < mtns.Count) {
+                    int hit = IndexOfStr(stns, mtns[mi]);
+                    if (hit >= 0) { strs[hit] = mtrs[mi]; }
+                    else { stns.Add(mtns[mi]); strs.Add(mtrs[mi]); }
+                    mi = mi + 1;
                 }
             }
             if (clsSpec || mtps.Count > 0) {
@@ -501,9 +530,31 @@ partial class Irgen {
             return new ExprVal(dummyVal, m.type);
         }
 
-        // Single candidate devirtualization: if only 1 concrete class implements this interface,
-        // directly invoke that implementation without runtime tag comparison overhead.
-        if (cands.Count == 1) {
+        // Single candidate devirtualization: only sound when the receiver's
+        // runtime class is STATICALLY KNOWN (a concrete class or struct --
+        // then it is the candidate or the scan would have included it). An
+        // interface-typed receiver can hold ANY implementor, including the
+        // built-in containers: List/Dict/StringBuilder are runtime objects
+        // with container tids and no ClassDecl, so the scan over
+        // binder.types can never see them -- devirtualizing on a lone
+        // candidate then calls that candidate with a mismatched receiver
+        // (iterator_lazy_semantics: `IEnumerable<int>` backed by the
+        // built-in List devirtualized to ReadOnlyCollection_GetEnumerator,
+        // a type-confused GEP on the list object -> AV). Interface-typed
+        // receivers take the tag chain below: a real implementor matches
+        // its vtable and behaves identically, anything else lands in the
+        // controlled fallback instead of the direct call.
+        bool devirt = (cands.Count == 1);
+        if (devirt && recv.ty != null && recv.ty.ival == 0) {
+            Node rt2 = binder.FindType(recv.ty.sval);
+            if (rt2 == null || HasMod(rt2, MOD.Abstract()) || HasMod(rt2, MOD.Iface())
+                    || (rt2.kind != AK.ClassDecl() && rt2.kind != AK.StructDecl())) {
+                devirt = false;
+            }
+        } else if (devirt) {
+            devirt = false;
+        }
+        if (devirt) {
             Node candCls = cands[0];
             Node candMeth = candMeths[0];
             string impl = candImpls[0];

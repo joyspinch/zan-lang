@@ -930,6 +930,38 @@ partial class Irgen {
         }
         Node cls = ClassOf(obj.ty);
         if (cls != null && FieldIndex(cls, e.sval) >= 0) {
+            // B-ID199 round3: a null receiver's instance-field read used to
+            // go straight to a raw GEP+load -- a hardware segfault with no
+            // diagnostic (the root of runtime_error_catch's 4th sub-test).
+            // Same contract as the C host's local fast path
+            // (src/compiler/access/access_member.c): a TYPE_CLASS receiver
+            // gets a null check first -- inside a try it raises a
+            // NullReferenceException, outside one it takes the soft channel
+            // (the same dual track EmitRuntimeCheckIf implements) -- and the
+            // field read then lands on the soft scratch page and yields a
+            // zero. A struct receiver is an inline value and can never be
+            // null, so it is not checked (same predicate as the A507
+            // instance-call guard, irgen_expr_call.zan).
+            if (cls.kind == AK.ClassDecl()) {
+                string rt0 = MapType(obj.ty);
+                if (IsPtrLL(rt0)) {
+                    string rn = NT();
+                    L("  " + rn + " = icmp eq " + rt0 + " " + obj.op + ", null");
+                    string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != ""
+                        ? e.a.sval : e.sval;
+                    EmitRuntimeCheckIf(e, rn,
+                        "null reference: receiver '" + rnm + "' is null");
+                    if (!ExternSeen("__zan_soft_scratch")) {
+                        externDecls.Add("__zan_soft_scratch");
+                        H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
+                    }
+                    string sb = NT();
+                    L("  " + sb + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
+                    string sel = NT();
+                    L("  " + sel + " = select i1 " + rn + ", i8* " + sb + ", i8* " + obj.op);
+                    obj = new ExprVal(sel, obj.ty);
+                }
+            }
             return LoadField(obj.op, obj.ty, e.sval);
         }
         // property getter: obj.Name -> obj.get_Name()

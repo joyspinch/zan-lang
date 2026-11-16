@@ -112,6 +112,16 @@ public class MOD {
 public class StrEsc {
     // the decoded literal as UTF-8 bytes
     public static List<int> DecodeBytes(string raw) {
+        return DecodeBytesChecked(raw, null);
+    }
+
+    // DecodeBytes with host-signature escape diagnostics: when `errs` is not
+    // null, every invalid escape records the SAME wording the C host's lexer
+    // emits (src/compiler/lexer/lexer_string.c, codes E0014-E0017) so the
+    // self-host rejects a program the host rejects with the same sentence
+    // (B-ID219). The decoded bytes are unchanged -- the host also keeps
+    // scanning after the diagnostic.
+    public static List<int> DecodeBytesChecked(string raw, List<string> errs) {
         List<int> r = new List<int>();
         int i = 0;
         while (i < raw.Length) {
@@ -139,18 +149,37 @@ public class StrEsc {
                     }
                     bool ok = got > 0;
                     if (nx == 117 && got != 4) { ok = false; }
-                    // a surrogate code point is not a scalar value
-                    if (ok && val >= 55296 && val <= 57343) { ok = false; }
-                    if (ok) {
-                        AddUtf8(r, val);
-                        i = j;
+                    if (!ok) {
+                        if (errs != null) {
+                            if (nx == 120 && got == 0) {
+                                errs.Add("[E0014] '\\x' escape requires at least one hex digit");
+                            } else {
+                                errs.Add("[E0015] '\\u' escape requires 4 hex digits");
+                            }
+                        }
+                        // the host rejects these; keep the letter and carry on
+                        if (nx == 117 && got == 4) { r.Add(nx); i = j; continue; }
+                        r.Add(nx);
+                        i = i + 2;
                         continue;
                     }
-                    // the host rejects these; keep the letter and carry on
-                    if (nx == 117 && got == 4) { r.Add(nx); i = j; continue; }
-                    r.Add(nx);
-                    i = i + 2;
+                    // a surrogate code point is not a scalar value
+                    if (val >= 55296 && val <= 57343) {
+                        if (errs != null) {
+                            errs.Add("[E0016] '\\" + ((char)nx) + "' escape value 0x" + HexUpper(val)
+                                + " is a surrogate code point");
+                        }
+                        if (nx == 117 && got == 4) { r.Add(nx); i = j; continue; }
+                        r.Add(nx);
+                        i = i + 2;
+                        continue;
+                    }
+                    AddUtf8(r, val);
+                    i = j;
                     continue;
+                }
+                if (errs != null) {
+                    errs.Add("[E0017] invalid escape sequence '\\" + ((char)nx) + "'");
                 }
                 r.Add(nx);
                 i = i + 2;
@@ -160,6 +189,15 @@ public class StrEsc {
             i = i + 1;
         }
         return r;
+    }
+
+    // the host's printf %X: uppercase hex, no leading zeros
+    public static string HexUpper(int v) {
+        if (v == 0) { return "0"; }
+        string digits = "0123456789ABCDEF";
+        string s = "";
+        while (v > 0) { s = digits.Substring(v % 16, 1) + s; v = v / 16; }
+        return s;
     }
 
     // the decoded literal as text
@@ -248,6 +286,7 @@ public class Node {
     public string attrBlob;        // packed custom attributes: Attr=val;Attr.Key=val;
     public string attrTableName;   // [Table("tbl")] or [Table(Name = "tbl")]
     public List<string> interfaces; // interfaces implemented by class/interface
+    public Node methodGroupTarget; // expected delegate signature; never an instance-specific method
     public Node resolvedSym;       // B-ID62: bound symbol for Call nodes
     public bool isIntrinsic;       // B-ID62: true if compiler intrinsic or builtin call
 
@@ -262,7 +301,7 @@ public class Node {
         attrFieldCustom = ""; attrFieldFlags = 0; attrFieldDefault = "";
         attrTable = false; attrBlob = ""; attrTableName = "";
         interfaces = new List<string>();
-        resolvedSym = null; isIntrinsic = false;
+        methodGroupTarget = null; resolvedSym = null; isIntrinsic = false;
     }
 
     public void Add(Node n) { kids.Add(n); }

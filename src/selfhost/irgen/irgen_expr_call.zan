@@ -16,6 +16,13 @@ partial class Irgen {
             bool builtinTask = cn == "Task";
             if (mn == "Run" || mn == "Spawn") { builtinTask = builtinTask && callee.isIntrinsic; }
             else { builtinTask = builtinTask && (e.resolvedSym == null || e.isIntrinsic); }
+            // 遮蔽守卫：宿主每个内建分派都带 !zan_type_defines(g, cn, mn)
+            // （call_builtins/builtin_io.c 等 24 处），用户类定义了同名成员就
+            // 不得劫持。checker 已把用户方法解析进 resolvedSym（isIntrinsic
+            // 才是真内建），判据与上方 Task 分支同款。缺它时用户
+            // Environment.ArgCount 被换成真 argv 内建：输出被替换，无参运行
+            // 还越界读 @__zan_argv 段错误（B-ID199 crash 簇 builtin_shadowing）。
+            bool builtinShadow = e.resolvedSym == null || e.isIntrinsic;
             if (builtinTask && (mn == "Run" || mn == "Spawn") && e.kids.Count == 1) {
                 return EmitTaskRunCall(e, mn == "Spawn");
             }
@@ -111,21 +118,39 @@ partial class Irgen {
             if (cn == "Cpu" && mn == "CpuFeature" && e.kids.Count == 1) {
                 return new ExprVal("0", MkType("int"));
             }
-            if (cn == "Environment" && mn == "ArgCount") {
+            if (cn == "Environment" && mn == "ArgCount" && e.kids.Count == 0 && builtinShadow) {
                 string a = NT(); L("  " + a + " = load i32, i32* @__zan_argc");
                 string a64 = NT(); L("  " + a64 + " = sext i32 " + a + " to i64");
                 string r = NT(); L("  " + r + " = sub i64 " + a64 + ", 1");
                 return new ExprVal(r, MkType("int"));
             }
-            if (cn == "Environment" && mn == "ArgAt") {
+            if (cn == "Environment" && mn == "ArgAt" && e.kids.Count == 1 && builtinShadow) {
+                // 契约同宿主（builtin_io.c ArgAt）：idx >= 0 且 idx+1 < argc
+                // 才读 @__zan_argv[idx+1]，越界回空串字面量。此前裸读，
+                // 无参运行（差分门不传 RUN_ARGS）idx=1 直接段错误。
                 ExprVal idx = GenExpr(e.kids[0]);
+                string pred = curLbl;
+                ExprVal ez = GenStr("");
+                string argc32 = NT(); L("  " + argc32 + " = load i32, i32* @__zan_argc");
+                string argc64 = NT(); L("  " + argc64 + " = sext i32 " + argc32 + " to i64");
                 string i1 = NT(); L("  " + i1 + " = add i64 " + idx.op + ", 1");
+                string nn = NT(); L("  " + nn + " = icmp sge i64 " + idx.op + ", 0");
+                string inr = NT(); L("  " + inr + " = icmp slt i64 " + i1 + ", " + argc64);
+                string ok = NT(); L("  " + ok + " = and i1 " + nn + ", " + inr);
+                int lok = NL(); int lout = NL();
+                L("  br i1 " + ok + ", label %L" + lok + ", label %L" + lout);
+                Label(lok);
                 string av = NT(); L("  " + av + " = load i8**, i8*** @__zan_argv");
                 string sp = NT(); L("  " + sp + " = getelementptr i8*, i8** " + av + ", i64 " + i1);
                 string r = NT(); L("  " + r + " = load i8*, i8** " + sp);
-                return new ExprVal(WrapManaged(r), MkType("string"));
+                string rm = WrapManaged(r);
+                string okLbl = curLbl;
+                L("  br label %L" + lout);
+                Label(lout);
+                string res = NT(); L("  " + res + " = phi i8* [ " + rm + ", %" + okLbl + " ], [ " + ez.op + ", %" + pred + " ]");
+                return new ExprVal(res, MkType("string"));
             }
-            if (cn == "File" && mn == "ReadAllText") {
+            if (cn == "File" && mn == "ReadAllText" && e.kids.Count == 1 && builtinShadow) {
                 ExprVal path = GenExpr(e.kids[0]);
                 string rb = NT(); L("  " + rb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_rb, i64 0, i64 0");
                 string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + rb + ")");
@@ -149,7 +174,7 @@ partial class Irgen {
                 L("  call void @free(i8* " + buf + ")");
                 return new ExprVal(managed, MkType("string"));
             }
-            if (cn == "File" && mn == "Exists") {
+            if (cn == "File" && mn == "Exists" && e.kids.Count == 1 && builtinShadow) {
                 ExprVal path = GenExpr(e.kids[0]);
                 string rb = NT(); L("  " + rb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_rb, i64 0, i64 0");
                 string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + rb + ")");
@@ -163,14 +188,14 @@ partial class Irgen {
                 Label(lend2);
                 return new ExprVal(okx, MkType("bool"));
             }
-            if (cn == "Environment" && mn == "ExeDir") {
+            if (cn == "Environment" && mn == "ExeDir" && e.kids.Count == 0 && builtinShadow) {
                 usesDirList = true;
                 string t = NT(); L("  " + t + " = call i8* @zan_exe_dir()");
                 string managed = WrapManaged(t);
                 L("  call void @free(i8* " + t + ")");
                 return new ExprVal(managed, MkType("string"));
             }
-            if (cn == "Directory" && mn == "ListNames") {
+            if (cn == "Directory" && mn == "ListNames" && e.kids.Count == 1 && builtinShadow) {
                 usesDirList = true;
                 ExprVal pat = GenExpr(e.kids[0]);
                 string t = NT(); L("  " + t + " = call i8* @zan_dir_list(i8* " + pat.op + ")");
@@ -178,7 +203,7 @@ partial class Irgen {
                 L("  call void @free(i8* " + t + ")");
                 return new ExprVal(managed, MkType("string"));
             }
-            if (cn == "File" && mn == "WriteAllText") {
+            if (cn == "File" && mn == "WriteAllText" && e.kids.Count == 2 && builtinShadow) {
                 ExprVal path = GenExpr(e.kids[0]);
                 ExprVal content = GenExpr(e.kids[1]);
                 string wb = NT(); L("  " + wb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_wb, i64 0, i64 0");
@@ -716,6 +741,10 @@ partial class Irgen {
             if (mname == "ToString" && e.kids.Count == 1 && !IsStr(recv.ty)
                 && ClassOf(recv.ty) == null && !IsListType(recv.ty) && !IsDictType(recv.ty) && !IsSbType(recv.ty)
                 && e.kids[0] != null && e.kids[0].kind == AK.StringLit()) {
+                List<string> specBad = new List<string>();
+                StrEsc.DecodeBytesChecked(e.kids[0].sval, specBad);
+                int sbi = 0;
+                while (sbi < specBad.Count) { diags.Error(specBad[sbi], e.kids[0].line, e.kids[0].col); sbi = sbi + 1; }
                 string spec = StrEsc.DecodeText(e.kids[0].sval);
                 return EmitScalarToStringFmt(recv, spec);
             }
@@ -852,7 +881,7 @@ partial class Irgen {
             // does NOT already own an applicable instance method or delegate field
             // of the same name (C# spec §12.8.9.2: instance methods shadow extensions).
             Node instCls = ClassOf(recv.ty);
-            bool hasInst = instCls != null && (ResolveMethodUp(instCls, mname, e, false) != null
+            bool hasInst = instCls != null && (ResolveMethodUp(instCls, mname, e, false, null) != null
                 || (FieldType(instCls, mname) != null && IsDelegate(FieldType(instCls, mname))));
             if (!hasInst) {
                 List<Node> extMs = new List<Node>();

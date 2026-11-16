@@ -6,7 +6,255 @@ namespace Zan;
 // resolves type/field/method names. Mirrors src/compiler/binder.c for the
 // bootstrap subset. Uses linear lookup over declaration lists (no dependency
 // on Dictionary, which gen0 does not fully support).
+// A probe result is ephemeral. Only the target signature belongs on the AST.
+public class MethodGroupBinding {
+    public Node method;
+    public Node ownerType;
+    public int score;
+    public MethodGroupBinding() { method = null; ownerType = null; score = -1; }
+}
+
 public class Binder {
+    public List<string> TypeParams(Node owner) {
+        List<string> r = new List<string>();
+        if (owner == null) { return r; }
+        int i = 0;
+        while (i < owner.kids.Count) {
+            if (owner.kids[i].kind == AK.TypeParam()) { r.Add(owner.kids[i].sval); }
+            i = i + 1;
+        }
+        return r;
+    }
+
+    public Node CopyType(Node t) {
+        if (t == null) { return null; }
+        Node r = new Node(t.kind);
+        r.sval = t.sval; r.sval2 = t.sval2; r.op = t.op; r.ival = t.ival;
+        r.arrRanks = t.arrRanks; r.mods = t.mods; r.line = t.line; r.col = t.col;
+        int i = 0;
+        while (i < t.kids.Count) { r.Add(CopyType(t.kids[i])); i = i + 1; }
+        return r;
+    }
+
+    public Node SubstType(Node t, List<string> names, List<Node> reps) {
+        if (t == null) { return null; }
+        int i = 0;
+        while (i < names.Count && i < reps.Count) {
+            if (t.sval == names[i] && t.kids.Count == 0) {
+                Node r = CopyType(reps[i]);
+                if (r == null) { return null; }
+                if (t.ival > 0) {
+                    string outerRanks = t.arrRanks;
+                    if (outerRanks == "") { outerRanks = "1"; }
+                    if (r.ival > 0) {
+                        string innerRanks = r.arrRanks;
+                        if (innerRanks == "") { innerRanks = "1"; }
+                        r.arrRanks = outerRanks + "," + innerRanks;
+                    } else { r.arrRanks = outerRanks; }
+                    r.ival = r.ival + t.ival;
+                }
+                if (t.op == 1) { r.op = 1; }
+                return r;
+            }
+            i = i + 1;
+        }
+        Node n = CopyType(t);
+        n.kids = new List<Node>();
+        i = 0;
+        while (i < t.kids.Count) { n.Add(SubstType(t.kids[i], names, reps)); i = i + 1; }
+        return n;
+    }
+
+    public Node SubstOwner(Node t, Node owner) {
+        if (owner == null) { return t; }
+        List<string> names = TypeParams(FindType(owner.sval));
+        if (names.Count == 0 || names.Count != owner.kids.Count) { return t; }
+        return SubstType(t, names, owner.kids);
+    }
+
+    public Node BaseType(Node owner) {
+        if (owner == null) { return null; }
+        Node cls = FindType(owner.sval);
+        if (cls == null || cls.sval2 == "") { return null; }
+        if (cls.type != null) { return SubstOwner(cls.type, owner); }
+        Node r = new Node(AK.TypeRef()); r.sval = cls.sval2; return r;
+    }
+
+    public Node MemberType(Node receiver, string name) {
+        Node owner = receiver;
+        int depth = 0;
+        while (owner != null && depth < 64) {
+            Node cls = FindType(owner.sval);
+            if (cls == null) { return null; }
+            Node f = FindField(cls, name);
+            if (f != null) { return SubstOwner(f.type, owner); }
+            Node g = FindMethod(cls, "get_" + name);
+            if (g != null) { return SubstOwner(g.type, owner); }
+            owner = BaseType(owner); depth = depth + 1;
+        }
+        return null;
+    }
+
+    public List<Node> DelegateParams(Node ty) {
+        List<Node> r = new List<Node>();
+        if (ty == null) { return r; }
+        // Func/Action are builtin delegate families the C host resolves
+        // before any scope lookup, so the stdlib's Action<T> declaration is
+        // shadowed at every arity (see the arity note in checker_type.zan).
+        // Letting that declaration answer for a bare `Action` would lend its
+        // unsubstituted T to the parameter list; params come from the
+        // use-site type args alone.
+        Node d = (ty.sval != "Func" && ty.sval != "Action") ? FindDelegate(ty.sval) : null;
+        if (d != null) {
+            int i = 0;
+            while (i < d.kids.Count) {
+                Node p = d.kids[i];
+                if (p.kind == AK.Param()) { r.Add(SubstType(p.type, TypeParams(d), ty.kids)); }
+                i = i + 1;
+            }
+            return r;
+        }
+        int count = ty.kids.Count;
+        if (ty.sval == "Func" && count > 0) { count = count - 1; }
+        int i = 0;
+        while (i < count) { r.Add(ty.kids[i]); i = i + 1; }
+        return r;
+    }
+
+    public Node DelegateRet(Node ty) {
+        // Same builtin shadowing as DelegateParams: Func/Action signatures
+        // are synthesized from the use-site type args, never from the
+        // stdlib's own generic declaration.
+        Node d = ty != null && ty.sval != "Func" && ty.sval != "Action"
+            ? FindDelegate(ty.sval) : null;
+        if (d != null && d.type != null) { return SubstType(d.type, TypeParams(d), ty.kids); }
+        if (ty != null && ty.sval == "Func" && ty.kids.Count > 0) { return ty.kids[ty.kids.Count - 1]; }
+        Node r = new Node(AK.TypeRef()); r.sval = "void"; return r;
+    }
+
+    public bool SameType(Node a, Node b) { return SameTypeAt(a, b, 0); }
+
+    bool SameTypeAt(Node a, Node b, int depth) {
+        if (a == null || b == null || depth > 64) { return false; }
+        if (a == b) { return true; }
+        if (a.sval != b.sval && a.ival == 0 && b.ival == 0 && IsDelegateName(a.sval) && IsDelegateName(b.sval)) {
+            if (DelegateIsAsync(a.sval) != DelegateIsAsync(b.sval)) { return false; }
+            List<Node> ap = DelegateParams(a); List<Node> bp = DelegateParams(b);
+            if (ap.Count != bp.Count || !SameTypeAt(DelegateRet(a), DelegateRet(b), depth + 1)) { return false; }
+            int j = 0;
+            while (j < ap.Count) { if (!SameTypeAt(ap[j], bp[j], depth + 1)) { return false; } j = j + 1; }
+            return true;
+        }
+        if (a.sval != b.sval || a.op != b.op || a.ival != b.ival
+            || a.arrRanks != b.arrRanks || a.kids.Count != b.kids.Count) { return false; }
+        int i = 0;
+        while (i < a.kids.Count) {
+            if (!SameTypeAt(a.kids[i], b.kids[i], depth + 1)) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    bool MethodGroupRefType(Node t) {
+        if (t == null || t.op == 1) { return false; }
+        if (t.ival > 0 || t.sval == "object" || t.sval == "string" || t.sval == "Task" || IsDelegateName(t.sval)) { return true; }
+        Node cls = FindType(t.sval);
+        return cls != null && cls.kind == AK.ClassDecl();
+    }
+
+    // Reference variance only: no numeric adaptation or boxing in the thunk.
+    bool MethodGroupConversion(Node to, Node from) {
+        if (to == null || from == null) { return false; }
+        if (SameType(to, from)) { return true; }
+        if (!MethodGroupRefType(to) || !MethodGroupRefType(from)) { return false; }
+        if (to.sval == "object" && to.ival == 0) { return true; }
+        if (to.ival > 0 || from.ival > 0) { return false; }
+        Node cur = from;
+        int depth = 0;
+        while (cur != null && depth < 64) {
+            if (SameType(to, cur)) { return true; }
+            Node cls = FindType(cur.sval);
+            if (cls == null) { return false; }
+            int i = 0;
+            while (i < cls.interfaces.Count) {
+                if (to.kids.Count == 0 && cls.interfaces[i] == to.sval) { return true; }
+                i = i + 1;
+            }
+            cur = BaseType(cur); depth = depth + 1;
+        }
+        return false;
+    }
+
+    int MethodGroupScore(Node m, Node owner, Node target) {
+        if (TypeParams(m).Count != 0 || ((m.mods & MOD.Async()) != 0) != DelegateIsAsync(target.sval)) { return -1; }
+        List<Node> dp = DelegateParams(target);
+        int pidx = 0; int score = 4; int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                if (p.ival == 1 || pidx >= dp.Count) { return -1; }
+                Node pt = SubstOwner(p.type, owner);
+                if (!MethodGroupConversion(pt, dp[pidx])) { return -1; }
+                score = score + (SameType(pt, dp[pidx]) ? 4 : 1);
+                pidx = pidx + 1;
+            }
+            i = i + 1;
+        }
+        if (pidx != dp.Count) { return -1; }
+        Node rt = SubstOwner(m.type, owner);
+        Node dr = DelegateRet(target);
+        if (dr.sval == "void") { return rt == null || rt.sval == "void" ? score : -1; }
+        return MethodGroupConversion(dr, rt) ? score : -1;
+    }
+
+    public bool HasMethodGroup(Node receiver, string name) {
+        Node owner = receiver; bool found = false; int depth = 0;
+        while (owner != null && depth < 64) {
+            Node cls = FindType(owner.sval);
+            if (cls == null) { break; }
+            if (FindField(cls, name) != null || FindMethod(cls, "get_" + name) != null) { return false; }
+            if (FindMethod(cls, name) != null) { found = true; }
+            owner = BaseType(owner); depth = depth + 1;
+        }
+        return found;
+    }
+
+    // form: 0 implicit with this, 1 type/static, 2 value/instance.
+    public MethodGroupBinding ResolveMethodGroup(Node receiver, string name, int form, Node target) {
+        MethodGroupBinding r = new MethodGroupBinding();
+        if (receiver == null || target == null || !IsDelegateName(target.sval)) { return r; }
+        Node dd = FindDelegate(target.sval);
+        int i = 0;
+        if (dd != null) {
+            while (i < dd.kids.Count) {
+                if (dd.kids[i].kind == AK.Param() && dd.kids[i].ival == 1) { return r; }
+                i = i + 1;
+            }
+        }
+        Node owner = receiver; int depth = 0; int bestDepth = -1; bool ambiguous = false;
+        while (owner != null && depth < 64) {
+            Node cls = FindType(owner.sval);
+            if (cls == null) { break; }
+            if (FindField(cls, name) != null || FindMethod(cls, "get_" + name) != null) { return new MethodGroupBinding(); }
+            i = 0;
+            while (i < cls.kids.Count) {
+                Node m = cls.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name) {
+                    bool stat = (m.mods & MOD.Static()) != 0;
+                    if ((form != 1 || stat) && (form != 2 || !stat)) {
+                        int score = MethodGroupScore(m, owner, target);
+                        if (score >= 0 && score > r.score) {
+                            r.method = m; r.ownerType = owner; r.score = score; bestDepth = depth; ambiguous = false;
+                        } else if (score >= 0 && score == r.score && depth == bestDepth && m != r.method) { ambiguous = true; }
+                    }
+                }
+                i = i + 1;
+            }
+            owner = BaseType(owner); depth = depth + 1;
+        }
+        return ambiguous ? new MethodGroupBinding() : r;
+    }
+
     public List<Node> types;   // class/struct/enum decls across all units
     public Dictionary<string, Node> typeMap; // O(1) hash index for FindType
     public List<string> tparams; // generic type-parameter names across all units
