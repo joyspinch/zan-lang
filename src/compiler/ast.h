@@ -465,6 +465,9 @@ struct zan_ast_node {
             zan_ast_node_t *expr;
             zan_ast_node_t *decl_type;
             int is_out;
+            /* checker 缓存的引用体类型（ref/out 实参精确类型校验用）：
+             * 位形式 = place 表达式类型；`out T x` 声明形式 = 解析后的 T。 */
+            zan_type_t *place_type;
         } ref_arg;
 
         struct {

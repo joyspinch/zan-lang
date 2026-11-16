@@ -634,7 +634,11 @@ static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
     }
     for (int i = 0; i < call->call.args.count; i++) {
         zan_ast_node_t *a = call->call.args.items[i];
-        if (!a || a->kind == AST_NAMED_ARG || a->kind == AST_REF_ARG) return NULL;
+        /* AST_REF_ARG 不再整体 bail：ref/out 实参的精确类型校验在
+         * check_call_arg_type 里做（此前 bail 导致带 ref/out 的调用
+         * 连常规实参校验都被跳过——ref int 形参收 int 实参这类宽度
+         * 错配静默通过，寄存器/栈槽宽度直接错）。 */
+        if (!a || a->kind == AST_NAMED_ARG) return NULL;
     }
     return only;
 }

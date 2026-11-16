@@ -45,6 +45,7 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
         node->ident.variance = 0;
     }
     if (kind == AST_MEMBER_ACCESS) node->member.method_group_target = NULL;
+    if (kind == AST_REF_ARG) node->ref_arg.place_type = NULL;
     if (kind == AST_METHOD_DECL || kind == AST_CONSTRUCTOR_DECL) {
         node->method_decl.is_task_return = false;
         node->method_decl.ext = NULL;

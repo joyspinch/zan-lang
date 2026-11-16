@@ -814,6 +814,8 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx
         *res = *node;
         res->ref_arg.decl_type = clone_ast_subst(node->ref_arg.decl_type, ctx);
         res->ref_arg.expr = clone_ast_subst(node->ref_arg.expr, ctx);
+        /* 泛型实例化克隆出的实参节点尚未被 checker 走过，类型缓存失效 */
+        res->ref_arg.place_type = NULL;
         return res;
     }
     case AST_QUERY_EXPR: {

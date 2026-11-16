@@ -689,6 +689,9 @@ public partial class Checker {
             if (callTargetMethod != null) {
                 CheckErasedArrayConversion(curTargetType, InferType(n.kids[i]),
                     n.kids[i] != null && n.kids[i].kind == AK.NullLit(), n.kids[i].line, n.kids[i].col);
+                if (n.kids[i] == null || n.kids[i].argName == "") {
+                    CheckRefArgWidth(callTargetMethod, n, i, curTargetType);
+                }
             }
             curTargetType = prevArgTarget;
             i = i + 1;
@@ -863,6 +866,50 @@ public partial class Checker {
     // parameter type). The parameter list must match the argument count --
     // the self-hosted checker resolves overloads by name, so a different
     // overload may be the intended one.
+    // ref/out 实参宽度检查（对齐 C 宿主 E3106，P3）：引用传递不发生
+    // 转换——place 类型必须与形参一致；普通值收 ref 形参同样静默跑错
+    // （发射期望 OutArg 地址形态）。泛型形参 T 走调用点推断，不裁决
+    // （判不出不误杀）。类型名按 sval 比较（含容器/数组拼写），与赋值
+    // 兼容 Walk 同口径的声明模型限。
+    void CheckRefArgWidth(Node cand, Node call, int index, Node pt) {
+        if (cand == null || cand.kind != AK.MethodDecl()) { return; }
+        Node p = null;
+        int seen = 0;
+        int k = 0;
+        while (k < cand.kids.Count) {
+            if (cand.kids[k].kind == AK.Param()) {
+                if (seen == index) { p = cand.kids[k]; break; }
+                seen = seen + 1;
+            }
+            k = k + 1;
+        }
+        if (p == null || p.ival != 1) { return; }
+        Node a = call.kids[index];
+        if (a == null || a.kind != AK.OutArg()) {
+            diags.Error("[E3106] argument " + (index + 1) + " of '" + cand.sval
+                + "' must be passed with 'ref'/'out'", call.line, call.col);
+            return;
+        }
+        if (pt == null) { return; }
+        Node place = null;
+        string placeSval = null;
+        if (a.ival == 1 && a.a != null) {
+            place = a.a;
+        } else if (a.ival == 2 && a.type != null) {
+            placeSval = a.type.sval;
+        }
+        if (place != null) {
+            Node at = InferType(place);
+            if (at != null) { placeSval = at.sval; }
+        }
+        if (placeSval == null || placeSval == "") { return; }
+        if (binder.IsTypeParam(pt.sval) || binder.IsTypeParam(placeSval)) { return; }
+        if (pt.sval != placeSval) {
+            diags.Error("[E3106] ref/out argument " + (index + 1) + " of '" + cand.sval
+                + "' must be of type '" + pt.sval + "', got '" + placeSval + "'",
+                a.line, a.col);
+        }
+    }
     void CheckTaskArgs(Node m, Node call) {
         if (m == null) { return; }
         int np = 0;

@@ -62,12 +62,70 @@ static void check_builtin_generic_call_args(zan_checker_t *c,
     }
 }
 
+/* ref/out 引用体类型精确相等（P3）：kind/名字/sym/元素/类型实参逐层比，
+ * 比值传递的隐式转换严格——ref 语义下不存在转换，宽度错配=按形参槽宽
+ * 写实参存储（int 变量传 ref long：4 字节局部按 8 字节写，邻接内存
+ * 静默受损）。 */
+static bool ref_referent_type_exact(zan_type_t *a, zan_type_t *b) {
+    if (!a || !b) return a == b;
+    if (a == b) return true;
+    if (a->kind != b->kind) return false;
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
+        if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank) return false;
+        return ref_referent_type_exact(a->element_type, b->element_type);
+    }
+    if (a->kind == TYPE_DELEGATE) {
+        if (a->delegate_is_async != b->delegate_is_async ||
+            a->delegate_param_count != b->delegate_param_count ||
+            !ref_referent_type_exact(a->delegate_ret_type,
+                                     b->delegate_ret_type)) return false;
+        for (int i = 0; i < a->delegate_param_count; i++)
+            if (!ref_referent_type_exact(a->delegate_param_types[i],
+                                         b->delegate_param_types[i])) return false;
+        return true;
+    }
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++)
+        if (!ref_referent_type_exact(a->type_args[i], b->type_args[i]))
+            return false;
+    if ((a->kind == TYPE_CLASS || a->kind == TYPE_STRUCT ||
+         a->kind == TYPE_INTERFACE || a->kind == TYPE_ENUM) && a->sym != b->sym)
+        return false;
+    if (a->name.len != b->name.len ||
+        memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0) return false;
+    return true;
+}
+
 static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                                 zan_ast_node_t *arg, zan_type_t *arg_type) {
     zan_ast_list_t *ps = &sig->decl->method_decl.params;
     if (index >= ps->count) return;
-    zan_type_t *pt = zan_binder_resolve_type(c->binder,
-                                             ps->items[index]->param.type);
+    zan_ast_node_t *param_node = ps->items[index];
+    zan_type_t *pt = zan_binder_resolve_type(c->binder, param_node->param.type);
+    /* ref/out 实参宽度检查（P3）：引用传递不发生转换。泛型形参 T 走
+     * 调用点推断，不在此裁决（判不出不误杀）。声明形式 `out T x` 的
+     * 引用体就是声明的 T，必然一致。 */
+    if (param_node->param.by_ref) {
+        if (!arg || arg->kind != AST_REF_ARG) {
+            /* 普通值按 ref 形参收：实参发射期望 AST_REF_ARG 的地址
+             * 形态，值形态会静默跑错（实测输出丢失）。 */
+            zan_diag_emit_code(c->diag, DIAG_ERROR,
+                arg ? arg->loc : sig->decl->loc, 3106,
+                "argument %d of '%.*s' must be passed with 'ref'/'out'",
+                index + 1, (int)sig->name.len, sig->name.str);
+            return;
+        }
+        zan_type_t *place_ty = arg->ref_arg.place_type;
+        if (place_ty && place_ty != c->binder->type_error && pt &&
+            pt->kind != TYPE_TYPE_PARAM && place_ty->kind != TYPE_TYPE_PARAM &&
+            !ref_referent_type_exact(pt, place_ty)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 3106,
+                "ref/out argument %d of '%.*s' must be of type '%s', got '%s'",
+                index + 1, (int)sig->name.len, sig->name.str,
+                type_name(pt), type_name(place_ty));
+        }
+        return;
+    }
     if (arg_type == c->binder->type_void) {
         if (!pt || pt->kind != TYPE_DELEGATE) {
             zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2034,

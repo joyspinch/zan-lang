@@ -83,10 +83,15 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * out declaration instead introduces a new, potentially shadowing local. */
         zan_ast_node_t *place = expr->ref_arg.expr;
         if (expr->ref_arg.decl_type && place && place->kind == AST_IDENTIFIER) {
-            checker_add_local_permissive(c, place->ident.name,
-                zan_binder_resolve_type(c->binder, expr->ref_arg.decl_type));
+            zan_type_t *dt = zan_binder_resolve_type(c->binder,
+                                                     expr->ref_arg.decl_type);
+            /* 缓存引用体类型：ref/out 实参的精确类型校验在
+             * check_call_arg_type 里做（check_call_arg_type 拿不到
+             * place 的推导结果——REF_ARG 整体定型为 error）。 */
+            expr->ref_arg.place_type = dt;
+            checker_add_local_permissive(c, place->ident.name, dt);
         } else {
-            zan_checker_check_expr(c, place);
+            expr->ref_arg.place_type = zan_checker_check_expr(c, place);
         }
         return c->binder->type_error;
     }
