@@ -153,6 +153,10 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - 组件写法与同目录既有组件保持一致：命名、事件命名、state 管理同构。
 - 注释只写代码看不出来的约束与"为什么"；不复述代码、不写日期流水、
   不写"本轮修改了什么"。
+  ① **注释与文档中的引用必须客观真实**：引用的仓库路径必须在磁盘真实存在，严禁残留历史搬迁重构前的旧路径；
+  ② **严禁脑补虚假类型契约**：类型是类（class）还是结构体（struct）、方法是独立重载还是转发包装，必须以代码实现为准，禁止在注释中臆造"别名"、"同一个结构体"等与编译器类型系统冲突的谎言；
+  ③ **Markdown 围栏与示例必须闭合且语法完备**：禁止留下空围栏、花括号不平衡或未闭合括号的伪代码片段，示例必须可读可理解；
+  ④ **标准库与包的依赖方向单向受控**：`stdlib` 为基石核心，严禁反向 `using` 位于 `packages/` 下的可选包，避免破坏生成器子编译闭包与 `--no-packages` 纯净环境。
 - 常量收拢：魔法数进常量；字段名引用 schema 生成物或常量，不散落裸字符串。
 - 资源（图片/字体/大 JSON）走内嵌或声明式引用，不在业务代码里手写路径拼接。
 - **高频基础数据热路径杜绝逐字符/堆分配循环**：
@@ -456,6 +460,12 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   需在注释里写明。坑出处：回绑写法表现为"第一条命令挂死、开连例程被递归
   进入两次"，分阶段打印（enter/connected/wired/ping ok）一击定位——
   async 挂死先怀疑命令被二次路由，别急着怀疑编译器。
+- **文件 IO 语义与 C# 直觉的两处差异**：`File.Delete` 对不存在的路径抛
+  IOException（C# 是无操作）——清理/finally 里删临时文件必须先
+  `File.Exists` 或包 try/catch；`Directory.CreateDirectory` 只建**单级**，
+  父目录不存在照样抛——建测试根目录树用 `Directory.CreateDirectoryRecursive`。
+  两处都只在运行期冒异常（裸 "Unhandled exception: IOException"），编译期
+  毫无提示。
 - **IDE 运行与发布编译参数解耦（调试挂满诊断，发布绝不挂隔离区）**：
   IDE 本地调试/F5 运行统一走 `-g --arc-guard --check-leaks --strict-runtime`，
   把野指针/悬垂指针和生命周期错乱当场转成受控断言 / `0xDEAD0000DEAD0000` 崩溃，
@@ -463,8 +473,6 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   （`--publish` 或 `-g --no-arc-guard --no-check-leaks`）严禁启用 `--arc-guard`
   与 `--check-leaks`，因为死块隔离区只吞不吐会导致长期运行的服务或桌面端 RSS
   无界膨胀；工程级 `strictMemory` 开关仅作用于本地非发布运行，绝不穿透覆盖发布配置。
-  坑出处：历史构建中本地 F5 与发布共用一套标志，导致部署产物因 quarantine
-  积累常驻内存，或调试时缺 guard 让 UAF 沦为偶发难以复现的 0xC0000005。
 - **原生栅格化与 Blit 裁剪必须做 64 位整数防溢出**：
   在计算目标裁剪右界和下界时，`dx + dw` 和 `dy + dh` 若直接用 32 位 `int` 相加，
   当坐标处于极端区间（如 `INT_MAX` 附近的平移或越界拖拽）会发生 signed integer

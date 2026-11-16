@@ -188,9 +188,8 @@ description: Zan 开发规范总纲——开发工作流闭环、代码规范（
   后 `WhereConds(conds)` 一口吞（多列 LIKE 用 `|` 分组 OR）。批量更新/
   删除走 `DbTable.Of(conn, "表").Query.WhereIn(...).ExecuteUpdateAsync(...)`
   （列名过 RequireIdent 白名单）。`W("片段")+InI(...)` 这类片段/参数分离
-  写法已整体删除，只以 `__` 前缀（`__Frag/__Pi/...`）存在于编译器生成代码
-  里，手写代码不可见；要给查询链接名字仍用门面根
-  `__DbQ_Post sel = __DbBind.Q_Post(conn);`（裸赋值 `this.Post` 编译不过）。
+  写法已整体删除，值全部自带（值自带后错位不可能发生）；要给查询链接
+  名字就用具名链：`SelectQuery<Post> sel = db.Select<Post>();`。
   坑出处：片段+参数靠位置配对，编译器查不出错位，历史上实烂三处
   （根治，值自带后错位不可能发生）。
 - **Zan.Web 菜单是显式选择（GenRoute 约定），别靠描述"顺便"进侧栏**。进

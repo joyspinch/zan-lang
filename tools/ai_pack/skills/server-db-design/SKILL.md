@@ -95,7 +95,9 @@ description: 服务端 DB 专属数据层细则——索引选择、两段式分
   显式列谓词下推：`q.inner.W("ts < ?"); q.inner.Pl(cut);`。
 - `await` 挂在 `async void` 方法上是火后不理：包装异步库调用的 facade
   方法签名必须 `async bool`/`async int`（调方才真正等得到完成）；
-  `async void` 只留给事件/停机钩子出口。
+  `async void` 只留给事件/停机钩子出口。最小复现：扩展方法体内
+  `await` 异步建表，调用方看似完成实则未跑（某入库 facade 曾在
+  建表完成前还池）。
 
 ## 十、RR 事务中的幂等重放
 

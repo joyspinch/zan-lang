@@ -154,16 +154,22 @@
   只改一边，差分门看不到（它比的是程序输出，不是诊断），但用户会拿到两套
   不同的错误信息。
 
-## 9. 语言能力缺口要堵在**编译期**——`new T()` 这类"没有构造入口"的形态
+## 9. 语言能力缺口要堵在**编译期**——`new T()` 与 `where T : new()` 约束系统
 
 - **坑（2026-10-21 实测）**：`class Maker<T> { T Make() { return new T(); } }`
   编译通过、运行期交出 **null**，第一次成员访问就崩进程（0xC0000005）。根因：
   类型参数没有构造入口，irgen 的 new 分支**既没报错也没生成构造调用**，只是把
   "未初始化的引用"返回了——静默错值，测试完全看不见。
-- **动作**：这类"语言当前做不到"的事，检查器要**编译期报错**，别让运行期交出
-  半个值。措辞 `cannot instantiate a type parameter 'T'`，两个后端同一次落地、
-  同一句措辞，用 reject 用例钉住。语言真要支持"按类型参数造对象"，得先有约束
-  系统（C# 的 `new()` 约束）——在那之前，**诚实的报错比静默的 null 强**。
+- **动作**：
+  1. 无约束的 `T` 在标量 `new T()` 时要在编译期拦截，措辞
+     `cannot instantiate a type parameter 'T'`（两个后端口径一致）；
+  2. 支持 `where T : new()` 约束（类与方法均可声明）：带 `new()` 约束的类型
+     参数允许 `new T()`；
+  3. 类型实参必须满足 `new()` 约束：值类型（struct）天生满足；类类型必须非抽象
+     且具备可访问的无参构造函数（或隐式默认构造），否则报
+     `'X' must have a public parameterless constructor to satisfy 'new()' constraint for 'T' of 'Y'`；
+  4. 发码侧（`irgen_expr.c`）在实例化特化体中通过 `resolve_type_ctx` 解析出具体
+     目标符号并调用其构造函数或生成零值。
 - **分清两种形态**：`new T()`（标量）与 `new T[n]`（数组）**不是一回事**。
   数组的元素类型在实例化时被替换，路径是通的（实测 `T[] buf = new T[3]`
   正常），一刀切禁掉会打断合法代码。判据：宿主侧 `is_array` 为真时类型已被包成
@@ -172,7 +178,22 @@
 - **推广**：凡是"宿主侧返回了一个半成品值"的分支，都是同一种病——检查器要在
   编译期把语义缺口堵住，而不是让运行期交出 null / 0 / 野指针。
 
-## 10. 数组的元素类型是**另一个**节点——每个遍历器都要下钻 `array_element`
+## 10. 限定名解析与类型身份比较
+
+- **坑（2026-10-21 / 2026-10-24 实测）**：
+  当限定名未命中真实类型时（如 `Gui.Action`），`nsresolve.c` 会退化提取简单名（`Action`）。
+  旧逻辑提取后直接 return，导致该简单名跳过了当前命名空间与 `using` 解析链，保留为裸名 `Action`；
+  而其它地方（如参数位置）被 mangle 的类型则是 `System_Action`。检查器（`checker.c` 的 `checker_type_equal`）
+  按名字字符串比较，导致同一类型在实参位是 `Action`、形参位是 `System_Action`，被误判为类型不匹配
+  （`cannot convert 'Action' to 'System_Action'`）。
+- **动作**：
+  1. `nsresolve.c` 在限定名未找到全名退化为简单名后，不能直接返回，必须继续执行 `using` 与上下文命名空间解析，
+     将其重写为目标类型的 `final` 名字（`System_Action`）；
+  2. 检查器 `checker_type_equal` 与 ARC `types_equal` 增加符号级同一性判定：
+     若 `a->sym && b->sym && a->sym == b->sym`，则类型身份一致；
+  3. 沉淀 conformance 测试 `tests/conformance/ns_fallback_mangled_type.zan`。
+
+## 11. 数组的元素类型是**另一个**节点——每个遍历器都要下钻 `array_element`
 
 - **AST 形状**：`T[]` 在语法树里是**两层**——解析器把元素类型包进一个**合成的**
   `AST_TYPE_REF`（`parser.c` 的 `parse_type` 收尾处），合成节点持有数组标志，
@@ -192,7 +213,7 @@
 - **自查口径**：凡是"限定名在普通位置能用、在数组位置报 undefined type"的
   现象，先查那个位置的遍历器有没有下钻到元素节点。
 
-## 11. 声明前瞻（`looks_like_var_decl`）：类型名的三种形态与 `?` / `[]` 后缀
+## 12. 声明前瞻（`looks_like_var_decl`）：类型名的三种形态与 `?` / `[]` 后缀
 
 - **类型名有三种 token 形态，各走各的规则**：声明前瞻里
   1. **关键字类型**（`string` / `int` / `bool` …）→ 关键字分支，**根本不看 `?`**，
@@ -213,7 +234,7 @@
   吃掉，后面一路报 `expected ':'`。
 - **`?` 后跟 `?.` / `??` 不是类型后缀**：`TK_QUESTION` 分支要继续排除 `?` 与 `.`
   （`a?.b` / `a ?? b` 是表达式）。
-- **两个后端的声明前瞻是同一条战线**：自举的 `src/selfhost/parser.zan`
+- **两个后端的声明前瞻是同一条战线**：自举的 `src/selfhost/frontend/parser.zan`
   （`IsDeclStart()` + `SkipType()`）与宿主的 `looks_like_var_decl` 判的是同一件事
   ——「这一行是声明还是表达式」。一个后端认了、另一个没认，就是分叉；而差分门
   只比"能编出来的程序"，看不出"一个能编、一个不能"。
@@ -232,7 +253,7 @@
   **全仓每个以标识符开头的语句**，回归面远大于看上去。
 
 
-## 12. Named array 前瞻与 Task 精确绑定（2026-11-11 实证）
+## 13. Named array 前瞻与 Task 精确绑定（2026-11-11 实证）
 
 - 数组局部声明与 cast 的 rank 扫描必须一致：host `looks_like_var_decl` 的简单名、限定名、泛型后缀分支均需接受 rank 中的逗号；selfhost `IsNamedCast` 识别命名类型后的连续 `[]` / `[,]`，再交给 `ParseType`。只接受空/逗号 rank 内容，保留 `(a[i])` 下标与 `(x) + y` 分组；不能把自然 fixture 改成别的写法绕过 parser。回归：`selfhost_named_array_cast` 覆盖 class[] / class[,] cast 后读写及两种表达式边界。
 - Task.Run/Spawn 的 Action 方法组由 checker 单次选择：零参、无方法类型参数、同步 void；类型接收者要求 static，值接收者要求 instance，隐式 instance 要有 this。零参派生候选即使返回类型错误也隐藏基类，其他 arity 可继续查基类；保留 local/field/property 遮蔽和歧义诊断。成功将实际 MethodDecl 写入 `arg.resolvedSym`，irgen 消费它，不按名字重新筛选；`Make().Work` 需要成员调用类型推断的 `StaticRecv` 回退，类型名没有表达式值类型。

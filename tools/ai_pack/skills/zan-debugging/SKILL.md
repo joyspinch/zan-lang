@@ -25,6 +25,10 @@ Common ones:
 * "can return null; accessing … faults at runtime" → store the value, check for
   null (or `?.`) before using it.
 * unknown member → the API does not exist as written: `zan_api_search` it.
+* "cannot concatenate 'string' and 'X'" → the operand is a class/enum, not a
+  primitive: call `.ToStr()` (or read the field) and concatenate that. Same
+  family: "cannot apply unary '~' to 'Enum'" → cast to int first
+  (`(int)flag`), or use the type's own `UnsetFlag` helper.
 
 ### `out` parameters: the call site must spell `out`, and don't overload on them
 

@@ -844,19 +844,6 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   原文(含遗留键)过一遍解析。
 - **同色折线大批量必须走批量入口,且批量入口要链接期验真**:逐条
   polyline 是每条一次覆盖缓冲清+合成+一次 FFI 跨界,3.2 万条航线
-- **HTML+CSS+Zan 设计稿零胶水规范与纯矢量图标体系（从截图还原精美客户端铁律）**:
-- **HTML + CSS + Zan 的装配边界**：窗口子类使用同名文档与 `Show()`；
-  页面使用 `Gui.Html.Load(app, html, handlers, baseDir)` 返回树，再由宿主挂载。
-  HTML 只在运行期解析；发布用 `--embed` 携带设计稿，业务代码管理状态与事件。
-  文档文本、图标与容器的映射以当前解析器和控件属性协议为准。
-  - **无边框窗口右上角系统控制按钮保护区（SetCaptionZone）**:声明 `data-win-chrome="false"` 沉浸式无边框窗口时，若标题栏高度生效，Win32 的 `WM_NCHITTEST` 会将整个窗口顶栏判定为 `HTCAPTION (2)` 导致拖拽吞掉右上角按钮点击；必须在 `OnLoad` 中调用 `form.GetApp().SetCaptionZone(width)`（如 `form.GetApp().Scale(160)`）为右上角功能区（菜单/最小化/最大化/关闭）保留非拖拽客户区。
-  - **Tabler SVG 纯矢量图标铁律(杜绝伪 Unicode 字符)**:按钮与图标控件一律声明标准 SVG 矢量名(如 `icon="player-play"`、`icon="player-skip-back"`、`icon="player-skip-forward"`、`icon="heart"`、`icon="volume"`、`icon="reload"`、`icon="playlist"`、`icon="chevron-down"` 等),走内置 997+ Tabler SVG 矢量图标集经 nanosvg 矢量光栅化与 GPU 贴图缓存。严禁使用 `▶`、`⏮`、`❤` 等 Unicode 假字符冒充图标。
-  - **Nanosvg 矢量图元约束与动态透明 SVG 规范**:
-    1. 颜色 Hex 解析：nanosvg 只接受 3 位或 6 位 Hex（`#RGB` / `#RRGGBB`），不支持 8 位 Hex（`#AARRGGBB` 会解析失败并静默回落为灰色 `#808080`）；透明度必须使用标准 XML 属性：`opacity="0.5"`、`fill-opacity="0.3"` 或 `stroke-opacity="0.8"`。
-    2. 几何图元限制：nanosvg 不解析 `<text>` 标签，动态矢量芯片、HUD 刻度等指示图形必须由 `<path>`、`<polygon>`、`<line>`、`<circle>`、`<rect>` 等几何图元绘制。
-    3. 动态透明 SVG 承载：通过 `Image.Src.Set("data:image/svg+xml;utf8," + svg)` 动态帧刷新时，图片控件必须在 CSS 中显式声明 `background: transparent; border: none;`，消除基础皮肤默认占位灰底。
-  - **高性能帧循环动画（FrameHook）**:复杂 2.5D/动态视觉（如雷达扫描、呼吸光晕、状态气泡）通过 `Form.FrameHook(OnFrameAnimation)` 注册帧回调，利用 `Stopwatch.GetMicroseconds() / 1000` 实施帧率节流（如 90ms / ~11 FPS）；每帧计算离散步进增量构造动态 SVG 并更新，调用 `form.GetApp().RequestRedraw()` 实现丝滑低占用原生动画。
-  - **HTML 文本与布局容器语义映射**:原生 `div` 标签映射为纯无格式布局容器(`Panel`,不绘制自身文本)。段落与标题必须使用语义标签 `<p>` 或 `<h1>`~`<h6>`(映射为 `Typography` 排版控件),行内文案使用 `<label>` 或 `<span>`(映射为 `Label` 控件)。当 `div` 元素承载动态单行文本胶囊时，声明 `display: block; white-space: nowrap;` 触发 `ArrangeFlow` 块流完成排版绘制。容器排版纵向排列时必须显式声明 `display: flex; flex-direction: column;` 避免子元素横向挤占。
   秒级卡死;批量=扁平交错顶点数组+每路径顶点数,每帧每色一次,
   GL 后端整个批次共享一次清+采样+合成(真实案例:lines-airline
   World Flights 接上解析后秒卡,批量后 sweep 单帧 ~0.7s)。坑:
@@ -915,6 +902,19 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   `ToggleSection`；折叠状态同时更新可见行、`ContentHeight` 与滚动量程。
   移出可见集合的编辑器经树操作退休输入；需要拦截冒泡时在路由处理器调用
   `e.Handle()`，不用 `Ui.ClickedIn` 几何轮询，图标继续使用标准 IconView。
+- **HTML+CSS+Zan 设计稿零胶水规范与纯矢量图标体系（从截图还原精美客户端铁律）**:
+- **HTML + CSS + Zan 的装配边界**：窗口子类使用同名文档与 `Show()`；
+  页面使用 `Gui.Html.Load(app, html, handlers, baseDir)` 返回树，再由宿主挂载。
+  HTML 只在运行期解析；发布用 `--embed` 携带设计稿，业务代码管理状态与事件。
+  文档文本、图标与容器的映射以当前解析器和控件属性协议为准。
+  - **无边框窗口右上角系统控制按钮保护区（SetCaptionZone）**:声明 `data-win-chrome="false"` 沉浸式无边框窗口时，若标题栏高度生效，Win32 的 `WM_NCHITTEST` 会将整个窗口顶栏判定为 `HTCAPTION (2)` 导致拖拽吞掉右上角按钮点击；必须在 `OnLoad` 中调用 `form.GetApp().SetCaptionZone(width)`（如 `form.GetApp().Scale(160)`）为右上角功能区（菜单/最小化/最大化/关闭）保留非拖拽客户区。
+  - **Tabler SVG 纯矢量图标铁律(杜绝伪 Unicode 字符)**:按钮与图标控件一律声明标准 SVG 矢量名(如 `icon="player-play"`、`icon="player-skip-back"`、`icon="player-skip-forward"`、`icon="heart"`、`icon="volume"`、`icon="reload"`、`icon="playlist"`、`icon="chevron-down"` 等),走内置 997+ Tabler SVG 矢量图标集经 nanosvg 矢量光栅化与 GPU 贴图缓存。严禁使用 `▶`、`⏮`、`❤` 等 Unicode 假字符冒充图标。
+  - **Nanosvg 矢量图元约束与动态透明 SVG 规范**:
+    1. 颜色 Hex 解析：nanosvg 只接受 3 位或 6 位 Hex（`#RGB` / `#RRGGBB`），不支持 8 位 Hex（`#AARRGGBB` 会解析失败并静默回落为灰色 `#808080`）；透明度必须使用标准 XML 属性：`opacity="0.5"`、`fill-opacity="0.3"` 或 `stroke-opacity="0.8"`。
+    2. 几何图元限制：nanosvg 不解析 `<text>` 标签，动态矢量芯片、HUD 刻度等指示图形必须由 `<path>`、`<polygon>`、`<line>`、`<circle>`、`<rect>` 等几何图元绘制。
+    3. 动态透明 SVG 承载：通过 `Image.Src.Set("data:image/svg+xml;utf8," + svg)` 动态帧刷新时，图片控件必须在 CSS 中显式声明 `background: transparent; border: none;`，消除基础皮肤默认占位灰底。
+  - **高性能帧循环动画（FrameHook）**:复杂 2.5D/动态视觉（如雷达扫描、呼吸光晕、状态气泡）通过 `Form.FrameHook(OnFrameAnimation)` 注册帧回调，利用 `Stopwatch.GetMicroseconds() / 1000` 实施帧率节流（如 90ms / ~11 FPS）；每帧计算离散步进增量构造动态 SVG 并更新，调用 `form.GetApp().RequestRedraw()` 实现丝滑低占用原生动画。
+  - **HTML 文本与布局容器语义映射**:原生 `div` 标签映射为纯无格式布局容器(`Panel`,不绘制自身文本)。段落与标题必须使用语义标签 `<p>` 或 `<h1>`~`<h6>`(映射为 `Typography` 排版控件),行内文案使用 `<label>` 或 `<span>`(映射为 `Label` 控件)。当 `div` 元素承载动态单行文本胶囊时，声明 `display: block; white-space: nowrap;` 触发 `ArrangeFlow` 块流完成排版绘制。容器排版纵向排列时必须显式声明 `display: flex; flex-direction: column;` 避免子元素横向挤占。
 - **分段单选按钮（Segmented Buttons）文字安全内边距阈值**:
   判定是否由下拉框升格为单行分段按钮时，文字宽度测量 `tw` 必须预留至少 `app.Scale(16)`
   的安全 padding（左右各 8px），否则在高 DPI 或多字宽下极易贴边或溢出截断；放不下时应
@@ -1593,6 +1593,11 @@ AI 生成的界面之所以"经常重叠在一起、尺寸位置乱七八糟"（
 		  1. 状态双轨分离：分离 `desiredCursorKind`（应用期望的目标光标）与 `appliedCursorKind`（Win32 实际生效的光标）；
 		  2. 非客户区失效标记：在 `WM_SETCURSOR` 处理中，当 `hit != HTCLIENT`（鼠标在非客户区时），将 `appliedCursorKind` 标记为 `-1`（失效），放行给系统设置拖拽光标；
 		  3. 客户区即时重置：当 `hit == HTCLIENT` 时，立即无条件调用 `SetCursor(CursorHandleOf(desiredCursorKind))` 并更新 `appliedCursorKind` 返回 1，使光标在跨过边框的第一时间恢复默认/目标光标，消除滞留延迟。
+
+	- 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
+  SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
+  "窗口创建失败/进程秒退";这次被它带偏,顺着去查机器环境半小时。直接
+  `Start-Process exe` 本体,要静默就最小化到任务栏。
 
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 

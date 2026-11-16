@@ -500,7 +500,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 动作：`class_vptr_offset`（`src/compiler/irgen.c`）对**所有类**一律返回
      1（0 号槽留指针位），结构体返回 0，显式布局类型自己给偏移也不留；
      虚表仍然只在"本类或祖先多态"时才发（`class_has_virtual_methods`），
-     但**布局**不再看多态。自举侧同步：`src/selfhost/irgen.zan` 的
+     但**布局**不再看多态。自举侧同步：`src/selfhost/irgen/irgen.zan` 的
      `FieldBase` 与 `EmitStruct` 同样按"类一律留槽"改。
    - 理由：vptr 槽以前只在多态类里留，于是 `Base`（无接口无虚方法）与
      `Derived : Base, IFace`（实现了接口）给**同一个字段**两套下标
@@ -928,7 +928,7 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
    - 理由：把「同步方法里的 await 一律拒绝」写成语义检查规则，会把全仓上百个合法文件一次
      判死（实测 150 个受检文件里判死 146 个：tests 109 / examples 20 / templates 7 /
      src 6 / packages 4），而它与仓库既有约定直接冲突——自举固定点 `tests/selfhost/prog1.zan`
-     的 `static void Main()` 里就有 `await P.AsTwice(21)`，`src/selfhost/checker.zan` 的
+     的 `static void Main()` 里就有 `await P.AsTwice(21)`，`src/selfhost/frontend/checker.zan` 的
      CheckAwaits 明写同步方法里的 await 是合法的。**判据只能是「操作数是不是帧」，不是
      「方法是不是 async」**。
    - 边界：这条只讲语义，不讲「可不可以写」——同步方法里写 `await` 完全合法，代价是

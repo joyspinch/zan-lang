@@ -241,7 +241,8 @@ RTS/动作游戏也遵守这条规则，高刷新率不是外部直绘 HUD 的�
 - **每个页面一张 .html 设计稿**：布局/列表/样式进设计稿，数据绑定走
   `data-bind`/`data-for`（服务端 JSON 或本地模型都接 JsonValue），
   交互在 code-behind。五件声明原语与硬边界见 gui-design skill 的
-  "HTML 窗口开发定式"（运行期文档装载与模型绑定；发布用 `--embed`）。
+  "HTML 窗口开发定式"（五件声明原语等；设计稿运行期加载，发布
+  `--embed` 烘入，不是编译输入）。
 - **页与页切换 = `Gui/Nav.zan` 的 `Nav.Embed`**（Tabs-as-outlet）：
   路由表对应按钮排（legend 的按钮本来就从 navigation.csv 读——
   `data-for` 一条渲染），中间区 = 出口；惰性实例化、默认切走保留
@@ -613,8 +614,8 @@ Post 调用核对编码，别信二手注释。
 
 ## GUI 登录门（登录成功才进主窗）定式
 
-- **时序**：GenForm 顺序是 Show→__CreateWindow(→OnLoad)→Run，在 OnLoad 里
-  阻塞即"主窗 Show 之前"的门。子窗类（ChildWindow 子类，覆写 Title/Width/
+- **时序**：入口顺序是 注册→LoadHtml 建树→OnLoad→Run，在 OnLoad 里
+  阻塞即"主窗 Run 之前"的门。子窗类（ChildWindow 子类，覆写 Title/Width/
   Height/ShowMaximize/IdBase）用 `OpenStandalone` + `PumpStandaloneUntil(
   stop)` 泵自己的事件循环；登录成功置位 stop 条件返回 true，主窗才继续。
   进程内没有干净的"放弃启动"出口：登录窗被直接关掉 = Pump 返回 false，
