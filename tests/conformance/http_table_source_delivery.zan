@@ -1,0 +1,170 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Sockets;
+using System.Threading;
+using Gui.Component.DataTable;
+
+// HttpTableSource 两契约（2026-11-16 af291b98e 修复的红绿钉）：
+//   1) 多源并发交付——完成结果按源排队。旧实现是单个静态完成槽
+//      （doneSrc 等四个静态字段），两个源并发在途时后完成者覆盖
+//      先完成者，先完成源的网格永久停在加载占位上。
+//   2) CreateTls 真走 TLS——旧 FetchOne 无视 useTls 恒用明文
+//      HttpClient，对 https 服务端发的全是明文 GET。TLS mock 不做
+//      握手，只锚定对端收到的首字节：0x16 = TLS ClientHello，
+//      明文 GET 的首字节是 'G'(71)。
+class Program {
+    static const int PLAIN_PORT = 28381;
+    static const int TLS_PORT = 28382;
+    static int failures = 0;
+    static int tlsFirstByte = -1;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    // HTTP 请求一次 recv 就够：请求行 + 头在一个段里；客户端发完头
+    // 不发 FIN，凑固定长度会死等。
+    static async string ReadHttpRequest(nint sock) {
+        byte[] buf = new byte[2048];
+        int got = await Socket.RecvPtrAsync(sock, (nint)buf, 2048);
+        if (got <= 0) { return ""; }
+        string req = buf.ToStr(0, got);
+        int end = req.IndexOf("\r\n\r\n");
+        if (end < 0) { end = req.Length; }
+        return req.Substring(0, end);
+    }
+
+    static void SendOk(nint sock, string json) {
+        byte[] bodyBytes = json.ToBytes();
+        string head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            + Convert.ToString(bodyBytes.Length) + "\r\nConnection: close\r\n\r\n";
+        byte[] headBytes = head.ToBytes();
+        byte[] pkt = new byte[headBytes.Length + bodyBytes.Length];
+        NativeMemory.Copy((nint)pkt, (nint)headBytes, headBytes.Length);
+        NativeMemory.Copy((nint)pkt + headBytes.Length, (nint)bodyBytes, bodyBytes.Length);
+        Socket.Send(sock, pkt, pkt.Length);
+    }
+
+    // 明文 mock：按请求里的 start 回两行数据页。
+    static async void HandlePlain(nint sock) {
+        try {
+            string req = await Program.ReadHttpRequest(sock);
+            int start = 0;
+            int sIdx = req.IndexOf("start=");
+            if (sIdx >= 0) {
+                start = req.Substring(sIdx + 6, 1).ToInt32();
+            }
+            string json = "{\"total\":2,\"rows\":[[\"r"
+                + Convert.ToString(start) + "-a\",\"v1\"],[\"r"
+                + Convert.ToString(start) + "-b\",\"v2\"]]}";
+            Program.SendOk(sock, json);
+            await Task.Delay(30);
+        } finally {
+            Socket.Close(sock);
+        }
+    }
+
+    // TLS mock：只记录首字节，不握手直接关。
+    static async void HandleTlsProbe(nint sock) {
+        try {
+            byte[] first = new byte[1];
+            int got = await Socket.RecvPtrAsync(sock, (nint)first, 1);
+            if (got > 0) {
+                Program.tlsFirstByte = first[0] & 255;
+            }
+            await Task.Delay(20);
+        } finally {
+            Socket.Close(sock);
+        }
+    }
+
+    static TcpListener plainListener;
+    static TcpListener tlsListener;
+
+    // 两个 mock 都常驻到用例结束：Stop() 取消挂起的 accept（返回 -1），
+    // 循环据此退出，进程快速干净收尾——泄漏插桩轮不等常驻线程。
+    static async void RunPlainServer() {
+        plainListener = new TcpListener("127.0.0.1", Program.PLAIN_PORT);
+        plainListener.Start();
+        while (true) {
+            nint sock = await plainListener.AcceptAsync();
+            if (sock < 0) { return; }
+            Task.Spawn(Program.HandlePlain(sock));
+        }
+    }
+
+    static async void RunTlsServer() {
+        tlsListener = new TcpListener("127.0.0.1", Program.TLS_PORT);
+        tlsListener.Start();
+        while (true) {
+            nint sock = await tlsListener.AcceptAsync();
+            if (sock < 0) { return; }
+            Task.Spawn(Program.HandleTlsProbe(sock));
+        }
+    }
+
+    static string MakeCache(string name) {
+        string dir = "_scratch/htcache_" + name;
+        Directory.CreateDirectoryRecursive(dir);
+        return dir;
+    }
+
+    // 等待一个源交付完成（UI 侧 Poll 泵消费完成队列）。
+    static async bool WaitDelivered(HttpTableSource src) {
+        for (int i = 0; i < 300; i = i + 1) {
+            src.Poll();
+            if (src.RowCount() == 2) { return true; }
+            await Task.Delay(10);
+        }
+        return false;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Task.Spawn(Program.RunPlainServer());
+        Task.Spawn(Program.RunTlsServer());
+        await Task.Delay(100);
+
+        // 1) 双源并发：两个源的块都必须交付（旧单槽实现下先完成者被覆盖）。
+        HttpTableSource a = HttpTableSource.Create("127.0.0.1", Program.PLAIN_PORT,
+            "/data-a", Program.MakeCache("a"));
+        HttpTableSource b = HttpTableSource.Create("127.0.0.1", Program.PLAIN_PORT,
+            "/data-b", Program.MakeCache("b"));
+        a.RequestBlock(0);
+        b.RequestBlock(0);
+        bool gotA = await Program.WaitDelivered(a);
+        bool gotB = await Program.WaitDelivered(b);
+        Program.Check(gotA && a.CellText(0, 0) == "r0-a", "source A delivered");
+        Program.Check(gotB && b.CellText(0, 0) == "r0-a", "source B delivered");
+
+        // 2) TLS 源首字节必须是 ClientHello 0x16（旧实现是明文 'G'=71）。
+        HttpTableSource t = HttpTableSource.CreateTls("127.0.0.1", Program.TLS_PORT,
+            "/secure", Program.MakeCache("tls"));
+        t.RequestBlock(0);
+        for (int i = 0; i < 100 && Program.tlsFirstByte < 0; i = i + 1) {
+            t.Poll();
+            await Task.Delay(10);
+        }
+        Program.Check(Program.tlsFirstByte == 0x16, "tls client hello observed");
+
+        // 停服收尾：取消两个 mock 的挂起 accept，常驻任务退出后进程快速干净收尾。
+        Program.plainListener.Stop();
+        Program.tlsListener.Stop();
+
+        if (Program.failures == 0) {
+            Console.WriteLine("HTTP_TABLE_SOURCE_DELIVERY_OK");
+            return 0;
+        }
+        return 1;
+    }
+
+    static int Main() {
+        return await Program.Run();
+    }
+}
