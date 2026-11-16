@@ -1,0 +1,93 @@
+using System;
+using System.Threading;
+
+// 多等待者完成协议契约：CancellationToken / TaskCompletionSource 旧实现
+// 共用单门且完成只 Signal 一次——N 个等待者只有一个被唤醒，其余永久挂死
+// （进程随之无法退出）。本用例锚定修复后的语义：
+//   1) 两个协程同挂一个 token，一次 Cancel 双双恢复；
+//   2) 两个协程同 await 一个 TCS，一次 SetResult 双双拿到结果，二次置位返回 false；
+//   3) 已完成的令牌再等待立即返回 true（完成后再登记不挂起）；
+//   4) 令牌 Close 唤醒挂起者返回 false；TCS Close 唤醒挂起者抛异常。
+class Program {
+    static int tokenWoke;
+    static int tcsGot;
+    static int closeRet;
+    static string tcsCloseNote;
+
+    static async int TokenWaiter(CancellationToken token) {
+        await token.WaitHandle();
+        Program.tokenWoke = Program.tokenWoke + 1;
+        return 0;
+    }
+
+    static async int TcsWaiter(TaskCompletionSource<int> tcs) {
+        int v = await tcs.Task;
+        if (v == 42) {
+            Program.tcsGot = Program.tcsGot + 1;
+        }
+        return v;
+    }
+
+    static async int CloseWaiter(CancellationToken token) {
+        bool r = await token.WaitHandle();
+        Program.closeRet = r ? 1 : 0;
+        return 0;
+    }
+
+    static async int TcsCloseWaiter(TaskCompletionSource<int> tcs) {
+        try {
+            int v = await tcs.Task;
+            Program.tcsCloseNote = "got:" + Convert.ToString(v);
+        } catch (Exception e) {
+            Program.tcsCloseNote = "threw:" + e.Message;
+        }
+        return 0;
+    }
+
+    static async int Run() {
+        // 1) 多等待者取消广播
+        CancellationTokenSource cts = new CancellationTokenSource();
+        Task.Spawn(Program.TokenWaiter(cts.Token));
+        Task.Spawn(Program.TokenWaiter(cts.Token));
+        await Task.Delay(30);
+        cts.Cancel();
+        await Task.Delay(30);
+        Console.WriteLine("token-woke " + Convert.ToString(Program.tokenWoke) + "/2");
+
+        // 2) 多等待者结果广播
+        TaskCompletionSource<int> tcs = new TaskCompletionSource<int>();
+        Task.Spawn(Program.TcsWaiter(tcs));
+        Task.Spawn(Program.TcsWaiter(tcs));
+        await Task.Delay(30);
+        bool first = tcs.TrySetResult(42);
+        bool again = tcs.TrySetResult(43);
+        await Task.Delay(30);
+        Console.WriteLine("tcs-got " + Convert.ToString(Program.tcsGot)
+            + "/2 set=" + Convert.ToString(first) + Convert.ToString(again));
+
+        // 3) 完成后登记立即返回
+        bool late = await cts.Token.WaitHandle();
+        Console.WriteLine("late-wait " + Convert.ToString(late));
+
+        // 4) Close 唤醒
+        CancellationTokenSource cts2 = new CancellationTokenSource();
+        TaskCompletionSource<int> tcs2 = new TaskCompletionSource<int>();
+        Task.Spawn(Program.CloseWaiter(cts2.Token));
+        await Task.Delay(30);
+        cts2.Token.Close();
+        await Task.Delay(30);
+        Console.WriteLine("close-ret " + Convert.ToString(Program.closeRet));
+
+        Task.Spawn(Program.TcsCloseWaiter(tcs2));
+        await Task.Delay(30);
+        tcs2.Close();
+        await Task.Delay(30);
+        Console.WriteLine("tcs-close " + Program.tcsCloseNote);
+        return 0;
+    }
+
+    static async void Main() {
+        await Program.Run();
+        Console.WriteLine("done");
+    }
+}

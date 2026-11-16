@@ -9,14 +9,16 @@ public class TaskCompletionSource<T> {
     T result;
     Exception error;
     bool isCompleted;
-    Gate gate;
+    bool closed;
     nint syncLock;
+    List<Gate> waiters;
 
     public TaskCompletionSource() {
         this.isCompleted = false;
+        this.closed = false;
         this.error = null;
-        this.gate = new Gate();
         this.syncLock = Mutex.Create();
+        this.waiters = new List<Gate>();
     }
 
     // 任务是否已经完成（成功、失败或取消）。
@@ -25,13 +27,40 @@ public class TaskCompletionSource<T> {
     }
 
     // 将底层操作转换为可 await 的 Task<T>。
-    // 当 TCS 尚未完成时，协程挂起在底层事件门上；完成后直接返回结果。
+    // 多等待者安全：每个等待者在锁下登记一把私有门，完成方持锁快照并清空
+    // 登记列表、解锁后逐个唤醒——旧实现全部等待者共用单门且完成只 Signal
+    // 一次，N 个挂起者只有一个被唤醒拿到结果，其余永久挂死；登记与挂起之间
+    // 的窗口由私有门的暂存信号语义兜住（唤醒后锁下重查完成标志）。
+    // TCS 已 Close 且未完成时抛异常（此前会永久挂死）。
     public async Task<T> Task {
         get {
+            Gate mine = new Gate();
+            bool waiting = false;
+            bool wasClosed = false;
+            Mutex.Lock(this.syncLock);
             if (!this.isCompleted) {
-                while (!this.isCompleted) {
-                    await this.gate.Wait();
+                if (!this.closed) {
+                    this.waiters.Add(mine);
+                    waiting = true;
+                } else {
+                    wasClosed = true;
                 }
+            }
+            Mutex.Unlock(this.syncLock);
+            while (waiting) {
+                await mine.Wait();
+                Mutex.Lock(this.syncLock);
+                if (this.isCompleted) {
+                    waiting = false;
+                } else if (this.closed) {
+                    waiting = false;
+                    wasClosed = true;
+                }
+                Mutex.Unlock(this.syncLock);
+            }
+            mine.Close();
+            if (wasClosed) {
+                throw new Exception("TaskCompletionSource was closed before completion.");
             }
             if (this.error != null) {
                 throw this.error;
@@ -40,8 +69,25 @@ public class TaskCompletionSource<T> {
         }
     }
 
+    // 须持锁调用：取走全部登记的私有等待门并重置登记列表。
+    List<Gate> TakeWaiters() {
+        List<Gate> taken = this.waiters;
+        this.waiters = new List<Gate>();
+        return taken;
+    }
+
+    // 解锁后调用：逐个 Signal 私有门——每个等待者恰好收到一次信号，
+    // 唤醒后锁下重查完成标志决定去留。
+    static void WakeAll(List<Gate> toWake) {
+        if (toWake == null) { return; }
+        for (int i = 0; i < toWake.Count; i = i + 1) {
+            toWake[i].Signal();
+        }
+    }
+
     // 尝试将任务标记为已成功完成并设置结果。
     public bool TrySetResult(T value) {
+        List<Gate> toWake = null;
         Mutex.Lock(this.syncLock);
         if (this.isCompleted) {
             Mutex.Unlock(this.syncLock);
@@ -49,8 +95,9 @@ public class TaskCompletionSource<T> {
         }
         this.result = value;
         this.isCompleted = true;
+        toWake = TakeWaiters();
         Mutex.Unlock(this.syncLock);
-        this.gate.Signal();
+        WakeAll(toWake);
         return true;
     }
 
@@ -63,6 +110,7 @@ public class TaskCompletionSource<T> {
 
     // 尝试将任务标记为发生错误并记录异常。
     public bool TrySetException(Exception exc) {
+        List<Gate> toWake = null;
         Mutex.Lock(this.syncLock);
         if (this.isCompleted) {
             Mutex.Unlock(this.syncLock);
@@ -70,8 +118,9 @@ public class TaskCompletionSource<T> {
         }
         this.error = exc;
         this.isCompleted = true;
+        toWake = TakeWaiters();
         Mutex.Unlock(this.syncLock);
-        this.gate.Signal();
+        WakeAll(toWake);
         return true;
     }
 
@@ -104,11 +153,17 @@ public class TaskCompletionSource<T> {
         return reg;
     }
 
-    // 关闭并释放底层资源。
+    // 关闭并释放底层资源；挂起中的等待者被唤醒并以异常收场
+    // （Task getter 抛 "closed before completion"），不再永久挂死。
     public void Close() {
-        if (this.gate != null) {
-            this.gate.Close();
+        List<Gate> toWake = null;
+        Mutex.Lock(this.syncLock);
+        if (!this.closed) {
+            this.closed = true;
+            toWake = TakeWaiters();
         }
+        Mutex.Unlock(this.syncLock);
+        WakeAll(toWake);
         if (this.syncLock != 0) {
             Mutex.Destroy(this.syncLock);
             this.syncLock = 0;
