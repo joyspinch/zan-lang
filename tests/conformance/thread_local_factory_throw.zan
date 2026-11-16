@@ -1,0 +1,51 @@
+using System;
+using System.Threading;
+
+// ThreadLocal.Value 工厂异常释锁契约：valueFactory 在锁内执行，抛异常时
+// 锁曾永不释放——Mutex 不可重入，本线程后续访问 Value 即死锁挂死（其它
+// 线程跟着全部挂死，进程无法退出）。修复后工厂调用包 try/finally：
+// 异常路径锁必释放、失败值不写入缓存（IsValueCreated 保持 false）。
+class Program {
+    static int factoryCalls;
+
+    static string Caught(Func<int> body) {
+        try {
+            body();
+            return "no-throw";
+        } catch (Exception e) {
+            return "caught:" + e.Message;
+        }
+    }
+
+    static int Boom() {
+        Program.factoryCalls = Program.factoryCalls + 1;
+        throw new Exception("factory-boom");
+    }
+
+    static int Main() {
+        // 1) 工厂抛异常：异常传出、锁释放。修复前第二次访问会在
+        //    Lock 上永久死锁（同一线程重入不可重入锁），进程挂死。
+        ThreadLocal<int> tl = new ThreadLocal<int>(Program.Boom);
+        Console.WriteLine("first " + Program.Caught(() => { return tl.Value; })
+            + " calls=" + Convert.ToString(Program.factoryCalls));
+        Console.WriteLine("second " + Program.Caught(() => { return tl.Value; })
+            + " calls=" + Convert.ToString(Program.factoryCalls));
+
+        // 2) 失败值不缓存：工厂抛异常的线程不留半成品。
+        Console.WriteLine("cached " + Convert.ToString(tl.IsValueCreated));
+
+        // 3) 回归：正常工厂懒加载、setter 直写覆盖工厂。
+        ThreadLocal<int> good = new ThreadLocal<int>(() => { return 7; });
+        Console.WriteLine("lazy " + Convert.ToString(good.Value)
+            + " created=" + Convert.ToString(good.IsValueCreated));
+        good.Value = 9;
+        Console.WriteLine("set " + Convert.ToString(good.Value)
+            + " created=" + Convert.ToString(good.IsValueCreated));
+
+        // 4) 回归：无工厂默认返回 null。
+        ThreadLocal<string> bare = new ThreadLocal<string>();
+        Console.WriteLine("bare " + Convert.ToString(bare.Value == null));
+        Console.WriteLine("done");
+        return 0;
+    }
+}
