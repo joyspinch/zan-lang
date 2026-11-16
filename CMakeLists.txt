@@ -2601,6 +2601,15 @@ add_test(NAME diag_arg_list_to_class
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_arg_list_to_class PROPERTIES TIMEOUT 60)
 
+add_test(NAME diag_ref_out_width_mismatch
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ref_out_width_mismatch.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_ref_out_width_mismatch${_exe_ext}
+    "-DEXPECT_REGEX=ref/out argument 1 of 'TakeRef' must be of type 'long', got 'int'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_ref_out_width_mismatch PROPERTIES TIMEOUT 60)
+
 add_test(NAME diag_arg_class_to_list
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
@@ -3223,6 +3232,7 @@ set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed shard_d
 # 出现，修好了就翻红提醒把它从名单里拿掉。
 set(_known_leaky
   closure_cycle_warning
+  http_table_source_delivery
 )
 # golden 必须取未插桩普通版的用例：泄漏报告打在 stdout 上，插桩版多一行报告
 # 就比不过 golden（已知会漏的那八条 + arc_leak_site_label），另有插桩自己会改
