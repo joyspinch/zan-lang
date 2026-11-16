@@ -1114,6 +1114,14 @@ zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name) {
     return scope_find(b->current_scope, name);
 }
 
+zan_symbol_t *zan_binder_type_receiver(zan_binder_t *b, zan_ast_node_t *expr) {
+    if (!b || !expr || expr->kind != AST_IDENTIFIER ||
+        !expr->ident.is_type_receiver) return NULL;
+    zan_scope_t *root = b->current_scope;
+    while (root->parent) root = root->parent;
+    return scope_find_type(root, expr->ident.name);
+}
+
 /* 类型参数按名字统一（A453 定性）：同名 T 在根作用域先到先得只保留一个
  * 对象，但全部消费方（binder_type_params_equiv 只比 arity、
  * checker_unify_method_tp / type_mentions_tp_checker / checker_type_equal

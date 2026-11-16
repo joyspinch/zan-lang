@@ -105,14 +105,19 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         zan_checker_check_stmt(c, stmt->while_stmt.body);
         break;
 
-    case AST_FOR_STMT:
+    case AST_FOR_STMT: {
+        struct checker_local *saved_locals = c->locals;
         if (stmt->for_stmt.init) zan_checker_check_stmt(c, stmt->for_stmt.init);
         if (stmt->for_stmt.cond) zan_checker_check_expr(c, stmt->for_stmt.cond);
+        /* The iterator sees the initializer's bindings, not body-local names. */
         if (stmt->for_stmt.step) zan_checker_check_expr(c, stmt->for_stmt.step);
         zan_checker_check_stmt(c, stmt->for_stmt.body);
+        c->locals = saved_locals;
         break;
+    }
 
-    case AST_FOREACH_STMT:
+    case AST_FOREACH_STMT: {
+        struct checker_local *saved_locals = c->locals;
         no_runtime_reject(c, stmt->loc, "`foreach`");
         {
             zan_type_t *col = zan_checker_check_expr(c, stmt->foreach_stmt.collection);
@@ -173,7 +178,9 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             checker_add_local(c, stmt->foreach_stmt.var_name, elem);
         }
         zan_checker_check_stmt(c, stmt->foreach_stmt.body);
+        c->locals = saved_locals;
         break;
+    }
 
     case AST_THROW_STMT:
         no_runtime_reject(c, stmt->loc, "`throw`");

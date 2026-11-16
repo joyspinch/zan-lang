@@ -74,8 +74,8 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     } else if (operand->kind == AST_MEMBER_ACCESS) {
         zan_ast_node_t *obj_expr = operand->member.object;
         /* ClassName.StaticField */
-        if (obj_expr->kind == AST_IDENTIFIER && !local_find(locals, obj_expr->ident.name)) {
-            zan_symbol_t *cs = zan_binder_lookup(g->binder, obj_expr->ident.name);
+        if (obj_expr->kind == AST_IDENTIFIER) {
+            zan_symbol_t *cs = receiver_type_symbol(g, obj_expr, locals);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fs = get_field_sym(cs, operand->member.name);
                 zan_symbol_t *getter = property_getter_sym(g, fs);
@@ -95,7 +95,7 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
         if (!slot_ptr && !prop_getter && obj_expr->kind == AST_IDENTIFIER) {
-            local_var_t *local = local_find(locals, obj_expr->ident.name);
+            local_var_t *local = receiver_local(obj_expr, locals);
             if (local && local->type && local->type->sym) {
                 int fi = get_field_index(local->type->sym, operand->member.name);
                 LLVMTypeRef st = get_struct_llvm_type(g, local->type->sym);

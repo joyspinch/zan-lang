@@ -21,9 +21,12 @@ typedef struct {
     LLVMValueRef slot_alloca;
     LLVMTypeRef  llvm;
     int          frame_index;
+    LLVMValueRef box_payload;
+    LLVMValueRef box_cell;
 } zan_async_slot_t;
 
 struct local_var;
+struct zan_fn_cleanup_state;
 typedef struct {
     LLVMBasicBlockRef lpad_bb;
     LLVMBasicBlockRef catch_bb;
@@ -34,6 +37,8 @@ typedef struct {
     struct local_var *cleanups;
     int cleanup_count;
     int cleanup_cap;
+    /* Only synchronous function roots cache lexical cleanup landing variants. */
+    struct zan_fn_cleanup_state *fn_cleanup;
 } zan_lpad_entry_t;
 
 /* 编译器生成的保护文本驻留表项 */
@@ -258,6 +263,9 @@ struct zan_irgen {
     int finally_loop_base;
     zan_irgen_pending_context_t pending;
     void *current_locals;
+    /* Scoped emission context; unlike current_locals this never outlives a call. */
+    void *active_cleanup_locals;
+    LLVMValueRef active_cleanup_fn;
 
     /* 算术溢出检测嵌套深度：大于 0 时在 checked 块内发射溢出检测 */
     int irgen_checked_depth;
@@ -478,6 +486,7 @@ struct zan_irgen {
     int refl_meta_cap;
     int refl_str_count;
     bool refl_used;               /* 标记已使用 typeof/GetType：需生成分配点记录表 */
+    bool refl_ctor_used;          /* live emitted CreateInstance; metadata alone is not callable demand */
     LLVMTypeRef  refl_field_type;   /* { i8* name, i8* typeName, i64 kind, i64 off } */
     LLVMValueRef refl_empty_str;
     LLVMValueRef fn_refl_find;      /* i64 (i8* ti, i8* name) */
@@ -495,6 +504,8 @@ struct zan_irgen {
         zan_symbol_t *sym;
         int           n;
         bool          ctors;
+        bool          ctor_ready; /* callable initializer emitted before site tables freeze */
+        zan_type_t   *list_type;   /* closed builtin List ctor table; sym is NULL */
         int           site;   /* ctor thunk 的分配点，desc_init 前预登记 */
     } *refl_mtabs;
     int refl_mtab_count;

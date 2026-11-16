@@ -9,6 +9,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(_WIN32)
+#include <malloc.h>
+#else
+#include <alloca.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -679,6 +684,435 @@ static zan_status_t run_checked_passes(LLVMModuleRef mod, LLVMTargetMachineRef t
     return zan_opt_verify_module(mod, "after pass pipeline");
 }
 
+/* ===================== 收缩 pass：nothrow 闭包 + invoke 塌缩 =====================
+ * 账本 §3.2 全局 pass ②（实施收口见账本 §10）。Zan 在任何带 landing
+ * pad 作用域内的调用一律降级为 invoke（irgen_rt.c zan_call_or_invoke，
+ * lpad_depth>0 即 invoke），对可证不抛的调用是纯体积税：每站点多
+ * norm/lpad 两个后继、landingpad cleanup、__zan_eh_state/tmp_top 簿记。
+ *
+ * 契约（design.md §11 S-UNWIND）：
+ *   nothrow(F) ⇔ F 无直接 raise 源调用（RaiseException/__cxa_throw，
+ *   fatal 形态 RaiseException→exit→unreachable 除外——personality 拒
+ *   收自定义 SEH code，无 landing pad 可达）
+ *             ∧ 所有直接被调者 nothrow。
+ *   extern 播种（失败方向 = 少塌缩）：Zan 名注册表命中（跨片 declare，
+ *   zan_opt_note_zan_fn_name 喂入）→ MAYTHROW；__zan_eh_tmp_unwind
+ *   （重抛）与 raise 源 → MAYTHROW；__cxa_/__gxx_/llvm./zan_/__zan_
+ *   前缀（native runtime/驱动/编译器助手，纯 C 无 cxa）与 CRT/Win32
+ *   精确名表 → nothrow；其余 extern 一律保守 MAYTHROW。递归由不动点
+ *   自然处理（初值 UNKNOWN，无证据不晋级）。
+ * 塌缩：仅被调者可解析为 Function 且 nothrow 的 invoke → call + br
+ * normal（call conv/call-site 属性逐槽保留；invoke 无 tail 语义，C API
+ * LLVMIsTailCall 按 CallInst 强转 InvokeInst，禁用）。personality 语义
+ * 不变：可抛调用一个不动，剩余 invoke 的 lpad 原样保留，死 lpad 交
+ * LLVM 管线清理。行为等价性由 nothrow 定义保证（不抛者调用序列无
+ * unwind 可观察差异）。LLVM C API 三陷阱（Erase 非 Remove / PHI 前驱
+ * 重建 / 站点函数类型）实录见 design.md §11.1。
+ */
+typedef enum { SHRINK_UNKNOWN = 0, SHRINK_NOTHROW = 1, SHRINK_MAYTHROW = 2 } shrink_state_t;
+
+typedef struct {
+    LLVMValueRef *keys;
+    int *vals;
+    unsigned mask;
+} shrink_map_t;
+
+static unsigned shrink_hash_ptr(const void *p) {
+    unsigned long long v = (unsigned long long)(uintptr_t)p;
+    v ^= v >> 17; v *= 0x9E3779B9U; v ^= v >> 13;
+    return (unsigned)v;
+}
+
+static bool shrink_map_init(shrink_map_t *m, unsigned cap_hint) {
+    unsigned cap = 1024;
+    while (cap < cap_hint * 2u) cap <<= 1;
+    m->keys = (LLVMValueRef *)calloc(cap, sizeof(LLVMValueRef));
+    m->vals = (int *)calloc(cap, sizeof(int));
+    if (!m->keys || !m->vals) return false;
+    m->mask = cap - 1;
+    return true;
+}
+
+/* 键不存在时插入并以 *fresh 标记；返回槽位指针 */
+static int *shrink_map_slot(shrink_map_t *m, LLVMValueRef k, bool *fresh) {
+    unsigned i = shrink_hash_ptr(k) & m->mask;
+    while (m->keys[i] && m->keys[i] != k) i = (i + 1) & m->mask;
+    if (fresh) *fresh = (m->keys[i] == NULL);
+    m->keys[i] = k;
+    return &m->vals[i];
+}
+
+static void shrink_map_free(shrink_map_t *m) {
+    free(m->keys); free(m->vals);
+    m->keys = NULL; m->vals = NULL; m->mask = 0;
+}
+
+/* raise 源（Zan EH 仅由这两个符号发起）。 */
+static bool shrink_is_raise_source(const char *n) {
+    return strcmp(n, "RaiseException") == 0 || strcmp(n, "__cxa_throw") == 0;
+}
+
+/* ---- Zan 函数名注册表（irgen_register_function 逐个喂入）----
+ * publish 跨片时，别的分片的 Zan 函数在本模块只是 declaration——
+ * 名字形状与 C 导入无法区分（App_FrameApp vs CancelIoEx），只能靠
+ * 编译器自己的发射记录。registry 命中 ⇒ 该 declaration 是 Zan 函数
+ * ⇒ 可抛。内容哈希 + strcmp：LLVM 函数名指针随分片模块销毁重建会
+ * 变，不能按指针判等；strdup 自持串，生命周期跨模块。 */
+static unsigned shrink_hash_str(const char *s) {
+    unsigned long long v = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        v ^= *p;
+        v *= 1099511628211ULL;
+    }
+    return (unsigned)v;
+}
+
+typedef struct {
+    char **keys;
+    unsigned mask;
+} shrink_strset_t;
+
+static shrink_strset_t shrink_zan_set;
+static bool shrink_zan_set_ready;
+
+static bool shrink_strset_init(shrink_strset_t *m, unsigned cap_hint) {
+    unsigned cap = 1024;
+    while (cap < cap_hint * 2u) cap <<= 1;
+    m->keys = (char **)calloc(cap, sizeof(char *));
+    if (!m->keys) return false;
+    m->mask = cap - 1;
+    return true;
+}
+
+static void shrink_strset_add(shrink_strset_t *m, const char *s) {
+    unsigned i = shrink_hash_str(s) & m->mask;
+    while (m->keys[i]) {
+        if (strcmp(m->keys[i], s) == 0) return;
+        i = (i + 1) & m->mask;
+    }
+    m->keys[i] = strdup(s);
+}
+
+static bool shrink_strset_has(shrink_strset_t *m, const char *s) {
+    if (!shrink_zan_set_ready) return false;
+    unsigned i = shrink_hash_str(s) & m->mask;
+    while (m->keys[i]) {
+        if (strcmp(m->keys[i], s) == 0) return true;
+        i = (i + 1) & m->mask;
+    }
+    return false;
+}
+
+void zan_opt_note_zan_fn_name(const char *name) {
+    if (!name || !*name) return;
+    if (!shrink_zan_set_ready) {
+        if (!shrink_strset_init(&shrink_zan_set, 16384)) return;
+        shrink_zan_set_ready = true;
+    }
+    shrink_strset_add(&shrink_zan_set, name);
+}
+
+/* native CRT/Win32 精确名（语料实测声明全集；新导入不进表 = 保守
+ * MAYTHROW，只损失塌缩不损失正确性）。均为 OS/CRT 函数：其 SEH 为
+ * OS 层，__gxx personality 拒收非 C++ code，无 Zan landing pad 可达。 */
+static const char *const shrink_native_names[] = {
+    "calloc", "malloc", "free", "realloc", "exit", "fflush", "printf",
+    "puts", "setvbuf", "strlen", "strncmp", "_setmode", "__acrt_iob_func",
+    "_ZSt13set_terminatePFvvE", "SetConsoleCP", "SetConsoleOutputCP",
+    "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "InitializeSRWLock",
+    "GetCurrentThreadId", "CancelIoEx", "DestroyWindow", "GetWindowLongPtrW",
+    "SetFocus", "SetForegroundWindow", "ShowWindow", "UpdateWindow",
+};
+
+/* declaration 的 nothrow 白名单（严格，宁漏勿错）：
+ * - raise 源（RaiseException/__cxa_throw）与重抛助手
+ *   __zan_eh_tmp_unwind 恒 MAYTHROW；
+ * - Zan 名注册表命中（跨片 Zan 函数）恒 MAYTHROW；
+ * - 前缀 __cxa_/__gxx_/llvm.：C++ ABI 支撑与 LLVM 内建；
+ * - 前缀 zan_（含 zan_rt_/zan_gui_/zan_dispatch_…）与 __zan_：native
+ *   runtime/驱动/编译器助手，纯 C 无 __cxa_*（实测 src/runtime、
+ *   src/drivers），其 RaiseException 为 fatal 形态（自定义 SEH code，
+ *   personality 拒收，无 landing pad 可达）；registry 先判，Zan 函数
+ *   即便撞前缀也判可抛；
+ * - CRT/Win32 精确名表。
+ * 其余 declaration → MAYTHROW。第一版"C ABI 默认 nothrow"被 IDE GUI
+ * smoke 证伪：跨片 Zan 声明被误判，塌缩拆掉了必需的 unwind 边（绿
+ * exe 启动即 FileNotFoundException，红 exe 正常起窗）——失败方向必须
+ * 是"少塌缩"。 */
+static bool shrink_extern_nothrow(const char *n) {
+    if (shrink_is_raise_source(n)) return false;
+    if (strcmp(n, "__zan_eh_tmp_unwind") == 0) return false;
+    if (shrink_strset_has(&shrink_zan_set, n)) return false;
+    if (strncmp(n, "__cxa_", 6) == 0 || strncmp(n, "__gxx_", 6) == 0 ||
+        strncmp(n, "llvm.", 5) == 0 || strncmp(n, "zan_", 4) == 0 ||
+        strncmp(n, "__zan_", 6) == 0)
+        return true;
+    for (unsigned i = 0;
+         i < sizeof(shrink_native_names) / sizeof(shrink_native_names[0]);
+         i++)
+        if (strcmp(n, shrink_native_names[i]) == 0) return true;
+    return false;
+}
+
+
+/* 调用站点的直接被调者（穿透常量 bitcast 到 Function），无则 NULL */
+static LLVMValueRef shrink_callee_fn(LLVMValueRef inst) {
+    LLVMValueRef callee = LLVMGetCalledValue(inst);
+    if (!callee) return NULL;
+    for (int d = 0; d < 8 && LLVMIsAConstantExpr(callee) &&
+                    LLVMGetConstOpcode(callee) == LLVMBitCast;
+         d++) {
+        callee = LLVMGetOperand(callee, 0);
+    }
+    return LLVMIsAFunction(callee) ? callee : NULL;
+}
+
+typedef struct { unsigned *v; unsigned n, cap; } shrink_uvec_t;
+
+static bool shrink_uvec_push(shrink_uvec_t *u, unsigned x) {
+    if (u->n == u->cap) {
+        unsigned nc = u->cap ? u->cap * 2 : 8;
+        unsigned *nv = (unsigned *)realloc(u->v, nc * sizeof(unsigned));
+        if (!nv) return false;
+        u->v = nv; u->cap = nc;
+    }
+    u->v[u->n++] = x;
+    return true;
+}
+
+/* fatal raise 形态（账本 §3.2/_lbpr 解剖）：RaiseException → exit →
+ * unreachable 紧邻。personality 是 __gxx_personality_v0/seh0，只认
+ * C++ ABI 魔数；RaiseException 的自定义 SEH code 不会进任何 Zan
+ * landing pad，进程即告终止——因此该形态不构成"可抛"，调用它的
+ * 函数对塌缩而言等价 nothrow。非此形态的 RaiseException 站点保守
+ * 记 MAYTHROW。 */
+static bool shrink_fatal_raise_after(LLVMValueRef raise_call) {
+    LLVMValueRef inst = LLVMGetNextInstruction(raise_call);
+    if (!inst || LLVMGetInstructionOpcode(inst) != LLVMCall) return false;
+    LLVMValueRef c = LLVMGetCalledValue(inst);
+    if (!c || !LLVMIsAFunction(c) ||
+        strcmp(LLVMGetValueName(c), "exit") != 0)
+        return false;
+    inst = LLVMGetNextInstruction(inst);
+    return inst && LLVMGetInstructionOpcode(inst) == LLVMUnreachable;
+}
+static void shrink_collapse_invoke(LLVMBuilderRef b, LLVMValueRef inv) {
+    LLVMValueRef fn = shrink_callee_fn(inv);
+    if (!fn) return;
+    unsigned nparams = LLVMGetNumArgOperands(inv);
+    LLVMValueRef *args =
+        (LLVMValueRef *)alloca((nparams ? nparams : 1) * sizeof(LLVMValueRef));
+    for (unsigned i = 0; i < nparams; i++) args[i] = LLVMGetOperand(inv, i);
+    LLVMBasicBlockRef norm = LLVMGetNormalDest(inv);
+    LLVMBasicBlockRef unw = LLVMGetUnwindDest(inv);
+
+    LLVMPositionBuilderBefore(b, inv);
+    /* 站点函数类型：runtime 的 C-ABI int-abi 会给同一符号混用不同函数
+     * 类型（如 invoke i64 @calloc vs declare ptr @calloc）——必须用
+     * 站点类型 LLVMGetCalledFunctionType，不能用 LLVMGlobalGetValueType
+     * 的声明规范类型，否则 RAUW 把 i64 结果静默改成 ptr（下游 icmp/call
+     * 全部类型错位）。 */
+    LLVMValueRef call = LLVMBuildCall2(b, LLVMGetCalledFunctionType(inv), fn,
+                                       args, nparams, "");
+    LLVMSetInstructionCallConv(call, LLVMGetInstructionCallConv(inv));
+    for (unsigned idx = 0; idx <= nparams; idx++) {
+        unsigned cnt = LLVMGetCallSiteAttributeCount(inv, idx);
+        if (!cnt) continue;
+        LLVMAttributeRef *attrs =
+            (LLVMAttributeRef *)alloca(cnt * sizeof(LLVMAttributeRef));
+        LLVMGetCallSiteAttributes(inv, idx, attrs);
+        for (unsigned a = 0; a < cnt; a++)
+            LLVMAddCallSiteAttribute(call, idx, attrs[a]);
+    }
+    LLVMReplaceAllUsesWith(inv, call);
+    LLVMBasicBlockRef blk = LLVMGetInstructionParent(inv);
+    /* unwind 目标块的 PHI 仍持有 (值, blk) 入口——RAUW 只修 value 不修
+     * CFG 前驱，erase 后该入口成悬空前驱（verifier: PHINode should
+     * have one entry for each predecessor）。对齐 LLVM
+     * BasicBlock::removePredecessor 语义：C API 无删入口接口，重建
+     * PHI 去掉该入口；入口全失（本 invoke 是 unw 唯一前驱）则整块
+     * 已不可达，RAUW undef 后删除 PHI。 */
+    LLVMValueRef phi = LLVMGetFirstInstruction(unw);
+    while (phi && LLVMGetInstructionOpcode(phi) == LLVMPHI) {
+        LLVMValueRef next = LLVMGetNextInstruction(phi);
+        unsigned n = LLVMCountIncoming(phi);
+        unsigned keep = 0, stale_at = n;
+        for (unsigned i = 0; i < n; i++) {
+            if (LLVMGetIncomingBlock(phi, i) == blk) stale_at = i;
+            else keep++;
+        }
+        if (stale_at < n) {
+            if (keep == 0) {
+                /* unw 只剩这一个（已消失的）前驱：块不可达 */
+                LLVMReplaceAllUsesWith(phi, LLVMGetUndef(LLVMTypeOf(phi)));
+                LLVMInstructionEraseFromParent(phi);
+            } else {
+                LLVMValueRef *vals =
+                    (LLVMValueRef *)alloca(keep * sizeof(LLVMValueRef));
+                LLVMBasicBlockRef *blks =
+                    (LLVMBasicBlockRef *)alloca(keep * sizeof(LLVMBasicBlockRef));
+                unsigned k = 0;
+                for (unsigned i = 0; i < n; i++) {
+                    if (i == stale_at) continue;
+                    vals[k] = LLVMGetIncomingValue(phi, i);
+                    blks[k] = LLVMGetIncomingBlock(phi, i);
+                    k++;
+                }
+                LLVMPositionBuilderBefore(b, phi);
+                LLVMValueRef nphi = LLVMBuildPhi(b, LLVMTypeOf(phi), "");
+                LLVMAddIncoming(nphi, vals, blks, keep);
+                LLVMReplaceAllUsesWith(phi, nphi);
+                LLVMInstructionEraseFromParent(phi);
+            }
+        }
+        phi = next;
+    }
+    /* 必须用 Erase（真删除）：RemoveFromParent 只摘链不销毁，被摘下的
+     * invoke 仍持有 normal/unwind 两个目标块的 use——目标块留下幽灵
+     * 前驱（打印器显 <null operand!>，verifier 解引用崩溃）。RAUW 已
+     * 先行，此刻 value 无引用，可安全删除。 */
+    LLVMInstructionEraseFromParent(inv);
+    LLVMPositionBuilderAtEnd(b, blk);
+    LLVMBuildBr(b, norm);
+}
+
+int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
+    unsigned nfn = 0;
+    for (LLVMValueRef f = LLVMGetFirstFunction(mod); f;
+         f = LLVMGetNextFunction(f)) nfn++;
+    if (nfn == 0) return 0;
+
+    shrink_map_t idx; /* Function -> 下标 + 1；0 = 未登记 */
+    if (!shrink_map_init(&idx, nfn)) return 0;
+    shrink_map_t st; /* Function -> shrink_state_t */
+    if (!shrink_map_init(&st, nfn)) { shrink_map_free(&idx); return 0; }
+
+    LLVMValueRef *fns = (LLVMValueRef *)calloc(nfn, sizeof(LLVMValueRef));
+    shrink_uvec_t *callees = (shrink_uvec_t *)calloc(nfn, sizeof(shrink_uvec_t));
+    bool *has_raise = (bool *)calloc(nfn, sizeof(bool));
+    if (!fns || !callees || !has_raise) goto fail;
+    {
+        unsigned fi = 0;
+        for (LLVMValueRef f = LLVMGetFirstFunction(mod); f;
+             f = LLVMGetNextFunction(f), fi++) {
+            fns[fi] = f;
+            bool fresh = false;
+            int *slot = shrink_map_slot(&idx, f, &fresh);
+            *slot = (int)(fi + 1);
+            (void)fresh;
+            const char *n = LLVMGetValueName(f);
+            *shrink_map_slot(&st, f, NULL) =
+                LLVMIsDeclaration(f)
+                ? (shrink_is_raise_source(n) ? SHRINK_MAYTHROW
+                   : (shrink_extern_nothrow(n) ? SHRINK_NOTHROW : SHRINK_MAYTHROW))
+                : SHRINK_UNKNOWN;
+        }
+        /* 边收集：caller -> callee（模块内定义）+ raise 源标记。
+         * 模块外被调者按名字规则直接惩罚 caller（保守：未知 extern
+         * 视为可抛——宁漏勿错）。 */
+        for (unsigned i = 0; i < nfn; i++) {
+            LLVMValueRef f = fns[i];
+            if (LLVMIsDeclaration(f)) continue;
+            for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb;
+                 bb = LLVMGetNextBasicBlock(bb)) {
+                for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+                     inst = LLVMGetNextInstruction(inst)) {
+                    unsigned op = LLVMGetInstructionOpcode(inst);
+                    if (op != LLVMCall && op != LLVMInvoke) continue;
+                    LLVMValueRef c = LLVMGetCalledValue(inst);
+                    const char *cn = c ? LLVMGetValueName(c) : NULL;
+                    if (cn && strcmp(cn, "RaiseException") == 0 &&
+                        shrink_fatal_raise_after(inst))
+                        continue; /* fatal 形态：不构成可抛 */
+                    c = shrink_callee_fn(inst);
+                    if (!c) {
+                        /* Unknown indirect targets may unwind. Skipping the
+                         * edge without this mark incorrectly proves wrappers
+                         * (reflection/delegates/vtables) nothrow. */
+                        has_raise[i] = true;
+                        continue;
+                    }
+                    bool fresh = false;
+                    int ci1 = *shrink_map_slot(&idx, c, &fresh);
+                    if (ci1 == 0) {
+                        if (!shrink_extern_nothrow(LLVMGetValueName(c)) ||
+                            shrink_is_raise_source(LLVMGetValueName(c)))
+                            has_raise[i] = true;
+                        continue;
+                    }
+                    unsigned ci = (unsigned)ci1 - 1;
+                    if (shrink_is_raise_source(LLVMGetValueName(c)))
+                        has_raise[i] = true;
+                    if (!shrink_uvec_push(&callees[i], ci)) goto oom;
+                }
+            }
+        }
+        /* 不动点（round-robin）：nothrow ⇔ 无 raise 源 ∧ 全部被调者
+         * nothrow。extern 种子已定，传播至闭包。 */
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (unsigned i = 0; i < nfn; i++) {
+                LLVMValueRef f = fns[i];
+                if (LLVMIsDeclaration(f)) continue;
+                int *sp = shrink_map_slot(&st, f, NULL);
+                if (*sp == SHRINK_NOTHROW || has_raise[i]) continue;
+                bool all_nt = true;
+                for (unsigned k = 0; k < callees[i].n; k++) {
+                    int cs = *shrink_map_slot(&st, fns[callees[i].v[k]], NULL);
+                    if (cs != SHRINK_NOTHROW) { all_nt = false; break; }
+                }
+                if (all_nt) { *sp = SHRINK_NOTHROW; changed = true; }
+            }
+        }
+        /* 塌缩：被调者 nothrow 且可解析为 Function 的 invoke → call+br。
+         * 先取后继再迭代（擦除只动 invoke 自己，插入的 call/br 不含
+         * invoke，按 next 指针继续安全）。 */
+        int collapsed = 0, total_inv = 0, nthr = 0;
+        LLVMBuilderRef b = LLVMCreateBuilderInContext(
+            LLVMGetModuleContext(mod));
+        for (unsigned i = 0; i < nfn; i++) {
+            LLVMValueRef f = fns[i];
+            if (LLVMIsDeclaration(f)) continue;
+            for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb;
+                 bb = LLVMGetNextBasicBlock(bb)) {
+                LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+                while (inst) {
+                    LLVMValueRef next = LLVMGetNextInstruction(inst);
+                    if (LLVMGetInstructionOpcode(inst) == LLVMInvoke) {
+                        total_inv++;
+                        LLVMValueRef c = shrink_callee_fn(inst);
+                        int cs = c ? *shrink_map_slot(&st, c, NULL)
+                                   : SHRINK_MAYTHROW;
+                        if (cs == SHRINK_NOTHROW) {
+                            /* invoke 无 tail 语义（musttail 仅 CallInst），
+                             * 无需检查——C API LLVMIsTailCall 会按 CallInst
+                             * 强转 InvokeInst，不可用。 */
+                            shrink_collapse_invoke(b, inst);
+                            collapsed++;
+                        }
+                    }
+                    inst = next;
+                }
+            }
+        }
+        for (unsigned i = 0; i < nfn; i++) {
+            if (*shrink_map_slot(&st, fns[i], NULL) == SHRINK_NOTHROW) nthr++;
+        }
+        LLVMDisposeBuilder(b);
+        zan_opt_verify_module(mod, "after shrink collapse");
+        fprintf(stderr,
+                "shrink: nounwind: %d/%d invokes collapsed (%d/%u fns nothrow)\n",
+                collapsed, total_inv, nthr, nfn);
+    }
+oom:
+fail:
+    for (unsigned i = 0; i < nfn; i++) free(callees[i].v);
+    free(fns); free(callees); free(has_raise);
+    shrink_map_free(&idx); shrink_map_free(&st);
+    return 0;
+}
+
 zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
     if (level == ZAN_OPT_NONE) return ZAN_OK;
 
@@ -700,6 +1134,12 @@ zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level
 zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level) {
     if (zan_opt_verify_module(mod, "before optimization") != ZAN_OK) return ZAN_ERROR;
     if (level == ZAN_OPT_NONE) return ZAN_OK;
+    /* S-UNWIND（全局 pass ②）：在 LLVM
+     * 管线前塌缩可证不抛的 invoke，死 lpad 块交给后续管线清理。
+     * ZAN_NO_UNWIND_SHRINK=1 关断（红绿对照用）。 */
+    if (!getenv("ZAN_NO_UNWIND_SHRINK")) {
+        zan_shrink_collapse_invokes(mod);
+    }
     const char *passes = NULL;
     switch (level) {
     case ZAN_OPT_BASIC: passes = "default<O1>"; break;

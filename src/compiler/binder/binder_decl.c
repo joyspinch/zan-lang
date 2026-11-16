@@ -133,7 +133,23 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
         if (!sym || sym->decl != node) continue;
         zan_type_t *type = sym->type;
 
-        register_type_param_list(b, &node->method_decl.type_params);
+        /* 委托自己的类型参数在与类绑定同款的独立子作用域里**无条件**
+         * 登记：register_type_param_list 的"外层已有同名即跳过"守卫
+         * 会被单元作用域里的用户同名类（class T）抢先命中，把委托的
+         * 形参 T 顶成用户类——binding_tp_shadowed_by_user_class 的
+         * 委托形参毒化即此。泛型形参按 C# 语义遮蔽外层同名类型。 */
+        zan_scope_t *saved = b->current_scope;
+        b->current_scope = scope_new(b->arena, saved);
+        b->current_scope->declaration_type_params = true;
+        for (int j = 0; j < node->method_decl.type_params.count; j++) {
+            zan_ast_node_t *tp = node->method_decl.type_params.items[j];
+            if (!tp || tp->kind != AST_IDENTIFIER) continue;
+            zan_type_t *tp_type = make_type(b->arena, TYPE_TYPE_PARAM,
+                                            tp->ident.name.str, tp->ident.name.len);
+            zan_symbol_t *tp_sym = make_symbol(b->arena, SYM_TYPE_PARAM,
+                                               tp->ident.name, tp_type, tp, 0);
+            scope_add(b->arena, b->current_scope, tp_sym);
+        }
         type->delegate_is_async = (node->method_decl.modifiers & MOD_ASYNC) != 0;
         type->delegate_ret_type = node->method_decl.return_type
             ? zan_binder_resolve_type(b, node->method_decl.return_type)
@@ -151,6 +167,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
         } else {
             type->delegate_param_types = NULL;
         }
+        b->current_scope = saved;
     }
 }
 
@@ -867,4 +884,127 @@ bool zan_binder_has_extension_method(zan_binder_t *b, zan_type_t *recv_ty,
         return true;
     }
     return false;
+}
+
+/* Method-group conversion has one resolver, including the call shape. Keep
+ * only the target on the AST: one generic body can be emitted repeatedly. */
+zan_type_t *zan_binder_method_group_target(zan_ast_node_t *expr) {
+    if (!expr) return NULL;
+    if (expr->kind == AST_IDENTIFIER) return expr->ident.method_group_target;
+    if (expr->kind == AST_MEMBER_ACCESS) return expr->member.method_group_target;
+    return NULL;
+}
+
+void zan_binder_set_method_group_target(zan_ast_node_t *expr, zan_type_t *target) {
+    if (!expr) return;
+    if (expr->kind == AST_IDENTIFIER) expr->ident.method_group_target = target;
+    if (expr->kind == AST_MEMBER_ACCESS) expr->member.method_group_target = target;
+}
+
+static bool method_group_ref_type(zan_type_t *t) {
+    return t && (t->kind == TYPE_CLASS || t->kind == TYPE_INTERFACE ||
+        t->kind == TYPE_OBJECT || t->kind == TYPE_STRING ||
+        t->kind == TYPE_ARRAY || t->kind == TYPE_DELEGATE || t->kind == TYPE_TASK);
+}
+
+/* Variance permits reference conversions, never numeric widening/boxing:
+ * the delegate invocation passes the selected method's actual ABI unchanged. */
+static bool method_group_conversion(zan_type_t *to, zan_type_t *from) {
+    if (!to || !from || to->kind == TYPE_TYPE_PARAM ||
+        from->kind == TYPE_TYPE_PARAM) return false;
+    if (binder_type_equal(to, from, 0)) return true;
+    if (!method_group_ref_type(to) || !method_group_ref_type(from)) return false;
+    if (to->kind == TYPE_OBJECT) return true;
+    return binder_type_derives(from, to, 0);
+}
+
+static zan_type_t *method_group_subst(zan_binder_t *b, zan_type_t *type,
+                                     zan_type_t *owner) {
+    zan_symbol_t *sym = owner ? owner->sym : NULL;
+    if (!type || !sym || !sym->decl || !owner->type_arg_count) return type;
+    zan_ast_list_t *tps = &sym->decl->type_decl.type_params;
+    if (tps->count != owner->type_arg_count) return type;
+    return zan_binder_subst_named(b, type, tps, owner->type_args);
+}
+
+static int method_group_candidate_score(zan_binder_t *b, zan_symbol_t *method,
+                                       zan_type_t *owner, zan_type_t *target) {
+    zan_ast_node_t *decl = method->decl;
+    if (!decl || decl->kind != AST_METHOD_DECL ||
+        decl->method_decl.type_params.count > 0 ||
+        ((decl->method_decl.modifiers & MOD_ASYNC) != 0) !=
+            (target->delegate_is_async != 0)) return -1;
+    zan_ast_list_t *ps = &decl->method_decl.params;
+    if (ps->count != target->delegate_param_count ||
+        (ps->count && !target->delegate_param_types)) return -1;
+    int score = 0;
+    for (int i = 0; i < ps->count; i++) {
+        zan_ast_node_t *p = ps->items[i];
+        if (!p || p->kind != AST_PARAM || p->param.by_ref)
+            return -1;
+        zan_type_t *pt = method_group_subst(b,
+            zan_binder_resolve_type(b, p->param.type), owner);
+        zan_type_t *dt = target->delegate_param_types[i];
+        if (!method_group_conversion(pt, dt)) return -1;
+        score += binder_type_equal(pt, dt, 0) ? 4 : 1;
+    }
+    zan_type_t *ret = decl->method_decl.return_type
+        ? method_group_subst(b,
+            zan_binder_resolve_type(b, decl->method_decl.return_type), owner)
+        : b->type_void;
+    zan_type_t *dr = target->delegate_ret_type;
+    if (!dr || dr->kind == TYPE_VOID) {
+        if (!ret || ret->kind != TYPE_VOID) return -1;
+    } else if (!ret || ret->kind == TYPE_VOID ||
+               !method_group_conversion(dr, ret)) {
+        return -1;
+    }
+    return score + 4;
+}
+
+zan_symbol_t *zan_binder_method_group(zan_binder_t *b, zan_type_t *receiver,
+    zan_istr_t name, zan_method_group_receiver_t form, zan_type_t *target,
+    int *score) {
+    if (score) *score = -1;
+    if (!receiver || !target || target->kind != TYPE_DELEGATE) return NULL;
+    /* Delegate signature types do not encode ref/out. Until method-group
+     * lowering supports that ABI, reject declaration-level by-ref targets. */
+    if (target->sym && target->sym->decl &&
+        target->sym->decl->kind == AST_DELEGATE_DECL) {
+        zan_ast_list_t *params = &target->sym->decl->method_decl.params;
+        for (int i = 0; i < params->count; i++)
+            if (params->items[i] && params->items[i]->param.by_ref) return NULL;
+    }
+    zan_symbol_t *best = NULL;
+    int best_score = -1, best_depth = -1;
+    bool ambiguous = false;
+    zan_type_t *owner = receiver;
+    for (int depth = 0; owner && owner->sym && depth < 64; depth++) {
+        zan_symbol_t *sym = owner->sym;
+        for (int i = 0; i < sym->member_count; i++) {
+            zan_symbol_t *m = sym->members[i];
+            if (!m || m->name.len != name.len ||
+                memcmp(m->name.str, name.str, (size_t)name.len) != 0) continue;
+            if (m->kind == SYM_FIELD || m->kind == SYM_PROPERTY) return NULL;
+            if (m->kind != SYM_METHOD) continue;
+            bool is_static = (m->modifiers & MOD_STATIC) != 0;
+            if ((form == ZAN_METHOD_GROUP_TYPE && !is_static) ||
+                (form == ZAN_METHOD_GROUP_VALUE && is_static)) continue;
+            int candidate = method_group_candidate_score(b, m, owner, target);
+            if (candidate < 0) continue;
+            if (candidate > best_score) {
+                best = m;
+                best_score = candidate;
+                best_depth = depth;
+                ambiguous = false;
+            } else if (candidate == best_score && depth == best_depth && m != best) {
+                ambiguous = true;
+            }
+        }
+        zan_type_t *base = owner->base_type;
+        owner = base && base != owner ? method_group_subst(b, base, owner) : NULL;
+    }
+    if (ambiguous) return NULL;
+    if (best && score) *score = best_score;
+    return best;
 }

@@ -359,7 +359,7 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                     if (pt->kind == TYPE_DELEGATE) {
                         if (j < 16 && !mg_delegate_candidates[j])
                             mg_delegate_candidates[j] = pt;
-                        if (!method_group_matches_delegate(c, mgs, pt)) {
+                        if (!method_group_matches_delegate(c, mg_probe, pt)) {
                             compatible = false;
                             break;
                         }
@@ -438,6 +438,24 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 }
                 return NULL;
             }
+        }
+    }
+    if (best) {
+        /* Commit only the winning outer signature, so cleanup and untyped
+         * value emission see the same target as typed call emission. */
+        zan_ast_list_t *ps = &best->decl->method_decl.params;
+        for (int j = 0; j < argc && j < ps->count; j++) {
+            zan_ast_node_t *arg = call->call.args.items[j];
+            if (!arg || !expr_method_group(c, arg)) continue;
+            zan_type_t *pt = zan_binder_resolve_type(c->binder, ps->items[j]->param.type);
+            if (best->parent && best->parent->decl && recv_type &&
+                recv_type->type_arg_count > 0) {
+                zan_ast_list_t *tps = &best->parent->decl->type_decl.type_params;
+                if (tps->count == recv_type->type_arg_count)
+                    pt = zan_binder_subst_named(c->binder, pt, tps, recv_type->type_args);
+            }
+            if (pt && pt->kind == TYPE_DELEGATE)
+                zan_binder_set_method_group_target(arg, pt);
         }
     }
     return best ? best : checker_find_method_call(type_sym, name, argc, type_arg_count);

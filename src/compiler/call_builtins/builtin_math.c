@@ -163,29 +163,34 @@
             int want_max = is_call_to(expr, "Math", "Max");
             LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef b = emit_expr(g, expr->call.args.items[1], locals);
-            LLVMTypeKind ka = LLVMGetTypeKind(LLVMTypeOf(a));
-            LLVMTypeKind kb = LLVMGetTypeKind(LLVMTypeOf(b));
-            int fa = (ka == LLVMDoubleTypeKind || ka == LLVMFloatTypeKind);
-            int fb = (kb == LLVMDoubleTypeKind || kb == LLVMFloatTypeKind);
+            zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+            zan_type_t *bt = infer_expr_type(g, expr->call.args.items[1], locals);
+            const char *result = zan_builtin_minmax_result("Math",
+                want_max ? "Max" : "Min", 3, at, bt);
             /* 守卫要逐个参数判：原来的写法是 "ka != Int && kb != Int"，
                遇到「一个指针 + 一个整数」就不报错了，pointer 随后被
                sitofp 成 double——生成非法 IR，编译死在代码生成阶段。 */
-            if (!math_arg_is_numeric(a) || !math_arg_is_numeric(b)) {
+            if (!result || !math_arg_is_numeric(a) || !math_arg_is_numeric(b)) {
+                int numeric_pair =
+                    zan_builtin_minmax_result("Math", "Min", 3, at, at) &&
+                    zan_builtin_minmax_result("Math", "Min", 3, bt, bt);
                 zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3055,
-                              "Math.%s requires numeric arguments",
-                              want_max ? "Max" : "Min");
+                    numeric_pair
+                        ? "Math.%s has no matching numeric overload; convert arguments explicitly"
+                        : "Math.%s requires numeric arguments",
+                    want_max ? "Max" : "Min");
                 return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
             }
-            if (fa || fb) {
+            if (strcmp(result, "double") == 0) {
                 LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
-                a = fa ? (ka == LLVMFloatTypeKind
-                            ? LLVMBuildFPExt(g->builder, a, dbl, "ext")
-                            : a)
-                       : LLVMBuildSIToFP(g->builder, a, dbl, "tofp");
-                b = fb ? (kb == LLVMFloatTypeKind
-                            ? LLVMBuildFPExt(g->builder, b, dbl, "ext")
-                            : b)
-                       : LLVMBuildSIToFP(g->builder, b, dbl, "tofp");
+                a = at->kind == TYPE_BYTE || at->kind == TYPE_USHORT ||
+                    at->kind == TYPE_CHAR || at->kind == TYPE_UINT || at->kind == TYPE_ULONG
+                    ? LLVMBuildUIToFP(g->builder, a, dbl, "tofp")
+                    : math_arg_to_double(g, a);
+                b = bt->kind == TYPE_BYTE || bt->kind == TYPE_USHORT ||
+                    bt->kind == TYPE_CHAR || bt->kind == TYPE_UINT || bt->kind == TYPE_ULONG
+                    ? LLVMBuildUIToFP(g->builder, b, dbl, "tofp")
+                    : math_arg_to_double(g, b);
                 LLVMValueRef a_nan = LLVMBuildFCmp(g->builder,
                     LLVMRealUNO, a, a, "an");
                 LLVMValueRef b_nan = LLVMBuildFCmp(g->builder,
@@ -199,12 +204,25 @@
                 return LLVMBuildSelect(g->builder, a_nan, a, from_b,
                     want_max ? "max" : "min");
             }
-            unsigned wa = LLVMGetIntTypeWidth(LLVMTypeOf(a));
-            unsigned wb = LLVMGetIntTypeWidth(LLVMTypeOf(b));
-            if (wa < wb) a = LLVMBuildSExt(g->builder, a, LLVMTypeOf(b), "sx");
-            else if (wb < wa) b = LLVMBuildSExt(g->builder, b, LLVMTypeOf(a), "sx");
+            /* Integer literals are emitted as i64 even when semantically int.
+             * Normalize both operands to the selected overload before comparing. */
+            int is_unsigned = strcmp(result, "uint") == 0 ||
+                              strcmp(result, "ulong") == 0;
+            LLVMTypeRef it = strcmp(result, "nint") == 0
+                ? map_type(g, g->binder->type_nint)
+                : strcmp(result, "long") == 0 || strcmp(result, "ulong") == 0
+                    ? LLVMInt64TypeInContext(g->ctx) : LLVMInt32TypeInContext(g->ctx);
+            if (LLVMTypeOf(a) != it)
+                a = LLVMBuildIntCast2(g->builder, a, it,
+                    at->kind != TYPE_UINT && at->kind != TYPE_USHORT &&
+                    at->kind != TYPE_BYTE && at->kind != TYPE_CHAR, "minmax.a");
+            if (LLVMTypeOf(b) != it)
+                b = LLVMBuildIntCast2(g->builder, b, it,
+                    bt->kind != TYPE_UINT && bt->kind != TYPE_USHORT &&
+                    bt->kind != TYPE_BYTE && bt->kind != TYPE_CHAR, "minmax.b");
             LLVMValueRef cmp = zan_icmp(g->builder,
-                want_max ? LLVMIntSGT : LLVMIntSLT, a, b, "cmp");
+                is_unsigned ? (want_max ? LLVMIntUGT : LLVMIntULT)
+                            : (want_max ? LLVMIntSGT : LLVMIntSLT), a, b, "cmp");
             return LLVMBuildSelect(g->builder, cmp, a, b, want_max ? "max" : "min");
         }
 

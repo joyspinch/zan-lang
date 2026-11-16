@@ -140,6 +140,8 @@
                         src_elem_llvm = otype->element_type
                             ? map_type(g, otype->element_type) : i64;
                     LLVMValueRef other_raw = emit_expr(g, expr->call.args.items[0], locals);
+                    int source_own = emit_call_arg_eh_push(g,
+                        expr->call.args.items[0], other_raw, locals);
                     LLVMValueRef other_ptr = LLVMBuildBitCast(g->builder, other_raw, list_pt, "ar.other");
                     LLVMValueRef other_i = LLVMBuildPtrToInt(g->builder, other_ptr, i64, "ar.oi");
                     LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, other_i,
@@ -252,6 +254,9 @@
                     LLVMBuildStore(g->builder, ni, idx_a);
                     LLVMBuildBr(g->builder, c_bb);
                     LLVMPositionBuilderAtEnd(g->builder, ar_done);
+                    if (source_own) emit_eh_tmp_pop(g);
+                    emit_release_owned_call_temp(g, expr->call.args.items[0],
+                        other_raw, locals);
                     return LLVMConstInt(i32t, 0, 0);
                 }
             }
@@ -314,17 +319,20 @@
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
+                    int recv_own = emit_intrinsic_own_recv(g, lobj, raw_ptr, locals);
+                    LLVMValueRef idx = emit_expr(g, expr->call.args.items[0], locals);
+                    if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
+                        idx = LLVMBuildSExt(g->builder, idx, i64, "idx.sx");
+                    }
+                    /* Index evaluation may resize or clear this same list.
+                     * Read its current count and buffer only after it returns. */
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
                     LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
                     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt");
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
-                    LLVMValueRef idx = emit_expr(g, expr->call.args.items[0], locals);
-                    if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
-                        LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
-                        idx = LLVMBuildSExt(g->builder, idx, i64, "idx.sx");
-                    }
                     emit_index_bounds_check(g, idx, count, expr->loc, "list");
                     idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
                     unsigned rwords = elem_slot_words(g, container_elem_type(ltype));
@@ -366,6 +374,7 @@
                             &tpos, 1, "tail");
                         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), tail_ptr);
                     }
+                    emit_intrinsic_drop_recv(g, lobj, raw_ptr, locals, recv_own);
                     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
                 }
             }

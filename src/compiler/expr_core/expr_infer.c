@@ -78,6 +78,8 @@ static zan_type_t *irgen_promote_pair(zan_irgen_t *g, zan_type_t *a,
 static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                                        local_scope_t *locals) {
     if (!e) return NULL;
+    zan_type_t *method_group_target = zan_binder_method_group_target(e);
+    if (method_group_target) return concretize(g, method_group_target);
     switch (e->kind) {
     case AST_STRING_LITERAL:
         return g->binder ? g->binder->type_string : NULL;
@@ -113,6 +115,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     case AST_BOOL_LITERAL:
         return g->binder ? g->binder->type_bool : NULL;
     case AST_IDENTIFIER: {
+        if (e->ident.is_type_receiver) {
+            zan_symbol_t *ts = zan_binder_type_receiver(g->binder, e);
+            return ts ? ts->type : NULL;
+        }
         local_var_t *l = local_find(locals, e->ident.name);
         if (l) return l->type;
         if (g->current_type_sym) {
@@ -526,10 +532,22 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                         ? zan_builtin_member_result(bcls, callee->member.name.str,
                                                     (int)callee->member.name.len)
                         : NULL;
+                    if (bt && strcmp(bcls, "Math") == 0 &&
+                        callee->member.name.len == 3 && e->call.args.count == 2 &&
+                        (memcmp(callee->member.name.str, "Min", 3) == 0 ||
+                         memcmp(callee->member.name.str, "Max", 3) == 0)) {
+                        res = zan_builtin_minmax_result(bcls,
+                            callee->member.name.str, 3,
+                            infer_expr_type(g, e->call.args.items[0], locals),
+                            infer_expr_type(g, e->call.args.items[1], locals));
+                    }
                     if (res) {
                         if (strcmp(res, "string") == 0) return g->binder->type_string;
                         if (strcmp(res, "int") == 0) return g->binder->type_int;
                         if (strcmp(res, "long") == 0) return g->binder->type_long;
+                        if (strcmp(res, "uint") == 0) return g->binder->type_uint;
+                        if (strcmp(res, "ulong") == 0) return g->binder->type_ulong;
+                        if (strcmp(res, "nint") == 0) return g->binder->type_nint;
                         if (strcmp(res, "double") == 0) return g->binder->type_double;
                         if (strcmp(res, "bool") == 0) return g->binder->type_bool;
                         if (strcmp(res, "char") == 0) return g->binder->type_char;
@@ -751,11 +769,23 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         }
         return zan_binder_make_tuple_type(g->binder, elems, n);
     }
-    case AST_SWITCH_EXPR:
-        /* `x switch { */
+    case AST_SWITCH_EXPR: {
         if (e->switch_expr.arms.count == 0) return NULL;
-        return infer_expr_type(g, e->switch_expr.arms.items[0]->switch_arm.result,
-                               locals);
+        zan_ast_node_t *arm = e->switch_expr.arms.items[0];
+        local_scope_t empty;
+        if (!locals) {
+            local_scope_init(&empty, g->arena);
+            locals = &empty;
+        }
+        int mark = locals->count;
+        if (arm->switch_arm.type_pattern && arm->switch_arm.var_name.len) {
+            zan_type_t *pattern = resolve_type_ctx(g, arm->switch_arm.type_pattern);
+            local_add(locals, arm->switch_arm.var_name, NULL, pattern);
+        }
+        zan_type_t *result = infer_expr_type(g, arm->switch_arm.result, locals);
+        locals->count = mark;
+        return result;
+    }
     case AST_WITH_EXPR:
         return infer_expr_type(g, e->with_expr.expr, locals);
     default:

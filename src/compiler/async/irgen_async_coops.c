@@ -194,6 +194,7 @@ void emit_async_eh_prologue(zan_irgen_t *g) {
         /* The coroutine root is never a departing lexical try/finally. */
         g->lpad_stack[g->lpad_depth].fin_idx = -1;
         g->lpad_stack[g->lpad_depth].finally_depth = 0;
+        g->lpad_stack[g->lpad_depth].fn_cleanup = NULL;
         g->lpad_depth++;
     }
 

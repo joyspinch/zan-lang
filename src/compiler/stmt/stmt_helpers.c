@@ -665,6 +665,37 @@ static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals
         zan_store_fit(g, LLVMConstNull(i8ptr), s_exc);
     }
 }
+typedef struct {
+    local_scope_t *locals;
+    zan_lpad_entry_t cleanup;
+} async_try_cleanup_t;
+
+static zan_walk_action_t collect_async_try_cleanup(zan_ast_node_t *node, void *data) {
+    async_try_cleanup_t *walk = data;
+    if (node->kind == AST_LAMBDA) return ZAN_WALK_SKIP_CHILDREN;
+    /* Coroutine frame owners are predeclared before lexical emission. The
+     * aliases added while emitting a block do not own their frame slots. */
+    for (int i = 0; i < walk->locals->count; i++) {
+        local_var_t *v = &walk->locals->vars[i];
+        if (v->async_decl != node || !local_needs_cleanup(v)) continue;
+        zan_lpad_entry_t *cleanup = &walk->cleanup;
+        if (ZAN_TAB_ENSURE(cleanup->cleanups, cleanup->cleanup_count,
+                           cleanup->cleanup_cap, 8))
+            cleanup->cleanups[cleanup->cleanup_count++] = *v;
+    }
+    return ZAN_WALK_CONTINUE;
+}
+
+static void emit_async_try_cleanups(zan_irgen_t *g, local_scope_t *locals,
+                                    zan_ast_node_t *body) {
+    async_try_cleanup_t walk = { .locals = locals };
+    zan_ast_walk(body, collect_async_try_cleanup, NULL, &walk);
+    /* Slots never entered on this branch are null; cleared slots stay null
+     * for the final frame cleanup and for later loop iterations. */
+    emit_lpad_cleanups(g, &walk.cleanup);
+    free(walk.cleanup.cleanups);
+}
+
 void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
     int target_fin = 0;
     LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
@@ -832,8 +863,17 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
         if (!pre || !pre->box_cell) return 0;
         int pre_idx = (int)(pre - locals->vars);
         slot = pre->alloca;
-        LLVMValueRef cell = pre->box_cell;
         LLVMValueRef owner = pre->box_owner_slot;
+        /* Each lexical entry owns a fresh cell. Escaped delegates keep the
+         * previous cell alive independently of this frame's current owner. */
+        LLVMValueRef fresh = emit_box_cell(g, stmt->loc, payload, type, NULL);
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder,
+            LLVMBuildOr(g->builder, LLVMBuildPtrToInt(g->builder, fresh, i64, "box.i"),
+                LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "box.tag"), i8ptr, "box.owner");
+        LLVMBuildStore(g->builder, tagged, owner);
+        LLVMValueRef cell = pre->box_cell;
         local_add(locals, stmt->var_decl.name, slot, type);
         local_var_t *v = &locals->vars[locals->count - 1];
         v->box_cell = cell;

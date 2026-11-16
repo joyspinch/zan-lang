@@ -17,6 +17,20 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     sh_map_init(&st.ext_globs);
     sh_map_init(&st.ext_fns);
 
+    /* S4b/design.md §8.3: 内部常量全局一律唯一定义——反射 fields/mtab/
+     * ctor/enum 等含指针字段表不能入 blob，逐全局升 external（原名
+     * 保留），消除 SH_G_TRAVEL 的整表按分片复制。时序硬约束：判据按
+     * sh_global_verdict memo 在 st.glob_v，晋升后不失效，故必须先于
+     * 任何判据调用（下方的脏不动点、sh_planner_mark、trial pass-1）。
+     * 只改 linkage、走 sh_link_rec 标准回滚（trial 失败路径统一恢复），
+     * 可置于 trial 闸门之前；blob 是破坏性重写（RAUW+删除不可回滚），
+     * 仍留在 trial 闸门之后——两者位置不可互换。 */
+    if (!sh_promote_const_globals(&st)) {
+        fprintf(stderr, "shard: %s — falling back to single module\n",
+                st.reason);
+        goto cleanup_planning;
+    }
+
     sh_member_t *mem = (sh_member_t *)calloc((size_t)(m->fn_count ? m->fn_count : 1),
                                              sizeof(*mem));
     int *uf = (int *)calloc((size_t)(m->fn_count ? m->fn_count : 1), sizeof(*uf));
@@ -254,6 +268,19 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         goto cleanup_planning;
     }
 
+    /* S4/design.md §5: immortal 常量 blob 化（唯一定义 + 偏移引用），
+     * 消除 TRAVEL 判据对托管字符串的按分片复制。失败时模块未变异或
+     * blob 形态本身即合法单模块，走既有回退。 */
+    if (!sh_build_const_blob(&st)) {
+        for (int i = 0; i < st.link_n; i++)
+            LLVMSetLinkage(st.link_recs[i].glob ? st.link_recs[i].glob
+                                                : st.link_recs[i].fn,
+                           st.link_recs[i].old_linkage);
+        fprintf(stderr, "shard: %s — falling back to single module\n",
+                st.reason);
+        goto cleanup_planning;
+    }
+
     /* 调整外部引用函数的符号链接为 external */
     for (int k = 0; k < nm; k++) {
         if (mem[k].comp < 0) continue;
@@ -282,7 +309,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     char tmp_ll[1200];
     tmp_ll[0] = '\0';
     FILE *body_file = NULL;
-    sh_body_index_t body_idx = {0};
+    sh_body_index_t body_idx = {0}, global_idx = {0};
     if (!st.failed) {
         if (!obj_base || !*obj_base) {
             sh_fail(&st, "missing shard output path");
@@ -299,8 +326,8 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 body_file = fopen(tmp_ll, "rb");
                 if (!body_file) {
                     sh_fail(&st, "cannot open shard module text (errno=%d)", errno);
-                } else if (!sh_build_body_index(&body_idx, body_file)) {
-                    sh_fail(&st, "cannot build complete shard body index");
+                } else if (!sh_build_body_index(&body_idx, &global_idx, body_file)) {
+                    sh_fail(&st, "cannot build complete shard body/global index");
                 }
             }
             if (err_msg) LLVMDisposeMessage(err_msg);
@@ -400,18 +427,25 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                     if (travel.vals[i] > 0) tv[t++] = travel.keys[i];
                 qsort(tv, (size_t)ntrav, sizeof(*tv), sh_cmp_name_ref);
                 for (int t2 = 0; ok && t2 < ntrav; t2++) {
-                    char *txt = LLVMPrintValueToString(tv[t2]);
-                    if (!txt) { sh_fail(&st, "print global failed"); ok = false; break; }
-                    if (strstr(txt, " comdat($") || strstr(txt, " = alias ")) {
-                        sh_fail(&st, "global '%s' carries comdat/alias",
-                                LLVMGetValueName(tv[t2]));
-                        LLVMDisposeMessage(txt);
+                    const char *global_name = LLVMGetValueName(tv[t2]);
+                    const sh_body_slice_t *sl = sh_find_body_slice(&global_idx, global_name);
+                    if (!sl) {
+                        sh_fail(&st, "global '%s' missing from shard module text", global_name);
                         ok = false;
                         break;
                     }
-                    sh_sb_puts(&gdecls, txt);
-                    sh_sb_puts(&gdecls, "\n");
-                    LLVMDisposeMessage(txt);
+                    size_t global_start = gdecls.n;
+                    if (!sh_append_body_slice(body_file, sl, &gdecls)) {
+                        sh_fail(&st, "cannot read global '%s' from shard module text", global_name);
+                        ok = false;
+                        break;
+                    }
+                    const char *txt = gdecls.p + global_start;
+                    if (strstr(txt, " comdat($") || strstr(txt, " = alias ")) {
+                        sh_fail(&st, "global '%s' carries comdat/alias", global_name);
+                        ok = false;
+                        break;
+                    }
                 }
                 free(tv);
             }
@@ -463,6 +497,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             sh_harvest_types(&st, &types, bodies.p ? bodies.p : "");
             sh_harvest_types(&st, &types, gdecls.p ? gdecls.p : "");
         }
+        SH_TRACE("shard %d: types done (%d bytes)\n", s, (int)types.n);
 
         /* 直接流式输出三段内容以降低内存驻留 */
         if (bodies.oom || gdecls.oom || types.oom) {
@@ -500,6 +535,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     }
 
     sh_free_body_index(&body_idx);
+    sh_free_body_index(&global_idx);
     if (body_file) fclose(body_file);
     if (tmp_ll[0]) {
         remove(tmp_ll);

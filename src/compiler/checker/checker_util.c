@@ -791,10 +791,32 @@ static bool expr_captures_this(zan_checker_t *c, zan_ast_node_t *node) {
     }
 }
 
+/* An instance method group creates a strong receiver closure too. Only the
+ * current receiver is relevant here; reading a delegate field/property does
+ * not create a new capture, and locals/parameters shadow implicit methods. */
+static bool method_group_captures_this(zan_checker_t *c, zan_ast_node_t *node) {
+    if (!node || !c->current_type_sym) return false;
+    zan_istr_t name;
+    if (node->kind == AST_IDENTIFIER) {
+        name = node->ident.name;
+        if (node->ident.is_type_receiver || checker_find_local_slot(c, name))
+            return false;
+    } else if (node->kind == AST_MEMBER_ACCESS && node->member.object &&
+               node->member.object->kind == AST_THIS_EXPR) {
+        name = node->member.name;
+    } else {
+        return false;
+    }
+    if (checker_find_field(c->current_type_sym, name)) return false;
+    zan_symbol_t *method = checker_find_method(c->current_type_sym, name);
+    return method && !(method->modifiers & MOD_STATIC);
+}
+
 static bool has_closure_capturing_this(zan_checker_t *c, zan_ast_node_t *node) {
     if (!node) return false;
     while (node && node->kind == AST_CAST_EXPR) node = node->cast.expr;
     if (!node) return false;
+    if (method_group_captures_this(c, node)) return true;
     if (node->kind == AST_LAMBDA) {
         return expr_captures_this(c, node->lambda.body);
     }

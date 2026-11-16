@@ -34,8 +34,16 @@ int zan_builtin_has_native_member(const char *type, int type_len,
 
 char zan_builtin_member_kind(const char *type, const char *name, int name_len);
 
+/* Returns NULL when overloads have different result types. */
 const char *zan_builtin_member_result(const char *type, const char *name,
                                       int name_len);
+
+struct zan_type;
+/* Math.Min/Max select a numeric overload from semantic argument types,
+ * never from the LLVM width of integer literals. NULL means no overload. */
+const char *zan_builtin_minmax_result(const char *type, const char *name,
+                                     int name_len, const struct zan_type *a,
+                                     const struct zan_type *b);
 
 /* 取内建方法的形参类型名列表（签名的括号里，按逗号分隔）。
  * 返回形参个数；out[] 里是各形参的类型名（"T" / "int" / "List<T>" …）。

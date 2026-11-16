@@ -3,7 +3,22 @@
 /* Composite Dispatcher Submodules */
 #include "stmt/stmt_helpers.c"
 
+static void emit_stmt_impl(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
+
 void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
+    void *saved_locals = g->active_cleanup_locals;
+    LLVMValueRef saved_fn = g->active_cleanup_fn;
+    if (locals) {
+        g->active_cleanup_locals = locals;
+        LLVMBasicBlockRef bb = LLVMGetInsertBlock(g->builder);
+        g->active_cleanup_fn = bb ? LLVMGetBasicBlockParent(bb) : NULL;
+    }
+    emit_stmt_impl(g, stmt, locals);
+    g->active_cleanup_locals = saved_locals;
+    g->active_cleanup_fn = saved_fn;
+}
+
+static void emit_stmt_impl(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
     if (locals) g->current_locals = locals;
 

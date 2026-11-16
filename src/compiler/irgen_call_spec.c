@@ -1,12 +1,42 @@
 #include "irgen_internal.h"
 bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
-    if (!e || e->kind != AST_IDENTIFIER) return false;
-    if (!g->current_type_sym) return false;
-    if (g->current_this &&
-        get_field_index(g->current_type_sym, e->ident.name) >= 0)
-        return true;
+    if (!e || e->kind != AST_IDENTIFIER || e->ident.is_type_receiver) return false;
+    if (!g->current_type_sym || !g->current_type_sym->decl) return false;
     zan_symbol_t *fs = get_field_sym(g->current_type_sym, e->ident.name);
-    return fs && fs->kind == SYM_FIELD && (fs->modifiers & MOD_STATIC) != 0;
+    if (!fs || !fs->decl) return false;
+    /* binder 把基类实例字段/属性合并进派生类成员表前缀，get_field_sym
+     * 会一并找到。裸名静态接收者的遮蔽判定只认**本类型声明**的成员：
+     * 继承字段不得遮蔽类型名（arc_static_member_shadow 金标口径——
+     * StaticShadowScope 里 StaticShadowStore.Current 必须走类静态路径，
+     * 否则静态成员访问退化为经 null 基类字段取值直接 E3009）。 */
+    zan_ast_list_t *ms = &g->current_type_sym->decl->type_decl.members;
+    for (int i = 0; i < ms->count; i++)
+        if (ms->items[i] == fs->decl) return true;
+    return false;
+}
+
+/* A proven qualified type never re-enters lexical value lookup. */
+local_var_t *receiver_local(zan_ast_node_t *e, local_scope_t *locals) {
+    if (!e || e->kind != AST_IDENTIFIER || e->ident.is_type_receiver || !locals)
+        return NULL;
+    return local_find(locals, e->ident.name);
+}
+zan_symbol_t *receiver_type_symbol(zan_irgen_t *g, zan_ast_node_t *e,
+                                   local_scope_t *locals) {
+    if (!g || !g->binder || !e || e->kind != AST_IDENTIFIER) return NULL;
+    if (e->ident.is_type_receiver)
+        return zan_binder_type_receiver(g->binder, e);
+    if (receiver_local(e, locals)) return NULL;
+    zan_symbol_t *sym = zan_binder_lookup(g->binder, e->ident.name);
+    if (ident_names_own_field(g, e)) {
+        zan_symbol_t *member = get_field_sym(g->current_type_sym, e->ident.name);
+        /* Layout slots include properties. A same-named property must not
+         * hide a type already selected by binder for a bare static path. */
+        if (!member || member->kind != SYM_PROPERTY || !sym ||
+            (sym->kind != SYM_CLASS && sym->kind != SYM_STRUCT &&
+             sym->kind != SYM_ENUM)) return NULL;
+    }
+    return sym;
 }
 
 static bool type_mentions_type_param(zan_type_t *t, int depth) {
@@ -320,7 +350,7 @@ void emit_intrinsic_drop_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
 }
 int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
                                  LLVMValueRef val, local_scope_t *locals) {
-    zan_type_t *at = infer_expr_type(g, arg, locals);
+    zan_type_t *at = call_arg_temp_type(g, arg, val, locals);
     if (!call_arg_is_owned_temp(g, arg, at, locals) ||
         LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return 0;
     if (expr_yields_delegate_value(g, arg, locals)) {

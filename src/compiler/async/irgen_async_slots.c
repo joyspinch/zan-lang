@@ -364,12 +364,62 @@ LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g) {
     return bb;
 }
 
+/* Reload boxed pointers at each use: a lexical declaration can replace its
+ * cell on a loop backedge, and a suspension can resume after the old cell was
+ * released. Entry-only cell/payload SSA addresses are not stable storage. */
+static void finalize_box_uses(zan_irgen_t *g, LLVMValueRef old,
+                              LLVMValueRef owner, LLVMTypeRef payload) {
+    LLVMValueRef *users = NULL;
+    int count = 0, cap = 0;
+    for (LLVMUseRef use = LLVMGetFirstUse(old); use; use = LLVMGetNextUse(use)) {
+        users = irgen_grow(users, &cap, count + 1, sizeof(*users));
+        users[count++] = LLVMGetUser(use);
+    }
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int u = 0; u < count; u++) {
+        LLVMValueRef user = users[u];
+        if (!LLVMIsAInstruction(user) ||
+            LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) !=
+                g->current_async_resume_fn) continue;
+        unsigned operands = (unsigned)LLVMGetNumOperands(user);
+        for (unsigned i = 0; i < operands; i++) {
+            if (LLVMGetOperand(user, i) != old) continue;
+            if (LLVMIsAPHINode(user)) {
+                if (i >= LLVMCountIncoming(user)) continue;
+                /* PHI values are evaluated on their incoming edges. */
+                LLVMBasicBlockRef pred = LLVMGetIncomingBlock(user, i);
+                LLVMPositionBuilderBefore(g->builder, LLVMGetBasicBlockTerminator(pred));
+            } else {
+                LLVMPositionBuilderBefore(g->builder, user);
+            }
+            LLVMValueRef tagged = LLVMBuildLoad2(g->builder, i8ptr, owner, "box.current");
+            LLVMValueRef cell = emit_closure_untag(g, tagged);
+            LLVMValueRef value = payload ? box_value_ptr(g, cell, payload) : cell;
+            LLVMSetOperand(user, i, value);
+        }
+    }
+    free(users);
+}
+
 /* 代理 alloca 替换为帧字段前完成指针类型提取与校验 */
 void emit_async_finalize_slots(zan_irgen_t *g) {
     zan_builder_point_t pt = zan_builder_save(g);
     for (int i = 0; i < g->current_async_slot_count; i++) {
         zan_async_slot_t *slot = &g->current_async_slots[i];
         LLVMValueRef proxy = slot->slot_alloca;
+        if (slot->box_payload) {
+            LLVMTypeRef rec = LLVMGetGEPSourceElementType(slot->box_payload);
+            LLVMTypeRef payload = LLVMStructGetTypeAtIndex(rec, ZAN_CLOSURE_HDR_FIELDS);
+            finalize_box_uses(g, slot->box_payload, proxy, payload);
+            if (LLVMGetFirstUse(slot->box_payload)) {
+                fprintf(stderr, "zanc: internal: boxed payload escaped its resume function\n");
+                exit(1);
+            }
+            LLVMInstructionEraseFromParent(slot->box_payload);
+            slot->box_payload = NULL;
+            finalize_box_uses(g, slot->box_cell, proxy, NULL);
+            slot->box_cell = NULL;
+        }
         LLVMPositionBuilderBefore(g->builder, proxy);
         LLVMValueRef address = LLVMBuildStructGEP2(g->builder,
             g->current_async_frame_type, g->current_async_frame,

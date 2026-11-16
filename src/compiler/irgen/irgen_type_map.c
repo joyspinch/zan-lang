@@ -110,22 +110,10 @@ LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
         if (type->element_type)
             return nullable_type_of(g, map_type(g, type->element_type));
         return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    case TYPE_DELEGATE: {
-        int pc = type->delegate_param_count;
-        LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
-            (size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
-        for (int i = 0; i < pc; i++) {
-            param_types[i] = map_type(g, type->delegate_param_types[i]);
-        }
-        LLVMTypeRef ret = type->delegate_is_async
-            ? LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)
-            : (type->delegate_ret_type
-                ? map_type(g, type->delegate_ret_type)
-                : LLVMVoidTypeInContext(g->ctx));
-        LLVMTypeRef fn_type = LLVMFunctionType(ret, param_types, (unsigned)pc, 0);
-        free(param_types);
-        return LLVMPointerType(fn_type, 0);
-    }
+    case TYPE_DELEGATE:
+        /* Delegate values use opaque pointers; invocation builds its own
+         * function signature. Expanding it here loops on recursive delegates. */
+        return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_STRUCT:
     case TYPE_CLASS: {
         if ((type->name.len == 4 && memcmp(type->name.str, "Span", 4) == 0) ||
@@ -685,6 +673,7 @@ void local_scope_init(local_scope_t *s, zan_arena_t *arena) {
     s->pattern_count = 0;
     s->pattern_cap = 0;
     s->patterns = NULL;
+    s->arg_owners = NULL;
 }
 local_scope_t *local_scope_new(zan_arena_t *arena) {
     local_scope_t *s = (local_scope_t *)zan_arena_alloc(arena, sizeof(local_scope_t));

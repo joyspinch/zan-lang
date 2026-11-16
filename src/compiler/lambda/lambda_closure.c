@@ -1029,10 +1029,16 @@ void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
 /* 实例方法组转委托：将接收者绑定入方法组记录 */
 LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
                                               LLVMValueRef recv, zan_loc_t loc) {
+    return emit_method_group_closure_typed(g, msym, recv, NULL, loc);
+}
+
+LLVMValueRef emit_method_group_closure_typed(zan_irgen_t *g, zan_symbol_t *msym,
+        LLVMValueRef recv, zan_type_t *receiver_type, zan_loc_t loc) {
     int fi = irgen_find_function(g, msym);
     if (fi < 0) return NULL;
     LLVMValueRef target = g->functions[fi].fn;
     LLVMTypeRef target_ty = g->functions[fi].fn_type;
+    target = route_generic_method(g, receiver_type, msym, target, target_ty, &target_ty);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     bool is_static = (recv == NULL);
     unsigned np = LLVMCountParamTypes(target_ty);

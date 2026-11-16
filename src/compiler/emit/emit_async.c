@@ -314,20 +314,6 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                 }
             }
         }
-        for (int k = 0; k < w->alocal_count; k++) {
-            async_local_t *al = &w->alocals[k];
-            if (!al->boxed) continue;
-            LLVMValueRef cell = emit_box_cell(g, al->decl->loc,
-                map_type(g, al->ztype), al->ztype, NULL);
-            LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder,
-                LLVMBuildOr(g->builder,
-                    LLVMBuildPtrToInt(g->builder, cell, i64, "fl.box.i"),
-                    LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "fl.box.tag"),
-                i8ptr, "fl.box.owner");
-            LLVMBuildStore(g->builder, tagged,
-                LLVMBuildStructGEP2(g->builder, frame_type, rframe,
-                    (unsigned)al->frame_index, "fl.box.slot"));
-        }
         LLVMBuildRet(g->builder, raw);
 
         /* ---- resume ---- */
@@ -345,6 +331,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         int slot_total = total_params + alocal_count;
         zan_async_slot_t *slots = (zan_async_slot_t *)zan_arena_alloc(g->arena,
             sizeof(zan_async_slot_t) * (size_t)(slot_total > 0 ? slot_total : 1));
+        memset(slots, 0, sizeof(*slots) * (size_t)(slot_total > 0 ? slot_total : 1));
         int si = 0;
         LLVMValueRef res_this = NULL;
         if (!is_static) {
@@ -406,6 +393,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                 lv->box_cell = cell;
                 lv->box_owner_slot = la;
                 lv->box_owned = 1;
+                slots[si].box_payload = lv->alloca;
+                slots[si].box_cell = cell;
             } else if (!w->alocals[k].no_arc &&
                        is_rc_managed_type(w->alocals[k].ztype) &&
                        LLVMGetTypeKind(w->alocals[k].llvm) == LLVMPointerTypeKind) {

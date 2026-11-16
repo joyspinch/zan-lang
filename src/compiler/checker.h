@@ -7,6 +7,7 @@
 #include "binder.h"
 
 struct checker_local;
+struct checker_byref_parameter;
 
 struct zan_checker {
     zan_binder_t *binder;
@@ -17,6 +18,9 @@ struct zan_checker {
     zan_symbol_t *current_type_sym;
     bool in_ctor;
     struct checker_local *locals;
+    /* ref/out bindings retain their lexical slot identity across lambdas. */
+    struct checker_byref_parameter *byref_parameters;
+    int lambda_depth;
     zan_ast_node_t *last_call_node;
     zan_symbol_t *last_call_method;
     /* [Table] 实体名清单：SyncStructureAll(Async) 零参调用点合成

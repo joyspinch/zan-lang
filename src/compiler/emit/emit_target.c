@@ -81,6 +81,10 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                         }
                     }
                 }
+                if (is_refl_root && m->kind == AST_CONSTRUCTOR_DECL && !is_cctor)
+                    is_refl_root = refl_ctor_needs_thunk(g);
+                if (is_refl_root && m->kind == AST_METHOD_DECL)
+                    is_refl_root = refl_method_needs_thunk(g, owner, m);
                 bool has_attrs = (m->meta && m->meta->attributes.count > 0);
                 if (is_entry || is_cctor || is_lib_export || is_refl_root || has_attrs) {
                     live[w] = 1;
@@ -179,6 +183,16 @@ done:
     int pending;
     do {
         pending = 0;
+        bool ctor_used_before = g->refl_ctor_used;
+        int metas_before = g->refl_meta_count;
+        int mtabs_before = g->refl_mtab_count;
+        int sites_before = g->leak_site_count;
+        /* Warm metadata and demanded ctor thunks before rooting bodies. Their
+         * implicit field initializers can discover further reflected types and
+         * callable dependencies; no dead-body stubs or site tables exist yet. */
+        refl_reserve_thunk_sites(g);
+        emit_pending_method_specs(g);
+        if (zan_diag_has_errors(g->diag)) break;
         for (int w = 0; w < work_count; w++) {
             if (live[w]) continue;
             zan_ast_node_t *member = work[w].member;
@@ -212,6 +226,16 @@ done:
                         }
                     }
                 }
+            /* Body roots share the callable predicates with thunk generation.
+             * Constructor query metadata alone must not retain instance bodies;
+             * cctors keep the existing initialization policy. */
+            if (is_refl_root && member->kind == AST_METHOD_DECL) {
+                is_refl_root = refl_method_needs_thunk(g, work[w].type_sym, member);
+            }
+            if (is_refl_root && member->kind == AST_CONSTRUCTOR_DECL &&
+                !(member->method_decl.modifiers & MOD_STATIC)) {
+                is_refl_root = refl_ctor_needs_thunk(g);
+            }
             bool root = (g->emit_lib &&
                          ((member->method_decl.modifiers & MOD_PUBLIC) ||
                           member->kind == AST_CONSTRUCTOR_DECL)) ||
@@ -228,6 +252,15 @@ done:
             emit_user_method_bodies(g, work, work_count, live);
             emit_pending_method_specs(g);
             if (zan_diag_has_errors(g->diag)) break;
+        }
+        /* Specializations can emit CreateInstance or discover metadata after
+         * the prewarm, even if no ordinary method body became live. Iterate
+         * again before replacing declarations by dead stubs in that case. */
+        if (ctor_used_before != g->refl_ctor_used ||
+            metas_before != g->refl_meta_count ||
+            mtabs_before != g->refl_mtab_count ||
+            sites_before != g->leak_site_count) {
+            pending++;
         }
     } while (pending);
     free(work_ix.slots);

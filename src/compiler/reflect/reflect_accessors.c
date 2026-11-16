@@ -369,9 +369,8 @@ static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, prop);
     LLVMValueRef psv = LLVMBuildIntToPtr(g->builder, pv, i8ptr, "refl.psv");
-    /* A present string property preserves null; only a missing/non-string
-     * member uses the empty-string fallback below. Retain accepts null. */
-    zan_call2(g->builder, arc_ty, g->rt_str_retain, &psv, 1, "");
+    /* Getter thunks transfer the getter's owned result, including null.
+     * Only the borrowed field load below needs a retain. */
     LLVMBuildRet(g->builder, psv);
 
     LLVMPositionBuilderAtEnd(g->builder, notprop);
@@ -458,16 +457,8 @@ static LLVMValueRef refl_get_obj_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, prop);
     LLVMValueRef ppv = LLVMBuildIntToPtr(g->builder, pv, i8ptr, "refl.ppv");
-    LLVMBasicBlockRef prop_ret = LLVMAppendBasicBlockInContext(g->ctx, fn, "prop.ret");
-    LLVMBasicBlockRef prop_retain = LLVMAppendBasicBlockInContext(g->ctx, fn, "prop.retain");
-    LLVMBuildCondBr(g->builder, LLVMBuildIsNull(g->builder, ppv, "refl.pnull"),
-                    prop_ret, prop_retain);
-
-    LLVMPositionBuilderAtEnd(g->builder, prop_retain);
-    zan_call2(g->builder, arc_ty, g->rt_retain, &ppv, 1, "");
-    LLVMBuildBr(g->builder, prop_ret);
-
-    LLVMPositionBuilderAtEnd(g->builder, prop_ret);
+    /* Getter thunks transfer an owned result; retaining here would add a
+     * second reference that the caller cannot consume. */
     LLVMBuildRet(g->builder, ppv);
 
     LLVMPositionBuilderAtEnd(g->builder, notprop);

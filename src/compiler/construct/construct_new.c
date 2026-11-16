@@ -754,14 +754,14 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
                     zan_ast_list_t ctor_arg_list = expr->new_expr.args;
                     ctor_arg_list.count = init_start;
-                    struct zan_ctor_entry *ctor = find_ctor(
-                        g, sym, &ctor_arg_list, locals, NULL);
+                    struct zan_ctor_entry *ctor = find_ctor_inst(
+                        g, sym, new_inst, &ctor_arg_list, locals, NULL);
                     if (!ctor) {
                         zan_ast_list_t filled;
                         if (fill_ctor_default_args(g, sym, &ctor_arg_list,
                                                    &filled)) {
-                            struct zan_ctor_entry *dc = find_ctor(
-                                g, sym, &filled, locals, NULL);
+                            struct zan_ctor_entry *dc = find_ctor_inst(
+                                g, sym, new_inst, &filled, locals, NULL);
                             if (dc) {
                                 ctor = dc;
                                 ctor_arg_list = filled;
@@ -1017,11 +1017,16 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                             }
                             if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
                                 zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
+                                zan_type_t *field_type = field_store_type(
+                                    g, fsym, new_inst ? new_inst : sym->type);
                                 zan_symbol_t *setter = property_setter_sym(g, fsym);
                                 if (setter) {
+                                    LLVMValueRef value = field_type && field_type->kind == TYPE_DELEGATE
+                                        ? emit_arg_typed(g, arg->binary.right, field_type, locals)
+                                        : emit_expr(g, arg->binary.right, locals);
                                     emit_property_setter_call(g, setter,
                                         new_inst ? new_inst : sym->type,
-                                        alloca, emit_expr(g, arg->binary.right, locals),
+                                        alloca, value,
                                         arg->binary.left, arg->binary.right, locals);
                                     continue;
                                 }
@@ -1039,9 +1044,8 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                     }
                                     if (!fval)
                                         fval =
-                                        (fsym && fsym->type && fsym->type->kind == TYPE_DELEGATE &&
-                                         arg->binary.right->kind == AST_LAMBDA)
-                                            ? emit_lambda_typed(g, arg->binary.right, fsym->type, locals)
+                                        (field_type && field_type->kind == TYPE_DELEGATE)
+                                            ? emit_arg_typed(g, arg->binary.right, field_type, locals)
                                             : emit_expr(g, arg->binary.right, locals);
                                     if (fsym && fsym->type) {
                                         LLVMTypeRef target_t = map_type(g, fsym->type);

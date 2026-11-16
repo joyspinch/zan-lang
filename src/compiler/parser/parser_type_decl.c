@@ -399,6 +399,7 @@ static void iter_fix_expr(zan_ast_node_t *e, iter_ctx *c) {
             e->member.object = obj;
             e->member.name = nm;
             e->member.null_cond = 0;
+            e->member.method_group_target = NULL;
         }
         return;
     case AST_BINARY:

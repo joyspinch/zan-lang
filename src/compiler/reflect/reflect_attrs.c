@@ -613,7 +613,8 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
                 }
             }
             for (int i = 0; i < g->refl_mtab_count; i++) {
-                if (!g->refl_mtabs[i].ctors || g->refl_mtabs[i].site >= 0) continue;
+                if (!refl_ctor_needs_thunk(g) || !g->refl_mtabs[i].ctors ||
+                    g->refl_mtabs[i].site >= 0) continue;
                 zan_symbol_t *sym = g->refl_mtabs[i].sym;
                 if (!sym || !sym->type || sym->type->kind != TYPE_CLASS) continue;
                 g->refl_mtabs[i].site = reserve_arc_site(g, sym, sym->type, 0, NULL);
@@ -624,9 +625,18 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
             int ctor_end = g->refl_mtab_count;
             while (ctor_cursor < ctor_end) {
                 int i = ctor_cursor++;
-                if (!g->refl_mtabs[i].ctors) continue;
-                LLVMValueRef init = refl_mtab_init(g, g->refl_mtabs[i].sym,
-                    true, g->refl_mtabs[i].n, true);
+                if (!refl_ctor_needs_thunk(g) || !g->refl_mtabs[i].ctors ||
+                    g->refl_mtabs[i].ctor_ready) continue;
+                g->refl_mtabs[i].ctor_ready = true;
+                LLVMValueRef init;
+                if (g->refl_mtabs[i].list_type) {
+                    LLVMValueRef rec = refl_builtin_list_ctor_record(g,
+                        g->refl_mtabs[i].list_type, true);
+                    init = LLVMConstArray(refl_method_type(g), &rec, 1);
+                } else {
+                    init = refl_mtab_init(g, g->refl_mtabs[i].sym,
+                        true, g->refl_mtabs[i].n, true);
+                }
                 if (init) LLVMSetInitializer(g->refl_mtabs[i].gv, init);
             }
         } while (sites != g->leak_site_count || metas != g->refl_meta_count ||

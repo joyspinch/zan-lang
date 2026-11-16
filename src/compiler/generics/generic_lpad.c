@@ -12,8 +12,16 @@ int expr_yields_delegate_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
     if (e->kind == AST_LAMBDA) return !irgen_is_tree_lambda(g, e);
+    zan_type_t *target = zan_binder_method_group_target(e);
+    if (target) {
+        zan_symbol_t *selected = resolve_method_group_conversion(g, e, target, locals, NULL);
+        return selected && (target_is_wasm32(g) || !(selected->modifiers & MOD_STATIC));
+    }
     if (e->kind != AST_MEMBER_ACCESS) return 0;
     zan_symbol_t *cls = expr_class_sym(g, e->member.object, locals);
+    /* A real field/property shadows an inherited method. Its loaded delegate
+     * is borrowed, not a fresh method-group closure for call cleanup to own. */
+    if (cls && get_field_sym(cls, e->member.name)) return 0;
     zan_symbol_t *ms = cls ? get_method_sym(cls, e->member.name) : NULL;
     return ms && ms->decl && ms->decl->kind == AST_METHOD_DECL &&
            (ms->decl->method_decl.modifiers & MOD_STATIC) == 0;
@@ -293,9 +301,42 @@ static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
  * 委托值不能拿 at（实参的推断类型）当前提：裸 lambda 没有自然类型，推断
  * 出来是空的，所以正常路径才改用 expr_yields_delegate_value 认它。这里跟
  * 正常路径同源判定，两边一致，异常路径才不会漏。 */
+void note_emitted_arg_owner(zan_irgen_t *g, zan_ast_node_t *expr,
+                            LLVMValueRef value, zan_type_t *type,
+                            local_scope_t *locals) {
+    if (!locals || !expr || !value || !type) return;
+    emitted_arg_owner_t *owner = (emitted_arg_owner_t *)zan_arena_alloc(
+        locals->arena, sizeof(*owner));
+    owner->expr = expr;
+    owner->value = value;
+    owner->function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    owner->type = type;
+    owner->next = locals->arg_owners;
+    locals->arg_owners = owner;
+}
+void note_emitted_delegate_owner(zan_irgen_t *g, zan_ast_node_t *expr,
+                                 LLVMValueRef value, zan_type_t *type,
+                                 local_scope_t *locals) {
+    if (!type || type->kind != TYPE_DELEGATE ||
+        !expr_yields_owned_rc_value(g, expr, locals) ||
+        infer_expr_type(g, expr, locals)) return;
+    note_emitted_arg_owner(g, expr, value, type, locals);
+}
+zan_type_t *call_arg_temp_type(zan_irgen_t *g, zan_ast_node_t *arg,
+                               LLVMValueRef value, local_scope_t *locals) {
+    LLVMValueRef function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    for (emitted_arg_owner_t *owner = locals ? locals->arg_owners : NULL;
+         owner; owner = owner->next) {
+        if (owner->expr == arg && owner->value == value && owner->function == function)
+            return owner->type;
+    }
+    return infer_expr_type(g, arg, locals);
+}
 int call_arg_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                   zan_type_t *at, local_scope_t *locals) {
     if (!arg) return 0;
+    if (type_is_binding(at) && arg->kind != AST_NULL_LITERAL &&
+        !type_is_binding(infer_expr_type(g, arg, locals))) return 1;
     if (irgen_expr_was_boxed(g, arg)) return 1;
     if (expr_is_local_ident(arg, locals)) return 0;
     if (irgen_is_tree_lambda(g, arg)) return 1;
@@ -306,6 +347,12 @@ int call_arg_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *arg,
 void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                          LLVMValueRef val, local_scope_t *locals) {
     if (!arg || !locals || !val) return;
+    zan_type_t *emitted_type = call_arg_temp_type(g, arg, val, locals);
+    if (type_is_binding(emitted_type) &&
+        call_arg_is_owned_temp(g, arg, emitted_type, locals)) {
+        emit_rc_release_for_type(g, emitted_type, val);
+        return;
+    }
     /* A556-1：实参位置发生的隐式装箱——传出去的是 fresh 堆箱临时，
      * 被调方按借用协议不释放参数，调用方在调用后释放。必须先于
      * local-ident 早退（装箱的正是那个局部变量的临时箱）。 */
@@ -332,9 +379,9 @@ void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
         emit_closure_release(g, val);
         return;
     }
-    zan_type_t *t = infer_expr_type(g, arg, locals);
+    zan_type_t *t = call_arg_temp_type(g, arg, val, locals);
     if (!t || !is_rc_managed_type(t)) return;
-    if (!expr_yields_owned_rc_value(g, arg, locals)) return;
+    if (!call_arg_is_owned_temp(g, arg, t, locals)) return;
     emit_rc_release_for_type(g, t, val);
 }
 int call_consumes_free_arg(LLVMValueRef callee) {
@@ -385,9 +432,15 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g,
         emit_eh_tmp_push_slot(g, fn_ptr, ZAN_EH_SLOT_DLG);
         eh_pushed = 1;
     }
+    int n_eh_args = 0;
     for (int k = 0; k < argc; k++) {
-        call_args[k] = emit_expr(
-            g, call->call.args.items[k], locals);
+        call_args[k] = emit_arg_typed(g, call->call.args.items[k],
+            k < pc ? dt->delegate_param_types[k] : NULL, locals);
+        /* Protect owners before later arguments or the callback can throw. */
+        if (!g->current_fn_no_runtime) {
+            n_eh_args += emit_call_arg_eh_push(g,
+                call->call.args.items[k], call_args[k], locals);
+        }
         if (k < pc) {
             call_args[k] = coerce_struct_value_arg(
                 g, call_args[k], param_types[k]);
@@ -399,6 +452,7 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g,
         LLVMGetTypeKind(ret) == LLVMVoidTypeKind ? "" : "dlgcall";
     LLVMValueRef result = emit_delegate_invoke(
         g, fn_ptr, fn_type, ret, call_args, argc, name);
+    for (int k = 0; k < n_eh_args; k++) emit_eh_tmp_pop(g);
     for (int k = 0; k < argc; k++) {
         emit_release_owned_call_temp(
             g, call->call.args.items[k], call_args[k], locals);
@@ -597,6 +651,111 @@ void lpad_register_local(zan_irgen_t *g, local_var_t *v) {
     }
 }
 
+typedef struct fn_cleanup_variant {
+    struct fn_cleanup_variant *next;
+    zan_lpad_entry_t landing;
+} fn_cleanup_variant_t;
+
+struct zan_fn_cleanup_state {
+    local_scope_t *locals;
+    LLVMValueRef tmp_mark;
+    fn_cleanup_variant_t *variants;
+    local_var_t *active;
+    int active_cap;
+};
+
+void init_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry,
+                  local_scope_t *locals, LLVMValueRef tmp_mark) {
+    struct zan_fn_cleanup_state *state = zan_arena_alloc(g->arena, sizeof(*state));
+    memset(state, 0, sizeof(*state));
+    state->locals = locals;
+    state->tmp_mark = tmp_mark;
+    entry->fn_cleanup = state;
+}
+
+static bool same_cleanup(const local_var_t *a, const local_var_t *b) {
+    /* Compare fields, not struct padding. Identity alone misses ownership
+     * changes of a slot (object flags, captured cells and ARC transfer). */
+    return a->name.str == b->name.str && a->name.len == b->name.len &&
+        a->alloca == b->alloca && a->type == b->type &&
+        a->arc_owned == b->arc_owned && a->arr_len_slot == b->arr_len_slot &&
+        a->eh_slot == b->eh_slot && a->box_cell == b->box_cell &&
+        a->box_owner_slot == b->box_owner_slot && a->box_owned == b->box_owned &&
+        a->opaque_string == b->opaque_string && a->obj_rc_flag == b->obj_rc_flag &&
+        a->byref_slot == b->byref_slot && a->binding_decl == b->binding_decl &&
+        a->async_decl == b->async_decl && a->async_role == b->async_role &&
+        a->frame_owner == b->frame_owner && a->struct_rc == b->struct_rc &&
+        a->per_iteration == b->per_iteration;
+}
+
+LLVMBasicBlockRef active_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry) {
+    struct zan_fn_cleanup_state *state = entry->fn_cleanup;
+    if (!state) return entry->lpad_bb;
+    int count = 0;
+    local_scope_t *locals = state->locals;
+    if (g->active_cleanup_fn == entry->fn && g->active_cleanup_locals)
+        locals = g->active_cleanup_locals;
+    state->active = irgen_grow(state->active, &state->active_cap,
+                               locals->count, sizeof(*state->active));
+    /* The ledger includes exited sibling scopes. Only slots still present in
+     * this function's lexical locals belong to this invoke. Preserve ledger
+     * order and full cleanup metadata, including safe null-initialized slots. */
+    for (int i = 0; i < entry->cleanup_count; i++) {
+        for (int j = 0; j < locals->count; j++) {
+            if (entry->cleanups[i].alloca == locals->vars[j].alloca) {
+                state->active[count++] = entry->cleanups[i];
+                break;
+            }
+        }
+    }
+    for (fn_cleanup_variant_t *v = state->variants; v; v = v->next) {
+        if (v->landing.cleanup_count != count) continue;
+        int i = 0;
+        while (i < count && same_cleanup(&v->landing.cleanups[i], &state->active[i])) i++;
+        if (i == count) return v->landing.lpad_bb;
+    }
+    fn_cleanup_variant_t *v = zan_arena_alloc(g->arena, sizeof(*v));
+    memset(v, 0, sizeof(*v));
+    v->landing.fn = entry->fn;
+    v->landing.lpad_bb = LLVMAppendBasicBlockInContext(g->ctx, entry->fn, "fn.lpad.active");
+    v->landing.cleanup_count = count;
+    if (count) {
+        size_t bytes = sizeof(*state->active) * (size_t)count;
+        v->landing.cleanups = zan_arena_alloc(g->arena, bytes);
+        memcpy(v->landing.cleanups, state->active, bytes);
+    }
+    v->next = state->variants;
+    state->variants = v;
+    return v->landing.lpad_bb;
+}
+
+void finish_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry) {
+    struct zan_fn_cleanup_state *state = entry->fn_cleanup;
+    zan_builder_point_t pt = zan_builder_save(g);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef lp_type = LLVMStructTypeInContext(g->ctx,
+        (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
+    for (fn_cleanup_variant_t *v = state->variants; v; v = v->next) {
+        LLVMPositionBuilderAtEnd(g->builder, v->landing.lpad_bb);
+        ensure_function_personality(g, entry->fn);
+        LLVMValueRef lp = LLVMBuildLandingPad(g->builder, lp_type,
+            get_eh_personality_fn(g), 0, "fn.lp");
+        LLVMSetCleanup(lp, 1);
+        LLVMValueRef mark = LLVMBuildLoad2(g->builder, i32t, state->tmp_mark, "fn.tmp.mark.val");
+        emit_eh_tmp_unwind_to(g, mark);
+        emit_lpad_cleanups(g, &v->landing);
+        LLVMBuildResume(g->builder, lp);
+    }
+    LLVMDeleteBasicBlock(entry->lpad_bb);
+    zan_builder_restore(g, pt);
+    free(state->active);
+    free(entry->cleanups);
+    entry->cleanups = NULL;
+    entry->cleanup_count = entry->cleanup_cap = 0;
+    entry->fn_cleanup = NULL;
+}
+
 void emit_lpad_cleanups(zan_irgen_t *g, zan_lpad_entry_t *entry) {
     if (!g || !entry || !entry->cleanups) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -670,12 +829,24 @@ void emit_release_owned_locals_no_pop(zan_irgen_t *g, local_scope_t *locals) {
         }
     }
 }
+static bool release_async_alias(zan_irgen_t *g, local_scope_t *locals, int index) {
+    local_var_t *alias = &locals->vars[index];
+    if (!g->current_async_frame || alias->frame_owner < 0 ||
+        alias->frame_owner >= locals->count) return false;
+    local_var_t *owner = &locals->vars[alias->frame_owner];
+    zan_lpad_entry_t cleanup = { .cleanups = owner, .cleanup_count = 1 };
+    emit_lpad_cleanups(g, &cleanup);
+    return true;
+}
+
 void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *locals, int start) {
     if (!locals) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = locals->count - 1; i >= start; i--) {
         pop_eh_slot(g, &locals->vars[i]);
-        if (locals->vars[i].obj_rc_flag) {
+        if (release_async_alias(g, locals, i)) {
+            continue;
+        } else if (locals->vars[i].obj_rc_flag) {
             emit_release_obj_local(g, &locals->vars[i]);
         } else if (locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
@@ -737,7 +908,9 @@ void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals, int s
         LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)) != NULL;
     for (int i = locals->count - 1; i >= start; i--) {
         if (!terminated) pop_eh_slot(g, &locals->vars[i]);
-        if (!terminated && locals->vars[i].obj_rc_flag) {
+        if (!terminated && release_async_alias(g, locals, i)) {
+            continue;
+        } else if (!terminated && locals->vars[i].obj_rc_flag) {
             emit_release_obj_local(g, &locals->vars[i]);
         } else if (!terminated && locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);

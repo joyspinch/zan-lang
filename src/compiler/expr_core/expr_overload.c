@@ -113,7 +113,8 @@ static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
     }
     if (a->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = a->member.object;
-    if (!obj || (obj->kind != AST_IDENTIFIER && obj->kind != AST_THIS_EXPR))
+    if (!obj || (obj->kind != AST_IDENTIFIER && obj->kind != AST_THIS_EXPR &&
+                 obj->kind != AST_MEMBER_ACCESS && obj->kind != AST_CALL))
         return NULL;
     /* Instance method groups participate in the same signature scoring as
      * static groups. Treating a local or this receiver as an unknown value
@@ -122,11 +123,19 @@ static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
     zan_symbol_t *cs = NULL;
     if (obj->kind == AST_THIS_EXPR) {
         cs = g->current_type_sym;
-    } else {
-        local_var_t *receiver = locals ? local_find(locals, obj->ident.name) : NULL;
+    } else if (obj->kind == AST_IDENTIFIER) {
+        local_var_t *receiver = receiver_local(obj, locals);
         zan_type_t *receiver_type = receiver ? receiver->type : NULL;
         cs = receiver ? (receiver_type ? receiver_type->sym : NULL)
-            : zan_binder_lookup(g->binder, obj->ident.name);
+            : receiver_type_symbol(g, obj, locals);
+        /* A bare host field/property is a value receiver too. An existing
+         * local, including one whose type is unknown, must still shadow it. */
+        if (!receiver && !cs) cs = expr_class_sym(g, obj, locals);
+    } else {
+        /* Resolve nested fields by their expression type, including closed
+         * generic field types. The final field guard below must still win
+         * over an inherited same-name method for delegate-valued members. */
+        cs = locals ? expr_class_sym(g, obj, locals) : NULL;
     }
     if (!cs || (cs->kind != SYM_CLASS && cs->kind != SYM_STRUCT)) return NULL;
     if (get_field_sym(cs, a->member.name)) return NULL;
@@ -137,39 +146,44 @@ static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
     return m;
 }
 
-static int method_group_score(zan_irgen_t *g, zan_symbol_t *mg, zan_type_t *pt) {
-    if (!pt || pt->kind != TYPE_DELEGATE) return -1;
-    if (mg->decl->method_decl.params.count != pt->delegate_param_count) return -1;
-    /* 委托形参族必须与方法形参族一致：不查这一层，`OnFocus(Control)`
-     * 会在 Action<string> 与 ControlEvent 之间打出平分，第一个声明
-     * 的错重载照样赢（B-ID48）。 */
-    for (int i = 0; i < pt->delegate_param_count; i++) {
-        zan_type_t *dpt = pt->delegate_param_types[i];
-        zan_ast_node_t *pn = mg->decl->method_decl.params.items[i];
-        zan_type_t *mpt = (pn && pn->kind == AST_PARAM && pn->param.type)
-            ? zan_binder_resolve_type(g->binder, pn->param.type) : NULL;
-        if (!dpt || !mpt) return -1;
-        if (!type_mentions_tp(dpt) && !type_mentions_tp(mpt) &&
-            type_family(dpt) != type_family(mpt))
-            return -1;
+/* Resolve afresh for every emission: AST bodies are shared by generic
+ * instances, so a method selected for one target must never be cached. */
+zan_symbol_t *resolve_method_group_conversion(zan_irgen_t *g,
+        zan_ast_node_t *expr, zan_type_t *target, local_scope_t *locals,
+        zan_type_t **receiver_type) {
+    if (receiver_type) *receiver_type = NULL;
+    zan_symbol_t *group = arg_method_group(g, expr, locals, -1);
+    if (!group || !target || target->kind != TYPE_DELEGATE) return NULL;
+    zan_type_t *receiver = NULL;
+    zan_method_group_receiver_t form = ZAN_METHOD_GROUP_VALUE;
+    if (expr->kind == AST_IDENTIFIER) {
+        receiver = g->cur_inst ? g->cur_inst
+            : (g->current_type_sym ? g->current_type_sym->type : NULL);
+        form = g->current_this ? ZAN_METHOD_GROUP_IMPLICIT : ZAN_METHOD_GROUP_TYPE;
+    } else {
+        zan_ast_node_t *obj = expr->member.object;
+        zan_symbol_t *type = receiver_type_symbol(g, obj, locals);
+        if (type && (type->kind == SYM_CLASS || type->kind == SYM_STRUCT ||
+                     type->kind == SYM_INTERFACE)) {
+            receiver = ident_inst_type(g, obj);
+            if (!receiver) receiver = infer_expr_type(g, obj, locals);
+            if (!receiver || receiver->sym != type) receiver = type->type;
+            form = ZAN_METHOD_GROUP_TYPE;
+        } else if (obj->kind == AST_THIS_EXPR && g->cur_inst) {
+            receiver = g->cur_inst;
+        } else {
+            receiver = infer_expr_type(g, obj, locals);
+        }
     }
-    int score = 2;
-    zan_type_t *rt = mg->decl->method_decl.return_type
-        ? zan_binder_resolve_type(g->binder, mg->decl->method_decl.return_type)
-        : NULL;
-    zan_type_t *dr = pt->delegate_ret_type;
-    if (rt && dr && !type_mentions_tp(rt) && !type_mentions_tp(dr)) {
-        if (types_concrete_equal(rt, dr)) score += 2;
-        else if (type_family(rt) != type_family(dr) &&
-                 type_family(rt) != FAM_UNKNOWN &&
-                 type_family(dr) != FAM_UNKNOWN)
-            return -1;
-    } else if (rt && !dr) {
-        /* 委托无返回类型槽而方法是 void：视作 void==void 贴合（Action
-         * 系委托 dr 为空时的等价判定） */
-        if (rt->kind == TYPE_VOID) score += 2;
-    }
-    return score;
+    if (receiver_type) *receiver_type = receiver;
+    if (g->cur_inst) target = subst_delegate_sig(g, target, g->cur_inst);
+    return zan_binder_method_group(g->binder, receiver, group->name, form,
+                                   target, NULL);
+}
+
+static int method_group_score(zan_irgen_t *g, zan_ast_node_t *expr,
+                              zan_type_t *target, local_scope_t *locals) {
+    return resolve_method_group_conversion(g, expr, target, locals, NULL) ? 4 : -1;
 }
 
 struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
@@ -179,6 +193,8 @@ bool implicit_ctor_for_arg(zan_irgen_t *g, zan_type_t *target,
                                   zan_type_t *source, zan_ast_node_t *arg,
                                   local_scope_t *locals);
 bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface);
+static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
+                              zan_ast_node_t *a, local_scope_t *locals);
 bool class_derives_from(zan_symbol_t *derived, zan_symbol_t *base) {
     if (!derived || !base) return false;
     for (zan_symbol_t *cur = derived; cur && cur->type && cur->type->base_type;
@@ -198,6 +214,12 @@ bool has_declared_ctor(zan_irgen_t *g, zan_symbol_t *sym) {
 struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                                         zan_ast_list_t *args, local_scope_t *locals,
                                         zan_ast_node_t *exclude) {
+    return find_ctor_inst(g, type_sym, NULL, args, locals, exclude);
+}
+
+struct zan_ctor_entry *find_ctor_inst(zan_irgen_t *g, zan_symbol_t *type_sym,
+        zan_type_t *owner, zan_ast_list_t *args, local_scope_t *locals,
+        zan_ast_node_t *exclude) {
     struct zan_ctor_entry *best = NULL;
     int best_score = -1;
     int argc = args ? args->count : 0;
@@ -235,12 +257,28 @@ struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                     arg = arg->named_arg.expr;
                     zan_type_t *nt = zan_binder_resolve_type(g->binder,
                         entry->decl->method_decl.params.items[target]->param.type);
+                    nt = subst_delegate_sig(g, nt, owner);
+                    if (arg_method_group(g, arg, locals, -1)) {
+                        int ms = method_group_score(g, arg, nt, locals);
+                        if (ms < 0) { compatible = false; break; }
+                        score += ms;
+                        continue;
+                    }
                     zan_type_t *nat = infer_expr_type(g, arg, locals);
+                    if (type_is_binding(nt) && !type_is_binding(nat)) {
+                        int bs = concrete_arg_score(g, nt, arg, locals);
+                        if (bs < 0) { compatible = false; break; }
+                        score += bs;
+                        continue;
+                    }
                     if (nt && nat && types_concrete_equal(nt, nat)) score += 4;
                     continue;
                 }
                 zan_ast_node_t *param = entry->decl->method_decl.params.items[j];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
+                /* Close delegate targets before candidate scoring, just as
+                 * construct_new closes them before typed argument emission. */
+                pt = subst_delegate_sig(g, pt, owner);
                 if (pt && args->items[j] && args->items[j]->kind == AST_LAMBDA) {
                     zan_ast_node_t *lam = args->items[j];
                     if (pt->kind != TYPE_DELEGATE ||
@@ -260,12 +298,18 @@ struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                     (pt && pt->kind == TYPE_DELEGATE)
                         ? pt->delegate_param_count : -1);
                 if (mg) {
-                    int ms = method_group_score(g, mg, pt);
+                    int ms = method_group_score(g, args->items[j], pt, locals);
                     if (ms < 0) { compatible = false; break; }
                     score += ms;
                     continue;
                 }
                 zan_type_t *at = infer_expr_type(g, args->items[j], locals);
+                if (type_is_binding(pt) && !type_is_binding(at)) {
+                    int bs = concrete_arg_score(g, pt, args->items[j], locals);
+                    if (bs < 0) { compatible = false; break; }
+                    score += bs;
+                    continue;
+                }
                 if (pt && at && type_mentions_tp(pt) && !type_mentions_tp(at)) {
                     if (types_match_modulo_tp(pt, at)) score += 3;
                     continue;
@@ -446,6 +490,13 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
         return ns < 0 ? -1 : ns;
     }
     zan_type_t *at = infer_expr_type(g, a, locals);
+    /* Binding<T> has the same value conversion as assignment. Exact T and
+     * Binding<T> overloads still outrank the synthesized binding candidate. */
+    if (type_is_binding(pt) && pt->type_arg_count == 1 &&
+        pt->type_args[0] && !type_is_binding(at)) {
+        int inner = concrete_arg_score(g, pt->type_args[0], a, locals);
+        return inner < 0 ? -1 : inner > 0 ? 1 : 0;
+    }
     if (at && !type_mentions_tp(at)) {
         if (types_concrete_equal(pt, at)) return 4;
         int pf = type_family(pt), af = type_family(at);
@@ -580,7 +631,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             g, a, locals,
             (dp0 && dp0->kind == TYPE_DELEGATE) ? dp0->delegate_param_count : -1);
         if (mg) {
-            int ms = method_group_score(g, mg, dp0);
+            int ms = method_group_score(g, a, dp0, locals);
             if (ms < 0) return -1;
             score += ms;
             continue;

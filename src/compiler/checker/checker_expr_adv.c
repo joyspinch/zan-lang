@@ -266,6 +266,8 @@
              * 闭包会捕获它们），lambda 自己的形参与局部加在前面遮住同名；
              * 出 lambda 时把链头还原，外层的作用域原样留着。 */
             struct checker_local *saved_locals = c->locals;
+            struct checker_byref_parameter *saved_byref = c->byref_parameters;
+            c->lambda_depth++;
             zan_type_t *saved_ret = c->current_return_type;
             c->current_return_type = NULL;
             zan_ast_node_t *saved_body = c->current_body;
@@ -285,6 +287,7 @@
                      * 后续检查安静降级（`checker_check_assignable` 见到
                      * error 就直接返回）。 */
                     checker_add_local_permissive(c, p->param.name, pt);
+                    checker_bind_byref_parameter(c, p);
                 }
             }
             if (expr->lambda.body) {
@@ -296,6 +299,8 @@
             c->current_body = saved_body;
             c->current_return_type = saved_ret;
             c->locals = saved_locals;
+            c->byref_parameters = saved_byref;
+            c->lambda_depth--;
         }
         return c->binder->type_error;
 
@@ -542,6 +547,11 @@
         zan_type_t *src = zan_checker_check_expr(c, expr->cast.expr);
         c->in_assignable_ctx = prev_assign;
         if (!dst) return c->binder->type_error;
+        if (dst->kind == TYPE_DELEGATE && expr_method_group(c, expr->cast.expr)) {
+            checker_check_assignable(c, dst, src, expr->cast.expr,
+                                     expr->loc, "cast");
+            return dst;
+        }
         if (!checker_cast_is_valid(c, dst, src)) {
             if (dst->kind == TYPE_OBJECT && !checker_type_is_ref(src))
                 zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2070,

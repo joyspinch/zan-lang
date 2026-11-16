@@ -1,10 +1,30 @@
 #include "irgen_internal.h"
+static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+
 LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
+    void *saved_locals = g->active_cleanup_locals;
+    LLVMValueRef saved_fn = g->active_cleanup_fn;
+    if (locals) {
+        g->active_cleanup_locals = locals;
+        LLVMBasicBlockRef bb = LLVMGetInsertBlock(g->builder);
+        g->active_cleanup_fn = bb ? LLVMGetBasicBlockParent(bb) : NULL;
+    }
+    LLVMValueRef value = emit_expr_impl(g, expr, locals);
+    g->active_cleanup_locals = saved_locals;
+    g->active_cleanup_fn = saved_fn;
+    return value;
+}
+
+static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     if (locals) g->current_locals = locals;
     if (g->emit_debug && expr->loc.line > 0) {
         di_set_loc(g, expr->loc);
     }
+
+    zan_type_t *method_group_target = zan_binder_method_group_target(expr);
+    if (method_group_target)
+        return emit_method_group_conversion(g, expr, method_group_target, locals);
 
     if (expr->kind == AST_REF_ARG) {
         return emit_ref_arg(g, expr, locals); }

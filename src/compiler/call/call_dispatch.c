@@ -80,7 +80,7 @@
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
             if (callee->member.object->kind == AST_IDENTIFIER) {
-                local_var_t *local = local_find(locals, callee->member.object->ident.name);
+                local_var_t *local = receiver_local(callee->member.object, locals);
                 if (local && local->type && local->type->sym) {
                     zan_symbol_t *type_sym = local->type->sym;
                     zan_symbol_t *method_sym = resolve_overload_typed(g, type_sym, callee->member.name, expr, locals);
@@ -200,10 +200,8 @@
                     }
                 }
 
-                zan_symbol_t *type_sym = NULL;
-                if (!ident_names_own_field(g, callee->member.object))
-                    type_sym = zan_binder_lookup(g->binder,
-                        callee->member.object->ident.name);
+                zan_symbol_t *type_sym = receiver_type_symbol(
+                    g, callee->member.object, locals);
                 if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
                     zan_symbol_t *method_sym = resolve_overload_typed(g, type_sym, callee->member.name, expr, locals);
                     if (method_sym) fill_default_args(g, expr, method_sym);

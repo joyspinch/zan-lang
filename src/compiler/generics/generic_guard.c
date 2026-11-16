@@ -348,7 +348,7 @@ void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg) {
 /* B-ID180：浮点→整型全通道 poison 收口（cast / 三元统一 / Convert 族，
  * 自举孪生三处同口径）。LLVM fptosi 对溢出值产生 poison：x86 得 0x8000…、
  * ARM64 饱和、WASM trap——三平台三种结果且优化器可任意利用，违反
- * SECURITY.md §1「无 UB」承诺（探针 _scratch/bid180_probe：越界值打印
+ * 本仓「无 UB」承诺（探针 _scratch/bid180_probe：越界值打印
  * 出 -0 垃圾、try 内毫无异常分发）。发射序：
  *   ① 范围谓词 [-2^63, 2^63)：NaN 两个比较全 false 自动落网；
  *   ② emit_runtime_check —— try 内抛 OverflowException（消息含

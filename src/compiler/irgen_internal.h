@@ -152,7 +152,17 @@ typedef struct {
     pattern_binding_t *patterns;
     int pattern_count;
     int pattern_cap;
+    /* Owned argument emissions, keyed by expression, SSA value and function. */
+    struct emitted_arg_owner *arg_owners;
 } local_scope_t;
+
+typedef struct emitted_arg_owner {
+    struct emitted_arg_owner *next;
+    zan_ast_node_t *expr;
+    LLVMValueRef value;
+    LLVMValueRef function;
+    zan_type_t *type;
+} emitted_arg_owner_t;
 
 enum {
     ASYNC_LOCAL_VALUE = 0,
@@ -230,6 +240,9 @@ extern zan_irgen_t *g_di_emit_ctx;
 struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                                  zan_ast_list_t *args, local_scope_t *locals,
                                  zan_ast_node_t *exclude);
+struct zan_ctor_entry *find_ctor_inst(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                      zan_type_t *owner, zan_ast_list_t *args,
+                                      local_scope_t *locals, zan_ast_node_t *exclude);
 struct zan_struct_type_entry *get_struct_entry(zan_irgen_t *g, zan_symbol_t *type_sym);
 
 /* ========================================================================= */
@@ -241,6 +254,11 @@ LLVMValueRef get_eh_personality_fn(zan_irgen_t *g);
 void ensure_function_personality(zan_irgen_t *g, LLVMValueRef fn);
 void emit_raise_exception(zan_irgen_t *g);
 void emit_raise_exception_through_cleanups(zan_irgen_t *g);
+/* 收缩 pass（optimizer.c）的 Zan 函数名注记：irgen 每注册一个 Zan
+ * 函数喂一次 LLVM 名；publish 跨片时这些名字在别的分片模块里只是
+ * declaration，收缩 pass 据此判"可抛"，避免把跨片 Zan 调用误判为
+ * C ABI nothrow 而拆掉必需的 unwind 边。 */
+void zan_opt_note_zan_fn_name(const char *name);
 LLVMValueRef zan_call_or_invoke(zan_irgen_t *g, LLVMBuilderRef b, LLVMTypeRef ty,
                                 LLVMValueRef fn, LLVMValueRef *args, unsigned n,
                                 const char *nm);
@@ -519,6 +537,8 @@ LLVMValueRef emit_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e, local_scope
 LLVMValueRef emit_unresolved_call_result(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 int format_name_path(zan_ast_node_t *n, char *buf, int cap);
 bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e);
+local_var_t *receiver_local(zan_ast_node_t *e, local_scope_t *locals);
+zan_symbol_t *receiver_type_symbol(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms, long long *out_vals, int cap);
 int is_string_like_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 bool lambda_body_has_value_return(zan_ast_node_t *n);
@@ -573,6 +593,10 @@ LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st, zan_ast_node_t *src
 LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+LLVMValueRef emit_expr_conditional_typed(zan_irgen_t *g, zan_ast_node_t *expr, zan_type_t *expected, local_scope_t *locals);
+void note_emitted_arg_owner(zan_irgen_t *g, zan_ast_node_t *expr, LLVMValueRef value, zan_type_t *type, local_scope_t *locals);
+void note_emitted_delegate_owner(zan_irgen_t *g, zan_ast_node_t *expr, LLVMValueRef value, zan_type_t *type, local_scope_t *locals);
+zan_type_t *call_arg_temp_type(zan_irgen_t *g, zan_ast_node_t *arg, LLVMValueRef value, local_scope_t *locals);
 LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 LLVMValueRef emit_expr_query_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
@@ -647,12 +671,18 @@ int body_writes_ident(zan_irgen_t *g, zan_ast_node_t *body, zan_istr_t name);
 void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals, zan_ast_node_t *param, zan_type_t *type, LLVMTypeRef payload, LLVMValueRef value, zan_ast_node_t *body);
 LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell, LLVMTypeRef payload);
 LLVMValueRef build_static_mg_record(zan_irgen_t *g, zan_loc_t loc, const char *lname, LLVMTypeRef rec_ty, LLVMValueRef thunk);
+zan_symbol_t *resolve_method_group_conversion(zan_irgen_t *g, zan_ast_node_t *expr,
+    zan_type_t *target, local_scope_t *locals, zan_type_t **receiver_type);
+LLVMValueRef emit_method_group_conversion(zan_irgen_t *g, zan_ast_node_t *expr,
+    zan_type_t *target, local_scope_t *locals);
 void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e, zan_type_t *dt, local_scope_t *locals);
 LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg, zan_type_t *ptype, local_scope_t *locals);
 LLVMValueRef emit_binding_acc_delegate(zan_irgen_t *g, LLVMValueRef acc, LLVMTypeRef acc_ty);
 LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc, LLVMTypeRef payload, zan_type_t *vtype, LLVMValueRef init);
 LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr, zan_type_t *expected, local_scope_t *locals);
 LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym, LLVMValueRef recv, zan_loc_t loc);
+LLVMValueRef emit_method_group_closure_typed(zan_irgen_t *g, zan_symbol_t *msym,
+    LLVMValueRef recv, zan_type_t *receiver_type, zan_loc_t loc);
 LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg, local_scope_t *locals);
 LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt, local_scope_t *locals);
 void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym, zan_ast_node_t *call, zan_ast_node_t *recv_expr, local_scope_t *locals, zan_type_t **bind);
@@ -739,6 +769,9 @@ void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals, int s
 void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *locals, int start);
 void lpad_register_local(zan_irgen_t *g, local_var_t *v);
 void emit_lpad_cleanups(zan_irgen_t *g, zan_lpad_entry_t *entry);
+void init_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry, local_scope_t *locals, LLVMValueRef tmp_mark);
+LLVMBasicBlockRef active_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry);
+void finish_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry);
 void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc, const char *msg);
 void emit_erased_new_hard_fail(zan_irgen_t *g);
 void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg);
@@ -798,6 +831,9 @@ LLVMValueRef refl_obj_type_fn(zan_irgen_t *g);
 void refl_reserve_thunk_sites(zan_irgen_t *g);
 bool refl_type_needs_site_meta(zan_irgen_t *g, zan_symbol_t *sym);
 bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n);
+bool refl_ctor_needs_thunk(zan_irgen_t *g);
+bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
+                             zan_ast_node_t *decl);
 void zan_irgen_emit_arc_desc_init(zan_irgen_t *g);
 
 

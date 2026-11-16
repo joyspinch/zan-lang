@@ -555,10 +555,10 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                     m->field_decl.initializer, "field initializer");
                 check_value_type_mismatch(g, fs->type, source_type,
                     m->field_decl.initializer, "field initializer");
-                LLVMValueRef v = fs->type && fs->type->kind == TYPE_DELEGATE &&
-                                 m->field_decl.initializer->kind == AST_LAMBDA
-                    ? emit_lambda_typed(g, m->field_decl.initializer,
-                                        fs->type, sf_locals)
+                zan_type_t *field_type = field_store_type(g, fs, insts[ii]);
+                LLVMValueRef v = field_type && field_type->kind == TYPE_DELEGATE
+                    ? emit_arg_typed(g, m->field_decl.initializer,
+                                     field_type, sf_locals)
                     : emit_expr(g, m->field_decl.initializer, sf_locals);
                 if (fs->type && (is_rc_managed_type(fs->type) || fs->type->kind == TYPE_OBJECT)) {
                     emit_rc_store_field(g, fs->type, gv, v, m->field_decl.initializer, sf_locals,

@@ -444,7 +444,10 @@ LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
 
     if (ZAN_TAB_ENSURE(g->string_literals, g->string_literal_count,
                        g->string_literal_cap, 512)) {
-        g->string_literals[g->string_literal_count].text = text;
+        /* Guard messages can come from reusable stack buffers. The cache key
+           must outlive their callers just like the emitted literal does. */
+        g->string_literals[g->string_literal_count].text = (zan_istr_t){
+            zan_arena_strdup(g->arena, text.str, (size_t)text.len), text.len };
         g->string_literals[g->string_literal_count].value = global;
         g->string_literal_count++;
     }

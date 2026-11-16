@@ -1,6 +1,7 @@
 /* builtin_api.c: 编译器内建类型成员表与签名描述定义 */
 
 #include "builtin_api.h"
+#include "binder.h"
 
 #include <string.h>
 
@@ -75,7 +76,17 @@ static const zan_builtin_member_t members_console[] = {
 
 static const zan_builtin_member_t members_math[] = {
     { "Abs",     'M', "double Abs(double value)" },
+    { "Max",     'M', "int Max(int a, int b)" },
+    { "Max",     'M', "long Max(long a, long b)" },
+    { "Max",     'M', "uint Max(uint a, uint b)" },
+    { "Max",     'M', "ulong Max(ulong a, ulong b)" },
+    { "Max",     'M', "nint Max(nint a, nint b)" },
     { "Max",     'M', "double Max(double a, double b)" },
+    { "Min",     'M', "int Min(int a, int b)" },
+    { "Min",     'M', "long Min(long a, long b)" },
+    { "Min",     'M', "uint Min(uint a, uint b)" },
+    { "Min",     'M', "ulong Min(ulong a, ulong b)" },
+    { "Min",     'M', "nint Min(nint a, nint b)" },
     { "Min",     'M', "double Min(double a, double b)" },
     { "Pow",     'M', "double Pow(double x, double y)" },
     { "Sqrt",    'M', "double Sqrt(double value)" },
@@ -478,12 +489,13 @@ int zan_builtin_member_params(const char *type, const char *name, int name_len,
 const char *zan_builtin_member_result(const char *type, const char *name,
                                       int name_len) {
     static const char *results[] = {
-        "string", "int", "long", "double", "bool", "void", "nint", "char",
+        "string", "int", "long", "uint", "ulong", "double", "bool", "void", "nint", "char",
         "List<string>", "List<K>", "List<V>", "ConsoleColor", "T[]",
         "Vector128", "Vector256",
     };
     const zan_builtin_type_t *bt = zan_builtin_find(type);
     if (!bt || !name || name_len <= 0) return NULL;
+    const char *result = NULL;
     for (int i = 0; i < bt->member_count; i++) {
         const char *m = bt->members[i].name;
         if ((int)strlen(m) != name_len || memcmp(m, name, (size_t)name_len) != 0)
@@ -492,13 +504,59 @@ const char *zan_builtin_member_result(const char *type, const char *name,
         const char *sp = strchr(sig, ' ');
         if (!sp) return NULL;
         size_t len = (size_t)(sp - sig);
+        const char *current = NULL;
         for (size_t r = 0; r < sizeof(results) / sizeof(results[0]); r++) {
-            if (strlen(results[r]) == len && memcmp(results[r], sig, len) == 0)
-                return results[r];
+            if (strlen(results[r]) == len && memcmp(results[r], sig, len) == 0) {
+                current = results[r];
+                break;
+            }
         }
-        return NULL;
+        if (!current || (result && result != current)) return NULL;
+        result = current;
     }
-    return NULL;
+    return result;
+}
+
+/* Keep Min/Max's numeric contract local: general arithmetic promotion still
+ * has legacy signed/unsigned shortcuts and must not decide these overloads. */
+static int minmax_arg_numeric(const zan_type_t *type) {
+    if (!type || type->is_nullable) return 0;
+    switch (type->kind) {
+    case TYPE_BYTE: case TYPE_SBYTE: case TYPE_SHORT: case TYPE_USHORT:
+    case TYPE_CHAR: case TYPE_INT: case TYPE_UINT: case TYPE_LONG:
+    case TYPE_ULONG: case TYPE_NINT: case TYPE_FLOAT: case TYPE_DOUBLE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int minmax_arg_signed(zan_type_kind_t kind) {
+    return kind == TYPE_SBYTE || kind == TYPE_SHORT || kind == TYPE_INT ||
+           kind == TYPE_LONG || kind == TYPE_NINT;
+}
+
+const char *zan_builtin_minmax_result(const char *type, const char *name,
+                                     int name_len, const struct zan_type *a,
+                                     const struct zan_type *b) {
+    if (!type || strcmp(type, "Math") != 0 || !name || name_len != 3 ||
+        (memcmp(name, "Min", 3) != 0 && memcmp(name, "Max", 3) != 0))
+        return NULL;
+    if (!minmax_arg_numeric(a) || !minmax_arg_numeric(b)) return NULL;
+    zan_type_kind_t ak = a->kind, bk = b->kind;
+    if (ak == TYPE_FLOAT || ak == TYPE_DOUBLE ||
+        bk == TYPE_FLOAT || bk == TYPE_DOUBLE) return "double";
+    if (ak == TYPE_ULONG || bk == TYPE_ULONG) {
+        if (minmax_arg_signed(ak) || minmax_arg_signed(bk)) return NULL;
+        return "ulong";
+    }
+    if (ak == TYPE_LONG || bk == TYPE_LONG) return "long";
+    if (ak == TYPE_UINT || bk == TYPE_UINT) {
+        if (minmax_arg_signed(ak) || minmax_arg_signed(bk)) return "long";
+        return "uint";
+    }
+    if (ak == TYPE_NINT || bk == TYPE_NINT) return "nint";
+    return "int";
 }
 
 char zan_builtin_member_kind(const char *type, const char *name, int name_len) {

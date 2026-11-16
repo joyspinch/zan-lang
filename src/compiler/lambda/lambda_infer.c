@@ -1,16 +1,26 @@
-bool type_mentions_tp(zan_type_t *t) {
+static bool type_mentions_tp_path(zan_type_t *t, zan_type_t **path, int depth) {
     if (!t) return false;
     if (t->kind == TYPE_TYPE_PARAM) return true;
+    for (int i = 0; i < depth; i++)
+        if (path[i] == t) return false;
+    /* Conservatively keep substitution enabled beyond the traversal budget. */
+    if (depth >= 64) return true;
+    path[depth++] = t;
     if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE)
-        return type_mentions_tp(t->element_type);
+        return type_mentions_tp_path(t->element_type, path, depth);
     if (t->kind == TYPE_DELEGATE) {
-        if (type_mentions_tp(t->delegate_ret_type)) return true;
+        if (type_mentions_tp_path(t->delegate_ret_type, path, depth)) return true;
         for (int i = 0; i < t->delegate_param_count; i++)
-            if (type_mentions_tp(t->delegate_param_types[i])) return true;
+            if (type_mentions_tp_path(t->delegate_param_types[i], path, depth)) return true;
     }
     for (int i = 0; i < t->type_arg_count; i++)
-        if (type_mentions_tp(t->type_args[i])) return true;
+        if (type_mentions_tp_path(t->type_args[i], path, depth)) return true;
     return false;
+}
+
+bool type_mentions_tp(zan_type_t *t) {
+    zan_type_t *path[64];
+    return type_mentions_tp_path(t, path, 0);
 }
 
 static void unify_method_tp(zan_type_t *dp, zan_type_t *at,
@@ -225,31 +235,71 @@ zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
     return subst_method_tp(g, rt, tps, bind);
 }
 
-/* async 委托调用：调用生成协程帧并在原地 await 挂起等待结果 */
-void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
-                                       zan_type_t *dt, local_scope_t *locals) {
-    if (!e || !dt || dt->kind != TYPE_DELEGATE) return;
-    zan_symbol_t *m = NULL;
-    if (e->kind == AST_IDENTIFIER) {
-        if (local_find(locals, e->ident.name)) return;
-        if (g->current_type_sym)
-            m = get_method_sym(g->current_type_sym, e->ident.name);
-    } else if (e->kind == AST_MEMBER_ACCESS && e->member.object &&
-               e->member.object->kind == AST_IDENTIFIER &&
-               !local_find(locals, e->member.object->ident.name)) {
-        zan_symbol_t *cs =
-            zan_binder_lookup(g->binder, e->member.object->ident.name);
-        if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT))
-            m = get_method_sym(cs, e->member.name);
+/* Target-typed method groups never re-enter the first-same-name value
+ * emitter. The shared resolver selects using this emission's concrete types. */
+LLVMValueRef emit_method_group_conversion(zan_irgen_t *g, zan_ast_node_t *expr,
+        zan_type_t *target, local_scope_t *locals) {
+    zan_type_t *owner = NULL;
+    zan_symbol_t *method = resolve_method_group_conversion(g, expr, target, locals, &owner);
+    if (!method) {
+        char target_name[256];
+        zan_type_display(target, target_name, sizeof(target_name));
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3047,
+            "method group cannot be converted to delegate type '%s': "
+            "signature is not compatible or the conversion is ambiguous",
+            target_name);
+        return LLVMConstNull(map_type(g, target));
     }
-    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return;
-    int m_async = (m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
-    if (m_async == (dt->delegate_is_async != 0)) return;
-    zan_diag_emit_code(g->diag, DIAG_ERROR, e->loc, 3047,
-        "cannot convert %s method '%.*s' to %s delegate '%.*s'",
-        m_async ? "async" : "non-async", m->name.len, m->name.str,
-        dt->delegate_is_async ? "async" : "non-async",
-        dt->name.len, dt->name.str);
+    if (method->modifiers & MOD_STATIC) {
+        if (target_is_wasm32(g))
+            return emit_method_group_closure_typed(g, method, NULL, owner, expr->loc);
+        int fi = irgen_find_function(g, method);
+        if (fi >= 0) {
+            LLVMTypeRef fn_type = g->functions[fi].fn_type;
+            return route_generic_method(g, owner, method, g->functions[fi].fn,
+                                        fn_type, &fn_type);
+        }
+    } else {
+        LLVMValueRef receiver = NULL;
+        zan_type_t *receiver_type = NULL;
+        zan_ast_node_t *receiver_expr = NULL;
+        if (expr->kind == AST_IDENTIFIER) {
+            if (g->current_this)
+                receiver = LLVMBuildLoad2(g->builder,
+                    LLVMGetAllocatedType(g->current_this), g->current_this, "this");
+        } else {
+            receiver_expr = expr->member.object;
+            receiver_type = infer_expr_type(g, receiver_expr, locals);
+            receiver = emit_guarded_member_object(g, expr, locals);
+        }
+        LLVMValueRef closure = receiver
+            ? emit_method_group_closure_typed(g, method, receiver, owner, expr->loc) : NULL;
+        if (closure) {
+            if (receiver_expr && receiver_is_owned_temp(g, receiver_expr, locals,
+                                                        receiver_type, receiver))
+                emit_rc_release_for_type(g, receiver_type, receiver);
+            return closure;
+        }
+    }
+    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3047,
+                      "cannot emit selected method group '%.*s'",
+                      (int)method->name.len, method->name.str);
+    return LLVMConstNull(map_type(g, target));
+}
+
+/* Legacy callers only validate; selection is shared with typed emission. */
+void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
+                               zan_type_t *dt, local_scope_t *locals) {
+    if (!e || !dt || dt->kind != TYPE_DELEGATE) return;
+    zan_type_t *target = zan_binder_method_group_target(e);
+    if (target && !resolve_method_group_conversion(g, e, dt, locals, NULL)) {
+        char target_name[256];
+        zan_type_display(dt, target_name, sizeof(target_name));
+        zan_diag_emit_code(g->diag, DIAG_ERROR, e->loc, 3047,
+            "method group cannot be converted to delegate type '%s': "
+            "signature is not compatible or the conversion is ambiguous",
+            target_name);
+    }
 }
 
 static zan_ast_node_t *ast_type_from_zan_type(zan_irgen_t *g,
@@ -295,6 +345,13 @@ static bool wrap_implicit_ctor_arg(zan_irgen_t *g, zan_ast_node_t *arg,
 LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
                                    zan_type_t *ptype, local_scope_t *locals) {
     zan_type_t *atype = infer_expr_type(g, arg, locals);
+    if (type_is_binding(ptype) && !type_is_binding(atype)) {
+        if (arg && arg->kind == AST_NULL_LITERAL)
+            return LLVMConstNull(map_type(g, ptype));
+        LLVMValueRef binding = emit_binding_value(g, ptype, arg, locals);
+        note_emitted_arg_owner(g, arg, binding, ptype, locals);
+        return binding;
+    }
     check_implicit_narrowing(g, ptype, atype, arg, "argument");
     check_value_type_mismatch(g, ptype, atype, arg, "argument");
     check_generic_invariance(g, ptype, atype, arg, "argument");
@@ -313,7 +370,11 @@ LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
     if (arg && ptype && ptype->kind == TYPE_DELEGATE) {
         if (arg->kind == AST_LAMBDA)
             return emit_lambda_typed(g, arg, ptype, locals);
-        check_delegate_async_match(g, arg, ptype, locals);
+        if (arg->kind == AST_CONDITIONAL)
+            return emit_expr_conditional_typed(g, arg, ptype, locals);
+        if (zan_binder_method_group_target(arg) ||
+            resolve_method_group_conversion(g, arg, ptype, locals, NULL))
+            return emit_method_group_conversion(g, arg, ptype, locals);
     }
     LLVMValueRef v = emit_expr(g, arg, locals);
     if (v && ptype && atype)

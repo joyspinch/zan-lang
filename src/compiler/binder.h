@@ -233,6 +233,24 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
 zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **args);
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
+/* Explicit qualified receivers retain their type identity across value scopes. */
+zan_symbol_t *zan_binder_type_receiver(zan_binder_t *b, zan_ast_node_t *expr);
+
+/* Method-group conversion: both checker and IR use the same candidate rules.
+ * TYPE/VALUE require static/instance respectively; IMPLICIT permits either
+ * only when this is available. No candidate or an ambiguous best match is NULL.
+ * The expression stores the target signature, not a candidate tied to one
+ * generic instantiation; IR resolves it again in its concrete context. */
+typedef enum {
+    ZAN_METHOD_GROUP_TYPE,
+    ZAN_METHOD_GROUP_VALUE,
+    ZAN_METHOD_GROUP_IMPLICIT
+} zan_method_group_receiver_t;
+zan_symbol_t *zan_binder_method_group(zan_binder_t *b, zan_type_t *receiver,
+    zan_istr_t name, zan_method_group_receiver_t form, zan_type_t *target,
+    int *score);
+zan_type_t *zan_binder_method_group_target(zan_ast_node_t *expr);
+void zan_binder_set_method_group_target(zan_ast_node_t *expr, zan_type_t *target);
 
 /* 类（含其基类链）是否实现了接口 iface。checker 与 irgen 共用这一份判定，
  * 免得两边对"接口方法算不算这个类型的成员"口径分叉。 */

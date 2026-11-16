@@ -851,42 +851,9 @@ codegen_ready:
             }
         }
 
-        if (irgen.uses_embed_api &&
-            resolved_stdlib_root[0]) {
-            char assets_cands[4][1200];
-            int assets_cand_count = 0;
-            for (int fi = 0; fi < input_count && assets_cand_count < 2; fi++) {
-                char assets_dir[1400];
-                snprintf(assets_dir, sizeof(assets_dir), "%s",
-                         input_files[fi]);
-                char *asep = strrchr(assets_dir, '/');
-                char *aback = strrchr(assets_dir, '\\');
-                if (!asep || (aback && aback > asep)) asep = aback;
-                if (!asep) continue;
-                *asep = 0;
-                snprintf(assets_cands[assets_cand_count], 1200, "%s/assets",
-                         assets_dir);
-                if (zan_file_exists(assets_cands[assets_cand_count]))
-                    assets_cand_count++;
-                else if (assets_cand_count < 3) {
-                    char *psep = strrchr(assets_dir, '/');
-                    char *pback = strrchr(assets_dir, '\\');
-                    if (!psep || (pback && pback > psep)) psep = pback;
-                    if (psep && psep != assets_dir) {
-                        *psep = 0;
-                        snprintf(assets_cands[assets_cand_count], 1200,
-                                 "%s/assets", assets_dir);
-                        if (zan_file_exists(assets_cands[assets_cand_count]))
-                            assets_cand_count++;
-                    }
-                }
-            }
-            if (assets_cand_count < 2 &&
-                strcmp(package_project_root, ".") != 0) {
-                snprintf(assets_cands[assets_cand_count], 1200, "%s/assets",
-                         package_project_root);
-                assets_cand_count++;
-            }
+        if (irgen.uses_embed_api && resolved_stdlib_root[0]) {
+            char assets_dir[4200];
+            snprintf(assets_dir, sizeof(assets_dir), "%s/assets", user_resource_root);
             bool assets_staged = false;
             for (int es = 0; es < embed_spec_count && !assets_staged; es++) {
                 const char *seq = strrchr(embed_specs[es], '=');
@@ -896,9 +863,8 @@ codegen_ready:
                     if (base && strcmp(base, "assets") == 0) assets_staged = true;
                 }
             }
-            for (int ac = 0; ac < assets_cand_count && !assets_staged; ac++) {
-                const char *adir = assets_cands[ac];
-                if (!zan_file_exists(adir)) { continue; }
+            if (!assets_staged && zan_file_exists(assets_dir)) {
+                const char *adir = assets_dir;
                 assets_staged = true;
                 char *assets_spec = (char *)malloc(strlen(adir) + 32);
                 if (assets_spec) {

@@ -82,7 +82,7 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
         zan_ast_node_t *vg = arg;
         while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
         zan_symbol_t *vmg = expr_method_group(c, vg);
-        if (vmg && !method_group_matches_delegate(c, vmg, pt)) {
+        if (vmg && !checker_bind_method_group(c, vg, pt)) {
             zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
                 "method '%.*s' cannot be converted to delegate type "
                 "'%s': signature is not compatible",
@@ -115,7 +115,7 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                 reject_method_group(c, vg);
                 return;
             }
-            if (!method_group_matches_delegate(c, vmg, pt)) {
+            if (!checker_bind_method_group(c, vg, pt)) {
                 zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
                     "method '%.*s' cannot be converted to delegate type "
                     "'%s': signature is not compatible",
@@ -130,6 +130,44 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                   "no implicit conversion",
                   type_name(arg_type), type_name(pt), index + 1,
                   (int)sig->name.len, sig->name.str);
+}
+
+/* Candidate validation and committed method-group targets must use the same
+ * parameter mapping and the constructed owner's closed generic signature. */
+static zan_type_t *checker_ctor_arg_type(zan_checker_t *c, zan_type_t *owner,
+        zan_ast_list_t *params, zan_ast_node_t *arg, int index) {
+    zan_ast_node_t *param = NULL;
+    bool named = arg && arg->kind == AST_NAMED_ARG;
+    if (named) {
+        for (int i = 0; i < params->count; i++) {
+            zan_ast_node_t *p = params->items[i];
+            if (p && p->kind == AST_PARAM &&
+                p->param.name.len == arg->named_arg.name.len &&
+                memcmp(p->param.name.str, arg->named_arg.name.str,
+                       (size_t)arg->named_arg.name.len) == 0) {
+                param = p;
+                break;
+            }
+        }
+    } else if (index < params->count) {
+        param = params->items[index];
+    } else if (params->count > 0) {
+        zan_ast_node_t *last = params->items[params->count - 1];
+        if (last && last->kind == AST_PARAM && last->param.is_params)
+            param = last;
+    }
+    if (!param || param->kind != AST_PARAM) return NULL;
+    zan_type_t *type = zan_binder_resolve_type(c->binder, param->param.type);
+    if (!named && param->param.is_params && type && type->kind == TYPE_ARRAY)
+        type = type->element_type;
+    if (type && owner->type_arg_count > 0 && owner->sym && owner->sym->decl &&
+        (owner->sym->decl->kind == AST_CLASS_DECL ||
+         owner->sym->decl->kind == AST_STRUCT_DECL)) {
+        zan_ast_list_t *tps = &owner->sym->decl->type_decl.type_params;
+        if (tps->count == owner->type_arg_count)
+            type = zan_binder_subst_named(c->binder, type, tps, owner->type_args);
+    }
+    return type;
 }
 
 static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
@@ -165,55 +203,33 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
             zan_ast_node_t *arg_node = (j < expr->new_expr.args.count)
                 ? expr->new_expr.args.items[j] : NULL;
             zan_type_t *at = arg_types[j];
-            zan_type_t *pt = NULL;
-
-            if (arg_node && arg_node->kind == AST_NAMED_ARG) {
-                for (int q = 0; q < ps->count; q++) {
-                    zan_ast_node_t *pp = ps->items[q];
-                    if (pp && pp->kind == AST_PARAM &&
-                        pp->param.name.len == arg_node->named_arg.name.len &&
-                        memcmp(pp->param.name.str, arg_node->named_arg.name.str,
-                               (size_t)arg_node->named_arg.name.len) == 0) {
-                        pt = zan_binder_resolve_type(c->binder, pp->param.type);
-                        break;
-                    }
-                }
-            } else if (j < ps->count) {
-                zan_ast_node_t *pp = ps->items[j];
-                if (pp && pp->kind == AST_PARAM) {
-                    pt = zan_binder_resolve_type(c->binder, pp->param.type);
-                    if (pp->param.is_params && pt && pt->kind == TYPE_ARRAY)
-                        pt = pt->element_type;
-                }
-            } else if (ps->count > 0) {
-                zan_ast_node_t *pp = ps->items[ps->count - 1];
-                if (pp && pp->kind == AST_PARAM && pp->param.is_params) {
-                    pt = zan_binder_resolve_type(c->binder, pp->param.type);
-                    if (pt && pt->kind == TYPE_ARRAY)
-                        pt = pt->element_type;
-                }
-            }
+            zan_type_t *pt = checker_ctor_arg_type(c, type, ps, arg_node, j);
 
             if (!pt || !at) continue;
-            if (at == c->binder->type_void) {
-                /* 方法组实参：委托形参还须签名兼容（B-ID48 同源） */
-                bool mg_ok = true;
-                zan_ast_node_t *vg = arg_node;
-                while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
-                zan_symbol_t *vmg = expr_method_group(c, vg);
-                if (pt && pt->kind == TYPE_DELEGATE && vmg &&
-                    !method_group_matches_delegate(c, vmg, pt))
-                    mg_ok = false;
-                if (!pt || pt->kind != TYPE_DELEGATE || !mg_ok) {
+            /* Method groups carry error/void until target-typed. Validate
+             * every constructor candidate without committing its target. */
+            zan_ast_node_t *group_arg = arg_node;
+            if (group_arg && group_arg->kind == AST_NAMED_ARG)
+                group_arg = group_arg->named_arg.expr;
+            zan_symbol_t *group = expr_method_group(c, group_arg);
+            if (group) {
+                if (!method_group_matches_delegate(c, group_arg, pt)) {
                     match = false;
-                    if (cand_bad_arg < 0) {
-                        cand_bad_arg = j;
-                        cand_bad_tgt = pt;
-                        cand_bad_src = at;
-                        cand_bad_node = arg_node;
-                    }
+                    cand_bad_arg = j;
+                    cand_bad_tgt = pt;
+                    cand_bad_src = at;
+                    cand_bad_node = group_arg;
+                    break;
                 }
                 continue;
+            }
+            if (at == c->binder->type_void) {
+                match = false;
+                cand_bad_arg = j;
+                cand_bad_tgt = pt;
+                cand_bad_src = at;
+                cand_bad_node = arg_node;
+                break;
             }
             if (checker_arg_type_mismatch(c, pt, at)) {
                 match = false;
@@ -228,6 +244,14 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
         }
 
         if (match) {
+            for (int j = 0; j < argc; j++) {
+                zan_ast_node_t *arg = expr->new_expr.args.items[j];
+                zan_type_t *pt = checker_ctor_arg_type(c, type, ps, arg, j);
+                if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
+                if (!arg || !expr_method_group(c, arg)) continue;
+                if (pt && pt->kind == TYPE_DELEGATE)
+                    zan_binder_set_method_group_target(arg, pt);
+            }
             return;
         }
 
@@ -310,8 +334,12 @@ static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     }
     if (e->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = e->member.object;
-    if (!obj || (obj->kind != AST_IDENTIFIER && obj->kind != AST_THIS_EXPR))
+    if (!obj || (obj->kind != AST_IDENTIFIER && obj->kind != AST_THIS_EXPR &&
+                 obj->kind != AST_MEMBER_ACCESS && obj->kind != AST_CALL))
         return NULL;
+    /* Nested field receivers (this.actions.Replay / holder.actions.Replay)
+     * are method groups too. Keep the final member-kind check below so a
+     * real delegate field/property still shadows an inherited method. */
     zan_type_t *ot = zan_checker_check_expr(c, obj);
     if (!ot || !ot->sym) return NULL;
     for (zan_symbol_t *s = ot->sym; s;
@@ -432,7 +460,7 @@ static bool class_has_op_delegate(zan_checker_t *c, zan_type_t *left,
             if (!pnode || pnode->kind != AST_PARAM || !pnode->param.type) continue;
             zan_type_t *pt = zan_binder_resolve_type(c->binder, pnode->param.type);
             if (pt && pt->kind == TYPE_DELEGATE) {
-                if (method_group_matches_delegate(c, mg, pt)) return true;
+                if (method_group_matches_delegate(c, right_node, pt)) return true;
             }
         }
     }
@@ -491,7 +519,7 @@ static void checker_builtin_mg_args(zan_checker_t *c, zan_type_t *recv,
             reject_method_group(c, vg);
             continue;
         }
-        if (!method_group_matches_delegate(c, vmg, pt)) {
+        if (!checker_bind_method_group(c, vg, pt)) {
             zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
                 "method '%.*s' cannot be converted to delegate type "
                 "'%s': signature is not compatible",

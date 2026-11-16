@@ -636,6 +636,8 @@ int main(int argc, char **argv) {
     }
 
     input_file = input_files[0];
+    char user_resource_root[4096];
+    resolve_user_resource_root(input_file, user_resource_root, sizeof(user_resource_root));
     if (package_project)
         snprintf(package_project_root, sizeof(package_project_root), "%s",
                  package_project);

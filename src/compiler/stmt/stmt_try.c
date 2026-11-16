@@ -24,6 +24,21 @@
             zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g, "try.tmp.cur"), tmp_mark_slot);
         }
         if (g->current_async_frame) {
+            tmp_mark_slot = emit_entry_alloca(g, i32t, "try.tmp.slot");
+            /* A native catch can be reached after an await resumes on another
+             * thread. Initialize on every resume, not in the persistent frame:
+             * an already-active try then uses this invocation's TLS baseline.
+             * A try first entered below overrides it with its lexical mark. */
+            zan_builder_point_t mark_pt = zan_builder_save(g);
+            LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+            LLVMValueRef entry_term = LLVMGetBasicBlockTerminator(entry);
+            if (entry_term) LLVMPositionBuilderBefore(g->builder, entry_term);
+            else LLVMPositionBuilderAtEnd(g->builder, entry);
+            zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g,
+                "try.tmp.resume"), tmp_mark_slot);
+            zan_builder_restore(g, mark_pt);
+            zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g,
+                "try.tmp.cur"), tmp_mark_slot);
             LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
                 g->current_async_frame_type, g->current_async_frame,
                 ASYNC_FRAME_HCOUNT, "eh.hc");
@@ -194,6 +209,7 @@
             try_lpad_entry->cleanups = NULL;
             try_lpad_entry->cleanup_count = 0;
             try_lpad_entry->cleanup_cap = 0;
+            try_lpad_entry->fn_cleanup = NULL;
             g->lpad_depth++;
         }
         int armed_idx = -1;
@@ -239,13 +255,14 @@
             LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.catch");
             zan_store_fit(g, ot, top_g);
         }
-        if (!g->current_async_frame && tmp_mark_slot) {
+        if (tmp_mark_slot) {
             LLVMValueRef mark = LLVMBuildLoad2(g->builder, i32t, tmp_mark_slot, "try.tmp.mark");
             emit_eh_tmp_unwind_to(g, mark);
         }
         if (!g->current_async_frame && try_lpad_entry) {
             emit_lpad_cleanups(g, try_lpad_entry);
         } else if (g->current_async_frame) {
+            emit_async_try_cleanups(g, locals, stmt->try_stmt.try_body);
             LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
                 g->current_async_frame_type, g->current_async_frame,
                 ASYNC_FRAME_HCOUNT, "eh.hc");
@@ -501,6 +518,7 @@
             try_lpad_entry->cleanups = NULL;
             try_lpad_entry->cleanup_count = 0;
             try_lpad_entry->cleanup_cap = 0;
+            try_lpad_entry->fn_cleanup = NULL;
         }
         break;
     }

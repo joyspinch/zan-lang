@@ -305,7 +305,7 @@ static void emit_raise_exception_impl(zan_irgen_t *g, bool include_cleanups) {
                 LLVMBasicBlockRef unreach_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "throw.unreach");
                 LLVMBuildInvoke2(g->builder, throw_ty, g->fn_cxa_throw,
                     (LLVMValueRef[]){ exc_mem, LLVMConstNull(i8ptr), LLVMConstNull(i8ptr) }, 3,
-                    unreach_bb, top->lpad_bb, "");
+                    unreach_bb, active_lpad(g, top), "");
                 LLVMPositionBuilderAtEnd(g->builder, unreach_bb);
                 LLVMBuildUnreachable(g->builder);
                 return;
@@ -337,7 +337,7 @@ LLVMValueRef zan_call_or_invoke(zan_irgen_t *g, LLVMBuilderRef b, LLVMTypeRef ty
             di_ensure_loc(b);
             ensure_function_personality(g, cur_fn);
             LLVMBasicBlockRef norm_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "inv.norm");
-            LLVMBasicBlockRef lpad_bb = top->lpad_bb;
+            LLVMBasicBlockRef lpad_bb = active_lpad(g, top);
 
             LLVMValueRef callee = fn;
             if (fn && LLVMIsAFunction(fn) && LLVMGlobalGetValueType(fn) != ty) {
@@ -435,6 +435,7 @@ void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
     g->functions[g->function_count].fn = fn;
     g->functions[g->function_count].fn_type = fn_type;
     g->functions[g->function_count].modifiers = sym ? sym->modifiers : 0;
+    zan_opt_note_zan_fn_name(LLVMGetValueName(fn));
     if ((g->function_count + 1) * 2 >= g->fn_index_cap)
         fn_index_rehash(g, g->fn_index_cap ? g->fn_index_cap * 2 : 2048);
     if (sym) fn_index_put(g, sym, g->function_count);

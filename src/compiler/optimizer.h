@@ -78,6 +78,15 @@ void zan_opt_report_print(const zan_opt_report_t *report);
 zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
 zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level);
 
+/* 收缩 pass（S-UNWIND）：nothrow 闭包后将可证
+ * 不抛的 invoke 塌缩为 call（personality/语义不变）。返回塌缩数。 */
+int zan_shrink_collapse_invokes(LLVMModuleRef mod);
+
+/* 注记 Zan 编译器发射的函数 LLVM 名（irgen_register_function 调用）。
+ * publish 跨片时该名在别的分片模块里只是 declaration，收缩 pass 用
+ * 它区分"Zan 函数（可抛）"与"C 导入（按前缀白名单判 nothrow）"。 */
+void zan_opt_note_zan_fn_name(const char *name);
+
 zan_status_t zan_opt_strip_unused(zan_irgen_t *g);
 
 /* Reject unsupported hardware calls, never mere intrinsic declarations. */

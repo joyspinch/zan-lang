@@ -229,6 +229,7 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
         if (obj != c->last_call_node) return;
         m = c->last_call_method;
     } else if (obj->kind == AST_IDENTIFIER) {
+        if (obj->ident.is_type_receiver) return;
         struct checker_local *l = checker_find_local_slot(c, obj->ident.name);
         if (l && l->type && l->type->is_nullable) {
             if (c->current_body && !node_guards_null(c->current_body, obj->ident.name, 0, expr->loc)) {
@@ -260,6 +261,7 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
 static bool receiver_is_value_expr(zan_checker_t *c, zan_ast_node_t *obj) {
     switch (obj->kind) {
     case AST_IDENTIFIER: {
+        if (obj->ident.is_type_receiver) return false;
         if (checker_find_local_slot(c, obj->ident.name)) return true;
         zan_symbol_t *s = zan_binder_lookup(c->binder, obj->ident.name);
         if (!s) return false;

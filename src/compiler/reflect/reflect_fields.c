@@ -28,13 +28,40 @@ static LLVMValueRef refl_const_string(zan_irgen_t *g, const char *s, int len) {
         LLVMConstInt(i64, ZAN_STR_HDR_WORD(len), 0),
         LLVMConstArray(i8, chars, (unsigned)(len + 1)) }, 3);
     free(chars);
-    char nm[64];
-    snprintf(nm, sizeof(nm), "__zan.refl.str.%d", g->refl_str_count++);
-    LLVMValueRef gv = LLVMAddGlobal(g->mod, rec_ty, nm);
-    LLVMSetInitializer(gv, init);
-    LLVMSetLinkage(gv, LLVMPrivateLinkage);
-    LLVMSetGlobalConstant(gv, 1);
-    LLVMSetAlignment(gv, 8);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int i = 0; i < len; i++) {
+        hash ^= (unsigned char)s[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    char nm[96];
+    LLVMValueRef gv;
+    unsigned collision = 0;
+    for (;;) {
+        snprintf(nm, sizeof(nm), "__zan.refl.str.pool.%016llx.%d.%u",
+                 (unsigned long long)hash, len, collision);
+        gv = LLVMGetNamedGlobal(g->mod, nm);
+        if (!gv) {
+            gv = LLVMAddGlobal(g->mod, rec_ty, nm);
+            LLVMSetInitializer(gv, init);
+            LLVMSetLinkage(gv, LLVMPrivateLinkage);
+            LLVMSetGlobalConstant(gv, 1);
+            LLVMSetUnnamedAddress(gv, LLVMGlobalUnnamedAddr);
+            LLVMSetAlignment(gv, 8);
+            break;
+        }
+        /* LLVM uniques constants in this context: equality checks the complete
+         * length/header/payload initializer, not just the hash or C string. */
+        if (LLVMGlobalGetValueType(gv) == rec_ty &&
+            LLVMIsGlobalConstant(gv) && LLVMGetInitializer(gv) == init)
+            break;
+        if (collision == UINT_MAX) {
+            zan_loc_t loc = {0};
+            zan_diag_emit_code(g->diag, DIAG_ERROR, loc, 3101,
+                               "reflection string constant pool exhausted");
+            return LLVMConstNull(LLVMPointerType(i8, 0));
+        }
+        collision++;
+    }
     LLVMValueRef idx[3] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 2, 0),
                             LLVMConstInt(i64, 0, 0) };
     return LLVMConstGEP2(rec_ty, gv, idx, 3);
@@ -276,18 +303,8 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
             slot++;
             continue;
         }
-        if (g->publish_mode) {
-            /* 在 publish 模式下：
-             * 私有字段（非 public 且不是属性）既不参与外部反射，也不参与 HTML 数据绑定，
-             * 剥离其反射元数据记录，避免级联展开庞大的字段类型元数据树 */
-            uint32_t mods = m->modifiers;
-            if (m->decl && m->decl->kind == AST_FIELD_DECL)
-                mods |= m->decl->field_decl.modifiers;
-            if (m->kind == SYM_FIELD && !(mods & MOD_PUBLIC)) {
-                slot++;
-                continue;
-            }
-        }
+        /* Field reflection has the same visibility contract in every build
+         * mode, including default-public and explicitly private fields. */
         LLVMValueRef off;
         if (entry && entry->explicit_layout && entry->field_offsets &&
             slot < entry->field_count)
@@ -492,6 +509,37 @@ bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n) {
 
 static bool refl_is_html_handler(zan_irgen_t *g, zan_symbol_t *m) {
     return refl_is_html_handler_name(g, (const char *)m->name.str, (size_t)m->name.len);
+}
+
+bool refl_ctor_needs_thunk(zan_irgen_t *g) {
+    /* Capability-wide fallback: a live CreateInstance may receive any TypeInfo,
+     * including dynamic GetType(), fields, ElementType or generic arguments.
+     * Library exports remain conservative for callers outside this module. */
+    return !g->publish_mode || g->emit_lib || g->refl_ctor_used;
+}
+
+/* F4/S1 谓词上移（design.md § P_method_thunk）：thunk 生成与 emit_target body-root 的唯一判定。
+ * 非 publish：全部方法（现状不变）。
+ * publish：仅 accessor（get_/set_ 且 owner 同名 property）、带注解方法、
+ * 设计稿事件处理器与框架生命周期钩子。
+ * 注意与 refl_method_should_export 的\u533a\u522b：\u672c\u8c13\u8bcd\u4e0d\u770b MOD_PUBLIC\uff08\u79c1\u6709 accessor/\u6ce8\u89e3\u4ecd\u751f thunk，\u4e0e\u73b0\u72b6\u4e00\u81f4）\u3002
+ */
+bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
+                             zan_ast_node_t *decl) {
+    if (!decl || decl->kind != AST_METHOD_DECL) { return false; }
+    if (!g->publish_mode) { return true; }
+    zan_symbol_t *msym = NULL;
+    if (owner) {
+        for (int i = 0; i < owner->member_count; i++) {
+            zan_symbol_t *p = owner->members[i];
+            if (p && p->decl == decl) { msym = p; break; }
+        }
+    }
+    if (msym && refl_accessor_flag(owner, msym) != 0) { return true; }
+    zan_ast_list_t *attrs = zan_ast_attributes(decl);
+    if (attrs && attrs->count > 0) { return true; }
+    return refl_is_html_handler_name(g, (const char *)decl->method_decl.name.str,
+                                    (size_t)decl->method_decl.name.len);
 }
 
 static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym, zan_symbol_t *m) {

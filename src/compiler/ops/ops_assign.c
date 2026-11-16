@@ -531,14 +531,23 @@ binding_lowered:
                             zan_store_fit(g, val8, elem_ptr);
                             emit_string_len_invalidate(g, arr_ptr);
                         } else {
+                        /* B-ID216：字段数组元素写必须走替后元素类型。读路径
+                         * （access_index.c）对 arr_type 做 concretize，克隆体
+                         * 里 T[] 变 int[]、元素 GEP 按 4 字节步；这里裸读
+                         * fsym->type（开放 T[]，map_type 落 default 的 i8*）
+                         * 会按 ptr 8 字节步寻址——alloc/读都是 elem 步、只有
+                         * 写是 ptr 步：Set(1,42) 越过 2×4 字节数据区写进堆
+                         * 邻位（无可见损坏），At(1) 读到从未写过的槽=0。 */
+                        zan_type_t *ft = (fsym->type && g->cur_inst)
+                            ? concretize(g, fsym->type) : fsym->type;
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
-                        if (fsym->type && fsym->type->element_type) {
-                            zan_type_t *et = fsym->type->element_type;
+                        if (ft && ft->element_type) {
+                            zan_type_t *et = ft->element_type;
                             elem_llvm = map_type(g, et);
                         }
                         LLVMValueRef elem_ptr;
-                        if (fsym->type && fsym->type->kind == TYPE_ARRAY &&
-                            fsym->type->array_rank > 1) {
+                        if (ft && ft->kind == TYPE_ARRAY &&
+                            ft->array_rank > 1) {
                             elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
                                 expr->binary.left, elem_llvm, locals, &ar_oob);
                         } else {
@@ -548,7 +557,7 @@ binding_lowered:
                         }
                         LLVMBasicBlockRef ar_do = NULL, ar_end = NULL;
                         emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);
-                        zan_type_t *et = fsym->type ? fsym->type->element_type : NULL;
+                        zan_type_t *et = ft ? ft->element_type : NULL;
                         LLVMValueRef stored = right;
                         /* 可空数组元素槽写入：封装标量值为可空对象 */
                         if (et && et->kind == TYPE_NULLABLE)
@@ -838,9 +847,8 @@ binding_lowered:
                     return right;
                 }
             }
-            if (obj_expr->kind == AST_IDENTIFIER &&
-                !local_find(locals, obj_expr->ident.name)) {
-                zan_symbol_t *cs = zan_binder_lookup(g->binder, obj_expr->ident.name);
+            if (obj_expr->kind == AST_IDENTIFIER) {
+                zan_symbol_t *cs = receiver_type_symbol(g, obj_expr, locals);
                 if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                     zan_symbol_t *fs = get_field_sym(cs, expr->binary.left->member.name);
                     zan_symbol_t *setter = property_setter_sym(g, fs);
@@ -873,7 +881,7 @@ binding_lowered:
                 }
             }
             if (!stored && obj_expr->kind == AST_IDENTIFIER) {
-                local_var_t *local = local_find(locals, obj_expr->ident.name);
+                local_var_t *local = receiver_local(obj_expr, locals);
                 if (local && local->type && local->type->sym) {
                     int fi = get_field_index(local->type->sym, expr->binary.left->member.name);
                     if (fi >= 0) {

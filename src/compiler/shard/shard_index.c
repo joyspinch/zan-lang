@@ -159,14 +159,8 @@ static int sh_hex_digit(unsigned char c) {
     return -1;
 }
 
-/* 解码 LLVM 打印器输出的 @name 标识符 */
-static char *sh_body_header_name(const char *header) {
-    bool quoted = false;
-    const char *p = header + 7;
-    for (; *p; p++) {
-        if (*p == '"') quoted = !quoted;
-        else if (*p == '@' && !quoted) break;
-    }
+/* 解码 LLVM 打印器输出的 @name 标识符（函数与全局共用）。 */
+static char *sh_ir_symbol_name(const char *p) {
     if (*p != '@') return NULL;
     p++;
     const char *start = p;
@@ -195,13 +189,23 @@ static char *sh_body_header_name(const char *header) {
         if (!n) { free(name); return NULL; }
         return name;
     }
-    while (*p && *p != '(' && *p != ' ' && *p != '\t' &&
+    while (*p && *p != '(' && *p != '=' && *p != ' ' && *p != '\t' &&
            *p != '\r' && *p != '\n') p++;
     size_t len = (size_t)(p - start);
     if (!len) return NULL;
     char *name = (char *)malloc(len + 1);
     if (name) { memcpy(name, start, len); name[len] = '\0'; }
     return name;
+}
+
+static char *sh_body_header_name(const char *header) {
+    bool quoted = false;
+    const char *p = header + 7;
+    for (; *p; p++) {
+        if (*p == '"') quoted = !quoted;
+        else if (*p == '@' && !quoted) break;
+    }
+    return sh_ir_symbol_name(p);
 }
 
 static bool sh_body_index_add(sh_body_index_t *idx, char *name,
@@ -238,19 +242,23 @@ static bool sh_body_index_add(sh_body_index_t *idx, char *name,
     return true;
 }
 
-static bool sh_build_body_index(sh_body_index_t *idx, FILE *file) {
+static bool sh_build_body_index(sh_body_index_t *idx, sh_body_index_t *globals,
+                                 FILE *file) {
     int cap = 1024;
-    idx->mask = cap - 1;
+    idx->mask = globals->mask = cap - 1;
     idx->keys = (char **)calloc((size_t)cap, sizeof(*idx->keys));
     idx->vals = (sh_body_slice_t *)calloc((size_t)cap, sizeof(*idx->vals));
-    if (!idx->keys || !idx->vals) return false;
+    globals->keys = (char **)calloc((size_t)cap, sizeof(*globals->keys));
+    globals->vals = (sh_body_slice_t *)calloc((size_t)cap, sizeof(*globals->vals));
+    if (!idx->keys || !idx->vals || !globals->keys || !globals->vals) return false;
 
-    /* 逐块读取长行：仅保留 define 函数头信息 */
+    /* One module-text pass: index function bodies and complete global records.
+     * LLVM prints each global on one logical line, which may span many chunks. */
     char chunk[16384];
     sh_sbuf_t header = {0};
     char *name = NULL;
-    long long pos = 0, body_start = 0;
-    bool line_start = true, in_body = false, in_header = false;
+    long long pos = 0, body_start = 0, global_start = 0;
+    bool line_start = true, in_body = false, in_header = false, in_global = false;
     bool ok = true;
     while (fgets(chunk, sizeof(chunk), file)) {
         size_t n = strlen(chunk);
@@ -258,12 +266,31 @@ static bool sh_build_body_index(sh_body_index_t *idx, FILE *file) {
             ok = false; break;
         }
         bool line_end = chunk[n - 1] == '\n';
-        if (line_start && !in_body && !strncmp(chunk, "define ", 7)) {
-            in_body = in_header = true;
-            body_start = pos;
-            header.n = 0;
+        if (line_start && !in_body && !in_global) {
+            if (!strncmp(chunk, "define ", 7)) {
+                in_body = in_header = true;
+                body_start = pos;
+                header.n = 0;
+            } else if (chunk[0] == '@') {
+                in_global = true;
+                global_start = pos;
+                header.n = 0;
+            }
         }
-        if (in_header) {
+        if (in_global) {
+            sh_sb_putn(&header, chunk, n);
+            if (header.oom) { ok = false; break; }
+            if (line_end) {
+                unsigned long long span = (unsigned long long)(pos - global_start) + n;
+                name = sh_ir_symbol_name(header.p);
+                if (!name || span > (unsigned long long)SIZE_MAX ||
+                    !sh_body_index_add(globals, name, global_start, (size_t)span)) {
+                    ok = false; break;
+                }
+                name = NULL;
+                in_global = false;
+            }
+        } else if (in_header) {
             sh_sb_putn(&header, chunk, n);
             if (header.oom) { ok = false; break; }
             if (line_end) {
@@ -283,7 +310,7 @@ static bool sh_build_body_index(sh_body_index_t *idx, FILE *file) {
         pos += (long long)n;
         line_start = line_end;
     }
-    if (ferror(file) || in_body) ok = false;
+    if (ferror(file) || in_body || in_global) ok = false;
     free(name);
     free(header.p);
     return ok;
@@ -396,8 +423,8 @@ static int sh_global_verdict(sh_state_t *st, LLVMValueRef gv) {
     if (!LLVMIsAGlobalVariable(gv)) {
         verdict = SH_G_BLOCK;
     } else if (LLVMHasMetadata(gv)) {
-        /* 剥离无定义的 !N 元数据节点引用 */
-        verdict = SH_G_BLOCK;
+        /* Keep metadata-bearing definitions in the coordinator; shards declare them. */
+        verdict = SH_G_DECL;
     } else if (LLVMIsDeclaration(gv)) {
         verdict = SH_G_DECL;
     } else if (LLVMIsThreadLocal(gv)) {

@@ -475,9 +475,8 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* 静态字段访问：ClassName.StaticField 直接读取全局变量 */
-        if (expr->member.object->kind == AST_IDENTIFIER &&
-            !local_find(locals, expr->member.object->ident.name)) {
-            zan_symbol_t *cs = zan_binder_lookup(g->binder, expr->member.object->ident.name);
+        if (expr->member.object->kind == AST_IDENTIFIER) {
+            zan_symbol_t *cs = receiver_type_symbol(g, expr->member.object, locals);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fs = get_field_sym(cs, expr->member.name);
                 zan_symbol_t *getter = property_getter_sym(g, fs);
@@ -497,9 +496,8 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* 静态方法引用作为委托传递：生成静态方法组记录 */
-        if (expr->member.object->kind == AST_IDENTIFIER &&
-            !local_find(locals, expr->member.object->ident.name)) {
-            zan_symbol_t *cs = zan_binder_lookup(g->binder, expr->member.object->ident.name);
+        if (expr->member.object->kind == AST_IDENTIFIER) {
+            zan_symbol_t *cs = receiver_type_symbol(g, expr->member.object, locals);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *ms = get_method_sym(cs, expr->member.name);
                 if (ms) {
@@ -518,7 +516,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         if (expr->member.object->kind == AST_IDENTIFIER) {
-            local_var_t *local = local_find(locals, expr->member.object->ident.name);
+            local_var_t *local = receiver_local(expr->member.object, locals);
             if (local && local->type && (local->type->kind == TYPE_STRUCT || local->type->kind == TYPE_CLASS)) {
                 zan_symbol_t *type_sym = local->type->sym;
                 if (type_sym) {

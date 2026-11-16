@@ -498,7 +498,8 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx
         return res;
     }
     case AST_IDENTIFIER: {
-        for (int i = 0; i < ctx->tparams->count && i < ctx->targs->count; i++) {
+        for (int i = 0; !node->ident.is_type_receiver &&
+             i < ctx->tparams->count && i < ctx->targs->count; i++) {
             zan_ast_node_t *tp = ctx->tparams->items[i];
             if (tp && tp->kind == AST_IDENTIFIER &&
                 tp->ident.name.len == node->ident.name.len &&

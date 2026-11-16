@@ -156,6 +156,8 @@ struct zan_ast_node {
         struct {
             zan_istr_t name;
             zan_ast_node_t *inst_type_ref;
+            struct zan_type *method_group_target; /* target, never an instance-specific candidate */
+            bool is_type_receiver; /* nsresolve proved an explicit qualified type */
             int variance; /* 0: invariant, 1: covariant (out), -1: contravariant (in) */
         } ident;
 
@@ -185,6 +187,7 @@ struct zan_ast_node {
             zan_ast_node_t *object;
             zan_istr_t name;
             int null_cond;
+            struct zan_type *method_group_target;
         } member;
 
         /* index: obj[i] or obj[i,j] (multi-dimensional) */

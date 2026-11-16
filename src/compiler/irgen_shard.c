@@ -14,4 +14,5 @@
 /* Composite Dispatcher Submodules */
 #include "shard/shard_index.c"
 #include "shard/shard_emit.c"
+#include "shard/shard_blob.c"
 #include "shard/shard_run.c"

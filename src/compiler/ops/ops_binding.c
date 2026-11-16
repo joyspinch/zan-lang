@@ -469,10 +469,8 @@ void emit_decl_field_initializers(zan_irgen_t *g,
         check_generic_invariance(g, field_type, source_type,
                                  field->field_decl.initializer,
                                  "field initializer");
-        LLVMValueRef value = field_type && field_type->kind == TYPE_DELEGATE &&
-                             field->field_decl.initializer->kind == AST_LAMBDA
-            ? emit_lambda_typed(g, field->field_decl.initializer,
-                                field_type, locals)
+        LLVMValueRef value = field_type && field_type->kind == TYPE_DELEGATE
+            ? emit_arg_typed(g, field->field_decl.initializer, field_type, locals)
             : emit_expr(g, field->field_decl.initializer, locals);
         LLVMValueRef field_ptr = emit_field_ptr(
             g, type_sym, st, object_ptr, fi, "field.init");

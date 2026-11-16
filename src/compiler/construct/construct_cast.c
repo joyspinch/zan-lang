@@ -137,6 +137,12 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
             }
         }
+        if (tt0 && tt0->kind == TYPE_DELEGATE && expr->cast.expr &&
+            (expr->cast.expr->kind == AST_LAMBDA ||
+             expr->cast.expr->kind == AST_CONDITIONAL ||
+             zan_binder_method_group_target(expr->cast.expr) ||
+             resolve_method_group_conversion(g, expr->cast.expr, tt0, locals, NULL)))
+            return emit_arg_typed(g, expr->cast.expr, tt0, locals);
         LLVMValueRef val = emit_expr(g, expr->cast.expr, locals);
         zan_type_t *tt = resolve_type_ctx(g, expr->cast.type);
         LLVMTypeRef target = tt ? map_type(g, tt) : LLVMInt64TypeInContext(g->ctx);

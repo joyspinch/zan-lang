@@ -68,7 +68,8 @@ static int lexer_escape_seq(zan_lexer_t *lex, zan_loc_t loc, zan_esc_out_t *out)
     }
 }
 
-/* A character literal holds a single Unicode scalar (docs/ABI.md §3.1), so the
+/* A character literal holds a single Unicode scalar (docs/SPEC.md, character
+ * literals), so the
  * escape must yield the code point itself -- not the first byte of its UTF-8
  * form.  String literals keep using lexer_escape_seq(), which does encode
  * escapes to UTF-8 bytes. */

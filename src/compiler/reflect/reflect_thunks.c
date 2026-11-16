@@ -155,11 +155,8 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
         /* 在 publish 模式下，仅为属性访问器（get_/set_）、带注解方法、
          * 设计稿事件处理器与框架生命周期钩子（B-ID160）生成 thunk，
          * 避免为所有普通方法生成包装桩强行锚定死代码，让链接器 --gc-sections 正常工作 */
-        zan_ast_list_t *attrs = zan_ast_attributes(decl);
-        bool need_thunk = !g->publish_mode ||
-                          (flags & (ZAN_REFL_MF_PROPGET | ZAN_REFL_MF_PROPSET)) != 0 ||
-                          (attrs && attrs->count > 0) ||
-                          refl_is_html_handler(g, msym);
+        /* F4/S1: 谓词上移共享（P_method_thunk），emit_target body-root 同源判定。 */
+        bool need_thunk = refl_method_needs_thunk(g, sym, decl);
         if (need_thunk) {
             int fi = irgen_find_function(g, msym);
             if (fi >= 0) {
@@ -324,6 +321,7 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef thunk = LLVMConstNull(i8ptr);
+    late = late && refl_ctor_needs_thunk(g);
     if (!decl) {
         if (late) {
             LLVMValueRef t = refl_make_ctor_thunk(g, sym, NULL, NULL);
@@ -389,51 +387,81 @@ static bool refl_list_scalar_element(zan_irgen_t *g, zan_type_t *elem_type) {
         kind == LLVMDoubleTypeKind || kind == LLVMPointerTypeKind;
 }
 
-static LLVMValueRef refl_emit_ctor_builtin_list(zan_irgen_t *g, zan_type_t *t) {
-    zan_type_t *elem_type = container_elem_type(t);
-    /* Metadata may be discovered while emitting user code. Reserve now, before
-     * any site-indexed tables freeze; emitting this thunk consumes that site. */
-    uint32_t saved_file = g->di_cur_file, saved_line = g->di_cur_line;
-    g->di_cur_file = g->di_cur_line = 0;
-    int site = reserve_arc_site(g, NULL, NULL, 1, elem_type);
-    g->di_cur_file = saved_file;
-    g->di_cur_line = saved_line;
+static void refl_register_mtab(zan_irgen_t *g, LLVMValueRef gv,
+                               LLVMTypeRef arr_ty, zan_symbol_t *sym,
+                               zan_type_t *list_type, int n, bool ctors) {
+    if (g->refl_mtab_count == g->refl_mtab_cap) {
+        int ncap = g->refl_mtab_cap ? g->refl_mtab_cap * 2 : 16;
+        g->refl_mtabs = (typeof(g->refl_mtabs))realloc(g->refl_mtabs,
+            (size_t)ncap * sizeof(*g->refl_mtabs));
+        g->refl_mtab_cap = ncap;
+    }
+    int i = g->refl_mtab_count++;
+    g->refl_mtabs[i].gv = gv;
+    g->refl_mtabs[i].arr_ty = arr_ty;
+    g->refl_mtabs[i].sym = sym;
+    g->refl_mtabs[i].n = n;
+    g->refl_mtabs[i].ctors = ctors;
+    g->refl_mtabs[i].ctor_ready = false;
+    g->refl_mtabs[i].list_type = list_type;
+    g->refl_mtabs[i].site = -1;
+}
+
+static LLVMValueRef refl_builtin_list_ctor_record(zan_irgen_t *g,
+                                                  zan_type_t *t, bool late) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
-    LLVMTypeRef vd = LLVMVoidTypeInContext(g->ctx);
-    char nm[96];
-    snprintf(nm, sizeof(nm), "__zan.refl.thunk.list_ctor.%d", g->refl_thunk_count++);
-    LLVMValueRef th = LLVMAddFunction(g->mod, nm,
-        LLVMFunctionType(vd, (LLVMTypeRef[]){ i8ptr, i64ptr, i64ptr }, 3, 0));
-    LLVMSetLinkage(th, LLVMInternalLinkage);
-    refl_list_point_t pt = refl_list_save(g);
-    g->current_fn = th;
-    LLVMPositionBuilderAtEnd(g->builder,
-        LLVMAppendBasicBlockInContext(g->ctx, th, "entry"));
-    di_clear(g);
-    LLVMValueRef raw = zan_call2(g->builder,
-        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0),
-        g->rt_alloc, (LLVMValueRef[]){ LLVMSizeOf(g->list_struct_type),
-            arc_site_arg(g, site), LLVMConstNull(i8ptr) }, 3, "refl.list");
-    LLVMValueRef list = LLVMBuildBitCast(g->builder, raw,
-        LLVMPointerType(g->list_struct_type, 0), "refl.lp");
-    LLVMBuildStore(g->builder, LLVMConstNull(g->list_struct_type), list);
-    LLVMBuildStore(g->builder, refl_to_slot(g, raw), LLVMGetParam(th, 2));
-    LLVMBuildRetVoid(g->builder);
-    refl_list_restore(g, pt);
+    LLVMValueRef thunk = LLVMConstNull(i8ptr);
+    if (late && refl_ctor_needs_thunk(g)) {
+        zan_type_t *elem_type = container_elem_type(t);
+        uint32_t saved_file = g->di_cur_file, saved_line = g->di_cur_line;
+        g->di_cur_file = g->di_cur_line = 0;
+        int site = reserve_arc_site(g, NULL, NULL, 1, elem_type);
+        g->di_cur_file = saved_file;
+        g->di_cur_line = saved_line;
+        LLVMTypeRef vd = LLVMVoidTypeInContext(g->ctx);
+        char nm[96];
+        snprintf(nm, sizeof(nm), "__zan.refl.thunk.list_ctor.%d", g->refl_thunk_count++);
+        LLVMValueRef th = LLVMAddFunction(g->mod, nm,
+            LLVMFunctionType(vd, (LLVMTypeRef[]){ i8ptr, i64ptr, i64ptr }, 3, 0));
+        LLVMSetLinkage(th, LLVMInternalLinkage);
+        refl_list_point_t pt = refl_list_save(g);
+        g->current_fn = th;
+        LLVMPositionBuilderAtEnd(g->builder,
+            LLVMAppendBasicBlockInContext(g->ctx, th, "entry"));
+        di_clear(g);
+        LLVMValueRef raw = zan_call2(g->builder,
+            LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0),
+            g->rt_alloc, (LLVMValueRef[]){ LLVMSizeOf(g->list_struct_type),
+                arc_site_arg(g, site), LLVMConstNull(i8ptr) }, 3, "refl.list");
+        LLVMValueRef list = LLVMBuildBitCast(g->builder, raw,
+            LLVMPointerType(g->list_struct_type, 0), "refl.lp");
+        LLVMBuildStore(g->builder, LLVMConstNull(g->list_struct_type), list);
+        LLVMBuildStore(g->builder, refl_to_slot(g, raw), LLVMGetParam(th, 2));
+        LLVMBuildRetVoid(g->builder);
+        refl_list_restore(g, pt);
+        thunk = LLVMConstBitCast(th, i8ptr);
+    }
 
-    LLVMValueRef rec = LLVMConstNamedStruct(refl_method_type(g), (LLVMValueRef[]){
+    return LLVMConstNamedStruct(refl_method_type(g), (LLVMValueRef[]){
         refl_const_string(g, ".ctor", 5), refl_field_type_name(g, t),
         LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), LLVMConstInt(i64, 0, 0),
-        LLVMConstNull(i8ptr), LLVMConstBitCast(th, i8ptr),
+        LLVMConstNull(i8ptr), thunk,
         LLVMConstInt(i64, 0, 0), refl_empty_string(g) }, 8);
+}
+
+static LLVMValueRef refl_emit_ctor_builtin_list(zan_irgen_t *g, zan_type_t *t) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef rec = refl_builtin_list_ctor_record(g, t, false);
+    char nm[96];
     snprintf(nm, sizeof(nm), "__zan.refl.ctor.List.%d", g->refl_thunk_count++);
     LLVMTypeRef arr_ty = LLVMArrayType(refl_method_type(g), 1);
     LLVMValueRef gv = LLVMAddGlobal(g->mod, arr_ty, nm);
     LLVMSetInitializer(gv, LLVMConstArray(refl_method_type(g), &rec, 1));
     LLVMSetLinkage(gv, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(gv, 1);
+    refl_register_mtab(g, gv, arr_ty, NULL, t, 1, true);
     return LLVMConstBitCast(gv, i8ptr);
 }
 
@@ -769,19 +797,13 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMSetLinkage(gv, LLVMPrivateLinkage);
     LLVMSetAlignment(gv, 8);
 
-    if (g->refl_mtab_count == g->refl_mtab_cap) {
-        int ncap = g->refl_mtab_cap ? g->refl_mtab_cap * 2 : 16;
-        g->refl_mtabs = (typeof(g->refl_mtabs))realloc(g->refl_mtabs,
-            (size_t)ncap * sizeof(*g->refl_mtabs));
-        g->refl_mtab_cap = ncap;
+    refl_register_mtab(g, gv, arr_ty, sym, NULL, n, ctors);
+    /* Constructor discovery metadata is valid even when no callable demand
+     * ever arrives. Its initializer is upgraded in the pre-freeze fixed point. */
+    if (ctors) {
+        LLVMValueRef init = refl_mtab_init(g, sym, true, n, false);
+        if (init) LLVMSetInitializer(gv, init);
     }
-    g->refl_mtabs[g->refl_mtab_count].gv = gv;
-    g->refl_mtabs[g->refl_mtab_count].arr_ty = arr_ty;
-    g->refl_mtabs[g->refl_mtab_count].sym = sym;
-    g->refl_mtabs[g->refl_mtab_count].n = n;
-    g->refl_mtabs[g->refl_mtab_count].ctors = ctors;
-    g->refl_mtabs[g->refl_mtab_count].site = -1;
-    g->refl_mtab_count++;
     *out_count = n;
     return LLVMConstBitCast(gv, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
 }

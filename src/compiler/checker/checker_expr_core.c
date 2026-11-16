@@ -1,3 +1,41 @@
+struct checker_byref_parameter {
+    struct checker_local *slot;
+    zan_ast_node_t *param;
+    int lambda_depth;
+    bool reported;
+    struct checker_byref_parameter *next;
+};
+
+static void checker_bind_byref_parameter(zan_checker_t *c,
+                                         zan_ast_node_t *param) {
+    if (!param->param.by_ref) return;
+    struct checker_local *slot = checker_find_local_slot(c, param->param.name);
+    if (!slot) return;
+    struct checker_byref_parameter *binding = zan_arena_alloc(
+        c->arena, sizeof(*binding));
+    binding->slot = slot;
+    binding->param = param;
+    binding->lambda_depth = c->lambda_depth;
+    binding->reported = false;
+    binding->next = c->byref_parameters;
+    c->byref_parameters = binding;
+}
+
+static void checker_reject_byref_capture(zan_checker_t *c, zan_istr_t name) {
+    if (!c->byref_parameters || !c->lambda_depth) return;
+    struct checker_local *slot = checker_find_local_slot(c, name);
+    for (struct checker_byref_parameter *p = c->byref_parameters; p; p = p->next) {
+        /* Compare bindings, not names: lambda parameters and locals may shadow. */
+        if (p->slot != slot || p->lambda_depth >= c->lambda_depth) continue;
+        if (!p->reported) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, p->param->loc, 3043,
+                "cannot capture a ref or out parameter in a lambda");
+            p->reported = true;
+        }
+        return;
+    }
+}
+
 zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     if (!expr) return c->binder->type_error;
 
@@ -40,7 +78,25 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_NULL_LITERAL:
         return c->binder->type_object;
 
+    case AST_REF_ARG: {
+        /* A ref/out use inside a lambda still captures its storage. An inline
+         * out declaration instead introduces a new, potentially shadowing local. */
+        zan_ast_node_t *place = expr->ref_arg.expr;
+        if (expr->ref_arg.decl_type && place && place->kind == AST_IDENTIFIER) {
+            checker_add_local_permissive(c, place->ident.name,
+                zan_binder_resolve_type(c->binder, expr->ref_arg.decl_type));
+        } else {
+            zan_checker_check_expr(c, place);
+        }
+        return c->binder->type_error;
+    }
+
     case AST_IDENTIFIER: {
+        if (expr->ident.is_type_receiver) {
+            zan_symbol_t *ts = zan_binder_type_receiver(c->binder, expr);
+            return ts && ts->type ? ts->type : c->binder->type_error;
+        }
+        checker_reject_byref_capture(c, expr->ident.name);
         zan_type_t *lt = checker_find_local(c, expr->ident.name);
         if (lt) return lt;
         if (c->current_type_sym) {
@@ -609,6 +665,50 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             (checker_is_task_call(expr, "Run") || checker_is_task_call(expr, "Spawn"))) {
             zan_type_t *tr = task_run_result_type(c, expr, arg_types);
             if (tr) return tr;
+        }
+        if (!callee_is_method && !called_sym && argc == 2 &&
+            expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *callee = expr->call.callee;
+            zan_ast_node_t *obj = callee->member.object;
+            zan_istr_t owner = {NULL, 0};
+            if (obj->kind == AST_IDENTIFIER &&
+                !checker_find_local(c, obj->ident.name))
+                owner = obj->ident.name;
+            else if (obj->kind == AST_MEMBER_ACCESS)
+                owner = obj->member.name;
+            if (owner.len == 4 && memcmp(owner.str, "Math", 4) == 0) {
+                const char *res = zan_builtin_minmax_result("Math",
+                    callee->member.name.str, (int)callee->member.name.len,
+                    arg_types[0], arg_types[1]);
+                if (res) {
+                    if (strcmp(res, "int") == 0) return c->binder->type_int;
+                    if (strcmp(res, "long") == 0) return c->binder->type_long;
+                    if (strcmp(res, "uint") == 0) return c->binder->type_uint;
+                    if (strcmp(res, "ulong") == 0) return c->binder->type_ulong;
+                    if (strcmp(res, "nint") == 0) return c->binder->type_nint;
+                    return c->binder->type_double;
+                }
+                if (callee->member.name.len == 3 &&
+                    (memcmp(callee->member.name.str, "Min", 3) == 0 ||
+                     memcmp(callee->member.name.str, "Max", 3) == 0) &&
+                    arg_types[0] && arg_types[1] &&
+                    arg_types[0]->kind != TYPE_ERROR &&
+                    arg_types[1]->kind != TYPE_ERROR &&
+                    arg_types[0]->kind != TYPE_TYPE_PARAM &&
+                    arg_types[1]->kind != TYPE_TYPE_PARAM) {
+                    int numeric_pair =
+                        zan_builtin_minmax_result("Math", "Min", 3,
+                            arg_types[0], arg_types[0]) &&
+                        zan_builtin_minmax_result("Math", "Min", 3,
+                            arg_types[1], arg_types[1]);
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 3055,
+                        numeric_pair
+                            ? "Math.%.*s has no matching numeric overload; convert arguments explicitly"
+                            : "Math.%.*s requires numeric arguments",
+                        (int)callee->member.name.len, callee->member.name.str);
+                    return c->binder->type_error;
+                }
+            }
         }
         if (!callee_is_method && recv) {
             zan_type_t *br = builtin_call_result_type(c, recv,

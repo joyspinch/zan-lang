@@ -105,7 +105,7 @@ void zan_diag_add_file(zan_diag_t *diag, const char *name, const char *source);
 void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
                    const char *fmt, ...);
 /* 带编号的诊断发射（A382 编号规范）：编号非 0 时打印/捕获的消息前缀
- * `[E####] `/`[W####] `，编号在 docs/DIAGNOSTIC_CODES.md 登记，同一语义点
+ * `[E####] `/`[W####] `，编号在诊断表集中登记，同一语义点
  * 一个编号、只增不减。level 为 WARNING 且被 treat_warnings_as_errors 升级
  * 时，前缀字母仍按发射时的级别（编号标识诊断本身，严重度另行展示）。 */
 void zan_diag_emit_code(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,

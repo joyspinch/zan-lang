@@ -193,6 +193,9 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         return true;
     }
     case ZAN_REFL_M_CNEW: {      /* CreateInstance(...) */
+        /* Record demand at emission, never by scanning dead user bodies. Do not
+         * narrow by the receiver's apparent type: TypeInfo flows are dynamic. */
+        g->refl_ctor_used = true;
         refl_arg_temps_t temps;
         LLVMValueRef slots = refl_pack_args(g, args, argc, 0, locals, &temps);
         LLVMValueRef idx = zan_call2(g->builder,
@@ -602,7 +605,9 @@ void emit_site_meta_table(zan_irgen_t *g) {
     free(elems);
 }
 bool refl_type_needs_site_meta(zan_irgen_t *g, zan_symbol_t *sym) {
-    if (!g->publish_mode) return true;
+    /* Erased object reflection needs the concrete allocation type, including
+       plain DTOs reached through nested serialization in publish builds. */
+    if (!g->publish_mode || g->refl_used) return true;
     if (!sym || !sym->type) return false;
     /* 1. 带注解特性的类型必须保留 */
     zan_ast_list_t *attrs = sym->decl ? zan_ast_attributes(sym->decl) : NULL;

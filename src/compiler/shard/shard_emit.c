@@ -88,7 +88,10 @@ static bool sh_refs_walk_value(sh_refs_t *r, LLVMValueRef v, int depth) {
 
 static bool sh_refs_scan_fn(sh_refs_t *r, LLVMValueRef fn) {
     sh_state_t *st = r->st;
-    /* 规避当前 LLVM 版本的 LLVMGetPersonalityFn 空指针缺陷 */
+    /* Personality is attached to the function, not an instruction operand. */
+    if (LLVMHasPersonalityFn(fn) &&
+        !sh_refs_note_fn(r, LLVMGetPersonalityFn(fn)))
+        return false;
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
          bb = LLVMGetNextBasicBlock(bb)) {
         for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in;
@@ -136,6 +139,8 @@ static bool sh_ident_char(char c) {
            (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '.' ||
            c == '-';
 }
+
+static char *sh_type_name_clean(LLVMTypeRef ty);
 
 static void sh_harvest_types(sh_state_t *st, sh_sbuf_t *types, const char *text) {
     for (const char *p = text; *p; p++) {
@@ -195,9 +200,10 @@ static void sh_harvest_types(sh_state_t *st, sh_sbuf_t *types, const char *text)
         sh_sb_puts(types, line);
         if (ne) {
             for (unsigned i = 0; i < ne; i++) {
-                char *es = LLVMPrintTypeToString(elems[i]);
+                /* Named struct fields need a reference, not an '= type' definition. */
+                char *es = sh_type_name_clean(elems[i]);
                 sh_sb_puts(types, es);
-                LLVMDisposeMessage(es);
+                free(es);
                 if (i + 1 < ne) sh_sb_puts(types, ", ");
             }
             free(elems);

@@ -730,6 +730,51 @@ static void resolve_package_project_root(const char *input) {
     snprintf(package_project_root, sizeof(package_project_root), ".");
 }
 
+static bool zan_file_exists(const char *path);
+
+/* Package lookup may climb to a SDK checkout. Only a user manifest or the
+ * primary input's directory owns default application resources. */
+static void resolve_user_resource_root(const char *input, char *root, size_t cap) {
+    char path[4096];
+#ifdef _WIN32
+    if (!zan_utf8_full_path(input, path, sizeof(path)))
+#else
+    if (!realpath(input, path))
+#endif
+        snprintf(path, sizeof(path), "%s", input);
+    char *sep = strrchr(path, '/');
+    char *back = strrchr(path, '\\');
+    if (!sep || (back && back > sep)) sep = back;
+    if (sep) sep[1] = '\0';
+    else snprintf(path, sizeof(path), ".");
+    snprintf(root, cap, "%s", path);
+    for (;;) {
+        char candidate[4200];
+        snprintf(candidate, sizeof(candidate), "%s/zan.proj", path);
+        if (zan_file_exists(candidate)) {
+            snprintf(root, cap, "%s", path);
+            return;
+        }
+        snprintf(candidate, sizeof(candidate), "%s/packages", path);
+        if (zan_file_exists(candidate)) return;
+        size_t len = strlen(path);
+        while (len > 1 && (path[len - 1] == '/' || path[len - 1] == '\\')) {
+            if (len == 3 && path[1] == ':') return;
+            path[--len] = '\0';
+        }
+        sep = strrchr(path, '/');
+        back = strrchr(path, '\\');
+        if (!sep || (back && back > sep)) sep = back;
+        if (!sep) return;
+        if (sep == path || (sep == path + 2 && path[1] == ':')) {
+            if (!sep[1]) return;
+            sep[1] = '\0';
+        } else {
+            *sep = '\0';
+        }
+    }
+}
+
 static char proj_android_package[256];
 static char proj_android_label[256];
 static bool proj_android_keys_ok = true;

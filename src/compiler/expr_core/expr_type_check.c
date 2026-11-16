@@ -537,14 +537,14 @@ zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_
     if (!member || member->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = member->member.object;
     if (obj->kind == AST_IDENTIFIER) {
-        local_var_t *l = local_find(locals, obj->ident.name);
+        local_var_t *l = receiver_local(obj, locals);
         if (l && l->type && l->type->sym) {
             zan_symbol_t *fsym = get_field_sym(l->type->sym, member->member.name);
             if (fsym) return field_type_through(g, fsym, l->type);
         }
         /* ClassName */
         if (!l && g && g->binder) {
-            zan_symbol_t *cs = zan_binder_lookup(g->binder, obj->ident.name);
+            zan_symbol_t *cs = receiver_type_symbol(g, obj, locals);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fsym = get_field_sym(cs, member->member.name);
                 if (fsym) return fsym->type;
@@ -552,7 +552,7 @@ zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_
         }
         /* EnumType */
         if (!l && g && g->binder) {
-            zan_symbol_t *es = zan_binder_lookup(g->binder, obj->ident.name);
+            zan_symbol_t *es = receiver_type_symbol(g, obj, locals);
             if (es && es->kind == SYM_ENUM) {
                 for (int ei = 0; ei < es->member_count; ei++) {
                     zan_symbol_t *em = es->members[ei];
@@ -565,7 +565,7 @@ zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_
                 }
             }
         }
-        if (g && g->current_type_sym) {
+        if (g && g->current_type_sym && ident_names_own_field(g, obj)) {
             zan_symbol_t *ofsym = get_field_sym(g->current_type_sym, obj->ident.name);
             if (ofsym && ofsym->type && ofsym->type->sym) {
                 zan_symbol_t *fsym = get_field_sym(ofsym->type->sym, member->member.name);

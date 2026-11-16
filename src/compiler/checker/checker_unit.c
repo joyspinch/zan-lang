@@ -26,20 +26,37 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
                                                       method->method_decl.return_type);
     check_generic_constraints(c, c->current_return_type, method->loc);
     struct checker_local *saved_locals = c->locals;
+    struct checker_byref_parameter *saved_byref = c->byref_parameters;
+    int saved_lambda_depth = c->lambda_depth;
     c->locals = NULL;
+    c->byref_parameters = NULL;
+    c->lambda_depth = 0;
     for (int j = 0; j < method->method_decl.params.count; j++) {
         zan_ast_node_t *p = method->method_decl.params.items[j];
         if (p && p->kind == AST_PARAM) {
             zan_type_t *pt = zan_binder_resolve_type(c->binder, p->param.type);
             checker_add_local(c, p->param.name, pt);
+            checker_bind_byref_parameter(c, p);
         }
     }
     zan_ast_node_t *saved_body = c->current_body;
     c->current_body = method->method_decl.body;
+    if (method->kind == AST_CONSTRUCTOR_DECL) {
+        /* Initializer arguments are stored outside the body. Check each once
+         * in parameter scope, with the same argument context as a normal call. */
+        zan_ast_list_t *args = zan_ast_method_base_args(method);
+        int saved_in_call_args = c->in_call_args;
+        c->in_call_args = 1;
+        for (int j = 0; j < args->count; j++)
+            zan_checker_check_expr(c, args->items[j]);
+        c->in_call_args = saved_in_call_args;
+    }
     zan_checker_check_stmt(c, method->method_decl.body);
     zan_definite_check(c->diag, method);
     c->current_body = saved_body;
     c->locals = saved_locals;
+    c->byref_parameters = saved_byref;
+    c->lambda_depth = saved_lambda_depth;
     c->current_return_type = saved;
     c->in_no_runtime = saved_nrt;
     c->current_method_decl = saved_method;
@@ -574,6 +591,20 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             check_weak_member(c, decl, member);
             check_extern_static(c, member);
+            if ((member->kind == AST_FIELD_DECL || member->kind == AST_PROPERTY_DECL) &&
+                member->field_decl.initializer) {
+                zan_type_t *target = zan_binder_resolve_type(
+                    c->binder, member->field_decl.type);
+                if (target && target->kind == TYPE_DELEGATE) {
+                    int saved_assignable = c->in_assignable_ctx;
+                    c->in_assignable_ctx = 1;
+                    zan_type_t *value = zan_checker_check_expr(
+                        c, member->field_decl.initializer);
+                    checker_check_assignable(c, target, value,
+                        member->field_decl.initializer, member->loc, "field initializer");
+                    c->in_assignable_ctx = saved_assignable;
+                }
+            }
             if (member->kind == AST_METHOD_DECL ||
                 member->kind == AST_CONSTRUCTOR_DECL ||
                 member->kind == AST_DESTRUCTOR_DECL) {

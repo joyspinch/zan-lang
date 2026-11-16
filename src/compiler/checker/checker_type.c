@@ -864,68 +864,76 @@ static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e);
  * （irgen_expr_lambda.c emit_lambda_typed），实现体在文件尾。 */
 static bool checker_type_is_expr_tree_target(zan_type_t *t);
 
-/* 方法组 → 委托的签名兼容性（C# 方法组转换规则的收窄版）：
- * 参数个数一致、每个委托形参可赋给方法形参（逆变方向）、
- * 返回值 void 对 void，否则方法返回类型可赋给委托返回类型（协变）。
- * 不兼容绝不能静默放行——发码侧裸函数指针按错误签名调用时，
- * 形参读到的就是寄存器残渣（B-ID48 的运行期腐坏）。 */
-static bool method_matches_delegate_sig(zan_checker_t *c, zan_symbol_t *m,
-                                        zan_type_t *dlg) {
-    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL ||
-        !dlg || dlg->kind != TYPE_DELEGATE)
-        return false;
-    if (m->decl->method_decl.type_params.count > 0)
-        return false; /* 泛型方法组：发码侧无实例化路径，直接判不兼容 */
-    zan_ast_list_t *ps = &m->decl->method_decl.params;
-    int dp = dlg->delegate_param_count;
-    if (!ps || ps->count != dp) return false;
-    if (dp > 0 && !dlg->delegate_param_types) return false;
-    for (int i = 0; i < dp; i++) {
-        zan_type_t *dpt = dlg->delegate_param_types[i];
-        zan_ast_node_t *pn = ps->items[i];
-        zan_type_t *mpt = (pn && pn->kind == AST_PARAM && pn->param.type)
-            ? zan_binder_resolve_type(c->binder, pn->param.type) : NULL;
-        if (!dpt || !mpt) return false;
-        if (dpt->kind == TYPE_TYPE_PARAM || mpt->kind == TYPE_TYPE_PARAM)
-            return false;
-        if (!checker_type_equal(dpt, mpt) &&
-            !checker_type_assignable(mpt, dpt))
-            return false;
-    }
-    zan_type_t *dret = dlg->delegate_ret_type;
-    zan_ast_node_t *rt = m->decl->method_decl.return_type;
-    zan_type_t *mret = rt ? zan_binder_resolve_type(c->binder, rt)
-                          : c->binder->type_void;
-    if (!dret || dret->kind == TYPE_VOID || dret->kind == TYPE_ERROR)
-        return !mret || mret->kind == TYPE_VOID;
-    if (!mret || mret->kind == TYPE_VOID) return false;
-    return checker_type_equal(dret, mret) ||
-           checker_type_assignable(dret, mret);
+static zan_symbol_t *checker_method_group_type_receiver(zan_checker_t *c,
+                                                        zan_ast_node_t *obj) {
+    if (!obj || obj->kind != AST_IDENTIFIER) return NULL;
+    zan_symbol_t *type = zan_binder_type_receiver(c->binder, obj);
+    if (type) return type;
+    if (checker_find_local_slot(c, obj->ident.name)) return NULL;
+    if (c->current_type_sym &&
+        checker_find_field(c->current_type_sym, obj->ident.name)) return NULL;
+    type = zan_binder_lookup(c->binder, obj->ident.name);
+    return type && (type->kind == SYM_CLASS || type->kind == SYM_STRUCT ||
+                    type->kind == SYM_INTERFACE) ? type : NULL;
 }
 
-static bool method_group_matches_delegate(zan_checker_t *c, zan_symbol_t *m,
-                                         zan_type_t *dlg) {
-    if (!m || !dlg) return false;
-    if (method_matches_delegate_sig(c, m, dlg)) return true;
-    for (zan_symbol_t *ts = m->parent; ts;
-         ts = (ts->type && ts->type->base_type) ? ts->type->base_type->sym : NULL) {
-        for (int i = 0; i < ts->member_count; i++) {
-            zan_symbol_t *cand = ts->members[i];
-            if (!cand || cand == m || cand->kind != SYM_METHOD) continue;
-            if (cand->name.len == m->name.len &&
-                memcmp(cand->name.str, m->name.str, (size_t)m->name.len) == 0) {
-                if (method_matches_delegate_sig(c, cand, dlg))
-                    return true;
-            }
+/* Resolve against the actual receiver form; binder owns signature and
+ * overload selection. Probing an outer overload must not cache its candidate. */
+static zan_symbol_t *checker_method_group_candidate(zan_checker_t *c,
+        zan_ast_node_t *expr, zan_type_t *target) {
+    zan_symbol_t *group = expr_method_group(c, expr);
+    if (!group) return NULL;
+    zan_type_t *receiver = NULL;
+    zan_method_group_receiver_t form = ZAN_METHOD_GROUP_VALUE;
+    if (expr->kind == AST_IDENTIFIER) {
+        receiver = c->current_type_sym ? c->current_type_sym->type : NULL;
+        bool has_this = c->current_method_decl &&
+            !(c->current_method_decl->method_decl.modifiers & MOD_STATIC);
+        form = has_this ? ZAN_METHOD_GROUP_IMPLICIT : ZAN_METHOD_GROUP_TYPE;
+    } else {
+        zan_ast_node_t *obj = expr->member.object;
+        zan_symbol_t *type = checker_method_group_type_receiver(c, obj);
+        if (type) {
+            receiver = obj->ident.inst_type_ref
+                ? zan_binder_resolve_type(c->binder, obj->ident.inst_type_ref)
+                : type->type;
+            form = ZAN_METHOD_GROUP_TYPE;
+        } else {
+            receiver = zan_checker_check_expr(c, obj);
         }
     }
-    return false;
+    return zan_binder_method_group(c->binder, receiver, group->name, form,
+                                   target, NULL);
+}
+
+static bool method_group_matches_delegate(zan_checker_t *c, zan_ast_node_t *expr,
+                                         zan_type_t *target) {
+    return checker_method_group_candidate(c, expr, target) != NULL;
+}
+
+static bool checker_bind_method_group(zan_checker_t *c, zan_ast_node_t *expr,
+                                      zan_type_t *target) {
+    bool matches = method_group_matches_delegate(c, expr, target);
+    zan_binder_set_method_group_target(expr, target);
+    return matches;
 }
 
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
                                      zan_type_t *value, zan_ast_node_t *expr,
                                      zan_loc_t loc, const char *what) {
     if (!target || !value) return;
+    if (expr && target->kind == TYPE_DELEGATE && expr->kind == AST_CONDITIONAL) {
+        zan_ast_node_t *arms[2] = { expr->conditional.then_expr,
+                                   expr->conditional.else_expr };
+        int saved_assignable = c->in_assignable_ctx;
+        c->in_assignable_ctx = 1;
+        for (int i = 0; i < 2; i++) {
+            zan_type_t *arm_type = zan_checker_check_expr(c, arms[i]);
+            checker_check_assignable(c, target, arm_type, arms[i], loc, what);
+        }
+        c->in_assignable_ctx = saved_assignable;
+        return;
+    }
     if (expr) {
         zan_symbol_t *mg = expr_method_group(c, expr);
         if (mg) {
@@ -935,7 +943,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
             }
             /* 方法组 → 委托：签名兼容才放行，不兼容当场报——
              * 静默放行会走到发码侧按错误签名调用（B-ID48）。 */
-            if (!method_group_matches_delegate(c, mg, target)) {
+            if (!checker_bind_method_group(c, expr, target)) {
                 zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2098,
                     "method '%.*s' cannot be converted to delegate type "
                     "'%s': signature is not compatible",

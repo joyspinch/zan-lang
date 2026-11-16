@@ -14,6 +14,10 @@ static LLVMValueRef coerce_ternary_value(zan_irgen_t *g, LLVMValueRef v,
 }
 LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+    return emit_expr_conditional_typed(g, expr, NULL, locals);
+}
+LLVMValueRef emit_expr_conditional_typed(zan_irgen_t *g, zan_ast_node_t *expr,
+        zan_type_t *expected, local_scope_t *locals) {
         LLVMValueRef cond = emit_expr(g, expr->conditional.cond, locals);
         /* normalize to i1 */
         cond = zan_tobool(g->builder, cond, "cond");
@@ -25,12 +29,20 @@ LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)), "tern.merge");
         LLVMBuildCondBr(g->builder, cond, then_bb, else_bb);
 
+        zan_type_t *conditional_type = expected && expected->kind == TYPE_DELEGATE
+            ? expected : infer_expr_type(g, expr, locals);
+        zan_type_t *delegate_type = conditional_type &&
+            conditional_type->kind == TYPE_DELEGATE ? conditional_type : NULL;
         LLVMPositionBuilderAtEnd(g->builder, then_bb);
-        LLVMValueRef then_val = emit_expr(g, expr->conditional.then_expr, locals);
+        LLVMValueRef then_val = delegate_type
+            ? emit_arg_typed(g, expr->conditional.then_expr, delegate_type, locals)
+            : emit_expr(g, expr->conditional.then_expr, locals);
         LLVMBasicBlockRef then_end = LLVMGetInsertBlock(g->builder);
 
         LLVMPositionBuilderAtEnd(g->builder, else_bb);
-        LLVMValueRef else_val = emit_expr(g, expr->conditional.else_expr, locals);
+        LLVMValueRef else_val = delegate_type
+            ? emit_arg_typed(g, expr->conditional.else_expr, delegate_type, locals)
+            : emit_expr(g, expr->conditional.else_expr, locals);
         LLVMBasicBlockRef else_end = LLVMGetInsertBlock(g->builder);
 
         /* A482：两臂都是 void 调用（语句位三元 `flag ? A() : B();`，最常见
@@ -51,7 +63,6 @@ LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMTypeRef tty = LLVMTypeOf(then_val);
         LLVMTypeRef ety = LLVMTypeOf(else_val);
         LLVMTypeRef phi_ty = tty;
-        zan_type_t *conditional_type = infer_expr_type(g, expr, locals);
         if (conditional_type && is_rc_managed_type(conditional_type)) {
             int then_owned = expr_yields_owned_rc_value(
                 g, expr->conditional.then_expr, locals);
@@ -111,6 +122,7 @@ LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef incoming_vals[] = { then_val, else_val };
         LLVMBasicBlockRef incoming_bbs[] = { then_end, else_end };
         LLVMAddIncoming(phi, incoming_vals, incoming_bbs, 2);
+        note_emitted_delegate_owner(g, expr, phi, delegate_type, locals);
         return phi;
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
@@ -129,6 +141,12 @@ LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     zan_istr_t hname = { (char *)kSwx, 4 };
     int mark = locals->count;
     local_add(locals, hname, rslot, rty);
+    if (is_rc_managed_type(rty) && LLVMGetTypeKind(rtll) == LLVMPointerTypeKind)
+        locals->vars[mark].arc_owned = 1;
+    else if (rty->kind == TYPE_STRUCT && type_contains_collection_rc(g, rty, 0))
+        locals->vars[mark].struct_rc = 1;
+    if (local_needs_cleanup(&locals->vars[mark]))
+        lpad_register_local(g, &locals->vars[mark]);
 
     zan_ast_node_t *syn = zan_ast_new(g->arena, AST_SWITCH_STMT, expr->loc);
     syn->switch_stmt.expr = expr->switch_expr.expr;
@@ -174,8 +192,11 @@ LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     }
 
     emit_stmt(g, syn, locals);
+    LLVMValueRef result = LLVMBuildLoad2(g->builder, rtll, rslot, "swx.load");
+    /* The expression yields +1. Transfer it out of the hidden cleanup slot. */
+    zan_store_fit(g, LLVMConstNull(rtll), rslot);
     locals->count = mark;
-    return LLVMBuildLoad2(g->builder, rtll, rslot, "swx.load");
+    return result;
 }
 
 /* record with 表达式：非破坏性浅拷贝并覆盖指定字段 */
