@@ -22,6 +22,8 @@ on:
       # Trigger on the runtime tree so their headers and vendored codecs cannot
       # silently leave a committed driver behind the new ABI.
       - 'src/runtime/**'
+      - 'src/drivers/**'
+      - 'src/third_party/**'
       # The win cross-link runtime objects also embed the compressed-resource
       # decoder, whose sources live outside src/runtime -- an edit to them
       # changes the committed object, so this leg has to re-run.
@@ -40,6 +42,8 @@ on:
     paths:
       - '.github/workflows/drivers.yml'
       - 'src/runtime/**'
+      - 'src/drivers/**'
+      - 'src/third_party/**'
       - 'packages/Zan.Data/**'
       - 'scripts/build_linux_gui_static.sh'
       - 'scripts/build_macos_gui.sh'
@@ -322,6 +326,7 @@ jobs:
           update: true
           install: >-
             ${{ matrix.prefix }}-gcc
+            ${{ matrix.prefix }}-clang
             ${{ matrix.prefix }}-sqlite3
             unzip
 
@@ -349,12 +354,23 @@ jobs:
           GAME="packages/Zan.Game/src/Game/Graphics/drivers/${{ matrix.target }}"
           WORK="build/native_drivers/${{ matrix.target }}"
           mkdir -p "$WORK" "$DEST/static" "$IMAGE/static" "$AUDIO/static" "$GAME/static"
+          CFLAGS=(-O2 -DNDEBUG -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
+                  -I src/drivers -I src/third_party -I src/runtime)
+          STATIC_TARGET=x86_64-w64-windows-gnu
+          if [ "${{ matrix.target }}" = win-arm64 ]; then STATIC_TARGET=aarch64-w64-windows-gnu; fi
           # Separate DLL and static objects: _STATIC suppresses PE exports.
-          cc -O2 -DNDEBUG -c src/runtime/gui_runtime.c -o "$WORK/gui.o"
-          cc -O2 -DNDEBUG -DZAN_GUI_STATIC -c src/runtime/gui_runtime.c -o "$WORK/gui.static.o"
-          c++ -O2 -DNDEBUG -fno-exceptions -fno-rtti -c src/runtime/gui_runtime_dwrite.cpp -o "$WORK/dwrite.o"
-          c++ -O2 -DNDEBUG -DZAN_GUI_STATIC -fno-exceptions -fno-rtti -c src/runtime/gui_runtime_dwrite.cpp -o "$WORK/dwrite.static.o"
-          c++ -O2 -shared -o "$DEST/zan_gui.dll" "$WORK/gui.o" "$WORK/dwrite.o" \
+          # Clang emits split sections as COFF COMDATs, which LLD can GC;
+          # GCC's split section names alone do not guarantee COMDAT status.
+          cc "${CFLAGS[@]}" -c src/drivers/gui/gui_runtime.c -o "$WORK/gui.o"
+          clang --target="$STATIC_TARGET" "${CFLAGS[@]}" -DZAN_GUI_STATIC -ffunction-sections -fdata-sections \
+            -c src/drivers/gui/gui_runtime.c -o "$WORK/gui.static.o"
+          cc "${CFLAGS[@]}" -c src/runtime/rt_crash.c -o "$WORK/crash.o"
+          c++ "${CFLAGS[@]}" -fno-exceptions -fno-rtti \
+            -c src/drivers/gui/gui_runtime_dwrite.cpp -o "$WORK/dwrite.o"
+          clang++ --target="$STATIC_TARGET" "${CFLAGS[@]}" -DZAN_GUI_STATIC -ffunction-sections -fdata-sections \
+            -fno-exceptions -fno-rtti \
+            -c src/drivers/gui/gui_runtime_dwrite.cpp -o "$WORK/dwrite.static.o"
+          c++ -O2 -shared -o "$DEST/zan_gui.dll" "$WORK/gui.o" "$WORK/dwrite.o" "$WORK/crash.o" \
             -Wl,--out-implib,"$DEST/libzan_gui.dll.a" -static-libgcc -static-libstdc++ \
             -luser32 -lgdi32 -ldwmapi -lshcore -limm32 -lole32 -lrpcrt4
           rm -f "$DEST/static/libzan_gui.a"
@@ -368,8 +384,9 @@ jobs:
               game) OUT="$GAME"; LIBS="-L$DEST -L$IMAGE -lzan_gui -lzan_image" ;;
             esac
             STATIC="ZAN_$(printf '%s' "$FEATURE" | tr '[:lower:]' '[:upper:]')_STATIC"
-            cc -O2 -DNDEBUG -c "src/runtime/$NAME.c" -o "$WORK/$NAME.o"
-            cc -O2 -DNDEBUG -D"$STATIC" -c "src/runtime/$NAME.c" -o "$WORK/$NAME.static.o"
+            cc "${CFLAGS[@]}" -c "src/drivers/$FEATURE/$NAME.c" -o "$WORK/$NAME.o"
+            clang --target="$STATIC_TARGET" "${CFLAGS[@]}" -D"$STATIC" -ffunction-sections -fdata-sections \
+              -c "src/drivers/$FEATURE/$NAME.c" -o "$WORK/$NAME.static.o"
             cc -O2 -shared -static-libgcc -o "$OUT/$NAME.dll" "$WORK/$NAME.o" \
               -Wl,--out-implib,"$OUT/lib$NAME.dll.a" $LIBS
             rm -f "$OUT/static/lib$NAME.a"
