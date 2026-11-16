@@ -208,11 +208,14 @@ public class AmqpChannel : IDisposable {
         return await this.BasicConsumeAsync(queue, true, handler);
     }
 
-    // 发布二进制消息 (分帧流水发送：Method 帧 -> Content Header 帧 -> Body 帧序列)
+    // 发布二进制消息 (分帧流水发送：Method 帧 -> Content Header 帧 -> Body 帧序列)。
+    // 任一帧发送失败即关闭连接并返回 false——此前三段 SendRawAsync 的返回
+    // 值全部被丢弃、无条件返回 true，连接已断调用方仍以为发布成功。
     public async bool BasicPublishBytesAsync(string exchange, string routingKey, byte[] body, int bodyLen, BasicProperties props) {
         if (!this.open || this.conn == null) { return false; }
         if (props == null) { props = BasicProperties.CreateDefault(); }
         if (body == null) { bodyLen = 0; }
+        if (bodyLen < 0 || (body != null && bodyLen > body.Length)) { return false; }
 
         // 1. 发送 Basic.Publish 方法帧 (Class 60, Method 40)
         AmqpWriter mw = new AmqpWriter();
@@ -225,7 +228,11 @@ public class AmqpChannel : IDisposable {
         mw.WriteBit(false); // immediate
         mw.FlushBits();
         byte[] methodPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, mw.ToBytes(), mw.Length());
-        await this.conn.SendRawAsync(methodPkt, methodPkt.Length);
+        int sentMethod = await this.conn.SendRawAsync(methodPkt, methodPkt.Length);
+        if (sentMethod < methodPkt.Length) {
+            this.conn.Close();
+            return false;
+        }
 
         // 2. 发送 Content Header 帧 (Type 2: Class 60, Weight 0, BodySize 64-bit, Properties)
         AmqpWriter hw = new AmqpWriter();
@@ -234,7 +241,11 @@ public class AmqpChannel : IDisposable {
         hw.WriteLongLong((long)bodyLen); // body size
         props.Encode(hw);
         byte[] headerPkt = AmqpFrame.Encode(AmqpConstants.FRAME_HEADER, this.channelId, hw.ToBytes(), hw.Length());
-        await this.conn.SendRawAsync(headerPkt, headerPkt.Length);
+        int sentHeader = await this.conn.SendRawAsync(headerPkt, headerPkt.Length);
+        if (sentHeader < headerPkt.Length) {
+            this.conn.Close();
+            return false;
+        }
 
         // 3. 发送 Content Body 帧 (Type 3: 切片按协商的 frameMax 流水切分)
         if (bodyLen > 0) {
@@ -247,7 +258,11 @@ public class AmqpChannel : IDisposable {
                 byte[] chunkBuf = new byte[chunk];
                 NativeMemory.Copy((nint)chunkBuf, (nint)body + offset, chunk);
                 byte[] bodyPkt = AmqpFrame.Encode(AmqpConstants.FRAME_BODY, this.channelId, chunkBuf, chunk);
-                await this.conn.SendRawAsync(bodyPkt, bodyPkt.Length);
+                int sentBody = await this.conn.SendRawAsync(bodyPkt, bodyPkt.Length);
+                if (sentBody < bodyPkt.Length) {
+                    this.conn.Close();
+                    return false;
+                }
                 offset = offset + chunk;
             }
         }

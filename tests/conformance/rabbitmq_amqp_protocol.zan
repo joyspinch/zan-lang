@@ -7,6 +7,7 @@ using Messaging.RabbitMQ;
 class Program {
     static int failures = 0;
     static int PORT = 15672;
+    static int EVIL_PORT = 15673;
 
     static void Check(bool cond, string name) {
         if (cond) {
@@ -312,6 +313,78 @@ class Program {
         }
     }
 
+    // 恶意 broker：完成握手后发送帧长超预算（0x7FFFFFFF）的帧头——
+    // 锚定帧循环的长度预算防线：直接断开，而不是按长度巨分配挂死
+    // （此前照单全收，new byte[2 GiB] 直接拖垮进程）。
+    static async void RunEvilBroker() {
+        TcpListener l = new TcpListener("127.0.0.1", Program.EVIL_PORT);
+        l.Start();
+        nint sock = await l.AcceptAsync();
+        try {
+            Socket.SetNoDelay(sock);
+            byte[] protoHdr = new byte[8];
+            int rHdr = await Program.ReadExact(sock, protoHdr, 8);
+            if (rHdr < 8) { return; }
+
+            AmqpWriter sw = new AmqpWriter();
+            sw.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            sw.WriteShort(AmqpConstants.METHOD_CONNECTION_START);
+            sw.WriteOctet(0);
+            sw.WriteOctet(9);
+            Dictionary<string, string> serverProps = new Dictionary<string, string>();
+            sw.WriteTable(serverProps);
+            sw.WriteLongString("PLAIN");
+            sw.WriteLongString("en_US");
+            byte[] startPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, sw.ToBytes(), sw.Length());
+            await Socket.SendAsync(sock, startPkt, startPkt.Length);
+
+            byte[] frameHdr = new byte[7];
+            await Program.ReadExact(sock, frameHdr, 7);
+            AmqpFrame f = AmqpFrame.DecodeHeader(frameHdr, 0);
+            byte[] p = new byte[f.length + 1];
+            await Program.ReadExact(sock, p, f.length + 1);
+
+            AmqpWriter tw = new AmqpWriter();
+            tw.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            tw.WriteShort(AmqpConstants.METHOD_CONNECTION_TUNE);
+            tw.WriteShort(2047);
+            tw.WriteLong(131072);
+            tw.WriteShort(60);
+            byte[] tunePkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, tw.ToBytes(), tw.Length());
+            await Socket.SendAsync(sock, tunePkt, tunePkt.Length);
+
+            await Program.ReadExact(sock, frameHdr, 7);
+            f = AmqpFrame.DecodeHeader(frameHdr, 0);
+            p = new byte[f.length + 1];
+            await Program.ReadExact(sock, p, f.length + 1);
+
+            await Program.ReadExact(sock, frameHdr, 7);
+            f = AmqpFrame.DecodeHeader(frameHdr, 0);
+            p = new byte[f.length + 1];
+            await Program.ReadExact(sock, p, f.length + 1);
+
+            AmqpWriter ow = new AmqpWriter();
+            ow.WriteShort(AmqpConstants.CLASS_CONNECTION);
+            ow.WriteShort(AmqpConstants.METHOD_CONNECTION_OPEN_OK);
+            ow.WriteShortString("");
+            byte[] openOkPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, ow.ToBytes(), ow.Length());
+            await Socket.SendAsync(sock, openOkPkt, openOkPkt.Length);
+
+            await Task.Delay(50);
+
+            byte[] evil = new byte[8];
+            evil[0] = (byte)AmqpConstants.FRAME_METHOD;
+            evil[1] = 0; evil[2] = 1;
+            evil[3] = 127; evil[4] = 255; evil[5] = 255; evil[6] = 255;
+            evil[7] = (byte)AmqpConstants.FRAME_END;
+            await Socket.SendAsync(sock, evil, evil.Length);
+            await Task.Delay(400);
+        } finally {
+            Socket.Close(sock);
+            l.Stop();
+        }
+    }
+
     static string receivedBody = "";
     static long receivedTag = 0;
     static string receivedTraceId = "";
@@ -383,11 +456,28 @@ class Program {
         bool pubQueueOk = await channel.PublishToQueueAsync("orders.q", "{\"queueMsg\":true}");
         Check(pubQueueOk, "minimal publish to queue sent");
 
+        // 9.5 bodyLen 界校验：声明长度超过缓冲区实际大小直接拒绝，
+        // 不再越界读取源缓冲。
+        byte[] tinyBody = new byte[4];
+        bool badLen = await channel.BasicPublishBytesAsync("orders.exchange", "orders.created", tinyBody, 100, null);
+        Check(badLen == false, "publish bodyLen overrun rejected");
+
         // 9. 优雅退出与资源清理
         channel.Dispose();
         channel = null;
         await conn.CloseAsync();
         conn = null;
+
+        // 9.6 帧长度预算：恶意 broker 握手后发送 2 GiB 帧长的帧——
+        // 客户端必须短窗内断开（此前按长度巨分配，读不满就一直挂着）。
+        Task.Spawn(Program.RunEvilBroker());
+        await Task.Delay(100);
+        AmqpConnection evilConn = await AmqpConnection.ConnectAsync(
+            "127.0.0.1", Program.EVIL_PORT, "admin", "secret123", "/");
+        Check(evilConn != null && evilConn.IsConnected(), "evil broker handshake completed");
+        await Task.Delay(300);
+        Check(evilConn.IsConnected() == false, "oversize frame tears down connection");
+        evilConn.Dispose();
 
         Program.serverRunning = false;
         if (Program.serverListener != null) {
