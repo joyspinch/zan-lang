@@ -39,21 +39,14 @@ namespace Ai;
 public class AiClient : IDisposable, IChat {
     public AiConfig config;
 
-    // 端点 → HttpClient（**按端点复用**，不是每次请求新建）。
-    //
-    // 为什么不每次新建：`HttpClient` 内部有连接池，每次新建等于每次
-    // 丢掉池子里的 keep-alive 连接——连接被服务端留着，客户端这边却
-    // 已经把它丢了。实测：每次请求新建 `HttpClient` 且不关，leakcheck
-    // 报"10 个 TcpClient / HttpRequest / ByteBuffer 泄漏"（每个请求一个）。
-    //
-    // 为什么不全局共用一个 `HttpClient`：连接池是**按 host/port 建的**，
-    // 换端点就得换客户端。所以按端点规范化串（`AiEndpoint.Canonical`）
-    // 做键，一个端点一个客户端。
-    private Dictionary<string, HttpClient> clients;
+    // 出网机械层（B-ID167② 提炼）：端点 → HttpClient 缓存、POST 重试
+    // 骨架与错误文案提取都在 `AiHttp`，本类只留协议面（鉴权头、路径、
+    // 消息体的 JSON 形状）。
+    private AiHttp http;
 
     public AiClient(AiConfig config) {
         this.config = config == null ? new AiConfig("", "", "") : config;
-        this.clients = new Dictionary<string, HttpClient>();
+        this.http = new AiHttp(this.config);
     }
 
     // 关闭所有出网连接（进程退出前或长寿命客户端空闲时调用）。
@@ -61,11 +54,7 @@ public class AiClient : IDisposable, IChat {
     // 不关的话，池子里的 keep-alive 连接会一直挂着到进程退出——服务端
     // 那边也是（半开连接）。
     public void Close() {
-        List<string> keys = this.clients.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            this.clients[keys[i]].Close();
-        }
-        this.clients.Clear();
+        this.http.Close();
     }
 
     public void Dispose() { this.Close(); }
@@ -538,13 +527,9 @@ public class AiClient : IDisposable, IChat {
     // 不让传输层回落到 64MiB 的默认值。
     private HttpClient StreamClient(AiEndpoint ep) {
         string key = ep.Canonical() + "|sse";
-        if (this.clients.ContainsKey(key)) { return this.clients[key]; }
-        HttpClient http = null;
-        if (ep.Tls()) {
-            http = HttpClient.CreateHttps(ep.Host(), ep.Port());
-        } else {
-            http = new HttpClient(ep.Host(), ep.Port());
-        }
+        HttpClient http = this.http.CacheGet(key);
+        if (http != null) { return http; }
+        http = this.http.CreateClient(ep);
         ExternalCallPolicy p = this.Policy(ep).IdleTimeout(this.config.readTimeoutMs)
             .NoTotalTimeout()
             .StreamLimit(this.config.responseLimitBytes);
@@ -554,9 +539,11 @@ public class AiClient : IDisposable, IChat {
         if (this.config.apiKey.Length > 0) {
             http.SetHeader("Authorization", "Bearer " + this.config.apiKey);
         }
-        this.clients[key] = http;
+        this.http.CachePut(key, http);
         return http;
-    }    // ------------------------------------------------------------------
+    }
+
+    // ------------------------------------------------------------------
     // 内部：HTTP
     // ------------------------------------------------------------------
 
@@ -564,65 +551,29 @@ public class AiClient : IDisposable, IChat {
     //
     // public 是因为 `Embeddings` 也用它（同一套出网预算与重试策略
     // 不该写两遍）。包内调用不会绕过 lastError 的约定。
+    // 重试骨架与错误文案在 `AiHttp.Post`（B-ID167② 提炼）。
     public async string PostJson(AiEndpoint ep, string path, string payload) {
-        if (payload.Length > this.config.requestLimitBytes) {
-            this.lastError = "请求体超过上限（"
-                + this.config.requestLimitBytes.ToString() + " 字节）";
-            return null;
-        }
-        int attempts = this.config.maxAttempts;
-        if (attempts < 1) { attempts = 1; }
-        string lastReason = "";
-        for (int attempt = 0; attempt < attempts; attempt = attempt + 1) {
-            if (attempt > 0) {
-                // 指数退避：100ms / 200ms / 400ms …（上限 2 秒）。
-                int wait = 100 * (1 << (attempt - 1));
-                if (wait > 2000) { wait = 2000; }
-                await Task.Delay(wait);
-            }
-            HttpClient http = null;
-            try {
-                http = this.Client(ep);
-                HttpResponse resp = await http.SendAsync("POST", ep.Path() + path, payload);
-                int status = resp.statusCode;
-                string bodyText = resp.body;
-                if (status >= 200 && status < 300) {
-                    return bodyText;
-                }
-                // 4xx 不重试（请求本身有问题）。
-                if (status < 500) {
-                    this.lastError = AiClient.HttpErrorMessage(status, bodyText);
-                    return null;
-                }
-                lastReason = "AI 服务返回 " + status.ToString();
-            } catch (Exception e) {
-                lastReason = "请求 AI 服务失败：" + e.Message;
-            }
-        }
-        this.lastError = lastReason;
-        return null;
+        string raw = await this.http.Post(this.Client(ep), ep.Path() + path, payload, "AI");
+        this.lastError = this.http.lastError;
+        return raw;
     }
 
     // 取（或建）该端点的 `HttpClient`。
     //
     // 同一个端点复用同一个客户端，连接池才能生效；换端点就换客户端
-    // （池是按 host/port 建的）。
+    // （池是按 host/port 建的）。缓存本体在 `AiHttp`，这里只留本协议
+    // 的鉴权头。
     private HttpClient Client(AiEndpoint ep) {
-        string key = ep.Canonical();
-        if (this.clients.ContainsKey(key)) { return this.clients[key]; }
-        HttpClient http = null;
-        if (ep.Tls()) {
-            http = HttpClient.CreateHttps(ep.Host(), ep.Port());
-        } else {
-            http = new HttpClient(ep.Host(), ep.Port());
-        }
+        HttpClient http = this.http.CacheGet(ep.Canonical());
+        if (http != null) { return http; }
+        http = this.http.CreateClient(ep);
         http.SetCallPolicy(this.Policy(ep));
         http.SetHeader("Content-Type", "application/json");
         http.SetHeader("Accept", "application/json");
         if (this.config.apiKey.Length > 0) {
             http.SetHeader("Authorization", "Bearer " + this.config.apiKey);
         }
-        this.clients[key] = http;
+        this.http.CachePut(ep.Canonical(), http);
         return http;
     }
 
@@ -728,26 +679,6 @@ public class AiClient : IDisposable, IChat {
         string msg = doc.StrAt(doc.Get(err, "message"), "");
         if (msg.Length > 0) { return msg; }
         return "AI 服务返回错误";
-    }
-
-    // 从 HTTP 响应里提错误文案（4xx 时的解释）。
-    private static string HttpErrorMessage(int status, string body) {
-        string detail = "";
-        if (body != null && body.Length > 0) {
-            JsonDoc doc = null;
-            try {
-                doc = JsonDoc.Parse(body);
-            } catch (Exception e) {
-                doc = null;
-            }
-            if (doc != null && doc.root >= 0) {
-                detail = AiClient.ErrorMessage(doc);
-            }
-        }
-        if (detail.Length == 0) {
-            detail = "AI 服务返回 " + status.ToString();
-        }
-        return detail;
     }
 
     // 记录用量：服务端口径与本包一致就用服务端的，否则保持估算。

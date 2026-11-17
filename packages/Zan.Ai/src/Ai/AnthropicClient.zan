@@ -45,9 +45,10 @@ public class AnthropicClient : IChat {
     // 配置（baseUrl / apiKey / model / 超时预算 / maxTokens）。
     public AiConfig config;
 
-    // 端点 → HttpClient（**按端点复用**，与 `AiClient` 同一纪律：每次
-    // 请求新建 HttpClient 等于每次丢掉连接池里的 keep-alive 连接）。
-    private Dictionary<string, HttpClient> clients;
+    // 出网机械层（B-ID167② 提炼）：端点 → HttpClient 缓存、POST 重试
+    // 骨架与错误文案提取都在 `AiHttp`，本类只留协议面（x-api-key 鉴权、
+    // /v1/messages 路径、内容块数组形状）。
+    private AiHttp http;
 
     // Anthropic API 版本头（`anthropic-version`）。
     private string apiVersion;
@@ -60,7 +61,7 @@ public class AnthropicClient : IChat {
 
     public AnthropicClient(AiConfig config) {
         this.config = config == null ? new AiConfig("", "", "") : config;
-        this.clients = new Dictionary<string, HttpClient>();
+        this.http = new AiHttp(this.config);
         this.apiVersion = AnthropicClient.DefaultApiVersion();
         this.lastError = "";
         this.lastUsage = new AiUsage();
@@ -68,7 +69,7 @@ public class AnthropicClient : IChat {
 
     public AnthropicClient(string baseUrl, string apiKey, string model) {
         this.config = new AiConfig(baseUrl, apiKey, model);
-        this.clients = new Dictionary<string, HttpClient>();
+        this.http = new AiHttp(this.config);
         this.apiVersion = AnthropicClient.DefaultApiVersion();
         this.lastError = "";
         this.lastUsage = new AiUsage();
@@ -84,11 +85,7 @@ public class AnthropicClient : IChat {
 
     // 关掉出网连接（进程退出前或长寿命客户端空闲时调用）。
     public void Close() {
-        List<string> keys = this.clients.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            this.clients[keys[i]].Close();
-        }
-        this.clients.Clear();
+        this.http.Close();
     }
 
     public void Dispose() { this.Close(); }
@@ -278,42 +275,12 @@ public class AnthropicClient : IChat {
     }
 
     // 发起一次 POST（带重试）。失败返回 null，原因在 lastError。
+    // 重试骨架与错误文案在 `AiHttp.Post`（B-ID167② 提炼）。
     public async string PostJson(AiEndpoint ep, string payload) {
-        if (payload.Length > this.config.requestLimitBytes) {
-            this.lastError = "请求体超过上限（"
-                + this.config.requestLimitBytes.ToString() + " 字节）";
-            return null;
-        }
-        int attempts = this.config.maxAttempts;
-        if (attempts < 1) { attempts = 1; }
-        string lastReason = "";
-        for (int attempt = 0; attempt < attempts; attempt = attempt + 1) {
-            if (attempt > 0) {
-                int wait = 100 * (1 << (attempt - 1));
-                if (wait > 2000) { wait = 2000; }
-                await Task.Delay(wait);
-            }
-            HttpClient http = null;
-            try {
-                http = this.Client(ep);
-                HttpResponse resp = await http.SendAsync("POST",
-                    AnthropicClient.MessagesPath(ep), payload);
-                int status = resp.statusCode;
-                string bodyText = resp.body;
-                if (status >= 200 && status < 300) {
-                    return bodyText;
-                }
-                if (status < 500) {
-                    this.lastError = AnthropicClient.HttpErrorMessage(status, bodyText);
-                    return null;
-                }
-                lastReason = "Anthropic 服务返回 " + status.ToString();
-            } catch (Exception e) {
-                lastReason = "请求 Anthropic 服务失败：" + e.Message;
-            }
-        }
-        this.lastError = lastReason;
-        return null;
+        string raw = await this.http.Post(this.Client(ep),
+            AnthropicClient.MessagesPath(ep), payload, "Anthropic");
+        this.lastError = this.http.lastError;
+        return raw;
     }
 
     // 请求路径。
@@ -328,16 +295,12 @@ public class AnthropicClient : IChat {
     }
 
     // 取（或建）该端点的 `HttpClient`。同一端点复用同一个客户端，连接池
-    // 才能生效；换端点就换客户端（池是按 host/port 建的）。
+    // 才能生效；换端点就换客户端（池是按 host/port 建的）。缓存本体在
+    // `AiHttp`，这里只留本协议的鉴权头。
     private HttpClient Client(AiEndpoint ep) {
-        string key = ep.Canonical();
-        if (this.clients.ContainsKey(key)) { return this.clients[key]; }
-        HttpClient http = null;
-        if (ep.Tls()) {
-            http = HttpClient.CreateHttps(ep.Host(), ep.Port());
-        } else {
-            http = new HttpClient(ep.Host(), ep.Port());
-        }
+        HttpClient http = this.http.CacheGet(ep.Canonical());
+        if (http != null) { return http; }
+        http = this.http.CreateClient(ep);
         http.SetCallPolicy(this.Policy(ep));
         http.SetHeader("Content-Type", "application/json");
         http.SetHeader("Accept", "application/json");
@@ -347,7 +310,7 @@ public class AnthropicClient : IChat {
         if (this.config.apiKey.Length > 0) {
             http.SetHeader("x-api-key", this.config.apiKey);
         }
-        this.clients[key] = http;
+        this.http.CachePut(ep.Canonical(), http);
         return http;
     }
 
@@ -356,13 +319,9 @@ public class AnthropicClient : IChat {
     // 掐断——读超时要的是"对端沉默一段时间"，不是"总共读多久"。
     private HttpClient StreamClient(AiEndpoint ep) {
         string key = ep.Canonical() + "|sse";
-        if (this.clients.ContainsKey(key)) { return this.clients[key]; }
-        HttpClient http = null;
-        if (ep.Tls()) {
-            http = HttpClient.CreateHttps(ep.Host(), ep.Port());
-        } else {
-            http = new HttpClient(ep.Host(), ep.Port());
-        }
+        HttpClient http = this.http.CacheGet(key);
+        if (http != null) { return http; }
+        http = this.http.CreateClient(ep);
         // 流式通路的总预算同样撤销（长流会被 totalTimeout 的墙钟掐断，
         // 停滞判据交给 IdleTimeout）；流上限显式给到响应上限，不让传输
         // 层回落到 64MiB 的默认值。
@@ -378,7 +337,7 @@ public class AnthropicClient : IChat {
         if (this.config.apiKey.Length > 0) {
             http.SetHeader("x-api-key", this.config.apiKey);
         }
-        this.clients[key] = http;
+        this.http.CachePut(key, http);
         return http;
     }
 
@@ -588,26 +547,6 @@ public class AnthropicClient : IChat {
         }
         turn.content = sb.ToString();
         return turn;
-    }
-
-    // 从 HTTP 响应里提错误文案（4xx 时的解释）。
-    private static string HttpErrorMessage(int status, string body) {
-        string detail = "";
-        if (body != null && body.Length > 0) {
-            JsonDoc doc = null;
-            try {
-                doc = JsonDoc.Parse(body);
-            } catch (Exception e) {
-                doc = null;
-            }
-            if (doc != null && doc.root >= 0) {
-                detail = AiClient.ErrorMessage(doc);
-            }
-        }
-        if (detail.Length == 0) {
-            detail = "Anthropic 服务返回 " + status.ToString();
-        }
-        return detail;
     }
 
     // 记录用量（Anthropic 的字段名是 input_tokens / output_tokens）。
