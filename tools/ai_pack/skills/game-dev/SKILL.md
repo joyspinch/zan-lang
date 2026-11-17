@@ -172,7 +172,7 @@ description: Zan 游戏开发规范——Gui 美术风格一致性、帧循环�
 
 ## 主题档案索引
 
-- 门控渲染、合成契约、世界画布与 HUD 边界、资源内嵌、精灵合批：[game-dev-render.md](game-dev-render.md)
-- 设计稿界面方案、面板布局缩放、DPI 契约、输入事件、保留树点击排空、登录门、SceneRouter 迁移：[game-dev-ui.md](game-dev-ui.md)
-- WorkerW 桌面壁纸、GPU 档 3D（NVIDIA 死锁）、移动端与触屏：[game-dev-platform.md](game-dev-platform.md)
-- packages/Zan.Game 各子系统定式（基础设施/2D 物理/寻路/粒子/资源运行时/音频/Procgen/公共基座/放置挂机/联机/基座引擎体系）：[game-dev-engine.md](game-dev-engine.md)
+- 门控渲染、合成契约、世界画布与 HUD 边界、资源内嵌、精灵合批：[game-dev-render.md](references/game-dev-render.md)
+- 设计稿界面方案、面板布局缩放、DPI 契约、输入事件、保留树点击排空、登录门、SceneRouter 迁移：[game-dev-ui.md](references/game-dev-ui.md)
+- WorkerW 桌面壁纸、GPU 档 3D（NVIDIA 死锁）、移动端与触屏：[game-dev-platform.md](references/game-dev-platform.md)
+- packages/Zan.Game 各子系统定式（基础设施/2D 物理/寻路/粒子/资源运行时/音频/Procgen/公共基座/放置挂机/联机/基座引擎体系）：[game-dev-engine.md](references/game-dev-engine.md)
