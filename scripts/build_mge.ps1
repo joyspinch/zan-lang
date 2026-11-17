@@ -10,7 +10,7 @@ Write-Output "[1/2] Building independent native drivers (static, mingw ABI)..."
     -Drivers @("zan_gui", "zan_image", "zan_audio")
 
 Write-Output "[2/2] Compiling and linking tools\mge\Mge.zan ..."
-build\zanc.exe tools\mge\Mge.zan --auto-stdlib -o build\mge.exe `
+build\zanc.exe tools\mge\Mge.zan tools\mge --auto-stdlib --package-project $root -o build\mge.exe `
     --subsystem windows `
     --link-mode static `
     --link-lib gdi32 --link-lib imm32 --link-lib dwmapi `

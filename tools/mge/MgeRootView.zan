@@ -1,0 +1,433 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace Mge;
+
+// A region owns clipping and explicit host geometry; all ordinary UI is standard controls.
+class MgeRegion : Control {
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+    }
+}
+
+class MgeWorldSurface : Control {
+    weak MgeRootView owner;
+    MapDoc gestureMap;
+    bool dragging;
+    int gesture;
+    int cell;
+
+    MgeWorldSurface(MgeRootView owner) {
+        this.InitControl("mge_world_surface", 0);
+        this.owner = owner;
+        this.name = "mge-world";
+    }
+    void SetCellSize(int value) { cell = value; }
+    public override void OnPaint(App app) {
+        MgeRootView current = owner;
+        if (current != null && current.MapActive()) {
+            MapDoc map = Mge.CurrentMap();
+            if (map != null && cell > 0 && bw > 0 && bh > 0) {
+                Mge.RenderWorld(app, map, bx, by, bw, bh, cell);
+            }
+        }
+    }
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.FindApp(); MgeRootView current = owner;
+        if (e.handled || e.originalSource != this || this.IsDisabled() || app == null
+            || app.window.EventButton() != 0 || current == null || !current.MapActive()) { return; }
+        gestureMap = Mge.CurrentMap();
+        if (gestureMap == null) { return; }
+        gesture = gesture + 1; dragging = true;
+        app.CapturePointer(this, true);
+        this.Edit(e, true);
+        e.Handle();
+    }
+    bool CurrentGesture(App app) {
+        MgeRootView current = owner;
+        return dragging && app != null && app.GetCapturedPointer() == this && !this.IsDisabled()
+            && current != null && current.MapActive() && gestureMap == Mge.CurrentMap();
+    }
+    void Edit(RoutedEventArgs e, bool press) {
+        App app = this.FindApp();
+        if (!this.CurrentGesture(app) || cell < 1 || e.x < bx || e.y < by || e.x >= bx + bw || e.y >= by + bh) { return; }
+        Mge.HandleGridInput(app, gestureMap, bx, by, cell, bw, bh, e.x, e.y, press);
+        MgeRootView current = owner;
+        if (current != null && this.CurrentGesture(app)) { current.SyncLists(); }
+    }
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (!e.handled && this.CurrentGesture(this.FindApp())) { this.Edit(e, false); e.Handle(); }
+    }
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || !dragging || app == null || app.window.EventButton() != 0) { return; }
+        int before = gesture;
+        if (this.CurrentGesture(app)) { this.Edit(e, false); }
+        if (gesture != before) { return; }
+        dragging = false; gestureMap = null;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        e.Handle();
+    }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        gesture = gesture + 1; dragging = false; gestureMap = null;
+        App app = this.FindApp();
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        base.OnPointerCancel(e);
+    }
+}
+
+class MgeRootView : UiViewOwner {
+    weak App app;
+    MgeRegion root;
+    MgeRegion mapPage;
+    MgeRegion center;
+    UiViewScope scope;
+    ControlInputHost inputHost;
+    List<Button> tabs;
+    List<Button> chromeButtons;
+    List<Button> mapButtons;
+    List<MapDoc> mapModels;
+    List<Button> spawnButtons;
+    List<JsonValue> spawnModels;
+    List<Button> tools;
+    List<Button> brushes;
+    ScrollColumn mapList;
+    ScrollColumn mapProps;
+    Column spawnList;
+    Row toolRow;
+    Row brushRow;
+    Label npcLabel;
+    Label statusLabel;
+    Label emptyMap;
+    Button createMap;
+    Button deleteMap;
+    Button defaultMap;
+    MgeWorldSurface world;
+    MapDoc selected;
+    int revision;
+    int mapActionEpoch;
+    bool retired;
+    int activePage = -1;
+
+    MgeRootView(App app) {
+        this.app = app;
+        root = new MgeRegion(); root.Class = "mge-root";
+        mapPage = new MgeRegion(); mapPage.name = "mge-map-page";
+        center = new MgeRegion();
+        tabs = new List<Button>(); chromeButtons = new List<Button>();
+        mapButtons = new List<Button>(); mapModels = new List<MapDoc>();
+        spawnButtons = new List<Button>(); spawnModels = new List<JsonValue>();
+        tools = new List<Button>(); brushes = new List<Button>();
+        mapList = new ScrollColumn(); mapList.Class = "mge-list"; mapList.name = "mge-map-list";
+        mapProps = new ScrollColumn(); mapProps.Class = "mge-props"; mapProps.name = "mge-map-props";
+        spawnList = new Column().Gap(Space.SM); spawnList.name = "mge-spawn-list";
+        toolRow = new Row().Gap(Space.XS); brushRow = new Row().Gap(Space.XS);
+        mapPage.Add(mapList); mapPage.Add(center); mapPage.Add(mapProps);
+        center.Add(toolRow); center.Add(brushRow);
+        createMap = new Button("新建地图").Small(); createMap.name = "mge-map-create";
+        deleteMap = new Button("删除地图").Small(); deleteMap.name = "mge-map-delete";
+        defaultMap = new Button("设为默认地图").Small(); defaultMap.name = "mge-map-default";
+        mapPage.Add(createMap); mapPage.Add(deleteMap);
+        string[] fieldNames = new string[] { "名称", "格子宽度", "格子高度", "列数", "行数", "初始位置 X", "初始位置 Y" };
+        for (int i = 0; i < Mge.mapInputs.Count; i = i + 1) {
+            Column field = new Column().Gap(Space.XS);
+            field.Add(new Label(fieldNames[i]).Small());
+            Mge.mapInputs[i].Class = "medium"; Mge.mapInputs[i].name = "mge-map-field-" + Str.FromInt(i);
+            field.Add(Mge.mapInputs[i]); mapProps.Add(field);
+        }
+        mapProps.Add(defaultMap);
+        mapProps.Add(new Label("刷怪点参数（数量 / 范围）").Small());
+        Row options = new Row().Gap(Space.SM); options.Class = "mge-spawn-options";
+        Mge.spawnCount.Class = "medium"; Mge.spawnRange.Class = "medium";
+        Mge.spawnCount.Grow(); Mge.spawnRange.Grow();
+        options.Add(Mge.spawnCount); options.Add(Mge.spawnRange); mapProps.Add(options);
+        npcLabel = new Label("").Small(); mapProps.Add(npcLabel); mapProps.Add(spawnList);
+        string[] labels = new string[] { "角色 NPC", "道具 装备", "技能", "地图" };
+        for (int i = 0; i < labels.Length; i = i + 1) {
+            Button b = new Button(labels[i]).Small(); b.name = "mge-tab-" + Str.FromInt(i);
+            tabs.Add(b); root.Add(b);
+        }
+        Button save = new Button("保存全部").Small(); Button export = new Button("导出 Zan").Small();
+        chromeButtons.Add(save); chromeButtons.Add(export); root.Add(save); root.Add(export);
+        string[] toolLabels = new string[] { "画格子", "放刷怪点", "设起点", "删刷怪点" };
+        string[] brushLabels = new string[] { "空地", "障碍", "透明", "障碍+透明" };
+        for (int i = 0; i < toolLabels.Length; i = i + 1) {
+            Button tool = new Button(toolLabels[i]).Small(); tools.Add(tool); toolRow.Add(tool);
+            Button brush = new Button(brushLabels[i]).Small(); brushes.Add(brush); brushRow.Add(brush);
+        }
+        world = new MgeWorldSurface(this); center.Add(world);
+        emptyMap = new Label("新建一张地图").Small(); center.Add(emptyMap);
+        root.Add(mapPage);
+        statusLabel = new Label("").Small(); statusLabel.Class = "mge-status"; root.Add(statusLabel);
+        scope = new UiViewScope(app, this, root);
+        this.BindActions();
+        for (int i = 0; i < Mge.sheetViews.Count; i = i + 1) {
+            Mge.sheetViews[i].Bind(scope, i); root.Add(Mge.sheetViews[i].Root());
+        }
+        inputHost = new ControlInputHost(root); inputHost.Bind(app);
+        this.SyncLists();
+        this.SyncSelection();
+        this.SyncPage();
+    }
+    static MgeRootView Create(App app) { return new MgeRootView(app); }
+    Control Root() { return root; }
+    bool IsActive() { return !retired && scope != null && scope.IsActive(); }
+    bool MapActive() { return this.IsActive() && activePage == 3 && Mge.tab == 3 && Mge.CurrentMap() != null; }
+
+    void BindActions() {
+        for (int i = 0; i < tabs.Count; i = i + 1) { tabs[i].Click.Add(scope.Action("tab:" + Str.FromInt(i), tabs[i]).Run); }
+        chromeButtons[0].Click.Add(scope.Action("save", chromeButtons[0]).Run);
+        chromeButtons[1].Click.Add(scope.Action("export", chromeButtons[1]).Run);
+        this.BindMapActions();
+    }
+    string MapAction(string name) { return "map-action:" + Str.FromInt(mapActionEpoch) + ":" + name; }
+    void BindMapActions() {
+        for (int i = 0; i < tools.Count; i = i + 1) {
+            tools[i].Click.Clear(); tools[i].Click.Add(scope.Action(this.MapAction("tool:" + Str.FromInt(i)), tools[i]).Run);
+            brushes[i].Click.Clear(); brushes[i].Click.Add(scope.Action(this.MapAction("brush:" + Str.FromInt(i)), brushes[i]).Run);
+        }
+        createMap.Click.Clear(); createMap.Click.Add(scope.Action(this.MapAction("map-create"), createMap).Run);
+        deleteMap.Click.Clear(); deleteMap.Click.Add(scope.Action(this.MapAction("map-delete"), deleteMap).Run);
+        defaultMap.Click.Clear(); defaultMap.Click.Add(scope.Action(this.MapAction("map-default"), defaultMap).Run);
+        for (int i = 0; i < Mge.mapInputs.Count; i = i + 1) {
+            Mge.mapInputs[i].Change.Clear();
+            Mge.mapInputs[i].Change.Add(scope.Action(this.MapAction("map-field:" + Str.FromInt(i)), Mge.mapInputs[i]).Run);
+        }
+        Mge.spawnCount.Change.Clear(); Mge.spawnCount.Change.Add(scope.Action(this.MapAction("spawn-count"), Mge.spawnCount).Run);
+        Mge.spawnRange.Change.Clear(); Mge.spawnRange.Change.Add(scope.Action(this.MapAction("spawn-range"), Mge.spawnRange).Run);
+        for (int i = 0; i < mapButtons.Count; i = i + 1) {
+            mapButtons[i].Click.Clear(); mapButtons[i].Click.Add(scope.Action(this.MapAction("map-select"), mapButtons[i]).Run);
+        }
+        for (int i = 0; i < spawnButtons.Count; i = i + 1) {
+            spawnButtons[i].Click.Clear(); spawnButtons[i].Click.Add(scope.Action(this.MapAction("spawn-delete"), spawnButtons[i]).Run);
+        }
+    }
+    void SyncPage() {
+        if (!this.IsActive()) { return; }
+        int page = Mge.tab;
+        if (activePage != page) {
+            activePage = page;
+            revision = revision + 1;
+            mapActionEpoch = mapActionEpoch + 1; this.BindMapActions();
+            // Commit page state before visibility can cancel an old gesture and reenter.
+            mapPage.Visible = page == 3;
+            if (page != 3) { App host = app; host.ReleaseInputSubtree(mapPage); }
+            if (!this.IsActive() || activePage != page || Mge.tab != page) { return; }
+            for (int i = 0; i < Mge.sheetViews.Count; i = i + 1) {
+                Mge.sheetViews[i].SetActive(i == page);
+                if (!this.IsActive() || activePage != page || Mge.tab != page) { return; }
+            }
+        }
+        for (int i = 0; i < tabs.Count; i = i + 1) { tabs[i].SetClassIn("on", page == i ? "on" : ""); }
+    }
+    void SyncSelection() {
+        if (!this.IsActive()) { return; }
+        MapDoc map = Mge.CurrentMap();
+        if (selected == map) {
+            if (map == null) { Mge.PushMapForm(); }
+            return;
+        }
+        selected = map;
+        mapActionEpoch = mapActionEpoch + 1; this.BindMapActions();
+        revision = revision + 1; int before = revision; App host = app;
+        host.ReleaseInputSubtree(mapProps);
+        if (!this.IsActive() || revision != before || Mge.CurrentMap() != map) { return; }
+        host.ReleaseInputSubtree(world);
+        if (!this.IsActive() || revision != before || Mge.CurrentMap() != map) { return; }
+        Mge.PushMapForm();
+    }
+    void Refresh() {
+        this.SyncPage();
+        if (!this.IsActive()) { return; }
+        this.SyncSelection();
+        if (!this.IsActive()) { return; }
+        this.SyncAvailability();
+        if (this.IsActive()) { this.SyncLists(); }
+    }
+    void SyncAvailability() {
+        bool hasMap = Mge.CurrentMap() != null;
+        deleteMap.Disabled.Set(!hasMap); defaultMap.Disabled.Set(!hasMap); mapProps.Disabled.Set(!hasMap);
+        center.Disabled.Set(!hasMap); emptyMap.Visible = !hasMap;
+        for (int i = 0; i < Mge.mapInputs.Count; i = i + 1) { Mge.mapInputs[i].Disabled.Set(!hasMap); }
+        Mge.spawnCount.Disabled.Set(!hasMap); Mge.spawnRange.Disabled.Set(!hasMap);
+    }
+    void SyncLists() {
+        if (!this.IsActive()) { return; }
+        revision = revision + 1; int before = revision;
+        // Remove departed identities only. Existing children keep focus, capture and scroll position.
+        for (int i = mapModels.Count - 1; i >= 0; i = i - 1) {
+            if (Mge.maps.IndexOf(mapModels[i]) < 0) {
+                Button old = mapButtons[i]; mapModels.RemoveAt(i); mapButtons.RemoveAt(i); mapList.Remove(old);
+                if (!this.IsActive() || revision != before) { return; }
+            }
+        }
+        for (int i = 0; i < Mge.maps.Count; i = i + 1) {
+            MapDoc map = Mge.maps[i]; int found = mapModels.IndexOf(map);
+            if (found < 0) {
+                Button b = new Button("").Small(); b.Click.Add(scope.Action(this.MapAction("map-select"), b).Run);
+                mapModels.Insert(i, map); mapButtons.Insert(i, b); mapList.InsertAt(i, b);
+            } else if (found != i) {
+                Button b = mapButtons[found]; mapModels.RemoveAt(found); mapButtons.RemoveAt(found);
+                mapModels.Insert(i, map); mapButtons.Insert(i, b); mapList.MoveChild(b, i);
+            }
+            if (!this.IsActive() || revision != before) { return; }
+            string label = map.name + "  " + Str.FromInt(map.cols) + "x" + Str.FromInt(map.rows);
+            if (map.isDefault) { label = label + "  (默认)"; }
+            mapButtons[i].SetText(label);
+            mapButtons[i].SetClassIn("on", map == Mge.CurrentMap() ? "on" : "");
+        }
+        MapDoc current = Mge.CurrentMap();
+        for (int i = spawnModels.Count - 1; i >= 0; i = i - 1) {
+            if (current == null || current.spawns.IndexOf(spawnModels[i]) < 0) {
+                Button old = spawnButtons[i]; spawnModels.RemoveAt(i); spawnButtons.RemoveAt(i); spawnList.Remove(old);
+                if (!this.IsActive() || revision != before || Mge.CurrentMap() != current) { return; }
+            }
+        }
+        if (current == null) { return; }
+        for (int i = 0; i < current.spawns.Count; i = i + 1) {
+            JsonValue spawn = current.spawns[i]; int found = spawnModels.IndexOf(spawn);
+            if (found < 0) {
+                Button b = new Button("").Small(); b.Click.Add(scope.Action(this.MapAction("spawn-delete"), b).Run);
+                spawnModels.Insert(i, spawn); spawnButtons.Insert(i, b); spawnList.InsertAt(i, b);
+            } else if (found != i) {
+                Button b = spawnButtons[found]; spawnModels.RemoveAt(found); spawnButtons.RemoveAt(found);
+                spawnModels.Insert(i, spawn); spawnButtons.Insert(i, b); spawnList.MoveChild(b, i);
+            }
+            if (!this.IsActive() || revision != before || Mge.CurrentMap() != current) { return; }
+            spawnButtons[i].SetText(spawn.Str("name", "") + " @" + Str.FromInt(spawn.Int("x", 0))
+                + "," + Str.FromInt(spawn.Int("y", 0)) + " x" + Str.FromInt(spawn.Int("count", 1)) + "  删除");
+        }
+    }
+    bool LayoutCurrent(UiViewScope view, int token, int page, MapDoc map) {
+        return this.IsActive() && scope == view && revision == token && activePage == page
+            && Mge.tab == page && Mge.CurrentMap() == map;
+    }
+    void PrepareView(UiViewScope view, App app) {
+        if (!this.IsActive() || scope != view || this.app != app) { return; }
+        this.Refresh();
+        if (!this.IsActive() || scope != view) { return; }
+        this.SyncAvailability();
+        if (!this.IsActive()) { return; }
+        for (int i = 0; i < tools.Count; i = i + 1) {
+            tools[i].SetClassIn("on", Mge.mapTool == i ? "on" : "");
+            brushes[i].SetClassIn("on", Mge.mapTool == 0 && Mge.brush == i ? "on" : "");
+        }
+        MapDoc map = Mge.CurrentMap();
+        defaultMap.SetText(map != null && map.isDefault ? "取消默认地图" : "设为默认地图");
+        JsonValue npc = Mge.sheets[0].Selected();
+        npcLabel.Text = "刷怪角色: " + (npc != null ? npc.Str("name", "") : "(先在角色页选中一个角色)");
+        statusLabel.Text = Mge.status + (Mge.Dirty() ? "   ·   有未保存修改" : "");
+        for (int i = 0; i < Mge.sheetViews.Count; i = i + 1) {
+            if (i == Mge.tab) { Mge.sheetViews[i].Refresh(); }
+            if (!this.IsActive() || scope != view) { return; }
+        }
+        int layoutToken = revision; int page = activePage;
+        int top = app.ContentTop(); int width = app.canvas.Width(); int height = app.canvas.Height() - top;
+        if (!view.Layout(0, top, width, height) || !this.LayoutCurrent(view, layoutToken, page, map)) { return; }
+        int statusH = app.Scale(28); int bodyH = height - statusH; if (bodyH < 0) { bodyH = 0; }
+        int railW = app.Scale(150); int pad = app.Scale(Space.SM); int itemH = app.Scale(40);
+        for (int i = 0; i < tabs.Count; i = i + 1) { tabs[i].Arrange(pad, top + app.Scale(Space.M) + i * (itemH + app.Scale(Space.XS)), railW - pad * 2, itemH); }
+        int saveH = app.Scale(32); int saveY = top + bodyH - saveH * 2 - app.Scale(Space.L);
+        chromeButtons[0].Arrange(pad, saveY, railW - pad * 2, saveH);
+        chromeButtons[1].Arrange(pad, saveY + saveH + pad, railW - pad * 2, saveH);
+        statusLabel.Arrange(0, top + bodyH, width, statusH);
+        int bodyW = width - railW; if (bodyW < 0) { bodyW = 0; }
+        mapPage.Arrange(railW, top, bodyW, bodyH);
+        for (int i = 0; i < Mge.sheetViews.Count; i = i + 1) {
+            Mge.sheetViews[i].Prepare(app, railW, top, bodyW, bodyH);
+            if (!this.LayoutCurrent(view, layoutToken, page, map)) { return; }
+        }
+        if (activePage != 3) { return; }
+        int listW = app.Scale(200); int propW = app.Scale(260);
+        if (listW > bodyW) { listW = bodyW; }
+        if (propW > bodyW - listW) { propW = bodyW - listW; }
+        int centerW = bodyW - listW - propW; int buttonH = app.Scale(32); int gap = app.Scale(Space.SM);
+        int buttonW = (listW - pad * 2 - gap) / 2; if (buttonW < 0) { buttonW = 0; }
+        createMap.Arrange(railW + pad, top + pad, buttonW, buttonH);
+        deleteMap.Arrange(railW + pad + buttonW + gap, top + pad, buttonW, buttonH);
+        mapList.Arrange(railW + pad, top + pad + buttonH + gap, listW - pad * 2, bodyH - pad * 2 - buttonH - gap);
+        if (!this.LayoutCurrent(view, layoutToken, page, map)) { return; }
+        mapProps.Arrange(railW + bodyW - propW, top, propW, bodyH);
+        if (!this.LayoutCurrent(view, layoutToken, page, map)) { return; }
+        int cx = railW + listW; center.Arrange(cx, top, centerW, bodyH);
+        int toolbarW = centerW - pad * 2; if (toolbarW < 0) { toolbarW = 0; }
+        int toolbarH = app.Scale(28);
+        toolRow.Arrange(cx + pad, top + pad, toolbarW, toolbarH);
+        brushRow.Arrange(cx + pad, top + pad + toolbarH + gap, toolbarW, toolbarH);
+        int gridY = top + pad + (toolbarH + gap) * 2;
+        int gridH = bodyH - (gridY - top) - pad; if (gridH < 0) { gridH = 0; }
+        int cell = 0; int gridW = toolbarW;
+        if (map != null && map.cols > 0 && map.rows > 0 && gridW > 0 && gridH > 0) {
+            cell = gridW / map.cols; int byH = gridH / map.rows; if (byH < cell) { cell = byH; }
+            if (cell < 4) { cell = 4; }
+            if (gridW > cell * map.cols) { gridW = cell * map.cols; }
+            if (gridH > cell * map.rows) { gridH = cell * map.rows; }
+        }
+        world.SetCellSize(cell); world.Arrange(cx + pad, gridY, gridW, gridH);
+        emptyMap.Arrange(cx + pad, gridY, toolbarW, app.Scale(32));
+    }
+    void ViewAction(string name, Control sender) {
+        if (!this.IsActive()) { return; }
+        if (name.StartsWith("tab:")) { Mge.tab = Str.ToInt(name.Substring(4)); this.Refresh(); return; }
+        if (name == "save") { Mge.SaveAll(); return; }
+        if (name == "export") { Mge.SaveAll(); Mge.Export(); return; }
+        if (name.StartsWith("sheet:")) {
+            int colon = name.IndexOf(":", 6); if (colon < 0) { return; }
+            int page = Str.ToInt(name.Substring(6, colon - 6));
+            if (page >= 0 && page < Mge.sheetViews.Count && page == Mge.tab) { Mge.sheetViews[page].ViewAction(name.Substring(colon + 1), sender); }
+            return;
+        }
+        if (!name.StartsWith("map-action:")) { return; }
+        int epochEnd = name.IndexOf(":", 11); if (epochEnd < 0) { return; }
+        if (Str.ToInt(name.Substring(11, epochEnd - 11)) != mapActionEpoch) { return; }
+        name = name.Substring(epochEnd + 1);
+        if (Mge.tab != 3 || activePage != 3) { return; }
+        if (name.StartsWith("tool:")) { Mge.mapTool = Str.ToInt(name.Substring(5)); return; }
+        if (name.StartsWith("brush:")) { Mge.brush = Str.ToInt(name.Substring(6)); Mge.mapTool = 0; return; }
+        if (name == "map-select") {
+            int index = mapButtons.IndexOf((Button)sender);
+            if (index >= 0) { Mge.SelectMap(Mge.maps.IndexOf(mapModels[index])); this.Refresh(); }
+            return;
+        }
+        if (name == "map-create") {
+            Mge.maps.Add(MapDoc.Create("map" + Str.FromInt(Mge.maps.Count + 1), 24, 24));
+            Mge.mapDirty = true; Mge.SelectMap(Mge.maps.Count - 1); this.Refresh(); return;
+        }
+        if (name == "map-delete") {
+            int index = Mge.mapSel;
+            if (index >= 0 && index < Mge.maps.Count) {
+                Mge.maps.RemoveAt(index); if (index >= Mge.maps.Count) { index = Mge.maps.Count - 1; }
+                Mge.mapDirty = true; Mge.SelectMap(index); this.Refresh();
+            }
+            return;
+        }
+        MapDoc map = Mge.CurrentMap(); if (map == null) { return; }
+        if (name == "map-default") {
+            map.isDefault = !map.isDefault;
+            for (int i = 0; i < Mge.maps.Count; i = i + 1) { if (Mge.maps[i] != map) { Mge.maps[i].isDefault = false; } }
+            Mge.mapDirty = true; this.SyncLists(); return;
+        }
+        if (name == "spawn-delete") {
+            int index = spawnButtons.IndexOf((Button)sender);
+            if (index >= 0) { int actual = map.spawns.IndexOf(spawnModels[index]); if (actual >= 0) { map.spawns.RemoveAt(actual); Mge.mapDirty = true; this.SyncLists(); } }
+            return;
+        }
+        if (name.StartsWith("map-field:")) { Mge.CommitMapField(Str.ToInt(name.Substring(10))); this.SyncLists(); return; }
+        if (name == "spawn-count") { Mge.spawnAmount = Mge.SanitizedInt(Mge.spawnCount, Mge.spawnAmount); }
+        if (name == "spawn-range") { Mge.spawnRadius = Mge.SanitizedInt(Mge.spawnRange, Mge.spawnRadius); }
+    }
+    void ViewPointer(Control sender, RoutedEventArgs args) { }
+    void Retire() {
+        if (retired) { return; }
+        retired = true; revision = revision + 1;
+        UiViewScope oldScope = scope; ControlInputHost oldHost = inputHost;
+        scope = null; inputHost = null; app = null;
+        // Publish retirement before cancellation can establish a replacement editor/session.
+        if (oldScope != null) { oldScope.Retire(); }
+        if (oldHost != null) { oldHost.Hide(); }
+    }
+    void Render(App app) { if (this.IsActive() && this.app == app) { root.RenderTree(app); } }
+}

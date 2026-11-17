@@ -1,0 +1,215 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace Mge;
+
+// A stable standard-control subtree. The editor registers its one input scope before input.
+class MgeSheetView {
+    Sheet sheet;
+    weak UiViewScope scope;
+    string prefix;
+    string pagePrefix;
+    int actionEpoch;
+    MgeRegion root;
+    Column left;
+    Column form;
+    Row actions;
+    ScrollColumn rows;
+    ScrollColumn fields;
+    List<Button> rowButtons;
+    List<JsonValue> rowModels;
+    List<Button> fieldButtons;
+    List<Button> actionButtons;
+    Label title;
+    JsonValue selected;
+    bool active;
+    int revision;
+
+    MgeSheetView(Sheet sheet) {
+        this.sheet = sheet;
+        root = new MgeRegion(); root.Class = "mge-sheet";
+        left = new Column().Gap(Space.SM); left.Pad(Space.M);
+        form = new Column().Gap(Space.SM); form.Pad(Space.M);
+        rows = new ScrollColumn(); rows.Class = "mge-list"; rows.Grow();
+        fields = new ScrollColumn(); fields.Class = "mge-fields"; fields.Grow();
+        rowButtons = new List<Button>(); rowModels = new List<JsonValue>();
+        fieldButtons = new List<Button>(); actionButtons = new List<Button>();
+        sheet.search.Class = "medium";
+        left.Add(sheet.search);
+        actions = new Row().Gap(Space.SM);
+        string[] labels = new string[] { "新建", "复制", "删除" };
+        for (int i = 0; i < labels.Length; i = i + 1) {
+            Button button = new Button(labels[i]).Small(); button.Grow();
+            actions.Add(button); actionButtons.Add(button);
+        }
+        left.Add(actions); left.Add(rows); root.Add(left); root.Add(form);
+        title = new Label(sheet.title + " 数据").Large(); form.Add(title); form.Add(fields);
+        for (int i = 0; i < sheet.specs.Count; i = i + 1) {
+            FieldSpec spec = sheet.specs[i]; Column entry = new Column().Gap(Space.XS);
+            entry.Add(new Label(spec.label).Small());
+            if (spec.kind < 2) {
+                sheet.inputs[i].Class = "medium"; entry.Add(sheet.inputs[i]); fieldButtons.Add(null);
+            } else {
+                Button choice = new Button("").Small(); choice.Secondary(); entry.Add(choice); fieldButtons.Add(choice);
+            }
+            fields.Add(entry);
+        }
+    }
+    static MgeSheetView Create(Sheet sheet) { return new MgeSheetView(sheet); }
+    Control Root() { return root; }
+    bool IsActive() { UiViewScope view = scope; return active && view != null && view.IsActive(); }
+    void Bind(UiViewScope view, int page) {
+        scope = view; pagePrefix = "sheet:" + Str.FromInt(page) + ":";
+        root.name = "mge-sheet-" + Str.FromInt(page);
+        this.BindActions(); this.SyncRows(); this.PushFields();
+    }
+    void BindActions() {
+        UiViewScope view = scope; if (view == null || !view.IsActive()) { return; }
+        prefix = pagePrefix + Str.FromInt(actionEpoch) + ":";
+        sheet.search.Change.Clear(); sheet.search.Change.Add(view.Action(prefix + "search", sheet.search).Run);
+        actionButtons[0].Click.Clear(); actionButtons[0].Click.Add(view.Action(prefix + "create", actionButtons[0]).Run);
+        actionButtons[1].Click.Clear(); actionButtons[1].Click.Add(view.Action(prefix + "duplicate", actionButtons[1]).Run);
+        actionButtons[2].Click.Clear(); actionButtons[2].Click.Add(view.Action(prefix + "delete", actionButtons[2]).Run);
+        for (int i = 0; i < sheet.specs.Count; i = i + 1) {
+            if (sheet.specs[i].kind < 2) {
+                Input input = sheet.inputs[i]; input.Change.Clear(); input.Change.Add(view.Action(prefix + "field:" + Str.FromInt(i), input).Run);
+            } else {
+                Button choice = fieldButtons[i]; choice.Click.Clear(); choice.Click.Add(view.Action(prefix + "choice:" + Str.FromInt(i), choice).Run);
+            }
+        }
+        for (int i = 0; i < rowButtons.Count; i = i + 1) {
+            rowButtons[i].Click.Clear(); rowButtons[i].Click.Add(view.Action(prefix + "select", rowButtons[i]).Run);
+        }
+    }
+    void SetActive(bool value) {
+        if (active == value && root.Visible == value) { return; }
+        active = value; revision = revision + 1;
+        actionEpoch = actionEpoch + 1; this.BindActions();
+        root.Visible = value;
+        if (!value) { App app = root.FindApp(); if (app != null) { app.ReleaseInputSubtree(root); } }
+    }
+    void Prepare(App app, int x, int y, int w, int h) {
+        if (!this.IsActive()) { return; }
+        root.Arrange(x, y, w, h);
+        int listW = app.Scale(240); if (listW > w) { listW = w; }
+        left.Arrange(x, y, listW, h); form.Arrange(x + listW, y, w - listW, h);
+    }
+    void Refresh() {
+        this.SyncRows();
+        if (selected != sheet.Selected()) { this.PushFields(); }
+        bool empty = sheet.Selected() == null;
+        fields.Disabled.Set(empty); actionButtons[1].Disabled.Set(empty); actionButtons[2].Disabled.Set(empty);
+        for (int i = 0; i < sheet.specs.Count; i = i + 1) {
+            if (sheet.specs[i].kind < 2) { sheet.inputs[i].Disabled.Set(empty); }
+            else { fieldButtons[i].Disabled.Set(empty); }
+        }
+        this.RefreshChoices();
+    }
+    bool Matches(JsonValue row) {
+        string text = sheet.search.GetText();
+        return text == "" || Str.Contains(row.Str("name", ""), text) || Str.Contains(row.Str("displayName", ""), text);
+    }
+    void SyncRows() {
+        UiViewScope view = scope; if (view == null || !view.IsActive()) { return; }
+        revision = revision + 1; int before = revision;
+        for (int i = rowModels.Count - 1; i >= 0; i = i - 1) {
+            if (sheet.rows.IndexOf(rowModels[i]) < 0 || !this.Matches(rowModels[i])) {
+                Button old = rowButtons[i]; rowModels.RemoveAt(i); rowButtons.RemoveAt(i); rows.Remove(old);
+                if (revision != before || scope != view || !view.IsActive()) { return; }
+            }
+        }
+        int target = 0;
+        for (int i = 0; i < sheet.rows.Count; i = i + 1) {
+            JsonValue row = sheet.rows[i]; if (!this.Matches(row)) { continue; }
+            int found = rowModels.IndexOf(row);
+            if (found < 0) {
+                Button item = new Button("").Small(); item.Click.Add(view.Action(prefix + "select", item).Run);
+                rowModels.Insert(target, row); rowButtons.Insert(target, item); rows.InsertAt(target, item);
+            } else if (found != target) {
+                Button item = rowButtons[found]; rowModels.RemoveAt(found); rowButtons.RemoveAt(found);
+                rowModels.Insert(target, row); rowButtons.Insert(target, item); rows.MoveChild(item, target);
+            }
+            if (revision != before || scope != view || !view.IsActive()) { return; }
+            string name = row.Str("name", ""); string display = row.Str("displayName", "");
+            rowButtons[target].SetText(name + (display != "" ? "  ·  " + display : ""));
+            rowButtons[target].SetClassIn("on", row == sheet.Selected() ? "on" : ""); target = target + 1;
+        }
+    }
+    void PushFields() {
+        JsonValue row = sheet.Selected();
+        selected = row; revision = revision + 1; int before = revision;
+        actionEpoch = actionEpoch + 1; this.BindActions();
+        App app = root.FindApp();
+        if (app != null) { app.ReleaseInputSubtree(fields); }
+        UiViewScope view = scope;
+        if (revision != before || sheet.Selected() != row || view == null || !view.IsActive()) { return; }
+        sheet.PushForm();
+        title.Text = sheet.title + (row != null ? " · " + row.Str("name", "") : " 数据");
+        this.RefreshChoices();
+    }
+    void RefreshChoices() {
+        JsonValue row = sheet.Selected();
+        for (int i = 0; i < sheet.specs.Count; i = i + 1) {
+            FieldSpec spec = sheet.specs[i]; if (spec.kind < 2) { continue; }
+            string label = "";
+            if (row != null && spec.kind == 2) { label = row.Bool(spec.key, spec.dfltInt == 1) ? "是" : "否"; }
+            else if (row != null) { label = Mge.OptionOf(spec.options, row.Int(spec.key, spec.dfltInt)); }
+            fieldButtons[i].SetText(label);
+        }
+    }
+    void ViewAction(string name, Control sender) {
+        if (!this.IsActive()) { return; }
+        int colon = name.IndexOf(":"); if (colon < 0 || Str.ToInt(name.Substring(0, colon)) != actionEpoch) { return; }
+        name = name.Substring(colon + 1);
+        if (name == "search") { this.SyncRows(); return; }
+        if (name == "create") {
+            sheet.rows.Add(sheet.NewRow()); sheet.sel = sheet.rows.Count - 1; sheet.dirty = true;
+            this.PushFields(); this.Refresh(); return;
+        }
+        if (name == "duplicate") {
+            JsonValue current = sheet.Selected(); if (current == null) { return; }
+            JsonValue copy = JsonValue.Parse(current.ToJson());
+            copy.Set("name", JsonValue.NewStr(sheet.UniqueName(current.Str("name", "row"))));
+            sheet.rows.Add(copy); sheet.sel = sheet.rows.Count - 1; sheet.dirty = true;
+            this.PushFields(); this.Refresh(); return;
+        }
+        if (name == "delete") {
+            if (sheet.sel < 0 || sheet.sel >= sheet.rows.Count) { return; }
+            sheet.rows.RemoveAt(sheet.sel); if (sheet.sel >= sheet.rows.Count) { sheet.sel = sheet.rows.Count - 1; }
+            sheet.dirty = true; this.PushFields(); this.Refresh(); return;
+        }
+        if (name == "select") {
+            int index = rowButtons.IndexOf((Button)sender); if (index < 0) { return; }
+            int actual = sheet.rows.IndexOf(rowModels[index]); if (actual < 0) { return; }
+            sheet.sel = actual; this.PushFields(); this.Refresh(); return;
+        }
+        if (name.StartsWith("field:")) { this.CommitField(Str.ToInt(name.Substring(6))); this.SyncRows(); return; }
+        if (name.StartsWith("choice:")) {
+            int index = Str.ToInt(name.Substring(7)); JsonValue row = sheet.Selected();
+            if (row == null || index < 0 || index >= sheet.specs.Count) { return; }
+            FieldSpec spec = sheet.specs[index];
+            if (spec.kind == 2) { row.Set(spec.key, JsonValue.NewBool(!row.Bool(spec.key, spec.dfltInt == 1))); }
+            else {
+                int value = row.Int(spec.key, spec.dfltInt) + 1; if (value >= spec.options.Count) { value = 0; }
+                row.Set(spec.key, JsonValue.NewNum(Str.FromInt(value)));
+            }
+            sheet.dirty = true; this.RefreshChoices();
+        }
+    }
+    void CommitField(int index) {
+        JsonValue row = sheet.Selected(); if (row == null || index < 0 || index >= sheet.specs.Count) { return; }
+        FieldSpec spec = sheet.specs[index];
+        if (spec.kind == 0) {
+            string value = sheet.inputs[index].GetText();
+            if (value != row.Str(spec.key, "")) { row.Set(spec.key, JsonValue.NewStr(value)); sheet.dirty = true; }
+        } else if (spec.kind == 1) {
+            Input input = sheet.inputs[index]; string raw = input.GetText(); string clean = Str.Digits(raw, true);
+            if (clean != raw) { input.SetText(clean); }
+            int value = Str.ToInt(clean);
+            if (value != row.Int(spec.key, spec.dfltInt)) { row.Set(spec.key, JsonValue.NewNum(Str.FromInt(value))); sheet.dirty = true; }
+        }
+    }
+}

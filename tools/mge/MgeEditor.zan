@@ -1,0 +1,703 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using Gui;
+using Gui.Widget;
+
+namespace Mge;
+
+// -----------------------------------------------------------------------------
+// Legend/Mir style game (角色 / 道具 / 技能 / 地图).
+// -----------------------------------------------------------------------------
+
+class Mge {
+    static App app;
+    static string dataDir;
+    static string status;
+
+    static List<Sheet> sheets;      // 0 npc, 1 item, 2 skill
+    static List<MgeSheetView> sheetViews;
+    static MgeRootView rootView;
+    static int tab;                 // 0..2 sheets, 3 map
+
+    static List<MapDoc> maps;
+    static int mapSel;
+    static int brush;               // 0 空地, 1 障碍, 2 透明, 3 障碍+透明
+    static int mapTool;             // 0 画格子, 1 刷怪点, 2 起点, 3 擦除刷怪点
+    static bool mapDirty;
+    static List<Input> mapInputs;   // 名称/格宽/格高/列数/行数/起点X/起点Y
+    static Input spawnCount;
+    static Input spawnRange;
+    static int spawnAmount;
+    static int spawnRadius;
+
+    static void Initialize() {
+        Mge.tab = 0; Mge.brush = 1; Mge.mapTool = 0; Mge.mapSel = -1;
+        Mge.mapDirty = false; Mge.status = "";
+        Mge.BuildSheets();
+        Mge.maps = new List<MapDoc>();
+        Mge.mapInputs = new List<Input>();
+        for (int i = 0; i < 7; i = i + 1) { Mge.mapInputs.Add(new Input("")); }
+        Mge.spawnCount = new Input(""); Mge.spawnRange = new Input("");
+        Mge.spawnAmount = 5; Mge.spawnRadius = 3;
+        Mge.spawnCount.SetText("5"); Mge.spawnRange.SetText("3");
+        Mge.sheetViews = new List<MgeSheetView>();
+        for (int i = 0; i < Mge.sheets.Count; i = i + 1) { Mge.sheetViews.Add(MgeSheetView.Create(Mge.sheets[i])); }
+    }
+
+    static void Attach(App host) {
+        Mge.app = host;
+        host.UseAppCss(".mge-root { background: var(--bg-primary); } .mge-status { background: var(--bg-secondary); padding: var(--padding-tiny) var(--padding-small); }"
+            + " .mge-list, .mge-fields { gap: var(--gap-medium); } .mge-props { padding: var(--padding-medium); gap: var(--gap-medium); }"
+            + " .mge-root Button.on { background: var(--bg-active); } .mge-root Row { flex-shrink: 0; }"
+            + " .mge-spawn-options { min-width: 0; } .mge-spawn-options > input { flex: 1 1 0; min-width: 0; }");
+        Mge.rootView = MgeRootView.Create(host);
+    }
+
+    static void Close() {
+        MgeRootView previous = Mge.rootView; Mge.rootView = null;
+        if (previous != null) { previous.Retire(); }
+        if (Mge.rootView != null) { return; }
+        Mge.app = null; Mge.sheetViews = null; Mge.sheets = null; Mge.maps = null;
+        Mge.mapInputs = null; Mge.spawnCount = null; Mge.spawnRange = null;
+    }
+
+    static void Run() {
+        Mge.Initialize();
+        Mge.dataDir = "mge-data";
+        if (Environment.ArgCount() > 0) { Mge.dataDir = Environment.ArgAt(0); }
+        Mge.status = "数据目录: " + Mge.dataDir;
+        Mge.LoadAll();
+        App a = App.CreateDark("MGE · 资源编辑器", 1280, 800);
+        Mge.Attach(a);
+        a.Show();
+        WidgetId.Mark();
+        while (a.isRunning) {
+            if (!a.ProcessEvent()) { break; }
+            a.BeginFrame();
+            WidgetId.ResetFrame();
+            if (!a.PrepareStandardHostFrame()) { continue; }
+            if (!a.ContinuePreparedFrame()) { continue; }
+            Mge.rootView.Render(a);
+            if (!a.ContinuePreparedFrame()) { continue; }
+            a.RenderChrome("MGE · 资源编辑器");
+            a.PresentFrame();
+        }
+        Mge.Close();
+    }
+
+    // ---- schema -------------------------------------------------------------
+
+    static void BuildSheets() {
+        Mge.sheets = new List<Sheet>();
+
+        List<FieldSpec> npc = new List<FieldSpec>();
+        npc.Add(FieldSpec.Text("名称", "name", "npc"));
+        npc.Add(FieldSpec.Text("显示名", "displayName", ""));
+        npc.Add(FieldSpec.Bool("默认主角", "hero", false));
+        npc.Add(FieldSpec.Int("等级", "level", 1));
+        npc.Add(FieldSpec.Int("最大HP", "maxhp", 100));
+        npc.Add(FieldSpec.Int("最大MP", "maxmp", 50));
+        npc.Add(FieldSpec.Int("命中", "hit", 100));
+        npc.Add(FieldSpec.Int("躲避", "dodge", 0));
+        npc.Add(FieldSpec.Int("暴击", "crit", 0));
+        npc.Add(FieldSpec.Int("经验值", "expReward", 0));
+        npc.Add(FieldSpec.Int("智能等级", "aiLevel", 0));
+        npc.Add(FieldSpec.Int("自动反击", "autoCounter", -1));
+        npc.Add(FieldSpec.Int("掉落几率", "dropChance", 100));
+        npc.Add(FieldSpec.Text("成长组件", "growth", ""));
+        npc.Add(FieldSpec.Text("技能表(逗号分隔)", "skills", ""));
+        Mge.sheets.Add(Sheet.Create("角色", "npc.json", npc));
+
+        List<string> cats = new List<string>();
+        cats.Add("装备");
+        cats.Add("道具");
+        cats.Add("特殊");
+        List<string> subs = new List<string>();
+        subs.Add("武器");
+        subs.Add("衣服");
+        subs.Add("头盔");
+        subs.Add("项链");
+        subs.Add("手镯");
+        subs.Add("戒指");
+        subs.Add("消耗");
+        subs.Add("其他");
+
+        List<FieldSpec> item = new List<FieldSpec>();
+        item.Add(FieldSpec.Text("名称", "name", "item"));
+        item.Add(FieldSpec.Text("显示名", "displayName", ""));
+        item.Add(FieldSpec.Enum("分类", "category", cats, 0));
+        item.Add(FieldSpec.Enum("子类", "subtype", subs, 0));
+        item.Add(FieldSpec.Int("等级需求", "levelReq", 0));
+        item.Add(FieldSpec.Int("最大叠加", "maxStack", 1));
+        item.Add(FieldSpec.Bool("禁止丢弃", "noDrop", false));
+        item.Add(FieldSpec.Int("攻击", "攻击", 0));
+        item.Add(FieldSpec.Int("魔法", "魔法", 0));
+        item.Add(FieldSpec.Int("道术", "道术", 0));
+        item.Add(FieldSpec.Int("防御", "防御", 0));
+        item.Add(FieldSpec.Int("魔御", "魔御", 0));
+        item.Add(FieldSpec.Text("图标", "icon", ""));
+        item.Add(FieldSpec.Text("气泡提示", "tooltip", ""));
+        Mge.sheets.Add(Sheet.Create("道具", "item.json", item));
+
+        List<string> factions = new List<string>();
+        factions.Add("敌方");
+        factions.Add("友方");
+        factions.Add("不限");
+        List<string> targets = new List<string>();
+        targets.Add("角色目标");
+        targets.Add("鼠标格子");
+        targets.Add("角色或格子");
+        targets.Add("自身");
+
+        List<FieldSpec> skill = new List<FieldSpec>();
+        skill.Add(FieldSpec.Text("名称", "name", "skill"));
+        skill.Add(FieldSpec.Text("显示名", "displayName", ""));
+        skill.Add(FieldSpec.Enum("目标阵营", "faction", factions, 0));
+        skill.Add(FieldSpec.Enum("目标位置", "target", targets, 0));
+        skill.Add(FieldSpec.Int("攻击距离", "attackRange", 1));
+        skill.Add(FieldSpec.Int("最小距离", "minRange", 0));
+        skill.Add(FieldSpec.Int("范围半径", "areaRadius", 0));
+        skill.Add(FieldSpec.Int("HP消耗", "costHp", 0));
+        skill.Add(FieldSpec.Int("MP消耗", "costMp", 0));
+        skill.Add(FieldSpec.Int("怒气消耗", "costRage", 0));
+        skill.Add(FieldSpec.Int("冷却间隔(ms)", "interval", 0));
+        skill.Add(FieldSpec.Int("伤害延迟(ms)", "damageDelay", 0));
+        skill.Add(FieldSpec.Int("优先级", "priority", 0));
+        skill.Add(FieldSpec.Int("伤害系数(%)", "damageScale", 100));
+        skill.Add(FieldSpec.Text("伤害公式", "formula", ""));
+        skill.Add(FieldSpec.Text("图标", "icon", ""));
+        Mge.sheets.Add(Sheet.Create("技能", "skill.json", skill));
+    }
+
+    // ---- persistence --------------------------------------------------------
+
+    static string PathOf(string file) {
+        return Mge.dataDir + "/" + file;
+    }
+
+    static void LoadAll() {
+        if (!Directory.Exists(Mge.dataDir)) { Directory.CreateDirectory(Mge.dataDir); }
+        int i = 0;
+        while (i < Mge.sheets.Count) {
+            Mge.LoadSheet(Mge.sheets[i]);
+            i = i + 1;
+        }
+        Mge.LoadMaps();
+        if (Mge.maps.Count > 0) { Mge.SelectMap(0); }
+        int k = 0;
+        while (k < Mge.sheets.Count) {
+            Sheet s = Mge.sheets[k];
+            if (s.rows.Count > 0) {
+                s.sel = 0;
+                s.PushForm();
+            }
+            k = k + 1;
+        }
+    }
+
+    static void LoadSheet(Sheet s) {
+        string path = Mge.PathOf(s.file);
+        if (!File.Exists(path)) { return; }
+        JsonValue doc = JsonValue.Parse(File.ReadAllText(path));
+        if (doc == null || !doc.IsArray()) { return; }
+        int i = 0;
+        while (i < doc.Count()) {
+            JsonValue row = doc.At(i);
+            if (row.IsObject()) { s.rows.Add(row); }
+            i = i + 1;
+        }
+    }
+
+    static void SaveSheet(Sheet s) {
+        JsonValue doc = JsonValue.NewArray();
+        int i = 0;
+        while (i < s.rows.Count) {
+            doc.Append(s.rows[i]);
+            i = i + 1;
+        }
+        File.WriteAllText(Mge.PathOf(s.file), doc.ToJson());
+        s.dirty = false;
+    }
+
+    static void LoadMaps() {
+        string path = Mge.PathOf("map.json");
+        if (!File.Exists(path)) { return; }
+        JsonValue doc = JsonValue.Parse(File.ReadAllText(path));
+        if (doc == null || !doc.IsArray()) { return; }
+        int i = 0;
+        while (i < doc.Count()) {
+            JsonValue o = doc.At(i);
+            MapDoc m = MapDoc.Create(o.Str("name", "map"),
+                o.Int("cols", 20), o.Int("rows", 20));
+            m.cellW = o.Int("cellW", 64);
+            m.cellH = o.Int("cellH", 32);
+            m.startX = o.Int("startX", 0);
+            m.startY = o.Int("startY", 0);
+            m.isDefault = o.Bool("default", false);
+            m.LoadCellString(o.Str("cells", ""));
+            JsonValue sp = o.Get("spawns");
+            if (sp != null && sp.IsArray()) {
+                int k = 0;
+                while (k < sp.Count()) {
+                    m.spawns.Add(sp.At(k));
+                    k = k + 1;
+                }
+            }
+            Mge.maps.Add(m);
+            i = i + 1;
+        }
+    }
+
+    static void SaveMaps() {
+        JsonValue doc = JsonValue.NewArray();
+        int i = 0;
+        while (i < Mge.maps.Count) {
+            MapDoc m = Mge.maps[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(m.name));
+            o.Set("cellW", JsonValue.NewNum(Str.FromInt(m.cellW)));
+            o.Set("cellH", JsonValue.NewNum(Str.FromInt(m.cellH)));
+            o.Set("cols", JsonValue.NewNum(Str.FromInt(m.cols)));
+            o.Set("rows", JsonValue.NewNum(Str.FromInt(m.rows)));
+            o.Set("startX", JsonValue.NewNum(Str.FromInt(m.startX)));
+            o.Set("startY", JsonValue.NewNum(Str.FromInt(m.startY)));
+            o.Set("default", JsonValue.NewBool(m.isDefault));
+            o.Set("cells", JsonValue.NewStr(m.CellString()));
+            JsonValue sp = JsonValue.NewArray();
+            int k = 0;
+            while (k < m.spawns.Count) {
+                sp.Append(m.spawns[k]);
+                k = k + 1;
+            }
+            o.Set("spawns", sp);
+            doc.Append(o);
+            i = i + 1;
+        }
+        File.WriteAllText(Mge.PathOf("map.json"), doc.ToJson());
+        Mge.mapDirty = false;
+    }
+
+    static void SaveAll() {
+        if (!Directory.Exists(Mge.dataDir)) { Directory.CreateDirectory(Mge.dataDir); }
+        int i = 0;
+        while (i < Mge.sheets.Count) {
+            Mge.SaveSheet(Mge.sheets[i]);
+            i = i + 1;
+        }
+        Mge.SaveMaps();
+        Mge.status = "已保存到 " + Mge.dataDir;
+    }
+
+
+    static void Export() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("// Generated by tools/mge -- do not edit by hand.\n");
+        sb.Append("// Regenerate: mge.exe " + Mge.dataDir + "  ->  \"导出 Zan\"\n\n");
+        sb.Append("using System;\n");
+        sb.Append("using Game.Zgm;\n\n");
+        sb.Append("/// The authored game data as a ready-to-run ZgmProject.\n");
+        sb.Append("class MgeData {\n");
+        sb.Append("    static ZgmProject Build() {\n");
+        sb.Append("        ZgmProject p = ZgmProject.Create();\n");
+        Mge.EmitNpcs(sb);
+        Mge.EmitItems(sb);
+        Mge.EmitSkills(sb);
+        Mge.EmitMaps(sb);
+        sb.Append("        return p;\n");
+        sb.Append("    }\n");
+        sb.Append("}\n");
+        File.WriteAllText(Mge.PathOf("ZgmData.zan"), sb.ToString());
+        Mge.status = "已导出 " + Mge.PathOf("ZgmData.zan");
+    }
+
+    static void EmitNpcs(StringBuilder sb) {
+        Sheet s = Mge.sheets[0];
+        int i = 0;
+        while (i < s.rows.Count) {
+            JsonValue r = s.rows[i];
+            string v = "n" + Str.FromInt(i);
+            sb.Append("\n        NpcConfig " + v + " = NpcConfig.Create("
+                + Str.Quote(r.Str("name", "npc")) + ");\n");
+            string dn = r.Str("displayName", "");
+            if (dn != "") {
+                sb.Append("        " + v + ".SetDisplayName(" + Str.Quote(dn) + ");\n");
+            }
+            if (r.Bool("hero", false)) { sb.Append("        " + v + ".SetHero(true);\n"); }
+            string growth = r.Str("growth", "");
+            if (growth != "") {
+                sb.Append("        " + v + ".SetGrowth(" + Str.Quote(growth) + ", "
+                    + Str.FromInt(r.Int("level", 1)) + ");\n");
+            }
+            int maxhp = r.Int("maxhp", 100);
+            int maxmp = r.Int("maxmp", 50);
+            sb.Append("        " + v + ".SetVitals(" + Str.FromInt(maxhp) + ", "
+                + Str.FromInt(maxhp) + ", " + Str.FromInt(maxmp) + ", "
+                + Str.FromInt(maxmp) + ");\n");
+            sb.Append("        " + v + ".SetCombat(" + Str.FromInt(r.Int("hit", 100))
+                + ", " + Str.FromInt(r.Int("dodge", 0)) + ", "
+                + Str.FromInt(r.Int("crit", 0)) + ");\n");
+            sb.Append("        " + v + ".SetBehavior(" + Str.FromInt(r.Int("aiLevel", 0))
+                + ", " + Str.FromInt(r.Int("autoCounter", -1)) + ");\n");
+            sb.Append("        " + v + ".SetExperience(0, "
+                + Str.FromInt(r.Int("expReward", 0)) + ");\n");
+            sb.Append("        " + v + ".SetDropChance("
+                + Str.FromInt(r.Int("dropChance", 100)) + ");\n");
+            List<string> skills = Str.SplitList(r.Str("skills", ""));
+            int k = 0;
+            while (k < skills.Count) {
+                sb.Append("        " + v + ".AddSkill(" + Str.Quote(skills[k]) + ");\n");
+                k = k + 1;
+            }
+            sb.Append("        p.AddNpc(" + v + ");\n");
+            i = i + 1;
+        }
+    }
+
+    static void EmitItems(StringBuilder sb) {
+        Sheet s = Mge.sheets[1];
+        List<string> cats = s.specs[2].options;
+        List<string> subs = s.specs[3].options;
+        int i = 0;
+        while (i < s.rows.Count) {
+            JsonValue r = s.rows[i];
+            string v = "it" + Str.FromInt(i);
+            string name = r.Str("name", "item");
+            string dn = r.Str("displayName", "");
+            if (dn == "") { dn = name; }
+            sb.Append("\n        ItemConfig " + v + " = ItemConfig.Create("
+                + Str.Quote(name) + ", " + Str.Quote(dn) + ");\n");
+            sb.Append("        " + v + ".SetCategory("
+                + Str.Quote(Mge.OptionOf(cats, r.Int("category", 0))) + ", "
+                + Str.Quote(Mge.OptionOf(subs, r.Int("subtype", 0))) + ");\n");
+            sb.Append("        " + v + ".SetLevelReq("
+                + Str.FromInt(r.Int("levelReq", 0)) + ");\n");
+            sb.Append("        " + v + ".SetMaxStack("
+                + Str.FromInt(r.Int("maxStack", 1)) + ");\n");
+            if (r.Bool("noDrop", false)) { sb.Append("        " + v + ".SetNoDrop(true);\n"); }
+            string icon = r.Str("icon", "");
+            if (icon != "") {
+                sb.Append("        " + v + ".SetIcon(" + Str.Quote(icon) + ");\n");
+            }
+            string tip = r.Str("tooltip", "");
+            if (tip != "") {
+                sb.Append("        " + v + ".SetTooltip(" + Str.Quote(tip) + ");\n");
+            }
+            Mge.EmitAttr(sb, v, r, "攻击");
+            Mge.EmitAttr(sb, v, r, "魔法");
+            Mge.EmitAttr(sb, v, r, "道术");
+            Mge.EmitAttr(sb, v, r, "防御");
+            Mge.EmitAttr(sb, v, r, "魔御");
+            sb.Append("        p.AddItem(" + v + ");\n");
+            i = i + 1;
+        }
+    }
+
+    static void EmitAttr(StringBuilder sb, string v, JsonValue r, string attr) {
+        int amount = r.Int(attr, 0);
+        if (amount == 0) { return; }
+        sb.Append("        " + v + ".AddAttr(" + Str.Quote(attr) + ", "
+            + Str.FromInt(amount) + ");\n");
+    }
+
+    static void EmitSkills(StringBuilder sb) {
+        Sheet s = Mge.sheets[2];
+        List<string> factions = s.specs[2].options;
+        int i = 0;
+        while (i < s.rows.Count) {
+            JsonValue r = s.rows[i];
+            string v = "sk" + Str.FromInt(i);
+            string name = r.Str("name", "skill");
+            string dn = r.Str("displayName", "");
+            if (dn == "") { dn = name; }
+            sb.Append("\n        SkillConfig " + v + " = SkillConfig.Create("
+                + Str.Quote(name) + ", " + Str.Quote(dn) + ");\n");
+            sb.Append("        " + v + ".SetFaction("
+                + Str.Quote(Mge.OptionOf(factions, r.Int("faction", 0))) + ");\n");
+            sb.Append("        " + v + ".SetTarget(" + Mge.TargetExpr(r.Int("target", 0))
+                + ");\n");
+            sb.Append("        " + v + ".SetRange("
+                + Str.FromInt(r.Int("attackRange", 1)) + ", "
+                + Str.FromInt(r.Int("minRange", 0)) + ");\n");
+            sb.Append("        " + v + ".SetArea("
+                + Str.FromInt(r.Int("areaRadius", 0)) + ");\n");
+            sb.Append("        " + v + ".SetCost(" + Str.FromInt(r.Int("costHp", 0))
+                + ", " + Str.FromInt(r.Int("costMp", 0)) + ", "
+                + Str.FromInt(r.Int("costRage", 0)) + ");\n");
+            sb.Append("        " + v + ".SetInterval("
+                + Str.FromInt(r.Int("interval", 0)) + ");\n");
+            sb.Append("        " + v + ".SetDamageDelay("
+                + Str.FromInt(r.Int("damageDelay", 0)) + ");\n");
+            sb.Append("        " + v + ".SetPriority("
+                + Str.FromInt(r.Int("priority", 0)) + ");\n");
+            sb.Append("        " + v + ".SetDamageScale("
+                + Mge.ScaleExpr(r.Int("damageScale", 100)) + ");\n");
+            string formula = r.Str("formula", "");
+            if (formula != "") {
+                sb.Append("        " + v + ".SetFormula(" + Str.Quote(formula) + ");\n");
+            }
+            string icon = r.Str("icon", "");
+            if (icon != "") {
+                sb.Append("        " + v + ".SetIcon(" + Str.Quote(icon) + ");\n");
+            }
+            sb.Append("        p.AddSkill(" + v + ");\n");
+            i = i + 1;
+        }
+    }
+
+    static string ScaleExpr(int percent) {
+        int whole = percent / 100;
+        int frac = percent - whole * 100;
+        if (frac < 0) { frac = -frac; }
+        string f = Str.FromInt(frac);
+        if (frac < 10) { f = "0" + f; }
+        return Str.FromInt(whole) + "." + f;
+    }
+
+    static string TargetExpr(int idx) {
+        if (idx == 1) { return "SkillTarget.MouseCell"; }
+        if (idx == 2) { return "SkillTarget.CharacterThenCell"; }
+        if (idx == 3) { return "SkillTarget.Self"; }
+        return "SkillTarget.Character";
+    }
+
+    static string FactionExpr(string camp) {
+        if (camp == "友方") { return "Faction.Friendly"; }
+        if (camp == "中立") { return "Faction.Neutral"; }
+        return "Faction.Enemy";
+    }
+
+    static void EmitMaps(StringBuilder sb) {
+        int i = 0;
+        while (i < Mge.maps.Count) {
+            MapDoc m = Mge.maps[i];
+            string v = "m" + Str.FromInt(i);
+            sb.Append("\n        MapConfig " + v + " = MapConfig.Create("
+                + Str.Quote(m.name) + ");\n");
+            sb.Append("        " + v + ".SetGrid(" + Str.FromInt(m.cellW) + ", "
+                + Str.FromInt(m.cellH) + ", " + Str.FromInt(m.cols) + ", "
+                + Str.FromInt(m.rows) + ");\n");
+            sb.Append("        " + v + ".SetStart(" + Str.FromInt(m.startX) + ", "
+                + Str.FromInt(m.startY) + ");\n");
+            if (m.isDefault) { sb.Append("        " + v + ".SetDefault(true);\n"); }
+            int y = 0;
+            while (y < m.rows) {
+                int x = 0;
+                while (x < m.cols) {
+                    int flags = m.CellAt(x, y);
+                    if (flags != 0) {
+                        sb.Append("        " + v + ".AddCell(MapCell.Of("
+                            + Str.FromInt(x) + ", " + Str.FromInt(y) + ", "
+                            + Str.FromInt(flags) + "));\n");
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            int k = 0;
+            while (k < m.spawns.Count) {
+                JsonValue sp = m.spawns[k];
+                sb.Append("        " + v + ".AddSpawn(MapSpawn.Of("
+                    + Str.Quote(sp.Str("name", "")) + ", "
+                    + Mge.FactionExpr(sp.Str("faction", "敌方")) + ", "
+                    + Str.FromInt(sp.Int("x", 0)) + ", "
+                    + Str.FromInt(sp.Int("y", 0)) + ", "
+                    + Str.FromInt(sp.Int("range", 3)) + ", "
+                    + Str.FromInt(sp.Int("count", 1)) + ")"
+                    + ".SetLevel(" + Str.FromInt(sp.Int("level", 0)) + "));\n");
+                k = k + 1;
+            }
+            sb.Append("        p.AddMap(" + v + ");\n");
+            i = i + 1;
+        }
+    }
+
+    static string OptionOf(List<string> opts, int idx) {
+        if (idx < 0 || idx >= opts.Count) { return ""; }
+        return opts[idx];
+    }
+
+
+    static bool Dirty() {
+        if (Mge.mapDirty) { return true; }
+        int i = 0;
+        while (i < Mge.sheets.Count) {
+            if (Mge.sheets[i].dirty) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+
+    static MapDoc CurrentMap() {
+        if (Mge.mapSel < 0 || Mge.mapSel >= Mge.maps.Count) { return null; }
+        return Mge.maps[Mge.mapSel];
+    }
+
+    static void SelectMap(int i) {
+        Mge.mapSel = i >= 0 && i < Mge.maps.Count ? i : -1;
+        if (Mge.rootView != null) { Mge.rootView.Refresh(); }
+        else { Mge.PushMapForm(); }
+    }
+
+    static void PushMapForm() {
+        MapDoc m = Mge.CurrentMap();
+        Mge.mapInputs[0].SetText(m != null ? m.name : "");
+        Mge.mapInputs[1].SetText(m != null ? Str.FromInt(m.cellW) : "");
+        Mge.mapInputs[2].SetText(m != null ? Str.FromInt(m.cellH) : "");
+        Mge.mapInputs[3].SetText(m != null ? Str.FromInt(m.cols) : "");
+        Mge.mapInputs[4].SetText(m != null ? Str.FromInt(m.rows) : "");
+        Mge.mapInputs[5].SetText(m != null ? Str.FromInt(m.startX) : "");
+        Mge.mapInputs[6].SetText(m != null ? Str.FromInt(m.startY) : "");
+        Mge.spawnCount.SetText(m != null ? Str.FromInt(Mge.spawnAmount) : "");
+        Mge.spawnRange.SetText(m != null ? Str.FromInt(Mge.spawnRadius) : "");
+    }
+
+    // A Change commits exactly its field; unedited fields are never pulled from UI.
+    static void CommitMapField(int index) {
+        MapDoc map = Mge.CurrentMap();
+        if (map == null || index < 0 || index >= Mge.mapInputs.Count) { return; }
+        if (index == 0) {
+            string name = Mge.mapInputs[0].GetText();
+            if (name != "" && name != map.name) { map.name = name; Mge.mapDirty = true; }
+            return;
+        }
+        int previous = 0;
+        if (index == 1) { previous = map.cellW; }
+        if (index == 2) { previous = map.cellH; }
+        if (index == 3) { previous = map.cols; }
+        if (index == 4) { previous = map.rows; }
+        if (index == 5) { previous = map.startX; }
+        if (index == 6) { previous = map.startY; }
+        int value = Mge.SanitizedInt(Mge.mapInputs[index], previous);
+        if (value == previous) { return; }
+        if (index <= 4 && value <= 0) { return; }
+        if (index == 1) { map.cellW = value; }
+        if (index == 2) { map.cellH = value; }
+        if (index == 3 || index == 4) {
+            int oldX = map.startX; int oldY = map.startY;
+            map.Resize(index == 3 ? value : map.cols, index == 4 ? value : map.rows);
+            if (map.startX != oldX) { Mge.mapInputs[5].SetText(Str.FromInt(map.startX)); }
+            if (map.startY != oldY) { Mge.mapInputs[6].SetText(Str.FromInt(map.startY)); }
+        }
+        if (index == 5) { if (value < 0 || value >= map.cols) { return; } map.startX = value; }
+        if (index == 6) { if (value < 0 || value >= map.rows) { return; } map.startY = value; }
+        Mge.mapDirty = true;
+    }
+
+    static int SanitizedInt(Input inp, int dflt) {
+        string raw = inp.GetText();
+        string clean = Str.Digits(raw, false);
+        if (clean != raw) { inp.SetText(clean); }
+        if (clean == "") { return dflt; }
+        return Str.ToInt(clean);
+    }
+
+    static void RenderWorld(App a, MapDoc m, int gx, int gy, int gw, int gh, int cell) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int gridW = cell * m.cols;
+        int gridH = cell * m.rows;
+
+        c.PushClip(gx, gy, gw, gh);
+        c.FillRect(gx, gy, gridW, gridH, t.bgTertiary);
+        int yy = 0;
+        while (yy < m.rows) {
+            int xx = 0;
+            while (xx < m.cols) {
+                int flags = m.CellAt(xx, yy);
+                if (flags != 0) {
+                    c.FillRect(gx + xx * cell, gy + yy * cell, cell, cell,
+                        Mge.FlagColor(t, flags));
+                }
+                xx = xx + 1;
+            }
+            yy = yy + 1;
+        }
+        int line = 0;
+        while (line <= m.cols) {
+            c.DrawLine(gx + line * cell, gy, gx + line * cell, gy + gridH, t.divider, 1);
+            line = line + 1;
+        }
+        line = 0;
+        while (line <= m.rows) {
+            c.DrawLine(gx, gy + line * cell, gx + gridW, gy + line * cell, t.divider, 1);
+            line = line + 1;
+        }
+
+        c.FillCircle(gx + m.startX * cell + cell / 2, gy + m.startY * cell + cell / 2,
+            cell / 3, t.success);
+        int k = 0;
+        while (k < m.spawns.Count) {
+            JsonValue sp = m.spawns[k];
+            int sxp = gx + sp.Int("x", 0) * cell + cell / 2;
+            int syp = gy + sp.Int("y", 0) * cell + cell / 2;
+            c.FillCircle(sxp, syp, cell / 3, t.warning);
+            c.DrawCircle(sxp, syp, sp.Int("range", 3) * cell, t.warning, 1);
+            k = k + 1;
+        }
+        c.PopClip();
+    }
+
+    static int FlagColor(Theme t, int flags) {
+        if (flags == 1) { return t.error; }
+        if (flags == 2) { return t.info; }
+        return t.warning;
+    }
+
+    static void HandleGridInput(App a, MapDoc m, int gx, int gy, int cell,
+                                int gridW, int gridH, int pointerX, int pointerY, bool press) {
+        if (m == null || cell < 1 || pointerX < gx || pointerY < gy
+            || pointerX >= gx + gridW || pointerY >= gy + gridH) { return; }
+        int cx = (pointerX - gx) / cell;
+        int cy = (pointerY - gy) / cell;
+        if (cx < 0 || cy < 0 || cx >= m.cols || cy >= m.rows) { return; }
+
+        if (Mge.mapTool == 0) {
+            if (m.CellAt(cx, cy) != Mge.brush) {
+                m.SetCell(cx, cy, Mge.brush);
+                Mge.mapDirty = true;
+                a.RequestRedraw();
+            }
+            return;
+        }
+        if (!press) { return; }
+        if (Mge.mapTool == 1) {
+            JsonValue npcRow = Mge.sheets[0].Selected();
+            if (npcRow == null) {
+                Mge.status = "请先在“角色”页选中一个角色，再放置刷怪点";
+                return;
+            }
+            if (m.SpawnIndexAt(cx, cy) >= 0) { return; }
+            JsonValue sp = JsonValue.NewObject();
+            sp.Set("name", JsonValue.NewStr(npcRow.Str("name", "")));
+            sp.Set("faction", JsonValue.NewStr("敌方"));
+            sp.Set("x", JsonValue.NewNum(Str.FromInt(cx)));
+            sp.Set("y", JsonValue.NewNum(Str.FromInt(cy)));
+            sp.Set("range", JsonValue.NewNum(Str.FromInt(Mge.spawnRadius)));
+            sp.Set("count", JsonValue.NewNum(Str.FromInt(Mge.spawnAmount)));
+            sp.Set("level", JsonValue.NewNum(Str.FromInt(npcRow.Int("level", 1))));
+            m.spawns.Add(sp);
+            Mge.mapDirty = true;
+            a.RequestRedraw();
+            return;
+        }
+        if (Mge.mapTool == 2) {
+            m.startX = cx;
+            m.startY = cy;
+            Mge.mapInputs[5].SetText(Str.FromInt(cx));
+            Mge.mapInputs[6].SetText(Str.FromInt(cy));
+            Mge.mapDirty = true;
+            a.RequestRedraw();
+            return;
+        }
+        int idx = m.SpawnIndexAt(cx, cy);
+        if (idx >= 0) {
+            m.spawns.RemoveAt(idx);
+            Mge.mapDirty = true;
+            a.RequestRedraw();
+        }
+    }
+
+}
