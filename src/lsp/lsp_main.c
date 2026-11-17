@@ -712,6 +712,14 @@ static void method_call_context(const char *text, size_t offset,
 
 /* diagnostics */
 
+/* B-ID200 余量①：单文档语义视图的跨文件类型 E1005 误报抑制（声明在后，
+ * 实现见 doc_intel_for 之后的 lsp_* 助手组）。 */
+static bool lsp_diag_known_external_type(const char *message,
+                                         const using_analysis_t *ua,
+                                         const char *own_ns);
+static void lsp_own_namespace(const char *text, char *out, size_t cap);
+static intellisense_t *doc_intel_for(lsp_server_t *s, const char *uri);
+
 static void publish_empty_diagnostics(lsp_server_t *s, const char *uri, int version) {
     json_value *params = json_new_obj();
     json_obj_set(params, "uri", json_new_str(uri));
@@ -763,8 +771,19 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
 
     json_value *arr = json_new_arr();
     int count = zan_diag_entry_count(diag);
+    /* B-ID200 余量①：跨文件类型的 E1005 抑制门数据（usings + 自身命名
+     * 空间）。doc 索引不可用时门默认关闭，行为退回单文档原状。 */
+    using_analysis_t ua;
+    memset(&ua, 0, sizeof(ua));
+    char own_ns[128] = {0};
+    intellisense_t *doc_is = doc_intel_for(s, uri);
+    if (doc_is && text && text[0]) {
+        ua = intel_analyze_usings(doc_is, text, strlen(text));
+        lsp_own_namespace(text, own_ns, sizeof(own_ns));
+    }
     for (int i = 0; i < count; i++) {
         const zan_diag_entry_t *e = zan_diag_entry_at(diag, i);
+        if (lsp_diag_known_external_type(e->message, &ua, own_ns)) continue;
         int line = (int)e->loc.line > 0 ? (int)e->loc.line - 1 : 0;
         /* e->loc */
         int col  = byte_col_to_utf16_char(text, line, (int)e->loc.col);
@@ -1561,6 +1580,82 @@ static void doc_intel_invalidate(const char *uri) {
         g_doc_intel_uri[0] = '\0';
         g_doc_intel_version = -1;
     }
+}
+
+/* ---- B-ID200 余量①：跨文件类型 E1005 误报抑制 ----
+ * 单文档语义视图缺工作区其他文件/包的声明，binder 对 stdlib 内建面
+ * （builtin_api）之外的类型引用当场打 E1005 undefined type。项目索引
+ * g_project_intel（工作区 + stdlib + 包闭包）已持有这些声明：索引按名
+ * 命中类型且其声明命名空间被本文件 using 导入（或与本文件同命名空间，
+ * 或属全局命名空间）时，该 E1005 是视图缺陷而非代码缺陷，抑制发布；
+ * 索引未命中仍原样上报——真拼写错误不吞。 */
+
+static bool lsp_using_covers(const using_analysis_t *ua, const char *ns) {
+    for (int i = 0; i < ua->using_count; i++)
+        if (strcmp(ua->usings[i].namespace_name, ns) == 0) return true;
+    return false;
+}
+
+/* 取首个顶层 namespace 声明名（无则空串）。失败方向是"门关得更紧"：
+ * 提取错了最多不抑制，不会放走真错误。 */
+static void lsp_own_namespace(const char *text, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!text) return;
+    const char *p = text;
+    while ((p = strstr(p, "namespace")) != NULL) {
+        bool open_bounded = p == text ||
+                            (!isalnum((unsigned char)p[-1]) && p[-1] != '_');
+        if (open_bounded && !isalnum((unsigned char)p[9]) && p[9] != '_') {
+            const char *q = p + 9;
+            while (*q == ' ' || *q == '\t') q++;
+            size_t n = 0;
+            while (n + 1 < cap &&
+                   (isalnum((unsigned char)q[n]) || q[n] == '_' || q[n] == '.'))
+                n++;
+            if (n > 0) {
+                memcpy(out, q, n);
+                out[n] = '\0';
+            }
+            return;
+        }
+        p += 9;
+    }
+}
+
+/* 消息形如 "[E1005] undefined type 'X'" / "undefined base type 'X'"；
+ * 引号不闭合视为畸形消息，不抑制。 */
+static bool lsp_undef_type_name(const char *message, char *out, size_t cap) {
+    static const char k_type[] = "undefined type '";
+    static const char k_base[] = "undefined base type '";
+    const char *p = strstr(message, k_type);
+    const char *q = strstr(message, k_base);
+    const char *key = NULL;
+    if (p && (!q || p <= q)) key = k_type;
+    else if (q) key = k_base;
+    else return false;
+    p += strlen(key);
+    size_t n = 0;
+    while (p[n] && p[n] != '\'' && n + 1 < cap) n++;
+    if (n == 0 || p[n] != '\'') return false;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
+}
+
+static bool lsp_diag_known_external_type(const char *message,
+                                         const using_analysis_t *ua,
+                                         const char *own_ns) {
+    if (!g_project_intel || g_project_intel->symbol_count == 0) return false;
+    char name[128];
+    if (!lsp_undef_type_name(message, name, sizeof(name))) return false;
+    const isym_t *sym = intel_lookup_symbol_any(g_project_intel, name);
+    if (!sym) return false;
+    if (sym->kind != ISYM_CLASS && sym->kind != ISYM_STRUCT &&
+        sym->kind != ISYM_ENUM && sym->kind != ISYM_INTERFACE)
+        return false;
+    if (!sym->parent[0]) return true; /* 全局命名空间类型，无需 using */
+    if (own_ns[0] && strcmp(sym->parent, own_ns) == 0) return true;
+    return lsp_using_covers(ua, sym->parent);
 }
 
 static void handle_did_close(lsp_server_t *s, json_value *params) {
