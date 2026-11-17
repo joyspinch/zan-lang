@@ -7535,6 +7535,12 @@ add_test(NAME lsp_integration_utf16
   COMMAND lsp_integration_test $<TARGET_FILE:zan-lsp>)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+  add_test(NAME embed_resource_owner
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
+      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
+      --out ${CMAKE_BINARY_DIR}/cases/embed_resource_owner${_exe_ext}
+      --work ${CMAKE_BINARY_DIR}/test-out/embed-resource-owner)
+  set_tests_properties(embed_resource_owner PROPERTIES TIMEOUT 240)
   add_test(NAME frame_log_parser
     COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_frame_log_parser.py
       --output ${CMAKE_BINARY_DIR}/test-out/frame-log-parser)
