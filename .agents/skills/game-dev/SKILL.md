@@ -5,7 +5,7 @@ description: Zan 游戏开发规范——Gui 美术风格一致性、帧循环�
 
 # Zan 游戏开发：美术风格、帧循环、HUD 与手感
 
-> 框架侧看 Gui App 帧循环（`packages/Zan.Gui/src/Gui/Core/App.zan`），
+> 框架侧看 Gui App 帧循环（`packages/Zan.Gui/src/Gui/Core/App/App.zan`），
 > 范例看 `templates/game/` 各游戏。
 
 ## 图形游戏的 Gui 组件必须匹配游戏美术风格（硬规则）

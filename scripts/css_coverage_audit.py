@@ -88,7 +88,7 @@ def coerced_value(val):
             return True
     return False
 
-# 引擎会匹配的伪状态（packages/Zan.Gui/src/Gui/Styling/Style.zan:92-97 的 name 分派）。
+# 引擎会匹配的伪状态（packages/Zan.Gui/src/Gui/Styling/Style/Style.zan:92-97 的 name 分派）。
 STATE_NAMES = {'hover', 'active', 'focus', 'focus-visible', 'disabled',
                'selected', 'checked'}
 

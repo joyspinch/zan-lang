@@ -836,7 +836,7 @@ subdirectory:
    (`win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `linux-riscv64`,
    `macos-x64`, `macos-arm64` — matching the cross-compile toolchain names).
 3. Native code is called from Zan through `[DllImport]`/`extern` declarations
-   (e.g. `packages/Zan.Gui/src/Gui/Backend/Win32Shell.zan`); the driver DLL/SO is loaded at
+   (e.g. `packages/Zan.Gui/src/Gui/Backend/Win32/Win32Shell.zan`); the driver DLL/SO is loaded at
    runtime.
 4. On `--publish`, the manifest's libraries are copied next to the output
    executable (`--link-mode shared`, the default) or folded in where a static
