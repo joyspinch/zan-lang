@@ -2,7 +2,7 @@
 """
 scripts/gui_layer_rules.py
 
-Zan.Gui 分层重构的棘轮机检（docs/GUI_ARCHITECTURE.md §4 P0 第 3 步，B-ID171）。
+Zan.Gui 分层重构的棘轮机检（B-ID171 P0 第 3 步，对应 TASKS.md 的 B-ID171～179）。
 由 scripts/check_code_standards.py --staged 在 pre-commit 时调用；也可单独运行：
 
     python scripts/gui_layer_rules.py --report     # 全树对照基线，列出超出基线的违规
@@ -36,7 +36,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE_REL = "scripts/gui_layers_baseline.json"
 GUI_ROOT = "packages/Zan.Gui/src/Gui/"
 SKIP_TOP = {"_scratch", "build", "dist", ".git", "node_modules", ".zan-packages"}
-DOC = "docs/GUI_ARCHITECTURE.md"
+DOC = "TASKS.md B-ID171～179"
 
 CATEGORIES = ("layering", "render_entry", "arbitration", "legacy_attr", "signal_new")
 CATEGORY_DESC = {
