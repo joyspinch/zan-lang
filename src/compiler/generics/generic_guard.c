@@ -355,8 +355,9 @@ void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg) {
  *      "outside the range" 走既有映射），try 外 soft 报告后继续；
  *   ③ clamp 归一化（上越界→INT64_MAX、下越界→INT64_MIN、NaN→0），
  *      fptosi 输入必定义，绝无 poison；
- *   ④ 窄目标（<64 位）截断：域内值与旧窄直转逐位一致，域外旧 poison
- *      现为定义值。 */
+ *   ④ 窄目标（<64 位）先按目标位宽饱和再截断：旧实现只在 i64 上饱和，
+ *      再截断到目标宽度——(int)-1e308 落 INT64_MIN 后截成 0，语义既不是
+ *      饱和也不是回绕。现在域外值直接落到目标类型的 MIN/MAX。 */
 LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val,
                                  LLVMTypeRef target, zan_loc_t loc,
                                  LLVMValueRef arm_mask) {
@@ -389,7 +390,21 @@ LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val,
             LLVMConstInt(i64t, INT64_MIN, 1),
             converted, "f2i.clo"),
         "f2i.chi");
-    if (LLVMGetIntTypeWidth(target) < 64)
+    unsigned tw = LLVMGetIntTypeWidth(target);
+    if (tw < 64 && tw > 1) {
+        int64_t tmin = -((int64_t)1 << (tw - 1));
+        int64_t tmax = ((int64_t)1 << (tw - 1)) - 1;
+        LLVMValueRef lo_t = LLVMConstInt(i64t, (uint64_t)tmin, 1);
+        LLVMValueRef hi_t = LLVMConstInt(i64t, (uint64_t)tmax, 1);
+        LLVMValueRef below = zan_icmp(g->builder, LLVMIntSLT, clamped, lo_t,
+                                      "f2i.tlo");
+        LLVMValueRef above = zan_icmp(g->builder, LLVMIntSGT, clamped, hi_t,
+                                      "f2i.thi");
+        LLVMValueRef hi_sel = LLVMBuildSelect(g->builder, above, hi_t, clamped,
+                                              "f2i.thi.sel");
+        clamped = LLVMBuildSelect(g->builder, below, lo_t, hi_sel, "f2i.tclamp");
+    }
+    if (tw < 64)
         return LLVMBuildTrunc(g->builder, clamped, target, "f2i.trunc");
     return clamped;
 }
