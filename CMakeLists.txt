@@ -313,12 +313,21 @@ if(NOT WIN32)
 else()
     set(ZAN_RT_OBJ_DEFS)
 endif()
-# -ffunction-sections: the publish link carries --gc-sections, which can only
-# prune sections that are already split per function. Without it these runtime
-# objects enter the link whole, so every program carries the runtime in full
-# (measured on the linux-musl set: .text 139,378 -> 93,202, -33%). MSVC has
-# no such flag (its equivalent is /Gy), hence the guard.
-if(MSVC)
+# Publish's --gc-sections needs runtime code split per function. The runtime
+# compiler is selected independently of the host CMake compiler: an MSVC/clang-cl
+# host can still use MinGW GCC here, so the host MSVC flag cannot select its flags.
+# Windows GNU runtime objects deliberately keep data together: TDM-GCC emits
+# zero-initialized tables as file-backed .data$ with -fdata-sections. Explicitly
+# disable that flag to keep those tables in BSS without changing their storage.
+if(WIN32)
+    get_filename_component(_zan_rt_cc_name "${ZAN_RT_IO_CC}" NAME)
+    string(TOLOWER "${_zan_rt_cc_name}" _zan_rt_cc_name)
+    if(_zan_rt_cc_name MATCHES "^(cl|clang-cl)([.]exe)?$")
+        set(ZAN_RT_OBJ_SECTIONS)
+    else()
+        set(ZAN_RT_OBJ_SECTIONS -ffunction-sections -fno-data-sections)
+    endif()
+elseif(MSVC)
     set(ZAN_RT_OBJ_SECTIONS)
 else()
     set(ZAN_RT_OBJ_SECTIONS -ffunction-sections -fdata-sections)
@@ -3696,6 +3705,16 @@ endif()
 find_program(ZAN_LLVM_OBJDUMP NAMES llvm-objdump
   HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
 if(ZAN_LLVM_OBJDUMP)
+  if(WIN32)
+    add_test(NAME native_driver_sections
+      COMMAND ${CMAKE_COMMAND}
+        -DRUNTIME_OBJECT=${ZAN_RT_IO_OBJ}
+        -DMEMORY_OBJECT=${ZAN_RT_MEM_OBJ}
+        -DTARGET=win-x64
+        -DOBJDUMP=${ZAN_LLVM_OBJDUMP}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_native_driver_sections.cmake)
+    set_tests_properties(native_driver_sections PROPERTIES TIMEOUT 30)
+  endif()
   add_test(NAME codegen_android_x64_baseline
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

@@ -71,7 +71,9 @@ if ($Static) {
         $source = Join-Path $root "src\drivers\$driverSubdir\$sourceName"
         $object = Join-Path $work "$driver.o"
         $definition = "-D" + $driver.ToUpperInvariant() + "_STATIC"
+        # Static archive members need separate code/data sections for publish GC.
         Invoke-Native $clangExe @("--target=$triple", "-O2", "-DNDEBUG", $definition,
+            "-ffunction-sections", "-fdata-sections",
             "-DWINVER=0x0601", "-D_WIN32_WINNT=0x0601",
             "-I", (Join-Path $root "src\drivers"),
             "-I", (Join-Path $root "src\third_party"),
@@ -82,7 +84,7 @@ if ($Static) {
             $dwrite = Join-Path $work "zan_gui_dwrite.o"
             $dwriteSource = Join-Path $root "src\drivers\gui\gui_runtime_dwrite.cpp"
             Invoke-Native $clangCxx @("--target=$triple", "-O2", "-DNDEBUG", "-DZAN_GUI_STATIC",
-                "-fno-exceptions", "-fno-rtti",
+                "-ffunction-sections", "-fdata-sections", "-fno-exceptions", "-fno-rtti",
                 "-I", (Join-Path $root "src\drivers"),
                 "-I", (Join-Path $root "src\runtime"),
                 "-c", $dwriteSource, "-o", $dwrite)
