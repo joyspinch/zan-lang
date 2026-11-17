@@ -220,7 +220,7 @@
    - **观察引用与子控件回调避免保活环**：仅观察 sender 身份的 fixture 字段用 weak，避免 control→闭包→observer→control；Designer 自持 Palette TreeView 的回调捕获 `WeakReference<Designer>`，触发时取 Target、判空后临时调用，避免 owner→child→callback→owner 环。weak 不负责保活，也不表示整条 GUI 引用图都应弱化。
 
    定位：`packages/Zan.Gui.Designer/src/Gui/Designer/Designer.Preview.zan`、`Designer.Palette.zan`，
-   `packages/Zan.Gui/src/Gui/Core/App/VisualTree.zan`；回归为
+   `packages/Zan.Gui/src/Gui/Core/App/App.VisualTree.zan`；回归为
    `tests/gui/designer_interaction_test.zan` 的 root viewport、SlotsAndReparent、click/drain 与 PreviewCancelReentry。
    直接运行收据 `build/test-out/gui-designer-direct-20261113-080718/result.json` compile0/run0、strictPass true；
    正式 `conformance_gui_designer_interaction` 收据

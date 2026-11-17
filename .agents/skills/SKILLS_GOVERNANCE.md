@@ -13,7 +13,7 @@
 6. 机器专属内容（路径/尺寸/环境限制）进项目文档或代码注释，不进 skill。
 7. **路径必须能落地**：skill 里写的文件/脚本在仓库里要真实存在。搬过家的
    东西要在同一提交里改掉引用（GUI 源码在 `packages/Zan.Gui/src/Gui`，
-   不在 `stdlib/Gui`；IDE 在 `src/ide_zan/src/`，入口是 `src/IdeForm.html`）。
+   不在 `stdlib/Gui`；IDE 在 `src/ide_zan/src/`，入口是 `src/ide_zan/src/IdeForm.html`）。
    机器绝对路径一律换成仓库相对路径或 `<ZAN_SDK>` 一类占位符。
 
 ## 当前 skill 清单（工作区 13 个）
