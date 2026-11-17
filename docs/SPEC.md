@@ -71,6 +71,10 @@ when       where      while
 
 `checked` / `unchecked`：checked 上下文里整型 + - * 溢出报软运行时错误
 （报点后回绕值继续流动；`ZAN_RT_HARD=1` 时硬陷阱退出），默认上下文环绕。
+checked 同时覆盖取负 -MIN、`++`/`--`、MIN / -1 与窄化强转（整型→窄整型、
+浮点→整型，用例 `checked_overflow_coverage` /
+`checked_float_to_int_overflow`）：try 内抛 `OverflowException`，try 外报
+软运行时错误后按溢出值继续（整型回绕 / 浮点→整型饱和）。
 `value` 是上下文关键字：仅在属性 setter 体内表示隐式传入值，其余位置可作普通标识符。
 
 ### 2.5 Literals
@@ -185,6 +189,13 @@ UTF-16 语义（char=码元）不在 Zan 口径内（Zan 的 char 是 8 字节�
 见 §2.5 类型表）。
 
 `nint` 是普通有符号整数类型（指针宽度），原生内存访问通过 `NativeMemory` / `[DllImport]` 完成，见 §7。`decimal` 有独立类型（`m` 后缀字面量、四则与比较运算，公开面在 `System.Decimal`；已知缺口见 TASKS.md A511——除法 scale、与 double 混算、打印路径）。
+
+**浮点→整型转换口径**：`(T)浮点` 对越界值不产生 poison（TASKS.md
+B-ID180）：先按 i64 域判定——try 内抛 `OverflowException`、try 外报软
+运行时错误；值随后**按目标位宽饱和**，域外落目标类型的 MIN/MAX（
+`(int)-1e308` 是 `-2147483648`、`(short)40000.0` 是 `32767`，不是回绕），
+NaN 归 0。checked 上下文里目标位宽域外一律抛 `OverflowException`（用例
+`float_to_int_saturation`、`checked_float_to_int_overflow`）。
 
 ### 3.2 Type Inference
 
