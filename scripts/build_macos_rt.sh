@@ -92,8 +92,17 @@ for pair in arm64:aarch64 x64:x86_64; do
     echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_crash.o zanrt_decimal.o libzancrypto.a zanrt_gui.o zan_embed_api.o zan_inflate.o"
 done
 
+# iOS uses the complete UIKit runtime, not the macOS compatibility shim.
+# Zig's ios target needs its bundled Darwin libc headers explicitly.
+ZIG_BIN=$(command -v "$ZIG")
+IOSHDR="$(dirname -- "$ZIG_BIN")/lib/libc/include/any-macos-any"
+if [ ! -f "$IOSHDR/pthread.h" ]; then
+    echo "iOS Darwin headers not found next to Zig: $IOSHDR" >&2
+    exit 1
+fi
 mkdir -p "$ROOT/toolchain/ios/arm64"
-"$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -I "$DRV" -O2 -ffunction-sections -fdata-sections \
-    -c "$DRV/gui/gui_compat_mac.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
+"$ZIG" cc -target aarch64-ios.14.0 -I "$IOSHDR" -g0 -std=c11 -fPIC \
+    -DZAN_GUI_IOS -DZAN_GUI_STATIC -I "$RT" -I "$DRV" -O2 -ffunction-sections -fdata-sections \
+    -c "$DRV/gui/gui_runtime.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
 echo "built toolchain/ios/arm64: zanrt_gui.o"
 

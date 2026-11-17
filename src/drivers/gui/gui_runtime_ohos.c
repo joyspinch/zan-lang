@@ -61,60 +61,14 @@ EXPORT void zan_gui_ohos_set_keyboard_height(i32 height) {
     if (height >= 0) g_keyboard_height = (int)height;
 }
 
-typedef struct { int e[8]; iptr win; } zan_oev_t;
-#define ZAN_OQ_CAP 512
-static zan_oev_t g_oq[ZAN_OQ_CAP];
-static int g_oq_head = 0, g_oq_tail = 0;
-static pthread_mutex_t g_oq_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static int g_pending_event[8];
-static iptr g_event_win = 0;
-static long long g_ev_seq = 0;
-
-/* 触控移动事件合并：取最新坐标；滚轮滑动事件合并：累加偏移量 */
-static void oq_push_locked(int kind, int x, int y, int button, int code, int mods) {
-    int last = (g_oq_tail + ZAN_OQ_CAP - 1) % ZAN_OQ_CAP;
-    int has_last = (g_oq_head != g_oq_tail);
-    if (kind == 1 && has_last && g_oq[last].e[0] == 1) {
-        g_oq[last].e[1] = x; g_oq[last].e[2] = y;
-        return;
-    }
-    if (kind == 13 && has_last && g_oq[last].e[0] == 13) {
-        g_oq[last].e[1] = x; g_oq[last].e[2] = y;
-        g_oq[last].e[4] += code;
-        return;
-    }
-    int next = (g_oq_tail + 1) % ZAN_OQ_CAP;
-    if (next == g_oq_head) return; /* full: drop */
-    zan_oev_t *z = &g_oq[g_oq_tail];
-    z->e[0] = kind; z->e[1] = x; z->e[2] = y; z->e[3] = button;
-    z->e[4] = code; z->e[5] = mods; z->e[6] = 0; z->e[7] = 0;
-    z->win = ZAN_OHOS_HWND;
-    g_oq_tail = next;
-}
-
-/* 触控抬起派发：设置吞掉点击标记以防拖拽误判为点击 */
-static void oq_push_flag_locked(int kind, int x, int y, int button, int code, int mods) {
-    oq_push_locked(kind, x, y, button, code, mods);
-    if (g_oq_head != g_oq_tail) {
-        int last = (g_oq_tail + ZAN_OQ_CAP - 1) % ZAN_OQ_CAP;
-        g_oq[last].e[6] = 1;
-    }
-}
+#include "gui_runtime_ohos_events.c"
 
 /* XComponent 回调桥接（接收 ArkTS 宿主分发的生命周期与触控事件） */
 
 EXPORT void zan_gui_ohos_attach(void *nw, int w, int h) {
     if (!nw || w <= 0 || h <= 0) return;
-    pthread_mutex_lock(&g_oq_lock);
-    g_owin.nw = nw;
-    g_owin.w = w; g_owin.h = h;
-    g_owin.attached = 1;
-    g_window_width = w;
-    g_window_height = h;
-    oq_push_locked(7, w, h, 0, 0, 0);
-    oq_push_locked(14, 0, 0, 0, 0, 0);
-    pthread_mutex_unlock(&g_oq_lock);
+    /* The host must report the new absolute surface geometry after attaching. */
+    ohos_window_attach(nw, w, h);
 
     /* 特性探测：真机优先使用 BufferQueue 直写，模拟器回退 EGL 呈现 */
     if (!g_nw_request) {
@@ -132,14 +86,6 @@ EXPORT void zan_gui_ohos_attach(void *nw, int w, int h) {
         int32_t fmt = 2; /* NATIVEBUFFER_PIXEL_FMT_BGRA_8888 */
         g_nw_handleopt((OHNativeWindow *)nw, SET_FORMAT, fmt);
     }
-}
-
-/* 进程切后台 Surface 销毁生命周期处理 */
-EXPORT void zan_gui_ohos_detach(void) {
-    pthread_mutex_lock(&g_oq_lock);
-    g_owin.attached = 0;
-    g_owin.nw = NULL;
-    pthread_mutex_unlock(&g_oq_lock);
 }
 
 static i64 ohs_tick_ms(void) {
@@ -293,303 +239,9 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
 }
 
 
-/* 包含 uchar.h 以支持 IMF 头文件中的 char16_t 类型定义 */
-#include <uchar.h>
-#include "inputmethod/inputmethod_controller_capi.h"
+#include "gui_runtime_ohos_input.c"
+#include "gui_runtime_ohos_clipboard.c"
 
-typedef InputMethod_ErrorCode (*FnImeProxyCreate)(InputMethod_TextEditorProxy **);
-typedef void (*FnImeProxyDestroy)(InputMethod_TextEditorProxy *);
-#define IME_PROXY_SETTER(name, field) \
-    typedef InputMethod_ErrorCode (*FnImeSet##name)( \
-        InputMethod_TextEditorProxy *, field);
-IME_PROXY_SETTER(GetTextConfig, OH_TextEditorProxy_GetTextConfigFunc)
-IME_PROXY_SETTER(InsertText, OH_TextEditorProxy_InsertTextFunc)
-IME_PROXY_SETTER(DeleteForward, OH_TextEditorProxy_DeleteForwardFunc)
-IME_PROXY_SETTER(DeleteBackward, OH_TextEditorProxy_DeleteBackwardFunc)
-IME_PROXY_SETTER(SendEnterKey, OH_TextEditorProxy_SendEnterKeyFunc)
-IME_PROXY_SETTER(MoveCursor, OH_TextEditorProxy_MoveCursorFunc)
-IME_PROXY_SETTER(SendKeyboardStatus, OH_TextEditorProxy_SendKeyboardStatusFunc)
-IME_PROXY_SETTER(HandleSetSelection, OH_TextEditorProxy_HandleSetSelectionFunc)
-IME_PROXY_SETTER(HandleExtendAction, OH_TextEditorProxy_HandleExtendActionFunc)
-IME_PROXY_SETTER(GetLeftTextOfCursor, OH_TextEditorProxy_GetLeftTextOfCursorFunc)
-IME_PROXY_SETTER(GetRightTextOfCursor, OH_TextEditorProxy_GetRightTextOfCursorFunc)
-IME_PROXY_SETTER(GetTextIndexAtCursor, OH_TextEditorProxy_GetTextIndexAtCursorFunc)
-IME_PROXY_SETTER(ReceivePrivateCommand, OH_TextEditorProxy_ReceivePrivateCommandFunc)
-IME_PROXY_SETTER(SetPreviewText, OH_TextEditorProxy_SetPreviewTextFunc)
-IME_PROXY_SETTER(FinishTextPreview, OH_TextEditorProxy_FinishTextPreviewFunc)
-typedef InputMethod_ErrorCode (*FnImeAttach)(InputMethod_TextEditorProxy *,
-    InputMethod_AttachOptions *, InputMethod_InputMethodProxy **);
-typedef InputMethod_ErrorCode (*FnImeDetach)(InputMethod_InputMethodProxy *);
-typedef InputMethod_AttachOptions *(*FnImeAttachOptsCreate)(bool);
-typedef void (*FnImeAttachOptsDestroy)(InputMethod_AttachOptions *);
-typedef InputMethod_ErrorCode (*FnImeCfgSetInputType)(InputMethod_TextConfig *,
-    InputMethod_TextInputType);
-typedef InputMethod_ErrorCode (*FnImeCfgSetEnterKeyType)(InputMethod_TextConfig *,
-    InputMethod_EnterKeyType);
-typedef InputMethod_ErrorCode (*FnImeCfgSetPreviewSupport)(InputMethod_TextConfig *,
-    bool);
-
-static FnImeProxyCreate g_ime_proxy_create;
-static FnImeProxyDestroy g_ime_proxy_destroy;
-static FnImeSetGetTextConfig g_ime_set_cfg;
-static FnImeSetInsertText g_ime_set_insert;
-static FnImeSetDeleteForward g_ime_set_delfwd;
-static FnImeSetDeleteBackward g_ime_set_delbwd;
-static FnImeSetSendEnterKey g_ime_set_enter;
-static FnImeSetMoveCursor g_ime_set_move;
-static FnImeSetSendKeyboardStatus g_ime_set_kbstatus;
-static FnImeSetHandleSetSelection g_ime_setsel;
-static FnImeSetHandleExtendAction g_ime_setext;
-static FnImeSetGetLeftTextOfCursor g_ime_set_left;
-static FnImeSetGetRightTextOfCursor g_ime_set_right;
-static FnImeSetGetTextIndexAtCursor g_ime_set_idx;
-static FnImeSetReceivePrivateCommand g_ime_set_priv;
-static FnImeSetSetPreviewText g_ime_set_prev;
-static FnImeSetFinishTextPreview g_ime_set_finprev;
-static FnImeAttach g_ime_attach;
-static FnImeDetach g_ime_detach;
-static FnImeAttachOptsCreate g_ime_opts_create;
-static FnImeAttachOptsDestroy g_ime_opts_destroy;
-static FnImeCfgSetInputType g_ime_cfg_input;
-static FnImeCfgSetEnterKeyType g_ime_cfg_enter;
-static FnImeCfgSetPreviewSupport g_ime_cfg_preview;
-
-static InputMethod_TextEditorProxy *g_ime_proxy = NULL;
-static InputMethod_InputMethodProxy *g_ime_im = NULL;
-static int g_ime_attached = 0;
-
-/* UTF-16 解码为 Unicode 码点（合并代理对） */
-static int ime_utf16_next(const char16_t *s, size_t n, size_t *i) {
-    if (*i >= n) { return 0; }
-    unsigned int u = (unsigned int)s[(*i)++];
-    if (u >= 0xD800 && u <= 0xDBFF && *i < n) {
-        unsigned int lo = (unsigned int)s[*i];
-        if (lo >= 0xDC00 && lo <= 0xDFFF) {
-            (*i)++;
-            return (int)(0x10000u + ((u - 0xD800u) << 10) + (lo - 0xDC00u));
-        }
-    }
-    return (int)u;
-}
-
-/* OpenHarmony 输入法 (IMF) 回调：通过线程安全环形队列传递输入文本 */
-static void ime_on_insert(InputMethod_TextEditorProxy *proxy,
-                          const char16_t *text, size_t length) {
-    (void)proxy;
-    size_t i = 0;
-    pthread_mutex_lock(&g_oq_lock);
-    for (;;) {
-        int cp = ime_utf16_next(text, length, &i);
-        if (cp <= 0) { break; }
-        if (cp == '\n') { cp = 13; }
-        oq_push_locked(6, 0, 0, 0, cp, 0);
-    }
-    pthread_mutex_unlock(&g_oq_lock);
-}
-
-static void ime_on_delete_backward(InputMethod_TextEditorProxy *proxy,
-                                   int32_t length) {
-    (void)proxy;
-    /* 文本长度按 UTF-16 单元计数，代理对视为单个码点 */
-    int n = (length + 1) / 2;
-    if (n < 1) { n = 1; }
-    pthread_mutex_lock(&g_oq_lock);
-    for (int k = 0; k < n; k++) { oq_push_locked(6, 0, 0, 0, 8, 0); }
-    pthread_mutex_unlock(&g_oq_lock);
-}
-
-static void ime_on_delete_forward(InputMethod_TextEditorProxy *proxy,
-                                  int32_t length) {
-    (void)proxy;
-    if (length < 1) { length = 1; }
-    pthread_mutex_lock(&g_oq_lock);
-    for (int32_t k = 0; k < length; k++) { oq_push_locked(4, 0, 0, 0, 46, 0); }
-    pthread_mutex_unlock(&g_oq_lock);
-}
-
-static void ime_on_enter_key(InputMethod_TextEditorProxy *proxy,
-                             InputMethod_EnterKeyType key) {
-    (void)proxy;
-    (void)key;
-    pthread_mutex_lock(&g_oq_lock);
-    oq_push_locked(6, 0, 0, 0, 13, 0);
-    pthread_mutex_unlock(&g_oq_lock);
-}
-
-static void ime_on_move_cursor(InputMethod_TextEditorProxy *proxy,
-                               InputMethod_Direction dir) {
-    (void)proxy;
-    int vk = 0;
-    switch (dir) {
-    case IME_DIRECTION_LEFT:  vk = 37; break;
-    case IME_DIRECTION_UP:    vk = 38; break;
-    case IME_DIRECTION_RIGHT: vk = 39; break;
-    case IME_DIRECTION_DOWN:  vk = 40; break;
-    default: return;
-    }
-    pthread_mutex_lock(&g_oq_lock);
-    oq_push_locked(4, 0, 0, 0, vk, 0);
-    pthread_mutex_unlock(&g_oq_lock);
-}
-
-/* 输入上下文查询空回退：光标位置与选区设为空 */
-static void ime_on_get_left_text(InputMethod_TextEditorProxy *proxy,
-                                 int32_t number, char16_t text[], size_t *length) {
-    (void)proxy; (void)number;
-    if (length) { *length = 0; }
-    if (text) { text[0] = 0; }
-}
-static void ime_on_get_right_text(InputMethod_TextEditorProxy *proxy,
-                                  int32_t number, char16_t text[], size_t *length) {
-    (void)proxy; (void)number;
-    if (length) { *length = 0; }
-    if (text) { text[0] = 0; }
-}
-static int32_t ime_on_get_index_at_cursor(InputMethod_TextEditorProxy *proxy) {
-    (void)proxy;
-    return 0;
-}
-static int32_t ime_on_private_command(InputMethod_TextEditorProxy *proxy,
-                                      InputMethod_PrivateCommand *cmd[], size_t size) {
-    (void)proxy; (void)cmd; (void)size;
-    return IME_ERR_OK;
-}
-static int32_t ime_on_set_preview_text(InputMethod_TextEditorProxy *proxy,
-                                       const char16_t text[], size_t length,
-                                       int32_t start, int32_t end) {
-    (void)proxy; (void)text; (void)length; (void)start; (void)end;
-    return IME_ERR_OK;
-}
-
-static void ime_on_keyboard_status(InputMethod_TextEditorProxy *proxy,
-                                   InputMethod_KeyboardStatus status) {
-    (void)proxy; (void)status;
-}
-static void ime_on_set_selection(InputMethod_TextEditorProxy *proxy,
-                                 int32_t start, int32_t end) {
-    (void)proxy; (void)start; (void)end;
-}
-static void ime_on_extend_action(InputMethod_TextEditorProxy *proxy,
-                                 InputMethod_ExtendAction action) {
-    (void)proxy; (void)action;
-}
-static void ime_on_finish_preview(InputMethod_TextEditorProxy *proxy) {
-    (void)proxy;
-}
-
-static void ime_on_get_text_config(InputMethod_TextEditorProxy *proxy,
-                                   InputMethod_TextConfig *config) {
-    (void)proxy;
-    /* 动态加载 libohinput.so 中的 TextConfig 配置接口 */
-    if (g_ime_cfg_input) { g_ime_cfg_input(config, IME_TEXT_INPUT_TYPE_TEXT); }
-    if (g_ime_cfg_preview) { g_ime_cfg_preview(config, false); }
-    if (g_ime_cfg_enter) { g_ime_cfg_enter(config, IME_ENTER_KEY_UNSPECIFIED); }
-}
-
-static void ime_ensure_proxy(void) {
-    if (g_ime_proxy || !g_ime_proxy_create) { return; }
-    InputMethod_TextEditorProxy *p = NULL;
-    if (g_ime_proxy_create(&p) != IME_ERR_OK || !p) { return; }
-#define IME_SET(fn, field, val) \
-    do { if (fn(p, val) != IME_ERR_OK) { goto fail; } } while (0)
-    IME_SET(g_ime_set_cfg, GetTextConfigFunc, ime_on_get_text_config);
-    IME_SET(g_ime_set_insert, InsertTextFunc, ime_on_insert);
-    IME_SET(g_ime_set_delbwd, DeleteBackwardFunc, ime_on_delete_backward);
-    IME_SET(g_ime_set_delfwd, DeleteForwardFunc, ime_on_delete_forward);
-    IME_SET(g_ime_set_enter, SendEnterKeyFunc, ime_on_enter_key);
-    IME_SET(g_ime_set_move, MoveCursorFunc, ime_on_move_cursor);
-    IME_SET(g_ime_set_left, GetLeftTextOfCursorFunc, ime_on_get_left_text);
-    IME_SET(g_ime_set_right, GetRightTextOfCursorFunc, ime_on_get_right_text);
-    IME_SET(g_ime_set_idx, GetTextIndexAtCursorFunc, ime_on_get_index_at_cursor);
-    IME_SET(g_ime_set_priv, ReceivePrivateCommandFunc, ime_on_private_command);
-    IME_SET(g_ime_set_prev, SetPreviewTextFunc, ime_on_set_preview_text);
-    IME_SET(g_ime_set_kbstatus, SendKeyboardStatusFunc, ime_on_keyboard_status);
-    IME_SET(g_ime_setsel, HandleSetSelectionFunc, ime_on_set_selection);
-    IME_SET(g_ime_setext, HandleExtendActionFunc, ime_on_extend_action);
-    IME_SET(g_ime_set_finprev, FinishTextPreviewFunc, ime_on_finish_preview);
-#undef IME_SET
-    g_ime_proxy = p;
-    return;
-fail:
-    g_ime_proxy_destroy(p);
-}
-
-static void ime_feature_detect(void) {
-    static int done = 0;
-    if (done) { return; }
-    done = 1;
-    void *h = dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_Create");
-    if (!h) { return; }
-    g_ime_proxy_create = (FnImeProxyCreate)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_Create");
-    g_ime_proxy_destroy = (FnImeProxyDestroy)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_Destroy");
-    g_ime_set_cfg = (FnImeSetGetTextConfig)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetGetTextConfigFunc");
-    g_ime_set_insert = (FnImeSetInsertText)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetInsertTextFunc");
-    g_ime_set_delfwd = (FnImeSetDeleteForward)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetDeleteForwardFunc");
-    g_ime_set_delbwd = (FnImeSetDeleteBackward)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetDeleteBackwardFunc");
-    g_ime_set_enter = (FnImeSetSendEnterKey)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetSendEnterKeyFunc");
-    g_ime_set_move = (FnImeSetMoveCursor)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetMoveCursorFunc");
-    g_ime_set_kbstatus = (FnImeSetSendKeyboardStatus)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetSendKeyboardStatusFunc");
-    g_ime_setsel = (FnImeSetHandleSetSelection)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetHandleSetSelectionFunc");
-    g_ime_setext = (FnImeSetHandleExtendAction)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetHandleExtendActionFunc");
-    g_ime_set_left = (FnImeSetGetLeftTextOfCursor)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetGetLeftTextOfCursorFunc");
-    g_ime_set_right = (FnImeSetGetRightTextOfCursor)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetGetRightTextOfCursorFunc");
-    g_ime_set_idx = (FnImeSetGetTextIndexAtCursor)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetGetTextIndexAtCursorFunc");
-    g_ime_set_priv = (FnImeSetReceivePrivateCommand)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetReceivePrivateCommandFunc");
-    g_ime_set_prev = (FnImeSetSetPreviewText)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetPreviewTextFunc");
-    g_ime_set_finprev = (FnImeSetFinishTextPreview)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetFinishTextPreviewFunc");
-    g_ime_attach = (FnImeAttach)dlsym(RTLD_DEFAULT, "OH_InputMethodController_Attach");
-    g_ime_detach = (FnImeDetach)dlsym(RTLD_DEFAULT, "OH_InputMethodController_Detach");
-    g_ime_opts_create = (FnImeAttachOptsCreate)dlsym(RTLD_DEFAULT, "OH_AttachOptions_Create");
-    g_ime_opts_destroy = (FnImeAttachOptsDestroy)dlsym(RTLD_DEFAULT, "OH_AttachOptions_Destroy");
-    /* 可选 TextConfig 支持：接口缺失时优雅降级 */
-    g_ime_cfg_input = (FnImeCfgSetInputType)dlsym(RTLD_DEFAULT, "OH_TextConfig_SetInputType");
-    g_ime_cfg_enter = (FnImeCfgSetEnterKeyType)dlsym(RTLD_DEFAULT, "OH_TextConfig_SetEnterKeyType");
-    g_ime_cfg_preview = (FnImeCfgSetPreviewSupport)dlsym(RTLD_DEFAULT, "OH_TextConfig_SetPreviewTextSupport");
-    if (!g_ime_proxy_destroy || !g_ime_set_cfg || !g_ime_set_insert ||
-        !g_ime_set_delbwd || !g_ime_set_delfwd || !g_ime_set_enter ||
-        !g_ime_set_move || !g_ime_set_left || !g_ime_set_right ||
-        !g_ime_set_idx || !g_ime_set_priv || !g_ime_set_prev ||
-        !g_ime_attach || !g_ime_detach || !g_ime_opts_create ||
-        !g_ime_opts_destroy) {
-        memset(&g_ime_proxy_create, 0, sizeof(g_ime_proxy_create));
-    }
-}
-
-/* 焦点驱动打开/关闭输入法会话 */
-EXPORT void zan_gui_set_ime_open(i32 on) {
-    ime_feature_detect();
-    ime_ensure_proxy();
-    if (!g_ime_proxy) { return; }
-    if (on) {
-        if (g_ime_attached) { return; }
-        InputMethod_AttachOptions *opts = g_ime_opts_create(true);
-        if (!opts) { return; }
-        InputMethod_InputMethodProxy *im = NULL;
-        InputMethod_ErrorCode ec = g_ime_attach(g_ime_proxy, opts, &im);
-        g_ime_opts_destroy(opts);
-        if (ec == IME_ERR_OK && im) {
-            g_ime_im = im;
-            g_ime_attached = 1;
-        }
-    } else {
-        if (!g_ime_attached) { return; }
-        g_ime_detach(g_ime_im);
-        g_ime_im = NULL;
-        g_ime_attached = 0;
-    }
-}
-
-void zan_gui_ohos_ime_shutdown(void) {
-    if (g_ime_attached) {
-        g_ime_detach(g_ime_im);
-        g_ime_im = NULL;
-        g_ime_attached = 0;
-    }
-    if (g_ime_proxy) {
-        g_ime_proxy_destroy(g_ime_proxy);
-        g_ime_proxy = NULL;
-    }
-}
 
 static const char *k_ohos_vs =
     "attribute vec2 a_pos;\n"
@@ -841,11 +493,6 @@ EXPORT void zan_gui_ohos_shutdown(void) {
 }
 
 
-EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
-    (void)title;
-    (void)width; (void)height;
-    return ZAN_OHOS_HWND;
-}
 EXPORT i32 zan_gui_show_window(iptr hwnd_val)            { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_minimize(iptr hwnd_val)               { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_toggle_maximize(iptr hwnd_val)        { (void)hwnd_val; return 1; }
@@ -854,14 +501,6 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     pthread_mutex_lock(&g_oq_lock);
     g_owin.closed = 1;
     oq_push_locked(8, 0, 0, 0, 0, 0);
-    pthread_mutex_unlock(&g_oq_lock);
-    return 0;
-}
-EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
-    (void)hwnd_val;
-    pthread_mutex_lock(&g_oq_lock);
-    g_owin.attached = 0;
-    g_owin.nw = NULL;
     pthread_mutex_unlock(&g_oq_lock);
     return 0;
 }
@@ -1121,24 +760,6 @@ EXPORT i32 zan_gui_set_title(iptr h, const char *t) { (void)h; (void)t; return 0
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type)     { (void)cursor_type; return 0; }
 
 
-static int oq_pop(void) {
-    pthread_mutex_lock(&g_oq_lock);
-    if (g_oq_head == g_oq_tail) { pthread_mutex_unlock(&g_oq_lock); return 0; }
-    zan_oev_t *z = &g_oq[g_oq_head];
-    for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
-    g_event_win = z->win;
-    g_oq_head = (g_oq_head + 1) % ZAN_OQ_CAP;
-    g_ev_seq++;
-    pthread_mutex_unlock(&g_oq_lock);
-    return 1;
-}
-
-EXPORT i32 zan_gui_poll_event(void) {
-    memset(g_pending_event, 0, sizeof(g_pending_event));
-    if (oq_pop()) { return 0; }
-    return 1;
-}
-
 EXPORT i32 zan_gui_wait_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     while (!oq_pop()) {
@@ -1163,28 +784,6 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
 }
 
 EXPORT i32 zan_gui_wake(void) { return 0; }
-EXPORT i32 zan_gui_inject_event(
-    iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
-    (void)hwnd_val;
-    pthread_mutex_lock(&g_oq_lock);
-    oq_push_locked((int)kind, (int)x, (int)y, (int)button, (int)keycode,
-                   (int)mods);
-    pthread_mutex_unlock(&g_oq_lock);
-    return 0;
-}
-EXPORT i32 zan_gui_inject_pending(void) {
-    return (g_oq_tail - g_oq_head + ZAN_OQ_CAP) % ZAN_OQ_CAP;
-}
-
-EXPORT i32 zan_gui_event_kind(void)    { return g_pending_event[0]; }
-EXPORT i64 zan_gui_event_seq(void)     { return g_ev_seq; }
-EXPORT i32 zan_gui_event_x(void)       { return g_pending_event[1]; }
-EXPORT i32 zan_gui_event_y(void)       { return g_pending_event[2]; }
-EXPORT i32 zan_gui_event_button(void)  { return g_pending_event[3]; }
-EXPORT i32 zan_gui_event_keycode(void) { return g_pending_event[4]; }
-EXPORT i32 zan_gui_event_mods(void)    { return g_pending_event[5]; }
-EXPORT i32 zan_gui_event_flag(void)    { return g_pending_event[6]; }
-EXPORT iptr zan_gui_event_hwnd(void)   { return g_event_win; }
 
 EXPORT i32 zan_gui_window_width(void)  { return g_window_width; }
 EXPORT i32 zan_gui_window_height(void) { return g_window_height; }
@@ -1213,22 +812,6 @@ EXPORT void zan_gui_ohos_set_files_dir(const char *path) {
     snprintf(g_files_dir, sizeof(g_files_dir), "%s", path);
 }
 
-static char g_ohos_clip_buf[2048] = {0};
-static pthread_mutex_t g_ohos_clip_lock = PTHREAD_MUTEX_INITIALIZER;
-
-EXPORT i32 zan_gui_set_clipboard(const char *utf8) {
-    if (!utf8) return 1;
-    pthread_mutex_lock(&g_ohos_clip_lock);
-    strncpy(g_ohos_clip_buf, utf8, sizeof(g_ohos_clip_buf) - 1);
-    g_ohos_clip_buf[sizeof(g_ohos_clip_buf) - 1] = '\0';
-    pthread_mutex_unlock(&g_ohos_clip_lock);
-    return 0;
-}
-
-EXPORT const char *zan_gui_get_clipboard(void) {
-    return g_ohos_clip_buf;
-}
-
 typedef int (*FnHiLogPrint)(int type, int level, unsigned int domain, const char *tag, const char *fmt, ...);
 static FnHiLogPrint g_hilog_print = NULL;
 static int g_hilog_inited = 0;
@@ -1255,7 +838,6 @@ EXPORT void zan_gui_ohos_log(i32 level, const char *tag, const char *fmt, ...) {
 }
 EXPORT int  zan_gui_drop_pending(void)             { return 0; }
 EXPORT const char *zan_gui_drop_take(void)         { return ""; }
-EXPORT void zan_gui_set_ime_pos(i32 x, i32 y)      { (void)x; (void)y; }
 EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) {
     (void)hwnd_val; (void)tint_argb; return 1;
 }

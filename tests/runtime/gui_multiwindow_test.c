@@ -5,18 +5,16 @@
 #include <stdio.h>
 #include <unistd.h>
 
-typedef int64_t i64;
-
-extern i64 zan_gui_create_window(const char *title, i64 width, i64 height);
-extern i64 zan_gui_show_window(i64 window);
-extern i64 zan_gui_close_window(i64 window);
-extern i64 zan_gui_client_width(i64 window);
-extern i64 zan_gui_client_height(i64 window);
-extern i64 zan_gui_create_surface(i64 width, i64 height);
-extern i64 zan_gui_present(i64 window, i64 surface_id);
-extern i64 zan_gui_poll_event(void);
-extern i64 zan_gui_event_kind(void);
-extern i64 zan_gui_event_hwnd(void);
+extern intptr_t zan_gui_create_window(const char *title, int32_t width, int32_t height);
+extern int32_t zan_gui_show_window(intptr_t window);
+extern int32_t zan_gui_close_window(intptr_t window);
+extern int32_t zan_gui_client_width(intptr_t window);
+extern int32_t zan_gui_client_height(intptr_t window);
+extern int32_t zan_gui_create_surface(int32_t width, int32_t height);
+extern int32_t zan_gui_present(intptr_t window, int32_t surface_id);
+extern int32_t zan_gui_poll_event(void);
+extern int32_t zan_gui_event_kind(void);
+extern intptr_t zan_gui_event_hwnd(void);
 
 static Display *d;
 
@@ -24,13 +22,13 @@ static void pump(int n) {
     for (int j = 0; j < n; j++) { zan_gui_poll_event(); usleep(3000); }
 }
 
-static i64 click_hwnd(int rx, int ry) {
+static intptr_t click_hwnd(int rx, int ry) {
     XWarpPointer(d, None, DefaultRootWindow(d), 0, 0, 0, 0, rx, ry);
     XSync(d, False);
     pump(6);
     XTestFakeButtonEvent(d, 1, 1, CurrentTime);
     XSync(d, False);
-    i64 hwnd = 0;
+    intptr_t hwnd = 0;
     for (int j = 0; j < 12; j++) {
         if (zan_gui_poll_event() == 0 && zan_gui_event_kind() == 2) {
             hwnd = zan_gui_event_hwnd();
@@ -45,8 +43,8 @@ static i64 click_hwnd(int rx, int ry) {
 }
 
 int main(void) {
-    i64 w1 = zan_gui_create_window("win-1", 300, 200);
-    i64 w2 = zan_gui_create_window("win-2", 360, 260);
+    intptr_t w1 = zan_gui_create_window("win-1", 300, 200);
+    intptr_t w2 = zan_gui_create_window("win-2", 360, 260);
     if (!w1 || !w2 || w1 == w2) { printf("create failed\n"); return 1; }
     zan_gui_show_window(w1);
     zan_gui_show_window(w2);
@@ -55,8 +53,8 @@ int main(void) {
                    zan_gui_client_width(w2) == 360 && zan_gui_client_height(w2) == 260;
     printf("per-window sizes: %s\n", sizes_ok ? "OK" : "FAIL");
 
-    i64 s1 = zan_gui_create_surface(300, 200);
-    i64 s2 = zan_gui_create_surface(360, 260);
+    int32_t s1 = zan_gui_create_surface(300, 200);
+    int32_t s2 = zan_gui_create_surface(360, 260);
     int present_ok = zan_gui_present(w1, s1) == 0 && zan_gui_present(w2, s2) == 0;
     printf("present isolation: %s\n", present_ok ? "OK" : "FAIL");
 
@@ -69,8 +67,8 @@ int main(void) {
     XSync(d, False);
     pump(30);
 
-    i64 h1 = click_hwnd(150, 120);
-    i64 h2 = click_hwnd(400 + 180, 120);
+    intptr_t h1 = click_hwnd(150, 120);
+    intptr_t h2 = click_hwnd(400 + 180, 120);
     int route_ok = (h1 == w1) && (h2 == w2);
     printf("routing: click1->%s click2->%s : %s\n",
            h1 == w1 ? "w1" : "?", h2 == w2 ? "w2" : "?",
@@ -81,7 +79,7 @@ int main(void) {
     int survive_ok = zan_gui_client_width(w2) == 360 &&
                      zan_gui_client_height(w2) == 260 &&
                      zan_gui_present(w2, s2) == 0;
-    i64 h2b = click_hwnd(400 + 180, 120);
+    intptr_t h2b = click_hwnd(400 + 180, 120);
     survive_ok = survive_ok && (h2b == w2);
     printf("survivor usable after close: %s\n", survive_ok ? "OK" : "FAIL");
 

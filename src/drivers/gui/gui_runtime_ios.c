@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,7 +134,7 @@ typedef struct {
     zan_imp_t   objc_msgSend;
     zan_class_t (*objc_allocateClassPair)(zan_class_t superclass, const char *name, size_t extraBytes);
     void        (*objc_registerClassPair)(zan_class_t cls);
-    int         (*class_addMethod)(zan_class_t cls, zan_sel_t name, zan_imp_t imp, const char *types);
+    bool        (*class_addMethod)(zan_class_t cls, zan_sel_t name, zan_imp_t imp, const char *types);
     zan_method_t (*class_getInstanceMethod)(zan_class_t cls, zan_sel_t name);
     zan_imp_t   (*method_getImplementation)(zan_method_t m);
     zan_imp_t   (*method_setImplementation)(zan_method_t m, zan_imp_t imp);
@@ -197,7 +198,9 @@ static zan_ios_win_t g_iwin;
 
 typedef struct { int e[8]; iptr win; } zan_iev_t;
 #define ZAN_IQ_CAP 512
-static zan_iev_t g_iq[ZAN_IQ_CAP];
+static zan_iev_t g_iq_initial[ZAN_IQ_CAP];
+static zan_iev_t *g_iq = g_iq_initial;
+static int g_iq_capacity = ZAN_IQ_CAP;
 static int g_iq_head = 0, g_iq_tail = 0;
 static pthread_mutex_t g_iq_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_iq_cond = PTHREAD_COND_INITIALIZER;
@@ -205,9 +208,37 @@ static pthread_cond_t  g_iq_cond = PTHREAD_COND_INITIALIZER;
 static int g_pending_event[8];
 static iptr g_event_win = 0;
 static int64_t g_ev_seq = 0;
+static _Atomic int g_ios_keyboard_height = 0;
+
+/* Reserve a complete text commit before enqueueing any scalar. A fixed-size
+ * queue otherwise silently truncates long paste/dictation results. */
+static int iq_reserve_locked(size_t count) {
+    int used = (g_iq_tail - g_iq_head + g_iq_capacity) % g_iq_capacity;
+    if (count <= (size_t)(g_iq_capacity - used - 1)) return 1;
+    if (count > (size_t)(INT32_MAX / 2) - (size_t)used - 1) return 0;
+    size_t needed = (size_t)used + count + 1;
+    size_t capacity = (size_t)g_iq_capacity;
+    while (capacity < needed) {
+        if (capacity > (size_t)INT32_MAX / 4) {
+            capacity = needed;
+            break;
+        }
+        capacity *= 2;
+    }
+    if (capacity > SIZE_MAX / sizeof(zan_iev_t)) return 0;
+    zan_iev_t *queue = (zan_iev_t *)malloc(capacity * sizeof(zan_iev_t));
+    if (!queue) return 0;
+    for (int i = 0; i < used; ++i) queue[i] = g_iq[(g_iq_head + i) % g_iq_capacity];
+    if (g_iq != g_iq_initial) free(g_iq);
+    g_iq = queue;
+    g_iq_capacity = (int)capacity;
+    g_iq_head = 0;
+    g_iq_tail = used;
+    return 1;
+}
 
 static void iq_push_locked(int kind, int x, int y, int button, int code, int mods, int flag) {
-    int last = (g_iq_tail + ZAN_IQ_CAP - 1) % ZAN_IQ_CAP;
+    int last = (g_iq_tail + g_iq_capacity - 1) % g_iq_capacity;
     int has_last = (g_iq_head != g_iq_tail);
     if (kind == 1 && has_last && g_iq[last].e[0] == 1) {
         g_iq[last].e[1] = x; g_iq[last].e[2] = y;
@@ -220,7 +251,7 @@ static void iq_push_locked(int kind, int x, int y, int button, int code, int mod
         pthread_cond_signal(&g_iq_cond);
         return;
     }
-    int next = (g_iq_tail + 1) % ZAN_IQ_CAP;
+    int next = (g_iq_tail + 1) % g_iq_capacity;
     if (next == g_iq_head) return;
     zan_iev_t *z = &g_iq[g_iq_tail];
     z->e[0] = kind; z->e[1] = x; z->e[2] = y; z->e[3] = button;
@@ -239,7 +270,7 @@ static int iq_pop(void) {
     zan_iev_t *z = &g_iq[g_iq_head];
     for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
     g_event_win = z->win;
-    g_iq_head = (g_iq_head + 1) % ZAN_IQ_CAP;
+    g_iq_head = (g_iq_head + 1) % g_iq_capacity;
     g_ev_seq++;
     pthread_mutex_unlock(&g_iq_lock);
     return 1;
@@ -264,7 +295,7 @@ static void zan_ios_init_bridge(void) {
     g_bridge.objc_msgSend = (zan_imp_t)dlsym(RTLD_DEFAULT, "objc_msgSend");
     g_bridge.objc_allocateClassPair = (zan_class_t (*)(zan_class_t, const char *, size_t))dlsym(RTLD_DEFAULT, "objc_allocateClassPair");
     g_bridge.objc_registerClassPair = (void (*)(zan_class_t))dlsym(RTLD_DEFAULT, "objc_registerClassPair");
-    g_bridge.class_addMethod = (int (*)(zan_class_t, zan_sel_t, zan_imp_t, const char *))dlsym(RTLD_DEFAULT, "class_addMethod");
+    g_bridge.class_addMethod = (bool (*)(zan_class_t, zan_sel_t, zan_imp_t, const char *))dlsym(RTLD_DEFAULT, "class_addMethod");
     g_bridge.class_getInstanceMethod = (zan_method_t (*)(zan_class_t, zan_sel_t))dlsym(RTLD_DEFAULT, "class_getInstanceMethod");
     g_bridge.method_getImplementation = (zan_imp_t (*)(zan_method_t))dlsym(RTLD_DEFAULT, "method_getImplementation");
     g_bridge.method_setImplementation = (zan_imp_t (*)(zan_method_t, zan_imp_t))dlsym(RTLD_DEFAULT, "method_setImplementation");
@@ -522,6 +553,8 @@ static void zan_ios_touches_cancelled(zan_id_t self, zan_sel_t _cmd, zan_id_t to
     zan_ios_handle_touch(self, touches, 2);
 }
 
+#include "gui_runtime_ios_input.c"
+
 static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t app, zan_id_t opts) {
     (void)self; (void)_cmd; (void)app; (void)opts;
 
@@ -655,6 +688,9 @@ static void zan_ios_register_classes(void) {
             g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("window"), (zan_imp_t)zan_ios_get_window, "@@:");
             g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("setWindow:"), (zan_imp_t)zan_ios_set_window, "v@:@");
             g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("application:openURL:options:"), (zan_imp_t)zan_ios_open_url, "B@:@@@");
+            g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("applicationWillResignActive:"), (zan_imp_t)zan_ios_input_resign, "v@:@");
+            g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("applicationDidBecomeActive:"), (zan_imp_t)zan_ios_input_resume, "v@:@");
+            g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("applicationWillTerminate:"), (zan_imp_t)zan_ios_input_terminate, "v@:@");
             g_bridge.objc_registerClassPair(cls_appdel);
         }
     }
@@ -733,6 +769,7 @@ EXPORT i32 zan_gui_toggle_maximize(iptr hwnd_val) { (void)hwnd_val; return 1; }
 
 EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     (void)hwnd_val;
+    zan_ios_input_shutdown();
     pthread_mutex_lock(&g_iq_lock);
     g_iwin.closed = 1;
     iq_push_locked(8, 0, 0, 0, 0, 0, 0);
@@ -742,6 +779,7 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
 
 EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
     (void)hwnd_val;
+    zan_ios_input_shutdown();
     g_iwin.attached = 0;
     return 0;
 }
@@ -845,8 +883,6 @@ EXPORT i32 zan_gui_safe_area_right(void) {
     }
     return 0;
 }
-
-static int g_ios_keyboard_height = 0;
 
 EXPORT void zan_gui_ios_set_keyboard_height(i32 height) {
     if (height >= 0) g_ios_keyboard_height = (int)height;
@@ -1131,7 +1167,7 @@ EXPORT i32 zan_gui_wait_event(void) {
     zan_iev_t *z = &g_iq[g_iq_head];
     for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
     g_event_win = z->win;
-    g_iq_head = (g_iq_head + 1) % ZAN_IQ_CAP;
+    g_iq_head = (g_iq_head + 1) % g_iq_capacity;
     g_ev_seq++;
     pthread_mutex_unlock(&g_iq_lock);
     return 0;
@@ -1144,7 +1180,7 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
         zan_iev_t *z = &g_iq[g_iq_head];
         for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
         g_event_win = z->win;
-        g_iq_head = (g_iq_head + 1) % ZAN_IQ_CAP;
+        g_iq_head = (g_iq_head + 1) % g_iq_capacity;
         g_ev_seq++;
         pthread_mutex_unlock(&g_iq_lock);
         return 0;
@@ -1173,7 +1209,7 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
         zan_iev_t *z = &g_iq[g_iq_head];
         for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
         g_event_win = z->win;
-        g_iq_head = (g_iq_head + 1) % ZAN_IQ_CAP;
+        g_iq_head = (g_iq_head + 1) % g_iq_capacity;
         g_ev_seq++;
         pthread_mutex_unlock(&g_iq_lock);
         return 0;
@@ -1199,7 +1235,10 @@ EXPORT i32 zan_gui_inject_event(
 }
 
 EXPORT i32 zan_gui_inject_pending(void) {
-    return (g_iq_tail - g_iq_head + ZAN_IQ_CAP) % ZAN_IQ_CAP;
+    pthread_mutex_lock(&g_iq_lock);
+    int count = (g_iq_tail - g_iq_head + g_iq_capacity) % g_iq_capacity;
+    pthread_mutex_unlock(&g_iq_lock);
+    return count;
 }
 
 EXPORT i32 zan_gui_event_kind(void)    { return g_pending_event[0]; }
@@ -1347,8 +1386,6 @@ EXPORT const char *zan_gui_drop_take(void) { return ""; }
 EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) { (void)hwnd_val; (void)tint_argb; return 0; }
 EXPORT i32 zan_gui_disable_glass(iptr hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) { (void)hwnd_val; (void)percent; return 0; }
-
-EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) { (void)x; (void)y; }
 
 static char g_ios_clipboard_buf[2048] = {0};
 static pthread_mutex_t g_ios_clip_lock = PTHREAD_MUTEX_INITIALIZER;

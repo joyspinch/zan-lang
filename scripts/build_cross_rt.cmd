@@ -79,11 +79,17 @@ for %%P in (arm64:aarch64 x64:x86_64) do (
 
 rem iOS. The ios os-tag wires no libc headers (unlike macos), so the runtime
 rem objects hand in zig's bundled Darwin set (any-macos-any); the .14.0 suffix
-rem matches the objects' LC_BUILD_VERSION. gui_compat_mac.c is self-contained.
+rem matches the objects' LC_BUILD_VERSION. Build the complete UIKit GUI runtime.
 if not exist toolchain\ios\arm64 mkdir toolchain\ios\arm64
-"%ZIG%" cc -target aarch64-ios.14.0 -g0 -std=c11 -fPIC -I %RT% -I %DRV% -I %TP% -O2 -c %DRV%\gui\gui_compat_mac.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
-for %%Z in ("%ZIG%") do set ZROOT=%%~dpZ
-set IOSHDR=%ZROOT%lib\libc\include\any-macos-any
+set ZROOT=
+for /f "delims=" %%Z in ('where "%ZIG%" 2^>nul') do set "ZROOT=%%~dpZ"
+if not defined ZROOT for %%Z in ("%ZIG%") do set "ZROOT=%%~dpZ"
+set "IOSHDR=%ZROOT%lib\libc\include\any-macos-any"
+if not exist "%IOSHDR%\pthread.h" (
+  echo iOS Darwin headers not found next to Zig: "%IOSHDR%"
+  exit /b 1
+)
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -DZAN_GUI_IOS -DZAN_GUI_STATIC -I %RT% -I %DRV% -O2 -ffunction-sections -fdata-sections -c %DRV%\gui\gui_runtime.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\ios\arm64\zanrt_io.o    || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -c %RT%\rt_io.c -o toolchain\ios\arm64\zanrt_io_mt.o || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\ios\arm64\zanrt_sync.o  || exit /b 1

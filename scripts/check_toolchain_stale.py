@@ -71,6 +71,17 @@ RT_CRYPTO = ["src/accel/zan_hw_accel.c", "src/accel/zan_hw_accel.h"] + \
 RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
                                      # links alongside as its own object (build_cross_rt.cmd)
 RT_GUI_MAC = ["src/drivers/gui/gui_compat_mac.c"]
+RT_GUI_IOS = ["src/drivers/gui/" + name for name in (
+    "gui_runtime.c", "gui_runtime_ios.c", "gui_runtime_ios_input.c",
+    "gui_runtime_ios_font.c", "gui_runtime_raster.c", "gui_runtime_glass.c",
+    "gui_runtime_layered.c", "gui_runtime_present.c", "gui_runtime_draw.c",
+    "gui_runtime_initial_fill.c", "gui_runtime_glyph.c", "gui_runtime_text.c",
+    "gui_runtime_font.c", "gui_runtime_tray.c", "gui_runtime_shims.c",
+    "gui_runtime_android.c", "gui_gl_backend.c", "gui_gl_context.c",
+    "gui_gl_draw.c", "gui_gl_shaders.c", "gui_gl.h", "gui_backend.h",
+    "gui_metal_backend.h", "zan_gui_graphics.h")
+] + ["src/drivers/image/zan_bitmap.h", "src/common/host_oom.h",
+     "src/runtime/rt_crash.h"]
 RT_MEM = ["src/runtime/rt_mem.c"]
 EMBED = ["src/embed/zan_embed_api.c", "src/common/host_oom.h"]
 INFLATE = ["src/embed/zan_inflate.c", "src/common/miniz_tinfl.c",
@@ -190,7 +201,7 @@ ARTIFACTS = [
     # refreshes these objects automatically -- they stay "manual" (reported,
     # not gating) until a job of its own exists. Listing them as "runtime"
     # would keep the freshness gate red forever on a target nobody rebuilds.
-    ("toolchain/ios/arm64/zanrt_gui.o", RT_GUI_MAC, "manual"),
+    ("toolchain/ios/arm64/zanrt_gui.o", RT_GUI_IOS, "manual"),
     # The five companions rebuild locally via zig's ios target plus zig's
     # bundled Darwin headers (-I lib/libc/include/any-macos-any -- the ios
     # os-tag does not wire them the way macos does; 2026-10-02 recipe).
@@ -633,10 +644,10 @@ def rebuild_cmd(artifact, zig, ndk):
             return base + ["-DZAN_IO_STACKLESS_ONLY", "-DZAN_CO_DRIVER",
                            "-c", f"{rt}/rt_io.c"]
         if name == "zanrt_gui.o":
-            # gui_compat_mac.c is self-contained -- no libc headers needed.
-            return ([zig, "cc", "-target", "aarch64-ios.14.0", "-g0",
-                     "-std=c11", "-fPIC", "-I", rt, "-I", drv, "-O2",
-                     "-c", f"{drv}/gui/gui_compat_mac.c"])
+            # Same UIKit translation unit as both explicit cross-build scripts.
+            return base + c11 + ["-DZAN_GUI_IOS", "-DZAN_GUI_STATIC", "-I", drv,
+                                 "-ffunction-sections", "-fdata-sections",
+                                 "-c", f"{drv}/gui/gui_runtime.c"]
         if name == "zan_embed_api.o":
             return base + c11 + ["-I", embed, "-c", f"{embed}/zan_embed_api.c"]
         if name == "zan_inflate.o":

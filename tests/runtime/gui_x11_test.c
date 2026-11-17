@@ -1,6 +1,8 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 
+/* Assertions perform the protocol operations even in Release builds. */
+#undef NDEBUG
 #include <assert.h>
 #include <poll.h>
 #include <signal.h>
@@ -10,12 +12,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-typedef int64_t i64;
-
-extern i64 zan_gui_create_window(const char *title, i64 width, i64 height);
-extern i64 zan_gui_close_window(i64 window);
-extern i64 zan_gui_set_cursor(i64 cursor);
-extern i64 zan_gui_set_clipboard(const char *text);
+extern intptr_t zan_gui_create_window(const char *title, int32_t width, int32_t height);
+extern int32_t zan_gui_close_window(intptr_t window);
+extern int32_t zan_gui_set_cursor(int32_t cursor);
+extern int32_t zan_gui_set_clipboard(const char *text);
 extern const char *zan_gui_get_clipboard(void);
 
 static void run_clipboard_owner(int ready_fd) {
@@ -71,9 +71,9 @@ static void run_clipboard_owner(int ready_fd) {
 }
 
 int main(void) {
-    i64 window = zan_gui_create_window("x11-test", 64, 64);
+    intptr_t window = zan_gui_create_window("x11-test", 64, 64);
     assert(window != 0);
-    for (i64 cursor = 0; cursor <= 5; cursor++)
+    for (int32_t cursor = 0; cursor <= 5; cursor++)
         assert(zan_gui_set_cursor(cursor) == 0);
 
     assert(zan_gui_set_clipboard("self clipboard") == 0);

@@ -64,3 +64,62 @@ roots (stdlib copies win if present):
 
 Browser components live in the separate `Zan.Gui.Browser` package (WebView /
 CefBrowser); `App` has no build-time dependency on it.
+
+## Native platform contracts
+
+`IPlatformWindow` and `IPlatformShell` select Win32 on Windows and the
+`zan_gui_*` C ABI on the other targets. Native sources are in
+`src/drivers/gui/`; each target needs a driver built from the matching sources.
+A source implementation or successful cross-compilation alone does not establish
+native UI behavior on that platform.
+
+- Desktop X11 and Cocoa accept client resize dimensions in **device pixels**.
+  `ResizeClientExact` uses the same native operation; neither method promises a
+  synchronous resize event. Cocoa converts through the target window's backing
+  scale. Mobile surfaces follow their host layout, so client resize and desktop
+  window positioning do not resize or move the mobile host.
+- X11 Xdnd and Cocoa file-URL drops expose paths for the **current dequeued
+  event and window**. Check `DropPending()` and consume `TakeDroppedFiles()`
+  during that event; advancing to another event releases unconsumed paths.
+  Remote file hosts and invalid UTF-8 paths are rejected. X11 cancels an
+  unanswered selection request after one second and currently rejects
+  incremental (`INCR`) selection transfers.
+- Android, iOS and OHOS text-input sessions use `ImeSetOpen`, `ImeSetCaret` and
+  `ImeComposing`. Text events carry Unicode scalar values; backspace uses text
+  code 8. Desktop input methods own their composition UI and may return an
+  empty composition string. iOS keeps marked text in a UIKit text-input proxy;
+  this interface does not provide the application's full document context or
+  promise grapheme-cluster deletion.
+- OHOS clipboard reads and writes use the system Pasteboard/UDMF services.
+  Missing services, denied access and other failures return a nonzero write
+  status or an empty read result. The driver loads these services dynamically;
+  it does not substitute a process-local clipboard.
+
+An OHOS host must call this native bridge after every surface attach and when
+its screen position, layout or transform changes:
+
+```c
+int32_t zan_gui_ohos_set_geometry(double surfaceScreenLeftPx,
+                                 double surfaceScreenTopPx,
+                                 double physicalScreenPxPerSurfacePx);
+```
+
+The origin is the surface's absolute position in physical screen pixels,
+including window and content offsets. Convert ArkUI `vp` coordinates first;
+parent-relative XComponent offsets alone are insufficient. An untransformed
+surface uses scale 1. Scale 0 invalidates the geometry and returns -1; valid
+geometry returns 0. The driver withholds cursor-position notifications until
+valid geometry is supplied. This repository currently has no ETS/NAPI host
+calling the bridge, so a host integration is still required for candidate
+positioning.
+
+The focused regressions are `runtime_gui_x11_platform`,
+`runtime_gui_mac_window_drop`, `runtime_gui_ios_input`,
+`runtime_gui_ohos_native` and `conformance_gui_capi_platform`. The mobile host
+tests exercise production state machines with native-service boundaries
+substituted; they do not replace system keyboard, permissions or cross-app
+clipboard checks on devices. `scripts/build_gui_ohos.sh check-native all`
+checks the official API-13 headers and links both OHOS architectures. Cocoa
+window/drop behavior requires a macOS SDK and a graphical macOS session;
+Retina, mixed-display scaling and real desktop drag sources need native
+acceptance checks.

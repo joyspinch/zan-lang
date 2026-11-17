@@ -13,6 +13,7 @@ static char *g_clip_read_linux = NULL;
 static Cursor g_cursors_linux[8];
 static XIM g_xim = NULL;
 static XIC g_xic = NULL;
+static XFontSet g_ime_fontset_linux = NULL;
 
 static int g_scale_linux = 100;
 static int g_titlebar_h_l = 32;
@@ -25,9 +26,15 @@ typedef struct {
     Window xid;
     GC gc;
     XIC xic;
+    int ime_position;
     Pixmap backbuf;
     int backbuf_w, backbuf_h;
     int w, h;
+    struct {
+        Window source, requestor;
+        i64 deadline;
+        int offered, accepted, pending, x, y;
+    } dnd;
 } zan_lwin_t;
 static zan_lwin_t g_lwins[ZAN_MAX_WINDOWS];
 static int g_lwin_count = 0;
@@ -42,6 +49,7 @@ static zan_lwin_t *lwin_find(Window xid) {
 
 i32 zan_gui_get_dpi_scale(void);
 i32 zan_gui_is_maximized(iptr hwnd_val);
+i64 zan_gui_get_tick_ms(void);
 
 static void x11_set_scale_metrics(int scale) {
     if (scale <= 0) { scale = 100; }
@@ -67,8 +75,11 @@ static void evq_push_linux(int kind, int x, int y, int button, int keycode, int 
     g_evq_tail_linux = next;
 }
 
+static void x11_drop_activate(int slot);
+
 static int evq_pop_linux(void) {
     if (g_evq_head_linux == g_evq_tail_linux) return 0;
+    x11_drop_activate(g_evq_head_linux);
     memcpy(g_pending_event_linux, g_evq_linux[g_evq_head_linux],
            sizeof(g_pending_event_linux));
     g_evq_head_linux = (g_evq_head_linux + 1) % ZAN_EVQ_CAP;
@@ -130,6 +141,8 @@ static int x11_vk_from_keysym(KeySym ks) {
 }
 
 static Atom x11_atom(const char *name) { return XInternAtom(g_display, name, False); }
+
+#include "gui_runtime_x11_drop.c"
 
 static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
     if (!g_display || !win) return;
@@ -290,20 +303,32 @@ static void x11_translate_event(XEvent *ev) {
     case KeyPress: {
         int mods = x11_mods(ev->xkey.state);
         KeySym ks = 0;
-        char buf[32];
+        char local[64];
+        char *buf = local;
         int n;
         zan_lwin_t *kw = lwin_find(ev->xkey.window);
-        XIC xic = (kw && kw->xic) ? kw->xic : g_xic;
+        XIC xic = kw ? kw->xic : NULL;
         if (xic) {
             Status st = 0;
-            n = Xutf8LookupString(xic, &ev->xkey, buf, sizeof(buf) - 1, &ks, &st);
+            int capacity = (int)sizeof(local) - 1;
+            n = Xutf8LookupString(xic, &ev->xkey, buf, capacity, &ks, &st);
+            if (st == XBufferOverflow) {
+                if (n <= 0 || n > 1024 * 1024) break;
+                buf = (char *)malloc((size_t)n + 1);
+                if (!buf) break;
+                capacity = n;
+                n = Xutf8LookupString(xic, &ev->xkey, buf, capacity, &ks, &st);
+            }
+            if (n < 0 || n > capacity || (st != XLookupChars && st != XLookupBoth)) n = 0;
         } else {
-            n = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &ks, NULL);
+            n = XLookupString(&ev->xkey, buf, sizeof(local) - 1, &ks, NULL);
         }
         evq_push_linux(4, 0, 0, 0, x11_vk_from_keysym(ks), mods);
-        /* 发射a WM_CHAR-style text event for each decoded character */
         if (n > 0) {
             buf[n] = '\0';
+            if (!x11_utf8_valid((const unsigned char *)buf)) n = 0;
+        }
+        if (n > 0) {
             const char *p = buf;
             while (*p) {
                 unsigned cp = x11_utf8_next(&p);
@@ -311,6 +336,7 @@ static void x11_translate_event(XEvent *ev) {
                     evq_push_linux(6, 0, 0, 0, (int)cp, mods);
             }
         }
+        if (buf != local) free(buf);
         break;
     }
     case KeyRelease: {
@@ -340,13 +366,72 @@ static void x11_translate_event(XEvent *ev) {
                       (unsigned)ew->backbuf_w, (unsigned)ew->backbuf_h, 0, 0);
         break;
     }
-    case ClientMessage:
-        evq_push_linux(8, 0, 0, 0, 0, 0);
+    case SelectionNotify:
+        x11_dnd_selection(&ev->xselection);
         break;
-    case FocusOut:
+    case ClientMessage:
+        if (x11_dnd_client(&ev->xclient)) break;
+        if (ev->xclient.message_type == x11_atom("WM_PROTOCOLS") &&
+            ev->xclient.format == 32 &&
+            (Atom)ev->xclient.data.l[0] == x11_atom("WM_DELETE_WINDOW"))
+            evq_push_linux(8, 0, 0, 0, 0, 0);
+        break;
+    case FocusIn: {
+        zan_lwin_t *fw = lwin_find(ev->xfocus.window);
+        if (fw && fw->xic) XSetICFocus(fw->xic);
+        break;
+    }
+    case FocusOut: {
+        zan_lwin_t *fw = lwin_find(ev->xfocus.window);
+        if (fw && fw->xic) XUnsetICFocus(fw->xic);
         evq_push_linux(9, 0, 0, 0, 0, 0);
         break;
     }
+    }
+}
+
+static XIC x11_create_ic(Window xid, int *position) {
+    *position = 0;
+    if (!g_xim) return NULL;
+    XIMStyles *styles = NULL;
+    if (XGetIMValues(g_xim, XNQueryInputStyle, &styles, NULL) != NULL || !styles)
+        return NULL;
+    const XIMStyle preferred[] = {
+        XIMPreeditPosition | XIMStatusNothing,
+        XIMPreeditNothing | XIMStatusNothing,
+        XIMPreeditNone | XIMStatusNone
+    };
+    XIC xic = NULL;
+    for (unsigned p = 0; p < sizeof(preferred) / sizeof(preferred[0]) && !xic; p++) {
+        for (unsigned short i = 0; i < styles->count_styles && !xic; i++) {
+            if (styles->supported_styles[i] != preferred[p]) continue;
+            if (preferred[p] & XIMPreeditPosition) {
+                if (!g_ime_fontset_linux) {
+                    char **missing = NULL;
+                    int missing_count = 0;
+                    char *default_string = NULL;
+                    g_ime_fontset_linux = XCreateFontSet(g_display, "fixed",
+                        &missing, &missing_count, &default_string);
+                    if (missing) XFreeStringList(missing);
+                }
+                if (!g_ime_fontset_linux) continue;
+                XPoint spot = { 0, 0 };
+                XVaNestedList attrs = XVaCreateNestedList(0, XNSpotLocation, &spot,
+                    XNFontSet, g_ime_fontset_linux, NULL);
+                if (!attrs) continue;
+                xic = XCreateIC(g_xim, XNInputStyle, preferred[p],
+                    XNClientWindow, xid, XNFocusWindow, xid,
+                    XNPreeditAttributes, attrs, NULL);
+                XFree(attrs);
+                if (xic) *position = 1;
+            } else {
+                xic = XCreateIC(g_xim, XNInputStyle, preferred[p],
+                    XNClientWindow, xid, XNFocusWindow, xid, NULL);
+            }
+        }
+    }
+    XFree(styles);
+    return xic;
 }
 
 EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
@@ -374,29 +459,30 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
         BlackPixel(g_display, screen), WhitePixel(g_display, screen));
 
     XStoreName(g_display, xid, title);
-    XSelectInput(g_display, xid,
-        ExposureMask | KeyPressMask | KeyReleaseMask |
+    long event_mask = ExposureMask | KeyPressMask | KeyReleaseMask |
         ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-        StructureNotifyMask | FocusChangeMask);
+        StructureNotifyMask | FocusChangeMask;
+    XSelectInput(g_display, xid, event_mask);
 
     Atom wm_delete = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(g_display, xid, &wm_delete, 1);
+    unsigned long dnd_version = 5;
+    XChangeProperty(g_display, xid, x11_atom("XdndAware"), XA_ATOM, 32,
+                    PropModeReplace, (unsigned char *)&dnd_version, 1);
 
-    XIC xic = NULL;
-    if (g_xim) {
-        xic = XCreateIC(g_xim,
-            XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-            XNClientWindow, xid,
-            XNFocusWindow, xid,
-            NULL);
-        if (xic) XSetICFocus(xic);
-    }
+    int ime_position = 0;
+    XIC xic = x11_create_ic(xid, &ime_position);
+    long filter_events = 0;
+    if (xic && XGetICValues(xic, XNFilterEvents, &filter_events, NULL) == NULL)
+        XSelectInput(g_display, xid, event_mask | filter_events);
     GC gc = XCreateGC(g_display, xid, 0, NULL);
 
     zan_lwin_t *w = &g_lwins[g_lwin_count++];
+    memset(w, 0, sizeof(*w));
     w->xid = xid;
     w->gc = gc;
     w->xic = xic;
+    w->ime_position = ime_position;
     w->backbuf = 0;
     w->backbuf_w = 0;
     w->backbuf_h = 0;
@@ -448,12 +534,14 @@ EXPORT i32 zan_gui_show_window(iptr win) {
 EXPORT i32 zan_gui_wait_event(void) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
+    x11_dnd_poll_timeout(0);
     if (evq_pop_linux()) return 0;
 
     int xfd = ConnectionNumber(g_display);
     XEvent ev;
     for (;;) {
         while (XPending(g_display) > 0) {
+            x11_dnd_poll_timeout(0);
             XNextEvent(g_display, &ev);
             if (ev.type == SelectionRequest) {
                 x11_serve_selection(&ev.xselectionrequest);
@@ -470,11 +558,14 @@ EXPORT i32 zan_gui_wait_event(void) {
             fds[1].fd = g_wake_pipe[0]; fds[1].events = POLLIN; fds[1].revents = 0;
             nfds = 2;
         }
-        int pr = poll(fds, (nfds_t)nfds, -1);
+        int poll_ms = x11_dnd_poll_timeout(-1);
+        if (XPending(g_display) > 0) continue;
+        int pr = poll(fds, (nfds_t)nfds, poll_ms);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
+        x11_dnd_poll_timeout(0);
         if (nfds == 2 && (fds[1].revents & POLLIN)) {
             char buf[64];
             while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) { }
@@ -487,6 +578,7 @@ EXPORT i32 zan_gui_wait_event(void) {
 EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
+    x11_dnd_poll_timeout(0);
     if (evq_pop_linux()) return 0;
 
     int xfd = ConnectionNumber(g_display);
@@ -495,6 +587,7 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     XEvent ev;
     for (;;) {
         while (XPending(g_display) > 0) {
+            x11_dnd_poll_timeout(0);
             XNextEvent(g_display, &ev);
             if (ev.type == SelectionRequest) {
                 x11_serve_selection(&ev.xselectionrequest);
@@ -517,12 +610,15 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
             fds[1].fd = g_wake_pipe[0]; fds[1].events = POLLIN; fds[1].revents = 0;
             nfds = 2;
         }
-        int pr = poll(fds, (nfds_t)nfds, (int)remain);
+        int poll_ms = x11_dnd_poll_timeout((int)remain);
+        if (XPending(g_display) > 0) continue;
+        int pr = poll(fds, (nfds_t)nfds, poll_ms);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (pr == 0) return 1;
+        x11_dnd_poll_timeout(0);
+        if (pr == 0) continue;
         if (nfds == 2 && (fds[1].revents & POLLIN)) {
             char buf[64];
             while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) { }
@@ -543,8 +639,10 @@ EXPORT i32 zan_gui_wake(void) {
 EXPORT i32 zan_gui_poll_event(void) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
+    x11_dnd_poll_timeout(0);
     if (evq_pop_linux()) return 0;
     for (;;) {
+        x11_dnd_poll_timeout(0);
         if (XPending(g_display) <= 0) return 1;
         XEvent ev;
         XNextEvent(g_display, &ev);
@@ -560,8 +658,10 @@ EXPORT i32 zan_gui_poll_event(void) {
 
 EXPORT i32 zan_gui_inject_event(
     iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
-    (void)hwnd_val;
+    Window previous = g_evwin_linux;
+    g_evwin_linux = hwnd_val ? (Window)(uintptr_t)hwnd_val : g_primary_win;
     evq_push_linux((int)kind, (int)x, (int)y, (int)button, (int)keycode, (int)mods);
+    g_evwin_linux = previous;
     zan_gui_wake();
     return 0;
 }
@@ -577,11 +677,22 @@ EXPORT i32 zan_gui_event_y(void)       { return g_pending_event_linux[2]; }
 EXPORT i32 zan_gui_event_button(void)  { return g_pending_event_linux[3]; }
 EXPORT i32 zan_gui_event_keycode(void) { return g_pending_event_linux[4]; }
 EXPORT i32 zan_gui_event_mods(void)    { return g_pending_event_linux[5]; }
+EXPORT i32 zan_gui_event_flag(void)    { return 0; }
 
 EXPORT i32 zan_gui_window_width(void)  { return g_win_w; }
 EXPORT i32 zan_gui_window_height(void) { return g_win_h; }
 
 EXPORT iptr zan_gui_event_hwnd(void)    { return (iptr)(unsigned)g_pending_event_linux[6]; }
+EXPORT int zan_gui_resize_client(iptr hwnd_val, i32 width, i32 height) {
+    if (!g_display || width <= 0 || height <= 0 || width > 65535 || height > 65535)
+        return -1;
+    zan_lwin_t *w = lwin_find((Window)(uintptr_t)hwnd_val);
+    if (!w) return -1;
+    XResizeWindow(g_display, w->xid, (unsigned)width, (unsigned)height);
+    XFlush(g_display);
+    return 0;
+}
+
 EXPORT i32 zan_gui_client_width(iptr hwnd_val) {
     zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
     return w ? w->w : g_win_w;
@@ -824,6 +935,8 @@ EXPORT i32 zan_gui_safe_area_top(void) { return 0; }
 EXPORT i32 zan_gui_safe_area_bottom(void) { return 0; }
 EXPORT i32 zan_gui_safe_area_left(void) { return 0; }
 EXPORT i32 zan_gui_safe_area_right(void) { return 0; }
+/* X11 owns no software keyboard surface; no client pixels are occluded here. */
+EXPORT i32 zan_gui_keyboard_height(void) { return 0; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
     (void)hwnd_val;
     if (count >= 0 && count <= 8) { g_caption_btn_count_l = (int)count; }
@@ -847,6 +960,7 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
     zan_lwin_t *w = lwin_find(xid);
     if (w) {
+        x11_drop_destroy(w);
         zan_gui_release_window((void *)(intptr_t)w->xid);
         if (w->backbuf) XFreePixmap(g_display, w->backbuf);
         if (w->gc) XFreeGC(g_display, w->gc);
@@ -874,6 +988,10 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
             }
         }
         if (g_xim) { XCloseIM(g_xim); g_xim = NULL; }
+        if (g_ime_fontset_linux) {
+            XFreeFontSet(g_display, g_ime_fontset_linux);
+            g_ime_fontset_linux = NULL;
+        }
         free(g_clip_text_linux);
         g_clip_text_linux = NULL;
         free(g_clip_read_linux);
@@ -1021,7 +1139,20 @@ static int x11_read_selection(Atom selection, Atom target, char **out) {
 }
 
 EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) {
-    (void)x; (void)y;
+    if (!g_display) return;
+    Window focus = None;
+    int revert = 0;
+    XGetInputFocus(g_display, &focus, &revert);
+    zan_lwin_t *w = lwin_find(focus);
+    if (!w || !w->xic || !w->ime_position) return;
+    XPoint spot;
+    spot.x = (short)(x < -32768 ? -32768 : x > 32767 ? 32767 : x);
+    spot.y = (short)(y < -32768 ? -32768 : y > 32767 ? 32767 : y);
+    XVaNestedList attrs = XVaCreateNestedList(0, XNSpotLocation, &spot, NULL);
+    if (!attrs) return;
+    XSetICValues(w->xic, XNPreeditAttributes, attrs, NULL);
+    XFree(attrs);
+    XFlush(g_display);
 }
 
 EXPORT const char *zan_gui_get_clipboard(void) {

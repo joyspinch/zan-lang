@@ -6,8 +6,8 @@ using Gui;
 namespace Gui.Backend;
 
 // IPlatformWindow / IPlatformShell 的非 Windows 实现：委托 zan_gui_* C
-// 驱动 ABI。X11 / macOS / Android 的驱动实现在 src/runtime
-// （gui_runtime_x11.c、gui_compat_mac.c、gui_runtime.c 等）。
+// 驱动 ABI。各平台原生实现在 src/drivers/gui
+// （gui_runtime_x11.c、gui_runtime_mac.m、gui_runtime_* 等）。
 //
 // 原 Window.zan / Clipboard.zan / Ime.zan 里按 `#if !WINDOWS` 分叉的
 // zan_gui_* 导入与调用全部收拢到这里；能力缺口（异形窗口、运行期
@@ -46,13 +46,11 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     [DllImport("zan_gui")]
     static extern long zan_gui_event_seq();
 
-    #if !MACOS
     [DllImport("zan_gui")]
     static extern string zan_gui_drop_take();
 
     [DllImport("zan_gui")]
     static extern int zan_gui_drop_pending();
-    #endif
 
     [DllImport("zan_gui")]
     static extern int zan_gui_event_x();
@@ -153,6 +151,9 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     [DllImport("zan_gui")]
     static extern int zan_gui_safe_area_right();
 
+    // These optional device services are only exported by the mobile drivers.
+    // Keep them out of desktop vtable link closures; methods below report absence.
+    #if ANDROID || IOS || OHOS
     [DllImport("zan_gui")]
     static extern int zan_gui_keyboard_height();
 
@@ -254,6 +255,7 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
 
     [DllImport("zan_gui")]
     static extern void zan_gui_inject_open_url(string url);
+    #endif
 
     // 在窗口后启用系统原生半透明玻璃（Win11 亚克力、macOS
     // NSVisualEffectView、Linux 合成器模糊），凡表面透明处生效。
@@ -269,10 +271,13 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     [DllImport("zan_gui")]
     static extern int zan_gui_set_opacity(nint hwnd, int percent);
 
-    #if !MACOS
-    // 将窗口左上角移动到屏幕工作区的 (x, y) 像素位置。
+    // 将窗口左上角移动到屏幕工作区的 (x, y) 设备像素位置。
     [DllImport("zan_gui")]
     static extern int zan_gui_set_window_pos(nint hwnd, int x, int y);
+
+    #if (LINUX && !ANDROID && !OHOS) || MACOS
+    [DllImport("zan_gui")]
+    static extern int zan_gui_resize_client(nint hwnd, int width, int height);
     #endif
 
     // 在显示器工作区上重新居中窗口。
@@ -299,13 +304,15 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     [DllImport("zan_gui")]
     static extern void zan_gui_set_ime_pos(int x, int y);
 
-    #if ANDROID
+    #if ANDROID || IOS || OHOS
     [DllImport("zan_gui")]
     static extern void zan_gui_set_ime_open(int on);
 
     [DllImport("zan_gui")]
     static extern string zan_gui_ime_composing();
+    #endif
 
+    #if ANDROID
     // Android：静态 APK 的驱动导出在 libmain.so；共享驱动只加载一次。
     static bool refreshQueryResolved;
     static nint refreshQuery;
@@ -358,11 +365,7 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     }
 
     public void SetPosition(nint hwnd, int x, int y) {
-        #if MACOS
-        // 没有自由定位概念的平台。
-        #else
         zan_gui_set_window_pos(hwnd, x, y);
-        #endif
     }
 
     public int DpiScale(nint hwnd) {
@@ -378,11 +381,14 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     }
 
     public void ResizeClient(nint hwnd, int w, int h) {
-        // 驱动尚无客户区缩放通道；安全空操作。
+        #if (LINUX && !ANDROID && !OHOS) || MACOS
+        zan_gui_resize_client(hwnd, w, h);
+        #endif
+        // 移动端宿主表面尺寸由系统布局决定，不能由窗口客户区接口调整。
     }
 
     public void ResizeClientExact(nint hwnd, int wDev, int hDev) {
-        // 同 ResizeClient。
+        this.ResizeClient(hwnd, wDev, hDev);
     }
 
     public void Center(nint hwnd) {
@@ -649,24 +655,16 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
 
     public List<string> TakeDroppedFiles() {
         List<string> outp = new List<string>();
-        #if MACOS
-        return outp;
-        #else
         string p = zan_gui_drop_take();
         while (p != "") {
             outp.Add(p);
             p = zan_gui_drop_take();
         }
         return outp;
-        #endif
     }
 
     public bool DropPending() {
-        #if MACOS
-        return false;
-        #else
         return zan_gui_drop_pending() != 0;
-        #endif
     }
 
     // ---- 时钟与节奏 -------------------------------------------------------
@@ -725,44 +723,87 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
         return zan_gui_safe_area_right();
     }
 
+    // Desktop drivers do not expose the mobile device-service ABI. Error-capable
+    // operations report -1; absent observations use the existing contract's empty
+    // value. Void device setters are no-ops and never claim to change the OS.
     public int KeyboardHeight() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_keyboard_height();
+        #else
+        return 0;
+        #endif
     }
 
     public void HapticFeedback(int type) {
+        #if ANDROID || IOS || OHOS
         zan_gui_haptic_feedback(type);
+        #endif
     }
 
     public int SensorGet(int sensorType, float[] outVec) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_sensor_get(sensorType, outVec);
+        #else
+        return -1;
+        #endif
     }
 
     public int SensorSet(int sensorType, float x, float y, float z) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_sensor_set(sensorType, x, y, z);
+        #else
+        return -1;
+        #endif
     }
 
     public int NotificationSend(string title, string body, string action, int badge, string sound) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_notification_send(title, body, action, badge, sound);
+        #else
+        return -1;
+        #endif
     }
 
     public int NetworkType() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_network_type();
+        #else
+        // Unknown, not an observed disconnection. Hardware.Network.Type currently
+        // maps all values outside 0..3 to None; this shell preserves the distinction.
+        return -1;
+        #endif
     }
 
     public void SetNetworkType(int type) {
+        #if ANDROID || IOS || OHOS
         zan_gui_set_network_type(type);
+        #endif
     }
 
     public bool IsDarkMode() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_is_dark_mode() == 1;
+        #else
+        // No desktop appearance observation here; bool cannot represent unknown.
+        return false;
+        #endif
     }
 
     public void SetDarkMode(bool isDark) {
+        #if ANDROID || IOS || OHOS
         zan_gui_set_dark_mode(isDark ? 1 : 0);
+        #endif
+        // Desktop: no native theme mutation or simulated state is performed.
     }
 
     public int ShareText(string text, string title) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_share_text(text, title);
+        #else
+        // Hardware.Share explicitly permits desktop clipboard fallback.
+        if (text == null) { return -1; }
+        return this.ClipboardSet(text) ? 0 : -1;
+        #endif
     }
 
     public string PickFile(string filter) {
@@ -770,99 +811,182 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     }
 
     public int PermissionCheck(int permType) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_permission_check(permType);
+        #else
+        // No desktop permission query: unknown must not become Granted (0).
+        // Hardware.Permissions maps this unsupported result to Denied.
+        return -1;
+        #endif
     }
 
     public int PermissionRequest(int permType) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_permission_request(permType);
+        #else
+        return -1;
+        #endif
     }
 
     public void SetPermission(int permType, int status) {
+        #if ANDROID || IOS || OHOS
         zan_gui_set_permission(permType, status);
+        #endif
     }
 
     public void ScreenKeepAwake(bool enable) {
+        #if ANDROID || IOS || OHOS
         zan_gui_screen_keep_awake(enable ? 1 : 0);
+        #endif
     }
 
     public bool ScreenIsKeepAwake() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_screen_is_keep_awake() == 1;
+        #else
+        return false;
+        #endif
     }
 
     public void ScreenSetBrightness(float brightness) {
+        #if ANDROID || IOS || OHOS
         zan_gui_screen_set_brightness(brightness);
+        #endif
     }
 
     public float ScreenGetBrightness() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_screen_get_brightness();
+        #else
+        // No window brightness override; system policy remains in effect.
+        return -1.0f;
+        #endif
     }
 
     public int LocationGet(double[] outCoords, float[] outMetrics) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_location_get(outCoords, outMetrics);
+        #else
+        return -1;
+        #endif
     }
 
     public void LocationSet(double lat, double lon, double alt, float acc, float speed) {
+        #if ANDROID || IOS || OHOS
         zan_gui_location_set(lat, lon, alt, acc, speed);
+        #endif
     }
 
     public string DeviceInfoGet(int infoKey) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_device_info_get(infoKey);
+        #else
+        if (infoKey == 3) { return OperatingSystem.Platform; }
+        return "";
+        #endif
     }
 
     public bool DeviceIsFoldable() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_device_is_foldable() == 1;
+        #else
+        // No foldable-device capability is exposed by the desktop drivers.
+        return false;
+        #endif
     }
 
     public void DeviceInfoSet(int infoKey, string val) {
+        #if ANDROID || IOS || OHOS
         zan_gui_device_info_set(infoKey, val);
+        #endif
     }
 
     public bool BiometricsCanAuthenticate() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_biometrics_can_authenticate() == 1;
+        #else
+        return false;
+        #endif
     }
 
     public int BiometricsType() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_biometrics_type();
+        #else
+        return 0;
+        #endif
     }
 
     public bool BiometricsAuthenticate(string title, string subtitle) {
+        #if ANDROID || IOS || OHOS
         return zan_gui_biometrics_authenticate(title, subtitle) == 1;
+        #else
+        return false;
+        #endif
     }
 
     public void BiometricsSetMock(bool canAuth, int bioType, bool authResult) {
+        #if ANDROID || IOS || OHOS
         zan_gui_biometrics_set_mock(canAuth ? 1 : 0, bioType, authResult ? 1 : 0);
+        #endif
     }
 
     public void SystemBarSetStatus(bool visible, int style, int color) {
+        #if ANDROID || IOS || OHOS
         zan_gui_system_bar_set_status(visible ? 1 : 0, style, color);
+        #endif
     }
 
     public bool SystemBarIsStatusVisible() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_system_bar_get_status_visible() == 1;
+        #else
+        return false;
+        #endif
     }
 
     public int SystemBarStyle() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_system_bar_get_status_style();
+        #else
+        return 0;
+        #endif
     }
 
     public int SystemBarColor() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_system_bar_get_status_color();
+        #else
+        return 0;
+        #endif
     }
 
     public void SystemBarSetNavVisible(bool visible) {
+        #if ANDROID || IOS || OHOS
         zan_gui_system_bar_set_nav_visible(visible ? 1 : 0);
+        #endif
     }
 
     public bool SystemBarIsNavVisible() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_system_bar_get_nav_visible() == 1;
+        #else
+        return false;
+        #endif
     }
 
     public string TakeOpenUrl() {
+        #if ANDROID || IOS || OHOS
         return zan_gui_take_open_url();
+        #else
+        return "";
+        #endif
     }
 
     public void InjectOpenUrl(string url) {
+        #if ANDROID || IOS || OHOS
         zan_gui_inject_open_url(url);
+        #endif
     }
 
     public bool SweepLayered() {
@@ -884,13 +1008,13 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     }
 
     public void ImeSetOpen(bool on) {
-        #if ANDROID
+        #if ANDROID || IOS || OHOS
         zan_gui_set_ime_open(on ? 1 : 0);
         #endif
     }
 
     public string ImeComposing() {
-        #if ANDROID
+        #if ANDROID || IOS || OHOS
         return zan_gui_ime_composing();
         #else
         return "";

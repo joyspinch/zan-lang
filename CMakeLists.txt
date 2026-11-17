@@ -944,6 +944,7 @@ if(ZAN_BUILD_GUI)
     # the probe always exists before the staleness check reads it.
     set(ZAN_ABI_PROBE "${CMAKE_BINARY_DIR}/zanc_abi_probe.bin")
     add_custom_command(TARGET zanc POST_BUILD
+        BYPRODUCTS "${ZAN_ABI_PROBE}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_FILE:zanc> ${ZAN_ABI_PROBE}
         VERBATIM)
@@ -4300,8 +4301,44 @@ endif()
 add_test(NAME runtime_gui_android_clock COMMAND zan_gui_android_clock_test)
 set_tests_properties(runtime_gui_android_clock PROPERTIES TIMEOUT 15)
 
+# Test production mobile adapters without requiring their native UI SDKs.
+foreach(_gui_native_case ios_input ohos_native)
+  add_executable(zan_gui_${_gui_native_case}_test
+    tests/runtime/gui_${_gui_native_case}_test.c)
+  set_target_properties(zan_gui_${_gui_native_case}_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED YES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(zan_gui_${_gui_native_case}_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m)
+  endif()
+  add_test(NAME runtime_gui_${_gui_native_case}
+    COMMAND zan_gui_${_gui_native_case}_test)
+  set_tests_properties(runtime_gui_${_gui_native_case} PROPERTIES TIMEOUT 15)
+endforeach()
+
 option(ZAN_BUILD_GUI_TESTS "Run the Gui conformance tests (requires zan_gui)" ON)
 if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
+  if(APPLE)
+    add_executable(zan_gui_mac_window_drop_test tests/runtime/gui_mac_window_drop_test.m)
+    set_target_properties(zan_gui_mac_window_drop_test PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+    target_link_libraries(zan_gui_mac_window_drop_test PRIVATE zan_gui "-framework Cocoa")
+    add_test(NAME runtime_gui_mac_window_drop COMMAND zan_gui_mac_window_drop_test)
+    set_tests_properties(runtime_gui_mac_window_drop PROPERTIES
+      TIMEOUT 30 SKIP_RETURN_CODE 77)
+    add_test(NAME conformance_gui_capi_platform
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/capi_platform_test.zan
+        "-DZANC_ARGS=--auto-stdlib;--stdlib-path;${CMAKE_SOURCE_DIR}/stdlib${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/capi_platform_test.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_capi_platform${_exe_ext}
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_capi_platform PROPERTIES TIMEOUT 180)
+  endif()
+
   add_executable(zan_gui_runtime_test tests/runtime/gui_runtime_test.c)
   target_link_libraries(zan_gui_runtime_test PRIVATE zan_gui)
   add_test(NAME runtime_gui COMMAND zan_gui_runtime_test)
@@ -4352,6 +4389,26 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       add_test(NAME runtime_gui_x11
         COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_x11_test>)
       set_tests_properties(runtime_gui_x11 PROPERTIES TIMEOUT 15)
+
+      add_executable(zan_gui_x11_platform_test tests/runtime/gui_x11_platform_test.c)
+      set_target_properties(zan_gui_x11_platform_test PROPERTIES
+        C_STANDARD 11 C_STANDARD_REQUIRED YES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+      target_link_libraries(zan_gui_x11_platform_test PRIVATE zan_gui ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
+      add_test(NAME runtime_gui_x11_platform
+        COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_x11_platform_test>)
+      set_tests_properties(runtime_gui_x11_platform PROPERTIES TIMEOUT 30)
+
+      add_test(NAME conformance_gui_capi_platform
+        COMMAND ${XVFB_RUN_EXECUTABLE} -a ${CMAKE_COMMAND}
+          -DZANC=$<TARGET_FILE:zanc>
+          -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/capi_platform_test.zan
+          "-DZANC_ARGS=--auto-stdlib;--stdlib-path;${CMAKE_SOURCE_DIR}/stdlib${_gui_driver_tail}"
+          -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/capi_platform_test.out
+          -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_capi_platform${_exe_ext}
+          -DSTDLIB_STAMP=${_stdlib_stamp}
+          -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+      set_tests_properties(conformance_gui_capi_platform PROPERTIES TIMEOUT 180)
 
       # Borderless-window caption hit-testing needs synthetic pointer events.
       if(X11_XTest_FOUND)

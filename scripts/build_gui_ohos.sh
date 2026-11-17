@@ -13,8 +13,18 @@
 # only maintenance path for both ohos driver flavors.
 #
 # Usage: scripts/build_gui_ohos.sh [x64|arm64|all]   (default: all)
+#        scripts/build_gui_ohos.sh check-native [x64|arm64|all]
+# check-native: real SDK API-13 syntax/link check, no staging, no FreeType build.
+# Run only while the parent session owns the shared build gate.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+MODE=build
+WANT="${1:-all}"
+if [ "$WANT" = check-native ]; then MODE=check; WANT="${2:-all}"; fi
+case "$WANT" in
+  x64|arm64|all) ;;
+  *) printf 'usage: %s [check-native] [x64|arm64|all]\n' "$0" >&2; exit 2 ;;
+esac
 
 # DevEco Studio location, most specific override first, then the standard
 # install dirs of each host. Nothing is pinned to an author's drive letter.
@@ -49,7 +59,34 @@ fi
 LLVM="$DEVECO/sdk/default/openharmony/native/llvm/bin"
 CLANG="$LLVM/clang.exe"
 AR="$LLVM/llvm-ar.exe"
+[ -x "$CLANG" ] || CLANG="$LLVM/clang"
+[ -x "$AR" ] || AR="$LLVM/llvm-ar"
 SYS="$DEVECO/sdk/default/openharmony/native/sysroot"
+
+check_native() {
+  local a="$1" triple
+  if [ "$a" = x64 ]; then triple=x86_64-linux-ohos13.0.0; else triple=aarch64-linux-ohos13.0.0; fi
+  local work="$REPO/build/cases"
+  mkdir -p "$work"
+  # Compile the production fragments with official declarations, then force all
+  # referenced C APIs into a standalone executable to reject missing link symbols.
+  "$CLANG" --target="$triple" --sysroot="$SYS" -std=c11 -O2 \
+    -DZAN_GUI_OHOS_SDK_CHECK -Werror=implicit-function-declaration \
+    -Werror=incompatible-function-pointer-types -Werror=unguarded-availability \
+    -fsyntax-only "$REPO/tests/runtime/gui_ohos_native_test.c"
+  "$CLANG" --target="$triple" --sysroot="$SYS" -std=c11 -O2 \
+    -DZAN_GUI_OHOS_SDK_CHECK -Werror=incompatible-function-pointer-types \
+    -Werror=unguarded-availability -Wl,--no-undefined \
+    "$REPO/tests/runtime/gui_ohos_native_test.c" \
+    -lpasteboard -ludmf -lohinputmethod -ldl -pthread -lm \
+    -o "$work/gui_ohos_native_sdk_$a"
+  printf '== ohos-%s: API-13 native SDK syntax and link checks passed\n' "$a"
+}
+
+if [ "$MODE" = check ]; then
+  if [ "$WANT" = all ]; then check_native x64; check_native arm64; else check_native "$WANT"; fi
+  exit 0
+fi
 
 # FreeType source: ZAN_FREETYPE_ROOT / FREETYPE_SRC (checkout root), a bare
 # FREETYPE_INC (its include dir), then the usual user-level checkouts.
@@ -68,7 +105,9 @@ if [ -z "$FT" ] || [ ! -f "$FT/include/ft2build.h" ]; then
 fi
 OUT="$REPO/build/ohos_gui_drivers"
 
-WANT="${1:-all}"
+# Pasteboard/UDMF and IME are resolved by dlopen/dlsym in the production GUI.
+# Do not add strong links or .libs entries: pre-API-13 systems must still load
+# the driver and report clipboard failure. check-native links these APIs above.
 
 FT_FILES="src/base/ftsystem.c src/base/ftinit.c src/base/ftdebug.c \
 src/base/ftbase.c src/base/ftbbox.c src/base/ftglyph.c src/base/ftbdf.c \
