@@ -400,6 +400,14 @@ LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val,
                                       "f2i.tlo");
         LLVMValueRef above = zan_icmp(g->builder, LLVMIntSGT, clamped, hi_t,
                                       "f2i.thi");
+        /* checked 上下文：目标位宽域外必须抛 OverflowException（与整型窄化
+         * 强转同口径），不能在 unchecked 的饱和值上静默继续。 */
+        if (g->irgen_checked_depth > 0) {
+            LLVMValueRef ovf = LLVMBuildOr(g->builder, below, above,
+                                           "f2i.tovf");
+            emit_runtime_check(g, ovf, loc,
+                "integer overflow in checked operation");
+        }
         LLVMValueRef hi_sel = LLVMBuildSelect(g->builder, above, hi_t, clamped,
                                               "f2i.thi.sel");
         clamped = LLVMBuildSelect(g->builder, below, lo_t, hi_sel, "f2i.tclamp");
