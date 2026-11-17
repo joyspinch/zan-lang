@@ -48,13 +48,17 @@
 - 双击该节点，IDE 即可自动完成编译并调起原生窗口。
 
 ### 2. 命令行直接编译运行
-```bash
-# 编译生成原生可执行程序
-build/zanc.exe tools/game_asset_tool/GameAssetTool.zan --auto-stdlib -o _scratch/game_asset_tool.exe
+在当前主仓根目录运行以下 PowerShell 命令，直接编译主树源码：
 
-# 运行工具
-./_scratch/game_asset_tool.exe
+```powershell
+Set-Location D:/project/zan-lang
+& ./scripts/build_gate.ps1 -Name build -Script {
+    build/zanc.exe tools/game_asset_tool/GameAssetTool.zan tools/game_asset_tool --auto-stdlib --package-project . --subsystem windows -o build/game_asset_tool.exe
+}
+build/game_asset_tool.exe
 ```
+
+入口 `GameAssetTool.zan` 排在首位，随后工具目录递归纳入 `PaperdollPart.zan`、`ToolUtil.zan` 等全部源码，已列入口不会重复纳入。`--package-project .` 使用当前主仓的 `packages/`；产物留在 `build/`，验证时不复制源码或包。生成的原生驱动文件应与程序保持在同一目录。
 
 ---
 
