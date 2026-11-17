@@ -78,7 +78,7 @@ build/zanc src/main.zan --auto-stdlib --target ios-arm64 --emit-ipa app.ipa \
 `androidLabel`/`androidPermissions`（逗号分隔，裸名自动补
 `android.permission.` 前缀）只在缺省时被 CLI 覆盖项顶掉；`skins`/`skinlist`
 决定 GUI 皮肤基线烤入——`skins = 1` 时烤 `skinlist` 列出的 pack（逗号
-分隔，`-` 表示清空），否则只烤基线 dark+light（base.css 恒烤）。裸 CLI
+分隔，`-` 表示清空），否则只烤基线 porcelain+graphite+navy（浅色/石墨/深蓝，base.css 恒烤）。裸 CLI
 与 `--emit-apk` 均按此收敛，与 IDE 暂存发布的 CopyThemeSkins 同规则。
 
 ### 1.4 库与工具通道
@@ -88,6 +88,14 @@ build/zanc src/lib.zan --auto-stdlib --emit-lib -o foo.dll   # 共享库（.so/.
 build/zanc --emit-symbols index.json src/...                 # 类型/成员索引（IDE 补全）后退出
 build/zanc --gen-meta meta.json src/...                      # 编译单元元数据 JSON 后退出
 ```
+
+反射成员表采用宿主编译器的紧凑描述 ABI：TypeInfo 的 15 槽头部与公开 API
+语义保持，字段、方法、构造器表改为共享记录池、payload 指针池和每类型 i32
+成员索引。跨库传递 TypeInfo 时，消费 helper 使用该表携带的池基址。
+**这是内部反射 ABI 变更，旧版预编译 Zan 库及消费方须以同一新版编译器重新构建**；
+不能把“公开 API 未变”理解为可混用新旧二进制。当前没有库级反射 ABI 版本协商或
+自动转换，旧平铺表与新索引表不可互读。自举编译器仍独立生成和消费其旧表示，
+不支持与宿主紧凑表示跨模块交换 TypeInfo 或依赖该成员表的对象动态反射。
 
 ### CPU 要求（x86-64）
 
@@ -185,7 +193,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | （位置参数，文件/目录） | — | `.zan` 文件，或**目录**（递归展开 `*.zan`，按路径排序）。目录输入跳过 `.` 前缀与 `.git/build/publish/bin/obj/node_modules/_scratch/dist/out/vendor/.zan-packages` 等目录；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：显式给 `.html`/`.htm` 会被 "the compile-time HTML channel has been removed" 拒绝——界面用 Gui 组件搭骨架、运行期 `Gui.App.LoadHtml` 装载标记（内嵌资源走 `--embed`） |
 | （无旗标，按目标自动） | — | Windows/Linux/macOS 的 x64/arm64 目标自动链入多 worker 协程调度器（`zanrt_io_mt`）；worker 数解析顺序：`System.Threading.AsyncRuntime.SetWorkers`（Main 内设置）→ `ZAN_CO_WORKERS` 环境变量 → 逻辑核数。IO 分片与同步完成快路径同理由 `AsyncRuntime` 优先于 `ZAN_IO_SHARDS`/`ZAN_IO_SYNCFAST` |
 | （默认，native） | — | Windows/Linux 原生默认链入小对象分配器（`rt_mem.c`：≤2048B 尺寸分级无锁缓存、跨线程 free 分 8 条带，`ld --wrap` 全图接管 malloc/free/calloc/realloc）。Apple 原生不链（ld64 无 `--wrap`）；Android 交叉永不链（bionic TLS bootstrap 崩溃）；linux-musl 交叉 sysroot 有对象即自动链。Windows 链接自动改走捆绑 GNU ld（lld 的 PE `--wrap` 改写导入槽，程序加载即死 exit 127）。实测 win-x64：spawn k=1 -26%~-31%，k=32 分片后不劣。调试：`ZAN_LINK_ECHO=1` 回显链接命令 |
-| `--version, -v` / `--help, -h` | — | 版本 / 帮助 |
+| `--version, -v` / `--help, -h` | — | 版本 / 帮助；`--version` 输出 `zanc X.Y.Z (gen0)`——代次标记（B-ID189）由自举差分门盖进报告指纹；自举驱动（gen1）同旗标输出 `(gen1)`，字面量由 `bump_version.ps1` 与 VERSION 同步，漂移即门失败 |
 
 ### 2.2 发布（Publish）
 | 参数 | 取值 / 默认 | 说明 |
@@ -266,6 +274,8 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `ZAN_VERBOSE_LINK` | 回显原生链接命令行（查 -L/-l 从哪来） |
 | `ZAN_PULLIN_DEBUG` | 打印 stdlib 拉入决策 |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
+| `ZAN_NO_PUBLISH_REFLECT_DEMAND` | `=1` 时禁用发布反射需求裁剪，恢复全分配点元数据、既有可调用钩子及完整成员签名元数据；仅影响 `--publish` 且非调试、非库构建，用于同源体积对照和回归定位 |
+| `ZAN_NO_PUBLISH_VSLOT_DEMAND` | `=1` 时恢复完整虚表槽引用；默认发布构建按实际发射的虚调用槽保留实现。调试、库构建以及外部接口可能供应实例时采用保守保留，用于回归定位 |
 | `ZANC_DUMP_BAD_IR` | LLVM verifier 拒绝时 dump 挂掉函数的 IR（定位 verifier 错误第一工具） |
 | `ZANC_TRACE` | 编译器内部跟踪（diag.c 统一出口） |
 | `ZAN_TRACE_SYNC` | 打印哪些外部符号把同步/协程运行时拉进来（排查"为什么带上了 co 调度器"） |

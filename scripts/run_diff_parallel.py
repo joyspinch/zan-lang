@@ -31,6 +31,25 @@ def log(msg):
         print(msg, flush=True)
 
 
+def capture_version(exe, workdir):
+    """First line of `<exe> --version`, or '' when the binary predates the
+    flag or cannot run: the stamp degrades to empty, it never fabricates
+    identity (B-ID189 -- the report must be attributable)."""
+    try:
+        rc, out, _ = run_cmd([exe, "--version"], workdir, timeout=60)
+    except Exception:
+        return ""
+    if rc != 0 or not out:
+        return ""
+    return out.splitlines()[0].strip()
+
+
+def version_token(v):
+    """The X.Y.Z out of 'zanc X.Y.Z (genN)', or '' for an unstamped line."""
+    parts = v.split()
+    return parts[1] if len(parts) >= 2 else ""
+
+
 def run_cmd(cmd, workdir, timeout=0):
     """Run a subprocess, capturing output the way execute_process does.
     A timeout kills the process: unvetted corpus cases can miscompile into
@@ -276,6 +295,29 @@ def main():
         if os.path.exists(passed_file):
             os.remove(passed_file)
     jobs = a.jobs if a.jobs > 0 else (os.cpu_count() or 8)
+
+    # ---- report identity stamp (B-ID189) ------------------------------------
+    # A differential report is only worth anything if a later session can
+    # reproduce it: both compilers' --version lines and the SHA256 of the
+    # selfhost source manifest pin which binaries and which source set ran.
+    # The gen1 driver keeps its version literal synced with the VERSION file
+    # via scripts/bump_version.ps1; when the two drift apart the report would
+    # pair mismatched identities, so the gate refuses to run at all.
+    stamp_zanc = capture_version(a.zanc, a.workdir)
+    stamp_gen1 = capture_version(a.gen1, a.workdir)
+    stamp_sources = ""
+    manifest = os.path.join(a.workdir, "scripts", "selfhost_sources.txt")
+    if os.path.isfile(manifest):
+        with open(manifest, "rb") as f:
+            stamp_sources = hashlib.sha256(f.read()).hexdigest()
+    log("-- selfhost differential stamp: zanc='%s' gen1='%s' sources=%s"
+        % (stamp_zanc, stamp_gen1, stamp_sources[:16]))
+    ztok, gtok = version_token(stamp_zanc), version_token(stamp_gen1)
+    if ztok and gtok and ztok != gtok:
+        log("ERROR: gen1 version drift: gen1 reports '%s', zanc reports '%s'; "
+            "sync src/selfhost/driver/main.zan (scripts/bump_version.ps1)"
+            % (stamp_gen1, stamp_zanc))
+        sys.exit(1)
     # the same link set the cmake gate resolves by platform: the system
     # libraries are fixed per OS, so they are derived here rather than
     # threaded through the cmake->python argument boundary
@@ -437,7 +479,9 @@ def main():
             log("-- FAIL inputs changed during validation; see inputs.json/inputs.after.json")
         with open(os.path.join(a.log_dir, "result.json"), "w", encoding="utf-8") as f:
             json.dump({"passed": passed, "rejected": rejected, "failures": failures,
-                       "inputs_stable": before == after, "llvm_as": a.llvm_as}, f, indent=2)
+                       "inputs_stable": before == after, "llvm_as": a.llvm_as,
+                       "zanc_version": stamp_zanc, "gen1_version": stamp_gen1,
+                       "sources_sha256": stamp_sources}, f, indent=2)
         if failures == 0:
             with open(os.path.join(a.log_dir, "passed.txt"), "w", encoding="utf-8") as f:
                 f.write("%d host/gen1 golden+exit pairs, %d diagnostic rejects; inputs stable.\n" % (passed, rejected))

@@ -33,6 +33,20 @@ $next = "$major.$minor.$patch"
 # strips it, build_ide.ps1 trims it), and one terminating newline keeps it a
 # well-formed text file.
 [System.IO.File]::WriteAllText($file, "$next`n")
+
+# Keep the self-hosted driver's identity literal on the same single source of
+# truth (B-ID189): the differential gate fail-closes when gen1's --version
+# drifts from zanc's, so the bump must rewrite it here, not leave that to
+# whoever remembers it exists.
+$driver = Join-Path $root 'src\selfhost\driver\main.zan'
+$driverText = [System.IO.File]::ReadAllText($driver)
+$pattern = '(static string SelfhostVersion\(\) \{ return ")[^"]+("; \})'
+$updated = [regex]::Replace($driverText, $pattern, ('${1}' + $next + '${2}'), 'Multiline')
+if ($updated -eq $driverText) {
+    Write-Output "BUMP_FAILED: SelfhostVersion literal not found in src\selfhost\driver\main.zan"
+    exit 1
+}
+[System.IO.File]::WriteAllText($driver, $updated)
 Write-Output "VERSION_BUMPED $current -> $next"
 # 显式成功退出：调用方（publish_ide.ps1）按 $LASTEXITCODE 判断这一步，
 # 而纯 PowerShell 脚本不设置它——不写这一行，上一条原生命令留下的

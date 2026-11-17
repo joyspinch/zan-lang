@@ -25,7 +25,9 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
-            printf("zanc %s\n", ZAN_VERSION);
+            /* generation marker (B-ID189): the differential gate stamps both
+             * compilers' --version into its report, so gen0 must name itself. */
+            printf("zanc %s (gen0)\n", ZAN_VERSION);
             opts->exit_code = 0;
             return ZAN_OPTIONS_EXIT;
         }
