@@ -99,9 +99,6 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **GUI 与游戏排版及实体建模统一规范（Flex + Float 单轨化，废除双轨与旧式 Dock）**：
   ① 界面与游戏 HUD 排版模型归一：全面收敛为 `Flow`（参与父级 Flex 弹性盒主轴与交叉轴伸缩、间距 Gap）与 `Float`（脱离文档流绝对/浮动摆位，结合九宫格 Anchor 锚点对齐自适应分辨率）；彻底淘汰传统桌面切边式 Dock 停靠算法与独立的游戏绝对像素画布；
   ② 游戏 UI 本质即 GUI 皮肤化：游戏世界视口（`GameViewport`）作为 GUI 控件树中的内容节点，上层 HUD、背包、血条、技能栏直接复用标准 GUI 控件（`Button`/`ProgressBar`/`Panel`/`Flex`），视觉差异纯粹通过 CSS 类、主题贴图与九宫格边框（Border-Image）实现；
-- **GUI 与游戏排版及实体建模统一规范（Flex + Float 单轨化，废除双轨与旧式 Dock）**：
-  ① 界面与游戏 HUD 排版模型归一：全面收敛为 `Flow`（参与父级 Flex 弹性盒主轴与交叉轴伸缩、间距 Gap）与 `Float`（脱离文档流绝对/浮动摆位，结合九宫格 Anchor 锚点对齐自适应分辨率）；彻底淘汰传统桌面切边式 Dock 停靠算法与独立的游戏绝对像素画布；
-  ② 游戏 UI 本质即 GUI 皮肤化：游戏世界视口（`GameViewport`）作为 GUI 控件树中的内容节点，上层 HUD、背包、血条、技能栏直接复用标准 GUI 控件（`Button`/`ProgressBar`/`Panel`/`Flex`），视觉差异纯粹通过 CSS 类、主题贴图与九宫格边框（Border-Image）实现；
   ③ 实体强类型与 Enum 规范：高频渲染、设计器文档模型与动作分发全面采用强类型实体（如 `SceneActionBinding`、`FieldPositionMode`、`SceneAnchor`）替代动态弱类型字典或通用 `JsonValue` 解包，彻底根除高频帧循环中的哈希查找与堆内存浪费；`JsonValue` 仅作为磁盘持久化边缘的序列化载体。
 - **Zan.Gui 界面禁止自绘**（源码 `packages/Zan.Gui/src/Gui`），全部用标准库控件与布局原语完成。
 - **窗口程序开发铁律：UI 线程专职渲染与事件派发，业务/IO/计算绝对异步解耦非阻塞**：
@@ -196,6 +193,26 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **包/平台专属定式与语言事实系列**（Web/ORM/AI/游戏/IDE/原生互操作定式、
   语言事实三则～十一则、BOM/catch taxonomy/树形父指针等逐坑）：
   见 [references/coding-details.md](references/coding-details.md)。
+
+## 四、验证纪律（实机/无头通用）
+
+逐坑细节（验证面收窄、探针测量、流式握手、几何/协议/格式对拍、IDE 无头探针、
+并发会话纪律、交叉工具链、GUI 事件门控、服务端端点等 40+ 小节）已拆入
+[references/verification.md](references/verification.md)——做实机验证、排查、
+或涉及并发/构建纪律的动作前，先读对应小节；本文件不随加载。
+
+两条总则：
+- **验证面自己收窄**：改了共享底座文件，先算"谁会被影响"，再定跑哪条检查。
+- **判定器优先**：能用断言钉住的行为不靠截图/时间阈值反推；说不出跑哪条命令
+  验证的改动，不做。
+## 五、经验沉淀纪律（skill 的准入标准）
+
+- 沉淀的是**通用可落地的规则**：动作 + 理由 + 适用边界。三样缺一的
+  不进 skill：没有"动作"的是感想，没有"理由"的是迷信，没有"边界"的是口号。
+- **不带流水账**：日期编号、"本轮/本机/这个 demo"、一次性排查过程、
+  具体文件路径——一律不进 skill 正文。教训先问"换个项目还成立吗"，
+  不成立就扔。
+- 被推翻的旧规则在同一提交里删除，skill 里不留"可能也对"的僵尸条目。
 
 - 单个 skill 控制在约 300 行内：逐坑细节、长流程挪 `references/` 子文件，
   正文只留决策规则；description ≤2 行、只写真实触发场景。
