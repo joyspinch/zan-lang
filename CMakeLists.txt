@@ -4127,6 +4127,20 @@ if(SELFHOST_CLANG)
       "-DSYSLIBS=${_sh_syslibs}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diff.cmake)
   set_tests_properties(selfhost_diff PROPERTIES TIMEOUT 1800)
+  # Consume the existing gen1 and differential runtime bundle; this focused
+  # driver never rebuilds either compiler or copies runtime DLLs/stdlib.
+  add_test(NAME selfhost_entry_format
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DGEN1=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
+      -DCLANG=${SELFHOST_CLANG}
+      -DBUILD_DIR=${CMAKE_BINARY_DIR}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      "-DRT_OBJS=${_shd_rt_objs}"
+      "-DSYSLIBS=${_sh_syslibs}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_entry_format.cmake)
+  set_tests_properties(selfhost_entry_format PROPERTIES
+    TIMEOUT 300 RESOURCE_LOCK selfhost_entry_format)
   add_test(NAME selfhost_production_diff
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
