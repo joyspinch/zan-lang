@@ -16,6 +16,32 @@ if(NOT ZANC OR NOT SRC OR NOT WORKDIR)
     "run_publish_dead_hook_ir: ZANC, SRC and WORKDIR are required")
 endif()
 
+get_filename_component(_case "${SRC}" NAME_WE)
+set(_live_marker "publish dead hook PASS")
+set(_dead_markers
+  "PUBLISH_DEAD_HOOK_ONPAINT_MUST_BE_DEAD"
+  "PUBLISH_DEAD_HOOK_ONUNUSED_MUST_BE_DEAD"
+  "PUBLISH_DEAD_HOOK_PAYLOAD_MUST_BE_DEAD")
+set(_dead_definitions
+  "PublishDeadHookOwner_OnPaint"
+  "PublishDeadHookOwner_OnUnusedAllocate"
+  "PublishDeadHookPayload_[A-Za-z0-9_]+")
+if(_case STREQUAL "publish_reflect_metadata_hook")
+  set(_live_marker "publish reflect metadata hook PASS")
+  set(_dead_markers
+    "PUBLISH_REFLECT_METADATA_ONPAINT_MUST_BE_DEAD"
+    "PUBLISH_REFLECT_METADATA_PAYLOAD_MUST_BE_DEAD")
+  set(_dead_definitions
+    "PublishReflectMetadataHookOwner_OnPaint"
+    "PublishReflectMetadataHookPayload_[A-Za-z0-9_]+")
+elseif(_case STREQUAL "publish_interface_candidates")
+  set(_live_marker "publish interface candidates PASS")
+  set(_dead_markers "PUBLISH_INTERFACE_CANDIDATE_MUST_BE_DEAD")
+  set(_dead_definitions
+    "PublishInterfaceDeadCandidate_[A-Za-z0-9_]+"
+    "PublishInterfaceDeadPayload_[A-Za-z0-9_]+")
+endif()
+
 execute_process(
   COMMAND "${ZANC}" "${SRC}" --auto-stdlib --package-project "${WORKDIR}"
           --publish --no-check-leaks --no-arc-guard --emit-ir
@@ -24,9 +50,9 @@ execute_process(
   ERROR_VARIABLE _err
   RESULT_VARIABLE _rc)
 string(REPLACE "\r" "" _ir "${_ir}")
-set(_ir_dir "${WORKDIR}/build/test-out/publish-dead-hook")
+set(_ir_dir "${WORKDIR}/build/test-out/${_case}")
 file(MAKE_DIRECTORY "${_ir_dir}")
-file(WRITE "${_ir_dir}/publish_dead_hook.ll" "${_ir}")
+file(WRITE "${_ir_dir}/${_case}.ll" "${_ir}")
 file(WRITE "${_ir_dir}/compiler.stderr.log" "${_err}")
 if(NOT _rc EQUAL 0)
   message(FATAL_ERROR
@@ -35,7 +61,7 @@ endif()
 
 # Require both the fixture marker and a real Console call so an empty or
 # unrelated IR stream cannot satisfy the negative assertions vacuously.
-string(FIND "${_ir}" "publish dead hook PASS" _pos)
+string(FIND "${_ir}" "${_live_marker}" _pos)
 if(_pos EQUAL -1)
   message(FATAL_ERROR
     "run_publish_dead_hook_ir: publish IR lacks the live marker")
@@ -46,10 +72,7 @@ if(_live_call STREQUAL "")
     "run_publish_dead_hook_ir: publish IR lacks the live Console call")
 endif()
 
-foreach(_forbidden
-    "PUBLISH_DEAD_HOOK_ONPAINT_MUST_BE_DEAD"
-    "PUBLISH_DEAD_HOOK_ONUNUSED_MUST_BE_DEAD"
-    "PUBLISH_DEAD_HOOK_PAYLOAD_MUST_BE_DEAD")
+foreach(_forbidden IN LISTS _dead_markers)
   string(FIND "${_ir}" "${_forbidden}" _pos)
   if(NOT _pos EQUAL -1)
     message(FATAL_ERROR
@@ -60,10 +83,7 @@ endforeach()
 # Check definitions as well as strings: a dead body replaced by an unreachable
 # stub is still unwanted emission. Include the constructor reached only from
 # the dead hook, rather than merely checking its caller.
-foreach(_forbidden_definition
-    "PublishDeadHookOwner_OnPaint"
-    "PublishDeadHookOwner_OnUnusedAllocate"
-    "PublishDeadHookPayload_[A-Za-z0-9_]+")
+foreach(_forbidden_definition IN LISTS _dead_definitions)
   string(REGEX MATCH "define[^\n]*@${_forbidden_definition}\\("
     _definition "${_ir}")
   if(NOT _definition STREQUAL "")

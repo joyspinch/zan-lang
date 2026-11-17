@@ -411,6 +411,7 @@ LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type, int r
 LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym, zan_type_t *inst);
 LLVMValueRef get_collection_release_decl(zan_irgen_t *g, int site);
 LLVMValueRef get_vtable_global(zan_irgen_t *g, zan_symbol_t *sym);
+bool vtable_has_instance_store(LLVMValueRef value, int depth);
 LLVMValueRef get_vtable_global_inst(zan_irgen_t *g, zan_symbol_t *sym, zan_type_t *inst);
 bool is_user_generic_sym(zan_symbol_t *sym);
 LLVMValueRef load_dict_value_words(zan_irgen_t *g, LLVMValueRef raw);
@@ -840,6 +841,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g);
 
 /* --- From irgen_stmt.c (7 functions) --- */
 bool call_is_async_callee(zan_irgen_t *g, zan_ast_node_t *call, local_scope_t *locals);
+bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner);
 void emit_eh_disarm_from(zan_irgen_t *g, int base);
 void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 void emit_finally_body(zan_irgen_t *g, local_scope_t *locals, const zan_irgen_finally_entry_t *entry);

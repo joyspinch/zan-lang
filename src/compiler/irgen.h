@@ -437,6 +437,7 @@ struct zan_irgen {
     LLVMValueRef soft_scratch_slot; /* 函数入口轻量刮擦页指针 */
     LLVMValueRef soft_scratch_fn;
     bool         publish_mode;
+    bool         publish_instance_prune; /* closed-world instance callable roots */
     char       **html_handlers;      /* publish：设计稿事件处理器名，按名保留反射 */
     int          html_handler_count;
     bool         strict_runtime;

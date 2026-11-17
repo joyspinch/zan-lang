@@ -467,6 +467,7 @@
                     int cand_count = 0;
 
                     /* 1. 非泛型类候选 */
+                        LLVMValueRef  eligibility;
                     for (int si = 0; si < g->struct_type_count; si++) {
                         zan_symbol_t *cls = g->struct_types[si].sym;
                         if (!cls || is_user_generic_sym(cls)) continue;
@@ -527,6 +528,24 @@
                         unsigned npar = LLVMCountParamTypes(cands[0].fnty);
                         LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npar > 0 ? npar : 1), sizeof(LLVMTypeRef));
                         LLVMGetParamTypes(cands[0].fnty, pts);
+                    unsigned candidate_md = LLVMGetMDKindIDInContext(
+                        c, "zan.interface.candidate", 23);
+                    if (g->publish_instance_prune) {
+                        for (int ci = 0; ci < cand_count; ci++) {
+                            LLVMValueRef vt = cands[ci].tagc;
+                            if (LLVMIsAConstantExpr(vt)) vt = LLVMGetOperand(vt, 0);
+                            size_t vlen = 0;
+                            const char *vname = LLVMGetValueName2(vt, &vlen);
+                            LLVMMetadataRef fields[] = {
+                                LLVMMDStringInContext2(c, cands[ci].cls->name.str,
+                                                       cands[ci].cls->name.len),
+                                LLVMMDStringInContext2(c, vname, vlen)
+                            };
+                            cands[ci].eligibility = LLVMMetadataAsValue(
+                                c, LLVMMDNodeInContext2(c, fields, 2));
+                        }
+                    }
+
                         int cargc = uargc + 1;
                         LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
                         /* A556-2：结构体箱的载荷在首字 vtable tag 之后（+8），
@@ -552,6 +571,9 @@
                         for (int k = 0; k < n_eh_args; k++)
                             emit_eh_tmp_pop(g);
                         if (recv_eh_pushed) emit_eh_tmp_pop(g);
+                        if (cands[0].eligibility &&
+                            (LLVMIsACallInst(r) || LLVMIsAInvokeInst(r)))
+                            LLVMSetMetadata(r, candidate_md, cands[0].eligibility);
                         for (int k = 0; k < uargc; k++)
                             emit_release_owned_call_temp(g, expr->call.args.items[k], avals[k], locals);
                         emit_release_owned_call_temp(g, callee->member.object, recv, locals);
@@ -583,6 +605,8 @@
                         int cargc = uargc + 1;
                         LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
                         /* A556-2：结构体箱的 this 指向载荷（+8），见单候选分支 */
+                        if (cands[ci].eligibility && LLVMIsAInstruction(cmp))
+                            LLVMSetMetadata(cmp, candidate_md, cands[ci].eligibility);
                         LLVMValueRef thisv = recv;
                         if (cands[ci].cls->kind == SYM_STRUCT)
                             thisv = LLVMBuildGEP2(g->builder,
@@ -604,6 +628,9 @@
                         LLVMPositionBuilderAtEnd(g->builder, nextbb);
                     }
                     free(cands);
+                        if (cands[ci].eligibility &&
+                            (LLVMIsACallInst(r) || LLVMIsAInvokeInst(r)))
+                            LLVMSetMetadata(r, candidate_md, cands[ci].eligibility);
 
                     emit_runtime_check(g, LLVMConstInt(LLVMInt1TypeInContext(c), 1, 0),
                                        expr->loc, "interface dispatch has no implementation");

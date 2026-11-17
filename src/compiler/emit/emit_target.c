@@ -7,6 +7,7 @@ static bool reflected_method_has_derived_owner(zan_irgen_t *g, zan_symbol_t *own
      * not have its own metadata or allocation site before late thunk emission. */
     for (int m = 0; m < g->refl_mtab_count; m++) {
         zan_symbol_t *sym = g->refl_mtabs[m].sym;
+        if (!refl_owner_can_have_instance(g, sym)) continue;
         zan_type_t *base = sym && sym->type ? sym->type->base_type : NULL;
         for (int depth = 0; base && base->sym && depth < 32; base = base->base_type, depth++) {
             if (base->sym == owner) return true;
@@ -15,9 +16,82 @@ static bool reflected_method_has_derived_owner(zan_irgen_t *g, zan_symbol_t *own
     return false;
 }
 
+static bool extern_type_can_supply_instances(zan_irgen_t *g, zan_type_t *type, int depth) {
+    if (!type || depth >= 32) return true;
+    switch (type->kind) {
+    case TYPE_CLASS:
+    case TYPE_INTERFACE:
+    case TYPE_OBJECT:
+    case TYPE_TYPE_PARAM:
+    case TYPE_TASK:
+    case TYPE_ERROR:
+        return true;
+    case TYPE_DELEGATE: {
+        /* Native delegates with arguments may invoke nested callbacks that
+         * supply objects. Parameterless Action has no such object channel. */
+        if (type->delegate_param_count > 0) return true;
+        zan_type_t *result = type->type_arg_count
+                                 ? subst_type_param_deep(g, type->delegate_ret_type, type)
+                                 : type->delegate_ret_type;
+        return extern_type_can_supply_instances(g, result, depth + 1);
+    }
+    case TYPE_ARRAY:
+    case TYPE_NULLABLE:
+        return extern_type_can_supply_instances(g, type->element_type, depth + 1);
+    case TYPE_STRUCT:
+        if (!type->sym) return true;
+        for (int i = 0; i < type->sym->member_count; i++) {
+            zan_symbol_t *member = type->sym->members[i];
+            if (!member || (member->modifiers & MOD_STATIC) ||
+                (member->kind != SYM_FIELD && member->kind != SYM_PROPERTY))
+                continue;
+            zan_type_t *field =
+                type->type_arg_count ? subst_type_param_deep(g, member->type, type) : member->type;
+            if (extern_type_can_supply_instances(g, field, depth + 1)) return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool extern_can_supply_instances(zan_irgen_t *g) {
+    for (int i = 0; i < g->function_count; i++) {
+        zan_symbol_t *sym = g->functions[i].sym;
+        if (!sym_declares_extern(sym)) continue;
+        zan_ast_node_t *decl = sym->decl;
+        zan_type_t *ret = decl->method_decl.return_type
+                              ? zan_binder_resolve_type(g->binder, decl->method_decl.return_type)
+                              : NULL;
+        if (decl->method_decl.return_type && extern_type_can_supply_instances(g, ret, 0)) {
+            zan_compile_trace("publish instance fallback: extern %.*s result kind=%d type=%.*s",
+                              (int)sym->name.len, sym->name.str, ret ? (int)ret->kind : -1,
+                              ret ? (int)ret->name.len : 0, ret ? ret->name.str : "");
+            return true;
+        }
+        for (int p = 0; p < decl->method_decl.params.count; p++) {
+            zan_ast_node_t *param = decl->method_decl.params.items[p];
+            /* Native code can also fill reference containers or invoke a
+             * callback passed by value with objects allocated outside Zan. */
+            zan_type_t *type = zan_binder_resolve_type(g->binder, param->param.type);
+            if (extern_type_can_supply_instances(g, type, 0)) {
+                zan_compile_trace(
+                    "publish instance fallback: extern %.*s argument kind=%d type=%.*s",
+                    (int)sym->name.len, sym->name.str, type ? (int)type->kind : -1,
+                    type ? (int)type->name.len : 0, type ? type->name.str : "");
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return ZAN_ERROR;
     g_di_emit_ctx = g;
+    const char *no_instance_prune = getenv("ZAN_NO_PUBLISH_INSTANCE_PRUNE");
+    g->publish_instance_prune = g->publish_mode && !g->emit_debug && !g->emit_lib &&
+                                !(no_instance_prune && strcmp(no_instance_prune, "1") == 0);
     di_debug_types_reset();
     if (g->publish_mode && !g->emit_debug && !g->function_compactor) {
         char error[4096];
@@ -43,6 +117,10 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     int work_count = 0;
     method_body_work_t *work = declare_user_methods(g, unit, &work_count);
     if (zan_diag_has_errors(g->diag)) { free(work); return ZAN_ERROR; }
+    /* Imported managed results and ref/out slots can supply instances without a
+     * local allocation site. Native handles and scalar returns do not do so. */
+    if (g->publish_instance_prune && extern_can_supply_instances(g))
+        g->publish_instance_prune = false;
 
     bool prune_stdlib_bodies = (g->publish_mode || g->obfuscate_strings) && !g->emit_debug;
     bool prune_user = prune_stdlib_bodies;
@@ -195,7 +273,7 @@ done:
     }
 
     if (prune_stdlib_bodies) emit_vtables(g);
-    work_fn_index_t work_ix = { 0 };
+    work_fn_index_t work_ix = { .g = g };
     work_fn_index_build(&work_ix, work, work_count);
     int pending;
     do {

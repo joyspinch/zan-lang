@@ -47,6 +47,17 @@ LLVMValueRef get_vtable_global(zan_irgen_t *g, zan_symbol_t *sym) {
     return gv;
 }
 
+bool vtable_has_instance_store(LLVMValueRef value, int depth) {
+    if (!value) return false;
+    if (depth > 16) return true;
+    for (LLVMUseRef use = LLVMGetFirstUse(value); use; use = LLVMGetNextUse(use)) {
+        LLVMValueRef user = LLVMGetUser(use);
+        if (LLVMIsAStoreInst(user) && LLVMGetOperand(user, 0) == value) return true;
+        if (LLVMIsAConstantExpr(user) && vtable_has_instance_store(user, depth + 1)) return true;
+    }
+    return false;
+}
+
 /* 从实例 inst 出发沿基类链找"声明该方法的类"在这次实例化里的具体类型
  * （`class Ch<T> : Base<T>` 的 Base<Order>、`class Ch<T> : Base<List<T>>` 的
  * Base<List<Order>>）。找不到返回 NULL。 */

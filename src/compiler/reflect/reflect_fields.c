@@ -519,6 +519,37 @@ bool refl_ctor_needs_thunk(zan_irgen_t *g) {
     return !g->publish_mode || g->emit_lib || g->refl_ctor_used;
 }
 
+bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner) {
+    if (!g->publish_instance_prune || !owner || !owner->type || owner->type->kind != TYPE_CLASS ||
+        refl_ctor_needs_thunk(g))
+        return true;
+    /* Recursive field metadata describes types without creating their objects.
+     * A derived allocation can still receive methods declared on this owner. */
+    for (int i = 1; i < g->leak_site_count; i++) {
+        zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
+        zan_type_t *type = sym ? sym->type : NULL;
+        int depth = 0;
+        for (; type && type->sym && depth < 32; type = type->base_type, depth++) {
+            if (type->sym == owner) return true;
+        }
+        if (depth == 32 && type) return true;
+    }
+    /* Runtime guard exceptions have site 0, but their vtable is stored into a
+     * real object. Metadata and interface tag comparisons do not make stores. */
+    for (int i = 0; i < g->struct_type_count; i++) {
+        zan_symbol_t *sym = g->struct_types[i].sym;
+        zan_type_t *type = sym ? sym->type : NULL;
+        for (int depth = 0; type && depth < 32; type = type->base_type, depth++) {
+            if (type->sym != owner) continue;
+            char name[320];
+            snprintf(name, sizeof(name), "__zan_vtable_%.*s", (int)sym->name.len, sym->name.str);
+            if (vtable_has_instance_store(LLVMGetNamedGlobal(g->mod, name), 0)) return true;
+            break;
+        }
+    }
+    return false;
+}
+
 /* F4/S1 谓词上移（design.md § P_method_thunk）：thunk 生成与 emit_target body-root 的唯一判定。
  * 非 publish：全部方法（现状不变）。
  * publish：仅 accessor（get_/set_ 且 owner 同名 property）、带注解方法、
@@ -529,6 +560,9 @@ bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
                              zan_ast_node_t *decl) {
     if (!decl || decl->kind != AST_METHOD_DECL) { return false; }
     if (!g->publish_mode) { return true; }
+    if (!(decl->method_decl.modifiers & MOD_STATIC) &&
+        !refl_owner_can_have_instance(g, owner))
+        return false;
     zan_symbol_t *msym = NULL;
     if (owner) {
         for (int i = 0; i < owner->member_count; i++) {

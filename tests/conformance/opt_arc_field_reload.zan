@@ -1,0 +1,54 @@
+using System;
+
+// Run with -O1 --publish and ZAN_NO_SHARD=1: two loads of Current may
+// observe different objects across Swap. Their retain/release must not cancel.
+class FieldReloadItem {
+    public int Value;
+    public FieldReloadItem(int value) { Value = value; }
+}
+
+class FieldReloadHolder {
+    public FieldReloadItem Current;
+
+    public void Swap(int value) {
+        Current = new FieldReloadItem(value);
+    }
+}
+
+class FieldReloadWitness {
+    public weak FieldReloadItem Previous;
+    public weak FieldReloadItem Replacement;
+}
+
+class OptArcFieldReload {
+    static void Check(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    static void Reload(FieldReloadHolder holder, FieldReloadWitness witness, int value) {
+        FieldReloadItem saved = holder.Current;
+        witness.Previous = saved;
+        holder.Swap(value);
+        witness.Replacement = holder.Current;
+        Check(witness.Previous != null, "A survives field swap through saved");
+        Check(saved.Value == value - 1, "saved still refers to A after swap");
+
+        saved = holder.Current;
+        Check(witness.Previous == null, "A freed when saved is reassigned");
+        Check(saved.Value == value, "saved reloads B from the same field");
+    }
+
+    static void Main() {
+        FieldReloadWitness witness = new FieldReloadWitness();
+        FieldReloadHolder holder = new FieldReloadHolder();
+        holder.Current = new FieldReloadItem(0);
+        for (int value = 1; value <= 2; value = value + 1) {
+            Reload(holder, witness, value);
+            Check(witness.Replacement != null, "B survives saved leaving scope");
+            Check(holder.Current.Value == value, "holder still owns B after return");
+        }
+        holder = null;
+        Check(witness.Replacement == null, "B freed when holder is released");
+        Console.WriteLine("PASS opt_arc_field_reload");
+    }
+}

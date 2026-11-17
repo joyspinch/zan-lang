@@ -1138,6 +1138,7 @@ typedef struct {
 } work_fn_slot_t;
 
 typedef struct {
+    zan_irgen_t *g;
     work_fn_slot_t *slots;
     int cap;
     const method_body_work_t *work;

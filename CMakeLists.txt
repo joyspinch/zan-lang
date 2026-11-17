@@ -3389,6 +3389,8 @@ foreach(_src ${_conf_srcs})
     # stubbed and dropped from the link line instead of failing the link.
     set(_extra_args
       "--publish;--link-mode;static;--driver-dir;${CMAKE_SOURCE_DIR}/tests/conformance/empty_driver_dir")
+  elseif(_name MATCHES "^publish_(reflect_(metadata_hook|field_hook)|interface_candidates)$")
+    set(_extra_args "--publish;--no-check-leaks;--no-arc-guard")
   elseif(_name MATCHES "^publish_(dead_hook|shared_vtable)$")
     set(_extra_args "--publish;--no-check-leaks;--no-arc-guard")
   elseif(_name STREQUAL "reflect_publish_hook")
@@ -3406,6 +3408,8 @@ foreach(_src ${_conf_srcs})
   elseif(_name MATCHES "^(binding_custom_property_ir|binding_property_dispatch_ir|binding_property_generic_ir)$")
     # Exercise property helpers and their caller debug-location isolation.
     set(_extra_args "-g")
+  elseif(_name STREQUAL "opt_arc_field_reload")
+    set(_extra_args "--publish;-O1")
   elseif(_name STREQUAL "opt_constfold_branch_phi")
     # A595: the O1+ pass pipeline used to be silently skipped because constfold
     # left stale PHI incoming entries when folding a constant branch (invalid
@@ -3490,6 +3494,10 @@ foreach(_src ${_conf_srcs})
   endif()
   set_tests_properties(case_${_name} PROPERTIES
     RESOURCE_LOCK src_${_name} TIMEOUT ${_case_timeout})
+  if(_name STREQUAL "opt_arc_field_reload")
+    set_tests_properties(case_${_name} PROPERTIES
+      ENVIRONMENT "ZAN_NO_SHARD=1;ZAN_RT_HARD=1")
+  endif()
   # The determinism lens needs a *second* codegen to compare against, so it
   # cannot share the run above -- but it shares the source, the arguments and
   # the stamp directory, and it produces no executable: the verdict is
@@ -7627,6 +7635,21 @@ if(Python3_Interpreter_FOUND)
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_publish_dead_hook_ir.cmake)
   set_tests_properties(publish_dead_hook_ir PROPERTIES TIMEOUT 120)
+  add_test(NAME publish_extern_instance_origins_ir
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_publish_extern_instance_origins_ir.cmake)
+  set_tests_properties(publish_extern_instance_origins_ir PROPERTIES TIMEOUT 120)
+  foreach(_hook_case publish_reflect_metadata_hook publish_interface_candidates)
+    add_test(NAME ${_hook_case}_ir
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/${_hook_case}.zan
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_publish_dead_hook_ir.cmake)
+    set_tests_properties(${_hook_case}_ir PROPERTIES TIMEOUT 120)
+  endforeach()
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}

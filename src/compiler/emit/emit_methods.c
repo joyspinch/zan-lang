@@ -56,12 +56,60 @@ static bool class_ctor_is_live(const work_fn_index_t *ix, const char *cname,
     return false;
 }
 
+static LLVMValueRef interface_candidate_metadata(zan_irgen_t *g, LLVMValueRef value) {
+    unsigned kind = LLVMGetMDKindIDInContext(g->ctx, "zan.interface.candidate", 23);
+    return LLVMIsAInstruction(value) ? LLVMGetMetadata(value, kind) : NULL;
+}
+
+static bool interface_candidate_can_exist(zan_irgen_t *g, LLVMValueRef instruction) {
+    LLVMValueRef metadata = interface_candidate_metadata(g, instruction);
+    if (!metadata || !g->publish_instance_prune || refl_ctor_needs_thunk(g)) return true;
+    if (LLVMGetMDNodeNumOperands(metadata) != 2) return true;
+    LLVMValueRef fields[2];
+    LLVMGetMDNodeOperands(metadata, fields);
+    unsigned class_len = 0, tag_len = 0;
+    const char *class_name = LLVMGetMDString(fields[0], &class_len);
+    const char *tag_name = LLVMGetMDString(fields[1], &tag_len);
+    if (!class_name || !tag_name || !class_len || !tag_len) return true;
+    zan_symbol_t *candidate = NULL;
+    for (int i = 0; i < g->struct_type_count; i++) {
+        zan_symbol_t *sym = g->struct_types[i].sym;
+        if (sym && sym->name.len == class_len &&
+            memcmp(sym->name.str, class_name, class_len) == 0) {
+            candidate = sym;
+            break;
+        }
+    }
+    /* Stack values and external receivers lack ordinary class allocation sites. */
+    if (!candidate || candidate->kind != SYM_CLASS) return true;
+    char vtable_name[384];
+    if (tag_len >= sizeof(vtable_name)) return true;
+    memcpy(vtable_name, tag_name, tag_len);
+    vtable_name[tag_len] = '\0';
+    if (vtable_has_instance_store(LLVMGetNamedGlobal(g->mod, vtable_name), 0)) return true;
+    for (int i = 1; i < g->leak_site_count; i++) {
+        if (!g->site_syms || g->site_syms[i] != candidate) continue;
+        if (!is_user_generic_sym(candidate)) return true;
+        zan_type_t *inst = g->site_inst ? g->site_inst[i] : NULL;
+        if (!inst || !inst->type_arg_count) return true;
+        LLVMValueRef vt = get_vtable_global_inst(g, candidate, inst);
+        size_t len = 0;
+        const char *name = LLVMGetValueName2(vt, &len);
+        if (len == tag_len && memcmp(name, tag_name, len) == 0) return true;
+    }
+    return false;
+}
+
 static bool vtable_has_live_use(LLVMValueRef vtg, const unsigned char *live,
                                 const work_fn_index_t *ix, int depth) {
     if (!vtg || depth > 4) return false;
     for (LLVMUseRef u = LLVMGetFirstUse(vtg); u; u = LLVMGetNextUse(u)) {
         LLVMValueRef user = LLVMGetUser(u);
         if (LLVMIsAInstruction(user)) {
+            /* A dispatch tag comparison observes a possible type; it does not
+             * construct an instance and cannot keep that type's vtable live. */
+            if (LLVMIsAICmpInst(user) && interface_candidate_metadata(ix->g, user))
+                continue;
             LLVMValueRef parent = LLVMGetBasicBlockParent(LLVMGetInstructionParent(user));
             if (!parent) return true;
             int i = work_fn_index_lookup(ix, parent);
@@ -98,7 +146,12 @@ static bool value_has_live_body_use(LLVMValueRef value, const unsigned char *liv
                                   : NULL;
         if (!parent) return true;
         int i = work_fn_index_lookup(ix, parent);
-        if (i < 0 || live[i] == 2) return true;
+        if (i < 0 || live[i] == 2) {
+            if ((LLVMIsACallInst(user) || LLVMIsAInvokeInst(user)) &&
+                !interface_candidate_can_exist(ix->g, user))
+                continue;
+            return true;
+        }
     }
     return false;
 }

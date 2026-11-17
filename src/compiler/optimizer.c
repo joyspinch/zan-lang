@@ -80,18 +80,9 @@ static LLVMValueRef get_arc_operand(LLVMValueRef call) {
 static bool are_same_arc_object(LLVMValueRef op1, LLVMValueRef op2) {
     op1 = strip_pointer_casts(op1);
     op2 = strip_pointer_casts(op2);
-    if (op1 == op2) return true;
-    if (!op1 || !op2) return false;
-    if (LLVMIsAInstruction(op1) && LLVMIsAInstruction(op2)) {
-        if (LLVMGetInstructionOpcode(op1) == LLVMLoad && LLVMGetInstructionOpcode(op2) == LLVMLoad) {
-            LLVMValueRef ptr1 = strip_pointer_casts(LLVMGetOperand(op1, 0));
-            LLVMValueRef ptr2 = strip_pointer_casts(LLVMGetOperand(op2, 0));
-            if (ptr1 == ptr2 && ptr1 != NULL) {
-                return true;
-            }
-        }
-    }
-    return false;
+    /* Distinct loads of one slot can observe different objects after a callback
+     * rewrites it. Only SSA identity proves retain/release cancellation safe. */
+    return op1 && op1 == op2;
 }
 
 static bool is_safe_pure_function(const char *fn_name) {
