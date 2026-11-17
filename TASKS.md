@@ -28,6 +28,7 @@
 
 - [ ] B-ID216 GUI 原生宿主接线与设备验收：OHOS 仓库尚无 ETS/NAPI 宿主调用 `zan_gui_ohos_set_geometry`，候选框绝对屏幕坐标需宿主在 attach/布局/窗口变化时提供；iOS/OHOS 输入代理尚不提供完整文档上下文。以 `gui_ios_input_test.c`、`gui_ohos_native_test.c`、`gui_mac_window_drop_test.m`、`gui_x11_platform_test.c` 为回归入口，补 Apple SDK 构建及真实键盘/候选框、OHOS 权限/跨应用剪贴板、Cocoa Finder 拖入/Retina 混屏、真实 XIM Position 验收；宿主状态机和交叉编译不能代替上述验收，契约见 `packages/Zan.Gui/README.md`。
 - [ ] B-ID217 桌面设备能力的 unsupported/unknown 契约收敛：Capi 已隔离移动 ABI，但 `Hardware.Network.Type` 将 -1 折 None、Permissions 将 -1 折 Denied、DarkMode bool 无法区分未知；Win32Platform 的通知/网络/权限/定位/生物识别仍有模拟成功值（`NotificationSend`、`NetworkType`、`PermissionCheck`、`LocationGet`、`BiometricsAuthenticate`）。先确定可观测能力和不支持返回契约，再替换假成功并补跨平台回归，不能复制模拟值补导出。
+- [ ] B-ID218 GUI 发布体积收口：同一 Form+Panel+Label+Button 示例在 Windows x64 `--publish --no-icon` 下仍为 9,880,576 B，连两个必需 DLL 共 10,791,355 B，真实窗口自动关闭 exit0，单次构建记录输入哈希未变（`build/test-out/gui-shard-fix-e399/final.json`）。继续定位 metadata/site/descriptor 与反射方法表的类型保留闭包；控件全量注册替换沿 B-ID172 既定方向，不另造 Install 梯子。先定动态构造与反射契约，再分批缩根，补固定源码/工具链/输入哈希的 EXE+依赖总量门禁；现有跨阶段输入含并发 GUI 改动，不能把体积差额归为编译器净收益。
 
 ### 批次 3 · 有前置（前置闭了再领）
 

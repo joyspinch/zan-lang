@@ -40,20 +40,6 @@ static int work_fn_index_lookup(const work_fn_index_t *ix, LLVMValueRef key) {
     return -1;
 }
 
-static LLVMValueRef find_owning_global(LLVMValueRef val, int depth) {
-    if (!val || depth > 4) return NULL;
-    if (LLVMIsAGlobalVariable(val)) return val;
-    for (LLVMUseRef u = LLVMGetFirstUse(val); u; u = LLVMGetNextUse(u)) {
-        LLVMValueRef user = LLVMGetUser(u);
-        if (LLVMIsAGlobalVariable(user)) return user;
-        if (LLVMIsAConstant(user)) {
-            LLVMValueRef gv = find_owning_global(user, depth + 1);
-            if (gv) return gv;
-        }
-    }
-    return NULL;
-}
-
 static bool class_ctor_is_live(const work_fn_index_t *ix, const char *cname,
                                const unsigned char *live) {
     if (!ix || !ix->work || !cname) return false;
@@ -88,33 +74,38 @@ static bool vtable_has_live_use(LLVMValueRef vtg, const unsigned char *live,
     return false;
 }
 
-static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
-                              const work_fn_index_t *ix) {
-    for (LLVMUseRef u = LLVMGetFirstUse(fn); u; u = LLVMGetNextUse(u)) {
+static bool value_has_live_body_use(LLVMValueRef value, const unsigned char *live,
+                                    const work_fn_index_t *ix, int depth) {
+    if (depth > 32) return true;
+    for (LLVMUseRef u = LLVMGetFirstUse(value); u; u = LLVMGetNextUse(u)) {
         LLVMValueRef user = LLVMGetUser(u);
+        if (LLVMIsAGlobalVariable(user)) {
+            const char *name = LLVMGetValueName(user);
+            if (!name || strncmp(name, "__zan_vtable_", 13) != 0) return true;
+            if (class_ctor_is_live(ix, name + 13, live) || vtable_has_live_use(user, live, ix, 0))
+                return true;
+            continue;
+        }
         if (LLVMIsAConstantExpr(user) || LLVMIsAConstantArray(user) ||
             LLVMIsAConstantStruct(user)) {
-            LLVMValueRef gv = find_owning_global(user, 0);
-            if (gv && LLVMIsAGlobalVariable(gv)) {
-                const char *gname = LLVMGetValueName(gv);
-                if (gname && strncmp(gname, "__zan_vtable_", 13) == 0) {
-                    const char *cname = gname + 13;
-                    if (class_ctor_is_live(ix, cname, live) ||
-                        vtable_has_live_use(gv, live, ix, 0)) {
-                        return true;
-                    }
-                    continue;
-                }
-            }
-            return true;
+            /* LLVM uniques constants: one initializer can belong to several
+             * vtables. An unused first owner must not hide a live sibling. */
+            if (value_has_live_body_use(user, live, ix, depth + 1)) return true;
+            continue;
         }
         LLVMValueRef parent = LLVMIsAInstruction(user)
-            ? LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) : NULL;
+                                  ? LLVMGetBasicBlockParent(LLVMGetInstructionParent(user))
+                                  : NULL;
         if (!parent) return true;
         int i = work_fn_index_lookup(ix, parent);
         if (i < 0 || live[i] == 2) return true;
     }
     return false;
+}
+
+static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
+                              const work_fn_index_t *ix) {
+    return value_has_live_body_use(fn, live, ix, 0);
 }
 
 static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,

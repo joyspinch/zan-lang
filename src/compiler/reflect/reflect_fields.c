@@ -496,15 +496,16 @@ static bool refl_is_framework_hook_name(const char *s, size_t n) {
 
 /* 设计稿事件处理器与框架钩子只经 Invoke 按名调用：publish 不保留的话 HasMethod
  * 对账通过、点击/回调却静默不执行。 */
-bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n) {
-    if (refl_is_framework_hook_name(s, n))
-        return true;
+bool refl_is_exact_html_handler_name(zan_irgen_t *g, const char *s, size_t n) {
     for (int i = 0; i < g->html_handler_count; i++) {
         const char *h = g->html_handlers[i];
-        if (strlen(h) == n && memcmp(h, s, n) == 0)
-            return true;
+        if (strlen(h) == n && memcmp(h, s, n) == 0) return true;
     }
     return false;
+}
+
+bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n) {
+    return refl_is_framework_hook_name(s, n) || refl_is_exact_html_handler_name(g, s, n);
 }
 
 static bool refl_is_html_handler(zan_irgen_t *g, zan_symbol_t *m) {

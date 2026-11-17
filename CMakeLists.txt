@@ -3389,6 +3389,12 @@ foreach(_src ${_conf_srcs})
     # stubbed and dropped from the link line instead of failing the link.
     set(_extra_args
       "--publish;--link-mode;static;--driver-dir;${CMAKE_SOURCE_DIR}/tests/conformance/empty_driver_dir")
+  elseif(_name MATCHES "^publish_(dead_hook|shared_vtable)$")
+    set(_extra_args "--publish;--no-check-leaks;--no-arc-guard")
+  elseif(_name STREQUAL "reflect_publish_hook")
+    # B-ID160/S1: On* lifecycle hook thunks are part of the publish contract;
+    # pin this case to --publish so the hook baseline is verified for real.
+    set(_extra_args "--publish;--no-check-leaks;--no-arc-guard")
   elseif(_name STREQUAL "publish_tls_bundle")
     # A --publish build of a Tls program verifies that the published exe starts
     # and hands back a usable TlsContext under native TLS without external dependencies.
@@ -7596,6 +7602,31 @@ add_test(NAME lsp_integration_utf16
   COMMAND lsp_integration_test $<TARGET_FILE:zan-lsp>)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+  if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    find_program(ZAN_SHARD_GC_CLANG NAMES clang
+      HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+    find_program(ZAN_SHARD_GC_NM NAMES llvm-nm
+      HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+    if(ZAN_SHARD_GC_CLANG AND ZAN_SHARD_GC_NM)
+      get_filename_component(_shard_gc_tools "${ZAN_SHARD_GC_NM}" DIRECTORY)
+      add_test(NAME conformance_shard_function_sections
+        COMMAND ${Python3_EXECUTABLE} -I -B -X utf8
+          ${CMAKE_SOURCE_DIR}/tests/test_shard_function_sections.py
+          --zanc $<TARGET_FILE:zanc> --cc ${ZAN_SHARD_GC_CLANG}
+          --llvm-tools ${_shard_gc_tools}
+          --out ${CMAKE_BINARY_DIR}/cases/conf_shard_function_sections${_exe_ext}
+          --log ${CMAKE_BINARY_DIR}/test-out/shard-function-sections.log)
+      set_tests_properties(conformance_shard_function_sections PROPERTIES
+        TIMEOUT 180 LABELS "compiler;publish;size")
+    endif()
+  endif()
+  add_test(NAME publish_dead_hook_ir
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/publish_dead_hook.zan
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_publish_dead_hook_ir.cmake)
+  set_tests_properties(publish_dead_hook_ir PROPERTIES TIMEOUT 120)
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}

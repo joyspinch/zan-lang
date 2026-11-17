@@ -396,6 +396,7 @@ static bool sh_emit_one_file(sh_state_t *st, int shard_idx, const char *frag_pat
         LLVMContextDispose(ctx);
         return false;
     }
+    zan_irgen_prepare_object_sections(g, mod);
     char *eerr = NULL;
     SH_TRACE("shard emit: verify ok -> codegen\n");
     if (LLVMTargetMachineEmitToFile(tm, mod, path, LLVMObjectFile, &eerr)) {

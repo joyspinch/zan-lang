@@ -1,3 +1,20 @@
+static bool reflected_method_has_derived_owner(zan_irgen_t *g, zan_symbol_t *owner,
+                                               zan_ast_node_t *member) {
+    if (!g->refl_used || !owner || member->kind != AST_METHOD_DECL ||
+        (member->method_decl.modifiers & MOD_STATIC))
+        return false;
+    /* Method tables include inherited instance hooks. Their declaring type need
+     * not have its own metadata or allocation site before late thunk emission. */
+    for (int m = 0; m < g->refl_mtab_count; m++) {
+        zan_symbol_t *sym = g->refl_mtabs[m].sym;
+        zan_type_t *base = sym && sym->type ? sym->type->base_type : NULL;
+        for (int depth = 0; base && base->sym && depth < 32; base = base->base_type, depth++) {
+            if (base->sym == owner) return true;
+        }
+    }
+    return false;
+}
+
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return ZAN_ERROR;
     g_di_emit_ctx = g;
@@ -226,6 +243,8 @@ done:
                         }
                     }
                 }
+            if (!is_refl_root)
+                is_refl_root = reflected_method_has_derived_owner(g, work[w].type_sym, member);
             /* Body roots share the callable predicates with thunk generation.
              * Constructor query metadata alone must not retain instance bodies;
              * cctors keep the existing initialization policy. */
@@ -241,7 +260,7 @@ done:
                           member->kind == AST_CONSTRUCTOR_DECL)) ||
                         is_refl_root ||
                         (member->kind == AST_METHOD_DECL &&
-                         refl_is_html_handler_name(g,
+                         refl_is_exact_html_handler_name(g,
                              (const char *)member->method_decl.name.str,
                              (size_t)member->method_decl.name.len));
             if (!root)
@@ -768,6 +787,76 @@ zan_status_t zan_irgen_create_target_machine(zan_irgen_t *g, LLVMTargetMachineRe
     return zan_bind_target_layout(g, out_tm);
 }
 
+void zan_irgen_prepare_object_sections(zan_irgen_t *g, LLVMModuleRef mod) {
+    /* Main and shard objects need the same GC granularity. COFF '$' suffixes
+     * merge into ordinary output sections. Preserve special runtime sections,
+     * TLS and weak/ODR groups when making strong definitions discardable. */
+    bool need_fn_sec = (g->obfuscate_strings || g->publish_mode) && !g->target_is_macos &&
+                       !g->target_is_ios && !g->target_is_wasm;
+    bool coff_publish_data = g->publish_mode && g->target_is_windows;
+    bool need_gv_sec = (g->obfuscate_strings || coff_publish_data) && !g->target_is_macos &&
+                       !g->target_is_ios && !g->target_is_wasm;
+    if (need_fn_sec) {
+        for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
+            if (LLVMIsDeclaration(fn) || LLVMGetSection(fn)) continue;
+            size_t nlen = 0;
+            const char *nm = LLVMGetValueName2(fn, &nlen);
+            if (!nm || !nlen || nlen > 200) continue;
+            LLVMLinkage linkage = LLVMGetLinkage(fn);
+            if (g->target_is_windows && !LLVMGetComdat(fn) &&
+                (linkage == LLVMExternalLinkage || linkage == LLVMInternalLinkage ||
+                 linkage == LLVMPrivateLinkage)) {
+                /* COFF GC needs COMDAT and '$' names for MinGW unwind sections.
+                 * NODUPLICATES preserves strong-definition errors. Keep weak
+                 * fallbacks ungrouped so the native runtime can override them.
+                 * Explicit COFF sections need internal rather than private keys. */
+                if (LLVMGetLinkage(fn) == LLVMPrivateLinkage)
+                    LLVMSetLinkage(fn, LLVMInternalLinkage);
+                LLVMComdatRef group = LLVMGetOrInsertComdat(mod, nm);
+                LLVMSetComdatSelectionKind(group, LLVMNoDeduplicateComdatSelectionKind);
+                LLVMSetComdat(fn, group);
+            }
+            char sec[256];
+            snprintf(sec, sizeof(sec), ".text%s%s", g->target_is_windows ? "$" : ".", nm);
+            LLVMSetSection(fn, sec);
+        }
+    }
+    if (need_gv_sec) {
+        int coff_obj = g->target_triple[0] ? strstr(g->target_triple, "windows-gnu") != NULL :
+#ifdef _WIN32
+                                           1;
+#else
+                                           0;
+#endif
+        const char *dsep = coff_obj ? "$" : ".";
+        for (LLVMValueRef gv = LLVMGetFirstGlobal(mod); gv; gv = LLVMGetNextGlobal(gv)) {
+            if (LLVMGetSection(gv)) continue;
+            if (!LLVMGetInitializer(gv)) continue;
+            if (LLVMIsThreadLocal(gv)) continue;
+            size_t nlen = 0;
+            const char *nm = LLVMGetValueName2(gv, &nlen);
+            if (!nm || !nlen || nlen > 200) continue;
+            if (strncmp(nm, "llvm.", 5) == 0) continue;
+            if (strncmp(nm, "rterr", 5) == 0) continue;
+            if (coff_publish_data) {
+                LLVMLinkage linkage = LLVMGetLinkage(gv);
+                if (LLVMGetComdat(gv) ||
+                    (linkage != LLVMExternalLinkage && linkage != LLVMInternalLinkage &&
+                     linkage != LLVMPrivateLinkage))
+                    continue;
+                if (linkage == LLVMPrivateLinkage) LLVMSetLinkage(gv, LLVMInternalLinkage);
+                LLVMComdatRef group = LLVMGetOrInsertComdat(mod, nm);
+                LLVMSetComdatSelectionKind(group, LLVMNoDeduplicateComdatSelectionKind);
+                LLVMSetComdat(gv, group);
+            }
+            char sec[260];
+            snprintf(sec, sizeof(sec), "%s%s%s", LLVMIsGlobalConstant(gv) ? ".rdata" : ".data",
+                     dsep, nm);
+            LLVMSetSection(gv, sec);
+        }
+    }
+}
+
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     abi_pending_report(g);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
@@ -921,59 +1010,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     }
     zan_irgen_init_llvm_targets();
 
-    /* publish 模式需要按函数拆独立 section，否则链接器 --gc-sections
-     * 无法丢弃未引用函数（section 粒度太粗，.text 里任何一个函数被引用
-     * 就把整个 .text 留住）。
-     * 全局数据不拆——Windows COFF 下成千上万个 .rdata$xxx section 会让
-     * REL32 relocation 溢出；全局数据靠 COMDAT/ICF 合并即可。
-     * 字符串混淆模式保留旧行为（全局数据也要拆）因为混淆需要精确控制。
-     * macOS/iOS/WASM 暂跳过——macOS 链接器默认按 atom 粒度做 dead_strip，
-     * iOS 有 App Store 工具链，WASM 靠 wasm-ld 自带 GC。 */
-    bool need_fn_sec = (g->obfuscate_strings || g->publish_mode)
-                       && !g->target_is_macos && !g->target_is_ios
-                       && !g->target_is_wasm;
-    bool need_gv_sec = g->obfuscate_strings
-                       && !g->target_is_macos && !g->target_is_ios
-                       && !g->target_is_wasm;
-    if (need_fn_sec) {
-        for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
-             fn = LLVMGetNextFunction(fn)) {
-            if (LLVMIsDeclaration(fn) || LLVMGetSection(fn)) continue;
-            size_t nlen = 0;
-            const char *nm = LLVMGetValueName2(fn, &nlen);
-            if (!nm || !nlen || nlen > 200) continue;
-            char sec[256];
-            snprintf(sec, sizeof(sec), ".text.%s", nm);
-            LLVMSetSection(fn, sec);
-        }
-    }
-    if (need_gv_sec) {
-        int coff_obj = g->target_triple[0]
-                           ? strstr(g->target_triple, "windows-gnu") != NULL
-                           :
-#ifdef _WIN32
-                           1;
-#else
-                           0;
-#endif
-        const char *dsep = coff_obj ? "$" : ".";
-        for (LLVMValueRef gv = LLVMGetFirstGlobal(g->mod); gv;
-             gv = LLVMGetNextGlobal(gv)) {
-            if (LLVMGetSection(gv)) continue;
-            if (!LLVMGetInitializer(gv)) continue;
-            if (LLVMIsThreadLocal(gv)) continue;
-            size_t nlen = 0;
-            const char *nm = LLVMGetValueName2(gv, &nlen);
-            if (!nm || !nlen || nlen > 200) continue;
-            if (strncmp(nm, "llvm.", 5) == 0) continue;
-            if (strncmp(nm, "rterr", 5) == 0) continue;
-            char sec[260];
-            snprintf(sec, sizeof(sec), "%s%s%s",
-                     LLVMIsGlobalConstant(gv) ? ".rdata" : ".data",
-                     dsep, nm);
-            LLVMSetSection(gv, sec);
-        }
-    }
+    zan_irgen_prepare_object_sections(g, g->mod);
 
     LLVMTargetMachineRef tm;
     if (zan_bind_target_layout(g, &tm) != ZAN_OK) return ZAN_ERROR;
