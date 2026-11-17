@@ -26,6 +26,7 @@
 /* zan */
 #include "zan_default_icon.h"
 #include "zan_version.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

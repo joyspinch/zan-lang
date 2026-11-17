@@ -1,10 +1,12 @@
 #include "irgen_internal.h"
 
 #include <llvm-c/IRReader.h>
+#include <errno.h>
 #include <limits.h>
 #include <time.h>
 #ifndef _WIN32
 #include <sys/types.h>
+#include <sys/stat.h>
 #endif
 #ifdef _WIN32
 #include <windows.h>

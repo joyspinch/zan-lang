@@ -1,5 +1,7 @@
 #include "irgen_internal.h"
 
+#include <limits.h>
+
 #define ZAN_REFL_FULLNAME_OFF (-112) /* B-ID107：头部 i8ptr，尾部倒数 OFF 不变 */
 #define ZAN_REFL_ATTRS_OFF   (-104)
 #define ZAN_REFL_TABLE_OFF   (-96)

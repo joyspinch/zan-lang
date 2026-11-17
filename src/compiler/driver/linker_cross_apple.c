@@ -623,6 +623,12 @@
         for (int ei = 0; ei < extra_link_lib_count; ei++) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " -l%s", extra_link_libs[ei]);
         }
+        /* Native Zan EH uses the host C++ ABI; keep its runtime after all inputs. */
+#ifdef __APPLE__
+        cmd_appendf(link_cmd, sizeof(link_cmd), " -lc++");
+#else
+        cmd_appendf(link_cmd, sizeof(link_cmd), " -lstdc++");
+#endif
         {
             cmd_appendf(link_cmd, sizeof(link_cmd), " -lm");
         }

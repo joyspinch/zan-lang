@@ -274,7 +274,9 @@ static bool sh_build_const_blob(sh_state_t *st) {
             }
             free(order);
         }
-        if (total <= 0 || total > (long long)1024 * 1024 * 1024) {
+        /* LLVMConstStringInContext takes an unsigned length (LLVM >= 15). */
+        if (total <= 0 || total > (long long)1024 * 1024 * 1024 ||
+            (unsigned long long)total > UINT_MAX) {
             sh_fail(st, "const blob size out of range (%lld)", total);
             ok = false;
         }
@@ -290,8 +292,8 @@ static bool sh_build_const_blob(sh_state_t *st) {
                  (int)set.n, total);
         for (size_t i = 0; i < set.n; i++)
             memcpy(buf + set.ents[i].offset, set.ents[i].img, set.ents[i].len);
-        cinit = LLVMConstStringInContext2(g->ctx, (const char *)buf,
-                                          (size_t)total, true);
+        cinit = LLVMConstStringInContext(g->ctx, (const char *)buf,
+                                         (unsigned)total, true);
         if (!cinit) { sh_fail(st, "out of memory"); ok = false; }
     }
     if (ok) {

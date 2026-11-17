@@ -172,7 +172,7 @@ int64_t __zan_dict_hash(const void *key, int64_t is_str) {
 
 #else /* !ZAN_BARE_METAL：hosted 熵盐版 */
 
-#include "rt_siphash.h"
+#include "../rt_siphash.h"
 #if defined(_WIN32)
 #include <time.h>
 #endif
