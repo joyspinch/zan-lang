@@ -286,7 +286,7 @@ GUI 验证定式（截图还原/像素复核/实机操作）逐坑：见 [refere
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
 - 完整心智模型、皮肤与样式解析:本技能各节、
-  `references/html-window.md` 的取色与取字统一封装。
+  `references/html-window-designer.md` 的取色与取字统一封装。
 - 守门测试:`policy_no_widget_drawing`(examples 自绘)、三条颜色/字号预算
   棘轮;新组件必带 conformance 测试。
 - 构建回归:`scripts\build_gallery.ps1` + `scripts\build_ide.ps1` 必须过;

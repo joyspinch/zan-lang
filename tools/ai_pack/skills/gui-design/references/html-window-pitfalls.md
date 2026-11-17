@@ -40,7 +40,7 @@ Zan.Game 的世界渲染属于游戏引擎，按其世界/视口渲染契约执�
   `Html.Build.zan`、控件注册与属性协议为准，不凭浏览器经验猜。
 - 五件声明原语：`data-on-*` 事件、`data-arg` 字面参数、`data-bind`
   模型路径、`data-if` 路径真值、`<template data-for>` 列表。
-  `@click` 等语法糖见 `references/html-window.md`。
+  `@click` 等语法糖见 `references/html-window-binding.md`。
 - `Form.Show` 默认把窗口实例作为模型；已有宿主里的页面需
   `ModelBinder.SetRoot(ui, model)`、`Wire()`、
   `ModelHosts.Register(app, binder)`，撤页时 Unregister。

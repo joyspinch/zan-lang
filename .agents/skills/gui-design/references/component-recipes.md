@@ -14,7 +14,44 @@
 - **拖动在路由事件期提交，绘制只读状态**：主键按下认领 `CapturePointer(control, true)`，Move 与主键 Up 使用事件坐标；Up 先提交最终位置，再结束并发通知，次键释放不能结束主拖动。Cancel 只清状态；Change 回调可能关闭、禁用或替换输入根，回调后须重验捕获和有效状态再发 DragEnd。原因：绘制期轮询漏掉重绘前输入及最后一次抬起坐标；Slider/SplitPanel 与调色板严格回归已覆盖这些边界。
 - **普通按压与拖动捕获分别认领触摸手势**：一参 CapturePointer 保留按压语义，触摸越过防抖阈值取消按压并清旧 pressed；拖动显式用二参 true 后继续接收 Move/Up，两种情况都禁止合成 Click。原因：普通 Button 也会捕获，不能以“有捕获”判定拖动；只清捕获又会留下 FocusManager 的旧 pressed。
 - **内联 CSS padding 走样式盒，不转成 Pad()**：ApplyInline 不能把 padding 简写取首数写成显式 Pad，否则四边/单位失真，替换或清空样式仍残留 padSet 优先级。实际布局读取解析后的四边值；手工 Pad/Padding 仍保留显式优先级。判定器：`css_dpi_test` 在100%–300% DPI比较首行坐标/宽度与替换样式后的几何；ScrollColumn 回归同时覆盖四边与显式 Pad。
-- **借用输入根按结构组合**：HUD/Layer 等适配器共用 InputRootAdapter，以既有 content/slot 链保留被包装的根、弱持宿主与业务 owner，绑定判环只查结构链，不能用受模态限制的 ContainsInputControl；高优先级 Layer 始终在 HUD 外层，重复 Bind 保位，Detach 跨不同适配器拼接且只释放自有输入。原因：各自维护链会产生 HUD→Layer→HUD 强环，后加入 HUD 还可能绕过模态。判定器：`input_root_composition_test` 真实 RenderIn/Open/Render、两种绑定顺序、跨 App、摘除保留其他层焦点/捕获及弱寿命，39 项 strict 通过。
+- **借用输入根按结构组合**：HUD/Layer 等适配器共用 InputRootAdapter，以既有 content/slot 链保留被包装的根、弱持宿主与业务 owner，绑定判环只查结构链，不能用受模态限制的 ContainsInputControl；高优先级 Layer 始终在 HUD 外层，重复 Bind 保位，Detach 跨不同适配器拼接且只释放自有输入。原因：各自维护链会产生 HUD→Layer→HUD 强环，后加入 HUD 还可能绕过模态。判定器：`input_root_composition_test` 覆盖真实 HUD 挂载与 Layer 打开、两种绑定顺序、跨 App、摘除保留其他层焦点/捕获及弱寿命。
+- **显隐与尺寸通知只走共享准备期**：Control 内部的 `PrepareLayoutEvents`
+  统一派发 Hide/Show/Resize，首次可见准备只建立基线，不发初始 Show/Resize，
+  RenderTree 不重放。借用输入根覆写 `LayoutChildren`、`OwnsLayoutChild`、
+  `LayoutChildVisible`、`LayoutRevision` 描述现有树，不重挂 parent、不另走通知遍历。
+  通知前提交状态，回调后重验宿主、根与准备代次、事件身份及归属；retire/rebind
+  不能让旧遍历继续处理新会话。原因：Paint 派发使重绘重放通知，回调换根或重绑又会
+  把旧快照带入新树。验证覆盖首次准备、隐藏/重显、尺寸变化、重复 Paint、回调重入、
+  跨 App 与实际 weak 释放，不以一次绘制成功代替生命周期验收。
+- **准备回调失效须传到参与者外层**：宿主返回本轮完成证明，失败后调用
+  `App.InvalidatePreparation()` 推进现有票据，停止外层旧尾段；不能只在局部 return，
+  否则后续准备可能把回调设置的新根覆盖。合法准备安装输入根仍被允许，不可一律取消。
+  正常 AutoClose 仅接受关闭状态和一次预期会话代次变化；回调重开、换根、推进事件或
+  额外续代次仍须失败。Layer 默认正式与生命周期严格正式已覆盖正常关闭及回调失效，
+  合法根安装另有独立正式回归，不能用严格旧 exe 冒充默认参数通过。
+- **Layer 窗口与消息队列由 App 统一消费**：Open/消息入队接入既有准备和输入树，
+  App 在模态层之前绘制已准备的普通窗口与队列；消费者不再调用 RenderStack 或
+  取得 QueueHost 手动布局绘制，避免双绘与第二套所有权。借用 LayoutChildren 不等于
+  真实绘制子树；页脚替换必须同步实际采用的 child 身份，最小化命中按当前任务条几何。
+  IDE 已重编并通过 retained-input；这不替代 IDE 完整布局或实机验收。
+- **聚合命中保留完整排除列表，测量重入按 App 分域**：HUD 与 fallback 的每级
+  HitTest 都透传同一 `excludedSubtrees` 列表，不能只保留首项。测量回调转移同一控件
+  到另一 App 时允许新宿主重测，拒绝回到仍在活动测量栈中的 App；finally 释放临时
+  测量记录。原因：截短列表会误命中已排除子树，单一 measuring 标志会吞掉合法迁移，
+  遗留宿主记录则会保活 App。现有回归覆盖多子树排除、跨 App 重测与弱寿命；
+  活跃祖先 App 的循环回访拦截仍需独立用例，不能把单次跨 App 迁移当成循环验证。
+- **派生视觉类用纯 `EffectiveClass()` 投影**：基类默认返回作者 Class，Input 将
+  Size、净化后的 FieldStatus 与 Round 投影成有效类，保留 Class/GetProp("class")
+  原文。普通样式、缓存、Selector 上下文与 :has、parts、输入几何均用同一投影；
+  Paint 不更新 liveApp 或 lastKeyNamedSeq。原因：临时改 Class 即使恢复，也会让
+  选择器回调看到伪造声明，测量、命中和绘制还可能分裂。验证改属性后重绘前的样式与
+  光标几何、部件和组合选择器，以及重复 Paint 不写宿主/序号/作者类。
+- **分页绑定在准备期维护子树**：Pagination.Page 使用 `Binding<int>`，默认绑定
+  属性是 page；data/value 仍是页码属性别名，不能按旧 Signal 对象示例传入。
+  覆写 `SyncBinding()` 检查当前页与重建条件，在测量前更新真实按钮树，OnPaint
+  不同步绑定、不重建。原因：绘制期才建树会让首绘前和连续输入使用过时页码按钮。
+  验证外部页码变化后首绘前即可点击、绑定写回与 Change 一次、重复 Paint 不读绑定
+  且保持子树身份；工厂属性等价另用真实 ControlFactory 验证。
 - **离屏滚轮重放保留原事件身份**：旧 CaptureWheel 两帧认领只恢复事件载荷，不能再次派发 routed Wheel，也不能先增后退事件序号；否则通知重复，且下一真实输入会撞上去重缓存。已路由消费的滚轮须跨 BeginFrame 保持已消费，不能被旧绘制路径重领。判定器：`scroll_routed_input_test` 的真实 EndOffscreenFrame→重放→下一指针/滚轮，以及 `scrollcolumn_input_lifecycle_test` 的混合消费。
 - **旧行数 API 只投影共享像素 offset**：RichText 用真实行高前缀定位、bottomAnchor=0 精确贴底；CodeBlock 的 UseScroll 保留行数与信号版本，内部投影不能吃掉半行像素余量。OnScrollChanged 在真实提交后统一通知、同值不通知；最终 Up 先退休旧捕获再通知，回调换根/新捕获不被旧动作覆盖。固定 header/copy 是真实子树，正文 ScrollViewport 排除固定区域，Paint 不处理输入。`richtext_codeblock_input_test` 已通过 strict 精确 golden/leak/guard，覆盖输入返回前投影、链接、复制一次、最终 Up、触控取消、DPI、重入与 weak；原 `richtext_test` 旧 golden 同轮严格通过。
 - **布局诊断不暴露可变缓存**：只读属性返回 List 仍可 Clear/Add；RichText.LineAt(index) 返回独立行、段与链接快照，越界/未布局为 null，修改快照不能污染实际布局。资源占位前须收口文本段宽，资源 advance 也计入行宽；探针实际复现宽度为零后才修根因，未复现的行高疑点不顺带改。
@@ -86,7 +123,7 @@
   RenderTree 本身不接输入，不另算命中坐标、不重新收养控件。关闭 dock/离页显式
   隐藏，HudLayer.SetVisible(false) 只退休本层输入。2026-11-11 检查器 probe 的滚动、
   hidden 焦点与根稳定属于历史局部结果；后续各消费方的 capture 释放、连续输入和重入
-  按架构文档中的对应版本收据确认，不能外推为完整 IDE、Gallery/tools 或实窗完成。
+  直接对照当前源码与对应回归证据确认，不能外推为完整 IDE、Gallery/tools 或实窗完成。
 
 - **铁律:控件自己负责绘制,使用处只配置**(实例化→配属性→喂数据→摆位置)。
   禁止在使用处用 Canvas 原语重画已有控件——组件修好后示例还在按旧画法显示,
@@ -146,7 +183,7 @@
   空旷错位；完整窗口预览共用 retained tree，选框、拾取、缩放、换父
   使用实际框。禁止另写逐控件布局或外层裁剪遮盖差异；那会丢掉继承、
   容器 chrome 和合法 overflow。视图 zoom 只缩放最终图像，细则与
-  几何/像素/交互验证见 `references/html-window.md` 所见所得专节。
+  几何/像素/交互验证见 `references/html-window-designer.md` 所见所得专节。
 - **设计器画布网格、焦点与容器拖拽鲁棒性**
   (点阵不可见/撤销失效/拖拽组件消失教训):
   1. 点阵网格尺寸按 DPI 缩放（至少 2px），颜色对比度采用 `Style.Fade(t.textSecondary, 85)`，
