@@ -7382,6 +7382,16 @@ add_test(NAME conformance_shard_deep_refl COMMAND ${CMAKE_COMMAND}
   -P ${CMAKE_SOURCE_DIR}/tests/run_arcnet.cmake)
 set_tests_properties(conformance_shard_deep_refl PROPERTIES TIMEOUT 240)
 
+# A named structure field must reference its type, without nesting its definition.
+add_test(NAME conformance_shard_struct_field COMMAND ${CMAKE_COMMAND}
+  -DZANC=$<TARGET_FILE:zanc>
+  -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/shard_struct_field.zan
+  -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/shard_struct_field.out
+  -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_shard_struct_field${_exe_ext}
+  -DWORKDIR=${CMAKE_BINARY_DIR}/test-out/shard-struct-field
+  -P ${CMAKE_SOURCE_DIR}/tests/run_shard_struct_field.cmake)
+set_tests_properties(conformance_shard_struct_field PROPERTIES TIMEOUT 180)
+
 # ---- --embed deflate compression ----
 # A 1200-byte repetitive asset bakes raw-deflate (embedres.c embed_maybe_compress)
 # with the len sign bit set and decodes lazily on first read; a 96-byte one

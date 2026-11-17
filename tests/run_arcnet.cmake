@@ -27,6 +27,12 @@ execute_process(
   RESULT_VARIABLE compile_rc
   OUTPUT_VARIABLE compile_out
   ERROR_VARIABLE  compile_err)
+if(DEFINED COMPILE_OUT_FILE AND NOT COMPILE_OUT_FILE STREQUAL "")
+  file(WRITE "${COMPILE_OUT_FILE}" "${compile_out}")
+endif()
+if(DEFINED COMPILE_ERR_FILE AND NOT COMPILE_ERR_FILE STREQUAL "")
+  file(WRITE "${COMPILE_ERR_FILE}" "${compile_err}")
+endif()
 if(NOT compile_rc EQUAL 0)
   message(FATAL_ERROR "compile failed (rc=${compile_rc})\n${compile_out}${compile_err}")
 endif()
