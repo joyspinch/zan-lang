@@ -7516,6 +7516,15 @@ add_test(NAME lsp_integration_utf16
   COMMAND lsp_integration_test $<TARGET_FILE:zan-lsp>)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+  add_test(NAME frame_log_parser
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_frame_log_parser.py
+      --output ${CMAKE_BINARY_DIR}/test-out/frame-log-parser)
+  set_tests_properties(frame_log_parser PROPERTIES TIMEOUT 60 LABELS "gui;perf;parser")
+  add_test(NAME uidriver_results
+    COMMAND ${CMAKE_COMMAND}
+      -DBINARY_DIR=${CMAKE_BINARY_DIR}/test-out/uidriver-results
+      -P ${CMAKE_SOURCE_DIR}/tests/cmake/UiDriverResultsTest.cmake)
+  set_tests_properties(uidriver_results PROPERTIES TIMEOUT 30)
   add_test(NAME selfhost_ir_fingerprint_protocol
     COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/test_normalize_ir.py -v)
   set_tests_properties(selfhost_ir_fingerprint_protocol PROPERTIES TIMEOUT 30)
