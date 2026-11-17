@@ -23,6 +23,12 @@
 #         -DSYSLIBS=<libs> -DCASES=<cases.txt> -DGAPS=<gaps.txt> \
 #         [-DREJECTS=<reject_cases.txt> -DREJECT_DIR=<dir>] \
 #         [-DWORKDIR=<dir>] [-DJOBS=<n>] -P run_selfhost_diff.cmake
+# Focused gate (no compiler/runtime rebuild, no known-gap exemptions):
+#   -DEXISTING_GEN1=ON -DFOCUS=<manifest> -DLOG_DIR=<logs>
+#   [-DFOCUS_CASES=<exact names>] [-DLLVM_AS=<llvm-as>] [-DSTDLIB_STAMP=<stamp>]
+# Only ZANC/GEN1/OUTDIR/CASE_DIR/REJECT_DIR/CLANG/RTOBJS and the focus inputs
+# are needed in this mode. A positive must match its golden and exit 0 on both
+# compilers; a negative pins both diagnostics and their count.
 #
 # The per-case loop (emit -> link -> run -> compare) runs on a Python thread
 # pool (scripts/run_diff_parallel.py) -- 230 independent clang links were the
@@ -31,21 +37,39 @@
 
 cmake_policy(SET CMP0012 NEW)
 
-if(NOT ZANC OR NOT SELFHOST_DIR OR NOT GEN1 OR NOT OUTDIR OR NOT CASES)
-  message(FATAL_ERROR "run_selfhost_diff.cmake: ZANC, SELFHOST_DIR, GEN1, OUTDIR and CASES are required")
+if(NOT ZANC OR NOT GEN1 OR NOT OUTDIR)
+  message(FATAL_ERROR "run_selfhost_diff.cmake: ZANC, GEN1 and OUTDIR are required")
+endif()
+if(FOCUS)
+  if(NOT EXISTING_GEN1 OR NOT LOG_DIR OR NOT CLANG OR NOT RTOBJS)
+    message(FATAL_ERROR "run_selfhost_diff.cmake: FOCUS requires EXISTING_GEN1=ON, LOG_DIR, CLANG and RTOBJS")
+  endif()
+  if(NOT EXISTS "${FOCUS}")
+    message(FATAL_ERROR "run_selfhost_diff.cmake: focus manifest '${FOCUS}' is missing")
+  endif()
+elseif(NOT SELFHOST_DIR OR NOT CASES)
+  message(FATAL_ERROR "run_selfhost_diff.cmake: SELFHOST_DIR and CASES are required for the full gate")
 endif()
 
 # A -D value that looks like a *relative* path loses its extension on some
 # CMake command lines (the ctest registration always passes absolute paths).
 # Fail with a clear message instead of the cryptic file(STRINGS) error.
-if(NOT EXISTS ${CASES})
+if(NOT FOCUS AND NOT EXISTS "${CASES}")
   message(FATAL_ERROR "run_selfhost_diff.cmake: the case list '${CASES}' does not exist (pass an absolute path)")
 endif()
 
-if(SELFHOST_SOURCES)
-  set(_srcs ${SELFHOST_SOURCES})
+if(NOT EXISTING_GEN1)
+  if(SELFHOST_SOURCES)
+    set(_srcs ${SELFHOST_SOURCES})
+  else()
+    message(FATAL_ERROR "run_selfhost_diff.cmake: SELFHOST_SOURCES is required (scripts/selfhost_sources.txt)")
+  endif()
 else()
-  message(FATAL_ERROR "run_selfhost_diff.cmake: SELFHOST_SOURCES is required (scripts/selfhost_sources.txt)")
+  foreach(_input ${ZANC} ${GEN1} ${CLANG} ${RTOBJS})
+    if(NOT EXISTS "${_input}")
+      message(FATAL_ERROR "run_selfhost_diff.cmake: missing existing input '${_input}'; build it before running the gate")
+    endif()
+  endforeach()
 endif()
 
 # The program runs from the repo root so a case can read repo-relative files.
@@ -63,16 +87,18 @@ if(GAPS AND NOT EXISTS ${GAPS})
   message(FATAL_ERROR "run_selfhost_diff.cmake: the known-gaps file '${GAPS}' does not exist (pass an absolute path)")
 endif()
 
-# ---- build gen1 once -------------------------------------------------------
-list(GET _srcs 0 _first)
-list(REMOVE_AT _srcs 0)
-execute_process(
-  COMMAND ${ZANC} ${_first} ${_srcs} --auto-stdlib -O0 -o ${GEN1}
-  RESULT_VARIABLE build_rc
-  OUTPUT_VARIABLE build_out
-  ERROR_VARIABLE build_err)
-if(NOT build_rc EQUAL 0)
-  message(FATAL_ERROR "gen1 build failed (rc=${build_rc})\n${build_out}${build_err}")
+# ---- build gen1 once (the focused gate consumes existing inputs) ------------
+if(NOT EXISTING_GEN1)
+  list(GET _srcs 0 _first)
+  list(REMOVE_AT _srcs 0)
+  execute_process(
+    COMMAND ${ZANC} ${_first} ${_srcs} --auto-stdlib -O0 -o ${GEN1}
+    RESULT_VARIABLE build_rc
+    OUTPUT_VARIABLE build_out
+    ERROR_VARIABLE build_err)
+  if(NOT build_rc EQUAL 0)
+    message(FATAL_ERROR "gen1 build failed (rc=${build_rc})\n${build_out}${build_err}")
+  endif()
 endif()
 
 # ---- hand the per-case loop to the parallel driver --------------------------
@@ -98,7 +124,13 @@ endif()
 
 set(_drv_args
   --zanc "${ZANC}" --gen1 "${GEN1}" --outdir "${OUTDIR}"
-  --case-dir "${CASE_DIR}" --cases "${CASES}" --workdir "${WORKDIR}")
+  --case-dir "${CASE_DIR}" --workdir "${WORKDIR}")
+if(CASES)
+  list(APPEND _drv_args --cases "${CASES}")
+endif()
+if(FOCUS)
+  list(APPEND _drv_args --reject-dir "${REJECT_DIR}")
+endif()
 if(CLANG)
   list(APPEND _drv_args --clang "${CLANG}")
 endif()
@@ -115,6 +147,18 @@ if(REJECTS)
 endif()
 if(JOBS)
   list(APPEND _drv_args --jobs "${JOBS}")
+endif()
+if(FOCUS)
+  list(APPEND _drv_args --focus "${FOCUS}" --log-dir "${LOG_DIR}")
+  if(FOCUS_CASES)
+    list(APPEND _drv_args --only ${FOCUS_CASES})
+  endif()
+  if(LLVM_AS)
+    list(APPEND _drv_args --llvm-as "${LLVM_AS}")
+  endif()
+  if(STDLIB_STAMP)
+    list(APPEND _drv_args --stdlib-stamp "${STDLIB_STAMP}")
+  endif()
 endif()
 
 execute_process(

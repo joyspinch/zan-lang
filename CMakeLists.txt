@@ -4220,11 +4220,48 @@ add_test(NAME selfhost_gen1
     -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
 set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
 
+# The gen1 twin of diag_method_group_this_return: the self-hosted checker
+# must emit the same W2072 return-escape warning, and --deny-warnings must
+# fail the compilation (the driver reports the warning lines, then refuses).
+# Consumes the gen1 built by the selfhost_gen1 test above; never rebuilds it.
+add_test(NAME selfhost_method_group_this_return
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_this_return.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/selfhost_method_group_this_return${_exe_ext}
+    "-DZANC_ARGS=--auto-stdlib;--deny-warnings"
+    "-DEXPECT_REGEX=\\[W2072\\] returned closure captures 'this' and escapes method scope"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(selfhost_method_group_this_return PROPERTIES TIMEOUT 120)
+
 # A semantic ownership gate needs the LLVM verifier as well as a linker;
 # clang alone can accept malformed textual IR without running the verifier.
 find_program(SELFHOST_LLVM_AS NAMES llvm-as
   HINTS "${LLVM_TOOLS_BINARY_DIR}" "$ENV{MOZBUILD_STATE_PATH}/clang/bin"
         "$ENV{USERPROFILE}/.mozbuild/clang/bin")
+if(SELFHOST_CLANG AND _shd_rt_objs)
+  # An exact manifest whitelist using existing compilers/runtime; never rebuild
+  # gen1 as a side effect of the focused test. FOCUS_CASES can narrow a direct
+  # script invocation further without changing the full differential gate.
+  add_test(NAME selfhost_method_group
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DGEN1=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
+      -DEXISTING_GEN1=ON
+      -DCLANG=${SELFHOST_CLANG}
+      -DLLVM_AS=${SELFHOST_LLVM_AS}
+      -DOUTDIR=${CMAKE_BINARY_DIR}/cases/selfhost_method_group
+      -DLOG_DIR=${CMAKE_BINARY_DIR}/test-out/selfhost-method-group/focused
+      -DCASE_DIR=${CMAKE_SOURCE_DIR}/tests/conformance
+      -DREJECT_DIR=${CMAKE_SOURCE_DIR}/tests/diag
+      -DFOCUS=${CMAKE_SOURCE_DIR}/tests/selfhost/method_group_focus.txt
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DJOBS=1
+      "-DRTOBJS=${_shd_rt_objs}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diff.cmake)
+  set_tests_properties(selfhost_method_group PROPERTIES
+    TIMEOUT 600 LABELS "full" RESOURCE_LOCK selfhost_method_group)
+endif()
 if(SELFHOST_CLANG AND SELFHOST_LLVM_AS)
   add_test(NAME selfhost_exception_ownership
     COMMAND ${CMAKE_COMMAND}
