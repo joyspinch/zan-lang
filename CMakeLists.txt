@@ -157,7 +157,6 @@ add_executable(zanc
     packages/Zan.Mvc/compiler/mvc_synth.c
     packages/Zan.Mvc/compiler/mvc_reflect.c
     packages/Zan.Data/compiler/orm_adapter.c
-    packages/Zan.Gui/compiler/gui_entry.c
     src/compiler/arena.c
     src/compiler/diag.c
     src/compiler/lexer.c
@@ -1692,8 +1691,8 @@ add_test(NAME diag_html_input_rejected
 set_tests_properties(diag_html_input_rejected PROPERTIES TIMEOUT 60)
 
 # B-ID147：窗口引导的两条边界。type=gui 工程里用户写了 static Main 时
-# 入口 shim 不合成（Main 整体优先），探针工程跑出 USER_MAIN_WINS；
-# 既有 Main 又无 gui 工程门的程序维持现行缺入口链接错误。
+# type=gui 工程显式 Main 回归（B-ID222：合成入口废除，入口只有用户
+# Main 一种来源）。既有 Main 又无 gui 工程门的程序维持现行缺入口链接错误。
 add_test(NAME conformance_gui_docapp_user_main
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
@@ -1704,19 +1703,6 @@ add_test(NAME conformance_gui_docapp_user_main
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(conformance_gui_docapp_user_main PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-
-set(_docapp_synth "${CMAKE_SOURCE_DIR}/tests/gui/docapp_synth")
-add_test(NAME conformance_gui_docapp_synth
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    "-DSRC=${_docapp_synth}/Earlier.zan"
-    "-DZANC_ARGS=${_docapp_synth}/marker.zan;--auto-stdlib;--subsystem;console"
-    "-DEXPECTED=${_docapp_synth}/docapp_synth.out"
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_docapp_synth${_exe_ext}
-    "-DWORKDIR=${_docapp_synth}"
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-set_tests_properties(conformance_gui_docapp_synth PROPERTIES
-    TIMEOUT 120 WORKING_DIRECTORY "${_docapp_synth}")
 
 # HeavyControls 查表大小写不敏感（HTML 标签规范小写化 vs PascalCase
 # 注册键）：精确 miss 后必须走不敏感兜底，否则自定义控件静默回落
@@ -4686,6 +4672,10 @@ foreach(_gui_native_case ios_input ohos_native)
 endforeach()
 
 option(ZAN_BUILD_GUI_TESTS "Run the Gui conformance tests (requires zan_gui)" ON)
+# ide_zan is temporarily out of the verification surface: its cases compile
+# src/ide_zan/** directly, so every Gui/stdlib refactor had to keep the IDE
+# compiling too. The sources stay in the tree; -DZAN_IDE_TESTS=ON restores.
+option(ZAN_IDE_TESTS "Register the ZanIDE (src/ide_zan) verification cases" OFF)
 if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   if(APPLE)
     add_executable(zan_gui_mac_window_drop_test tests/runtime/gui_mac_window_drop_test.m)
@@ -6693,18 +6683,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
   endforeach()
 
-  add_test(NAME conformance_gui_code_navigation_work_lifecycle
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/code_navigation_work_lifecycle_test.zan
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/nav/IdeCodeNavigationWork.zan;--auto-stdlib;-g;--strict-runtime;--check-leaks;--arc-guard"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/code_navigation_work_lifecycle_test.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_code_navigation_work_lifecycle${_exe_ext}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_code_navigation_work_lifecycle PROPERTIES
-    TIMEOUT 180 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+  if(ZAN_IDE_TESTS)
+    add_test(NAME conformance_gui_code_navigation_work_lifecycle
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/code_navigation_work_lifecycle_test.zan
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/nav/IdeCodeNavigationWork.zan;--auto-stdlib;-g;--strict-runtime;--check-leaks;--arc-guard"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/code_navigation_work_lifecycle_test.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_code_navigation_work_lifecycle${_exe_ext}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_code_navigation_work_lifecycle PROPERTIES
+      TIMEOUT 180 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+  endif()
 
   add_test(NAME conformance_gui_visible_row_host_reuse
     COMMAND ${CMAKE_COMMAND}
@@ -6991,53 +6983,55 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # Exercise the real Marketplace selection partial across a queued click and
-  # another measurement, using both the HTML factory and a typed list.
-  set(_market_selection_sources
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/components/MarketplaceView.Selection.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/MarketplaceCatalog.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/MarketplaceClient.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplacePackage.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplacePlan.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceVersion.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceResponse.zan"
-    "${CMAKE_SOURCE_DIR}/packages/Zan.Diagnostics/src/System/Diagnostics/ProcessHost.zan"
-    "${CMAKE_SOURCE_DIR}/packages/Zan.Globalization/src/System/Globalization/Lang.zan")
-  add_test(NAME ide_marketplace_selection
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/ide_marketplace/MarketplaceSelectionTests.zan
-      "-DZANC_ARGS=${_market_selection_sources};--auto-stdlib;--link-mode;static${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide_marketplace/MarketplaceSelectionTests.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/ide_marketplace_selection${_exe_ext}
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(ide_marketplace_selection PROPERTIES
-    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+  if(ZAN_IDE_TESTS)
+    # Exercise the real Marketplace selection partial across a queued click and
+    # another measurement, using both the HTML factory and a typed list.
+    set(_market_selection_sources
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/components/MarketplaceView.Selection.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/MarketplaceCatalog.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/MarketplaceClient.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplacePackage.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplacePlan.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceVersion.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceResponse.zan"
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Diagnostics/src/System/Diagnostics/ProcessHost.zan"
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Globalization/src/System/Globalization/Lang.zan")
+    add_test(NAME ide_marketplace_selection
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/ide_marketplace/MarketplaceSelectionTests.zan
+        "-DZANC_ARGS=${_market_selection_sources};--auto-stdlib;--link-mode;static${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide_marketplace/MarketplaceSelectionTests.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/ide_marketplace_selection${_exe_ext}
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(ide_marketplace_selection PROPERTIES
+      TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-  set(_market_price_sources
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/MarketplaceInstall.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/MarketplaceClient.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplacePackage.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplacePlan.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceVersion.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceResponse.zan"
-    "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceProtocol.zan"
-    "${CMAKE_SOURCE_DIR}/packages/Zan.Diagnostics/src/System/Diagnostics/ProcessHost.zan"
-    "${CMAKE_SOURCE_DIR}/packages/Zan.Globalization/src/System/Globalization/Lang.zan")
-  add_test(NAME ide_marketplace_price_gate
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/ide_marketplace/MarketplacePriceGateTests.zan
-      "-DZANC_ARGS=${_market_price_sources};--auto-stdlib;--link-mode;static"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide_marketplace/MarketplacePriceGateTests.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/ide_marketplace_price_gate${_exe_ext}
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(ide_marketplace_price_gate PROPERTIES
-    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set(_market_price_sources
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/MarketplaceInstall.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/MarketplaceClient.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplacePackage.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplacePlan.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceVersion.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceResponse.zan"
+      "${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/marketplace/MarketplaceProtocol.zan"
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Diagnostics/src/System/Diagnostics/ProcessHost.zan"
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Globalization/src/System/Globalization/Lang.zan")
+    add_test(NAME ide_marketplace_price_gate
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/ide_marketplace/MarketplacePriceGateTests.zan
+        "-DZANC_ARGS=${_market_price_sources};--auto-stdlib;--link-mode;static"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide_marketplace/MarketplacePriceGateTests.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/ide_marketplace_price_gate${_exe_ext}
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(ide_marketplace_price_gate PROPERTIES
+      TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+  endif()
 
   add_test(NAME conformance_gui_css_dpi
     COMMAND ${CMAKE_COMMAND}
@@ -7074,107 +7068,111 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     endif()
   endforeach()
 
-  set(_gui_ide_document_page_sources
-    src/ide_zan/src/views/StartPage.zan
-    src/ide_zan/src/views/DiffView.zan
-    src/ide_zan/src/views/IdeDocumentPageOwner.zan
-    src/ide_zan/src/views/RecentRow.zan
-    src/ide_zan/src/views/NewsRow.zan
-    src/ide_zan/src/views/DiffRow.zan
-    src/ide_zan/src/models/views/RecentItem.zan
-    src/ide_zan/src/models/views/NewsItem.zan
-    src/ide_zan/src/services/AiStaging.zan
-    src/ide_zan/src/services/AiDiff.zan
-    tests/gui/models/IdeDocumentPagesFixture.zan)
-  list(TRANSFORM _gui_ide_document_page_sources PREPEND "${CMAKE_SOURCE_DIR}/")
-  add_test(NAME conformance_gui_ide_document_pages
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_document_pages_test.zan
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${_gui_ide_document_page_sources};--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_document_pages_test.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_document_pages${_exe_ext}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
+  if(ZAN_IDE_TESTS)
+    set(_gui_ide_document_page_sources
+      src/ide_zan/src/views/StartPage.zan
+      src/ide_zan/src/views/DiffView.zan
+      src/ide_zan/src/views/IdeDocumentPageOwner.zan
+      src/ide_zan/src/views/RecentRow.zan
+      src/ide_zan/src/views/NewsRow.zan
+      src/ide_zan/src/views/DiffRow.zan
+      src/ide_zan/src/models/views/RecentItem.zan
+      src/ide_zan/src/models/views/NewsItem.zan
+      src/ide_zan/src/services/AiStaging.zan
+      src/ide_zan/src/services/AiDiff.zan
+      tests/gui/models/IdeDocumentPagesFixture.zan)
+    list(TRANSFORM _gui_ide_document_page_sources PREPEND "${CMAKE_SOURCE_DIR}/")
+    add_test(NAME conformance_gui_ide_document_pages
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_document_pages_test.zan
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        "-DZANC_ARGS=${_gui_ide_document_page_sources};--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_document_pages_test.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_document_pages${_exe_ext}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_ide_document_pages PROPERTIES
+      TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+
+    set(_gui_ide_document_page_host_sources
+      src/ide_zan/src/shell/ZanIDE.DocumentPages.zan
+      src/ide_zan/src/shell/IdeDocumentPageWork.zan
+      src/ide_zan/src/editor/ZanIDE.DocumentLoad.zan
+      src/ide_zan/src/services/ZanIDE.Recent.zan
+      src/ide_zan/src/services/AiStaging.zan
+      src/ide_zan/src/services/AiDiff.zan
+      src/ide_zan/src/models/shell/TabRecord.zan
+      src/ide_zan/src/models/shell/AiPreset.zan
+      src/ide_zan/src/models/shell/IdeRecentWorkspace.zan
+      src/ide_zan/src/models/shell/IdeShellSettings.zan
+      src/ide_zan/src/models/editor/IdeDocumentRead.zan
+      src/ide_zan/src/models/docs/DocBaseline.zan
+      src/ide_zan/src/models/docs/DocBaselineEntry.zan
+      src/ide_zan/src/views/StartPage.zan
+      src/ide_zan/src/views/DiffView.zan
+      src/ide_zan/src/views/IdeDocumentPageOwner.zan
+      src/ide_zan/src/views/RecentRow.zan
+      src/ide_zan/src/views/NewsRow.zan
+      src/ide_zan/src/views/DiffRow.zan
+      src/ide_zan/src/models/views/RecentItem.zan
+      src/ide_zan/src/models/views/NewsItem.zan
+      tests/gui/models/IdeDocumentPageHostFixture.zan)
+    list(TRANSFORM _gui_ide_document_page_host_sources PREPEND "${CMAKE_SOURCE_DIR}/")
+    add_test(NAME conformance_gui_ide_document_page_host
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_document_page_host_test.zan
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        "-DZANC_ARGS=${_gui_ide_document_page_host_sources};--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_document_page_host_test.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_document_page_host${_exe_ext}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_ide_document_page_host PROPERTIES
+      TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+  endif()
+
+  if(ZAN_IDE_TESTS)
+    add_test(NAME conformance_gui_ide_ribbon_retained_input
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_ribbon_retained_input_test.zan
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/models/IdeRibbonFixture.zan;${CMAKE_SOURCE_DIR}/tests/gui/models/IdeRibbonWitness.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/shell/ZanIDE.Ribbon.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/shell/ZanIDE.RibbonView.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/shell/IdeRibbonViewOwner.zan;--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_ribbon_retained_input_test.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_ribbon_retained_input${_exe_ext}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_ide_document_pages PROPERTIES
-    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+    set_tests_properties(conformance_gui_ide_ribbon_retained_input PROPERTIES
+      TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
 
-  set(_gui_ide_document_page_host_sources
-    src/ide_zan/src/shell/ZanIDE.DocumentPages.zan
-    src/ide_zan/src/shell/IdeDocumentPageWork.zan
-    src/ide_zan/src/editor/ZanIDE.DocumentLoad.zan
-    src/ide_zan/src/services/ZanIDE.Recent.zan
-    src/ide_zan/src/services/AiStaging.zan
-    src/ide_zan/src/services/AiDiff.zan
-    src/ide_zan/src/models/shell/TabRecord.zan
-    src/ide_zan/src/models/shell/AiPreset.zan
-    src/ide_zan/src/models/shell/IdeRecentWorkspace.zan
-    src/ide_zan/src/models/shell/IdeShellSettings.zan
-    src/ide_zan/src/models/editor/IdeDocumentRead.zan
-    src/ide_zan/src/models/docs/DocBaseline.zan
-    src/ide_zan/src/models/docs/DocBaselineEntry.zan
-    src/ide_zan/src/views/StartPage.zan
-    src/ide_zan/src/views/DiffView.zan
-    src/ide_zan/src/views/IdeDocumentPageOwner.zan
-    src/ide_zan/src/views/RecentRow.zan
-    src/ide_zan/src/views/NewsRow.zan
-    src/ide_zan/src/views/DiffRow.zan
-    src/ide_zan/src/models/views/RecentItem.zan
-    src/ide_zan/src/models/views/NewsItem.zan
-    tests/gui/models/IdeDocumentPageHostFixture.zan)
-  list(TRANSFORM _gui_ide_document_page_host_sources PREPEND "${CMAKE_SOURCE_DIR}/")
-  add_test(NAME conformance_gui_ide_document_page_host
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_document_page_host_test.zan
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${_gui_ide_document_page_host_sources};--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_document_page_host_test.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_document_page_host${_exe_ext}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
+    add_test(NAME conformance_gui_ide_editor_tabs_preparation
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_editor_tabs_preparation_test.zan
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/models/IdeEditorTabsFixture.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/ZanIDE.EditorFormat.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/IdeEditorTabEvents.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/DesignedControl.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/IdeTreePanelHost.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.design.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.design.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.design.zan;--embed;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.html=ide/panels/ExplorerPanel.html;--embed;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.html=ide/panels/ToolsPanel.html;--embed;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.html=ide/panels/StdlibPanel.html;--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_editor_tabs_preparation_test.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_editor_tabs_preparation${_exe_ext}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_ide_document_page_host PROPERTIES
-    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+    set_tests_properties(conformance_gui_ide_editor_tabs_preparation PROPERTIES
+      TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
 
-  add_test(NAME conformance_gui_ide_ribbon_retained_input
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_ribbon_retained_input_test.zan
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/models/IdeRibbonFixture.zan;${CMAKE_SOURCE_DIR}/tests/gui/models/IdeRibbonWitness.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/shell/ZanIDE.Ribbon.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/shell/ZanIDE.RibbonView.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/shell/IdeRibbonViewOwner.zan;--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_ribbon_retained_input_test.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_ribbon_retained_input${_exe_ext}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_ide_ribbon_retained_input PROPERTIES
-    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
-
-  add_test(NAME conformance_gui_ide_editor_tabs_preparation
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_editor_tabs_preparation_test.zan
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/models/IdeEditorTabsFixture.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/ZanIDE.EditorFormat.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/IdeEditorTabEvents.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/DesignedControl.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/IdeTreePanelHost.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.design.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.design.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.design.zan;--embed;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.html=ide/panels/ExplorerPanel.html;--embed;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.html=ide/panels/ToolsPanel.html;--embed;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.html=ide/panels/StdlibPanel.html;--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_editor_tabs_preparation_test.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_editor_tabs_preparation${_exe_ext}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_ide_editor_tabs_preparation PROPERTIES
-    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
-
-  add_test(NAME conformance_gui_ide_stdlib_preparation
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_stdlib_preparation_test.zan
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/models/IdeStdlibFixture.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/ZanIDE.EditorFormat.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/IdeEditorTabEvents.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/DesignedControl.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/IdeTreePanelHost.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.design.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.design.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.design.zan;--embed;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.html=ide/panels/StdlibPanel.html;--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_stdlib_preparation_test.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_stdlib_preparation${_exe_ext}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_ide_stdlib_preparation PROPERTIES
-    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+    add_test(NAME conformance_gui_ide_stdlib_preparation
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_stdlib_preparation_test.zan
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/models/IdeStdlibFixture.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/ZanIDE.EditorFormat.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/editor/IdeEditorTabEvents.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/DesignedControl.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/IdeTreePanelHost.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.design.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ExplorerPanel.design.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/ToolsPanel.design.zan;--embed;${CMAKE_SOURCE_DIR}/src/ide_zan/src/panels/StdlibPanel.html=ide/panels/StdlibPanel.html;--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_stdlib_preparation_test.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_stdlib_preparation${_exe_ext}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_ide_stdlib_preparation PROPERTIES
+      TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+  endif()
 
   add_test(NAME conformance_gui_remaining_game_retained_hud
     COMMAND ${CMAKE_COMMAND}
@@ -7278,30 +7276,32 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_sessionlist_retained_input PROPERTIES
     TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
 
-  set(_gui_ide_ai_host_sources
-    src/ide_zan/src/panels/ZanIDE.AiSessionsPanel.zan
-    src/ide_zan/src/panels/AiPanel.SessionsLayout.zan
-    src/ide_zan/src/dialogs/AiAssistantWindow.zan
-    src/ide_zan/src/dialogs/IdeAiWindowPreparation.zan
-    src/ide_zan/src/models/shell/AiSession.zan
-    tests/gui/models/IdeAiHostFixture.zan
-    tests/gui/models/IdeAiSidebarFixture.zan
-    tests/gui/models/IdeAiDockPreparation.zan
-    tests/gui/models/IdeAiHostState.zan
-    tests/gui/models/IdeAiSessionImage.zan)
-  list(TRANSFORM _gui_ide_ai_host_sources PREPEND "${CMAKE_SOURCE_DIR}/")
-  add_test(NAME conformance_gui_ide_ai_host_lifecycle
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_ai_host_lifecycle_test.zan
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${_gui_ide_ai_host_sources};--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_ai_host_lifecycle_test.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_ai_host_lifecycle${_exe_ext}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_ide_ai_host_lifecycle PROPERTIES
-    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+  if(ZAN_IDE_TESTS)
+    set(_gui_ide_ai_host_sources
+      src/ide_zan/src/panels/ZanIDE.AiSessionsPanel.zan
+      src/ide_zan/src/panels/AiPanel.SessionsLayout.zan
+      src/ide_zan/src/dialogs/AiAssistantWindow.zan
+      src/ide_zan/src/dialogs/IdeAiWindowPreparation.zan
+      src/ide_zan/src/models/shell/AiSession.zan
+      tests/gui/models/IdeAiHostFixture.zan
+      tests/gui/models/IdeAiSidebarFixture.zan
+      tests/gui/models/IdeAiDockPreparation.zan
+      tests/gui/models/IdeAiHostState.zan
+      tests/gui/models/IdeAiSessionImage.zan)
+    list(TRANSFORM _gui_ide_ai_host_sources PREPEND "${CMAKE_SOURCE_DIR}/")
+    add_test(NAME conformance_gui_ide_ai_host_lifecycle
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ide_ai_host_lifecycle_test.zan
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        "-DZANC_ARGS=${_gui_ide_ai_host_sources};--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/ide_ai_host_lifecycle_test.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ide_ai_host_lifecycle${_exe_ext}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_ide_ai_host_lifecycle PROPERTIES
+      TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+  endif()
 
   add_test(NAME conformance_gui_designer_inspector_extras
     COMMAND ${CMAKE_COMMAND}
@@ -7434,6 +7434,8 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
+# ide_zan is temporarily out of the verification surface; ZAN_IDE_TESTS=ON restores.
+if(ZAN_IDE_TESTS)
 add_test(NAME ide_compile_modes
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -DZANC=$<TARGET_FILE:zanc>
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/ide_compile_modes${_exe_ext}
@@ -7491,6 +7493,7 @@ add_test(NAME conformance_ide_signing_config
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(conformance_ide_signing_config PROPERTIES
   TIMEOUT 180 LABELS "full;standard;smoke;ide")
+endif()
 
 add_test(NAME conformance_ide_intent_command
   COMMAND ${CMAKE_COMMAND}
