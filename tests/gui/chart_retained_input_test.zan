@@ -1,0 +1,368 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Component.Chart;
+
+class ChartRetainedWitness {
+    public weak ChartView view;
+}
+
+class ChartRetainedInputTest {
+    static int clicks;
+    static int selections;
+    static int hovers;
+    static int leaves;
+    static int legends;
+    static int zooms;
+    static int ranges;
+    static ChartInteractionEvent lastClick;
+
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception("chart retained: " + message); }
+    }
+
+    static void Clicked(ChartInteractionEvent e) { clicks = clicks + 1; lastClick = e; }
+    static void Selected(ChartInteractionEvent e) { selections = selections + 1; }
+    static void Hovered(ChartInteractionEvent e) { hovers = hovers + 1; }
+    static void Left(ChartInteractionEvent e) { leaves = leaves + 1; }
+    static void Legend(ChartInteractionEvent e) { legends = legends + 1; }
+    static void Zoom(ChartInteractionEvent e) { zooms = zooms + 1; }
+    static void Range(ChartInteractionEvent e) { ranges = ranges + 1; }
+
+    static void Click(App app, int x, int y) {
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static Control Tip(ChartView view, string text) {
+        for (int i = 0; i < view.ChildCount(); i = i + 1) {
+            Control child = view.ChildAt(i);
+            if (child.Tip == text && child.StyleVisible()) { return child; }
+        }
+        return null;
+    }
+
+    static void Family(App app, ChartView view, ChartOption option, int x, int y,
+    ChartElementType element, string name, int seriesIndex) {
+        option.animate = false; option.showLegend = false; option.showTooltip = false;
+        view.SetOption(option); view.Arrange(0, 0, 480, 320);
+        lastClick = null;
+        Click(app, x, y);
+        Check(lastClick != null && lastClick.elementType == element && lastClick.seriesName == name
+        && lastClick.seriesIndex == seriesIndex && lastClick.dataIndex >= 0,
+        name + " typed hit exists before paint (actual " + (lastClick != null ? lastClick.seriesName + "/" + Convert.ToString(lastClick.seriesIndex)
+        + "/" + Convert.ToString((int)lastClick.elementType) : "null") + ")");
+        int dataIndex = lastClick.dataIndex;
+        int before = clicks; int beforeHovers = hovers; int beforeLeaves = leaves;
+        for (int i = 0; i < 2; i = i + 1) {
+            app.BeginOffscreenFrame(); view.OnPaint(app); app.EndOffscreenFrame();
+        }
+        Check(clicks == before && hovers == beforeHovers && leaves == beforeLeaves,
+        name + " paint does not advance events");
+        lastClick = null; Click(app, x, y);
+        Check(lastClick != null && lastClick.elementType == element && lastClick.seriesName == name
+        && lastClick.seriesIndex == seriesIndex && lastClick.dataIndex == dataIndex,
+        name + " repeated paint preserves hit identity");
+    }
+
+    static void WaterfallAndRiver(App app, ChartView view) {
+        ChartOption waterfall = ChartOption.Of("", new List<string>{"start", "down", "sum"},
+        new List<ChartSeries>{ChartSeries.Waterfall("waterfall", new List<ChartData>{
+            ChartData.Named(80, "start"), ChartData.Named(-30, "down"), ChartData.Named(0, "total")})});
+            waterfall.Y(ChartAxis.ValueRange(0, 100));
+            Family(app, view, waterfall, 250, 100, ChartElementType.Bar, "waterfall", 0);
+            Check(lastClick.dataIndex == 1 && lastClick.value == -30, "waterfall hits cumulative decrement above zero");
+            Family(app, view, waterfall, 390, 200, ChartElementType.Bar, "waterfall", 0);
+            Check(lastClick.dataIndex == 2 && lastClick.value == 50, "waterfall total exposes accumulated value");
+            ChartOption negative = ChartOption.Of("", new List<string>{"start", "down", "up", "sum"},
+            new List<ChartSeries>{ChartSeries.Waterfall("negative", new List<ChartData>{
+                ChartData.Named(20, "start"), ChartData.Named(-60, "down"),
+                ChartData.Named(70, "up"), ChartData.Named(0, "total")})});
+                Family(app, view, negative, 200, 230, ChartElementType.Bar, "negative", 0);
+                Check(lastClick.dataIndex == 1 && lastClick.value == -60, "waterfall automatic axis includes negative cumulative extent");
+                waterfall.zoom = true; waterfall.zoomStart = 50; waterfall.zoomEnd = 100;
+                app.StateSet(Chart.ZoomLoKey(view.Wid()), 500); app.StateSet(Chart.ZoomHiKey(view.Wid()), 1000);
+                Family(app, view, waterfall, 140, 100, ChartElementType.Bar, "waterfall", 0);
+                Check(lastClick.dataIndex == 1 && lastClick.value == -30, "waterfall zoom retains preceding accumulation");
+
+                ChartSeries first = ChartSeries.Of("river-first", ChartType.Custom, new List<int>());
+                first.custom = "themeRiver"; first.riverNames.Add("A");
+                first.riverPoints.Add(ChartRiverPoint.Of("T1", 20, 0));
+                first.riverPoints.Add(ChartRiverPoint.Of("T2", 20, 0));
+                first.riverPoints.Add(ChartRiverPoint.Of("T3", 20, 0));
+                ChartSeries second = ChartSeries.Of("river-second", ChartType.Custom, new List<int>());
+                second.custom = "themeRiver"; second.riverNames.Add("B"); second.riverNames.Add("A");
+                second.riverPoints.Add(ChartRiverPoint.Of("T1", 60, 0));
+                second.riverPoints.Add(ChartRiverPoint.Of("T2", 60, 0));
+                second.riverPoints.Add(ChartRiverPoint.Of("T3", 60, 0));
+                second.riverPoints.Add(ChartRiverPoint.Of("T2", 20, 1));
+                ChartOption river = ChartOption.Of("", null, new List<ChartSeries>{first, second});
+                Family(app, view, river, 250, 100, ChartElementType.EventBand, "river-second", 1);
+                Check(lastClick.dataIndex == 1 && lastClick.dataName == "B" && lastClick.value == 60,
+                "themeRiver maps local category names to retained aggregate identity");
+                Family(app, view, river, 250, 240, ChartElementType.EventBand, "river-second", 1);
+                Check(lastClick.dataIndex == 3 && lastClick.dataName == "A" && lastClick.value == 40,
+                "themeRiver aggregate includes all visible contributors");
+                second.silent = true;
+                river.animate = false; river.showLegend = false; river.showTooltip = true;
+                view.SetOption(river); view.Arrange(0, 0, 480, 320);
+                lastClick = null; Click(app, 250, 100);
+                Check(lastClick != null && lastClick.elementType != ChartElementType.EventBand,
+                "themeRiver silent-only band has no input target");
+                Family(app, view, river, 250, 240, ChartElementType.EventBand, "river-first", 0);
+                Check(lastClick.dataIndex == 1 && lastClick.value == 40, "themeRiver silent contributor preserves aggregate");
+                second.hidden = true;
+                Family(app, view, river, 250, 100, ChartElementType.EventBand, "river-first", 0);
+                Check(lastClick.dataName == "A" && lastClick.value == 20, "themeRiver hidden source does not contribute");
+            }
+
+            static void Families(App app, ChartView view) {
+                Family(app, view, ChartOption.FromJson("{\"xAxis\":{\"type\":\"category\",\"data\":[\"A\"]},"
+                + "\"yAxis\":{\"type\":\"value\",\"min\":0,\"max\":100},"
+                + "\"series\":[{\"name\":\"vertical\",\"type\":\"bar\",\"data\":[80]}]}"),
+                240, 160, ChartElementType.Bar, "vertical", 0);
+                Family(app, view, ChartOption.FromJson("{\"xAxis\":{\"type\":\"value\",\"min\":0,\"max\":100},"
+                + "\"yAxis\":{\"type\":\"category\",\"data\":[\"A\"]},"
+                + "\"series\":[{\"name\":\"horizontal\",\"type\":\"bar\",\"data\":[80]}]}"),
+                240, 160, ChartElementType.Bar, "horizontal", 0);
+                Family(app, view, ChartOption.FromJson("{\"xAxis\":{\"type\":\"category\",\"data\":[\"A\"]},"
+                + "\"yAxis\":{\"type\":\"value\",\"min\":0,\"max\":100},"
+                + "\"series\":[{\"name\":\"area\",\"type\":\"line\",\"stack\":\"sum\",\"areaStyle\":{},\"data\":[80]}]}"),
+                240, 160, ChartElementType.LinePoint, "area", 0);
+                Family(app, view, ChartOption.Of("", null, new List<ChartSeries>{ChartSeries.OfCandles("candle",
+                new List<Candle>{Candle.Of(20, 40, 10, 60)})}),
+                240, 160, ChartElementType.Candlestick, "candle", 0);
+                ChartOption bubbles = ChartOption.Of("", null, new List<ChartSeries>{ChartSeries.OfBubbles("bubble",
+                new List<Bubble>{Bubble.Of(50, 50, 100)})});
+                bubbles.X(ChartAxis.ValueRange(0, 100)); bubbles.Y(ChartAxis.ValueRange(0, 100));
+                Family(app, view, bubbles, 250, 150, ChartElementType.ScatterPoint, "bubble", 0);
+                Family(app, view, ChartOption.FromJson("{\"radar\":{\"indicator\":[{\"name\":\"A\",\"max\":100},"
+                + "{\"name\":\"B\",\"max\":100},{\"name\":\"C\",\"max\":100}]},"
+                + "\"series\":[{\"name\":\"radar\",\"type\":\"radar\",\"data\":[20,40,60]}]}"),
+                240, 150, ChartElementType.RadarAxis, "radar", 0);
+                Family(app, view, ChartOption.FromJson("{\"series\":[{\"name\":\"gauge\",\"type\":\"gauge\",\"data\":[42]}]}"),
+                240, 160, ChartElementType.Gauge, "gauge", 0);
+                Family(app, view, ChartOption.FromJson("{\"series\":[{\"name\":\"funnel\",\"type\":\"funnel\","
+                + "\"data\":[{\"name\":\"A\",\"value\":80},{\"name\":\"B\",\"value\":40}]}]}"),
+                180, 100, ChartElementType.FunnelStage, "funnel", 0);
+                ChartOption boxes = ChartOption.Of("", null, new List<ChartSeries>{
+                    ChartSeries.OfBoxes("first", new List<BoxItem>{BoxItem.Of("A", 1, 2, 3, 4, 5)}),
+                    ChartSeries.OfBoxes("box", new List<BoxItem>{BoxItem.Of("B", 2, 3, 4, 5, 6)})});
+                    Family(app, view, boxes, 240, 160, ChartElementType.BoxPlot, "box", 1);
+                    boxes.Y(ChartAxis.Category(new List<string>{"A"}));
+                    Family(app, view, boxes, 240, 160, ChartElementType.BoxPlot, "box", 1);
+                    Family(app, view, ChartOption.Of("", null, new List<ChartSeries>{
+                        ChartSeries.OfErrors("error", new List<ErrorItem>{ErrorItem.Of("A", 20, 3)})}),
+                        240, 160, ChartElementType.ErrorBar, "error", 0);
+                        Family(app, view, ChartOption.FromJson("{\"matrix\":{\"x\":{\"data\":[\"X\"]},\"y\":{\"data\":[\"Y\"]}},"
+                        + "\"series\":[{\"name\":\"matrix\",\"type\":\"heatmap\",\"coordinateSystem\":\"matrix\",\"data\":[[\"X\",\"Y\",2.5]]}]}"),
+                        280, 200, ChartElementType.HeatmapCell, "matrix", 0);
+                        Family(app, view, ChartOption.Of("", null, new List<ChartSeries>{ChartSeries.WordCloud("word", new List<ChartData>{
+                            ChartData.Named(100, "retained")})}), 240, 160, ChartElementType.WordTag, "word", 0);
+                        }
+
+                        static void Composites(App app, ChartView view) {
+                            Family(app, view, ChartOption.FromJson("{\"grid\":[{\"left\":0,\"top\":32,\"width\":220,\"height\":250},"
+                            + "{\"left\":240,\"top\":32,\"width\":220,\"height\":250}],"
+                            + "\"xAxis\":[{\"type\":\"category\",\"gridIndex\":0,\"data\":[\"A\"]},{\"type\":\"category\",\"gridIndex\":1,\"data\":[\"B\"]}],"
+                            + "\"yAxis\":[{\"type\":\"value\",\"gridIndex\":0,\"min\":0,\"max\":100},{\"type\":\"value\",\"gridIndex\":1,\"min\":0,\"max\":100}],"
+                            + "\"series\":[{\"name\":\"left\",\"type\":\"bar\",\"data\":[80]},{\"name\":\"right\",\"type\":\"bar\",\"xAxisIndex\":1,\"yAxisIndex\":1,\"data\":[80]}]}"),
+                            350, 160, ChartElementType.Bar, "right", 1);
+                            Family(app, view, ChartOption.FromJson("{\"xAxis\":{\"type\":\"category\",\"data\":[\"A\"]},\"yAxis\":{\"type\":\"value\"},"
+                            + "\"series\":[{\"name\":\"bars\",\"type\":\"bar\",\"data\":[80]},"
+                            + "{\"name\":\"overlay\",\"type\":\"pie\",\"center\":[\"75%\",\"50%\"],\"radius\":\"30%\",\"data\":[{\"name\":\"P\",\"value\":1}]}]}"),
+                            370, 150, ChartElementType.PieSlice, "overlay", 1);
+                            Family(app, view, ChartOption.FromJson("{\"xAxis\":{\"type\":\"category\",\"data\":[\"A\"]},"
+                            + "\"yAxis\":{\"type\":\"value\",\"min\":0,\"max\":100},\"series\":[{\"name\":\"pictorial\",\"type\":\"pictorialBar\",\"data\":[80]}]}"),
+                            240, 160, ChartElementType.Bar, "pictorial", 0);
+                            Family(app, view, ChartOption.FromJson("{\"series\":[{\"name\":\"sun\",\"type\":\"sunburst\",\"data\":[{\"name\":\"leaf\",\"value\":10}]}]}"),
+                            300, 160, ChartElementType.Node, "sun", 0);
+                            Family(app, view, ChartOption.FromJson("{\"series\":[{\"name\":\"sun levels\",\"type\":\"sunburst\","
+                            + "\"levels\":[{},{\"r0\":\"40%\",\"r\":\"80%\"}],\"data\":[{\"name\":\"leaf\",\"value\":10}]}]}"),
+                            340, 160, ChartElementType.Node, "sun levels", 0);
+                            lastClick = null; Click(app, 250, 160);
+                            Check(lastClick != null && lastClick.elementType != ChartElementType.Node, "explicit sunburst inner radius remains empty");
+                            int plotX = app.theme.paddingMedium + app.Scale(8);
+                            int plotW = 480 - 2 * plotX;
+                            int plotY = Chart.PanelContentTop(app, 0, 0, 480, "", null, false)
+                            + Canvas.FontHeight(ChartFonts.AxisLabel(app)) + app.Scale(6);
+                            ChartOption parallel = ChartOption.FromJson("{\"parallelAxis\":[{\"min\":0,\"max\":100},{\"min\":0,\"max\":100}],"
+                            + "\"parallel\":{\"layout\":\"vertical\"},\"series\":[{\"name\":\"parallel\",\"type\":\"parallel\",\"data\":[[80,20]]}]}" );
+                            parallel.parAxes[0].dim = 1; parallel.parAxes[1].dim = 0;
+                            Family(app, view, parallel, plotX + plotW * 20 / 100, plotY, ChartElementType.LinePoint, "parallel", 0);
+                        }
+
+                        static ChartView HostView(Control host) {
+                            for (int i = 0; i < host.ChildCount(); i = i + 1) {
+                                Control child = host.ChildAt(i);
+                                if (child is ChartView) { return (ChartView)child; }
+                            }
+                            return null;
+                        }
+
+                        static void HtmlCode(App app, Control root) {
+                            Html.Install(); ChartHost.Install();
+                            Control markup = Html.Load(app, "<chart id='parity' type='pie' title='same'></chart>", null, "");
+                            ChartHost html = (ChartHost)markup.Find("parity");
+                            ChartHost code = new ChartHost(); code.SetProp("type", "pie"); code.SetProp("title", "same");
+                            Check(html != null, "HTML chart uses registered ChartHost");
+                            ChartOption source = ChartOption.FromJson("{\"animation\":false,\"legend\":{\"show\":false},\"series\":[{\"name\":\"parity\","
+                            + "\"type\":\"pie\",\"data\":[{\"name\":\"A\",\"value\":3},{\"name\":\"B\",\"value\":7}]}]}");
+                            html.SetOption(source); code.SetOption(source.Clone());
+                            ChartView first = HostView(html); ChartView second = HostView(code);
+                            Check(first != null && second != null, "HTML and code own retained ChartView");
+                            root.Add(html); root.MeasureTree(app); html.Arrange(0, 0, 480, 320); first.Arrange(0, 0, 480, 320);
+                            first.OnClick(ChartRetainedInputTest.Clicked); Click(app, 280, 120);
+                            Check(lastClick != null, "HTML click exists before paint");
+                            ChartInteractionEvent expected = lastClick;
+                            root.Remove(html); root.Add(code); root.MeasureTree(app); code.Arrange(0, 0, 480, 320); second.Arrange(0, 0, 480, 320);
+                            second.OnClick(ChartRetainedInputTest.Clicked); Click(app, 280, 120);
+                            Check(lastClick != null && expected.elementType == lastClick.elementType && expected.seriesName == lastClick.seriesName
+                            && expected.dataName == lastClick.dataName && expected.dataIndex == lastClick.dataIndex, "HTML and code retain identical hit semantics");
+                            first.Dispose(); second.Dispose(); root.Remove(code);
+                        }
+
+                        static void SaveImage(App app, Control root) {
+                            string directory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Environment.ProcessPath), "../test-out"));
+                            Directory.CreateDirectory(directory);
+                            string previous = Environment.CurrentDirectory;
+                            Environment.SetCurrentDirectory(directory);
+                            ChartOption source = ChartOption.FromJson("{\"animation\":false,\"legend\":{\"show\":false},"
+                            + "\"toolbox\":{\"show\":true,\"feature\":{\"saveAsImage\":{}}},\"series\":[{\"name\":\"save\",\"type\":\"pie\",\"data\":[3,7]}]}");
+                            ChartView view = ChartView.Of(source); root.Add(view); root.MeasureTree(app); view.Arrange(0, 0, 480, 320);
+                            string file = "chart_" + Convert.ToString(view.wid) + ".png";
+                            if (File.Exists(file)) { File.Delete(file); }
+                            Control save = Tip(view, "保存为图片"); Check(save != null, "save action is prepared");
+                            Click(app, save.bx + 2, save.by + 2);
+                            App other = App.CreateOffscreen("save isolation", 64, 64);
+                            other.BeginOffscreenFrame(); Check(other.PrepareStandardHostFrame(), "other save frame prepared"); other.EndOffscreenFrame();
+                            Check(!File.Exists(file), "another App cannot consume save request");
+                            other.StopLoop(); other.canvas.Destroy();
+                            app.BeginOffscreenFrame(); Check(app.PrepareStandardHostFrame(), "save frame prepared"); view.OnPaint(app);
+                            Check(!File.Exists(file), "Paint does not consume save request"); app.EndOffscreenFrame();
+                            Check(File.Exists(file), "present tail saves PNG");
+                            byte[] bytes = File.ReadAllBytes(file);
+                            Check(bytes.Length > 24 && bytes[0] == 137 && bytes[1] == 80 && bytes[2] == 78 && bytes[3] == 71,
+                            "saved output is a real PNG");
+                            Check(bytes[18] == 1 && bytes[19] == 224 && bytes[22] == 1 && bytes[23] == 64, "saved image retains chart rectangle dimensions");
+                            File.Delete(file); Environment.SetCurrentDirectory(previous); view.Dispose(); root.Remove(view);
+                        }
+
+                        static long Pixels(Canvas canvas) {
+                            long result = 0;
+                            for (int y = 32; y < 280; y = y + 1) {
+                                for (int x = 20; x < 460; x = x + 1) {
+                                    result = result + (long)(canvas.GetPixel(x, y) & 0x00FFFFFF);
+                                }
+                            }
+                            return result;
+                        }
+
+                        static void Progressive(App app, Control root) {
+                            ChartOption source = ChartOption.FromJson("{\"animation\":false,\"backgroundColor\":\"#ffffff\",\"legend\":{\"show\":false},"
+                            + "\"parallelAxis\":[{\"min\":0,\"max\":100},{\"min\":0,\"max\":100}],"
+                            + "\"parallel\":{\"layout\":\"vertical\"},\"series\":[{\"name\":\"early\",\"type\":\"parallel\","
+                            + "\"itemStyle\":{\"color\":\"#ff0000\"}},{\"name\":\"last\",\"type\":\"parallel\","
+                            + "\"itemStyle\":{\"color\":\"#0000ff\"},\"data\":[[80,80]]}]}" );
+                            source.showTooltip = false;
+                            for (int i = 0; i < 1000; i = i + 1) { source.series[0].parRows.Add(new List<int>{20, 20}); }
+                            ChartView view = ChartView.Of(source); view.OnClick(ChartRetainedInputTest.Clicked);
+                            root.Add(view); root.MeasureTree(app); view.Arrange(0, 0, 480, 320);
+                            int plotX = app.theme.paddingMedium + app.Scale(8);
+                            int plotW = 480 - 2 * plotX;
+                            int plotY = Chart.PanelContentTop(app, 0, 0, 480, "", source.series, false)
+                            + Canvas.FontHeight(ChartFonts.AxisLabel(app)) + app.Scale(6);
+                            app.BeginOffscreenFrame(); Check(app.PrepareStandardHostFrame(), "progressive frame prepared");
+                            view.OnPaint(app); long first = Pixels(app.canvas);
+                            App other = App.CreateOffscreen("parallel isolation", 64, 64);
+                            other.BeginOffscreenFrame(); Check(other.PrepareStandardHostFrame(), "parallel other prepared"); other.EndOffscreenFrame();
+                            other.StopLoop(); other.canvas.Destroy();
+                            view.OnPaint(app); Check(first == Pixels(app.canvas), "same progressive snapshot paints identical pixels");
+                            app.EndOffscreenFrame();
+                            lastClick = null; Click(app, plotX + plotW * 80 / 100, plotY);
+                            Check(lastClick != null && lastClick.elementType != ChartElementType.LinePoint,
+                            "progressive rows remain hidden before their prepared batch");
+                            for (int frame = 0; frame < 44; frame = frame + 1) {
+                                app.BeginOffscreenFrame(); Check(app.PrepareStandardHostFrame(), "next progressive frame prepared");
+                                view.OnPaint(app); app.EndOffscreenFrame();
+                            }
+                            Click(app, plotX + plotW * 80 / 100, plotY);
+                            Check(lastClick != null && lastClick.seriesName == "last", "progressive rendering reaches final row");
+                            int slot = ChartView.AllocCacheSlot();
+                            ChartView.PrepareCached(app, source, slot, 0, 0, 480, 320);
+                            app.BeginOffscreenFrame(); ChartView.RenderCached(app, source, slot, 0, 0, 480, 320);
+                            Check((app.canvas.GetPixel(plotX + plotW * 80 / 100, plotY + 8) & 0x00FFFFFF) == 255,
+                            "cached large parallel includes final row on first paint");
+                            app.EndOffscreenFrame(); ChartView.ReleaseCached(app.canvas, slot);
+                            lastClick = null; view.Dispose(); root.Remove(view);
+                        }
+
+                        static void Exercise(App app, Control root, ChartRetainedWitness witness) {
+                            ChartOption option = ChartOption.FromJson("{\"animation\":false,\"legend\":{\"show\":false},"
+                            + "\"series\":[{\"name\":\"pie\",\"type\":\"pie\",\"center\":[\"50%\",\"50%\"],"
+                            + "\"radius\":\"70%\",\"data\":[{\"name\":\"A\",\"value\":3},{\"name\":\"B\",\"value\":7}]}]}");
+                            ChartView view = ChartView.Of(option);
+                            view.OnClick(ChartRetainedInputTest.Clicked);
+                            view.On(ChartEventType.PieSelected, ChartRetainedInputTest.Selected);
+                            view.On(ChartEventType.Hover, ChartRetainedInputTest.Hovered);
+                            view.On(ChartEventType.MouseOut, ChartRetainedInputTest.Left);
+                            root.Add(view);
+                            root.MeasureTree(app);
+                            root.Arrange(0, 0, 480, 320);
+                            view.Arrange(0, 0, 480, 320);
+                            int x = 280; int y = 120;
+                            Click(app, x, y);
+                            Check(clicks == 1, "first click routes before paint: " + Convert.ToString(clicks));
+                            Check(selections == 1, "first pie selection applies before paint: " + Convert.ToString(selections));
+                            Click(app, x, y);
+                            Check(clicks == 2, "consecutive clicks require no paint: " + Convert.ToString(clicks));
+                            Check(selections == 2, "consecutive pie selections require no paint: " + Convert.ToString(selections));
+                            Check(hovers > 0, "routed pointer computes hover before paint");
+                            int childCount = view.ChildCount();
+                            int oldClicks = clicks; int oldSelections = selections; int oldHovers = hovers; int oldLeaves = leaves;
+                            for (int i = 0; i < 2; i = i + 1) {
+                                app.BeginOffscreenFrame(); view.OnPaint(app); app.EndOffscreenFrame();
+                            }
+                            Check(view.ChildCount() == childCount && clicks == oldClicks && selections == oldSelections
+                            && hovers == oldHovers && leaves == oldLeaves, "paint preserves nodes and interaction events");
+                            ChartOption bars = ChartOption.FromJson("{\"animation\":false,\"toolbox\":{\"show\":true,"
+                            + "\"feature\":{\"dataView\":{},\"magicType\":{\"type\":[\"line\",\"bar\"]}}},"
+                            + "\"legend\":{\"show\":true},\"xAxis\":{\"type\":\"category\",\"data\":[\"A\",\"B\",\"C\"]},"
+                            + "\"yAxis\":{\"type\":\"value\"},\"dataZoom\":[{\"type\":\"slider\",\"start\":0,\"end\":100}],"
+                            + "\"series\":[{\"name\":\"bars\",\"type\":\"bar\",\"data\":[12,35,20]}]}");
+                            view.SetOption(bars);
+                            view.On(ChartEventType.LegendSelected, ChartRetainedInputTest.Legend);
+                            view.On(ChartEventType.DataZoom, ChartRetainedInputTest.Zoom);
+                            view.Arrange(10, 10, 460, 300);
+                            Control dataView = Tip(view, "数据视图");
+                            Check(dataView != null, "toolbox exists before paint after option replacement");
+                            Click(app, dataView.bx + 3, dataView.by + 3);
+                            Control close = Tip(view, "关闭");
+                            Check(close != null, "data view opens and prepares close button without paint");
+                            Click(app, close.bx + 3, close.by + 3);
+                            Check(Tip(view, "关闭") == null, "data view closes without paint");
+                            childCount = view.ChildCount();
+                            app.BeginOffscreenFrame(); view.OnPaint(app); app.EndOffscreenFrame();
+                            Check(view.ChildCount() == childCount, "cartesian paint creates no input children");
+                            Families(app, view);
+                            WaterfallAndRiver(app, view);
+                            Composites(app, view);
+                            lastClick = null;
+                            witness.view = view;
+                            view.Dispose();
+                            root.Remove(view);
+                        }
+
+                        static void Main() {
+                            App app = App.CreateOffscreen("chart retained", 480, 320);
+                            Control root = new Control(); root.UseApp(app); app.SetRootControl(root);
+                            ChartRetainedWitness witness = new ChartRetainedWitness();
+                            Exercise(app, root, witness);
+                            Check(witness.view == null, "preparation and action children do not retain view");
+                            HtmlCode(app, root); SaveImage(app, root); Progressive(app, root);
+                            lastClick = null;
+                            app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+                            app.StopLoop(); app.canvas.Destroy();
+                            Console.WriteLine("CHART_RETAINED_INPUT_OK");
+                        }
+                    }

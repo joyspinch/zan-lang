@@ -1,0 +1,326 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+public partial class ChartView {
+    internal ChartLegendLayout legendLayout;
+    internal ChartZoomLayout zoomLayout;
+    internal ChartDataRangeLayout rangeLayout;
+    internal ChartCartesianGeometry cartesianGeometry;
+    internal ChartHorizontalGeometry horizontalGeometry;
+    internal ChartCandleGeometry candleGeometry;
+    internal ChartBubbleGeometry bubbleGeometry;
+    internal ChartPictorialGeometry pictorialGeometry;
+    internal ChartSunburstGeometry sunburstGeometry;
+    internal ChartPieGeometry pieGeometry;
+    internal ChartMapGeometry mapGeometry;
+    internal ChartScatterGeometry scatterGeometry;
+    internal ChartHeatmapGeometry heatmapGeometry;
+    internal ChartMatrixGeometry matrixGeometry;
+    internal ChartStatisticalGeometry statisticalGeometry;
+    internal ChartTreeGeometry treeGeometry;
+    internal ChartForceGeometry forceGeometry;
+    internal ChartChordGeometry chordGeometry;
+    internal ChartTreemapGeometry treemapGeometry;
+    internal ChartVennGeometry vennGeometry;
+    internal ChartEventRiverGeometry eventRiverGeometry;
+    internal ChartSankeyGeometry sankeyGeometry;
+    internal ChartRadarGeometry radarGeometry;
+    internal ChartGaugeGeometry gaugeGeometry;
+    internal ChartFunnelGeometry funnelGeometry;
+    internal ChartWordCloudGeometry wordCloudGeometry;
+    internal int preparedGrowth = 1000;
+    int bodyHeight;
+    bool preparing;
+
+    void EnsurePreparation(App app) {
+        if (app == null || !app.isRunning || disposed) { return; }
+        if (preparationRegistration != null && preparationRegistration.active
+        && preparationRegistration.host == app) { return; }
+        if (preparationRegistration != null) { preparationRegistration.Invalidate(); }
+        preparationRegistration = app.RegisterLoopParticipant(this, new ChartViewPreparation(this));
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        bx = x; by = y;
+        bw = width > 0 ? width : 0; bh = height > 0 ? height : 0;
+        this.PrepareChrome(this.App);
+    }
+
+    // Resolve mutable public options at the preparation boundary. Paint and all
+    // routed events in this turn consume this same projection and geometry.
+    internal void PrepareChrome(App app) { this.PrepareChrome(app, false); }
+
+    internal void PrepareChrome(App app, bool painting) {
+        if (app == null || this.App != app || !app.isRunning || disposed || preparing) { return; }
+        preparing = true;
+        ChartOption previousOption = Chart.legendOpt;
+        bool previousGrid = Chart.gridPanelSub; bool previousZoom = Chart.zoomBarHidden;
+        int previousTools = Chart.toolReserve; int previousLegend = Chart.legendBottomReserve;
+        int previousZoomReserve = Chart.zoomBandReserve;
+        try {
+            ChartView.EnsurePresentTail();
+            this.EnsurePreparation(app);
+            this.BeginActionFrame();
+            Chart.gridPanelSub = false; Chart.zoomBarHidden = false;
+            ChartOption current = controller != null ? controller.Option() : sourceOption;
+            if (current != null) { sourceOption = current; }
+            if (sourceOption == null) { sourceOption = ChartOption.Create(); }
+            resolved = ResolvedChart.Resolve(sourceOption, app.theme, app, wid);
+            option = resolved.DrawOption(wid, !staticFrame && resolved.animate);
+            if (app.StateGet(Chart.TbZoomKey(wid), 0) != 0) { option.zoom = true; }
+            ChartView.ApplyMagic(option, app.StateGet(Chart.TbMagicKey(wid), 0));
+            ChartView.ApplyDataLegend(app, option);
+            this.PrepareGrowth(app);
+            Chart.legendOpt = option;
+            Chart.toolReserve = option.toolboxShow ? ChartToolbox.Width(app, option) : 0;
+            Chart.legendBottomReserve = 0;
+            Chart.zoomBandReserve = 0;
+            int rangeHeight = ChartViewDataRange.Height(app, option);
+            bodyHeight = bh - rangeHeight;
+            if (rangeHeight > 0 && bodyHeight < app.Scale(80)) { rangeHeight = 0; bodyHeight = bh; }
+            toolboxLayout = null; legendLayout = null; zoomLayout = null; rangeLayout = null;
+            cartesianGeometry = null; horizontalGeometry = null; pieGeometry = null; mapGeometry = null; scatterGeometry = null;
+            treemapGeometry = null;
+            vennGeometry = null; eventRiverGeometry = null; sankeyGeometry = null;
+            heatmapGeometry = null; matrixGeometry = null; treeGeometry = null; forceGeometry = null; chordGeometry = null;
+            radarGeometry = null; gaugeGeometry = null; funnelGeometry = null;
+            candleGeometry = null; bubbleGeometry = null; pictorialGeometry = null; sunburstGeometry = null;
+            if (this.Status() == "ready" && bw > 0 && bh > 0) {
+                this.PrepareBody(app);
+                this.PrepareLegends(app);
+                this.PrepareRange(app, rangeHeight);
+                this.PrepareToolbox(app);
+                if (staticFrame && preparedPanel != null) { preparedPanel.PrepareComplete(app); }
+                else if (painting && preparedPanel != null) { preparedPanel.BeforePaint(app); }
+            } else {
+                if (preparedPanel != null) { preparedPanel.Release(app); }
+                preparedPanel = null;
+            }
+        } finally {
+            this.EndActionFrame();
+            Chart.EndFrame();
+            Chart.legendOpt = previousOption;
+            Chart.gridPanelSub = previousGrid; Chart.zoomBarHidden = previousZoom;
+            Chart.toolReserve = previousTools; Chart.legendBottomReserve = previousLegend;
+            Chart.zoomBandReserve = previousZoomReserve;
+            preparing = false;
+        }
+        this.RefreshPreparedPointer(app);
+        this.PrepareLifecycle();
+    }
+
+    void PrepareGrowth(App app) {
+        string kind = ChartView.DispatchKind(sourceOption);
+        bool animate = resolved.animate && !staticFrame && kind != "map" && kind != "heatmap"
+        && kind != "wordCloud" && kind != "force" && kind != "treemap";
+        preparedGrowth = animate
+        ? app.AnimIntroIn(IdHash.HashInt(wid, 500), sourceOption.animMs, bx, by, bw, bh) : 1000;
+    }
+
+    void PrepareLifecycle() {
+        if (disposed) { return; }
+        bool resized = hasRendered && (lastRenderW != bw || lastRenderH != bh);
+        bool updated = hasRendered && (controller != null
+        ? controller.Version() != lastControllerVersion : directVersion != lastDirectVersion);
+        lastRenderW = bw; lastRenderH = bh;
+        if (controller != null) { lastControllerVersion = controller.Version(); }
+        else { lastDirectVersion = directVersion; }
+        hasRendered = true;
+        if (resized) {
+            Resized.Raise();
+            this.RaiseInteraction(ChartView.EventAt(ChartEventType.Resize, wid, bw, bh));
+        }
+        if (updated && !disposed) {
+            Updated.Raise();
+            ChartInteractionEvent eventArgs = ChartInteractionEvent.Of(ChartEventType.DataChanged, wid);
+            if (controller != null) { this.RaiseLocal(eventArgs); }
+            else { this.RaiseInteraction(eventArgs); }
+        }
+    }
+
+    internal ChartPreparedPanel preparedPanel;
+    internal static ChartPreparedPanel paintingPanel;
+
+    internal static ChartPreparedPanel PaintPanel(ChartOption model, int x, int y, int w, int h) {
+        ChartPreparedPanel panel = ChartView.paintingPanel;
+        if (panel != null && panel.option == model) { return panel; }
+        ChartView view = ChartView.activeEventView;
+        return view != null && view.preparedPanel != null ? view.preparedPanel.Find(model, x, y, w, h) : null;
+    }
+
+    void PrepareBody(App app) {
+        ChartPreparedPanel previous = preparedPanel;
+        preparedPanel = ChartPreparedPanel.Create(app, option, bx, by, bw, bodyHeight, preparedGrowth, previous);
+        cartesianGeometry = preparedPanel.cartesianGeometry;
+        horizontalGeometry = preparedPanel.horizontalGeometry;
+        candleGeometry = preparedPanel.candleGeometry;
+        bubbleGeometry = preparedPanel.bubbleGeometry;
+        pictorialGeometry = preparedPanel.pictorialGeometry;
+        sunburstGeometry = preparedPanel.sunburstGeometry;
+        pieGeometry = preparedPanel.pieGeometry;
+        mapGeometry = preparedPanel.mapGeometry;
+        scatterGeometry = preparedPanel.scatterGeometry;
+        heatmapGeometry = preparedPanel.heatmapGeometry;
+        matrixGeometry = preparedPanel.matrixGeometry;
+        statisticalGeometry = preparedPanel.statisticalGeometry;
+        treeGeometry = preparedPanel.treeGeometry;
+        forceGeometry = preparedPanel.forceGeometry;
+        chordGeometry = preparedPanel.chordGeometry;
+        treemapGeometry = preparedPanel.treemapGeometry;
+        vennGeometry = preparedPanel.vennGeometry;
+        eventRiverGeometry = preparedPanel.eventRiverGeometry;
+        sankeyGeometry = preparedPanel.sankeyGeometry;
+        radarGeometry = preparedPanel.radarGeometry;
+        gaugeGeometry = preparedPanel.gaugeGeometry;
+        funnelGeometry = preparedPanel.funnelGeometry;
+        wordCloudGeometry = preparedPanel.wordCloudGeometry;
+        zoomLayout = preparedPanel.zoomLayout;
+        if (mapGeometry != null && option.roam && option.iwid != 0) {
+            this.BindAction(40, 0, mapGeometry.x, mapGeometry.y, mapGeometry.w, mapGeometry.h, "");
+        }
+        if (treeGeometry != null && treeGeometry.layout.Count > 0 && ChartView.TreeRoamEnabled(option.roam)) {
+            this.BindAction(41, 0, treeGeometry.ax, treeGeometry.ay, treeGeometry.aw, treeGeometry.ah, "");
+        }
+        this.PreparePanelChildren(app, preparedPanel);
+        if (previous != null) { previous.Release(app); }
+    }
+
+    void PrepareLegends(App app) {
+        legendLayout = preparedPanel != null ? preparedPanel.legendLayout : null;
+        this.PreparePanelActions(app, preparedPanel);
+    }
+
+    void PreparePanelActions(App app, ChartPreparedPanel panel) {
+        if (panel == null) { return; }
+        ChartLegendLayout legend = panel.legendLayout;
+        if (legend != null) {
+            for (int i = 0; i < legend.entries.Count; i = i + 1) {
+                ChartLegendEntry entry = legend.entries[i];
+                int index = entry.index;
+                int seriesIndex = entry.kind == 2 ? index : entry.seriesIndex;
+                int rootIndex = seriesIndex >= 0 && seriesIndex < panel.option.series.Count
+                ? ChartView.SeriesIndexOf(option, panel.option.series[seriesIndex]) : -1;
+                if (rootIndex < 0) { continue; }
+                if (entry.kind == 2) {
+                    if (panel.option.legendSelectedMode == "none") { continue; }
+                    ChartActionControl action = this.BindAction(2, rootIndex, entry.x, entry.y, entry.w, entry.h, "");
+                    action.p0 = panel.option.legendSelectedMode == "single" ? 1 : 0;
+                } else {
+                    int key = Chart.LegendSliceKey(option.iwid, rootIndex, entry.dataIndex);
+                    ChartActionControl action = this.BindAction(3, key, entry.x, entry.y, entry.w, entry.h, "");
+                    action.p0 = key;
+                    action.p1 = panel.option.series[seriesIndex].data[entry.dataIndex].hidden ? 1 : 0;
+                }
+            }
+        }
+        if (panel.chordGeometry != null) {
+            for (int i = 0; i < panel.chordGeometry.legends.Count; i = i + 1) {
+                ChartLegendEntry entry = panel.chordGeometry.legends[i];
+                ChartActionControl action = this.BindAction(3, entry.index, entry.x, entry.y, entry.w, entry.h, "");
+                action.p0 = entry.index;
+            }
+        }
+        if (panel.forceGeometry != null && panel.forceGeometry.lead != null && panel.forceGeometry.layout != null) {
+            ChartForceGeometry geometry = panel.forceGeometry;
+            ChartSeries lead = geometry.lead;
+            int count = lead.graphCats.Count > 0 ? lead.graphCats.Count : geometry.nn;
+            if (lead.graphCats.Count > 0 || count <= 16) {
+                int px = panel.x + panel.w - app.theme.paddingMedium - geometry.legendW;
+                int py = Chart.LegendStartY(app, panel.y, geometry.top);
+                int height = Canvas.FontHeight(ChartFonts.Legend(app)) + app.Scale(6);
+                for (int i = 0; i < count; i = i + 1) {
+                    int key = Chart.LegendSliceKey(option.iwid, 0, i);
+                    ChartActionControl action = this.BindAction(3, key, px, py + i * height, geometry.legendW, height, "");
+                    action.p0 = key;
+                }
+            }
+        }
+        if (panel.zoomLayout != null) { zoomLayout = panel.zoomLayout; this.PrepareZoom(app); }
+        for (int i = 0; i < panel.panels.Count; i = i + 1) { this.PreparePanelActions(app, panel.panels[i]); }
+        for (int i = 0; i < panel.overlays.Count; i = i + 1) { this.PreparePanelActions(app, panel.overlays[i]); }
+    }
+
+    void PrepareZoom(App app) {
+        if (zoomLayout == null) { return; }
+        ChartZoomLayout z = zoomLayout;
+        ChartActionControl band = this.BindAction(12, 0, z.loX + z.hitHalf, z.y,
+        z.hiX - z.loX - z.hitHalf * 2, z.bandH, "");
+        ChartActionControl lo = this.BindAction(10, 0, z.loX - z.hitHalf, z.y, z.hitHalf * 2, z.h, "");
+        ChartActionControl hi = this.BindAction(11, 0, z.hiX - z.hitHalf, z.y, z.hitHalf * 2, z.h, "");
+        lo.p0 = z.x; lo.p1 = z.w; lo.p2 = z.minGap;
+        hi.p0 = z.x; hi.p1 = z.w; hi.p2 = z.minGap;
+        band.p0 = z.x; band.p1 = z.w; band.p2 = z.minGap;
+        ChartZoom component = Chart.ZoomBarComp(option);
+        if (component != null && component.zoomLock) {
+            lo.Visible = false; hi.Visible = false; band.p3 = 1;
+        }
+    }
+
+    void PrepareRange(App app, int height) {
+        if (height <= 0) { return; }
+        rangeLayout = ChartDataRangeLayout.Create(app, option, bx, by + bodyHeight, bw, height);
+        if (rangeLayout == null) { return; }
+        ChartDataRangeLayout r = rangeLayout;
+        if (r.splits.Count > 0) {
+            for (int i = 0; i < r.splits.Count; i = i + 1) {
+                ChartLegendEntry entry = r.splits[i];
+                this.BindAction(23, entry.index, entry.x, entry.y, entry.w, entry.h, "");
+            }
+        } else if (option.dataRangeCalculable) {
+            ChartActionControl lo = this.BindAction(20, 0, r.loX - r.handle,
+            r.y - app.Scale(2), r.handle * 2, r.h + app.Scale(4), "");
+            ChartActionControl hi = this.BindAction(21, 0, r.hiX - r.handle,
+            r.y - app.Scale(2), r.handle * 2, r.h + app.Scale(4), "");
+            lo.p0 = r.x; lo.p1 = r.w; hi.p0 = r.x; hi.p1 = r.w;
+        }
+    }
+
+    void PrepareToolbox(App app) {
+        if (!option.toolboxShow || suppressCanvasToolbox) { return; }
+        toolboxLayout = ChartToolboxLayout.Create(app, option, bx, by, bw);
+        string[] tips = new string[]{
+            "数据视图", "切换为折线", "切换为柱状", "还原", "保存为图片", "区域缩放" };
+            for (int i = 0; i < toolboxLayout.actions.Count; i = i + 1) {
+                int action = toolboxLayout.actions[i];
+                this.BindAction(1, action, toolboxLayout.x + i * (toolboxLayout.button + toolboxLayout.gap),
+                toolboxLayout.y, toolboxLayout.button, toolboxLayout.button, tips[action]);
+            }
+            if (app.StateGet(Chart.TbViewKey(wid), 0) != 0) {
+                int pad = app.Scale(16);
+                int buttonWidth = app.Scale(72);
+                int buttonHeight = app.Scale(26);
+                int buttonY = by + bh - pad * 2 - buttonHeight;
+                this.BindAction(32, 0, bx + pad, by + pad, bw - pad * 2, bh - pad * 2, "");
+                this.BindAction(30, 0, bx + pad * 2, buttonY, buttonWidth, buttonHeight, "复制");
+                this.BindAction(31, 0, bx + pad * 2 + buttonWidth + app.Scale(8), buttonY,
+                buttonWidth, buttonHeight, "关闭");
+            }
+        }
+
+        internal ChartActionControl FindAction(int kind, int index) {
+            for (int i = 0; i < actionControls.Count; i = i + 1) {
+                ChartActionControl action = actionControls[i];
+                if (action.action == kind && action.index == index && action.StyleVisible()) { return action; }
+            }
+            return null;
+        }
+    }
+
+    internal class ChartViewPreparation : AppLoopParticipant, AppPreparationParticipant {
+        internal weak ChartView owner;
+
+        internal ChartViewPreparation(ChartView view) { owner = view; }
+        public void Tick(App app, int now) { }
+        public int NextDeadline() { return -1; }
+        public void BeforeInput(App app, int kind) { this.Prepare(app); }
+        public void BeforePaint(App app, int sequence) {
+            ChartView view = owner; if (view != null) { view.PrepareChrome(app, true); }
+        }
+
+        void Prepare(App app) {
+            ChartView view = owner;
+            if (view != null) { view.PrepareChrome(app); }
+        }
+    }

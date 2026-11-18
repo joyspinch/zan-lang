@@ -1,0 +1,100 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+public partial class ChartView {
+    internal static ChartHit PaintHit(App app, ChartElementType element) {
+        if (ChartView.HoverBlocked(app)) { return null; }
+        ChartPreparedPanel panel = ChartView.paintingPanel;
+        ChartHit hit = panel != null ? panel.hit : ChartView.activeEventView.currentHit;
+        return hit != null && hit.elementType == element ? hit : null;
+    }
+
+    ChartHit PreparedHit(App app, int x, int y) {
+        if (preparedPanel != null) { preparedPanel.ClearHits(); }
+        if (option == null || this.Status() != "ready" || !pointerInside || !pointerBody
+        || !this.ContainsPoint(x, y) || preparedPanel == null) { return null; }
+        return preparedPanel.Hit(app, option, x, y);
+    }
+
+    internal int axisHoverIndex = -1;
+    int publishedHoverKey;
+    int publishedHoverIndex = -1;
+
+    void RefreshPreparedPointer(App app) {
+        if (pointerInside) {
+            pointerInside = this.ContainsPoint(pointerX, pointerY);
+            pointerBody = pointerInside;
+            for (int i = actionControls.Count - 1; i >= 0; i = i - 1) {
+                ChartActionControl action = actionControls[i];
+                if (!action.StyleVisible() || !action.ContainsPoint(pointerX, pointerY)) { continue; }
+                pointerBody = action.action == 40 || action.action == 41;
+                break;
+            }
+        }
+        this.UpdatePreparedPointer(app);
+    }
+
+    void UpdatePreparedPointer(App app) {
+        if (app == null || disposed) { return; }
+        axisHoverIndex = -1;
+        if (pointerInside && pointerBody && cartesianGeometry != null) {
+            ChartFrame frame = cartesianGeometry.frame;
+            if (pointerX >= frame.plotX && pointerX < frame.plotX + frame.plotW
+            && pointerY >= frame.plotY && pointerY < frame.plotY + frame.plotH) {
+                axisHoverIndex = frame.CatIndexAt(pointerX, cartesianGeometry.labels.Count);
+            }
+        }
+        int key = option != null && option.connectGroup != 0 ? Chart.ConnectHoverKey(option.iwid) : 0;
+        if (publishedHoverKey != 0 && (key != publishedHoverKey || axisHoverIndex < 0)
+        && app.StateGet(publishedHoverKey, -1) == publishedHoverIndex) {
+            app.StateSet(publishedHoverKey, -1);
+        }
+        publishedHoverKey = 0; publishedHoverIndex = -1;
+        if (key != 0 && axisHoverIndex >= 0) {
+            app.StateSet(key, axisHoverIndex);
+            publishedHoverKey = key; publishedHoverIndex = axisHoverIndex;
+        }
+        currentHit = this.PreparedHit(app, pointerX, pointerY);
+        this.DispatchPointerEvents(app, bx, by, bw, bh, this.Status());
+        if (option != null && option.dataRangeHoverLink && option.iwid != 0) {
+            bool hover = pointerInside && rangeLayout != null && pointerX >= bx && pointerX < bx + bw
+            && pointerY >= by + bodyHeight && pointerY < by + bh;
+            int value = hover ? 1 : 0;
+            if (app.StateGet(Chart.DRangeHoverKey(option.iwid), 0) != value) {
+                app.StateSet(Chart.DRangeHoverKey(option.iwid), value);
+                this.Invalidate();
+            }
+        }
+    }
+
+    void SelectPreparedHit(App app, ChartHit hit) {
+        if (hit == null || option == null || option.iwid == 0) { return; }
+        if (hit.elementType == ChartElementType.PieSlice) {
+            int key = Chart.PieSelKey(option.iwid, hit.seriesIndex, hit.dataIndex);
+            bool selected = app.StateGet(key, option.series[hit.seriesIndex].data[hit.dataIndex].selected ? 1 : 0) == 0;
+            app.StateSet(key, selected ? 1 : 0);
+            ChartInteractionEvent eventArgs = ChartView.EventFromHit(ChartEventType.PieSelected, option.iwid, hit);
+            eventArgs.selected = selected;
+            this.RaiseInteraction(eventArgs);
+        } else if (hit.elementType == ChartElementType.MapRegion && option.mapSelect
+        && mapGeometry != null && ChartKinds.SelectedModeEnabled(mapGeometry.series.selectedMode)) {
+            bool multiple = mapGeometry.series.selectedMode == "multiple";
+            int key = multiple ? Chart.MapRegionSelKey(option.iwid, hit.dataIndex) : Chart.MapSelKey(option.iwid);
+            int old = app.StateGet(key, multiple ? 0 : -1);
+            bool selected = multiple ? old == 0 : old != hit.dataIndex;
+            app.StateSet(key, multiple ? (selected ? 1 : 0) : (selected ? hit.dataIndex : -1));
+            ChartInteractionEvent eventArgs = ChartView.EventFromHit(ChartEventType.MapSelected, option.iwid, hit);
+            eventArgs.selected = selected;
+            this.RaiseInteraction(eventArgs);
+        }
+    }
+
+    void RaiseZoomChange(App app, int lo, int hi, int x, int y) {
+        ChartInteractionEvent eventArgs = ChartInteractionEvent.Of(ChartEventType.DataZoom, wid);
+        eventArgs.zoomStart = lo; eventArgs.zoomEnd = hi;
+        eventArgs.x = x; eventArgs.y = y;
+        this.RaiseInteraction(eventArgs);
+    }
+}

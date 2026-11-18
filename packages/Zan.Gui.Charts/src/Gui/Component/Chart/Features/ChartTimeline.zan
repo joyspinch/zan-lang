@@ -2,327 +2,173 @@ using System;
 using System.Json;
 using System.Numerics;
 using Gui;
-using Gui.Backend;
 
 namespace Gui.Component.Chart;
 
-// ECharts timeline 动态时间轴组件：
-// 多帧 option + 底部播放器（播放/暂停、前/后帧、帧轴点选）+ 帧合并。
-// 模型（全链路确定性——不读时钟做逻辑，帧推进只由显式输入驱动）：
-// - 调用方把 N 帧的 <see cref="ChartOption"/> 装进 <see cref="frames"/>，
-// 当前帧号持久化在 App 状态键（<see cref="ChartTimeline.TlIdxKey"/>），跨帧存活。
-// - <see cref="Draw"/> 画播放器条（面板底部，dataRange 条之上），
-// 返回当前帧号；宿主用 <see cref="Current"/> 从 frames 取帧渲染。
-// - 自动播放：挂钟只用于「距上拍是否已过 intervalMs」的判断
-// （Carousel.autoplay 同款模式），上拍时刻由调用方持有
-// （即时模式宿主每帧重建，实例字段会归零）。
-// - <see cref="Merge"/> 把当前帧的数据/标题叠加到基础 option 上，
-// 供 ECharts「baseOption + options[]」时间轴语义：轴/图例等
-// 外壳留在 base，series data 逐帧替换。
-public class ChartTimeline {
-    // 帧序列：每帧一个完整 option（ECharts timeline 的 options[]）。
+// 布局准备播放器几何，路由输入与循环调度推进帧，绘制只读状态。
+// Merge 实现 ECharts baseOption + options[] 的逐帧系列替换。
+public partial class ChartTimeline : Control {
     public List<ChartOption> frames;
-    // 帧标签（空 = 用帧 option 的 title，再退化为 1..N）。
     public List<string> labels;
-    // 自动播放间隔（毫秒；0 = 不自动播放）。
     public int intervalMs;
 
     public ChartTimeline() {
+        this.InitControl("chartTimeline", 0);
+        this.InitTimelineInput();
         this.frames = new List<ChartOption>();
         this.labels = new List<string>();
         this.intervalMs = 0;
     }
 
-    // 构造空时间轴（帧与标签逐个经 Frame/Labels 追加）。
-    public static ChartTimeline Of() {
-        return new ChartTimeline();
-    }
+    public static ChartTimeline Of() { return new ChartTimeline(); }
 
-    // 追加一帧（返回 this 便于链式装配）。
-    public ChartTimeline Frame(ChartOption o) {
-        if (o != null) { this.frames.Add(o); }
+    public ChartTimeline Frame(ChartOption option) {
+        if (option != null) { this.frames.Add(option); this.Invalidate(); }
         return this;
     }
 
-    // 逐帧标签（与 Frame 同序；超出部分忽略，缺省回退 title/序号）。
-    public ChartTimeline Labels(List<string> ls) {
-        if (ls != null) {
-            for (int i = 0; i < ls.Count; i = i + 1) { this.labels.Add(ls[i]); }
+    public ChartTimeline Labels(List<string> values) {
+        if (values != null) {
+            for (int i = 0; i < values.Count; i = i + 1) { this.labels.Add(values[i]); }
+            this.Invalidate();
         }
         return this;
     }
 
-    // 自动播放（毫秒/帧；ECharts timeline.autoPlay + PlayState）。
     public ChartTimeline AutoPlay(int interval) {
         this.intervalMs = interval;
+        App app = this.App;
+        if (app != null) { this.PrepareTimeline(app); }
+        this.Invalidate();
         return this;
     }
 
-    // 帧数。
     public int FrameCount() { return this.frames.Count; }
 
-    // 第 i 帧的 option；越界返回 null。
-    public ChartOption FrameAt(int i) {
-        if (i < 0 || i >= this.frames.Count) { return null; }
-        return this.frames[i];
+    public ChartOption FrameAt(int index) {
+        if (index < 0 || index >= this.frames.Count) { return null; }
+        return this.frames[index];
     }
 
-    // 当前帧（钳制后；空序列返回 null）。
-    public ChartOption Current(int idx) {
-        return this.FrameAt(ChartTimeline.Clamp(idx, this.frames.Count));
+    public ChartOption Current(int index) {
+        return this.FrameAt(ChartTimeline.Clamp(index, this.frames.Count));
     }
 
-    // 宿主侧帧号读取：从 App 状态取当前帧号（未初始化/越界钳到
-    // 有效域），供「先渲染当前帧、再画播放器条」的调用顺序。
-    public static int TimelineIdxOf(App app, int wid, int n) {
-        if (app == null || n < 1) { return 0; }
-        return ChartTimeline.Clamp(app.StateGet(ChartTimeline.TlIdxKey(wid), 0), n);
+    public int CurrentIndex() {
+        return ChartTimeline.TimelineIdxOf(this.App, this.WidgetId(), this.frames.Count);
     }
 
-    // 从 ECharts timeline JSON 节点解析：
-    // "options":[{"series":[...]}, ...]}
-    // 也接受单对象 timeline 配置形态。data[] 是逐帧标签；
-    // options 缺失时退回 baseOption（空时间轴，无帧）。base 的
-    // 外壳字段（轴/图例/标题等）由调用方持有，本解析只产帧与标签。
-    public static ChartTimeline FromJsonValue(JsonValue tl, JsonValue optionsNode) {
-        ChartTimeline t = ChartTimeline.Of();
-        if (tl != null && tl.IsObject()) {
-            if (tl.Bool("autoPlay", false)) {
-                t.intervalMs = tl.Int("playInterval", 1000);
-            } else if (tl.Has("playInterval")) {
-                t.intervalMs = tl.Int("playInterval", 1000);
+    public static int TimelineIdxOf(App app, int wid, int count) {
+        if (app == null || count < 1) { return 0; }
+        return ChartTimeline.Clamp(app.StateGet(ChartTimeline.TlIdxKey(wid), 0), count);
+    }
+
+    public static ChartTimeline FromJsonValue(JsonValue timeline, JsonValue options) {
+        ChartTimeline result = ChartTimeline.Of();
+        if (timeline != null && timeline.IsObject()) {
+            if (timeline.Bool("autoPlay", false) || timeline.Has("playInterval")) {
+                result.intervalMs = timeline.Int("playInterval", 1000);
             }
-            JsonValue data = tl.Get("data");
+            JsonValue data = timeline.Get("data");
             if (data != null && data.IsArray()) {
                 for (int i = 0; i < data.Count(); i = i + 1) {
-                    t.labels.Add(data.At(i).AsString(""));
+                    result.labels.Add(data.At(i).AsString(""));
                 }
             }
         }
-        if (optionsNode != null && optionsNode.IsArray()) {
-            for (int i = 0; i < optionsNode.Count(); i = i + 1) {
-                t.frames.Add(ChartOption.FromJsonValue(optionsNode.At(i)));
+        if (options != null && options.IsArray()) {
+            for (int i = 0; i < options.Count(); i = i + 1) {
+                result.frames.Add(ChartOption.FromJsonValue(options.At(i)));
             }
         }
-        return t;
+        return result;
     }
 
-    // 帧显示名：labels[i] → frames[i].title → 序号。
-    public string LabelAt(int i) {
-        if (i < this.labels.Count && this.labels[i].Length > 0) {
-            return this.labels[i];
+    public string LabelAt(int index) {
+        if (index < this.labels.Count && this.labels[index].Length > 0) {
+            return this.labels[index];
         }
-        if (i < this.frames.Count && this.frames[i].title.Length > 0) {
-            return this.frames[i].title;
+        if (index < this.frames.Count && this.frames[index].title.Length > 0) {
+            return this.frames[index].title;
         }
-        return Convert.ToString(i + 1);
+        return Convert.ToString(index + 1);
     }
 
-    // ---- 纯 seam（conformance 直测，无 App）----
-
-    // 帧号钳制：负值回 0，越界回尾帧（空序列恒 0）。
-    // 空/非法序列（n<1）的契约是本 seam 特有语义，核心钳制转发 stdlib MathUtil.Clamp。
-    public static int Clamp(int i, int n) {
-        if (n < 1) { return 0; }
-        return MathUtil.Clamp(i, 0, n - 1);
+    public static int Clamp(int index, int count) {
+        if (count < 1) { return 0; }
+        return MathUtil.Clamp(index, 0, count - 1);
     }
 
-    // 自动播放推进：now - last >= interval 时翻下一帧（循环）。
-    // 纯函数 seam：返回新的帧号与新的上拍时刻。
-    public static int StepPlay(int i, int n, int last, int now, int interval) {
-        if (n < 1) { return 0; }
-        if (interval < 1) { return Clamp(i, n); }
-        if (last < 0) { return Clamp(i, n); }
-        if (now - last < interval) { return Clamp(i, n); }
-        return (Clamp(i, n) + 1) % n;
+    // 纯节拍函数：过期只推进一次，避免暂停或阻塞后补发大量帧。
+    public static int StepPlay(int index, int count, int last, int now, int interval) {
+        if (count < 1) { return 0; }
+        if (interval < 1 || last < 0 || now - last < interval) { return Clamp(index, count); }
+        return (Clamp(index, count) + 1) % count;
     }
 
-    // 帧合并（ECharts baseOption + options[i] 语义的落地）：
-    // base 的轴/图例/缩放/标记等外壳保留，把帧的 series 逐条
-    // 叠进同名系列（数据 + 每帧样式字段），base 没有的系列追加；
-    // 帧标题非空时覆盖 base 标题。base 自身不被修改。
-    public static ChartOption Merge(ChartOption baseOpt, ChartOption frame) {
-        ChartOption o = baseOpt != null ? baseOpt.Clone() : ChartOption.Create();
-        if (o == null) { o = ChartOption.Create(); }
-        if (frame == null) { return o; }
-        if (frame.title.Length > 0) { o.title = frame.title; }
+    public static ChartOption Merge(ChartOption baseOption, ChartOption frame) {
+        ChartOption result = baseOption != null ? baseOption.Clone() : ChartOption.Create();
+        if (result == null) { result = ChartOption.Create(); }
+        if (frame == null) { return result; }
+        if (frame.title.Length > 0) { result.title = frame.title; }
         for (int i = 0; i < frame.series.Count; i = i + 1) {
-            ChartSeries fs = frame.series[i];
-            ChartSeries fc = fs != null ? fs.Clone() : null;
-            if (fc == null) { continue; }
-            int hit = 0 - 1;
-            for (int si = 0; si < o.series.Count; si = si + 1) {
-                if (o.series[si].name == fs.name) { hit = si; break; }
+            ChartSeries source = frame.series[i];
+            ChartSeries copy = source != null ? source.Clone() : null;
+            if (copy == null) { continue; }
+            int found = -1;
+            for (int j = 0; j < result.series.Count; j = j + 1) {
+                if (result.series[j].name == source.name) { found = j; break; }
             }
-            if (hit < 0) {
-                o.series.Add(fc);
-                continue;
-            }
-            // 帧系列是完整的独立快照：替换整个同名系列，避免
-            // 漏掉 gauge、tree、box/error、事件、mark 或逐系列样式。
-            // fc 已由 Clone 构造，因此替换不会把 frame 引用带入结果。
-            o.series[hit] = fc;
+            if (found < 0) { result.series.Add(copy); }
+            else { result.series[found] = copy; }
         }
-        return o;
+        return result;
     }
 
-    // ---- 交互键（基于作用域 Hash 派生，与 zoom/dataRange/tree/toolbox 天然隔离）----
-
-    // 当前帧号（持久化；默认 -1 = 首帧前未初始化）。
     public static int TlIdxKey(int wid) { return IdHash.HashInt(wid, 201); }
-    // 播放/暂停（1 = 播放中）。
     public static int TlPlayKey(int wid) { return IdHash.HashInt(wid, 202); }
-    // 本帧上拍时刻（autoplay 用；由宿主每帧回写）。
     public static int TlTickKey(int wid) { return IdHash.HashInt(wid, 203); }
-    // 命中 id：播放/暂停按钮、前后帧、第 bi 个帧点。
-    public static int TlHitPlay(int wid) { return IdHash.HashInt(wid, 204); }
-    // 命中 id：前一帧按钮。
-    public static int TlHitPrev(int wid) { return IdHash.HashInt(wid, 205); }
-    // 命中 id：后一帧按钮。
-    public static int TlHitNext(int wid) { return IdHash.HashInt(wid, 206); }
-    // 命中 id：第 bi 个帧点（点选跳帧）。
-    public static int TlHitDot(int wid, int bi) { return IdHash.HashInt(bi, IdHash.HashInt(wid, 207)); }
 
-    // ---- 播放器条 ----
+    public static int Height(App app) { return app.Scale(26); }
 
-    // 播放器条高度（宿主在 dataRange 之上让位；不画时为 0）。
-    public static int Height(App app) {
-        return app.Scale(26);
-    }
-
-    // 画播放器条并驱动帧状态（面板内底部一横条）：
-    // [播放/暂停] [前一帧] [轨道 + 帧点] [后一帧] [当前帧标签]。
-    // 帧号/播放态持久化在 wid 的 App 状态里；autoplay 到拍推进
-    // （Carousel.autoplay 同款：上拍时刻由 App 状态持有，宿主
-    // 每帧重建也不丢）。返回当前帧号。
-    public int Draw(App app, int wid, int x, int y, int w) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int n = this.frames.Count;
-        if (n < 1) { return 0; }
-
-        // 帧号初始化（默认 -1 → 首帧）。
-        int idx = app.StateGet(ChartTimeline.TlIdxKey(wid), 0 - 1);
-        if (idx < 0) {
-            idx = 0;
-            app.StateSet(ChartTimeline.TlIdxKey(wid), 0);
-        }
-        idx = ChartTimeline.Clamp(idx, n);
-
-        // 播放态：AutoPlay 过的缺省即播放中（ECharts timeline.autoPlay
-        // : true 起播），用户暂停/恢复后以存储值为准。
-        int playing = app.StateGet(ChartTimeline.TlPlayKey(wid),
-                                    this.intervalMs > 0 ? 1 : 0);
-        int barH = ChartTimeline.Height(app);
-        int btn = app.Scale(18);
-        int pad = app.Scale(2);
-        int bx = x;
-        int by = y + (barH - btn) / 2;
+    void DrawFrame(App app) {
+        ChartTimelineLayout layout = inputLayout;
+        int count = this.frames.Count;
+        if (layout == null || count < 1 || layout.dots.Count != count) { return; }
+        Canvas canvas = app.canvas;
+        int index = this.CurrentIndex();
+        int playing = app.StateGet(ChartTimeline.TlPlayKey(this.WidgetId()), intervalMs > 0 ? 1 : 0);
         int glyph = app.Scale(13);
-        int fg = Style.Part(app, "chart", "hint", "", "", "",
-                            Style.SNormal()).FgOr(0);
-
-        // 播放/暂停。
-        int playId = ChartTimeline.TlHitPlay(wid);
-        app.hitTester.RegisterRect(playId, bx, by, btn, btn, 3);
-        c.DrawGlyphIn(playing == 1 ? "pause" : "play", bx, by, btn, btn,
-                      glyph, fg);
-        int dotBg = Style.Part(app, "chart", "zoom-track", "", "", "",
-                               Style.SNormal()).BgOr(0);
-        int dotOn = Style.Part(app, "chart", "zoom-window", "", "", "",
-                               Style.SNormal()).BgOr(0);
-        if (Ui.Clicked(app, playId)) {
-            app.StateSet(ChartTimeline.TlPlayKey(wid), playing == 1 ? 0 : 1);
-            if (playing == 0) {
-                // 从暂停进入播放：重置上拍，立即走一拍。
-                app.StateSet(ChartTimeline.TlTickKey(wid), 0);
-            }
-            app.RequestRedraw();
-            playing = playing == 1 ? 0 : 1;
-        }
-        bx = bx + btn + pad;
-
-        // 前一帧。
-        int prevId = ChartTimeline.TlHitPrev(wid);
-        app.hitTester.RegisterRect(prevId, bx, by, btn, btn, 3);
-        c.DrawGlyphIn("chevron-left", bx, by, btn, btn, glyph, fg);
-        if (Ui.Clicked(app, prevId)) {
-            int nextIdx = (idx + n - 1) % n;
-            app.StateSet(ChartTimeline.TlIdxKey(wid), nextIdx);
-            ChartInteractionEvent prevEvent = ChartInteractionEvent.Of(
-                ChartEventType.TimelineChanged, wid);
-            prevEvent.dataIndex = nextIdx;
-            ChartView.RaiseActive(prevEvent);
-            app.RequestRedraw();
-        }
-        bx = bx + btn + pad * 2;
-
-        // 轨道 + 帧点（点选跳帧）。
-        int dotR = app.Scale(3);
-        int dotD = dotR * 2 + app.Scale(4);
-        int rightW = btn + pad * 2 + app.Scale(56);
-        int trackX = bx;
-        int trackW = x + w - rightW - trackX;
-        if (trackW < dotD && n > 0) { trackW = dotD; }
-        c.FillRoundRect(trackX, y + barH / 2 - app.Scale(1), trackW,
-                        app.Scale(2), app.Scale(1), dotBg);
-        for (int bi = 0; bi < n; bi = bi + 1) {
-            int cx = trackX + (bi * trackW) / (n > 1 ? n - 1 : 1);
-            int cy = y + barH / 2;
-            int did = ChartTimeline.TlHitDot(wid, bi);
-            app.hitTester.RegisterRect(did, cx - dotD / 2, cy - dotD / 2,
-                                       dotD, dotD, 3);
-            c.FillCircle(cx, cy, bi == idx ? dotR + app.Scale(1) : dotR,
-                         bi == idx ? dotOn : dotBg);
-            if (bi == idx && this.LabelAt(bi).Length > 0) {
-                string lb = this.LabelAt(bi);
-                int lw = Canvas.MeasureText(lb, ChartFonts.Legend(app));
-                int lx = cx - lw / 2;
-                if (lx < trackX) { lx = trackX; }
-                if (lx + lw > trackX + trackW) { lx = trackX + trackW - lw; }
-                c.DrawText(lx, cy - Canvas.FontHeight(ChartFonts.Legend(app))
-                           - app.Scale(2), lb, fg,
-                           ChartFonts.Legend(app));
-            }
-            if (Ui.Clicked(app, did)) {
-                app.StateSet(ChartTimeline.TlIdxKey(wid), bi);
-                ChartInteractionEvent dotEvent = ChartInteractionEvent.Of(
-                    ChartEventType.TimelineChanged, wid);
-                dotEvent.dataIndex = bi;
-                ChartView.RaiseActive(dotEvent);
-                app.RequestRedraw();
+        int foreground = Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0);
+        int dotBackground = Style.Part(app, "chart", "zoom-track", "", "", "", Style.SNormal()).BgOr(0);
+        int dotActive = Style.Part(app, "chart", "zoom-window", "", "", "", Style.SNormal()).BgOr(0);
+        canvas.DrawGlyphIn(playing == 1 ? "pause" : "play", layout.play.x, layout.play.y,
+        layout.play.width, layout.play.height, glyph, foreground);
+        canvas.DrawGlyphIn("chevron-left", layout.previous.x, layout.previous.y,
+        layout.previous.width, layout.previous.height, glyph, foreground);
+        canvas.FillRoundRect(layout.track.x, layout.track.y, layout.track.width, layout.track.height,
+        app.Scale(1), dotBackground);
+        for (int i = 0; i < count; i = i + 1) {
+            Rect dot = layout.dots[i];
+            int center = dot.x + dot.width / 2;
+            canvas.FillCircle(center, layout.dotY,
+            i == index ? layout.dotRadius + app.Scale(1) : layout.dotRadius,
+            i == index ? dotActive : dotBackground);
+            if (i == index) {
+                string label = this.LabelAt(i);
+                if (label.Length > 0) {
+                    int width = Canvas.MeasureText(label, ChartFonts.Legend(app));
+                    int left = center - width / 2;
+                    if (left < layout.track.x) { left = layout.track.x; }
+                    if (left + width > layout.track.x + layout.track.width) {
+                        left = layout.track.x + layout.track.width - width;
+                    }
+                    canvas.DrawText(left, layout.dotY - Canvas.FontHeight(ChartFonts.Legend(app))
+                    - app.Scale(2), label, foreground, ChartFonts.Legend(app));
+                }
             }
         }
-
-        // 后一帧。
-        int nx = trackX + trackW + pad * 2;
-        int nextId = ChartTimeline.TlHitNext(wid);
-        app.hitTester.RegisterRect(nextId, nx, by, btn, btn, 3);
-        c.DrawGlyphIn("chevron-right", nx, by, btn, btn, glyph, fg);
-        if (Ui.Clicked(app, nextId)) {
-            int nextIdx = (idx + 1) % n;
-            app.StateSet(ChartTimeline.TlIdxKey(wid), nextIdx);
-            ChartInteractionEvent nextEvent = ChartInteractionEvent.Of(
-                ChartEventType.TimelineChanged, wid);
-            nextEvent.dataIndex = nextIdx;
-            ChartView.RaiseActive(nextEvent);
-            app.RequestRedraw();
-        }
-
-        // 自动播放：到拍推进并请求动画帧（挂钟只判断节拍，
-        // 上拍时刻持久化在 App 状态——即时模式宿主每帧重建不丢）。
-        if (playing == 1 && this.intervalMs > 0) {
-            int now = Window.GetTickMs();
-            int last = app.StateGet(ChartTimeline.TlTickKey(wid), 0);
-            if (last == 0) { last = now; }
-            int nxt = ChartTimeline.StepPlay(idx, n, last, now, this.intervalMs);
-            if (nxt != idx) {
-                app.StateSet(ChartTimeline.TlIdxKey(wid), nxt);
-            }
-            app.StateSet(ChartTimeline.TlTickKey(wid), nxt != idx ? now : last);
-            app.RequestAnimationFrameIn(this.intervalMs / 4 > 16 ? this.intervalMs / 4 : 16,
-                                        x, y, w, barH);
-        }
-        return ChartTimeline.Clamp(app.StateGet(ChartTimeline.TlIdxKey(wid), idx), n);
+        canvas.DrawGlyphIn("chevron-right", layout.next.x, layout.next.y,
+        layout.next.width, layout.next.height, glyph, foreground);
     }
 }

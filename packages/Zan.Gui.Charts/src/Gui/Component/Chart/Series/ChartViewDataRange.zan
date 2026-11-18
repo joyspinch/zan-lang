@@ -96,22 +96,18 @@ public class ChartViewDataRange {
         Canvas c = app.canvas;
         int fs = ChartFonts.SeriesLabel(app);
         int fg = Style.Part(app, "chart", "axis", "", "", "",
-                            Style.SNormal()).FgOr(0);
+        Style.SNormal()).FgOr(0);
         if (o.dataRangeList.Count > 0) {
             ChartViewDataRange.DrawSplits(app, c, x, y, w, o, fs, fg);
             return;
         }
-        int dLo = 0; int dHi = 0;
-        ChartViewDataRange.DataSpan(o, out dLo, out dHi);
-        if (o.dataRangeLo != ChartOption.Auto()) { dLo = o.dataRangeLo; }
-        if (o.dataRangeHi != ChartOption.Auto()) { dHi = o.dataRangeHi; }
-        if (dHi <= dLo) { dHi = dLo + 1; }
-        int pad = ChartViewDataRange.Pad(app);
-        int bx = x + pad;
-        int bw = w - pad * 2;
-        if (bw < app.Scale(24)) { return; }
-        int barY = y + app.Scale(2);
-        int barH = app.Scale(12);
+        ChartView view = ChartView.activeEventView;
+        ChartDataRangeLayout layout = view != null && view.option == o ? view.rangeLayout : null;
+        if (layout == null) { layout = ChartDataRangeLayout.Create(app, o, x, y, w, h); }
+        if (layout == null) { return; }
+        int dLo = layout.lo; int dHi = layout.hi;
+        int bx = layout.x; int bw = layout.w;
+        int barY = layout.y; int barH = layout.h;
         int nSeg = o.dataRangeSplit;
         if (nSeg < 2) { nSeg = 5; }
         int segW = bw / nSeg;
@@ -134,16 +130,13 @@ public class ChartViewDataRange {
         int lh = Canvas.FontHeight(fs);
         c.DrawText(bx, barY + barH + app.Scale(2), ls, fg, fs);
         c.DrawText(bx + bw - Canvas.MeasureText(hs, fs),
-                   barY + barH + app.Scale(2), hs, fg, fs);
+        barY + barH + app.Scale(2), hs, fg, fs);
         if (!o.dataRangeCalculable) { return; }
 
         // calculable：色带上叠加双滑块窗口（DRangeLo/HiKey 0..1000，
         // 默认 0..1000 = 不裁剪）。
-        int loQ = app.StateGet(Chart.DRangeLoKey(o.iwid), 0);
-        int hiQ = app.StateGet(Chart.DRangeHiKey(o.iwid), 1000);
-        int hw = app.Scale(6);
-        int loX = bx + loQ * bw / 1000;
-        int hiX = bx + hiQ * bw / 1000;
+        int hw = layout.handle;
+        int loX = layout.loX; int hiX = layout.hiX;
         int outX = loX;
         int outW = hiX - loX;
         if (outX < bx) { outW = outW - (bx - outX); outX = bx; }
@@ -151,58 +144,9 @@ public class ChartViewDataRange {
         if (outW < 0) { outW = 0; }
         c.FillRect(outX, barY, outW, barH, ChartColor.WithAlpha(fg, 36));
         c.FillRoundRect(loX - hw, barY - app.Scale(1), hw * 2, barH + app.Scale(2),
-                        app.Scale(3), ChartColor.Rgb(88, 93, 100));
+        app.Scale(3), ChartColor.Rgb(88, 93, 100));
         c.FillRoundRect(hiX - hw, barY - app.Scale(1), hw * 2, barH + app.Scale(2),
-                        app.Scale(3), ChartColor.Rgb(88, 93, 100));
-        int loId = app.focus.AllocId();
-        int hiId = app.focus.AllocId();
-        app.hitTester.RegisterRect(loId, loX - hw, barY - app.Scale(2),
-                                   hw * 2, barH + app.Scale(4), 3);
-        app.hitTester.RegisterRect(hiId, hiX - hw, barY - app.Scale(2),
-                                   hw * 2, barH + app.Scale(4), 3);
-        int mxQ = (app.mouseX - bx) * 1000 / bw;
-        if (mxQ < 0) { mxQ = 0; }
-        if (mxQ > 1000) { mxQ = 1000; }
-        int minGap = 20;
-        bool dirty = false;
-        if (Ui.Pressed(app, loId)) {
-            int nv = mxQ;
-            if (nv > hiQ - minGap) { nv = hiQ - minGap; }
-            if (nv < 0) { nv = 0; }
-            if (nv != loQ) {
-                app.StateSet(Chart.DRangeLoKey(o.iwid), nv);
-                dirty = true;
-            }
-        } else if (Ui.Pressed(app, hiId)) {
-            int nv = mxQ;
-            if (nv < loQ + minGap) { nv = loQ + minGap; }
-            if (nv > 1000) { nv = 1000; }
-            if (nv != hiQ) {
-                app.StateSet(Chart.DRangeHiKey(o.iwid), nv);
-                dirty = true;
-            }
-        }
-        if (dirty) {
-            app.RequestRedraw();
-            ChartInteractionEvent de = ChartInteractionEvent.Of(
-                ChartEventType.DataRange, o.iwid);
-            de.zoomStart = app.StateGet(Chart.DRangeLoKey(o.iwid), 0);
-            de.zoomEnd = app.StateGet(Chart.DRangeHiKey(o.iwid), 1000);
-            de.x = app.mouseX;
-            de.y = app.mouseY;
-            ChartView.RaiseActive(de);
-        }
-        // hoverLink：指针悬停在 dataRange 条上 → 置图的高亮键；离开清除。
-        // 主图消费（HoverHighlight）把值域落在滑动窗口内的图形强调。
-        if (o.dataRangeHoverLink && o.iwid != 0) {
-            bool was = app.StateGet(Chart.DRangeHoverKey(o.iwid), 0) == 1;
-            bool now = app.mouseX >= x && app.mouseX < x + w
-                && app.mouseY >= y && app.mouseY < y + h;
-            if (now != was) {
-                app.StateSet(Chart.DRangeHoverKey(o.iwid), now ? 1 : 0);
-                app.RequestRedraw();
-            }
-        }
+        app.Scale(3), ChartColor.Rgb(88, 93, 100));
     }
 
     // hoverLink 消费 seam：悬停 dataRange 期间，值落在当前滑动
@@ -213,30 +157,26 @@ public class ChartViewDataRange {
         if (!o.dataRangeHoverLink || o.iwid == 0) { return false; }
         if (app.StateGet(Chart.DRangeHoverKey(o.iwid), 0) != 1) { return false; }
         return v >= Chart.DRangeEff(app, o, o.iwid, vMin, vMax, false)
-            && v <= Chart.DRangeEff(app, o, o.iwid, vMin, vMax, true);
+        && v <= Chart.DRangeEff(app, o, o.iwid, vMin, vMax, true);
     }
 
     // splitList 形态：横向色块 + 标签，点击切灰。
     public static void DrawSplits(App app, Canvas c, int x, int y, int w,
-                           ChartOption o, int fs, int fg) {
-        int pad = ChartViewDataRange.Pad(app);
+    ChartOption o, int fs, int fg) {
+        ChartView view = ChartView.activeEventView;
+        ChartDataRangeLayout layout = view != null && view.option == o ? view.rangeLayout : null;
+        if (layout == null) {
+            layout = ChartDataRangeLayout.Create(app, o, x, y, w, ChartViewDataRange.Height(app, o));
+        }
+        if (layout == null) { return; }
         int sw = app.Scale(10);
-        int gap = app.Scale(6);
-        int rowH = Canvas.FontHeight(fs) + app.Scale(4);
-        int cx = x + pad;
-        int cy = y + (ChartViewDataRange.Height(app, o) - rowH) / 2;
-        int maxX = x + w - pad;
-        int n = o.dataRangeList.Count;
+        int n = layout.splits.Count;
         int lgFs = fs;
         for (int bi = 0; bi < n; bi = bi + 1) {
-            ChartRangeSplit sp = o.dataRangeList[bi];
-            string lbl = sp.label;
+            ChartLegendEntry entry = layout.splits[bi];
+            int cx = entry.x; int cy = entry.y;
+            string lbl = entry.text;
             int tw = Canvas.MeasureText(lbl, lgFs);
-            int chipW = sw + app.Scale(4) + tw + gap;
-            if (cx > x + pad && cx + chipW > maxX) {
-                cx = x + pad;
-                cy = cy + rowH + app.Scale(2);
-            }
             bool off = app.StateGet(Chart.DRangeBandKey(o.iwid, bi), 0) != 0;
             int col = ChartColor.Rgb(214, 217, 222);
             if (o.rampColors != null && o.rampColors.Count >= 2 && n > 1) {
@@ -244,7 +184,7 @@ public class ChartViewDataRange {
             }
             if (off) { col = ChartColor.WithAlpha(col, 60); }
             c.FillRoundRect(cx, cy + app.Scale(1), sw, sw,
-                            app.Scale(2), col);
+            app.Scale(2), col);
             int tcol = fg;
             if (off) { tcol = ChartColor.WithAlpha(fg, 100); }
             c.DrawText(cx + sw + app.Scale(4), cy + app.Scale(2), lbl, tcol, lgFs);
@@ -252,19 +192,6 @@ public class ChartViewDataRange {
                 int my = cy + app.Scale(2) + Canvas.FontHeight(lgFs) / 2;
                 c.FillRect(cx + sw + app.Scale(4), my, tw, 1, tcol);
             }
-            int hitId = app.focus.AllocId();
-            app.hitTester.RegisterRect(hitId, cx, cy, sw + app.Scale(4) + tw, rowH, 3);
-            if (Ui.Clicked(app, hitId)) {
-                int nextOff = off ? 0 : 1;
-                app.StateSet(Chart.DRangeBandKey(o.iwid, bi), nextOff);
-                ChartInteractionEvent splitEvent = ChartInteractionEvent.Of(
-                    ChartEventType.DataRange, o.iwid);
-                splitEvent.dataIndex = bi;
-                splitEvent.selected = nextOff == 0;
-                ChartView.RaiseActive(splitEvent);
-                app.RequestRedraw();
-            }
-            cx = cx + chipW;
         }
     }
 }

@@ -13,142 +13,33 @@ public partial class ChartView {
     // labels[0] 对应的数据索引（dataZoom 窗口起点）。绘图区几何
     // 以 ChartFrame 返回，供调用方画缩放滑块。
     public static ChartFrame HBarCore(App app, int x, int y, int w, int h, ChartOption o,
-                               List<string> labels, List<ChartSeries> series,
-                               bool stacked, int g, int baseIdx) {
+    List<string> labels, List<ChartSeries> series,
+    bool stacked, int g, int baseIdx) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         c.PushClip(x, y, w, h);
-        int pad = t.paddingMedium;
-        // 迷你面板（matrix 锚格 ~40px 高）：主题 pad 在整幅上是留白，
-        // 在迷你格里上下各吃一行后绘图区成负值、整格柱子静默不画
-        // ——格内留白收缩（官方 mini-bar 柱条几乎撑满格子）。
-        if (h < app.Scale(60)) { pad = app.Scale(3); }
-        int axisFs = ChartFonts.AxisLabel(app);
-        int n = labels.Count;
-        int ns = series.Count;
-        int wid = o.iwid;
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, series, wid, o.showLegend);
-        // 剔除隐藏序列，使槽位布局只按可见序列分配；事件 payload
-        // 仍通过原始 option 回查系列下标。Zero-Alloc 池化复用。
-        Chart.renderContext.EnsureScratch();
-        List<ChartSeries> visSeries = Chart.renderContext.scratchSer1; visSeries.Clear();
-        for (int hi2 = 0; hi2 < series.Count; hi2 = hi2 + 1) {
-            if (!series[hi2].hidden) {
-                visSeries.Add(series[hi2]);
-            }
-        }
-        if (visSeries.Count > 0) { series = visSeries; }
-        ns = series.Count;
-        if (ns < 1) { ns = 1; }
-
-        if (n < 1 || ns < 1) { c.PopClip(); return null; }
-
-        // 值域分两套模式：小数系列（bar-negative2 的 -0.07..0.47）走
-        // ×1000 定点域（NiceRange 取 nice 界），整数系列保持原 int
-        // 域（NiceMin/NiceMax）——两套的映射/累计都是模式自洽的，
-        // 整数路径逐像素不变。
-        bool vFrac = Chart.SeriesFracAny(series, 0);
-        int ticksH = 5;
-        int lo;
-        int hi;
-        if (vFrac) {
-            int dataMinF = 0;
-            int dataMaxF = 0;
-            for (int fi = 0; fi < series.Count; fi = fi + 1) {
-                if (!series[fi].hidden) {
-                    for (int fj = 0; fj < series[fi].Count(); fj = fj + 1) {
-                        double dfv = series[fi].Number(fj);
-                        int fvF = (int)(dfv * 1000.0 + (dfv >= 0 ? 0.5 : 0 - 0.5));
-                        if (fvF > dataMaxF) { dataMaxF = fvF; }
-                        if (fvF < dataMinF) { dataMinF = fvF; }
-                    }
-                }
-            }
-            ChartSpan spH = Chart.NiceRange(dataMinF, dataMaxF);
-            lo = spH.lo;
-            hi = spH.hi;
-            ticksH = spH.ticks;
-        } else {
-            int dataMin = 0;
-            int dataMax = 0;
-            for (int fi = 0; fi < series.Count; fi = fi + 1) {
-                if (!series[fi].hidden) {
-                    for (int fj = 0; fj < series[fi].Count(); fj = fj + 1) {
-                        int fv = series[fi].Value(fj);
-                        if (fv > dataMax) { dataMax = fv; }
-                        if (fv < dataMin) { dataMin = fv; }
-                    }
-                }
-            }
-            lo = (int)Chart.NiceMin((double)dataMin);
-            hi = (int)Chart.NiceMax(dataMax);
-        }
-        if (stacked) {
-            int stMax = 0;
-            for (int qi = 0; qi < series.Count; qi = qi + 1) {
-                if (series[qi].Count() > stMax) { stMax = series[qi].Count(); }
-            }
-            // 正负独立累加器下的组顶/组底定标（MaxStackAll 会把
-            // 正负相加，量程缩水）。Y 量程随 dataZoom 可见窗口重定
-            // （与 Chart.BuildAxesR 同一契约）：窗口化只在真的缩放
-            // 时启用，未缩放图逐像素不变。
-            if (vFrac) {
-                int hz0 = 0 - 1;
-                int hz1 = 0 - 1;
-                if (o.zoom && o.iwid != 0 && n > 1) {
-                    int hw0 = Chart.ZoomI0(app, o, o.iwid, n);
-                    int hw1 = Chart.ZoomI1(app, o, o.iwid, n);
-                    if (hw0 > 0 || hw1 < n - 1) { hz0 = hw0; hz1 = hw1; }
-                }
-                ChartSpan seH = Chart.StackExtentF(series, 0, hz0, hz1);
-                ChartSpan spN = Chart.NiceRange(seH.lo, seH.hi);
-                lo = spN.lo;
-                hi = spN.hi;
-                ticksH = spN.ticks;
-            } else {
-                hi = Chart.NiceMax(Chart.MaxBarStackGroupsW(series, stMax, baseIdx));
-                lo = (int)Chart.NiceMin((double)Chart.MinBarStackGroupsW(series, stMax, baseIdx));
-            }
-        }
-        // 值轴是 x 轴（横条）：声明 min/max（含 'dataMin'/'dataMax'
-        // 字面量）固定定义域——watermark max:10887、bar-race
-        // max:'dataMax'（钉原始数据上界，不 nice）。之前全不读。
-        ChartAxis hval = o.XAxis0();
-        if (hval != null && hval.type != ChartAxisType.Category) {
-            if (hval.minDataB) { lo = Chart.BarDataMinRaw(series); }
-            else if (hval.min != ChartOption.Auto()) { lo = hval.min; }
-            if (hval.maxDataB) { hi = Chart.BarDataMaxRaw(series); }
-            else if (hval.max != ChartOption.Auto()) { hi = hval.max; }
-        }
-        if (hi <= lo) { hi = lo + 1; }
-        int span = hi - lo;
-
-        // 最宽的类别标签决定左侧留白
-        int leftGut = app.Scale(20);
-        for (int li = 0; li < n; li = li + 1) {
-            int lw = Canvas.MeasureText(labels[li], axisFs);
-            if (lw + app.Scale(12) > leftGut) { leftGut = lw + app.Scale(12); }
-        }
-        // 的锚格轴全隐）：42px 迷你格若照搬整幅 botGut，绘图区算成
-        // 负值，整格柱子静默不画。
-        bool hbarXLabOn = o.xAxes.Count < 1 || o.xAxes[0].labelShow;
-        int botGut = hbarXLabOn
-            ? Canvas.FontHeight(axisFs) + app.Scale(8) : 0;
-        int plotX = x + pad + leftGut;
-        int plotY = plotTop;
-        int plotW = (x + w - pad) - plotX;
-        // 底部图例（ECharts 6 默认）从绘图区底边扣除。
-        int plotH = (y + h - pad - botGut - Chart.legendBottomReserve) - plotY;
-        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
-        if (plotH < app.Scale(8)) { c.PopClip(); return null; }
-
+        ChartPreparedPanel panel = ChartView.PaintPanel(o, x, y, w, h);
+        ChartHorizontalGeometry geometry = panel != null ? panel.horizontalGeometry : null;
+        if (geometry == null) { c.PopClip(); return null; }
+        int pad = geometry.pad;
+        int axisFs = geometry.axisFs;
+        labels = geometry.labels; series = geometry.series;
+        int n = labels.Count; int ns = series.Count; int wid = o.iwid;
+        baseIdx = geometry.baseIdx;
+        stacked = geometry.stacked;
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, o.series, wid, o.showLegend);
+        bool vFrac = geometry.vFrac;
+        int lo = geometry.lo; int hi = geometry.hi; int span = geometry.span; int ticksH = geometry.ticksH;
+        int leftGut = geometry.leftGut;
+        int plotX = geometry.plotX; int plotY = geometry.plotY;
+        int plotW = geometry.plotW; int plotH = geometry.plotH;
         // 垂直数值网格线 + 标签（覆盖负值）
         StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         StyleBox sAxis = Style.Part(app, "chart", "axis", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         StyleBox sLabel = Style.Part(app, "chart", "label", "", "", "",
-                                     Style.SNormal());
+        Style.SNormal());
         int ticks = ticksH;
         bool grid = o.showGrid;
         // ECharts axis.show：数值轴（x）/类目轴（y）整条显隐。
@@ -183,31 +74,14 @@ public partial class ChartView {
             c.FillRect(catLineX, plotY, app.Scale(2), plotH, sAxis.BgOr(0));
         }
 
-        int rowH = plotH / n;
-        if (rowH < 1) { rowH = 1; }
-        // 水平柱的行带与柱列同样由 barGrid 解算（类目轴在 y：带宽按
-        // plotH/类目数，见 ChartBarLayout.BarBandWidth）。Zero-Alloc 池化复用。
-        double band = ChartView.BarBandWidth(plotH, n);
+        int rowH = geometry.rowH;
+        double band = geometry.band;
         ChartView.EnsureBarScratch();
-        List<ChartSeries> hSer = ChartView.scratchBarSer; hSer.Clear();
-        List<string> hIds = ChartView.scratchBarStackIds; hIds.Clear();
-        List<int> hSi = ChartView.scratchBarSi; hSi.Clear();
-        for (int hi2 = 0; hi2 < ns; hi2 = hi2 + 1) {
-            if (!series[hi2].hidden) {
-                hSer.Add(series[hi2]);
-                hSi.Add(hi2);
-                if (series[hi2].stackName.Length > 0) { hIds.Add(series[hi2].stackName); }
-                else { hIds.Add("__ec_stack_" + Convert.ToString(hi2)); }
-            }
-        }
-        List<ChartBarCol> hCols = ChartView.CalcBarCols(band, hSer, hIds);
-        List<ChartBarCol> hColOf = ChartView.scratchColOf; hColOf.Clear();
-        for (int hc = 0; hc < ns; hc = hc + 1) { hColOf.Add(null); }
-        for (int hb = 0; hb < hSi.Count; hb = hb + 1) { hColOf[hSi[hb]] = hCols[hb]; }
+        List<ChartBarCol> hColOf = geometry.columns;
         int rad = app.Scale(2);
-        int mx = app.mouseX;
-        int my = app.mouseY;
-        ChartHit hbarHit = null;
+        int mx = ChartView.PointerX(app);
+        int my = ChartView.PointerY(app);
+        ChartHit hbarHit = ChartView.PaintHit(app, ChartElementType.Bar);
         if (catShow) {
             for (int li = 0; li < n; li = li + 1) {
                 int rowY = plotY + li * rowH;
@@ -218,9 +92,9 @@ public partial class ChartView {
                     hlab = hbY.labelFormatter.Replace("{value}", hlab);
                 }
                 if (hbY.labelSt != null && hbY.labelSt.rich != null
-                    && hlab.IndexOf("{") >= 0) {
+                && hlab.IndexOf("{") >= 0) {
                     RichBlock blk = ChartView.RichLayout(app,
-                        Chart.RichTokenize(hlab, hbY.labelSt), hbY.labelSt, axisFs);
+                    Chart.RichTokenize(hlab, hbY.labelSt), hbY.labelSt, axisFs);
                     int bx = x + pad + (leftGut - app.Scale(6) - blk.w) / 2;
                     int by = rowY + (rowH - blk.h) / 2;
                     if (bx < x + pad) { bx = x + pad; }
@@ -228,7 +102,7 @@ public partial class ChartView {
                     ChartView.RichDraw(app, c, bx, by, blk, sLabel.FgOr(0));
                 } else {
                     c.DrawTextCentered(x + pad, rowY, leftGut - app.Scale(6), rowH,
-                        hlab, sLabel.FgOr(0), axisFs);
+                    hlab, sLabel.FgOr(0), axisFs);
                 }
             }
         }
@@ -239,7 +113,7 @@ public partial class ChartView {
             int aX1 = Chart.ValueX(plotX, plotW, lo, hi, o.markHi);
             if (aX1 < aX0) { int tmp = aX0; aX0 = aX1; aX1 = tmp; }
             int areaBase = Style.Part(app, "chart", "mark-area", "", "", "",
-                                      Style.SNormal()).BgOr(0);
+            Style.SNormal()).BgOr(0);
             c.FillRect(aX0, plotY, aX1 - aX0, plotH, ChartColor.WithAlpha(areaBase, 28));
         }
 
@@ -279,7 +153,7 @@ public partial class ChartView {
                             if (vFrac) {
                                 double dvH = sc.Number(sdi);
                                 v = (int)((long)(int)(dvH * 1000.0
-                                    + (dvH >= 0 ? 0.5 : 0 - 0.5)) * g / 1000L);
+                                + (dvH >= 0 ? 0.5 : 0 - 0.5)) * g / 1000L);
                             } else {
                                 v = (int)((long)sc.Value(sdi) * g / 1000L);
                             }
@@ -289,7 +163,7 @@ public partial class ChartView {
                         // 快捷路在“负值后跟 0”时与官方不一致。
                         double baseRaw = ChartView.StackBaseAt(series, si, sdi);
                         long baseF = (long)(baseRaw * 1000.0
-                            + (baseRaw >= 0.0 ? 0.5 : 0 - 0.5));
+                        + (baseRaw >= 0.0 ? 0.5 : 0 - 0.5));
                         int segBase = (int)(baseF * (long)g / 1000L);
                         int x0 = Chart.ValueX(plotX, plotW, lo, hi, segBase);
                         int x1 = Chart.ValueX(plotX, plotW, lo, hi, segBase + v);
@@ -303,24 +177,17 @@ public partial class ChartView {
                         int barH = 0;
                         if (hbc.width > 0.0) {
                             barH = ChartView.RoundPx((double)plotY + ((double)i + 0.5) * band
-                                + hbc.offset + hbc.width) - by;
+                            + hbc.offset + hbc.width) - by;
                             if (barH < 1) { barH = 1; }
                         }
                         int segRad = rad;
                         if (si != topSi[gi]) { segRad = 0; }
-                        bool hov = mx >= drawX && mx < drawX + segW
-                            && my >= by && my < by + barH;
-                        if (!sc.silent && mx >= drawX && mx < drawX + segW
-                            && my >= by && my < by + barH && segW > 0) {
-                            hbarHit = ChartView.MakeDataHit(sc,
-                                ChartView.SeriesIndexOf(o, sc), baseIdx + i,
-                                labels[i], ChartElementType.Bar, mx, my,
-                                sc.Value(baseIdx + i));
-                        }
+                        bool hov = hbarHit != null && hbarHit.seriesIndex == ChartView.SeriesIndexOf(o, sc)
+                        && hbarHit.dataIndex == sdi;
                         int fill = sc.color;
                         if (hov) {
                             fill = sc.itemStyle.emphasis.color != 0
-                                ? sc.itemStyle.emphasis.color : App.Lighten(fill, 80);
+                            ? sc.itemStyle.emphasis.color : App.Lighten(fill, 80);
                         }
                         if (segW > 0) {
                             c.FillRoundRect(drawX, by, segW, barH, segRad, fill);
@@ -328,14 +195,14 @@ public partial class ChartView {
                         // barBorderColor/barBorderWidth（ECharts）：
                         // 描边贴段外框，悬停被 emphasis 覆盖。
                         int hBcol = hov && sc.itemStyle.emphasis.borderColor != 0
-                            ? sc.itemStyle.emphasis.borderColor
-                            : sc.itemStyle.normal.borderColor;
+                        ? sc.itemStyle.emphasis.borderColor
+                        : sc.itemStyle.normal.borderColor;
                         int hBwid = hov && sc.itemStyle.emphasis.borderWidth > 0
-                            ? sc.itemStyle.emphasis.borderWidth
-                            : sc.itemStyle.normal.borderWidth;
+                        ? sc.itemStyle.emphasis.borderWidth
+                        : sc.itemStyle.normal.borderWidth;
                         if (hBwid > 0 && segW > 0) {
                             ChartView.StrokeRect(c, drawX, by, segW, barH,
-                                hBcol, app.Scale(hBwid));
+                            hBcol, app.Scale(hBwid));
                         }
                         // 段内数值标签（ECharts label.position）：
                         // "left" 段内左对齐、"right" 段内右对齐、
@@ -349,7 +216,7 @@ public partial class ChartView {
                                 int rawV = 0;
                                 if (sdi < sc.Count()) { rawV = sc.Value(sdi); }
                                 string lbl = ChartView.LabelText(sc, sdi,
-                                    labels[i], rawV);
+                                labels[i], rawV);
                                 int lw = Canvas.MeasureText(lbl, scFs);
                                 if (lw + app.Scale(4) <= segW) {
                                     int scCol = sc.label.color;
@@ -389,7 +256,7 @@ public partial class ChartView {
             int bgInk2 = 0;
             if (showBg2 && bgCol2 == 0) {
                 bgInk2 = Style.Part(app, "chart", "grid", "", "", "",
-                                    Style.SNormal()).BgOr(0);
+                Style.SNormal()).BgOr(0);
             }
 
             int x0 = Chart.ValueX(plotX, plotW, lo, hi, 0);
@@ -402,7 +269,7 @@ public partial class ChartView {
                         if (vFrac) {
                             double dvHG = series[si].Number(ndi);
                             v = (int)((long)(int)(dvHG * 1000.0
-                                + (dvHG >= 0 ? 0.5 : 0 - 0.5)) * g / 1000L);
+                            + (dvHG >= 0 ? 0.5 : 0 - 0.5)) * g / 1000L);
                         } else {
                             v = (int)((long)series[si].Value(ndi) * g / 1000L);
                         }
@@ -431,37 +298,30 @@ public partial class ChartView {
                     int barH = 0;
                     if (hbc2.width > 0.0) {
                         barH = ChartView.RoundPx((double)plotY + ((double)i + 0.5) * band
-                            + hbc2.offset + hbc2.width) - by;
+                        + hbc2.offset + hbc2.width) - by;
                         if (barH < 1) { barH = 1; }
                     }
                     if (showBg2 && plotW > 2) {
                         c.FillRoundRect(plotX + 1, by, plotW - 2, barH,
-                            rad < 1 ? 1 : (rad > 3 ? 3 : rad),
-                            bgCol2 != 0 ? bgCol2 : bgInk2);
+                        rad < 1 ? 1 : (rad > 3 ? 3 : rad),
+                        bgCol2 != 0 ? bgCol2 : bgInk2);
                     }
-                    bool hov = mx >= bx && mx < bx + bw
-                        && my >= by && my < by + barH;
-                    if (!series[si].silent && mx >= bx && mx < bx + bw
-                        && my >= by && my < by + barH && bw > 0) {
-                                    hbarHit = ChartView.MakeDataHit(series[si],
-                            ChartView.SeriesIndexOf(o, series[si]), ndi,
-                            labels[i], ChartElementType.Bar, mx, my,
-                            series[si].Value(ndi));
-                    }
+                    bool hov = hbarHit != null && hbarHit.seriesIndex == ChartView.SeriesIndexOf(o, series[si])
+                    && hbarHit.dataIndex == ndi;
                     int fill = series[si].color;
                     if (hov) {
                         fill = series[si].itemStyle.emphasis.color != 0
-                            ? series[si].itemStyle.emphasis.color : App.Lighten(fill, 80);
+                        ? series[si].itemStyle.emphasis.color : App.Lighten(fill, 80);
                     }
                     int corners = toRight ? Corner.Right() : Corner.Left();
                     List<int> cellGradH = series[si].itemStyle.normal.gradStops;
                     if (ndi < series[si].data.Count && series[si].data[ndi].itemStyle != null
-                        && series[si].data[ndi].itemStyle.normal.gradStops != null
-                        && series[si].data[ndi].itemStyle.normal.gradStops.Count >= 2) {
+                    && series[si].data[ndi].itemStyle.normal.gradStops != null
+                    && series[si].data[ndi].itemStyle.normal.gradStops.Count >= 2) {
                         cellGradH = series[si].data[ndi].itemStyle.normal.gradStops;
                     }
                     if (hov && series[si].itemStyle.emphasis.gradStops != null
-                        && series[si].itemStyle.emphasis.gradStops.Count >= 2) {
+                    && series[si].itemStyle.emphasis.gradStops.Count >= 2) {
                         cellGradH = series[si].itemStyle.emphasis.gradStops;
                     }
                     if (bw > 0) {
@@ -469,7 +329,7 @@ public partial class ChartView {
                             c.FillRoundRectIn(bx, by, bw, barH, rad, corners, fill);
                         } else {
                             ChartView.BarCellR4Grad(c, bx, by, bw, barH,
-                                barRad2, rad, fill, false, cellGradH, true);
+                            barRad2, rad, fill, false, cellGradH, true);
                         }
                     }
                     if ((o.showValues || series[si].labelShow) && bw > 0) {
@@ -477,7 +337,7 @@ public partial class ChartView {
                         if (series[si].label.fontSize > 0) { hbFs = series[si].label.fontSize; }
                         int hbFh = Canvas.FontHeight(hbFs);
                         string lbl = ChartView.LabelText(series[si], ndi,
-                            labels[i], series[si].Value(ndi));
+                        labels[i], series[si].Value(ndi));
                         int lw = Canvas.MeasureText(lbl, hbFs);
                         // 逐项 labelSide：1 = 段左侧、2 = 段右侧（bar8
                         // 正负交错标签）；0 = 跟随柱条方向（右正左负）。
@@ -504,7 +364,7 @@ public partial class ChartView {
             ChartSeries sm = series[si3];
             if (sm.hidden || sm.markLines.Count < 1) { continue; }
             ChartView.DrawHBarMarkLines(app, plotX, plotY, plotW, plotH,
-                lo, hi, sm, baseIdx, winLast);
+            lo, hi, sm, baseIdx, winLast);
         }
         // markPoint（转置）：mark 点 y = 本系列柱条行带中心线、x = 值
         // 位置（柱端）——与纵向柱 xMarkMap 同构。series 级
@@ -512,26 +372,22 @@ public partial class ChartView {
             ChartSeries ms2 = series[msi2];
             if (ms2.hidden || ms2.marks.Count < 1) { continue; }
             ChartView.DrawSeriesMarksH(app, ms2, baseIdx, n, band,
-                hColOf[msi2], plotY, plotX, plotW, lo, hi);
+            hColOf[msi2], plotY, plotX, plotW, lo, hi);
         }
 
-        ChartView.OfferActiveHit(hbarHit);
         if (o.showTooltip && n > 0 && rowH > 0) {
-            if (mx >= plotX && mx < plotX + plotW
-                && my >= plotY && my < plotY + plotH) {
-                int idx = (my - plotY) / rowH;
-                if (idx < 0) { idx = 0; }
-                if (idx > n - 1) { idx = n - 1; }
+            if (panel != null && panel.axisHover >= 0 && panel.axisHover < n) {
+                int idx = panel.axisHover;
                 int rowY = plotY + idx * rowH;
                 int crossCol = Style.Part(app, "chart", "crosshair", "", "", "",
-                    Style.SNormal()).BgOr(0);
+                Style.SNormal()).BgOr(0);
                 if (crossCol != 0) {
                     c.FillRect(plotX, rowY, plotW, rowH,
-                        ChartColor.WithAlpha(crossCol, 40));
+                    ChartColor.WithAlpha(crossCol, 40));
                     c.FillRect(plotX, rowY, plotW, 1,
-                        ChartColor.WithAlpha(crossCol, 180));
+                    ChartColor.WithAlpha(crossCol, 180));
                     c.FillRect(plotX, rowY + rowH - 1, plotW, 1,
-                        ChartColor.WithAlpha(crossCol, 180));
+                    ChartColor.WithAlpha(crossCol, 180));
                 }
                 List<TooltipRow> rows = new List<TooltipRow>();
                 rows.Add(TooltipRow.Of(0, labels[idx]));
@@ -542,7 +398,7 @@ public partial class ChartView {
                         int tdi = baseIdx + idx;
                         if (tdi < ts.Count()) { tv = ts.Value(tdi); }
                         rows.Add(TooltipRow.Of(ts.color,
-                            ts.name + "  " + Convert.ToString(tv)));
+                        ts.name + "  " + Convert.ToString(tv)));
                     }
                 }
                 ChartView.TooltipCard(app, mx, my, plotX + plotW, rows);
@@ -566,140 +422,65 @@ public partial class ChartView {
     // 从 0 到当前累计的总计柱），增/减/总计三色 + 阶间连接线 +
     // tooltip；累计在整个数据上算完后再按 dataZoom 窗口切片。
     public static void DrawWaterfall(App app, int x, int y, int w, int h,
-                              ChartOption o, int g) {
+    ChartOption o, int g) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        ChartPreparedPanel panel = ChartView.PaintPanel(o, x, y, w, h);
+        ChartCartesianGeometry geometry = panel != null ? panel.cartesianGeometry : null;
+        if (geometry == null || geometry.waterfallColumns == null || o.series.Count < 1) { return; }
         List<ChartSeries> series = o.series;
-        if (series.Count < 1) { return; }
         ChartSeries s = series[0];
-        List<string> labels = o.XCategories();
-        int fullN = labels.Count;
-        if (fullN < 1) { return; }
-
-        // dataZoom：窗口索引 [i0,i1]（含端点）。累计量在整个
-        // 数据上计算后再切片，使窗口内的柱条延续窗口前的
-        // 累计值，而不是从 0 重启。
-        int zoomH = 0;
-        int i0 = 0;
-        int i1 = fullN - 1;
-        if (o.zoom && o.iwid != 0 && fullN > 1) {
-            i0 = Chart.ZoomI0(app, o, o.iwid, fullN);
-            i1 = Chart.ZoomI1(app, o, o.iwid, fullN);
-            zoomH = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
-        }
-        List<string> winLabels = Chart.WindowLabels(labels, i0, i1);
+        List<string> winLabels = geometry.labels;
         int n = winLabels.Count;
         if (n < 1) { return; }
-
-        Chart.renderContext.EnsureScratch();
-        List<int> cumAll = Chart.renderContext.scratchI1; cumAll.Clear();
-        int acc = 0;
-        for (int ii = 0; ii < fullN; ii = ii + 1) {
-            int v = 0;
-            if (ii < s.Count()) { v = s.Value(ii); }
-            if (ii < s.data.Count && s.data[ii].name == "total") { cumAll.Add(acc); }
-            else { acc = acc + v; cumAll.Add(acc); }
+        ChartFrame f = geometry.frame;
+        Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, series, o.iwid, o.showLegend);
+        Chart.DrawAxes(app, f, o, winLabels);
+        if (geometry.zoomHeight > 0) {
+            Chart.DrawZoomBar(app, o, f.plotX, f.plotW, x, y, w, h, o.iwid, geometry.fullCount);
         }
-        int maxC = acc;
-        int minC = 0;
-        int fi = 0;
-        while (fi < fullN) {
-            if (cumAll[fi] > maxC) { maxC = cumAll[fi]; }
-            if (cumAll[fi] < minC) { minC = cumAll[fi]; }
-            fi = fi + 1;
-        }
-        if (maxC < 1 && minC >= 0) { maxC = 1; }
-
-        // 自动数值轴，覆盖负的累计值（基线为 0）。
-        if (o.yAxes.Count == 0 && minC < 0) {
-            o.yAxes.Add(ChartAxis.ValueRange(minC, Chart.NiceMax(maxC)));
-        }
-        // dataZoom 滑条预留带先于面板头声明：底部图例锚点据此上移。
-        Chart.zoomBandReserve = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, series, o.iwid, o.showLegend);
-        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h - zoomH, plotTop, winLabels, o, series, maxC, 0 - 1, i0, i1);
-        if (zoomH > 0) {
-            Chart.DrawZoomBar(app, o, f.plotX, f.plotW, x, y, w, h, o.iwid, fullN);
-        }
-        // 瀑布柱列仍由 barGrid 解算（官方 bar-waterfall 的两/三条系列
-        // 共用 stack 'Total' → 一条列），不再用 `step*5/10` 近似。Zero-Alloc 池化复用。
-        double band = ChartView.BarBandWidth(f.plotW, n);
-        ChartView.EnsureBarScratch();
-        List<ChartSeries> wfSer = ChartView.scratchBarSer; wfSer.Clear();
-        List<string> wfIds = ChartView.scratchBarStackIds; wfIds.Clear();
-        for (int wi = 0; wi < series.Count; wi = wi + 1) {
-            if (!series[wi].hidden) {
-                wfSer.Add(series[wi]);
-                if (series[wi].stackName.Length > 0) { wfIds.Add(series[wi].stackName); }
-                else { wfIds.Add("__ec_stack_" + Convert.ToString(wi)); }
-            }
-        }
-        List<ChartBarCol> wfCols = ChartView.CalcBarCols(band, wfSer, wfIds);
-        double wfOff = 0.0;
-        double wfW = 0.0;
-        if (wfCols.Count > 0) { wfOff = wfCols[0].offset; wfW = wfCols[0].width; }
-        int rad = app.Scale(3);
-        if (!o.rounded) { rad = app.Scale(1); }
+        int rad = app.Scale(o.rounded ? 3 : 1);
 
         StyleBox sAccent = Style.Part(app, "chart", "accent", "", "", "",
-                                      Style.SNormal());
+        Style.SNormal());
         StyleBox sMark = Style.Part(app, "chart", "mark", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
-                                    Style.SNormal());
-        int prev = 0;
-        if (i0 > 0) { prev = cumAll[i0 - 1]; }
+        Style.SNormal());
         int prevBx = 0;
         int prevBw = 0;
-        for (int ci = 0; ci < n; ci = ci + 1) {
-            int oi = i0 + ci;
-            int v = 0;
-            if (oi < s.Count()) { v = s.Value(oi); }
-            bool isTotal = (oi < s.data.Count && s.data[oi].name == "total");
-            int topV = prev;
-            int botV = prev;
-            if (isTotal) { topV = acc; botV = 0; }
-            else { topV = prev + v; botV = prev; }
-            int yTop = f.YOf(topV, 0);
-            int yBot = f.YOf(botV, 0);
-            if (yBot < yTop) { int tmp = yTop; yTop = yBot; yBot = tmp; }
+        for (int ci = 0; ci < n && !s.hidden; ci = ci + 1) {
+            ChartWaterfallColumn column = geometry.waterfallColumns[ci];
+            int v = column.value;
+            bool isTotal = column.total;
+            int yTop = column.top;
+            int yBot = column.bottom;
             int col = s.color;
             if (col == 0) { col = ChartColor.Palette(t, 0); }
             if (isTotal) { col = sAccent.BgOr(0); }
             else if (v < 0) { col = sMark.BgOr(0); }
-            // 本类目的柱列：左缘 = 带中心 + offset，右缘取整后相减。
-            int bx = ChartView.BarX0(f, ci, band, wfOff);
-            int bw = 0;
-            if (wfW > 0.0) {
-                bw = ChartView.RoundPx((double)f.plotX + ((double)ci + 0.5) * band
-                    + wfOff + wfW) - bx;
-                if (bw < 1) { bw = 1; }
-            }
+            int bx = column.x;
+            int bw = column.width;
             ChartView.BarCell(c, bx, yTop, bw, yBot - yTop, rad, col, o.gradient);
 
             // 从前一柱顶到当前柱底的连接线
             if (ci > 0) {
                 int px0 = prevBx + prevBw;
                 int px1 = bx;
-                int pyc = f.YOf(prev, 0);
+                int pyc = column.connectorY;
                 c.DrawLine(px0, pyc, px1, pyc, sGrid.BgOr(0), app.Scale(1));
             }
             prevBx = bx;
             prevBw = bw;
-            if (!isTotal) { prev = prev + v; }
 
             if (o.showValues || s.labelShow) {
                 int wfFs = Style.FontFallback(app, "medium");
                 if (s.label.fontSize > 0) { wfFs = s.label.fontSize; }
                 int wfFh = Canvas.FontHeight(wfFs);
                 int wfCol = Style.Part(app, "chart", "label", "", "", "",
-                                       Style.SNormal()).FgOr(0);
+                Style.SNormal()).FgOr(0);
                 if (s.label.color != 0) { wfCol = s.label.color; }
-                // total 柱的数据项值是 0，标签显示累计和（cumAll 在
-                // 该下标处的快照），而不是画一个没有意义的 "0"。
-                int wfVal = v;
-                if (isTotal && oi >= 0 && oi < cumAll.Count) { wfVal = cumAll[oi]; }
-                string lbl = Convert.ToString(wfVal);
+                string lbl = Convert.ToString(column.labelValue);
                 int lw = Canvas.MeasureText(lbl, wfFs);
                 int lx2 = bx + (bw - lw) / 2;
                 if (lx2 < f.plotX) { lx2 = f.plotX; }
@@ -719,7 +500,7 @@ public partial class ChartView {
             ChartView.PushPlotClip(app, f.plotX, f.plotY, f.plotW, f.plotH);
             for (int sli = 0; sli < series.Count; sli = sli + 1) {
                 ChartSeries sl = series[sli];
-                if (!sl.hidden) { ChartView.DrawSeriesMarkLines(app, f, sl, i0, i1, o); }
+                if (!sl.hidden) { ChartView.DrawSeriesMarkLines(app, f, sl, geometry.first, geometry.last, o); }
             }
             c.PopClip();
         }
@@ -729,32 +510,21 @@ public partial class ChartView {
         Chart.DrawBreakAreas(c, f, o.YAxis0(), 0);
         Chart.DrawBreakAreas(c, f, o.YAxis1(), 1);
         Chart.DrawBreakAreas(c, f, o.XAxis0(), 2);
-        if (o.showTooltip) {
-            int mx = app.mouseX;
-            int my = app.mouseY;
-            if (mx >= f.plotX && mx < f.plotX + f.plotW
-                && my >= f.plotY && my < f.plotY + f.plotH) {
-                int tIdx = (mx - f.plotX) / ChartView.RoundPx(band);
-                if (tIdx < 0) { tIdx = 0; }
-                if (tIdx > n - 1) { tIdx = n - 1; }
-                int oiT = i0 + tIdx;
-                int tv = 0;
-                if (oiT < s.Count()) { tv = s.Value(oiT); }
-                bool tIsTotal = (oiT < s.data.Count && s.data[oiT].name == "total");
-                string nm = winLabels[tIdx];
-                if (nm.Length == 0) { nm = "Step " + Convert.ToString(tIdx + 1); }
-                string vtxt = Convert.ToString(tv);
-                if (tv >= 0) { vtxt = "+" + vtxt; }
-                if (tIsTotal) { vtxt = Convert.ToString(acc); }
-                int col = s.color;
-                if (col == 0) { col = ChartColor.Palette(t, 0); }
-                if (tIsTotal) { col = sAccent.BgOr(0); }
-                else if (tv < 0) { col = sMark.BgOr(0); }
-                List<TooltipRow> rows = new List<TooltipRow>{
-                    TooltipRow.Of(0, o.title),
-                    TooltipRow.Of(col, nm + "  " + vtxt) };
-                ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, rows);
+        if (o.showTooltip && !s.hidden && !s.silent && !ChartView.HoverBlocked(app)
+        && panel.axisHover >= 0 && panel.axisHover < n) {
+            int index = panel.axisHover;
+            ChartWaterfallColumn column = geometry.waterfallColumns[index];
+            string name = winLabels[index];
+            if (name.Length == 0) { name = "Step " + Convert.ToString(index + 1); }
+            string value = Convert.ToString(column.value);
+            if (column.value >= 0) { value = "+" + value; }
+            if (column.total) { value = Convert.ToString(geometry.waterfallTotal); }
+            int color = s.color != 0 ? s.color : ChartColor.Palette(t, 0);
+            if (column.total) { color = sAccent.BgOr(0); }
+            else if (column.value < 0) { color = sMark.BgOr(0); }
+            List<TooltipRow> rows = new List<TooltipRow>{
+                TooltipRow.Of(0, o.title), TooltipRow.Of(color, name + "  " + value) };
+                ChartView.TooltipCard(app, ChartView.PointerX(app), ChartView.PointerY(app), f.plotX + f.plotW, rows);
             }
         }
     }
-}

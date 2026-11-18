@@ -1,0 +1,306 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+class ChartFrameWatch {
+    public weak App app;
+    public weak ChartView view;
+    public weak ChartOption source;
+    public weak ChartOption draw;
+    public weak ResolvedChart resolved;
+}
+
+class ChartCacheRetireAction {
+    public weak App app;
+    public ChartOption replacement;
+    public int slot;
+    public int calls;
+    public void Run() {
+        App host = this.app;
+        if (host == null) { return; }
+        this.calls = this.calls + 1;
+        ChartView.ReleaseCached(host.canvas, this.slot);
+        ChartView.CachedOwner(host.canvas, this.replacement, IdHash.HashInt(this.slot, 300), 0, 0, 320, 240);
+    }
+}
+
+class ChartFrameModelReuseTest {
+    static int misses;
+    static int hits;
+    static int disposed;
+
+    static void OnDisposed() { disposed = disposed + 1; }
+
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("chart frame reuse: " + label); }
+    }
+
+    static ChartOption Source() {
+        return ChartOption.FromJson("{\"animation\":false,\"xAxis\":{\"type\":\"category\",\"data\":[\"A\",\"B\",\"C\"]},"
+        + "\"yAxis\":{\"type\":\"value\"},\"series\":[{\"name\":\"bars\",\"type\":\"bar\",\"data\":[12,35,20]}]}");
+    }
+
+    static long Pixels(Canvas canvas) {
+        long sum = 0;
+        for (int y = 0; y < 240; y = y + 1) {
+            for (int x = 0; x < 320; x = x + 1) {
+                sum = sum + (long)(canvas.GetPixel(x, y) & 0x00FFFFFF);
+            }
+        }
+        return sum;
+    }
+
+    static bool Cached(App app, ChartOption source, int slot) {
+        ChartView.PrepareCached(app, source, slot, 0, 0, 320, 240);
+        app.BeginOffscreenFrame();
+        bool hit = ChartView.RenderCached(app, source, slot, 0, 0, 320, 240);
+        app.EndOffscreenFrame();
+        if (hit) { hits = hits + 1; } else { misses = misses + 1; }
+        return hit;
+    }
+
+    static void CacheLifecycle(ChartFrameWatch watch) {
+        App app = App.CreateOffscreen("chart frame cache", 320, 240);
+        ChartOption source = ChartFrameModelReuseTest.Source();
+        source.animate = false;
+        int slot = ChartView.AllocCacheSlot();
+        Check("first render misses", !Cached(app, source, slot));
+        long firstPixels = Pixels(app.canvas);
+        Check("unchanged render hits", Cached(app, source, slot));
+        Check("hit restores the rendered pixels", firstPixels == Pixels(app.canvas));
+        ChartView owner = ChartView.CachedOwner(app.canvas, source, IdHash.HashInt(slot, 300), 0, 0, 320, 240);
+        owner.OnDisposed(ChartFrameModelReuseTest.OnDisposed);
+        Check("owner persists on hit", owner == ChartView.CachedOwner(app.canvas, source,
+        IdHash.HashInt(slot, 300), 0, 0, 320, 240));
+        // The option and list keep their identities; both replacement and nested
+        // mutation must invalidate the pixels without a controller version bump.
+        source.series[0].data[0] = ChartData.Of(80);
+        Check("list element replacement misses", !Cached(app, source, slot));
+        long changedPixels = Pixels(app.canvas);
+        Check("data change refreshes pixels", firstPixels != changedPixels);
+        Check("miss preserves owner identity", owner == ChartView.CachedOwner(app.canvas, source,
+        IdHash.HashInt(slot, 300), 0, 0, 320, 240));
+        Check("replacement settles to hit", Cached(app, source, slot));
+        Check("replacement hit restores refreshed pixels", changedPixels == Pixels(app.canvas));
+        source.series[0].data[0].val = 15;
+        source.series[0].data[0].number = 15.0;
+        Check("nested data mutation misses", !Cached(app, source, slot));
+        source.legendItemWidth = source.legendItemWidth + 9;
+        Check("forwarded legend geometry misses", !Cached(app, source, slot));
+        source.showValues = true;
+        Check("public option switch misses", !Cached(app, source, slot));
+        source.series[0].hidden = true;
+        Check("public series switch misses", !Cached(app, source, slot));
+        source.series[0].hidden = false;
+        Check("series visible again misses", !Cached(app, source, slot));
+        Check("chart theme changes", ChartTheme.Use(app, "macarons"));
+        Check("theme change misses", !Cached(app, source, slot));
+        Check("new theme settles to hit", Cached(app, source, slot));
+        owner.Restore();
+        ChartOption restored = owner.GetOption();
+        Check("restore keeps the initial snapshot", restored.series[0].data[0].val == 12
+        && !restored.showValues && !restored.series[0].hidden);
+        // RenderCached's explicit option remains authoritative after Restore;
+        // the next call must re-read its mutable data and current theme.
+        source.series[0].data[1] = ChartData.Of(91);
+        Check("theme changes after restore", ChartTheme.Use(app, "dark"));
+        Check("mutable update after restore misses", !Cached(app, source, slot));
+        ChartOption current = owner.GetOption();
+        Check("next update and theme replace restored projection", current.series[0].data[1].val == 91
+        && current.showValues && app.ChartThemeName() == "dark");
+        Check("post-restore update settles to hit", Cached(app, source, slot));
+        app.StateSet(Chart.TbMagicKey(IdHash.HashInt(slot, 300)), 1);
+        Check("toolbox projection misses", !Cached(app, source, slot));
+        Check("toolbox projection settles to hit", Cached(app, source, slot));
+        app.StateSet(Chart.LegendKey(IdHash.HashInt(slot, 300), 0), 1);
+        Check("legend state misses", !Cached(app, source, slot));
+        watch.app = app;
+        watch.source = source;
+        owner = ChartView.CachedOwner(app.canvas, source, IdHash.HashInt(slot, 300), 0, 0, 320, 240);
+        watch.view = owner;
+        ChartView.ReleaseCached(app.canvas, slot);
+        Check("released slot misses", !Cached(app, source, slot));
+        Check("released owner disposed", owner.IsDisposed() && disposed == 1);
+        ChartView.ReleaseCached(app.canvas, slot);
+        app.canvas.Destroy();
+    }
+
+    static void FrameCopies(ChartFrameWatch watch) {
+        App app = App.CreateOffscreen("chart frame copies", 320, 240);
+        ChartOption source = ChartFrameModelReuseTest.Source();
+        // Fields formerly omitted by the independent DrawOption field list.
+        source.titleLink = "https://example.com/title";
+        source.tooltipTriggerOn = "click";
+        source.tooltipConfine = true;
+        source.tooltipShowDelay = 37;
+        source.pointerCross = true;
+        source.toolboxDataViewReadOnly = true;
+        source.toolboxMark = true;
+        source.legendItemWidth = 39;
+        source.legendData = new List<string>(); source.legendData.Add("bars");
+        source.pieCenterText = true;
+        source.zoomStartValue = "B";
+        source.colorPal = new List<int>(); source.colorPal.Add(ChartColor.Rgb(32, 64, 96));
+        ResolvedChart resolved = ResolvedChart.Resolve(source, app.theme, app, 71);
+        ChartOption draw = resolved.DrawOption(71, false);
+        Check("option fields cross once", draw.titleLink == source.titleLink
+        && draw.tooltipTriggerOn == "click" && draw.tooltipConfine
+        && draw.tooltipShowDelay == 37 && draw.pointerCross && draw.toolboxMark
+        && draw.toolboxDataViewReadOnly && draw.legendItemWidth == 39
+        && draw.pieCenterText && draw.zoomStartValue == "B");
+        Check("frame source and writable shells isolated", draw != source
+        && draw.xAxes != source.xAxes && draw.xAxes[0] != source.xAxes[0]
+        && draw.series[0] != source.series[0]);
+        Check("read-only frame data borrowed", draw.series[0].data == source.series[0].data
+        && draw.zooms == source.zooms && draw.colorPal == source.colorPal);
+        draw.xAxes[0].labelRotate = 45;
+        ChartView.ApplyMagic(draw, 1);
+        Check("frame mutations stay local", source.xAxes[0].labelRotate != 45
+        && source.series[0].type == ChartType.Bar);
+        ChartOption snapshot = source.Clone();
+        snapshot.series[0].data[0].val = 99;
+        snapshot.legendData.Add("extra");
+        snapshot.colorPal[0] = 123;
+        Check("snapshot isolates mutable data and palette", source.series[0].data[0].val == 12
+        && source.legendData.Count == 1 && source.colorPal[0] != 123);
+        List<ChartSeries> selected = new List<ChartSeries>(); selected.Add(draw.series[0]);
+        ChartOption overlay = draw.OverlayOption(selected);
+        Check("overlay retains full frame fields", overlay.overlay && !overlay.showLegend
+        && overlay.tooltipConfine && overlay.pointerCross && overlay.pieCenterText
+        && overlay.legendItemWidth == 39 && overlay.colorPal == draw.colorPal
+        && overlay.xAxes == draw.xAxes && overlay.series[0] == draw.series[0]
+        && overlay.declOrder == null && overlay.iwid == draw.iwid);
+        overlay.series = new List<ChartSeries>();
+        overlay.geos = new List<ChartGeo>();
+        Check("overlay membership replacement stays local", draw.series.Count == 1);
+        ChartOption pie = ChartOption.FromJson("{\"series\":[{\"type\":\"pie\",\"data\":[3,7]}]}");
+        ChartOption pieDraw = ResolvedChart.Resolve(pie, app.theme, app, 72).DrawOption(72, true);
+        pieDraw.series[0].data[0].hidden = true;
+        Check("pie retains writable data isolation and animation", !pie.series[0].data[0].hidden && pieDraw.animate);
+        watch.source = source; watch.draw = draw; watch.resolved = resolved; watch.app = app;
+        app.canvas.Destroy();
+    }
+
+    static void DeclarationOrder() {
+        ChartOption source = ChartOption.FromJson("{\"series\":["
+        + "{\"name\":\"first\",\"type\":\"bar\",\"z\":30,\"data\":[1]},"
+        + "{\"name\":\"second\",\"type\":\"line\",\"z\":10,\"data\":[2]},"
+        + "{\"name\":\"third\",\"type\":\"bar\",\"z\":20,\"data\":[3]}]}");
+        ResolvedChart resolved = ResolvedChart.Resolve(source, Theme.Light(), null, 73);
+        ChartOption draw = resolved.DrawOption(73, false);
+        Check("cyclic draw permutation", draw.series[0].name == "second"
+        && draw.series[1].name == "third" && draw.series[2].name == "first");
+        Check("declaration order uses inverse permutation", draw.declOrder[0] == draw.series[2]
+        && draw.declOrder[1] == draw.series[0] && draw.declOrder[2] == draw.series[1]);
+        ChartSeries lead = ChartView.LeadSeries(draw);
+        Check("lead remains first declared", lead != null && lead.name == "first");
+        ChartOption cloned = draw.Clone();
+        Check("snapshot declaration order points into cloned series", cloned.declOrder[0] == cloned.series[2]);
+        int fp = ChartView.FingerprintCore(1, 0, 0, source, resolved);
+        source.series[0].z = 5;
+        ResolvedChart changed = ResolvedChart.Resolve(source, Theme.Light(), null, 73);
+        Check("z mutation invalidates fingerprint", fp != ChartView.FingerprintCore(1, 0, 0, source, changed));
+    }
+
+    static void CacheScopeAndRetirement() {
+        App first = App.CreateOffscreen("cache scope one", 320, 240);
+        App second = App.CreateOffscreen("cache scope two", 320, 240);
+        ChartOption source = ChartFrameModelReuseTest.Source();
+        int slot = ChartView.AllocCacheSlot();
+        int key = IdHash.HashInt(slot, 300);
+        ChartView.PrepareCached(first, source, slot, 0, 0, 320, 240);
+        first.BeginOffscreenFrame();
+        ChartView.RenderCached(first, source, slot, 0, 0, 320, 240);
+        first.EndOffscreenFrame();
+        ChartView.PrepareCached(second, source, slot, 0, 0, 320, 240);
+        second.BeginOffscreenFrame();
+        Check("second Canvas first call misses", !ChartView.RenderCached(second, source, slot, 0, 0, 320, 240));
+        second.EndOffscreenFrame();
+        ChartView owner = ChartView.CachedOwner(first.canvas, source, key, 0, 0, 320, 240);
+        ChartView other = ChartView.CachedOwner(second.canvas, source, key, 0, 0, 320, 240);
+        Check("same slot keeps Canvas owners separate", owner != other);
+        ChartCacheRetireAction action = new ChartCacheRetireAction();
+        action.app = first; action.slot = slot;
+        action.replacement = ChartFrameModelReuseTest.Source();
+        action.replacement.showValues = true;
+        Control root = new Control(); root.UseApp(first); root.Add(owner); first.SetRootControl(root);
+        root.MeasureTree(first); root.Arrange(0, 0, 320, 240); owner.Arrange(0, 0, 320, 240);
+        owner.OnUpdated(action.Run);
+        owner.SetOption(source);
+        source.series[0].data[0] = ChartData.Of(71);
+        first.ProcessOffscreenInput(1, 100, 90, 0, 0, 0, 0);
+        Check("preparation callback retires old owner", action.calls == 1 && owner.IsDisposed());
+        ChartView replacement = ChartView.CachedOwner(first.canvas, action.replacement, key, 0, 0, 320, 240);
+        Check("old preparation does not resurrect owner", replacement != owner);
+        root.Remove(owner); root.Add(replacement); replacement.Arrange(0, 0, 320, 240);
+        ChartView.PrepareCached(first, action.replacement, slot, 0, 0, 320, 240);
+        first.BeginOffscreenFrame();
+        Check("retired slot does not restore stale pixels", !ChartView.RenderCached(first,
+        action.replacement, slot, 0, 0, 320, 240));
+        first.EndOffscreenFrame();
+        ChartView.PrepareCached(first, action.replacement, slot, 0, 0, 320, 240);
+        first.BeginOffscreenFrame();
+        Check("replacement snapshot settles to hit", ChartView.RenderCached(first,
+        action.replacement, slot, 0, 0, 320, 240));
+        first.EndOffscreenFrame();
+        Check("paint never replays lifecycle callback", action.calls == 1);
+        ChartView.ReleaseCached(first.canvas, slot);
+        Check("releasing one Canvas preserves other owner", !other.IsDisposed());
+        ChartView.ReleaseCached(second.canvas, slot);
+        root.Remove(replacement); first.StopLoop(); second.StopLoop();
+        first.canvas.Destroy(); second.canvas.Destroy();
+    }
+
+    static void BenchmarkBatch(App app, ChartOption source, int slot, bool mutate) {
+        int hitCount = 0;
+        int missCount = 0;
+        long beforeBytes = GC.GetAllocatedBytesForCurrentThread();
+        long started = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < 120; i = i + 1) {
+            if (mutate) { source.showValues = !source.showValues; }
+            ChartView.PrepareCached(app, source, slot, 0, 0, 320, 240);
+            app.BeginOffscreenFrame();
+            bool hit = ChartView.RenderCached(app, source, slot, 0, 0, 320, 240);
+            app.EndOffscreenFrame();
+            if (hit) { hitCount = hitCount + 1; } else { missCount = missCount + 1; }
+        }
+        long elapsed = Stopwatch.GetMicroseconds() - started;
+        long bytes = GC.GetAllocatedBytesForCurrentThread() - beforeBytes;
+        Console.WriteLine("CHART_FRAME_BENCH mode=" + (mutate ? "mutable-miss" : "stable-hit")
+        + " frames=120 series=1 points=3 width=320 height=240 hits=" + Convert.ToString(hitCount)
+        + " misses=" + Convert.ToString(missCount) + " elapsed_us=" + Convert.ToString(elapsed)
+        + " allocated_bytes=" + Convert.ToString(bytes));
+    }
+
+    static void OptionalBenchmark() {
+        if (Environment.GetEnvironmentVariable("ZAN_CHART_FRAME_BENCH") != "1") { return; }
+        App app = App.CreateOffscreen("chart benchmark", 320, 240);
+        ChartOption source = ChartFrameModelReuseTest.Source();
+        int slot = ChartView.AllocCacheSlot();
+        ChartView.PrepareCached(app, source, slot, 0, 0, 320, 240);
+        app.BeginOffscreenFrame();
+        ChartView.RenderCached(app, source, slot, 0, 0, 320, 240);
+        app.EndOffscreenFrame();
+        BenchmarkBatch(app, source, slot, false);
+        BenchmarkBatch(app, source, slot, true);
+        ChartView.ReleaseCached(app.canvas, slot);
+        app.canvas.Destroy();
+    }
+
+    static void Main() {
+        App frame = App.CreateOffscreen("independent frame context", 8, 8);
+        ChartFrameWatch watch = new ChartFrameWatch();
+        FrameCopies(watch);
+        Check("frame copies release normally", watch.app == null && watch.source == null
+        && watch.draw == null && watch.resolved == null);
+        DeclarationOrder();
+        CacheLifecycle(watch);
+        Check("cache owner and source release normally", watch.app == null
+        && watch.view == null && watch.source == null);
+        Check("cache counters cover hit and miss", hits == 5 && misses == 12);
+        CacheScopeAndRetirement();
+        OptionalBenchmark();
+        frame.canvas.Destroy();
+        Console.WriteLine("CHART_FRAME_MODEL_REUSE_OK");
+    }
+}

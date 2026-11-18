@@ -12,7 +12,6 @@ public partial class ChartView {
         return raw;
     }
 
-
     // 是否配置了任何 emphasis paint（填充/边框色/边框宽任一
     // 非零）；全零时命中不重画高亮。
     public static bool PieHasEmphasisPaint(int fill, int borderColor, int borderWidth) {
@@ -23,8 +22,8 @@ public partial class ChartView {
     // 最内环内孔 = ringInner% × rOuter（0 = 实心，钳到 ro-minGap）；
     // 结果保证 0 <= ri < ro。绘制与命中必须同用本函数。
     public static void PieRingBounds(PieLayout layout, int ring, int ringCount,
-                              int rOuter, int band, int minGap,
-                              out int ri, out int ro) {
+    int rOuter, int band, int minGap,
+    out int ri, out int ro) {
         if (ringCount < 1) { ringCount = 1; }
         if (ring < 0) { ring = 0; }
         if (ring >= ringCount) { ring = ringCount - 1; }
@@ -60,7 +59,7 @@ public partial class ChartView {
     // markPoint 极值标注、环图中心标注、扇区命中（PieSelected
     // 点击 + emphasis 重画）与 tooltip。
     public static void DrawPie(App app, int x, int y, int w, int h,
-                        ChartOption o, bool sliceLabels, int g) {
+    ChartOption o, bool sliceLabels, int g) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
@@ -69,235 +68,35 @@ public partial class ChartView {
         // 画过，这里只叠加几何（mix2/mix3/mix12 同图内嵌饼）。
         int top = y + pad;
         if (!o.overlay) { top = ChartView.PanelHead(app, x, y, w, h, o.title); }
-        PieLayout layout = PieLayout.Of(t, o);
+        ChartPreparedPanel panel = ChartView.PaintPanel(o, x, y, w, h);
+        ChartPieGeometry geometry = panel != null ? panel.pieGeometry : null;
+        if (geometry == null) { return; }
+        PieLayout layout = geometry.layout;
         List<PieSlice> slices = layout.slices;
         long total = layout.totalWide;
-        int ringCount = layout.ringCount;
-        if (ringCount < 1) { ringCount = 1; }
-
-        int hotSi = 0 - 1;
-        int hotDi = 0 - 1;
-        int bodyY = top;
-        if (o.showLegend) {
-            // ECharts 饼图图例：逐数据项、跨系列同名去重（取首个）；
-            // legend.data 白名单存在时按白名单过滤并排序；项文本只有
-            // 名字（百分比在扇区标签里）。orient=vertical 左侧整列
-            // （legend.x=left），否则顶部一行放不下换行。
-            List<PieLegendItem> cands = ChartView.PieLegendCollect(o);
-            if (o.legendData != null && o.legendData.Count > 1) {
-                for (int wi = 0; wi < o.legendData.Count && wi < cands.Count; wi = wi + 1) {
-                    for (int ci = wi; ci < cands.Count; ci = ci + 1) {
-                        if (cands[ci].name == o.legendData[wi]) {
-                            PieLegendItem tc = cands[wi]; cands[wi] = cands[ci]; cands[ci] = tc;
-                            break;
-                        }
-                    }
-                }
-            }
-            int rowH = Canvas.FontHeight(ChartFonts.Legend(app)) + app.Scale(6);
-            int gap = app.Scale(8);
-            int x0 = x + pad;
-            int maxX = x + w - pad;
-            int xCur = x0;
-            // 官方盒模型（LegendModel.defaultOption: left 'center'、
-            // 锚定，未声明时水平居中、贴底 15px。此前写死在内容顶部
-            // （yCur = top）导致 pie-simple 的竖排图例跑到左上角。
-            bool legVert = o.legendOrient == "vertical";
-            int lgRows = cands.Count;
-            if (!legVert) { lgRows = 1; }
-            int lgH = lgRows * rowH;
-            int yCur = Chart.LegendFloatTop(app, y, h, lgH, pad);
-            if (!legVert && cands.Count > 0) {
-                int rowW = 0 - gap;
-                for (int ci = 0; ci < cands.Count; ci = ci + 1) {
-                    rowW = rowW + Chart.LegendChipW(app, cands[ci].name) + gap;
-                }
-                xCur = Chart.LegendFloatLeft(app, x, w, rowW, pad, x0, maxX);
-            } else if (legVert) {
-                xCur = Chart.LegendFloatLeft(app, x, w,
-                    Chart.LegendChipW(app, cands.Count > 0 ? cands[0].name : ""),
-                    pad, x0, maxX);
-            }
-            for (int ci = 0; ci < cands.Count; ci = ci + 1) {
-                PieLegendItem item = cands[ci];
-                int si = item.seriesIndex;
-                int di = item.dataIndex;
-                ChartSeries ps = o.series[si];
-                int col = PieLayout.SliceColor(t, ps, di, PieLayout.SlicePalIndex(o, ps, di, si * 16 + di));
-                bool hid = ps.data[di].hidden;
-                string lbl = item.name;
-                int cw = Chart.LegendChipW(app, lbl);
-                if (legVert) { xCur = x0; }
-                else if (xCur > x0 && xCur + cw > maxX) {
-                    xCur = x0;
-                    yCur = yCur + rowH;
-                }
-                if (app.mouseX >= xCur && app.mouseX < xCur + cw
-                    && app.mouseY >= yCur && app.mouseY < yCur + rowH) {
-                    hotSi = si;
-                    hotDi = di;
-                }
-                int key = 0;
-                if (o.iwid != 0) { key = Chart.LegendSliceKey(o.iwid, si, di); }
-                Chart.DrawLegendChip(app, xCur, yCur, cw, rowH, col, lbl, hid, key);
-                if (legVert) {
-                    // ECharts 图例是浮层：竖排列不占几何空间，饼体仍按
-                    // 整板布局（official pie.opt 左侧图例压在空区）。
-                    yCur = yCur + rowH;
-                } else {
-                    xCur = xCur + cw + gap;
-                    int legBottom = yCur + rowH;
-                    if (legBottom > bodyY) { bodyY = legBottom; }
-                }
-            }
-            // 顶部浮层图例让出一行饼体空间；贴底图例（LegendFloatTop
-            // 落到板底）不占几何——bodyY 记到板底会把全部外标钳到
-            // tyMax（pie-nest 曾因此整排标签压底）。图例中线在板上
-            // 半区才视为"顶部占位"。
-            if (bodyY > y + h / 2) { bodyY = top; }
-            if (o.showLegend && bodyY > top) {
-                bodyY = bodyY + app.Scale(4);
-            }
-        }
-
-        int areaW = w - pad * 2;
-        int areaH = (y + h - pad) - bodyY;
-        int pct = 72;
-        if (sliceLabels) { pct = 52; }
-        if (ringCount > 1) { pct = 64; }
-        int rOuter = ChartView.RadialRadius(areaW, areaH, pct);
-        int cx = x + pad + areaW / 2;
-        int cy = bodyY + areaH / 2;
-        int sweepMax = 360 * g / 1000;
+        int ringCount = geometry.geoX.Length;
+        int bodyY = geometry.bodyY;
+        int areaW = geometry.areaW; int areaH = geometry.areaH;
+        int rOuter = geometry.rOuter; int cx = geometry.cx; int cy = geometry.cy;
+        int band = geometry.band; int ringGap = geometry.ringGap;
+        int[] geoX = geometry.geoX; int[] geoY = geometry.geoY;
+        int[] geoRi = geometry.geoRi; int[] geoRo = geometry.geoRo;
         int rot = layout.rot;
-
-        int band = 0;
-        if (ringCount > 1) { band = rOuter / ringCount; }
-        if (band < app.Scale(2)) { band = app.Scale(2); }
-        if (ringCount > 1 && band * ringCount > rOuter) {
-            band = rOuter / ringCount;
-            if (band < 1) { band = 1; }
+        int sweepMax = 360 * g / 1000;
+        int hotSi = -1; int hotDi = -1;
+        for (int i = 0; i < geometry.legend.entries.Count; i = i + 1) {
+            ChartLegendEntry entry = geometry.legend.entries[i];
+            ChartSeries series = o.series[entry.seriesIndex];
+            int color = PieLayout.SliceColor(t, series, entry.dataIndex,
+            PieLayout.SlicePalIndex(o, series, entry.dataIndex, entry.seriesIndex * 16 + entry.dataIndex));
+            Chart.DrawLegendChip(app, entry.x, entry.y, entry.w, entry.h, color,
+            entry.text, series.data[entry.dataIndex].hidden, entry.index);
+            ChartActionControl action = ChartView.activeEventView != null
+            ? ChartView.activeEventView.FindAction(3, entry.index) : null;
+            if (action != null && action.hot) { hotSi = entry.seriesIndex; hotDi = entry.dataIndex; }
         }
-        int ringGap = app.Scale(2);
-        if (ringGap < 1) { ringGap = 1; }
-
-        // 逐环几何：有 center/radius 覆盖的环按自身圆心与内外径解析
-        // （% 相对面板 w/h 与 min(w,h)/2，px 走 GaugeScalar，ECharts
-        // 容器语义），其余环共享默认圆心与均分带边界。绘制、悬停、
-        // 标签、markPoint、中心标注、命中、emphasis 全部取自这里，
-        // 保证无覆盖路径与原 PieRingBounds 结果逐位一致。
-        int[] geoX = new int[ringCount];
-        int[] geoY = new int[ringCount];
-        int[] geoRi = new int[ringCount];
-        int[] geoRo = new int[ringCount];
-        int radExt = (w < h ? w : h) / 2;
-        for (int rg = 0; rg < ringCount; rg = rg + 1) {
-            int riG = 0;
-            int roG = 0;
-            ChartView.PieRingBounds(layout, rg, ringCount, rOuter, band,
-                ringGap, out riG, out roG);
-            int gxG = cx;
-            int gyG = cy;
-            if (layout.ringCenter != null && rg < layout.ringCenter.Count
-                && layout.ringCenter[rg] != null) {
-                gxG = x + ChartView.GaugeScalar(app, layout.ringCenter[rg].x, w);
-                gyG = y + ChartView.GaugeScalar(app, layout.ringCenter[rg].y, h);
-            }
-            if (layout.ringRadius != null && rg < layout.ringRadius.Count
-                && layout.ringRadius[rg] != null) {
-                roG = ChartView.GaugeScalar(app, layout.ringRadius[rg], radExt);
-                if (roG < 1) { roG = 1; }
-                int riN = 0;
-                if (layout.ringRadiusIn != null
-                    && rg < layout.ringRadiusIn.Count
-                    && layout.ringRadiusIn[rg] != null) {
-                    riN = ChartView.GaugeScalar(app, layout.ringRadiusIn[rg], radExt);
-                }
-                if (riN < 0) { riN = 0; }
-                if (riN >= roG) { riN = roG - 1; }
-                riG = riN;
-            }
-            geoX[rg] = gxG;
-            geoY[rg] = gyG;
-            geoRi[rg] = riG;
-            geoRo[rg] = roG;
-        }
-
-        int hoverK = 0 - 1;
-        int mx0 = app.mouseX;
-        int my0 = app.mouseY;
-        // 指针被上层弹层/抽屉接管时扇区不再悬停高亮/出卡（悬停穿透）。
-        bool hoverAllowed = my0 >= bodyY && !ChartView.HoverBlocked(app);
-        if (hoverAllowed) {
-            for (int kh = slices.Count - 1; kh >= 0; kh = kh - 1) {
-                PieSlice sh = slices[kh];
-                int ringH = sh.ring;
-                if (ringH >= ringCount) { ringH = ringCount - 1; }
-                if (ringH < 0) { ringH = 0; }
-                int riH = geoRi[ringH];
-                int roH = ChartView.PieSliceRo(riH, geoRo[ringH], sh.roseP);
-                int hitCx = geoX[ringH];
-                int hitCy = geoY[ringH];
-                if (sh.selected && sh.seriesIndex >= 0
-                    && sh.seriesIndex < o.series.Count) {
-                    int offHit = app.Scale(ChartView.PieSelectedOffset(
-                        o.series[sh.seriesIndex].selectedOffset));
-                    int midHit = rot + (sh.a0 + sh.a1) / 2;
-                    // 选中弹出沿本环圆心偏移（多饼各自 center 时
-                    // 默认圆心不属于任何环，命中会整体错位）。
-                    hitCx = hitCx + ChartView.FillDx(midHit) * offHit / 1000;
-                    hitCy = hitCy + ChartView.FillDy(midHit) * offHit / 1000;
-                }
-                int ddxH = mx0 - hitCx;
-                int ddyH = my0 - hitCy;
-                int distH = ChartView.ISqrt(ddxH * ddxH + ddyH * ddyH);
-                int angH = ((ChartView.AngleOf(ddxH, ddyH) - rot) % 360 + 360) % 360;
-                int endH = sh.a1;
-                if (endH > sweepMax) { endH = sweepMax; }
-                if (distH >= riH && distH < roH && endH > sh.a0
-                    && angH >= sh.a0 && angH < endH) {
-                    hoverK = kh;
-                    break;
-                }
-            }
-        }
-        if (hoverK >= 0) {
-            PieSlice hot = slices[hoverK];
-            ChartSeries hotSeries = null;
-            if (hot.seriesIndex >= 0 && hot.seriesIndex < o.series.Count) {
-                hotSeries = o.series[hot.seriesIndex];
-            }
-            if (hotSeries != null) {
-                ChartHit ph = ChartHit.Of(ChartElementType.PieSlice,
-                    hot.seriesIndex, hotSeries.name, hot.dataIndex, hot.name,
-                    hot.value, mx0, my0);
-                if (hot.dataIndex >= 0 && hot.dataIndex < hotSeries.data.Count) {
-                    ph.numberValueSet = hotSeries.data[hot.dataIndex].numberSet;
-                    ph.numberValue = hotSeries.data[hot.dataIndex].number;
-                }
-                ChartView.OfferActiveHit(ph);
-            }
-        }
-        if (hoverK >= 0 && o.iwid != 0
-            && ChartView.activeEventView != null
-            && ChartView.OwnsActiveClick(app,
-                ChartView.activeEventView.eventHitId)) {
-            PieSlice clk = slices[hoverK];
-            if (clk.seriesIndex >= 0 && clk.seriesIndex < o.series.Count) {
-                int key = Chart.PieSelKey(o.iwid, clk.seriesIndex, clk.dataIndex);
-                int nv = 1;
-                if (clk.selected) { nv = 0; }
-                app.StateSet(key, nv);
-                ChartInteractionEvent pe = ChartInteractionEvent.DataPoint(
-                    ChartEventType.PieSelected, o.iwid, clk.seriesIndex,
-                    o.series[clk.seriesIndex].name, clk.dataIndex, clk.name,
-                    ChartElementType.PieSlice);
-                pe.value = clk.value;
-                pe.selected = nv == 1;
-                ChartView.RaiseActive(pe);
-                app.RequestRedraw();
-            }
-        }
+        int mx0 = ChartView.PointerX(app); int my0 = ChartView.PointerY(app);
+        int hoverK = ChartView.HoverBlocked(app) ? -1 : geometry.HitIndex(app, o, mx0, my0, g);
 
         c.PushClip(x + pad, bodyY, areaW, areaH);
         for (int k = 0; k < slices.Count; k = k + 1) {
@@ -318,11 +117,11 @@ public partial class ChartView {
             int sx = 0;
             int sy = 0;
             bool pop = sl.selected
-                || (sl.seriesIndex == hotSi && sl.dataIndex == hotDi);
+            || (sl.seriesIndex == hotSi && sl.dataIndex == hotDi);
             if (pop && sl.seriesIndex >= 0
-                && sl.seriesIndex < o.series.Count) {
+            && sl.seriesIndex < o.series.Count) {
                 int offPx = app.Scale(ChartView.PieSelectedOffset(
-                    o.series[sl.seriesIndex].selectedOffset));
+                o.series[sl.seriesIndex].selectedOffset));
                 int midSel = rot + (a0 + a1) / 2;
                 sx = ChartView.FillDx(midSel) * offPx / 1000;
                 sy = ChartView.FillDy(midSel) * offPx / 1000;
@@ -341,7 +140,7 @@ public partial class ChartView {
                 c.FillSector(scx, scy, ri, ro, pa0, aHi, sl.color);
                 if (pop) {
                     StrokeSector(c, scx, scy, ri, ro, pa0, aHi,
-                        ChartColor.ContrastFg(sl.color), app.Scale(2));
+                    ChartColor.ContrastFg(sl.color), app.Scale(2));
                 }
                 if (sl.seriesIndex >= 0 && sl.seriesIndex < o.series.Count) {
                     ChartSeries bs = o.series[sl.seriesIndex];
@@ -357,7 +156,7 @@ public partial class ChartView {
                     }
                     if (bWid > 0 && bCol != 0) {
                         StrokeSector(c, scx, scy, ri, ro, pa0, aHi,
-                            bCol, app.Scale(bWid));
+                        bCol, app.Scale(bWid));
                     }
                 }
             }
@@ -390,7 +189,7 @@ public partial class ChartView {
             int fsO = ChartFonts.SeriesLabel(app);
             int lh = Canvas.FontHeight(fsO) + app.Scale(2);
             int outerFg = Style.Part(app, "chart", "label", "", "", "",
-                Style.SNormal()).FgOr(0);
+            Style.SNormal()).FgOr(0);
             for (int p = 0; p < slices.Count; p = p + 1) {
                 PieSlice sl = slices[p];
                 int ring = sl.ring;
@@ -413,7 +212,7 @@ public partial class ChartView {
                     // data[i].label 覆盖系列级文本样式（pie-rich-text
                     // 的逐扇区底板 + rich 表挂在这层）。
                     if (sl.dataIndex >= 0 && sl.dataIndex < slS.data.Count
-                        && slS.data[sl.dataIndex].dlabel != null) {
+                    && slS.data[sl.dataIndex].dlabel != null) {
                         lblStyle = slS.data[sl.dataIndex].dlabel;
                     }
                     if (slS.pieLabels) { showPct = true; }
@@ -428,15 +227,15 @@ public partial class ChartView {
                 if (lblStyle != null && lblStyle.color != 0) { lblColor = lblStyle.color; }
                 // 生效 rich 表（有才走富文本排版；否则剥壳纯文本）。
                 ChartTextStyle richSt = slS != null
-                    ? ChartView.PieSliceRichStyle(slS, sl) : null;
+                ? ChartView.PieSliceRichStyle(slS, sl) : null;
                 int lcx = geoX[ring];
                 int lcy = geoY[ring];
                 bool popL = sl.selected
-                    || (sl.seriesIndex == hotSi && sl.dataIndex == hotDi);
+                || (sl.seriesIndex == hotSi && sl.dataIndex == hotDi);
                 if (popL && sl.seriesIndex >= 0
-                    && sl.seriesIndex < o.series.Count) {
+                && sl.seriesIndex < o.series.Count) {
                     int offPx = app.Scale(ChartView.PieSelectedOffset(
-                        o.series[sl.seriesIndex].selectedOffset));
+                    o.series[sl.seriesIndex].selectedOffset));
                     int midPop = rot + (sl.a0 + sl.a1) / 2;
                     lcx = cx + ChartView.FillDx(midPop) * offPx / 1000;
                     lcy = cy + ChartView.FillDy(midPop) * offPx / 1000;
@@ -445,7 +244,7 @@ public partial class ChartView {
                     // 内位（inside/inner/center，labelLayout.ts:441-445）：
                     // 中角 (r+r0)/2 再外推 3px 居中，center 落圆心，无引线。
                     int roLblMid = ChartView.PieSliceRo(geoRi[ring], geoRo[ring],
-                        sl.roseP);
+                    sl.roseP);
                     int rLbl = (geoRi[ring] + roLblMid) / 2 + app.Scale(3);
                     int mid = rot + (sl.a0 + sl.a1) / 2;
                     int lxp = ChartView.FillX(lcx, rLbl, mid);
@@ -457,19 +256,19 @@ public partial class ChartView {
                     if (richSt != null) {
                         string rawP = ChartView.PieSliceRaw(slS, sl, pct);
                         RichBlock blk = ChartView.RichLayout(app,
-                            Chart.RichTokenize(rawP, richSt), richSt, fsO);
+                        Chart.RichTokenize(rawP, richSt), richSt, fsO);
                         ChartView.RichDraw(app, c, lxp - blk.w / 2,
-                            lyp - blk.h / 2, blk, lblColor);
+                        lyp - blk.h / 2, blk, lblColor);
                     } else {
                         string pl = ChartView.PieLabelFmt(slS, sl.name, sl.value, pct);
                         int pw = Canvas.MeasureText(pl, fsO);
                         c.DrawText(lxp - pw / 2, Canvas.CenterTextYAt(lyp, fsO),
-                            pl, lblColor, fsO);
+                        pl, lblColor, fsO);
                     }
                 } else if (showPct && sl.a1 <= sweepMax && pct >= 4
-                           && !outerLabel && !nativeIn && !nativeOut) {
+                && !outerLabel && !nativeIn && !nativeOut) {
                     int roLblMid = ChartView.PieSliceRo(geoRi[ring], geoRo[ring],
-                        sl.roseP);
+                    sl.roseP);
                     int rLbl = (geoRi[ring] + roLblMid) / 2;
                     if (ringCount == 1 && geoRi[0] < app.Scale(4)) {
                         rLbl = geoRo[0] * 62 / 100;
@@ -479,30 +278,30 @@ public partial class ChartView {
                     int lyp = ChartView.FillY(lcy, rLbl, mid);
                     string pl = Convert.ToString(pct) + "%";
                     if (sl.seriesIndex >= 0 && sl.seriesIndex < o.series.Count
-                        && o.series[sl.seriesIndex].labelFmt.Length > 0) {
+                    && o.series[sl.seriesIndex].labelFmt.Length > 0) {
                         pl = ChartView.PieLabelFmt(o.series[sl.seriesIndex],
-                            sl.name, sl.value, pct);
+                        sl.name, sl.value, pct);
                     }
                     int pw = Canvas.MeasureText(pl, fsO);
                     c.DrawText(lxp - pw / 2, Canvas.CenterTextYAt(lyp, fsO),
-                        pl, lblColor, fsO);
+                    pl, lblColor, fsO);
                 } else if (sl.a1 <= sweepMax && pct >= 1
-                           && (outerLabel || nativeOut)) {
+                && (outerLabel || nativeOut)) {
                     // 外标初始几何（labelLayout.ts:430-470）：径向段长
                     // 到基准外径 + len（roseType 扇区半径小，源码
                     // len + r - sectorShape.r 补差）；x3 水平 ±len2；
                     // alignTo:'edge' 文本锚压视口边、对齐反向（454-471）。
                     int roLbl = ChartView.PieSliceRo(geoRi[ring], geoRo[ring],
-                        sl.roseP);
+                    sl.roseP);
                     int midO = rot + (sl.a0 + sl.a1) / 2;
                     int dirX = ChartView.FillDx(midO);
                     int dirY = ChartView.FillDy(midO);
                     int len1 = app.Scale(slS != null && slS.labelLineLen >= 0
-                        ? slS.labelLineLen : 15);
+                    ? slS.labelLineLen : 15);
                     int len2 = app.Scale(slS != null && slS.labelLineLen2 >= 0
-                        ? slS.labelLineLen2 : 30);
+                    ? slS.labelLineLen2 : 30);
                     int dist = app.Scale(slS != null && slS.labelDist >= 0
-                        ? slS.labelDist : 5);
+                    ? slS.labelDist : 5);
                     int x1 = lcx + dirX * roLbl / 1000;
                     int y1 = lcy + dirY * roLbl / 1000;
                     int x2 = lcx + dirX * (geoRo[ring] + len1) / 1000;
@@ -512,32 +311,32 @@ public partial class ChartView {
                     // 富文本块（有 rich 声明才排版）或剥壳纯文本；
                     // 块宽/文本宽供 alignTo:'edge' 与文本锚共用。
                     string rawO = slS != null
-                        ? ChartView.PieSliceRaw(slS, sl, pct) : sl.name;
+                    ? ChartView.PieSliceRaw(slS, sl, pct) : sl.name;
                     RichBlock blkO = null;
                     string txt = rawO;
                     if (richSt != null) {
                         blkO = ChartView.RichLayout(app,
-                            Chart.RichTokenize(rawO, richSt), richSt, fsO);
+                        Chart.RichTokenize(rawO, richSt), richSt, fsO);
                         txt = ChartView.PieStripRich(rawO);
                     }
                     int tw2 = blkO != null ? blkO.w : Canvas.MeasureText(txt, fsO);
                     if (slS != null && slS.labelAlignTo == 2) {
                         int ed = slS.labelEdgeDist >= 0
-                            ? app.Scale(slS.labelEdgeDist)
-                            : app.Scale((w - 2 * pad) * 25 / 100);
+                        ? app.Scale(slS.labelEdgeDist)
+                        : app.Scale((w - 2 * pad) * 25 / 100);
                         x3 = Chart.PieEdgeX3(rightSide, x + pad, w - 2 * pad,
-                            ed, tw2, dist);
+                        ed, tw2, dist);
                     }
                     int txp = rightSide ? x3 + dist : x3 - dist - tw2;
                     if (slS != null && slS.labelAlignTo == 2) {
                         txp = rightSide ? x3 + dist - tw2 : x3 - dist - tw2;
                     }
                     int tcol = lblStyle != null && lblStyle.color != 0
-                        ? lblStyle.color : outerFg;
+                    ? lblStyle.color : outerFg;
                     bool draws = slS == null || Chart.PieLeaderDraws(slS.labelLineShow);
                     labels.Add(new PieOuterLabelEntry(x1, y1, x2, x3, txp, y2,
-                        rightSide ? 1 : 0, tcol, sl.color, draws, txt, blkO,
-                        blkO != null ? blkO.h : lh));
+                    rightSide ? 1 : 0, tcol, sl.color, draws, txt, blkO,
+                    blkO != null ? blkO.h : lh));
                 }
             }
             // 去重叠：每半球一列，按文本顶 y 插入排序后自上而下只推
@@ -571,7 +370,7 @@ public partial class ChartView {
                 if (sideItems.Count > 0) {
                     int top0 = sideItems[0].yc - sideItems[0].height / 2;
                     int bot0 = sideItems[sideItems.Count - 1].yc
-                        + sideItems[sideItems.Count - 1].height / 2;
+                    + sideItems[sideItems.Count - 1].height / 2;
                     int dy = 0;
                     if (top0 < bodyY) { dy = bodyY - top0; }
                     if (bot0 + dy > y + h - pad) { dy = y + h - pad - bot0; }
@@ -591,8 +390,8 @@ public partial class ChartView {
                     c.DrawLine(item.x2, item.yc, item.x3, item.yc, item.lineColor, 1);
                 }
                 int tyo = item.block != null
-                    ? item.yc - item.block.h / 2
-                    : Canvas.CenterTextYAt(item.yc, fsO);
+                ? item.yc - item.block.h / 2
+                : Canvas.CenterTextYAt(item.yc, fsO);
                 if (tyo < bodyY) { tyo = bodyY; }
                 int blkH = item.block != null ? item.block.h : Canvas.FontHeight(fsO);
                 int tyMax = y + h - pad - blkH;
@@ -600,7 +399,7 @@ public partial class ChartView {
                 int txp = item.tx;
                 if (txp < x + pad) { txp = x + pad; }
                 int twQ = item.block != null ? item.block.w
-                    : Canvas.MeasureText(item.text, fsO);
+                : Canvas.MeasureText(item.text, fsO);
                 if (txp + twQ > x + w - pad) {
                     txp = x + w - pad - twQ;
                 }
@@ -642,11 +441,11 @@ public partial class ChartView {
                 markRwP = slices[worstI].roseP;
             }
             ChartView.DrawPieMark(app, c, geoX[markRb], geoY[markRb],
-                ChartView.PieSliceRo(geoRi[markRb], geoRo[markRb], markRbP),
-                rot, slices, bestI, "max", t, o.series);
+            ChartView.PieSliceRo(geoRi[markRb], geoRo[markRb], markRbP),
+            rot, slices, bestI, "max", t, o.series);
             ChartView.DrawPieMark(app, c, geoX[markRw], geoY[markRw],
-                ChartView.PieSliceRo(geoRi[markRw], geoRo[markRw], markRwP),
-                rot, slices, worstI, "min", t, o.series);
+            ChartView.PieSliceRo(geoRi[markRw], geoRo[markRw], markRwP),
+            rot, slices, worstI, "min", t, o.series);
         }
 
         // 环形图中心标注：选中扇区名优先，否则累计值。ECharts 默认
@@ -664,9 +463,9 @@ public partial class ChartView {
                 }
                 int tw = Canvas.MeasureText(tot, Style.FontFallback(app, "large"));
                 c.DrawText(geoX[0] - tw / 2,
-                    Canvas.CenterTextYAt(geoY[0], Style.FontFallback(app, "large")),
-                    tot, Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0),
-                    Style.FontFallback(app, "large"));
+                Canvas.CenterTextYAt(geoY[0], Style.FontFallback(app, "large")),
+                tot, Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0),
+                Style.FontFallback(app, "large"));
             }
         }
 
@@ -675,8 +474,8 @@ public partial class ChartView {
         // 命中几何与 tooltip 展示解耦：关闭 tooltip 不能关闭
         // PieSlice 的 Hover/MouseOut/Click 事件。
         {
-            int mx = app.mouseX;
-            int my = app.mouseY;
+            int mx = ChartView.PointerX(app);
+            int my = ChartView.PointerY(app);
             if (my < bodyY) { return; }
             // 指针被上层弹层/抽屉接管时扇区命中/emphasis/tooltip 整体静默。
             if (ChartView.HoverBlocked(app)) { return; }
@@ -696,9 +495,9 @@ public partial class ChartView {
                 int tipCx = geoX[ring];
                 int tipCy = geoY[ring];
                 if (sl.selected && sl.seriesIndex >= 0
-                    && sl.seriesIndex < o.series.Count) {
+                && sl.seriesIndex < o.series.Count) {
                     int offTip = app.Scale(ChartView.PieSelectedOffset(
-                        o.series[sl.seriesIndex].selectedOffset));
+                    o.series[sl.seriesIndex].selectedOffset));
                     int midTip = rot + (sl.a0 + sl.a1) / 2;
                     tipCx = geoX[ring] + ChartView.FillDx(midTip) * offTip / 1000;
                     tipCy = geoY[ring] + ChartView.FillDy(midTip) * offTip / 1000;
@@ -710,7 +509,7 @@ public partial class ChartView {
                 int aEndTip = sl.a1;
                 if (aEndTip > sweepMax) { aEndTip = sweepMax; }
                 if (tipDist >= ri && tipDist < ro && aEndTip > sl.a0
-                    && tipAng >= sl.a0 && tipAng < aEndTip) {
+                && tipAng >= sl.a0 && tipAng < aEndTip) {
                     long ringTot = total;
                     if (ring < layout.ringTotalWide.Count && layout.ringTotalWide[ring] > 0) {
                         ringTot = layout.ringTotalWide[ring];
@@ -727,15 +526,15 @@ public partial class ChartView {
                         int aEnd2 = sl.a1;
                         if (aEnd2 > sweepMax) { aEnd2 = sweepMax; }
                         if (aEnd2 > sl.a0
-                            && ChartView.PieHasEmphasisPaint(
-                                hs2.itemStyle.emphasis.color,
-                                hs2.itemStyle.emphasis.borderColor,
-                                hs2.itemStyle.emphasis.borderWidth)) {
+                        && ChartView.PieHasEmphasisPaint(
+                        hs2.itemStyle.emphasis.color,
+                        hs2.itemStyle.emphasis.borderColor,
+                        hs2.itemStyle.emphasis.borderWidth)) {
                             int hcx = geoX[ring];
                             int hcy = geoY[ring];
                             if (sl.selected) {
                                 int offH = app.Scale(ChartView.PieSelectedOffset(
-                                    hs2.selectedOffset));
+                                hs2.selectedOffset));
                                 int midH = rot + (sl.a0 + sl.a1) / 2;
                                 hcx = geoX[ring] + ChartView.FillDx(midH) * offH / 1000;
                                 hcy = geoY[ring] + ChartView.FillDy(midH) * offH / 1000;
@@ -748,14 +547,14 @@ public partial class ChartView {
                                 ha1 = ha1 - (sl.padAngle - halfPad);
                             }
                             c.FillSector(hcx, hcy, ri, ro,
-                                ha0, ha1, hiFill);
+                            ha0, ha1, hiFill);
                             int bc = hs2.itemStyle.emphasis.borderColor;
                             int bw2 = hs2.itemStyle.emphasis.borderWidth;
                             if (bc == 0) { bc = hs2.itemStyle.normal.borderColor; }
                             if (bw2 <= 0) { bw2 = hs2.itemStyle.normal.borderWidth; }
                             StrokeSector(c, hcx, hcy, ri, ro,
-                                ha0, ha1, bc,
-                                app.Scale(bw2));
+                            ha0, ha1, bc,
+                            app.Scale(bw2));
                         }
                     }
                     if (o.showTooltip) {
@@ -763,106 +562,106 @@ public partial class ChartView {
                         List<TooltipRow> rows = new List<TooltipRow>{
                             TooltipRow.Of(0, o.title),
                             TooltipRow.Of(sl.color,
-                                sl.name + "  " + Convert.ToString(sl.value)
-                                + "  (" + Convert.ToString(pct3) + "%)") };
-                        ChartView.TooltipCard(app, mx, my, x + w, rows);
+                            sl.name + "  " + Convert.ToString(sl.value)
+                            + "  (" + Convert.ToString(pct3) + "%)") };
+                            ChartView.TooltipCard(app, mx, my, x + w, rows);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
-    }
-    // 饼图 markPoint：在扇区中角方向延伸一个标签。线 + 圆 + 文字。
-    // idx < 0 时不画；与 SliceOutMidAngle 共享角度约定（rot + 中角），
-    // 屏幕位置按数学域 +270° 换算（与 selectOffset 路径同源）。
-    // 扇区静态选中时整体外偏 selectedOffset：引线与标签必须锚在
-    // 偏移后的圆心，否则 mark 点落在与扇区脱开的位置。
-    // label.formatter 模板：{a}=系列名 {b}=项名 {c}=值 {d}=百分比
-    // 整数（不带 %，官方写法 "{d}%"）；{@dim}=数据集维度原值（饼聚
-    // 合后行维度不可得，退化为值）。{style|content} 富文本包装剥壳
-    // 取内容（分色/底色的富文本排版本待富文本层，T4-2）。
-    // 逐扇区生效的 rich 样式表：data[i].label 覆盖系列级 label；
-    // 无 rich 声明返回 null（走剥壳纯文本路径）。
-    public static ChartTextStyle PieSliceRichStyle(ChartSeries s, PieSlice sl) {
-        ChartTextStyle st = s.label;
-        if (sl.dataIndex >= 0 && sl.dataIndex < s.data.Count
+        // 饼图 markPoint：在扇区中角方向延伸一个标签。线 + 圆 + 文字。
+        // idx < 0 时不画；与 SliceOutMidAngle 共享角度约定（rot + 中角），
+        // 屏幕位置按数学域 +270° 换算（与 selectOffset 路径同源）。
+        // 扇区静态选中时整体外偏 selectedOffset：引线与标签必须锚在
+        // 偏移后的圆心，否则 mark 点落在与扇区脱开的位置。
+        // label.formatter 模板：{a}=系列名 {b}=项名 {c}=值 {d}=百分比
+        // 整数（不带 %，官方写法 "{d}%"）；{@dim}=数据集维度原值（饼聚
+        // 合后行维度不可得，退化为值）。{style|content} 富文本包装剥壳
+        // 取内容（分色/底色的富文本排版本待富文本层，T4-2）。
+        // 逐扇区生效的 rich 样式表：data[i].label 覆盖系列级 label；
+        // 无 rich 声明返回 null（走剥壳纯文本路径）。
+        public static ChartTextStyle PieSliceRichStyle(ChartSeries s, PieSlice sl) {
+            ChartTextStyle st = s.label;
+            if (sl.dataIndex >= 0 && sl.dataIndex < s.data.Count
             && s.data[sl.dataIndex].dlabel != null) {
-            st = s.data[sl.dataIndex].dlabel;
-        }
-        if (st != null && st.rich != null) { return st; }
-        return null;
-    }
-
-    // 逐扇区模板原始串（{a}{b}{c}{d}{@dim} 已展开、rich 壳保留）：
-    // data[i].label.formatter 模板覆盖系列级；无模板返回名称。
-    public static string PieSliceRaw(ChartSeries s, PieSlice sl, int pct) {
-        string fmt = s.labelFmt;
-        if (sl.dataIndex >= 0 && sl.dataIndex < s.data.Count
-            && s.data[sl.dataIndex].labelFmtT.Length > 0) {
-            fmt = s.data[sl.dataIndex].labelFmtT;
-        }
-        if (fmt.Length == 0) { return sl.name; }
-        return Chart.RichFmtRaw(s, fmt, sl.name, sl.value, pct);
-    }
-
-    public static string PieLabelFmt(ChartSeries s, string name, int val, int pct) {
-        // 与 tooltip 同一道令牌展开（Chart.RichFmtRaw），饼图额外剥
-        // {style|...} 壳取纯文本。
-        return ChartView.PieStripRich(Chart.RichFmtRaw(s, s.labelFmt, name, val, pct));
-    }
-
-    // 剥 {styleName|content} 壳取 content；裸 {token} 原样保留。
-    public static string PieStripRich(string f) {
-        string r = "";
-        int i = 0;
-        while (i < f.Length) {
-            int ob = f.IndexOf("{", i);
-            if (ob < 0) { r = r + f.Substring(i); break; }
-            r = r + f.Substring(i, ob - i);
-            int cb = f.IndexOf("}", ob);
-            if (cb < 0) { r = r + f.Substring(ob); break; }
-            int bar = f.IndexOf("|", ob);
-            if (bar >= 0 && bar < cb) {
-                r = r + f.Substring(bar + 1, cb - bar - 1);
-            } else {
-                r = r + f.Substring(ob, cb - ob + 1);
+                st = s.data[sl.dataIndex].dlabel;
             }
-            i = cb + 1;
+            if (st != null && st.rich != null) { return st; }
+            return null;
         }
-        return r;
-    }
 
-    public static void DrawPieMark(App app, Canvas c, int cx, int cy, int rOuter,
-                            int rot, List<PieSlice> slices, int idx,
-                            string lbl, Theme t, List<ChartSeries> series) {
-        if (idx < 0 || idx >= slices.Count) { return; }
-        PieSlice sl = slices[idx];
-        int mid = rot + (sl.a0 + sl.a1) / 2;
-        int markCx = cx;
-        int markCy = cy;
-        if (sl.selected && sl.seriesIndex >= 0 && sl.seriesIndex < series.Count) {
-            int offSel = app.Scale(ChartView.PieSelectedOffset(
-                series[sl.seriesIndex].selectedOffset));
-            markCx = cx + ChartView.FillDx(mid) * offSel / 1000;
-            markCy = cy + ChartView.FillDy(mid) * offSel / 1000;
+        // 逐扇区模板原始串（{a}{b}{c}{d}{@dim} 已展开、rich 壳保留）：
+        // data[i].label.formatter 模板覆盖系列级；无模板返回名称。
+        public static string PieSliceRaw(ChartSeries s, PieSlice sl, int pct) {
+            string fmt = s.labelFmt;
+            if (sl.dataIndex >= 0 && sl.dataIndex < s.data.Count
+            && s.data[sl.dataIndex].labelFmtT.Length > 0) {
+                fmt = s.data[sl.dataIndex].labelFmtT;
+            }
+            if (fmt.Length == 0) { return sl.name; }
+            return Chart.RichFmtRaw(s, fmt, sl.name, sl.value, pct);
         }
-        int px = markCx + ChartView.SinDeg(mid) * rOuter / 1000;
-        int py = markCy + ChartView.SinDeg(mid + 270) * rOuter / 1000;
-        int off = app.Scale(18);
-        int ex = markCx + ChartView.SinDeg(mid) * (rOuter + off) / 1000;
-        int ey = markCy + ChartView.SinDeg(mid + 270) * (rOuter + off) / 1000;
-        int sCol = Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0);
-        c.DrawLine(px, py, ex, ey, sCol, 1);
-        c.FillCircle(ex, ey, app.Scale(2), sCol);
-        string txt = lbl + " " + Convert.ToString(sl.value);
-        int fs = ChartFonts.SeriesLabel(app);
-        int tw = Canvas.MeasureText(txt, fs);
-        int tx = ex;
-        int ty = ey - Canvas.FontHeight(fs) - app.Scale(2);
-        // 屏幕位置约定 x = SinDeg(mid)；mid 在 0..360 环上——
-        // 右半圈（x >= 0）文本左对齐在 ex 处，左半圈右对齐。
-        if (ChartView.SinDeg(mid) >= 0) { tx = ex + app.Scale(4); }
-        else { tx = ex - app.Scale(4) - tw; }
-        c.DrawText(tx, ty, txt, sCol, fs);
+
+        public static string PieLabelFmt(ChartSeries s, string name, int val, int pct) {
+            // 与 tooltip 同一道令牌展开（Chart.RichFmtRaw），饼图额外剥
+            // {style|...} 壳取纯文本。
+            return ChartView.PieStripRich(Chart.RichFmtRaw(s, s.labelFmt, name, val, pct));
+        }
+
+        // 剥 {styleName|content} 壳取 content；裸 {token} 原样保留。
+        public static string PieStripRich(string f) {
+            string r = "";
+            int i = 0;
+            while (i < f.Length) {
+                int ob = f.IndexOf("{", i);
+                if (ob < 0) { r = r + f.Substring(i); break; }
+                r = r + f.Substring(i, ob - i);
+                int cb = f.IndexOf("}", ob);
+                if (cb < 0) { r = r + f.Substring(ob); break; }
+                int bar = f.IndexOf("|", ob);
+                if (bar >= 0 && bar < cb) {
+                    r = r + f.Substring(bar + 1, cb - bar - 1);
+                } else {
+                    r = r + f.Substring(ob, cb - ob + 1);
+                }
+                i = cb + 1;
+            }
+            return r;
+        }
+
+        public static void DrawPieMark(App app, Canvas c, int cx, int cy, int rOuter,
+        int rot, List<PieSlice> slices, int idx,
+        string lbl, Theme t, List<ChartSeries> series) {
+            if (idx < 0 || idx >= slices.Count) { return; }
+            PieSlice sl = slices[idx];
+            int mid = rot + (sl.a0 + sl.a1) / 2;
+            int markCx = cx;
+            int markCy = cy;
+            if (sl.selected && sl.seriesIndex >= 0 && sl.seriesIndex < series.Count) {
+                int offSel = app.Scale(ChartView.PieSelectedOffset(
+                series[sl.seriesIndex].selectedOffset));
+                markCx = cx + ChartView.FillDx(mid) * offSel / 1000;
+                markCy = cy + ChartView.FillDy(mid) * offSel / 1000;
+            }
+            int px = markCx + ChartView.SinDeg(mid) * rOuter / 1000;
+            int py = markCy + ChartView.SinDeg(mid + 270) * rOuter / 1000;
+            int off = app.Scale(18);
+            int ex = markCx + ChartView.SinDeg(mid) * (rOuter + off) / 1000;
+            int ey = markCy + ChartView.SinDeg(mid + 270) * (rOuter + off) / 1000;
+            int sCol = Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0);
+            c.DrawLine(px, py, ex, ey, sCol, 1);
+            c.FillCircle(ex, ey, app.Scale(2), sCol);
+            string txt = lbl + " " + Convert.ToString(sl.value);
+            int fs = ChartFonts.SeriesLabel(app);
+            int tw = Canvas.MeasureText(txt, fs);
+            int tx = ex;
+            int ty = ey - Canvas.FontHeight(fs) - app.Scale(2);
+            // 屏幕位置约定 x = SinDeg(mid)；mid 在 0..360 环上——
+            // 右半圈（x >= 0）文本左对齐在 ex 处，左半圈右对齐。
+            if (ChartView.SinDeg(mid) >= 0) { tx = ex + app.Scale(4); }
+            else { tx = ex - app.Scale(4) - tw; }
+            c.DrawText(tx, ty, txt, sCol, fs);
+        }
     }
-}

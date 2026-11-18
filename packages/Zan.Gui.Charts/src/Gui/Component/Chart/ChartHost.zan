@@ -25,6 +25,7 @@ public class ChartHost : Control {
     ButtonGroup toolboxGroup;
     List<Button> toolboxButtons;
     int lastToolboxActionsHash;
+    int typeSchemaGeneration;
 
     // 自注册入口（B-ID44 约定）：按需注册到 ControlFactory
     public static void Install() {
@@ -39,6 +40,8 @@ public class ChartHost : Control {
         chartType = "bar";
         opt = ChartHost.SampleOf("bar");
         view = ChartView.Of(opt);
+        view.Grow();
+        this.Add(view);
         widgetToolbox = false;
         toolboxGroup = null;
         toolboxButtons = null;
@@ -51,6 +54,8 @@ public class ChartHost : Control {
         opt = o != null ? o : ChartHost.SampleOf("bar");
         chartType = opt.series.Count > 0 ? ChartKinds.TypeName(opt.series[0].type) : "bar";
         view = ChartView.Of(opt);
+        view.Grow();
+        this.Add(view);
         widgetToolbox = false;
         toolboxGroup = null;
         toolboxButtons = null;
@@ -59,20 +64,47 @@ public class ChartHost : Control {
 
     public override string Kind() { return "ChartHost"; }
 
-    // 当前图型字符串与标题的文本应答；其余键交基类
-    // （Props 未声明的键走 GetExtra/样式类 fallback）。
-    public override string GetProp(string key) {
-        if (key == "type") { return chartType; }
-        if (key == "title") { return opt.title; }
-        if (key == "widgetToolbox") { return widgetToolbox ? "true" : "false"; }
-        return base.GetProp(key);
+    // 绑定访问器而非当前 opt 字段：切型/SetOption 换配置后，已发布的
+    // PropSpec 仍读取当前配置，写入也经过宿主的语义 setter。
+    public string Type {
+        get { return chartType; }
+        set { this.SetChartType(value); }
     }
 
-    public override void SetProp(string key, string val) {
-        if (key == "type") { this.SetChartType(val); return; }
-        if (key == "title") { opt.title = val; return; }
-        if (key == "widgetToolbox") { this.SetWidgetToolbox(val == "true" || val == "1"); return; }
-        base.SetProp(key, val);
+    public string Title {
+        get { return opt.title; }
+        set { opt.title = value; this.Invalidate(); }
+    }
+
+    public bool WidgetToolbox {
+        get { return widgetToolbox; }
+        set { this.SetWidgetToolbox(value); }
+    }
+
+    protected override int PropertySchemaKey() { return typeSchemaGeneration; }
+
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec type = new PropSpec("type", "Type", 3).Default("bar");
+        type.Field("Type", 0);
+        for (int i = (int)ChartType.Line; i <= (int)ChartType.Custom; i = i + 1) {
+            type.options.Add(ChartKinds.TypeName((ChartType)i));
+        }
+        type.options.Add("area");
+        type.options.Add("stacked");
+        type.options.Add("hbar");
+        type.options.Add("hstacked");
+        type.options.Add("donut");
+        // 自定义渲染器标签和别名仍是合法类型，当前值也能枚举导出。
+        if (!type.options.Contains(chartType)) { type.options.Add(chartType); }
+        ps.Add(type);
+        PropSpec title = new PropSpec("title", "Title", 0).Default("");
+        title.Field("Title", 0);
+        ps.Add(title);
+        PropSpec toolbox = new PropSpec("widgetToolbox", "Widget toolbox", 2).Default("false");
+        toolbox.Field("WidgetToolbox", 2);
+        ps.Add(toolbox);
+        return ps;
     }
 
     // 启用/禁用外挂控件模式工具箱（ButtonGroup/Button 挂载）
@@ -81,6 +113,7 @@ public class ChartHost : Control {
         if (!enable && toolboxGroup != null) {
             toolboxGroup.Visible = false;
         }
+        this.Invalidate();
     }
 
     public bool IsWidgetToolbox() { return widgetToolbox; }
@@ -122,197 +155,211 @@ public class ChartHost : Control {
             toolboxButtons.Clear();
             string[] icons = new string[]{
                 "table", "chart-line", "chart-bar", "undo", "save", "search" };
-            string[] tips = new string[]{
-                "数据视图", "切换为折线", "切换为柱状", "还原", "保存为图片", "区域缩放" };
-            for (int k = 0; k < ids.Count; k = k + 1) {
-                int act = ids[k];
-                Button b = new Button(new IconView(icons[act], 14));
-                b.Tip = tips[act];
-                b.Class = "toolbox-btn ghost small";
-                b.Click.Add(() => {
-                    this.OnToolboxAction(act);
-                });
-                toolboxButtons.Add(b);
-                toolboxGroup.AddButton(b);
+                string[] tips = new string[]{
+                    "数据视图", "切换为折线", "切换为柱状", "还原", "保存为图片", "区域缩放" };
+                    for (int k = 0; k < ids.Count; k = k + 1) {
+                        int act = ids[k];
+                        Button b = new Button(new IconView(icons[act], 14));
+                        b.Tip = tips[act];
+                        b.Class = "toolbox-btn ghost small";
+                        WeakReference<ChartHost> owner = new WeakReference<ChartHost>(this);
+                        b.Click.Add(() => {
+                            ChartHost host = owner.Target;
+                            if (host != null) { host.OnToolboxAction(act); }
+                        });
+                        toolboxButtons.Add(b);
+                        toolboxGroup.AddButton(b);
+                    }
+                    lastToolboxActionsHash = h;
+                }
+
+                int wid = view.Wid();
+                int magic = app.StateGet(Chart.TbMagicKey(wid), 0);
+                int zOn = app.StateGet(Chart.TbZoomKey(wid), 0);
+                for (int k = 0; k < ids.Count; k = k + 1) {
+                    int act = ids[k];
+                    bool on = (act == 1 && magic == 1) || (act == 2 && magic == 2)
+                    || (act == 5 && zOn != 0);
+                    if (k < toolboxButtons.Count) {
+                        toolboxButtons[k].Checked = on;
+                    }
+                }
+
+                int btn = ChartToolbox.Btn(app);
+                int gap = ChartToolbox.Gap(app);
+                int pad = ChartToolbox.Pad(app);
+                int n = ids.Count;
+                int rowW = n * btn + (n - 1) * gap;
+                int baseX = bx + bw - pad - rowW;
+                int baseY = by + pad;
+
+                toolboxGroup.Visible = true;
+                toolboxGroup.Arrange(baseX, baseY, rowW, btn);
             }
-            lastToolboxActionsHash = h;
-        }
 
-        int wid = view.Wid();
-        int magic = app.StateGet(Chart.TbMagicKey(wid), 0);
-        int zOn = app.StateGet(Chart.TbZoomKey(wid), 0);
-        for (int k = 0; k < ids.Count; k = k + 1) {
-            int act = ids[k];
-            bool on = (act == 1 && magic == 1) || (act == 2 && magic == 2)
-                || (act == 5 && zOn != 0);
-            if (k < toolboxButtons.Count) {
-                toolboxButtons[k].Checked = on;
+            private void OnToolboxAction(int action) {
+                App app = this.FindApp();
+                if (app == null || opt == null || view == null) { return; }
+                int wid = view.Wid();
+                int magic = app.StateGet(Chart.TbMagicKey(wid), 0);
+                int zOn = app.StateGet(Chart.TbZoomKey(wid), 0);
+                ChartToolbox.Click(app, action, wid, opt, bx, by, bw, bh, magic, zOn);
+                app.RequestRedraw();
             }
-        }
 
-        int btn = ChartToolbox.Btn(app);
-        int gap = ChartToolbox.Gap(app);
-        int pad = ChartToolbox.Pad(app);
-        int n = ids.Count;
-        int rowW = n * btn + (n - 1) * gap;
-        int baseX = bx + bw - pad - rowW;
-        int baseY = by + pad;
+            // 同类型重放保持配置与视图；实际切型重拼示例数据，保留宿主标题。
+            // 真数据的类型与内容仍由 SetOption 一起接管。
+            public void SetChartType(string s) {
+                if (s == null || s == "") { s = "bar"; }
+                if (s == chartType) { return; }
+                string title = opt.title;
+                chartType = s;
+                typeSchemaGeneration = typeSchemaGeneration + 1;
+                opt = ChartHost.SampleOf(s);
+                opt.title = title;
+                view.SetOption(opt);
+                this.RefreshToolboxButtons();
+                this.Invalidate();
+            }
 
-        toolboxGroup.Visible = true;
-        toolboxGroup.Arrange(baseX, baseY, rowW, btn);
-    }
+            // 整体替换 option（类型、图例、系列全由调用方定）；null
+            // 忽略。ChartView 重建，入场动画重放一次。
+            public void SetOption(ChartOption o) {
+                if (o == null) { return; }
+                opt = o;
+                string nextType = opt.series.Count > 0 ? ChartKinds.TypeName(opt.series[0].type) : "bar";
+                if (chartType != nextType) {
+                    chartType = nextType;
+                    typeSchemaGeneration = typeSchemaGeneration + 1;
+                }
+                view.SetOption(o);
+                this.RefreshToolboxButtons();
+                this.Invalidate();
+            }
 
-    private void OnToolboxAction(int action) {
-        App app = this.FindApp();
-        if (app == null || opt == null || view == null) { return; }
-        int wid = view.Wid();
-        int magic = app.StateGet(Chart.TbMagicKey(wid), 0);
-        int zOn = app.StateGet(Chart.TbZoomKey(wid), 0);
-        ChartToolbox.Click(app, action, wid, opt, bx, by, bw, bh, magic, zOn);
-        app.RequestRedraw();
-    }
+            // 获取当前配置选项
+            public ChartOption GetOption() {
+                return opt;
+            }
 
-    // 切换图型并重拼示例 option。宿主已用 SetOption 接管数据后
-    // 切型会重置为示例数据——类型与数据一起由 SetOption 定。
-    public void SetChartType(string s) {
-        chartType = s;
-        opt = ChartHost.SampleOf(s);
-        view = ChartView.Of(opt);
-        this.RefreshToolboxButtons();
-    }
+            // 设置预设主题（如 "macarons", "dark", "shine", "blue" 等）
+            public void SetTheme(string name) {
+                if (name == null || name.Length == 0) { return; }
+                ChartSkin.SetCurrent(name);
+            }
 
-    // 整体替换 option（类型、图例、系列全由调用方定）；null
-    // 忽略。ChartView 重建，入场动画重放一次。
-    public void SetOption(ChartOption o) {
-        if (o == null) { return; }
-        opt = o;
-        view = ChartView.Of(o);
-        this.RefreshToolboxButtons();
-    }
+            // 示例尺寸（自由画布/流式布局都可再覆写宽高）。
+            public override void OnMeasure(App app) {
+                app = this.ResolveApp(app);
+                // 基线图表主题懒装载（App 不再构造即装载，见 ChartTheme）。
+                if (app != null) { ChartTheme.EnsureDefault(app); }
+                prefW = 320;
+                prefH = 200;
+            }
 
-    // 获取当前配置选项
-    public ChartOption GetOption() {
-        return opt;
-    }
+            public override void Arrange(int x, int y, int w, int h) {
+                this.bx = x; this.by = y;
+                this.bw = w > 0 ? w : 0; this.bh = h > 0 ? h : 0;
+                App app = this.App;
+                if (widgetToolbox && opt != null && opt.toolboxShow && app != null) {
+                    view.suppressCanvasToolbox = true;
+                    this.SyncToolboxWidget(app);
+                } else {
+                    view.suppressCanvasToolbox = false;
+                    if (toolboxGroup != null) { toolboxGroup.Visible = false; }
+                }
+                view.Arrange(bx, by, bw, bh);
+            }
 
-    // 设置预设主题（如 "macarons", "dark", "shine", "blue" 等）
-    public void SetTheme(string name) {
-        if (name == null || name.Length == 0) { return; }
-        ChartSkin.SetCurrent(name);
-    }
+            // 按图型字符串现拼示例 option——设计器画布预览与 `type`
+            // 切换共用同一份，保证"设计器所见 = 生成窗体初见"。别名
+            // （area/stacked/hbar/hstacked/donut）映射到对应系列风格；
+            // line/bar 之外的注册表类型配各自的示例系列；依赖结构化
+            // 数据的图型先以分类示例呈现（类型串留在 chartType 上，
+            // 真数据由 SetOption 接管）。
+            public static ChartOption SampleOf(string type) {
+                List<string> cats = new List<string>{
+                    "Mon", "Tue", "Wed", "Thu", "Fri" };
+                    List<int> a = new List<int>{ 24, 52, 38, 66, 45 };
+                    List<int> b = new List<int>{ 30, 20, 50, 40, 60 };
+                    string t = type;
+                    if (t == null || t == "") { t = "bar"; }
 
-    // 示例尺寸（自由画布/流式布局都可再覆写宽高）。
-    public override void OnMeasure(App app) {
-        app = this.ResolveApp(app);
-        // 基线图表主题懒装载（App 不再构造即装载，见 ChartTheme）。
-        if (app != null) { ChartTheme.EnsureDefault(app); }
-        prefW = 320;
-        prefH = 200;
-    }
-
-    public override void OnPaint(App app) {
-        app = this.ResolveApp(app);
-        // 兜底：跳过测量的画布路径也能拿到基线主题。
-        if (app != null) { ChartTheme.EnsureDefault(app); }
-        if (widgetToolbox && opt != null && opt.toolboxShow) {
-            view.suppressCanvasToolbox = true;
-            this.SyncToolboxWidget(app);
-        } else {
-            view.suppressCanvasToolbox = false;
-            if (toolboxGroup != null) { toolboxGroup.Visible = false; }
-        }
-        view.Render(app, bx, by, bw, bh);
-    }
-
-    // 按图型字符串现拼示例 option——设计器画布预览与 `type`
-    // 切换共用同一份，保证"设计器所见 = 生成窗体初见"。别名
-    // （area/stacked/hbar/hstacked/donut）映射到对应系列风格；
-    // line/bar 之外的注册表类型配各自的示例系列；依赖结构化
-    // 数据的图型先以分类示例呈现（类型串留在 chartType 上，
-    // 真数据由 SetOption 接管）。
-    public static ChartOption SampleOf(string type) {
-        List<string> cats = new List<string>{
-            "Mon", "Tue", "Wed", "Thu", "Fri" };
-        List<int> a = new List<int>{ 24, 52, 38, 66, 45 };
-        List<int> b = new List<int>{ 30, 20, 50, 40, 60 };
-        string t = type;
-        if (t == null || t == "") { t = "bar"; }
-
-        if (t == "pie" || t == "donut") {
-            ChartOption o = ChartOption.With(ChartType.Pie, "", cats);
-            ChartSeries s = ChartSeries.Pie("Series A", a);
-            if (t == "donut") { s.innerPct = 55; }
-            o.showLegend = true;
-            o.Add(s);
-            return o;
-        }
-        if (t == "scatter") {
-            ChartOption o = ChartOption.Scatter("");
-            List<ChartPoint> pts = new List<ChartPoint>{
-                ChartPoint.Of(12, 24), ChartPoint.Of(28, 52),
-                ChartPoint.Of(40, 38), ChartPoint.Of(55, 66),
-                ChartPoint.Of(70, 45) };
-            o.Add(ChartSeries.OfPoints("Series A", pts));
-            return o;
-        }
-        if (t == "gauge") {
-            ChartOption o = ChartOption.With(ChartType.Gauge, "", cats);
-            o.Add(ChartSeries.Gauge("Series A", 66));
-            return o;
-        }
-        if (t == "funnel") {
-            ChartOption o = ChartOption.With(ChartType.Funnel, "", cats);
-            o.Add(ChartSeries.Funnel("Series A", a));
-            return o;
-        }
-        if (t == "radar") {
-            ChartOption o = ChartOption.With(ChartType.Radar, "", cats);
-            o.Add(ChartSeries.Polar("Series A", a));
-            o.Add(ChartSeries.Polar("Series B", b));
-            return o;
-        }
-        if (t == "wordcloud") {
-            ChartOption o = ChartOption.With(ChartType.WordCloud, "", cats);
-            List<ChartData> words = new List<ChartData>{
-                ChartData.Named(72, "Zan"), ChartData.Named(58, "Gui"),
-                ChartData.Named(46, "Chart"), ChartData.Named(35, "LLVM"),
-                ChartData.Named(27, "ARC"), ChartData.Named(19, "Wasm") };
-            o.Add(ChartSeries.WordCloud("Words", words));
-            return o;
-        }
-        if (t == "area") {
-            ChartOption o = ChartOption.With(ChartType.Line, "", cats);
-            o.Add(ChartSeries.Area("Series A", a)).Add(ChartSeries.Area("Series B", b));
-            return o;
-        }
-        if (t == "stacked") {
-            ChartOption o = ChartOption.With(ChartType.Bar, "", cats);
-            o.Add(ChartSeries.StackedBar("Series A", a)).Add(ChartSeries.StackedBar("Series B", b));
-            return o;
-        }
-        if (t == "hbar") {
-            ChartOption o = ChartOption.With(ChartType.Bar, "", cats);
-            o.Add(ChartSeries.HBar("Series A", a)).Add(ChartSeries.HBar("Series B", b));
-            return o;
-        }
-        if (t == "hstacked") {
-            ChartOption o = ChartOption.With(ChartType.Bar, "", cats);
-            o.Add(ChartSeries.HStacked("Series A", a)).Add(ChartSeries.HStacked("Series B", b));
-            return o;
-        }
-        if (t == "line" || t == "bar") {
-            ChartType ct = ChartType.Bar;
-            if (t == "line") { ct = ChartType.Line; }
-            ChartOption o = ChartOption.With(ct, "", cats);
-            o.Add("Series A", ct, a).Add("Series B", ct, b);
-            return o;
-        }
-        /* 其余注册表类型（k/map/graph/chord/force/eventRiver/
-         * treemap/tree/heatmap 及扩展渲染器标签）依赖结构化数据，
-         * 示例先以分类柱状呈现；类型字符串留在 chartType，宿主
-         * SetOption 接管后按真数据渲染。 */
-        ChartOption fb = ChartOption.With(ChartType.Bar, "", cats);
-        fb.Add("Series A", a).Add("Series B", b);
-        return fb;
-    }
-}
+                    if (t == "pie" || t == "donut") {
+                        ChartOption o = ChartOption.With(ChartType.Pie, "", cats);
+                        ChartSeries s = ChartSeries.Pie("Series A", a);
+                        if (t == "donut") { s.innerPct = 55; }
+                        o.showLegend = true;
+                        o.Add(s);
+                        return o;
+                    }
+                    if (t == "scatter") {
+                        ChartOption o = ChartOption.Scatter("");
+                        List<ChartPoint> pts = new List<ChartPoint>{
+                            ChartPoint.Of(12, 24), ChartPoint.Of(28, 52),
+                            ChartPoint.Of(40, 38), ChartPoint.Of(55, 66),
+                            ChartPoint.Of(70, 45) };
+                            o.Add(ChartSeries.OfPoints("Series A", pts));
+                            return o;
+                        }
+                        if (t == "gauge") {
+                            ChartOption o = ChartOption.With(ChartType.Gauge, "", cats);
+                            o.Add(ChartSeries.Gauge("Series A", 66));
+                            return o;
+                        }
+                        if (t == "funnel") {
+                            ChartOption o = ChartOption.With(ChartType.Funnel, "", cats);
+                            o.Add(ChartSeries.Funnel("Series A", a));
+                            return o;
+                        }
+                        if (t == "radar") {
+                            ChartOption o = ChartOption.With(ChartType.Radar, "", cats);
+                            o.Add(ChartSeries.Polar("Series A", a));
+                            o.Add(ChartSeries.Polar("Series B", b));
+                            return o;
+                        }
+                        if (t == "wordcloud") {
+                            ChartOption o = ChartOption.With(ChartType.WordCloud, "", cats);
+                            List<ChartData> words = new List<ChartData>{
+                                ChartData.Named(72, "Zan"), ChartData.Named(58, "Gui"),
+                                ChartData.Named(46, "Chart"), ChartData.Named(35, "LLVM"),
+                                ChartData.Named(27, "ARC"), ChartData.Named(19, "Wasm") };
+                                o.Add(ChartSeries.WordCloud("Words", words));
+                                return o;
+                            }
+                            if (t == "area") {
+                                ChartOption o = ChartOption.With(ChartType.Line, "", cats);
+                                o.Add(ChartSeries.Area("Series A", a)).Add(ChartSeries.Area("Series B", b));
+                                return o;
+                            }
+                            if (t == "stacked") {
+                                ChartOption o = ChartOption.With(ChartType.Bar, "", cats);
+                                o.Add(ChartSeries.StackedBar("Series A", a)).Add(ChartSeries.StackedBar("Series B", b));
+                                return o;
+                            }
+                            if (t == "hbar") {
+                                ChartOption o = ChartOption.With(ChartType.Bar, "", cats);
+                                o.Add(ChartSeries.HBar("Series A", a)).Add(ChartSeries.HBar("Series B", b));
+                                return o;
+                            }
+                            if (t == "hstacked") {
+                                ChartOption o = ChartOption.With(ChartType.Bar, "", cats);
+                                o.Add(ChartSeries.HStacked("Series A", a)).Add(ChartSeries.HStacked("Series B", b));
+                                return o;
+                            }
+                            if (t == "line" || t == "bar") {
+                                ChartType ct = ChartType.Bar;
+                                if (t == "line") { ct = ChartType.Line; }
+                                ChartOption o = ChartOption.With(ct, "", cats);
+                                o.Add("Series A", ct, a).Add("Series B", ct, b);
+                                return o;
+                            }
+                            /* 其余注册表类型（k/map/graph/chord/force/eventRiver/
+                            * treemap/tree/heatmap 及扩展渲染器标签）依赖结构化数据，
+                            * 示例先以分类柱状呈现；类型字符串留在 chartType，宿主
+                            * SetOption 接管后按真数据渲染。 */
+                            ChartOption fb = ChartOption.With(ChartType.Bar, "", cats);
+                            fb.Add("Series A", a).Add("Series B", b);
+                            return fb;
+                        }
+                    }

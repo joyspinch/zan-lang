@@ -11,7 +11,7 @@ namespace Gui.Component.Chart;
 // 十字线 + 数值工具提示。多级控制对应 ECharts：option.*
 // （全局）< series.*（逐系列）< data[i].*（逐项），因此混合图表
 // 只是共享同一坐标系的不同类型系列。
-public partial class ChartView {
+public partial class ChartView : Control {
     ChartOption option;
     ChartOption sourceOption;
     ChartOption initialOption;
@@ -42,11 +42,7 @@ public partial class ChartView {
     bool hasRendered;
     bool disposed;
     ChartEventHub eventHub;
-    int eventHitId;
     ChartHit currentHit;
-    int lastZoomLo;
-    int lastZoomHi;
-    int lastEventStateWid;
     static ChartView activeEventView;
 
     // —— 跨帧悬停槽（按 wid）——
@@ -101,6 +97,8 @@ public partial class ChartView {
 
     // 初始化保留式生命周期字段（事件、动画/版本跟踪、事件 hub）。
     void InitLifecycle() {
+        this.InitControl("chartView", 0);
+        this.InitRoutedInput();
         Resized = new UiEvent();
         Updated = new UiEvent();
         Disposed = new UiEvent();
@@ -112,11 +110,7 @@ public partial class ChartView {
         hasRendered = false;
         disposed = false;
         eventHub = new ChartEventHub();
-        eventHitId = 0 - 1;
         currentHit = null;
-        lastZoomLo = 0 - 1;
-        lastZoomHi = 0 - 1;
-        lastEventStateWid = 0 - 1;
         directStatus = "ready";
         directStatusMessage = "";
     }
@@ -127,14 +121,15 @@ public partial class ChartView {
         if (o.iwid == 0) { return; }
         for (int si = 0; si < o.series.Count; si = si + 1) {
             ChartSeries s = o.series[si];
+            if (s.type != ChartType.Pie && s.type != ChartType.Funnel) { continue; }
             if (s.data.Count > 1) {
                 for (int di = 0; di < s.data.Count; di = di + 1) {
                     s.data[di].hidden = app.StateGet(
-                        Chart.LegendSliceKey(o.iwid, si, di), 0) == 1;
+                    Chart.LegendSliceKey(o.iwid, si, di), 0) == 1;
                     int sel0 = 0;
                     if (s.data[di].selected) { sel0 = 1; }
                     s.data[di].selected = app.StateGet(
-                        Chart.PieSelKey(o.iwid, si, di), sel0) == 1;
+                    Chart.PieSelKey(o.iwid, si, di), sel0) == 1;
                 }
             } else {
                 s.hidden = app.StateGet(Chart.LegendKey(o.iwid, si), 0) == 1;
@@ -142,22 +137,7 @@ public partial class ChartView {
         }
     }
 
-    // 层级图表（treemap/sunburst）最近一次的悬停命中。
-    // 由命中追踪辅助函数设置，调用方立即读取以绘制工具提示，
-    // 因此不会跨帧存留。
-    static bool tailHooked;  // App 呈现尾段已挂（首帧渲染时自挂）
-    static string ttName;
-    static int ttVal;
-    static int ttX;  // treemap：命中单元格矩形
-    static int ttY;
-    static int ttW;
-    static int ttH;
-    static int ttRadius;
-    static ChartNode ttNode;
-    static int ttA0;  // sunburst：命中扇区扫掠 + 环深度
-    static int ttA1;
-    static int ttDepth;
-    static ChartNode ttSunNode;  // sunburst：命中的叶子节点（typed hit 用）
+    static bool tailHooked;  // App 呈现尾段在准备阶段注册一次。
 
     // 绑定一个选项（内部深复制为 initialOption 供 Restore 用），
     // 动画/交互键取新 WidgetId。
@@ -253,7 +233,7 @@ public partial class ChartView {
         if (this.disposed || eventArgs == null) { return; }
         this.eventHub.Raise(eventArgs);
         if (this.controller != null
-            && eventArgs.type != ChartEventType.DataChanged) {
+        && eventArgs.type != ChartEventType.DataChanged) {
             this.controller.RaiseEvent(eventArgs);
         }
     }
@@ -274,7 +254,7 @@ public partial class ChartView {
 
     // 构造仅带类型/wid/像素坐标的图表级事件载荷。
     public static ChartInteractionEvent EventAt(ChartEventType type, int wid,
-                                         int px, int py) {
+    int px, int py) {
         ChartInteractionEvent e = ChartInteractionEvent.Of(type, wid);
         e.x = px;
         e.y = py;
@@ -284,11 +264,11 @@ public partial class ChartView {
     // 由命中结果构造数据点事件载荷；hit 为 null 时退化为
     // Of(type, wid)（图表级事件）。
     public static ChartInteractionEvent EventFromHit(ChartEventType type, int wid,
-                                               ChartHit hit) {
+    ChartHit hit) {
         if (hit == null) { return ChartInteractionEvent.Of(type, wid); }
         ChartInteractionEvent e = ChartInteractionEvent.DataPoint(type, wid,
-            hit.seriesIndex, hit.seriesName, hit.dataIndex, hit.dataName,
-            hit.elementType);
+        hit.seriesIndex, hit.seriesName, hit.dataIndex, hit.dataName,
+        hit.elementType);
         e.value = hit.value;
         e.numberValueSet = hit.numberValueSet;
         e.numberValue = hit.numberValue;
@@ -302,47 +282,26 @@ public partial class ChartView {
         return e;
     }
 
-    // 当前帧由 renderer 提供的命中候选。renderer 按绘制顺序调用，
-    // 后来的具体图元覆盖早先的候选，但不会产生额外事件。
-    public static void OfferActiveHit(ChartHit hit) {
-        if (ChartView.activeEventView != null && hit != null) {
-            ChartView.activeEventView.currentHit = hit;
-        }
-    }
-
-    // 指针被上层弹层/抽屉/遮罩接管时，图表悬停命中整体静默：
-    // 命中点的 tooltip 卡在 PresentFrame 末尾统一绘制，会叠到
-    // 弹层上面（悬停穿透）。入口在此统一拦截，各 Offer*/PointsHover
-    // 无需重复判断。
+    // Retained pointer ownership fences all body feedback, including tooltips.
     public static bool HoverBlocked(App app) {
-        return app == null || app.PointerCaptured();
-    }
-
-    // 混合 Cartesian 图在渲染结束后才复算部分 overlay 命中。
-    // 系列索引与主体绘制顺序一致：后面的系列视觉上覆盖前面的
-    // 系列；较早系列的延迟命中不能反过来遮掉已经命中的后层。
-    public static void OfferTopmostCategoryHit(ChartHit hit) {
-        if (ChartView.activeEventView == null || hit == null) { return; }
-        ChartHit old = ChartView.activeEventView.currentHit;
-        if (old == null || hit.seriesIndex >= old.seriesIndex) {
-            ChartView.activeEventView.currentHit = hit;
-        }
+        return app == null || ChartView.activeEventView == null
+        || !ChartView.activeEventView.pointerInside || !ChartView.activeEventView.pointerBody;
     }
 
     // 构造数据点命中：数据项名取 s.data[dataIndex].name（无则用
     // fallbackName），并携带 number 值与系列 axisIndex。
     // s 为 null 时返回 null。
     public static ChartHit MakeDataHit(ChartSeries s, int seriesIndex, int dataIndex,
-                                string fallbackName, ChartElementType elementType,
-                                int px, int py, int value) {
+    string fallbackName, ChartElementType elementType,
+    int px, int py, int value) {
         if (s == null) { return null; }
         string dataName = fallbackName;
         if (dataIndex >= 0 && dataIndex < s.data.Count
-            && s.data[dataIndex].name.Length > 0) {
+        && s.data[dataIndex].name.Length > 0) {
             dataName = s.data[dataIndex].name;
         }
         ChartHit h = ChartHit.Of(elementType, seriesIndex, s.name,
-            dataIndex, dataName, value, px, py);
+        dataIndex, dataName, value, px, py);
         h.axisIndex = s.axisIndex;
         if (dataIndex >= 0 && dataIndex < s.data.Count) {
             ChartData d = s.data[dataIndex];
@@ -352,90 +311,21 @@ public partial class ChartView {
         return h;
     }
 
-    // 折线数据点的 proximity 命中：在绘图区内找最近可见 Line
-    // 系列点（命中半径 Scale(10)），命中后经 OfferActiveHit /
-    // OfferTopmostCategoryHit 提交。baseIdx 为 dataZoom 窗口基址。
-    public static void OfferCategoryPointHits(App app, ChartFrame f,
-                                       List<string> labels,
-                                       List<ChartSeries> series, int baseIdx,
-                                       int g, ChartElementType elementType,
-                                       bool forceTopmost) {
-        if (f == null || labels == null || labels.Count < 1 || series == null) { return; }
-        if (ChartView.HoverBlocked(app)) { return; }
-        int mx = app.mouseX;
-        int my = app.mouseY;
-        if (mx < f.plotX || mx >= f.plotX + f.plotW
-            || my < f.plotY || my >= f.plotY + f.plotH) { return; }
-        int n = labels.Count;
-        int bestD = 0;
-        ChartHit best = null;
-        for (int si = 0; si < series.Count; si = si + 1) {
-            ChartSeries s = series[si];
-            if (s == null || s.hidden || s.type != ChartType.Line) { continue; }
-            for (int vi = 0; vi < n; vi = vi + 1) {
-                int oi = baseIdx + vi;
-                if (oi < 0 || oi >= s.Count()) { continue; }
-                int px = f.CatX(vi, n);
-                int py = f.YOf((int)((long)s.Value(oi) * g / 1000L), s.axisIndex);
-                int pdx = mx - px;
-                int pdy = my - py;
-                int pd2 = pdx * pdx + pdy * pdy;
-                if (best == null || pd2 < bestD) {
-                    bestD = pd2;
-                    best = ChartView.MakeDataHit(s, si, oi, labels[vi],
-                        elementType, px, py, s.Value(oi));
-                }
-                // 线体命中（官方 linePrecision 沿整条折线，不只数据
-                // 点半径）：指针到相邻两点连线的距离也计入，归属较
-                // 近的端点，值/名语义与点命中一致。平滑曲线近似为
-                // 数据点弦，粗抓半径下与视觉线重合。
-                if (vi + 1 < n && oi + 1 < s.Count()) {
-                    int oj = oi + 1;
-                    int qx = f.CatX(vi + 1, n);
-                    int qy = f.YOf((int)((long)s.Value(oj) * g / 1000L),
-                        s.axisIndex);
-                    int sd2 = ChartView.SegDist2(mx, my, px, py, qx, qy);
-                    if (sd2 >= 0 && (best == null || sd2 < bestD)) {
-                        int qdx = mx - qx;
-                        int qdy = my - qy;
-                        bool nearerQ = qdx * qdx + qdy * qdy
-                            <= pdx * pdx + pdy * pdy;
-                        int ui = nearerQ ? vi + 1 : vi;
-                        int uoi = nearerQ ? oj : oi;
-                        int ux = nearerQ ? qx : px;
-                        int uy = nearerQ ? qy : py;
-                        bestD = sd2;
-                        best = ChartView.MakeDataHit(s, si, uoi, labels[ui],
-                            elementType, ux, uy, s.Value(uoi));
-                    }
-                }
-            }
+    // Item tooltip consumes the same retained hit that routed input published.
+    internal static void DrawCategoryItemTooltip(App app, ChartFrame frame, ChartOption model) {
+        if (frame == null || model == null || !model.showTooltip || model.tooltipTrigger != "item") { return; }
+        ChartHit hit = ChartView.PaintHit(app, ChartElementType.LinePoint);
+        if (hit == null || hit.seriesIndex < 0 || hit.seriesIndex >= model.series.Count) { return; }
+        ChartSeries series = model.series[hit.seriesIndex];
+        string value = Convert.ToString(hit.value);
+        if (series.SeriesFrac(hit.dataIndex)) {
+            double number = series.Number(hit.dataIndex);
+            value = Chart.FracText((int)(number * 1000 + (number >= 0 ? 0.5 : -0.5)));
         }
-        int hitR = app.Scale(10);
-        if (best != null && bestD <= hitR * hitR) {
-            best.pixelX = mx;
-            best.pixelY = my;
-            if (forceTopmost) { ChartView.OfferActiveHit(best); }
-            else { ChartView.OfferTopmostCategoryHit(best); }
-            // ECharts trigger:'item' 的数据点悬停卡：列卡由
-            // CartesianTooltip 负责，声明 item 时它整体不画，官方
-            // 凹凸图"悬停某条线出该点值卡"的观感由这里补齐。
-            // --nomouse 把 showTooltip 关掉，截图/回归不进卡。
-            if (Chart.legendOpt != null && Chart.legendOpt.showTooltip
-                && Chart.legendOpt.tooltipTrigger == "item") {
-                ChartSeries bs = series[best.seriesIndex];
-                string vt = Convert.ToString(best.value);
-                if (bs.SeriesFrac(best.dataIndex)) {
-                    double dn = bs.Number(best.dataIndex);
-                    vt = Chart.FracText((int)(dn * 1000
-                        + (dn >= 0 ? 0.5 : 0 - 0.5)));
-                }
-                List<TooltipRow> rows = new List<TooltipRow>();
-                rows.Add(TooltipRow.Of(0, best.dataName));
-                rows.Add(TooltipRow.Of(bs.color, bs.name + "  " + vt));
-                ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, rows);
-            }
-        }
+        List<TooltipRow> rows = new List<TooltipRow>();
+        rows.Add(TooltipRow.Of(0, hit.dataName));
+        rows.Add(TooltipRow.Of(series.color, series.name + "  " + value));
+        ChartView.TooltipCard(app, hit.pixelX, hit.pixelY, frame.plotX + frame.plotW, rows);
     }
 
     // 该图（自身 hub 或其 controller）是否订阅了 type 事件。
@@ -464,25 +354,14 @@ public partial class ChartView {
         return (int)(dx * dx + dy * dy);
     }
 
-    // id 是否属于当前 activeEventView 的可点击命中（id < 0 恒假）；
-    // 渲染器用它仲裁扇区/区域点击归属。
-    public static bool OwnsActiveClick(App app, int id) {
-        if (ChartView.activeEventView == null || id < 0) { return false; }
-        return Ui.OwnsClick(app, id);
-    }
-
-    // 帧尾指针事件派发：进入/离开、Hover/MouseOut（命中变化时）、
-    // Click/DoubleClick（经 eventHitId），随后清空 activeEventView。
-    // statusNow != "ready" 时不产生指针事件。
+    // Routed pointer transitions publish Hover/MouseOut before painting.
     void DispatchPointerEvents(App app, int x, int y, int w, int h,
-                               string statusNow) {
-        bool over = statusNow == "ready"
-            && app.mouseX >= x && app.mouseX < x + w
-            && app.mouseY >= y && app.mouseY < y + h;
+    string statusNow) {
+        bool over = statusNow == "ready" && this.pointerInside && this.pointerBody;
         ChartHit hit = over ? this.currentHit : null;
         if (hit != null) {
-            hit.pixelX = app.mouseX;
-            hit.pixelY = app.mouseY;
+            hit.pixelX = this.pointerX;
+            hit.pixelY = this.pointerY;
         }
         bool wasOver = ChartView.HoverSlotOver(this.wid);
         ChartHit prevHit = ChartView.HoverSlotHit(this.wid);
@@ -490,56 +369,29 @@ public partial class ChartView {
         bool left = !over && wasOver;
         bool hitChanged = !ChartHit.Same(prevHit, hit);
         if (hitChanged || entered || left) {
-            // 悬停可见反馈晚命中一帧：emphasis.focus 渐隐在下一帧
-            // 渲染入口才读悬停槽（fadeFocus 帧内静态），item 悬停卡
-            // 也随命中重画。hitTester 的 hover 不含系列命中，鼠标
-            // 停住后不再有 mousemove 调度重绘——光标停在数据点上会
-            // 永远等不到下一帧。命中变化时这里补一帧。
             app.NoteRedrawWhy("chart-hover");
             app.needsRedraw = true;
         }
         if ((hitChanged || left) && prevHit != null) {
             ChartInteractionEvent me = ChartView.EventFromHit(
-                ChartEventType.MouseOut, this.wid, prevHit);
+            ChartEventType.MouseOut, this.wid, prevHit);
             this.RaiseInteraction(me);
         }
         if ((hitChanged || entered) && hit != null) {
             ChartInteractionEvent he = ChartView.EventFromHit(
-                ChartEventType.Hover, this.wid, hit);
+            ChartEventType.Hover, this.wid, hit);
             this.RaiseInteraction(he);
         } else if (entered && hit == null) {
             ChartInteractionEvent he2 = ChartView.EventAt(
-                ChartEventType.Hover, this.wid, app.mouseX, app.mouseY);
+            ChartEventType.Hover, this.wid, this.pointerX, this.pointerY);
             this.RaiseInteraction(he2);
         } else if (left && hit == null && prevHit == null) {
             ChartInteractionEvent me2 = ChartView.EventAt(
-                ChartEventType.MouseOut, this.wid, app.mouseX, app.mouseY);
+            ChartEventType.MouseOut, this.wid, this.pointerX, this.pointerY);
             this.RaiseInteraction(me2);
         }
-        if (statusNow == "ready" && this.eventHitId >= 0
-            && Ui.Clicked(app, this.eventHitId)) {
-            if (hit != null) {
-                ChartInteractionEvent ce = ChartView.EventFromHit(
-                    ChartEventType.Click, this.wid, hit);
-                this.RaiseInteraction(ce);
-            } else {
-                ChartInteractionEvent ce2 = ChartView.EventAt(
-                    ChartEventType.Click, this.wid, app.mouseX, app.mouseY);
-                this.RaiseInteraction(ce2);
-            }
-        }
-        if (statusNow == "ready" && this.eventHitId >= 0
-            && !app.ClickClaimed()
-            && Ui.DoubleClicked(app, this.eventHitId)) {
-            ChartInteractionEvent de = hit != null
-                ? ChartView.EventFromHit(ChartEventType.DoubleClick, this.wid, hit)
-                : ChartView.EventAt(ChartEventType.DoubleClick, this.wid,
-                                    app.mouseX, app.mouseY);
-            this.RaiseInteraction(de);
-        }
         ChartView.HoverSlotSet(this.wid,
-            hit == null ? null : ChartHit.Copy(hit), over);
-        ChartView.activeEventView = null;
+        hit == null ? null : ChartHit.Copy(hit), over);
     }
 
     // 按事件类型注册交互处理器（Click/Hover/LegendSelected/…），
@@ -621,7 +473,7 @@ public partial class ChartView {
             this.directStatus = "ready"; this.directStatusMessage = "";
             this.directVersion = this.directVersion + 1;
             ChartInteractionEvent re = ChartInteractionEvent.Of(
-                ChartEventType.Restore, this.wid);
+            ChartEventType.Restore, this.wid);
             this.RaiseInteraction(re);
         }
         return this;
@@ -689,6 +541,7 @@ public partial class ChartView {
     // controller 的生命周期由创建它的调用方拥有，view 不会替其 Dispose。
     public void Dispose() {
         if (this.disposed) { return; }
+        if (preparedPanel != null) { preparedPanel.Release(this.App); preparedPanel = null; }
         this.disposed = true;
         this.directStatus = "disposed"; this.directStatusMessage = "";
         if (this.Disposed.Count() > 0) { this.Disposed.Raise(); }

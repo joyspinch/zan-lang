@@ -1,0 +1,249 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Component.Chart;
+
+internal class ChartParallelPath {
+    internal List<int> xs = new List<int>();
+    internal List<int> ys = new List<int>();
+    internal int seriesIndex; internal int dataIndex;
+    internal int color; internal int width;
+    internal bool silent;
+    internal string name;
+}
+
+internal class ChartParallelGeometry {
+    internal int dimensions; internal int top; internal int font;
+    internal int x; internal int y; internal int w; internal int h;
+    internal List<int> low; internal List<int> high;
+    internal List<int> categoryColumns;
+    internal List<ChartParallelPath> rows = new List<ChartParallelPath>();
+    internal int fingerprint;
+    internal int slot = -1;
+    internal int start; internal int end; internal int committed;
+    internal int hitRadius;
+    internal bool stream;
+    internal weak App host;
+    static List<ChartParallelGeometry> pending;
+
+    internal static ChartParallelGeometry Create(App app, ChartOption o, int x, int y, int w, int h,
+    int growth, ChartParallelGeometry previous) {
+        Theme t = app.theme; List<ChartSeries> series = o.series;
+        // 维数：优先 parallelAxis 声明；缺省按数据最长行推断。
+        int dims = o.parAxes.Count;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            ChartSeries s = series[si];
+            if (s.hidden || s.custom != "parallel") { continue; }
+            for (int ri = 0; ri < s.parRows.Count; ri = ri + 1) {
+                if (s.parRows[ri].Count > dims) { dims = s.parRows[ri].Count; }
+            }
+        }
+        if (dims < 2) { return null; }
+
+        // parallelAxis[].dim：6.1 语义，轴声明绑定数据列（official
+        // nutrients 的轴序是 [16,2,4,3,...]，不是数组槽位）。dim 未
+        // 声明（-1）时退回数组槽位本身（axis i ↔ 列 i）。
+        List<int> col = new List<int>();
+        for (int d = 0; d < dims; d = d + 1) {
+            int ci = d;
+            if (d < o.parAxes.Count && o.parAxes[d].dim >= 0
+            && o.parAxes[d].dim < 100000) {
+                ci = o.parAxes[d].dim;
+            }
+            col.Add(ci);
+        }
+        // 列值域包络（dim→[lo,hi]），与轴值域共用（轴值域按列查）。
+        int nCols = 0;
+        for (int d = 0; d < dims; d = d + 1) {
+            if (col[d] + 1 > nCols) { nCols = col[d] + 1; }
+        }
+        List<ChartSpan> colSpans = new List<ChartSpan>();
+        List<int> colLo = new List<int>();
+        List<int> colHi = new List<int>();
+        for (int ci2 = 0; ci2 < nCols; ci2 = ci2 + 1) {
+            ChartSpan cspan = new ChartSpan();
+            cspan.lo = 0;
+            cspan.hi = 0;
+            colSpans.Add(cspan);
+            colLo.Add(0); colHi.Add(0);
+        }
+
+        int plotTop = Chart.PanelContentTop(app, x, y, w, o.title, series, o.showLegend);
+
+        // 每轴值域：显式 min/max 优先，否则按其数据列包络走
+        // NiceRange；类目维域 = [0, 类目数-1]（值存下标）。
+        List<int> lo = new List<int>();
+        List<int> hi = new List<int>();
+        for (int d = 0; d < dims; d = d + 1) {
+            int dLo = 0;
+            int dHi = 0;
+            bool hasRng = false;
+            if (d < o.parAxes.Count) {
+                if (o.parAxes[d].minSet) { dLo = o.parAxes[d].min; hasRng = true; }
+                if (o.parAxes[d].maxSet) { dHi = o.parAxes[d].max; hasRng = true; }
+                if (o.parAxes[d].cats.Count > 0) {
+                    // 类目维：域 = [0, 类目数-1]（值存下标）。
+                    dLo = 0;
+                    dHi = o.parAxes[d].cats.Count - 1;
+                    hasRng = true;
+                }
+            }
+            if (!hasRng) {
+                int dc = col[d];
+                if (dc >= colLo.Count) {
+                    dLo = int.MaxValue;
+                    dHi = int.MinValue;
+                    for (int si = 0; si < series.Count; si = si + 1) {
+                        ChartSeries s = series[si];
+                        if (s.hidden || s.custom != "parallel") { continue; }
+                        for (int ri = 0; ri < s.parRows.Count; ri = ri + 1) {
+                            List<int> row = s.parRows[ri];
+                            if (dc >= row.Count) { continue; }
+                            if (row[dc] < dLo) { dLo = row[dc]; }
+                            if (row[dc] > dHi) { dHi = row[dc]; }
+                        }
+                    }
+                    if (dLo == int.MaxValue) { dLo = 0; dHi = 1; }
+                    ChartSpan sp = Chart.NiceRange(dLo, dHi);
+                    dLo = sp.lo;
+                    dHi = sp.hi;
+                } else {
+                    dLo = colLo[dc];
+                    dHi = colHi[dc];
+                }
+            }
+            if (dHi <= dLo) { dHi = dLo + 1; }
+            lo.Add(dLo);
+            hi.Add(dHi);
+        }
+
+        // 布局：标题/图例下方一块绘图区，轴间留端点标签。
+        int pad = t.paddingMedium;
+        int axisFs = ChartFonts.AxisLabel(app);
+        int nameH = Canvas.FontHeight(axisFs);
+        int plotX = x + pad + app.Scale(8);
+        int plotY = plotTop + nameH + app.Scale(6);
+        int plotW = (x + w - pad - app.Scale(8)) - plotX;
+        int plotH = (y + h - pad - nameH - app.Scale(4)) - plotY;
+        if (plotW < 10 || plotH < 10) { return null; }
+
+        ChartParallelGeometry result = new ChartParallelGeometry();
+        result.host = app; result.dimensions = dims; result.top = plotTop; result.font = axisFs;
+        result.x = plotX; result.y = plotY; result.w = plotW; result.h = plotH;
+        result.low = lo; result.high = hi; result.hitRadius = app.Scale(6);
+        result.categoryColumns = ChartView.ParCatLookup(o);
+        bool horizontal = o.parLayout == "vertical";
+        int count = 0;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            if (!series[si].hidden && series[si].custom == "parallel") { count = count + series[si].parRows.Count; }
+        }
+        result.stream = count > 1000;
+        int fp = ChartView.ParHash(17, dims); fp = ChartView.ParHash(fp, plotX); fp = ChartView.ParHash(fp, plotY);
+        fp = ChartView.ParHash(fp, plotW); fp = ChartView.ParHash(fp, plotH); fp = ChartView.ParHash(fp, horizontal ? 1 : 0);
+        fp = ChartView.ParHash(fp, app.bgThemeGen); fp = ChartView.ParHash(fp, app.ThemeMenuIndex());
+        for (int d = 0; d < dims; d = d + 1) { fp = ChartView.ParHash(fp, lo[d]); fp = ChartView.ParHash(fp, hi[d]); }
+        int colorSlot = 0; int rowIndex = 0;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            ChartSeries source = series[si];
+            if (source.hidden || source.custom != "parallel") { continue; }
+            ChartLineStyle style = source.itemStyle != null && source.itemStyle.normal != null ? source.itemStyle.normal.lineStyle : null;
+            int width = style != null && style.width > 0 ? app.Scale(style.width) : app.Scale(2); if (width < 1) { width = 1; }
+            int alpha = style != null && style.alpha > 0 ? style.alpha : 255;
+            if (!result.stream && growth < 1000) { alpha = alpha * (60 + 195 * growth / 1000) / 255; }
+            int baseColor = source.color != 0 ? source.color : ChartColor.Palette(t, colorSlot);
+            for (int ri = 0; ri < source.parRows.Count; ri = ri + 1) {
+                List<int> sourceRow = source.parRows[ri];
+                ChartParallelPath row = new ChartParallelPath(); row.seriesIndex = si; row.dataIndex = ri;
+                row.name = source.name; row.silent = source.silent; row.width = width;
+                row.color = ChartColor.WithAlpha(ChartView.ParRowColor(o, result.categoryColumns, baseColor, rowIndex, sourceRow), alpha);
+                rowIndex = rowIndex + 1;
+                if (sourceRow.Count >= 2) {
+                    for (int d = 0; d < dims; d = d + 1) {
+                        int value = col[d] < sourceRow.Count ? sourceRow[col[d]] : lo[d]; int span = hi[d] - lo[d];
+                        if (d < o.parAxes.Count && o.parAxes[d].inverse && !o.parAxes[d].minSet && !o.parAxes[d].maxSet) { value = hi[d] - (value - lo[d]); }
+                        int coordinate = horizontal ? plotX + (value - lo[d]) * plotW / span : plotY + plotH - (value - lo[d]) * plotH / span;
+                        int lower = horizontal ? plotX : plotY; int upper = lower + (horizontal ? plotW : plotH);
+                        if (coordinate < lower) { coordinate = lower; } if (coordinate > upper) { coordinate = upper; }
+                        row.xs.Add(horizontal ? coordinate : plotX + d * plotW / (dims - 1));
+                        row.ys.Add(horizontal ? plotY + d * plotH / (dims - 1) : coordinate);
+                    }
+                }
+                fp = ChartView.ParHash(fp, row.color); fp = ChartView.ParHash(fp, width); fp = ChartView.ParHash(fp, si);
+                for (int d = 0; d < row.xs.Count; d = d + 1) { fp = ChartView.ParHash(fp, row.xs[d]); fp = ChartView.ParHash(fp, row.ys[d]); }
+                result.rows.Add(row);
+            }
+            colorSlot = colorSlot + 1;
+        }
+        result.fingerprint = fp;
+        if (previous != null && previous.fingerprint == fp && previous.rows.Count == result.rows.Count) {
+            result.slot = previous.slot; result.committed = previous.committed;
+            result.start = previous.committed; result.end = previous.end;
+            previous.slot = -1;
+        }
+        if (result.stream && result.slot < 0) { result.slot = ChartView.AllocCacheSlot(); }
+        if (!result.stream) { result.end = result.rows.Count; }
+        return result;
+    }
+
+    internal void Release(App app) {
+        if (app != null && slot >= 0) { app.canvas.ReleaseSlot(slot); }
+        slot = -1;
+        if (ChartParallelGeometry.pending != null) {
+            for (int i = ChartParallelGeometry.pending.Count - 1; i >= 0; i = i - 1) {
+                if (ChartParallelGeometry.pending[i] == this) { ChartParallelGeometry.pending.RemoveAt(i); }
+            }
+            if (ChartParallelGeometry.pending.Count == 0) { ChartParallelGeometry.pending = null; }
+        }
+    }
+
+    internal void PrepareComplete(App app) {
+        this.Release(app);
+        stream = false; start = 0; end = rows.Count;
+    }
+
+    internal void BeforePaint(App app) {
+        if (!stream) { return; }
+        start = committed;
+        int next = committed + 24;
+        end = next < rows.Count ? next : rows.Count;
+        if (ChartParallelGeometry.pending == null) { ChartParallelGeometry.pending = new List<ChartParallelGeometry>(); }
+        if (!ChartParallelGeometry.pending.Contains(this)) { ChartParallelGeometry.pending.Add(this); }
+        if (end < rows.Count) { app.RequestAnimationFrame(16); }
+    }
+
+    internal static void Flush(App app) {
+        if (ChartParallelGeometry.pending == null) { return; }
+        for (int i = ChartParallelGeometry.pending.Count - 1; i >= 0; i = i - 1) {
+            ChartParallelGeometry item = ChartParallelGeometry.pending[i];
+            App owner = item.host;
+            if (owner != null && owner.isRunning && owner != app) { continue; }
+            ChartParallelGeometry.pending.RemoveAt(i);
+            if (owner != null && owner.isRunning && item.slot >= 0 && item.end > item.committed) {
+                app.canvas.SnapshotRect(item.x, item.y, item.w, item.h, item.slot);
+                item.committed = item.end;
+            }
+        }
+        if (ChartParallelGeometry.pending.Count == 0) { ChartParallelGeometry.pending = null; }
+    }
+
+    internal void Draw(App app) {
+        int first = committed;
+        if (!stream || first == 0 || !app.canvas.RestoreRect(x, y, w, h, slot)) { first = 0; }
+        for (int i = first; i < end; i = i + 1) {
+            ChartParallelPath row = rows[i]; app.canvas.DrawPolyline(row.xs, row.ys, row.color, row.width);
+        }
+    }
+
+    internal ChartHit Hit(int px, int py) {
+        long radius = (long)hitRadius * hitRadius;
+        for (int i = 0; i < end; i = i + 1) {
+            ChartParallelPath row = rows[i]; if (row.silent) { continue; }
+            for (int d = 0; d < row.xs.Count; d = d + 1) {
+                long dx = (long)px - row.xs[d]; long dy = (long)py - row.ys[d];
+                if (dx * dx + dy * dy <= radius) { return ChartHit.Of(ChartElementType.LinePoint, row.seriesIndex, row.name, row.dataIndex, "", 0, px, py); }
+            }
+        }
+        return null;
+    }
+}

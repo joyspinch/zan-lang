@@ -1,0 +1,373 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+internal class ChartPreparedText {
+    internal int x; internal int y; internal int color; internal int font;
+    internal string text;
+
+    internal static ChartPreparedText Of(int x, int y, string text, int color, int font) {
+        ChartPreparedText result = new ChartPreparedText();
+        result.x = x; result.y = y; result.text = text; result.color = color; result.font = font;
+        return result;
+    }
+}
+
+public partial class ChartView {
+    void PreparePanelChildren(App app, ChartPreparedPanel panel) {
+        ChartOption previous = Chart.legendOpt;
+        bool previousGrid = Chart.gridPanelSub;
+        bool previousZoom = Chart.zoomBarHidden;
+        try {
+            Chart.legendOpt = panel.option;
+            Chart.gridPanelSub = panel.grid; Chart.zoomBarHidden = panel.hideZoom;
+            if (panel.option.grids.Count > 1 && !panel.option.overlay) { this.PrepareMultiPanels(app, panel); }
+            else { this.PrepareOverlayPanels(app, panel); }
+        } finally {
+            panel.previous = null;
+            Chart.legendOpt = previous;
+            Chart.gridPanelSub = previousGrid; Chart.zoomBarHidden = previousZoom;
+        }
+    }
+
+    void PrepareMultiPanels(App app, ChartPreparedPanel panel) {
+        ChartOption o = panel.option;
+        int x = panel.x; int y = panel.y; int w = panel.w; int h = panel.h; int g = panel.growth;
+        int nG = o.grids.Count;
+        if (nG < 1) { return; }
+        int headerH = app.Scale(o.titles.Count > 0 ? 52 : 30);
+        // matrix 锚定形态（⑥-3b）：矩阵骨架整幅先画（自带快照缓存），
+        // 格几何现算一份供 grid/geo/title 锚定取矩形。
+        MatGeom mgeo = null;
+        if (o.matrix != null) {
+            mgeo = panel.matrixGeometry != null ? panel.matrixGeometry.layout : null;
+        }
+        for (int gi = 0; gi < nG; gi = gi + 1) {
+            ChartGridSpec gs = o.grids[gi];
+            // A16：与单格 BuildAxesR 同一解算（GridRawRect）——矩形只
+            // 由六参决定；面板头/图例带是外壳语义，仅当声明值伸进头
+            // 部时钳回（头部内容永远优先显示）。matrix 锚定格以格矩
+            // 形为基准再按自身六参内缩，不参与外壳钳制。
+            bool anchored = gs.matAnchor && mgeo != null;
+            ChartLayoutRect gr;
+            if (anchored) {
+                int cx0 = ChartView.MatXAt(mgeo, mgeo.yBands + gs.mx0);
+                int cx1 = ChartView.MatXAt(mgeo, mgeo.yBands + gs.mx1 + 1);
+                int cy0 = ChartView.MatYAt(mgeo, mgeo.xBands + gs.my0);
+                int cy1 = ChartView.MatYAt(mgeo, mgeo.xBands + gs.my1 + 1);
+                gr = ChartGeometry.GridRawRect(gs.lRaw, gs.rRaw, gs.tRaw, gs.bRaw,
+                gs.wRaw, gs.hRaw, (double)(cx1 - cx0),
+                (double)(cy1 - cy0), false);
+                gr.x = gr.x + (cx0 - x);
+                gr.y = gr.y + (cy0 - y);
+            } else {
+                gr = ChartGeometry.GridRawRect(gs.lRaw, gs.rRaw,
+                gs.tRaw, gs.bRaw, gs.wRaw, gs.hRaw, (double)w, (double)h, false);
+            }
+            int gx0 = x + (int)Math.Round(gr.x);
+            int gx1 = gx0 + (int)Math.Round(gr.width);
+            int gy0 = y + (int)Math.Round(gr.y);
+            int gy1 = gy0 + (int)Math.Round(gr.height);
+            if (!anchored) {
+                if (gy0 < y + headerH) { gy0 = y + headerH; }
+                if (gy1 > y + h - Chart.legendBottomReserve) {
+                    gy1 = y + h - Chart.legendBottomReserve;
+                }
+            }
+            // 尺寸门只防退化矩形（全画面板误声明等）；matrix 锚格的
+            // 迷你面板是合法形态（官方 mini-bar 每格仅 ~40px 高），
+            // 门槛对齐 geo 落格的 8px。
+            if (gy1 - gy0 < app.Scale(anchored ? 8 : 40)
+            || gx1 - gx0 < app.Scale(anchored ? 8 : 40)) { continue; }
+
+            // 系列按 xAxisIndex 分组（越界钳入最后一格，不声明轴的
+            // demo 靠它落位）；visualMap.seriesIndex 重映射到组内新
+            // 下标（visualMap 是全局面板语义）。matrix 锚定形态下
+            // geo 载体系列（isGeoBase）不进格分组——它们按 geo.coord
+            // 单独落格。
+            List<ChartSeries> grp = new List<ChartSeries>();
+            List<int> origIdx = new List<int>();
+            for (int si3 = 0; si3 < o.series.Count; si3 = si3 + 1) {
+                if (o.matrix != null && o.series[si3].isGeoBase) { continue; }
+                int giEff = o.series[si3].xIndex;
+                if (giEff > nG - 1) { giEff = nG - 1; }
+                if (giEff != gi) { continue; }
+                grp.Add(o.series[si3]);
+                origIdx.Add(si3);
+            }
+            if (grp.Count < 1) { continue; }
+            // 子 option 外壳复用 + 系列共享：ChartOption.Clone 会把
+            // 全部系列的数据（candlestick-large 2.2 万根蜡烛 ×2 格）
+            // 逐项深拷一遍，每帧 18ms 纯属克隆税。子面板对系列的
+            // 改动只有 xIndex/axisIndex 两个整数——它们是渲染器
+            // 只读（RenderOnce 下游不回写系列），因此把原系列直接
+            // 装进共享外壳；真正需要新列表的 xAxes/yAxes/grids/
+            // titles/visualMaps 都在此显式重建。子面板绝不回写
+            // 原系列（下一帧还要按原始 xIndex 分组）。
+            ChartOption sub = ChartOption.Create();
+            sub.overlay = o.overlay;
+            sub.backgroundColor = o.backgroundColor;
+            sub.iwid = o.iwid;
+            sub.connectGroup = o.connectGroup;
+            sub.smooth = o.smooth; sub.gradient = o.gradient;
+            sub.rounded = o.rounded; sub.animMs = o.animMs;
+            sub.animate = false;  // 静态快照帧语义与 RenderCached 一致
+            sub.showLegend = o.showLegend;
+            sub.showTooltip = o.showTooltip;
+            sub.toolboxShow = false;  // 工具箱只随全画面板画一次
+            sub.zoom = o.zoom;
+            sub.markLine = o.markLine; sub.markPoint = o.markPoint;
+            sub.markLabel = o.markLabel; sub.markLo = o.markLo; sub.markHi = o.markHi;
+            sub.dataRangeShow = o.dataRangeShow;
+            sub.dataRangeLo = o.dataRangeLo; sub.dataRangeHi = o.dataRangeHi;
+            sub.dataRangeCalculable = o.dataRangeCalculable;
+            sub.dataRangeSplit = o.dataRangeSplit;
+            sub.gridLeft = o.gridLeft; sub.gridRight = o.gridRight;
+            sub.gridTop = o.gridTop; sub.gridBottom = o.gridBottom;
+            sub.gridLeftPct = o.gridLeftPct; sub.gridRightPct = o.gridRightPct;
+            sub.gridTopPct = o.gridTopPct; sub.gridBottomPct = o.gridBottomPct;
+            sub.containLabel = o.containLabel;
+            sub.legendOrient = o.legendOrient;
+            sub.legendSelectedMode = o.legendSelectedMode;
+            sub.legendX = o.legendX; sub.legendFormatter = o.legendFormatter;
+            sub.showGrid = o.showGrid; sub.showValues = o.showValues;
+            sub.rampColors = o.rampColors;  // 只读共享
+            sub.defaultType = o.defaultType;
+            sub.datasets = o.datasets;  // 只读共享（dataset.source 不改）
+            // dataZoom：窗口全格生效（官方 touch demo 的
+            // xAxisIndex:[0,1] 双 grid 同窗联动），滑条条带只随最后
+            // 一个 grid 画一次（每个子面板各画一条会叠两道）；
+            // zoomBarHidden 让非末格只应用窗口、不预留条带。
+            sub.zoom = o.zoom;
+            Chart.zoomBarHidden = gi != nG - 1;
+            // 图例全图一份，随第一格（官方多 grid 图例置顶）。
+            // 图例全图一份，随第一格（官方多 grid 图例置顶）。matrix
+            // 锚定形态的格是迷你面板（~40px），格内图例会把绘图区
+            // 吃穿——官方 legend:{} 画在整幅底部，面板级图例挂账
+            // （TASKS.md ⑥-3b），这里先按格内不画走。
+            sub.showLegend = o.showLegend && gi == 0 && !anchored;
+            sub.xAxes = new List<ChartAxis>();
+            for (int axi = 0; axi < o.xAxes.Count; axi = axi + 1) {
+                if (o.xAxes[axi].gridIndex == gi) { sub.xAxes.Add(o.xAxes[axi]); }
+            }
+            if (sub.xAxes.Count == 0 && gi < o.xAxes.Count) { sub.xAxes.Add(o.xAxes[gi]); }
+            sub.yAxes = new List<ChartAxis>();
+            for (int ayi = 0; ayi < o.yAxes.Count; ayi = ayi + 1) {
+                if (o.yAxes[ayi].gridIndex == gi) { sub.yAxes.Add(o.yAxes[ayi]); }
+            }
+            if (sub.yAxes.Count == 0 && gi < o.yAxes.Count) { sub.yAxes.Add(o.yAxes[gi]); }
+            // 子系列直接共享原系列对象（数据不拷贝）；轴下标归一化
+            // 由 ResolvedChart.Resolve 的 stateWid 机制与下方 xAxes/
+            // yAxes 单轴表承接：子面板的 xAxes/yAxes 只装本格轴，
+            // 系列的 axisIndex/xIndex 保持原值（RenderOnce 下游
+            // ChartFrame.YOf 按 axisIndex 读子轴表，单轴表使
+            // index 0 命中本格轴）。原 ChartSeries 只读共享，
+            // 绝不回写（下一帧还要按原始 xIndex 分组）。
+            List<ChartSeries> subSeries = new List<ChartSeries>();
+            for (int si4 = 0; si4 < o.series.Count; si4 = si4 + 1) {
+                ChartSeries cs4 = o.series[si4];
+                // 与上面的 grp 分组同一条规则：matrix 锚定形态下 geo
+                // 载体系列不进格（否则载体 series[0] 把子面板 kind
+                // 劫持成 map，迷你 bar 全灭）。
+                if (o.matrix != null && cs4.isGeoBase) { continue; }
+                int gx4 = cs4.xIndex;
+                if (gx4 > nG - 1) { gx4 = nG - 1; }
+                if (gx4 != gi) { continue; }
+                subSeries.Add(cs4);
+            }
+            sub.series = subSeries;
+            sub.grids = new List<ChartGridSpec>();
+            sub.title = ""; sub.titleSub = "";
+            sub.titles = new List<ChartTitleSpec>();
+            sub.visualMaps = new List<ChartVisualMap>();
+            if (o.matrix != null) {
+                // matrix 锚定形态：子面板绝不能带 matrix（否则子分发
+                // 又进 matrix 车道重画整幅骨架），dataZoom 滑条也不随
+                // 格画（官方位在矩阵盒底缘之外，挂账）。
+                sub.zoom = false;
+                Chart.zoomBarHidden = true;
+            }
+            for (int vi3 = 0; vi3 < o.visualMaps.Count; vi3 = vi3 + 1) {
+                ChartVisualMap vm3 = o.visualMaps[vi3] != null ? o.visualMaps[vi3].Clone() : null;
+                if (vm3 != null) {
+                    // 不属于本组的 visualMap 置为不可命中值（-1 是
+                    // "全部系列"通配，置 -1 会让别格的映射串场）。
+                    int newsi = 0 - 999;
+                    for (int oi3 = 0; oi3 < origIdx.Count; oi3 = oi3 + 1) {
+                        if (origIdx[oi3] == vm3.seriesIndex) { newsi = oi3; break; }
+                    }
+                    vm3.seriesIndex = newsi;
+                    sub.visualMaps.Add(vm3);
+                }
+            }
+            Chart.gridPanelSub = true;
+            ChartPreparedPanel child = ChartPreparedPanel.Create(app, sub, gx0, gy0, gx1 - gx0, gy1 - gy0, g,
+            panel.previous != null && panel.panels.Count < panel.previous.panels.Count ? panel.previous.panels[panel.panels.Count] : null);
+            panel.panels.Add(child);
+            this.PreparePanelChildren(app, child);
+            Chart.gridPanelSub = false;
+            Chart.zoomBarHidden = false;
+        }
+        // matrix 锚定的 geo 组件：逐个构造单 geo 子 option 落到格矩形
+        // （复用 DrawMap 的单矩形渲染；roam/tooltip 不启用，g=999 走
+        // 非快照帧——快照槽按 CacheKey 全局编址，同帧多图互踩）。
+        if (o.matrix != null && mgeo != null) {
+            for (int gi8 = 0; gi8 < o.geos.Count; gi8 = gi8 + 1) {
+                ChartGeo ge = o.geos[gi8];
+                if (!ge.matAnchor) { continue; }
+                int gcx0 = ChartView.MatXAt(mgeo, mgeo.yBands + ge.mx0);
+                int gcx1 = ChartView.MatXAt(mgeo, mgeo.yBands + ge.mx1 + 1);
+                int gcy0 = ChartView.MatYAt(mgeo, mgeo.xBands + ge.my0);
+                int gcy1 = ChartView.MatYAt(mgeo, mgeo.xBands + ge.my1 + 1);
+                if (gcx1 - gcx0 < app.Scale(8) || gcy1 - gcy0 < app.Scale(8)) {
+                    continue;
+                }
+                ChartSeries carrier = null;
+                for (int si8 = 0; si8 < o.series.Count; si8 = si8 + 1) {
+                    ChartSeries s8 = o.series[si8];
+                    if (s8.isGeoBase && s8.geoIndex == gi8) {
+                        carrier = s8;
+                        break;
+                    }
+                }
+                if (carrier == null) { continue; }
+                ChartOption gsub = ChartOption.Create();
+                gsub.overlay = true;
+                gsub.iwid = o.iwid;
+                gsub.backgroundColor = o.backgroundColor;
+                gsub.showTooltip = false;
+                gsub.showLegend = false;
+                gsub.animate = false;
+                gsub.animMs = 0;
+                gsub.series = new List<ChartSeries>();
+                gsub.series.Add(carrier);
+                Chart.gridPanelSub = true;
+                // g 必须传 1000（终帧）：DrawMap 的矢量区域填色只在
+                // g>=1000 走，g<1000 视为入场动画中段，只填底不填
+                // 区域（矩阵锚格没有入场动画，永远终帧）。10 个 geo
+                // 的快照指纹随格矩形各不相同，不会误命中彼此的槽。
+                ChartPreparedPanel child = ChartPreparedPanel.Create(app, gsub, gcx0, gcy0, gcx1 - gcx0, gcy1 - gcy0, 1000, null);
+                panel.panels.Add(child);
+                this.PreparePanelChildren(app, child);
+                Chart.gridPanelSub = false;
+            }
+        }
+        // 标题数组：面板坐标绘制（top/left 百分比），子调用已抑制。
+        // matrix 锚定标题以格矩形为基准（stock 的 coord 锚定、
+        // grid-layout 的响应式分节标题）。
+        for (int ti3 = 0; ti3 < o.titles.Count; ti3 = ti3 + 1) {
+            ChartTitleSpec ts = o.titles[ti3];
+            if (ts.text.Length < 1) { continue; }
+            int bx = x;
+            int by = y;
+            int bw = w;
+            int bh = h;
+            if (ts.matAnchor && mgeo != null) {
+                bx = ChartView.MatXAt(mgeo, mgeo.yBands + ts.mx0);
+                bw = ChartView.MatXAt(mgeo, mgeo.yBands + ts.mx1 + 1) - bx;
+                by = ChartView.MatYAt(mgeo, mgeo.xBands + ts.my0);
+                bh = ChartView.MatYAt(mgeo, mgeo.xBands + ts.my1 + 1) - by;
+            }
+            int fs = Style.FontFallback(app, "large");
+            int subFs = ChartFonts.SeriesLabel(app);
+            int tH = Canvas.FontHeight(fs)
+            + (ts.sub.Length > 0 ? Canvas.FontHeight(subFs) + app.Scale(2) : 0);
+            int ty = by + app.theme.paddingMedium;
+            if (ts.topPct >= 0) { ty = by + bh * ts.topPct / 100; }
+            else if (ts.topPx >= 0) { ty = by + app.Scale(ts.topPx); }
+            int tx = bx + app.theme.paddingMedium;
+            int tW = Canvas.MeasureText(ts.text, fs);
+            int maxW = bw - app.theme.paddingMedium * 2;
+            if (ts.align == "center") {
+                tx = bx + (bw - tW) / 2;
+            } else if (ts.leftPct >= 0) {
+                tx = bx + bw * ts.leftPct / 100;
+            } else if (ts.leftPx >= 0) {
+                tx = bx + app.Scale(ts.leftPx);
+            } else if (ts.align == "right") {
+                tx = bx + bw - app.theme.paddingMedium - tW;
+            }
+            // 官方 title left:'center' 是最常用形态：left 未声明但
+            // 前一项居中的多标题示例均按 center 处理。
+            if (ts.align.Length == 0 && ts.leftPct < 0 && ts.leftPx < 0) {
+                tx = bx + (bw - tW) / 2;
+            }
+            if (tx < bx) { tx = bx; }
+            int subCol = Style.Part(app, "chart", "axis-title", "", "", "",
+            Style.SNormal()).FgOr(0);
+            panel.titles.Add(ChartPreparedText.Of(tx, ty, ts.text, ChartView.PanelForeground(app), fs));
+            if (ts.sub.Length > 0) {
+                int sW = Canvas.MeasureText(ts.sub, subFs);
+                int sx = tx;
+                if (ts.align.Length == 0 && ts.leftPct < 0 && ts.leftPx < 0) {
+                    sx = bx + (bw - sW) / 2;
+                }
+                panel.titles.Add(ChartPreparedText.Of(sx, ty + Canvas.FontHeight(fs) + app.Scale(2), ts.sub, subCol, subFs));
+            }
+        }
+    }
+
+    void PrepareOverlayPanels(App app, ChartPreparedPanel panel) {
+        ChartOption o = panel.option;
+        string kind = ChartView.DispatchKind(o);
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries series = o.series[i];
+            if (series.hidden) { continue; }
+            bool pie = series.type == ChartType.Pie && kind != "pie" && kind != "rose" && !series.piePerPoint;
+            bool gauge = series.type == ChartType.Gauge && kind != "gauge";
+            bool funnel = series.type == ChartType.Funnel && kind != "funnel" && series.center != null && series.radius != null;
+            if (!pie && !gauge && !funnel) { continue; }
+            List<ChartSeries> selected = new List<ChartSeries>(); selected.Add(series);
+            ChartOption option = o.OverlayOption(selected);
+            int x = panel.x; int w = panel.w;
+            if (funnel) {
+                w = ChartView.GaugeScalar(app, series.radius, panel.w);
+                if (w < app.Scale(40)) { w = app.Scale(40); }
+                x = panel.x + ChartView.GaugeScalar(app, series.center.x, panel.w) - w / 2;
+            }
+            ChartPreparedPanel child = ChartPreparedPanel.CreateKind(app, option, x, panel.y, w, panel.h, panel.growth, null, pie ? "pie" : (gauge ? "gauge" : "funnel"));
+            panel.overlays.Add(child);
+        }
+        if (kind != "map" || (o.xAxes.Count == 0 && o.yAxes.Count == 0)) { return; }
+        List<ChartSeries> cartesian = new List<ChartSeries>();
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries series = o.series[i];
+            if (!series.hidden && series.coordSys != "geo" && (series.type == ChartType.Bar
+            || series.type == ChartType.Line || series.type == ChartType.Scatter)) { cartesian.Add(series); }
+        }
+        if (cartesian.Count == 0) { return; }
+        ChartOption option = o.OverlayOption(cartesian);
+        option.geos = new List<ChartGeo>(); option.series = cartesian;
+        Chart.gridPanelSub = true;
+        ChartPreparedPanel child = ChartPreparedPanel.Create(app, option, panel.x, panel.y, panel.w, panel.h, panel.growth, null);
+        panel.overlays.Add(child);
+    }
+
+    static void PaintPreparedPanel(App app, ChartPreparedPanel panel) {
+        if (panel == null) { return; }
+        ChartPreparedPanel previous = ChartView.paintingPanel;
+        ChartOption previousOption = Chart.legendOpt;
+        bool previousGrid = Chart.gridPanelSub; bool previousZoom = Chart.zoomBarHidden;
+        try {
+            ChartView.paintingPanel = panel; Chart.legendOpt = panel.option;
+            Chart.gridPanelSub = panel.grid; Chart.zoomBarHidden = panel.hideZoom;
+            if (panel.option.grids.Count > 1 && !panel.option.overlay) { ChartView.PaintMultiPanels(app, panel); }
+            else { ChartView.RenderOrdered(app, panel.x, panel.y, panel.w, panel.h, panel.option, panel.growth); }
+        } finally {
+            ChartView.paintingPanel = previous; Chart.legendOpt = previousOption;
+            Chart.gridPanelSub = previousGrid; Chart.zoomBarHidden = previousZoom;
+        }
+    }
+
+    static void PaintMultiPanels(App app, ChartPreparedPanel panel) {
+        if (panel.matrixGeometry != null) {
+            ChartView.DrawMatrix(app, panel.x, panel.y, panel.w, panel.h, panel.option, panel.growth);
+        }
+        for (int i = 0; i < panel.panels.Count; i = i + 1) { ChartView.PaintPreparedPanel(app, panel.panels[i]); }
+        for (int i = 0; i < panel.titles.Count; i = i + 1) {
+            ChartPreparedText text = panel.titles[i];
+            app.canvas.DrawText(text.x, text.y, text.text, text.color, text.font);
+        }
+    }
+}

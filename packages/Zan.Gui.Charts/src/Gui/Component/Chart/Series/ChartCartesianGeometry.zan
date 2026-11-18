@@ -1,0 +1,408 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+internal class ChartWaterfallColumn {
+    internal int x;
+    internal int width;
+    internal int top;
+    internal int bottom;
+    internal int connectorY;
+    internal int value;
+    internal int labelValue;
+    internal bool total;
+}
+
+// Cartesian window and axes are prepared once for both drawing and routed hits.
+internal class ChartCartesianGeometry {
+    internal ChartFrame frame;
+    internal List<string> labels;
+    internal int first;
+    internal int last;
+    internal int fullCount;
+    internal int zoomHeight;
+    internal int axisCount;
+    internal bool noCategoryX;
+    internal string kind;
+    internal int maximum;
+    internal bool fractionalStack;
+    internal double barBand;
+    internal List<ChartBarCol> barColumns;
+    internal List<ChartWaterfallColumn> waterfallColumns;
+    internal int waterfallTotal;
+    ChartOption model;
+    int x;
+    int y;
+    int w;
+    int h;
+
+    internal static ChartCartesianGeometry For(App app, ChartOption o, int x, int y, int w, int h) {
+        ChartPreparedPanel panel = ChartView.PaintPanel(o, x, y, w, h);
+        return panel != null ? panel.cartesianGeometry : null;
+    }
+
+    internal static ChartCartesianGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        string kind = ChartView.DispatchKind(o);
+        if (o.grids.Count > 1 || (kind != "lines" && kind != "bar" && kind != "barStacked"
+        && kind != "stackedArea" && kind != "waterfall" && kind != "k")) { return null; }
+        ChartCartesianGeometry geometry = new ChartCartesianGeometry();
+        geometry.model = o;
+        geometry.kind = kind;
+        geometry.x = x; geometry.y = y; geometry.w = w; geometry.h = h;
+        List<string> labels = o.XCategories();
+        int count = labels.Count;
+        bool noCategories = o.YAxis0().type == ChartAxisType.Category
+        || o.XAxis0().type == ChartAxisType.Value
+        || (o.XAxis0().type == ChartAxisType.Time && labels.Count == 0);
+        if (noCategories) {
+            for (int i = 0; i < o.series.Count; i = i + 1) {
+                ChartSeries series = o.series[i];
+                if (series.hidden) { continue; }
+                if (series.points.Count > count) { count = series.points.Count; }
+                if (series.data.Count > count) { count = series.data.Count; }
+            }
+        }
+        geometry.noCategoryX = noCategories;
+        geometry.axisCount = noCategories ? count : 0;
+        geometry.fullCount = count;
+        geometry.first = 0; geometry.last = count - 1;
+        if (o.zoom && o.iwid != 0 && count > 1) {
+            geometry.first = Chart.ZoomI0(app, o, o.iwid, count);
+            geometry.last = Chart.ZoomI1(app, o, o.iwid, count);
+            geometry.zoomHeight = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
+        }
+        geometry.labels = Chart.WindowLabels(labels, geometry.first, geometry.last);
+        int top = Chart.PanelContentTop(app, x, y, w, o.title, o.series, o.showLegend);
+        int maximum = -1;
+        geometry.maximum = Chart.NiceMax(Chart.MaxOfWindow(o.series, geometry.first, geometry.last));
+        if (kind == "barStacked") {
+            int slots = geometry.labels.Count;
+            if (o.XAxis0().type == ChartAxisType.Value) { slots = 1; }
+            maximum = Chart.MaxStackW(o.series, slots, geometry.first);
+        }
+        if (kind == "waterfall") {
+            geometry.LayoutWaterfall(app, o, x, y, w, h, top);
+            return geometry;
+        }
+        if (kind == "stackedArea") {
+            geometry.LayoutStacked(app, o, x, y, w, h, top);
+        } else {
+            geometry.frame = Chart.LayoutAxesR(app, x, y, w, h - geometry.zoomHeight, top,
+            geometry.labels, o, o.series, maximum, -1, geometry.first, geometry.last);
+        }
+        geometry.PrepareColumns(o);
+        return geometry;
+    }
+
+    void LayoutWaterfall(App app, ChartOption o, int x, int y, int w, int h, int top) {
+        waterfallColumns = new List<ChartWaterfallColumn>();
+        List<int> cumulative = new List<int>();
+        ChartSeries series = o.series.Count > 0 ? o.series[0] : null;
+        int low = 0; int high = 0; int sum = 0;
+        for (int i = 0; i < fullCount; i = i + 1) {
+            if (series != null && !(i < series.data.Count && series.data[i].name == "total")) {
+                sum = sum + (i < series.Count() ? series.Value(i) : 0);
+            }
+            cumulative.Add(sum);
+            if (sum < low) { low = sum; }
+            if (sum > high) { high = sum; }
+        }
+        waterfallTotal = sum;
+        if (high < 1 && low >= 0) { high = 1; }
+        if (o.yAxes.Count == 0 && low < 0) { o.Y(ChartAxis.ValueRange(low, Chart.NiceMax(high))); }
+        frame = Chart.LayoutAxesR(app, x, y, w, h - zoomHeight, top, labels, o,
+        o.series, high, -1, first, last);
+        barBand = ChartView.BarBandWidth(frame.plotW, labels.Count);
+        List<ChartSeries> visible = new List<ChartSeries>();
+        List<string> stacks = new List<string>();
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (o.series[i].hidden) { continue; }
+            visible.Add(o.series[i]);
+            stacks.Add(o.series[i].stackName.Length > 0 ? o.series[i].stackName : "waterfall-" + Convert.ToString(i));
+        }
+        List<ChartBarCol> columns = ChartView.CalcBarCols(barBand, visible, stacks);
+        double offset = columns.Count > 0 ? columns[0].offset : 0.0;
+        double width = columns.Count > 0 ? columns[0].width : 0.0;
+        int previous = first > 0 ? cumulative[first - 1] : 0;
+        for (int i = 0; i < labels.Count; i = i + 1) {
+            int original = first + i;
+            ChartWaterfallColumn column = new ChartWaterfallColumn();
+            column.value = series != null && original < series.Count() ? series.Value(original) : 0;
+            column.total = series != null && original < series.data.Count && series.data[original].name == "total";
+            column.labelValue = column.total ? cumulative[original] : column.value;
+            int upper = column.total ? sum : previous + column.value;
+            int lower = column.total ? 0 : previous;
+            int upperY = frame.YOf(upper, 0); int lowerY = frame.YOf(lower, 0);
+            column.top = upperY < lowerY ? upperY : lowerY;
+            column.bottom = upperY > lowerY ? upperY : lowerY;
+            column.connectorY = frame.YOf(previous, 0);
+            column.x = ChartView.BarX0(frame, i, barBand, offset);
+            if (width > 0.0) {
+                column.width = ChartView.RoundPx((double)frame.plotX + ((double)i + 0.5) * barBand
+                + offset + width) - column.x;
+                if (column.width < 1) { column.width = 1; }
+            }
+            waterfallColumns.Add(column);
+            if (!column.total) { previous = previous + column.value; }
+        }
+    }
+
+    void LayoutStacked(App app, ChartOption o, int x, int y, int w, int h, int top) {
+        int count = labels.Count > 0 ? labels.Count : axisCount;
+        fractionalStack = Chart.SeriesFracAny(o.series, 0);
+        ChartSpan span;
+        if (fractionalStack) {
+            int peak = 0;
+            for (int i = 0; i < count; i = i + 1) {
+                int sum = 0;
+                for (int si = 0; si < o.series.Count; si = si + 1) {
+                    ChartSeries series = o.series[si];
+                    if (series.hidden || !ChartView.IsStackedSeries(series) || first + i >= series.Count()) { continue; }
+                    double value = series.Number(first + i);
+                    sum = sum + (int)(value * 1000.0 + (value >= 0 ? 0.5 : -0.5));
+                }
+                if (sum > peak) { peak = sum; }
+            }
+            span = Chart.NiceSpan6(0, peak, ChartOption.AutoD(), ChartOption.AutoD());
+        } else {
+            span = Chart.NiceSpan6(0, Chart.MaxStackGroupsW(o.series, count, first),
+            ChartOption.AutoD(), ChartOption.AutoD());
+        }
+        maximum = span.hi;
+        if (o.yAxes.Count == 0) { o.Y(ChartAxis.Value()); }
+        ChartAxis axis = o.YAxis0();
+        int ticks = axis.ticks;
+        double high = axis.maxD;
+        if (!fractionalStack) {
+            if (span.ticks > 0) { axis.ticks = span.ticks; }
+            axis.SetRange(axis.minD, (double)maximum);
+        }
+        frame = Chart.LayoutAxesR(app, x, y, w, h - zoomHeight, top, labels, o,
+        o.series, maximum, -1, first, last);
+        axis.ticks = ticks;
+        axis.SetRange(axis.minD, high);
+    }
+
+    void PrepareColumns(ChartOption o) {
+        List<ChartSeries> bars = new List<ChartSeries>();
+        List<string> stacks = new List<string>();
+        List<int> indices = new List<int>();
+        barColumns = new List<ChartBarCol>();
+        bool valueBars = o.XAxis0().type == ChartAxisType.Value;
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries series = o.series[i];
+            barColumns.Add(null);
+            if (series.hidden || !ChartView.IsBarFamily(series.type)
+            || (valueBars && series.points.Count > 0)) { continue; }
+            bars.Add(series); indices.Add(i);
+            stacks.Add(series.stackName.Length > 0 ? series.stackName : "bar-" + Convert.ToString(i));
+        }
+        barBand = ChartView.BarBandWidth(frame.plotW, labels.Count);
+        List<ChartBarCol> columns = ChartView.CalcBarCols(barBand, bars, stacks);
+        for (int i = 0; i < indices.Count; i = i + 1) { barColumns[indices[i]] = columns[i]; }
+    }
+
+    internal ChartHit Hit(App app, ChartOption o, int px, int py, int growth) {
+        ChartFrame f = frame;
+        if (f == null || px < f.plotX || px >= f.plotX + f.plotW
+        || py < f.plotY || py >= f.plotY + f.plotH) { return null; }
+        int count = labels.Count > 0 ? labels.Count : last - first + 1;
+        if (count < 1) { return null; }
+        int category = f.CatIndexAt(px, count);
+        int original = first + category;
+        if (kind == "waterfall") {
+            if (o.series.Count < 1 || waterfallColumns == null || category >= waterfallColumns.Count) { return null; }
+            ChartSeries series = o.series[0];
+            ChartWaterfallColumn column = waterfallColumns[category];
+            if (series.hidden || series.silent || (original < series.data.Count && series.data[original].gap)
+            || px < column.x || px >= column.x + column.width || py < column.top || py >= column.bottom) { return null; }
+            return ChartHit.Of(ChartElementType.Bar, 0, series.name, original, labels[category],
+            column.total ? waterfallTotal : column.value, px, py);
+        }
+        ChartHit best = null;
+        int radius = app.Scale(10);
+        int bestDistance = radius * radius + 1;
+        double band = barBand;
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries series = o.series[i];
+            ChartBarCol column = barColumns[i];
+            if (series.hidden || series.silent || column == null || original >= series.Count()
+            || (original < series.data.Count && series.data[original].gap)) { continue; }
+            int left = ChartView.BarX0(f, category, band, column.offset);
+            int right = ChartView.RoundPx((double)f.plotX
+            + ((double)category + 0.5) * band + column.offset + column.width);
+            if (kind == "lines") {
+                int cellWidth = f.CatWidth(category, count);
+                int barWidth = cellWidth / 2;
+                left = f.CatLeft(category, count) + (cellWidth - barWidth) / 2;
+                right = left + barWidth;
+            }
+            if (column.width <= 0) { continue; }
+            if (right <= left) { right = left + 1; }
+            double value = series.Number(original);
+            double baseline = ChartView.IsStackedSeries(series)
+            ? ChartView.StackBaseAt(o.series, i, original) : 0.0;
+            long valueF = (long)((baseline + value) * 1000.0
+            + (baseline + value >= 0 ? 0.5 : -0.5));
+            long baseF = (long)(baseline * 1000.0 + (baseline >= 0 ? 0.5 : -0.5));
+            int endY = f.YOfFL(valueF * growth / 1000L, series.axisIndex);
+            int baseY = f.YOfFL(baseF * growth / 1000L, series.axisIndex);
+            int top = endY < baseY ? endY : baseY;
+            int bottom = endY > baseY ? endY : baseY;
+            int minimum = app.Scale(series.barMinHeight);
+            if (bottom - top < minimum) {
+                if (endY <= baseY) { top = bottom - minimum; }
+                else { bottom = top + minimum; }
+            }
+            if (px >= left && px < right && py >= top && py < bottom) {
+                best = ChartView.MakeDataHit(series, i, original,
+                category < labels.Count ? labels[category] : "#" + Convert.ToString(original + 1),
+                ChartElementType.Bar, px, py, series.Value(original));
+            }
+        }
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries series = o.series[si];
+            if (series.hidden || series.silent || !ChartView.IsLineFamily(series.type)) { continue; }
+            for (int i = 0; i < count; i = i + 1) {
+                int index = first + i;
+                if (index >= series.Count() || (index < series.data.Count && series.data[index].gap)) { continue; }
+                int sx = this.PointX(series, i, count, growth);
+                int sy = this.PointY(o, series, si, i, count, growth);
+                int dx = px - sx; int dy = py - sy;
+                int distance = dx * dx + dy * dy;
+                int chosen = index;
+                if (i + 1 < count && index + 1 < series.Count()
+                && !(index + 1 < series.data.Count && series.data[index + 1].gap)) {
+                    int ex = this.PointX(series, i + 1, count, growth);
+                    int ey = this.PointY(o, series, si, i + 1, count, growth);
+                    int segment = ChartView.SegDist2(px, py, sx, sy, ex, ey);
+                    if (segment >= 0 && segment < distance) {
+                        distance = segment;
+                        int qx = px - ex; int qy = py - ey;
+                        if (qx * qx + qy * qy <= dx * dx + dy * dy) { chosen = index + 1; }
+                    }
+                }
+                if (distance <= radius * radius && (best == null
+                || si > best.seriesIndex || (si == best.seriesIndex && distance < bestDistance))) {
+                    bestDistance = distance;
+                    string name = chosen - first < labels.Count ? labels[chosen - first]
+                    : "#" + Convert.ToString(chosen + 1);
+                    best = ChartView.MakeDataHit(series, si, chosen, name,
+                    ChartElementType.LinePoint, px, py, series.Value(chosen));
+                    if (chosen < series.points.Count) {
+                        best.xValueSet = true; best.xValue = (double)series.points[chosen].x / (double)series.pointG;
+                        best.yValueSet = true; best.yValue = (double)series.points[chosen].y / (double)series.pointG;
+                    }
+                }
+            }
+        }
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries series = o.series[si];
+            if (series.hidden || series.silent) { continue; }
+            ChartHit candidate = null;
+            if (ChartView.IsBarFamily(series.type) && series.points.Count > 0) {
+                candidate = this.HitValueBars(app, series, si, px, py, growth);
+            } else if (series.type == ChartType.Scatter && series.data.Count > 0) {
+                for (int vi = 0; vi < count; vi = vi + 1) {
+                    int index = first + vi;
+                    if (index >= series.data.Count || series.data[index].gap) { continue; }
+                    int sx = f.CatX(vi, count);
+                    int sy = f.YOfFL((long)(series.Number(index) * 1000.0) * growth / 1000L, series.axisIndex);
+                    int radius = series.symbolSize > 0 ? app.Scale(Chart.SymbolRadius(series.symbolSize, 0)) : app.Scale(3);
+                    if (series.data[index].sizeSet && series.data[index].size > 0) { radius = app.Scale(series.data[index].size); }
+                    radius = radius + app.Scale(2);
+                    long dx = px - sx; long dy = py - sy;
+                    if (dx * dx + dy * dy <= (long)radius * radius) {
+                        candidate = ChartView.MakeDataHit(series, si, index, vi < labels.Count ? labels[vi] : "",
+                        ChartElementType.ScatterPoint, px, py, series.Value(index));
+                    }
+                }
+            } else if (kind == "stackedArea" && ChartView.IsStackedSeries(series) && original < series.Count()) {
+                double top = ChartView.StackTopAt(o.series, si, original);
+                double bottom = top - series.Number(original);
+                int topY = f.YOfFL((long)(top * 1000.0) * growth / 1000L, series.axisIndex);
+                int bottomY = f.YOfFL((long)(bottom * 1000.0) * growth / 1000L, series.axisIndex);
+                int low = topY < bottomY ? topY : bottomY;
+                int high = topY > bottomY ? topY : bottomY;
+                if (py >= low && py <= high) {
+                    candidate = ChartView.MakeDataHit(series, si, original, category < labels.Count ? labels[category] : "",
+                    ChartElementType.LinePoint, px, py, series.Value(original));
+                }
+            }
+            if (candidate != null && (best == null || candidate.seriesIndex >= best.seriesIndex)) { best = candidate; }
+        }
+        return best;
+    }
+
+    ChartHit HitValueBars(App app, ChartSeries series, int si, int px, int py, int growth) {
+        int minimumGap = 0;
+        for (int i = first; i <= last && i < series.points.Count; i = i + 1) {
+            for (int j = i + 1; j <= last && j < series.points.Count; j = j + 1) {
+                int gap = series.points[j].x - series.points[i].x;
+                if (gap < 0) { gap = -gap; }
+                if (gap > 0 && (minimumGap == 0 || gap < minimumGap)) { minimumGap = gap; }
+            }
+        }
+        int width = minimumGap > 0 ? frame.XOfValue(minimumGap) - frame.XOfValue(0) : frame.plotW / 4;
+        if (width < 0) { width = -width; }
+        width = width / 2;
+        if (series.barWidth > 0) { width = app.Scale(series.barWidth); }
+        if (width > frame.plotW / 4) { width = frame.plotW / 4; }
+        if (width < app.Scale(2)) { width = app.Scale(2); }
+        int zeroY = frame.YOf(0, series.axisIndex);
+        int zeroX = frame.XOfValue(0);
+        ChartHit hit = null;
+        for (int i = first; i <= last && i < series.points.Count; i = i + 1) {
+            int sx = frame.XOfValue(series.points[i].x);
+            int sy = frame.YOf((int)((long)series.points[i].y * growth / 1000L), series.axisIndex);
+            int left = sx - width / 2;
+            int top = sy < zeroY ? sy : zeroY;
+            int height = sy < zeroY ? zeroY - sy : sy - zeroY;
+            int cellWidth = width;
+            int minimum = app.Scale(series.barMinHeight);
+            if (series.barHeight > 0) {
+                left = sx < zeroX ? sx : zeroX;
+                cellWidth = sx < zeroX ? zeroX - sx : sx - zeroX;
+                if (cellWidth < minimum) { cellWidth = minimum; left = sx < zeroX ? zeroX - minimum : zeroX; }
+                height = app.Scale(series.barHeight);
+                if (height < app.Scale(2)) { height = app.Scale(2); }
+                top = sy - height / 2;
+            } else if (height < minimum) { height = minimum; top = sy <= zeroY ? zeroY - minimum : zeroY; }
+            if (cellWidth > 0 && height > 0 && px >= left && px < left + cellWidth && py >= top && py < top + height) {
+                hit = ChartView.MakeDataHit(series, si, i,
+                "[" + Convert.ToString(series.points[i].x) + ", " + Convert.ToString(series.points[i].y) + "]",
+                ChartElementType.Bar, px, py, series.points[i].y);
+                hit.xValueSet = true; hit.xValue = series.points[i].x;
+                hit.yValueSet = true; hit.yValue = series.points[i].y;
+            }
+        }
+        return hit;
+    }
+
+    int PointX(ChartSeries series, int index, int count, int growth) {
+        int original = first + index;
+        if (series.points.Count > 0 && original < series.points.Count) {
+            return frame.isTime ? frame.XOfTime(Chart.PointV(series.points[original].x, series.pointG))
+            : Chart.ValueXF(frame.plotX, frame.plotW, frame.xLo, frame.xHi,
+            series.points[original].x, series.pointG);
+        }
+        if (frame.catY) { return frame.XOfValue((int)((long)series.Value(original) * growth / 1000L)); }
+        return kind == "bar" || kind == "barStacked" ? frame.CatMid(index, count) : frame.CatX(index, count);
+    }
+
+    int PointY(ChartOption o, ChartSeries series, int si, int index, int count, int growth) {
+        int original = first + index;
+        if (frame.catY && series.points.Count == 0) { return frame.CatMidY(index, count); }
+        if (series.points.Count > 0 && kind != "stackedArea") {
+            return frame.YOfFL((long)series.points[original].y * 1000L / (long)series.pointG, series.axisIndex);
+        }
+        double value = kind == "stackedArea" ? ChartView.StackTopAt(o.series, si, original) : series.Number(original);
+        long fixedValue = (long)(value * 1000.0 + (value >= 0 ? 0.5 : -0.5));
+        return frame.YOfFL(fixedValue * growth / 1000L, series.axisIndex);
+    }
+
+    internal ChartHit Hit(App app, ChartOption o, int x, int y) {
+        return this.Hit(app, o, x, y, 1000);
+    }
+}

@@ -29,32 +29,18 @@ public partial class Chart {
     // 折千分值进 minGap。showDetail 标签官方缺省只在 hover/拖拽时显
     // （handleLabel.show 缺省 false + emphasis true）——静态首帧不画。
     public static void DrawZoomBar(App app, ChartOption o, int plotX, int plotW,
-                            int x, int y, int w, int h, int wid, int n) {
+    int x, int y, int w, int h, int wid, int n) {
         ChartZoom zc = Chart.ZoomBarComp(o);
         if (zc == null) { return; }
         Canvas c = app.canvas;
         if (plotW < 4 || n < 2 || w < 4) { return; }
 
-        // ---- 条几何 ----
-        int barH = Chart.ZoomBarH(app, zc, h);
-        int barY = y + h - app.Scale(22) - barH;
-        if (zc.top >= 0) { barY = y + app.Scale(zc.top); }
-        else if (zc.topPct >= 0) { barY = y + h * zc.topPct / 100; }
-        else if (zc.bottom >= 0) { barY = y + h - app.Scale(zc.bottom) - barH; }
-        int barW = plotW;
-        int barX = plotX;
-        if (zc.width >= 0) { barW = app.Scale(zc.width); }
-        else if (zc.widthPct >= 0) { barW = w * zc.widthPct / 100; }
-        if (zc.left >= 0) { barX = x + app.Scale(zc.left); }
-        else if (zc.leftPct >= 0) { barX = x + w * zc.leftPct / 100; }
-        else if (zc.right >= 0) { barX = x + w - app.Scale(zc.right) - barW; }
-        else if (zc.rightPct >= 0) { barX = x + w - w * zc.rightPct / 100 - barW; }
-        if (barW < 4) { return; }
-
-        int lo = app.StateGet(Chart.ZoomLoKey(wid), 0);
-        int hi = app.StateGet(Chart.ZoomHiKey(wid), 1000);
-        int loX = barX + lo * barW / 1000;
-        int hiX = barX + hi * barW / 1000;
+        ChartPreparedPanel panel = ChartView.PaintPanel(o, x, y, w, h);
+        ChartZoomLayout layout = panel != null ? panel.zoomLayout : null;
+        if (layout == null) { return; }
+        int barX = layout.x; int barY = layout.y;
+        int barW = layout.w; int barH = layout.h;
+        int loX = layout.loX; int hiX = layout.hiX;
 
         // 官方 token 缺省（visual/tokens.ts），声明色覆盖。
         int colBorder = zc.borderColor != 0 ? zc.borderColor : ChartColor.Rgb(224, 228, 242);
@@ -63,7 +49,7 @@ public partial class Chart {
         int colSelDbArea = zc.selDbAreaColor != 0 ? zc.selDbAreaColor : ChartColor.Rgb(192, 201, 230);
         int colSelDbLine = zc.selDbLineColor != 0 ? zc.selDbLineColor : ChartColor.Rgb(130, 146, 204);
         int colFiller = zc.fillerColor != 0 ? zc.fillerColor
-            : ChartColor.WithAlpha(ChartColor.Rgb(135, 175, 255), 51);
+        : ChartColor.WithAlpha(ChartColor.Rgb(135, 175, 255), 51);
         int colHandleFill = ChartColor.Rgb(255, 255, 255);
         int colHandleBorder = ChartColor.Rgb(192, 201, 230);
 
@@ -139,14 +125,7 @@ public partial class Chart {
         c.DrawRect(barX, barY, barW, barH, colBorder, 1);
 
         // ---- 手柄（官方缺省 grip path 8x40，aspect 0.2）----
-        int hw = 0;
-        if (zc.handleSizePx == 0) {
-            hw = 0;
-        } else if (zc.handleSizePx > 0) {
-            hw = app.Scale(zc.handleSizePx);
-        } else {
-            hw = barH * zc.handleSize / 100;
-        }
+        int hw = layout.handle;
         if (hw > 0) {
             int hH = hw;
             int hTop = barY;
@@ -167,12 +146,12 @@ public partial class Chart {
         }
 
         // ---- moveHandle（brushSelect 缺省 true，窗口等宽底条）----
-        bool moveStrip = zc.brushSelect && hiX > loX;
+        bool moveStrip = layout.moveStrip;
         if (moveStrip) {
             int mhH = app.Scale(7);
             int mhY = barY + barH;
             c.FillRoundRectIn(loX, mhY, hiX - loX, mhH, 2, 12,
-                ChartColor.WithAlpha(ChartColor.Rgb(130, 146, 204), 128));
+            ChartColor.WithAlpha(ChartColor.Rgb(130, 146, 204), 128));
             int ic = mhH * 8 / 10;
             int icy = mhY + (mhH - ic) / 2;
             int icx = loX + (hiX - loX) / 2;
@@ -182,68 +161,6 @@ public partial class Chart {
             }
         }
 
-        // ---- 交互（千分值窗口状态，wid 键）----
-        int hwHalf = hw > 0 ? 3 : app.Scale(6);
-        int loId = app.focus.AllocId();
-        int hiId = app.focus.AllocId();
-        int bandId = app.focus.AllocId();
-        app.hitTester.RegisterRect(loId, loX - hwHalf, barY, hwHalf * 2, barH, 3);
-        app.hitTester.RegisterRect(hiId, hiX - hwHalf, barY, hwHalf * 2, barH, 3);
-        int bandH = barH;
-        if (moveStrip) { bandH = barH + app.Scale(7); }
-        app.hitTester.RegisterRect(bandId, loX + hwHalf, barY, hiX - loX - hwHalf * 2, bandH, 3);
-
-        int mxPm = (app.mouseX - barX) * 1000 / barW;
-        if (mxPm < 0) { mxPm = 0; }
-        if (mxPm > 1000) { mxPm = 1000; }
-        int minGap = 1000 / (n - 1);
-        if (minGap < 20) { minGap = 20; }
-        if (zc.minSpan > 0) {
-            int g2 = zc.minSpan * 10;
-            if (g2 > minGap) { minGap = g2; }
-        }
-        if (zc.minValueSpan > 0) {
-            // 数据单位按类目均分近似（时间轴 ms 亦然——点距均匀时等价）。
-            int g3 = zc.minValueSpan * 1000 / (n - 1);
-            if (g3 > minGap) { minGap = g3; }
-        }
-
-        if (zc.zoomLock) {
-            // zoomLock：跨度锁定，只许整体平移。
-            if (Ui.Pressed(app, bandId)) {
-                int width = hi - lo;
-                int nlo = mxPm - width / 2;
-                if (nlo < 0) { nlo = 0; }
-                if (nlo + width > 1000) { nlo = 1000 - width; }
-                app.StateSet(Chart.ZoomLoKey(wid), nlo);
-                app.StateSet(Chart.ZoomHiKey(wid), nlo + width);
-                app.RequestRedraw();
-            }
-            return;
-        }
-
-        if (Ui.Pressed(app, loId)) {
-            lo = mxPm;
-            if (lo > hi - minGap) { lo = hi - minGap; }
-            if (lo < 0) { lo = 0; }
-            app.StateSet(Chart.ZoomLoKey(wid), lo);
-            app.RequestRedraw();
-        } else if (Ui.Pressed(app, hiId)) {
-            hi = mxPm;
-            if (hi < lo + minGap) { hi = lo + minGap; }
-            if (hi > 1000) { hi = 1000; }
-            app.StateSet(Chart.ZoomHiKey(wid), hi);
-            app.RequestRedraw();
-        } else if (Ui.Pressed(app, bandId)) {
-            // 平移：保持带宽，以指针为中心。
-            int width = hi - lo;
-            int nlo = mxPm - width / 2;
-            if (nlo < 0) { nlo = 0; }
-            if (nlo + width > 1000) { nlo = 1000 - width; }
-            app.StateSet(Chart.ZoomLoKey(wid), nlo);
-            app.StateSet(Chart.ZoomHiKey(wid), nlo + width);
-            app.RequestRedraw();
-        }
     }
 
     // 首个可见 slider 组件（show!=false 的 x 靶向组件）；
@@ -303,7 +220,7 @@ public partial class Chart {
             ChartSeries s = o.series[i];
             if (s.hidden) { continue; }
             if (s.type == ChartType.Line || s.type == ChartType.Bar
-                || s.type == ChartType.K || s.type == ChartType.Scatter) {
+            || s.type == ChartType.K || s.type == ChartType.Scatter) {
                 return s;
             }
         }

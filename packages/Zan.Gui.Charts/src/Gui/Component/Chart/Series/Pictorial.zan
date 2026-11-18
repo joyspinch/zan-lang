@@ -25,29 +25,18 @@ namespace Gui.Component.Chart;
 public partial class ChartView {
 
     public static void DrawPictorialBar(App app, int x, int y, int w, int h,
-                                 ChartOption o, int g) {
+    ChartOption o, int g) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         List<ChartSeries> series = o.series;
-        List<string> labels = o.XCategories();
-        // 类目名缺失时从首个系列 data.name 推导（pictorialBar 常见
-        // 无显式 xAxis.data 的写法）。
-        if (labels.Count < 1) {
-            for (int si = 0; si < series.Count; si = si + 1) {
-                if (series[si].hidden || series[si].data.Count < 1) { continue; }
-                for (int di = 0; di < series[si].data.Count; di = di + 1) {
-                    labels.Add(series[si].data[di].name);
-                }
-                break;
-            }
-        }
+        ChartPreparedPanel panel = ChartView.PaintPanel(o, x, y, w, h);
+        ChartPictorialGeometry geometry = panel != null ? panel.pictorialGeometry : null;
+        if (geometry == null || geometry.labels.Count < 1) { return; }
+        List<string> labels = geometry.labels;
         int n = labels.Count;
-        if (n < 1) { return; }
-
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, series,
-            o.iwid, o.showLegend);
-        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h, plotTop, labels,
-            o, series, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+        Chart.DrawPanelI(app, x, y, w, h, o.legendTextColor, o.title, series, o.iwid, o.showLegend);
+        ChartFrame f = geometry.frame;
+        Chart.DrawAxes(app, f, o, labels);
         int alpha = 255;
         if (g < 1000) { alpha = 60 + 195 * g / 1000; }
         if (alpha > 255) { alpha = 255; }
@@ -61,8 +50,6 @@ public partial class ChartView {
         }
         if (nsVis < 1) { nsVis = 1; }
         int slot = 0;
-        int mX = app.mouseX;
-        int mY = app.mouseY;
         for (int si = 0; si < series.Count; si = si + 1) {
             ChartSeries s = series[si];
             if (s.hidden || s.custom != "pictorialBar") { continue; }
@@ -96,15 +83,7 @@ public partial class ChartView {
                     offY = s.picOffYPct != 0 ? baseH * s.picOffYPct / 100 : app.Scale(s.picOffY);
                 }
                 ChartView.Symbol(app, c, f, s, sx + offX, yBase + offY, subW,
-                    hVal, col, colA, v);
-                // 命中：整槽矩形出 tooltip 数据点。
-                if (mX >= bx && mX < bx + bw && mY >= yTop + offY
-                    && mY <= yBase + offY) {
-                    ChartHit mh = ChartHit.Of(ChartElementType.Bar,
-                        ChartView.SeriesIndexOf(o, s), s.name, i,
-                        i < labels.Count ? labels[i] : "", v, mX, mY);
-                    ChartView.OfferActiveHit(mh);
-                }
+                hVal, col, colA, v);
             }
             slot = slot + 1;
         }
@@ -112,8 +91,8 @@ public partial class ChartView {
 
     // 一个数据槽的符号绘制（模式分派见类注释）。
     public static void Symbol(App app, Canvas c, ChartFrame f, ChartSeries s,
-                       int sx, int yBase, int sw, int hVal, int col,
-                       int colA, int v) {
+    int sx, int yBase, int sw, int hVal, int col,
+    int colA, int v) {
         string sym = s.picSymbol;
         bool repeat = s.picRepeat == "true" || s.picRepeat == "fixed";
         if (s.picClip) {
@@ -123,7 +102,7 @@ public partial class ChartView {
             int fullH = f.plotH;
             if (hVal > fullH) { hVal = fullH; }
             ChartView.DrawSource(app, c, s, sym,
-                sx, yBase - hVal, sw, hVal, fullH, col, colA, true);
+            sx, yBase - hVal, sw, hVal, fullH, col, colA, true);
             return;
         }
         if (repeat) {
@@ -138,7 +117,7 @@ public partial class ChartView {
             int ty = yBase - th;
             while (ty + th > yBase - hVal) {
                 ChartView.DrawSource(app, c, s, sym,
-                    sx + (sw - tw) / 2, ty, tw, th, th, col, colA, false);
+                sx + (sw - tw) / 2, ty, tw, th, th, col, colA, false);
                 ty = ty - th;
                 if (ty < f.plotY - th) { break; }
             }
@@ -150,20 +129,20 @@ public partial class ChartView {
             int cw = s.picW > 0 ? s.picW : sw;
             int chh = s.picH > 0 ? s.picH : cw;
             ChartView.DrawSource(app, c, s, sym,
-                sx + (sw - cw) / 2, yBase - hVal - chh / 2, cw, chh,
-                chh, col, colA, false);
+            sx + (sw - cw) / 2, yBase - hVal - chh / 2, cw, chh,
+            chh, col, colA, false);
             return;
         }
         // ① 拉伸：符号随 (sw, hVal) 变形（ECharts 默认）。
         ChartView.DrawSource(app, c, s, sym,
-            sx, yBase - hVal, sw, hVal, hVal, col, colA, false);
+        sx, yBase - hVal, sw, hVal, hVal, col, colA, false);
     }
 
     // 符号源分派：内置形状 / path:// 折线仿射 / image:// 位图。
     // fullH 仅 clip 模式用（位图裁剪的源窗口比例）。
     public static void DrawSource(App app, Canvas c, ChartSeries s, string sym,
-                           int dx, int dy, int dw, int dh, int fullH,
-                           int col, int colA, bool clip) {
+    int dx, int dy, int dw, int dh, int fullH,
+    int col, int colA, bool clip) {
         if (dw < 1 || dh < 1) { return; }
         if (sym == "" || sym == "roundRect" || sym == "rect") {
             int rad = sym == "rect" ? 0 : (dw < dh ? dw : dh) / 5;
@@ -173,29 +152,29 @@ public partial class ChartView {
         }
         if (sym == "circle") {
             c.FillCircle(dx + dw / 2, dy + dh / 2,
-                (dw < dh ? dw : dh) / 2, colA);
+            (dw < dh ? dw : dh) / 2, colA);
             return;
         }
         if (sym == "triangle") {
             ChartView.Poly(c, dx, dy, dw, dh, colA,
-                new int[] { 50, 0, 100, 100, 0, 100 });
+            new int[] { 50, 0, 100, 100, 0, 100 });
             return;
         }
         if (sym == "diamond") {
             ChartView.Poly(c, dx, dy, dw, dh, colA,
-                new int[] { 50, 0, 100, 50, 50, 100, 0, 50 });
+            new int[] { 50, 0, 100, 50, 50, 100, 0, 50 });
             return;
         }
         if (sym == "pin") {
             c.FillCircle(dx + dw / 2, dy + dh * 40 / 100, dw / 2, colA);
             ChartView.Poly(c, dx, dy, dw, dh, colA,
-                new int[] { 50, 100, 78, 55, 22, 55 });
+            new int[] { 50, 100, 78, 55, 22, 55 });
             return;
         }
         if (sym == "arrow") {
             ChartView.Poly(c, dx, dy, dw, dh, colA,
-                new int[] { 50, 0, 100, 50, 68, 50, 68, 100, 32, 100,
-                    32, 50, 0, 50 });
+            new int[] { 50, 0, 100, 50, 68, 50, 68, 100, 32, 100,
+            32, 50, 0, 50 });
             return;
         }
         if (sym.StartsWith("path://")) {
@@ -206,7 +185,7 @@ public partial class ChartView {
         if (sym.StartsWith("image://")) {
             string uri = sym.Substring(8, sym.Length - 8);
             ChartView.DrawImageUri(c, uri, dx, dy, dw, dh,
-                fullH, clip);
+            fullH, clip);
             return;
         }
         // 未知符号名按 roundRect 兜底（ECharts 图形名全集之外）。
@@ -217,12 +196,12 @@ public partial class ChartView {
 
     // 内置多边形：uv 千分比坐标对仿射到 (dx,dy,dw,dh) 后填充。Zero-Alloc 池化复用。
     public static void Poly(Canvas c, int dx, int dy, int dw, int dh, int col,
-                     int[] uv) {
+    int[] uv) {
         Chart.renderContext.EnsureScratch();
         List<ChartMapPoint> pts = Chart.renderContext.scratchPoly1; pts.Clear();
         for (int k = 0; k + 1 < uv.Length; k = k + 2) {
             pts.Add(ChartMapPoint.Of(dx + uv[k] * dw / 100,
-                dy + uv[k + 1] * dh / 100));
+            dy + uv[k + 1] * dh / 100));
         }
         ChartView.FillPolygon(c, pts, col);
     }
@@ -230,9 +209,9 @@ public partial class ChartView {
     // path:// 折线化后各向异性仿射进目标盒（ECharts 把 path bbox
     // 拉到 symbolSize 盒，不保纵横比），随系列色填充、洞回填底色。Zero-Alloc 池化复用。
     public static void DrawPath(Canvas c, string dd, int dx, int dy, int dw,
-                         int dh, int colA, int col) {
+    int dh, int colA, int col) {
         List<ChartMapRing> rings = ChartSvgMap.PathRings(dd,
-            1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
         if (rings.Count < 1) { return; }
         int mnX = 0; int mnY = 0; int mxX = 0; int mxY = 0;
         bool any = false;
@@ -270,7 +249,7 @@ public partial class ChartView {
     // （键 = 数据指纹，逐出后按需重注册），按目标盒缩放；clip 时
     // 源窗口取位图下部（符号底边贴基线、上沿裁到值高）。
     public static void DrawImageUri(Canvas c, string uri, int dx, int dy, int dw,
-                             int dh, int fullH, bool clip) {
+    int dh, int fullH, bool clip) {
         int b64 = uri.IndexOf("base64,");
         if (b64 < 0) { return; }
         string data = uri.Substring(b64 + 7, uri.Length - (b64 + 7));

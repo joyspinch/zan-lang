@@ -7,6 +7,7 @@ namespace Gui.Component.Chart;
 public class ResolvedChart {
     public ChartOption source;
     public List<ResolvedSeries> series;
+    public List<int> drawOrder;  // draw index -> declaration index, fixed for this resolve
     public int wid;
     public int stateWid;  // connect 组的交互态基址（组长 wid）；无组 = wid
     public bool animate;
@@ -23,7 +24,7 @@ public class ResolvedChart {
         outp.source = source;
         outp.series = new List<ResolvedSeries>();
         outp.wid = wid;
-        outp.animate = source.animate;
+        outp.animate = source.animate && source.animation;
         // connect() 联动：交互态（dataZoom 窗口 / 图例开关）统一
         // 存取在组长 wid 上。组长登记在组键里（组内第一张图写入），
         // 本图非组长时用组长 wid 读写这些状态，实现跨图同帧联动。
@@ -60,14 +61,15 @@ public class ResolvedChart {
         // 压住柱群）。源 option 不回写——每帧重排，声明序恒为准。
         List<int> zorder = new List<int>();
         ChartView.ZOrder(source, zorder);
+        outp.drawOrder = zorder;
         for (int i = 0; i < zorder.Count; i = i + 1) {
             ChartSeries s = source.series[zorder[i]];
             bool hidden = s.hidden;
             if (app != null && stateWid != 0) {
                 hidden = app.StateGet(Chart.LegendKey(stateWid, i), hidden ? 1 : 0) == 1;
             }
-            ResolvedSeries rs = ResolvedSeries.Of(s, theme, i, wid, source.animate, hidden,
-                                                  source.colorPal);
+            ResolvedSeries rs = ResolvedSeries.Of(s, theme, i, wid, outp.animate, hidden,
+            source.colorPal);
             // CSS 通道：样式表可用 chart::series-1..8 的 background
             // 覆写该系列的定性色。仅显式规则生效——规则不存在时
             // BgOr 为 0，自动回退 token 调色板 / ECharts 默认色。
@@ -77,13 +79,13 @@ public class ResolvedChart {
             // （基线包 echarts6 常驻后，multiple-x-axis/
             // area-stack-gradient 曾被逐槽覆写回默认调色板）。
             bool seriesExplicit = s.color != 0
-                || s.itemStyle.normal.color != 0;
+            || s.itemStyle.normal.color != 0;
             bool rootPal = source.colorPal != null
-                && source.colorPal.Count > 0;
+            && source.colorPal.Count > 0;
             if (app != null && !seriesExplicit && !rootPal) {
                 int cssCol = Style.Part(app, "chart",
-                                        "series-" + Convert.ToString(i + 1),
-                                        "", "", "", Style.SNormal()).BgOr(0);
+                "series-" + Convert.ToString(i + 1),
+                "", "", "", Style.SNormal()).BgOr(0);
                 if (cssCol != 0) { rs.OverrideColor(cssCol); }
             }
             outp.series.Add(rs);
@@ -115,139 +117,19 @@ public class ResolvedChart {
     // iwid 用 stateWid（connect 组的组长 wid）：渲染器所有交互
     // 键（dataZoom/图例/十字线）自动落到组共享的键上。
     public ChartOption DrawOption(int wid, bool animate) {
-        ChartOption o = ChartOption.Create();
-        ChartOption s = this.source;
-        o.title = s.title;
-        o.titleSub = s.titleSub; o.titleAlign = s.titleAlign;
-        o.titleColor = s.titleColor; o.titleSubColor = s.titleSubColor;
-        o.xAxes = new List<ChartAxis>();
-        for (int xi = 0; xi < s.xAxes.Count; xi = xi + 1) { o.xAxes.Add(s.xAxes[xi].Clone()); }
-        o.datasets = new List<ChartJsonDataset>();
-        for (int dsi = 0; dsi < s.datasets.Count; dsi = dsi + 1) { o.datasets.Add(s.datasets[dsi]); }
-        o.visualMaps = new List<ChartVisualMap>();
-        for (int vmi = 0; vmi < s.visualMaps.Count; vmi = vmi + 1) {
-            o.visualMaps.Add(s.visualMaps[vmi].Clone());
-        }
-        o.titles = new List<ChartTitleSpec>();
-        for (int tmi = 0; tmi < s.titles.Count; tmi = tmi + 1) { o.titles.Add(s.titles[tmi]); }
-        o.grids = new List<ChartGridSpec>();
-        for (int gmi = 0; gmi < s.grids.Count; gmi = gmi + 1) { o.grids.Add(s.grids[gmi]); }
-        o.markAreas = new List<ChartMarkArea>();
-        for (int mai = 0; mai < s.markAreas.Count; mai = mai + 1) { o.markAreas.Add(s.markAreas[mai]); }
-        o.yAxes = new List<ChartAxis>();
-        for (int yi = 0; yi < s.yAxes.Count; yi = yi + 1) { o.yAxes.Add(s.yAxes[yi].Clone()); }
+        ChartOption o = this.source.CopyFrame();
         o.series = this.MaterializeSeries();
-        // N7：drawOption.series 已是 ZOrder 绘制序；把声明序快照交给
-        // 它（同引用），LeadSeries/DispatchKind 据此仍读声明序首条。
-        List<int> zord = new List<int>();
-        ChartView.ZOrder(s, zord);
+        // Invert drawOrder: a cyclic permutation is not its own inverse.
         List<ChartSeries> decl = new List<ChartSeries>();
-        for (int zi = 0; zi < zord.Count; zi = zi + 1) {
-            decl.Add(o.series[zord[zi]]);
+        for (int i = 0; i < o.series.Count; i = i + 1) { decl.Add(null); }
+        for (int i = 0; i < this.drawOrder.Count; i = i + 1) {
+            decl[this.drawOrder[i]] = o.series[i];
         }
         o.declOrder = decl;
-        o.defaultType = s.defaultType;        o.showLegend = s.showLegend; o.showTooltip = s.showTooltip;
-        o.tooltipTrigger = s.tooltipTrigger;
-        o.toolboxShow = s.toolboxShow;
-        o.toolboxDataView = s.toolboxDataView; o.toolboxMagicLine = s.toolboxMagicLine;
-        o.toolboxMagicBar = s.toolboxMagicBar; o.toolboxRestore = s.toolboxRestore;
-        o.toolboxSave = s.toolboxSave; o.toolboxZoom = s.toolboxZoom;
-        o.roam = s.roam; o.roamWheelMode = s.roamWheelMode; o.mapSelect = s.mapSelect;
-        o.showGrid = s.showGrid; o.showValues = s.showValues;
-        o.animate = animate; o.smooth = s.smooth; o.gradient = s.gradient;
-        o.rounded = s.rounded; o.animMs = s.animMs; o.donutPct = s.donutPct;
-        o.gaugeMax = s.gaugeMax; o.pieLabels = s.pieLabels; o.pieRings = s.pieRings;
-        o.radarIndicators = new List<RadarIndicator>();
-        if (s.radarIndicators != null) {
-            for (int ri = 0; ri < s.radarIndicators.Count; ri = ri + 1) {
-                o.radarIndicators.Add(new RadarIndicator(s.radarIndicators[ri].name, s.radarIndicators[ri].max));
-            }
-        }
-        o.radarMax = new List<int>();
-        for (int ri = 0; ri < s.radarMax.Count; ri = ri + 1) { o.radarMax.Add(s.radarMax[ri]); }
-        o.radarNames = new List<string>();
-        for (int ri = 0; ri < s.radarNames.Count; ri = ri + 1) { o.radarNames.Add(s.radarNames[ri]); }
-        o.radarScaled = s.radarScaled;
-        o.radarNameColor = s.radarNameColor;
-        o.polars = new List<RadarPolar>();
-        for (int ri = 0; ri < s.polars.Count; ri = ri + 1) {
-            o.polars.Add(s.polars[ri].Clone());
-        }
-        // 极坐标轴（angleAxis/radiusAxis）：DrawPolarCoord 从
-        // drawOption 读——漏拷会让 startAngle/类目全部回落默认。
-        o.angleAxes = new List<PolarAxisSpec>();
-        for (int ri2 = 0; ri2 < s.angleAxes.Count; ri2 = ri2 + 1) {
-            o.angleAxes.Add(s.angleAxes[ri2].Clone());
-        }
-        o.radiusAxes = new List<PolarAxisSpec>();
-        for (int ri3 = 0; ri3 < s.radiusAxes.Count; ri3 = ri3 + 1) {
-            o.radiusAxes.Add(s.radiusAxes[ri3].Clone());
-        }
-        // geo 组件必须随 drawOption 一起过河：渲染期的分派
-        // （ChartView.Render 的 pointerKind、RenderOnce 的 kind）
-        // 读的都是 drawOption 而非 source，漏拷等于 geos.Count==0，
-        // `DispatchKind` 的 geo 组件级判定永不命中，geo 形态的
-        // series[0] 的 scatter 分发，底图与全部投影点一起丢。
-        o.geos = new List<ChartGeo>();
-        for (int gci2 = 0; gci2 < s.geos.Count; gci2 = gci2 + 1) {
-            o.geos.Add(s.geos[gci2].Clone());
-        }
-        // matrix 组件同理必须随 drawOption 过河：DispatchKind 的
-        // 组件级判定读 drawOption（与 geo 同款）。漏拷等于组件缺席，
-        // 矩阵形态会按 heatmap 落进直角热力图车道。规格解析后不可
-        // 变，只读共享（zooms 同款定式）。
-        o.matrix = s.matrix;
-        o.zoom = s.zoom; o.markLine = s.markLine;
-        o.markPoint = s.markPoint; o.markLabel = s.markLabel; o.markLo = s.markLo;
-        o.markHi = s.markHi; o.gridLeft = s.gridLeft; o.gridRight = s.gridRight;
-        o.gridTop = s.gridTop; o.gridBottom = s.gridBottom;
-        o.gridLeftPct = s.gridLeftPct; o.gridRightPct = s.gridRightPct;
-        o.gridTopPct = s.gridTopPct; o.gridBottomPct = s.gridBottomPct;
-        o.containLabel = s.containLabel;
-        // A16 盒模型原始参数必须随帧拷贝——FrameOption 是渲染路径的
-        // 唯一 option 形态，漏拷会让 BuildAxesR 的 GridRawRect 拿到
-        // null 而整图退回缺省 15%/65%/10%/80% 矩形（line-stack/
-        // line-aqi 等全部声明 grid 的 demo 边距全错的根因）。
-        o.gridLeftRaw = s.gridLeftRaw != null ? s.gridLeftRaw.Clone() : null;
-        o.gridRightRaw = s.gridRightRaw != null ? s.gridRightRaw.Clone() : null;
-        o.gridTopRaw = s.gridTopRaw != null ? s.gridTopRaw.Clone() : null;
-        o.gridBottomRaw = s.gridBottomRaw != null ? s.gridBottomRaw.Clone() : null;
-        o.gridWidthRaw = s.gridWidthRaw != null ? s.gridWidthRaw.Clone() : null;
-        o.gridHeightRaw = s.gridHeightRaw != null ? s.gridHeightRaw.Clone() : null;
-        o.obLeftRaw = s.obLeftRaw != null ? s.obLeftRaw.Clone() : null;
-        o.obRightRaw = s.obRightRaw != null ? s.obRightRaw.Clone() : null;
-        o.obTopRaw = s.obTopRaw != null ? s.obTopRaw.Clone() : null;
-        o.obBottomRaw = s.obBottomRaw != null ? s.obBottomRaw.Clone() : null;
-        o.obDeclared = s.obDeclared;
-        o.zoomStart = s.zoomStart; o.zoomEnd = s.zoomEnd;
-        // N2：zooms 组件只读共享——条几何/阴影/手柄样式渲染期读它。
-        o.zooms = s.zooms; o.zoomX = s.zoomX; o.zoomY = s.zoomY;
-        o.windowStart = this.windowStart; o.windowEnd = this.windowEnd;
-        o.backgroundColor = s.backgroundColor; o.backgroundGradStops = s.backgroundGradStops; o.iwid = this.stateWid;
-        o.connectGroup = s.connectGroup;
-        o.rampColors = new List<int>();
-        for (int ci = 0; ci < s.rampColors.Count; ci = ci + 1) { o.rampColors.Add(s.rampColors[ci]); }
-        o.rampLo = s.rampLo; o.rampHi = s.rampHi;
-        o.radarShape = s.radarShape; o.radarSplitArea = s.radarSplitArea;
-        o.legendOrient = s.legendOrient; o.legendSelectedMode = s.legendSelectedMode;
-        o.legendTextColor = s.legendTextColor;
-        o.legendX = s.legendX;
-        o.legendLeft = s.legendLeft; o.legendRight = s.legendRight;
-        o.legendTop = s.legendTop; o.legendBottom = s.legendBottom;
-        o.legendHasLeft = s.legendHasLeft; o.legendHasRight = s.legendHasRight;
-        o.legendHasTop = s.legendHasTop; o.legendHasBottom = s.legendHasBottom;
-        o.legendLeftPx = s.legendLeftPx; o.legendRightPx = s.legendRightPx;
-        o.legendTopPx = s.legendTopPx; o.legendBottomPx = s.legendBottomPx;
-        o.legendBoxW = s.legendBoxW; o.legendBoxH = s.legendBoxH;
-        o.legendFormatter = s.legendFormatter;
-        o.dataRangeShow = s.dataRangeShow; o.dataRangeLo = s.dataRangeLo;
-        o.dataRangeHi = s.dataRangeHi; o.dataRangeCalculable = s.dataRangeCalculable;
-        o.dataRangeHoverLink = s.dataRangeHoverLink;
-        o.dataRangeSplit = s.dataRangeSplit;
-        o.dataRangeList = new List<ChartRangeSplit>();
-        for (int di = 0; di < s.dataRangeList.Count; di = di + 1) {
-            o.dataRangeList.Add(s.dataRangeList[di].Clone());
-        }
+        o.animate = animate;
+        o.windowStart = this.windowStart;
+        o.windowEnd = this.windowEnd;
+        o.iwid = this.stateWid;
         return o;
     }
 }

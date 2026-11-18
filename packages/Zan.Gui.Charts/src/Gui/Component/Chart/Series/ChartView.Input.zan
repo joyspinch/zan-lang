@@ -1,0 +1,400 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Component.Chart;
+
+// Routed input and retained chrome children for ChartView. Renderers may read
+// the pointer snapshot while painting, but never poll App's immediate mouse or
+// hit-tester state. All mutations originate in these routed event methods.
+public partial class ChartView {
+    int pointerX;
+    int pointerY;
+    bool pointerInside;
+    bool pointerBody;
+    List<ChartActionControl> actionControls;
+    int actionFrame;
+    internal ChartToolboxLayout toolboxLayout;
+    AppLoopRegistration preparationRegistration;
+
+    void InitRoutedInput() {
+        this.pointerX = 0 - 1000000;
+        this.pointerY = 0 - 1000000;
+        this.pointerInside = false;
+        this.actionControls = new List<ChartActionControl>();
+        this.actionFrame = 0;
+    }
+
+    public override string Kind() { return "ChartView"; }
+    public override string StyleType() { return "chart"; }
+
+    public override void OnMeasure(App app) {
+        if (app == null) { return; }
+        ChartTheme.EnsureDefault(app);
+        this.prefW = app.Scale(320);
+        this.prefH = app.Scale(200);
+        this.EnsurePreparation(app);
+    }
+
+    public override void OnPaint(App app) {
+        app = this.ResolveApp(app);
+        if (app != null) { this.RenderFrame(app, this.bx, this.by, this.bw, this.bh); }
+    }
+
+    void SetRoutedPointer(int x, int y, bool inside) {
+        this.SetRoutedPointer(x, y, inside, true);
+    }
+
+    void SetRoutedPointer(int x, int y, bool inside, bool body) {
+        bool changed = pointerX != x || pointerY != y || pointerInside != inside || pointerBody != body;
+        pointerX = x; pointerY = y; pointerInside = inside; pointerBody = body;
+        this.UpdatePreparedPointer(this.App);
+        if (changed) { this.Invalidate(); }
+    }
+
+    public override void OnPointerEnter(RoutedEventArgs e) {
+        base.OnPointerEnter(e);
+        if (e.originalSource == this) { this.SetRoutedPointer(e.x, e.y, true); }
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (e.originalSource == this) { this.SetRoutedPointer(e.x, e.y, true); }
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        if (e.originalSource == this) { this.SetRoutedPointer(e.x, e.y, false); }
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        this.SetRoutedPointer(e.x, e.y, false);
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        if (e.originalSource != this) { return; }
+        this.SetRoutedPointer(e.x, e.y, true);
+        this.RouteChartClick(e.x, e.y, e.isDoubleClick);
+        e.Handle();
+    }
+
+    void RouteChartClick(int x, int y, bool doubleClick) {
+        App app = this.App;
+        if (app == null || this.Status() != "ready") { return; }
+        this.pointerX = x; this.pointerY = y; this.pointerInside = true; this.pointerBody = true;
+        this.currentHit = this.PreparedHit(app, x, y);
+        ChartHit hit = ChartHit.Copy(this.currentHit);
+        this.SelectPreparedHit(app, hit);
+        ChartInteractionEvent eventArgs = hit != null
+        ? ChartView.EventFromHit(ChartEventType.Click, wid, hit)
+        : ChartView.EventAt(ChartEventType.Click, wid, x, y);
+        this.RaiseInteraction(eventArgs);
+        if (doubleClick && !disposed) {
+            this.RaiseInteraction(hit != null
+            ? ChartView.EventFromHit(ChartEventType.DoubleClick, wid, hit)
+            : ChartView.EventAt(ChartEventType.DoubleClick, wid, x, y));
+        }
+        this.PrepareChrome(app);
+        this.Invalidate();
+    }
+
+    public static int PointerX(App app) {
+        return ChartView.activeEventView != null && ChartView.activeEventView.pointerInside
+        && ChartView.activeEventView.pointerBody
+        ? ChartView.activeEventView.pointerX : 0 - 1000000;
+    }
+
+    public static int PointerY(App app) {
+        return ChartView.activeEventView != null && ChartView.activeEventView.pointerInside
+        && ChartView.activeEventView.pointerBody
+        ? ChartView.activeEventView.pointerY : 0 - 1000000;
+    }
+
+    public static bool PointerInside(App app) {
+        return ChartView.activeEventView != null && ChartView.activeEventView.pointerInside
+        && ChartView.activeEventView.pointerBody;
+    }
+
+    void BeginActionFrame() {
+        this.actionFrame = this.actionFrame + 1;
+        if (this.actionControls == null) { this.actionControls = new List<ChartActionControl>(); }
+    }
+
+    ChartActionControl BindAction(int kind, int index, int x, int y, int w, int h,
+    string tip) {
+        ChartActionControl found = null;
+        for (int i = 0; i < this.actionControls.Count; i = i + 1) {
+            ChartActionControl item = this.actionControls[i];
+            if (item.action == kind && item.index == index) { found = item; break; }
+        }
+        if (found == null) {
+            found = new ChartActionControl(this, kind, index);
+            this.actionControls.Add(found);
+            this.Add(found);
+        }
+        found.stamp = this.actionFrame;
+        found.Visible = w > 0 && h > 0;
+        found.Tip = tip != null ? tip : "";
+        found.p0 = 0;
+        found.p1 = 0;
+        found.p2 = 0;
+        found.p3 = 0;
+        found.Arrange(x, y, w > 0 ? w : 0, h > 0 ? h : 0);
+        return found;
+    }
+
+    void EndActionFrame() {
+        if (this.actionControls == null) { return; }
+        for (int i = 0; i < this.actionControls.Count; i = i + 1) {
+            ChartActionControl item = this.actionControls[i];
+            if (item.stamp != this.actionFrame) { item.Visible = false; item.hot = false; }
+        }
+    }
+
+    void UpdateActionPointer(ChartActionControl action, RoutedEventArgs e) {
+        this.SetRoutedPointer(e.x, e.y, this.ContainsPoint(e.x, e.y),
+        action.action == 40 || action.action == 41);
+    }
+
+    void LeaveActionPointer(ChartActionControl action, RoutedEventArgs e) {
+        this.SetRoutedPointer(e.x, e.y, false, false);
+    }
+
+    bool ActionPointerDown(ChartActionControl action, RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null) { return false; }
+        int kind = action.action;
+        if (kind == 10 || kind == 11 || kind == 12 || kind == 20 || kind == 21) {
+            this.ActionPointerMove(action, e);
+            return true;
+        }
+        if (kind == 40 || kind == 41) {
+            ChartOption o = this.option;
+            if (o == null) { return false; }
+            if (kind == 40) {
+                app.StateSet(Chart.MapDragXKey(o.iwid), e.x);
+                app.StateSet(Chart.MapDragYKey(o.iwid), e.y);
+                app.StateSet(Chart.MapDragPanXKey(o.iwid), app.StateGet(Chart.MapPanXKey(o.iwid), 0));
+                app.StateSet(Chart.MapDragPanYKey(o.iwid), app.StateGet(Chart.MapPanYKey(o.iwid), 0));
+                app.StateSet(Chart.MapDragKey(o.iwid), 1);
+            } else {
+                app.StateSet(Chart.TreeDragXKey(o.iwid), e.x);
+                app.StateSet(Chart.TreeDragYKey(o.iwid), e.y);
+                app.StateSet(Chart.TreeDragPanXKey(o.iwid), app.StateGet(Chart.TreePanXKey(o.iwid), 0));
+                app.StateSet(Chart.TreeDragPanYKey(o.iwid), app.StateGet(Chart.TreePanYKey(o.iwid), 0));
+                app.StateSet(Chart.TreeDragMovedKey(o.iwid), 0);
+                app.StateSet(Chart.TreeDraggingKey(o.iwid), 1);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void ActionPointerMove(ChartActionControl action, RoutedEventArgs e) {
+        App app = this.App;
+        ChartOption o = this.option;
+        if (app == null || o == null) { return; }
+        int kind = action.action;
+        if (kind >= 10 && kind <= 12) {
+            if (action.p1 <= 0) { return; }
+            int mx = (e.x - action.p0) * 1000 / action.p1;
+            if (mx < 0) { mx = 0; }
+            if (mx > 1000) { mx = 1000; }
+            int lo = app.StateGet(Chart.ZoomLoKey(o.iwid), o.zoomStart * 10);
+            int hi = app.StateGet(Chart.ZoomHiKey(o.iwid), o.zoomEnd * 10);
+            int oldLo = lo; int oldHi = hi;
+            int gap = action.p2;
+            if (kind == 10 && action.p3 == 0) {
+                lo = mx;
+                if (lo > hi - gap) { lo = hi - gap; }
+                if (lo < 0) { lo = 0; }
+            } else if (kind == 11 && action.p3 == 0) {
+                hi = mx;
+                if (hi < lo + gap) { hi = lo + gap; }
+                if (hi > 1000) { hi = 1000; }
+            } else {
+                int width = hi - lo;
+                lo = mx - width / 2;
+                if (lo < 0) { lo = 0; }
+                if (lo + width > 1000) { lo = 1000 - width; }
+                hi = lo + width;
+            }
+            app.StateSet(Chart.ZoomLoKey(o.iwid), lo);
+            app.StateSet(Chart.ZoomHiKey(o.iwid), hi);
+            if (oldLo != lo || oldHi != hi) { this.RaiseZoomChange(app, lo, hi, e.x, e.y); }
+            this.PrepareChrome(app);
+            this.Invalidate();
+            return;
+        }
+        if (kind == 20 || kind == 21) {
+            if (action.p1 <= 0) { return; }
+            int q = (e.x - action.p0) * 1000 / action.p1;
+            if (q < 0) { q = 0; }
+            if (q > 1000) { q = 1000; }
+            int lo = app.StateGet(Chart.DRangeLoKey(o.iwid), 0);
+            int hi = app.StateGet(Chart.DRangeHiKey(o.iwid), 1000);
+            if (kind == 20) {
+                lo = q;
+                if (lo > hi - 20) { lo = hi - 20; }
+                if (lo < 0) { lo = 0; }
+            } else {
+                hi = q;
+                if (hi < lo + 20) { hi = lo + 20; }
+                if (hi > 1000) { hi = 1000; }
+            }
+            app.StateSet(Chart.DRangeLoKey(o.iwid), lo);
+            app.StateSet(Chart.DRangeHiKey(o.iwid), hi);
+            ChartInteractionEvent de = ChartInteractionEvent.Of(ChartEventType.DataRange, o.iwid);
+            de.zoomStart = lo;
+            de.zoomEnd = hi;
+            de.x = e.x;
+            de.y = e.y;
+            this.RaiseInteraction(de);
+            this.Invalidate();
+            return;
+        }
+        if (kind == 40 && app.StateGet(Chart.MapDragKey(o.iwid), 0) == 1) {
+            int dx = e.x - app.StateGet(Chart.MapDragXKey(o.iwid), e.x);
+            int dy = e.y - app.StateGet(Chart.MapDragYKey(o.iwid), e.y);
+            int panX = app.StateGet(Chart.MapDragPanXKey(o.iwid), 0) - dx;
+            int panY = app.StateGet(Chart.MapDragPanYKey(o.iwid), 0) - dy;
+            app.StateSet(Chart.MapPanXKey(o.iwid), panX);
+            app.StateSet(Chart.MapPanYKey(o.iwid), panY);
+            ChartInteractionEvent panEvent = ChartInteractionEvent.Of(ChartEventType.MapRoam, o.iwid);
+            panEvent.x = panX;
+            panEvent.y = panY;
+            this.RaiseInteraction(panEvent);
+            this.Invalidate();
+            return;
+        }
+        if (kind == 41 && app.StateGet(Chart.TreeDraggingKey(o.iwid), 0) == 1) {
+            int dx = e.x - app.StateGet(Chart.TreeDragXKey(o.iwid), e.x);
+            int dy = e.y - app.StateGet(Chart.TreeDragYKey(o.iwid), e.y);
+            if (dx != 0 || dy != 0) { app.StateSet(Chart.TreeDragMovedKey(o.iwid), 1); }
+            int panX = app.StateGet(Chart.TreeDragPanXKey(o.iwid), 0) - dx;
+            int panY = app.StateGet(Chart.TreeDragPanYKey(o.iwid), 0) - dy;
+            app.StateSet(Chart.TreePanXKey(o.iwid), panX);
+            app.StateSet(Chart.TreePanYKey(o.iwid), panY);
+            this.Invalidate();
+        }
+    }
+
+    void ActionPointerUp(ChartActionControl action, RoutedEventArgs e) {
+        App app = this.App;
+        ChartOption o = this.option;
+        if (app == null || o == null) { return; }
+        if (action.action == 40) { app.StateSet(Chart.MapDragKey(o.iwid), 0); }
+        if (action.action == 41) {
+            app.StateSet(Chart.TreeDraggingKey(o.iwid), 0);
+            app.StateSet(Chart.TreeDragMovedKey(o.iwid), 0);
+        }
+    }
+
+    void ActionClick(ChartActionControl action, RoutedEventArgs e) {
+        ChartView previous = ChartView.activeEventView;
+        ChartView.activeEventView = this;
+        this.DispatchActionClick(action, e);
+        ChartView.activeEventView = previous;
+        this.PrepareChrome(this.App);
+        this.Invalidate();
+    }
+
+    void DispatchActionClick(ChartActionControl action, RoutedEventArgs e) {
+        App app = this.App;
+        ChartOption o = this.option;
+        if (app == null || o == null) { return; }
+        int kind = action.action;
+        if (kind == 1) {
+            int magic = app.StateGet(Chart.TbMagicKey(this.wid), 0);
+            int zOn = app.StateGet(Chart.TbZoomKey(this.wid), 0);
+            ChartToolbox.Click(app, action.index, this.wid, o,
+            this.bx, this.by, this.bw, this.bh, magic, zOn);
+            return;
+        }
+        if (kind == 2) {
+            int si = action.index;
+            if (si < 0 || si >= o.series.Count) { return; }
+            bool hid = app.StateGet(Chart.LegendKey(o.iwid, si), o.series[si].hidden ? 1 : 0) == 1;
+            hid = Chart.LegendClick(app, o.iwid, o.series, si, hid, action.p0);
+            for (int i = 0; i < o.series.Count; i = i + 1) {
+                if (i != si && o.series[i].name == o.series[si].name) {
+                    app.StateSet(Chart.LegendKey(o.iwid, i), hid ? 1 : 0);
+                }
+            }
+            return;
+        }
+        if (kind == 3) {
+            if (action.p0 == 0) { return; }
+            int old = app.StateGet(action.p0, action.p1);
+            app.StateSet(action.p0, old == 0 ? 1 : 0);
+            this.Invalidate();
+            return;
+        }
+        if (kind == 23) {
+            int nextOff = app.StateGet(Chart.DRangeBandKey(o.iwid, action.index), 0) == 0 ? 1 : 0;
+            app.StateSet(Chart.DRangeBandKey(o.iwid, action.index), nextOff);
+            ChartInteractionEvent splitEvent = ChartInteractionEvent.Of(ChartEventType.DataRange, o.iwid);
+            splitEvent.dataIndex = action.index;
+            splitEvent.selected = nextOff == 0;
+            this.RaiseInteraction(splitEvent);
+            this.Invalidate();
+            return;
+        }
+        if (kind == 30) {
+            Clipboard.SetText(ChartView.OptionTsv(o));
+            return;
+        }
+        if (kind == 31) {
+            app.StateSet(Chart.TbViewKey(this.wid), 0);
+            this.Invalidate();
+            return;
+        }
+        if (kind == 40 || kind == 41) {
+            this.RouteChartClick(e.x, e.y, e.isDoubleClick);
+        }
+    }
+
+    static int WheelTicksDelta(int delta) {
+        if (delta == 0) { return 0; }
+        int ticks = delta / 120;
+        if (ticks == 0) { ticks = delta > 0 ? 1 : 0 - 1; }
+        if (ticks > 8) { ticks = 8; }
+        if (ticks < 0 - 8) { ticks = 0 - 8; }
+        return ticks;
+    }
+
+    bool ActionWheel(ChartActionControl action, RoutedEventArgs e) {
+        App app = this.App;
+        ChartOption o = this.option;
+        if (app == null || o == null || e.delta == 0) { return false; }
+        int ticks = ChartView.WheelTicksDelta(e.delta);
+        if (action.action == 40) {
+            if (!o.roam || ChartKinds.RoamWheelModeSanitize(o.roamWheelMode) != "zoom") { return false; }
+            int zoom = app.StateGet(Chart.MapZoomKey(o.iwid), 100);
+            int next = ChartView.ZoomByTicks(zoom, ticks, 40, 280);
+            if (next == zoom) { return true; }
+            app.StateSet(Chart.MapZoomKey(o.iwid), next);
+            ChartInteractionEvent roamEvent = ChartInteractionEvent.Of(ChartEventType.MapRoam, o.iwid);
+            roamEvent.value = next;
+            roamEvent.x = e.x;
+            roamEvent.y = e.y;
+            this.RaiseInteraction(roamEvent);
+            this.Invalidate();
+            return true;
+        }
+        if (action.action == 41 && ChartView.TreeRoamEnabled(o.roam)) {
+            int zoom = app.StateGet(Chart.TreeZoomKey(o.iwid), 100);
+            if (zoom <= 0) { zoom = 100; }
+            int next = ChartView.ZoomByTicks(zoom, ticks, 20, 400);
+            if (next == zoom) { return true; }
+            int panX = (e.x - action.bx + app.StateGet(Chart.TreePanXKey(o.iwid), 0)) * next / zoom - (e.x - action.bx);
+            int panY = (e.y - action.by + app.StateGet(Chart.TreePanYKey(o.iwid), 0)) * next / zoom - (e.y - action.by);
+            app.StateSet(Chart.TreeZoomKey(o.iwid), next);
+            app.StateSet(Chart.TreePanXKey(o.iwid), panX);
+            app.StateSet(Chart.TreePanYKey(o.iwid), panY);
+            this.Invalidate();
+            return true;
+        }
+        return false;
+    }
+}

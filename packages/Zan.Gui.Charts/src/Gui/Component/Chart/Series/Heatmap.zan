@@ -34,7 +34,7 @@ public partial class ChartView {
     // DrawHeatmapGridCore（直角），再画悬停覆盖层（主体可被缓存，
     // 命中提示始终实时）。
     public static void DrawHeatmap(App app, int x, int y, int w, int h,
-                            ChartOption o, int g) {
+    ChartOption o, int g) {
         if (ChartView.HeatmapGridDetect(o)) {
             ChartView.DrawHeatmapGridCore(app, x, y, w, h, o, g);
             ChartView.HeatmapGridHover(app, x, y, w, h, o);
@@ -97,20 +97,17 @@ public partial class ChartView {
     // 以便 RenderCached 缓存，指针反馈在
     // 缓存命中后重绘于其上。
     public static void DrawHeatmapCore(App app, int x, int y, int w, int h,
-                                ChartOption o, int g) {
+    ChartOption o, int g) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
         int top = ChartView.PanelHead(app, x, y, w, h, o.title);
 
-        int rows = o.series.Count;
-        if (rows < 1) { return; }
-        int cols = 0;
-        int r = 0;
-        for (; r < rows; r = r + 1) {
-            if (o.series[r].Count() > cols) { cols = o.series[r].Count(); }
-        }
-        if (cols < 1) { return; }
+        ChartHeatmapGeometry geometry = ChartView.PreparedHeatmap(app, o, x, y, w, h);
+        if (geometry == null) { return; }
+        HeatGridGeom grid = geometry.grid;
+        if (grid == null || grid.rows < 1 || grid.cols < 1) { return; }
+        int rows = grid.rows; int cols = grid.cols; int r = 0;
 
         // 颜色渐变带的全局最小/最大值。
         int lo = 0;
@@ -145,16 +142,14 @@ public partial class ChartView {
             if (span < 1) { span = 1; }
         }
 
-        int rowLabelW = app.Scale(56);
-        int colHeadH = app.Scale(16);
-        int gridX = x + pad + rowLabelW;
-        int gridY = top + colHeadH;
-        int gridW = w - pad * 2 - rowLabelW;
-        int gridH = (y + h - pad) - gridY;
+        int rowLabelW = geometry.rowLabelW;
+        int colHeadH = geometry.colHeadH;
+        int gridX = grid.gx; int gridY = grid.gy;
+        int gridW = grid.gw; int gridH = grid.gh;
         int cellW = ChartView.HeatmapCellSize(gridW, 0, cols);
         int cellH = ChartView.HeatmapCellSize(gridH, 0, rows);
         if (cellW < 1 || cellH < 1) { return; }
-        int cellGap = app.Scale(2);
+        int cellGap = geometry.gap;
 
         // 列表头（类别标签）；网格过密时跳过，
         // 单元格太窄放不下文字（96 列热力图没有空间）。
@@ -165,9 +160,9 @@ public partial class ChartView {
                     int colX = gridX + ChartView.HeatmapCellStart(gridW, ci, cols);
                     int colW = ChartView.HeatmapCellSize(gridW, ci, cols);
                     c.DrawTextCentered(colX, top, colW, colHeadH,
-                        labels[ci],
-                        Style.Part(app, "chart", "axis", "", "", "", Style.SNormal()).FgOr(0),
-                        ChartFonts.SeriesLabel(app));
+                    labels[ci],
+                    Style.Part(app, "chart", "axis", "", "", "", Style.SNormal()).FgOr(0),
+                    ChartFonts.SeriesLabel(app));
                 }
             }
         }
@@ -186,9 +181,9 @@ public partial class ChartView {
             int rowH = ChartView.HeatmapCellSize(gridH, r, rows);
             if (rowH >= app.Scale(12)) {
                 c.DrawText(x + pad, Canvas.CenterTextY(rowY, rowH, ChartFonts.AxisLabel(app)),
-                    o.series[r].name,
-                    Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
-                    ChartFonts.SeriesLabel(app));
+                o.series[r].name,
+                Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
+                ChartFonts.SeriesLabel(app));
             }
             for (int cc = 0; cc < cols; cc = cc + 1) {
                 // 稀疏行的尾部不是零值数据：保持空白，且与
@@ -204,8 +199,8 @@ public partial class ChartView {
                     cellCol = ChartColor.RampAt(o.rampColors, inten);
                 } else {
                     cellCol = App.LerpColor(
-                        Style.Part(app, "chart", "cell", "", "", "", Style.SNormal()).BgOr(0),
-                        o.series[r].color, inten);
+                    Style.Part(app, "chart", "cell", "", "", "", Style.SNormal()).BgOr(0),
+                    o.series[r].color, inten);
                 }
                 int bx = gridX + ChartView.HeatmapCellStart(gridW, cc, cols);
                 int by = rowY;
@@ -214,7 +209,7 @@ public partial class ChartView {
                 if (drawW < 1) { drawW = 1; }
                 if (drawH < 1) { drawH = 1; }
                 c.FillRoundRect(bx, by, drawW, drawH,
-                    t.borderRadiusSmall, cellCol);
+                t.borderRadiusSmall, cellCol);
             }
             r = r + 1;
         }
@@ -223,105 +218,44 @@ public partial class ChartView {
     // 热力图悬停覆盖层：高亮指针下的单元格并
     // 显示其值。在 DrawHeatmapCore（或 RenderCached
     // 恢复）之后绘制，缓存主体在鼠标移动时无需重绘。
-    public static void HeatmapHover(App app, int x, int y, int w, int h, ChartOption o) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int pad = t.paddingMedium;
-        // 仅做布局：这里绝不调用 PanelHead（它会重绘整个面板
-        // 背景盖住色块）。主体已由 Core 绘制；顶部直接复用
-        // HeadBandBottom，确保标题/工具箱与主体使用同一边界。
-        int top = Chart.HeadBandBottom(app, y, o.title);
-        int rows = o.series.Count;
-        if (rows < 1) { return; }
-        int cols = 0;
-        for (int r = 0; r < rows; r = r + 1) {
-            if (o.series[r].Count() > cols) { cols = o.series[r].Count(); }
-        }
-        if (cols < 1) { return; }
-        int rowLabelW = app.Scale(56);
-        int colHeadH = app.Scale(16);
-        int gridX = x + pad + rowLabelW;
-        int gridY = top + colHeadH;
-        int gridW = w - pad * 2 - rowLabelW;
-        int gridH = (y + h - pad) - gridY;
-        int cellW = ChartView.HeatmapCellSize(gridW, 0, cols);
-        int cellH = ChartView.HeatmapCellSize(gridH, 0, rows);
-        if (cellW < 1 || cellH < 1) { return; }
-        int cellGap = app.Scale(2);
-
-        int mx = app.mouseX;
-        int my = app.mouseY;
-        // 色带模式下的取色域（与主体一致：显式边界或数据范围）。
-        bool ramp = o.rampColors != null && o.rampColors.Count >= 2;
-        int dLo2 = 0;
-        int dHi2 = 0;
-        if (ramp) {
-            int lo2 = 0;
-            int hi2 = 0;
-            bool rangeSeen2 = false;
-            for (int r3 = 0; r3 < rows; r3 = r3 + 1) {
-                if (o.series[r3].hidden) { continue; }
-                for (int cc3 = 0; cc3 < o.series[r3].Count(); cc3 = cc3 + 1) {
-                    int v3 = o.series[r3].Value(cc3);
-                    if (!rangeSeen2) { lo2 = v3; hi2 = v3; rangeSeen2 = true; }
-                    else {
-                        if (v3 < lo2) { lo2 = v3; }
-                        if (v3 > hi2) { hi2 = v3; }
-                    }
-                }
-            }
-            dLo2 = lo2;
-            dHi2 = hi2;
-            if (o.rampLo != ChartOption.Auto()) { dLo2 = o.rampLo; }
-            if (o.rampHi != ChartOption.Auto()) { dHi2 = o.rampHi; }
-        }
-        int span2 = dHi2 - dLo2;
-        if (span2 < 1) { span2 = 1; }
-        if (mx >= gridX && mx < gridX + gridW
-            && my >= gridY && my < gridY + gridH) {
-            int cc2 = ChartView.HeatmapIndexAt(mx - gridX, gridW, cols);
-            int rr2 = ChartView.HeatmapIndexAt(my - gridY, gridH, rows);
-            int bx = gridX + ChartView.HeatmapCellStart(gridW, cc2, cols);
-            int by = gridY + ChartView.HeatmapCellStart(gridH, rr2, rows);
-            int drawW = ChartView.HeatmapCellSize(gridW, cc2, cols) - cellGap;
-            int drawH = ChartView.HeatmapCellSize(gridH, rr2, rows) - cellGap;
-            if (drawW < 1) { drawW = 1; }
-            if (drawH < 1) { drawH = 1; }
-            if (cc2 >= 0 && cc2 < cols && rr2 >= 0 && rr2 < rows) {
-                bool inCell = mx >= bx && mx < bx + drawW
-                    && my >= by && my < by + drawH;
-                ChartSeries hs = o.series[rr2];
-                // 缺失列、隐藏行和 cellGap 都不是可见数据图元。
-                if (inCell && !hs.hidden && cc2 < hs.Count()) {
-                    c.DrawRect(bx, by, drawW, drawH,
-                        Style.Part(app, "chart", "cell", "", "", "", Style.SNormal()).BorderOr(0), 1);
-                    int v2 = hs.Value(cc2);
-                    string lbl = "";
-                    List<string> labels = o.XCategories();
-                    if (cc2 < labels.Count) { lbl = labels[cc2]; }
-                    if (lbl.Length == 0) { lbl = "#" + Convert.ToString(cc2 + 1); }
-                    ChartHit hh = ChartHit.Of(ChartElementType.HeatmapCell,
-                        rr2, hs.name, cc2, lbl, v2, bx, by);
-                    hh.numberValueSet = cc2 < hs.data.Count && hs.data[cc2].numberSet;
-                    if (hh.numberValueSet) { hh.numberValue = hs.data[cc2].number; }
-                    ChartView.OfferActiveHit(hh);
-                    int chip = hs.color;
-                    if (ramp) {
-                        int ti = (v2 - dLo2) * 1000 / span2;
-                        if (ti < 0) { ti = 0; }
-                        if (ti > 1000) { ti = 1000; }
-                        chip = ChartColor.RampAt(o.rampColors, ti);
-                    }
-                    if (o.showTooltip) {
-                        List<TooltipRow> tooltipRows = new List<TooltipRow>();
-                        tooltipRows.Add(TooltipRow.Of(chip,
-                            hs.name + " · " + lbl + "  " + Convert.ToString(v2)));
-                        ChartView.TooltipCard(app, mx, my, x + w, tooltipRows);
-                    }
-                }
-            }
-        }
+    internal static ChartHeatmapGeometry PreparedHeatmap(App app, ChartOption o, int x, int y, int w, int h) {
+        ChartView view = ChartView.activeEventView;
+        ChartPreparedPanel panel = ChartView.PaintPanel(o, x, y, w, h);
+        ChartHeatmapGeometry geometry = panel != null ? panel.heatmapGeometry : null;
+        return geometry;
     }
+
+    public static void HeatmapHover(App app, int x, int y, int w, int h, ChartOption o) {
+        ChartView.DrawPreparedHeatmapHover(app, o, ChartView.PreparedHeatmap(app, o, x, y, w, h), x + w);
+    }
+
+    static void DrawPreparedHeatmapHover(App app, ChartOption o, ChartHeatmapGeometry geometry, int right) {
+        ChartView view = ChartView.activeEventView;
+        int mx = ChartView.PointerX(app); int my = ChartView.PointerY(app);
+        ChartHit hit = ChartView.PaintHit(app, ChartElementType.HeatmapCell);
+        if (hit == null || hit.elementType != ChartElementType.HeatmapCell) { return; }
+        if (geometry == null) { return; }
+        HeatGridGeom grid = geometry.grid;
+        ChartSeries series = o.series[hit.seriesIndex];
+        int col = geometry.cartesian ? series.data[hit.dataIndex].heatX : hit.dataIndex;
+        int row = geometry.cartesian ? series.data[hit.dataIndex].heatY : hit.seriesIndex;
+        int width = ChartView.HeatmapCellSize(grid.gw, col, grid.cols) - geometry.gap;
+        int height = ChartView.HeatmapCellSize(grid.gh, row, grid.rows) - geometry.gap;
+        if (width < 1) { width = 1; } if (height < 1) { height = 1; }
+        app.canvas.DrawRect(hit.pixelX, hit.pixelY, width, height,
+        Style.Part(app, "chart", "cell", "", "", "", Style.SNormal()).BorderOr(0), 1);
+        if (!o.showTooltip) { return; }
+        int chip = geometry.cartesian ? ChartView.HeatmapGridColorAt(grid, series.Number(hit.dataIndex), 1000) : series.color;
+        if (chip == 0) { chip = series.color; }
+        string text = series.name + " · " + hit.dataName + "  " + ChartView.HeatmapGridNumText(series.Number(hit.dataIndex));
+        if (geometry.cartesian) {
+            string label = row < grid.yCats.Count ? grid.yCats[row] : "#" + Convert.ToString(row + 1);
+            text = hit.dataName + " · " + label + "  " + ChartView.HeatmapGridNumText(series.Number(hit.dataIndex));
+        }
+        List<TooltipRow> rows = new List<TooltipRow>(); rows.Add(TooltipRow.Of(chip, text));
+        ChartView.TooltipCard(app, mx, my, right, rows);
+    }
+
 }
 
 public partial class ChartView {
@@ -332,14 +266,14 @@ public partial class ChartView {
     // PanelHead（会重绘面板底），悬停层传 HeadBandBottom（绝不重绘）。
     // 数据不成图（空/越界）返回 null。
     public static HeatGridGeom HeatmapGridGeomFromFacts(App app, int x, int y, int w, int h,
-                                                 ChartOption o, int top,
-                                                 int maxX, int maxY,
-                                                 double eLo, double eHi) {
+    ChartOption o, int top,
+    int maxX, int maxY,
+    double eLo, double eHi) {
         HeatGridGeom geo = HeatGridGeom.Of();
         geo.xCats = o.xAxes.Count > 0
-            ? o.xAxes[0].categories : new List<string>();
+        ? o.xAxes[0].categories : new List<string>();
         geo.yCats = o.yAxes.Count > 0
-            ? o.yAxes[0].categories : new List<string>();
+        ? o.yAxes[0].categories : new List<string>();
         if (maxX < 0 || maxY < 0) { return null; }
         geo.cols = geo.xCats.Count > 0 ? geo.xCats.Count : maxX + 1;
         geo.rows = geo.yCats.Count > 0 ? geo.yCats.Count : maxY + 1;
@@ -387,7 +321,7 @@ public partial class ChartView {
     static HeatGridGeom heatMemo;
 
     public static void HeatMemoStore(App app, ChartOption o, int x, int y, int w,
-                              int h, HeatGridGeom geo) {
+    int h, HeatGridGeom geo) {
         ChartView.heatMemoOpt = o;
         ChartView.heatMemoX = x;
         ChartView.heatMemoY = y;
@@ -398,12 +332,12 @@ public partial class ChartView {
     }
 
     public static HeatGridGeom HeatMemoLoad(App app, ChartOption o, int x, int y,
-                                     int w, int h) {
+    int w, int h) {
         if (ChartView.heatMemoOpt != o) { return null; }
         if (ChartView.heatMemo == null) { return null; }
         if (ChartView.heatMemoX != x || ChartView.heatMemoY != y
-            || ChartView.heatMemoW != w || ChartView.heatMemoH != h
-            || ChartView.heatMemoScale != app.Scale(100)) {
+        || ChartView.heatMemoW != w || ChartView.heatMemoH != h
+        || ChartView.heatMemoScale != app.Scale(100)) {
             return null;
         }
         return ChartView.heatMemo;
@@ -412,7 +346,7 @@ public partial class ChartView {
     // 数据包络 + 下标包络一趟扫（悬停层备忘 miss 时的兜底推导；
     // 核心层把同一趟与快照指纹合并，不走这里）。
     public static void HeatFactsScan(ChartOption o, out int maxX, out int maxY,
-                              out double eLo, out double eHi) {
+    out double eLo, out double eHi) {
         maxX = 0 - 1;
         maxY = 0 - 1;
         eLo = 0.0;
@@ -440,13 +374,13 @@ public partial class ChartView {
     // 量化——分片版就是连续版的阶梯化）。g 是入场渐显系数。
     public static int HeatmapGridColorAt(HeatGridGeom geo, double v, int g) {
         return ChartView.MatColorAt(geo.ramp, geo.dLo, geo.dHi, geo.split,
-            v, g);
+        v, g);
     }
 
     // 色带取色原语（直角与矩阵两条热力车道共用）：参数与语义同上，
     // 与具体几何类解耦。
     public static int MatColorAt(List<int> ramp, double dLo, double dHi, int split,
-                          double v, int g) {
+    double v, int g) {
         if (ramp == null || ramp.Count < 2) { return 0; }
         double span = dHi - dLo;
         if (span < 0.000001) { span = 1.0; }
@@ -496,7 +430,7 @@ public partial class ChartView {
     // hidden/label 位、色带与值域声明、主题色。g<1000（直渲入场
     // 渐显探针）不缓存，逐帧重画让渐显照常走。
     public static void DrawHeatmapGridCore(App app, int x, int y, int w, int h,
-                                    ChartOption o, int g) {
+    ChartOption o, int g) {
         Canvas c = app.canvas;
         int top = ChartView.PanelHead(app, x, y, w, h, o.title);
         // 单趟数据扫：指纹 + 包络 + 下标包络。缓存命中帧只付这一趟
@@ -513,13 +447,13 @@ public partial class ChartView {
         for (int si = 0; si < o.series.Count; si = si + 1) {
             ChartSeries s = o.series[si];
             f = (f * 31 + (s.hidden ? 1 : 0)
-                + (s.labelShowT == 1 ? 2 : 0)) % 2000000000;
+            + (s.labelShowT == 1 ? 2 : 0)) % 2000000000;
             if (s.hidden) { continue; }
             for (int di = 0; di < s.data.Count; di = di + 1) {
                 ChartData d = s.data[di];
                 if (d.heatX < 0 || d.heatY < 0 || d.gap) { continue; }
                 f = (f * 31 + d.heatX * 7 + d.heatY * 13
-                    + (int)(d.number * 1000.0) * 29) % 2000000000;
+                + (int)(d.number * 1000.0) * 29) % 2000000000;
                 if (d.heatX > maxX) { maxX = d.heatX; }
                 if (d.heatY > maxY) { maxY = d.heatY; }
                 if (!seen) { eLo = d.number; eHi = d.number; seen = true; }
@@ -533,19 +467,18 @@ public partial class ChartView {
         // 值域、主题色——主题切换/图例开关都要能踢掉快照。
         f = ChartView.VisualInputFold(f, o);
         f = (f * 31 + Style.Part(app, "chart", "axis", "", "", "",
-            Style.SNormal()).FgOr(0)) % 2000000000;
+        Style.SNormal()).FgOr(0)) % 2000000000;
         f = (f * 31 + Style.Part(app, "chart", "label", "", "", "",
-            Style.SNormal()).FgOr(0)) % 2000000000;
+        Style.SNormal()).FgOr(0)) % 2000000000;
         f = (f * 31 + Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0)) % 2000000000;
         if (maxX < 0 || maxY < 0) { return; }
         int slot = 250 + ((o.iwid % 20) + 20) % 20;
         bool cached = g >= 1000
-            && app.StateGet(Chart.CacheKey(slot), 0) == f
-            && c.RestoreRect(x, top, w, (y + h) - top, slot);
+        && app.StateGet(Chart.CacheKey(slot), 0) == f
+        && c.RestoreRect(x, top, w, (y + h) - top, slot);
         c.PushClip(x, top, w, (y + h) - top);
         if (!cached) {
-            HeatGridGeom geo = ChartView.HeatmapGridGeomFromFacts(
-                app, x, y, w, h, o, top, maxX, maxY, eLo, eHi);
+            HeatGridGeom geo = ChartView.PreparedHeatmap(app, o, x, y, w, h).grid;
             if (geo != null) {
                 ChartView.HeatMemoStore(app, o, x, y, w, h, geo);
                 ChartView.DrawHeatmapGridBody(app, o, geo, g, x, w);
@@ -558,11 +491,11 @@ public partial class ChartView {
 
     // 直角热力图的轴标签与格子绘制（快照 miss 帧执行一次）。
     public static void DrawHeatmapGridBody(App app, ChartOption o, HeatGridGeom geo,
-                                    int g, int x, int w) {
+    int g, int x, int w) {
         Canvas c = app.canvas;
         int axisFont = ChartFonts.AxisLabel(app);
         int axisColor = Style.Part(app, "chart", "axis", "", "", "",
-            Style.SNormal()).FgOr(0);
+        Style.SNormal()).FgOr(0);
 
         // 轴标签（网格下方/左侧，稀疏步长防重叠）。
         int xLabW = 0;
@@ -571,10 +504,10 @@ public partial class ChartView {
             if (lw > xLabW) { xLabW = lw; }
         }
         int xStep = ChartView.HeatmapGridStep(xLabW + app.Scale(2),
-            ChartView.HeatmapCellSize(geo.gw, 0, geo.cols));
+        ChartView.HeatmapCellSize(geo.gw, 0, geo.cols));
         int yLabH = axisFont + app.Scale(6);
         int yStep = ChartView.HeatmapGridStep(yLabH,
-            ChartView.HeatmapCellSize(geo.gh, 0, geo.rows));
+        ChartView.HeatmapCellSize(geo.gh, 0, geo.rows));
         int xStripH = axisFont + app.Scale(8);
         int xStripY = geo.gy + geo.gh + app.Scale(2);
         for (int ci = 0; ci < geo.cols; ci = ci + xStep) {
@@ -589,11 +522,11 @@ public partial class ChartView {
             int inkR = cx0 + cw0 / 2 + tw / 2;
             if (inkR > x + w - 14) {
                 c.DrawText(x + w - 14 - tw,
-                    Canvas.CenterTextY(xStripY, xStripH, axisFont),
-                    geo.xCats[ci], axisColor, axisFont);
+                Canvas.CenterTextY(xStripY, xStripH, axisFont),
+                geo.xCats[ci], axisColor, axisFont);
             } else {
                 c.DrawTextCentered(cx0, xStripY, cw0, xStripH,
-                    geo.xCats[ci], axisColor, axisFont);
+                geo.xCats[ci], axisColor, axisFont);
             }
         }
         for (int ri = 0; ri < geo.rows; ri = ri + yStep) {
@@ -603,8 +536,8 @@ public partial class ChartView {
             int rh0 = ChartView.HeatmapCellSize(geo.gh, ri, geo.rows);
             int tw = c.MeasureText(txt, axisFont);
             c.DrawText(geo.gx - app.Scale(6) - tw,
-                Canvas.CenterTextY(ry0, rh0, axisFont),
-                txt, axisColor, axisFont);
+            Canvas.CenterTextY(ry0, rh0, axisFont),
+            txt, axisColor, axisFont);
         }
 
         // 逐格落位（"-" 与缺失格留空；多系列后声明覆盖先声明，
@@ -640,7 +573,7 @@ public partial class ChartView {
         }
         bool useRamp = geo.ramp != null && geo.ramp.Count >= 2;
         int labelFg = Style.Part(app, "chart", "label", "", "", "",
-            Style.SNormal()).FgOr(0);
+        Style.SNormal()).FgOr(0);
         for (int ri = 0; ri < geo.rows; ri = ri + 1) {
             int by = geo.gy + ChartView.HeatmapCellStart(geo.gh, ri, geo.rows);
             int bh = ChartView.HeatmapCellSize(geo.gh, ri, geo.rows);
@@ -653,16 +586,16 @@ public partial class ChartView {
                 ChartSeries s = o.series[cellSer[slot]];
                 ChartData d = s.data[cellIdx[slot]];
                 int col = useRamp ? ChartView.HeatmapGridColorAt(geo, d.number, g)
-                                  : s.color;
+                : s.color;
                 int bx = geo.gx + ChartView.HeatmapCellStart(geo.gw, ci, geo.cols);
                 c.FillRect(bx, by, bw, bh, col);
                 // 逐格数值标签（官方 heatmap-cartesian 的 label.show）：
                 // 格子放得下才画，large 族自动跳过。
                 if (s.labelShowT == 1 && bw >= app.Scale(18)
-                    && bh >= app.Scale(12)) {
+                && bh >= app.Scale(12)) {
                     c.DrawTextCentered(bx, by, bw, bh,
-                        ChartView.HeatmapGridNumText(d.number),
-                        labelFg, ChartFonts.SeriesLabel(app));
+                    ChartView.HeatmapGridNumText(d.number),
+                    labelFg, ChartFonts.SeriesLabel(app));
                 }
             }
         }
@@ -672,70 +605,7 @@ public partial class ChartView {
     // 值"。几何从核心层的快照备忘复用（miss 才现算）；指针不在
     // 本图面板内直接早退——悬停层每帧都会跑，几何推导与数据扫描
     // 不能在这里付。
-    public static void HeatmapGridHover(App app, int x, int y, int w, int h,
-                                 ChartOption o) {
-        int mx = app.mouseX;
-        int my = app.mouseY;
-        if (mx < x || mx >= x + w || my < y || my >= y + h) { return; }
-        Canvas c = app.canvas;
-        HeatGridGeom geo = ChartView.HeatMemoLoad(app, o, x, y, w, h);
-        if (geo == null) {
-            int top = Chart.HeadBandBottom(app, y, o.title);
-            int maxX = 0 - 1;
-            int maxY = 0 - 1;
-            double eLo = 0.0;
-            double eHi = 0.0;
-            ChartView.HeatFactsScan(o, out maxX, out maxY, out eLo, out eHi);
-            geo = ChartView.HeatmapGridGeomFromFacts(app, x, y, w, h, o,
-                top, maxX, maxY, eLo, eHi);
-            if (geo == null) { return; }
-            ChartView.HeatMemoStore(app, o, x, y, w, h, geo);
-        }
-        if (mx < geo.gx || mx >= geo.gx + geo.gw
-            || my < geo.gy || my >= geo.gy + geo.gh) { return; }
-        int ci = ChartView.HeatmapIndexAt(mx - geo.gx, geo.gw, geo.cols);
-        int ri = ChartView.HeatmapIndexAt(my - geo.gy, geo.gh, geo.rows);
-        if (ci < 0 || ri < 0) { return; }
-        // 找该格的数据项（语料单系列；多系列取先声明者）。
-        int fsi = 0 - 1;
-        int fdi = 0 - 1;
-        for (int si = 0; si < o.series.Count && fsi < 0; si = si + 1) {
-            ChartSeries s = o.series[si];
-            if (s.hidden) { continue; }
-            for (int di = 0; di < s.data.Count; di = di + 1) {
-                ChartData d = s.data[di];
-                if (d.heatX == ci && d.heatY == ri && !d.gap) {
-                    fsi = si;
-                    fdi = di;
-                    break;
-                }
-            }
-        }
-        if (fsi < 0) { return; }
-        ChartSeries hs = o.series[fsi];
-        ChartData hd = hs.data[fdi];
-        int bx = geo.gx + ChartView.HeatmapCellStart(geo.gw, ci, geo.cols);
-        int by = geo.gy + ChartView.HeatmapCellStart(geo.gh, ri, geo.rows);
-        int bw = ChartView.HeatmapCellSize(geo.gw, ci, geo.cols);
-        int bh = ChartView.HeatmapCellSize(geo.gh, ri, geo.rows);
-        c.DrawRect(bx, by, bw, bh,
-            Style.Part(app, "chart", "cell", "", "", "", Style.SNormal()).BorderOr(0), 1);
-        string xl = ci < geo.xCats.Count
-            ? geo.xCats[ci] : "#" + Convert.ToString(ci + 1);
-        string yl = ri < geo.yCats.Count
-            ? geo.yCats[ri] : "#" + Convert.ToString(ri + 1);
-        ChartHit hh = ChartHit.Of(ChartElementType.HeatmapCell,
-            fsi, hs.name, fdi, xl, 0, bx, by);
-        hh.numberValueSet = hd.numberSet;
-        if (hh.numberValueSet) { hh.numberValue = hd.number; }
-        ChartView.OfferActiveHit(hh);
-        if (o.showTooltip) {
-            int chip = ChartView.HeatmapGridColorAt(geo, hd.number, 1000);
-            if (chip == 0) { chip = hs.color; }
-            List<TooltipRow> tooltipRows = new List<TooltipRow>();
-            tooltipRows.Add(TooltipRow.Of(chip,
-                xl + " · " + yl + "  " + ChartView.HeatmapGridNumText(hd.number)));
-            ChartView.TooltipCard(app, mx, my, x + w, tooltipRows);
-        }
+    public static void HeatmapGridHover(App app, int x, int y, int w, int h, ChartOption o) {
+        ChartView.DrawPreparedHeatmapHover(app, o, ChartView.PreparedHeatmap(app, o, x, y, w, h), x + w);
     }
 }

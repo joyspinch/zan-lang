@@ -1,0 +1,123 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+internal class ChartPieGeometry {
+    internal PieLayout layout;
+    internal ChartLegendLayout legend;
+    internal int bodyY;
+    internal int areaW;
+    internal int areaH;
+    internal int rOuter;
+    internal int cx;
+    internal int cy;
+    internal int band;
+    internal int ringGap;
+    internal int[] geoX;
+    internal int[] geoY;
+    internal int[] geoRi;
+    internal int[] geoRo;
+
+    internal static ChartPieGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        ChartPieGeometry geometry = new ChartPieGeometry();
+        geometry.Build(app, o, x, y, w, h);
+        return geometry;
+    }
+
+    void Build(App app, ChartOption o, int x, int y, int w, int h) {
+        int pad = app.theme.paddingMedium;
+        int top = o.overlay ? y + pad : Chart.HeadBandBottom(app, y, o.title);
+        layout = PieLayout.Of(app.theme, o);
+        legend = ChartLegendLayout.Pie(app, o, x, y, w, h, top);
+        bodyY = legend.bodyY;
+        int ringCount = layout.ringCount > 0 ? layout.ringCount : 1;
+        bool sliceLabels = o.pieLabels;
+        areaW = w - pad * 2;
+        areaH = (y + h - pad) - bodyY;
+        int pct = 72;
+        if (sliceLabels) { pct = 52; }
+        if (ringCount > 1) { pct = 64; }
+        rOuter = ChartView.RadialRadius(areaW, areaH, pct);
+        cx = x + pad + areaW / 2;
+        cy = bodyY + areaH / 2;
+
+        band = 0;
+        if (ringCount > 1) { band = rOuter / ringCount; }
+        if (band < app.Scale(2)) { band = app.Scale(2); }
+        if (ringCount > 1 && band * ringCount > rOuter) {
+            band = rOuter / ringCount;
+            if (band < 1) { band = 1; }
+        }
+        ringGap = app.Scale(2);
+        if (ringGap < 1) { ringGap = 1; }
+
+        // 逐环几何：有 center/radius 覆盖的环按自身圆心与内外径解析
+        // （% 相对面板 w/h 与 min(w,h)/2，px 走 GaugeScalar，ECharts
+        // 容器语义），其余环共享默认圆心与均分带边界。绘制、悬停、
+        // 标签、markPoint、中心标注、命中、emphasis 全部取自这里，
+        // 保证无覆盖路径与原 PieRingBounds 结果逐位一致。
+        geoX = new int[ringCount];
+        geoY = new int[ringCount];
+        geoRi = new int[ringCount];
+        geoRo = new int[ringCount];
+        int radExt = (w < h ? w : h) / 2;
+        for (int rg = 0; rg < ringCount; rg = rg + 1) {
+            int riG = 0;
+            int roG = 0;
+            ChartView.PieRingBounds(layout, rg, ringCount, rOuter, band,
+            ringGap, out riG, out roG);
+            int gxG = cx;
+            int gyG = cy;
+            if (layout.ringCenter != null && rg < layout.ringCenter.Count
+            && layout.ringCenter[rg] != null) {
+                gxG = x + ChartView.GaugeScalar(app, layout.ringCenter[rg].x, w);
+                gyG = y + ChartView.GaugeScalar(app, layout.ringCenter[rg].y, h);
+            }
+            if (layout.ringRadius != null && rg < layout.ringRadius.Count
+            && layout.ringRadius[rg] != null) {
+                roG = ChartView.GaugeScalar(app, layout.ringRadius[rg], radExt);
+                if (roG < 1) { roG = 1; }
+                int riN = 0;
+                if (layout.ringRadiusIn != null
+                && rg < layout.ringRadiusIn.Count
+                && layout.ringRadiusIn[rg] != null) {
+                    riN = ChartView.GaugeScalar(app, layout.ringRadiusIn[rg], radExt);
+                }
+                if (riN < 0) { riN = 0; }
+                if (riN >= roG) { riN = roG - 1; }
+                riG = riN;
+            }
+            geoX[rg] = gxG;
+            geoY[rg] = gyG;
+            geoRi[rg] = riG;
+            geoRo[rg] = roG;
+        }
+
+    }
+
+    internal int HitIndex(App app, ChartOption o, int mx, int my, int growth) {
+        if (my < bodyY) { return -1; }
+        int ringCount = geoX.Length;
+        for (int i = layout.slices.Count - 1; i >= 0; i = i - 1) {
+            PieSlice slice = layout.slices[i];
+            int ring = slice.ring;
+            if (ring < 0) { ring = 0; }
+            if (ring >= ringCount) { ring = ringCount - 1; }
+            int hx = geoX[ring]; int hy = geoY[ring];
+            if (slice.selected && slice.seriesIndex >= 0 && slice.seriesIndex < o.series.Count) {
+                int offset = app.Scale(ChartView.PieSelectedOffset(o.series[slice.seriesIndex].selectedOffset));
+                int middle = layout.rot + (slice.a0 + slice.a1) / 2;
+                hx = hx + ChartView.FillDx(middle) * offset / 1000;
+                hy = hy + ChartView.FillDy(middle) * offset / 1000;
+            }
+            int dx = mx - hx; int dy = my - hy;
+            int distance = ChartView.ISqrt(dx * dx + dy * dy);
+            int angle = ((ChartView.AngleOf(dx, dy) - layout.rot) % 360 + 360) % 360;
+            int end = slice.a1 < 360 * growth / 1000 ? slice.a1 : 360 * growth / 1000;
+            if (distance >= geoRi[ring] && distance < ChartView.PieSliceRo(geoRi[ring], geoRo[ring], slice.roseP)
+            && angle >= slice.a0 && angle < end) { return i; }
+        }
+        return -1;
+    }
+}

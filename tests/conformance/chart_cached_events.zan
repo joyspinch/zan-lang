@@ -4,33 +4,81 @@ using Gui.Component.Chart;
 
 namespace Conf;
 
-// RenderCached 缓存命中帧的 owner-view 事件链路断言：
-// - miss 帧产出的 Keyed 实例经 SetCachedOwner 登记后，
-// 后续命中帧 CachedOwner 返回同一实例（实例身份是事件
-// 订阅归属的基础；悬停的跨帧连续性由 wid 悬停槽承载，
-// 不依赖实例存活）；
-// - 未登记键现建 owner 且 wid 即传入键；
-// - 事件 id 段 = 9700000 + wid（与普通 Render 同约定）；
-// - owner view 的初始化态：eventHitId 未注册、wid 悬停槽
-// 为空——命中帧由 BeginCachedEventFrame 恢复派发语义。
 class Program {
+    static int clicks;
+    static int hovers;
+    static int dataIndex = -1;
+    static int leaves;
+
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception("cached chart: " + message); }
+    }
+    static void Left(ChartInteractionEvent e) { leaves = leaves + 1; }
+    static void Click(App app, int x, int y) {
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static void Clicked(ChartInteractionEvent e) { clicks = clicks + 1; dataIndex = e.dataIndex; }
+    static void Hovered(ChartInteractionEvent e) { hovers = hovers + 1; }
+
     static void Main() {
+        App app = App.CreateOffscreen("cached chart events", 320, 240);
+        Control root = new Control(); root.UseApp(app); app.SetRootControl(root);
         ChartOption heat = ChartOption.Of("Cached", null,
-            new List<ChartSeries>{ChartSeries.Of("H", ChartType.Heatmap,
-                new List<int>{1, 2, 3, 4})});
-        ChartView v0 = ChartView.Keyed(heat, 300005);
-        v0.staticFrame = true;
-        ChartView.SetCachedOwner(300005, v0, 10, 10, 200, 100);
-        ChartView v1 = ChartView.CachedOwner(heat, 300005, 12, 14, 220, 110);
-        Console.WriteLine("ownerSame:" + Convert.ToString(v1 == v0)
-            + ":" + Convert.ToString(v1.wid == 300005));
-        ChartView v2 = ChartView.CachedOwner(heat, 300009, 0, 0, 50, 50);
-        Console.WriteLine("freshOwner:" + Convert.ToString(v2 != null)
-            + ":" + Convert.ToString(v2.wid == 300009));
-        Console.WriteLine("hitIdSeg:" + Convert.ToString(v0.eventHitId < 0)
-            + ":" + Convert.ToString(9700000 + 300005));
-        Console.WriteLine("freshState:"
-            + Convert.ToString(ChartView.HoverSlotHit(300009) == null)
-            + ":" + Convert.ToString(ChartView.HoverSlotOver(300009) == false));
+        new List<ChartSeries>{ChartSeries.Of("H", ChartType.Heatmap,
+        new List<int>{1, 2, 3, 4})});
+        heat.animate = false; heat.showLegend = false;
+        int slot = ChartView.AllocCacheSlot(); int key = IdHash.HashInt(slot, 300);
+        ChartView owner = ChartView.CachedOwner(app.canvas, heat, key, 0, 0, 320, 240);
+        ChartView same = ChartView.CachedOwner(app.canvas, heat, key, 12, 14, 220, 110);
+        Console.WriteLine("ownerSame:" + Convert.ToString(owner == same) + ":" + Convert.ToString(owner.wid == key));
+        App otherApp = App.CreateOffscreen("cache scope", 320, 240);
+        Canvas otherCanvas = otherApp.canvas;
+        ChartView other = ChartView.CachedOwner(otherCanvas, heat, key, 0, 0, 320, 240);
+        Console.WriteLine("canvasScoped:" + Convert.ToString(other != owner));
+        owner.OnClick(Program.Clicked); owner.On(ChartEventType.Hover, Program.Hovered);
+        owner.On(ChartEventType.MouseOut, Program.Left);
+        root.Add(owner); root.MeasureTree(app); root.Arrange(0, 0, 320, 240); owner.Arrange(0, 0, 320, 240);
+        app.ProcessOffscreenInput(2, 100, 90, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 100, 90, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(2, 100, 90, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 100, 90, 0, 0, 0, 0);
+        Console.WriteLine("retainedInput:" + Convert.ToString(clicks == 2) + ":" + Convert.ToString(hovers > 0) + ":" + Convert.ToString(dataIndex == 0));
+        int before = clicks; int nodes = owner.ChildCount();
+        ChartView.PrepareCached(app, heat, slot, 0, 0, 320, 240);
+        app.BeginOffscreenFrame(); owner.OnPaint(app); app.EndOffscreenFrame();
+        Console.WriteLine("paintPure:" + Convert.ToString(clicks == before) + ":" + Convert.ToString(owner.ChildCount() == nodes));
+        ChartView.PrepareCached(app, heat, slot, 0, 0, 320, 240);
+        app.BeginOffscreenFrame();
+        bool miss = !ChartView.RenderCached(app, heat, slot, 0, 0, 320, 240);
+        bool restored = ChartView.RenderCached(app, heat, slot, 0, 0, 320, 240);
+        app.EndOffscreenFrame();
+        Click(app, 100, 90);
+        Check(miss && restored && clicks == 3 && dataIndex == 0,
+        "snapshot miss and hit preserve retained subscriptions and geometry");
+        Console.WriteLine("cachedFrame:true:true:true");
+        heat.toolboxShow = true; heat.toolboxDataView = true;
+        app.ProcessOffscreenInput(1, 100, 90, 0, 0, 0, 0);
+        Control tool = null;
+        for (int i = 0; i < owner.ChildCount(); i = i + 1) {
+            Control child = owner.ChildAt(i);
+            if (child.Tip == "数据视图" && child.StyleVisible()) { tool = child; }
+        }
+        Check(tool != null, "toolbox prepared before paint");
+        int oldLeaves = leaves;
+        Click(app, tool.bx + 3, tool.by + 3);
+        Check(clicks == 3 && leaves > oldLeaves && ChartView.HoverSlotHit(key) == null,
+        "chrome neither forwards click nor retains a body hover");
+        Click(app, 100, 90);
+        Check(clicks == 3 && ChartView.HoverSlotHit(key) == null, "data view overlay fences body hits");
+        Console.WriteLine("pointerBody:true:true:true");
+        root.Remove(owner); ChartView.ReleaseCached(app.canvas, slot);
+        ChartView fresh = ChartView.CachedOwner(app.canvas, heat, key, 0, 0, 320, 240);
+        Check(fresh != owner && owner.IsDisposed(), "release creates a new retained owner");
+        Console.WriteLine("freshOwner:true:true");
+        ChartView.ReleaseCached(app.canvas, slot);
+        ChartView.ReleaseCached(otherCanvas, slot); otherApp.StopLoop(); otherCanvas.Destroy();
+        app.StopLoop(); app.canvas.Destroy();
     }
 }

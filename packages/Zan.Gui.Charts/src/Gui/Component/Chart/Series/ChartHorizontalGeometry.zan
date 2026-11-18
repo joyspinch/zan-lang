@@ -1,0 +1,253 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+internal class ChartHorizontalGeometry {
+    internal int pad;
+    internal int axisFs;
+    internal int lo;
+    internal int hi;
+    internal int span;
+    internal int ticksH;
+    internal int leftGut;
+    internal int plotX;
+    internal int plotY;
+    internal int plotW;
+    internal int plotH;
+    internal int rowH;
+    internal int baseIdx;
+    internal int zoomH;
+    internal int fullCount;
+    internal bool vFrac;
+    internal bool stacked;
+    internal double band;
+    internal List<string> labels;
+    internal List<ChartSeries> series;
+    internal List<ChartBarCol> columns;
+
+    internal static ChartHorizontalGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        string kind = ChartView.DispatchKind(o);
+        if (kind != "hbar" && kind != "barStackedHbar") { return null; }
+        Theme t = app.theme;
+        List<string> labels = o.YAxis0().categories.Count > 0 ? o.YAxis0().categories : o.XCategories();
+        List<ChartSeries> series = o.series;
+        bool stacked = false;
+        for (int i = 0; i < series.Count; i = i + 1) {
+            if (series[i].stackName.Length > 0) { stacked = true; }
+        }
+        int fullCount = labels.Count;
+        int baseIdx = 0;
+        int last = fullCount - 1;
+        int zoomH = 0;
+        if (o.zoom && o.iwid != 0 && fullCount > 1) {
+            baseIdx = Chart.ZoomI0(app, o, o.iwid, fullCount);
+            last = Chart.ZoomI1(app, o, o.iwid, fullCount);
+            zoomH = Chart.zoomBarHidden ? 0 : Chart.ZoomBandH(app, o, h);
+        }
+        labels = Chart.WindowLabels(labels, baseIdx, last);
+        h = h - zoomH;
+        int pad = t.paddingMedium;
+        // 迷你面板（matrix 锚格 ~40px 高）：主题 pad 在整幅上是留白，
+        // 在迷你格里上下各吃一行后绘图区成负值、整格柱子静默不画
+        // ——格内留白收缩（官方 mini-bar 柱条几乎撑满格子）。
+        if (h < app.Scale(60)) { pad = app.Scale(3); }
+        int axisFs = ChartFonts.AxisLabel(app);
+        int n = labels.Count;
+        int ns = series.Count;
+        int wid = o.iwid;
+        int plotTop = Chart.PanelContentTop(app, x, y, w, o.title, o.series, o.showLegend);
+        // 剔除隐藏序列，使槽位布局只按可见序列分配；事件 payload
+        // 仍通过原始 option 回查系列下标。Zero-Alloc 池化复用。
+        List<ChartSeries> visSeries = new List<ChartSeries>();
+        for (int hi2 = 0; hi2 < series.Count; hi2 = hi2 + 1) {
+            if (!series[hi2].hidden) {
+                visSeries.Add(series[hi2]);
+            }
+        }
+        if (visSeries.Count > 0) { series = visSeries; }
+        ns = series.Count;
+        if (ns < 1) { ns = 1; }
+
+        if (n < 1 || ns < 1) { return null; }
+
+        // 值域分两套模式：小数系列（bar-negative2 的 -0.07..0.47）走
+        // ×1000 定点域（NiceRange 取 nice 界），整数系列保持原 int
+        // 域（NiceMin/NiceMax）——两套的映射/累计都是模式自洽的，
+        // 整数路径逐像素不变。
+        bool vFrac = Chart.SeriesFracAny(series, 0);
+        int ticksH = 5;
+        int lo;
+        int hi;
+        if (vFrac) {
+            int dataMinF = 0;
+            int dataMaxF = 0;
+            for (int fi = 0; fi < series.Count; fi = fi + 1) {
+                if (!series[fi].hidden) {
+                    for (int fj = 0; fj < series[fi].Count(); fj = fj + 1) {
+                        double dfv = series[fi].Number(fj);
+                        int fvF = (int)(dfv * 1000.0 + (dfv >= 0 ? 0.5 : 0 - 0.5));
+                        if (fvF > dataMaxF) { dataMaxF = fvF; }
+                        if (fvF < dataMinF) { dataMinF = fvF; }
+                    }
+                }
+            }
+            ChartSpan spH = Chart.NiceRange(dataMinF, dataMaxF);
+            lo = spH.lo;
+            hi = spH.hi;
+            ticksH = spH.ticks;
+        } else {
+            int dataMin = 0;
+            int dataMax = 0;
+            for (int fi = 0; fi < series.Count; fi = fi + 1) {
+                if (!series[fi].hidden) {
+                    for (int fj = 0; fj < series[fi].Count(); fj = fj + 1) {
+                        int fv = series[fi].Value(fj);
+                        if (fv > dataMax) { dataMax = fv; }
+                        if (fv < dataMin) { dataMin = fv; }
+                    }
+                }
+            }
+            lo = (int)Chart.NiceMin((double)dataMin);
+            hi = (int)Chart.NiceMax(dataMax);
+        }
+        if (stacked) {
+            int stMax = 0;
+            for (int qi = 0; qi < series.Count; qi = qi + 1) {
+                if (series[qi].Count() > stMax) { stMax = series[qi].Count(); }
+            }
+            // 正负独立累加器下的组顶/组底定标（MaxStackAll 会把
+            // 正负相加，量程缩水）。Y 量程随 dataZoom 可见窗口重定
+            // （与 Chart.BuildAxesR 同一契约）：窗口化只在真的缩放
+            // 时启用，未缩放图逐像素不变。
+            if (vFrac) {
+                int hz0 = 0 - 1;
+                int hz1 = 0 - 1;
+                if (o.zoom && o.iwid != 0 && n > 1) {
+                    int hw0 = Chart.ZoomI0(app, o, o.iwid, n);
+                    int hw1 = Chart.ZoomI1(app, o, o.iwid, n);
+                    if (hw0 > 0 || hw1 < n - 1) { hz0 = hw0; hz1 = hw1; }
+                }
+                ChartSpan seH = Chart.StackExtentF(series, 0, hz0, hz1);
+                ChartSpan spN = Chart.NiceRange(seH.lo, seH.hi);
+                lo = spN.lo;
+                hi = spN.hi;
+                ticksH = spN.ticks;
+            } else {
+                hi = Chart.NiceMax(Chart.MaxBarStackGroupsW(series, stMax, baseIdx));
+                lo = (int)Chart.NiceMin((double)Chart.MinBarStackGroupsW(series, stMax, baseIdx));
+            }
+        }
+        // 值轴是 x 轴（横条）：声明 min/max（含 'dataMin'/'dataMax'
+        // 字面量）固定定义域——watermark max:10887、bar-race
+        // max:'dataMax'（钉原始数据上界，不 nice）。之前全不读。
+        ChartAxis hval = o.XAxis0();
+        if (hval != null && hval.type != ChartAxisType.Category) {
+            if (hval.minDataB) { lo = Chart.BarDataMinRaw(series); }
+            else if (hval.min != ChartOption.Auto()) { lo = hval.min; }
+            if (hval.maxDataB) { hi = Chart.BarDataMaxRaw(series); }
+            else if (hval.max != ChartOption.Auto()) { hi = hval.max; }
+        }
+        if (hi <= lo) { hi = lo + 1; }
+        int span = hi - lo;
+
+        // 最宽的类别标签决定左侧留白
+        int leftGut = app.Scale(20);
+        for (int li = 0; li < n; li = li + 1) {
+            int lw = Canvas.MeasureText(labels[li], axisFs);
+            if (lw + app.Scale(12) > leftGut) { leftGut = lw + app.Scale(12); }
+        }
+        // 的锚格轴全隐）：42px 迷你格若照搬整幅 botGut，绘图区算成
+        // 负值，整格柱子静默不画。
+        bool hbarXLabOn = o.xAxes.Count < 1 || o.xAxes[0].labelShow;
+        int botGut = hbarXLabOn
+        ? Canvas.FontHeight(axisFs) + app.Scale(8) : 0;
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        // 底部图例（ECharts 6 默认）从绘图区底边扣除。
+        int plotH = (y + h - pad - botGut - Chart.legendBottomReserve) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(8)) { return null; }
+
+        int rowH = plotH / n;
+        if (rowH < 1) { rowH = 1; }
+        // 水平柱的行带与柱列同样由 barGrid 解算（类目轴在 y：带宽按
+        // plotH/类目数，见 ChartBarLayout.BarBandWidth）。Zero-Alloc 池化复用。
+        double band = ChartView.BarBandWidth(plotH, n);
+        List<ChartSeries> hSer = new List<ChartSeries>();
+        List<string> hIds = new List<string>();
+        List<int> hSi = new List<int>();
+        for (int hi2 = 0; hi2 < ns; hi2 = hi2 + 1) {
+            if (!series[hi2].hidden) {
+                hSer.Add(series[hi2]);
+                hSi.Add(hi2);
+                if (series[hi2].stackName.Length > 0) { hIds.Add(series[hi2].stackName); }
+                else { hIds.Add("__ec_stack_" + Convert.ToString(hi2)); }
+            }
+        }
+        List<ChartBarCol> hCols = ChartView.CalcBarCols(band, hSer, hIds);
+        List<ChartBarCol> hColOf = new List<ChartBarCol>();
+        for (int hc = 0; hc < ns; hc = hc + 1) { hColOf.Add(null); }
+        for (int hb = 0; hb < hSi.Count; hb = hb + 1) { hColOf[hSi[hb]] = hCols[hb]; }
+        ChartHorizontalGeometry geometry = new ChartHorizontalGeometry();
+        geometry.pad = pad;
+        geometry.axisFs = axisFs;
+        geometry.lo = lo;
+        geometry.hi = hi;
+        geometry.span = span;
+        geometry.ticksH = ticksH;
+        geometry.leftGut = leftGut;
+        geometry.plotX = plotX;
+        geometry.plotY = plotY;
+        geometry.plotW = plotW;
+        geometry.plotH = plotH;
+        geometry.rowH = rowH;
+        geometry.baseIdx = baseIdx;
+        geometry.zoomH = zoomH;
+        geometry.fullCount = fullCount;
+        geometry.vFrac = vFrac; geometry.stacked = stacked; geometry.band = band;
+        geometry.labels = labels; geometry.series = series; geometry.columns = hColOf;
+        return geometry;
+    }
+
+    internal ChartHit Hit(ChartOption option, int px, int py, int growth, App app) {
+        if (px < plotX || px >= plotX + plotW || py < plotY || py >= plotY + plotH) { return null; }
+        ChartHit hit = null;
+        for (int i = 0; i < labels.Count; i = i + 1) {
+            int index = baseIdx + i;
+            for (int si = 0; si < series.Count; si = si + 1) {
+                ChartSeries item = series[si];
+                if (item.hidden || item.silent || index >= item.Count()) { continue; }
+                ChartBarCol column = columns[si];
+                if (column == null || column.width <= 0) { continue; }
+                int top = ChartView.BarY0(plotY, i, band, column.offset);
+                int bottom = ChartView.RoundPx((double)plotY + ((double)i + 0.5) * band + column.offset + column.width);
+                if (bottom <= top) { bottom = top + 1; }
+                int value = vFrac ? (int)((long)(int)(item.Number(index) * 1000.0
+                + (item.Number(index) >= 0 ? 0.5 : -0.5)) * growth / 1000L)
+                : (int)((long)item.Value(index) * growth / 1000L);
+                int baseline = 0;
+                if (stacked) {
+                    double number = ChartView.StackBaseAt(series, si, index);
+                    baseline = (int)((long)(number * 1000.0 + (number >= 0 ? 0.5 : -0.5)) * growth / 1000L);
+                }
+                int start = Chart.ValueX(plotX, plotW, lo, hi, baseline);
+                int end = Chart.ValueX(plotX, plotW, lo, hi, baseline + value);
+                int width = end - start;
+                if (!stacked && item.barMinHeight > 0) {
+                    int minimum = app.Scale(item.barMinHeight);
+                    if (width < 0 && -width < minimum) { width = -minimum; }
+                    else if (width >= 0 && width < minimum) { width = minimum; }
+                }
+                int left = width < 0 ? start + width : start;
+                if (width < 0) { width = -width; }
+                if (px >= left && px < left + width && py >= top && py < bottom) {
+                    hit = ChartView.MakeDataHit(item, ChartView.SeriesIndexOf(option, item), index,
+                    labels[i], ChartElementType.Bar, px, py, item.Value(index));
+                }
+            }
+        }
+        return hit;
+    }
+}

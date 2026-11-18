@@ -10,6 +10,13 @@ public partial class ChartView {
     // 直接失配并重新渲染。
     public static void ReleaseCached(Canvas c, int slot) {
         c.ReleaseSlot(slot);
+        int key = IdHash.HashInt(slot, 300);
+        ChartCacheOwner entry = ChartView.FindCachedEntry(c, key);
+        if (entry == null) { return; }
+        ChartView.cachedEntries.RemoveAt(ChartView.cachedEntries.IndexOf(entry));
+        if (ChartView.cachedEntries.Count == 0) { ChartView.cachedEntries = null; }
+        // Unregister before Dispose can recreate the same slot from a callback.
+        if (entry.view != null) { entry.view.Dispose(); }
     }
 
     // 静态且光栅化成本高的图表的缓存区域渲染（热力图、
@@ -21,110 +28,78 @@ public partial class ChartView {
     // 几何变化自动失效（指纹比较 + 几何匹配）。
     // 悬停反馈（如 HeatmapHover）由调用方在命中*之后*绘制，
     // 使工具提示保持活跃。帧由缓存提供时返回 true。
-    // 交互事件由每槽位的持久 owner view 承载：缓存命中帧也
-    // 设置 activeEventView 并派发 Hover/MouseOut/Click/
-    // DoubleClick，调用方补画的命中层（HeatmapHover 等）的
-    // OfferActiveHit 由此到达持久 view，handler 不再丢失。
-    public static bool RenderCached(App app, ChartOption o, int slot,
-                             int x, int y, int w, int h) {
-        Canvas c = app.canvas;
-        // 由槽位推导的稳定交互 id（基于作用域 Hash 派生），使指纹读取的
-        // dataZoom 窗口状态与渲染器读取的一致。
-        int zwid = IdHash.HashInt(slot, 300);
-        ResolvedChart resolved = ResolvedChart.Resolve(o, app.theme, app, zwid);
-        int fp = ChartView.CacheFingerprint(app, o, resolved, x, y, w, h);
-        bool cached = app.StateGet(Chart.CacheKey(slot), 0) == fp
-            && c.RestoreRect(x, y, w, h, slot);
-        if (cached) {
-            // 缓存命中帧：像素来自快照，但交互仍走持久 owner view。
-            ChartView owner = ChartView.CachedOwner(o, zwid, x, y, w, h);
-            owner.BeginCachedEventFrame(app, x, y, w, h);
-            return true;
-        }
+    // 交互由槽位的持久 retained owner 在输入阶段处理；快照恢复
+    // 只恢复像素，不更新命中或派发事件。owner 必须接入 Control 树。
+    public static ChartView PrepareCached(App app, ChartOption source, int slot,
+    int x, int y, int w, int h) {
+        if (app == null || !app.isRunning) { return null; }
+        int key = IdHash.HashInt(slot, 300);
+        ChartView view = ChartView.CachedOwner(app.canvas, source, key, x, y, w, h);
+        view.sourceOption = source; view.staticFrame = true;
+        view.UseApp(app); view.Arrange(x, y, w, h);
+        ChartCacheOwner entry = ChartView.FindCachedEntry(app.canvas, key);
+        if (view.disposed || entry == null || entry.view != view || view.resolved == null) { return null; }
+        entry.preparedFingerprint = ChartView.CacheFingerprint(app, view.sourceOption, view.resolved, x, y, w, h);
+        entry.prepared = true;
+        return view;
+    }
 
-        // 未命中：常规渲染最终帧，存入快照并记下指纹。
-        ChartView view = ChartView.Keyed(o, zwid);
-        view.staticFrame = true;  // 快照始终是最终形态
-        view.Render(app, x, y, w, h);
-        c.SnapshotRect(x, y, w, h, slot);
-        app.StateSet(Chart.CacheKey(slot), fp);
-        ChartView.SetCachedOwner(zwid, view, x, y, w, h);
+    public static bool RenderCached(App app, ChartOption o, int slot,
+    int x, int y, int w, int h) {
+        if (app == null || !app.isRunning) { return false; }
+        Canvas canvas = app.canvas;
+        ChartCacheOwner entry = ChartView.FindCachedEntry(canvas, IdHash.HashInt(slot, 300));
+        if (entry == null || !entry.prepared || entry.view == null || entry.view.disposed) { return false; }
+        ChartView view = entry.view;
+        if (view.sourceOption != o || view.bx != x || view.by != y || view.bw != w || view.bh != h) { return false; }
+        int fingerprint = entry.preparedFingerprint;
+        if (app.StateGet(Chart.CacheKey(slot), 0) == fingerprint && canvas.RestoreRect(x, y, w, h, slot)) { return true; }
+        view.RenderFrame(app, x, y, w, h);
+        if (view.disposed || ChartView.FindCachedEntry(canvas, entry.key) != entry || entry.view != view) { return false; }
+        canvas.SnapshotRect(x, y, w, h, slot);
+        app.StateSet(Chart.CacheKey(slot), fingerprint);
         return false;
     }
 
-    // RenderCached 每槽位的持久 owner view。Keyed 临时实例在
-    // 缓存 miss 帧产生，这里把它保留下来：后续缓存命中帧复用
-    // 同一实例，previousHit 连续性与事件订阅归属由此成立。
-    // 平行数组按槽位序存放（slot 数量少且有限）。
-    static List<ChartView> cachedOwners;
-    static List<int> cachedOwnerKeys;
-    static List<int> cachedOwnerRects;
+    static List<ChartCacheOwner> cachedEntries;
 
-    // 登记 key（zwid）对应的持久 owner view 及其矩形
-    // （平行数组按 key 首次出现顺序存放；重复 key 原位更新）。
-    public static void SetCachedOwner(int key, ChartView v, int x, int y, int w, int h) {
-        if (ChartView.cachedOwnerKeys == null) {
-            ChartView.cachedOwners = new List<ChartView>();
-            ChartView.cachedOwnerKeys = new List<int>();
-            ChartView.cachedOwnerRects = new List<int>();
-        }
-        for (int i = 0; i < ChartView.cachedOwnerKeys.Count; i = i + 1) {
-            if (ChartView.cachedOwnerKeys[i] == key) {
-                ChartView.cachedOwners[i] = v;
-                ChartView.cachedOwnerRects[i * 4] = x;
-                ChartView.cachedOwnerRects[i * 4 + 1] = y;
-                ChartView.cachedOwnerRects[i * 4 + 2] = w;
-                ChartView.cachedOwnerRects[i * 4 + 3] = h;
-                return;
+    static ChartCacheOwner FindCachedEntry(Canvas canvas, int key) {
+        if (ChartView.cachedEntries == null) { return null; }
+        for (int i = ChartView.cachedEntries.Count - 1; i >= 0; i = i - 1) {
+            ChartCacheOwner e = ChartView.cachedEntries[i];
+            if (e.scoped && e.canvas == null) {
+                ChartView.cachedEntries.RemoveAt(i);
+                continue;
+            }
+            if (e.key == key && e.canvas == canvas && e.scoped == (canvas != null)) {
+                return e;
             }
         }
-        ChartView.cachedOwnerKeys.Add(key);
-        ChartView.cachedOwners.Add(v);
-        ChartView.cachedOwnerRects.Add(x);
-        ChartView.cachedOwnerRects.Add(y);
-        ChartView.cachedOwnerRects.Add(w);
-        ChartView.cachedOwnerRects.Add(h);
+        return null;
     }
 
-    // 取 key 的持久 owner view 并刷新其缓存矩形；不存在或已
-    // disposed 时现建一个 Keyed view 并登记返回。
-    public static ChartView CachedOwner(ChartOption o, int key, int x, int y,
-                                 int w, int h) {
-        if (ChartView.cachedOwnerKeys != null) {
-            for (int i = 0; i < ChartView.cachedOwnerKeys.Count; i = i + 1) {
-                if (ChartView.cachedOwnerKeys[i] == key) {
-                    ChartView v = ChartView.cachedOwners[i];
-                    if (v != null && !v.disposed) {
-                        ChartView.cachedOwnerRects[i * 4] = x;
-                        ChartView.cachedOwnerRects[i * 4 + 1] = y;
-                        ChartView.cachedOwnerRects[i * 4 + 2] = w;
-                        ChartView.cachedOwnerRects[i * 4 + 3] = h;
-                        return v;
-                    }
-                }
-            }
+    static void SetCachedOwner(Canvas canvas, int key, ChartView v,
+    int x, int y, int w, int h) {
+        ChartCacheOwner entry = ChartView.FindCachedEntry(canvas, key);
+        if (entry == null) {
+            entry = new ChartCacheOwner();
+            entry.canvas = canvas;
+            entry.scoped = canvas != null;
+            entry.key = key;
+            if (ChartView.cachedEntries == null) { ChartView.cachedEntries = new List<ChartCacheOwner>(); }
+            ChartView.cachedEntries.Add(entry);
         }
-        // 没有可用 owner（首帧即命中、或 owner 已释放）：现建一个
-        // 并登记，事件订阅虽然只能由后续帧补上，但命中层立即生效。
+        entry.renderRevision = entry.renderRevision + 1;
+        entry.view = v;
+    }
+
+    public static ChartView CachedOwner(Canvas canvas, ChartOption o, int key,
+    int x, int y, int w, int h) {
+        ChartCacheOwner entry = ChartView.FindCachedEntry(canvas, key);
+        if (entry != null && entry.view != null && !entry.view.disposed) { return entry.view; }
         ChartView nv = ChartView.Keyed(o, key);
-        ChartView.SetCachedOwner(key, nv, x, y, w, h);
+        ChartView.SetCachedOwner(canvas, key, nv, x, y, w, h);
         return nv;
-    }
-
-    // 缓存命中帧的事件帧开销等价于 Render 的尾部：注册根命中
-    // 区、设置 activeEventView，由调用方补画的命中层填
-    // currentHit，最后统一派发。像素不被触碰——快照已经恢复。
-    void BeginCachedEventFrame(App app, int x, int y, int w, int h) {
-        if (this.disposed) { return; }
-        ChartView.activeEventView = this;
-        this.currentHit = null;
-        if (this.eventHitId < 0) {
-            this.eventHitId = IdHash.HashInt(this.wid, 970);
-        }
-        if (this.Status() == "ready") {
-            app.hitTester.RegisterRect(this.eventHitId, x, y, w, h, 0);
-        }
-        this.DispatchPointerEvents(app, x, y, w, h, this.Status());
     }
 
     // RenderCached 的数据指纹：系列值 + 类型/轴/隐藏、
@@ -133,7 +108,7 @@ public partial class ChartView {
     // 像素的因素都使缓存快照失效；悬停位置刻意不
     // 不（悬停层在缓存命中后绘制于其上）。
     public static int CacheFingerprint(App app, ChartOption o, ResolvedChart resolved,
-                                int x, int y, int w, int h) {
+    int x, int y, int w, int h) {
         int zoomLo = 0;
         int zoomHi = 0;
         if (o.zoom) {
@@ -141,18 +116,21 @@ public partial class ChartView {
             zoomHi = app.StateGet(Chart.ZoomHiKey(resolved.stateWid), o.zoomEnd * 10);
         }
         int fp = ChartView.FingerprintCore(
-            app.ThemeMenuIndex() * 7919 + app.bgThemeGen, zoomLo, zoomHi, o, resolved);
+        app.ThemeMenuIndex() * 7919 + app.bgThemeGen, zoomLo, zoomHi, o, resolved);
         // dataRange 交互态（滑条 q + 分段隐藏位）会改快照像素
         // （条本体也在快照里），故折入缓存指纹。
         if (o.dataRangeShow && resolved.stateWid != 0) {
             fp = (fp * 31 + app.StateGet(Chart.DRangeLoKey(resolved.stateWid), 0)
-                + app.StateGet(Chart.DRangeHiKey(resolved.stateWid), 1000) * 7
-                + 1) % 2000000000;
+            + app.StateGet(Chart.DRangeHiKey(resolved.stateWid), 1000) * 7
+            + 1) % 2000000000;
             for (int bi = 0; bi < o.dataRangeList.Count; bi = bi + 1) {
                 fp = (fp * 31 + app.StateGet(Chart.DRangeBandKey(resolved.stateWid, bi), 0)
-                    + 3) % 2000000000;
+                + 3) % 2000000000;
             }
         }
+        // Toolbox state changes the frame projection without changing the source.
+        fp = (fp * 31 + app.StateGet(Chart.TbMagicKey(resolved.wid), 0) * 7
+        + app.StateGet(Chart.TbZoomKey(resolved.wid), 0) * 13) % 2000000000;
         // 视口：快照槽位绑定像素矩形；控件移动 / 缩放而
         // 复用旧快照会画出错位像素，因此矩形进入指纹。
         fp = (fp * 31 + x * 7 + y * 13 + w * 17 + h * 19) % 2000000000;
@@ -176,7 +154,7 @@ public partial class ChartView {
     // 无需 App 即可验证数据/可见性/主题/缩放变化都会改变指纹；
     // CacheFingerprint 从 App 读取这两个状态，语义与旧版完全一致。
     public static int FingerprintCore(int themeGen, int zoomLo, int zoomHi,
-                               ChartOption o, ResolvedChart resolved) {
+    ChartOption o, ResolvedChart resolved) {
         int h = themeGen;
         h = (h * 31 + resolved.wid) % 2000000000;
         // connect 组改变交互键基址（状态随组长 wid 存取），
@@ -185,19 +163,19 @@ public partial class ChartView {
         if (resolved.animate) { h = (h * 31 + 17) % 2000000000; }
         h = (h * 31 + o.zoomStart + o.zoomEnd + o.backgroundColor) % 2000000000;
         h = (h * 31 + o.donutPct + (o.pieRings ? 1 : 0) + (o.pieLabels ? 1 : 0)
-            + o.gaugeMax) % 2000000000;
+        + o.gaugeMax) % 2000000000;
         // 改变布局/像素的 option 开关与边距。
         h = (h * 31 + (o.showLegend ? 1 : 0) + (o.showGrid ? 1 : 0)
-            + (o.showValues ? 1 : 0) + (o.smooth ? 1 : 0)) % 2000000000;
+        + (o.showValues ? 1 : 0) + (o.smooth ? 1 : 0)) % 2000000000;
         h = (h * 31 + (o.gradient ? 1 : 0) + (o.rounded ? 1 : 0)
-            + o.markLine + o.markLo + o.markHi) % 2000000000;
+        + o.markLine + o.markLo + o.markHi) % 2000000000;
         h = ChartView.FoldStr(h, o.markLabel, 1);
         h = ChartView.FoldStr(h, o.title, 2);
         h = (h * 31 + o.gridLeft + o.gridRight + o.gridTop + o.gridBottom) % 2000000000;
         // A16：原始六参（px/%/关键字）直接决定矩形，折进指纹
         // （kind + 量值 + 关键字串）。
         ChartBoxParam[] fps = new ChartBoxParam[] { o.gridLeftRaw, o.gridRightRaw,
-            o.gridTopRaw, o.gridBottomRaw, o.gridWidthRaw, o.gridHeightRaw };
+        o.gridTopRaw, o.gridBottomRaw, o.gridWidthRaw, o.gridHeightRaw };
         for (int fi = 0; fi < 6; fi = fi + 1) {
             ChartBoxParam fpv = fps[fi];
             if (fpv == null) { h = (h * 31 + 29) % 2000000000; continue; }
@@ -206,7 +184,7 @@ public partial class ChartView {
         }
         if (o.obDeclared) {
             ChartBoxParam[] fob = new ChartBoxParam[] { o.obLeftRaw, o.obRightRaw,
-                o.obTopRaw, o.obBottomRaw };
+            o.obTopRaw, o.obBottomRaw };
             for (int fi2 = 0; fi2 < 4; fi2 = fi2 + 1) {
                 ChartBoxParam fov = fob[fi2];
                 if (fov == null) { h = (h * 31 + 23) % 2000000000; continue; }
@@ -229,10 +207,10 @@ public partial class ChartView {
         for (int pi = 0; pi < o.polars.Count; pi = pi + 1) {
             RadarPolar p = o.polars[pi];
             h = (h * 31 + p.startAngle + p.splitNumber + p.axisLineWidth
-                + p.splitLineWidth) % 2000000000;
+            + p.splitLineWidth) % 2000000000;
             if (p.center != null) {
                 h = (h * 31 + p.center.x.amount + (p.center.x.percent ? 7 : 0)
-                    + p.center.y.amount + (p.center.y.percent ? 11 : 0)) % 2000000000;
+                + p.center.y.amount + (p.center.y.percent ? 11 : 0)) % 2000000000;
             }
             h = (h * 31 + p.radius.amount + (p.radius.percent ? 13 : 0)) % 2000000000;
             h = (h * 31 + p.nameColor + p.axisLineColor + p.splitLineColor) % 2000000000;
@@ -249,8 +227,21 @@ public partial class ChartView {
         // legend 布局/格式与 dataRange 配置改像素，须入指纹。
         h = ChartView.FoldStr(h, o.legendOrient, 32);
         h = ChartView.FoldStr(h, o.legendFormatter, 33);
+        h = ChartView.FoldStr(h, o.legendIcon, 51);
+        h = (h * 31 + o.legendItemGap + o.legendItemWidth * 3
+        + o.legendItemHeight * 7 + o.legendTextColor) % 2000000000;
+        if (o.legendData != null) {
+            for (int li = 0; li < o.legendData.Count; li = li + 1) {
+                h = ChartView.FoldStr(h, o.legendData[li], li + 52);
+            }
+        }
+        if (o.backgroundGradStops != null) {
+            for (int bi = 0; bi < o.backgroundGradStops.Count; bi = bi + 1) {
+                h = (h * 31 + o.backgroundGradStops[bi]) % 2000000000;
+            }
+        }
         h = (h * 31 + (o.dataRangeShow ? 1 : 0) + (o.dataRangeCalculable ? 2 : 0)
-            + o.dataRangeLo + o.dataRangeHi + o.dataRangeSplit) % 2000000000;
+        + o.dataRangeLo + o.dataRangeHi + o.dataRangeSplit) % 2000000000;
         for (int di = 0; di < o.dataRangeList.Count; di = di + 1) {
             h = ChartView.FoldStr(h, o.dataRangeList[di].label, 34);
             h = (h * 31 + o.dataRangeList[di].lo + o.dataRangeList[di].hi) % 2000000000;
@@ -284,9 +275,10 @@ public partial class ChartView {
             h = ChartView.FoldStr(h, ay.position, 30);
         }
         h = (h * 31 + o.series.Count) % 2000000000;
-        for (int s = 0; s < o.series.Count; s = s + 1) {
-            ChartSeries cs = o.series[s];
+        for (int s = 0; s < resolved.series.Count; s = s + 1) {
             ResolvedSeries rs = resolved.series[s];
+            ChartSeries cs = rs.source;
+            h = (h * 31 + resolved.drawOrder[s] * 7 + cs.z * 11 + cs.zlevel * 13) % 2000000000;
             h = (h * 31 + cs.type + cs.axisIndex) % 2000000000;
             h = ChartView.FoldStr(h, cs.name, 5);
             h = (h * 31 + cs.stack + cs.innerPct) % 2000000000;
@@ -296,7 +288,7 @@ public partial class ChartView {
             h = (h * 31 + rs.color + rs.lineColor + rs.lineWidth + rs.areaColor) % 2000000000;
             h = (h * 31 + rs.labelColor + rs.labelFontSize) % 2000000000;
             h = (h * 31 + cs.itemStyle.normal.borderColor
-                + cs.itemStyle.normal.borderWidth) % 2000000000;
+            + cs.itemStyle.normal.borderWidth) % 2000000000;
             h = ChartView.FoldStr(h, cs.itemStyle.normal.lineStyle.type, 8);
             // 逐系列绘制开关：平滑覆盖 / 面积填充 / 阶梯 /
             // 漏斗排序 / 玫瑰 / 水平柱 / 树方向。
@@ -312,10 +304,10 @@ public partial class ChartView {
             h = ChartView.FoldStr(h, cs.symbolSizeFn, 46);
             // 批 6：force/chord/funnel/wordCloud 参数化字段全部入指纹。
             h = (h * 31 + cs.forceScaling + cs.forceGravity * 3
-                + cs.forceMinRadius * 7 + cs.forceMaxRadius * 13
-                + cs.chordSort * 17 + (cs.chordSortSub ? 1 : 0)
-                + cs.chordGapDeg * 19 + cs.chordRingWidthPct * 23
-                + cs.funnelGap * 31) % 2000000000;
+            + cs.forceMinRadius * 7 + cs.forceMaxRadius * 13
+            + cs.chordSort * 17 + (cs.chordSortSub ? 1 : 0)
+            + cs.chordGapDeg * 19 + cs.chordRingWidthPct * 23
+            + cs.funnelGap * 31) % 2000000000;
             h = ChartView.FoldStr(h, cs.chordRibbonType, 38);
             h = ChartView.FoldStr(h, cs.funnelAlign, 39);
             h = ChartView.FoldStr(h, cs.wcRotate, 40);
@@ -327,9 +319,9 @@ public partial class ChartView {
             // 饼标矩阵字段（label.show 三态 / labelLine / alignTo 族）
             // 改外标几何与显隐，须入指纹。
             h = (h * 31 + cs.labelShowT + cs.labelLineShow * 3
-                + cs.labelLineLen * 7 + cs.labelLineLen2 * 11
-                + cs.labelDist * 13 + cs.labelEdgeDist * 17
-                + cs.labelAlignTo * 19) % 2000000000;
+            + cs.labelLineLen * 7 + cs.labelLineLen2 * 11
+            + cs.labelDist * 13 + cs.labelEdgeDist * 17
+            + cs.labelAlignTo * 19) % 2000000000;
             h = ChartView.FoldStr(h, cs.labelPos, 48);
             h = ChartView.FoldStr(h, cs.labelFmt, 49);
             // 富文本声明改标签排版（块高进去重叠），入指纹。
@@ -355,14 +347,14 @@ public partial class ChartView {
             }
             for (int pi = 0; pi < cs.points.Count; pi = pi + 1) {
                 h = (h * 31 + cs.points[pi].x + cs.points[pi].y
-                    + cs.points[pi].color) % 2000000000;
+                + cs.points[pi].color) % 2000000000;
                 if (cs.points[pi].sizeSet) {
                     h = (h * 31 + 31 + cs.points[pi].size) % 2000000000;
                 }
             }
             for (int ci = 0; ci < cs.candles.Count; ci = ci + 1) {
                 h = (h * 31 + cs.candles[ci].open + cs.candles[ci].high
-                    + cs.candles[ci].low + cs.candles[ci].close) % 2000000000;
+                + cs.candles[ci].low + cs.candles[ci].close) % 2000000000;
             }
             for (int bi = 0; bi < cs.bubbles.Count; bi = bi + 1) {
                 h = (h * 31 + cs.bubbles[bi].x + cs.bubbles[bi].y + cs.bubbles[bi].weight) % 2000000000;
@@ -370,7 +362,7 @@ public partial class ChartView {
             for (int xi = 0; xi < cs.boxes.Count; xi = xi + 1) {
                 h = ChartView.FoldStr(h, cs.boxes[xi].label, 15);
                 h = (h * 31 + cs.boxes[xi].lo + cs.boxes[xi].q1
-                    + cs.boxes[xi].med + cs.boxes[xi].q3 + cs.boxes[xi].hi) % 2000000000;
+                + cs.boxes[xi].med + cs.boxes[xi].q3 + cs.boxes[xi].hi) % 2000000000;
             }
             for (int ei = 0; ei < cs.errors.Count; ei = ei + 1) {
                 h = ChartView.FoldStr(h, cs.errors[ei].label, 16);
@@ -386,12 +378,12 @@ public partial class ChartView {
             for (int vi = 0; vi < cs.events.Count; vi = vi + 1) {
                 h = ChartView.FoldStr(h, cs.events[vi].name, 18);
                 h = (h * 31 + cs.events[vi].start + cs.events[vi].end
-                    + cs.events[vi].value) % 2000000000;
+                + cs.events[vi].value) % 2000000000;
             }
             for (int gi = 0; gi < cs.regions.Count; gi = gi + 1) {
                 h = ChartView.FoldStr(h, cs.regions[gi].name, 19);
                 h = (h * 31 + cs.regions[gi].value
-                    + cs.regions[gi].rings.Count) % 2000000000;
+                + cs.regions[gi].rings.Count) % 2000000000;
             }
             // 台账③：geo/map 底图区域描边色/宽（mapBorderW/C，
             // 官方缺省 0.5px #b7b9be），改了会改快照像素，与快照
@@ -401,16 +393,16 @@ public partial class ChartView {
             for (int mi = 0; mi < cs.marks.Count; mi = mi + 1) {
                 h = ChartView.FoldStr(h, cs.marks[mi].kind, 20);
                 h = (h * 31 + cs.marks[mi].dataIndex
-                    + cs.marks[mi].xValue + cs.marks[mi].yValue) % 2000000000;
+                + cs.marks[mi].xValue + cs.marks[mi].yValue) % 2000000000;
             }
             for (int mi2 = 0; mi2 < cs.markLines.Count; mi2 = mi2 + 1) {
                 h = ChartView.FoldStr(h, cs.markLines[mi2].kind, 24);
                 h = (h * 31 + cs.markLines[mi2].yValue
-                    + cs.markLines[mi2].xValue) % 2000000000;
+                + cs.markLines[mi2].xValue) % 2000000000;
                 h = ChartView.FoldStr(h, cs.markLines[mi2].lineType, 25);
             }
             h = (h * 31 + cs.gauge.min + cs.gauge.max + cs.gauge.precision
-                + cs.gauge.splitNumber + cs.gauge.innerRadius.amount) % 2000000000;
+            + cs.gauge.splitNumber + cs.gauge.innerRadius.amount) % 2000000000;
         }
         if (o.zoom) {
             h = (h * 31 + zoomLo) % 2000000000;

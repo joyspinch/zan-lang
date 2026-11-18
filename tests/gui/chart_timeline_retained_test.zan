@@ -1,0 +1,90 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+class TimelineLifetime {
+    public weak ChartTimeline timeline;
+}
+
+class ChartTimelineRetainedTest {
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception("timeline retained: " + message); }
+    }
+
+    static Control FindAction(ChartTimeline timeline, string tip) {
+        for (int i = 0; i < timeline.ChildCount(); i = i + 1) {
+            Control child = timeline.ChildAt(i);
+            if (child.Tip == tip) { return child; }
+        }
+        return null;
+    }
+
+    static void Click(App app, Control target) {
+        int x = target.bx + target.bw / 2;
+        int y = target.by + target.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static void Exercise(App app, Control root, TimelineLifetime witness) {
+        ChartTimeline timeline = ChartTimeline.Of()
+        .Frame(ChartHost.SampleOf("bar"))
+        .Frame(ChartHost.SampleOf("line"))
+        .Frame(ChartHost.SampleOf("pie"));
+        root.Add(timeline);
+        root.MeasureTree(app);
+        root.Arrange(0, 0, 420, 100);
+        timeline.Arrange(20, 30, 360, ChartTimeline.Height(app));
+        Control next = FindAction(timeline, "后一帧");
+        Check(next != null && root.HitTest(next.bx + 2, next.by + 2) == next,
+        "buttons participate in hit testing before paint");
+        Click(app, next);
+        Check(timeline.CurrentIndex() == 1, "first input changes frame before paint");
+        int children = timeline.ChildCount();
+        int index = timeline.CurrentIndex();
+        int id = next.WidgetId();
+        for (int i = 0; i < 2; i = i + 1) {
+            app.BeginOffscreenFrame();
+            timeline.OnPaint(app);
+            app.EndOffscreenFrame();
+        }
+        Check(timeline.CurrentIndex() == index && timeline.ChildCount() == children
+        && next.WidgetId() == id, "paint preserves frame and input identities");
+        timeline.Arrange(40, 30, 320, ChartTimeline.Height(app));
+        Check(FindAction(timeline, "后一帧") == next && next.WidgetId() == id,
+        "resize keeps button identity");
+        timeline.AutoPlay(500);
+        int due = app.MinLoopDeadline();
+        Check(due >= 0, "autoplay provides a scheduler deadline");
+        app.TickLoopParticipants(due);
+        Check(timeline.CurrentIndex() == 2 && app.MinLoopDeadline() > due,
+        "scheduler advances once and rearms");
+        app.TickLoopParticipants(due);
+        Check(timeline.CurrentIndex() == 2, "same turn does not replay advancement");
+        Control play = FindAction(timeline, "播放/暂停");
+        Check(play != null, "play action exists");
+        Click(app, play);
+        Check(app.MinLoopDeadline() == -1, "pause retires deadline");
+        app.TickLoopParticipants(due + 10000);
+        Check(timeline.CurrentIndex() == 2, "paused timeline remains unchanged");
+        Click(app, play);
+        Check(app.MinLoopDeadline() >= 0, "resume rearms without paint");
+        witness.timeline = timeline;
+        root.Remove(timeline);
+        Check(app.MinLoopDeadline() == -1, "detached timeline has no deadline");
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("timeline retained", 420, 100);
+        Control root = new Control();
+        root.UseApp(app);
+        app.SetRootControl(root);
+        TimelineLifetime witness = new TimelineLifetime();
+        Exercise(app, root, witness);
+        Check(witness.timeline == null, "scheduler does not retain detached timeline");
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        app.StopLoop();
+        app.canvas.Destroy();
+        Console.WriteLine("CHART_TIMELINE_RETAINED_OK");
+    }
+}

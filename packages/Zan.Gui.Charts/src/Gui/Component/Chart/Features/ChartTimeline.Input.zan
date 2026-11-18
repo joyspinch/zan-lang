@@ -1,0 +1,188 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Component.Chart;
+
+public partial class ChartTimeline {
+    List<ChartActionControl> actionControls;
+    int actionFrame;
+    ChartTimelineLayout inputLayout;
+    int layoutX;
+    int layoutY;
+    int layoutWidth;
+    int layoutScale;
+    AppLoopRegistration playbackRegistration;
+    int playbackDeadline;
+    int playbackInterval;
+
+    void InitTimelineInput() {
+        actionControls = new List<ChartActionControl>();
+        playbackDeadline = -1;
+    }
+
+    public override string Kind() { return "ChartTimeline"; }
+    public override string StyleType() { return "chart-timeline"; }
+
+    public override void OnMeasure(App app) {
+        app = this.ResolveApp(app);
+        if (app == null) { return; }
+        prefW = app.Scale(320);
+        prefH = ChartTimeline.Height(app);
+        this.EnsurePlaybackRegistration(app);
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        bx = x; by = y;
+        bw = width > 0 ? width : 0; bh = height > 0 ? height : 0;
+        App app = this.App;
+        if (app != null) { this.PrepareTimeline(app); }
+    }
+
+    public override void OnPaint(App app) {
+        app = this.ResolveApp(app);
+        if (app != null) { this.DrawFrame(app); }
+    }
+
+    void EnsurePlaybackRegistration(App app) {
+        if (!app.isRunning) { return; }
+        if (playbackRegistration != null && playbackRegistration.active
+        && playbackRegistration.host == app) { return; }
+        if (playbackRegistration != null) { playbackRegistration.Invalidate(); }
+        playbackDeadline = -1;
+        playbackRegistration = app.RegisterLoopParticipant(this, new ChartTimelinePlayback(this));
+    }
+
+    internal void PrepareTimeline(App app) {
+        if (this.App != app || !app.isRunning) { return; }
+        this.EnsurePlaybackRegistration(app);
+        int count = frames.Count;
+        int scale = app.Scale(100);
+        if (inputLayout == null || inputLayout.dots.Count != count || layoutX != bx
+        || layoutY != by || layoutWidth != bw || layoutScale != scale) {
+            inputLayout = ChartTimelineLayout.Create(app, bx, by, bw, count);
+            layoutX = bx; layoutY = by; layoutWidth = bw; layoutScale = scale;
+        }
+        actionFrame = actionFrame + 1;
+        if (count > 0) {
+            this.BindAction(50, 0, inputLayout.play, "播放/暂停");
+            this.BindAction(51, 0, inputLayout.previous, "前一帧");
+            this.BindAction(53, 0, inputLayout.next, "后一帧");
+            for (int i = 0; i < count; i = i + 1) {
+                this.BindAction(52, i, inputLayout.dots[i], this.LabelAt(i));
+            }
+            int key = ChartTimeline.TlIdxKey(this.WidgetId());
+            int index = app.StateGet(key, -1);
+            int current = ChartTimeline.Clamp(index, count);
+            if (current != index) { app.StateSet(key, current); }
+        }
+        for (int i = 0; i < actionControls.Count; i = i + 1) {
+            ChartActionControl action = actionControls[i];
+            if (action.stamp != actionFrame) { action.Visible = false; action.hot = false; }
+        }
+        this.SyncPlayback(app, Window.GetTickMs());
+    }
+
+    void BindAction(int kind, int index, Rect bounds, string tip) {
+        int slot = kind == 50 ? 0 : kind == 51 ? 1 : kind == 53 ? 2 : index + 3;
+        ChartActionControl action;
+        if (slot < actionControls.Count) { action = actionControls[slot]; }
+        else {
+            action = new ChartActionControl(this, kind, index);
+            actionControls.Add(action);
+            this.Add(action);
+        }
+        action.stamp = actionFrame;
+        action.Visible = bounds.width > 0 && bounds.height > 0;
+        action.Tip = tip;
+        action.Arrange(bounds.x, bounds.y, bounds.width, bounds.height);
+    }
+
+    bool PlaybackEligible(App app) {
+        if (app == null || this.App != app || !app.isRunning || frames.Count < 1
+        || intervalMs < 1 || app.rootControl == null
+        || !app.rootControl.ContainsInputControl(this)) { return false; }
+        Control node = this;
+        while (node != null) {
+            if (!node.StyleVisible()) { return false; }
+            node = node.Parent();
+        }
+        return app.StateGet(ChartTimeline.TlPlayKey(this.WidgetId()), 1) == 1;
+    }
+
+    void SyncPlayback(App app, int now) {
+        if (!this.PlaybackEligible(app)) { playbackDeadline = -1; return; }
+        if (playbackDeadline < 0 || playbackInterval != intervalMs) {
+            playbackInterval = intervalMs;
+            app.StateSet(ChartTimeline.TlTickKey(this.WidgetId()), now);
+            playbackDeadline = now + intervalMs;
+            if (playbackRegistration != null) { playbackRegistration.Reschedule(); }
+        }
+    }
+
+    internal int PlaybackDeadline() {
+        return this.PlaybackEligible(this.App) ? playbackDeadline : -1;
+    }
+
+    internal void TickPlayback(App app, int now) {
+        if (playbackRegistration == null || !playbackRegistration.active
+        || playbackRegistration.host != app || this.App != app) { return; }
+        this.SyncPlayback(app, now);
+        if (playbackDeadline < 0 || now < playbackDeadline) { return; }
+        int next = (this.CurrentIndex() + 1) % frames.Count;
+        app.StateSet(ChartTimeline.TlIdxKey(this.WidgetId()), next);
+        app.StateSet(ChartTimeline.TlTickKey(this.WidgetId()), now);
+        playbackDeadline = now + intervalMs;
+        this.Invalidate();
+        this.RaiseTimeline(next);
+    }
+
+    internal void StopPlayback(App app) {
+        if (playbackRegistration != null && playbackRegistration.host == app) {
+            playbackDeadline = -1;
+            playbackRegistration = null;
+        }
+    }
+
+    void UpdateActionPointer(ChartActionControl action, RoutedEventArgs e) { }
+    void LeaveActionPointer(ChartActionControl action, RoutedEventArgs e) { }
+    bool ActionPointerDown(ChartActionControl action, RoutedEventArgs e) { return false; }
+    void ActionPointerMove(ChartActionControl action, RoutedEventArgs e) { }
+    void ActionPointerUp(ChartActionControl action, RoutedEventArgs e) { }
+    bool ActionWheel(ChartActionControl action, RoutedEventArgs e) { return false; }
+
+    void RaiseTimeline(int index) {
+        Control node = this.Parent();
+        while (node != null && !(node is ChartView)) { node = node.Parent(); }
+        if (node is ChartView) {
+            ChartInteractionEvent changed = ChartInteractionEvent.Of(ChartEventType.TimelineChanged, this.WidgetId());
+            changed.dataIndex = index;
+            ((ChartView)node).RaiseInteraction(changed);
+        }
+    }
+
+    void ActionClick(ChartActionControl action, RoutedEventArgs e) {
+        App app = this.App;
+        int count = frames.Count;
+        if (app == null || !app.isRunning || count < 1) { return; }
+        int wid = this.WidgetId();
+        int index = this.CurrentIndex();
+        if (action.action == 50) {
+            int playing = app.StateGet(ChartTimeline.TlPlayKey(wid), intervalMs > 0 ? 1 : 0);
+            app.StateSet(ChartTimeline.TlPlayKey(wid), playing == 1 ? 0 : 1);
+            playbackDeadline = -1;
+            this.SyncPlayback(app, Window.GetTickMs());
+            if (playbackRegistration != null) { playbackRegistration.Reschedule(); }
+            this.Invalidate();
+            return;
+        }
+        int next = index;
+        if (action.action == 51) { next = (index + count - 1) % count; }
+        else if (action.action == 52) { next = ChartTimeline.Clamp(action.index, count); }
+        else if (action.action == 53) { next = (index + 1) % count; }
+        else { return; }
+        app.StateSet(ChartTimeline.TlIdxKey(wid), next);
+        this.Invalidate();
+        this.RaiseTimeline(next);
+    }
+}
