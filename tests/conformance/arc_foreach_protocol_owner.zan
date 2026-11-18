@@ -1,0 +1,142 @@
+using System;
+
+class YieldedItem { public int value = 42; }
+class ForeachWitness {
+    public weak YieldedItem item;
+    public weak OwnedEnumerator iterator;
+    public weak OwnedItems items;
+    public int steps;
+}
+class OwnedItems {
+    ForeachWitness witness;
+    public OwnedItems(ForeachWitness witness) { this.witness = witness; }
+    public OwnedEnumerator GetEnumerator() {
+        OwnedEnumerator iterator = new OwnedEnumerator(witness);
+        witness.iterator = iterator;
+        return iterator;
+    }
+}
+class OwnedEnumerator {
+    ForeachWitness witness;
+    int index;
+    public OwnedEnumerator(ForeachWitness witness) { this.witness = witness; }
+    public bool MoveNext() {
+        if (witness.item != null) { throw new Exception("previous Current still owned"); }
+        witness.steps = witness.steps + 1;
+        index = index + 1;
+        return index <= 3;
+    }
+    public YieldedItem Current {
+        get {
+            YieldedItem item = new YieldedItem();
+            witness.item = item;
+            return item;
+        }
+    }
+}
+class SnapshotItems {
+    public YieldedItem item;
+    public SnapshotEnumerator GetEnumerator() { return new SnapshotEnumerator(item); }
+}
+class SnapshotEnumerator {
+    YieldedItem item;
+    bool done;
+    public SnapshotEnumerator(YieldedItem item) { this.item = item; }
+    public bool MoveNext() {
+        if (done) { return false; }
+        done = true;
+        return true;
+    }
+    public YieldedItem Current() { return item; }
+}
+class Program {
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+    static OwnedItems Make(ForeachWitness witness) {
+        OwnedItems items = new OwnedItems(witness);
+        witness.items = items;
+        return items;
+    }
+    static YieldedItem First(OwnedItems items) {
+        foreach (YieldedItem item in items) { return item; }
+        return null;
+    }
+    static YieldedItem FirstSnapshot(SnapshotItems items) {
+        foreach (YieldedItem item in items) { return item; }
+        return null;
+    }
+    static void ThrowFromCall(YieldedItem item) {
+        Require(item.value == 42, "call item alive");
+        throw new Exception("expected");
+    }
+    static void CheckReturn(ForeachWitness witness) {
+        YieldedItem result = First(Make(witness));
+        Require(result != null && result.value == 42, "returned item alive");
+        Require(witness.item != null, "return retains Current");
+        Require(witness.iterator == null, "return retires enumerator");
+        Require(witness.items == null, "return retires collection temporary");
+        result = null;
+        Require(witness.item == null, "return drops iteration owner");
+        SnapshotItems items = new SnapshotItems();
+        items.item = new YieldedItem();
+        witness.item = items.item;
+        result = FirstSnapshot(items);
+        items.item = null;
+        Require(result.value == 42, "snapshot return alive");
+        result = null;
+        Require(witness.item == null, "snapshot return drops iteration owner");
+    }
+    static void CheckNormal(ForeachWitness witness) {
+        witness.steps = 0;
+        int sum = 0;
+        foreach (YieldedItem item in Make(witness)) { sum = sum + item.value; }
+        Require(sum == 126 && witness.steps == 4, "normal iterations");
+        Require(witness.item == null, "normal retires Current");
+        Require(witness.iterator == null, "normal retires enumerator");
+        Require(witness.items == null, "normal retires collection temporary");
+    }
+    static void CheckContinue(ForeachWitness witness) {
+        witness.steps = 0;
+        foreach (YieldedItem item in Make(witness)) {
+            Require(item.value == 42, "continue item alive");
+            continue;
+        }
+        Require(witness.steps == 4, "continue iterations");
+        Require(witness.item == null, "continue retires Current");
+        Require(witness.iterator == null, "continue retires enumerator");
+        Require(witness.items == null, "continue retires collection temporary");
+    }
+    static void CheckBreak(ForeachWitness witness) {
+        foreach (YieldedItem item in Make(witness)) {
+            Require(item.value == 42, "break item alive");
+            break;
+        }
+        Require(witness.item == null, "break retires Current");
+        Require(witness.iterator == null, "break retires enumerator");
+        Require(witness.items == null, "break retires collection temporary");
+    }
+    static void CheckThrow(ForeachWitness witness, bool call) {
+        bool caught = false;
+        try {
+            foreach (YieldedItem item in Make(witness)) {
+                if (call) { ThrowFromCall(item); }
+                throw new Exception("expected");
+            }
+        } catch (Exception ex) { caught = true; }
+        Require(caught, "throw caught");
+        Require(witness.item == null, "throw retires Current");
+        Require(witness.iterator == null, "throw retires enumerator");
+        Require(witness.items == null, "throw retires collection temporary");
+    }
+    static void Main() {
+        ForeachWitness witness = new ForeachWitness();
+        CheckReturn(witness);
+        CheckNormal(witness);
+        CheckContinue(witness);
+        CheckBreak(witness);
+        CheckThrow(witness, false);
+        CheckThrow(witness, true);
+        Console.WriteLine("OK");
+    }
+}

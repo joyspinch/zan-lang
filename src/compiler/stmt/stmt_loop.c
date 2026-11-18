@@ -118,6 +118,7 @@
             zan_store_fit(g, ev0, enum_slot ? enum_slot : enum_alloc);
         }
 
+        int fe_scope = locals->count;
         bool fe_coll_registered = false;
         {
             zan_type_t *coll_t = infer_expr_type(g,
@@ -158,8 +159,12 @@
         if (!iter_alloc) iter_alloc = emit_entry_alloca(g, elem_llvm, "fv");
         local_add(locals, stmt->foreach_stmt.var_name, iter_alloc, elem_type);
         int fe_body_start = locals->count;
-        if (fe_enum_ty && elem_type && is_rc_managed_type(elem_type))
+        if (fe_enum_ty && elem_type && is_rc_managed_type(elem_type)) {
             zan_store_fit(g, LLVMConstNull(elem_llvm), iter_alloc);
+            /* Current returns +1. Register the iteration slot as an ordinary
+             * owner so return/throw/break/continue share lexical cleanup. */
+            arc_own_local(g, locals);
+        }
 
         LLVMTypeRef list_ptr_ty = LLVMTypeOf(collection);
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.cond");
@@ -264,14 +269,10 @@
 
             emit_stmt(g, stmt->foreach_stmt.body, locals);
             emit_release_owned_locals_from(g, locals, fe_body_start);
-            if (elem_type && is_rc_managed_type(elem_type)) {
-                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMValueRef cv = LLVMBuildLoad2(g->builder, i8ptr, iter_alloc, "fe.cur_rel");
-                emit_rc_release_for_type(g, elem_type, cv);
-                LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), iter_alloc);
-            }
-            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+                emit_release_owned_locals_range(g, locals, fe_start);
                 LLVMBuildBr(g->builder, step_bb);
+            }
 
             LLVMPositionBuilderAtEnd(g->builder, step_bb);
             LLVMBuildBr(g->builder, cond_bb);
@@ -286,13 +287,7 @@
             g->finally_loop_base = fe_saved_loop_fbase;
             g->eh_armed_loop_base = fe_saved_loop_ehbase;
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
-            if (elem_type && is_rc_managed_type(elem_type)) {
-                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMValueRef cv = LLVMBuildLoad2(g->builder, i8ptr, iter_alloc, "fe.cur_end_rel");
-                emit_rc_release_for_type(g, elem_type, cv);
-                LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), iter_alloc);
-            }
-            emit_release_owned_locals_from(g, locals, fe_start);
+            emit_release_owned_locals_from(g, locals, fe_scope);
             if (!fe_coll_registered)
                 emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
                                              collection, locals);

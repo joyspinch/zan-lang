@@ -1045,6 +1045,7 @@ partial class Irgen {
         if (curAsync) { MaterializeAsyncLoopLocal(enReg, enTy, s.ival); }
         else { EA(enReg, enTy); }
         L("  store " + enTy + " " + en.op + ", " + enTy + "* " + enReg);
+        TransferTempOwner(en);
         if (curAsync) { ArmAsyncLocal(enReg, enumTy, false); }
         string elt = MapType(elemTy);
         string ereg = AddLocal(s.sval, elemTy);
@@ -1073,12 +1074,9 @@ partial class Irgen {
         loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
-        ExprVal curEn = en;
-        if (curAsync) {
-            string enVal = NT();
-            L("  " + enVal + " = load " + enTy + ", " + enTy + "* " + enReg);
-            curEn = new ExprVal(enVal, enumTy);
-        }
+        string enVal = NT();
+        L("  " + enVal + " = load " + enTy + ", " + enTy + "* " + enReg);
+        ExprVal curEn = new ExprVal(enVal, enumTy);
         Node call1 = new Node(AK.Call()); call1.kids = new List<Node>();
         ExprVal mn = EmitInstanceCall(curEn, ecls.sval, "MoveNext", call1);
         string c = NT();
@@ -1102,7 +1100,7 @@ partial class Irgen {
             string old = NT();
             L("  " + old + " = load " + elt + ", " + elt + "* " + ereg);
             L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
-            EmitArcRetain(ev.op, elemTy);
+            if (!TransferTempOwner(ev)) { EmitArcRetain(ev.op, elemTy); }
             EmitArcRelease(old, elemTy);
         } else {
             L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
@@ -1110,6 +1108,14 @@ partial class Irgen {
         GenStmt(s.c);
         if (!term) { L("  br label %L" + linc); }
         Label(linc);
+        // Keep the slot armed for the whole loop, but consume Current before
+        // MoveNext: continue shares this edge and exceptions see a null slot.
+        if (ArcManaged(elemTy) || elemTy.ival >= 1) {
+            string previous = NT();
+            L("  " + previous + " = load " + elt + ", " + elt + "* " + ereg);
+            L("  store " + elt + " null, " + elt + "* " + ereg);
+            EmitArcRelease(previous, elemTy);
+        }
         L("  br label %L" + lc);
         Label(lend);
         ReleaseLocalsFrom(feScope);
