@@ -1349,15 +1349,27 @@ zan_escape_stats_t zan_opt_escape(zan_irgen_t *g) {
     return stats;
 }
 
-static zan_status_t zan_opt_early_mem2reg(zan_irgen_t *g) {
-    const char *early = getenv("ZAN_EARLY_PASSES");
+bool zan_opt_knob_off(signed char knob, const char *env) {
+    if (knob == 1) return true;
+    if (knob == 0) return getenv(env) != NULL;
+    return false;
+}
+
+static zan_status_t zan_opt_early_mem2reg(zan_irgen_t *g,
+                                         const zan_opt_knobs_t *knobs) {
+    const char *early = knobs->early_passes ? knobs->early_passes
+                                            : getenv("ZAN_EARLY_PASSES");
     if (early && strcmp(early, "none") == 0) return ZAN_OK;
     return run_checked_passes(g->mod, NULL,
                              (early && early[0]) ? early : "sroa,early-cse");
 }
 
-zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level) {
+zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
+                              zan_opt_level_t level,
+                              const zan_opt_knobs_t *knobs) {
     zan_opt_report_t report;
+    static const zan_opt_knobs_t default_knobs;
+    if (!knobs) knobs = &default_knobs;
     memset(&report, 0, sizeof(report));
     if (zan_opt_verify_module(g->mod, "before optimizer") != ZAN_OK) return report;
     report.success = true;
@@ -1365,17 +1377,25 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
 
     double t0 = get_time_ms();
 
-    /* 调试旋钮：ZAN_NO_OPT_<NAME>=1 跳过对应自定义 pass（A595 二分） */
-    if (!getenv("ZAN_NO_OPT_EARLY") && zan_opt_early_mem2reg(g) != ZAN_OK) {
+    /* 调试旋钮：-fno-opt-<name>（或回退 ZAN_NO_OPT_<NAME>=1）跳过对应
+     * 自定义 pass（A595 二分） */
+    if (!zan_opt_knob_off(knobs->no_early, "ZAN_NO_OPT_EARLY") &&
+        zan_opt_early_mem2reg(g, knobs) != ZAN_OK) {
         report.success = false;
         return report;
     }
-    if (!getenv("ZAN_NO_OPT_ESCAPE")) report.escape = zan_opt_escape(g);
-    if (!getenv("ZAN_NO_OPT_ARC")) report.arc = zan_opt_arc(g, level);
-    if (!getenv("ZAN_NO_OPT_DEVIRT")) report.devirt = zan_opt_devirtualize(g, binder);
-    if (!getenv("ZAN_NO_OPT_CONSTFOLD")) report.constfold = zan_opt_const_fold(g);
-    if (!getenv("ZAN_NO_OPT_DCE")) report.dce = zan_opt_dce(g);
-    if (!getenv("ZAN_NO_OPT_INLINE")) report.inlining = zan_opt_inline(g, level);
+    if (!zan_opt_knob_off(knobs->no_escape, "ZAN_NO_OPT_ESCAPE"))
+        report.escape = zan_opt_escape(g);
+    if (!zan_opt_knob_off(knobs->no_arc, "ZAN_NO_OPT_ARC"))
+        report.arc = zan_opt_arc(g, level);
+    if (!zan_opt_knob_off(knobs->no_devirt, "ZAN_NO_OPT_DEVIRT"))
+        report.devirt = zan_opt_devirtualize(g, binder);
+    if (!zan_opt_knob_off(knobs->no_constfold, "ZAN_NO_OPT_CONSTFOLD"))
+        report.constfold = zan_opt_const_fold(g);
+    if (!zan_opt_knob_off(knobs->no_dce, "ZAN_NO_OPT_DCE"))
+        report.dce = zan_opt_dce(g);
+    if (!zan_opt_knob_off(knobs->no_inline, "ZAN_NO_OPT_INLINE"))
+        report.inlining = zan_opt_inline(g, level);
     report.success = zan_opt_configure_llvm_passes(g, level) == ZAN_OK;
 
     double t1 = get_time_ms();

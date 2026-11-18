@@ -592,6 +592,7 @@ int main(int argc, char **argv) {
     const char *warn_level_arg = opts.warn_level_arg;
     const char *suppress_arg = opts.suppress_arg;
     int opt_level = opts.opt_level;
+    zan_opt_knobs_t opt_knobs = opts.opt_knobs;
     const char **pp_defines = (const char **)opts.pp_defines;
     int pp_define_count = opts.pp_define_count;
     const char *target_name = opts.target_name;

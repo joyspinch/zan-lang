@@ -10,6 +10,9 @@ void print_usage(void) {
     fprintf(stderr, "    --emit-lib       Force library output (no CRT/entry point)\n");
     fprintf(stderr, "    -O0..-O3/-Os/-Oz Set optimization level (default: O2; --publish: Os;\n");
     fprintf(stderr, "                     -g forces O0; -Oz = minimum size for edge/embedded)\n");
+    fprintf(stderr, "    -fno-opt-<pass>  Skip a custom optimizer pass (bisection): early,\n");
+    fprintf(stderr, "                     escape, arc, devirt, constfold, dce, inline\n");
+    fprintf(stderr, "    --early-passes=<list>  Override early LLVM pass pipeline (or 'none')\n");
     fprintf(stderr, "    --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
     fprintf(stderr, "    --cpu-profile <baseline|avx2>  x86-64 CPU requirements (default: target default)\n");
     fprintf(stderr, "    --list-targets   Show available cross-compilation targets\n");

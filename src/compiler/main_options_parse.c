@@ -83,6 +83,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     const char *suppress_arg = NULL;     /* A382② --suppress */
     zan_pkg_scope_t package_scope = ZAN_PKG_SCOPE_PROJECT;
     int opt_level = -1;
+    zan_opt_knobs_t opt_knobs; memset(&opt_knobs, 0, sizeof(opt_knobs));
 #define ZAN_MAX_PP_DEFINES 1024
 #define ZAN_MAX_LINK_INPUTS 1024
 #define ZAN_MAX_EMBED_SPECS 1024
@@ -236,6 +237,29 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             opt_level = ZAN_OPT_SIZE;
         } else if (strcmp(argv[i], "-Oz") == 0) {
             opt_level = ZAN_OPT_SIZE_MIN;
+        } else if (strncmp(argv[i], "-fno-opt-", 9) == 0) {
+            /* 优化器调试旋钮（二分用）：显式关闭对应自定义 pass。
+             * 未显式给出时 optimizer.c 回退读 ZAN_NO_OPT_* 环境变量。 */
+            const char *name = argv[i] + 9;
+            signed char *slot = NULL;
+            if (strcmp(name, "early") == 0) slot = &opt_knobs.no_early;
+            else if (strcmp(name, "escape") == 0) slot = &opt_knobs.no_escape;
+            else if (strcmp(name, "arc") == 0) slot = &opt_knobs.no_arc;
+            else if (strcmp(name, "devirt") == 0) slot = &opt_knobs.no_devirt;
+            else if (strcmp(name, "constfold") == 0) slot = &opt_knobs.no_constfold;
+            else if (strcmp(name, "dce") == 0) slot = &opt_knobs.no_dce;
+            else if (strcmp(name, "inline") == 0) slot = &opt_knobs.no_inline;
+            if (!slot) {
+                fprintf(stderr,
+                        "zanc: unknown optimizer pass in '%s' (known: early, "
+                        "escape, arc, devirt, constfold, dce, inline)
+",
+                        argv[i]);
+                opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
+            }
+            *slot = 1;
+        } else if (strncmp(argv[i], "--early-passes=", 15) == 0) {
+            opt_knobs.early_passes = argv[i] + 15;
         } else if (strncmp(argv[i], "-ferror-limit=", 14) == 0) {
             /* atoi 曾把 "abc" 静默变 0——main.c 以 >=0 判已设置，0 即
              * 抑制全部错误显示；现严格十进制复核，垃圾值按用法错误退出 */
@@ -428,6 +452,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     opts->suppress_arg = suppress_arg;
     opts->package_scope = package_scope;
     opts->opt_level = opt_level;
+    opts->opt_knobs = opt_knobs;
     for (int k = 0; k < pp_define_count && k < ZAN_MAX_PP_DEFINES; k++) opts->pp_defines[k] = pp_defines[k];
     opts->pp_define_count = pp_define_count;
     opts->target_name = target_name;

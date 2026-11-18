@@ -60,6 +60,7 @@ typedef struct zan_options {
     const char *suppress_arg;
     zan_pkg_scope_t package_scope;
     int opt_level;
+    zan_opt_knobs_t opt_knobs;
     const char *pp_defines[ZAN_MAX_PP_DEFINES];
     int pp_define_count;
     const char *target_name;

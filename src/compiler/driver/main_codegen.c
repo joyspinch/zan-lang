@@ -213,7 +213,8 @@
     }
 
     if (effective_opt > ZAN_OPT_NONE) {
-        zan_opt_report_t opt_report = zan_optimize(&irgen, NULL, effective_opt);
+        zan_opt_report_t opt_report =
+            zan_optimize(&irgen, NULL, effective_opt, &opt_knobs);
         if (!opt_report.success) goto codegen_failed;
         zan_opt_report_print(&opt_report);
         phase("optimize");

@@ -169,6 +169,9 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `-o <file>` | — | 输出文件。**后缀决定产物类型**：`.dll/.so/.dylib`=共享库，`.a/.lib`=静态库，其余=可执行 |
 | `--emit-lib` | 关 | 强制库输出（无 CRT/入口点）；与 `-o` 后缀推断并存时后缀仍决定 shared/static |
 | `-O0..-O3/-Os/-Oz` | 默认 `-O2` | 优化档；`--publish` 默认 `-Os`；`-Oz` 极限体积（边缘/嵌入式）。显式 `-O` 覆盖 `--publish` 默认，但 `-g` 总是强制 `-O0` |
+| `-fno-opt-<pass>` | 关 | 跳过单个自定义优化 pass（二分定位用）：`early/escape/arc/devirt/constfold/dce/inline`；未知 pass 名报用法错误 |
+| `--early-passes=<list>` | — | 覆盖早期 LLVM pass 管线（如 `sroa,early-cse`），`none` 跳过整个早期阶段 |
+| ↳ 环境变量回退 | — | `-fno-opt-*` 未显式给出时回退读 `ZAN_NO_OPT_<PASS>=1`，`--early-passes` 未给出时回退读 `ZAN_EARLY_PASSES`（兼容既有二分脚本）；显式 CLI 优先 |
 | `--target <name>` | 本机 | 交叉编译（§3 全表） |
 | `--list-targets` | — | 列出全部目标后退出 |
 | `--subsystem <console\|windows>` | 自动 | PE 子系统（仅 Windows）；GUI 程序自动推断 windows |
