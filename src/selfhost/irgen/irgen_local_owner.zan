@@ -91,23 +91,43 @@ partial class Irgen {
         L("  call void @zlocal_arm(i8* " + raw + ", void (i8*)* " + dt + ")");
     }
 
-    bool GotoVisibleLocal(int i) {
-        return locName[i].Length < 6 || locName[i].Substring(0, 6) != "__qdot";
+    bool GotoVisibleLocal(int i, Node target) {
+        if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") {
+            return false;
+        }
+        if (target == null) { return true; }
+        // Goto emission retires catch bindings when it leaves their handlers.
+        // Ordinary owning locals still participate in the forward-jump check.
+        if (curAsync) {
+            for (int j = 0; j < asyncCatchBindings.Count; j = j + 1) {
+                Node clause = asyncCatchBindings[j];
+                if (asyncLocalRegs[clause.ival] == locReg[i]) {
+                    return FlowContains(clause.a, target);
+                }
+            }
+        } else {
+            for (int j = 0; j < syncFlow.catchLocals.Count; j = j + 1) {
+                if (syncFlow.catchLocals[j] == i) {
+                    return FlowContains(syncFlow.catchScopes[j], target);
+                }
+            }
+        }
+        return true;
     }
 
-    int GotoVisibleLocals() {
+    int GotoVisibleLocals(Node target) {
         int count = 0; int i = 0;
         while (i < locName.Count) {
-            if (GotoVisibleLocal(i)) { count = count + 1; }
+            if (GotoVisibleLocal(i, target)) { count = count + 1; }
             i = i + 1;
         }
         return count;
     }
 
-    int GotoOwnedLocals() {
+    int GotoOwnedLocals(Node target) {
         int count = 0; int i = 0;
         while (i < locName.Count) {
-            if (GotoVisibleLocal(i) && (i >= locRef.Count || !locRef[i]) && locName[i] != "") {
+            if (GotoVisibleLocal(i, target) && (i >= locRef.Count || !locRef[i]) && locName[i] != "") {
                 if (locBox[i] || ArcManaged(locType[i]) || (locType[i] != null && locType[i].ival >= 1)) {
                     count = count + 1;
                 }
@@ -120,9 +140,10 @@ partial class Irgen {
     void RecordForwardGoto(Node jump) {
         string name = "" + LabelId(jump.sval);
         if (Contains(syncFlow.definedGotoLabels, name)) { return; }
+        Node target = FindFlowLabel(jump.sval);
         syncFlow.pendingGotoNodes.Add(jump);
-        syncFlow.pendingGotoLocals.Add(GotoVisibleLocals());
-        syncFlow.pendingGotoOwned.Add(GotoOwnedLocals());
+        syncFlow.pendingGotoLocals.Add(GotoVisibleLocals(target));
+        syncFlow.pendingGotoOwned.Add(GotoOwnedLocals(target));
     }
 
     void DefineGotoLabel(Node label) {
@@ -131,8 +152,8 @@ partial class Irgen {
         while (i < syncFlow.pendingGotoNodes.Count) {
             Node jump = syncFlow.pendingGotoNodes[i];
             if (jump != null && "" + LabelId(jump.sval) == name) {
-                if (syncFlow.pendingGotoLocals[i] < GotoVisibleLocals()
-                    || syncFlow.pendingGotoOwned[i] != GotoOwnedLocals()) {
+                if (syncFlow.pendingGotoLocals[i] < GotoVisibleLocals(label)
+                    || syncFlow.pendingGotoOwned[i] != GotoOwnedLocals(label)) {
                     diags.Error("goto '" + jump.sval + "' leaves (or enters) a scope with owning locals; the abandoned references would leak -- restructure with break/return", jump.line, jump.col);
                 }
                 syncFlow.pendingGotoNodes[i] = null;
