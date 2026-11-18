@@ -26,6 +26,9 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 动作：类型位置的节点为 `AST_TYPE_REF`，不可与表达式标识符 `AST_IDENTIFIER` 混淆。
    - 理由：混淆会导致符号绑定阶段将类型引用误判为局部变量或成员，引发语义解析穿透。
    - 边界：语法解析器（`parser.c`）中前瞻判定（`looks_like_var_decl`）需严格区分类型指示符与表达式操作符。
+   - primitive keyword 后的点属于表达式：`(int.MaxValue - h) / 4` 不能仅凭
+     `int` token 进入 cast；先排除 `keyword.member`，同时保留 `(int)-8` 等真实
+     cast。判定器 `primitive_constants`。
 3. **调用形状与静态性强约束**：
    - 动作：发射调用指令时，接收者槽位必须由目标方法的静态性确定（实例方法绑定 `this`，静态方法无接收者槽）。
    - 理由：防止属性或方法静态性判定失配导致 IRGen 阶段解引用空指针。

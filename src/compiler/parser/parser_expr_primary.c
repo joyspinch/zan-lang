@@ -337,7 +337,19 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         case TK_DOUBLE: case TK_FLOAT: case TK_DECIMAL:
         case TK_BOOL: case TK_CHAR: case TK_NINT:
         case TK_STRING: case TK_OBJECT: {
+            zan_lexer_mark_t saved_lex;
+            zan_lexer_mark(p->lex, &saved_lex, p->arena);
+            zan_token_t saved_cur = p->current;
+            zan_token_t saved_prev = p->previous;
             parser_advance(p);
+            /* (int.MaxValue - h) groups a static-member expression. A type
+             * keyword alone is insufficient evidence of a cast. */
+            if (zan_lexer_peek(p->lex).kind == TK_DOT) {
+                zan_lexer_reset(p->lex, &saved_lex);
+                p->current = saved_cur;
+                p->previous = saved_prev;
+                break;
+            }
             zan_ast_node_t *ctype = parse_type_ref(p);
             parser_expect(p, TK_RPAREN);
             zan_ast_node_t *coperand = parse_unary(p);
