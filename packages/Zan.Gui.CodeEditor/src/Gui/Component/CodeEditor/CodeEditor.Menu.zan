@@ -1,12 +1,15 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-using Gui.Backend;
+using Gui.Widget;
 
 namespace Gui.Component.CodeEditor;
 
 // CodeEditor 分部：上下文右键菜单与断点调试菜单分发
 public partial class CodeEditor {
+    private ContextMenu contextMenu;
+    private CodeEditorMenuSession contextSession;
+
     // 返回并清除右键菜单请求的待处理宿主命令
     // （如"find"、"gotoline"）；无命令时返回空字符串。
     public string TakeCommand() {
@@ -59,7 +62,7 @@ public partial class CodeEditor {
     public List<ContextMenuItem> BuildBreakpointMenuItems() {
         List<ContextMenuItem> items = new List<ContextMenuItem>();
         items.Add(new ContextMenuItem(
-            CodeEditor.T("Toggle Breakpoint", "切换断点"), "F9", 30));
+        CodeEditor.T("Toggle Breakpoint", "切换断点"), "F9", 30));
         if (hostBreakpointItems != null && hostBreakpointItems.Count > 0) {
             items.Add(new ContextMenuItem("", "", 0));
             for (int hi = 0; hi < hostBreakpointItems.Count; hi = hi + 1) {
@@ -68,7 +71,7 @@ public partial class CodeEditor {
         }
         items.Add(new ContextMenuItem("", "", 0));
         items.Add(new ContextMenuItem(
-            CodeEditor.T("Remove All Breakpoints", "删除所有断点"), "", 31));
+        CodeEditor.T("Remove All Breakpoints", "删除所有断点"), "", 31));
         return items;
     }
 
@@ -107,247 +110,189 @@ public partial class CodeEditor {
             new ContextMenuItem("", "", 0),
             new ContextMenuItem(CodeEditor.T("Find...", "查找..."), "Ctrl+F", 9),
             new ContextMenuItem(CodeEditor.T("Go to Line...", "跳转到行..."), "Ctrl+G", 10) };
-        return items;
-    }
-
-    // 组装当前右键菜单：基础项 + 快速修复项 + 宿主项。
-    // 宿主项排在最后（宿主能力是 IDE 层的增值项），前面用
-    // 一条分隔行隔开。
-    public List<ContextMenuItem> BuildCtxMenuItems() {
-        List<ContextMenuItem> menuItems = CodeEditor.BuildCtxMenu();
-        // 快速修复：光标所在行使用了
-        // 未导入命名空间的 stdlib 类型时，提示插入缺失的 `using`。
-        string qfNs = QuickFixNs();
-        if (qfNs.Length > 0) {
-            menuItems.Insert(0, new ContextMenuItem("", "", 0));
-            menuItems.Insert(0, new ContextMenuItem(CodeEditor.T("Add using ", "添加 using ") + qfNs + ";", "Ctrl+.", 20));
+            return items;
         }
-        // VS 对齐的实例相关项：代码片段、调试断点、代码折叠。
-        // 它们取决于光标位置与当前折叠状态，只能在实例里组装
-        // （BuildCtxMenu 是静态的，只放与位置无关的基础项）。
-        menuItems.Add(new ContextMenuItem("", "", 0));
-        menuItems.Add(new ContextMenuItem(
+
+        // 组装当前右键菜单：基础项 + 快速修复项 + 宿主项。
+        // 宿主项排在最后（宿主能力是 IDE 层的增值项），前面用
+        // 一条分隔行隔开。
+        public List<ContextMenuItem> BuildCtxMenuItems() {
+            List<ContextMenuItem> menuItems = CodeEditor.BuildCtxMenu();
+            // 快速修复：光标所在行使用了
+            // 未导入命名空间的 stdlib 类型时，提示插入缺失的 `using`。
+            string qfNs = QuickFixNs();
+            if (qfNs.Length > 0) {
+                menuItems.Insert(0, new ContextMenuItem("", "", 0));
+                menuItems.Insert(0, new ContextMenuItem(CodeEditor.T("Add using ", "添加 using ") + qfNs + ";", "Ctrl+.", 20));
+            }
+            // VS 对齐的实例相关项：代码片段、调试断点、代码折叠。
+            // 它们取决于光标位置与当前折叠状态，只能在实例里组装
+            // （BuildCtxMenu 是静态的，只放与位置无关的基础项）。
+            menuItems.Add(new ContextMenuItem("", "", 0));
+            menuItems.Add(new ContextMenuItem(
             CodeEditor.T("Insert Snippet...", "插入代码片段..."), "", 21));
-        menuItems.Add(new ContextMenuItem(
+            menuItems.Add(new ContextMenuItem(
             CodeEditor.T("Toggle Breakpoint", "切换断点"), "F9", 22));
-        bool canFold = this.FoldableAt(curLine) && !this.FoldedAt(curLine);
-        bool isFolded = this.FoldedAt(curLine) || this.FoldHides(curLine);
-        if (canFold || isFolded) {
-            menuItems.Add(new ContextMenuItem("", "", 0));
-            if (canFold) {
-                menuItems.Add(new ContextMenuItem(
+            bool canFold = this.FoldableAt(curLine) && !this.FoldedAt(curLine);
+            bool isFolded = this.FoldedAt(curLine) || this.FoldHides(curLine);
+            if (canFold || isFolded) {
+                menuItems.Add(new ContextMenuItem("", "", 0));
+                if (canFold) {
+                    menuItems.Add(new ContextMenuItem(
                     CodeEditor.T("Fold", "折叠"), "Ctrl+M", 23));
-            }
-            if (isFolded) {
-                menuItems.Add(new ContextMenuItem(
+                }
+                if (isFolded) {
+                    menuItems.Add(new ContextMenuItem(
                     CodeEditor.T("Unfold", "展开"), "Ctrl+Shift+M", 24));
-            }
-            if (this.AnyFolded()) {
-                menuItems.Add(new ContextMenuItem(
+                }
+                if (this.AnyFolded()) {
+                    menuItems.Add(new ContextMenuItem(
                     CodeEditor.T("Unfold All", "全部展开"), "", 25));
+                }
+            }
+            if (hostCtxItems != null && hostCtxItems.Count > 0) {
+                menuItems.Add(new ContextMenuItem("", "", 0));
+                for (int hi = 0; hi < hostCtxItems.Count; hi = hi + 1) {
+                    menuItems.Add(hostCtxItems[hi]);
+                }
+            }
+            return menuItems;
+        }
+        // Execute the same semantic action with or without a mounted editor.
+        public void RunCtxAction(App app, int act) {
+            Control root = app != null ? app.rootControl : null;
+            int generation = app != null ? app.inputRootGeneration : 0;
+            long sequence = app != null ? app.window.EventSeq() : 0;
+            this.DispatchCtxAction(act);
+            this.RestoreEditorFocus(app, root, generation, sequence);
+        }
+
+        // 派发右键菜单动作：控件内行为直接执行，宿主命令写进
+        // ctxCmd（宿主经 TakeCommand() 取走）。与 RunCtxAction
+        // 同一条路径，只是没有窗口上下文时也能用。
+        public void DispatchCtxAction(int act) {
+            this.CloseContextMenu();
+            if (act == 1) { CutSelection(); CheckErrors(); }
+            else if (act == 2) { CopySelection(); }
+            else if (act == 3) { PasteClipboard(); CheckErrors(); UpdateCompletion(); }
+            else if (act == 4) { DeleteAtCaret(); CheckErrors(); }
+            else if (act == 5) { SelectAll(); }
+            else if (act == 6) { ToggleComment(); CheckErrors(); }
+            else if (act == 7) { DuplicateLine(); CheckErrors(); }
+            else if (act == 8) { DeleteLine(); CheckErrors(); }
+            else if (act == 9) { ctxCmd = "find"; }
+            else if (act == 10) { ctxCmd = "gotoline"; }
+            else if (act == 11) { ctxCmd = "gotodef"; }
+            else if (act == 12) { ctxCmd = "findrefs"; }
+            else if (act == 13) { AddCaretAbove(); }
+            else if (act == 14) { AddCaretBelow(); }
+            else if (act == 15) { Undo(); CheckErrors(); }
+            else if (act == 16) { Redo(); CheckErrors(); }
+            else if (act == 20) { ApplyQuickFix(); }
+            else if (act == 21) { this.ShowSnippetPicker(); }
+            else if (act == 22) { this.ToggleBreakpoint(curLine); }
+            else if (act == 23) { this.ToggleFold(curLine); }
+            else if (act == 24) { this.ExpandFoldAt(curLine); }
+            else if (act == 25) { this.UnfoldAll(); }
+            else if (act == 30) { this.ToggleBreakpoint(ctxBpLine); }
+            else if (act == 31) { this.ClearBreakpoints(); }
+            else if (act >= 100) {
+                string hc = ctxMenuMode == 1 ? HostBreakpointCmd(act) : HostCtxCmd(act);
+                if (hc.Length > 0) { ctxCmd = hc; }
             }
         }
-        if (hostCtxItems != null && hostCtxItems.Count > 0) {
-            menuItems.Add(new ContextMenuItem("", "", 0));
-            for (int hi = 0; hi < hostCtxItems.Count; hi = hi + 1) {
-                menuItems.Add(hostCtxItems[hi]);
-            }
-        }
-        return menuItems;
-    }
-    // 按 id 执行右键菜单动作（见 BuildCtxMenu）。
-    public void RunCtxAction(App app, int act) {
-        this.DispatchCtxAction(act);
-        if (app != null) {
-            // 菜单本体也是阻挡区：点菜单项的那次按下把焦点落到了菜
-            // 单矩形上（编辑器失焦），关闭后把键盘交还给编辑器——否
-            // 则选完「撤销」就不能接着打字了。
-            app.focus.SetFocused(this.lastId);
-            app.RequestRedraw();
-        }
-    }
 
-    // 派发右键菜单动作：控件内行为直接执行，宿主命令写进
-    // ctxCmd（宿主经 TakeCommand() 取走）。与 RunCtxAction
-    // 同一条路径，只是没有窗口上下文时也能用。
-    public void DispatchCtxAction(int act) {
-        if (act == 1) { CutSelection(); CheckErrors(); }
-        else if (act == 2) { CopySelection(); }
-        else if (act == 3) { PasteClipboard(); CheckErrors(); UpdateCompletion(); }
-        else if (act == 4) { DeleteAtCaret(); CheckErrors(); }
-        else if (act == 5) { SelectAll(); }
-        else if (act == 6) { ToggleComment(); CheckErrors(); }
-        else if (act == 7) { DuplicateLine(); CheckErrors(); }
-        else if (act == 8) { DeleteLine(); CheckErrors(); }
-        else if (act == 9) { ctxCmd = "find"; }
-        else if (act == 10) { ctxCmd = "gotoline"; }
-        else if (act == 11) { ctxCmd = "gotodef"; }
-        else if (act == 12) { ctxCmd = "findrefs"; }
-        else if (act == 13) { AddCaretAbove(); }
-        else if (act == 14) { AddCaretBelow(); }
-        else if (act == 15) { Undo(); CheckErrors(); }
-        else if (act == 16) { Redo(); CheckErrors(); }
-        else if (act == 20) { ApplyQuickFix(); }
-        else if (act == 21) { this.ShowSnippetPicker(); }
-        else if (act == 22) { this.ToggleBreakpoint(curLine); }
-        else if (act == 23) { this.ToggleFold(curLine); }
-        else if (act == 24) { this.ExpandFoldAt(curLine); }
-        else if (act == 25) { this.UnfoldAll(); }
-        else if (act == 30) { this.ToggleBreakpoint(ctxBpLine); }
-        else if (act == 31) { this.ClearBreakpoints(); }
-        else if (act >= 100) {
-            string hc = HostCtxCmd(act);
-            if (hc.Length > 0) { ctxCmd = hc; }
-        }
-        ctxOpen = false;
-    }
+        // 右键菜单当前是否打开。
+        public bool CtxMenuOpen() { return ctxOpen; }
 
-    // 右键菜单当前是否打开。
-    public bool CtxMenuOpen() { return ctxOpen; }
+        // 右键菜单的种类：0 = 文本区主菜单，1 = 行号槽的断点菜单。
+        public int CtxMenuMode() { return ctxMenuMode; }
 
-    // 右键菜单的种类：0 = 文本区主菜单，1 = 行号槽的断点菜单。
-    public int CtxMenuMode() { return ctxMenuMode; }
+        // 断点菜单针对的行（0 起）。
+        public int CtxBreakpointLine() { return ctxBpLine; }
 
-    // 断点菜单针对的行（0 起）。
-    public int CtxBreakpointLine() { return ctxBpLine; }
+        // 当前准备后的行号槽宽度（逻辑像素）。
+        public int GutterWidth() { return gutterWLast; }
 
-    // 上一帧的行号槽宽度（逻辑像素）。
-    public int GutterWidth() { return gutterWLast; }
-
-    // 将右键菜单绘制为顶层浮层（限制在整个
-    // 窗口而非编辑器矩形内），并处理菜单项点击。必须在
-    // 帧末调用，以免被其他内容覆盖。
-    public void RenderCtxMenu(App app) {
-        if (!ctxOpen) { return; }
-        Canvas c = app.canvas;
-        Gui.Theme t = app.theme;
-        EditorPalette pal = EditorPalette.For(t);
-        int fontSize = Style.FontFallback(app, "medium");
-        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
-        if (lineH < 1) { lineH = 1; }
-
-        List<ContextMenuItem> menuItems = ctxMenuMode == 1
+        private void ShowContextMenu(App app, int x, int y) {
+            if (app == null || !app.isRunning || !this.InputFocusEligible(app, app.rootControl)) { return; }
+            this.CloseContextMenu();
+            if (!app.isRunning || !this.InputFocusEligible(app, app.rootControl)) { return; }
+            ctxX = x;
+            ctxY = y;
+            acActive = false;
+            refPopOpen = false;
+            ContextMenu menu = new ContextMenu();
+            menu.SetProp("style", "overflow-y:auto");
+            List<ContextMenuItem> source = ctxMenuMode == 1
             ? this.BuildBreakpointMenuItems() : this.BuildCtxMenuItems();
-        int itemH = lineH;
-        int sepH = app.Scale(7);
-        int mW = app.Scale(150);
-        for (int wi = 0; wi < menuItems.Count; wi = wi + 1) {
-            ContextMenuItem item = menuItems[wi];
-            if (item.action != 0) {
-                int lw = Canvas.MeasureText(item.label, fontSize)
-                         + Canvas.MeasureText(item.key, fontSize) + app.Scale(44);
-                if (lw > mW) { mW = lw; }
-            }
-        }
-        int mH = app.Scale(6);
-        for (int hi = 0; hi < menuItems.Count; hi = hi + 1) {
-            if (menuItems[hi].action == 0) { mH = mH + sepH; } else { mH = mH + itemH; }
-        }
-
-        int winW = c.Width();
-        int winH = c.Height();
-        int topB = app.titlebarH;
-        // 菜单放不下时先去掉次要项：VS 的菜单不会弹到屏幕外——
-        // 宁可少几项，也不能让最后几项点不到。删除顺序按 VS 的
-        // 菜单口径排：VS 的代码右键里本来就没有「跳转到行」
-        // 「查找」（它们在编辑/转到菜单里），先去掉这两个。
-        int availH = winH - topB - app.Scale(8);
-        List<int> droppable = new List<int>();
-        droppable.Add(10);
-        droppable.Add(9);
-        droppable.Add(7);
-        droppable.Add(8);
-        droppable.Add(13);
-        droppable.Add(14);
-        for (int di = 0; di < droppable.Count; di = di + 1) {
-            if (mH <= availH) { break; }
-            for (int ri = menuItems.Count - 1; ri >= 0; ri = ri - 1) {
-                if (menuItems[ri].action == droppable[di]) {
-                    menuItems.RemoveAt(ri);
-                    mH = mH - itemH;
-                    break;
+            for (int i = 0; i < source.Count; i = i + 1) {
+                ContextMenuItem item = source[i];
+                if (item.action == 0) { menu.AddSeparator(); }
+                else {
+                    MenuItem entry = MenuItem.Item(item.label, "", item.action);
+                    entry.shortcut = item.key;
+                    menu.AddItem(entry);
                 }
             }
+            CodeEditorMenuSession session = new CodeEditorMenuSession();
+            session.Owner = this;
+            session.Host = app;
+            session.Root = app.rootControl;
+            session.Generation = app.inputRootGeneration;
+            session.Menu = menu;
+            session.Retirement = app.WatchInputRetirement(this, session);
+            contextMenu = menu;
+            contextSession = session;
+            ctxOpen = true;
+            menu.ActionSelected.AddS(session.Selected);
+            menu.Dismissed.AddS(session.Dismissed);
+            menu.ShowAt(app, x, y);
+            if (contextSession == session && !menu.IsOpen()) { this.CloseContextMenu(); }
         }
-        for (int ri = menuItems.Count - 1; ri > 0; ri = ri - 1) {
-            if (menuItems[ri].action == 0 && menuItems[ri - 1].action == 0) {
-                menuItems.RemoveAt(ri);
-                mH = mH - sepH;
-            }
-        }
-        int mX = ctxX;
-        int mY = ctxY;
-        if (mX + mW > winW) { mX = winW - mW - app.Scale(4); }
-        if (mY + mH > winH) { mY = winH - mH - app.Scale(4); }
-        if (mX < 0) { mX = 0; }
-        if (mY < topB) { mY = topB; }
 
-        // 菜单打开期间整窗吞掉主键点击。菜单是模态浮层（Windows
-        // 口径）：菜单外的那一下点击用来「关菜单」，不该再落回下层
-        // 控件（功能区按钮、文件树行……）——此前只挡菜单自身矩形，
-        // 关闭菜单的同时把下层也点了一下，就是「浮层打开期间鼠标操作
-        // 穿透到下层表面」。全窗拦截区先注册、菜单本体后注册（命中区
-        // 后注册者优先），菜单内部照常可点。它只吞点击、不画像素，
-        // 故登记为 hit-only：不能让它把原生浮层（WebView）整片裁掉。
-        int maskId = app.BlockHitsRect(0, 0, c.Width(), c.Height());
-        app.hitOnlyBlockers.Add(maskId);
-        c.FillRoundRect(mX + 2, mY + 2, mW, mH, app.Scale(4), pal.shadow);
-        c.SurfaceRoundRect(mX, mY, mW, mH, app.Scale(4), pal.popupBg, pal.border, 1);
-        app.BlockHitsRect(mX, mY, mW, mH);
-
-        int ry = mY + app.Scale(3);
-        for (int ri = 0; ri < menuItems.Count; ri = ri + 1) {
-            ContextMenuItem item = menuItems[ri];
-            if (item.action == 0) {
-                c.FillRect(mX + app.Scale(6), ry + sepH / 2, mW - app.Scale(12), 1, pal.border);
-                ry = ry + sepH;
-            } else {
-                bool hov = app.mouseX >= mX && app.mouseX < mX + mW
-                           && app.mouseY >= ry && app.mouseY < ry + itemH;
-                int tcol = pal.menuText;
-                if (hov) {
-                    c.FillRect(mX + app.Scale(2), ry, mW - app.Scale(4), itemH, pal.selBg);
-                    tcol = pal.textSel;
-                }
-                int ty = Canvas.CenterTextY(ry, itemH, fontSize);
-                c.DrawText(mX + app.Scale(12), ty, item.label, tcol, fontSize);
-                int kw = Canvas.MeasureText(item.key, fontSize);
-                c.DrawText(mX + mW - kw - app.Scale(10), ty, item.key, pal.muted, fontSize);
-                ry = ry + itemH;
+        private void CloseContextMenu() {
+            CodeEditorMenuSession session = contextSession;
+            ContextMenu menu = contextMenu;
+            contextSession = null;
+            contextMenu = null;
+            ctxOpen = false;
+            if (session != null) { session.Invalidate(); }
+            if (menu != null) {
+                menu.ClearCallbacks();
+                App host = menu.App;
+                if (host != null && host.overlayHost != null) { host.overlayHost.Hide(menu); }
             }
         }
 
-        // 左键点击选中菜单项或关闭菜单。长按开菜单的那次
-        // 收尾释放不算：不守卫的话，触摸长按一松手菜单就被
-        // 这次释放原点关闭（本函数读原始事件序，不经
-        // ClickAvailable 的全局守卫）。
-        if (app.EventKind() == 3 && app.window.EventButton() == 0
-            && !app.LongPressFired()) {
-            bool inside = app.mouseX >= mX && app.mouseX < mX + mW
-                          && app.mouseY >= mY && app.mouseY < mY + mH;
-            if (inside) {
-                int cy2 = mY + app.Scale(3);
-                int chosen = 0 - 1;
-                for (int ci = 0; ci < menuItems.Count; ci = ci + 1) {
-                    ContextMenuItem item = menuItems[ci];
-                    int rh = itemH;
-                    if (item.action == 0) { rh = sepH; }
-                    if (item.action != 0 && app.mouseY >= cy2 && app.mouseY < cy2 + rh) {
-                        chosen = item.action;
-                    }
-                    cy2 = cy2 + rh;
-                }
-                if (chosen >= 0) { RunCtxAction(app, chosen); }
-            } else {
-                ctxOpen = false;
-                // 关菜单的那一下按下被全窗拦截区吞掉了（下层控件没
-                // 收到它，焦点也落到了拦截区上），把键盘焦点还给编辑
-                // 器：菜单是编辑器的浮层，关掉后应继续能打字。
-                app.focus.SetFocused(this.lastId);
-                app.RequestRedraw();
+        private void RestoreEditorFocus(App host, Control root, int generation, long sequence) {
+            if (host == null || !host.isRunning || host.rootControl != root
+            || host.inputRootGeneration != generation || host.window.EventSeq() != sequence
+            || this.App != host || !this.InputFocusEligible(host, root)
+            || host.overlayHost.ActiveRoot() != null) { return; }
+            this.Focus(host);
+            if (host.isRunning && this.App == host && host.rootControl == root
+            && host.inputRootGeneration == generation && host.window.EventSeq() == sequence) {
+                host.RequestRedraw();
             }
+        }
+
+        void ContextMenuFinished(CodeEditorMenuSession session, Control sender, bool selected) {
+            if (contextSession != session || sender != contextMenu) { return; }
+            App host = session.Host;
+            Control root = session.Root;
+            int generation = session.Generation;
+            long sequence = host != null ? host.window.EventSeq() : 0;
+            int action = selected ? contextMenu.SelectedAction() : -1;
+            this.CloseContextMenu();
+            if (host == null || !host.isRunning || host.rootControl != root
+            || host.inputRootGeneration != generation || this.App != host
+            || !this.InputFocusEligible(host, root)) { return; }
+            if (selected && action >= 0) { this.DispatchCtxAction(action); }
+            this.RestoreEditorFocus(host, root, generation, sequence);
+        }
+
+        void ContextMenuRetired(CodeEditorMenuSession session) {
+            if (contextSession == session) { this.CloseContextMenu(); }
         }
     }
-
-
-}

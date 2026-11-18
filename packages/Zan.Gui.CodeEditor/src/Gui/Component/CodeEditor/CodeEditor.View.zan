@@ -1,0 +1,200 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+public partial class CodeEditor {
+    private CodeCompletionDescription completionDescription;
+    private CodeSignatureLayout signatureLayout;
+    private bool preparingEditor;
+    private int preparedAnimationClock = -1;
+    private int editorLayoutRevision;
+
+    public static void Install() {
+        ControlFactory.Register("CodeEditor", (string kind) => new CodeEditor());
+    }
+    public override string Kind() { return "CodeEditor"; }
+    public override string StyleType() { return "codeeditor"; }
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> properties = new List<PropSpec>();
+        PropSpec path = PropSpec.Text("path", "Document Path"); path.ViaExtra(); properties.Add(path);
+        PropSpec text = PropSpec.Text("text", "Code Content"); text.ViaExtra(); properties.Add(text);
+        return properties;
+    }
+    public override string GetExtra(string key) {
+        if (key == "path") { return documentPath; }
+        if (key == "text") { return this.GetText(); }
+        return base.GetExtra(key);
+    }
+    public override bool SetExtra(string key, string value) {
+        if (key == "path") { documentPath = value; return true; }
+        if (key == "text") { this.LoadText(value); return true; }
+        return base.SetExtra(key, value);
+    }
+    private int EditorLineHeight(App app) {
+        int height = Canvas.FontHeight(FontSize(app.theme)) + app.Scale(4);
+        return height > 0 ? height : 1;
+    }
+    public override void OnMeasure(App app) {
+        prefW = app.Scale(600); prefH = app.Scale(400);
+    }
+    public override void Arrange(int x, int y, int width, int height) {
+        bx = x; by = y; bw = width > 0 ? width : 0; bh = height > 0 ? height : 0;
+        editorLayoutRevision = editorLayoutRevision + 1;
+        App app = this.App;
+        if (app != null) { this.PrepareEditorView(app); }
+    }
+    private CodeEditorViewProof CaptureEditorView(App host) {
+        CodeEditorViewProof proof = new CodeEditorViewProof();
+        proof.Host = host; proof.Root = host.rootControl; proof.Surface = host.canvas;
+        proof.Generation = host.inputRootGeneration; proof.Sequence = host.window.EventSeq();
+        proof.Revision = editorLayoutRevision; proof.Path = documentPath; proof.Stamp = TextStamp();
+        proof.Line = curLine; proof.Column = curCol; proof.Focused = host.focus.focusedControl;
+        return proof;
+    }
+    private bool EditorViewCurrent(CodeEditorViewProof proof) {
+        App host = proof.Host;
+        return host != null && host.isRunning && this.App == host && host.rootControl == proof.Root
+        && host.canvas == proof.Surface && host.inputRootGeneration == proof.Generation
+        && host.window.EventSeq() == proof.Sequence && editorLayoutRevision == proof.Revision
+        && documentPath == proof.Path && TextStamp() == proof.Stamp && curLine == proof.Line
+        && curCol == proof.Column && host.focus.focusedControl == proof.Focused && this.StyleVisible();
+    }
+    private void NormalizeEditorViewport(App app) {
+        int lineH = this.EditorLineHeight(app);
+        int rows = bh / lineH;
+        if (rows < 1) { rows = 1; }
+        if (editorScrollY < 0) { editorScrollY = scrollLine * lineH; targetScrollY = editorScrollY; }
+        if (AnyFolded()) {
+            UnfoldContaining(curLine);
+            if (execLine >= 0) { UnfoldContaining(execLine); }
+        }
+        int count = AnyFolded() ? FoldVisibleTotal() : lines.Count;
+        maxScrollY = (count - rows) * lineH;
+        if (maxScrollY < 0) { maxScrollY = 0; }
+        // 仅当本帧光标实际移动时才保持其在视野内；
+        // 单纯的滚轮/滚动条滚动不改变光标行，不应把视图拉回光标处。
+        if (curLine != ensuredCaretLine) {
+            int caretRow = FoldVisibleRowOf(curLine);
+            int topL = editorScrollY / lineH;
+            if (caretRow < topL) {
+                targetScrollY = caretRow * lineH;
+                editorScrollY = targetScrollY;
+                scrollLine = caretRow;
+                lastScrollMs = app.nowMs;
+                lastHoverMoveMs = app.nowMs;
+                hoverTip = null;
+            } else if (caretRow >= topL + rows) {
+                targetScrollY = (caretRow - rows + 1) * lineH;
+                editorScrollY = targetScrollY;
+                scrollLine = caretRow - rows + 1;
+                lastScrollMs = app.nowMs;
+                lastHoverMoveMs = app.nowMs;
+                hoverTip = null;
+            }
+            ensuredCaretLine = curLine;
+        }
+        if (editorScrollY > maxScrollY) { editorScrollY = maxScrollY; }
+        if (editorScrollY < 0) { editorScrollY = 0; }
+        if (targetScrollY > maxScrollY) { targetScrollY = maxScrollY; }
+        if (targetScrollY < 0) { targetScrollY = 0; }
+        scrollLine = editorScrollY / lineH;
+
+    }
+    private bool PrepareEditorView(App app, bool prepareHover = true) {
+        if (preparingEditor || app == null || bw <= 0 || bh <= 0) { return false; }
+        preparingEditor = true;
+        try {
+            if (!analysisDetached && analysisApp != app) { AttachAnalysis(app); }
+            Rect area = new Rect(bx, by, bw, bh);
+            int lineH = this.EditorLineHeight(app);
+            int fontSize = FontSize(app.theme);
+            gutterWLast = app.Scale(48);
+            int textX = bx + gutterWLast + app.theme.paddingSmall;
+            this.PrepareEditorState(app, area);
+            BeginLensFrame(app);
+            BuildRowLayout(area, lineH, Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(3));
+            pageRows = VisibleRowCount();
+            codeLens.Clear();
+            for (int i = 0; i < visibleRows.Count; i++) {
+                CeVisibleRowLayout row = visibleRows[i];
+                if (row.lensY < 0 || row.line >= lines.Count) { continue; }
+                string text = lines[row.line];
+                string declaration = row.decl.Length > 0 ? row.decl : CodeEditor.DeclNameAt(text);
+                if (declaration.Length == 0) { continue; }
+                int refs = LensRefCountBudgeted(declaration, row.line);
+                if (refs < 0) { continue; }
+                string label = refs == 1 ? "1 reference" : Convert.ToString(refs) + " references";
+                int x = textX + Canvas.MeasureText(CodeEditor.LeadWs(text), fontSize);
+                int width = Canvas.MeasureText(label, Style.FontFallback(app, "small"));
+                if (x + width < bx + bw) { codeLens.Add(new CodeLensRef(row.line, declaration, x, row.lensY, width, refs)); }
+            }
+            CodeEditorViewProof proof = this.CaptureEditorView(app);
+            bool focused = this.HasFocus(app);
+            this.PrepareCompletionPopup(app, area, lineH, textX, fontSize, focused, proof);
+            if (!EditorViewCurrent(proof)) { return false; }
+            this.PrepareSignaturePopup(app, area, lineH, textX, fontSize, focused, proof);
+            if (!EditorViewCurrent(proof)) { return false; }
+            this.PrepareReferencePopup(app, area);
+            if (prepareHover) { this.PrepareHover(app, area, lineH, textX, fontSize); }
+            return EditorViewCurrent(proof);
+        } finally { preparingEditor = false; }
+    }
+    private void PrepareEditorState(App app, Rect area) {
+        Theme t = app.theme;
+        StyleBox textStyle = Style.Part(app, "codeeditor", "text", "", "", "", Style.SNormal());
+        cssKw = Style.Part(app, "codeeditor", "keyword",
+        "", "", "", Style.SNormal()).FgOr(0);
+        cssTy = Style.Part(app, "codeeditor", "type",
+        "", "", "", Style.SNormal()).FgOr(0);
+        cssStr = Style.Part(app, "codeeditor", "string",
+        "", "", "", Style.SNormal()).FgOr(0);
+        cssCom = Style.Part(app, "codeeditor", "comment",
+        "", "", "", Style.SNormal()).FgOr(0);
+        cssNum = Style.Part(app, "codeeditor", "number",
+        "", "", "", Style.SNormal()).FgOr(0);
+        UpdateAnalysisPalette(t, textStyle.FgOr(0));
+        RequestAnalysis();
+        this.NormalizeEditorViewport(app);
+        lastDiagLine = curLine;
+        InvalidateDiagStale();
+        this.UpdateBracketPair();
+        if (preparedAnimationClock != app.nowMs) {
+            preparedAnimationClock = app.nowMs;
+            int lineH = this.EditorLineHeight(app);
+            // 平滑滚动追赶：每帧按指数衰减向 targetScrollY 逼近
+            if (!barDragging && editorScrollY != targetScrollY) {
+                int diff = targetScrollY - editorScrollY;
+                int step = diff * 35 / 100;
+                if (step == 0) {
+                    if (diff > 0) { step = 1; }
+                    else { step = 0 - 1; }
+                }
+                editorScrollY = editorScrollY + step;
+                scrollLine = editorScrollY / lineH;
+                lastScrollMs = app.nowMs;
+                lastHoverMoveMs = app.nowMs;
+                hoverTip = null;
+                app.NoteScrollDamage(area.x, area.y, area.width, area.height);
+            }
+
+        }
+    }
+    private void PrepareReferencePopup(App app, Rect area) {
+        refPopGW = 0; refPopGH = 0; refPopShown = 0;
+        if (!refPopOpen || refPopLines.Count == 0) { return; }
+        int shown = refPopLines.Count > 10 ? 10 : refPopLines.Count;
+        int rowH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
+        int width = app.Scale(440);
+        if (width > area.width - app.Scale(20)) { width = area.width - app.Scale(20); }
+        int height = rowH + shown * rowH + app.Scale(6);
+        int x = refPopX; int y = refPopY;
+        if (x + width > area.Right()) { x = area.Right() - width - app.Scale(6); }
+        if (x < area.x) { x = area.x + app.Scale(2); }
+        if (y + height > area.Bottom()) { y = area.Bottom() - height - app.Scale(4); }
+        if (y < area.y) { y = area.y + app.Scale(2); }
+        refPopGX = x; refPopGY = y; refPopGW = width; refPopGH = height;
+        refPopRowH = rowH; refPopHeadH = rowH; refPopShown = shown;
+    }
+}

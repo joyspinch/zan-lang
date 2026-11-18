@@ -1,0 +1,175 @@
+using System;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+public partial class CodeEditor {
+    private Rect debugHoverBounds;
+    private Rect symbolHoverBounds;
+    private Rect linkUnderline;
+
+    private void SyncHoverDwell(App app) {
+        int stamp = TextStamp();
+        if (hoverDwellPath == documentPath && hoverDwellStamp == stamp
+        && hoverDwellScrollY == editorScrollY) { return; }
+        hoverDwellPath = documentPath;
+        hoverDwellStamp = stamp;
+        hoverDwellScrollY = editorScrollY;
+        lastHoverMoveMs = app.nowMs;
+    }
+
+    // Pointer-derived content and callback results are prepared before painting.
+    private void PrepareHover(App app, Rect area, int lineH, int textX, int font) {
+        debugHoverBounds = null; symbolHoverBounds = null; linkUnderline = null;
+        this.SyncHoverDwell(app);
+        bool free = !app.PointerCaptured();
+        bool scrolling = barDragging || editorScrollY != targetScrollY || app.nowMs - lastScrollMs < 450;
+        if (!free || scrolling) { return; }
+        if (execLine >= 0 && dbgVars.Count > 0) {
+            hoverTip = null;
+            if (app.mouseX >= textX && area.Contains(app.mouseX, app.mouseY)) {
+                int row = LineAtY(lineH, app.mouseY);
+                if (row >= 0 && row < lines.Count) {
+                    int column = CodeEditor.ColFromX(lines[row], app.mouseX - textX, font);
+                    hoverTip = CodeEditor.LookupVarRaw(dbgVars, CodeEditor.WordAt(lines[row], column));
+                    hoverTipX = app.mouseX; hoverTipY = app.mouseY;
+                }
+            }
+            if (hoverTip != null) { this.PrepareDebugHover(app, area, font); }
+        }
+        if (!acActive && !ctxOpen && Modifiers.HasCtrl(app.window.EventMods())
+        && app.mouseX >= textX && area.Contains(app.mouseX, app.mouseY)) {
+            int row = LineAtY(lineH, app.mouseY);
+            if (row >= 0 && row < lines.Count) {
+                string text = lines[row];
+                int column = CodeEditor.ColFromX(text, app.mouseX - textX, font);
+                int start = Math.Max(0, Math.Min(column, text.Length)); int end = start;
+                while (start > 0 && CodeEditor.IsIdentByte(text[start - 1] & 255)) { start = start - 1; }
+                while (end < text.Length && CodeEditor.IsIdentByte(text[end] & 255)) { end = end + 1; }
+                if (end > start && LineTopY(row) >= 0) {
+                    linkUnderline = new Rect(textX + Canvas.MeasureText(text.Substring(0, start), font),
+                    LineTopY(row) + (lineH + Canvas.FontHeight(font)) / 2 + app.Scale(1),
+                    Canvas.MeasureText(text.Substring(start, end - start), font), app.Scale(1));
+                }
+            }
+        }
+        if (acActive || ctxOpen || refPopOpen || mouseSelecting || execLine >= 0) { return; }
+        string word = WordAtMouse(app, area, app.Scale(48), font);
+        if (word.Length == 0) { return; }
+        int wait = 450 - (app.nowMs - lastHoverMoveMs);
+        int scrollWait = 450 - (app.nowMs - lastScrollMs);
+        if (scrollWait > wait) { wait = scrollWait; }
+        if (wait > 0) { app.RequestWakeFrameIn(wait); return; }
+        int line = LineAtY(lineH, app.mouseY);
+        int col = line >= 0 && line < lines.Count ? CodeEditor.ColFromX(lines[line], app.mouseX - textX, font) : 0;
+        CodeEditorViewProof proof = this.CaptureEditorView(app);
+        int pointerX = app.mouseX; int pointerY = app.mouseY;
+        int offset = editorScrollY; int target = targetScrollY;
+        string signature = line >= 0 && line < lines.Count ? LspHoverFor(word, line, col) : "";
+        if (!EditorViewCurrent(proof) || app.mouseX != pointerX || app.mouseY != pointerY
+        || editorScrollY != offset || targetScrollY != target || app.PointerCaptured()) { return; }
+        string doc = "";
+        if (signature.Length == 0) {
+            signature = SigHelpForHover(word); doc = CodeEditor.DescDoc(word);
+            if (doc.Length == 0) { doc = CodeEditor.DescKeyword(word); }
+            if (signature.Length == 0 && doc.Length > 0) { signature = word; }
+        }
+        if (signature.Length > 0) { this.PrepareSymbolHover(app, area, font, signature, doc); }
+    }
+
+    private Rect HoverBounds(App app, Rect area, int width, int height, int x, int y, bool debug = false) {
+        if (x + width > area.Right()) { x = area.Right() - width - app.Scale(4); }
+        if (x < area.x) { x = area.x + app.Scale(2); }
+        if (y + height > area.Bottom()) { y = app.mouseY - height - app.Scale(6); }
+        if (y < area.y) { y = area.y + app.Scale(2); }
+        Rect bounds = new Rect(x, y, width, height);
+        int outset = debug ? 1 : 0;
+        if (!app.FrameDamageContains(x - outset, y - outset, width + 2, height + 2)) {
+            app.RequireFullFrame(); app.RequestRedraw();
+            return null;
+        }
+        return bounds;
+    }
+
+    private void PrepareDebugHover(App app, Rect area, int font) {
+        if (hoverRawHl == null) { hoverRawHl = new List<string>(); } else { hoverRawHl.Clear(); }
+        if (hoverHl == null) { hoverHl = new List<string>(); } else { hoverHl.Clear(); }
+        CodeEditor.BuildHoverLines(hoverTip, hoverRawHl);
+        int cap = Math.Max(app.Scale(200), Math.Min(app.Scale(500), area.width - app.Scale(16)));
+        int inner = cap - app.Scale(16);
+        for (int i = 0; i < hoverRawHl.Count; i = i + 1) {
+            string text = hoverRawHl[i];
+            if (Canvas.MeasureText(text, font) > inner) { CodeEditor.WrapText(text, inner, font, hoverHl, 6); }
+            else { hoverHl.Add(text); }
+        }
+        int width = 0;
+        for (int i = 0; i < hoverHl.Count; i = i + 1) { width = Math.Max(width, Canvas.MeasureText(hoverHl[i], font)); }
+        width = Math.Min(cap, width + app.Scale(16));
+        int height = (Canvas.FontHeight(font) + app.Scale(2)) * hoverHl.Count + app.Scale(8);
+        debugHoverBounds = this.HoverBounds(app, area, width, height, hoverTipX + app.Scale(8), hoverTipY + app.Scale(20), true);
+    }
+
+    private void PrepareSymbolHover(App app, Rect area, int font, string signature, string doc) {
+        int padding = app.Scale(8);
+        int cap = Math.Max(app.Scale(220), Math.Min(app.Scale(380), area.width - app.Scale(24)));
+        int inner = cap - padding * 2;
+        if (hoverSiglines == null) { hoverSiglines = new List<string>(); } else { hoverSiglines.Clear(); }
+        if (hoverHlines == null) { hoverHlines = new List<string>(); } else { hoverHlines.Clear(); }
+        CodeEditor.WrapText(signature, inner, font, hoverSiglines, 4);
+        int small = Style.FontFallback(app, "small");
+        if (doc.Length > 0) { CodeEditor.WrapText(doc, inner, small, hoverHlines, 6); }
+        int width = 0;
+        for (int i = 0; i < hoverSiglines.Count; i = i + 1) { width = Math.Max(width, Canvas.MeasureText(hoverSiglines[i], font)); }
+        for (int i = 0; i < hoverHlines.Count; i = i + 1) { width = Math.Max(width, Canvas.MeasureText(hoverHlines[i], small)); }
+        width = Math.Max(app.Scale(120), Math.Min(inner, width) + padding * 2);
+        int height = padding * 2 + hoverSiglines.Count * Canvas.FontHeight(font);
+        if (hoverHlines.Count > 0) { height = height + app.Scale(4) + hoverHlines.Count * (Canvas.FontHeight(small) + app.Scale(2)); }
+        symbolHoverBounds = this.HoverBounds(app, area, width, height, app.mouseX + app.Scale(12), app.mouseY + app.Scale(18));
+    }
+
+    private void ClearPreparedHover(App app, Rect area) {
+        Rect bounds = debugHoverBounds != null ? debugHoverBounds : symbolHoverBounds;
+        if (bounds != null && (bounds.x - 1 < area.x || bounds.y - 1 < area.y
+        || bounds.Right() + 3 > area.Right() || bounds.Bottom() + 3 > area.Bottom())) {
+            app.RequireFullFrame();
+        }
+        debugHoverBounds = null; symbolHoverBounds = null; linkUnderline = null;
+        hoverTip = null;
+    }
+
+    private void PaintPreparedHover(App app, EditorPalette palette, int font) {
+        bool hashing = App.PaintHashSuspend();
+        try { this.PaintHoverSurface(app, palette, font); }
+        finally { App.PaintHashResume(hashing); }
+    }
+
+    private void PaintHoverSurface(App app, EditorPalette palette, int font) {
+        Canvas canvas = app.canvas;
+        Rect bounds = debugHoverBounds;
+        if (bounds != null) {
+            canvas.FillRoundRect(bounds.x - 1, bounds.y - 1, bounds.width + 2, bounds.height + 2, app.Scale(4), palette.shadowStrong);
+            canvas.SurfaceRoundRect(bounds.x, bounds.y, bounds.width, bounds.height, app.Scale(4), palette.hoverBg, palette.accent, 1);
+            int y = bounds.y + app.Scale(4);
+            for (int i = 0; i < hoverHl.Count; i = i + 1) {
+                canvas.DrawText(bounds.x + app.Scale(8), y, hoverHl[i], i == 0 ? palette.signature : palette.str, font);
+                y = y + Canvas.FontHeight(font) + app.Scale(2);
+            }
+        }
+        bounds = symbolHoverBounds;
+        if (bounds != null) {
+            canvas.FillRoundRect(bounds.x + 2, bounds.y + 2, bounds.width, bounds.height, app.Scale(4), palette.shadow);
+            canvas.SurfaceRoundRect(bounds.x, bounds.y, bounds.width, bounds.height, app.Scale(4), palette.popupBg, palette.accent, 1);
+            int y = bounds.y + app.Scale(8);
+            for (int i = 0; i < hoverSiglines.Count; i = i + 1) {
+                canvas.DrawText(bounds.x + app.Scale(8), y, hoverSiglines[i], palette.signature, font); y = y + Canvas.FontHeight(font);
+            }
+            y = y + app.Scale(4);
+            int small = Style.FontFallback(app, "small");
+            for (int i = 0; i < hoverHlines.Count; i = i + 1) {
+                canvas.DrawText(bounds.x + app.Scale(8), y, hoverHlines[i], palette.text, small); y = y + Canvas.FontHeight(small) + app.Scale(2);
+            }
+        }
+        bounds = linkUnderline;
+        if (bounds != null) { canvas.FillRect(bounds.x, bounds.y, bounds.width, bounds.height, palette.link); }
+    }
+}

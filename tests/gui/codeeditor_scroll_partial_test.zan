@@ -1,0 +1,159 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Component.CodeEditor;
+
+class ScrollPartialFrame {
+    public int[] pixels;
+    public int scroll;
+    public bool partial;
+    public bool blocked;
+    public bool pending;
+}
+
+class CodeEditorScrollPartialProbe {
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static string Document() {
+        string text = "";
+        for (int i = 0; i < 100; i = i + 1) {
+            text = text + "// row " + Convert.ToString(i) + " long text clears old glyphs\n";
+        }
+        return text;
+    }
+
+    static void Input(App app, int kind, int x, int y, int delta) {
+        app.window.InjectEvent(kind, x, y, 0, delta, 0);
+        bool found = false;
+        for (int attempt = 0; attempt < 40 && !found; attempt = attempt + 1) {
+            Check(app.PollOneEvent() >= 0, "owned window remains open");
+            found = app.window.EventKind() == kind && app.window.EventX() == x
+            && app.window.EventY() == y && app.window.EventKeyCode() == delta;
+        }
+        Check(found, "injected event reaches the production event pump");
+    }
+
+    static ScrollPartialFrame Frame(App app, CodeEditor editor, Rect area, int time, bool invalidated = false) {
+        app.FreezeAnimClock(time);
+        app.SyncSurface();
+        editor.UseApp(app); app.SetRootControl(editor);
+        app.BeginFrame();
+        editor.MeasureTree(app); editor.Arrange(area.x, area.y, area.width, area.height);
+        bool partial = app.partialFrame;
+        try {
+            editor.RenderTree(app);
+            app.canvas.FillRect(area.x + area.width + 32, area.y + 24, 48, 48,
+            invalidated ? 0xFFCE5B37 : 0xFF3761A0);
+            app.RenderChrome("scroll damage probe");
+        } catch (Exception ex) {
+            if (partial) { app.canvas.PopClip(); }
+            throw ex;
+        }
+        ScrollPartialFrame result = new ScrollPartialFrame();
+        result.scroll = editor.ScrollY();
+        result.partial = partial;
+        result.blocked = app.partialBlocked;
+        result.pending = app.partialPending;
+        app.PresentFrame();
+        int width = app.canvas.Width();
+        int height = app.canvas.Height();
+        result.pixels = new int[width * height];
+        for (int y = 0; y < height; y = y + 1) {
+            for (int x = 0; x < width; x = x + 1) {
+                result.pixels[y * width + x] = app.canvas.GetPixel(x, y);
+            }
+        }
+        return result;
+    }
+
+    static List<ScrollPartialFrame> Sequence(App app, Rect area, bool partial) {
+        CodeEditor editor = new CodeEditor();
+        editor.DetachAnalysis();
+        editor.documentPath = "scroll-damage.zan";
+        editor.LoadText(Document());
+        app.SetPartialFrames(partial);
+        app.focus.ClearFocus();
+        Input(app, 1, app.canvas.Width() - 10, app.canvas.Height() - 10, 0);
+        app.RequestRedraw();
+        Frame(app, editor, area, 1000);
+        Frame(app, editor, area, 1000);
+        List<ScrollPartialFrame> frames = new List<ScrollPartialFrame>();
+        try {
+            ScrollPartialFrame first = Frame(app, editor, area, 1000);
+            frames.Add(first);
+            Input(app, 13, area.x + 80, area.y + 60, 0 - 120);
+            ScrollPartialFrame wheel = Frame(app, editor, area, 1016);
+            Check(wheel.scroll > first.scroll, "first routed wheel changes real editor scroll state without replay");
+            if (partial) {
+                Check(!wheel.blocked && wheel.pending, "scroll damage must schedule a bounded successor without full invalidation"
+                + " scroll=" + Convert.ToString(wheel.scroll) + " blocked=" + Convert.ToString(wheel.blocked)
+                + " pending=" + Convert.ToString(wheel.pending));
+            }
+            frames.Add(wheel);
+            Input(app, 0, area.x + 80, area.y + 60, 0);
+            for (int step = 0; step < 8; step = step + 1) {
+                ScrollPartialFrame smooth = Frame(app, editor, area, 1048 + step * 16);
+                if (partial) { Check(smooth.partial, "smooth successor must use the declared scroll damage"); }
+                frames.Add(smooth);
+            }
+            Input(app, 13, area.x + 80, area.y + 60, 120);
+            ScrollPartialFrame reverse = Frame(app, editor, area, 1192);
+            Check(reverse.scroll < frames[frames.Count - 1].scroll, "reverse wheel changes real scroll state");
+            frames.Add(reverse);
+            Input(app, 0, area.x + 80, area.y + 60, 0);
+            for (int step = 0; step < 18; step = step + 1) {
+                frames.Add(Frame(app, editor, area, 1208 + step * 16));
+            }
+            Check(editor.ScrollY() == 0, "reverse sequence reaches the clamped document start");
+            // Unknown damage must keep full-frame priority over a later bounded declaration.
+            app.RequestRedraw();
+            app.NoteScrollDamage(area.x, area.y, area.width, area.height);
+            ScrollPartialFrame invalidated = Frame(app, editor, area, 1512, true);
+            Check(!invalidated.partial, "unbounded invalidation cannot be downgraded to partial");
+            Check(app.canvas.GetPixel(area.x + area.width + 40, area.y + 32) == 0xFFCE5B37,
+            "unbounded full fallback repaints the changed pixels outside the scroll viewport");
+            frames.Add(invalidated);
+        } finally { editor.DetachAnalysis(); }
+        return frames;
+    }
+
+    static void Main() {
+        #if WINDOWS
+        App previous = App.FrameApp();
+        App app = new App("scroll damage probe", 720, 480, true);
+        try {
+            app.Show();
+            app.SyncSurface();
+            Rect area = new Rect(40, app.titlebarH + 36, 360, 210);
+            List<ScrollPartialFrame> full = Sequence(app, area, false);
+            List<ScrollPartialFrame> partial = Sequence(app, area, true);
+            Check(full.Count == partial.Count, "same input sequence frame count");
+            int changed = 0;
+            int partialCount = 0;
+            for (int frame = 0; frame < full.Count; frame = frame + 1) {
+                Check(full[frame].scroll == partial[frame].scroll, "same real scroll state per frame");
+                Check(full[frame].pixels.Length == partial[frame].pixels.Length, "same native surface dimensions");
+                if (partial[frame].partial) { partialCount = partialCount + 1; }
+                for (int pixel = 0; pixel < full[frame].pixels.Length; pixel = pixel + 1) {
+                    Check(full[frame].pixels[pixel] == partial[frame].pixels[pixel],
+                    "full/partial ARGB mismatch frame=" + Convert.ToString(frame) + " pixel=" + Convert.ToString(pixel));
+                    if (frame == 1 && full[frame].pixels[pixel] != full[0].pixels[pixel]) { changed = changed + 1; }
+                }
+            }
+            Check(changed > 0 && partialCount > 0, "real changed pixels and real partial frames are required");
+            Console.WriteLine("CODEEDITOR_SCROLL_PARTIAL_OK");
+        } finally {
+            app.UnfreezeAnimClock();
+            app.StopLoop();
+            app.window.Destroy();
+            app.canvas.Destroy();
+            App.frameApp = previous;
+        }
+        #else
+        Console.WriteLine("CODEEDITOR_SCROLL_PARTIAL_SKIP native Windows required");
+        #endif
+    }
+}

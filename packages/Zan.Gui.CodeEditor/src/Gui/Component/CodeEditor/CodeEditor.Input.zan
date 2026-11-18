@@ -7,20 +7,8 @@ namespace Gui.Component.CodeEditor;
 
 // CodeEditor 分部：键盘输入分发、字符键与快捷键、光标导航与剪贴板按键
 public partial class CodeEditor {
-    // 分发输入事件：kind==6（字符/编辑键）转 HandleCharKey，
-    // kind==4（导航/选择键）转 HandleNavKey，其余种类忽略。
-    public void HandleInput(App app) {
-        int kind = app.EventKind();
-        if (kind == 6) {
-            HandleCharKey(app);
-        } else if (kind == 4) {
-            HandleNavKey(app);
-        }
-    }
-
     // kind==6：键入字符、Ctrl 快捷键和编辑键。
-    public void HandleCharKey(App app) {
-        int code = app.window.EventKeyCode();
+    private void HandleCharKey(App app, int code, int modifiers) {
         bool ate = ateCtrlKey;
         ateCtrlKey = false;
         // Ctrl 组合已经在 kind==4 里处理过：Windows 之后还会送一个
@@ -36,8 +24,8 @@ public partial class CodeEditor {
         // Ctrl+Shift+Space = 切换参数信息的重载（VS：再按一次参数信息
         // 逐个翻重载）。必须排在 Ctrl+Space 之前，否则会被当成"列出全部
         // 候选"的显式补全。
-        if ((code == 32 || code == 0) && Modifiers.HasCtrl(app.window.EventMods())
-                && Modifiers.HasShift(app.window.EventMods())) {
+        if ((code == 32 || code == 0) && Modifiers.HasCtrl(modifiers)
+        && Modifiers.HasShift(modifiers)) {
             this.SigSwitchOverload(1);
             app.RequestRedraw();
             return;
@@ -45,7 +33,7 @@ public partial class CodeEditor {
         // Ctrl+Space = 显式打开补全，列出
         // 作用域内所有内容，即使未输入前缀（部分平台 code 为 0 且带 Ctrl，
         // 其他平台为按住 Ctrl 的空格；严格防止 Windows IME 的裸 0 码误触发）。
-        if (((code == 0 && Modifiers.HasCtrl(app.window.EventMods())) || (code == 32 && Modifiers.HasCtrl(app.window.EventMods())))) {
+        if (((code == 0 && Modifiers.HasCtrl(modifiers)) || (code == 32 && Modifiers.HasCtrl(modifiers)))) {
             if (!InStringOrCommentContext()) {
                 ForceCompletion();
                 app.RequestRedraw();
@@ -127,8 +115,8 @@ public partial class CodeEditor {
                 string lCh = ln.Substring(curCol - 1, 1);
                 string rCh = ln.Substring(curCol, 1);
                 if ((lCh == "(" && rCh == ")") || (lCh == "[" && rCh == "]")
-                    || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
-                    || (lCh == "'" && rCh == "'")) {
+                || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
+                || (lCh == "'" && rCh == "'")) {
                     SaveUndo();
                     lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
                     curCol = curCol - 1;
@@ -143,7 +131,7 @@ public partial class CodeEditor {
             return;
         } else if (code == 13) {
             EndUndoGroup();
-            int m13 = app.window.EventMods();
+            int m13 = modifiers;
             if (Modifiers.HasCtrl(m13)) {
                 // Ctrl+M：折叠/展开当前块；Ctrl+Shift+M：展开。
                 // Windows 上 Ctrl+M 与 Enter 同码（都是 CR），只能靠
@@ -164,7 +152,7 @@ public partial class CodeEditor {
             app.RequestRedraw();
         } else if (code == 9) {
             EndUndoGroup();
-            bool tabShift = Modifiers.HasShift(app.window.EventMods());
+            bool tabShift = Modifiers.HasShift(modifiers);
             if (snipActive) {
                 // 片段模式：Tab 跳到下一个洞（补全弹窗在片段里不打扰用户）。
                 SnipNext();
@@ -197,7 +185,7 @@ public partial class CodeEditor {
             selActive = false;
             refPopOpen = false;
             ClearExtraCarets();
-            ctxOpen = false;
+            this.CloseContextMenu();
             SnipEnd();
             app.RequestRedraw();
         } else if (code > 31) {
@@ -305,20 +293,19 @@ public partial class CodeEditor {
     }
 
     // kind==4：导航 / 选择 / 多光标移动键。
-    public void HandleNavKey(App app) {
-        int kc = app.window.EventKeyCode();
+    private void HandleNavKey(App app, int kc, int modifiers) {
         // 片段模式里移动光标 = 离开片段（VS：光标一动，片段即结束）。
         if (snipActive && (kc == 37 || kc == 38 || kc == 39 || kc == 40
-            || kc == 33 || kc == 34 || kc == 35 || kc == 36)) {
+        || kc == 33 || kc == 34 || kc == 35 || kc == 36)) {
             SnipEnd();
         }
         if (!(acActive && (kc == 38 || kc == 40))) { CancelSemanticCompletion(); }
         // 剪贴板与全选按虚拟键处理。只认控制字符（Ctrl+C = 3）在
         // 中文输入法开着、或键盘布局不产生控制字符时会整个丢掉，
         // 于是复制粘贴时灵时不灵。
-        int cmods = app.window.EventMods();
+        int cmods = modifiers;
         if (Modifiers.HasCtrl(cmods) && !Modifiers.HasAlt(cmods)
-            && (kc == 67 || kc == 86 || kc == 88 || kc == 65)) {
+        && (kc == 67 || kc == 86 || kc == 88 || kc == 65)) {
             ateCtrlKey = true;
             if (kc == 67) { CopySelection(); }
             else if (kc == 88) { CutSelection(); CheckErrors(); }
@@ -341,21 +328,21 @@ public partial class CodeEditor {
         } else if (kc == 27) { EndUndoGroup(); acActive = false; acFilter = ""; acSnippetOnly = false; selActive = false; refPopOpen = false; app.RequestRedraw(); }
         else if (kc == 37) {
             EndUndoGroup();
-            int m37 = app.window.EventMods();
+            int m37 = modifiers;
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m37));
             if (Modifiers.HasCtrl(m37)) { MoveWordLeft(); } else { MoveLeft(); }
             app.RequestRedraw();
         }
         else if (kc == 39) {
             EndUndoGroup();
-            int m39 = app.window.EventMods();
+            int m39 = modifiers;
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m39));
             if (Modifiers.HasCtrl(m39)) { MoveWordRight(); } else { MoveRight(); }
             app.RequestRedraw();
         }
         else if (kc == 38) {
             EndUndoGroup();
-            int mods38 = app.window.EventMods();
+            int mods38 = modifiers;
             if (Modifiers.HasCtrl(mods38) && Modifiers.HasAlt(mods38)) { AddCaretAbove(); }
             else if (Modifiers.HasAlt(mods38)) { ClearExtraCarets(); MoveLineUp(); CheckErrors(); }
             else { ClearExtraCarets(); SelPrepare(Modifiers.HasShift(mods38)); MoveUp(); }
@@ -363,7 +350,7 @@ public partial class CodeEditor {
         }
         else if (kc == 40) {
             EndUndoGroup();
-            int mods40 = app.window.EventMods();
+            int mods40 = modifiers;
             if (Modifiers.HasCtrl(mods40) && Modifiers.HasAlt(mods40)) { AddCaretBelow(); }
             else if (Modifiers.HasAlt(mods40)) { ClearExtraCarets(); MoveLineDown(); CheckErrors(); }
             else { ClearExtraCarets(); SelPrepare(Modifiers.HasShift(mods40)); MoveDown(); }
@@ -372,7 +359,7 @@ public partial class CodeEditor {
         else if (kc == 33) {
             EndUndoGroup();
             int vis = pageRows;
-            bool sh = Modifiers.HasShift(app.window.EventMods());
+            bool sh = Modifiers.HasShift(modifiers);
             acActive = false; ClearExtraCarets(); SelPrepare(sh);
             int np = curLine - vis; if (np < 0) { np = 0; }
             curLine = np; ClampCol(); app.RequestRedraw();
@@ -380,14 +367,14 @@ public partial class CodeEditor {
         else if (kc == 34) {
             EndUndoGroup();
             int vis = pageRows;
-            bool sh = Modifiers.HasShift(app.window.EventMods());
+            bool sh = Modifiers.HasShift(modifiers);
             acActive = false; ClearExtraCarets(); SelPrepare(sh);
             int np = curLine + vis; if (np > lines.Count - 1) { np = lines.Count - 1; }
             curLine = np; ClampCol(); app.RequestRedraw();
         }
         else if (kc == 36) {
             EndUndoGroup();
-            int m36 = app.window.EventMods();
+            int m36 = modifiers;
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m36));
             if (Modifiers.HasCtrl(m36)) { curLine = 0; curCol = 0; }
             else { curCol = SmartHomeCol(); }
@@ -395,7 +382,7 @@ public partial class CodeEditor {
         }
         else if (kc == 35) {
             EndUndoGroup();
-            int m35 = app.window.EventMods();
+            int m35 = modifiers;
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m35));
             if (Modifiers.HasCtrl(m35)) { curLine = lines.Count - 1; }
             curCol = lines[curLine].Length;
@@ -422,8 +409,8 @@ public partial class CodeEditor {
                 string lCh = ln.Substring(curCol - 1, 1);
                 string rCh = ln.Substring(curCol, 1);
                 if ((lCh == "(" && rCh == ")") || (lCh == "[" && rCh == "]")
-                    || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
-                    || (lCh == "'" && rCh == "'")) {
+                || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
+                || (lCh == "'" && rCh == "'")) {
                     SaveUndo();
                     lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
                     curCol = curCol - 1;

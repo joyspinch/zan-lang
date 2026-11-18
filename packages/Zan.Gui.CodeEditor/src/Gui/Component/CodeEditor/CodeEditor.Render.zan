@@ -32,1160 +32,402 @@ public partial class CodeEditor {
             s_filterKinds = new List<string>{
                 "", "M", "P", "F",
                 "E", "T", "K", "S" };
-        }
-        return s_filterKinds;
-    }
-
-
-    // 主渲染：画表面/装订线/高亮文本/光标/诊断与选区，处理焦点
-    // （获得焦点即占用 Tab）、滚轮与行布局，随后是补全弹窗、右键
-    // 菜单、CodeLens、引用弹窗、滚动条与悬停提示，最后做点击（移动
-    // 光标/多击选择）与按键输入。分析只消费后台成品。返回本帧
-    // 编辑器的焦点 id。
-    public int Render(App app, Rect area) {
-        if (!analysisDetached && analysisApp != app) { AttachAnalysis(app); }
-        Canvas c = app.canvas;
-        Gui.Theme t = app.theme;
-        EditorPalette pal = EditorPalette.For(t);
-        StyleBox surfaceStyle = Style.Part(app, "codeeditor", "surface", "",
-                                           "", "", Style.SNormal());
-        StyleBox gutterStyle = Style.Part(app, "codeeditor", "gutter", "",
-                                          "", "", Style.SNormal());
-        StyleBox dividerStyle = Style.Part(app, "codeeditor", "divider", "",
-                                           "", "", Style.SNormal());
-        StyleBox textStyle = Style.Part(app, "codeeditor", "text", "",
-                                        "", "", Style.SNormal());
-        // 皮肤 CSS 的语法色部件：base.css 默认把它们映射到 --code-*
-        // token（亮/暗底各有一套），皮肤可直接改写。每帧解析一次，
-        // 未声明回退 0，再由 Highlight 按调色板兜底。
-        cssKw = Style.Part(app, "codeeditor", "keyword",
-                           "", "", "", Style.SNormal()).FgOr(0);
-        cssTy = Style.Part(app, "codeeditor", "type",
-                           "", "", "", Style.SNormal()).FgOr(0);
-        cssStr = Style.Part(app, "codeeditor", "string",
-                            "", "", "", Style.SNormal()).FgOr(0);
-        cssCom = Style.Part(app, "codeeditor", "comment",
-                            "", "", "", Style.SNormal()).FgOr(0);
-        cssNum = Style.Part(app, "codeeditor", "number",
-                            "", "", "", Style.SNormal()).FgOr(0);
-        UpdateAnalysisPalette(t, textStyle.FgOr(0));
-        RequestAnalysis();
-        int id = app.focus.AllocId();
-        lastId = id;
-        bool focused = app.focus.IsFocused(id);
-        if (!focused || app.EventKind() == 2 || app.EventKind() == 3) {
-            CancelSemanticCompletion();
-        }
-        // 获得焦点时占用 Tab，防止 App 移走键盘焦点；
-        // 编辑器改用 Tab/Shift+Tab 缩进。
-        if (focused) { app.tabHoldId = id; }
-        // 本组件直接读取 mouseX/mouseY 而不经过
-        // 命中测试器，因此必须自行尊重捕获覆盖层：
-        // 当查找栏（或菜单 / 浮动窗口）盖在文本上时，
-        // 其上的点击不得移动光标，其下也不得弹出悬停内容。
-        bool ptrFree = !app.PointerCaptured();
-
-        int fontSize = FontSize(t);
-        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
-        if (lineH < 1) { lineH = 1; }
-        int gutterW = app.Scale(48);
-        // 记下本帧的行号槽宽度：宿主与测试要按它算行号槽的命中区域
-        // （行号槽右键弹断点菜单）。
-        this.gutterWLast = gutterW;
-
-        c.FillRect(area.x, area.y, area.width, area.height, surfaceStyle.BgOr(0));
-        c.FillRect(area.x, area.y, gutterW, area.height, gutterStyle.BgOr(0));
-        c.FillRect(area.x + gutterW, area.y, 1, area.height, dividerStyle.BgOr(0));
-
-        // 认领以真溢出为前提：整个文档放得下一屏时不认领，滚轮穿透
-        // 给外层容器/页面（maxScroll 为 0 时滚了也是原样钳回）。
-        // 折叠生效时按可见行数计滚动范围与溢出。
-        int visLines = area.height / lineH;
-        if (visLines < 1) { visLines = 1; }
-        pageRows = visLines;
-
-        int docRows = lines.Count;
-        if (AnyFolded()) { docRows = FoldVisibleTotal(); }
-
-        maxScrollY = (docRows - visLines) * lineH;
-        if (maxScrollY < 0) { maxScrollY = 0; }
-
-        bool ownsWheel = false;
-        if (docRows > visLines) {
-            ownsWheel = app.CaptureWheel(
-                area.x, area.y, area.width, area.height);
-        }
-
-        // 外部通过 SetScrollLine 改变行号或首次布局时的像素初始化
-        if (scrollY < 0) {
-            scrollY = scrollLine * lineH;
-            targetScrollY = scrollY;
-        }
-
-        if (focused) { HandleInput(app); }
-        // 活动行的 using 提示在消费时抑制，移动光标不触发全文分析。
-        lastDiagLine = curLine;
-        // 本帧缓冲区已稳定：丢弃编译器诊断的
-        // 过期记忆，使其只重算一次而非每可见行一次。
-        InvalidateDiagStale();
-
-        // 在滚动条滑块上拖拽：绝对像素响应，零延迟同步视口
-        if (app.EventKind() == 1 && barDragging) {
-            int total = lines.Count;
-            if (total < 1) { total = 1; }
-            int thumbH = visLines * area.height / total;
-            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
-            if (thumbH > area.height) { thumbH = area.height; }
-            int travel = area.height - thumbH;
-            int newY = 0;
-            if (travel > 0 && maxScrollY > 0) {
-                int my = app.mouseY - area.y - thumbH / 2;
-                newY = my * maxScrollY / travel;
             }
-            if (newY < 0) { newY = 0; }
-            if (newY > maxScrollY) { newY = maxScrollY; }
-            scrollY = newY;
-            targetScrollY = newY;
-            scrollLine = scrollY / lineH;
-            lastScrollMs = app.nowMs;
-            lastHoverMoveMs = app.nowMs;
-            hoverTip = null;
-            acActive = false;
-            refPopOpen = false;
-            app.NoteScrollDamage(area.x, area.y, area.width, area.height);
+            return s_filterKinds;
         }
 
-        // 滚轮事件：按像素平滑累加目标偏移，触控板小步进与鼠标均细腻响应
-        if (ownsWheel) {
-            acActive = false;
-            refPopOpen = false;
-            int delta = app.window.EventKeyCode();
-            // 每 120 刻度对应 3 行像素高度
-            int pixStep = (delta * lineH * 3) / 120;
-            if (pixStep == 0) {
-                if (delta > 0) { pixStep = 1; }
-                else if (delta < 0) { pixStep = 0 - 1; }
-            }
-            // 突然反向滚动时重设目标，防止惯性滞后
-            if ((targetScrollY > scrollY && delta > 0) || (targetScrollY < scrollY && delta < 0)) {
-                targetScrollY = scrollY;
-            }
-            targetScrollY = targetScrollY - pixStep;
-            if (targetScrollY < 0) { targetScrollY = 0; }
-            if (targetScrollY > maxScrollY) { targetScrollY = maxScrollY; }
-            lastScrollMs = app.nowMs;
-            lastHoverMoveMs = app.nowMs;
-            hoverTip = null;
-            app.RequestRedraw();
-            app.NoteScrollDamage(area.x, area.y, area.width, area.height);
-        }
+        // Paint the prepared editor surface and view animation; routed events own input.
+        public override void OnPaint(App app) {
+            Rect area = new Rect(bx, by, bw, bh);
+            if (area.width <= 0 || area.height <= 0) { return; }
+            Canvas c = app.canvas;
+            Gui.Theme t = app.theme;
+            EditorPalette pal = EditorPalette.For(t);
+            StyleBox surfaceStyle = Style.Part(app, "codeeditor", "surface", "",
+            "", "", Style.SNormal());
+            StyleBox gutterStyle = Style.Part(app, "codeeditor", "gutter", "",
+            "", "", Style.SNormal());
+            StyleBox dividerStyle = Style.Part(app, "codeeditor", "divider", "",
+            "", "", Style.SNormal());
+            StyleBox textStyle = Style.Part(app, "codeeditor", "text", "",
+            "", "", Style.SNormal());
+            // 皮肤 CSS 的语法色部件：base.css 默认把它们映射到 --code-*
+            // token（亮/暗底各有一套），皮肤可直接改写。每帧解析一次，
+            // 未声明回退 0，再由 Highlight 按调色板兜底。
+            bool focused = this.HasFocus(app);
+            int fontSize = FontSize(t);
+            int lineH = this.EditorLineHeight(app);
+            int gutterW = app.Scale(48);
 
-        // 平滑滚动追赶：每帧按指数衰减向 targetScrollY 逼近
-        if (!barDragging && scrollY != targetScrollY) {
-            int diff = targetScrollY - scrollY;
-            int step = diff * 35 / 100;
-            if (step == 0) {
-                if (diff > 0) { step = 1; }
-                else { step = 0 - 1; }
-            }
-            scrollY = scrollY + step;
-            scrollLine = scrollY / lineH;
-            lastScrollMs = app.nowMs;
-            lastHoverMoveMs = app.nowMs;
-            hoverTip = null;
-            app.RequestRedraw();
-            app.NoteScrollDamage(area.x, area.y, area.width, area.height);
-        }
+            c.FillRect(area.x, area.y, area.width, area.height, surfaceStyle.BgOr(0));
+            c.FillRect(area.x, area.y, gutterW, area.height, gutterStyle.BgOr(0));
+            c.FillRect(area.x + gutterW, area.y, 1, area.height, dividerStyle.BgOr(0));
 
-        // 光标/执行行落在隐藏区时先展开覆盖区间，再按可见行号
-        // 保持其在视野内（文档行 ≠ 可见行，二者都经折叠映射换算）。
-        if (AnyFolded()) {
-            UnfoldContaining(curLine);
-            if (execLine >= 0) { UnfoldContaining(execLine); }
-        }
+            int textX = area.x + gutterW + t.paddingSmall;
+            int visLines = pageRows;
+            StyleBox hoverStyle = Style.Part(app, "codeeditor", "hover", "",
+            "", "", Style.SNormal());
+            StyleBox breakpointStyle = Style.Part(app, "codeeditor", "breakpoint", "",
+            "", "", Style.SNormal());
+            StyleBox lineNumberStyle = Style.Part(app, "codeeditor", "line-number", "",
+            "", "", Style.SNormal());
+            StyleBox caretStyle = Style.Part(app, "codeeditor", "caret", "",
+            "", "", Style.SNormal());
+            RenderLines(app, area, lineH, fontSize, gutterW, textX, visLines, focused,
+            hoverStyle.BgOr(0), breakpointStyle.BgOr(0),
+            lineNumberStyle.FgOr(0), caretStyle.BgOr(0),
+            textStyle.FgOr(0));
+            // 分析完成的 Post 自带重绘；不为引用扫描请求下一帧。
 
-        // 仅当本帧光标实际移动时才保持其在视野内；
-        // 单纯的滚轮/滚动条滚动不改变光标行，不应把视图拉回光标处。
-        if (curLine != ensuredCaretLine) {
-            int caretRow = FoldVisibleRowOf(curLine);
-            int topL = scrollY / lineH;
-            if (caretRow < topL) {
-                targetScrollY = caretRow * lineH;
-                scrollY = targetScrollY;
-                scrollLine = caretRow;
-                lastScrollMs = app.nowMs;
-                lastHoverMoveMs = app.nowMs;
-                hoverTip = null;
-            } else if (caretRow >= topL + visLines) {
-                targetScrollY = (caretRow - visLines + 1) * lineH;
-                scrollY = targetScrollY;
-                scrollLine = caretRow - visLines + 1;
-                lastScrollMs = app.nowMs;
-                lastHoverMoveMs = app.nowMs;
-                hoverTip = null;
-            }
-            ensuredCaretLine = curLine;
-        }
-        if (scrollY > maxScrollY) { scrollY = maxScrollY; }
-        if (scrollY < 0) { scrollY = 0; }
-        if (targetScrollY > maxScrollY) { targetScrollY = maxScrollY; }
-        if (targetScrollY < 0) { targetScrollY = 0; }
-        scrollLine = scrollY / lineH;
+            // ---- 右侧诊断 / 滚动条（VS 风格概览标尺） ----
+            RenderOverviewRuler(app, area, visLines);
 
-        int textX = area.x + gutterW + t.paddingSmall;
-        if (codeLens == null) {
-            codeLens = new List<CodeLensRef>();
-        } else {
-            codeLens.Clear();
-        }
-        BeginLensFrame(app);
-        // 引用计数标注在声明上方独占的一行，
-        // 与 Visual Studio 一致，因此本帧所绘行先
-        // 布局好，后续所有行/像素映射都读取该布局。
-        BuildRowLayout(area, lineH,
-            Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(3));
-        visLines = VisibleRowCount();
-        pageRows = visLines;
-        StyleBox hoverStyle = Style.Part(app, "codeeditor", "hover", "",
-                                         "", "", Style.SNormal());
-        StyleBox breakpointStyle = Style.Part(app, "codeeditor", "breakpoint", "",
-                                              "", "", Style.SNormal());
-        StyleBox lineNumberStyle = Style.Part(app, "codeeditor", "line-number", "",
-                                              "", "", Style.SNormal());
-        StyleBox caretStyle = Style.Part(app, "codeeditor", "caret", "",
-                                         "", "", Style.SNormal());
-        RenderLines(app, area, lineH, fontSize, gutterW, textX, visLines, focused,
-                    hoverStyle.BgOr(0), breakpointStyle.BgOr(0),
-                    lineNumberStyle.FgOr(0), caretStyle.BgOr(0),
-                    textStyle.FgOr(0));
-        // 分析完成的 Post 自带重绘；不为引用扫描请求下一帧。
+            // ---- 自动补全弹窗（绘制在光标下方，带图标） ----
+            PaintCompletionPopup(app, area, lineH, textX, fontSize, focused, visLines);
 
-        // ---- 右侧诊断 / 滚动条（VS 风格概览标尺） ----
-        RenderOverviewRuler(app, area, visLines);
+            PaintSignaturePopup(app, area, lineH, textX, fontSize, focused, visLines);
 
-        // ---- 自动补全弹窗（绘制在光标下方，带图标） ----
-        RenderAcPopup(app, area, lineH, textX, fontSize, focused, visLines);
+            this.PaintPreparedHover(app, pal, fontSize);
 
-        // ---- 光标所在调用的参数信息 ----
-        // 上一帧画出的重载箭头矩形先取一份快照：气泡可能在本帧已经
-        // 收起（焦点被别处抢走、补全弹窗打开），但用户点的是刚看见
-        // 的那个箭头，命中判定要用看见时的那份几何——和核心按上一帧
-        // 命中快照解析点击是同一个道理。
-        int arrowPrevX = this.sigPrevX;
-        int arrowPrevY = this.sigPrevY;
-        int arrowPrevW = this.sigPrevW;
-        int arrowPrevH = this.sigPrevH;
-        int arrowNextX = this.sigNextX;
-        int arrowNextY = this.sigNextY;
-        int arrowNextW = this.sigNextW;
-        int arrowNextH = this.sigNextH;
-        RenderSigHelp(app, area, lineH, textX, fontSize, focused, visLines);
-
-        // ---- 右键上下文菜单 ----
-        // 在文本区内按下鼠标右键（button 1）时打开。
-        if (app.EventKind() == 2 && app.window.EventButton() == 1 && ptrFree) {
-            bool inGutter = app.mouseX >= area.x && app.mouseX < area.x + gutterW
-                            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
-            if (inGutter) {
-                // 行号槽右键：VS 在这里给的是断点菜单（切换/条件/
-                // 删除全部），不是编辑菜单。光标不跟着走——断点操作
-                // 只针对被点的那一行。
-                int bpLine = LineAtY(lineH, app.mouseY);
-                if (bpLine >= lines.Count) { bpLine = lines.Count - 1; }
-                if (bpLine < 0) { bpLine = 0; }
-                ctxBpLine = bpLine;
-                ctxMenuMode = 1;
-                ctxOpen = true;
-                ctxX = app.mouseX;
-                ctxY = app.mouseY;
-                acActive = false;
-                app.RequestRedraw();
-            } else {
-            bool overArea = app.mouseX >= area.x + gutterW && app.mouseX < area.x + area.width
-                            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
-            if (overArea) {
-                if (!selActive) {
-                    int rclk = LineAtY(lineH, app.mouseY);
-                    if (rclk < 0) { rclk = curLine; }
-                    if (rclk >= lines.Count) { rclk = lines.Count - 1; }
-                    if (rclk < 0) { rclk = 0; }
-                    curLine = rclk;
-                    curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
-                }
-                ctxMenuMode = 0;
-                ctxOpen = true;
-                ctxX = app.mouseX;
-                ctxY = app.mouseY;
-                acActive = false;
-                app.RequestRedraw();
-            }
-            }
-        }
-
-        // ---- 触摸长按上下文菜单 ----
-        // 与右键同一几何、同一光标落点语义：按住文本区不动
-        // 打开菜单。编辑区是自绘表面，但按压帧命中的正是本
-        // 处注册的 `id`（区域逐帧以相同顺序注册），PollLongPress
-        // 直接比对即可，无需哨兵。ptrFree 与右键一致：查找栏
-        // 等浮层盖住文本时不开菜单。
-        if (app.TouchDevice() && ptrFree && app.PollLongPress(id)) {
-            bool lpOver = app.mouseX >= area.x + gutterW
-                          && app.mouseX < area.x + area.width
-                          && app.mouseY >= area.y
-                          && app.mouseY < area.y + area.height;
-            if (lpOver) {
-                if (!selActive) {
-                    int lpLine = LineAtY(lineH, app.mouseY);
-                    if (lpLine < 0) { lpLine = curLine; }
-                    if (lpLine >= lines.Count) { lpLine = lines.Count - 1; }
-                    if (lpLine < 0) { lpLine = 0; }
-                    curLine = lpLine;
-                    curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
-                }
-                ctxMenuMode = 0;
-                ctxOpen = true;
-                ctxX = app.mouseX;
-                ctxY = app.mouseY;
-                acActive = false;
-                app.RequestRedraw();
-            }
-        }
-
-        app.hitTester.RegisterRect(id, area.x, area.y, area.width, area.height, 1);
-
-        // ---- 按下左键：放置光标 / 开始拖选 ----
-        // 点击落在自动补全弹窗上时跳过（松开时处理）。
-        // 弹窗有三块几何：候选列表、种类过滤条、右侧说明面板；
-        // 签名帮助还有一个气泡。漏掉哪一块，点它就穿透到文本区
-        // （光标跳行、浮层被顺带关掉）。
-        bool overPopup = acActive && popShown > 0
-            && app.mouseX >= popX && app.mouseX < popX + popW
-            && app.mouseY >= popY && app.mouseY < popY + popH;
-        bool overDesc = acActive && descW > 0
-            && app.mouseX >= descX && app.mouseX < descX + descW
-            && app.mouseY >= descY && app.mouseY < descY + descH;
-        bool overFilter = acActive && filtW > 0
-            && app.mouseX >= filtX && app.mouseX < filtX + filtW
-            && app.mouseY >= filtY && app.mouseY < filtY + filtH;
-        bool overSig = sigGW > 0
-            && app.mouseX >= sigGX && app.mouseX < sigGX + sigGW
-            && app.mouseY >= sigGY && app.mouseY < sigGY + sigGH;
-        bool overCodeLens = false;
-        for (int cli = 0; cli < codeLens.Count; cli = cli + 1) {
-            CodeLensRef cl = codeLens[cli];
-            if (app.mouseX >= cl.x && app.mouseX < cl.x + cl.w
-                && app.mouseY >= cl.y && app.mouseY < cl.y + lensRowH) {
-                overCodeLens = true;
-            }
-        }
-        // 引用列表弹窗：点击条目跳转，点击外部关闭。
-        if (refPopOpen && app.EventKind() == 2 && app.window.EventButton() == 0
-            && ptrFree) {
-            bool insidePop = app.mouseX >= refPopGX && app.mouseX < refPopGX + refPopGW
-                && app.mouseY >= refPopGY && app.mouseY < refPopGY + refPopGH;
-            if (insidePop) {
-                int relRow = (app.mouseY - refPopGY - refPopHeadH) / refPopRowH;
-                if (relRow >= 0 && relRow < refPopShown && relRow < refPopLines.Count) {
-                    JumpToRefLine(refPopName, refPopLines[relRow]);
-                    refPopOpen = false;
-                }
-                app.RequestRedraw();
-                return id;
-            }
-            // 点外部关闭：这次点击属于「关弹窗」这一个手势，不能
-            // 顺手落到文本区（光标跳行 + 选区被改写）。提前返回，
-            // 文本区的按下路径就不会再处理这次按下。
-            refPopOpen = false;
-            app.RequestRedraw();
-            return id;
-        }
-
-        // 签名条上的重载箭头（VS 的「◀ 2/3 ▶」）：点击即切换重载，
-        // 光标不动——箭头在浮层里，不在文本行上。命中用上一帧画出
-        // 的那份矩形（见上方快照），气泡本帧收起也照样认。
-        if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
-                && arrowPrevW > 0) {
-            int sigDelta = 0;
-            if (app.mouseX >= arrowPrevX && app.mouseX < arrowPrevX + arrowPrevW
-                && app.mouseY >= arrowPrevY && app.mouseY < arrowPrevY + arrowPrevH) {
-                sigDelta = -1;
-            } else if (app.mouseX >= arrowNextX && app.mouseX < arrowNextX + arrowNextW
-                && app.mouseY >= arrowNextY && app.mouseY < arrowNextY + arrowNextH) {
-                sigDelta = 1;
-            }
-            if (sigDelta != 0) {
-                this.SigSwitchOverload(sigDelta);
-                app.RequestRedraw();
-                return id;
-            }
-        }
-
-        // 点击缩略图或滚动条（右侧）：跳到对应行。
-        int minimapW = app.Scale(56);
-        if (area.width < app.Scale(360)) { minimapW = 0; }
-        int scrollBarW = app.Scale(14);
-        int diagStripW = minimapW + scrollBarW;
-        int diagStripX = area.x + area.width - diagStripW;
-        if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
-            && !ctxOpen && !overPopup && !overDesc && !overFilter && !overCodeLens
-            && !overSig
-            && app.mouseX >= diagStripX && app.mouseX < area.x + area.width
-            && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
-            int dtotal = lines.Count;
-            if (dtotal < 1) { dtotal = 1; }
-            int dtgt = (app.mouseY - area.y) * dtotal / area.height;
-            if (dtgt < 0) { dtgt = 0; }
-            if (dtgt >= lines.Count) { dtgt = lines.Count - 1; }
-            curLine = dtgt;
-            lastDiagLine = dtgt; // 同步跳过滚动条点击瞬间的诊断扫描
-            if (curCol > lines[curLine].Length) { curCol = lines[curLine].Length; }
-            selActive = false;
-            ClearExtraCarets();
-            int targetLine = dtgt - visLines / 2;
-            if (targetLine < 0) { targetLine = 0; }
-            if (targetLine > lines.Count - visLines) { targetLine = lines.Count - visLines; }
-            if (targetLine < 0) { targetLine = 0; }
-            scrollLine = targetLine;
-            scrollY = scrollLine * lineH;
-            targetScrollY = scrollY;
-            barDragging = true;
-            lastScrollMs = app.nowMs;
-            lastHoverMoveMs = app.nowMs;
-            hoverTip = null;
-            acActive = false;
-            refPopOpen = false;
-            app.RequestRedraw();
-            return id;
-        }
-
-        // 在滚动条滑块上拖动已在前置阶段完成视口更新与重绘请求，
-        // 此处直接拦截鼠标移动事件，避免穿透到文本区引发误选。
-        if (app.EventKind() == 1 && barDragging) {
-            return id;
-        }
-        if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
-            && !ctxOpen && !overPopup && !overDesc && !overFilter && !overCodeLens
-            && !overSig) {
-            bool overText = app.mouseX >= area.x + gutterW && app.mouseX < diagStripX
-                            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
-            if (overText) {
-                app.focus.SetFocused(id);
-                bool sh = Modifiers.HasShift(app.window.EventMods());
-                bool ct = Modifiers.HasCtrl(app.window.EventMods());
-                if (ct) {
-                    // Ctrl+点击：放置光标并请求宿主执行转到定义。
-                    CaretFromMouse(app, area, gutterW, fontSize);
-                    selActive = false;
-                    ClearExtraCarets();
-                    gotoRequested = true;
-                } else if (sh) {
-                    if (!selActive) {
-                        selAnchorLine = curLine; selAnchorCol = curCol; selActive = true;
-                    }
-                    CaretFromMouse(app, area, gutterW, fontSize);
-                } else {
-                    CaretFromMouse(app, area, gutterW, fontSize);
-                    bool near = curLine == lastClickLine
-                        && curCol >= lastClickCol - 1 && curCol <= lastClickCol + 1;
-                    if (app.nowMs - lastClickMs <= 400 && near) {
-                        clickCount = clickCount + 1;
-                    } else {
-                        clickCount = 1;
-                    }
-                    lastClickMs = app.nowMs;
-                    lastClickLine = curLine;
-                    lastClickCol = curCol;
-                    if (clickCount == 2) {
-                        SelectWordCaret();
-                        mouseSelecting = false;
-                    } else if (clickCount >= 3) {
-                        SelectLineCaret();
-                        mouseSelecting = false;
-                        clickCount = 0;
-                    } else {
-                        selAnchorLine = curLine; selAnchorCol = curCol;
-                        selActive = false;
-                        ClearExtraCarets();
-                        mouseSelecting = true;
-                    }
-                }
-                acActive = false;
-                app.RequestRedraw();
-            }
-        }
-
-        // ---- 拖动：把选区延伸到指针 ----
-        if (app.EventKind() == 1 && mouseSelecting) {
-            CaretFromMouse(app, area, gutterW, fontSize);
-            if (curLine != selAnchorLine || curCol != selAnchorCol) { selActive = true; }
-            else { selActive = false; }
-            app.RequestRedraw();
-        }
-
-        // 文档或视口变化后，同一屏幕坐标也必须重新等待静止期。
-        if (hoverDwellPath != documentPath || hoverDwellStamp != TextStamp()
-            || hoverDwellScrollY != scrollY) {
-            hoverDwellPath = documentPath;
-            hoverDwellStamp = TextStamp();
-            hoverDwellScrollY = scrollY;
-            lastHoverMoveMs = app.nowMs;
-        }
-
-        // ---- 悬停：指针静止防抖后才触发重绘以展示符号提示，避免高速滑过引发整窗无效重绘 ----
-        if (app.EventKind() == 1 && !mouseSelecting && !acActive && ptrFree) {
-            if (app.mouseX >= area.x && app.mouseX < area.x + area.width
-                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
-                // 仅当鼠标移动超过一定像素，重置悬停静止计时器
-                int mdx = app.mouseX - lastHoverX;
-                int mdy = app.mouseY - lastHoverY;
-                if (mdx < 0) { mdx = -mdx; }
-                if (mdy < 0) { mdy = -mdy; }
-                if (mdx > 3 || mdy > 3) {
-                    lastHoverX = app.mouseX;
-                    lastHoverY = app.mouseY;
-                    lastHoverMoveMs = app.nowMs;
-                }
-            }
-        }
-
-        if (app.EventKind() == 3) {
-            mouseSelecting = false;
-            barDragging = false;
-        }
-
-        if (app.EventKind() == 3 && app.window.EventButton() == 0 && !ctxOpen
-            && ptrFree) {
-            // CodeLens 点击：打开可展开的全部引用列表。
-            bool clHit = false;
-            for (int clc = 0; clc < codeLens.Count; clc = clc + 1) {
-                CodeLensRef cl = codeLens[clc];
-                if (app.mouseX >= cl.x && app.mouseX < cl.x + cl.w
-                    && app.mouseY >= cl.y && app.mouseY < cl.y + lensRowH) {
-                    refPopLines = new List<int>();
-                    CollectRefs(cl.name, cl.line, refPopLines);
-                    refPopName = cl.name;
-                    refPopSel = 0;
-                    refPopX = cl.x;
-                    refPopY = cl.y + lensRowH;
-                    // 此弹窗只能列出本缓冲区的行，
-                    // 因此仅当透镜统计的所有引用都在其中时才作答。
-                    refPopOpen = refPopLines.Count > 0
-                        && refPopLines.Count >= cl.count;
-                    if (!refPopOpen) {
-                        // 其他文件中也有使用：把光标放在
-                        // 声明上，让宿主按项目范围列出。
-                        int nameCol = CodeEditor.FindWordFrom(lines[cl.line], cl.name, 0);
-                        if (nameCol < 0) { nameCol = 0; }
-                        GoToLineCol(cl.line, nameCol);
-                        ctxCmd = "findrefs";
-                    }
-                    clHit = true;
-                    app.RequestRedraw();
-                }
-            }
-            if (clHit) {
-                // 已处理
-            }
-            // 种类过滤条点击：切换所选种类。
-            else if (acActive && filtW > 0
-                && app.mouseX >= filtX && app.mouseX < filtX + filtW
-                && app.mouseY >= filtY && app.mouseY < filtY + filtH) {
-                List<string> fk2 = CodeEditor.GetFilterKinds();
-                int step = app.Scale(16) + app.Scale(4);
-                int fidx = (app.mouseX - (filtX + app.Scale(5))) / step;
-                if (fidx >= 0 && fidx < fk2.Count) {
-                    string chosenF = fk2[fidx];
-                    if (chosenF == "" || HasKind(chosenF)) {
-                        if (acFilter == chosenF) { acFilter = ""; }
-                        else { acFilter = chosenF; }
-                        acSel = 0;
-                        ApplyKindFilter();
-                    }
-                }
-                app.RequestRedraw();
-            }
-            // 检查自动补全弹窗点击
-            else if (acActive && popShown > 0
-                && app.mouseX >= popX && app.mouseX < popX + popW
-                && app.mouseY >= popY && app.mouseY < popY + popH) {
-                int relY = app.mouseY - popY - app.Scale(2);
-                int clickedRow = relY / popItemH;
-                if (clickedRow >= 0 && clickedRow < popShown) {
-                    int clickedIdx = popFirst + clickedRow;
-                    if (clickedIdx >= 0 && clickedIdx < acItems.Count) {
-                        acSel = clickedIdx;
-                        AcceptCompletion(false);
-                    }
-                }
-                app.RequestRedraw();
-            } else {
-                int hit = app.ClickTarget();
-                if (hit == id && app.mouseX < area.x + gutterW) {
-                    int clicked = LineAtY(lineH, app.mouseY);
-                    if (clicked >= lines.Count) { clicked = lines.Count - 1; }
-                    // 槽位最右一列是折叠标记区：命中折叠起点时切换折叠，
-                    // 其余槽位点击仍是断点开关。
-                    int foldX = area.x + gutterW - app.Scale(18);
-                    if (clicked >= 0 && app.mouseX >= foldX
-                        && app.mouseX < area.x + gutterW - app.Scale(4)
-                        && FoldableAt(clicked)) {
-                        ToggleFold(clicked);
-                    } else if (clicked >= 0) {
-                        ToggleBreakpoint(clicked);
-                    }
-                    app.RequestRedraw();
-                }
-            }
-        }
-
-        bool isScrolling = barDragging || (scrollY != targetScrollY) || (app.nowMs - lastScrollMs < 450);
-
-        // ---- 调试悬停提示 ----
-        if (execLine >= 0 && dbgVars.Count > 0 && ptrFree && !isScrolling) {
-            // 检测鼠标光标下的字词
-            if (app.mouseX >= textX && app.mouseX < area.x + area.width
-                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
-                int hoverLine = LineAtY(lineH, app.mouseY);
-                if (hoverLine >= 0 && hoverLine < lines.Count) {
-                    int hoverCol = CodeEditor.ColFromX(lines[hoverLine], app.mouseX - textX, fontSize);
-                    string hWord = CodeEditor.WordAt(lines[hoverLine], hoverCol);
-                    if (hWord.Length > 0) {
-                        DbgVar raw = CodeEditor.LookupVarRaw(dbgVars, hWord);
-                        if (raw != null) {
-                            hoverTip = raw;
-                            hoverTipX = app.mouseX;
-                            hoverTipY = app.mouseY;
-                        } else {
-                            hoverTip = null;
-                        }
-                    } else {
-                        hoverTip = null;
-                    }
-                }
-            }
-            // 绘制（可能多行、JSON 格式化的）提示。
-            if (hoverTip != null) {
-                if (this.hoverRawHl == null) { this.hoverRawHl = new List<string>(); } else { this.hoverRawHl.Clear(); }
-                List<string> rawHl = this.hoverRawHl;
-                CodeEditor.BuildHoverLines(hoverTip, rawHl);
-                int capW = area.width - app.Scale(16);
-                if (capW > app.Scale(500)) { capW = app.Scale(500); }
-                if (capW < app.Scale(200)) { capW = app.Scale(200); }
-                int capInnerW = capW - app.Scale(16);
-
-                if (this.hoverHl == null) { this.hoverHl = new List<string>(); } else { this.hoverHl.Clear(); }
-                List<string> hl = this.hoverHl;
-                for (int ri = 0; ri < rawHl.Count; ri = ri + 1) {
-                    string rLine = rawHl[ri];
-                    if (Canvas.MeasureText(rLine, fontSize) > capInnerW) {
-                        CodeEditor.WrapText(rLine, capInnerW, fontSize, hl, 6);
-                    } else {
-                        hl.Add(rLine);
-                    }
-                }
-                if (hl.Count == 0 && rawHl.Count > 0) { hl.Add(rawHl[0]); }
-
-                int rowh = Canvas.FontHeight(fontSize) + app.Scale(2);
-                int maxw = 0;
-                for (int k = 0; k < hl.Count; k = k + 1) {
-                    int mw = Canvas.MeasureText(hl[k], fontSize);
-                    if (mw > maxw) { maxw = mw; }
-                }
-                int ttW2 = maxw + app.Scale(16);
-                if (ttW2 > capW) { ttW2 = capW; }
-                int ttH2 = rowh * hl.Count + app.Scale(8);
-                int ttX2 = hoverTipX + app.Scale(8);
-                int ttY2 = hoverTipY + app.Scale(20);
-                if (ttX2 + ttW2 > area.x + area.width) { ttX2 = area.x + area.width - ttW2 - app.Scale(4); }
-                if (ttX2 < area.x) { ttX2 = area.x + app.Scale(2); }
-                if (ttY2 + ttH2 > area.y + area.height) { ttY2 = hoverTipY - ttH2 - app.Scale(6); }
-                if (ttY2 < area.y) { ttY2 = area.y + app.Scale(2); }
-                c.FillRoundRect(ttX2 - 1, ttY2 - 1, ttW2 + 2, ttH2 + 2, app.Scale(4), pal.shadowStrong);
-                c.SurfaceRoundRect(ttX2, ttY2, ttW2, ttH2, app.Scale(4), pal.hoverBg, pal.accent, 1);
-                int ty = ttY2 + app.Scale(4);
-                for (int kk = 0; kk < hl.Count; kk = kk + 1) {
-                    int col = pal.str;
-                    if (kk == 0) { col = pal.signature; }
-                    c.DrawText(ttX2 + app.Scale(8), ty, hl[kk], col, fontSize);
-                    ty = ty + rowh;
-                }
-            }
-        }
-
-        // ---- Ctrl+悬停：给标识符加下划线作为可点击链接 ----
-        if (!acActive && !ctxOpen && ptrFree
-            && Modifiers.HasCtrl(app.window.EventMods())) {
-            int utextX = area.x + gutterW + t.paddingSmall;
-            if (app.mouseX >= utextX && app.mouseX < area.x + area.width
-                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
-                int uln = LineAtY(lineH, app.mouseY);
-                if (uln >= 0 && uln < lines.Count) {
-                    string uls = lines[uln];
-                    int ucol = CodeEditor.ColFromX(uls, app.mouseX - utextX, fontSize);
-                    if (ucol >= 0 && ucol <= uls.Length) {
-                        int ua = ucol;
-                        while (ua > 0 && CodeEditor.IsIdentByte(uls[ua - 1] & 255)) { ua = ua - 1; }
-                        int ub = ucol;
-                        while (ub < uls.Length && CodeEditor.IsIdentByte(uls[ub] & 255)) { ub = ub + 1; }
-                        if (ub > ua && LineTopY(uln) >= 0) {
-                            int uxp = utextX + Canvas.MeasureText(uls.Substring(0, ua), fontSize);
-                            int uwp = Canvas.MeasureText(uls.Substring(ua, ub - ua), fontSize);
-                            int uyp = LineTopY(uln)
-                                + (lineH + Canvas.FontHeight(fontSize)) / 2 + app.Scale(1);
-                            c.FillRect(uxp, uyp, uwp, app.Scale(1), pal.link);
-                        }
-                    }
-                }
-            }
-        }
-
-        // ---- 符号悬停提示（方法/属性签名 + 文档）：滚动中严格抑制，需滚动与鼠标均彻底静止 450ms 后才解析显示 ----
-        if (!acActive && !ctxOpen && !refPopOpen && !mouseSelecting
-            && execLine < 0 && ptrFree && !isScrolling
-            && (app.nowMs - lastHoverMoveMs >= 450)) {
-            string hw = WordAtMouse(app, area, gutterW, fontSize);
-            if (hw.Length > 0) {
-                string hsig = "";
-                string hdoc = "";
-                int hln = LineAtY(lineH, app.mouseY);
-                int hcol = 0;
-                if (hln >= 0 && hln < lines.Count) {
-                    hcol = CodeEditor.ColFromX(lines[hln], app.mouseX - textX, fontSize);
-                }
-                string hoverPath = documentPath;
-                int hoverVersion = TextStamp();
-                int hoverX = app.mouseX;
-                int hoverY = app.mouseY;
-                int hoverScrollY = scrollY;
-                int hoverTargetScrollY = targetScrollY;
-                if (hln >= 0 && hln < lines.Count) { hsig = LspHoverFor(hw, hln, hcol); }
-                bool hoverCurrent = documentPath == hoverPath && TextStamp() == hoverVersion
-                    && app.mouseX == hoverX && app.mouseY == hoverY
-                    && scrollY == hoverScrollY && targetScrollY == hoverTargetScrollY
-                    && !barDragging && !mouseSelecting && !app.PointerCaptured();
-                if (hoverCurrent && hsig.Length == 0) {
-                    hsig = SigHelpForHover(hw);
-                    hdoc = CodeEditor.DescDoc(hw);
-                    if (hdoc.Length == 0) { hdoc = CodeEditor.DescKeyword(hw); }
-                    if (hsig.Length == 0 && hdoc.Length > 0) { hsig = hw; }
-                }
-                if (hoverCurrent && hsig.Length > 0) {
-                    int hpad = app.Scale(8);
-                    int hfh = Canvas.FontHeight(fontSize);
-                    int sfh = Canvas.FontHeight(Style.FontFallback(app, "small"));
-                    // 固定内部文本宽度；签名和文档都按它换行，
-                    // 内容不会溢出框体，再按实际生成的最宽
-                    // 行收缩框体（绝不宽于上限）。
-                    int maxHoverW = area.width - app.Scale(24);
-                    if (maxHoverW > app.Scale(380)) { maxHoverW = app.Scale(380); }
-                    if (maxHoverW < app.Scale(220)) { maxHoverW = app.Scale(220); }
-                    int innerW = maxHoverW - hpad * 2;
-                    if (this.hoverSiglines == null) { this.hoverSiglines = new List<string>(); } else { this.hoverSiglines.Clear(); }
-                    List<string> siglines = this.hoverSiglines;
-                    CodeEditor.WrapText(hsig, innerW, fontSize, siglines, 4);
-                    if (this.hoverHlines == null) { this.hoverHlines = new List<string>(); } else { this.hoverHlines.Clear(); }
-                    List<string> hlines = this.hoverHlines;
-                    if (hdoc.Length > 0) {
-                        CodeEditor.WrapText(hdoc, innerW, Style.FontFallback(app, "small"), hlines, 6);
-                    }
-                    int widest = 0;
-                    int wi = 0;
-                    for (; wi < siglines.Count; wi = wi + 1) {
-                        int lw = Canvas.MeasureText(siglines[wi], fontSize);
-                        if (lw > widest) { widest = lw; }
-                    }
-                    wi = 0;
-                    while (wi < hlines.Count) {
-                        int lw = Canvas.MeasureText(hlines[wi], Style.FontFallback(app, "small"));
-                        if (lw > widest) { widest = lw; }
-                        wi = wi + 1;
-                    }
-                    if (widest > innerW) { widest = innerW; }
-                    int hw2 = widest + hpad * 2;
-                    if (hw2 < app.Scale(120)) { hw2 = app.Scale(120); }
-                    int hh = hpad * 2 + siglines.Count * hfh;
-                    if (hlines.Count > 0) {
-                        hh = hh + app.Scale(4) + hlines.Count * (sfh + app.Scale(2));
-                    }
-                    int hx = app.mouseX + app.Scale(12);
-                    int hy = app.mouseY + app.Scale(18);
-                    if (hx + hw2 > area.x + area.width) { hx = area.x + area.width - hw2 - app.Scale(4); }
-                    if (hx < area.x) { hx = area.x + app.Scale(2); }
-                    if (hy + hh > area.y + area.height) { hy = app.mouseY - hh - app.Scale(6); }
-                    if (hy < area.y) { hy = area.y + app.Scale(2); }
-                    c.FillRoundRect(hx + 2, hy + 2, hw2, hh, app.Scale(4), pal.shadow);
-                    c.SurfaceRoundRect(hx, hy, hw2, hh, app.Scale(4), pal.popupBg, pal.accent, 1);
-                    int hty = hy + hpad;
-                    for (int sl = 0; sl < siglines.Count; sl = sl + 1) {
-                        c.DrawText(hx + hpad, hty, siglines[sl], pal.signature, fontSize);
-                        hty = hty + hfh;
-                    }
-                    hty = hty + app.Scale(4);
-                    for (int hl = 0; hl < hlines.Count; hl = hl + 1) {
-                        c.DrawText(hx + hpad, hty, hlines[hl], pal.text, Style.FontFallback(app, "small"));
-                        hty = hty + sfh + app.Scale(2);
-                    }
-                }
-            }
-        }
-
-        // ---- 可展开的引用列表弹窗（来自 CodeLens 点击） ----
-        if (refPopOpen && refPopLines.Count > 0) {
-            int rpMax = 10;
-            int rpShown = refPopLines.Count;
-            if (rpShown > rpMax) { rpShown = rpMax; }
-            int rpRowH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
-            int rpHeadH = rpRowH;
-            int rpW = app.Scale(440);
-            if (rpW > area.width - app.Scale(20)) { rpW = area.width - app.Scale(20); }
-            int rpH = rpHeadH + rpShown * rpRowH + app.Scale(6);
-            int rpX = refPopX;
-            int rpY = refPopY;
-            if (rpX + rpW > area.x + area.width) { rpX = area.x + area.width - rpW - app.Scale(6); }
-            if (rpX < area.x) { rpX = area.x + app.Scale(2); }
-            if (rpY + rpH > area.y + area.height) { rpY = area.y + area.height - rpH - app.Scale(4); }
-            if (rpY < area.y) { rpY = area.y + app.Scale(2); }
-            refPopGX = rpX; refPopGY = rpY; refPopGW = rpW; refPopGH = rpH;
-            refPopRowH = rpRowH; refPopHeadH = rpHeadH; refPopShown = rpShown;
-            c.FillRoundRect(rpX + 2, rpY + 2, rpW, rpH, app.Scale(4), pal.shadowMed);
-            c.SurfaceRoundRect(rpX, rpY, rpW, rpH, app.Scale(4), pal.popupBg, pal.accent, 1);
-            // 头部："N references to <name>"
-            string rpHead = Convert.ToString(refPopLines.Count) + " references to " + refPopName;
-            c.FillRect(rpX + 1, rpY + 1, rpW - 2, rpHeadH, pal.panelBg);
-            c.DrawText(rpX + app.Scale(8), rpY + app.Scale(4), rpHead, pal.signature, Style.FontFallback(app, "small"));
-            for (int rri = 0; rri < rpShown; rri = rri + 1) {
-                int rl = refPopLines[rri];
-                int ry = rpY + rpHeadH + rri * rpRowH;
-                bool rhover = app.mouseX >= rpX && app.mouseX < rpX + rpW
+            // ---- 可展开的引用列表弹窗（来自 CodeLens 点击） ----
+            if (refPopOpen && refPopLines.Count > 0) {
+                int rpMax = 10;
+                int rpShown = refPopLines.Count;
+                if (rpShown > rpMax) { rpShown = rpMax; }
+                int rpRowH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
+                int rpHeadH = rpRowH;
+                int rpW = app.Scale(440);
+                if (rpW > area.width - app.Scale(20)) { rpW = area.width - app.Scale(20); }
+                int rpH = rpHeadH + rpShown * rpRowH + app.Scale(6);
+                int rpX = refPopX;
+                int rpY = refPopY;
+                if (rpX + rpW > area.x + area.width) { rpX = area.x + area.width - rpW - app.Scale(6); }
+                if (rpX < area.x) { rpX = area.x + app.Scale(2); }
+                if (rpY + rpH > area.y + area.height) { rpY = area.y + area.height - rpH - app.Scale(4); }
+                if (rpY < area.y) { rpY = area.y + app.Scale(2); }
+                c.FillRoundRect(rpX + 2, rpY + 2, rpW, rpH, app.Scale(4), pal.shadowMed);
+                c.SurfaceRoundRect(rpX, rpY, rpW, rpH, app.Scale(4), pal.popupBg, pal.accent, 1);
+                // 头部："N references to <name>"
+                string rpHead = Convert.ToString(refPopLines.Count) + " references to " + refPopName;
+                c.FillRect(rpX + 1, rpY + 1, rpW - 2, rpHeadH, pal.panelBg);
+                c.DrawText(rpX + app.Scale(8), rpY + app.Scale(4), rpHead, pal.signature, Style.FontFallback(app, "small"));
+                for (int rri = 0; rri < rpShown; rri = rri + 1) {
+                    int rl = refPopLines[rri];
+                    int ry = rpY + rpHeadH + rri * rpRowH;
+                    bool rhover = app.mouseX >= rpX && app.mouseX < rpX + rpW
                     && app.mouseY >= ry && app.mouseY < ry + rpRowH;
-                if (rhover) { c.FillRect(rpX + 1, ry, rpW - 2, rpRowH, pal.selBg); }
-                string rnum = Convert.ToString(rl + 1);
-                c.DrawText(rpX + app.Scale(8), ry + app.Scale(3), rnum, pal.lineNo, Style.FontFallback(app, "small"));
-                string rcode = CodeEditor.TrimStr(lines[rl]);
-                if (rcode.Length > 64) { rcode = rcode.Substring(0, 64) + "..."; }
-                c.DrawText(rpX + app.Scale(48), ry + app.Scale(3), rcode, pal.text, Style.FontFallback(app, "small"));
-            }
-            if (refPopLines.Count > rpShown) {
-                int mory = rpY + rpHeadH + rpShown * rpRowH;
-                c.DrawText(rpX + app.Scale(8), mory - rpRowH + app.Scale(3),
+                    if (rhover) { c.FillRect(rpX + 1, ry, rpW - 2, rpRowH, pal.selBg); }
+                    string rnum = Convert.ToString(rl + 1);
+                    c.DrawText(rpX + app.Scale(8), ry + app.Scale(3), rnum, pal.lineNo, Style.FontFallback(app, "small"));
+                    string rcode = CodeEditor.TrimStr(lines[rl]);
+                    if (rcode.Length > 64) { rcode = rcode.Substring(0, 64) + "..."; }
+                    c.DrawText(rpX + app.Scale(48), ry + app.Scale(3), rcode, pal.text, Style.FontFallback(app, "small"));
+                }
+                if (refPopLines.Count > rpShown) {
+                    int mory = rpY + rpHeadH + rpShown * rpRowH;
+                    c.DrawText(rpX + app.Scale(8), mory - rpRowH + app.Scale(3),
                     "... +" + Convert.ToString(refPopLines.Count - rpShown) + " more", pal.lineNo, Style.FontFallback(app, "small"));
+                }
             }
+
         }
 
-        // BeginFrame 会清掉预约；有效标识符只为尚未到期的静止期预约一帧。
-        // 到期帧重新命中当前鼠标/文档/视口，空白处及已到期位置不续约。
-        if (!acActive && !ctxOpen && !refPopOpen && !mouseSelecting
-            && execLine < 0 && !app.PointerCaptured() && !barDragging
-            && scrollY == targetScrollY
-            && WordAtMouse(app, area, gutterW, fontSize).Length > 0) {
-            int hoverWait = 450 - (app.nowMs - lastHoverMoveMs);
-            int scrollWait = 450 - (app.nowMs - lastScrollMs);
-            if (scrollWait > hoverWait) { hoverWait = scrollWait; }
-            if (hoverWait > 0) { app.RequestWakeFrameIn(hoverWait); }
-        }
-        return id;
-    }
-
-    // 绘制可见行窗口：装订线、断点/执行标记、行号、
-    // 选区高亮、语法区间、光标、错误下划线、
-    // 行内错误提示和 CodeLens。裁剪到编辑器矩形内。
-    public void RenderLines(App app, Rect area, int lineH, int fontSize, int gutterW,
-                     int textX, int visLines, bool focused, int hoverColor,
-                     int breakpointColor, int lineNumberColor, int caretColor,
-                     int defaultText) {
-        Canvas c = app.canvas;
-        Gui.Theme t = app.theme;
-        EditorPalette pal = EditorPalette.For(t);
-        // 光标括号配对在行循环前算一次（内部有记忆，光标与文档
-        // 未变的帧零扫描）；画框在行内按命中行落笔。
-        this.UpdateBracketPair();
-        // Visual Studio 风格标识符同词高亮（Word Occurrences Highlight）：
-        // 当无主动文本选区且获得焦点时，获取当前光标所在词；若为有效标识符，
-        // 在视口所有可见行高亮其出现位置。
-        string highlightWord = "";
-        int occColor = 0;
-        if (!selActive && focused && lines != null && curLine >= 0 && curLine < lines.Count) {
-            string w = WordAtCaret();
-            if (w.Length > 0 && CodeEditor.IsIdentByte(w[0] & 255) && !CodeEditor.IsKeywordLang(w, syntaxLang)) {
-                highlightWord = w;
-                // 计算比选区底色更柔和的淡色半透明高亮，或微亮背景
-                int baseSel = CodeEditor.SelColor(t);
-                // 降低透明度：提取 RGB，置半透明 alpha
-                occColor = (baseSel & 16777215) | 671088640; // 0x28000000 左右淡层
+        // 绘制可见行窗口：装订线、断点/执行标记、行号、
+        // 选区高亮、语法区间、光标、错误下划线、
+        // 行内错误提示和 CodeLens。裁剪到编辑器矩形内。
+        public void RenderLines(App app, Rect area, int lineH, int fontSize, int gutterW,
+        int textX, int visLines, bool focused, int hoverColor,
+        int breakpointColor, int lineNumberColor, int caretColor,
+        int defaultText) {
+            Canvas c = app.canvas;
+            Gui.Theme t = app.theme;
+            EditorPalette pal = EditorPalette.For(t);
+            // 光标括号配对在行循环前算一次（内部有记忆，光标与文档
+            // 未变的帧零扫描）；画框在行内按命中行落笔。
+            // Visual Studio 风格标识符同词高亮（Word Occurrences Highlight）：
+            // 当无主动文本选区且获得焦点时，获取当前光标所在词；若为有效标识符，
+            // 在视口所有可见行高亮其出现位置。
+            string highlightWord = "";
+            int occColor = 0;
+            if (!selActive && focused && lines != null && curLine >= 0 && curLine < lines.Count) {
+                string w = WordAtCaret();
+                if (w.Length > 0 && CodeEditor.IsIdentByte(w[0] & 255) && !CodeEditor.IsKeywordLang(w, syntaxLang)) {
+                    highlightWord = w;
+                    // 计算比选区底色更柔和的淡色半透明高亮，或微亮背景
+                    int baseSel = CodeEditor.SelColor(t);
+                    // 降低透明度：提取 RGB，置半透明 alpha
+                    occColor = (baseSel & 16777215) | 671088640; // 0x28000000 左右淡层
+                }
             }
-        }
-        // 把所有行渲染裁剪到编辑器框内，长代码行、宽
-        // 装订线、选区高亮和行内错误提示就绝不会绘制
-        // 到编辑器矩形之外的相邻窗格。
-        c.PushClip(area.x, area.y, area.width, area.height);
-        int digitW = Canvas.MeasureText("9", fontSize);
-        if (digitW < 1) { digitW = app.Scale(7); }
-        int textYOffset = Canvas.CenterTextY(0, lineH, fontSize);
-        int scale2 = app.Scale(2);
-        int scale4 = app.Scale(4);
-        int scale6 = app.Scale(6);
-        int scale8 = app.Scale(8);
-        int scale10 = app.Scale(10);
-        int scale16 = app.Scale(16);
-        int dotSz = scale10;
-        int dotYOffset = (lineH - dotSz) >> 1;
-        int gutterDotX = area.x + scale6;
-        int gutterNumBaseX = area.x + gutterW - scale8;
-        int gutterChevX = area.x + gutterW - scale16;
-        int minimapW = app.Scale(56);
-        if (area.width < app.Scale(360)) { minimapW = 0; }
-        int rightStripW = minimapW + app.Scale(14);
-        int lineContentW = area.width - gutterW - rightStripW - 1;
-        if (lineContentW < 0) { lineContentW = 0; }
-        int caretH = lineH - scale4;
+            // 把所有行渲染裁剪到编辑器框内，长代码行、宽
+            // 装订线、选区高亮和行内错误提示就绝不会绘制
+            // 到编辑器矩形之外的相邻窗格。
+            c.PushClip(area.x, area.y, area.width, area.height);
+            int digitW = Canvas.MeasureText("9", fontSize);
+            if (digitW < 1) { digitW = app.Scale(7); }
+            int textYOffset = Canvas.CenterTextY(0, lineH, fontSize);
+            int scale2 = app.Scale(2);
+            int scale4 = app.Scale(4);
+            int scale6 = app.Scale(6);
+            int scale8 = app.Scale(8);
+            int scale10 = app.Scale(10);
+            int scale16 = app.Scale(16);
+            int dotSz = scale10;
+            int dotYOffset = (lineH - dotSz) >> 1;
+            int gutterDotX = area.x + scale6;
+            int gutterNumBaseX = area.x + gutterW - scale8;
+            int gutterChevX = area.x + gutterW - scale16;
+            int minimapW = app.Scale(56);
+            if (area.width < app.Scale(360)) { minimapW = 0; }
+            int rightStripW = minimapW + app.Scale(14);
+            int lineContentW = area.width - gutterW - rightStripW - 1;
+            if (lineContentW < 0) { lineContentW = 0; }
+            int caretH = lineH - scale4;
 
-        for (int i = 0; i < visibleRows.Count; i = i + 1) {
-            CeVisibleRowLayout vrow = visibleRows[i];
-            int ln = vrow.line;
-            if (ln < lines.Count) {
-                int rowY = vrow.top;
-                int lensY = vrow.lensY;
-                int textY = rowY + textYOffset;
+            for (int i = 0; i < visibleRows.Count; i = i + 1) {
+                CeVisibleRowLayout vrow = visibleRows[i];
+                int ln = vrow.line;
+                if (ln < lines.Count) {
+                    int rowY = vrow.top;
+                    int lensY = vrow.lensY;
+                    int textY = rowY + textYOffset;
 
-                if (ln == execLine) {
-                    c.FillRect(area.x + gutterW + 1, rowY, lineContentW, lineH, pal.warnLineBg);
-                } else if (ln == curLine && focused) {
-                    c.FillRect(area.x + gutterW + 1, rowY, lineContentW,
-                               lineH, hoverColor);
-                }
+                    if (ln == execLine) {
+                        c.FillRect(area.x + gutterW + 1, rowY, lineContentW, lineH, pal.warnLineBg);
+                    } else if (ln == curLine && focused) {
+                        c.FillRect(area.x + gutterW + 1, rowY, lineContentW,
+                        lineH, hoverColor);
+                    }
 
-                bool isCompilerErr = HasCompilerErr(ln);
-                bool isLocalErr = LocalDiagnosticMessage(ln).Length > 0;
-                // 语言服务推送的语义诊断（打字即报）。
-                int semCount = SemanticDiagCount(ln);
-                bool hasErr = isCompilerErr || isLocalErr || semCount > 0;
+                    bool isCompilerErr = HasCompilerErr(ln);
+                    bool isLocalErr = LocalDiagnosticMessage(ln).Length > 0;
+                    // 语言服务推送的语义诊断（打字即报）。
+                    int semCount = SemanticDiagCount(ln);
+                    bool hasErr = isCompilerErr || isLocalErr || semCount > 0;
 
-                if (hasErr) {
-                    c.FillRect(area.x + gutterW + 1, rowY, lineContentW, lineH, 0x18FF4444);
-                }
+                    if (hasErr) {
+                        c.FillRect(area.x + gutterW + 1, rowY, lineContentW, lineH, 0x18FF4444);
+                    }
 
-                if (HasBreakpoint(ln)) {
-                    c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, dotSz, breakpointColor);
-                } else if (hasErr) {
-                    c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, dotSz, pal.error);
-                }
-                if (ln == execLine) {
-                    c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, scale2, pal.warn);
-                }
+                    if (HasBreakpoint(ln)) {
+                        c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, dotSz, breakpointColor);
+                    } else if (hasErr) {
+                        c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, dotSz, pal.error);
+                    }
+                    if (ln == execLine) {
+                        c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, scale2, pal.warn);
+                    }
 
-                string num = GetLineNumStr(ln + 1);
-                int numW = num.Length * digitW;
-                int numColor = hasErr ? pal.error : lineNumberColor;
-                c.DrawText(gutterNumBaseX - numW, textY, num,
-                           numColor, fontSize);
+                    string num = GetLineNumStr(ln + 1);
+                    int numW = num.Length * digitW;
+                    int numColor = hasErr ? pal.error : lineNumberColor;
+                    c.DrawText(gutterNumBaseX - numW, textY, num,
+                    numColor, fontSize);
 
-                // 折叠标记：有效折叠起点行在槽位最右列画箭头，
-                // 折叠中 ▸、展开 ▾；点击该列切换（见槽位点击处理）。
-                if (FoldableAt(ln)) {
-                    string chev = FoldedAt(ln) ? "▸" : "▾";
-                    c.DrawText(gutterChevX, textY, chev,
-                               lineNumberColor, fontSize);
-                }
+                    // 折叠标记：有效折叠起点行在槽位最右列画箭头，
+                    // 折叠中 ▸、展开 ▾；点击该列切换（见槽位点击处理）。
+                    if (FoldableAt(ln)) {
+                        string chev = FoldedAt(ln) ? "▸" : "▾";
+                        c.DrawText(gutterChevX, textY, chev,
+                        lineNumberColor, fontSize);
+                    }
 
-                string text = lines[ln];
+                    string text = lines[ln];
 
-                // 词频/符号多处出现高亮（Word Occurrences Highlight，位于选区或语法文本底层）
-                if (highlightWord.Length > 0) {
-                    CodeEditor.DrawWordOccurrences(c, text, highlightWord, textX, rowY, lineH, fontSize, occColor);
-                }
+                    // 词频/符号多处出现高亮（Word Occurrences Highlight，位于选区或语法文本底层）
+                    if (highlightWord.Length > 0) {
+                        CodeEditor.DrawWordOccurrences(c, text, highlightWord, textX, rowY, lineH, fontSize, occColor);
+                    }
 
-                // 选区高亮
-                if (selActive) {
-                    CodeEditor.DrawSelHighlight(c, app, selAnchorLine, selAnchorCol,
+                    // 选区高亮
+                    if (selActive) {
+                        CodeEditor.DrawSelHighlight(c, app, selAnchorLine, selAnchorCol,
                         curLine, curCol, ln, text, textX, rowY, lineH, fontSize, area);
-                }
+                    }
 
-                // 光标括号配对：锚/配偶两格各画一枚描边小框（VS 同
-                // 款）。本格越界（滚动到行尾之后）不画。
-                if (focused && bpMLine >= 0 && (ln == bpALine || ln == bpMLine)) {
-                    CodeEditor.DrawBracketBox(c, text,
+                    // 光标括号配对：锚/配偶两格各画一枚描边小框（VS 同
+                    // 款）。本格越界（滚动到行尾之后）不画。
+                    if (focused && bpMLine >= 0 && (ln == bpALine || ln == bpMLine)) {
+                        CodeEditor.DrawBracketBox(c, text,
                         ln == bpALine ? bpACol : bpMCol,
                         textX, rowY, lineH, fontSize, pal.accent);
-                }
+                    }
 
-                // 错误指示（红色下划线）。真实编译器错误具有权威优先权；
-                // 出现编译器错误时以其为准，否则显示本地语法诊断。
-                if (isCompilerErr) {
-                    c.FillRect(textX, rowY + lineH - scale2,
+                    // 错误指示（红色下划线）。真实编译器错误具有权威优先权；
+                    // 出现编译器错误时以其为准，否则显示本地语法诊断。
+                    if (isCompilerErr) {
+                        c.FillRect(textX, rowY + lineH - scale2,
                         Canvas.MeasureText(text, fontSize), scale2, pal.error);
-                } else if (isLocalErr) {
-                    c.FillRect(textX, rowY + lineH - scale2,
+                    } else if (isLocalErr) {
+                        c.FillRect(textX, rowY + lineH - scale2,
                         Canvas.MeasureText(text, fontSize), scale2, pal.errorDim);
-                }
-
-                // 语义诊断的波浪线（VS 的做法）：画在出错的那几个字符
-                // 下面，错误红、警告黄。诊断没有区间时退化成整行一条。
-                for (int sd = 0; sd < semCount; sd = sd + 1) {
-                    Diagnostic sdiag = SemanticDiagAt(ln, sd);
-                    if (sdiag == null) { continue; }
-                    int slot = sdiag.SeveritySlot();
-                    int scol = pal.error;
-                    if (slot == 1) { scol = pal.warn; }
-                    else if (slot == 2) { scol = pal.accent; }
-                    int sx0 = textX;
-                    int sx1 = textX + Canvas.MeasureText(text, fontSize);
-                    if (sdiag.HasRange()) {
-                        int sc = sdiag.startCol;
-                        int ec = sdiag.endCol;
-                        if (sc < 0) { sc = 0; }
-                        if (ec > text.Length) { ec = text.Length; }
-                        if (ec <= sc) { ec = sc + 1; }
-                        sx0 = textX + Canvas.MeasureText(Text.Left(text, sc), fontSize);
-                        sx1 = textX + Canvas.MeasureText(Text.Left(text, ec), fontSize);
                     }
-                    CodeEditor.DrawSquiggle(c, sx0, sx1,
+
+                    // 语义诊断的波浪线（VS 的做法）：画在出错的那几个字符
+                    // 下面，错误红、警告黄。诊断没有区间时退化成整行一条。
+                    for (int sd = 0; sd < semCount; sd = sd + 1) {
+                        Diagnostic sdiag = SemanticDiagAt(ln, sd);
+                        if (sdiag == null) { continue; }
+                        int slot = sdiag.SeveritySlot();
+                        int scol = pal.error;
+                        if (slot == 1) { scol = pal.warn; }
+                        else if (slot == 2) { scol = pal.accent; }
+                        int sx0 = textX;
+                        int sx1 = textX + Canvas.MeasureText(text, fontSize);
+                        if (sdiag.HasRange()) {
+                            int sc = sdiag.startCol;
+                            int ec = sdiag.endCol;
+                            if (sc < 0) { sc = 0; }
+                            if (ec > text.Length) { ec = text.Length; }
+                            if (ec <= sc) { ec = sc + 1; }
+                            sx0 = textX + Canvas.MeasureText(Text.Left(text, sc), fontSize);
+                            sx1 = textX + Canvas.MeasureText(Text.Left(text, ec), fontSize);
+                        }
+                        CodeEditor.DrawSquiggle(c, sx0, sx1,
                         rowY + lineH - scale2 - scale2, scol, scale2);
-                }
-
-                CeHlLine hl = GetHl(ln, text, t, defaultText);
-                List<CodeSpan> spans = hl.spans;
-                int sx = textX;
-                for (int si2 = 0; si2 < spans.Count; si2 = si2 + 1) {
-                    CodeSpan span = spans[si2];
-                    c.DrawText(sx, textY, span.text, span.color, fontSize);
-                    int sw = span.width;
-                    if (sw < 0) {
-                        sw = Canvas.MeasureText(span.text, fontSize);
-                        span.width = sw;
                     }
-                    sx = sx + sw;
-                }
 
-                // 调试行内即时值：暂停在执行行时，行尾以注释色
-                // 灰字列出该行引用到的局部变量（名 = 值）。
-                if (ln == execLine && dbgVars.Count > 0) {
-                    string inline = this.InlineValuesFor(text);
-                    if (inline.Length > 0) {
-                        int ix = sx + scale16;
-                        int maxW = area.x + area.width - rightStripW - ix;
-                        if (maxW > 0) {
-                            while (inline.Length > 0
-                                   && Canvas.MeasureText(inline, fontSize) > maxW) {
-                                inline = inline.Substring(0, inline.Length - 1);
-                            }
-                            if (inline.Length > 0) {
-                                c.DrawText(ix, textY, inline, pal.comment, fontSize);
+                    CeHlLine hl = GetHl(ln, text, t, defaultText);
+                    List<CodeSpan> spans = hl.spans;
+                    int sx = textX;
+                    for (int si2 = 0; si2 < spans.Count; si2 = si2 + 1) {
+                        CodeSpan span = spans[si2];
+                        c.DrawText(sx, textY, span.text, span.color, fontSize);
+                        int sw = span.width;
+                        if (sw < 0) {
+                            sw = Canvas.MeasureText(span.text, fontSize);
+                            span.width = sw;
+                        }
+                        sx = sx + sw;
+                    }
+
+                    // 调试行内即时值：暂停在执行行时，行尾以注释色
+                    // 灰字列出该行引用到的局部变量（名 = 值）。
+                    if (ln == execLine && dbgVars.Count > 0) {
+                        string inline = this.InlineValuesFor(text);
+                        if (inline.Length > 0) {
+                            int ix = sx + scale16;
+                            int maxW = area.x + area.width - rightStripW - ix;
+                            if (maxW > 0) {
+                                while (inline.Length > 0
+                                && Canvas.MeasureText(inline, fontSize) > maxW) {
+                                    inline = inline.Substring(0, inline.Length - 1);
+                                }
+                                if (inline.Length > 0) {
+                                    c.DrawText(ix, textY, inline, pal.comment, fontSize);
+                                }
                             }
                         }
                     }
-                }
 
-                if (ln == curLine && focused) {
-                    string upto = Text.Left(text, curCol);
-                    int cxp = textX + Canvas.MeasureText(upto, fontSize);
-                    c.FillRect(cxp, rowY + scale2, 1,
-                               caretH, caretColor);
-                    // Tab 预测：弹窗选中项在已输入前缀之外的
-                    // 部分，以暗色幽灵文本紧随光标显示。
-                    if (acActive && !selActive) {
-                        string ghost = GhostExtension();
-                        if (ghost.Length > 0) {
-                            c.DrawText(cxp + scale2, textY, ghost,
-                                       lineNumberColor, fontSize);
+                    if (ln == curLine && focused) {
+                        string upto = Text.Left(text, curCol);
+                        int cxp = textX + Canvas.MeasureText(upto, fontSize);
+                        c.FillRect(cxp, rowY + scale2, 1,
+                        caretH, caretColor);
+                        // Tab 预测：弹窗选中项在已输入前缀之外的
+                        // 部分，以暗色幽灵文本紧随光标显示。
+                        if (acActive && !selActive) {
+                            string ghost = GhostExtension();
+                            if (ghost.Length > 0) {
+                                c.DrawText(cxp + scale2, textY, ghost,
+                                lineNumberColor, fontSize);
+                            }
                         }
                     }
-                }
 
-                // CodeLens：此处声明成员的引用计数，位于
-                // 声明上方独占的一行并随之缩进，
-                // 与 Visual Studio 一致。仍在统计的计数（本帧
-                // 预算不足）留空该行，而不显示
-                // 尚未得到的数字。
-                if (lensY >= 0) {
-                    string decl = vrow.decl;
-                    if (decl.Length == 0) {
-                        decl = CodeEditor.DeclNameAt(text);
-                    }
-                    if (decl.Length > 0) {
-                        int refs = LensRefCountBudgeted(decl, ln);
-                        if (refs >= 0) {
-                            string clLabel = Convert.ToString(refs) + " references";
-                            if (refs == 1) { clLabel = "1 reference"; }
-                            int clx = textX + Canvas.MeasureText(
+                    // CodeLens：此处声明成员的引用计数，位于
+                    // 声明上方独占的一行并随之缩进，
+                    // 与 Visual Studio 一致。仍在统计的计数（本帧
+                    // 预算不足）留空该行，而不显示
+                    // 尚未得到的数字。
+                    if (lensY >= 0) {
+                        string decl = vrow.decl;
+                        if (decl.Length == 0) {
+                            decl = CodeEditor.DeclNameAt(text);
+                        }
+                        if (decl.Length > 0) {
+                            int refs = LensRefCountBudgeted(decl, ln);
+                            if (refs >= 0) {
+                                string clLabel = Convert.ToString(refs) + " references";
+                                if (refs == 1) { clLabel = "1 reference"; }
+                                int clx = textX + Canvas.MeasureText(
                                 CodeEditor.LeadWs(text), fontSize);
-                            int clw = Canvas.MeasureText(clLabel, Style.FontFallback(app, "small"));
-                            if (clx + clw < area.x + area.width) {
-                                c.DrawText(clx,
+                                int clw = Canvas.MeasureText(clLabel, Style.FontFallback(app, "small"));
+                                if (clx + clw < area.x + area.width) {
+                                    c.DrawText(clx,
                                     Canvas.CenterTextY(lensY, lensRowH,
-                                        Style.FontFallback(app, "small")),
+                                    Style.FontFallback(app, "small")),
                                     clLabel, pal.changeLabel, Style.FontFallback(app, "small"));
-                                codeLens.Add(new CodeLensRef(ln, decl, clx,
-                                    lensY, clw, refs));
+                                }
                             }
                         }
                     }
-                }
 
-                // 本行上的次要光标（多光标）。
-                if (focused && carets.Count > 0) {
-                    for (int mci = 0; mci < carets.Count; mci = mci + 1) {
-                        if (carets[mci].line == ln) {
-                            int mcc = carets[mci].col;
-                            if (mcc > text.Length) { mcc = text.Length; }
-                            int mcx = textX + Canvas.MeasureText(Text.Left(text, mcc), fontSize);
-                            c.FillRect(mcx, rowY + app.Scale(2), 1, lineH - app.Scale(4), pal.caretSecondary);
+                    // 本行上的次要光标（多光标）。
+                    if (focused && carets.Count > 0) {
+                        for (int mci = 0; mci < carets.Count; mci = mci + 1) {
+                            if (carets[mci].line == ln) {
+                                int mcc = carets[mci].col;
+                                if (mcc > text.Length) { mcc = text.Length; }
+                                int mcx = textX + Canvas.MeasureText(Text.Left(text, mcc), fontSize);
+                                c.FillRect(mcx, rowY + app.Scale(2), 1, lineH - app.Scale(4), pal.caretSecondary);
+                            }
                         }
                     }
-                }
 
-                // 显示光标行或鼠标悬停行的错误原因。编译器诊断具有权威优先权；
-                int rightBoundX = area.x + area.width - rightStripW;
-                bool isHovered = (app.mouseX >= textX && app.mouseX < rightBoundX && app.mouseY >= rowY && app.mouseY < rowY + lineH);
-                bool shouldShowErr = isCompilerErr || isLocalErr || semCount > 0;
-                if (shouldShowErr && (ln == curLine || isHovered)) {
-                    // 编译器诊断具有权威优先权；没有它时用语言服务
-                    // 推送的语义诊断，再退到本地语法诊断。
-                    string errMsg = "";
-                    if (isCompilerErr) { errMsg = CompilerErrMsg(ln); }
-                    else if (semCount > 0) {
-                        Diagnostic sdiag = SemanticDiagAt(ln, 0);
-                        if (sdiag != null) { errMsg = sdiag.msg; }
-                    }
-                    if (errMsg.Length == 0 && isLocalErr) { errMsg = LocalDiagnosticMessage(ln); }
-                    if (errMsg.Length > 0) {
-                        int errPad = app.Scale(6);
-                        int errFh = Canvas.FontHeight(fontSize);
-                        int maxErrBoxW = area.width - (textX - area.x) - rightStripW - app.Scale(8);
-                        if (maxErrBoxW > app.Scale(480)) { maxErrBoxW = app.Scale(480); }
-                        if (maxErrBoxW < app.Scale(220)) { maxErrBoxW = app.Scale(220); }
-                        int maxErrInnerW = maxErrBoxW - errPad * 2;
-
-                        List<string> errLines = new List<string>();
-                        CodeEditor.WrapText(errMsg, maxErrInnerW, fontSize, errLines, 4);
-                        if (errLines.Count == 0) { errLines.Add(errMsg); }
-
-                        int errWidest = 0;
-                        for (int eli = 0; eli < errLines.Count; eli = eli + 1) {
-                            int lw = Canvas.MeasureText(errLines[eli], fontSize);
-                            if (lw > errWidest) { errWidest = lw; }
+                    // 显示光标行或鼠标悬停行的错误原因。编译器诊断具有权威优先权；
+                    int rightBoundX = area.x + area.width - rightStripW;
+                    bool isHovered = (app.mouseX >= textX && app.mouseX < rightBoundX && app.mouseY >= rowY && app.mouseY < rowY + lineH);
+                    bool shouldShowErr = isCompilerErr || isLocalErr || semCount > 0;
+                    if (shouldShowErr && (ln == curLine || isHovered)) {
+                        // 编译器诊断具有权威优先权；没有它时用语言服务
+                        // 推送的语义诊断，再退到本地语法诊断。
+                        string errMsg = "";
+                        if (isCompilerErr) { errMsg = CompilerErrMsg(ln); }
+                        else if (semCount > 0) {
+                            Diagnostic sdiag = SemanticDiagAt(ln, 0);
+                            if (sdiag != null) { errMsg = sdiag.msg; }
                         }
-                        int ttW = errWidest + errPad * 2;
-                        int ttH = errPad * 2 + errLines.Count * errFh + (errLines.Count - 1) * app.Scale(2);
-                        int ttX = textX;
-                        if (ttX + ttW > area.x + area.width - rightStripW) {
-                            ttX = area.x + area.width - rightStripW - ttW - app.Scale(2);
-                        }
-                        if (ttX < area.x) { ttX = area.x + app.Scale(2); }
-                        int ttY = rowY - ttH - app.Scale(2);
-                        if (ttY < area.y) { ttY = rowY + lineH + app.Scale(2); }
-                        c.FillRoundRect(ttX + 1, ttY + 1, ttW, ttH, app.Scale(3), pal.shadowSoft);
-                        c.SurfaceRoundRect(ttX, ttY, ttW, ttH, app.Scale(3), pal.errTipBg, pal.error, 1);
-                        int ety = ttY + errPad;
-                        for (int eli = 0; eli < errLines.Count; eli = eli + 1) {
-                            c.DrawText(ttX + errPad, ety, errLines[eli], pal.errTipText, fontSize);
-                            ety = ety + errFh + app.Scale(2);
+                        if (errMsg.Length == 0 && isLocalErr) { errMsg = LocalDiagnosticMessage(ln); }
+                        if (errMsg.Length > 0) {
+                            int errPad = app.Scale(6);
+                            int errFh = Canvas.FontHeight(fontSize);
+                            int maxErrBoxW = area.width - (textX - area.x) - rightStripW - app.Scale(8);
+                            if (maxErrBoxW > app.Scale(480)) { maxErrBoxW = app.Scale(480); }
+                            if (maxErrBoxW < app.Scale(220)) { maxErrBoxW = app.Scale(220); }
+                            int maxErrInnerW = maxErrBoxW - errPad * 2;
+
+                            List<string> errLines = new List<string>();
+                            CodeEditor.WrapText(errMsg, maxErrInnerW, fontSize, errLines, 4);
+                            if (errLines.Count == 0) { errLines.Add(errMsg); }
+
+                            int errWidest = 0;
+                            for (int eli = 0; eli < errLines.Count; eli = eli + 1) {
+                                int lw = Canvas.MeasureText(errLines[eli], fontSize);
+                                if (lw > errWidest) { errWidest = lw; }
+                            }
+                            int ttW = errWidest + errPad * 2;
+                            int ttH = errPad * 2 + errLines.Count * errFh + (errLines.Count - 1) * app.Scale(2);
+                            int ttX = textX;
+                            if (ttX + ttW > area.x + area.width - rightStripW) {
+                                ttX = area.x + area.width - rightStripW - ttW - app.Scale(2);
+                            }
+                            if (ttX < area.x) { ttX = area.x + app.Scale(2); }
+                            int ttY = rowY - ttH - app.Scale(2);
+                            if (ttY < area.y) { ttY = rowY + lineH + app.Scale(2); }
+                            c.FillRoundRect(ttX + 1, ttY + 1, ttW, ttH, app.Scale(3), pal.shadowSoft);
+                            c.SurfaceRoundRect(ttX, ttY, ttW, ttH, app.Scale(3), pal.errTipBg, pal.error, 1);
+                            int ety = ttY + errPad;
+                            for (int eli = 0; eli < errLines.Count; eli = eli + 1) {
+                                c.DrawText(ttX + errPad, ety, errLines[eli], pal.errTipText, fontSize);
+                                ety = ety + errFh + app.Scale(2);
+                            }
                         }
                     }
                 }
             }
+            c.PopClip();
         }
-        c.PopClip();
+
     }
-
-
-}

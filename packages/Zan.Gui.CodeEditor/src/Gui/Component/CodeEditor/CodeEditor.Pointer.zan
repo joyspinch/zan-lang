@@ -1,0 +1,474 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+public partial class CodeEditor {
+    public override int InputFocusCapabilities() { return 3; }
+    public override bool AcceptsRetainedLongPress() { return true; }
+
+    private bool PrepareEditorInput(RoutedEventArgs e) {
+        App host = this.App;
+        if (host == null || this.IsDisabled() || !this.StyleVisible()) { return false; }
+        Control root = host.rootControl;
+        int generation = host.inputRootGeneration;
+        long sequence = host.window.EventSeq();
+        if (!this.PrepareEditorView(host, false)) { return false; }
+        return host.isRunning && this.App == host && host.rootControl == root
+        && host.inputRootGeneration == generation && host.window.EventSeq() == sequence
+        && this.InputFocusEligible(host, root) && e.GestureRouteCurrent();
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        if (!this.PrepareEditorInput(e)) { return; }
+        App app = this.App;
+        int key = e.keyCode;
+        if (key == 9) {
+            this.HandleCharKey(app, key, e.modifiers);
+            e.Handle();
+        } else if (key == 8 || key == 27 || (key >= 33 && key <= 40) || key == 46
+        || (Modifiers.HasCtrl(e.modifiers) && !Modifiers.HasAlt(e.modifiers)
+        && (key == 65 || key == 67 || key == 86 || key == 88))) {
+            this.HandleNavKey(app, key, e.modifiers);
+            e.Handle();
+        }
+    }
+    public override void OnTextInput(RoutedEventArgs e) {
+        if (!this.PrepareEditorInput(e)) { return; }
+        this.HandleCharKey(this.App, e.keyCode, e.modifiers);
+        e.Handle();
+    }
+    public override void OnInputFocusLost() {
+        mouseSelecting = false;
+        barDragging = false;
+        ateCtrlKey = false;
+        this.CancelSemanticCompletion();
+    }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        mouseSelecting = false;
+        barDragging = false;
+        base.OnPointerCancel(e);
+    }
+    public override void OnPointerDown(RoutedEventArgs e) {
+        if (!this.PrepareEditorInput(e)) { return; }
+        base.OnPointerDown(e);
+        if (!e.GestureRouteCurrent()) { return; }
+        App app = this.App;
+        int button = app.window.EventButton();
+        Rect area = new Rect(bx, by, bw, bh);
+        int fontSize = FontSize(app.theme);
+        int lineH = this.EditorLineHeight(app);
+        int gutterW = gutterWLast;
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        int visLines = pageRows;
+        this.CancelSemanticCompletion();
+        if (button == 1) {
+            bool inGutter = e.x >= area.x && e.x < area.x + gutterW
+            && e.y >= area.y && e.y < area.y + area.height;
+            if (inGutter) {
+                // 行号槽右键：VS 在这里给的是断点菜单（切换/条件/
+                // 删除全部），不是编辑菜单。光标不跟着走——断点操作
+                // 只针对被点的那一行。
+                int bpLine = LineAtY(lineH, e.y);
+                if (bpLine >= lines.Count) { bpLine = lines.Count - 1; }
+                if (bpLine < 0) { bpLine = 0; }
+                ctxBpLine = bpLine;
+                ctxMenuMode = 1;
+                this.ShowContextMenu(app, e.x, e.y);
+                e.Handle();
+            } else {
+                bool overArea = e.x >= area.x + gutterW && e.x < area.x + area.width
+                && e.y >= area.y && e.y < area.y + area.height;
+                if (overArea) {
+                    if (!selActive) {
+                        int rclk = LineAtY(lineH, e.y);
+                        if (rclk < 0) { rclk = curLine; }
+                        if (rclk >= lines.Count) { rclk = lines.Count - 1; }
+                        if (rclk < 0) { rclk = 0; }
+                        curLine = rclk;
+                        curCol = CodeEditor.ColFromX(lines[curLine], e.x - textX, fontSize);
+                    }
+                    ctxMenuMode = 0;
+                    this.ShowContextMenu(app, e.x, e.y);
+                    e.Handle();
+                }
+            }
+        }
+
+        if (button != 0 || ctxOpen) { return; }
+        bool overPopup = acActive && popShown > 0
+        && e.x >= popX && e.x < popX + popW
+        && e.y >= popY && e.y < popY + popH;
+        bool overDesc = acActive && descW > 0
+        && e.x >= descX && e.x < descX + descW
+        && e.y >= descY && e.y < descY + descH;
+        bool overFilter = acActive && filtW > 0
+        && e.x >= filtX && e.x < filtX + filtW
+        && e.y >= filtY && e.y < filtY + filtH;
+        bool overSig = sigGW > 0
+        && e.x >= sigGX && e.x < sigGX + sigGW
+        && e.y >= sigGY && e.y < sigGY + sigGH;
+        bool overCodeLens = false;
+        for (int cli = 0; cli < codeLens.Count; cli = cli + 1) {
+            CodeLensRef cl = codeLens[cli];
+            if (e.x >= cl.x && e.x < cl.x + cl.w
+            && e.y >= cl.y && e.y < cl.y + lensRowH) {
+                overCodeLens = true;
+            }
+        }
+        // 引用列表弹窗：点击条目跳转，点击外部关闭。
+        if (refPopOpen) {
+            bool insidePop = e.x >= refPopGX && e.x < refPopGX + refPopGW
+            && e.y >= refPopGY && e.y < refPopGY + refPopGH;
+            if (insidePop) {
+                int relRow = (e.y - refPopGY - refPopHeadH) / refPopRowH;
+                if (relRow >= 0 && relRow < refPopShown && relRow < refPopLines.Count) {
+                    JumpToRefLine(refPopName, refPopLines[relRow]);
+                    refPopOpen = false;
+                }
+                app.RequestRedraw();
+                e.Handle(); return;
+            }
+            // 点外部关闭：这次点击属于「关弹窗」这一个手势，不能
+            // 顺手落到文本区（光标跳行 + 选区被改写）。提前返回，
+            // 文本区的按下路径就不会再处理这次按下。
+            refPopOpen = false;
+            app.RequestRedraw();
+            e.Handle(); return;
+        }
+
+        // 签名条上的重载箭头（VS 的「◀ 2/3 ▶」）：点击即切换重载，
+        // 箭头命中使用本次准备后的几何，保持文本光标。
+        if (sigPrevW > 0) {
+            int sigDelta = 0;
+            if (e.x >= sigPrevX && e.x < sigPrevX + sigPrevW
+            && e.y >= sigPrevY && e.y < sigPrevY + sigPrevH) {
+                sigDelta = -1;
+            } else if (e.x >= sigNextX && e.x < sigNextX + sigNextW
+            && e.y >= sigNextY && e.y < sigNextY + sigNextH) {
+                sigDelta = 1;
+            }
+            if (sigDelta != 0) {
+                this.SigSwitchOverload(sigDelta);
+                app.RequestRedraw();
+                e.Handle(); return;
+            }
+        }
+
+        // 点击缩略图或滚动条（右侧）：跳到对应行。
+        int minimapW = app.Scale(56);
+        if (area.width < app.Scale(360)) { minimapW = 0; }
+        int scrollBarW = app.Scale(14);
+        int diagStripW = minimapW + scrollBarW;
+        int diagStripX = area.x + area.width - diagStripW;
+        if (!ctxOpen && !overPopup && !overDesc && !overFilter && !overCodeLens
+        && !overSig
+        && e.x >= diagStripX && e.x < area.x + area.width
+        && e.y >= area.y && e.y < area.y + area.height) {
+            int dtotal = lines.Count;
+            if (dtotal < 1) { dtotal = 1; }
+            int dtgt = (e.y - area.y) * dtotal / area.height;
+            if (dtgt < 0) { dtgt = 0; }
+            if (dtgt >= lines.Count) { dtgt = lines.Count - 1; }
+            curLine = dtgt;
+            lastDiagLine = dtgt; // 同步跳过滚动条点击瞬间的诊断扫描
+            if (curCol > lines[curLine].Length) { curCol = lines[curLine].Length; }
+            selActive = false;
+            ClearExtraCarets();
+            int targetLine = dtgt - visLines / 2;
+            if (targetLine < 0) { targetLine = 0; }
+            if (targetLine > lines.Count - visLines) { targetLine = lines.Count - visLines; }
+            if (targetLine < 0) { targetLine = 0; }
+            scrollLine = targetLine;
+            editorScrollY = scrollLine * lineH;
+            targetScrollY = editorScrollY;
+            barDragging = true;
+            lastScrollMs = app.nowMs;
+            lastHoverMoveMs = app.nowMs;
+            hoverTip = null;
+            acActive = false;
+            refPopOpen = false;
+            app.RequestRedraw();
+            app.CapturePointer(this, true); e.Handle(); return;
+        }
+
+        if (!ctxOpen && !overPopup && !overDesc && !overFilter && !overCodeLens
+        && !overSig) {
+            bool overText = e.x >= area.x + gutterW && e.x < diagStripX
+            && e.y >= area.y && e.y < area.y + area.height;
+            if (overText) {
+                CodeEditorViewProof focusProof = this.CaptureEditorView(app);
+                this.Focus(app);
+                focusProof.Focused = app.focus.focusedControl;
+                if (!e.GestureRouteCurrent() || !this.EditorViewCurrent(focusProof)) { return; }
+                bool sh = Modifiers.HasShift(e.modifiers);
+                bool ct = Modifiers.HasCtrl(e.modifiers);
+                if (ct) {
+                    // Ctrl+点击：放置光标并请求宿主执行转到定义。
+                    CaretFromPoint(e.x, e.y, area, gutterW, fontSize);
+                    selActive = false;
+                    ClearExtraCarets();
+                    gotoRequested = true;
+                } else if (sh) {
+                    if (!selActive) {
+                        selAnchorLine = curLine; selAnchorCol = curCol; selActive = true;
+                    }
+                    CaretFromPoint(e.x, e.y, area, gutterW, fontSize);
+                } else {
+                    CaretFromPoint(e.x, e.y, area, gutterW, fontSize);
+                    bool near = curLine == lastClickLine
+                    && curCol >= lastClickCol - 1 && curCol <= lastClickCol + 1;
+                    if (app.nowMs - lastClickMs <= 400 && near) {
+                        clickCount = clickCount + 1;
+                    } else {
+                        clickCount = 1;
+                    }
+                    lastClickMs = app.nowMs;
+                    lastClickLine = curLine;
+                    lastClickCol = curCol;
+                    if (clickCount == 2) {
+                        SelectWordCaret();
+                        mouseSelecting = false;
+                    } else if (clickCount >= 3) {
+                        SelectLineCaret();
+                        mouseSelecting = false;
+                        clickCount = 0;
+                    } else {
+                        selAnchorLine = curLine; selAnchorCol = curCol;
+                        selActive = false;
+                        ClearExtraCarets();
+                        mouseSelecting = true;
+                    }
+                }
+                acActive = false;
+                if (mouseSelecting) { app.CapturePointer(this, true); }
+                app.RequestRedraw();
+                e.Handle();
+            }
+        }
+
+    }
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (!this.PrepareEditorInput(e)) { return; }
+        App app = this.App;
+        Rect area = new Rect(bx, by, bw, bh);
+        int lineH = this.EditorLineHeight(app);
+        int fontSize = FontSize(app.theme);
+        int gutterW = gutterWLast;
+        int visLines = pageRows;
+        if (barDragging) {
+            int total = lines.Count;
+            if (total < 1) { total = 1; }
+            int thumbH = visLines * area.height / total;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            if (thumbH > area.height) { thumbH = area.height; }
+            int travel = area.height - thumbH;
+            int newY = 0;
+            if (travel > 0 && maxScrollY > 0) {
+                int my = e.y - area.y - thumbH / 2;
+                newY = my * maxScrollY / travel;
+            }
+            if (newY < 0) { newY = 0; }
+            if (newY > maxScrollY) { newY = maxScrollY; }
+            editorScrollY = newY;
+            targetScrollY = newY;
+            scrollLine = editorScrollY / lineH;
+            lastScrollMs = app.nowMs;
+            lastHoverMoveMs = app.nowMs;
+            hoverTip = null;
+            acActive = false;
+            refPopOpen = false;
+            app.NoteScrollDamage(area.x, area.y, area.width, area.height);
+
+            e.Handle();
+            return;
+        }
+        if (mouseSelecting) {
+            CaretFromPoint(e.x, e.y, area, gutterW, fontSize);
+            selActive = curLine != selAnchorLine || curCol != selAnchorCol;
+            app.RequestRedraw();
+            e.Handle();
+            return;
+        }
+        // 文档或视口变化后，同一屏幕坐标也必须重新等待静止期。
+        this.SyncHoverDwell(app);
+
+        // ---- 悬停：指针静止防抖后才触发重绘以展示符号提示，避免高速滑过引发整窗无效重绘 ----
+        if (!mouseSelecting && !acActive) {
+            if (e.x >= area.x && e.x < area.x + area.width
+            && e.y >= area.y && e.y < area.y + area.height) {
+                // 仅当鼠标移动超过一定像素，重置悬停静止计时器
+                int mdx = e.x - lastHoverX;
+                int mdy = e.y - lastHoverY;
+                if (mdx < 0) { mdx = -mdx; }
+                if (mdy < 0) { mdy = -mdy; }
+                if (mdx > 3 || mdy > 3) {
+                    lastHoverX = e.x;
+                    lastHoverY = e.y;
+                    lastHoverMoveMs = app.nowMs;
+                }
+            }
+        }
+
+    }
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        bool selected = mouseSelecting && selActive;
+        mouseSelecting = false;
+        barDragging = false;
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        base.OnPointerUp(e);
+        if (selected) { e.Handle(); }
+    }
+    public override void OnClick(RoutedEventArgs e) {
+        if (!this.PrepareEditorInput(e) || ctxOpen) { return; }
+        App app = this.App;
+        Rect area = new Rect(bx, by, bw, bh);
+        int lineH = this.EditorLineHeight(app);
+        int gutterW = gutterWLast;
+        // CodeLens 点击：打开可展开的全部引用列表。
+        bool clHit = false;
+        for (int clc = 0; clc < codeLens.Count; clc = clc + 1) {
+            CodeLensRef cl = codeLens[clc];
+            if (e.x >= cl.x && e.x < cl.x + cl.w
+            && e.y >= cl.y && e.y < cl.y + lensRowH) {
+                refPopLines = new List<int>();
+                CollectRefs(cl.name, cl.line, refPopLines);
+                refPopName = cl.name;
+                refPopSel = 0;
+                refPopX = cl.x;
+                refPopY = cl.y + lensRowH;
+                // 此弹窗只能列出本缓冲区的行，
+                // 因此仅当透镜统计的所有引用都在其中时才作答。
+                refPopOpen = refPopLines.Count > 0
+                && refPopLines.Count >= cl.count;
+                if (!refPopOpen) {
+                    // 其他文件中也有使用：把光标放在
+                    // 声明上，让宿主按项目范围列出。
+                    int nameCol = CodeEditor.FindWordFrom(lines[cl.line], cl.name, 0);
+                    if (nameCol < 0) { nameCol = 0; }
+                    GoToLineCol(cl.line, nameCol);
+                    ctxCmd = "findrefs";
+                }
+                clHit = true;
+                app.RequestRedraw();
+            }
+        }
+        if (clHit) {
+            // 已处理
+        }
+        // 种类过滤条点击：切换所选种类。
+        else if (acActive && filtW > 0
+        && e.x >= filtX && e.x < filtX + filtW
+        && e.y >= filtY && e.y < filtY + filtH) {
+            List<string> fk2 = CodeEditor.GetFilterKinds();
+            int step = app.Scale(16) + app.Scale(4);
+            int fidx = (e.x - (filtX + app.Scale(5))) / step;
+            if (fidx >= 0 && fidx < fk2.Count) {
+                string chosenF = fk2[fidx];
+                if (chosenF == "" || HasKind(chosenF)) {
+                    if (acFilter == chosenF) { acFilter = ""; }
+                    else { acFilter = chosenF; }
+                    acSel = 0;
+                    ApplyKindFilter();
+                }
+            }
+            app.RequestRedraw();
+        }
+        // 检查自动补全弹窗点击
+        else if (acActive && popShown > 0
+        && e.x >= popX && e.x < popX + popW
+        && e.y >= popY && e.y < popY + popH) {
+            int relY = e.y - popY - app.Scale(2);
+            int clickedRow = relY / popItemH;
+            if (clickedRow >= 0 && clickedRow < popShown) {
+                int clickedIdx = popFirst + clickedRow;
+                if (clickedIdx >= 0 && clickedIdx < acItems.Count) {
+                    acSel = clickedIdx;
+                    AcceptCompletion(false);
+                }
+            }
+            app.RequestRedraw();
+        } else {
+            if (e.x < area.x + gutterW) {
+                int clicked = LineAtY(lineH, e.y);
+                if (clicked >= lines.Count) { clicked = lines.Count - 1; }
+                // 槽位最右一列是折叠标记区：命中折叠起点时切换折叠，
+                // 其余槽位点击仍是断点开关。
+                int foldX = area.x + gutterW - app.Scale(18);
+                if (clicked >= 0 && e.x >= foldX
+                && e.x < area.x + gutterW - app.Scale(4)
+                && FoldableAt(clicked)) {
+                    ToggleFold(clicked);
+                } else if (clicked >= 0) {
+                    ToggleBreakpoint(clicked);
+                }
+                app.RequestRedraw();
+            }
+        }
+
+        e.Handle();
+    }
+    public override void OnWheel(RoutedEventArgs e) {
+        if (!this.PrepareEditorInput(e) || maxScrollY <= 0) { return; }
+        App app = this.App;
+        Rect area = new Rect(bx, by, bw, bh);
+        int lineH = this.EditorLineHeight(app);
+        int previous = targetScrollY;
+        this.ClearPreparedHover(app, area);
+        acActive = false;
+        refPopOpen = false;
+        int delta = e.delta;
+        // 每 120 刻度对应 3 行像素高度
+        int pixStep = (delta * lineH * 3) / 120;
+        if (pixStep == 0) {
+            if (delta > 0) { pixStep = 1; }
+            else if (delta < 0) { pixStep = 0 - 1; }
+        }
+        // 突然反向滚动时重设目标，防止惯性滞后
+        if ((targetScrollY > editorScrollY && delta > 0) || (targetScrollY < editorScrollY && delta < 0)) {
+            targetScrollY = editorScrollY;
+        }
+        targetScrollY = targetScrollY - pixStep;
+        if (targetScrollY < 0) { targetScrollY = 0; }
+        if (targetScrollY > maxScrollY) { targetScrollY = maxScrollY; }
+        lastScrollMs = app.nowMs;
+        lastHoverMoveMs = app.nowMs;
+        hoverTip = null;
+        app.NoteScrollDamage(area.x, area.y, area.width, area.height);
+
+        if (targetScrollY != previous) { e.Handle(); }
+    }
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName != "LongPress") { base.OnRoutedEvent(e); return; }
+        if (!this.PrepareEditorInput(e)) { return; }
+        App app = this.App;
+        Rect area = new Rect(bx, by, bw, bh);
+        int gutterW = gutterWLast;
+        int lineH = this.EditorLineHeight(app);
+        int fontSize = FontSize(app.theme);
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        mouseSelecting = false;
+        barDragging = false;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        bool lpOver = e.x >= area.x + gutterW
+        && e.x < area.x + area.width
+        && e.y >= area.y
+        && e.y < area.y + area.height;
+        if (lpOver) {
+            if (!selActive) {
+                int lpLine = LineAtY(lineH, e.y);
+                if (lpLine < 0) { lpLine = curLine; }
+                if (lpLine >= lines.Count) { lpLine = lines.Count - 1; }
+                if (lpLine < 0) { lpLine = 0; }
+                curLine = lpLine;
+                curCol = CodeEditor.ColFromX(lines[curLine], e.x - textX, fontSize);
+            }
+            ctxMenuMode = 0;
+            this.ShowContextMenu(app, e.x, e.y);
+            e.Handle();
+        }
+
+    }
+}

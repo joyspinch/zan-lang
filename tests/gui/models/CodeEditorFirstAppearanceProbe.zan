@@ -1,0 +1,149 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component.CodeEditor;
+
+using System.IO;
+
+// Shares native input/frame capture with the hover-clear regression.
+class CodeEditorFirstAppearanceProbe {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception("first hover appearance: " + message); }
+    }
+
+    static bool Inside(Rect rect, int x, int y) {
+        return x >= rect.x && x < rect.x + rect.width
+        && y >= rect.y && y < rect.y + rect.height;
+    }
+
+    static void SamePixels(HoverDamageFrame left, HoverDamageFrame right, string message) {
+        Check(left.pixels.Length == right.pixels.Length, message + " dimensions");
+        for (int pixel = 0; pixel < left.pixels.Length; pixel++) {
+            Check(left.pixels[pixel] == right.pixels[pixel],
+            message + " pixel=" + Convert.ToString(pixel));
+        }
+    }
+
+    // Returns baseline, first appearance, and (only if scheduled) one successor.
+    static List<HoverDamageFrame> Sequence(App app, Rect area, Rect damage,
+    bool partial, bool tall, bool deferred, string evidence) {
+        CodeEditor editor = new CodeEditor();
+        editor.DetachAnalysis();
+        editor.LoadText(CodeEditorHoverDamageProbe.Document());
+        editor.documentPath = "first-appearance.zan";
+        app.SetPartialFrames(partial);
+        app.focus.ClearFocus();
+        int fontSize = editor.FontSize(app.theme);
+        int textX = area.x + app.Scale(48) + app.theme.paddingSmall;
+        int hoverX = textX + Canvas.MeasureText("pay", fontSize);
+        int hoverY = area.y + Canvas.FontHeight(fontSize) / 2;
+        int semanticCalls = 0;
+        List<HoverDamageFrame> frames = new List<HoverDamageFrame>();
+        try {
+            CodeEditorHoverDamageProbe.Input(app, 1, hoverX, hoverY, 0);
+            app.RequestRedraw();
+            CodeEditorHoverDamageProbe.Frame(app, editor, area, 2000);
+            // No hover provider yet; stable pointer/document and no scrolling.
+            app.RequestRedraw();
+            frames.Add(CodeEditorHoverDamageProbe.Frame(app, editor, area, 2016));
+            editor.externalHover = (string path, int line, int col, string word) => {
+                semanticCalls++;
+                if (tall) { return "payload(\nfirstParameter,\nsecondParameter,\nthirdParameter)"; }
+                return "payload()";
+            };
+            // This legitimate damage is the only first-appearance redraw cause.
+            // No input event or RequestRedraw may promote this frame to full.
+            app.NoteDamage(damage.x, damage.y, damage.width, damage.height);
+            HoverDamageFrame first = CodeEditorHoverDamageProbe.Frame(app, editor, area, 2600);
+            Check(first.partial == partial, "first appearance really uses selected damage mode");
+            Check(semanticCalls > 0, "production semantic hover provider was consumed");
+            frames.Add(first);
+            bool scheduled = app.needsRedraw;
+            if (evidence != "") {
+                int firstChanged = 0;
+                for (int pixel = 0; pixel < first.pixels.Length; pixel++) {
+                    if (first.pixels[pixel] != frames[0].pixels[pixel]) { firstChanged++; }
+                }
+                File.AppendAllText(evidence, "firstAppearance partial=" + Convert.ToString(first.partial)
+                + " deferred=" + Convert.ToString(deferred) + " changedPixels=" + Convert.ToString(firstChanged)
+                + " successorScheduled=" + Convert.ToString(scheduled) + "\n");
+            }
+            if (partial && deferred) {
+                SamePixels(frames[0], first, "first partial defers the new tooltip as a unit");
+                Check(scheduled, "clipped first appearance schedules its own full successor");
+                // No new input, RequestRedraw or NoteDamage occurs here.
+                HoverDamageFrame successor = CodeEditorHoverDamageProbe.Frame(app, editor, area, 2616);
+                Check(!successor.partial, "one automatically requested successor is full");
+                frames.Add(successor);
+            } else {
+                Check(!scheduled, "complete first appearance does not schedule a redundant successor");
+            }
+            Check(!app.needsRedraw, "appearance converges without a busy redraw loop");
+        } finally {
+            editor.DetachAnalysis();
+        }
+        return frames;
+    }
+
+    static void Run(App app, string evidence) {
+        Rect overflowArea = new Rect(40, app.titlebarH + 24, 360, 72);
+        // Full reference proves the existing real hover actually changes pixels
+        // outside this small editor; a no-tooltip false green is not accepted.
+        List<HoverDamageFrame> full = Sequence(app, overflowArea, overflowArea, false, true, false, evidence);
+        int outside = 0;
+        int width = app.canvas.Width();
+        for (int y = 0; y < app.canvas.Height(); y++) {
+            for (int x = 0; x < width; x++) {
+                if (!Inside(overflowArea, x, y)
+                && full[0].pixels[y * width + x] != full[1].pixels[y * width + x]) { outside++; }
+            }
+        }
+        Check(outside > 0, "full reference has actual overflow pixels");
+        List<HoverDamageFrame> clipped = Sequence(app, overflowArea, overflowArea, true, true, true, evidence);
+        Check(clipped.Count == 3, "exactly one requested appearance successor");
+        SamePixels(clipped[0], clipped[1], "first partial safely defers the new overflow tooltip");
+        SamePixels(full[1], clipped[2], "automatic successor matches full reference ARGB");
+
+        Rect containedArea = new Rect(40, app.titlebarH + 24, 360, 240);
+        List<HoverDamageFrame> containedFull = Sequence(app, containedArea, containedArea, false, false, false, evidence);
+        int changed = 0;
+        int minX = width;
+        int minY = app.canvas.Height();
+        int maxX = 0;
+        int maxY = 0;
+        for (int y = 0; y < app.canvas.Height(); y++) {
+            for (int x = 0; x < width; x++) {
+                if (containedFull[0].pixels[y * width + x] != containedFull[1].pixels[y * width + x]) {
+                    Check(Inside(containedArea, x, y), "contained reference stays in its damage clip");
+                    if (x < minX) { minX = x; }
+                    if (y < minY) { minY = y; }
+                    if (x > maxX) { maxX = x; }
+                    if (y > maxY) { maxY = y; }
+                    changed++;
+                }
+            }
+        }
+        Check(changed > 0, "contained reference visibly paints a real tooltip");
+        // Use a strict subrectangle that contains the real first-appearance
+        // pixels; editor containment alone must not force a full frame.
+        Rect containedClip = new Rect(minX - 2, minY - 2, maxX - minX + 5, maxY - minY + 5);
+        Check(containedClip.width < containedArea.width && containedClip.height < containedArea.height,
+        "contained damage is a genuine local clip inside the editor");
+        List<HoverDamageFrame> contained = Sequence(app, containedArea, containedClip, true, false, false, evidence);
+        Check(contained.Count == 2 && contained[1].partial,
+        "contained first appearance remains a local frame with no successor");
+        SamePixels(containedFull[1], contained[1], "contained partial matches full ARGB");
+        // A popup entirely inside the editor can still cross the current clip.
+        // Intersect the actual popup pixels with a narrow vertical damage strip.
+        Check(maxX > minX + 8, "real contained tooltip spans the narrow clip boundary");
+        Rect narrow = new Rect(minX, containedArea.y, 4, containedArea.height);
+        List<HoverDamageFrame> clippedInside = Sequence(app, containedArea, narrow, true, false, true, evidence);
+        SamePixels(containedFull[1], clippedInside[2],
+        "narrow intersecting clip gets one complete automatic successor");
+        if (evidence != "") {
+            File.AppendAllText(evidence, "firstAppearance outsidePixels=" + Convert.ToString(outside)
+            + " containedChanged=" + Convert.ToString(changed) + " narrowWidth=4 casesPassed=3\n");
+        }
+        Console.WriteLine("CODEEDITOR_FIRST_APPEARANCE_OK");
+    }
+}

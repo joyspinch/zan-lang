@@ -1,0 +1,186 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Gui;
+using Gui.Backend;
+using Gui.Component.CodeEditor;
+
+class HoverDamageFrame {
+    public int[] pixels;
+    public int scroll;
+    public bool partial;
+    public bool tip;
+}
+
+class CodeEditorHoverDamageProbe {
+    static string evidence = "";
+    static void Check(bool value, string message) { if (!value) { throw new Exception(message); } }
+    static string Document() {
+        string text = "";
+        for (int row = 0; row < 80; row = row + 1) { text = text + "payload + payload // row " + Convert.ToString(row) + "\n"; }
+        return text;
+    }
+    static List<DbgVar> Variables(bool overflow) {
+        string json = "{";
+        int fields = overflow ? 16 : 1;
+        for (int row = 0; row < fields; row = row + 1) {
+            if (row > 0) { json = json + ","; }
+            json = json + "\"field" + Convert.ToString(row) + "\": " + Convert.ToString(row);
+        }
+        json = json + "}";
+        List<DbgVar> vars = new List<DbgVar>();
+        vars.Add(new DbgVar("payload", "ProbeRecord", json));
+        return vars;
+    }
+    static void Input(App app, int kind, int x, int y, int delta) {
+        app.window.InjectEvent(kind, x, y, 0, delta, 0);
+        bool found = false;
+        for (int attempt = 0; attempt < 40 && !found; attempt = attempt + 1) {
+            Check(app.PollOneEvent() >= 0, "owned event pump stays open");
+            found = app.window.EventKind() == kind && app.window.EventX() == x
+            && app.window.EventY() == y && app.window.EventKeyCode() == delta;
+        }
+        Check(found, "owned injected input reaches production event pump");
+    }
+    static HoverDamageFrame Frame(App app, CodeEditor editor, Rect area, int clock) {
+        app.FreezeAnimClock(clock);
+        app.SyncSurface();
+        editor.UseApp(app); app.SetRootControl(editor);
+        app.BeginFrame();
+        editor.MeasureTree(app); editor.Arrange(area.x, area.y, area.width, area.height);
+        bool partial = app.partialFrame;
+        try {
+            editor.RenderTree(app);
+            app.RenderChrome("hover damage probe");
+        } catch (Exception ex) {
+            if (partial) { app.canvas.PopClip(); }
+            throw ex;
+        }
+        HoverDamageFrame result = new HoverDamageFrame();
+        result.partial = partial;
+        result.scroll = editor.ScrollY();
+        result.tip = editor.hoverTip != null;
+        app.PresentFrame();
+        int width = app.canvas.Width();
+        int height = app.canvas.Height();
+        result.pixels = new int[width * height];
+        for (int y = 0; y < height; y = y + 1) {
+            for (int x = 0; x < width; x = x + 1) { result.pixels[y * width + x] = app.canvas.GetPixel(x, y); }
+        }
+        return result;
+    }
+    static List<HoverDamageFrame> Sequence(App app, Rect area, bool partial, bool debug, bool overflow) {
+        CodeEditor editor = new CodeEditor();
+        editor.DetachAnalysis();
+        editor.LoadText(Document());
+        editor.documentPath = "hover-damage.zan";
+        editor.SetDebugVars(Variables(overflow));
+        app.SetPartialFrames(partial);
+        app.focus.ClearFocus();
+        Input(app, 1, app.canvas.Width() - 8, app.canvas.Height() - 8, 0);
+        app.RequestRedraw();
+        Frame(app, editor, area, 1000);
+        Frame(app, editor, area, 1000);
+        List<HoverDamageFrame> frames = new List<HoverDamageFrame>();
+        try {
+            int fontSize = editor.FontSize(app.theme);
+            int textX = area.x + app.Scale(48) + app.theme.paddingSmall;
+            int hoverX = textX + Canvas.MeasureText("pay", fontSize);
+            int hoverY = area.y + Canvas.FontHeight(fontSize) / 2;
+            Input(app, 1, hoverX, hoverY, 0);
+            app.RequestRedraw();
+            HoverDamageFrame clear = Frame(app, editor, area, 2000);
+            int semanticCalls = 0;
+            if (debug) { editor.execLine = 0; }
+            else {
+                editor.externalHover = (string path, int line, int col, string word) => {
+                    semanticCalls = semanticCalls + 1;
+                    return "payload(\nfirstParameter,\nsecondParameter,\nthirdParameter)";
+                };
+            }
+            app.RequestRedraw();
+            HoverDamageFrame shown = Frame(app, editor, area, 2600);
+            Check((debug ? shown.tip : semanticCalls > 0) && !shown.partial,
+            "real hover is visibly established in full frame");
+            int outside = 0;
+            int width = app.canvas.Width();
+            for (int y = 0; y < app.canvas.Height(); y = y + 1) {
+                for (int x = 0; x < width; x = x + 1) {
+                    bool inEditor = x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height;
+                    if (!inEditor && shown.pixels[y * width + x] != clear.pixels[y * width + x]) { outside = outside + 1; }
+                }
+            }
+            Check(overflow ? outside > 0 : outside == 0, "real hover pixels match overflow precondition");
+            Check(!app.needsRedraw, "stationary hover does not request a busy redraw successor");
+            frames.Add(shown);
+            int shownSemanticCalls = semanticCalls;
+            Input(app, 13, hoverX, hoverY, 0 - 120);
+            HoverDamageFrame wheel = Frame(app, editor, area, 2616);
+            Check(wheel.scroll > shown.scroll && !wheel.tip, "real wheel scroll clears the displayed hover");
+            Check(debug || semanticCalls == shownSemanticCalls, "scroll suppresses semantic hover resolution");
+            int remainingOutside = 0;
+            for (int y = 0; y < app.canvas.Height(); y = y + 1) {
+                for (int x = 0; x < width; x = x + 1) {
+                    bool inEditor = x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height;
+                    if (!inEditor && wheel.pixels[y * width + x] != clear.pixels[y * width + x]) { remainingOutside = remainingOutside + 1; }
+                }
+            }
+            Check(partial || remainingOutside == 0, "full scroll frame clears every outside hover pixel");
+            frames.Add(wheel);
+            if (evidence != "") {
+                File.AppendAllText(evidence, "debug=" + Convert.ToString(debug) + " overflow=" + Convert.ToString(overflow)
+                + " configuredPartial=" + Convert.ToString(partial) + " outsidePixels=" + Convert.ToString(outside)
+                + " semanticCalls=" + Convert.ToString(semanticCalls) + " shownTip=" + Convert.ToString(shown.tip)
+                + " wheelScroll=" + Convert.ToString(wheel.scroll) + " wheelPartial=" + Convert.ToString(wheel.partial)
+                + " remainingOutsidePixels=" + Convert.ToString(remainingOutside) + "\n");
+            }
+            Input(app, 0, hoverX, hoverY, 0);
+            for (int step = 0; step < 4; step = step + 1) { frames.Add(Frame(app, editor, area, 2632 + step * 16)); }
+        } finally { editor.DetachAnalysis(); }
+        return frames;
+    }
+    static void Main(string[] args) {
+        if (args.Length > 0) { evidence = args[0]; File.WriteAllText(evidence, ""); }
+        #if WINDOWS
+        App previous = App.FrameApp();
+        App app = new App("hover damage probe", 720, 560, true);
+        try {
+            app.Show();
+            app.SyncSurface();
+            Rect area = new Rect(40, app.titlebarH + 24, 360, 72);
+            for (int mode = 0; mode < 4; mode = mode + 1) {
+                bool debug = mode % 2 == 0;
+                bool overflow = mode < 2;
+                Rect viewport = overflow ? area : new Rect(area.x, area.y, area.width, 240);
+                List<HoverDamageFrame> full = Sequence(app, viewport, false, debug, overflow);
+                List<HoverDamageFrame> partial = Sequence(app, viewport, true, debug, overflow);
+                Check(full.Count == partial.Count, "same hover sequence length");
+                for (int frame = 0; frame < full.Count; frame = frame + 1) {
+                    Check(full[frame].scroll == partial[frame].scroll, "same real hover-scroll state");
+                    Check(full[frame].pixels.Length == partial[frame].pixels.Length, "same native surface dimensions");
+                    for (int pixel = 0; pixel < full[frame].pixels.Length; pixel = pixel + 1) {
+                        Check(full[frame].pixels[pixel] == partial[frame].pixels[pixel],
+                        "hover clear full/partial ARGB mismatch frame=" + Convert.ToString(frame) + " pixel=" + Convert.ToString(pixel)
+                        + " debug=" + Convert.ToString(debug));
+                    }
+                }
+                Check(overflow ? !partial[1].partial : partial[1].partial,
+                "only overflowing hover requires a full clearing successor");
+                for (int frame = 2; frame < partial.Count; frame = frame + 1) {
+                    Check(partial[frame].partial, "smooth scroll resumes bounded damage after hover clears");
+                }
+            }
+            CodeEditorFirstAppearanceProbe.Run(app, evidence);
+            Console.WriteLine("CODEEDITOR_HOVER_DAMAGE_OK");
+        } finally {
+            app.UnfreezeAnimClock();
+            app.StopLoop();
+            app.window.Destroy();
+            app.canvas.Destroy();
+            App.frameApp = previous;
+        }
+        #else
+        Console.WriteLine("CODEEDITOR_HOVER_DAMAGE_SKIP native Windows required");
+        #endif
+    }
+}

@@ -3,6 +3,14 @@ using Gui;
 using Gui.Backend;
 using Gui.Component;
 
+class SemanticEventEditor : CodeEditor {
+    public int moves;
+    public override void OnPointerMove(RoutedEventArgs e) {
+        moves = moves + 1;
+        base.OnPointerMove(e);
+    }
+}
+
 class Program {
     static void Assert(bool condition, string message) {
         if (!condition) { Console.WriteLine("FAIL: " + message); Environment.Exit(1); }
@@ -54,6 +62,8 @@ class Program {
             hover.documentPath = "third.zan"; return "poison hover";
         };
         Assert(hover.LspHoverFor("foo", 0, 1) == "", "hover file switch rejected");
+        signature.externalSignature = null;
+        hover.externalHover = null;
     }
 
     static void TestCompletionGuards() {
@@ -85,7 +95,7 @@ class Program {
         int version = e.TextStamp();
         e.AcceptCompletion(true);
         Assert(e.GetText() == "中fo" && e.TextStamp() == version && e.undoStack.Count == 0,
-            "textEdit cannot split UTF-8");
+        "textEdit cannot split UTF-8");
         e.LoadText("foTAIL"); e.curCol = 2;
         e.externalCompletion = (string path, int line, int col) => {
             List<CodeCompletionItem> items = new List<CodeCompletionItem>();
@@ -122,6 +132,7 @@ class Program {
         e.LoadText("Fo"); e.curCol = 2; e.UpdateCompletion();
         e.documentPath = "third.zan"; e.ApplyKindFilter();
         Assert(!e.acActive, "kind filter cannot revive stale completion");
+        e.externalCompletion = null;
     }
 
     static App guiApp;
@@ -129,7 +140,9 @@ class Program {
     static Rect guiArea;
 
     static void GuiBody() {
-        guiEditor.Render(guiApp, guiArea);
+        guiEditor.UseApp(guiApp); guiApp.SetRootControl(guiEditor);
+        guiEditor.MeasureTree(guiApp); guiEditor.Arrange(guiArea.x, guiArea.y, guiArea.width, guiArea.height);
+        guiEditor.RenderTree(guiApp);
     }
 
     static void GuiFrame() {
@@ -138,9 +151,13 @@ class Program {
 
     static void GuiEvent(int kind, int x, int y, int code, int mods) {
         guiApp.window.InjectEvent(kind, x, y, 0, code, mods);
-        guiApp.SetPollEventMode();
-        Assert(guiApp.PumpGuarded(), "GUI event pump");
-        Assert(guiApp.EventKind() == kind, "injected event dispatched");
+        bool found = false;
+        for (int attempt = 0; attempt < 40 && !found; attempt = attempt + 1) {
+            Assert(guiApp.PollOneEvent() >= 0, "GUI event pump");
+            found = guiApp.window.EventKind() == kind && guiApp.window.EventX() == x
+            && guiApp.window.EventY() == y && guiApp.window.EventKeyCode() == code;
+        }
+        Assert(found, "injected event dispatched");
         GuiFrame();
     }
 
@@ -159,8 +176,8 @@ class Program {
         guiApp.FreezeAnimClock(10000);
         guiApp.Show();
         for (int i = 0; i < 256 && guiApp.window.PollEvent() == 0; i = i + 1) { }
-        guiArea = new Rect(0, 0, 480, 260);
-        guiEditor = new CodeEditor();
+        guiArea = new Rect(0, guiApp.ContentTop(), 480, 260 - guiApp.ContentTop());
+        guiEditor = new SemanticEventEditor();
         guiEditor.documentPath = "event.zan";
         guiEditor.LoadText("obj"); guiEditor.curCol = 3;
         bool ready = false;
@@ -171,7 +188,7 @@ class Program {
             return items;
         };
         GuiEvent(1, 400, 220, 0, 0);
-        guiApp.focus.SetFocused(guiEditor.LastWidgetId());
+        guiEditor.Focus(guiApp);
 
         GuiEvent(6, 400, 220, 46, 0);
         int dotToken = guiEditor.SemanticCompletionToken();
@@ -180,7 +197,7 @@ class Program {
         Assert(guiEditor.SemanticCompletionToken() == dotToken, "dot keyup preserves intent");
         ready = true;
         Assert(guiEditor.RefreshSemanticResult("textDocument/completion", "event.zan",
-            guiEditor.TextStamp(), 0, 4, "", dotToken), "dot result after keyup accepted");
+        guiEditor.TextStamp(), 0, 4, "", dotToken), "dot result after keyup accepted");
         Assert(guiEditor.acActive && guiEditor.acItems[0] == "WriteLine", "dot popup after keyup");
 
         guiEditor.LoadText(""); ready = false;
@@ -192,7 +209,7 @@ class Program {
         Assert(guiEditor.SemanticCompletionToken() == forcedToken, "Space/Ctrl keyup preserves intent");
         ready = true;
         Assert(guiEditor.RefreshSemanticResult("textDocument/completion", "event.zan",
-            guiEditor.TextStamp(), 0, 0, "", forcedToken), "forced result after keyup accepted");
+        guiEditor.TextStamp(), 0, 0, "", forcedToken), "forced result after keyup accepted");
         Assert(guiEditor.acActive, "forced popup after keyup");
 
         guiEditor.LoadText("obj."); guiEditor.curCol = 4; ready = false;
@@ -203,7 +220,7 @@ class Program {
         GuiEvent(2, 400, 220, 0, 0);
         Assert(guiEditor.SemanticCompletionToken() < 0, "mouse press cancels pending intent");
         GuiEvent(3, 400, 220, 0, 0);
-        guiApp.focus.SetFocused(guiEditor.LastWidgetId());
+        guiEditor.Focus(guiApp);
         GuiEvent(6, 400, 220, 0, Modifiers.Ctrl());
         guiApp.focus.SetFocused(-1);
         GuiEvent(5, 400, 220, 32, 0);
@@ -224,9 +241,17 @@ class Program {
         int fontSize = guiEditor.FontSize(guiApp.theme);
         int textX = guiApp.Scale(48) + guiApp.theme.paddingSmall;
         int fooX = textX + Canvas.MeasureText("f", fontSize) / 2;
-        int fooY = Canvas.FontHeight(fontSize) / 2;
+        int fooY = guiArea.y + Canvas.FontHeight(fontSize) / 2;
         GuiEvent(1, fooX, fooY, 0, 0);
-        Assert(hoverCalls == 0 && guiApp.wakeFrameNextMs == 20450, "hover reserves idle deadline");
+        Assert(hoverCalls == 0 && guiApp.wakeFrameNextMs == 20450,
+        "hover reserves idle deadline: calls=" + Convert.ToString(hoverCalls)
+        + " wake=" + Convert.ToString(guiApp.wakeFrameNextMs)
+        + " move=" + Convert.ToString(guiEditor.lastHoverMoveMs)
+        + " scroll=" + Convert.ToString(guiEditor.lastScrollMs)
+        + " routed=" + Convert.ToString(((SemanticEventEditor)guiEditor).moves)
+        + " hit=" + Convert.ToString(guiEditor.HitTest(fooX, fooY) == guiEditor)
+        + " eligible=" + Convert.ToString(guiEditor.InputFocusEligible(guiApp, guiApp.rootControl))
+        + " capture=" + Convert.ToString(guiApp.PointerCaptured()));
         GuiIdleAt(20100);
         Assert(!guiApp.needsRedraw && hoverCalls == 0, "hover waits without input");
         GuiFrame();
@@ -247,7 +272,7 @@ class Program {
         guiEditor.LoadText(hoverText.Replace("bar", "baz"));
         GuiIdleAt(21450); GuiFrame();
         Assert(hoverCalls == 1 && guiApp.wakeFrameNextMs == 21900,
-            "document change at deadline restarts dwell");
+        "document change at deadline restarts dwell");
         GuiIdleAt(21900); GuiFrame();
         Assert(hoverCalls == 2 && hoveredWord == "baz", "deadline re-hits changed document");
 
@@ -256,7 +281,7 @@ class Program {
         guiEditor.SetScrollY(1);
         GuiIdleAt(22450); GuiFrame();
         Assert(hoverCalls == 2 && guiApp.wakeFrameNextMs == 22900,
-            "viewport change at deadline restarts dwell");
+        "viewport change at deadline restarts dwell");
         // 跳出文本、装订线、行尾空白都不得预约无效位置的下一帧。
         GuiEvent(1, 490, 280, 0, 0);
         Assert(guiApp.wakeFrameNextMs < 0 && hoverCalls == 2, "leave editor cancels hover wake");
@@ -265,7 +290,11 @@ class Program {
         GuiEvent(1, 400, fooY, 0, 0);
         Assert(guiApp.wakeFrameNextMs < 0, "trailing whitespace has no hover wake");
         guiApp.UnfreezeAnimClock();
-        guiApp.window.Destroy();
+        guiEditor.externalCompletion = null; guiEditor.externalHover = null;
+        guiEditor.DetachAnalysis(); guiApp.SetRootControl(null); guiEditor = null;
+        guiApp.StopLoop(); guiApp.window.Destroy(); guiApp.canvas.Destroy();
+        if (App.frameApp == guiApp) { App.frameApp = null; }
+        guiApp = null;
     }
 
     static void Main() {
@@ -280,9 +309,9 @@ class Program {
         Assert(CodeEditor.ByteColumnToUtf16(unicode, 100) == 5, "byte column clamps to end");
         Assert(CodeEditor.Utf16ColumnToByte(unicode, 100) == unicode.Length, "UTF-16 column clamps to end");
         Assert(CodeEditor.Utf16ColumnToByte(unicode, CodeEditor.ByteColumnToUtf16(unicode, 4)) == 4,
-            "BMP boundary round trip");
+        "BMP boundary round trip");
         Assert(CodeEditor.Utf16ColumnToByte(unicode, CodeEditor.ByteColumnToUtf16(unicode, 8)) == 8,
-            "supplementary boundary round trip");
+        "supplementary boundary round trip");
 
         CodeEditor e = new CodeEditor();
         e.documentPath = "buffer.zan";
@@ -315,6 +344,7 @@ class Program {
         Assert(e.GetText() == "obj.WrTail;" && e.curCol == 6, "undo restores buffer and caret");
         e.Redo();
         Assert(e.GetText() == "obj.WriteLine();", "redo completion");
+        e.externalCompletion = null;
 
         CodeEditor insert = new CodeEditor();
         insert.documentPath = "insert.zan";
@@ -354,6 +384,7 @@ class Program {
         };
         insert.UpdateCompletion();
         Assert(!insert.acActive && insert.GetText() == "new file", "stale provider response rejected");
+        insert.externalCompletion = null;
 
         CodeEditor forced = new CodeEditor(); forced.documentPath = "empty.zan";
         bool requested = false;
