@@ -1113,7 +1113,7 @@ try {
             Require-Target $tree 'ide-ribbon-overflow'
         }
         Require-RibbonOverflow 'small-overflow' @(14, 18, 17)
-        Require-RibbonOverflow 'narrow-overflow' @(12, 15, 13, 20, 14, 18, 17) @(12, 15)
+        Require-RibbonOverflow 'narrow-overflow' @(15, 13, 20, 14, 18, 17) @(15)
     }
 } finally {
     if ($null -ne $process) {
