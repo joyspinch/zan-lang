@@ -283,8 +283,54 @@
 `--check-leaks --arc-guard -g` 实跑无泄漏，并用 IR 核对惰性元数据生成后的
 用户分配点仍保留实际文件、行列与匹配的 `!dbg`。不外推为其他平台已验证。
 
+### 12.1 宿主紧凑成员表 ABI（2026-11-18 实现契约）
+
+TypeInfo 仍是指向类型名的值，15 槽头部及各负偏移保持；公开 API、成员顺序、
+遮蔽与 override 选择、属性、泛型、构造、ARC/EH 语义保持。字段、方法、构造器
+表的**内部二进制布局已变更**，不能把公开 API 保持理解为新旧二进制兼容。
+
+- 每类型成员表为 `{native recordPool*, native valuePool*, [count x i32] ids}`。
+  ids 按原枚举顺序索引共享记录池；helper 必须加载该表携带的两个池基址，
+  跨 DLL 查询库返回的 TypeInfo 时不能使用消费模块自己的池。
+- 字段记录 40 字节：六个 i32 payload ID（name、typeName、customName、default、
+  fieldTypeInfo、attrs），随后 i64 offset/enumValue、i32 kind、i32 flags。
+  方法/构造器记录 32 字节：五个 i32 payload ID（name、returnType、paramTypes、
+  thunk、attrs），随后 i32 returnKind、i32 paramCount、i32 flags。
+  payload 池存原生指针，ID 0 是 null；所有 ID 均零扩展后索引，窄标量越界须诊断。
+  offset/enumValue 保留 i64；源语言枚举成员仍受 int32 契约约束。
+- 原 9×8 字段、8×8 方法记录仅作编译器生成期的逻辑表示，最终 IR 不保留旧平铺
+  物理表。完整 LLVM 常量相等才可去重，参数数组须按完整内容规范化；继承字段
+  offset 由目标 DataLayout 解析。thunk 按实际 callee 与调用约定共享，仍直接调用
+  已选定方法，不得在冻结后增加分配站点或虚槽需求。
+- 在全部支持函数、导出与初始化根发射后，沿真实根的前向常量闭包选择活表；
+  常量互引循环不能自根，linkonce/ODR/available_externally 定义不能自行成为根。
+  将死表塞进共享池会反向保活其字符串、thunk 及其他类型描述。
+
+库与消费方必须以同一新版宿主编译器重建；旧预编译 Zan 库的成员表与新 helper
+不可互读。当前没有库级反射 ABI 版本协商或自动转换。自举编译器独立生成并消费
+旧成员表，不能与宿主紧凑表跨模块交换 TypeInfo 或依赖该表的对象动态反射。
+这里描述实现契约；验收入口是 `publish_reflect_compact_{members,ctor,sharing}`、
+`publish_reflect_compact_ir` 与同版 `emit_lib_windows_reflect_compact`，新增入口的
+通过状态须由本轮实际执行结果给出，不沿用上节既有测试的结论。
+
 ## 13. 进程捕获的 deadline 与启动确认
 
 带超时的进程捕获必须让读管道和等待子进程都能返回检查单调时钟：Windows 用 `PeekNamedPipe` 确认可读量后限定 `ReadFile` 长度，POSIX 用非阻塞 read、有限 `poll` 和 `waitpid(WNOHANG)`；持续输出也不能形成无界 drain。超时后只排空该边界已有字节的快照，不能等后代持有的写端 EOF。保留六参旧 ABI，POSIX 超时入口另增七参符号，并重建所有受影响目标的 sync bundle；不能在 Windows 调不存在的 POSIX 入口。deadline 约束等待与排空流程，OS 终止/回收没有任意硬实时保证，特权子进程可能令 kill 返回 EPERM。
 
 POSIX `StartProgram` 用 CLOEXEC 错误管道确认最终 exec，重定向或 exec 失败必须回报启动失败；成功 exec 后程序自行退出 127 仍属启动成功。用 `process_capture_timeout` 和 `rt_proc_contract_test.c` 分别核对 API 与原生边界，覆盖无输出、持续输出、超时快照、后代持管、启动失败及正常退出回收；双平台分别留证，已有断言通过不替代新增边界的验证。
+
+## 14. 原生加速归档按功能提取（2026-11-18 Windows 验证）
+
+- **以归档成员作为依赖边界**：`libzancrypto.a` 的 aes/asym/b64/cpu/crc/gcm/hash/json/pixel/sm
+  分别编译为独立 TU；把聚合 TU 放进单成员归档仍会让 JSON 引用带入密码算法。
+  `zan_hw_accel.c` 仅保留 native 测试直接 include 的入口，生产归档编译 `hw/rt_hw_*.c`。
+- **CPU 检测与 KAT 状态不得反向依赖算法**：轻量 cpu 成员负责查询、初始化、门禁和状态，
+  算法成员把自己的 KAT 传入门禁。JSON 经已有查询初始化 dispatch；AES/GCM 只共享真实
+  内核，不复制实现。跨 TU 私有 helper 的可见性与公开 ABI 分开管理。
+- **验收最终消费物**：`ar t` 的十成员只能证明拆分，不能证明没有反向提取。
+  `native_accel_json_link` 仅调用 JSON scanner，关闭 section GC 后检查最终定义符号
+  只来自 JSON/CPU，并验证 scanner 输出；`native_cpu_feature_gates` 覆盖冷启动、KAT
+  未触发及屏蔽 SIMD 后的回退。主线程报告这两项及受影响算法回归在 Windows 通过。
+- **所有生产配方共用 TU 集合**：主机、两套 selfhost 归档及 shell/cmd 跨平台入口
+  都枚举 `rt_hw_*.c`；selfhost 仍使用各自编译器，不能混用宿主对象的 CRT/ABI。
+  三份实际归档十成员与脚本语法检查不构成其他平台已编译、运行的证据。

@@ -288,8 +288,12 @@
 
 - **发布构建不能按 DTO 外形裁掉动态反射元数据**（2026-11-14 探针对照）：
   `object.GetField*` 与 JSON 的嵌套对象读取依赖分配描述符里的具体类型 meta；
-  `typeof(T)` 有字段列表不代表实例能动态读值。启用 `refl_used` 时，普通无注解、
-  无接口、无虚方法的 DTO 也必须保留 site meta 和相应发射可达性；不能只保留多态类。
+  `typeof(T)` 有字段列表不代表实例能动态读值。实际发射对象 GetType/Get/Set/Invoke
+  时，普通无注解、无接口、无虚方法的 DTO 也须保留 site meta 和相应发射可达性，
+  不能只保留多态类。仅显式 `typeof(T)` 则只保留其递归元数据根，不开启全分配点
+  元数据；预热、descriptor、legacy 表与 body-root 共用 `refl_needs_site_meta`，
+  晚发现动态需求纳入冻结前固定点。`publish_reflect_ctor_demand_metadata` 同时验证
+  无关类/List 的正常使用、死 GetType 不开启需求与无关字段名/hook 不进入发布 IR。
   `publish_reflect_object_metadata.zan` 在旧 publish 构建读取 Id 即失败，调试构建正常；
   修复后两种构建均精确输出、空 stderr，覆盖嵌套 int/string/bool 与对象身份。
   探针收据 `build/test-out/gui-publish-reflect-20261113T201915Z/report.json`；
@@ -305,8 +309,40 @@
   body、需求、metadata、方法表及站点统一求固定点，并用 ready 状态保证幂等。
   发布 IR 门禁检查无构造 thunk/死构造专用 marker；元数据查询可合法常量折叠，
   不要求物理表存在，另用运行期数量/参数 golden 验证。能力级保留不等于逐类型裁剪。
+- **成员发现、签名查询和调用需求分别保留**：发布模式从实际发射的 TypeInfo 查询登记
+  返回类型、参数类型、方法注解与构造签名能力，纳入发射固定点；收敛后统一投影已有
+  initializer，保留方法行、顺序、名字、参数数量、flags、retkind 与 thunk，仅解除无人
+  查询的签名细节。无构造查询且无 CreateInstance 才解除 ctor 表引用；调用分派不依赖
+  被清除的类型字符串。投影阶段仍处理 8 槽逻辑方法记录，15 槽 TypeInfo 头部保持；
+  最终输出再转为紧凑池与索引表，内部 ABI 与跨库重建要求见 `runtime-abi.md` §12.1。
+  投影遇未知表形状保守跳过，不在该阶段新建站点。`publish_reflect_signature_demand_names/late` 与 IR 门禁
+  验证死查询不贡献需求、名字枚举及属性读写正常、反射 hook 晚发现查询仍保留完整签名。
+  `ZAN_NO_PUBLISH_REFLECT_DEMAND=1` 可关闭整组需求裁剪，供同源 A/B 与回归定位。
+- **启动初始化的需求与依赖排序共用可执行图（2026-11-18 host 实证）**：
+  `emit_static_init.c` 的函数图以 Main、库导出、既定特性/HTML 回调及已激活初始化器为根，
+  合入反射 getter/setter、Invoke 与 CreateInstance 的间接边；元数据、调用桩和清理函数
+  不能独立激活类型。新增初始化器、闭合泛型特化和反射需求都加入 body 固定点，收敛后
+  用同一图从各初始化器求依赖，再按声明顺序 DFS 跳回边；字段/自动属性先于 cctor。
+  普通模式的死方法诊断补发必须晚于启动集合冻结。用 `publish_static_init_demand`
+  及 `_reflect` 同时验证活依赖与 metadata-only/死循环负例；普通 IR 可保留诊断体的
+  字符串和零初始化存储，但不得出现对应的 `__zan_sinit_`。publish 的全 IR 负项不能放宽。
+- **闭包查询复用图，不逐个 use 重新扫描 LLVM users（2026-11-18 采样实证）**：
+  旧 IDE 编译 CPU 超过 1000 秒，三次取样两次命中旧 `sinit_reaches_root`、一次命中
+  `LLVMGetBasicBlockParent`，确认重复反向扫描瓶颈。每轮只建一次函数索引和邻接表，
+  公共根闭包算一次后按函数索引查询；最终排序每个初始化器只做一次 BFS，复用映射。
+  IR 新增后下一轮重建，不能跨轮沿用过期闭包。修后定向 probe 不再卡在该扫描；
+  这不证明完整 IDE 编译或端到端性能已验收。
+- **反射名字解码必须保留 managed string 的常量 GEP 偏移（2026-11-18 IR 实证）**：
+  真实 Invoke 名字为 `getelementptr ([25 x i8], ptr @literal, i64 0, i64 16)`，
+  前 16 字节是托管头。只递归 operand0 会把头和负载整体与八字节方法名比较，误判
+  不匹配，令共享 thunk 仍调用 `dead: unreachable` 的 OnShared/OnSecond，运行退出
+  0x80000003。按 GEP 源类型、常量索引及 target layout 累计字节偏移，定位聚合负载，
+  以 payload 首个 NUL 截断后比较，避免尾部 padding 干扰；先判 LLVM kind 再取字符串。
+  已知不匹配仍返回 0，只有无法解析的动态值返回 unknown，不能把全部不匹配放宽来
+  掩盖裁剪错误。验收同时检查 thunk、实际 callee 非死桩及真实调用；表/payload 正确
+  不能证明 callee body 可执行。host 反射初始化 probe 与相关 IR 门已通过；不外推自举。
 - **主对象与分片对象共用发布分节策略**：对象写出前统一准备可回收节，不能只在主对象路径设置；准备时机须晚于分片规划，避免 COMDAT 改变可移动性。Windows COFF 强定义使用独立 `$` 子节和 NODUPLICATES COMDAT，保留重复强定义报错；弱运行时后备函数、既有 ODR 组、TLS 与显式特殊节保留原契约。MinGW 函数节须带 `$函数名`，才能生成独立展开信息。验证必须检查最终链接的活/死函数与数据符号，并实际运行；未定义符号可能在 GC 前报错，不能用其消失与否代替裁剪验证。
-- **方法名形似事件不等于独立保留根**：精确扫描到的 HTML handler 可独立保留；通用 `On*` 只在所属类型实际反射或其他活调用需要时保留。派生类型的反射方法表包含继承实例方法，声明基类即使没有自己的 metadata/site 也须参与闭包；冻结站点表和生成死桩的时序不变。用未使用类型的 hook/分配图负例与继承 hook 调用正例共同验证，不能通过删反射契约换体积。
+- **方法名形似事件不等于独立保留根**：精确扫描到的 HTML handler 可独立保留；发布模式通用 `On*` 调用桩与 body root 共用实际发射的 `Invoke*` 名字需求。字面量精确去重，计算名字与含 NUL 名字保守回退；死方法不贡献需求，晚发现名字须继续固定点。成员签名与 HasMethod 不随调用桩裁剪，属性和注解保留既有契约。派生反射表包含继承实例方法，声明基类即使没有自己的 metadata/site 也须参与闭包；继承访问器须按派生 owner 中的属性名识别，不能要求其声明也出现在派生成员表。`publish_reflect_invoke_demand_literal/dynamic` 与 IR 门禁共同验证死 hook 裁剪、动态回退、继承调用、晚发现调用及属性读写；冻结站点表和生成死桩的时序不变。
 - **字段 TypeInfo 不证明实例方法体可达**：保留字段与方法签名查询，把实例 hook/thunk 的接收者资格另行判断；派生分配可接收基类声明的方法，动态 CreateInstance、库导出和托管 extern 返回/ref/out 维持保守契约；extern 数组元素与结构体字段须递归检查并替换闭合泛型实参，string、byte[] 和纯数值结构体不应误关裁剪。运行时 guard 的 site=0 对象仍有真实虚表 store，不能仅凭普通分配站点缺失认定无实例。回归同时验证 metadata-only 的 HasMethod 以及字段 TypeInfo 构造派生实例并调用继承 hook。
 - **接口候选不能给自身制造保留证据**：发射候选时保存具体类型与闭合虚表的 instruction metadata；活性固定点只在独立分配站点、真实虚表 store 或保守回退存在时启用候选调用边。候选的 tag 比较属于观察，不能当构造证据；普通调用、委托和未知 metadata 保守处理。不能在发射时按尚未完整的 sites 提前过滤，也不能等候选 body 发出并 new 自己后再判断。用 late allocation、继承实现、闭合泛型正例和自分配死实现负例联合验证。
 - **ARC 抵消只认同一 SSA 对象**：同一字段地址的两次 load 可在中间回调改写后得到不同对象，不能据地址相等抵消 retain/release；仅剥离 pointer cast 后的 SSA identity 足够。若要跨 load 优化，必须先证明内存没有被改写。分片在自定义 ARC 优化之前提取，裁剪改变函数所在模块会暴露旧优化缺陷；用弱引用生命周期与正常优化 GUI 运行验收，不能靠关闭 ARC 优化交付。

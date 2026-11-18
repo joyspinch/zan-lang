@@ -990,6 +990,20 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
       走 disarm 免释放回退，抛出走 unwind 按槽 kind 释放。A528（结构体
       ctor 字段）零运行时改动闭环即此模式。
 
+    - **实例调用保住已加载的接收者值**：在 null/scratch 替换及实参求值前
+      retain 借用值；owned local 也不能豁免，`receiver.M(Clear(ref receiver))`
+      会先释放槽里的旧值。owned 表达式沿用其 +1；正常在调用边界释放，EH
+      用既有临时栈收口。class/interface 的借用与 owned 接收者统一走
+      `emit_eh_tmp_push_obj`：tagged delegate 必须编码为 DLG，一次登记对应一次
+      pop，实参先退再退接收者；原始 tag 不能当 EH kind 解码。
+    - **自举同口径**：`EmitInstanceCallAs` 在 guard/参数前通过
+      `HoldCallReceiver` 转移已有 temp owner 或 retain 借用值，复用 local-owner
+      链兜 EH，返回时 `DropCallReceiver` 清槽并释放；不能只 AddTemp 拖到分号。
+      delegate→interface cast 复用 `EraseDelegateReference`，转移源临时所有权。
+      判定器 `arc_callback_receiver_lifetime` 用 weak witness 同时验证调用内存活、
+      ref 清空、嵌套参数异常、tagged capture 释放、返回 this 同表达式退役；
+      读回旧标量不能证明对象仍存活。独立 failed-as 析构时机不随此修复扩展。
+
 55. **ARC 分配点编号从 1 起，site 0 是运行时的"未跟踪"哨兵**：
     - 动作：`reserve_arc_site` 的站点索引一律从 1 开始分配（0 号槽永远
       留空，去重循环也从 1 起扫）。

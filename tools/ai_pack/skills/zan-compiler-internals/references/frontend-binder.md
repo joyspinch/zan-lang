@@ -36,6 +36,25 @@
   与 `diag_method_group_selected_receiver`；另用错误 T 的 ctor 探针确认 E2037 仍拒绝。
   直接委托赋值绿不代表泛型 ctor 绿，最小探针通过后仍须重建实际 IDE 消费者。
 
+- **cctor 与实例构造器分属不同判重集合（2026-11-18 host 实证）**：
+  `static C()` 与 `public C()` 的空参数表相同，但可同时声明，且不能依赖声明先后。
+  `binder/binder_sym.c` 的 `member_clash_one` 仅在两个 `SYM_CONSTRUCTOR` 的
+  `MOD_STATIC` 位相同时调用参数等价判重；不能改测试为带参构造器绕过 E1004。
+  本轮两个静态需求 fixture 曾因此同时编译失败；修后它们与 `static_constructor`
+  probe 通过。正例在 `static_constructor.zan` 覆盖两种声明顺序；
+  `duplicate_instance_constructor.zan` 与 `duplicate_static_constructor.zan`
+  保证同类重复构造器仍报 E1004，不能为允许 static/instance 共存而关闭构造器判重。
+- **实例构造候选过滤必须贯穿 checker（2026-11-18 focused diff 实证）**：
+  binder 合法地把 cctor 与实例构造器都记为 `SYM_CONSTRUCTOR`，所以
+  `check_ctor_available` 和 `check_ctor_call_arguments` 都必须在计数、arity、
+  可访问性及实参匹配之前排除 `MOD_STATIC`。仅修后端实例构造表并不够：
+  仅有 cctor 的类传入实参曾错报 E2018；声明 `C(int)` 再写 `new C()` 曾被
+  零参 cctor 提前放行，构造体静默不执行。
+  契约：仅 cctor 时 `new C()` 合法、`new C(1)` 报 E2017；声明实例 `C(int)`
+  后 `new C()` 报 E2018。判定器为 `static_constructor` 正例及
+  `static_ctor_instance_argument`、`static_ctor_no_implicit_instance` 两反例；
+  修复后的通过状态以主线程本轮重建与定向日志为准，不改 manifest 降低断言。
+
 ## 4. 闭包捕获与控制流分析
 
 - **捕获变量而不是捕获值快照**：

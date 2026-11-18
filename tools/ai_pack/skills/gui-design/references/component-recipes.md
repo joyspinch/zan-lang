@@ -22,6 +22,12 @@
   不能让旧遍历继续处理新会话。原因：Paint 派发使重绘重放通知，回调换根或重绑又会
   把旧快照带入新树。验证覆盖首次准备、隐藏/重显、尺寸变化、重复 Paint、回调重入、
   跨 App 与实际 weak 释放，不以一次绘制成功代替生命周期验收。
+- **绘制回调返回后立即核对当前帧与节点归属**：OnPaint、Paint 事件及每个子树
+  返回后复用准备代次、parent、借用 owner 和 revision 检查；RenderTree 入口先拒绝
+  失效帧，避免把新 App 的子控件继承回旧 App。隐藏、移除或转移只中止失效子树，
+  合法父节点的其余兄弟仍可绘制；root/event/phase 换代则中止整帧旧尾段。裁剪用
+  finally 恢复，styleCtx 与 paint hash 同样成对还原。control_paint_fences 严格回归
+  覆盖 HTML/代码正常绘制、HUD 四种变更、节点/帧失效、异常、状态恢复及 weak 释放。
 - **准备回调失效须传到参与者外层**：宿主返回本轮完成证明，失败后调用
   `App.InvalidatePreparation()` 推进现有票据，停止外层旧尾段；不能只在局部 return，
   否则后续准备可能把回调设置的新根覆盖。合法准备安装输入根仍被允许，不可一律取消。
@@ -39,6 +45,19 @@
   测量记录。原因：截短列表会误命中已排除子树，单一 measuring 标志会吞掉合法迁移，
   遗留宿主记录则会保活 App。现有回归覆盖多子树排除、跨 App 重测与弱寿命；
   活跃祖先 App 的循环回访拦截仍需独立用例，不能把单次跨 App 迁移当成循环验证。
+- **弹层布局的每个回调后立即停止失效尾段**：Measure/Arrange 后核对登记 revision、
+  App、root/根代次、事件、准备票据和 frame，再继续安排或布局通知；外层返回后才查
+  代次无法阻止内部旧 Arrange。点弹层保留登记，下一轮从新状态恢复，不用 Dismiss
+  掩盖失效。RenderAll 只画准备结果，不调用旧 BlockHitsBelow/Rect 改焦点或点击认领；
+  隐藏与零尺寸登记在准备期退休。严格回归覆盖测量/安排×输入/绘制×换根/推进事件/
+  同事件嵌套准备的12组合、弱释放、连续Paint纯度与真实点击不穿透；路由、菜单生命
+  周期和准备快照三项正式通过。异常断言退出的 reachable 报告不等于正常退出泄漏。
+- **当轮绑定先于测量约束计算**：父节点传入 available/clamp，子节点只同步一次
+  绑定并解析当前样式，再扣本轮 margin、求声明 width，finally 恢复临时测量宽度。
+  不能先按旧样式算 width 再进入 SyncBinding，否则 margin/width 改动滞后一轮；也
+  不能先独立同步再测量造成重复回调。scroll 严格与正式单项覆盖 240→176px、
+  200→100px 及恢复、一次同步、detach/root 换代尾段，原 HTML/代码几何断言保留。
+  离屏借用 HTML 子树仍须显式绑定宿主，不能因其 parent 属于未绑定文档根而吞测量。
 - **派生视觉类用纯 `EffectiveClass()` 投影**：基类默认返回作者 Class，Input 将
   Size、净化后的 FieldStatus 与 Round 投影成有效类，保留 Class/GetProp("class")
   原文。普通样式、缓存、Selector 上下文与 :has、parts、输入几何均用同一投影；
@@ -51,6 +70,11 @@
   不同步绑定、不重建。原因：绘制期才建树会让首绘前和连续输入使用过时页码按钮。
   验证外部页码变化后首绘前即可点击、绑定写回与 Change 一次、重复 Paint 不读绑定
   且保持子树身份；工厂属性等价另用真实 ControlFactory 验证。
+- **重复项的可见部件各持有真实控件**：把准备移出 Paint 时，不能让多行共用一枚
+  可变控件，否则准备完成后全部只剩最后一行的文本与几何。沿既有 Arrange 和滚动
+  回调维护可见实例池，文本改变才更新生成子树，命中直接读准备后的控件边界；
+  空态、模式切换和 Reset 退休旧部件。头像回归应覆盖不同首字、首绘前点击、滚动后
+  点击、重复绘制不改子树及自然 weak 释放，不能只检查主气泡正文。
 - **离屏滚轮重放保留原事件身份**：旧 CaptureWheel 两帧认领只恢复事件载荷，不能再次派发 routed Wheel，也不能先增后退事件序号；否则通知重复，且下一真实输入会撞上去重缓存。已路由消费的滚轮须跨 BeginFrame 保持已消费，不能被旧绘制路径重领。判定器：`scroll_routed_input_test` 的真实 EndOffscreenFrame→重放→下一指针/滚轮，以及 `scrollcolumn_input_lifecycle_test` 的混合消费。
 - **旧行数 API 只投影共享像素 offset**：RichText 用真实行高前缀定位、bottomAnchor=0 精确贴底；CodeBlock 的 UseScroll 保留行数与信号版本，内部投影不能吃掉半行像素余量。OnScrollChanged 在真实提交后统一通知、同值不通知；最终 Up 先退休旧捕获再通知，回调换根/新捕获不被旧动作覆盖。固定 header/copy 是真实子树，正文 ScrollViewport 排除固定区域，Paint 不处理输入。`richtext_codeblock_input_test` 已通过 strict 精确 golden/leak/guard，覆盖输入返回前投影、链接、复制一次、最终 Up、触控取消、DPI、重入与 weak；原 `richtext_test` 旧 golden 同轮严格通过。
 - **布局诊断不暴露可变缓存**：只读属性返回 List 仍可 Clear/Add；RichText.LineAt(index) 返回独立行、段与链接快照，越界/未布局为 null，修改快照不能污染实际布局。资源占位前须收口文本段宽，资源 advance 也计入行宽；探针实际复现宽度为零后才修根因，未复现的行高疑点不顺带改。
@@ -115,7 +139,13 @@
   `scene_designer_color` 颜色 probe 亦通过，不外推为 IDE 实机或正式 CTest 通过。
 - **嵌入区域的布局、绘制与输入共用同一几何**：HUD 在输入前调用
   `SetBounds(x,y,width,height)`（App 坐标）与 `Bind(app)`，共享 prepare 对同一树
-  Measure/Arrange；绘制用 `RenderIn(app,x,y,width,height)`，不把首次绑定推迟到 Paint。
+  Measure/Arrange；绘制只调用 `Paint(app)` 消费准备结果，不再绑定、布局或重置区域。
+  已移除旧 Render/RenderIn/RenderViewport/PrepareLayout/BindInputRoot 入口。Paint 须核
+  当前 App、适配器实际根链及准备证明，隐藏、摘除或跨 App 后的旧绘制不能复活输入；
+  连续 Paint 不增加 Measure/Arrange、不更改准备票据与根代次，首绘前即可真实点击。
+  已绑定 HUD 的 Add 必须推进现有准备票据，再登记新 scope；准备后业务 Add 与
+  OnPaint 内 Add 均不能把未测排成员带入同次绘制。下一共享准备完成后才允许绘制和
+  命中，不靠 Paint 补布局或每帧复制成员表；guihost 严格回归保留原 golden 与 weak。
   当前 SceneDesigner 用 `InitializeInput(app)` 提前登记，再以 `SetBounds(app,...)`、
   `SetHostPanelBounds(app,tools,properties)` 更新区域；Designer Inspector 的入口为
   `PrepareInspectorInput(App,Rect)`，不沿用旧 RenderInspector 代替准备。
@@ -141,10 +171,11 @@
   开关列表里,用户会犯迷糊该点哪个。停靠组件给了 `SetNoSwitch`:面板声明
   "不进通用开关列表",入口只留显眼的那一处。
 - **放不下的命令要有去处,不能被裁**(Ribbon 溢出教训):工具条/功能区宽度
-  不够时,降级(先丢低价值命令、再把带文字的小命令收成图标格)只到"降级到底"
-  为止;再放不下就把尾部命令收进右端「»」溢出菜单(Office 式)。命令不许
-  被裁成"看得见点不着"——设计器排版组 17 个图标格塞进 324px 工具条时,右半
-  (等宽/等高/等尺寸/层次)整片失联,就是没有溢出兜底。
+  不够时,低优先级命令退出条带、文字收成图标格,所有隐藏命令仍须进入右端
+  「»」溢出菜单。条带与菜单合起来须恰好保留每条原命令,不能因 optional
+  标记而丢失入口。菜单须命中标准 ContextMenu 表面,按真实按钮声明高度和
+  inset 测量；验证同时检查完整末行点击、短窗滚动与空白边距实际背景色,
+  不以按钮几何或 alpha 正确代替整片菜单不透底。
 - **排布只算一遍**:测量宽度、绘制、判定"放不下"必须读同一份落位结果
   (组件里一份 Layout → 槽位列表,测量/绘制/溢出三处共用),否则会出现
   "量出来放得下、画出来被裁"——两套游标算法迟早对不上。
