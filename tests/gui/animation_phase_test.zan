@@ -18,7 +18,60 @@ class AnimationPhaseTest {
         AnimationPhaseTest.Check(label, delta > -0.000001 && delta < 0.000001);
     }
 
+    static int SurfacePixel(App app, Button button, int ms) {
+        app.FreezeAnimClock(ms);
+        app.BeginOffscreenFrame();
+        button.RenderInside(app, new Rect(12, 12, 90, 36));
+        app.EndOffscreenFrame();
+        return app.canvas.GetPixel(20, 30);
+    }
+
+    static void CheckRetainedSurface() {
+        Dispatcher.Init();
+        App app = App.CreateOffscreen("retained surface", 120, 72);
+        Button button = new Button("Action");
+        button.ClassName = "motion-test";
+        app.sheet = Css.Parse("button.motion-test { background: #202020; border: 0; border-radius: 0; transition: 100ms; }"
+            + "button.motion-test:hover { background: #606060; }"
+            + "button.motion-test:active { background: #c0c0c0; }"
+            + "button.motion-test:focus { border: 1 #ffffff; }"
+            + "button.motion-test:disabled { background: #303030; }");
+        app.SetRootControl(button);
+        int idle = AnimationPhaseTest.SurfacePixel(app, button, 1000);
+        app.ProcessOffscreenInput(1, 38, 24, 0, 0, 0, 0);
+        AnimationPhaseTest.Eq("hover starts at idle", AnimationPhaseTest.SurfacePixel(app, button, 1000), idle);
+        AnimationPhaseTest.Check("hover schedules a bounded follow-up", app.animNextMs >= 0 && app.animRectValid && !app.animRectAll);
+        int hoverMid = AnimationPhaseTest.SurfacePixel(app, button, 1050);
+        int hover = AnimationPhaseTest.SurfacePixel(app, button, 1100);
+        AnimationPhaseTest.Eq("retained hover reaches CSS endpoint", hover, 0xff606060);
+        AnimationPhaseTest.Check("retained hover has an intermediate frame", idle != hoverMid && hover != hoverMid);
+        app.ProcessOffscreenInput(2, 38, 24, 0, 0, 0, 0);
+        AnimationPhaseTest.Eq("press starts at hover", AnimationPhaseTest.SurfacePixel(app, button, 1100), hover);
+        int pressMid = AnimationPhaseTest.SurfacePixel(app, button, 1150);
+        int press = AnimationPhaseTest.SurfacePixel(app, button, 1200);
+        AnimationPhaseTest.Eq("press and focus coexist", press, 0xffc0c0c0);
+        AnimationPhaseTest.Eq("focus border is visible", app.canvas.GetPixel(12, 30), 0xffffffff);
+        AnimationPhaseTest.Check("press has an intermediate frame", pressMid != hover && pressMid != press);
+        app.ProcessOffscreenInput(3, 38, 24, 0, 0, 0, 0);
+        AnimationPhaseTest.Eq("release starts at pressed color", AnimationPhaseTest.SurfacePixel(app, button, 1200), press);
+        AnimationPhaseTest.Eq("release returns to hover", AnimationPhaseTest.SurfacePixel(app, button, 1300), hover);
+        app.reducedMotion = true;
+        app.ProcessOffscreenInput(1, 112, 60, 0, 0, 0, 0);
+        AnimationPhaseTest.Eq("reduced motion snaps on pointer leave", AnimationPhaseTest.SurfacePixel(app, button, 1300), idle);
+        app.ProcessOffscreenInput(1, 38, 24, 0, 0, 0, 0);
+        AnimationPhaseTest.Eq("reduced motion snaps on hover", AnimationPhaseTest.SurfacePixel(app, button, 1300), hover);
+        button.Disabled = true;
+        AnimationPhaseTest.Eq("disabled wins over the hover and focus endpoints", AnimationPhaseTest.SurfacePixel(app, button, 1300), 0xff303030);
+        AnimationPhaseTest.Check("visual states preserve the arranged hit box",
+            button.bx == 12 && button.by == 12 && button.bw == 90 && button.bh == 36);
+        app.SetRootControl(null);
+        app.UnfreezeAnimClock();
+        app.StopLoop();
+        app.canvas.Destroy();
+    }
+
     static void Main() {
+        AnimationPhaseTest.CheckRetainedSurface();
         AnimationPhaseTest.Eq("start phase", Spin.DotPhase(0), 0);
         AnimationPhaseTest.Eq("mid-dot phase", Spin.DotPhase(45), 500);
         AnimationPhaseTest.Eq("next dot phase", Spin.DotPhase(90), 1000);

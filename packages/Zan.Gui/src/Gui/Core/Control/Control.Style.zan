@@ -692,7 +692,66 @@ public partial class Control {
         if (!this.ComputedStyleCurrent(app)) {
             this.ResolveStyle(app, Style.SNormal());
         }
-        computedStyle.Paint(app, bx, by, bw, bh);
+        Control target = this.SurfaceInputOwner();
+        StyleBox box = target == null ? computedStyle : this.InputSurface(app, target, computedStyle);
+        box.Paint(app, bx, by, bw, bh);
+    }
+
+    // A retained indicator can use its owner's input without becoming a separate hit target.
+    protected virtual Control SurfaceInputOwner() {
+        return this.InputFocusCapabilities() != 0 ? this : null;
+    }
+
+    private AnimSlot surfaceHover;
+    private AnimSlot surfacePress;
+    private AnimSlot surfaceFocus;
+
+    private StyleBox InputSurface(App app, Control target, StyleBox normal) {
+        int state = computedStyleState < 0 ? Style.SNormal() : computedStyleState;
+        int id = target.WidgetId();
+        bool enabled = !target.IsDisabled();
+        bool hovered = enabled && app.focus.IsHovered(id);
+        bool pressed = hovered && app.focus.IsPressed(id);
+        bool focusedTarget = enabled && app.focus.IsFocused(id);
+        int ms = enabled ? normal.transitionMs : 0;
+        if (ms > 0 && !app.reducedMotion) {
+            if (hovered && surfaceHover == null) { surfaceHover = new AnimSlot(0, 0, 0, 0, 0, 0); }
+            if (pressed && surfacePress == null) { surfacePress = new AnimSlot(0, 0, 0, 0, 0, 0); }
+            if (focusedTarget && surfaceFocus == null) { surfaceFocus = new AnimSlot(0, 0, 0, 0, 0, 0); }
+        }
+        int hover = app.SurfaceTransitionIn(surfaceHover, hovered, ms, bx, by, bw, bh);
+        int press = app.SurfaceTransitionIn(surfacePress, pressed, ms, bx, by, bw, bh);
+        int focus = app.SurfaceTransitionIn(surfaceFocus, focusedTarget, ms, bx, by, bw, bh);
+        if (!enabled) { return this.SurfaceVariant(app, state | Style.SDisabled()); }
+        hover = Style.Curve(normal.easing, hover);
+        press = Style.Curve(normal.easing, press);
+        if (focus == 1000) {
+            int focusedState = state | Style.SFocus();
+            return this.BlendSurface(app, this.SurfaceVariant(app, focusedState), focusedState, hover, press);
+        }
+        StyleBox box = this.BlendSurface(app, normal, state, hover, press);
+        if (focus == 0) { return box; }
+        int withFocus = state | Style.SFocus();
+        StyleBox focused = this.BlendSurface(app, this.SurfaceVariant(app, withFocus), withFocus, hover, press);
+        return StyleBox.Blend(box, focused, Style.Curve(normal.easing, focus));
+    }
+
+    private StyleBox BlendSurface(App app, StyleBox box, int state, int hover, int press) {
+        if (press == 1000) { return this.SurfaceVariant(app, state | Style.SHover() | Style.SActive()); }
+        if (hover > 0) {
+            box = StyleBox.Blend(box, this.SurfaceVariant(app, state | Style.SHover()), hover);
+        }
+        if (press > 0) {
+            box = StyleBox.Blend(box, this.SurfaceVariant(app, state | Style.SHover() | Style.SActive()), press);
+        }
+        return box;
+    }
+
+    private StyleBox SurfaceVariant(App app, int state) {
+        // State changes affect paint only. Keep the measured box and selector context intact.
+        StyleBox box = Style.Full(app, this.StyleType(), this.EffectiveClass(), name, state);
+        Style.Inline(box, this);
+        return box;
     }
 
     // 设置测量偏好尺寸（px）：布局优先于 OnMeasure 的自测量与

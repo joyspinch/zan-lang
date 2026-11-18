@@ -457,7 +457,9 @@ try {
         $size = if ($ProjectOverflowOnly) { $projectSize }
             elseif ($stage -like 'narrow*') { $narrow }
             elseif ($stage -like 'small*') { $small } else { $standard }
-        if ($client.w -ne $size.w -or $client.h -ne $size.h) { throw "Unexpected native size at $stage" }
+        if ($client.w -ne $size.w -or $client.h -ne $size.h) {
+            throw "Unexpected native client size at ${stage}: $($client.w)x$($client.h), expected $($size.w)x$($size.h) (HWND=$window, DPI=$nativeDpi)"
+        }
         [pscustomobject]@{ pid = $process.Id; hwnd = $window.ToInt64(); exe = $exe;
             processStartUtc = $processStarted.ToString('o'); processStartTicks = $processStarted.Ticks;
             exeMtimeUtc = $exeInfo.LastWriteTimeUtc.ToString('o'); exeMtimeTicks = $exeInfo.LastWriteTimeUtc.Ticks;
