@@ -56,6 +56,7 @@ typedef struct {
     int         line;
     int         col;
     bool        is_static;
+    bool        is_top_level_type;
     ivis_t      visibility;
     int         param_count;        /* number of parameters (methods) */
     int         offset;
@@ -161,6 +162,7 @@ typedef struct {
 /* Initialize */
 void intel_init(intellisense_t *is);
 
+/* NULL content removes the file. An empty buffer keeps it in the index. */
 void intel_parse_file(intellisense_t *is, const char *filepath,
                       const char *content, size_t len);
 

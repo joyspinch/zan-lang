@@ -1,36 +1,38 @@
-# -*- coding: utf-8 -*-
-"""B-ID200 余量①回归：跨文件类型 E1005 误报抑制（C 宿主 zan-lsp）。
+"""Exercise cross-file diagnostics and document revisions through C zan-lsp stdio."""
 
-单文档语义视图下，binder 对工作区其他文件声明的类型打
-"[E1005] undefined type"；LSP 发布前按项目索引（工作区 + stdlib +
-包闭包）抑制"索引按名命中类型 + 命名空间被本文件 using 导入（或同
-命名空间 / 全局命名空间）"的误报。四象限：
-
-  lib.zan    声明 namespace App 的 Helper（被引用方，自身应干净）
-  main.zan   using App + Helper       → 0 条（抑制生效）
-  nomain.zan 无 using + Helper         → E1005 保留（命名空间门）
-  typo.zan   using App + Helpr         → E1005 保留（真拼写错误不吞）
-
-用法：python run_lsp_diag_suppress_test.py --exe <zan-lsp 路径>
-"""
 import argparse
 import json
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
-LIB = """namespace App;
 
-class Helper {
-    static string Tag() { return "ok"; }
-    int value;
-    int GetValue() { return value; }
+CASES = [
+    ("lib.zan", """namespace App.Shared;
+
+public class Helper {
+    public static string Tag() { return "ok"; }
+    public class Nested {}
 }
-"""
-
-MAIN = """using App;
+""", set()),
+    ("qualified.zan", """class Qualified : App.Shared.Helper {
+    App.Shared.Helper value;
+}
+""", set()),
+    ("wrong_qualifier.zan", """using App.Shared;
+class WrongQualifier {
+    App.Other.Helper value;
+}
+""", {"[E1005] undefined type 'App.Other.Helper'"}),
+    ("nested_qualifier.zan", """class NestedQualifier {
+    Helper.Nested value;
+}
+""", {"[E1005] undefined type 'Helper.Nested'"}),
+    ("main.zan", """using App.Shared;
 
 class Prog {
     static void Main() {
@@ -38,30 +40,27 @@ class Prog {
         string s = Helper.Tag();
     }
 }
-"""
-
-NOMAIN = """class Prog2 {
-    static void Main() {
-        Helper h = new Helper();
-    }
+""", set()),
+    ("no_import.zan", """// namespace App.Shared;
+class NoImport {
+    Helper value;
 }
-"""
-
-TYPO = """using App;
-
-class Prog3 {
-    static void Main() {
-        Helpr h = new Helpr();
-    }
+""", {"[E1005] undefined type 'Helper'"}),
+    ("typo.zan", """using App.Shared;
+class Typo {
+    Helpr value;
 }
-"""
-
-# 文件 → (期望保留的 "undefined type 'X'" 类型名列表；空 = 应干净)
-EXPECT = [
-    ("lib.zan", LIB, []),
-    ("main.zan", MAIN, []),
-    ("nomain.zan", NOMAIN, ["Helper"]),
-    ("typo.zan", TYPO, ["Helpr"]),
+""", {"[E1005] undefined type 'Helpr'"}),
+    ("derived.zan", """using App.Shared;
+class Derived : Helper {}
+""", set()),
+    ("same_namespace.zan", """// namespace Other;
+namespace App /* comment between name parts */ . Shared;
+class SameNamespace : Helper {}
+""", set()),
+    ("missing_base.zan", """using App.Shared;
+class MissingBase : Helpr {}
+""", {"[E1013] undefined base type 'Helpr'"}),
 ]
 
 
@@ -70,97 +69,182 @@ def frame(message):
     return b"Content-Length: %d\r\n\r\n" % len(body) + body
 
 
-def read_msg(stdout):
-    header = b""
-    while b"\r\n\r\n" not in header:
-        c = stdout.read(1)
-        if not c:
-            return None
-        header += c
-    n = int(header.decode("ascii").split("Content-Length:")[1].strip().split("\r\n")[0])
-    return json.loads(stdout.read(n))
+def read_messages(stdout, messages):
+    try:
+        while True:
+            headers = {}
+            while True:
+                line = stdout.readline()
+                if not line:
+                    raise EOFError("zan-lsp closed stdout")
+                if line == b"\r\n":
+                    break
+                key, value = line.split(b":", 1)
+                headers[key.lower()] = value.strip()
+            size = int(headers[b"content-length"])
+            body = stdout.read(size)
+            if len(body) != size:
+                raise EOFError("incomplete LSP message")
+            messages.put(json.loads(body))
+    except (EOFError, KeyError, OSError, ValueError) as exc:
+        messages.put(exc)
+
+
+def run_session(proc, workspace, messages, deadline):
+    def send(method, params=None, request_id=None):
+        message = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        if request_id is not None:
+            message["id"] = request_id
+        proc.stdin.write(frame(message))
+        proc.stdin.flush()
+
+    def receive_until(matches, waiting_for):
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                if remaining <= 0:
+                    raise queue.Empty
+                message = messages.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError(f"timed out waiting for {waiting_for}") from None
+            if isinstance(message, Exception):
+                raise RuntimeError(f"waiting for {waiting_for}: {message}") from message
+            if matches(message):
+                return message
+
+    def request(method, request_id, params=None):
+        send(method, params, request_id)
+        response = receive_until(lambda msg: msg.get("id") == request_id, method)
+        if "result" not in response:
+            raise RuntimeError(f"{method} failed: {response}")
+
+    request("initialize", 1, {"rootUri": workspace.as_uri(), "capabilities": {}})
+    send("initialized", {})
+    pending = {}
+    for name, text, wanted in CASES:
+        uri = (workspace / name).as_uri()
+        pending[uri] = name, wanted
+        send("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": "zan", "version": 1, "text": text,
+        }})
+
+    def is_pending_diagnostics(msg):
+        return (msg.get("method") == "textDocument/publishDiagnostics"
+                and msg["params"]["uri"] in pending
+                and msg["params"].get("version") == 1)
+
+    while pending:
+        waiting_for = ", ".join(name for name, _ in pending.values())
+        params = receive_until(is_pending_diagnostics, f"diagnostics for {waiting_for}")["params"]
+        name, wanted = pending.pop(params["uri"])
+        actual = {d["message"] for d in params["diagnostics"] if d["severity"] == 1}
+        if actual != wanted:
+            raise RuntimeError(f"{name}: expected {sorted(wanted)}, got {sorted(actual)}")
+
+    def next_diagnostics(uri, version, wanted):
+        def for_document(msg):
+            return (msg.get("method") == "textDocument/publishDiagnostics"
+                    and msg["params"]["uri"] == uri)
+
+        params = receive_until(for_document, f"document revision {version}")["params"]
+        actual = {d["message"] for d in params["diagnostics"] if d["severity"] == 1}
+        if params.get("version") != version or actual != wanted:
+            raise RuntimeError(f"revision {version}: expected {sorted(wanted)}, got {params}")
+
+    def open_document(uri, version, text):
+        send("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": "zan", "version": version, "text": text,
+        }})
+
+    def change_document(uri, version, text):
+        send("textDocument/didChange", {"textDocument": {"uri": uri, "version": version},
+                                        "contentChanges": [{"text": text}]})
+
+    def close_document(uri):
+        send("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    # Reopen the last document slot with a lower version and different text.
+    uri = (workspace / "missing_base.zan").as_uri()
+    change_document(uri, 2, "class Changing { StillMissing value; }")
+    change_document(uri, 3, "class Changing {}")
+    change_document(uri, 2, "class Changing { StaleValue value; }")
+    next_diagnostics(uri, 3, set())
+
+    close_document(uri)
+    next_diagnostics(uri, 3, set())
+    open_document(uri, 0, "class Reopened { NewlyMissing value; }")
+    next_diagnostics(uri, 0, {"[E1005] undefined type 'NewlyMissing'"})
+    change_document(uri, 1, "class Reopened {}")
+    next_diagnostics(uri, 1, set())
+
+    # Closing a dirty document publishes its clear before the same version is reused.
+    change_document(uri, 2, "class Reopened { ClosedDraft value; }")
+    close_document(uri)
+    open_document(uri, 2, "class Reopened { NewDraft value; }")
+    next_diagnostics(uri, 2, set())
+    next_diagnostics(uri, 2, {"[E1005] undefined type 'NewDraft'"})
+
+    # Closing the unsaved overlay restores the disk declarations for other files.
+    lib = (workspace / "lib.zan").as_uri()
+    use = "using App.Shared; class Use { Helper saved; DraftOnly draft; }"
+    change_document(lib, 2, "namespace App.Shared; public class DraftOnly {}")
+    next_diagnostics(lib, 2, set())
+    change_document(uri, 3, use)
+    next_diagnostics(uri, 3, {"[E1005] undefined type 'Helper'"})
+    close_document(lib)
+    next_diagnostics(lib, 2, set())
+    change_document(uri, 4, use)
+    next_diagnostics(uri, 4, {"[E1005] undefined type 'DraftOnly'"})
+
+    # A source without a disk copy contributes declarations only while open.
+    unsaved = (workspace / "unsaved.zan").as_uri()
+    open_document(unsaved, 0, "namespace App.Shared; public class DraftOnly {}")
+    next_diagnostics(unsaved, 0, set())
+    change_document(uri, 5, use)
+    next_diagnostics(uri, 5, set())
+    close_document(unsaved)
+    next_diagnostics(unsaved, 0, set())
+    change_document(uri, 6, use)
+    next_diagnostics(uri, 6, {"[E1005] undefined type 'DraftOnly'"})
+
+    request("shutdown", 2)
+    send("exit")
+    code = proc.wait(timeout=max(0, deadline - time.monotonic()))
+    if code:
+        raise RuntimeError(f"zan-lsp exited with status {code}")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--exe", required=True)
-    ap.add_argument("--timeout", type=int, default=120,
-                    help="总时限；首建索引在 reader 线程后台进行，不阻塞发布")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exe", required=True)
+    parser.add_argument("--timeout", type=int, default=120, help="session deadline in seconds")
+    args = parser.parse_args()
 
-    ws = Path(tempfile.mkdtemp(prefix="lsp_diag_suppress_"))
-    for name, text, _ in EXPECT:
-        (ws / name).write_text(text, encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix="lsp_diag_suppress_") as temp_dir:
+        workspace = Path(temp_dir)
+        for name, text, _ in CASES:
+            (workspace / name).write_text(text, encoding="utf-8")
 
-    proc = subprocess.Popen([args.exe], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    failures = []
-    try:
-        def send(obj):
-            proc.stdin.write(frame(obj))
-            proc.stdin.flush()
+        with subprocess.Popen([args.exe], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE) as proc:
+            messages = queue.Queue()
+            reader = threading.Thread(target=read_messages, args=(proc.stdout, messages))
+            reader.start()
+            try:
+                run_session(proc, workspace, messages, time.monotonic() + args.timeout)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                print(f"FAIL {exc}", file=sys.stderr)
+                return 1
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+                reader.join()
 
-        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-              "params": {"processId": None, "rootUri": ws.as_uri(),
-                         "capabilities": {}}})
-
-        # 先收 initialize 响应，再发 didOpen（会话握手次序）。
-        deadline = time.time() + 20
-        init_done = False
-        while time.time() < deadline and not init_done:
-            m = read_msg(proc.stdout)
-            if m is None:
-                break
-            if m.get("id") == 1:
-                init_done = True
-        if not init_done:
-            print("FAIL initialize 未在 20s 内应答", file=sys.stderr)
-            return 1
-
-        send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
-        uri_of = {}
-        for name, text, _ in EXPECT:
-            uri = (ws / name).as_uri()
-            uri_of[uri] = name
-            send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
-                  "params": {"textDocument": {"uri": uri, "languageId": "zan",
-                                              "version": 1, "text": text}}})
-
-        first_pub = {}  # name → 首次 publishDiagnostics 的 diagnostics
-        deadline = time.time() + args.timeout
-        while len(first_pub) < len(EXPECT) and time.time() < deadline:
-            m = read_msg(proc.stdout)
-            if m is None:
-                break
-            if m.get("method") != "textDocument/publishDiagnostics":
-                continue
-            name = uri_of.get(m["params"].get("uri"))
-            if name is not None and name not in first_pub:
-                first_pub[name] = m["params"]["diagnostics"]
-
-        for name, _, wanted in EXPECT:
-            if name not in first_pub:
-                failures.append("%s: 未收到 publishDiagnostics" % name)
-                continue
-            msgs = [d.get("message", "") for d in first_pub[name]]
-            if not wanted:
-                errs = [m for m in msgs if "E1005" in m]
-                if errs:
-                    failures.append("%s: 应干净仍有误报 %s" % (name, errs[:3]))
-            else:
-                for t in wanted:
-                    if not any(("undefined type '%s'" % t) in m for m in msgs):
-                        failures.append("%s: 应保留 undefined type '%s'，实际 %s"
-                                        % (name, t, msgs[:3]))
-
-        if failures:
-            for f in failures:
-                print("FAIL " + f, file=sys.stderr)
-            return 1
-        print("lsp_diag_suppress: 4/4 象限符合预期（抑制/命名空间门/真错保留）")
-        return 0
-    finally:
-        proc.kill()
+    print(f"lsp_diag_suppress: {len(CASES)}/{len(CASES)} documents matched")
+    return 0
 
 
 if __name__ == "__main__":

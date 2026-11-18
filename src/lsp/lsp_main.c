@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <winsock2.h>
 #include <windows.h>
+#include "win_utf8.h"
 typedef SOCKET lsp_sock_t;
 #define LSP_INVALID_SOCK INVALID_SOCKET
 #else
@@ -59,14 +60,16 @@ typedef struct lsp_msg {
 typedef struct {
     char *uri;
     char *text;
-    long    version;
-    bool    diag_pending;
+    int      version;
+    bool     diag_pending;
     uint64_t last_change_ms;
+    uint64_t revision;
 } lsp_doc_t;
 
 typedef struct {
     lsp_doc_t docs[LSP_MAX_DOCS];
     int       doc_count;
+    uint64_t  next_revision;
     bool      shutdown_requested;
     bool      project_indexed;
     char      workspace_root[1024];
@@ -83,7 +86,7 @@ typedef struct {
     pthread_t diag_thread;
     bool diag_thread_valid;
 #endif
-    volatile bool diag_stop;
+    bool      diag_stop;
 #ifdef _WIN32
     CRITICAL_SECTION q_lock;
     HANDLE worker_thread;
@@ -289,17 +292,25 @@ static lsp_doc_t *lsp_find_doc(lsp_server_t *s, const char *uri) {
     return NULL;
 }
 
-static void lsp_set_doc(lsp_server_t *s, const char *uri, const char *text) {
+static lsp_doc_t *lsp_set_doc(lsp_server_t *s, const char *uri, const char *text) {
     lsp_doc_t *d = lsp_find_doc(s, uri);
     if (d) {
         free(d->text);
-        d->text = dup_str(text);
-        return;
+    } else {
+        if (s->doc_count >= LSP_MAX_DOCS) return NULL;
+        d = &s->docs[s->doc_count++];
+        *d = (lsp_doc_t){0};
+        d->uri = dup_str(uri);
     }
-    if (s->doc_count >= LSP_MAX_DOCS) return;
-    d = &s->docs[s->doc_count++];
-    d->uri = dup_str(uri);
     d->text = dup_str(text);
+    return d;
+}
+
+static void lsp_schedule_diagnostics(lsp_server_t *s, lsp_doc_t *d, int version) {
+    d->version = version;
+    d->revision = ++s->next_revision;
+    d->last_change_ms = lsp_now_ms();
+    d->diag_pending = true;
 }
 
 static void lsp_remove_doc(lsp_server_t *s, const char *uri) {
@@ -712,38 +723,29 @@ static void method_call_context(const char *text, size_t offset,
 
 /* diagnostics */
 
-/* B-ID200 余量①：单文档语义视图的跨文件类型 E1005 误报抑制（声明在后，
- * 实现见 doc_intel_for 之后的 lsp_* 助手组）。 */
-static bool lsp_diag_known_external_type(const char *message,
-                                         const using_analysis_t *ua,
-                                         const char *own_ns);
-static void lsp_own_namespace(const char *text, char *out, size_t cap);
-static intellisense_t *doc_intel_for(lsp_server_t *s, const char *uri);
+static bool lsp_diag_known_external_type(lsp_server_t *s, const char *message,
+                                         const zan_ast_node_t *unit);
 
-static void publish_empty_diagnostics(lsp_server_t *s, const char *uri, int version) {
+static char *diagnostics_payload(const char *uri, int version, json_value *diagnostics) {
     json_value *params = json_new_obj();
     json_obj_set(params, "uri", json_new_str(uri));
-    /* LSP 3.17：publishDiagnostics 携带 version，客户端据此丢弃
-     * 旧版本文档的迟到诊断。 */
     json_obj_set(params, "version", json_new_num(version));
-    json_obj_set(params, "diagnostics", json_new_arr());
+    json_obj_set(params, "diagnostics", diagnostics);
     json_value *note = json_new_obj();
     json_obj_set(note, "jsonrpc", json_new_str("2.0"));
     json_obj_set(note, "method", json_new_str("textDocument/publishDiagnostics"));
     json_obj_set(note, "params", params);
     char *payload = json_serialize(note);
-    lsp_write(s, payload);
-    free(payload);
     json_free(note);
+    return payload;
 }
 
-static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *text, int version) {
+static json_value *collect_diagnostics(lsp_server_t *s, const char *uri, const char *text) {
+    json_value *arr = json_new_arr();
     size_t ul = strlen(uri);
     if ((ul > 5 && strcmp(uri + ul - 5, ".html") == 0) ||
-        (ul > 4 && strcmp(uri + ul - 4, ".htm") == 0)) {
-        publish_empty_diagnostics(s, uri, version);
-        return;
-    }
+        (ul > 4 && strcmp(uri + ul - 4, ".htm") == 0))
+        return arr;
 
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
@@ -769,21 +771,10 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
         }
     }
 
-    json_value *arr = json_new_arr();
     int count = zan_diag_entry_count(diag);
-    /* B-ID200 余量①：跨文件类型的 E1005 抑制门数据（usings + 自身命名
-     * 空间）。doc 索引不可用时门默认关闭，行为退回单文档原状。 */
-    using_analysis_t ua;
-    memset(&ua, 0, sizeof(ua));
-    char own_ns[128] = {0};
-    intellisense_t *doc_is = doc_intel_for(s, uri);
-    if (doc_is && text && text[0]) {
-        ua = intel_analyze_usings(doc_is, text, strlen(text));
-        lsp_own_namespace(text, own_ns, sizeof(own_ns));
-    }
     for (int i = 0; i < count; i++) {
         const zan_diag_entry_t *e = zan_diag_entry_at(diag, i);
-        if (lsp_diag_known_external_type(e->message, &ua, own_ns)) continue;
+        if (lsp_diag_known_external_type(s, e->message, ast)) continue;
         int line = (int)e->loc.line > 0 ? (int)e->loc.line - 1 : 0;
         /* e->loc */
         int col  = byte_col_to_utf16_char(text, line, (int)e->loc.col);
@@ -820,23 +811,9 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
         json_arr_add(arr, d);
     }
 
-    json_value *params = json_new_obj();
-    json_obj_set(params, "uri", json_new_str(uri));
-    json_obj_set(params, "version", json_new_num(version));
-    json_obj_set(params, "diagnostics", arr);
-
-    json_value *note = json_new_obj();
-    json_obj_set(note, "jsonrpc", json_new_str("2.0"));
-    json_obj_set(note, "method", json_new_str("textDocument/publishDiagnostics"));
-    json_obj_set(note, "params", params);
-
-    char *payload = json_serialize(note);
-    lsp_write(s, payload);
-    free(payload);
-    json_free(note);
-
     zan_diag_free_buffers(diag);
     zan_arena_free(arena);
+    return arr;
 }
 
 /* responses */
@@ -956,9 +933,12 @@ static void uri_percent_encode_path(const char *in, char *out, size_t cap) {
 }
 
 static void uri_to_native_path(const char *uri, char *out, size_t cap) {
-    const char *rest = NULL;
-    if (strncmp(uri, "file:///", 8) == 0) rest = uri + 8;   /* file:///C:/... */
-    else if (strncmp(uri, "file://", 7) == 0) rest = uri + 7; /* file://host/... */
+    const char *rest = strncmp(uri, "file://", 7) == 0 ? uri + 7 : NULL;
+#ifdef _WIN32
+    /* Drop the URI slash before a Windows drive letter. */
+    if (rest && rest[0] == '/' && isalpha((unsigned char)rest[1]) && rest[2] == ':')
+        rest++;
+#endif
     if (rest) {
         char decoded[1200];
         uri_percent_decode(rest, decoded, sizeof(decoded));
@@ -1437,13 +1417,28 @@ static void ensure_project_indexed(lsp_server_t *s) {
     ensure_stdlib_indexed(s);
 }
 
-static void update_project_index(lsp_server_t *s, const char *uri,
-                                 const char *text) {
-    if (!g_project_intel || !uri || !text) return;
+static void update_project_index(const char *uri, const char *text) {
+    if (!g_project_intel) return;
     char path[1024];
     uri_to_native_path(uri, path, sizeof(path));
     intel_parse_file(g_project_intel, path, text, strlen(text));
-    (void)s;
+}
+
+static char *read_file_all(const char *path);
+
+static void restore_project_index(const char *uri) {
+    if (!g_project_intel) return;
+    char path[1024];
+    uri_to_native_path(uri, path, sizeof(path));
+    char *text = strncmp(uri, "file://", 7) == 0 ? read_file_all(path) : NULL;
+    intel_parse_file(g_project_intel, path, text, text ? strlen(text) : 0);
+    free(text);
+}
+
+static int lsp_read_version(json_value *td, int fallback) {
+    double version = json_get_num(json_obj_get(td, "version"), fallback);
+    if (!(version >= INT32_MIN && version <= INT32_MAX)) return fallback;
+    return (int)version;
 }
 
 static void handle_did_open(lsp_server_t *s, json_value *params) {
@@ -1451,22 +1446,12 @@ static void handle_did_open(lsp_server_t *s, json_value *params) {
     const char *uri = json_get_str(json_obj_get(td, "uri"));
     const char *text = json_get_str(json_obj_get(td, "text"));
     if (!uri || !text) return;
-    lsp_doc_lock(s);
-    lsp_set_doc(s, uri, text);
-
-    json_value *ver_j = json_obj_get(td, "version");
-    int over = ver_j ? (int)json_get_num(ver_j, 0) : 0;
-    lsp_doc_t *d = lsp_find_doc(s, uri);
-    if (d) {
-        if (over > 0) d->version = over;
-        /* 与 didChange 同路径：交诊断线程去抖发布，不阻塞 worker。 */
-        d->last_change_ms = lsp_now_ms();
-        d->diag_pending = true;
-    }
-    lsp_doc_unlock(s);
+    lsp_doc_t *d = lsp_set_doc(s, uri, text);
+    if (!d) return;
+    lsp_schedule_diagnostics(s, d, lsp_read_version(td, 0));
 
     ensure_project_indexed(s);
-    update_project_index(s, uri, text);
+    update_project_index(uri, text);
     ensure_packages_indexed(s);
 }
 
@@ -1513,43 +1498,23 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     int n = json_arr_count(changes);
     if (n <= 0) return;
 
-    json_value *ver_j = json_obj_get(td, "version");
-    int incoming = ver_j ? (int)json_get_num(ver_j, 0) : 0;
+    lsp_doc_t *d = lsp_find_doc(s, uri);
+    int fallback = d && d->version < INT32_MAX ? d->version + 1 : 0;
+    int incoming = lsp_read_version(td, fallback);
+    if (d && incoming <= d->version) return;
 
-    lsp_doc_t *d = NULL;
-    /* 写侧与诊断线程的读侧快照互斥（doc_lock）。 */
-    lsp_doc_lock(s);
-    d = lsp_find_doc(s, uri);
-    if (!d) {
-        for (int i = 0; i < n && !d; i++) {
-            json_value *ch = json_arr_at(changes, i);
-            if (!json_obj_get(ch, "range")) {
-                const char *text = json_get_str(json_obj_get(ch, "text"));
-                if (text) {
-                    lsp_set_doc(s, uri, text);
-                    d = lsp_find_doc(s, uri);
-                }
-            }
+    for (int i = 0; i < n; i++) {
+        json_value *ch = json_arr_at(changes, i);
+        if (d) {
+            lsp_doc_apply_change(d, ch);
+        } else if (!json_obj_get(ch, "range")) {
+            const char *text = json_get_str(json_obj_get(ch, "text"));
+            if (text) d = lsp_set_doc(s, uri, text);
         }
-        if (!d) {
-            lsp_doc_unlock(s);
-            return;
-        }
-    } else {
-        if (incoming > 0 && incoming <= d->version) {
-            lsp_doc_unlock(s);
-            return;
-        }
-        for (int i = 0; i < n; i++)
-            lsp_doc_apply_change(d, json_arr_at(changes, i));
     }
-
-    d->version = incoming > 0 ? incoming : d->version + 1;
-    d->last_change_ms = lsp_now_ms();
-    d->diag_pending = true;
-    lsp_doc_unlock(s);
-
-    update_project_index(s, uri, d->text);
+    if (!d) return;
+    lsp_schedule_diagnostics(s, d, incoming);
+    update_project_index(uri, d->text);
 }
 
 static intellisense_t *g_doc_intel = NULL;
@@ -1582,80 +1547,79 @@ static void doc_intel_invalidate(const char *uri) {
     }
 }
 
-/* ---- B-ID200 余量①：跨文件类型 E1005 误报抑制 ----
- * 单文档语义视图缺工作区其他文件/包的声明，binder 对 stdlib 内建面
- * （builtin_api）之外的类型引用当场打 E1005 undefined type。项目索引
- * g_project_intel（工作区 + stdlib + 包闭包）已持有这些声明：索引按名
- * 命中类型且其声明命名空间被本文件 using 导入（或与本文件同命名空间，
- * 或属全局命名空间）时，该 E1005 是视图缺陷而非代码缺陷，抑制发布；
- * 索引未命中仍原样上报——真拼写错误不吞。 */
-
-static bool lsp_using_covers(const using_analysis_t *ua, const char *ns) {
-    for (int i = 0; i < ua->using_count; i++)
-        if (strcmp(ua->usings[i].namespace_name, ns) == 0) return true;
+static bool lsp_namespace_matches(const zan_ast_node_t *name, const char *ns) {
+    if (!name || name->kind != AST_QUALIFIED_NAME) return false;
+    const zan_ast_list_t *parts = &name->qualified_name.parts;
+    if (parts->count == 0) return false;
+    for (int i = 0; i < parts->count; i++) {
+        const zan_ast_node_t *part = parts->items[i];
+        if (!part || part->kind != AST_IDENTIFIER) return false;
+        zan_istr_t ident = part->ident.name;
+        if (!ident.len || strncmp(ns, ident.str, ident.len) != 0) return false;
+        ns += ident.len;
+        if (i + 1 == parts->count) return *ns == '\0';
+        if (*ns != '.') return false;
+        ns++;
+    }
     return false;
 }
 
-/* 取首个顶层 namespace 声明名（无则空串）。失败方向是"门关得更紧"：
- * 提取错了最多不抑制，不会放走真错误。 */
-static void lsp_own_namespace(const char *text, char *out, size_t cap) {
-    out[0] = '\0';
-    if (!text) return;
-    const char *p = text;
-    while ((p = strstr(p, "namespace")) != NULL) {
-        bool open_bounded = p == text ||
-                            (!isalnum((unsigned char)p[-1]) && p[-1] != '_');
-        if (open_bounded && !isalnum((unsigned char)p[9]) && p[9] != '_') {
-            const char *q = p + 9;
-            while (*q == ' ' || *q == '\t') q++;
-            size_t n = 0;
-            while (n + 1 < cap &&
-                   (isalnum((unsigned char)q[n]) || q[n] == '_' || q[n] == '.'))
-                n++;
-            if (n > 0) {
-                memcpy(out, q, n);
-                out[n] = '\0';
-            }
-            return;
-        }
-        p += 9;
+static bool lsp_namespace_visible(const zan_ast_node_t *unit, const char *ns) {
+    if (ns[0] == '\0') return true;
+    const zan_ast_node_t *own = unit->comp_unit.ns;
+    if (own && lsp_namespace_matches(own->namespace_decl.name, ns)) return true;
+    const zan_ast_list_t *usings = &unit->comp_unit.usings;
+    for (int i = 0; i < usings->count; i++) {
+        const zan_ast_node_t *u = usings->items[i];
+        if (!u->using_decl.is_static && lsp_namespace_matches(u->using_decl.name, ns))
+            return true;
     }
+    return false;
 }
 
-/* 消息形如 "[E1005] undefined type 'X'" / "undefined base type 'X'"；
- * 引号不闭合视为畸形消息，不抑制。 */
-static bool lsp_undef_type_name(const char *message, char *out, size_t cap) {
-    static const char k_type[] = "undefined type '";
-    static const char k_base[] = "undefined base type '";
-    const char *p = strstr(message, k_type);
-    const char *q = strstr(message, k_base);
-    const char *key = NULL;
-    if (p && (!q || p <= q)) key = k_type;
-    else if (q) key = k_base;
-    else return false;
-    p += strlen(key);
-    size_t n = 0;
-    while (p[n] && p[n] != '\'' && n + 1 < cap) n++;
-    if (n == 0 || p[n] != '\'') return false;
-    memcpy(out, p, n);
-    out[n] = '\0';
-    return true;
-}
+/* 单文档 binder 看不到其他文件。只在项目索引有可见的同名类型时，
+ * 过滤这两条未定义类型诊断。命名空间和 using 来自同一份诊断快照。 */
+static bool lsp_diag_known_external_type(lsp_server_t *s, const char *message,
+                                         const zan_ast_node_t *unit) {
+    static const char type_prefix[] = "[E1005] undefined type '";
+    static const char base_prefix[] = "[E1013] undefined base type '";
+    if (!unit) return false;
 
-static bool lsp_diag_known_external_type(const char *message,
-                                         const using_analysis_t *ua,
-                                         const char *own_ns) {
-    if (!g_project_intel || g_project_intel->symbol_count == 0) return false;
-    char name[128];
-    if (!lsp_undef_type_name(message, name, sizeof(name))) return false;
-    const isym_t *sym = intel_lookup_symbol_any(g_project_intel, name);
-    if (!sym) return false;
-    if (sym->kind != ISYM_CLASS && sym->kind != ISYM_STRUCT &&
-        sym->kind != ISYM_ENUM && sym->kind != ISYM_INTERFACE)
+    const char *name;
+    bool base = strncmp(message, base_prefix, sizeof(base_prefix) - 1) == 0;
+    if (base)
+        name = message + sizeof(base_prefix) - 1;
+    else if (strncmp(message, type_prefix, sizeof(type_prefix) - 1) == 0)
+        name = message + sizeof(type_prefix) - 1;
+    else
         return false;
-    if (!sym->parent[0]) return true; /* 全局命名空间类型，无需 using */
-    if (own_ns[0] && strcmp(sym->parent, own_ns) == 0) return true;
-    return lsp_using_covers(ua, sym->parent);
+
+    const char *end = strchr(name, '\'');
+    if (!end || end == name || end[1] != '\0') return false;
+    const char *short_name = end;
+    while (short_name > name && short_name[-1] != '.') short_name--;
+    size_t len = (size_t)(end - short_name);
+    size_t qualifier_len = short_name == name ? 0 : (size_t)(short_name - name - 1);
+
+    bool found = false;
+    lsp_doc_lock(s);
+    for (int i = 0; g_project_intel && i < g_project_intel->symbol_count; i++) {
+        const isym_t *sym = &g_project_intel->symbols[i];
+        if (!sym->is_top_level_type || (base && sym->kind == ISYM_ENUM)) continue;
+        /* 长度达到字段上限时，索引名可能已被截断。 */
+        if (len >= sizeof(sym->name) - 1 || strlen(sym->name) != len ||
+            memcmp(sym->name, short_name, len) != 0)
+            continue;
+        size_t ns_len = strlen(sym->parent);
+        if (ns_len >= sizeof(sym->parent) - 1) continue;
+        if (short_name == name ? lsp_namespace_visible(unit, sym->parent)
+                               : qualifier_len == ns_len && memcmp(sym->parent, name, ns_len) == 0) {
+            found = true;
+            break;
+        }
+    }
+    lsp_doc_unlock(s);
+    return found;
 }
 
 static void handle_did_close(lsp_server_t *s, json_value *params) {
@@ -1663,22 +1627,29 @@ static void handle_did_close(lsp_server_t *s, json_value *params) {
     const char *uri = json_get_str(json_obj_get(td, "uri"));
     if (!uri) return;
     int last_version = 0;
-    lsp_doc_lock(s);
     lsp_doc_t *d = lsp_find_doc(s, uri);
-    if (d) last_version = d->version;
-    lsp_remove_doc(s, uri);
-    lsp_doc_unlock(s);
+    if (d) {
+        last_version = d->version;
+        lsp_remove_doc(s, uri);
+        restore_project_index(uri);
+    }
     doc_intel_invalidate(uri);
-    publish_diagnostics(s, uri, "", last_version);
+    char *payload = diagnostics_payload(uri, last_version, json_new_arr());
+    lsp_write(s, payload);
+    free(payload);
 }
 
-
 static int diag_worker_loop(lsp_server_t *s) {
-    while (!s->diag_stop) {
+    for (;;) {
         lsp_sleep_ms(20);
         char *uri = NULL, *text = NULL;
         int version = 0;
+        uint64_t revision = 0;
         lsp_doc_lock(s);
+        if (s->diag_stop) {
+            lsp_doc_unlock(s);
+            break;
+        }
         uint64_t now = lsp_now_ms();
         for (int i = 0; i < s->doc_count; i++) {
             lsp_doc_t *d = &s->docs[i];
@@ -1686,13 +1657,24 @@ static int diag_worker_loop(lsp_server_t *s) {
                 uri = dup_str(d->uri);
                 text = dup_str(d->text);
                 version = d->version;
+                revision = d->revision;
                 d->diag_pending = false;
                 break;
             }
         }
         lsp_doc_unlock(s);
         if (!uri) continue;
-        publish_diagnostics(s, uri, text, version);
+
+        json_value *diagnostics = collect_diagnostics(s, uri, text);
+        char *payload = diagnostics_payload(uri, version, diagnostics);
+        /* The check and write share the lock with didChange and didClose.
+         * Clients can reuse an LSP version when reopening the same URI. */
+        lsp_doc_lock(s);
+        lsp_doc_t *current = lsp_find_doc(s, uri);
+        if (!s->diag_stop && current && current->revision == revision)
+            lsp_write(s, payload);
+        lsp_doc_unlock(s);
+        free(payload);
         free(uri);
         free(text);
     }
@@ -2318,7 +2300,11 @@ static int find_text_references(const char *text, const char *word,
 }
 
 static char *read_file_all(const char *path) {
+#ifdef _WIN32
+    FILE *f = zan_utf8_fopen(path, "rb");
+#else
     FILE *f = fopen(path, "rb");
+#endif
     if (!f) return NULL;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long n = ftell(f);
@@ -4033,10 +4019,8 @@ static void run_leak_check(lsp_server_t *s, const char *uri) {
     {
         /* 泄漏诊断同样携带 version，客户端按文档当前版归并。 */
         int lv = 0;
-        lsp_doc_lock(s);
         lsp_doc_t *ld = lsp_find_doc(s, uri);
         if (ld) lv = ld->version;
-        lsp_doc_unlock(s);
         json_obj_set(params, "version", json_new_num(lv));
     }
     json_obj_set(params, "diagnostics", arr);
@@ -4084,6 +4068,7 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
     json_value *params = json_obj_get(msg, "params");
     if (!method) return;
 
+    /* 请求处理统一持锁，保护诊断线程读取的文档和项目索引。 */
     lsp_doc_lock(s);
     if (strcmp(method, "initialize") == 0) {
         handle_initialize(s, id, params);
@@ -4376,7 +4361,9 @@ int main(int argc, char **argv) {
         pthread_join(server.worker_thread, NULL);
 #endif
 
+    lsp_doc_lock(&server);
     server.diag_stop = true;
+    lsp_doc_unlock(&server);
 #ifdef _WIN32
     if (server.diag_thread) {
         WaitForSingleObject(server.diag_thread, INFINITE);

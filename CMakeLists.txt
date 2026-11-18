@@ -7696,6 +7696,10 @@ if(Python3_Interpreter_FOUND)
       --server $<TARGET_FILE:zan-lsp>
       --client ${CMAKE_BINARY_DIR}/lsp_session_regression${_exe_ext})
   set_tests_properties(lsp_session_editor PROPERTIES TIMEOUT 300)
+  add_test(NAME lsp_diag_external_types
+    COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lsp/run_lsp_diag_suppress_test.py
+      --exe $<TARGET_FILE:zan-lsp>)
+  set_tests_properties(lsp_diag_external_types PROPERTIES TIMEOUT 150)
 endif()
 
 # ---- zanfmt (code formatter, written in Zan) ----

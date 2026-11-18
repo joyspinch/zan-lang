@@ -625,6 +625,7 @@ typedef struct {
     int line_count;
     intel_token_t *tokens;
     int token_count;
+    int type_depth;
     bool declarations_only;
 } intel_ast_ctx_t;
 
@@ -1174,12 +1175,15 @@ static void intel_ast_walk(intel_ast_ctx_t *c, const zan_ast_node_t *n,
                 intel_ast_append(declaration, sizeof(declaration), param);
             }
             if (n->type_decl.type_params.count) intel_ast_append(declaration, sizeof(declaration), ">");
-            intel_ast_symbol(c, n, n->type_decl.name, NULL, type, parent, declaration,
-                             n->kind == AST_CLASS_DECL ? ISYM_CLASS : n->kind == AST_STRUCT_DECL ? ISYM_STRUCT
-                             : n->kind == AST_ENUM_DECL ? ISYM_ENUM : ISYM_INTERFACE,
-                             n->type_decl.modifiers, 0, type_scope);
+            isym_t *sym = intel_ast_symbol(c, n, n->type_decl.name, NULL, type, parent, declaration,
+                                           n->kind == AST_CLASS_DECL ? ISYM_CLASS : n->kind == AST_STRUCT_DECL ? ISYM_STRUCT
+                                           : n->kind == AST_ENUM_DECL ? ISYM_ENUM : ISYM_INTERFACE,
+                                           n->type_decl.modifiers, 0, type_scope);
+            if (sym) sym->is_top_level_type = c->type_depth == 0;
         }
+        c->type_depth++;
         intel_ast_walk_list(c, &n->type_decl.members, name, type_scope);
+        c->type_depth--;
         break;
     }
     case AST_METHOD_DECL: case AST_CONSTRUCTOR_DECL: case AST_DESTRUCTOR_DECL: case AST_DELEGATE_DECL:
@@ -1529,11 +1533,12 @@ void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char
         fdst++;
     }
     is->indexed_file_count = fdst;
+    if (!content) return;
     if (reserve_files(is, fdst + 1)) {
         snprintf(is->indexed_files[is->indexed_file_count++], 512, "%s", filepath);
     }
 
-    if (!content || len == 0) return;
+    if (len == 0) return;
 
     /* 底层系统交互与数据协议契约：设计稿统一经 intel_parse_design_html 解析 */
     {
