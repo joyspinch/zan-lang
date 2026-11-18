@@ -25,11 +25,17 @@ class Program {
     static List<DataColumn> cols;
     static DataSource src;
     static DataTableState st;
+    static DataTableControl table;
 
     static void Body() {
-        WidgetId.ResetFrame();
         if (st != null && cols != null && src != null) {
-            DataTable.RenderSource(app, 20, 20, 560, 300, cols, src, st);
+            if (table == null || table.state != st) {
+                table = new DataTableControl(cols, src, st);
+                table.UseApp(app); app.SetRootControl(table);
+            }
+            table.MeasureTree(app);
+            table.Arrange(20, app.ContentTop() + 20, 560, 300);
+            table.RenderTree(app);
         }
         app.RunOverlays();
     }
@@ -40,18 +46,28 @@ class Program {
         app.FrameGuarded(Body);
     }
 
+    static void Dispatch(int kind, int x, int y, int button, int code, int mods) {
+        app.window.InjectEvent(kind, x, y, button, code, mods);
+        for (int attempt = 0; attempt < 40; attempt = attempt + 1) {
+            if (app.PollOneEvent() < 0) { throw new Exception("table event pump"); }
+            if (app.window.EventKind() == kind && app.window.EventX() == x
+            && app.window.EventY() == y && app.window.EventKeyCode() == code) { return; }
+        }
+        throw new Exception("table injected event dispatched");
+    }
+
     static void MoveTo(int x, int y) {
-        app.window.InjectEvent(1, x, y, 0, 0, 0);
+        Dispatch(1, x, y, 0, 0, 0);
         PumpFrame();
     }
 
     static void Press(int x, int y, int button, int mods) {
-        app.window.InjectEvent(2, x, y, button, 0, mods);
+        Dispatch(2, x, y, button, 0, mods);
         PumpFrame();
     }
 
     static void Release(int x, int y, int button, int mods) {
-        app.window.InjectEvent(3, x, y, button, 0, mods);
+        Dispatch(3, x, y, button, 0, mods);
         PumpFrame();
     }
 
@@ -64,13 +80,13 @@ class Program {
     // 滚轮一格（delta 在键码位，与 GUI 事件约定一致）。
     static void Wheel(int x, int y) {
         MoveTo(x, y);
-        app.window.InjectEvent(13, x, y, 0, -120, 0);
+        Dispatch(13, x, y, 0, -120, 0);
         PumpFrame();
     }
 
     static int RowY(int row) {
-        return 20 + app.theme.heightMedium + row * app.theme.heightMedium
-            + app.theme.heightMedium / 2;
+        return app.ContentTop() + 20 + app.theme.heightMedium + row * app.theme.heightMedium
+        + app.theme.heightMedium / 2;
     }
 
     // 选择签名：勾选行数 + 活动单元格 + 矩形选区
@@ -80,9 +96,9 @@ class Program {
             if (st.selected[i]) { n = n + 1; }
         }
         return Convert.ToString(n) + "|" + Convert.ToString(st.hitOrder)
-            + "|" + Convert.ToString(st.hitCol) + "|"
-            + Convert.ToString(st.rangeR0) + "," + Convert.ToString(st.rangeR1)
-            + "," + Convert.ToString(st.rangeC0) + "," + Convert.ToString(st.rangeC1);
+        + "|" + Convert.ToString(st.hitCol) + "|"
+        + Convert.ToString(st.rangeR0) + "," + Convert.ToString(st.rangeR1)
+        + "," + Convert.ToString(st.rangeC0) + "," + Convert.ToString(st.rangeC1);
     }
 
     static List<DataRow> Rows() {
@@ -120,11 +136,34 @@ class Program {
     }
 
     static int PopupY() {
-        int my = 20 + app.theme.heightMedium;
+        int my = app.ContentTop() + 20 + app.theme.heightMedium;
         int canH = app.canvas.Height();
         if (my + app.Scale(348) > canH) { my = canH - app.Scale(348) - app.Scale(6); }
         if (my < app.titlebarH) { my = app.titlebarH; }
         return my;
+    }
+
+    static void RetainedFields() {
+        Reset();
+        app.overlayHost.Dismiss();
+        DataTable.OpenFind(st);
+        table.Arrange(20, app.ContentTop() + 20, 560, 300);
+        Control search = app.focus.focusedControl;
+        if (!(search is Input)) { throw new Exception("find prepares a focused real input"); }
+        Dispatch(6, 0, 0, 0, 88, 0);
+        if (st.findBuf != "X") { throw new Exception("find input commits before paint"); }
+        string query = st.findBuf;
+        app.BeginOffscreenFrame(); table.RenderTree(app); table.RenderTree(app); app.EndOffscreenFrame();
+        if (st.findBuf != query) { throw new Exception("paint cannot replay text input"); }
+        DataTable.CloseFind(st); table.Arrange(20, app.ContentTop() + 20, 560, 300);
+        if (search.parent != null || search.IsFocused(app)) { throw new Exception("closed find retires its focus endpoint"); }
+        cols[1].editable = true; cols[1].editorKind = 3;
+        DataTable.BeginEdit(st, cols, src, 0, 1);
+        table.Arrange(20, app.ContentTop() + 20, 560, 300);
+        Control editor = app.focus.focusedControl;
+        if (!(editor is Input)) { throw new Exception("inline editor acquires retained focus during preparation"); }
+        DataTable.CancelEdit(st); table.Arrange(20, app.ContentTop() + 20, 560, 300);
+        if (editor.parent != null || editor.IsFocused(app)) { throw new Exception("cancelled edit retires its input"); }
     }
 
     static void Main() {
@@ -150,7 +189,7 @@ class Program {
         Click(mx + app.Scale(24), my + app.Scale(16));
         bool insideKept = Sig() == sig0 && st.openMenu == 0;
         Console.WriteLine("filterPopupClickInsideKeepsSelection="
-            + (insideKept ? 1 : 0));
+        + (insideKept ? 1 : 0));
 
         // ---- 2. 弹窗开着时点弹窗外的表格体：只关弹窗，不动选择 ----
         // 弹窗左缘之外是行号列的窄带——表格体内、弹窗外。
@@ -159,15 +198,15 @@ class Program {
         bool outsideKept = Sig() == sig0;
         bool outsideClosed = st.openMenu < 0;
         Console.WriteLine("filterPopupClickOutsideKeepsSelection="
-            + (outsideKept ? 1 : 0));
+        + (outsideKept ? 1 : 0));
         Console.WriteLine("filterPopupClickOutsideClosesPopup="
-            + (outsideClosed ? 1 : 0));
+        + (outsideClosed ? 1 : 0));
 
         // ---- 3. 筛选钮仍是弹窗的开关（开 / 再点关） ----
         int firstDataX = 20 + numW + selW;
         int iconX = firstDataX + st.dispW[0] - app.Scale(14) - app.Scale(1)
-                    + app.Scale(7);
-        int iconY = 20 + app.theme.heightMedium / 2;
+        + app.Scale(7);
+        int iconY = app.ContentTop() + 20 + app.theme.heightMedium / 2;
         Click(iconX, iconY);
         bool iconOpened = st.openMenu == 0;
         Click(iconX, iconY);
@@ -180,21 +219,21 @@ class Program {
         PumpFrame();
         int tabW = (app.Scale(256) - app.Scale(10) * 2) / 4;
         int tabY = my + app.Scale(8) + app.Scale(28) + app.Scale(6)
-                   + app.Scale(28) / 2;
+        + app.Scale(28) / 2;
         int tabX = mx + app.Scale(10) + tabW + tabW / 2;
         Click(tabX, tabY);
         Console.WriteLine("filterPopupOwnControlWorks="
-            + (st.filterTab == 1 ? 1 : 0));
+        + (st.filterTab == 1 ? 1 : 0));
 
         // ---- 5. 弹窗开着时点表头标题：只关闭弹窗（表头 chrome
         //         被模态清零，这一手势不排序） ----
         DataTable.OpenFilterMenu(st, cols, src, 0);
         PumpFrame();
         int titleX = firstDataX + app.Scale(40);
-        int titleY = 20 + app.theme.heightMedium / 2;
+        int titleY = app.ContentTop() + 20 + app.theme.heightMedium / 2;
         Click(titleX, titleY);
         Console.WriteLine("filterPopupHeaderTitleDismisses="
-            + (st.openMenu < 0 ? 1 : 0));
+        + (st.openMenu < 0 ? 1 : 0));
 
         // ---- 6. 没有弹窗时表头排序照常 ----
         st.sortCol = -1;
@@ -202,7 +241,7 @@ class Program {
         st.sortKeys.Clear();
         Click(titleX, titleY);
         Console.WriteLine("headerSortWithoutPopup="
-            + (st.sortCol == 0 ? 1 : 0));
+        + (st.sortCol == 0 ? 1 : 0));
 
         // ---- 7. 图表浮层（居中模态）同样不得穿透 ----
         Reset();
@@ -214,7 +253,7 @@ class Program {
         bool chartKept = Sig() == chartBase;
         Click(20 + numW + selW + 40, RowY(2));
         Console.WriteLine("chartOverlayKeepsSelection="
-            + (chartKept && Sig() == chartBase ? 1 : 0));
+        + (chartKept && Sig() == chartBase ? 1 : 0));
 
         // ---- 8. 导出进度弹层（居中模态）同样不得穿透 ----
         Reset();
@@ -228,7 +267,7 @@ class Program {
         bool exportKept = Sig() == exportBase;
         Click(20 + numW + selW + 40, RowY(2));
         Console.WriteLine("exportOverlayKeepsSelection="
-            + (exportKept && Sig() == exportBase ? 1 : 0));
+        + (exportKept && Sig() == exportBase ? 1 : 0));
 
         // ---- 9. 居中模态开着时表体不滚轮（滚轮归浮层） ----
         int wheelX = 20 + numW + selW + 40;
@@ -239,7 +278,7 @@ class Program {
         PumpFrame();
         Wheel(wheelX, wheelY);
         Console.WriteLine("chartOverlayBlocksWheel="
-            + (st.scrollRow == 0 ? 1 : 0));
+        + (st.scrollRow == 0 ? 1 : 0));
 
         Reset();
         st.exportUi = new DataTableExportUi();
@@ -249,6 +288,7 @@ class Program {
         PumpFrame();
         Wheel(wheelX, wheelY);
         Console.WriteLine("exportOverlayBlocksWheel="
-            + (st.scrollRow == 0 ? 1 : 0));
+        + (st.scrollRow == 0 ? 1 : 0));
+        RetainedFields();
     }
 }

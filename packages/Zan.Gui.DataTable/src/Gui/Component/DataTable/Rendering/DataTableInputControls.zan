@@ -1,0 +1,197 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// Persistent standard controls prepared with the table's visible rows.
+internal class DataTableInputControls {
+    internal List<DataTableCheckSlot> checks = new List<DataTableCheckSlot>();
+    internal List<DataTableInputRegion> regions = new List<DataTableInputRegion>();
+    internal List<DataTableTextField> fields = new List<DataTableTextField>();
+    internal Pagination pager;
+    internal Control editor;
+    internal string statusText = "";
+    internal List<DataTableInputRegion> footerChips = new List<DataTableInputRegion>();
+}
+
+internal class DataTableCheckSlot {
+    internal string key;
+    internal Checkbox control;
+    internal DataTableCheckSlot(string key, Checkbox control) {
+        this.key = key;
+        this.control = control;
+    }
+}
+
+// Geometry belongs to the table; this child only supplies the standard checkbox skin.
+internal class DataTableCheck : Checkbox {
+    public override int InputFocusCapabilities() { return 0; }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        return null;
+    }
+}
+
+public partial class DataTable {
+    internal static string CheckKey(int kind, int row, int column) {
+        return Convert.ToString(kind) + ":" + Convert.ToString(row) + ":" + Convert.ToString(column);
+    }
+
+    private static Checkbox PrepareCheck(App app, DataTableState st,
+    List<DataTableCheckSlot> prior, List<DataTableCheckSlot> next, string key,
+    int x, int y, int size, bool value, bool mixed) {
+        Checkbox checkbox = null;
+        for (int i = 0; i < prior.Count; i = i + 1) {
+            if (prior[i].key == key) { checkbox = prior[i].control; break; }
+        }
+        if (checkbox == null) { checkbox = new DataTableCheck(); }
+        checkbox.SetChecked(value);
+        checkbox.Indeterminate = mixed;
+        next.Add(new DataTableCheckSlot(key, checkbox));
+        DataTableVisualTree.LayoutControl(app, st, checkbox, 5, x, y, x, y, size, size);
+        return checkbox;
+    }
+
+    internal static void PaintPreparedCheck(App app, DataTableState st, int x, int y) {
+        if (st == null || st.inputControls == null) { return; }
+        List<DataTableCheckSlot> checks = st.inputControls.checks;
+        for (int i = 0; i < checks.Count; i = i + 1) {
+            Checkbox checkbox = checks[i].control;
+            if (checkbox.bx == x && checkbox.by == y) {
+                checkbox.RenderTree(app);
+                return;
+            }
+        }
+    }
+
+    internal static void PrepareInputControls(App app, int x, int viewW,
+    DataTableFrame f, DataTableBodyLayout lay,
+    List<DataColumn> cols, DataSource src, DataTableState st) {
+        if (st.inputControls == null) { st.inputControls = new DataTableInputControls(); }
+        DataTableInputControls controls = st.inputControls;
+        List<DataTableCheckSlot> prior = controls.checks;
+        List<DataTableCheckSlot> next = new List<DataTableCheckSlot>();
+        controls.checks = next;
+        int box = app.Scale(16);
+        if (st.showSelect) {
+            bool all = st.order.Count > 0;
+            for (int i = 0; i < st.order.Count; i = i + 1) {
+                if (!DataTable.IsSelected(st, src, st.order[i])) { all = false; break; }
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            }
+            DataTable.PrepareCheck(app, st, prior, next, "all", x + f.numW + (f.selW - box) / 2,
+            f.y + (f.headerH - box) / 2, box, all, false);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+        }
+        for (int r = 0; r < lay.visRows && lay.start + r < lay.total; r = r + 1) {
+            int order = lay.start + r;
+            int row = DataTable.DispRowOf(st, order);
+            int y = lay.bodyTop + r * f.rowH;
+            int kind = DataTable.DispKind(st, order);
+            if (kind == 2) { continue; }
+            if (kind == 1) {
+                GroupRow group = st.groups[row];
+                int state = DataTable.GroupCheckState(st, group, src);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                int size = app.Scale(14);
+                int left = x + f.numW + f.selW + group.level * app.Scale(16)
+                + app.Scale(6) + app.Scale(14) + app.Scale(4);
+                DataTable.PrepareCheck(app, st, prior, next, DataTable.CheckKey(1, row, -1),
+                left, y + (f.rowH - size) / 2, size, state == 1, state == 2);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                continue;
+            }
+            if (!src.CellReady(row, 0)) { continue; }
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            if (st.showSelect) {
+                bool selected = DataTable.IsSelected(st, src, row);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                DataTable.PrepareCheck(app, st, prior, next, DataTable.CheckKey(0, row, -1),
+                x + f.numW + (f.selW - box) / 2, y + (f.rowH - box) / 2,
+                box, selected, false);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            }
+            for (int i = 0; i < f.columns.Count; i = i + 1) {
+                FrameColumn column = f.columns[i];
+                int cc = column.column;
+                if (!cols[cc].isBool || cols[cc].boolStyle != 0) { continue; }
+                int width = st.dispW[cc];
+                int left = DataTable.BandLeft(column.band, f.firstDataX, f.bandX, f.rightX);
+                int right = DataTable.BandRight(column.band, f.firstDataX, f.bandX, f.bandW,
+                f.rightX, f.pinnedW, f.pinnedRW, f.clipRight);
+                if (column.x + width <= left || column.x >= right) { continue; }
+                string value = DataTable.CellTextRouted(cols, src, row, cc);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                DataTableVisualTree.SetVisibleClip(st, left, lay.bodyTop, right - left, lay.bodyH);
+                DataTable.PrepareCheck(app, st, prior, next, DataTable.CheckKey(0, row, cc),
+                column.x + (width - box) / 2, y + (f.rowH - box) / 2,
+                box, DataTable.ParseBool(value), false);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            }
+        }
+        if (st.paged) {
+            int totalPages = VirtualScrollHost.CalcTotalPages(lay.total, lay.visRows);
+            if (controls.pager == null) { controls.pager = new Pagination(totalPages, st.pageModel); }
+            controls.pager.Page = st.pageModel;
+            controls.pager.SetTotal(totalPages);
+            controls.pager.MeasureTree(app);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            int width = controls.pager.prefW > 0 ? controls.pager.prefW : app.Scale(160);
+            int px = x + (viewW - width) / 2;
+            if (px < x + app.theme.paddingMedium) { px = x + app.theme.paddingMedium; }
+            int py = lay.bodyTop + lay.bodyH + lay.bottomPinnedH + lay.summaryH
+            + (lay.pagerH - app.theme.heightMedium) / 2;
+            DataTableVisualTree.SetVisibleClip(st, x, py, viewW, app.theme.heightMedium);
+            DataTableVisualTree.LayoutControl(app, st, controls.pager, 6, -1, -1,
+            px, py, width, app.theme.heightMedium);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+        }
+        controls.editor = null;
+        if (st.editing && st.activeEditorWidget != null) {
+            Rect rect = DataTable.EditorRect(f, lay, cols, st);
+            if (rect != null) {
+                controls.editor = st.activeEditorWidget;
+                DataTableVisualTree.SetVisibleClip(st, f.firstDataX, lay.bodyTop, f.dataViewW, lay.bodyH);
+                DataTableVisualTree.LayoutControl(app, st, controls.editor, 7, st.editRow, st.editCol,
+                rect.x, rect.y, rect.width, rect.height);
+            }
+        }
+        DataTable.PrepareFillHandle(f, lay, st);
+    }
+
+    internal static Rect EditorRect(DataTableFrame f, DataTableBodyLayout lay,
+    List<DataColumn> cols, DataTableState st) {
+        if (!st.editing || st.editCol < 0 || st.editCol >= cols.Count) { return null; }
+        int order = -1;
+        for (int r = 0; r < lay.visRows && lay.start + r < lay.total; r = r + 1) {
+            int slot = lay.start + r;
+            if (DataTable.DispKind(st, slot) == 0 && DataTable.DispRowOf(st, slot) == st.editRow) {
+                order = slot; break;
+            }
+        }
+        if (order < 0) { return null; }
+        for (int i = 0; i < f.columns.Count; i = i + 1) {
+            FrameColumn column = f.columns[i];
+            if (column.column == st.editCol) {
+                return new Rect(column.x, lay.bodyTop + (order - lay.start) * f.rowH,
+                st.dispW[st.editCol], f.rowH);
+            }
+        }
+        return null;
+    }
+
+    internal static void PrepareFillHandle(DataTableFrame f, DataTableBodyLayout lay, DataTableState st) {
+        st.fillHX = -1; st.fillHY = -1;
+        if (!DataTable.HasRange(st) || st.editing) { return; }
+        int row = DataTable.MaxI(st.rangeR0, st.rangeR1);
+        int col = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        if (row < lay.start || row >= lay.start + lay.visRows || row >= lay.total) { return; }
+        for (int i = 0; i < f.columns.Count; i = i + 1) {
+            if (f.columns[i].column == col) {
+                st.fillHX = f.columns[i].x + st.dispW[col];
+                st.fillHY = lay.bodyTop + (row - lay.start + 1) * f.rowH;
+                return;
+            }
+        }
+    }
+}

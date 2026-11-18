@@ -7,7 +7,11 @@
 全面消灭早期 3900+ 行与 1100+ 行巨石单体文件，采用职责高度内聚的正交渲染流水线：
 
 ```
-                [DataTable.Render 调度中枢 (~260 行)]
+               [DataTableControl / DataGrid<T>]
+                                  │
+                 [Arrange → DataTableVisualTree.Prepare]
+                                  │
+                [RenderTree → 已准备的绘制快照]
                                   │
        ┌──────────────┬───────────┴───────────┬──────────────┐
        ▼              ▼                       ▼              ▼
@@ -16,31 +20,31 @@
        │              │                       │              │
        └──────────────┴───────────┬───────────┴──────────────┘
                                   ▼
-                        [RenderInteraction]
-                    (命中几何/Tooltip/键盘导航/选区)
-                                  │
-                                  ▼
                              [RenderCell]
                     (图元绘制/文本折行/迷你图)
+
+输入树：DataTableInputRegion / DataTableTextField / 标准子控件
+       → RoutedEventArgs → 模型更新 → 下一轮 Prepare
+菜单与 Tooltip：既有 AppPreparationParticipant 准备阶段同步
 ```
 
 ### 1. 单职责分层渲染管线
-- **`DataTable.Render.zan`**：精简为主干生命周期调度中枢，统一度量计算与流程编排。
+- **`Rendering/Render.zan` / `DataTableVisualTree.zan`**：准备阶段统一计算布局、查询和可见子树；绘制阶段消费已准备的快照。
 - **`DataTable.RenderCell.zan`**：单元格图元绘制、富文本断行、条件格式（数据条/色阶/图标）与 Sparkline 迷你图。
 - **`DataTable.RenderHeader.zan`**：多级 Band 跨度表头、分组面板芯片拖拽、排序箭头与列宽调整手柄。
 - **`DataTable.RenderFrozen.zan`**：冻结列坐标几何推算、双向区域裁剪（`PushBandClip`）与置顶固定行。
 - **`DataTable.RenderBody.zan`**：虚拟滚动行循环、主从明细挂载（`DetailProvider`）、组件列控件池与选区高亮。
 - **`DataTable.RenderFooter.zan`**：底部置底固定行、总计汇总行（Summary）、分页器（Pagination）与底部聚合状态栏。
-- **`DataTable.RenderInteraction.zan`**：指针几何映射、截断 Tooltip 悬停探测、查找条与快速筛选行键盘拦截、多选区拖拽与右键上下文菜单。
+- **`Rendering/RenderInteraction.zan` / `DataTableVisualTree.Input.zan`**：由真实控件路由驱动选区、拖拽、滚轮和键盘导航；不在 Paint 中推进输入。
 
 ### 2. 解耦就地编辑与筛选菜单
 - **`DataTable.FilterMenu.zan`**：列头漏斗筛选菜单专用模块，包含唯一值列表去重、组合规则条件与日历选择。
-- **`DataTable.InPlaceEditor.zan`**：单元格就地编辑浮层、外部编辑器控件宿主、原生选择下拉列表与单元格日历。
-- **`DataTable.MicroWidgets.zan`**：轻量级微控件原语（`TabBtn`, `IconBtn`, `TextBtn`, `EditBox`, `Chip`, `DrawMiniCheck`），消除重复画框逻辑。
+- **`Rendering/DataTableTextField.zan`**：持久 Input 负责查找、筛选行和就地编辑；焦点、提交和取消在准备阶段或输入路由中完成。
+- **`Features/DataTableFeaturePopup.zan`**：选择列表、日历、筛选与导出浮层均挂入现有 OverlayHost，并使用标准子控件。
 - **`DataTable.NavKey.zan`**：全量键盘导航与剪贴板快捷键（上下左右、PageUp/Down、Home/End、Tab/Enter、Ctrl+C/V/X/A）。
 
 ### 3. 结构化运行时状态实体（State Encapsulation）
-`DataTableState` 收敛为结构化组合设计，保持 100% 现有属性向后兼容：
+`DataTableState` 按功能组合状态，控件输入直接更新对应模型：
 - **`DataTablePivotState`**：透视表交叉聚合矩阵、行列维度映射与物化源状态。
 - **`DataTableUndoState`**：行级别撤销/重做日志堆栈、事务分组与回滚。
 - **`DataTableFillState`**：Excel 式选区填充柄拖拽状态与源/目标矩形跟踪。

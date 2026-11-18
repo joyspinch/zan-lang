@@ -1,0 +1,75 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component.DataTable;
+
+class PivotLifetimeSource : DataSource {
+    public int Polls;
+    public bool Pending;
+    public override int RowCount() { return 2; }
+    public override string CellText(int row, int col) {
+        if (col == 0) { return "Apples"; }
+        if (col == 1) { return "North"; }
+        return row == 0 ? "2" : "5";
+    }
+    public override int CellNum(int row, int col) {
+        return col == 2 ? (row == 0 ? 2 : 5) : 0;
+    }
+    public override double CellReal(int row, int col) {
+        return (double)this.CellNum(row, col);
+    }
+    public override bool Poll() {
+        Polls = Polls + 1;
+        bool changed = Pending; Pending = false;
+        return changed;
+    }
+}
+
+class PivotLifetimeWitness {
+    public weak DataTableState State;
+}
+
+class Program {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+    static DataSource CreateView(PivotLifetimeSource source, PivotLifetimeWitness witness) {
+        DataTableState state = new DataTableState(); witness.State = state;
+        List<DataColumn> columns = new List<DataColumn>();
+        columns.Add(DataColumn.Text("item", 100));
+        columns.Add(DataColumn.Text("region", 100));
+        columns.Add(DataColumn.Numeric("amount", 80));
+        DataTable.EnsureInit(state, columns, source);
+        Check(DataTable.SetPivot(state, columns, source, 0, 1, 2, 0), "valid pivot enters view");
+        DataTable.PivotEnsure(state, columns, source);
+        DataSource view = DataTable.PivotViewSource(state, source);
+        Check(view.RowCount() == 1 && view.CellText(0, 0) == "Apples"
+            && view.CellText(0, 1) == "7" && view.CellNum(0, 1) == 7
+            && view.CellReal(0, 1) == 7.0 && view.CellNum(0, 2) == 7,
+            "live wrapper reads materialized values and row total");
+        Console.WriteLine("live pivot readers OK");
+        int before = source.Polls;
+        Check(!state.pvDirty && !view.Poll() && source.Polls == before + 1 && !state.pvDirty,
+            "unchanged source polls once without dirtying pivot");
+        source.Pending = true;
+        Check(view.Poll() && source.Polls == before + 2 && state.pvDirty && !source.Pending,
+            "changed source polls once and dirties live pivot");
+        Console.WriteLine("live pivot polling OK");
+        return view;
+    }
+    static void Main() {
+        PivotLifetimeSource source = new PivotLifetimeSource();
+        PivotLifetimeWitness witness = new PivotLifetimeWitness();
+        DataSource view = CreateView(source, witness);
+        Check(witness.State == null, "retained wrapper does not retain table state");
+        Console.WriteLine("pivot owner released OK");
+        Check(view.RowCount() == 0 && view.CellText(0, 0) == ""
+            && view.CellText(0, 1) == "" && view.CellNum(0, 1) == 0
+            && view.CellReal(0, 1) == 0.0, "expired wrapper readers return empty values");
+        Console.WriteLine("expired pivot readers OK");
+        int before = source.Polls; source.Pending = true;
+        Check(!view.Poll() && source.Polls == before && source.Pending,
+            "expired wrapper does not poll independently retained source");
+        Console.WriteLine("expired pivot polling OK");
+    }
+}

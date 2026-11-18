@@ -1,0 +1,184 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+internal class DataTableTextField : Input {
+    internal string key;
+    internal int field;
+    internal int column;
+    internal weak DataTableVisualTree tree;
+    internal weak DataTableState state;
+    private bool syncing;
+
+    internal DataTableTextField() {
+        this.InitInput("", "");
+        DataTableTextRelay relay = new DataTableTextRelay(this);
+        this.Change.AddS(relay.Changed);
+    }
+
+    internal void Sync(string value) {
+        syncing = true;
+        try { if (this.GetText() != value) { this.SetText(value); } }
+        finally { syncing = false; }
+    }
+
+    internal void CommitText() {
+        if (!syncing && tree != null) { tree.TextChanged(this); }
+    }
+
+    public override void TriggerEvent(string name) {
+        DataTableState st = state;
+        if (st != null) {
+            if (field == 1 && name == "Focus") { st.filterRowFocusCol = column; }
+            else if (field == 1 && name == "Blur" && st.filterRowFocusCol == column) { st.filterRowFocusCol = -1; }
+            else if (field == 2 && (name == "Focus" || name == "Blur")) { st.findFocused = name == "Focus"; }
+        }
+        base.TriggerEvent(name);
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        if (tree != null && tree.TextKey(this, e)) { return; }
+        base.OnKeyDown(e);
+    }
+}
+
+internal class DataTableTextRelay {
+    private weak DataTableTextField field;
+    internal DataTableTextRelay(DataTableTextField field) { this.field = field; }
+    internal void Changed(Control sender) { if (field != null) { field.CommitText(); } }
+}
+
+internal partial class DataTableVisualTree {
+    private void TextField(App app, DataTableState st, string key, int field, int column,
+    string value, int x, int y, int w, int h) {
+        DataTableTextField input = null;
+        List<DataTableTextField> fields = st.inputControls.fields;
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            if (fields[i].key == key) { input = fields[i]; break; }
+        }
+        if (input == null) { input = new DataTableTextField(); input.key = key; fields.Add(input); }
+        input.tree = this; input.state = st; input.field = field; input.column = column; input.Sync(value);
+        DataTableVisualTree.LayoutControl(app, st, input, 11, field, column, x, y, w, h);
+    }
+
+    internal void PrepareTextFields(App app, DataTableState st, List<DataColumn> cols,
+    DataSource src, DataTableFrame f, DataTableBodyLayout lay) {
+        Control host = this.owner;
+        if (st.showFilterRow) {
+            for (int i = 0; i < f.columns.Count; i = i + 1) {
+                FrameColumn column = f.columns[i]; int cc = column.column;
+                int left = DataTable.BandLeft(column.band, f.firstDataX, f.bandX, f.rightX);
+                int right = DataTable.BandRight(column.band, f.firstDataX, f.bandX, f.bandW,
+                f.rightX, f.pinnedW, f.pinnedRW, f.clipRight);
+                if (column.x + st.dispW[cc] <= left || column.x >= right) { continue; }
+                DataTableVisualTree.SetVisibleClip(st, left, f.y + f.headerH, right - left, lay.filterRowH);
+                this.TextField(app, st, "filter:" + Convert.ToString(cc), 1, cc,
+                st.filterRowText[cc], column.x + 2, f.y + f.headerH + 3,
+                st.dispW[cc] - 4, lay.filterRowH - 6);
+            }
+        }
+        DataTableVisualTree.SetVisibleClip(st, host.bx, host.by, host.bw, host.bh);
+        if (st.findOpen) {
+            DataTable.FindEnsureCount(st, cols, src);
+            int boxW = app.Scale(200); int buttonW = app.Scale(26); int countW = 0;
+            if (st.findQuery.Length > 0 && st.findCount > 0) {
+                string count = Convert.ToString(st.findIndex >= 0 ? st.findIndex + 1 : 0)
+                + "/" + Convert.ToString(st.findCount);
+                countW = Canvas.MeasureText(count, Style.FontFallback(app, "small")) + app.Scale(10);
+            }
+            int width = app.Scale(28) + boxW + countW + buttonW * 3 + app.Scale(12);
+            int x = host.bx + host.bw - width - app.Scale(10);
+            int y = f.y + app.Scale(6); int height = app.theme.heightMedium;
+            this.TextField(app, st, "find", 2, -1, st.findBuf, x + app.Scale(26),
+            y + app.Scale(4), boxW, height - app.Scale(8));
+            int bx = x + app.Scale(26) + boxW + app.Scale(6) + countW;
+            for (int i = 0; i < 3; i = i + 1) {
+                this.Region(app, st, "find:" + Convert.ToString(i), 20 + i, -1, -1,
+                bx + i * buttonW, y + app.Scale(2), buttonW, height - app.Scale(4));
+            }
+        }
+        if (st.editing && st.activeEditorWidget == null) {
+            Rect rect = DataTable.EditorRect(f, lay, cols, st);
+            if (rect != null) {
+                DataColumn col = cols[st.editCol];
+                int buttons = col.editorKind == 3 ? app.Scale(34)
+                : col.editorKind == 1 || col.editorKind == 2 ? app.Scale(20) : 0;
+                this.TextField(app, st, "editor", 3, st.editCol, st.editBuf,
+                rect.x, rect.y, Math.Max(app.Scale(24), rect.width - buttons), rect.height);
+                if (col.editorKind == 3) {
+                    int width = app.Scale(16); int height = (rect.height - app.Scale(6)) / 2;
+                    this.Region(app, st, "stepup", 26, -1, st.editCol, rect.x + rect.width - width - app.Scale(3),
+                    rect.y + app.Scale(3), width, height);
+                    this.Region(app, st, "stepdown", 27, -1, st.editCol, rect.x + rect.width - width - app.Scale(3),
+                    rect.y + app.Scale(3) + height, width, height);
+                } else if (col.editorKind == 1 || col.editorKind == 2) {
+                    this.Region(app, st, "editpopup", 28, -1, st.editCol, rect.x + rect.width - buttons,
+                    rect.y, buttons, rect.height);
+                }
+                st.inputControls.editor = DataTableVisualTree.PreparedControl(st, 11, 3, st.editCol);
+            }
+        }
+    }
+
+    private void PrepareTextFocus(App app, DataTableState st) {
+        Control target = null;
+        if (st.editing && st.editorFocusPending && st.activeEditorWidget != null) {
+            target = st.activeEditorWidget;
+        } else {
+            for (int i = 0; i < this.slots.Count; i = i + 1) {
+                DataTableVisualSlot slot = this.slots[i];
+                if (slot.kind != 11) { continue; }
+                if ((slot.row == 3 && st.editing && st.editorFocusPending)
+                || (slot.row == 2 && st.findOpen && st.findFocused)
+                || (slot.row == 1 && slot.column == st.filterRowFocusCol)) {
+                    target = slot.control; break;
+                }
+            }
+        }
+        if (target == null) { return; }
+        st.editorFocusPending = false;
+        if (!target.IsFocused(app)) { target.Focus(app); }
+    }
+
+    internal void TextChanged(DataTableTextField field) {
+        DataTableInputContext context = this.InputContext();
+        if (context == null) { return; }
+        DataTableState st = context.state; string text = field.GetText();
+        if (field.field == 1) {
+            st.filterRowText[field.column] = text;
+            DataTable.InvalidateQuery(st); st.FilterChanged.Raise();
+        } else if (field.field == 2) {
+            st.findBuf = text; st.findCur = text.Length;
+            DataTable.CommitFind(st, context.columns, context.source);
+        } else {
+            st.editBuf = text; st.editCur = text.Length; st.editError = "";
+            if (context.columns[field.column].editorKind == 1) { DataTable.RefreshChoices(st, context.columns[field.column]); }
+        }
+        if (this.owner != null && this.owner.App != null) { this.owner.App.RequestRedraw(); }
+    }
+
+    internal bool TextKey(DataTableTextField field, RoutedEventArgs e) {
+        DataTableInputContext context = this.InputContext();
+        if (context == null || (e.keyCode != 13 && e.keyCode != 27 && e.keyCode != 9)) { return false; }
+        DataTableState st = context.state;
+        if (field.field == 3) {
+            if (e.keyCode == 27) { DataTable.CancelEdit(st); }
+            else { DataTable.CommitEdit(st, context.columns, context.source); }
+        } else if (field.field == 2) {
+            if (e.keyCode == 27) { DataTable.CloseFind(st); }
+            else if (e.keyCode == 13) {
+                DataTable.CommitFind(st, context.columns, context.source);
+                DataTable.FindStep(st, context.columns, context.source,
+                Modifiers.HasShift(e.modifiers) ? -1 : 1, context.body.visRows);
+            } else { return false; }
+        } else if (e.keyCode == 27) {
+            field.Sync(""); st.filterRowText[field.column] = "";
+            DataTable.InvalidateQuery(st); st.FilterChanged.Raise();
+        } else { return false; }
+        e.Handle(); this.Invalidate();
+        if (owner != null && owner.App != null) { owner.App.RequestRedraw(); }
+        return true;
+    }
+}

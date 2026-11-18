@@ -67,12 +67,12 @@ public partial class DataTable {
     // 单元格（数据行 row、列 col）是否命中当前查询。供每帧
     // 的高亮绘制与导航扫描调用——一次子串比较，循环内安全。
     public static bool CellMatches(DataTableState st, List<DataColumn> cols, DataSource src,
-                            int row, int col) {
+    int row, int col) {
         if (!st.findOpen || st.findQuery.Length == 0) { return false; }
         if (col < 0 || col >= cols.Count) { return false; }
         if (!DataTable.FindableCol(cols[col])) { return false; }
         return DataTable.ContainsCI(DataTable.CellTextRouted(cols, src, row, col),
-                                    st.findQuery);
+        st.findQuery);
     }
 
     // 提交查询：把缓冲同步为生效查询，并按显示顺序统计命中
@@ -93,7 +93,7 @@ public partial class DataTable {
     }
 
     // 命中计数就地刷新：缓冲与生效查询不一致（正在输入）
-    // 才重新统计，否则 O(1) 空转。由查找条绘制每帧调用。
+    // 才重新统计，否则 O(1) 空转。由查找输入提交或准备阶段调用。
     public static void FindEnsureCount(DataTableState st, List<DataColumn> cols, DataSource src) {
         if (st.findQuery == st.findBuf) { return; }
         DataTable.CommitFind(st, cols, src);
@@ -104,7 +104,7 @@ public partial class DataTable {
     // 滚入视野。把 (显示槽位 × 可见列) 摊平成一条序列环扫：
     // 组表头/详情带槽位天然不命中，跳过即可。
     public static void FindStep(DataTableState st, List<DataColumn> cols, DataSource src,
-                         int dir, int visRows) {
+    int dir, int visRows) {
         if (st.findQuery.Length == 0) { DataTable.CommitFind(st, cols, src); }
         if (st.findQuery.Length == 0 || st.findCount == 0) { return; }
         int n = DataTable.DispCount(st);
@@ -145,91 +145,37 @@ public partial class DataTable {
         }
     }
 
-    // 查找条浮层：网格右上角的输入框 + 命中计数 + 上/下/关闭。
-    // 绘制在上下文菜单等模态浮层之前，因此菜单永远盖住它；
-    // 键盘输入在 RenderSource 的查找键盘块处理（与筛选行
-    // 同一模式），这里只处理条内的指针交互。
-    public static void RenderFindBar(App app, int x, int y, int viewW,
-                              List<DataColumn> cols, DataSource src, DataTableState st,
-                              int visRows) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
+    // Find input and buttons are persistent children prepared by DataTableVisualTree.
+    internal static void PaintFindBar(App app, int x, int y, int viewW,
+    List<DataColumn> cols, DataSource src, DataTableState st, int visRows) {
+        Canvas c = app.canvas; Theme t = app.theme;
         int fs = Style.FontFallback(app, "small");
-        // 模态浮层（右键菜单/列选择器/条件格式清除/编辑器弹窗）打开
-        // 时查找条不得响应：条内命中是几何判定，直接读原始事件，
-        // 菜单钳位后正好盖住查找条所在角落，点菜单项会点穿到
-        // 上/下/关闭钮上。ModalEvt 与 RenderSource 入口同一份清单。
-        int evt = DataTable.ModalEvt(app, st);
-        DataTable.FindEnsureCount(st, cols, src);
-
-        int barH = t.heightMedium;
-        int barY = y + app.Scale(6);
-        int boxW = app.Scale(200);
-        int btnW = app.Scale(26);
-        int countW = 0;
+        int barH = t.heightMedium; int barY = y + app.Scale(6);
+        int boxW = app.Scale(200); int btnW = app.Scale(26); int countW = 0;
+        string count = "";
         if (st.findQuery.Length > 0 && st.findCount > 0) {
-            string cnt = Convert.ToString(st.findIndex >= 0 ? st.findIndex + 1 : 0)
-                         + "/" + Convert.ToString(st.findCount);
-            countW = Canvas.MeasureText(cnt, fs) + app.Scale(10);
+            count = Convert.ToString(st.findIndex >= 0 ? st.findIndex + 1 : 0)
+            + "/" + Convert.ToString(st.findCount);
+            countW = Canvas.MeasureText(count, fs) + app.Scale(10);
         }
         int barW = app.Scale(28) + boxW + countW + btnW * 3 + app.Scale(12);
         int barX = x + viewW - barW - app.Scale(10);
-
-        StyleBox sBar = Style.Part(app, "datatable", "panel", "", "", "",
-                                   Style.SNormal());
-        c.FillRoundRect(barX, barY, barW, barH, t.borderRadiusSmall, sBar.BgOr(0));
-        c.DrawRoundRect(barX, barY, barW, barH, t.borderRadiusSmall,
-                        sBar.BorderOr(0), 1);
-
-        // 输入框 + 引导图标
-        int ibx = barX + app.Scale(26);
-        int iby = barY + app.Scale(4);
-        int ibh = barH - app.Scale(8);
-        DataTable.EditBox(app, ibx, iby, boxW, ibh, st.findBuf,
-                          DataTable.T("Find...", "查找..."), st.findFocused);
-        c.DrawGlyphIn("search", barX + app.Scale(5), barY, app.Scale(20), barH,
-                      app.Scale(13), Style.Part(app, "datatable", "icon", "", "", "",
-                                                 Style.SNormal()).FgOr(0));
-        int inputId = app.focus.AllocId();
-        app.hitTester.RegisterRect(inputId, ibx, iby, boxW, ibh, 0);
-        if (evt == 3 && app.window.EventButton() == 0
-            && app.hitTester.HitTest(app.mouseX, app.mouseY) == inputId
-            && !st.findFocused) {
-            st.findFocused = true;
-            st.findCur = st.findBuf.Length;
-            app.RequestRedraw();
-        }
-
-        // 命中计数（有生效查询且有命中时）
-        int cx2 = ibx + boxW + app.Scale(6);
+        StyleBox panel = Style.Part(app, "datatable", "panel", "", "", "", Style.SNormal());
+        c.FillRoundRect(barX, barY, barW, barH, t.borderRadiusSmall, panel.BgOr(0));
+        c.DrawRoundRect(barX, barY, barW, barH, t.borderRadiusSmall, panel.BorderOr(0), 1);
+        int color = Style.Part(app, "datatable", "icon", "", "", "", Style.SNormal()).FgOr(0);
+        c.DrawGlyphIn("search", barX + app.Scale(5), barY, app.Scale(20), barH, app.Scale(13), color);
+        int bx = barX + app.Scale(26) + boxW + app.Scale(6);
         if (countW > 0) {
-            string cnt = Convert.ToString(st.findIndex >= 0 ? st.findIndex + 1 : 0)
-                         + "/" + Convert.ToString(st.findCount);
-            c.DrawText(cx2, Canvas.CenterTextY(barY, barH, fs), cnt,
-                       Style.Part(app, "datatable", "hint", "", "", "",
-                                  Style.SNormal()).FgOr(0), fs);
+            c.DrawText(bx, Canvas.CenterTextY(barY, barH, fs), count,
+            Style.Part(app, "datatable", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
         }
-        cx2 = cx2 + countW;
-
-        // 上 / 下 / 关闭
-        for (int b = 0; b < 3; b = b + 1) {
-            string icon = b == 0 ? "chevron-up" : (b == 1 ? "chevron-down" : "close");
-            int bid = app.focus.AllocId();
-            app.hitTester.RegisterRect(bid, cx2, barY + app.Scale(2), btnW,
-                                       barH - app.Scale(4), 0);
-            bool hot = app.focus.IsHovered(bid);
-            int gcol = Style.Part(app, "datatable", "icon", "", "", "",
-                                  hot ? Style.SHover() : Style.SNormal()).FgOr(0);
-            c.DrawGlyphIn(icon, cx2, barY + app.Scale(2), btnW, barH - app.Scale(4),
-                          app.Scale(13), gcol);
-            if (evt == 3 && app.window.EventButton() == 0
-                && app.hitTester.HitTest(app.mouseX, app.mouseY) == bid) {
-                if (b == 0) { DataTable.FindStep(st, cols, src, 0 - 1, visRows); }
-                else if (b == 1) { DataTable.FindStep(st, cols, src, 1, visRows); }
-                else { DataTable.CloseFind(st); }
-                app.RequestRedraw();
-            }
-            cx2 = cx2 + btnW;
+        Control input = DataTableVisualTree.PreparedControl(st, 11, 2, -1);
+        if (input != null) { input.RenderTree(app); }
+        bx = bx + countW;
+        for (int i = 0; i < 3; i = i + 1) {
+            string icon = i == 0 ? "chevron-up" : i == 1 ? "chevron-down" : "close";
+            c.DrawGlyphIn(icon, bx + i * btnW, barY + app.Scale(2), btnW, barH - app.Scale(4), app.Scale(13), color);
         }
     }
 }

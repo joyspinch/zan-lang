@@ -1,0 +1,70 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+internal partial class DataTableVisualTree {
+    internal void RouteBody(RoutedEventArgs e) {
+        Control host = this.owner;
+        if (host == null || e.originalSource != host) { return; }
+        if (e.eventName == "PointerCancel") {
+            DataTableState retired = this.preparedState;
+            if (retired != null) {
+                retired.fillDrag = false; retired.rangeDrag = false; retired.rowSelDrag = false;
+                retired.dragRow = -1; retired.dragMoved = false; retired.rowGripDrag = false;
+                retired.rangeSelTouched.Clear();
+            }
+            if (host.App != null) { host.App.RequestRedraw(); }
+            return;
+        }
+        DataTableInputContext context = this.InputContext();
+        if (context == null || host.App == null) { return; }
+        App app = host.App; DataTableState st = context.state;
+        string name = e.eventName;
+        if (name == "Wheel") {
+            int step = e.delta / 120;
+            if (step == 0) { step = e.delta > 0 ? 1 : (e.delta < 0 ? -1 : 0); }
+            if (Modifiers.HasShift(e.modifiers) || (e.modifiers & 4) != 0) {
+                int value = st.scrollX - step * app.Scale(48);
+                if (value < 0) { value = 0; }
+                if (value > context.frame.maxScrollX) { value = context.frame.maxScrollX; }
+                st.scrollX = value;
+            } else if (Modifiers.HasCtrl(e.modifiers) && !st.paged && DataTable.HasRange(st)) {
+                int anchor = st.rangeR0;
+                int far = st.rangeR1;
+                if (far >= anchor && anchor >= 0) {
+                    int next = Math.Max(anchor, Math.Min(far - step, DataTable.DispCount(st) - 1));
+                    if (next != far) {
+                        st.rangeR1 = next;
+                        st.rangeC1 = st.rangeC0;
+                        DataTable.SyncRangeChecks(st, context.source);
+                        if (!context.Current() || !e.GestureRouteCurrent()) { return; }
+                        DataTable.ScrollSlotIntoView(st, next, context.body.visRows);
+                        st.SelectionChanged.Raise();
+                    }
+                }
+            } else if (st.paged) {
+                int pages = VirtualScrollHost.CalcTotalPages(context.body.total, context.body.visRows);
+                st.pageModel.Set(VirtualScrollHost.ClampPage(st.pageModel.Get() - step, pages));
+            } else {
+                int value = VirtualScrollHost.ClampStartRow(st.scrollRow - step * 3,
+                context.body.total, context.body.visRows);
+                if (value != st.scrollRow) { st.scrollRow = value; st.ScrollChanged.Raise(); }
+            }
+            e.Handle();
+        } else {
+            if (name == "PointerDown" && app.window.EventButton() == 0) { host.Focus(); }
+            DataTable.HandleBodyInput(app, host.bx, host.by, host.bw, host.bh,
+            context.frame, context.body, context.columns, context.source, st, e);
+            if (!context.Current() || !e.GestureRouteCurrent()) { return; }
+            if (name == "PointerDown" && (st.fillDrag || st.rangeDrag || st.rowSelDrag)) {
+                app.CapturePointer(host, true); e.Handle();
+            } else if (name == "PointerUp" && app.window.EventButton() == 0) {
+                app.ReleasePointerCapture();
+            } else if (name == "KeyDown" || name == "TextInput" || name == "Click") { e.Handle(); }
+        }
+        if (context.Current() && e.GestureRouteCurrent()) { this.InputChanged(); }
+        app.RequestRedraw();
+    }
+}

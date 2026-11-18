@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using Gui;
 using Gui.Widget;
@@ -11,11 +12,12 @@ namespace Gui.Component.DataTable;
 // layout.Add(grid);
 // ```
 // 内部自动维护主从明细（activeDetails）的 Visual Tree 子节点拓扑生命周期，
-// 并将指针与键盘事件原生委托至 DataTable 渲染流水线。
+// 并将指针与键盘事件路由至准备好的输入节点。
 public class DataTableControl : Control {
     public List<DataColumn> columns;
     public DataSource source;
     public DataTableState state;
+    private DataTableVisualTree visualTree;
 
     public void InitGrid(List<DataColumn> cols, DataSource src, DataTableState st) {
         this.InitControl("datatable", 5);
@@ -42,14 +44,70 @@ public class DataTableControl : Control {
 
     public override string StyleType() { return "datatable"; }
 
+    public override bool ChildControlsRenderedByOwner() { return true; }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        this.bx = x; this.by = y; this.bw = w > 0 ? w : 0; this.bh = h > 0 ? h : 0;
+        if (this.visualTree == null) { this.visualTree = new DataTableVisualTree(this); }
+        this.visualTree.Prepare(this.App, this.columns, this.source, this.state);
+    }
+
+    public override bool AcceptsRetainedLongPress() { return true; }
+    public override int InputFocusCapabilities() { return 3; }
+
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName != "PointerCancel") { this.PrepareInputTree(); }
+        if (this.visualTree != null) { this.visualTree.RouteBody(e); }
+        if (!e.handled) { base.OnRoutedEvent(e); }
+    }
+
+    public override void OnPreviewRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName == "PointerCancel") { base.OnPreviewRoutedEvent(e); return; }
+        this.PrepareInputTree();
+        if (this.visualTree != null && this.visualTree.RouteMenuEvent(e)) { return; }
+        base.OnPreviewRoutedEvent(e);
+    }
+
+    public override bool ChildInViewport(Control child) {
+        return this.visualTree != null && this.visualTree.ContainsPrepared(this.state, child);
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        this.PrepareInputTree();
+        Control hit = base.HitTestCore(x, y, pointerType, excludedSubtrees);
+        return this.visualTree != null ? this.visualTree.ClipHit(hit, x, y) : hit;
+    }
+
+    private void PrepareInputTree() {
+        if (this.visualTree == null || this.visualTree.NeedsPrepare(this.columns, this.source, this.state)) {
+            this.Arrange(this.bx, this.by, this.bw, this.bh);
+        }
+    }
+
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        this.PrepareInputTree();
+        base.CollectInputFocus(app, controls);
+    }
+
+    public override Control FindInputFocus(App app) {
+        this.PrepareInputTree();
+        return base.FindInputFocus(app);
+    }
+
     public DataTableState State() { return this.state; }
 
     public DataTableControl Bind(List<DataColumn> cols, DataSource src) {
+        bool changed = this.source != src;
+        bool schemaChanged = this.columns != cols;
         this.columns = cols != null ? cols : new List<DataColumn>();
         this.source = src;
+        if (changed && this.state != null) { DataTable.InvalidateData(this.state); }
+        else if (schemaChanged && this.state != null) { DataTable.InvalidateView(this.state); }
         if (this.state != null && this.source != null) {
             DataTable.EnsureInit(this.state, this.columns, this.source);
         }
+        // Commit the binding before Cancel can reenter Bind with a newer source.
+        if (changed && this.visualTree != null) { this.visualTree.Retire(this.state); }
         return this;
     }
 
@@ -182,11 +240,6 @@ public class DataTableControl : Control {
     }
 
     public override void OnPaint(App app) {
-        if (this.columns == null || this.source == null || this.state == null) { return; }
-        // 挂接 Visual Tree 子树容器拓扑，使主从明细控件正常接入父子关系与事件冒泡
-        this.children = new List<Control>();
-        this.state.activeDetails = this.children;
-        this.state.ownerControl = this;
-        DataTable.RenderSource(app, this.bx, this.by, this.bw, this.bh, this.columns, this.source, this.state);
+        if (this.visualTree != null) { this.visualTree.Render(app, this.columns, this.source, this.state); }
     }
 }

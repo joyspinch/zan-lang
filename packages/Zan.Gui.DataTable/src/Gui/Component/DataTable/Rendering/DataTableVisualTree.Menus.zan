@@ -1,0 +1,164 @@
+using System;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+internal partial class DataTableVisualTree {
+    AppLoopRegistration menuPreparation;
+    weak App menuApp;
+
+    private void EnsureMenuPreparation(App app) {
+        if (menuPreparation != null && menuApp == app) { return; }
+        if (menuPreparation != null) { menuPreparation.Invalidate(); }
+        DataTableMenuPreparation participant = new DataTableMenuPreparation();
+        participant.tree = this;
+        menuApp = app;
+        menuPreparation = app.RegisterLoopParticipant(owner, participant);
+    }
+    internal void PrepareInputMenus(App app) {
+        Control host = owner;
+        DataTableState st = preparedState;
+        if (host == null || host.FindApp() != app || st == null || inputColumns == null || inputSource == null) { return; }
+        if (this.NeedsPrepare(inputColumns, inputSource, st)) {
+            this.Prepare(app, inputColumns, inputSource, st); return;
+        }
+        if (!this.Current(st) || columns == null || source == null || !host.StyleVisible()) { return; }
+        // Closing states participate too: a hidden feature must retire its old popup.
+        DataTable.PrepareMenus(app, st, columns, source, host.bx, host.by, host.bw, host.bh);
+        DataTable.PrepareFeaturePopups(app, st, columns, source, host.bx, host.by, host.bw, host.bh);
+        if (this.Current(st)) { this.PrepareHover(app, st); }
+    }
+    internal void DispatchMenuAction(bool header, int action) {
+        Control host = owner;
+        DataTableState st = preparedState;
+        if (host == null || st == null || columns == null || source == null) { return; }
+        App app = host.FindApp();
+        if (app == null) { return; }
+        if (header) {
+            int col = st.hdrCtxCol;
+            if (col < 0 || col >= columns.Count) { return; }
+            DataTable.DispatchHeaderAction(app, st, columns, source, col, action);
+            if (st.dirty) { DataTable.Recompute(st, columns, source); }
+        } else { DataTable.DispatchRowAction(app, st, columns, source, action); }
+        app.RequestRedraw();
+    }
+
+    internal bool RouteMenuEvent(RoutedEventArgs e) {
+        Control host = owner;
+        DataTableState st = preparedState;
+        App app = host != null ? host.FindApp() : null;
+        if (app == null || st == null || !this.Current(st) || frame == null || body == null) { return false; }
+        if (e.eventName == "Click" && e.isDoubleClick && this.RouteHeaderAutoFit(app, st, e)) { return true; }
+        bool longPress = e.eventName == "LongPress";
+        bool rightDown = e.eventName == "PointerDown" && app.window.EventButton() == 1;
+        if (!longPress && !rightDown) { return false; }
+        if (st.openMenu >= 0 || st.colChooserOpen || st.ctxOpen || st.hdrCtxOpen
+        || e.x < host.bx || e.x >= frame.clipRight) { return false; }
+        int col = this.MenuColumn(e.x);
+        if (col >= 0) {
+            int top = columns[col].band == "" && frame.bandLevels > 0 ? frame.y : frame.titleTop;
+            int height = columns[col].band == "" && frame.bandLevels > 0 ? frame.headerH : frame.titleRowH;
+            if (e.y >= top && e.y < top + height) {
+                st.hdrCtxCol = col;
+                st.hdrCtxX = e.x;
+                st.hdrCtxY = e.y;
+                st.hitCol = col;
+                DataTable.OpenHdrMenu(st);
+                e.Handle();
+                this.PrepareInputMenus(app);
+                app.RequestRedraw();
+                return true;
+            }
+        }
+        if (e.y < body.bodyTop || e.y >= body.bodyTop + body.bodyH) { return false; }
+        int order = -1;
+        int rr = (e.y - body.bodyTop) / frame.rowH;
+        if (rr >= 0 && rr < body.visRows && body.start + rr < body.total) { order = body.start + rr; }
+        if (order >= 0 && DataTable.DispKind(st, order) == 2) { order = -1; }
+        if (order >= 0 && DataTable.DispKind(st, order) == 0
+        && !DataTable.HasRange(st) && !DataTable.HasSelection(st)) {
+            int row = DataTable.DispRowOf(st, order);
+            if (!DataTable.IsSelected(st, source, row)) {
+                DataTable.SelectAllRows(st, source, false);
+                DataTable.SetSelected(st, source, row, true);
+                st.selAnchor = order;
+            }
+        }
+        st.ctxX = e.x;
+        st.ctxY = e.y;
+        st.ctxRow = order >= 0 && DataTable.DispKind(st, order) == 0 ? DataTable.DispRowOf(st, order) : -1;
+        st.ctxOrder = st.ctxRow >= 0 ? order : -1;
+        st.ctxCol = col;
+        st.rangeDrag = false;
+        int current = generation;
+        e.Handle();
+        st.RowContext.Raise();
+        // RowContext may rebind/retire this table or open its own overlay.
+        if (generation != current || preparedState != st || !e.GestureRouteCurrent()) { return true; }
+        if (!st.externalRowMenu) { DataTable.OpenRowMenu(st); this.PrepareInputMenus(app); }
+        app.RequestRedraw();
+        return true;
+    }
+    private bool RouteHeaderAutoFit(App app, DataTableState st, RoutedEventArgs e) {
+        if (st.ctxOpen || st.hdrCtxOpen || st.openMenu >= 0 || st.colChooserOpen) { return false; }
+        for (int i = frame.columns.Count - 1; i >= 0; i = i - 1) {
+            FrameColumn entry = frame.columns[i];
+            int col = entry.column;
+            if (!columns[col].resizable) { continue; }
+            int top = columns[col].band == "" && frame.bandLevels > 0 ? frame.y : frame.titleTop;
+            int height = columns[col].band == "" && frame.bandLevels > 0 ? frame.headerH : frame.titleRowH;
+            int edge = entry.x + st.dispW[col];
+            int width = app.Scale(6);
+            int pad = e.pointerType == 1 ? app.Scale(6) : 0;
+            int left = edge - width / 2 - pad;
+            int right = left + width + pad * 2;
+            if (pad > 0 && (columns[col].filterable || columns[col].sortable)) {
+                int iconLeft = edge - frame.menuIconW - app.Scale(1);
+                if (right > iconLeft) { right = iconLeft; }
+                left = right - width - pad * 2;
+            }
+            int bandLeft = DataTable.BandLeft(entry.band, frame.firstDataX, frame.bandX, frame.rightX);
+            int bandRight = DataTable.BandRight(entry.band, frame.firstDataX, frame.bandX, frame.bandW,
+            frame.rightX, frame.pinnedW, frame.pinnedRW, frame.clipRight);
+            if (left < bandLeft) { left = bandLeft; }
+            if (right > bandRight) { right = bandRight; }
+            if (e.x >= left && e.x < right && e.y >= top && e.y < top + height) {
+                e.Handle();
+                st.resizeCol = -1;
+                DataTable.AutoFitColumn(app, columns, source, st, col);
+                app.RequestRedraw();
+                return true;
+            }
+        }
+        return false;
+    }
+    private int MenuColumn(int x) {
+        DataTableState st = preparedState;
+        for (int i = frame.columns.Count - 1; i >= 0; i = i - 1) {
+            FrameColumn item = frame.columns[i];
+            int left = item.x;
+            int right = left + st.dispW[item.column];
+            int bandLeft = DataTable.BandLeft(item.band, frame.firstDataX, frame.bandX, frame.rightX);
+            int bandRight = DataTable.BandRight(item.band, frame.firstDataX, frame.bandX, frame.bandW,
+            frame.rightX, frame.pinnedW, frame.pinnedRW, frame.clipRight);
+            if (left < bandLeft) { left = bandLeft; }
+            if (right > bandRight) { right = bandRight; }
+            if (x >= left && x < right) { return item.column; }
+        }
+        return -1;
+    }
+}
+
+internal class DataTableMenuPreparation : AppLoopParticipant, AppPreparationParticipant {
+    internal weak DataTableVisualTree tree;
+    public int NextDeadline() { return -1; }
+    public void Tick(App app, int now) { }
+    public void BeforeInput(App app, int kind) {
+        DataTableVisualTree current = tree;
+        if (current != null) { current.PrepareInputMenus(app); }
+    }
+    public void BeforePaint(App app, int frameSequence) {
+        DataTableVisualTree current = tree;
+        if (current != null) { current.PrepareInputMenus(app); }
+    }
+}

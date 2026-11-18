@@ -1,0 +1,311 @@
+using System;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+// Layout reconciles the desired visible set; Paint only reads its prepared slots.
+internal partial class DataTableVisualTree {
+    weak Control owner;
+    List<Control> visible;
+    List<DataTableVisualSlot> slots;
+    int generation;
+    Dictionary<Control, Rect> hitClips;
+    Rect clip;
+    bool preparing;
+    bool computingFrame;
+    bool prepared;
+    bool inputChanged;
+
+    internal void InputChanged() { this.inputChanged = true; }
+    weak DataTableState preparedState;
+    List<DataColumn> columns;
+    DataSource source;
+    DataTableFrame frame;
+    DataTableBodyLayout body;
+    int revision;
+    int scrollRow;
+    int scrollX;
+    int page;
+    List<DataColumn> inputColumns;
+    weak DataSource inputSource;
+    int columnCount;
+
+    internal bool NeedsPrepare(List<DataColumn> cols, DataSource src, DataTableState st) {
+        return !this.preparing && (this.inputChanged || !this.Current(st) || cols != this.inputColumns
+        || src != this.inputSource || (cols != null && cols.Count != this.columnCount));
+    }
+
+    private bool Current(DataTableState st) {
+        return this.prepared && st != null && st == this.preparedState && !st.dirty
+        && st.viewRevision == this.revision && st.scrollRow == this.scrollRow
+        && st.scrollX == this.scrollX && st.pageModel.Get() == this.page;
+    }
+
+    internal DataTableVisualTree(Control owner) {
+        this.owner = owner;
+        this.visible = new List<Control>();
+        this.slots = new List<DataTableVisualSlot>();
+        this.generation = 0;
+    }
+
+    internal void Invalidate() {
+        this.prepared = false;
+        // EnsureInit/SyncBindings can update revisions while computing this frame.
+        // Bind/Retire still invalidates its generation unconditionally.
+        if (this.computingFrame) { return; }
+        this.generation = this.generation + 1;
+        // Also invalidates a provider/paint callback's collection context.
+        this.visible = new List<Control>();
+    }
+
+    internal bool ContainsPrepared(DataTableState st, Control child) {
+        return this.Current(st) && this.visible.Contains(child);
+    }
+
+    internal void Prepare(App app, List<DataColumn> cols, DataSource src, DataTableState st) {
+        Control host = this.owner;
+        if (host == null || app == null) { return; }
+        this.EnsureMenuPreparation(app);
+        bool previousPreparing = this.preparing;
+        this.preparing = true;
+        this.generation = this.generation + 1;
+        int current = this.generation;
+        this.prepared = false;
+        this.visible = new List<Control>();
+        this.slots = new List<DataTableVisualSlot>();
+        this.hitClips = new Dictionary<Control, Rect>();
+        this.clip = new Rect(host.bx, host.by, host.bw, host.bh);
+        DataTableVisualTree previousTree = st != null ? st.visualTree : null;
+        List<Control> previousDetails = st != null ? st.activeDetails : null;
+        Control previousOwner = st != null ? st.ownerControl : null;
+        if (st != null) {
+            st.retainedTree = this;
+            st.visualTree = this;
+            st.activeDetails = this.visible;
+            st.ownerControl = host;
+        }
+        try {
+            this.inputColumns = cols;
+            this.inputSource = src;
+            this.columnCount = cols != null ? cols.Count : 0;
+            if (cols != null && src != null && st != null) {
+                if (st.pivotView) {
+                    DataTable.PivotEnsure(st, cols, src);
+                    cols = DataTable.PivotViewCols(st);
+                    src = DataTable.PivotViewSource(st, src);
+                } else if (st.transposeView) {
+                    DataTable.TransposeEnsure(st);
+                    cols = st.trViewCols;
+                    src = DataTable.TransposeViewSource(st, src);
+                }
+                if (this.generation != current) { return; }
+                this.computingFrame = true;
+                try { this.frame = DataTable.PrepareFrame(app, host.bx, host.by, host.bw, host.bh, cols, src, st); }
+                finally { this.computingFrame = false; }
+                if (this.generation != current) { return; }
+                this.body = DataTable.ComputeBodyLayout(app, this.frame.y, this.frame.viewH, this.frame, src, st);
+                if (this.generation != current) { return; }
+                DataTable.PrepareVisibleControls(app, host.bx, host.bw, this.frame, this.body, cols, src, st);
+                if (this.generation != current) { return; }
+                DataTable.PrepareInputControls(app, host.bx, host.bw, this.frame, this.body, cols, src, st);
+                if (this.generation != current) { return; }
+                this.PrepareRegions(app, st, cols, src, this.frame, this.body);
+                if (this.generation != current) { return; }
+                this.PrepareTextFields(app, st, cols, src, this.frame, this.body);
+                if (this.generation != current) { return; }
+            } else {
+                this.frame = null;
+                this.body = null;
+            }
+            if (!this.Reconcile(current)) { return; }
+            this.columns = cols;
+            this.source = src;
+            this.preparedState = st;
+            if (st != null) {
+                this.revision = st.viewRevision;
+                this.scrollRow = st.scrollRow;
+                this.scrollX = st.scrollX;
+                this.page = st.pageModel.Get();
+            }
+            this.inputChanged = false;
+            this.prepared = true;
+            if (st != null) { this.PrepareTextFocus(app, st); }
+        } finally {
+            this.preparing = previousPreparing;
+            if (st != null) {
+                st.visualTree = previousTree;
+                if (previousTree != null) {
+                    st.activeDetails = previousDetails;
+                    st.ownerControl = previousOwner;
+                } else { st.activeDetails = this.visible; }
+            }
+        }
+        if (!previousPreparing && this.generation == current && this.Current(st)) {
+            this.PrepareInputMenus(app);
+        }
+    }
+
+    internal void Render(App app, List<DataColumn> cols, DataSource src, DataTableState st) {
+        Control host = this.owner;
+        if (host == null || !this.Current(st) || this.frame == null) { return; }
+        int current = this.generation;
+        DataTableVisualTree previousTree = st.visualTree;
+        List<Control> previousDetails = st.activeDetails;
+        Control previousOwner = st.ownerControl;
+        st.visualTree = this;
+        st.activeDetails = this.visible;
+        st.ownerControl = host;
+        try {
+            DataTable.RenderPanels(app, host.bx, host.by, host.bw, this.frame, this.columns, this.source, st);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            DataTable.RenderPreparedSource(app, host.bx, host.bw, this.frame, this.body,
+            this.columns, this.source, st);
+        } finally {
+            st.visualTree = previousTree;
+            if (previousTree != null) {
+                st.activeDetails = previousDetails;
+                st.ownerControl = previousOwner;
+            } else { st.activeDetails = this.visible; }
+        }
+    }
+
+    private bool Reconcile(int current) {
+        Control host = this.owner;
+        if (host == null || this.generation != current) { return false; }
+        List<Control> desired = this.visible;
+        List<Control> removed = new List<Control>();
+        for (int i = 0; i < host.ChildCount(); i = i + 1) {
+            Control child = host.ChildAt(i);
+            if (!desired.Contains(child)) { removed.Add(child); }
+        }
+        host.RemoveChildren(removed, () => { return this.generation == current; });
+        if (this.generation != current) { return false; }
+        for (int i = 0; i < desired.Count; i = i + 1) {
+            Control child = desired[i];
+            if (child.parent == host && host.IndexOf(child) != i) { host.MoveChild(child, i); }
+        }
+        return true;
+    }
+
+    internal DataTableInputContext InputContext() {
+        DataTableState st = this.preparedState;
+        if (!this.Current(st)) { return null; }
+        DataTableInputContext context = new DataTableInputContext();
+        context.tree = this; context.generation = this.generation;
+        context.frame = this.frame; context.body = this.body;
+        context.columns = this.columns; context.source = this.source; context.state = st;
+        return context;
+    }
+
+    internal bool IsInputCurrent(DataTableInputContext context) {
+        return context != null && context.tree == this && context.generation == this.generation
+        && context.state == this.preparedState && context.columns == this.columns
+        && context.source == this.source && this.owner != null;
+    }
+
+    internal void RecordPainter(int row, int column, int painter) {
+        this.slots.Add(new DataTableVisualSlot(painter == 1 ? 8 : 9, row, column, null));
+    }
+
+    internal static int PreparedPainter(DataTableState st, int row, int column) {
+        if (st == null || st.visualTree == null) { return 0; }
+        List<DataTableVisualSlot> preparedSlots = st.visualTree.slots;
+        for (int i = 0; i < preparedSlots.Count; i = i + 1) {
+            DataTableVisualSlot slot = preparedSlots[i];
+            if (slot.row == row && slot.column == column) {
+                if (slot.kind == 8) { return 1; }
+                if (slot.kind == 9) { return 2; }
+            }
+        }
+        return 0;
+    }
+
+    internal void Retire(DataTableState st) {
+        Control host = this.owner;
+        this.prepared = false;
+        this.generation = this.generation + 1;
+        this.visible = new List<Control>();
+        int current = this.generation;
+        this.slots = new List<DataTableVisualSlot>();
+        this.hitClips = new Dictionary<Control, Rect>();
+        if (st != null && st.visualTree != this) { st.activeDetails = this.visible; }
+        if (host == null) { return; }
+        bool previousPreparing = this.preparing;
+        this.preparing = true;
+        try { host.RemoveChildren(host.SnapshotChildren(), () => { return this.generation == current; }); }
+        finally { this.preparing = previousPreparing; }
+    }
+
+    internal bool Attach(DataTableState st, Control child) {
+        Control host = this.owner;
+        List<Control> desired = st.activeDetails;
+        if (host == null || desired != this.visible) { return false; }
+        int current = this.generation;
+        if (child.parent != host || host.IndexOf(child) < 0) { host.Add(child); }
+        if (this.generation != current || st.activeDetails != desired
+        || child.parent != host || host.IndexOf(child) < 0) { return false; }
+        if (!desired.Contains(child)) { desired.Add(child); }
+        this.hitClips[child] = new Rect(this.clip.x, this.clip.y, this.clip.width, this.clip.height);
+        return true;
+    }
+
+    internal static bool LayoutControl(App app, DataTableState st, Control child,
+    int kind, int row, int column, int x, int y, int w, int h) {
+        if (child == null || !DataTableVisualTree.AttachVisibleControl(st, child)) { return false; }
+        child.MeasureTree(app);
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return false; }
+        child.Arrange(x, y, w, h);
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return false; }
+        if (st != null && st.visualTree != null) {
+            st.visualTree.slots.Add(new DataTableVisualSlot(kind, row, column, child));
+        }
+        return true;
+    }
+
+    internal void RecordComponent(int row, int column, Control child) {
+        this.slots.Add(new DataTableVisualSlot(1, row, column, child));
+    }
+
+    internal static Control PreparedControl(DataTableState st, int kind, int row, int column) {
+        if (st == null || st.visualTree == null) { return null; }
+        List<DataTableVisualSlot> preparedSlots = st.visualTree.slots;
+        for (int i = 0; i < preparedSlots.Count; i = i + 1) {
+            DataTableVisualSlot slot = preparedSlots[i];
+            if (slot.kind == kind && slot.row == row && slot.column == column) { return slot.control; }
+        }
+        return null;
+    }
+
+    internal Control ClipHit(Control hit, int x, int y) {
+        Control host = this.owner;
+        Control child = hit;
+        while (child != null && child != host && child.parent != host) { child = child.parent; }
+        if (child == null || child == host) { return hit; }
+        if (!this.prepared || this.hitClips == null || !this.hitClips.ContainsKey(child)
+        || !this.hitClips[child].Contains(x, y)) { return host; }
+        return hit;
+    }
+
+    internal static void SetVisibleClip(DataTableState st, int x, int y, int w, int h) {
+        if (st == null || st.visualTree == null || !DataTableVisualTree.IsCurrentRender(st)) { return; }
+        Control host = st.visualTree.owner;
+        if (host == null) { return; }
+        int left = x > host.bx ? x : host.bx;
+        int top = y > host.by ? y : host.by;
+        int right = x + w < host.bx + host.bw ? x + w : host.bx + host.bw;
+        int bottom = y + h < host.by + host.bh ? y + h : host.by + host.bh;
+        st.visualTree.clip.Set(left, top, right > left ? right - left : 0, bottom > top ? bottom - top : 0);
+    }
+
+    internal static bool IsCurrentRender(DataTableState st) {
+        return st == null || st.visualTree == null || st.activeDetails == st.visualTree.visible;
+    }
+
+    internal static bool AttachVisibleControl(DataTableState st, Control child) {
+        if (child == null) { return false; }
+        if (st == null) { return true; }
+        if (st.visualTree != null) { return st.visualTree.Attach(st, child); }
+        if (st.activeDetails != null && !st.activeDetails.Contains(child)) { st.activeDetails.Add(child); }
+        return true;
+    }
+}

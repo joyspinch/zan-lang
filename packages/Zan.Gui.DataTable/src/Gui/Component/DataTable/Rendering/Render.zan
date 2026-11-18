@@ -9,26 +9,23 @@ namespace Gui.Component.DataTable;
 // DataTable 主渲染管线：统一度量计算与顶层生命周期调度（表头/主体/页脚/交互/浮层分层解耦）。
 public partial class DataTable {
     // 便捷重载：渲染内存中的 List<DataRow>（包装为 RowListSource）
-    public static void Render(App app, int x, int y, int viewW, int viewH,
-                       List<DataColumn> cols, List<DataRow> rows, DataTableState st) {
-        RowListSource src;
-        if (st != null) {
-            if (st.cachedRowSource == null) {
-                st.cachedRowSource = new RowListSource(rows);
-            } else {
-                st.cachedRowSource.rows = rows;
-            }
-            src = st.cachedRowSource;
-        } else {
-            src = new RowListSource(rows);
-        }
-        DataTable.RenderSource(app, x, y, viewW, viewH, cols, src, st);
-    }
 
     // 渲染前奏：把全部每帧布局几何解析到 DataTableFrame
-    public static DataTableFrame ComputeFrame(App app, int x, int y, int viewW, int viewH,
-                       List<DataColumn> cols, DataSource src, DataTableState st) {
-        Canvas c = app.canvas;
+
+    internal static void RenderPanels(App app, int x, int y, int viewW, DataTableFrame f,
+    List<DataColumn> cols, DataSource src, DataTableState st) {
+        int filterH = f.panelY - y;
+        if (filterH > 0) { DataTable.PaintFilterPanel(app, x, y, viewW, filterH, cols, src, st); }
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+        if (f.groupPanelH > 0) {
+            DataTable.RenderGroupPanel(app, x, f.panelY, viewW, f.groupPanelH, cols, st,
+            st.dragCol >= 0 && st.dragColMoved);
+        }
+    }
+
+    // Preparation computes geometry before routing and painting.
+    internal static DataTableFrame PrepareFrame(App app, int x, int y, int viewW, int viewH,
+    List<DataColumn> cols, DataSource src, DataTableState st) {
         Theme t = app.theme;
 
         // 服务端数据源在帧间交付数据
@@ -62,7 +59,7 @@ public partial class DataTable {
                 for (int wcol = 0; wcol < cols.Count; wcol = wcol + 1) {
                     DataColumn wcol2 = cols[wcol];
                     if (!wcol2.wrapText || wcol >= st.colHidden.Count
-                        || st.colHidden[wcol]) { continue; }
+                    || st.colHidden[wcol]) { continue; }
                     int innerW2 = app.Scale(st.colWidths[wcol]) - app.Scale(12);
                     if (innerW2 < app.Scale(16)) { continue; }
                     string txt = DataTable.CellTextRouted(cols, src, srow, wcol);
@@ -84,17 +81,10 @@ public partial class DataTable {
 
         int filterPanelH = 0;
         if (st.showFilterPanel || st.pivotView) { filterPanelH = app.Scale(30); }
-        if (filterPanelH > 0) {
-            DataTable.RenderFilterPanel(app, x, y, viewW, filterPanelH, cols, src, st);
-        }
         int groupPanelH = 0;
         if (st.showGroupPanel) { groupPanelH = app.Scale(34); }
         int hdrY = y + filterPanelH + groupPanelH;
         int panelY = y + filterPanelH;
-        if (st.showGroupPanel) {
-            DataTable.RenderGroupPanel(app, x, panelY, viewW, groupPanelH, cols, st,
-                                       st.dragCol >= 0 && st.dragColMoved);
-        }
         y = hdrY;
         viewH = viewH - filterPanelH - groupPanelH;
 
@@ -102,14 +92,14 @@ public partial class DataTable {
         if (st.showRowNum) {
             numW = app.Scale(46);
             int needW = Canvas.MeasureText(Convert.ToString(src.RowCount()), Style.FontFallback(app, "small"))
-                        + app.Scale(16);
+            + app.Scale(16);
             if (needW > numW) { numW = needW; }
         }
         int selW = 0;
         if (st.showSelect) { selW = app.Scale(40); }
 
         int gridColor = Style.Part(app, "datatable", "grid", "", "", "",
-                                   Style.SNormal()).BgOr(0);
+        Style.SNormal()).BgOr(0);
         int menuIconW = app.Scale(14);
 
         int sbGutter = app.Scale(12);
@@ -205,31 +195,17 @@ public partial class DataTable {
     }
 
     // 核心渲染调度入口
-    public static void RenderSource(App app, int x, int y, int viewW, int viewH,
-                       List<DataColumn> cols, DataSource src, DataTableState st) {
+
+    internal static void RenderPreparedSource(App app, int x, int viewW,
+    DataTableFrame f, DataTableBodyLayout lay,
+    List<DataColumn> cols, DataSource src, DataTableState st) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int evt = DataTable.ModalEvt(app, st);
-        int openMenuAtStart = st.openMenu;
-
-        // 透视视图或转置视图展开
-        if (st.pivotView) {
-            DataTable.PivotEnsure(st, cols, src);
-            cols = DataTable.PivotViewCols(st);
-            src = DataTable.PivotViewSource(st, src);
-        } else if (st.transposeView) {
-            DataTable.TransposeEnsure(st);
-            cols = st.trViewCols;
-            src = DataTable.TransposeViewSource(st, src);
-        }
-
-        // 统一解析帧几何与条带度量
-        DataTableFrame f = DataTable.ComputeFrame(app, x, y, viewW, viewH, cols, src, st);
         int numW = f.numW;
         int selW = f.selW;
         int headerH = f.headerH;
-        y = f.y;
-        viewH = f.viewH;
+        int y = f.y;
+        int viewH = f.viewH;
 
         // 外边框与表格背景（复用帧样式快照）
         StyleBox sSurface = f.styles.surface;
@@ -238,46 +214,38 @@ public partial class DataTable {
         c.DrawRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, sSurface.BorderOr(0), 1);
 
         // 1. 渲染管道阶段：表头区域、Band行与列交互
-        DataTable.RenderHeader(app, x, y, viewW, f, cols, src, st, evt, openMenuAtStart);
+        DataTable.RenderHeader(app, x, y, viewW, f, cols, src, st);
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
 
         // 2. 渲染管道阶段：计算主体布局并渲染数据行虚拟化视口
-        DataTableBodyLayout lay = DataTable.ComputeBodyLayout(app, y, viewH, f, src, st);
-        DataTable.RenderBody(app, x, y, viewW, viewH, f, lay, cols, src, st, evt);
+        if (lay == null) { return; }
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+        DataTable.RenderBody(app, x, y, viewW, viewH, f, lay, cols, src, st);
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
 
-        // 3. 渲染管道阶段：交互分发、键盘导航与指针拖拽映射
-        DataTable.RenderInteraction(app, x, y, viewW, viewH, f, lay, cols, src, st, evt);
-
+        // 页脚与浮条共享本次 Render 的选区快照；下次调用重新读取，
+        // 不依赖 data/view revision 覆盖所有直接字段修改。
+        SelectionStatistics selection = null;
+        if ((DataTable.HasRange(st) || DataTable.HasMulti(st))
+        && (st.showStatusBar || st.showSelectionSummary)) {
+            selection = new SelectionStatistics(st.showStatusBar, st.showSelectionSummary);
+        }
         // 4. 渲染管道阶段：固定底行、汇总行、分页器与滚动条
-        DataTable.RenderFooter(app, x, y, viewW, viewH, f, lay, cols, src, st, evt);
+        DataTable.RenderFooter(app, x, y, viewW, viewH, f, lay, cols, src, st, selection);
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
 
         // 5. 顶层非模态/模态浮层（按 z-order 位于最顶层）
         if (st.findOpen) {
-            DataTable.RenderFindBar(app, x, y, viewW, cols, src, st, lay.visRows);
+            DataTable.PaintFindBar(app, x, y, viewW, cols, src, st, lay.visRows);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
         }
-        if (st.openMenu >= 0 && st.openMenu < cols.Count) {
-            DataTable.RenderMenu(app, x, y, viewW, headerH, numW, selW, cols, src, st);
-        }
-        if (st.ctxOpen) {
-            DataTable.RenderContextMenu(app, x, y, viewW, viewH, cols, src, st);
-        }
-        if (st.hdrCtxOpen) {
-            DataTable.RenderHeaderMenu(app, x, y, viewW, viewH, cols, src, st);
-        }
-        if (st.colChooserOpen) {
-            DataTable.RenderColumnChooser(app, x, y, viewW, viewH, cols, src, st);
-        }
-        if (st.cfClearOpen) {
-            DataTable.RenderCfClear(app, x, y, viewW, viewH, cols, st);
-        }
-        if (st.chartOpen) {
-            DataTable.RenderChart(app, x, y, viewW, viewH, st);
-        }
-        if (st.ExportUiOpen()) {
-            DataTable.RenderExportUi(app, x, y, viewW, viewH, st);
-        }
+
         if (st.showSelectionSummary && !st.editing && (DataTable.HasRange(st) || DataTable.HasMulti(st))
-            && !st.ExportUiOpen() && !st.chartOpen && !st.cfClearOpen) {
-            SelectionSummary selSum = DataTable.ComputeSelectionSummary(st, cols, src);
+        && !st.ExportUiOpen() && !st.chartOpen && !st.cfClearOpen) {
+            if (selection == null) { selection = new SelectionStatistics(false, true); }
+            selection.Read(st, cols, src);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            SelectionSummary selSum = selection.summary;
             if (selSum.cellCount > 1) {
                 string sumTxt = selSum.Format();
                 if (sumTxt.Length > 0) {
@@ -333,8 +301,7 @@ public partial class DataTable {
             int tyy = y + viewH - th - app.Scale(12);
             c.FillRoundRect(tx, tyy, tw, th, t.borderRadiusMedium, sToast.BgOr(0));
             c.DrawTextCentered(tx, tyy, tw, th, st.toast, sToast.FgOr(0), tfs);
-            st.toastFrames = st.toastFrames - 1;
-            if (st.toastFrames > 0) { app.RequestRedraw(); }
+
         }
     }
 }

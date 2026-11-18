@@ -5,101 +5,838 @@ using Gui.Component.DataTable;
 
 class NestedTreeTestItem {
     public string name;
-    public bool active;
-    public NestedTreeTestItem(string n, bool a) {
-        this.name = n;
-        this.active = a;
+    public NestedTreeTestItem(string name) { this.name = name; }
+}
+
+class NestedTreeSource : DataSource {
+    public override int RowCount() { return 30; }
+    public override string CellText(int row, int col) { return "Row " + Convert.ToString(row); }
+}
+
+class NestedTreeCancel {
+    public weak App app;
+    public weak DataTableControl table;
+    public weak DataGrid<NestedTreeTestItem> grid;
+    public weak Input renewed;
+    public List<NestedTreeTestItem> replacement;
+    public int calls;
+    public int action;
+    public Exception failure;
+
+    public void Handle(Control sender, RoutedEventArgs e) {
+        if (e.eventName != "PointerCancel") { return; }
+        this.calls = this.calls + 1;
+        int next = this.action;
+        this.action = 0;
+        if (next == 1) {
+            DataTable.ExpandRow(this.table.state, this.table.source, 0);
+            this.table.Arrange(this.table.bx, this.table.by, this.table.bw, this.table.bh);
+            this.table.OnPaint(this.app);
+            this.renewed.Focus(this.app);
+            this.app.CapturePointer(this.renewed);
+        } else if (next == 2) {
+            this.grid.Bind(this.replacement);
+            this.grid.Arrange(this.grid.bx, this.grid.by, this.grid.bw, this.grid.bh);
+            this.grid.OnPaint(this.app);
+            this.renewed.Focus(this.app);
+            this.app.CapturePointer(this.renewed);
+        } else if (next == 3) {
+            throw this.failure;
+        }
     }
 }
 
+class NestedTreePaint : Control {
+    public int paints;
+    public NestedTreePaint() { this.InitControl("nested-paint", 0); }
+    public override void OnPaint(App app) {
+        this.paints = this.paints + 1;
+        // FillRect uses ARGB; the opaque marker deliberately overflows so only
+        // the table's visible band may receive ink.
+        app.canvas.FillRect(this.bx - 20, this.by - 20, this.bw + 40, this.bh + 40, unchecked((int)0xFFEA00D4));
+    }
+}
+
+class NestedTreeRebindProvider : DetailProvider {
+    public weak DataTableControl table;
+    public NestedTreePaint stale;
+    public DataSource next;
+    public int calls;
+    public override int Slots(DataSource src, int row) { return 4; }
+    public override Control ProvideControl(App app, DataSource src, int row, int x, int y, int w, int h) {
+        this.calls = this.calls + 1;
+        this.table.Bind(this.table.columns, this.next);
+        return this.stale;
+    }
+}
+
+class NestedTreeCellRebindProvider : CellWidgetProvider {
+    public weak DataTableControl table;
+    public NestedTreePaint stale;
+    public DataSource next;
+    public int calls;
+    public override Control Provide(App app, DataSource src, int row, int col, int x, int y, int w, int h) {
+        this.calls = this.calls + 1;
+        this.table.Bind(this.table.columns, this.next);
+        return this.stale;
+    }
+}
+
+class NestedTreeRebindComp : CellComp {
+    public weak DataTableControl table;
+    public NestedTreePaint stale;
+    public DataSource next;
+    public int fills;
+    public NestedTreeRebindComp() : base("nested-tree-rebind") { }
+    public override Control Acquire(App app, DataSource src, int row, int col, RowKey key,
+    int x, int y, int w, int h, int rows, int cols) { return this.stale; }
+    public override void FillStr(Control ctl, string val, DataColumn col, DataSource src, int row) {
+        this.fills = this.fills + 1;
+        this.table.Bind(this.table.columns, this.next);
+    }
+    public override void Reset() { this.stale = null; this.next = null; }
+}
+
+class NestedTreeCustomRenderer : CellRenderer {
+    public bool covered;
+    public int paints;
+    public weak DataTableControl table;
+    public DataSource replacement;
+    public Exception failure;
+    public override bool OwnsCell(DataSource src, int row, int col) { return this.covered; }
+    public override void Paint(App app, Canvas canvas, DataSource src, int row, int col,
+    int x, int y, int w, int h, bool selected, bool hovered) {
+        this.paints = this.paints + 1;
+        if (this.failure != null) { throw this.failure; }
+        if (this.replacement != null) {
+            DataSource next = this.replacement;
+            this.replacement = null;
+            this.table.Bind(this.table.columns, next);
+        }
+    }
+}
+
+class NestedTreeCustomStyler : CellStyler {
+    public bool covered;
+    public int paints;
+    public override bool OwnsCell(DataSource src, int row, int col) { return this.covered; }
+    public override void PaintCell(App app, DataSource src, int row, int col,
+    int x, int y, int w, int h) {
+        this.paints = this.paints + 1;
+    }
+}
+
+class NestedTreeCustomComp : CellComp {
+    public Input editor;
+    public int acquisitions;
+    public NestedTreeCustomComp() : base("nested-tree-custom") {
+        this.editor = new Input("Custom fallback");
+        this.editor.SetProp("style", "height: 16px");
+    }
+    public override Control Acquire(App app, DataSource src, int row, int col, RowKey key,
+    int x, int y, int w, int h, int rows, int cols) {
+        this.acquisitions = this.acquisitions + 1;
+        return row == 0 ? this.editor : null;
+    }
+    public override void Reset() { this.editor = null; }
+}
+
+class NestedTreeView : UiViewOwner {
+    public int x;
+    public int y;
+    public int width;
+    public int height;
+    public void PrepareView(UiViewScope view, App app) { view.Layout(this.x, this.y, this.width, this.height); }
+    public void ViewAction(string name, Control sender) { }
+    public void ViewPointer(Control sender, RoutedEventArgs args) { }
+}
+
+class NestedTreeCellProvider : CellWidgetProvider {
+    public Input editor;
+    public int calls;
+    public override Control Provide(App app, DataSource src, int row, int col, int x, int y, int w, int h) {
+        this.calls = this.calls + 1;
+        return row == 0 && col == 0 ? this.editor : null;
+    }
+}
+
+class NestedTreeChromeEvents {
+    public weak DataTableControl table;
+    public int filters;
+    public int selections;
+    public int reorders;
+    public bool rebind;
+    public void FilterChanged() { filters = filters + 1; }
+    public void SelectionChanged() { selections = selections + 1; }
+    public void ColumnReordered() {
+        reorders = reorders + 1;
+        if (rebind) { table.Bind(table.columns, new NestedTreeSource()); }
+    }
+}
+
+class NestedTreeWitness {
+    public weak DataTableControl table;
+    public weak DataTableState state;
+    public weak Control detail;
+}
+
 public class DataTableNestedVisualTreeTest {
-    public static void Main() {
-        App app = App.CreateDark("Nested Tree Test", 1024, 768);
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
 
-        // 1. 验证 DataGrid 宿主子控件树挂载
+    static void Paint(App app, Control table) {
+        app.BeginOffscreenFrame();
+        try {
+            table.MeasureTree(app);
+            table.Arrange(table.bx, table.by, table.bw, table.bh);
+            table.RenderTree(app);
+        }
+        finally { app.EndOffscreenFrame(); }
+    }
+
+    static void PaintOnly(App app, Control table) {
+        app.BeginOffscreenFrame();
+        try { table.RenderTree(app); }
+        finally { app.EndOffscreenFrame(); }
+    }
+
+    static List<NestedTreeTestItem> Items(string prefix) {
+        List<NestedTreeTestItem> rows = new List<NestedTreeTestItem>();
+        for (int i = 0; i < 30; i = i + 1) {
+            rows.Add(new NestedTreeTestItem(prefix + Convert.ToString(i)));
+        }
+        return rows;
+    }
+
+    static List<DataColumn> Columns() {
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(new DataColumn("Name", 180));
+        return cols;
+    }
+
+    static void Configure(DataTableState state) {
+        state.rowH = 28;
+        state.showSummary = false;
+        state.showStatusBar = false;
+        state.showFilterRow = false;
+        state.showSelectionSummary = false;
+    }
+
+    static void Arm(App app, Input editor) {
+        editor.Focus(app);
+        app.CapturePointer(editor);
+        Check(editor.IsFocused(app) && app.GetCapturedPointer() == editor, "fixture owns focus and capture");
+    }
+
+    static void Released(App app, Control detail, Input editor, string label) {
+        Check(detail.parent == null && detail.FindApp() == null, label + " detaches tree and host");
+        Check(!editor.IsFocused(app) && app.GetCapturedPointer() == null, label + " releases focus and capture");
+    }
+
+    static void TableLifecycle(App app, NestedTreeWitness witness) {
+        DataTableState state = new DataTableState();
+        Configure(state);
+        DataTableControl table = new DataTableControl(Columns(), new NestedTreeSource(), state);
+        table.Class = "zs-nested-table";
+        Panel detail = Panel.Column();
+        Input editor = new Input("Detail editor");
+        Input renewed = new Input("Renewed editor");
+        Button button = new Button("Detail action");
+        detail.Add(editor);
+        detail.Add(renewed);
+        detail.Add(button);
+        state.detail = new ControlDetailProvider((a, src, row) => detail, 4);
+        DataTable.ExpandRow(state, table.source, 0);
+        app.SetRootControl(table);
+        table.UseApp(app);
+        table.Arrange(10, 10, 600, 320);
+        ControlChildren children = table.Children;
+        Paint(app, table);
+        Check(table.Children == children && table.IndexOf(detail) >= 0 && detail.parent == table,
+        "table retains its children collection");
+        Check(detail.parent == table && editor.FindApp() == app && detail.Class.Contains("zs-nested-table"),
+        "standard adoption propagates parent, App and scope");
+        int x = button.bx + 2;
+        int y = button.by + 2;
+        Control hit = table.HitTest(x, y);
+        Check(hit == button, "detail button participates in table hit testing");
+        bool clicked = false;
+        bool bubbled = false;
+        button.OnRouted((Control sender, RoutedEventArgs e) => {
+            if (e.eventName == "click") { clicked = true; }
+        });
+        table.OnRouted((Control sender, RoutedEventArgs e) => {
+            if (e.eventName == "click") { bubbled = true; }
+        });
+        Control.RouteEvent(hit, new RoutedEventArgs("click", hit));
+        Check(clicked && bubbled, "detail events bubble through the adopted table");
+
+        NestedTreeCancel cancel = new NestedTreeCancel();
+        cancel.app = app;
+        cancel.table = table;
+        cancel.renewed = renewed;
+        editor.OnRouted(cancel.Handle);
+        renewed.OnRouted(cancel.Handle);
+        Arm(app, editor);
+        Paint(app, table);
+        Check(table.Children == children && table.IndexOf(detail) >= 0 && cancel.calls == 0
+        && editor.IsFocused(app) && app.GetCapturedPointer() == editor,
+        "unchanged visible intersection preserves input without cancellation");
+        state.scrollRow = 2;
+        Paint(app, table);
+        Check(detail.parent == table && cancel.calls == 0 && editor.IsFocused(app)
+        && app.GetCapturedPointer() == editor, "partially visible detail remains mounted");
+        state.scrollRow = 12;
+        Paint(app, table);
+        Released(app, detail, editor, "scroll out");
+        Check(detail.parent == null && cancel.calls == 1, "scroll out retires exactly once");
+        state.scrollRow = 0;
+        Paint(app, table);
+        Check(table.IndexOf(detail) >= 0 && detail.parent == table, "scroll back reuses provider instance");
+        Arm(app, editor);
+        DataTable.CollapseRow(state, 0);
+        Paint(app, table);
+        Released(app, detail, editor, "collapse");
+        Check(detail.parent == null && cancel.calls == 2, "collapse retires exactly once");
+
+        DataTable.ExpandRow(state, table.source, 0);
+        Paint(app, table);
+        Arm(app, editor);
+        cancel.action = 1;
+        DataTable.CollapseRow(state, 0);
+        Paint(app, table);
+        Check(table.IndexOf(detail) >= 0 && detail.parent == table
+        && renewed.IsFocused(app) && app.GetCapturedPointer() == renewed && cancel.calls == 3,
+        "cancel repaint supersedes stale collapse removal");
+
+        cancel.failure = new Exception("nested detail cancel sentinel");
+        cancel.action = 3;
+        DataTable.CollapseRow(state, 0);
+        bool caught = false;
+        try { Paint(app, table); }
+        catch (Exception ex) { Check(ex == cancel.failure, "cancel exception identity"); caught = true; }
+        Check(caught && detail.parent == table && table.IndexOf(detail) >= 0,
+        "throwing cancel aborts structural removal");
+        Paint(app, table);
+        Released(app, detail, renewed, "retry after throwing cancel");
+
+        DataTable.ExpandRow(state, table.source, 0);
+        Paint(app, table);
+        Arm(app, editor);
+        table.Bind(table.columns, new NestedTreeSource());
+        Released(app, detail, editor, "source replacement before paint");
+        Check(table.Children == children && children.Count == 0, "source replacement keeps children collection");
+        Paint(app, table);
+        Arm(app, editor);
+        table.Bind(table.columns, null);
+        Released(app, detail, editor, "null source binding");
+        Paint(app, table);
+        Check(children.Count == 0 && state.activeDetails.Count == 0, "null source has no visible subtree");
+        witness.table = table;
+        witness.state = state;
+        witness.detail = detail;
+        app.SetRootControl(null);
+    }
+
+    static void GridLifecycle(App app) {
         DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem>();
-        List<NestedTreeTestItem> items = new List<NestedTreeTestItem>();
-        items.Add(new NestedTreeTestItem("Item1", true));
-        items.Add(new NestedTreeTestItem("Item2", false));
-        grid.Bind(items);
-        grid.Col("Name", 120, u => u.name);
+        grid.Col("Name", 180, item => item.name);
+        List<NestedTreeTestItem> rows = Items("first");
+        grid.Bind(rows);
+        Configure(grid.st);
+        Panel detail = Panel.Column();
+        Input editor = new Input("Grid detail");
+        Input renewed = new Input("Renewed grid detail");
+        detail.Add(editor);
+        detail.Add(renewed);
+        grid.st.detail = new ControlDetailProvider((a, src, row) => detail, 4);
+        DataTable.ExpandRow(grid.st, grid.source, 0);
+        app.SetRootControl(grid);
+        grid.UseApp(app);
+        grid.Arrange(10, 10, 600, 320);
+        ControlChildren children = grid.Children;
+        Paint(app, grid);
+        NestedTreeCancel cancel = new NestedTreeCancel();
+        cancel.app = app;
+        cancel.grid = grid;
+        cancel.renewed = renewed;
+        editor.OnRouted(cancel.Handle);
+        Arm(app, editor);
+        grid.Bind(rows);
+        Paint(app, grid);
+        Check(grid.Children == children && grid.IndexOf(detail) >= 0 && detail.parent == grid
+        && cancel.calls == 0 && editor.IsFocused(app) && app.GetCapturedPointer() == editor,
+        "same grid binding preserves visible intersection and input");
+        grid.st.scrollRow = 12;
+        Paint(app, grid);
+        Released(app, detail, editor, "grid scroll out");
+        grid.st.scrollRow = 0;
+        Paint(app, grid);
+        Arm(app, editor);
+        DataTable.CollapseRow(grid.st, 0);
+        Paint(app, grid);
+        Released(app, detail, editor, "grid collapse");
+        DataTable.ExpandRow(grid.st, grid.source, 0);
+        Paint(app, grid);
+        Arm(app, editor);
+        grid.Bind(Items("second"));
+        Released(app, detail, editor, "grid source replacement before paint");
+        Paint(app, grid);
+        Arm(app, editor);
+        cancel.replacement = Items("newest");
+        cancel.action = 2;
+        grid.Bind(Items("superseded"));
+        Check(grid.data == cancel.replacement && grid.source.data == cancel.replacement
+        && grid.Children == children && grid.IndexOf(detail) >= 0 && detail.parent == grid
+        && renewed.IsFocused(app) && app.GetCapturedPointer() == renewed,
+        "cancel rebind keeps newest source and renewed visible subtree");
+        grid.Bind(null);
+        Released(app, detail, renewed, "grid null source");
+        Paint(app, grid);
+        Check(detail.parent == null, "empty grid retires detail subtree");
+        app.SetRootControl(null);
+    }
 
-        // 创建自定义真控件行明细
-        Panel detailPanel = Panel.Root("detail_panel");
-        Button detailBtn = new Button("Detail Action");
-        detailPanel.With(detailBtn);
+    static void Adoption(App app) {
+        Panel root = Panel.Row();
+        Panel oldParent = Panel.Column();
+        DataTableControl table = new DataTableControl(Columns(), new NestedTreeSource());
+        Configure(table.state);
+        root.Add(oldParent);
+        root.Add(table);
+        Panel detail = Panel.Column();
+        Input editor = new Input("Moved detail");
+        detail.Add(editor);
+        oldParent.Add(detail);
+        table.state.detail = new ControlDetailProvider((a, src, row) => detail, 4);
+        DataTable.ExpandRow(table.state, table.source, 0);
+        app.SetRootControl(root);
+        root.UseApp(app);
+        table.Arrange(10, 10, 600, 320);
+        oldParent.Add(detail);
+        Arm(app, editor);
+        Paint(app, table);
+        Check(oldParent.ChildCount() == 0 && table.IndexOf(detail) >= 0 && detail.parent == table
+        && editor.FindApp() == app && !editor.IsFocused(app) && app.GetCapturedPointer() == null,
+        "adoption removes old owner and retires its input");
+        table.state.detail = new ControlDetailProvider((a, src, row) => table, 4);
+        Paint(app, table);
+        Check(table.parent == root && table.IndexOf(table) < 0 && detail.parent == null,
+        "standard adoption rejects self without creating a visual-tree cycle");
+        DataTable.SetDetail(table.state, null);
+        app.SetRootControl(null);
+    }
 
-        grid.State().detail = new ControlDetailProvider((a, src, r) => detailPanel, 4);
-        grid.State().expandedRows.Add(0); // 展开第 0 行
+    static void WidgetColumns(App app) {
+        DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem>();
+        grid.WidgetCol("Active", 180, "switch", item => "true");
+        grid.Bind(Items("widgets"));
+        Configure(grid.st);
+        app.SetRootControl(grid);
+        grid.UseApp(app);
+        grid.Arrange(10, 10, 600, 320);
+        Paint(app, grid);
+        Check(grid.ChildCount() > 0, "component columns contribute retained children");
+        Control first = grid.ChildAt(0);
+        Check(first.parent == grid && first.FindApp() == app, "component column uses standard adoption");
+        first.Focus(app);
+        app.CapturePointer(first);
+        Paint(app, grid);
+        Check(grid.ChildAt(0) == first && first.IsFocused(app) && app.GetCapturedPointer() == first,
+        "component column intersection preserves its instance and input");
+        grid.st.scrollRow = 12;
+        Paint(app, grid);
+        Check(first.parent == null && first.FindApp() == null && !first.IsFocused(app)
+        && app.GetCapturedPointer() == null, "component column scroll out retires input");
+        grid.Bind(null);
+        Check(grid.ChildCount() == 0, "component column binding retires the visible set");
+        app.SetRootControl(null);
+        CellComp comp = CellComp.Find("switch");
+        if (comp != null) { comp.Reset(); }
+    }
 
-        // 布局 DataGrid
-        grid.Arrange(10, 10, 600, 400);
-        grid.OnPaint(app);
+    static void OwnerPaintAndClip(App app, Control table, DataTableState state, DataSource source) {
+        Configure(state);
+        NestedTreePaint detail = new NestedTreePaint();
+        state.detail = new ControlDetailProvider((a, src, row) => detail, 4);
+        DataTable.ExpandRow(state, source, 0);
+        app.SetRootControl(table);
+        table.UseApp(app);
+        table.Arrange(10, 10, 600, 180);
+        Paint(app, table);
+        Check(detail.paints == 1, "owner paints retained detail exactly once on its first frame");
+        Paint(app, table);
+        Check(detail.paints == 2, "owner paints retained detail once on subsequent frames");
+        state.scrollRow = 2;
+        Paint(app, table);
+        Check(detail.paints == 3 && detail.parent == table, "partial detail paints once and remains mounted");
+        int headerY = detail.by + state.rowH / 2;
+        int insideY = detail.by + state.rowH * 2;
+        int px = detail.bx + 8;
+        Check(detail.by < insideY && insideY < detail.by + detail.bh,
+        "partial detail fixture intersects viewport");
+        Check((app.canvas.GetPixel(px, insideY) & 0xFFFFFF) == 0xEA00D4,
+        "partial detail paints inside body clip");
+        Check((app.canvas.GetPixel(px, headerY) & 0xFFFFFF) != 0xEA00D4,
+        "partial detail ink cannot cover the header");
+        Check(table.HitTest(px, insideY, 0) == detail && table.HitTest(px, headerY, 0) == table,
+        "detail hit uses the same visible body clip as paint");
+        Check(table.HitTest(px, headerY, 1) == table,
+        "touch tolerance does not pierce the visible body clip");
+        app.SetRootControl(null);
+    }
 
-        // 验证 detailPanel 已被挂载到 grid 的视觉子树
-        if (grid.children == null || grid.children.Count == 0) {
-            Console.WriteLine("FAIL: children not populated");
-            return;
-        }
+    static void CallbackInvalidation(App app) {
+        DataTableControl table = new DataTableControl(Columns(), new NestedTreeSource());
+        Configure(table.state);
+        NestedTreeRebindProvider provider = new NestedTreeRebindProvider();
+        provider.table = table;
+        provider.next = new NestedTreeSource();
+        provider.stale = new NestedTreePaint();
+        table.state.detail = provider;
+        DataTable.ExpandRow(table.state, table.source, 0);
+        app.SetRootControl(table);
+        table.UseApp(app);
+        table.Arrange(10, 10, 600, 320);
+        PaintOnly(app, table);
+        Check(provider.calls == 1 && table.source == provider.next && provider.stale.paints == 0
+        && provider.stale.parent == null && table.ChildCount() == 0,
+        "detail provider rebind invalidates stale adoption and paint");
+        // A return through the cancelled detail must have popped its clip.
+        app.canvas.FillRect(1, 1, 2, 2, unchecked((int)0xFFEA00D4));
+        Check((app.canvas.GetPixel(1, 1) & 0xFFFFFF) == 0xEA00D4,
+        "superseded provider restores clip stack");
+        DataTable.SetDetail(table.state, null);
+        app.SetRootControl(null);
+    }
 
-        bool foundDetail = false;
-        for (int i = 0; i < grid.children.Count; i = i + 1) {
-            if (grid.children[i] == detailPanel) {
-                foundDetail = true;
-                break;
+    static void CellCallbackInvalidation(App app) {
+        DataTableControl table = new DataTableControl(Columns(), new NestedTreeSource());
+        Configure(table.state);
+        NestedTreeCellRebindProvider provider = new NestedTreeCellRebindProvider();
+        provider.table = table;
+        provider.next = new NestedTreeSource();
+        provider.stale = new NestedTreePaint();
+        table.state.cellWidgets = provider;
+        app.SetRootControl(table);
+        table.UseApp(app);
+        table.Arrange(10, 10, 600, 320);
+        PaintOnly(app, table);
+        Check(provider.calls == 1 && table.source == provider.next && provider.stale.paints == 0
+        && provider.stale.parent == null && table.ChildCount() == 0,
+        "cell provider rebind invalidates stale adoption and paint");
+        app.canvas.FillRect(1, 1, 2, 2, unchecked((int)0xFFEA00D4));
+        Check((app.canvas.GetPixel(1, 1) & 0xFFFFFF) == 0xEA00D4,
+        "superseded cell provider restores cell and band clips");
+        table.state.cellWidgets = null;
+        app.SetRootControl(null);
+    }
+
+    static void ComponentCallbackInvalidation(App app) {
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.WidgetCol("Callback", 180, "nested-tree-rebind"));
+        DataTableControl table = new DataTableControl(cols, new NestedTreeSource());
+        Configure(table.state);
+        NestedTreeRebindComp comp = new NestedTreeRebindComp();
+        comp.table = table;
+        comp.next = new NestedTreeSource();
+        NestedTreePaint stale = new NestedTreePaint();
+        comp.stale = stale;
+        CellComp.Register(comp);
+        app.SetRootControl(table);
+        table.UseApp(app);
+        table.Arrange(10, 10, 600, 320);
+        PaintOnly(app, table);
+        Check(comp.fills == 1 && table.source == comp.next && stale.paints == 0
+        && stale.parent == null && table.ChildCount() == 0,
+        "component fill rebind invalidates stale adoption and paint");
+        app.SetRootControl(null);
+        comp.Reset();
+    }
+
+    static void CustomPainterCompatibility(App app, int mode) {
+        List<DataColumn> columns = new List<DataColumn>();
+        columns.Add(DataColumn.WidgetCol("Custom", 180, "nested-tree-custom"));
+        DataTableControl table = new DataTableControl(columns, new NestedTreeSource());
+        Configure(table.state);
+        NestedTreeCustomComp comp = new NestedTreeCustomComp();
+        CellComp.Register(comp);
+        NestedTreeCustomRenderer renderer = new NestedTreeCustomRenderer();
+        NestedTreeCustomStyler styler = new NestedTreeCustomStyler();
+        renderer.covered = true; styler.covered = true;
+        if (mode == 0) { columns[0].renderer = renderer; }
+        else if (mode == 1) { table.state.cellRenderer = renderer; }
+        else { table.state.styler = styler; }
+        app.SetRootControl(table); table.UseApp(app);
+        table.Arrange(10, 10, 600, 320);
+        int px = 10 + app.Scale(46) + app.Scale(40) + 8;
+        int py = 10 + app.theme.heightMedium + 8;
+        app.ProcessOffscreenInput(2, px, py, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, px, py, 0, 0, 0, 0);
+        Check(comp.acquisitions == 0 && renderer.paints == 0 && styler.paints == 0
+        && comp.editor.parent == null && !comp.editor.IsFocused(app),
+        "custom cell preparation neither paints nor creates an invisible default editor");
+        PaintOnly(app, table);
+        Check(comp.editor.parent == null && comp.acquisitions == 0,
+        "owning custom painter suppresses the default component input tree");
+        renderer.covered = false; styler.covered = false;
+        table.Arrange(10, 10, 600, 320);
+        PaintOnly(app, table);
+        Check(comp.editor.parent == table && table.IndexOf(comp.editor) >= 0,
+        "custom painter ownership change prepares the default fallback before paint");
+        int centeredY = comp.editor.by;
+        Check(comp.editor.StyleHeight() < table.state.rowH && centeredY > 10 + app.theme.heightMedium,
+        "compatibility geometry fixture has a naturally short centered editor");
+        Arm(app, comp.editor);
+        table.Arrange(10, 10, 600, 320);
+        Check(comp.editor.by == centeredY, "compatibility preparation preserves the shared vertical centering");
+        Check(comp.editor.IsFocused(app) && app.GetCapturedPointer() == comp.editor,
+        "visible compatibility intersection retains focus and capture during preparation");
+        renderer.covered = true; styler.covered = true;
+        table.Arrange(10, 10, 600, 320);
+        Released(app, comp.editor, comp.editor, "custom fallback replaced by owning painter before paint");
+        PaintOnly(app, table);
+        Check(comp.editor.parent == null, "prepared custom coverage retires the previous fallback");
+        app.ProcessOffscreenInput(2, px, py, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, px, py, 0, 0, 0, 0);
+        Check(!comp.editor.IsFocused(app), "covered custom cell cannot reactivate the invisible editor");
+        renderer.covered = false; styler.covered = false;
+        table.Arrange(10, 10, 600, 320);
+        PaintOnly(app, table);
+        Arm(app, comp.editor);
+        table.state.scrollRow = 12;
+        table.Arrange(10, 10, 600, 320);
+        Released(app, comp.editor, comp.editor, "compatibility fallback scrolled out before paint");
+        table.state.scrollRow = 0;
+        table.Arrange(10, 10, 600, 320);
+        PaintOnly(app, table);
+        Arm(app, comp.editor);
+        table.state.colHidden[0] = true;
+        DataTable.InvalidateView(table.state);
+        table.Arrange(10, 10, 600, 320);
+        Released(app, comp.editor, comp.editor, "compatibility fallback hidden before paint");
+        if (mode < 2) {
+            table.state.colHidden[0] = false;
+            DataTable.InvalidateView(table.state);
+            table.Arrange(10, 10, 600, 320);
+            if (mode == 0) {
+                PaintOnly(app, table);
+                Arm(app, comp.editor);
+                renderer.covered = true;
+                table.Arrange(10, 10, 600, 320);
+                Released(app, comp.editor, comp.editor, "owning painter retires fallback before its paint can throw");
+                renderer.failure = new Exception("custom painter sentinel");
+                bool caught = false;
+                try { PaintOnly(app, table); }
+                catch (Exception failure) {
+                    Check(failure == renderer.failure, "custom paint preserves original exception identity");
+                    caught = true;
+                }
+                Check(caught, "custom painter exception propagates");
+                Released(app, comp.editor, comp.editor, "throwing custom painter retires input");
+                Check(comp.editor.parent == null, "throwing custom painter cannot restore fallback input");
+                renderer.failure = null;
             }
+            renderer.covered = true;
+            table.Arrange(10, 10, 600, 320);
+            DataSource replacement = new NestedTreeSource();
+            renderer.table = table; renderer.replacement = replacement;
+            PaintOnly(app, table);
+            Check(table.source == replacement && comp.editor.parent == null
+            && !comp.editor.IsFocused(app) && app.GetCapturedPointer() == null,
+            "custom painter Bind invalidates the stale fallback tail");
         }
-        if (!foundDetail) {
-            Console.WriteLine("FAIL: detailPanel not found in grid.children");
-            return;
+        app.SetRootControl(null);
+        comp.Reset();
+    }
+
+    static void InputPreparation(App app) {
+        DataTableControl table = new DataTableControl(Columns(), new NestedTreeSource());
+        Configure(table.state);
+        Panel detail = Panel.Column();
+        Input editor = new Input("Before paint");
+        detail.Add(editor);
+        table.state.detail = new ControlDetailProvider((a, src, row) => detail, 4);
+        DataTable.ExpandRow(table.state, table.source, 0);
+        app.SetRootControl(table);
+        table.UseApp(app);
+        NestedTreeView owner = new NestedTreeView();
+        owner.x = 10; owner.y = 10; owner.width = 600; owner.height = 320;
+        UiViewScope view = new UiViewScope(app, owner, table);
+        // The first event itself drives UiViewScope.Layout, without any paint.
+        int px = 24;
+        int py = 10 + app.theme.heightMedium + table.state.rowH + 8;
+        app.ProcessOffscreenInput(2, px, py, 0, 0, 0, 0);
+        Check(app.pointerDownTarget == editor && editor.IsFocused(app) && detail.parent == table,
+        "first real input prepares and focuses detail before paint");
+        app.ProcessOffscreenInput(3, px, py, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Check(editor.GetText().Contains("A"), "first detail receives text before paint");
+        string before = editor.GetText();
+        DataTable.CollapseRow(table.state, 0);
+        Check(!editor.InputFocusEligible(app, app.rootControl), "invalidation gates old focus before preparation");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 66, 0, 0);
+        Check(editor.GetText() == before && detail.parent == null && !editor.IsFocused(app),
+        "collapse followed immediately by text retires old editor");
+        DataTable.ExpandRow(table.state, table.source, 0);
+        app.ProcessOffscreenInput(2, px, py, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, px, py, 0, 0, 0, 0);
+        Check(editor.IsFocused(app), "reexpand restores the retained provider instance before input");
+        before = editor.GetText();
+        table.state.scrollRow = 12;
+        app.ProcessOffscreenInput(6, 0, 0, 0, 67, 0, 0);
+        Check(editor.GetText() == before && detail.parent == null && !editor.IsFocused(app),
+        "scroll then text uses the next prepared visible set");
+        table.state.scrollRow = 0;
+        owner.x = 70; owner.y = 30;
+        app.ProcessOffscreenInput(2, 84, py + 20, 0, 0, 0, 0);
+        Check(app.pointerDownTarget == editor && table.bx == 70 && table.by == 30,
+        "region move is visible to the next input before paint");
+        app.ProcessOffscreenInput(3, 84, py + 20, 0, 0, 0, 0);
+        view.Retire();
+        app.SetRootControl(null);
+
+        table = new DataTableControl(Columns(), new NestedTreeSource());
+        Configure(table.state);
+        NestedTreeCellProvider provider = new NestedTreeCellProvider();
+        provider.editor = new Input("Cell");
+        table.columns[0].widgetProvider = provider;
+        app.SetRootControl(table);
+        table.UseApp(app);
+        owner.x = 10; owner.y = 10;
+        view = new UiViewScope(app, owner, table);
+        px = 10 + app.Scale(46) + app.Scale(40) + 8;
+        py = 10 + app.theme.heightMedium + 8;
+        app.ProcessOffscreenInput(2, px, py, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, px, py, 0, 0, 0, 0);
+        Check(provider.editor.IsFocused(app), "cell widget participates in first input preparation");
+        int calls = provider.calls;
+        PaintOnly(app, table);
+        PaintOnly(app, table);
+        Check(provider.calls == calls, "repeated paint does not invoke providers or rebuild the input tree");
+        before = provider.editor.GetText();
+        table.columns.Clear();
+        app.ProcessOffscreenInput(6, 0, 0, 0, 68, 0, 0);
+        Check(provider.editor.parent == null && provider.editor.GetText() == before && !provider.editor.IsFocused(app),
+        "in-place schema removal retires focused widget before the next input");
+        view.Retire();
+        app.SetRootControl(null);
+    }
+
+    static Control FooterChip(DataTableControl table, string text) {
+        string label = DataTable.T("Remove filter", "移除筛选") + ": " + text;
+        for (int i = 0; i < table.ChildCount(); i = i + 1) {
+            Control child = table.ChildAt(i);
+            if (child.a11yLabel == label) { return child; }
         }
+        throw new Exception("prepared footer filter chip: " + text);
+    }
 
-        // 验证 parent 拓扑引用链路
-        if (detailPanel.Parent() != grid) {
-            Console.WriteLine("FAIL: detailPanel.parent != grid");
-            return;
-        }
+    static void ClickControl(App app, Control control) {
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        Check(app.rootControl.HitTest(x, y) == control, "prepared chrome owns the real hit");
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
 
-        // 2. 验证 Visual Tree 空间命中测试穿透
-        int targetX = detailBtn.bx + 2;
-        int targetY = detailBtn.by + 2;
-        Control hit = grid.HitTest(targetX, targetY);
-        if (hit != detailBtn) {
-            Console.WriteLine("FAIL: HitTest did not reach detailBtn");
-            return;
-        }
+    static void RetainedChrome(App app) {
+        List<DataColumn> columns = Columns();
+        columns[0].field = "name";
+        columns.Add(DataColumn.Field(new DataColumn("Other", 180), "other"));
+        DataTableControl table = new DataTableControl(columns, new NestedTreeSource());
+        Configure(table.state);
+        table.state.showStatusBar = true;
+        table.state.showFilterRow = true;
+        table.UseApp(app);
+        app.SetRootControl(table);
+        table.Arrange(10, 10, 760, 400);
+        NestedTreeChromeEvents events = new NestedTreeChromeEvents();
+        events.table = table;
+        table.state.FilterChanged.Add(events.FilterChanged);
+        table.state.SelectionChanged.Add(events.SelectionChanged);
+        table.state.ColumnReorder.Add(events.ColumnReordered);
+        // The first projected chip belongs to column 1, not projection index 0.
+        table.state.filters[1].textQuery = "Row";
+        table.state.filterRowText[0] = "Row";
+        FilterGroup tree = FilterGroup.And();
+        tree.Conditions().Add(FilterCondition.Contains("name", "Row"));
+        DataTable.SetFilterTree(table.state, tree);
+        table.Arrange(10, 10, 760, 400);
+        Control column = FooterChip(table, "Other: " + DataTable.T("contains", "contains") + " Row");
+        PaintOnly(app, table); PaintOnly(app, table);
+        Check(table.state.filters[1].Active() && events.filters == 0,
+        "repeated footer paint does not remove filters");
+        ClickControl(app, column);
+        Check(!table.state.filters[1].Active() && table.state.filterRowText[0] == "Row"
+        && table.state.filterTree == tree && events.filters == 1,
+        "footer column chip removes its actual projected column before paint");
+        table.Arrange(10, 10, 760, 400);
+        Check(column.parent == null, "removed footer chip retires from the tree");
+        ClickControl(app, FooterChip(table, "Name " + DataTable.T("contains", "contains") + " Row"));
+        Check(table.state.filterRowText[0] == "" && table.state.filterTree == tree && events.filters == 2,
+        "footer filter-row chip removes only its text");
+        table.Arrange(10, 10, 760, 400);
+        ClickControl(app, FooterChip(table, DataTable.DescribeFilterTree(table.state, 120)));
+        Check(table.state.filterTree == null && events.filters == 3,
+        "footer tree chip removes its tree before paint");
+        table.Arrange(10, 10, 760, 400);
+        table.state.rangeR0 = 1; table.state.rangeR1 = 2;
+        table.state.rangeC0 = 0; table.state.rangeC1 = 1;
+        int x = 10 + app.Scale(46) + app.Scale(40) + 50;
+        int y = 10 + app.theme.heightMedium * 2 + 12;
+        Check(table.HitTest(x, y) == table, "body wheel fixture hits table content");
+        app.ProcessOffscreenInput(13, x, y, 0, -120, Modifiers.Ctrl(), 0);
+        Check(table.state.rangeR1 == 3 && table.state.rangeC1 == 0 && events.selections == 2,
+        "Ctrl wheel extends range and notifies before paint: row=" + Convert.ToString(table.state.rangeR1)
+        + " col=" + Convert.ToString(table.state.rangeC1) + " notifications=" + Convert.ToString(events.selections));
+        app.ProcessOffscreenInput(13, x, y, 0, 120, Modifiers.Ctrl(), 0);
+        Check(table.state.rangeR1 == 2 && events.selections == 4, "Ctrl wheel shrinks range and mirrors row selection");
+        table.Arrange(10, 10, 760, 400);
+        int gripX = 10 + app.Scale(46) + app.Scale(40) + 3;
+        int gripY = 10 + app.theme.heightMedium / 2;
+        app.ProcessOffscreenInput(2, gripX, gripY, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() != null, "column grip captures its retained endpoint");
+        app.ProcessOffscreenInput(1, gripX + 400, gripY, 0, 0, 0, 0);
+        events.rebind = true;
+        app.ProcessOffscreenInput(3, gripX + 400, gripY, 0, 0, 0, 0);
+        Check(events.reorders == 1 && table.state.colOrder[0] == 1 && table.state.hitCol == 0
+        && table.state.dragCol == -1 && app.GetCapturedPointer() == null,
+        "column reorder notifies once and retires capture before reentrant Bind");
+        table.Arrange(10, 10, 760, 400);
+        app.ProcessOffscreenInput(2, gripX, gripY, 0, 0, 0, 0);
+        Check(table.state.dragCol >= 0 && app.GetCapturedPointer() != null,
+        "renewed column drag owns capture");
+        DataTable.InvalidateView(table.state);
+        app.CancelInputSubtree(table);
+        Check(table.state.dragCol == -1 && app.GetCapturedPointer() == null,
+        "cancel clears column gesture even after its prepared context expires");
+        app.SetRootControl(null);
+    }
 
-        // 3. 验证事件双向路由分发（从子控件向父网格冒泡）
-        bool btnClicked = false;
-        bool gridSawBubble = false;
-
-        detailBtn.OnRouted((Control sender, RoutedEventArgs e) => {
-            if (e.eventName == "click") {
-                btnClicked = true;
-            }
-        });
-
-        grid.OnRouted((Control sender, RoutedEventArgs e) => {
-            if (e.eventName == "click") {
-                gridSawBubble = true;
-            }
-        });
-
-        RoutedEventArgs evt = new RoutedEventArgs("click", hit);
-        evt.x = targetX;
-        evt.y = targetY;
-
-        Control.RouteEvent(hit, evt);
-
-        if (!btnClicked) {
-            Console.WriteLine("FAIL: detailBtn did not receive click");
-            return;
-        }
-        if (!gridSawBubble) {
-            Console.WriteLine("FAIL: grid did not see bubbling click from detailBtn");
-            return;
-        }
-
+    public static void Main() {
+        App app = App.CreateOffscreen("Nested table tree", 800, 480);
+        RetainedChrome(app);
+        InputPreparation(app);
+        for (int mode = 0; mode < 3; mode = mode + 1) { CustomPainterCompatibility(app, mode); }
+        NestedTreeWitness witness = new NestedTreeWitness();
+        TableLifecycle(app, witness);
+        Check(witness.table == null && witness.state == null && witness.detail == null,
+        "table, state and detail have no owner reference cycle");
+        GridLifecycle(app);
+        Adoption(app);
+        WidgetColumns(app);
+        DataTableControl table = new DataTableControl(Columns(), new NestedTreeSource());
+        OwnerPaintAndClip(app, table, table.state, table.source);
+        DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem>();
+        grid.Col("Name", 180, item => item.name);
+        grid.Bind(Items("paint"));
+        OwnerPaintAndClip(app, grid, grid.st, grid.source);
+        CallbackInvalidation(app);
+        CellCallbackInvalidation(app);
+        ComponentCallbackInvalidation(app);
+        app.canvas.Destroy();
         Console.WriteLine("ALL NESTED VISUAL TREE TESTS PASSED.");
     }
 }

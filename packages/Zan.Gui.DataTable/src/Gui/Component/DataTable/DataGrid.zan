@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using System.Json;
 using Gui;
@@ -30,6 +31,7 @@ public class DataGrid<T> : Control {
     // 设计稿契约类型名（如 ContractRow / User），供设计器属性协议与运行时投影识别。
     public string of;
     public bool defaultFactory;
+    private DataTableVisualTree visualTree;
 
     public void InitGrid() {
         this.InitControl("datatable", 5);
@@ -56,6 +58,58 @@ public class DataGrid<T> : Control {
 
     public override string StyleType() { return "datatable"; }
 
+    public override bool ChildControlsRenderedByOwner() { return true; }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        this.bx = x; this.by = y; this.bw = w > 0 ? w : 0; this.bh = h > 0 ? h : 0;
+        this.SyncDescs();
+        if (this.visualTree == null) { this.visualTree = new DataTableVisualTree(this); }
+        this.visualTree.Prepare(this.App, this.descs, this.source, this.st);
+    }
+
+    public override bool AcceptsRetainedLongPress() { return true; }
+    public override int InputFocusCapabilities() { return 3; }
+
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName != "PointerCancel") { this.PrepareInputTree(); }
+        if (this.visualTree != null) { this.visualTree.RouteBody(e); }
+        if (!e.handled) { base.OnRoutedEvent(e); }
+    }
+
+    public override void OnPreviewRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName == "PointerCancel") { base.OnPreviewRoutedEvent(e); return; }
+        this.PrepareInputTree();
+        if (this.visualTree != null && this.visualTree.RouteMenuEvent(e)) { return; }
+        base.OnPreviewRoutedEvent(e);
+    }
+
+    public override bool ChildInViewport(Control child) {
+        return this.visualTree != null && this.visualTree.ContainsPrepared(this.st, child);
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        this.PrepareInputTree();
+        Control hit = base.HitTestCore(x, y, pointerType, excludedSubtrees);
+        return this.visualTree != null ? this.visualTree.ClipHit(hit, x, y) : hit;
+    }
+
+    private void PrepareInputTree() {
+        this.SyncDescs();
+        if (this.visualTree == null || this.visualTree.NeedsPrepare(this.descs, this.source, this.st)) {
+            this.Arrange(this.bx, this.by, this.bw, this.bh);
+        }
+    }
+
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        this.PrepareInputTree();
+        base.CollectInputFocus(app, controls);
+    }
+
+    public override Control FindInputFocus(App app) {
+        this.PrepareInputTree();
+        return base.FindInputFocus(app);
+    }
+
     // ---- 数据 ---------------------------------------------------------------
 
     // 绑定调用方的列表。不复制——网格每帧读取，
@@ -63,6 +117,7 @@ public class DataGrid<T> : Control {
     public DataGrid<T> Bind(List<T> src) {
         int n = 0;
         if (src != null) { n = src.Count; }
+        bool changed = this.data != src;
         // 换了列表、或者行数变了：引擎里的行号集合（st.order）还是上一份数据
         // 的，不重算就会拿越界行号去取单元格。
         if (this.data != src || n != this.boundN) {
@@ -86,6 +141,8 @@ public class DataGrid<T> : Control {
                 return null;
             };
         }
+        // Cancellation observes the committed binding and may supersede it.
+        if (changed && this.visualTree != null) { this.visualTree.Retire(this.st); }
         return this;
     }
 
@@ -121,6 +178,7 @@ public class DataGrid<T> : Control {
 
     public GridColumn<T> Add(GridColumn<T> col) {
         this.gcols.Add(col);
+        DataTable.InvalidateView(this.st);
         return col;
     }
 
@@ -371,7 +429,6 @@ public class DataGrid<T> : Control {
         return DataTable.LoadLayoutToken(this.st, this.descs, token);
     }
 
-
     // 根据当前列刷新引擎的描述符列表。描述符
     // 按引用共享，配置器的原地修改
     // 立即可见；此处仅在新增列时重新同步列表长度，
@@ -392,17 +449,13 @@ public class DataGrid<T> : Control {
     }
 
     public override void OnPaint(App app) {
-        this.SyncDescs();
-        this.children = new List<Control>();
-        this.st.activeDetails = this.children;
-        this.st.ownerControl = this;
-        DataTable.RenderSource(app, bx, by, bw, bh, this.descs, this.source, this.st);
+        if (this.visualTree != null) { this.visualTree.Render(app, this.descs, this.source, this.st); }
     }
 
     // 声明式契约：外观开关全部落在引擎 state 上，没有对应的
     // 控件字段，因此按 GetExtra/SetExtra 挂钩发布（规格不绑定
     // 字段，读写经由下面两个覆盖走到 st）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec rn = PropSpec.Bool("rowNumbers", "Row numbers");
         rn.WithTip("Show the row number gutter.");
@@ -571,134 +624,134 @@ public class DataGrid<T> : Control {
         }
         if (key == "columns") {
             if (val.Length > 0 && val[0] == 91) { // '['
-                this.SetColumnsJson(val);
-                return true;
-            }
-            return false;
+            this.SetColumnsJson(val);
+            return true;
         }
-        if (key == "previewColumns") { this.SetPreviewColumns(val); return true; }
-        if (key == "rowNumbers") { this.st.showRowNum = PropSpec.IsOn(val); return true; }
-        if (key == "selectable") { this.st.showSelect = PropSpec.IsOn(val); return true; }
-        if (key == "striped") { this.st.striped = PropSpec.IsOn(val); return true; }
-        if (key == "rowHeight") { this.st.rowH = DataTable.ParseInt(val); return true; }
-        if (key == "rowReorder") { this.st.rowReorder = PropSpec.IsOn(val); return true; }
-        if (key == "summary") { this.st.showSummary = PropSpec.IsOn(val); return true; }
-        if (key == "filterRow") { this.st.showFilterRow = PropSpec.IsOn(val); return true; }
-        if (key == "statusBar") { this.st.showStatusBar = PropSpec.IsOn(val); return true; }
-        if (key == "groupPanel") { this.st.showGroupPanel = PropSpec.IsOn(val); return true; }
-        if (key == "allowAddRow") { this.st.allowAddRow = PropSpec.IsOn(val); return true; }
         return false;
     }
+    if (key == "previewColumns") { this.SetPreviewColumns(val); return true; }
+    if (key == "rowNumbers") { this.st.showRowNum = PropSpec.IsOn(val); return true; }
+    if (key == "selectable") { this.st.showSelect = PropSpec.IsOn(val); return true; }
+    if (key == "striped") { this.st.striped = PropSpec.IsOn(val); return true; }
+    if (key == "rowHeight") { this.st.rowH = DataTable.ParseInt(val); return true; }
+    if (key == "rowReorder") { this.st.rowReorder = PropSpec.IsOn(val); return true; }
+    if (key == "summary") { this.st.showSummary = PropSpec.IsOn(val); return true; }
+    if (key == "filterRow") { this.st.showFilterRow = PropSpec.IsOn(val); return true; }
+    if (key == "statusBar") { this.st.showStatusBar = PropSpec.IsOn(val); return true; }
+    if (key == "groupPanel") { this.st.showGroupPanel = PropSpec.IsOn(val); return true; }
+    if (key == "allowAddRow") { this.st.allowAddRow = PropSpec.IsOn(val); return true; }
+    return false;
+}
 
-    public override List<string> Events() {
-        List<string> e = Control.CommonEvents();
-        e.Add("RowClick");
-        e.Add("RowContext");
-        e.Add("RowRightClick");
-        e.Add("RowDoubleClick");
-        e.Add("CellClick");
-        e.Add("CellDoubleClick");
-        e.Add("CellDblClick");
-        e.Add("CellEdit");
-        e.Add("CellValidating");
-        e.Add("SelectionChanged");
-        e.Add("Sort");
-        e.Add("HeaderClick");
-        e.Add("ColumnClick");
-        e.Add("FilterChanged");
-        e.Add("ColumnResize");
-        e.Add("ColumnResizeEnd");
-        e.Add("ColumnReorder");
-        e.Add("GroupChanged");
-        e.Add("BandToggled");
-        e.Add("RowInserted");
-        e.Add("RowDeleted");
-        e.Add("ScrollChanged");
-        return e;
-    }
+public override List<string> Events() {
+    List<string> e = Control.CommonEvents();
+    e.Add("RowClick");
+    e.Add("RowContext");
+    e.Add("RowRightClick");
+    e.Add("RowDoubleClick");
+    e.Add("CellClick");
+    e.Add("CellDoubleClick");
+    e.Add("CellDblClick");
+    e.Add("CellEdit");
+    e.Add("CellValidating");
+    e.Add("SelectionChanged");
+    e.Add("Sort");
+    e.Add("HeaderClick");
+    e.Add("ColumnClick");
+    e.Add("FilterChanged");
+    e.Add("ColumnResize");
+    e.Add("ColumnResizeEnd");
+    e.Add("ColumnReorder");
+    e.Add("GroupChanged");
+    e.Add("BandToggled");
+    e.Add("RowInserted");
+    e.Add("RowDeleted");
+    e.Add("ScrollChanged");
+    return e;
+}
 
-    // 最近一次命中的数据字段名（CellClick/ColumnResize 等事件
-    // 的 HitCol 翻译成稳定 field 名；越界/未命名列返回 ""）。
-    // 声明式列级事件（columns[i].click）按它分派，
-    // 列重排不影响路由。
-    public string HitField() {
-        int i = this.st.HitCol();
-        if (i < 0 || i >= this.gcols.Count) { return ""; }
-        return this.gcols[i].desc.FieldName();
-    }
+// 最近一次命中的数据字段名（CellClick/ColumnResize 等事件
+// 的 HitCol 翻译成稳定 field 名；越界/未命名列返回 ""）。
+// 声明式列级事件（columns[i].click）按它分派，
+// 列重排不影响路由。
+public string HitField() {
+    int i = this.st.HitCol();
+    if (i < 0 || i >= this.gcols.Count) { return ""; }
+    return this.gcols[i].desc.FieldName();
+}
 
-    // 把网格的语义事件转发到引擎 state 自身的 UiEvent
-    // 字段（与链式 `OnRowClick`/… 订阅的队列相同），
-    // 使 JSON/设计器的 `onRowClick` 处理器生效；其余事件回退
-    // 到 `On` 上的通用事件集合。
-    public override void BindEvent(string evt, Action a) {
-        if (evt == "RowClick") { this.st.RowClick.Add(a); return; }
-        if (evt == "RowContext" || evt == "RowRightClick") { this.st.RowContext.Add(a); return; }
-        if (evt == "RowDoubleClick") { this.st.RowDoubleClick.Add(a); return; }
-        if (evt == "CellClick") { this.st.CellClick.Add(a); return; }
-        if (evt == "CellDoubleClick" || evt == "CellDblClick") { this.st.CellDoubleClick.Add(a); return; }
-        if (evt == "CellEdit") { this.st.CellEdit.Add(a); return; }
-        if (evt == "CellValidating") { this.st.CellValidating.Add(a); return; }
-        if (evt == "SelectionChanged") { this.st.SelectionChanged.Add(a); return; }
-        if (evt == "Sort") { this.st.Sort.Add(a); return; }
-        if (evt == "HeaderClick" || evt == "ColumnClick") { this.st.HeaderClick.Add(a); return; }
-        if (evt == "FilterChanged") { this.st.FilterChanged.Add(a); return; }
-        if (evt == "ColumnResize") { this.st.ColumnResize.Add(a); return; }
-        if (evt == "ColumnResizeEnd") { this.st.ColumnResizeEnd.Add(a); return; }
-        if (evt == "ColumnReorder") { this.st.ColumnReorder.Add(a); return; }
-        if (evt == "GroupChanged") { this.st.GroupChanged.Add(a); return; }
-        if (evt == "BandToggled") { this.st.BandToggled.Add(a); return; }
-        if (evt == "RowInserted") { this.st.RowInserted.Add(a); return; }
-        if (evt == "RowDeleted") { this.st.RowDeleted.Add(a); return; }
-        if (evt == "ScrollChanged") { this.st.ScrollChanged.Add(a); return; }
-        On.AddByName(evt, a);
-    }
+// 把网格的语义事件转发到引擎 state 自身的 UiEvent
+// 字段（与链式 `OnRowClick`/… 订阅的队列相同），
+// 使 JSON/设计器的 `onRowClick` 处理器生效；其余事件回退
+// 到 `On` 上的通用事件集合。
+public override void BindEvent(string evt, Action a) {
+    if (evt == "RowClick") { this.st.RowClick.Add(a); return; }
+    if (evt == "RowContext" || evt == "RowRightClick") { this.st.RowContext.Add(a); return; }
+    if (evt == "RowDoubleClick") { this.st.RowDoubleClick.Add(a); return; }
+    if (evt == "CellClick") { this.st.CellClick.Add(a); return; }
+    if (evt == "CellDoubleClick" || evt == "CellDblClick") { this.st.CellDoubleClick.Add(a); return; }
+    if (evt == "CellEdit") { this.st.CellEdit.Add(a); return; }
+    if (evt == "CellValidating") { this.st.CellValidating.Add(a); return; }
+    if (evt == "SelectionChanged") { this.st.SelectionChanged.Add(a); return; }
+    if (evt == "Sort") { this.st.Sort.Add(a); return; }
+    if (evt == "HeaderClick" || evt == "ColumnClick") { this.st.HeaderClick.Add(a); return; }
+    if (evt == "FilterChanged") { this.st.FilterChanged.Add(a); return; }
+    if (evt == "ColumnResize") { this.st.ColumnResize.Add(a); return; }
+    if (evt == "ColumnResizeEnd") { this.st.ColumnResizeEnd.Add(a); return; }
+    if (evt == "ColumnReorder") { this.st.ColumnReorder.Add(a); return; }
+    if (evt == "GroupChanged") { this.st.GroupChanged.Add(a); return; }
+    if (evt == "BandToggled") { this.st.BandToggled.Add(a); return; }
+    if (evt == "RowInserted") { this.st.RowInserted.Add(a); return; }
+    if (evt == "RowDeleted") { this.st.RowDeleted.Add(a); return; }
+    if (evt == "ScrollChanged") { this.st.ScrollChanged.Add(a); return; }
+    base.BindEvent(evt, a);
+}
 
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 表格专属事件将自身（Control 句柄）封包给带参回调；通用事件按名路由。
-    public override void BindEventS(string evt, ControlEvent a) {
-        if (evt == "RowClick") { this.st.RowClick.Add(() => a(this)); return; }
-        if (evt == "RowContext" || evt == "RowRightClick") { this.st.RowContext.Add(() => a(this)); return; }
-        if (evt == "RowDoubleClick") { this.st.RowDoubleClick.Add(() => a(this)); return; }
-        if (evt == "CellClick") { this.st.CellClick.Add(() => a(this)); return; }
-        if (evt == "CellDoubleClick" || evt == "CellDblClick") { this.st.CellDoubleClick.Add(() => a(this)); return; }
-        if (evt == "CellEdit") { this.st.CellEdit.Add(() => a(this)); return; }
-        if (evt == "CellValidating") { this.st.CellValidating.Add(() => a(this)); return; }
-        if (evt == "SelectionChanged") { this.st.SelectionChanged.Add(() => a(this)); return; }
-        if (evt == "Sort") { this.st.Sort.Add(() => a(this)); return; }
-        if (evt == "HeaderClick" || evt == "ColumnClick") { this.st.HeaderClick.Add(() => a(this)); return; }
-        if (evt == "FilterChanged") { this.st.FilterChanged.Add(() => a(this)); return; }
-        if (evt == "ColumnResize") { this.st.ColumnResize.Add(() => a(this)); return; }
-        if (evt == "ColumnResizeEnd") { this.st.ColumnResizeEnd.Add(() => a(this)); return; }
-        if (evt == "ColumnReorder") { this.st.ColumnReorder.Add(() => a(this)); return; }
-        if (evt == "GroupChanged") { this.st.GroupChanged.Add(() => a(this)); return; }
-        if (evt == "BandToggled") { this.st.BandToggled.Add(() => a(this)); return; }
-        if (evt == "RowInserted") { this.st.RowInserted.Add(() => a(this)); return; }
-        if (evt == "RowDeleted") { this.st.RowDeleted.Add(() => a(this)); return; }
-        if (evt == "ScrollChanged") { this.st.ScrollChanged.Add(() => a(this)); return; }
-        On.AddByNameS(evt, a);
-    }
+// <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
+// 表格专属事件将自身（Control 句柄）封包给带参回调；通用事件按名路由。
+public override void BindEventS(string evt, ControlEvent a) {
+    if (evt == "RowClick") { this.st.RowClick.Add(() => a(this)); return; }
+    if (evt == "RowContext" || evt == "RowRightClick") { this.st.RowContext.Add(() => a(this)); return; }
+    if (evt == "RowDoubleClick") { this.st.RowDoubleClick.Add(() => a(this)); return; }
+    if (evt == "CellClick") { this.st.CellClick.Add(() => a(this)); return; }
+    if (evt == "CellDoubleClick" || evt == "CellDblClick") { this.st.CellDoubleClick.Add(() => a(this)); return; }
+    if (evt == "CellEdit") { this.st.CellEdit.Add(() => a(this)); return; }
+    if (evt == "CellValidating") { this.st.CellValidating.Add(() => a(this)); return; }
+    if (evt == "SelectionChanged") { this.st.SelectionChanged.Add(() => a(this)); return; }
+    if (evt == "Sort") { this.st.Sort.Add(() => a(this)); return; }
+    if (evt == "HeaderClick" || evt == "ColumnClick") { this.st.HeaderClick.Add(() => a(this)); return; }
+    if (evt == "FilterChanged") { this.st.FilterChanged.Add(() => a(this)); return; }
+    if (evt == "ColumnResize") { this.st.ColumnResize.Add(() => a(this)); return; }
+    if (evt == "ColumnResizeEnd") { this.st.ColumnResizeEnd.Add(() => a(this)); return; }
+    if (evt == "ColumnReorder") { this.st.ColumnReorder.Add(() => a(this)); return; }
+    if (evt == "GroupChanged") { this.st.GroupChanged.Add(() => a(this)); return; }
+    if (evt == "BandToggled") { this.st.BandToggled.Add(() => a(this)); return; }
+    if (evt == "RowInserted") { this.st.RowInserted.Add(() => a(this)); return; }
+    if (evt == "RowDeleted") { this.st.RowDeleted.Add(() => a(this)); return; }
+    if (evt == "ScrollChanged") { this.st.ScrollChanged.Add(() => a(this)); return; }
+    base.BindEventS(evt, a);
+}
 
-    public override void TriggerEvent(string evt) {
-        if (evt == "RowClick") { this.st.RowClick.Raise(); return; }
-        if (evt == "RowContext" || evt == "RowRightClick") { this.st.RowContext.Raise(); return; }
-        if (evt == "RowDoubleClick") { this.st.RowDoubleClick.Raise(); return; }
-        if (evt == "CellClick") { this.st.CellClick.Raise(); return; }
-        if (evt == "CellDoubleClick" || evt == "CellDblClick") { this.st.CellDoubleClick.Raise(); return; }
-        if (evt == "CellEdit") { this.st.CellEdit.Raise(); return; }
-        if (evt == "CellValidating") { this.st.CellValidating.Raise(); return; }
-        if (evt == "SelectionChanged") { this.st.SelectionChanged.Raise(); return; }
-        if (evt == "Sort") { this.st.Sort.Raise(); return; }
-        if (evt == "HeaderClick" || evt == "ColumnClick") { this.st.HeaderClick.Raise(); return; }
-        if (evt == "FilterChanged") { this.st.FilterChanged.Raise(); return; }
-        if (evt == "ColumnResize") { this.st.ColumnResize.Raise(); return; }
-        if (evt == "ColumnResizeEnd") { this.st.ColumnResizeEnd.Raise(); return; }
-        if (evt == "ColumnReorder") { this.st.ColumnReorder.Raise(); return; }
-        if (evt == "GroupChanged") { this.st.GroupChanged.Raise(); return; }
-        if (evt == "BandToggled") { this.st.BandToggled.Raise(); return; }
-        if (evt == "RowInserted") { this.st.RowInserted.Raise(); return; }
-        if (evt == "RowDeleted") { this.st.RowDeleted.Raise(); return; }
-        if (evt == "ScrollChanged") { this.st.ScrollChanged.Raise(); return; }
-        base.TriggerEvent(evt);
-    }
+public override void TriggerEvent(string evt) {
+    if (evt == "RowClick") { this.st.RowClick.Raise(); return; }
+    if (evt == "RowContext" || evt == "RowRightClick") { this.st.RowContext.Raise(); return; }
+    if (evt == "RowDoubleClick") { this.st.RowDoubleClick.Raise(); return; }
+    if (evt == "CellClick") { this.st.CellClick.Raise(); return; }
+    if (evt == "CellDoubleClick" || evt == "CellDblClick") { this.st.CellDoubleClick.Raise(); return; }
+    if (evt == "CellEdit") { this.st.CellEdit.Raise(); return; }
+    if (evt == "CellValidating") { this.st.CellValidating.Raise(); return; }
+    if (evt == "SelectionChanged") { this.st.SelectionChanged.Raise(); return; }
+    if (evt == "Sort") { this.st.Sort.Raise(); return; }
+    if (evt == "HeaderClick" || evt == "ColumnClick") { this.st.HeaderClick.Raise(); return; }
+    if (evt == "FilterChanged") { this.st.FilterChanged.Raise(); return; }
+    if (evt == "ColumnResize") { this.st.ColumnResize.Raise(); return; }
+    if (evt == "ColumnResizeEnd") { this.st.ColumnResizeEnd.Raise(); return; }
+    if (evt == "ColumnReorder") { this.st.ColumnReorder.Raise(); return; }
+    if (evt == "GroupChanged") { this.st.GroupChanged.Raise(); return; }
+    if (evt == "BandToggled") { this.st.BandToggled.Raise(); return; }
+    if (evt == "RowInserted") { this.st.RowInserted.Raise(); return; }
+    if (evt == "RowDeleted") { this.st.RowDeleted.Raise(); return; }
+    if (evt == "ScrollChanged") { this.st.ScrollChanged.Raise(); return; }
+    base.TriggerEvent(evt);
+}
 }

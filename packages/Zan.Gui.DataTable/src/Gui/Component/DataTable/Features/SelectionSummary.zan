@@ -30,22 +30,28 @@ public class SelectionSummary {
         string res = "Count: " + Convert.ToString(this.cellCount);
         if (this.hasNumeric) {
             res = res + "   Sum: " + DataTable.FormatReal(this.sum, 2)
-                      + "   Avg: " + DataTable.FormatReal(this.average, 2)
-                      + "   Min: " + DataTable.FormatReal(this.min, 2)
-                      + "   Max: " + DataTable.FormatReal(this.max, 2);
+            + "   Avg: " + DataTable.FormatReal(this.average, 2)
+            + "   Min: " + DataTable.FormatReal(this.min, 2)
+            + "   Max: " + DataTable.FormatReal(this.max, 2);
         }
         return res;
     }
 }
 
 public partial class DataTable {
-    // 独立计算选区统计指标（纯函数式查询，不修改视图状态）
+    // 外部查询始终读取当前数据，不参与渲染调用内的快照共享。
     public static SelectionSummary ComputeSelectionSummary(DataTableState st, List<DataColumn> cols, DataSource src) {
-        SelectionSummary res = new SelectionSummary();
-        if (!DataTable.HasRange(st) && !DataTable.HasMulti(st)) {
-            return res;
-        }
+        SelectionStatistics stats = new SelectionStatistics(false, true);
+        stats.Read(st, cols, src);
+        return stats.summary;
+    }
 
+    // 一次并集遍历同时累积两种口径。CellNum 是可覆写的数据源契约，
+    // 不得用文本解析代替；公式逐格截断，文本统计仍读取原始 CellText。
+    internal static void CollectSelectionStatistics(DataTableState st, List<DataColumn> cols, DataSource src,
+    SelectionStatistics stats, bool footer, bool textSummary) {
+        SelectionSummary res = stats.summary;
+        if (!DataTable.HasRange(st) && !DataTable.HasMulti(st)) { return; }
         int nRanges = DataTable.RangeCount(st);
         bool firstNum = true;
 
@@ -62,11 +68,21 @@ public partial class DataTable {
                         for (int qj = 0; qj < qi && !dup; qj = qj + 1) {
                             int jr0 = -1; int jc0 = -1; int jr1 = -1; int jc1 = -1;
                             if (DataTable.RangeAt(st, qj, out jr0, out jc0, out jr1, out jc1)
-                                && rri >= jr0 && rri <= jr1 && rci >= jc0 && rci <= jc1) {
+                            && rri >= jr0 && rri <= jr1 && rci >= jc0 && rci <= jc1) {
                                 dup = true;
                             }
                         }
-                        if (!dup) {
+                        if (!dup && footer && cols[rci].numeric) {
+                            double frv = 0.0;
+                            if (cols[rci].formula.Length > 0
+                            && DataTable.FormulaTryReal(cols, src, drow, rci, out frv)) {
+                                stats.footerSum = stats.footerSum + (int)frv;
+                            } else {
+                                stats.footerSum = stats.footerSum + src.CellNum(drow, rci);
+                            }
+                            stats.footerCount = stats.footerCount + 1;
+                        }
+                        if (!dup && textSummary) {
                             res.cellCount = res.cellCount + 1;
                             string val = src.CellText(drow, rci);
                             string trimmed = DataTable.TrimSpace(val);
@@ -95,7 +111,6 @@ public partial class DataTable {
         if (res.numericCount > 0) {
             res.average = res.sum / (double)res.numericCount;
         }
-        return res;
     }
 
     public static SelectionSummary GetSelectionSummary(DataTableState st, List<DataColumn> cols, DataSource src) {

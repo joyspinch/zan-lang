@@ -84,20 +84,25 @@ public partial class DataTable {
     // 用 384：主面板 +256 起还有孙级色板（RichMenu 内部约定），
     // 只给 256 会与紧跟其后的行菜单块（ctx）的行 id 数值相撞，
     // 两个菜单同开时悬停/按压按 id 匹配会串。
-    public static void EnsureMenuIds(DataTableState st) {
-        if (st.hdrMenuBaseId < 0) { st.hdrMenuBaseId = WidgetId.Block(384); }
-        if (st.ctxMenuBaseId < 0) { st.ctxMenuBaseId = WidgetId.Block(256); }
+    public static void EnsureMenus(DataTableState st) {
+        if (st.ctxRetainedMenu != null && st.hdrRetainedMenu != null) { return; }
+        DataTableMenuSession bridge = new DataTableMenuSession();
+        bridge.state = st;
+        if (st.ctxRetainedMenu == null) {
+            st.ctxRetainedMenu = new RichMenu();
+            st.ctxRetainedMenu.ActionSelected.AddS(bridge.RowSelected);
+            st.ctxRetainedMenu.Dismissed.AddS(bridge.RowDismissed);
+        }
+        if (st.hdrRetainedMenu == null) {
+            st.hdrRetainedMenu = new RichMenu();
+            st.hdrRetainedMenu.ActionSelected.AddS(bridge.HeaderSelected);
+            st.hdrRetainedMenu.Dismissed.AddS(bridge.HeaderDismissed);
+        }
     }
 
-    // 行右键菜单打开（右键/长按打开点调用）：置位并复位
-    // RichMenu 信号——开关信号由打开点与组件共同书写，
-    // 渲染函数据此区分"刚打开"与"组件已自行关闭"。
+    // 菜单打开点更新模型，准备阶段挂入持久 RichMenu；结果由事件直接提交。
     public static void OpenRowMenu(DataTableState st) {
         st.ctxOpen = true;
-        st.ctxMenuOpen.Set(true);
-        st.ctxMenuResult.Set(0 - 1);
-        st.ctxMenuSub.Set(0 - 1);
-        st.ctxMenuScroll.Set(0);
         st.tipOi = -1;
         st.tipCol = -1;
         st.hdrTipCol = -1;
@@ -107,11 +112,6 @@ public partial class DataTable {
     // 表头列菜单打开（右键/长按打开点调用）。同上。
     public static void OpenHdrMenu(DataTableState st) {
         st.hdrCtxOpen = true;
-        st.hdrMenuOpen.Set(true);
-        st.hdrMenuResult.Set(0 - 1);
-        st.hdrMenuSub.Set(0 - 1);
-        st.hdrMenuSub2.Set(0 - 1);
-        st.hdrMenuScroll.Set(0);
         st.tipOi = -1;
         st.tipCol = -1;
         st.hdrTipCol = -1;
@@ -129,70 +129,70 @@ public partial class DataTable {
     // （撤销是编辑能力，不依赖数据源可增删行——固定行数的源
     // 一样能编辑单元格）；末尾恒有全选与清除选择。
     public static List<MenuItem> BuildRowMenuItems(DataTableState st, List<DataColumn> cols,
-                                            DataSource src) {
+    DataSource src) {
         List<MenuItem> items = new List<MenuItem>();
         int undoN = DataTable.UndoDepth(st);
         string undoLbl = DataTable.T("Undo", "撤销");
         if (undoN > 0) { undoLbl = undoLbl + "  (" + Convert.ToString(undoN) + ")"; }
         items.Add(MenuItem.Shortcut(DataTable.T("Copy", "复制"), "copy", "Ctrl+C",
-                                    DataTable.RowActCopy));
+        DataTable.RowActCopy));
         items.Add(MenuItem.Item(DataTable.T("Copy with headers", "复制（含表头）"),
-                                "copy", DataTable.RowActCopyHdr));
+        "copy", DataTable.RowActCopyHdr));
         items.Add(MenuItem.Shortcut(DataTable.T("Cut", "剪切"), "cut", "Ctrl+X",
-                                    DataTable.RowActCut));
+        DataTable.RowActCut));
         items.Add(MenuItem.Shortcut(DataTable.T("Paste", "粘贴"), "clipboard", "Ctrl+V",
-                                    DataTable.RowActPaste));
+        DataTable.RowActPaste));
         items.Add(MenuItem.Shortcut(DataTable.T("Clear selected cells", "清空所选单元格"),
-                                    "close", "Delete", DataTable.RowActClear));
+        "close", "Delete", DataTable.RowActClear));
         items.Add(MenuItem.Separator());
         List<MenuItem> exportKids = new List<MenuItem>();
         exportKids.Add(MenuItem.Item(DataTable.T("CSV Export", "导出 CSV"), "download",
-                                     DataTable.RowActExportCsv));
+        DataTable.RowActExportCsv));
         exportKids.Add(MenuItem.Item(DataTable.T("Excel Export", "导出 Excel"), "download",
-                                     DataTable.RowActExportXlsx));
+        DataTable.RowActExportXlsx));
         items.Add(MenuItem.Submenu(DataTable.T("Export", "导出"), "download", exportKids));
         items.Add(MenuItem.Item(DataTable.T("Chart from selection", "从选区生成图表"),
-                                "chart", DataTable.RowActChart));
+        "chart", DataTable.RowActChart));
         if (st.pivotView) {
             items.Add(MenuItem.Item(DataTable.T("Exit pivot view", "退出透视视图"),
-                                    "table", DataTable.RowActPivotExit));
+            "table", DataTable.RowActPivotExit));
             items.Add(MenuItem.Item(DataTable.T("Drill into this cell", "下钻此单元格"),
-                                    "zoom-in", DataTable.RowActPivotDrill));
+            "zoom-in", DataTable.RowActPivotDrill));
         } else {
             items.Add(MenuItem.Item(DataTable.T("Pivot from selection", "从选区生成透视表"),
-                                    "table", DataTable.RowActPivot));
+            "table", DataTable.RowActPivot));
         }
         if (st.transposeView) {
             items.Add(MenuItem.Item(DataTable.T("Exit transpose view", "退出转置视图"),
-                                    "arrows-exchange", DataTable.RowActTranspose));
+            "arrows-exchange", DataTable.RowActTranspose));
         } else {
             items.Add(MenuItem.Item(DataTable.T("Transpose view", "转置视图"),
-                                    "arrows-exchange", DataTable.RowActTranspose));
+            "arrows-exchange", DataTable.RowActTranspose));
         }
         items.Add(MenuItem.Shortcut(DataTable.T("Find", "查找"), "search", "Ctrl+F",
-                                    DataTable.RowActFind));
+        DataTable.RowActFind));
         if (DataTable.IsGrouped(st)) {
             items.Add(MenuItem.Item(DataTable.T("Expand All Groups", "展开全部分组"),
-                                    "", DataTable.RowActExpandGroups));
+            "", DataTable.RowActExpandGroups));
             items.Add(MenuItem.Item(DataTable.T("Collapse All Groups", "折叠全部分组"),
-                                    "", DataTable.RowActContractGroups));
+            "", DataTable.RowActContractGroups));
         }
         bool canRows = src.CanInsert();
         if (canRows) {
             items.Add(MenuItem.Separator());
             items.Add(MenuItem.Shortcut(DataTable.T("Insert row", "插入行"), "plus",
-                                        "Ctrl+Ins", DataTable.RowActInsert));
+            "Ctrl+Ins", DataTable.RowActInsert));
             items.Add(MenuItem.Shortcut(DataTable.T("Delete rows", "删除行"), "minus",
-                                        "Ctrl+Del", DataTable.RowActDelete));
+            "Ctrl+Del", DataTable.RowActDelete));
         }
         if (undoN > 0) {
             items.Add(MenuItem.Shortcut(undoLbl, "undo", "Ctrl+Z", DataTable.RowActUndo));
         }
         items.Add(MenuItem.Separator());
         items.Add(MenuItem.Shortcut(DataTable.T("Select all", "全选"), "check", "Ctrl+A",
-                                    DataTable.RowActSelAll));
+        DataTable.RowActSelAll));
         items.Add(MenuItem.Item(DataTable.T("Clear selection", "清除选择"), "close",
-                                DataTable.RowActSelNone));
+        DataTable.RowActSelNone));
 
         // 业务层自定义右键菜单项扩展（对标 AG Grid getContextMenuItems / DevExpress PopupMenu）
         if (st.contextMenuFunc != null) {
@@ -217,7 +217,7 @@ public partial class DataTable {
     // 执行行菜单选中的 action（由 RenderContextMenu 下一帧调用，
     // 避免在弹层分发阶段改动表格状态）。
     public static void DispatchRowAction(App app, DataTableState st, List<DataColumn> cols,
-                                  DataSource src, int act) {
+    DataSource src, int act) {
         if (act >= DataTable.RowActCustomBase) {
             int ci = act - DataTable.RowActCustomBase;
             if (st.activeCustomMenuItems != null && ci >= 0 && ci < st.activeCustomMenuItems.Count) {
@@ -256,14 +256,14 @@ public partial class DataTable {
             // 异步流式导出 + 进度/取消弹层（与画廊 Excel 导出同一
             // 通道），取代旧的同步整写——大表导出不再冻结 UI。
             DataTable.ExportToCsvAsyncUi(app, st, cols, src,
-                                         "datatable_export.csv", false);
+            "datatable_export.csv", false);
         } else if (act == DataTable.RowActExportXlsx) {
             // xlsx 入口经 DataTable.sXlsxExportUi 槽（Export.zan 里
             // 的 RunXlsxExportUi）：XlsxBook/Zip/Deflate 写盘家族只有
             // 真的导出 Excel 才进编译图。未装配（无人调用
             // DataTableXlsx.Importable）时弹层显示无可导内容。
             DataTable.ExportToXlsxAsyncUi(app, st, cols, src,
-                                          "datatable_export.xlsx", false);
+            "datatable_export.xlsx", false);
         } else if (act == DataTable.RowActChart) {
             if (DataTable.BuildChartFromRange(st, cols, src)) {
                 st.chartOpen = true;
@@ -330,73 +330,72 @@ public partial class DataTable {
         }
     }
 
-    // 行右键菜单：声明式构建并交给 RichMenu。菜单打开期间
-    // 本函数每帧重入（重建同一份 items——action 码与结构稳定），
-    // 选中结果写入 st.ctxMenuResult，下一帧在此统一执行。
-    public static void RenderContextMenu(App app, int x, int y, int viewW, int viewH,
-                                  List<DataColumn> cols, DataSource src, DataTableState st) {
-        DataTable.EnsureMenuIds(st);
-        int act = st.ctxMenuResult.Get();
-        if (act >= 0) {
-            st.ctxMenuResult.Set(0 - 1);
-            st.ctxMenuOpen.Set(false);
-            st.ctxMenuSub.Set(0 - 1);
-            DataTable.DispatchRowAction(app, st, cols, src, act);
-            app.RequestRedraw();
+    // 准备持久菜单的项集和锚点，输入结果由 DataTableMenuSession 即时提交。
+    public static void PrepareMenus(App app, DataTableState st, List<DataColumn> cols,
+    DataSource src, int x, int y, int viewW, int viewH) {
+        DataTable.EnsureMenus(st);
+        if (!st.ctxOpen) { st.ctxRetainedMenu.Close(); }
+        else if (!st.ctxRetainedMenu.IsOpen()) {
+            List<MenuItem> items = DataTable.BuildRowMenuItems(st, cols, src);
+            int mw = app.Scale(190);
+            int mh = RichMenu.ViewHeight(app, items, 11);
+            int mx = st.ctxX;
+            int my = st.ctxY;
+            if (mx + mw > x + viewW) { mx = x + viewW - mw - app.Scale(2); }
+            if (my + mh > y + viewH) { my = y + viewH - mh - app.Scale(2); }
+            if (mx < x) { mx = x; }
+            if (my < y) { my = y; }
+            st.ctxRetainedMenu.maxRows = 11;
+            st.ctxRetainedMenu.minWidth = mw;
+            st.ctxRetainedMenu.SetItems(items);
+            st.ctxRetainedMenu.ShowAtAnchor(app, st.ownerControl, mx, my);
+            st.ctxOpen = st.ctxRetainedMenu.IsOpen();
         }
-        if (!st.ctxOpen) { return; }
-
-        int mw = app.Scale(190);
-        List<MenuItem> items = DataTable.BuildRowMenuItems(st, cols, src);
-        int mh = OverlayPopup.RichHeight(app, items);
-        int mx = st.ctxX;
-        int my = st.ctxY;
-        if (mx + mw > x + viewW) { mx = x + viewW - mw - app.Scale(2); }
-        if (my + mh > y + viewH) { my = y + viewH - mh - app.Scale(2); }
-        if (mx < x) { mx = x; }
-        if (my < y) { my = y; }
-        app.AddOverlay(OverlayPopup.RichMenu(mx, my, items, st.ctxMenuBaseId,
-            st.ctxMenuResult, st.ctxMenuOpen, st.ctxMenuSub, st.ctxMenuScroll,
-            11, mw));
-        // RichMenu 的开关信号是唯一事实来源：组件因外部点击/
-        // Escape/失焦关闭时镜像回 ctxOpen，让表格的模态抑制解除。
-        st.ctxOpen = st.ctxMenuOpen.Get();
+        if (!st.hdrCtxOpen || st.hdrCtxCol < 0 || st.hdrCtxCol >= cols.Count) {
+            st.hdrCtxOpen = false;
+            st.hdrRetainedMenu.Close();
+        } else if (!st.hdrRetainedMenu.IsOpen()) {
+            st.hdrRetainedMenu.maxRows = 11;
+            st.hdrRetainedMenu.minWidth = app.Scale(180);
+            st.hdrRetainedMenu.SetItems(DataTable.BuildHeaderMenuItems(st, cols, src));
+            st.hdrRetainedMenu.ShowAtAnchor(app, st.ownerControl, st.hdrCtxX, st.hdrCtxY);
+            st.hdrCtxOpen = st.hdrRetainedMenu.IsOpen();
+        }
     }
 
     // ---------- 选区生成图表浮层 ----------
     // 由选中范围构建的模态柱状图（见 BuildChartFromRange）。
     // 点击 [x] 按钮、面板外部或 Escape 关闭。
     public static void RenderChart(App app, int x, int y, int viewW, int viewH,
-                            DataTableState st) {
+    DataTableState st) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         StyleBox sMenu = Style.Part(app, "datatable", "menu", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         StyleBox sGrid = Style.Part(app, "datatable", "grid", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         StyleBox sHeader = Style.Part(app, "datatable", "header", "", "", "",
-                                      Style.SNormal());
+        Style.SNormal());
         StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         StyleBox sLabel = Style.Part(app, "datatable", "label", "", "", "",
-                                     Style.SNormal());
+        Style.SNormal());
         StyleBox sAccent = Style.Part(app, "datatable", "accent", "", "", "",
-                                      Style.SNormal());
+        Style.SNormal());
         StyleBox sRowHover = Style.Part(app, "datatable", "row", "", "",
-                                        "", Style.SHover());
+        "", Style.SHover());
 
         int m = app.Scale(20);
         int px = x + m;
         int py = y + m;
         int pw = viewW - m * 2;
         int ph = viewH - m * 2;
-        if (pw < app.Scale(120) || ph < app.Scale(100)) { st.chartOpen = false; return; }
+        if (pw < app.Scale(120) || ph < app.Scale(100)) { return; }
 
         // 遮罩 + 面板
         c.FillRect(x, y, viewW, viewH, t.overlay);
         // 模态：接管滚轮并屏蔽图表浮层下的所有命中
-        app.CaptureWheel(x, y, viewW, viewH);
-        app.BlockHitsRect(x, y, viewW, viewH);
+
         c.FillRoundRect(px, py, pw, ph, t.borderRadiusMedium, sMenu.BgOr(0));
         c.DrawRoundRect(px, py, pw, ph, t.borderRadiusMedium, sMenu.BorderOr(0), 1);
 
@@ -405,14 +404,14 @@ public partial class DataTable {
         c.FillRect(px + 1, py + 1, pw - 2, th, sHeader.BgOr(0));
         c.FillRect(px + 1, py + th, pw - 2, 1, sGrid.BgOr(0));
         c.DrawText(px + app.Scale(14), Canvas.CenterTextY(py, th, Style.FontFallback(app, "medium")),
-                   DataTable.T("Chart", "图表") + " · " + st.chartTitle, sMenu.FgOr(0), Style.FontFallback(app, "medium"));
+        DataTable.T("Chart", "图表") + " · " + st.chartTitle, sMenu.FgOr(0), Style.FontFallback(app, "medium"));
 
         // 关闭按钮
         int cbs = app.Scale(22);
         int cbx = px + pw - cbs - app.Scale(8);
         int cby = py + (th - cbs) / 2;
         bool cbHot = app.mouseX >= cbx && app.mouseX < cbx + cbs
-                     && app.mouseY >= cby && app.mouseY < cby + cbs;
+        && app.mouseY >= cby && app.mouseY < cby + cbs;
         if (cbHot) { c.FillRoundRect(cbx, cby, cbs, cbs, app.Scale(4), sRowHover.BgOr(0)); }
         c.DrawTextCentered(cbx, cby, cbs, cbs, "×", sMenu.FgOr(0), Style.FontFallback(app, "large"));
 
@@ -434,9 +433,9 @@ public partial class DataTable {
             // 基线 + 最大/零轴标签 + 一条淡中线
             c.FillRect(plotX, plotBottom, plotW, 1, sMenu.BorderOr(0));
             c.DrawText(px + app.Scale(8), Canvas.CenterTextYAt(plotTop, Style.FontFallback(app, "small")),
-                       Convert.ToString(mx), sHint.FgOr(0), Style.FontFallback(app, "small"));
+            Convert.ToString(mx), sHint.FgOr(0), Style.FontFallback(app, "small"));
             c.DrawText(px + app.Scale(8), Canvas.CenterTextYAt(plotBottom, Style.FontFallback(app, "small")),
-                       "0", sHint.FgOr(0), Style.FontFallback(app, "small"));
+            "0", sHint.FgOr(0), Style.FontFallback(app, "small"));
             int midY = plotTop + plotH / 2;
             c.FillRect(plotX, midY, plotW, 1, sGrid.BgOr(0));
 
@@ -465,21 +464,17 @@ public partial class DataTable {
                 // 基线下的分类标签（按槽位裁剪）
                 c.PushClip(slotL, plotBottom + app.Scale(4), slotW, app.Scale(20));
                 c.DrawTextCentered(slotL, plotBottom + app.Scale(4), slotW,
-                                   Canvas.FontHeight(Style.FontFallback(app, "small")),
-                                   bar.label, sHint.FgOr(0), Style.FontFallback(app, "small"));
+                Canvas.FontHeight(Style.FontFallback(app, "small")),
+                bar.label, sHint.FgOr(0), Style.FontFallback(app, "small"));
                 c.PopClip();
             }
         }
 
         // 关闭交互：[x]、点击面板外部或 Escape
-        bool clicked = app.EventKind() == 3 && app.window.EventButton() == 0;
+
         bool inside = app.mouseX >= px && app.mouseX < px + pw
-                      && app.mouseY >= py && app.mouseY < py + ph;
-        if ((clicked && (cbHot || !inside))
-            || (app.EventKind() == 4 && app.window.EventKeyCode() == 27)) {
-            st.chartOpen = false;
-            app.RequestRedraw();
-        }
+        && app.mouseY >= py && app.mouseY < py + ph;
+
     }
 
     // 选区数据透视浮层已移除：透视升级为表格自身的视图
@@ -492,7 +487,7 @@ public partial class DataTable {
     // （视觉重心比正中略稳）。高度由内容令牌推出，纯几何，
     // conformance 直接断言。
     public static void ExportUiRect(App app, int x, int y, int viewW, int viewH,
-                             out int px, out int py, out int pw, out int ph) {
+    out int px, out int py, out int pw, out int ph) {
         Theme t = app.theme;
         int fSmall = Style.FontFallback(app, "small");
         pw = app.Scale(340);
@@ -500,7 +495,7 @@ public partial class DataTable {
         if (pw > maxW) { pw = maxW; }
         if (pw < app.Scale(180)) { pw = app.Scale(180); }
         ph = app.Scale(16) + t.heightMedium + app.Scale(14) + app.Scale(10)
-            + app.Scale(12) + fSmall + app.Scale(10) + t.heightSmall + app.Scale(16);
+        + app.Scale(12) + fSmall + app.Scale(10) + t.heightSmall + app.Scale(16);
         px = x + (viewW - pw) / 2;
         if (px < x) { px = x; }
         py = y + (viewH - ph) * 2 / 5;
@@ -513,21 +508,21 @@ public partial class DataTable {
     // 行数计数；运行中可取消（Escape 等效），结束给出结果与
     // 关闭按钮。
     public static void RenderExportUi(App app, int x, int y, int viewW, int viewH,
-                               DataTableState st) {
+    DataTableState st) {
         DataTableExportUi ui = st.exportUi;
         if (ui == null || !ui.visible) { return; }
         // 后台进度暂存 -> 弹层状态（UI 线程每帧拉取）
-        DataTableUiExportProgress.SyncUi();
+
         Canvas c = app.canvas;
         Theme t = app.theme;
         StyleBox sMenu = Style.Part(app, "datatable", "menu", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         StyleBox sTrack = Style.Part(app, "datatable", "progress-track", "", "", "",
-                                     Style.SNormal());
+        Style.SNormal());
         StyleBox sFill = Style.Part(app, "datatable", "progress-fill", "", "", "",
-                                    Style.SNormal());
+        Style.SNormal());
         int fMed = Style.FontFallback(app, "medium");
         int fSmall = Style.FontFallback(app, "small");
 
@@ -536,8 +531,7 @@ public partial class DataTable {
 
         // 遮罩 + 模态
         c.FillRect(x, y, viewW, viewH, t.overlay);
-        app.CaptureWheel(x, y, viewW, viewH);
-        app.BlockHitsRect(x, y, viewW, viewH);
+
         c.FillRoundRect(px, py, pw, ph, t.borderRadiusMedium, sMenu.BgOr(0));
         c.DrawRoundRect(px, py, pw, ph, t.borderRadiusMedium, sMenu.BorderOr(0), 1);
 
@@ -574,51 +568,36 @@ public partial class DataTable {
         string detail;
         if (ui.finished) {
             detail = ui.ok
-                ? DataTable.T("Exported: ", "已导出：") + ui.path
-                : DataTable.T("Export failed: ", "导出失败：") + ui.message;
+            ? DataTable.T("Exported: ", "已导出：") + ui.path
+            : DataTable.T("Export failed: ", "导出失败：") + ui.message;
         } else {
             detail = Convert.ToString(ui.done) + " / " + Convert.ToString(ui.total)
-                + " " + DataTable.T("rows", "行");
+            + " " + DataTable.T("rows", "行");
         }
         c.DrawText(tx, ty, detail, sHint.FgOr(0), fSmall);
 
         // 按钮行：运行中=取消，结束=关闭
         string label = ui.finished ? DataTable.T("Close", "关闭")
-                                   : DataTable.T("Cancel", "取消");
+        : DataTable.T("Cancel", "取消");
         string cls = ui.finished ? "small primary" : "small text";
         int bh = t.heightSmall;
         int bw = Canvas.MeasureText(label, fSmall) + app.Scale(24);
         int bxc = px + pw - pad - bw;
         int byc = py + ph - pad - bh;
         bool hot = app.mouseX >= bxc && app.mouseX < bxc + bw
-                   && app.mouseY >= byc && app.mouseY < byc + bh;
+        && app.mouseY >= byc && app.mouseY < byc + bh;
         StyleBox bs = Style.Part(app, "datatable", "button", "", cls, "",
-                                 Style.SNormal());
+        Style.SNormal());
         if (hot) {
             bs = Style.Part(app, "datatable", "button", "", cls, "",
-                            Style.SHover());
+            Style.SHover());
         }
         c.FillRoundRect(bxc, byc, bw, bh, bs.RadiusOr(t.borderRadiusSmall), bs.BgOr(0));
         c.DrawTextCentered(bxc, byc, bw, bh, label, bs.FgOr(0), fSmall);
 
-        bool clicked = app.EventKind() == 3 && app.window.EventButton() == 0
-                       && app.mouseX >= bxc && app.mouseX < bxc + bw
-                       && app.mouseY >= byc && app.mouseY < byc + bh;
-        if (clicked
-            || (app.EventKind() == 4 && app.window.EventKeyCode() == 27)) {
-            // 运行中：取消/Escape 请求中止（弹层保留到 OnDone 回来
-            // 给出"已取消"）；结束后：关闭/Escape 收起弹层。
-            if (ui.finished) {
-                st.exportUi = null;
-            } else {
-                ui.cancel.Store(1);
-            }
-            app.RequestRedraw();
-            return;
-        }
         // 运行中自驱重绘：进度条随后台写盘推进（完成后静止，
         // 等用户关闭）。
-        if (!ui.finished) { app.RequestRedraw(); }
+
     }
 
     // ---------- 表头（列）上下文菜单 ----------
@@ -671,7 +650,7 @@ public partial class DataTable {
 
     // 高亮规则的默认阈值：列数值的平均值（空列回退 0）。
     public static int MedianThreshold(App app, DataTableState st, List<DataColumn> cols,
-                               DataSource src, int col) {
+    DataSource src, int col) {
         double sum = 0.0;
         int n = 0;
         for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
@@ -733,30 +712,30 @@ public partial class DataTable {
         // 用首列蓝，与旧面板默认一致）。
         List<MenuItem> hl = new List<MenuItem>();
         hl.Add(MenuItem.Item(DataTable.T("Greater Than Average", "大于均值"),
-                             cfMode == 3 ? "check" : "",
-                             DataTable.HdrActCfGreater));
+        cfMode == 3 ? "check" : "",
+        DataTable.HdrActCfGreater));
         hl.Add(MenuItem.Item(DataTable.T("Less Than Average", "小于均值"),
-                             cfMode == 4 ? "check" : "",
-                             DataTable.HdrActCfLess));
+        cfMode == 4 ? "check" : "",
+        DataTable.HdrActCfLess));
         kids.Add(MenuItem.Submenu(DataTable.T("Highlight Rules", "高亮规则"),
-                                  "eye", hl));
+        "eye", hl));
 
         // 前/后规则（名次缓存随 Recompute 重建）。
         List<MenuItem> tb = new List<MenuItem>();
         tb.Add(MenuItem.Item(DataTable.T("Top 10 Items", "前 10 项"),
-                             (cfMode == 5 && !cfRankPct) ? "check" : "",
-                             DataTable.HdrActCfTopN));
+        (cfMode == 5 && !cfRankPct) ? "check" : "",
+        DataTable.HdrActCfTopN));
         tb.Add(MenuItem.Item(DataTable.T("Top 10 %", "前 10 %"),
-                             (cfMode == 5 && cfRankPct) ? "check" : "",
-                             DataTable.HdrActCfTopPct));
+        (cfMode == 5 && cfRankPct) ? "check" : "",
+        DataTable.HdrActCfTopPct));
         tb.Add(MenuItem.Item(DataTable.T("Bottom 10 Items", "后 10 项"),
-                             (cfMode == 6 && !cfRankPct) ? "check" : "",
-                             DataTable.HdrActCfBottomN));
+        (cfMode == 6 && !cfRankPct) ? "check" : "",
+        DataTable.HdrActCfBottomN));
         tb.Add(MenuItem.Item(DataTable.T("Bottom 10 %", "后 10 %"),
-                             (cfMode == 6 && cfRankPct) ? "check" : "",
-                             DataTable.HdrActCfBottomPct));
+        (cfMode == 6 && cfRankPct) ? "check" : "",
+        DataTable.HdrActCfBottomPct));
         kids.Add(MenuItem.Submenu(DataTable.T("Top/Bottom Rules", "前/后规则"),
-                                  "sort", tb));
+        "sort", tb));
         kids.Add(MenuItem.Separator());
 
         // 数据条：4 组渐变 + 4 组纯色（渐变双端同色由渲染层做
@@ -765,14 +744,14 @@ public partial class DataTable {
         for (int i = 0; i < 8; i = i + 1) {
             int ci = i < 4 ? i : i + 4;
             string lbl = DataTable.T(i < 4 ? "Gradient Fill" : "Solid Fill",
-                                    i < 4 ? "渐变" : "纯色")
-                + " " + DataTable.SwatchName(ci);
+            i < 4 ? "渐变" : "纯色")
+            + " " + DataTable.SwatchName(ci);
             string icon = (cfMode == 1 && cfColor == ps[ci]) ? "check" : "";
             bars.Add(MenuItem.SwatchItem(lbl, icon, DataTable.HdrActCfBar0 + i,
-                                         ps[ci], 0));
+            ps[ci], 0));
         }
         kids.Add(MenuItem.Submenu(DataTable.T("Data Bars", "数据条"),
-                                  "chart-bar", bars));
+        "chart-bar", bars));
 
         // 色阶：双色渐变预设对，每项带双色对拼色块。
         List<MenuItem> scales = new List<MenuItem>();
@@ -783,27 +762,27 @@ public partial class DataTable {
             string lbl = DataTable.SwatchName(ci);
             string icon = (cfMode == 2 && cfColor == c0 && cfColor2 == c1) ? "check" : "";
             scales.Add(MenuItem.SwatchItem(lbl, icon, DataTable.HdrActCfScale0 + i,
-                                           c0, c1));
+            c0, c1));
         }
         kids.Add(MenuItem.Submenu(DataTable.T("Color Scales", "色阶"),
-                                  "color", scales));
+        "color", scales));
 
         kids.Add(MenuItem.Separator());
         // 打开"清除规则"弹窗：全表规则逐条列出，勾选单删/多删。
         // 直项不带勾选态——它不是开关，是弹窗入口（同筛选…/列选择器…）。
         kids.Add(MenuItem.Item(DataTable.T("Clear Rules…", "清除规则…"), "close",
-                               DataTable.HdrActCfClear));
+        DataTable.HdrActCfClear));
         return kids;
     }
 
     // 表头菜单 action 执行（RenderHeaderMenu 下一帧统一调用）。
     public static void DispatchHeaderAction(App app, DataTableState st, List<DataColumn> cols,
-                                     DataSource src, int col, int act) {
+    DataSource src, int col, int act) {
         // 通过菜单设置新规则 = 撤销显式清除（cfRules[col].off 让位）。
         bool cfSet = (act >= DataTable.HdrActCfBar0 && act < DataTable.HdrActCfBar0 + 8)
-            || (act >= DataTable.HdrActCfScale0 && act < DataTable.HdrActCfScale0 + 8)
-            || act == DataTable.HdrActCfGreater || act == DataTable.HdrActCfLess
-            || (act >= DataTable.HdrActCfTopN && act <= DataTable.HdrActCfBottomPct);
+        || (act >= DataTable.HdrActCfScale0 && act < DataTable.HdrActCfScale0 + 8)
+        || act == DataTable.HdrActCfGreater || act == DataTable.HdrActCfLess
+        || (act >= DataTable.HdrActCfTopN && act <= DataTable.HdrActCfBottomPct);
         if (cfSet && col >= 0) {
             if (st.cfRules == null) { st.cfRules = new List<ColumnCfRule>(); }
             while (st.cfRules.Count <= col) { st.cfRules.Add(ColumnCfRule.Create()); }
@@ -913,31 +892,11 @@ public partial class DataTable {
         }
     }
 
-    // 表头列上下文菜单：声明式构建并交给 RichMenu。选中结果
-    // 写入 st.hdrMenuResult，下一帧在此统一执行并关闭。
-    public static void RenderHeaderMenu(App app, int x, int y, int viewW, int viewH,
-                                 List<DataColumn> cols, DataSource src, DataTableState st) {
-        DataTable.EnsureMenuIds(st);
+    // 表头菜单项由持久 ContextMenu 承载，DataTableMenuSession 在选中时提交操作。
+    public static List<MenuItem> BuildHeaderMenuItems(DataTableState st,
+    List<DataColumn> cols, DataSource src) {
         int col = st.hdrCtxCol;
-        if (col < 0 || col >= cols.Count) {
-            st.hdrCtxOpen = false;
-            st.hdrMenuOpen.Set(false);
-            return;
-        }
-        int act = st.hdrMenuResult.Get();
-        if (act >= 0) {
-            st.hdrMenuResult.Set(0 - 1);
-            st.hdrCtxOpen = false;
-            st.hdrMenuOpen.Set(false);
-            st.hdrMenuSub.Set(0 - 1);
-            st.hdrMenuSub2.Set(0 - 1);
-            DataTable.DispatchHeaderAction(app, st, cols, src, col, act);
-            // 菜单可能改了规则/聚合/名次缓存依赖的状态：
-            // 本帧立即重算，数据条/色阶的 min/max 不用过期。
-            if (st.dirty) { DataTable.Recompute(st, cols, src); }
-            app.RequestRedraw();
-        }
-        if (!st.hdrCtxOpen) { return; }
+        if (col < 0 || col >= cols.Count) { return new List<MenuItem>(); }
 
         bool canFilter = cols[col].filterable;
         bool canAgg = cols[col].numeric;
@@ -952,26 +911,26 @@ public partial class DataTable {
         List<MenuItem> items = new List<MenuItem>();
         // 排序组：当前方向勾选在对应子项上。
         items.Add(MenuItem.Item(DataTable.T("Sort Ascending", "升序排序"),
-                                sortDir == 1 ? "check" : "",
-                                DataTable.HdrActSortAsc));
+        sortDir == 1 ? "check" : "",
+        DataTable.HdrActSortAsc));
         items.Add(MenuItem.Item(DataTable.T("Sort Descending", "降序排序"),
-                                sortDir == 2 ? "check" : "",
-                                DataTable.HdrActSortDesc));
+        sortDir == 2 ? "check" : "",
+        DataTable.HdrActSortDesc));
         if (canClear) {
             items.Add(MenuItem.Item(DataTable.T("Clear Sort", "清除排序"), "",
-                                    DataTable.HdrActClearSort));
+            DataTable.HdrActClearSort));
         }
         items.Add(MenuItem.Separator());
         items.Add(MenuItem.Item(DataTable.T("Auto-fit Column", "自动列宽"), "",
-                                DataTable.HdrActFitCol));
+        DataTable.HdrActFitCol));
         items.Add(MenuItem.Item(DataTable.T("Auto-fit All", "自动全部列宽"), "",
-                                DataTable.HdrActFitAll));
+        DataTable.HdrActFitAll));
         items.Add(MenuItem.Separator());
         items.Add(MenuItem.Item(DataTable.T("Group by This", "按此列分组"), "",
-                                DataTable.HdrActGroup));
+        DataTable.HdrActGroup));
         if (st.groupCols.Count > 0) {
             items.Add(MenuItem.Item(DataTable.T("Ungroup All", "取消分组"), "",
-                                    DataTable.HdrActUngroup));
+            DataTable.HdrActUngroup));
         }
         items.Add(MenuItem.Separator());
         // 冻结：两个明确条目而非循环开关（见旧注释——让用户
@@ -983,40 +942,35 @@ public partial class DataTable {
         if (frz == 2) { pinRLbl = DataTable.T("Unfreeze", "取消冻结"); }
         items.Add(MenuItem.Item(pinRLbl, "", DataTable.HdrActPinRight));
         items.Add(MenuItem.Item(DataTable.T("Hide Column", "隐藏此列"), "",
-                                DataTable.HdrActHide));
+        DataTable.HdrActHide));
         if (anyHidden) {
             items.Add(MenuItem.Item(DataTable.T("Show All Columns", "显示所有列"), "",
-                                    DataTable.HdrActShowAll));
+            DataTable.HdrActShowAll));
         }
         items.Add(MenuItem.Item(DataTable.T("Column Chooser…", "列选择器…"), "",
-                                DataTable.HdrActChooser));
+        DataTable.HdrActChooser));
         if (canAgg) {
             items.Add(MenuItem.Separator());
             // 合计：子菜单父项只作展开入口，勾选在子项
             // （父项不该呈选中态）。
             int aggMode = curAgg >= 1 && curAgg <= 5 ? curAgg : 0;
             items.Add(MenuItem.Submenu(DataTable.T("Total", "合计"), "calculator",
-                                       DataTable.BuildAggChildren(aggMode)));
+            DataTable.BuildAggChildren(aggMode)));
         }
         if (canFilter) {
             items.Add(MenuItem.Separator());
             items.Add(MenuItem.Item(DataTable.T("Filter…", "筛选…"), "filter",
-                                    DataTable.HdrActFilter));
+            DataTable.HdrActFilter));
         }
         if (canAgg) {
             items.Add(MenuItem.Separator());
             items.Add(MenuItem.Submenu(DataTable.T("Conditional Formatting", "条件格式"),
-                                       "flag", DataTable.BuildCfChildren(cols[col], st, col)));
+            "flag", DataTable.BuildCfChildren(cols[col], st, col)));
         }
         items.Add(MenuItem.Separator());
         items.Add(MenuItem.Item(DataTable.T("Reset Columns", "重置所有列"), "undo",
-                                DataTable.HdrActResetCols));
+        DataTable.HdrActResetCols));
 
-        app.AddOverlay(OverlayPopup.RichMenu(st.hdrCtxX, st.hdrCtxY, items,
-            st.hdrMenuBaseId, st.hdrMenuResult, st.hdrMenuOpen, st.hdrMenuSub,
-            st.hdrMenuScroll, 11, app.Scale(180), st.hdrMenuSub2));
-        // RichMenu 的开关信号是唯一事实来源：组件因外部点击/
-        // Escape/失焦关闭时镜像回 hdrCtxOpen。
-        st.hdrCtxOpen = st.hdrMenuOpen.Get();
+        return items;
     }
 }

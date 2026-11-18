@@ -39,21 +39,26 @@ public partial class DataTable {
     // 分支调用（画布已裁剪到格矩形内）。`src` 是网格当前
     // 数据源，用于稳定行键池化。
     public static void DrawCompCell(App app, DataColumn col, string val,
-                             int cx, int cy, int cw, int rowH,
-                             int rowIdx, int cc, DataSource src,
-                             DataTableState st) {
+    int cx, int cy, int cw, int rowH,
+    int rowIdx, int cc, DataSource src,
+    DataTableState st) {
         CellComp comp = CellComp.Find(col.compId);
         if (comp == null) {
-            // 未注册的 compId：画占位块，fail-soft 不炸帧。
-            Canvas c = app.canvas;
-            Theme t = app.theme;
-            StyleBox ph = Style.Part(app, "datatable", "progress-track",
-                                     "", "", "", Style.SNormal());
-            c.FillRoundRect(cx + t.paddingSmall, cy + app.Scale(4),
-                            cw - t.paddingSmall * 2, rowH - app.Scale(8),
-                            t.borderRadiusSmall, ph.BgOr(0));
+            StyleBox ph = Style.Part(app, "datatable", "progress-track", "", "", "", Style.SNormal());
+            app.canvas.FillRoundRect(cx + app.theme.paddingSmall, cy + app.Scale(4),
+            cw - app.theme.paddingSmall * 2, rowH - app.Scale(8), app.theme.borderRadiusSmall, ph.BgOr(0));
             return;
         }
+        Control ctl = DataTableVisualTree.PreparedControl(st, 1, rowIdx, cc);
+        if (ctl == null || !DataTableVisualTree.IsCurrentRender(st)) { return; }
+        ctl.RenderTree(app);
+    }
+
+    internal static Control PrepareCompCell(App app, DataColumn col, string val,
+    int cx, int cy, int cw, int rowH,
+    int rowIdx, int cc, DataSource src, DataTableState st) {
+        CellComp comp = CellComp.Find(col.compId);
+        if (comp == null) { return null; }
         List<int> vals = new List<int>();
         if (col.cellType != 10) {
             List<string> parts = DataTable.NumSeries(val);
@@ -70,6 +75,7 @@ public partial class DataTable {
         // （与选择/详情的键回退语义一致）。
         RowKey key = null;
         if (src != null) { key = src.GetRowKey(rowIdx); }
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return null; }
         if (key == null) { key = RowKey.Legacy(rowIdx); }
         // 池键冠以本表实例序号：注册表是进程级单例，裸 (RowKey, col)
         // 会让同屏两个网格（或一表一预览）声明同一 compId 时拿到
@@ -79,28 +85,30 @@ public partial class DataTable {
         // 可能重灌选项/分段、Rate.Max 重排星号块）都会领新 id——
         // 全部圈进保留段，见 CompBandEnter 的注释。
         int outerSeq = DataTable.CompBandEnter();
-        Control ctl = comp.Acquire(app, src, rowIdx, cc, key,
-                                   cx, cy, cw, rowH, rows, cols);
-        if (ctl != null) {
-            // 数值形态（cellType 9）走序列灌值；字符串形态
-            // （cellType 10 WidgetCol）直接把原始单元格文本给适配器。
-            if (col.cellType == 10) {
-                comp.FillStr(ctl, val, col, src, rowIdx);
-            } else {
-                comp.Fill(ctl, vals, rows, cols, col.heatBand);
+        Control ctl = null;
+        try {
+            ctl = comp.Acquire(app, src, rowIdx, cc, key, cx, cy, cw, rowH, rows, cols);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return null; }
+            if (ctl != null) {
+                DataTableComponentBinding binding = st.visualTree.ComponentBinding(ctl, comp, col, src, st, rowIdx, cc);
+                binding.syncing = true;
+                try {
+                    if (col.cellType == 10) { comp.FillStr(ctl, val, col, src, rowIdx); }
+                    else { comp.Fill(ctl, vals, rows, cols, col.heatBand); }
+                } finally { binding.syncing = false; }
             }
-        }
-        DataTable.CompBandExit(outerSeq);
-        if (ctl == null) { return; }
-        if (st != null && st.activeDetails != null) {
-            if (!st.activeDetails.Contains(ctl)) {
-                st.activeDetails.Add(ctl);
-            }
-            if (st.ownerControl != null) {
-                ctl.parent = st.ownerControl;
-            }
-        }
+        } finally { DataTable.CompBandExit(outerSeq); }
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return null; }
+        if (ctl == null) { return null; }
+        if (!DataTable.LayoutCompControl(app, ctl, col, cx, cy, cw, rowH, rowIdx, cc, st)) { return null; }
+        return ctl;
+    }
+
+    internal static bool LayoutCompControl(App app, Control ctl, DataColumn col,
+    int cx, int cy, int cw, int rowH, int rowIdx, int cc, DataTableState st) {
+        if (!DataTableVisualTree.AttachVisibleControl(st, ctl)) { return false; }
         ctl.MeasureTree(app);
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return false; }
         // 组件默认在格内垂直居中（DataColumn.VTop() 可声明顶对齐）：
         // 叶子控件都在 Arrange 矩形的顶边作画，行高大于控件自然高度
         // 时把矩形整体下移半格高差即可居中。矩阵形态（cellType 9，
@@ -110,19 +118,30 @@ public partial class DataTable {
             if (natH > 0 && natH < rowH) { cy = cy + (rowH - natH) / 2; }
         }
         ctl.Arrange(cx, cy, cw, rowH);
-        ctl.RenderTree(app);
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return false; }
+        if (st != null && st.visualTree != null) {
+            st.visualTree.RecordComponent(rowIdx, cc, ctl);
+        }
+        return true;
+    }
+
+    internal static void CommitCompCell(CellComp comp, Control ctl, DataColumn col, string val,
+    int rowIdx, int cc, DataSource src, DataTableState st) {
         // 写回轮询（WidgetCol 形态）：控件本帧产生了新值则按
         // ToggleBoolCell 同款通道提交——记撤销、写源、Raise
         // CellEdit；值与单元格现状相同则静默跳过。
         if (st != null && col.cellType == 10) {
             string nv = "";
-            if (comp.TakeCommit(ctl, ref nv) && src != null
-                && rowIdx >= 0 && cc >= 0 && nv != val) {
+            bool commit = comp.TakeCommit(ctl, ref nv);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            if (commit && src != null && rowIdx >= 0 && cc >= 0 && nv != val) {
                 DataTable.Journal(st, RowEdit.Cell(rowIdx, cc, val, nv));
                 src.SetCell(rowIdx, cc, nv);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
                 st.hitRow = rowIdx;
                 st.hitCol = cc;
                 st.CellEdit.Raise();
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
             }
         }
         // 点击归一：组件内发生了激活（如 BandGrid 双击），把
@@ -130,7 +149,9 @@ public partial class DataTable {
         if (st != null) {
             int pr = 0;
             int pc = 0;
-            if (comp.CompPos(ctl, ref pr, ref pc)) {
+            bool activated = comp.CompPos(ctl, ref pr, ref pc);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            if (activated) {
                 if (rowIdx >= 0 && cc >= 0) {
                     st.hitRow = rowIdx;
                     st.hitCol = cc;
@@ -138,6 +159,7 @@ public partial class DataTable {
                 st.compR = pr;
                 st.compC = pc;
                 st.CellClick.Raise();
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
             }
         }
     }
@@ -157,7 +179,7 @@ public partial class DataTable {
     public static RowKey CompPoolKey(DataTableState st, RowKey key) {
         if (st == null || key == null) { return key; }
         return RowKey.Of("t" + Convert.ToString(st.inst) + "@"
-                         + key.Canonical());
+        + key.Canonical());
     }
 
     // 测试钩子：两个状态实例对同一行键得到不同池键，且同一实例

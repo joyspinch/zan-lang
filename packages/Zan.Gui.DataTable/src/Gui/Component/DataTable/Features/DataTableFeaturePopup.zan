@@ -1,0 +1,598 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// Feature panels are real trees. OverlayHost owns dismissal, focus and outside input.
+internal class DataTableFeaturePopup : Control {
+    internal weak DataTableState state;
+    internal weak Control anchor;
+    internal DataTableInputContext context;
+    internal int kind;
+    internal int column = -1;
+    internal int viewX;
+    internal int viewY;
+    internal int viewW;
+    internal int viewH;
+    private List<DataTablePopupPart> parts = new List<DataTablePopupPart>();
+    private List<DataTablePopupPart> previous;
+    private VirtualList list;
+    private List<int> rowColumns = new List<int>();
+    private List<string> rowValues = new List<string>();
+    private string listStamp = "";
+    private bool syncing;
+
+    internal DataTableFeaturePopup() { this.InitControl("datatable-feature", 5); }
+
+    private bool Current() {
+        return state != null && state.featurePopup == this && context != null && context.Current();
+    }
+
+    internal void Prepare(App app, DataTableInputContext snapshot, Control owner, int mode,
+    int x, int y, int width, int height) {
+        context = snapshot; state = snapshot.state; anchor = owner;
+        kind = mode; column = mode == 1 ? state.openMenu : state.editCol;
+        viewX = x; viewY = y; viewW = width; viewH = height;
+        syncing = true;
+        previous = parts; parts = new List<DataTablePopupPart>();
+        try {
+            if (mode == 1) { PrepareFilter(app); }
+            else if (mode == 2) { PrepareChooser(app); }
+            else if (mode == 3) { PrepareClear(app); }
+            else if (mode == 4) { PrepareEditor(app); }
+            else { PrepareVisual(app); }
+            if (!Current()) { return; }
+            List<Control> removed = new List<Control>();
+            for (int i = 0; i < this.ChildCount(); i = i + 1) {
+                Control child = this.ChildAt(i);
+                bool keep = false;
+                for (int j = 0; j < parts.Count; j = j + 1) {
+                    if (parts[j].control == child) { keep = true; break; }
+                }
+                if (!keep) { removed.Add(child); }
+            }
+            this.RemoveChildren(removed, () => { return this.Current(); });
+        } finally { previous = null; syncing = false; }
+    }
+
+    private Control Prior(string key) {
+        for (int i = 0; previous != null && i < previous.Count; i = i + 1) {
+            if (previous[i].key == key) { return previous[i].control; }
+        }
+        return null;
+    }
+
+    private void Place(string key, Control child, int x, int y, int w, int h) {
+        parts.Add(new DataTablePopupPart(key, child, new Rect(x, y, w, h)));
+        if (child.parent != this) { this.Add(child); }
+    }
+
+    private void Caption(string key, string text, int x, int y, int w, int h) {
+        Label label = (Label)Prior(key);
+        if (label == null) { label = new Label(text); }
+        label.Text = text;
+        Place(key, label, x, y, w, h);
+    }
+
+    private void ButtonAt(string key, string text, int action, int argument,
+    int x, int y, int w, int h, bool active) {
+        DataTablePopupButton button = (DataTablePopupButton)Prior(key);
+        if (button == null) { button = new DataTablePopupButton(this, action, argument); }
+        button.SetText(text);
+        if (active) { button.AddClass("primary"); } else { button.RemoveClass("primary"); }
+        Place(key, button, x, y, w, h);
+    }
+
+    private void InputAt(string key, string value, string hint, int field,
+    int x, int y, int w, int h) {
+        DataTablePopupInput input = (DataTablePopupInput)Prior(key);
+        if (input == null) { input = new DataTablePopupInput(this, field, hint); }
+        if (input.GetText() != value) { input.SetText(value); }
+        Place(key, input, x, y, w, h);
+    }
+
+    private void CheckAt(string key, string text, bool value, int action, int argument,
+    int x, int y, int w, int h) {
+        DataTablePopupCheck check = (DataTablePopupCheck)Prior(key);
+        if (check == null) { check = new DataTablePopupCheck(this, action, argument); }
+        check.SetLabel(text);
+        check.SetChecked(value);
+        Place(key, check, x, y, w, h);
+    }
+
+    private void ListAt(App app, string stamp, int count, int rowHeight,
+    int x, int y, int w, int h) {
+        if (list == null) { list = new VirtualList(); list.SetRowHeight(rowHeight); }
+        if (stamp != listStamp) {
+            listStamp = stamp;
+            DataTablePopupRows rows = new DataTablePopupRows(this);
+            list.SetRows(count, rows.Build);
+            list.Refresh();
+        }
+        Place("list", list, x, y, w, h);
+    }
+
+    internal Control BuildRow(int index) {
+        if (!Current()) { return new Label(""); }
+        DataTableState st = state;
+        if (kind == 2) {
+            int col = rowColumns[index];
+            Panel row = Panel.Row(); row.Pad(0); row.Gap(2);
+            DataTablePopupCheck check = new DataTablePopupCheck(this, 20, col);
+            check.SetLabel(context.columns[col].title);
+            check.SetChecked(!(col < st.colHidden.Count && st.colHidden[col]));
+            check.Grow(); row.Add(check);
+            DataTablePopupButton left = new DataTablePopupButton(this, 21, col);
+            left.SetText("←"); left.Width(26); row.Add(left);
+            DataTablePopupButton right = new DataTablePopupButton(this, 22, col);
+            right.SetText("→"); right.Width(26); row.Add(right);
+            return row;
+        }
+        if (kind == 3) {
+            CfClearItem item = st.cfClearItems[index];
+            DataTablePopupCheck check = new DataTablePopupCheck(this, 30, index);
+            check.SetLabel(context.columns[item.column].title + " — "
+            + DataTable.CfRuleLabel(st, context.columns[item.column], item.column));
+            check.SetChecked(item.selected);
+            return check;
+        }
+        if (kind == 4) {
+            DataTablePopupButton button = new DataTablePopupButton(this, 40, index);
+            button.SetText(rowValues[index]);
+            return button;
+        }
+        DataTablePopupCheck valueCheck = new DataTablePopupCheck(this, 10, index);
+        valueCheck.SetLabel(rowValues[index]);
+        valueCheck.SetChecked(!st.filters[column].IsHidden(rowValues[index]));
+        return valueCheck;
+    }
+
+    private void PrepareChooser(App app) {
+        int p = app.Scale(10); int gap = app.Scale(6); int box = app.Scale(26);
+        prefW = app.Scale(244); prefH = app.Scale(326);
+        InputAt("search", state.colChooserSearch, "Search columns...", 10,
+        p, p, prefW - p * 2, box);
+        rowColumns = DataTable.ChooserOrder(state, context.columns);
+        string stamp = "chooser:" + state.colChooserSearch + ":";
+        for (int i = 0; i < rowColumns.Count; i = i + 1) {
+            int col = rowColumns[i];
+            stamp = stamp + Convert.ToString(col) + ":" + Convert.ToString(state.colHidden[col]) + ";";
+        }
+        ListAt(app, stamp, rowColumns.Count, 26, p, p + box + gap,
+        prefW - p * 2, app.Scale(232));
+        int bw = (prefW - p * 2 - gap) / 2; int by = prefH - p - app.Scale(28);
+        ButtonAt("all", "Show All", 23, 0, p, by, bw, app.Scale(28), false);
+        ButtonAt("close", "Close", 1, 0, p + bw + gap, by, bw, app.Scale(28), false);
+    }
+
+    private void PrepareFilter(App app) {
+        int p = app.Scale(10); int gap = app.Scale(4); int rh = app.Scale(28);
+        int box = app.Scale(26); int mi = column; ColFilter filter = state.filters[mi];
+        prefW = app.Scale(256); prefH = app.Scale(348);
+        if (state.filterTab == 3) {
+            prefH = app.Scale(8) + rh + app.Scale(6) + rh + app.Scale(8)
+            + DataTable.RulesTabHeight(app, filter, context.columns[mi]) + app.Scale(40);
+        }
+        int inner = prefW - p * 2;
+        Caption("title", context.columns[mi].title, p, app.Scale(8), inner - app.Scale(60), rh);
+        ButtonAt("asc", "↑", 2, 1, prefW - p - app.Scale(56), app.Scale(8), app.Scale(26), rh, false);
+        ButtonAt("desc", "↓", 2, 2, prefW - p - app.Scale(26), app.Scale(8), app.Scale(26), rh, false);
+        int cy = app.Scale(8) + rh + app.Scale(6); int tw = inner / 4;
+        List<string> tabs = new List<string>{"Values", "Text", "Batch", "Rules"};
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            ButtonAt("tab" + Convert.ToString(i), tabs[i], 3, i, p + tw * i, cy,
+            tw, rh, state.filterTab == i);
+        }
+        cy = cy + rh + app.Scale(8);
+        int bottom = prefH - app.Scale(40);
+        if (state.filterTab == 0) {
+            InputAt("search", state.searchText, "Search values...", 1, p, cy, inner, box);
+            cy = cy + box + app.Scale(6);
+            CheckAt("select-all", "(Select All)", filter.hidden.Count == 0, 11, 0,
+            p, cy, inner, app.Scale(24));
+            cy = cy + app.Scale(24);
+            if (state.menuSearchCache != state.searchText) {
+                state.menuMatched = new List<string>();
+                for (int i = 0; i < state.menuVals.Count; i = i + 1) {
+                    if (DataTable.ContainsCI(state.menuVals[i], state.searchText)) {
+                        state.menuMatched.Add(state.menuVals[i]);
+                    }
+                }
+                state.menuSearchCache = state.searchText;
+            }
+            rowValues = state.menuMatched;
+            string stamp = "values:" + Convert.ToString(mi) + ":" + state.searchText + ":";
+            for (int i = 0; i < filter.hidden.Count; i = i + 1) { stamp = stamp + filter.hidden[i] + ";"; }
+            ListAt(app, stamp, rowValues.Count, 24, p, cy, inner, bottom - cy);
+        } else if (state.filterTab == 1) {
+            List<string> modes = new List<string>{"Contains", "Equals", "Starts", "Ends"};
+            int cw = (inner - app.Scale(9)) / 4;
+            for (int i = 0; i < modes.Count; i = i + 1) {
+                ButtonAt("text-mode" + Convert.ToString(i), modes[i], 4, i + 1,
+                p + (cw + app.Scale(3)) * i, cy, cw, app.Scale(24), filter.textMode == i + 1);
+            }
+            cy = cy + app.Scale(32);
+            InputAt("query", filter.textQuery, "Enter filter text...", 2, p, cy, inner, box);
+            Caption("hint", "Live-filters as you type (case-insensitive).", p,
+            cy + box + app.Scale(10), inner, app.Scale(40));
+        } else if (state.filterTab == 2) {
+            Caption("batch-label", "One condition per line:", p, cy, inner, app.Scale(22));
+            cy = cy + app.Scale(22);
+            DataTablePopupArea area = (DataTablePopupArea)Prior("batch");
+            if (area == null) { area = new DataTablePopupArea(this); }
+            string text = "";
+            for (int i = 0; i < state.batchLines.Count; i = i + 1) {
+                if (i > 0) { text = text + "\n"; } text = text + state.batchLines[i];
+            }
+            if (area.GetText() != text) { area.SetText(text); }
+            int ah = bottom - cy - app.Scale(66); if (ah < app.Scale(48)) { ah = app.Scale(48); }
+            Place("batch", area, p, cy, inner, ah); cy = cy + ah + app.Scale(6);
+            CheckAt("exact", "Exact match", state.batchExactFlag == 1, 12, 0,
+            p, cy, inner, app.Scale(22)); cy = cy + app.Scale(28);
+            int bw = (inner - app.Scale(6)) / 2;
+            ButtonAt("keep", "Keep matching", 13, 1, p, cy, bw, box, true);
+            ButtonAt("exclude", "Exclude", 13, 0, p + bw + app.Scale(6), cy, bw, box, false);
+        } else { PrepareRules(app, filter, p, cy, inner); }
+        int bw = (inner - app.Scale(6)) / 2; int by = bottom + app.Scale(6);
+        ButtonAt("clear", "Clear Filter", 14, 0, p, by, bw, app.Scale(28), false);
+        ButtonAt("close", "Close", 1, 0, p + bw + app.Scale(6), by, bw, app.Scale(28), false);
+    }
+
+    private void PrepareRules(App app, ColFilter filter, int p, int cy, int inner) {
+        int gap = app.Scale(4); int ch = app.Scale(22); int box = app.Scale(26);
+        int labelH = Canvas.FontHeight(Style.FontFallback(app, "small")) + gap;
+        Caption("compare-label", "Compare", p, cy, inner, labelH); cy = cy + labelH;
+        List<string> operators = new List<string>{">", ">=", "<", "<=", "=", "<>", "in", "not in"};
+        int cw = (inner - gap * 3) / 4;
+        for (int i = 0; i < operators.Count; i = i + 1) {
+            ButtonAt("compare" + Convert.ToString(i), operators[i], 5, i + 1,
+            p + (cw + gap) * (i % 4), cy + (ch + gap) * (i / 4), cw, ch, filter.cmpMode == i + 1);
+        }
+        cy = cy + (ch + gap) * 2; int half = (inner - gap) / 2;
+        ButtonAt("empty", "is empty", 5, 9, p, cy, half, ch, filter.cmpMode == 9);
+        ButtonAt("not-empty", "not empty", 5, 10, p + half + gap, cy, half, ch, filter.cmpMode == 10);
+        cy = cy + ch + app.Scale(6);
+        if (filter.cmpMode != 0 && filter.cmpMode != 9 && filter.cmpMode != 10) {
+            bool two = filter.cmpMode == 7 || filter.cmpMode == 8;
+            InputAt("operand-a", filter.cmpA, "value", 4, p, cy, two ? half : inner, box);
+            if (two) { InputAt("operand-b", filter.cmpB, "and", 5, p + half + gap, cy, half, box); }
+            cy = cy + box + gap;
+        }
+        cy = cy + app.Scale(6);
+        if (context.columns[column].isDate) {
+            Caption("date-label", "Date range", p, cy, inner, labelH); cy = cy + labelH;
+            List<string> dates = new List<string>{"Today", "Yesterday", "This week", "Last 7d", "This month", "Last 30d",
+            "Quarter", "This year", "YTD", "Past", "Future"};
+            int width = (inner - gap * 2) / 3;
+            for (int i = 0; i < dates.Count; i = i + 1) {
+                ButtonAt("date" + Convert.ToString(i), dates[i], 6, i + 1,
+                p + (width + gap) * (i % 3), cy + (ch + gap) * (i / 3), width, ch, filter.datePreset == i + 1);
+            }
+            cy = cy + (ch + gap) * 4 + app.Scale(6);
+        }
+        Caption("top-label", "Top / bottom", p, cy, inner, labelH); cy = cy + labelH;
+        List<string> tops = new List<string>{"Top N", "Bottom N", "Top N%", "Bot N%", "Above avg", "Below avg"};
+        int third = (inner - gap * 2) / 3;
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            ButtonAt("top" + Convert.ToString(i), tops[i], 7, i + 1,
+            p + (third + gap) * (i % 3), cy + (ch + gap) * (i / 3), third, ch, filter.topMode == i + 1);
+        }
+        cy = cy + (ch + gap) * 2;
+        if (filter.topMode >= 1 && filter.topMode <= 4) {
+            Caption("n-label", "N", p, cy, app.Scale(20), box);
+            InputAt("n", Convert.ToString(filter.topN), "10", 6, p + app.Scale(20), cy, app.Scale(64), box);
+            ButtonAt("minus", "−", 8, -1, p + app.Scale(88), cy, app.Scale(24), box, false);
+            ButtonAt("plus", "+", 8, 1, p + app.Scale(116), cy, app.Scale(24), box, false);
+        }
+    }
+
+    private void PrepareClear(App app) {
+        int p = app.Scale(16); int rh = app.theme.heightMedium; int bh = app.theme.heightSmall;
+        prefW = DataTable.MinI(app.Scale(440), viewW - app.Scale(16));
+        prefH = DataTable.MinI(p * 2 + rh + app.Scale(20) + state.cfClearItems.Count * rh + bh,
+        viewH - app.Scale(16));
+        Caption("title", "Clear formatting rules", p, p, prefW - p * 2, rh);
+        string stamp = "clear:";
+        for (int i = 0; i < state.cfClearItems.Count; i = i + 1) {
+            stamp = stamp + Convert.ToString(state.cfClearItems[i].selected) + ":";
+        }
+        ListAt(app, stamp, state.cfClearItems.Count, app.theme.heightMedium * 1000 / app.Scale(1000), p, p + rh + app.Scale(10),
+        prefW - p * 2, prefH - p * 2 - rh - app.Scale(20) - bh);
+        int bw = (prefW - p * 2 - app.Scale(12)) / 3; int y = prefH - p - bh;
+        ButtonAt("selected", "Clear selected", 31, 0, p, y, bw, bh, true);
+        ButtonAt("all", "Clear all", 31, 1, p + bw + app.Scale(6), y, bw, bh, false);
+        ButtonAt("close", "Close", 1, 0, p + (bw + app.Scale(6)) * 2, y, bw, bh, false);
+    }
+
+    private void PrepareEditor(App app) {
+        DataColumn col = context.columns[state.editCol];
+        if (col.editorKind == 2) {
+            Calendar calendar = (Calendar)Prior("calendar");
+            if (calendar == null) {
+                DataTablePopupCalendar created = new DataTablePopupCalendar(this);
+                calendar = created;
+            }
+            int day = DataTable.ParseDate(state.editBuf, col.dateOrder);
+            if (day == DataTable.NoDate()) { day = DataTable.Today(); }
+            calendar.SetDate(DateTime.FromUnixSeconds(day * 86400));
+            prefW = app.Scale(300); prefH = app.Scale(290);
+            Place("calendar", calendar, 0, 0, prefW, prefH);
+        } else {
+            rowValues = new List<string>();
+            for (int i = 0; i < state.edPopItems.Count; i = i + 1) {
+                rowValues.Add(col.choices[state.edPopItems[i]]);
+            }
+            prefW = app.Scale(240); prefH = DataTable.MinI(app.Scale(240), rowValues.Count * app.Scale(28));
+            if (prefH < app.Scale(28)) { prefH = app.Scale(28); }
+            string stamp = "editor:" + state.editBuf;
+            for (int i = 0; i < rowValues.Count; i = i + 1) { stamp = stamp + ":" + rowValues[i]; }
+            ListAt(app, stamp, rowValues.Count, 28, 0, 0, prefW, prefH);
+        }
+    }
+
+    private void PrepareVisual(App app) {
+        DataTablePopupVisual visual = (DataTablePopupVisual)Prior("visual");
+        if (visual == null) { visual = new DataTablePopupVisual(this); }
+        prefW = viewW; prefH = viewH;
+        Place("visual", visual, 0, 0, prefW, prefH);
+        if (kind == 5) {
+            int size = app.Scale(22); int margin = app.Scale(20);
+            ButtonAt("close", "×", 1, 0, prefW - margin - size - app.Scale(8),
+            margin + (app.theme.heightLarge - size) / 2, size, size, false);
+        } else {
+            DataTableUiExportProgress.SyncUi();
+            int px; int py; int pw; int ph;
+            DataTable.ExportUiRect(app, 0, 0, prefW, prefH, out px, out py, out pw, out ph);
+            string text = state.exportUi.finished ? "Close" : "Cancel";
+            int width = Canvas.MeasureText(text, Style.FontFallback(app, "small")) + app.Scale(24);
+            ButtonAt("close", text, 50, 0, px + pw - app.Scale(16) - width,
+            py + ph - app.Scale(16) - app.theme.heightSmall, width, app.theme.heightSmall, false);
+        }
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w; bh = h;
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            DataTablePopupPart part = parts[i];
+            part.control.MeasureTree(this.App);
+            Rect rect = part.rect;
+            part.control.Arrange(x + rect.x, y + rect.y, rect.width, rect.height);
+        }
+    }
+
+    public override void OnPaint(App app) {
+        if (kind >= 5) { return; }
+        StyleBox surface = Style.Part(app, "datatable", "menu", "", "", "", Style.SNormal());
+        app.canvas.FillRoundRect(bx, by, bw, bh, app.theme.borderRadiusMedium, surface.BgOr(0));
+        app.canvas.DrawRoundRect(bx, by, bw, bh, app.theme.borderRadiusMedium, surface.BorderOr(0), 1);
+    }
+
+    internal void Execute(int action, int argument, bool value) {
+        if (syncing || !Current()) { return; }
+        DataTableInputContext proof = context; DataTableState st = state; App app = this.App;
+        if (action == 1) { Close(); return; }
+        if (action == 50) { CancelExport(); return; }
+        ColFilter filter = kind == 1 ? st.filters[column] : null;
+        bool query = false; bool columnsChanged = false;
+        if (action == 2) { DataTable.SortBy(st, column, argument); }
+        else if (action == 3) { st.filterTab = argument; st.editFocus = 0; }
+        else if (action == 4) { filter.textMode = argument; query = true; }
+        else if (action == 5) { filter.cmpMode = filter.cmpMode == argument ? 0 : argument; query = true; }
+        else if (action == 6) { filter.datePreset = filter.datePreset == argument ? 0 : argument; query = true; }
+        else if (action == 7) { filter.topMode = filter.topMode == argument ? 0 : argument; query = true; }
+        else if (action == 8) { filter.topN = DataTable.MaxI(1, filter.topN + argument); query = true; }
+        else if (action == 10) { filter.Toggle(rowValues[argument]); query = true; }
+        else if (action == 11) { filter.hidden.Clear(); query = true; }
+        else if (action == 12) { st.batchExactFlag = value ? 1 : 0; }
+        else if (action == 13) {
+            filter.batchTerms.Clear();
+            for (int i = 0; i < st.batchLines.Count; i = i + 1) {
+                if (st.batchLines[i] != "") { filter.batchTerms.Add(st.batchLines[i]); }
+            }
+            filter.batchExact = st.batchExactFlag == 1; filter.batchKeep = argument == 1; query = true;
+        } else if (action == 14) {
+            st.filters[column] = new ColFilter(); st.searchText = ""; st.editFocus = 0;
+            st.batchLines = new List<string>{""}; st.batchExactFlag = 0; query = true;
+        } else if (action == 20) { DataTable.ChooserToggle(st, proof.columns, argument, value); columnsChanged = true; }
+        else if (action == 21 || action == 22) {
+            DataTable.ChooserMove(st, proof.columns, argument, action == 21); columnsChanged = true;
+        } else if (action == 23) { DataTable.ShowAllColumns(st); columnsChanged = true; }
+        else if (action == 30) { st.cfClearItems[argument].selected = value; }
+        else if (action == 31) { DataTable.ApplyCfClear(st, argument == 1); }
+        else if (action == 40) {
+            st.editBuf = rowValues[argument]; st.editCur = st.editBuf.Length;
+            st.edPopSel = st.edPopItems[argument]; st.edPopOpen = false;
+        }
+        if (app != null) { app.RequestRedraw(); }
+        if (query) { DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); return; }
+        if (columnsChanged) { st.ColumnResize.Raise(); return; }
+    }
+
+    internal void TextChanged(int field, string text) {
+        if (syncing || !Current()) { return; }
+        DataTableState st = state;
+        ColFilter filter = kind == 1 ? st.filters[column] : null;
+        bool query = false;
+        if (field == 10) { st.colChooserSearch = text; }
+        else if (field == 1) { st.searchText = text; }
+        else if (field == 2) { filter.textQuery = text; query = true; }
+        else if (field == 3) { st.batchLines = text.Split("\n"); }
+        else if (field == 4) { filter.cmpA = text; query = true; }
+        else if (field == 5) { filter.cmpB = text; query = true; }
+        else if (field == 6) {
+            int number = 0;
+            for (int i = 0; i < text.Length; i = i + 1) {
+                int ch = (int)text[i];
+                if (ch < 48 || ch > 57 || number >= 100000) { return; }
+                number = number * 10 + ch - 48;
+            }
+            filter.topN = number; query = true;
+        } else if (field == 20) {
+            st.editBuf = text; st.editCur = text.Length; st.edPopOpen = false;
+        }
+        if (this.App != null) { this.App.RequestRedraw(); }
+        if (query) { DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); }
+    }
+
+    private void CancelExport() {
+        DataTableExportUi ui = state != null ? state.exportUi : null;
+        if (ui == null) { return; }
+        if (ui.finished) { ui.visible = false; Close(); }
+        else { ui.cancel.Store(1); if (this.App != null) { this.App.RequestRedraw(); } }
+    }
+
+    private void Close() {
+        if (state == null) { return; }
+        if (kind == 1) { state.openMenu = -1; state.editFocus = 0; }
+        else if (kind == 2) { state.colChooserOpen = false; }
+        else if (kind == 3) { state.cfClearOpen = false; }
+        else if (kind == 4) { state.edPopOpen = false; }
+        else if (kind == 5) { state.chartOpen = false; }
+        else if (kind == 6 && state.exportUi != null) { state.exportUi.visible = false; }
+        App app = this.App;
+        app.overlayHost.Hide(this);
+        if (app != null) { app.RequestRedraw(); }
+    }
+
+    public override bool DismissOnOutsideClick() { return kind != 6; }
+    public override bool OnPopupEscape(App app) {
+        if (kind == 6) { CancelExport(); return true; }
+        return false;
+    }
+    public override void OnPopupDismissed() {
+        if (state == null || state.featurePopup != this) { return; }
+        if (kind == 1 && state.openMenu == column) { state.openMenu = -1; state.editFocus = 0; }
+        else if (kind == 2) { state.colChooserOpen = false; }
+        else if (kind == 3) { state.cfClearOpen = false; }
+        else if (kind == 4) { state.edPopOpen = false; }
+        else if (kind == 5) { state.chartOpen = false; }
+        else if (kind == 6 && state.exportUi != null && state.exportUi.finished) { state.exportUi.visible = false; }
+    }
+}
+
+internal class DataTablePopupPart {
+    internal string key;
+    internal Control control;
+    internal Rect rect;
+    internal DataTablePopupPart(string key, Control control, Rect rect) {
+        this.key = key; this.control = control; this.rect = rect;
+    }
+}
+
+internal class DataTablePopupRows {
+    private weak DataTableFeaturePopup popup;
+    internal DataTablePopupRows(DataTableFeaturePopup popup) { this.popup = popup; }
+    internal Control Build(int index) { return popup != null ? popup.BuildRow(index) : new Label(""); }
+}
+
+internal class DataTablePopupRelay {
+    private weak DataTableFeaturePopup popup;
+    private int action;
+    private int argument;
+    internal DataTablePopupRelay(DataTableFeaturePopup popup, int action, int argument) {
+        this.popup = popup; this.action = action; this.argument = argument;
+    }
+    internal void Selected(Control sender) { if (popup != null) { popup.Execute(action, argument, false); } }
+    internal void Toggled(Control sender) { if (popup != null) { popup.Execute(action, argument, ((Checkbox)sender).IsChecked()); } }
+    internal void Edited(Control sender) { if (popup != null) { popup.TextChanged(action, ((Input)sender).GetText()); } }
+    internal void AreaEdited(Control sender) { if (popup != null) { popup.TextChanged(3, ((TextArea)sender).GetText()); } }
+    internal void DateChanged(Control sender) {
+        if (popup == null || popup.context == null || popup.state == null) { return; }
+        DateTime date = ((Calendar)sender).GetDate();
+        int day = DateTime.DaysFromCivil(date.Year(), date.Month(), date.Day());
+        popup.TextChanged(20, DataTable.FormatDate(day,
+        DataTable.DateStoreFormat(popup.context.columns[popup.state.editCol])));
+    }
+}
+
+internal class DataTablePopupButton : Button {
+    internal DataTablePopupButton(DataTableFeaturePopup popup, int action, int argument) {
+        DataTablePopupRelay relay = new DataTablePopupRelay(popup, action, argument);
+        this.Click.AddS(relay.Selected);
+    }
+}
+
+internal class DataTablePopupCheck : Checkbox {
+    internal DataTablePopupCheck(DataTableFeaturePopup popup, int action, int argument) : base(" ") {
+        DataTablePopupRelay relay = new DataTablePopupRelay(popup, action, argument);
+        this.Change.AddS(relay.Toggled);
+    }
+}
+
+internal class DataTablePopupInput : Input {
+    internal DataTablePopupInput(DataTableFeaturePopup popup, int field, string hint) {
+        this.InitInput("", hint);
+        DataTablePopupRelay relay = new DataTablePopupRelay(popup, field, 0);
+        this.Change.AddS(relay.Edited);
+    }
+}
+
+internal class DataTablePopupArea : TextArea {
+    internal DataTablePopupArea(DataTableFeaturePopup popup) {
+        this.InitTextArea("", "");
+        DataTablePopupRelay relay = new DataTablePopupRelay(popup, 3, 0);
+        this.Change.AddS(relay.AreaEdited);
+    }
+}
+
+internal class DataTablePopupCalendar : Calendar {
+    internal DataTablePopupCalendar(DataTableFeaturePopup popup) {
+        DataTablePopupRelay relay = new DataTablePopupRelay(popup, 20, 0);
+        this.Change.AddS(relay.DateChanged);
+    }
+}
+
+internal class DataTablePopupVisual : Control {
+    private weak DataTableFeaturePopup popup;
+    internal DataTablePopupVisual(DataTableFeaturePopup popup) { this.InitControl("datatable-feature-visual", 1); this.popup = popup; }
+    public override void OnPaint(App app) {
+        if (popup == null || popup.state == null) { return; }
+        if (popup.kind == 5) { DataTable.RenderChart(app, bx, by, bw, bh, popup.state); }
+        else { DataTable.RenderExportUi(app, bx, by, bw, bh, popup.state); }
+    }
+}
+
+public partial class DataTable {
+    internal static void PrepareFeaturePopups(App app, DataTableState st, List<DataColumn> cols,
+    DataSource src, int x, int y, int viewW, int viewH) {
+        if (st == null || st.retainedTree == null) { return; }
+        DataTableInputContext snapshot = st.retainedTree.InputContext();
+        if (snapshot == null) { return; }
+        int kind = 0;
+        if (st.openMenu >= 0 && st.openMenu < cols.Count) { kind = 1; }
+        if (st.colChooserOpen) { kind = 2; }
+        if (st.cfClearOpen) { kind = 3; }
+        if (st.editing && st.edPopOpen) { kind = 4; }
+        if (st.chartOpen) { kind = 5; }
+        if (st.ExportUiOpen()) { kind = 6; }
+        DataTableFeaturePopup popup = st.featurePopup;
+        if (kind == 0) { if (popup != null) { app.overlayHost.Hide(popup); } return; }
+        Control owner = st.ownerControl;
+        if (owner == null) { return; }
+        if (popup == null || popup.kind != kind || (kind == 1 && popup.column != st.openMenu)) {
+            DataTableFeaturePopup retired = popup;
+            popup = new DataTableFeaturePopup();
+            st.featurePopup = popup;
+            if (retired != null) { app.overlayHost.Hide(retired); }
+            if (!snapshot.Current()) { return; }
+        }
+        popup.Prepare(app, snapshot, owner, kind, x, y, viewW, viewH);
+        if (!snapshot.Current()) { return; }
+        int px = x; int py = y;
+        if (kind == 1) {
+            py = snapshot.frame.y + snapshot.frame.headerH;
+            for (int i = 0; i < snapshot.frame.columns.Count; i = i + 1) {
+                if (snapshot.frame.columns[i].column == st.openMenu) { px = snapshot.frame.columns[i].x; break; }
+            }
+        } else if (kind == 2) { px = x + viewW - popup.prefW - app.Scale(4); py = y + app.Scale(4); }
+        else if (kind == 3) { px = x + (viewW - popup.prefW) / 2; py = y + (viewH - popup.prefH) / 2; }
+        else if (kind == 4) {
+            Rect rect = DataTable.EditorRect(snapshot.frame, snapshot.body, cols, st);
+            if (rect == null) { st.edPopOpen = false; app.overlayHost.Hide(popup); return; }
+            px = rect.x; py = rect.y + rect.height;
+        }
+        if (app.overlayHost.ActiveRoot() != popup) { app.overlayHost.ShowAtAnchor(app, owner, popup, px, py); }
+        else { popup.Arrange(px, py, popup.prefW, popup.prefH); }
+    }
+}

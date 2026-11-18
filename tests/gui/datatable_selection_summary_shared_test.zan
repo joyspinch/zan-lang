@@ -1,0 +1,106 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.DataTable;
+
+namespace Gui.Component.DataTable;
+
+// CellNum intentionally disagrees with CellText: footer must honor the source contract.
+class SelectionSummaryCountingSource : DataSource {
+    public int textReads;
+    public int numberReads;
+    public string first = "1.75";
+
+    public override int RowCount() { return 2; }
+    public override string CellText(int row, int col) {
+        textReads = textReads + 1;
+        if (col == 0) { return row == 0 ? first : "-2.25"; }
+        if (col == 1) { return row == 0 ? " 3.5 " : "words"; }
+        if (col == 2) { return row == 0 ? "100.5" : "200.5"; }
+        if (col == 3) { return "ignored"; }
+        return "";
+    }
+    public override int CellNum(int row, int col) {
+        numberReads = numberReads + 1;
+        if (col == 0) { return row == 0 ? 17 : -22; }
+        if (col == 2) { return 999; }
+        return 7;
+    }
+    public void ResetReads() { textReads = 0; numberReads = 0; }
+}
+
+class Program {
+    static bool Near(double a, double b) { double d = a - b; return d > -0.000001 && d < 0.000001; }
+
+    static void Main() {
+        SelectionSummaryCountingSource src = new SelectionSummaryCountingSource();
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Numeric("Number", 80));
+        cols.Add(new DataColumn("Text", 80));
+        cols.Add(DataColumn.Formula("Formula", 80, "1.75"));
+        cols.Add(DataColumn.Formula("Broken", 80, "1 +"));
+        DataTableState st = new DataTableState();
+        DataTable.EnsureInit(st, cols, src);
+        DataTable.Recompute(st, cols, src);
+
+        src.ResetReads();
+        SelectionStatistics empty = new SelectionStatistics(true, true);
+        empty.Read(st, cols, src);
+        Console.WriteLine("empty=" + (empty.summary.cellCount == 0 && empty.footerCount == 0
+        && src.textReads == 0 && src.numberReads == 0));
+
+        st.rangeR0 = 0; st.rangeR1 = 1; st.rangeC0 = 0; st.rangeC1 = 2;
+        DataTable.ArchiveRange(st);
+        // Reversed and overlapping: union remains two rows by four columns.
+        st.rangeR0 = 1; st.rangeR1 = 0; st.rangeC0 = 3; st.rangeC1 = 1;
+        src.ResetReads();
+        SelectionStatistics frame = new SelectionStatistics(true, true);
+        frame.Read(st, cols, src);
+        SelectionSummary summary = frame.summary;
+        Console.WriteLine("union=" + (summary.cellCount == 8 && summary.numericCount == 5));
+        Console.WriteLine("footerPolicy=" + (frame.footerCount == 6 && frame.footerSum == 11
+        && frame.footerSum / frame.footerCount == 1));
+        Console.WriteLine("textPolicy=" + (Program.Near(summary.sum, 304.0)
+        && Program.Near(summary.average, 60.8) && Program.Near(summary.min, -2.25)
+        && Program.Near(summary.max, 200.5)));
+        Console.WriteLine("oneReadPerPolicy=" + (src.textReads == 8 && src.numberReads == 4));
+        frame.Read(st, cols, src);
+        string formatted = frame.summary.Format();
+        Console.WriteLine("sameFrameReuse=" + (src.textReads == 8 && src.numberReads == 4
+        && formatted.IndexOf("Sum: 304.00") >= 0));
+
+        // Direct source mutation has no revision: the next frame must still see it.
+        src.first = "9.25";
+        src.ResetReads();
+        SelectionStatistics next = new SelectionStatistics(true, true);
+        next.Read(st, cols, src);
+        Console.WriteLine("nextFrameFresh=" + (Program.Near(next.summary.sum, 311.5)
+        && next.footerSum == 11 && src.textReads == 8 && src.numberReads == 4));
+        src.ResetReads();
+        SelectionSummary query = DataTable.ComputeSelectionSummary(st, cols, src);
+        Console.WriteLine("queryTextOnly=" + (Program.Near(query.sum, 311.5)
+        && src.textReads == 8 && src.numberReads == 0));
+        src.ResetReads();
+        SelectionStatistics footer = new SelectionStatistics(true, false);
+        footer.Read(st, cols, src);
+        Console.WriteLine("footerOnly=" + (footer.footerSum == 11 && footer.footerCount == 6
+        && src.textReads == 0 && src.numberReads == 4));
+
+        DataTable.ClearMulti(st);
+        DataTable.ClearRange(st);
+        st.dispFlat = false;
+        st.dispRows.Clear();
+        st.dispRows.Add(new DispRow(1, 0, 0));
+        st.dispRows.Add(new DispRow(0, 1, 1));
+        st.dispRows.Add(new DispRow(2, 1, 0));
+        st.dispRows.Add(new DispRow(0, 0, 2));
+        st.rangeR0 = 0; st.rangeR1 = 2; st.rangeC0 = 0; st.rangeC1 = 0;
+        src.ResetReads();
+        SelectionStatistics mapped = new SelectionStatistics(true, true);
+        mapped.Read(st, cols, src);
+        Console.WriteLine("displayMapping=" + (mapped.summary.cellCount == 1
+        && Program.Near(mapped.summary.sum, -2.25) && mapped.footerSum == -22
+        && src.textReads == 1 && src.numberReads == 1));
+        DataTable.InvalidateFormulaCache();
+    }
+}

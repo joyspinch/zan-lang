@@ -1,0 +1,414 @@
+using System;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+// Persistent input endpoint. Painting belongs to the table; routing belongs to this child.
+internal class DataTableInputRegion : Control {
+    internal string key;
+    internal int action;
+    internal int row;
+    internal int column;
+    internal string path = "";
+    internal FilterChip filterChip;
+    internal weak DataTableVisualTree tree;
+    internal weak DataTableState state;
+
+    public override int InputFocusCapabilities() { return 0; }
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        base.OnRoutedEvent(e);
+        DataTableVisualTree current = this.tree;
+        if (current == null || !e.GestureRouteCurrent()) { return; }
+        current.RouteRegion(this, e);
+    }
+
+    public override void OnPaint(App app) {
+        if (action < 26 || action > 28) { return; }
+        int visual = this.IsPressed(app) ? Style.SActive() : this.IsHovered(app) ? Style.SHover() : Style.SNormal();
+        Control.BareBox(app, "button", visual).Paint(app, bx, by, bw, bh);
+        string icon = action == 26 ? "chevron-up" : "chevron-down";
+        int color = Style.Part(app, "datatable", "icon", "", "", "", visual).FgOr(0);
+        app.canvas.DrawGlyphIn(icon, bx, by, bw, bh, app.Scale(12), color);
+    }
+}
+
+internal partial class DataTableVisualTree {
+    private DataTableInputRegion Region(App app, DataTableState st, string key, int action,
+    int row, int column, int x, int y, int w, int h) {
+        if (w <= 0 || h <= 0) { return null; }
+        DataTableInputControls controls = st.inputControls;
+        DataTableInputRegion region = null;
+        for (int i = 0; i < controls.regions.Count; i = i + 1) {
+            if (controls.regions[i].key == key) { region = controls.regions[i]; break; }
+        }
+        if (region == null) {
+            region = new DataTableInputRegion(); region.key = key;
+            controls.regions.Add(region);
+        }
+        region.tree = this; region.state = st; region.action = action; region.row = row; region.column = column;
+        region.a11yLabel = action == 1 ? "select-all" : action == 13 ? "select-row" : "";
+        region.a11yRole = action == 1 || action == 13 ? "checkbox" : "button";
+        DataTableVisualTree.LayoutControl(app, st, region, 10, row, column, x, y, w, h);
+        return region;
+    }
+
+    internal void PrepareRegions(App app, DataTableState st, List<DataColumn> cols,
+    DataSource src, DataTableFrame f, DataTableBodyLayout lay) {
+        Control host = this.owner;
+        int x = host.bx; int w = host.bw;
+        DataTableVisualTree.SetVisibleClip(st, x, host.by, w, host.bh);
+        int filterH = f.panelY - host.by;
+        if (filterH > 0) {
+            List<FilterChip> chips = DataTable.FilterChips(st, cols);
+            int clearW = chips.Count > 1 ? app.Scale(74) : 0;
+            if (clearW > 0) { this.Region(app, st, "clearfilters", 23, -1, -1,
+            x + w - clearW - app.Scale(6), host.by + app.Scale(5), clearW, filterH - app.Scale(10)); }
+            int cx = x + app.Scale(10);
+            int limit = x + w - clearW - app.Scale(8);
+            int chipH = filterH - app.Scale(10);
+            for (int i = 0; i < chips.Count; i = i + 1) {
+                int width = Canvas.MeasureText(chips[i].Text(), Style.FontFallback(app, "small")) + app.Scale(38);
+                if (cx + width > limit) { break; }
+                int close = app.Scale(14); int right = cx + width - close - app.Scale(6);
+                DataTableInputRegion body = this.Region(app, st, "filterchip:" + Convert.ToString(i), 24,
+                i, -1, cx, host.by + app.Scale(5), right - cx, chipH);
+                DataTableInputRegion remove = this.Region(app, st, "filterremove:" + Convert.ToString(i), 25,
+                i, -1, right, host.by + app.Scale(5) + (chipH - close) / 2, close, close);
+                if (body != null) { body.filterChip = chips[i]; }
+                if (remove != null) { remove.filterChip = chips[i]; }
+                cx = cx + width + app.Scale(8);
+            }
+        }
+        if (st.showSelect) {
+            this.Region(app, st, "all", 1, -1, -1, x + f.numW, f.y, f.selW, f.headerH);
+        }
+        for (int i = 0; i < f.columns.Count; i = i + 1) {
+            FrameColumn column = f.columns[i]; int cc = column.column;
+            DataColumn col = cols[cc]; int cw = st.dispW[cc];
+            int left = DataTable.BandLeft(column.band, f.firstDataX, f.bandX, f.rightX);
+            int right = DataTable.BandRight(column.band, f.firstDataX, f.bandX, f.bandW,
+            f.rightX, f.pinnedW, f.pinnedRW, f.clipRight);
+            DataTableVisualTree.SetVisibleClip(st, left, f.y, right - left, f.headerH);
+            if (column.x + cw <= left || column.x >= right) { continue; }
+            int top = col.band == "" && f.bandLevels > 0 ? f.y : f.titleTop;
+            int height = col.band == "" && f.bandLevels > 0 ? f.headerH : f.titleRowH;
+            int grip = app.theme.paddingSmall + app.Scale(7);
+            string key = Convert.ToString(cc);
+            DataTableInputRegion title = this.Region(app, st, "title:" + key, 2, -1, cc, column.x + grip, top,
+            cw - grip - f.menuIconW, height);
+            if (title != null) { title.a11yLabel = col.title; }
+            this.Region(app, st, "grip:" + key, 3, -1, cc, column.x, top, grip, height);
+            if (col.filterable || col.sortable) {
+                this.Region(app, st, "filter:" + key, 4, -1, cc,
+                column.x + cw - f.menuIconW - app.Scale(1), top, f.menuIconW, height);
+            }
+            if (col.resizable) {
+                int resizeW = app.Scale(6);
+                this.Region(app, st, "resize:" + key, 5, -1, cc,
+                column.x + cw - resizeW / 2, top, resizeW, height);
+            }
+        }
+        for (int level = 0; level < f.bandLevels; level = level + 1) {
+            List<BandSpan> spans = DataTable.BandRow(st, cols, f.columns, level);
+            for (int i = 0; i < spans.Count; i = i + 1) {
+                BandSpan span = spans[i]; FrameColumn first = f.columns[span.from];
+                int left = DataTable.BandLeft(first.band, f.firstDataX, f.bandX, f.rightX);
+                int right = DataTable.BandRight(first.band, f.firstDataX, f.bandX, f.bandW,
+                f.rightX, f.pinnedW, f.pinnedRW, f.clipRight);
+                DataTableVisualTree.SetVisibleClip(st, left, f.y, right - left, f.headerH);
+                DataTableInputRegion region = this.Region(app, st, "band:" + span.path, 6,
+                -1, -1, first.x + app.Scale(4), f.y + level * f.bandRowH, app.Scale(14), f.bandRowH);
+                if (region != null) { region.path = span.path; }
+            }
+        }
+        DataTableVisualTree.SetVisibleClip(st, x, host.by, w, host.bh);
+        if (f.groupPanelH > 0) {
+            int buttonW = app.Scale(74);
+            this.Region(app, st, "columns", 7, -1, -1, x + w - buttonW - app.Scale(6),
+            f.panelY + app.Scale(6), buttonW, f.groupPanelH - app.Scale(12));
+            List<GroupChipGeometry> chips = DataTable.GroupChipLayout(app, cols, st, x);
+            for (int i = 0; i < chips.Count; i = i + 1) {
+                GroupChipGeometry chip = chips[i]; int cc = st.groupCols[i];
+                string key = Convert.ToString(cc); int remove = app.Scale(20);
+                this.Region(app, st, "group:" + key, 8, -1, cc, chip.x,
+                f.panelY + app.Scale(5), chip.width - remove, f.groupPanelH - app.Scale(10));
+                this.Region(app, st, "ungroup:" + key, 9, -1, cc, chip.x + chip.width - remove,
+                f.panelY + app.Scale(5), remove, f.groupPanelH - app.Scale(10));
+            }
+        }
+        for (int r = 0; r < lay.visRows && lay.start + r < lay.total; r = r + 1) {
+            int order = lay.start + r; int row = DataTable.DispRowOf(st, order);
+            int top = lay.bodyTop + r * f.rowH; int kind = DataTable.DispKind(st, order);
+            string key = Convert.ToString(row);
+            if (kind == 2) { continue; }
+            if (kind == 1) {
+                GroupRow group = st.groups[row];
+                int checkX = x + f.numW + f.selW + group.level * app.Scale(16) + app.Scale(24);
+                this.Region(app, st, "groupcheck:" + key, 12, row, -1,
+                checkX, top, app.Scale(18), f.rowH);
+                continue;
+            }
+            if (!src.CellReady(row, 0)) { continue; }
+            if (st.showSelect) { this.Region(app, st, "rowcheck:" + key, 13, row, -1,
+            x + f.numW, top, f.selW, f.rowH); }
+            if (st.showRowNum && DataTable.CanExpand(st, src, row)) {
+                this.Region(app, st, "detail:" + key, 14, row, -1, x, top, app.Scale(16), f.rowH);
+            }
+            if (st.showRowNum && st.rowReorder && st.groupCols.Count == 0) {
+                this.Region(app, st, "rowgrip:" + key, 15, order, -1,
+                x + f.numW - app.Scale(10), top, app.Scale(10), f.rowH);
+            }
+            for (int i = 0; i < f.columns.Count; i = i + 1) {
+                FrameColumn column = f.columns[i]; int cc = column.column;
+                int left = DataTable.BandLeft(column.band, f.firstDataX, f.bandX, f.rightX);
+                int right = DataTable.BandRight(column.band, f.firstDataX, f.bandX, f.bandW,
+                f.rightX, f.pinnedW, f.pinnedRW, f.clipRight);
+                DataTableVisualTree.SetVisibleClip(st, left, lay.bodyTop, right - left, lay.bodyH);
+                if (DataTableVisualTree.PreparedControl(st, 0, row, cc) != null
+                || DataTableVisualTree.PreparedControl(st, 1, row, cc) != null
+                || DataTableVisualTree.PreparedPainter(st, row, cc) != 0) { continue; }
+                string cellKey = key + ":" + Convert.ToString(cc);
+                if (cols[cc].isBool && cols[cc].editable) {
+                    this.Region(app, st, "bool:" + cellKey, 16, row, cc,
+                    column.x, top, st.dispW[cc], f.rowH);
+                }
+                if (st.treeAdapter != null && cc == st.treeCol && DataTable.CanTreeExpand(st, src, row)) {
+                    this.Region(app, st, "tree:" + cellKey, 17, row, cc, column.x, top,
+                    app.Scale(16) * (DataTable.DispDepth(st, order) + 1), f.rowH);
+                }
+            }
+            DataTableVisualTree.SetVisibleClip(st, x, lay.bodyTop, w, lay.bodyH);
+        }
+        DataTableVisualTree.SetVisibleClip(st, x, host.by, w, host.bh);
+        if (st.allowAddRow && src.CanInsert() && lay.total - lay.start < lay.visRows) {
+            this.Region(app, st, "add", 18, -1, -1, x,
+            lay.bodyTop + (lay.total - lay.start) * f.rowH, w, f.rowH);
+        }
+        this.PrepareFooterChips(app, st, cols, src, lay);
+        if (!st.paged && lay.total > lay.visRows) {
+            int size = app.Scale(8);
+            this.Region(app, st, "vscroll", 10, -1, -1, x + w - size - app.Scale(2),
+            lay.bodyTop + app.Scale(2), size, lay.bodyH - app.Scale(4));
+        }
+        if (f.maxScrollX > 0) {
+            int size = app.Scale(8);
+            this.Region(app, st, "hscroll", 11, -1, -1, f.bandX + app.Scale(2),
+            lay.bodyTop + lay.bodyH - size - app.Scale(2), f.bandW - app.Scale(4), size);
+        }
+    }
+
+    private void PrepareFooterChips(App app, DataTableState st, List<DataColumn> cols,
+    DataSource src, DataTableBodyLayout lay) {
+        DataTableInputControls controls = st.inputControls;
+        controls.footerChips.Clear();
+        controls.statusText = "";
+        if (!st.showStatusBar) { return; }
+        int total = src.RowCount();
+        if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+        string text = DataTable.T("Rows", "行数:") + " " + Convert.ToString(st.order.Count);
+        if (st.order.Count != total) { text = text + " / " + Convert.ToString(total); }
+        int selected = 0;
+        if (st.selectionModel != null && st.selectionModel.AllSelected()) { selected = -1; }
+        else {
+            for (int i = 0; i < st.selected.Count; i = i + 1) {
+                if (st.selected[i]) { selected = selected + 1; }
+            }
+        }
+        if (selected > 0) { text = text + "    " + DataTable.T("Selected", "已选:") + " " + Convert.ToString(selected); }
+        controls.statusText = text;
+        int font = Style.FontFallback(app, "small");
+        Control host = this.owner;
+        int x = host.bx + app.theme.paddingMedium + Canvas.MeasureText(text, font) + app.Scale(16);
+        int right = host.bx + host.bw - app.theme.paddingMedium;
+        int y = lay.bodyTop + lay.bodyH + lay.bottomPinnedH + lay.summaryH + lay.pagerH + app.Scale(4);
+        int height = lay.statusBarH - app.Scale(8);
+        List<FilterChip> chips = DataTable.FilterSummaryChips(st, cols);
+        for (int i = 0; i < chips.Count; i = i + 1) {
+            FilterChip chip = chips[i];
+            int width = Canvas.MeasureText(chip.Text(), font) + app.Scale(22);
+            if (x + width > right) { break; }
+            string key = "footerfilter:" + Convert.ToString(chip.Kind()) + ":" + Convert.ToString(chip.Col());
+            DataTableInputRegion region = this.Region(app, st, key, 29, chip.Kind(), chip.Col(), x, y, width, height);
+            if (region != null) {
+                region.filterChip = chip;
+                region.a11yLabel = DataTable.T("Remove filter", "移除筛选") + ": " + chip.Text();
+                controls.footerChips.Add(region);
+            }
+            x = x + width + app.Scale(6);
+        }
+    }
+
+    private int GroupSlot(App app, List<DataColumn> cols, DataTableState st, int pointerX) {
+        List<GroupChipGeometry> chips = DataTable.GroupChipLayout(app, cols, st, this.owner.bx);
+        int result = 0;
+        for (int i = 0; i < chips.Count; i = i + 1) {
+            if (pointerX > chips[i].x + chips[i].width / 2) { result = i + 1; }
+        }
+        return result;
+    }
+
+    internal void RouteRegion(DataTableInputRegion region, RoutedEventArgs e) {
+        if (e.eventName == "PointerCancel") {
+            DataTableState retired = region.state;
+            if (retired != null) {
+                retired.resizeCol = -1; retired.dragCol = -1; retired.dragColMoved = false;
+                retired.dragChip = -1; retired.dragVbar = false; retired.dragHbar = false;
+                if (region.action == 15) { retired.dragRow = -1; retired.dragMoved = false; retired.rowGripDrag = false; }
+            }
+            e.Handle();
+            if (region.App != null) { region.App.RequestRedraw(); }
+            return;
+        }
+        DataTableInputContext context = this.InputContext();
+        Control host = this.owner;
+        if (context == null || host == null || host.App == null) { return; }
+        App app = host.App; DataTableState st = context.state;
+        DataTableFrame f = context.frame; DataTableBodyLayout lay = context.body;
+        int action = region.action; int col = region.column;
+        string name = e.eventName;
+        bool primary = app.window.EventButton() == 0;
+        if (name == "PointerDown" && primary && (action == 3 || action == 5
+        || action == 8 || action == 10 || action == 11)) {
+            if (action == 3) { st.dragCol = col; st.dragColStartX = e.x; st.dragColMoved = false; }
+            if (action == 5) { st.resizeCol = col; st.resizeStartX = e.x; st.resizeStartW = st.colWidths[col]; }
+            if (action == 8) { st.dragChip = col; }
+            if (action == 10) { st.dragVbar = true; }
+            if (action == 11) { st.dragHbar = true; }
+            app.CapturePointer(region, true); e.Handle();
+        }
+        if (name == "PointerMove" || (name == "PointerUp" && primary)
+        || (name == "PointerDown" && primary && (action == 10 || action == 11))) {
+            if (action == 5 && st.resizeCol == col) {
+                int width = st.resizeStartW + (e.x - st.resizeStartX);
+                if (width < app.Scale(48)) { width = app.Scale(48); }
+                if (width != st.colWidths[col]) {
+                    st.colWidths[col] = width; st.hitCol = col; st.ColumnResize.Raise();
+                    if (!context.Current() || !e.GestureRouteCurrent()) { return; }
+                }
+            }
+            if (action == 3 && st.dragCol == col) {
+                int distance = e.x - st.dragColStartX;
+                if (distance > app.Scale(2) || distance < -app.Scale(2)) { st.dragColMoved = true; }
+                st.dropVis = f.columns.Count;
+                for (int i = 0; i < f.columns.Count; i = i + 1) {
+                    FrameColumn candidate = f.columns[i];
+                    if (e.x < candidate.x + st.dispW[candidate.column] / 2) { st.dropVis = i; break; }
+                }
+            }
+            if (action == 10 && st.dragVbar) {
+                int thumb = region.bh * lay.visRows / lay.total;
+                if (thumb < app.Scale(24)) { thumb = app.Scale(24); }
+                int denominator = region.bh - thumb; if (denominator < 1) { denominator = 1; }
+                int value = (e.y - region.by - thumb / 2) * (lay.total - lay.visRows) / denominator;
+                value = VirtualScrollHost.ClampStartRow(value, lay.total, lay.visRows);
+                if (value != st.scrollRow) { st.scrollRow = value; st.ScrollChanged.Raise(); }
+            }
+            if (action == 11 && st.dragHbar) {
+                int thumb = region.bw * f.bandW / f.bandNatW;
+                if (thumb < app.Scale(24)) { thumb = app.Scale(24); }
+                int denominator = region.bw - thumb; if (denominator < 1) { denominator = 1; }
+                int value = (e.x - region.bx - thumb / 2) * f.maxScrollX / denominator;
+                if (value < 0) { value = 0; } if (value > f.maxScrollX) { value = f.maxScrollX; }
+                st.scrollX = value;
+            }
+        }
+        if (name == "PointerUp" && primary
+        && (action == 3 || action == 5 || action == 8 || action == 10 || action == 11)) {
+            // Retire the gesture before model invalidation or external notification.
+            bool resizing = action == 5 && st.resizeCol == col;
+            bool moving = action == 3 && st.dragCol == col && st.dragColMoved;
+            bool grouping = action == 8 && st.dragChip == col;
+            st.resizeCol = -1; st.dragCol = -1; st.dragColMoved = false;
+            st.dragChip = -1; st.dragVbar = false; st.dragHbar = false;
+            if (app.GetCapturedPointer() == region) { app.ReleasePointerCapture(); }
+            e.Handle();
+            if (resizing) { st.hitCol = col; st.ColumnResizeEnd.Raise(); }
+            else if (moving) {
+                if (st.showGroupPanel && e.y >= f.panelY && e.y < f.panelY + f.groupPanelH) {
+                    DataTable.GroupByAt(st, col, this.GroupSlot(app, context.columns, st, e.x));
+                    st.GroupChanged.Raise();
+                } else {
+                    int before = st.dropVis < f.columns.Count ? f.columns[st.dropVis].column : -1;
+                    if (before != col) {
+                        st.hitCol = col;
+                        DataTable.MoveColumn(st, col, before);
+                        st.ColumnReorder.Raise();
+                    }
+                }
+            } else if (grouping) {
+                int from = DataTable.GroupDepth(st, col);
+                int slot = this.GroupSlot(app, context.columns, st, e.x);
+                if (slot > from) { slot = slot - 1; }
+                if (from >= 0 && slot != from) { DataTable.MoveGroup(st, col, slot); st.GroupChanged.Raise(); }
+            }
+            if (!context.Current() || !e.GestureRouteCurrent()) { app.RequestRedraw(); return; }
+        }
+        if (name == "Click" && primary) {
+            if (action == 1) {
+                bool all = st.order.Count > 0;
+                for (int i = 0; i < st.order.Count; i = i + 1) {
+                    if (!DataTable.IsSelected(st, context.source, st.order[i])) { all = false; break; }
+                }
+                DataTable.SelectAllRows(st, context.source, !all); st.SelectionChanged.Raise();
+            } else if (action == 2 && context.columns[col].sortable) {
+                st.hitCol = col; st.HeaderClick.Raise();
+                if (!context.Current() || !e.GestureRouteCurrent()) { return; }
+                DataTable.CycleSort(st, col, Modifiers.HasShift(e.modifiers)); st.dirty = true; st.Sort.Raise();
+            } else if (action == 4) {
+                if (st.openMenu == col) { st.openMenu = -1; }
+                else { DataTable.OpenFilterMenu(st, context.columns, context.source, col); }
+            } else if (action == 6) {
+                DataTable.ToggleBand(st, context.columns, region.path); st.BandToggled.Raise();
+            } else if (action == 7) { DataTable.SetColumnChooser(st, !st.colChooserOpen); }
+            else if (action == 9) { DataTable.UngroupOne(st, col); st.GroupChanged.Raise(); }
+            else if (action == 12) {
+                GroupRow group = st.groups[region.row];
+                int checked = DataTable.GroupCheckState(st, group, context.source);
+                DataTable.SelectGroupRows(st, group, context.source, checked != 1); st.SelectionChanged.Raise();
+            } else if (action == 13) {
+                bool selected = DataTable.IsSelected(st, context.source, region.row);
+                DataTable.SetSelected(st, context.source, region.row, !selected);
+                st.hitRow = region.row; st.SelectionChanged.Raise();
+            } else if (action == 14) { DataTable.ToggleDetail(st, context.source, region.row); }
+            else if (action == 16) { DataTable.ToggleBoolCell(st, context.columns, context.source, region.row, col); }
+            else if (action == 17) { DataTable.TreeToggle(st, context.source, region.row); }
+            else if (action == 20 || action == 21) {
+                DataTable.FindStep(st, context.columns, context.source, action == 20 ? -1 : 1, lay.visRows);
+            } else if (action == 22) { DataTable.CloseFind(st); }
+            else if (action == 23) { DataTable.ClearAllFilters(st); }
+            else if (action == 24 && region.filterChip != null) {
+                DataTable.OpenFilterChip(st, context.columns, context.source, region.filterChip);
+            } else if (action == 25 && region.filterChip != null) {
+                DataTable.RemoveFilterChip(st, region.filterChip);
+            } else if (action == 29 && region.filterChip != null) {
+                DataTable.RemoveFilterChip(st, region.filterChip);
+                st.FilterChanged.Raise();
+            } else if (action == 26 || action == 27) {
+                st.editBuf = DataTable.StepValue(context.columns[st.editCol], st.editBuf, action == 26 ? 1 : -1);
+                st.editCur = st.editBuf.Length; st.editError = "";
+            } else if (action == 28) { st.edPopOpen = !st.edPopOpen; }
+            else if (action == 18) {
+                int row = DataTable.AppendRow(st, context.columns, context.source);
+                if (row >= 0 && context.Current()) {
+                    DataTable.Recompute(st, context.columns, context.source);
+                    DataTable.FocusRow(st, context.columns, context.source, row);
+                }
+            }
+            e.Handle();
+        }
+        if (action == 15) {
+            if (name == "PointerDown" && primary) {
+                st.dragRow = region.row; st.dragStartY = e.y; st.dragMoved = false; st.rowGripDrag = true;
+                app.CapturePointer(region, true); e.Handle();
+            } else if (name == "PointerMove" || (name == "PointerUp" && primary)) {
+                DataTable.HandleBodyInput(app, host.bx, host.by, host.bw, host.bh,
+                f, lay, context.columns, context.source, st, e);
+                if (name == "PointerUp") { app.ReleasePointerCapture(); }
+                e.Handle();
+            }
+        }
+        if (name == "PointerDown" || name == "Click") { e.Handle(); }
+        if (context.Current() && e.GestureRouteCurrent()) { this.InputChanged(); }
+        app.RequestRedraw();
+    }
+}

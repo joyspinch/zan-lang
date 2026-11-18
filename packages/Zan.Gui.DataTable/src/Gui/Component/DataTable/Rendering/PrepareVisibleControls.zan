@@ -1,0 +1,113 @@
+using System;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+public partial class DataTable {
+    // Same frame/bands as RenderBody; only providers, adoption and layout run here.
+    internal static void PrepareVisibleControls(App app, int x, int viewW,
+    DataTableFrame f, DataTableBodyLayout lay,
+    List<DataColumn> cols, DataSource src, DataTableState st) {
+        for (int r = 0; r < lay.visRows && lay.start + r < lay.total; r = r + 1) {
+            int order = lay.start + r;
+            int kind = DataTable.DispKind(st, order);
+            if (kind == 1) { continue; }
+            int row = DataTable.DispRowOf(st, order);
+            int ry = lay.bodyTop + r * f.rowH;
+            if (kind == 2) {
+                int part = DataTable.DispPart(st, order);
+                if (part != 0 && r != 0) { continue; }
+                ry = ry - part * f.rowH;
+                int span = part + 1;
+                int next = order + 1;
+                while (next < lay.total && DataTable.DispKind(st, next) == 2
+                && DataTable.DispPart(st, next) != 0 && DataTable.DispRowOf(st, next) == row) {
+                    span = span + 1;
+                    next = next + 1;
+                }
+                if (st.detail == null) { continue; }
+                int dx = x + app.Scale(4);
+                int dw = viewW - app.Scale(6);
+                int height = span * f.rowH;
+                int top = ry > lay.bodyTop ? ry : lay.bodyTop;
+                int bottom = ry + height < lay.bodyTop + lay.bodyH ? ry + height : lay.bodyTop + lay.bodyH;
+                DataTableVisualTree.SetVisibleClip(st, dx, top, dw, bottom - top);
+                Control child = st.detail.ProvideControl(app, src, row, dx, ry, dw, height);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                DataTableVisualTree.LayoutControl(app, st, child, 2, row, -1, dx, ry, dw, height);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                continue;
+            }
+            bool ready = src.CellReady(row, 0);
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            if (!ready) {
+                src.RequestBlock(row);
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                continue;
+            }
+            for (int i = 0; i < f.columns.Count; i = i + 1) {
+                FrameColumn column = f.columns[i];
+                int cc = column.column;
+                int cw = st.dispW[cc];
+                int left = DataTable.BandLeft(column.band, f.firstDataX, f.bandX, f.rightX);
+                int right = DataTable.BandRight(column.band, f.firstDataX, f.bandX, f.bandW,
+                f.rightX, f.pinnedW, f.pinnedRW, f.clipRight);
+                if (column.x + cw <= left || column.x >= right) { continue; }
+                CellSpan span = null;
+                if (st.spanProvider != null) { span = st.spanProvider.GetSpan(src, row, cc); }
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                if (span != null && span.IsCovered()) { continue; }
+                int width = cw;
+                int height = f.rowH;
+                if (span != null && span.IsMaster()) {
+                    if (span.colSpan > 1) {
+                        width = 0;
+                        for (int sc = cc; sc < cc + span.colSpan && sc < cols.Count; sc = sc + 1) {
+                            if (sc < st.dispW.Count && (sc >= st.colHidden.Count || !st.colHidden[sc])) {
+                                width = width + st.dispW[sc];
+                            }
+                        }
+                    }
+                    if (span.rowSpan > 1) { height = span.rowSpan * f.rowH; }
+                }
+                int clipLeft = column.x > left ? column.x : left;
+                int clipRight = column.x + width < right ? column.x + width : right;
+                int clipBottom = ry + f.rowH < lay.bodyTop + lay.bodyH ? ry + f.rowH : lay.bodyTop + lay.bodyH;
+                DataTableVisualTree.SetVisibleClip(st, clipLeft, ry, clipRight - clipLeft, clipBottom - ry);
+                CellWidgetProvider provider = cols[cc].widgetProvider;
+                if (provider == null) { provider = st.cellWidgets; }
+                Control child = null;
+                if (provider != null) {
+                    child = provider.Provide(app, src, row, cc, column.x, ry, width, height);
+                    if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                    DataTableVisualTree.LayoutControl(app, st, child, 0, row, cc, column.x, ry, width, height);
+                    if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                }
+                if (child != null) { continue; }
+                int painter = 0;
+                if (st.styler != null && st.styler.OwnsCell(src, row, cc)) { painter = 1; }
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                CellRenderer renderer = cols[cc].renderer;
+                if (renderer == null) { renderer = st.cellRenderer; }
+                if (painter == 0 && renderer != null && renderer.OwnsCell(src, row, cc)) { painter = 2; }
+                if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                if (painter != 0) { st.visualTree.RecordPainter(row, cc, painter); continue; }
+                if (cols[cc].cellType == 9 || cols[cc].cellType == 10) {
+                    string value = DataTable.CellTextRouted(cols, src, row, cc);
+                    if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                    DataTable.PrepareCompCell(app, cols[cc], value, column.x, ry, width, height, row, cc, src, st);
+                    if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                }
+            }
+        }
+        if (lay.total == 0) {
+            bool loading = src.HasMore() && src.RowCount() == 0;
+            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+            st.overlayKind = loading ? "loading" : "empty";
+            Control overlay = loading ? st.loadingWidget : st.emptyWidget;
+            DataTableVisualTree.SetVisibleClip(st, f.firstDataX, lay.bodyTop, f.dataViewW, lay.bodyH);
+            DataTableVisualTree.LayoutControl(app, st, overlay, 3, -1, -1,
+            f.firstDataX, lay.bodyTop, f.dataViewW, lay.bodyH);
+        } else { st.overlayKind = ""; }
+    }
+}
