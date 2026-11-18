@@ -10,79 +10,114 @@ namespace Gui.Hmi;
 // 缓冲按位号的刻度换算成原始计数写入。
 public class NumPad : Control {
     // 输入缓冲（显示文本，尚未按位号刻度换算）。
-    public SignalString entry;
+    public Binding<string> Text;
     // 确认（ENT）时写入的目标位号；null = 无目标，结果留在缓冲。
     public IoTag target;
-    // 命中 id 块：0..11 数字/小数点/退格，12 +/-，13 CLR，14 ENT，
-    // 15 保留给 On.Fire。
-    public int baseId;
+    private List<Button> keys;
     // 允许输入负号与小数点。
     public bool allowSign;
     // 允许输入小数点；整个缓冲只允许一个小数点。
     public bool allowDot;
     // 确认（ENT）时触发。
-    public UiEvent Enter;
+    public UiEvent Submit;
     // 取消（ESC）时触发。
     public UiEvent Cancel;
 
     // 默认设计期构造：允许负号与小数点，无目标位号。
     public NumPad() {
         this.InitControl("numPad", 0);
-        entry = new SignalString("");
+        Text = "";
         target = null;
-        baseId = WidgetId.Block(16);
         allowSign = true;
         allowDot = true;
         wiresOwnEvents = true;
-        Enter = new UiEvent();
+        Submit = new UiEvent();
         Cancel = new UiEvent();
+        keys = new List<Button>();
+        for (int i = 0; i < 15; i = i + 1) {
+            string label = i < 12 ? this.KeyAt(i) : (i == 12 ? "+/-" : (i == 13 ? "CLR" : "ENT"));
+            NumPadKey key = new NumPadKey(this, label);
+            key.ClassName = i == 14 ? "primary" : (i == 13 ? "warning" : "");
+            keys.Add(key);
+            this.Add(key);
+        }
     }
 
-    // 输入缓冲的信号访问器。
-    public SignalString Entry() { return entry; }
-    // 当前缓冲文本。
-    public string Text() { return entry.Get(); }
-    // 覆盖缓冲文本（不触发 Enter）。
-    public void SetText(string s) { entry.Set(s); }
+    // 覆盖缓冲文本（不触发 Submit）。
+    public void SetText(string s) { Text.Set(s); }
     // 清空缓冲。
-    public void Clear() { entry.Set(""); }
+    public void Clear() { Text.Set(""); }
 
     // 确认时写入的位号（同时把它的当前值预置进缓冲）。
     public NumPad Target(IoTag t) {
         target = t;
-        entry.Set(t.Text());
+        Text.Set(t.Text());
         return this;
     }
 
     // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "NumPad"; }
 
-    // 覆写：公共事件之外提供 "Enter" 与 "Cancel"。
+    // 覆写：公共事件之外提供 "Submit" 与 "Cancel"。
     public override List<string> Events() {
         List<string> e = Control.CommonEvents();
-        e.Add("Enter");
+        e.Add("Submit");
         e.Add("Cancel");
         return e;
     }
 
-    // 覆写："Enter"/"Cancel" 挂对应事件，其余按名称走通用路由。
+    // 覆写："Submit"/"Cancel" 挂对应事件，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
-        if (evt == "Enter") { Enter.Add(a); return; }
+        if (evt == "Submit") { Submit.Add(a); return; }
         if (evt == "Cancel") { Cancel.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
+    }
+
+    public override void BindEventS(string evt, ControlEvent handler) {
+        if (evt == "Submit") { Submit.AddS(handler); return; }
+        if (evt == "Cancel") { Cancel.AddS(handler); return; }
+        base.BindEventS(evt, handler);
+    }
+
+    public override int InputFocusCapabilities() { return 1; }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        if (this.IsDisabled()) { return; }
+        if (e.keyCode == 13) { this.Press("ENT"); }
+        else if (e.keyCode == 27) { Cancel.RaiseS(this); }
+        else if (e.keyCode == 8) { this.Press("←"); }
+        else { base.OnKeyDown(e); return; }
+        e.Handle();
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        App app = this.FindApp();
+        if (app == null) { return; }
+        int pad = app.Scale(8);
+        int gap = app.Scale(4);
+        int top = by + pad * 2 + app.theme.heightLarge;
+        int rowH = (bh - (top - by) - pad - gap * 4) / 5;
+        int colW = (bw - pad * 2 - gap * 2) / 3;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            Button key = keys[i];
+            key.Visible = (i != 10 || allowDot) && (i != 12 || allowSign);
+            key.Arrange(bx + pad + (i % 3) * (colW + gap),
+                top + (i / 3) * (rowH + gap), colW, rowH);
+        }
     }
 
     // 覆写：返回设计器属性清单（输入缓冲 / 允许负号 / 允许小数点）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec v = PropSpec.Text("value", "Entry");
-        v.sstr = entry;
+        v.Field("Text", 0);
         ps.Add(v);
         PropSpec sg = PropSpec.Bool("sign", "Allow sign");
-        sg.flag = allowSign;
+        sg.Field("allowSign", 2);
         ps.Add(sg);
         PropSpec dt = PropSpec.Bool("dot", "Allow decimal point");
-        dt.flag = allowDot;
+        dt.Field("allowDot", 2);
         ps.Add(dt);
         return ps;
     }
@@ -115,7 +150,7 @@ public class NumPad : Control {
         int dispH = t.heightLarge;
         c.FillRoundRect(bx + pad, by + pad, bw - pad * 2, dispH,
                         t.borderRadiusSmall, App.Darken(Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), 20));
-        string shown = entry.Get();
+        string shown = Text.Get();
         if (shown == "") { shown = "0"; }
         c.DrawText(bx + pad * 2, by + pad + dispH / 2 - Canvas.FontHeight(fs) / 2,
                    shown, Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
@@ -127,91 +162,46 @@ public class NumPad : Control {
                        u, Style.Part(app, "hmi", "hint", "", "", "", Style.SNormal()).FgOr(0), fsS);
         }
 
-        int gy = by + pad + dispH + pad;
-        int gh = bh - (gy - by) - pad;
-        int rowH = (gh - app.Scale(4) * 4) / 5;
-        int colW = (bw - pad * 2 - app.Scale(4) * 2) / 3;
-        for (int i = 0; i < 12; i = i + 1) {
-            int r = i / 3;
-            int cc = i - r * 3;
-            int kx = bx + pad + cc * (colW + app.Scale(4));
-            int ky = gy + r * (rowH + app.Scale(4));
-            string label = this.KeyAt(i);
-            if (label == "." && !allowDot) { continue; }
-            this.PaintKey(app, baseId + i, kx, ky, colW, rowH, label,
-                          Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0));
-        }
-
-        // 底行：正负号 / 清零 / 确认。
-        int by2 = gy + 4 * (rowH + app.Scale(4));
-        int signW = colW;
-        if (allowSign) {
-            this.PaintKey(app, baseId + 12, bx + pad, by2, signW, rowH,
-                          "+/-", Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0));
-        }
-        this.PaintKey(app, baseId + 13, bx + pad + colW + app.Scale(4), by2,
-                      colW, rowH, "CLR", Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "status", "", "warning", "", Style.SNormal()).BgOr(0));
-        this.PaintKey(app, baseId + 14,
-                      bx + pad + (colW + app.Scale(4)) * 2, by2, colW, rowH,
-                      "ENT", Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).BgOr(0), Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).FgOr(0));
-        On.Fire(app, baseId + 15, this);
-    }
-
-    // 画一枚按键（含悬停/按下反馈与点击命中注册）。
-    public void PaintKey(App app, int id, int x, int y, int w, int h, string label,
-                  int bg, int fg) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int hv = Ui.HoverLevelMsIn(app, id, 0, x, y, w, h);
-        int fill = App.LerpColor(bg, Style.Part(app, "hmi", "track", "", "", "", Style.SHover()).BgOr(0), hv);
-        if (Ui.PressedDown(app, id)) { fill = App.Darken(fill, 12); }
-        c.FillRoundRect(x, y, w, h, t.borderRadiusSmall, fill);
-        c.DrawRoundRect(x, y, w, h, t.borderRadiusSmall, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
-        c.DrawTextCentered(x, y, w, h, label, fg, Style.FontFallback(app, "large"));
-        app.hitTester.RegisterRect(id, x, y, w, h, 0);
-        if (Ui.Clicked(app, id)) {
-            this.Press(label);
-            app.RequestRedraw();
-        }
     }
 
     // 处理一次按键，`label` 即键面文字。
     public void Press(string label) {
-        string s = entry.Get();
+        string s = Text.Get();
         if (label == "ENT") {
             this.Commit();
-            Enter.RaiseS(this);
+            Submit.RaiseS(this);
             return;
         }
         if (label == "CLR") {
-            entry.Set("");
+            Text.Set("");
             return;
         }
         if (label == "←") {
-            if (s.Length > 0) { entry.Set(s.Substring(0, s.Length - 1)); }
+            if (s.Length > 0) { Text.Set(s.Substring(0, s.Length - 1)); }
             return;
         }
         if (label == "+/-") {
+            if (!allowSign) { return; }
             if (s.Length > 0 && s.Substring(0, 1) == "-") {
-                entry.Set(s.Substring(1, s.Length - 1));
+                Text.Set(s.Substring(1, s.Length - 1));
             } else {
-                entry.Set("-" + s);
+                Text.Set("-" + s);
             }
             return;
         }
         if (label == ".") {
             if (!allowDot || s.IndexOf(".") >= 0) { return; }
-            if (s == "") { entry.Set("0."); return; }
-            entry.Set(s + ".");
+            if (s == "") { Text.Set("0."); return; }
+            Text.Set(s + ".");
             return;
         }
-        entry.Set(s + label);
+        Text.Set(s + label);
     }
 
     // 把输入缓冲按目标位号的刻度换算并写入。
     public void Commit() {
         if (target == null) { return; }
-        target.SetRaw(NumPad.Parse(entry.Get(), target.Scale()));
+        target.SetRaw(NumPad.Parse(Text.Get(), target.Scale()));
     }
 
     // "12.34" + scale=100 -> 1234。多余的小数位截断，缺位补零。
@@ -238,5 +228,18 @@ public class NumPad : Control {
         if (digits > 0 && frac != "") { v = v + Convert.ToInt32(frac); }
         if (neg) { v = 0 - v; }
         return v;
+    }
+}
+
+internal class NumPadKey : Button {
+    private weak NumPad owner;
+
+    internal NumPadKey(NumPad pad, string label) : base(label) { owner = pad; }
+
+    public override void OnClick(RoutedEventArgs e) {
+        if (this.IsDisabled()) { return; }
+        base.OnClick(e);
+        NumPad pad = owner;
+        if (pad != null && this.Parent() == pad) { pad.Press(this.Label()); }
     }
 }

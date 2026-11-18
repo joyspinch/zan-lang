@@ -1,0 +1,135 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Hmi;
+
+class HmiInputCounts {
+    public int entered;
+    public int cardClicks;
+    public int rows;
+    public int acknowledgements;
+    public weak Control lastSender;
+    public void Entered(Control sender) { entered = entered + 1; lastSender = sender; }
+    public void CardClicked(Control sender) { cardClicks = cardClicks + 1; lastSender = sender; }
+    public void RowClicked(Control sender) { rows = rows + 1; lastSender = sender; }
+    public void Acknowledged(Control sender) { acknowledgements = acknowledgements + 1; lastSender = sender; }
+}
+
+class HmiRetainedInputTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("HMI retained input: " + label); }
+    }
+
+    static void Prepare(Form form) {
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+    }
+
+    static void Click(Form form, Control target) {
+        int x = target.bx + target.bw / 2;
+        int y = target.by + target.bh / 2;
+        form.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        form.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static Form Host(Control control, int width, int height) {
+        Form form = Form.CreateOffscreen("HMI", width, height);
+        form.GetApp().SetChromeVisible(false);
+        control.SetProp("style", "width:100%;height:100%");
+        form.Add(control);
+        Prepare(form);
+        return form;
+    }
+
+    static void Close(Form form) {
+        App app = form.GetApp();
+        app.SetRootControl(null);
+        app.StopLoop();
+        app.canvas.Destroy();
+        app.canvas = null;
+    }
+
+    static void Keypad() {
+        HmiInputCounts counts = new HmiInputCounts();
+        IoTag tag = new IoTag("SP", "", 1);
+        NumPad pad = new NumPad();
+        pad.Target(tag);
+        pad.Clear();
+        pad.BindEventS("Submit", counts.Entered);
+        Form form = Host(pad, 200, 260);
+        int children = pad.ChildCount();
+        Click(form, pad.ChildAt(0));
+        Click(form, pad.ChildAt(1));
+        Check(pad.Text.Get() == "78" && tag.Raw() == 0 && counts.entered == 0,
+            "two keys edit before first paint without committing");
+        Click(form, pad.ChildAt(14));
+        Check(tag.Raw() == 78 && counts.entered == 1 && counts.lastSender == pad,
+            "Enter commits and uses semantic sender");
+        form.CaptureSnapshot();
+        form.CaptureSnapshot();
+        Check(tag.Raw() == 78 && counts.entered == 1 && pad.ChildCount() == children,
+            "paint neither submits nor rebuilds keys");
+        pad.allowSign = false;
+        pad.allowDot = false;
+        Prepare(form);
+        Check(!pad.ChildAt(10).Visible && !pad.ChildAt(12).Visible, "disabled key kinds leave input tree");
+        pad.Press("+/-");
+        pad.Press(".");
+        Check(pad.Text.Get() == "78", "programmatic key input follows the same constraints");
+        Close(form);
+    }
+
+    static void Card() {
+        HmiInputCounts counts = new HmiInputCounts();
+        DeviceCard card = new DeviceCard("Pump");
+        card.BindEventS("Click", counts.CardClicked);
+        Form form = Host(card, 240, 120);
+        Click(form, card);
+        Check(counts.cardClicks == 1 && counts.lastSender == card, "card uses inherited Click before paint");
+        form.CaptureSnapshot();
+        form.CaptureSnapshot();
+        Check(counts.cardClicks == 1, "card paint cannot replay Click");
+        Close(form);
+    }
+
+    static void Alarms() {
+        HmiInputCounts counts = new HmiInputCounts();
+        AlarmBuffer buffer = new AlarmBuffer();
+        AlarmItem oldest = buffer.Raise("A", "First", 1);
+        AlarmItem newest = buffer.Raise("B", "Second", 2);
+        AlarmList list = new AlarmList(buffer);
+        list.BindEventS("RowClick", counts.RowClicked);
+        Form form = Host(list, 520, 200);
+        Click(form, list.ChildAt(0));
+        Check(list.SelectedItem() == newest && counts.rows == 1 && counts.lastSender == list,
+            "newest retained row selects before first paint");
+        Click(form, list.ChildAt(1));
+        Check(list.SelectedItem() == oldest && counts.rows == 2, "consecutive row selection needs no paint");
+        form.CaptureSnapshot();
+        form.CaptureSnapshot();
+        Check(counts.rows == 2 && list.SelectedItem() == oldest, "list paint has no selection side effects");
+        Close(form);
+
+        AlarmBanner banner = new AlarmBanner(buffer);
+        banner.BindEventS("Ack", counts.Acknowledged);
+        Form bannerForm = Host(banner, 600, 50);
+        Click(bannerForm, banner.ChildAt(0));
+        Check(buffer.UnackedCount() == 0 && counts.acknowledgements == 1 && counts.lastSender == banner,
+            "acknowledgement executes before paint");
+        bannerForm.CaptureSnapshot();
+        bannerForm.CaptureSnapshot();
+        Check(counts.acknowledgements == 1 && !banner.ChildAt(0).Visible,
+            "paint never acknowledges and preparation removes empty action");
+        Close(bannerForm);
+    }
+
+    static void Main() {
+        App sentinel = App.CreateOffscreen("HMI sentinel", 1, 1);
+        Keypad();
+        Card();
+        Alarms();
+        sentinel.canvas.Destroy();
+        sentinel.canvas = null;
+        sentinel.StopLoop();
+        Console.WriteLine("HMI_RETAINED_INPUT_OK");
+    }
+}

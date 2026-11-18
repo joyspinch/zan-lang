@@ -10,10 +10,7 @@ namespace Gui.Hmi;
 public class AlarmList : Control {
     // 数据源（可与 AlarmBanner 共享同一份报警）。
     public AlarmBuffer buffer;
-    // 整条命中 id（On.Fire 用）。
-    public int wid;
-    // 行命中区的连续 id 块（缓冲上限即最大行数）。
-    public int rowBaseId;
+    private List<AlarmListRow> visibleRows;
     // 当前选中行下标（-1 = 无）。
     public int selected;
     // 选中行变化时触发。
@@ -32,8 +29,7 @@ public class AlarmList : Control {
     public AlarmList(AlarmBuffer buf) {
         this.InitControl("alarmList", 5);
         buffer = buf;
-        wid = WidgetId.Next();
-        rowBaseId = WidgetId.Block(256);
+        visibleRows = new List<AlarmListRow>();
         selected = -1;
         wiresOwnEvents = true;
         RowClick = new UiEvent();
@@ -51,7 +47,7 @@ public class AlarmList : Control {
     public override string Kind() { return "AlarmList"; }
 
     // 覆写：无设计器属性（内容由数据源驱动）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         return new List<PropSpec>();
     }
 
@@ -65,7 +61,51 @@ public class AlarmList : Control {
     // 覆写："RowClick" 挂 RowClick 事件，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "RowClick") { RowClick.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
+    }
+
+    public override void BindEventS(string evt, ControlEvent handler) {
+        if (evt == "RowClick") { RowClick.AddS(handler); return; }
+        base.BindEventS(evt, handler);
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        App app = this.FindApp();
+        if (app == null) { return; }
+        int rowH = app.theme.heightSmall;
+        if (rowH < 1) { return; }
+        int count = buffer != null ? buffer.Count() : 0;
+        int shown = bh > rowH ? (bh - rowH + rowH - 1) / rowH : 0;
+        if (shown > count) { shown = count; }
+        while (visibleRows.Count > shown) {
+            AlarmListRow removed = visibleRows[visibleRows.Count - 1];
+            visibleRows.RemoveAt(visibleRows.Count - 1);
+            this.Remove(removed);
+        }
+        for (int i = 0; i < shown; i = i + 1) {
+            int index = count - 1 - i;
+            AlarmItem item = buffer.At(index);
+            AlarmListRow row = i < visibleRows.Count ? visibleRows[i] : null;
+            if (row == null || row.Item != item) {
+                if (row != null) { this.Remove(row); }
+                row = new AlarmListRow(this, item);
+                if (i < visibleRows.Count) { visibleRows[i] = row; }
+                else { visibleRows.Add(row); }
+                this.Add(row);
+            }
+            row.Index = index;
+            row.Arrange(bx, by + rowH * (i + 1), bw, rowH);
+        }
+    }
+
+    internal void SelectRow(AlarmListRow row) {
+        if (buffer == null || row.Parent() != this || row.Index < 0
+            || row.Index >= buffer.Count() || buffer.At(row.Index) != row.Item) { return; }
+        selected = row.Index;
+        RowClick.RaiseS(this);
+        App app = this.FindApp();
+        if (app != null) { app.RequestRedraw(); }
     }
 
     // 覆写：固定首选尺寸 480 x 200（逻辑 px）。
@@ -100,37 +140,55 @@ public class AlarmList : Control {
         c.DrawText(c4, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "状态",
                    Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
 
-        c.PushClip(bx, by + rowH, bw, bh - rowH);
-        int y = by + rowH;
-        // 最新的排在最上面：现场值班看的是刚发生的那条。
-        for (int k = buffer.Count() - 1; k >= 0; k = k - 1) {
-            if (y >= by + bh) { break; }
-            AlarmItem a = buffer.At(k);
-            int col = AlarmItem.ColorOf(app, a.Priority());
-            int bg = Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0);
-            if (!a.IsAcked()) { bg = App.LerpColor(Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0), col, 28); }
-            if (k == selected) { bg = App.LerpColor(bg, Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).BgOr(0), 22); }
-            c.FillRect(bx, y, bw, rowH, bg);
-            c.DrawLine(bx, y + rowH - 1, bx + bw, y + rowH - 1, Style.Part(app, "hmi", "grid", "", "", "", Style.SNormal()).BgOr(0), 1);
-            int ty = y + rowH / 2 - Canvas.FontHeight(fs) / 2;
-            c.DrawText(c0, ty, a.Stamp(), Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
-            c.DrawText(c1, ty, AlarmItem.LevelOf(a.Priority()), col, fs);
-            c.DrawText(c2, ty, a.Point(), Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
-            c.DrawText(c3, ty, a.Message(), Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
-            string st = "已复归";
-            if (a.IsActive()) { st = "活动"; }
-            if (!a.IsAcked()) { st = st + "*"; }
-            c.DrawText(c4, ty, st, Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
-            int rowId = rowBaseId + (k % 256);
-            app.hitTester.RegisterRect(rowId, bx, y, bw, rowH, 0);
-            if (Ui.Clicked(app, rowId)) {
-                selected = k;
-                RowClick.RaiseS(this);
-                app.RequestRedraw();
-            }
-            y = y + rowH;
+
+    }
+}
+
+internal class AlarmListRow : Button {
+    private weak AlarmList owner;
+    internal AlarmItem Item;
+    internal int Index;
+
+    internal AlarmListRow(AlarmList list, AlarmItem item) : base("") {
+        owner = list;
+        Item = item;
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        if (this.IsDisabled()) { return; }
+        base.OnClick(e);
+        AlarmList list = owner;
+        if (list != null) { list.SelectRow(this); }
+    }
+
+    public override void OnPaint(App app) {
+        AlarmList list = owner;
+        if (list == null || this.Parent() != list) { return; }
+        Canvas c = app.canvas;
+        int fs = Style.FontFallback(app, "small");
+        int col = AlarmItem.ColorOf(app, Item.Priority());
+        int bg = Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0);
+        if (!Item.IsAcked()) { bg = App.LerpColor(bg, col, 28); }
+        if (Index == list.Selected()) {
+            bg = App.LerpColor(bg, Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).BgOr(0), 22);
         }
-        c.PopClip();
-        On.Fire(app, wid, this);
+        c.FillRect(bx, by, bw, bh, bg);
+        c.DrawLine(bx, by + bh - 1, bx + bw, by + bh - 1,
+            Style.Part(app, "hmi", "grid", "", "", "", Style.SNormal()).BgOr(0), 1);
+        int ty = by + bh / 2 - Canvas.FontHeight(fs) / 2;
+        int c0 = bx + app.Scale(8);
+        int c1 = c0 + app.Scale(76);
+        int c2 = c1 + app.Scale(60);
+        int c3 = c2 + app.Scale(110);
+        int c4 = bx + bw - app.Scale(70);
+        int label = Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0);
+        int value = Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0);
+        c.DrawText(c0, ty, Item.Stamp(), label, fs);
+        c.DrawText(c1, ty, AlarmItem.LevelOf(Item.Priority()), col, fs);
+        c.DrawText(c2, ty, Item.Point(), value, fs);
+        c.DrawText(c3, ty, Item.Message(), value, fs);
+        string state = Item.IsActive() ? "活动" : "已复归";
+        if (!Item.IsAcked()) { state = state + "*"; }
+        c.DrawText(c4, ty, state, label, fs);
     }
 }

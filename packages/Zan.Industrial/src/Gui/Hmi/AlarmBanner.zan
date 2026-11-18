@@ -10,10 +10,7 @@ namespace Gui.Hmi;
 public class AlarmBanner : Control {
     // 数据源（可与 AlarmList 共享同一份报警）。
     public AlarmBuffer buffer;
-    // 整条命中 id。
-    public int wid;
-    // 确认按钮命中 id。
-    public int ackId;
+    private Button acknowledge;
     // 报警被确认时触发。
     public UiEvent Ack;
 
@@ -31,18 +28,19 @@ public class AlarmBanner : Control {
     public AlarmBanner(AlarmBuffer buf) {
         this.InitControl("alarmBanner", 1);
         buffer = buf;
-        wid = WidgetId.Next();
-        ackId = WidgetId.Next();
         wiresOwnEvents = true;
         Ack = new UiEvent();
         prefH = 0;
+        acknowledge = new AlarmAcknowledgeButton(this);
+        acknowledge.ClassName = "small";
+        this.Add(acknowledge);
     }
 
     // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "AlarmBanner"; }
 
     // 覆写：无设计器属性（内容由数据源驱动）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         return new List<PropSpec>();
     }
 
@@ -56,7 +54,35 @@ public class AlarmBanner : Control {
     // 覆写："Ack" 挂 Ack 事件，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Ack") { Ack.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
+    }
+
+    public override void BindEventS(string evt, ControlEvent handler) {
+        if (evt == "Ack") { Ack.AddS(handler); return; }
+        base.BindEventS(evt, handler);
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        App app = this.FindApp();
+        if (app == null) { return; }
+        int count = buffer != null ? buffer.UnackedCount() : 0;
+        acknowledge.Visible = count > 0;
+        string caption = "确认 (" + Convert.ToString(count) + ")";
+        if (acknowledge.Label() != caption) { acknowledge.SetText(caption); }
+        acknowledge.MeasureTree(app);
+        int buttonW = Canvas.MeasureText(caption, Style.FontFallback(app, "small")) + app.Scale(20);
+        acknowledge.Arrange(bx + bw - buttonW - app.Scale(8),
+            by + (bh - app.theme.heightSmall) / 2, buttonW, app.theme.heightSmall);
+    }
+
+    internal void Acknowledge() {
+        AlarmBuffer source = buffer;
+        if (source == null || source.UnackedCount() == 0) { return; }
+        source.AckAll();
+        Ack.RaiseS(this);
+        App app = this.FindApp();
+        if (app != null) { app.RequestRedraw(); }
     }
 
     // 首选高度 = 主题的 medium 行高。
@@ -70,7 +96,7 @@ public class AlarmBanner : Control {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fs = Style.FontFallback(app, "medium");
-        AlarmItem a = buffer.Newest();
+        AlarmItem a = buffer != null ? buffer.Newest() : null;
         if (a == null) {
             c.FillRect(bx, by, bw, bh, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0));
             c.DrawText(bx + app.Scale(10),
@@ -94,27 +120,17 @@ public class AlarmBanner : Control {
         c.DrawText(bx + app.Scale(10), by + bh / 2 - Canvas.FontHeight(fs) / 2,
                    txt, Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).FgOr(0), fs);
 
-        int n = buffer.UnackedCount();
-        string btn = "确认 (" + Convert.ToString(n) + ")";
-        int fsS = Style.FontFallback(app, "small");
-        int bwid = Canvas.MeasureText(btn, fsS) + app.Scale(20);
-        int bxx = bx + bw - bwid - app.Scale(8);
-        int byy = by + (bh - t.heightSmall) / 2;
-        int hv = Ui.HoverLevelMsIn(app, ackId, 0, bxx, byy, bwid, t.heightSmall);
-        c.FillRoundRect(bxx, byy, bwid, t.heightSmall, t.borderRadiusSmall,
-                        App.Lighten(bg, 20 + hv / 20));
-        c.DrawRoundRect(bxx, byy, bwid, t.heightSmall, t.borderRadiusSmall,
-                        Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).FgOr(0), 1);
-        c.DrawTextCentered(bxx, byy, bwid, t.heightSmall, btn,
-                           Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).FgOr(0), fsS);
-        app.hitTester.RegisterRect(ackId, bxx, byy, bwid,
-                                            t.heightSmall, 0);
-        if (Ui.Clicked(app, ackId)) {
-            buffer.AckAll();
-            Ack.RaiseS(this);
-            app.RequestRedraw();
-        }
-        app.hitTester.RegisterRect(wid, bx, by, bw, bh, 0);
-        On.Fire(app, wid, this);
+
+    }
+}
+
+internal class AlarmAcknowledgeButton : Button {
+    private weak AlarmBanner owner;
+    internal AlarmAcknowledgeButton(AlarmBanner banner) : base("") { owner = banner; }
+    public override void OnClick(RoutedEventArgs e) {
+        if (this.IsDisabled()) { return; }
+        base.OnClick(e);
+        AlarmBanner banner = owner;
+        if (banner != null && this.Parent() == banner) { banner.Acknowledge(); }
     }
 }
