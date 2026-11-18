@@ -373,8 +373,8 @@ public class CefBrowser : IDisposable {
     public void BlockPopups() { SetPopupPolicy(1, null); }
 
     // 弹窗不再自己开窗口，改为把目标 URL 交给宿主：标签式外壳在这里
-    // 新建一个标签，单页外壳可以直接 <see cref="Navigate"/>。回调在
-    // <see cref="Render"/> 里（UI 线程）被调用。
+    // 新建一个标签，单页外壳可以直接 <see cref="Navigate"/>。回调由
+    // BrowserNativeLoop 在共享 CEF Work 后轮询派发（UI 线程）。
     public void OnPopup(CefPopupFn handler) { SetPopupPolicy(2, handler); }
 
     // 直接设置弹窗策略（0 = CEF 自开 / 1 = 拦掉 / 2 = 交宿主回调）；
@@ -392,8 +392,8 @@ public class CefBrowser : IDisposable {
     }
 
     // 按事件名订阅 CDP 事件 / 给命令挂回调的路由（首次调用时建）。
-    // 拿到它之后，<see cref="Render"/> 每帧把消息队列交给它分派，
-    // 此时不要再直接用 <see cref="TakeCdpMessage"/>。
+    // 拿到它之后，BrowserNativeLoop 在共享 CEF Work 后把消息队列交给它
+    // 分派；此时不要再直接用 <see cref="TakeCdpMessage"/>。
     public CefCdp Cdp() {
         if (cdpRouter == null) { cdpRouter = new CefCdp(this); }
         return cdpRouter;
@@ -428,12 +428,9 @@ public class CefBrowser : IDisposable {
     }
 
     // 关闭浏览器并释放原生资源。
-    // CEF 的关闭是异步的：close_browser 之后还要靠消息循环转几圈才真正
-    // 销毁原生窗口，而这个视图从此不再 Render，没人再推循环——只 Close
-    // 就撒手的话，关掉的标签留下的 Chromium 子窗口会一直挂在宿主窗口上
-    // 盖住其他控件。因此原生侧先把窗口隐藏（立刻不再挡人），这里再当场
-    // 把循环推到它消失为止（有上限，别让病态页面把 UI 线程卡死；没推完
-    // 的收尾由后续帧或 CefHost.Shutdown 兜底）。
+    // CEF 的关闭是异步的：先隐藏原生窗口，再把 close 尾项留给
+    // BrowserNativeLoop 随 App turn 继续泵；不依赖这个视图再次绘制。
+    // App 停止后的最终排空由进程级 CefHost.Shutdown 负责。
     public void Destroy() {
         nativeDestroyed = true;
         BrowserNativeEntry previous = nativeEntry;
@@ -446,16 +443,14 @@ public class CefBrowser : IDisposable {
         this.Destroy();
     }
 
-    // 把原生浏览器放到给定的客户区矩形里，推一轮 CEF 消息循环，然后
-    // 轮询引擎的变化，更新 Url()/Title() 并触发
-    // NavStart / LoadingChanged / TitleChanged / NavComplete。浏览器跑在
-    // 自己的进程/线程上，因此它的事件以这种每帧差异的形式到达 UI。
-    // CEF 不可用时画一个占位符（说明原因）。
+    // 登记原生浏览器的客户区矩形并绘制 native clip/不可用占位符。
+    // 创建、共享 CEF Work 与事件轮询由 BrowserNativeLoop 在 App turn
+    // 服务阶段执行；重复 Render/Paint 不会额外推进 CEF。
     public int Render(int x, int y, int w, int h) {
         return this.Render(App.FrameApp(), x, y, w, h);
     }
 
-    // Compatibility facade: immediate callers still drive one complete turn.
+    // Compatibility facade: immediate callers register bounds with the App loop.
     public int Render(App app, int x, int y, int w, int h) {
         if (app == null) { app = App.FrameApp(); }
         BrowserNativeEntry entry = this.AttachNative(app, null);

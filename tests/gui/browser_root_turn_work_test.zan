@@ -1,0 +1,173 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Component.CefBrowser;
+
+// Offline pump acceptance: WorkBackend counts the process-pump boundary. No CEF
+// initialization, native browser, or real-engine acceptance is implied here.
+class BrowserRootTurnWorkTest {
+    public weak App Root;
+    public weak CefWorkLoop Gate;
+    public BrowserNativeLoop KeptLoop;
+
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+    static void Turn(App app) { app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0); }
+    static BrowserNativeLoop Attach(App app, CefBrowser browser, BrowserWorkCounter counter) {
+        BrowserNativeEntry entry = browser.AttachNative(app, null);
+        Check(entry != null, "live App accepts browser attachment");
+        entry.SetBounds(0, 0, 32, 32);
+        BrowserNativeLoop loop = BrowserNativeLoop.For(app);
+        loop.WorkBackend = counter.Work;
+        return loop;
+    }
+    static ChildWindow Child(App parent, App app) {
+        ChildWindow child = new ChildWindow();
+        child.host = app; child.parentApp = parent; child.open = true;
+        ChildWindows.Register(child);
+        return child;
+    }
+    static void CloseChild(ChildWindow child) {
+        child.host.StopLoop(); child.open = false;
+        ChildWindows.Prune(); child.host.canvas.Destroy();
+    }
+
+    static void SharedTurns() {
+        App root = App.CreateOffscreen("Browser work root", 100, 100);
+        App a = App.CreateOffscreen("Browser child A", 100, 100);
+        App b = App.CreateOffscreen("Browser child B", 100, 100);
+        App nested = App.CreateOffscreen("Browser grandchild", 100, 100);
+        App independent = App.CreateOffscreen("Browser independent", 100, 100);
+        ChildWindow ca = Child(root, a);
+        ChildWindow cb = Child(root, b);
+        ChildWindow cn = Child(a, nested);
+        BrowserWorkCounter counter = new BrowserWorkCounter();
+        CefBrowser vr = new CefBrowser(); CefBrowser va = new CefBrowser();
+        CefBrowser vb = new CefBrowser(); CefBrowser vn = new CefBrowser();
+        CefBrowser vi = new CefBrowser();
+        BrowserNativeLoop lr = Attach(root, vr, counter);
+        BrowserNativeLoop la = Attach(a, va, counter);
+        BrowserNativeLoop lb = Attach(b, vb, counter);
+        BrowserNativeLoop ln = Attach(nested, vn, counter);
+        BrowserNativeLoop li = Attach(independent, vi, counter);
+        Check(lr != la && la != lb && lb != ln, "browser services remain App scoped");
+        counter.NestedApp = independent;
+        Turn(root);
+        Check(counter.Calls == 2 && lr.workCount == 1 && li.workCount == 1
+            && la.workCount == 0 && lb.workCount == 0 && ln.workCount == 0,
+            "same numeric turn on independent root pumps inside outer Work; siblings share one pump");
+        Turn(root);
+        Check(counter.Calls == 3, "new root turn pumps exactly once");
+        int turn = root.BeginLoopTurn();
+        int before = counter.Calls;
+        la.Tick(a, Window.GetTickMs());
+        lr.Tick(root, Window.GetTickMs()); lb.Tick(b, Window.GetTickMs()); ln.Tick(nested, Window.GetTickMs());
+        root.EndLoopTurn(turn);
+        Check(counter.Calls == before + 1, "child-first service and root tail share a pump");
+        before = counter.Calls;
+        lr.Tick(root, Window.GetTickMs()); lr.Tick(root, Window.GetTickMs()); la.Tick(a, Window.GetTickMs());
+        Check(counter.Calls == before + 3, "turn zero retains unconditional compatibility pumping");
+        CloseChild(cn); CloseChild(cb); CloseChild(ca);
+        root.StopLoop(); independent.StopLoop(); root.canvas.Destroy(); independent.canvas.Destroy();
+        Console.WriteLine("browser Work root / siblings / nested child / independent root / turn zero: ok");
+    }
+
+    static void StopAndRecreate() {
+        App root = App.CreateOffscreen("Browser stopped gate", 100, 100);
+        App a = App.CreateOffscreen("Browser stopped child", 100, 100);
+        App b = App.CreateOffscreen("Browser survivor", 100, 100);
+        App detached = App.CreateOffscreen("Browser turn zero close", 100, 100);
+        ChildWindow ca = Child(root, a); ChildWindow cb = Child(root, b);
+        ChildWindow cd = Child(root, detached);
+        BrowserWorkCounter counter = new BrowserWorkCounter();
+        CefBrowser vr = new CefBrowser(); CefBrowser va = new CefBrowser();
+        CefBrowser vb = new CefBrowser(); CefBrowser vd = new CefBrowser();
+        BrowserNativeLoop lr = Attach(root, vr, counter);
+        BrowserNativeLoop la = Attach(a, va, counter);
+        BrowserNativeLoop lb = Attach(b, vb, counter);
+        BrowserNativeLoop ld = Attach(detached, vd, counter);
+        counter.StopApp = a;
+        int turn = root.BeginLoopTurn();
+        lr.Tick(root, Window.GetTickMs());
+        Check(counter.Calls == 1 && !a.isRunning && la.EntryCount() == 0,
+            "reentrant child stop after root claim cannot pump again");
+        cd.parentApp = null;
+        detached.StopLoop();
+        Check(counter.Calls == 2 && ld.host == null, "detached child turn zero Stopped still pumps close work");
+        lb.Tick(b, Window.GetTickMs());
+        Check(counter.Calls == 2, "turn zero stop cannot erase the live root claim");
+        la.Tick(a, Window.GetTickMs());
+        Check(counter.Calls == 2, "stopped service cannot tick afterward");
+        vr.Destroy();
+        lr.Tick(root, Window.GetTickMs());
+        Check(root.FindLoopService("Gui.Component.BrowserNativeLoop") == null,
+            "last browser retirement removes its App service within the live turn");
+        CefBrowser replacement = new CefBrowser();
+        lr = Attach(root, replacement, counter);
+        lr.Tick(root, Window.GetTickMs());
+        Check(counter.Calls == 2, "replacement App service cannot reset a live root claim");
+        root.EndLoopTurn(turn);
+        turn = root.BeginLoopTurn();
+        lr.Tick(root, Window.GetTickMs());
+        lb.Tick(b, Window.GetTickMs());
+        Check(counter.Calls == 3, "survivors pump on the next turn");
+        root.StopLoop();
+        Check(counter.Calls == 3 && lr.host == null,
+            "root stop after registration detach reuses its existing claim");
+        root.EndLoopTurn(turn);
+        CloseChild(cb); CloseChild(ca); CloseChild(cd); root.canvas.Destroy();
+        Console.WriteLine("browser Work reentrant stop / turn zero close / service recreation / root stop: ok");
+    }
+
+    static void RegisterDuringInput() {
+        App root = App.CreateOffscreen("Browser preparation root", 100, 100);
+        App app = App.CreateOffscreen("Browser preparation child", 100, 100);
+        ChildWindow child = Child(root, app);
+        BrowserWorkCounter counter = new BrowserWorkCounter();
+        CefBrowser parentBrowser = new CefBrowser(); CefBrowser browser = new CefBrowser();
+        BrowserInputRegistration prep = new BrowserInputRegistration();
+        prep.Browser = browser; prep.Counter = counter;
+        app.RegisterLoopParticipant(app, prep);
+        app.ProcessOffscreenInput(1, 10, 10, 0, 0, 0, 0);
+        BrowserNativeLoop loop = BrowserNativeLoop.For(app);
+        Check(prep.Registrations == 1 && counter.Calls == 1 && loop.workCount == 1,
+            "first registration in BeforeInput joins current turn service");
+        BrowserNativeLoop parentLoop = Attach(root, parentBrowser, counter);
+        Turn(app);
+        Check(counter.Calls == 2 && parentLoop.workCount == 1 && loop.workCount == 1,
+            "later root registration shares the preparation-created root gate");
+        CloseChild(child); root.StopLoop(); root.canvas.Destroy();
+        Console.WriteLine("browser Work first input preparation registration / later root attachment: ok");
+    }
+
+    static void WeakRoot(BrowserRootTurnWorkTest witness) {
+        App root = App.CreateOffscreen("Browser weak pump root", 100, 100);
+        CefBrowser browser = new CefBrowser();
+        BrowserWorkCounter counter = new BrowserWorkCounter();
+        BrowserNativeLoop loop = Attach(root, browser, counter);
+        witness.Root = root; witness.Gate = CefWorkLoop.For(root); witness.KeptLoop = loop;
+        Turn(root);
+        browser.Destroy(); loop.Tick(root, Window.GetTickMs());
+        Check(root.FindLoopService("Gui.Component.BrowserNativeLoop") == null,
+            "idle Browser service retires its registration");
+        // Keep the old service deliberately; its shared gate may remain live,
+        // but that gate must not own root after this helper returns.
+        root.canvas.Destroy();
+    }
+
+    static void Main() {
+        Check(!CefHost.IsRunning(), "fixture must not initialize CEF");
+        App frame = App.CreateOffscreen("Browser independent frame", 16, 16);
+        SharedTurns(); StopAndRecreate(); RegisterDuringInput();
+        BrowserRootTurnWorkTest witness = new BrowserRootTurnWorkTest();
+        WeakRoot(witness);
+        Check(witness.Root == null && witness.Gate != null && witness.Gate.Root == null,
+            "retaining Browser service and gate cannot retain their root App");
+        witness.KeptLoop = null;
+        Check(witness.Gate == null, "root gate releases without static collection cleanup");
+        frame.canvas.Destroy();
+        Console.WriteLine("browser Work weak root / retained service / shared gate ARC: ok");
+        Console.WriteLine("browser_root_turn_work: ok");
+    }
+}

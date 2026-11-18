@@ -14,10 +14,12 @@ public class BrowserNativeLoop : AppLoopParticipant, AppLoopService, AppLoopStop
     int deadline;
     bool stopped;
     bool ticking;
-    int lastWorkTurn;
-    weak App lastWorkRoot;
+    CefWorkLoop workLoop;
     int wakeGeneration;
     public int workCount;
+    // Optional process-pump adapter; null uses CefHost.Work. Root-turn gating
+    // applies before either backend, allowing offline scheduling acceptance.
+    public Action WorkBackend;
 
     public BrowserNativeLoop() {
         entries = new List<BrowserNativeEntry>();
@@ -34,6 +36,9 @@ public class BrowserNativeLoop : AppLoopParticipant, AppLoopService, AppLoopStop
         if (existing is BrowserNativeLoop) { return (BrowserNativeLoop)existing; }
         BrowserNativeLoop loop = new BrowserNativeLoop();
         loop.host = app;
+        // Acquire while the root is live; StopLoop detaches its registration
+        // list before invoking Stopped, so closing services keep this claim.
+        loop.workLoop = CefWorkLoop.For(ChildWindows.LoopRoot(app));
         loop.registration = app.RegisterLoopParticipant(app, loop);
         return loop;
     }
@@ -69,11 +74,16 @@ public class BrowserNativeLoop : AppLoopParticipant, AppLoopService, AppLoopStop
 
     void WorkOnce(App app) {
         int turn = app.LoopTurnIdentity();
-        App root = ChildWindows.LoopRoot(app);
-        if (turn != 0 && lastWorkRoot == root && lastWorkTurn == turn) { return; }
-        lastWorkRoot = root;
-        lastWorkTurn = turn;
-        CefHost.Work();
+        if (turn != 0) {
+            App root = ChildWindows.LoopRoot(app);
+            if (workLoop == null || workLoop.Root != root) { workLoop = CefWorkLoop.For(root); }
+            if (!workLoop.TryEnter(turn)) { return; }
+        }
+        // Turn zero deliberately pumps on every call without changing the
+        // shared nonzero claim, including reentrant shutdown of another App.
+        Action backend = WorkBackend;
+        if (backend != null) { backend(); }
+        else { CefHost.Work(); }
         workCount = workCount + 1;
     }
 
@@ -131,7 +141,7 @@ public class BrowserNativeLoop : AppLoopParticipant, AppLoopService, AppLoopStop
         // CEF Close is async and process-wide. Other live App services may keep
         // pumping; the application's existing CefHost.Shutdown owns final drain.
         try { WorkOnce(app); }
-        finally { closing.Clear(); host = null; lastWorkRoot = null; }
+        finally { closing.Clear(); host = null; workLoop = null; WorkBackend = null; }
         if (first != null) { throw first; }
     }
 }
