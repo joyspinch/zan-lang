@@ -1,0 +1,224 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+namespace Zan;
+
+public partial class LspServer {
+    static string workspaceRoot;
+
+    static string WorkspacePath(string uri) {
+        if (!uri.StartsWith("file://")) { return ""; }
+        string path = uri.Substring(7);
+        if (path.StartsWith("localhost/")) { path = path.Substring(9); }
+        if (path == "") { return ""; }
+        #if WINDOWS
+        if (!path.StartsWith("/")) { path = "//" + path; }
+        #else
+        if (!path.StartsWith("/")) { return ""; }
+        #endif
+        path = Encoding.UrlDecode(path.Replace("+", "%2b"));
+        #if WINDOWS
+        if (path.Length >= 3 && path[0] == '/' && path[2] == ':') {
+            path = path.Substring(1);
+        }
+        #endif
+        try {
+            path = Path.GetFullPath(path);
+        } catch (ArgumentException ex) {
+            return "";
+        } catch (IOException ex) {
+            return "";
+        }
+        #if WINDOWS
+        path = path.Replace("\\", "/");
+        #endif
+        while (path.Length > 1 && path.EndsWith("/") && !path.EndsWith(":/")) {
+            path = path.Substring(0, path.Length - 1);
+        }
+        return path;
+    }
+
+    static string PathKey(string path) {
+        #if WINDOWS
+        return path.ToLower();
+        #else
+        return path;
+        #endif
+    }
+
+    static string ProjectOf(string path) {
+        if (workspaceRoot == null || workspaceRoot == "" || !path.EndsWith(".zan")) { return ""; }
+        string root = PathKey(workspaceRoot);
+        string prefix = root.EndsWith("/") ? root : root + "/";
+        if (!PathKey(path).StartsWith(prefix)) { return ""; }
+        int end = path.LastIndexOf("/");
+        while (end >= prefix.Length) {
+            string dir = path.Substring(0, end);
+            if (File.Exists(Path.Combine(dir, "zan.proj"))) { return dir; }
+            end = dir.LastIndexOf("/");
+        }
+        return workspaceRoot;
+    }
+
+    static bool SkipSourceDirectory(string name) {
+        return name == ".git" || name == "bin" || name == "obj" || name == "build"
+            || name == "dist" || name == "node_modules" || name == "target" || name == "_scratch";
+    }
+
+    static void AppendDiskSources(string dir, List<string> paths) {
+        if (!Directory.ExistsOnDisk(dir)) { return; }
+        List<string> files;
+        List<string> children;
+        try {
+            files = Directory.GetFiles(dir, "*.zan");
+            children = Directory.GetDirectoryPaths(dir);
+        } catch (IOException ex) {
+            return;
+        }
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string path = files[i];
+            if (path.EndsWith(".zan") && !File.IsReparsePoint(path)) { paths.Add(path); }
+        }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            string child = children[i];
+            if (SkipSourceDirectory(Path.GetFileName(child)) || File.IsReparsePoint(child)
+                    || File.Exists(Path.Combine(child, "zan.proj"))) { continue; }
+            AppendDiskSources(child, paths);
+        }
+    }
+
+    static void ReadLexerDiagnostics(Lexer lexer, Diags diagnostics) {
+        for (int i = 0; i < lexer.escMsgs.Count; i = i + 1) {
+            diagnostics.Error(lexer.escMsgs[i], lexer.escMsgLine[i], lexer.escMsgCol[i]);
+        }
+    }
+
+    static void AnalyzeDocument(LspDocument doc) {
+        RemoveSymbolsOf(doc.Uri);
+        Lexer lexer = new Lexer(doc.Text);
+        List<Token> tokens = lexer.Run();
+        CollectTopLevelSymbols(doc.Uri, tokens);
+        Diags diagnostics = new Diags();
+        ReadLexerDiagnostics(lexer, diagnostics);
+        Parser parser = new Parser(tokens, diagnostics);
+        Node unit = parser.ParseDeclsOnly();
+        CollectMemberSymbols(doc.Uri, unit);
+        RefreshWorkspaceDiagnostics(doc.ProjectRoot, doc);
+        if (doc.ProjectRoot == "") {
+            CheckDiagnostics(unit, diagnostics);
+            PublishDiagnostics(doc.Uri, doc.Version, DiagArray(diagnostics, doc.Text));
+        }
+    }
+
+    static void CheckDiagnostics(Node unit, Diags diagnostics) {
+        Binder binder = new Binder();
+        binder.Bind(unit);
+        Checker checker = new Checker(binder, diagnostics);
+        checker.Check(unit);
+    }
+
+    static void AddAffectedProject(List<string> roots, string root) {
+        if (root == "") { return; }
+        string key = PathKey(root);
+        for (int i = 0; i < roots.Count; i = i + 1) {
+            if (PathKey(roots[i]) == key) { return; }
+        }
+        roots.Add(root);
+    }
+
+    // Document notifications and watched-file notifications share the same refresh path.
+    static void RefreshWorkspaceDiagnostics(string previousRoot, LspDocument changed) {
+        EnsureInit();
+        List<string> roots = new List<string>();
+        AddAffectedProject(roots, previousRoot);
+        for (int i = 0; i < documents.Count; i = i + 1) {
+            LspDocument doc = documents[i];
+            string root = ProjectOf(doc.FilePath);
+            if (PathKey(root) != PathKey(doc.ProjectRoot)) {
+                AddAffectedProject(roots, doc.ProjectRoot);
+                AddAffectedProject(roots, root);
+                doc.ProjectRoot = root;
+            }
+            if (changed == null || doc == changed) { AddAffectedProject(roots, root); }
+        }
+        for (int i = 0; i < roots.Count; i = i + 1) { AnalyzeProject(roots[i]); }
+    }
+
+    static void AnalyzeProject(string root) {
+        List<LspDocument> open = new List<LspDocument>();
+        Dictionary<string, bool> overlays = new Dictionary<string, bool>();
+        string key = PathKey(root);
+        for (int i = 0; i < documents.Count; i = i + 1) {
+            LspDocument doc = documents[i];
+            if (PathKey(doc.ProjectRoot) == key) {
+                open.Add(doc);
+                overlays[PathKey(doc.FilePath)] = true;
+            }
+        }
+        if (open.Count == 0) { return; }
+
+        Node unit = new Node(AK.CompUnit());
+        Diags diagnostics = new Diags();
+        List<string> names = new List<string>();
+        List<int> starts = new List<int>();
+        int line = 1;
+        for (int i = 0; i < open.Count; i = i + 1) {
+            LspDocument doc = open[i];
+            names.Add(doc.Uri);
+            starts.Add(line);
+            line = AppendDiagnosticSource(unit, diagnostics, doc.Text, line);
+        }
+        List<string> paths = new List<string>();
+        AppendDiskSources(root, paths);
+        paths.Sort();
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            string path = paths[i];
+            #if WINDOWS
+            path = path.Replace("\\", "/");
+            #endif
+            if (overlays.ContainsKey(PathKey(path))) { continue; }
+            string text;
+            try {
+                text = File.ReadAllText(path);
+            } catch (IOException ex) {
+                continue;
+            }
+            names.Add("");
+            starts.Add(line);
+            line = AppendDiagnosticSource(unit, diagnostics, text, line);
+        }
+
+        diagnostics.SetFiles(names, starts);
+        Parser resolver = new Parser(new List<Token>(), diagnostics);
+        resolver.ResolveWorkspace(unit);
+        CheckDiagnostics(unit, diagnostics);
+        Dictionary<string, Diags> byUri = new Dictionary<string, Diags>();
+        for (int i = 0; i < open.Count; i = i + 1) { byUri[open[i].Uri] = new Diags(); }
+        for (int i = 0; i < diagnostics.items.Count; i = i + 1) {
+            Diag d = diagnostics.items[i];
+            if (d.line <= 0) { continue; }
+            string uri = diagnostics.FileOfLine(d.line);
+            if (uri != "") {
+                byUri[uri].Add(new Diag(d.msg, diagnostics.LineInFile(d.line), d.col, d.warn));
+            }
+        }
+        for (int i = 0; i < open.Count; i = i + 1) {
+            LspDocument doc = open[i];
+            PublishDiagnostics(doc.Uri, doc.Version, DiagArray(byUri[doc.Uri], doc.Text));
+        }
+    }
+
+    static int AppendDiagnosticSource(Node unit, Diags diagnostics, string text, int line) {
+        // Each source has an independent lexer/parser, but its positions live in the project unit.
+        Lexer lexer = new Lexer(text);
+        lexer.line = line;
+        List<Token> tokens = lexer.Run();
+        ReadLexerDiagnostics(lexer, diagnostics);
+        Parser parser = new Parser(tokens, diagnostics);
+        Node source = parser.ParseSourceDecls();
+        for (int i = 0; i < source.kids.Count; i = i + 1) { unit.Add(source.kids[i]); }
+        return lexer.line + 1;
+    }
+}

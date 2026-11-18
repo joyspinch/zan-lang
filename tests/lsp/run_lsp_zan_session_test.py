@@ -37,6 +37,8 @@ Failure prints the offending frame and exits 1; success prints PASS.
 import json
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 
 def utf16_length(text):
@@ -191,12 +193,96 @@ def fail(ctx, detail):
     sys.exit(1)
 
 
+def check_workspace(s, workspace):
+    caller = (workspace / "app/src/Use.zan").as_uri()
+    library = (workspace / "app/Service.zan").as_uri()
+    manifest = workspace / "app/src/zan.proj"
+
+    def open_doc(uri, text):
+        s.notify("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": "zan", "version": 1, "text": text}})
+
+    def change_doc(uri, version, text):
+        s.notify("textDocument/didChange", {
+            "textDocument": {"uri": uri, "version": version},
+            "contentChanges": [{"text": text}],
+        })
+
+    def close_doc(uri):
+        s.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    def expect_diag(uri, version, messages):
+        diag = s.diag_for(uri)
+        actual = [d["message"] for d in diag["diagnostics"] if d["severity"] == 1]
+        if diag["version"] != version or len(actual) != len(messages) or set(actual) != messages:
+            fail("workspace diagnostics", "%s: expected version %d and %r, got %r"
+                 % (uri, version, messages, diag))
+        return diag["diagnostics"]
+
+    text = ("using Library; class Use { static int Run(Service service) "
+            "{ return Service.Read() + service.Count; } }")
+    open_doc(caller, text)
+    expect_diag(caller, 1, set())
+    change_doc(caller, 2, "using Library; class Use { SiblingOnly a; NestedOnly b; }")
+    expect_diag(caller, 2, {"undefined type 'SiblingOnly'", "undefined type 'NestedOnly'"})
+    change_doc(caller, 3, "class Use { Service a; Other.Service b; }")
+    errors = expect_diag(caller, 3, {"undefined type 'Service'", "undefined type 'Other.Service'"})
+    for error in errors:
+        if error["range"]["start"]["line"] != 0:
+            fail("workspace diagnostics", "wrong source line: %r" % error)
+    change_doc(caller, 4, text)
+    expect_diag(caller, 4, set())
+
+    open_doc(library, "namespace Library; public class Service { public int Count; }")
+    expect_diag(caller, 4, {"type 'Library.Service' has no member 'Read'"})
+    expect_diag(library, 1, set())
+    change_doc(library, 2, "namespace Library; public class Service { public static int Read() { return 1; } }")
+    expect_diag(caller, 4, {"type 'Library.Service' has no member 'Count'"})
+    expect_diag(library, 2, set())
+    change_doc(library, 1, "class Stale {}")
+    close_doc(library)
+    expect_diag(library, 2, set())
+    expect_diag(caller, 4, set())
+
+    manifest.write_text("name=NestedApp\n", encoding="utf-8")
+    s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": manifest.as_uri(), "type": 1}]})
+    expect_diag(caller, 4, {"undefined type 'Service'"})
+    manifest.unlink()
+    s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": manifest.as_uri(), "type": 3}]})
+    expect_diag(caller, 4, set())
+    close_doc(caller)
+    expect_diag(caller, 4, set())
+
+
 def main():
     exe = sys.argv[sys.argv.index("--exe") + 1]
+    with tempfile.TemporaryDirectory(prefix="zan lsp + ") as temp:
+        workspace = Path(temp)
+        sources = {
+            "app/zan.proj": "name=App\n",
+            "app/src/Use.zan": "class DiskUse {}\n",
+            "app/Service.zan": ("namespace Library; public class Service {\n"
+                                "public int Count; public static int Read() { return 1; }\n"
+                                "MissingInDependency bad; }\n"),
+            "app/Broken.zan": "/* unfinished comment\n",
+            "app/nested/zan.proj": "name=Nested\n",
+            "app/nested/Types.zan": "namespace Library; public class NestedOnly {}\n",
+            "app-extra/zan.proj": "name=Sibling\n",
+            "app-extra/Types.zan": "namespace Library; public class Service {} public class SiblingOnly {}\n",
+        }
+        for name, text in sources.items():
+            source = workspace / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(text, encoding="utf-8")
+        run_session(exe, workspace)
+
+
+def run_session(exe, workspace):
     s = Session(exe)
 
     # initialize
-    caps = s.request("initialize", {}).get("result", {}).get("capabilities", {})
+    caps = s.request("initialize", {"rootUri": workspace.as_uri() + "/"}).get(
+        "result", {}).get("capabilities", {})
     for key in ("definitionProvider", "referencesProvider",
                 "documentSymbolProvider", "hoverProvider",
                 "completionProvider", "renameProvider",
@@ -572,6 +658,8 @@ def main():
     diag = s.diag_for(SYN_URI)
     if diag is None or diag["diagnostics"] != []:
         fail("didClose", "expected cleared diagnostics, got %r" % (diag,))
+
+    check_workspace(s, workspace)
 
     # shutdown + exit
     resp = s.request("shutdown", {})

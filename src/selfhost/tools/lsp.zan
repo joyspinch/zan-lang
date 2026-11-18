@@ -4,10 +4,9 @@ using System.Collections.Generic;
 namespace Zan;
 
 /// <summary>
-/// 纯 Zan Language Server Protocol (LSP) 服务端 —— B-ID200 首切片。
-/// 复用自举前端（src/selfhost/frontend/）做真诊断与符号索引：
-/// - 真诊断：Lexer + Parser(ParseDeclsOnly) + Binder + Checker 的完整管线，
-///   语法与语义错误映射为 LSP Diagnostics（行列来自前端 token/AST 位置）。
+/// 纯 Zan Language Server Protocol (LSP) 服务端。
+/// 复用自举前端做语法和语义诊断。同一工程的源码独立解析后一起绑定，
+/// 打开文档优先采用编辑器缓冲区。诊断按源码位置发布。
 /// - documentSymbol：AST 顶层/成员声明（类声明位置由 token 扫描补位——
 ///   前端 ParseClass 不回填 line/col）。
 /// - definition：打开文档的类/方法/字段声明符号索引跳转。
@@ -21,8 +20,7 @@ namespace Zan;
 /// - hover：符号索引信息（种类+声明位置）；内建类型写死描述。
 /// - completion：符号索引 + 关键字/内建类型，按光标前缀过滤。
 /// 已知局限（后续切片收敛，见 TASKS.md B-ID200）：
-/// - 语义诊断是单文档视图：using 指向的外部包/项目内其他文件的类型
-///   会被报 undefined，尚未做项目级符号解析。
+/// - 工程外标准库和包源码尚未进入诊断单元。
 /// - JSON 只覆盖 LSP 会话实际用到的子集；字符串转义完整处理。
 /// 入口：zanc --lsp 派发 Run()（driver/main.zan）。
 /// </summary>
@@ -30,11 +28,15 @@ public class LspDocument {
     public string Uri;
     public string Text;
     public int Version;
+    public string FilePath;
+    public string ProjectRoot;
 
     public LspDocument(string uri, string text, int version) {
         Uri = uri;
         Text = text;
         Version = version;
+        FilePath = "";
+        ProjectRoot = "";
     }
 }
 
@@ -145,7 +147,7 @@ public class LspInlayHint {
     }
 }
 
-public class LspServer {
+public partial class LspServer {
     [DllImport("crt")] public static extern int getchar();
     [DllImport("crt")] public static extern int putchar(int c);
 
@@ -428,25 +430,6 @@ public class LspServer {
     }
 
     // ============================ 分析层 ============================
-
-    /// 解析文档：发布真诊断并重建该文档的声明符号索引。
-    static void Analyze(string uri, string text, int version) {
-        RemoveSymbolsOf(uri);
-        Lexer lx = new Lexer(text);
-        List<Token> toks = lx.Run();
-        CollectTopLevelSymbols(uri, toks);
-
-        Diags dg = new Diags();
-        Parser ps = new Parser(toks, dg);
-        Node unit = ps.ParseDeclsOnly();
-        Binder b = new Binder();
-        b.Bind(unit);
-        Checker ck = new Checker(b, dg);
-        ck.Check(unit);
-        CollectMemberSymbols(uri, unit);
-
-        PublishDiagnostics(uri, version, DiagArray(dg, text));
-    }
 
     /// 顶层类型声明位置：前端 ParseClass/ParseInterface/ParseEnum 不回填
     /// line/col，声明行从 token 流取（关键字后的标识符）。
@@ -770,6 +753,7 @@ public class LspServer {
         string pms = ExtractJsonContainer(rawJson, "params");
 
         if (method == "initialize") {
+            workspaceRoot = WorkspacePath(ExtractJsonField(pms, "rootUri"));
             // 能力如实声明：全量同步 + 诊断 + 补全/悬停/定义/引用/文档符号
             // 位置口径：UTF-16 code unit（LSP 默认；出入站均在协议边界转换）
             string res = "{\"jsonrpc\":\"2.0\",\"id\":" + (id == "" ? "1" : id) + ",\"result\":{"
@@ -803,7 +787,9 @@ public class LspServer {
             string text = ExtractJsonField(td, "text");
             int ver = ExtractJsonInt(td, "version", 1);
             StoreDocument(uri, text, ver);
-            Analyze(uri, text, ver);
+            LspDocument doc = FindDocument(uri);
+            doc.FilePath = WorkspacePath(uri);
+            AnalyzeDocument(doc);
             return;
         }
 
@@ -811,15 +797,19 @@ public class LspServer {
             // textDocumentSync=1 全量同步：取 contentChanges[0].text
             string td = ExtractJsonContainer(pms, "textDocument");
             string uri = ExtractJsonField(td, "uri");
-            int ver = ExtractJsonInt(td, "version", 1);
+            LspDocument doc = FindDocument(uri);
+            if (doc == null) { return; }
+            int ver = ExtractJsonInt(td, "version", doc.Version + 1);
+            if (ver <= doc.Version) { return; }
             string changes = ExtractJsonContainer(pms, "contentChanges");
             string text = "";
             if (changes.StartsWith("[") && changes.Length > 1) {
                 // 第一个元素的 text 字段（全量同步下通常只有一个变更）
                 text = ExtractJsonField(changes.Substring(1), "text");
             }
-            StoreDocument(uri, text, ver);
-            Analyze(uri, text, ver);
+            doc.Text = text;
+            doc.Version = ver;
+            AnalyzeDocument(doc);
             return;
         }
 
@@ -832,6 +822,14 @@ public class LspServer {
             RemoveSymbolsOf(uri);
             // 清空诊断（带最后已知版本号，与 C 宿主行为一致）
             PublishDiagnostics(uri, lastVer, "[]");
+            if (doc != null && doc.ProjectRoot != "") {
+                RefreshWorkspaceDiagnostics(doc.ProjectRoot, doc);
+            }
+            return;
+        }
+
+        if (method == "workspace/didChangeWatchedFiles") {
+            RefreshWorkspaceDiagnostics("", null);
             return;
         }
 
