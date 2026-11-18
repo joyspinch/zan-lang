@@ -886,6 +886,7 @@ partial class Irgen {
             || mname == "SetFieldDouble" || mname == "SetFieldBool" || mname == "SetFieldObject") {
             int lset = NL();
             int lend = NL();
+            string lookupFrom = curLbl;
             L("  br i1 " + hit + ", label %L" + lset + ", label %L" + lend);
             Label(lset);
             string foff_p = NT();
@@ -907,20 +908,30 @@ partial class Irgen {
             string fp = NT();
             L("  " + fp + " = getelementptr inbounds i8, i8* " + rop + ", i64 " + foff);
 
-            if (mname == "SetFieldString") {
+            if (mname == "SetFieldString" || mname == "SetFieldObject") {
+                int lstore = NL();
+                L("  switch i64 " + fkind + ", label %L" + lend + " [");
+                L("    i64 " + ReflFkOf("string") + ", label %L" + lstore);
+                L("    i64 " + ReflFkOf("object") + ", label %L" + lstore);
+                L("  ]");
+                Label(lstore);
                 string sp = NT();
                 L("  " + sp + " = bitcast i8* " + fp + " to i8**");
-                string valOp = NT();
-                L("  " + valOp + " = bitcast " + MapType(vVal.ty) + " " + vVal.op + " to i8*");
+                string valOp = Coerce(vVal, "i8*");
+                string old = NT();
+                L("  " + old + " = load i8*, i8** " + sp);
+                // Erased ARC dispatch handles both managed strings and objects.
+                Node refTy = MkType("object");
+                EmitArcRetain(valOp, refTy);
                 L("  store i8* " + valOp + ", i8** " + sp);
-            } else if (mname == "SetFieldObject") {
-                string sp = NT();
-                L("  " + sp + " = bitcast i8* " + fp + " to i8**");
-                string valOp = NT();
-                L("  " + valOp + " = bitcast " + MapType(vVal.ty) + " " + vVal.op + " to i8*");
-                L("  store i8* " + valOp + ", i8** " + sp);
-                L("  call void @zretain(i8* " + valOp + ")");
-            } else if (mname == "SetFieldBool") {
+                EmitArcRelease(old, refTy);
+                L("  br label %L" + lend);
+                Label(lend);
+                string result = NT();
+                L("  " + result + " = phi i64 [ 0, %" + lookupFrom + " ], [ 0, %L" + lset + " ], [ 1, %L" + lstore + " ]");
+                return new ExprVal(result, MkType("bool"));
+            }
+            if (mname == "SetFieldBool") {
                 string val1 = NT();
                 L("  " + val1 + " = icmp ne i64 " + vVal.op + ", 0");
                 string val8 = NT();
