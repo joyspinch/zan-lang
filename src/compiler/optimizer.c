@@ -1104,7 +1104,8 @@ fail:
     return 0;
 }
 
-zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
+zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level,
+                                           const zan_opt_knobs_t *knobs) {
     if (level == ZAN_OPT_NONE) return ZAN_OK;
 
 #if ZAN_LLVM_MAJOR >= 23
@@ -1117,18 +1118,22 @@ zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level
 
     LLVMTargetMachineRef tm = NULL;
     if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK) return ZAN_ERROR;
-    zan_status_t status = zan_opt_run_passes_on_module(g->mod, tm, level);
+    zan_status_t status = zan_opt_run_passes_on_module(g->mod, tm, level, knobs);
     if (tm) LLVMDisposeTargetMachine(tm);
     return status;
 }
 
-zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level) {
+zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm,
+                                          zan_opt_level_t level,
+                                          const zan_opt_knobs_t *knobs) {
+    static const zan_opt_knobs_t default_knobs;
+    if (!knobs) knobs = &default_knobs;
     if (zan_opt_verify_module(mod, "before optimization") != ZAN_OK) return ZAN_ERROR;
     if (level == ZAN_OPT_NONE) return ZAN_OK;
     /* S-UNWIND（全局 pass ②）：在 LLVM
      * 管线前塌缩可证不抛的 invoke，死 lpad 块交给后续管线清理。
-     * ZAN_NO_UNWIND_SHRINK=1 关断（红绿对照用）。 */
-    if (!getenv("ZAN_NO_UNWIND_SHRINK")) {
+     * -fno-opt-shrink（或回退 ZAN_NO_UNWIND_SHRINK=1）关断（红绿对照用）。 */
+    if (!zan_opt_knob_off(knobs->no_shrink, "ZAN_NO_UNWIND_SHRINK")) {
         zan_shrink_collapse_invokes(mod);
     }
     const char *passes = NULL;
@@ -1141,15 +1146,17 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRe
     default: return ZAN_ERROR;
     }
 
-    /* 调试旋钮：ZAN_OPT_PIPELINE 覆盖默认管线文本（如 "sroa" 逐 pass
-     * 二分），"none" 完全跳过 LLVM 管线——定位优化缺陷用（A595）。 */
+    /* 调试旋钮：--opt-pipeline（或回退 ZAN_OPT_PIPELINE）覆盖默认管线
+     * 文本（如 "sroa" 逐 pass 二分），"none" 完全跳过 LLVM 管线——定位
+     * 优化缺陷用（A595）。 */
     {
-        const char *pipe_env = getenv("ZAN_OPT_PIPELINE");
-        if (pipe_env && pipe_env[0]) {
-            if (strcmp(pipe_env, "none") == 0) {
+        const char *pipe = knobs->pipeline ? knobs->pipeline
+                                           : getenv("ZAN_OPT_PIPELINE");
+        if (pipe && pipe[0]) {
+            if (strcmp(pipe, "none") == 0) {
                 return ZAN_OK;
             }
-            passes = pipe_env;
+            passes = pipe;
         }
     }
 
@@ -1396,7 +1403,7 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
         report.dce = zan_opt_dce(g);
     if (!zan_opt_knob_off(knobs->no_inline, "ZAN_NO_OPT_INLINE"))
         report.inlining = zan_opt_inline(g, level);
-    report.success = zan_opt_configure_llvm_passes(g, level) == ZAN_OK;
+    report.success = zan_opt_configure_llvm_passes(g, level, knobs) == ZAN_OK;
 
     double t1 = get_time_ms();
     report.time_ms = t1 - t0;

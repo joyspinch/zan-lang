@@ -249,17 +249,19 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             else if (strcmp(name, "constfold") == 0) slot = &opt_knobs.no_constfold;
             else if (strcmp(name, "dce") == 0) slot = &opt_knobs.no_dce;
             else if (strcmp(name, "inline") == 0) slot = &opt_knobs.no_inline;
+            else if (strcmp(name, "shrink") == 0) slot = &opt_knobs.no_shrink;
             if (!slot) {
                 fprintf(stderr,
                         "zanc: unknown optimizer pass in '%s' (known: early, "
-                        "escape, arc, devirt, constfold, dce, inline)
-",
+                        "escape, arc, devirt, constfold, dce, inline, shrink)\n",
                         argv[i]);
                 opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
             }
             *slot = 1;
         } else if (strncmp(argv[i], "--early-passes=", 15) == 0) {
             opt_knobs.early_passes = argv[i] + 15;
+        } else if (strncmp(argv[i], "--opt-pipeline=", 15) == 0) {
+            opt_knobs.pipeline = argv[i] + 15;
         } else if (strncmp(argv[i], "-ferror-limit=", 14) == 0) {
             /* atoi 曾把 "abc" 静默变 0——main.c 以 >=0 判已设置，0 即
              * 抑制全部错误显示；现严格十进制复核，垃圾值按用法错误退出 */

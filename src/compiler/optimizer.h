@@ -84,7 +84,9 @@ typedef struct {
     signed char no_constfold; /* -fno-opt-constfold */
     signed char no_dce;       /* -fno-opt-dce */
     signed char no_inline;    /* -fno-opt-inline */
+    signed char no_shrink;    /* -fno-opt-shrink（S-UNWIND 塌缩） */
     const char *early_passes; /* --early-passes=<llvm-pass-list> */
+    const char *pipeline;     /* --opt-pipeline=<text|none> */
 } zan_opt_knobs_t;
 
 /* 单旋钮判定：显式 > 环境变量回退。env 仅在旋钮未显式设置时读取。 */
@@ -94,8 +96,11 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
                               zan_opt_level_t level,
                               const zan_opt_knobs_t *knobs);
 void zan_opt_report_print(const zan_opt_report_t *report);
-zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
-zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level);
+zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level,
+                                           const zan_opt_knobs_t *knobs);
+zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm,
+                                          zan_opt_level_t level,
+                                          const zan_opt_knobs_t *knobs);
 
 /* 收缩 pass（S-UNWIND）：nothrow 闭包后将可证
  * 不抛的 invoke 塌缩为 call（personality/语义不变）。返回塌缩数。 */

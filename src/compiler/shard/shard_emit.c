@@ -381,7 +381,8 @@ static bool sh_emit_one_file(sh_state_t *st, int shard_idx, const char *frag_pat
     }
     if (g->publish_mode || g->obfuscate_strings || getenv("ZAN_SHARD_OPT")) {
         if (zan_opt_run_passes_on_module(mod, tm,
-                (g->publish_mode || g->obfuscate_strings) ? ZAN_OPT_SIZE : ZAN_OPT_FULL) != ZAN_OK) {
+                (g->publish_mode || g->obfuscate_strings) ? ZAN_OPT_SIZE : ZAN_OPT_FULL,
+                NULL) != ZAN_OK) {
             st->optimizer_failed = true;
             snprintf(errbuf, errsz, "LLVM optimization failed");
             LLVMDisposeModule(mod);
