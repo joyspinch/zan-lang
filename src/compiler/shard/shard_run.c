@@ -11,11 +11,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     sh_state_t st;
     memset(&st, 0, sizeof(st));
     st.g = g;
-    sh_map_init(&st.fn_v); sh_map_init(&st.glob_v);
-    sh_map_init(&st.members_all);
-    sh_map_init(&st.needs_decl);
-    sh_map_init(&st.ext_globs);
-    sh_map_init(&st.ext_fns);
 
     /* S4b/design.md §8.3: 内部常量全局一律唯一定义——反射 fields/mtab/
      * ctor/enum 等含指针字段表不能入 blob，逐全局升 external（原名
@@ -28,8 +23,13 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     if (!sh_promote_const_globals(&st)) {
         fprintf(stderr, "shard: %s — falling back to single module\n",
                 st.reason);
-        goto cleanup_planning;
+        return 0;
     }
+    sh_map_init(&st.fn_v); sh_map_init(&st.glob_v);
+    sh_map_init(&st.members_all);
+    sh_map_init(&st.needs_decl);
+    sh_map_init(&st.ext_globs);
+    sh_map_init(&st.ext_fns);
 
     sh_member_t *mem = (sh_member_t *)calloc((size_t)(m->fn_count ? m->fn_count : 1),
                                              sizeof(*mem));
