@@ -444,6 +444,33 @@ static void refl_note_invoke_name(zan_irgen_t *g, zan_ast_node_t *name) {
     g->refl_invoke_names[g->refl_invoke_name_count++] = text;
 }
 
+/* thunk 把返回引用的所有权放进 ret 槽；不接管所有权的消费臂丢弃前必须
+ * 释放，否则每次调用漏一个对象（探针 p2：InvokeLong 取 object 字段，
+ * 进程退出漏 payload）。incl_string：数值化臂对 FK_STRING 错配返回的
+ * 串一并释放；ISTRING 臂接管 FK_STRING，只丢 FK_REF。 */
+static void refl_emit_owned_drop(zan_irgen_t *g, LLVMValueRef v,
+                                 LLVMValueRef k, LLVMValueRef called,
+                                 bool incl_string) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef owned = LLVMBuildICmp(g->builder, LLVMIntEQ, k,
+        LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), "refl.dropref");
+    if (incl_string) {
+        owned = LLVMBuildOr(g->builder, owned,
+            LLVMBuildICmp(g->builder, LLVMIntEQ, k,
+                LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0), "refl.dropstr"),
+            "refl.dropref2");
+    }
+    LLVMValueRef take = LLVMBuildAnd(g->builder, called, owned, "refl.droprise");
+    LLVMValueRef p = LLVMBuildIntToPtr(g->builder, v, i8ptr, "refl.dropp");
+    LLVMValueRef safe = LLVMBuildSelect(g->builder, take, p,
+        LLVMConstNull(i8ptr), "refl.dropsel");
+    zan_call2(g->builder,
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                         (LLVMTypeRef[]){ i8ptr }, 1, 0),
+        g->rt_release_dyn, (LLVMValueRef[]){ safe }, 1, "");
+}
+
 /* `obj */
 static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
                                       LLVMValueRef recv, zan_istr_t name,
@@ -539,17 +566,20 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
                 LLVMBuildIsNotNull(g->builder, s, "refl.isnn"), "refl.isok2");
             *out = LLVMBuildSelect(g->builder, isstr, s, refl_empty_string(g),
                                    "refl.istr");
+            refl_emit_owned_drop(g, v, k, called, false);
             return true;
         }
         if (code == ZAN_REFL_M_IDOUBLE) {
             *out = LLVMBuildSelect(g->builder, called,
                 refl_pget_as_f64(g, v, k), LLVMConstReal(dbl, 0.0), "refl.idv");
+            refl_emit_owned_drop(g, v, k, called, true);
             return true;
         }
         LLVMValueRef iv = LLVMBuildSelect(g->builder, called,
             refl_pget_as_i64(g, v, k), LLVMConstInt(i64, 0, 0), "refl.iiv");
         *out = code == ZAN_REFL_M_IINT
              ? LLVMBuildTrunc(g->builder, iv, i32, "refl.ii32") : iv;
+        refl_emit_owned_drop(g, v, k, called, true);
         return true;
     }
     if (code == ZAN_REFL_M_OBOOL) {   /* GetFieldBool(name) */
