@@ -575,6 +575,7 @@ int main(int argc, char **argv) {
     bool runtime_checks = opts.runtime_checks;
     bool strict_runtime = opts.strict_runtime;
     bool publish_mode = opts.publish_mode;
+    bool no_pullin_filter = opts.no_pullin_filter;
     int obfuscate_strings_opt = opts.obfuscate_strings_opt;
     bool hide_diagnostics = opts.hide_diagnostics;
     const char *site_map_path = opts.site_map_path;
@@ -748,7 +749,7 @@ int main(int argc, char **argv) {
 
         explicit_input_count = input_count;
 
-        pi_filter_active = !emit_symbols_path &&
+        pi_filter_active = !no_pullin_filter && !emit_symbols_path &&
                            getenv("ZAN_NO_PULLIN_FILTER") == NULL;
         if (pi_filter_active) {
             pi_arena = zan_arena_new();

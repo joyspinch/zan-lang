@@ -72,6 +72,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
     bool packages_disabled = false;
+    bool no_pullin_filter = false;
     bool quiet = false;
     const char *package_api = NULL;
     const char *package_install_dir = NULL;
@@ -208,6 +209,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
         } else if (strcmp(argv[i], "--no-packages") == 0) {
             packages_disabled = true;
             package_project_root[0] = '\0';
+        } else if (strcmp(argv[i], "--no-pullin-filter") == 0) {
+            no_pullin_filter = true;
         } else if (strcmp(argv[i], "--package-api") == 0 && i + 1 < argc) {
             package_api = argv[++i];
         } else if (strcmp(argv[i], "--package-list-missing") == 0) {
@@ -324,7 +327,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
                         "[A-Za-z0-9._+-] (it is passed to the linker as "
                         "-l<name>; use --libpath for search paths)\n",
                         argv[i + 1]);
-                return 1;
+                opts->exit_code = 1;
+                return ZAN_OPTIONS_ERROR;
             }
             if (extra_link_lib_count < ZAN_LINK_MAX_LIBS)
                 extra_link_libs[extra_link_lib_count++] = argv[++i];
@@ -433,6 +437,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     opts->runtime_checks = runtime_checks;
     opts->strict_runtime = strict_runtime;
     opts->publish_mode = publish_mode;
+    opts->no_pullin_filter = no_pullin_filter;
     opts->obfuscate_strings_opt = obfuscate_strings_opt;
     opts->hide_diagnostics = hide_diagnostics;
     opts->site_map_path = site_map_path;

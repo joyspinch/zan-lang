@@ -39,6 +39,7 @@ typedef struct zan_options {
     bool runtime_checks;
     bool strict_runtime;
     bool publish_mode;
+    bool no_pullin_filter; /* --no-pullin-filter；未给时回退 ZAN_NO_PULLIN_FILTER */
     int obfuscate_strings_opt;
     bool hide_diagnostics;
     const char *site_map_path;
