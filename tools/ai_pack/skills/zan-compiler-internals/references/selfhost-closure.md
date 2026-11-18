@@ -2924,6 +2924,12 @@ kernel32、shell32、user32、advapi32、version）。
 - 修法：在求值前先用 `ArgTypeNode(e.a)` 做无开销的静态类型预判，仅在左臂明确可能为可空时才先求值；若非可空，复用第一次求得的 `la` 或仅求值一次，严禁对同一 AST 节点调用两次 `GenExpr`。
 - 判据：IR 生成阶段的所有 helper 必须严格保持单遍（single-pass）发射。任何试探性分支若需求值子表达式，必须将结果缓存传递或确保提前返回，绝不允许穿透后丢弃并重复发射。
 
+- 语义检查同样要复用接收者推断。`InferType` / `CheckCall` 解析成员接收者后，
+  把该类型传入 `MethodUpCall`、候选评分与参数目标类型匹配，保留静态调用和泛型替换。
+  `mvc_hardening` 的主线程采样曾反复落在 `InferType → MethodUpCall → CallReceiverType`，
+  三条 MVC 用例均超过 120 秒；复用后 `mvc_hardening`、`server_mvc_timezone`、
+  `web_route_regex` 均在原预算内匹配宿主输出。
+
 ## 147. 字符串头与对象 ARC 头不通用：动态调用返回值不能对字符串字面量 `@zretain`
 
 - 坑（2026-11-10 实测）：在泛型容器（如 `List<T>`）的动态反射调用（`InvokeString`/`InvokeObject`）中，对返回指针如果统一调用 `@zretain`，当被反射方法返回的是字符串常量时，由于字符串在只读 `.rdata` 常量区，其对象头布局为 `[-24]=0, [-16]=len, [-8]=magic (TSNZ/1515082580)`，而不是 ARC 类对象的 `[-24]=cid, [-16]=rc, [-8]=dtor`。调用 `@zretain` 会在 `lock incq -0x10(%rcx)` 处尝试原子递增只读段中的字符串长度字段，直接触发 Windows 0xC0000005 写入访问冲突崩溃。

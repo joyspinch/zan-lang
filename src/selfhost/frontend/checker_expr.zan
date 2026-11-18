@@ -566,20 +566,14 @@ public partial class Checker {
         return true;
     }
 
-    Node CallReceiverType(Node call) {
-        if (call == null || call.a == null) { return null; }
-        if (call.a.kind == AK.Ident()) { return curClass != null ? MkType(curClass.sval) : null; }
-        if (call.a.kind == AK.MemberAccess()) {
-            Node ty = InferType(call.a.a);
-            if (ty != null) { return ty; }
-            Node cls = StaticRecv(call.a.a);
-            if (cls != null) {
-                ty = MkType(cls.sval);
-                if (call.a.d != null && call.a.d.sval == "__typeargs") { ty.kids = call.a.d.kids; }
-                return ty;
-            }
-        }
-        return call.type;
+    // Reuse the type already inferred for the member receiver. Inferring it
+    // again during overload selection multiplies the work along a call chain.
+    Node CallReceiverType(Node call, Node cls, Node valueType) {
+        if (call.a.kind == AK.Ident()) { return cls != null ? MkType(cls.sval) : null; }
+        if (valueType != null) { return valueType; }
+        Node ty = MkType(cls.sval);
+        if (call.a.d != null && call.a.d.sval == "__typeargs") { ty.kids = call.a.d.kids; }
+        return ty;
     }
 
     Node CallParamType(Node cand, Node call, int index, Node receiver) {
@@ -629,7 +623,7 @@ public partial class Checker {
             Node m = cls.kids[i];
             if (m.kind == AK.CtorDecl() && !HasMod(m, MOD.Static()) && AcceptsArgcOf(m, call.kids.Count)
                 && MethodGroupArgsFit(m, call, call.type)) {
-                int score = CallScore(m, call);
+                int score = CallScore(m, call, null);
                 if (score > best) { pick = m; best = score; }
             }
             i = i + 1;
@@ -645,13 +639,12 @@ public partial class Checker {
         if (callee != null) { callee.isIntrinsic = IsTaskActionCall(n); }
         bool hasNamed = false;
         Node callTargetMethod = null;
-        Node callTargetCls = null;
-        Node callTargetOt = null;
+        Node receiver = null;
         if (callee != null) {
             if (callee.kind == AK.Ident()) {
                 CheckByRefCapture(callee.sval);
-                callTargetMethod = MethodUpCall(curClass, callee.sval, n);
-                callTargetCls = curClass;
+                receiver = CallReceiverType(n, curClass, null);
+                callTargetMethod = MethodUpCall(curClass, callee.sval, n, receiver);
             } else if (callee.kind == AK.MemberAccess()) {
                 Node ot = InferType(callee.a);
                 Node cls = ClassOf(ot);
@@ -659,9 +652,8 @@ public partial class Checker {
                     cls = StaticRecv(callee.a);
                 }
                 if (cls != null) {
-                    callTargetMethod = MethodUpCall(cls, callee.sval, n);
-                    callTargetCls = cls;
-                    callTargetOt = ot;
+                    receiver = CallReceiverType(n, cls, ot);
+                    callTargetMethod = MethodUpCall(cls, callee.sval, n, receiver);
                 }
             }
         }
@@ -672,7 +664,7 @@ public partial class Checker {
             if (n.kids[i].argName != "") { hasNamed = true; }
             Node prevArgTarget = curTargetType;
             if (callTargetMethod != null) {
-                curTargetType = CallParamType(callTargetMethod, n, i, CallReceiverType(n));
+                curTargetType = CallParamType(callTargetMethod, n, i, receiver);
             } else {
                 curTargetType = null;
             }
