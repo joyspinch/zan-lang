@@ -793,8 +793,6 @@ struct zan_irgen {
 
 void zan_irgen_shard_buf_append(zan_irgen_t *g, LLVMValueRef fn, const char *txt);
 void zan_irgen_shard_buf_free(zan_irgen_t *g);
-bool zan_irgen_shard_harvest_fn(zan_irgen_t *g, LLVMValueRef fn);
-void zan_irgen_shard_harvest_stats(void);
 /* 插值与 ToString("F2") 共用的 spec→printf 映射（irgen_expr.c 定义） */
 int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
                             bool is_ulong, bool *want_float,
