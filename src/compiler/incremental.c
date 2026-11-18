@@ -24,6 +24,21 @@
 
 #include "../common/host_oom.h"
 
+/* popen 走 shell（cmd.exe / /bin/sh），路径即使加引号，$()、反引号、
+ * %VAR% 等在引号内仍会被展开——只能白名单字符集，越界拒绝。 */
+static bool incr_spawn_path_safe(const char *p) {
+    if (!p) return false;
+    for (; *p; p++) {
+        char c = *p;
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') ||
+                  c == '.' || c == '_' || c == '-' || c == '+' ||
+                  c == ' ' || c == '/' || c == '\\' || c == ':';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 uint64_t zan_hash_buffer(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -485,11 +500,12 @@ static DWORD WINAPI compile_worker(LPVOID arg) {
         }
     }
 
-    if (strchr(task->source_path, '"') || strchr(obj_path, '"')) {
+    if (!incr_spawn_path_safe(task->source_path) || !incr_spawn_path_safe(obj_path)) {
         task->result->source_path = zan_strdup(task->source_path);
         task->result->object_path = NULL;
         task->result->exit_code = -1;
-        task->result->error_msg = zan_strdup("path contains embedded quote");
+        task->result->error_msg =
+            zan_strdup("path contains characters unsafe for shell spawn");
         return 1;
     }
     char cmd[2048];
@@ -613,11 +629,12 @@ static void *compile_worker_posix(void *arg) {
         }
     }
 
-    if (strchr(task->source_path, '"') || strchr(obj_path, '"')) {
+    if (!incr_spawn_path_safe(task->source_path) || !incr_spawn_path_safe(obj_path)) {
         task->result->source_path = zan_strdup(task->source_path);
         task->result->object_path = NULL;
         task->result->exit_code = -1;
-        task->result->error_msg = zan_strdup("path contains embedded quote");
+        task->result->error_msg =
+            zan_strdup("path contains characters unsafe for shell spawn");
         return NULL;
     }
     char cmd[2048];
