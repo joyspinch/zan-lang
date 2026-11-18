@@ -1,0 +1,160 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+class DesignerInspectorCardsRetainedTest {
+    static void Check(bool condition, string message) { if (!condition) { throw new Exception(message); } }
+    static Control Find(Control root, string name) {
+        if (root == null) { return null; }
+        if (root.name == name) { return root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control result = Find(root.ChildAt(i), name); if (result != null) { return result; }
+        }
+        return null;
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static FormField Add(Designer designer, int type, string kind, string name) {
+        FormField field = FormField.New(type, designer.fields.Count + 1);
+        field.kind = kind; field.fname = name; field.name = name;
+        designer.fields.Add(field); designer.sel = field; return field;
+    }
+    static void Prepare(App app, Designer designer) {
+        // Float preserves the real canvas geometry through DesignMakeFloat.
+        // Prepare that standard region too; an Inspector-only fixture has no
+        // PreviewNode, so the production visibility guard correctly rejects Float.
+        // The regions do not overlap and no Inspector Paint is needed for input.
+        designer.PrepareCanvasInput(app, new Rect(600, 20, 380, 820));
+        designer.PrepareInspectorInput(app, new Rect(20, 20, 560, 820));
+    }
+    static Button Card(Designer designer, string command, int value) {
+        Control control = Find(designer.InspectorInputRoot(), "inspector-card-" + command + "-" + Convert.ToString(value));
+        Check(control is Button, "card action is a standard retained Button: " + command);
+        return (Button)control;
+    }
+    static void Click(App app, Designer designer, string command, int value) {
+        Prepare(app, designer); Button button = Card(designer, command, value);
+        ScrollColumn body = (ScrollColumn)Find(designer.InspectorInputRoot(), "inspector-body");
+        body.SetScrollTop(body.ScrollTop() + button.by - body.by - app.Scale(8));
+        Prepare(app, designer);
+        Check(Card(designer, command, value) == button, "scroll preparation preserves button identity");
+        Check(button.bw > 0 && button.bh > 0 && button.by >= body.by
+            && button.by + button.bh <= body.by + body.bh, "button has visible geometry before Paint: " + command);
+        int x = button.bx + button.bw / 2; int y = button.by + button.bh / 2;
+        Control hit = designer.InspectorInputRoot().HitTest(x, y, 0);
+        Check(hit != null && button.ContainsInputControl(hit), "real click center hits its retained button: " + command);
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0); Drain(app);
+    }
+    static void Release(App app, Designer designer) {
+        designer.RetireInspectorInput(); designer.RetireCanvasInput(); designer.DisposeDesignPreview();
+        app.StopLoop(); app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void SingleLayoutAndPresets() {
+        App app = App.CreateOffscreen("Cards single", 1000, 900);
+        Designer designer = new Designer(); designer.fields.Clear(); designer.inspCategory = 2;
+        FormField field = Add(designer, 8, "Button", "single");
+        Prepare(app, designer); Button fill = Card(designer, "fill-height", 0);
+        int undo = designer.undoStack.Count;
+        Prepare(app, designer); Prepare(app, designer);
+        Check(Card(designer, "fill-height", 0) == fill && designer.undoStack.Count == undo,
+            "repeated preparation preserves identity and does not push undo");
+        Click(app, designer, "fill-height", 0);
+        Check(field.position == 0 && field.flexGrow == 1 && field.fh == 0
+            && designer.undoStack.Count == undo + 1, "Fill H changes model and undo before Paint");
+        Click(app, designer, "auto-height", 0);
+        Check(field.position == 0 && field.flexGrow == 0 && field.fh == 0, "Auto H changes model before Paint");
+        Click(app, designer, "position", 0);
+        Check(field.position == 1, "Float action commits before Paint");
+        Check(Card(designer, "position", 0).GetProp("text") == Designer.T("To Flow", "转流式"), "position label synchronizes after action");
+        Click(app, designer, "position", 0);
+        Check(field.position == 0 && field.fx == 0 && field.fy == 0, "Flow action resets absolute coordinates");
+        List<int> docks = new List<int>{ 1, 5, 2, 3, 0, 4 };
+        for (int i = 0; i < docks.Count; i = i + 1) {
+            int side = docks[i]; Click(app, designer, "dock", side);
+            Check(field.dockSide == side && field.position == 0, "all six dock actions commit before Paint");
+        }
+        Click(app, designer, "width", 160); Click(app, designer, "height", 32);
+        Click(app, designer, "margin", 8); Click(app, designer, "padding", 16);
+        Check(field.fw == 160 && field.fh == 32 && field.margin == 8 && field.padding == 16,
+            "W/H/Mg/Pd presets remain functional");
+        Release(app, designer);
+    }
+    static void ShellAndContainer() {
+        App app = App.CreateOffscreen("Cards shell", 1000, 900);
+        Designer designer = new Designer(); designer.fields.Clear();
+        FormField status = Add(designer, 59, "StatusBar", "status");
+        List<int> statusHeights = new List<int>{ 24, 28, 32 };
+        for (int i = 0; i < statusHeights.Count; i = i + 1) {
+            int height = statusHeights[i]; Click(app, designer, "status-height", height);
+            Check(status.fh == height && status.position == 0 && status.dockSide == 2, "StatusBar presets preserve bottom docking");
+        }
+        FormField tools = Add(designer, 58, "ToolStrip", "tools");
+        Click(app, designer, "tools-dock", 2);
+        Check(tools.dockSide == 2 && tools.position == 0, "ToolStrip bottom docks before Paint");
+        Click(app, designer, "tools-dock", 1);
+        Check(tools.dockSide == 1 && tools.position == 0, "ToolStrip top docks before Paint");
+        List<int> toolHeights = new List<int>{ 28, 32, 40 };
+        for (int i = 0; i < toolHeights.Count; i = i + 1) {
+            int height = toolHeights[i]; Click(app, designer, "tools-height", height);
+            Check(tools.fh == height && tools.position == 0, "ToolStrip height presets commit before Paint");
+        }
+        FormField panel = Add(designer, 45, "Panel", "panel"); panel.designSource = JsonValue.NewObject();
+        Click(app, designer, "direction", 1); Check(panel.flexDir == 1, "Row action commits");
+        Click(app, designer, "direction", 0); Check(panel.flexDir == 0, "Column action commits");
+        Click(app, designer, "gap", 12); Click(app, designer, "container-padding", 24);
+        Check(panel.gap == 12 && panel.padding == 24 && panel.designSource.Int("gap", -1) == 12
+            && panel.designSource.Int("padding", -1) == 24, "container presets update model and source JSON");
+        Release(app, designer);
+    }
+    static void BatchAndStaleActions() {
+        App app = App.CreateOffscreen("Cards batch", 1000, 900);
+        Designer designer = new Designer(); designer.fields.Clear();
+        FormField first = Add(designer, 8, "Button", "first");
+        FormField second = Add(designer, 8, "Button", "second"); designer.sel = first;
+        designer.freeExtra.Add(second);
+        Click(app, designer, "batch-lock", 0);
+        Check(first.locked && second.locked, "batch lock commits before Paint");
+        Click(app, designer, "batch-lock", 0);
+        Check(!first.locked && !second.locked, "batch unlock commits before Paint");
+        Click(app, designer, "batch-fill-height", 0);
+        Check(first.flexGrow == 1 && second.flexGrow == 1 && first.fh == 0 && second.fh == 0, "batch Fill H commits");
+        Click(app, designer, "batch-position", 0);
+        Check(first.position == 1 && second.position == 1, "batch Float commits");
+        Click(app, designer, "batch-position", 0);
+        Check(first.position == 0 && second.position == 0, "batch Flow commits");
+        Click(app, designer, "batch-margin", 12); Click(app, designer, "batch-padding", 24);
+        Check(first.margin == 12 && second.margin == 12 && first.padding == 24 && second.padding == 24,
+            "batch margins and padding commit");
+        Button oldMargin = Card(designer, "batch-margin", 4);
+        int undo = designer.undoStack.Count;
+        FormField replacement = Add(designer, 8, "Button", "replacement"); designer.sel = first;
+        designer.freeExtra.Clear(); designer.freeExtra.Add(replacement); Prepare(app, designer);
+        oldMargin.Click.RaiseS(oldMargin); Drain(app);
+        Check(first.margin == 12 && second.margin == 12 && replacement.margin != 4 && designer.undoStack.Count == undo,
+            "old batch action cannot target a changed selection with the same primary");
+        designer.freeExtra.Clear(); Prepare(app, designer);
+        Button oldFill = Card(designer, "fill-height", 0);
+        designer.sel = replacement; Prepare(app, designer);
+        int before = replacement.flexGrow; undo = designer.undoStack.Count;
+        oldFill.Click.RaiseS(oldFill); Drain(app);
+        Check(replacement.flexGrow == before && designer.undoStack.Count == undo, "old target action is inert");
+        Button current = Card(designer, "fill-height", 0);
+        designer.RetireInspectorCards(); designer.RetireInspectorCards();
+        current.Click.RaiseS(current); Drain(app);
+        Check(replacement.flexGrow == before && designer.undoStack.Count == undo, "retired epoch action is inert");
+        Prepare(app, designer); current = Card(designer, "fill-height", 0);
+        app.StopLoop(); current.Click.RaiseS(current); Drain(app);
+        Check(replacement.flexGrow == before && designer.undoStack.Count == undo, "stopped scope action is inert");
+        Release(app, designer);
+    }
+    static void Main() {
+        ControlBootstrap.Install();
+        SingleLayoutAndPresets(); ShellAndContainer(); BatchAndStaleActions();
+        Console.WriteLine("designer inspector Cards retained ok");
+    }
+}

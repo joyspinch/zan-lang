@@ -3,9 +3,8 @@
 #      src/page.html plus an html under the skipped src/docs subtree; the
 #      probe source carries the DesignDoc. token, which is the auto-embed
 #      gate signal,
-#   2. compile --publish WITHOUT any explicit --embed: the compiler must
-#      discover src/page.html on its own (main.c design gate + embedres.c
-#      zan_embed_collect_design_html),
+#   2. compile --publish with an explicit alias for page.html: the compiler
+#      must also discover src/page.html on its own and share its payload,
 #   3. assert the exe carries NO plaintext of the design (publish bakes are
 #      encrypted),
 #   4. run it from a directory that does NOT contain src/, so the read goes
@@ -31,7 +30,8 @@ file(WRITE ${proj_dir}/src/docs/hidden.html "<html>must-not-embed</html>")
 configure_file(${SRC} ${proj_dir}/app.zan COPYONLY)
 
 execute_process(
-  COMMAND ${ZANC} ${proj_dir}/app.zan --publish -o ${OUT_EXE}
+  COMMAND ${ZANC} ${proj_dir}/app.zan --publish
+    --embed "${proj_dir}/src/page.html=views/start.html" -o ${OUT_EXE}
   RESULT_VARIABLE compile_rc
   OUTPUT_VARIABLE compile_out
   ERROR_VARIABLE  compile_err)
@@ -43,7 +43,7 @@ endif()
 # HEX read: text-mode file(READ) stops at the first NUL byte and any 0x3B
 # in the image list-splits the variable into extra FIND parameters.
 file(READ ${OUT_EXE} image HEX)
-string(FIND ${image} "7365637265742D706167652D39313337" hit)
+string(FIND "${image}" "7365637265742d706167652d39313337" hit)
 if(NOT hit EQUAL -1)
   message(FATAL_ERROR "the design html is baked as plaintext; publish encryption did not engage")
 endif()

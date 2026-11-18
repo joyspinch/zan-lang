@@ -1,0 +1,192 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    void BuildInspectorExtraProps(FormField field) {
+        inspectorExtrasProps = this.InspectorExtraColumn(inspectorExtrasRoot, "inspector-extra-props");
+        Flex heading = this.InspectorExtraRow(inspectorExtrasProps, "inspector-props-heading");
+        Label title = this.InspectorExtraLabel(heading,
+            field.compRef ? Designer.T("COMPONENT PROPS", "组件属性") : Designer.T("WIDGET PROPS", "控件属性"), true);
+        title.Class = "tertiary small";
+        this.InspectorExtraButton(heading, "inspector-props-dialog", Designer.T("Edit…", "编辑…"), "props-dialog", 0, "");
+        if (field.compRef) {
+            this.InspectorExtraButton(inspectorExtrasProps, "inspector-component-unpack",
+                Designer.T("Unpack to inline copy", "解包为内联副本"), "unpack", 0, "");
+            this.EnsureCompPropDecls(field.customKind);
+            for (int i = 0; i < compPropDecls.Count; i = i + 1) {
+                CompPropDecl decl = compPropDecls[i];
+                this.BuildInspectorExtraProp(field, decl.key, decl.label, decl.def, false);
+            }
+        } else {
+            // Typed builtin rows belong to the main grid. Only their dedicated
+            // icon/asset/color launchers are retained here, without duplicate inputs.
+            List<string> rows = Designer.BuiltinPropRows(field.kind);
+            if (rows == null) { return; }
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                int bar = rows[i].IndexOf("|");
+                if (bar < 0) { continue; }
+                string key = rows[i].Substring(0, bar);
+                if (key != "icon" && !Designer.IsAssetProp(key) && !Designer.IsColorProp(key)) { continue; }
+                this.BuildInspectorExtraProp(field, key, rows[i].Substring(bar + 1), "", true);
+            }
+        }
+    }
+
+    void BuildInspectorExtraProp(FormField field, string key, string label, string fallback, bool builtin) {
+        DesignerInspectorExtraProp prop = new DesignerInspectorExtraProp();
+        prop.key = key;
+        prop.fallback = fallback;
+        prop.builtin = builtin;
+        prop.shadow = Designer.CompPropValue(field, key, fallback);
+        prop.root = this.InspectorExtraRow(inspectorExtrasProps, "inspector-prop-row-" + key);
+        Label caption = this.InspectorExtraLabel(prop.root, Designer.CleanPropLabel(label), false);
+        caption.Prefer(116, InspectorMetrics.RowHeight);
+        caption.SetProp("style", "width:38%;flex-shrink:1;min-width:0;overflow:hidden;");
+        bool isBool = !builtin && (Designer.IsBoolProp(key, label, prop.shadow) || fallback == "true" || fallback == "false");
+        List<string> options = Designer.ExtractPropOptions(label);
+        if (isBool) {
+            prop.toggle = new Switch();
+            prop.toggle.Size = "small";
+            prop.toggle.name = "inspector-prop-" + key;
+            prop.toggle.SetOn(PropSpec.IsOn(prop.shadow));
+            prop.root.Add(prop.toggle);
+            prop.action = this.InspectorExtraAction(prop.toggle, prop.root, "prop-value", inspectorExtrasPropRows.Count, key);
+            prop.toggle.OnChange(prop.action.Run);
+        } else if (!builtin && options.Count > 0) {
+            prop.select = SelectBox.FromOptions(options, "");
+            prop.select.Size = "small";
+            prop.select.name = "inspector-prop-" + key;
+            prop.select.SetSelectedByText(prop.shadow);
+            prop.select.SetProp("style", "flex:1;min-width:0;");
+            prop.root.Add(prop.select);
+            prop.action = this.InspectorExtraAction(prop.select, prop.root, "prop-value", inspectorExtrasPropRows.Count, key);
+            prop.select.OnChange(prop.action.Run);
+        } else {
+            prop.input = new Input("");
+            prop.input.Size = "small";
+            prop.input.name = "inspector-prop-" + key;
+            prop.input.SetText(prop.shadow);
+            prop.input.SetProp("style", "flex:1;min-width:0;");
+            if (!builtin) { prop.root.Add(prop.input); }
+            prop.action = this.InspectorExtraAction(prop.input, prop.root, "prop-value", inspectorExtrasPropRows.Count, key);
+            prop.input.OnChange(prop.action.Run);
+            if (key == "icon" || Designer.IsAssetProp(key)) {
+                Button pick = this.InspectorExtraButton(prop.root, "inspector-prop-pick-" + key,
+                    key == "icon" ? Designer.T("Pick icon", "选图标") : Designer.T("Browse", "浏览"),
+                    key == "icon" ? "prop-icon" : "prop-asset", inspectorExtrasPropRows.Count, key);
+                if (builtin) { pick.SetProp("style", "flex:1;min-width:0;"); }
+            } else if (Designer.IsColorProp(key)) {
+                prop.color = new ColorPicker();
+                prop.color.Mode = "hex";
+                prop.color.name = "inspector-prop-color-" + key;
+                this.SyncInspectorExtraColor(prop, prop.shadow);
+                prop.color.Prefer(builtin ? 96 : 28, InspectorMetrics.RowHeight);
+                prop.color.SetProp("style", "flex-shrink:0;");
+                prop.root.Add(prop.color);
+                DesignerInspectorExtraAction color = this.InspectorExtraAction(prop.color, prop.root, "prop-color", inspectorExtrasPropRows.Count, key);
+                prop.color.OnChange(color.Run);
+            }
+        }
+        if (!builtin) {
+            Button reset = this.InspectorExtraButton(prop.root, "inspector-prop-default-" + key,
+                "", "prop-default", inspectorExtrasPropRows.Count, key);
+            reset.Icon = "rotate-ccw";
+            reset.Prefer(InspectorMetrics.ActionButtonSize, InspectorMetrics.ActionButtonSize);
+            reset.Tip = Designer.T("Restore default", "恢复默认值");
+        }
+        inspectorExtrasPropRows.Add(prop);
+    }
+
+    void SyncInspectorExtraColor(DesignerInspectorExtraProp prop, string value) {
+        if (prop.color == null) { return; }
+        Color parsed = Designer.ParseColorValue(value);
+        if (!parsed.IsNone()) { prop.color.SetColor(parsed.ToARGB()); }
+        prop.colorShadow = prop.color.Value.Get();
+    }
+
+    void SyncInspectorExtraPropEditor(DesignerInspectorExtraProp prop, string value) {
+        prop.shadow = value;
+        if (prop.input != null && prop.input.GetText() != value) { prop.input.SetText(value); }
+        if (prop.toggle != null) { prop.toggle.SetOn(PropSpec.IsOn(value)); }
+        if (prop.select != null) { prop.select.SetSelectedByText(value); }
+        this.SyncInspectorExtraColor(prop, value);
+    }
+
+    void SyncInspectorExtraProps(FormField field) {
+        if (inspectorExtrasPropRows == null) { return; }
+        int epoch = inspectorExtrasEpoch;
+        for (int i = 0; i < inspectorExtrasPropRows.Count; i = i + 1) {
+            DesignerInspectorExtraProp prop = inspectorExtrasPropRows[i];
+            if (prop.input != null && prop.input.GetText() != prop.shadow) {
+                // Existing icon/asset dialogs programmatically SetText; consume that
+                // write in preparation, never by polling or mutating inside Paint.
+                this.WriteInspectorExtraProp(prop, prop.input.GetText(), true);
+                prop.iconPickerPending = false;
+            } else {
+                if (prop.iconPickerPending && iconPickTarget != prop.input) { prop.iconPickerPending = false; }
+                string value = Designer.CompPropValue(field, prop.key, prop.fallback);
+                if (value != prop.shadow) { this.SyncInspectorExtraPropEditor(prop, value); }
+            }
+            if (epoch != inspectorExtrasEpoch || !this.InspectorExtrasSessionCurrent()) { return; }
+        }
+    }
+
+    void WriteInspectorExtraProp(DesignerInspectorExtraProp prop, string value, bool discrete) {
+        DesignerInspectorExtraAction action = prop.action;
+        if (!this.InspectorExtraActionCurrent(action)) { return; }
+        FormField field = action.target;
+        string old = Designer.CompPropValue(field, prop.key, prop.fallback);
+        if (value != old) {
+            // The existing icon dialog pushes its snapshot immediately before SetText.
+            // Its completed picker write must not add a second identical snapshot.
+            bool pickerUndo = prop.iconPickerPending && iconPickTarget != prop.input;
+            if (pickerUndo) { undoSession = ""; undoSessionPushed = false; }
+            else if (discrete) { this.BarrierInspectorUndo(); }
+            else { this.GateInspectorUndo("extras-prop|" + Convert.ToString(action.epoch) + "|" + prop.key); }
+            if (!this.InspectorExtraActionCurrent(action)) { return; }
+            Designer.SetCompPropValue(field, prop.key, value);
+            this.MarkDocDirty();
+        }
+        this.SyncInspectorExtraPropEditor(prop, value);
+    }
+
+    void InvokeInspectorPropAction(DesignerInspectorExtraAction action) {
+        if (action.index < 0 || action.index >= inspectorExtrasPropRows.Count) { return; }
+        DesignerInspectorExtraProp prop = inspectorExtrasPropRows[action.index];
+        if (prop.key != action.value) { return; }
+        if (action.command == "prop-icon") {
+            prop.iconPickerPending = true;
+            this.OpenIconPicker(inspectorExtrasApp, prop.input);
+        }
+        else if (action.command == "prop-asset") {
+            this.OpenAssetPicker(inspectorExtrasApp, prop.input);
+            // Reuse the existing picker/path semantics with a borrowed completion.
+            // The legacy helper initially subscribes a strong Designer method group.
+            if (assetPicker != null && this.InspectorExtraActionCurrent(action)) {
+                assetPicker.Accepted.Clear();
+                DesignerInspectorExtraAction accepted = this.InspectorExtraAction(prop.input, prop.root,
+                    "prop-asset-accepted", action.index, prop.key);
+                assetPicker.Accepted.Add(accepted.Run);
+            }
+        } else if (action.command == "prop-asset-accepted") {
+            this.OnAssetPicked();
+            if (this.InspectorExtraActionCurrent(action)) {
+                this.WriteInspectorExtraProp(prop, prop.input.GetText(), true);
+            }
+        }
+        else if (action.command == "prop-default") { this.WriteInspectorExtraProp(prop, prop.fallback, true); }
+        else if (action.command == "prop-color" && prop.color != null) {
+            this.WriteInspectorExtraProp(prop, Designer.ColorValueText(prop.color.Value.Get()), false);
+        } else if (action.command == "prop-value") {
+            string value = prop.shadow;
+            if (prop.input != null) { value = prop.input.GetText(); }
+            else if (prop.toggle != null) { value = prop.toggle.IsOn() ? "true" : "false"; }
+            else if (prop.select != null) { value = prop.select.SelectedText(); }
+            this.WriteInspectorExtraProp(prop, value, prop.input == null);
+        }
+    }
+}

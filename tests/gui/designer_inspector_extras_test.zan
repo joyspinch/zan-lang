@@ -1,0 +1,293 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+class DesignerInspectorExtrasTest {
+    static void Check(bool condition, string message) { if (!condition) { throw new Exception(message); } }
+    static Control Find(Control root, string name) {
+        if (root == null) { return null; }
+        if (root.name == name) { return root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control found = Find(root.ChildAt(i), name);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+    static Control Extra(Designer designer, string name) {
+        Control result = Find(designer.InspectorInputRoot(), "inspector-" + name);
+        Check(result != null, "retained extra exists: " + name);
+        return result;
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static void Fire(Designer designer, string name) {
+        Control control = Extra(designer, name);
+        Check(control is Button, "extra command is a standard Button");
+        ((Button)control).Click.RaiseS(control);
+    }
+    static void Prepare(App app, Designer designer) {
+        designer.PrepareInspectorInput(app, new Rect(20, 20, 560, 820));
+    }
+    static void ClickVisible(App app, Designer designer, string name) {
+        Control control = Extra(designer, name);
+        ScrollColumn body = (ScrollColumn)Extra(designer, "body");
+        body.SetScrollTop(body.ScrollTop() + control.by - body.by - app.Scale(8));
+        Prepare(app, designer);
+        Check(Extra(designer, name) == control && control.bw > 0 && control.bh > 0,
+            "scroll and layout preserve action identity before Paint");
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Drain(app);
+    }
+    static FormField Add(Designer designer, int type, string kind, string name) {
+        FormField field = FormField.New(type, designer.fields.Count + 1);
+        field.kind = kind;
+        field.fname = name;
+        field.name = name;
+        designer.fields.Add(field);
+        designer.sel = field;
+        return field;
+    }
+    static void Release(App app, Designer designer) {
+        designer.RetireInspectorInput();
+        designer.RetireCanvasInput();
+        designer.DisposeDesignPreview();
+        app.StopLoop();
+        app.SetRootControl(null);
+        Drain(app);
+        app.canvas.Destroy();
+    }
+    static void Edit(Input input, string text) {
+        input.SetText(text);
+        input.Change.RaiseS(input);
+    }
+    static void CssAndRetirement() {
+        App app = App.CreateOffscreen("extras CSS", 1000, 900);
+        Designer designer = new Designer();
+        designer.fields.Clear();
+        designer.inspCategory = 3;
+        FormField field = Add(designer, 8, "Button", "same");
+        field.styleText = "color: var(--primary)";
+        Prepare(app, designer);
+        Input input = (Input)Extra(designer, "style-input-0");
+        Control root = Extra(designer, "extras");
+        int undo = designer.undoStack.Count;
+        Prepare(app, designer);
+        Check(Extra(designer, "extras") == root && Extra(designer, "style-input-0") == input,
+            "stable preparation preserves retained controls");
+        Edit(input, "color: red");
+        Edit(input, "color: blue");
+        Check(field.styleText == "color: blue" && designer.undoStack.Count == undo + 1,
+            "CSS changes commit before Paint with one typing undo session");
+        ClickVisible(app, designer, "style-preset-0");
+        for (int i = 1; i < 5; i = i + 1) { Fire(designer, "style-preset-" + Convert.ToString(i)); }
+        Check(Designer.SplitDecls(field.styleText).Count == 6 && field.styleText.Contains("--radius-small")
+            && field.styleText.Contains("box-shadow"), "all five CSS presets remain reachable");
+        Fire(designer, "style-remove-0");
+        Check(!field.styleText.Contains("color: blue"), "declaration delete commits");
+        Fire(designer, "style-add");
+        Input added = (Input)Extra(designer, "style-input-5");
+        Edit(added, "opacity: 0.5");
+        Check(field.styleText.Contains("opacity: 0.5"), "blank declaration can be added and edited");
+        Input old = (Input)Extra(designer, "style-input-0");
+        FormField replacement = Add(designer, 8, "Button", "same");
+        Prepare(app, designer);
+        undo = designer.undoStack.Count;
+        Edit(old, "stale: old-target");
+        Check(replacement.styleText == "" && designer.undoStack.Count == undo,
+            "same-name replacement rejects old weak target action");
+        Fire(designer, "style-add");
+        Input current = (Input)Extra(designer, "style-input-0");
+        designer.inspCategory = 1;
+        Edit(current, "stale: category");
+        Check(replacement.styleText == "", "category guard rejects action even before next Prepare");
+        designer.inspCategory = 3;
+        designer.RetireInspectorFieldExtras();
+        Edit(current, "stale: epoch");
+        Check(replacement.styleText == "", "retired epoch rejects queued CSS action");
+        Prepare(app, designer);
+        Fire(designer, "style-add");
+        current = (Input)Extra(designer, "style-input-0");
+        designer.SuspendInspectorInput();
+        Edit(current, "stale: hidden");
+        Check(replacement.styleText == "", "hidden Inspector rejects old editor");
+        Prepare(app, designer);
+        Fire(designer, "style-add");
+        current = (Input)Extra(designer, "style-input-0");
+        app.StopLoop();
+        Edit(current, "stale: stopped");
+        Check(replacement.styleText == "", "stopped scope rejects old editor");
+        Release(app, designer);
+    }
+    static void OptionsAndBinding() {
+        App app = App.CreateOffscreen("extras rows", 1000, 900);
+        Designer designer = new Designer();
+        designer.fields.Clear();
+        designer.inspCategory = 4;
+        FormField tabs = Add(designer, 36, "Tabs", "tabs");
+        tabs.options = new List<string>{ "One", "Two", "Three" };
+        FormField child = FormField.New(8, 100);
+        child.childTab = 1;
+        tabs.kids.Add(child);
+        tabs.uiState.Set(1);
+        designer.SetBindVars(new List<string>{ "model.name", "model.value" });
+        Prepare(app, designer);
+        SelectBox binding = (SelectBox)Extra(designer, "binding");
+        binding.SetSelectedByText("model.value");
+        binding.Change.RaiseS(binding);
+        Check(tabs.BindingCount == 1 && tabs.BindingAt(0).Path == "model.value"
+            && tabs.BindingAt(0).Property == "" && tabs.BindingAt(0).TwoWay,
+            "binding picker commits selected code variable");
+        binding.SetSelectedByText("");
+        binding.Change.RaiseS(binding);
+        Check(tabs.BindingCount == 0, "binding picker clears the declaration");
+        binding.SetSelectedByText("model.name");
+        binding.Change.RaiseS(binding);
+        Check(tabs.BindingCount == 1 && tabs.BindingAt(0).Path == "model.name",
+            "binding picker recreates a cleared declaration");
+        int undo = designer.undoStack.Count;
+        Control stale = Extra(designer, "option-remove-1");
+        Fire(designer, "option-up-1");
+        Check(tabs.OptionAt(0) == "Two" && child.childTab == 0 && tabs.uiState.Get() == 0
+            && designer.undoStack.Count == undo + 1, "moving Tabs option also moves child slot and active page");
+        stale.TriggerEvent("Click");
+        Drain(app);
+        Check(tabs.OptionCount() == 3, "old row action cannot delete a reordered index");
+        Fire(designer, "option-remove-0");
+        Check(tabs.OptionCount() == 2 && child.childTab == 0 && tabs.uiState.Get() == 0,
+            "delete Tabs option repairs dependent state");
+        Input append = (Input)Extra(designer, "option-append");
+        append.SetText("Four");
+        Fire(designer, "option-add");
+        Check(tabs.OptionCount() == 3 && tabs.OptionAt(2) == "Four" && append.GetText() == "",
+            "quick append commits and clears retained input");
+        designer.Undo();
+        Prepare(app, designer);
+        Check(designer.fields[0].OptionCount() == 2, "quick append undo restores document");
+        FormField table = Add(designer, 23, "DataGrid", "table");
+        table.options = new List<string>{ "Name:name", "Age:age" };
+        table.extra = JsonValue.Parse("{\"columns\":[{\"width\":111},{\"width\":222}]}");
+        Prepare(app, designer);
+        Fire(designer, "option-down-0");
+        JsonValue first = Designer.ColEntry(table, 0);
+        Check(first != null && first.Int("width", 0) == 222 && table.OptionAt(0) == "Age:age",
+            "column metadata follows row movement");
+        ((Input)Extra(designer, "option-append")).SetText("Active");
+        ((Input)Extra(designer, "option-append-field")).SetText("active");
+        Fire(designer, "option-add");
+        Check(table.OptionAt(2) == "Active:active", "column quick append preserves title/field structure");
+        Fire(designer, "option-remove-0");
+        first = Designer.ColEntry(table, 0);
+        Check(first != null && first.Int("width", 0) == 111, "column metadata follows delete");
+        FormField tools = Add(designer, 58, "ToolStrip", "Tools");
+        tools.options = new List<string>{ "Save:save", "-" };
+        Prepare(app, designer);
+        undo = designer.undoStack.Count;
+        Extra(designer, "option-title-0").TriggerEvent("DoubleClick");
+        Check(Designer.GetToolItemClick(tools, 0) == "OnToolsSaveClick"
+            && designer.undoStack.Count == undo + 1, "tool item double click generates handler with undo");
+        Prepare(app, designer);
+        Extra(designer, "option-title-1").TriggerEvent("DoubleClick");
+        Check(designer.rowsEdField == tools && designer.rowsEdSel == 1,
+            "separator double click opens structured row editor");
+        Fire(designer, "option-down-0");
+        Check(Designer.GetToolItemClick(tools, 1) == "OnToolsSaveClick", "tool handler metadata follows movement");
+        Release(app, designer);
+    }
+    static void ComponentPropsAndPickers() {
+        App app = App.CreateOffscreen("extras components", 1000, 900);
+        Designer designer = new Designer();
+        designer.fields.Clear();
+        designer.inspCategory = 1;
+        List<UserComponent> components = new List<UserComponent>();
+        components.Add(new UserComponent("Sample", "{\"props\":["
+            + "{\"key\":\"title\",\"target\":\"body\",\"label\":\"Title\",\"def\":\"Hello\"},"
+            + "{\"key\":\"round\",\"target\":\"body\",\"label\":\"Round (true/false)\",\"def\":\"true\"},"
+            + "{\"key\":\"tone\",\"target\":\"body\",\"label\":\"Tone (primary/success)\",\"def\":\"primary\"},"
+            + "{\"key\":\"icon\",\"target\":\"body\",\"def\":\"save\"},"
+            + "{\"key\":\"src\",\"target\":\"body\",\"def\":\"a.png\"},"
+            + "{\"key\":\"color\",\"target\":\"body\",\"def\":\"#ff0000\"}],"
+            + "\"fields\":[{\"type\":8,\"name\":\"body\",\"label\":\"Body\"}]}"));
+        designer.SetUserComponents(components);
+        FormField field = FormField.NewCustom("Sample", 1);
+        field.compRef = true;
+        field.customKind = "Sample";
+        field.fname = "instance";
+        field.name = "instance";
+        designer.fields.Add(field);
+        designer.sel = field;
+        Prepare(app, designer);
+        Input title = (Input)Extra(designer, "prop-title");
+        Check(title.GetText() == "Hello", "component declared default reaches retained editor");
+        Edit(title, "Changed");
+        Switch toggle = (Switch)Extra(designer, "prop-round");
+        toggle.SetOn(false);
+        toggle.Change.RaiseS(toggle);
+        SelectBox tone = (SelectBox)Extra(designer, "prop-tone");
+        tone.SetSelectedByText("success");
+        tone.Change.RaiseS(tone);
+        Check(Designer.CompPropValue(field, "title", "") == "Changed"
+            && Designer.CompPropValue(field, "round", "") == "false"
+            && Designer.CompPropValue(field, "tone", "") == "success", "text, bool and enum component props commit");
+        Fire(designer, "prop-default-title");
+        Check(Designer.CompPropValue(field, "title", "") == "Hello", "component default action restores declaration");
+        ColorPicker color = (ColorPicker)Extra(designer, "prop-color-color");
+        Color parsed = Designer.ParseColorValue("#00ff00");
+        color.SetColor(parsed.ToARGB());
+        color.Change.RaiseS(color);
+        Check(Designer.CompPropValue(field, "color", "") == Designer.ColorValueText(color.Value.Get()),
+            "retained color picker commits without Paint");
+        Input asset = (Input)Extra(designer, "prop-src");
+        asset.SetText("assets/new.png");
+        Prepare(app, designer);
+        Check(Designer.CompPropValue(field, "src", "") == "assets/new.png", "programmatic asset picker SetText bridges in Prepare");
+        Fire(designer, "prop-pick-icon");
+        Check(designer.iconPickTarget == Extra(designer, "prop-icon") && designer.iconWin != null,
+            "icon picker remains reachable");
+        Fire(designer, "props-dialog");
+        Check(designer.propsEdField == field && designer.propsWin != null, "large property editor remains reachable");
+        designer.RetireInspectorFieldExtras();
+        Check(designer.iconPickTarget == null, "retiring extras detaches old picker target");
+        Edit(title, "stale component");
+        Check(Designer.CompPropValue(field, "title", "") == "Hello", "retired component editor is inert");
+        Prepare(app, designer);
+        Fire(designer, "component-unpack");
+        Check(designer.sel != field && !designer.sel.compRef, "component can unpack to inline fields");
+        designer.SetUserComponents(new List<UserComponent>());
+        Release(app, designer);
+    }
+    static void BorrowedOwner() {
+        App app = App.CreateOffscreen("extras weak", 1000, 900);
+        Designer designer = new Designer();
+        designer.fields.Clear();
+        designer.inspCategory = 3;
+        Add(designer, 8, "Button", "weak");
+        Prepare(app, designer);
+        Control button = Extra(designer, "style-preset-0");
+        DesignerInspectorExtrasWitness witness = new DesignerInspectorExtrasWitness();
+        witness.Owner = designer;
+        Release(app, designer);
+        designer = null;
+        button.TriggerEvent("Click");
+        Drain(app);
+        Check(witness.Owner == null, "retained old action does not retain Designer");
+    }
+    static void Main() {
+        ControlBootstrap.Install();
+        App frame = App.CreateOffscreen("frame", 2, 2);
+        CssAndRetirement();
+        OptionsAndBinding();
+        ComponentPropsAndPickers();
+        BorrowedOwner();
+        frame.StopLoop();
+        frame.canvas.Destroy();
+        Console.WriteLine("designer inspector extras ok");
+    }
+}

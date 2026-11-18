@@ -88,6 +88,7 @@ class DesignerWysiwygTest {
         app.SetOffscreenViewport(480, 320, dpi);
         app.UseAppCss(hdoc.css);
         Control tree = hdoc.root;
+        tree.Grow();
         runtime.Add(tree);
         DesignerWysiwygTest.Freeze(app);
         runtime.CaptureSnapshot();
@@ -115,6 +116,39 @@ class DesignerWysiwygTest {
         editor.canvas.Destroy();
     }
 
+    static void WindowResize(string html) {
+        Designer designer = new Designer();
+        designer.LoadHtmlText(html);
+        designer.targetDpi = 150;
+        App editor = App.CreateOffscreen("resize editor", 760, 500);
+        Check("resize initial preview", designer.PrepareDesignPreview(editor));
+        string fields = Member(JsonValue.ParseLenient(designer.SaveJson()), "fields").ToJson();
+        Form runtime = Form.CreateOffscreen("Preview parity", 480, 320);
+        App app = runtime.GetApp();
+        Control tree = Html.Load(app, html);
+        tree.Grow();
+        runtime.Add(tree);
+        app.SetRootControl(tree);
+        Freeze(app);
+        Freeze(designer.pvDocForm.GetApp());
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            int width = pass == 0 ? 640 : 480;
+            int height = pass == 0 ? 420 : 320;
+            designer.ApplyDesignSize(width, height);
+            Check("resize preserves authored field declarations",
+                Member(JsonValue.ParseLenient(designer.SaveJson()), "fields").ToJson() == fields);
+            Check("resized preview prepares", designer.PrepareDesignPreview(editor));
+            app.SetOffscreenViewport(width, height, 150);
+            runtime.CaptureSnapshot();
+            SameRects(designer, tree);
+            SamePixels(designer.pvDocForm.GetApp().canvas, app.canvas);
+        }
+        designer.DisposeDesignPreview();
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+        editor.canvas.Destroy();
+    }
+
     static void DpiChanges(string html) {
         Designer designer = new Designer();
         designer.LoadHtmlText(html);
@@ -128,6 +162,7 @@ class DesignerWysiwygTest {
         App app = runtime.GetApp();
         app.UseAppCss(hdoc.css);
         Control tree = hdoc.root;
+        tree.Grow();
         runtime.Add(tree);
         Freeze(app);
         Freeze(designer.pvDocForm.GetApp());
@@ -208,9 +243,9 @@ class DesignerWysiwygTest {
         Check("root mixed reorder keeps text slots", content.ToJson() == "[\"lead\",0,\"between\",1,\"tail\"]"
             && Member(root, "fields").At(0).Str("name", "") == "B");
         Element body = (Element)Html.Parse(designer.SaveHtml(), "", null).root;
-        Check("root mixed reorder changes actual source order", body.elOrder[1].kid == body.children[0]
-            && body.elOrder[3].kid == body.children[1]
-            && body.children[0].name == "B" && body.children[1].name == "A");
+        Check("root mixed reorder changes actual source order", body.elOrder[1].kid == body.ChildAt(0)
+            && body.elOrder[3].kid == body.ChildAt(1)
+            && body.ChildAt(0).name == "B" && body.ChildAt(1).name == "A");
         designer.Undo();
         Check("root reorder undo", designer.fields[0].fname == "A");
         designer.Redo();
@@ -227,8 +262,8 @@ class DesignerWysiwygTest {
             && Member(owner, "kids").At(0).Str("name", "") == "B");
         body = (Element)Html.Parse(designer.SaveHtml(), "", null).root;
         Element element = (Element)Node(body, "Owner");
-        Check("nested mixed reorder changes actual source order", element.children[0].name == "B"
-            && element.children[1].name == "A");
+        Check("nested mixed reorder changes actual source order", element.ChildAt(0).name == "B"
+            && element.ChildAt(1).name == "A");
         designer.SelToEdge(0);
         root = JsonValue.ParseLenient(designer.SaveJson());
         owner = Member(root, "fields").At(0);
@@ -283,15 +318,22 @@ class DesignerWysiwygTest {
         Check("window appearance restored", first.shapeMode == 0 && first.ShapeOffX() == 0
             && first.ChromeVisible() && first.Resizable() && first.WindowOpacity() == 100
             && first.canvas.Width() == first.Scale(240) && first.canvas.Height() == first.Scale(160));
-        string htmlToClone = "<!doctype html><html><head><style>div { color: red; }</style></head>"
-            + "<body data-zan-design><div id=\"placed\" data-position=\"1\" data-anchor=\"9\" data-fx=\"4\" data-fy=\"5\" data-fw=\"60\" data-fh=\"30\"></div></body></html>";
-        Control original = Html.Parse(htmlToClone, "", null).root;
+        string htmlToClone = "<!doctype html><html><head><style>div { color: red; }</style></head><body data-zan-design>"
+            + "<div id=\"placed\" data-position=\"1\" data-anchor=\"9\" style=\"position:absolute;left:4px;top:5px;width:60px;height:30px\"></div></body></html>";
+        HtmlDoc cloneDoc = Html.Parse(htmlToClone, "", null);
+        Control original = cloneDoc.root;
         Control clone = Html.Clone(original);
         if (clone == null) { throw new Exception("clone failed"); }
         Control placed = Node(clone, "placed");
-        Check("clone design positioning", clone.designCss == original.designCss
-            && placed.designFloat && placed.designAnchor == 9
-            && placed.logX == 4 && placed.logY == 5 && placed.logW == 60 && placed.logH == 30);
+        Form cloneHost = Form.CreateOffscreen("clone", 240, 160);
+        cloneHost.GetApp().UseAppCss(cloneDoc.css);
+        cloneHost.Add(clone);
+        cloneHost.CaptureSnapshot();
+        Check("clone CSS positioning", placed.CssAttr("style") == Node(original, "placed").CssAttr("style")
+            && placed.StylePosition() == 2
+            && placed.bx == clone.bx + 4 && placed.by == clone.by + 5
+            && placed.bw == 60 && placed.bh == 30);
+        cloneHost.GetApp().canvas.Destroy();
         first.canvas.Destroy();
         second.canvas.Destroy();
     }
@@ -316,6 +358,7 @@ class DesignerWysiwygTest {
         HtmlDoc hdoc = Html.Parse(shapedHtml, "", null);
         app.UseAppCss(hdoc.css);
         Control tree = hdoc.root;
+        tree.Grow();
         runtime.Add(tree);
         Freeze(app);
         runtime.CaptureSnapshot();
@@ -344,16 +387,96 @@ class DesignerWysiwygTest {
         editor.canvas.Destroy();
     }
 
+    static void StarterPresetLayout(int preset) {
+        Designer designer = new Designer();
+        designer.layoutMode = 1;
+        designer.winW = 480;
+        designer.winH = 320;
+        designer.winChrome = false;
+        designer.InsertStarterPreset(preset);
+        App editor = App.CreateOffscreen("preset layout", 760, 500);
+        designer.targetDpi = 100;
+        Check("preset creates a CSS shell", designer.fields.Count == 1);
+        if (designer.fields.Count != 1) { editor.canvas.Destroy(); return; }
+        FormField shellField = designer.fields[0];
+        int fillWidth = 0;
+        int fillHeight = 0;
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            if (pass == 1) { designer.winW = 640; designer.winH = 420; }
+            Check("preset preview", designer.PrepareDesignPreview(editor));
+            Control shell = Node(designer.pvDocRoot, shellField.fname);
+            Check("preset shell fills the document", shell.bx == designer.pvDocRoot.bx
+                && shell.by == designer.pvDocRoot.by && shell.bw == designer.pvDocRoot.bw
+                && shell.bh == designer.pvDocRoot.bh);
+            Control first = Node(designer.pvDocRoot, shellField.kids[0].fname);
+            Control fill = Node(designer.pvDocRoot, shellField.kids[1].fname);
+            Check("CSS preset children mount without flow wrappers",
+                first.parent == shell && fill.parent == shell);
+            if (preset == 1) {
+                Control status = Node(designer.pvDocRoot, shellField.kids[2].fname);
+                Check("classic toolbar is the first 34px row", first.bx == shell.bx
+                    && first.by == shell.by && first.bw == shell.bw && first.bh == 34);
+                Check("classic content fills between fixed rows", fill.bx == shell.bx
+                    && fill.by == first.by + first.bh && fill.bw == shell.bw
+                    && fill.bh == shell.bh - 58);
+                Check("classic status is the last 24px row", status.parent == shell
+                    && status.bx == shell.bx && status.by == fill.by + fill.bh
+                    && status.bw == shell.bw && status.bh == 24
+                    && status.by + status.bh == shell.by + shell.bh);
+                Check("classic siblings do not overlap", first.by + first.bh <= fill.by
+                    && fill.by + fill.bh <= status.by);
+            } else {
+                Check("split sidebar keeps 220px", first.bx == shell.bx
+                    && first.by == shell.by && first.bw == 220 && first.bh == shell.bh);
+                Check("split main fills the remaining column", fill.bx == first.bx + first.bw
+                    && fill.by == shell.by && fill.bw == shell.bw - 220 && fill.bh == shell.bh);
+                Check("split siblings do not overlap", first.bx + first.bw <= fill.bx);
+            }
+            if (pass == 0) { fillWidth = fill.bw; fillHeight = fill.bh; }
+            else {
+                Check("preset fill grows with the resized window",
+                    fill.bw == fillWidth + 160 && fill.bh == fillHeight + 100);
+            }
+        }
+        string saved = designer.SaveHtml();
+        Designer reloaded = new Designer();
+        reloaded.LoadHtmlText(saved);
+        string resaved = reloaded.SaveHtml();
+        if (resaved != saved) {
+            int offset = 0;
+            while (offset < saved.Length && offset < resaved.Length
+                && saved[offset] == resaved[offset]) { offset = offset + 1; }
+            int begin = offset > 80 ? offset - 80 : 0;
+            int beforeCount = saved.Length - begin;
+            int afterCount = resaved.Length - begin;
+            if (beforeCount > 240) { beforeCount = 240; }
+            if (afterCount > 240) { afterCount = 240; }
+            Console.WriteLine("preset " + Convert.ToString(preset)
+                + " first difference " + Convert.ToString(offset)
+                + " before=" + saved.Substring(begin, beforeCount)
+                + " after=" + resaved.Substring(begin, afterCount));
+        }
+        Check("CSS preset preserves its frameless window", !reloaded.winChrome);
+        Check("CSS preset saves without adding flow metadata", !reloaded.loadError
+            && resaved == saved);
+        designer.DisposeDesignPreview();
+        editor.canvas.Destroy();
+    }
+
     static void Main() {
+        ControlBootstrap.Install();
         string html = File.ReadAllText("tests/gui/designer_wysiwyg.html");
         for (int dpi = 100; dpi <= 300; dpi = dpi + 25) {
             DesignerWysiwygTest.RunAtDpi(html, dpi);
         }
+        DesignerWysiwygTest.WindowResize(html);
         DesignerWysiwygTest.DpiChanges(html);
         DesignerWysiwygTest.MixedEdit(html);
         DesignerWysiwygTest.MixedReorder();
         DesignerWysiwygTest.CssDpiLengths();
         DesignerWysiwygTest.WindowStateAndClone();
+        DesignerWysiwygTest.StarterPresetLayout(1);
+        DesignerWysiwygTest.StarterPresetLayout(2);
         DesignerWysiwygTest.ShapedPreview(html, 100, 1);
         DesignerWysiwygTest.ShapedPreview(html, 150, 1);
         DesignerWysiwygTest.ShapedPreview(html, 100, 2);

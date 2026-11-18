@@ -28,7 +28,7 @@ class DesignerContextMenuRoutedTest {
     }
     static Control Item(ContextMenu menu, int action) {
         for (int i = 0; i < menu.items.Count; i = i + 1) {
-            if (menu.items[i].kind == 0 && menu.items[i].action == action) { return menu.Children[i]; }
+            if (menu.items[i].kind == 0 && menu.items[i].action == action) { return menu.ChildAt(i); }
         }
         throw new Exception("missing action " + Convert.ToString(action));
     }
@@ -38,9 +38,9 @@ class DesignerContextMenuRoutedTest {
     static Designer Create() {
         Designer d = new Designer();
         d.LoadHtmlText("<html><body data-zan-design id=\"Menu\" data-win-w=\"640\" data-win-h=\"480\" data-layout-mode=\"1\">"
-            + "<button id=\"A\" data-position=\"1\" data-fx=\"10\" data-fy=\"20\" data-fw=\"80\" data-fh=\"30\">A</button>"
-            + "<button id=\"B\" data-position=\"1\" data-fx=\"110\" data-fy=\"70\" data-fw=\"80\" data-fh=\"30\">B</button>"
-            + "<button id=\"C\" data-position=\"1\" data-fx=\"210\" data-fy=\"120\" data-fw=\"80\" data-fh=\"30\">C</button></body></html>");
+            + "<button id=\"A\" data-position=\"1\" style=\"position:absolute;left:10px;top:20px;width:80px;height:30px\">A</button>"
+            + "<button id=\"B\" data-position=\"1\" style=\"position:absolute;left:110px;top:70px;width:80px;height:30px\">B</button>"
+            + "<button id=\"C\" data-position=\"1\" style=\"position:absolute;left:210px;top:120px;width:80px;height:30px\">C</button></body></html>");
         return d;
     }
     static void FourMenus() {
@@ -136,13 +136,13 @@ class DesignerContextMenuRoutedTest {
         RibbonCounter count = new RibbonCounter();
         Ribbon tabs = new Ribbon(); tabs.AddTab("one"); tabs.AddTab("two"); witness.Tab = tabs;
         app.SetRootControl(tabs); tabs.MeasureTree(app); tabs.Arrange(0, 0, 1000, 200);
-        Control tab = tabs.Children[0].Children[1];
+        Control tab = tabs.ChildAt(0).ChildAt(1);
         Click(app, tab); Check(tabs.activeTab.Get() == 1 && tab.FindApp() == null, "tab action rebuilds and detaches old tab");
         Ribbon ribbon = new Ribbon(); RibbonGroup group = new RibbonGroup("group");
         group.Add(RibbonItem.Small("", "command")); ribbon.AddGroup(group); witness.Item = ribbon;
         ribbon.CommandClicked.Add(count.Run);
         app.SetRootControl(ribbon); ribbon.MeasureTree(app); ribbon.Arrange(0, 0, 1000, 200);
-        Control button = ribbon.Children[0].Children[0].Children[0].Children[0];
+        Control button = ribbon.ChildAt(0).ChildAt(0).ChildAt(0).ChildAt(0);
         Click(app, button); Check(count.Count == 1, "group item action notifies once");
         Input(app, 2, button.bx + 4, button.by + 4, 0, 0);
         Check(app.GetCapturedPointer() == button, "rebuild test establishes real capture");
@@ -156,12 +156,73 @@ class DesignerContextMenuRoutedTest {
         Ribbon commands = new Ribbon(); RibbonCmd command = new RibbonCmd("", "flat"); command.act = 19;
         commands.AddCommand(command); witness.Cmd = commands; commands.CommandClicked.Add(count.Run);
         app.SetRootControl(commands); commands.MeasureTree(app); commands.Arrange(0, 0, 1000, 200);
-        Click(app, commands.Children[0].Children[0]);
+        Click(app, commands.ChildAt(0).ChildAt(0));
         Check(count.Count == 2 && commands.lastAct == 19, "flat command retains action code and notification");
         app.SetRootControl(null);
     }
+    static void CanvasClick(App app, int x, int y, int mods) {
+        app.ProcessOffscreenInput(2, x, y, 0, 0, mods, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, mods, 0);
+    }
+    static void CanvasDoubleClick() {
+        ControlBootstrap.Install();
+        App app = App.CreateOffscreen("designer canvas", 1100, 1000);
+        Designer d = Create(); d.hostPanels = true;
+        List<UserComponent> components = new List<UserComponent>();
+        components.Add(new UserComponent("CardPart", "{\"name\":\"CardPart\",\"winW\":80,\"winH\":30,\"fields\":[{\"kind\":\"Label\",\"name\":\"Inner\",\"label\":\"Part\"}]}"));
+        d.SetUserComponents(components);
+        d.PrepareCanvasInput(app, new Rect(0, 0, 1100, 1000));
+        Control input = d.canvasView.Root();
+        // No Designer Paint occurs between input pairs: preparation owns current geometry.
+        Rect a = d.DesignViewRect(d.fields[0], d.canvasInput.ox, d.canvasInput.oy, d.canvasInput.ps);
+        Rect b = d.DesignViewRect(d.fields[1], d.canvasInput.ox, d.canvasInput.oy, d.canvasInput.ps);
+        int ax = a.x + a.width / 2; int ay = a.y + a.height / 2;
+        int bx = b.x + b.width / 2; int by = b.y + b.height / 2;
+        Control identity = input.HitTest(ax, ay);
+        CanvasClick(app, ax, ay, 0);
+        Check(!d.inlineRenaming && d.ConsumeOpenCodeBehind() == "", "first canvas click only selects");
+        CanvasClick(app, bx, by, 0);
+        Check(!d.inlineRenaming && d.ConsumeOpenCodeBehind() == "", "different fields never form a double click");
+        CanvasClick(app, bx, by, 0);
+        Check(d.inlineRenaming && d.sel == d.fields[1] && d.ConsumeOpenCodeBehind() == ""
+            && d.fields[1].GetHandler("Click") == "", "ordinary button double click edits text without generating handler");
+        d.CancelInlineRename();
+        Check(input.HitTest(ax, ay) == identity, "field identity survives preparation and selection");
+        d.SuspendCanvasInput(); d.PrepareCanvasInput(app, new Rect(0, 0, 1100, 1000));
+        CanvasClick(app, ax, ay, 1); CanvasClick(app, ax, ay, 1);
+        Check(!d.inlineRenaming && d.ConsumeOpenCodeBehind() == "handler:OnAClick"
+            && d.fields[0].GetHandler("Click") == "OnAClick", "Ctrl double click explicitly creates and navigates handler");
+        d.SuspendCanvasInput(); d.fields[0].compRef = true; d.fields[0].customKind = "CardPart";
+        d.PrepareCanvasInput(app, new Rect(0, 0, 1100, 1000));
+        CanvasClick(app, ax, ay, 0); CanvasClick(app, ax, ay, 0);
+        Check(d.ConsumeOpenComponent() == "CardPart" && !d.inlineRenaming, "component references retain natural open action");
+        d.SuspendCanvasInput(); d.fields[0].compRef = false;
+        d.PrepareCanvasInput(app, new Rect(0, 0, 1100, 1000));
+        app.ProcessOffscreenInput(2, bx, by, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(1, bx + 30, by + 20, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, bx + 30, by + 20, 0, 0, 0, 0);
+        Check(!d.inlineRenaming && d.ConsumeOpenCodeBehind() == "", "drag release never activates double click");
+        d.SuspendCanvasInput(); d.PrepareCanvasInput(app, new Rect(0, 0, 1100, 1000));
+        app.ProcessOffscreenInput(2, ax, ay, 0, 0, 0, 0);
+        d.ResetInteractionState();
+        Check(app.GetCapturedPointer() == null, "reset retires canvas capture");
+        app.ProcessOffscreenInput(3, ax, ay, 0, 0, 0, 0);
+        Check(!d.inlineRenaming && d.ConsumeOpenComponent() == "", "stale release after hide is inert");
+        d.PrepareCanvasInput(app, new Rect(0, 0, 1100, 1000));
+        int zoom = d.winZoom;
+        app.ProcessOffscreenInput(13, ax, ay, 0, 120, 1, 0);
+        Check(d.winZoom != zoom, "routed Ctrl wheel zooms without paint claims");
+        d.OpenZoomMenu(app, 20, 20);
+        CanvasClick(app, ax, ay, 0); CanvasClick(app, ax, ay, 0);
+        Check(!d.inlineRenaming && d.ConsumeOpenCodeBehind() == "", "overlay owns clicks above canvas");
+        d.CloseDesignerMenus();
+        d.LoadHtmlText("<html><body data-zan-design id=\"Replaced\"></body></html>");
+        Check(input.ChildCount() == 0 && !d.canvasInput.ready,
+            "document replacement retires old field identities before new layout");
+        d.DisposeDesignPreview(); Drain(app); app.canvas.Destroy();
+    }
     static void Main() {
-        FourMenus(); Closing();
+        FourMenus(); Closing(); CanvasDoubleClick();
         App ribbonApp = App.CreateOffscreen("visible ribbon formal", 1100, 500);
         DesignerMenuWitness visible = new DesignerMenuWitness(); VisibleRibbonBorrow(visible, ribbonApp);
         Check(visible.Owner == null, "visible Designer Ribbon rebuild does not retain business owner");

@@ -239,7 +239,7 @@ partial class Designer {
     // 多选批量属性修改：当主选中组件在属性面板被修改时，将通用几何、盒模型与排版定位属性批量同步给其它选中组件
     void SyncBatchProps(FormField primary, string key) {
         if (primary == null || freeExtra == null || freeExtra.Count == 0 || key == "") { return; }
-        if (key == "name" || key == "label" || key == "bind" || key == "component") { return; }
+        if (key == "name" || key == "label" || key == "bindingPath" || key == "bindingProperty" || key == "component") { return; }
         for (int i = 0; i < freeExtra.Count; i = i + 1) {
             FormField f = freeExtra[i];
             if (f == null || f == primary || f.locked) { continue; }
@@ -530,17 +530,16 @@ partial class Designer {
         }
     }
 
-    // --- 撤销 / 重做（整份设计 JSON 快照，同场景设计器） ----------
+    // --- 撤销 / 重做（独立结构化文档快照，同场景设计器） ----------
 
     // 记录当前设计；在任何修改前调用。当前状态和栈顶相同
     // （上一次压栈后设计没真正变过）时不重复压栈。
-    void PushUndo() {
+    public void PushUndo() {
         this.PushUndoAction("");
     }
 
-    void PushUndoAction(string action) {
-        string j = this.SaveJson();
-        if (undoStack.Count > 0 && undoStack[undoStack.Count - 1] == j) {
+    public void PushUndoAction(string action) {
+        if (undoStack.Count > 0 && this.DocumentMatchesSnapshot(undoStack[undoStack.Count - 1])) {
             if (action != "" && undoActionStack.Count > 0) {
                 undoActionStack[undoActionStack.Count - 1] = action;
             }
@@ -548,13 +547,13 @@ partial class Designer {
         }
         string act = action != "" ? action : (pendingUndoAction != "" ? pendingUndoAction : Designer.T("change", "修改"));
         pendingUndoAction = "";
-        undoStack.Add(j);
+        undoStack.Add(this.CaptureDocumentSnapshot());
         undoActionStack.Add(act);
         if (undoStack.Count > 60) {
             undoStack.RemoveAt(0);
             if (undoActionStack.Count > 0) { undoActionStack.RemoveAt(0); }
         }
-        redoStack = new List<string>();
+        redoStack = new List<DesignerDocumentSnapshot>();
         redoActionStack = new List<string>();
         this.MarkDocDirty();
     }
@@ -562,8 +561,8 @@ partial class Designer {
     // 拖拽/缩放结束（或任何「压了栈但没改成」的操作收尾）时调用：
     // 设计和栈顶一致说明这次操作没有实际改动，把栈顶退掉，
     // 免得 Ctrl+Z 第一脚踩空。
-    void PopUndoIfUnchanged() {
-        if (undoStack.Count > 0 && undoStack[undoStack.Count - 1] == this.SaveJson()) {
+    public void PopUndoIfUnchanged() {
+        if (undoStack.Count > 0 && this.DocumentMatchesSnapshot(undoStack[undoStack.Count - 1])) {
             undoStack.RemoveAt(undoStack.Count - 1);
             if (undoActionStack.Count > 0) {
                 undoActionStack.RemoveAt(undoActionStack.Count - 1);
@@ -572,43 +571,42 @@ partial class Designer {
     }
 
     // 撤销：当前设计压入重做栈，载入撤销栈顶；栈空时仅提示。
-    // 恢复快照必须走 ApplyJson——LoadJson 会清空两个历史栈，
-    // 一步撤销之后整个历史就没了。
-    void Undo() {
+    // Restore copies the model without consuming it or clearing either history stack.
+    public void Undo() {
         if (undoStack.Count == 0) {
             msg = Designer.T("nothing to undo", "没有可撤销的操作");
             return;
         }
-        redoStack.Add(this.SaveJson());
+        redoStack.Add(this.CaptureDocumentSnapshot());
         string act = Designer.T("change", "修改");
         if (undoActionStack.Count > 0) {
             act = undoActionStack[undoActionStack.Count - 1];
             undoActionStack.RemoveAt(undoActionStack.Count - 1);
         }
         redoActionStack.Add(act);
-        string j = undoStack[undoStack.Count - 1];
+        DesignerDocumentSnapshot document = undoStack[undoStack.Count - 1];
         undoStack.RemoveAt(undoStack.Count - 1);
-        this.ApplyJson(j);
+        this.InstallDocumentSnapshot(document, false, false);
         this.SyncFreeSelBase();
         msg = Designer.T("undone: ", "已撤销: ") + act + " (" + Designer.T("remaining ", "剩余 ") + Convert.ToString(undoStack.Count) + Designer.T(" steps", " 步") + ")";
     }
 
     // 重做：当前设计压入撤销栈，载入重做栈顶；栈空时仅提示。
-    void Redo() {
+    public void Redo() {
         if (redoStack.Count == 0) {
             msg = Designer.T("nothing to redo", "没有可重做的操作");
             return;
         }
-        undoStack.Add(this.SaveJson());
+        undoStack.Add(this.CaptureDocumentSnapshot());
         string act = Designer.T("change", "修改");
         if (redoActionStack.Count > 0) {
             act = redoActionStack[redoActionStack.Count - 1];
             redoActionStack.RemoveAt(redoActionStack.Count - 1);
         }
         undoActionStack.Add(act);
-        string j = redoStack[redoStack.Count - 1];
+        DesignerDocumentSnapshot document = redoStack[redoStack.Count - 1];
         redoStack.RemoveAt(redoStack.Count - 1);
-        this.ApplyJson(j);
+        this.InstallDocumentSnapshot(document, false, false);
         this.SyncFreeSelBase();
         msg = Designer.T("redone: ", "已重做: ") + act + " (" + Designer.T("remaining ", "剩余 ") + Convert.ToString(redoStack.Count) + Designer.T(" steps", " 步") + ")";
     }

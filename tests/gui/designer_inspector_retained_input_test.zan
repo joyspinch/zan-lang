@@ -1,0 +1,155 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+class DesignerInspectorRetainedInputTest {
+    static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+    static Control Find(Control root, string name) {
+        if (root == null) { return null; }
+        if (root.name == name) { return root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control result = Find(root.ChildAt(i), name); if (result != null) { return result; }
+        }
+        return null;
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static void Click(App app, Control control) {
+        Check(control != null && control.bw > 0 && control.bh > 0, "retained control has pre-input geometry");
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0); Drain(app);
+    }
+    static void OpenEvents(App app, Designer designer) {
+        Click(app, Find(designer.InspectorInputRoot(), "inspector-events"));
+        Check(designer.inspTab == 1, "real tab click selects Events without Paint");
+        // Click commits after Up's BeforeInput pass. The next real input prepares
+        // the new tab's tree; draining actions alone does not run preparation.
+        app.ProcessOffscreenInput(1, 25, 25, 0, 0, 0, 0); Drain(app);
+    }
+    static Input Handler(Designer designer, string key) {
+        Control input = Find(designer.InspectorInputRoot(), "inspector-handler-" + key);
+        Check(input is Input, "event handler " + key + " is a retained Input"); return (Input)input;
+    }
+    static Input Handler(Designer designer) { return Handler(designer, "fld:Click"); }
+    static FormField AddButton(Designer designer, string name) {
+        FormField field = FormField.New(8, designer.fields.Count + 1);
+        field.kind = "Button"; field.fname = name; field.name = name;
+        designer.fields.Add(field); designer.sel = field; return field;
+    }
+    static void Prepare(App app, Designer designer, int height) {
+        designer.PrepareInspectorInput(app, new Rect(20, 20, 360, height));
+    }
+    static void Release(App app, Designer designer) {
+        designer.RetireInspectorInput(); designer.RetireCanvasInput();
+        designer.DisposeDesignPreview(); app.StopLoop(); app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void FirstInputFilterScrollUndo() {
+        App app = App.CreateOffscreen("retained inspector", 800, 700);
+        Designer designer = new Designer(); designer.fields.Clear();
+        FormField first = AddButton(designer, "first");
+        designer.InitializeInspectorInput(app);
+        Control initialized = designer.InspectorInputRoot();
+        Check(initialized != null && !initialized.visible, "early registration keeps unprepared Inspector hidden");
+        Prepare(app, designer, 620);
+        Control root = designer.InspectorInputRoot();
+        Check(root == initialized, "first prepare reuses early registered tree");
+        int undo = designer.undoStack.Count;
+        OpenEvents(app, designer);
+        Check(designer.inspTab == 1 && designer.undoStack.Count == undo, "first tab click works without Paint or document mutation");
+        Input editor = Handler(designer); Click(app, editor);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 66, 0, 0); Drain(app);
+        Check(first.GetHandler("Click") == "AB" && designer.undoStack.Count == undo + 1,
+            "event typing writes before Paint and one editing session owns one undo snapshot");
+        int typedUndo = designer.undoStack.Count;
+        designer.inspFilterInput.SetText("Resize");
+        app.ProcessOffscreenInput(1, 25, 25, 0, 0, 0, 0);
+        Check(editor.parent.parent == null && app.focus.focusedId != editor.WidgetId(),
+            "filter removes the handler subtree and retires focus before next input");
+        designer.inspFilterInput.SetText(""); app.ProcessOffscreenInput(1, 25, 25, 0, 0, 0, 0);
+        Check(Handler(designer) == editor && first.GetHandler("Click") == "AB" && designer.undoStack.Count == typedUndo,
+            "clearing filter reuses handler input and does not dirty document");
+        Prepare(app, designer, 210);
+        ScrollColumn body = (ScrollColumn)Find(root, "inspector-body");
+        int previous = body.ScrollTop();
+        app.ProcessOffscreenInput(13, body.bx + 10, body.by + 10, 0, 0 - 120, 0, 0);
+        Check(body.ScrollTop() > previous, "retained ScrollColumn owns wheel without Paint");
+        Control outside = root.HitTest(body.bx + 10, body.by - 1, 0);
+        Check(outside != editor, "event input cannot hit through body clip");
+        designer.Undo();
+        Check(designer.fields.Count == 1 && designer.fields[0].GetHandler("Click") == "",
+            "event undo restores original document through replacement fields");
+        Prepare(app, designer, 620);
+        Check(app.focus.focusedId != editor.WidgetId(), "document replacement retires old handler focus");
+        Release(app, designer);
+    }
+    static void TargetHideAndMove() {
+        App oldApp = App.CreateOffscreen("old inspector", 800, 700);
+        App nextApp = App.CreateOffscreen("next inspector", 800, 700);
+        Designer designer = new Designer(); designer.fields.Clear();
+        FormField first = AddButton(designer, "same");
+        designer.InitializeInspectorInput(oldApp); Prepare(oldApp, designer, 620);
+        OpenEvents(oldApp, designer);
+        Input oldEditor = Handler(designer); Click(oldApp, oldEditor);
+        FormField replacement = AddButton(designer, "same");
+        appInput(oldApp); Input nextEditor = Handler(designer);
+        Check(nextEditor != oldEditor && oldApp.focus.focusedId != oldEditor.WidgetId(),
+            "same-name replacement retires old field editors by identity");
+        oldEditor.SetText("stale"); oldEditor.Change.RaiseS(oldEditor);
+        Check(first.GetHandler("Click") == "" && replacement.GetHandler("Click") == "",
+            "old event sender cannot submit to replacement field");
+        Click(oldApp, nextEditor); Control retainedRoot = designer.InspectorInputRoot();
+        designer.SuspendInspectorInput(); designer.SuspendInspectorInput();
+        Check(oldApp.focus.focusedId != nextEditor.WidgetId()
+            && (oldApp.rootControl == null || !oldApp.rootControl.ContainsInputControl(nextEditor)),
+            "hidden Inspector retires focus and input membership");
+        nextEditor.SetText("stale-hidden"); nextEditor.Change.RaiseS(nextEditor);
+        Check(replacement.GetHandler("Click") == "", "hidden event sender cannot write");
+        Prepare(oldApp, designer, 620);
+        Check(designer.InspectorInputRoot() == retainedRoot, "hide and show preserve the early registration and root");
+        Input beforeMove = Handler(designer); Click(oldApp, beforeMove);
+        oldApp.ProcessOffscreenInput(6, 0, 0, 0, 67, 0, 0); Drain(oldApp);
+        Check(replacement.GetHandler("Click") == "C", "first input after show works before Paint");
+        replacement.SetHandler("Click", "");
+        designer.InitializeInspectorInput(nextApp); Prepare(nextApp, designer, 620);
+        Input afterMove = Handler(designer);
+        Check(afterMove != beforeMove && oldApp.focus.focusedId != beforeMove.WidgetId(),
+            "cross-App Inspector replaces tree and retires old host focus");
+        beforeMove.SetText("stale-host"); beforeMove.Change.RaiseS(beforeMove);
+        Check(replacement.GetHandler("Click") == "", "old App event actions are inert after retirement");
+        Release(nextApp, designer); oldApp.StopLoop(); oldApp.SetRootControl(null); Drain(oldApp); oldApp.canvas.Destroy();
+    }
+    static void PickerAndStop() {
+        App app = App.CreateOffscreen("inspector event choice", 800, 700);
+        Designer designer = new Designer(); designer.fields.Clear();
+        FormField field = AddButton(designer, "choice");
+        designer.InitializeInspectorInput(app); Prepare(app, designer, 620);
+        OpenEvents(app, designer);
+        Input editor = Handler(designer);
+        SelectBox picker = (SelectBox)Find(designer.InspectorInputRoot(), "inspector-handler-pick-fld:Click");
+        int undo = designer.undoStack.Count;
+        picker.Select(1); picker.Change.RaiseS(picker); Drain(app);
+        Check(field.GetHandler("Click") == editor.GetText() && field.GetHandler("Click") != ""
+            && designer.undoStack.Count == undo + 1, "recommended event choice writes with discrete undo before Paint");
+        designer.Undo(); Prepare(app, designer, 620);
+        Check(designer.fields[0].GetHandler("Click") == "", "event choice undo restores previous handler");
+        Check(designer.sel == null && app.focus.focusedId != editor.WidgetId()
+            && !app.rootControl.ContainsInputControl(editor), "undo retires field target and its handler input");
+        Input stoppedEditor = Handler(designer, "win:Load");
+        string beforeStop = designer.SaveJson(); app.StopLoop();
+        stoppedEditor.SetText("stopped"); stoppedEditor.Change.RaiseS(stoppedEditor); Drain(app);
+        Check(designer.fields[0].GetHandler("Click") == "" && designer.SaveJson() == beforeStop,
+            "stopped window handler actions cannot write document");
+        Release(app, designer);
+    }
+    static void appInput(App app) { app.ProcessOffscreenInput(1, 25, 25, 0, 0, 0, 0); }
+    static void Main() {
+        ControlBootstrap.Install();
+        FirstInputFilterScrollUndo(); TargetHideAndMove(); PickerAndStop();
+        Console.WriteLine("designer inspector retained input ok");
+    }
+}

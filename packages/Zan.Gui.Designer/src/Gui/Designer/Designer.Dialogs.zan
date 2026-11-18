@@ -33,8 +33,10 @@ partial class Designer {
         bool table = (f.ftype == 23 || f.ftype == 41);
         string head = table ? Designer.T("Edit columns — ", "编辑列 —— ")
             : Designer.T("Edit options — ", "编辑选项 —— ");
-        rowsWin = this.NewEditorWindow(app, app.Scale(880), app.Scale(560),
+        rowsWin = this.NewEditorWindow(app, 880, 560,
             head + (f.fname.Length > 0 ? f.fname : FormField.TypeName(f.ftype)));
+        rowsWin.view = new DesignerDialogBody(this, 0);
+        rowsWin.Open(app);
         msg = Designer.T("editing rows in the large dialog: pick a row on the left, edit it on the right",
             "正在弹窗中编辑：在左侧选中一行，在右侧编辑它的属性");
         return true;
@@ -57,28 +59,52 @@ partial class Designer {
         propsScroll = 0;
         propsFilter.SetText("");
         iconPickTarget = null;
-        propsWin = this.NewEditorWindow(app, app.Scale(760), app.Scale(520),
+        propsWin = this.NewEditorWindow(app, 760, 520,
             Designer.T("Widget props — ", "组件属性 —— ")
                 + (f.fname.Length > 0 ? f.fname : FormField.TypeName(f.ftype)));
+        propsWin.view = new DesignerDialogBody(this, 1);
+        propsWin.Open(app);
         msg = Designer.T("editing widget props in the large dialog: pick a key on the left, edit it on the right",
             "正在弹窗中编辑组件属性：在左侧选中一个键，在右侧编辑它");
     }
 
-    // 大编辑器统一开 LayerState 仿真窗口：居中、可拖动、可缩放，
-    // 内容几何每帧从窗口读。每次打开新建（几何随内容变），
-    // 构造器自带 Layer 保留 id 段并恢复宿主计数器，随开随建无害。
+    // 大编辑器使用 Layer 的 retained modal host。尺寸保持逻辑像素，
+    // 由标准宿主统一做 DPI、居中、遮罩、输入和关闭生命周期。
     LayerState NewEditorWindow(App app, int w, int h, string title) {
         this.CloseDesignerMenus();
-        int W = app.canvas.Width();
-        int H = app.canvas.Height();
-        if (w > W - app.Scale(32)) { w = W - app.Scale(32); }
-        if (h > H - app.Scale(32)) { h = H - app.Scale(32); }
-        LayerState s = new LayerState(title, (W - w) / 2, (H - h) / 2, w, h);
-        // 底部操作行由编辑器自己画（格式提示 + 绑定路径 + 完成）。
-        s.footer = false;
-        s.autoCenter = true;
-        s.Open();
+        int dpi = app.Scale(1000) / 10;
+        if (dpi < 1) { dpi = 100; }
+        int maxW = (app.canvas.Width() - app.Scale(32)) * 100 / dpi;
+        int maxH = (app.canvas.Height() - app.Scale(32)) * 100 / dpi;
+        if (w > maxW) { w = maxW; }
+        if (h > maxH) { h = maxH; }
+        if (w < 240) { w = 240; }
+        if (h < 200) { h = 200; }
+        LayerState s = new LayerState(title, 0, 0, w, h);
+        s.kind = 1; s.modal = true; s.footer = false;
+        s.twoButtons = false; s.okText = ""; s.cancelText = ""; s.altText = "";
         return s;
+    }
+
+    void SyncEditorWindowState() {
+        if (quickInsertWin != null) {
+            if (!quickInsertOpen) { quickInsertWin.open = false; }
+            if (!quickInsertWin.open) {
+                quickInsertWin = null; quickInsertResults = null; quickInsertOpen = false;
+                if (quickInsertInput.parent != null) { quickInsertInput.parent.Remove(quickInsertInput); }
+            }
+        }
+        if (keymapHelpWin != null) {
+            if (!keymapHelpOpen) { keymapHelpWin.open = false; }
+            if (!keymapHelpWin.open) { keymapHelpWin = null; keymapHelpOpen = false; }
+        }
+        if (rowsWin != null && !rowsWin.open) {
+            rowsWin = null; rowsEdField = null; rowsEdSel = 0 - 1; rowsEdSelPrev = 0 - 1;
+        }
+        if (propsWin != null && !propsWin.open) {
+            propsWin = null; propsEdField = null; propsEdSel = 0 - 1; propsEdSelPrev = 0 - 1;
+        }
+        if (iconWin != null && !iconWin.open) { iconWin = null; iconPickTarget = null; }
     }
 
     // 任一大编辑器窗口开着。画布的原始指针路径（选中/拖拽/滚轮
@@ -93,6 +119,10 @@ partial class Designer {
     // 关闭全部编辑器窗口并清掉编辑态。选中下标一并复位，下次
     // 打开按打开逻辑重选。
     void CloseBigEditors() {
+        quickInsertOpen = false; keymapHelpOpen = false;
+        if (quickInsertWin != null) { quickInsertWin.open = false; }
+        if (keymapHelpWin != null) { keymapHelpWin.open = false; }
+        this.SyncEditorWindowState();
         rowsEdField = null;
         propsEdField = null;
         rowsEdSel = 0 - 1;
@@ -108,6 +138,8 @@ partial class Designer {
     // 重置全部交互、手势捕获、弹层与上下文菜单状态（Tab 切换或失焦时调用）。
     // 防止未关闭的菜单阻断宿主 IDE 命中测试，或未释放的拖拽捕获导致界面假死。
     public void ResetInteractionState() {
+        this.SuspendInspectorInput();
+        this.SuspendCanvasInput();
         this.CloseDesignerMenus();
         freeDragging = false;
         freeDragHasMoved = false;
@@ -474,9 +506,8 @@ partial class Designer {
     }
 
 
-    void RenderRowsEditor(App app, Canvas c, Theme t) {
-        if (rowsEdField == null || rowsWin == null) { return; }
-        Layer.Render(app, rowsWin);
+    void RenderRowsEditor(App app, Canvas c, Theme t, Rect body) {
+        if (rowsEdField == null || rowsWin == null || body == null) { return; }
         if (!rowsWin.open) {
             // 用户点了 X（或 Esc）：清编辑态，下一帧不再画。
             rowsEdField = null;
@@ -500,33 +531,29 @@ partial class Designer {
         int fgHint = Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
         int border = Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BorderOr(0);
         StyleBox accent = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal());
-        int ix = rowsWin.x + pad;
-        int iw = rowsWin.w - pad * 2;
-        // 与外框的入场动画同偏移：Layer.Render 画标题栏时把 y 上移 EntranceDy，
-        // 正文不用同一偏移就会在入场那 180ms 内外框在动、内容不动。
-        int animY = rowsWin.y - Layer.EntranceDy(app, rowsWin);
-
+        int ix = body.x;
+        int iw = body.width;
         // 顶部工具条：左侧计数（“选项 (22)”），右侧命令组右对齐。
         int barH = app.Scale(30);
-        int top = animY + Layer.BarH(app) + pad;
+        int top = body.y;
         string what = table ? Designer.T("Columns", "列") : Designer.T("Options", "选项");
         c.DrawText(ix, Canvas.CenterTextY(top, barH, fsT),
             what + " (" + Convert.ToString(rows) + ")", fgMain, fsT);
-        int dnId = SmallIconBtn(app, "chevron-down", 0,
-            ix + iw - app.Scale(28), top, app.Scale(28));
-        int upId = SmallIconBtn(app, "chevron-up", 0,
-            ix + iw - app.Scale(62), top, app.Scale(28));
-        int delId = SmallBtn(app, Designer.T("Delete", "删除"), 5,
-            ix + iw - app.Scale(132), top, app.Scale(64));
-        int dupId = SmallBtn(app, Designer.T("Copy", "复制"), 0,
-            ix + iw - app.Scale(202), top, app.Scale(64));
-        int addId = SmallBtn(app, Designer.T("Add", "添加"), 1,
-            ix + iw - app.Scale(272), top, app.Scale(64));
+        SmallIconBtn(app, "chevron-down", 0,
+            ix + iw - app.Scale(28), top, app.Scale(28), "rows.down");
+        SmallIconBtn(app, "chevron-up", 0,
+            ix + iw - app.Scale(62), top, app.Scale(28), "rows.up");
+        SmallBtn(app, Designer.T("Delete", "删除"), 5,
+            ix + iw - app.Scale(132), top, app.Scale(64), "rows.delete");
+        SmallBtn(app, Designer.T("Copy", "复制"), 0,
+            ix + iw - app.Scale(202), top, app.Scale(64), "rows.duplicate");
+        SmallBtn(app, Designer.T("Add", "添加"), 1,
+            ix + iw - app.Scale(272), top, app.Scale(64), "rows.add");
         // 主体两栏 + 底部说明区的几何（工具条命令的选中行滚动
         // 保证也要用 listH，所以先于命令处理算好）。
         int bodyY = top + barH + app.Scale(10);
         int footH = app.Scale(74);
-        int bodyBot = animY + rowsWin.h - footH - pad;
+        int bodyBot = body.y + body.height - footH;
         int bodyH = bodyBot - bodyY;
         if (bodyH < app.Scale(120)) { bodyH = app.Scale(120); }
         int listW = app.Scale(280);
@@ -537,55 +564,7 @@ partial class Designer {
         int slot = app.Scale(30);
         int listY = bodyY + app.Scale(36);
         int listH = bodyBot - listY;
-
-        if (Ui.Clicked(app, addId)) {
-            this.PushUndo();
-            string def = Designer.T("New option", "新选项");
-            if (table) { def = Designer.T("New column", "新列"); }
-            if (tool || ribbon) { def = Designer.T("New item", "新项"); }
-            f.AddOption(def);
-            rowsEdSel = f.OptionCount() - 1;
-            rowsEdSelPrev = 0 - 1;
-            this.EnsureSelVisible(f.OptionCount(), slot, listH);
-            app.RequestRedraw();
-        }
-        if (Ui.Clicked(app, dupId) && rowsEdSel >= 0) {
-            this.PushUndo();
-            int src = rowsEdSel;
-            f.AddOption(f.OptionAt(rowsEdSel));
-            f.MoveOption(f.OptionCount() - 1, rowsEdSel + 1);
-            Designer.CopyColEntry(f, src, rowsEdSel + 1);
-            Designer.CopyToolItemEntry(f, src, rowsEdSel + 1);
-            rowsEdSel = rowsEdSel + 1;
-            rowsEdSelPrev = 0 - 1;
-            this.EnsureSelVisible(f.OptionCount(), slot, listH);
-            app.RequestRedraw();
-        }
-        if (Ui.Clicked(app, delId) && rowsEdSel >= 0) {
-            this.PushUndo();
-            this.RemoveOptionFixup(f, rowsEdSel);
-            if (rowsEdSel > f.OptionCount() - 1) { rowsEdSel = f.OptionCount() - 1; }
-            rowsEdSelPrev = 0 - 1;
-            app.RequestRedraw();
-        }
-        if (Ui.Clicked(app, upId) && rowsEdSel > 0) {
-            this.PushUndo();
-            int mv = rowsEdSel;
-            this.MoveOptionFixup(f, mv, mv - 1);
-            rowsEdSel = rowsEdSel - 1;
-            rowsEdSelPrev = 0 - 1;
-            this.EnsureSelVisible(rows, slot, listH);
-            app.RequestRedraw();
-        }
-        if (Ui.Clicked(app, dnId) && rowsEdSel >= 0 && rowsEdSel < rows - 1) {
-            this.PushUndo();
-            int mv = rowsEdSel;
-            this.MoveOptionFixup(f, mv, mv + 1);
-            rowsEdSel = rowsEdSel + 1;
-            rowsEdSelPrev = 0 - 1;
-            this.EnsureSelVisible(rows, slot, listH);
-            app.RequestRedraw();
-        }
+        rowsListH = listH;
 
         // 左栏：筛选框 + 行列表（内容超高滚动）。
         rowsFilter.Arrange(ix, bodyY, listW, app.Scale(28));
@@ -594,14 +573,8 @@ partial class Designer {
         int contentH = rows * slot + app.Scale(8);
         int maxScroll = contentH - listH;
         if (maxScroll < 0) { maxScroll = 0; }
-        if (InRect(app.mouseX, app.mouseY, ix, listY, listW, listH)
-                && app.CaptureWheel(ix, listY, listW, listH)) {
-            int wdelta = app.window.EventKeyCode();
-            rowsScroll = rowsScroll - wdelta * app.Scale(40) / 120;
-            if (rowsScroll < 0) { rowsScroll = 0; }
-            if (rowsScroll > maxScroll) { rowsScroll = maxScroll; }
-            app.RequestRedraw();
-        }
+        rowsListBounds = new Rect(ix, listY, listW, listH);
+        rowsMaxScroll = maxScroll;
         if (rowsScroll > maxScroll) { rowsScroll = maxScroll; }
 
         int visible = 0;
@@ -616,11 +589,12 @@ partial class Designer {
             bool onscreen = ly + slot > listY && ly < listY + listH;
             if (show && onscreen) {
                 visible = visible + 1;
+                Control rowControl = this.DesignerRow(app, ix, ly, listW, slot - 4, "rows.select", i);
                 bool selR = i == rowsEdSel;
                 if (selR) {
                     c.FillRoundRect(ix, ly, listW, slot - 4, app.Scale(4),
                         Style.Fade(accent.BgOr(0), 60));
-                } else if (Ui.Over(app, ix, ly, listW, slot - 4)) {
+                } else if (rowControl.IsHovered()) {
                     c.FillRoundRect(ix, ly, listW, slot - 4, app.Scale(4),
                         Style.Fade(accent.BgOr(0), 24));
                 }
@@ -644,14 +618,7 @@ partial class Designer {
                             "〈" + sub + "〉", fgHint, fs);
                     }
                 }
-                // 行命中矩形使用作用域 Hash ID，不与每帧顺序分配的按钮 id 碰撞
-                int rid = IdHash.HashInt(i, 8895);
-                app.hitTester.RegisterRect(rid, ix, ly, listW, slot - 4, 0);
-                if (Ui.Clicked(app, rid)) {
-                    rowsEdSel = i;
-                    rowsEdSelPrev = 0 - 1;
-                    app.RequestRedraw();
-                }
+                rowControl.RenderTree(app);
             }
             ly = ly + slot;
         }
@@ -706,49 +673,17 @@ partial class Designer {
             this.WriteBackToolItem(app, f);
             if (tool || ribbon) {
                 // PropertyGrid 行里放不下按钮：图标选择走隐藏 Input 转交。
-                int pickId = SmallBtn(app, Designer.T("Pick icon…", "选择图标…"), 0,
-                    gx, gridY + gridH + app.Scale(6), app.Scale(110));
-                if (Ui.Clicked(app, pickId)) {
-                    iconHolder.SetText(rowEdField);
-                    this.OpenIconPicker(app, iconHolder);
-                    app.RequestRedraw();
-                }
+                SmallBtn(app, Designer.T("Pick icon…", "选择图标…"), 0,
+                    gx, gridY + gridH + app.Scale(6), app.Scale(110), "rows.pick");
                 if (tool) {
                     int navBtnW = app.Scale(110);
-                    int navId = SmallBtn(app, Designer.T("Code behind", "定位事件代码"), 0,
-                        gx + app.Scale(116), gridY + gridH + app.Scale(6), navBtnW);
-                    if (Ui.Clicked(app, navId)) {
-                        string target = StyleSheet.Trim(toolEdClick);
-                        if (target == "") {
-                            string baseName = f.fname != "" ? f.fname : "Tool";
-                            string itmName = StyleSheet.Trim(rowEdTitle);
-                            if (itmName == "") { itmName = "Item" + Convert.ToString(rowsEdSel + 1); }
-                            target = "On" + Designer.CleanIdentifier(baseName)
-                                + Designer.CleanIdentifier(itmName) + "Click";
-                            toolEdClick = target;
-                            this.WriteBackToolItem(app, f);
-                        }
-                        this.RequestOpenCodeBehindHandler(target);
-                    }
+                    SmallBtn(app, Designer.T("Code behind", "定位事件代码"), 0,
+                        gx + app.Scale(116), gridY + gridH + app.Scale(6), navBtnW, "rows.tool-nav");
                 }
             } else if (table) {
                 int colNavBtnW = app.Scale(110);
-                int colNavId = SmallBtn(app, Designer.T("Code behind", "定位点击代码"), 0,
-                    gx, gridY + gridH + app.Scale(6), colNavBtnW);
-                if (Ui.Clicked(app, colNavId)) {
-                    string target = StyleSheet.Trim(colEdClick);
-                    if (target == "") {
-                        string baseName = f.fname != "" ? f.fname : "Table";
-                        string colName = StyleSheet.Trim(rowEdField);
-                        if (colName == "") { colName = StyleSheet.Trim(rowEdTitle); }
-                        if (colName == "") { colName = "Col" + Convert.ToString(rowsEdSel + 1); }
-                        target = "On" + Designer.CleanIdentifier(baseName)
-                            + Designer.CleanIdentifier(colName) + "CellClick";
-                        colEdClick = target;
-                        this.WriteBackCol(app, f);
-                    }
-                    this.RequestOpenCodeBehindHandler(target);
-                }
+                SmallBtn(app, Designer.T("Code behind", "定位点击代码"), 0,
+                    gx, gridY + gridH + app.Scale(6), colNavBtnW, "rows.col-nav");
             }
         } else if (rows > 0) {
             c.DrawText(gx, gridY + app.Scale(12),
@@ -794,59 +729,23 @@ partial class Designer {
             bindHint = Designer.T("One option per row.", "每行一个选项。");
         }
         c.DrawText(ix, footY + app.Scale(26), bindHint, fgHint, fs);
-        string bpath = Designer.T("Bind path: ", "绑定路径：") + f.bindPath;
-        if (f.bindPath == "") {
+        string boundPath = f.BindingCount > 0 ? f.BindingAt(0).Path : "";
+        string bpath = Designer.T("Bind path: ", "绑定路径：") + boundPath;
+        if (boundPath == "") {
             bpath = Designer.T("Bind path: (none — set in Properties)",
                 "绑定路径：（未设置 —— 在属性里填）");
         }
         c.DrawText(ix, footY + app.Scale(44),
             Ellipsis.Fit(bpath, iw - app.Scale(104), fs), fgHint, fs);
-        int doneId = SmallBtn(app, Designer.T("Close", "关闭"), 1,
-            ix + iw - app.Scale(84), footY + app.Scale(23), app.Scale(84));
-        if (Ui.Clicked(app, doneId)) { this.CloseBigEditors(); }
+        SmallBtn(app, Designer.T("Close", "关闭"), 1,
+            ix + iw - app.Scale(84), footY + app.Scale(23), app.Scale(84), "rows.close");
 
-        // 键盘：Delete 删除选中行，↑/↓ 换选（输入框持有焦点、或
-        // 图标选择器在顶层时不抢）。
-        if (iconWin == null && app.focus.focusedId < 0
-                && !app.PointerCaptured()) {
-            int ek2 = app.EventKind();
-            if (ek2 == 4) {
-                int kc = app.window.EventKeyCode();
-                if (kc == 46 && rowsEdSel >= 0) {
-                    this.PushUndo();
-                    this.RemoveOptionFixup(f, rowsEdSel);
-                    if (rowsEdSel > f.OptionCount() - 1) {
-                        rowsEdSel = f.OptionCount() - 1;
-                    }
-                    rowsEdSelPrev = 0 - 1;
-                    app.RequestRedraw();
-                } else if (kc == 38 && rowsEdSel > 0) {
-                    this.PushUndo();
-                    this.MoveOptionFixup(f, rowsEdSel, rowsEdSel - 1);
-                    rowsEdSel = rowsEdSel - 1;
-                    rowsEdSelPrev = 0 - 1;
-                    this.EnsureSelVisible(rows, slot, listH);
-                    app.RequestRedraw();
-                } else if (kc == 40 && rowsEdSel < rows - 1) {
-                    this.PushUndo();
-                    this.MoveOptionFixup(f, rowsEdSel, rowsEdSel + 1);
-                    rowsEdSel = rowsEdSel + 1;
-                    rowsEdSelPrev = 0 - 1;
-                    this.EnsureSelVisible(rows, slot, listH);
-                    app.RequestRedraw();
-                }
-            }
-        }
 
-        if (iconWin != null) {
-            this.RenderIconPicker(app, c, t);
-        }
     }
 
 
-    void RenderPropsEditor(App app, Canvas c, Theme t) {
-        if (propsEdField == null || propsWin == null) { return; }
-        Layer.Render(app, propsWin);
+    void RenderPropsEditor(App app, Canvas c, Theme t, Rect body) {
+        if (propsEdField == null || propsWin == null || body == null) { return; }
         if (!propsWin.open) {
             propsEdField = null;
             propsWin = null;
@@ -869,50 +768,24 @@ partial class Designer {
         int fgHint = Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
         int border = Style.Part(app, "designer", "panel", "", "", "", Style.SNormal()).BorderOr(0);
         StyleBox accent = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal());
-        int ix = propsWin.x + pad;
-        int iw = propsWin.w - pad * 2;
-        // 与外框的入场动画同偏移：Layer.Render 画标题栏时把 y 上移 EntranceDy，
-        // 正文不用同一偏移就会在入场那 180ms 内外框在动、内容不动。
-        int animY = propsWin.y - Layer.EntranceDy(app, propsWin);
+        int ix = body.x;
+        int iw = body.width;
 
         // 顶部工具条：计数 + 添加 / 删除。
         int barH = app.Scale(30);
-        int top = animY + Layer.BarH(app) + pad;
+        int top = body.y;
         c.DrawText(ix, Canvas.CenterTextY(top, barH, fsT),
             Designer.T("Props", "属性") + " (" + Convert.ToString(count) + ")",
             fgMain, fsT);
-        int delId = SmallBtn(app, Designer.T("Delete", "删除"), 5,
-            ix + iw - app.Scale(70), top, app.Scale(70));
-        int addId = SmallBtn(app, Designer.T("Add", "添加"), 1,
-            ix + iw - app.Scale(146), top, app.Scale(70));
-        if (Ui.Clicked(app, addId)) {
-            this.PushUndo();
-            string k = "prop";
-            int nn = 1;
-            while (Designer.HasCompProp(f, k)) {
-                nn = nn + 1;
-                k = "prop" + Convert.ToString(nn);
-            }
-            Designer.SetCompPropValue(f, k, "");
-            propsEdSel = count;
-            propsEdSelPrev = 0 - 1;
-            app.RequestRedraw();
-        }
-        if (Ui.Clicked(app, delId) && propsEdSel >= 0 && f.extra != null) {
-            this.PushUndo();
-            JsonValue props = f.extra.Get("props");
-            if (props != null && props.IsObject() && propsEdSel < props.Count()) {
-                Designer.DropCompProp(f, props.KeyAt(propsEdSel));
-            }
-            if (propsEdSel > count - 2) { propsEdSel = count - 2; }
-            propsEdSelPrev = 0 - 1;
-            app.RequestRedraw();
-        }
+        SmallBtn(app, Designer.T("Delete", "删除"), 5,
+            ix + iw - app.Scale(70), top, app.Scale(70), "props.delete");
+        SmallBtn(app, Designer.T("Add", "添加"), 1,
+            ix + iw - app.Scale(146), top, app.Scale(70), "props.add");
 
         // 主体两栏 + 底部说明区的几何。
         int bodyY = top + barH + app.Scale(10);
         int footH = app.Scale(56);
-        int bodyBot = animY + propsWin.h - footH - pad;
+        int bodyBot = body.y + body.height - footH;
         int bodyH = bodyBot - bodyY;
         if (bodyH < app.Scale(120)) { bodyH = app.Scale(120); }
         int listW = app.Scale(240);
@@ -931,14 +804,8 @@ partial class Designer {
         int contentH = count * slot + app.Scale(8);
         int maxScroll = contentH - listH;
         if (maxScroll < 0) { maxScroll = 0; }
-        if (InRect(app.mouseX, app.mouseY, ix, listY, listW, listH)
-                && app.CaptureWheel(ix, listY, listW, listH)) {
-            int wdelta = app.window.EventKeyCode();
-            propsScroll = propsScroll - wdelta * app.Scale(40) / 120;
-            if (propsScroll < 0) { propsScroll = 0; }
-            if (propsScroll > maxScroll) { propsScroll = maxScroll; }
-            app.RequestRedraw();
-        }
+        propsListBounds = new Rect(ix, listY, listW, listH);
+        propsMaxScroll = maxScroll;
         if (propsScroll > maxScroll) { propsScroll = maxScroll; }
 
         int visible = 0;
@@ -959,11 +826,12 @@ partial class Designer {
             bool onscreen = ly + slot > listY && ly < listY + listH;
             if (show && onscreen) {
                 visible = visible + 1;
+                Control rowControl = this.DesignerRow(app, ix, ly, listW, slot - 4, "props.select", i);
                 bool selR = i == propsEdSel;
                 if (selR) {
                     c.FillRoundRect(ix, ly, listW, slot - 4, app.Scale(4),
                         Style.Fade(accent.BgOr(0), 60));
-                } else if (Ui.Over(app, ix, ly, listW, slot - 4)) {
+                } else if (rowControl.IsHovered()) {
                     c.FillRoundRect(ix, ly, listW, slot - 4, app.Scale(4),
                         Style.Fade(accent.BgOr(0), 24));
                 }
@@ -975,14 +843,7 @@ partial class Designer {
                     c.DrawText(ix + listW - app.Scale(10) - vw, cy,
                         Ellipsis.Fit(val, listW / 2, fs), fgHint, fs);
                 }
-                // 行命中矩形使用作用域 Hash ID
-                int rid = IdHash.HashInt(i, 8897);
-                app.hitTester.RegisterRect(rid, ix, ly, listW, slot - 4, 0);
-                if (Ui.Clicked(app, rid)) {
-                    propsEdSel = i;
-                    propsEdSelPrev = 0 - 1;
-                    app.RequestRedraw();
-                }
+                rowControl.RenderTree(app);
             }
             ly = ly + slot;
         }
@@ -1037,40 +898,10 @@ partial class Designer {
         c.DrawText(ix, footY + app.Scale(26), Designer.T(
                 "Values are strings; numbers and enums go in their text form.",
                 "值为字符串；数字与枚举以其文本形式传入。"), fgHint, fs);
-        int doneId = SmallBtn(app, Designer.T("Close", "关闭"), 1,
-            ix + iw - app.Scale(84), footY + app.Scale(14), app.Scale(84));
-        if (Ui.Clicked(app, doneId)) { this.CloseBigEditors(); }
+        SmallBtn(app, Designer.T("Close", "关闭"), 1,
+            ix + iw - app.Scale(84), footY + app.Scale(14), app.Scale(84), "props.close");
 
-        // 键盘：Delete 删除选中键，↑/↓ 换选（输入框持有焦点时不抢）。
-        if (app.focus.focusedId < 0 && !app.PointerCaptured()) {
-            int ek2 = app.EventKind();
-            if (ek2 == 4) {
-                int kc = app.window.EventKeyCode();
-                if (kc == 46 && propsEdSel >= 0) {
-                    this.PushUndo();
-                    if (f.extra != null) {
-                        JsonValue props = f.extra.Get("props");
-                        if (props != null && props.IsObject()
-                                && propsEdSel < props.Count()) {
-                            Designer.DropCompProp(f, props.KeyAt(propsEdSel));
-                        }
-                    }
-                    if (propsEdSel > count - 2) { propsEdSel = count - 2; }
-                    propsEdSelPrev = 0 - 1;
-                    app.RequestRedraw();
-                } else if (kc == 38 && propsEdSel > 0) {
-                    propsEdSel = propsEdSel - 1;
-                    propsEdSelPrev = 0 - 1;
-                    this.EnsurePropSelVisible(count, slot, listH);
-                    app.RequestRedraw();
-                } else if (kc == 40 && propsEdSel < count - 1) {
-                    propsEdSel = propsEdSel + 1;
-                    propsEdSelPrev = 0 - 1;
-                    this.EnsurePropSelVisible(count, slot, listH);
-                    app.RequestRedraw();
-                }
-            }
-        }
+
     }
 
     // --- 表单预览 --------------------------------------------------------

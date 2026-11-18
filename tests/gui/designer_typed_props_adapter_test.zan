@@ -1,0 +1,358 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+
+class DesignerTypedPropsAdapterTest {
+    static int fails;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { fails = fails + 1; Console.WriteLine("FAIL " + label); }
+    }
+
+    static void DrainDispatcher() {
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { return; }
+            action();
+        }
+    }
+
+    static void ReleaseDesigner(Designer designer) {
+        if (designer == null || designer.propGrid == null) { return; }
+        designer.propGrid.BeforeChange = null;
+        designer.propGrid.Change.Clear();
+    }
+
+    static PropSpec Find(List<PropSpec> specs, string key) {
+        for (int i = 0; i < specs.Count; i = i + 1) {
+            if (specs[i].key == key) { return specs[i]; }
+        }
+        return null;
+    }
+
+    static void TestAdapterBindings() {
+        ControlBootstrap.Install();
+        Designer designer = new Designer();
+        designer.layoutMode = 0;
+
+        designer.LoadHtmlText("<body data-win-w=\"480\" data-win-h=\"320\">"
+            + "<SplitPanel id=\"splitOne\" style=\"width: 300px; height: 200px\"></SplitPanel></body>");
+        FormField splitField = designer.fields[0];
+        designer.sel = splitField;
+        List<PropSpec> splitSpecs = designer.FieldSpecs(splitField);
+        PropSpec orient = Find(splitSpecs, "props.orient");
+        Check(orient != null, "typed split enum is projected with props prefix");
+        if (orient != null) {
+            Check(orient.kind == 3 && orient.ValueKind() == 1, "numeric enum metadata is preserved");
+            Check(orient.Read() == "0", "missing numeric enum uses source initial value");
+            Check(orient.options.Count == 2 && orient.options[0] == "vertical"
+                && orient.options[1] == "horizontal", "enum options are copied");
+            orient.Write("horizontal");
+            Check(Designer.CompPropValue(splitField, "orient", "missing") == "1",
+                "numeric enum stores the selected option index in document props");
+            App editor = App.CreateOffscreen("typed preview host", 640, 480);
+            designer.MarkDocDirty();
+            Check(designer.PrepareDesignPreview(editor), "typed document preview prepares");
+            DesignPreviewNode node = designer.PreviewNode(splitField);
+            SplitPanel preview = node != null ? node.control as SplitPanel : null;
+            Check(preview != null, "document constructs the typed SplitPanel");
+            if (preview != null) {
+                List<PropSpec> previewSpecs = preview.Props();
+                PropSpec previewOrient = Find(previewSpecs, "orient");
+                Check(preview.GetProp("orient") == "1" && previewOrient != null
+                    && previewOrient.ReadFrom(preview) == "1", "document replays numeric enum value through SetProp");
+                Check(preview.handleW == preview.bw && preview.handleH == SplitPanel.BarSize(),
+                    "shared Arrange applies horizontal orientation behavior");
+            }
+            designer.DisposeDesignPreview();
+            editor.canvas.Destroy();
+        }
+
+        FormField inputField = FormField.New(0, 2);
+        inputField.kind = "Input";
+        inputField.fname = "inputOne";
+        inputField.name = "inputOne";
+        designer.sel = inputField;
+        List<PropSpec> inputSpecs = designer.FieldSpecs(inputField);
+        PropSpec status = Find(inputSpecs, "props.status");
+        Check(status != null, "typed input enum is projected");
+        if (status != null) {
+            Check(status.kind == 3 && status.ValueKind() == 0, "text enum metadata is preserved");
+            Check(status.Read() == "", "unset text enum remains empty");
+            status.Write("warning");
+            Check(Designer.CompPropValue(inputField, "status", "missing") == "warning",
+                "text enum stores option text in document props");
+        }
+        PropSpec maxlen = Find(inputSpecs, "props.maxlen");
+        Check(maxlen != null && maxlen.kind == 1 && maxlen.lo == 0 && maxlen.hi == 4096
+            && maxlen.step == 1 && maxlen.hasRange, "numeric range and step metadata are copied");
+        ReleaseDesigner(designer);
+    }
+
+    static int IndexOf(List<PropSpec> specs, string key) {
+        for (int i = 0; i < specs.Count; i = i + 1) {
+            if (specs[i].key == key) { return i; }
+        }
+        return -1;
+    }
+
+    static void TestPropertyGridResetAndDefaultPresence() {
+        Designer designer = new Designer();
+        FormField field = FormField.New(0, 3);
+        field.kind = "Input";
+        field.fname = "inputReset";
+        field.name = "inputReset";
+        CompPropEditRow row = new CompPropEditRow("reset", "Reset", false, null, null, "");
+        row.docField = field; row.docKey = "reset";
+        row.docDefault = "fallback"; row.docHasDefault = true;
+        Check(row.DocText == "fallback", "missing key reads declared fallback");
+
+        PropSpec reset = PropSpec.Text("props.reset", "Reset").Default("default");
+        reset.str = row.DocText;
+        List<PropSpec> one = new List<PropSpec>(); one.Add(reset);
+        int before = 0; int changed = 0;
+        PropertyGrid grid = new PropertyGrid();
+        grid.OnBeforeChange((string key) => { before = before + 1; });
+        grid.OnChange(() => { changed = changed + 1; });
+        grid.Bind("typed-reset", one);
+        grid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(Designer.CompPropValue(field, "reset", "missing") == "default",
+            "real PropertyGrid reset writes typed document binding");
+        Check(before == 1 && changed == 1, "reset runs before-change and change callbacks");
+
+        row.DocText = "custom";
+        designer.fields.Add(field); designer.sel = field;
+        designer.pvDocDirty = false;
+        designer.propGrid.Bind("typed-reset-document", one);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(Designer.CompPropValue(field, "reset", "missing") == "default",
+            "Designer PropertyGrid reset uses the same typed document adapter");
+        Check(designer.undoStack.Count > 0 && designer.pvDocDirty,
+            "typed reset enters undo history and marks the document dirty");
+        row.DocText = "";
+        Check(row.DocText == "" && Designer.CompPropValue(field, "reset", "fallback") == "",
+            "explicit empty text remains distinct from missing default");
+
+        grid.BeforeChange = null;
+        grid.Change.Clear();
+        DrainDispatcher();
+        ReleaseDesigner(designer);
+
+        CompPropEditRow absent = new CompPropEditRow("unset", "Unset", false, null, null, "");
+        absent.docField = field; absent.docKey = "unset";
+        absent.docHasDefault = false; absent.docDefault = "";
+        Check(absent.DocText == "", "property without declared default reads empty text");
+    }
+
+    static void TestInspectorCommitCallbacks() {
+        ControlBootstrap.Install();
+        Designer designer = new Designer();
+        designer.fields.Clear();
+        FormField field = FormField.New(0, 10);
+        field.kind = "Input"; field.fname = "first"; field.name = "first";
+        FormField duplicate = FormField.New(0, 11);
+        duplicate.kind = "Input"; duplicate.fname = "taken"; duplicate.name = "taken";
+        designer.fields.Add(field); designer.fields.Add(duplicate); designer.sel = field;
+
+        PropSpec name = PropSpec.Text("name", "Name").Default("taken");
+        name.str = field.fname;
+        List<PropSpec> specs = new List<PropSpec>(); specs.Add(name);
+        designer.propGrid.Bind("rename-conflict", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(field.fname == "first" && field.name == "first", "conflicting name commit restores prior identifier");
+        Check(designer.ConsumeRenamedField() == "", "conflicting name does not emit rename event");
+
+        PropSpec rename = PropSpec.Text("name", "Name").Default("renamed");
+        rename.str = field.fname;
+        specs = new List<PropSpec>(); specs.Add(rename);
+        designer.propGrid.Bind("rename-valid", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(field.fname == "renamed" && field.name == "renamed", "valid name commit renames the field");
+        Check(designer.ConsumeRenamedField() == "first:renamed", "valid rename emits code-behind rename event");
+
+        FormField floated = FormField.New(0, 12);
+        floated.kind = "Input"; floated.fname = "floatOne"; floated.name = "floatOne";
+        designer.sel = floated; designer.layoutMode = 0;
+        PropSpec position = PropSpec.Int("position", "Position").Default("1");
+        position.num = floated.position;
+        specs = new List<PropSpec>(); specs.Add(position);
+        designer.propGrid.Bind("float-position", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(floated.position == 1 && floated.dockSide == 0, "Float selection clears docking");
+
+        FormField narrow = FormField.New(0, 13);
+        narrow.kind = "Input"; narrow.fname = "spanOne"; narrow.name = "spanOne";
+        designer.sel = narrow;
+        PropSpec span = PropSpec.Int("span", "Span").Default("99");
+        span.num = narrow.span;
+        specs = new List<PropSpec>(); specs.Add(span);
+        designer.propGrid.Bind("span-clamp", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(narrow.span == 24, "span commit clamps to 24 columns");
+
+        FormField status = FormField.New(59, 14);
+        status.kind = "StatusBar"; status.fname = "statusOne"; status.name = "statusOne";
+        status.dockSide = 1; status.position = 1; status.anchor = 9; status.fx = 12;
+        designer.fields.Add(status); designer.sel = status;
+        PropSpec statusPosition = PropSpec.Int("position", "Position").Default("1");
+        statusPosition.num = status.position;
+        specs = new List<PropSpec>(); specs.Add(statusPosition);
+        designer.propGrid.Bind("status-position", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(status.position == 0 && status.dockSide == 2 && status.anchor == 0 && status.fx == 0,
+            "StatusBar commit enforces bottom flow placement");
+        PropSpec statusDock = PropSpec.Enum("dock", "Dock", new List<string>{ "Bottom" }).Default("0");
+        statusDock.num = status.dockSide;
+        specs = new List<PropSpec>(); specs.Add(statusDock);
+        designer.propGrid.Bind("status-dock", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(status.dockSide == 2 && status.position == 0 && status.anchor == 0 && status.fx == 0,
+            "StatusBar dock commit stays bottom and flow anchored");
+        status.fh = 0;
+        specs = designer.FieldSpecs(status);
+        PropSpec statusHeight = Find(specs, "h");
+        Check(statusHeight != null && statusHeight.Read() == "0"
+            && status.fh == 0 && statusHeight.HasDefault(),
+            "StatusBar height default is projected without mutating the field");
+        designer.undoStack.Clear(); designer.pvDocDirty = false;
+        designer.propGrid.Bind("status-height", specs);
+        designer.propGrid.ResetToDefault(IndexOf(specs, "h"));
+        DrainDispatcher();
+        Check(status.fh == FormField.DefaultHFor(status.ftype), "StatusBar height reset commits its default height");
+        Check(designer.undoStack.Count > 0 && designer.pvDocDirty,
+            "StatusBar height reset retains undo and dirty tracking");
+
+        FormField tools = FormField.New(58, 15);
+        tools.kind = "ToolStrip"; tools.fname = "toolsOne"; tools.name = "toolsOne";
+        tools.dockSide = 1; tools.position = 1; tools.anchor = 8; tools.fx = 9;
+        designer.fields.Add(tools); designer.sel = tools;
+        PropSpec toolsPosition = PropSpec.Int("position", "Position").Default("1");
+        toolsPosition.num = tools.position;
+        specs = new List<PropSpec>(); specs.Add(toolsPosition);
+        designer.propGrid.Bind("tools-position", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(tools.position == 0 && tools.dockSide == 1 && tools.anchor == 0 && tools.fx == 0,
+            "ToolStrip commit enforces flow and top dock defaults");
+        int dockSelection = 1;
+        PropSpec toolsDock = PropSpec.Enum("dock", "Dock", new List<string>{ "Top", "Bottom" }).Default("1");
+        toolsDock.num = dockSelection;
+        specs = new List<PropSpec>(); specs.Add(toolsDock);
+        designer.propGrid.Bind("tools-dock", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(tools.dockSide == 2 && tools.position == 0 && tools.anchor == 0 && tools.fx == 0,
+            "ToolStrip dock commit supports bottom placement while retaining flow constraints");
+        tools.fh = 0;
+        specs = designer.FieldSpecs(tools);
+        PropSpec toolsHeight = Find(specs, "h");
+        Check(toolsHeight != null && toolsHeight.Read() == "0"
+            && tools.fh == 0 && toolsHeight.HasDefault(),
+            "ToolStrip height default is projected without mutating the field");
+        designer.undoStack.Clear(); designer.pvDocDirty = false;
+        designer.propGrid.Bind("tools-height", specs);
+        designer.propGrid.ResetToDefault(IndexOf(specs, "h"));
+        DrainDispatcher();
+        Check(tools.fh == FormField.DefaultHFor(tools.ftype), "ToolStrip height reset commits its default height");
+        Check(designer.undoStack.Count > 0 && designer.pvDocDirty,
+            "ToolStrip height reset retains undo and dirty tracking");
+
+        FormField tabs = FormField.New(36, 16);
+        tabs.kind = "Tabs"; tabs.fname = "tabsOne"; tabs.name = "tabsOne";
+        tabs.options.Clear(); tabs.options.Add("One"); tabs.options.Add("Two");
+        designer.sel = tabs;
+        specs = designer.FieldSpecs(tabs);
+        PropSpec declaredPage = Find(specs, "activePage");
+        Check(declaredPage != null && declaredPage.ValueKind() == 1,
+            "Tabs active page exposes a numeric uiState binding");
+        PropSpec activePageCommit = PropSpec.Int("activePage", "Active page").Default("9");
+        activePageCommit.num = tabs.uiState;
+        specs = new List<PropSpec>(); specs.Add(activePageCommit);
+        designer.propGrid.Bind("tabs-page-clamp", specs);
+        designer.propGrid.ResetToDefault(0);
+        DrainDispatcher();
+        Check(tabs.uiState.Get() == 1, "Tabs active page commit clamps to the last available page");
+
+        FormField table = FormField.New(23, 17);
+        table.kind = "DataGrid"; table.fname = "tableOne"; table.name = "tableOne";
+        table.extra = JsonValue.NewObject(); table.extra.Set("of", JsonValue.NewStr("OldRow"));
+        designer.sel = table; designer.ofEd = "OldRow";
+        specs = designer.FieldSpecs(table);
+        PropSpec entity = Find(specs, "of");
+        Check(entity != null, "DataGrid FieldSpecs includes the typed row entity property");
+        if (entity != null) {
+            entity.Default("NewRow");
+            designer.propGrid.Bind("table-entity", specs);
+            designer.propGrid.ResetToDefault(IndexOf(specs, "of"));
+            DrainDispatcher();
+        }
+        Check(table.extra.Str("of", "") == "NewRow", "DataGrid of commit persists in extra document data");
+        designer.ofEd = "NewRow";
+        specs = designer.FieldSpecs(table);
+        entity = Find(specs, "of");
+        if (entity != null) {
+            entity.Default("");
+            designer.propGrid.Bind("table-entity-empty", specs);
+            designer.propGrid.ResetToDefault(IndexOf(specs, "of"));
+            DrainDispatcher();
+        }
+        Check(table.extra == null || !table.extra.Has("of"), "empty of commit removes the optional document key");
+
+        FormField bound = FormField.New(0, 18);
+        bound.kind = "Input"; bound.fname = "boundOne"; bound.name = "boundOne";
+        designer.fields.Add(bound); designer.sel = bound;
+        specs = designer.FieldSpecs(bound);
+        PropSpec bindingPath = Find(specs, "bindingPath");
+        Check(bindingPath != null && Find(specs, "bindingProperty") != null,
+            "Inspector exposes canonical binding editor keys");
+        if (bindingPath != null) {
+            bindingPath.Default("user.name");
+            designer.propGrid.Bind("binding-path-add", specs);
+            designer.propGrid.ResetToDefault(IndexOf(specs, "bindingPath"));
+            DrainDispatcher();
+        }
+        Check(bound.BindingCount == 1 && bound.BindingAt(0).Path == "user.name"
+            && bound.BindingAt(0).Property == "" && bound.BindingAt(0).TwoWay,
+            "Inspector path commit creates a default two-way declaration");
+        specs = designer.FieldSpecs(bound);
+        PropSpec bindingProperty = Find(specs, "bindingProperty");
+        if (bindingProperty != null) {
+            bindingProperty.Default("placeholder");
+            designer.propGrid.Bind("binding-property-edit", specs);
+            designer.propGrid.ResetToDefault(IndexOf(specs, "bindingProperty"));
+            DrainDispatcher();
+        }
+        Check(bound.BindingCount == 1 && bound.BindingAt(0).Path == "user.name"
+            && bound.BindingAt(0).Property == "placeholder",
+            "Inspector property commit updates the same declaration");
+        specs = designer.FieldSpecs(bound);
+        bindingPath = Find(specs, "bindingPath");
+        if (bindingPath != null) {
+            bindingPath.Default("");
+            designer.propGrid.Bind("binding-path-clear", specs);
+            designer.propGrid.ResetToDefault(IndexOf(specs, "bindingPath"));
+            DrainDispatcher();
+        }
+        Check(bound.BindingCount == 0, "Inspector empty path removes only the edited declaration");
+        ReleaseDesigner(designer);
+        DrainDispatcher();
+    }
+
+    static void Main() {
+        TestAdapterBindings();
+        TestPropertyGridResetAndDefaultPresence();
+        TestInspectorCommitCallbacks();
+        if (fails == 0) { Console.WriteLine("DESIGNER_TYPED_PROPS_ADAPTER_OK"); }
+        else { Console.WriteLine("DESIGNER_TYPED_PROPS_ADAPTER_FAIL " + Convert.ToString(fails)); }
+    }
+}

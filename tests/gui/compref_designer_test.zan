@@ -5,6 +5,11 @@ using Gui;
 using Gui.Widget;
 using Gui.Designer;
 
+class CompRefClickProbe {
+    public int clicks;
+    public void OnClick(Control sender) { clicks = clicks + 1; }
+}
+
 class CompRefDesignerTest {
     static int fails;
 
@@ -20,18 +25,49 @@ class CompRefDesignerTest {
         Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
     }
 
+    static void TraceTree(Control root, string indent) {
+        Console.WriteLine(indent + root.Kind() + " #" + root.name);
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            TraceTree(root.ChildAt(i), indent + "  ");
+        }
+    }
+
     static string CompDoc() {
-        return "{\"name\":\"BadgeCard\",\"role\":\"control\","
-            + "\"winW\":260,\"winH\":120,\"layoutMode\":0,"
-            + "\"props\":[{\"key\":\"btnText\",\"label\":\"按钮文字\","
-            + "\"kind\":\"text\",\"target\":\"InnerBtn\",\"prop\":\"text\","
-            + "\"def\":\"Go\"}],"
-            + "\"fields\":["
-            + "{\"kind\":\"Label\",\"label\":\"inner title\",\"name\":\"InnerTitle\","
-            + "\"span\":24,\"fx\":16,\"fy\":12,\"fw\":200,\"fh\":24,\"options\":[]},"
-            + "{\"kind\":\"Button\",\"label\":\"Go\",\"name\":\"InnerBtn\","
-            + "\"span\":24,\"fx\":16,\"fy\":48,\"fw\":120,\"fh\":28,\"options\":[]}"
-            + "]}";
+        return "{\n"
+            + "  \"name\": \"BadgeCard\",\n"
+            + "  \"role\": \"control\",\n"
+            + "  \"winW\": 260,\n"
+            + "  \"winH\": 120,\n"
+            + "  \"layoutMode\": 0,\n"
+            + "  \"props\": [\n"
+            + "    {\n"
+            + "      \"key\": \"btnText\",\n"
+            + "      \"label\": \"按钮文字\",\n"
+            + "      \"kind\": \"text\",\n"
+            + "      \"target\": \"InnerBtn\",\n"
+            + "      \"prop\": \"text\",\n"
+            + "      \"def\": \"Go\"\n"
+            + "    }\n"
+            + "  ],\n"
+            + "  \"fields\": [\n"
+            + "    {\n"
+            + "      \"kind\": \"Label\",\n"
+            + "      \"label\": \"inner title\",\n"
+            + "      \"name\": \"InnerTitle\",\n"
+            + "      \"span\": 24,\n"
+            + "      \"options\": [],\n"
+            + "      \"style\": \"position:absolute;left:16px;top:12px;width:200px;height:24px\"\n"
+            + "    },\n"
+            + "    {\n"
+            + "      \"kind\": \"Button\",\n"
+            + "      \"label\": \"Go\",\n"
+            + "      \"name\": \"InnerBtn\",\n"
+            + "      \"span\": 24,\n"
+            + "      \"options\": [],\n"
+            + "      \"style\": \"position:absolute;left:16px;top:48px;width:120px;height:28px\"\n"
+            + "    }\n"
+            + "  ]\n"
+            + "}";
     }
 
     static void Main() {
@@ -75,10 +111,14 @@ class CompRefDesignerTest {
         Eq("ref survives round trip",
             fs2 == null ? "" : fs2.At(0).Str("ref", ""), "BadgeCard");
 
-        Control pv = d.PvCompCtl(null, d.fields[0], 260, 120);
+        App editor = App.CreateOffscreen("component preview host", 640, 480);
+        Ok("document preview prepared", d.PrepareDesignPreview(editor));
+        Control pv = d.pvDocRoot;
         Ok("preview built", pv != null);
         if (pv != null) {
-            Ok("preview label", pv.Find("inner title") != null);
+            Control title = pv.Find("InnerTitle");
+            if (title == null) { Console.WriteLine(d.SaveHtml()); TraceTree(pv, ""); }
+            Ok("preview label", title != null && title.GetProp("text") == "inner title");
             Ok("preview button", pv.Find("InnerBtn") != null);
             Control pb = pv.Find("InnerBtn");
             Eq("preview default prop", pb == null ? "" : pb.GetProp("text"), "Go");
@@ -90,7 +130,9 @@ class CompRefDesignerTest {
         Eq("decl default", d.compPropDecls.Count == 1 ? d.compPropDecls[0].def : "", "Go");
 
         d.SetCompPropValue(d.fields[0], "btnText", "HEY!");
-        Control pv2 = d.PvCompCtl(null, d.fields[0], 260, 120);
+        d.MarkDocDirty();
+        Ok("instance props preview prepared", d.PrepareDesignPreview(editor));
+        Control pv2 = d.pvDocRoot;
         Ok("preview rebuilt for new props", pv2 != null);
         if (pv2 != null) {
             Control pb2 = pv2.Find("InnerBtn");
@@ -104,14 +146,25 @@ class CompRefDesignerTest {
         Ok("reload clean with props", !d.loadError);
         Eq("props reload",
             d.CompPropValue(d.fields[0], "btnText", "<def>"), "HEY!");
-        Control pv3 = d.PvCompCtl(null, d.fields[0], 260, 120);
+        Ok("reloaded document preview prepared", d.PrepareDesignPreview(editor));
+        Control pv3 = d.pvDocRoot;
         if (pv3 != null) {
             Control pb3 = pv3.Find("InnerBtn");
             Eq("preview after reload", pb3 == null ? "" : pb3.GetProp("text"), "HEY!");
         } else { Ok("preview after reload built", false); }
 
-        d.fields[0].pvPreview = false;
-        d.fields[0].pvPreview = true;
+        Control liveButton = pv3 != null ? pv3.Find("InnerBtn") : null;
+        if (liveButton != null) {
+            CompRefClickProbe probe = new CompRefClickProbe();
+            liveButton.BindEventS("Click", probe.OnClick);
+            int x = liveButton.bx + liveButton.bw / 2;
+            int y = liveButton.by + liveButton.bh / 2;
+            d.pvDocForm.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+            d.pvDocForm.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+            d.RenderDesignPreview();
+            d.RenderDesignPreview();
+            Ok("component click routed once across snapshots", probe.clicks == 1);
+        } else { Ok("component click target exists", false); }
 
         d.UnpackUserComponent(d.fields[0]);
         Ok("unpack replaced the ref", !d.fields[0].compRef);
@@ -147,6 +200,39 @@ class CompRefDesignerTest {
         }
         Ok("unknown component is null",
             UserComponentRegistry.Build("Nope") == null);
+        Control code = ControlFactory.Create("BadgeCard");
+        Ok("registered component uses the shared factory", code != null && code.Find("InnerBtn") is Button);
+        if (code != null) {
+            code.SetProp("btnText", "Code value");
+            Control codeButton = code.Find("InnerBtn");
+            Eq("factory property uses shared setter", codeButton == null ? "" : codeButton.GetProp("text"), "Code value");
+            Eq("factory property reads the target", code.GetProp("btnText"), "Code value");
+        }
+        App markupApp = App.CreateOffscreen("component markup", 320, 200);
+        Control markup = Html.Load(markupApp, "<BadgeCard btnText=\"Markup value\"></BadgeCard>");
+        Ok("HTML component builds the same widget kind", markup != null && markup.Find("InnerBtn") is Button);
+        if (markup != null) {
+            Control markupButton = markup.Find("InnerBtn");
+            Eq("HTML instance property uses shared setter",
+                markupButton == null ? "" : markupButton.GetProp("text"), "Markup value");
+        }
+        markupApp.canvas.Destroy();
+        UserComponentRegistry.Register("BadgeCard", CompDoc().Replace("\"Go\"", "\"Reloaded\""));
+        Control reloaded = ControlFactory.Create("BadgeCard");
+        Control reloadedButton = reloaded == null ? null : reloaded.Find("InnerBtn");
+        Ok("factory resolves the current definition", reloadedButton != null
+            && reloadedButton.GetProp("text") == "Reloaded");
+        if (code != null) {
+            Eq("registry reload keeps existing instance values", code.GetProp("btnText"), "Code value");
+        }
+        UserComponentRegistry.SetAll(new List<UserComponent>());
+        Ok("removed component factory does not retain its definition", ControlFactory.Create("BadgeCard") == null);
+        UserComponentRegistry.Register("LoopCard", "<body><LoopCard></LoopCard></body>");
+        bool cycle = false;
+        try { UserComponentRegistry.Build("LoopCard"); }
+        catch (InvalidOperationException error) { cycle = true; }
+        Ok("circular component reference fails explicitly", cycle);
+        UserComponentRegistry.SetAll(comps);
         Ok("preview and registry agree",
             UserComponentRegistry.JsonOf("BadgeCard") == CompDoc());
 
@@ -172,6 +258,11 @@ class CompRefDesignerTest {
         d.rowEdField = "";
         Eq("cleared row joins empty", d.JoinRowOption(rowf), "");
 
+        d.DisposeDesignPreview();
+        d.propGrid.BeforeChange = null;
+        d.propGrid.Change.Clear();
+        editor.canvas.Destroy();
+        UserComponentRegistry.SetAll(new List<UserComponent>());
         if (fails == 0) { Console.WriteLine("COMPREF_DESIGNER_OK"); }
     }
 }

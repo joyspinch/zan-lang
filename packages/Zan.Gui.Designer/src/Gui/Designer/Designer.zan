@@ -9,7 +9,7 @@ using Gui.Markup;
 
 namespace Gui.Designer;
 
-partial class Designer {
+partial class Designer : UiViewOwner {
     // designer 界面文案跟随宿主 UI 语言，通过 T(en, zh) 读取。
     static string lang = "en";
 
@@ -58,8 +58,9 @@ partial class Designer {
     // 快速组件插入面板 (Quick Insert Spotlight HUD)
     bool quickInsertOpen;
     Input quickInsertInput;
-    int quickInsertX;
-    int quickInsertY;
+    LayerState quickInsertWin;
+    Flex quickInsertResults;
+    LayerState keymapHelpWin;
     int quickInsertDesX;
     int quickInsertDesY;
     int quickInsertSelIdx;
@@ -105,10 +106,16 @@ partial class Designer {
 		    ContextMenu canvasMenuCtl;
 		    bool canvasMenuArm;
 		    FormField canvasMenuHit; // 右键命中的组件（null 表示画板空白处）
-		    FormField canvasLastClickField; // 画布单击命中的组件（用于精准双击打开代码，防单次点击误跳）
-		    int canvasLastClickMs;          // 画布单击时间戳 (毫秒)
-		    int canvasLastClickX;           // 画布单击屏幕 X (用于位移阈值判断，防手抖拖拽误触发)
-		    int canvasLastClickY;           // 画布单击屏幕 Y
+    DesignerCanvasInput canvasInput;
+    ControlInputHost canvasInputHost;
+    DesignerSurface designerSurface;
+    ControlInputHost designerSurfaceHost;
+    List<DesignerCommandAction> designerActions;
+    int designerControlSeen;
+    UiViewScope canvasView;
+    Rect canvasHostRect;
+    bool canvasInputDispatch;
+    bool canvasClickBlocked;
 	    int freeGuideX;      // 纵向智能参考线的设计空间 x 坐标（-1 = 无）
     int freeGuideY;      // 横向智能参考线的设计空间 y 坐标（-1 = 无）
     FormField hoverField; // 指针悬停命中的可视字段（hover 描边高亮）
@@ -143,8 +150,8 @@ partial class Designer {
     // 整份设计 JSON 快照（最多 60 份）：任何修改前压栈，
     // 撤销时把当前快照压回重做栈再载入栈顶。和场景设计器
     // 同一套模型——SaveJson/LoadJson 就是文档的完整往返。
-    List<string> undoStack;
-    List<string> redoStack;
+    List<DesignerDocumentSnapshot> undoStack;
+    List<DesignerDocumentSnapshot> redoStack;
     List<string> undoActionStack;
     List<string> redoActionStack;
     string pendingUndoAction;
@@ -163,22 +170,8 @@ partial class Designer {
     // 圆形显示（智能手表）：设计器在自由画布上叠加圆形可视
     // 区域。以 `winRound` 保存在设计 JSON 中。
     bool winRound;
-    // 预览缩放（千分比，参见 PvS/PvFont）；1000 = 1:1（流式模式）。
-    int pvScale;
-    // 本帧画出的页签矩形（渲染时填，指针处理时读）。
+    // 编辑态页签选择区域来自实际控件树的布局结果。
     List<TabHeaderHit> tabHits;
-    // 真实控件预览的等比缩放：渲染真控件（输入/表格/图表等）时
-    // 临时把 app.dpiScale 和主题度量按视图缩放放大/缩小，让它们
-    // 的字号、内边距随画布一起等比缩放，渲染完精确还原。
-    // czBase 是被缩放前的主题度量快照，czDpi 是原 dpiScale。
-    ThemeMetricsSnapshot czSnapshot; // 强类型度量快照（主表示）
-    List<int> czBase;                // 兼容视图（24 项整数列表）
-    int czDpi;
-    // 进入缩放前的 app.metricsScale（退出时原值还原）。
-    int czScale;
-    // 嵌套深度：预览整体已经夹在一层缩放里时，里层的 PvCtrl /
-    // 图表等再夹一次只能是空操作，否则度量会被重复缩放。
-    int czDepth;
 
     // 缩放下拉菜单（50%–200% 档位）：点功能区缩放按钮弹出，
     // 在叠层顶部绘制。zoomMenuArm 跳过打开当帧的那次点击，
@@ -328,10 +321,7 @@ partial class Designer {
     List<UserComponent> userComps;
     bool saveCompRequested;
 
-    // 引用节点画布预览的构建缓存：key = 代次|组件名|宽x高。
-    // 组件文档只在加载/保存时变（SetUserComponents 递增代次），
-    // 尺寸变化才重建 FormBuilder 树，其余帧只重渲染。
-    List<PreviewControlCache> pvCompCache;
+    // 组件目录变化使统一的文档运行树缓存失效。
     int pvCompGen;
     JsonValue docSource;
     string pvDocKey;
@@ -511,6 +501,7 @@ partial class Designer {
     // 属性面板重命名控件事件：供宿主 IDE 同步更新对应 code-behind 源码中的变量引用。
     string renamedOldField;
     string renamedNewField;
+    string inspectorNameBefore;
 
     // 切换被设计窗口的布局模型。宿主在打开一份设计时
     // 调用（设计文档里存了 layoutMode），设计器自己不提供
@@ -542,7 +533,12 @@ partial class Designer {
         return Lang.Tr(en, zh);
     }
 
+    public Control RootControl() { return designerSurface; }
+
     Designer() {
+        this.designerSurface = new DesignerSurface(this);
+        this.designerSurfaceHost = new ControlInputHost(designerSurface);
+        this.designerActions = new List<DesignerCommandAction>();
         this.fields = new List<FormField>();
         this.sel = null;
         this.selPrev = null;
@@ -562,10 +558,6 @@ partial class Designer {
         this.zoomMenuX = 0;
         this.zoomMenuY = 0;
         this.zoomMenuArm = false;
-        this.czBase = null;
-        this.czDpi = 0;
-        this.czScale = 1000;
-        this.czDepth = 0;
         this.freeDragging = false;
         this.freeResizing = false;
         this.freeResizeH = 4;
@@ -579,10 +571,6 @@ partial class Designer {
 	        this.canvasMenuY = 0;
 		        this.canvasMenuArm = false;
 		        this.canvasMenuHit = null;
-		        this.canvasLastClickField = null;
-		        this.canvasLastClickMs = 0;
-		        this.canvasLastClickX = 0;
-		        this.canvasLastClickY = 0;
 	        this.freeGuideX = 0 - 1;
         this.freeGuideY = 0 - 1;
         this.hoverField = null;
@@ -610,12 +598,16 @@ partial class Designer {
         this.outlineSyncing = false;
         this.quickInsertOpen = false;
         this.quickInsertInput = new Input();
+        DesignerCommandAction quickFilter = this.EnsureDesignerAction("quick.filter", 0);
+        DesignerCommandAction quickKeys = this.EnsureDesignerAction("quick.input", 0);
+        this.quickInsertInput.Change.Add(quickFilter.Run);
+        this.quickInsertInput.OnRouted(quickKeys.Pointer);
         this.quickInsertMatches = new List<int>();
         this.quickInsertLastQ = "";
         this.quickInsertSelIdx = 0;
         this.keymapHelpOpen = false;
-        this.undoStack = new List<string>();
-        this.redoStack = new List<string>();
+        this.undoStack = new List<DesignerDocumentSnapshot>();
+        this.redoStack = new List<DesignerDocumentSnapshot>();
         this.undoActionStack = new List<string>();
         this.redoActionStack = new List<string>();
         this.pendingUndoAction = "";
@@ -629,7 +621,6 @@ partial class Designer {
         this.freePanOX = 0;
         this.freePanOY = 0;
         this.winRound = false;
-        this.pvScale = 1000;
         this.tabHits = new List<TabHeaderHit>();
         this.labelPos = 0;
         this.formSize = 1;
@@ -662,6 +653,9 @@ partial class Designer {
             if (self == null) { return; }
             if (self.sel != null) {
                 self.GateInspectorUndo("pg|" + self.sel.fname + "|" + propKey);
+                if (propKey == "name") { self.inspectorNameBefore = self.sel.fname; }
+            } else {
+                self.GateInspectorUndo("win|" + propKey);
             }
         });
         this.propGrid.OnChange(() => {
@@ -669,38 +663,101 @@ partial class Designer {
             if (self == null) { return; }
             if (self.sel != null) {
                 string chKey = self.propGrid.ChangedKey();
-                if (chKey == "position") {
-                    if (self.sel.position == 1) {
+                bool isToolStrip = self.sel.ftype == 58 || self.sel.kind == "ToolStrip";
+                bool isStatusBar = self.sel.ftype == 59 || self.sel.kind == "StatusBar";
+                if (chKey == "name") {
+                    string oldName = self.inspectorNameBefore;
+                    string nextName = StyleSheet.Trim(self.sel.fname);
+                    self.inspectorNameBefore = "";
+                    if (nextName == "" || self.UsedFieldName(self.sel, nextName)) {
+                        self.sel.fname = oldName;
+                        self.sel.name = oldName;
+                        self.propGrid.Bind("fld" + Convert.ToString(self.inspKeySeq), self.FieldSpecs(self.sel));
+                        self.msg = Designer.T("A control with that name already exists.", "已有控件使用了该名称。");
+                    } else if (nextName != oldName) {
+                        self.renamedOldField = oldName;
+                        self.renamedNewField = nextName;
+                        self.sel.fname = nextName;
+                        self.sel.name = nextName;
+                        self.msg = Designer.T("Renamed variable: ", "已重命名变量: ") + nextName;
+                    }
+                } else if (chKey == "position") {
+                    if (isToolStrip || isStatusBar) {
+                        self.sel.position = 0;
+                        self.sel.anchor = 0;
+                        self.sel.fx = 0;
+                        if (isStatusBar) { self.sel.dockSide = 2; }
+                        else if (self.sel.dockSide != 2) { self.sel.dockSide = 1; }
+                    } else if (self.sel.position == 1) {
                         self.sel.dockSide = 0;
                         if (self.sel.fw <= 0) { self.sel.fw = self.sel.LayoutW() > 0 ? self.sel.LayoutW() : 120; }
                         if (self.sel.fh <= 0) { self.sel.fh = FormField.DefaultHFor(self.sel.ftype); }
-                    } else if (self.sel.position == 0) {
-                        if (self.sel.dockSide == 0 && self.layoutMode == 1) {
-                            self.sel.dockSide = 1;
-                        }
+                    } else if (self.sel.position == 0 && self.sel.dockSide == 0 && self.layoutMode == 1) {
+                        self.sel.dockSide = 1;
                     }
                 } else if (chKey == "dock") {
-                    if (self.sel.ftype == 58 || self.sel.kind == "ToolStrip") {
+                    if (isToolStrip) {
                         int idx = self.propGrid.GetInt("dock", 0);
                         self.sel.dockSide = (idx == 1) ? 2 : 1;
                         self.sel.position = 0;
-                    } else if (self.sel.ftype == 59 || self.sel.kind == "StatusBar") {
+                        self.sel.anchor = 0;
+                        self.sel.fx = 0;
+                    } else if (isStatusBar) {
                         self.sel.dockSide = 2;
                         self.sel.position = 0;
+                        self.sel.anchor = 0;
+                        self.sel.fx = 0;
                     } else {
-                        if (self.sel.dockSide > 0) {
-                            self.sel.position = 0;
-                        } else {
-                            if (self.layoutMode == 1) {
-                                self.sel.position = 1;
-                            }
-                        }
+                        if (self.sel.dockSide > 0) { self.sel.position = 0; }
+                        else if (self.layoutMode == 1) { self.sel.position = 1; }
                     }
-                    self.ApplyResizeToFields(self.fields, self.winW, self.winH, 0, 0);
+                } else if (chKey == "h") {
+                    if (isStatusBar || isToolStrip) {
+                        if (self.sel.fh <= 0) { self.sel.fh = FormField.DefaultHFor(self.sel.ftype); }
+                        self.sel.dockSide = isStatusBar ? 2 : (self.sel.dockSide == 2 ? 2 : 1);
+                        self.sel.position = 0;
+                        self.sel.anchor = 0;
+                        self.sel.fx = 0;
+                    }
+                } else if (chKey == "span") {
+                    int span = self.propGrid.GetInt("span", self.sel.span);
+                    if (span < 1) { span = 1; }
+                    if (span > 24) { span = 24; }
+                    self.sel.span = span;
+                } else if (chKey == "activePage" && self.sel.kind == "Tabs") {
+                    int pages = self.sel.OptionCount();
+                    if (pages < 1) { pages = 1; }
+                    int page = self.propGrid.GetInt("activePage", 0);
+                    if (page < 0) { page = 0; }
+                    if (page >= pages) { page = pages - 1; }
+                    self.sel.uiState.Set(page);
+                } else if (chKey == "of" && (self.sel.ftype == 23 || self.sel.ftype == 41)) {
+                    string entity = StyleSheet.Trim(self.propGrid.Value("of"));
+                    if (entity == "") {
+                        if (self.sel.extra != null) {
+                            self.sel.extra.Remove("of");
+                            if (self.sel.extra.Count() == 0) { self.sel.extra = null; }
+                        }
+                    } else {
+                        if (self.sel.extra == null) { self.sel.extra = JsonValue.NewObject(); }
+                        self.sel.extra.Set("of", JsonValue.NewStr(entity));
+                    }
+                    self.ofEd = entity;
+                } else if (chKey == "bindingPath" || chKey == "bindingProperty") {
+                    string path = StyleSheet.Trim(self.propGrid.Value("bindingPath"));
+                    string property = StyleSheet.Trim(self.propGrid.Value("bindingProperty"));
+                    if (path == "") {
+                        if (self.sel.BindingCount > 0) { self.sel.RemoveBindingAt(0); }
+                    } else if (self.sel.BindingCount == 0) {
+                        if (property == "") { self.sel.BindPath(path); }
+                        else { self.sel.BindPath(path, property); }
+                    } else {
+                        self.sel.SetBindingPath(0, path);
+                        self.sel.SetBindingProperty(0, property);
+                    }
                 } else if (chKey == "flexWrap") {
                     self.sel.flexWrap = self.propGrid.Value("flexWrap") == "true";
-                } else if (chKey == "w" || chKey == "h") {
-                    self.ApplyResizeToFields(self.fields, self.winW, self.winH, 0, 0);
+                } else if (chKey == "w") {
                 }
                 self.DesignDeclareRect(self.sel);
                 if (self.freeExtra != null && self.freeExtra.Count > 0) {
@@ -712,6 +769,12 @@ partial class Designer {
                     int nw = self.propGrid.GetInt("width", self.winW);
                     int nh = self.propGrid.GetInt("height", self.winH);
                     self.ApplyDesignSize(nw, nh);
+                } else if (chKey == "device") {
+                    DeviceProfile selected = DeviceProfile.At(self.propGrid.GetInt("device", self.devSelIdx));
+                    self.ApplyDevice(selected);
+                } else if (chKey == "orient") {
+                    self.devOrient = self.propGrid.GetInt("orient", self.devOrient);
+                    self.ApplyDevice(DeviceProfile.ById(self.device));
                 } else if (chKey == "title") {
                     if (self.winTitleInput != null) {
                         self.winTitleInput.SetText(self.winTitle);
@@ -738,7 +801,7 @@ partial class Designer {
         this.inlineRenameInput = new Input(Designer.T("Rename", "重命名"));
         this.winTitle = Designer.T("Main Window", "主窗口");
         this.winTitleInput = new Input(Designer.T("window title", "窗口标题"));
-        this.winTitleInput.data = this.winTitle;
+        this.winTitleInput.Text = this.winTitle;
         this.pvDocDirty = true;
         this.winW = 480;
         this.winH = 360;
@@ -782,7 +845,6 @@ partial class Designer {
         this.jsonOpen = false;
         this.userComps = new List<UserComponent>();
         this.saveCompRequested = false;
-        this.pvCompCache = new List<PreviewControlCache>();
         this.pvCompGen = 0;
         this.compPropFor = "";
         this.compPropDecls = new List<CompPropDecl>();

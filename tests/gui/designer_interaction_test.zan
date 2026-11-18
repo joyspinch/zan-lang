@@ -11,7 +11,7 @@ class DesignerInteractionEvents {
     int ups;
     int clicks;
     int wheels;
-    Control clickSender;
+    weak Control clickSender;
 
     void Bind(Control control) {
         control.BindEventS("Enter", (Control sender) => { enters = enters + 1; });
@@ -67,17 +67,17 @@ class DesignerInteractionHostState {
 
     void Check(App host) {
         DesignerInteractionTest.Check("host event kind/sequence preserved",
-            host.EventKind() == kind && host.window.EventSeq() == sequence
-            && Window.EventSeqGlobal() == globalSequence);
+        host.EventKind() == kind && host.window.EventSeq() == sequence
+        && Window.EventSeqGlobal() == globalSequence);
         DesignerInteractionTest.Check("host event payload preserved",
-            host.window.EventX() == x && host.window.EventY() == y
-            && host.window.EventButton() == button && host.window.EventKeyCode() == key
-            && host.window.EventMods() == mods && host.window.EventFlag() == flag);
+        host.window.EventX() == x && host.window.EventY() == y
+        && host.window.EventButton() == button && host.window.EventKeyCode() == key
+        && host.window.EventMods() == mods && host.window.EventFlag() == flag);
         DesignerInteractionTest.Check("host pointer/focus preserved",
-            host.mouseX == mouseX && host.mouseY == mouseY && host.pointerDown == pointerDown
-            && host.focus.pressedId == pressed && host.focus.hoveredId == hovered
-            && host.focus.focusedId == focused && host.pressTargetId == pressTarget
-            && host.clickTargetId == clickTarget);
+        host.mouseX == mouseX && host.mouseY == mouseY && host.pointerDown == pointerDown
+        && host.focus.pressedId == pressed && host.focus.hoveredId == hovered
+        && host.focus.focusedId == focused && host.pressTargetId == pressTarget
+        && host.clickTargetId == clickTarget);
     }
 }
 
@@ -95,11 +95,15 @@ class DesignerInteractionHarness {
         designer.snapGrid = false;
         designer.showGrid = false;
         designer.showGuides = false;
+        designer.hostPanels = true;
         host = App.CreateOffscreen("designer interaction host", 1120, 850);
         DesignerInteractionTest.Freeze(host);
         DesignerInteractionTest.Check("offscreen prepare", designer.PrepareDesignPreview(host));
         DesignerInteractionTest.Freeze(this.Target());
-        this.Neutral();
+        designer.PrepareCanvasInput(host, new Rect(0, 0, 1120, 850));
+        DesignerInteractionTest.Check("canvas prepares before first input", designer.canvasInput.ready
+        && designer.canvasInput.ChildCount() == 0);
+        this.UpdateView();
     }
 
     App Target() { return designer.pvDocForm.GetApp(); }
@@ -130,20 +134,22 @@ class DesignerInteractionHarness {
 
     void Input(int kind, int x, int y, int button, int key, int mods, int flag) {
         host.BeginOffscreenFrame();
+        // IDE 宿主（ZanIDE.EditorFormat.PrepareView）每帧重挂画布输入：
+        // 快照安装（Undo/LoadJson）会 SuspendCanvasInput，只有下一帧的
+        // Prepare 才重新武装；harness 必须镜像同一帧序（prepare→input→paint）。
+        designer.PrepareCanvasInput(host, new Rect(0, 0, 1120, 850));
         host.ProcessOffscreenInput(kind, x, y, button, key, mods, flag);
-        designer.RenderDesignCanvas(host, host.canvas, host.theme, 16, 16, 1040, 760);
+        Rect region = designer.CanvasRegion(host, new Rect(0, 0, 1120, 850));
+        designer.RenderDesignCanvas(host, host.canvas, host.theme,
+        region.x, region.y, region.width, region.height);
         host.EndOffscreenFrame();
-        if (host.ReplayOffscreenWheel()) {
-            host.BeginOffscreenFrame();
-            designer.RenderDesignCanvas(host, host.canvas, host.theme, 16, 16, 1040, 760);
-            host.EndOffscreenFrame();
-        }
-        psMilli = designer.lastFitPct * designer.DesignDpi() / 100;
-        Canvas source = this.Target().canvas;
-        int viewW = designer.DesignViewPx(source.Width(), psMilli);
-        int viewH = designer.DesignViewPx(source.Height(), psMilli);
-        ox = 16 + host.Scale(12) + (1040 - host.Scale(24) - viewW) / 2 - designer.freePanX;
-        oy = 16 + host.Scale(10) + (760 - host.Scale(20) - viewH) / 2 - designer.freePanY;
+        this.UpdateView();
+    }
+
+    void UpdateView() {
+        psMilli = designer.canvasInput.ps;
+        ox = designer.canvasInput.ox;
+        oy = designer.canvasInput.oy;
     }
 
     void Neutral() { this.Input(0, host.mouseX, host.mouseY, 0, 0, 0, 0); }
@@ -158,7 +164,7 @@ class DesignerInteractionHarness {
         this.Input(3, 1, 1, 0, 0, 4, 0);
         this.Neutral();
         DesignerInteractionTest.Check("release clears editing gesture",
-            !designer.freeDragging && !designer.freeResizing && designer.designMoves == null);
+        !designer.freeDragging && !designer.freeResizing && designer.designMoves == null);
     }
 
     TabHeaderHit Header(string name, int page) {
@@ -181,7 +187,7 @@ class DesignerInteractionHarness {
     }
 
     void Forward(int kind, int x, int y, int button, int key, int mods, int flag,
-            bool inside, bool replay) {
+    bool inside, bool replay) {
         host.BeginOffscreenFrame();
         host.ProcessOffscreenInput(kind, 53, 67, button, key, mods, flag);
         DesignerInteractionHostState saved = new DesignerInteractionHostState(host);
@@ -241,31 +247,34 @@ class DesignerInteractionTest {
 
     static string Html() {
         return "<!DOCTYPE html><html><head><title>Interaction</title></head>"
-            + "<body data-zan-design id=\"Interaction\" data-win-w=\"880\" data-win-h=\"640\" data-layout-mode=\"1\" data-form-size=\"0\" style=\"margin:0;padding:0\">"
-            + "<section id=\"Native\" data-kind=\"Element\" style=\"width:320px;height:220px;padding:16px;margin:0;box-sizing:border-box\">"
-            + "<div id=\"Nested\" data-kind=\"Element\" style=\"width:260px;height:140px;padding:12px;margin:0;box-sizing:border-box\">"
-            + "<button id=\"Natural\" data-on-click=\"Apply\" style=\"width:144px;height:48px;padding:4px;border:2px solid #405060;margin:0;box-sizing:border-box\">Apply</button>"
-            + "</div></section>"
-            + "<zan-tabs id=\"Tabs\" data-options=\"First|Second\" data-active-tab=\"0\" data-position=\"1\" data-fx=\"360\" data-fy=\"16\" data-fw=\"400\" data-fh=\"220\">"
-            + "<button id=\"TabFirst\" data-child-tab=\"0\" data-position=\"1\" data-fx=\"12\" data-fy=\"14\" data-fw=\"100\" data-fh=\"34\">First</button>"
-            + "<button id=\"TabSecond\" data-child-tab=\"1\" data-position=\"1\" data-fx=\"12\" data-fy=\"14\" data-fw=\"100\" data-fh=\"34\">Second</button></zan-tabs>"
-            + "<zan-split-panel id=\"Split\" data-options=\"vertical|180\" data-position=\"1\" data-fx=\"360\" data-fy=\"280\" data-fw=\"400\" data-fh=\"220\">"
-            + "<button id=\"SplitFirst\" data-child-tab=\"0\" data-position=\"1\" data-fx=\"16\" data-fy=\"18\" data-fw=\"100\" data-fh=\"34\">Left</button>"
-            + "<button id=\"SplitSecond\" data-child-tab=\"1\" data-position=\"1\" data-fx=\"16\" data-fy=\"18\" data-fw=\"100\" data-fh=\"34\">Right</button></zan-split-panel>"
-            + "<button id=\"Loose\" data-position=\"1\" data-fx=\"20\" data-fy=\"350\" data-fw=\"100\" data-fh=\"40\">Loose</button></body></html>";
+        + "<body data-zan-design id=\"Interaction\" data-win-w=\"880\" data-win-h=\"640\" data-layout-mode=\"1\" data-form-size=\"0\" style=\"margin:0;padding:0\">"
+        + "<section id=\"Native\" style=\"width:320px;height:220px;padding:16px;margin:0;box-sizing:border-box\">"
+        + "<section id=\"Nested\" style=\"width:260px;height:140px;padding:12px;margin:0;box-sizing:border-box\">"
+        + "<button id=\"Natural\" data-on-click=\"Apply\" style=\"width:144px;height:48px;padding:4px;border:2px solid #405060;margin:0;box-sizing:border-box\">Apply</button>"
+        + "</section></section>"
+        + "<zan-tabs id=\"Tabs\" data-options=\"First|Second\" data-active-tab=\"0\" data-position=\"1\" style=\"position:absolute;left:360px;top:16px;width:400px;height:220px\">"
+        + "<button id=\"TabFirst\" data-child-tab=\"0\" data-position=\"1\" style=\"position:absolute;left:12px;top:14px;width:100px;height:34px\">First</button>"
+        + "<button id=\"TabSecond\" data-child-tab=\"1\" data-position=\"1\" style=\"position:absolute;left:12px;top:14px;width:100px;height:34px\">Second</button>"
+        + "</zan-tabs>"
+        + "<zan-split-panel id=\"Split\" data-options=\"vertical|180\" data-position=\"1\" style=\"position:absolute;left:360px;top:280px;width:400px;height:220px\">"
+        + "<button id=\"SplitFirst\" data-child-tab=\"0\" data-position=\"1\" style=\"position:absolute;left:16px;top:18px;width:100px;height:34px\">Left</button>"
+        + "<button id=\"SplitSecond\" data-child-tab=\"1\" data-position=\"1\" style=\"position:absolute;left:16px;top:18px;width:100px;height:34px\">Right</button>"
+        + "</zan-split-panel><button id=\"Loose\" data-position=\"1\" style=\"position:absolute;left:20px;top:350px;width:100px;height:40px\">Loose</button>"
+        + "</body></html>";
     }
 
     static string WrappedHtml() {
         return "<!DOCTYPE html><html><body data-zan-design id=\"Wrapped\" data-win-w=\"880\" data-win-h=\"640\" data-layout-mode=\"0\" data-form-size=\"0\">"
-            + "<zan-tabs id=\"WrappedTabs\" data-options=\"First|Second\" data-active-tab=\"1\" data-position=\"1\" data-fx=\"20\" data-fy=\"20\" data-fw=\"640\" data-fh=\"220\">"
-            + "<input id=\"HiddenCaption\" data-label=\"Hidden\" data-child-tab=\"0\" data-span=\"12\" data-fh=\"36\">"
-            + "<label id=\"TabSpacer\" data-child-tab=\"1\" data-span=\"24\" data-fh=\"24\">Before</label>"
-            + "<input id=\"TabCaption\" data-label=\"Caption\" data-child-tab=\"1\" data-span=\"12\" data-fh=\"36\" style=\"width:168px;height:30px;padding:4px;border:2px solid #405060\"></zan-tabs>"
-            + "<zan-split-panel id=\"WrappedSplit\" data-options=\"vertical|300\" data-position=\"1\" data-fx=\"20\" data-fy=\"300\" data-fw=\"640\" data-fh=\"220\">"
-            + "<label id=\"LeftSpacer\" data-child-tab=\"0\" data-span=\"24\" data-fh=\"24\">Before</label>"
-            + "<input id=\"LeftCaption\" data-label=\"Left\" data-child-tab=\"0\" data-span=\"12\" data-fh=\"36\">"
-            + "<label id=\"RightSpacer\" data-child-tab=\"1\" data-span=\"24\" data-fh=\"24\">Before</label>"
-            + "<input id=\"RightCaption\" data-label=\"Right\" data-child-tab=\"1\" data-span=\"12\" data-fh=\"36\"></zan-split-panel></body></html>";
+        + "<zan-tabs id=\"WrappedTabs\" data-options=\"First|Second\" data-active-tab=\"1\" data-position=\"1\" style=\"position:absolute;left:20px;top:20px;width:640px;height:220px\">"
+        + "<input id=\"HiddenCaption\" data-label=\"Hidden\" data-child-tab=\"0\" data-span=\"12\" style=\"height:36px\">"
+        + "<label id=\"TabSpacer\" data-child-tab=\"1\" data-span=\"24\" style=\"height:24px\">Before</label>"
+        + "<input id=\"TabCaption\" data-label=\"Caption\" data-child-tab=\"1\" data-span=\"12\" style=\"height:36px;width:168px;height:30px;padding:4px;border:2px solid #405060\">"
+        + "</zan-tabs>"
+        + "<zan-split-panel id=\"WrappedSplit\" data-options=\"vertical|300\" data-position=\"1\" style=\"position:absolute;left:20px;top:300px;width:640px;height:220px\">"
+        + "<label id=\"LeftSpacer\" data-child-tab=\"0\" data-span=\"24\" style=\"height:24px\">Before</label>"
+        + "<input id=\"LeftCaption\" data-label=\"Left\" data-child-tab=\"0\" data-span=\"12\" style=\"height:36px\">"
+        + "<label id=\"RightSpacer\" data-child-tab=\"1\" data-span=\"24\" style=\"height:24px\">Before</label>"
+        + "<input id=\"RightCaption\" data-label=\"Right\" data-child-tab=\"1\" data-span=\"12\" style=\"height:36px\"></zan-split-panel></body></html>";
     }
 
     static void NaturalPickAndDrag() {
@@ -278,40 +287,42 @@ class DesignerInteractionTest {
         Control nestedControl = h.Node("Nested");
         Rect before = h.Bounds("Natural");
         DesignerInteractionTest.Check("natural HTML native elements",
-            nativeControl is Element && nestedControl is Element
-            && !native.IsContainer() && !nested.IsContainer());
+        nativeControl is Element && nestedControl is Element
+        && !native.IsContainer() && !nested.IsContainer());
         DesignerInteractionTest.Check("natural retained parent chain",
-            nestedControl.parent == nativeControl && h.Node("Natural").parent == nestedControl);
+        nestedControl.parent == nativeControl && h.Node("Natural").parent == nestedControl);
         DesignerInteractionTest.Check("native recursive ownership",
-            d.DesignOwnerOf(child) == nested && d.DesignOwnerOf(nested) == native
-            && d.IsAncestorOf(native, child) && d.DesignInSubtree(native, child)
-            && d.DesignCanContain(native) && d.DesignCanContain(nested));
+        d.DesignOwnerOf(child) == nested && d.DesignOwnerOf(nested) == native
+        && d.IsAncestorOf(native, child) && d.DesignInSubtree(native, child)
+        && d.DesignCanContain(native) && d.DesignCanContain(nested));
         int x = before.x + before.width / 2;
         int y = before.y + before.height / 2;
         DesignerInteractionTest.Check("deepest natural HTML pick", d.DesignPickDevice(x, y) == child);
         DesignerInteractionTest.Check("native parent padding pick",
-            d.DesignPickDevice(nativeControl.bx + nativeControl.bw - 5, nativeControl.by + 10) == native);
+        d.DesignPickDevice(nativeControl.bx + nativeControl.bw - 5, nativeControl.by + 10) == native);
         DesignerInteractionTest.Check("nested parent padding pick",
-            d.DesignPickDevice(nestedControl.bx + nestedControl.bw - 5, nestedControl.by + 5) == nested);
+        d.DesignPickDevice(nestedControl.bx + nestedControl.bw - 5, nestedControl.by + 5) == nested);
         List<FormField> got = new List<FormField>();
         d.MarqueeCollect(d.fields, before.x, before.y, before.x + before.width, before.y + before.height, got);
         DesignerInteractionTest.Check("native marquee traverses descendants",
-            DesignerInteractionTest.Contains(got, native) && DesignerInteractionTest.Contains(got, nested)
-            && DesignerInteractionTest.Contains(got, child) && d.HasAncestorIn(child, got));
+        DesignerInteractionTest.Contains(got, native) && DesignerInteractionTest.Contains(got, nested)
+        && DesignerInteractionTest.Contains(got, child) && d.HasAncestorIn(child, got));
         Control originalTree = d.pvDocRoot;
         d.winZoom = 750;
         h.Neutral();
         DesignerInteractionTest.Check("zoom preserves document tree", d.pvDocRoot == originalTree);
         DesignerInteractionTest.Check("scaled view pick",
-            d.DesignPickView(h.ViewX(x), h.ViewY(y), h.ox, h.oy, h.psMilli) == child);
+        d.DesignPickView(h.ViewX(x), h.ViewY(y), h.ox, h.oy, h.psMilli) == child);
         DesignerInteractionTest.SameRect("zoom preserves geometry", h.Bounds("Natural"),
-            before.x, before.y, before.width, before.height);
+        before.x, before.y, before.width, before.height);
         d.winZoom = 1000;
         h.Neutral();
         string document = d.SaveJson();
         h.Pointer(2, x, y);
-        DesignerInteractionTest.Check("click arms drag without converting", d.sel == child
-            && d.freeDragging && !d.freeDragHasMoved && child.position == 0 && child.fw == 0 && child.fh == 0);
+        DesignerInteractionTest.Check("click selects actual control", d.sel == child);
+        DesignerInteractionTest.Check("click arms drag", d.freeDragging && !d.freeDragHasMoved);
+        DesignerInteractionTest.Check("click preserves CSS flow", child.position == 0);
+        DesignerInteractionTest.Check("click preserves document", d.SaveJson() == document);
         h.Pointer(1, x + 2, y + 1);
         DesignerInteractionTest.Check("subthreshold drag preserves document", d.SaveJson() == document && !d.freeDragHasMoved);
         h.Pointer(3, x + 2, y + 1);
@@ -319,23 +330,30 @@ class DesignerInteractionTest {
         DesignerInteractionTest.Check("click release preserves document", d.SaveJson() == document);
         h.Pointer(2, x, y);
         h.Pointer(1, x + 23, y + 17);
+        StyleBox declared = new StyleBox();
+        Css.Parse(".field {" + child.designSource.Str("style", "") + "}")
+        .ApplyBox(declared, ".field");
         DesignerInteractionTest.Check("first real move declares Float", child.position == 1
-            && child.anchor == 0 && child.dockSide == 0 && child.flexGrow == 0
-            && child.fw == before.width && child.fh == before.height
-            && child.designSource.Has("fx") && child.designSource.Has("fy")
-            && child.designSource.Has("fw") && child.designSource.Has("fh"));
+        && child.anchor == 0 && child.dockSide == 0 && child.flexGrow == 0
+        && child.fw == before.width && child.fh == before.height
+        && declared.position == 2 && declared.posL == child.fx && declared.posT == child.fy
+        && declared.width == child.fw && declared.height == child.fh);
         h.Neutral();
+        DesignerInteractionTest.Check("float offsets match runtime positioned origin",
+        child.fx == d.DesignLogical(before.x + 23 - h.Node("Nested").bx)
+        && child.fy == d.DesignLogical(before.y + 17 - h.Node("Nested").by)
+        && h.Node("Natural").StylePosition() == 2);
         DesignerInteractionTest.SameRect("first flow-to-float drag", h.Bounds("Natural"),
-            before.x + 23, before.y + 17, before.width, before.height);
+        before.x + 23, before.y + 17, before.width, before.height);
         DesignerInteractionTest.Check("float authored parent", h.Node("Natural").parent == h.Node("Nested"));
         h.Pointer(1, x + 35, y + 26);
         h.Neutral();
         DesignerInteractionTest.SameRect("second drag uses original world snapshot", h.Bounds("Natural"),
-            before.x + 35, before.y + 26, before.width, before.height);
+        before.x + 35, before.y + 26, before.width, before.height);
         h.Pointer(3, x + 35, y + 26);
         h.Neutral();
         DesignerInteractionTest.SameRect("drop in original native parent", h.Bounds("Natural"),
-            before.x + 35, before.y + 26, before.width, before.height);
+        before.x + 35, before.y + 26, before.width, before.height);
         DesignerInteractionTest.Check("native owner retained after drop", d.DesignOwnerOf(child) == nested);
         h.Dispose();
     }
@@ -349,32 +367,41 @@ class DesignerInteractionTest {
         Rect before = h.Bounds(name);
         Control wrapper = control.parent;
         DesignerInteractionTest.Check(name + " genuine caption/flow wrappers", wrapper is FbStack
-            && wrapper.parent is FbFlow && wrapper.parent.parent == slot);
+        && wrapper.parent is FbFlow && wrapper.parent.parent == slot);
+        FbFlow flow = (FbFlow)wrapper.parent;
+        int cellIndex = 0 - 1;
+        for (int i = 0; i < flow.ChildCount(); i = i + 1) {
+            if (flow.ChildAt(i) == wrapper) { cellIndex = i; }
+        }
+        DesignerInteractionTest.Check(name + " caption precedes field with authored span",
+        wrapper.ChildCount() == 2 && wrapper.ChildAt(0) is Label && wrapper.ChildAt(1) == control
+        && ((Label)wrapper.ChildAt(0)).GetProp("text") == field.label
+        && cellIndex >= 0 && flow.SpanAt(cellIndex) == field.span);
         DesignerInteractionTest.Check(name + " authored SlotHost differs from wrapper",
-            d.DesignOwnerOf(field) == owner && d.DesignParentHost(field) == slot
-            && control.by > wrapper.by && d.DesignEditOriginY(field) != d.AbsOriginY(field)
-            && field.LayoutY() == control.by - d.AbsOriginY(field));
+        d.DesignOwnerOf(field) == owner && d.DesignParentHost(field) == slot
+        && control.by > wrapper.by && d.DesignEditOriginY(field) != d.AbsOriginY(field)
+        && field.LayoutY() == control.by - d.AbsOriginY(field));
         d.sel = field;
         d.ClearExtraSel();
         d.DesignBeginMove();
         DesignerInteractionTest.Check(name + " one move root", d.designMoves.Count == 1
-            && d.designMoves[0].field == field);
+        && d.designMoves[0].field == field);
         DesignerInteractionTest.Check(name + " world-to-authored-slot conversion",
-            field.fx == before.x - d.DesignSlotOriginX(slot)
-            && field.fy == before.y - d.DesignSlotOriginY(slot)
-            && field.fw == before.width && field.fh == before.height);
+        field.fx == before.x - d.DesignSlotOriginX(slot)
+        && field.fy == before.y - d.DesignSlotOriginY(slot)
+        && field.fw == before.width && field.fh == before.height);
         h.Neutral();
-        DesignerInteractionTest.SameRect(name + " detach wrapper without jumping", h.Bounds(name),
-            before.x, before.y, before.width, before.height);
         DesignerInteractionTest.Check(name + " direct parent after conversion",
-            h.Node(name).parent == h.Node(ownerName).SlotHost(slotIndex));
+        h.Node(name).parent == h.Node(ownerName).SlotHost(slotIndex));
+        DesignerInteractionTest.SameRect(name + " detach wrapper without jumping", h.Bounds(name),
+        before.x, before.y, before.width, before.height);
         field.fx = field.fx + 19;
         field.fy = field.fy + 11;
         d.DesignDeclareRect(field);
         d.MarkDocDirty();
         h.Neutral();
         DesignerInteractionTest.SameRect(name + " move in authored slot", h.Bounds(name),
-            before.x + 19, before.y + 11, before.width, before.height);
+        before.x + 19, before.y + 11, before.width, before.height);
         d.designMoves = null;
     }
 
@@ -397,12 +424,11 @@ class DesignerInteractionTest {
         int y = Designer.FreeHandleY(handle, before.y, before.height);
         h.Pointer(2, x, y);
         DesignerInteractionTest.Check("resize handle " + Convert.ToString(handle), d.freeResizing
-            && d.freeResizeH == handle && !d.designResizeMoved && field.position == 0);
+        && d.freeResizeH == handle && !d.designResizeMoved && field.position == 0);
         bool left = handle == 0 || handle == 6 || handle == 7;
         bool top = handle == 0 || handle == 1 || handle == 2;
         bool right = handle == 2 || handle == 3 || handle == 4;
         bool bottom = handle == 4 || handle == 5 || handle == 6;
-        string style = field.styleText;
         for (int step = 1; step <= 2; step = step + 1) {
             int dx = step * 7;
             int dy = step * 5;
@@ -414,26 +440,40 @@ class DesignerInteractionTest {
             int expectedH = before.height + (bottom ? dy : 0) - (top ? dy : 0);
             Rect act = h.Bounds("Natural");
             DesignerInteractionTest.SameRect("resize real geometry " + Convert.ToString(handle),
-                h.Bounds("Natural"), expectedX, expectedY, expectedW, expectedH);
-            DesignerInteractionTest.Check("resize overrides original CSS border-box size",
-                field.position == 1 && field.fw == expectedW && field.fh == expectedH
-                && field.styleText == style);
+            h.Bounds("Natural"), expectedX, expectedY, expectedW, expectedH);
+            StyleBox authored = new StyleBox();
+            Css.Parse(".field {" + field.styleText + "}").ApplyBox(authored, ".field");
+            DesignerInteractionTest.Check("resize writes actual CSS border-box size",
+            field.position == 1 && field.fw == expectedW && field.fh == expectedH
+            && authored.position == 2 && authored.width == expectedW && authored.height == expectedH
+            && authored.posL == field.fx && authored.posT == field.fy
+            && field.styleText.Contains("padding:4px") && field.styleText.Contains("border:2px solid #405060"));
         }
         h.ReleaseOutside();
         h.Dispose();
     }
 
-    static void ResizeMinimum() {
-        DesignerInteractionHarness h = new DesignerInteractionHarness(DesignerInteractionTest.Html());
+    static void ResizeMinimumCase(string html, int minW, int minH) {
+        DesignerInteractionHarness h = new DesignerInteractionHarness(html);
         h.designer.sel = h.Field("Natural");
         Rect before = h.Bounds("Natural");
         h.Pointer(2, before.x, before.y);
         h.Pointer(1, before.x + before.width + 40, before.y + before.height + 40);
         h.Neutral();
         DesignerInteractionTest.SameRect("minimum resize keeps right/bottom fixed", h.Bounds("Natural"),
-            before.x + before.width - 8, before.y + before.height - 8, 8, 8);
+        before.x + before.width - minW, before.y + before.height - minH, minW, minH);
         h.ReleaseOutside();
         h.Dispose();
+    }
+
+    static void ResizeMinimum() {
+        string html = DesignerInteractionTest.Html();
+        // Each axis has two sides of padding 4 + border 2: minimum border-box 12.
+        DesignerInteractionTest.ResizeMinimumCase(html, 12, 12);
+        string plain = html.Replace("padding:4px;border:2px solid #405060", "padding:0;border:0");
+        DesignerInteractionTest.ResizeMinimumCase(plain, 8, 8);
+        string constrained = html.Replace("width:144px;height:48px;", "width:144px;height:48px;min-width:24px;min-height:20px;");
+        DesignerInteractionTest.ResizeMinimumCase(constrained, 24, 20);
     }
 
     static void ParentChildMove() {
@@ -446,25 +486,28 @@ class DesignerInteractionTest {
         Rect otherBefore = h.Bounds("Loose");
         d.sel = child;
         d.freeExtra.Add(parent);
+        string childStyle = child.styleText;
+        int childWidth = child.fw;
+        int childHeight = child.fh;
         int x = childBefore.x + childBefore.width / 2;
         int y = childBefore.y + childBefore.height / 2;
         h.Pointer(2, x, y);
         h.Pointer(1, x + 20, y + 15);
         DesignerInteractionTest.Check("selected descendant moves only ancestor root",
-            d.designMoves.Count == 1 && d.designMoves[0].field == parent
-            && parent.position == 1 && child.position == 0 && child.fx == 0 && child.fy == 0
-            && child.fw == 0 && child.fh == 0);
+        d.designMoves.Count == 1 && d.designMoves[0].field == parent
+        && parent.position == 1 && child.position == 0 && child.fx == 0 && child.fy == 0
+        && child.fw == childWidth && child.fh == childHeight && child.styleText == childStyle);
         h.Neutral();
         DesignerInteractionTest.SameRect("group parent moved once", h.Bounds("Native"),
-            parentBefore.x + 20, parentBefore.y + 15, parentBefore.width, parentBefore.height);
+        parentBefore.x + 20, parentBefore.y + 15, parentBefore.width, parentBefore.height);
         DesignerInteractionTest.SameRect("group child carried once", h.Bounds("Natural"),
-            childBefore.x + 20, childBefore.y + 15, childBefore.width, childBefore.height);
+        childBefore.x + 20, childBefore.y + 15, childBefore.width, childBefore.height);
         h.Pointer(1, x + 32, y + 24);
         h.Neutral();
         DesignerInteractionTest.SameRect("group second frame child carried once", h.Bounds("Natural"),
-            childBefore.x + 32, childBefore.y + 24, childBefore.width, childBefore.height);
+        childBefore.x + 32, childBefore.y + 24, childBefore.width, childBefore.height);
         DesignerInteractionTest.SameRect("group unrelated control unchanged", h.Bounds("Loose"),
-            otherBefore.x, otherBefore.y, otherBefore.width, otherBefore.height);
+        otherBefore.x, otherBefore.y, otherBefore.width, otherBefore.height);
         h.ReleaseOutside();
         d.sel = parent;
         d.ClearExtraSel();
@@ -472,7 +515,7 @@ class DesignerInteractionTest {
         string document = d.SaveJson();
         d.FreeReparentSel(h.Field("Nested"));
         DesignerInteractionTest.Check("native descendant cannot become its ancestor's parent",
-            d.SaveJson() == document && d.DesignOwnerOf(parent) == null);
+        d.SaveJson() == document && d.DesignOwnerOf(parent) == null);
         d.designMoves = null;
         h.Dispose();
     }
@@ -482,10 +525,10 @@ class DesignerInteractionTest {
         Control slot = h.Node(ownerName).SlotHost(slotIndex);
         Control child = h.Node(childName);
         DesignerInteractionTest.Check(childName + " actual slot parent",
-            child.parent == slot && h.designer.DesignParentHost(field) == slot);
+        child.parent == slot && h.designer.DesignParentHost(field) == slot);
         DesignerInteractionTest.SameRect(childName + " authored slot coordinates", h.Bounds(childName),
-            slot.bx + slot.StyleInsetL() - slot.ScrollLeft() + field.fx,
-            slot.by + slot.StyleInsetT() - slot.ScrollTop() + field.fy, field.fw, field.fh);
+        slot.bx + slot.StyleInsetL() - slot.ScrollLeft() + field.fx,
+        slot.by + slot.StyleInsetT() - slot.ScrollTop() + field.fy, field.fw, field.fh);
     }
 
     static void ReparentToSlot(DesignerInteractionHarness h, string ownerName, int slotIndex) {
@@ -495,6 +538,10 @@ class DesignerInteractionTest {
         Control slot = h.Node(ownerName).SlotHost(slotIndex);
         d.sel = field;
         d.ClearExtraSel();
+        Rect before = h.Bounds("Loose");
+        h.Pointer(2, before.x + before.width / 2, before.y + before.height / 2);
+        DesignerInteractionTest.Check("reparent starts retained gesture", d.freeDragging
+        && h.host.GetCapturedPointer() == d.canvasInput);
         d.DesignBeginMove();
         int worldX = d.DesignSlotOriginX(slot) + 36;
         int worldY = d.DesignSlotOriginY(slot) + 70;
@@ -506,33 +553,38 @@ class DesignerInteractionTest {
         d.freeDragHasMoved = true;
         FormField drop = d.FreeDropContainerDevice(worldX + width / 2, worldY + height / 2);
         DesignerInteractionTest.Check(ownerName + " retained drop hit resolves slot",
-            drop == owner && d.designDropSlot == slotIndex
-            && d.freeDropPX == d.DesignSlotOriginX(slot) && d.freeDropPY == d.DesignSlotOriginY(slot));
+        drop == owner && d.designDropSlot == slotIndex
+        && d.freeDropPX == d.DesignSlotOriginX(slot) && d.freeDropPY == d.DesignSlotOriginY(slot));
         d.FreeReparentSel(drop);
         DesignerInteractionTest.Check(ownerName + " reparent model coordinates",
-            d.DesignOwnerOf(field) == owner && field.childTab == slotIndex
-            && field.fx == 36 && field.fy == 70);
+        d.DesignOwnerOf(field) == owner && field.childTab == slotIndex
+        && field.fx == 36 && field.fy == 70);
         h.Neutral();
         DesignerInteractionTest.SameRect(ownerName + " reparent preserves world rectangle", h.Bounds("Loose"),
-            worldX, worldY, width, height);
+        worldX, worldY, width, height);
         DesignerInteractionTest.SlotGeometry(h, "Loose", ownerName, slotIndex);
         h.ReleaseOutside();
     }
 
     static void SlotsAndReparent() {
         DesignerInteractionHarness h = new DesignerInteractionHarness(DesignerInteractionTest.Html());
+        Control document = h.designer.pvDocRoot;
+        Control viewport = document.parent;
+        DesignerInteractionTest.Check("preview document fills client viewport for retained drop traversal",
+        viewport != null && document.bw == viewport.bw - viewport.StyleInsetL() - viewport.StyleInsetR()
+        && document.bh == viewport.bh - viewport.StyleInsetT() - viewport.StyleInsetB());
         DesignerInteractionTest.SlotGeometry(h, "TabFirst", "Tabs", 0);
         DesignerInteractionTest.SlotGeometry(h, "SplitFirst", "Split", 0);
         DesignerInteractionTest.SlotGeometry(h, "SplitSecond", "Split", 1);
         DesignerInteractionTest.Check("inactive tab excluded from geometry picking",
-            !h.designer.DesignVisible(h.Field("TabSecond")));
+        !h.designer.DesignVisible(h.Field("TabSecond")));
         h.EditPage("Tabs", 1);
         Tabs tabs = (Tabs)h.Node("Tabs");
         DesignerInteractionTest.Check("editing header selects actual page", tabs.Active() == 1
-            && h.Field("Tabs").uiState.Get() == 1 && h.designer.sel == h.Field("Tabs")
-            && h.designer.activeContainer == h.Field("Tabs")
-            && !h.designer.DesignVisible(h.Field("TabFirst"))
-            && h.designer.DesignVisible(h.Field("TabSecond")));
+        && h.Field("Tabs").uiState.Get() == 1 && h.designer.sel == h.Field("Tabs")
+        && h.designer.activeContainer == h.Field("Tabs")
+        && !h.designer.DesignVisible(h.Field("TabFirst"))
+        && h.designer.DesignVisible(h.Field("TabSecond")));
         DesignerInteractionTest.SlotGeometry(h, "TabSecond", "Tabs", 1);
         DesignerInteractionTest.ReparentToSlot(h, "Tabs", 1);
         DesignerInteractionTest.ReparentToSlot(h, "Split", 1);
@@ -559,21 +611,32 @@ class DesignerInteractionTest {
         DesignerInteractionHostState saved = new DesignerInteractionHostState(h.host);
         target.ProcessOffscreenInput(1, x, y, 0, 0, 0, 0);
         h.designer.RenderDesignPreview();
-        DesignerInteractionTest.Check("direct offscreen hover", target.focus.IsHovered(button.wid) && events.enters == 1);
+        if (!button.IsHovered() || events.enters != 1) {
+            Control hit = target.rootControl.HitTest(x, y);
+            Console.WriteLine("direct hover enters=" + Convert.ToString(events.enters)
+            + " hovered=" + Convert.ToString(target.focus.hoveredId) + " button=" + Convert.ToString(button.wid)
+            + " hit=" + (hit == null ? "null" : hit.Kind() + "#" + hit.name)
+            + " bounds=" + Convert.ToString(button.bx) + "," + Convert.ToString(button.by)
+            + "," + Convert.ToString(button.bw) + "," + Convert.ToString(button.bh));
+        }
+        DesignerInteractionTest.Check("direct offscreen hover", button.IsHovered() && events.enters == 1);
         saved.Check(h.host);
         target.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
         h.designer.RenderDesignPreview();
         DesignerInteractionTest.Check("direct offscreen press", target.pointerDown
-            && target.focus.IsPressed(button.wid) && events.downs == 1 && events.clicks == 0);
+        && button.IsPressed() && events.downs == 1 && events.clicks == 0);
         saved.Check(h.host);
         target.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
         h.designer.RenderDesignPreview();
-        DesignerInteractionTest.Check("direct offscreen release queues dedicated Click",
-            !target.pointerDown && !target.focus.IsPressed(button.wid) && events.ups == 1 && events.clicks == 0);
+        DesignerInteractionTest.Check("direct offscreen release clears physical press",
+        !target.pointerDown && !button.IsPressed());
+        DesignerInteractionTest.Check("direct offscreen MouseUp once", events.ups == 1);
+        DesignerInteractionTest.Check("direct offscreen turn delivers dedicated Click once",
+        events.clicks == 1 && events.clickSender == button);
         target.DrainPosts();
-        DesignerInteractionTest.Check("direct offscreen dedicated Button.Click", events.clicks == 1
-            && events.clickSender == button
-            && h.designer.pvEvents.last == "Click → Apply · " + button.Kind());
+        DesignerInteractionTest.Check("direct offscreen drain does not duplicate Button.Click", events.clicks == 1
+        && events.clickSender == button
+        && h.designer.pvEvents.last == "Click → Apply · " + button.Kind());
         saved.Check(h.host);
         DesignerInteractionTest.Check("direct input preserves document", h.designer.SaveJson() == document);
         h.host.EndOffscreenFrame();
@@ -598,20 +661,27 @@ class DesignerInteractionTest {
         int x = bounds.x + bounds.width / 2;
         int y = bounds.y + bounds.height / 2;
         h.Forward(1, x, y, 0, 0, 0, 0, true, true);
-        DesignerInteractionTest.Check("preview hover/enter", h.Target().focus.IsHovered(button.wid) && events.enters == 1);
+        DesignerInteractionTest.Check("preview hover/enter", button.IsHovered() && events.enters == 1);
         h.Forward(2, x, y, 0, 0, 0, 0, true, true);
         DesignerInteractionTest.Check("preview down once", h.Target().pointerDown
-            && h.Target().focus.IsPressed(button.wid) && events.downs == 1 && events.clicks == 0);
+        && button.IsPressed() && events.downs == 1 && events.clicks == 0);
         h.Forward(3, x, y, 0, 0, 0, 0, true, true);
-        DesignerInteractionTest.Check("preview up once", !h.Target().pointerDown && events.ups == 1 && events.clicks == 0);
+        DesignerInteractionTest.Check("preview release clears physical press",
+        !h.Target().pointerDown && !button.IsPressed());
+        DesignerInteractionTest.Check("preview MouseUp once", events.ups == 1);
+        DesignerInteractionTest.Check("preview turn delivers dedicated click once",
+        events.clicks == 1 && events.clickSender == button);
         h.Target().DrainPosts();
-        DesignerInteractionTest.Check("preview deferred dedicated click once", events.clicks == 1 && events.clickSender == button
-            && d.pvEvents.last == "Click → Apply · " + button.Kind());
+        DesignerInteractionTest.Check("preview drain does not duplicate dedicated click",
+        events.clicks == 1 && events.clickSender == button);
+        DesignerInteractionTest.Check("preview consumes dedicated click into status",
+        d.pvEvents.last == ""
+        && d.msg == Designer.T("preview ", "预览 ") + "Click → Apply · " + button.Kind());
         h.Forward(1, 0, 0, 0, 0, 0, 0, false, true);
-        DesignerInteractionTest.Check("preview leave once", events.leaves == 1 && !h.Target().focus.IsHovered(button.wid));
+        DesignerInteractionTest.Check("preview leave once", events.leaves == 1 && !button.IsHovered());
         DesignerInteractionTest.Check("preview preserves selection/document",
-            d.SaveJson() == document && d.sel == selection && d.freeExtra.Count == 1
-            && d.freeExtra[0] == h.Field("Native"));
+        d.SaveJson() == document && d.sel == selection && d.freeExtra.Count == 1
+        && d.freeExtra[0] == h.Field("Native"));
         TabHeaderHit header = h.Header("Tabs", 1);
         int tabX = d.DesignPointerPx(header.x + header.w / 2, h.ox, h.psMilli);
         int tabY = d.DesignPointerPx(header.y + header.h / 2, h.oy, h.psMilli);
@@ -620,8 +690,8 @@ class DesignerInteractionTest {
         d.RenderDesignPreview();
         Tabs previewTabs = (Tabs)h.Node("Tabs");
         DesignerInteractionTest.Check("runtime preview tab changes independently", previewTabs.Active() == 1
-            && h.Field("Tabs").uiState.Get() == 0 && d.SaveJson() == document
-            && !d.DesignVisible(h.Field("TabFirst")) && d.DesignVisible(h.Field("TabSecond")));
+        && h.Field("Tabs").uiState.Get() == 0 && d.SaveJson() == document
+        && !d.DesignVisible(h.Field("TabFirst")) && d.DesignVisible(h.Field("TabSecond")));
         h.Forward(2, x, y, 0, 0, 0, 0, true, false);
         DesignerInteractionTest.Check("preview has outstanding press", h.Target().pointerDown);
         Control previewTree = d.pvDocRoot;
@@ -629,16 +699,16 @@ class DesignerInteractionTest {
         h.Neutral();
         Tabs editTabs = (Tabs)h.Node("Tabs");
         DesignerInteractionTest.Check("exit preview restores authored page", d.pvDocRoot != previewTree
-            && editTabs.Active() == 0 && h.Field("Tabs").uiState.Get() == 0
-            && d.DesignVisible(h.Field("TabFirst")) && !d.DesignVisible(h.Field("TabSecond")));
+        && editTabs.Active() == 0 && h.Field("Tabs").uiState.Get() == 0
+        && d.DesignVisible(h.Field("TabFirst")) && !d.DesignVisible(h.Field("TabSecond")));
         DesignerInteractionTest.Check("mode rebuild clears outstanding press", !h.Target().pointerDown
-            && h.Target().focus.pressedId == 0 - 1 && h.Target().pressTargetId == 0 - 1
-            && h.Target().clickTargetId == 0 - 1);
+        && h.Target().focus.pressedId == 0 - 1 && h.Target().pressTargetId == 0 - 1
+        && h.Target().clickTargetId == 0 - 1);
         Control restoredTree = d.pvDocRoot;
         h.EditPage("Tabs", 0);
         DesignerInteractionTest.Check("click original page with unchanged key remains correct",
-            d.pvDocRoot == restoredTree && ((Tabs)h.Node("Tabs")).Active() == 0
-            && d.SaveJson() == document);
+        d.pvDocRoot == restoredTree && ((Tabs)h.Node("Tabs")).Active() == 0
+        && d.SaveJson() == document);
         h.Target().DrainPosts();
         DesignerInteractionTest.Check("mode transition does not click old button", events.clicks == 1);
         h.Dispose();
@@ -646,8 +716,8 @@ class DesignerInteractionTest {
 
     static void NoTargetPress(App target, string label) {
         DesignerInteractionTest.Check(label, !target.pointerDown && target.focus.pressedId == 0 - 1
-            && target.pressTargetId == 0 - 1 && target.clickTargetId == 0 - 1
-            && target.hitTester.AnchorIdOf(0) == 0 - 1 && target.hitTester.AnchorIdOf(1) == 0 - 1);
+        && target.pressTargetId == 0 - 1 && target.clickTargetId == 0 - 1
+        && target.GetCapturedPointer() == null && target.pointerDownTarget == null);
     }
 
     static void PreviewEditorGestures() {
@@ -664,7 +734,7 @@ class DesignerInteractionTest {
         DesignerInteractionTest.NoTargetPress(h.Target(), "middle does not press preview splitter");
         h.Input(1, x + 30, y + 15, 2, 0, 0, 0);
         DesignerInteractionTest.Check("middle moves only editor viewport", d.freePanX == 0 - 30
-            && d.freePanY == 0 - 15 && split.Size() == size);
+        && d.freePanY == 0 - 15 && split.Size() == size);
         DesignerInteractionTest.NoTargetPress(h.Target(), "middle move has no preview drag");
         h.Input(3, x + 30, y + 15, 2, 0, 0, 0);
         h.Neutral();
@@ -679,7 +749,7 @@ class DesignerInteractionTest {
         int zoom = d.winZoom;
         h.Input(13, h.ViewX(bx), h.ViewY(by), 0, 120, 1, 0);
         DesignerInteractionTest.Check("Ctrl-wheel zoom belongs to editor", d.winZoom == zoom + 100
-            && events.wheels == 0 && split.Size() == size && h.Field("Tabs").uiState.Get() == 0);
+        && events.wheels == 0 && split.Size() == size && h.Field("Tabs").uiState.Get() == 0);
         DesignerInteractionTest.NoTargetPress(h.Target(), "Ctrl-wheel leaves no target press");
         h.Forward(2, bx, by, 0, 0, 0, 0, true, false);
         DesignerInteractionTest.Check("press before gesture cancellation", h.Target().pointerDown && events.downs == 1);
@@ -688,7 +758,7 @@ class DesignerInteractionTest {
         h.Forward(3, bx, by, 0, 0, 0, 0, false, false);
         h.Target().DrainPosts();
         DesignerInteractionTest.Check("filtered wheel produces no click or wheel", events.wheels == 0
-            && events.clicks == 0 && split.Size() == size);
+        && events.clicks == 0 && split.Size() == size);
         d.freeHand = true;
         h.Forward(2, bx, by, 0, 0, 0, 0, true, false);
         DesignerInteractionTest.NoTargetPress(h.Target(), "hand tool blocks preview left press");
@@ -698,38 +768,67 @@ class DesignerInteractionTest {
         h.Dispose();
     }
 
-    static void PreviewWheelReplay() {
+    static void PreviewCancelReentry() {
+        DesignerInteractionHarness h = new DesignerInteractionHarness(DesignerInteractionTest.Html());
+        Designer d = h.designer;
+        d.preview = true;
+        h.Neutral();
+        Button button = (Button)h.Node("Natural");
+        DesignerInteractionEvents events = new DesignerInteractionEvents();
+        events.Bind(button);
+        Rect bounds = h.Bounds("Natural");
+        int bx = bounds.x + bounds.width / 2;
+        int by = bounds.y + bounds.height / 2;
+        int replacementPresses = 0;
+        button.OnRouted((Control sender, RoutedEventArgs e) => {
+            if (e.eventName != "PointerCancel" || replacementPresses != 0) { return; }
+            sender.OnPointerCancel(e);
+            e.Handle();
+            replacementPresses = replacementPresses + 1;
+            App replacement = sender.FindApp();
+            if (replacement == null) { return; }
+            replacement.ProcessOffscreenInput(2, sender.bx + sender.bw / 2,
+            sender.by + sender.bh / 2, 0, 0, 0, 0);
+        });
+        h.Forward(2, bx, by, 0, 0, 0, 0, true, false);
+        DesignerInteractionTest.Check("replacement test establishes captured preview press",
+        h.Target().pointerDown && h.Target().GetCapturedPointer() == button);
+        h.Forward(13, bx, by, 0, 120, 1, 0, true, false);
+        DesignerInteractionTest.Check("cancel callback replacement press survives editor filter",
+        replacementPresses == 1 && h.Target().pointerDown
+        && h.Target().GetCapturedPointer() == button && h.Target().pointerDownTarget != null
+        && button.IsPressed() && events.clicks == 0 && events.wheels == 0);
+        h.Dispose();
+    }
+
+    static void PreviewRetainedWheel() {
         string html = "<html><head><style>#Scroll { width:200px; height:100px; overflow-y:scroll; }</style></head>"
-            + "<body data-zan-design id=\"Wheel\" data-win-w=\"300\" data-win-h=\"240\" data-layout-mode=\"1\">"
-            + "<div id=\"Scroll\">"
-            + "<div style=\"height:500px\">Tall content</div></div></body></html>";
+        + "<body data-zan-design id=\"Wheel\" data-win-w=\"300\" data-win-h=\"240\" data-layout-mode=\"1\">"
+        + "<div id=\"Scroll\">"
+        + "<div style=\"height:500px\">Tall content</div></div></body></html>";
         DesignerInteractionHarness h = new DesignerInteractionHarness(html);
         h.designer.preview = true;
         h.Neutral();
         Control scroll = h.Node("Scroll");
         Check("scroll starts at top", scroll.ScrollTop() == 0);
+        DesignerInteractionEvents events = new DesignerInteractionEvents();
+        events.Bind(scroll);
         int x = scroll.bx + scroll.bw / 2;
         int y = scroll.by + scroll.bh / 2;
         h.Forward(13, x, y, 0, 0 - 120, 0, 0, true, true);
-        if (scroll.ScrollTop() != h.Target().scrollSpeed) {
-            Console.WriteLine("wheel actual=" + Convert.ToString(scroll.ScrollTop())
-                + " step=" + Convert.ToString(h.Target().scrollSpeed)
-                + " owner=" + Convert.ToString(h.Target().wheelOwnerOrder)
-                + " claimed=" + Convert.ToString(h.Target().wheelClaimSeq)
-                + " extent=" + Convert.ToString(scroll.scrollExtent)
-                + " height=" + Convert.ToString(scroll.bh)
-                + " mode=" + Convert.ToString(scroll.StyleOverflowY())
-                + " over=" + Convert.ToString(Ui.Over(h.Target(), scroll.bx, scroll.by, scroll.bw, scroll.bh)));
-        }
-        Check("first preview wheel consumed once", scroll.ScrollTop() == h.Target().scrollSpeed);
-        Check("wheel replay bounded", !h.Target().ReplayOffscreenWheel());
+        Check("first preview wheel consumed once", scroll.ScrollTop() == h.Target().scrollSpeed
+        && events.wheels == 1);
+        h.designer.RenderDesignPreview();
+        h.designer.RenderDesignPreview();
+        Check("snapshots do not replay wheel", scroll.ScrollTop() == h.Target().scrollSpeed
+        && events.wheels == 1);
         h.Dispose();
     }
 
     static void FractionalDpiEditing(int dpi) {
         string html = DesignerInteractionTest.Html()
-            .Replace("data-fx=\"20\" data-fy=\"350\" data-fw=\"100\" data-fh=\"40\"",
-                "data-fx=\"23\" data-fy=\"351\" data-fw=\"101\" data-fh=\"41\"");
+        .Replace("position:absolute;left:20px;top:350px;width:100px;height:40px",
+        "position:absolute;left:23px;top:351px;width:101px;height:41px");
         DesignerInteractionHarness h = new DesignerInteractionHarness(html);
         Designer d = h.designer;
         h.host.SetOffscreenViewport(1120, 850, 150);
@@ -740,14 +839,14 @@ class DesignerInteractionTest {
         App target = h.Target();
         Rect before = h.Bounds("Loose");
         SameRect("odd authored geometry at " + Convert.ToString(dpi), before,
-            target.Scale(23), target.ContentTop() + target.Scale(351), target.Scale(101), target.Scale(41));
+        target.Scale(23), target.ContentTop() + target.Scale(351), target.Scale(101), target.Scale(41));
         for (int pass = 0; pass < 3; pass = pass + 1) {
             d.DesignMakeFloat(field);
             h.Neutral();
             Check("repeated Float conversion preserves logical dimensions",
-                field.fx == 23 && field.fy == 351 && field.fw == 101 && field.fh == 41);
+            field.fx == 23 && field.fy == 351 && field.fw == 101 && field.fh == 41);
             SameRect("repeated Float conversion preserves device geometry", h.Bounds("Loose"),
-                before.x, before.y, before.width, before.height);
+            before.x, before.y, before.width, before.height);
         }
         int x = before.x + before.width / 2;
         int y = before.y + before.height / 2;
@@ -758,7 +857,7 @@ class DesignerInteractionTest {
         h.Neutral();
         Check("target DPI zoom retains tree", d.pvDocRoot == tree);
         SameRect("target DPI zoom retains actual geometry", h.Bounds("Loose"),
-            before.x, before.y, before.width, before.height);
+        before.x, before.y, before.width, before.height);
         d.winZoom = 0;
         h.Neutral();
         Check("target DPI zoom roundtrip preserves document", d.SaveJson() == saved);
@@ -768,14 +867,14 @@ class DesignerInteractionTest {
         h.Neutral();
         Check("DPI change retains source tree and document", d.pvDocRoot == tree && d.SaveJson() == saved);
         SameRect("DPI change roundtrip preserves geometry", h.Bounds("Loose"),
-            before.x, before.y, before.width, before.height);
+        before.x, before.y, before.width, before.height);
         h.Pointer(2, x, y);
         Check("target DPI canvas selection", d.sel == field && d.freeDragging);
         h.Pointer(1, x + target.Scale(20), y + target.Scale(12));
         h.Neutral();
         Check("fractional drag retains odd dimensions", field.fw == 101 && field.fh == 41);
         Check("fractional drag follows logical movement", field.fx >= 42 && field.fx <= 44
-            && field.fy >= 362 && field.fy <= 364);
+        && field.fy >= 362 && field.fy <= 364);
         h.ReleaseOutside();
         d.Undo();
         h.Neutral();
@@ -783,12 +882,18 @@ class DesignerInteractionTest {
         Check("fractional drag undo preserves document", d.SaveJson() == saved);
         d.sel = field;
         h.Pointer(2, before.x + before.width, before.y + before.height);
+        if (!d.freeResizing || d.freeResizeH != 4) {
+            Console.WriteLine("resize dpi=" + Convert.ToString(dpi) + " handle=" + Convert.ToString(d.freeResizeH)
+            + " resizing=" + Convert.ToString(d.freeResizing) + " dragging=" + Convert.ToString(d.freeDragging)
+            + " input=" + Convert.ToString(d.canvasInput.ready) + " ps=" + Convert.ToString(h.psMilli)
+            + " mouse=" + Convert.ToString(h.host.mouseX) + "," + Convert.ToString(h.host.mouseY));
+        }
         Check("fractional resize handle", d.freeResizing && d.freeResizeH == 4);
         h.Pointer(1, before.x + before.width + target.Scale(16), before.y + before.height + target.Scale(8));
         h.Neutral();
         Check("fractional resize keeps authored left/top", field.fx == 23 && field.fy == 351);
         Check("fractional resize follows logical size", field.fw >= 116 && field.fw <= 118
-            && field.fh >= 48 && field.fh <= 50);
+        && field.fh >= 48 && field.fh <= 50);
         h.ReleaseOutside();
         d.Undo();
         h.Neutral();
@@ -817,7 +922,7 @@ class DesignerInteractionTest {
         Check("target tooltip delay scheduled", target.wakeFrameNextMs >= 0);
         target.ForwardOffscreenFrameRequests(host);
         Check("target tooltip wakes visible host", host.wakeFrameNextMs >= 0
-            && target.wakeFrameNextMs == 0 - 1);
+        && target.wakeFrameNextMs == 0 - 1);
         target.focus.hoverStartMs = Window.GetTickMs() - Tooltip.DefaultDelayMs() - 1;
         Html.PaintTip(control, "target tip");
         TooltipRequest pending = Tooltip.Suspend();
@@ -847,35 +952,33 @@ class DesignerInteractionTest {
 
     static void RibbonClickLifecycle() {
         #if WINDOWS
-        App app = new App("ribbon click lifecycle", 240, 160);
-        for (int i = 0; i < 256; i = i + 1) {
-            if (app.PollOneEvent() == 0) { break; }
-        }
-        int id = 78901;
-        int x = app.Scale(24);
-        int y = app.ContentTop() + app.Scale(24);
+        App app = App.CreateOffscreen("ribbon click lifecycle", 240, 160);
+        Ribbon ribbon = new Ribbon();
+        RibbonGroup group = new RibbonGroup("DPI");
         RibbonItem item = RibbonItem.Small("layout", "DPI").SetMenu();
-        app.BeginFrame();
-        app.hitTester.RegisterRect(id, x, y, app.Scale(40), app.Scale(24), 0);
-        app.PresentFrame();
+        item.act = 73;
+        group.Add(item);
+        ribbon.AddGroup(group);
+        app.SetRootControl(ribbon);
+        ribbon.MeasureTree(app);
+        ribbon.Arrange(0, 0, 240, Ribbon.HeightGroups(app));
+        Control button = ribbon.ChildAt(0).ChildAt(0).ChildAt(0).ChildAt(0);
         for (int click = 0; click < 2; click = click + 1) {
-            app.window.InjectEvent(2, x + 4, y + 4, 0, 0, 0);
-            Check("ribbon press dispatched", app.PollOneEvent() == 1);
-            app.BeginFrame();
-            app.hitTester.RegisterRect(id, x, y, app.Scale(40), app.Scale(24), 0);
-            app.PresentFrame();
-            app.window.InjectEvent(3, x + 4, y + 4, 0, 0, 0);
-            Check("ribbon release dispatched", app.PollOneEvent() == 1);
-            app.BeginFrame();
-            app.hitTester.RegisterRect(id, x, y, app.Scale(40), app.Scale(24), 0);
-            Check("ribbon fresh release fires", Ribbon.ItemClicked(app, id, item));
-            app.PresentFrame();
-            app.BeginFrame();
-            app.hitTester.RegisterRect(id, x, y, app.Scale(40), app.Scale(24), 0);
-            Check("ribbon repaint does not replay release", !Ribbon.ItemClicked(app, id, item));
-            app.PresentFrame();
+            int x = button.bx + button.bw / 2;
+            int y = button.by + button.bh / 2;
+            app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+            Check("ribbon retained Button captures press", app.GetCapturedPointer() == button);
+            app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+            app.DrainPosts();
+            Check("ribbon fresh release routes retained command", ribbon.lastAct == 73);
+            ribbon.lastAct = -1;
+            app.BeginOffscreenFrame();
+            ribbon.RenderTree(app);
+            app.EndOffscreenFrame();
+            Check("ribbon repaint does not replay retained command", ribbon.lastAct == -1);
         }
-        app.window.Destroy();
+        app.SetRootControl(null);
+        app.DrainPosts();
         app.canvas.Destroy();
         #endif
     }
@@ -894,7 +997,7 @@ class DesignerInteractionTest {
         // 2. 画布点击释放输入焦点契约
         h.host.focus.focusedId = 1234;
         h.Input(2, h.ox + 10, h.oy + 10, 0, 0, 0, 0);
-        Check("canvas click clears focus", h.host.focus.focusedId < 0);
+        Check("canvas click transfers keyboard focus", h.host.focus.focusedControl == d.canvasInput);
 
         // 3. 拖拽坐标下限防御（防负数越界移出画布）
         d.sel = loose;
@@ -909,15 +1012,12 @@ class DesignerInteractionTest {
 
         // 4. ek == 4 KeyDown 快捷键撤销与重做
         d.preview = false;
-        h.host.focus.ClearFocus();
+        h.host.focus.SetFocused(d.canvasInput.WidgetId(), d.canvasInput);
         d.sel = loose;
         d.PushUndo();
         loose.fx = 99;
         loose.fy = 88;
-        h.host.BeginOffscreenFrame();
-        h.host.ProcessOffscreenInput(4, 0, 0, 0, 90, Modifiers.Ctrl(), 0);
-        d.Render(h.host, 0, 0, 1120, 850);
-        h.host.EndOffscreenFrame();
+        h.Input(4, 0, 0, 0, 90, Modifiers.Ctrl(), 0);
         Check("Ctrl+Z keydown undo restored", h.Field("Loose").fx != 99);
 
         // 5. 换父防御：当落点为自身或子树时，回退到当前父级而非 null（防止组件意外脱离丢失）
@@ -935,7 +1035,52 @@ class DesignerInteractionTest {
         h.Dispose();
     }
 
+    static void GuidesAndPopups() {
+        DesignerInteractionHarness h = new DesignerInteractionHarness(DesignerInteractionTest.Html());
+        Designer d = h.designer;
+        d.showRulers = true; d.showGuides = true;
+        h.Neutral();
+        DesignerCanvasInput input = d.canvasInput;
+        int x = input.inX + h.host.Scale(90);
+        int y = input.inY + h.host.Scale(6);
+        h.Input(2, x, y, 0, 0, 0, 0);
+        Check("ruler starts retained guide gesture", d.draggingGuideAxis == 1
+        && h.host.GetCapturedPointer() == input && !d.freeDragging && !d.freeMarquee);
+        h.Input(1, x, input.inY + h.host.Scale(85), 0, 0, 0, 0);
+        h.Input(3, x, input.inY + h.host.Scale(85), 0, 0, 0, 0);
+        Check("guide commits once", d.hGuides.Count == 1 && d.draggingGuideAxis == -1);
+        int guide = d.hGuides[0];
+        h.Neutral(); h.Neutral();
+        Check("guide paint does not replay input", d.hGuides.Count == 1 && d.hGuides[0] == guide);
+
+        d.OpenQuickInsert(h.host);
+        Check("quick insert uses retained Layer", d.quickInsertWin != null && d.quickInsertWin.open
+        && d.quickInsertWin.view is Flex && d.quickInsertResults.ChildCount() == 7);
+        h.Neutral();
+        int original = d.fields.Count;
+        Button pick = d.quickInsertResults.ChildAt(4) as Button;
+        Check("quick insert item is standard Button", pick != null);
+        int px = pick.bx + pick.bw / 2;
+        int py = pick.by + pick.bh / 2;
+        h.Input(2, px, py, 0, 0, 0, 0);
+        h.Input(3, px, py, 0, 0, 0, 0);
+        h.host.DrainPosts();
+        Check("quick insert routes one command", d.fields.Count == original + 1 && !d.quickInsertOpen);
+        h.Neutral(); h.Neutral();
+        Check("quick insert paint does not repeat command", d.fields.Count == original + 1);
+        d.OpenQuickInsert(h.host);
+        h.Neutral();
+        h.Input(4, 0, 0, 0, 40, 0, 0);
+        Check("quick insert keyboard moves once after reopen", d.quickInsertSelIdx == 1);
+        d.CloseBigEditors();
+        d.keymapHelpOpen = true; d.EnsureKeymapHelpWindow(h.host);
+        Check("shortcut help uses standard controls", d.keymapHelpWin != null && d.keymapHelpWin.view is Flex);
+        d.CloseBigEditors();
+        h.Dispose();
+    }
+
     static void Main() {
+        ControlBootstrap.Install();
         Dispatcher.Init();
         DesignerInteractionTest.NaturalPickAndDrag();
         DesignerInteractionTest.CaptionSlots();
@@ -946,13 +1091,15 @@ class DesignerInteractionTest {
         DesignerInteractionTest.DirectOffscreenButton();
         DesignerInteractionTest.PreviewButtonAndModes();
         DesignerInteractionTest.PreviewEditorGestures();
-        DesignerInteractionTest.PreviewWheelReplay();
+        DesignerInteractionTest.PreviewCancelReentry();
+        DesignerInteractionTest.PreviewRetainedWheel();
         DesignerInteractionTest.OffscreenFrameScope();
         for (int dpi = 125; dpi <= 300; dpi = dpi + 25) {
             DesignerInteractionTest.FractionalDpiEditing(dpi);
         }
         DesignerInteractionTest.RibbonClickLifecycle();
         DesignerInteractionTest.DesignerShortcutsAndDropSafety();
+        DesignerInteractionTest.GuidesAndPopups();
         Console.WriteLine("DESIGNER_INTERACTION_OK");
     }
 }

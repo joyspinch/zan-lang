@@ -6,89 +6,19 @@ using System.Json;
 namespace Gui.Designer;
 
 partial class Designer {
-    string SaveJson() {
-        JsonValue o = JsonValue.NewObject();
-        o.Put("name", JsonValue.NewStr(formNameInput.GetText()));
-        // 组件文档（role: "control"）必须存回它的 role，否则另存一次
-        // 就退化成窗口文档。
-        if (docRole != "") { o.Put("role", JsonValue.NewStr(docRole)); }
-        // 目标设备画像（"" = 桌面自由尺寸即文档缺省，不写键）。
-        if (device != "") { o.Put("device", JsonValue.NewStr(device)); }
-        o.Put("labelPos", JsonValue.NewNum(Convert.ToString(labelPos)));
-        o.Put("formSize", JsonValue.NewNum(Convert.ToString(formSize)));
-        o.Put("labelWidth", JsonValue.NewNum(Convert.ToString(labelWidth)));
-        o.Put("hideStar", JsonValue.NewBool(hideStar));
-        o.Put("showSubmit", JsonValue.NewBool(showSubmit));
-        o.Put("showReset", JsonValue.NewBool(showReset));
-        o.Put("submit", JsonValue.NewStr(submitInput.GetText()));
-        o.Put("winW", JsonValue.NewNum(Convert.ToString(winW)));
-        o.Put("winH", JsonValue.NewNum(Convert.ToString(winH)));
-        o.Put("winTitle", JsonValue.NewStr(winTitle));
-        o.Put("winResizable", JsonValue.NewBool(winResizable));
-        o.Put("winTool", JsonValue.NewBool(winTool));
-        o.Put("winTopMost", JsonValue.NewBool(winTopMost));
-        if (winMinWidth > 0) { o.Put("winMinWidth", JsonValue.NewNum(Convert.ToString(winMinWidth))); }
-        if (winMinHeight > 0) { o.Put("winMinHeight", JsonValue.NewNum(Convert.ToString(winMinHeight))); }
-        o.Put("winCenter", JsonValue.NewBool(winCenter));
-        o.Put("winPosX", JsonValue.NewNum(Convert.ToString(winPosX)));
-        o.Put("winPosY", JsonValue.NewNum(Convert.ToString(winPosY)));
-        o.Put("layoutMode", JsonValue.NewNum(Convert.ToString(layoutMode)));
-        o.Put("winZoom", JsonValue.NewNum(Convert.ToString(winZoom)));
-        o.Put("winRound", JsonValue.NewBool(winRound));
-        o.Put("winShape", this.ShapeJson());
-        o.Put("winShapeRadius", JsonValue.NewNum(Convert.ToString(winShapeRadius)));
-        o.Put("winChrome", JsonValue.NewBool(winChrome));
-        o.Put("winGlass", JsonValue.NewBool(winGlass));
-        o.Put("winOpacity", JsonValue.NewNum(Convert.ToString(winOpacity)));
-        o.Put("winShadow", JsonValue.NewNum(Convert.ToString(winShadow)));
-        for (int e = 0; e < winEvents.Count; e = e + 1) {
-            if (winEvents[e].val != "") {
-                o.Put("on" + winEvents[e].key, JsonValue.NewStr(winEvents[e].val));
-            }
-        }
-        JsonValue fieldsArr = JsonValue.NewArray();
-        for (int fi = 0; fi < fields.Count; fi = fi + 1) {
-            fieldsArr.Append(this.FieldJson(fields[fi]));
-        }
-        o.Put("fields", fieldsArr);
-        if (docSource != null && docSource.IsObject()) {
-            for (int i = 0; i < docSource.Count(); i = i + 1) {
-                string key = docSource.KeyAt(i);
-                if (!o.Has(key)) { o.Put(key, docSource.ValAt(i)); }
-            }
-        }
-        if (docSource != null && docSource.Has("bodyContent")) {
-            o.Set("bodyContent", this.RemapDesignContent(docSource.Get("bodyContent"),
-                docSource.Get("fields"), fields));
-        }
-        return o.PrettyToJson() + "\n";
+    // Persistence uses the same writer as worker snapshots, without copying the tree.
+    public string SaveJson() {
+        DesignerDocumentSnapshot document = this.CaptureDocumentOptions();
+        document.fields = fields;
+        document.docSource = docSource;
+        return document.ToJson();
     }
 
-    // winShape 的 JSON：Rect/Rounded/Ellipse 为普通整数，
-    // 自定义并集形状为区域数组（"t,x,y,w,h,r;..." -> [{"t":..},..]）。
-    JsonValue ShapeJson() {
-        if (winShape != 3) { return JsonValue.NewNum(Convert.ToString(winShape)); }
-        JsonValue arr = JsonValue.NewArray();
-        List<string> parts = winShapeSpec.Split(";");
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            List<string> n = parts[i].Split(",");
-            if (n.Count >= 6) {
-                JsonValue r = JsonValue.NewObject();
-                r.Put("t", JsonValue.NewNum(n[0]));
-                r.Put("x", JsonValue.NewNum(n[1]));
-                r.Put("y", JsonValue.NewNum(n[2]));
-                r.Put("w", JsonValue.NewNum(n[3]));
-                r.Put("h", JsonValue.NewNum(n[4]));
-                r.Put("r", JsonValue.NewNum(n[5]));
-                arr.Append(r);
-            }
-        }
-        return arr;
+    public JsonValue ShapeJson() {
+        return DesignerDocumentSnapshot.ShapeJson(winShape, winShapeSpec);
     }
 
-    // ShapeJson 的逆操作：winShape 区域数组 -> 运行时消费的紧凑
-    // "t,x,y,w,h,r;..." 规格。
-    string ShapeSpecFromJson(JsonValue arr) { return Designer.PreparedShapeSpec(arr); }
+    public string ShapeSpecFromJson(JsonValue arr) { return Designer.PreparedShapeSpec(arr); }
 
     static string PreparedShapeSpec(JsonValue arr) {
         string s = "";
@@ -185,6 +115,102 @@ partial class Designer {
 
     JsonValue FieldJson(FormField f) { return Designer.PreparedFieldJson(f); }
 
+    static StyleBox FieldStyleBox(string css) {
+        StyleBox box = new StyleBox();
+        if (css != null && css != "") {
+            StyleSheet sheet = Css.Parse(".design-field {" + css + "}");
+            sheet.ApplyBox(box, ".design-field");
+        }
+        return box;
+    }
+
+    static string SetFieldCss(string css, string key, string value) {
+        string result = "";
+        List<string> declarations = Css.SplitTopTrim(css, ";");
+        for (int i = 0; i < declarations.Count; i = i + 1) {
+            string declaration = declarations[i];
+            int colon = declaration.IndexOf(":");
+            if (colon < 0 || declaration.Substring(0, colon).Trim().ToLower() == key) { continue; }
+            result = result + declaration + ";";
+        }
+        if (value == "") { return result; }
+        return result + key + ":" + value + ";";
+    }
+
+    static bool HasFieldCss(string css, string key) {
+        List<string> declarations = Css.SplitTopTrim(css, ";");
+        for (int i = 0; i < declarations.Count; i = i + 1) {
+            int colon = declarations[i].IndexOf(":");
+            if (colon >= 0 && declarations[i].Substring(0, colon).Trim().ToLower() == key) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Explicit geometry edits replace opposing constraints from the previous mode.
+    static string FieldRectCss(FormField f) {
+        string css = f.styleText;
+        css = Designer.SetFieldCss(css, "left", "");
+        css = Designer.SetFieldCss(css, "right", "");
+        css = Designer.SetFieldCss(css, "top", "");
+        css = Designer.SetFieldCss(css, "bottom", "");
+        bool absolute = f.position == 1 || f.dockSide > 0;
+        css = Designer.SetFieldCss(css, "position", absolute ? "absolute" : "static");
+        css = Designer.SetFieldCss(css, "width", f.fw > 0 || f.position == 1
+            ? Convert.ToString(f.fw) + "px" : "auto");
+        css = Designer.SetFieldCss(css, "height", f.fh > 0 || f.position == 1
+            ? Convert.ToString(f.fh) + "px" : "auto");
+        if (!absolute) { return css; }
+        if (f.dockSide != 2 && f.dockSide != 4) {
+            css = Designer.SetFieldCss(css, "left", Convert.ToString(f.fx) + "px");
+        }
+        if (f.dockSide != 2) {
+            css = Designer.SetFieldCss(css, "top", Convert.ToString(f.fy) + "px");
+        }
+        if (f.dockSide == 1 || f.dockSide == 2 || f.dockSide == 5) {
+            css = Designer.SetFieldCss(css, "left", f.dockSide == 2 ? "0" : Convert.ToString(f.fx) + "px");
+            css = Designer.SetFieldCss(css, "right", "0");
+            css = Designer.SetFieldCss(css, "width", "");
+        }
+        if (f.dockSide == 3 || f.dockSide == 4 || f.dockSide == 5) {
+            css = Designer.SetFieldCss(css, "bottom", "0");
+            css = Designer.SetFieldCss(css, "height", "");
+        }
+        if (f.dockSide == 2) { css = Designer.SetFieldCss(css, "bottom", "0"); }
+        if (f.dockSide == 4) { css = Designer.SetFieldCss(css, "right", "0"); }
+        return css;
+    }
+
+    // Geometry edits use the runtime CSS parser; untouched authored units stay intact.
+    static string FieldLayoutCss(FormField f) {
+        string css = f.styleText == null ? "" : f.styleText;
+        StyleBox box = Designer.FieldStyleBox(css);
+        if ((f.position == 1 || f.dockSide > 0) && box.position != 2) {
+            css = Designer.FieldRectCss(f);
+            box = Designer.FieldStyleBox(css);
+        } else if (f.position == 1 && f.dockSide == 0) {
+            if (box.posL != f.fx && (box.posL != StyleBox.Unset() || f.fx != 0 || f.designSource == null)) {
+                css = Designer.SetFieldCss(css, "left", Convert.ToString(f.fx) + "px");
+            }
+            if (box.posT != f.fy && (box.posT != StyleBox.Unset() || f.fy != 0 || f.designSource == null)) {
+                css = Designer.SetFieldCss(css, "top", Convert.ToString(f.fy) + "px");
+            }
+        }
+        if (f.fw > 0 && box.width != f.fw && box.widthPm < 0
+            && f.dockSide != 1 && f.dockSide != 2 && f.dockSide != 5) {
+            css = Designer.SetFieldCss(css, "width", Convert.ToString(f.fw) + "px");
+        }
+        bool authoredHeight = f.fh > 0
+            && (!f.IsFixedHeight() || f.fh != FormField.DefaultHFor(f.ftype));
+        if ((FormField.DocHeightType(f.ftype) || authoredHeight) && box.height != f.fh
+            && box.heightPm < 0 && (box.height >= 0 || !Designer.HasFieldCss(css, "height"))
+            && f.dockSide != 3 && f.dockSide != 4 && f.dockSide != 5) {
+            css = Designer.SetFieldCss(css, "height", Convert.ToString(f.fh) + "px");
+        }
+        return css.Trim();
+    }
+
     static JsonValue PreparedFieldJson(FormField f) {
         JsonValue o = JsonValue.NewObject();
         o.Put("kind", JsonValue.NewStr(f.KindName()));
@@ -195,8 +221,7 @@ partial class Designer {
         o.Put("label", JsonValue.NewStr(f.label));
         o.Put("name", JsonValue.NewStr(f.fname));
         o.Put("placeholder", JsonValue.NewStr(f.placeholder));
-        o.Put("bind", JsonValue.NewStr(f.bindPath));
-        o.Put("bindProp", JsonValue.NewStr(f.bindProp));
+        if (f.BindingCount > 0) { o.Put("bindings", f.BindingsJson()); }
         o.Put("required", JsonValue.NewBool(f.required));
         if (f.disabled) { o.Put("disabled", JsonValue.NewBool(true)); }
         if (!f.visible) { o.Put("visible", JsonValue.NewBool(false)); }
@@ -204,47 +229,7 @@ partial class Designer {
         if (f.ftype == 15 || f.ftype == 16) {
             o.Put("wrap", JsonValue.NewBool(f.wrap));
         }
-        bool isSbOut = (f.ftype == 59 || f.kind == "StatusBar");
-        bool isTsOut = (f.ftype == 58 || f.kind == "ToolStrip");
-        if (isSbOut) {
-            f.dockSide = 2;
-            f.position = 0;
-            f.fx = 0;
-            f.anchor = 0;
-            if (f.fh <= 0) { f.fh = FormField.DefaultHFor(f.ftype); }
-        } else if (isTsOut) {
-            if (f.dockSide == 0) { f.dockSide = 1; }
-            f.position = 0;
-            f.fx = 0;
-            f.anchor = 0;
-            if (f.fh <= 0) { f.fh = FormField.DefaultHFor(f.ftype); }
-        }
-        o.Put("span", JsonValue.NewNum(Convert.ToString(f.span)));
-        if (f.designSource == null || f.designSource.Has("fx") || f.fx != 0) {
-            o.Put("fx", JsonValue.NewNum(Convert.ToString(f.fx)));
-        }
-        if (f.designSource == null || f.designSource.Has("fy") || f.fy != 0) {
-            o.Put("fy", JsonValue.NewNum(Convert.ToString(f.fy)));
-        }
-        if (f.designSource == null || f.designSource.Has("fw") || f.fw != 0) {
-            o.Put("fw", JsonValue.NewNum(Convert.ToString(f.fw)));
-        }
-        // 高度：什么时候文档带高度，决定了运行时的行高从哪来。
-        // 1) 内容型控件（多行文本/附件/表格/树/图表…）：一律带，值是
-        //    类型标准行高或作者改过的值——它们没有样式表默认高度，
-        //    不带就会塌成一行高、和下一行叠在一起。
-        // 2) 其它类型：只在作者显式定过高度时带。皮肤定高的类型
-        //    （输入框/下拉/开关…）的高度归尺寸档，容器（面板/卡片/
-        //    标签页…）按内容自适应，都不写高度。
-        // 运行时按声明排（声明优先于样式表，见 Control.StyleHeightIn）。
-        bool fhAuthored = f.fh > 0
-            && (!f.IsFixedHeight() || f.fh != FormField.DefaultHFor(f.ftype));
-        if (FormField.DocHeightType(f.ftype) || fhAuthored) {
-            o.Put("fh", JsonValue.NewNum(Convert.ToString(f.fh)));
-        }
-        if (f.dockSide != 0 || (f.designSource != null && f.designSource.Has("dock"))) {
-            o.Put("dock", JsonValue.NewNum(Convert.ToString(f.dockSide)));
-        }
+        if (f.span > 0) { o.Put("span", JsonValue.NewNum(Convert.ToString(f.span))); }
         if (f.position != 0 || f.designSource == null || f.designSource.Has("position")) {
             o.Put("position", JsonValue.NewNum(Convert.ToString(f.position)));
         }
@@ -309,7 +294,8 @@ partial class Designer {
         if (f.Class != "") { o.Put("class", JsonValue.NewStr(f.Class)); }
         // 内联 CSS 声明：与元素 style 属性同键同名（.html 设计稿里
         // 就是元素的 style 属性），解码端按同一属性名读回。
-        if (f.styleText != "") { o.Put("style", JsonValue.NewStr(f.styleText)); }
+        string css = Designer.FieldLayoutCss(f);
+        if (css != "") { o.Put("style", JsonValue.NewStr(css)); }
         // 未建模的键(DataGrid 的 "of"/"columns"、"props" 直通表…)
         // 原样写回:手写设计稿里设计器不认识的声明不能因为
         // 往返一次就消失。
@@ -335,168 +321,33 @@ partial class Designer {
         return o;
     }
 
-    // 根据 SaveJson 生成（或
-    // 手写/工具生成的）JSON 设计文档重建表单。用真正的 JSON 解析器读取，因此任意
-    // 合法格式——美化打印、紧凑、或键乱序——加载结果都一致，
-    // 而不依赖每行一个键的布局。
-    // 把一份设计 JSON 恢复到模型上。Undo/Redo 走这里：保持历史栈不变。
-    // 打开新文档用 LoadJson。
-    void ApplyJson(string s) {
-        this.CloseDesignerMenus();
-        fields = new List<FormField>();
-        sel = null;
-        selPrev = null;
-        activeContainer = null;
-        docRole = "";
-        docSource = null;
-        pvDocKey = "";
-        pvDocRoot = null;
-        pvDocNodes = null;
-        this.MarkDocDirty();
-        loadError = false;
-        // 严格解析：截断/损坏的设计稿不能被宽松解析静默降级成
-        // 半份表单（下一次编辑就会把降级文档覆盖回盘）。
-        // IDE 打开前已用 ParseableJson 拦过一次，这里兜底防御。
-        JsonValue root = null;
-        try {
-            root = JsonValue.Parse(s);
-        } catch (JsonException ex) {
-            loadError = true;
-            lastError = ex.Message;
-            seq = 0;
-            return;
-        }
-        if (root == null || !root.IsObject()) {
-            loadError = true;
-            lastError = "document is not a JSON object";
-            seq = 0;
-            return;
-        }
-        if (root.Has("name")) { formNameInput.SetText(root.Str("name", formNameInput.GetText())); }
-        docSource = root;
-        docRole = root.Str("role", "");
-        labelPos = root.Int("labelPos", labelPos);
-        formSize = root.Int("formSize", formSize);
-        labelWidth = root.Int("labelWidth", labelWidth);
-        hideStar = root.Bool("hideStar", hideStar);
-        showSubmit = root.Bool("showSubmit", showSubmit);
-        showReset = root.Bool("showReset", showReset);
-        if (root.Has("submit")) { submitInput.SetText(root.Str("submit", "")); }
-        winW = root.Int("winW", winW);
-        winH = root.Int("winH", winH);
-        // 目标设备画像：未知 id 回退桌面；锁定类画像把画布钉回
-        // 基准视口（方向按文档宽高推断）——手改 JSON 的 winW/winH
-        // 由此自愈，锁定的语义不靠文档自觉。
-        device = root.Str("device", "");
-        DeviceProfile loadDev = DeviceProfile.ById(device);
-        if (loadDev == null) {
-            device = "";
-        } else if (loadDev.Locked()) {
-            int orL = 0;
-            if (loadDev.Rotatable() && winW > winH) { orL = 1; }
-            winW = loadDev.CanvasW(orL);
-            winH = loadDev.CanvasH(orL);
-        }
-        if (root.Has("winTitle")) { winTitle = root.Str("winTitle", winTitle); }
-        winResizable = root.Bool("winResizable", winResizable);
-        // 锁定画像的另一半自愈：文档里 winResizable:true 与钉死的
-        // 画布矛盾——挂载据此不发 SetResizable(false)，"整块
-        // 表面"的移动端窗口会变成可拉伸。与上面画布钉回同一契约。
-        if (loadDev != null && loadDev.Locked()) { winResizable = false; }
-        winTool = root.Bool("winTool", winTool);
-        winTopMost = root.Bool("winTopMost", winTopMost);
-        winMinWidth = root.Int("winMinWidth", winMinWidth);
-        winMinHeight = root.Int("winMinHeight", winMinHeight);
-        winCenter = root.Bool("winCenter", winCenter);
-        winPosX = root.Int("winPosX", winPosX);
-        winPosY = root.Int("winPosY", winPosY);
-        layoutMode = root.Int("layoutMode", layoutMode);
-        // 0 = 适应视口（模板的默认值）。设计比编辑器视口大时
-        // 100% 只能看到中间一小块，所以这个值必须保留，不能
-        // 被夹回 100%。
-        winZoom = root.Int("winZoom", winZoom);
-        if (winZoom < 0) { winZoom = 0; }
-        // 只钳上限；下限不动——100..249 的存量值被钳到 250 会在
-        // 加载期静默改写文档（保存后 zoom 就变了），运行时自身
-        // 能正确渲染这些档位。
-        if (winZoom > 2000) { winZoom = 2000; }
-        winRound = root.Bool("winRound", winRound);
-        // winRound 随画像走：解析出的画像不是圆表盘（含未知 id、
-        // 桌面缺省）时一律回落 false——改名的 watch id 留下的
-        // winRound:true 不该把桌面/手机文档渲染并保存成椭圆窗口。
-        // 反向同样自愈：watch 文档缺了 winRound 也补回 true，锁定
-        // 语义不靠文档自觉。手绘圆角走 winShape==2，不经此键。
-        if (loadDev != null) {
-            winRound = loadDev.Round();
-        } else {
-            winRound = false;
-        }
-        JsonValue wsh = root.Get("winShape");
-        if (wsh != null && wsh.IsArray()) {
-            winShape = 3;
-            winShapeSpec = ShapeSpecFromJson(wsh);
-        } else {
-            winShape = root.Int("winShape", winShape);
-            winShapeSpec = "";
-        }
-        winShapeRadius = root.Int("winShapeRadius", winShapeRadius);
-        winChrome = root.Bool("winChrome", winChrome);
-        winGlass = root.Bool("winGlass", winGlass);
-        winOpacity = root.Int("winOpacity", winOpacity);
-        if (winOpacity <= 0) { winOpacity = 100; }
-        winShadow = root.Int("winShadow", 10);
-        if (winShapeRadius <= 0 && winShape == 1) { winShapeRadius = 12; }
-        if (layoutMode < 0 || layoutMode > 1) { layoutMode = 0; }
-        winEvents = new List<EventBinding>();
-        List<string> wEvs = Designer.WindowEventNames();
-        for (int e = 0; e < wEvs.Count; e = e + 1) {
-            string key = "on" + wEvs[e];
-            if (root.Has(key)) {
-                this.WinSetHandler(wEvs[e], root.Str(key, ""));
+    // Apply preserves history; opening a document resets it only on success.
+    public void ApplyJson(string text) {
+        DesignerDocumentSnapshot options = this.CaptureDocumentOptions();
+        DesignerDocumentSnapshot document = Designer.PrepareJson(text, options);
+        // Keep the synchronous loader's missing-shadow default and sticky diagnostic.
+        if (!document.loadError) {
+            if (document.docSource != null) {
+                document.winShadow = document.docSource.Int("winShadow", 10);
+                if (document.docSource.Has("submit")) {
+                    document.submit = document.docSource.Str("submit", "");
+                }
             }
+            document.lastError = lastError;
         }
-        JsonValue arr = root.Get("fields");
-        if (arr != null && arr.IsArray()) {
-            BuildFieldsFromJson(arr, fields);
-        }
-        int effH = (this.winChrome ? (winH - 32) : winH);
-        for (int i = 0; i < fields.Count; i = i + 1) {
-            FormField f = fields[i];
-            if (f != null && (f.ftype == 59 || f.kind == "StatusBar")) {
-                f.dockSide = 2;
-                f.position = 0;
-                f.anchor = 0;
-                f.flexGrow = 0;
-                f.fx = 0;
-                f.fw = winW;
-                if (f.fh <= 0) { f.fh = FormField.DefaultHFor(f.ftype); }
-                f.fy = effH - f.fh;
-                if (f.fy < 0) { f.fy = 0; }
-                this.DesignDeclareRect(f);
-            }
-        }
-        designAppliedW = winW;
-        designAppliedH = winH;
-        seq = CountFields(fields);
+        this.InstallDocumentSnapshot(document, true, false);
     }
 
-    // 打开/换入一份新文档：恢复模型后清空撤销/重做历史——快照
-    // 是整份设计 JSON，不清理的话，上一个文档的撤销会把别的设计
-    // 灌进当前画布并在帧末落盘覆盖本文件（IDE 所有设计稿标签页
-    // 共用一个设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
-    // 解析失败（loadError）保持历史。
-    void LoadJson(string s) {
-        this.ApplyJson(s);
+    public void LoadJson(string text) {
+        this.ApplyJson(text);
         if (!loadError) { this.ResetHistoryLocked(); }
     }
 
-    // 载入新文档时清空撤销/重做历史：快照是整份设计 JSON，
-    // 不清理的话，上一个文档的撤销会把别的设计灌进当前画布
-    // 并在帧末落盘覆盖本文件（IDE 所有设计稿标签页共用一个
-    // 设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
-    void ResetHistoryLocked() {
-        undoStack = new List<string>();
-        redoStack = new List<string>();
+    public void ResetHistoryLocked() {
+        undoStack = new List<DesignerDocumentSnapshot>();
+        redoStack = new List<DesignerDocumentSnapshot>();
+        undoActionStack = new List<string>();
+        redoActionStack = new List<string>();
     }
 
     // 上一次 LoadJson 是否失败（文档损坏被拒绝）。宿主（IDE）
@@ -591,17 +442,19 @@ partial class Designer {
             JsonValue kids = f.Get("kids");
             // 流式布局的字段没有矩形；在这里补一个会把它钉死在
             // 设计从未指定的绝对位置上。
-            if (!f.Has("fx") && !f.Has("fy")
-                && !f.Has("fw") && !f.Has("fh")) {
+            StyleBox layout = Designer.FieldStyleBox(f.Str("style", ""));
+            if (layout.position != 2 || layout.posR != StyleBox.Unset()
+                || layout.posB != StyleBox.Unset() || layout.width < 0 || layout.height < 0
+                || layout.widthPm >= 0 || layout.heightPm >= 0) {
                 if (kids != null && kids.IsArray()) {
                     Designer.FitFieldsToCanvas(kids, boxW, boxH, margin);
                 }
                 continue;
             }
-            int fx = f.Int("fx", 0);
-            int fy = f.Int("fy", 0);
-            int fw = f.Int("fw", 0);
-            int fh = f.Int("fh", 0);
+            int fx = layout.posL == StyleBox.Unset() ? 0 : layout.posL;
+            int fy = layout.posT == StyleBox.Unset() ? 0 : layout.posT;
+            int fw = layout.width >= 0 ? layout.width : 0;
+            int fh = layout.height >= 0 ? layout.height : 0;
             if (fw > boxW - 2 * margin) { fw = boxW - 2 * margin; }
             if (fh > boxH - 2 * margin) { fh = boxH - 2 * margin; }
             if (fw < 0) { fw = 0; }
@@ -610,10 +463,12 @@ partial class Designer {
             if (fx < margin) { fx = margin; }
             if (fy + fh > boxH - margin) { fy = boxH - margin - fh; }
             if (fy < margin) { fy = margin; }
-            f.Set("fx", JsonValue.NewNum(Convert.ToString(fx)));
-            f.Set("fy", JsonValue.NewNum(Convert.ToString(fy)));
-            f.Set("fw", JsonValue.NewNum(Convert.ToString(fw)));
-            f.Set("fh", JsonValue.NewNum(Convert.ToString(fh)));
+            string css = f.Str("style", "");
+            css = Designer.SetFieldCss(css, "left", Convert.ToString(fx) + "px");
+            css = Designer.SetFieldCss(css, "top", Convert.ToString(fy) + "px");
+            css = Designer.SetFieldCss(css, "width", Convert.ToString(fw) + "px");
+            css = Designer.SetFieldCss(css, "height", Convert.ToString(fh) + "px");
+            f.Set("style", JsonValue.NewStr(css));
             if (kids != null && kids.IsArray()) {
                 Designer.FitFieldsToCanvas(kids, fw, fh, 0);
             }
@@ -667,8 +522,7 @@ partial class Designer {
         f.fname = o.Str("name", f.fname);
         f.name = f.fname;
         f.placeholder = o.Str("placeholder", "");
-        f.bindPath = o.Str("bind", f.bindPath);
-        f.bindProp = o.Str("bindProp", f.bindProp);
+        f.ReadBindingsJson(o.Get("bindings"));
         f.required = o.Bool("required", f.required);
         f.disabled = o.Bool("disabled", false);
         f.visible = o.Bool("visible", true);
@@ -676,23 +530,17 @@ partial class Designer {
         f.wrap = o.Bool("wrap", f.wrap);
         f.Class = o.Str("class", f.Class);
         f.styleText = o.Str("style", f.styleText);
-        f.span = o.Int("span", f.span);
-        f.fx = o.Int("fx", 0);
-        f.fy = o.Int("fy", 0);
-        f.fw = o.Int("fw", 0);
-        f.fh = o.Int("fh", 0);
-        // 旧文档里的 fh=32 是当年给每个字段写死的默认，不是作者的意思：
-        // 当成"没写高度"处理。内容型控件（多行文本/附件/表格…）随后
-        // 还原成类型标准行高——否则它们永远是一行高、和下一行叠在一起；
-        // 容器还原成自适应高度，皮肤定高的类型归尺寸档。
-        if (f.fh == 32) { f.fh = 0; }
-        if (f.IsFullWidthBanner()) {
-            f.fx = 0;
-        }
-        if (f.fh <= 0 && (FormField.DocHeightType(f.ftype) || f.IsFixedHeight())) {
+        f.span = o.Int("span", 0);
+        StyleBox layout = Designer.FieldStyleBox(f.styleText);
+        f.fx = layout.posL == StyleBox.Unset() ? 0 : layout.posL;
+        f.fy = layout.posT == StyleBox.Unset() ? 0 : layout.posT;
+        f.fw = layout.width >= 0 ? layout.width : 0;
+        f.fh = layout.height >= 0 ? layout.height : 0;
+        if (!Designer.HasFieldCss(f.styleText, "height")
+            && (FormField.DocHeightType(f.ftype) || f.IsFixedHeight())) {
             f.fh = FormField.DefaultHFor(f.ftype);
         }
-        f.position = o.Int("position", f.position);
+        f.position = layout.position == 2 ? 1 : o.Int("position", f.position);
         f.anchor = o.Int("anchor", f.anchor);
         f.flexGrow = o.Int("flexGrow", f.flexGrow);
         f.margin = o.Int("margin", f.margin);
@@ -705,16 +553,18 @@ partial class Designer {
         f.altRects = o.Str("alt", f.altRects);
         f.locked = o.Bool("locked", f.locked);
         f.defOn = o.Bool("defOn", f.defOn);
-        f.dockSide = o.Int("dock", o.Int("dockSide", 0));
-        if (f.ftype == 58 || f.kind == "ToolStrip") {
-            if (f.dockSide == 0) { f.dockSide = 1; }
-            f.position = 0;
-            f.anchor = 0;
-        }
-        if (f.ftype == 59 || f.kind == "StatusBar") {
-            f.dockSide = 2;
-            f.position = 0;
-            f.anchor = 0;
+        f.dockSide = 0;
+        if (layout.position == 2) {
+            bool left = layout.posL != StyleBox.Unset();
+            bool right = layout.posR != StyleBox.Unset();
+            bool top = layout.posT != StyleBox.Unset();
+            bool bottom = layout.posB != StyleBox.Unset();
+            if (left && right && top && bottom) { f.dockSide = 5; }
+            else if (left && right && bottom) { f.dockSide = 2; }
+            else if (left && right && top) { f.dockSide = 1; }
+            else if (top && bottom && left) { f.dockSide = 3; }
+            else if (top && bottom && right) { f.dockSide = 4; }
+            if (f.dockSide > 0) { f.position = 0; }
         }
         f.childTab = o.Int("childTab", f.childTab);
         // Tabs 标签条方向：文档里存选项名，容忍旧的数字写法。
@@ -776,13 +626,12 @@ partial class Designer {
     static bool IsModeledKey(string k) {
         if (k.Length > 2 && k.Substring(0, 2) == "on") { return true; }
         return k == "kind" || k == "type" || k == "custom" || k == "label"
-            || k == "name" || k == "placeholder" || k == "bind"
-            || k == "bindProp" || k == "required" || k == "wrap"
+            || k == "name" || k == "placeholder" || k == "bindings"
+            || k == "required" || k == "wrap"
             || k == "disabled" || k == "visible" || k == "tooltip"
-            || k == "class" || k == "style" || k == "span" || k == "fx"
-            || k == "fy"
-            || k == "fw" || k == "fh" || k == "alt" || k == "locked"
-            || k == "defOn" || k == "dock" || k == "childTab"
+            || k == "class" || k == "style" || k == "span"
+            || k == "alt" || k == "locked"
+            || k == "defOn" || k == "childTab"
             || k == "position" || k == "anchor" || k == "flexGrow"
             || k == "margin" || k == "padding" || k == "gap"
             || k == "flexDir" || k == "justify" || k == "alignItems" || k == "flexWrap"

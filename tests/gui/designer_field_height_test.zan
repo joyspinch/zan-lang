@@ -1,4 +1,5 @@
 using System;
+using System.Json;
 using Gui;
 using Gui.Widget;
 using Gui.Designer;
@@ -11,8 +12,7 @@ using Gui.Designer;
 //     塌成一行高、和下一行叠在一起；
 //  3. 皮肤定高的类型（输入框/下拉/开关…）归尺寸档管、容器（面板/
 //     卡片…）按内容自适应，文档都不写高度；
-//  4. 旧文档里给每个字段写死的 fh=32 是历史默认，不是作者的意思：
-//     容器不能被钉死在 32 行高（内容溢出、与下一行叠）；
+//  4. CSS 的显式高度（包括 0 和 32px）必须保留，不能当成未声明；
 //  5. 流式行的行高要装得下最高的字段，相邻两行不得重叠。
 class DesignerFieldHeightTest {
     static int fails;
@@ -98,39 +98,52 @@ class DesignerFieldHeightTest {
         FormField area = FormField.New(1, 3);
         d.fields.Add(area);
 
-        string json = d.SaveJson();
-        AssertTrue(json.Contains("\"fh\": 48"), "custom height is written to the document");
-        // 输入框的类型默认行高不该出现在文档里（尺寸档仍然说话）。
-        int plainH = FormField.DefaultHFor(0);
-        string plainMark = "\"fh\": " + Convert.ToString(plainH);
-        AssertTrue(!json.Contains(plainMark), "type default height is not written to the document");
-        // 内容型控件（多行文本）必须带高度，否则运行时塌成一行高。
-        AssertTrue(json.Contains("\"fh\": " + Convert.ToString(FormField.DefaultHFor(1))),
-            "content type height is written to the document");
+        JsonValue fields = JsonValue.ParseLenient(d.SaveJson()).Get("fields");
+        AssertTrue(fields.At(1).Str("style", "").Contains("height:48px"),
+            "custom height is written as CSS");
+        AssertTrue(!fields.At(0).Str("style", "").Contains("height:"),
+            "type default height is not written to the document");
+        AssertTrue(fields.At(2).Str("style", "").Contains("height:"
+            + Convert.ToString(FormField.DefaultHFor(1)) + "px"),
+            "content type height is written as CSS");
     }
 
-    // 旧文档写死的 fh=32 是历史默认，不是作者的意思：容器不能被钉死在
-    // 32 行高（内容溢出、和下一行叠），内容型控件还原成标准行高。
-    static void TestLegacyDefaultHeight() {
+    // 标准 CSS 的零高度和 32px 都是作者声明，导入和保存必须保留。
+    static void TestExplicitCssHeight() {
         Designer d = new Designer();
-        d.LoadHtmlText("<html><body data-zan-design id=\"Legacy\">"
-            + "<div id=\"Box\" data-kind=\"Panel\" data-fh=\"32\"></div>"
-            + "<textarea id=\"Note\" data-kind=\"TextArea\" data-fh=\"32\"></textarea>"
-            + "</body></html>");
+        d.LoadHtmlText("<html><body data-zan-design id=\"ExplicitHeight\">"
+            + "<zan-panel id=\"Box\" style=\"height:32px\"></zan-panel>"
+            + "<textarea id=\"Note\" style=\"height:32px\"></textarea>"
+            + "<input id=\"Zero\" style=\"height:0px\" /></body></html>");
         FormField box = Find(d.fields, "Box");
         FormField note = Find(d.fields, "Note");
-        AssertTrue(box != null && note != null, "legacy fields loaded");
-        if (box == null || note == null) { return; }
-        AssertEqInt(box.fh, 0, "legacy container height 32 is not an authored height");
-        AssertEqInt(note.fh, FormField.DefaultHFor(1), "legacy content height falls back to the type row height");
+        FormField zero = Find(d.fields, "Zero");
+        AssertTrue(box != null && note != null && zero != null, "CSS fields loaded");
+        if (box == null || note == null || zero == null) { return; }
+        AssertEqInt(box.fh, 32, "explicit container height 32 is preserved");
+        AssertEqInt(note.fh, 32, "explicit content height 32 is preserved");
+        AssertEqInt(zero.fh, 0, "explicit zero height is preserved");
         string json = d.SaveJson();
-        AssertTrue(!json.Contains("\"fh\": 32"), "legacy default height is not written back");
+        Designer roundTrip = new Designer();
+        roundTrip.LoadJson(json);
+        AssertTrue(!roundTrip.loadError, "CSS height document reloads");
+        FormField roundBox = Find(roundTrip.fields, "Box");
+        FormField roundNote = Find(roundTrip.fields, "Note");
+        FormField roundZero = Find(roundTrip.fields, "Zero");
+        AssertTrue(roundBox != null && roundNote != null && roundZero != null,
+            "CSS fields survive document reload");
+        if (roundBox == null || roundNote == null || roundZero == null) { return; }
+        AssertEqInt(roundBox.fh, 32, "container height survives document reload");
+        AssertEqInt(roundNote.fh, 32, "content height survives document reload");
+        AssertEqInt(roundZero.fh, 0, "zero height survives document reload");
+        AssertTrue(roundTrip.SaveJson() == json, "CSS height saving reaches a fixed point");
     }
 
     static void Main() {
+        ControlBootstrap.Install();
         TestFieldHeights();
         TestDocumentHeight();
-        TestLegacyDefaultHeight();
+        TestExplicitCssHeight();
         if (fails == 0) {
             Console.WriteLine("DESIGNER_FIELD_HEIGHT_TEST_OK");
         } else {

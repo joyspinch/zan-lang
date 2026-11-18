@@ -431,11 +431,34 @@ partial class Designer {
 
     // 内置组件的直通属性行：kind → "键|双语标签" 列表。值存
     // f.extra["props"]——与引用节点实例值同一张直通表，挂载时
-    // 泛化发射 SetProp、画布预览经 ApplyFieldProps 落到真控件。
+    // HTML 装载与代码构建都经 Control.SetProp 落到同一控件属性。
     // 只列设计期有意义的形态/展示属性；运行态开关（如 Countdown
     // 的 active）不进来。键全部取自各控件 Props()/SetExtra 的
     // 已支持集，新增前先核对控件源码。没有行的 kind 返回 null。
+    static List<PropSpec> BuiltinPropSpecs(string kind) {
+        Control control = ControlFactory.Create(kind);
+        if (control == null) { return null; }
+        List<PropSpec> specs = control.Props();
+        return specs.Count > 0 ? specs : null;
+    }
+
+    // Legacy callers receive a key/label projection; metadata-backed controls
+    // have no parallel descriptor table.
     static List<string> BuiltinPropRows(string kind) {
+        List<PropSpec> specs = Designer.BuiltinPropSpecs(kind);
+        if (specs != null) {
+            List<string> rows = new List<string>();
+            for (int i = 0; i < specs.Count; i = i + 1) {
+                PropSpec spec = specs[i];
+                if (spec.kind == 5 || spec.key == "") { continue; }
+                rows.Add(spec.key + "|" + spec.label);
+            }
+            return rows;
+        }
+        return Designer.LegacyBuiltinPropRows(kind);
+    }
+
+    static List<string> LegacyBuiltinPropRows(string kind) {
         if (kind == "Button") {
             List<string> r = new List<string>();
             r.Add("icon|" + Designer.T("Icon", "图标"));
@@ -672,7 +695,7 @@ partial class Designer {
         }
         if (kind == "Tabs") {
             List<string> r = new List<string>();
-            r.Add("style|" + Designer.T("Style (line/card/segment)", "形态 (line/card/segment)"));
+            r.Add("tabStyle|" + Designer.T("Tab style (line/card/segment)", "标签形态 (line/card/segment)"));
             r.Add("orient|" + Designer.T("Orientation (horizontal/vertical)", "方向 (horizontal/vertical)"));
             r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
             r.Add("showAdd|" + Designer.T("Show add button (true/false)", "显示添加按钮 (true/false)"));
@@ -716,14 +739,6 @@ partial class Designer {
             r.Add("title|" + Designer.T("Title", "标题"));
             r.Add("content|" + Designer.T("Content", "内容"));
             r.Add("placement|" + Designer.T("Placement (top/bottom/left/right)", "弹出方位 (top/bottom/left/right)"));
-            return r;
-        }
-        if (kind == "Chart") {
-            List<string> r = new List<string>();
-            r.Add("type|" + Designer.T(
-                "Type (line/bar/area/stacked/hbar/pie/donut/scatter/gauge/funnel/radar/wordCloud)",
-                "类型 (line/bar/area/stacked/hbar/pie/donut/scatter/gauge/funnel/radar/wordCloud)"));
-            r.Add("title|" + Designer.T("Title", "标题"));
             return r;
         }
         if (kind == "Image" || kind == "ImageView") {
@@ -997,7 +1012,7 @@ partial class Designer {
         }
         if (kind == "Tabs") {
             List<string> r = new List<string>();
-            r.Add("style|" + Designer.T("Header style (line/card/segment)", "页头外观 (line/card/segment)"));
+            r.Add("tabStyle|" + Designer.T("Header style (line/card/segment)", "页头外观 (line/card/segment)"));
             r.Add("size|" + Designer.T("Size (small/medium/large)", "尺寸 (small/medium/large)"));
             r.Add("closable|" + Designer.T("Closable tabs (true/false)", "标签可关闭 (true/false)"));
             r.Add("showAdd|" + Designer.T("Add button (true/false)", "尾随新增按钮 (true/false)"));
@@ -1016,108 +1031,6 @@ partial class Designer {
         return null;
     }
 
-
-    // 把字段 extra["props"] 直通表落到真控件上（画布预览用）：
-    // 预览件每帧新建，逐键 SetProp；控件不认的键走基类 fallback
-    // 退化为样式类，无副作用。
-    static void ApplyFieldProps(Control ctl, FormField f) {
-        if (ctl == null || f.extra == null) { return; }
-        JsonValue props = f.extra.Get("props");
-        if (props == null || !props.IsObject()) { return; }
-        for (int i = 0; i < props.Count(); i = i + 1) {
-            ctl.SetProp(props.KeyAt(i), props.ValAt(i).AsString(""));
-        }
-    }
-
-    // 预览树上应用组件属性：与运行期注册表（UserComponentRegistry.
-    // ApplyProps）共用同一语义——实例值优先，缺省取声明里的 def，
-    // 落到目标控件（预览树按组件文档原名查找）。实例值存
-    // f.extra 的 "props" 直通对象。
-    void ApplyCompProps(Control root, JsonValue compRoot, FormField f) {
-        JsonValue inst = f.extra == null ? null : f.extra.Get("props");
-        UserComponentRegistry.ApplyProps(root, compRoot, inst);
-    }
-
-    // 引用节点画布预览的构建缓存：组件文档只在代次变化时
-    // 重建（SetUserComponents / 尺寸变化 / 实例属性变化），
-    // 其余帧复用整棵 FormBuilder 树只重渲染。找不到组件或
-    // 解析失败返回 null，调用方退回占位块。新构建的树按声明
-    // 接线预览分发，缓存命中直接复用已接线的树。
-    Control PvCompCtl(App app, FormField f, int w, int h) {
-        if (f.customKind == "") { return null; }
-        string doc = this.UserCompJson(f.customKind);
-        if (doc == "") { return null; }
-        string instFp = "";
-        if (f.extra != null) {
-            JsonValue ip = f.extra.Get("props");
-            if (ip != null) { instFp = ip.PrettyToJson(); }
-        }
-        string key = Convert.ToString(pvCompGen) + "|" + f.customKind
-            + "|" + Convert.ToString(w) + "x" + Convert.ToString(h)
-            + "|" + instFp;
-        for (int i = 0; i < pvCompCache.Count; i = i + 1) {
-            if (pvCompCache[i].key == key) { return pvCompCache[i].control; }
-        }
-        JsonValue root = null;
-        string html = "";
-        string trimmed = doc.Trim();
-        if (trimmed.StartsWith("<")) {
-            html = trimmed;
-            root = JsonValue.ParseLenient(DesignerHtml.DocOf(HtmlParser.Parse(trimmed, "")));
-        } else {
-            root = JsonValue.ParseLenient(doc);
-            if (root != null) { html = DesignerHtml.FromJsonDoc(doc); }
-        }
-        if (html == "" || root == null) { return null; }
-        HtmlDoc hd = Html.Parse(html, "", null);
-        Control ctl = hd != null ? hd.root : null;
-        if (ctl == null) { return null; }
-        this.ApplyCompProps(ctl, root, f);
-        this.ApplyPreviewFormSize(ctl, root.Int("formSize", 1));
-        this.WirePreviewEvents(app, ctl);
-        // 宿主设计稿在引用节点上声明的 on<Event>：组件文档里没有，
-        // 单独绑到树的根控件（运行期 WireNode 解析的就是这批）。
-        for (int i = 0; i < f.events.Count; i = i + 1) {
-            string fe = f.events[i].key;
-            string fh = f.events[i].val;
-            if (fe == "" || fh == "") { continue; }
-            ctl.BindEventS(fe, (Control s) => { this.PvFlash(app, fe, fh, s); });
-        }
-        pvCompCache.Add(new PreviewControlCache(key, ctl));
-        if (pvCompCache.Count > 64) {
-            pvCompCache.Clear();
-        }
-        return ctl;
-    }
-
-    // 给预览真控件树按声明绑定分发反馈：ChildWindow.
-    // WireNode 的设计器版——处理器名没有注册表可解析，改成状态条
-    // 闪现反馈。基类 FireCommon 只给有订阅的控件注册命中区
-    // （`!On.Any()` 即返回），所以绑定本身就让"点了没反应"的
-    // 声明控件变成可点的活预览。闭包按迭代捕获，
-    // 循环内绑定各拿各的 evt/hn。
-    void WirePreviewEvents(App app, Control root) {
-        if (root == null) { return; }
-        for (int i = 0; i < root.events.Count; i = i + 1) {
-            string evt = root.events[i].key;
-            string hn = root.events[i].val;
-            if (evt == "" || hn == "") { continue; }
-            root.BindEventS(evt, (Control s) => { this.PvFlash(app, evt, hn, s); });
-        }
-        for (int j = 0; j < root.children.Count; j = j + 1) {
-            this.WirePreviewEvents(app, root.children[j]);
-        }
-    }
-
-    // 预览态事件分发反馈：状态条闪现 "事件 → 处理器名"，sender
-    // 非空时附控件种类。预览里声明的处理器没有真身可调，这条
-    // 反馈本身就是"这里会触发"的所见即所得。
-    void PvFlash(App app, string evt, string hname, Control sender) {
-        string who = "";
-        if (sender != null) { who = " · " + sender.Kind(); }
-        msg = Designer.T("preview ", "预览 ") + evt + " → " + hname + who;
-        if (app != null) { app.RequestRedraw(); }
-    }
 
     // 添加运行期注册（HeavyControls）的自定义组件
     // 到表单/活动容器，与内置组件的 AddField 对应。

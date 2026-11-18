@@ -1,0 +1,174 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+class DesignerSnapshotHistoryTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static string Document() {
+        return "{\"name\":\"History\",\"role\":\"control\",\"submit\":\"Send\","
+            + "\"onLoad\":\"Loaded\",\"docCss\":\".x{color:red}\","
+            + "\"bodyContent\":[\"start\",0,\"end\"],\"fields\":["
+            + "{\"kind\":\"Panel\",\"name\":\"box\",\"label\":\"Box\","
+            + "\"htmlContent\":[\"lead\",0,\"tail\"],\"kids\":["
+            + "{\"kind\":\"Button\",\"name\":\"go\",\"label\":\"Go\","
+            + "\"onClick\":\"Clicked\",\"bindings\":["
+            + "{\"path\":\"saveTitle\",\"property\":\"text\",\"twoWay\":false},"
+            + "{\"path\":\"theme\",\"property\":\"class\",\"twoWay\":true}],"
+            + "\"options\":[\"one\"],"
+            + "\"props\":{\"readonly\":true,\"image\":\"assets/icon.png\"}}]}]}";
+    }
+
+    static void SnapshotAndHistory() {
+        Designer d = new Designer();
+        d.LoadJson(Document());
+        d.seq = 87;
+        d.freePanX = 31; d.freePanY = 42;
+        d.inspScroll = 15; d.rowsScroll = 25; d.propsScroll = 35;
+        Input nameInput = d.formNameInput;
+        TextArea jsonPreview = d.jsonArea;
+        DesignerDocumentSnapshot baseline = d.CaptureDocumentSnapshot();
+        string golden = d.SaveJson();
+        Check(golden == baseline.ToJson() && d.SaveHtml() == baseline.ToHtml(), "single persistence writer");
+        d.PushUndoAction("first");
+        d.PushUndoAction("coalesced");
+        Check(d.undoStack.Count == 1 && d.undoActionStack.Count == 1
+            && d.undoActionStack[0] == "coalesced", "deduplicate snapshot and update action");
+        DesignerDocumentSnapshot retained = d.undoStack[0];
+        FormField panel = d.fields[0];
+        FormField child = panel.kids[0];
+        Check(child.BindingCount == 2 && child.BindingAt(0).Path == "saveTitle"
+            && !child.BindingAt(0).TwoWay && child.BindingAt(1).Property == "class",
+            "binding declarations load through the designer codec");
+        panel.label = "changed"; child.label = "Changed";
+        child.SetBindingPath(0, "changedTitle");
+        child.SetBindingProperty(1, "disabled");
+        child.options[0] = "two"; child.SetHandler("Click", "ChangedClick");
+        child.extra.Set("future", JsonValue.NewStr("changed"));
+        panel.designSource.Set("futureSource", JsonValue.NewBool(true));
+        d.docSource.Set("docCss", JsonValue.NewStr("changed"));
+        d.WinSetHandler("Load", "ChangedLoad");
+        d.seq = 99;
+        Check(retained.fields[0].label == "Box" && retained.fields[0].kids[0].options[0] == "one"
+            && retained.fields[0].kids[0].GetHandler("Click") == "Clicked"
+            && !retained.fields[0].kids[0].extra.Has("future")
+            && retained.fields[0].kids[0].BindingAt(0).Path == "saveTitle"
+            && !retained.fields[0].kids[0].BindingAt(0).TwoWay
+            && retained.fields[0].kids[0].BindingAt(1).Property == "class"
+            && !retained.fields[0].designSource.Has("futureSource")
+            && retained.docSource.Str("docCss", "") == ".x{color:red}", "deep history independence");
+        d.sel = child; d.selPrev = panel; d.activeContainer = panel;
+        d.Undo();
+        Check(d.DocumentMatchesSnapshot(baseline) && d.seq == 87 && !retained.applied,
+            "undo restores captured model and sequence without consuming snapshot");
+        Check(d.undoStack.Count == 0 && d.redoStack.Count == 1 && d.redoActionStack[0] == "coalesced",
+            "undo preserves opposite history and labels");
+        Check(d.sel == null && d.selPrev == null && d.activeContainer == null
+            && d.freePanX == 31 && d.freePanY == 42 && d.inspScroll == 15
+            && d.rowsScroll == 25 && d.propsScroll == 35, "selection reset and scroll preserved");
+        Check(d.SaveJson() == golden && d.WinGetHandler("Load") == "Loaded",
+            "golden and window events after undo");
+        Check(d.formNameInput == nameInput && d.jsonArea == jsonPreview && d.jsonArea.IsReadOnly(),
+            "initialized controls and readonly preview remain installed");
+        JsonValue sourceFields = d.docSource.Get("fields");
+        Check(sourceFields != null && d.fields[0].designSource == sourceFields.At(0),
+            "body content source identity");
+        JsonValue sourceKids = d.fields[0].designSource.Get("kids");
+        Check(sourceKids != null && d.fields[0].kids[0].designSource == sourceKids.At(0),
+            "nested mixed content source identity");
+        JsonValue props = d.fields[0].kids[0].extra.Get("props");
+        Check(props != null && props.Bool("readonly", false)
+            && props.Str("image", "") == "assets/icon.png", "readonly and resource declarations survive");
+        d.Redo();
+        Check(d.fields[0].label == "changed" && d.fields[0].kids[0].options[0] == "two"
+            && d.fields[0].kids[0].BindingAt(0).Path == "changedTitle"
+            && d.fields[0].kids[0].BindingAt(1).Property == "disabled"
+            && d.WinGetHandler("Load") == "ChangedLoad" && d.seq == 99
+            && d.undoStack.Count == 1 && d.redoStack.Count == 0, "redo structured state");
+        d.Undo();
+        d.fields[0].label = "installed edit";
+        Check(retained.fields[0].label == "Box" && baseline.fields[0].label == "Box",
+            "restore remains independent from retained snapshots");
+        d.PushUndoAction("branch edit");
+        Check(d.redoStack.Count == 0 && d.redoActionStack.Count == 0, "new edit clears redo");
+        Console.WriteLine("snapshot history OK");
+    }
+
+    static void NoOpAndLimit() {
+        Designer d = new Designer();
+        d.LoadJson(Document());
+        d.PushUndo(); d.PopUndoIfUnchanged();
+        Check(d.undoStack.Count == 0 && d.undoActionStack.Count == 0, "no-op removes snapshot and label");
+        d.PushUndo(); d.fields[0].kids[0].tooltipText = "different"; d.PopUndoIfUnchanged();
+        Check(d.undoStack.Count == 1, "nested change remains undoable");
+        d.ResetHistoryLocked();
+        for (int i = 0; i < 65; i = i + 1) {
+            d.fields[0].label = Convert.ToString(i);
+            d.PushUndoAction("step " + Convert.ToString(i));
+        }
+        Check(d.undoStack.Count == 60 && d.undoActionStack.Count == 60
+            && d.undoStack[0].fields[0].label == "5" && d.undoActionStack[0] == "step 5",
+            "bounded history evicts corresponding action");
+        Console.WriteLine("history limit OK");
+    }
+
+    static void LoadPolicies() {
+        Designer d = new Designer();
+        d.LoadJson(Document());
+        d.PushUndoAction("keep"); d.fields[0].label = "edited"; d.Undo();
+        int redo = d.redoStack.Count;
+        d.winShadow = 29;
+        d.LoadJson("{oops");
+        Check(d.loadError && d.lastError.Length > 0 && d.fields.Count == 0 && d.seq == 0
+            && d.redoStack.Count == redo && d.winShadow == 29, "malformed document contract");
+        d.LoadJson("[]");
+        Check(d.loadError && d.lastError == "document is not a JSON object"
+            && d.redoStack.Count == redo, "non-object error and history");
+        d.Redo();
+        Check(!d.loadError && d.fields.Count == 1 && d.fields[0].label == "edited",
+            "redo can recover after failed open");
+        d.PushUndoAction("preserve");
+        d.ApplyJson(Document());
+        Check(d.undoStack.Count > 0, "ApplyJson keeps history");
+        d.LoadJson("{}");
+        Check(!d.loadError && d.undoStack.Count == 0 && d.redoStack.Count == 0
+            && d.winShadow == 10, "successful open resets history and shadow default");
+        d.LoadJson(Document()); d.PushUndoAction("prepared");
+        DesignerDocumentSnapshot broken = Designer.PrepareJson("{bad", d.CaptureDocumentOptions());
+        Check(d.ApplyPreparedDocument(broken) && d.loadError && d.undoStack.Count == 1
+            && !d.ApplyPreparedDocument(broken), "failed prepared load consumes once and preserves history");
+        DesignerDocumentSnapshot ready = Designer.PrepareJson(Document(), d.CaptureDocumentOptions());
+        Check(d.ApplyPreparedDocument(ready) && !d.loadError && d.undoStack.Count == 0
+            && d.redoStack.Count == 0 && !d.ApplyPreparedDocument(ready), "prepared open resets once");
+        Check(d.DocumentMatchesSnapshot(ready) && d.SaveJson() == ready.ToJson(), "prepared baseline remains independent");
+        Console.WriteLine("load policies OK");
+    }
+
+    static void ExactModelRestore() {
+        Designer d = new Designer();
+        d.LoadJson(Document());
+        d.fields[0].fh = 32;
+        d.winZoom = 111; d.winShape = 3; d.winShapeSpec = "1,2,3,40,50,6";
+        d.winOpacity = 0; d.winShapeRadius = 0;
+        d.PushUndoAction("exact");
+        d.fields[0].fh = 44; d.winZoom = 333; d.winShapeSpec = ""; d.winOpacity = 100;
+        d.Undo();
+        Check(d.fields[0].fh == 32 && d.winZoom == 111 && d.winOpacity == 0
+            && d.winShapeRadius == 0 && d.winShapeSpec == "1,2,3,40,50,6",
+            "history must not pass through JSON import normalization");
+        Check(d.SaveJson() == d.CaptureDocumentSnapshot().ToJson(), "custom shape uses one writer");
+        Console.WriteLine("exact model restore OK");
+    }
+
+    static void Main() {
+        SnapshotAndHistory();
+        NoOpAndLimit();
+        LoadPolicies();
+        ExactModelRestore();
+        Console.WriteLine("designer snapshot history OK");
+    }
+}

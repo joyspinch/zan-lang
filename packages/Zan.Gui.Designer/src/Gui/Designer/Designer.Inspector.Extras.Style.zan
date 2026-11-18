@@ -1,0 +1,128 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    void BuildInspectorStyle(FormField field) {
+        inspectorExtrasStyle = this.InspectorExtraColumn(inspectorExtrasRoot, "inspector-style");
+        Label title = this.InspectorExtraLabel(inspectorExtrasStyle, Designer.T("STYLE (CSS)", "样式（CSS）"), false);
+        title.Class = "tertiary small";
+        inspectorExtrasStyleRows = this.InspectorExtraColumn(inspectorExtrasStyle, "inspector-style-rows");
+        inspectorExtrasStyleInputs = new List<Input>();
+        List<string> declarations = Designer.SplitDecls(field.styleText);
+        for (int i = 0; i < declarations.Count; i = i + 1) {
+            Input input = new Input("property: value");
+            input.SetText(declarations[i]);
+            inspectorExtrasStyleInputs.Add(input);
+        }
+        this.BuildInspectorStyleRows();
+        inspectorExtrasStyleShadow = field.styleText;
+        Flex commands = this.InspectorExtraRow(inspectorExtrasStyle, "inspector-style-commands");
+        this.InspectorExtraButton(commands, "inspector-style-add", Designer.T("+ Declaration", "+ 声明"), "style-add", 0, "");
+        List<string> names = new List<string>{ Designer.T("Background", "底色"), Designer.T("Text", "字色"),
+            Designer.T("Radius", "圆角"), Designer.T("Border", "边框"), Designer.T("Shadow", "阴影") };
+        List<string> values = new List<string>{ "background: var(--bg-secondary)", "color: var(--primary)",
+            "border-radius: var(--radius-small)", "border: 1px solid var(--border-primary)",
+            "box-shadow: 0 4px 12px rgba(0,0,0,0.2)" };
+        // Wrap presets independently so every preset remains reachable in narrow Inspectors.
+        Flex presets = Flex.Row();
+        presets.name = "inspector-style-presets";
+        presets.SetProp("style", "flex:0 0 auto;min-width:0;flex-wrap:wrap;gap:var(--gap-small);");
+        inspectorExtrasStyle.Add(presets);
+        for (int i = 0; i < names.Count; i = i + 1) {
+            this.InspectorExtraButton(presets, "inspector-style-preset-" + Convert.ToString(i),
+                "+ " + names[i], "style-preset", i, values[i]);
+        }
+    }
+
+    void RetireInspectorExtraActions(string prefix) {
+        List<DesignerInspectorExtraAction> kept = new List<DesignerInspectorExtraAction>();
+        for (int i = 0; i < inspectorExtrasActions.Count; i = i + 1) {
+            if (!inspectorExtrasActions[i].command.StartsWith(prefix)) { kept.Add(inspectorExtrasActions[i]); }
+        }
+        inspectorExtrasActions = kept;
+    }
+
+    void BuildInspectorStyleRows() {
+        int epoch = inspectorExtrasEpoch;
+        int rowEpoch = inspectorExtrasStyleEpoch + 1;
+        inspectorExtrasStyleEpoch = rowEpoch;
+        this.RetireInspectorExtraActions("style-row-");
+        Flex host = inspectorExtrasStyleRows;
+        host.RemoveAll();
+        if (epoch != inspectorExtrasEpoch || rowEpoch != inspectorExtrasStyleEpoch || host != inspectorExtrasStyleRows) { return; }
+        for (int i = 0; i < inspectorExtrasStyleInputs.Count; i = i + 1) {
+            Flex row = this.InspectorExtraRow(host, "inspector-style-row-" + Convert.ToString(i));
+            Input input = inspectorExtrasStyleInputs[i];
+            // Rebuilding siblings preserves Input identity but replaces its subscription.
+            input.Change.Clear();
+            input.name = "inspector-style-input-" + Convert.ToString(i);
+            input.Size = "small";
+            input.SetProp("style", "flex:1;min-width:0;");
+            row.Add(input);
+            DesignerInspectorExtraAction edit = this.InspectorExtraAction(input, row, "style-row-edit", i, "");
+            input.OnChange(edit.Run);
+            Button remove = this.InspectorExtraButton(row, "inspector-style-remove-" + Convert.ToString(i),
+                "", "style-row-remove", i, "");
+            remove.Icon = "x";
+            remove.Prefer(InspectorMetrics.ActionButtonSize, InspectorMetrics.ActionButtonSize);
+        }
+    }
+
+    void RebuildInspectorStyleRows(FormField field) {
+        inspectorExtrasStyleInputs = new List<Input>();
+        List<string> declarations = Designer.SplitDecls(field.styleText);
+        for (int i = 0; i < declarations.Count; i = i + 1) {
+            Input input = new Input("property: value");
+            input.SetText(declarations[i]);
+            inspectorExtrasStyleInputs.Add(input);
+        }
+        inspectorExtrasStyleShadow = field.styleText;
+        this.BuildInspectorStyleRows();
+    }
+
+    string InspectorStyleText() {
+        string joined = "";
+        for (int i = 0; i < inspectorExtrasStyleInputs.Count; i = i + 1) {
+            string text = inspectorExtrasStyleInputs[i].GetText().Trim();
+            if (text == "") { continue; }
+            if (joined != "") { joined = joined + "; "; }
+            joined = joined + text;
+        }
+        return joined;
+    }
+
+    void CommitInspectorStyle(DesignerInspectorExtraAction action, bool discrete) {
+        if (!this.InspectorExtraActionCurrent(action)) { return; }
+        FormField field = action.target;
+        string text = this.InspectorStyleText();
+        if (text == field.styleText) { return; }
+        if (discrete) { this.BarrierInspectorUndo(); }
+        else { this.GateInspectorUndo("extras-style|" + Convert.ToString(action.epoch)); }
+        if (!this.InspectorExtraActionCurrent(action)) { return; }
+        field.styleText = text;
+        inspectorExtrasStyleShadow = text;
+        this.MarkDocDirty();
+    }
+
+    void InvokeInspectorStyleAction(DesignerInspectorExtraAction action) {
+        if (action.command == "style-row-edit") { this.CommitInspectorStyle(action, false); return; }
+        if (action.command == "style-row-remove") {
+            int index = action.index;
+            if (index < 0 || index >= inspectorExtrasStyleInputs.Count) { return; }
+            // Keep the row action valid until the model commit, then retire its epoch.
+            inspectorExtrasStyleInputs.RemoveAt(index);
+            this.CommitInspectorStyle(action, true);
+            this.BuildInspectorStyleRows();
+        } else if (action.command == "style-add" || action.command == "style-preset") {
+            Input input = new Input("property: value");
+            input.SetText(action.value);
+            inspectorExtrasStyleInputs.Add(input);
+            this.CommitInspectorStyle(action, true);
+            this.BuildInspectorStyleRows();
+        }
+    }
+}

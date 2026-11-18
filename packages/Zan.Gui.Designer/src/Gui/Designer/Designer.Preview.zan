@@ -28,8 +28,8 @@ partial class Designer {
             if (evt == "" || handler == "") { continue; }
             root.BindEventS(evt, (Control sender) => { events.Note(evt, handler, sender); });
         }
-        for (int i = 0; i < root.children.Count; i = i + 1) {
-            this.BindDesignPreviewEvents(root.children[i], events);
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            this.BindDesignPreviewEvents(root.ChildAt(i), events);
         }
     }
 
@@ -37,17 +37,7 @@ partial class Designer {
         if (pvDocForm == null) { return; }
         App target = pvDocForm.GetApp();
         if (target.canvas == null) { return; }
-        for (int pass = 0; pass < 2; pass = pass + 1) {
-            target.BeginOffscreenFrame();
-            try {
-                pvDocForm.RenderFrame(target);
-                target.RenderChrome(winTitle);
-                target.EndOffscreenFrame();
-            } finally {
-                target.CancelOffscreenFrame();
-            }
-            if (pass != 0 || !target.ReplayOffscreenWheel()) { break; }
-        }
+        pvDocForm.CaptureSnapshot();
         bool shapeNeeded = target.shapeMode != 0 || target.WindowOpacity() < 100;
         if (!shapeNeeded) {
             pvShapeReady = false;
@@ -97,14 +87,13 @@ partial class Designer {
             || ((kind == 2 || kind == 3) && button == 2)
             || (kind == 13 && Modifiers.HasCtrl(host.window.EventMods()));
         if (editorGesture) {
-            kind = 0;
-            inside = false;
-            target.pointerDown = false;
+            pvInputFocused = false;
             target.pressTargetId = 0 - 1;
             target.clickTargetId = 0 - 1;
-            target.focus.ClearPress();
-            target.hitTester.ClearAnchor(0);
-            target.hitTester.ClearAnchor(1);
+            // Retire capture and the retained Down before notifying PointerCancel.
+            // Its callback may replace the gesture, tree, or App lifetime.
+            target.CancelRoutedPointer();
+            return;
         }
         if (kind == 2) { pvInputFocused = inside; }
         bool pointer = kind == 1 || kind == 2 || kind == 3 || kind == 13;
@@ -117,7 +106,7 @@ partial class Designer {
         bool move = target.mouseX != x || target.mouseY != y;
         if (kind == 0 && !move) { return; }
         if (kind == 0) { kind = 1; }
-        target.ProcessOffscreenInput(kind, x, y, button,
+        pvDocForm.ProcessOffscreenInput(kind, x, y, button,
             host.window.EventKeyCode(), host.window.EventMods(), host.window.EventFlag());
         this.RenderDesignPreview();
         target.ForwardOffscreenFrameRequests(host);
@@ -230,28 +219,23 @@ partial class Designer {
         string key = doc.ToJson() + "|" + Convert.ToString(pvCompGen)
             + "|" + Convert.ToString(preview);
         if (pvDocRoot == null || pvDocKey != key) {
-            string html = this.SaveHtml();
-            HtmlDoc hdoc = Html.Parse(html, "", null);
-            Control tree = hdoc != null ? hdoc.root : null;
+            target.UseAppCss("");
+            Control tree = Html.Load(target, this.SaveHtml());
             if (tree == null) { return false; }
+            // 正式 Form 装配同样让文档根填满客户区；子树布局不做设计器修正。
+            if (tree is Element) { tree.Grow(); }
             List<DesignPreviewNode> nodes = new List<DesignPreviewNode>();
             this.CollectDesignPreviewNodes(tree, fields, nodes);
-            if (hdoc != null && hdoc.css != "") {
-                target.UseAppCss(hdoc.css);
-            } else {
-                FormBuilder.ApplyStyles(target, doc);
-            }
             FormBuilder.ConfigureWindow(target, doc);
-            if (pvDocRoot != null) { pvDocRoot.parent = null; }
-            pvDocForm.children.Clear();
+            pvDocForm.SetTitle(winTitle);
+            pvDocForm.Children.Clear();
             pvDocForm.Add(tree);
             pvDocRoot = tree;
-            target.SetRootControl(tree);
             pvDocNodes = nodes;
             pvDocKey = key;
             pvEvents = new DesignPreviewEvents();
             this.BindDesignPreviewEvents(tree, pvEvents);
-            target.ProcessOffscreenInput(0, 0 - 100000, 0 - 100000, 0, 0, 0, 0);
+            pvDocForm.ProcessOffscreenInput(0, 0 - 100000, 0 - 100000, 0, 0, 0, 0);
             target.focus.SetFocused(0 - 1);
             target.focus.SetHovered(0 - 1);
             target.focus.ClearPress();
@@ -371,6 +355,8 @@ partial class Designer {
     }
 
     void DisposeDesignPreview() {
+        this.RetireInspectorInput();
+        this.RetireCanvasInput();
         this.CloseDesignerMenus();
         if (pvShapeImage != null && pvShapeImage != "") { Canvas.EvictImage(pvShapeImage); }
         pvShapeImage = "";

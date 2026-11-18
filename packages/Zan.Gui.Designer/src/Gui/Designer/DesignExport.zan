@@ -15,8 +15,8 @@ namespace Gui.Designer;
 // 键、纯文本内容进 "text" 键（装载端 InitElement/SetText 还原）；
 // - name/class/style ← 同名属性（style 反向自 ApplyInline 落下的
 // style* 字段重组，只发与缺省不同的键）；
-// - dock/fx/fy/fw/fh ← dock 与 logX/logY/logW/logH（logPlaceSet
-// 为假时不发几何，装载端按内容测量）；
+// - 尺寸偏好、浮动位置、增长和间距 → 标准 CSS；已有内联声明优先，
+// 未指定的几何由运行时按内容测量；
 // - label ← `GetProp("text")`（容器没有 text，发空串即跳过）；
 // - options ← Props() 里 kind==3（枚举）spec 的选项表；
 // - on<Event> ← events 槽（SetHandler 存的处理器名）；
@@ -33,14 +33,12 @@ public class DesignExport {
     static string Export(Control root, string name, int winW, int winH) {
         JsonValue head = JsonValue.NewObject();
         head.Put("name", JsonValue.NewStr(name));
-        // 手搭树是停靠/绝对几何的集合，文档因此走自由画布
-        // （layoutMode=1）：FormBuilder 的 free 路径才消费
-        // dock/fx/fy/fw/fh，流式模式会忽略这些键把整棵树重排。
+        // 保留手搭树的自由画布编辑模式；运行时布局统一消费 style。
         head.Put("layoutMode", JsonValue.NewNum("1"));
         if (winW > 0) { head.Put("winW", JsonValue.NewNum(Convert.ToString(winW))); }
         if (winH > 0) { head.Put("winH", JsonValue.NewNum(Convert.ToString(winH))); }
         JsonValue fields = JsonValue.NewArray();
-        List<Control> top = root.children;
+        ControlChildren top = root.Children;
         for (int i = 0; i < top.Count; i = i + 1) {
             fields.Append(DesignExport.NodeJson(top[i]));
         }
@@ -72,14 +70,7 @@ public class DesignExport {
         if (c.Class != "") { o.Put("class", JsonValue.NewStr(c.Class)); }
         string style = DesignExport.StyleJson(c);
         if (style != "") { o.Put("style", JsonValue.NewStr(style)); }
-        if (c.StylePosition() == 2 || c.mx != 0 || c.my != 0) {
-            o.Put("fx", JsonValue.NewNum(Convert.ToString(c.mx)));
-            o.Put("fy", JsonValue.NewNum(Convert.ToString(c.my)));
-            if (c.prefW > 0) { o.Put("fw", JsonValue.NewNum(Convert.ToString(c.prefW))); }
-            if (c.prefH > 0) { o.Put("fh", JsonValue.NewNum(Convert.ToString(c.prefH))); }
-        }
-        if (c.bindPath != "") { o.Put("bind", JsonValue.NewStr(c.bindPath)); }
-        if (c.bindProp != "") { o.Put("bindProp", JsonValue.NewStr(c.bindProp)); }
+        if (c.BindingCount > 0) { o.Put("bindings", c.BindingsJson()); }
         // 事件名 → 处理器名（设计器模型存名不存 Action）。
         for (int e = 0; e < c.events.Count; e = e + 1) {
             o.Put("on" + c.events[e].key, JsonValue.NewStr(c.events[e].val));
@@ -94,10 +85,10 @@ public class DesignExport {
             if (ft != "") { o.Put("text", JsonValue.NewStr(ft)); }
         }
         // 子控件（Element 的 AddKid 与普通 Add 统一落 children）。
-        if (c.children.Count > 0) {
+        if (c.ChildCount() > 0) {
             JsonValue kids = JsonValue.NewArray();
-            for (int k = 0; k < c.children.Count; k = k + 1) {
-                kids.Append(DesignExport.NodeJson(c.children[k]));
+            for (int k = 0; k < c.ChildCount(); k = k + 1) {
+                kids.Append(DesignExport.NodeJson(c.ChildAt(k)));
             }
             o.Put("kids", kids);
         }
@@ -109,8 +100,30 @@ public class DesignExport {
     // 都只在原文里）；没有原文时才按 style* 字段的现值重建（控件的
     // 视觉键由样式盒重放后回填，值与缺省相同的键不发）。
     static string StyleJson(Control c) {
-        if (c.inlineStyleCss != "") { return c.inlineStyleCss; }
-        string s = "";
+        string s = c.inlineStyleCss;
+        StyleBox box = Designer.FieldStyleBox(s);
+        if (c.prefSet) {
+            if (c.prefW > 0 && !Designer.HasFieldCss(s, "width")) {
+                s = Designer.SetFieldCss(s, "width", Convert.ToString(c.prefW) + "px");
+            }
+            if (c.prefH > 0 && !Designer.HasFieldCss(s, "height")) {
+                s = Designer.SetFieldCss(s, "height", Convert.ToString(c.prefH) + "px");
+            }
+        }
+        if (c.mx != 0 || c.my != 0) {
+            if (box.position == 0) { s = Designer.SetFieldCss(s, "position", "absolute"); }
+            if (box.posL == StyleBox.Unset()) {
+                s = Designer.SetFieldCss(s, "left", Convert.ToString(c.mx) + "px");
+            }
+            if (box.posT == StyleBox.Unset()) {
+                s = Designer.SetFieldCss(s, "top", Convert.ToString(c.my) + "px");
+            }
+        }
+        if (c.grow) { s = Designer.SetFieldCss(s, "flex-grow", "1"); }
+        if (c.gap != 0 && box.gap < 0) {
+            s = Designer.SetFieldCss(s, "gap", Convert.ToString(c.gap) + "px");
+        }
+        if (c.inlineStyleCss != "") { return s; }
         if (c.styleBg != 0) {
             s = s + "background:" + Style.Hex8(c.styleBg) + ";";
         }
@@ -144,7 +157,7 @@ public class DesignExport {
         for (int i = 0; i < ps.Count; i = i + 1) {
             PropSpec p = ps[i];
             if (p.kind != 3 || p.options.Count == 0 || !p.IsBound()) { continue; }
-            string v = p.Read();
+            string v = p.ReadFrom(c);
             if (v == "") { continue; }
             bool known = false;
             for (int j = 0; j < p.options.Count; j = j + 1) {

@@ -1,0 +1,178 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    List<Label> inspectorEventGroupLabels;
+
+    string InspectorEventShape() {
+        if (sel == null) { return "window"; }
+        string shape = sel.fname + "|" + sel.kind + "|" + Convert.ToString(sel.ftype);
+        List<string> events = sel.Events();
+        for (int i = 0; i < events.Count; i = i + 1) { shape = shape + "|" + events[i]; }
+        if (sel.ftype == 58) {
+            for (int i = 0; i < sel.OptionCount(); i = i + 1) { shape = shape + "|" + sel.OptionAt(i); }
+        }
+        return shape;
+    }
+
+    bool PrepareInspectorEvents(App app, string filter) {
+        int generation = inspectorInputGeneration;
+        UiViewScope view = inspectorView; Control root = inspectorRoot; FormField target = sel;
+        ScrollColumn body = inspectorBody;
+        string shape = this.InspectorEventShape();
+        if (inspectorEventSignature != shape) {
+            activeEventDropdown = "";
+            // Drop the old hosted rows before installing another target's handlers.
+            if (!this.SetInspectorChildren(body, new List<Control>())) { return false; }
+            if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return false; }
+            eventEditRowsTarget = "";
+            this.SyncEventRows(target == null, target);
+            inspectorEventViews = new List<DesignerInspectorEventRow>();
+            for (int i = 0; i < eventEditRows.Count; i = i + 1) {
+                inspectorEventViews.Add(new DesignerInspectorEventRow(eventEditRows[i], target,
+                    inspectorEventTextAction, inspectorEventPickAction, inspectorEventJumpAction,
+                    inspectorEventOpenAction, inspectorEventCloseAction));
+            }
+            inspectorEventGroupLabels = new List<Label>();
+            List<string> groups = Designer.EventGroups();
+            for (int i = 0; i < groups.Count; i = i + 1) {
+                Label label = new Label(""); label.Class = "secondary small";
+                label.name = "inspector-event-group-" + groups[i];
+                label.Prefer(0, InspectorMetrics.RowHeightCompact);
+                inspectorEventGroupLabels.Add(label);
+            }
+            inspectorEventSignature = shape;
+        }
+        List<Control> children = new List<Control>();
+        List<string> groups = Designer.EventGroups();
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            string group = groups[i]; int count = 0;
+            for (int j = 0; j < inspectorEventViews.Count; j = j + 1) {
+                DesignerInspectorEventRow row = inspectorEventViews[j];
+                EventEditRow edit = row.edit;
+                string handler = this.InspectorEventValue(row);
+                if (handler != edit.shadow) { edit.shadow = handler; edit.input.SetText(handler); }
+                if (edit.category != group || !this.InspectorEventMatches(row, filter)) { continue; }
+                count = count + 1;
+            }
+            if (count == 0) { continue; }
+            Label label = inspectorEventGroupLabels[i];
+            label.SetProp("text", Designer.GroupLabel(group) + "  (" + Convert.ToString(count) + ")");
+            children.Add(label);
+            for (int j = 0; j < inspectorEventViews.Count; j = j + 1) {
+                DesignerInspectorEventRow row = inspectorEventViews[j];
+                if (row.edit.category != group || !this.InspectorEventMatches(row, filter)) { continue; }
+                if (!this.PrepareInspectorEventOptions(row)) { return false; }
+                if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return false; }
+                children.Add(row.root);
+            }
+        }
+        return this.SetInspectorChildren(body, children);
+    }
+
+    bool InspectorEventMatches(DesignerInspectorEventRow row, string filter) {
+        EventEditRow edit = row.edit;
+        return filter == "" || edit.title.ToLower().Contains(filter) || edit.rawEv.ToLower().Contains(filter)
+            || edit.category.ToLower().Contains(filter) || edit.shadow.ToLower().Contains(filter);
+    }
+
+    string InspectorEventValue(DesignerInspectorEventRow row) {
+        EventEditRow edit = row.edit;
+        if (edit.isRoot) { return this.WinGetHandler(edit.rawEv); }
+        FormField target = row.target;
+        if (target == null) { return ""; }
+        if (edit.toolIdx >= 0) { return Designer.GetToolItemClick(target, edit.toolIdx); }
+        return target.GetHandler(edit.rawEv);
+    }
+
+    bool PrepareInspectorEventOptions(DesignerInspectorEventRow row) {
+        int generation = inspectorInputGeneration;
+        UiViewScope view = inspectorView; Control root = inspectorRoot; App app = inspectorApp; FormField target = sel;
+        JsonValue options = JsonValue.NewArray();
+        options.AppendStr(Designer.T("(None / Clear)", "(无 / 清除事件)"));
+        options.AppendStr(row.edit.sug + Designer.T(" (Recommended)", " (推荐新建)"));
+        List<string> values = new List<string>(); values.Add(""); values.Add(row.edit.sug);
+        if (candidateHandlers != null) {
+            for (int i = 0; i < candidateHandlers.Count; i = i + 1) {
+                string name = candidateHandlers[i];
+                if (values.Contains(name)) { continue; }
+                values.Add(name); options.AppendStr(name);
+            }
+        }
+        string key = options.ToJson();
+        if (key != row.optionsKey) {
+            row.picker.SetOpen(false);
+            if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return false; }
+            row.optionsKey = key; row.values = values;
+            row.picker.SetOptionsText(key);
+            if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return false; }
+        }
+        // The picker is the arrow beside the text editor, not a second handler value.
+        if (!row.picker.open) { row.picker.Select(0 - 1); }
+        return this.InspectorInputCurrent(generation, view, root, app, target);
+    }
+
+    bool InspectorEventCurrent(DesignerInspectorEventRow row) {
+        return inspTab == 1 && inspectorReady && inspectorRegion != null && inspectorView != null
+            && inspectorView.IsActive() && inspectorRoot != null && inspectorRoot.visible
+            && row.root.parent == inspectorBody && row.root.visible && row.target == sel
+            && row.edit.isRoot == (sel == null) && inspectorEventViews != null && inspectorEventViews.Contains(row)
+            && inspectorEventSignature == this.InspectorEventShape();
+    }
+
+    void WriteInspectorEvent(DesignerInspectorEventRow row, string value, bool discrete) {
+        if (!this.InspectorEventCurrent(row)) { return; }
+        int generation = inspectorInputGeneration;
+        UiViewScope view = inspectorView; Control root = inspectorRoot; App app = inspectorApp; FormField target = sel;
+        EventEditRow edit = row.edit;
+        string current = this.InspectorEventValue(row);
+        if (current != value) {
+            if (discrete) { this.BarrierInspectorUndo(); }
+            else { this.GateInspectorUndo("evt|" + Convert.ToString(inspKeySeq) + "|" + edit.key); }
+            if (!this.InspectorInputCurrent(generation, view, root, app, target)
+                    || !this.InspectorEventCurrent(row)) { return; }
+            if (edit.isRoot) { this.WinSetHandler(edit.rawEv, value); }
+            else if (edit.toolIdx >= 0) { Designer.SetToolItemClick(row.target, edit.toolIdx, value); }
+            else { row.target.SetHandler(edit.rawEv, value); }
+            this.MarkDocDirty();
+        }
+        if (!this.InspectorInputCurrent(generation, view, root, app, target)
+                || !this.InspectorEventCurrent(row)) { return; }
+        edit.shadow = value;
+        if (edit.input.GetText().Trim() != value) { edit.input.SetText(value); }
+    }
+
+    void InspectorEventAction(string name, Control sender) {
+        if (inspectorEventViews == null) { return; }
+        for (int i = 0; i < inspectorEventViews.Count; i = i + 1) {
+            DesignerInspectorEventRow row = inspectorEventViews[i];
+            if (sender != row.edit.input && sender != row.picker && sender != row.label) { continue; }
+            if (!this.InspectorEventCurrent(row)) { return; }
+            int generation = inspectorInputGeneration;
+            UiViewScope view = inspectorView; Control root = inspectorRoot; App app = inspectorApp; FormField target = sel;
+            if (name == "inspector-event-text") {
+                this.WriteInspectorEvent(row, row.edit.input.GetText().Trim(), false);
+            } else if (name == "inspector-event-pick") {
+                int selected = row.picker.Selected();
+                if (selected >= 0 && selected < row.values.Count) {
+                    this.WriteInspectorEvent(row, row.values[selected], true);
+                }
+                if (!this.InspectorInputCurrent(generation, view, root, app, target)
+                        || !this.InspectorEventCurrent(row)) { return; }
+                activeEventDropdown = "";
+            } else if (name == "inspector-event-jump") {
+                string handler = row.edit.input.GetText().Trim();
+                if (handler == "") { handler = row.edit.sug; this.WriteInspectorEvent(row, handler, true); }
+                if (this.InspectorInputCurrent(generation, view, root, app, target)
+                        && this.InspectorEventCurrent(row)) { this.RequestOpenCodeBehindHandler(handler); }
+            } else if (name == "inspector-event-open") { activeEventDropdown = row.edit.key; }
+            else if (name == "inspector-event-close" && activeEventDropdown == row.edit.key) { activeEventDropdown = ""; }
+            return;
+        }
+    }
+}
