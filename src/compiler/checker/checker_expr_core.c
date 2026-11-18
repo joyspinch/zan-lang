@@ -97,6 +97,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_IDENTIFIER: {
+        if (expr->ident.inst_type_ref)
+            return zan_binder_resolve_type(c->binder, expr->ident.inst_type_ref);
         if (expr->ident.is_type_receiver) {
             zan_symbol_t *ts = zan_binder_type_receiver(c->binder, expr);
             return ts && ts->type ? ts->type : c->binder->type_error;
