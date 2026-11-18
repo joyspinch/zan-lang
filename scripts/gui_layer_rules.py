@@ -9,7 +9,7 @@ Zan.Gui 分层重构的棘轮机检（B-ID171 P0 第 3 步，对应 TASKS.md 的
     python scripts/gui_layer_rules.py --update F…  # 修掉违规后：按工作树重算这些文件的基线条目（锁定收紧）
     python scripts/gui_layer_rules.py --baseline   # 整份重写基线（工作树与 HEAD 逐项取大，仅初建/重置用）
 
-五类规则，全部是"只减不增"的棘轮——现存违规记在 scripts/gui_layers_baseline.json，
+六类规则，全部是"只减不增"的棘轮——现存违规记在 scripts/gui_layers_baseline.json，
 提交时逐文件比对暂存版内容，计数超过基线即拒绝：
 
   layering      Zan.Gui 包内依赖只能向下：按目录判定文件所在层，检查向上的 using、
@@ -18,6 +18,8 @@ Zan.Gui 分层重构的棘轮机检（B-ID171 P0 第 3 步，对应 TASKS.md 的
   arbitration   不得新增 App 即时模式输入仲裁调用（ClaimClick、BlockHitsRect…、Ui.Activate*）。
   legacy_attr   设计器文档（带 data-zan-design）以外的 html 不得新增 data-dock/fx/fy/fw/fh/span。
   signal_new    Zan.Gui 以外不得新增 new SignalInt/SignalBool/SignalString 或 Signal.Int/Bool/String。
+  static_field  Gui.Core/Widget/Component 不得新增静态可变字段（2026-11-09 裁定，B-ID171 ④）——
+                static 且非 const/readonly 的字段声明；静态状态必须走实例或显式收口。
 
 基线只许降不许升：暂存了基线文件且某类总数高于 HEAD 时拒绝，除非设置环境变量
 ZAN_GUI_BASELINE_RAISE=1 并在提交说明写明理由。纯移动文件（git mv）按旧路径的基线比对，
@@ -38,13 +40,14 @@ GUI_ROOT = "packages/Zan.Gui/src/Gui/"
 SKIP_TOP = {"_scratch", "build", "dist", ".git", "node_modules", ".zan-packages"}
 DOC = "TASKS.md B-ID171～179"
 
-CATEGORIES = ("layering", "render_entry", "arbitration", "legacy_attr", "signal_new")
+CATEGORIES = ("layering", "render_entry", "arbitration", "legacy_attr", "signal_new", "static_field")
 CATEGORY_DESC = {
     "layering": "Zan.Gui 向上依赖",
     "render_entry": "即时模式入口 Render(App …)",
     "arbitration": "App 即时模式输入仲裁调用",
     "legacy_attr": "旧布局方言属性",
     "signal_new": "Zan.Gui 外新建 Signal*",
+    "static_field": "Core/Widget/Component 静态可变字段",
 }
 
 # 目录（packages/Zan.Gui/src/Gui/ 下第一段；"" 为根目录文件）→ 层级。
@@ -77,6 +80,24 @@ UI_ACTIVATE_RE = re.compile(r"(?<![\w.])Ui\s*\.\s*(Activate\w*)\s*\(")
 RENDER_ENTRY_RE = re.compile(r"(?<![\w.])Render\s*\(\s*App\s+[A-Za-z_]")
 SIGNAL_NEW_RE = re.compile(r"(?<![\w.])(?:new\s+(Signal(?:Int|Bool|String))\s*\(|Signal\s*\.\s*(Int|Bool|String)\s*\()")
 LEGACY_ATTR_RE = re.compile(r"\b(data-(?:dock|fx|fy|fw|fh|span))\s*=")
+# 静态可变字段（B-ID171 ④）：static 修饰、无 const/readonly 的字段声明。
+# 判定在 strip_code 后逐行做：行尾分号收尾、行内无括号（方法/属性/事件不命中）、
+# 无 `=>`（表达式体成员），`static` 为独立 token。只对 Core/Widget/Component 层计数。
+STATIC_FIELD_LAYERS = ("Core", "Widget", "Component")
+
+
+def count_static_mutable_fields(code: str) -> int:
+    hits = 0
+    for line in code.split("\n"):
+        s = line.strip()
+        if not s or s.startswith(("using ", "namespace ")):
+            continue
+        if not s.endswith(";") or "(" in s or "=>" in s:
+            continue
+        toks = s[:-1].split()
+        if "static" in toks and "const" not in toks and "readonly" not in toks:
+            hits += 1
+    return hits
 
 USING_RE = re.compile(r"^\s*using\s+(?:static\s+)?([A-Za-z_][\w.]*)\s*;")
 NAMESPACE_RE = re.compile(r"^\s*namespace\s+([A-Za-z_][\w.]*)\s*;", re.M)
@@ -322,6 +343,10 @@ def file_metrics(rel: str, text: str, table: Optional[TypeTable]) -> Dict[str, C
         count = len(RENDER_ENTRY_RE.findall(code))
         if count:
             metrics["render_entry"]["Render(App"] += count
+    if layer in STATIC_FIELD_LAYERS:
+        sfc = count_static_mutable_fields(code)
+        if sfc:
+            metrics["static_field"]["static mutable field"] += sfc
     if table is None:
         return metrics
 
