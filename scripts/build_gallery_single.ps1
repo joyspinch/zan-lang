@@ -27,7 +27,7 @@ Write-Output "[1/4] Building static native drivers ..."
 # ---- bake the skin packs (base.css + skins) into the exe -----------------
 Write-Output "[2/4] Embedding skin packs (base.css + all skins) ..."
 & powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
-    -Root packages\Zan.Gui\src\Gui\skins -Prefix skins `
+    -Root packages\Zan.Gui\skins -Prefix skins `
     -OutC build\embed_gen_gallery.c -OutO build\embed_gen_gallery.o -Clang clang
 if ($LASTEXITCODE -ne 0) { throw "EMBED_GEN_FAILED" }
 
