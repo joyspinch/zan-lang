@@ -537,6 +537,34 @@ partial class Irgen {
     }
 
     ExprVal EmitReflInstCall(ExprVal recv, string mname, Node e) {
+    string CoerceReflectInvokeNumber(ExprVal value, string member, Node call) {
+        string source = MapType(value.ty);
+        if (source == "double") {
+            if (member == "InvokeDouble") { return value.op; }
+            return NarrowReflectInvokeInt(EmitFptosiGuarded(call, value.op), member);
+        }
+
+        // Reflection transports reference results as pointer bits in a numeric slot.
+        string slot = "0";
+        if (IsPtrLL(source)) { slot = Coerce(value, "i64"); }
+        else if (source == "i1") { slot = ToI64(value.op, source); }
+        else if (source == "i64" || source == "i32" || source == "i16" || source == "i8") {
+            slot = ToI64(value);
+        }
+        if (member == "InvokeDouble") {
+            return Coerce(new ExprVal(slot, MkType("long")), "double");
+        }
+        return NarrowReflectInvokeInt(slot, member);
+    }
+
+    string NarrowReflectInvokeInt(string slot, string member) {
+        if (member != "InvokeInt" || slot == "0") { return slot; }
+        string narrowed = FromI64(slot, "i32");
+        string widened = NT();
+        L("  " + widened + " = sext i32 " + narrowed + " to i64");
+        return widened;
+    }
+
         if (mname == "HasMethod") {
             string methName = e.kids.Count > 0 && e.kids[0].kind == AK.StringLit() ? e.kids[0].sval : "";
             Node cls0 = ClassOf(recv.ty);
@@ -574,16 +602,10 @@ partial class Irgen {
                 if (mname == "Invoke") {
                     return new ExprVal("1", MkType("bool"));
                 }
-                if (mname == "InvokeInt") {
-                    return new ExprVal(ToI64(cres), MkType("int"));
-                }
-                if (mname == "InvokeLong") {
-                    string s64 = Coerce(cres, "i64");
-                    return new ExprVal(s64, MkType("long"));
-                }
-                if (mname == "InvokeDouble") {
-                    string sd = Coerce(cres, "double");
-                    return new ExprVal(sd, MkType("double"));
+                if (mname == "InvokeInt" || mname == "InvokeLong" || mname == "InvokeDouble") {
+                    string number = CoerceReflectInvokeNumber(cres, mname, e);
+                    string typeName = mname == "InvokeInt" ? "int" : (mname == "InvokeLong" ? "long" : "double");
+                    return new ExprVal(number, MkType(typeName));
                 }
                 if (mname == "InvokeString") {
                     return cres;
@@ -698,14 +720,9 @@ partial class Irgen {
                         ExprVal cres = EmitInstanceCallAs(castRecv, cand, methName, invCall, false);
                         if (mname == "Invoke") {
                             L("  store i64 1, i64* " + resSlot);
-                        } else if (mname == "InvokeInt") {
-                            L("  store i64 " + ToI64(cres) + ", i64* " + resSlot);
-                        } else if (mname == "InvokeLong") {
-                            string s64 = Coerce(cres, "i64");
-                            L("  store i64 " + s64 + ", i64* " + resSlot);
-                        } else if (mname == "InvokeDouble") {
-                            string sd = Coerce(cres, "double");
-                            L("  store double " + sd + ", double* " + resSlot);
+                        } else if (mname == "InvokeInt" || mname == "InvokeLong" || mname == "InvokeDouble") {
+                            string number = CoerceReflectInvokeNumber(cres, mname, e);
+                            L("  store " + retTyLL + " " + number + ", " + retTyLL + "* " + resSlot);
                         } else if (mname == "InvokeString" || mname == "InvokeObject") {
                             string sptr = Coerce(cres, "i8*");
                             L("  store i8* " + sptr + ", i8** " + resSlot);
