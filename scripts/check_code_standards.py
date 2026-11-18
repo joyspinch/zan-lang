@@ -11,6 +11,7 @@ Validates code changes against core quality baselines:
   5. Zan.Gui layering ratchet (scripts/gui_layer_rules.py + scripts/gui_layers_baseline.json):
      no new upward dependencies inside Zan.Gui, no new immediate-mode entry points or
      arbitration calls, no new legacy layout attributes, no new Signal* outside Zan.Gui.
+  6. src/compiler must never gain new #include of packages/*/compiler hooks (B-ID222).
 
 Usage:
     python scripts/check_code_standards.py --staged      # Check staged git changes (pre-commit)
@@ -40,6 +41,13 @@ UNDERSCORE_EXEMPT_DIRS = (
 
 MAX_NEW_FILE_LINES = 1200
 MAX_FUNCTION_LINES = 120
+
+# Package compiler-hook includes tolerated only until B-ID223/224 remove them;
+# anything else (incl. re-adding the removed Zan.Gui one) is rejected.
+COMPILER_PACKAGE_INCLUDE_ALLOWLIST = frozenset((
+    '#include "../../packages/Zan.Data/compiler/orm_adapter.h"',
+    '#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"',
+))
 
 
 def strip_comments_and_strings(line: str) -> str:
@@ -97,6 +105,28 @@ def check_stdlib_dependency(rel_path: str, line_num: int, raw_line: str, strippe
             f"       stdlib 是语言基石，反向引用扩展包会破坏编译闭包与 --no-packages 纯净环境。"
         )
     return None
+
+
+def check_compiler_package_include(rel_path: str, line_num: int, raw_line: str, stripped_line: str) -> Optional[str]:
+    """Rule 6: src/compiler must not include packages/*/compiler hooks (B-ID222)."""
+    norm_path = rel_path.replace("\\", "/")
+    if not norm_path.startswith("src/compiler/"):
+        return None
+    if not (norm_path.endswith(".c") or norm_path.endswith(".h")):
+        return None
+    # Match on the raw line: strip_comments_and_strings erases the quoted
+    # include path, which would silence this rule entirely.
+    line_no_comment = re.sub(r'//.*$', '', raw_line)
+    if not re.match(r'^\s*#include\s+"\.\./\.\./packages/', line_no_comment):
+        return None
+    inc = line_no_comment.strip()
+    if inc in COMPILER_PACKAGE_INCLUDE_ALLOWLIST:
+        return None
+    return (
+        f"src/compiler 严禁新增对 packages/*/compiler 钩子头的 #include ('{inc}')。\n"
+        f"       包以 C 钩子编进 zanc 的通道已废除（B-ID222，2026-11-19 裁定）："
+        f"编译期扩展走包侧数据或 Zan 代码，编译器永不点名包。"
+    )
 
 
 def check_pascal_case_api(rel_path: str, line_num: int, raw_line: str, stripped_line: str) -> Optional[str]:
@@ -220,6 +250,10 @@ def check_staged() -> int:
             if err:
                 violations.append(f"[FAIL] {rel_path}:{line_num} - {err}")
 
+            err = check_compiler_package_include(rel_path, line_num, raw_line, stripped)
+            if err:
+                violations.append(f"[FAIL] {rel_path}:{line_num} - {err}")
+
             err = check_pascal_case_api(rel_path, line_num, raw_line, stripped)
             if err:
                 violations.append(f"[FAIL] {rel_path}:{line_num} - {err}")
@@ -263,6 +297,10 @@ def check_files(paths: List[str]) -> int:
                 violations.append(f"[FAIL] {rel_path}:{idx} - {err}")
 
             err = check_stdlib_dependency(rel_path, idx, raw_line, stripped)
+            if err:
+                violations.append(f"[FAIL] {rel_path}:{idx} - {err}")
+
+            err = check_compiler_package_include(rel_path, idx, raw_line, stripped)
             if err:
                 violations.append(f"[FAIL] {rel_path}:{idx} - {err}")
 

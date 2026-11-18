@@ -32,7 +32,7 @@
 
 - [ ] B-ID220 ZanIDE 项目配置窗打开停顿。用 `tests/ide/theme_drawer_probe.ps1 -ProjectOverflowOnly` 恢复工程，在窄窗溢出菜单点击「项目配置」。Windows x64 正式发布构建有一次 `UIWATCHDOG stall stage=child-window blocked=246ms`，原始输出见 `build/test-out/ide-theme-drawer/project-overflow/stdout.log`。待区分窗口装配、绑定准备与首帧耗时，定位后复验打开、关闭和重复打开。
 - [ ] B-ID221 ZanIDE 符号导出进程的退出生命周期。
-- [~] B-ID222 包编译器钩子·Gui 入口根除（2026-11-19 用户裁定：包以 C 钩子编进 zanc 的形态整体不应存在，编译器永不点名包；2026-11-19 领账）。`packages/Zan.Gui/compiler/`（98 行，main_frontend.c:276 + main.c:504 两调用点）整目录删除，"无 Main 即 new <文件名>().Show()"约定废除（gui 工程模板脚手架自带 Main，零编译器机制）。同批补机检：禁 src/compiler 新增对 packages/*/compiler 的 #include。工程加载或符号刷新经 `EmitSymbolsDetach` 启动后台编译，`DrainSymbolWorkAsync` 只等待监视器线程。待为发起的导出建立进程归属和退出策略，验证导出在途时关闭 IDE 或切换工程，避免遗留进程或旧结果写回。工程模式探针在清理临时工程前会等待该工程的 worker。
+- [ ] B-ID226 diag_docapp_no_entry 金标过期（2026-11-19 B-ID222 验证时实证，HEAD 存量红非新引入）：链接器报文已 lld 化（实测 `ld.lld: error: undefined symbol: WinMain`，PATH 上 VS2022 LLVM 的 ld.lld），CMakeLists.txt:1801 的 EXPECT_REGEX 仍锁 GNU ld 措辞（`undefined reference to .WinMain.`）——全仓唯一用此措辞的金标。修法二选一：(a) 链接器消息规范化（对齐 main_driver.c:1058 ELF 路已有的 lld 措辞归一先例）；(b) 更新金标正则兼容两种措辞。定位到 exe 链接的 ld 回落点后单跑收口，归属 driver/toolchain 面。工程加载或符号刷新经 `EmitSymbolsDetach` 启动后台编译，`DrainSymbolWorkAsync` 只等待监视器线程。待为发起的导出建立进程归属和退出策略，验证导出在途时关闭 IDE 或切换工程，避免遗留进程或旧结果写回。工程模式探针在清理临时工程前会等待该工程的 worker。
 
 ### 批次 3 · 有前置（前置闭了再领）
 

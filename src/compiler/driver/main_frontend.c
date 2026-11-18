@@ -272,15 +272,6 @@
            引用要进解析/裁剪视野），又必须晚于所有输入解析完（控制器齐了）。 */
         zan_compile_trace("synth action dispatch");
         zan_mvc_synthesize_dispatch(ast, arena, diag);
-        zan_compile_trace("synth docapp main");
-        if (zan_gui_needs_entry(ast)) {
-            if (!load_proj_android_keys_done) {
-                load_proj_android_keys();
-                load_proj_android_keys_done = true;
-            }
-            zan_gui_synthesize_entry(ast, arena, diag, proj_app_type,
-                                     proj_entry_file, input_file);
-        }
         zan_compile_trace("nsresolve generated");
         zan_nsresolve_run(ast, arena, diag);
         zan_compile_trace("prune");

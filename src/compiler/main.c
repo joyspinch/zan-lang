@@ -501,7 +501,6 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
     return unit;
 }
 
-#include "../../packages/Zan.Gui/compiler/gui_entry.h"
 #include "driver/main_dump.c"
 #include "driver/main_driver.c"
 
