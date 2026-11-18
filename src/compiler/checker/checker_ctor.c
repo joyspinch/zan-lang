@@ -243,7 +243,8 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *m = sym->members[i];
         if (!m || m->kind != SYM_CONSTRUCTOR || !m->decl) continue;
-        if (m->decl->kind != AST_CONSTRUCTOR_DECL) continue;
+        if (m->decl->kind != AST_CONSTRUCTOR_DECL ||
+            (m->modifiers & MOD_STATIC)) continue;
         declared++;
         int lo = 0, hi = 0;
         ctor_arity(m->decl, &lo, &hi);

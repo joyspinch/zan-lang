@@ -362,7 +362,10 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
                       type_sym->name.len, type_sym->name.str);
         return true;
     }
+    /* A cctor initializes the type; an instance ctor constructs an object.
+     * Their empty parameter lists do not put them in the same overload set. */
     if (m->kind == SYM_CONSTRUCTOR && added->kind == SYM_CONSTRUCTOR &&
+        ((m->modifiers ^ added->modifiers) & MOD_STATIC) == 0 &&
         binder_params_equiv(m, added)) {
         zan_diag_emit_code(b->diag, DIAG_ERROR, added->decl->loc, 1004,
                       "duplicate constructor in '%.*s': a constructor "
