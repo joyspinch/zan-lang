@@ -100,7 +100,8 @@ $frontendSources = @(
     'src/compiler/arena.c', 'src/compiler/diag.c', 'src/compiler/lexer.c',
     'src/compiler/ast.c', 'src/compiler/parser.c', 'src/compiler/nsresolve.c',
     'src/compiler/binder.c', 'src/compiler/checker.c', 'src/compiler/definite.c',
-    'src/compiler/builtin_api.c', 'tests/fuzz/fuzz_frontend.c'
+    'src/compiler/builtin_api.c', 'tests/fuzz/fuzz_frontend.c',
+    'packages/Zan.Data/compiler/orm_adapter.c', 'packages/Zan.Mvc/compiler/mvc_routes.c'
 )
 $clangArgs = @(
     '-O1', '-g', '-fsanitize=fuzzer,address', '-D_CRT_SECURE_NO_WARNINGS',

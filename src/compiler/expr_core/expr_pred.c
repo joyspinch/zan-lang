@@ -243,6 +243,18 @@ static void zan_arr_hdr_store(zan_irgen_t *g, LLVMValueRef raw, int off,
         LLVMBuildBitCast(g->builder, p, LLVMPointerType(i64, 0), name));
 }
 
+static void zan_register_array(zan_irgen_t *g, LLVMValueRef array,
+                               LLVMValueRef bytes, uint64_t data_offset,
+                               zan_type_t *elem_type) {
+    LLVMValueRef fn = g->rt_live_register_array;
+    if (!fn) return;
+    LLVMValueRef offset = LLVMConstInt(LLVMInt64TypeInContext(g->ctx), data_offset, 0);
+    LLVMValueRef refs = LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
+                                    is_rc_managed_type(elem_type), 0);
+    LLVMValueRef args[] = {array, bytes, offset, refs};
+    zan_call2(g->builder, LLVMGlobalGetValueType(fn), fn, args, 4, "");
+}
+
 static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
                                          LLVMValueRef count, zan_type_t *elem_type) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -281,10 +293,7 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
     }
     LLVMValueRef off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
     LLVMValueRef arr_ptr = LLVMBuildGEP2(g->builder, i8, raw, &off, 1, "arr");
-    if (g->rt_live_register) {
-        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_register),
-            g->rt_live_register, (LLVMValueRef[]){ arr_ptr, bytes }, 2, "");
-    }
+    zan_register_array(g, arr_ptr, bytes, 0, elem_type);
     return arr_ptr;
 }
 LLVMValueRef zan_array_alloc_typed(zan_irgen_t *g, LLVMValueRef total,
@@ -305,7 +314,7 @@ LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
         "arr.len");
 }
 LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
-                                      int rank, LLVMTypeRef elem_llvm) {
+                              int rank, LLVMTypeRef elem_llvm, zan_type_t *elem_type) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
@@ -349,10 +358,7 @@ LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
     }
     LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
     LLVMValueRef arr_ptr = LLVMBuildGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
-    if (g->rt_live_register) {
-        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_register),
-            g->rt_live_register, (LLVMValueRef[]){ arr_ptr, bytes }, 2, "");
-    }
+    zan_register_array(g, arr_ptr, bytes, (uint64_t)rank * 8, elem_type);
     return arr_ptr;
 }
 

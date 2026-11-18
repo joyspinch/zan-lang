@@ -20,8 +20,14 @@
 
             char cmd[4096];
             snprintf(cmd, sizeof(cmd),
-                     "ld.lld -static%s --eh-frame-hdr --gc-sections -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
-                     (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, sys, obj_tmp);
+                     "ld.lld -static%s --eh-frame-hdr --gc-sections -o \"%s\" \"%s/crt1.o\"",
+                     (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys);
+            /* Zig musl on RISC-V does not use the legacy .init/.fini objects. */
+            bool legacy_init = target.arch != ZAN_ARCH_RISCV64;
+            if (legacy_init) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/crti.o\"", sys);
+            }
+            cmd_appendf(cmd, sizeof(cmd), " \"%s\"", obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
@@ -101,6 +107,9 @@
             for (int d = 0; d < cross_archive_count; d++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_archives[d]);
             }
+            for (int li = 0; li < import_lib_count; li++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
+            }
             {
                 static const char *const ft_libs[] = {
                     "libfreetype.a", "libfontconfig.a", "libexpat.a"
@@ -118,8 +127,10 @@
                 cmd_appendf(cmd, sizeof(cmd), " %s",
                          static_driver_libs[li]);
             }
-            { cmd_appendf(cmd, sizeof(cmd),
-                       " --end-group \"%s/crtn.o\"", sys); }
+            cmd_appendf(cmd, sizeof(cmd), " --end-group");
+            if (legacy_init) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/crtn.o\"", sys);
+            }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_OHOS) {
             char exe_dir[1024] = {0};
@@ -144,9 +155,9 @@
                 return 1;
             }
             char cmd[8192];
-            /* OHOS 的 exe 走**全静态**链接（musl 的 libc.a + 静态 libunwind 与
-               compiler-rt），静态模型里没有 EGL/GLES/FreeType 的位置，而预编译
-               的 OHOS GUI 驱动直接调用它们 ⇒ 任何 GUI 程序在这条路上都链不过
+            /* OHOS 的 exe 走**全静态**链接（musl 的 libc.a + 静态 libc++abi、
+               libunwind 与 compiler-rt），静态模型里没有 EGL/GLES/FreeType 的位置，
+               而预编译的 OHOS GUI 驱动直接调用它们 ⇒ 任何 GUI 程序在这条路上都链不过
                （一串 undefined symbol：eglMakeCurrent / glCreateShader / FT_*）。
                与其让用户去猜，直接说清楚：OHOS 的 GUI 走 HAP 形态（--emit-lib），
                exe 形态要等驱动改成运行时 dlopen 才通得过。 */
@@ -186,9 +197,10 @@
                     return 1;
                 }
             }
+            /* libunwind locates the executable's tables through PT_GNU_EH_FRAME. */
             snprintf(cmd, sizeof(cmd),
-                     "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\""
-                     " \"%s/clang_rt.crtbegin.o\" \"%s\"",
+                     "ld.lld -static%s --eh-frame-hdr --gc-sections -o \"%s\""
+                     " \"%s/crt1.o\" \"%s/crti.o\" \"%s/clang_rt.crtbegin.o\" \"%s\"",
                      (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
@@ -227,11 +239,22 @@
                 cmd_appendf(cmd, sizeof(cmd),
                          " \"%s/zan_inflate.o\"", sys);
             }
-            { cmd_appendf(cmd, sizeof(cmd),
-                       " --start-group \"%s/libc.a\" \"%s/libunwind.a\""
-                       " \"%s/libclang_rt.builtins.a\"", sys, sys, sys); }
+            cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", sys);
+            for (int ei = 0; ei < extra_link_input_count; ei++) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", extra_link_inputs[ei]);
+            }
+            cmd_appendf(cmd, sizeof(cmd),
+                        " --start-group \"%s/libc.a\" \"%s/libc++abi.a\""
+                        " \"%s/libunwind.a\" \"%s/libclang_rt.builtins.a\"",
+                        sys, sys, sys, sys);
             for (int d = 0; d < cross_archive_count; d++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_archives[d]);
+            }
+            for (int li = 0; li < import_lib_count; li++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
+            }
+            for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
                 cmd_appendf(cmd, sizeof(cmd), " %s",
@@ -250,33 +273,18 @@
                                ? "android-arm64" : "android-x64";
             char sys[1200];
             snprintf(sys, sizeof(sys), "%s/%s", exe_dir, asub);
-            const char *drv_libs[ZAN_LINK_MAX_LIBS];
-            int drv_lib_len[ZAN_LINK_MAX_LIBS];
-            int drv_lib_count = 0;
-            for (int li = 0; li < irgen.extern_lib_count; li++) {
-                if (zan_win_system_lib(irgen.extern_libs[li].str,
-                                       (int)irgen.extern_libs[li].len))
-                    continue;
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue;
-                if (drv_lib_count >= ZAN_LINK_MAX_LIBS)
-                    link_cap_exceeded("DllImport libraries", ZAN_LINK_MAX_LIBS);
-                drv_libs[drv_lib_count] = nm;
-                drv_lib_len[drv_lib_count] = nlen;
-                drv_lib_count++;
-            }
+            bool dynamic_link = import_lib_count > 0 || extra_link_lib_count > 0;
             char cmd[8192];
-            if (drv_lib_count > 0) {
+            if (dynamic_link) {
                 snprintf(cmd, sizeof(cmd),
-                         "ld.lld -pie%s --gc-sections -o \"%s\" \"%s/crtbegin_dynamic.o\""
+                         "ld.lld -pie%s --dynamic-linker=/system/bin/linker64 --eh-frame-hdr"
+                         " --gc-sections -o \"%s\" \"%s/crtbegin_dynamic.o\""
                          " \"%s\"",
                          (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, obj_tmp);
             } else {
                 snprintf(cmd, sizeof(cmd),
-                         "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crtbegin_static.o\""
+                         "ld.lld -static%s --eh-frame-hdr --gc-sections -o \"%s\""
+                         " \"%s/crtbegin_static.o\""
                          " \"%s\"",
                          (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, obj_tmp);
             }
@@ -287,6 +295,10 @@
             for (int di = 0; di < extra_lib_path_count; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          extra_lib_paths[di]);
+            }
+            cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", sys);
+            for (int ei = 0; ei < extra_link_input_count; ei++) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", extra_link_inputs[ei]);
             }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
@@ -317,7 +329,7 @@
                 cmd_appendf(cmd, sizeof(cmd),
                          " \"%s/zan_inflate.o\"", sys);
             }
-            if (drv_lib_count > 0) {
+            if (dynamic_link) {
                 cmd_appendf(cmd, sizeof(cmd), " --start-group");
             } else {
                 cmd_appendf(cmd, sizeof(cmd),
@@ -330,11 +342,16 @@
                 cmd_appendf(cmd, sizeof(cmd), " %s",
                          static_driver_libs[li]);
             }
-            for (int li = 0; li < drv_lib_count; li++) {
-                cmd_appendf(cmd, sizeof(cmd), " -l%.*s",
-                         drv_lib_len[li], drv_libs[li]);
+            for (int li = 0; li < import_lib_count; li++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
             }
-            if (drv_lib_count > 0) {
+            for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
+            }
+            /* Zan invokes use the Itanium C++ ABI. The NDK archives also
+               draw on bionic, so keep them in the executable's rescan group. */
+            cmd_appendf(cmd, sizeof(cmd), " \"%s/libc++abi.a\" \"%s/libunwind.a\"", sys, sys);
+            if (dynamic_link) {
                 cmd_appendf(cmd, sizeof(cmd),
                          " --end-group \"%s/libc.so\" \"%s/libm.so\""
                          " \"%s/liblog.so\" \"%s/libdl.so\""
@@ -477,20 +494,22 @@
             if (winrt_io[0]) {
                 cmd_appendf(cmd, sizeof(cmd), " -lws2_32");
             }
-            { cmd_appendf(cmd, sizeof(cmd), have_gcc
-                       ? " -lgcc -lgcc_eh -lsupc++"
-                       : " -lclang_rt.builtins-aarch64 -lunwind -lucrt"); }
+            if (target.arch == ZAN_ARCH_AARCH64 && !have_gcc) {
+                /* MSYS2 CLANGARM64 libc++ 23.1.5-1 ships a static libc++.a
+                   with libc++abi, its SEH unwinder and Win32 thread support. */
+                cmd_appendf(cmd, sizeof(cmd),
+                         " \"%s/libc++.a\" -lclang_rt.builtins-aarch64 -lucrt", syslib);
+            } else {
+                cmd_appendf(cmd, sizeof(cmd), have_gcc
+                         ? " -lgcc -lgcc_eh -lsupc++"
+                         : " -lclang_rt.builtins-aarch64 -lunwind -lucrt");
+            }
             for (int ei = 0; ei < extra_link_lib_count; ei++) {
                 cmd_appendf(cmd, sizeof(cmd), " -l%s",
                          extra_link_libs[ei]);
             }
-            for (int li = 0; li < irgen.extern_lib_count; li++) {
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue;
-                cmd_appendf(cmd, sizeof(cmd), " -l%.*s", nlen, nm);
+            for (int li = 0; li < import_lib_count; li++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
                 cmd_appendf(cmd, sizeof(cmd), " %s",
@@ -521,27 +540,6 @@
                 free(source);
                 return 1;
             }
-            if (rt_io_obj) {
-                static const char *const sock_pre[] = {
-                    "zan_io_socket_", "zan_gate_", "zan_io_connect_",
-                    "zan_io_resolve", "zan_io_sockaddr_",
-                    NULL
-                };
-                static const char *const gui_pre2[] = { "zan_gui_", NULL };
-                if (wasm_obj_vec_refs_any(&generated_objects, sock_pre)
-                    && !wasm_obj_vec_refs_any(&generated_objects, gui_pre2)) {
-                    fprintf(stderr,
-                            "error: socket-async programs are not available for "
-                            "the wasm32 target\n");
-                    generated_object_vec_remove(&generated_objects, obj_tmp);
-                    zan_diag_free_buffers(irgen.diag);
-                    zan_irgen_destroy(&irgen);
-                    zan_arena_free(ir_arena);
-                    zan_arena_free(arena);
-                    free(source);
-                    return 1;
-                }
-            }
             char cmd[8192];
             snprintf(cmd, sizeof(cmd),
                      "wasm-ld%s --gc-sections -z stack-size=4194304 --max-memory=536870912 "
@@ -549,6 +547,12 @@
                      "-o \"%s\" \"%s/crt1.o\" \"%s\"",
                      (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys,
                      obj_tmp);
+            for (int di = 0; di < zan_lib_ndirs; di++) {
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", zan_lib_dirs[di]);
+            }
+            for (int di = 0; di < extra_lib_path_count; di++) {
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", extra_lib_paths[di]);
+            }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                          extra_link_inputs[ei]);
@@ -693,6 +697,12 @@
             if (irgen.wasm_eh_used) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_ehtag.o\"",
                          sys);
+            }
+            for (int li = 0; li < import_lib_count; li++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
+            }
+            for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
             }
             { cmd_appendf(cmd, sizeof(cmd),
                        " \"%s/libc.a\" \"%s/libm.a\" \"%s/libzigc.a\""

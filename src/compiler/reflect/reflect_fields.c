@@ -138,7 +138,6 @@ static LLVMValueRef refl_slot_offset(zan_irgen_t *g, LLVMTypeRef st, int slot) {
 }
 
 static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size);
-static void refl_append_method_params(zan_irgen_t *g, zan_ast_node_t *decl, char *buf, size_t cap);
 static LLVMValueRef refl_empty_string(zan_irgen_t *g);
 
 static void refl_extract_field_attrs(zan_symbol_t *m, const char **custom_name,
@@ -164,13 +163,13 @@ static void refl_extract_field_attrs(zan_symbol_t *m, const char **custom_name,
             len -= (dot + 1);
         }
 
-        /* 1. Custom Name: JsonProperty, JsonPropertyName, Column */
+        if (zan_data_orm_reflect_column(a, (zan_istr_t){s, (uint32_t)len},
+                                        custom_name, flags)) continue;
+        /* 1. Custom Name: JsonProperty, JsonPropertyName */
         if ((len == 12 && memcmp(s, "JsonProperty", 12) == 0) ||
             (len == 21 && memcmp(s, "JsonPropertyAttribute", 21) == 0) ||
             (len == 16 && memcmp(s, "JsonPropertyName", 16) == 0) ||
-            (len == 25 && memcmp(s, "JsonPropertyNameAttribute", 25) == 0) ||
-            (len == 6  && memcmp(s, "Column", 6) == 0) ||
-            (len == 15 && memcmp(s, "ColumnAttribute", 15) == 0)) {
+            (len == 25 && memcmp(s, "JsonPropertyNameAttribute", 25) == 0)) {
             for (int j = 0; j < a->attribute.args.count; j++) {
                 zan_ast_node_t *arg = a->attribute.args.items[j];
                 if (!arg) continue;
@@ -189,9 +188,6 @@ static void refl_extract_field_attrs(zan_symbol_t *m, const char **custom_name,
                         }
                     } else if (an.len == 10 && memcmp(an.str, "IsIdentity", 10) == 0) {
                         if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
-                            /* bit 3 = identity（自增列）。与 pk 位分离：
-                             * 复合主键（IsPrimary）不能被当成自增列，
-                             * PkList 按 IsIdent 排除自增列走列级主键。 */
                             *flags |= 8ULL;
                         }
                     } else if (an.len == 9 && memcmp(an.str, "IsPrimary", 9) == 0) {

@@ -227,8 +227,6 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
         const zan_ast_list_t *saved_type_params = c->method_type_params;
         c->method_type_params = &n->method_decl.type_params;
         c->shadow.count = 0;
-        for (int i = 0; i < c->fields.count; i++)
-            shadow_add(&c->shadow, c->fields.items[i]);
         collect_shadows_list(c, &n->method_decl.params);
         collect_shadows(c, n->method_decl.body);
         nr_walk(c, n->method_decl.return_type, ns, usings);
@@ -238,6 +236,7 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
             nr_walk_list(c, &n->method_decl.ext->base_args, ns, usings);
         }
         nr_walk(c, n->method_decl.body, ns, usings);
+        c->shadow.count = 0;
         c->method_type_params = saved_type_params;
         break;
     }
@@ -359,7 +358,7 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
             resolve_static_receiver(c, n->member.object, ns, usings,
                                     n->member.name);
         else if (n->member.object && n->member.object->kind == AST_MEMBER_ACCESS)
-            resolve_qualified_receiver(c, n->member.object);
+            resolve_qualified_receiver(c, n->member.object, ns, usings);
         nr_walk(c, n->member.object, ns, usings);
         break;
 
@@ -399,6 +398,13 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
         break;
 
     case AST_AWAIT_EXPR:
+        if (c->refs) {
+            /* Native await lowering can throw without a source type reference. */
+            static const char exception_name[] = "InvalidOperationException";
+            zan_refs_add(c->refs,
+                         (zan_istr_t){(char *)exception_name, sizeof(exception_name) - 1},
+                         c->arena);
+        }
         nr_walk(c, n->await_expr.expr, ns, usings);
         break;
 
@@ -489,6 +495,31 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     }
 }
 
+static void index_declarations(nr_ctx_t *c, const zan_ast_list_t *decls) {
+    c->items = (nr_type_t *)zan_arena_alloc(c->arena,
+                    sizeof(nr_type_t) * (size_t)decls->count);
+    for (int i = 0; i < decls->count; i++) {
+        zan_ast_node_t *d = decls->items[i];
+        if (!d || !is_type_decl_kind(d->kind)) continue;
+        nr_type_t *t = &c->items[c->count++];
+        *t = (nr_type_t){0};
+        t->decl = d;
+        t->simple = decl_source_name(d);
+        t->full = decl_full_name(c->arena, d);
+        if (decl_owner(d)) t->alias = join_ns(c->arena, zan_ast_ns_name(d), t->simple);
+        t->final = decl_simple_name(d);
+    }
+    nr_index_build(&c->by_full, c->items, c->count, NR_FULL, c->arena);
+    nr_index_build(&c->by_simple, c->items, c->count, NR_SIMPLE, c->arena);
+    nr_index_build(&c->by_alias, c->items, c->count, NR_ALIAS, c->arena);
+}
+
+static void walk_declaration(nr_ctx_t *c, zan_ast_node_t *decl, const nr_type_t *type) {
+    c->owner = type;
+    c->shadow.count = 0;
+    nr_walk(c, decl, zan_ast_ns_name(decl), zan_ast_ns_usings(decl));
+}
+
 static void nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena,
                           zan_diag_t *diag, bool qualified_keys) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
@@ -504,53 +535,46 @@ static void nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena,
     c.arena = arena;
     c.diag = diag;
     c.qualified_keys = qualified_keys;
-    c.items = (nr_type_t *)zan_arena_alloc(arena,
-                    sizeof(nr_type_t) * (size_t)(decls->count + 1));
+    index_declarations(&c, decls);
 
-    for (int i = 0; i < decls->count; i++) {
-        zan_ast_node_t *d = decls->items[i];
-        if (!d || !is_type_decl_kind(d->kind)) continue;
-        nr_type_t *t = &c.items[c.count++];
-        t->decl = d;
-        t->simple = decl_simple_name(d);
-        t->ns = zan_ast_ns_name(d);
-        t->full = join_ns(arena, t->ns, t->simple);
-        t->final = t->simple;
-        t->conflicting = false;
-    }
-    nr_index_build(&c.by_full, c.items, c.count, 1, arena);
-    nr_index_build(&c.by_simple, c.items, c.count, 0, arena);
-
-    /* 2 */
-    for (int node = 0; node < c.count; node++) {
-        zan_istr_t simple = c.items[node].simple;
-        for (int other = c.by_simple.buckets[nr_hash(simple) & c.by_simple.mask];
-             other >= 0; other = c.by_simple.chains[other].next) {
-            int j = c.by_simple.chains[other].idx;
-            if (j <= node) continue;
-            if (ns_istr_eq(c.items[j].simple, simple) &&
-                !ns_istr_eq(c.items[node].full, c.items[j].full)) {
-                c.items[node].conflicting = true;
-                c.items[j].conflicting = true;
-            }
+    /* A late source name can coincide with a key already assigned in pass one. */
+    for (int i = 0; i < c.count; i++) {
+        nr_type_t *t = &c.items[i];
+        if (ns_istr_eq(t->final, t->simple)) continue;
+        for (int node = c.by_simple.buckets[nr_hash(t->final) & c.by_simple.mask];
+             node >= 0; node = c.by_simple.chains[node].next) {
+            nr_type_t *other = &c.items[c.by_simple.chains[node].idx];
+            if (ns_istr_eq(other->simple, t->final)) other->conflicting = true;
         }
     }
 
     for (int i = 0; i < c.count; i++) {
-        if (qualified_keys ? c.items[i].ns.len == 0 : !c.items[i].conflicting) continue;
-        zan_istr_t m = qualified_keys ? c.items[i].full : mangle(&c, c.items[i].full);
-        c.items[i].final = m;
-        if (zan_ast_orig_name(c.items[i].decl).len == 0)
-            zan_ast_ensure_decl_meta(c.items[i].decl, arena)->orig_name = c.items[i].simple;
-        decl_set_name(c.items[i].decl, m);
+        nr_type_t *t = &c.items[i];
+        int first = i;
+        for (int node = c.by_simple.buckets[nr_hash(t->simple) & c.by_simple.mask];
+             node >= 0; node = c.by_simple.chains[node].next) {
+            int j = c.by_simple.chains[node].idx;
+            nr_type_t *other = &c.items[j];
+            if (!ns_istr_eq(other->simple, t->simple)) continue;
+            if (!same_decl_identity(other, t)) t->conflicting = true;
+            else if (j < first) first = j;
+        }
+        /* The binder diagnoses duplicates only when they have the same key. */
+        if (first < i) t->final = c.items[first].final;
+        else if (qualified_keys) t->final = t->full;
+        else if (t->conflicting && ns_istr_eq(t->final, t->simple))
+            t->final = mangle(&c, t->full);
+        if (!ns_istr_eq(t->final, t->simple) && zan_ast_orig_name(t->decl).len == 0)
+            zan_ast_ensure_decl_meta(t->decl, arena)->orig_name = t->simple;
+        decl_set_name(t->decl, t->final);
     }
+    nr_index_build(&c.by_final, c.items, c.count, NR_FINAL, arena);
 
-    /* 4 */
+    int type = 0;
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *d = decls->items[i];
         if (!d) continue;
-        c.shadow.count = 0;
-        nr_walk(&c, d, zan_ast_ns_name(d), zan_ast_ns_usings(d));
+        walk_declaration(&c, d, is_type_decl_kind(d->kind) ? &c.items[type++] : NULL);
     }
     free(c.fields.items);
     free(c.shadow.items);
@@ -570,37 +594,18 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     zan_ast_list_t *decls = &unit->comp_unit.decls;
     if (decls->count == 0) return;
 
-    int count = 0;
-    for (int i = 0; i < decls->count; i++) {
-        zan_ast_node_t *d = decls->items[i];
-        if (d && is_type_decl_kind(d->kind)) count++;
-    }
-    if (count == 0) return;
-    nr_type_t *items = (nr_type_t *)zan_arena_alloc(
-        arena, sizeof(nr_type_t) * (size_t)count);
-    if (!items) return;
-    int n = 0;
-    for (int i = 0; i < decls->count; i++) {
-        zan_ast_node_t *d = decls->items[i];
-        if (!d || !is_type_decl_kind(d->kind)) continue;
-        items[n].decl = d;
-        items[n].simple = decl_simple_name(d);
-        items[n].ns = zan_ast_ns_name(d);
-        items[n].full = join_ns(arena, items[n].ns, items[n].simple);
-        items[n].final = items[n].simple;
-        items[n].conflicting = false;
-        n++;
-    }
-    nr_index_t by_full;
-    nr_index_build(&by_full, items, n, 1, arena);
-    nr_index_t by_simple;
-    nr_index_build(&by_simple, items, n, 0, arena);
+    if (getenv("ZAN_NO_PRUNE")) return;
+    nr_ctx_t c = {0};
+    c.arena = arena;
+    index_declarations(&c, decls);
+    int n = c.count;
+    nr_type_t *items = c.items;
 
     int user_roots = 0;
     for (int i = 0; i < n; i++)
         if (!items[i].decl->from_stdlib) user_roots++;
     if (user_roots == 0) return;
-    if (getenv("ZAN_NO_PRUNE")) return;
+    nr_index_build(&c.by_final, items, n, NR_FINAL, arena);
     unsigned char *kept = (unsigned char *)calloc((size_t)n, 1);
     if (!kept) return;
     for (int i = 0; i < n; i++) {
@@ -618,35 +623,13 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
             }
             if (is_ext_host) kept[i] = 1;
 
-            /* 控制器（自动路由发现）：不修剪包与标准库控制器 */
-            if (d->kind == AST_CLASS_DECL && d->type_decl.name.str) {
-                uint32_t nl = d->type_decl.name.len;
-                const char *ns = d->type_decl.name.str;
-                if (nl >= 10 && memcmp(ns + nl - 10, "Controller", 10) == 0) {
-                    if (nl != 10 && (nl != 13 || memcmp(ns, "AppController", 13) != 0) &&
-                        (nl != 15 || memcmp(ns, "AdminController", 15) != 0) &&
-                        (nl != 13 || memcmp(ns, "ApiController", 13) != 0)) {
-                        kept[i] = 1;
-                    }
-                } else if (zan_ast_has_attr(d, "Route")) {
-                    kept[i] = 1;
-                }
-            }
+            if (zan_mvc_keep_namespace_decl(d)) kept[i] = 1;
         }
     }
 
     unsigned char *walked = (unsigned char *)calloc((size_t)n, 1);
     if (!walked) { free(kept); return; }
-    nr_ctx_t c;
-    memset(&c, 0, sizeof(c));
-    c.arena = arena;
-    c.diag = NULL;
-    c.items = items;
-    c.count = n;
-    nr_index_build(&c.by_full, items, n, 1, arena);
-    nr_index_build(&c.by_simple, items, n, 0, arena);
-    zp_refs_t refs;
-    memset(&refs, 0, sizeof(refs));
+    zp_refs_t refs = {0};
     c.refs = &refs;
     for (;;) {
         int before = 0;
@@ -656,10 +639,19 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
             walked[i] = 1;
             zan_ast_node_t *d = items[i].decl;
             refs.count = 0;
-            nr_walk(&c, d, zan_ast_ns_name(d), zan_ast_ns_usings(d));
+            walk_declaration(&c, d, &items[i]);
+            /* Keep duplicates of a live declaration visible to the binder. */
+            zan_refs_add(&refs, items[i].final, arena);
+            zan_ast_node_t *owner = decl_owner(d);
+            if (owner) zan_refs_add(&refs, decl_simple_name(owner), arena);
             for (int k = 0; k < refs.count; k++) {
-                int j = nr_index_find(&by_simple, items, 0, refs.items[k]);
-                if (j >= 0) kept[j] = 1;
+                zan_istr_t key = refs.items[k];
+                nr_index_t *ix = &c.by_final;
+                for (int node = ix->buckets[nr_hash(key) & ix->mask]; node >= 0;
+                     node = ix->chains[node].next) {
+                    int j = ix->chains[node].idx;
+                    if (ns_istr_eq(items[j].final, key)) kept[j] = 1;
+                }
             }
         }
         int after = 0;
@@ -669,15 +661,14 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     free(walked);
 
     int w = 0;
+    int type = 0;
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *d = decls->items[i];
-        if (d && is_type_decl_kind(d->kind)) {
-            int j = nr_index_find(&by_full, items, 1,
-                                  join_ns(arena, zan_ast_ns_name(d), decl_simple_name(d)));
-            if (j >= 0 && !kept[j]) continue;
-        }
+        if (d && is_type_decl_kind(d->kind) && !kept[type++]) continue;
         decls->items[w++] = d;
     }
     decls->count = w;
+    free(c.fields.items);
+    free(c.shadow.items);
     free(kept);
 }

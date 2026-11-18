@@ -202,6 +202,7 @@ rem <NDK>\lib\clang\<ver>\lib\linux\ into toolchain\android-<arch>\; libc.a is
 rem run through llvm-objcopy --decompress-debug-sections (zstd) so any lld
 rem links it. main.c never wraps malloc on Android (zanrt_mem.o + --wrap
 rem crashes under bionic's TLS bootstrap), so rt_mem is not built here.
+rem The NDK Clang driver locates the matching libc++abi.a and libunwind.a.
 if "%ANDROID_NDK%"=="" (
   for /d %%D in ("%LOCALAPPDATA%\Android\Sdk\ndk\*") do set ANDROID_NDK=%%D
 )
@@ -228,30 +229,26 @@ for %%P in (android-x64:x86_64 android-arm64:aarch64) do (
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\%%A\zanrt_decimal.o || exit /b 1
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -I src\common -O2 -c %EMBED%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -I %RT% -I src\common -O2 -c %EMBED%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
+    for %%L in (libc++abi.a libunwind.a) do (
+      call :copy_android_archive %%B-linux-android28 %%L "toolchain\%%A" || exit /b 1
+    )
     echo built toolchain\%%A
   )
 )
 
-rem OpenHarmony (OHOS): the NDK layout matches Android's (toolchains\llvm\
-rem prebuilt\windows-x86_64\{bin,sysroot}) but the target triples end in
-rem -linux-ohos and the sysroot libc is musl, so the same clang invocation
-rem works with -target <arch>-linux-ohos (no API level). OHOS musl libc.a
-rem exposes pthread/epoll; it lacks shm_open -- the __OHOS__ shim inside
-rem rt_sync.c (shared with Android) backs shared tables with files under
-rem $ZAN_SHM_DIR (default /data/local/tmp). Set OHOS_NDK to the NDK root
-rem (the directory containing native\). The sysroot subset itself
-rem (crt1.o crti.o crtn.o libc.a from sysroot\usr\lib\<triple>\,
-rem clang_rt.crtbegin.o clang_rt.crtend.o libclang_rt.builtins.a from
-rem llvm\lib\clang\<ver>\lib\<triple>\, libunwind.a from
-rem llvm\lib\<triple>\) is copied into toolchain\ohos-<arch>\; libm.a and
-rem libdl.a in the OHOS sysroot are empty 8-byte archives (math/dl symbols
-rem live in libc.a), so they are not committed. zap_main.o, zan_inflate.o
-rem and the NDK's libEGL.so/libGLESv3.so/libfreetype.so are produced here but
-rem also stay uncommitted (zanc needs them in toolchain\ohos-<arch> at
-rem cross-link time; rerun this script on a fresh checkout). The GL/FreeType
-rem set is what the prebuilt OHOS GUI driver links against -- the old empty
-rem stubs (scripts\ohos_stub.c) satisfied none of its symbols, so they are
-rem gone (TASKS.md A503).
+rem OpenHarmony (OHOS): set OHOS_NDK to the SDK root containing native\.
+rem Clang uses the OHOS triple and the musl sysroot under native\.
+rem The __OHOS__ shim inside rt_sync.c backs shared tables with files under
+rem $ZAN_SHM_DIR (default /data/local/tmp).
+rem The bundled crt1.o, crti.o, crtn.o and libc.a come from the target's
+rem sysroot\usr\lib directory. The compiler-rt objects and builtins archive
+rem come from Clang's resource directory, and libunwind.a from llvm\lib.
+rem This recipe also copies the target's libc++abi.a from llvm\lib and the
+rem sysroot's empty libdl.a and libpthread.a. The latter satisfy the ELF
+rem dependent library names in libunwind.a and libc++abi.a. OHOS libc.a
+rem supplies the symbols. The bundled copies use Native SDK 26.0.0.105.
+rem The NDK's libEGL.so, libGLESv3.so and libfreetype.so also enable the
+rem separate HAP GUI link.
 rem NDK-free fallback (automated below): without OHOS_NDK the build delegates
 rem to scripts\build_ohos_rt_zig.sh, which rebuilds the same objects with zig
 rem (its bundled musl supplies the headers; -D__OHOS__ re-adds the OS
@@ -274,9 +271,13 @@ goto :ohos_done
 :ohos_ndk
 set OHOSBIN=%OHOS_NDK%\native\llvm\bin
 set OHOSSYS=%OHOS_NDK%\native\sysroot
-for %%P in (ohos-x64:x86_64-unknown-linux-ohos ohos-arm64:aarch64-unknown-linux-ohos) do (
+for %%P in (ohos-x64:x86_64-linux-ohos ohos-arm64:aarch64-linux-ohos) do (
   for /f "tokens=1,2 delims=:" %%A in ("%%P") do (
     if not exist toolchain\%%A mkdir toolchain\%%A
+    copy /y "%OHOSBIN%\..\lib\%%B\libc++abi.a" "toolchain\%%A\libc++abi.a" >nul || exit /b 1
+    for %%L in (libdl.a libpthread.a) do (
+      copy /y "%OHOSSYS%\usr\lib\%%B\%%L" "toolchain\%%A\%%L" >nul || exit /b 1
+    )
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
@@ -284,8 +285,8 @@ for %%P in (ohos-x64:x86_64-unknown-linux-ohos ohos-arm64:aarch64-unknown-linux-
     rem (rt_hw_accel.c's SHA-256 kernel) only under a TU-level feature macro
     rem -- the target("sha2") attribute enables codegen but not the header
     rem guard -- so the timer object needs -march. Handled after the loop;
-    %OHOSBIN%\clang.exe --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || if "%%B"=="x86_64-unknown-linux-ohos" exit /b 1
-%OHOSBIN%\clang.exe --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || if "%%B"=="x86_64-unknown-linux-ohos" exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || if "%%A"=="ohos-x64" exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || if "%%A"=="ohos-x64" exit /b 1
     rem One archive member per feature. OHOS clang 15 needs its ARM crypto
     rem header macro only for the hash implementation, never for CPU dispatch.
     if exist toolchain\%%A\libzancrypto.a del /q toolchain\%%A\libzancrypto.a
@@ -331,3 +332,13 @@ echo built toolchain\ohos-arm64\zanrt_timer.o +crypto
 
 :ohos_done
 exit /b 0
+
+:copy_android_archive
+for /f "delims=" %%F in ('"%NDKBIN%\clang.exe" -target %~1 --print-file-name %~2') do (
+  if not "%%F"=="%~2" if exist "%%F" (
+    copy /y "%%~fF" "%~3\%~2" >nul || exit /b 1
+    exit /b 0
+  )
+)
+echo error: %~1 NDK archive %~2 not found 1>&2
+exit /b 1

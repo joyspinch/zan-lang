@@ -10,7 +10,7 @@
 #   powershell -File scripts\clean_build.ps1 -Apply
 #   powershell -File scripts\clean_build.ps1 -Apply -Screenshots  # also the PNGs
 #
-# Three lines of junk, three different rules:
+# Five lines of junk, five different rules:
 #
 #   1. build\cases\      the case cache. Reused between runs (run_case.cmake
 #                         skips the compile when the exe is newer than the
@@ -26,6 +26,19 @@
 #                         against an explicit keep list, never by pattern.
 #   3. ctest leftovers   one LastTest.log.tmpXXXXXX per run, never cleaned by
 #                         ctest itself.
+#   4. build\test-out\   one timestamped directory per acceptance / publish
+#                         verification run, each holding a full publish tree
+#                         (ZanIDE.exe alone is ~90MB). Nothing rotated them:
+#                         748 directories / 14GB by 2026-11. Swept by run age
+#                         (TestOutKeepDays), whole directory at a time.
+#   5. experiment dirs   selfhost_illir* / selfhost_sweep* (selfhost emitter IR
+#                         audits and builtin sweeps), selfhost_repo (the
+#                         audit_selfhost_ir_golden.py IR dump) and ab (a full
+#                         reference-compiler build tree per ab_compiler.ps1
+#                         run) are regenerable one-off output. 24GB in 28
+#                         directories by 2026-11. Swept by experiment age.
+#                         build\cef-headers\ is a 1.9GB download cache and is
+#                         deliberately NOT swept.
 #
 # Rules:
 # - Real products, the toolchain and every non-executable (runtime .a / .lib /
@@ -41,6 +54,8 @@ param(
     [switch]$Screenshots,
     [int]$KeepDays = 7,        # 用例缓存的保质期：超过就当冷缓存丢掉
     [int]$MaxCacheMB = 512,     # 用例缓存的体积上限：超了就从最旧的开始扔
+    [int]$TestOutKeepDays = 2,  # build\test-out\ 的每个运行目录保留几天
+    [int]$ExperimentKeepDays = 7, # selfhost_* / ab 一次性实验目录保留几天
     [string]$Build = (Join-Path $PSScriptRoot "..\build")
 )
 
@@ -70,6 +85,28 @@ $keepExe = @(
 )
 
 $plan = [ordered]@{}
+
+# 目录的体积和年龄都不能直接读：DirectoryInfo.Length 不存在，目录 mtime 也不
+# 会因子目录写入而更新（NTFS 只更新直接子项所在目录）。所以按树内最新的文件
+# 时间算年龄——活跃会话正在写的目录不会被误判成旧货。
+function Get-TreeBytes([System.IO.FileSystemInfo]$item) {
+    if ($item -is [System.IO.FileInfo]) { return $item.Length }
+    $sum = (Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Measure-Object Length -Sum).Sum
+    if ($null -eq $sum) { 0 } else { [int64]$sum }
+}
+
+function Get-NewestWriteTime([System.IO.FileSystemInfo]$item) {
+    if ($item -is [System.IO.FileInfo]) { return $item.LastWriteTime }
+    # 只用树内文件的时间：目录自身 mtime 会被子项创建刷新，拿它判定会把
+    # 刚被别人 Set-Content 碰过的旧目录当天货（探针实测过一次）。
+    $newest = $null
+    foreach ($f in (Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        if ($null -eq $newest -or $f.LastWriteTime -gt $newest) { $newest = $f.LastWriteTime }
+    }
+    if ($null -eq $newest) { return $item.LastWriteTime }   # 空目录只能退回目录时间
+    return $newest
+}
 
 # ---- 1. build\cases\ 的用例缓存：按最近使用清扫，不是全删 ----------------
 $casesDir = Join-Path $buildFull 'cases'
@@ -120,7 +157,32 @@ $diffExe = @($diffDirs | ForEach-Object {
 })
 if ($diffExe.Count) { $plan['自举对拍的一次性可执行文件'] = $diffExe }
 
-# ---- 5. 截图：每帧一张 PNG，攒起来能到几万个 -------------------------------
+# ---- 5. build\test-out\：每次验收/发布验证一个带时间戳的目录 ---------------
+# 目录里是完整 publish 产物（ZanIDE.exe 单个 ~90MB），2026-11 已累积到 748 个
+# 目录 / 14GB。按运行时间轮转整目录，保留最近 TestOutKeepDays 天（当前会话的
+# 证据一定在内），更早的运行产物都是历史记录，要复查就跑一遍。
+$testOutDir = Join-Path $buildFull 'test-out'
+if (Test-Path -LiteralPath $testOutDir) {
+    $testOutCutoff = (Get-Date).AddDays(-$TestOutKeepDays)
+    $staleRuns = @(Get-ChildItem -LiteralPath $testOutDir -Directory -ErrorAction SilentlyContinue |
+                   Where-Object { (Get-NewestWriteTime $_) -lt $testOutCutoff })
+    if ($staleRuns.Count) { $plan["验收产物（build\test-out\ 超过 $TestOutKeepDays 天的运行）"] = $staleRuns }
+    Write-Host ("[test-out] 保留 {0} 个运行目录，清掉 {1} 个" -f `
+                ((Get-ChildItem -LiteralPath $testOutDir -Directory -ErrorAction SilentlyContinue).Count - $staleRuns.Count),
+                $staleRuns.Count)
+}
+
+# ---- 6. 一次性实验目录：自举 IR / 内置函数矩阵 / 参照编译器 A/B -------------
+# 这些目录都能重跑重建，且一次批量实验就是 1-2GB；2026-11 累积 24GB / 28 个目录。
+# cef-headers 是下载缓存，不在名单里。
+$expPatterns = @('selfhost_illir*', 'selfhost_sweep*', 'selfhost_repo', 'ab')
+$expCutoff = (Get-Date).AddDays(-$ExperimentKeepDays)
+$expDirs = @($expPatterns | ForEach-Object {
+    Get-ChildItem -LiteralPath $buildFull -Directory -Filter $_ -ErrorAction SilentlyContinue
+} | Where-Object { (Get-NewestWriteTime $_) -lt $expCutoff })
+if ($expDirs.Count) { $plan["一次性实验目录（超过 $ExperimentKeepDays 天的）"] = @($expDirs) }
+
+# ---- 7. 截图：每帧一张 PNG，攒起来能到几万个 -------------------------------
 if ($Screenshots) {
     $pngs = @(Get-ChildItem -LiteralPath $buildFull -Recurse -File -Filter '*.png' -ErrorAction SilentlyContinue)
     if ($pngs.Count) { $plan['截图（PNG）'] = $pngs }
@@ -131,17 +193,18 @@ if ($plan.Count -eq 0) {
     exit 0
 }
 
-$totalFiles = 0
+$totalItems = 0
 $totalMB = 0.0
 Write-Host ("build/ sweep target: {0}" -f $buildFull)
 foreach ($k in $plan.Keys) {
-    $files = $plan[$k]
-    $mb = ($files | Measure-Object Length -Sum).Sum / 1MB
-    $totalFiles += $files.Count
+    $items = $plan[$k]
+    $mb = 0.0
+    foreach ($it in $items) { $mb += (Get-TreeBytes $it) / 1MB }
+    $totalItems += $items.Count
     $totalMB += $mb
-    Write-Host ("  {0,-42} {1,6} 个  {2,8:N1} MB" -f $k, $files.Count, $mb)
+    Write-Host ("  {0,-42} {1,6} 个  {2,8:N1} MB" -f $k, $items.Count, $mb)
 }
-Write-Host ("  {0,-42} {1,6} 个  {2,8:N1} MB" -f '合计', $totalFiles, $totalMB)
+Write-Host ("  {0,-42} {1,6} 个  {2,8:N1} MB" -f '合计', $totalItems, $totalMB)
 
 if (-not $Apply) {
     Write-Host ""
@@ -154,7 +217,11 @@ $skipped = 0
 foreach ($k in $plan.Keys) {
     foreach ($f in $plan[$k]) {
         try {
-            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+            if ($f -is [System.IO.DirectoryInfo]) {
+                Remove-Item -LiteralPath $f.FullName -Recurse -Force -ErrorAction Stop
+            } else {
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+            }
             $deleted++
         } catch {
             # in use by a running process, or locked by another session
@@ -164,5 +231,5 @@ foreach ($k in $plan.Keys) {
 }
 
 Write-Host ""
-Write-Host ("deleted {0} file(s), skipped {1} (in use)." -f $deleted, $skipped)
+Write-Host ("deleted {0} entry(ies), skipped {1} (in use)." -f $deleted, $skipped)
 exit 0

@@ -1,4 +1,4 @@
-/* rt_sync_table_life.c: 共享内存表生命周期、挂载、内存驻留统计与锁/过期管理 */
+/* rt_sync_table_life.c: 共享内存表生命周期、挂载、内存驻留统计与原子行操作 */
 
 typedef struct {
     uint64_t capacity;
@@ -514,7 +514,7 @@ int64_t zan_shared_table_stat(int64_t handle, int32_t what) {
 int32_t zan_shared_table_expire(
     int64_t handle, const char *key, int64_t ttl_ms) {
     if (ttl_ms < 0) return 0;
-    int64_t now_ms = zan_wall_now_ms();
+    int64_t now_ms = zan_time_epoch_ms();
     if (ttl_ms > INT64_MAX - now_ms) return 0;
     return zan_shared_table_expire_at(handle, key, now_ms + ttl_ms);
 }
@@ -524,7 +524,7 @@ int32_t zan_shared_table_expire_at(
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table || !key || expires_at_ms < 0) return 0;
     zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, zan_wall_now_ms(),
+    zan_purge_expired_locked(table->header, zan_time_epoch_ms(),
                              ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
@@ -556,7 +556,7 @@ int64_t zan_shared_table_expires_at(int64_t handle, const char *key) {
 int64_t zan_shared_table_purge_expired(int64_t handle, int64_t now_ms) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
-    if (now_ms < 0) now_ms = zan_wall_now_ms();
+    if (now_ms < 0) now_ms = zan_time_epoch_ms();
     zan_struct_lock(table->header);
     uint64_t before = table->header->count;
     zan_purge_expired_locked(table->header, now_ms, UINT64_MAX);
@@ -565,122 +565,83 @@ int64_t zan_shared_table_purge_expired(int64_t handle, int64_t now_ms) {
     return (int64_t)removed;
 }
 
-int32_t zan_shared_table_rate_allow(
-    int64_t handle, const char *key, int64_t now_ms,
-    int64_t window_ms, int64_t limit) {
+int32_t zan_shared_table_edit_ints(
+    int64_t handle, const char *key, int64_t now_ms, uint64_t purge_limit,
+    const char *const *columns, uint32_t column_count,
+    zan_table_int_edit_fn edit, void *context) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
-    if (limit <= 0) return 1;
-    if (!table || !key || window_ms <= 0) return 0;
-    if (now_ms < 0) now_ms = zan_wall_now_ms();
-    if (window_ms > INT64_MAX - now_ms) return 0;
-    zan_shared_column *count_column = zan_find_column(
-        table->header, "count", ZAN_TABLE_INT);
-    zan_shared_column *start_column = zan_find_column(
-        table->header, "window_start", ZAN_TABLE_INT);
-    if (!count_column || !start_column) return 0;
+    if (!table || !key || !edit || column_count > ZAN_TABLE_MAX_COLUMNS ||
+        (column_count && !columns)) return 0;
 
-    int allowed = 0;
-    zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, now_ms, ZAN_PURGE_MAX_BATCH);
-    unsigned char *row = zan_find_row(table->header, key, 0);
-    if (!row) row = zan_find_row(table->header, key, 1);
+    zan_shared_header *header = table->header;
+    uint32_t offsets[ZAN_TABLE_MAX_COLUMNS];
+    uint64_t selected = 0;
+    for (uint32_t i = 0; i < column_count; i++) {
+        zan_shared_column *column = zan_find_column(header, columns[i], ZAN_TABLE_INT);
+        if (!column) return 0;
+        uint64_t bit = UINT64_C(1) << (column - header->columns);
+        if (selected & bit) return 0;
+        selected |= bit;
+        offsets[i] = column->offset;
+    }
+
+    size_t key_len = zan_strnlen(key, header->key_size + 1u);
+    zan_struct_lock(header);
+    if (now_ms < 0) now_ms = zan_time_epoch_ms();
+    zan_purge_expired_locked(header, now_ms, purge_limit);
+    if (key_len == 0 || key_len > header->key_size) {
+        zan_struct_unlock(header);
+        return 0;
+    }
+
+    uint64_t hash = zan_hash_bytes(key);
+    unsigned char *row = zan_find_key_slot(header, key, hash, 0);
+    int exists = row != NULL;
+    int64_t values[ZAN_TABLE_MAX_COLUMNS];
+    int64_t expires_at = 0;
     if (row) {
         zan_row_lock(row);
-        int64_t count = 0;
-        int64_t start = 0;
-        memcpy(&count, row + count_column->offset, sizeof(count));
-        memcpy(&start, row + start_column->offset, sizeof(start));
-        if (start <= 0 || now_ms - start >= window_ms) {
-            count = 1;
-            start = now_ms;
-            zan_expiry_set(
-                table->header, zan_row_slot(table->header, row), row,
-                now_ms + window_ms);
-            allowed = 1;
-        } else if (count < limit) {
-            count++;
-            allowed = 1;
-        }
-        memcpy(row + count_column->offset, &count, sizeof(count));
-        memcpy(row + start_column->offset, &start, sizeof(start));
-        zan_row_unlock(row);
+        for (uint32_t i = 0; i < column_count; i++)
+            memcpy(&values[i], row + offsets[i], sizeof(values[i]));
+        expires_at = *zan_row_expires_at(row);
+    } else {
+        memset(values, 0, column_count * sizeof(*values));
     }
-    zan_struct_unlock(table->header);
-    return allowed;
-}
 
-int32_t zan_shared_table_lock_acquire(
-    int64_t handle, const char *key, int64_t owner,
-    int64_t now_ms, int64_t lease_ms) {
-    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
-    if (!table || !key || owner == 0 || lease_ms <= 0) return 0;
-    if (now_ms < 0) now_ms = zan_wall_now_ms();
-    if (lease_ms > INT64_MAX - now_ms) return 0;
-    zan_shared_column *owner_column = zan_find_column(
-        table->header, "owner", ZAN_TABLE_INT);
-    if (!owner_column) return 0;
-
-    int acquired = 0;
-    zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, now_ms, UINT64_MAX);
-    unsigned char *row = zan_find_row(table->header, key, 0);
-    if (!row) {
-        row = zan_find_row(table->header, key, 1);
+    int committed = 0;
+    zan_table_edit_action action = edit(context, exists, values, &expires_at);
+    if (action == ZAN_TABLE_EDIT_WRITE && expires_at >= 0) {
+        if (!row) {
+            row = zan_find_key_slot(header, key, hash, 1);
+            if (row) zan_row_lock(row);
+        }
         if (row) {
-            zan_row_lock(row);
-            memcpy(row + owner_column->offset, &owner, sizeof(owner));
-            zan_expiry_set(
-                table->header, zan_row_slot(table->header, row), row,
-                now_ms + lease_ms);
-            zan_row_unlock(row);
-            acquired = 1;
+            /* After publication, typed readers still wait on the row lock. */
+            if (!exists) zan_publish_key_row(header, row, key, key_len, hash);
+            for (uint32_t i = 0; i < column_count; i++)
+                memcpy(row + offsets[i], &values[i], sizeof(values[i]));
+            if (expires_at != *zan_row_expires_at(row))
+                zan_expiry_set(header, zan_row_slot(header, row), row, expires_at);
+            committed = 1;
         }
+    } else if (action == ZAN_TABLE_EDIT_DELETE && row) {
+        zan_delete_row_locked(header, row);
+        committed = 1;
     }
-    zan_struct_unlock(table->header);
-    return acquired;
-}
-
-int32_t zan_shared_table_lock_release(
-    int64_t handle, const char *key, int64_t owner) {
-    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
-    if (!table || !key || owner == 0) return 0;
-    zan_shared_column *owner_column = zan_find_column(
-        table->header, "owner", ZAN_TABLE_INT);
-    if (!owner_column) return 0;
-
-    int released = 0;
-    zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
-    unsigned char *row = zan_find_row(table->header, key, 0);
-    if (row) {
-        zan_row_lock(row);
-        int64_t current_owner = 0;
-        memcpy(&current_owner, row + owner_column->offset, sizeof(current_owner));
-        if (current_owner == owner) {
-            zan_expiry_remove(table->header, row);
-            memset(row + 8, 0, table->header->row_stride - 8);
-            zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
-            table->header->count--;
-            released = 1;
-        }
-        zan_row_unlock(row);
-    }
-    zan_struct_unlock(table->header);
-    return released;
+    if (row) zan_row_unlock(row);
+    zan_struct_unlock(header);
+    return committed;
 }
 
 int32_t zan_shared_table_delete(int64_t handle, const char *key) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
+    zan_purge_expired_locked(table->header, zan_time_epoch_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
         zan_row_lock(row);
-        zan_expiry_remove(table->header, row);
-        memset(row + 8, 0, table->header->row_stride - 8);
-        zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
-        table->header->count--;
+        zan_delete_row_locked(table->header, row);
         zan_row_unlock(row);
     }
     zan_struct_unlock(table->header);
@@ -723,3 +684,6 @@ void zan_shared_table_clear(int64_t handle) {
     table->header->expiry_count = 0;
     zan_struct_unlock(table->header);
 }
+
+/* Keep the stdlib's native compatibility symbols in the existing sync object. */
+#include "rt_sync_table_compat.c"

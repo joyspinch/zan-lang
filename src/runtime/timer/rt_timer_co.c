@@ -83,40 +83,7 @@ void zan_co_live_add(void *frame) {
     live_unlock();
 }
 
-#define ZAN_MAX_JOIN_FIRES 16
-static int join_on_untrack(void *frame, void **out_joiners,
-                           zan_timer_step_t *out_steps, int max_fires);
-
-void zan_co_live_del(void *frame) {
-    if (!frame || !g_colive_cap) return;
-    void *fire_joiners[ZAN_MAX_JOIN_FIRES];
-    zan_timer_step_t fire_steps[ZAN_MAX_JOIN_FIRES];
-    live_lock();
-    int nfires = join_on_untrack(frame, fire_joiners, fire_steps, ZAN_MAX_JOIN_FIRES);
-    size_t mask = g_colive_cap - 1;
-    size_t i = live_hash(frame) & mask;
-    for (;;) {
-        void *cur = g_colive_slots[i];
-        if (!cur) break;
-        if (cur == frame) {
-            g_colive_slots[i] = ZAN_LIVE_DEAD;
-            g_colive_live--;
-            g_colive_dead++;
-            break;
-        }
-        i = (i + 1) & mask;
-    }
-    live_unlock();
-    void (*_hook)(void *, zan_timer_step_t) = g_ready_hook;
-    if (_hook) {
-        for (int k = 0; k < nfires; k++) {
-            _hook(fire_joiners[k], fire_steps[k]);
-        }
-    }
-}
-
 int zan_co_live_count(void) {
-    if (!g_colive_cap) return 0;
     live_lock();
     int n = (int)g_colive_live;
     live_unlock();
@@ -124,6 +91,7 @@ int zan_co_live_count(void) {
 }
 
 static int live_has_nolock(void *frame) {
+    if (!g_colive_cap) return 0;
     size_t mask = g_colive_cap - 1;
     size_t i = live_hash(frame) & mask;
     for (;;) {
@@ -135,7 +103,7 @@ static int live_has_nolock(void *frame) {
 }
 
 int zan_co_live_has(void *frame) {
-    if (!frame || !g_colive_cap) return 0;
+    if (!frame) return 0;
     live_lock();
     int found = live_has_nolock(frame);
     live_unlock();
@@ -218,32 +186,41 @@ static void joinmap_put(zan_join_pair_t *pr) {
                            : 64);
     size_t mask = g_joinmap_cap - 1;
     size_t i = live_hash(pr->frame) & mask;
+    size_t reuse = SIZE_MAX;
     for (;;) {
         zan_join_pair_t *cur = g_joinmap_slots[i];
-        if (!cur || cur == JOINMAP_TOMB) {
-            if (cur == JOINMAP_TOMB) g_joinmap_dead--;
-            g_joinmap_slots[i] = pr;
-            g_joinmap_live++;
-            return;
-        }
-        if (cur != JOINMAP_TOMB && cur->frame == pr->frame) {
-            /* 同一任务被多个 join 监听：头插法链入一对多链表 */
+        if (!cur) break;
+        if (cur == JOINMAP_TOMB) {
+            if (reuse == SIZE_MAX) reuse = i;
+        } else if (cur->frame == pr->frame) {
+            /* Keep every subscriber for a frame on the same chain. */
             pr->next_in_frame = cur;
             g_joinmap_slots[i] = pr;
             return;
         }
         i = (i + 1) & mask;
     }
+    if (reuse != SIZE_MAX) {
+        i = reuse;
+        g_joinmap_dead--;
+    }
+    g_joinmap_slots[i] = pr;
+    g_joinmap_live++;
 }
 
-static zan_join_pair_t *joinmap_get(void *frame) {
+static zan_join_pair_t *joinmap_take(void *frame) {
     if (!g_joinmap_cap) return NULL;
     size_t mask = g_joinmap_cap - 1;
     size_t i = live_hash(frame) & mask;
     for (;;) {
         zan_join_pair_t *cur = g_joinmap_slots[i];
         if (!cur) return NULL;
-        if (cur != JOINMAP_TOMB && cur->frame == frame) return cur;
+        if (cur != JOINMAP_TOMB && cur->frame == frame) {
+            g_joinmap_slots[i] = JOINMAP_TOMB;
+            g_joinmap_live--;
+            g_joinmap_dead++;
+            return cur;
+        }
         i = (i + 1) & mask;
     }
 }
@@ -292,38 +269,80 @@ static int join_any_done(zan_join_t *j) {
     return 0;
 }
 
-static void join_fire_locked(zan_join_t *j, void **out_joiner, zan_timer_step_t *out_step) {
-    *out_joiner = NULL;
-    if (j->fired) return;
-    int trig = j->any ? join_any_done(j) : (j->remaining == 0);
-    if (!trig) return;
-    j->fired = 1;
-    *out_joiner = j->joiner;
-    *out_step = j->joiner_step;
+typedef void (*zan_join_ready_t)(void *, zan_timer_step_t);
+
+typedef struct {
+    void *frame;
+    zan_timer_step_t step;
+} zan_join_wake_t;
+
+#define JOIN_INLINE_WAKES 16
+
+typedef struct {
+    size_t count;
+    size_t overflow_cap;
+    zan_join_wake_t *overflow;
+    zan_join_wake_t local[JOIN_INLINE_WAKES];
+} zan_join_wakes_t;
+
+static zan_join_ready_t join_ready_hook(void) {
+    timer_lock();
+    zan_join_ready_t hook = g_ready_hook;
+    timer_unlock();
+    return hook;
 }
 
-static int join_on_untrack(void *frame, void **out_joiners,
-                           zan_timer_step_t *out_steps, int max_fires) {
-    int nfires = 0;
-    zan_join_pair_t *pr = joinmap_get(frame);
+static void join_wakes_add(zan_join_wakes_t *wakes, const zan_join_t *j) {
+    if (!j->joiner || !j->joiner_step) return;
+    size_t i = wakes->count++;
+    zan_join_wake_t wake = {j->joiner, j->joiner_step};
+    if (i < JOIN_INLINE_WAKES) {
+        wakes->local[i] = wake;
+        return;
+    }
+    i -= JOIN_INLINE_WAKES;
+    if (i == wakes->overflow_cap) {
+        size_t cap = wakes->overflow_cap ? wakes->overflow_cap * 2 : JOIN_INLINE_WAKES;
+        if (cap < wakes->overflow_cap || cap > SIZE_MAX / sizeof(wake))
+            zan_rt_fatal("oom", "join: wake list too large");
+        zan_join_wake_t *items = realloc(wakes->overflow, cap * sizeof(wake));
+        if (!items) zan_rt_fatal("oom", "join: wake list allocation failed");
+        wakes->overflow = items;
+        wakes->overflow_cap = cap;
+    }
+    wakes->overflow[i] = wake;
+}
+
+static void join_wakes_dispatch(zan_join_wakes_t *wakes) {
+    if (!wakes->count) return;
+    zan_join_ready_t hook = join_ready_hook();
+    if (hook) {
+        for (size_t i = 0; i < wakes->count; i++) {
+            zan_join_wake_t wake = i < JOIN_INLINE_WAKES
+                ? wakes->local[i] : wakes->overflow[i - JOIN_INLINE_WAKES];
+            hook(wake.frame, wake.step);
+        }
+    }
+    free(wakes->overflow);
+}
+
+static void join_on_task_end_locked(void *frame, zan_join_wakes_t *wakes) {
+    zan_join_pair_t *pr = joinmap_take(frame);
     while (pr) {
         zan_join_pair_t *next = pr->next_in_frame;
+        pr->next_in_frame = NULL;
         if (!pr->done) {
             pr->done = 1;
-            pr->owner->remaining--;
-            void *joiner = NULL;
-            zan_timer_step_t step = NULL;
-            join_fire_locked(pr->owner, &joiner, &step);
-            if (joiner && step && nfires < max_fires) {
-                out_joiners[nfires] = joiner;
-                out_steps[nfires] = step;
-                nfires++;
+            zan_join_t *j = pr->owner;
+            j->remaining--;
+            if (!j->fired && (j->any ? join_any_done(j) : j->remaining == 0)) {
+                j->fired = 1;
+                /* A ready waiter may immediately cancel and free its join. */
+                join_wakes_add(wakes, j);
             }
         }
-        joinmap_remove(frame, pr);
         pr = next;
     }
-    return nfires;
 }
 
 static int zan_sched_trace(void) {
@@ -338,37 +357,36 @@ static int zan_sched_trace(void) {
 }
 
 void zan_join_complete(void *frame) {
-    if (!frame || !g_joinmap_cap) return;
-    void *fire_joiners[ZAN_MAX_JOIN_FIRES];
-    zan_timer_step_t fire_steps[ZAN_MAX_JOIN_FIRES];
-    int nfires = 0;
+    if (!frame) return;
+    zan_join_wakes_t wakes = {0};
     live_lock();
-    zan_join_pair_t *pr = joinmap_get(frame);
-    while (pr) {
-        zan_join_pair_t *next = pr->next_in_frame;
-        if (!pr->done) {
-            pr->done = 1;
-            pr->owner->remaining--;
-            void *joiner = NULL;
-            zan_timer_step_t step = NULL;
-            join_fire_locked(pr->owner, &joiner, &step);
-            if (joiner && step && nfires < ZAN_MAX_JOIN_FIRES) {
-                fire_joiners[nfires] = joiner;
-                fire_steps[nfires] = step;
-                nfires++;
+    join_on_task_end_locked(frame, &wakes);
+    live_unlock();
+    join_wakes_dispatch(&wakes);
+}
+
+void zan_co_live_del(void *frame) {
+    if (!frame) return;
+    zan_join_wakes_t wakes = {0};
+    live_lock();
+    if (g_colive_cap) {
+        size_t mask = g_colive_cap - 1;
+        size_t i = live_hash(frame) & mask;
+        for (;;) {
+            void *cur = g_colive_slots[i];
+            if (!cur) break;
+            if (cur == frame) {
+                g_colive_slots[i] = ZAN_LIVE_DEAD;
+                g_colive_live--;
+                g_colive_dead++;
+                break;
             }
+            i = (i + 1) & mask;
         }
-        joinmap_remove(frame, pr);
-        pr = next;
+        join_on_task_end_locked(frame, &wakes);
     }
     live_unlock();
-
-    void (*_hook)(void *, zan_timer_step_t) = g_ready_hook;
-    if (_hook) {
-        for (int i = 0; i < nfires; i++) {
-            _hook(fire_joiners[i], fire_steps[i]);
-        }
-    }
+    join_wakes_dispatch(&wakes);
 }
 
 long long zan_join_new(int npairs, int any) {
@@ -386,11 +404,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
     if (!j || !frame) return 0;
     int bound = 0;
     live_lock();
-    /* An empty live table means no coroutine was ever tracked: the frame
-     * cannot be live, so skip instead of indexing g_colive_slots with a
-     * full-width hash (cap==0 makes mask==SIZE_MAX and the slot load faults,
-     * B-ID212). */
-    if (g_colive_cap != 0 && live_has_nolock(frame)) {
+    if (live_has_nolock(frame)) {
         int32_t done = __atomic_load_n(
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);
@@ -414,7 +428,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
 
 int zan_join_wait2(long long entry, void *frame, zan_timer_step_t step) {
     zan_join_t *j = (zan_join_t *)(intptr_t)entry;
-    if (!j || !g_ready_hook || !frame || !step) return 2;
+    if (!j || !frame || !step || !join_ready_hook()) return 2;
     int satisfied;
     live_lock();
     satisfied = j->fired || (j->any ? join_any_done(j) : j->remaining == 0);
@@ -427,8 +441,10 @@ void zan_join_cancel(long long entry) {
     zan_join_t *j = (zan_join_t *)(intptr_t)entry;
     if (!j) return;
     live_lock();
-    for (int i = 0; i < j->npairs; i++)
-        joinmap_remove(j->pairs[i].frame, &j->pairs[i]);
+    for (int i = 0; i < j->npairs; i++) {
+        zan_join_pair_t *pr = &j->pairs[i];
+        if (!pr->done) joinmap_remove(pr->frame, pr);
+    }
     live_unlock();
     free(j);
 }

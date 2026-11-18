@@ -28,6 +28,12 @@ int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]);
 int64_t zan_hw_sha512(const uint8_t *data, int64_t len, uint8_t out[64]);
 int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]);
 
+/* Ordinary Zan FFI uses 64-bit nint slots even on 32-bit targets. */
+int64_t zan_hw_ffi_sha256(uint64_t data, int64_t len, uint64_t out);
+int64_t zan_hw_ffi_sha1(uint64_t data, int64_t len, uint64_t out);
+int64_t zan_hw_ffi_sha512(uint64_t data, int64_t len, uint64_t out);
+int64_t zan_hw_ffi_sm3(uint64_t data, int64_t len, uint64_t out);
+
 /* SM4 分组密码 CBC 模式 (PKCS#7 填充)：支持 AES-NI/AVX2/ARM-SM4 硬件指令与 T-table 回退 */
 int64_t zan_hw_sm4_cbc_encrypt(const uint8_t *in, int64_t len,
                                const uint8_t *key, const uint8_t *iv,
@@ -129,6 +135,9 @@ void zan_hw_vec128_store(void *addr, const void *val);
 
 int64_t zan_hw_base64_encode(const uint8_t *src, int64_t len, char *dst);
 int64_t zan_hw_base64_decode(const char *src, int64_t len, uint8_t *dst);
+int64_t zan_hw_ffi_base64_capacity(int64_t len);
+int64_t zan_hw_ffi_base64_encode(uint64_t src, int64_t len, uint64_t dst);
+int64_t zan_hw_ffi_base64_decode(uint64_t dst, uint64_t src, int64_t len);
 
 int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len);
 int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len);

@@ -688,79 +688,84 @@ public partial class Control {
     // OnPaint 只需在之上绘制自己的内容。未设置任何样式时为空操作，
     // 因此自行绘制表面的既有控件不受影响。
     void PaintStyleBox(App app) {
+        paintedStyle = computedStyle;
         if (wiresOwnEvents || styleSurfaceOwned) { return; }
-        if (!this.ComputedStyleCurrent(app)) {
-            this.ResolveStyle(app, Style.SNormal());
+        StyleBox box = computedStyle;
+        int normalState = computedStyleState < 0 ? Style.SNormal() : computedStyleState;
+        int state = this.SurfaceState(app);
+        if (state != normalState || surfaceTarget != null) {
+            box = this.PaintSurface(app, box, normalState, state);
         }
-        Control target = this.SurfaceInputOwner();
-        StyleBox box = target == null ? computedStyle : this.InputSurface(app, target, computedStyle);
+        paintedStyle = box;
         box.Paint(app, bx, by, bw, bh);
     }
+
+    internal StyleBox paintedStyle;
 
     // A retained indicator can use its owner's input without becoming a separate hit target.
     protected virtual Control SurfaceInputOwner() {
         return this.InputFocusCapabilities() != 0 ? this : null;
     }
 
-    private static Control SurfaceEndpoint(Control hit) {
-        while (hit != null) {
-            if (hit.InputFocusCapabilities() != 0) { return hit; }
-            hit = hit.parent;
-        }
-        return null;
-    }
-
-    private AnimSlot surfaceHover;
-    private AnimSlot surfacePress;
-    private AnimSlot surfaceFocus;
-
-    private StyleBox InputSurface(App app, Control target, StyleBox normal) {
+    internal int SurfaceState(App app) {
         int state = computedStyleState < 0 ? Style.SNormal() : computedStyleState;
-        int id = target.WidgetId();
-        bool enabled = !target.IsDisabled();
-        bool hovered = enabled && Control.SurfaceEndpoint(app.lastHoveredControl) == target;
-        Control down = app.capturedPointerControl != null ? app.capturedPointerControl : app.pointerDownTarget;
-        bool pressed = hovered && Control.SurfaceEndpoint(down) == target;
-        bool focusedTarget = enabled && app.focus.IsFocused(id);
-        int ms = enabled ? normal.transitionMs : 0;
-        if (ms > 0 && !app.reducedMotion) {
-            if (hovered && surfaceHover == null) { surfaceHover = new AnimSlot(0, 0, 0, 0, 0, 0); }
-            if (pressed && surfacePress == null) { surfacePress = new AnimSlot(0, 0, 0, 0, 0, 0); }
-            if (focusedTarget && surfaceFocus == null) { surfaceFocus = new AnimSlot(0, 0, 0, 0, 0, 0); }
-        }
-        int hover = app.SurfaceTransitionIn(surfaceHover, hovered, ms, bx, by, bw, bh);
-        int press = app.SurfaceTransitionIn(surfacePress, pressed, ms, bx, by, bw, bh);
-        int focus = app.SurfaceTransitionIn(surfaceFocus, focusedTarget, ms, bx, by, bw, bh);
-        if (!enabled) { return this.SurfaceVariant(app, state | Style.SDisabled()); }
-        hover = Style.Curve(normal.easing, hover);
-        press = Style.Curve(normal.easing, press);
-        if (focus == 1000) {
-            int focusedState = state | Style.SFocus();
-            return this.BlendSurface(app, this.SurfaceVariant(app, focusedState), focusedState, hover, press);
-        }
-        StyleBox box = this.BlendSurface(app, normal, state, hover, press);
-        if (focus == 0) { return box; }
-        int withFocus = state | Style.SFocus();
-        StyleBox focused = this.BlendSurface(app, this.SurfaceVariant(app, withFocus), withFocus, hover, press);
-        return StyleBox.Blend(box, focused, Style.Curve(normal.easing, focus));
+        if (app == null) { return state; }
+        Control owner = this.SurfaceInputOwner();
+        return state | app.RetainedSurfaceState(owner != null ? owner : this);
     }
 
-    private StyleBox BlendSurface(App app, StyleBox box, int state, int hover, int press) {
-        if (press == 1000) { return this.SurfaceVariant(app, state | Style.SHover() | Style.SActive()); }
-        if (hover > 0) {
-            box = StyleBox.Blend(box, this.SurfaceVariant(app, state | Style.SHover()), hover);
+    private StyleBox surfaceNormal;
+    private StyleBox surfaceTarget;
+    private StyleBox surfaceFrom;
+    private StyleBox surfaceBlend;
+    private int surfaceDuration;
+    private int surfaceState;
+    private int surfaceStartMs;
+
+    private StyleBox PaintSurface(App app, StyleBox normal, int normalState, int state) {
+        bool stateChanged = state != surfaceState;
+        if (surfaceNormal != normal || stateChanged) {
+            StyleBox target = normal;
+            if (state != normalState) {
+                target = Style.Full(app, computedStyleType, computedStyleCls, name, state);
+                Style.Inline(target, this);
+            }
+            if (stateChanged) {
+                StyleBox previous = surfaceTarget == null ? normal : this.SurfaceSample(app);
+                surfaceDuration = target.transitionMs;
+                surfaceFrom = surfaceDuration > 0 && !app.reducedMotion
+                    && (state & Style.SDisabled()) == 0 && !previous.SameSurface(target)
+                    ? previous : null;
+                surfaceStartMs = app.nowMs;
+            }
+            if (target != surfaceTarget) { surfaceBlend = null; }
+            surfaceNormal = normal;
+            surfaceTarget = target;
+            surfaceState = state;
         }
-        if (press > 0) {
-            box = StyleBox.Blend(box, this.SurfaceVariant(app, state | Style.SHover() | Style.SActive()), press);
+        StyleBox result = this.SurfaceSample(app);
+        if (surfaceFrom != null) { app.RequestAnimationFrameIn(bx, by, bw, bh); }
+        else if (state == normalState) {
+            surfaceNormal = null;
+            surfaceTarget = null;
         }
-        return box;
+        return result;
     }
 
-    private StyleBox SurfaceVariant(App app, int state) {
-        // State changes affect paint only. Keep the measured box and selector context intact.
-        StyleBox box = Style.Full(app, this.StyleType(), this.EffectiveClass(), name, state);
-        Style.Inline(box, this);
-        return box;
+    private StyleBox SurfaceSample(App app) {
+        StyleBox target = surfaceTarget;
+        if (surfaceFrom == null) { return target; }
+        int elapsed = app.nowMs - surfaceStartMs;
+        if (app.reducedMotion || elapsed >= surfaceDuration) {
+            surfaceFrom = null;
+            surfaceBlend = null;
+            return target;
+        }
+        if (elapsed <= 0) { return surfaceFrom; }
+        int progress = (int)((long)elapsed * 1000 / surfaceDuration);
+        if (surfaceBlend == null) { surfaceBlend = target.Clone(); }
+        StyleBox.BlendSurfaceInto(surfaceBlend, surfaceFrom, target, Style.Curve(target.easing, progress));
+        return surfaceBlend;
     }
 
     // 设置测量偏好尺寸（px）：布局优先于 OnMeasure 的自测量与

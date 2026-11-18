@@ -539,7 +539,6 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx, zan_ast_node_t *call
 LLVMValueRef emit_object_family_call(zan_irgen_t *g, zan_ast_node_t *expr, int fam, local_scope_t *locals);
 LLVMValueRef emit_parse_bad_pred(zan_irgen_t *g, LLVMValueRef s, LLVMValueRef ep);
 LLVMValueRef emit_parse_str_guard(zan_irgen_t *g, LLVMValueRef s, zan_loc_t loc);
-LLVMValueRef emit_string_copy_range(zan_irgen_t *g, LLVMValueRef start, LLVMValueRef end);
 LLVMValueRef emit_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals, int *owned);
 LLVMValueRef emit_unresolved_call_result(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 int format_name_path(zan_ast_node_t *n, char *buf, int cap);
@@ -572,7 +571,6 @@ LLVMValueRef emit_byte_eq_mask_i64(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef 
 bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals, LLVMValueRef *out);
 bool emit_cpu_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals, LLVMValueRef *out);
 bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals, LLVMValueRef *out);
-bool emit_pixel_ops_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals, LLVMValueRef *out);
 LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v, unsigned lanes);
 LLVMValueRef emit_property_getter_call(zan_irgen_t *g, zan_symbol_t *getter, zan_type_t *recv_type, LLVMValueRef recv, zan_ast_node_t *obj_ast, local_scope_t *locals);
 void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter, zan_type_t *recv_type, LLVMValueRef recv, LLVMValueRef value, zan_ast_node_t *obj_ast, zan_ast_node_t *rhs_ast, local_scope_t *locals);
@@ -672,7 +670,8 @@ LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total, LLVMValueRef co
 LLVMValueRef zan_array_alloc_typed(zan_irgen_t *g, LLVMValueRef total, LLVMValueRef count, zan_type_t *elem_type);
 LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr);
 bool zan_convert_tostring_exact_decl(zan_irgen_t *g, zan_ast_node_t *arg, local_scope_t *locals);
-LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims, int rank, LLVMTypeRef elem_llvm);
+LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
+                              int rank, LLVMTypeRef elem_llvm, zan_type_t *elem_type);
 bool zan_type_defines(zan_irgen_t *g, const char *type_name, const char *method);
 
 /* --- From irgen_expr_dispatch.c (1 functions) --- */
@@ -756,10 +755,11 @@ void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code);
 void emit_fopen_check(zan_irgen_t *g, LLVMValueRef fp, const char *msg);
 void emit_guard_report3(zan_irgen_t *g, LLVMValueRef file_gv, unsigned line, unsigned col, LLVMValueRef msg_gv);
 void emit_guard_report_merged(zan_irgen_t *g, LLVMValueRef text);
-void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index, LLVMValueRef length, zan_loc_t loc, const char *kind);
+/* Bounds checks return the failure predicate, or NULL when checks are disabled. */
+LLVMValueRef emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index, LLVMValueRef length, zan_loc_t loc, const char *kind);
 LLVMValueRef emit_index_i64(zan_irgen_t *g, LLVMValueRef value, const char *name);
 LLVMValueRef emit_index_oob_pred(zan_irgen_t *g, LLVMValueRef index, LLVMValueRef length);
-void emit_index_range_check(zan_irgen_t *g, LLVMValueRef index, LLVMValueRef length, bool allow_end, zan_loc_t loc, const char *kind);
+LLVMValueRef emit_index_range_check(zan_irgen_t *g, LLVMValueRef index, LLVMValueRef length, bool allow_end, zan_loc_t loc, const char *kind);
 LLVMValueRef emit_index_safe_bounds(zan_irgen_t *g, LLVMValueRef index, LLVMValueRef length, zan_loc_t loc, const char *kind);
 LLVMValueRef emit_index_safe_check(zan_irgen_t *g, LLVMValueRef index, LLVMValueRef length, bool allow_end, zan_loc_t loc, const char *kind);
 void emit_io_abort_if(zan_irgen_t *g, LLVMValueRef cond, const char *msg);

@@ -1,5 +1,6 @@
 /* rt_hw_b64.c: Base64 快速查表与编解码向量加速实现 */
 #include "rt_hw_internal.h"
+#include "../../common/zan_abi.h"
 
 /* 7 */
 
@@ -166,5 +167,24 @@ int64_t zan_hw_base64_decode(const char *src, int64_t len, uint8_t *dst) {
     }
 
     return (int64_t)(d - dst);
+}
+
+int64_t zan_hw_ffi_base64_capacity(int64_t len) {
+    if (len <= 0) return 1;
+    const int64_t groups = len / 3 + (len % 3 != 0);
+    /* Leave room for the terminator and allocation header. The encoder
+     * reports its output length as a pointer difference. */
+    if (groups > (PTRDIFF_MAX - ZAN_ARR_HDR_SIZE - 1) / 4) return -1;
+    return groups * 4 + 1;
+}
+
+int64_t zan_hw_ffi_base64_encode(uint64_t src, int64_t len, uint64_t dst) {
+    return zan_hw_base64_encode((const uint8_t *)(uintptr_t)src, len,
+                                (char *)(uintptr_t)dst);
+}
+
+int64_t zan_hw_ffi_base64_decode(uint64_t dst, uint64_t src, int64_t len) {
+    return zan_hw_base64_decode((const char *)(uintptr_t)src, len,
+                                (uint8_t *)(uintptr_t)dst);
 }
 

@@ -3,6 +3,7 @@
 #define ZAN_IRGEN_COMPACT_H
 
 #include <stddef.h>
+#include <llvm-c/TargetMachine.h>
 #include <llvm-c/Types.h>
 
 #ifdef __cplusplus
@@ -19,6 +20,11 @@ int zan_irgen_compactor_run(zan_irgen_compactor_t *compactor,
                             char *errbuf, size_t errbuf_size);
 
 void zan_irgen_compactor_destroy(zan_irgen_compactor_t *compactor);
+
+/* LLVM's C target-machine API does not expose the emulated TLS option. */
+LLVMTargetMachineRef zan_create_emulated_tls_target_machine(
+    LLVMTargetRef target, const char *triple, const char *cpu,
+    const char *features, LLVMCodeGenOptLevel level);
 
 #ifdef __cplusplus
 }

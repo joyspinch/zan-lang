@@ -1,4 +1,6 @@
 #include "irgen_internal.h"
+#include "../../packages/Zan.Data/compiler/orm_adapter.h"
+#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 
 #include <limits.h>
 

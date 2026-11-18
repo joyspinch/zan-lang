@@ -29,15 +29,18 @@ script drives one full session and asserts the B-ID200 first-slice behaviors:
   cjk utf-16 columns             diagnostics/hover positions after CJK
                                  content on the same line (UTF-16, not bytes)
   didClose                       diagnostics cleared notification
-  shutdown/exit                  process exits 0
+  manifest changes               project boundaries update while stdin is idle
+  shutdown/exit                  polling stops, then process exits 0
 
 Failure prints the offending frame and exits 1; success prints PASS.
 """
 
 import json
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 
@@ -111,14 +114,25 @@ class Session(object):
     def __init__(self, exe):
         self.proc = subprocess.Popen(
             [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        self.buf = b""
         self.serial = 10
         self.notifications = []
         self.pending = None  # response read while draining for a diagnostic
+        self.frames = queue.Queue()
+        threading.Thread(target=self._read_frames, daemon=True).start()
 
     def send(self, msg):
         self.proc.stdin.write(frame(msg))
         self.proc.stdin.flush()
+
+    def expect_exit(self, reason):
+        try:
+            rc = self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+            fail(reason, "server did not exit")
+        if rc != 0:
+            fail(reason, "exit code %d" % rc)
 
     def request(self, method, params):
         self.serial += 1
@@ -130,30 +144,41 @@ class Session(object):
     def notify(self, method, params):
         self.send({"jsonrpc": "2.0", "method": method, "params": params})
 
+    def _read_frames(self):
+        try:
+            while True:
+                headers = {}
+                while True:
+                    line = self.proc.stdout.readline()
+                    if not line.endswith(b"\r\n"):
+                        raise AssertionError("invalid or incomplete LSP header: %r" % line)
+                    if line == b"\r\n":
+                        break
+                    key, _, value = line.partition(b":")
+                    headers[key.strip().lower().decode("ascii")] = value.strip()
+                size = int(headers["content-length"])
+                body = self.proc.stdout.read(size)
+                if len(body) != size:
+                    raise AssertionError("server closed mid-body")
+                self.frames.put(json.loads(body.decode("utf-8")))
+        except Exception as error:
+            self.frames.put(error)
+
     def _read_frame(self):
-        # read header lines until blank line
-        headers = {}
-        while True:
-            line = b""
-            while not line.endswith(b"\r\n"):
-                ch = self.proc.stdout.read(1)
-                if not ch:
-                    raise AssertionError("server closed mid-header: %r"
-                                         % self.buf[-200:])
-                line += ch
-            line = line[:-2]
-            if line == b"":
-                break
-            k, _, v = line.partition(b":")
-            headers[k.strip().lower().decode("ascii")] = v.strip()
-        n = int(headers["content-length"])
-        body = b""
-        while len(body) < n:
-            chunk = self.proc.stdout.read(n - len(body))
-            if not chunk:
-                raise AssertionError("server closed mid-body")
-            body += chunk
-        return json.loads(body.decode("utf-8"))
+        try:
+            frame = self.frames.get(timeout=10)
+        except queue.Empty:
+            raise AssertionError("timed out waiting for an LSP frame") from None
+        if isinstance(frame, Exception):
+            raise frame
+        return frame
+
+    def expect_quiet(self, seconds):
+        try:
+            frame = self.frames.get(timeout=seconds)
+        except queue.Empty:
+            return
+        fail("unexpected LSP output", repr(frame))
 
     def pump_until_response(self, rid):
         """Read frames until the response with id == rid shows up;
@@ -195,8 +220,9 @@ def fail(ctx, detail):
 
 def check_workspace(s, workspace):
     caller = (workspace / "app/src/Use.zan").as_uri()
-    library = (workspace / "app/Service.zan").as_uri()
+    library = (workspace / "app/lib/Service.zan").as_uri()
     manifest = workspace / "app/src/zan.proj"
+    library_manifest = workspace / "app/lib/zan.proj"
 
     def open_doc(uri, text):
         s.notify("textDocument/didOpen", {"textDocument": {
@@ -244,14 +270,192 @@ def check_workspace(s, workspace):
     expect_diag(library, 2, set())
     expect_diag(caller, 4, set())
 
+    # Verify the watched-file path independently by editing a dependency's
+    # contents without changing any manifest.
+    library_source = workspace / "app/lib/Service.zan"
+    original = library_source.read_text(encoding="utf-8")
+    for updated, messages in (("class Other {}", {"undefined type 'Service'"}), (original, set())):
+        library_source.write_text(updated, encoding="utf-8")
+        s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": library, "type": 2}]})
+        expect_diag(caller, 4, messages)
+
+    check_inheritance(workspace, open_doc, change_doc, close_doc, expect_diag)
+    check_inheritance_edges(s, workspace, open_doc, change_doc, close_doc, expect_diag)
+    check_nested_types(workspace, open_doc, change_doc, close_doc, expect_diag)
+
+    # No client messages during these mutations. The final pair changes only
+    # the dependency's project, while the open caller stays in app.
+    missing = {"undefined type 'Service'"}
     manifest.write_text("name=NestedApp\n", encoding="utf-8")
-    s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": manifest.as_uri(), "type": 1}]})
-    expect_diag(caller, 4, {"undefined type 'Service'"})
-    manifest.unlink()
-    s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": manifest.as_uri(), "type": 3}]})
+    expect_diag(caller, 4, missing)
+    manifest.rename(library_manifest)
+    expect_diag(caller, 4, missing)
+    library_manifest.unlink()
     expect_diag(caller, 4, set())
-    close_doc(caller)
+    library_manifest.write_text("name=NestedLib\n", encoding="utf-8")
+    expect_diag(caller, 4, missing)
+    library_manifest.unlink()
     expect_diag(caller, 4, set())
+    s.expect_quiet(1.2)
+    return manifest
+
+
+CONTRACTS = (
+    "namespace Contracts;\n"
+    "public interface IRead<T> { int Read(T input); int Optional(); }\n"
+    "public interface IReader : IRead<int> { int Optional() { return 0; } }\n"
+    "public abstract class AbstractReader { public abstract int Fetch(); }\n"
+    "public abstract class Middle : AbstractReader {}\n"
+    "public class BaseReader { public int Read(int input) { return input; } }\n"
+)
+
+
+def check_inheritance(workspace, open_doc, change_doc, close_doc, expect_diag):
+    implementation = (workspace / "app/contracts/Implementation.zan").as_uri()
+    dependency = (workspace / "app/contracts/Contracts.zan").as_uri()
+    missing_read = "[E1015] type 'Reader' does not implement interface method 'Read'"
+    missing_fetch = ("[E2093] non-abstract class 'ConcreteReader' does not implement abstract method "
+                     "'Fetch' inherited from 'Contracts.AbstractReader'")
+    open_doc(implementation, "using Contracts;\n"
+             "class Reader : IReader { public int Read(string input) { return 0; } }\n"
+             "class ConcreteReader : Middle {}\n"
+             "class Unknown : Helpr {}\n"
+             "class UnknownInterface : BaseReader, NoContract {}\n")
+    errors = expect_diag(implementation, 1, {
+        missing_read, missing_fetch, "undefined base type 'Helpr'", "undefined base type 'NoContract'",
+    })
+    expected_positions = {missing_read: (1, 0), missing_fetch: (2, 0),
+                          "undefined base type 'Helpr'": (3, 16),
+                          "undefined base type 'NoContract'": (4, 37)}
+    for error in errors:
+        start = error["range"]["start"]
+        if (start["line"], start["character"]) != expected_positions[error["message"]]:
+            fail("inheritance diagnostic range", repr(error))
+
+    change_doc(implementation, 2, "using Contracts;\n"
+               "class Reader : BaseReader, IReader {}\n"
+               "class ConcreteReader : Middle { public override int Fetch() { return 1; } }\n")
+    expect_diag(implementation, 2, set())
+    open_doc(dependency, CONTRACTS.replace("IRead<int>", "IRead<string>"))
+    expect_diag(implementation, 2, {missing_read})
+    expect_diag(dependency, 1, set())
+    close_doc(dependency)
+    expect_diag(dependency, 1, set())
+    expect_diag(implementation, 2, set())
+    close_doc(implementation)
+    expect_diag(implementation, 2, set())
+
+
+def check_inheritance_edges(s, workspace, open_doc, change_doc, close_doc, expect_diag):
+    edges = (workspace / "app/inheritance/Edges.zan").as_uri()
+    text = (
+        "namespace Inheritance;\n"
+        "class Alpha : Beta {}\n"
+        "interface IFirst : ISecond {}\n"
+        "class Illegal : Closed {}\n"
+        "class Hides : Base { public virtual int Read(string value) { return 0; } }\n"
+        "class Overload : Base { public virtual int Read() { return 0; } }\n"
+        "class Replaces : Base { public override int Read(int value) { return value; } }\n"
+    )
+    class_cycle = "[E1011] cyclic inheritance involving 'Inheritance.Alpha'"
+    interface_cycle = "[E1011] cyclic inheritance involving 'Inheritance.IFirst'"
+    sealed_base = "[E1014] cannot derive from sealed type 'Inheritance.Closed'"
+    hides_slot = ("[W2097] 'Read' is declared 'virtual' but hides an inherited virtual with the same "
+                  "name and arity; calls through base-class references will run the base implementation "
+                  "-- use 'override' to replace it")
+    open_doc(edges, text)
+    diagnostics = expect_diag(edges, 1, {class_cycle, interface_cycle, sealed_base})
+    expected = {
+        class_cycle: (1, 1, 0),
+        interface_cycle: (1, 2, 0),
+        sealed_base: (1, 3, 16),
+        hides_slot: (2, 4, 36),
+    }
+    actual = {d["message"]: (d["severity"], d["range"]["start"]["line"],
+                             d["range"]["start"]["character"]) for d in diagnostics}
+    if len(diagnostics) != len(expected) or actual != expected:
+        fail("inheritance edge diagnostics", repr(diagnostics))
+
+    response = s.request("textDocument/documentSymbol", {"textDocument": {"uri": edges}})
+    if not any(symbol["name"] == "Alpha" for symbol in response.get("result", [])):
+        fail("request with inheritance cycle", repr(response))
+
+    repaired = (text.replace("Alpha : Beta", "Alpha")
+                .replace("IFirst : ISecond", "IFirst")
+                .replace("Illegal : Closed", "Legal")
+                .replace("virtual int Read(string value)", "override int Read(int value)"))
+    change_doc(edges, 2, repaired)
+    if expect_diag(edges, 2, set()):
+        fail("inheritance recovery", "diagnostics remain after fixing the inheritance clauses")
+    close_doc(edges)
+    expect_diag(edges, 2, set())
+
+
+def check_nested_types(workspace, open_doc, change_doc, close_doc, expect_diag):
+    use = (workspace / "app/qualified/Use.zan").as_uri()
+    imported = (
+        "using Library;\n"
+        "class Holder { public Value Inner; }\n"
+        "struct Value { public int ValueOnly() { return 1; } }\n"
+        "class Use : Outer.Inner {\n"
+        "    Library.Outer.Inner first;\n"
+        "    Other.Outer.Inner second;\n"
+        "    int Imported() { return Outer.Inner.Read(); }\n"
+        "    int Shadowed(Holder Outer, int Inner) {\n"
+        "        return Outer.Inner.ValueOnly() + Library.Outer.Inner.Read() + Inner;\n"
+        "    }\n"
+        "}\n"
+    )
+    open_doc(use, imported)
+    expect_diag(use, 1, set())
+
+    relative = (
+        "namespace Library.Client;\n"
+        "class Use {\n"
+        "    Outer.Inner first;\n"
+        "    int Call() { return Outer.Inner.Read(); }\n"
+        "}\n"
+    )
+    change_doc(use, 2, relative)
+    expect_diag(use, 2, set())
+
+    scoped = (
+        "namespace Library;\n"
+        "public partial class Outer {\n"
+        "    Inner item;\n"
+        "    int Call() { return Inner.Read(); }\n"
+        "    public class Branch : Inner {\n"
+        "        Inner local;\n"
+        "        Deep.Leaf leaf;\n"
+        "        int ReadSibling() { return Inner.Read() + Deep.Leaf.ReadLeaf(); }\n"
+        "    }\n"
+        "}\n"
+    )
+    change_doc(use, 3, scoped)
+    expect_diag(use, 3, set())
+
+    invalid = (
+        "using Library;\n"
+        "class Use {\n"
+        "    Other.Missing.Inner wrongOwner;\n"
+        "    Missing.Outer.Inner wrongNamespace;\n"
+        "    Inner unqualified;\n"
+        "    int Read() { return Other.Outer.Inner.Read(); }\n"
+        "}\n"
+    )
+    change_doc(use, 4, invalid)
+    errors = expect_diag(use, 4, {
+        "undefined type 'Other.Missing.Inner'",
+        "undefined type 'Missing.Outer.Inner'",
+        "undefined type 'Inner'",
+        "type 'Other.Outer.Inner' has no method 'Read'",
+    })
+    if {d["range"]["start"]["line"] for d in errors} != {2, 3, 4, 5}:
+        fail("nested type diagnostic range", repr(errors))
+    change_doc(use, 5, imported)
+    expect_diag(use, 5, set())
+    close_doc(use)
+    expect_diag(use, 5, set())
 
 
 def main():
@@ -261,10 +465,37 @@ def main():
         sources = {
             "app/zan.proj": "name=App\n",
             "app/src/Use.zan": "class DiskUse {}\n",
-            "app/Service.zan": ("namespace Library; public class Service {\n"
-                                "public int Count; public static int Read() { return 1; }\n"
-                                "MissingInDependency bad; }\n"),
+            "app/lib/Service.zan": ("namespace Library; public class Service {\n"
+                                    "public int Count; public static int Read() { return 1; }\n"
+                                    "MissingInDependency bad; }\n"),
             "app/Broken.zan": "/* unfinished comment\n",
+            "app/contracts/zan.proj": "name=Contracts\n",
+            "app/contracts/Contracts.zan": CONTRACTS,
+            "app/inheritance/zan.proj": "name=Inheritance\n",
+            "app/inheritance/Bases.zan": (
+                "namespace Inheritance;\n"
+                "class Beta : Alpha {}\n"
+                "interface IEmpty {}\n"
+                "interface ISecond : IEmpty, IFirst {}\n"
+                "sealed class Closed {}\n"
+                "class Ancestor { public virtual int Read(int value) { return value; } }\n"
+                "class Base : Ancestor {}\n"
+                "class Probe { void Use(ISecond value) { value.Missing(); } }\n"
+            ),
+            "app/qualified/zan.proj": "name=Qualified\n",
+            "app/qualified/Library.zan": (
+                "namespace Library;\n"
+                "public partial class Outer {\n"
+                "    public class Inner { public static int Read() { return 1; } }\n"
+                "    public class Deep {\n"
+                "        public class Leaf { public static int ReadLeaf() { return 2; } }\n"
+                "    }\n"
+                "}\n"
+            ),
+            "app/qualified/Other.zan": (
+                "namespace Other;\n"
+                "public class Outer { public class Inner {} }\n"
+            ),
             "app/nested/zan.proj": "name=Nested\n",
             "app/nested/Types.zan": "namespace Library; public class NestedOnly {}\n",
             "app-extra/zan.proj": "name=Sibling\n",
@@ -275,6 +506,21 @@ def main():
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(text, encoding="utf-8")
         run_session(exe, workspace)
+        check_workspace_eof(exe, workspace)
+    print("PASS tool_lsp_zan_session")
+
+
+def check_workspace_eof(exe, workspace):
+    s = Session(exe)
+    s.request("initialize", {"rootUri": workspace.as_uri() + "/"})
+    uri = (workspace / "app/src/Use.zan").as_uri()
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": uri, "languageId": "zan", "version": 1, "text": "class Use {}"}})
+    diag = s.diag_for(uri)
+    if diag["version"] != 1 or diag["diagnostics"]:
+        fail("workspace EOF", "expected a clean open document, got %r" % diag)
+    s.proc.stdin.close()
+    s.expect_exit("workspace EOF")
 
 
 def run_session(exe, workspace):
@@ -659,22 +905,16 @@ def run_session(exe, workspace):
     if diag is None or diag["diagnostics"] != []:
         fail("didClose", "expected cleared diagnostics, got %r" % (diag,))
 
-    check_workspace(s, workspace)
+    manifest = check_workspace(s, workspace)
 
-    # shutdown + exit
+    # Keep a project document open so an active poller would publish on change.
     resp = s.request("shutdown", {})
-    if "result" not in resp:
-        fail("shutdown", "no result in %r" % (resp,))
+    if "result" not in resp or resp["result"] is not None:
+        fail("shutdown", "expected a null result in %r" % (resp,))
+    manifest.write_text("name=AfterShutdown\n", encoding="utf-8")
+    s.expect_quiet(2.2)
     s.notify("exit", None)
-    try:
-        rc = s.proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        s.proc.kill()
-        fail("exit", "server did not exit after exit notification")
-    if rc != 0:
-        fail("exit", "exit code %d" % rc)
-
-    print("PASS tool_lsp_zan_session")
+    s.expect_exit("exit")
 
 
 if __name__ == "__main__":

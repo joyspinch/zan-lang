@@ -251,25 +251,39 @@ public partial class Parser {
         while (j < gu.kids.Count) { unit.Add(gu.kids[j]); j = j + 1; }
     }
 
-    // Merge `partial` type declarations: members (and base) of later parts are
-    // appended to the first part of the same kind/name, later parts dropped.
-    // Runs before binding so the rest of the pipeline sees one decl per type.
-    void MergePartials(Node unit) {
+    bool CanMergeParts(Node first, Node part) {
+        if (first.kind != part.kind || !HasModBit(first.mods, MOD.Partial())
+                || !HasModBit(part.mods, MOD.Partial())
+                || (first.mods & MOD.Iface()) != (part.mods & MOD.Iface())) {
+            return false;
+        }
+        int i = 0;
+        while (i < first.kids.Count && first.kids[i].kind == AK.TypeParam()) {
+            if (i >= part.kids.Count || part.kids[i].kind != AK.TypeParam()
+                    || first.kids[i].sval != part.kids[i].sval) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return i >= part.kids.Count || part.kids[i].kind != AK.TypeParam();
+    }
+
+    // Merge siblings before hoisting so each nested type has its canonical
+    // owner, including when its declarations come from different owner parts.
+    void MergePartials(Node owner) {
         List<Node> merged = new List<Node>();
+        Dictionary<string, Node> parts = new Dictionary<string, Node>();
         int di = 0;
-        while (di < unit.kids.Count) {
-            Node d = unit.kids[di];
+        while (di < owner.kids.Count) {
+            Node d = owner.kids[di];
             Node first = null;
-            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && HasModBit(d.mods, MOD.Partial())) {
-                int fi = 0;
-                while (fi < merged.Count) {
-                    Node e = merged[fi];
-                    if (e.kind == d.kind && HasModBit(e.mods, MOD.Partial()) && e.sval == d.sval) {
-                        first = e;
-                        fi = merged.Count;
-                    } else {
-                        fi = fi + 1;
-                    }
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                string full = FullTypeName(d);
+                if (parts.ContainsKey(full)) {
+                    Node candidate = parts[full];
+                    if (CanMergeParts(candidate, d)) { first = candidate; }
+                } else {
+                    parts[full] = d;
                 }
             }
             if (first != null) {
@@ -285,32 +299,37 @@ public partial class Parser {
                     }
                     mi = mi + 1;
                 }
-                if (first.sval2 == "" && d.sval2 != "") { first.sval2 = d.sval2; first.type = d.type; }
-                if (d.nsUsings != null) {
-                    if (first.nsUsings == null) {
-                        first.nsUsings = new List<string>();
-                    }
-                    int ui = 0;
-                    while (ui < d.nsUsings.Count) {
-                        string u = d.nsUsings[ui];
-                        if (u != null && u != "") {
-                            int k = 0;
-                            bool dup = false;
-                            while (k < first.nsUsings.Count) {
-                                if (first.nsUsings[k] == u) { dup = true; }
-                                k = k + 1;
-                            }
-                            if (!dup) { first.nsUsings.Add(u); }
-                        }
-                        ui = ui + 1;
-                    }
+                if (first.sval2 == "" && d.sval2 != "") {
+                    first.sval2 = d.sval2;
+                    first.type = d.type;
+                    first.baseLine = d.baseLine;
+                    first.baseCol = d.baseCol;
                 }
+                first.mods = first.mods | (d.mods & MOD.Sealed());
             } else {
                 merged.Add(d);
             }
             di = di + 1;
         }
-        unit.kids = merged;
+        owner.kids = merged;
+        for (int i = 0; i < merged.Count; i = i + 1) {
+            Node d = merged[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { MergePartials(d); }
+        }
+    }
+
+    void CheckDuplicateTypes(Node unit) {
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        for (int i = 0; i < unit.kids.Count; i = i + 1) {
+            Node d = unit.kids[i];
+            if (!IsTypeDeclaration(d) || d.sval == "") { continue; }
+            string full = FullTypeName(d);
+            if (seen.ContainsKey(full)) {
+                diags.Error("[E1010] duplicate type declaration '" + full + "'", d.line, d.col);
+            } else {
+                seen[full] = true;
+            }
+        }
     }
 
     // Nested type declarations lift to the unit top level under their simple
@@ -337,11 +356,7 @@ public partial class Parser {
             Node mem = typeNode.kids[mi];
             if (mem.kind == AK.ClassDecl() || mem.kind == AK.StructDecl()
                     || mem.kind == AK.EnumDecl() || mem.kind == AK.DelegateDecl()) {
-                // a hoisted nested type keeps the enclosing declaration's
-                // resolution context (the C host stamps members with the
-                // file's namespace, not an Outer.Inner path)
-                mem.nsName = typeNode.nsName != null ? typeNode.nsName : "";
-                mem.nsUsings = typeNode.nsUsings;
+                // Keep the source context stamped before partials merged.
                 mem.a = typeNode;
                 hoisted = hoisted + HoistNested(unit, mem);
                 unit.Add(mem);

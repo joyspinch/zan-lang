@@ -45,8 +45,8 @@ static int owner_stage, owner_start_failed, owner_barriers, owner_releases;
 static int owner_batch, owner_steps, owner_rearms;
 static LONG owner_local_out;
 static void owner_finish(void) {
-    if (owner_start_failed) blocking_start_failed(owner_job);
-    else blocking_finish_worker(owner_job);
+    if (owner_start_failed) owner_job->status = ZAN_BLOCKING_THREAD_FAILED;
+    blocking_spawn(blocking_finish_worker(owner_job));
 }
 #if defined(_WIN32)
 static DWORD WINAPI owner_worker(void *unused) {
@@ -115,14 +115,13 @@ static void owner_count_release(volatile LONG *counter) {
 static void owner_resume(void *frame) { (void)frame; owner_steps++; }
 static void run_dns_owner_case(int stage, int start_failed, int started) {
     zan_co_fhdr frame = {0};
-    int64_t out64 = 99;
     int32_t out = 99;
     int initial_steps = owner_steps, initial_barriers = owner_barriers;
     owner_job = calloc(1, sizeof(*owner_job));
     CHECK(owner_job != NULL);
     owner_watched = owner_job; owner_frees = 0; owner_releases = 0;
     owner_job->frame = &frame; owner_job->step = owner_resume;
-    owner_job->out = &out; owner_job->out64 = &out64;
+    owner_job->out = &out;
     owner_job->started = started; owner_job->deadline_ms = 1;
     g_blocking_active = started; g_blocking_inflight = 1;
     g_blocking_pending = owner_job;
@@ -131,7 +130,7 @@ static void run_dns_owner_case(int stage, int start_failed, int started) {
     g_co_parked = 1;
     CHECK(dns_timeout_scan() == 1);
     CHECK(owner_barriers == initial_barriers + (stage != 0));
-    CHECK(out == 0 && out64 == 0 && owner_releases == 1);
+    CHECK(out == 0 && owner_releases == 1);
     CHECK(g_blocking_inflight == 0 && co_cnt_outstanding() == 1);
     CHECK(g_blocking_pending == NULL && g_blocking_queued == NULL);
     CHECK(g_blocking_queued_n == 0);

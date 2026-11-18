@@ -265,12 +265,12 @@ int32_t zan_shared_table_rate_allow(i64 handle, const char *key, i64 now_ms,
 int32_t zan_shared_table_lock_acquire(i64 handle, const char *key, i64 owner,
                                       i64 now_ms, i64 lease_ms) {
     (void)handle; (void)key; (void)owner; (void)now_ms; (void)lease_ms;
-    return 1;
+    return 0;
 }
 
 int32_t zan_shared_table_lock_release(i64 handle, const char *key, i64 owner) {
     (void)handle; (void)key; (void)owner;
-    return 1;
+    return 0;
 }
 
 int32_t zan_shared_table_delete(i64 handle, const char *key) {
@@ -635,11 +635,6 @@ void zan_rt_blocking_co(void *fn, int32_t argc, long long a0, long long a1,
 int system(const char *cmd) {
     (void)cmd;
     return -1;
-}
-
-char *getenv(const char *name) {
-    (void)name;
-    return 0;
 }
 
 int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {

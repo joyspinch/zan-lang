@@ -9,6 +9,16 @@ public partial class Parser {
         return NestedPrefix(d.a) + d.a.sval + ".";
     }
 
+    string FullTypeName(Node d) {
+        string name = NestedPrefix(d) + d.sval;
+        return d.nsName == null || d.nsName == "" ? name : d.nsName + "." + name;
+    }
+
+    bool IsTypeDeclaration(Node d) {
+        return d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()
+            || d.kind == AK.EnumDecl() || d.kind == AK.DelegateDecl();
+    }
+
     void QualifyTypes(Node unit) {
         qDcls = new List<Node>();
         qFulls = new List<string>();
@@ -23,12 +33,9 @@ public partial class Parser {
             // are already hoisted to unit level at this point (the C host
             // runs zan_parser_flatten_nested_types before
             // zan_nsresolve_run), so all participate in the conflict table
-            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()
-                    || d.kind == AK.EnumDecl() || d.kind == AK.DelegateDecl()) {
-                string ns = d.nsName != null ? d.nsName : "";
-                string npref = NestedPrefix(d);
+            if (IsTypeDeclaration(d)) {
                 qDcls.Add(d);
-                qFulls.Add(ns == "" ? npref + d.sval : ns + "." + npref + d.sval);
+                qFulls.Add(FullTypeName(d));
                 qFinals.Add(d.sval);
             }
             di = di + 1;
@@ -80,10 +87,20 @@ public partial class Parser {
         }
         // 4. rewrite references against each declaration's own context
         di = 0;
+        ci = 0;
         while (di < unit.kids.Count) {
             Node d = unit.kids[di];
-            RewriteBaseClause(d, d.nsName != null ? d.nsName : "", d.nsUsings);
+            if (IsTypeDeclaration(d)) {
+                qWorkspaceOwner = d;
+                qOwnerFull = qFulls[ci];
+                ci = ci + 1;
+            }
             NsWalkDecl(d);
+            if (IsTypeDeclaration(d)) {
+                RewriteBaseClause(d, d.nsName != null ? d.nsName : "", d.nsUsings);
+            }
+            qWorkspaceOwner = null;
+            qOwnerFull = "";
             di = di + 1;
         }
     }
@@ -134,7 +151,10 @@ public partial class Parser {
         int n = 0;
         int i = 0;
         while (i < hit.Count) {
-            if (ArityMatches(tr, qDcls[hit[i]])) { n = n + 1; }
+            Node d = qDcls[hit[i]];
+            // Nested declarations outside the resolved owner path do not
+            // participate in namespace-level simple-name ambiguity.
+            if ((!workspaceNames || d.a == null) && ArityMatches(tr, d)) { n = n + 1; }
             i = i + 1;
         }
         return n;
@@ -153,8 +173,100 @@ public partial class Parser {
         return tp == tr.kids.Count;
     }
 
+    bool DeclaresTypeParam(Node decl, string name) {
+        if (decl == null) { return false; }
+        int i = 0;
+        while (i < decl.kids.Count) {
+            Node param = decl.kids[i];
+            if (param.kind == AK.TypeParam() && param.sval == name) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    int FindTypeByFullName(string full, Node tr) {
+        if (tr == null) { return qFullIx.First(full); }
+        List<int> matches = qFullIx.Get(full);
+        if (matches == null) { return -1; }
+        int i = 0;
+        while (i < matches.Count) {
+            int hit = matches[i];
+            if (ArityMatches(tr, qDcls[hit])) { return hit; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    int FindWorkspaceImport(string name, Node tr, List<string> us) {
+        if (us == null) { return -1; }
+        int i = 0;
+        while (i < us.Count) {
+            string prefix = us[i];
+            if (prefix != null && prefix != "") {
+                int hit = FindTypeByFullName(prefix + "." + name, tr);
+                if (hit >= 0) { return hit; }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    int FindNestedType(string name, Node tr) {
+        // Use the source path since backend names may have been mangled.
+        Node owner = qWorkspaceOwner;
+        string full = qOwnerFull;
+        while (owner != null) {
+            int hit = FindTypeByFullName(full + "." + name, tr);
+            if (hit >= 0) { return hit; }
+            owner = owner.a;
+            if (owner != null) { full = full.Substring(0, full.LastIndexOf(".")); }
+        }
+        return -1;
+    }
+
+    int FindWorkspaceName(string name, Node tr, string ns, List<string> us) {
+        int nested = FindNestedType(name, tr);
+        if (nested >= 0) { return nested; }
+        bool qualified = name.IndexOf(".") > 0;
+        if (qualified) {
+            int exact = FindTypeByFullName(name, tr);
+            if (exact >= 0) { return exact; }
+            int imported = FindWorkspaceImport(name, tr, us);
+            if (imported >= 0) { return imported; }
+        }
+        string scope = ns;
+        while (scope != "") {
+            int hit = FindTypeByFullName(scope + "." + name, tr);
+            if (hit >= 0) { return hit; }
+            int dot = scope.LastIndexOf(".");
+            scope = dot > 0 ? scope.Substring(0, dot) : "";
+        }
+        if (qualified) { return -1; }
+        if (ns == "") {
+            int global = FindTypeByFullName(name, tr);
+            if (global >= 0) { return global; }
+        }
+        int imported = FindWorkspaceImport(name, tr, us);
+        return imported >= 0 ? imported : FindTypeByFullName(name, tr);
+    }
+
+    string ResolveWorkspaceType(string name, Node tr, string ns, List<string> us) {
+        if (name.IndexOf(".") < 0 && tr.kids.Count == 0
+                && (DeclaresTypeParam(qWorkspaceMethod, name) || DeclaresTypeParam(qWorkspaceOwner, name))) {
+            return name;
+        }
+        int hit = FindWorkspaceName(name, tr, ns, us);
+        if (hit >= 0) { return qFinals[hit]; }
+        if (name.IndexOf(".") < 0 && CountSimpleMatching(name, tr) >= 2 && FindFullExact(name) < 0) {
+            diags.Error("[E1019] ambiguous type '" + name + "'; qualify it with its namespace", tr.line, tr.col);
+        }
+        return name;
+    }
+
     string ResolveQualifiedName(string r, Node tr, string ns, List<string> us) {
-        int hit = -1;
+        if (workspaceNames) { return ResolveWorkspaceType(r, tr, ns, us); }
+        int hit = FindNestedType(r, tr);
+        if (hit >= 0) { return qFinals[hit]; }
         if (ns != null && ns != "") { hit = FindFullExact(ns + "." + r); }
         if (hit < 0) { hit = FindFullExact(r); }
         if (hit < 0 && us != null) {
@@ -178,10 +290,13 @@ public partial class Parser {
     }
 
     string ResolveSimpleName(string r, Node tr, string ns, List<string> us) {
+        if (workspaceNames) { return ResolveWorkspaceType(r, tr, ns, us); }
+        int hit = FindNestedType(r, tr);
+        if (hit >= 0) { return qFinals[hit]; }
         // same-namespace first (the global namespace is a namespace too: a
         // declaration at global scope must win over an import)
         string local = ns == "" ? r : ns + "." + r;
-        int hit = FindFullExact(local);
+        hit = FindFullExact(local);
         if (hit >= 0) {
             if (ArityMatches(tr, qDcls[hit])) { return qFinals[hit]; }
             // the same-namespace declaration cannot take the reference's
@@ -256,7 +371,6 @@ public partial class Parser {
 
     void RewriteBaseClause(Node d, string ns, List<string> us) {
         if (d.type != null) {
-            NsWalk(d.type, ns, us, new List<string>());
             d.sval2 = d.type.sval;
         } else {
             string b = d.sval2;
@@ -436,7 +550,13 @@ public partial class Parser {
     }
 
     string ResolveStaticReceiver(string r, string ns, List<string> us, string member) {
-        int hit = FindFullExact(ns == "" ? r : ns + "." + r);
+        if (workspaceNames) {
+            int workspaceHit = FindWorkspaceName(r, null, ns, us);
+            return workspaceHit >= 0 ? qFinals[workspaceHit] : null;
+        }
+        int hit = FindNestedType(r, null);
+        if (hit >= 0) { return qFinals[hit]; }
+        hit = FindFullExact(ns == "" ? r : ns + "." + r);
         if (hit < 0 && us != null) {
             int u = 0;
             while (u < us.Count && hit < 0) {

@@ -222,6 +222,13 @@ int main(int argc, char **argv) {
     rc = zan_proc_capture_safe(self, short_args, 1, &buf, &len, &code);
     check(rc == 0 && code == 127 && len == 5, "legacy capture ABI remains infinite");
     zan_proc_free_buf(buf);
+    int64_t start = zan_monotonic_us();
+    const char *silent_args[] = {"--silent"};
+    check(zan_proc_run_safe_timeout(self, silent_args, 1, 80) == -1,
+          "RunSafe timeout is reported as failure");
+    check(zan_monotonic_us() - start < 2000000, "RunSafe returns before the child exits");
+    check(zan_proc_run_safe_timeout(self, short_args, 1, 5000) == 127,
+          "RunSafe returns the completed child's exit code");
     launch_contract();
     closed_streams(self);
     check(descriptor_count() == before, "all parent descriptors closed");

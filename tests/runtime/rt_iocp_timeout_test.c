@@ -156,13 +156,13 @@ static void run_handoff(int worker_path, int count) {
     CHECK(co_all_idle());
 }
 
-static void run_dns_handoff(int timeout, int started) {
+static void run_dns_handoff(int timeout, int started, int lost_wake) {
     zan_co_fhdr frame = {0};
-    int64_t out = 1234;
+    int32_t out = 1234;
     zan_blocking_job_t *job = calloc(1, sizeof(*job));
     job->frame = &frame;
     job->step = resume_handoff;
-    job->out64 = &out;
+    job->out = &out;
     job->result = 17;
     job->deadline_ms = 1;
     job->started = started;
@@ -171,7 +171,14 @@ static void run_dns_handoff(int timeout, int started) {
     else g_blocking_done = job;
     if (started) g_blocking_active = 1;
     handoff_active = 1;
-    CHECK((timeout ? dns_timeout_scan() : dns_drain()) == 1);
+    if (lost_wake) {
+        g_blocking_wake_lost = 1;
+        g_co_parked = g_wk[0].parked = 1;
+        co_wait_io(&g_wk[0], 0);
+        CHECK(!g_co_parked && !g_wk[0].parked && !g_blocking_wake_lost);
+    } else {
+        CHECK((timeout ? dns_timeout_scan() : dns_drain()) == 1);
+    }
     handoff_active = 0;
     CHECK(out == (timeout ? 0 : 17));
     CHECK(g_blocking_inflight == 0 && co_cnt_outstanding() == 1);
@@ -222,6 +229,8 @@ static void run_case(int worker_path, int error, int expire) {
     CHECK(g_io_count == 0 && g_rto == NULL);
     CHECK(completion == NULL);
 }
+#include "rt_co_sched_checks.h"
+
 int main(void) {
     _putenv_s("ZAN_IO_SYNCFAST", "0");
     /* co_wait_io uses g_wk, allocated by scheduler init, not reactor init. */
@@ -243,12 +252,14 @@ int main(void) {
         run_handoff(path, 4);
     }
     CHECK(handoff_checks == 10 && resumed == 10);
-    run_dns_handoff(0, 0);
-    run_dns_handoff(1, 0);
-    run_dns_handoff(1, 1);
-    CHECK(handoff_checks == 13 && resumed == 13);
+    run_dns_handoff(0, 0, 0);
+    run_dns_handoff(1, 0, 0);
+    run_dns_handoff(1, 1, 0);
+    run_dns_handoff(0, 0, 1);
+    CHECK(handoff_checks == 14 && resumed == 14);
     run_owner_checks();
-    zan_io_shutdown();
-    if (!failures) puts("PASS IOCP timeout ownership and completion handoff in both polling paths");
+    run_co_sched_checks();
+    run_join_checks();
+    if (!failures) puts("PASS IOCP timeout ownership, scheduler progress and join fan-out");
     return failures != 0;
 }

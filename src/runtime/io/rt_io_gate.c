@@ -1,5 +1,6 @@
-/* Coroutine counting gate. Each prepared wait owns its registration and timer. */
-#if defined(ZAN_CO_DRIVER) && !defined(_WIN32)
+/* Coroutine counting gate. Each prepared wait owns its registration and timer.
+ * Native threads can enter the gate even with the self-host fallback scheduler. */
+#ifndef _WIN32
 #include <pthread.h>
 #endif
 #include <limits.h>
@@ -24,28 +25,23 @@ typedef struct zan_gate {
     long long next_ticket;
     int ref_count;
     int closed;
-#if defined(ZAN_CO_DRIVER) && defined(_WIN32)
+#ifdef _WIN32
     CRITICAL_SECTION lock;
-#elif defined(ZAN_CO_DRIVER)
+#else
     pthread_mutex_t lock;
 #endif
 } zan_gate;
 
-#if defined(ZAN_CO_DRIVER) && defined(_WIN32)
+#ifdef _WIN32
 static void zan_gate_lock(zan_gate *g) { EnterCriticalSection(&g->lock); }
 static void zan_gate_unlock(zan_gate *g) { LeaveCriticalSection(&g->lock); }
 static void zan_gate_lock_init(zan_gate *g) { InitializeCriticalSection(&g->lock); }
 static void zan_gate_lock_free(zan_gate *g) { DeleteCriticalSection(&g->lock); }
-#elif defined(ZAN_CO_DRIVER)
+#else
 static void zan_gate_lock(zan_gate *g) { pthread_mutex_lock(&g->lock); }
 static void zan_gate_unlock(zan_gate *g) { pthread_mutex_unlock(&g->lock); }
 static void zan_gate_lock_init(zan_gate *g) { pthread_mutex_init(&g->lock, NULL); }
 static void zan_gate_lock_free(zan_gate *g) { pthread_mutex_destroy(&g->lock); }
-#else
-static void zan_gate_lock(zan_gate *g) { (void)g; }
-static void zan_gate_unlock(zan_gate *g) { (void)g; }
-static void zan_gate_lock_init(zan_gate *g) { (void)g; }
-static void zan_gate_lock_free(zan_gate *g) { (void)g; }
 #endif
 
 static void gate_destroy(zan_gate *g) {

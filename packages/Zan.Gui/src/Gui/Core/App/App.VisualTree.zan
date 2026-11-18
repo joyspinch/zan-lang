@@ -167,7 +167,6 @@ public partial class App {
         }
         this.SyncRoutedPointerState(kind);
         lastInputMs = Window.GetTickMs();
-        needsRedraw = true;
         return true;
     }
 
@@ -190,6 +189,11 @@ public partial class App {
         else { Window.SetCursor(0); }
     }
 
+    bool ThemeDrawerHover(int pointerType) {
+        return pointerType != 1 && !pointerDown && capturedPointerControl == null
+            && themeDrawer != null && overlayHost != null && overlayHost.ActiveRoot() == themeDrawer;
+    }
+
     // Both native event pumps enter here; one event is routed once per App.
     bool DispatchWindowInput(int kind) {
         if (kind != 1 && kind != 2 && kind != 3 && kind != 4
@@ -205,9 +209,25 @@ public partial class App {
         routedWindowSequence = sequence;
         routedWindowSequenceValid = true;
         routedWindowDispatchComplete = false;
+        if (kind == 1 && !needsRedraw && preparingInputDepth == 0
+                && lastHoveredControl == null && pointerDownTarget == null
+                && window.EventFlag() != 1 && this.ThemeDrawerHover(currentPointerType)) {
+            ThemeDrawer drawer = (ThemeDrawer)themeDrawer;
+            Control box = drawer.Box();
+            // The current layout has no endpoint on the scrim. Hover transitions,
+            // presses and a pending layout change still go through preparation.
+            if (drawer.IsOpen() && box.bw > 0 && box.bh > 0
+                    && !box.ContainsPoint(window.EventX(), window.EventY(), 0)) {
+                routedFocusAssigned = false;
+                routedWindowHandled = true;
+                routedWindowDispatchComplete = true;
+                return true;
+            }
+        }
         if (!this.PrepareInputParticipants(kind, sequence)) { return false; }
         if (this.KeyBlocked(kind)) {
             routedWindowHandled = true;
+            needsRedraw = true;
             routedWindowDispatchComplete = true;
             return true;
         }
@@ -226,6 +246,10 @@ public partial class App {
         int pointerType = window.EventFlag() == 1 ? 1 : this.currentPointerType;
         int key = window.EventKeyCode();
         int dispatchTicket = pointerGestureTicket;
+        // The appearance drawer uses retained hover states. Motion within the
+        // same endpoint (including its scrim) can leave the current frame intact.
+        bool drawerHover = kind == 1 && this.ThemeDrawerHover(pointerType);
+        Control previousHover = lastHoveredControl;
         bool handled = this.DispatchVisualTree(kind, window.EventX(),
             window.EventY(), key, kind == 13 ? key : 0, pointerType);
         // Nested input owns its newer sequence and dispatch result.
@@ -237,7 +261,10 @@ public partial class App {
         routedWindowHandled = handled;
         routedWindowGestureTicket = dispatchTicket;
         if (dispatchTicket != pointerGestureTicket) { routedWindowHandled = true; }
-        if (routedWindowHandled) { needsRedraw = true; }
+        if (routedWindowHandled && (!drawerHover || previousHover != lastHoveredControl
+                || dispatchTicket != pointerGestureTicket || !this.ThemeDrawerHover(pointerType))) {
+            needsRedraw = true;
+        }
         routedWindowDispatchComplete = true;
         return true;
     }

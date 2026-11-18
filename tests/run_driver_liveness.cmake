@@ -215,6 +215,20 @@ foreach(_mode IN LISTS _modes)
   if(NOT _rc EQUAL 0 OR NOT _out STREQUAL "12\n")
     message(FATAL_ERROR "run_driver_liveness: ${_mode} extern call failed (${_rc})\n${_out}${_err}")
   endif()
+  file(SHA256 "${_outdir}/app.exe" _before)
+  file(WRITE "${_outdir}/invalid.o" "invalid test object\n")
+  execute_process(
+    COMMAND "${ZANC}" "${_project}/main.zan" ${_common} --publish
+            --link-mode shared --subsystem console --link-input "${_outdir}/invalid.o"
+            -o "${_outdir}/app.exe"
+    WORKING_DIRECTORY "${_project}"
+    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  file(SHA256 "${_outdir}/app.exe" _after)
+  file(GLOB _staging "${_outdir}/.zanc-*")
+  if(_rc EQUAL 0 OR NOT _before STREQUAL _after OR _staging)
+    message(FATAL_ERROR
+      "run_driver_liveness: failed link exit=${_rc}, output before=${_before}, after=${_after}, staging=${_staging}\n${_out}${_err}")
+  endif()
 endforeach()
 
 if(NOT MODE OR MODE STREQUAL "static")

@@ -144,43 +144,6 @@ partial class Irgen {
         H("}");
     }
 
-    // The NativeMemory digest intrinsic (the C host's emit_nm_digest): the
-    // hardware kernel writes the raw digest into a scratch buffer; the value
-    // is a string of those raw bytes, or null when the kernel is unavailable.
-    ExprVal NmDigest(Node e, string kernel, int dlen) {
-        ExprVal p = GenExpr(e.kids[0]);
-        ExprVal len = GenExpr(e.kids[1]);
-        // a negative length would underflow the digest buffer: clamp it
-        string neg = NT();
-        L("  " + neg + " = icmp slt i64 " + len.op + ", 0");
-        string clen = NT();
-        L("  " + clen + " = select i1 " + neg + ", i64 0, i64 " + len.op);
-        string buf = NT();
-        L("  " + buf + " = alloca [" + dlen + " x i8], align 8");
-        if (!ExternSeen(kernel)) {
-            externDecls.Add(kernel);
-            H("declare i64 @" + kernel + "(i8*, i64, i8*)");
-        }
-        string st = NT();
-        L("  " + st + " = call i64 @" + kernel + "(i8* " + NmAddr(p, "0")
-          + ", i64 " + clen + ", i8* " + buf + ")");
-        string ok = NT();
-        L("  " + ok + " = icmp sge i64 " + st + ", 0");
-        int lHas = NL(); int lNone = NL(); int lDone = NL();
-        L("  br i1 " + ok + ", label %L" + lHas + ", label %L" + lNone);
-        Label(lHas);
-        string s = NT();
-        L("  " + s + " = call i8* @zstr_new(i64 " + dlen + ")");
-        L("  call void @memcpy(i8* " + s + ", i8* " + buf + ", i64 " + dlen + ")");
-        L("  br label %L" + lDone);
-        Label(lNone);
-        L("  br label %L" + lDone);
-        Label(lDone);
-        string r = NT();
-        L("  " + r + " = phi i8* [ " + s + ", %L" + lHas + " ], [ null, %L" + lNone + " ]");
-        return OwnedString(r);
-    }
-
     // ---- NativeMemory runtime helpers ----
     // The C host lowers these intrinsics to calls into the zan_hw_* runtime
     // helpers (src/compiler/irgen_expr.c); the argument list below is already
@@ -428,55 +391,6 @@ partial class Irgen {
             string r = NT();
             L("  " + r + " = select i1 " + over + ", i64 " + n.op + ", i64 " + run);
             return new ExprVal(r, MkType("int"));
-        }
-        if ((m == "Sha256" || m == "Sha1" || m == "Sha512" || m == "Sm3") && argc == 2) {
-            // the digest intrinsics: the C host's emit_nm_digest. The kernel
-            // writes the RAW digest bytes into a scratch buffer; on success
-            // the value is a string of those bytes, on failure (the hardware
-            // kernel is unavailable) it is null.
-            string kern = "zan_hw_sha256"; int dlen = 32;
-            if (m == "Sha1") { kern = "zan_hw_sha1"; dlen = 20; }
-            else if (m == "Sha512") { kern = "zan_hw_sha512"; dlen = 64; }
-            else if (m == "Sm3") { kern = "zan_hw_sm3"; dlen = 32; }
-            return NmDigest(e, kern, dlen);
-        }
-        if (m == "Base64Encode" && argc == 2) {
-            // Base64Encode(ptr, size) -> heap string (length = ((len+2)/3)*4 + 1)
-            ExprVal p = GenExpr(e.kids[0]);
-            ExprVal len = GenExpr(e.kids[1]);
-            if (!ExternSeen("zan_hw_base64_encode")) {
-                externDecls.Add("zan_hw_base64_encode");
-                H("declare i64 @zan_hw_base64_encode(i8*, i64, i8*)");
-            }
-            string sp = NT();
-            L("  " + sp + " = add i64 " + len.op + ", 2");
-            string d3 = NT();
-            L("  " + d3 + " = sdiv i64 " + sp + ", 3");
-            string m4 = NT();
-            L("  " + m4 + " = mul i64 " + d3 + ", 4");
-            string cap = NT();
-            L("  " + cap + " = add i64 " + m4 + ", 1");
-            string s = NT();
-            L("  " + s + " = call i8* @malloc(i64 " + cap + ")");
-            string w = NT();
-            L("  " + w + " = call i64 @zan_hw_base64_encode(i8* " + NmAddr(p, "0") + ", i64 " + len.op + ", i8* " + s + ")");
-            string m = NT();
-            L("  " + m + " = call i8* @zstr_new(i64 " + w + ")");
-            L("  call i8* @memcpy(i8* " + m + ", i8* " + s + ", i64 " + w + ")");
-            return OwnedString(m);
-        }
-        if (m == "Base64Decode" && argc == 3) {
-            // Base64Decode(dst, src, size) -> written bytes
-            ExprVal dst = GenExpr(e.kids[0]);
-            ExprVal src = GenExpr(e.kids[1]);
-            ExprVal size = GenExpr(e.kids[2]);
-            if (!ExternSeen("zan_hw_base64_decode")) {
-                externDecls.Add("zan_hw_base64_decode");
-                H("declare i64 @zan_hw_base64_decode(i8*, i64, i8*)");
-            }
-            string w = NT();
-            L("  " + w + " = call i64 @zan_hw_base64_decode(i8* " + NmAddr(src, "0") + ", i64 " + size.op + ", i8* " + NmAddr(dst, "0") + ")");
-            return new ExprVal(w, MkType("int"));
         }
         if (m == "AesCbcEncrypt" && argc == 6) {
             ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);

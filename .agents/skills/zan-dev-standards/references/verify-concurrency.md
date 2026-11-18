@@ -184,6 +184,22 @@
   热的工作集要保住，冷的才扔。
 - **日志合并成一份**：`ctest` 的完整输出归档成 `build\test-out\<tier>-<时间>.log`，
   只留最近 5 份；别每个用例一个输出文件散在 `build\` 里。
+- **`test-out\` 与一次性实验目录要按轮转清**：每次验收/发布验证都会在
+  `build\test-out\` 新建一个带时间戳的目录，里面是整份 publish 产物
+  （`ZanIDE.exe` 单个 ~90MB）；`selfhost_illir*` / `selfhost_sweep*` /
+  `selfhost_repo` / `ab` 每轮批量实验各 1–2GB。
+  坑出处：2026-11 实测 `build\` 47GB —— test-out **748 个目录 / 14.2GB**、
+  selfhost_* **28 个目录 / 24GB**、`ab` 1.3GB，而当时的 `clean_build.ps1`
+  只扫 `cases\`、`build\` 根 exe 和 `selfhost_diff*`，**这 45GB 永远扫不到**
+  （`build\` 被 git-ignore，`git status` 也看不见，于是没人发现）。
+  现已纳入清扫：test-out 与实验目录按内容时间轮转
+  （`-TestOutKeepDays` / `-ExperimentKeepDays`，默认 2 / 7 天），
+  `cef-headers` 是 1.9GB 下载缓存，明确不清。
+  判据：**清扫脚本覆盖不到的目录等于没有清扫**——新增任何"按运行/实验落盘
+  的目录"，同一提交把它加进清扫名单。
+  坑出处 2：目录自身的 `LastWriteTime` 不能当年龄——子项写入会刷新它，
+  刚被别人碰过的旧目录会被判成新货（探针实测过：10 天前 mtime 的目录
+  没被命中）。按**树内最新文件时间**判，空目录才退回目录时间。
 - **`build\` 根不能按通配符删**：真工具链（链接器 `ld.lld.exe`、仓库自带的
   `repomap.exe` / `zan-mcp.exe` / `zanfmt.exe`…）也在那儿，按名字猜着删会踩到
   发布脚本。保留清单写死在清扫脚本里，每条都注明来源。

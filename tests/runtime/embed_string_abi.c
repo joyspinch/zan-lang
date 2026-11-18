@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../../src/common/zan_abi.h"
 
@@ -11,6 +12,7 @@ typedef struct {
 extern void zan_embed_register(const embed_entry *, long long);
 extern const char *zan_embed_read(const char *);
 extern const unsigned char *zan_embed_bytes(const char *, int *);
+extern int64_t zan_embed_list_alloc(const char *);
 
 static int valid(const char *text, uint32_t len) {
     uint64_t rc, word;
@@ -40,9 +42,19 @@ int main(void) {
     if (zan_embed_bytes("binary", &len) != raw || len != 4) return 5;
     if (!valid(zan_embed_read("empty"), 0) ||
         !valid(zan_embed_read("missing"), 0)) return 6;
+    char *names = (char *)(uintptr_t)zan_embed_list_alloc(NULL);
+    char *filtered = (char *)(uintptr_t)zan_embed_list_alloc("text");
+    char *again = (char *)(uintptr_t)zan_embed_list_alloc("text");
     zan_embed_register(NULL, 0);
     if (strcmp(a, "text") || !valid(a, 4)) return 7;
     if (zan_embed_bytes("missing", &len) || len != 0) return 8;
+    if (!names || strcmp(names, "binary\ntext\nempty\n")) return 9;
+    if (!filtered || !again || strcmp(filtered, "text\n")) return 10;
+    filtered[0] = 'T';
+    free(filtered);
+    if (strcmp(again, "text\n") || zan_embed_list_alloc("") != 0) return 11;
+    free(again);
+    free(names);
     puts("PASS embed_string_abi");
     return 0;
 }

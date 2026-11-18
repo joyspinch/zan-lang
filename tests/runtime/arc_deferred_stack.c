@@ -18,12 +18,10 @@ __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #include <stdatomic.h>
 
 extern void zan_rt_release_dyn(void *);
-extern int zan_rt_defer_pending(void);
-extern void zan_rt_defer_drain(void);
 typedef struct Object { uint64_t rc, descriptor; int remaining; } Object;
 static void (*descriptor)(void *);
 static atomic_int phase;
-static int mode, stack_released, heap_released, failures;
+static int mode, stack_released, heap_released, shallow_released, failures;
 static Object heap_leaf;
 
 static void require(int value, const char *message) {
@@ -60,17 +58,18 @@ static void destructor(void *payload) {
         zan_rt_release_dyn(&heap_leaf.remaining);
     } else if (self->remaining == -2) {
         heap_released++;
-    } else if (mode == 0) {
+    } else if (self->remaining == -3) {
+        shallow_released++;
+    } else {
         Object local = object(-1, 1);
         zan_rt_release_dyn(&local.remaining);
         require(stack_released == 1, "stack destructor delayed past caller frame");
         require(heap_released == 0, "nested heap release lost depth bound");
-        require(zan_rt_defer_pending(), "nested heap release was not deferred");
-        /* On failure stop before local storage expires into the real queue. */
         if (failures) { fflush(NULL); _Exit(7); }
-    } else {
-        atomic_store_explicit(&phase, 1, memory_order_release);
-        wait_phase(2);
+        if (mode) {
+            atomic_store_explicit(&phase, 1, memory_order_release);
+            wait_phase(2);
+        }
     }
 }
 #ifdef _WIN32
@@ -80,11 +79,10 @@ static void *shallow_thread(void *unused) {
 #endif
     (void)unused;
     wait_phase(1);
-    Object leaf = object(-2, 0);
+    Object leaf = object(-3, 0);
     zan_rt_release_dyn(&leaf.remaining);
-    /* A second thread's shallow call must run synchronously even while the
-     * first thread has 100 live destructor frames. It must not inherit 100. */
-    require(heap_released == 1, "release depth leaked across threads");
+    require(shallow_released == 1, "release depth leaked across threads");
+    require(heap_released == 0, "shallow release drained another thread's work");
     if (failures) { fflush(NULL); _Exit(9); }
     atomic_store_explicit(&phase, 2, memory_order_release);
     return 0;
@@ -93,15 +91,13 @@ int ArcDeferredStackTest(void) {
     descriptor = destructor;
     heap_leaf = object(-2, 0);
     Object root = object(99, 0);
-#ifndef ARC_DEPTH_ONLY
     zan_rt_release_dyn(&root.remaining);
     require(heap_released == 1, "nested heap queue did not drain at root return");
-    require(!zan_rt_defer_pending(), "root returned with deferred heap work");
     if (failures) return 7;
     puts("PASS stack synchronous and nested heap bounded");
-#endif
 
     mode = 1;
+    stack_released = 0;
     heap_released = 0;
     atomic_init(&phase, 0);
 #ifdef _WIN32
@@ -118,8 +114,7 @@ int ArcDeferredStackTest(void) {
 #else
     require(pthread_join(thread, NULL) == 0, "thread join failed");
 #endif
-    zan_rt_defer_drain();
-    require(!zan_rt_defer_pending(), "threaded release left pending work");
+    require(heap_released == 1, "owner thread did not drain its release queue");
     if (failures) return 9;
     puts("PASS release depth isolated between threads");
     return 0;

@@ -4,7 +4,7 @@
  * consumes: target, generated_objects, obj_path, publish_mode,
  *   cross_compiling, no_icon, icon_path, emit_lib, default_icon_explicit,
  *   extra_link_inputs, extra_link_input_count
- * defines: icon_obj, link_ret
+ * defines: link_ret（icon 产物改走 link_work_icon，随 link_work_dir 统一清理）
  * （下方四个 #include 是同一 main() 作用域内的二级拼接片段。） */
 #include "linker_setup.c"
 #include "linker_host.c"

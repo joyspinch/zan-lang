@@ -1,3 +1,11 @@
+#include "mvc_compiler.h"
+#include "arena.h"
+#include "diag.h"
+#include "lexer.h"
+#include "parser.h"
+#include "synth_buffer.h"
+#include <string.h>
+
 /* ---------- __AttrRoutes 动作派发的编译期合成 ----------
  *
  * 约定路由（packages/Zan.Mvc/.../AttrRoutes.zan）把每条路由的 handler 统一
@@ -18,36 +26,6 @@
  * 参数（必填走 Need*，[Opt("name=default")] 可选走 In*），[Tx]/[ReadOnly]。
  * 表单模型参数与泛型动作暂不合成（对应路由仍注册，派发回落到 404）。
  */
-
-typedef struct {
-    char *buf;
-    size_t len;
-    size_t cap;
-} zd_buf_t;
-
-static void zd_putf(zd_buf_t *b, const char *fmt, ...) {
-    if (!b || !fmt) return;
-    if (!b->buf) {
-        b->cap = 16384;
-        b->buf = (char *)malloc(b->cap);
-        if (!b->buf) { b->cap = 0; return; }
-        b->buf[0] = 0;
-    }
-    for (;;) {
-        va_list ap;
-        va_start(ap, fmt);
-        int n = vsnprintf(b->buf + b->len, b->cap - b->len, fmt, ap);
-        va_end(ap);
-        if (n < 0) return;
-        if ((size_t)n < b->cap - b->len) { b->len += (size_t)n; return; }
-        size_t ncap = b->cap * 2;
-        while (ncap < b->len + (size_t)n + 1) ncap *= 2;
-        char *grown = (char *)realloc(b->buf, ncap);
-        if (!grown) return;
-        b->buf = grown;
-        b->cap = ncap;
-    }
-}
 
 /* 属性名归一：剥命名空间前缀与尾部 "Attribute"（与反射侧打包口径一致）。 */
 static const char *zd_attr_name(zan_ast_node_t *a, int *out_len) {
@@ -207,7 +185,7 @@ static bool zd_class_is_controller(zan_ast_node_t *unit, zan_ast_node_t *decl,
 }
 
 /* 生成一条动作分支；返回 false 表示签名不可绑定（跳过该动作）。 */
-static bool zd_emit_action(zd_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
+static bool zd_emit_action(zan_synth_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
                            const char *full, const char *view_owner,
                            bool class_tx, bool class_ro) {
     if (!b->buf || !m || !full || !view_owner) return false;
@@ -269,7 +247,7 @@ static bool zd_emit_action(zd_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
     char mname[192];
     snprintf(mname, sizeof(mname), "%.*s", (int)m->method_decl.name.len,
              m->method_decl.name.str);
-    zd_putf(b, "        if (actionKey == \"%s.%s\") {\n", full, mname);
+    zan_synth_putf(b, "        if (actionKey == \"%s.%s\") {\n", full, mname);
 
     /* 参数绑定：实例动作借控制器上的 Need* / In*（带 ApiError 中止语义），
        静态动作没有实例，直接读 ctx 并在缺失时抛同样的 ApiError。
@@ -370,38 +348,38 @@ static bool zd_emit_action(zd_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
     }
 
     if (is_static) {
-        zd_putf(b, "%s", binds);
-        zd_putf(b, "            %s%s.%s(%s);\n", aw, full, mname, args);
+        zan_synth_putf(b, "%s", binds);
+        zan_synth_putf(b, "            %s%s.%s(%s);\n", aw, full, mname, args);
     } else {
-        zd_putf(b, "            %s __c = new %s();\n", full, full);
-        zd_putf(b, "            __c.Bind(ctx);\n");
-        zd_putf(b, "            __c.SetView(\"%s.%s\");\n", view_owner, mname);
-        if (ro) zd_putf(b, "            __c.UseReadOnly();\n");
-        if (tx) zd_putf(b, "            bool __tx = false;\n");
-        zd_putf(b, "            try {\n");
-        zd_putf(b, "                if (await __c.BeforeAsync()) {\n");
+        zan_synth_putf(b, "            %s __c = new %s();\n", full, full);
+        zan_synth_putf(b, "            __c.Bind(ctx);\n");
+        zan_synth_putf(b, "            __c.SetView(\"%s.%s\");\n", view_owner, mname);
+        if (ro) zan_synth_putf(b, "            __c.UseReadOnly();\n");
+        if (tx) zan_synth_putf(b, "            bool __tx = false;\n");
+        zan_synth_putf(b, "            try {\n");
+        zan_synth_putf(b, "                if (await __c.BeforeAsync()) {\n");
         if (tx) {
-            zd_putf(b, "                    bool __begun = await __c.TxBegin();\n");
-            zd_putf(b, "                    if (!__begun) { throw new System.Web.ApiError(503, \"0503\", \"服务不可用\"); }\n");
-            zd_putf(b, "                    __tx = true;\n");
+            zan_synth_putf(b, "                    bool __begun = await __c.TxBegin();\n");
+            zan_synth_putf(b, "                    if (!__begun) { throw new System.Web.ApiError(503, \"0503\", \"服务不可用\"); }\n");
+            zan_synth_putf(b, "                    __tx = true;\n");
         }
-        zd_putf(b, "%s", binds);
-        zd_putf(b, "                    %s__c.%s(%s);\n", aw, mname, args);
+        zan_synth_putf(b, "%s", binds);
+        zan_synth_putf(b, "                    %s__c.%s(%s);\n", aw, mname, args);
         if (tx) {
-            zd_putf(b, "                    await __c.TxCommit();\n");
-            zd_putf(b, "                    __tx = false;\n");
+            zan_synth_putf(b, "                    await __c.TxCommit();\n");
+            zan_synth_putf(b, "                    __tx = false;\n");
         }
-        zd_putf(b, "                }\n");
+        zan_synth_putf(b, "                }\n");
         if (tx) {
-            zd_putf(b, "            } catch (System.Exception __x) {\n");
-            zd_putf(b, "                if (__tx) { try { await __c.TxRollback(); } catch (System.Exception __r) { } }\n");
-            zd_putf(b, "                throw;\n");
+            zan_synth_putf(b, "            } catch (System.Exception __x) {\n");
+            zan_synth_putf(b, "                if (__tx) { try { await __c.TxRollback(); } catch (System.Exception __r) { } }\n");
+            zan_synth_putf(b, "                throw;\n");
         }
-        zd_putf(b, "            } finally {\n");
-        zd_putf(b, "                await __c.AfterAsync();\n");
-        zd_putf(b, "            }\n");
+        zan_synth_putf(b, "            } finally {\n");
+        zan_synth_putf(b, "                await __c.AfterAsync();\n");
+        zan_synth_putf(b, "            }\n");
     }
-    zd_putf(b, "            return true;\n        }\n");
+    zan_synth_putf(b, "            return true;\n        }\n");
     return true;
 }
 
@@ -412,14 +390,14 @@ typedef struct {
 
 static zan_walk_action_t zd_probe_register(zan_ast_node_t *n, void *ud) {
     zd_probe_t *p = (zd_probe_t *)ud;
-    int registration = zan_routes_registration(n);
-    if (registration == 1) p->app = true;
-    if (registration == 2) p->framework = true;
+    zan_mvc_registration_t registration = zan_mvc_registration(n);
+    if (registration == ZAN_MVC_REGISTER_APP) p->app = true;
+    if (registration == ZAN_MVC_REGISTER_FRAMEWORK) p->framework = true;
     return ZAN_WALK_CONTINUE;
 }
 
-static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
-                                      zan_diag_t *diag) {
+void zan_mvc_synthesize_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
+                                 zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     zd_probe_t probe = {0};
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -429,16 +407,16 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
     }
     if (!probe.app && !probe.framework) return;
 
-    zd_buf_t b;
+    zan_synth_buf_t b;
     memset(&b, 0, sizeof(b));
-    zd_putf(&b, "/* 由编译器合成的动作派发器（勿手改）：约定路由的 handler 统一是\n");
-    zd_putf(&b, "   __AttrRoutes.Dispatch，实际控制器方法调用在这里按 actionKey 展开。 */\n");
-    zd_putf(&b, "class __ZanActionDispatch {\n");
+    zan_synth_putf(&b, "/* 由编译器合成的动作派发器（勿手改）：约定路由的 handler 统一是\n");
+    zan_synth_putf(&b, "   __AttrRoutes.Dispatch，实际控制器方法调用在这里按 actionKey 展开。 */\n");
+    zan_synth_putf(&b, "class __ZanActionDispatch {\n");
     int skipped = 0;
     for (int framework = 0; framework <= 1; framework++) {
         /* Both entry points exist even if one set is empty. Only an explicit
          * RegisterFramework call enables generation of framework action bodies. */
-        zd_putf(&b, "    public static async bool %s(System.Web.HttpContext ctx, string actionKey) {\n",
+        zan_synth_putf(&b, "    public static async bool %s(System.Web.HttpContext ctx, string actionKey) {\n",
                 framework ? "DispatchFramework" : "Dispatch");
         int emitted = 0;
         for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -446,7 +424,7 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
             if (!decl || decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str)
                 continue;
             if (decl->from_stdlib) continue;
-            bool framework_controller = zan_routes_framework_controller(unit, decl);
+            bool framework_controller = zan_mvc_framework_controller(unit, decl);
             if (framework) {
                 if (!probe.framework || !framework_controller) continue;
             } else {
@@ -472,7 +450,7 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
              * not reflection's collision identity. MVC views omit only the
              * conventional Zan.Web prefix and retain the Controller suffix. */
             zan_istr_t view_ns = ns;
-            zan_istr_t simple = zan_routes_simple_name(decl);
+            zan_istr_t simple = zan_mvc_simple_name(decl);
             if (view_ns.len == 7 && memcmp(view_ns.str, "Zan.Web", 7) == 0)
                 view_ns.len = 0;
             else if (view_ns.len > 8 && memcmp(view_ns.str, "Zan.Web.", 8) == 0) {
@@ -503,13 +481,13 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
             }
         }
 
-        if (emitted == 0) zd_putf(&b, "        await Task.Delay(0);\n");
-        zd_putf(&b, "        return false;\n");
-        zd_putf(&b, "    }\n");
+        if (emitted == 0) zan_synth_putf(&b, "        await Task.Delay(0);\n");
+        zan_synth_putf(&b, "        return false;\n");
+        zan_synth_putf(&b, "    }\n");
         zan_compile_trace("%s action dispatch: %d emitted",
                           framework ? "framework" : "app", emitted);
     }
-    zd_putf(&b, "}\n");
+    zan_synth_putf(&b, "}\n");
 
     if (!b.buf) return;
     if (skipped > 0)
@@ -532,92 +510,3 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
         zan_ast_list_push(&unit->comp_unit.decls,
                           synth->comp_unit.decls.items[i], arena);
 }
-
-/* ---------- gui 工程的入口 shim 合成（B-ID147） ----------
- *
- * zan.proj type=gui 且用户没写 Main、没有 __DesignMain 时，合成一个
- * `new <入口文件基名>().show()` 调用——窗口即对象（类继承框架的
- * Window 基类，show 装载同目录同名 .html 并绑定自身）。编译器不认识
- * 任何框架类型：`show` 只是类型检查自然会过的方法调用；用户写了
- * Main 即整体优先（__DesignMain 回退语义）。 */
-typedef struct {
-    int main;        /* 用户声明的 static Main */
-    int design_main; /* 已有 __DesignMain */
-} zdm_probe_t;
-
-static zan_walk_action_t zdm_probe_walk(zan_ast_node_t *n, void *ud) {
-    zdm_probe_t *p = (zdm_probe_t *)ud;
-    if (!n) return ZAN_WALK_CONTINUE;
-    if (n->kind == AST_METHOD_DECL && n->method_decl.name.str) {
-        zan_istr_t nm = n->method_decl.name;
-        if (nm.len == 4 && memcmp(nm.str, "Main", 4) == 0 &&
-            (n->method_decl.modifiers & MOD_STATIC))
-            p->main = 1;
-        if (nm.len == 12 && memcmp(nm.str, "__DesignMain", 12) == 0)
-            p->design_main = 1;
-    }
-    return ZAN_WALK_CONTINUE;
-}
-
-static void zan_synth_docapp_main(zan_ast_node_t *unit, zan_arena_t *arena,
-                                  zan_diag_t *diag, const char *entry_file) {
-    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
-    zdm_probe_t probe = {0};
-    for (int i = 0; i < unit->comp_unit.decls.count; i++)
-        zan_ast_walk(unit->comp_unit.decls.items[i], zdm_probe_walk, NULL,
-                     &probe);
-    if (probe.main || probe.design_main) return;
-    if (!load_proj_android_keys_done) {
-        load_proj_android_keys();
-        load_proj_android_keys_done = true;
-    }
-    if (strcmp(proj_app_type, "gui") != 0) return;
-
-    /* 入口类名 = 入口文件基名帕斯卡化（App.zan ↔ class App 约定）。
-       zan.proj 声明了 entry 键时优先（多文件工程的入口不在排序首位，
-       如 src/Models/ 辅助类排在窗口类之前）。 */
-    const char *entry = proj_entry_file[0] ? proj_entry_file : entry_file;
-    const char *slash = strrchr(entry, '/');
-    const char *bslash = strrchr(entry, '\\');
-    if (bslash > slash) slash = bslash;
-    const char *base = slash ? slash + 1 : entry;
-    char cls[256];
-    size_t blen = strlen(base);
-    if (blen >= sizeof(cls)) blen = sizeof(cls) - 1;
-    memcpy(cls, base, blen);
-    cls[blen] = 0;
-    char *dot = strrchr(cls, '.');
-    if (dot) *dot = 0;
-    if (cls[0] >= 'a' && cls[0] <= 'z') cls[0] = (char)(cls[0] - 32);
-    if (cls[0] == 0) return;
-
-    zd_buf_t b;
-    memset(&b, 0, sizeof(b));
-    zd_putf(&b, "/* 由编译器合成的窗口入口（勿手改）：type=gui 工程无 Main\n");
-    zd_putf(&b, "   时的回退入口；用户写了 Main 即整体优先，本类不参与。 */\n");
-    zd_putf(&b, "static class __ZanDocMain {\n");
-    zd_putf(&b, "    static void __DesignMain() {\n");
-    zd_putf(&b, "        new %s().Show();\n", cls);
-    zd_putf(&b, "    }\n}\n");
-    if (!b.buf) return;
-
-    size_t slen = b.len;
-    char *src = zan_arena_strdup(arena, b.buf, slen);
-    free(b.buf);
-    if (!src) return;
-    int file_id = diag->file_count;
-    zan_diag_add_file(diag, "<docapp-main>", src);
-    zan_lexer_t lex;
-    zan_lexer_init(&lex, src, slen, file_id, arena, diag);
-    zan_parser_t parser;
-    zan_parser_init(&parser, &lex, arena, diag);
-    zan_ast_node_t *synth = zan_parser_parse(&parser);
-    if (!synth || synth->kind != AST_COMPILATION_UNIT) return;
-    for (int i = 0; i < synth->comp_unit.usings.count; i++)
-        zan_ast_list_push(&unit->comp_unit.usings,
-                          synth->comp_unit.usings.items[i], arena);
-    for (int i = 0; i < synth->comp_unit.decls.count; i++)
-        zan_ast_list_push(&unit->comp_unit.decls,
-                          synth->comp_unit.decls.items[i], arena);
-}
-

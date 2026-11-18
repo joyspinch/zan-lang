@@ -19,6 +19,7 @@ typedef struct {
     abi_slot_kind_t kind;
     LLVMTypeRef ty;
     LLVMTypeRef parts[2];
+    LLVMTypeRef wide_storage;
     int nparts;
     bool byval;
     unsigned stack_align;
@@ -203,6 +204,47 @@ static LLVMTypeRef sysv_part_type(zan_irgen_t *g, sysv_info_t *in, int eb) {
     return LLVMFloatTypeInContext(g->ctx);
 }
 
+typedef struct {
+    unsigned integer;
+    unsigned sse;
+} sysv_regs_t;
+
+static void sysv_assign_arg_regs(abi_slot_t *slot, sysv_regs_t *free_regs) {
+    if (slot->kind == ABI_SLOT_INDIRECT) return; /* byval uses the stack */
+
+    bool coerced = slot->kind == ABI_SLOT_COERCE;
+    unsigned integer = 0, sse = 0;
+    int nparts = coerced ? slot->nparts : 1;
+    for (int i = 0; i < nparts; i++) {
+        LLVMTypeRef part = coerced ? slot->parts[i] : slot->ty;
+        switch (LLVMGetTypeKind(part)) {
+        case LLVMIntegerTypeKind:
+            integer += (LLVMGetIntTypeWidth(part) + 63) / 64;
+            break;
+        case LLVMPointerTypeKind:
+            integer++;
+            break;
+        case LLVMFloatTypeKind:
+        case LLVMDoubleTypeKind:
+        case LLVMVectorTypeKind: /* two floats in one SSE eightbyte */
+            sse++;
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (integer <= free_regs->integer && sse <= free_regs->sse) {
+        free_regs->integer -= integer;
+        free_regs->sse -= sse;
+    } else if (coerced && (integer != 1 || sse != 0)) {
+        /* Spill the whole aggregate without consuming either register bank.
+         * A single INTEGER eightbyte already spills as one LLVM argument. */
+        slot->kind = ABI_SLOT_INDIRECT;
+        slot->byval = true;
+    }
+}
+
 static bool aarch64_hfa(LLVMTypeRef t, LLVMTypeRef *base, int *count) {
     switch (LLVMGetTypeKind(t)) {
     case LLVMFloatTypeKind:
@@ -291,6 +333,8 @@ static void abi_classify(zan_irgen_t *g, abi_target_t tgt, LLVMTypeRef ty,
         } else {
             slot->parts[0] = LLVMArrayType(LLVMInt64TypeInContext(g->ctx), 2);
         }
+        if (abi_size_of(slot->parts[0]) > size)
+            slot->wide_storage = slot->parts[0];
         return;
     }
 
@@ -346,6 +390,16 @@ static LLVMValueRef abi_byte_ptr(zan_irgen_t *g, LLVMValueRef base,
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMValueRef idx = LLVMConstInt(LLVMInt64TypeInContext(g->ctx), off, 0);
     return LLVMBuildInBoundsGEP2(g->builder, i8, base, &idx, 1, "abi.off");
+}
+
+static LLVMValueRef abi_slot_alloca(zan_irgen_t *g, const abi_slot_t *slot,
+                                    const char *name) {
+    /* AArch64 can use a wider ABI carrier than the declared aggregate. */
+    LLVMTypeRef storage = slot->wide_storage ? slot->wide_storage : slot->ty;
+    LLVMValueRef tmp = LLVMBuildAlloca(g->builder, storage, name);
+    unsigned align = (unsigned)abi_align_of(storage);
+    LLVMSetAlignment(tmp, align < 8 ? 8 : align);
+    return tmp;
 }
 
 static void abi_pending_add(zan_irgen_t *g, const char *name) {
@@ -418,11 +472,16 @@ LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
         return NULL;
     }
     abi_classify(g, tgt, zan_ret, true, &ret_slot);
-    for (unsigned i = 0; i < pc; i++)
+    bool sret = (ret_slot.kind == ABI_SLOT_SRET);
+    /* A SysV hidden result pointer occupies the first integer argument register. */
+    sysv_regs_t free_regs = {sret ? 5 : 6, 8};
+    for (unsigned i = 0; i < pc; i++) {
         abi_classify(g, tgt, zan_params[i], false, &arg_slots[i]);
+        if (tgt == ABI_TARGET_SYSV64)
+            sysv_assign_arg_regs(&arg_slots[i], &free_regs);
+    }
 
     unsigned cn = 0;
-    bool sret = (ret_slot.kind == ABI_SLOT_SRET);
     LLVMTypeRef ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (sret) c_params[cn++] = ptr_ty;
     for (unsigned i = 0; i < pc; i++) {
@@ -501,9 +560,9 @@ LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
         abi_slot_t *s = &arg_slots[i];
         LLVMValueRef v = LLVMGetParam(thunk, i);
         if (s->kind == ABI_SLOT_DIRECT) { c_args[an++] = v; continue; }
-        LLVMValueRef tmp = LLVMBuildAlloca(g->builder, zan_params[i], "abi.arg");
-        unsigned al = (unsigned)abi_align_of(zan_params[i]);
-        LLVMSetAlignment(tmp, al < 8 ? 8 : al);
+        LLVMValueRef tmp = abi_slot_alloca(g, s, "abi.arg");
+        if (s->wide_storage)
+            LLVMBuildStore(g->builder, LLVMConstNull(s->wide_storage), tmp);
         LLVMBuildStore(g->builder, v, tmp);
         if (s->kind == ABI_SLOT_INDIRECT) { c_args[an++] = tmp; continue; }
         for (int k = 0; k < s->nparts; k++) {
@@ -548,9 +607,7 @@ LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
         LLVMBuildRet(g->builder,
                      LLVMBuildLoad2(g->builder, zan_ret, ret_tmp, "abi.ret"));
     } else if (ret_slot.kind == ABI_SLOT_COERCE) {
-        LLVMValueRef tmp = LLVMBuildAlloca(g->builder, zan_ret, "abi.rettmp");
-        unsigned al = (unsigned)abi_align_of(zan_ret);
-        LLVMSetAlignment(tmp, al < 8 ? 8 : al);
+        LLVMValueRef tmp = abi_slot_alloca(g, &ret_slot, "abi.rettmp");
         for (int k = 0; k < ret_slot.nparts; k++) {
             LLVMValueRef part = ret_slot.nparts == 1
                 ? call

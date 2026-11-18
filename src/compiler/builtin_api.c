@@ -148,16 +148,6 @@ static const zan_builtin_member_t members_dir[] = {
     { "SetCurrentDirectory", 'M', "void SetCurrentDirectory(string path)" },
 };
 
-static const zan_builtin_member_t members_path[] = {
-    { "Combine",                    'M', "string Combine(string a, string b)" },
-    { "GetFileName",                'M', "string GetFileName(string path)" },
-    { "GetFileNameWithoutExtension",'M', "string GetFileNameWithoutExtension(string path)" },
-    { "GetDirectoryName",           'M', "string GetDirectoryName(string path)" },
-    { "GetExtension",               'M', "string GetExtension(string path)" },
-    { "HasExtension",               'M', "bool HasExtension(string path)" },
-    { "GetTempPath",                'M', "string GetTempPath()" },
-};
-
 static const zan_builtin_member_t members_env[] = {
     { "ArgCount", 'M', "int ArgCount()" },
     { "ArgAt",    'M', "string ArgAt(int index)" },
@@ -181,9 +171,6 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "AsF64",  'M', "double AsF64(long bits)" },
     { "GetString", 'M', "string GetString(nint ptr)" },
     { "PutString", 'M', "void PutString(nint ptr, string text)" },
-    { "Sha256", 'M', "string Sha256(nint ptr, long size)" },
-    { "Sha1",   'M', "string Sha1(nint ptr, long size)" },
-    { "Sha512", 'M', "string Sha512(nint ptr, long size)" },
     { "Crc32",  'M', "long Crc32(nint ptr, long size)" },
     { "Crc32Update", 'M', "long Crc32Update(long crc, nint ptr, long size)" },
     { "Crc32C", 'M', "long Crc32C(nint ptr, long size)" },
@@ -201,11 +188,8 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "GhashUpdate",   'M', "long GhashUpdate(nint h, nint data, long len, nint y)" },
     { "RsaModPow",     'M', "long RsaModPow(nint baseVal, long bLen, nint exp, long eLen, nint mod, long mLen, nint outBuf)" },
     { "RsaCrtModPow",  'M', "long RsaCrtModPow(nint msg, long mLen, nint p, long pLen, nint q, long qLen, nint dp, long dpLen, nint dq, long dqLen, nint qinv, long qinvLen, nint outBuf, long outLen)" },
-    { "Sm3",              'M', "string Sm3(nint ptr, long size)" },
     { "Sm4CbcEncrypt",    'M', "long Sm4CbcEncrypt(nint dst, nint src, long size, nint key, nint iv)" },
     { "Sm4CbcDecrypt",    'M', "long Sm4CbcDecrypt(nint dst, nint src, long size, nint key, nint iv)" },
-    { "Base64Encode",     'M', "string Base64Encode(nint ptr, long size)" },
-    { "Base64Decode",     'M', "long Base64Decode(nint dst, nint src, long size)" },
     { "JsonSkipWhitespace", 'M', "long JsonSkipWhitespace(nint ptr, long pos, long len)" },
     { "JsonScanString",     'M', "long JsonScanString(nint ptr, long pos, long len)" },
     { "JsonParseFast",      'M', "long JsonParseFast(nint buf, long len, nint slots, long slotCap, nint pairs, long pairCap, nint outCounts)" },
@@ -355,13 +339,6 @@ static const zan_builtin_member_t members_task[] = {
     { "JoinCancel",'M', "void JoinCancel(long entry)" },
 };
 
-static const zan_builtin_member_t members_pixelops[] = {
-    { "BlendOver",           'M', "void BlendOver(nint dst, nint src, int count)" },
-    { "SwapRB",              'M', "void SwapRB(nint dst, nint src, int count)" },
-    { "FillRect",            'M', "void FillRect(nint dst, int dstStride, int x, int y, int w, int h, int color)" },
-    { "ResampleBilinearRow", 'M', "void ResampleBilinearRow(nint dst, nint src0, nint src1, nint xIndices, nint xWeights, int weightY, int width)" },
-};
-
 static const zan_builtin_member_t members_scalar[] = {
     { "ToString",            'M', "string ToString()" },
 };
@@ -395,11 +372,9 @@ static const zan_builtin_type_t builtin_types[] = {
     BT("Char", "Char", "char", 1, members_charcls),
     BT("File", "File", "File", 1, members_file),
     BT("Directory", "Directory", "Directory", 1, members_dir),
-    BT("Path", "Path", "Path", 1, members_path),
     BT("Environment", "Environment", "Environment", 1, members_env),
     BT("NativeMemory", "NativeMemory", "NativeMemory", 1, members_nativemem),
     BT("Task", "Task", "Task", 1, members_task),
-    BT("PixelOps", "PixelOps", "PixelOps", 1, members_pixelops),
     BT("BitOperations", "BitOperations", "BitOperations", 1, members_bitops),
     BT("Cpu", "Cpu", "Cpu", 1, members_cpu),
     BT("Aes", "Aes", "Aes", 1, members_x86_aes),

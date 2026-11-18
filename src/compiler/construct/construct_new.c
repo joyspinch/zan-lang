@@ -612,7 +612,7 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMSizeOf(elem_llvm), "total");
                 arr = zan_array_alloc_typed(g, total, dims[0], elem_type);
             } else {
-                arr = zan_mdarray_alloc(g, dims, rank, elem_llvm);
+                arr = zan_mdarray_alloc(g, dims, rank, elem_llvm, elem_type);
             }
             int ninit = expr->new_expr.args.count - ndims;
             if (ninit > 0) {

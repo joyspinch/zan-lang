@@ -1,0 +1,62 @@
+using System;
+using System.Threading;
+
+class Program {
+    static void Check(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    static async void WaitUntilCancelled(AsyncGate gate, AsyncGate entered, AtomicInt resumed) {
+        entered.Signal();
+        await gate.Wait();
+        resumed.Add(1);
+    }
+
+    static async void WaitForGate(AsyncGate gate) {
+        await gate.Wait();
+    }
+
+    static async void Run() {
+        AsyncGate banked = new AsyncGate();
+        banked.Signal();
+        banked.SignalAll();
+        Check(await banked.Wait(), "Signal must count before Wait");
+        Check(await banked.Wait(), "SignalAll must count before Wait");
+        banked.Dispose();
+        Check(!banked.IsOpen() && !(await banked.Wait()), "closed gate accepts no new waits");
+
+        for (int i = 0; i < 64; i = i + 1) {
+            AsyncGate gate = new AsyncGate();
+            long waiter = Task.Spawn(WaitForGate(gate));
+            Thread.Start(() => {
+                gate.Signal();
+                gate.SignalAll();
+                gate.Close();
+            });
+            // Keep a scheduler timer pending while a native thread may be the
+            // only producer. Poll the task ownership, not the gate wait itself.
+            while (gate.IsOpen() || Task.IsDone(waiter) == 0) { await Task.Delay(1); }
+            Task.Release(waiter);
+            gate.Close();
+            Check(!(await gate.Wait()), "cross-thread Close must invalidate the handle");
+        }
+
+        AsyncGate gateToCancel = new AsyncGate();
+        AsyncGate entered = new AsyncGate();
+        AtomicInt resumed = new AtomicInt(0);
+        long task = Task.Spawn(WaitUntilCancelled(gateToCancel, entered, resumed));
+        await entered.Wait();
+        Task.Cancel(task);
+        gateToCancel.Close();
+        List<long> tasks = new List<long>();
+        tasks.Add(task);
+        Check((await Task.WhenAll(tasks)) == 1, "Close must release the cancelled wait");
+        Check(resumed.Load() == 0, "a cancelled waiter must skip its continuation");
+        entered.Close();
+        Console.WriteLine("async gate lifetime passed");
+    }
+
+    static void Main() {
+        await Program.Run();
+    }
+}

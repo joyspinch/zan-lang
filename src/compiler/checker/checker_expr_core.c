@@ -482,65 +482,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 "nameof requires a single identifier or member access");
             return c->binder->type_error;
         }
-        /* 零参 SyncStructureAll(Async)：合成 Meta[] 实参（见文件尾
-         * checker_synthesize_table_array），之后按普通扩展调用走。 */
-        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
-            expr->call.args.count == 0 &&
-            ((expr->call.callee->member.name.len == 16 &&
-              memcmp(expr->call.callee->member.name.str, "SyncStructureAll",
-                     16) == 0) ||
-             (expr->call.callee->member.name.len == 21 &&
-              memcmp(expr->call.callee->member.name.str,
-                     "SyncStructureAllAsync", 21) == 0))) {
-            zan_type_t *srecv = zan_checker_check_expr(
-                c, expr->call.callee->member.object);
-            if (checker_recv_is_conn(c, srecv)) {
-                /* 改写为静态直调 DbExtensions.SyncStructureAll*(db, metas)：
-                 * 扩展分发 + await 会踩泛型环境失真（体不执行、结果槽 0，
-                 * B-ID63 家族；metrics 直调 SyncAsync 的同一绕开术）——
-                 * 扩展就是 this 首参的静态，直调语义等价。 */
-                zan_ast_node_t *recvnode = expr->call.callee->member.object;
-                zan_istr_t mname = expr->call.callee->member.name;
-                zan_ast_node_t *zid = zan_ast_new(c->arena, AST_IDENTIFIER,
-                                                  expr->loc);
-                zid->ident.name = checker_istr_lit(c->arena, "DbExtensions");
-                zid->ident.inst_type_ref = NULL;
-                zan_ast_node_t *ncal = zan_ast_new(c->arena, AST_MEMBER_ACCESS,
-                                                   expr->loc);
-                ncal->member.object = zid;
-                ncal->member.name = mname;
-                ncal->member.null_cond = 0;
-                expr->call.callee = ncal;
-                zan_ast_list_init(&expr->call.args);
-                zan_ast_list_push(&expr->call.args, recvnode, c->arena);
-                zan_ast_list_push(&expr->call.args,
-                                  checker_synthesize_table_array(c, expr->loc),
-                                  c->arena);
-            }
+        zan_type_t *checked_receiver = NULL;
+        if (zan_data_orm_schema_candidate(c, expr)) {
+            zan_ast_node_t *callee = expr->call.callee;
+            checked_receiver = zan_checker_check_expr(c, callee->member.object);
+            if ((!checked_receiver || !checked_receiver->sym ||
+                 !checker_find_method_call(checked_receiver->sym, callee->member.name, 0, 0)) &&
+                zan_data_orm_lower_schema(c, expr, checked_receiver))
+                checked_receiver = NULL;
         }
-        /* __AttrRoutes.Register(app) 编译期控制器发现：合成 TypeInfo[] 实参
-         * 注入为第 2 实参，交给 Zan.Mvc 框架动态约定路由引擎遍历计算；
-         * 第 3 实参是 main.c 合成的动作派发器（约定路由的 handler 统一是
-         * __AttrRoutes.Dispatch，真正的方法调用按 actionKey 在这里展开成
-         * 强类型调用——反射 Invoke 拿不到异步协程句柄，await 不了）。 */
-        int route_registration = zan_routes_registration(expr);
-        if (route_registration == 1 &&
-            (expr->call.args.count == 1 || expr->call.args.count == 2)) {
-            if (expr->call.args.count == 1) {
-                zan_ast_list_push(&expr->call.args,
-                                  checker_synthesize_controllers_array(c, expr->loc),
-                                  c->arena);
-            }
-            zan_ast_list_push(&expr->call.args,
-                              checker_synthesize_dispatcher_ref(c, expr->loc, false),
-                              c->arena);
-        } else if (route_registration == 2 && expr->call.args.count == 1) {
-            /* Framework opt-in keeps its own dispatcher; Register(app) must
-             * neither discover these controllers nor overwrite this delegate. */
-            zan_ast_list_push(&expr->call.args,
-                              checker_synthesize_dispatcher_ref(c, expr->loc, true),
-                              c->arena);
-        }
+        zan_mvc_rewrite_route_call(&c->mvc_routes, expr, c->arena);
         zan_type_t *callee_type;
         zan_type_t *recv = NULL;
         int callee_is_method = 0;
@@ -564,7 +515,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
         }
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
-            recv = zan_checker_check_expr(c, expr->call.callee->member.object);
+            recv = checked_receiver ? checked_receiver :
+                zan_checker_check_expr(c, expr->call.callee->member.object);
             if (recv && recv->sym) {
                 zan_symbol_t *m = checker_find_method_call(
                     recv->sym, expr->call.callee->member.name,

@@ -75,6 +75,9 @@
         LLVMTypeRef live_reg_args[] = { i8ptr, i64 };
         g->rt_live_register = LLVMAddFunction(g->mod, "zan_rt_live_register",
             LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), live_reg_args, 2, 0));
+        LLVMTypeRef live_array_args[] = { i8ptr, i64, i64, LLVMInt32TypeInContext(g->ctx) };
+        g->rt_live_register_array = LLVMAddFunction(g->mod, "zan_rt_live_register_array",
+            LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), live_array_args, 4, 0));
         LLVMTypeRef live_unreg_args[] = { i8ptr };
         g->rt_live_unregister = LLVMAddFunction(g->mod, "zan_rt_live_unregister",
             LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), live_unreg_args, 1, 0));
@@ -323,6 +326,7 @@
                 g->arc_defer_depth = LLVMAddGlobal(g->mod, i32t,
                                                    "__zan_arc_rel_depth");
                 LLVMSetInitializer(g->arc_defer_depth, LLVMConstNull(i32t));
+                LLVMSetLinkage(g->arc_defer_depth, LLVMInternalLinkage);
                 /* This is recursion depth, not a shared queue count. A second
                  * thread must never decrement or inherit another thread's frame. */
                 if (!g->target_is_wasm)
@@ -388,8 +392,7 @@
             LLVMBuildBr(g->builder, tail_bb);
             LLVMPositionBuilderAtEnd(g->builder, tail_bb);
         }
-        /* B-ID78 回归补丁：defer 三符号在此补弱回退体（必须等声明建成，
-         * 见 irgen_weak.c emit_defer_fallback 注释） */
+        /* Define the per-thread queue after declaring its three entry points. */
         emit_defer_fallback(g);
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, fb);

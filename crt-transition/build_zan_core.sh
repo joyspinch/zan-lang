@@ -102,7 +102,7 @@ python3 crt-transition/localize_syms.py "$OUT" \
   _zan_co_sched_init _zan_co_ready _zan_co_delay \
   _zan_co_frame_free _zan_co_pending _zan_co_sched_run_until \
   _zan_co_sched_run \
-  _zan_embed_has _zan_embed_read _zan_embed_bytes _zan_embed_list \
+  _zan_embed_has _zan_embed_read _zan_embed_bytes _zan_embed_list_alloc \
   _zan_embed_decode _zan_embed_rawlen \
   _zan_rt_dbl_parse _zan_rt_dbl_str _zan_rt_guard_fail3 \
   _zan_rt_set_strict _zan_rt_soft_is_hard \

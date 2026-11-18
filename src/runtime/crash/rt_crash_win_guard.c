@@ -73,6 +73,17 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+static HMODULE zan_crash_pin_callback_image(void) {
+    HMODULE image;
+    /* VEH and the unhandled filter can outlive the caller's DLL reference.
+     * Keep their code mapped for the lifetime of the process. */
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            (LPCSTR)(ULONG_PTR)&zan__crash_filter, &image))
+        return NULL;
+    return image;
+}
+
 static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
                                    const char *reason,
                                    void **bt, unsigned btn) {
@@ -331,7 +342,8 @@ static void zan__guard_log_deferred(zan__thread_slot *s, zan__fault_t *flt) {
 }
 #endif /* x64 recovery */
 
-/* 在崩溃恢复点保护下执行函数 (正常返回 1，捕获故障返回 0) */
+/* 在崩溃恢复点保护下执行函数 (正常返回 1，捕获故障返回 0)。
+ * 恢复只还原护栏栈顶，跳过故障调用链的栈展开与资源清理。 */
 int zan__guard_call(void (*fn)(void *), void *arg) {
     if (!fn) return 1;
     zan__thread_slot *s = zan__slot(1);
@@ -339,7 +351,8 @@ int zan__guard_call(void (*fn)(void *), void *arg) {
     if (!s->ready) {
         s->ready = 1;
         /* 重新确立全局未处理异常过滤器所有权 */
-        SetUnhandledExceptionFilter(zan__crash_filter);
+        if (zan_crash_pin_callback_image())
+            SetUnhandledExceptionFilter(zan__crash_filter);
         zan__crash_install();
         /* 保护页后备栈空间，保证栈溢出时有足够栈深度写入日志 */
         ULONG guarantee = 64 * 1024;
@@ -419,16 +432,6 @@ static void zan__crash_atexit(void) {
     zan__crash_note("exit", detail);
 }
 
-/* 主程序实例标记（区分 DLL 宿主副本） */
-static int zan__crash_in_main_image(void) {
-    HMODULE m = NULL;
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            (LPCSTR)(ULONG_PTR)&zan__crash_in_main_image, &m))
-        return 1;
-    return (uintptr_t)m == (uintptr_t)GetModuleHandleA(NULL);
-}
-
 void zan__crash_install(void) {
 #if defined(__SANITIZE_ADDRESS__)
     return;
@@ -440,12 +443,17 @@ void zan__crash_install(void) {
     /* 单进程内共享的向量化异常处理程序 */
     if (InterlockedCompareExchange((LONG volatile *)&zan__crash_installed,
                                    1, 0) != 0) return;
+    HMODULE image = zan_crash_pin_callback_image();
+    if (!image) {
+        InterlockedExchange(&zan__crash_installed, 0);
+        return;
+    }
     zan__crash_resolve_paths();
     SetUnhandledExceptionFilter(zan__crash_filter);
     /* 向量化异常处理优先于帧异常拦截 */
     AddVectoredExceptionHandler(1, zan__crash_veh);
     zan__crash_note("run", "");
-    if (zan__crash_in_main_image()) atexit(zan__crash_atexit);
+    if (image == GetModuleHandleA(NULL)) atexit(zan__crash_atexit);
 }
 
 #if defined(__GNUC__) || defined(__clang__)

@@ -66,8 +66,9 @@ static char *zan_win_quote_cmdline(const char *exe, const char **args, int32_t a
 }
 #endif
 
-int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
-    if (!exe) return -1;
+int32_t zan_proc_run_safe_timeout(const char *exe, const char **args,
+                                  int32_t argc, int32_t timeout_ms) {
+    if (!exe || argc < 0 || (argc > 0 && !args)) return -1;
 #ifdef _WIN32
     char *cmdline = zan_win_quote_cmdline(exe, args, argc);
     if (!cmdline) return -1;
@@ -90,12 +91,17 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
     free(wcmd);
     if (!ok) return -1;
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD result = WaitForSingleObject(pi.hProcess,
+        timeout_ms > 0 ? (DWORD)timeout_ms : INFINITE);
+    if (result == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+    }
     DWORD code = 0;
-    GetExitCodeProcess(pi.hProcess, &code);
+    BOOL exited = result == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return (int32_t)code;
+    return exited ? (int32_t)code : -1;
 #else
     char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
     if (!argv) return -1;
@@ -116,13 +122,31 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
     }
     free(argv);
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return -1;
+    int64_t deadline = timeout_ms > 0
+        ? zan_monotonic_us() + (int64_t)timeout_ms * 1000 : 0;
+    for (;;) {
+        pid_t waited = waitpid(pid, &status, deadline ? WNOHANG : 0);
+        if (waited == pid) break;
+        if (waited < 0 && errno != EINTR) return -1;
+        if (!deadline) continue;
+        int64_t left = deadline - zan_monotonic_us();
+        if (left <= 0) {
+            kill(pid, SIGKILL);
+            do { waited = waitpid(pid, &status, 0); }
+            while (waited < 0 && errno == EINTR);
+            return -1;
+        }
+        struct timespec delay = {0, (long)(left < 10000 ? left : 10000) * 1000};
+        nanosleep(&delay, NULL);
     }
     if (WIFEXITED(status)) return (int32_t)WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + (int32_t)WTERMSIG(status);
     return -1;
 #endif
+}
+
+int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
+    return zan_proc_run_safe_timeout(exe, args, argc, -1);
 }
 
 #ifndef _WIN32

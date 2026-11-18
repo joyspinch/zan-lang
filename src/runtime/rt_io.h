@@ -85,7 +85,22 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
 void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
                        int32_t *out);
 
-/* 脱离反应堆主循环执行阻塞原生调用：在线程池中派发并在完成后唤醒协程 */
+enum zan_blocking_status {
+    ZAN_BLOCKING_OK = 0,
+    ZAN_BLOCKING_QUEUE_FULL,
+    ZAN_BLOCKING_THREAD_FAILED,
+    ZAN_BLOCKING_NO_MEMORY,
+    ZAN_BLOCKING_INVALID_CALL
+};
+
+/* Both slots belong to the suspended frame. Status is written before wake;
+ * out is optional for void and is written only on success. */
+void zan_rt_blocking_checked_co(void *fn, int32_t argc,
+                                int64_t a0, int64_t a1, int64_t a2, int64_t a3,
+                                void *frame, zan_co_step_t step, int64_t *out,
+                                int32_t *status);
+
+/* Legacy native ABI for previously emitted code. Submission failure is fatal. */
 void zan_rt_blocking_co(void *fn, int32_t argc,
                         int64_t a0, int64_t a1, int64_t a2, int64_t a3,
                         void *frame, zan_co_step_t step, int64_t *out);

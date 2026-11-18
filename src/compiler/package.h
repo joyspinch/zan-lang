@@ -128,6 +128,10 @@ bool zan_pkg_write_lock(zan_pkg_registry_t *reg);
 
 bool zan_pkg_read_lock(zan_pkg_registry_t *reg);
 
+/* Bind compiler package discovery to the project's restored lock graph, if present. */
+bool zan_pkg_prepare_project(const char *project_dir);
+bool zan_pkg_project_has_lock(const char *project_dir);
+
 /* 计算文件 SHA-256 校验和（小写十六进制，共 64 字符 + '\\0'） */
 bool zan_pkg_compute_checksum(const char *file_path, char out_hex[65]);
 bool zan_pkg_compute_tree_checksum(const char *dir, char out_hex[65]);

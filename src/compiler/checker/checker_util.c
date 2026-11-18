@@ -159,15 +159,6 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
 
 #define CHECKER_DERIVES_MAX_DEPTH 8192
 
-/* SyncStructureAll(Async) 编译期实体发现（定义见文件尾 SyncStructureAll 节） */
-static bool checker_recv_is_conn(zan_checker_t *c, zan_type_t *recv);
-static zan_ast_node_t *checker_synthesize_table_array(zan_checker_t *c,
-                                                      zan_loc_t loc);
-static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
-                                                            zan_loc_t loc);
-static zan_ast_node_t *checker_synthesize_dispatcher_ref(zan_checker_t *c,
-                                                         zan_loc_t loc,
-                                                         bool framework);
 static bool checker_is_builtin_class_name(zan_istr_t n);
 static bool checker_is_target_builtin_class(zan_ast_node_t *obj) {
     if (!obj) return false;
@@ -225,7 +216,6 @@ static void checker_bind_call_intrinsic(zan_checker_t *c, zan_ast_node_t *expr,
     }
     expr->call.is_intrinsic = 0;
 }
-static zan_istr_t checker_istr_lit(zan_arena_t *arena, const char *s);
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
                       zan_arena_t *arena, zan_diag_t *diag) {
     memset(c, 0, sizeof(*c));

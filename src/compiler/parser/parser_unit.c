@@ -86,22 +86,44 @@ static void zsrc_append(char *buf, int cap, int *off, const char *fmt, ...) {
     if (*off > cap) *off = cap;
 }
 
-static int tref_write(char *buf, int cap, zan_ast_node_t *t) {
-    int n = 0;
-    if (!t || t->kind != AST_TYPE_REF || cap <= 0) return 0;
-    zsrc_append(buf, cap, &n, "%.*s",
-                     (int)t->type_ref.name.len, t->type_ref.name.str);
-    if (t->type_ref.type_args.count > 0) {
-        zsrc_append(buf, cap, &n, "<");
-        for (int i = 0; i < t->type_ref.type_args.count; i++) {
-            if (i > 0) zsrc_append(buf, cap, &n, ", ");
-            n += tref_write(buf + n, cap - n, t->type_ref.type_args.items[i]);
+static void tref_write(char *buf, int cap, int *off, zan_ast_node_t *t) {
+    if (!t || *off >= cap) return;
+    if (t->kind == AST_TUPLE_TYPE) {
+        zsrc_append(buf, cap, off, "(");
+        for (int i = 0; i < t->tuple_type.elems.count; i++) {
+            if (i > 0) zsrc_append(buf, cap, off, ", ");
+            tref_write(buf, cap, off, t->tuple_type.elems.items[i]);
         }
-        zsrc_append(buf, cap, &n, ">");
+        zsrc_append(buf, cap, off, ")");
+        return;
     }
-    if (t->type_ref.is_array) zsrc_append(buf, cap, &n, "[]");
-    if (t->type_ref.is_nullable) zsrc_append(buf, cap, &n, "?");
-    return n;
+    if (t->kind != AST_TYPE_REF) return;
+    zan_ast_node_t *element = t;
+    while (element->kind == AST_TYPE_REF && element->type_ref.array_element)
+        element = element->type_ref.array_element;
+    if (element != t) {
+        tref_write(buf, cap, off, element);
+    } else {
+        zsrc_append(buf, cap, off, "%.*s",
+                    (int)t->type_ref.name.len, t->type_ref.name.str);
+        if (t->type_ref.type_args.count > 0) {
+            zsrc_append(buf, cap, off, "<");
+            for (int i = 0; i < t->type_ref.type_args.count; i++) {
+                if (i > 0) zsrc_append(buf, cap, off, ", ");
+                tref_write(buf, cap, off, t->type_ref.type_args.items[i]);
+            }
+            zsrc_append(buf, cap, off, ">");
+        }
+    }
+    /* The parser stores the first written rank on the outermost array. */
+    for (zan_ast_node_t *array = t;
+         array && array->kind == AST_TYPE_REF && array->type_ref.is_array;
+         array = array->type_ref.array_element) {
+        zsrc_append(buf, cap, off, "[");
+        for (int i = 1; i < array->type_ref.array_rank; i++) zsrc_append(buf, cap, off, ",");
+        zsrc_append(buf, cap, off, "]");
+    }
+    if (t->type_ref.is_nullable) zsrc_append(buf, cap, off, "?");
 }
 
 static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
@@ -137,7 +159,7 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
     for (int i = 0; i < ddecl->method_decl.params.count; i++) {
         zan_ast_node_t *pp = ddecl->method_decl.params.items[i];
         if (i > 0) zsrc_append(src, cap, &n, ", ");
-        n += tref_write(src + n, cap - n, pp->param.type);
+        tref_write(src, cap, &n, pp->param.type);
         zsrc_append(src, cap, &n, " a%d", i);
     }
     int invoke_params_end = n;
@@ -208,7 +230,7 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
         zsrc_append(src, cap, &n, "    public ");
-        n += tref_write(src + n, cap - n, pp->param.type);
+        tref_write(src, cap, &n, pp->param.type);
         zsrc_append(src, cap, &n, " %.*s;\n",
                          (int)pp->param.name.len, pp->param.name.str);
     }
@@ -216,7 +238,7 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
         if (i > 0) zsrc_append(src, cap, &n, ", ");
-        n += tref_write(src + n, cap - n, pp->param.type);
+        tref_write(src, cap, &n, pp->param.type);
         zsrc_append(src, cap, &n, " %.*s",
                          (int)pp->param.name.len, pp->param.name.str);
     }
@@ -233,7 +255,7 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
         if (i > 0) zsrc_append(src, cap, &n, ", ");
-        n += tref_write(src + n, cap - n, pp->param.type);
+        tref_write(src, cap, &n, pp->param.type);
         zsrc_append(src, cap, &n, " %.*s",
                          (int)pp->param.name.len, pp->param.name.str);
     }
@@ -302,6 +324,15 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                           arena);
 }
 
+static zan_ast_node_t **nested_owner_slot(zan_ast_node_t *d) {
+    if (d->kind == AST_DELEGATE_DECL)
+        return d->meta ? &d->meta->delegate_host : NULL;
+    if (d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL ||
+        d->kind == AST_INTERFACE_DECL || d->kind == AST_ENUM_DECL)
+        return &d->type_decl.nested_host;
+    return NULL;
+}
+
 void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
@@ -318,6 +349,7 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
                 zan_istr_t e_ns = zan_ast_ns_name(e);
                 zan_istr_t d_ns = zan_ast_ns_name(d);
                 if (e->kind == d->kind &&
+                    e->type_decl.nested_host == d->type_decl.nested_host &&
                     (e->type_decl.modifiers & MOD_PARTIAL) &&
                     e_ns.len == d_ns.len &&
                     (!e_ns.len || memcmp(e_ns.str, d_ns.str, e_ns.len) == 0) &&
@@ -330,6 +362,14 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
             }
         }
         if (first) {
+            /* Hoisting puts owners before their children. Reparent a later
+             * part's children before comparing or merging those children. */
+            for (int ni = di + 1; ni < decls->count; ni++) {
+                zan_ast_node_t **owner = nested_owner_slot(decls->items[ni]);
+                if (owner && *owner == d) *owner = first;
+            }
+            first->from_stdlib &= d->from_stdlib;
+            first->from_package &= d->from_package;
             for (int mi = 0; mi < d->type_decl.members.count; mi++)
                 zan_ast_list_push(&first->type_decl.members,
                                   d->type_decl.members.items[mi], arena);
@@ -362,18 +402,17 @@ static int hoist_nested_types(zan_ast_node_t *unit, zan_ast_node_t *type_node,
     int mi = 0;
     while (mi < m) {
         zan_ast_node_t *mem = members->items[mi];
-        if (mem->kind == AST_DELEGATE_DECL) {
+        if (mem->kind == AST_DELEGATE_DECL)
+            zan_ast_ensure_decl_meta(mem, arena);
+        zan_ast_node_t **owner = nested_owner_slot(mem);
+        if (owner) {
+            *owner = type_node;
+            mem->from_stdlib = type_node->from_stdlib;
+            mem->from_package = type_node->from_package;
             zan_ast_list_push(decls, mem, arena);
             hoisted++;
-            for (int k = mi; k < m - 1; k++) members->items[k] = members->items[k + 1];
-            members->count--;
-            m--;
-        } else if (mem->kind == AST_CLASS_DECL || mem->kind == AST_STRUCT_DECL ||
-                   mem->kind == AST_INTERFACE_DECL || mem->kind == AST_ENUM_DECL) {
-            hoisted += hoist_nested_types(unit, mem, decls, arena);
-            mem->type_decl.nested_host = type_node;
-            zan_ast_list_push(decls, mem, arena);
-            hoisted++;
+            if (mem->kind != AST_DELEGATE_DECL)
+                hoisted += hoist_nested_types(unit, mem, decls, arena);
             for (int k = mi; k < m - 1; k++) members->items[k] = members->items[k + 1];
             members->count--;
             m--;
@@ -480,7 +519,7 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx
     case AST_TYPE_REF: {
         for (int i = 0; i < ctx->tparams->count && i < ctx->targs->count; i++) {
             zan_ast_node_t *tp = ctx->tparams->items[i];
-            if (tp && tp->kind == AST_IDENTIFIER &&
+            if (!node->type_ref.ns_decl && tp && tp->kind == AST_IDENTIFIER &&
                 tp->ident.name.len == node->type_ref.name.len &&
                 memcmp(tp->ident.name.str, node->type_ref.name.str, (size_t)node->type_ref.name.len) == 0) {
                 zan_ast_node_t *ta = ctx->targs->items[i];
@@ -502,7 +541,7 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx
         return res;
     }
     case AST_IDENTIFIER: {
-        for (int i = 0; !node->ident.is_type_receiver &&
+        for (int i = 0; !node->ident.is_type_receiver && !node->ident.ns_decl &&
              i < ctx->tparams->count && i < ctx->targs->count; i++) {
             zan_ast_node_t *tp = ctx->tparams->items[i];
             if (tp && tp->kind == AST_IDENTIFIER &&
@@ -512,6 +551,7 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx
                 zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_IDENTIFIER, node->loc);
                 *res = *node;
                 res->ident.name = ta->type_ref.name;
+                res->ident.ns_decl = ta->type_ref.ns_decl;
                 return res;
             }
         }

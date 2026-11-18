@@ -60,7 +60,7 @@ endif()
 get_filename_component(_driver_test_root "${OUTLL}" DIRECTORY)
 execute_process(
   COMMAND "${CMAKE_COMMAND}" "-DGEN1=${GEN1}"
-    "-DOUTDIR=${_driver_test_root}/test-out/selfhost-driver"
+    "-DOUTDIR=${_driver_test_root}/test-out/selfhost-driver" "-DCLANG=${CLANG}"
     -P "${CMAKE_CURRENT_LIST_DIR}/run_selfhost_driver.cmake"
   RESULT_VARIABLE driver_rc
   OUTPUT_VARIABLE driver_out

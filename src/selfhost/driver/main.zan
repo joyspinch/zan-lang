@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 namespace Zan;
 
@@ -81,7 +82,10 @@ public partial class Program {
     }
 
     static void AddInput(string path) {
-        string norm = NormPath(path);
+        string norm = Path.GetFullPath(path);
+        #if WINDOWS
+        norm = norm.Replace("\\", "/").ToLower();
+        #endif
         if (Included(norm)) { return; }
         inclPaths.Add(norm);
         inclSrcs.Add(File.ReadAllText(path));
@@ -273,35 +277,6 @@ public partial class Program {
         return s;
     }
 
-    public static void DedupTopTypes(Node unit) {
-        List<string> seen = new List<string>();
-        int i = 0;
-        while (i < unit.kids.Count) {
-            Node d = unit.kids[i];
-            int k = d.kind;
-            bool isType = k == AK.ClassDecl() || k == AK.StructDecl()
-                || k == AK.EnumDecl() || k == AK.DelegateDecl();
-            bool dup = false;
-            if (isType) {
-                string full = d.nsName != null && d.nsName != "" ? d.nsName + "." + d.sval : d.sval;
-                int j = 0;
-                while (j < seen.Count) {
-                    if (seen[j] == full) { dup = true; break; }
-                    j = j + 1;
-                }
-            }
-            if (dup) {
-                unit.kids.RemoveAt(i);
-                continue;
-            }
-            if (isType) {
-                string full = d.nsName != null && d.nsName != "" ? d.nsName + "." + d.sval : d.sval;
-                seen.Add(full);
-            }
-            i = i + 1;
-        }
-    }
-
     static string FindClang() {
         string envClang = Environment.GetEnvironmentVariable("ZAN_CLANG");
         if (envClang != null && envClang.Length > 0 && File.Exists(envClang)) {
@@ -364,43 +339,48 @@ public partial class Program {
                 rtDir = exe + "/../build";
             }
         }
-        string clangBin = FindClang();
-        string clangStr = clangBin;
-        if (clangStr.IndexOf(" ") >= 0) {
-            clangStr = "\"" + clangStr + "\"";
-        }
-        string opt = optLevel != null && optLevel.Length > 0 ? optLevel : "-O2";
-        string cmd = clangStr + " " + opt + " -Wno-override-module \"" + llPath + "\" ";
+        List<string> args = new List<string>();
+        args.Add(optLevel != null && optLevel.Length > 0 ? optLevel : "-O2");
+        args.Add("-Wno-override-module");
+        args.Add(llPath);
         if (File.Exists(rtDir + "/zanrt_sh_rt_file.obj")) {
-            cmd = cmd + "\"" + rtDir + "/zanrt_sh_rt_file.obj\" "
-                      + "\"" + rtDir + "/zanrt_sh_rt_io.obj\" "
-                      + "\"" + rtDir + "/zanrt_sh_rt_timer.obj\" "
-                      + "\"" + rtDir + "/zanrt_sh_rt_decimal.obj\" "
-                      + "\"" + rtDir + "/zanrt_sh_rt_sync.obj\" "
-                      + "\"" + rtDir + "/zanrt_sh_zan_embed_api.obj\" "
-                      + "\"" + rtDir + "/zanrt_sh_rt_hw_accel.obj\" ";
+            args.Add(rtDir + "/zanrt_sh_rt_file.obj");
+            args.Add(rtDir + "/zanrt_sh_rt_io.obj");
+            args.Add(rtDir + "/zanrt_sh_rt_timer.obj");
+            args.Add(rtDir + "/zanrt_sh_rt_decimal.obj");
+            args.Add(rtDir + "/zanrt_sh_rt_sync.obj");
+            args.Add(rtDir + "/zanrt_sh_zan_embed_api.obj");
             if (File.Exists(rtDir + "/zanrt_sh_rt_crash.obj")) {
-                cmd = cmd + "\"" + rtDir + "/zanrt_sh_rt_crash.obj\" ";
+                args.Add(rtDir + "/zanrt_sh_rt_crash.obj");
             } else if (File.Exists(rtDir + "/zanrt_sh_rt_crash.o")) {
-                cmd = cmd + "\"" + rtDir + "/zanrt_sh_rt_crash.o\" ";
+                args.Add(rtDir + "/zanrt_sh_rt_crash.o");
             }
+            args.Add(rtDir + "/libzancrypto_sh.a");
         } else if (File.Exists(rtDir + "/zanrt_file.obj")) {
-            cmd = cmd + "\"" + rtDir + "/zanrt_file.obj\" "
-                      + "\"" + rtDir + "/zanrt_io.obj\" "
-                      + "\"" + rtDir + "/zanrt_timer.obj\" "
-                      + "\"" + rtDir + "/zanrt_sync.obj\" "
-                      + "\"" + rtDir + "/zanrt_decimal.obj\" ";
+            args.Add(rtDir + "/zanrt_file.obj");
+            args.Add(rtDir + "/zanrt_io.obj");
+            args.Add(rtDir + "/zanrt_timer.obj");
+            args.Add(rtDir + "/zanrt_sync.obj");
+            args.Add(rtDir + "/zanrt_decimal.obj");
             if (File.Exists(rtDir + "/zanrt_crash.obj")) {
-                cmd = cmd + "\"" + rtDir + "/zanrt_crash.obj\" ";
+                args.Add(rtDir + "/zanrt_crash.obj");
             } else if (File.Exists(rtDir + "/zanrt_crash.o")) {
-                cmd = cmd + "\"" + rtDir + "/zanrt_crash.o\" ";
+                args.Add(rtDir + "/zanrt_crash.o");
+            }
+            if (File.Exists(rtDir + "/libzancrypto.a")) {
+                args.Add(rtDir + "/libzancrypto.a");
             }
         }
-        cmd = cmd + "-lkernel32 -lshell32 -luser32 -ladvapi32 -lversion -lws2_32 -lbcrypt -o \"" + outPath + "\"";
-        if (clangStr.Length > 0 && (int)clangStr[0] == 34) {
-            cmd = "\"" + cmd + "\"";
-        }
-        int rc = Nio.system(cmd);
+        args.Add("-lkernel32");
+        args.Add("-lshell32");
+        args.Add("-luser32");
+        args.Add("-ladvapi32");
+        args.Add("-lversion");
+        args.Add("-lws2_32");
+        args.Add("-lbcrypt");
+        args.Add("-o");
+        args.Add(outPath);
+        int rc = Process.RunSafe(FindClang(), args);
         if (rc != 0) {
             throw "zanc: linking failed with exit code " + rc;
         }
@@ -592,10 +572,25 @@ public partial class Program {
             }
             bool isExe = outPath.Length >= 4 && outPath.Substring(outPath.Length - 4, 4) == ".exe";
             if (isExe && !emitLib) {
-                string llPath = outPath + ".tmp.ll";
-                File.WriteAllText(llPath, ir);
-                LinkExe(outPath, llPath, optLevel);
-                File.Delete(llPath);
+                string finalPath = Path.GetFullPath(outPath);
+                string suffix = Guid.New();
+                string workDir = Path.GetDirectoryName(finalPath) + "/.zanc-" + suffix;
+                if (suffix.Length == 0 || !Nio.CreateDirectoryExclusive(workDir)) {
+                    throw "zanc: cannot create a staging directory for " + outPath;
+                }
+                string llPath = workDir + "/module.ll";
+                string exePath = workDir + "/program.exe";
+                try {
+                    File.WriteAllText(llPath, ir);
+                    LinkExe(exePath, llPath, optLevel);
+                    if (Nio.ReplaceFile(exePath, finalPath) != 0) {
+                        throw "zanc: cannot publish executable " + outPath;
+                    }
+                } finally {
+                    File.Delete(llPath);
+                    File.Delete(exePath);
+                    Directory.Delete(workDir);
+                }
             } else {
                 File.WriteAllText(outPath, ir);
             }

@@ -163,16 +163,6 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         /* NativeMemory */
         if (is_call_to(e, "NativeMemory", "GetString") && e->call.args.count == 3)
             return 1;
-        if (is_call_to(e, "NativeMemory", "Sha256") && e->call.args.count == 2)
-            return 1;
-        if (is_call_to(e, "NativeMemory", "Sha1") && e->call.args.count == 2)
-            return 1;
-        if (is_call_to(e, "NativeMemory", "Sha512") && e->call.args.count == 2)
-            return 1;
-        if (is_call_to(e, "NativeMemory", "Sm3") && e->call.args.count == 2)
-            return 1;
-        if (is_call_to(e, "NativeMemory", "Base64Encode") && e->call.args.count == 2)
-            return 1;
         zan_symbol_t *cs = extern_check_callee_sym(g, e);
         if (sym_declares_extern(cs)) {
             zan_type_t *rt = method_ret_type_at(g, cs, e, NULL, locals);
@@ -767,10 +757,6 @@ void emit_lpad_cleanups(zan_irgen_t *g, zan_lpad_entry_t *entry) {
             release_boxed_local(g, cl);
         } else if (cl->struct_rc) {
             emit_struct_local_release(g, cl->type, cl->alloca);
-            LLVMTypeRef st = LLVMIsAAllocaInst(cl->alloca)
-                ? LLVMGetAllocatedType(cl->alloca) : LLVMTypeOf(cl->alloca);
-            if (st && LLVMGetTypeKind(st) == LLVMStructTypeKind)
-                LLVMBuildStore(g->builder, LLVMConstNull(st), cl->alloca);
         } else if (local_owns_arc(cl)) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, cl->alloca, "arc.rel");
             emit_rc_release_for_type(g, cl->type, cur);

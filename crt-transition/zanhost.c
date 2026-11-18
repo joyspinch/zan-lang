@@ -6,6 +6,7 @@
  * this compiler additionally reference the zan_ext / zan_dt / zan_dir helper
  * families (see ngen_host.zan) — those live in the full runtime objects, not
  * here. */
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -35,7 +36,7 @@ FILE *zan_pkg_fopen(const char *path, const char *mode) { return fopen(path, mod
 __attribute__((weak)) int zan_embed_has(const char *name) { (void)name; return 0; }
 __attribute__((weak)) const char *zan_embed_read(const char *name) { (void)name; return NULL; }
 __attribute__((weak)) void *zan_embed_bytes(const char *name, int *outLen) { (void)name; if (outLen) *outLen = 0; return NULL; }
-__attribute__((weak)) const char *zan_embed_list(const char *prefix) { (void)prefix; return ""; }
+__attribute__((weak)) int64_t zan_embed_list_alloc(const char *prefix) { (void)prefix; return 0; }
 
 /* ---- File.zan fopen/remove/rename (DllImport EntryPoint remaps) ---- */
 FILE *zan_file_fopen(const char *path, const char *mode) { return fopen(path, mode); }

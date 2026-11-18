@@ -1,0 +1,248 @@
+using System.Collections.Generic;
+namespace Zan;
+
+class InheritanceFrame {
+    public Node Decl;
+    public int NextBase;
+
+    public InheritanceFrame(Node decl) { Decl = decl; }
+}
+
+public partial class Checker {
+    // LSP checks a fresh tree per analysis. Binder and Checker both read these
+    // links directly, so remove rejected edges from every AST representation.
+    void ResolveLspInheritance(Node unit) {
+        const int visiting = 1;
+        const int done = 2;
+        Dictionary<string, int> state = new Dictionary<string, int>();
+        List<InheritanceFrame> stack = new List<InheritanceFrame>();
+        for (int i = 0; i < unit.kids.Count; i = i + 1) {
+            Node root = unit.kids[i];
+            if ((root.kind != AK.ClassDecl() && root.kind != AK.StructDecl())
+                || state.ContainsKey(root.sval) || binder.FindType(root.sval) != root) { continue; }
+            state[root.sval] = visiting;
+            stack.Add(new InheritanceFrame(root));
+            while (stack.Count > 0) {
+                int top = stack.Count - 1;
+                InheritanceFrame frame = stack[top];
+                Node decl = frame.Decl;
+                List<Node> extra = decl.interfaceRefs;
+                int slot = frame.NextBase;
+                if (slot > (extra == null ? 0 : extra.Count)) {
+                    CheckVirtualHiding(decl);
+                    state[decl.sval] = done;
+                    stack.RemoveAt(top);
+                    continue;
+                }
+                frame.NextBase = slot + 1;
+                Node reference = decl.type;
+                if (slot > 0 && extra != null) { reference = extra[slot - 1]; }
+                if (reference == null) { continue; }
+                Node parent = binder.FindType(reference.sval);
+                if (parent == null || (parent.kind != AK.ClassDecl() && parent.kind != AK.StructDecl())) { continue; }
+
+                int parentState = state.ContainsKey(parent.sval) ? state[parent.sval] : 0;
+                if (HasMod(parent, MOD.Sealed()) && !HasMod(parent, MOD.Iface())) {
+                    diags.Error("[E1014] cannot derive from sealed type '" + parent.sval + "'",
+                        reference.line, reference.col);
+                } else if (parentState == visiting) {
+                    diags.Error("[E1011] cyclic inheritance involving '" + parent.sval + "'", parent.line, parent.col);
+                } else {
+                    if (parentState == 0) {
+                        state[parent.sval] = visiting;
+                        stack.Add(new InheritanceFrame(parent));
+                    }
+                    continue;
+                }
+                if (slot == 0) {
+                    decl.type = null;
+                    decl.sval2 = "";
+                } else if (extra != null) {
+                    extra.RemoveAt(slot - 1);
+                    decl.interfaces.RemoveAt(slot - 1);
+                    frame.NextBase = slot;
+                }
+            }
+        }
+    }
+
+    void CheckVirtualHiding(Node decl) {
+        if (HasMod(decl, MOD.Iface()) || decl.sval2 == "") { return; }
+        for (int i = 0; i < decl.kids.Count; i = i + 1) {
+            Node method = decl.kids[i];
+            if (method.kind != AK.MethodDecl() || !HasMod(method, MOD.Virtual())
+                || HasMod(method, MOD.Override()) || !HasInheritedVirtual(decl, method)) { continue; }
+            Node location = method.type;
+            if (location == null || location.line == 0) { location = method; }
+            diags.Warning("[W2097] '" + method.sval + "' is declared 'virtual' but hides an inherited virtual "
+                + "with the same name and arity; calls through base-class references will run the base "
+                + "implementation -- use 'override' to replace it", location.line, location.col);
+        }
+    }
+
+    bool HasInheritedVirtual(Node decl, Node method) {
+        int arity = ParamCountOf(method);
+        int virtualFlags = MOD.Virtual() | MOD.Override() | MOD.Abstract();
+        Node parent = binder.FindType(decl.sval2);
+        while (parent != null && !HasMod(parent, MOD.Iface())) {
+            for (int i = 0; i < parent.kids.Count; i = i + 1) {
+                Node candidate = parent.kids[i];
+                if (candidate.kind == AK.MethodDecl() && (candidate.mods & virtualFlags) != 0
+                    && candidate.sval == method.sval && ParamCountOf(candidate) == arity) { return true; }
+            }
+            parent = binder.FindType(parent.sval2);
+        }
+        return false;
+    }
+
+    // These references have already been qualified in their declaring file.
+    List<Node> ContractBases(Node owner, Node decl) {
+        List<Node> bases = new List<Node>();
+        Node first = binder.BaseType(owner);
+        if (first != null) { bases.Add(first); }
+        if (decl.interfaceRefs != null) {
+            for (int i = 0; i < decl.interfaceRefs.Count; i = i + 1) {
+                bases.Add(binder.SubstOwner(decl.interfaceRefs[i], owner));
+            }
+        }
+        return bases;
+    }
+
+    void CheckInheritanceContracts(Node decl) {
+        if (HasMod(decl, MOD.Iface())) { return; }
+        Node owner = MkType(decl.sval);
+        List<Node> classChain = new List<Node>();
+        List<string> seen = new List<string>();
+        Node current = owner;
+        while (current != null && !seen.Contains(current.sval)) {
+            Node currentDecl = binder.FindType(current.sval);
+            if (currentDecl == null || HasMod(currentDecl, MOD.Iface())) { break; }
+            seen.Add(current.sval);
+            classChain.Add(current);
+            current = binder.BaseType(current);
+        }
+
+        List<Node> bases = ContractBases(owner, decl);
+        List<Node> interfaces = new List<Node>();
+        List<string> active = new List<string>();
+        for (int i = 0; i < bases.Count; i = i + 1) {
+            CollectContractInterfaces(bases[i], interfaces, active);
+        }
+        for (int i = 0; i < interfaces.Count; i = i + 1) {
+            CheckInterfaceContract(decl, classChain, interfaces[i], interfaces);
+        }
+        if (decl.kind != AK.ClassDecl() || HasMod(decl, MOD.Abstract())) { return; }
+        for (int i = 1; i < classChain.Count; i = i + 1) {
+            Node ancestor = binder.FindType(classChain[i].sval);
+            if (ancestor == null) { continue; }
+            for (int j = 0; j < ancestor.kids.Count; j = j + 1) {
+                Node method = ancestor.kids[j];
+                if (method.kind != AK.MethodDecl() || !HasMod(method, MOD.Abstract())) { continue; }
+                if (!HasContractMethod(classChain, method, null)) {
+                    diags.Error("[E2093] non-abstract class '" + decl.sval
+                        + "' does not implement abstract method '" + method.sval
+                        + "' inherited from '" + ancestor.sval + "'", decl.line, decl.col);
+                }
+            }
+        }
+    }
+
+    void CollectContractInterfaces(Node iface, List<Node> interfaces, List<string> active) {
+        Node ifaceDecl = binder.FindType(iface.sval);
+        if (ifaceDecl == null || !HasMod(ifaceDecl, MOD.Iface())
+            || active.Contains(iface.sval) || active.Count >= 64) { return; }
+        for (int i = 0; i < interfaces.Count; i = i + 1) {
+            if (binder.SameType(iface, interfaces[i])) { return; }
+        }
+        interfaces.Add(iface);
+        active.Add(iface.sval);
+        List<Node> bases = ContractBases(iface, ifaceDecl);
+        for (int i = 0; i < bases.Count; i = i + 1) {
+            CollectContractInterfaces(bases[i], interfaces, active);
+        }
+        active.RemoveAt(active.Count - 1);
+    }
+
+    void CheckInterfaceContract(Node decl, List<Node> classChain, Node iface, List<Node> interfaces) {
+        Node ifaceDecl = binder.FindType(iface.sval);
+        if (ifaceDecl == null) { return; }
+        for (int i = 0; i < ifaceDecl.kids.Count; i = i + 1) {
+            Node method = ifaceDecl.kids[i];
+            if (method.kind != AK.MethodDecl() || method.d != null || HasMod(method, MOD.Static())) { continue; }
+            if (!HasContractMethod(classChain, method, iface) && !HasContractMethod(interfaces, method, iface)) {
+                diags.Error("[E1015] type '" + decl.sval + "' does not implement interface method '"
+                    + method.sval + "'", decl.line, decl.col);
+            }
+        }
+    }
+
+    bool HasContractMethod(List<Node> classChain, Node required, Node iface) {
+        int arity = ParamCountOf(required);
+        for (int i = 0; i < classChain.Count; i = i + 1) {
+            Node owner = classChain[i];
+            Node decl = binder.FindType(owner.sval);
+            if (decl == null) { continue; }
+            for (int j = 0; j < decl.kids.Count; j = j + 1) {
+                Node candidate = decl.kids[j];
+                if (candidate.kind != AK.MethodDecl() || candidate.sval != required.sval
+                    || (HasMod(decl, MOD.Iface()) && candidate.d == null)
+                    || ParamCountOf(candidate) != arity) { continue; }
+                // The host checks abstract overrides by name and arity.
+                if (iface == null ? HasMod(candidate, MOD.Override())
+                    : MatchesInterfaceMethod(candidate, owner, required, iface)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    bool MatchesInterfaceMethod(Node method, Node owner, Node required, Node iface) {
+        if (HasMod(method, MOD.Static()) || HasMod(method, MOD.Async()) != HasMod(required, MOD.Async())
+            || method.ival != required.ival) { return false; }
+        int param = 0;
+        for (int i = 0; i < required.kids.Count; i = i + 1) {
+            Node expected = required.kids[i];
+            if (expected.kind != AK.Param()) { continue; }
+            while (method.kids[param].kind != AK.Param()) { param = param + 1; }
+            Node actual = method.kids[param];
+            param = param + 1;
+            if (actual.ival != expected.ival || actual.op != expected.op
+                || !ContractTypeMatches(binder.SubstOwner(actual.type, owner),
+                    binder.SubstOwner(expected.type, iface))) { return false; }
+        }
+        Node actualReturn = binder.SubstOwner(method.type, owner);
+        Node expectedReturn = binder.SubstOwner(required.type, iface);
+        if (HasMod(method, MOD.Async())) {
+            actualReturn = TaskElemTy(actualReturn);
+            expectedReturn = TaskElemTy(expectedReturn);
+        }
+        if (ContractTypeMatches(actualReturn, expectedReturn)) { return true; }
+        return ContractReturnDerives(actualReturn, expectedReturn, new List<string>());
+    }
+
+    bool ContractTypeMatches(Node actual, Node expected) {
+        if (actual == null || expected == null) { return actual == expected; }
+        if (binder.SameType(actual, expected)) { return true; }
+        // As in the host, an unsubstituted type parameter cannot disprove a match.
+        return (actual.kids.Count == 0 && actual.ival == 0 && binder.FindType(actual.sval) == null
+                && binder.IsTypeParam(actual.sval))
+            || (expected.kids.Count == 0 && expected.ival == 0 && binder.FindType(expected.sval) == null
+                && binder.IsTypeParam(expected.sval));
+    }
+
+    bool ContractReturnDerives(Node actual, Node expected, List<string> active) {
+        if (actual == null || expected == null || actual.op != 0 || expected.op != 0
+            || actual.ival != 0 || expected.ival != 0
+            || active.Contains(actual.sval) || active.Count >= 64) { return false; }
+        if (binder.SameType(actual, expected)) { return true; }
+        Node decl = binder.FindType(actual.sval);
+        if (decl == null) { return false; }
+        active.Add(actual.sval);
+        bool found = false;
+        List<Node> bases = ContractBases(actual, decl);
+        for (int i = 0; i < bases.Count && !found; i = i + 1) {
+            found = ContractReturnDerives(bases[i], expected, active);
+        }
+        active.RemoveAt(active.Count - 1);
+        return found;
+    }
+}

@@ -134,6 +134,8 @@ long long zan_exe_dir_into(char *out, long long cap);
 long long zan_dir_list_into(const char *pattern, char *out, long long cap);
 
 int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc);
+int32_t zan_proc_run_safe_timeout(const char *exe, const char **args,
+                                  int32_t argc, int32_t timeout_ms);
 int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t argc);
 int32_t zan_proc_start_program_safe(const char *exe, const char *log_path);
 int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,

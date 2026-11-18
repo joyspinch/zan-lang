@@ -360,15 +360,12 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
+    zan_purge_expired_locked(table->header, zan_time_epoch_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row_hash(
         table->header, (uint64_t)key_hash, 0);
     if (row) {
         zan_row_lock(row);
-        zan_expiry_remove(table->header, row);
-        memset(row + 8, 0, table->header->row_stride - 8);
-        zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
-        table->header->count--;
+        zan_delete_row_locked(table->header, row);
         zan_row_unlock(row);
     }
     zan_struct_unlock(table->header);

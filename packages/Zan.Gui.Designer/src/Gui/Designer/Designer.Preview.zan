@@ -14,12 +14,6 @@ partial class Designer {
     WindowShapeMask pvShapeMask;
     string pvShapeImage;
     bool pvShapeReady;
-    int pvShapeW;
-    int pvShapeH;
-    int pvShapeDpi;
-    int pvShapeMode;
-    int pvShapeOpacity;
-    int pvShapeRadius;
 
     void BindDesignPreviewEvents(Control root, DesignPreviewEvents events) {
         for (int i = 0; i < root.events.Count; i = i + 1) {
@@ -38,38 +32,7 @@ partial class Designer {
         App target = pvDocForm.GetApp();
         if (target.canvas == null) { return; }
         pvDocForm.CaptureSnapshot();
-        bool shapeNeeded = target.shapeMode != 0 || target.WindowOpacity() < 100;
-        if (!shapeNeeded) {
-            pvShapeReady = false;
-        } else {
-            int curW = target.canvas.Width();
-            int curH = target.canvas.Height();
-            int curDpi = target.dpiScale;
-            int curMode = target.shapeMode;
-            int curOp = target.WindowOpacity();
-            int curRadius = this.winShapeRadius;
-            bool shapeParamsMatch = pvShapeReady && curW == pvShapeW && curH == pvShapeH
-                && curDpi == pvShapeDpi && curMode == pvShapeMode && curOp == pvShapeOpacity
-                && curRadius == pvShapeRadius;
-
-            // 拖动或尺寸调整进行中跳过耗时软件 SDF 掩码计算，采用硬件加速表面直绘制避免卡死
-            if (this.freeResizing || this.freeDragging || this.dragging || this.freePanning) {
-                // 拖动中沿用已有快照或直通绘制，不进行全分辨率像素循环
-            } else if (!shapeParamsMatch) {
-                if (pvShapeMask == null) { pvShapeMask = new WindowShapeMask(); }
-                if (pvShapeImage == null || pvShapeImage == "") {
-                    pvShapeImage = "mem:designer-shape-" + Convert.ToString(pvDocForm.CommonId());
-                }
-                pvShapeReady = target.canvas.SnapshotWindowShape(pvShapeImage,
-                    pvShapeMask, target.shapeRegions, target.dpiScale, target.WindowOpacity());
-                pvShapeW = curW;
-                pvShapeH = curH;
-                pvShapeDpi = curDpi;
-                pvShapeMode = curMode;
-                pvShapeOpacity = curOp;
-                pvShapeRadius = curRadius;
-            }
-        }
+        pvShapeReady = false;
         this.UpdateDesignPreviewLayout();
     }
 
@@ -208,6 +171,7 @@ partial class Designer {
 
         if (pvDocRoot != null && !pvDocDirty) {
             if (preview) {
+                if (target.HasDueOffscreenFrame()) { this.RenderDesignPreview(); }
                 target.ForwardOffscreenFrameRequests(host);
             }
             return true;
@@ -340,11 +304,20 @@ partial class Designer {
     void PaintDesignPreview(Canvas canvas, int x, int y, int width, int height) {
         if (pvDocForm == null) { return; }
         // viewport 变化会替换并销毁旧表面，每次绘制取离屏 App 当前持有的画布。
-        Canvas source = pvDocForm.GetApp().canvas;
+        App target = pvDocForm.GetApp();
+        Canvas source = target.canvas;
         if (source == null) { return; }
-        if (pvDocForm.GetApp().shapeMode != 0 || pvDocForm.GetApp().WindowOpacity() < 100) {
-            if (pvShapeReady && pvShapeW == source.Width() && pvShapeH == source.Height()
-                    && !this.freeResizing && !this.freeDragging && !this.dragging && !this.freePanning) {
+        bool moving = freeResizing || freeDragging || dragging || freePanning;
+        if (!moving && (target.shapeMode != 0 || target.WindowOpacity() < 100)) {
+            if (!pvShapeReady) {
+                if (pvShapeMask == null) { pvShapeMask = new WindowShapeMask(); }
+                if (pvShapeImage == null || pvShapeImage == "") {
+                    pvShapeImage = "mem:designer-shape-" + Convert.ToString(pvDocForm.CommonId());
+                }
+                pvShapeReady = source.SnapshotWindowShape(pvShapeImage, pvShapeMask,
+                    target.shapeRegions, target.dpiScale, target.WindowOpacity());
+            }
+            if (pvShapeReady) {
                 canvas.BlitImage(pvShapeImage, x, y, width, height,
                     0, 0, source.Width(), source.Height());
                 return;

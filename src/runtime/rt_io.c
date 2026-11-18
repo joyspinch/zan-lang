@@ -32,7 +32,7 @@ static ZAN_MAYBE_UNUSED int zan_sched_trace(void){static volatile int t=-1;int c
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <pthread.h>
-#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <time.h>
@@ -65,12 +65,10 @@ static ZAN_MAYBE_UNUSED void zan_io_fd_cloexec(int fd) {
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <poll.h>
-#include <fcntl.h>
 #include <unistd.h>
 #elif defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/event.h>
 #include <poll.h>
-#include <fcntl.h>
 #include <unistd.h>
 #elif defined(_WIN32)
 #include <winsock2.h>
@@ -81,7 +79,6 @@ static ZAN_MAYBE_UNUSED void zan_io_fd_cloexec(int fd) {
 #include <malloc.h>           /* _aligned_malloc / _aligned_free (op pool) */
 #else
 #include <sys/select.h>
-#include <fcntl.h>
 #include <unistd.h>
 #endif
 #include "../common/host_oom.h"

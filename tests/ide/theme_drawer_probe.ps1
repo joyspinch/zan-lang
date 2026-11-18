@@ -40,6 +40,8 @@ public static class IdeThemeProbeNative {
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(
         IntPtr hwnd, System.Text.StringBuilder title, int capacity);
     public static string Title(IntPtr hwnd) {
@@ -48,6 +50,7 @@ public static class IdeThemeProbeNative {
     }
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc callback, IntPtr state);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
@@ -75,7 +78,8 @@ $small = @{ w = [int][Math]::Floor(900 * $dpi / 96); h = [int][Math]::Floor(820 
 $narrow = @{ w = [int][Math]::Floor(600 * $dpi / 96); h = $small.h }
 $projectSize = @{ w = [int][Math]::Floor(560 * $dpi / 96); h = $small.h }
 $projectChildStages = @('project-settings', 'project-short-top', 'project-short-bottom')
-$stages = @('before', 'appearance', 'effects', 'closed', 'skin-zero', 'skin-one',
+$stages = @('before', 'appearance', 'effects', 'effects-mesh', 'effects-mesh-next', 'effects-reset',
+    'closed', 'skin-zero', 'skin-one',
     'closed-again', 'navy', 'porcelain-return', 'graphite-return', 'small', 'small-news', 'small-home',
     'small-overflow', 'small-overflow-closed', 'narrow', 'narrow-overflow', 'narrow-closed',
     'small-closed', 'restored', 'start-command', 'command-closed')
@@ -116,18 +120,22 @@ New-Item -ItemType Directory -Force -Path $cache | Out-Null
 $script = Join-Path $work 'script.txt'
 $commands = [Collections.Generic.List[string]]::new()
 function Add-Commands([string[]]$lines) { foreach ($line in $lines) { $commands.Add($line) } }
-function Add-Snapshot([string]$name, $size = $standard) {
+function Add-Snapshot([string]$name, $size = $standard, [switch]$KeepFrame) {
     # Explicit full-client coordinates include the actual caption. The default
     # dump starts below titlebarH and cannot prove a whole-window contract.
-    Add-Commands @('redraw full', "dump tree $name.json", "dump theme $name.theme.json",
+    if (!$KeepFrame) { Add-Commands @('redraw full') }
+    Add-Commands @("dump tree $name.json", "dump theme $name.theme.json",
         "dump pixels $name.bin 0 0 $($size.w) $($size.h)", "dump probe probe.stage $name.ready", 'wait 2000')
 }
 Add-Commands @("client-dev $($standard.w) $($standard.h)", 'wait 5000')
 # The host clicks the corresponding retained control through its native HWND
-# after the before/appearance/effects/closed markers.
+# after the matching snapshot markers.
 Add-Snapshot 'before'
 Add-Snapshot 'appearance'
 Add-Snapshot 'effects'
+Add-Snapshot 'effects-mesh' -KeepFrame
+Add-Snapshot 'effects-mesh-next' -KeepFrame
+Add-Snapshot 'effects-reset'
 Add-Snapshot 'closed'
 Add-Commands @('clickid @theme-tab-0', 'wait 250',
     'clickid @theme-skin-0', 'wait 500')
@@ -138,7 +146,7 @@ Add-Commands @('clickid @theme-drawer-close', 'wait 500')
 Add-Snapshot 'closed-again'
 foreach ($change in @(@{ name = 'navy'; index = 2 }, @{ name = 'porcelain-return'; index = 0 },
         @{ name = 'graphite-return'; index = 1 })) {
-    Add-Commands @("clickid @theme-skin-$($change.index)",
+    Add-Commands @('clickid @window-theme', 'wait 250', "clickid @theme-skin-$($change.index)",
         'wait 500', 'clickid @theme-drawer-close', 'wait 500')
     Add-Snapshot $change.name
 }
@@ -439,10 +447,6 @@ try {
             }
             continue
         }
-        foreach ($extension in @('.json', '.theme.json', '.bin', '.ready')) {
-            $file = Get-Item -LiteralPath (Join-Path $out ($stage + $extension))
-            if ($file.LastWriteTimeUtc -lt $started) { throw "Stale stage evidence: $stage$extension" }
-        }
         if ($window -eq [IntPtr]::Zero) {
             $windows = @([IdeThemeProbeNative]::Windows([uint32]$process.Id) | Where-Object {
                 [IdeThemeProbeNative]::GetWindow($_, 4) -eq [IntPtr]::Zero
@@ -451,20 +455,40 @@ try {
             $window = $windows[0]
             Write-ProcessRecord $window
         }
+        if ($stage -eq 'before') {
+            # The probe posts messages to its own HWND. Keep its client beyond
+            # the desktop pointer while it is exercising a modal drawer.
+            $outsideDesktop = [IdeThemeProbeNative]::GetSystemMetrics(76) + [IdeThemeProbeNative]::GetSystemMetrics(78) + 128
+            if (![IdeThemeProbeNative]::SetWindowPos($window, [IntPtr]::Zero, $outsideDesktop, 0, 0, 0, 0x15)) {
+                throw 'Could not isolate the owned IDE window from the desktop pointer'
+            }
+        }
         $client = Read-NativeClient $window
         $nativeDpi = [int][IdeThemeProbeNative]::GetDpiForWindow($window)
         if ($nativeDpi -ne $dpi) { throw "Native DPI changed: $nativeDpi/$dpi" }
         $size = if ($ProjectOverflowOnly) { $projectSize }
             elseif ($stage -like 'narrow*') { $narrow }
             elseif ($stage -like 'small*') { $small } else { $standard }
-        if ($client.w -ne $size.w -or $client.h -ne $size.h) {
-            throw "Unexpected native client size at ${stage}: $($client.w)x$($client.h), expected $($size.w)x$($size.h) (HWND=$window, DPI=$nativeDpi)"
+        $minimized = [IdeThemeProbeNative]::IsIconic($window)
+        $foreground = [IdeThemeProbeNative]::GetForegroundWindow() -eq $window
+        $outer = [IdeThemeProbeNative+Rect]::new()
+        if (![IdeThemeProbeNative]::GetWindowRect($window, [ref]$outer)) { throw 'GetWindowRect failed' }
+        if ($minimized -or $client.w -ne $size.w -or $client.h -ne $size.h) {
+            throw "Unexpected native client at ${stage}: $($client.w)x$($client.h), expected $($size.w)x$($size.h) (HWND=$window, DPI=$nativeDpi, minimized=$minimized, foreground=$foreground)"
+        }
+        if (!$ProjectOverflowOnly -and $outer.L -lt $outsideDesktop) {
+            throw "Probe window returned to the desktop at $stage (left=$($outer.L), expected at least $outsideDesktop)"
+        }
+        foreach ($extension in @('.json', '.theme.json', '.bin', '.ready')) {
+            $file = Get-Item -LiteralPath (Join-Path $out ($stage + $extension))
+            if ($file.LastWriteTimeUtc -lt $started) { throw "Stale stage evidence: $stage$extension" }
         }
         [pscustomobject]@{ pid = $process.Id; hwnd = $window.ToInt64(); exe = $exe;
             processStartUtc = $processStarted.ToString('o'); processStartTicks = $processStarted.Ticks;
             exeMtimeUtc = $exeInfo.LastWriteTimeUtc.ToString('o'); exeMtimeTicks = $exeInfo.LastWriteTimeUtc.Ticks;
             scriptMtimeUtc = $scriptInfo.LastWriteTimeUtc.ToString('o'); scriptMtimeTicks = $scriptInfo.LastWriteTimeUtc.Ticks;
             stage = $stage; w = $client.w; h = $client.h; dpi = $nativeDpi;
+            minimized = $minimized; foreground = $foreground; left = $outer.L; top = $outer.T;
             capturedUtc = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json |
             Set-Content -LiteralPath (Join-Path $out ($stage + '.native.json')) -Encoding utf8
         $nativeTarget = switch ($stage) {
@@ -474,11 +498,10 @@ try {
             'project-overflow-again' { 'ribbon-overflow-command-15' }
             'before' { 'window-theme' }
             'appearance' { 'theme-tab-1' }
-            'effects' { 'theme-drawer-close' }
+            'effects' { 'theme-effect-8' }
+            'effects-mesh-next' { 'theme-effect--1' }
+            'effects-reset' { 'theme-drawer-close' }
             'closed' { 'window-theme' }
-            'closed-again' { 'window-theme' }
-            'navy' { 'window-theme' }
-            'porcelain-return' { 'window-theme' }
         }
         if ($nativeTarget -or $stage -in @('graphite-return', 'small-overflow-closed', 'narrow-closed', 'small-closed', 'small', 'small-news',
                 'start-command', 'project-extensions') -and
@@ -908,7 +931,7 @@ try {
             throw "Real IDE shadow band/content alpha invalid: $($dump.name) ($outerAlpha/$innerAlpha)"
         }
     }
-    function Require-DrawerWindowEdges($closed, $opened) {
+    function Require-DrawerWindowEdges($closed, $opened, [switch]$AllowCaptionEffect) {
         if ($closed.w -ne $opened.w -or $closed.h -ne $opened.h) {
             throw 'Drawer open changed the window dimensions'
         }
@@ -926,6 +949,7 @@ try {
                     $point[0], $point[1], $before, $after)
             }
         }
+        if ($AllowCaptionEffect) { return }
         $chromeX = $closed.x + [int][Math]::Floor($closed.w / 3)
         $native = Read-Tree ($closed.name + '.native')
         $chromeY = $closed.y + [int]($native.dpi / 8) + 4
@@ -1089,7 +1113,40 @@ try {
         foreach ($name in @('theme-drawer-close', 'theme-tab-0', 'theme-tab-1', 'theme-animations')) {
             Require-Target $effects $name
         }
-        Require-Surface $effects (Read-Pixels 'effects') (Read-Theme 'effects')
+        $effectTargets = @(Get-Targets $effects | Where-Object { $_.name -match '^theme-effect-(-1|[1-8])$' -and $_.pointerHit -eq 1 })
+        if ($effectTargets.Count -ne 9) { throw 'Expected nine reachable backdrop choices' }
+        $effectRows = @($effectTargets | Group-Object y | Sort-Object { [int]$_.Name })
+        if ($effectRows.Count -ne 3 -or @($effectRows | Where-Object Count -ne 3).Count -ne 0) {
+            throw 'Backdrop choices must form three rows of three buttons'
+        }
+        $effectColumns = @($effectTargets | Group-Object x)
+        if ($effectColumns.Count -ne 3 -or @($effectColumns | Where-Object Count -ne 3).Count -ne 0) {
+            throw 'Backdrop choice columns do not align'
+        }
+        $still = Read-Pixels 'effects'
+        Require-Surface $effects $still (Read-Theme 'effects')
+        $mesh = Read-Pixels 'effects-mesh'
+        $meshNext = Read-Pixels 'effects-mesh-next'
+        $reset = Read-Pixels 'effects-reset'
+        foreach ($frame in @($mesh, $meshNext, $reset)) {
+            Require-DrawerWindowEdges $still $frame -AllowCaptionEffect
+        }
+        # Compare a window-content scanline away from the pointer and drawer.
+        $sampleY = [int][Math]::Floor($still.h / 2)
+        $from = [int][Math]::Floor($still.w / 5)
+        $to = [int][Math]::Floor($still.w / 2)
+        $changed = 0
+        $advanced = 0
+        for ($x = $from; $x -lt $to; $x++) {
+            $basePixel = Get-Pixel $still $x $sampleY
+            $meshPixel = Get-Pixel $mesh $x $sampleY
+            if ($meshPixel -ne $basePixel) { $changed++ }
+            if ((Get-Pixel $meshNext $x $sampleY) -ne $meshPixel) { $advanced++ }
+            if ((Get-Pixel $reset $x $sampleY) -ne $basePixel) {
+                throw "Following the static skin left a stale mesh pixel at x=$x"
+            }
+        }
+        if ($changed -lt 3 -or $advanced -lt 3) { throw 'Mesh did not render and advance on the rounded window' }
         Require-Skin (Read-Theme 'porcelain-return') 0
         foreach ($stage in @('closed-again', 'graphite-return', 'small', 'small-news', 'small-home',
                 'small-overflow', 'small-overflow-closed', 'narrow', 'narrow-overflow', 'narrow-closed',

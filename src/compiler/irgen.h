@@ -399,8 +399,9 @@ struct zan_irgen {
     LLVMValueRef rt_arr_retain;  /* zan_rt_arr_retain(void*) */
     LLVMValueRef rt_arr_release; /* zan_rt_arr_release(void*) */
     /* B-ID89 活对象注册表挂钩 */
-    LLVMValueRef rt_live_register;   /* zan_rt_live_register(void*, int64_t) */
-    LLVMValueRef rt_live_unregister; /* zan_rt_live_unregister(void*) */
+    LLVMValueRef rt_live_register;
+    LLVMValueRef rt_live_register_array;
+    LLVMValueRef rt_live_unregister;
     LLVMTypeRef weak_node_type;  /* { next, target, slot } */
     LLVMValueRef weak_buckets;
     LLVMValueRef weak_lock;      /* zan_weak_lock */
@@ -793,6 +794,8 @@ struct zan_irgen {
 
 void zan_irgen_shard_buf_append(zan_irgen_t *g, LLVMValueRef fn, const char *txt);
 void zan_irgen_shard_buf_free(zan_irgen_t *g);
+bool zan_irgen_shard_harvest_fn(zan_irgen_t *g, LLVMValueRef fn);
+void zan_irgen_shard_harvest_stats(void);
 /* 插值与 ToString("F2") 共用的 spec→printf 映射（irgen_expr.c 定义） */
 int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
                             bool is_ulong, bool *want_float,
@@ -908,6 +911,9 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 int zan_irgen_drop_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
 int zan_irgen_prune_extern_libs(zan_irgen_t *g);
+
+/* Match a bundled iOS driver's logical DllImport name. */
+bool zan_irgen_imports_ios_driver(const zan_irgen_t *g, const char *driver);
 
 /* 检查模块中是否存在以指定前缀开头的方法实现 */
 bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix);

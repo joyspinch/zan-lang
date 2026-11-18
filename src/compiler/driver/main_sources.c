@@ -554,6 +554,16 @@ static void scan_namespace_tokens(const char *source, size_t len) {
     zan_arena_free(arena);
 }
 
+static bool locked_project_package_dir(const char *parent, const char *name) {
+#ifdef _WIN32
+    if (_stricmp(name, "packages") != 0 && _stricmp(name, ".zan-packages") != 0)
+        return false;
+#else
+    if (strcmp(name, "packages") != 0) return false;
+#endif
+    return zan_pkg_project_has_lock(parent);
+}
+
 static int skip_project_dir(const char *name) {
     static const char *skip[] = {
         ".zan-packages", ".git", ".svn", ".hg", "build", "publish",
@@ -606,7 +616,8 @@ void zan_collect_dir_sources(const char *dir, const char ***files,
         snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-            if (fd.cFileName[0] == '.' || skip_project_dir(fd.cFileName)) continue;
+            if (fd.cFileName[0] == '.' || skip_project_dir(fd.cFileName) ||
+                locked_project_package_dir(dir, fd.cFileName)) continue;
             zan_collect_dir_sources(path, files, count, cap);
         } else {
             size_t nlen = strlen(fd.cFileName);
@@ -627,7 +638,8 @@ void zan_collect_dir_sources(const char *dir, const char ***files,
         if (lstat(path, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
             if (S_ISLNK(st.st_mode)) continue;
-            if (e->d_name[0] == '.' || skip_project_dir(e->d_name)) continue;
+            if (e->d_name[0] == '.' || skip_project_dir(e->d_name) ||
+                locked_project_package_dir(dir, e->d_name)) continue;
             zan_collect_dir_sources(path, files, count, cap);
         } else if (S_ISREG(st.st_mode)) {
             size_t nlen = strlen(e->d_name);
@@ -652,7 +664,8 @@ static void scan_project_namespaces(const char *root) {
         snprintf(path, sizeof(path), "%s\\%s", root, fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-            if (!skip_project_dir(fd.cFileName)) scan_project_namespaces(path);
+            if (!skip_project_dir(fd.cFileName) &&
+                !locked_project_package_dir(root, fd.cFileName)) scan_project_namespaces(path);
         } else {
             size_t nlen = strlen(fd.cFileName);
             if (nlen < 5 || strcmp(fd.cFileName + nlen - 4, ".zan") != 0) continue;
@@ -673,7 +686,8 @@ static void scan_project_namespaces(const char *root) {
         struct stat st;
         if (lstat(path, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            if (!S_ISLNK(st.st_mode) && !skip_project_dir(e->d_name))
+            if (!S_ISLNK(st.st_mode) && !skip_project_dir(e->d_name) &&
+                !locked_project_package_dir(root, e->d_name))
                 scan_project_namespaces(path);
         } else if (S_ISREG(st.st_mode)) {
             size_t nlen = strlen(e->d_name);
@@ -687,15 +701,66 @@ static void scan_project_namespaces(const char *root) {
 #endif
 }
 
-static bool project_root_has_manifest(void) {
-    char manifest[1200];
-    snprintf(manifest, sizeof(manifest), "%s/zan.proj", package_project_root);
+static bool zan_file_exists(const char *path);
+
+static bool package_project_has_manifest(const char *root) {
+    char manifest[4200];
+    snprintf(manifest, sizeof(manifest), "%s/zan.proj", root);
     FILE *f = fopen(manifest, "rb");
     if (f) { fclose(f); return true; }
     return false;
 }
 
+static bool project_root_has_manifest(void) {
+    /* The first call follows package root selection for both inferred and explicit roots. */
+    static bool package_project_prepared;
+    if (!package_project_prepared) {
+        if (!zan_pkg_prepare_project(package_project_root)) exit(1);
+        package_project_prepared = true;
+    }
+    return package_project_has_manifest(package_project_root);
+}
+
+static bool package_parent_dir(char *path) {
+    char *sep = strrchr(path, '/');
+#ifdef _WIN32
+    char *back = strrchr(path, '\\');
+    if (!sep || (back && back > sep)) sep = back;
+#endif
+    if (!sep || !sep[1]) return false;
+    if (sep == path || (sep == path + 2 && path[1] == ':')) sep++;
+    *sep = '\0';
+    return true;
+}
+
+static bool resolve_locked_project_root(const char *input) {
+    char root[4096];
+#ifdef _WIN32
+    if (!zan_utf8_full_path(input, root, sizeof(root))) return false;
+#else
+    if (!realpath(input, root)) return false;
+#endif
+    while (package_parent_dir(root)) {
+        if (zan_pkg_project_has_lock(root)) {
+            if (strlen(root) >= sizeof(package_project_root)) {
+                fprintf(stderr, "error: locked package project path is too long: '%s'\n", root);
+                exit(1);
+            }
+            snprintf(package_project_root, sizeof(package_project_root), "%s", root);
+            return true;
+        }
+        if (package_project_has_manifest(root)) break;
+        char manifest[4200];
+        snprintf(manifest, sizeof(manifest), "%s/zan.json", root);
+        if (zan_file_exists(manifest)) break;
+        snprintf(manifest, sizeof(manifest), "%s/zan.pkg", root);
+        if (zan_file_exists(manifest)) break;
+    }
+    return false;
+}
+
 static void resolve_package_project_root(const char *input) {
+    if (resolve_locked_project_root(input)) return;
     snprintf(package_project_root, sizeof(package_project_root), "%s", input);
     char *sep = strrchr(package_project_root, '/');
     char *back = strrchr(package_project_root, '\\');
@@ -703,10 +768,7 @@ static void resolve_package_project_root(const char *input) {
     if (sep) *sep = 0;
     else snprintf(package_project_root, sizeof(package_project_root), ".");
     for (;;) {
-        char manifest[1200];
-        snprintf(manifest, sizeof(manifest), "%s/zan.proj", package_project_root);
-        FILE *f = fopen(manifest, "rb");
-        if (f) { fclose(f); return; }
+        if (package_project_has_manifest(package_project_root)) return;
 
         char pkg_dir[1200];
         snprintf(pkg_dir, sizeof(pkg_dir), "%s/packages", package_project_root);
@@ -729,8 +791,6 @@ static void resolve_package_project_root(const char *input) {
     }
     snprintf(package_project_root, sizeof(package_project_root), ".");
 }
-
-static bool zan_file_exists(const char *path);
 
 /* Package lookup may climb to a SDK checkout. Only a user manifest or the
  * primary input's directory owns default application resources. */

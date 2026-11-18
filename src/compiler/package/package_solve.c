@@ -334,13 +334,13 @@ static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char
     }
     if (!reg->resolved) {
         reg->resolved = (zan_package_t **)calloc(256, sizeof(zan_package_t *));
+        if (!reg->resolved) zan_host_oom();
         reg->resolved_count = 0;
     }
     for (int i = 0; i < reg->resolved_count; i++) {
         if (reg->resolved[i] && strcmp(reg->resolved[i]->name, name) == 0) {
-            if (source && source[0]) strncpy(reg->resolved[i]->source, source, sizeof(reg->resolved[i]->source) - 1);
-            if (checksum && checksum[0]) strncpy(reg->resolved[i]->checksum, checksum, sizeof(reg->resolved[i]->checksum) - 1);
-            return zan_version_compare(&reg->resolved[i]->version, &v) == 0;
+            fprintf(stderr, "error: duplicate package '%s' in lock file\n", name);
+            return false;
         }
     }
     if (reg->resolved_count >= 256) {
@@ -348,6 +348,7 @@ static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char
         return false;
     }
     zan_package_t *pkg = (zan_package_t *)calloc(1, sizeof(zan_package_t));
+    if (!pkg) zan_host_oom();
     strncpy(pkg->name, name, sizeof(pkg->name) - 1);
     pkg->version = v;
     pkg->has_version = true;
@@ -359,7 +360,11 @@ static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char
 
 bool zan_pkg_read_lock(zan_pkg_registry_t *reg) {
     if (!reg || !reg->lock_file) return false;
+#ifdef _WIN32
+    FILE *f = zan_utf8_fopen(reg->lock_file, "r");
+#else
     FILE *f = fopen(reg->lock_file, "r");
+#endif
     if (!f) return false;
 
     char line[1024];
@@ -375,43 +380,60 @@ bool zan_pkg_read_lock(zan_pkg_registry_t *reg) {
         skip_ws(&p);
         if (*p == '#' || *p == '\n' || *p == '\r' || *p == 0) continue;
         if (*p == '[') {
-            if (strncmp(p, "[[package]]", 11) == 0) {
-                if (in_pkg) {
-                    if (!cur_name[0] || !cur_ver[0] || !add_locked_pkg(reg, cur_name, cur_ver, cur_source, cur_checksum)) {
-                        ok = false;
-                        break;
-                    }
-                }
-                in_pkg = true;
-                cur_name[0] = 0;
-                cur_ver[0] = 0;
-                cur_source[0] = 0;
-                cur_checksum[0] = 0;
+            if (strncmp(p, "[[package]]", 11) != 0) { ok = false; break; }
+            p += 11;
+            skip_ws(&p);
+            if (*p && *p != '#') { ok = false; break; }
+            if (in_pkg && !add_locked_pkg(reg, cur_name, cur_ver, cur_source, cur_checksum)) {
+                ok = false;
+                break;
             }
+            in_pkg = true;
+            cur_name[0] = 0;
+            cur_ver[0] = 0;
+            cur_source[0] = 0;
+            cur_checksum[0] = 0;
             continue;
         }
-        if (!in_pkg) continue;
+        if (!in_pkg) { ok = false; break; }
         char key[128] = {0};
         int ki = 0;
         while (*p && *p != '=' && !isspace((unsigned char)*p) && ki < 127) { key[ki++] = *p; p++; }
         key[ki] = 0;
         skip_ws(&p);
-        if (*p == '=') p++;
+        if (!ki || *p != '=') { ok = false; break; }
+        p++;
         skip_ws(&p);
-        char val[512] = {0};
-        if (*p == '"') { read_qstr(&p, val, sizeof(val)); }
-        else { int vi = 0; while (*p && *p != '\n' && *p != '\r' && vi < 511) { val[vi++] = *p; p++; } val[vi] = 0; }
-
+        char *field;
+        size_t cap;
         if (strcmp(key, "name") == 0) {
-            strncpy(cur_name, val, sizeof(cur_name) - 1);
+            field = cur_name; cap = sizeof(cur_name);
         } else if (strcmp(key, "version") == 0) {
-            strncpy(cur_ver, val, sizeof(cur_ver) - 1);
+            field = cur_ver; cap = sizeof(cur_ver);
         } else if (strcmp(key, "source") == 0) {
-            strncpy(cur_source, val, sizeof(cur_source) - 1);
+            field = cur_source; cap = sizeof(cur_source);
         } else if (strcmp(key, "checksum") == 0) {
-            strncpy(cur_checksum, val, sizeof(cur_checksum) - 1);
+            field = cur_checksum; cap = sizeof(cur_checksum);
+        } else {
+            continue;
         }
+        const char *end;
+        if (*p == '"') {
+            end = strchr(++p, '"');
+            if (!end) { ok = false; break; }
+            const char *tail = end + 1;
+            skip_ws(&tail);
+            if (*tail && *tail != '#') { ok = false; break; }
+        } else {
+            end = p + strcspn(p, "\r\n");
+            while (end > p && isspace((unsigned char)end[-1])) end--;
+        }
+        size_t len = (size_t)(end - p);
+        if (len >= cap) { ok = false; break; }
+        memcpy(field, p, len);
+        field[len] = 0;
     }
+    if (ferror(f)) ok = false;
     if (ok && in_pkg) {
         if (!cur_name[0] || !cur_ver[0] || !add_locked_pkg(reg, cur_name, cur_ver, cur_source, cur_checksum)) {
             ok = false;
@@ -419,5 +441,186 @@ bool zan_pkg_read_lock(zan_pkg_registry_t *reg) {
     }
     fclose(f);
     return ok;
+}
+
+static char *locked_project_dir;
+static zan_pkg_registry_t locked_project;
+
+static const zan_pkg_registry_t *pkg_project_lock(const char *project_dir) {
+    return locked_project_dir && strcmp(locked_project_dir, project_dir) == 0
+        ? &locked_project : NULL;
+}
+
+static void pkg_clear_project_lock(void) {
+    free(locked_project_dir);
+    locked_project_dir = NULL;
+    zan_pkg_registry_destroy(&locked_project);
+}
+
+static bool pkg_path_present(const char *path) {
+#ifdef _WIN32
+    wchar_t *wide = zan_utf8_to_wide_alloc(path);
+    if (!wide) return true;
+    DWORD attr = GetFileAttributesW(wide);
+    DWORD error = GetLastError();
+    free(wide);
+    if (attr != INVALID_FILE_ATTRIBUTES) return true;
+    return error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND;
+#else
+    struct stat st;
+    return lstat(path, &st) == 0 || (errno != ENOENT && errno != ENOTDIR);
+#endif
+}
+
+bool zan_pkg_project_has_lock(const char *project_dir) {
+    if (!project_dir || !project_dir[0]) return false;
+    char path[4200];
+    int n = snprintf(path, sizeof(path), "%s" PATH_SEP "zan.lock", project_dir);
+    return n >= 0 && (size_t)n < sizeof(path) && pkg_path_present(path);
+}
+
+static bool pkg_plain_dir(const char *dir) {
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(dir);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) &&
+           !(attr & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+    struct stat st;
+    return lstat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static bool pkg_locked_dir(const zan_pkg_registry_t *reg, const zan_package_t *pkg,
+                           char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s" PATH_SEP "%s", reg->cache_dir, pkg->name);
+    return n >= 0 && (size_t)n < cap;
+}
+
+static void pkg_package_source_dir(const char *root, char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s" PATH_SEP "src", root);
+    if (n >= 0 && (size_t)n < cap && pkg_is_dir(out)) return;
+    n = snprintf(out, cap, "%s" PATH_SEP "stdlib", root);
+    if (n >= 0 && (size_t)n < cap && pkg_is_dir(out)) return;
+    snprintf(out, cap, "%s", root);
+}
+
+static bool pkg_locked_dependencies_match(const zan_pkg_registry_t *reg,
+                                          const zan_package_t *pkg) {
+    for (int i = 0; i < pkg->dep_count; i++) {
+        const zan_dependency_t *dep = &pkg->deps[i];
+        const zan_package_t *locked = NULL;
+        for (int j = 0; j < reg->resolved_count; j++) {
+            if (strcmp(reg->resolved[j]->name, dep->name) == 0) {
+                locked = reg->resolved[j];
+                break;
+            }
+        }
+        if (!locked || !zan_pkg_version_satisfies(dep, &locked->version)) {
+            fprintf(stderr, "error: dependency '%s' of '%s' missing or incompatible in '%s'\n",
+                    dep->name, pkg->name, reg->lock_file);
+            return false;
+        }
+        if (dep->source[0] && strcmp(dep->source, locked->source) != 0) {
+            fprintf(stderr, "error: source mismatch for dependency '%s' of '%s' in '%s'\n",
+                    dep->name, pkg->name, reg->lock_file);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool pkg_validate_locked_package(const zan_pkg_registry_t *reg,
+                                         const zan_package_t *locked) {
+    char dir[1024], source[1024], manifest[1100];
+    if (!pkg_locked_dir(reg, locked, dir, sizeof(dir)) || !pkg_plain_dir(dir)) {
+        fprintf(stderr, "error: locked package '%s' is missing from '%s'\n",
+                locked->name, reg->cache_dir);
+        return false;
+    }
+    pkg_package_source_dir(dir, source, sizeof(source));
+    if (!pkg_plain_dir(source)) {
+        fprintf(stderr, "error: invalid source directory '%s' for locked package '%s'\n",
+                source, locked->name);
+        return false;
+    }
+    snprintf(manifest, sizeof(manifest), "%s" PATH_SEP "zan.pkg", dir);
+    zan_package_t pkg = {0};
+    bool ok = zan_pkg_load(&pkg, manifest);
+    if (!ok || strcmp(pkg.name, locked->name) != 0) {
+        fprintf(stderr, "error: manifest for locked package '%s' is missing or invalid at '%s'\n",
+                locked->name, manifest);
+        ok = false;
+    } else if (!pkg.has_version || zan_version_compare(&pkg.version, &locked->version) != 0) {
+        char expected[64], actual[64];
+        zan_version_format(&locked->version, expected, sizeof(expected));
+        fprintf(stderr, "error: version mismatch for locked package '%s': expected %s, got %s\n",
+                locked->name, expected,
+                pkg.has_version ? zan_version_format(&pkg.version, actual, sizeof(actual)) : "<invalid>");
+        ok = false;
+    }
+    if (ok && locked->checksum[0]) {
+        char actual[65];
+        if (!zan_pkg_compute_tree_checksum(dir, actual)) {
+            fprintf(stderr, "error: cannot verify checksum for locked package '%s'\n", locked->name);
+            ok = false;
+        } else if (strcmp(actual, locked->checksum) != 0) {
+            fprintf(stderr, "error: checksum mismatch for package '%s': expected %s, got %s\n",
+                    locked->name, locked->checksum, actual);
+            ok = false;
+        }
+    }
+    if (ok) ok = pkg_locked_dependencies_match(reg, &pkg);
+    zan_pkg_destroy(&pkg);
+    return ok;
+}
+
+bool zan_pkg_prepare_project(const char *project_dir) {
+    pkg_clear_project_lock();
+    if (!zan_pkg_project_has_lock(project_dir)) return true;
+
+    zan_pkg_registry_t reg;
+    pkg_registry_init(&reg, project_dir);
+    bool ok = zan_pkg_read_lock(&reg);
+    if (!ok) {
+        fprintf(stderr, "error: cannot read valid package lock '%s'\n", reg.lock_file);
+    } else if (reg.resolved_count && !pkg_plain_dir(reg.cache_dir)) {
+        fprintf(stderr, "error: package cache '%s' is missing for lock '%s'\n",
+                reg.cache_dir, reg.lock_file);
+        ok = false;
+    }
+    for (int i = 0; ok && i < reg.resolved_count; i++)
+        ok = pkg_validate_locked_package(&reg, reg.resolved[i]);
+
+    if (ok) {
+        char manifest[1200];
+        snprintf(manifest, sizeof(manifest), "%s" PATH_SEP "zan.json", project_dir);
+        if (!pkg_path_present(manifest))
+            snprintf(manifest, sizeof(manifest), "%s" PATH_SEP "zan.pkg", project_dir);
+        if (pkg_path_present(manifest)) {
+            zan_package_t pkg = {0};
+            if (zan_pkg_load(&pkg, manifest)) {
+                ok = pkg_locked_dependencies_match(&reg, &pkg);
+            } else {
+                fprintf(stderr, "error: cannot read package manifest '%s' for lock '%s'\n",
+                        manifest, reg.lock_file);
+                ok = false;
+            }
+            zan_pkg_destroy(&pkg);
+        }
+    }
+    if (!ok) {
+        zan_pkg_registry_destroy(&reg);
+        return false;
+    }
+
+    static bool cleanup_registered;
+    if (!cleanup_registered) {
+        atexit(pkg_clear_project_lock);
+        cleanup_registered = true;
+    }
+    locked_project_dir = strdup(project_dir);
+    if (!locked_project_dir) zan_host_oom();
+    locked_project = reg;
+    return true;
 }
 

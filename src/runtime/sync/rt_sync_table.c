@@ -1,5 +1,7 @@
 /* rt_sync_table.c: 跨平台共享内存表核心结构、CAS 自旋锁与槽位查找算法 */
 
+#include "rt_sync_table_edit.h"
+
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
 #define ZAN_TABLE_VERSION 5
 #define ZAN_TABLE_MAX_COLUMNS 64
@@ -508,24 +510,16 @@ static void zan_expiry_set(
     zan_expiry_down(header, encoded - 1);
 }
 
-static int64_t zan_wall_now_ms(void) {
-#ifdef _WIN32
-    FILETIME ft;
-    ULARGE_INTEGER value;
-    GetSystemTimeAsFileTime(&ft);
-    value.LowPart = ft.dwLowDateTime;
-    value.HighPart = ft.dwHighDateTime;
-    return (int64_t)(value.QuadPart / UINT64_C(10000) - UINT64_C(11644473600000));
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-#endif
+/* Caller holds both the structure lock and the row lock. */
+static void zan_delete_row_locked(zan_shared_header *header, unsigned char *row) {
+    zan_expiry_remove(header, row);
+    memset(row + 8, 0, header->row_stride - 8);
+    zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
+    header->count--;
 }
 
 /* 共享表惰性过期淘汰机制 */
 #define ZAN_PURGE_MIN_INTERVAL_MS 16
-#define ZAN_PURGE_MAX_BATCH 64
 
 static void zan_purge_expired_locked(
     zan_shared_header *header, int64_t now_ms, uint64_t max_batch) {
@@ -535,10 +529,7 @@ static void zan_purge_expired_locked(
         unsigned char *row = zan_row_at(header, heap[0]);
         if (*zan_row_expires_at(row) > now_ms) break;
         zan_row_lock(row);
-        zan_expiry_remove(header, row);
-        memset(row + 8, 0, header->row_stride - 8);
-        zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
-        header->count--;
+        zan_delete_row_locked(header, row);
         zan_row_unlock(row);
         batch++;
     }
@@ -548,7 +539,7 @@ static void zan_purge_expired(zan_shared_header *header) {
     if (__atomic_load_n(&header->expiry_count, __ATOMIC_RELAXED) == 0)
         return;
     static int64_t last_attempt_ms;
-    int64_t now_ms = zan_wall_now_ms();
+    int64_t now_ms = zan_time_epoch_ms();
     int64_t last = __atomic_load_n(&last_attempt_ms, __ATOMIC_RELAXED);
     if (last > now_ms - ZAN_PURGE_MIN_INTERVAL_MS && last <= now_ms) return;
     __atomic_store_n(&last_attempt_ms, now_ms, __ATOMIC_RELAXED);
@@ -562,17 +553,14 @@ static void zan_purge_expired(zan_shared_header *header) {
     zan_struct_unlock(header);
 }
 
-static unsigned char *zan_find_row(
-    zan_shared_header *header, const char *key, int create) {
-    size_t key_len = zan_strnlen(key, header->key_size + 1u);
-    if (!key || key_len == 0 || key_len > header->key_size) return NULL;
-
+/* Insert mode also returns a free slot and requires the structure lock. */
+static unsigned char *zan_find_key_slot(
+    zan_shared_header *header, const char *key, uint64_t hash, int insert) {
     /* 共享表负载因子达到 7/8 时拒绝插入并扩容 */
-    if (create && header->count >= header->capacity - header->capacity / 8)
+    if (insert && header->count >= header->capacity - header->capacity / 8)
         return NULL;
 
-    uint64_t hash = zan_hash_bytes(key);
-    uint64_t first_tombstone = UINT64_MAX;
+    unsigned char *first_tombstone = NULL;
     for (uint64_t probe = 0; probe < header->capacity; probe++) {
         uint64_t index = (hash + probe) & (header->capacity - 1);
         unsigned char *row = zan_row_at(header, index);
@@ -585,31 +573,34 @@ static unsigned char *zan_find_row(
             continue;
         }
         if (state == ZAN_SLOT_TOMBSTONE) {
-            if (first_tombstone == UINT64_MAX) first_tombstone = index;
+            if (!first_tombstone) first_tombstone = row;
             continue;
         }
-        if (!create) return NULL;
-        if (first_tombstone != UINT64_MAX) row = zan_row_at(header, first_tombstone);
-        *zan_row_hash(row) = hash;
-        memcpy(zan_row_key(row), key, key_len);
-        if ((size_t)key_len < header->key_size)
-            zan_row_key(row)[key_len] = '\0';
-        zan_publish_state(row, ZAN_SLOT_USED);
-        header->count++;
-        return row;
+        if (!insert) return NULL;
+        return first_tombstone ? first_tombstone : row;
     }
+    return insert ? first_tombstone : NULL;
+}
 
-    if (create && first_tombstone != UINT64_MAX) {
-        unsigned char *row = zan_row_at(header, first_tombstone);
-        *zan_row_hash(row) = hash;
-        memcpy(zan_row_key(row), key, key_len);
-        if ((size_t)key_len < header->key_size)
-            zan_row_key(row)[key_len] = '\0';
-        zan_publish_state(row, ZAN_SLOT_USED);
-        header->count++;
-        return row;
-    }
-    return NULL;
+static void zan_publish_key_row(
+    zan_shared_header *header, unsigned char *row,
+    const char *key, size_t key_len, uint64_t hash) {
+    *zan_row_hash(row) = hash;
+    memcpy(zan_row_key(row), key, key_len);
+    if (key_len < header->key_size) zan_row_key(row)[key_len] = '\0';
+    zan_publish_state(row, ZAN_SLOT_USED);
+    header->count++;
+}
+
+static unsigned char *zan_find_row(
+    zan_shared_header *header, const char *key, int create) {
+    size_t key_len = zan_strnlen(key, header->key_size + 1u);
+    if (key_len == 0 || key_len > header->key_size) return NULL;
+    uint64_t hash = zan_hash_bytes(key);
+    unsigned char *row = zan_find_key_slot(header, key, hash, create);
+    if (create && row && zan_load_state(row) != ZAN_SLOT_USED)
+        zan_publish_key_row(header, row, key, key_len, hash);
+    return row;
 }
 
 static unsigned char *zan_row_for(

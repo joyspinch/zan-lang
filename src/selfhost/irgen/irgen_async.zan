@@ -10,6 +10,105 @@ partial class Irgen {
         return MkType("void");
     }
 
+    Node AwaitExternTarget(Node call) {
+        if (call == null || call.kind != AK.Call() || call.a == null || call.isIntrinsic) { return null; }
+        Node method = call.resolvedSym;
+        if (method == null && call.a.kind == AK.Ident() && LocalIdx(call.a.sval) < 0) {
+            Node cls = binder.FindType(curClass);
+            method = ResolveMethod(cls, call.a.sval, call, true, null);
+            if (method == null) { method = FindExternMethod(call.a.sval); }
+        }
+        if (method == null || !HasMod(method, MOD.Extern())) { return null; }
+        return method;
+    }
+
+    ExprVal EmitAwaitExtern(Node call, Node method) {
+        Node ret = method.type;
+        string retName = ret == null ? "void" : ret.sval;
+        if (!curAsync || !IsStatic(method) || HasMod(method, MOD.Variadic())) {
+            diags.Error("await native extern requires a fixed-arity static method in an async method", call.line, call.col);
+            return new ExprVal("0", MkType("int"));
+        }
+        if (retName != "void" && (ret == null || MapType(ret) != "i64"
+                || (retName != "int" && retName != "long" && retName != "nint"))) {
+            diags.Error("await native extern requires an int, long, nint, or void result", call.line, call.col);
+            return new ExprVal("0", MkType("int"));
+        }
+        List<Node> args = OrderArgs(method, call);
+        if (args.Count > 4) {
+            diags.Error("await native extern supports at most four scalar arguments", call.line, call.col);
+            return new ExprVal("0", MkType("int"));
+        }
+        string paramTypes = "";
+        string values = "";
+        int i = 0;
+        while (i < args.Count) {
+            Node param = ParamTypeNode(method, i);
+            if (param == null || MapType(param) != "i64" || IsErasedType(param) || IsRefParam(method, i)) {
+                diags.Error("await native extern requires by-value integer, nint, bool, or enum scalars", call.line, call.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            if (i > 0) { paramTypes = paramTypes + ", "; }
+            paramTypes = paramTypes + "i64";
+            ExprVal arg = GenArgExpr(args[i], param);
+            values = values + ", i64 " + CallArg(arg, param, true);
+            i = i + 1;
+        }
+        while (i < 4) { values = values + ", i64 0"; i = i + 1; }
+
+        Node owner = binder.FindType(DeclOwnerOf(binder.FindType(curClass), method));
+        DeclareExtern(owner, method);
+        string native = MethodSym(owner.sval, method);
+        if (!ExternSeen("zan_rt_blocking_checked_co")) {
+            externDecls.Add("zan_rt_blocking_checked_co");
+            H("declare void @zan_rt_blocking_checked_co(i8*, i32, i64, i64, i64, i64, i8*, void(i8*)*, i64*, i32*)");
+        }
+        int st = curAwaitSeq + 1;
+        curAwaitSeq = st;
+        string slot = FrameGep("%ff", curSubBase);
+        string status = NT(); L("  " + status + " = bitcast i64* " + slot + " to i32*");
+        string result = "null";
+        if (retName != "void") { result = FrameGep("%ff", 6); }
+        EmitTempReleases();
+        EmitAsyncSaveSlots();
+        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+        L("  call void @zan_rt_blocking_checked_co(i8* bitcast (" + MapType(ret) + " (" + paramTypes + ")* @"
+            + native + " to i8*), i32 " + args.Count + values + ", i8* %fp, void(i8*)* @" + curResumeSym
+            + ", i64* " + result + ", i32* " + status + ")");
+        EmitAsyncSuspend();
+        L("  ret void");
+        L("resume_" + st + ":");
+        term = false; curLbl = "resume_" + st;
+        EmitAsyncReloadSlots();
+        EmitAsyncRearm();
+        slot = FrameGep("%ff", curSubBase);
+        status = NT(); L("  " + status + " = bitcast i64* " + slot + " to i32*");
+        string code = NT(); L("  " + code + " = load i32, i32* " + status);
+        L("  store i64 0, i64* " + slot);
+        string failed = NT(); L("  " + failed + " = icmp ne i32 " + code + ", 0");
+        int bad = NL(); int ok = NL();
+        L("  br i1 " + failed + ", label %L" + bad + ", label %L" + ok);
+        Label(bad);
+        Node message = new Node(AK.StringLit());
+        message.sval = "Unable to dispatch awaited native call";
+        Node exception = new Node(AK.NewExpr());
+        exception.type = MkType("InvalidOperationException");
+        exception.Add(message);
+        Node raise = new Node(AK.ThrowStmt());
+        raise.a = exception;
+        GenThrow(raise);
+        Label(ok);
+        if (retName == "void") { return new ExprVal("0", MkType("void")); }
+        string rs = FrameGep("%ff", 6);
+        string value = NT(); L("  " + value + " = load i64, i64* " + rs);
+        L("  store i64 0, i64* " + rs);
+        if (retName == "int") {
+            string low = NT(); L("  " + low + " = trunc i64 " + value + " to i32");
+            value = NT(); L("  " + value + " = sext i32 " + low + " to i64");
+        }
+        return new ExprVal(value, ret);
+    }
+
     // Lower `await <callExpr>`; returns the awaited result (+1 owned if ARC).
     ExprVal EmitAwait(Node callExpr) {
         if (!curAsync && callExpr != null && callExpr.a != null && callExpr.a.kind == AK.MemberAccess()
@@ -29,6 +128,8 @@ partial class Irgen {
             }
         }
         if (curAsync && IsSocketIntrinsic(callExpr)) { return EmitSocketIntrinsic(callExpr); }
+        Node native = AwaitExternTarget(callExpr);
+        if (native != null) { return EmitAwaitExtern(callExpr, native); }
         ExprVal sub = GenExpr(callExpr);
         // The awaited operand has to be a coroutine frame: the lowering reads
         // the frame's slot 9 (the resume entry) and hands the frame to the
@@ -41,9 +142,8 @@ partial class Irgen {
         // emit_expr_await_expr): a coroutine frame (the awaited call started
         // one), a TASK HANDLE (poll the task until it is done, then take
         // its result), and anything else -- the value passes through
-        // unchanged (the host's function ends with `return sub`).
-        // `await sqlite3_step(stmt)` (a plain int call) is that third shape:
-        // the host awaits nothing and hands the value on.
+        // unchanged (the host's function ends with `return sub`). Native
+        // extern calls were handled above, before any synchronous call is emitted.
         if (!sub.asyncCall) {
             if (sub.ty != null && sub.ty.sval == "Task") {
                 return EmitAwaitTaskHandle(sub);

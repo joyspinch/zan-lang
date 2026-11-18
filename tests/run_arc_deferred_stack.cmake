@@ -13,7 +13,7 @@ if(NOT native_rc STREQUAL "0")
   message(FATAL_ERROR "native fixture failed (${native_rc}): ${native_out}${native_err}")
 endif()
 execute_process(COMMAND "${ZANC}" "${ROOT}/tests/conformance/arc_deferred_stack.zan"
-  --no-stdlib -O1 --link-input "${object}" -o "${OUT_EXE}"
+  --no-stdlib --no-fast-alloc -O1 --link-input "${object}" -o "${OUT_EXE}"
   RESULT_VARIABLE compile_rc OUTPUT_VARIABLE compile_out ERROR_VARIABLE compile_err TIMEOUT 40)
 file(WRITE "${log_dir}/compile.log" "exit=${compile_rc}\n${compile_out}${compile_err}")
 if(NOT compile_rc STREQUAL "0")

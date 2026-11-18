@@ -5,8 +5,14 @@ using System.Text;
 
 namespace Zan;
 
+class LspProjectManifests {
+    public string Root;
+    public Dictionary<string, bool> Paths = new Dictionary<string, bool>();
+}
+
 public partial class LspServer {
     static string workspaceRoot;
+    static Dictionary<string, LspProjectManifests> projectManifests = new Dictionary<string, LspProjectManifests>();
 
     static string WorkspacePath(string uri) {
         if (!uri.StartsWith("file://")) { return ""; }
@@ -67,7 +73,7 @@ public partial class LspServer {
             || name == "dist" || name == "node_modules" || name == "target" || name == "_scratch";
     }
 
-    static void AppendDiskSources(string dir, List<string> paths) {
+    static void AppendDiskSources(string dir, List<string> paths, Dictionary<string, bool> manifests) {
         if (!Directory.ExistsOnDisk(dir)) { return; }
         List<string> files;
         List<string> children;
@@ -83,9 +89,12 @@ public partial class LspServer {
         }
         for (int i = 0; i < children.Count; i = i + 1) {
             string child = children[i];
-            if (SkipSourceDirectory(Path.GetFileName(child)) || File.IsReparsePoint(child)
-                    || File.Exists(Path.Combine(child, "zan.proj"))) { continue; }
-            AppendDiskSources(child, paths);
+            if (SkipSourceDirectory(Path.GetFileName(child)) || File.IsReparsePoint(child)) { continue; }
+            string manifest = Path.Combine(child, "zan.proj");
+            bool exists = File.Exists(manifest);
+            // Keep excluded boundaries too so removing their manifest brings sources back in.
+            manifests[manifest] = exists;
+            if (!exists) { AppendDiskSources(child, paths, manifests); }
         }
     }
 
@@ -116,7 +125,7 @@ public partial class LspServer {
         Binder binder = new Binder();
         binder.Bind(unit);
         Checker checker = new Checker(binder, diagnostics);
-        checker.Check(unit);
+        checker.CheckLsp(unit, false);
     }
 
     static void AddAffectedProject(List<string> roots, string root) {
@@ -128,11 +137,7 @@ public partial class LspServer {
         roots.Add(root);
     }
 
-    // Document notifications and watched-file notifications share the same refresh path.
-    static void RefreshWorkspaceDiagnostics(string previousRoot, LspDocument changed) {
-        EnsureInit();
-        List<string> roots = new List<string>();
-        AddAffectedProject(roots, previousRoot);
+    static void UpdateProjectRoots(List<string> roots) {
         for (int i = 0; i < documents.Count; i = i + 1) {
             LspDocument doc = documents[i];
             string root = ProjectOf(doc.FilePath);
@@ -141,7 +146,38 @@ public partial class LspServer {
                 AddAffectedProject(roots, root);
                 doc.ProjectRoot = root;
             }
-            if (changed == null || doc == changed) { AddAffectedProject(roots, root); }
+        }
+    }
+
+    // Document notifications and watched-file notifications share the same refresh path.
+    static void RefreshWorkspaceDiagnostics(string previousRoot, LspDocument changed) {
+        List<string> roots = new List<string>();
+        AddAffectedProject(roots, previousRoot);
+        UpdateProjectRoots(roots);
+        if (changed == null) {
+            for (int i = 0; i < documents.Count; i = i + 1) {
+                AddAffectedProject(roots, documents[i].ProjectRoot);
+            }
+        } else {
+            AddAffectedProject(roots, changed.ProjectRoot);
+        }
+        for (int i = 0; i < roots.Count; i = i + 1) { AnalyzeProject(roots[i]); }
+    }
+
+    static void PollWorkspaceManifests() {
+        List<string> roots = new List<string>();
+        UpdateProjectRoots(roots);
+        List<string> projects = projectManifests.Keys;
+        for (int i = 0; i < projects.Count; i = i + 1) {
+            LspProjectManifests manifests = projectManifests[projects[i]];
+            List<string> paths = manifests.Paths.Keys;
+            for (int j = 0; j < paths.Count; j = j + 1) {
+                string path = paths[j];
+                if (File.Exists(path) != manifests.Paths[path]) {
+                    AddAffectedProject(roots, manifests.Root);
+                    break;
+                }
+            }
         }
         for (int i = 0; i < roots.Count; i = i + 1) { AnalyzeProject(roots[i]); }
     }
@@ -157,7 +193,10 @@ public partial class LspServer {
                 overlays[PathKey(doc.FilePath)] = true;
             }
         }
-        if (open.Count == 0) { return; }
+        if (open.Count == 0) {
+            projectManifests.Remove(key);
+            return;
+        }
 
         Node unit = new Node(AK.CompUnit());
         Diags diagnostics = new Diags();
@@ -171,7 +210,10 @@ public partial class LspServer {
             line = AppendDiagnosticSource(unit, diagnostics, doc.Text, line);
         }
         List<string> paths = new List<string>();
-        AppendDiskSources(root, paths);
+        LspProjectManifests manifests = new LspProjectManifests();
+        manifests.Root = root;
+        AppendDiskSources(root, paths, manifests.Paths);
+        projectManifests[key] = manifests;
         paths.Sort();
         for (int i = 0; i < paths.Count; i = i + 1) {
             string path = paths[i];
@@ -196,7 +238,7 @@ public partial class LspServer {
         Binder binder = new Binder();
         binder.Bind(unit);
         Checker checker = new Checker(binder, diagnostics);
-        checker.CheckWorkspace(unit);
+        checker.CheckLsp(unit, true);
         Dictionary<string, Diags> byUri = new Dictionary<string, Diags>();
         for (int i = 0; i < open.Count; i = i + 1) { byUri[open[i].Uri] = new Diags(); }
         for (int i = 0; i < diagnostics.items.Count; i = i + 1) {

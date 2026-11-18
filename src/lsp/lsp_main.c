@@ -758,11 +758,13 @@ static zan_ast_node_t *parse_diagnostic_source(zan_arena_t *arena, zan_diag_t *d
 }
 
 static void add_diagnostic_sources(zan_ast_node_t *unit, zan_arena_t *arena,
-                                   lsp_diag_sources_t *sources) {
+                                   zan_diag_t *unit_diag, lsp_diag_sources_t *sources) {
     zan_nsresolve_stamp(unit, arena);
     for (int i = 0; i < sources->count; i++) {
         lsp_diag_source_t *source = &sources->items[i];
         if (!source->text) source->text = read_file_all(source->path);
+        /* Keep dependency file IDs aligned with declaration provenance. */
+        zan_diag_add_file(unit_diag, source->path, source->text);
         if (!source->text) continue;
 
         zan_diag_t *diag = zan_diag_new(arena);
@@ -811,7 +813,7 @@ static json_value *collect_diagnostics(lsp_server_t *s, const char *uri, const c
     if (ast && !zan_diag_has_errors(diag)) {
         if (sources->workspace) {
             zan_diag_only_file(diag, 0);
-            add_diagnostic_sources(ast, arena, sources);
+            add_diagnostic_sources(ast, arena, diag, sources);
             zan_nsresolve_workspace(ast, arena, diag);
             /* Qualified binder keys separate partial types in different namespaces. */
             zan_parser_merge_partials(ast, arena, diag);

@@ -11,7 +11,7 @@
 # rather than only on the host.
 
 execute_process(
-  COMMAND "${ZANC}" "${SRC}" --target "${TARGET}" --emit-ir
+  COMMAND "${ZANC}" "${SRC}" --target "${TARGET}" --emit-ir -O0
   OUTPUT_VARIABLE _ir
   ERROR_VARIABLE _err
   RESULT_VARIABLE _rc
@@ -29,8 +29,12 @@ foreach(_n ${_needles})
     continue()
   endif()
   string(FIND "${_ir}" "${_n}" _pos)
+  if(_pos EQUAL -1 AND _n MATCHES "^call ")
+    string(REGEX REPLACE "^call " "invoke " _invoke "${_n}")
+    string(FIND "${_ir}" "${_invoke}" _pos)
+  endif()
   if(_pos EQUAL -1)
     message(FATAL_ERROR
-      "run_abi_case: ${TARGET} IR does not declare the extern with the C ABI shape:\n  ${_n}")
+      "run_abi_case: ${TARGET} IR is missing the C ABI shape:\n  ${_n}")
   endif()
 endforeach()

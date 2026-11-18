@@ -14,13 +14,16 @@ REQUIRED = (
     "crt1.o", "crti.o", "crtn.o", "libc.a", "libc++.a",
     "libc++abi.a", "libunwind.a", "libcompiler_rt.a",
 )
+# Zig's RISC-V musl startup uses only crt1.o. Match zanc's static link.
+RISCV_REQUIRED = tuple(name for name in REQUIRED if name not in ("crti.o", "crtn.o"))
 LINK_COMMAND = re.compile(
     r'^\s*(?:ld\.lld(?:\.exe)?|"[^"\r\n]*[/\\]ld\.lld(?:\.exe)?"'
     r'|[^\s"]*[/\\]ld\.lld(?:\.exe)?)\s+'
 )
 
 
-def selected_inputs(trace, cache_root):
+def selected_inputs(trace, cache_root, target="linux-musl"):
+    required = RISCV_REQUIRED if target == "linux-riscv64" else REQUIRED
     commands = [line for line in trace.splitlines() if LINK_COMMAND.match(line)]
     if len(commands) != 1:
         raise ValueError("expected exactly one Zig linker invocation")
@@ -34,7 +37,7 @@ def selected_inputs(trace, cache_root):
     pattern = re.compile(
         r'(?:^|[\s"])(?P<path>(?:' + "|".join(re.escape(p) for p in sorted(roots))
         + r')[/\\]o[/\\][0-9a-fA-F]+[/\\](?P<name>'
-        + "|".join(re.escape(name) for name in REQUIRED) + r'))(?=$|[\s"])'
+        + "|".join(re.escape(name) for name in required) + r'))(?=$|[\s"])'
     )
     selected = {}
     for match in pattern.finditer(commands[0]):
@@ -45,7 +48,7 @@ def selected_inputs(trace, cache_root):
         if not source.is_file():
             raise ValueError("missing absolute target runtime input: " + str(source))
         selected[name] = source
-    missing = set(REQUIRED) - selected.keys()
+    missing = set(required) - selected.keys()
     if missing:
         raise ValueError("Zig did not supply runtime inputs: " + ", ".join(sorted(missing)))
     return selected
@@ -106,6 +109,8 @@ def main():
     parser.add_argument("trace", type=Path, help="link trace, or staged directory with --publish")
     parser.add_argument("output", type=Path)
     parser.add_argument("--publish", action="store_true", help="install staged .o/.a artifacts with rollback")
+    parser.add_argument("--target", choices=("linux-musl", "linux-arm64", "linux-riscv64"),
+                        default="linux-musl", help="target whose runtime inputs are staged")
     cache = parser.add_mutually_exclusive_group()
     cache.add_argument("--cache-root", type=Path)
     cache.add_argument("--zig-env", type=Path, help="JSON output of the same Zig executable's env command")
@@ -126,7 +131,7 @@ def main():
         cache_root = json.loads(options.zig_env.read_text(encoding="utf-8"))["global_cache_dir"]
     if cache_root is None:
         parser.error("staging requires --cache-root or --zig-env")
-    selected = selected_inputs(options.trace.read_text(encoding="utf-8"), cache_root)
+    selected = selected_inputs(options.trace.read_text(encoding="utf-8"), cache_root, options.target)
     options.output.mkdir(parents=True, exist_ok=True)
     # Validate the entire selection before publishing any of it. The caller
     # builds into its own staging directory and publishes only after success.

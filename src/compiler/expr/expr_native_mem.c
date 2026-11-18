@@ -301,10 +301,6 @@ bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
             nm_addr(g, p, zero64), len }, 2, "nm.crc32c");
         return true;
     }
-    if (is_call_to(expr, "NativeMemory", "Sha256") && expr->call.args.count == 2) {
-        emit_nm_digest(g, expr, locals, out, "zan_hw_sha256", 32);
-        return true;
-    }
     if (is_call_to(expr, "NativeMemory", "AesCbcEncrypt") && expr->call.args.count == 6) {
         LLVMValueRef dst = nm_arg(g, expr, 0, locals);
         LLVMValueRef src = nm_arg(g, expr, 1, locals);
@@ -586,18 +582,6 @@ bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
             coerce_int_to(g, crc, i32t), nm_addr(g, p, zero64), len }, 3, "nm.crc32c.u");
         return true;
     }
-    if (is_call_to(expr, "NativeMemory", "Sha1") && expr->call.args.count == 2) {
-        emit_nm_digest(g, expr, locals, out, "zan_hw_sha1", 20);
-        return true;
-    }
-    if (is_call_to(expr, "NativeMemory", "Sha512") && expr->call.args.count == 2) {
-        emit_nm_digest(g, expr, locals, out, "zan_hw_sha512", 64);
-        return true;
-    }
-    if (is_call_to(expr, "NativeMemory", "Sm3") && expr->call.args.count == 2) {
-        emit_nm_digest(g, expr, locals, out, "zan_hw_sm3", 32);
-        return true;
-    }
     if (is_call_to(expr, "NativeMemory", "Sm4CbcEncrypt") && expr->call.args.count == 5) {
         LLVMValueRef dst = nm_arg(g, expr, 0, locals);
         LLVMValueRef src = nm_arg(g, expr, 1, locals);
@@ -626,41 +610,6 @@ bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
             nm_addr(g, src, zero64), size, nm_addr(g, key, zero64), nm_addr(g, iv, zero64), nm_addr(g, dst, zero64)
         }, 5, "nm.sm4_dec");
-        return true;
-    }
-    if (is_call_to(expr, "NativeMemory", "Base64Encode") && expr->call.args.count == 2) {
-        LLVMValueRef p = nm_arg(g, expr, 0, locals);
-        LLVMValueRef len = nm_arg(g, expr, 1, locals);
-        len = LLVMBuildSelect(g->builder,
-            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.b64e.neg"),
-            zero64, len, "nm.b64e.len");
-        LLVMValueRef plus2 = LLVMBuildAdd(g->builder, len, LLVMConstInt(i64t, 2, 0), "nm.b64e.p2");
-        LLVMValueRef div3 = LLVMBuildSDiv(g->builder, plus2, LLVMConstInt(i64t, 3, 0), "nm.b64e.d3");
-        LLVMValueRef mul4 = LLVMBuildMul(g->builder, div3, LLVMConstInt(i64t, 4, 0), "nm.b64e.m4");
-        LLVMValueRef cap = LLVMBuildAdd(g->builder, mul4, LLVMConstInt(i64t, 1, 0), "nm.b64e.cap");
-        LLVMValueRef s = emit_string_alloc_rc(g, cap);
-        LLVMTypeRef ty = LLVMFunctionType(i64t,
-            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_base64_encode");
-        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_base64_encode", ty);
-        LLVMValueRef written = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
-            nm_addr(g, p, zero64), len, s
-        }, 3, "nm.b64e.w");
-        emit_string_len_set(g, s, written);
-        *out = s;
-        return true;
-    }
-    if (is_call_to(expr, "NativeMemory", "Base64Decode") && expr->call.args.count == 3) {
-        LLVMValueRef dst = nm_arg(g, expr, 0, locals);
-        LLVMValueRef src = nm_arg(g, expr, 1, locals);
-        LLVMValueRef size = nm_arg(g, expr, 2, locals);
-        LLVMTypeRef ty = LLVMFunctionType(i64t,
-            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_base64_decode");
-        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_base64_decode", ty);
-        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
-            nm_addr(g, src, zero64), size, nm_addr(g, dst, zero64)
-        }, 3, "nm.b64d.w");
         return true;
     }
     if (is_call_to(expr, "NativeMemory", "JsonSkipWhitespace") && expr->call.args.count == 3) {

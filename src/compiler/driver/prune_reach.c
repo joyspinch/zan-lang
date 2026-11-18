@@ -6,15 +6,12 @@ static int pi_typeish(zan_token_kind_t k) {
            k == TK_VOID;
 }
 
-static bool pi_is_orm_conn_hook(zan_istr_t name) {
-    return name.len == 6 && memcmp(name.str, "__Conn", 6) == 0;
-}
+static void pi_flag_qualified(zan_istr_t name);
 
-/* A zero-argument __Conn hook enables recv.<Entity> on its class and
-   descendants. The checker can synthesize both of these type references. */
-static void pi_seed_orm_accessor_deps(void) {
-    pi_flag_ident(NULL, "BaseRepository", 14);
-    pi_flag_ident(NULL, "ZanSql", 6);
+static void pi_seed_await_deps(void) {
+    /* Native await can raise this exception even if the source never names it. */
+    pi_reach("System");
+    pi_flag_ident(NULL, "InvalidOperationException", sizeof("InvalidOperationException") - 1);
 }
 
 static void pi_seed_source(const char *source, size_t len) {
@@ -36,6 +33,9 @@ static void pi_seed_source(const char *source, size_t len) {
             zan_token_t tok = zan_lexer_next(&lex);
             if (tok.kind == TK_EOF) break;
             switch (tok.kind) {
+            case TK_AWAIT:
+                if (pass == 1) pi_seed_await_deps();
+                break;
             case TK_LBRACE:
                 depth++;
                 break;
@@ -170,9 +170,9 @@ static void pi_seed_source(const char *source, size_t len) {
                             chain = name;
                             zan_token_t next = zan_lexer_peek(&lex);
                             if (next.kind == TK_LPAREN &&
-                                pi_is_orm_conn_hook(tok.str_val) &&
+                                zan_data_orm_connection_hook(tok.str_val) &&
                                 zan_lexer_peek2(&lex).kind == TK_RPAREN)
-                                pi_seed_orm_accessor_deps();
+                                zan_data_orm_seed_accessor_types(pi_flag_qualified);
                             if (name->len == 4 &&
                                 memcmp(name->str, "Task", 4) == 0 &&
                                 next.kind == TK_DOT) {
@@ -290,8 +290,8 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     case AST_DESTRUCTOR_DECL:
     case AST_DELEGATE_DECL:
         if (n->kind == AST_METHOD_DECL && n->method_decl.params.count == 0 &&
-            pi_is_orm_conn_hook(n->method_decl.name))
-            pi_seed_orm_accessor_deps();
+            zan_data_orm_connection_hook(n->method_decl.name))
+            zan_data_orm_seed_accessor_types(pi_flag_qualified);
         pi_seed_ast(n->method_decl.return_type);
         pi_seed_list(&n->method_decl.params);
         pi_seed_list(&n->method_decl.type_params);
@@ -501,18 +501,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
                 }
             }
             pi_flag_istr(n->member.name);
-            /* Also flag <Name>Dao for ORM entity member access (e.g. this.SysDepartment -> SysDepartmentDao) */
-            if (n->member.name.len > 0 && n->member.name.len < 100 &&
-                n->member.name.str[0] >= 'A' && n->member.name.str[0] <= 'Z') {
-                char dao_buf[128];
-                memcpy(dao_buf, n->member.name.str, (size_t)n->member.name.len);
-                memcpy(dao_buf + n->member.name.len, "Dao", 4);
-                pi_name_t *dao = pi_intern(dao_buf, (size_t)n->member.name.len + 3);
-                if (dao && !dao->user_decl) {
-                    dao->flagged = 1;
-                    if (pi_seeding_stdlib) dao->flagged_stdlib = 1;
-                }
-            }
+            zan_data_orm_seed_member_dao(n->member.name, pi_flag_istr);
         }
         pi_seed_chain(obj, 1);
         return;
@@ -549,6 +538,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         pi_seed_ast(n->lambda.body);
         return;
     case AST_AWAIT_EXPR:
+        pi_seed_await_deps();
         pi_seed_ast(n->await_expr.expr);
         return;
     case AST_STRING_INTERP:

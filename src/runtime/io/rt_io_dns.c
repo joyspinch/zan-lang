@@ -12,15 +12,16 @@ typedef struct zan_blocking_job {
     /* Protected by dns_lock: timeout delivery owns the job through io_wake. */
     int      timeout_delivering;
     int      started;
-    int64_t  result;        
-/* 已解析的 IPv4 网络序地址 */
+    int64_t  result;
+    enum zan_blocking_status status;
     void    *sabuf;
     int32_t  sacap;
     int32_t  port;
     void    *frame;
     zan_co_step_t step;
-    int32_t *out;
+    int32_t *out; /* DNS's 32-bit result, with 0 indicating failure */
     int64_t *out64;
+    int32_t *out_status;
     void (*run)(struct zan_blocking_job *job);
 } zan_blocking_job_t;
 
@@ -30,6 +31,16 @@ typedef struct zan_dns_work {
     /* 工作线程解析的 sockaddr 结果暂存区 */
     unsigned char sa_staging[sizeof(struct sockaddr_in6)];
 } zan_dns_work_t;
+
+/* Job allocation has a caller-visible failure path, so bypass rt_io.c's
+ * fatal-on-OOM allocator. The test can replace just this allocation. */
+#ifndef ZAN_BLOCKING_JOB_CALLOC
+#pragma push_macro("calloc")
+#undef calloc
+static void *blocking_job_calloc(size_t size) { return calloc(1, size); }
+#pragma pop_macro("calloc")
+#define ZAN_BLOCKING_JOB_CALLOC blocking_job_calloc
+#endif
 
 static zan_blocking_job_t *g_blocking_pending; /* in flight, owned by workers */
 static zan_blocking_job_t *g_blocking_done;
@@ -60,12 +71,47 @@ static void dns_lock(void) { pthread_mutex_lock(&g_dns_mx); }
 static void dns_unlock(void) { pthread_mutex_unlock(&g_dns_mx); }
 #endif
 
-/* 空闲线程槽位启动排队任务 */
-static void blocking_start_next(void);
+/* Called with dns_lock held. The reserved slot owns the job until start/finish. */
+static zan_blocking_job_t *blocking_take_queued(void) {
+    if (g_blocking_active >= ZAN_BLOCKING_MAX_ACTIVE || !g_blocking_queued)
+        return NULL;
+    zan_blocking_job_t *job = g_blocking_queued;
+    g_blocking_queued = job->queue_next;
+    job->queue_next = NULL;
+    g_blocking_queued_n--;
+    job->started = 1;
+    g_blocking_active++;
+    return job;
+}
 
 static void blocking_spawn(zan_blocking_job_t *job);
+static void blocking_native_run(zan_blocking_job_t *job);
 
-static void blocking_finish_worker(zan_blocking_job_t *job) {
+static void blocking_native_status(int32_t *out, enum zan_blocking_status status) {
+    if (out) {
+        *out = status;
+    } else if (status != ZAN_BLOCKING_OK) {
+        fprintf(stderr, "await extern: blocking dispatch failed (status %d)\n", (int)status);
+        abort();
+    }
+}
+
+static void blocking_deliver(zan_blocking_job_t *job) {
+    if (job->run == blocking_native_run)
+        blocking_native_status(job->out_status, job->status);
+    if (job->status == ZAN_BLOCKING_OK) {
+        if (job->out) *job->out = (int32_t)job->result;
+        if (job->out64) *job->out64 = job->result;
+        if (job->sabuf && job->result > 0 && job->result <= job->sacap)
+            memcpy(job->sabuf, ((zan_dns_work_t *)job)->sa_staging, (size_t)job->result);
+    } else if (job->out) {
+        *job->out = 0; /* DNS failure */
+    }
+    io_wake(job->frame, job->step);
+    free(job);
+}
+
+static zan_blocking_job_t *blocking_finish_worker(zan_blocking_job_t *job) {
     zan_blocking_job_t *next = NULL;
     int discard = 0, notify = 0;
     dns_lock();
@@ -87,18 +133,11 @@ static void blocking_finish_worker(zan_blocking_job_t *job) {
             if (g_blocking_active > 0) g_blocking_active--;
         }
     }
-    if (g_blocking_active < ZAN_BLOCKING_MAX_ACTIVE && g_blocking_queued) {
-        next = g_blocking_queued;
-        g_blocking_queued = next->queue_next;
-        next->queue_next = NULL;
-        g_blocking_queued_n--;
-        next->started = 1;
-        g_blocking_active++;
-    }
+    next = blocking_take_queued();
     dns_unlock();
     if (discard) free(job);
     if (notify) dns_wake_notify();
-    if (next) blocking_spawn(next);
+    return next;
 }
 
 /* 工作线程调度跳板入口 */
@@ -109,7 +148,7 @@ static void *blocking_worker(void *arg) {
 #endif
     zan_blocking_job_t *job = (zan_blocking_job_t *)arg;
     job->run(job);
-    blocking_finish_worker(job);
+    blocking_spawn(blocking_finish_worker(job));
 #if defined(_WIN32)
     return 0;
 #else
@@ -117,60 +156,21 @@ static void *blocking_worker(void *arg) {
 #endif
 }
 
-static void blocking_start_failed(zan_blocking_job_t *job) {
-    int deliver = 0, discard = 0;
-    dns_lock();
-    zan_blocking_job_t **pp = &g_blocking_pending;
-    while (*pp && *pp != job) pp = &(*pp)->next;
-    if (*pp == job) {
-        *pp = job->next;
-        deliver = 1;
-    }
-    if (job->started && g_blocking_active > 0) g_blocking_active--;
-    job->started = 0;
-    job->result = 0;
-    if (deliver) {
-        job->next = g_blocking_done;
-        g_blocking_done = job;
-    }
-    discard = !deliver && !job->timeout_delivering;
-    dns_unlock();
-    if (deliver) dns_wake_notify();
-    if (discard) free(job);
-    blocking_start_next();
-}
-
 static void blocking_spawn(zan_blocking_job_t *job) {
+    while (job) {
 #if defined(_WIN32)
-    HANDLE h = CreateThread(NULL, 0, blocking_worker, job, 0, NULL);
-    if (!h) {
-        blocking_start_failed(job);
-        return;
-    }
-    CloseHandle(h);
+        HANDLE h = CreateThread(NULL, 0, blocking_worker, job, 0, NULL);
+        if (h) { CloseHandle(h); return; }
 #else
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, blocking_worker, job) != 0) {
-        blocking_start_failed(job);
-        return;
-    }
-    pthread_detach(tid);
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, blocking_worker, job) == 0) {
+            pthread_detach(tid);
+            return;
+        }
 #endif
-}
-
-static void blocking_start_next(void) {
-    zan_blocking_job_t *next = NULL;
-    dns_lock();
-    if (g_blocking_active < ZAN_BLOCKING_MAX_ACTIVE && g_blocking_queued) {
-        next = g_blocking_queued;
-        g_blocking_queued = next->queue_next;
-        next->queue_next = NULL;
-        g_blocking_queued_n--;
-        next->started = 1;
-        g_blocking_active++;
+        job->status = ZAN_BLOCKING_THREAD_FAILED;
+        job = blocking_finish_worker(job);
     }
-    dns_unlock();
-    if (next) blocking_spawn(next);
 }
 
 static void blocking_submit(zan_blocking_job_t *job) {
@@ -196,10 +196,8 @@ static void blocking_submit(zan_blocking_job_t *job) {
     }
     dns_unlock();
     if (oversubscribed) {
-        if (job->out) *job->out = 0;
-        if (job->out64) *job->out64 = 0;
-        io_wake(job->frame, job->step);
-        free(job);
+        job->status = ZAN_BLOCKING_QUEUE_FULL;
+        blocking_deliver(job);
         return;
     }
     if (start) blocking_spawn(job);
@@ -271,7 +269,6 @@ static int dns_timeout_scan(void) {
         zan_blocking_job_t *j = timed_out;
         timed_out = j->next;
         if (j->out) *j->out = 0;
-        if (j->out64) *j->out64 = 0;
         io_wake(j->frame, j->step);
         dns_lock();
         j->timeout_delivering = 0;
@@ -328,15 +325,7 @@ static int dns_drain(void) {
     dns_unlock();
     while (j) {
         zan_blocking_job_t *n = j->next;
-        if (j->out) *j->out = (int32_t)j->result;
-        if (j->out64) *j->out64 = j->result;
-        if (j->sabuf && j->sacap > 0 && j->result > 0) {
-            size_t len = (size_t)j->result;
-            if (len <= (size_t)j->sacap)
-                memcpy(j->sabuf, ((zan_dns_work_t *)j)->sa_staging, len);
-        }
-        io_wake(j->frame, j->step);
-        free(j);
+        blocking_deliver(j);
         /* Keep the blocking owner until the ready continuation owns liveness. */
         InterlockedDecrement((volatile LONG *)&g_blocking_inflight);
         woke++;
@@ -381,7 +370,7 @@ void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
         return;
     }
     zan_io_init();
-    zan_dns_work_t *w = (zan_dns_work_t *)calloc(1, sizeof(*w));
+    zan_dns_work_t *w = (zan_dns_work_t *)ZAN_BLOCKING_JOB_CALLOC(sizeof(*w));
     if (!w) {
         if (out) *out = 0;
         io_wake(frame, step);
@@ -408,7 +397,7 @@ void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
         return;
     }
     zan_io_init();
-    zan_dns_work_t *w = (zan_dns_work_t *)calloc(1, sizeof(*w));
+    zan_dns_work_t *w = (zan_dns_work_t *)ZAN_BLOCKING_JOB_CALLOC(sizeof(*w));
     if (!w) {
         if (out) *out = 0;
         io_wake(frame, step);
@@ -445,10 +434,6 @@ typedef void (*zan_blocking_void4)(int64_t, int64_t, int64_t, int64_t);
 /* 编译器标量 ABI 调用规约适配 */
 static void blocking_native_run(zan_blocking_job_t *base) {
     zan_blocking_work_t *w = (zan_blocking_work_t *)base;
-    if (!w->fn || w->argc < 0 || w->argc > 4) {
-        w->job.result = 0;
-        return;
-    }
     if (!w->job.out64) {
         switch (w->argc) {
         case 0: ((zan_blocking_void0)w->fn)(); break;
@@ -469,18 +454,19 @@ static void blocking_native_run(zan_blocking_job_t *base) {
     }
 }
 
-void zan_rt_blocking_co(void *fn, int32_t argc,
-                        int64_t a0, int64_t a1, int64_t a2, int64_t a3,
-                        void *frame, zan_co_step_t step, int64_t *out) {
+void zan_rt_blocking_checked_co(void *fn, int32_t argc,
+                                int64_t a0, int64_t a1, int64_t a2, int64_t a3,
+                                void *frame, zan_co_step_t step, int64_t *out,
+                                int32_t *status) {
     if (!fn || argc < 0 || argc > 4) {
-        if (out) *out = 0;
+        blocking_native_status(status, ZAN_BLOCKING_INVALID_CALL);
         io_wake(frame, step);
         return;
     }
     zan_io_init();
-    zan_blocking_work_t *w = (zan_blocking_work_t *)calloc(1, sizeof(*w));
+    zan_blocking_work_t *w = (zan_blocking_work_t *)ZAN_BLOCKING_JOB_CALLOC(sizeof(*w));
     if (!w) {
-        if (out) *out = 0;
+        blocking_native_status(status, ZAN_BLOCKING_NO_MEMORY);
         io_wake(frame, step);
         return;
     }
@@ -493,8 +479,15 @@ void zan_rt_blocking_co(void *fn, int32_t argc,
     w->job.frame = frame;
     w->job.step = step;
     w->job.out64 = out;
+    w->job.out_status = status;
     w->job.run = blocking_native_run;
     blocking_submit(&w->job);
+}
+
+void zan_rt_blocking_co(void *fn, int32_t argc,
+                        int64_t a0, int64_t a1, int64_t a2, int64_t a3,
+                        void *frame, zan_co_step_t step, int64_t *out) {
+    zan_rt_blocking_checked_co(fn, argc, a0, a1, a2, a3, frame, step, out, NULL);
 }
 
 

@@ -3,10 +3,8 @@ using System;
 namespace System.Threading;
 
 // 事件驱动的协程等待/通知原语（异步条件变量）。
-// 由运行时 gate 实现（<see cref="Gate"/> / src/runtime/rt_io.c
-// 中的 zan_gate_*）：等待方真正挂起在调度器上，
-// 只有其他协程调用 <see cref="Signal"/> 时才被唤醒——零
-// 轮询、无人为延迟、唤醒确定。等待前发出的信号
+// 复用 <see cref="Gate"/> 的运行时票据。等待方挂起在调度器上，
+// 由 Signal、SignalAll 或 Close 唤醒。等待前发出的信号
 // 会被记账（计数语义），因此
 // <code>while (!ready) { await gate.Wait(); }</code> 式的重查惯用法不会丢失唤醒。
 // （取代了早期的回环 self-pipe 实现，后者需要
@@ -19,32 +17,52 @@ public class AsyncGate : IDisposable {
     }
 
     // 句柄是否仍可用（未 Close）；与"是否已 Signal"无关（Gate.IsValid 的旧名）。
-    public bool IsOpen() { return this.handle != 0; }
+    public bool IsOpen() {
+        lock (this) {
+            return this.handle != 0;
+        }
+    }
 
-    // 挂起直到 Signal（暂存信号可立即消费）；门已 Close 时返回 false。
+    // Close 之后的新等待返回 false，已经登记的等待仍会唤醒。
     public async bool Wait() {
-        if (this.handle == 0) { return false; }
-        await Gate.Park(this.handle);
+        long h = 0;
+        long ticket = 0;
+        lock (this) {
+            h = this.handle;
+            if (h == 0) { return false; }
+            ticket = Gate.zan_gate_prepare(h);
+        }
+        if (ticket == 0) { return false; }
+        await Gate.Park(h, ticket);
         return true;
     }
 
     // 唤醒一个等待者；无等待者时暂存一次信号。
     public void Signal() {
-        if (this.handle == 0) { return; }
-        Gate.zan_gate_signal(this.handle);
+        lock (this) {
+            if (this.handle != 0) {
+                Gate.zan_gate_signal(this.handle);
+            }
+        }
     }
 
     // 唤醒全部等待者（Monitor.PulseAll 口径）；无等待者时暂存一次信号。
     public void SignalAll() {
-        if (this.handle == 0) { return; }
-        Gate.zan_gate_signal_all(this.handle);
+        lock (this) {
+            if (this.handle != 0) {
+                Gate.zan_gate_signal_all(this.handle);
+            }
+        }
     }
 
     // 释放运行时句柄；此后的 Wait 立即返回 false。
     public void Close() {
-        if (this.handle == 0) { return; }
-        long h = this.handle;
-        this.handle = 0;
+        long h = 0;
+        lock (this) {
+            if (this.handle == 0) { return; }
+            h = this.handle;
+            this.handle = 0;
+        }
         Gate.zan_gate_free(h);
     }
 

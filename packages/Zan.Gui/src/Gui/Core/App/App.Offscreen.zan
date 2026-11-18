@@ -48,6 +48,7 @@ public partial class App {
 
     // 离屏帧只重置本 App 的登记和表面，不泵系统事件或同步平台外壳。
     long offscreenOpenedEventSequence;
+    int offscreenForwardedFrameMs = -1;
 
     internal void BeginSnapshotFrame() { this.BeginOffscreenFrameCore(false); }
 
@@ -62,6 +63,9 @@ public partial class App {
         offscreenOpenedEventSequence = window.EventSeq();
         offscreenTooltip = Widget.Tooltip.Suspend();
         try {
+            frameCadence.SetRate(window.RefreshRate());
+            frameCadence.Begin(Stopwatch.GetMicroseconds());
+            offscreenForwardedFrameMs = -1;
             lastFrameMs = nowMs;
             if (!freezeAnimClock) { nowMs = Window.GetTickMs(); }
             needsRedraw = false;
@@ -125,8 +129,7 @@ public partial class App {
             this.RenderFrameOverlays();
             if (!this.ContinuePreparedFrame()) { return; }
             if (this.FxActive()) {
-                BackdropFx.PaintFx(this, canvas, this.EffectiveFx(), 0, 0,
-                    canvas.Width(), canvas.Height(), nowMs, theme, dpiScale);
+                this.PaintBackdropFx(nowMs);
                 BackdropFx.TakeDamage();
             }
             focus.UpdateImeSession();
@@ -143,20 +146,28 @@ public partial class App {
         }
     }
 
-    // 离屏帧的延迟绘制由可见宿主的事件循环兑现。
+    bool HasDueOffscreenFrame() {
+        return needsRedraw || (offscreenForwardedFrameMs >= 0 && Window.GetTickMs() >= offscreenForwardedFrameMs);
+    }
+
+    // 宿主可能在到期前因其他工作重绘。保留截止时间，直到离屏表面实际开帧。
     void ForwardOffscreenFrameRequests(App host) {
         if (window.GetHandle() != 0 || host == null || host == this) { return; }
-        if (needsRedraw) { host.RequestRedraw(); needsRedraw = false; }
-        int due = wakeFrameNextMs;
+        int now = Window.GetTickMs();
+        int due = offscreenForwardedFrameMs;
+        if (needsRedraw) {
+            host.RequestRedraw();
+            needsRedraw = false;
+            due = now;
+        }
+        if (wakeFrameNextMs >= 0 && (due < 0 || wakeFrameNextMs < due)) { due = wakeFrameNextMs; }
         if (animNextMs >= 0 && (due < 0 || animNextMs < due)) { due = animNextMs; }
         if (wakeNextMs >= 0 && (due < 0 || wakeNextMs < due)) { due = wakeNextMs; }
-        if (due >= 0) {
-            int delay = due - Window.GetTickMs();
-            host.RequestWakeFrameIn(delay < 0 ? 0 : delay);
-        }
-        wakeFrameNextMs = 0 - 1;
-        animNextMs = 0 - 1;
-        wakeNextMs = 0 - 1;
+        offscreenForwardedFrameMs = due;
+        if (due >= 0) { host.RequestWakeFrameIn(due <= now ? 0 : due - now); }
+        wakeFrameNextMs = -1;
+        animNextMs = -1;
+        wakeNextMs = -1;
     }
 
 }

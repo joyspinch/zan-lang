@@ -127,6 +127,7 @@ typedef struct {
     zan_istr_t ns_name;
     zan_istr_t orig_name;
     zan_ast_list_t *ns_usings;
+    zan_ast_node_t *delegate_host; /* enclosing type of a hoisted delegate */
 } zan_decl_meta_t;
 
 struct zan_ast_node {
@@ -159,6 +160,7 @@ struct zan_ast_node {
             struct zan_type *method_group_target; /* target, never an instance-specific candidate */
             bool is_type_receiver; /* nsresolve proved an explicit qualified type */
             int variance; /* 0: invariant, 1: covariant (out), -1: contravariant (in) */
+            const zan_ast_node_t *ns_decl; /* resolved static receiver across nsresolve passes */
         } ident;
 
         /* binary / assignment */
@@ -491,6 +493,7 @@ struct zan_ast_node {
             /* With rt_type set: NULL pins the declaration's lexical binding
              * (including generic bodies); otherwise valid only in this scope. */
             void *rt_scope;
+            const zan_ast_node_t *ns_decl; /* resolved type across nsresolve passes */
         } type_ref;
 
         struct {

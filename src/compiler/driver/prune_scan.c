@@ -472,15 +472,8 @@ static void pi_scan_file(pi_file_t *f) {
                                prev == TK_RBRACKET)) {
                 zan_token_t next = zan_lexer_peek(&lex);
                 if (next.kind == TK_IDENT) {
-                    if ((next.str_val.len == 5 && memcmp(next.str_val.str, "Route", 5) == 0) ||
-                        (next.str_val.len == 13 && memcmp(next.str_val.str, "ApiController", 13) == 0) ||
-                        (next.str_val.len == 5 && memcmp(next.str_val.str, "Table", 5) == 0) ||
-                        (next.str_val.len == 6 && memcmp(next.str_val.str, "Custom", 6) == 0) ||
-                        (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpGet", 7) == 0) ||
-                        (next.str_val.len == 8 && memcmp(next.str_val.str, "HttpPost", 8) == 0) ||
-                        (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpPut", 7) == 0) ||
-                        (next.str_val.len == 10 && memcmp(next.str_val.str, "HttpDelete", 10) == 0) ||
-                        (next.str_val.len == 9 && memcmp(next.str_val.str, "HttpPatch", 9) == 0) ||
+                    if (zan_mvc_is_route_pullin_attribute(next.str_val) ||
+                        zan_data_orm_is_table_marker(next.str_val) ||
                         (next.str_val.len == 4 && memcmp(next.str_val.str, "Test", 4) == 0)) {
                         f->has_controller = 1;
                     }
@@ -516,12 +509,8 @@ static void pi_scan_file(pi_file_t *f) {
                 zan_token_t next = zan_lexer_peek(&lex);
                 if (next.kind == TK_IDENT) {
                     tok = zan_lexer_next(&lex);
-                    if (tok.str_val.len >= 10 &&
-                        memcmp(tok.str_val.str + tok.str_val.len - 10, "Controller", 10) == 0) {
-                        f->has_controller = 1;
-                    }
-                    if (tok.str_val.len >= 3 &&
-                        memcmp(tok.str_val.str + tok.str_val.len - 3, "Dao", 3) == 0) {
+                    if (zan_mvc_has_controller_suffix(tok.str_val) ||
+                        zan_data_orm_keep_pullin_decl(tok.str_val)) {
                         f->has_controller = 1;
                     }
                     pi_name_t *name = pi_intern(tok.str_val.str,
@@ -592,10 +581,8 @@ static void pi_scan_file(pi_file_t *f) {
             pi_name_t *cur_id = pi_intern(tok.str_val.str,
                                           tok.str_val.len);
             if (prev == TK_COLON) {
-                if ((tok.str_val.len >= 10 &&
-                     memcmp(tok.str_val.str + tok.str_val.len - 10, "Controller", 10) == 0) ||
-                    (tok.str_val.len == 14 && memcmp(tok.str_val.str, "BaseRepository", 14) == 0) ||
-                    (tok.str_val.len == 7 && memcmp(tok.str_val.str, "BaseDao", 7) == 0)) {
+                if (zan_mvc_has_controller_suffix(tok.str_val) ||
+                    zan_data_orm_keep_pullin_base(tok.str_val)) {
                     f->has_controller = 1;
                 }
             }

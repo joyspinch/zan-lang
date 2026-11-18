@@ -293,8 +293,7 @@ public partial class App {
             bgSnapGen = 0;
             if (shapeShadow > 0) { this.PaintShapeShadow(); }
             this.PaintShapeFill();
-            // 异形背景只绘制上述静态形状；渐变壁纸与动态 Fx 不进入此分支。
-            // 仍记录主题渐变参数，防止切换渐变状态后复用旧主题基面。
+            // 这里只缓存静态轮廓和阴影，动态效果在呈现前单独合成。
             if (!partialFrame) {
                 c.SnapshotRect(0, 0, width, height, slot);
                 this.RememberShapeBackground(width, height, slot);
@@ -522,13 +521,41 @@ public partial class App {
         return theme.fx;
     }
 
-    // 当前皮肤的动画背景效果运行中时为 true。
-    // 异形窗口上绝不运行：效果层会合成到整个
-    // 表面，粒子会点亮轮廓之外
-    // 的透明像素而非设计本身。
+    // 普通窗口和单一圆角轮廓支持动态效果。圆角窗只在轮廓的实心内区合成。
     bool FxActive() {
         return fxEnabled && this.EffectiveFx() != 0 && !glassNative
-            && shapeMode == 0;
+            && (shapeMode == 0 || this.BackdropShape() != null);
+    }
+
+    private WindowShapeRegion BackdropShape() {
+        if (shapeRegions == null) { return null; }
+        WindowShapeRegion content = null;
+        for (int i = 0; i < shapeRegions.Count; i = i + 1) {
+            WindowShapeRegion region = shapeRegions[i];
+            if (region.kind == WindowShapeKind.ShadowBand) { continue; }
+            if (region.kind != WindowShapeKind.RoundedRect || content != null) { return null; }
+            content = region;
+        }
+        return content;
+    }
+
+    void PaintBackdropFx(int phaseMs) {
+        int x = 0;
+        int y = 0;
+        int width = canvas.Width();
+        int height = canvas.Height();
+        if (shapeMode != 0) {
+            WindowShapeRegion shape = this.BackdropShape();
+            if (shape == null) { return; }
+            PreparedShapeItem pixels = new PreparedShapeItem(shape, dpiScale);
+            // The opaque inner strip avoids drawing over corner and shadow alpha.
+            x = pixels.in1X1;
+            y = pixels.in1Y1;
+            width = pixels.in1X2 - x;
+            height = pixels.in1Y2 - y;
+        }
+        BackdropFx.PaintFx(this, canvas, this.EffectiveFx(), x, y, width, height,
+            phaseMs, theme, dpiScale);
     }
 
     // 启用/禁用此窗口皮肤的动态背景效果。
@@ -539,7 +566,7 @@ public partial class App {
         fxTouchedFull = false;
         if (!on) { fxNextMs = -1; }
         this.NoteRedrawWhy("SetBackdropFx");
-        needsRedraw = true;
+        this.RequestRedraw();
     }
 
     // 从 Gui 动画库（Gui.BackdropFx）中选择动态背景效果：
@@ -552,7 +579,7 @@ public partial class App {
         fxTouched = null;
         fxTouchedFull = false;
         this.NoteRedrawWhy("SetFxKind");
-        needsRedraw = true;
+        this.RequestRedraw();
     }
 
     // 纯效果帧：恢复上次完整渲染帧的快照，
@@ -618,8 +645,7 @@ public partial class App {
             perfFxRenderT0 = Window.GetTickUs();
         }
         int fxPhaseMs = Window.GetTickMs();
-        BackdropFx.PaintFx(this, fc, this.EffectiveFx(), 0, 0, cw, chh,
-                          fxPhaseMs, theme, dpiScale);
+        this.PaintBackdropFx(fxPhaseMs);
         // 本拍把屏幕上的特效相位推进到了 fxPhaseMs：记入 fxFrameMs，
         // 否则随后的损伤裁剪帧（悬停条带）仍按上一整帧的旧相位在
         // 条带内重合成特效，与条带外已在屏幕上的新相位错开——
@@ -689,10 +715,22 @@ public partial class App {
     }
 
     int FxIntervalMs() {
+        if (shapeMode != 0) { return BackdropFx.IntervalMs(this.EffectiveFx()); }
         return (int)Math.Ceiling(1000.0 / frameCadence.Rate());
     }
 
     void ScheduleFxFrame() {
+        // Layered windows present the entire composited surface. Run their
+        // decorative effects at the effect's own cadence independently of UI frames.
+        if (shapeMode != 0) {
+            displayFxPending = false;
+            int interval = this.FxIntervalMs();
+            // When a burst skipped its snapshot, the recovery frame must be
+            // far enough from the previous full frame to capture a new one.
+            if (!fxSnapValid) { interval = Math.Max(interval, 120); }
+            fxNextMs = Window.GetTickMs() + interval;
+            return;
+        }
         frameCadence.SetRate(window.RefreshRate());
         frameCadence.Begin(Stopwatch.GetMicroseconds());
         displayFxPending = window.RequestDisplayFrame();

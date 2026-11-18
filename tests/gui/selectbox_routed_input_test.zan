@@ -82,7 +82,12 @@ class SelectBoxRoutedInputTest {
         Binding<int> model = -1; box.Value = model;
         SelectInputState state = new SelectInputState(); state.Box = box;
         box.Open.AddS(state.Opened); box.Close.AddS(state.Closed); box.Change.AddS(state.Changed);
-        app.SetRootControl(box); box.UseApp(app); box.MeasureTree(app); box.Arrange(20, 20, 180, 32);
+        app.UseAppCss("select { padding: 3px 13px 1px 7px; } "
+            + "select::arrow { font-size: 10px; } select::clear { font-size: 12px; }");
+        box.Size.Set("tiny");
+        app.SetRootControl(box); box.UseApp(app); box.MeasureTree(app);
+        Check(box.prefH == app.theme.heightTiny, "bound tiny size uses the select style during measurement");
+        box.Arrange(20, 20, 180, 35);
         Click(app, box);
         Control popup = app.overlayHost.ActiveRoot();
         Check(box.IsOpen() && popup != null && state.Opens == 1, "zero Paint real head click mounts popup");
@@ -120,12 +125,9 @@ class SelectBoxRoutedInputTest {
         Click(app, box); Input(app, 9, 0, 0, 0);
         Check(!box.IsOpen(), "blur closes old session");
         box.Clearable(true); box.SetIndex(2); box.SyncBinding();
-        StyleBox headStyle = box.ResolveStyleAs(app, "select", box.StyleClass(), Style.SNormal());
-        StyleBox arrowStyle = box.ResolvePartAs(app, "select", "arrow", "", box.StyleClass(), Style.SNormal());
-        StyleBox clearStyle = box.ResolvePartAs(app, "select", "clear", "", box.StyleClass(), Style.SNormal());
-        int clearSize = clearStyle.FontOr(app.theme.iconSizeSmall);
-        int clearX = box.bx + box.bw - headStyle.PadROr(app.Scale(6))
-            - arrowStyle.FontOr(app.theme.iconSizeSmall) - app.Scale(4) - clearSize / 2;
+        // Right edge 200, then the authored 13px padding, 1px border,
+        // 10px arrow, theme gap, and half of the 12px clear slot.
+        int clearX = 170 - app.theme.gapSmall;
         int changes = state.Changes; int opens = state.Opens;
         Input(app, 2, clearX, box.by + box.bh / 2, 0);
         Input(app, 3, clearX, box.by + box.bh / 2, 0);
@@ -158,11 +160,80 @@ class SelectBoxRoutedInputTest {
         witness.Host = other; witness.Box = box; witness.Popup = popup;
         app.canvas.Destroy(); other.canvas.Destroy(); return witness;
     }
+    static void SamePixels(Canvas canvas, int x, int y, int w, int h, string part) {
+        for (int row = 0; row < h; row = row + 1) {
+            for (int col = 0; col < w; col = col + 1) {
+                if (canvas.GetPixel(x + col, y + row) != canvas.GetPixel(x + col, y + row + 80)) {
+                    Check(false, part + " uses the arranged content box");
+                    return;
+                }
+            }
+        }
+    }
+    static void TriggerPixels(App app, Control trigger, string caption, int font, int color, bool showClear) {
+        app.SetRootControl(trigger);
+        trigger.MeasureTree(app);
+        trigger.Arrange(20, 20, app.Scale(155), app.Scale(35));
+        if (showClear) { app.focus.SetHovered(trigger.WidgetId()); }
+        app.BeginOffscreenFrame();
+        trigger.RenderTree(app);
+        Canvas canvas = app.canvas;
+        int border = app.Scale(1);
+        int x = trigger.bx + app.Scale(7) + border;
+        int y = trigger.by + app.Scale(3) + border;
+        int h = trigger.bh - app.Scale(3) - app.Scale(1) - 2 * border;
+        int right = trigger.bx + trigger.bw - app.Scale(13) - border;
+        int arrow = app.Scale(10);
+        int clear = app.Scale(12);
+        int arrowX = right - arrow;
+        int clearX = arrowX - app.theme.gapSmall - clear;
+        int textW = (showClear ? clearX : arrowX) - x - app.theme.gapSmall;
+        canvas.FillRect(x, y + 80, right - x, h, 0xff506070);
+        canvas.DrawText(x, Canvas.CenterTextY(y + 80, h, font),
+                        Ellipsis.Fit(caption, textW, font), color, font);
+        canvas.DrawGlyphIn("chevron-down", arrowX, y + 80, arrow, h, arrow, 0xff2080e0);
+        SamePixels(canvas, x, y, textW, h, "trigger caption");
+        SamePixels(canvas, arrowX, y, arrow, h, "trigger arrow");
+        if (showClear) {
+            canvas.DrawGlyphIn("close", clearX, y + 80, clear, h, clear, 0xffb04060);
+            SamePixels(canvas, clearX, y, clear, h, "trigger clear icon");
+        }
+        app.EndOffscreenFrame();
+        app.SetRootControl(null);
+    }
+    static void VisualGeometry() {
+        App app = App.CreateOffscreen("Select trigger geometry", 420, 240);
+        app.EnableSkins();
+        app.reducedMotion = true;
+        string[] skins = new string[] { "porcelain", "graphite" };
+        string longLabel = "A long label that should stop before the arrow";
+        for (int i = 0; i < skins.Length; i = i + 1) {
+            int skin = app.SkinIndexOf(skins[i]);
+            Check(skin >= 0, "selection pixel fixture skin exists");
+            app.ApplySkin(skin);
+            app.SetOffscreenViewport(420, 240, i == 0 ? 100 : 125);
+            app.UseAppCss("select, select:hover { padding: 3px 13px 1px 7px; background: #506070; } "
+                + "select::arrow { font-size: 10px; color: #2080e0; } "
+                + "select::clear, select::clear:hover { font-size: 12px; color: #b04060; } "
+                + "select::placeholder { font-size: 11px; color: #467b90; }");
+            SelectBox box = new SelectBox(longLabel);
+            box.Size.Set("tiny");
+            TriggerPixels(app, box, longLabel, app.Scale(11), 0xff467b90, false);
+            box.AddOption(longLabel); box.SetIndex(0); box.Clearable(true);
+            TriggerPixels(app, box, longLabel, app.theme.fontSizeSmall, app.theme.textPrimary, true);
+            Dropdown<string> dropdown = new Dropdown<string>();
+            dropdown.ClassName = "large";
+            dropdown.Hint(longLabel);
+            TriggerPixels(app, dropdown, longLabel, app.Scale(11), 0xff467b90, false);
+        }
+        app.StopLoop(); app.canvas.Destroy();
+    }
     static void Main() {
         App frame = App.CreateOffscreen("unrelated frame App", 2, 2);
         SelectInputWitness witness = Exercise();
         Check(witness.Host == null && witness.Box == null && witness.Popup == null,
             "weak popup rows do not retain App or owner");
+        VisualGeometry();
         frame.canvas.Destroy(); Console.WriteLine("SELECTBOX_ROUTED_INPUT_OK");
     }
 }

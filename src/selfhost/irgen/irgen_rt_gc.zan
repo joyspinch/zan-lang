@@ -197,6 +197,7 @@ partial class Irgen {
         H("  %old = atomicrmw xchg i32* @zan.gc.lock, i32 0 seq_cst");
         H("  ret void");
         H("}");
+        EmitGcMutatorGate();
         H("define internal void @zan_gc_boot_locked() {");
         H("entry:");
         H("  store i64 1, i64* @zan.gc.booted");
@@ -507,6 +508,78 @@ partial class Irgen {
         H("}");
     }
 
+    // The host must cover all threads that can mutate managed references.
+    // A successful scan keeps the registry lock until scanning finishes,
+    // preventing the next mutator from entering the heap during the walk.
+    void EmitGcMutatorGate() {
+        H("@zan.gc.enabled = internal global i1 false");
+        H("@zan.gc.mutators = internal global i64 0");
+        H("@zan.gc.depth = internal thread_local global i64 0");
+        H("define void @zan_rt_heap_diagnostics_enable() {");
+        H("  call void @zan_gc_acquire()");
+        H("  store i1 true, i1* @zan.gc.enabled");
+        H("  call void @zan_gc_release()");
+        H("  ret void");
+        H("}");
+        H("define void @zan_rt_heap_mutator_enter() {");
+        H("entry:");
+        H("  %depth = load i64, i64* @zan.gc.depth");
+        H("  %next = add i64 %depth, 1");
+        H("  store i64 %next, i64* @zan.gc.depth");
+        H("  %first = icmp eq i64 %depth, 0");
+        H("  br i1 %first, label %register, label %done");
+        H("register:");
+        H("  call void @zan_gc_acquire()");
+        H("  %active = load i64, i64* @zan.gc.mutators");
+        H("  %more = add i64 %active, 1");
+        H("  store i64 %more, i64* @zan.gc.mutators");
+        H("  call void @zan_gc_release()");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+        H("define void @zan_rt_heap_mutator_leave() {");
+        H("entry:");
+        H("  %depth = load i64, i64* @zan.gc.depth");
+        H("  %missing = icmp eq i64 %depth, 0");
+        H("  br i1 %missing, label %invalid, label %pop");
+        H("invalid:");
+        H("  call void @exit(i32 1)");
+        H("  unreachable");
+        H("pop:");
+        H("  %next = sub i64 %depth, 1");
+        H("  store i64 %next, i64* @zan.gc.depth");
+        H("  %last = icmp eq i64 %next, 0");
+        H("  br i1 %last, label %unregister, label %done");
+        H("unregister:");
+        H("  call void @zan_gc_acquire()");
+        H("  %active = load i64, i64* @zan.gc.mutators");
+        H("  %fewer = sub i64 %active, 1");
+        H("  store i64 %fewer, i64* @zan.gc.mutators");
+        H("  call void @zan_gc_release()");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+        H("define internal i1 @zan_gc_scan_begin() {");
+        H("entry:");
+        H("  call void @zan_gc_acquire()");
+        H("  %enabled = load i1, i1* @zan.gc.enabled");
+        H("  %depth = load i64, i64* @zan.gc.depth");
+        H("  %in_heap = icmp ne i64 %depth, 0");
+        H("  %own = zext i1 %in_heap to i64");
+        H("  %active = load i64, i64* @zan.gc.mutators");
+        H("  %alone = icmp eq i64 %active, %own");
+        H("  %safe = and i1 %enabled, %alone");
+        H("  br i1 %safe, label %accept, label %reject");
+        H("accept:");
+        H("  ret i1 true");
+        H("reject:");
+        H("  call void @zan_gc_release()");
+        H("  ret i1 false");
+        H("}");
+    }
+
     // zan_gc_detect_cycles: the host's algorithm over the tracker. Nodes are
     // 5-word records {obj, rc, internal_rc, marked, size} indexed by registry
     // slot; dead slots carry obj=0 (and rc=-2 in pass 1). Roots are the
@@ -516,13 +589,15 @@ partial class Irgen {
     void EmitGcDetect() {
         H("define i64 @zan_gc_detect_cycles() {");
         H("entry:");
+        H("  %scan = call i1 @zan_gc_scan_begin()");
+        H("  br i1 %scan, label %locked, label %unavailable");
+        H("unavailable:");
+        H("  ret i64 -1");
+        H("locked:");
         H("  %d0 = load i8*, i8** @zan.gc.dict");
         H("  %nd = icmp eq i8* %d0, null");
-        H("  br i1 %nd, label %r0, label %go");
-        H("r0:");
-        H("  ret i64 0");
+        H("  br i1 %nd, label %rzero, label %go");
         H("go:");
-        H("  call void @zan_gc_acquire()");
         H("  %objs = load i8*, i8** @zan.gc.objs");
         H("  %sizes = load i8*, i8** @zan.gc.sizes");
         H("  %n = call i64 @zlist_count(i8* %objs)");
@@ -534,11 +609,17 @@ partial class Irgen {
         H("alloc:");
         H("  %nb = mul i64 %n, 40");
         H("  %raw = call i8* @malloc(i64 %nb)");
+        H("  %raw_nil = icmp eq i8* %raw, null");
+        H("  br i1 %raw_nil, label %oom, label %init");
+        H("oom:");
+        H("  call void @zan_gc_release()");
+        H("  ret i64 -1");
+        H("init:");
         H("  %nodes = bitcast i8* %raw to i64*");
         H("  store i64* %nodes, i64** @zan.gc.nodes");
         H("  br label %p1h");
         H("p1h:");
-        H("  %i1 = phi i64 [ 0, %alloc ], [ %i1n, %p1t ]");
+        H("  %i1 = phi i64 [ 0, %init ], [ %i1n, %p1t ]");
         H("  %c1 = icmp sge i64 %i1, %n");
         H("  br i1 %c1, label %p2h, label %p1b");
         H("p1b:");
@@ -619,12 +700,19 @@ partial class Irgen {
         H("p3init:");
         H("  %nb8 = mul i64 %n, 8");
         H("  %wraw = call i8* @malloc(i64 %nb8)");
+        H("  %wraw_nil = icmp eq i8* %wraw, null");
+        H("  br i1 %wraw_nil, label %worklist_oom, label %worklist_init");
+        H("worklist_oom:");
+        H("  call void @free(i8* %raw)");
+        H("  store i64* null, i64** @zan.gc.nodes");
+        H("  br label %oom");
+        H("worklist_init:");
         H("  %wl = bitcast i8* %wraw to i64*");
         H("  store i64* %wl, i64** @zan.gc.wl");
         H("  store i64 0, i64* @zan.gc.wtail");
         H("  br label %p3h");
         H("p3h:");
-        H("  %i3 = phi i64 [ 0, %p3init ], [ %i3n, %p3t ]");
+        H("  %i3 = phi i64 [ 0, %worklist_init ], [ %i3n, %p3t ]");
         H("  %c3 = icmp sge i64 %i3, %n");
         H("  br i1 %c3, label %bfsh, label %p3b");
         H("p3b:");
@@ -786,23 +874,32 @@ partial class Irgen {
         H("rm1:");
         H("  ret i64 -1");
         H("go:");
+        H("  %scan = call i1 @zan_gc_scan_begin()");
+        H("  br i1 %scan, label %locked, label %rm1");
+        H("locked:");
         H("  %d0 = load i8*, i8** @zan.gc.dict");
         H("  %nd = icmp eq i8* %d0, null");
         H("  br i1 %nd, label %r0, label %lock");
         H("r0:");
+        H("  call void @zan_gc_release()");
         H("  ret i64 0");
         H("lock:");
-        H("  call void @zan_gc_acquire()");
         H("  %objs = load i8*, i8** @zan.gc.objs");
         H("  %sizes = load i8*, i8** @zan.gc.sizes");
         H("  %n = call i64 @zlist_count(i8* %objs)");
         H("  %rows = add i64 " + k + ", 2");
         H("  %sbz = mul i64 %rows, 24");
         H("  %sraw = call i8* @malloc(i64 %sbz)");
+        H("  %sraw_nil = icmp eq i8* %sraw, null");
+        H("  br i1 %sraw_nil, label %oom, label %stats_init");
+        H("oom:");
+        H("  call void @zan_gc_release()");
+        H("  ret i64 -1");
+        H("stats_init:");
         H("  %stats = bitcast i8* %sraw to i64*");
         H("  br label %zh");
         H("zh:");
-        H("  %iz = phi i64 [ 0, %lock ], [ %izn, %zt ]");
+        H("  %iz = phi i64 [ 0, %stats_init ], [ %izn, %zt ]");
         H("  %cz = icmp sge i64 %iz, %rows");
         H("  br i1 %cz, label %ah, label %zb");
         H("zb:");

@@ -9,8 +9,8 @@ Validates scripts/package_mobile.ps1 across:
   5. iOS privacy descriptions injection in Info.plist
   6. HarmonyOS module.json5 permission declarations and pack.info structure
   7. End-to-end multi-platform dispatch (-Platform all)
-  8. Static security & environment variable audit on src/compiler/apk.c
-  9. App Store privacy audit on src/compiler/ipa.c
+  8. Static security & environment variable audit on src/packaging/apk.c
+  9. App Store privacy audit on src/packaging/ipa.c
 """
 from __future__ import annotations
 
@@ -119,9 +119,9 @@ def test_all_platforms_dry_run():
     print("  PASS: Multi-platform orchestration succeeded.")
 
 
-def test_compiler_apk_source_audit():
-    print("[8/9] Auditing src/compiler/apk.c keystore environment variables...")
-    apk_c = REPO_ROOT / "src" / "compiler" / "apk.c"
+def test_apk_source_audit():
+    print("[8/9] Auditing src/packaging/apk.c keystore environment variables...")
+    apk_c = REPO_ROOT / "src" / "packaging" / "apk.c"
     text = apk_c.read_text(encoding="utf-8")
     assert "ZAN_ANDROID_KEYSTORE" in text, "ZAN_ANDROID_KEYSTORE missing"
     assert "ZAN_ANDROID_KEYSTORE_PASS" in text, "ZAN_ANDROID_KEYSTORE_PASS missing"
@@ -129,9 +129,9 @@ def test_compiler_apk_source_audit():
     print("  PASS: apk.c supports commercial keystore environment configuration.")
 
 
-def test_compiler_ipa_source_audit():
-    print("[9/9] Auditing src/compiler/ipa.c App Store privacy strings...")
-    ipa_c = REPO_ROOT / "src" / "compiler" / "ipa.c"
+def test_ipa_source_audit():
+    print("[9/9] Auditing src/packaging/ipa.c App Store privacy strings...")
+    ipa_c = REPO_ROOT / "src" / "packaging" / "ipa.c"
     text = ipa_c.read_text(encoding="utf-8")
     assert "NSLocationWhenInUseUsageDescription" in text
     assert "NSFaceIDUsageDescription" in text
@@ -152,8 +152,8 @@ def main():
     test_ios_privacy_declarations()
     test_ohos_module_and_pack_info()
     test_all_platforms_dry_run()
-    test_compiler_apk_source_audit()
-    test_compiler_ipa_source_audit()
+    test_apk_source_audit()
+    test_ipa_source_audit()
     print("==========================================================")
     print("ALL 9 PACKAGING & SIGNING REGRESSION TESTS PASSED.")
     print("==========================================================")

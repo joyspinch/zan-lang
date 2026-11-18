@@ -10,7 +10,9 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Target/TargetMachine.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
@@ -237,4 +239,19 @@ extern "C" int zan_irgen_compactor_run(zan_irgen_compactor_t *compactor,
 
 extern "C" void zan_irgen_compactor_destroy(zan_irgen_compactor_t *compactor) {
     delete compactor;
+}
+
+extern "C" LLVMTargetMachineRef zan_create_emulated_tls_target_machine(
+    LLVMTargetRef target, const char *triple, const char *cpu,
+    const char *features, LLVMCodeGenOptLevel level) {
+    llvm::TargetOptions options;
+    options.EmulatedTLS = true;
+#if LLVM_VERSION_MAJOR >= 18
+    auto opt_level = static_cast<llvm::CodeGenOptLevel>(level);
+#else
+    auto opt_level = static_cast<llvm::CodeGenOpt::Level>(level);
+#endif
+    auto *machine = reinterpret_cast<llvm::Target *>(target)->createTargetMachine(
+        triple, cpu, features, options, llvm::Reloc::PIC_, {}, opt_level);
+    return reinterpret_cast<LLVMTargetMachineRef>(machine);
 }

@@ -6,7 +6,7 @@
 #   zan_embed_read(name)        -> NUL-terminated bytes (text resources)
 #   zan_embed_has(name)         -> 1/0
 #   zan_embed_bytes(name,&len)  -> raw pointer + length (binary resources)
-#   zan_embed_list(prefix)      -> '\n'-joined names with that prefix
+#   zan_embed_list_alloc(prefix) -> caller-owned, '\n'-joined name buffer
 #
 # Only the data lives here; the read API is either the always-linked
 # src\runtime\zan_embed_api.c or the copy zanc emits into a program that calls

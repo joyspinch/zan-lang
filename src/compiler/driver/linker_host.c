@@ -50,7 +50,6 @@
                     if (rt_inflate_obj) argv[a++] = rt_inflate_obj;
                     if (rt_timer_obj) argv[a++] = rt_timer_obj;
                     if (rt_crash_obj) argv[a++] = rt_crash_obj;
-                    if (rt_crypto_archive) argv[a++] = rt_crypto_archive;
                     argv[a++] = "-out-implib";
                     argv[a++] = implib;
                     char ldirbufs[ZAN_LINK_MAX_DIRS * 2 + 4][520]; int nld = 0;
@@ -92,25 +91,33 @@
                         argv[a++] = dllcrt[li];
                     }
                     if (rt_io_obj) argv[a++] = "-lws2_32";
-                    char libbufs[ZAN_LINK_MAX_LIBS][128]; int nb = 0;
-                    for (int li = 0; li < irgen.extern_lib_count; li++) {
-                        if (nb >= ZAN_LINK_MAX_LIBS ||
-                            a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
-                            link_cap_exceeded("DllImport libraries", ZAN_LINK_MAX_LIBS);
-                        int nlen;
-                        const char *nm = zan_dllimport_lname(
-                            irgen.extern_libs[li].str,
-                            (int)irgen.extern_libs[li].len, &nlen);
-                        if (!nm) continue;
-                        snprintf(libbufs[nb], sizeof(libbufs[0]),
-                                 "-l%.*s", nlen, nm);
-                        argv[a++] = libbufs[nb++];
+                    for (int ei = 0; ei < extra_link_input_count; ei++) {
+                        if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                            link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
+                        argv[a++] = extra_link_inputs[ei];
+                    }
+                    char libbufs[ZAN_LINK_MAX_LIBS][128];
+                    for (int li = 0; li < import_lib_count; li++) {
+                        if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                            link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
+                        snprintf(libbufs[li], sizeof(libbufs[0]), "-l%.*s",
+                                 import_lib_lens[li], import_libs[li]);
+                        argv[a++] = libbufs[li];
+                    }
+                    char explicit_libs[ZAN_LINK_MAX_LIBS][160];
+                    for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                        if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                            link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
+                        snprintf(explicit_libs[ei], sizeof(explicit_libs[0]), "-l%s",
+                                 extra_link_libs[ei]);
+                        argv[a++] = explicit_libs[ei];
                     }
                     for (int li = 0; li < static_driver_lib_count; li++) {
                         if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
                             link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                         argv[a++] = static_driver_libs[li];
                     }
+                    if (rt_crypto_archive) argv[a++] = rt_crypto_archive;
                     argv[a++] = "--end-group";
                     argv[a] = NULL;
                     if (getenv("ZAN_VERBOSE_LINK")) {
@@ -136,53 +143,33 @@
                                  zan_lib_dirs[di]);
                     }
                     for (int di = 0; di < extra_lib_path_count; di++) {
-                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
-                                 extra_lib_paths[di]);
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", extra_lib_paths[di]);
                     }
-                    for (int li = 0; li < irgen.extern_lib_count; li++) {
-                        int nlen;
-                        const char *nm = zan_dllimport_lname(
-                            irgen.extern_libs[li].str,
-                            (int)irgen.extern_libs[li].len, &nlen);
-                        if (!nm) continue;
-                        if (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS) {
-                            for (int d = 0; d < used_driver_count; d++) {
-                                if (used_driver_runtime[d] ||
-                                    used_driver_static[d] ||
-                                    used_driver_len[d] != nlen ||
-                                    memcmp(used_drivers[d], nm,
-                                           (size_t)nlen) != 0)
-                                    continue;
-                                char primary[1200], fallback[1200];
-                                snprintf(primary, sizeof(primary),
-                                         "%s/lib%.*s.dylib", driver_dirs[d],
-                                         nlen, nm);
-                                if (!zan_file_exists(primary) &&
-                                    zan_find_macos_driver_dylib(
-                                        driver_dirs[d], nm, nlen,
-                                        fallback, sizeof(fallback))) {
-                                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
-                                             fallback);
-                                    nm = NULL;
-                                }
-                                break;
-                            }
-                            if (!nm) continue;
-                        }
-                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s",
-                                 nlen, nm);
+                    for (int ei = 0; ei < extra_link_input_count; ei++) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", extra_link_inputs[ei]);
+                    }
+                    for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
+                    }
+                    for (int li = 0; li < import_lib_count; li++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
                     }
                     for (int li = 0; li < static_driver_lib_count; li++) {
                         cmd_appendf(cmd, sizeof(cmd), " %s",
                                  static_driver_libs[li]);
                     }
+                    if (rt_crypto_archive) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crypto_archive);
+                    }
                     if (getenv("ZAN_VERBOSE_LINK"))
                         fprintf(stderr, "[link] %s\n", cmd);
                     link_ret = system(cmd);
+                    lib_spawned = true;
 #endif
                 } else if (target.os == ZAN_OS_LINUX) {
                     snprintf(cmd, sizeof(cmd),
-                             "ld.lld -shared -o \"%s\" \"%s\"", obj_path, obj_tmp);
+                             "ld.lld -shared -o \"%s\" \"%s\"", shared_out, obj_tmp);
                     if (rt_io_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_io_obj);
@@ -222,14 +209,16 @@
                 } else if (target.os == ZAN_OS_MACOS) {
                     const char *march = (target.arch == ZAN_ARCH_AARCH64)
                                         ? "arm64" : "x86_64";
-                    char tbd[1200];
-                    snprintf(tbd, sizeof(tbd), "%s/macos/libSystem.tbd",
-                             exe_dir);
-                    if (!zan_file_exists(tbd)) {
+                    char system_tbd[1200], cxxabi_tbd[1200];
+                    snprintf(system_tbd, sizeof(system_tbd), "%s/macos/libSystem.tbd", exe_dir);
+                    snprintf(cxxabi_tbd, sizeof(cxxabi_tbd), "%s/macos/libc++abi.tbd", exe_dir);
+                    const char *missing_tbd = !zan_file_exists(system_tbd) ? system_tbd
+                                            : !zan_file_exists(cxxabi_tbd) ? cxxabi_tbd : NULL;
+                    if (missing_tbd) {
                         fprintf(stderr,
-                                "error: bundled macOS libSystem stub not found "
-                                "at '%s'; reinstall zan or rebuild with "
-                                "toolchain/macos present\n", tbd);
+                                "error: bundled Apple SDK stub not found at '%s'; "
+                                "reinstall zan or rebuild with toolchain/macos present\n",
+                                missing_tbd);
                         generated_object_vec_remove(&generated_objects, obj_tmp);
                         zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
@@ -240,8 +229,8 @@
                     }
                     snprintf(cmd, sizeof(cmd),
                              "ld64.lld -dylib -arch %s -platform_version macos "
-                             "11.0 11.0 -o \"%s\" \"%s\" \"%s\"",
-                             march, obj_path, obj_tmp, tbd);
+                             "11.0 11.0 -o \"%s\" \"%s\" \"%s\" \"%s\"",
+                             march, obj_path, obj_tmp, system_tbd, cxxabi_tbd);
                     if (rt_io_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_io_obj);
@@ -286,10 +275,16 @@
                                         ? "android-arm64" : "android-x64";
                     char sys3[1200];
                     snprintf(sys3, sizeof(sys3), "%s/%s", exe_dir3, asub3);
-                    char probe3[1300];
-                    snprintf(probe3, sizeof(probe3),
-                             "%s/android_native_app_glue.o", sys3);
-                    if (!zan_file_exists(probe3)) {
+                    bool needs_activity_glue = apk_path != NULL;
+                    for (int d = 0; d < used_driver_count && !needs_activity_glue; d++) {
+                        needs_activity_glue = used_driver_len[d] == 7 &&
+                                              memcmp(used_drivers[d], "zan_gui", 7) == 0;
+                    }
+                    char libc3[1300], glue3[1300];
+                    snprintf(libc3, sizeof(libc3), "%s/libc.so", sys3);
+                    snprintf(glue3, sizeof(glue3), "%s/android_native_app_glue.o", sys3);
+                    if (!zan_file_exists(libc3) ||
+                        (needs_activity_glue && !zan_file_exists(glue3))) {
                         fprintf(stderr,
                                 "error: bundled %s sysroot subset not found "
                                 "at '%s'; reinstall zan or rebuild with "
@@ -304,16 +299,23 @@
                         return 1;
                     }
                     snprintf(cmd, sizeof(cmd),
-                             "ld.lld -shared --no-undefined -o \"%s\""
-                             " \"%s/android_native_app_glue.o\" \"%s\"",
-                             obj_path, sys3, obj_tmp);
+                             "ld.lld -shared --no-undefined --eh-frame-hdr -o \"%s\" \"%s\"",
+                             obj_path, obj_tmp);
+                    if (needs_activity_glue)
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", glue3);
                     for (int di = 0; di < zan_lib_ndirs; di++) {
                         cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                                  zan_lib_dirs[di]);
                     }
+                    cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", sys3);
                     for (int di = 0; di < extra_lib_path_count; di++) {
-                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
-                                 extra_lib_paths[di]);
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", extra_lib_paths[di]);
+                    }
+                    for (int ei = 0; ei < extra_link_input_count; ei++) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", extra_link_inputs[ei]);
+                    }
+                    for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
                     }
                     if (rt_io_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -355,17 +357,8 @@
                         cmd_appendf(cmd, sizeof(cmd), " %s",
                                  static_driver_libs[li]);
                     }
-                    for (int li = 0; li < irgen.extern_lib_count; li++) {
-                        if (zan_win_system_lib(irgen.extern_libs[li].str,
-                                               (int)irgen.extern_libs[li].len))
-                            continue;
-                        int nlen;
-                        const char *nm = zan_dllimport_lname(
-                            irgen.extern_libs[li].str,
-                            (int)irgen.extern_libs[li].len, &nlen);
-                        if (!nm) continue;
-                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s",
-                                 nlen, nm);
+                    for (int li = 0; li < import_lib_count; li++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
                     }
                     { cmd_appendf(cmd, sizeof(cmd),
                                " \"%s/libc.so\" \"%s/libm.so\""
@@ -375,12 +368,13 @@
                                " \"%s/libandroid.so\" \"%s/libEGL.so\""
                                " \"%s/libGLESv2.so\" \"%s/libaaudio.so\"",
                                sys3, sys3, sys3, sys3); }
-                    { cmd_appendf(cmd, sizeof(cmd),
-                               " \"%s/libclang_rt.builtins.a\"",
-                               sys3); }
+                    cmd_appendf(cmd, sizeof(cmd),
+                                " \"%s/libc++abi.a\" \"%s/libunwind.a\""
+                                " \"%s/libclang_rt.builtins.a\"", sys3, sys3, sys3);
                     if (getenv("ZAN_VERBOSE_LINK"))
                         fprintf(stderr, "[link] %s\n", cmd);
                     link_ret = system(cmd);
+                    lib_spawned = true;
                 } else if (target.os == ZAN_OS_OHOS) {
                     const char *osub = (target.arch == ZAN_ARCH_AARCH64)
                                        ? "ohos-arm64" : "ohos-x64";
@@ -405,7 +399,7 @@
                     snprintf(cmd, sizeof(cmd),
                              "ld.lld -shared -o \"%s\" \"%s/zap_main.o\""
                              " \"%s\" \"%s/libclang_rt.builtins.a\"",
-                             obj_path, sys4, obj_tmp, sys4);
+                             shared_out, sys4, obj_tmp, sys4);
                     /* OHOS 的 GUI 驱动是**预编译产物**（仓库里只有 .a/.so，没有
                        源码），它直接调用 EGL/GLES 与 FreeType。链接期要的是
                        **OHOS NDK 里的同名库**（设备系统提供真库，链接只需要它们
@@ -479,9 +473,30 @@
                         cmd_appendf(cmd, sizeof(cmd),
                                  " \"%s/zan_inflate.o\"", sys4);
                     }
+                    cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", sys4);
+                    for (int di = 0; di < zan_lib_ndirs; di++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", zan_lib_dirs[di]);
+                    }
+                    for (int di = 0; di < extra_lib_path_count; di++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", extra_lib_paths[di]);
+                    }
+                    for (int ei = 0; ei < extra_link_input_count; ei++) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", extra_link_inputs[ei]);
+                    }
+                    for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
+                    }
+                    for (int li = 0; li < import_lib_count; li++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
+                    }
+                    for (int li = 0; li < static_driver_lib_count; li++) {
+                        cmd_appendf(cmd, sizeof(cmd), " %s", static_driver_libs[li]);
+                    }
                     if (getenv("ZAN_VERBOSE_LINK"))
                         fprintf(stderr, "[link] %s\n", cmd);
-                    link_ret = system(cmd);
+                    link_ret = zan_link_elf_shared(cmd, sizeof(cmd), &irgen, live_imports,
+                                                  elf_diagnostics);
+                    lib_spawned = true;
                 } else {
                     fprintf(stderr, "error: shared libraries are not supported "
                             "for this target yet\n");
@@ -499,21 +514,25 @@
                                  zan_lib_dirs[di]);
                     }
                     for (int di = 0; di < extra_lib_path_count; di++) {
-                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
-                                 extra_lib_paths[di]);
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", extra_lib_paths[di]);
                     }
-                    for (int li = 0; li < irgen.extern_lib_count; li++) {
-                        if (target.os != ZAN_OS_WINDOWS &&
-                            zan_win_system_lib(irgen.extern_libs[li].str,
-                                               (int)irgen.extern_libs[li].len))
-                            continue;
-                        int nlen;
-                        const char *nm = zan_dllimport_lname(
-                            irgen.extern_libs[li].str,
-                            (int)irgen.extern_libs[li].len, &nlen);
-                        if (!nm) continue;
-                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s",
-                                 nlen, nm);
+                    for (int ei = 0; ei < extra_link_input_count; ei++) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", extra_link_inputs[ei]);
+                    }
+                    for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
+                    }
+                    if (target.os == ZAN_OS_LINUX) {
+                        for (int d = 0; d < cross_archive_count; d++) {
+                            cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_archives[d]);
+                        }
+                    } else if (target.os == ZAN_OS_MACOS) {
+                        for (int d = 0; d < cross_dylib_count; d++) {
+                            cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_dylibs[d]);
+                        }
+                    }
+                    for (int li = 0; li < import_lib_count; li++) {
+                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
                     }
                     for (int li = 0; li < static_driver_lib_count; li++) {
                         cmd_appendf(cmd, sizeof(cmd), " %s",
@@ -521,6 +540,16 @@
                     }
                     if (getenv("ZAN_VERBOSE_LINK"))
                         fprintf(stderr, "[link] %s\n", cmd);
-                    link_ret = system(cmd);
+                    link_ret = check_elf_imports
+                        ? zan_link_elf_shared(cmd, sizeof(cmd), &irgen, live_imports,
+                                              elf_diagnostics)
+                        : system(cmd);
+                }
+                if (check_elf_imports && live_imports) {
+                    if (link_ret == 0 && !publish_link_output(shared_out, obj_path)) {
+                        fprintf(stderr, "error: cannot publish linked output '%s'\n", obj_path);
+                        link_ret = 1;
+                    }
+                    if (link_ret != 0) remove(shared_out);
                 }
             }

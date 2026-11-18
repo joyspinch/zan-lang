@@ -554,8 +554,12 @@ static unsigned char *read_all(const char *path, size_t *len) {
 static int write_all(const char *path, const unsigned char *d, size_t n) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    if (n > 0 && fwrite(d, 1, n, f) != n) { fclose(f); return -1; }
-    fclose(f);
+    int ok = n == 0 || fwrite(d, 1, n, f) == n;
+    int close_status = fclose(f);
+    if (!ok || close_status != 0) {
+        remove(path);
+        return -1;
+    }
     return 0;
 }
 
@@ -908,9 +912,7 @@ success_zip: ;
                             "%s.unsigned", apk_path) != 0) {
             remove(tmp_apk); return 1;
         }
-        remove(keep);
-        rename(tmp_apk, keep);
-        fprintf(stderr, "  (unsigned package kept at %s)\n", keep);
+        if (rename(tmp_apk, keep) != 0) remove(tmp_apk);
         return 1;
     }
     remove(tmp_apk);

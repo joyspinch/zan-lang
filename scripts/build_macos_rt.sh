@@ -8,6 +8,7 @@
 # stub is enough to link them.
 #
 #   scripts/build_macos_rt.sh [path-to-zig]
+#   scripts/build_macos_rt.sh path-to-zig --ios-entry-only [output-dir]
 #
 # 契约：工程辅助自动化与脚本执行规范
 # committed (they are our own code; *.o is gitignored, so `git add -f` them).
@@ -23,7 +24,14 @@ ACCEL="$ROOT/src/accel"
 EMBED="$ROOT/src/embed"
 DRV="$ROOT/src/drivers"
 
-for pair in arm64:aarch64 x64:x86_64; do
+macos_targets='arm64:aarch64 x64:x86_64'
+ios_out="$ROOT/toolchain/ios/arm64"
+if [ "${2:-}" = '--ios-entry-only' ]; then
+    macos_targets=
+    ios_out=${3:-$ios_out}
+fi
+
+for pair in $macos_targets; do
     sub=${pair%%:*}
     arch=${pair#*:}
     out="$ROOT/toolchain/macos/$sub"
@@ -100,9 +108,11 @@ if [ ! -f "$IOSHDR/pthread.h" ]; then
     echo "iOS Darwin headers not found next to Zig: $IOSHDR" >&2
     exit 1
 fi
-mkdir -p "$ROOT/toolchain/ios/arm64"
+mkdir -p "$ios_out"
+"$ZIG" cc -target aarch64-ios.14.0 -I "$IOSHDR" -g0 -std=c11 -fPIC \
+    -I "$RT" -O2 -c "$RT/rt_crash.c" -o "$ios_out/zanrt_crash.o"
 "$ZIG" cc -target aarch64-ios.14.0 -I "$IOSHDR" -g0 -std=c11 -fPIC \
     -DZAN_GUI_IOS -DZAN_GUI_STATIC -I "$RT" -I "$DRV" -O2 -ffunction-sections -fdata-sections \
-    -c "$DRV/gui/gui_runtime.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
-echo "built toolchain/ios/arm64: zanrt_gui.o"
+    -c "$DRV/gui/gui_runtime.c" -o "$ios_out/zanrt_gui.o"
+echo "built $ios_out: zanrt_gui.o zanrt_crash.o"
 

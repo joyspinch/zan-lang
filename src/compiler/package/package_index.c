@@ -92,6 +92,8 @@ static void pkg_index_source_tree_collect(pkg_probe_list_t *list,
     for (int i = 0; i < ent->count; i++) {
         const char *name = ent->names[i];
         if (!pkg_safe_component(name)) continue;
+        /* The lock's tree checksum excludes Git metadata. */
+        if (package->locked && strcmp(name, ".git") == 0) continue;
         char path[1024];
         if (snprintf(path, sizeof(path), "%s" PATH_SEP "%s", dir, name)
             >= (int)sizeof(path)) continue;
@@ -141,6 +143,22 @@ static bool pkg_mark_seen(pkg_seen_names_t *seen, const char *name) {
     return true;
 }
 
+static void pkg_index_add_package(zan_pkg_source_index_t *index, const char *store,
+                                  const char *name, const char *root,
+                                  zan_pkg_namespace_probe_t probe, int project_owned,
+                                  bool locked, pkg_probe_list_t *list) {
+    char source[1024];
+    pkg_package_source_dir(root, source, sizeof(source));
+    pkg_index_package_t *package = (pkg_index_package_t *)malloc(sizeof(*package));
+    if (!package) zan_host_oom();
+    package->store = pkg_index_copy(store);
+    package->name = pkg_index_copy(name);
+    package->locked = locked;
+    package->next = index->packages;
+    index->packages = package;
+    pkg_index_source_tree_collect(list, package, source, probe, 0, source, project_owned);
+}
+
 static void pkg_index_store(zan_pkg_source_index_t *index, const char *store,
                              zan_pkg_namespace_probe_t probe,
                              pkg_seen_names_t *seen, int project_owned,
@@ -152,33 +170,11 @@ static void pkg_index_store(zan_pkg_source_index_t *index, const char *store,
     for (int i = 0; i < n; i++) {
         const char *name = names[i];
         if (!pkg_safe_component(name)) continue;
-        char root[1024], source[1024];
+        char root[1024];
         if (snprintf(root, sizeof(root), "%s" PATH_SEP "%s", store, name)
             >= (int)sizeof(root)) continue;
-#ifdef _WIN32
-        DWORD attr = GetFileAttributesA(root);
-        if (attr == INVALID_FILE_ATTRIBUTES ||
-            (attr & FILE_ATTRIBUTE_REPARSE_POINT) ||
-            !(attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
-#else
-        struct stat st;
-        if (lstat(root, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-#endif
-        if (snprintf(source, sizeof(source), "%s" PATH_SEP "src", root)
-            >= (int)sizeof(source)) continue;
-        if (!pkg_is_dir(source)) {
-            if (snprintf(source, sizeof(source), "%s" PATH_SEP "stdlib", root)
-                >= (int)sizeof(source)) continue;
-            if (!pkg_is_dir(source)) snprintf(source, sizeof(source), "%s", root);
-        }
-        if (!pkg_mark_seen(seen, name)) continue;
-        pkg_index_package_t *package = (pkg_index_package_t *)malloc(sizeof(*package));
-        package->store = pkg_index_copy(store);
-        package->name = pkg_index_copy(name);
-        package->next = index->packages;
-        index->packages = package;
-        pkg_index_source_tree_collect(list, package, source, probe, 0, source,
-                                       project_owned);
+        if (!pkg_plain_dir(root) || !pkg_mark_seen(seen, name)) continue;
+        pkg_index_add_package(index, store, name, root, probe, project_owned, false, list);
     }
     pkg_dir_names_free(names, n);
 }
@@ -359,26 +355,25 @@ static int pkg_canon_dup(char canon[][1024], int count, const char *raw) {
     return 0;
 }
 
-zan_pkg_source_index_t *zan_pkg_source_index_create(
-    const char *project_dir, zan_pkg_namespace_probe_t probe) {
-    if (!project_dir || !project_dir[0] || !probe) return NULL;
-    zan_pkg_source_index_t *index = (zan_pkg_source_index_t *)calloc(1, sizeof(*index));
+static void pkg_index_loose_stores(zan_pkg_source_index_t *index,
+                                  const char *project_dir,
+                                  zan_pkg_namespace_probe_t probe,
+                                  pkg_probe_list_t *list) {
     char store[1024];
     /* 候选 store 根常互相重合（exe 目录旁的 ..\packages 就是项目的
      * packages/）：先规范化再去重，重复根不再做整树枚举。 */
     char canon[6][1024];
     int canon_count = 0;
     pkg_seen_names_t seen = {0};
-    pkg_probe_list_t list = {0};
     snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
     if (!pkg_canon_dup(canon, canon_count, store)) {
         canon_count++;
-        pkg_index_store(index, store, probe, &seen, 1, &list);
+        pkg_index_store(index, store, probe, &seen, 1, list);
     }
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
     if (!pkg_canon_dup(canon, canon_count, store)) {
         canon_count++;
-        pkg_index_store(index, store, probe, &seen, 1, &list);
+        pkg_index_store(index, store, probe, &seen, 1, list);
     }
     char exe_dir[1024] = {0};
 #ifdef _WIN32
@@ -387,12 +382,12 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
         snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
         if (!pkg_canon_dup(canon, canon_count, store)) {
             canon_count++;
-            pkg_index_store(index, store, probe, &seen, 1, &list);
+            pkg_index_store(index, store, probe, &seen, 1, list);
         }
         snprintf(store, sizeof(store), "%s\\packages", exe_dir);
         if (!pkg_canon_dup(canon, canon_count, store)) {
             canon_count++;
-            pkg_index_store(index, store, probe, &seen, 1, &list);
+            pkg_index_store(index, store, probe, &seen, 1, list);
         }
     }
 #elif defined(__APPLE__)
@@ -402,7 +397,7 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
         if (!pkg_canon_dup(canon, canon_count, store)) {
             canon_count++;
-            pkg_index_store(index, store, probe, &seen, 1, &list);
+            pkg_index_store(index, store, probe, &seen, 1, list);
         }
     }
 #else
@@ -413,12 +408,33 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
         if (!pkg_canon_dup(canon, canon_count, store)) {
             canon_count++;
-            pkg_index_store(index, store, probe, &seen, 1, &list);
+            pkg_index_store(index, store, probe, &seen, 1, list);
         }
     }
 #endif
     if (zan_pkg_global_store(store, sizeof(store)))
-        pkg_index_store(index, store, probe, &seen, 0, &list);
+        pkg_index_store(index, store, probe, &seen, 0, list);
+    for (int i = 0; i < seen.count; i++) free(seen.names[i]);
+    free(seen.names);
+}
+
+zan_pkg_source_index_t *zan_pkg_source_index_create(
+    const char *project_dir, zan_pkg_namespace_probe_t probe) {
+    if (!project_dir || !project_dir[0] || !probe) return NULL;
+    zan_pkg_source_index_t *index = (zan_pkg_source_index_t *)calloc(1, sizeof(*index));
+    if (!index) zan_host_oom();
+    pkg_probe_list_t list = {0};
+    const zan_pkg_registry_t *lock = pkg_project_lock(project_dir);
+    if (lock) {
+        for (int i = 0; i < lock->resolved_count; i++) {
+            const zan_package_t *pkg = lock->resolved[i];
+            char root[1024];
+            if (pkg_locked_dir(lock, pkg, root, sizeof(root)))
+                pkg_index_add_package(index, lock->cache_dir, pkg->name, root, probe, 1, true, &list);
+        }
+    } else {
+        pkg_index_loose_stores(index, project_dir, probe, &list);
+    }
     /* 阶段二：并行 probe + 按走树原次序注册 */
     pkg_index_build_from_items(index, &list, probe);
     pkg_probe_list_free(&list);
@@ -427,8 +443,6 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
     g_pkg_dirs_total = 0;
     g_pkg_dirs_uniform = 0;
     g_pkg_probe_calls = 0;
-    for (int i = 0; i < seen.count; i++) free(seen.names[i]);
-    free(seen.names);
     return index;
 }
 
@@ -549,10 +563,27 @@ static int pkg_store_source_roots(const char *store,
     return count;
 }
 
+static int pkg_locked_roots(const zan_pkg_registry_t *lock,
+                            char (*out)[1024], int max_roots, bool sources) {
+    int count = 0;
+    for (int i = 0; i < lock->resolved_count && count < max_roots; i++) {
+        char dir[1024];
+        if (!pkg_locked_dir(lock, lock->resolved[i], dir, sizeof(dir))) continue;
+        if (sources)
+            pkg_package_source_dir(dir, out[count], sizeof(*out));
+        else
+            snprintf(out[count], sizeof(*out), "%s", dir);
+        count++;
+    }
+    return count;
+}
+
 int zan_pkg_all_source_roots(const char *project_dir,
                              char (*out_roots)[1024], int max_roots) {
     if (!project_dir || !project_dir[0] || !out_roots || max_roots <= 0)
         return 0;
+    const zan_pkg_registry_t *lock = pkg_project_lock(project_dir);
+    if (lock) return pkg_locked_roots(lock, out_roots, max_roots, true);
     char store[1024];
     int count = 0;
     if (project_dir && project_dir[0]) {
@@ -627,6 +658,8 @@ int zan_pkg_all_manifest_dirs(const char *project_dir,
                               char (*out_dirs)[1024], int max_dirs) {
     if (!project_dir || !project_dir[0] || !out_dirs || max_dirs <= 0)
         return 0;
+    const zan_pkg_registry_t *lock = pkg_project_lock(project_dir);
+    if (lock) return pkg_locked_roots(lock, out_dirs, max_dirs, false);
     char store[1024];
     int count = 0;
     if (project_dir && project_dir[0]) {

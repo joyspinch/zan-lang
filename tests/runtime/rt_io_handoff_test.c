@@ -93,6 +93,8 @@ static void run_failed_registration(void) {
     drain(1);
     close(fd);
 }
+#include "rt_co_sched_checks.h"
+
 int main(void) {
     setenv("ZAN_CO_WORKERS", "1", 1);
     zan_co_sched_init();
@@ -104,7 +106,8 @@ int main(void) {
     run_failed_registration();
     CHECK(observations >= 8 && resumed == 10);
     run_owner_checks();
-    zan_io_shutdown();
-    if (!failures) puts("PASS Linux reactor handoff, batch accounting and close notification");
+    run_co_sched_checks();
+    run_join_checks();
+    if (!failures) puts("PASS Linux reactor handoff, scheduler progress and join fan-out");
     return failures != 0;
 }

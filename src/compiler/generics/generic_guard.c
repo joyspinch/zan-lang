@@ -454,10 +454,10 @@ LLVMValueRef emit_index_i64(zan_irgen_t *g, LLVMValueRef value,
     if (width > 64) return LLVMBuildTrunc(g->builder, value, i64, name);
     return value;
 }
-void emit_index_range_check(zan_irgen_t *g, LLVMValueRef index,
+LLVMValueRef emit_index_range_check(zan_irgen_t *g, LLVMValueRef index,
                                    LLVMValueRef length, bool allow_end,
                                    zan_loc_t loc, const char *kind) {
-    if (!g->runtime_checks || !g->current_fn) return;
+    if (!g->runtime_checks || !g->current_fn) return NULL;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     index = emit_index_i64(g, index, "idx.i64");
     length = emit_index_i64(g, length, "len.i64");
@@ -470,11 +470,12 @@ void emit_index_range_check(zan_irgen_t *g, LLVMValueRef index,
     char msg[96];
     snprintf(msg, sizeof(msg), "%s index out of bounds", kind ? kind : "array");
     emit_runtime_check(g, bad, loc, msg);
+    return bad;
 }
-void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
+LLVMValueRef emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
                                     LLVMValueRef length, zan_loc_t loc,
                                     const char *kind) {
-    emit_index_range_check(g, index, length, false, loc, kind);
+    return emit_index_range_check(g, index, length, false, loc, kind);
 }
 
 /* A507 越界写保护（TASKS.md）：与 emit_index_range_check 同一谓词，但把

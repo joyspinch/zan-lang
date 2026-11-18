@@ -109,12 +109,23 @@ void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena) {
 
 typedef struct {
     zan_ast_node_t *decl;
-    zan_istr_t simple;
-    zan_istr_t ns;       /* namespace ("" if global) */
-    zan_istr_t full;     /* ns.simple, or simple if global */
-    zan_istr_t final;
+    zan_istr_t simple;   /* source name before renaming */
+    zan_istr_t full;     /* namespace, enclosing types, and source name */
+    zan_istr_t alias;    /* legacy namespace + short name for nested types */
+    zan_istr_t final;    /* flat name used by the binder */
     bool conflicting;
 } nr_type_t;
+
+typedef enum { NR_SIMPLE, NR_FULL, NR_ALIAS, NR_FINAL } nr_key_t;
+
+static zan_istr_t nr_key(const nr_type_t *t, nr_key_t key) {
+    switch (key) {
+    case NR_FULL: return t->full;
+    case NR_ALIAS: return t->alias;
+    case NR_FINAL: return t->final;
+    default: return t->simple;
+    }
+}
 
 typedef struct {
     zan_istr_t *items;
@@ -158,6 +169,9 @@ typedef struct {
     nr_shadow_t fields;
     nr_index_t by_full;
     nr_index_t by_simple;
+    nr_index_t by_alias;
+    nr_index_t by_final;
+    const nr_type_t *owner;
     zp_refs_t *refs;
     /* 数组的元素类型节点与外层的包装节点**同名**：包装节点已经报过
      * "ambiguous type"，元素节点再报一遍就是同一条诊断出现两次。解析元素
@@ -169,7 +183,7 @@ typedef struct {
 } nr_ctx_t;
 
 static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
-                           int key_is_full, zan_arena_t *arena) {
+                           nr_key_t key, zan_arena_t *arena) {
     int nb = 16;
     while (nb < count * 2) nb <<= 1;
     ix->mask = (uint32_t)(nb - 1);
@@ -179,7 +193,8 @@ static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
     ix->count = 0;
     for (int i = 0; i < nb; i++) ix->buckets[i] = -1;
     for (int i = 0; i < count; i++) {
-        zan_istr_t k = key_is_full ? items[i].full : items[i].simple;
+        zan_istr_t k = nr_key(&items[i], key);
+        if (!k.len) continue;
         uint32_t b = nr_hash(k) & ix->mask;
         ix->chains[ix->count].idx = i;
         ix->chains[ix->count].next = ix->buckets[b];
@@ -187,14 +202,12 @@ static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
     }
 }
 
-static int nr_index_find(nr_index_t *ix, nr_type_t *items, int key_is_full,
+static int nr_index_find(nr_index_t *ix, nr_type_t *items, nr_key_t kind,
                          zan_istr_t key) {
     int best = -1;
     for (int node = ix->buckets[nr_hash(key) & ix->mask]; node >= 0;
          node = ix->chains[node].next) {
-        zan_istr_t k = key_is_full ? items[ix->chains[node].idx].full
-                                   : items[ix->chains[node].idx].simple;
-        if (ns_istr_eq(k, key)) {
+        if (ns_istr_eq(nr_key(&items[ix->chains[node].idx], kind), key)) {
             int idx = ix->chains[node].idx;
             if (best < 0 || idx < best) best = idx;
         }
@@ -229,7 +242,7 @@ static bool is_type_decl_kind(zan_ast_kind_t k) {
            k == AST_DELEGATE_DECL;
 }
 
-static zan_istr_t decl_simple_name(zan_ast_node_t *d) {
+static zan_istr_t decl_simple_name(const zan_ast_node_t *d) {
     if (d->kind == AST_DELEGATE_DECL) return d->method_decl.name;
     return d->type_decl.name;
 }
@@ -239,9 +252,50 @@ static void decl_set_name(zan_ast_node_t *d, zan_istr_t name) {
     else d->type_decl.name = name;
 }
 
-static nr_type_t *find_full(nr_ctx_t *c, zan_istr_t full) {
-    int i = nr_index_find(&c->by_full, c->items, 1, full);
+static zan_ast_node_t *decl_owner(const zan_ast_node_t *decl) {
+    if (decl->kind == AST_DELEGATE_DECL)
+        return decl->meta ? decl->meta->delegate_host : NULL;
+    return decl->type_decl.nested_host;
+}
+
+static zan_istr_t decl_source_name(zan_ast_node_t *decl) {
+    zan_istr_t name = zan_ast_orig_name(decl);
+    return name.len ? name : decl_simple_name(decl);
+}
+
+static zan_istr_t decl_full_name(zan_arena_t *arena, zan_ast_node_t *decl) {
+    zan_ast_node_t *owner = decl_owner(decl);
+    zan_istr_t prefix = owner ? decl_full_name(arena, owner) : zan_ast_ns_name(decl);
+    return join_ns(arena, prefix, decl_source_name(decl));
+}
+
+static bool same_decl_identity(const nr_type_t *a, const nr_type_t *b) {
+    /* A textual path can cross the namespace boundary at different points. */
+    return ns_istr_eq(a->full, b->full) &&
+           ns_istr_eq(zan_ast_ns_name(a->decl), zan_ast_ns_name(b->decl));
+}
+
+static nr_type_t *find_full_exact(nr_ctx_t *c, zan_istr_t full) {
+    int i = nr_index_find(&c->by_full, c->items, NR_FULL, full);
     return i >= 0 ? &c->items[i] : NULL;
+}
+
+static nr_type_t *find_full(nr_ctx_t *c, zan_istr_t full) {
+    nr_type_t *exact = find_full_exact(c, full);
+    if (exact) return exact;
+
+    /* A nested type was historically visible through its namespace alone.
+     * Keep that spelling when it identifies only one declaration identity. */
+    nr_type_t *found = NULL;
+    nr_index_t *ix = &c->by_alias;
+    for (int node = ix->buckets[nr_hash(full) & ix->mask]; node >= 0;
+         node = ix->chains[node].next) {
+        nr_type_t *t = &c->items[ix->chains[node].idx];
+        if (!ns_istr_eq(t->alias, full)) continue;
+        if (found && !same_decl_identity(found, t)) return NULL;
+        found = t;
+    }
+    return found;
 }
 
 static nr_type_t *find_full_joined(nr_ctx_t *c, zan_istr_t a, zan_istr_t b) {
@@ -263,6 +317,33 @@ static nr_type_t *find_full_joined(nr_ctx_t *c, zan_istr_t a, zan_istr_t b) {
     nr_type_t *res = find_full(c, key);
     if (p != buf) free(p);
     return res;
+}
+
+static nr_type_t *find_lexical_type(nr_ctx_t *c, zan_istr_t name) {
+    if (!c->owner) return NULL;
+    zan_istr_t prefix = c->owner->full;
+    for (zan_ast_node_t *owner = c->owner->decl; owner; owner = decl_owner(owner)) {
+        nr_type_t *t = find_full_joined(c, prefix, name);
+        if (t) return t;
+        while (prefix.len > 0 && prefix.str[prefix.len - 1] != '.') prefix.len--;
+        if (prefix.len > 0) prefix.len--;
+    }
+    return NULL;
+}
+
+static nr_type_t *find_final(nr_ctx_t *c, zan_istr_t name) {
+    int i = nr_index_find(&c->by_final, c->items, NR_FINAL, name);
+    return i >= 0 ? &c->items[i] : NULL;
+}
+
+static nr_type_t *find_namespace_type(nr_ctx_t *c, zan_istr_t ns, zan_istr_t name) {
+    for (;;) {
+        nr_type_t *t = find_full_joined(c, ns, name);
+        if (t || ns.len == 0) return t;
+        while (ns.len > 0 && ns.str[ns.len - 1] != '.') ns.len--;
+        if (ns.len == 0) return NULL;
+        ns.len--;
+    }
 }
 
 static zan_istr_t flatten_qname_buf(zan_ast_node_t *q, char *buf, size_t buf_cap, char **out_heap) {
@@ -350,22 +431,32 @@ static int decl_type_param_count(const zan_ast_node_t *d) {
     return d->type_decl.type_params.count;
 }
 
-static bool arity_matches(const zan_ast_node_t *tr, const nr_type_t *t) {
-    return decl_type_param_count(t->decl) == tr->type_ref.type_args.count;
+static nr_type_t *find_imported_type(nr_ctx_t *c, const zan_ast_list_t *usings,
+                                     zan_istr_t name, int arity) {
+    if (!usings) return NULL;
+    char buf[256];
+    for (int i = 0; i < usings->count; i++) {
+        zan_ast_node_t *u = usings->items[i];
+        if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
+        char *heap = NULL;
+        zan_istr_t ns = flatten_qname_buf(u->using_decl.name, buf, sizeof(buf), &heap);
+        nr_type_t *t = find_full_joined(c, ns, name);
+        free(heap);
+        if (t && (arity < 0 || decl_type_param_count(t->decl) == arity)) return t;
+    }
+    return NULL;
 }
 
-static int count_simple_matching(nr_ctx_t *c, zan_istr_t simple,
-                                 const zan_ast_node_t *tr) {
-    int want = tr->type_ref.type_args.count;
-    int n = 0;
+static bool ambiguous_simple_type(nr_ctx_t *c, zan_istr_t simple, int arity) {
+    const nr_type_t *first = NULL;
     for (int node = c->by_simple.buckets[nr_hash(simple) & c->by_simple.mask];
          node >= 0; node = c->by_simple.chains[node].next) {
-        int idx = c->by_simple.chains[node].idx;
-        if (ns_istr_eq(c->items[idx].simple, simple) &&
-            decl_type_param_count(c->items[idx].decl) == want)
-            n++;
+        const nr_type_t *t = &c->items[c->by_simple.chains[node].idx];
+        if (!ns_istr_eq(t->simple, simple) || decl_type_param_count(t->decl) != arity) continue;
+        if (first && !same_decl_identity(first, t)) return true;
+        first = t;
     }
-    return n;
+    return false;
 }
 
 static bool matches_type_param(const zan_ast_list_t *params, zan_istr_t name) {
@@ -378,84 +469,67 @@ static bool matches_type_param(const zan_ast_list_t *params, zan_istr_t name) {
     return false;
 }
 
+static zan_istr_t qualified_builtin_name(zan_istr_t name) {
+    static const char *const names[] = {
+        "System.Collections.Generic.List",
+        "System.Collections.Generic.Dictionary",
+        "System.Text.StringBuilder",
+        "System.Span",
+        "System.ReadOnlySpan",
+        "System.Reflection.TypeInfo",
+        "System.Threading.Tasks.Task",
+        "System.Func",
+        "System.Action",
+        "System.Linq.Action", /* Legacy spelling used by Zan.Game.Cards. */
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char *full = names[i];
+        size_t len = strlen(full);
+        if (name.len == len && memcmp(name.str, full, len) == 0) {
+            const char *simple = strrchr(full, '.') + 1;
+            return (zan_istr_t){(char *)simple, (uint32_t)(full + len - simple)};
+        }
+    }
+    return name;
+}
+
 static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
                         zan_istr_t ctx_ns, zan_ast_list_t *usings) {
+    if (tr->type_ref.ns_decl) {
+        tr->type_ref.name = decl_simple_name(tr->type_ref.ns_decl);
+        if (c->refs) zan_refs_add(c->refs, tr->type_ref.name, c->arena);
+        return;
+    }
     zan_istr_t R = tr->type_ref.name;
     if (R.len == 0) return;
-    if (c->qualified_keys && tr->type_ref.type_args.count == 0 &&
-        (matches_type_param(c->type_params, R) || matches_type_param(c->method_type_params, R)))
-        return;
-    nr_type_t *t = NULL;
+    int arity = tr->type_ref.type_args.count;
+    if (arity == 0 && (matches_type_param(c->type_params, R) ||
+                      matches_type_param(c->method_type_params, R))) return;
 
-    if (ns_has_dot(R)) {
-        t = find_full(c, R);
-        if (!t && usings) {
-            char ubuf[256];
-            for (int i = 0; i < usings->count && !t; i++) {
-                zan_ast_node_t *u = usings->items[i];
-                if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
-                char *uheap = NULL;
-                zan_istr_t up = flatten_qname_buf(u->using_decl.name, ubuf, sizeof(ubuf), &uheap);
-                t = find_full_joined(c, up, R);
-                if (uheap) free(uheap);
-            }
-        }
-        if (t && !arity_matches(tr, t)) {
-            t = NULL;
-        }
-        if (t) {
-            tr->type_ref.name = t->final;
-            if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
-            return;
-        }
-        if (!c->qualified_keys) {
-            uint32_t last = 0;
-            for (uint32_t i = 0; i < R.len; i++)
-                if (R.str[i] == '.') last = i + 1;
-            R = mk_istr(c->arena, R.str + last, R.len - last);
-            tr->type_ref.name = R;
-        }
-    }
-
-    t = find_full_joined(c, ctx_ns, R);
-    if (!t && ctx_ns.len > 0) {
-        char abuf[256];
-        if (ctx_ns.len < sizeof(abuf)) {
-            memcpy(abuf, ctx_ns.str, ctx_ns.len);
-            abuf[ctx_ns.len] = '\0';
-            for (char *dot = strrchr(abuf, '.'); dot; dot = strrchr(abuf, '.')) {
-                *dot = '\0';
-                zan_istr_t anc = mk_istr(c->arena, abuf, (uint32_t)(dot - abuf));
-                t = find_full_joined(c, anc, R);
-                if (t) break;
-            }
-        }
-    }
-    if (t && !arity_matches(tr, t)) {
-        if (c->refs) zan_refs_add(c->refs, R, c->arena);
-        return;
-    }
-    if (!t && usings) {
-        char ubuf[256];
-        for (int i = 0; i < usings->count && !t; i++) {
-            zan_ast_node_t *u = usings->items[i];
-            if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
-            char *uheap = NULL;
-            zan_istr_t up = flatten_qname_buf(u->using_decl.name, ubuf, sizeof(ubuf), &uheap);
-            t = find_full_joined(c, up, R);
-            if (uheap) free(uheap);
-            if (t && !arity_matches(tr, t)) t = NULL;
-        }
-    }
+    bool qualified = ns_has_dot(R);
+    nr_type_t *t = qualified ? find_full_exact(c, R) : NULL;
+    if (!t) t = find_lexical_type(c, R);
+    if (!t) t = find_namespace_type(c, ctx_ns, R);
+    if (!t) t = find_imported_type(c, usings, R, arity);
+    if (!t) t = find_full(c, R);
+    if (!t && !qualified) t = find_final(c, R);
     if (t) {
-        tr->type_ref.name = t->final;
-        if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
+        if (decl_type_param_count(t->decl) == arity) {
+            tr->type_ref.ns_decl = t->decl;
+            tr->type_ref.name = t->final;
+        }
+        if (c->refs) zan_refs_add(c->refs, tr->type_ref.name, c->arena);
         return;
+    }
+    if (qualified) {
+        R = qualified_builtin_name(R);
+        tr->type_ref.name = R;
     }
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
+    if (qualified) return; /* Preserve unresolved qualifiers for the binder diagnostic. */
 
-    if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R) && c->diag &&
-        !c->quiet_ambiguity) {
+    if (c->diag && !c->quiet_ambiguity && ambiguous_simple_type(c, R, arity) &&
+        !find_full(c, R)) {
         zan_diag_emit_code(c->diag, DIAG_ERROR, tr->loc, 1019,
                       "ambiguous type '%.*s'; qualify it with its namespace",
                       (int)R.len, R.str);
@@ -492,80 +566,69 @@ static bool decl_has_member(const zan_ast_node_t *d, zan_istr_t name) {
  * （"Color Color" 的思路）。命中唯一 → 用它；命中零个或多个 → 不猜，
  * 留给后面的诊断说话。 */
 static nr_type_t *pick_by_member(nr_ctx_t *c, zan_istr_t simple,
-                                  zan_istr_t member, int *hits_out) {
+                                  zan_istr_t member, bool *ambiguous) {
     nr_type_t *hit = NULL;
-    int hit_idx = -1;
-    int hits = 0;
     for (int node = c->by_simple.buckets[nr_hash(simple) & c->by_simple.mask];
          node >= 0; node = c->by_simple.chains[node].next) {
-        int idx = c->by_simple.chains[node].idx;
-        if (!ns_istr_eq(c->items[idx].simple, simple)) continue;
-        if (!decl_has_member(c->items[idx].decl, member)) continue;
-        if (!hit || idx < hit_idx) { hit = &c->items[idx]; hit_idx = idx; }
-        hits++;
+        nr_type_t *t = &c->items[c->by_simple.chains[node].idx];
+        if (!ns_istr_eq(t->simple, simple) || !decl_has_member(t->decl, member)) continue;
+        if (hit && !same_decl_identity(hit, t)) {
+            *ambiguous = true;
+            return NULL;
+        }
+        hit = t;
     }
-    if (hits_out) *hits_out = hits;
-    return hits == 1 ? hit : NULL;
+    return hit;
+}
+
+static bool receiver_shadowed(nr_ctx_t *c, zan_istr_t name) {
+    return shadow_has(&c->shadow, name) || shadow_has(&c->fields, name);
 }
 
 static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
                                     zan_istr_t ctx_ns, zan_ast_list_t *usings,
                                     zan_istr_t member) {
+    if (id->ident.ns_decl) {
+        zan_istr_t name = decl_simple_name(id->ident.ns_decl);
+        if (!ns_istr_eq(id->ident.name, name)) id->ident.is_type_receiver = true;
+        id->ident.name = name;
+        if (c->refs) zan_refs_add(c->refs, name, c->arena);
+        return;
+    }
     zan_istr_t R = id->ident.name;
-    if (R.len == 0 || shadow_has(&c->shadow, R)) return;
+    if (R.len == 0 || receiver_shadowed(c, R)) return;
 
-    if (c->refs) zan_refs_add(c->refs, R, c->arena);
-
-    nr_type_t *t = NULL;
-    t = find_full_joined(c, ctx_ns, R);
-    if (!t && ctx_ns.len > 0) {
-        char abuf[256];
-        if (ctx_ns.len < sizeof(abuf)) {
-            memcpy(abuf, ctx_ns.str, ctx_ns.len);
-            abuf[ctx_ns.len] = '\0';
-            for (char *dot = strrchr(abuf, '.'); dot; dot = strrchr(abuf, '.')) {
-                *dot = '\0';
-                zan_istr_t anc = mk_istr(c->arena, abuf, (uint32_t)(dot - abuf));
-                t = find_full_joined(c, anc, R);
-                if (t) break;
-            }
-        }
-    }
-    if (!t && usings) {
-        char ubuf[256];
-        for (int i = 0; i < usings->count && !t; i++) {
-            zan_ast_node_t *u = usings->items[i];
-            if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
-            char *uheap = NULL;
-            zan_istr_t up = flatten_qname_buf(u->using_decl.name, ubuf, sizeof(ubuf), &uheap);
-            t = find_full_joined(c, up, R);
-            if (uheap) free(uheap);
-        }
-    }
+    nr_type_t *t = find_lexical_type(c, R);
+    if (!t) t = find_namespace_type(c, ctx_ns, R);
+    if (!t) t = find_imported_type(c, usings, R, -1);
     if (!t) t = find_full(c, R);
     /* 名字被多个命名空间占用（System.Data.Window / System.Automation.Window /
      * Gui.Backend.Window）时，裸名 + 成员访问按"谁声明了这个成员"消歧：
      * 命中唯一就用它；命中多个 → 报歧义（和类型位置的诊断同一口径）；
      * 命中零个 → 不猜，交给后面的诊断。 */
     if (!t && member.len && !c->qualified_keys) {
-        int hits = 0;
-        t = pick_by_member(c, R, member, &hits);
-        if (!t && hits > 1 && c->diag)
+        bool ambiguous = false;
+        t = pick_by_member(c, R, member, &ambiguous);
+        if (ambiguous && c->diag)
             zan_diag_emit_code(c->diag, DIAG_ERROR, id->loc, 1019,
                           "ambiguous type '%.*s'; qualify it with its namespace",
                           (int)R.len, R.str);
     }
+    if (!t) t = find_final(c, R);
     if (t) {
+        if (!ns_istr_eq(R, t->final)) id->ident.is_type_receiver = true;
+        id->ident.ns_decl = t->decl;
         id->ident.name = t->final;
-        if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
     }
+    if (c->refs) zan_refs_add(c->refs, id->ident.name, c->arena);
 }
 
 static zan_istr_t flatten_receiver(nr_ctx_t *c, zan_ast_node_t *n) {
     zan_istr_t empty = {0};
     if (!n) return empty;
     if (n->kind == AST_IDENTIFIER) {
-        if (c->qualified_keys && shadow_has(&c->shadow, n->ident.name)) return empty;
+        if (n->ident.inst_type_ref || n->ident.ns_decl ||
+            receiver_shadowed(c, n->ident.name)) return empty;
         return n->ident.name;
     }
     if (n->kind == AST_MEMBER_ACCESS) {
@@ -576,10 +639,15 @@ static zan_istr_t flatten_receiver(nr_ctx_t *c, zan_ast_node_t *n) {
     return empty;
 }
 
-static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv) {
+static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv,
+                                       zan_istr_t ctx_ns, zan_ast_list_t *usings) {
     zan_istr_t full = flatten_receiver(c, recv);
-    if (full.len == 0 || !ns_has_dot(full)) return;
-    nr_type_t *t = find_full(c, full);
+    if (full.len == 0) return;
+    nr_type_t *t = find_full_exact(c, full);
+    if (!t) t = find_lexical_type(c, full);
+    if (!t) t = find_namespace_type(c, ctx_ns, full);
+    if (!t) t = find_imported_type(c, usings, full, -1);
+    if (!t) t = find_full(c, full);
     if (!t) {
         /* `A */
         if (c->refs) {
@@ -598,6 +666,8 @@ static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv) {
     recv->ident.inst_type_ref = NULL;
     recv->ident.method_group_target = NULL;
     recv->ident.is_type_receiver = true;
+    recv->ident.variance = 0;
+    recv->ident.ns_decl = t->decl;
     if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
 }
 

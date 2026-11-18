@@ -237,26 +237,6 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
     free(call_args);
     return result;
 }
-LLVMValueRef emit_string_copy_range(zan_irgen_t *g,
-        LLVMValueRef start, LLVMValueRef end) {
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef len = zan_sub(g->builder,
-        LLVMBuildPtrToInt(g->builder, end, i64, "e.i"),
-        LLVMBuildPtrToInt(g->builder, start, i64, "s.i"), "slen");
-    LLVMValueRef total = zan_add(g->builder, len,
-        LLVMConstInt(i64, 1, 0), "cap");
-    LLVMValueRef buf = emit_string_alloc_rc(g, total);
-    LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr,
-        (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
-    LLVMValueRef mc = get_libc_fn(g, "memcpy", memcpy_ty);
-    zan_call2(g->builder, memcpy_ty, mc,
-        (LLVMValueRef[]){ buf, start, len }, 3, "");
-    LLVMValueRef endp = LLVMBuildGEP2(g->builder,
-        LLVMInt8TypeInContext(g->ctx), buf, &len, 1, "ep");
-    zan_store_fit(g, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 0, 0), endp);
-    return buf;
-}
 
 /* 检查 Lambda 函数体内是否包含显式带值返回 (return <expr>;) */
 bool lambda_body_has_value_return(zan_ast_node_t *n) {

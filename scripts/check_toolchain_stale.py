@@ -354,10 +354,9 @@ ARTIFACTS = [
     ("toolchain/ohos-x64/zan_embed_api.o", EMBED, "runtime"),
     ("toolchain/ohos-x64/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/ohos-x64/zap_main.o", ["toolchain/ohos-x64/zap_main.c"], "runtime"),
-    # The OHOS NDK sysroot subset (crt + libc.a + compiler-rt builtins/unwind)
-    # tracks the SDK itself, not repo sources -- report-only, refreshed by
-    # hand. libm.a/libdl.a are empty archives in the OHOS sysroot and are not
-    # committed.
+    # The OHOS sysroot subset tracks the NDK release. libdl.a and
+    # libpthread.a satisfy the dependent library names of the EH archives.
+    # OHOS libc.a provides the dl and pthread symbols.
     ("toolchain/ohos-arm64/libc.a", OHOS_NDK, "manual"),
     ("toolchain/ohos-arm64/crt1.o", OHOS_NDK, "manual"),
     ("toolchain/ohos-arm64/crti.o", OHOS_NDK, "manual"),
@@ -366,6 +365,9 @@ ARTIFACTS = [
     ("toolchain/ohos-arm64/clang_rt.crtend.o", OHOS_NDK, "manual"),
     ("toolchain/ohos-arm64/libclang_rt.builtins.a", OHOS_NDK, "manual"),
     ("toolchain/ohos-arm64/libunwind.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/libc++abi.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/libdl.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/libpthread.a", OHOS_NDK, "manual"),
     ("toolchain/ohos-x64/libc.a", OHOS_NDK, "manual"),
     ("toolchain/ohos-x64/crt1.o", OHOS_NDK, "manual"),
     ("toolchain/ohos-x64/crti.o", OHOS_NDK, "manual"),
@@ -374,6 +376,9 @@ ARTIFACTS = [
     ("toolchain/ohos-x64/clang_rt.crtend.o", OHOS_NDK, "manual"),
     ("toolchain/ohos-x64/libclang_rt.builtins.a", OHOS_NDK, "manual"),
     ("toolchain/ohos-x64/libunwind.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/libc++abi.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/libdl.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/libpthread.a", OHOS_NDK, "manual"),
 ]
 
 # Keep the existing `gui` policy group for all native feature drivers, while

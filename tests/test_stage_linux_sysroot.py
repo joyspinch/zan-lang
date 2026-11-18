@@ -48,6 +48,14 @@ class SysrootSelectionTests(unittest.TestCase):
         )
         self.assertEqual(set(self.select(trace)), set(MODULE.REQUIRED))
 
+    def test_riscv_startup_uses_only_crt1(self):
+        sources = [path for path in self.sources if path.name not in ("crti.o", "crtn.o")]
+        trace = self.trace(sources)
+        selected = MODULE.selected_inputs(trace, self.root, "linux-riscv64")
+        self.assertEqual(selected, {path.name: path for path in sources})
+        with self.assertRaisesRegex(ValueError, "crti.o, crtn.o"):
+            MODULE.selected_inputs(trace, self.root, "linux-arm64")
+
     def test_missing_input_fails(self):
         with self.assertRaisesRegex(ValueError, "did not supply"):
             self.select(self.trace(self.sources[:-1]))

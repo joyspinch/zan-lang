@@ -714,6 +714,62 @@ class DesignerInteractionTest {
         h.Dispose();
     }
 
+    static void PreviewIdleAnimation() {
+        DesignerInteractionHarness h = new DesignerInteractionHarness(DesignerInteractionTest.Html());
+        Designer d = h.designer;
+        App target = h.Target();
+        Window.FreezeTick(10000);
+        try {
+            d.preview = true;
+            d.winOpacity = 65;
+            Check("prepare translucent preview", d.PrepareDesignPreview(h.host));
+            Button button = (Button)h.Node("Natural");
+            button.ClassName = "preview-motion";
+            target.sheet = Css.Parse("button.preview-motion { background: #202020; transition: 100ms; }"
+                + "button.preview-motion:hover { background: #606060; }");
+            d.RenderDesignPreview();
+            int x = button.bx + target.Scale(10);
+            int y = button.by + button.bh / 2;
+            int idle = target.canvas.GetPixel(x, y);
+            int composedIdle = PreviewComposedPixel(h, x, y);
+            Check("translucent snapshot prepared", d.pvShapeReady);
+            h.Forward(1, x, y, 0, 0, 0, 0, true, false);
+            int due = h.host.wakeFrameNextMs;
+            Check("hover wakes preview host", due > 10000);
+            Check("hover starts from idle", target.canvas.GetPixel(x, y) == idle);
+            h.host.wakeFrameNextMs = -1;
+            Check("early host frame preserves preview deadline", d.PrepareDesignPreview(h.host)
+                && h.host.wakeFrameNextMs == due && target.canvas.GetPixel(x, y) == idle);
+
+            Window.FreezeTick(10050);
+            target.nowMs = 10050;
+            Check("idle host advances preview", d.PrepareDesignPreview(h.host));
+            int middle = target.canvas.GetPixel(x, y);
+            int composedMiddle = PreviewComposedPixel(h, x, y);
+            Check("translucent preview publishes intermediate pixels", middle != idle && composedMiddle != composedIdle);
+
+            Window.FreezeTick(10100);
+            target.nowMs = 10100;
+            Check("idle host finishes preview", d.PrepareDesignPreview(h.host));
+            int end = target.canvas.GetPixel(x, y);
+            int composedEnd = PreviewComposedPixel(h, x, y);
+            Check("hover reaches final preview color", end == 0xff606060 && end != middle);
+            Check("translucent preview publishes final pixels", composedEnd != composedIdle && composedEnd != composedMiddle);
+            Check("finished transition has no follow-up", !target.HasDueOffscreenFrame());
+        } finally {
+            Window.UnfreezeTick();
+            h.Dispose();
+        }
+    }
+
+    static int PreviewComposedPixel(DesignerInteractionHarness h, int x, int y) {
+        Canvas canvas = h.host.canvas;
+        Canvas source = h.Target().canvas;
+        canvas.Clear(0xff000000);
+        h.designer.PaintDesignPreview(canvas, 0, 0, source.Width(), source.Height());
+        return canvas.GetPixel(x, y);
+    }
+
     static void NoTargetPress(App target, string label) {
         DesignerInteractionTest.Check(label, !target.pointerDown && target.focus.pressedId == 0 - 1
         && target.pressTargetId == 0 - 1 && target.clickTargetId == 0 - 1
@@ -1056,10 +1112,12 @@ class DesignerInteractionTest {
         d.OpenQuickInsert(h.host);
         Check("quick insert uses retained Layer", d.quickInsertWin != null && d.quickInsertWin.open
         && d.quickInsertWin.view is Flex && d.quickInsertResults.ChildCount() == 7);
-        h.Neutral();
+        h.host.BeginOffscreenFrame();
+        Check("quick insert host prepares popup layout", h.host.PrepareStandardHostFrame());
+        h.host.EndOffscreenFrame();
         int original = d.fields.Count;
         Button pick = d.quickInsertResults.ChildAt(4) as Button;
-        Check("quick insert item is standard Button", pick != null);
+        Check("quick insert item is an arranged standard Button", pick != null && pick.bw > 0 && pick.bh > 0);
         int px = pick.bx + pick.bw / 2;
         int py = pick.by + pick.bh / 2;
         h.Input(2, px, py, 0, 0, 0, 0);
@@ -1090,6 +1148,7 @@ class DesignerInteractionTest {
         DesignerInteractionTest.SlotsAndReparent();
         DesignerInteractionTest.DirectOffscreenButton();
         DesignerInteractionTest.PreviewButtonAndModes();
+        DesignerInteractionTest.PreviewIdleAnimation();
         DesignerInteractionTest.PreviewEditorGestures();
         DesignerInteractionTest.PreviewCancelReentry();
         DesignerInteractionTest.PreviewRetainedWheel();

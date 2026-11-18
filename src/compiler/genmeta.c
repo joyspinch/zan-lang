@@ -6,6 +6,7 @@
 #include "zan.h"
 #include "diag.h"
 #include "lexer.h"
+#include "../../packages/Zan.Data/compiler/orm_adapter.h"
 #include "../common/json.h"
 
 #include <stdarg.h>

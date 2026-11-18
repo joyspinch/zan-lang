@@ -120,9 +120,8 @@ static LLVMValueRef embed_libc(zan_irgen_t *g, const char *name,
 
 struct embed_api_ctx {
     LLVMTypeRef  i8, i8p, i32, i64, ent_ty;
-    LLVMValueRef gtbl, gcnt, gbuf, empty;
+    LLVMValueRef gtbl, gcnt, empty;
     LLVMValueRef own_tbl, own_cnt, own_payloads;
-    long long    buf_cap;
     unsigned long long seed;
 };
 
@@ -587,9 +586,10 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
 
 static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
-    LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
-    LLVMValueRef fn = embed_define(g, "zan_embed_list", fty);
+    LLVMTypeRef fty = LLVMFunctionType(c->i64, args, 1, 0);
+    LLVMValueRef fn = embed_define(g, "zan_embed_list_alloc", fty);
     if (!fn) return;
+    LLVMTypeRef ret_ty = LLVMGetReturnType(LLVMGlobalGetValueType(fn));
     LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
 
     LLVMTypeRef slen_args[] = { c->i8p };
@@ -613,72 +613,59 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMValueRef malloc_fn = embed_libc(g, "malloc", c->i8p, mal_args, 1,
                                         &mal_ty);
 
+    LLVMTypeRef free_args[] = { c->i8p }, free_ty;
+    LLVMValueRef free_fn = embed_libc(g, "free", LLVMVoidTypeInContext(g->ctx),
+                                      free_args, 1, &free_ty);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
-    LLVMBasicBlockRef alloc = LLVMAppendBasicBlockInContext(g->ctx, fn, "alloc");
-    LLVMBasicBlockRef init = LLVMAppendBasicBlockInContext(g->ctx, fn, "init");
-    LLVMBasicBlockRef oom = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom");
-    LLVMBasicBlockRef ready = LLVMAppendBasicBlockInContext(g->ctx, fn, "ready");
+    LLVMBasicBlockRef scan = LLVMAppendBasicBlockInContext(g->ctx, fn, "scan");
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
+    LLVMBasicBlockRef pcmp = LLVMAppendBasicBlockInContext(g->ctx, fn, "pcmp");
     LLVMBasicBlockRef take = LLVMAppendBasicBlockInContext(g->ctx, fn, "take");
-    LLVMBasicBlockRef take2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "take2");
     LLVMBasicBlockRef dup = LLVMAppendBasicBlockInContext(g->ctx, fn, "dup");
     LLVMBasicBlockRef dhead = LLVMAppendBasicBlockInContext(g->ctx, fn, "dhead");
     LLVMBasicBlockRef dbody = LLVMAppendBasicBlockInContext(g->ctx, fn, "dbody");
+    LLVMBasicBlockRef dcmp = LLVMAppendBasicBlockInContext(g->ctx, fn, "dcmp");
+    LLVMBasicBlockRef dnext = LLVMAppendBasicBlockInContext(g->ctx, fn, "dnext");
+    LLVMBasicBlockRef append = LLVMAppendBasicBlockInContext(g->ctx, fn, "append");
+    LLVMBasicBlockRef fits = LLVMAppendBasicBlockInContext(g->ctx, fn, "fits");
+    LLVMBasicBlockRef copy = LLVMAppendBasicBlockInContext(g->ctx, fn, "copy");
     LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
-    LLVMBasicBlockRef nextslot = LLVMAppendBasicBlockInContext(g->ctx, fn,
-                                                               "nextslot");
+    LLVMBasicBlockRef nextslot = LLVMAppendBasicBlockInContext(g->ctx, fn, "nextslot");
+    LLVMBasicBlockRef adv = LLVMAppendBasicBlockInContext(g->ctx, fn, "adv");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+    LLVMBasicBlockRef alloc = LLVMAppendBasicBlockInContext(g->ctx, fn, "alloc");
+    LLVMBasicBlockRef publish = LLVMAppendBasicBlockInContext(g->ctx, fn, "publish");
+    LLVMBasicBlockRef empty = LLVMAppendBasicBlockInContext(g->ctx, fn, "empty");
 
     LLVMPositionBuilderAtEnd(b, entry);
-    LLVMValueRef real_empty = LLVMBuildGlobalStringPtr(b, "", "embed_empty");
-    LLVMValueRef prefix = LLVMGetParam(fn, 0);
+    LLVMValueRef zero = LLVMConstInt(c->i64, 0, 0);
+    LLVMValueRef one = LLVMConstInt(c->i64, 1, 0);
+    LLVMValueRef prefix_arg = LLVMGetParam(fn, 0);
+    LLVMValueRef prefix = LLVMBuildSelect(b, LLVMBuildIsNull(b, prefix_arg, "nopre"),
+                                          c->empty, prefix_arg, "prefix");
+    LLVMValueRef plen = LLVMBuildCall2(b, slen_ty, strlen_fn, &prefix, 1, "plen");
+    LLVMValueRef rtbl = LLVMBuildLoad2(b, c->i8p, c->gtbl, "rtbl");
+    LLVMValueRef rn = LLVMBuildLoad2(b, c->i64, c->gcnt, "rcnt");
     LLVMValueRef ia = LLVMBuildAlloca(b, c->i64, "i");
     LLVMValueRef oa = LLVMBuildAlloca(b, c->i64, "o");
     LLVMValueRef bva = LLVMBuildAlloca(b, c->i8p, "b");
     LLVMValueRef nva = LLVMBuildAlloca(b, c->i64, "n");
     LLVMValueRef sva = LLVMBuildAlloca(b, c->i64, "slot");
     LLVMValueRef ja = LLVMBuildAlloca(b, c->i64, "j");
-    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), ia);
-    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), oa);
-    LLVMBuildStore(b, LLVMBuildLoad2(b, c->i8p, c->gtbl, "tbl0"), bva);
-    LLVMBuildStore(b, LLVMBuildLoad2(b, c->i64, c->gcnt, "cnt0"), nva);
-    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), sva);
-    LLVMValueRef buf0 = LLVMBuildLoad2(b, c->i8p, c->gbuf, "buf0");
-    LLVMBuildCondBr(b, LLVMBuildIsNull(b, buf0, "nobuf"), alloc, ready);
+    LLVMValueRef scratch = LLVMBuildAlloca(b, c->i8p, "scratch");
+    LLVMBuildStore(b, LLVMConstNull(c->i8p), scratch);
+    LLVMBuildBr(b, scan);
 
-    LLVMPositionBuilderAtEnd(b, alloc);
-    LLVMValueRef cap = LLVMConstInt(c->i64,
-        (unsigned long long)c->buf_cap + ZAN_OBJ_HDR_SIZE, 0);
-    LLVMValueRef nb = LLVMBuildCall2(b, mal_ty, malloc_fn, &cap, 1, "nb");
-    LLVMBuildCondBr(b, LLVMBuildIsNull(b, nb, "failed"), oom, init);
-
-    LLVMPositionBuilderAtEnd(b, init);
-    /* The reusable borrowed buffer still needs a readable Zan string header. */
-    LLVMValueRef hdr = LLVMBuildBitCast(b, nb, LLVMPointerType(c->i64, 0), "hdr");
-    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STRING_SENTINEL_RC, 0), hdr);
-    LLVMValueRef one = LLVMConstInt(c->i64, 1, 0);
-    LLVMValueRef magic = LLVMBuildGEP2(b, c->i64, hdr, &one, 1, "magic");
-    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STRING_MAGIC, 0), magic);
-    LLVMValueRef skip = LLVMConstInt(c->i64, ZAN_OBJ_HDR_SIZE, 0);
-    LLVMBuildStore(b, LLVMBuildGEP2(b, c->i8, nb, &skip, 1, "data"), c->gbuf);
-    LLVMBuildBr(b, ready);
-
-    LLVMPositionBuilderAtEnd(b, oom);
-    LLVMBuildRet(b, real_empty);
-
-    LLVMPositionBuilderAtEnd(b, ready);
-    LLVMValueRef buf = LLVMBuildLoad2(b, c->i8p, c->gbuf, "buf");
-    LLVMValueRef plen = LLVMBuildAlloca(b, c->i64, "pl");
-    LLVMBasicBlockRef plz = LLVMAppendBasicBlockInContext(g->ctx, fn, "plz");
-    LLVMBasicBlockRef pls = LLVMAppendBasicBlockInContext(g->ctx, fn, "pls");
-    LLVMBuildCondBr(b, LLVMBuildIsNull(b, prefix, "nopre"), plz, pls);
-    LLVMPositionBuilderAtEnd(b, plz);
-    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), plen);
-    LLVMBuildBr(b, head);
-    LLVMPositionBuilderAtEnd(b, pls);
-    LLVMBuildStore(b, LLVMBuildCall2(b, slen_ty, strlen_fn, &prefix, 1, "pl0"),
-                   plen);
+    /* Size first, then fill an invocation-local buffer using the same scan. */
+    LLVMPositionBuilderAtEnd(b, scan);
+    LLVMValueRef buf = LLVMBuildLoad2(b, c->i8p, scratch, "buf");
+    LLVMValueRef sizing = LLVMBuildIsNull(b, buf, "sizing");
+    LLVMBuildStore(b, zero, ia);
+    LLVMBuildStore(b, zero, oa);
+    LLVMBuildStore(b, rtbl, bva);
+    LLVMBuildStore(b, rn, nva);
+    LLVMBuildStore(b, zero, sva);
     LLVMBuildBr(b, head);
 
     LLVMPositionBuilderAtEnd(b, head);
@@ -695,25 +682,17 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMValueRef ent = embed_entry_at(b, c, base, i);
     LLVMValueRef nmp = LLVMBuildStructGEP2(b, c->ent_ty, ent, 0, "nmp");
     LLVMValueRef nm = LLVMBuildLoad2(b, c->i8p, nmp, "nm");
-    LLVMValueRef pl = LLVMBuildLoad2(b, c->i64, plen, "plv");
-    LLVMValueRef nmnull = LLVMBuildIsNull(b, nm, "nonm");
-    LLVMBasicBlockRef pfx = LLVMAppendBasicBlockInContext(g->ctx, fn, "pfx");
-    LLVMBuildCondBr(b, nmnull, next, pfx);
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, nm, "nonm"), next, pcmp);
 
-    LLVMPositionBuilderAtEnd(b, pfx);
-    LLVMValueRef pargs[] = { nm, prefix, pl };
-    LLVMBasicBlockRef pcmp = LLVMAppendBasicBlockInContext(g->ctx, fn, "pcmp");
-    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, pl,
-        LLVMConstInt(c->i64, 0, 0), "nopl"), take, pcmp);
     LLVMPositionBuilderAtEnd(b, pcmp);
+    LLVMValueRef pargs[] = { nm, prefix, plen };
     LLVMValueRef pc = LLVMBuildCall2(b, sncmp_ty, strncmp_fn, pargs, 3, "pc");
     LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, pc,
         LLVMConstInt(c->i32, 0, 0), "pmatch"), take, next);
 
     LLVMPositionBuilderAtEnd(b, take);
     LLVMValueRef s0 = LLVMBuildLoad2(b, c->i64, sva, "scur");
-    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s0,
-        LLVMConstInt(c->i64, 0, 0), "is0"), take2, dup);
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s0, zero, "is0"), append, dup);
 
     LLVMPositionBuilderAtEnd(b, dup);
     LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), ja);
@@ -721,51 +700,42 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
 
     LLVMPositionBuilderAtEnd(b, dhead);
     LLVMValueRef j = LLVMBuildLoad2(b, c->i64, ja, "jv");
-    LLVMValueRef rn = LLVMBuildLoad2(b, c->i64, c->gcnt, "rcnt");
-    LLVMValueRef rtbl = LLVMBuildLoad2(b, c->i8p, c->gtbl, "rtbl");
     LLVMValueRef dok = LLVMBuildAnd(b,
         LLVMBuildICmp(b, LLVMIntSLT, j, rn, "jmore"),
         LLVMBuildIsNotNull(b, rtbl, "rhastbl"), "rgo");
-    LLVMBuildCondBr(b, dok, dbody, take2);
+    LLVMBuildCondBr(b, dok, dbody, append);
 
     LLVMPositionBuilderAtEnd(b, dbody);
-    j = LLVMBuildLoad2(b, c->i64, ja, "jv2");
     LLVMValueRef rent = embed_entry_at(b, c, rtbl, j);
     LLVMValueRef rnmp = LLVMBuildStructGEP2(b, c->ent_ty, rent, 0, "rnmp");
     LLVMValueRef rnm = LLVMBuildLoad2(b, c->i8p, rnmp, "rnm");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, rnm, "noname"), dnext, dcmp);
+    LLVMPositionBuilderAtEnd(b, dcmp);
     LLVMValueRef req = LLVMBuildCall2(b, scmp_ty, strcmp_fn,
         (LLVMValueRef[]){ rnm, nm }, 2, "req");
-    LLVMBasicBlockRef rmatch = LLVMAppendBasicBlockInContext(g->ctx, fn,
-                                                             "rmatch");
-    LLVMBuildCondBr(b, LLVMBuildAnd(b,
-        LLVMBuildIsNotNull(b, rnm, "rnonull"),
-        LLVMBuildICmp(b, LLVMIntEQ, req, LLVMConstInt(c->i32, 0, 0), "ris"),
-        "rdup"), next, rmatch);
-    LLVMPositionBuilderAtEnd(b, rmatch);
-    LLVMValueRef j2 = LLVMBuildLoad2(b, c->i64, ja, "jv3");
-    LLVMBuildStore(b, LLVMBuildAdd(b, j2, LLVMConstInt(c->i64, 1, 0), "j1"),
-                   ja);
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, req,
+        LLVMConstInt(c->i32, 0, 0), "duplicate"), next, dnext);
+    LLVMPositionBuilderAtEnd(b, dnext);
+    LLVMBuildStore(b, LLVMBuildAdd(b, j, one, "j1"), ja);
     LLVMBuildBr(b, dhead);
 
-    LLVMPositionBuilderAtEnd(b, take2);
-    LLVMValueRef l = LLVMBuildCall2(b, slen_ty, strlen_fn,
-        (LLVMValueRef[]){ nm }, 1, "l");
-
-    LLVMValueRef o = LLVMBuildLoad2(b, c->i64, oa, "o");
-    LLVMValueRef need = LLVMBuildAdd(b, LLVMBuildAdd(b, o, l, "ol"),
-        LLVMConstInt(c->i64, 2, 0), "need");
-    LLVMBasicBlockRef fits = LLVMAppendBasicBlockInContext(g->ctx, fn, "fits");
-    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntSGT, need,
-        LLVMConstInt(c->i64, (unsigned long long)c->buf_cap, 0), "over"),
-        done, fits);
+    LLVMPositionBuilderAtEnd(b, append);
+    LLVMValueRef name_len = LLVMBuildCall2(b, slen_ty, strlen_fn, &nm, 1, "name.len");
+    LLVMValueRef offset = LLVMBuildLoad2(b, c->i64, oa, "offset");
+    LLVMValueRef remaining = LLVMBuildSub(b, LLVMConstInt(c->i64, INT32_MAX, 0),
+                                         offset, "remaining");
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntULT, name_len, remaining, "fits"),
+                    fits, empty);
     LLVMPositionBuilderAtEnd(b, fits);
-    LLVMValueRef dst = LLVMBuildGEP2(b, c->i8, buf, &o, 1, "dst");
-    LLVMValueRef margs[] = { dst, nm, l };
+    LLVMValueRef newline = LLVMBuildAdd(b, offset, name_len, "newline");
+    LLVMBuildStore(b, LLVMBuildAdd(b, newline, one, "length"), oa);
+    LLVMBuildCondBr(b, sizing, next, copy);
+    LLVMPositionBuilderAtEnd(b, copy);
+    LLVMValueRef dst = LLVMBuildGEP2(b, c->i8, buf, &offset, 1, "dst");
+    LLVMValueRef margs[] = { dst, nm, name_len };
     LLVMBuildCall2(b, mcpy_ty, memcpy_fn, margs, 3, "");
-    LLVMValueRef o2 = LLVMBuildAdd(b, o, l, "o2");
-    LLVMValueRef nlp = LLVMBuildGEP2(b, c->i8, buf, &o2, 1, "nlp");
-    LLVMBuildStore(b, LLVMConstInt(c->i8, 10, 0), nlp);
-    LLVMBuildStore(b, LLVMBuildAdd(b, o2, LLVMConstInt(c->i64, 1, 0), "o3"), oa);
+    LLVMValueRef newline_ptr = LLVMBuildGEP2(b, c->i8, buf, &newline, 1, "newline.p");
+    LLVMBuildStore(b, LLVMConstInt(c->i8, '\n', 0), newline_ptr);
     LLVMBuildBr(b, next);
 
     LLVMPositionBuilderAtEnd(b, next);
@@ -775,21 +745,36 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
 
     LLVMPositionBuilderAtEnd(b, nextslot);
     LLVMValueRef s = LLVMBuildLoad2(b, c->i64, sva, "sscur");
-    LLVMBasicBlockRef adv = LLVMAppendBasicBlockInContext(g->ctx, fn, "adv");
-    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s,
-        LLVMConstInt(c->i64, 0, 0), "was0"), adv, done);
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s, zero, "was0"), adv, done);
     LLVMPositionBuilderAtEnd(b, adv);
-    LLVMBuildStore(b, LLVMConstInt(c->i64, 1, 0), sva);
-    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), ia);
+    LLVMBuildStore(b, one, sva);
+    LLVMBuildStore(b, zero, ia);
     LLVMBuildStore(b, c->own_tbl, bva);
     LLVMBuildStore(b, c->own_cnt, nva);
     LLVMBuildBr(b, head);
 
     LLVMPositionBuilderAtEnd(b, done);
-    LLVMValueRef oend = LLVMBuildLoad2(b, c->i64, oa, "oend");
-    LLVMValueRef endp = LLVMBuildGEP2(b, c->i8, buf, &oend, 1, "endp");
-    LLVMBuildStore(b, LLVMConstInt(c->i8, 0, 0), endp);
-    LLVMBuildRet(b, buf);
+    LLVMValueRef length = LLVMBuildLoad2(b, c->i64, oa, "length");
+    LLVMBasicBlockRef sized = LLVMAppendBasicBlockInContext(g->ctx, fn, "sized");
+    LLVMBuildCondBr(b, sizing, sized, publish);
+    LLVMPositionBuilderAtEnd(b, sized);
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, length, zero, "nomatches"),
+                    empty, alloc);
+
+    LLVMPositionBuilderAtEnd(b, alloc);
+    LLVMValueRef size = LLVMBuildAdd(b, length, one, "size");
+    LLVMValueRef names = LLVMBuildCall2(b, mal_ty, malloc_fn, &size, 1, "names");
+    LLVMBuildStore(b, names, scratch);
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, names, "failed"), empty, scan);
+
+    LLVMPositionBuilderAtEnd(b, publish);
+    LLVMValueRef end = LLVMBuildGEP2(b, c->i8, buf, &length, 1, "end");
+    LLVMBuildStore(b, LLVMConstInt(c->i8, 0, 0), end);
+    LLVMBuildRet(b, ret_ty == c->i8p ? buf : LLVMBuildPtrToInt(b, buf, ret_ty, "result"));
+
+    LLVMPositionBuilderAtEnd(b, empty);
+    LLVMBuildCall2(b, free_ty, free_fn, &buf, 1, "");
+    LLVMBuildRet(b, LLVMConstNull(ret_ty));
     LLVMDisposeBuilder(b);
 }
 
@@ -918,6 +903,47 @@ static bool embed_plan_payloads(const zan_embed_list_t *files,
     return true;
 }
 
+static bool embed_collect_spec(zan_embed_list_t *files, const zan_embed_spec_t *spec) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s", spec->spec);
+    char *eq = strrchr(path, '=');
+    const char *prefix = NULL;
+    if (eq) { *eq = 0; prefix = eq + 1; }
+    if (!prefix || !prefix[0]) prefix = embed_basename(path);
+#ifdef _WIN32
+    for (char *p = path; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+#endif
+    int before = files->n;
+    if (embed_is_dir(path)) {
+        if (spec->subdirs && spec->subdir_count > 0)
+            embed_walk_filtered(files, path, prefix, spec->subdirs, spec->subdir_count);
+        else embed_walk(files, path, prefix);
+    } else embed_add_file(files, path, prefix);
+    return files->n != before;
+}
+
+static void embed_free_files(zan_embed_list_t *files) {
+    for (int i = 0; i < files->n; i++) {
+        free(files->v[i].name);
+        free(files->v[i].data);
+    }
+    free(files->v);
+}
+
+bool zan_embed_visit_spec(const char *spec, zan_embed_visit_fn visit, void *context) {
+    zan_embed_list_t files = {0};
+    zan_embed_spec_t item = { .spec = spec };
+    bool ok = embed_collect_spec(&files, &item);
+    for (int i = 0; ok && i < files.n; i++) {
+        zan_embed_file_t *file = &files.v[i];
+        ok = visit(file->name, (const char *)file->data, (size_t)file->len, context);
+    }
+    embed_free_files(&files);
+    return ok;
+}
+
 int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int count) {
     zan_embed_list_t files = {0};
     struct embed_baked_entry *baked = NULL;
@@ -926,25 +952,7 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
 
     for (int i = 0; i < count; i++) {
         if (!specs[i].spec || !specs[i].spec[0]) continue;
-        char path[1024];
-        snprintf(path, sizeof(path), "%s", specs[i].spec);
-        char *eq = strrchr(path, '=');
-        const char *prefix = NULL;
-        if (eq) { *eq = 0; prefix = eq + 1; }
-        if (!prefix || !prefix[0]) prefix = embed_basename(path);
-#ifdef _WIN32
-        for (char *p = path; *p; p++) {
-            if (*p == '/') *p = '\\';
-        }
-#endif
-        int before = files.n;
-        int filtering = specs[i].subdirs != NULL && specs[i].subdir_count > 0
-                        && embed_is_dir(path);
-        if (filtering) embed_walk_filtered(&files, path, prefix,
-                                           specs[i].subdirs, specs[i].subdir_count);
-        else if (embed_is_dir(path)) embed_walk(&files, path, prefix);
-        else embed_add_file(&files, path, prefix);
-        if (files.n == before) {
+        if (!embed_collect_spec(&files, &specs[i])) {
             fprintf(stderr, "error: --embed '%s' matched no readable file\n",
                     specs[i].spec);
             goto cleanup;
@@ -964,11 +972,9 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fields[] = { i8p, i8p, i64 };
     LLVMTypeRef ent_ty = LLVMStructTypeInContext(g->ctx, fields, 3, 0);
-    long long total_names = 0;
     for (int i = 0; i < files.n; i++) {
         const zan_embed_file_t *file = &files.v[i];
         long long name_len = (long long)strlen(file->name);
-        total_names += name_len + 1;
         char label[64];
         snprintf(label, sizeof(label), "zan.embed.n%d", i);
         baked[i].name = embed_bytes_global(g, label,
@@ -1032,7 +1038,6 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
     c.i32 = i32;
     c.i64 = i64;
     c.ent_ty = ent_ty;
-    c.buf_cap = total_names + 4096;
     c.gtbl = LLVMAddGlobal(g->mod, i8p, "zan.embed.gtbl");
     LLVMSetInitializer(c.gtbl, LLVMConstNull(i8p));
     LLVMSetLinkage(c.gtbl, LLVMInternalLinkage);
@@ -1043,9 +1048,6 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
     c.own_cnt = LLVMConstInt(i64, (unsigned long long)files.n, 0);
     c.own_payloads = own_payloads;
     c.seed = seed;
-    c.gbuf = LLVMAddGlobal(g->mod, i8p, "zan.embed.gbuf");
-    LLVMSetInitializer(c.gbuf, LLVMConstNull(i8p));
-    LLVMSetLinkage(c.gbuf, LLVMInternalLinkage);
     LLVMTypeRef empty_fields[] = { i64, i64, LLVMArrayType(c.i8, 1) };
     LLVMTypeRef empty_ty = LLVMStructTypeInContext(g->ctx, empty_fields, 3, 0);
     LLVMValueRef empty_vals[] = {
@@ -1058,7 +1060,7 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
     LLVMSetGlobalConstant(empty_gv, 1);
     LLVMSetLinkage(empty_gv, LLVMPrivateLinkage);
     LLVMSetAlignment(empty_gv, 8);
-    LLVMValueRef empty_idx[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 2, 0) };
+    LLVMValueRef empty_idx[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 2, 0) };
     c.empty = LLVMConstInBoundsGEP2(empty_ty, empty_gv, empty_idx, 2);
 
     embed_emit_register(g, &c);
@@ -1073,11 +1075,7 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
     result = files.n;
 
 cleanup:
-    for (int i = 0; i < files.n; i++) {
-        free(files.v[i].name);
-        free(files.v[i].data);
-    }
-    free(files.v);
+    embed_free_files(&files);
     free(ents);
     free(baked);
     return result;

@@ -829,7 +829,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 for (int k = 0; k < pc; k++) {
                     zan_ast_node_t *param = member->method_decl.params.items[k];
                     zan_type_t *ptype = zan_binder_resolve_type(g->binder, param->param.type);
-                    pzt[k] = ptype;
+                    pzt[k] = param->param.by_ref ? NULL : ptype;
                     LLVMTypeRef llvm_pt = map_type(g, ptype);
                     pt[k] = param->param.by_ref
                         ? LLVMPointerType(llvm_pt, 0)

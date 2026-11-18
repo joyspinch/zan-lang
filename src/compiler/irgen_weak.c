@@ -404,7 +404,6 @@ static void emit_weak_load_retain_body(zan_irgen_t *g) {
     emit_weak_unlock(g);
     LLVMBuildRet(b, v);
 }
-void emit_defer_fallback(zan_irgen_t *g);
 static void emit_live_registry_fallback(zan_irgen_t *g);
 void emit_weak_runtime(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = weak_i8ptr(g);
@@ -466,77 +465,104 @@ void emit_weak_runtime(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, begin_entry);
     emit_weak_destroy_begin_body(g, weak_calloc);
 
-    emit_defer_fallback(g);
-
     emit_live_registry_fallback(g);
 }
 
-/* B-ID78 延迟释放队列的形态自足弱回退：rt_release_dyn 的深树防护无条件
- * 引用 zan_rt_defer_push/pending/drain（类释放胶水），但 rt_mem.o 只在
- * 原生 exe 与跨端 linux exe 链入——Windows DLL、macOS dylib、Android
- * 静态链（bionic 上 --wrap=malloc 崩，刻意不链）与 selfhost 对象束都拿
- * 不到它，B-ID78 后这些形态全部断链（emit_lib 门 2026-11-03 实锤：
- * dll/dylib undefined reference to zan_rt_defer_*）。这里对 release_dyn
- * 已建好的三个声明补弱链路 + 函数体：链入 rt_mem.o 的形态由强定义覆盖
- * （真队列语义不变，与 zan_io_pump 的弱覆盖先例同款）；未链入的形态
- * 退化为 push 即同步调析构——与真实现自身节点分配失败的 fail-open 路径
- * 同语义，不泄漏、不挂队列，深树级联在该形态回到 B-ID78 前的同步递归。
- * 必须在 defer 声明建成之后调用：LLVMAddFunction 不查重名，先建会让
- * release_dyn 的同名声明被 mangler 改名（zan_rt_defer_push.5）而指空。 */
+/* Release spills to a per-thread queue when recursion reaches its limit. The
+ * outer release drains that same queue, including work added by destructors. */
 void emit_defer_fallback(zan_irgen_t *g) {
-    if (!g->rt_defer_push || !g->rt_defer_pending || !g->rt_defer_drain)
-        return;
-    /* 调用点位于 rt_release_dyn 构造中段，builder 停在 tail_bb——发完回退体
-     * 必须恢复原插入位置，否则后续 Br 会插进 drain 的 entry。 */
-    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
-    LLVMTypeRef i8ptr = weak_i8ptr(g);
-    LLVMSetLinkage(g->rt_defer_push, LLVMWeakAnyLinkage);
-    LLVMSetLinkage(g->rt_defer_pending, LLVMWeakAnyLinkage);
-    LLVMSetLinkage(g->rt_defer_drain, LLVMWeakAnyLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef ptr = weak_i8ptr(g);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef node_type = LLVMStructTypeInContext(g->ctx,
+        (LLVMTypeRef[]){ ptr, ptr, ptr }, 3, 0);
+    LLVMTypeRef dtor_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &ptr, 1, 0);
+    LLVMValueRef head = LLVMAddGlobal(g->mod, ptr, "zan.arc.defer.head");
+    LLVMSetInitializer(head, LLVMConstNull(ptr));
+    LLVMSetLinkage(head, LLVMInternalLinkage);
+    if (!g->target_is_wasm) LLVMSetThreadLocal(head, 1);
+    LLVMSetLinkage(g->rt_defer_push, LLVMInternalLinkage);
+    LLVMSetLinkage(g->rt_defer_pending, LLVMInternalLinkage);
+    LLVMSetLinkage(g->rt_defer_drain, LLVMInternalLinkage);
 
-    /* push(fn, obj)：回退即同步析构（fail-open，同真实现分配失败路径） */
-    LLVMBasicBlockRef push_entry = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_defer_push, "entry");
-    LLVMPositionBuilderAtEnd(g->builder, push_entry);
-    LLVMTypeRef dfn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-        (LLVMTypeRef[]){ i8ptr }, 1, 0);
-    LLVMValueRef dfn = LLVMBuildBitCast(g->builder,
-        LLVMGetParam(g->rt_defer_push, 1), LLVMPointerType(dfn_ty, 0), "dfn");
-    zan_call2(g->builder, dfn_ty, dfn,
-        (LLVMValueRef[]){ LLVMGetParam(g->rt_defer_push, 0) }, 1, "");
-    LLVMBuildRetVoid(g->builder);
+    LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_defer_push, "entry"));
+    LLVMValueRef node_size = LLVMSizeOf(node_type);
+    LLVMValueRef node = zan_call2(b, LLVMGlobalGetValueType(g->fn_malloc),
+        g->fn_malloc, &node_size, 1, "node");
+    zan_irgen_emit_oom_check(g, g->rt_defer_push, node);
+    LLVMBuildStore(b, LLVMBuildLoad2(b, ptr, head, "head"),
+        LLVMBuildStructGEP2(b, node_type, node, 0, "next.slot"));
+    LLVMBuildStore(b, LLVMGetParam(g->rt_defer_push, 0),
+        LLVMBuildStructGEP2(b, node_type, node, 1, "fn.slot"));
+    LLVMBuildStore(b, LLVMGetParam(g->rt_defer_push, 1),
+        LLVMBuildStructGEP2(b, node_type, node, 2, "obj.slot"));
+    LLVMBuildStore(b, node, head);
+    LLVMBuildRetVoid(b);
 
-    /* pending()：回退形态无队列，恒 0 */
-    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(
-        g->ctx, g->rt_defer_pending, "entry"));
-    LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
+    LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_defer_pending, "entry"));
+    LLVMValueRef pending = LLVMBuildICmp(b, LLVMIntNE,
+        LLVMBuildLoad2(b, ptr, head, "head"), LLVMConstNull(ptr), "pending");
+    LLVMBuildRet(b, LLVMBuildZExt(b, pending, i32, "pending.i32"));
 
-    /* drain()：无队列可排 */
-    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(
-        g->ctx, g->rt_defer_drain, "entry"));
-    LLVMBuildRetVoid(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_defer_drain, "entry");
+    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, g->rt_defer_drain, "loop");
+    LLVMBasicBlockRef pop = LLVMAppendBasicBlockInContext(g->ctx, g->rt_defer_drain, "pop");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, g->rt_defer_drain, "done");
+    LLVMPositionBuilderAtEnd(b, entry);
+    /* Reserve the outer depth so releases inside a destructor cannot start a
+     * second drain. They append work to this loop instead. */
+    LLVMBuildStore(b, LLVMConstInt(i32, 1, 0), g->arc_defer_depth);
+    LLVMBuildBr(b, loop);
 
-    LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    LLVMPositionBuilderAtEnd(b, loop);
+    node = LLVMBuildLoad2(b, ptr, head, "head");
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, node, LLVMConstNull(ptr), "empty"),
+        done, pop);
+
+    LLVMPositionBuilderAtEnd(b, pop);
+    LLVMValueRef next = LLVMBuildLoad2(b, ptr,
+        LLVMBuildStructGEP2(b, node_type, node, 0, "next.slot"), "next");
+    LLVMValueRef dtor = LLVMBuildLoad2(b, ptr,
+        LLVMBuildStructGEP2(b, node_type, node, 1, "fn.slot"), "fn");
+    LLVMValueRef obj = LLVMBuildLoad2(b, ptr,
+        LLVMBuildStructGEP2(b, node_type, node, 2, "obj.slot"), "obj");
+    LLVMBuildStore(b, next, head);
+    zan_call2(b, LLVMGlobalGetValueType(g->fn_free), g->fn_free, &node, 1, "");
+    zan_call2(b, dtor_type, dtor, &obj, 1, "");
+    LLVMBuildBr(b, loop);
+
+    LLVMPositionBuilderAtEnd(b, done);
+    LLVMBuildStore(b, LLVMConstNull(i32), g->arc_defer_depth);
+    LLVMBuildRetVoid(b);
+    LLVMPositionBuilderAtEnd(b, saved);
 }
 
-/* B-ID89 活对象注册表与 GC 探测器的弱符号兜底：
- * 当 rt_mem.o 未链入时（如 DLL / macOS / 未开启 fast-alloc），
- * 注册/反注册降级为空操作，探测与快照返回 0，确保符号完备不报链接错误。 */
+/* Without rt_mem, heap registration is inert and scans report unavailable. */
 static void emit_live_registry_fallback(zan_irgen_t *g) {
-    if (!g->rt_live_register || !g->rt_live_unregister) return;
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
-
-    LLVMSetLinkage(g->rt_live_register, LLVMWeakAnyLinkage);
-    LLVMBasicBlockRef reg_entry = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_live_register, "entry");
-    LLVMPositionBuilderAtEnd(g->builder, reg_entry);
-    LLVMBuildRetVoid(g->builder);
-
-    LLVMSetLinkage(g->rt_live_unregister, LLVMWeakAnyLinkage);
-    LLVMBasicBlockRef unreg_entry = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_live_unregister, "entry");
-    LLVMPositionBuilderAtEnd(g->builder, unreg_entry);
-    LLVMBuildRetVoid(g->builder);
+    LLVMTypeRef hook_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    const char *gate_names[] = {
+        "zan_rt_heap_diagnostics_enable", "zan_rt_heap_mutator_enter",
+        "zan_rt_heap_mutator_leave"
+    };
+    LLVMValueRef hooks[] = {
+        g->rt_live_register, g->rt_live_register_array, g->rt_live_unregister,
+        NULL, NULL, NULL
+    };
+    for (size_t i = 0; i < sizeof(gate_names) / sizeof(gate_names[0]); i++) {
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, gate_names[i]);
+        hooks[3 + i] = fn ? fn : LLVMAddFunction(g->mod, gate_names[i], hook_type);
+    }
+    for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); i++) {
+        if (!hooks[i]) continue;
+        LLVMSetLinkage(hooks[i], LLVMWeakAnyLinkage);
+        LLVMPositionBuilderAtEnd(g->builder,
+            LLVMAppendBasicBlockInContext(g->ctx, hooks[i], "entry"));
+        LLVMBuildRetVoid(g->builder);
+    }
 
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -550,7 +576,7 @@ static void emit_live_registry_fallback(zan_irgen_t *g) {
     LLVMBasicBlockRef cyc_entry = LLVMAppendBasicBlockInContext(g->ctx,
         cyc_fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, cyc_entry);
-    LLVMBuildRet(g->builder, LLVMConstInt(i64t, 0, 0));
+    LLVMBuildRet(g->builder, LLVMConstAllOnes(i64t));
 
     LLVMValueRef snap_fn = LLVMGetNamedFunction(g->mod, "zan_gc_write_heap_snapshot");
     if (!snap_fn) {
@@ -561,7 +587,7 @@ static void emit_live_registry_fallback(zan_irgen_t *g) {
     LLVMBasicBlockRef snap_entry = LLVMAppendBasicBlockInContext(g->ctx,
         snap_fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, snap_entry);
-    LLVMBuildRet(g->builder, LLVMConstInt(i64t, 0, 0));
+    LLVMBuildRet(g->builder, LLVMConstAllOnes(i64t));
 
     LLVMValueRef reg_fg_fn = LLVMGetNamedFunction(g->mod, "zan_rt_register_site_field_graphs");
     if (!reg_fg_fn) {

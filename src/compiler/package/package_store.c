@@ -456,6 +456,7 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
 typedef struct pkg_index_package {
     char *store;
     char *name;
+    bool locked;
     struct pkg_index_package *next;
 } pkg_index_package_t;
 

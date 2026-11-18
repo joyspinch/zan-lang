@@ -82,4 +82,33 @@ foreach(mode IN ITEMS host warning deny clean_deny initializer_clean_deny)
     endif()
   endif()
 endforeach()
-message(STATUS "selfhost driver option and warning contracts passed")
+
+if(WIN32 AND CLANG)
+  set(_exe "${OUTDIR}/driver output.exe")
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}"
+    "${GEN1}" -o "${_exe}" "${_clean}" --auto-stdlib -O0
+    WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc
+    OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
+  if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_exe}")
+    message(FATAL_ERROR "direct executable link failed, rc=${rc}\n${stdout}${stderr}")
+  endif()
+  execute_process(COMMAND "${_exe}" RESULT_VARIABLE rc TIMEOUT 15)
+  if(NOT "${rc}" STREQUAL "0")
+    message(FATAL_ERROR "direct executable failed, rc=${rc}")
+  endif()
+  file(SHA256 "${_exe}" _before)
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CMAKE_COMMAND}"
+    "${GEN1}" -o "${_exe}" "${_clean}" --auto-stdlib -O0
+    WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc
+    OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
+  string(FIND "${stdout}${stderr}" "linking failed" _link_failure)
+  if("${rc}" STREQUAL "0" OR _link_failure EQUAL -1)
+    message(FATAL_ERROR "direct driver did not report link failure, rc=${rc}\n${stdout}${stderr}")
+  endif()
+  file(SHA256 "${_exe}" _after)
+  file(GLOB _staging "${OUTDIR}/.zanc-*")
+  if(NOT _before STREQUAL _after OR _staging)
+    message(FATAL_ERROR "failed link altered the executable or retained staging files")
+  endif()
+endif()
+message(STATUS "selfhost driver option, warning and link contracts passed")

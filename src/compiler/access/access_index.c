@@ -252,39 +252,45 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             if (arr_type->element_type) {
                 elem_llvm = map_type(g, arr_type->element_type);
             }
-            LLVMValueRef elem_ptr;
+            LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr_ptr, "arridx.null");
+            emit_runtime_check(g, isnull, expr->loc,
+                "null reference where a string/byte buffer is required (element access)");
+            /* The scratch base keeps length and dimension probes safe after a soft null error. */
+            arr_ptr = emit_soft_base_select(g, arr_ptr, isnull, expr->loc);
+
+            LLVMValueRef elem_ptr, oob;
             if (arr_type->array_rank > 1) {
-                /* B-ID183：多维同款 null 守卫（emit_mdarray_elem_ptr 读维度
-                 * 头，null 直接崩），口径与一维一致。 */
-                LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr_ptr,
-                    "mdarridx.null");
-                emit_runtime_check(g, isnull, expr->loc,
-                    "null reference where a string/byte buffer is required (element access)");
-                arr_ptr = emit_soft_base_select(g, arr_ptr, isnull, expr->loc);
                 elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr, expr,
-                                                 elem_llvm, locals, NULL);
+                                                 elem_llvm, locals, &oob);
             } else {
-                /* B-ID183：null 数组索引此前无守卫——zan_array_len 解引用
-                 * null 头直接段错误（探针 _scratch/arrprobe：try 内也崩）。
-                 * 对齐字符串分支（emit_string_base_guard）与 C# 语义：try 内
-                 * 抛 NullReferenceException，try 外 soft 报告后落 scratch 页
-                 * （len 读 0 → 越界钳 0 → 读 0，定义行为）。 */
-                LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr_ptr,
-                    "arridx.null");
-                emit_runtime_check(g, isnull, expr->loc,
-                    "null reference where a string/byte buffer is required (element access)");
-                arr_ptr = emit_soft_base_select(g, arr_ptr, isnull, expr->loc);
                 LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
                 LLVMValueRef arr_len = zan_array_len(g, arr_ptr);
-                emit_index_bounds_check(g, idx, arr_len, expr->loc, "array");
-                idx = emit_index_safe_bounds(g, idx, arr_len, expr->loc, "array");
+                oob = emit_index_bounds_check(g, idx, arr_len, expr->loc, "array");
                 LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                     LLVMPointerType(elem_llvm, 0), "arrp");
                 elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
             }
-            return promote_loaded(g,
-                LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem"),
-                arr_type->element_type);
+            if (!g->runtime_checks || !g->current_fn)
+                return promote_loaded(g,
+                    LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem"),
+                    arr_type->element_type);
+
+            /* Only the valid edge may load an element, even on an empty array. */
+            LLVMValueRef invalid = LLVMBuildOr(g->builder, isnull, oob, "arridx.invalid");
+            LLVMBasicBlockRef fail_bb = LLVMGetInsertBlock(g->builder);
+            LLVMValueRef fn = LLVMGetBasicBlockParent(fail_bb);
+            LLVMBasicBlockRef load_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arridx.load");
+            LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arridx.done");
+            LLVMBuildCondBr(g->builder, invalid, done_bb, load_bb);
+            LLVMPositionBuilderAtEnd(g->builder, load_bb);
+            LLVMValueRef elem = LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
+            LLVMBuildBr(g->builder, done_bb);
+            LLVMPositionBuilderAtEnd(g->builder, done_bb);
+            LLVMValueRef result = LLVMBuildPhi(g->builder, elem_llvm, "arridx.value");
+            LLVMValueRef values[] = { LLVMConstNull(elem_llvm), elem };
+            LLVMBasicBlockRef blocks[] = { fail_bb, load_bb };
+            LLVMAddIncoming(result, values, blocks, 2);
+            return promote_loaded(g, result, arr_type->element_type);
         }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);

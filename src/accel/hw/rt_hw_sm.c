@@ -156,6 +156,16 @@ int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
     return 0;
 }
 
+int64_t zan_hw_ffi_sha512(uint64_t data, int64_t len, uint64_t out) {
+    return zan_hw_sha512((const uint8_t *)(uintptr_t)data, len < 0 ? 0 : len,
+                         (uint8_t *)(uintptr_t)out);
+}
+
+int64_t zan_hw_ffi_sm3(uint64_t data, int64_t len, uint64_t out) {
+    return zan_hw_sm3((const uint8_t *)(uintptr_t)data, len,
+                      (uint8_t *)(uintptr_t)out);
+}
+
 static inline uint32_t zan_rotl32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }

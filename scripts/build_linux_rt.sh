@@ -48,8 +48,11 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     # A successful target link selects compatible musl, startup, C++ ABI,
     # unwind and compiler-rt inputs. Never select cache files by recency.
     "$ZIG" c++ -target "$arch-linux-musl" -O2 -static -fexceptions -funwind-tables -v \
-        "$stage/exception.cpp" -o "$stage/exception-$arch" 2> "$stage/link-$sub.log"
-    python3 -I "$ROOT/scripts/stage_linux_sysroot.py" --zig-env "$stage/zig-env.json" \
+        "$stage/exception.cpp" -o "$stage/exception-$arch" > "$stage/link-$sub.log" 2>&1 || {
+            cat "$stage/link-$sub.log" >&2
+            exit 1
+        }
+    python3 -I "$ROOT/scripts/stage_linux_sysroot.py" --target "$sub" --zig-env "$stage/zig-env.json" \
         "$stage/link-$sub.log" "$out"
     # -fPIC throughout: the same objects are linked both into static
     # executables (where ld.lld relaxes the PIC sequences) and into shared

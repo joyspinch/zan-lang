@@ -20,7 +20,7 @@
 #   - the NDK sysroot subset the cross link needs: crtbegin_static.o,
 #     crtend_android.o, libc.a, libm.a, libdl.a, the dynamic libc/libm/libdl/
 #     liblog/libandroid/libEGL/libGLESv2/libaaudio .so files and
-#     libclang_rt.builtins.a
+#     libclang_rt.builtins.a, libc++abi.a and libunwind.a
 #
 # The NDK's libc.a is compressed with zstd (llvm-objcopy --decompress-debug-
 # sections) so that lld can link it; the script decompresses it the same way
@@ -124,6 +124,14 @@ for pair in android-x64:x86_64 android-arm64:aarch64; do
         -o "$out/zan_inflate.o"
 
     # ---- the NDK sysroot subset the cross link needs ----------------------
+    for f in libc++abi.a libunwind.a; do
+        archive=$("$CC" --sysroot="$SYSROOT" -target "$triple" -print-file-name="$f")
+        if [ "$archive" = "$f" ] || [ ! -f "$archive" ]; then
+            echo "error: $triple NDK archive '$f' not found under $PRE" >&2
+            exit 1
+        fi
+        cp -f "$archive" "$out/$f"
+    done
     LIBDIR="$SYSROOT/usr/lib/$triple"
     for f in crtbegin_static.o crtend_android.o libc.a libm.a libdl.a \
              libc.so libm.so libdl.so liblog.so libandroid.so libEGL.so \

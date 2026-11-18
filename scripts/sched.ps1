@@ -433,6 +433,7 @@ function Invoke-Reap {
         $full = [System.IO.Path]::GetFullPath($p)
         if ($full.Equals($mainRoot, [StringComparison]::OrdinalIgnoreCase)) { continue }
         if ($referenced -contains $full) { Write-Host "  保留副本 $full（活跃任务登记在用）"; continue }
+        if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
         $dirty = (& git -C $full status --porcelain 2>$null | Measure-Object).Count
         if ($dirty -gt 0) { Write-Host "  保留副本 $full（有 $dirty 处未提交改动，不敢删）"; continue }
         $head = (& git -C $full rev-parse HEAD 2>$null)

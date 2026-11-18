@@ -1,28 +1,53 @@
 using System;
-using System.Runtime.CompilerServices;
 
 namespace System.Drawing;
 
-// 底层高性能像素操作物理原语（硬件加速与向量化）。
-// 由编译器 irgen 直接降低为 LLVM 向量化内部循环与指令，
-// 供上层 ImageBuffer、GUI 渲染器与游戏引擎自举调用。
-[Intrinsic]
+// 高性能像素操作，通过原生加速归档实现。
 public class PixelOps {
+    [DllImport("crt", EntryPoint = "zan_hw_pixel_blend_over")]
+    private static extern void NativeBlendOver(ref byte dst, ref byte src, long count);
+
+    [DllImport("crt", EntryPoint = "zan_hw_pixel_swap_rb")]
+    private static extern void NativeSwapRB(ref byte dst, ref byte src, long count);
+
+    [DllImport("crt", EntryPoint = "zan_hw_pixel_fill_rect")]
+    private static extern void NativeFillRect(ref byte dst, long stride, long x, long y, long w, long h, uint color);
+
+    [DllImport("crt", EntryPoint = "zan_hw_pixel_resample_bilinear_row")]
+    private static extern void NativeResampleBilinearRow(ref byte dst, ref byte src0, ref byte src1,
+                                                       ref int xIndices, ref int xWeights, int weightY, long width);
+
     // 将 count 个 32 位 ARGB 像素使用标准 Porter-Duff Over 算法合成到 dst。
-    [DllImport("crt")]
-    public static extern void BlendOver(nint dst, nint src, int count);
+    public static void BlendOver(nint dst, nint src, int count) {
+        if (count <= 0 || dst == 0 || src == 0) { return; }
+        Span<byte> target = new Span<byte>(dst, 1);
+        Span<byte> source = new Span<byte>(src, 1);
+        NativeBlendOver(ref target[0], ref source[0], count);
+    }
 
     // 交换 count 个 32 位像素的 R 和 B 通道（RGBA ↔ BGRA）。
-    [DllImport("crt")]
-    public static extern void SwapRB(nint dst, nint src, int count);
+    public static void SwapRB(nint dst, nint src, int count) {
+        if (count <= 0 || dst == 0 || src == 0) { return; }
+        Span<byte> target = new Span<byte>(dst, 1);
+        Span<byte> source = new Span<byte>(src, 1);
+        NativeSwapRB(ref target[0], ref source[0], count);
+    }
 
     // 快速填充指定矩形区域的 32 位像素颜色。
-    [DllImport("crt")]
-    public static extern void FillRect(nint dst, int dstStride, int x, int y, int w, int h, int color);
+    public static void FillRect(nint dst, int dstStride, int x, int y, int w, int h, int color) {
+        if (w <= 0 || h <= 0 || dst == 0) { return; }
+        Span<byte> target = new Span<byte>(dst, 1);
+        NativeFillRect(ref target[0], dstStride, x, y, w, h, (uint)color);
+    }
 
-    // 双线性重采样单行：根据 X 轴源索引、X 轴权重数组和当前行 Y 权重，
-    // 对 src0 和 src1 两行像素进行水平加垂直双线性插值，输出 width 个像素到 dst。
-    // xWeights 与 weightY 范围为 0..256（定点数）。
-    [DllImport("crt")]
-    public static extern void ResampleBilinearRow(nint dst, nint src0, nint src1, nint xIndices, nint xWeights, int weightY, int width);
+    // 双线性重采样单行。xWeights 与 weightY 范围为 0..256（定点数）。
+    public static void ResampleBilinearRow(nint dst, nint src0, nint src1, nint xIndices, nint xWeights, int weightY, int width) {
+        if (width <= 0 || dst == 0 || src0 == 0 || src1 == 0 || xIndices == 0 || xWeights == 0) { return; }
+        Span<byte> target = new Span<byte>(dst, 1);
+        Span<byte> top = new Span<byte>(src0, 1);
+        Span<byte> bottom = new Span<byte>(src1, 1);
+        Span<int> indices = new Span<int>(xIndices, 1);
+        Span<int> weights = new Span<int>(xWeights, 1);
+        NativeResampleBilinearRow(ref target[0], ref top[0], ref bottom[0], ref indices[0], ref weights[0], weightY, width);
+    }
 }

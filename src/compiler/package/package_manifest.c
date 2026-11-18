@@ -573,16 +573,20 @@ static void ensure_dir_pkg(const char *path) {
 #endif
 }
 
-void zan_pkg_init(zan_pkg_registry_t *reg, const char *project_dir) {
+static void pkg_registry_init(zan_pkg_registry_t *reg, const char *project_dir) {
     memset(reg, 0, sizeof(*reg));
     size_t dlen = strlen(project_dir);
     reg->cache_dir = (char *)malloc(dlen + 32);
-    snprintf(reg->cache_dir, dlen + 32, "%s" PATH_SEP ".zan-packages", project_dir);
-    ensure_dir_pkg(reg->cache_dir);
     reg->lock_file = (char *)malloc(dlen + 16);
-    snprintf(reg->lock_file, dlen + 16, "%s" PATH_SEP "zan.lock", project_dir);
     reg->resolved = (zan_package_t **)calloc(256, sizeof(zan_package_t *));
-    reg->resolved_count = 0;
+    if (!reg->cache_dir || !reg->lock_file || !reg->resolved) zan_host_oom();
+    snprintf(reg->cache_dir, dlen + 32, "%s" PATH_SEP ".zan-packages", project_dir);
+    snprintf(reg->lock_file, dlen + 16, "%s" PATH_SEP "zan.lock", project_dir);
+}
+
+void zan_pkg_init(zan_pkg_registry_t *reg, const char *project_dir) {
+    pkg_registry_init(reg, project_dir);
+    ensure_dir_pkg(reg->cache_dir);
 }
 
 bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t *ver) {

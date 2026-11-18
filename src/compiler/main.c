@@ -11,7 +11,8 @@
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
-#include "attr_routes.h"
+#include "../../packages/Zan.Data/compiler/orm_adapter.h"
+#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 #include "irgen.h"
 #include "optimizer.h"
 #include "crosscomp.h"
@@ -20,8 +21,7 @@
 #include "symbols.h"
 #include "package.h"
 #include "win_utf8.h"
-#include "apk.h"
-#include "ipa.h"
+#include "../packaging/mobile_postlink.h"
 #include <llvm-c/Comdat.h>
 /* zan */
 #include "zan_default_icon.h"
@@ -73,6 +73,83 @@ typedef struct {
     int count;
     int capacity;
 } generated_object_vec_t;
+
+static char link_work_dir[1024];
+static char link_work_icon[1100];
+static char link_work_output[1100];
+static char link_work_package[1100];
+static char link_work_package_sidecar[1120];
+static char link_work_unsigned_package[1120];
+
+static bool publish_link_output(const char *from, const char *to) {
+#ifdef _WIN32
+    wchar_t *wide_from = zan_utf8_to_wide_alloc(from);
+    wchar_t *wide_to = zan_utf8_to_wide_alloc(to);
+    bool ok = wide_from && wide_to &&
+        MoveFileExW(wide_from, wide_to, MOVEFILE_REPLACE_EXISTING);
+    free(wide_from);
+    free(wide_to);
+    return ok;
+#else
+    return rename(from, to) == 0;
+#endif
+}
+
+static void clear_link_work_dir(void) {
+    if (!link_work_dir[0]) return;
+    if (link_work_output[0]) remove(link_work_output);
+    if (link_work_icon[0]) remove(link_work_icon);
+    if (link_work_package[0]) remove(link_work_package);
+    if (link_work_package_sidecar[0]) remove(link_work_package_sidecar);
+    if (link_work_unsigned_package[0]) remove(link_work_unsigned_package);
+#ifdef _WIN32
+    wchar_t *wide = zan_utf8_to_wide_alloc(link_work_dir);
+    if (wide) {
+        if (RemoveDirectoryW(wide)) link_work_dir[0] = '\0';
+        free(wide);
+    }
+#else
+    if (rmdir(link_work_dir) == 0) link_work_dir[0] = '\0';
+#endif
+}
+
+static bool create_link_work_dir(const char *output) {
+#ifdef _WIN32
+    char full_path[1024];
+    if (!zan_utf8_full_path(output, full_path, sizeof(full_path))) return false;
+    output = full_path;
+#endif
+    const char *sep = strrchr(output, '/');
+#ifdef _WIN32
+    const char *win_sep = strrchr(output, '\\');
+    if (win_sep && (!sep || win_sep > sep)) sep = win_sep;
+#endif
+    size_t parent_len = sep ? (size_t)(sep - output) + 1 : 0;
+    if (parent_len + 64 >= sizeof(link_work_dir)) return false;
+#ifdef _WIN32
+    bool created = false;
+    for (unsigned attempt = 0; attempt < 64; attempt++) {
+        snprintf(link_work_dir, sizeof(link_work_dir), "%.*s.zanc-%lu-%llu-%u",
+                 (int)parent_len, output, (unsigned long)GetCurrentProcessId(),
+                 (unsigned long long)GetTickCount64(), attempt);
+        wchar_t *wide = zan_utf8_to_wide_alloc(link_work_dir);
+        if (!wide) return false;
+        created = CreateDirectoryW(wide, NULL) != 0;
+        DWORD error = created ? ERROR_SUCCESS : GetLastError();
+        free(wide);
+        if (created) break;
+        if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) return false;
+    }
+    if (!created) return false;
+#else
+    snprintf(link_work_dir, sizeof(link_work_dir), "%.*s.zanc-XXXXXX",
+             (int)parent_len, output);
+    if (!mkdtemp(link_work_dir)) return false;
+#endif
+    if (atexit(clear_link_work_dir) == 0) return true;
+    clear_link_work_dir();
+    return false;
+}
 
 static bool zan_is_zcomp_path(const char *p) {
     size_t n = strlen(p);
@@ -424,7 +501,7 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
     return unit;
 }
 
-#include "driver/main_synth.c"
+#include "../../packages/Zan.Gui/compiler/gui_entry.h"
 #include "driver/main_dump.c"
 #include "driver/main_driver.c"
 
@@ -520,18 +597,7 @@ static int zan_write_static_lib(const char *obj, const char *arc,
         fprintf(stderr,
                 "error: static library emission requires llvm-ar; install LLVM "
                 "on PATH or place llvm-ar beside zanc\n");
-    if (rc == 0) {
-#ifdef _WIN32
-        wchar_t *wide_tmp = zan_utf8_to_wide_alloc(tmp);
-        wchar_t *wide_arc = zan_utf8_to_wide_alloc(arc);
-        rc = wide_tmp && wide_arc &&
-             MoveFileExW(wide_tmp, wide_arc, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
-        free(wide_tmp);
-        free(wide_arc);
-#else
-        rc = rename(tmp, arc);
-#endif
-    }
+    if (rc == 0 && !publish_link_output(tmp, arc)) rc = -1;
     remove(tmp);
     free(tmp);
     return rc == 0 ? 0 : -1;
@@ -807,10 +873,15 @@ int main(int argc, char **argv) {
         generated_object_vec_keep_or_remove(&generated_objects, obj_tmp,
                                             link_ret != 0 &&
                                             getenv("ZAN_KEEP_FAILED_OBJ") != NULL);
-        if (icon_obj[0]) remove(icon_obj);
 
-        if (link_ret != 0) {
-            fprintf(stderr, "error: linking failed\n");
+        bool publish_failed = link_ret == 0 && !emit_lib && !apk_path && !ipa_path &&
+                              !publish_link_output(obj_path, final_link_path);
+        if (link_ret != 0 || publish_failed) {
+            clear_link_work_dir();
+            if (publish_failed)
+                fprintf(stderr, "error: cannot publish linked output '%s'\n", final_link_path);
+            else
+                fprintf(stderr, "error: linking failed\n");
             zan_diag_free_buffers(irgen.diag);
             zan_irgen_destroy(&irgen);
             zan_arena_free(ir_arena);
@@ -822,7 +893,7 @@ int main(int argc, char **argv) {
         if ((publish_mode || target.os == ZAN_OS_WINDOWS) &&
             used_driver_count > 0) {
             char outdir[1024];
-            snprintf(outdir, sizeof(outdir), "%s", obj_path);
+            snprintf(outdir, sizeof(outdir), "%s", final_link_path);
             { char *s1 = strrchr(outdir, '/'); char *s2 = strrchr(outdir, '\\');
               char *s = (s1 > s2) ? s1 : s2;
               if (s) *s = '\0'; else snprintf(outdir, sizeof(outdir), "."); }
@@ -958,105 +1029,58 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (apk_path) {
-            const char *abi = (target.arch == ZAN_ARCH_AARCH64)
-                              ? "arm64-v8a" : "x86_64";
-            char pkg[256], lbl[256];
-            if (apk_package) {
-                if (strlen(apk_package) >= sizeof(pkg)) {
-                    fprintf(stderr, "error: --apk-package exceeds %zu bytes\n",
-                            sizeof(pkg) - 1);
-                    remove(obj_path);
-                    zan_diag_free_buffers(irgen.diag);
-                    zan_irgen_destroy(&irgen);
-                    zan_arena_free(ir_arena);
-                    zan_arena_free(arena);
-                    free(source);
-                    return 1;
-                }
-                snprintf(pkg, sizeof(pkg), "%s", apk_package);
-            } else {
-              const char *base = strrchr(input_file, '/');
-              const char *base2 = strrchr(input_file, '\\');
-              if (base2 > base) base = base2;
-              base = base ? base + 1 : input_file;
-              snprintf(pkg, sizeof(pkg), "dev.zan.%s", base);
-              { char *dot = strrchr(pkg, '.');
-                if (dot && strcmp(dot, ".zan") == 0) *dot = 0; }
-              for (char *c = pkg; *c; c++) {
-                  if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z')
-                        || (*c >= '0' && *c <= '9') || *c == '_' || *c == '.'))
-                      *c = '_';
-              }
+        if (apk_path || ipa_path) {
+            const char *package_path = apk_path ? apk_path : ipa_path;
+            snprintf(link_work_package, sizeof(link_work_package), "%s/package%s",
+                     link_work_dir, apk_path ? ".apk" : ".ipa");
+            if (apk_path) {
+                snprintf(link_work_package_sidecar, sizeof(link_work_package_sidecar),
+                         "%s.idsig", link_work_package);
+                snprintf(link_work_unsigned_package, sizeof(link_work_unsigned_package),
+                         "%s.unsigned", link_work_package);
             }
-            if (apk_label) {
-                if (strlen(apk_label) >= sizeof(lbl)) {
-                    fprintf(stderr, "error: --apk-label exceeds %zu bytes\n",
-                            sizeof(lbl) - 1);
-                    remove(obj_path);
-                    zan_diag_free_buffers(irgen.diag);
-                    zan_irgen_destroy(&irgen);
-                    zan_arena_free(ir_arena);
-                    zan_arena_free(arena);
-                    free(source);
-                    return 1;
-                }
-                snprintf(lbl, sizeof(lbl), "%s", apk_label);
-            } else {
-              const char *base = strrchr(input_file, '/');
-              const char *base2 = strrchr(input_file, '\\');
-              if (base2 > base) base = base2;
-              base = base ? base + 1 : input_file;
-              snprintf(lbl, sizeof(lbl), "%s", base);
-              { char *d2 = strrchr(lbl, '.');
-                if (d2 && strcmp(d2, ".zan") == 0) *d2 = 0; }
+            const zan_mobile_postlink_options_t mobile = {
+                .input_path = input_file,
+                .linked_path = obj_path,
+                .staged_path = link_work_package,
+                .apk_path = apk_path,
+                .apk_package = apk_package,
+                .apk_label = apk_label,
+                .apk_arm64 = target.arch == ZAN_ARCH_AARCH64,
+                .quiet = quiet,
+                .driver_count = used_driver_count,
+                .driver_dirs = driver_dirs,
+                .driver_names = used_drivers,
+                .driver_name_lengths = used_driver_len,
+                .android_permission_count = proj_android_perm_count,
+                .android_permissions = proj_android_perms,
+                .ipa_path = ipa_path,
+                .ipa_name = ipa_name,
+                .ipa_bundle_id = ipa_bundle_id,
+                .icon_path = icon_path
+            };
+            int package_status = zan_mobile_postlink(&mobile);
+            if (package_status != 0 && apk_path &&
+                zan_file_exists(link_work_unsigned_package)) {
+                char unsigned_path[1120];
+                int n = snprintf(unsigned_path, sizeof(unsigned_path), "%s.unsigned", apk_path);
+                if (n > 0 && (size_t)n < sizeof(unsigned_path) &&
+                    publish_link_output(link_work_unsigned_package, unsigned_path))
+                    fprintf(stderr, "  (unsigned package kept at %s)\n", unsigned_path);
             }
-            char *extras[256]; int nextra = 0;
-            { char outdir_a[1024]; snprintf(outdir_a, sizeof(outdir_a), "%s", obj_path);
-              { char *s1 = strrchr(outdir_a, '/'); char *s2 = strrchr(outdir_a, '\\');
-                char *s = (s1 > s2) ? s1 : s2; if (s) *s = 0; }
-              for (int d = 0; d < used_driver_count && nextra < 256; d++) {
-                  const char *dd = driver_dirs[d];
-                  if (!dd[0]) continue;
-                  char drv[64];
-                  snprintf(drv, sizeof(drv), "%.*s", used_driver_len[d], used_drivers[d]);
-                  char manifest_p[1300];
-                  snprintf(manifest_p, sizeof(manifest_p), "%s/%s.bundle", dd, drv);
-                  FILE *mf = fopen(manifest_p, "rb");
-                  if (!mf) continue;
-                  char line[128];
-                  while (fgets(line, sizeof(line), mf) && nextra < 256) {
-                      size_t l = strlen(line);
-                      while (l > 0 && (line[l-1]=='\n'||line[l-1]=='\r'||line[l-1]==' '||line[l-1]=='\t')) line[--l]=0;
-                      if (l == 0) continue;
-                      if (!strstr(line, ".so")) continue;
-                      static char names[256][128];
-                      snprintf(names[nextra], sizeof(names[0]), "%s/%s", dd, line);
-                      extras[nextra] = names[nextra];
-                      nextra++;
-                  }
-                  fclose(mf);
-              }
+            if (package_status == 0 && !publish_link_output(link_work_package, package_path)) {
+                fprintf(stderr, "error: cannot publish package '%s'\n", package_path);
+                package_status = 1;
             }
-            char shell_dir[1300];
-            { char exe_dir_a[1024] = {0};
-#ifdef _WIN32
-              { char mod[1024]; DWORD n = GetModuleFileNameA(NULL, mod, sizeof(mod));
-                if (n > 0 && n < sizeof(mod)) { char *s = strrchr(mod, '\\'); if (s) *s = 0; snprintf(exe_dir_a, sizeof(exe_dir_a), "%s", mod); } }
-#elif defined(__APPLE__)
-              { uint32_t sz = sizeof(exe_dir_a); if (_NSGetExecutablePath(exe_dir_a, &sz) == 0) { char *s = strrchr(exe_dir_a, '/'); if (s) *s = 0; } }
-#else
-              { ssize_t n = readlink("/proc/self/exe", exe_dir_a, sizeof(exe_dir_a) - 1);
-                if (n > 0) { exe_dir_a[n] = 0; char *s = strrchr(exe_dir_a, '/'); if (s) *s = 0; } }
-#endif
-              snprintf(shell_dir, sizeof(shell_dir), "%s/apk-shell", exe_dir_a);
+            if (package_status == 0 && apk_path &&
+                zan_file_exists(link_work_package_sidecar)) {
+                char idsig_path[1120];
+                int n = snprintf(idsig_path, sizeof(idsig_path), "%s.idsig", apk_path);
+                if (n <= 0 || (size_t)n >= sizeof(idsig_path) ||
+                    !publish_link_output(link_work_package_sidecar, idsig_path))
+                    fprintf(stderr, "warning: cannot publish APK v4 signature for '%s'\n", apk_path);
             }
-            if (!quiet)
-                printf("  packaging APK ? %s\n", apk_path);
-            if (zan_apk_build(apk_path, obj_path, abi, pkg, lbl, shell_dir,
-                              extras, nextra,
-                              proj_android_perm_count, proj_android_perms) != 0) {
-                remove(obj_path);
+            if (package_status != 0) {
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -1064,91 +1088,10 @@ int main(int argc, char **argv) {
                 free(source);
                 return 1;
             }
-            remove(obj_path);
-        }
-
-        if (ipa_path) {
-            const char *app_name = ipa_name;
-            char def_name[256];
-            if (!app_name) {
-                const char *base = zan_path_basename(ipa_path);
-                if (!base || !base[0] || strcmp(base, "out.exe") == 0 || strcmp(base, "main") == 0) {
-                    base = zan_path_basename(input_file);
-                }
-                size_t blen = strlen(base);
-                if (blen > 4 && (strcmp(base + blen - 4, ".ipa") == 0 || strcmp(base + blen - 4, ".exe") == 0 || strcmp(base + blen - 4, ".zan") == 0)) {
-                    snprintf(def_name, sizeof(def_name), "%.*s", (int)(blen - 4), base);
-                } else {
-                    snprintf(def_name, sizeof(def_name), "%s", base);
-                }
-                app_name = def_name;
-            }
-            char def_bundle_id[512];
-            const char *bundle_id = ipa_bundle_id;
-            if (!bundle_id) {
-                snprintf(def_bundle_id, sizeof(def_bundle_id), "dev.zan.%s", app_name);
-                bundle_id = def_bundle_id;
-            }
-            const char *effective_icon = icon_path;
-            if (!effective_icon) {
-                const char *candidates[] = {
-                    "assets/icon.png",
-                    "assets/icon.ico",
-                    "icon.png",
-                    "icon.ico",
-                    NULL
-                };
-                for (int ci = 0; candidates[ci]; ci++) {
-                    FILE *ft = fopen(candidates[ci], "rb");
-                    if (ft) {
-                        fclose(ft);
-                        effective_icon = candidates[ci];
-                        break;
-                    }
-                }
-            }
-            const char *effective_assets = NULL;
-            char assets_cand[1200] = {0};
-            if (input_file) {
-                char adir[1200];
-                snprintf(adir, sizeof(adir), "%s", input_file);
-                char *s1 = strrchr(adir, '/');
-                char *s2 = strrchr(adir, '\\');
-                if (!s1 || (s2 && s2 > s1)) s1 = s2;
-                if (s1) {
-                    *s1 = 0;
-                    snprintf(assets_cand, sizeof(assets_cand), "%s/assets", adir);
-                    if (zan_file_exists(assets_cand)) {
-                        effective_assets = assets_cand;
-                    } else {
-                        char *p1 = strrchr(adir, '/');
-                        char *p2 = strrchr(adir, '\\');
-                        if (!p1 || (p2 && p2 > p1)) p1 = p2;
-                        if (p1) {
-                            *p1 = 0;
-                            snprintf(assets_cand, sizeof(assets_cand), "%s/assets", adir);
-                            if (zan_file_exists(assets_cand)) effective_assets = assets_cand;
-                        }
-                    }
-                }
-            }
-            if (!effective_assets && zan_file_exists("assets")) {
-                effective_assets = "assets";
-            }
-            if (zan_ipa_build(ipa_path, obj_path, app_name, bundle_id, app_name, "1.0.0", effective_icon, effective_assets) != 0) {
-                remove(obj_path);
-                zan_diag_free_buffers(irgen.diag);
-                zan_irgen_destroy(&irgen);
-                zan_arena_free(ir_arena);
-                zan_arena_free(arena);
-                free(source);
-                return 1;
-            }
-            remove(obj_path);
         }
 
         if (!quiet) {
-            const char *final_out = ipa_path ? ipa_path : (apk_path ? apk_path : obj_path);
+            const char *final_out = ipa_path ? ipa_path : (apk_path ? apk_path : final_link_path);
             if (input_count == 1) {
                 printf("%s '%s' ? '%s'\n", publish_mode ? "Published" : "Compiled", input_file, final_out);
             } else {
@@ -1166,6 +1109,8 @@ int main(int argc, char **argv) {
     zan_arena_free(arena);
     free(source);
 #ifdef _WIN32
+    /* ExitProcess bypasses the CRT's atexit callbacks. */
+    clear_link_work_dir();
     fflush(stdout);
     fflush(stderr);
     ExitProcess(0);

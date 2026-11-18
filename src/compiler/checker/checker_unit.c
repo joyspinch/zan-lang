@@ -221,103 +221,224 @@ static bool checker_class_is_abstract(zan_symbol_t *sym) {
     return false;
 }
 
-/* 本类（含继承来的）是否覆盖了某个抽象方法（按名字 + 参数个数匹配）。 */
-static bool checker_class_overrides(zan_symbol_t *sym, zan_istr_t name,
-                                    int arity, int depth) {
-    if (!sym || depth > 16) return false;
-    for (int i = 0; i < sym->member_count; i++) {
-        zan_symbol_t *m = sym->members[i];
-        if (!m || m->kind != SYM_METHOD) continue;
-        if (!(m->modifiers & MOD_OVERRIDE)) continue;
-        if (m->name.len == name.len &&
-            memcmp(m->name.str, name.str, (size_t)name.len) == 0 &&
-            checker_method_param_count(m) == arity)
-            return true;
-    }
-    if (sym->type && sym->type->base_type && sym->type->base_type->sym)
-        return checker_class_overrides(sym->type->base_type->sym, name, arity,
-                                       depth + 1);
-    return false;
-}
+typedef struct signature_owner {
+    zan_type_t *base;
+    const struct signature_owner *derived;
+} signature_owner_t;
 
-/* 收集继承链上声明的全部抽象方法（连同声明它们的基类）。
- * 一次性收集完再判定：逐层递归判定会把「中间那层抽象类」误当成
- * 被检查对象——中间层本来就可以不实现。 */
 typedef struct {
-    zan_symbol_t *owner;   /* 声明该抽象方法的基类 */
-    zan_symbol_t *method;
-} checker_abstract_item_t;
+    const signature_owner_t *owner;
+    const zan_ast_list_t *method_params;
+} signature_scope_t;
 
-static void collect_base_abstract_methods(zan_symbol_t *sym,
-                                          checker_abstract_item_t *out,
-                                          int *n, int cap, int depth) {
-    if (!sym || depth > 16) return;
-    zan_symbol_t *base = (sym->type && sym->type->base_type)
-        ? sym->type->base_type->sym : NULL;
-    if (!base) return;
-    for (int i = 0; i < base->member_count; i++) {
-        zan_symbol_t *m = base->members[i];
-        if (!m || m->kind != SYM_METHOD) continue;
-        if (!(m->modifiers & MOD_ABSTRACT)) continue;
-        if (*n < cap) { out[*n].owner = base; out[*n].method = m; (*n)++; }
-    }
-    collect_base_abstract_methods(base, out, n, cap, depth + 1);
+static bool signature_name_equal(zan_istr_t a, zan_istr_t b) {
+    return a.len == b.len && (!a.len || memcmp(a.str, b.str, a.len) == 0);
 }
 
-/* 收集继承链上尚未被本类覆盖的抽象方法，逐条报错。
- * 只看「继承来的」抽象方法：本类自己声明的抽象方法由「本类必须也是
- * abstract」那条规则管。 */
-static void check_abstract_implementations(zan_checker_t *c,
-                                           zan_symbol_t *sym) {
-    if (!sym) return;
-    checker_abstract_item_t items[128];
-    int n = 0;
-    collect_base_abstract_methods(sym, items, &n, 128, 0);
-    for (int i = 0; i < n; i++) {
-        zan_symbol_t *m = items[i].method;
-        zan_symbol_t *owner = items[i].owner;
-        if (checker_class_overrides(sym, m->name, checker_method_param_count(m), 0))
-            continue;
-        zan_diag_emit_code(c->diag, DIAG_ERROR, sym->decl->loc, 2093,
-            "non-abstract class '%.*s' does not implement abstract method "
-            "'%.*s' inherited from '%.*s'",
-            (int)sym->name.len, sym->name.str,
-            (int)m->name.len, m->name.str,
-            (int)owner->name.len, owner->name.str);
+static int signature_param_index(const zan_ast_list_t *params, zan_istr_t name) {
+    for (int i = 0; params && i < params->count; i++) {
+        if (signature_name_equal(params->items[i]->ident.name, name)) return i;
+    }
+    return -1;
+}
+
+/* Each base edge has type arguments expressed in the derived owner's scope.
+ * Method type parameters shadow the owner and compare by their position. */
+static zan_type_t *signature_subst(zan_type_t *type, signature_scope_t *scope,
+                                   int *method_param) {
+    *method_param = -1;
+    if (type && type->kind == TYPE_TYPE_PARAM)
+        *method_param = signature_param_index(scope->method_params, type->name);
+    while (type && type->kind == TYPE_TYPE_PARAM && *method_param < 0 && scope->owner) {
+        zan_type_t *base = scope->owner->base;
+        int i = signature_param_index(&base->sym->decl->type_decl.type_params, type->name);
+        if (i < 0 || i >= base->type_arg_count) break;
+        type = base->type_args[i];
+        scope->owner = scope->owner->derived;
+        scope->method_params = NULL;
+    }
+    return type;
+}
+
+static bool signature_is_tuple(zan_type_t *t) {
+    return t->kind == TYPE_STRUCT && t->sym && !t->sym->decl &&
+           t->name.len >= 7 && memcmp(t->name.str, "__tuple", 7) == 0;
+}
+
+static bool signature_type_equal(zan_type_t *a, signature_scope_t as,
+                                 zan_type_t *b, signature_scope_t bs, int depth) {
+    if (depth > 64) return false;
+    int ap, bp;
+    a = signature_subst(a, &as, &ap);
+    b = signature_subst(b, &bs, &bp);
+    if (ap >= 0 || bp >= 0) return ap == bp;
+    if (!a || !b) return a == b;
+    if (a->kind != b->kind) return false;
+    if (a->kind == TYPE_TYPE_PARAM)
+        return as.owner == bs.owner && signature_name_equal(a->name, b->name);
+    if (a == b && as.owner == bs.owner && as.method_params == bs.method_params)
+        return true;
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
+        return (a->kind != TYPE_ARRAY || a->array_rank == b->array_rank) &&
+            signature_type_equal(a->element_type, as, b->element_type, bs, depth + 1);
+    }
+    if (signature_is_tuple(a) && signature_is_tuple(b)) {
+        if (a->sym->member_count != b->sym->member_count) return false;
+        for (int i = 0; i < a->sym->member_count; i++) {
+            if (!signature_type_equal(a->sym->members[i]->type, as,
+                                      b->sym->members[i]->type, bs, depth + 1))
+                return false;
+        }
+        return true;
+    }
+    if (a->sym && b->sym ? a->sym != b->sym : !signature_name_equal(a->name, b->name))
+        return false;
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++) {
+        if (!signature_type_equal(a->type_args[i], as, b->type_args[i], bs, depth + 1))
+            return false;
+    }
+    return true;
+}
+
+static zan_type_t *signature_base(zan_symbol_t *owner) {
+    return owner && owner->type ? owner->type->base_type : NULL;
+}
+
+static bool signature_compare(zan_symbol_t *derived, zan_symbol_t *base,
+                              const signature_owner_t *owner, bool compare_return,
+                              int depth) {
+    zan_symbol_t *current = owner ? owner->base->sym : derived->parent;
+    if (current == base->parent) {
+        signature_scope_t ds = {NULL, &derived->decl->method_decl.type_params};
+        signature_scope_t bs = {owner, &base->decl->method_decl.type_params};
+        if (compare_return)
+            return signature_type_equal(derived->type, ds, base->type, bs, 0);
+        for (int i = 0; i < derived->member_count; i++) {
+            zan_symbol_t *a = derived->members[i], *b = base->members[i];
+            if (!a || !b || a->kind != SYM_PARAM || b->kind != SYM_PARAM ||
+                !a->decl || !b->decl || a->decl->param.by_ref != b->decl->param.by_ref ||
+                !signature_type_equal(a->type, ds, b->type, bs, 0)) return false;
+        }
+        return true;
+    }
+    zan_type_t *next = signature_base(current);
+    if (!next || !next->sym || !next->sym->decl || depth >= CHECKER_DERIVES_MAX_DEPTH)
+        return false;
+    signature_owner_t edge = {next, owner};
+    return signature_compare(derived, base, &edge, compare_return, depth + 1);
+}
+
+bool zan_checker_virtual_signature_equal(zan_symbol_t *a, zan_symbol_t *b) {
+    if (a == b) return a != NULL;
+    if (checker_method_param_count(a) < 0 ||
+        checker_method_param_count(a) != checker_method_param_count(b) ||
+        !signature_name_equal(a->name, b->name) ||
+        ((a->modifiers ^ b->modifiers) & (MOD_STATIC | MOD_ASYNC)) ||
+        a->decl->method_decl.type_params.count != b->decl->method_decl.type_params.count ||
+        a->member_count != b->member_count) return false;
+    return signature_compare(a, b, NULL, false, 0) ||
+           signature_compare(b, a, NULL, false, 0);
+}
+
+/* Match the same nearest override that supplies the virtual slot. */
+static zan_symbol_t *checker_find_abstract_override(zan_symbol_t *cls,
+                                                    zan_symbol_t *required) {
+    for (zan_symbol_t *owner = cls; owner && owner != required->parent; ) {
+        for (int i = 0; i < owner->member_count; i++) {
+            zan_symbol_t *candidate = owner->members[i];
+            if (candidate && candidate->kind == SYM_METHOD &&
+                (candidate->modifiers & MOD_OVERRIDE) &&
+                zan_checker_virtual_signature_equal(candidate, required)) return candidate;
+        }
+        zan_type_t *base = signature_base(owner);
+        owner = base ? base->sym : NULL;
+    }
+    return NULL;
+}
+
+static void check_abstract_implementations(zan_checker_t *c, zan_symbol_t *cls) {
+    for (zan_type_t *base = signature_base(cls); base && base->sym;
+         base = signature_base(base->sym)) {
+        zan_symbol_t *owner = base->sym;
+        for (int i = 0; i < owner->member_count; i++) {
+            zan_symbol_t *required = owner->members[i];
+            if (!required || required->kind != SYM_METHOD ||
+                !(required->modifiers & MOD_ABSTRACT)) continue;
+            zan_symbol_t *found = checker_find_abstract_override(cls, required);
+            if (found && signature_compare(found, required, NULL, true, 0) &&
+                ((found->modifiers & MOD_ABSTRACT) || found->decl->method_decl.body))
+                continue; /* A reabstracted slot is checked at its new declaration. */
+            zan_diag_emit_code(c->diag, DIAG_ERROR, cls->decl->loc, 2093,
+                "non-abstract class '%.*s' does not implement abstract method "
+                "'%.*s' inherited from '%.*s'",
+                (int)cls->name.len, cls->name.str,
+                (int)required->name.len, required->name.str,
+                (int)owner->name.len, owner->name.str);
+        }
     }
 }
 
-/* 抽象成员的规则：抽象方法不能是 static / async；含抽象方法的类必须
- * 声明为 abstract；具体类必须实现继承来的全部抽象方法。 */
 static void check_abstract_members(zan_checker_t *c, zan_ast_node_t *decl) {
     zan_symbol_t *ts = c->current_type_sym;
-    if (!ts) return;
-    /* 类是否 abstract 以声明上的修饰符为准（符号表里的那份不总是同一个）。 */
-    bool cls_abstract = (decl->type_decl.modifiers & MOD_ABSTRACT) != 0;
+    if (!ts || ts->decl != decl) return;
+    bool is_class = decl->kind == AST_CLASS_DECL;
+    bool is_interface = decl->kind == AST_INTERFACE_DECL;
+    uint32_t mods = decl->type_decl.modifiers;
+    if ((mods & MOD_ABSTRACT) && ((!is_class && !is_interface) ||
+        (is_class && (mods & (MOD_STATIC | MOD_SEALED))))) {
+        zan_diag_emit_code(c->diag, DIAG_ERROR, decl->loc, 2110,
+            "type '%.*s' cannot be declared abstract with its kind or modifiers",
+            (int)ts->name.len, ts->name.str);
+    }
     bool has_abstract_method = false;
     for (int j = 0; j < decl->type_decl.members.count; j++) {
         zan_ast_node_t *member = decl->type_decl.members.items[j];
-        if (member->kind != AST_METHOD_DECL) continue;
-        if (!(member->method_decl.modifiers & MOD_ABSTRACT)) continue;
+        if (member->kind != AST_METHOD_DECL) {
+            if (((member->kind == AST_FIELD_DECL || member->kind == AST_PROPERTY_DECL) &&
+                 (member->field_decl.modifiers & MOD_ABSTRACT)) ||
+                ((member->kind == AST_CONSTRUCTOR_DECL || member->kind == AST_DESTRUCTOR_DECL) &&
+                 (member->method_decl.modifiers & MOD_ABSTRACT))) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2111,
+                    "only methods can be declared abstract");
+            }
+            continue;
+        }
+        uint32_t mm = member->method_decl.modifiers;
+        if (!(mm & MOD_ABSTRACT)) continue;
         has_abstract_method = true;
-        if (member->method_decl.modifiers & MOD_STATIC) {
+        zan_istr_t name = member->method_decl.name;
+        if (!is_class && !is_interface) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2111,
+                "abstract method '%.*s' must be declared in a class or interface",
+                (int)name.len, name.str);
+        }
+        if (mm & MOD_STATIC) {
             zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2094,
-                "an abstract method cannot be static: '%.*s'",
-                (int)member->method_decl.name.len, member->method_decl.name.str);
+                "an abstract method cannot be static: '%.*s'", (int)name.len, name.str);
         }
-        if (member->method_decl.modifiers & MOD_ASYNC) {
+        if (mm & MOD_ASYNC) {
             zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2095,
-                "an abstract method cannot be async: '%.*s'",
-                (int)member->method_decl.name.len, member->method_decl.name.str);
+                "an abstract method cannot be async: '%.*s'", (int)name.len, name.str);
+        }
+        if (mm & (MOD_PRIVATE | MOD_SEALED | MOD_EXTERN)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2112,
+                "an abstract method cannot be private, sealed, or extern: '%.*s'",
+                (int)name.len, name.str);
+        }
+        if (member->method_decl.body) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2113,
+                "an abstract method cannot have a body: '%.*s'", (int)name.len, name.str);
         }
     }
-    if (has_abstract_method && !cls_abstract) {
-        zan_diag_emit_code(c->diag, DIAG_ERROR, decl->loc, 2096,
-            "class '%.*s' declares an abstract method and must be declared "
-            "'abstract'", (int)ts->name.len, ts->name.str);
-    }
-    if (!cls_abstract)
+    if (is_class && !(mods & MOD_ABSTRACT)) {
+        if (has_abstract_method) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, decl->loc, 2096,
+                "class '%.*s' declares an abstract method and must be declared "
+                "'abstract'", (int)ts->name.len, ts->name.str);
+        }
         check_abstract_implementations(c, ts);
+    }
 }
 
 static void check_virtual_shadows_base(zan_checker_t *c, zan_ast_node_t *decl) {
@@ -354,222 +475,11 @@ static void check_virtual_shadows_base(zan_checker_t *c, zan_ast_node_t *decl) {
     }
 }
 
-/* ---------- SyncStructureAll(Async) 的编译期实体发现 ----------
- *
- * "自动发现自动建表"：`db.SyncStructureAllAsync()` 零参调用不查运行时
- * 注册表——checker 在编译单元里预扫描 [Table] 类，在调用点原地合成
- * `new Meta[] { Meta.For<E1>(), ... }` 实参，交给库侧逐实体 Sync。
- * 无运行时 ABI、无生成器，实体清单与编译单元永远一致。 */
-
-static void checker_collect_table_entities(zan_checker_t *c,
-                                           zan_ast_node_t *unit) {
-    if (c->table_ents_done || !unit || unit->kind != AST_COMPILATION_UNIT) {
-        return;
-    }
-    c->table_ents_done = true;
-    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
-        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
-        if (decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str) continue;
-        if (!zan_ast_has_attr(decl, "Table")) continue;
-        int dup = 0;
-        for (int k = 0; k < c->table_ent_count; k++) {
-            if (c->table_ents[k].len == decl->type_decl.name.len &&
-                memcmp(c->table_ents[k].str, decl->type_decl.name.str,
-                       (size_t)decl->type_decl.name.len) == 0) { dup = 1; break; }
-        }
-        if (dup) continue;
-        if (c->table_ent_count >= c->table_ent_cap) {
-            int ncap = c->table_ent_cap ? c->table_ent_cap * 2 : 16;
-            zan_istr_t *nm = (zan_istr_t *)zan_arena_alloc(
-                c->arena, (size_t)ncap * sizeof(zan_istr_t));
-            for (int k = 0; k < c->table_ent_count; k++) nm[k] = c->table_ents[k];
-            c->table_ents = nm;
-            c->table_ent_cap = ncap;
-        }
-        c->table_ents[c->table_ent_count++] = decl->type_decl.name;
-    }
-}
-
-/* 接收者能否充当同步连接：本身是（或实现）IDbConnection/IDbExecutor。 */
-static bool checker_recv_is_conn(zan_checker_t *c, zan_type_t *recv) {
-    if (!recv || !recv->sym) return false;
-    if (recv->kind != TYPE_CLASS && recv->kind != TYPE_STRUCT &&
-        recv->kind != TYPE_INTERFACE) return false;
-    zan_symbol_t *isym = zan_binder_lookup(
-        c->binder, checker_istr_lit(c->arena, "IDbConnection"));
-    zan_symbol_t *xsym = zan_binder_lookup(
-        c->binder, checker_istr_lit(c->arena, "IDbExecutor"));
-    if (isym && recv->sym == isym) return true;
-    if (xsym && recv->sym == xsym) return true;
-    if (recv->kind != TYPE_INTERFACE &&
-        (recv->kind == TYPE_CLASS || recv->kind == TYPE_STRUCT)) {
-        if (isym && zan_binder_class_implements_iface(recv->sym, isym)) return true;
-        if (xsym && zan_binder_class_implements_iface(recv->sym, xsym)) return true;
-    }
-    return false;
-}
-
-/* new Meta[] { Meta.For<E1>(), ... }：数组初始化式，元素为泛型静态
- * 调用（与 ZanSql.FromConnection 同款合成形状，多 type_args）。 */
-static zan_ast_node_t *checker_synthesize_table_array(zan_checker_t *c,
-                                                      zan_loc_t loc) {
-    zan_ast_node_t *tref = zan_ast_new(c->arena, AST_TYPE_REF, loc);
-    tref->type_ref.name = checker_istr_lit(c->arena, "Meta");
-    tref->type_ref.is_nullable = false;
-    tref->type_ref.is_array = true;
-    zan_ast_list_init(&tref->type_ref.type_args);
-    zan_ast_node_t *n = zan_ast_new(c->arena, AST_NEW_EXPR, loc);
-    n->new_expr.type = tref;
-    n->new_expr.call_init = NULL;
-    zan_ast_list_init(&n->new_expr.args);
-    zan_ast_list_init(&n->new_expr.arg_inits);
-    n->new_expr.is_array = true;
-    n->new_expr.array_init = true;
-    n->new_expr.array_rank = 0;
-    n->new_expr.list_copy = false;
-    for (int i = 0; i < c->table_ent_count; i++) {
-        zan_ast_node_t *zid = zan_ast_new(c->arena, AST_IDENTIFIER, loc);
-        zid->ident.name = checker_istr_lit(c->arena, "Meta");
-        zid->ident.inst_type_ref = NULL;
-        zan_ast_node_t *cal = zan_ast_new(c->arena, AST_MEMBER_ACCESS, loc);
-        cal->member.object = zid;
-        cal->member.name = checker_istr_lit(c->arena, "For");
-        cal->member.null_cond = 0;
-        zan_ast_node_t *call = zan_ast_new(c->arena, AST_CALL, loc);
-        call->call.callee = cal;
-        zan_ast_list_init(&call->call.args);
-        zan_ast_list_init(&call->call.type_args);
-        zan_ast_list_push(&call->call.type_args,
-                          checker_type_ref(c, c->table_ents[i], NULL, loc),
-                          c->arena);
-        zan_ast_list_push(&n->new_expr.args, call, c->arena);
-    }
-    return n;
-}
-
-/* ---------- __AttrRoutes.Register 的编译期控制器发现 ----------
- *
- * 预扫描 compilation unit 里的 Controller 类，在 __AttrRoutes.Register(app)
- * 调用点原地合成 `new TypeInfo[] { typeof(C1), typeof(C2), ... }` 实参，
- * 由框架动态约定路由引擎遍历计算并载入共享内存表。 */
-
-static void checker_collect_controllers(zan_checker_t *c,
-                                        zan_ast_node_t *unit) {
-    if (c->ctrl_ents_done || !unit || unit->kind != AST_COMPILATION_UNIT) {
-        return;
-    }
-    c->ctrl_ents_done = true;
-    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
-        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
-        if (decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str) continue;
-        if (decl->type_decl.modifiers & MOD_ABSTRACT) continue;
-        if (decl->type_decl.type_params.count > 0) continue;
-
-        /* B-ID110：库侧（stdlib / packages）自带控制器不参与隐式发现——
-         * 否则 Zan.Mvc 拉入编译集的 200+ 框架控制器被用户项目的
-         * __AttrRoutes.Register 全量吞掉；框架页归 Boot/显式注册管。
-         *
-         * 判定按**来源**而不是命名空间：模板/示例项目（用户自己的代码）
-         * 也统一使用 Zan.Web.* 命名空间，按命名空间跳过会把项目自己的
-         * 控制器一并吞掉（server-legend 全体 API 404 就是这么来的）。 */
-        if (decl->from_stdlib || decl->from_package ||
-            zan_routes_framework_controller(unit, decl)) continue;
-
-        /* 排除框架基类本身 */
-        uint32_t nl = decl->type_decl.name.len;
-        const char *ns = decl->type_decl.name.str;
-        if (nl == 10 && memcmp(ns, "Controller", 10) == 0) continue;
-        if (nl == 13 && memcmp(ns, "AppController", 13) == 0) continue;
-        if (nl == 15 && memcmp(ns, "AdminController", 15) == 0) continue;
-        if (nl == 13 && memcmp(ns, "ApiController", 13) == 0) continue;
-        if (nl == 20 && memcmp(ns, "CrudScreenController", 20) == 0) continue;
-
-        /* 判定是否为控制器：以 Controller 结尾，或带有 [Route]/[ApiController]，或继承自 Controller 家族 */
-        bool is_ctrl = false;
-        if (nl >= 10 && memcmp(ns + nl - 10, "Controller", 10) == 0) {
-            is_ctrl = true;
-        } else if (zan_ast_has_attr(decl, "Route") || zan_ast_has_attr(decl, "ApiController")) {
-            is_ctrl = true;
-        } else {
-            for (int b = 0; b < decl->type_decl.bases.count; b++) {
-                zan_ast_node_t *base = decl->type_decl.bases.items[b];
-                if (base && base->kind == AST_TYPE_REF && base->type_ref.name.str) {
-                    uint32_t bl = base->type_ref.name.len;
-                    const char *bs = base->type_ref.name.str;
-                    if (bl >= 10 && memcmp(bs + bl - 10, "Controller", 10) == 0) {
-                        is_ctrl = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (!is_ctrl) continue;
-
-        int dup = 0;
-        for (int k = 0; k < c->ctrl_ent_count; k++) {
-            if (c->ctrl_ents[k].len == decl->type_decl.name.len &&
-                memcmp(c->ctrl_ents[k].str, decl->type_decl.name.str,
-                       (size_t)decl->type_decl.name.len) == 0) { dup = 1; break; }
-        }
-        if (dup) continue;
-        if (c->ctrl_ent_count >= c->ctrl_ent_cap) {
-            int ncap = c->ctrl_ent_cap ? c->ctrl_ent_cap * 2 : 32;
-            zan_istr_t *nm = (zan_istr_t *)zan_arena_alloc(
-                c->arena, (size_t)ncap * sizeof(zan_istr_t));
-            for (int k = 0; k < c->ctrl_ent_count; k++) nm[k] = c->ctrl_ents[k];
-            c->ctrl_ents = nm;
-            c->ctrl_ent_cap = ncap;
-        }
-        c->ctrl_ents[c->ctrl_ent_count++] = decl->type_decl.name;
-    }
-}
-
-/* __ZanActionDispatch.Dispatch：main.c 为含 __AttrRoutes.Register 的编译单元
- * 合成动作派发类；这里把它的方法组作为 Register 的第三实参传进去。 */
-static zan_ast_node_t *checker_synthesize_dispatcher_ref(zan_checker_t *c,
-                                                         zan_loc_t loc,
-                                                         bool framework) {
-    zan_ast_node_t *id = zan_ast_new(c->arena, AST_IDENTIFIER, loc);
-    id->ident.name = checker_istr_lit(c->arena, "__ZanActionDispatch");
-    id->ident.inst_type_ref = NULL;
-    zan_ast_node_t *m = zan_ast_new(c->arena, AST_MEMBER_ACCESS, loc);
-    m->member.object = id;
-    m->member.name = checker_istr_lit(c->arena,
-                                    framework ? "DispatchFramework" : "Dispatch");
-    m->member.null_cond = 0;
-    return m;
-}
-
-/* new TypeInfo[] { typeof(C1), typeof(C2), ... } */
-static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
-                                                            zan_loc_t loc) {
-    zan_ast_node_t *tref = zan_ast_new(c->arena, AST_TYPE_REF, loc);
-    tref->type_ref.name = checker_istr_lit(c->arena, "TypeInfo");
-    tref->type_ref.is_nullable = false;
-    tref->type_ref.is_array = true;
-    zan_ast_list_init(&tref->type_ref.type_args);
-    zan_ast_node_t *n = zan_ast_new(c->arena, AST_NEW_EXPR, loc);
-    n->new_expr.type = tref;
-    n->new_expr.call_init = NULL;
-    zan_ast_list_init(&n->new_expr.args);
-    zan_ast_list_init(&n->new_expr.arg_inits);
-    n->new_expr.is_array = true;
-    n->new_expr.array_init = true;
-    n->new_expr.array_rank = 0;
-    n->new_expr.list_copy = false;
-    for (int i = 0; i < c->ctrl_ent_count; i++) {
-        zan_ast_node_t *tof = zan_ast_new(c->arena, AST_TYPEOF_EXPR, loc);
-        tof->cast.type = checker_type_ref(c, c->ctrl_ents[i], NULL, loc);
-        zan_ast_list_push(&n->new_expr.args, tof, c->arena);
-    }
-    return n;
-}
-
 static void check_unit(zan_checker_t *c, zan_ast_node_t *unit, int64_t only_file_id) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
 
-    checker_collect_table_entities(c, unit);
-    checker_collect_controllers(c, unit);
+    zan_data_orm_prepare(c, unit);
+    zan_mvc_collect_controllers(&c->mvc_routes, unit, c->arena);
     check_all_struct_cycles(c, unit);
 
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -582,10 +492,8 @@ static void check_unit(zan_checker_t *c, zan_ast_node_t *unit, int64_t only_file
         c->current_type_sym = zan_binder_lookup(c->binder, decl->type_decl.name);
         zan_scope_t *saved_scope = zan_binder_push_type_params(
             c->binder, &decl->type_decl.type_params);
-        if (decl->kind == AST_CLASS_DECL) {
-            check_virtual_shadows_base(c, decl);
-            check_abstract_members(c, decl);
-        }
+        if (decl->kind == AST_CLASS_DECL) check_virtual_shadows_base(c, decl);
+        check_abstract_members(c, decl);
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             if (only_file_id >= 0 && member->loc.file_id != only_file_id) continue;

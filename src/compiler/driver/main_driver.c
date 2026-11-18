@@ -957,6 +957,170 @@ static int zan_path_is_package_source(const char *path) {
     return 0;
 }
 
+static const bool *zan_capture_live_imports(const zan_irgen_t *g) {
+    if (!g->extern_fn_count) return NULL;
+    bool *live = zan_arena_alloc(g->arena, (size_t)g->extern_fn_count * sizeof(*live));
+    for (int i = 0; i < g->extern_fn_count; i++) {
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, g->extern_fns[i].name.str);
+        live[i] = fn && LLVMIsDeclaration(fn) && LLVMGetFirstUse(fn);
+    }
+    return live;
+}
+
+/* An explicit link file can supply a DllImport without using its -l name.
+ * Require coverage for every live symbol before omitting -l. The linker
+ * still validates file format, target and symbol visibility. */
+static bool zan_link_inputs_supply_import(const zan_irgen_t *g, zan_istr_t lib,
+                                          const bool *live, const char **inputs,
+                                          int count) {
+    if (!live || !count) return false;
+    int needed = 0, supplied = 0;
+    bool *found = calloc((size_t)g->extern_fn_count, sizeof(*found));
+    if (!found) return false;
+    for (int i = 0; i < g->extern_fn_count; i++) {
+        found[i] = !live[i] || g->extern_fns[i].lib.len != lib.len ||
+                   memcmp(g->extern_fns[i].lib.str, lib.str, lib.len) != 0;
+        if (!found[i]) needed++;
+    }
+    for (int e = 0; e < count && supplied < needed; e++) {
+        const char *input = inputs[e];
+        /* Double quotes alone don't protect these characters from the shell. */
+#ifdef _WIN32
+        if (strpbrk(input, "\"%\r\n")) continue;
+#else
+        if (strpbrk(input, "\"$`\\\r\n")) continue;
+#endif
+        const char *file_name = zan_path_basename(input);
+        const char *so = strstr(file_name, ".so");
+        bool elf_shared = !g->target_is_windows && !g->target_is_macos &&
+                          !g->target_is_ios && !g->target_is_wasm &&
+                          so && (so[3] == '\0' || so[3] == '.');
+        char command[1600];
+        int len = snprintf(command, sizeof(command),
+            "llvm-nm --defined-only --extern-only --format=posix %s\"%s%s\" 2>%s",
+            elf_shared ? "--dynamic " : "",
+            input[0] == '-' || input[0] == '@' ? "./" : "", input,
+#ifdef _WIN32
+            "NUL"
+#else
+            "/dev/null"
+#endif
+        );
+        if (len < 0 || (size_t)len >= sizeof(command)) continue;
+#ifdef _WIN32
+        FILE *pipe = _popen(command, "r");
+#else
+        FILE *pipe = popen(command, "r");
+#endif
+        if (!pipe) continue;
+        char line[1024];
+        while (fgets(line, sizeof(line), pipe)) {
+            size_t len = strcspn(line, " \t\r\n");
+            if (!len || line[len - 1] == ':') continue;
+            const char *name = line;
+            if ((g->target_is_macos || g->target_is_ios) && name[0] == '_') {
+                name++;
+                len--;
+            }
+            for (int i = 0; i < g->extern_fn_count; i++) {
+                zan_istr_t symbol = g->extern_fns[i].name;
+                if (!found[i] && symbol.len == len &&
+                    memcmp(symbol.str, name, len) == 0) {
+                    found[i] = true;
+                    supplied++;
+                }
+            }
+        }
+#ifdef _WIN32
+        _pclose(pipe);
+#else
+        pclose(pipe);
+#endif
+    }
+    free(found);
+    return needed > 0 && supplied == needed;
+}
+
+/* ELF shared libraries can bind to their host's runtime. Require resolution
+ * of active named DllImports while preserving those loader bindings. */
+static int zan_link_elf_shared(char *cmd, size_t cap, const zan_irgen_t *g,
+                               const bool *live, const char *diagnostics) {
+    if (!live) return system(cmd);
+    cmd_appendf(cmd, cap, " --unresolved-symbols=report-all --warn-unresolved-symbols"
+                       " --no-demangle --error-limit=0 --color-diagnostics=never"
+                       " > \"%s\" 2>&1", diagnostics);
+    int rc = system(cmd);
+    FILE *stream = fopen(diagnostics, "rb");
+    if (!stream) {
+        fprintf(stderr, "error: cannot read ELF linker diagnostics\n");
+        return 1;
+    }
+    static const char warning[] = "ld.lld: warning: undefined symbol: ";
+    char line[2048];
+    bool skip_reference = false;
+    bool missing = false;
+    while (fgets(line, sizeof(line), stream)) {
+        if (rc == 0 && strncmp(line, warning, sizeof(warning) - 1) == 0) {
+            skip_reference = true;
+            const char *symbol = line + sizeof(warning) - 1;
+            size_t len = strcspn(symbol, "\r\n");
+            for (int i = 0; i < g->extern_fn_count; i++) {
+                zan_istr_t name = g->extern_fns[i].name;
+                zan_istr_t lib = g->extern_fns[i].lib;
+                int lib_len;
+                if (live[i] && name.len == len && memcmp(name.str, symbol, len) == 0 &&
+                    zan_dllimport_lname(lib.str, (int)lib.len, &lib_len)) {
+                    fprintf(stderr, "error: undefined DllImport '%.*s' from '%.*s'\n",
+                            (int)name.len, name.str, (int)lib.len, lib.str);
+                    missing = true;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (skip_reference && (strncmp(line, ">>>", 3) == 0 || line[0] == '\r' || line[0] == '\n'))
+            continue;
+        skip_reference = false;
+        fputs(line, stderr);
+    }
+    if (ferror(stream)) {
+        fprintf(stderr, "error: cannot read ELF linker diagnostics\n");
+        missing = true;
+    }
+    fclose(stream);
+    remove(diagnostics);
+    return missing ? 1 : rc;
+}
+
+/* The WASI runtime has single-threaded implementations of atomics, monitors,
+ * clocks and UI-thread state. Reject calls to its unsupported capabilities
+ * after dead-code elimination, while the module is still available. */
+static bool zan_wasi_capabilities_supported(const zan_irgen_t *g) {
+    static const char *const unsupported[] = {
+        "zan_shared_table_", "zan_mmap_", "zan_plat_", "zan_proc_", "zan_gate_",
+        "zan_io_socket_", "zan_io_connect_", "zan_io_resolve", "zan_io_sockaddr_",
+        "zan_io_close_notify", "zan_io_wait_co", "zan_io_recv_co",
+        "zan_io_recv_to_co", "zan_io_accept_co", "zan_rt_blocking_co",
+        "SSL_", "TLS_", "BIO_", "X509_", "ERR_get_error", "d2i_X509",
+        "i2d_X509_PUBKEY", "CRYPTO_free"
+    };
+    for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
+         fn = LLVMGetNextFunction(fn)) {
+        if (!LLVMIsDeclaration(fn) || !LLVMGetFirstUse(fn)) continue;
+        const char *name = LLVMGetValueName(fn);
+        if (strcmp(name, "zan_shared_table_hash") == 0) continue;
+        bool unavailable = strcmp(name, "zan_thread_start") == 0;
+        for (size_t i = 0; !unavailable && i < sizeof(unsupported) / sizeof(unsupported[0]); i++)
+            unavailable = strncmp(name, unsupported[i], strlen(unsupported[i])) == 0;
+        if (unavailable) {
+            fprintf(stderr, "error: native capability '%s' is not available "
+                            "for the wasm32-wasi target\n", name);
+            return false;
+        }
+    }
+    return true;
+}
+
 static int wasm_obj_refs_any(const char *obj, const char *const *prefixes) {
     char nmout[1300];
     snprintf(nmout, sizeof(nmout), "%s.nm", obj);

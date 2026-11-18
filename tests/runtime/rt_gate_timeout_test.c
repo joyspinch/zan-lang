@@ -1,28 +1,27 @@
-/* Deterministic Gate timer/park interleavings; no real clock or scheduler. */
+/* Gate ticket interleavings and native-thread contention without ZAN_CO_DRIVER. */
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <pthread.h>
+#include <sched.h>
 #endif
-#define ZAN_CO_DRIVER 1
+
 typedef void (*zan_co_step_t)(void *);
 static void zan_co_ready(void *frame, zan_co_step_t step) {
-    (void)step;
-    (*(int *)frame)++;
+    step(frame);
 }
-static long long zan_timer_after_ctx(long long ms, void (*cb)(void *), void *ctx) {
-    (void)ms; (void)cb; (void)ctx; return 1;
-}
-static int zan_timer_clear(long long id) { (void)id; return 1; }
-static int live_allocations;
+static atomic_int live_allocations;
 static void *test_calloc(size_t n, size_t size) {
     void *p = calloc(n, size);
-    if (p) live_allocations++;
+    if (p) atomic_fetch_add_explicit(&live_allocations, 1, memory_order_relaxed);
     return p;
 }
 static void test_free(void *p) {
-    if (p) live_allocations--;
+    if (p) atomic_fetch_sub_explicit(&live_allocations, 1, memory_order_relaxed);
     free(p);
 }
 #define calloc test_calloc
@@ -32,7 +31,7 @@ static void test_free(void *p) {
 #undef free
 
 static int failures;
-static void step(void *frame) { (void)frame; }
+static void step(void *frame) { (*(int *)frame)++; }
 static void check(int condition, const char *name) {
     printf("%s %s\n", condition ? "PASS" : "FAIL", name);
     if (!condition) failures++;
@@ -127,6 +126,95 @@ static void signal_all_pending(void) {
     check(a == 1 && b == 1 && c == 0, "SignalAll includes pending waits without extra surplus");
     zan_gate_free(h);
 }
+enum { NATIVE_THREADS = 4, NATIVE_WAITS = 2048 };
+
+typedef struct {
+    long long gate;
+    atomic_int arrived;
+    atomic_int start;
+} native_gate_run;
+
+typedef struct {
+    native_gate_run *run;
+    atomic_int wakes[NATIVE_WAITS];
+} native_gate_worker;
+
+static void count_native_wake(void *frame) {
+    atomic_fetch_add_explicit((atomic_int *)frame, 1, memory_order_relaxed);
+}
+
+static void yield_thread(void) {
+#ifdef _WIN32
+    Sleep(0);
+#else
+    sched_yield();
+#endif
+}
+
+#ifdef _WIN32
+static DWORD WINAPI native_worker(void *arg) {
+#else
+static void *native_worker(void *arg) {
+#endif
+    native_gate_worker *worker = arg;
+    native_gate_run *run = worker->run;
+    atomic_fetch_add_explicit(&run->arrived, 1, memory_order_relaxed);
+    while (!atomic_load_explicit(&run->start, memory_order_acquire)) yield_thread();
+    for (int i = 0; i < NATIVE_WAITS; i++) {
+        long long ticket = zan_gate_prepare(run->gate);
+        if (!ticket) abort();
+        zan_gate_park_ticket(run->gate, ticket, &worker->wakes[i], count_native_wake);
+        zan_gate_signal(run->gate);
+    }
+    return 0;
+}
+
+static void native_thread_contention(void) {
+    native_gate_run run;
+    run.gate = zan_gate_new();
+    if (!run.gate) abort();
+    atomic_init(&run.arrived, 0);
+    atomic_init(&run.start, 0);
+    native_gate_worker workers[NATIVE_THREADS];
+#ifdef _WIN32
+    HANDLE threads[NATIVE_THREADS];
+#else
+    pthread_t threads[NATIVE_THREADS];
+#endif
+    for (int i = 0; i < NATIVE_THREADS; i++) {
+        workers[i].run = &run;
+        for (int j = 0; j < NATIVE_WAITS; j++) atomic_init(&workers[i].wakes[j], 0);
+#ifdef _WIN32
+        threads[i] = CreateThread(NULL, 0, native_worker, &workers[i], 0, NULL);
+        if (!threads[i]) abort();
+#else
+        if (pthread_create(&threads[i], NULL, native_worker, &workers[i]) != 0) abort();
+#endif
+    }
+    while (atomic_load_explicit(&run.arrived, memory_order_relaxed) != NATIVE_THREADS)
+        yield_thread();
+    atomic_store_explicit(&run.start, 1, memory_order_release);
+
+    int exact_wakes = 0;
+    for (int i = 0; i < NATIVE_THREADS; i++) {
+#ifdef _WIN32
+        if (WaitForSingleObject(threads[i], INFINITE) != WAIT_OBJECT_0) abort();
+        CloseHandle(threads[i]);
+#else
+        if (pthread_join(threads[i], NULL) != 0) abort();
+#endif
+    }
+    for (int i = 0; i < NATIVE_THREADS; i++) {
+        for (int j = 0; j < NATIVE_WAITS; j++) {
+            if (atomic_load_explicit(&workers[i].wakes[j], memory_order_relaxed) == 1)
+                exact_wakes++;
+        }
+    }
+    check(exact_wakes == NATIVE_THREADS * NATIVE_WAITS,
+          "native threads wake every prepared ticket exactly once before close");
+    zan_gate_free(run.gate);
+}
+
 int main(void) {
     interleaved_tickets();
     timeout_before_park();
@@ -135,6 +223,7 @@ int main(void) {
     close_pending();
     untimed_and_counting();
     signal_all_pending();
+    native_thread_contention();
     check(live_allocations == 0, "all native gate allocations released");
     printf("failures: %d\n", failures);
     return failures ? 1 : 0;

@@ -321,9 +321,11 @@ void emit_collection_value_release(zan_irgen_t *g, zan_type_t *type,
 void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
                                       LLVMValueRef slot) {
     LLVMTypeRef st = LLVMIsAAllocaInst(slot)
-        ? LLVMGetAllocatedType(slot) : LLVMTypeOf(slot);
+        ? LLVMGetAllocatedType(slot) : map_type(g, type);
     if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return;
     LLVMValueRef cur = LLVMBuildLoad2(g->builder, st, slot, "arc.srel");
+    /* A landing pad can revisit this slot after normal scope exit. */
+    LLVMBuildStore(g->builder, LLVMConstNull(st), slot);
     emit_collection_value_release(g, type, cur, 0);
 }
 void emit_struct_local_retain(zan_irgen_t *g, zan_type_t *type,

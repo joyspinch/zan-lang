@@ -3,6 +3,7 @@
 #ifndef ZAN_ABI_H
 #define ZAN_ABI_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 
@@ -85,8 +86,15 @@ size_t zan_mem_trim(void);
 
 /* 运行时活对象注册表与孤儿环探测 (B-ID89) */
 void zan_rt_live_register(void *obj, size_t size);
+void zan_rt_live_register_array(void *obj, uint64_t size, uint64_t data_offset,
+                                int32_t elements_are_refs);
 void zan_rt_live_unregister(void *obj);
 void zan_rt_register_site_field_graphs(void **graphs, void **tynames, int64_t count);
+/* Enable only after all heap access is covered by paired mutator intervals.
+ * Diagnostics return -1 when a scan cannot acquire a quiescent heap. */
+void zan_rt_heap_diagnostics_enable(void);
+void zan_rt_heap_mutator_enter(void);
+void zan_rt_heap_mutator_leave(void);
 int64_t zan_gc_detect_cycles(void);
 void zan_rt_dump_leaks(void);
 int64_t zan_gc_write_heap_snapshot(const char *path);

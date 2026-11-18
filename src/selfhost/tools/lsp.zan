@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace Zan;
 
@@ -149,11 +150,24 @@ public class LspInlayHint {
 
 public partial class LspServer {
     [DllImport("crt")] public static extern int getchar();
-    [DllImport("crt")] public static extern int putchar(int c);
+    #if WINDOWS
+    [DllImport("crt", EntryPoint = "_fdopen")] static extern nint OpenStream(int fd, string mode);
+    [DllImport("crt", EntryPoint = "_setmode")] static extern int SetStreamMode(int fd, int mode);
+    #else
+    [DllImport("crt", EntryPoint = "fdopen")] static extern nint OpenStream(int fd, string mode);
+    #endif
+    [DllImport("crt", EntryPoint = "fputs")] static extern int WriteStream(string text, nint stream);
+    [DllImport("crt", EntryPoint = "fflush")] static extern int FlushStream(nint stream);
+    [DllImport("crt", EntryPoint = "fclose")] static extern int CloseStream(nint stream);
 
     static List<LspDocument> documents;
     static List<LspSymbol> symbols;
     static bool isRunning = true;
+    static bool shutdownRequested;
+    static Mutex workspaceLock;
+    static Semaphore manifestStop;
+    static Semaphore manifestDone;
+    static nint outputStream;
 
     static void EnsureInit() {
         if (documents == null) {
@@ -535,14 +549,21 @@ public partial class LspServer {
     static string DiagArray(Diags dg, string text) {
         StringBuilder sb = new StringBuilder();
         sb.Append('[');
-        int i = 0;
-        while (i < dg.items.Count) {
+        // The frontend can report the same signature type in multiple passes.
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        bool first = true;
+        for (int i = 0; i < dg.items.Count; i = i + 1) {
             Diag d = dg.items[i];
-            if (i > 0) { sb.Append(','); }
+            string severity = d.warn ? "2" : "1";
+            string key = d.line.ToString() + ":" + d.col.ToString() + ":" + severity + ":" + d.msg;
+            if (seen.ContainsKey(key)) { continue; }
+            seen[key] = true;
+            if (!first) { sb.Append(','); }
+            first = false;
             int dl = d.line > 0 ? d.line - 1 : 0;
             int dc = d.col > 0 ? Utf16ColOf(text, dl, d.col - 1) : 0;
             sb.Append("{\"severity\":");
-            sb.Append(d.warn ? "2" : "1");
+            sb.Append(severity);
             sb.Append(",\"range\":{\"start\":{\"line\":");
             sb.Append(dl);
             sb.Append(",\"character\":");
@@ -555,7 +576,6 @@ public partial class LspServer {
             sb.Append("\"message\":");
             sb.Append(EncodeJsonString(d.msg));
             sb.Append('}');
-            i = i + 1;
         }
         sb.Append(']');
         return sb.ToString();
@@ -723,16 +743,9 @@ public partial class LspServer {
     public static void SendResponse(string jsonBody) {
         int len = jsonBody.Length;
         string header = "Content-Length: " + len.ToString() + "\r\n\r\n";
-        WriteRaw(header);
-        WriteRaw(jsonBody);
-    }
-
-    static void WriteRaw(string s) {
-        int i = 0;
-        while (i < s.Length) {
-            putchar((int)s[i]);
-            i = i + 1;
-        }
+        WriteStream(header, outputStream);
+        WriteStream(jsonBody, outputStream);
+        FlushStream(outputStream);
     }
 
     /// LSP 位置对象 JSON（行列 0-based 直传）。
@@ -899,6 +912,10 @@ public partial class LspServer {
         }
 
         if (method == "shutdown") {
+            if (!shutdownRequested) {
+                shutdownRequested = true;
+                manifestStop.Release();
+            }
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
             return;
         }
@@ -1664,7 +1681,7 @@ public partial class LspServer {
         Binder b = new Binder();
         b.Bind(unit);
         Checker ck = new Checker(b, dg);
-        ck.Check(unit);
+        ck.CheckLsp(unit, false);
 
         int ti = 0;
         while (ti < toks.Count && hints.Count < 256) {
@@ -2049,10 +2066,57 @@ public partial class LspServer {
             || kind == LspSymbol.KindDelegate();
     }
 
+    static void WatchWorkspaceManifests() {
+        try {
+            while (!manifestStop.WaitOne(1000)) {
+                workspaceLock.WaitOne();
+                try {
+                    if (isRunning && !shutdownRequested) { PollWorkspaceManifests(); }
+                } finally {
+                    workspaceLock.ReleaseMutex();
+                }
+            }
+        } catch (Exception ex) {
+            Console.ErrorWriteLine("LSP manifest polling stopped: " + ex.Message);
+        } finally {
+            manifestDone.Release();
+        }
+    }
+
     // 启动基于标准输入的 LSP 主事件循环
     public static void Run() {
         EnsureInit();
         isRunning = true;
+        shutdownRequested = false;
+        #if WINDOWS
+        // Content-Length counts wire bytes, including CRLF in raw output.
+        SetStreamMode(1, 0x8000);
+        #endif
+        outputStream = OpenStream(1, "wb");
+        if (outputStream == 0) {
+            Console.ErrorWriteLine("LSP could not open stdout");
+            return;
+        }
+        workspaceLock = new Mutex();
+        manifestStop = new Semaphore(0, 1);
+        manifestDone = new Semaphore(0, 1);
+        bool watching = Thread.Start(WatchWorkspaceManifests);
+        if (!watching) { Console.ErrorWriteLine("LSP could not start manifest polling"); }
+        try {
+            ReadMessages();
+        } finally {
+            if (watching) {
+                if (!shutdownRequested) { manifestStop.Release(); }
+                manifestDone.WaitOne();
+            }
+            manifestDone.Dispose();
+            manifestStop.Dispose();
+            workspaceLock.Dispose();
+            CloseStream(outputStream);
+        }
+    }
+
+    static void ReadMessages() {
         while (isRunning) {
             string line = "";
             int c = getchar();
@@ -2081,9 +2145,16 @@ public partial class LspServer {
                     buf[count] = (byte)c;
                     count = count + 1;
                 }
-                string body = buf.ToStr(0, count);
-                if (body.Length > 0) {
-                    HandleMessage(body);
+                if (count != contentLen) { break; }
+                if (count > 0) {
+                    string body = buf.ToStr(0, count);
+                    // Requests and polling share document state and the complete output frame.
+                    workspaceLock.WaitOne();
+                    try {
+                        HandleMessage(body);
+                    } finally {
+                        workspaceLock.ReleaseMutex();
+                    }
                 }
             }
         }

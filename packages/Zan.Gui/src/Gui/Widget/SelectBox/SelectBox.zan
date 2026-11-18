@@ -148,6 +148,7 @@ public partial class SelectBox : Control {
     // 主构造：占位提示 + 是否多选；默认弹层最多显示 6 行，级联联动开。
     public SelectBox(string hintText, bool isMulti) {
         this.InitControl("selectbox", 0);
+        styleSurfaceOwned = true;
         this.opts = new List<SelectOption>();
         Value = -1;
         this.hint = hintText;
@@ -714,9 +715,10 @@ public partial class SelectBox : Control {
 
     // 触发器高度（按尺寸档取主题行高）。
     public int HeadHeight(Theme t) {
-        int sz = this.SizeIdx();
-        if (sz == 0) { return t.heightSmall; }
-        if (sz == 2) { return t.heightLarge; }
+        string cls = this.SizeClassIn(Class);
+        if (Style.Has(cls, "tiny")) { return t.heightTiny; }
+        if (Style.Has(cls, "small")) { return t.heightSmall; }
+        if (Style.Has(cls, "large")) { return t.heightLarge; }
         return t.heightMedium;
     }
 
@@ -732,123 +734,91 @@ public partial class SelectBox : Control {
 
     // 尺寸档 string → 渲染下标（0 small / 1 medium / 2 large）。
     public int SizeIdx() {
-        if (Size == null) { return 1; }
-        string s = Size.Get();
-        if (s == "tiny" || s == "small") { return 0; }
-        if (s == "large") { return 2; }
+        string cls = this.SizeClassIn(Class);
+        if (Style.Has(cls, "tiny") || Style.Has(cls, "small")) { return 0; }
+        if (Style.Has(cls, "large")) { return 2; }
         return 1;
     }
 
     // 校验状态以额外 class 的形式进入样式层（base.css 的
     // `select.success/.warning/.error` 规则），绘制代码不再直接
     // 覆盖边框颜色。
+    public override string StyleType() { return "select"; }
+    public override string EffectiveClass() { return this.StyleClass(); }
+
     public string StyleClass() {
+        string cls = this.SizeClassIn(Class);
         string extra = "";
         if (status == 1) { extra = "success"; }
         if (status == 2) { extra = "warning"; }
         if (status == 3) { extra = "error"; }
-        string sz = "";
-        if (Size != null) { sz = Control.SizeClass(Size.Get()); }
-        if (sz != "") {
-            if (extra == "") { extra = sz; } else { extra = extra + " " + sz; }
-        }
-        if (extra == "") { return Class; }
-        if (Class == "") { return extra; }
-        return Class + " " + extra;
+        if (extra == "") { return cls; }
+        return cls == "" ? extra : cls + " " + extra;
     }
 
-    // 覆写：高取样式行高（触发器），宽缺省 200。
     public override void OnMeasure(App app) {
         this.SyncBinding();
-        StyleBox s = this.ResolveStyleAs(app, "select", Class, Style.SNormal());
-        prefH = s.HeightOr(this.HeadHeight(app.theme));
-        prefW = s.WidthOr(app.Scale(200));
+        StyleBox normal = this.Box(app);
+        prefH = normal.HeightOr(this.HeadHeight(app.theme));
+        prefW = normal.WidthOr(app.Scale(200));
     }
 
-    // 触发器外观投影；输入由保留树分发，弹层经 OnPaintOverlay 绘制。
+    private int ArrowSize(App app, Rect content) {
+        StyleBox arrow = this.ResolvePart(app, "arrow", "", Style.SNormal());
+        return DropdownChrome.SlotSize(content, arrow.FontOr(app.theme.iconSizeSmall));
+    }
+
+    private Rect ClearBounds(App app, Rect content, int arrowSize) {
+        StyleBox clear = this.ResolvePart(app, "clear", "", Style.SNormal());
+        int size = DropdownChrome.SlotSize(content, clear.FontOr(app.theme.iconSizeSmall));
+        int left = content.Right() - arrowSize - app.theme.gapSmall - size;
+        if (left < content.x) { size = 0; }
+        return new Rect(left, content.y, size, content.height);
+    }
+
+    // 触发器使用布局分配的盒。常态内容槽也用于绘制前的输入命中。
     public override void OnPaint(App app) {
-        int x = bx;
-        int y = by;
-        int w = bw;
-        int hIn = bh;
         app = this.ResolveApp(app);
-        if (app == null || app.canvas == null) { return; }
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        string cls = this.StyleClass();
-        int h = this.HeadHeight(t);
-        if (hIn > 0) { h = hIn; }
-        StyleBox s = this.ResolveEasedStyleAsIn(
-            app, wid, "select", cls, false, open, x, y, w, h);
-        h = s.HeightOr(h);
-        int fs = this.FontSize(app, s);
-        bool overHead = app.focus != null && app.focus.IsHovered(wid);
-
-        // 有值时的清除按钮几何（箭头左侧）。
-        int partState = Style.StateOf(app, wid, false);
-        if (open) { partState = partState + Style.SSelected(); }
-        StyleBox arrowStyle = this.ResolvePartAs(app, "select", "arrow", "",
-                                                 cls, partState);
-        StyleBox clearStyle = this.ResolvePartAs(app, "select", "clear", "",
-                                                 cls, partState);
-        int pad = s.PadLOr(app.Scale(6));
-        int padR = s.PadROr(app.Scale(6));
-        int slotGap = app.Scale(4);
-        int arrowSize = arrowStyle.FontOr(t.iconSizeSmall);
-        int clearSize = clearStyle.FontOr(t.iconSizeSmall);
-        int arrowX = x + w - padR - arrowSize;
-        int arrowSlot = arrowSize + padR;
-        int clearX = arrowX - slotGap - clearSize;
-        bool showClear = clearable && this.HasValue() && overHead;
-        bool overClear = showClear && app.mouseX >= clearX
-            && app.mouseX < clearX + clearSize;
-
-        // ---- 触发控件 ----
-        // 从样式层解析为 `select` 控件，使皮肤
-        // 像 input 一样为其设置样式（`select:hover`、`select:focus` 等）；
-        // 校验状态通过 StyleClass 的额外 class 在 CSS 中着色。
-        s.Paint(app, x, y, w, h);
-
-        int textY = Canvas.CenterTextY(y, h, fs);
-        int rightAnchor = (showClear ? clearX : arrowX) - slotGap;
-        int headMaxW = rightAnchor - (x + pad);
-        if (headMaxW < 0) { headMaxW = 0; }
-        string shown = this.Text();
-        StyleBox placeholderStyle = this.ResolvePartAs(app, "select", "placeholder", "",
-                                                        cls, partState);
-        if (multi && cascade && shown != "") {
-            // 级联多选：勾选值渲染成标签芯片（× 可单独移除，
-            // 放不下折叠 +N），而不是一长串逗号文本。
-            CascadePanel.DrawCascadeTags(this, app, c, t, cls, partState, x, y, w, h,
-                                         pad, arrowSlot, showClear, clearSize, fs);
-        } else if (shown == "") {
-            int hintFs = placeholderStyle.FontOr(fs);
-            int hintY = Canvas.CenterTextY(y, h, hintFs);
-            c.DrawText(x + pad, hintY,
-                Ellipsis.Fit(hint, headMaxW, hintFs),
-                placeholderStyle.FgOr(s.fg), hintFs);
-        } else {
-            c.DrawText(x + pad, textY,
-                Ellipsis.Fit(shown, headMaxW, fs), s.fg, fs);
-        }
-
+        if (app == null || app.canvas == null || bw <= 0 || bh <= 0) { return; }
+        StyleBox normal = this.Box(app);
+        Rect content = DropdownChrome.ContentBounds(this, normal, app.theme.paddingMedium);
+        int arrowSize = this.ArrowSize(app, content);
+        int right = content.Right() - arrowSize;
+        bool showClear = clearable && this.HasValue() && app.focus != null && app.focus.IsHovered(wid);
+        Rect clear = null;
         if (showClear) {
-            int clearState = Style.SNormal();
-            if (open) { clearState = clearState + Style.SSelected(); }
-            if (app.focus.IsFocused(wid)) { clearState = clearState + Style.SFocus(); }
-            if (overClear) { clearState = clearState + Style.SHover(); }
-            if (overClear && app.focus.IsPressed(wid)) {
-                clearState = clearState + Style.SActive();
-            }
-            clearStyle = this.ResolvePartAs(app, "select", "clear", "",
-                                            cls, clearState);
-            c.DrawGlyphIn("close", clearX, y, clearSize, h,
-                clearSize, clearStyle.FgOr(s.fg));
+            clear = this.ClearBounds(app, content, arrowSize);
+            if (clear.width > 0) { right = clear.x; }
         }
-        c.DrawGlyphIn("chevron-down", x + w - arrowSlot, y,
-            arrowSlot, h, arrowSize, arrowStyle.FgOr(s.fg));
+        int textWidth = right - content.x - app.theme.gapSmall;
+        int font = this.FontSize(app, normal);
+        string cls = this.StyleClass();
+        StyleBox box = this.ResolveEasedStyleAsIn(
+            app, wid, "select", cls, this.IsDisabled(), open, bx, by, bw, bh);
+        box.Paint(app, bx, by, bw, bh);
 
+        int state = Style.StateOf(app, wid, this.IsDisabled());
+        if (open) { state = state | Style.SSelected(); }
+        string shown = this.Text();
+        if (multi && cascade && shown != "") {
+            CascadePanel.DrawCascadeTagsIn(this, app.canvas, app, cls, state, content, textWidth, font);
+        } else if (shown == "") {
+            StyleBox placeholder = this.ResolvePart(app, "placeholder", "", state);
+            DropdownChrome.PaintLabel(app.canvas, content, textWidth, hint,
+                                      placeholder.FontOr(font), placeholder.FgOr(box.fg));
+        } else {
+            DropdownChrome.PaintLabel(app.canvas, content, textWidth, shown, font, box.fg);
+        }
 
+        if (clear != null && clear.width > 0) {
+            int clearState = state & ~(Style.SHover() | Style.SActive());
+            if (clear.Contains(app.mouseX, app.mouseY)) { clearState = state; }
+            StyleBox clearStyle = this.ResolvePart(app, "clear", "", clearState);
+            app.canvas.DrawGlyphIn("close", clear.x, clear.y, clear.width, clear.height,
+                                   clear.width, clearStyle.FgOr(box.fg));
+        }
+        StyleBox arrow = this.ResolvePart(app, "arrow", "", state);
+        DropdownChrome.PaintArrow(app.canvas, content, arrowSize, arrow.FgOr(box.fg));
     }
 
     // 弹层宽度：不窄于触发器，但至少能放下最长的一条；

@@ -1,23 +1,17 @@
         } else if (cross_compiling && (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS)) {
             char exe_dir2[1024];
             zan_exe_dir(exe_dir2, sizeof(exe_dir2));
-            char tbd[1200];
-            if (target.os == ZAN_OS_IOS) {
-                snprintf(tbd, sizeof(tbd), "%s/ios/libSystem.tbd", exe_dir2);
-                if (!zan_file_exists(tbd)) {
-                    snprintf(tbd, sizeof(tbd), "%s/macos/libSystem.tbd", exe_dir2);
-                }
-            } else {
-                snprintf(tbd, sizeof(tbd), "%s/macos/libSystem.tbd", exe_dir2);
-            }
-            if (!zan_file_exists(tbd)) {
+            const char *sdk_subdir = (target.os == ZAN_OS_IOS) ? "ios" : "macos";
+            char system_tbd[1200], cxxabi_tbd[1200];
+            snprintf(system_tbd, sizeof(system_tbd), "%s/%s/libSystem.tbd", exe_dir2, sdk_subdir);
+            snprintf(cxxabi_tbd, sizeof(cxxabi_tbd), "%s/%s/libc++abi.tbd", exe_dir2, sdk_subdir);
+            const char *missing_tbd = !zan_file_exists(system_tbd) ? system_tbd
+                                    : !zan_file_exists(cxxabi_tbd) ? cxxabi_tbd : NULL;
+            if (missing_tbd) {
                 fprintf(stderr,
-                        "error: bundled %s libSystem stub not found at "
-                        "'%s'; reinstall zan or rebuild with "
-                        "toolchain/%s present\n",
-                        (target.os == ZAN_OS_IOS) ? "iOS" : "macOS",
-                        tbd,
-                        (target.os == ZAN_OS_IOS) ? "ios" : "macos");
+                        "error: bundled Apple SDK stub not found at '%s'; "
+                        "reinstall zan or rebuild with toolchain/%s present\n",
+                        missing_tbd, sdk_subdir);
                 generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
@@ -145,24 +139,8 @@
                     }
                 }
             }
-            bool has_game_driver = false;
-            if (target.os == ZAN_OS_IOS) {
-                for (int li = 0; li < irgen.extern_lib_count; li++) {
-                    if (strncmp(irgen.extern_libs[li].str, "zan_game", irgen.extern_libs[li].len) == 0) {
-                        has_game_driver = true;
-                        break;
-                    }
-                }
-            }
-            bool has_gui_driver = has_game_driver;
-            if (target.os == ZAN_OS_IOS && !has_gui_driver) {
-                for (int li = 0; li < irgen.extern_lib_count; li++) {
-                    if (strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0) {
-                        has_gui_driver = true;
-                        break;
-                    }
-                }
-            }
+            bool has_game_driver = zan_irgen_imports_ios_driver(&irgen, "zan_game");
+            bool has_gui_driver = has_game_driver || zan_irgen_imports_ios_driver(&irgen, "zan_gui");
             if (!has_gui_driver) {
                 for (int di = 0; di < cross_dylib_count; di++) {
                     if (strstr(cross_dylibs[di], "zan_gui") != NULL) {
@@ -184,15 +162,7 @@
                     }
                 }
             }
-            bool has_image_driver = has_game_driver;
-            if (target.os == ZAN_OS_IOS && !has_image_driver) {
-                for (int li = 0; li < irgen.extern_lib_count; li++) {
-                    if (strncmp(irgen.extern_libs[li].str, "zan_image", irgen.extern_libs[li].len) == 0) {
-                        has_image_driver = true;
-                        break;
-                    }
-                }
-            }
+            bool has_image_driver = has_game_driver || zan_irgen_imports_ios_driver(&irgen, "zan_image");
             if (has_image_driver && zan_file_exists(macrt_image)) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_image);
             }
@@ -219,21 +189,24 @@
                     }
                 }
             }
-            bool has_audio_driver = false;
-            if (target.os == ZAN_OS_IOS) {
-                for (int li = 0; li < irgen.extern_lib_count; li++) {
-                    if (strncmp(irgen.extern_libs[li].str, "zan_audio", irgen.extern_libs[li].len) == 0) {
-                        has_audio_driver = true;
-                        break;
-                    }
-                }
-            }
+            bool has_audio_driver = zan_irgen_imports_ios_driver(&irgen, "zan_audio");
             if (has_audio_driver && zan_file_exists(macrt_audio)) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_audio);
             }
+            for (int di = 0; di < zan_lib_ndirs; di++) {
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", zan_lib_dirs[di]);
+            }
+            for (int di = 0; di < extra_lib_path_count; di++) {
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", extra_lib_paths[di]);
+            }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
-                cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
-                         extra_link_inputs[ei]);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", extra_link_inputs[ei]);
+            }
+            for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
+            }
+            for (int li = 0; li < import_lib_count; li++) {
+                cmd_appendf(cmd, sizeof(cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
             }
             for (int di = 0; di < cross_dylib_count; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -243,7 +216,7 @@
                 cmd_appendf(cmd, sizeof(cmd),
                          " -rpath @loader_path");
             }
-            { cmd_appendf(cmd, sizeof(cmd), " \"%s\"", tbd); }
+            cmd_appendf(cmd, sizeof(cmd), " \"%s\" \"%s\"", system_tbd, cxxabi_tbd);
             if (target.os == ZAN_OS_IOS && has_gui_driver) {
                 const char *ios_tbds[] = {"UIKit.tbd", "Foundation.tbd", "CoreGraphics.tbd", "QuartzCore.tbd", "CoreText.tbd"};
                 for (size_t ti = 0; ti < sizeof(ios_tbds) / sizeof(ios_tbds[0]); ti++) {
@@ -386,16 +359,11 @@
             argv[a++] = "-l:libwinpthread.a";
             if (rt_io_obj) argv[a++] = "-lws2_32";
             char libbufs[ZAN_LINK_MAX_LIBS][128]; int nb = 0;
-            for (int li = 0; li < irgen.extern_lib_count; li++) {
-                if (nb >= ZAN_LINK_MAX_LIBS ||
-                    a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
-                    link_cap_exceeded("DllImport libraries", ZAN_LINK_MAX_LIBS);
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue;
-                snprintf(libbufs[nb], sizeof(libbufs[nb]), "-l%.*s", nlen, nm);
+            for (int li = 0; li < import_lib_count; li++) {
+                if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                    link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
+                snprintf(libbufs[nb], sizeof(libbufs[0]), "-l%.*s",
+                         import_lib_lens[li], import_libs[li]);
                 argv[a++] = libbufs[nb++];
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
@@ -475,13 +443,8 @@
                 cmd_appendf(link_cmd, sizeof(link_cmd),
                          " -l:libwinpthread.a");
             }
-            for (int li = 0; li < irgen.extern_lib_count; li++) {
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue;
-                cmd_appendf(link_cmd, sizeof(link_cmd), " -l%.*s", nlen, nm);
+            for (int li = 0; li < import_lib_count; li++) {
+                cmd_appendf(link_cmd, sizeof(link_cmd), " -l%.*s", import_lib_lens[li], import_libs[li]);
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
                 cmd_appendf(link_cmd, sizeof(link_cmd), " %s",
@@ -541,9 +504,6 @@
         if (rt_crash_obj) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crash_obj);
         }
-        if (rt_crypto_archive) {
-            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crypto_archive);
-        }
         if (rt_mem_obj) {
 #ifdef __APPLE__
             cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_mem_obj);
@@ -567,22 +527,9 @@
                      " -Wl,-rpath,'$ORIGIN'");
 #endif
         }
-        static const char *const win_only_libs[] = {
-            "user32", "gdi32", "kernel32", "advapi32", "shell32", "ole32",
-            "oleaut32", "comdlg32", "comctl32", "gdiplus", "dwmapi", "shcore",
-            "uxtheme", "msimg32", "winmm", "ws2_32", "shlwapi", "opengl32", NULL };
-        for (int li = 0; li < irgen.extern_lib_count; li++) {
-            const char *lib = irgen.extern_libs[li].str;
-            int lib_len = (int)irgen.extern_libs[li].len;
-            int skip = 0;
-            for (int wi = 0; win_only_libs[wi]; wi++) {
-                if ((int)strlen(win_only_libs[wi]) == lib_len &&
-                    memcmp(win_only_libs[wi], lib, lib_len) == 0) { skip = 1; break; }
-            }
-            if (skip) continue;
-            int name_len;
-            const char *name = zan_dllimport_lname(lib, lib_len, &name_len);
-            if (!name) continue;
+        for (int li = 0; li < import_lib_count; li++) {
+            const char *name = import_libs[li];
+            int name_len = import_lib_lens[li];
             if (target.os == ZAN_OS_MACOS) {
                 for (int d = 0; d < used_driver_count; d++) {
                     if (used_driver_runtime[d] ||
@@ -622,6 +569,9 @@
         }
         for (int ei = 0; ei < extra_link_lib_count; ei++) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " -l%s", extra_link_libs[ei]);
+        }
+        if (rt_crypto_archive) {
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crypto_archive);
         }
         /* Native Zan EH uses the host C++ ABI; keep its runtime after all inputs. */
 #ifdef __APPLE__

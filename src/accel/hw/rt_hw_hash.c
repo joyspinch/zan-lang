@@ -530,6 +530,16 @@ int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
     return 0;
 }
 
+int64_t zan_hw_ffi_sha256(uint64_t data, int64_t len, uint64_t out) {
+    return zan_hw_sha256((const uint8_t *)(uintptr_t)data, len,
+                         (uint8_t *)(uintptr_t)out);
+}
+
+int64_t zan_hw_ffi_sha1(uint64_t data, int64_t len, uint64_t out) {
+    return zan_hw_sha1((const uint8_t *)(uintptr_t)data, len,
+                       (uint8_t *)(uintptr_t)out);
+}
+
 /* 2 */
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 

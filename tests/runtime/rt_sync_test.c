@@ -6,6 +6,7 @@
 #endif
 
 #include "src/runtime/rt_sync.h"
+#include "src/runtime/sync/rt_sync_table_edit.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -212,16 +213,44 @@ static void test_monitor(void) {
     zan_ui_thread_assert("test on UI thread");
 }
 
+static const int64_t shared_policy_now = INT64_C(4102444800000);
+
+enum { SHARED_WORKER_ITERATIONS = 1000, SHARED_RATE_LIMIT = 1500 };
+
+static int shared_table_worker(int64_t table, int64_t owner) {
+    zan_shared_table_increment(table, "workers", "ready", 1);
+    int64_t deadline = zan_monotonic_us() + 5000000;
+    while (zan_shared_table_get_int(table, "workers", "ready") < 2) {
+        if (zan_monotonic_us() >= deadline) return 0;
+#ifdef _WIN32
+        Sleep(1);
+#else
+        const struct timespec pause = {0, 1000000};
+        nanosleep(&pause, NULL);
+#endif
+    }
+
+    int acquired = zan_shared_table_lock_acquire(
+        table, "cross-lease", owner, shared_policy_now, 1000);
+    zan_shared_table_increment(table, "workers", "acquired", acquired);
+    int64_t allowed = 0;
+    for (int i = 0; i < SHARED_WORKER_ITERATIONS; i++) {
+        zan_shared_table_increment(table, "workers", "count", 1);
+        allowed += zan_shared_table_rate_allow(
+            table, "cross-rate", shared_policy_now, 1000, SHARED_RATE_LIMIT);
+    }
+    zan_shared_table_increment(table, "workers", "admitted", allowed);
+    return 1;
+}
+
 static int shared_table_child(const char *name) {
     int64_t table = zan_shared_table_open(name);
     if (!table) return 2;
-    for (int i = 0; i < 1000; i++) {
-        zan_shared_table_increment(table, "workers", "count", 1);
-    }
+    int ready = shared_table_worker(table, 22);
     zan_shared_table_set_float(table, "workers", "load", 2.5);
     zan_shared_table_set_string(table, "workers", "label", "child");
     zan_shared_table_close(table);
-    return 0;
+    return ready ? 0 : 3;
 }
 
 static void test_shared_table(void) {
@@ -235,7 +264,7 @@ static void test_shared_table(void) {
 #endif
     int64_t table = zan_shared_table_create(
         name, 64, 32,
-        "i:count;i:window_start;i:owner;f:load;s:32:label;");
+        "i:count;i:window_start;i:owner;i:ready;i:admitted;i:acquired;f:load;s:32:label;");
     CHECK(table != 0, "could not create shared table");
     if (!table) return;
 
@@ -263,9 +292,7 @@ static void test_shared_table(void) {
     if (CreateProcessA(
             NULL, command, NULL, NULL, FALSE, 0, NULL, NULL,
             &startup, &process)) {
-        for (int i = 0; i < 1000; i++) {
-            zan_shared_table_increment(table, "workers", "count", 1);
-        }
+        CHECK(shared_table_worker(table, 11), "shared-table workers did not rendezvous");
         WaitForSingleObject(process.hProcess, INFINITE);
         DWORD exit_code = 1;
         GetExitCodeProcess(process.hProcess, &exit_code);
@@ -279,9 +306,7 @@ static void test_shared_table(void) {
         _exit(shared_table_child(name));
     }
     if (child > 0) {
-        for (int i = 0; i < 1000; i++) {
-            zan_shared_table_increment(table, "workers", "count", 1);
-        }
+        CHECK(shared_table_worker(table, 11), "shared-table workers did not rendezvous");
         int status = 0;
         if (waitpid(child, &status, 0) == child && WIFEXITED(status)) {
             child_status = WEXITSTATUS(status);
@@ -290,8 +315,24 @@ static void test_shared_table(void) {
 #endif
 
     CHECK(child_status == 0, "shared-table child failed: %d", child_status);
-    CHECK(zan_shared_table_get_int(table, "workers", "count") == 2000,
+    CHECK(zan_shared_table_get_int(table, "workers", "count") ==
+              2 * SHARED_WORKER_ITERATIONS,
           "cross-process increments were not atomic");
+    CHECK(zan_shared_table_get_int(table, "workers", "admitted") == SHARED_RATE_LIMIT,
+          "processes did not share one rate limit");
+    CHECK(zan_shared_table_get_int(table, "cross-rate", "count") == SHARED_RATE_LIMIT,
+          "rate limit and stored count disagree across processes");
+    CHECK(zan_shared_table_get_int(table, "workers", "acquired") == 1,
+          "processes did not share exclusive lease ownership");
+    int64_t owner = zan_shared_table_get_int(table, "cross-lease", "owner");
+    CHECK(owner == 11 || owner == 22, "cross-process lease owner is missing");
+    int64_t other_owner = owner == 11 ? 22 : 11;
+    CHECK(zan_shared_table_lock_release(table, "cross-lease", other_owner) == 0,
+          "cross-process lease released by the losing owner");
+    CHECK(zan_shared_table_lock_release(table, "cross-lease", owner) == 1,
+          "cross-process lease could not be released by its owner");
+    CHECK(zan_shared_table_delete(table, "cross-rate") == 1,
+          "could not delete cross-process rate row");
     CHECK(zan_shared_table_get_float(table, "workers", "load") == 2.5,
           "cross-process float update was not visible");
     CHECK(strcmp(
@@ -299,7 +340,7 @@ static void test_shared_table(void) {
               "child") == 0,
           "cross-process string update was not visible");
 
-    int64_t expiry_base = INT64_C(4102444800000);
+    int64_t expiry_base = shared_policy_now;
     CHECK(zan_shared_table_set_int(table, "ttl-a", "count", 1) == 1,
           "could not create first expiring row");
     CHECK(zan_shared_table_set_int(table, "ttl-b", "count", 2) == 1,
@@ -360,7 +401,8 @@ static void test_shared_table(void) {
     int64_t second = zan_shared_table_open(name);
     CHECK(second != 0, "could not open second table handle");
     if (second) {
-        CHECK(zan_shared_table_increment(second, "workers", "count", -1) == 1999,
+        CHECK(zan_shared_table_increment(second, "workers", "count", -1) ==
+                  2 * SHARED_WORKER_ITERATIONS - 1,
               "second handle could not update shared row");
         zan_shared_table_close(second);
     }
@@ -378,6 +420,79 @@ static void test_shared_table(void) {
     CHECK(zan_shared_table_destroy(table) == 1, "could not destroy shared table");
     CHECK(zan_shared_table_open(name) == 0,
           "destroyed shared table can still be opened");
+}
+
+typedef struct {
+    zan_table_edit_action action;
+    int64_t expiry;
+    int calls;
+    int existed;
+} table_edit_probe;
+
+static zan_table_edit_action apply_table_edit(
+    void *context, int exists, int64_t *values, int64_t *expires_at) {
+    table_edit_probe *probe = (table_edit_probe *)context;
+    probe->calls++;
+    probe->existed = exists;
+    values[0] += 3;
+    values[1] += 5;
+    *expires_at = probe->expiry;
+    return probe->action;
+}
+
+static void test_shared_table_edit(void) {
+    int64_t table = zan_shared_table_create_anon(8, 16, "i:a;i:b;");
+    CHECK(table != 0, "could not create generic row-edit table");
+    if (!table) return;
+
+    const char *const columns[] = {"b", "a"};
+    const char *const duplicate_columns[] = {"a", "a"};
+    const int64_t now = shared_policy_now;
+    const int64_t deadline = now + 1000;
+    table_edit_probe probe = {ZAN_TABLE_EDIT_KEEP, deadline, 0, 0};
+    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, duplicate_columns, 2,
+                                    apply_table_edit, &probe) == 0 && probe.calls == 0,
+          "duplicate columns invoked the row editor");
+    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                    apply_table_edit, &probe) == 0 && probe.calls == 1 &&
+              !probe.existed && zan_shared_table_count(table) == 0,
+          "keeping a missing row created it or skipped the callback");
+
+    probe.action = ZAN_TABLE_EDIT_WRITE;
+    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                    apply_table_edit, &probe) == 1 && !probe.existed,
+          "generic row edit did not create a missing row");
+    CHECK(zan_shared_table_get_int(table, "row", "b") == 3 &&
+              zan_shared_table_get_int(table, "row", "a") == 5 &&
+              zan_shared_table_expires_at(table, "row") == deadline,
+          "generic insert did not store columns in callback order with expiry");
+
+    probe.expiry = -1;
+    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                    apply_table_edit, &probe) == 0 && probe.existed,
+          "negative expiry was committed");
+    CHECK(zan_shared_table_get_int(table, "row", "b") == 3 &&
+              zan_shared_table_get_int(table, "row", "a") == 5 &&
+              zan_shared_table_expires_at(table, "row") == deadline,
+          "failed edit changed the row");
+
+    probe.expiry = deadline + 1000;
+    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                    apply_table_edit, &probe) == 1 && probe.existed,
+          "generic update did not find the existing row");
+    CHECK(zan_shared_table_get_int(table, "row", "b") == 6 &&
+              zan_shared_table_get_int(table, "row", "a") == 10 &&
+              zan_shared_table_expires_at(table, "row") == probe.expiry &&
+              zan_shared_table_purge_expired(table, deadline) == 0,
+          "generic update did not extend expiry along with the values");
+
+    probe.action = ZAN_TABLE_EDIT_DELETE;
+    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                    apply_table_edit, &probe) == 1 && probe.existed &&
+              zan_shared_table_count(table) == 0 &&
+              zan_shared_table_purge_expired(table, probe.expiry) == 0,
+          "generic delete did not remove the row and its expiry");
+    zan_shared_table_close(table);
 }
 
 static void test_file_handle(void) {
@@ -510,6 +625,7 @@ int main(int argc, char **argv) {
     test_atomic_int();
     test_monitor();
     test_shared_table();
+    test_shared_table_edit();
     test_file_handle();
 #ifndef _WIN32
     test_file_no_follow_symlink();

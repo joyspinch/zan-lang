@@ -153,6 +153,11 @@ llvm_map_components_to_libnames(LLVM_LIBS ${ZAN_LLVM_COMPONENTS})
 add_executable(zanc
     src/compiler/main.c
     src/compiler/main_options_parse.c
+    packages/Zan.Mvc/compiler/mvc_routes.c
+    packages/Zan.Mvc/compiler/mvc_synth.c
+    packages/Zan.Mvc/compiler/mvc_reflect.c
+    packages/Zan.Data/compiler/orm_adapter.c
+    packages/Zan.Gui/compiler/gui_entry.c
     src/compiler/arena.c
     src/compiler/diag.c
     src/compiler/lexer.c
@@ -193,8 +198,9 @@ add_executable(zanc
     src/compiler/crosscomp.c
     src/compiler/winres.c
     src/compiler/embedres.c
-    src/compiler/apk.c
-    src/compiler/ipa.c
+    src/packaging/apk.c
+    src/packaging/ipa.c
+    src/packaging/mobile_postlink.c
     src/compiler/builtin_api.c
     src/compiler/symbols.c
     src/runtime/rt_decimal.c
@@ -602,6 +608,8 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_thread.c
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table.c
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_life.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_compat.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_edit.h
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_ops.c
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_net.c
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_proc.c
@@ -703,11 +711,16 @@ foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
         list(APPEND _cross_sysroot_cmds
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/${_linux_sub}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_linux_sys}/crt1.o" "${_linux_sys}/crti.o"
-                    "${_linux_sys}/crtn.o" "${_linux_sys}/libc.a"
+                    "${_linux_sys}/crt1.o" "${_linux_sys}/libc.a"
                     "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
                     "${_linux_sys}/zanrt_timer.o"
                     ${CMAKE_BINARY_DIR}/${_linux_sub}/)
+        if(NOT _linux_sub STREQUAL "linux-riscv64")
+            list(APPEND _cross_sysroot_cmds
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_linux_sys}/crti.o" "${_linux_sys}/crtn.o"
+                        ${CMAKE_BINARY_DIR}/${_linux_sub}/)
+        endif()
         if(EXISTS "${_linux_sys}/zanrt_crash.o")
             list(APPEND _cross_sysroot_cmds
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -838,6 +851,8 @@ endif()
 # Reuses the compiler front-end (no LLVM dependency) plus the intellisense
 # engine to serve the Language Server Protocol over stdio.
 add_executable(zan-lsp
+    packages/Zan.Mvc/compiler/mvc_routes.c
+    packages/Zan.Data/compiler/orm_adapter.c
     src/lsp/lsp_main.c
     src/compiler/nsresolve.c
     src/common/json.c
@@ -1345,6 +1360,23 @@ add_test(NAME runtime_gate_timeout COMMAND zanrt_gate_timeout_test)
 set_tests_properties(runtime_gate_timeout PROPERTIES TIMEOUT 30)
 add_dependencies(zanc zanrt_gate_timeout_test)
 
+add_executable(zanrt_blocking_dispatch_test tests/runtime/rt_blocking_dispatch_test.c)
+set_target_properties(zanrt_blocking_dispatch_test PROPERTIES
+  C_STANDARD 11 C_STANDARD_REQUIRED YES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+if(MSVC)
+  target_compile_options(zanrt_blocking_dispatch_test PRIVATE /UNDEBUG)
+else()
+  target_compile_options(zanrt_blocking_dispatch_test PRIVATE -UNDEBUG)
+endif()
+if(WIN32)
+  target_link_libraries(zanrt_blocking_dispatch_test PRIVATE ws2_32)
+else()
+  target_link_libraries(zanrt_blocking_dispatch_test PRIVATE Threads::Threads)
+endif()
+add_test(NAME runtime_blocking_dispatch COMMAND zanrt_blocking_dispatch_test)
+set_tests_properties(runtime_blocking_dispatch PROPERTIES TIMEOUT 30)
+
 # Standalone POSIX fixture includes rt_sync_proc.c and supplies its clock stub.
 if(NOT WIN32)
   add_executable(zanrt_proc_contract_test tests/runtime/rt_proc_contract_test.c)
@@ -1672,6 +1704,19 @@ add_test(NAME conformance_gui_docapp_user_main
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(conformance_gui_docapp_user_main PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+set(_docapp_synth "${CMAKE_SOURCE_DIR}/tests/gui/docapp_synth")
+add_test(NAME conformance_gui_docapp_synth
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    "-DSRC=${_docapp_synth}/Earlier.zan"
+    "-DZANC_ARGS=${_docapp_synth}/marker.zan;--auto-stdlib;--subsystem;console"
+    "-DEXPECTED=${_docapp_synth}/docapp_synth.out"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_docapp_synth${_exe_ext}
+    "-DWORKDIR=${_docapp_synth}"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_docapp_synth PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${_docapp_synth}")
 
 # HeavyControls 查表大小写不敏感（HTML 标签规范小写化 vs PascalCase
 # 注册键）：精确 miss 后必须走不敏感兜底，否则自定义控件静默回落
@@ -3069,6 +3114,16 @@ set_target_properties(zan_rpc_framing_test PROPERTIES
 )
 add_test(NAME unit_rpc_framing COMMAND zan_rpc_framing_test)
 
+add_executable(zanrt_heap_diagnostics_test tests/runtime/rt_heap_diagnostics_test.c)
+set_target_properties(zanrt_heap_diagnostics_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES)
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+  target_link_libraries(zanrt_heap_diagnostics_test PRIVATE Threads::Threads)
+endif()
+add_test(NAME runtime_heap_diagnostics COMMAND zanrt_heap_diagnostics_test
+  "${CMAKE_BINARY_DIR}/rt_heap_diagnostics_snapshot.txt")
+set_tests_properties(runtime_heap_diagnostics PROPERTIES TIMEOUT 30)
+
 # ---- Runtime: allocator double-free detection (rt_mem.c) ----
 # Produced programs link the size-class allocator with
 # `ld --wrap=malloc,free,calloc,realloc`; a second free of a live block is an
@@ -3392,9 +3447,8 @@ set(_plain_golden ${_known_leaky} array_local_free arc_leak_site_label)
 # Native ABI fixture deliberately supplies its own descriptors/headers, outside
 # leak-site registration. Keep one uninstrumented binary and a precise verdict.
 list(APPEND _conf_skip_cases arc_deferred_stack)
-# The pending/drain assertions require rt_mem's real queue. Apple targets use
-# synchronous weak fallbacks because the native linker does not include rt_mem.
-if(NOT APPLE AND TARGET zanrt_mem)
+# Verify the generated thread-local queue without the optional allocator.
+if(WIN32 OR UNIX)
   set(_arc_fixture_cc "${CMAKE_C_COMPILER}")
   if(WIN32)
     set(_arc_fixture_cc "${ZAN_RT_IO_CC}")
@@ -8223,6 +8277,19 @@ foreach(_case ${_golden_cases})
   endif()
 endforeach()
 
+add_executable(irgen_abi_test
+  tests/abi/irgen_abi_test.c
+  src/compiler/irgen_abi.c
+  src/compiler/diag.c
+  src/compiler/arena.c)
+target_include_directories(irgen_abi_test PRIVATE src/compiler src/common ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(irgen_abi_test PRIVATE ${_llvm_defs_list})
+llvm_map_components_to_libnames(_abi_test_llvm_libs core analysis)
+target_link_libraries(irgen_abi_test PRIVATE ${_abi_test_llvm_libs} ${LLVM_SYSTEM_LIBS})
+set_target_properties(irgen_abi_test PROPERTIES LINKER_LANGUAGE CXX
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+add_test(NAME abi_irgen_thunk COMMAND irgen_abi_test)
+
 # ---- Struct-by-value FFI ABI: the C signature per target ----
 # Cross targets only need the LLVM backends zanc already registers; nothing is
 # linked, so these run everywhere the compiler builds.
@@ -8492,6 +8559,23 @@ add_test(NAME lsp_integration_utf16
   COMMAND lsp_integration_test $<TARGET_FILE:zan-lsp>)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+  if(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|x64)$")
+    find_program(ZAN_DISPATCH_CLANG NAMES clang
+      HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+    find_program(ZAN_DISPATCH_LLD NAMES ld.lld
+      HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+    if(ZAN_DISPATCH_CLANG AND ZAN_DISPATCH_LLD)
+      foreach(_dispatch_case await_extern_dispatch socket_dispatch)
+        add_test(NAME case_${_dispatch_case}
+          COMMAND "${Python3_EXECUTABLE}" -I -B
+            "${CMAKE_SOURCE_DIR}/tests/runtime/run_await_extern_dispatch.py" ${_dispatch_case}
+            --zanc $<TARGET_FILE:zanc> --cc "${ZAN_RT_IO_CC}"
+            --clang "${ZAN_DISPATCH_CLANG}" --lld "${ZAN_DISPATCH_LLD}"
+            --out-exe "${CMAKE_BINARY_DIR}/cases/case_${_dispatch_case}${_exe_ext}")
+        set_tests_properties(case_${_dispatch_case} PROPERTIES TIMEOUT 160 LABELS "standard;runtime")
+      endforeach()
+    endif()
+  endif()
   if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     find_program(ZAN_SHARD_GC_CLANG NAMES clang
       HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
@@ -8696,6 +8780,7 @@ set(_lspzan_srcs
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/checker.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/checker_type.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/checker_expr.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/checker_inheritance.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/tools/lsp.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/tools/lsp_workspace.zan
 )

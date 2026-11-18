@@ -438,7 +438,7 @@ static const char **gm_table_entity_names(json_value *classes, int *out_count) {
         for (int ai = 0; ai < attrs->as.arr.count; ai++) {
             const char *an =
                 json_get_str(json_obj_get(attrs->as.arr.items[ai], "name"));
-            if (an && strcmp(an, "Table") == 0) {
+            if (an && zan_data_orm_is_table_marker((zan_istr_t){an, (uint32_t)strlen(an)})) {
                 table = true;
                 break;
             }

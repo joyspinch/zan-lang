@@ -5,6 +5,7 @@
 #include "zan.h"
 #include "ast.h"
 #include "binder.h"
+#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 
 struct checker_local;
 struct checker_byref_parameter;
@@ -23,17 +24,8 @@ struct zan_checker {
     int lambda_depth;
     zan_ast_node_t *last_call_node;
     zan_symbol_t *last_call_method;
-    /* [Table] 实体名清单：SyncStructureAll(Async) 零参调用点合成
-     * Meta[] 实参用；zan_checker_check 入口对编译单元预扫描收集。 */
-    zan_istr_t *table_ents;
-    int table_ent_count;
-    int table_ent_cap;
-    bool table_ents_done;
-    /* Controller 类名清单：__AttrRoutes.Register 调用点合成 TypeInfo[] 实参用 */
-    zan_istr_t *ctrl_ents;
-    int ctrl_ent_count;
-    int ctrl_ent_cap;
-    bool ctrl_ents_done;
+    struct zan_data_orm_state *data_orm;
+    zan_mvc_route_state_t mvc_routes;
     zan_ast_node_t *current_body;
     zan_ast_node_t *current_method_decl;
     /* 已经报过"null 绑不上值类型形参"的实参位置：同一个实参只报一次
@@ -61,5 +53,8 @@ void zan_checker_check_file(zan_checker_t *c, zan_ast_node_t *unit, uint32_t fil
 
 zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr);
 void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt);
+
+/* Compare the parameter signature of methods in a class hierarchy. */
+bool zan_checker_virtual_signature_equal(zan_symbol_t *a, zan_symbol_t *b);
 
 #endif /* ZAN_CHECKER_H */

@@ -1,14 +1,12 @@
 /* main_linker.c - 跨平台链接器参数组装与驱动库定位执行 */
 /* 涵盖 Windows (lld-link/ld), Linux (ld.lld/musl), macOS (ld64/lld), WASM (wasm-ld), Android, OHOS 等目标 */
 
-        char icon_obj[1100];
-        icon_obj[0] = '\0';
         if (!no_icon && !emit_lib && target.os == ZAN_OS_WINDOWS) {
             int arm64 = target.arch == ZAN_ARCH_AARCH64;
-            snprintf(icon_obj, sizeof(icon_obj), "%s.icon.o", obj_path);
+            snprintf(link_work_icon, sizeof(link_work_icon), "%s/icon.o", link_work_dir);
             int ires = 1;
             if (icon_path) {
-                ires = zan_winres_icon_object(icon_path, icon_obj, arm64);
+                ires = zan_winres_icon_object(icon_path, link_work_icon, arm64);
                 if (ires != 0)
                     fprintf(stderr, "warning: cannot embed icon '%s'; "
                                     "the executable gets the built-in one\n",
@@ -17,14 +15,12 @@
             if (ires != 0 && (!publish_mode || default_icon_explicit)) {
                 ires = zan_winres_icon_object_mem(zan_default_icon,
                                                   ZAN_DEFAULT_ICON_LEN,
-                                                  icon_obj, arm64);
+                                                  link_work_icon, arm64);
             }
-            if (ires != 0) {
-                icon_obj[0] = '\0';
-            } else if (extra_link_input_count < ZAN_MAX_LINK_INPUTS) {
-                extra_link_inputs[extra_link_input_count++] = icon_obj;
-            } else {
-                link_cap_exceeded("link inputs", ZAN_MAX_LINK_INPUTS);
+            if (ires == 0) {
+                if (extra_link_input_count >= ZAN_MAX_LINK_INPUTS)
+                    link_cap_exceeded("link inputs", ZAN_MAX_LINK_INPUTS);
+                extra_link_inputs[extra_link_input_count++] = link_work_icon;
             }
         }
 
@@ -209,37 +205,17 @@
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
             && target.os != ZAN_OS_ANDROID && target.os != ZAN_OS_OHOS
             && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS
-            && target.os != ZAN_OS_IOS) {
-            int needs_sync = 1;
-            if (target.os == ZAN_OS_WASI) {
-                static const char *const disp_pre[] = {
-                    "zan_dispatch_", NULL
-                };
-                static const char *const other_sync_pre[] = {
-                    "zan_atomic_int_", "zan_shared_table_",
-                    "zan_thread_", "zan_monitor_",
-                    "zan_monotonic_", "zan_plat_",
-                    "zan_exe_dir_into", "zan_dir_list_into",
-                    NULL
-                };
-                static const char *const gui_pre[] = { "zan_gui_", NULL };
-                int has_disp = wasm_obj_vec_refs_any(&generated_objects, disp_pre);
-                int has_other = wasm_obj_vec_refs_any(&generated_objects, other_sync_pre);
-                needs_sync = (has_other || has_disp)
-                    && !wasm_obj_vec_refs_any(&generated_objects, gui_pre);
-            }
-            if (needs_sync) {
-                fprintf(stderr,
-                        "error: AtomicInt and SharedTable are not available for "
-                        "this cross-compilation target yet\n");
-                generated_object_vec_remove(&generated_objects, obj_tmp);
-                zan_diag_free_buffers(irgen.diag);
-                zan_irgen_destroy(&irgen);
-                zan_arena_free(ir_arena);
-                zan_arena_free(arena);
-                free(source);
-                return 1;
-            }
+            && target.os != ZAN_OS_IOS && target.os != ZAN_OS_WASI) {
+            fprintf(stderr,
+                    "error: synchronization runtime is not available for "
+                    "this cross-compilation target yet\n");
+            generated_object_vec_remove(&generated_objects, obj_tmp);
+            zan_diag_free_buffers(irgen.diag);
+            zan_irgen_destroy(&irgen);
+            zan_arena_free(ir_arena);
+            zan_arena_free(arena);
+            free(source);
+            return 1;
         }
 
         char zan_lib_dirs[ZAN_LINK_MAX_DIRS][512]; int zan_lib_ndirs = 0;
@@ -412,6 +388,59 @@
             }
         }
 
+        const char *import_libs[ZAN_LINK_MAX_LIBS];
+        int import_lib_lens[ZAN_LINK_MAX_LIBS];
+        int import_lib_count = 0;
+        if (!emit_lib || lib_shared) {
+            for (int li = 0; li < irgen.extern_lib_count; li++) {
+                zan_istr_t lib = irgen.extern_libs[li];
+                int nlen;
+                const char *nm = zan_dllimport_lname(lib.str, (int)lib.len, &nlen);
+                if (!nm) continue;
+                bool bundled = false;
+                for (int d = 0; d < used_driver_count && !bundled; d++) {
+                    if (used_driver_runtime[d] || used_driver_len[d] != nlen ||
+                        memcmp(used_drivers[d], nm, (size_t)nlen) != 0)
+                        continue;
+                    if (cross_compiling && (target.os == ZAN_OS_LINUX ||
+                                           target.os == ZAN_OS_OHOS)) {
+                        char archive[1200];
+                        snprintf(archive, sizeof(archive), "%s/static/lib%.*s.a",
+                                 driver_dirs[d], nlen, nm);
+                        for (int i = 0; i < cross_archive_count; i++)
+                            if (strcmp(cross_archives[i], archive) == 0) bundled = true;
+                    } else if (cross_compiling && target.os == ZAN_OS_MACOS) {
+                        char dylib[1200];
+                        bundled = zan_find_macos_driver_dylib(driver_dirs[d], nm, nlen,
+                                                             dylib, sizeof(dylib));
+                    }
+                }
+                if (cross_compiling && !emit_lib && target.os == ZAN_OS_IOS) {
+                    static const char *const ios_modules[] = {
+                        "zan_gui", "zan_image", "zan_audio", "zan_game"
+                    };
+                    for (size_t i = 0; i < sizeof(ios_modules) / sizeof(ios_modules[0]); i++)
+                        if (strlen(ios_modules[i]) == (size_t)nlen &&
+                            memcmp(nm, ios_modules[i], (size_t)nlen) == 0) bundled = true;
+                }
+                if (target.os == ZAN_OS_WASI) {
+                    static const char *const wasi_modules[] = {
+                        "zan_gui", "zan_image", "zan_audio", "zan_game"
+                    };
+                    for (size_t i = 0; i < sizeof(wasi_modules) / sizeof(wasi_modules[0]); i++)
+                        if (strlen(wasi_modules[i]) == (size_t)nlen &&
+                            memcmp(nm, wasi_modules[i], (size_t)nlen) == 0) bundled = true;
+                }
+                if (bundled || zan_link_inputs_supply_import(&irgen, lib, live_imports,
+                                                             extra_link_inputs,
+                                                             explicit_link_input_count)) continue;
+                if (import_lib_count >= ZAN_LINK_MAX_LIBS)
+                    link_cap_exceeded("DllImport libraries", ZAN_LINK_MAX_LIBS);
+                import_libs[import_lib_count] = nm;
+                import_lib_lens[import_lib_count++] = nlen;
+            }
+        }
+
         if (emit_lib) {
             if (!lib_shared) {
                 if (zan_write_static_lib(obj_tmp, obj_path, target.os) != 0) {
@@ -429,7 +458,7 @@
             } else {
                 if (cross_compiling
                     && (rt_io_obj || rt_sync_obj || rt_file_obj
-                        || rt_decimal_obj || rt_embed_obj)) {
+                        || rt_decimal_obj || rt_embed_obj || rt_inflate_obj)) {
                     if (!target_rt_sub) {
                         fprintf(stderr,
                                 "error: no bundled runtime objects for this "
@@ -503,6 +532,13 @@
                     }
                 }
                 char cmd[8192];
+                char elf_output[1200], elf_diagnostics[1200];
+                const char *shared_out = obj_path;
+                if (check_elf_imports && live_imports) {
+                    snprintf(elf_output, sizeof(elf_output), "%s/shared.so", link_work_dir);
+                    snprintf(elf_diagnostics, sizeof(elf_diagnostics), "%s/elf-link.log", link_work_dir);
+                    shared_out = elf_output;
+                }
                 bool lib_spawned = false;
                 char exe_dir[1024];
                 zan_exe_dir(exe_dir, sizeof(exe_dir));

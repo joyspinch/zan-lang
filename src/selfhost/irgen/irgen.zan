@@ -421,12 +421,13 @@ partial class Irgen {
     // Emit `declare <ret> @<sym>(<params>)` for a [DllImport] extern method,
     // deduplicated against builtins and prior declarations. Calls route to the
     // raw symbol via MethodSym.
+    string ExternParamType(Node p, bool variadic) {
+        if (p.ival == 1) { return MapType(p.type) + "*"; }
+        return variadic ? MapFieldType(p.type) : MapType(p.type);
+    }
+
     void DeclareExtern(Node cls, Node m) {
-        string sym = ExternName(m);
-        // NativeMemory hardware helpers live in the C runtime under zan_hw_*
-        // (matches the C host's symbol routing); inline-lowered methods are
-        // filtered out by the caller before we get here
-        if (cls.sval == "NativeMemory") { sym = "zan_hw_" + sym; }
+        string sym = MethodSym(cls.sval, m);
         if (sym.StartsWith("__zan_decimal_")) { DeclareDecimalExtern(sym, m); return; }
         if (ExternSeen(sym)) { return; }
         externDecls.Add(sym);
@@ -443,7 +444,7 @@ partial class Irgen {
                 Node p = m.kids[i];
                 if (p.kind == AK.Param()) {
                     if (first == 0) { paramList = paramList + ", "; }
-                    string pt = ((m.mods & MOD.Variadic()) != 0) ? MapFieldType(p.type) : MapType(p.type);
+                    string pt = ExternParamType(p, HasMod(m, MOD.Variadic()));
                     paramList = paramList + pt + " %p" + pi;
                     first = 0;
                     pi = pi + 1;
@@ -473,7 +474,7 @@ partial class Irgen {
             Node p = m.kids[i];
             if (p.kind == AK.Param()) {
                 if (first == 0) { sig = sig + ", "; }
-                sig = sig + (((m.mods & MOD.Variadic()) != 0) ? MapFieldType(p.type) : MapType(p.type));
+                sig = sig + ExternParamType(p, HasMod(m, MOD.Variadic()));
                 first = 0;
             }
             i = i + 1;
@@ -704,13 +705,15 @@ partial class Irgen {
         SeedExternBuiltins();
         // B-ID211: decide once, before any emission, whether the GC probe
         // runtime (and the allocation-tracking hooks in zalloc/zrelease and
-        // the zstr pair) are needed. Pre-adding the two symbols keeps the
-        // stdlib's DllImport declares out of the module -- the finalize-time
-        // EmitGcProbeRuntime defines them instead.
+        // the zstr pair) are needed. EmitGcProbeRuntime supplies the definitions
+        // for these symbols.
         gcProbeUsed = AstUsesGcProbe(unit);
         if (gcProbeUsed) {
             externDecls.Add("zan_gc_detect_cycles");
             externDecls.Add("zan_gc_write_heap_snapshot");
+            externDecls.Add("zan_rt_heap_diagnostics_enable");
+            externDecls.Add("zan_rt_heap_mutator_enter");
+            externDecls.Add("zan_rt_heap_mutator_leave");
         }
         EmitSyncPendingRuntime();
         EmitExceptionPayloadRuntime();
@@ -988,17 +991,14 @@ partial class Irgen {
                     // to zan_hw_* in the C runtime).
                     bool lowered = false;
                     if (MatchBuiltinClass(cls.sval, "Vector128") || MatchBuiltinClass(cls.sval, "Vector256") || MatchBuiltinClass(cls.sval, "BitOperations")
-                    || MatchBuiltinClass(cls.sval, "Sse2") || MatchBuiltinClass(cls.sval, "Sse42") || MatchBuiltinClass(cls.sval, "Aes")
-                    || MatchBuiltinClass(cls.sval, "PixelOps")) {
+                    || MatchBuiltinClass(cls.sval, "Sse2") || MatchBuiltinClass(cls.sval, "Sse42") || MatchBuiltinClass(cls.sval, "Aes")) {
                         lowered = true;
                     } else if (MatchBuiltinClass(cls.sval, "NativeMemory")) {
                         string nm = ExternName(m);
                         if (nm == "Alloc" || nm == "Free" || nm == "Copy" || nm == "Copy2D" || nm == "Fill"
                         || nm == "Compare" || nm == "GetString" || nm == "PutString"
                         || nm == "Crc32" || nm == "Crc32C" || nm == "Crc32CUpdate"
-                        || nm == "Crc32Update"
-                        || nm == "Find" || nm == "Base64Encode" || nm == "Base64Decode"
-                        || nm == "Sha256" || nm == "Sha1" || nm == "Sha512" || nm == "Sm3") {
+                        || nm == "Crc32Update" || nm == "Find") {
                             lowered = true;
                         }
                     }

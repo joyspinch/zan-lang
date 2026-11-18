@@ -8,6 +8,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
+#include "win_utf8.h"
 #define PATH_SEP "\\"
 #define popen _popen
 #define pclose _pclose

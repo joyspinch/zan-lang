@@ -6,12 +6,6 @@
         }
 
         {
-            LLVMValueRef px_out = NULL;
-            if (emit_pixel_ops_call(g, expr, locals, &px_out))
-                return px_out;
-        }
-
-        {
             LLVMValueRef bit_out = NULL;
             if (emit_bit_operations_call(g, expr, locals, &bit_out))
                 return bit_out;

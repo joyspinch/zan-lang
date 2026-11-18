@@ -483,9 +483,11 @@ done:
 
 /* ---- output ---- */
 
+static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage);
+
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path) {
-    if (zan_opt_validate_cpu(g, g->mod) != ZAN_OK ||
-        zan_opt_verify_module(g->mod, "before IR output") != ZAN_OK) return ZAN_ERROR;
+    if (zan_bind_target_layout(g, NULL) != ZAN_OK ||
+        prepare_target_output(g, "before IR output") != ZAN_OK) return ZAN_ERROR;
     char *ir = LLVMPrintModuleToString(g->mod);
     char *owned = NULL;   /* 自述头 + IR 的拼接缓冲（malloc 释放） */
     /* 产物自述目标特性：编译器自己用 AVX2 档后端出码，但 .ll 文本里没有这层
@@ -619,6 +621,21 @@ int zan_irgen_prune_extern_libs(zan_irgen_t *g) {
     }
     g->extern_lib_count = kept;
     return dropped;
+}
+
+bool zan_irgen_imports_ios_driver(const zan_irgen_t *g, const char *driver) {
+    if (!g->target_is_ios) return false;
+    size_t driver_len = strlen(driver);
+    for (int li = 0; li < g->extern_lib_count; li++) {
+        zan_istr_t lib = g->extern_libs[li];
+        if (lib.len > 3 && memcmp(lib.str, "lib", 3) == 0) {
+            lib.str += 3;
+            lib.len -= 3;
+        }
+        if (lib.len == driver_len && memcmp(lib.str, driver, driver_len) == 0)
+            return true;
+    }
+    return false;
 }
 
 bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix) {
@@ -838,9 +855,17 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
        否则消费方（llc 等）用 generic CPU 拿到 256 位向量路径会合法化失败。 */
     snprintf(g->target_cpu, sizeof(g->target_cpu), "%s", tm_cpu);
     snprintf(g->target_features, sizeof(g->target_features), "%s", tm_features);
-    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
-        target, triple, tm_cpu, tm_features,
-        cg, LLVMRelocPIC, LLVMCodeModelDefault);
+    /* Android's API 28 floor predates ELF TLS. Match the NDK's codegen. */
+    LLVMTargetMachineRef tm = strstr(triple, "android")
+        ? zan_create_emulated_tls_target_machine(target, triple, tm_cpu, tm_features, cg)
+        : LLVMCreateTargetMachine(target, triple, tm_cpu, tm_features,
+                                  cg, LLVMRelocPIC, LLVMCodeModelDefault);
+    if (!tm) {
+        zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3091,
+                           "failed to create target machine for '%s'", triple);
+        LLVMDisposeMessage(triple);
+        return ZAN_ERROR;
+    }
 
     LLVMSetTarget(g->mod, triple);
     LLVMTargetDataRef dl = LLVMCreateTargetDataLayout(tm);
@@ -935,7 +960,7 @@ void zan_irgen_prepare_object_sections(zan_irgen_t *g, LLVMModuleRef mod) {
     }
 }
 
-zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
+static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage) {
     abi_pending_report(g);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     bool w32_triple = strncmp(g->target_triple, "wasm32", 6) == 0;
@@ -1080,21 +1105,29 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             }
         }
     }
-    if (g->target_is_ios) {
+    /* Only the UIKit driver supplies its own main and calls Zan's entry. */
+    if (zan_irgen_imports_ios_driver(g, "zan_gui") ||
+        zan_irgen_imports_ios_driver(g, "zan_game")) {
         LLVMValueRef mainf = LLVMGetNamedFunction(g->mod, "main");
         if (mainf && LLVMCountBasicBlocks(mainf) > 0) {
             LLVMSetValueName2(mainf, "zan_user_main", strlen("zan_user_main"));
         }
     }
-    zan_irgen_init_llvm_targets();
-
-    zan_irgen_prepare_object_sections(g, g->mod);
-
-    LLVMTargetMachineRef tm;
-    if (zan_bind_target_layout(g, &tm) != ZAN_OK) return ZAN_ERROR;
-
     if (zan_opt_validate_cpu(g, g->mod) != ZAN_OK ||
-        zan_opt_verify_module(g->mod, "before object output") != ZAN_OK) {
+        zan_opt_verify_module(g->mod, stage) != ZAN_OK) return ZAN_ERROR;
+    return ZAN_OK;
+}
+
+zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
+    LLVMTargetMachineRef tm;
+    if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK) return ZAN_ERROR;
+
+    if (prepare_target_output(g, "before object output") != ZAN_OK) {
+        LLVMDisposeTargetMachine(tm);
+        return ZAN_ERROR;
+    }
+    zan_irgen_prepare_object_sections(g, g->mod);
+    if (zan_opt_verify_module(g->mod, "after object section preparation") != ZAN_OK) {
         LLVMDisposeTargetMachine(tm);
         return ZAN_ERROR;
     }

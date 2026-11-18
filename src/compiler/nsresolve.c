@@ -3,6 +3,7 @@
 #include "nsresolve.h"
 #include "arena.h"
 #include "diag.h"
+#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>

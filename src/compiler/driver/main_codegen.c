@@ -144,27 +144,31 @@
         fprintf(stderr, "note: -g forces -O0 (debug info is emitted unoptimized)\n");
         effective_opt = ZAN_OPT_NONE;
     }
-    char obj_path[1024];
+    char final_link_path[1024];
+    const char *obj_path = final_link_path;
+    int path_len;
     if (ipa_path) {
-        snprintf(obj_path, sizeof(obj_path), "%s.macho_tmp", ipa_path);
+        path_len = snprintf(final_link_path, sizeof(final_link_path), "%s.macho_tmp", ipa_path);
     } else if (output_file) {
-        snprintf(obj_path, sizeof(obj_path), "%s", output_file);
+        path_len = snprintf(final_link_path, sizeof(final_link_path), "%s", output_file);
     } else {
         size_t ilen = strlen(input_file);
         const char *def_ext = (target.os == ZAN_OS_WINDOWS) ? ".exe" : "";
         if (ilen > 4 && strcmp(input_file + ilen - 4, ".zan") == 0) {
-            snprintf(obj_path, sizeof(obj_path), "%.*s%s", (int)(ilen - 4), input_file, def_ext);
+            path_len = snprintf(final_link_path, sizeof(final_link_path),
+                                "%.*s%s", (int)(ilen - 4), input_file, def_ext);
         } else {
-            snprintf(obj_path, sizeof(obj_path), "%s%s", input_file,
-                     (target.os == ZAN_OS_WINDOWS) ? ".exe" : ".out");
+            path_len = snprintf(final_link_path, sizeof(final_link_path), "%s%s", input_file,
+                                (target.os == ZAN_OS_WINDOWS) ? ".exe" : ".out");
         }
     }
 
-    if (output_file) {
+    const char *requested_output = ipa_path ? ipa_path : (apk_path ? apk_path : output_file);
+    if (requested_output) {
         char out_dir[1024];
-        size_t olen = strlen(output_file);
+        size_t olen = strlen(requested_output);
         if (olen < sizeof(out_dir)) {
-            memcpy(out_dir, output_file, olen + 1);
+            memcpy(out_dir, requested_output, olen + 1);
             for (char *p = out_dir; *p; p++) {
                 if ((*p == '/' || *p == '\\') && p > out_dir) {
                     char sep = *p;
@@ -183,6 +187,26 @@
     zan_driver_registry_t driver_reg;
     zan_driver_prefix_snapshot_t driver_prefixes = {0};
     if (!do_emit_ir) {
+        if (path_len <= 0 || path_len >= (int)sizeof(final_link_path)) {
+            fprintf(stderr, "error: invalid or too long output path\n");
+            goto codegen_failed;
+        }
+        const char *artifact_path = requested_output ? requested_output : obj_path;
+        if (!create_link_work_dir(artifact_path)) {
+            fprintf(stderr, "error: cannot create a staging directory for '%s'\n",
+                    obj_path);
+            goto codegen_failed;
+        }
+        if (!emit_lib || apk_path || ipa_path) {
+            int n = snprintf(link_work_output, sizeof(link_work_output), "%s/linked-%s",
+                             link_work_dir, zan_path_basename(final_link_path));
+            if (n < 0 || n >= (int)sizeof(link_work_output)) {
+                link_work_output[0] = '\0';
+                fprintf(stderr, "error: staged output path is too long\n");
+                goto codegen_failed;
+            }
+            obj_path = link_work_output;
+        }
         if (!mf_built) {
             if (zan_opt_strip_unused(&irgen) != ZAN_OK) goto codegen_failed;
             zan_irgen_prune_extern_libs(&irgen);
@@ -192,9 +216,18 @@
                                       driver_dir_override, &driver_prefixes);
     }
 
+    const int explicit_link_input_count = extra_link_input_count;
+    const bool check_elf_imports = lib_shared &&
+        (target.os == ZAN_OS_LINUX || target.os == ZAN_OS_OHOS);
+    const bool *live_imports = NULL;
     if (!do_emit_ir && want_shard && mf_built) {
+        /* A live import may disappear from the main module after sharding. */
+        if (explicit_link_input_count || check_elf_imports)
+            live_imports = zan_capture_live_imports(&irgen);
+        char shard_base[1100];
+        snprintf(shard_base, sizeof(shard_base), "%s/module", link_work_dir);
         phase("shard");
-        shard_n = zan_irgen_shard_run(&irgen, &mf, obj_path, &shard_objs);
+        shard_n = zan_irgen_shard_run(&irgen, &mf, shard_base, &shard_objs);
         if (shard_n < 0) {
             fprintf(stderr, "error: shard emission failed\n");
             zan_diag_free_buffers(irgen.diag);
@@ -231,9 +264,12 @@
         }
     }
 
+    if (!do_emit_ir && target.os == ZAN_OS_WASI && !zan_wasi_capabilities_supported(&irgen))
+        goto codegen_failed;
+
     goto codegen_ready;
 codegen_failed:
-    fprintf(stderr, "error: code generation stopped after optimization failure\n");
+    fprintf(stderr, "error: code generation stopped\n");
     if (mf_built) zan_irgen_manifest_free(&mf);
     for (int i = 0; i < shard_n; i++) {
         remove(shard_objs[i]);
@@ -269,238 +305,8 @@ codegen_ready:
                     irgen.target_features[0] ? irgen.target_features : "+sse2");
         }
     } else {
-        char cross_archives[ZAN_MAX_USED_DRIVERS][1200];
-        int cross_archive_count = 0;
-        if (cross_compiling && (target.os == ZAN_OS_LINUX
-                                || target.os == ZAN_OS_OHOS)) {
-            zan_driver_registry_t cross_reg;
-            zan_discover_drivers(resolved_stdlib_root, &cross_reg);
-            const char *dsub = zan_driver_subdir(&target);
-            for (int li = 0; li < irgen.extern_lib_count; li++) {
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue;
-                char archive[1200];
-                archive[0] = '\0';
-                int didx = zan_driver_find(&cross_reg, nm, nlen);
-                if (didx >= 0) {
-                    snprintf(archive, sizeof(archive),
-                             "%s/%s/drivers/%s/static/lib%.*s.a",
-                             cross_reg.entries[didx].root,
-                             cross_reg.entries[didx].module, dsub, nlen, nm);
-                }
-                if (archive[0] && zan_file_exists(archive)) {
-                    if (cross_archive_count >= ZAN_MAX_USED_DRIVERS)
-                        link_cap_exceeded("static driver archives", ZAN_MAX_USED_DRIVERS);
-                    {
-                        snprintf(cross_archives[cross_archive_count],
-                                 sizeof(cross_archives[0]), "%s", archive);
-                        cross_archive_count++;
-                    }
-                } else {
-                    int n = zan_irgen_stub_extern_lib(
-                        &irgen, irgen.extern_libs[li].str,
-                        (int)irgen.extern_libs[li].len);
-                    if (n > 0 && !zan_win_system_lib(
-                            irgen.extern_libs[li].str,
-                            (int)irgen.extern_libs[li].len)) {
-                        fprintf(stderr,
-                                "warning: no static %s archive for "
-                                "[DllImport(\"%.*s\")]; its %d function(s) "
-                                "are stubbed and will fail at runtime\n",
-                                dsub, (int)irgen.extern_libs[li].len,
-                                irgen.extern_libs[li].str, n);
-                    }
-                }
-            }
-        }
-
-        if (cross_compiling && target.os == ZAN_OS_OHOS) {
-            char oexe[1024] = {0};
-            zan_exe_dir(oexe, sizeof(oexe));
-            const char *odrop_sub = (target.arch == ZAN_ARCH_AARCH64)
-                                    ? "ohos-arm64" : "ohos-x64";
-            zan_driver_registry_t oreg;
-            zan_discover_drivers(resolved_stdlib_root, &oreg);
-            for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
-                if (zan_win_system_lib(irgen.extern_libs[li].str,
-                                       (int)irgen.extern_libs[li].len))
-                    continue;
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue;
-                int resolvable = 0;
-                int via_static_archive = 0;
-                { char drvso[1300];
-                  snprintf(drvso, sizeof(drvso), "%s/%s/lib%.*s.so",
-                           oexe, odrop_sub, nlen, nm);
-                  if (zan_file_exists(drvso)) {
-                      resolvable = 1;
-                  } else {
-                      int didx = zan_driver_find(&oreg, nm, nlen);
-                      if (didx >= 0) {
-                          snprintf(drvso, sizeof(drvso),
-                                   "%s/%s/drivers/%s/static/lib%.*s.a",
-                                   oreg.entries[didx].root,
-                                   oreg.entries[didx].module,
-                                   odrop_sub, nlen, nm);
-                          if (zan_file_exists(drvso)) {
-                              resolvable = 1;
-                              via_static_archive = 1;
-                          } else {
-                              snprintf(drvso, sizeof(drvso),
-                                       "%s/%s/drivers/%s/lib%.*s.so",
-                                       oreg.entries[didx].root,
-                                       oreg.entries[didx].module,
-                                       odrop_sub, nlen, nm);
-                              resolvable = zan_file_exists(drvso);
-                          }
-                      }
-                  }
-                }
-                if (via_static_archive) {
-                    zan_irgen_drop_extern_lib(
-                        &irgen, irgen.extern_libs[li].str,
-                        (int)irgen.extern_libs[li].len);
-                } else if (!resolvable) {
-                    zan_irgen_stub_extern_lib(
-                        &irgen, irgen.extern_libs[li].str,
-                        (int)irgen.extern_libs[li].len);
-                    zan_irgen_drop_extern_lib(
-                        &irgen, irgen.extern_libs[li].str,
-                        (int)irgen.extern_libs[li].len);
-                }
-            }
-        }
-
-        char cross_dylibs[ZAN_MAX_USED_DRIVERS][1200];
-        int cross_dylib_count = 0;
-        if (cross_compiling && target.os == ZAN_OS_MACOS) {
-            zan_driver_registry_t mac_reg;
-            zan_discover_drivers(resolved_stdlib_root, &mac_reg);
-            const char *dsub = zan_driver_subdir(&target);
-            for (int li = 0; li < irgen.extern_lib_count; li++) {
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue; /* CRT/libc/libm: resolved by libSystem */
-                char dylib[1200];
-                dylib[0] = '\0';
-                int didx = zan_driver_find(&mac_reg, nm, nlen);
-                if (didx >= 0) {
-                    char driver_dir[1200];
-                    snprintf(driver_dir, sizeof(driver_dir),
-                             "%s/%s/drivers/%s", mac_reg.entries[didx].root,
-                             mac_reg.entries[didx].module, dsub);
-                    zan_find_macos_driver_dylib(
-                        driver_dir, nm, nlen, dylib, sizeof(dylib));
-                }
-                if (dylib[0]) {
-                    if (cross_dylib_count >= ZAN_MAX_USED_DRIVERS)
-                        link_cap_exceeded("driver dylibs", ZAN_MAX_USED_DRIVERS);
-                    {
-                        snprintf(cross_dylibs[cross_dylib_count],
-                                 sizeof(cross_dylibs[0]), "%s", dylib);
-                        cross_dylib_count++;
-                    }
-                } else if (target.os == ZAN_OS_IOS &&
-                           (strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0 ||
-                            strncmp(irgen.extern_libs[li].str, "zan_image", irgen.extern_libs[li].len) == 0 ||
-                            strncmp(irgen.extern_libs[li].str, "zan_game", irgen.extern_libs[li].len) == 0 ||
-                            strncmp(irgen.extern_libs[li].str, "zan_audio", irgen.extern_libs[li].len) == 0)) {
-                    /* iOS 使用静态内嵌的 zanrt_gui.o / zanrt_image.o / zanrt_game.o / zanrt_audio.o，不打桩也不需要外部 dylib */
-                } else {
-                    int n = zan_irgen_stub_extern_lib(
-                        &irgen, irgen.extern_libs[li].str,
-                        (int)irgen.extern_libs[li].len);
-                    if (n > 0 && !zan_win_system_lib(
-                            irgen.extern_libs[li].str,
-                            (int)irgen.extern_libs[li].len)) {
-                        fprintf(stderr,
-                                "warning: no %s driver dylib for "
-                                "[DllImport(\"%.*s\")]; its %d function(s) "
-                                "are stubbed and will fail at runtime\n",
-                                dsub, (int)irgen.extern_libs[li].len,
-                                irgen.extern_libs[li].str, n);
-                    }
-                }
-            }
-        }
-
-        if (target.os != ZAN_OS_WINDOWS) {
-            for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
-                if (!zan_win_system_lib(irgen.extern_libs[li].str,
-                                        (int)irgen.extern_libs[li].len))
-                    continue;
-                zan_irgen_stub_extern_lib(&irgen, irgen.extern_libs[li].str,
-                                          (int)irgen.extern_libs[li].len);
-                zan_irgen_drop_extern_lib(&irgen, irgen.extern_libs[li].str,
-                                          (int)irgen.extern_libs[li].len);
-            }
-        }
-
-        if (cross_compiling && target.os == ZAN_OS_ANDROID) {
-            char aexe[1024] = {0};
-            zan_exe_dir(aexe, sizeof(aexe));
-            const char *asub = (target.arch == ZAN_ARCH_AARCH64)
-                               ? "android-arm64" : "android-x64";
-            for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
-                if (zan_win_system_lib(irgen.extern_libs[li].str,
-                                       (int)irgen.extern_libs[li].len))
-                    continue;
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue;
-                int resolvable = 0;
-                { char stubso[1200];
-                  snprintf(stubso, sizeof(stubso), "%s/%s/lib%.*s.so",
-                           aexe, asub, nlen, nm);
-                  if (zan_file_exists(stubso)) {
-                      resolvable = 1;
-                  } else {
-                      int didx = zan_driver_find(&driver_reg, nm, nlen);
-                      if (didx >= 0) {
-                          snprintf(stubso, sizeof(stubso),
-                                   "%s/%s/drivers/%s/lib%.*s.so",
-                                   driver_reg.entries[didx].root,
-                                   driver_reg.entries[didx].module,
-                                   zan_driver_subdir(&target), nlen, nm);
-                          resolvable = zan_file_exists(stubso);
-                          if (!resolvable) {
-                              snprintf(stubso, sizeof(stubso),
-                                       "%s/%s/drivers/%s/static/lib%.*s.a",
-                                       driver_reg.entries[didx].root,
-                                       driver_reg.entries[didx].module,
-                                       zan_driver_subdir(&target), nlen, nm);
-                              resolvable = zan_file_exists(stubso);
-                          }
-                      }
-                  }
-                }
-                if (!resolvable) {
-                    int nst = zan_irgen_stub_extern_lib(
-                        &irgen, irgen.extern_libs[li].str,
-                        (int)irgen.extern_libs[li].len);
-                    zan_irgen_drop_extern_lib(
-                        &irgen, irgen.extern_libs[li].str,
-                        (int)irgen.extern_libs[li].len);
-                    if (nst > 0) {
-                        fprintf(stderr,
-                                "warning: no android driver for "
-                                "[DllImport(\"%.*s\")]; its %d function(s) "
-                                "are stubbed and will fail at runtime\n",
-                                nlen, nm, nst);
-                    }
-                }
-            }
-        }
+        if (shard_n == 0 && (explicit_link_input_count || check_elf_imports))
+            live_imports = zan_capture_live_imports(&irgen);
         char driver_dirs[ZAN_MAX_USED_DRIVERS][1024];
         const char *used_drivers[ZAN_MAX_USED_DRIVERS]; int used_driver_count = 0;
         int used_driver_len[ZAN_MAX_USED_DRIVERS];
@@ -562,6 +368,29 @@ codegen_ready:
                                  "%s/%s/drivers/%s", droot, mod, dsub);
                     }
                 }
+            }
+        }
+
+        char cross_archives[ZAN_MAX_USED_DRIVERS][1200];
+        int cross_archive_count = 0;
+        char cross_dylibs[ZAN_MAX_USED_DRIVERS][1200];
+        int cross_dylib_count = 0;
+        for (int d = 0; cross_compiling && d < used_driver_count; d++) {
+            if (used_driver_runtime[d] || !driver_dirs[d][0]) continue;
+            if (target.os == ZAN_OS_LINUX || target.os == ZAN_OS_OHOS) {
+                char *archive = cross_archives[cross_archive_count];
+                snprintf(archive, sizeof(cross_archives[0]), "%s/static/lib%.*s.a",
+                         driver_dirs[d], used_driver_len[d], used_drivers[d]);
+                if (zan_file_exists(archive)) {
+                    used_driver_static[d] = true;
+                    cross_archive_count++;
+                }
+            } else if (target.os == ZAN_OS_MACOS) {
+                char *dylib = cross_dylibs[cross_dylib_count];
+                if (zan_find_macos_driver_dylib(driver_dirs[d], used_drivers[d],
+                                              used_driver_len[d], dylib,
+                                              sizeof(cross_dylibs[0])))
+                    cross_dylib_count++;
             }
         }
 
@@ -639,79 +468,6 @@ codegen_ready:
                 used_driver_embedded[d] = true;
                 snprintf(embedded_driver_file[d],
                          sizeof(embedded_driver_file[0]), "%s", file);
-            }
-        }
-
-        if (target.os == ZAN_OS_WINDOWS) {
-            char win_exe_dir[1024] = {0};
-            zan_exe_dir(win_exe_dir, sizeof(win_exe_dir));
-            for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
-                int nlen;
-                const char *nm = zan_dllimport_lname(
-                    irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm || zan_win_system_lib(nm, nlen)) continue;
-                char dir[1200];
-                dir[0] = '\0';
-                for (int d = 0; d < used_driver_count; d++) {
-                    if (used_driver_len[d] == nlen &&
-                        memcmp(used_drivers[d], nm, (size_t)nlen) == 0) {
-                        snprintf(dir, sizeof(dir), "%s", driver_dirs[d]);
-                        break;
-                    }
-                }
-                bool resolvable = false;
-                static const char fmts[8][28] = {
-                    "%s/static/lib%s.a", "%s/static/%s.lib",
-                    "%s/lib%s.a",        "%s/%s.lib",
-                    "%s/lib%s.dll.a",    "%s/%s.dll.a",
-                    "%s/lib%s.dll",      "%s/%s.dll"
-                };
-                if (dir[0]) {
-                    for (int f = 0; f < 8 && !resolvable; f++) {
-                        char cand[1300];
-                        snprintf(cand, sizeof(cand), fmts[f], dir, nm);
-                        resolvable = zan_file_exists(cand);
-                    }
-                }
-                if (!resolvable && win_exe_dir[0]) {
-                    char mlib[1300];
-                    snprintf(mlib, sizeof(mlib), "%s\\mingw\\lib\\lib%s.a", win_exe_dir, nm);
-                    resolvable = zan_file_exists(mlib);
-                    if (!resolvable) {
-                        snprintf(mlib, sizeof(mlib), "%s\\mingw\\lib\\lib%s.dll.a", win_exe_dir, nm);
-                        resolvable = zan_file_exists(mlib);
-                    }
-                }
-                if (!resolvable) {
-                    for (int di = 0; di < extra_lib_path_count && !resolvable; di++) {
-                        char cand[1300];
-                        snprintf(cand, sizeof(cand), "%s/lib%s.a", extra_lib_paths[di], nm);
-                        resolvable = zan_file_exists(cand);
-                        if (!resolvable) {
-                            snprintf(cand, sizeof(cand), "%s/lib%s.dll.a", extra_lib_paths[di], nm);
-                            resolvable = zan_file_exists(cand);
-                        }
-                    }
-                }
-                if (resolvable) continue;
-                int n = zan_irgen_stub_extern_lib(
-                    &irgen, irgen.extern_libs[li].str,
-                    (int)irgen.extern_libs[li].len);
-                if (n > 0) {
-                    char libname[128];
-                    snprintf(libname, sizeof(libname), "%.*s",
-                             (int)irgen.extern_libs[li].len,
-                             irgen.extern_libs[li].str);
-                    zan_irgen_drop_extern_lib(
-                        &irgen, irgen.extern_libs[li].str,
-                        (int)irgen.extern_libs[li].len);
-                    fprintf(stderr,
-                            "warning: no archive or shared library resolved "
-                            "for [DllImport(\"%s\")];"
-                            " its %d function(s) are stubbed and will fail at"
-                            " run time\n", libname, n);
-                }
             }
         }
 
@@ -911,9 +667,9 @@ codegen_ready:
             }
         }
 
-        char obj_tmp[1024];
+        char obj_tmp[1100];
         generated_object_vec_t generated_objects = {0};
-        snprintf(obj_tmp, sizeof(obj_tmp), "%s.o", obj_path);
+        snprintf(obj_tmp, sizeof(obj_tmp), "%s/module.o", link_work_dir);
 
         if (shard_n > 0) {
             for (int i = 0; i < shard_n; i++) {

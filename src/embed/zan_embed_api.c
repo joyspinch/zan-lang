@@ -48,45 +48,32 @@ const unsigned char* zan_embed_bytes(const char* name, int* outLen) {
     return e->data;
 }
 
-const char* zan_embed_list(const char* prefix) {
-    static char* buf = 0;
-    static size_t cap = 0;
-    size_t pl = prefix ? strlen(prefix) : 0;
-    size_t need = 1;
-    long long i;
-    for (i = 0; i < g_cnt; i++) {
-        const char* nm = g_tab[i].name;
-        if (!nm) continue;
-        if (pl && strncmp(nm, prefix, pl) != 0) continue;
-        need += strlen(nm) + 1;
+/* The nint result is a caller-owned, NUL-terminated buffer. */
+int64_t zan_embed_list_alloc(const char* prefix) {
+    const zan_embed_ent* table = g_tab;
+    long long count = g_cnt;
+    if (!table) return 0;
+    size_t prefix_len = prefix ? strlen(prefix) : 0;
+    size_t len = 0;
+    for (long long i = 0; i < count; i++) {
+        const char* name = table[i].name;
+        if (!name || (prefix_len && strncmp(name, prefix, prefix_len) != 0)) continue;
+        size_t name_len = strlen(name);
+        if (name_len >= INT32_MAX - len) return 0;
+        len += name_len + 1;
     }
-    if (need > cap) {
-        static const struct {
-            uint64_t rc, magic;
-            char data[1];
-        } empty = { ZAN_STRING_SENTINEL_RC, ZAN_STR_HDR_WORD(0), { 0 } };
-        char* nb = (char*)realloc(buf ? buf - ZAN_OBJ_HDR_SIZE : 0,
-                                 need + ZAN_OBJ_HDR_SIZE);
-        if (!nb) return empty.data;
-        /* ARC and string length may inspect the words before the data. */
-        uint64_t* hdr = (uint64_t*)nb;
-        hdr[0] = ZAN_STRING_SENTINEL_RC;
-        hdr[1] = ZAN_STRING_MAGIC;
-        buf = nb + ZAN_OBJ_HDR_SIZE; cap = need;
+    if (!len) return 0;
+    char* names = malloc(len + 1);
+    if (!names) return 0;
+    size_t offset = 0;
+    for (long long i = 0; i < count; i++) {
+        const char* name = table[i].name;
+        if (!name || (prefix_len && strncmp(name, prefix, prefix_len) != 0)) continue;
+        size_t name_len = strlen(name);
+        memcpy(names + offset, name, name_len);
+        offset += name_len;
+        names[offset++] = '\n';
     }
-    {
-        size_t o = 0;
-        for (i = 0; i < g_cnt; i++) {
-            const char* nm = g_tab[i].name;
-            if (!nm) continue;
-            if (pl && strncmp(nm, prefix, pl) != 0) continue;
-            {
-                size_t l = strlen(nm);
-                memcpy(buf + o, nm, l); o += l;
-                buf[o++] = '\n';
-            }
-        }
-        buf[o] = '\0';
-    }
-    return buf;
+    names[offset] = '\0';
+    return (int64_t)(uintptr_t)names;
 }

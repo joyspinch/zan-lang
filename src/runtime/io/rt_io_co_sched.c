@@ -104,8 +104,14 @@ static int co_steal(zan_co_worker_t *w, zan_co_task *out) {
     return 0;
 }
 
+static void co_poll_io(zan_co_worker_t *w, long long timeout_ms, int parked);
+
 static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
-    if (++w->tick % ZAN_GLOBAL_TICK == 0 && co_load(&g_inj_len) > 0) {
+    int global_tick = ++w->tick % ZAN_GLOBAL_TICK == 0;
+    /* Local work can stay runnable indefinitely. Poll its IO shard on the
+     * same cadence as the global queue, including during nested dispatch. */
+    if (global_tick && zan_io_has_pending()) co_poll_io(w, 0, 0);
+    if (global_tick && co_load(&g_inj_len) > 0) {
         zan_co_task batch[ZAN_INJ_BATCH];
         int n = inj_pop_batch(batch, ZAN_INJ_BATCH);
         if (n > 0) {
@@ -244,22 +250,40 @@ static long long co_pump_timers(void) {
     return (cached == 0) ? 1 : cached;
 }
 
-/* 阻塞在完成端口等待 I/O 就绪并恢复协程 */
-static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
+static void co_leave_park(zan_co_worker_t *w) {
+    InterlockedExchange(&w->parked, 0);
+    InterlockedDecrement(&g_co_parked);
+}
+
+static void co_consume_wake(void) {
+    LONG pending = co_load(&g_co_wake);
+    while (pending > 0) {
+        LONG prev = InterlockedCompareExchange(&g_co_wake, pending - 1, pending);
+        if (prev == pending) return;
+        pending = prev;
+    }
+}
+
+/* Poll the worker's own shard. Only a caller that published a park may
+ * remove it. IO completions still publish ready work before dropping owners. */
+static void co_poll_io(zan_co_worker_t *w, long long timeout_ms, int parked) {
     if (timeout_ms > 0x7FFFFFFF) timeout_ms = 0x7FFFFFFF;
     DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
 #if defined(_WIN32)
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     if (g_blocking_wake_lost && InterlockedExchange(&g_blocking_wake_lost, 0)) {
-        if (dns_drain() > 0) return;
+        if (parked) {
+            co_leave_park(w);
+            parked = 0;
+        }
+        dns_drain();
+        to = 0;
     }
     BOOL ok = GetQueuedCompletionStatusEx(io_shard(co_worker_shard(w->index)),
                                           entries, 64, &removed, to, FALSE);
-    InterlockedExchange(&w->parked, 0);
-    InterlockedDecrement(&g_co_parked);
+    if (parked) co_leave_park(w);
     if (!ok) {
-        /* Timeout or error */
         dns_timeout_scan();
         rto_timeout_scan();
         dns_drain();
@@ -271,7 +295,7 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     for (ULONG i = 0; i < removed; i++) {
         if (entries[i].lpOverlapped == NULL) {
             if (entries[i].lpCompletionKey == ZAN_WAKE_KEY) {
-                if (co_load(&g_co_wake) > 0) InterlockedDecrement(&g_co_wake);
+                co_consume_wake();
             } else {
                 dns_drain();
             }
@@ -302,24 +326,34 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
         completed_count--;
         IO_CNT_DEC();
     }
+    if (!parked) {
+        /* A steady completion stream must still advance pending deadlines. */
+        if (g_blocking_inflight > 0) dns_timeout_scan();
+        if (g_io_count > 0) rto_timeout_scan();
+    }
 #else
-    (void)w;
     STRACE("w%d waitio enter to=%lld haspend=%d", w->index, (long long)to, zan_io_has_pending());
     int polled = zan_io_pump_timeout(to == INFINITE ? -1 : (int64_t)to);
-    BOOL ok = (polled >= 0);
-    if (co_load(&g_co_wake) > 0) InterlockedDecrement(&g_co_wake);
-    InterlockedExchange(&w->parked, 0);
-    InterlockedDecrement(&g_co_parked);
-    STRACE("w%d waitio ret=%d ok=%d", w->index, polled, (int)ok);
-    if (!ok) {
+    if (parked) {
+        co_leave_park(w);
+        co_consume_wake();
+    }
+    STRACE("w%d waitio ret=%d", w->index, polled);
+    if (polled < 0) {
         dns_timeout_scan();
         zan_io_shard_t *psh = &g_ioshard[io_thread_shard()];
         shard_lock(psh);
         rto_timeout_scan(psh);
         shard_unlock(psh);
         dns_drain();
+    } else if (!parked && g_blocking_inflight > 0) {
+        dns_timeout_scan();
     }
 #endif
+}
+
+static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
+    co_poll_io(w, timeout_ms, 1);
 }
 
 static int co_all_idle(void) {
@@ -357,16 +391,16 @@ static void co_timeperiod_raise(void) { }
  * 协程标记成"就绪"并入队，没人执行它它就不会跑。单 worker 下唯一的
  * worker 正卡在同步等待里，所以等待者自己得顶上 worker 的活。
  *
- * 一次只跑一个就够：跑完再回到等待循环，下一轮继续派发+取任务。
- * 限制条数是为了不让一个长任务把整个同步等待饿死（那是另一个极端的
- * 饥饿：等待迟迟不结束）。
+ * 每轮限批，跑完回到等待循环检查同步等待的截止时间。
  */
 static void co_run_ready_tasks(void) {
     zan_co_worker_t *w = co_self();
     if (!w) return;
     for (int i = 0; i < 64; i++) {
         zan_co_task t;
-        if (!co_next_task(w, &t)) return;
+        int found = co_next_task(w, &t);
+        co_search_end(w, found);
+        if (!found) return;
         co_run(w, &t);
     }
 }
@@ -429,7 +463,7 @@ static void co_worker(int worker) {
     if (g_co_tls != TLS_OUT_OF_INDEXES) TlsSetValue(g_co_tls, w);
     LONG idle_seen = -1;
     for (;;) {
-        if (co_load(&g_co_stop)) { co_pool_retire(w); return; }
+        if (co_load(&g_co_stop)) break;
         /* 队列繁忙时持续推进到期定时器 */
         if (zan_timer_pending() > 0) co_pump_timers();
         zan_co_task t;
@@ -453,8 +487,7 @@ static void co_worker(int worker) {
                 InterlockedExchange(&g_co_stop, 1);
                 for (int i = 0; i < g_co_workers; i++)
                     co_wake_shard(co_worker_shard(i));
-                co_pool_retire(w);
-                return;
+                break;
             }
             idle_seen = seq;
             Sleep(1);
@@ -480,9 +513,8 @@ static void co_worker(int worker) {
         w->st.park++;
         long long tnow = zan_timer_next_timeout();
         if (tnow >= 0 && tnow < to) to = tnow;
-        if (tnow == 0 || co_has_runnable()) {
-            InterlockedExchange(&w->parked, 0);
-            InterlockedDecrement(&g_co_parked);
+        if (co_load(&g_co_stop) || tnow == 0 || co_has_runnable()) {
+            co_leave_park(w);
             STRACE("w%d park-skip tnow=%lld runnable=%d", w->index, tnow, co_has_runnable());
             continue;
         }
@@ -496,6 +528,8 @@ static void co_worker(int worker) {
                (int)g_co_parked, (int)g_co_stop);
         co_wait_io(w, to);
     }
+    if (g_co_tls != TLS_OUT_OF_INDEXES) TlsSetValue(g_co_tls, NULL);
+    co_pool_retire(w);
 }
 
 static void co_stats_dump(void) {
@@ -668,41 +702,26 @@ void zan_co_sched_run(void) {
 
 void zan_co_sched_run_until(const volatile int *done) {
     if ((co_load(&g_co_pool_live) || co_load(&g_co_pool_fg)) && done != NULL) {
-        /* 从 worker 线程进来：这个调用点在等一个**子协程**跑完（根驱动
-         * await：非 async 方法里 await 一个 async 调用，编译器分配子帧后
-         * 让当前线程把它驱动到完成）。
-         *
-         * 这里**不能自旋等 done**。子协程是 co_submit 提交的，而 co_submit
-         * 从 worker 线程提交时把任务放进**调用者自己那个 worker 的 LIFO
-         * 槽**（w->lifo）——别的 worker 偷不到（co_steal 偷的是别人的
-         * 队列，不偷 lifo 槽）。当前 worker 正卡在这个自旋里，压根没机会
-         * 去取那个 LIFO 槽，于是子协程永远跑不起来，done 永远不置位：
-         * 死锁。worker 数再多也一样（实测 1/2/4/8 全卡）。
-         *
-         * 正确做法：等的时候**自己顶上 worker 的活**——就地取就绪任务跑
-         * 起来（同 co_run_ready_tasks 的思路，A470 的 zan_co_sync_sleep
-         * 就是这么等的）。子协程跑完，done 置位，等待结束。
-         *
-         * 非 worker 线程（主线程）进来时没有自己的队列，自旋是对的：
-         * 子协程会被别的 worker 跑掉。 */
+        /* A synchronous await on a worker must drive its own LIFO slot,
+         * timers and IO shard. The outer frame is still running throughout. */
         zan_co_worker_t *w = co_self();
         if (w) {
-            int spins = 0;
-            for (;;) {
-                if (__atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) return;
-                /* 就地跑就绪任务：子协程多半就在本 worker 的 LIFO 槽里 */
-                zan_co_task t;
-                if (co_next_task(w, &t)) {
-                    co_run(w, &t);
-                    spins = 0;
-                    continue;
-                }
-                /* 队列空：派发到期定时器（子协程可能在等定时器） */
+            while (__atomic_load_n(done, __ATOMIC_ACQUIRE) == 0) {
                 if (zan_timer_pending() > 0) co_pump_timers();
-                if (__atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) return;
-                if (spins < 512) { Sleep(0); spins++; }
-                else Sleep(1);
+                if (__atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) break;
+                zan_co_task t;
+                int found = co_next_task(w, &t);
+                co_search_end(w, found);
+                if (found) {
+                    co_run(w, &t);
+                } else if (zan_io_has_pending()) {
+                    /* Another worker can set done without an IO packet. */
+                    co_poll_io(w, 1, 0);
+                } else {
+                    Sleep(1);
+                }
             }
+            return;
         }
         int spins = 0;
         while (__atomic_load_n(done, __ATOMIC_ACQUIRE) == 0) {

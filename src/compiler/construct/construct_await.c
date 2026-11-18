@@ -336,6 +336,23 @@ static LLVMValueRef blocking_arg_i64(zan_irgen_t *g, LLVMValueRef v,
     return LLVMBuildSExt(g->builder, v, i64, "blocking.arg");
 }
 
+/* Dispatch failure is raised in the resumed coroutine's exception context. */
+static void emit_blocking_dispatch_throw(zan_irgen_t *g, zan_loc_t loc,
+                                         local_scope_t *locals) {
+    zan_ast_node_t *type = zan_ast_new(g->arena, AST_TYPE_REF, loc);
+    static const char exception_name[] = "InvalidOperationException";
+    type->type_ref.name = (zan_istr_t){ (char *)exception_name, sizeof(exception_name) - 1 };
+    zan_ast_node_t *msg = zan_ast_new(g->arena, AST_STRING_LITERAL, loc);
+    static const char message[] = "Unable to dispatch awaited native call";
+    msg->str_val = (zan_istr_t){ (char *)message, sizeof(message) - 1 };
+    zan_ast_node_t *exc = zan_ast_new(g->arena, AST_NEW_EXPR, loc);
+    exc->new_expr.type = type;
+    zan_ast_list_push(&exc->new_expr.args, msg, g->arena);
+    zan_ast_node_t *stmt = zan_ast_new(g->arena, AST_THROW_STMT, loc);
+    stmt->throw_stmt.value = exc;
+    emit_stmt(g, stmt, locals);
+}
+
 /* 原生异步挂起原语发射 */
 static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
         zan_ast_node_t *expr, local_scope_t *locals, zan_symbol_t *sym) {
@@ -415,9 +432,12 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
     g->uses_socket_async = true;
     int state = g->current_async_next_state++;
     LLVMValueRef frame = g->current_async_frame;
-    LLVMTypeRef frame_type = g->current_async_frame_type;
     LLVMValueRef frame_i8 = LLVMBuildBitCast(g->builder, frame, i8ptr,
                                              "blocking.frame");
+    /* This await has no child frame, so the child scratch slot can hold status. */
+    LLVMValueRef scratch = get_async_sub_slot_ptr(g);
+    LLVMTypeRef status_type = LLVMPointerType(i32, 0);
+    LLVMValueRef status = LLVMBuildBitCast(g->builder, scratch, status_type, "blocking.status");
     LLVMValueRef out = NULL;
     if (ret->kind != TYPE_VOID) {
         out = get_async_result_ptr(g);
@@ -430,10 +450,10 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
     LLVMValueRef rt_args[] = {
         fnptr, LLVMConstInt(i32, (unsigned)argc, 0),
         args[0], args[1], args[2], args[3],
-        frame_i8, g->current_async_resume_fn, out
+        frame_i8, g->current_async_resume_fn, out, status
     };
     zan_call2(g->builder, g->rt_blocking_co_type, g->rt_blocking_co,
-              rt_args, 9, "");
+              rt_args, sizeof(rt_args) / sizeof(*rt_args), "");
     LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
     LLVMBasicBlockRef resume = LLVMAppendBasicBlockInContext(g->ctx,
@@ -441,6 +461,20 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
     LLVMAddCase(g->current_async_switch,
         LLVMConstInt(i32, (unsigned)state, 0), resume);
     LLVMPositionBuilderAtEnd(g->builder, resume);
+    status = LLVMBuildBitCast(g->builder, scratch, status_type, "blocking.status.resume");
+    LLVMValueRef code = LLVMBuildLoad2(g->builder, i32, status, "blocking.code");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), scratch);
+    LLVMBasicBlockRef failed = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.blocking.failed");
+    LLVMBasicBlockRef success = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.blocking.success");
+    LLVMBuildCondBr(g->builder, zan_icmp(g->builder, LLVMIntNE, code,
+        LLVMConstInt(i32, 0, 0), "blocking.failed"), failed, success);
+    LLVMPositionBuilderAtEnd(g->builder, failed);
+    emit_blocking_dispatch_throw(g, expr->loc, locals);
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+        LLVMBuildUnreachable(g->builder);
+    LLVMPositionBuilderAtEnd(g->builder, success);
     if (ret->kind == TYPE_VOID) return LLVMConstInt(i64, 0, 0);
     LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64, get_async_result_ptr(g), "blocking.raw");
     return coerce_await_result(g, expr, raw, locals);

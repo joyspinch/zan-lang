@@ -608,9 +608,9 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         return -1;
     }
     size_t written = fwrite(zip.out.data, 1, zip.out.len, out);
-    fclose(out);
+    int close_status = fclose(out);
 
-    if (written != zip.out.len) {
+    if (written != zip.out.len || close_status != 0) {
         fprintf(stderr, "error: failed to write complete IPA file to '%s'\n", ipa_path);
         remove(ipa_path);
         zip_destroy(&zip);

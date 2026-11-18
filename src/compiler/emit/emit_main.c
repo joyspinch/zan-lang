@@ -253,7 +253,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         LLVMValueRef tbl = LLVMBuildLoad2(g->builder, LLVMPointerType(i8p, 0), g->g_site_field_graphs, "fgtbl");
         LLVMValueRef tntbl = g->g_site_tynames ? LLVMBuildLoad2(g->builder, LLVMPointerType(i8p, 0), g->g_site_tynames, "tntbl")
                                                : LLVMConstNull(LLVMPointerType(i8p, 0));
-        LLVMValueRef sc = LLVMConstInt(i64t, (uint64_t)g->leak_site_count, 0);
+        LLVMValueRef sc = LLVMBuildLoad2(g->builder, i64t, g->g_site_count, "fg.site.count");
         zan_call2(g->builder, reg_ty, reg_fn, (LLVMValueRef[]){ tbl, tntbl, sc }, 3, "");
     }
 
