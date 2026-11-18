@@ -133,13 +133,19 @@ partial class Irgen {
             bool isStruct = tc != null && tc.kind == AK.StructDecl();
             bool refTarget = tn == "string" || tn == "object" || IsContainerType(tn)
                 || (tc != null && (tc.kind == AK.ClassDecl() || tc.kind == AK.StructDecl()));
-            bool staticOk = tn == "object" || v.ty.sval == tn || IsSubclassName(v.ty.sval, tn);
-            if (refTarget && !staticOk) {
-                string ok;
-                if (tn == "string") { ok = EmitStringIdTest(v); }
-                else { ok = EmitClassIdTest(v, tn); }
+            if (refTarget && !HasStaticReferenceConversion(v.ty, tgt)) {
                 int lok = NL();
                 int lbad = NL();
+                if (!isStruct) {
+                    // A null reference converts successfully. A struct unbox
+                    // still requires a matching runtime object.
+                    int lcheck = NL();
+                    string nil = NT();
+                    L("  " + nil + " = icmp eq " + MapType(v.ty) + " " + v.op + ", null");
+                    L("  br i1 " + nil + ", label %L" + lok + ", label %L" + lcheck);
+                    Label(lcheck);
+                }
+                string ok = EmitReferenceTypeTest(v, tgt);
                 L("  br i1 " + ok + ", label %L" + lok + ", label %L" + lbad);
                 Label(lbad);
                 if (isStruct) {
@@ -149,14 +155,7 @@ partial class Irgen {
                 }
                 Label(lok);
                 term = false;
-                string tll = MapType(tgt);
-                string cv = v.op;
-                if (MapType(v.ty) != tll) {
-                    string b = NT();
-                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
-                    cv = b;
-                }
-                ExprVal converted = new ExprVal(cv, tgt);
+                ExprVal converted = new ExprVal(Coerce(v, MapType(tgt)), tgt);
                 converted.ownerTemp = v.ownerTemp;
                 return converted;
             }
@@ -165,9 +164,8 @@ partial class Irgen {
         return new ExprVal(v.op, tgt);
     }
 
-    // x as T -- like gen0: upcasts/identity and object targets pass the value
-    // through; a downcast or dynamic type test consults the runtime class id
-    // (or string id) and yields null on failure without throwing.
+    // x as T: statically safe conversions pass through. A failed runtime
+    // type test yields null.
     ExprVal GenAs(Node e) {
         ExprVal v = GenExpr(e.a);
         if (e.type == null || v == null) { return v; }
@@ -178,26 +176,12 @@ partial class Irgen {
             Node tc = binder.FindType(tn);
             bool refTarget = tn == "string" || tn == "object" || IsContainerType(tn)
                 || (tc != null && tc.kind == AK.ClassDecl());
-            bool staticOk = tn == "object" || v.ty.sval == tn || IsSubclassName(v.ty.sval, tn);
-            if (staticOk) {
-                string cv = v.op;
-                if (MapType(v.ty) != tll) {
-                    string b = NT();
-                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
-                    cv = b;
-                }
-                return new ExprVal(cv, tgt);
+            if (HasStaticReferenceConversion(v.ty, tgt)) {
+                return new ExprVal(Coerce(v, tll), tgt);
             }
             if (refTarget) {
-                string ok;
-                if (tn == "string") { ok = EmitStringIdTest(v); }
-                else { ok = EmitClassIdTest(v, tn); }
-                string cv = v.op;
-                if (MapType(v.ty) != tll) {
-                    string b = NT();
-                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
-                    cv = b;
-                }
+                string ok = EmitReferenceTypeTest(v, tgt);
+                string cv = Coerce(v, tll);
                 string safe = NT();
                 L("  " + safe + " = select i1 " + ok + ", " + tll + " " + cv + ", " + tll + " null");
                 return new ExprVal(safe, tgt);
@@ -411,11 +395,42 @@ partial class Irgen {
         return cse.b.kids.Count > 0;
     }
 
+    bool IsClosedListType(Node ty) {
+        return IsListType(ty) && IsContainerType("List")
+            && ty.kids.Count == 1 && !MentionsTypeParam(ty.kids[0]);
+    }
+
+    bool HasStaticReferenceConversion(Node src, Node tgt) {
+        if (IsClosedListType(tgt)) {
+            return IsListType(src) && src.kids.Count == 1
+                && ArrayTypeKey(src.kids[0]) == ArrayTypeKey(tgt.kids[0]);
+        }
+        return tgt.sval == "object" || IsSubclassName(src.sval, tgt.sval);
+    }
+
+    string EmitClosedListTypeTest(ExprVal obj, Node tgt) {
+        if (IsClosedListType(obj.ty)) {
+            if (HasStaticReferenceConversion(obj.ty, tgt)) { return Bool1(EmitNonNullVal(obj)); }
+            return "false";
+        }
+        if (!IsPtrType(obj.ty) || (!IsListType(obj.ty) && !DynamicReferenceType(obj.ty))) { return "false"; }
+        // Use the allocation's List<T> metadata even for a nullable List<T>? target.
+        string meta = ReflMetaConst(tgt, "List<" + FormatTypeNode(tgt.kids[0]) + ">");
+        string raw = Coerce(obj, "i8*");
+        string ok = NT();
+        L("  " + ok + " = call i1 @zlist_matches_type(i8* " + raw + ", i8* " + meta + ")");
+        return ok;
+    }
+
+    string EmitReferenceTypeTest(ExprVal obj, Node tgt) {
+        if (IsClosedListType(tgt)) { return EmitClosedListTypeTest(obj, tgt); }
+        if (tgt.sval == "string") { return EmitStringIdTest(obj); }
+        return EmitClassIdTest(obj, tgt.sval);
+    }
+
     // The type test half of a switch pattern (`case T x:`): an i1 condition.
-    // A pattern that needs a runtime class identity (an `object`-typed
-    // scrutinee, or a downcast to a derived class) asks the object's header:
-    // it carries the address of its class's tid global.
     string EmitTypeTestVal(ExprVal obj, Node pat, Node at) {
+        if (IsClosedListType(pat)) { return EmitClosedListTypeTest(obj, pat); }
         string tt = pat.sval;
         string st = obj.ty != null ? obj.ty.sval : "";
         if (tt == "string") {
@@ -471,9 +486,7 @@ partial class Irgen {
         string cid = NT();
         L("  " + cid + " = call i8* @__zan_class_id(i8* " + obj.op + ")");
         string acc = "";
-        // a built-in container: its own class id (the element type is not part
-        // of the runtime identity -- the C host tells a List<int> from a
-        // List<string> by the class alone as well)
+        // A built-in container's class ID identifies its container kind.
         if (IsContainerType(tt)) {
             string ccmp = NT();
             L("  " + ccmp + " = icmp eq i8* " + cid + ", bitcast (i8** @__tid_" + ContainerTidName(tt) + " to i8*)");
